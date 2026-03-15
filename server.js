@@ -8,6 +8,7 @@ import { fileURLToPath } from 'url';
 import linegiftRouter from './apps/linegift-sync/router.js';
 import mercariRouter from './apps/mercari-sync/router.js';
 import aesRouter, { startPythonBackend, stopPythonBackend } from './apps/aes-pdf-sorter/router.js';
+import rankingRouter from './apps/ranking-checker/router.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -144,7 +145,7 @@ const apps = [
     description: 'キーワード別の楽天・Yahoo・Amazon順位確認',
     icon: '📊',
     path: '/apps/ranking-checker',
-    status: 'coming-soon',
+    status: 'active',
     category: 'analysis',
   },
 ];
@@ -252,6 +253,7 @@ app.post('/change-password', requireAuth, (req, res) => {
 app.use('/apps/linegift-sync', requireAppAccess('linegift-sync'), linegiftRouter);
 app.use('/apps/mercari-sync', requireAppAccess('mercari-sync'), mercariRouter);
 app.use('/apps/aes-pdf-sorter', requireAppAccess('aes-pdf-sorter'), aesRouter);
+app.use('/apps/ranking-checker', requireAppAccess('ranking-checker'), rankingRouter);
 
 // 未実装アプリのプレースホルダー
 app.get('/apps/:appId', requireAuth, (req, res) => {

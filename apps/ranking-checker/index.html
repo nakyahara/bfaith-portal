@@ -1,0 +1,1515 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>検索順位チェッカー</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: 'Meiryo UI', 'Yu Gothic UI', sans-serif;
+  background: #f5f0e8;
+  color: #333;
+  min-height: 100vh;
+}
+
+/* ─── Nav ──────────────────────────────────────────────────────────────── */
+.nav {
+  background: #2b2b2b;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  padding: 0 20px;
+  height: 50px;
+  gap: 16px;
+}
+.nav-title { font-size: 17px; font-weight: bold; }
+.nav-btn {
+  background: #555; color: #fff; border: none; border-radius: 4px;
+  padding: 6px 14px; cursor: pointer; font-size: 13px; font-family: inherit;
+}
+.nav-btn:hover { background: #777; }
+.nav-btn.active { background: #5a9e6f; }
+.nav-right { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+
+/* ─── Screens ──────────────────────────────────────────────────────────── */
+.screen { display: none; padding: 20px; max-width: 1400px; margin: 0 auto; }
+.screen.active { display: block; }
+
+/* ─── Card ─────────────────────────────────────────────────────────────── */
+.card {
+  background: #fff; border-radius: 8px; box-shadow: 0 2px 12px rgba(0,0,0,.08);
+  padding: 28px 32px; max-width: 580px; margin: 60px auto;
+}
+.card h2 { font-size: 16px; margin-bottom: 18px; }
+.form-row { display: flex; align-items: center; margin-bottom: 12px; gap: 10px; }
+.form-row label { width: 140px; flex-shrink: 0; font-size: 13px; }
+.form-row input {
+  flex: 1; padding: 7px 10px; border: 1px solid #ccc; border-radius: 4px;
+  font-size: 13px; font-family: inherit;
+}
+.form-row input:focus { outline: none; border-color: #5a9e6f; box-shadow: 0 0 0 2px rgba(90,158,111,.2); }
+.btn-row { display: flex; gap: 8px; margin-top: 18px; flex-wrap: wrap; }
+.status { font-size: 13px; color: #5a9e6f; margin-top: 10px; }
+.count-label { font-size: 12px; color: #888; text-align: right; margin-top: 4px; }
+
+/* ─── Buttons ──────────────────────────────────────────────────────────── */
+.btn {
+  padding: 8px 18px; border: none; border-radius: 4px; cursor: pointer;
+  font-size: 13px; font-family: inherit; transition: background .15s;
+}
+.btn-primary { background: #5a9e6f; color: #fff; }
+.btn-primary:hover { background: #4a8c5f; }
+.btn-secondary { background: #e0e0e0; color: #333; }
+.btn-secondary:hover { background: #ccc; }
+.btn-danger { background: #c62828; color: #fff; }
+.btn-danger:hover { background: #a01e1e; }
+.btn-sm { padding: 4px 10px; font-size: 12px; }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+
+/* ─── Progress ─────────────────────────────────────────────────────────── */
+.progress-area { display: flex; align-items: center; gap: 12px; margin: 10px 0; }
+.progress-bar { flex: 0 0 400px; height: 18px; background: #e0e0e0; border-radius: 9px; overflow: hidden; }
+.progress-fill { height: 100%; background: linear-gradient(90deg, #5a9e6f, #7ec496); transition: width .3s; width: 0%; }
+.progress-text { font-size: 13px; color: #555; }
+
+/* ─── Toolbar ──────────────────────────────────────────────────────────── */
+.toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.toolbar .sep { width: 1px; height: 24px; background: #ccc; margin: 0 4px; }
+
+/* ─── Product Cards (list screen) ──────────────────────────────────────── */
+.product-card {
+  background: #fff;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  margin-bottom: 8px;
+  overflow: hidden;
+}
+.product-card:nth-child(even) { background: #faf7f2; }
+.product-header {
+  display: flex;
+  align-items: stretch;
+  min-height: 60px;
+}
+.product-thumb {
+  width: 64px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+}
+.product-thumb img {
+  width: 56px; height: 56px; object-fit: cover; border-radius: 4px;
+  cursor: pointer; background: #f0f0f0;
+}
+.product-keyword {
+  width: 160px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  padding: 8px;
+  font-weight: 500;
+  font-size: 13px;
+  word-break: break-all;
+}
+.product-keyword a { color: #333; text-decoration: none; }
+.product-keyword a:hover { color: #1565C0; text-decoration: underline; }
+.product-rows { flex: 1; min-width: 0; }
+.product-ops {
+  width: 100px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 4px;
+}
+
+/* ─── Sub-row (within product card) ────────────────────────────────────── */
+.sub-row {
+  display: flex;
+  align-items: center;
+  padding: 4px 0;
+  border-top: 1px solid #eee;
+  font-size: 13px;
+}
+.sub-row:first-child { border-top: none; }
+.sr-label { width: 56px; text-align: center; flex-shrink: 0; }
+.sr-comp-img { width: 48px; flex-shrink: 0; text-align: center; }
+.sr-comp-img img {
+  width: 36px; height: 36px; object-fit: cover; border-radius: 3px;
+  cursor: pointer; background: #f0f0f0;
+}
+.sr-rank { width: 56px; flex-shrink: 0; text-align: center; font-weight: bold; font-size: 14px; }
+.sr-arrow { width: 32px; flex-shrink: 0; text-align: center; font-weight: bold; }
+.sr-avg { width: 64px; flex-shrink: 0; text-align: center; }
+
+.badge-own { background: #e8f5e9; color: #2e7d32; padding: 2px 8px; border-radius: 3px; font-size: 11px; display: inline-block; }
+.badge-yahoo { background: #fce4ec; color: #c62828; padding: 2px 8px; border-radius: 3px; font-size: 11px; display: inline-block; }
+.badge-amazon { background: #fff3e0; color: #e65100; padding: 2px 8px; border-radius: 3px; font-size: 11px; display: inline-block; }
+.badge-comp { background: #e3f2fd; color: #1565c0; padding: 2px 8px; border-radius: 3px; font-size: 11px; display: inline-block; }
+.rank-up { color: #1565C0; }
+.rank-down { color: #C62828; }
+.rank-same { color: #2E7D32; }
+.rank-na { color: #999; }
+
+/* ─── Column header bar ───────────────────────────────────────────────── */
+.col-header {
+  display: flex;
+  align-items: center;
+  background: #3d3d3d;
+  color: #fff;
+  font-size: 12px;
+  font-weight: bold;
+  padding: 6px 0;
+  border-radius: 4px 4px 0 0;
+  margin-bottom: 0;
+}
+.col-header > div { text-align: center; }
+.ch-thumb { width: 64px; flex-shrink: 0; }
+.ch-kw { width: 160px; flex-shrink: 0; text-align: left; padding-left: 8px; }
+.ch-label { width: 56px; flex-shrink: 0; }
+.ch-comp-img { width: 48px; flex-shrink: 0; }
+.ch-rank { width: 56px; flex-shrink: 0; }
+.ch-arrow { width: 32px; flex-shrink: 0; }
+.ch-avg { width: 64px; flex-shrink: 0; }
+.ch-ops { width: 100px; flex-shrink: 0; }
+
+/* ─── Pagination ───────────────────────────────────────────────────────── */
+.pagination { display: flex; align-items: center; gap: 12px; margin-top: 12px; font-size: 13px; }
+
+/* ─── Modal ────────────────────────────────────────────────────────────── */
+.modal-overlay {
+  display: none; position: fixed; inset: 0; background: rgba(0,0,0,.4);
+  z-index: 200; justify-content: center; align-items: center;
+}
+.modal-overlay.show { display: flex; }
+.modal {
+  background: #fff; border-radius: 8px; padding: 24px 28px;
+  min-width: 460px; box-shadow: 0 8px 30px rgba(0,0,0,.2);
+}
+.modal h3 { margin-bottom: 16px; }
+.modal .hint { font-size: 11px; color: #888; margin-top: -6px; margin-bottom: 10px; padding-left: 150px; }
+
+/* ─── Debug log panel ──────────────────────────────────────────────────── */
+#debug-panel {
+  background: #1e1e1e; color: #0f0; font-family: 'Consolas', monospace;
+  font-size: 11px; padding: 8px 12px; max-height: 200px; overflow-y: auto;
+  border-radius: 4px; margin-top: 10px; display: none;
+  white-space: pre-wrap; word-break: break-all;
+}
+#debug-panel.show { display: block; }
+
+/* ─── Unregistered Screen ──────────────────────────────────────────────── */
+table.unreg-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.unreg-table thead th {
+  background: #4a4a4a; color: #fff; padding: 8px 6px; font-weight: bold;
+  text-align: center; white-space: nowrap;
+}
+table.unreg-table tbody td {
+  padding: 6px; text-align: center; vertical-align: middle; border-bottom: 1px solid #e0e0e0;
+}
+table.unreg-table tbody tr:nth-child(even) { background: #faf7f2; }
+</style>
+</head>
+<body>
+
+<!-- ═══ Nav ════════════════════════════════════════════════════════════════ -->
+<div class="nav">
+  <span class="nav-title">&#x1f50d; 検索順位チェッカー</span>
+  <button class="nav-btn active" onclick="showScreen('main')" id="nav-main">メイン</button>
+  <button class="nav-btn" onclick="showScreen('list')" id="nav-list">商品リスト</button>
+  <button class="nav-btn" onclick="showScreen('unreg')" id="nav-unreg">未登録商品</button>
+  <div class="nav-right">
+    <button class="nav-btn" onclick="openSettings()">&#x2699; API設定</button>
+  </div>
+</div>
+
+<!-- ═══ Screen 1: Main ════════════════════════════════════════════════════ -->
+<div id="screen-main" class="screen active">
+  <div class="card">
+    <h2>&#x1f6d2; 商品を登録する</h2>
+    <div class="form-row"><label>検索ワード *</label><input type="text" id="reg-keyword" placeholder="例: アロマオイル 天然"></div>
+    <div class="form-row"><label>商品コード *</label><input type="text" id="reg-code" placeholder="例: abc-123"></div>
+    <div class="hint" style="font-size:11px;color:#888;margin-top:-6px;margin-bottom:10px;padding-left:150px;">※ 楽天・Yahoo!共通の商品コード</div>
+    <div class="form-row"><label>楽天URL（任意）</label><input type="text" id="reg-rakuten-url" placeholder="空欄 → 商品コードから自動生成"></div>
+    <div class="form-row"><label>Yahoo!URL（任意）</label><input type="text" id="reg-yahoo-url" placeholder="空欄 → 商品コードから自動生成"></div>
+    <div class="form-row" style="display:none"><label>Amazon ASIN（任意）</label><input type="text" id="reg-amazon-asin" placeholder="例: B0XXXXXXXXXX"></div>
+    <div class="hint" style="display:none">※ AmazonのASINコード（商品ページURLの /dp/XXXX 部分）</div>
+    <div class="form-row"><label>競合URL&#x2460;（任意）</label><input type="text" id="reg-comp1"></div>
+    <div class="form-row"><label>競合URL&#x2461;（任意）</label><input type="text" id="reg-comp2"></div>
+    <div class="btn-row">
+      <button class="btn btn-primary" onclick="registerProduct()">登録</button>
+    </div>
+    <div class="status" id="reg-status"></div>
+    <div class="count-label" id="reg-count"></div>
+  </div>
+</div>
+
+<!-- ═══ Screen 2: Product List ════════════════════════════════════════════ -->
+<div id="screen-list" class="screen">
+  <div class="toolbar">
+    <button class="btn btn-primary" id="btn-check-start" onclick="startCheck()">&#x25b6; チェック開始</button>
+    <button class="btn btn-secondary" id="btn-check-stop" onclick="stopCheck()" disabled>&#x25a0; 停止</button>
+    <div class="sep"></div>
+    <button class="btn btn-secondary" onclick="exportJSON()">JSONエクスポート</button>
+    <button class="btn btn-secondary" onclick="importJSON()">JSONインポート</button>
+    <div class="sep"></div>
+    <button class="btn btn-secondary" onclick="exportCSV()">サマリーCSV</button>
+    <button class="btn btn-secondary" onclick="exportDailyCSV()">日別データCSV</button>
+    <button class="btn btn-secondary" onclick="importCSV()" style="background:#e8f5e9;color:#2e7d32;">CSV一括登録</button>
+    <input type="file" id="import-file" accept=".json" style="display:none" onchange="handleImport(event)">
+    <input type="file" id="import-csv-file" accept=".csv,.txt" style="display:none" onchange="handleCSVImport(event)">
+    <div class="sep"></div>
+    <label style="font-size:12px;cursor:pointer;"><input type="checkbox" id="toggle-debug" onchange="toggleDebug()"> デバッグログ</label>
+    <div class="sep"></div>
+    <label style="font-size:12px;">並び替え:
+      <select id="sort-mode" onchange="onSortChange()" style="padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-size:12px;font-family:inherit;">
+        <option value="change">変動順</option>
+        <option value="review">レビュー件数順</option>
+        <option value="registered">登録順</option>
+      </select>
+    </label>
+    <div style="margin-left:auto; font-size:13px; color:#555;" id="list-total"></div>
+  </div>
+
+  <div class="progress-area" id="progress-area" style="display:none">
+    <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+    <span class="progress-text" id="progress-text"></span>
+  </div>
+
+  <div id="debug-panel"></div>
+
+  <!-- Column Header -->
+  <div class="col-header">
+    <div class="ch-thumb">画像</div>
+    <div class="ch-kw">検索ワード</div>
+    <div class="ch-label">対象</div>
+    <div class="ch-comp-img">競合画像</div>
+    <div class="ch-rank">今回</div>
+    <div class="ch-arrow">&#x2191;&#x2193;</div>
+    <div class="ch-avg">1-2日前</div>
+    <div class="ch-avg">3-10日前</div>
+    <div class="ch-avg">11-30日前</div>
+    <div class="ch-avg">31-90日前</div>
+    <div class="ch-avg">91-180日前</div>
+    <div class="ch-ops">操作</div>
+  </div>
+
+  <div id="list-container"></div>
+  <div class="pagination" id="list-pagination"></div>
+</div>
+
+<!-- ═══ Screen 3: Unregistered ════════════════════════════════════════════ -->
+<div id="screen-unreg" class="screen">
+  <div class="toolbar">
+    <button class="btn btn-primary" id="btn-fetch" onclick="startFetchShop()">未登録商品を取得</button>
+    <button class="btn btn-secondary" id="btn-fetch-stop" onclick="stopFetchShop()" disabled>&#x25a0; 停止</button>
+    <div style="margin-left:auto; font-size:13px; color:#555;" id="unreg-count"></div>
+  </div>
+  <div class="progress-area" id="unreg-progress" style="display:none">
+    <div class="progress-bar"><div class="progress-fill" id="unreg-progress-fill"></div></div>
+    <span class="progress-text" id="unreg-progress-text"></span>
+  </div>
+  <div style="background:#fff;border-radius:6px;padding:12px 16px;margin-bottom:12px;">
+    <div style="font-size:13px;font-weight:bold;margin-bottom:8px;">共通設定（各行に自動入力）</div>
+    <div style="display:flex;gap:16px;flex-wrap:wrap;">
+      <label style="font-size:12px;">競合URL&#x2460;共通: <input type="text" id="common-comp1" style="width:280px;padding:4px 8px;border:1px solid #ccc;border-radius:3px;font-size:12px;"></label>
+      <label style="font-size:12px;">競合URL&#x2461;共通: <input type="text" id="common-comp2" style="width:280px;padding:4px 8px;border:1px solid #ccc;border-radius:3px;font-size:12px;"></label>
+    </div>
+  </div>
+  <table class="unreg-table">
+    <thead><tr>
+      <th style="width:60px">画像</th><th style="width:200px">商品名</th><th style="width:120px">商品コード</th><th style="width:200px">URL</th>
+      <th style="width:140px">検索ワード *</th><th style="width:160px">競合URL&#x2460;</th><th style="width:160px">競合URL&#x2461;</th><th style="width:80px">操作</th>
+    </tr></thead>
+    <tbody id="unreg-tbody"></tbody>
+  </table>
+  <div class="pagination" id="unreg-pagination"></div>
+</div>
+
+<!-- ═══ Settings Modal ════════════════════════════════════════════════════ -->
+<div class="modal-overlay" id="settings-modal">
+  <div class="modal">
+    <h3>&#x2699; API設定</h3>
+    <h4 style="margin:12px 0 8px;font-size:13px;color:#bf4f00;">楽天</h4>
+    <div class="form-row"><label>アプリケーションID *</label><input type="text" id="cfg-appid" placeholder="楽天Webサービスで取得"></div>
+    <div class="form-row"><label>アクセスキー *</label><input type="text" id="cfg-accesskey" placeholder="楽天Webサービスで取得"></div>
+    <div class="form-row"><label>ショップコード</label><input type="text" id="cfg-shopcode" placeholder="未登録商品取得に必要"></div>
+    <div class="hint">※ ショップコード = 商品URLの item.rakuten.co.jp/<b>XXXX</b>/ の XXXX 部分</div>
+    <h4 style="margin:16px 0 8px;font-size:13px;color:#e60033;">Yahoo!ショッピング</h4>
+    <div class="form-row"><label>Client ID (appid)</label><input type="text" id="cfg-yahoo-appid" placeholder="Yahoo!デベロッパーで取得"></div>
+    <div class="hint">※ Yahoo!デベロッパーネットワークでアプリケーション登録して取得</div>
+    <!-- Amazon設定（PA-API利用条件未達のため一時非表示） -->
+    <div style="display:none">
+    <h4 style="margin:16px 0 8px;font-size:13px;color:#ff9900;">Amazon</h4>
+    <div class="form-row"><label>Access Key</label><input type="text" id="cfg-amazon-access-key" placeholder="PA-APIで取得"></div>
+    <div class="form-row"><label>Secret Key</label><input type="password" id="cfg-amazon-secret-key" placeholder="PA-APIで取得"></div>
+    <div class="form-row"><label>アソシエイトID</label><input type="text" id="cfg-amazon-tag" placeholder="例: xxxxx-22"></div>
+    <div class="hint">※ アソシエイト・セントラル → ツール → Product Advertising API で取得</div>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-primary" onclick="saveSettings()">保存</button>
+      <button class="btn btn-secondary" onclick="closeSettings()">キャンセル</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ Edit Modal ════════════════════════════════════════════════════════ -->
+<div class="modal-overlay" id="edit-modal">
+  <div class="modal">
+    <h3>商品を編集</h3>
+    <input type="hidden" id="edit-id">
+    <div class="form-row"><label>検索ワード *</label><input type="text" id="edit-keyword"></div>
+    <div class="form-row"><label>商品コード *</label><input type="text" id="edit-code"></div>
+    <div class="form-row"><label>楽天URL（任意）</label><input type="text" id="edit-rakuten-url" placeholder="空欄 → 商品コードから自動生成"></div>
+    <div class="form-row"><label>Yahoo!URL（任意）</label><input type="text" id="edit-yahoo-url" placeholder="空欄 → 商品コードから自動生成"></div>
+    <div class="form-row" style="display:none"><label>Amazon ASIN（任意）</label><input type="text" id="edit-amazon-asin" placeholder="例: B0XXXXXXXXXX"></div>
+    <div class="form-row"><label>競合URL&#x2460;</label><input type="text" id="edit-comp1"></div>
+    <div class="form-row"><label>競合URL&#x2461;</label><input type="text" id="edit-comp2"></div>
+    <div class="btn-row">
+      <button class="btn btn-primary" onclick="saveEdit()">保存</button>
+      <button class="btn btn-secondary" onclick="closeEdit()">キャンセル</button>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ═══════════════════════════════════════════════════════════════════════════ */
+// Base path for API calls — auto-detect from current page URL
+const BASE_PATH = location.pathname.replace(/\/+$/, '');
+const STORAGE_KEY = 'rakuten_ranking_data';
+const CONFIG_KEY  = 'rakuten_ranking_config';
+const MAX_PRODUCTS = 5000;
+const MAX_RANK = 100;  // 100位まで探索（高速化）
+const HITS = 30;
+const API_DELAY = 1100;
+const KW_DELAY  = 2000;
+const LIST_PER_PAGE = 50;
+const UNREG_PER_PAGE = 30;
+
+let products = [];
+let checkRunning = false;
+let checkAbort = false;
+let fetchRunning = false;
+let fetchAbort = false;
+let unregProducts = [];
+let listPage = 0;
+let unregPage = 0;
+
+/* ═══ Debug Log ═══════════════════════════════════════════════════════════ */
+function debugLog(msg) {
+  console.log('[RankChecker]', msg);
+  const panel = document.getElementById('debug-panel');
+  if (panel) {
+    const time = new Date().toLocaleTimeString('ja-JP');
+    panel.textContent += `[${time}] ${msg}\n`;
+    panel.scrollTop = panel.scrollHeight;
+  }
+}
+function toggleDebug() {
+  const panel = document.getElementById('debug-panel');
+  panel.classList.toggle('show', document.getElementById('toggle-debug').checked);
+}
+
+/* ═══ Data ════════════════════════════════════════════════════════════════ */
+function uuid() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0;
+    return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+  });
+}
+// --- サーバー側JSONファイルでデータ永続化 ---
+let _configCache = null;
+
+async function loadData() {
+  try {
+    const resp = await fetch(BASE_PATH + '/data');
+    const obj = await resp.json();
+    products = obj.products || [];
+  } catch(e) {
+    // サーバー未起動時はlocalStorageフォールバック
+    try { const raw = localStorage.getItem(STORAGE_KEY); if (raw) products = JSON.parse(raw); } catch(e2) { products = []; }
+  }
+}
+function saveData() {
+  const obj = { products };
+  fetch(BASE_PATH + '/data', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(obj) }).catch(() => {});
+  // ローカルにもバックアップ
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(products)); } catch(e) {}
+}
+async function loadConfigAsync() {
+  try {
+    const resp = await fetch(BASE_PATH + '/config');
+    _configCache = await resp.json();
+  } catch(e) {
+    try { const r = localStorage.getItem(CONFIG_KEY); _configCache = r ? JSON.parse(r) : {}; } catch(e2) { _configCache = {}; }
+  }
+  return _configCache;
+}
+function loadConfig() {
+  if (_configCache) return _configCache;
+  // 同期フォールバック（初回ロード前）
+  try { const r = localStorage.getItem(CONFIG_KEY); return r ? JSON.parse(r) : {}; } catch(e) { return {}; }
+}
+function saveConfig(c) {
+  _configCache = c;
+  fetch(BASE_PATH + '/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(c) }).catch(() => {});
+  try { localStorage.setItem(CONFIG_KEY, JSON.stringify(c)); } catch(e) {}
+}
+
+/* ═══ URL Matching ════════════════════════════════════════════════════════ */
+function normalizeUrl(url) {
+  if (!url) return '';
+  url = url.trim();
+  // Remove protocol
+  url = url.replace(/^https?:\/\//, '');
+  // Remove www.
+  url = url.replace(/^www\./, '');
+  // Remove query string and fragment
+  url = url.split('?')[0].split('#')[0];
+  // Remove trailing slashes
+  url = url.replace(/\/+$/, '');
+  return url.toLowerCase();
+}
+
+function urlsMatch(a, b) {
+  if (!a || !b) return false;
+  const na = normalizeUrl(a);
+  const nb = normalizeUrl(b);
+  // Exact match
+  if (na === nb) return true;
+  // One might contain the other (e.g. with/without trailing path segment)
+  return na.includes(nb) || nb.includes(na);
+}
+
+/* ═══ Rank Utilities ══════════════════════════════════════════════════════ */
+function rankToNum(r) {
+  if (r === null || r === undefined || r === 'error') return MAX_RANK + 1;
+  return parseInt(r);
+}
+function displayRank(r) {
+  if (r === null || r === undefined) return '圏外';
+  if (r === 'error') return 'エラー';
+  return String(r);
+}
+function calcAvgRank(history, field, startDaysAgo, endDaysAgo) {
+  const today = new Date(); today.setHours(0,0,0,0);
+  const rangeStart = new Date(today); rangeStart.setDate(rangeStart.getDate() - endDaysAgo);
+  const rangeEnd   = new Date(today); rangeEnd.setDate(rangeEnd.getDate() - startDaysAgo);
+  const vals = [];
+  for (const entry of history) {
+    const d = new Date(entry.date); d.setHours(0,0,0,0);
+    if (d >= rangeStart && d <= rangeEnd) {
+      const v = entry[field];
+      if (v !== null && v !== undefined && v !== 'error') vals.push(parseInt(v));
+    }
+  }
+  if (vals.length === 0) return null;
+  return Math.round(vals.reduce((a,b) => a+b, 0) / vals.length);
+}
+function getLatestEntry(h) { return (!h || h.length === 0) ? null : h.reduce((a,b) => a.date > b.date ? a : b); }
+function getSortScore(p) {
+  const latest = getLatestEntry(p.history);
+  if (!latest) return -1;
+  const avg12 = calcAvgRank(p.history, 'own_rank', 1, 2);
+  if (avg12 === null) return -1;
+  return Math.abs(rankToNum(latest.own_rank) - rankToNum(avg12));
+}
+function arrowInfo(rank, avg12) {
+  if (avg12 === null) return { text: '—', cls: 'rank-na' };
+  const cur = rankToNum(rank), avg = rankToNum(avg12);
+  if (cur < avg) return { text: '↑', cls: 'rank-up' };
+  if (cur > avg) return { text: '↓', cls: 'rank-down' };
+  return { text: '→', cls: 'rank-same' };
+}
+
+/* ═══ Rakuten API ════════════════════════════════════════════════════════ */
+const RAKUTEN_API = BASE_PATH + '/api/rakuten';
+const YAHOO_API = BASE_PATH + '/api/yahoo';
+const AMAZON_API = BASE_PATH + '/api/amazon';
+const YAHOO_HITS = 50;
+const AMAZON_HITS = 10; // PA-API最大10件/ページ, 最大10ページ = 100位まで
+
+async function apiSearch(keyword, page, appId, shopCode) {
+  const cfg = loadConfig();
+  const accessKey = cfg.accessKey || '';
+
+  const params = new URLSearchParams({
+    applicationId: appId,
+    accessKey: accessKey,
+    hits: HITS,
+    page: page,
+    format: 'json',
+    sort: 'standard',
+  });
+  if (keyword && keyword.trim()) params.set('keyword', keyword);
+  if (shopCode) params.set('shopCode', shopCode);
+
+  const url = RAKUTEN_API + '?' + params.toString();
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20000);
+  let response;
+  try {
+    response = await fetch(url, { signal: controller.signal });
+  } catch (e) {
+    clearTimeout(timer);
+    throw new Error(e.name === 'AbortError' ? 'APIタイムアウト (20秒)' : e.message);
+  }
+  clearTimeout(timer);
+
+  if (!response.ok) {
+    const text = await response.text();
+    debugLog(`楽天API HTTP ${response.status}: ${text.slice(0, 500)}`);
+    throw new Error(`API HTTP Error ${response.status}\n${text.slice(0, 300)}`);
+  }
+
+  const data = await response.json();
+  if (data.error) {
+    debugLog('楽天API Error: ' + (data.error_description || data.error));
+    throw new Error(data.error_description || data.error);
+  }
+  return data;
+}
+
+/* ═══ Yahoo! Shopping API ═════════════════════════════════════════════════ */
+async function yahooApiSearch(keyword, start, appId) {
+  const params = new URLSearchParams({
+    appid: appId,
+    query: keyword,
+    results: YAHOO_HITS,
+    start: start,
+    sort: '-score',
+  });
+
+  const response = await fetch(YAHOO_API + '?' + params.toString());
+  if (!response.ok) {
+    const text = await response.text();
+    debugLog(`Yahoo API HTTP ${response.status}: ${text.slice(0, 500)}`);
+    throw new Error(`Yahoo API HTTP Error ${response.status}`);
+  }
+  const data = await response.json();
+  return data;
+}
+/* ═══ Amazon PA-API 5.0 ══════════════════════════════════════════════════ */
+async function amazonApiSearch(keyword, itemPage) {
+  const params = new URLSearchParams({ keyword, itemPage });
+  const response = await fetch(AMAZON_API + '?' + params.toString());
+  if (!response.ok) {
+    const text = await response.text();
+    debugLog(`Amazon API HTTP ${response.status}: ${text.slice(0, 500)}`);
+    throw new Error(`Amazon API HTTP Error ${response.status}`);
+  }
+  return await response.json();
+}
+
+async function checkAmazonRank(keyword, targetAsin) {
+  const maxPages = 10; // PA-API上限: 10ページ × 10件 = 100位
+  let position = 0;
+
+  for (let page = 1; page <= maxPages && !checkAbort; page++) {
+    if (page > 1) await delay(API_DELAY);
+
+    let data;
+    try {
+      data = await amazonApiSearch(keyword, page);
+    } catch(e) {
+      debugLog(`  Amazon API失敗 page=${page}: ${e.message}`);
+      break;
+    }
+
+    const items = data.SearchResult ? data.SearchResult.Items || [] : [];
+    if (items.length === 0) break;
+
+    if (page === 1) {
+      debugLog(`  Amazon API応答: total=${data.SearchResult ? data.SearchResult.TotalResultCount : 0}, returned=${items.length}`);
+    }
+
+    for (const item of items) {
+      position++;
+      if (item.ASIN && item.ASIN.toUpperCase() === targetAsin.toUpperCase()) {
+        debugLog(`  ★ Amazon 発見! rank=${position} ASIN=${item.ASIN}`);
+        return position;
+      }
+    }
+  }
+
+  debugLog(`  ✗ Amazon 圏外 (${position}件チェック, 上限100位)`);
+  return null;
+}
+
+async function apiSearchSort(keyword, page, appId, shopCode, sort) {
+  const cfg = loadConfig();
+  const params = new URLSearchParams({
+    applicationId: appId,
+    accessKey: cfg.accessKey || '',
+    hits: HITS,
+    page: page,
+    format: 'json',
+    sort: sort || 'standard',
+  });
+  if (keyword && keyword.trim()) params.set('keyword', keyword);
+  if (shopCode) params.set('shopCode', shopCode);
+
+  const response = await fetch(RAKUTEN_API + '?' + params.toString());
+  if (!response.ok) {
+    const text = await response.text();
+    debugLog(`API HTTP ${response.status}: ${text.slice(0, 500)}`);
+    throw new Error(`API HTTP Error ${response.status}`);
+  }
+  const data = await response.json();
+  if (data.error) {
+    debugLog('API Error: ' + (data.error_description || data.error));
+    throw new Error(data.error_description || data.error);
+  }
+  return data;
+}
+
+function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+/* ═══ Screen Navigation ══════════════════════════════════════════════════ */
+function showScreen(name) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.querySelectorAll('.nav-btn[id^="nav-"]').forEach(b => b.classList.remove('active'));
+  document.getElementById('screen-' + name).classList.add('active');
+  const nb = document.getElementById('nav-' + name);
+  if (nb) nb.classList.add('active');
+  if (name === 'main') updateRegCount();
+  if (name === 'list') renderList();
+}
+
+/* ═══ Screen 1: Registration ═════════════════════════════════════════════ */
+function updateRegCount() {
+  document.getElementById('reg-count').textContent = `登録数: ${products.length} / ${MAX_PRODUCTS.toLocaleString()}`;
+}
+function codeToRakutenUrl(code) {
+  return 'https://item.rakuten.co.jp/b-faith/' + code.replace(/\/+$/, '') + '/';
+}
+function codeToYahooUrl(code) {
+  return 'https://store.shopping.yahoo.co.jp/b-faith01/' + code.replace(/\/+$/, '') + '.html';
+}
+function urlToCode(url) {
+  const m = url.match(/item\.rakuten\.co\.jp\/b-faith\/([^/?#]+)/i);
+  return m ? m[1] : url;
+}
+// URLを解決: 手動URL優先、なければ商品コードから自動生成
+function getRakutenUrl(p) {
+  return p.own_url || (p.product_code ? codeToRakutenUrl(p.product_code) : '');
+}
+function getYahooUrl(p) {
+  return p.yahoo_url || (p.product_code ? codeToYahooUrl(p.product_code) : '');
+}
+function getAmazonAsin(p) {
+  if (p.amazon_asin) return p.amazon_asin;
+  // URLからASIN抽出
+  if (p.amazon_url) {
+    const m = p.amazon_url.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/i);
+    return m ? m[1] : '';
+  }
+  return '';
+}
+function getAmazonUrl(p) {
+  const asin = getAmazonAsin(p);
+  return asin ? `https://www.amazon.co.jp/dp/${asin}` : '';
+}
+function registerProduct() {
+  const kw   = document.getElementById('reg-keyword').value.trim();
+  const code = document.getElementById('reg-code').value.trim();
+  const rakutenUrl = document.getElementById('reg-rakuten-url').value.trim();
+  const yahooUrl = document.getElementById('reg-yahoo-url').value.trim();
+  const amazonAsin = document.getElementById('reg-amazon-asin').value.trim();
+  const c1   = document.getElementById('reg-comp1').value.trim();
+  const c2   = document.getElementById('reg-comp2').value.trim();
+  if (!kw) return alert('検索ワードを入力してください。');
+  if (!code) return alert('商品コードを入力してください。');
+  if (products.length >= MAX_PRODUCTS) return alert('登録上限（5,000件）に達しています。');
+
+  products.push({
+    id: uuid(), keyword: kw, product_code: code,
+    own_url: rakutenUrl,     // 空なら商品コードから自動生成
+    yahoo_url: yahooUrl,     // 空なら商品コードから自動生成
+    amazon_asin: amazonAsin,
+    competitor1_url: c1, competitor2_url: c2, history: [],
+  });
+  saveData();
+  ['reg-keyword','reg-code','reg-rakuten-url','reg-yahoo-url','reg-amazon-asin','reg-comp1','reg-comp2'].forEach(id => document.getElementById(id).value = '');
+  document.getElementById('reg-status').textContent = `✔ 「${kw}」を登録しました。`;
+  updateRegCount();
+}
+
+/* ═══ Screen 2: Product List ═════════════════════════════════════════════ */
+function getSortedProducts() {
+  const mode = (document.getElementById('sort-mode') || {}).value || 'change';
+  if (mode === 'review') {
+    // レビュー件数順（多い順、nullは末尾）
+    return [...products].sort((a, b) => {
+      const ra = a.review_count != null ? a.review_count : -1;
+      const rb = b.review_count != null ? b.review_count : -1;
+      return rb - ra;
+    });
+  }
+  if (mode === 'registered') {
+    // 登録順（そのまま）
+    return [...products];
+  }
+  // 変動順（デフォルト）
+  const scored = products.map(p => ({ score: getSortScore(p), p }));
+  const withData = scored.filter(x => x.score >= 0).sort((a,b) => b.score - a.score);
+  const noData = scored.filter(x => x.score < 0);
+  return [...withData.map(x => x.p), ...noData.map(x => x.p)];
+}
+
+function onSortChange() { listPage = 0; renderList(); }
+
+function renderList() {
+  const sorted = getSortedProducts();
+  const container = document.getElementById('list-container');
+  container.innerHTML = '';
+
+  const total = sorted.length;
+  const totalPages = Math.max(1, Math.ceil(total / LIST_PER_PAGE));
+  if (listPage >= totalPages) listPage = Math.max(0, totalPages - 1);
+
+  const start = listPage * LIST_PER_PAGE;
+  const pageItems = sorted.slice(start, start + LIST_PER_PAGE);
+  document.getElementById('list-total').textContent = `全 ${total} 件`;
+
+  for (const product of pageItems) {
+    container.appendChild(buildProductCard(product));
+  }
+  renderPagination('list-pagination', listPage, totalPages, p => { listPage = p; renderList(); });
+}
+
+function buildProductCard(product) {
+  const latest = getLatestEntry(product.history);
+  const h = product.history || [];
+  const card = document.createElement('div');
+  card.className = 'product-card';
+
+  const header = document.createElement('div');
+  header.className = 'product-header';
+
+  // Thumbnail
+  const thumbDiv = document.createElement('div');
+  thumbDiv.className = 'product-thumb';
+  const thumbUrl = product._thumbUrl || '';
+  if (thumbUrl) {
+    const img = document.createElement('img');
+    img.src = thumbUrl;
+    img.onclick = () => { const u = getRakutenUrl(product); if (u) window.open(u, '_blank'); };
+    img.onerror = function() { this.style.display = 'none'; };
+    thumbDiv.appendChild(img);
+  }
+  header.appendChild(thumbDiv);
+
+  // Keyword + product code
+  const kwDiv = document.createElement('div');
+  kwDiv.className = 'product-keyword';
+  const searchUrl = 'https://search.rakuten.co.jp/search/mall/' + encodeURIComponent(product.keyword) + '/';
+  const codeHtml = product.product_code ? `<div style="font-size:10px;color:#888;font-weight:normal;margin-top:2px;">${escHtml(product.product_code)}</div>` : '';
+  const reviewHtml = product.review_count != null ? `<div style="font-size:10px;color:#e65100;font-weight:normal;">★${product.review_count}</div>` : '';
+  kwDiv.innerHTML = `<div><a href="${searchUrl}" target="_blank">${escHtml(product.keyword)}</a>${codeHtml}${reviewHtml}</div>`;
+  header.appendChild(kwDiv);
+
+  // Sub-rows container
+  const rowsDiv = document.createElement('div');
+  rowsDiv.className = 'product-rows';
+
+  // Build sub-rows
+  const subRows = [{ label: '楽天', cls: 'badge-own', field: 'own_rank', rank: latest ? latest.own_rank : null, url: '' }];
+  if (getYahooUrl(product)) subRows.push({ label: 'Yahoo!', cls: 'badge-yahoo', field: 'yahoo_own_rank', rank: latest ? latest.yahoo_own_rank : null, url: '' });
+  // Amazon表示は一時無効化（PA-API利用条件未達）バックエンドは維持
+  // if (getAmazonAsin(product)) subRows.push({ label: 'Amazon', cls: 'badge-amazon', field: 'amazon_own_rank', rank: latest ? latest.amazon_own_rank : null, url: getAmazonUrl(product) });
+  if (product.competitor1_url) subRows.push({ label: '競合①', cls: 'badge-comp', field: 'competitor1_rank', rank: latest ? latest.competitor1_rank : null, url: product.competitor1_url });
+  if (product.competitor2_url) subRows.push({ label: '競合②', cls: 'badge-comp', field: 'competitor2_rank', rank: latest ? latest.competitor2_rank : null, url: product.competitor2_url });
+
+  for (const sr of subRows) {
+    const row = document.createElement('div');
+    row.className = 'sub-row';
+
+    // Label
+    row.innerHTML += `<div class="sr-label"><span class="${sr.cls}">${sr.label}</span></div>`;
+
+    // Competitor image
+    const compImgHtml = sr.url && product['_compThumb_' + sr.field]
+      ? `<img src="${product['_compThumb_' + sr.field]}" onclick="window.open('${escHtml(sr.url)}','_blank')" onerror="this.style.display='none'">`
+      : '';
+    row.innerHTML += `<div class="sr-comp-img">${compImgHtml}</div>`;
+
+    // Current rank
+    row.innerHTML += `<div class="sr-rank">${displayRank(sr.rank)}</div>`;
+
+    // Arrow
+    const avg12 = calcAvgRank(h, sr.field, 1, 2);
+    const arrow = arrowInfo(sr.rank, avg12);
+    row.innerHTML += `<div class="sr-arrow ${arrow.cls}">${arrow.text}</div>`;
+
+    // Averages
+    const periods = [[1,2],[3,10],[11,30],[31,90],[91,180]];
+    for (const [s,e] of periods) {
+      const avg = calcAvgRank(h, sr.field, s, e);
+      row.innerHTML += `<div class="sr-avg ${avg === null ? 'rank-na' : ''}">${avg !== null ? avg : '—'}</div>`;
+    }
+    rowsDiv.appendChild(row);
+  }
+  header.appendChild(rowsDiv);
+
+  // Operations
+  const opsDiv = document.createElement('div');
+  opsDiv.className = 'product-ops';
+  opsDiv.innerHTML = `
+    <button class="btn btn-secondary btn-sm" onclick="openEdit('${product.id}')">編集</button>
+    <button class="btn btn-danger btn-sm" onclick="deleteProduct('${product.id}')">削除</button>
+  `;
+  header.appendChild(opsDiv);
+
+  card.appendChild(header);
+  return card;
+}
+
+/* ═══ Ranking Check ══════════════════════════════════════════════════════ */
+async function startCheck() {
+  if (checkRunning) return;
+  if (products.length === 0) return alert('登録商品がありません。');
+  const cfg = loadConfig();
+  if (!cfg.applicationId || !cfg.accessKey) return alert('楽天APIのアプリケーションIDとアクセスキーが設定されていません。\n右上の「API設定」で設定してください。');
+
+  checkRunning = true;
+  checkAbort = false;
+  document.getElementById('btn-check-start').disabled = true;
+  document.getElementById('btn-check-stop').disabled = false;
+  document.getElementById('progress-area').style.display = 'flex';
+  document.getElementById('progress-fill').style.width = '0%';
+  document.getElementById('progress-text').textContent = '準備中...';
+  document.getElementById('debug-panel').textContent = '';
+
+  const total = products.length;
+  const today = new Date().toISOString().slice(0, 10);
+  const appId = cfg.applicationId;
+
+  debugLog(`チェック開始: ${total} 件, appId=${appId.slice(0,8)}...`);
+
+  for (let i = 0; i < products.length; i++) {
+    if (checkAbort) break;
+    const product = products[i];
+
+    if (i > 0) await delay(KW_DELAY);
+    if (checkAbort) break;
+
+    debugLog(`--- [${i+1}/${total}] キーワード: "${product.keyword}" ---`);
+    debugLog(`  自社URL: ${getRakutenUrl(product)}`);
+
+    // --- 楽天チェック ---
+    let own_r = null, c1_r = null, c2_r = null;
+    try {
+      const result = await checkOneKeyword(product, appId);
+      own_r = result.own;
+      c1_r = result.comp1;
+      c2_r = result.comp2;
+      if (result.ownThumb) product._thumbUrl = result.ownThumb;
+      if (result.comp1Thumb) product['_compThumb_competitor1_rank'] = result.comp1Thumb;
+      if (result.comp2Thumb) product['_compThumb_competitor2_rank'] = result.comp2Thumb;
+      if (result.ownReviewCount != null) product.review_count = result.ownReviewCount;
+
+      debugLog(`  楽天結果: 自社=${displayRank(own_r)}, 競合①=${displayRank(c1_r)}, 競合②=${displayRank(c2_r)}`);
+    } catch (e) {
+      debugLog(`  楽天エラー: ${e.message}`);
+      own_r = 'error';
+      c1_r = product.competitor1_url ? 'error' : null;
+      c2_r = product.competitor2_url ? 'error' : null;
+    }
+
+    // --- Yahoo!チェック ---
+    let yahoo_r = null;
+    const yahooUrl = getYahooUrl(product);
+    if (yahooUrl && cfg.yahooAppId) {
+      try {
+        if (!checkAbort) await delay(API_DELAY);
+        yahoo_r = await checkYahooRank(product.keyword, yahooUrl, cfg.yahooAppId);
+        debugLog(`  Yahoo!結果: ${displayRank(yahoo_r)}`);
+      } catch (e) {
+        debugLog(`  Yahoo!エラー: ${e.message}`);
+        yahoo_r = 'error';
+      }
+    }
+
+    // --- Amazonチェック（一時無効化: PA-API利用条件未達）---
+    let amazon_r = null;
+    const amazonAsin = getAmazonAsin(product);
+    if (false && amazonAsin && cfg.amazonAccessKey) {
+      try {
+        if (!checkAbort) await delay(API_DELAY);
+        debugLog(`  Amazon ASIN: ${amazonAsin}`);
+        amazon_r = await checkAmazonRank(product.keyword, amazonAsin);
+        debugLog(`  Amazon結果: ${displayRank(amazon_r)}`);
+      } catch (e) {
+        debugLog(`  Amazonエラー: ${e.message}`);
+        amazon_r = 'error';
+      }
+    }
+
+    // 同日のエントリがあれば上書き、なければ追加
+    const newEntry = {
+      date: today,
+      own_rank: own_r,
+      competitor1_rank: product.competitor1_url ? c1_r : null,
+      competitor2_rank: product.competitor2_url ? c2_r : null,
+      yahoo_own_rank: yahooUrl ? yahoo_r : null,
+      amazon_own_rank: amazonAsin ? amazon_r : null,
+    };
+    const todayIdx = product.history.findIndex(e => e.date === today);
+    if (todayIdx >= 0) {
+      product.history[todayIdx] = newEntry;
+    } else {
+      product.history.push(newEntry);
+    }
+
+    const pct = ((i + 1) / total * 100).toFixed(0);
+    document.getElementById('progress-fill').style.width = pct + '%';
+    document.getElementById('progress-text').textContent = `${i + 1} / ${total} 完了`;
+    saveData();
+
+    // Update the display for this product immediately
+    renderList();
+  }
+
+  checkRunning = false;
+  document.getElementById('btn-check-start').disabled = false;
+  document.getElementById('btn-check-stop').disabled = true;
+  document.getElementById('progress-text').textContent += checkAbort ? '  (中断)' : '  ✔ 完了';
+  debugLog(checkAbort ? 'チェック中断' : 'チェック完了');
+  renderList();
+}
+function stopCheck() { checkAbort = true; }
+
+async function checkOneKeyword(product, appId) {
+  const targets = {};
+  const ownUrl = getRakutenUrl(product);
+  if (ownUrl) targets.own = ownUrl;
+  if (product.competitor1_url) targets.comp1 = product.competitor1_url;
+  if (product.competitor2_url) targets.comp2 = product.competitor2_url;
+
+  const found = {};
+  const thumbs = {};
+  let organicRank = 0;
+  let ownReviewCount = null;
+  const maxPages = Math.min(34, Math.ceil(MAX_RANK / HITS));
+
+  for (let page = 1; page <= maxPages; page++) {
+    if (checkAbort) break;
+    if (organicRank >= MAX_RANK) break;
+
+    if (page > 1) await delay(API_DELAY);
+
+    let data;
+    try {
+      data = await apiSearch(product.keyword, page, appId);
+      if (page === 1) {
+        debugLog(`  API応答: count=${data.count || 0}, pageCount=${data.pageCount || 0}, items=${(data.Items||[]).length}`);
+      }
+    } catch(e) {
+      debugLog(`  API失敗 page=${page}: ${e.message}`);
+      break;
+    }
+
+    const items = data.Items || [];
+    if (items.length === 0) {
+      debugLog(`  page ${page}: アイテム0件 → 終了`);
+      break;
+    }
+
+    for (const wrapper of items) {
+      if (checkAbort) break;
+      if (organicRank >= MAX_RANK) break;
+
+      const item = wrapper.Item || {};
+      const itemUrl = item.itemUrl || '';
+      organicRank++;
+
+      if (!itemUrl) continue;
+
+      for (const [key, targetUrl] of Object.entries(targets)) {
+        if (found[key] !== undefined) continue;
+        if (urlsMatch(targetUrl, itemUrl)) {
+          found[key] = organicRank;
+          debugLog(`  ★ ${key} 発見! rank=${organicRank} url=${itemUrl}`);
+          const imgs = item.mediumImageUrls || [];
+          if (imgs.length > 0) thumbs[key] = (imgs[0].imageUrl || '').replace('?_ex=128x128', '?_ex=200x200');
+          if (key === 'own' && item.reviewCount != null) {
+            ownReviewCount = item.reviewCount;
+            debugLog(`  レビュー件数: ${ownReviewCount}`);
+          }
+        }
+      }
+
+      // Log first few URLs on page 1 for debugging
+      if (page === 1 && organicRank <= 3) {
+        debugLog(`  #${organicRank}: ${normalizeUrl(itemUrl)}`);
+      }
+
+      if (Object.keys(found).length === Object.keys(targets).length) break;
+    }
+
+    if (Object.keys(found).length === Object.keys(targets).length) break;
+    if (page >= (data.pageCount || 0)) break;
+  }
+
+  debugLog(`  探索完了: ${organicRank}件チェック, 発見=${JSON.stringify(found)}`);
+
+  // Log normalized URLs for comparison if not found
+  for (const [key, targetUrl] of Object.entries(targets)) {
+    if (found[key] === undefined) {
+      debugLog(`  ✗ ${key} 圏外: normalized="${normalizeUrl(targetUrl)}"`);
+    }
+  }
+
+  return {
+    own: found.own !== undefined ? found.own : null,
+    comp1: found.comp1 !== undefined ? found.comp1 : null,
+    comp2: found.comp2 !== undefined ? found.comp2 : null,
+    ownThumb: thumbs.own || null,
+    comp1Thumb: thumbs.comp1 || null,
+    comp2Thumb: thumbs.comp2 || null,
+    ownReviewCount: ownReviewCount,
+  };
+}
+
+/* ═══ Yahoo! Ranking Check ═══════════════════════════════════════════════ */
+async function checkYahooRank(keyword, targetUrl, appId) {
+  const maxResults = 100; // 100位まで探索（高速化）
+  let position = 0;
+
+  for (let start = 1; start < maxResults && !checkAbort; start += YAHOO_HITS) {
+    if (start > 1) await delay(API_DELAY);
+
+    let data;
+    try {
+      data = await yahooApiSearch(keyword, start, appId);
+    } catch(e) {
+      debugLog(`  Yahoo API失敗 start=${start}: ${e.message}`);
+      break;
+    }
+
+    const hits = data.hits || [];
+    if (hits.length === 0) break;
+
+    if (start === 1) {
+      debugLog(`  Yahoo API応答: total=${data.totalResultsAvailable || 0}, returned=${hits.length}`);
+    }
+
+    for (const item of hits) {
+      position++;
+      const itemUrl = item.url || '';
+      if (urlsMatch(targetUrl, itemUrl)) {
+        debugLog(`  ★ Yahoo! 発見! rank=${position}`);
+        return position;
+      }
+    }
+
+    // これ以上ページがなければ終了
+    if (start + YAHOO_HITS > (data.totalResultsAvailable || 0)) break;
+    if (start + YAHOO_HITS > maxResults) break;
+  }
+
+  debugLog(`  ✗ Yahoo! 圏外 (${position}件チェック)`);
+  return null;
+}
+
+/* ═══ Edit / Delete ══════════════════════════════════════════════════════ */
+function openEdit(id) {
+  const p = products.find(x => x.id === id);
+  if (!p) return;
+  document.getElementById('edit-id').value = id;
+  document.getElementById('edit-keyword').value = p.keyword;
+  document.getElementById('edit-code').value = p.product_code || '';
+  document.getElementById('edit-rakuten-url').value = p.own_url || '';
+  document.getElementById('edit-yahoo-url').value = p.yahoo_url || '';
+  document.getElementById('edit-amazon-asin').value = p.amazon_asin || '';
+  document.getElementById('edit-comp1').value = p.competitor1_url || '';
+  document.getElementById('edit-comp2').value = p.competitor2_url || '';
+  document.getElementById('edit-modal').classList.add('show');
+}
+function closeEdit() { document.getElementById('edit-modal').classList.remove('show'); }
+function saveEdit() {
+  const id = document.getElementById('edit-id').value;
+  const kw = document.getElementById('edit-keyword').value.trim();
+  const code = document.getElementById('edit-code').value.trim();
+  if (!kw || !code) return alert('検索ワードと商品コードは必須です。');
+  const p = products.find(x => x.id === id);
+  if (!p) return;
+  p.keyword = kw;
+  p.product_code = code;
+  p.own_url = document.getElementById('edit-rakuten-url').value.trim();
+  p.yahoo_url = document.getElementById('edit-yahoo-url').value.trim();
+  p.amazon_asin = document.getElementById('edit-amazon-asin').value.trim();
+  p.competitor1_url = document.getElementById('edit-comp1').value.trim();
+  p.competitor2_url = document.getElementById('edit-comp2').value.trim();
+  saveData(); closeEdit(); renderList();
+}
+function deleteProduct(id) {
+  const p = products.find(x => x.id === id);
+  if (!p) return;
+  if (!confirm(`「${p.keyword}」を削除しますか？`)) return;
+  products = products.filter(x => x.id !== id);
+  saveData(); renderList();
+}
+
+/* ═══ JSON Export / Import ═══════════════════════════════════════════════ */
+function exportJSON() {
+  downloadFile(JSON.stringify(products, null, 2), 'rakuten_ranking_data.json', 'application/json');
+}
+function importJSON() { document.getElementById('import-file').click(); }
+function handleImport(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  if (!confirm('現在のデータをインポートしたファイルで上書きしますか？')) { event.target.value = ''; return; }
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const data = JSON.parse(e.target.result);
+      if (Array.isArray(data)) products = data;
+      else if (data.products && Array.isArray(data.products)) products = data.products;
+      else throw new Error('Invalid format');
+      saveData(); renderList(); alert('インポートしました。');
+    } catch(err) { alert('インポートに失敗しました:\n' + err.message); }
+    event.target.value = '';
+  };
+  reader.readAsText(file);
+}
+
+/* ═══ CSV一括登録 ════════════════════════════════════════════════════════ */
+function importCSV() { document.getElementById('import-csv-file').click(); }
+
+function handleCSVImport(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const text = e.target.result;
+      const lines = text.split(/\r?\n/).filter(l => l.trim());
+      if (lines.length < 2) { alert('CSVにデータがありません'); return; }
+
+      // ヘッダー解析
+      const header = parseCSVLine(lines[0]).map(h => h.trim().toLowerCase());
+      const codeIdx = header.findIndex(h => h.includes('商品コード') || h.includes('code') || h === 'product_code');
+      const kwIdx = header.findIndex(h => h.includes('キーワード') || h.includes('keyword') || h === 'keyword');
+      const nameIdx = header.findIndex(h => h.includes('商品名') || h.includes('name') || h === 'product_name');
+
+      if (codeIdx < 0) { alert('「商品コード」列が見つかりません。\nCSVのヘッダーに「商品コード」を含めてください。'); return; }
+      if (kwIdx < 0) { alert('「キーワード」列が見つかりません。\nCSVのヘッダーに「キーワード」を含めてください。'); return; }
+
+      // 既存の商品コードセット
+      const existingCodes = new Set(products.map(p => p.product_code).filter(Boolean));
+
+      let added = 0, skipped = 0;
+      for (let i = 1; i < lines.length; i++) {
+        const cols = parseCSVLine(lines[i]);
+        const code = (cols[codeIdx] || '').trim();
+        const keyword = (cols[kwIdx] || '').trim();
+        if (!code || !keyword) continue;
+
+        if (existingCodes.has(code)) { skipped++; continue; }
+
+        products.push({
+          id: crypto.randomUUID(),
+          keyword: keyword,
+          product_code: code,
+          own_url: '',
+          yahoo_url: '',
+          amazon_asin: '',
+          competitor1_url: '',
+          competitor2_url: '',
+          history: [],
+        });
+        existingCodes.add(code);
+        added++;
+      }
+
+      saveData();
+      renderList();
+      alert(`CSV一括登録完了\n\n追加: ${added} 件\nスキップ（重複）: ${skipped} 件`);
+    } catch (err) { alert('CSVインポートに失敗しました:\n' + err.message); }
+    event.target.value = '';
+  };
+  reader.readAsText(file, 'utf-8');
+}
+
+function parseCSVLine(line) {
+  const result = [];
+  let current = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQuotes) {
+      if (ch === '"' && line[i + 1] === '"') { current += '"'; i++; }
+      else if (ch === '"') { inQuotes = false; }
+      else { current += ch; }
+    } else {
+      if (ch === '"') { inQuotes = true; }
+      else if (ch === ',') { result.push(current); current = ''; }
+      else { current += ch; }
+    }
+  }
+  result.push(current);
+  return result;
+}
+
+/* ═══ CSV Export ══════════════════════════════════════════════════════════ */
+function exportCSV() {
+  const header = [
+    '検索ワード','楽天URL','Yahoo!URL','Amazon ASIN','チェック日',
+    '楽天順位','楽天1-2日前','楽天3-10日前','楽天11-30日前','楽天31-90日前','楽天91-180日前',
+    'Yahoo!順位','Yahoo!1-2日前','Yahoo!3-10日前','Yahoo!11-30日前','Yahoo!31-90日前','Yahoo!91-180日前',
+    'Amazon順位','Amazon1-2日前','Amazon3-10日前','Amazon11-30日前','Amazon31-90日前','Amazon91-180日前',
+    '競合①URL','競合①順位','競合①1-2日前','競合①3-10日前','競合①11-30日前','競合①31-90日前','競合①91-180日前',
+    '競合②URL','競合②順位','競合②1-2日前','競合②3-10日前','競合②11-30日前','競合②31-90日前','競合②91-180日前',
+  ];
+  const rows = [header];
+  for (const p of products) {
+    const latest = getLatestEntry(p.history);
+    const h = p.history;
+    const av = (f,s,e) => { const v = calcAvgRank(h,f,s,e); return v !== null ? v : ''; };
+    const amzAsin = getAmazonAsin(p);
+    rows.push([
+      p.keyword, getRakutenUrl(p), getYahooUrl(p), amzAsin, latest ? latest.date : '',
+      latest ? displayRank(latest.own_rank) : '',
+      av('own_rank',1,2),av('own_rank',3,10),av('own_rank',11,30),av('own_rank',31,90),av('own_rank',91,180),
+      latest&&getYahooUrl(p) ? displayRank(latest.yahoo_own_rank) : '',
+      getYahooUrl(p)?av('yahoo_own_rank',1,2):'', getYahooUrl(p)?av('yahoo_own_rank',3,10):'',
+      getYahooUrl(p)?av('yahoo_own_rank',11,30):'', getYahooUrl(p)?av('yahoo_own_rank',31,90):'',
+      getYahooUrl(p)?av('yahoo_own_rank',91,180):'',
+      latest&&amzAsin ? displayRank(latest.amazon_own_rank) : '',
+      amzAsin?av('amazon_own_rank',1,2):'', amzAsin?av('amazon_own_rank',3,10):'',
+      amzAsin?av('amazon_own_rank',11,30):'', amzAsin?av('amazon_own_rank',31,90):'',
+      amzAsin?av('amazon_own_rank',91,180):'',
+      p.competitor1_url||'',
+      latest&&p.competitor1_url?displayRank(latest.competitor1_rank):'',
+      p.competitor1_url?av('competitor1_rank',1,2):'', p.competitor1_url?av('competitor1_rank',3,10):'',
+      p.competitor1_url?av('competitor1_rank',11,30):'', p.competitor1_url?av('competitor1_rank',31,90):'',
+      p.competitor1_url?av('competitor1_rank',91,180):'',
+      p.competitor2_url||'',
+      latest&&p.competitor2_url?displayRank(latest.competitor2_rank):'',
+      p.competitor2_url?av('competitor2_rank',1,2):'', p.competitor2_url?av('competitor2_rank',3,10):'',
+      p.competitor2_url?av('competitor2_rank',11,30):'', p.competitor2_url?av('competitor2_rank',31,90):'',
+      p.competitor2_url?av('competitor2_rank',91,180):'',
+    ]);
+  }
+  const csv = rows.map(r => r.map(v => `"${String(v).replace(/"/g,'""')}"`).join(',')).join('\n');
+  downloadFile('\uFEFF' + csv, `ranking_summary_${new Date().toISOString().slice(0,10)}.csv`, 'text/csv');
+}
+
+function exportDailyCSV() {
+  const header = ['検索ワード','商品コード','楽天URL','Yahoo!URL','Amazon ASIN','日付','楽天順位','Yahoo!順位','Amazon順位','競合①URL','競合①順位','競合②URL','競合②順位'];
+  const rows = [header];
+  for (const p of products) {
+    const code = p.product_code || urlToCode(getRakutenUrl(p));
+    const amzAsin = getAmazonAsin(p);
+    for (const entry of (p.history || [])) {
+      rows.push([
+        p.keyword, code, getRakutenUrl(p), getYahooUrl(p), amzAsin, entry.date,
+        displayRank(entry.own_rank),
+        getYahooUrl(p) ? displayRank(entry.yahoo_own_rank) : '',
+        amzAsin ? displayRank(entry.amazon_own_rank) : '',
+        p.competitor1_url || '', p.competitor1_url ? displayRank(entry.competitor1_rank) : '',
+        p.competitor2_url || '', p.competitor2_url ? displayRank(entry.competitor2_rank) : '',
+      ]);
+    }
+  }
+  const csv = rows.map(r => r.map(v => `"${String(v).replace(/"/g,'""')}"`).join(',')).join('\n');
+  downloadFile('\uFEFF' + csv, `rakuten_ranking_daily_${new Date().toISOString().slice(0,10)}.csv`, 'text/csv');
+}
+
+/* ═══ Screen 3: Unregistered ═════════════════════════════════════════════ */
+async function startFetchShop() {
+  if (fetchRunning) return;
+  const cfg = loadConfig();
+  if (!cfg.applicationId || !cfg.accessKey) return alert('楽天APIのアプリケーションIDとアクセスキーが設定されていません。');
+  if (!cfg.shopCode) return alert('ショップコードが設定されていません。\nAPI設定で入力してください。');
+
+  fetchRunning = true; fetchAbort = false;
+  document.getElementById('btn-fetch').disabled = true;
+  document.getElementById('btn-fetch-stop').disabled = false;
+  document.getElementById('unreg-progress').style.display = 'flex';
+  document.getElementById('unreg-progress-text').textContent = '取得中...';
+  unregProducts = [];
+  debugLog(`未登録取得開始: appId=${cfg.applicationId}, shopCode=${cfg.shopCode}, accessKey=${cfg.accessKey ? '設定済み' : '未設定'}`);
+
+  const seenUrls = new Set();
+  const regUrls = new Set(products.map(p => normalizeUrl(getRakutenUrl(p))));
+
+  // 複数ソートで取得し、漏れを減らす
+  const sorts = ['standard', '-updateTimestamp', '+itemPrice', '-itemPrice'];
+
+  for (const sortOrder of sorts) {
+    if (fetchAbort) break;
+    let page = 1;
+    debugLog(`ソート「${sortOrder}」で取得開始...`);
+
+    while (unregProducts.length < 3000 && !fetchAbort) {
+      if (!(sortOrder === sorts[0] && page === 1)) await delay(API_DELAY);
+      let data;
+      try { data = await apiSearchSort('', page, cfg.applicationId, cfg.shopCode, sortOrder); } catch(e) {
+        debugLog(`取得エラー (sort=${sortOrder}, page=${page}): ${e.message}`);
+        break;
+      }
+      const items = data.Items || [];
+      if (items.length === 0) break;
+
+      if (page === 1) debugLog(`sort=${sortOrder}: count=${data.count}, pageCount=${data.pageCount}`);
+
+      for (const w of items) {
+        const item = w.Item || {};
+        const url = item.itemUrl || '';
+        if (!url || seenUrls.has(url)) continue;
+        seenUrls.add(url);
+        if (!regUrls.has(normalizeUrl(url))) {
+          const imgs = item.mediumImageUrls || [];
+          unregProducts.push({ name: item.itemName || url, url, thumbnail_url: imgs.length > 0 ? (imgs[0].imageUrl||'') : '' });
+        }
+      }
+      document.getElementById('unreg-progress-fill').style.width = Math.min(seenUrls.size/Math.max(data.count||1,1)*100,100).toFixed(0)+'%';
+      document.getElementById('unreg-progress-text').textContent = `取得中... ${seenUrls.size} 件 (${sortOrder})`;
+      if (page >= (data.pageCount||0)) break;
+      page++;
+    }
+    debugLog(`sort=${sortOrder} 完了: 累計 ${seenUrls.size} 件`);
+  }
+
+  fetchRunning = false;
+  document.getElementById('btn-fetch').disabled = false;
+  document.getElementById('btn-fetch-stop').disabled = true;
+  document.getElementById('unreg-progress-text').textContent = `取得完了: 全 ${seenUrls.size} 件 / 未登録 ${unregProducts.length} 件`;
+  document.getElementById('unreg-count').textContent = `未登録: ${unregProducts.length} 件`;
+  unregPage = 0;
+  renderUnreg();
+}
+function stopFetchShop() { fetchAbort = true; }
+
+function renderUnreg() {
+  const tbody = document.getElementById('unreg-tbody');
+  tbody.innerHTML = '';
+  const total = unregProducts.length;
+  const totalPages = Math.max(1, Math.ceil(total / UNREG_PER_PAGE));
+  if (unregPage >= totalPages) unregPage = Math.max(0, totalPages - 1);
+  const start = unregPage * UNREG_PER_PAGE;
+  const pageItems = unregProducts.slice(start, start + UNREG_PER_PAGE);
+  const commonC1 = document.getElementById('common-comp1').value.trim();
+  const commonC2 = document.getElementById('common-comp2').value.trim();
+
+  for (let i = 0; i < pageItems.length; i++) {
+    const item = pageItems[i];
+    const idx = start + i;
+    const tr = document.createElement('tr');
+    const itemCode = urlToCode(item.url);
+    tr.innerHTML = `
+      <td>${item.thumbnail_url ? `<img src="${item.thumbnail_url}" style="width:48px;height:48px;object-fit:cover;border-radius:3px;cursor:pointer" onclick="window.open('${escAttr(item.url)}','_blank')" onerror="this.style.display='none'">` : ''}</td>
+      <td style="text-align:left;font-size:12px;max-width:200px;word-break:break-all">${escHtml(item.name)}</td>
+      <td style="text-align:left;font-size:12px;color:#333;word-break:break-all">${escHtml(itemCode)}</td>
+      <td style="text-align:left;font-size:11px;color:#666;max-width:200px;word-break:break-all">${escHtml(item.url)}</td>
+      <td><input type="text" id="unreg-kw-${idx}" style="width:100%;padding:4px 6px;border:1px solid #ccc;border-radius:3px;font-size:12px"></td>
+      <td><input type="text" id="unreg-c1-${idx}" value="${escAttr(commonC1)}" style="width:100%;padding:4px 6px;border:1px solid #ccc;border-radius:3px;font-size:12px"></td>
+      <td><input type="text" id="unreg-c2-${idx}" value="${escAttr(commonC2)}" style="width:100%;padding:4px 6px;border:1px solid #ccc;border-radius:3px;font-size:12px"></td>
+      <td><button class="btn btn-primary btn-sm" onclick="registerFromUnreg(${idx})">登録</button></td>
+    `;
+    tbody.appendChild(tr);
+  }
+  renderPagination('unreg-pagination', unregPage, totalPages, p => { unregPage = p; renderUnreg(); });
+}
+function registerFromUnreg(idx) {
+  const kw = document.getElementById(`unreg-kw-${idx}`).value.trim();
+  if (!kw) return alert('検索ワードを入力してください。');
+  if (products.length >= MAX_PRODUCTS) return alert('登録上限に達しています。');
+  const item = unregProducts[idx];
+  products.push({
+    id: uuid(), keyword: kw, own_url: item.url,
+    competitor1_url: document.getElementById(`unreg-c1-${idx}`).value.trim(),
+    competitor2_url: document.getElementById(`unreg-c2-${idx}`).value.trim(),
+    history: [],
+  });
+  saveData();
+  unregProducts.splice(idx, 1);
+  document.getElementById('unreg-count').textContent = `未登録: ${unregProducts.length} 件`;
+  renderUnreg();
+}
+
+/* ═══ Settings ═══════════════════════════════════════════════════════════ */
+function openSettings() {
+  const cfg = loadConfig();
+  document.getElementById('cfg-appid').value = cfg.applicationId || '';
+  document.getElementById('cfg-accesskey').value = cfg.accessKey || '';
+  document.getElementById('cfg-shopcode').value = cfg.shopCode || '';
+  document.getElementById('cfg-yahoo-appid').value = cfg.yahooAppId || '';
+  document.getElementById('cfg-amazon-access-key').value = cfg.amazonAccessKey || '';
+  document.getElementById('cfg-amazon-secret-key').value = cfg.amazonSecretKey || '';
+  document.getElementById('cfg-amazon-tag').value = cfg.amazonAssociateTag || '';
+  document.getElementById('settings-modal').classList.add('show');
+}
+function closeSettings() { document.getElementById('settings-modal').classList.remove('show'); }
+function saveSettings() {
+  const appId = document.getElementById('cfg-appid').value.trim();
+  const accessKey = document.getElementById('cfg-accesskey').value.trim();
+  const yahooAppId = document.getElementById('cfg-yahoo-appid').value.trim();
+  if (!appId) return alert('楽天アプリケーションIDは必須です。');
+  if (!accessKey) return alert('楽天アクセスキーは必須です。');
+  saveConfig({
+    applicationId: appId, accessKey: accessKey,
+    shopCode: document.getElementById('cfg-shopcode').value.trim(),
+    yahooAppId: yahooAppId,
+    amazonAccessKey: document.getElementById('cfg-amazon-access-key').value.trim(),
+    amazonSecretKey: document.getElementById('cfg-amazon-secret-key').value.trim(),
+    amazonAssociateTag: document.getElementById('cfg-amazon-tag').value.trim(),
+  });
+  alert('API設定を保存しました。');
+  closeSettings();
+}
+
+/* ═══ Pagination ═════════════════════════════════════════════════════════ */
+function renderPagination(containerId, currentPage, totalPages, onPageChange) {
+  const c = document.getElementById(containerId);
+  c.innerHTML = '';
+  const prev = document.createElement('button');
+  prev.className = 'btn btn-secondary btn-sm';
+  prev.textContent = '< 前のページ';
+  prev.disabled = currentPage <= 0;
+  prev.onclick = () => onPageChange(currentPage - 1);
+  c.appendChild(prev);
+  const label = document.createElement('span');
+  label.textContent = `${currentPage + 1} / ${totalPages} ページ`;
+  c.appendChild(label);
+  const next = document.createElement('button');
+  next.className = 'btn btn-secondary btn-sm';
+  next.textContent = '次のページ >';
+  next.disabled = currentPage >= totalPages - 1;
+  next.onclick = () => onPageChange(currentPage + 1);
+  c.appendChild(next);
+}
+
+/* ═══ Utility ════════════════════════════════════════════════════════════ */
+function escHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function escAttr(s) { return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;'); }
+function downloadFile(content, filename, type) {
+  const blob = new Blob([content], { type: type + ';charset=utf-8' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = filename; a.click(); URL.revokeObjectURL(a.href);
+}
+
+/* ═══ Init ═══════════════════════════════════════════════════════════════ */
+(async function init() {
+  await loadData();
+  await loadConfigAsync();
+  // 既存データのマイグレーション: product_codeがなければown_urlから抽出
+  let updated = false;
+  for (const p of products) {
+    if (!p.product_code && p.own_url) {
+      const code = urlToCode(p.own_url);
+      if (code) { p.product_code = code; updated = true; }
+    }
+  }
+  if (updated) saveData();
+  updateRegCount();
+})();
+</script>
+</body>
+</html>
