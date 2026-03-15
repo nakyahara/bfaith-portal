@@ -295,7 +295,7 @@ app.get('/admin/users', requireAdmin, (req, res) => {
 });
 
 app.post('/admin/users/add', requireAdmin, (req, res) => {
-  const { email, displayName, password, role } = req.body;
+  const { email, displayName, password, role, allowedApps } = req.body;
 
   if (!email || !displayName || !password) {
     return res.redirect('/admin/users?error=' + encodeURIComponent('全項目を入力してください'));
@@ -307,12 +307,18 @@ app.post('/admin/users/add', requireAdmin, (req, res) => {
     return res.redirect('/admin/users?error=' + encodeURIComponent('パスワードは6文字以上で設定してください'));
   }
 
+  const parsedRole = role || 'user';
+  const parsedApps = parsedRole === 'admin' ? '*'
+    : Array.isArray(allowedApps) ? allowedApps
+    : allowedApps ? [allowedApps]
+    : [];
+
   users.push({
     email: email.toLowerCase(),
     passwordHash: bcrypt.hashSync(password, 10),
     displayName,
-    role: role || 'user',
-    allowedApps: [],
+    role: parsedRole,
+    allowedApps: parsedApps,
   });
   saveUsers(users);
   res.redirect('/admin/users?success=' + encodeURIComponent(`${displayName} を追加しました`));
@@ -330,6 +336,17 @@ app.post('/admin/users/delete', requireAdmin, (req, res) => {
   const removed = users.splice(idx, 1)[0];
   saveUsers(users);
   res.redirect('/admin/users?success=' + encodeURIComponent(`${removed.displayName} を削除しました`));
+});
+
+// ユーザー別の権限更新（Ajax）
+app.post('/admin/users/permissions', requireAdmin, express.json(), (req, res) => {
+  const { email, allowedApps } = req.body;
+  const user = users.find(u => u.email === email);
+  if (!user) return res.status(404).json({ error: 'ユーザーが見つかりません' });
+  if (user.role === 'admin') return res.status(400).json({ error: '管理者の権限は変更できません' });
+  user.allowedApps = Array.isArray(allowedApps) ? allowedApps : [];
+  saveUsers(users);
+  res.json({ ok: true });
 });
 
 app.post('/admin/users/reset-password', requireAdmin, (req, res) => {

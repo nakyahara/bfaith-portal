@@ -5,6 +5,63 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ユーザー管理 - B-Faith Portal</title>
   <link rel="stylesheet" href="/style.css">
+  <style>
+    .apps-checkboxes {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .apps-checkboxes label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .apps-checkboxes input[type="checkbox"] {
+      width: 16px;
+      height: 16px;
+      cursor: pointer;
+    }
+    .btn-perm-save {
+      margin-top: 8px;
+      padding: 4px 12px;
+      font-size: 12px;
+      background: #2563eb;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .btn-perm-save:hover {
+      background: #1d4ed8;
+    }
+    .perm-saved {
+      display: inline-block;
+      color: #16a34a;
+      font-size: 12px;
+      margin-left: 8px;
+      opacity: 0;
+      transition: opacity 0.3s;
+    }
+    .perm-saved.show {
+      opacity: 1;
+    }
+    .add-apps-checkboxes {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 4px;
+    }
+    .add-apps-checkboxes label {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+  </style>
 </head>
 <body>
   <header class="portal-header">
@@ -14,7 +71,6 @@
     </div>
     <div class="header-right">
       <span class="user-name"><%= displayName %></span>
-      <a href="/admin/permissions" class="btn-admin">権限管理</a>
       <a href="/logout" class="btn-logout">ログアウト</a>
     </div>
   </header>
@@ -54,7 +110,18 @@
             </select>
           </div>
         </div>
-        <button type="submit" class="btn-save">追加</button>
+        <div class="form-group">
+          <label>アクセス可能アプリ</label>
+          <div class="add-apps-checkboxes">
+            <% apps.forEach(app => { %>
+              <label>
+                <input type="checkbox" name="allowedApps" value="<%= app.id %>">
+                <%= app.icon %> <%= app.name %>
+              </label>
+            <% }) %>
+          </div>
+        </div>
+        <button type="submit" class="btn-save" style="margin-top: 12px;">追加</button>
       </form>
     </div>
 
@@ -77,17 +144,23 @@
             <td><%= user.email %></td>
             <td><span class="role-badge role-<%= user.role %>"><%= user.role === 'admin' ? '管理者' : '一般' %></span></td>
             <td>
-              <% if (user.allowedApps === '*') { %>
+              <% if (user.role === 'admin') { %>
                 <span class="role-badge role-admin">全アプリ</span>
-              <% } else if (Array.isArray(user.allowedApps) && user.allowedApps.length > 0) { %>
-                <% user.allowedApps.forEach(appId => { %>
-                  <% const appInfo = apps.find(a => a.id === appId); %>
-                  <% if (appInfo) { %>
-                    <span class="app-tag"><%= appInfo.icon %> <%= appInfo.name %></span>
-                  <% } %>
-                <% }) %>
               <% } else { %>
-                <span style="color: #999; font-size: 13px;">なし</span>
+                <form class="perm-form" data-email="<%= user.email %>">
+                  <div class="apps-checkboxes">
+                    <% apps.forEach(app => { %>
+                      <label>
+                        <input type="checkbox" value="<%= app.id %>"
+                          <%= (Array.isArray(user.allowedApps) && user.allowedApps.includes(app.id)) ? 'checked' : '' %>
+                        >
+                        <%= app.icon %> <%= app.name %>
+                      </label>
+                    <% }) %>
+                  </div>
+                  <button type="submit" class="btn-perm-save">保存</button>
+                  <span class="perm-saved">保存しました</span>
+                </form>
               <% } %>
             </td>
             <td>
@@ -115,5 +188,29 @@
       </tbody>
     </table>
   </main>
+
+  <script>
+    document.querySelectorAll('.perm-form').forEach(form => {
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const email = form.dataset.email;
+        const checked = [...form.querySelectorAll('input[type="checkbox"]:checked')].map(cb => cb.value);
+        try {
+          const res = await fetch('/admin/users/permissions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email, allowedApps: checked }),
+          });
+          if (res.ok) {
+            const msg = form.querySelector('.perm-saved');
+            msg.classList.add('show');
+            setTimeout(() => msg.classList.remove('show'), 2000);
+          }
+        } catch (err) {
+          alert('保存に失敗しました');
+        }
+      });
+    });
+  </script>
 </body>
 </html>
