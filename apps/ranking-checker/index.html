@@ -1260,7 +1260,7 @@ function parseCSVLine(line) {
 /* ═══ CSV Export ══════════════════════════════════════════════════════════ */
 function exportCSV() {
   const header = [
-    '検索ワード','楽天URL','Yahoo!URL','Amazon ASIN','チェック日',
+    '商品コード','検索ワード','楽天URL','Yahoo!URL','Amazon ASIN','チェック日',
     '楽天順位','楽天1-2日前','楽天3-10日前','楽天11-30日前','楽天31-90日前','楽天91-180日前',
     'Yahoo!順位','Yahoo!1-2日前','Yahoo!3-10日前','Yahoo!11-30日前','Yahoo!31-90日前','Yahoo!91-180日前',
     'Amazon順位','Amazon1-2日前','Amazon3-10日前','Amazon11-30日前','Amazon31-90日前','Amazon91-180日前',
@@ -1273,8 +1273,9 @@ function exportCSV() {
     const h = p.history;
     const av = (f,s,e) => { const v = calcAvgRank(h,f,s,e); return v !== null ? v : ''; };
     const amzAsin = getAmazonAsin(p);
+    const code = p.product_code || urlToCode(getRakutenUrl(p));
     rows.push([
-      p.keyword, getRakutenUrl(p), getYahooUrl(p), amzAsin, latest ? latest.date : '',
+      code, p.keyword, getRakutenUrl(p), getYahooUrl(p), amzAsin, latest ? latest.date : '',
       latest ? displayRank(latest.own_rank) : '',
       av('own_rank',1,2),av('own_rank',3,10),av('own_rank',11,30),av('own_rank',31,90),av('own_rank',91,180),
       latest&&getYahooUrl(p) ? displayRank(latest.yahoo_own_rank) : '',
