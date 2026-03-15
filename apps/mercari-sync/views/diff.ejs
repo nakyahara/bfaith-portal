@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>差分チェック - 楽天→メルカリShops</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+  <style>
+    .product-thumb { width: 60px; height: 60px; object-fit: cover; border-radius: 4px; }
+    .nav-tabs-sm .nav-link { font-size: 0.85rem; padding: 0.4rem 0.8rem; }
+  </style>
+</head>
+<body>
+  <nav class="navbar navbar-dark bg-danger px-3">
+    <a class="navbar-brand fw-bold" href="/apps/mercari-sync/">楽天→メルカリShops 登録ツール</a>
+    <div class="ms-auto d-flex align-items-center gap-2">
+      <a href="/apps/mercari-sync/" class="btn btn-outline-light btn-sm">差分チェック</a>
+      <a href="/apps/mercari-sync/settings" class="btn btn-outline-light btn-sm">設定</a>
+      <a href="/" class="btn btn-outline-light btn-sm">ポータルに戻る</a>
+    </div>
+  </nav>
+  <div class="container py-4">
+
+<% if (mode === 'csv') { %>
+<div class="alert alert-success d-flex align-items-center mb-3 py-2">
+  <strong class="me-2">CSVモード</strong>
+  <span class="text-muted small">楽天の商品をメルカリShops一括登録用CSVとしてエクスポートします</span>
+  <a href="/apps/mercari-sync/settings" class="btn btn-outline-secondary btn-sm ms-auto">モード変更</a>
+</div>
+<% } else { %>
+<div class="alert alert-primary d-flex align-items-center mb-3 py-2">
+  <strong class="me-2">APIモード</strong>
+  <span class="text-muted small">メルカリShops APIで直接登録します</span>
+  <a href="/apps/mercari-sync/settings" class="btn btn-outline-secondary btn-sm ms-auto">モード変更</a>
+</div>
+<% } %>
+
+<h2 class="mb-1">差分チェック</h2>
+<p class="text-muted mb-4">楽天に登録済みでメルカリShopsに未登録の商品を洗い出します。</p>
+
+<% if (mode === 'csv') { %>
+<div class="card mb-3" id="registeredSection">
+  <div class="card-body">
+    <div class="d-flex align-items-center mb-2">
+      <h6 class="mb-0">登録済み商品データ管理</h6>
+      <span class="badge bg-primary ms-2" id="registeredCount"><%= registered_count %>件</span>
+    </div>
+    <p class="text-muted small mb-3">
+      メルカリShopsに登録済みの商品コードをここで管理します。差分チェック時にこのデータと照合し、未登録商品のみ表示します。
+      CSVエクスポート時には自動で登録済みに追加されます。
+    </p>
+    <ul class="nav nav-tabs nav-tabs-sm mb-3" role="tablist">
+      <li class="nav-item"><button class="nav-link active small" data-bs-toggle="tab" data-bs-target="#tabMercariCsv">メルカリCSV取込</button></li>
+      <li class="nav-item"><button class="nav-link small" data-bs-toggle="tab" data-bs-target="#tabGenericCsv">別システムCSV取込</button></li>
+      <li class="nav-item"><button class="nav-link small" data-bs-toggle="tab" data-bs-target="#tabManage">データ管理</button></li>
+    </ul>
+    <div class="tab-content">
+      <div class="tab-pane fade show active" id="tabMercariCsv">
+        <p class="text-muted small mb-2">メルカリShops管理画面からエクスポートしたCSVをアップロードします（SKU商品管理コード列を自動検出）。複数回アップロード可能（追記型）。</p>
+        <div class="d-flex align-items-center gap-3">
+          <input type="file" class="form-control form-control-sm" id="mercariCsvFile" accept=".csv" style="max-width:400px">
+          <button class="btn btn-outline-secondary btn-sm" id="btnUploadMercariCsv">取込</button>
+          <span id="mercariUploadResult" class="small"></span>
+        </div>
+      </div>
+      <div class="tab-pane fade" id="tabGenericCsv">
+        <p class="text-muted small mb-2">別の管理システムからエクスポートしたCSVを取り込みます。商品コード列は自動検出しますが、見つからない場合は列名を指定できます。</p>
+        <div class="d-flex align-items-center gap-3 flex-wrap">
+          <input type="file" class="form-control form-control-sm" id="genericCsvFile" accept=".csv" style="max-width:350px">
+          <input type="text" class="form-control form-control-sm" id="genericCsvColumn" placeholder="列名（空欄で自動検出）" style="max-width:200px">
+          <button class="btn btn-outline-secondary btn-sm" id="btnUploadGenericCsv">取込</button>
+        </div>
+        <div id="genericUploadResult" class="small mt-2"></div>
+      </div>
+      <div class="tab-pane fade" id="tabManage">
+        <p class="text-muted small mb-2">登録済みデータの管理。クリアすると全件削除されます（楽天データには影響しません）。</p>
+        <div class="d-flex align-items-center gap-3">
+          <button class="btn btn-outline-danger btn-sm" id="btnClearRegistered">全データクリア</button>
+          <span id="manageResult" class="small"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<% } %>
+
+<div class="card mb-4">
+  <div class="card-body d-flex align-items-center gap-3 flex-wrap">
+    <button class="btn btn-danger btn-lg px-4" id="btnCheck">差分チェック実行</button>
+    <span id="checkStatus" class="text-muted"></span>
+    <div id="summaryBadges" class="d-none ms-auto">
+      <span class="badge bg-secondary me-1" id="badgeRakuten"></span>
+      <span class="badge bg-warning text-dark me-1" id="badgeMercari"></span>
+      <span class="badge bg-dark me-1 d-none" id="badgeExcluded"></span>
+      <span class="badge bg-info me-1 d-none" id="badgeSkuMatched"></span>
+      <span class="badge bg-danger" id="badgeDiff"></span>
+    </div>
+  </div>
+</div>
+
+<div id="resultSection" class="d-none">
+  <div class="d-flex align-items-center mb-3 gap-3">
+    <h5 class="mb-0">未登録商品一覧</h5>
+    <div class="ms-auto d-flex gap-2">
+      <button class="btn btn-outline-secondary btn-sm" id="btnSelectAll">全選択</button>
+      <button class="btn btn-outline-secondary btn-sm" id="btnDeselectAll">全解除</button>
+      <% if (mode === 'csv') { %>
+      <button class="btn btn-success px-4" id="btnAction" disabled>CSVダウンロード</button>
+      <% } else { %>
+      <button class="btn btn-danger px-4" id="btnAction" disabled>選択した商品をメルカリに登録</button>
+      <% } %>
+    </div>
+  </div>
+  <div id="selectedCount" class="text-muted small mb-2">0件選択中</div>
+  <div class="table-responsive">
+    <table class="table table-hover align-middle">
+      <thead class="table-light">
+        <tr>
+          <th style="width:40px"><input type="checkbox" id="chkAll"></th>
+          <th style="width:80px">画像</th>
+          <th>商品名</th>
+          <% if (mode === 'csv') { %>
+          <th style="width:130px">商品管理番号</th>
+          <th style="width:80px">SKU数</th>
+          <% } else { %>
+          <th style="width:130px">SKU管理番号</th>
+          <% } %>
+          <th style="width:110px">価格</th>
+          <th style="width:80px">在庫</th>
+        </tr>
+      </thead>
+      <tbody id="diffTableBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="modal fade" id="progressModal" tabindex="-1" data-bs-backdrop="static">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-body text-center py-4">
+        <div class="spinner-border text-danger mb-3" role="status"></div>
+        <p class="mb-1 fw-bold" id="progressTitle">処理中…</p>
+        <p class="text-muted small" id="progressText"></p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal fade" id="resultModal" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header"><h5 class="modal-title">登録結果</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+      <div class="modal-body" id="resultModalBody"></div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">閉じる</button>
+        <button type="button" class="btn btn-danger" onclick="location.reload()">差分チェックに戻る</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal fade" id="csvResultModal" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header bg-success text-white"><h5 class="modal-title">CSVエクスポート完了</h5><button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div>
+      <div class="modal-body">
+        <div class="alert alert-success" id="csvSuccessMsg"></div>
+        <div id="csvWarnings" class="d-none">
+          <h6 class="text-warning">注意事項</h6>
+          <ul id="csvWarningList" class="list-group mb-3"></ul>
+        </div>
+        <div class="mt-3">
+          <h6>次のステップ</h6>
+          <ol class="mb-0">
+            <li>ダウンロードされたCSVファイルを確認</li>
+            <li>メルカリShops管理画面 → 「出品・商品一覧」→「CSV一括登録」を開く</li>
+            <li>CSVファイルをアップロード</li>
+            <li>内容を確認して「一括で登録する」を選択</li>
+          </ol>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">閉じる</button>
+        <button type="button" class="btn btn-success" onclick="location.reload()">差分チェックに戻る</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script>
+const BASE = '/apps/mercari-sync';
+const currentMode = '<%= mode %>';
+let diffItems = [];
+
+function updateRegisteredCount(count) {
+  const el = document.getElementById('registeredCount');
+  if (el) el.textContent = count + '件';
+}
+
+<% if (mode === 'csv') { %>
+document.getElementById('btnUploadMercariCsv')?.addEventListener('click', async () => {
+  const fileInput = document.getElementById('mercariCsvFile');
+  const resultEl = document.getElementById('mercariUploadResult');
+  if (!fileInput.files.length) { resultEl.innerHTML = '<span class="text-danger">ファイルを選択してください</span>'; return; }
+  const formData = new FormData();
+  formData.append('file', fileInput.files[0]);
+  resultEl.innerHTML = '<span class="text-muted">読み込み中…</span>';
+  try {
+    const res = await fetch(BASE + '/api/upload-mercari-csv', {method: 'POST', body: formData});
+    const data = await res.json();
+    if (data.error) { resultEl.innerHTML = `<span class="text-danger">${escapeHtml(data.error)}</span>`; }
+    else { resultEl.innerHTML = `<span class="text-success fw-bold">${escapeHtml(data.message)}</span>`; updateRegisteredCount(data.total); }
+  } catch(e) { resultEl.innerHTML = `<span class="text-danger">エラー: ${e.message}</span>`; }
+});
+
+document.getElementById('btnUploadGenericCsv')?.addEventListener('click', async () => {
+  const fileInput = document.getElementById('genericCsvFile');
+  const columnInput = document.getElementById('genericCsvColumn');
+  const resultEl = document.getElementById('genericUploadResult');
+  if (!fileInput.files.length) { resultEl.innerHTML = '<span class="text-danger">ファイルを選択してください</span>'; return; }
+  const formData = new FormData();
+  formData.append('file', fileInput.files[0]);
+  formData.append('column_name', columnInput.value.trim());
+  resultEl.innerHTML = '<span class="text-muted">読み込み中…</span>';
+  try {
+    const res = await fetch(BASE + '/api/import-registered-csv', {method: 'POST', body: formData});
+    const data = await res.json();
+    if (data.error) {
+      let html = `<span class="text-danger">${escapeHtml(data.error)}</span>`;
+      if (data.messages) { html += '<ul class="mt-1 mb-0 small">'; data.messages.forEach(m => html += `<li>${escapeHtml(m)}</li>`); html += '</ul>'; }
+      resultEl.innerHTML = html;
+    } else {
+      let html = `<span class="text-success fw-bold">${escapeHtml(data.message)}</span>`;
+      if (data.messages) { html += '<ul class="mt-1 mb-0 small text-muted">'; data.messages.forEach(m => html += `<li>${escapeHtml(m)}</li>`); html += '</ul>'; }
+      resultEl.innerHTML = html;
+      updateRegisteredCount(data.total);
+    }
+  } catch(e) { resultEl.innerHTML = `<span class="text-danger">エラー: ${e.message}</span>`; }
+});
+
+document.getElementById('btnClearRegistered')?.addEventListener('click', async () => {
+  if (!confirm('登録済みデータを全件クリアしますか？\n（楽天の商品データには影響しません）')) return;
+  const resultEl = document.getElementById('manageResult');
+  try {
+    const res = await fetch(BASE + '/api/registered-items/clear', {method: 'POST'});
+    const data = await res.json();
+    resultEl.innerHTML = `<span class="text-success">${escapeHtml(data.message)}</span>`;
+    updateRegisteredCount(0);
+  } catch(e) { resultEl.innerHTML = `<span class="text-danger">エラー: ${e.message}</span>`; }
+});
+<% } %>
+
+document.getElementById('btnCheck').addEventListener('click', async () => {
+  const statusEl = document.getElementById('checkStatus');
+  statusEl.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>チェック中（楽天の全商品を取得しています。数分かかる場合があります）';
+  document.getElementById('btnCheck').disabled = true;
+  document.getElementById('resultSection').classList.add('d-none');
+  document.getElementById('summaryBadges').classList.add('d-none');
+  try {
+    let res;
+    if (currentMode === 'csv') {
+      res = await fetch(BASE + '/api/check-csv', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
+    } else {
+      res = await fetch(BASE + '/api/check', {method:'POST'});
+    }
+    const data = await res.json();
+    if (data.error) { statusEl.innerHTML = `<span class="text-danger">エラー: ${escapeHtml(data.error)}</span>`; return; }
+    diffItems = data.diff_items || [];
+    statusEl.innerHTML = `<span class="text-success">チェック完了</span>`;
+    document.getElementById('badgeRakuten').textContent = `楽天: ${data.rakuten_total}件`;
+    document.getElementById('badgeMercari').textContent = currentMode === 'csv' ? `登録済み: ${data.registered_total}件` : `メルカリ: ${data.mercari_total}件`;
+    document.getElementById('badgeDiff').textContent = `未登録: ${data.diff_count}件`;
+    const excludedBadge = document.getElementById('badgeExcluded');
+    if (data.excluded_count > 0) { excludedBadge.textContent = `除外: ${data.excluded_count}件`; excludedBadge.classList.remove('d-none'); } else { excludedBadge.classList.add('d-none'); }
+    const skuMatchedBadge = document.getElementById('badgeSkuMatched');
+    if (data.sku_matched_count > 0) { skuMatchedBadge.textContent = `SKU照合済: ${data.sku_matched_count}件`; skuMatchedBadge.classList.remove('d-none'); } else { skuMatchedBadge.classList.add('d-none'); }
+    document.getElementById('summaryBadges').classList.remove('d-none');
+    renderTable(diffItems);
+    document.getElementById('resultSection').classList.remove('d-none');
+  } catch(e) { statusEl.innerHTML = `<span class="text-danger">エラー: ${e.message}</span>`; }
+  finally { document.getElementById('btnCheck').disabled = false; }
+});
+
+function renderTable(items) {
+  const tbody = document.getElementById('diffTableBody');
+  if (items.length === 0) { const c = currentMode === 'csv' ? 7 : 6; tbody.innerHTML = `<tr><td colspan="${c}" class="text-center text-muted py-4">未登録商品はありません</td></tr>`; return; }
+  if (currentMode === 'csv') {
+    tbody.innerHTML = items.map((item, i) => `<tr><td><input type="checkbox" class="item-check" data-idx="${i}" onchange="updateButtons()"></td><td>${item.image_url ? `<img src="${escapeHtml(item.image_url)}" class="product-thumb" onerror="this.style.display='none'">` : '<span class="text-muted small">なし</span>'}</td><td><span class="fw-bold">${escapeHtml(item.name)}</span>${item.has_price_diff ? `<br><small class="text-warning">価格差あり: ${escapeHtml(item.price_range)}</small>` : ''}</td><td><code class="small">${escapeHtml(item.item_code)}</code></td><td><span class="badge ${item.over_10_skus ? 'bg-warning text-dark' : 'bg-info'}">${item.sku_count} SKU</span>${item.over_10_skus ? `<br><small class="text-warning">10超: ${Math.ceil(item.sku_count/10)}商品に分割</small>` : ''}</td><td>¥${Number(item.price).toLocaleString()}</td><td>${item.inventory}</td></tr>`).join('');
+  } else {
+    tbody.innerHTML = items.map((item, i) => `<tr><td><input type="checkbox" class="item-check" data-idx="${i}" onchange="updateButtons()"></td><td>${item.image_url ? `<img src="${escapeHtml(item.image_url)}" class="product-thumb" onerror="this.style.display='none'">` : '<span class="text-muted small">なし</span>'}</td><td><span class="fw-bold">${escapeHtml(item.name)}</span></td><td><code class="small">${escapeHtml(item.sku_code)}</code></td><td>¥${Number(item.price).toLocaleString()}</td><td>${item.inventory}</td></tr>`).join('');
+  }
+  updateButtons();
+}
+
+function updateButtons() {
+  const checked = document.querySelectorAll('.item-check:checked');
+  const total = document.querySelectorAll('.item-check');
+  document.getElementById('selectedCount').textContent = `${checked.length}件選択中`;
+  document.getElementById('btnAction').disabled = checked.length === 0;
+  document.getElementById('chkAll').indeterminate = checked.length > 0 && checked.length < total.length;
+  document.getElementById('chkAll').checked = checked.length === total.length && total.length > 0;
+}
+
+document.getElementById('chkAll').addEventListener('change', (e) => { document.querySelectorAll('.item-check').forEach(cb => cb.checked = e.target.checked); updateButtons(); });
+document.getElementById('btnSelectAll').addEventListener('click', () => { document.querySelectorAll('.item-check').forEach(cb => cb.checked = true); updateButtons(); });
+document.getElementById('btnDeselectAll').addEventListener('click', () => { document.querySelectorAll('.item-check').forEach(cb => cb.checked = false); updateButtons(); });
+
+document.getElementById('btnAction').addEventListener('click', async () => {
+  if (currentMode === 'csv') await runCsvExport();
+  else await runApiRegister();
+});
+
+async function runCsvExport() {
+  const checked = document.querySelectorAll('.item-check:checked');
+  const selectedItems = Array.from(checked).map(cb => diffItems[parseInt(cb.dataset.idx)]);
+  const itemCodes = selectedItems.map(item => item.item_code);
+  const manageNumbers = {};
+  selectedItems.forEach(item => { manageNumbers[item.item_code] = item._manage_number || item.item_code; });
+  const modal = new bootstrap.Modal(document.getElementById('progressModal'));
+  document.getElementById('progressTitle').textContent = 'CSVエクスポート中…';
+  document.getElementById('progressText').textContent = `${itemCodes.length}件の商品データを変換しています`;
+  modal.show();
+  try {
+    const res = await fetch(BASE + '/api/export-csv', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({item_codes:itemCodes,manage_numbers:manageNumbers})});
+    modal.hide();
+    const contentType = res.headers.get('content-type') || '';
+    if (contentType.includes('application/json')) { const data = await res.json(); if (data.error) { alert('エラー: ' + data.error); return; } }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = contentType.includes('zip') ? 'mercari_import.zip' : 'mercari_import.csv';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+    const exportCount = res.headers.get('X-Export-Count') || itemCodes.length;
+    const warningCount = res.headers.get('X-Warning-Count') || '0';
+    document.getElementById('csvSuccessMsg').textContent = `${exportCount}件の商品データをCSVにエクスポートしました。`;
+    if (parseInt(warningCount) > 0) { document.getElementById('csvWarnings').classList.remove('d-none'); document.getElementById('csvWarningList').innerHTML = `<li class="list-group-item list-group-item-warning">${warningCount}件の注意事項があります。</li>`; }
+    else { document.getElementById('csvWarnings').classList.add('d-none'); }
+    try { const countRes = await fetch(BASE + '/api/registered-items/count'); const countData = await countRes.json(); updateRegisteredCount(countData.count); } catch(e) {}
+    new bootstrap.Modal(document.getElementById('csvResultModal')).show();
+  } catch(e) { modal.hide(); alert('CSVエクスポート中にエラー: ' + e.message); }
+}
+
+async function runApiRegister() {
+  const checked = document.querySelectorAll('.item-check:checked');
+  const skuCodes = Array.from(checked).map(cb => diffItems[parseInt(cb.dataset.idx)].sku_code);
+  const modal = new bootstrap.Modal(document.getElementById('progressModal'));
+  document.getElementById('progressTitle').textContent = 'メルカリShopsに登録中…';
+  document.getElementById('progressText').textContent = `0 / ${skuCodes.length} 件完了`;
+  modal.show();
+  try {
+    const res = await fetch(BASE + '/api/register', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sku_codes:skuCodes})});
+    const data = await res.json();
+    modal.hide();
+    showApiResult(data, skuCodes.length);
+  } catch(e) { modal.hide(); alert('登録中にエラー: ' + e.message); }
+}
+
+function showApiResult(data, total) {
+  const success = data.success || [], failure = data.failure || [];
+  let html = `<div class="alert ${failure.length === 0 ? 'alert-success' : 'alert-warning'}"><strong>成功: ${success.length}件 / 失敗: ${failure.length}件</strong>（合計 ${total}件）</div>`;
+  if (failure.length > 0) { html += '<h6 class="text-danger">失敗した商品</h6><ul class="list-group mb-3">'; failure.forEach(f => { html += `<li class="list-group-item list-group-item-danger"><code>${escapeHtml(f.code)}</code> — ${escapeHtml(f.error)}</li>`; }); html += '</ul>'; }
+  if (success.length > 0) { html += '<h6 class="text-success">成功した商品</h6><ul class="list-group">'; success.forEach(s => { html += `<li class="list-group-item list-group-item-success"><code>${escapeHtml(s.code)}</code> ${escapeHtml(s.name)}</li>`; }); html += '</ul>'; }
+  document.getElementById('resultModalBody').innerHTML = html;
+  new bootstrap.Modal(document.getElementById('resultModal')).show();
+}
+
+function escapeHtml(str) { return String(str||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+  </script>
+</body>
+</html>

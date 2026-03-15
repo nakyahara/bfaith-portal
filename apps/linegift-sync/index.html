@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>楽天→LINEギフト 商品同期ツール</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family:"Segoe UI","Hiragino Sans","Meiryo",sans-serif; background:#f5f5f5; color:#333; }
+.header { background:linear-gradient(135deg,#BF0000,#06C755); color:#fff; padding:16px 24px; display:flex; align-items:center; gap:12px; }
+.header h1 { font-size:20px; }
+.header .badge { background:rgba(255,255,255,0.25); padding:4px 10px; border-radius:12px; font-size:12px; }
+.tabs { display:flex; background:#fff; border-bottom:2px solid #e0e0e0; overflow-x:auto; }
+.tab { padding:12px 20px; cursor:pointer; border-bottom:3px solid transparent; white-space:nowrap; font-weight:500; transition:all 0.2s; }
+.tab:hover { background:#f0f0f0; }
+.tab.active { border-bottom-color:#BF0000; color:#BF0000; font-weight:700; }
+.panel { display:none; padding:24px; max-width:1400px; margin:0 auto; }
+.panel.active { display:block; }
+.card { background:#fff; border-radius:8px; box-shadow:0 2px 8px rgba(0,0,0,0.08); padding:20px; margin-bottom:16px; }
+.card h2 { font-size:16px; margin-bottom:12px; padding-bottom:8px; border-bottom:1px solid #eee; }
+label { display:block; font-weight:500; margin-bottom:4px; font-size:14px; }
+input[type=text],input[type=number],select,textarea { width:100%; padding:8px 12px; border:1px solid #ccc; border-radius:6px; font-size:14px; margin-bottom:12px; }
+textarea { min-height:80px; resize:vertical; }
+button { padding:8px 16px; border:none; border-radius:6px; cursor:pointer; font-size:14px; font-weight:500; transition:background 0.2s; }
+.btn-primary { background:#BF0000; color:#fff; }
+.btn-primary:hover { background:#a00; }
+.btn-green { background:#06C755; color:#fff; }
+.btn-green:hover { background:#05a847; }
+.btn-secondary { background:#6c757d; color:#fff; }
+.btn-secondary:hover { background:#545b62; }
+.btn-danger { background:#dc3545; color:#fff; }
+.btn-danger:hover { background:#c82333; }
+.badge-new { background:#06C755; color:#fff; padding:2px 8px; border-radius:10px; font-size:12px; }
+.badge-exist { background:#2196F3; color:#fff; padding:2px 8px; border-radius:10px; font-size:12px; }
+.badge-exclude { background:#dc3545; color:#fff; padding:2px 8px; border-radius:10px; font-size:12px; }
+.badge-warn { background:#ff9800; color:#fff; padding:2px 6px; border-radius:10px; font-size:11px; margin-left:4px; }
+.cat-suggest { position:absolute; top:100%; left:0; right:0; background:#fff; border:1px solid #ccc; border-radius:0 0 6px 6px; max-height:200px; overflow-y:auto; z-index:100; box-shadow:0 4px 12px rgba(0,0,0,0.15); }
+.cat-suggest-item { padding:6px 12px; cursor:pointer; font-size:13px; border-bottom:1px solid #f0f0f0; }
+.cat-suggest-item:hover { background:#e3f2fd; }
+.cat-suggest-item .cat-code { font-weight:700; color:#BF0000; }
+.cat-suggest-item .cat-name { color:#666; margin-left:8px; }
+.stats { display:flex; gap:16px; margin-bottom:16px; flex-wrap:wrap; }
+.stat-box { background:#fff; border-radius:8px; padding:16px; text-align:center; min-width:120px; box-shadow:0 2px 4px rgba(0,0,0,0.06); }
+.stat-box .num { font-size:28px; font-weight:700; }
+.stat-box .lbl { font-size:12px; color:#666; margin-top:4px; }
+table { width:100%; border-collapse:collapse; font-size:13px; }
+th { background:#f8f8f8; text-align:left; padding:8px 10px; border-bottom:2px solid #ddd; position:sticky; top:0; }
+td { padding:8px 10px; border-bottom:1px solid #eee; }
+tr:hover { background:#fafafa; }
+.table-wrap { max-height:500px; overflow:auto; border:1px solid #ddd; border-radius:6px; }
+.drop-zone { border:2px dashed #ccc; border-radius:8px; padding:40px; text-align:center; color:#999; transition:all 0.2s; cursor:pointer; }
+.drop-zone:hover,.drop-zone.dragover { border-color:#BF0000; color:#BF0000; background:#fff5f5; }
+.progress-bar { width:100%; height:6px; background:#e0e0e0; border-radius:3px; overflow:hidden; margin:8px 0; }
+.progress-fill { height:100%; background:linear-gradient(90deg,#BF0000,#06C755); transition:width 0.3s; }
+.flex-row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+.flex-row > * { flex:1; min-width:200px; }
+.msg { padding:12px; border-radius:6px; margin:8px 0; }
+.msg-info { background:#e3f2fd; color:#1565c0; }
+.msg-warn { background:#fff3e0; color:#e65100; }
+.msg-ok { background:#e8f5e9; color:#2e7d32; }
+.filter-btn { padding:6px 14px; border:1px solid #ddd; background:#fff; border-radius:16px; cursor:pointer; font-size:13px; margin-right:4px; }
+.filter-btn.active { background:#BF0000; color:#fff; border-color:#BF0000; }
+.toast { position:fixed; bottom:20px; right:20px; background:#333; color:#fff; padding:12px 20px; border-radius:8px; z-index:9999; animation:fadeIn 0.3s; }
+@keyframes fadeIn { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>楽天 → LINEギフト 商品同期ツール</h1>
+  <span class="badge">全機能統合版</span>
+</div>
+<div class="tabs" id="tabBar">
+  <div class="tab active" onclick="switchTab('settings')">設定</div>
+  <div class="tab" onclick="switchTab('rakuten')">楽天商品</div>
+  <div class="tab" onclick="switchTab('linegift')">既存LINEギフト</div>
+  <div class="tab" onclick="switchTab('diff')">差分比較</div>
+  <div class="tab" onclick="switchTab('exclude')">除外管理</div>
+  <div class="tab" onclick="switchTab('catmap')">カテゴリマッピング</div>
+  <div class="tab" onclick="switchTab('csvout')">CSV出力</div>
+  <div class="tab" onclick="switchTab('images')">画像管理</div>
+</div>
+
+<div class="panel active" id="panel-settings">
+  <div class="card"><h2>楽天RMS API設定</h2>
+    <div class="flex-row">
+      <div><label>serviceSecret</label><input type="text" id="apiServiceSecret" placeholder="RMS APIのserviceSecret"></div>
+      <div><label>licenseKey</label><input type="text" id="apiLicenseKey" placeholder="RMS APIのlicenseKey"></div>
+    </div>
+    <div style="max-width:420px;margin-top:4px"><label>楽天店舗スラッグ（画像URL生成に必須）</label><input type="text" id="shopSlug" placeholder="例: b-faith（https://www.rakuten.co.jp/b-faith/ の b-faith 部分）"></div>
+    <p style="font-size:12px;color:#888">RMS管理画面 → API設定 から取得できます</p>
+  </div>
+  <div class="card"><h2>商品コード変換ルール</h2>
+    <div class="flex-row">
+      <div><label>変換方法</label>
+        <select id="codeConvertMode" onchange="toggleCodeOptions()">
+          <option value="same">そのまま使用</option>
+          <option value="prefix">プレフィックス付与</option>
+          <option value="replace">置換ルール</option>
+        </select>
+      </div>
+      <div id="prefixOpt" style="display:none"><label>プレフィックス</label><input type="text" id="codePrefix" placeholder="LG-"></div>
+      <div id="replaceOpt" style="display:none"><label>置換ルール (1行1ルール: 検索文字列=置換文字列)</label><textarea id="codeReplaceRules" placeholder="ABC=XYZ"></textarea></div>
+    </div>
+  </div>
+  <div class="card"><h2>配送方法マッピング</h2>
+    <p style="margin-bottom:8px;color:#666">楽天の配送方法をLINEギフトの配送方法に対応付けます。マッチしない場合はデフォルトが使われます。</p>
+    <div class="msg msg-info" style="margin-bottom:12px;font-size:13px">⚠ 楽天RMS検索APIは配送方法を返しません。楽天CSVインポートを使う場合のみ変換テーブルが機能します。<br>APIで取得した商品はすべて「デフォルト配送方法」が適用されます。</div>
+    <div class="flex-row" style="margin-bottom:12px">
+      <div><label>デフォルト配送方法</label><select id="defShipping"><option value="宅急便">宅急便</option><option value="宅急便コンパクト">宅急便コンパクト</option><option value="クール宅急便">クール宅急便</option><option value="ネコポス">ネコポス</option><option value="ゆうパック">ゆうパック</option><option value="ゆうパケット">ゆうパケット</option><option value="クリックポスト">クリックポスト</option><option value="その他" selected>その他</option></select></div>
+    </div>
+    <div class="flex-row" style="margin-bottom:8px">
+      <div><input type="text" id="shipRakutenName" placeholder="楽天の配送方法名（例: 宅配便）"></div>
+      <div><select id="shipLineName"><option value="宅急便">宅急便</option><option value="宅急便コンパクト">宅急便コンパクト</option><option value="クール宅急便">クール宅急便</option><option value="ネコポス">ネコポス</option><option value="ゆうパック">ゆうパック</option><option value="ゆうパケット">ゆうパケット</option><option value="クリックポスト">クリックポスト</option><option value="その他">その他</option></select></div>
+      <div><button class="btn-green" onclick="addShipMapping()">追加</button></div>
+    </div>
+    <div class="table-wrap" style="max-height:200px"><table><thead><tr><th>楽天の配送方法</th><th>LINEギフトの配送方法</th><th>操作</th></tr></thead><tbody id="shipMapBody"></tbody></table></div>
+    <div style="margin-top:10px">
+      <button class="btn-secondary" onclick="showRakutenShippingValues()" style="font-size:13px">楽天の実際の配送方法値を確認</button>
+      <span style="font-size:12px;color:#888;margin-left:8px">（楽天商品取得後に押してください）</span>
+    </div>
+    <div id="shippingValuesDisplay" style="display:none;margin-top:8px"></div>
+  </div>
+  <div class="card"><h2>デフォルト値設定</h2>
+    <div class="flex-row">
+      <div><label>在庫数デフォルト</label><input type="number" id="defStock" value="99"></div>
+      <div><label>発送までの日数</label><input type="number" id="defShipDays" value="3"></div>
+      <div><label>到着までの日数</label><input type="number" id="defArrDays" value="5"></div>
+    </div>
+  </div>
+  <div class="card"><h2>データ管理</h2>
+    <div class="flex-row">
+      <div><button class="btn-primary" onclick="exportState()">設定エクスポート (JSON)</button></div>
+      <div><button class="btn-secondary" onclick="document.getElementById('importStateFile').click()">設定インポート</button><input type="file" id="importStateFile" accept=".json" style="display:none" onchange="importState(event)"></div>
+      <div><button class="btn-danger" onclick="if(confirm('全データをクリアしますか？')){localStorage.clear();location.reload()}">全データクリア</button></div>
+    </div>
+  </div>
+</div>
+
+<div class="panel" id="panel-rakuten">
+  <div class="card"><h2>楽天商品取得</h2>
+    <button class="btn-primary" onclick="fetchRakuten()" style="font-size:16px;padding:12px 32px">商品を取得する</button>
+    <div id="rakutenProgress" style="display:none;margin-top:12px"><div class="progress-bar"><div class="progress-fill" id="rakutenProgressFill" style="width:0%"></div></div><span id="rakutenProgressText"></span></div>
+    <div id="rakutenFetchResult" style="display:none;margin-top:12px"></div>
+  </div>
+  <div class="card" id="fetchScriptCard" style="display:none"><h2>商品取得に追加の手順が必要です</h2>
+    <div class="msg msg-ok" style="margin-bottom:16px">
+      <strong>✅ 方法1（推奨）: start.bat をダブルクリック</strong><br>
+      同じフォルダにある <code>start.bat</code> をダブルクリックしてサーバーを起動してから、再度「商品を取得する」を押してください。<br>
+      <small style="color:#555">※ ブラウザが自動で開きます。そのまま操作を続けてください。</small>
+    </div>
+    <details style="border:1px solid #ddd;border-radius:6px;padding:12px">
+      <summary style="cursor:pointer;font-weight:500;color:#666">方法2: Node.jsスクリプトを手動実行（上級者向け）</summary>
+      <div style="margin-top:12px">
+        <textarea id="fetchScriptArea" style="min-height:180px;font-family:monospace;font-size:12px" readonly></textarea>
+        <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+          <button class="btn-primary" onclick="copyFetchScript()">スクリプトをコピー</button>
+          <button class="btn-secondary" onclick="saveFetchScript()">ファイルとして保存</button>
+        </div>
+        <div class="msg msg-info" style="margin-top:12px">
+          <strong>手順:</strong><br>
+          1. 上のボタンでスクリプトをコピーまたは保存<br>
+          2. コマンドプロンプトで <code>node fetch-rakuten.js</code> を実行<br>
+          3. 完了後、下の「JSONファイルを読み込む」で取得結果を読み込み
+        </div>
+        <div style="margin-top:12px">
+          <button class="btn-green" onclick="document.getElementById('rakutenJsonFile').click()" style="font-size:14px;padding:10px 24px">JSONファイルを読み込む</button>
+          <input type="file" id="rakutenJsonFile" accept=".json" style="display:none" onchange="importRakutenFile(event)">
+        </div>
+      </div>
+    </details>
+  </div>
+  <div class="card" style="padding:12px">
+    <details><summary style="cursor:pointer;font-size:13px;color:#666">CSVファイルから読み込む場合はこちら</summary>
+      <div style="margin-top:12px">
+        <div class="drop-zone" id="rakutenDropZone" onclick="document.getElementById('rakutenCsvFile').click()">CSVファイルをドラッグ＆ドロップまたはクリック</div>
+        <input type="file" id="rakutenCsvFile" accept=".csv,.json" style="display:none" onchange="importRakutenFile(event)">
+      </div>
+    </details>
+  </div>
+  <div class="stats" id="rakutenStats"></div>
+  <div class="card"><h2>楽天商品一覧 <span id="rakutenCount"></span></h2>
+    <input type="text" id="rakutenSearch" placeholder="商品名・コードで検索..." oninput="renderRakutenTable()">
+    <div class="table-wrap"><table><thead><tr><th>商品コード</th><th>商品名</th><th>価格</th><th>配送方法</th><th>ジャンル</th><th>画像</th></tr></thead><tbody id="rakutenBody"></tbody></table></div>
+  </div>
+</div>
+
+<div class="panel" id="panel-linegift">
+  <div class="card"><h2>既存LINEギフト商品インポート</h2>
+    <div class="drop-zone" id="lineDropZone" onclick="document.getElementById('lineCsvFile').click()">
+      LINEギフトのCSVファイルをドラッグ＆ドロップまたはクリック
+    </div>
+    <input type="file" id="lineCsvFile" accept=".csv" style="display:none" onchange="importLineCsv(event)">
+  </div>
+  <div class="stats" id="lineStats"></div>
+  <div class="card"><h2>既存商品一覧 <span id="lineCount"></span></h2>
+    <input type="text" id="lineSearch" placeholder="商品名・コードで検索..." oninput="renderLineTable()">
+    <div class="table-wrap"><table><thead><tr><th>商品コード</th><th>商品名</th><th>価格</th><th>カテゴリ</th><th>販売状態</th></tr></thead><tbody id="lineBody"></tbody></table></div>
+  </div>
+</div>
+
+<div class="panel" id="panel-diff">
+  <div class="card"><h2>差分比較</h2>
+    <button class="btn-primary" onclick="renderDiffTable()">差分を再計算</button>
+  </div>
+  <div class="stats" id="diffStats"></div>
+  <div class="card">
+    <div class="flex-row" style="margin-bottom:12px">
+      <button class="filter-btn active" onclick="setDiffFilter('all')">全て</button>
+      <button class="filter-btn" onclick="setDiffFilter('new')">未登録</button>
+      <button class="filter-btn" onclick="setDiffFilter('exist')">登録済</button>
+      <button class="filter-btn" onclick="setDiffFilter('exclude')">除外</button>
+    </div>
+    <div class="table-wrap"><table><thead><tr><th><input type="checkbox" onchange="toggleAllDiff(this)"></th><th>ステータス</th><th>楽天コード</th><th>LINEコード</th><th>商品名</th><th>価格</th><th>操作</th></tr></thead><tbody id="diffBody"></tbody></table></div>
+  </div>
+</div>
+
+<div class="panel" id="panel-exclude">
+  <div class="card"><h2>除外管理</h2>
+    <p style="margin-bottom:12px;color:#666">同期対象から除外する商品コードを管理します。</p>
+    <div class="flex-row" style="margin-bottom:12px">
+      <div style="flex:3"><input type="text" id="excludeInput" placeholder="商品コードを入力（カンマ区切りで複数可）"></div>
+      <div style="flex:1"><input type="text" id="excludeReason" placeholder="除外理由（任意）"></div>
+      <div><button class="btn-danger" onclick="addExclusions()">除外追加</button></div>
+    </div>
+  </div>
+  <div class="card"><h2>除外リスト <span id="excludeCount"></span></h2>
+    <div class="table-wrap"><table><thead><tr><th>商品コード</th><th>理由</th><th>追加日</th><th>操作</th></tr></thead><tbody id="excludeBody"></tbody></table></div>
+  </div>
+</div>
+
+<div class="panel" id="panel-catmap">
+  <div class="card"><h2>LINEギフトカテゴリマスタ読込</h2>
+    <p style="margin-bottom:12px;color:#666">LINEギフトのカテゴリマスタCSV（linegift-type-export.csv）を読み込むと、下のカテゴリ選択でコード・名前から検索できるようになります。</p>
+    <div class="flex-row" style="margin-bottom:8px">
+      <div><button class="btn-green" onclick="document.getElementById('catMasterFile').click()">カテゴリマスタCSVを読み込む</button><input type="file" id="catMasterFile" accept=".csv" style="display:none" onchange="importCatMaster(event)"></div>
+      <div id="catMasterStatus" style="font-size:13px;color:#888"></div>
+    </div>
+  </div>
+  <div class="card"><h2>カテゴリマッピング</h2>
+    <p style="margin-bottom:12px;color:#666">楽天ジャンルIDをLINEギフトのカテゴリコードに対応付けます。</p>
+    <div class="flex-row" style="margin-bottom:12px">
+      <div><label>デフォルトカテゴリコード</label>
+        <div style="position:relative"><input type="text" id="defaultCatCode" placeholder="デフォルトのLINEギフトカテゴリコード" oninput="showCatSuggest(this,'defCatSuggest')" onfocus="showCatSuggest(this,'defCatSuggest')" autocomplete="off"><div id="defCatSuggest" class="cat-suggest" style="display:none"></div></div>
+      </div>
+    </div>
+    <div style="margin-bottom:12px;display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+      <button class="btn-secondary" onclick="showRakutenGenreValues()" style="font-size:13px">楽天の実際のジャンルIDを確認</button>
+      <span style="font-size:12px;color:#888">（楽天商品取得後に押してください）</span>
+      <button class="btn-primary" onclick="document.getElementById('genreMappingFile').click()" style="font-size:13px">ジャンルマッピングJSON読込</button>
+      <input type="file" id="genreMappingFile" accept=".json" style="display:none" onchange="importGenreMapping(event)">
+      <span id="genreMappingStatus" style="font-size:12px;color:#888"></span>
+    </div>
+    <div id="genreValuesDisplay" style="display:none;margin-bottom:12px"></div>
+    <div class="flex-row" style="margin-bottom:12px">
+      <div><input type="text" id="catGenreId" placeholder="楽天ジャンルID"></div>
+      <div style="position:relative"><input type="text" id="catLineCode" placeholder="LINEカテゴリコード（入力で検索）" oninput="showCatSuggest(this,'catLineSuggest')" onfocus="showCatSuggest(this,'catLineSuggest')" autocomplete="off"><div id="catLineSuggest" class="cat-suggest" style="display:none"></div></div>
+      <div><button class="btn-green" onclick="addCatMapping()">追加</button></div>
+    </div>
+  </div>
+  <div class="card"><h2>マッピング一覧 <span id="catmapCount"></span></h2>
+    <div class="table-wrap"><table><thead><tr><th>楽天ジャンルID</th><th>LINEカテゴリコード</th><th>カテゴリ名</th><th>操作</th></tr></thead><tbody id="catmapBody"></tbody></table></div>
+  </div>
+</div>
+
+<div class="panel" id="panel-csvout">
+  <div class="card"><h2>LINEギフトCSV出力</h2>
+    <div class="flex-row" style="margin-bottom:12px">
+      <div><label>出力対象</label>
+        <select id="exportTarget">
+          <option value="new">未登録商品のみ</option>
+          <option value="all">全差分商品（除外以外）</option>
+          <option value="selected">チェック済みのみ</option>
+        </select>
+      </div>
+      <div><label>商品名75文字制限</label>
+        <select id="nameTruncMode">
+          <option value="truncate">自動切り詰め（警告付き）</option>
+          <option value="warn">警告のみ（切り詰めない）</option>
+        </select>
+      </div>
+    </div>
+    <button class="btn-green" onclick="generateExportCsv()" style="margin-right:8px">プレビュー生成</button>
+    <label style="display:inline-block;margin:0 12px 0 0;font-size:13px">文字コード:
+      <select id="csvEncoding" style="width:auto;margin:0;padding:4px 8px">
+        <option value="sjis" selected>Shift-JIS</option>
+        <option value="utf8">UTF-8（BOM付き）</option>
+      </select>
+    </label>
+    <button class="btn-primary" onclick="downloadExportCsv()">ダウンロード</button>
+  </div>
+  <div class="card" id="csvPreviewCard" style="display:none"><h2>プレビュー</h2>
+    <div id="csvValidation"></div>
+    <div class="table-wrap" style="max-height:400px"><table id="csvPreviewTable"></table></div>
+  </div>
+</div>
+
+<div class="panel" id="panel-images">
+  <div class="card"><h2>画像ダウンロード</h2>
+    <p style="margin-bottom:12px;color:#666">楽天商品の画像をまとめてダウンロードします。start.bat でサーバーを起動している必要があります。</p>
+    <div class="flex-row" style="margin-bottom:12px">
+      <div><label>出力対象</label>
+        <select id="imageTarget">
+          <option value="new">未登録商品のみ</option>
+          <option value="all">全商品</option>
+        </select>
+      </div>
+      <div><label>ダウンロード画像</label>
+        <select id="imageMode">
+          <option value="all">全画像（_01〜_10.jpg、最大10枚）</option>
+          <option value="first">1枚目のみ（_01.jpg、白抜き画像）</option>
+        </select>
+      </div>
+      <div><label>保存フォルダ名（start.bat と同じフォルダ内）</label>
+        <input type="text" id="imageSaveDir" value="linegift_images" placeholder="linegift_images">
+      </div>
+    </div>
+    <div style="margin-bottom:12px">
+      <button class="btn-green" onclick="startImageDownload()" style="font-size:15px;padding:10px 28px">▼ 画像をダウンロード</button>
+      <button class="btn-secondary" onclick="exportImageTsv()" style="margin-left:8px">URL一覧(TSV)</button>
+    </div>
+    <div id="imgDownloadProgress" style="display:none;margin-top:8px">
+      <div class="progress-bar"><div class="progress-fill" id="imgProgressFill" style="width:0%"></div></div>
+      <span id="imgProgressText" style="font-size:13px"></span>
+    </div>
+    <div id="imgDownloadResult" style="display:none;margin-top:8px"></div>
+  </div>
+  <div class="card"><h2>ダウンロード除外URLパターン</h2>
+    <p style="margin-bottom:12px;color:#666">このテキストを含む画像URLはダウンロードしません。クーポン画像・バナー等を除外するのに使います。</p>
+    <div class="flex-row" style="margin-bottom:8px">
+      <div><input type="text" id="imgExcludeInput" placeholder="除外したい文字列（例: /coupon/ ）" onkeydown="if(event.key==='Enter')addImgExcludePattern()"></div>
+      <div style="flex:0"><button class="btn-secondary" onclick="addImgExcludePattern()">追加</button></div>
+    </div>
+    <div id="imgExcludeList"><p style="color:#888;font-size:13px">除外パターンなし</p></div>
+  </div>
+  <details style="margin:0 0 16px 0">
+    <summary style="cursor:pointer;color:#888;font-size:13px;padding:8px">Node.jsスクリプトを手動実行する（上級者向け）</summary>
+    <div class="card" style="margin-top:0">
+      <button class="btn-secondary" onclick="generateImageScript()">スクリプト生成</button>
+      <div id="imageScriptCard" style="display:none;margin-top:8px">
+        <textarea id="imageScriptArea" style="min-height:200px;font-family:monospace;font-size:12px" readonly></textarea>
+        <button class="btn-secondary" onclick="copyImageScript()" style="margin-top:8px">コピー</button>
+      </div>
+    </div>
+  </details>
+</div>
+
+<div id="toastArea"></div>
+<script>
+// === XSS Prevention ===
+function esc(s){if(s==null)return'';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
+
+// === 楽天画像パス → フルURL変換 ===
+// images[].location は相対パス（例: /image3/xxx.jpg） → https://image.rakuten.co.jp/{slug}/cabinet/image3/xxx.jpg
+function buildImageUrl(img, slug){
+  if(!img||!slug)return'';
+  const loc=img.location||img.path||'';
+  if(!loc)return'';
+  if(loc.startsWith('http'))return loc;
+  const p=loc.startsWith('/')?loc:'/'+loc;
+  return'https://image.rakuten.co.jp/'+slug+'/cabinet'+p;
+}
+
+// === HTML → プレーンテキスト変換（メルカリShops版と同仕様） ===
+// 処理: <img>削除 / バナーテーブル(<a>あり)削除 / スペックテーブルはテキスト化 / <br>→改行 / タグ除去
+function stripHtml(html){
+  if(!html)return'';
+  const parser=new DOMParser();
+  const doc=parser.parseFromString(html,'text/html');
+  const body=doc.body;
+  // 1. <img>を全削除
+  body.querySelectorAll('img').forEach(el=>el.remove());
+  // 2. テーブル処理
+  body.querySelectorAll('table').forEach(table=>{
+    if(table.querySelector('a')){table.remove();return}
+    const rows=table.querySelectorAll('tr');
+    const parts=[];
+    rows.forEach(row=>{
+      row.querySelectorAll('th,td').forEach(cell=>{cell.querySelectorAll('br').forEach(br=>br.replaceWith(', '))});
+      const th=row.querySelector('th');
+      const tds=[...row.querySelectorAll('td')];
+      if(th&&tds.length>0){const k=th.textContent.trim();const v=tds[tds.length-1].textContent.trim().replace(/^[,\s]+|[,\s]+$/g,'');if(k&&v)parts.push(k+': '+v)}
+      else if(tds.length>=2){const k=tds[0].textContent.trim();const v=tds[tds.length-1].textContent.trim().replace(/^[,\s]+|[,\s]+$/g,'');if(k&&v)parts.push(k+': '+v)}
+      else if(tds.length===1){const v=tds[0].textContent.trim().replace(/^[,\s]+|[,\s]+$/g,'');if(v)parts.push(v)}
+    });
+    if(parts.length>0){table.replaceWith(parts.join('\n')+'\n')}else{table.remove()}
+  });
+  // 3. <a>タグはテキストだけ残す
+  body.querySelectorAll('a').forEach(a=>a.replaceWith(a.textContent));
+  // 4. <br>→改行
+  body.querySelectorAll('br').forEach(br=>br.replaceWith('\n'));
+  // 5. テキスト抽出・整形
+  let text=body.textContent;
+  text=text.replace(/[ \t]+\n/g,'\n').replace(/\n{3,}/g,'\n\n');
+  return text.trim().slice(0,2000);
+}
+
+// === State ===
+let state={rakutenItems:[],lineItems:[],exclusions:{},catMappings:{},shipMappings:{},catMaster:[],imageExcludePatterns:[],diffFilter:'all',checkedDiff:{}};
+let csvPreviewData=null;
+
+// === Tab Switching ===
+function switchTab(id){document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));document.getElementById('panel-'+id).classList.add('active');const tabs=document.querySelectorAll('.tab');const ids=['settings','rakuten','linegift','diff','exclude','catmap','csvout','images'];tabs[ids.indexOf(id)].classList.add('active')}
+
+// === Toast ===
+function toast(msg){const d=document.createElement('div');d.className='toast';d.textContent=msg;document.getElementById('toastArea').appendChild(d);setTimeout(()=>d.remove(),3000)}
+
+// === Toggle Code Options ===
+function toggleCodeOptions(){const m=document.getElementById('codeConvertMode').value;document.getElementById('prefixOpt').style.display=m==='prefix'?'block':'none';document.getElementById('replaceOpt').style.display=m==='replace'?'block':'none'}
+
+// === Product Code Conversion ===
+function convertCode(code){const m=document.getElementById('codeConvertMode').value;if(m==='prefix')return(document.getElementById('codePrefix').value||'')+code;if(m==='replace'){const rules=(document.getElementById('codeReplaceRules').value||'').split('\n');for(const r of rules){const[f,t]=r.split('=');if(f&&code.includes(f))code=code.replace(f,t||'')}return code}return code}
+
+// === File Reading (Shift-JIS / UTF-8) ===
+function readFileAuto(file){return new Promise((resolve)=>{const r=new FileReader();r.onload=()=>{const buf=r.result;try{const sjis=new TextDecoder('shift_jis',{fatal:true});const t=sjis.decode(buf);resolve(t)}catch(e){const utf8=new TextDecoder('utf-8');resolve(utf8.decode(buf))}};r.readAsArrayBuffer(file)})}
+
+// === CSV Parser ===
+function parseCsv(text){const lines=[];let cur=[];let field='';let inQ=false;for(let i=0;i<text.length;i++){const c=text[i];if(inQ){if(c==='"'&&text[i+1]==='"'){field+='"';i++}else if(c==='"'){inQ=false}else{field+=c}}else{if(c==='"'){inQ=true}else if(c===','){cur.push(field);field=''}else if(c==='\n'||c==='\r'){if(c==='\r'&&text[i+1]==='\n')i++;cur.push(field);if(cur.length>1||cur[0]!=='')lines.push(cur);cur=[];field=''}else{field+=c}}}if(field||cur.length)cur.push(field);if(cur.length>1||cur[0]!=='')lines.push(cur);return lines}
+
+function csvToObjects(rows){if(rows.length<2)return[];const h2=rows[0];return rows.slice(1).map(r=>{const o={};h2.forEach((k,i)=>o[k.trim()]=r[i]||'');return o})}
+
+// === Rakuten RMS API ===
+function getRmsAuth(){const ss=document.getElementById('apiServiceSecret').value;const lk=document.getElementById('apiLicenseKey').value;if(!ss||!lk){toast('設定タブでserviceSecretとlicenseKeyを入力してください');return null}return btoa(ss+':'+lk)}
+
+async function fetchRakuten(){const auth=getRmsAuth();if(!auth)return;document.getElementById('rakutenProgress').style.display='block';document.getElementById('rakutenFetchResult').style.display='none';document.getElementById('fetchScriptCard').style.display='none';let items=[];let cursor='*';let page=0;try{while(true){page++;const url='https://api.rms.rakuten.co.jp/es/2.0/items/search?cursorMark='+encodeURIComponent(cursor)+'&hits=50';const proxyUrl='/apps/linegift-sync/proxy?cursorMark='+encodeURIComponent(cursor)+'&hits=50';let res;try{res=await fetch(proxyUrl,{headers:{'Authorization':'ESA '+auth}})}catch(pe){res=await fetch(url,{headers:{'Authorization':'ESA '+auth}})}if(!res.ok){throw new Error('HTTP '+res.status)}const data=await res.json();const rawList=data.results||data.items||(data.itemSearch&&data.itemSearch.items)||[];const itemsNode=rawList.map(r=>(r&&r.item)?r.item:r);const numFound=data.numFound||(data.itemSearch&&data.itemSearch.numFound)||0;const nextMark=data.nextCursorMark||(data.itemSearch&&data.itemSearch.nextCursorMark);if(page===1)console.log('[RMS Debug] numFound:',numFound,'results:',rawList.length,'item keys:',Object.keys(itemsNode[0]||{}).join(','),'shipping fields:',JSON.stringify({postageFlag:(itemsNode[0]||{}).postageFlag,shippingInfo:(itemsNode[0]||{}).shippingInfo,deliveryInfo:(itemsNode[0]||{}).deliveryInfo,shippingMethod:(itemsNode[0]||{}).shippingMethod,shipping:(itemsNode[0]||{}).shipping,deliveryType:(itemsNode[0]||{}).deliveryType}));const slugEl=document.getElementById('shopSlug');const slug=slugEl?slugEl.value.trim():'';const pageItems=itemsNode.map(it=>{const variantList=Object.values(it.variants&&typeof it.variants==='object'&&!Array.isArray(it.variants)?it.variants:{});const vPrices=variantList.map(v=>parseInt(v.standardPrice||0)||0).filter(p=>p>0);const price=vPrices.length>0?Math.min(...vPrices):0;const imgs=[];if(it.whiteBgImage)imgs.push(buildImageUrl(it.whiteBgImage,slug));(it.images||[]).forEach(img=>{const u=buildImageUrl(img,slug);if(u&&!imgs.includes(u))imgs.push(u)});const fv=variantList[0];const shipping=fv&&fv.shipping?(fv.shipping.postageIncluded?'送料込み':'送料別'):(it.shippingMethod||it.shipping||it.deliveryInfo||'');return{code:it.manageNumber||it.itemNumber||'',name:it.title||it.itemName||'',price,url:it.itemUrl||it.url||'',images:imgs,genreId:String(it.genreId||''),desc:stripHtml((it.productDescription&&(it.productDescription.pc||it.productDescription.sp||it.productDescription.mobile))||it.salesDescription||it.description||it.itemCaption||''),shipping,variants:Object.entries(it.variants&&typeof it.variants==='object'&&!Array.isArray(it.variants)?it.variants:{}).map(([id,v])=>({id,price:parseInt(v.standardPrice||0)||0,janCode:(v.articleNumber&&v.articleNumber.value)||'',selectorValues:v.selectorValues||{},merchantSkuId:v.merchantDefinedSkuId||id})),variantSelectors:(it.variantSelectors||[]).map(s=>({key:s.key,displayName:s.displayName}))}});items=items.concat(pageItems);const pct=Math.min(Math.round(items.length/Math.max(numFound,1)*100),100);document.getElementById('rakutenProgressFill').style.width=pct+'%';document.getElementById('rakutenProgressText').textContent=items.length+'/'+numFound+'件';if(!nextMark||nextMark===cursor||pageItems.length===0)break;cursor=nextMark;await new Promise(r=>setTimeout(r,1100))}state.rakutenItems=items;saveState();renderRakutenTable();document.getElementById('rakutenProgress').style.display='none';document.getElementById('rakutenFetchResult').style.display='block';document.getElementById('rakutenFetchResult').innerHTML='<div class="msg msg-ok">'+items.length+'件の楽天商品を取得しました</div>';toast(items.length+'件の楽天商品を取得しました')}catch(e){console.error('[fetchRakuten]',e.name,e.message,e.stack);document.getElementById('rakutenProgress').style.display='none';const isNetErr=e instanceof TypeError&&(e.message.includes('fetch')||e.message.includes('Failed')||e.message.includes('network'));if(isNetErr&&items.length===0){showFetchScript();toast('start.bat でサーバーを起動してから再試行してください')}else{document.getElementById('rakutenFetchResult').style.display='block';document.getElementById('rakutenFetchResult').innerHTML='<div class="msg msg-warn">⚠ エラー: '+esc(e.message)+'<br><small>詳細はブラウザのコンソール(F12→コンソール)を確認してください</small></div>';if(items.length>0){state.rakutenItems=items;saveState();renderRakutenTable();toast('途中まで取得: '+items.length+'件')}else{toast('エラー: '+e.message.slice(0,60))}}}}
+
+function showFetchScript(){const ss=document.getElementById('apiServiceSecret').value;const lk=document.getElementById('apiLicenseKey').value;let script='// 楽天RMS API 商品取得スクリプト\n';script+='// 実行: node fetch-rakuten.js\n';script+='const https=require("https");\nconst fs=require("fs");\n\n';script+='const AUTH="ESA "+Buffer.from("'+ss+':'+lk+'").toString("base64");\n';script+='const BASE="https://api.rms.rakuten.co.jp/es/2.0/items/search";\n\n';script+='let allItems=[];let cursor="*";let page=0;\n\n';script+='function fetchPage(){\n';script+='  const url=BASE+"?cursorMark="+encodeURIComponent(cursor)+"&hits=50";\n';script+='  const u=new URL(url);\n';script+='  const opts={hostname:u.hostname,path:u.pathname+u.search,headers:{"Authorization":AUTH}};\n';script+='  https.get(opts,res=>{\n';script+='    let body="";\n';script+='    res.on("data",d=>body+=d);\n';script+='    res.on("end",()=>{\n';script+='      if(res.statusCode!==200){console.error("Error "+res.statusCode+": "+body);save();return}\n';script+='      const data=JSON.parse(body);\n';script+='      const rawList=data.results||data.items||[];\n';script+='      const items=rawList.map(r=>r&&r.item?r.item:r).map(it=>({\n';script+='        code:it.manageNumber||it.itemNumber||"",\n';script+='        name:it.title||it.itemName||"",\n';script+='        price:(()=>{const vs=Object.values(it.variants&&typeof it.variants==="object"&&!Array.isArray(it.variants)?it.variants:{});const ps=vs.map(v=>parseInt(v.standardPrice||0)||0).filter(p=>p>0);return ps.length?Math.min(...ps):0})(),\n';script+='        url:it.itemUrl||it.url||"",\n';script+='        images:[...(it.whiteBgImage?[it.whiteBgImage]:[]),...(it.images||[])].map(img=>typeof img==="string"?img:img.location||img.url||""),\n';script+='        genreId:String(it.genreId||""),\n';script+='        desc:(it.productDescription&&(it.productDescription.pc||it.productDescription.sp||it.productDescription.mobile))||it.salesDescription||it.description||it.itemCaption||"",\n';script+='        shipping:(()=>{const vs=Object.values(it.variants&&typeof it.variants==="object"&&!Array.isArray(it.variants)?it.variants:{});const fv=vs[0];return fv&&fv.shipping?(fv.shipping.postageIncluded?"送料込み":"送料別"):"";})(),\n';script+='      }));\n';script+='      allItems=allItems.concat(items);\n';script+='      page++;\n';script+='      const numFound=data.numFound||0;\n';script+='      const nextMark=data.nextCursorMark;\n';script+='      console.log("Page "+page+": "+allItems.length+"/"+numFound+" items");\n';script+='      if(!nextMark||nextMark===cursor||items.length===0){save();return}\n';script+='      cursor=nextMark;\n';script+='      setTimeout(fetchPage,1100);\n';script+='    });\n';script+='  }).on("error",e=>{console.error(e.message);save()});\n';script+='}\n\n';script+='function save(){\n';script+='  const fname="rakuten_items_"+new Date().toISOString().slice(0,10)+".json";\n';script+='  fs.writeFileSync(fname,JSON.stringify(allItems,null,2),"utf-8");\n';script+='  console.log("Saved "+allItems.length+" items to "+fname);\n';script+='}\n\n';script+='fetchPage();\n';document.getElementById('fetchScriptArea').value=script;document.getElementById('fetchScriptCard').style.display='block'}
+
+function copyFetchScript(){const ta=document.getElementById('fetchScriptArea');ta.select();document.execCommand('copy');toast('コピーしました')}
+
+function saveFetchScript(){const text=document.getElementById('fetchScriptArea').value;const blob=new Blob([text],{type:'text/javascript'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='fetch-rakuten.js';a.click();toast('fetch-rakuten.js を保存しました')}
+
+async function importRakutenFile(e){const file=e.target.files[0];if(!file)return;if(file.name.endsWith('.json')){const text=await file.text();try{const items=JSON.parse(text);if(!Array.isArray(items)){toast('JSONの形式が正しくありません');return}state.rakutenItems=items.map(i=>({code:i.code||i.manageNumber||'',name:i.name||i.title||i.itemName||'',price:parseInt(i.price||i.standardPrice||i.itemPrice||0)||0,url:i.url||i.itemUrl||'',images:i.images||[],genreId:String(i.genreId||''),desc:stripHtml(i.desc||i.description||i.itemCaption||''),shipping:i.shipping||'',variants:i.variants||[]}));saveState();renderRakutenTable();toast(state.rakutenItems.length+'件の楽天商品をJSONからインポートしました')}catch(ex){toast('JSONパースエラー: '+ex.message)}return}const text=await readFileAuto(file);const rows=parseCsv(text);const objs=csvToObjects(rows);const header=rows[0]||[];const codeCol=header.findIndex(h2=>/商品管理番号|itemCode|item_code|商品コード/.test(h2));const nameCol=header.findIndex(h2=>/商品名|itemName|item_name/.test(h2));const priceCol=header.findIndex(h2=>/販売価格|価格|itemPrice|price/.test(h2));state.rakutenItems=objs.map(o=>{const vals=Object.values(o);return{code:codeCol>=0?vals[codeCol]:(o["商品管理番号"]||o["itemCode"]||Object.values(o)[0]||''),name:nameCol>=0?vals[nameCol]:(o["商品名"]||o["itemName"]||''),price:parseInt(priceCol>=0?vals[priceCol]:(o["販売価格"]||o["itemPrice"]||'0'))||0,url:o["itemUrl"]||o["商品URL"]||'',images:[],genreId:o["genreId"]||o["ジャンル"]||'',desc:stripHtml(o["itemCaption"]||o["商品説明"]||''),shipping:o["配送方法"]||o["shippingMethod"]||''}});saveState();renderRakutenTable();toast(state.rakutenItems.length+'件の楽天商品をCSVからインポートしました')}
+
+// === Render Tables ===
+function renderRakutenTable(){const q2=document.getElementById('rakutenSearch').value.toLowerCase();const items=state.rakutenItems.filter(i=>!q2||i.name.toLowerCase().includes(q2)||i.code.toLowerCase().includes(q2));document.getElementById('rakutenCount').textContent='('+items.length+'件)';const tb=document.getElementById('rakutenBody');tb.innerHTML=items.slice(0,200).map(i=>'<tr><td>'+esc(i.code)+'</td><td>'+esc(i.name)+'</td><td>'+Number(i.price).toLocaleString()+'円</td><td>'+esc(i.shipping||'-')+'</td><td>'+esc(i.genreId)+'</td><td>'+(i.images&&i.images[0]?'<img src="'+esc(i.images[0])+'" style="height:40px">':'-')+'</td></tr>').join('');const st=document.getElementById('rakutenStats');st.innerHTML='<div class="stat-box"><div class="num">'+state.rakutenItems.length+'</div><div class="lbl">全商品</div></div>'}
+
+async function importLineCsv(e){const file=e.target.files[0];if(!file)return;const text=await readFileAuto(file);const rows=parseCsv(text);const objs=csvToObjects(rows);state.lineItems=objs.map(o=>({code:o["商品コード"]||Object.values(o)[0]||'',name:o["商品名"]||Object.values(o)[1]||'',price:parseInt(o["販売価格"]||0)||0,category:o["カテゴリコード"]||'',status:o["販売状態"]||''}));saveState();renderLineTable();toast(state.lineItems.length+'件のLINEギフト商品をインポートしました')}
+
+function renderLineTable(){const q2=document.getElementById('lineSearch').value.toLowerCase();const items=state.lineItems.filter(i=>!q2||i.name.toLowerCase().includes(q2)||i.code.toLowerCase().includes(q2));document.getElementById('lineCount').textContent='('+items.length+'件)';const tb=document.getElementById('lineBody');tb.innerHTML=items.slice(0,200).map(i=>'<tr><td>'+esc(i.code)+'</td><td>'+esc(i.name)+'</td><td>'+Number(i.price).toLocaleString()+'円</td><td>'+esc(i.category)+'</td><td>'+esc(i.status)+'</td></tr>').join('');const st=document.getElementById('lineStats');st.innerHTML='<div class="stat-box"><div class="num">'+state.lineItems.length+'</div><div class="lbl">全商品</div></div>'}
+
+// === Diff ===
+function getDiffItems(){const lineCodeSet=new Set(state.lineItems.map(i=>i.code));return state.rakutenItems.map(ri=>{const lc=convertCode(ri.code);const isExcluded=!!state.exclusions[ri.code];const isExist=lineCodeSet.has(lc);let status='new';if(isExcluded)status='exclude';else if(isExist)status='exist';return{...ri,lineCode:lc,status}})}
+
+function setDiffFilter(f){state.diffFilter=f;document.querySelectorAll('.filter-btn').forEach(b=>{b.classList.toggle('active',b.textContent.includes(f==='all'?'全':f==='new'?'未登録':f==='exist'?'登録済':'除外'))});renderDiffTable()}
+
+function toggleAllDiff(cb){document.querySelectorAll('.diff-check').forEach(c=>{c.checked=cb.checked;state.checkedDiff[c.dataset.code]=cb.checked});saveState()}
+
+const q="'";
+function renderDiffTable(){const items=getDiffItems();const filtered=state.diffFilter==='all'?items:items.filter(i=>i.status===state.diffFilter);const newC=items.filter(i=>i.status==='new').length;const existC=items.filter(i=>i.status==='exist').length;const exclC=items.filter(i=>i.status==='exclude').length;const longNameC=items.filter(i=>i.name.length>75).length;document.getElementById('diffStats').innerHTML='<div class="stat-box"><div class="num">'+items.length+'</div><div class="lbl">全体</div></div><div class="stat-box"><div class="num" style="color:#06C755">'+newC+'</div><div class="lbl">未登録</div></div><div class="stat-box"><div class="num" style="color:#2196F3">'+existC+'</div><div class="lbl">登録済</div></div><div class="stat-box"><div class="num" style="color:#dc3545">'+exclC+'</div><div class="lbl">除外</div></div>'+(longNameC>0?'<div class="stat-box"><div class="num" style="color:#ff9800">'+longNameC+'</div><div class="lbl">名前75字超</div></div>':'');
+const tb=document.getElementById('diffBody');tb.innerHTML=filtered.slice(0,300).map(i=>{const badge=i.status==='new'?'badge-new':i.status==='exist'?'badge-exist':'badge-exclude';const label=i.status==='new'?'未登録':i.status==='exist'?'登録済':'除外';const chk=state.checkedDiff[i.code]?' checked':'';const nameWarn=i.name.length>75?'<span class="badge-warn" title="LINEギフト上限75文字">'+i.name.length+'字</span>':'';return'<tr><td><input type="checkbox" class="diff-check" data-code="'+esc(i.code)+'"'+chk+' onchange="state.checkedDiff[this.dataset.code]=this.checked;saveState()"></td><td><span class="'+badge+'">'+label+'</span></td><td>'+esc(i.code)+'</td><td>'+esc(i.lineCode)+'</td><td>'+esc(i.name)+nameWarn+'</td><td>'+Number(i.price).toLocaleString()+'円</td><td>'+(i.status!=='exclude'?'<button class="btn-danger" style="padding:2px 8px;font-size:11px" onclick="quickExclude('+q+esc(i.code)+q+')">除外</button>':'')+'</td></tr>'}).join('')}
+
+function quickExclude(code){state.exclusions[code]={reason:'差分画面から除外',date:new Date().toISOString().slice(0,10)};saveState();renderDiffTable();renderExcludeTable();toast(code+' を除外しました')}
+
+// === Exclusion ===
+function addExclusions(){const input=document.getElementById('excludeInput').value;const reason=document.getElementById('excludeReason').value||'手動追加';const codes=input.split(/[,、\s]+/).map(c=>c.trim()).filter(Boolean);codes.forEach(c=>{state.exclusions[c]={reason,date:new Date().toISOString().slice(0,10)}});saveState();renderExcludeTable();document.getElementById('excludeInput').value='';toast(codes.length+'件を除外リストに追加しました')}
+
+function removeExclusion(code){delete state.exclusions[code];saveState();renderExcludeTable();toast(code+' を除外解除しました')}
+
+function renderExcludeTable(){const entries=Object.entries(state.exclusions);document.getElementById('excludeCount').textContent='('+entries.length+'件)';const tb=document.getElementById('excludeBody');tb.innerHTML=entries.map(([code,info])=>'<tr><td>'+esc(code)+'</td><td>'+esc(info.reason)+'</td><td>'+esc(info.date)+'</td><td><button class="btn-secondary" style="padding:2px 8px;font-size:11px" onclick="removeExclusion('+q+esc(code)+q+')">解除</button></td></tr>').join('')}
+
+// === Category Mapping ===
+async function importCatMaster(e){const file=e.target.files[0];if(!file)return;const text=await readFileAuto(file);const rows=parseCsv(text);if(rows.length<2){toast('CSVにデータがありません');return}const header=rows[0];const codeIdx=header.findIndex(h=>/コード/.test(h));const mainIdx=header.findIndex(h=>/メイングループ/.test(h));const subIdx=header.findIndex(h=>/サブグループ/.test(h));const typeIdx=header.findIndex(h=>/アイテムタイプ(?!ID)/.test(h));const tmplIdx=header.findIndex(h=>/テンプレート/.test(h));state.catMaster=rows.slice(1).filter(r=>r.length>1).filter(r=>!(tmplIdx>=0&&r[tmplIdx]==='deprecated')).map(r=>({code:r[codeIdx>=0?codeIdx:1]||'',main:r[mainIdx>=0?mainIdx:2]||'',sub:r[subIdx>=0?subIdx:3]||'',type:r[typeIdx>=0?typeIdx:4]||''}));saveState();document.getElementById('catMasterStatus').innerHTML='<span style="color:#2e7d32">'+state.catMaster.length+'件のカテゴリを読み込みました</span>';toast(state.catMaster.length+'件のカテゴリマスタを読み込みました')}
+
+function getCatMasterLabel(code){const m=state.catMaster.find(c=>c.code===code);return m?(m.main+' > '+m.sub+' > '+m.type):''}
+
+function showCatSuggest(input,suggestId){const sd=document.getElementById(suggestId);const q2=input.value.trim().toLowerCase();if(!q2||state.catMaster.length===0){sd.style.display='none';return}const matches=state.catMaster.filter(c=>c.code.toLowerCase().includes(q2)||c.main.toLowerCase().includes(q2)||c.sub.toLowerCase().includes(q2)||c.type.toLowerCase().includes(q2)).slice(0,15);if(matches.length===0){sd.style.display='none';return}sd.innerHTML=matches.map(c=>'<div class="cat-suggest-item" onmousedown="selectCatSuggest(this,'+q+esc(c.code)+q+')"><span class="cat-code">'+esc(c.code)+'</span><span class="cat-name">'+esc(c.main)+' > '+esc(c.sub)+' > '+esc(c.type)+'</span></div>').join('');sd.style.display='block';input.addEventListener('blur',()=>{setTimeout(()=>{sd.style.display='none'},200)},{once:true})}
+
+function selectCatSuggest(el,code){const input=el.parentElement.previousElementSibling;input.value=code;el.parentElement.style.display='none';saveState()}
+
+function showRakutenGenreValues(){const d=document.getElementById('genreValuesDisplay');if(!state.rakutenItems||state.rakutenItems.length===0){d.innerHTML='<div class="msg msg-warn">楽天商品が読み込まれていません。先に「楽天商品」タブで商品を取得してください。</div>';d.style.display='block';return}const genreCounts={};state.rakutenItems.forEach(i=>{if(i.genreId)genreCounts[i.genreId]=(genreCounts[i.genreId]||0)+1});const sorted=Object.entries(genreCounts).sort((a,b)=>b[1]-a[1]);if(sorted.length===0){d.innerHTML='<div class="msg msg-warn">ジャンルIDが空です。</div>'}else{d.innerHTML='<div class="msg msg-info"><strong>楽天商品のジャンルID（商品数順）</strong><br><br>'+sorted.map(([gid,cnt])=>{const mapped=state.catMappings[gid]?'<span style="color:#2e7d32"> → '+esc(state.catMappings[gid])+'</span>':'<span style="color:#e65100"> 未マッピング</span>';return'<code style="background:#f0f0f0;padding:2px 8px;border-radius:3px;margin:2px;display:inline-block">'+esc(gid)+' ('+cnt+'件)'+mapped+'</code>'}).join(' ')+'</div>'}d.style.display='block'}
+
+function importGenreMapping(e){const file=e.target.files[0];if(!file)return;const r=new FileReader();r.onload=()=>{try{const data=JSON.parse(r.result);const entries=Object.entries(data);if(entries.length===0){toast('マッピングデータが空です');return}let added=0,updated=0;entries.forEach(([gid,code])=>{if(state.catMappings[gid]){if(state.catMappings[gid]!==code){state.catMappings[gid]=code;updated++}}else{state.catMappings[gid]=code;added++}});saveState();renderCatmapTable();document.getElementById('genreMappingStatus').innerHTML='<span style="color:#2e7d32">'+entries.length+'件読込（新規'+added+' / 更新'+updated+'）</span>';toast(entries.length+'件のジャンルマッピングを読み込みました')}catch(ex){toast('JSONの読み込みに失敗しました: '+ex.message)}};r.readAsText(file)}
+
+function addCatMapping(){const gid=document.getElementById('catGenreId').value.trim();const lc=document.getElementById('catLineCode').value.trim();if(!gid||!lc){toast('両方入力してください');return}state.catMappings[gid]=lc;saveState();renderCatmapTable();document.getElementById('catGenreId').value='';document.getElementById('catLineCode').value='';toast('マッピングを追加しました')}
+
+function removeCatMapping(gid){delete state.catMappings[gid];saveState();renderCatmapTable()}
+
+function renderCatmapTable(){const entries=Object.entries(state.catMappings);document.getElementById('catmapCount').textContent='('+entries.length+'件)';const tb=document.getElementById('catmapBody');tb.innerHTML=entries.map(([gid,lc])=>{const label=getCatMasterLabel(lc);return'<tr><td>'+esc(gid)+'</td><td>'+esc(lc)+'</td><td style="font-size:12px;color:#666">'+esc(label||'-')+'</td><td><button class="btn-danger" style="padding:2px 8px;font-size:11px" onclick="removeCatMapping('+q+esc(gid)+q+')">削除</button></td></tr>'}).join('')}
+
+function getCatCode(genreId){return state.catMappings[genreId]||document.getElementById('defaultCatCode').value||''}
+
+// === Shipping Mapping ===
+const LINE_SHIP_OPTIONS=["宅急便","宅急便コンパクト","クール宅急便","ネコポス","ゆうパック","ゆうパケット","クリックポスト","その他"];
+
+function addShipMapping(){const rk=document.getElementById('shipRakutenName').value.trim();const ln=document.getElementById('shipLineName').value;if(!rk){toast('楽天の配送方法名を入力してください');return}state.shipMappings[rk]=ln;saveState();renderShipMapTable();document.getElementById('shipRakutenName').value='';toast('配送方法マッピングを追加しました')}
+
+function removeShipMapping(rk){delete state.shipMappings[rk];saveState();renderShipMapTable()}
+
+function renderShipMapTable(){const entries=Object.entries(state.shipMappings);const tb=document.getElementById('shipMapBody');tb.innerHTML=entries.map(([rk,ln])=>'<tr><td>'+esc(rk)+'</td><td>'+esc(ln)+'</td><td><button class="btn-danger" style="padding:2px 8px;font-size:11px" onclick="removeShipMapping('+q+esc(rk)+q+')">削除</button></td></tr>').join('')}
+
+function showRakutenShippingValues(){const d=document.getElementById('shippingValuesDisplay');if(!state.rakutenItems||state.rakutenItems.length===0){d.innerHTML='<div class="msg msg-warn">楽天商品が読み込まれていません。先に「楽天商品」タブで商品を取得してください。</div>';d.style.display='block';return}const values=[...new Set(state.rakutenItems.map(i=>i.shipping).filter(Boolean))].sort();if(values.length===0){d.innerHTML='<div class="msg msg-warn">配送方法の値が空です。APIレスポンスに配送方法フィールドが含まれていない可能性があります。start.bat の黒い画面に表示される [RMS Item Keys] を確認してください。</div>'}else{d.innerHTML='<div class="msg msg-info"><strong>楽天商品の配送方法（実際の値）</strong><br>この値を下の「楽天の配送方法名」欄に入力してマッピングしてください：<br><br>'+values.map(v=>'<code style="background:#f0f0f0;padding:2px 8px;border-radius:3px;margin:2px;display:inline-block">'+esc(v)+'</code>').join(' ')+'</div>'}d.style.display='block'}
+
+function getShipMethod(rakutenShipping){if(!rakutenShipping)return document.getElementById('defShipping').value||'その他';for(const[rk,ln] of Object.entries(state.shipMappings)){if(rakutenShipping.includes(rk))return ln}return document.getElementById('defShipping').value||'その他'}
+
+// === CSV Export ===
+const LINE_COLS=["商品コード","商品名","商品説明","販売価格","カテゴリコード","ブランドID","販売状態","配送方法","バリエーションラベル","サブバリエーションラベル","バリエーションコード","バリエーション名","サブバリエーション名","JANコード","在庫数","販売開始予約日時","販売中止予約日時","お一人様一個限り","購入個数上限設定","セールID","セール価格","セールページ表示順","ショップページ表示順","商品画像URL","発送作業休日","発送までの日数","到着までの日数"];
+
+function generateExportCsv(){const items=getDiffItems();const target=document.getElementById('exportTarget').value;let filtered;if(target==='new')filtered=items.filter(i=>i.status==='new');else if(target==='selected')filtered=items.filter(i=>state.checkedDiff[i.code]);else filtered=items.filter(i=>i.status!=='exclude');
+const defStock=document.getElementById('defStock').value||'99';const defShipDays=document.getElementById('defShipDays').value||'3';const defArrDays=document.getElementById('defArrDays').value||'5';
+csvPreviewData=[LINE_COLS];const warnings=[];const truncMode=document.getElementById('nameTruncMode').value;let truncCount=0;filtered.forEach(i=>{const lc=convertCode(i.code);const cat=getCatCode(i.genreId);if(!cat)warnings.push(lc+': カテゴリコード未設定');if(i.shipping&&!state.shipMappings[i.shipping]&&!Object.keys(state.shipMappings).some(k=>i.shipping.includes(k)))warnings.push(lc+': 配送方法「'+i.shipping+'」未マッピング(デフォルト使用)');let name=i.name;if(name.length>75){truncCount++;warnings.push(lc+': 商品名'+name.length+'文字→'+(truncMode==='truncate'?'75文字に切り詰め':'75文字超過'));if(truncMode==='truncate')name=name.slice(0,75)}const shipMethod=getShipMethod(i.shipping);const imgUrl=(i.images||[]).slice(0,10).join(' ');const vars=i.variants&&i.variants.length>1?i.variants:null;if(vars){const sels=i.variantSelectors||[];const selKeys=sels.map(s=>s.key);const vKey0=selKeys[0]||'Key0';const vKey1=selKeys[1]||'Key1';const vLabel0=sels[0]?sels[0].displayName:'';const vLabel1=sels[1]?sels[1].displayName:'';vars.forEach(v=>{const vp=v.price>0?Math.round(v.price*1.1):Math.round((i.price||0)*1.1);const sv=v.selectorValues||{};const svKeys=Object.keys(sv);const vName=sv[vKey0]||sv[svKeys[0]]||'';const vSubName=sv[vKey1]||sv[svKeys[1]]||'';const row=[lc,name,i.desc||'',String(vp),cat,'0','draft',shipMethod,vLabel0,vLabel1,v.merchantSkuId||v.id,vName,vSubName,v.janCode||'',defStock,'','','0','0','','','','','','','',''];csvPreviewData.push(row)})}else{const janCode=i.variants&&i.variants[0]?i.variants[0].janCode:'';const price110=Math.round((i.price||0)*1.1);const row=[lc,name,i.desc||'',String(price110),cat,'0','draft',shipMethod,'','',lc,'','',janCode,defStock,'','','0','0','','','','','','','',''];csvPreviewData.push(row)}});if(truncCount>0)warnings.unshift('商品名75文字超過: '+truncCount+'件'+(truncMode==='truncate'?' (自動切り詰め済み)':' (要修正)'));
+const vDiv=document.getElementById('csvValidation');if(warnings.length){vDiv.innerHTML='<div class="msg msg-warn">⚠ 警告:<br>'+warnings.map(w=>esc(w)).join('<br>')+'</div>'}else{vDiv.innerHTML='<div class="msg msg-ok">✓ '+filtered.length+'件の商品を出力準備完了</div>'}
+const tbl=document.getElementById('csvPreviewTable');let html='<thead><tr>'+LINE_COLS.map(c=>'<th>'+esc(c)+'</th>').join('')+'</tr></thead><tbody>';csvPreviewData.slice(1,21).forEach(row=>{html+='<tr>'+row.map(c=>'<td>'+esc(c)+'</td>').join('')+'</tr>'});html+='</tbody>';tbl.innerHTML=html;document.getElementById('csvPreviewCard').style.display='block';toast('プレビューを生成しました ('+filtered.length+'件)')}
+
+// Shift-JIS encoder using TextDecoder reverse mapping (built once, cached)
+function buildSjisMap(){const map={};const dec=new TextDecoder('shift_jis',{fatal:true});const buf=new Uint8Array(2);for(let hi=0x81;hi<=0xEA;hi++){if(hi>=0xA0&&hi<=0xDF)continue;for(let lo=0x40;lo<=0xFC;lo++){if(lo===0x7F)continue;buf[0]=hi;buf[1]=lo;try{const ch=dec.decode(buf);if(ch.length===1){const cp=ch.codePointAt(0);if(!map[cp])map[cp]=(hi<<8)|lo}}catch(e){}}}for(let b=0xA1;b<=0xDF;b++){try{const ch=dec.decode(new Uint8Array([b]));if(ch.length===1)map[ch.codePointAt(0)]=b}catch(e){}}map[0xFF5E]=0x8160;map[0x2015]=0x815C;map[0xFF0D]=0x817C;return map}
+function utf8ToSjis(str){if(!window._sjisMap)window._sjisMap=buildSjisMap();const m=window._sjisMap;const out=[];for(let i=0;i<str.length;i++){const cp=str.codePointAt(i);if(cp<=0x7F){out.push(cp)}else{const mapped=m[cp];if(mapped!==undefined){if(mapped>0xFF){out.push((mapped>>8)&0xFF,mapped&0xFF)}else{out.push(mapped)}}else{out.push(0x3F)}}if(cp>0xFFFF)i++}return new Uint8Array(out)}
+function downloadExportCsv(){if(!csvPreviewData){toast('先にプレビューを生成してください');return}const csv=csvPreviewData.map(row=>row.map(c=>{let s=String(c).replace(/\r?\n/g,' ').replace(/"/g,'""');return'"'+s+'"'}).join(',')).join('\r\n');const enc=document.getElementById('csvEncoding').value;if(enc==='sjis'){try{const sjisData=utf8ToSjis(csv);const blob=new Blob([sjisData],{type:'application/octet-stream'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='linegift_import_'+new Date().toISOString().slice(0,10)+'.csv';a.click();toast('CSVをダウンロードしました (Shift-JIS)')}catch(e){console.error('Shift-JIS encoding error:',e);toast('Shift-JIS変換エラー: '+e.message);return}}else{const bom='\uFEFF';const blob=new Blob([bom+csv],{type:'text/csv;charset=utf-8'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='linegift_import_'+new Date().toISOString().slice(0,10)+'.csv';a.click();toast('CSVをダウンロードしました (UTF-8)')}}
+
+// === Image Management ===
+function generateImageScript(){const items=getDiffItems();const target=document.getElementById('imageTarget').value;const filtered=target==='new'?items.filter(i=>i.status==='new'):items.filter(i=>i.status!=='exclude');let script='// LINEギフト用画像ダウンロードスクリプト\n';script+='const https=require("https");const http=require("http");const fs=require("fs");const path=require("path");\n';script+='const dir="./linegift_images";if(!fs.existsSync(dir))fs.mkdirSync(dir,{recursive:true});\n';script+='const items=[\n';filtered.forEach(i=>{const imgs=i.images||[];const lc=convertCode(i.code);imgs.forEach((url,idx)=>{script+='  {code:"'+lc+'",url:"'+url+'",idx:'+idx+'},\n'})});script+='];\n';script+='let i=0;function dl(){if(i>=items.length){console.log("Done!");return}const it=items[i++];const ext=path.extname(new URL(it.url).pathname)||".jpg";const fname=it.code+"_"+it.idx+ext;const out=fs.createWriteStream(path.join(dir,fname));const mod=it.url.startsWith("https")?https:http;mod.get(it.url,res=>{res.pipe(out);out.on("finish",()=>{console.log(i+"/"+items.length+" "+fname);setTimeout(dl,500)})}).on("error",e=>{console.error(fname+": "+e.message);setTimeout(dl,500)})}dl();\n';document.getElementById('imageScriptArea').value=script;document.getElementById('imageScriptCard').style.display='block';toast('スクリプトを生成しました ('+filtered.length+'商品)')}
+
+function copyImageScript(){const ta=document.getElementById('imageScriptArea');ta.select();document.execCommand('copy');toast('コピーしました')}
+
+async function startImageDownload(){const items=getDiffItems();const target=document.getElementById('imageTarget').value;const mode=document.getElementById('imageMode').value;const dir=(document.getElementById('imageSaveDir').value||'linegift_images').trim();const filtered=target==='new'?items.filter(i=>i.status==='new'):items.filter(i=>i.status!=='exclude');const imageList=[];filtered.forEach(i=>{const lc=convertCode(i.code);const excluded=state.imageExcludePatterns||[];const allImgs=mode==='first'?(i.images&&i.images[0]?[i.images[0]]:[]):(i.images||[]);const imgs=allImgs.filter(url=>url&&!excluded.some(p=>p&&url.includes(p))).slice(0,10);imgs.forEach((url,idx)=>{imageList.push({code:lc,url,position:String(idx+1).padStart(2,'0')})})});if(imageList.length===0){toast('ダウンロードする画像がありません（商品を取得してから実行してください）');return}const prog=document.getElementById('imgDownloadProgress');const result=document.getElementById('imgDownloadResult');prog.style.display='block';result.style.display='none';document.getElementById('imgProgressFill').style.width='0%';document.getElementById('imgProgressText').textContent='0/'+imageList.length+'枚 準備中...';try{const res=await fetch('/apps/linegift-sync/download-images',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items:imageList,dir})});const data=await res.json();if(!res.ok)throw new Error(data.error||'サーバーエラー');const jobId=data.jobId;const total=data.total;const poll=setInterval(async()=>{try{const sr=await fetch('/apps/linegift-sync/download-status?id='+jobId);const status=await sr.json();const pct=Math.round(status.done/total*100);document.getElementById('imgProgressFill').style.width=pct+'%';document.getElementById('imgProgressText').textContent=status.done+'/'+total+'枚 ダウンロード中...';if(status.complete){clearInterval(poll);prog.style.display='none';result.style.display='block';const errHtml=status.errors.length>0?'<br>⚠ エラー '+status.errors.length+'件（URLが無効な画像）':'';result.innerHTML='<div class="msg msg-ok">✅ ダウンロード完了: '+status.done+'枚<br>保存先: <code>'+esc(status.dir)+'</code>'+errHtml+'</div>';toast(status.done+'枚のダウンロードが完了しました')}}catch(e){clearInterval(poll);prog.style.display='none';result.style.display='block';result.innerHTML='<div class="msg msg-warn">⚠ サーバーとの通信が途切れました。start.bat の黒い画面を確認してください。</div>'}},1000)}catch(e){prog.style.display='none';result.style.display='block';const isNetErr=e instanceof TypeError&&(e.message.includes('fetch')||e.message.includes('Failed'));if(isNetErr){showFetchScript();result.innerHTML='<div class="msg msg-warn">⚠ start.bat でサーバーを起動してから再試行してください</div>'}else{result.innerHTML='<div class="msg msg-warn">⚠ エラー: '+esc(e.message)+'</div>'}}}
+
+function addImgExcludePattern(){const val=document.getElementById('imgExcludeInput').value.trim();if(!val){toast('パターンを入力してください');return}if(state.imageExcludePatterns.includes(val)){toast('既に登録済みです');return}state.imageExcludePatterns.push(val);saveState();renderImgExcludeList();document.getElementById('imgExcludeInput').value='';toast('除外パターンを追加しました: '+val)}
+
+function removeImgExcludePattern(idx){state.imageExcludePatterns.splice(idx,1);saveState();renderImgExcludeList()}
+
+function renderImgExcludeList(){const div=document.getElementById('imgExcludeList');if(!div)return;if(!state.imageExcludePatterns||state.imageExcludePatterns.length===0){div.innerHTML='<p style="color:#888;font-size:13px">除外パターンなし</p>';return}div.innerHTML=state.imageExcludePatterns.map((p,i)=>'<div style="display:flex;align-items:center;gap:8px;margin:4px 0"><code style="background:#f5f5f5;padding:3px 10px;border-radius:4px;flex:1;font-size:13px">'+esc(p)+'</code><button class="btn-danger" style="padding:2px 8px;font-size:11px;white-space:nowrap" onclick="removeImgExcludePattern('+i+')">削除</button></div>').join('')}
+
+function exportImageTsv(){const items=getDiffItems();const target=document.getElementById('imageTarget').value;const filtered=target==='new'?items.filter(i=>i.status==='new'):items.filter(i=>i.status!=='exclude');let tsv='商品コード\tLINEコード\t画像URL\n';filtered.forEach(i=>{const lc=convertCode(i.code);(i.images||[]).forEach(url=>{tsv+=i.code+'\t'+lc+'\t'+url+'\n'})});const blob=new Blob(['﻿'+tsv],{type:'text/tab-separated-values;charset=utf-8'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='image_urls.tsv';a.click();toast('TSVをダウンロードしました')}
+
+// === State Management ===
+function saveState(){try{const s={rakutenItems:state.rakutenItems,lineItems:state.lineItems,exclusions:state.exclusions,catMappings:state.catMappings,checkedDiff:state.checkedDiff,shipMappings:state.shipMappings,catMaster:state.catMaster,imageExcludePatterns:state.imageExcludePatterns,apiServiceSecret:document.getElementById('apiServiceSecret').value,apiLicenseKey:document.getElementById('apiLicenseKey').value,shopSlug:document.getElementById('shopSlug').value,codeConvertMode:document.getElementById('codeConvertMode').value,codePrefix:document.getElementById('codePrefix').value,codeReplaceRules:document.getElementById('codeReplaceRules').value,defaultCatCode:document.getElementById('defaultCatCode').value,defStock:document.getElementById('defStock').value,defShipping:document.getElementById('defShipping').value,defShipDays:document.getElementById('defShipDays').value,defArrDays:document.getElementById('defArrDays').value};localStorage.setItem('rlSync',JSON.stringify(s))}catch(e){console.error('save error',e)}}
+
+function loadState(){try{const raw=localStorage.getItem('rlSync');if(!raw)return;const s=JSON.parse(raw);state.rakutenItems=s.rakutenItems||[];state.lineItems=s.lineItems||[];state.exclusions=s.exclusions||{};state.catMappings=s.catMappings||{};state.checkedDiff=s.checkedDiff||{};state.shipMappings=s.shipMappings||{};state.catMaster=s.catMaster||[];state.imageExcludePatterns=s.imageExcludePatterns||[];if(state.catMaster.length>0)document.getElementById('catMasterStatus').innerHTML='<span style="color:#2e7d32">'+state.catMaster.length+'件のカテゴリマスタ読込済み</span>';if(s.apiServiceSecret)document.getElementById('apiServiceSecret').value=s.apiServiceSecret;if(s.apiLicenseKey)document.getElementById('apiLicenseKey').value=s.apiLicenseKey;if(s.shopSlug)document.getElementById('shopSlug').value=s.shopSlug;if(s.codeConvertMode){document.getElementById('codeConvertMode').value=s.codeConvertMode;toggleCodeOptions()}if(s.codePrefix)document.getElementById('codePrefix').value=s.codePrefix;if(s.codeReplaceRules)document.getElementById('codeReplaceRules').value=s.codeReplaceRules;if(s.defaultCatCode)document.getElementById('defaultCatCode').value=s.defaultCatCode;if(s.defStock)document.getElementById('defStock').value=s.defStock;if(s.defShipping)document.getElementById('defShipping').value=s.defShipping;if(s.defShipDays)document.getElementById('defShipDays').value=s.defShipDays;if(s.defArrDays)document.getElementById('defArrDays').value=s.defArrDays;renderRakutenTable();renderLineTable();renderExcludeTable();renderCatmapTable();renderShipMapTable();renderImgExcludeList()}catch(e){console.error('load error',e)}}
+
+function exportState(){saveState();const raw=localStorage.getItem('rlSync');if(!raw){toast('データがありません');return}const blob=new Blob([raw],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='rlsync_backup_'+new Date().toISOString().slice(0,10)+'.json';a.click();toast('設定をエクスポートしました')}
+
+function importState(e){const file=e.target.files[0];if(!file)return;const r=new FileReader();r.onload=()=>{try{localStorage.setItem('rlSync',r.result);location.reload()}catch(ex){toast('インポート失敗')}};r.readAsText(file)}
+
+// === Drag and Drop ===
+function setupDrop(zoneId,fileInputId){const zone=document.getElementById(zoneId);if(!zone)return;zone.addEventListener('dragover',e=>{e.preventDefault();zone.classList.add('dragover')});zone.addEventListener('dragleave',()=>zone.classList.remove('dragover'));zone.addEventListener('drop',e=>{e.preventDefault();zone.classList.remove('dragover');const fi=document.getElementById(fileInputId);const dt=new DataTransfer();dt.items.add(e.dataTransfer.files[0]);fi.files=dt.files;fi.dispatchEvent(new Event('change'))})}
+
+// === Init ===
+window.addEventListener('DOMContentLoaded',()=>{loadState();setupDrop('rakutenDropZone','rakutenCsvFile');setupDrop('lineDropZone','lineCsvFile');document.querySelectorAll('input,select,textarea').forEach(el=>{if(el.id&&!el.id.includes('File')){el.addEventListener('change',saveState)}})});
+</script>
+</body>
+</html>

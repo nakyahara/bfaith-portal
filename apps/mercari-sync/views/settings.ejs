@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>設定 - 楽天→メルカリShops</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+</head>
+<body>
+  <nav class="navbar navbar-dark bg-danger px-3">
+    <a class="navbar-brand fw-bold" href="/apps/mercari-sync/">楽天→メルカリShops 登録ツール</a>
+    <div class="ms-auto d-flex align-items-center gap-2">
+      <a href="/apps/mercari-sync/" class="btn btn-outline-light btn-sm">差分チェック</a>
+      <a href="/apps/mercari-sync/settings" class="btn btn-outline-light btn-sm">設定</a>
+      <a href="/" class="btn btn-outline-light btn-sm">ポータルに戻る</a>
+    </div>
+  </nav>
+  <div class="container py-4">
+
+<h2 class="mb-4">設定</h2>
+
+<% if (saved) { %>
+<div class="alert alert-success alert-dismissible fade show">
+  設定を保存しました。
+  <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+</div>
+<% } %>
+
+<form method="post" action="/apps/mercari-sync/settings">
+
+  <div class="card mb-4 border-primary">
+    <div class="card-header fw-bold bg-primary text-white">動作モード</div>
+    <div class="card-body">
+      <div class="btn-group w-100" role="group">
+        <input type="radio" class="btn-check" name="operation_mode" id="modeCSV" value="csv" <%= (cfg.operation_mode || 'csv') === 'csv' ? 'checked' : '' %>>
+        <label class="btn btn-outline-primary" for="modeCSV">CSV出力モード（推奨）</label>
+        <input type="radio" class="btn-check" name="operation_mode" id="modeAPI" value="api" <%= (cfg.operation_mode || '') === 'api' ? 'checked' : '' %>>
+        <label class="btn btn-outline-primary" for="modeAPI">API直接登録モード</label>
+      </div>
+      <p class="text-muted small mt-2 mb-0">
+        <strong>CSV出力モード</strong>: メルカリShops管理画面からCSVインポートで一括登録します。IP制限なし。<br>
+        <strong>API直接登録モード</strong>: メルカリShops APIで直接登録します（パートナー申請・IP固定が必要）。
+      </p>
+    </div>
+  </div>
+
+  <div class="card mb-4">
+    <div class="card-header fw-bold">楽天 RMS API 認証情報</div>
+    <div class="card-body">
+      <div class="mb-3">
+        <label class="form-label">Service Secret <small class="text-muted">（SP〜 で始まる）</small></label>
+        <input type="password" class="form-control" name="service_secret" value="<%= cfg.service_secret || '' %>" placeholder="SPxxxxxxxxxxxxxxxx">
+      </div>
+      <div class="mb-3">
+        <label class="form-label">License Key <small class="text-muted">（SL〜 で始まる）</small></label>
+        <input type="password" class="form-control" name="license_key" value="<%= cfg.license_key || '' %>" placeholder="SLxxxxxxxxxxxxxxxx">
+        <div class="form-text text-warning">ライセンスキーは3ヶ月で失効します。期限切れの場合はRMS管理画面で再発行してください。</div>
+      </div>
+      <div class="mb-3">
+        <label class="form-label">楽天店舗URL <small class="text-muted">（例: b-faith ※ドメイン部分のみ）</small></label>
+        <input type="text" class="form-control" name="shop_url" value="<%= cfg.shop_url || '' %>" placeholder="b-faith">
+      </div>
+    </div>
+  </div>
+
+  <div class="card mb-4" id="csvSettingsCard">
+    <div class="card-header fw-bold">CSV出力設定（メルカリShops一括登録用）</div>
+    <div class="card-body">
+      <div class="row g-3 mb-3">
+        <div class="col-md-4">
+          <label class="form-label">配送方法</label>
+          <select class="form-select" name="shipping_method_code">
+            <% const smc = cfg.shipping_method_code || '3'; %>
+            <option value="1" <%= smc === '1' ? 'selected' : '' %>>1: 未定</option>
+            <option value="2" <%= smc === '2' ? 'selected' : '' %>>2: クール便</option>
+            <option value="3" <%= smc === '3' ? 'selected' : '' %>>3: らくらくメルカリ便</option>
+            <option value="4" <%= smc === '4' ? 'selected' : '' %>>4: クールメルカリ便（冷蔵）</option>
+            <option value="5" <%= smc === '5' ? 'selected' : '' %>>5: クールメルカリ便（冷凍）</option>
+            <option value="6" <%= smc === '6' ? 'selected' : '' %>>6: メルカリBiz配送</option>
+          </select>
+        </div>
+        <div class="col-md-4">
+          <label class="form-label">発送元の地域</label>
+          <select class="form-select" name="shipping_from_area_code">
+            <% const sfac = cfg.shipping_from_area_code || 'jp27';
+               const areas = [["jp01","北海道"],["jp02","青森県"],["jp03","岩手県"],["jp04","宮城県"],["jp05","秋田県"],["jp06","山形県"],["jp07","福島県"],["jp08","茨城県"],["jp09","栃木県"],["jp10","群馬県"],["jp11","埼玉県"],["jp12","千葉県"],["jp13","東京都"],["jp14","神奈川県"],["jp15","新潟県"],["jp16","富山県"],["jp17","石川県"],["jp18","福井県"],["jp19","山梨県"],["jp20","長野県"],["jp21","岐阜県"],["jp22","静岡県"],["jp23","愛知県"],["jp24","三重県"],["jp25","滋賀県"],["jp26","京都府"],["jp27","大阪府"],["jp28","兵庫県"],["jp29","奈良県"],["jp30","和歌山県"],["jp31","鳥取県"],["jp32","島根県"],["jp33","岡山県"],["jp34","広島県"],["jp35","山口県"],["jp36","徳島県"],["jp37","香川県"],["jp38","愛媛県"],["jp39","高知県"],["jp40","福岡県"],["jp41","佐賀県"],["jp42","長崎県"],["jp43","熊本県"],["jp44","大分県"],["jp45","宮崎県"],["jp46","鹿児島県"],["jp47","沖縄県"]];
+               areas.forEach(([code, name]) => { %>
+            <option value="<%= code %>" <%= sfac === code ? 'selected' : '' %>><%= code %>: <%= name %></option>
+            <% }); %>
+          </select>
+        </div>
+        <div class="col-md-4">
+          <label class="form-label">発送までの日数</label>
+          <select class="form-select" name="days_to_ship_code">
+            <% const dtsc = cfg.days_to_ship_code || '2'; %>
+            <option value="1" <%= dtsc === '1' ? 'selected' : '' %>>1: 1〜2日で発送</option>
+            <option value="2" <%= dtsc === '2' ? 'selected' : '' %>>2: 2〜3日で発送</option>
+            <option value="3" <%= dtsc === '3' ? 'selected' : '' %>>3: 4〜7日で発送</option>
+            <option value="4" <%= dtsc === '4' ? 'selected' : '' %>>4: 90日以内で発送</option>
+            <option value="5" <%= dtsc === '5' ? 'selected' : '' %>>5: 8〜14日で発送</option>
+          </select>
+        </div>
+      </div>
+      <div class="row g-3">
+        <div class="col-md-4">
+          <label class="form-label">配送料の負担</label>
+          <select class="form-select" name="shipping_cost_burden">
+            <% const scb = cfg.shipping_cost_burden || '1'; %>
+            <option value="1" <%= scb === '1' ? 'selected' : '' %>>1: 送料込み（出品者負担）</option>
+            <option value="2" <%= scb === '2' ? 'selected' : '' %>>2: 送料別（購入者負担）</option>
+          </select>
+        </div>
+        <div class="col-md-4">
+          <label class="form-label">商品ステータス</label>
+          <select class="form-select" name="default_product_status">
+            <% const dps = cfg.default_product_status || '1'; %>
+            <option value="1" <%= dps === '1' ? 'selected' : '' %>>1: 非公開（下書き）</option>
+            <option value="2" <%= dps === '2' ? 'selected' : '' %>>2: 公開</option>
+          </select>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card mb-4" id="exclusionSettingsCard">
+    <div class="card-header fw-bold">除外設定</div>
+    <div class="card-body">
+      <div class="mb-4">
+        <label class="form-label fw-bold">商品除外リスト</label>
+        <p class="text-muted small mb-2">メルカリShopsに登録したくない商品の商品管理番号を1行に1つずつ入力してください。</p>
+        <textarea class="form-control font-monospace" name="excluded_items" rows="5" placeholder="例:&#10;item-001&#10;item-002"><%= cfg.excluded_items || '' %></textarea>
+      </div>
+      <hr>
+      <label class="form-label fw-bold">画像除外設定</label>
+      <div class="row g-3">
+        <div class="col-md-6">
+          <label class="form-label">除外する画像の位置番号</label>
+          <input type="text" class="form-control" name="excluded_image_positions" value="<%= cfg.excluded_image_positions || '' %>" placeholder="例: 2, 5, 10">
+        </div>
+        <div class="col-md-6">
+          <label class="form-label">除外する画像URLパターン</label>
+          <textarea class="form-control" name="excluded_image_patterns" rows="3" placeholder="例:&#10;banner&#10;logo"><%= cfg.excluded_image_patterns || '' %></textarea>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card mb-4" id="apiSettingsCard">
+    <div class="card-header fw-bold">メルカリShops API <span class="badge bg-secondary ms-2">APIモード用</span></div>
+    <div class="card-body">
+      <div class="mb-3">
+        <label class="form-label">アクセストークン</label>
+        <input type="password" class="form-control" name="mercari_token" value="<%= cfg.mercari_token || '' %>">
+      </div>
+      <div class="mb-3">
+        <div class="form-check">
+          <input class="form-check-input" type="checkbox" name="use_sandbox" id="use_sandbox" <%= (cfg.use_sandbox || '0') === '1' ? 'checked' : '' %>>
+          <label class="form-check-label" for="use_sandbox">サンドボックス環境を使用する</label>
+        </div>
+      </div>
+      <div class="mb-3">
+        <label class="form-label">配送方法（API用文字列）</label>
+        <input type="text" class="form-control" name="shipping_method" value="<%= cfg.shipping_method || '' %>" placeholder="例: EAZY">
+      </div>
+      <div class="row g-3 mb-3">
+        <div class="col-md-6">
+          <label class="form-label">発送元地域</label>
+          <input type="text" class="form-control" name="shipping_from_area" value="<%= cfg.shipping_from_area || '' %>" placeholder="例: 27">
+        </div>
+        <div class="col-md-6">
+          <label class="form-label">発送までの日数</label>
+          <input type="number" class="form-control" name="days_to_ship" value="<%= cfg.days_to_ship || '1' %>" min="1" max="7">
+        </div>
+      </div>
+      <button type="button" class="btn btn-outline-secondary btn-sm" id="btnTestConn">接続テスト</button>
+      <span id="connResult" class="ms-2"></span>
+    </div>
+  </div>
+
+  <div class="card mb-4">
+    <div class="card-header fw-bold">カテゴリマッピング（楽天ジャンルID → メルカリカテゴリID）</div>
+    <div class="card-body">
+      <div class="mb-2">
+        <label class="form-label">デフォルトカテゴリID</label>
+        <input type="text" class="form-control" name="default_mercari_category" value="<%= cfg.default_mercari_category || '' %>" placeholder="メルカリShopsのカテゴリID">
+      </div>
+      <hr>
+      <div id="mappingRows">
+        <% category_mappings.forEach(m => { %>
+        <div class="row g-2 mb-2 mapping-row">
+          <div class="col-5"><input type="text" class="form-control form-control-sm mapping-genre" placeholder="楽天ジャンルID" value="<%= m.rakuten_genre_id %>"></div>
+          <div class="col-5"><input type="text" class="form-control form-control-sm mapping-cat" placeholder="メルカリカテゴリID" value="<%= m.mercari_category %>"></div>
+          <div class="col-2"><button type="button" class="btn btn-outline-danger btn-sm" onclick="this.closest('.mapping-row').remove()">削除</button></div>
+        </div>
+        <% }); %>
+      </div>
+      <button type="button" class="btn btn-outline-secondary btn-sm mt-2" id="btnAddMapping">+ 行を追加</button>
+      <input type="hidden" name="category_mappings_json" id="category_mappings_json">
+    </div>
+  </div>
+
+  <button type="submit" class="btn btn-danger px-5" id="btnSave">保存</button>
+</form>
+
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script>
+const BASE = '/apps/mercari-sync';
+
+function updateModeUI() {
+  const isCSV = document.getElementById('modeCSV').checked;
+  document.getElementById('csvSettingsCard').classList.toggle('d-none', !isCSV);
+  document.getElementById('apiSettingsCard').classList.toggle('d-none', isCSV);
+}
+document.querySelectorAll('[name="operation_mode"]').forEach(r => r.addEventListener('change', updateModeUI));
+updateModeUI();
+
+document.getElementById('btnAddMapping').addEventListener('click', () => {
+  const row = document.createElement('div');
+  row.className = 'row g-2 mb-2 mapping-row';
+  row.innerHTML = '<div class="col-5"><input type="text" class="form-control form-control-sm mapping-genre" placeholder="楽天ジャンルID"></div><div class="col-5"><input type="text" class="form-control form-control-sm mapping-cat" placeholder="メルカリカテゴリID"></div><div class="col-2"><button type="button" class="btn btn-outline-danger btn-sm" onclick="this.closest(\'.mapping-row\').remove()">削除</button></div>';
+  document.getElementById('mappingRows').appendChild(row);
+});
+
+document.querySelector('form').addEventListener('submit', () => {
+  const mappings = [];
+  document.querySelectorAll('.mapping-row').forEach(row => {
+    const genre = row.querySelector('.mapping-genre').value.trim();
+    const cat = row.querySelector('.mapping-cat').value.trim();
+    if (genre && cat) mappings.push({rakuten_genre_id: genre, mercari_category: cat});
+  });
+  document.getElementById('category_mappings_json').value = JSON.stringify(mappings);
+});
+
+document.getElementById('btnTestConn').addEventListener('click', async () => {
+  const el = document.getElementById('connResult');
+  el.textContent = '確認中…';
+  try {
+    const res = await fetch(BASE + '/api/test-connection', {method:'POST'});
+    const data = await res.json();
+    el.textContent = data.message;
+    el.className = data.ok ? 'ms-2 text-success fw-bold' : 'ms-2 text-danger fw-bold';
+  } catch(e) { el.textContent = 'エラー: ' + e.message; el.className = 'ms-2 text-danger'; }
+});
+  </script>
+</body>
+</html>

@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>B-Faith Portal</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <% if (typeof role !== 'undefined' && role === 'admin') { %>
+        <a href="/admin/permissions" class="btn-admin">権限管理</a>
+      <% } %>
+      <a href="/logout" class="btn-logout">ログアウト</a>
+    </div>
+  </header>
+
+  <main class="dashboard">
+    <% categories.forEach(cat => { %>
+      <% const catApps = apps.filter(a => a.category === cat.id); %>
+      <% if (catApps.length > 0) { %>
+      <section class="app-section">
+        <h2><span class="category-icon"><%= cat.icon %></span> <%= cat.name %></h2>
+        <div class="app-grid">
+          <% catApps.forEach(app => { %>
+            <a href="<%= app.path %>" class="app-card <%= app.status === 'coming-soon' ? 'coming-soon' : '' %>">
+              <div class="app-icon"><%= app.icon %></div>
+              <div class="app-info">
+                <h3><%= app.name %></h3>
+                <p><%= app.description %></p>
+              </div>
+              <% if (app.status === 'coming-soon') { %>
+                <span class="badge-soon">準備中</span>
+              <% } else { %>
+                <span class="badge-active">稼働中</span>
+              <% } %>
+            </a>
+          <% }) %>
+        </div>
+      </section>
+      <% } %>
+    <% }) %>
+
+    <% if (externalLinks.length > 0) { %>
+    <section class="app-section">
+      <h2><span class="category-icon">🔗</span> 外部リンク</h2>
+      <div class="app-grid">
+        <% externalLinks.forEach(link => { %>
+          <a href="<%= link.url %>" target="_blank" rel="noopener" class="app-card external">
+            <div class="app-icon"><%= link.icon %></div>
+            <div class="app-info">
+              <h3><%= link.name %></h3>
+              <p><%= link.description %></p>
+            </div>
+            <span class="badge-external">外部</span>
+          </a>
+        <% }) %>
+      </div>
+    </section>
+    <% } %>
+  </main>
+</body>
+</html>

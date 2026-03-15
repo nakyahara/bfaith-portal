@@ -1,0 +1,737 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AESラベル並び替えツール</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500;700&family=Roboto:wght@300;400;500;700&display=swap">
+    <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons">
+
+    <style>
+        :root {
+            --primary-color: #1a73e8;
+            --primary-color-dark: #1557b0;
+            --text-primary: #202124;
+            --text-secondary: #5f6368;
+            --border-color: #dadce0;
+            --background-color: #f8f9fa;
+            --drop-zone-bg: rgba(26, 115, 232, 0.04);
+            --shadow-light: 0 1px 3px rgba(0,0,0,0.1);
+            --shadow-medium: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        * { box-sizing: border-box; }
+        body {
+            font-family: 'Noto Sans JP', 'Roboto', sans-serif;
+            margin: 0;
+            background-color: var(--background-color);
+            color: var(--text-primary);
+        }
+
+        /* ヘッダー */
+        .header-section {
+            background: linear-gradient(135deg, var(--primary-color) 0%, var(--primary-color-dark) 100%);
+            color: white; padding: 16px 24px;
+            display: flex; align-items: center; justify-content: space-between;
+        }
+        .header-main-content { display: flex; align-items: center; gap: 16px; }
+        .header-icon { font-size: 32px; }
+        .header-text h1 { margin: 0; font-size: 20px; font-weight: 500; }
+        .header-text p { margin: 4px 0 0; font-size: 13px; opacity: 0.85; }
+        .header-stats { display: flex; align-items: center; gap: 16px; }
+        .header-stat-item { font-size: 13px; display: flex; align-items: center; gap: 4px; }
+        .header-stat-value { font-weight: 700; }
+
+        /* ポータルに戻るボタン */
+        .back-to-portal {
+            background: rgba(255,255,255,0.15); color: white; border: 1px solid rgba(255,255,255,0.3);
+            padding: 6px 14px; border-radius: 4px; text-decoration: none; font-size: 13px;
+            transition: background 0.2s;
+        }
+        .back-to-portal:hover { background: rgba(255,255,255,0.25); color: white; }
+
+        /* コンテナ */
+        .container { max-width: 1100px; margin: 0 auto; padding: 24px; }
+
+        /* ドロップゾーン */
+        .unified-drop-zone {
+            border: 2px dashed var(--border-color); border-radius: 12px;
+            padding: 40px 20px; text-align: center; cursor: pointer;
+            background: var(--drop-zone-bg); transition: all 0.3s;
+            margin-bottom: 20px;
+        }
+        .unified-drop-zone:hover, .unified-drop-zone.dragover {
+            border-color: var(--primary-color); background: rgba(26, 115, 232, 0.08);
+        }
+        .unified-drop-icon { font-size: 48px; color: var(--primary-color); margin-bottom: 12px; }
+        .unified-drop-title { font-size: 18px; font-weight: 500; margin: 0 0 8px; }
+        .unified-drop-subtitle { font-size: 14px; color: var(--text-secondary); margin: 0 0 16px; }
+        .supported-formats { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
+        .format-tag {
+            background: white; border: 1px solid var(--border-color); padding: 4px 12px;
+            border-radius: 16px; font-size: 12px; font-family: monospace;
+        }
+
+        /* コントロールボタン */
+        .control-buttons { display: flex; gap: 12px; margin-bottom: 20px; }
+        .control-button {
+            display: flex; align-items: center; gap: 6px; padding: 10px 20px;
+            border: none; border-radius: 8px; font-size: 14px; cursor: pointer;
+            font-weight: 500; transition: all 0.2s;
+        }
+        .control-button.primary {
+            background: var(--primary-color); color: white;
+        }
+        .control-button.primary:hover:not(:disabled) { background: var(--primary-color-dark); }
+        .control-button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+        .control-button.secondary {
+            background: white; color: var(--text-secondary); border: 1px solid var(--border-color);
+        }
+        .control-button.secondary:hover { background: #f1f3f4; }
+
+        /* 処理中 */
+        .processing-section {
+            text-align: center; padding: 32px; background: white;
+            border-radius: 12px; border: 1px solid var(--border-color); margin-bottom: 20px;
+        }
+        .processing-icon { font-size: 48px; color: var(--primary-color); animation: spin 1.5s linear infinite; }
+        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+        .processing-text { font-size: 16px; font-weight: 500; margin-top: 12px; }
+        .processing-detail { font-size: 13px; color: var(--text-secondary); margin-top: 4px; }
+        .progress-bar {
+            width: 100%; height: 4px; background: #e8eaed; border-radius: 2px;
+            overflow: hidden; margin-top: 16px;
+        }
+        .progress-fill {
+            height: 100%; background: var(--primary-color); transition: width 0.5s ease;
+            border-radius: 2px;
+        }
+
+        /* ファイルカテゴリ */
+        .file-categories { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+        .file-category {
+            background: white; border: 1px solid var(--border-color); border-radius: 12px;
+            padding: 20px; text-align: center; cursor: pointer; transition: all 0.2s;
+            min-height: 160px;
+        }
+        .file-category:hover { box-shadow: var(--shadow-medium); }
+        .file-category.dragover { border-color: var(--primary-color); background: rgba(26, 115, 232, 0.04); }
+        .category-icon { font-size: 36px; margin-bottom: 8px; }
+        .category-icon.shipping { color: #e53935; }
+        .category-icon.order { color: #1e88e5; }
+        .category-icon.invoice { color: #43a047; }
+        .category-title { font-size: 14px; font-weight: 500; margin: 0 0 4px; }
+        .category-description { font-size: 12px; color: var(--text-secondary); margin: 0 0 8px; }
+        .file-pattern {
+            display: inline-block; font-family: monospace; font-size: 11px;
+            background: #f1f3f4; padding: 2px 8px; border-radius: 4px;
+        }
+        .file-list { margin-top: 12px; text-align: left; }
+        .file-item {
+            display: flex; align-items: center; gap: 6px; padding: 6px 8px;
+            background: #f8f9fa; border-radius: 6px; margin-bottom: 4px; font-size: 12px;
+        }
+        .file-item .material-icons { font-size: 16px; }
+        .file-item.shipping .material-icons { color: #e53935; }
+        .file-item.order .material-icons { color: #1e88e5; }
+        .file-item.invoice .material-icons { color: #43a047; }
+        .file-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .remove-file {
+            background: none; border: none; cursor: pointer; padding: 2px;
+            color: var(--text-secondary); display: flex;
+        }
+        .remove-file:hover { color: #e53935; }
+
+        /* モーダル */
+        .modal-overlay {
+            display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+            z-index: 1000; align-items: center; justify-content: center;
+        }
+        .modal-overlay.show { display: flex; }
+        .modal-dialog {
+            background: white; border-radius: 16px; width: 90%; max-width: 700px;
+            max-height: 85vh; overflow: hidden; display: flex; flex-direction: column;
+            box-shadow: 0 24px 48px rgba(0,0,0,0.2);
+        }
+        .modal-header {
+            padding: 24px; text-align: center; background: #f0fdf4;
+            border-bottom: 1px solid #e8f5e9; position: relative;
+        }
+        .modal-close {
+            position: absolute; top: 12px; right: 12px; background: none;
+            border: none; cursor: pointer; color: var(--text-secondary); display: flex;
+        }
+        .success-icon { font-size: 48px; color: #43a047; }
+        .modal-title { font-size: 20px; font-weight: 500; margin: 8px 0 4px; }
+        .modal-subtitle { font-size: 14px; color: var(--text-secondary); margin: 0; }
+        .modal-body { padding: 24px; overflow-y: auto; flex: 1; }
+        .modal-footer {
+            padding: 16px 24px; border-top: 1px solid var(--border-color);
+            display: flex; justify-content: flex-end; gap: 12px;
+        }
+        .modal-button {
+            display: flex; align-items: center; gap: 6px; padding: 10px 20px;
+            border: none; border-radius: 8px; font-size: 14px; cursor: pointer; font-weight: 500;
+        }
+        .modal-button.primary { background: var(--primary-color); color: white; }
+        .modal-button.primary:hover { background: var(--primary-color-dark); }
+        .modal-button.secondary {
+            background: white; color: var(--text-secondary); border: 1px solid var(--border-color);
+        }
+        .modal-button.all-downloaded { background: #28a745; cursor: default; }
+
+        /* ダウンロードセクション */
+        .download-section { margin-bottom: 16px; }
+        .section-header { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+        .section-icon { color: var(--primary-color); }
+        .section-title { font-size: 16px; font-weight: 500; margin: 0; }
+        .file-set-grid { display: flex; flex-direction: column; gap: 12px; }
+        .file-set {
+            background: #f8f9fa; border: 1px solid var(--border-color); border-radius: 12px;
+            padding: 16px; position: relative;
+        }
+        .set-header { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+        .set-number {
+            width: 32px; height: 32px; background: var(--primary-color); color: white;
+            border-radius: 50%; display: flex; align-items: center; justify-content: center;
+            font-weight: 700; font-size: 14px;
+        }
+        .set-info h3 { margin: 0; font-size: 14px; }
+        .set-info p { margin: 2px 0 0; font-size: 12px; color: var(--text-secondary); }
+        .file-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+        .file-pair.single { grid-template-columns: 1fr; }
+        .pair-file {
+            background: white; border: 1px solid var(--border-color); border-radius: 8px;
+            padding: 12px; cursor: pointer; transition: all 0.2s; position: relative;
+        }
+        .pair-file:hover { border-color: var(--primary-color); box-shadow: var(--shadow-light); }
+        .pair-file.downloaded { border-color: #43a047; background: #f0fdf4; }
+        .pair-file.downloading { opacity: 0.7; }
+        .pair-file-header { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+        .pair-file-icon { font-size: 20px; }
+        .pair-file-icon.invoice { color: #43a047; }
+        .pair-file-icon.label { color: #e53935; }
+        .pair-file-icon.error { color: #f44336; }
+        .pair-file-type { font-size: 12px; color: var(--text-secondary); }
+        .pair-file-name { font-size: 11px; word-break: break-all; color: var(--text-primary); }
+
+        .download-all-set {
+            position: absolute; top: 12px; right: 12px; background: var(--primary-color);
+            color: white; border: none; border-radius: 6px; padding: 4px 10px;
+            font-size: 12px; cursor: pointer; display: flex; align-items: center; gap: 4px;
+        }
+        .download-all-set.all-downloaded { background: #43a047; }
+
+        .redownload-all-set, .redownload-button {
+            position: absolute; background: none; border: none; cursor: pointer;
+            color: var(--text-secondary); display: none; padding: 2px;
+        }
+        .redownload-all-set { top: 12px; right: 100px; font-size: 11px; display: flex; align-items: center; gap: 2px; }
+        .redownload-button { top: 4px; right: 4px; }
+        .pair-file.downloaded .redownload-button { display: flex; }
+
+        .settings-toggle {
+            position: absolute; top: 12px; left: 12px; background: none;
+            border: none; cursor: pointer; color: var(--text-secondary); display: flex;
+        }
+        .settings-panel {
+            display: none; position: absolute; top: 52px; right: 12px; background: white;
+            border: 1px solid var(--border-color); border-radius: 12px; padding: 16px;
+            box-shadow: var(--shadow-medium); z-index: 10; min-width: 300px; text-align: left;
+        }
+        .settings-panel.show { display: block; }
+        .settings-panel-header { font-size: 14px; font-weight: 500; margin-bottom: 12px; display: flex; align-items: center; gap: 6px; }
+        .settings-item { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; }
+        .settings-item-label { font-size: 13px; }
+        .settings-item-description { font-size: 11px; color: var(--text-secondary); margin-top: 2px; }
+        .settings-switch {
+            width: 40px; height: 22px; background: #ccc; border-radius: 11px;
+            cursor: pointer; position: relative; transition: background 0.2s;
+        }
+        .settings-switch::after {
+            content: ''; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px;
+            background: white; border-radius: 50%; transition: left 0.2s;
+        }
+        .settings-switch.active { background: var(--primary-color); }
+        .settings-switch.active::after { left: 20px; }
+
+        /* 再ダウンロード確認 */
+        .redownload-confirm-overlay {
+            display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.4);
+            z-index: 2000; align-items: center; justify-content: center;
+        }
+        .redownload-confirm-overlay.show { display: flex; }
+        .redownload-confirm-dialog {
+            background: white; border-radius: 12px; padding: 24px; width: 90%; max-width: 400px;
+            text-align: center; box-shadow: 0 16px 32px rgba(0,0,0,0.2);
+        }
+        .redownload-confirm-icon { font-size: 36px; color: var(--primary-color); }
+        .redownload-confirm-title { font-size: 16px; font-weight: 500; margin: 8px 0; }
+        .redownload-confirm-message { font-size: 14px; color: var(--text-secondary); margin-bottom: 20px; }
+        .redownload-confirm-buttons { display: flex; gap: 12px; justify-content: center; }
+        .redownload-confirm-button {
+            padding: 8px 20px; border: none; border-radius: 8px; font-size: 14px;
+            cursor: pointer; font-weight: 500;
+        }
+        .redownload-confirm-button.primary { background: var(--primary-color); color: white; }
+        .redownload-confirm-button.secondary { background: #f1f3f4; color: var(--text-secondary); }
+
+        .download-progress {
+            margin-top: 16px; padding: 12px; background: #f8f9fa;
+            border-radius: 8px; border: 1px solid #e9ecef; font-size: 14px; color: #495057;
+        }
+        .download-progress-bar {
+            width: 100%; height: 4px; background: rgba(26, 115, 232, 0.1);
+            border-radius: 2px; overflow: hidden; margin-top: 8px;
+        }
+        .download-progress-fill {
+            height: 100%; background: linear-gradient(90deg, var(--primary-color) 0%, #1557b0 100%);
+            width: 0%; transition: width 0.3s ease; border-radius: 2px;
+        }
+
+        @media (max-width: 768px) {
+            .file-categories { grid-template-columns: 1fr; }
+            .file-pair { grid-template-columns: 1fr; }
+            .header-section { flex-direction: column; gap: 12px; }
+        }
+    </style>
+</head>
+<body>
+    <div id="app">
+        <!-- ヘッダー -->
+        <div class="header-section">
+            <div class="header-main-content">
+                <div class="header-icon"><span class="material-icons">sort</span></div>
+                <div class="header-text">
+                    <h1>AESラベル並び替えツール</h1>
+                    <p>ネクストエンジン・AES・ロジザードファイルを効率的に処理・整理</p>
+                </div>
+            </div>
+            <div class="header-stats">
+                <div class="header-stat-item">
+                    <span class="material-icons" style="font-size: 14px;">description</span>
+                    <span class="header-stat-value">{{ files.shipping.length + files.order.length + files.invoice.length }}</span>
+                </div>
+                <div class="header-stat-item" v-if="canProcess">
+                    <span class="material-icons" style="font-size: 14px;">check_circle</span> 準備完了
+                </div>
+                <a href="/" class="back-to-portal">
+                    <span class="material-icons" style="font-size: 14px; vertical-align: middle;">home</span>
+                    ポータルに戻る
+                </a>
+            </div>
+        </div>
+
+        <div class="container">
+            <!-- ドロップゾーン -->
+            <div class="unified-drop-zone"
+                 :class="{ dragover: draggedCategory === 'unified' }"
+                 @click="selectAllFiles"
+                 @dragover.prevent="handleUnifiedDragOver"
+                 @dragleave.prevent="handleDragLeave"
+                 @drop.prevent="handleUnifiedDrop">
+                <span class="material-icons unified-drop-icon">cloud_upload</span>
+                <h3 class="unified-drop-title">ファイルをここにドロップ</h3>
+                <p class="unified-drop-subtitle">複数のファイルを一度にアップロードできます</p>
+                <div class="supported-formats">
+                    <span class="format-tag">AES*.pdf</span>
+                    <span class="format-tag">logi_jyuchu*.csv</span>
+                    <span class="format-tag">TMP*.pdf</span>
+                </div>
+            </div>
+
+            <!-- コントロールボタン -->
+            <div class="control-buttons">
+                <button class="control-button primary" @click="startProcessing" :disabled="!canProcess || isProcessing">
+                    <span class="material-icons">play_arrow</span> 処理開始
+                </button>
+                <button class="control-button secondary" @click="clearAllFiles">
+                    <span class="material-icons">clear</span> 全てクリア
+                </button>
+            </div>
+
+            <!-- 処理中 -->
+            <div v-if="isProcessing" class="processing-section">
+                <span class="material-icons processing-icon">sync</span>
+                <div class="processing-text">{{ processingStatus }}</div>
+                <div class="processing-detail">{{ processingDetail }}</div>
+                <div class="progress-bar"><div class="progress-fill" :style="{ width: progress + '%' }"></div></div>
+            </div>
+
+            <!-- ファイルカテゴリ -->
+            <div class="file-categories">
+                <div class="file-category" :class="{ dragover: draggedCategory === 'shipping' }"
+                     @click="selectFiles('shipping')"
+                     @dragover.prevent="handleDragOver($event, 'shipping')"
+                     @dragleave.prevent="handleDragLeave"
+                     @drop.prevent="handleDrop($event, 'shipping')">
+                    <span class="material-icons category-icon shipping">local_shipping</span>
+                    <h3 class="category-title">AES配送ラベル</h3>
+                    <p class="category-description">AESから始まるファイル名のPDFファイル</p>
+                    <span class="file-pattern">AES*.pdf</span>
+                    <div v-if="files.shipping.length > 0" class="file-list">
+                        <div v-for="(file, index) in files.shipping" :key="index" class="file-item shipping">
+                            <span class="material-icons">picture_as_pdf</span>
+                            <span class="file-name">{{ file.name }}</span>
+                            <button @click.stop="removeFile('shipping', index)" class="remove-file"><span class="material-icons">close</span></button>
+                        </div>
+                    </div>
+                </div>
+                <div class="file-category" :class="{ dragover: draggedCategory === 'order' }"
+                     @click="selectFiles('order')"
+                     @dragover.prevent="handleDragOver($event, 'order')"
+                     @dragleave.prevent="handleDragLeave"
+                     @drop.prevent="handleDrop($event, 'order')">
+                    <span class="material-icons category-icon order">table_chart</span>
+                    <h3 class="category-title">オーダーCSV</h3>
+                    <p class="category-description">ネクストエンジンから出力されたCSVファイル</p>
+                    <span class="file-pattern">logi_jyuchu*.csv</span>
+                    <div v-if="files.order.length > 0" class="file-list">
+                        <div v-for="(file, index) in files.order" :key="index" class="file-item order">
+                            <span class="material-icons">table_chart</span>
+                            <span class="file-name">{{ file.name }}</span>
+                            <button @click.stop="removeFile('order', index)" class="remove-file"><span class="material-icons">close</span></button>
+                        </div>
+                    </div>
+                </div>
+                <div class="file-category" :class="{ dragover: draggedCategory === 'invoice' }"
+                     @click="selectFiles('invoice')"
+                     @dragover.prevent="handleDragOver($event, 'invoice')"
+                     @dragleave.prevent="handleDragLeave"
+                     @drop.prevent="handleDrop($event, 'invoice')">
+                    <span class="material-icons category-icon invoice">receipt</span>
+                    <h3 class="category-title">納品書PDF</h3>
+                    <p class="category-description">ロジザードから出力されたPDFファイル</p>
+                    <span class="file-pattern">TMP*.pdf</span>
+                    <div v-if="files.invoice.length > 0" class="file-list">
+                        <div v-for="(file, index) in files.invoice" :key="index" class="file-item invoice">
+                            <span class="material-icons">picture_as_pdf</span>
+                            <span class="file-name">{{ file.name }}</span>
+                            <button @click.stop="removeFile('invoice', index)" class="remove-file"><span class="material-icons">close</span></button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 非表示ファイル入力 -->
+            <input ref="unifiedInput" type="file" style="display: none" multiple accept=".pdf,.csv" @change="handleUnifiedFileSelect">
+            <input ref="shippingInput" type="file" style="display: none" multiple accept=".pdf" @change="handleFileSelect($event, 'shipping')">
+            <input ref="orderInput" type="file" style="display: none" multiple accept=".csv" @change="handleFileSelect($event, 'order')">
+            <input ref="invoiceInput" type="file" style="display: none" multiple accept=".pdf" @change="handleFileSelect($event, 'invoice')">
+
+            <!-- 結果モーダル -->
+            <div class="modal-overlay" id="resultModal">
+                <div class="modal-dialog">
+                    <div class="modal-header">
+                        <button class="modal-close" onclick="closeResultModal()"><span class="material-icons">close</span></button>
+                        <button class="settings-toggle" onclick="toggleSettings()"><span class="material-icons">settings</span></button>
+                        <span class="material-icons success-icon">check_circle</span>
+                        <div>
+                            <h2 class="modal-title">処理完了</h2>
+                            <p class="modal-subtitle" id="modalSubtitle">ファイルの処理が正常に完了しました</p>
+                        </div>
+                        <div class="settings-panel" id="settingsPanel">
+                            <div class="settings-panel-header"><span class="material-icons">tune</span> ダウンロード設定</div>
+                            <div class="settings-item">
+                                <div class="settings-item-label">再ダウンロード許可<div class="settings-item-description">ダウンロード済みファイルの再取得を有効にします</div></div>
+                                <div class="settings-switch active" id="redownloadSwitch" onclick="toggleRedownload()"></div>
+                            </div>
+                            <div class="settings-item">
+                                <div class="settings-item-label">確認ダイアログ表示<div class="settings-item-description">再ダウンロード前に確認ダイアログを表示します</div></div>
+                                <div class="settings-switch active" id="confirmSwitch" onclick="toggleConfirm()"></div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="modal-body" id="modalBody"></div>
+                    <div class="modal-footer">
+                        <button class="modal-button secondary" onclick="closeResultModal()"><span class="material-icons">close</span> 閉じる</button>
+                        <button class="modal-button" id="redownloadAllButton" onclick="redownloadAllFiles()" style="display: none;"><span class="material-icons">refresh</span> すべて再取得</button>
+                        <button class="modal-button primary" onclick="downloadAllFiles()"><span class="material-icons">download</span> すべてダウンロード</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 再ダウンロード確認 -->
+            <div class="redownload-confirm-overlay" id="redownloadConfirmModal">
+                <div class="redownload-confirm-dialog">
+                    <div><span class="material-icons redownload-confirm-icon">refresh</span></div>
+                    <h3 class="redownload-confirm-title">再ダウンロード確認</h3>
+                    <div class="redownload-confirm-message" id="redownloadConfirmMessage">このファイルを再度ダウンロードしますか？</div>
+                    <div class="redownload-confirm-buttons">
+                        <button class="redownload-confirm-button secondary" onclick="closeRedownloadConfirm()">キャンセル</button>
+                        <button class="redownload-confirm-button primary" onclick="confirmRedownload()">再ダウンロード</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script>
+    // ポータルプレフィックス（EJSから渡される）
+    const PORTAL_PREFIX = '<%= portalPrefix %>';
+
+    const { createApp } = Vue;
+    const app = createApp({
+        data() {
+            return {
+                files: { shipping: [], order: [], invoice: [] },
+                draggedCategory: null,
+                isProcessing: false,
+                progress: 0,
+                processingStatus: '',
+                processingDetail: ''
+            };
+        },
+        computed: {
+            canProcess() {
+                return this.files.shipping.length > 0 && this.files.order.length > 0 && this.files.invoice.length > 0;
+            }
+        },
+        methods: {
+            selectFiles(category) {
+                const map = { shipping: 'shippingInput', order: 'orderInput', invoice: 'invoiceInput' };
+                this.$refs[map[category]].click();
+            },
+            selectAllFiles() { this.$refs.unifiedInput.click(); },
+            handleFileSelect(event, category) {
+                const files = Array.from(event.target.files);
+                this.addFiles(files, category);
+                event.target.value = '';
+            },
+            handleDragOver(event, category) { this.draggedCategory = category; },
+            handleUnifiedDragOver() { this.draggedCategory = 'unified'; },
+            handleDragLeave() { this.draggedCategory = null; },
+            handleDrop(event, category) {
+                this.draggedCategory = null;
+                this.addFiles(Array.from(event.dataTransfer.files), category);
+            },
+            handleUnifiedDrop(event) {
+                this.draggedCategory = null;
+                this.addUnifiedFiles(Array.from(event.dataTransfer.files));
+            },
+            handleUnifiedFileSelect(event) {
+                this.addUnifiedFiles(Array.from(event.target.files));
+                event.target.value = '';
+            },
+            getFileId(file) { return `${file.name}_${file.size}`; },
+            isDuplicate(file, category) {
+                return this.files[category].some(f => this.getFileId(f) === this.getFileId(file));
+            },
+            addFiles(files, category) {
+                const validations = {
+                    shipping: f => f.name.startsWith('AES') && f.name.toLowerCase().endsWith('.pdf'),
+                    order: f => f.name.startsWith('logi_jyuchu') && f.name.toLowerCase().endsWith('.csv'),
+                    invoice: f => f.name.startsWith('TMP') && f.name.toLowerCase().endsWith('.pdf')
+                };
+                const valid = files.filter(f => validations[category] ? validations[category](f) : true);
+                valid.forEach(f => { if (!this.isDuplicate(f, category)) this.files[category].push(f); });
+            },
+            addUnifiedFiles(files) {
+                files.forEach(file => {
+                    const fn = file.name.toLowerCase();
+                    if (fn.startsWith('aes') && fn.endsWith('.pdf')) {
+                        if (!this.isDuplicate(file, 'shipping')) this.files.shipping.push(file);
+                    } else if (fn.startsWith('logi_jyuchu') && fn.endsWith('.csv')) {
+                        if (!this.isDuplicate(file, 'order')) this.files.order.push(file);
+                    } else if (fn.startsWith('tmp') && fn.endsWith('.pdf')) {
+                        if (!this.isDuplicate(file, 'invoice')) this.files.invoice.push(file);
+                    }
+                });
+            },
+            removeFile(category, index) { this.files[category].splice(index, 1); },
+            clearAllFiles() {
+                const total = this.files.shipping.length + this.files.order.length + this.files.invoice.length;
+                if (total > 0 && !confirm(`${total}個のファイルを削除します。よろしいですか？`)) return;
+                this.files = { shipping: [], order: [], invoice: [] };
+            },
+            async startProcessing() {
+                this.isProcessing = true;
+                this.progress = 0;
+                this.processingStatus = '処理を開始しています...';
+                this.processingDetail = 'ファイルをアップロード中';
+
+                const formData = new FormData();
+                [...this.files.shipping, ...this.files.order, ...this.files.invoice].forEach(f => formData.append('files', f));
+
+                try {
+                    const steps = [
+                        { progress: 20, status: 'ファイルを読み込み中...', detail: 'CSVデータを解析中' },
+                        { progress: 40, status: 'バーコードを読み取り中...', detail: '配送ラベルを処理中' },
+                        { progress: 60, status: '注文番号を抽出中...', detail: '納品書を解析中' },
+                        { progress: 80, status: 'データを照合中...', detail: '注文と配送を紐づけ中' },
+                        { progress: 95, status: 'ファイルを生成中...', detail: '処理済みPDFを作成中' }
+                    ];
+                    const interval = setInterval(() => {
+                        const step = steps.find(s => s.progress > this.progress);
+                        if (step) { this.progress = step.progress; this.processingStatus = step.status; this.processingDetail = step.detail; }
+                    }, 800);
+
+                    const response = await fetch(`${PORTAL_PREFIX}/process_aes_sorting`, { method: 'POST', body: formData });
+                    clearInterval(interval);
+                    this.progress = 100;
+                    this.processingStatus = '処理完了';
+
+                    if (response.ok) {
+                        const ct = response.headers.get('Content-Type');
+                        if (ct && ct.includes('application/json')) {
+                            showResultModal(await response.json());
+                        } else {
+                            alert('予期しないレスポンス形式です');
+                        }
+                    } else {
+                        try { const e = await response.json(); alert('エラー: ' + (e.detail || 'サーバーエラー')); }
+                        catch { alert('エラー: ' + (await response.text()).substring(0, 200)); }
+                    }
+                } catch (error) {
+                    alert('ネットワークエラー: ' + error.message);
+                } finally {
+                    this.isProcessing = false;
+                }
+            }
+        }
+    });
+    window.vueApp = app.mount('#app');
+
+    // --- モーダル制御 ---
+    let currentFiles = [];
+    let downloadedFiles = new Set();
+    let downloadingFiles = new Set();
+    let redownloadSettings = { enabled: true, showConfirm: true };
+    let pendingRedownload = null;
+
+    function showResultModal(result) {
+        currentFiles = result.files || [];
+        downloadedFiles.clear();
+        downloadingFiles.clear();
+        document.getElementById('modalSubtitle').textContent = `成功: ${result.processed_count}件、エラー: ${result.error_count}件`;
+        document.getElementById('modalBody').innerHTML = generateModalContent(result);
+        document.getElementById('resultModal').classList.add('show');
+    }
+
+    function generateModalContent(result) {
+        if (!result.files || !result.files.length) return '<p>ダウンロード可能なファイルがありません。</p>';
+        const invoices = result.files.filter(f => f.type === 'invoice');
+        const labels = result.files.filter(f => f.type === 'label');
+        const errors = result.files.filter(f => f.type === 'error_log');
+        const sets = Math.min(invoices.length, labels.length);
+        let html = '<div class="download-section"><div class="section-header"><span class="material-icons section-icon">inventory</span><h3 class="section-title">ダウンロードセット (' + (sets + errors.length) + 'セット)</h3></div><div class="file-set-grid">';
+
+        let setNum = 1;
+        for (let i = 0; i < sets; i++) {
+            const ids = `${invoices[i].download_id},${labels[i].download_id}`;
+            html += `<div class="file-set" data-set-id="${setNum}"><button class="download-all-set" onclick="downloadMultipleFiles('${ids}')"><span class="material-icons" style="font-size:14px">download</span> セット取得</button><div class="set-header"><div class="set-number">${setNum}</div><div class="set-info"><h3>セット${setNum}</h3><p>ステータス: 正常処理</p></div></div><div class="file-pair">`;
+            html += fileTile(invoices[i], 'invoice', 'description', '処理済み納品書', setNum);
+            html += fileTile(labels[i], 'label', 'local_shipping', '対応ラベル', setNum);
+            html += '</div></div>';
+            setNum++;
+        }
+        for (const err of errors) {
+            html += `<div class="file-set" data-set-id="${setNum}"><button class="download-all-set" onclick="downloadFile('${err.download_id}')"><span class="material-icons" style="font-size:14px">download</span> 取得</button><div class="set-header"><div class="set-number">${setNum}</div><div class="set-info"><h3>セット${setNum}</h3><p>ステータス: エラー</p></div></div><div class="file-pair single">`;
+            html += fileTile(err, 'error', 'error', 'エラーログ', setNum);
+            html += '</div></div>';
+            setNum++;
+        }
+        html += '</div></div>';
+        if (currentFiles.length > 0) {
+            html += `<div class="download-progress" id="downloadProgress" style="display:none"><div>ダウンロード進捗: <span id="downloadProgressText">0 / ${currentFiles.length}</span></div><div class="download-progress-bar"><div class="download-progress-fill" id="downloadProgressFill"></div></div></div>`;
+        }
+        return html;
+    }
+
+    function fileTile(f, type, icon, label, setNum) {
+        return `<div class="pair-file ${type}" data-file-id="${f.download_id}" data-set-id="${setNum}" onclick="downloadFile('${f.download_id}')"><div class="pair-file-header"><span class="material-icons pair-file-icon ${type}">${icon}</span><span class="pair-file-type">${label}</span></div><div class="pair-file-name">${f.filename}</div><button class="redownload-button" onclick="event.stopPropagation();redownloadFile('${f.download_id}','${f.filename}')"><span class="material-icons">refresh</span></button></div>`;
+    }
+
+    function closeResultModal() {
+        document.getElementById('resultModal').classList.remove('show');
+        const sp = document.getElementById('settingsPanel'); if (sp) sp.classList.remove('show');
+        currentFiles = []; downloadedFiles.clear(); downloadingFiles.clear();
+        if (window.vueApp) {
+            window.vueApp.files = { shipping: [], order: [], invoice: [] };
+            window.vueApp.isProcessing = false; window.vueApp.progress = 0;
+        }
+    }
+
+    function downloadFile(fileId) {
+        if (downloadedFiles.has(fileId) || downloadingFiles.has(fileId)) return;
+        downloadingFiles.add(fileId); updateFileState(fileId, 'downloading');
+        window.open(`${PORTAL_PREFIX}/download/${fileId}`, '_blank');
+        setTimeout(() => {
+            downloadingFiles.delete(fileId); downloadedFiles.add(fileId);
+            updateFileState(fileId, 'downloaded'); updateProgress(); updateAllBtn();
+        }, 1500);
+    }
+
+    function downloadMultipleFiles(ids) {
+        ids.split(',').filter(Boolean).forEach((id, i) => setTimeout(() => downloadFile(id.trim()), i * 300));
+    }
+
+    function downloadAllFiles() {
+        if (downloadedFiles.size === currentFiles.length && currentFiles.length > 0) return;
+        currentFiles.forEach((f, i) => setTimeout(() => downloadFile(f.download_id), i * 200));
+    }
+
+    function updateFileState(fileId, state) {
+        const el = document.querySelector(`[data-file-id="${fileId}"]`);
+        if (el) { el.classList.remove('downloading', 'downloaded', 'redownloading'); if (state) el.classList.add(state); }
+    }
+
+    function updateProgress() {
+        const pe = document.getElementById('downloadProgress'), pt = document.getElementById('downloadProgressText'), pf = document.getElementById('downloadProgressFill');
+        if (pe && pt && pf) {
+            const d = downloadedFiles.size, t = currentFiles.length;
+            pt.textContent = `${d} / ${t}`; pf.style.width = `${t > 0 ? (d/t)*100 : 0}%`;
+            pe.style.display = d > 0 && d < t ? 'block' : 'none';
+        }
+    }
+
+    function updateAllBtn() {
+        const btn = document.querySelector('.modal-button.primary');
+        if (btn && downloadedFiles.size === currentFiles.length && currentFiles.length > 0) {
+            btn.classList.add('all-downloaded');
+            btn.innerHTML = '<span class="material-icons">check_circle</span>完了';
+        }
+    }
+
+    function toggleSettings() { document.getElementById('settingsPanel').classList.toggle('show'); }
+    function toggleRedownload() { redownloadSettings.enabled = !redownloadSettings.enabled; document.getElementById('redownloadSwitch').classList.toggle('active', redownloadSettings.enabled); }
+    function toggleConfirm() { redownloadSettings.showConfirm = !redownloadSettings.showConfirm; document.getElementById('confirmSwitch').classList.toggle('active', redownloadSettings.showConfirm); }
+
+    function redownloadFile(fileId, fileName) {
+        if (!downloadedFiles.has(fileId)) { downloadFile(fileId); return; }
+        if (!redownloadSettings.enabled) return;
+        if (redownloadSettings.showConfirm) { showRedownloadConfirm(fileId, fileName); } else { executeRedownload(fileId); }
+    }
+    function executeRedownload(fileId) {
+        downloadedFiles.delete(fileId); downloadingFiles.delete(fileId);
+        updateFileState(fileId, 'redownloading');
+        window.open(`${PORTAL_PREFIX}/download/${fileId}`, '_blank');
+        setTimeout(() => { downloadingFiles.delete(fileId); downloadedFiles.add(fileId); updateFileState(fileId, 'downloaded'); updateProgress(); updateAllBtn(); }, 1500);
+    }
+    function redownloadAllFiles() {
+        if (!redownloadSettings.enabled || downloadedFiles.size === 0) return;
+        if (redownloadSettings.showConfirm) { showRedownloadConfirm('all', '', true, '全ファイル'); }
+        else { currentFiles.forEach((f, i) => { if (downloadedFiles.has(f.download_id)) setTimeout(() => executeRedownload(f.download_id), i * 200); }); }
+    }
+    function showRedownloadConfirm(fileId, fileName, isMultiple, setName) {
+        const msg = isMultiple ? `${setName}のファイルを再度ダウンロードしますか？` : `「${fileName}」を再度ダウンロードしますか？`;
+        document.getElementById('redownloadConfirmMessage').textContent = msg;
+        pendingRedownload = { fileId, isMultiple };
+        document.getElementById('redownloadConfirmModal').classList.add('show');
+    }
+    function closeRedownloadConfirm() { document.getElementById('redownloadConfirmModal').classList.remove('show'); pendingRedownload = null; }
+    function confirmRedownload() {
+        if (pendingRedownload) {
+            if (pendingRedownload.fileId === 'all') { currentFiles.forEach((f, i) => { if (downloadedFiles.has(f.download_id)) setTimeout(() => executeRedownload(f.download_id), i * 200); }); }
+            else { executeRedownload(pendingRedownload.fileId); }
+        }
+        closeRedownloadConfirm();
+    }
+
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeResultModal(); closeRedownloadConfirm(); } });
+    document.addEventListener('click', e => { if (e.target.id === 'resultModal') closeResultModal(); if (e.target.id === 'redownloadConfirmModal') closeRedownloadConfirm(); });
+    </script>
+</body>
+</html>

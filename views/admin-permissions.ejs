@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>権限管理 - B-Faith Portal</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <a href="/" class="back-link">← ダッシュボード</a>
+      <h1>権限管理</h1>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= displayName %></span>
+      <a href="/logout" class="btn-logout">ログアウト</a>
+    </div>
+  </header>
+
+  <main class="admin-page">
+    <% if (success) { %>
+      <div class="success-msg">権限を保存しました。対象ユーザーは再ログイン後に反映されます。</div>
+    <% } %>
+
+    <form method="POST" action="/admin/permissions">
+      <table class="permissions-table">
+        <thead>
+          <tr>
+            <th>ユーザー</th>
+            <% apps.forEach(app => { %>
+              <th class="app-col">
+                <span class="app-col-icon"><%= app.icon %></span>
+                <span class="app-col-name"><%= app.name %></span>
+              </th>
+            <% }) %>
+          </tr>
+        </thead>
+        <tbody>
+          <% users.forEach(user => { %>
+            <tr>
+              <td class="user-cell">
+                <strong><%= user.displayName %></strong>
+                <span class="user-id">(<%= user.username %>)</span>
+              </td>
+              <% apps.forEach(app => { %>
+                <td class="check-cell">
+                  <input type="checkbox"
+                    name="permissions[<%= user.username %>][]"
+                    value="<%= app.id %>"
+                    <%= user.allowedApps.includes(app.id) ? 'checked' : '' %>
+                  >
+                </td>
+              <% }) %>
+            </tr>
+          <% }) %>
+        </tbody>
+      </table>
+
+      <div class="admin-actions">
+        <button type="submit" class="btn-save">保存</button>
+      </div>
+    </form>
+  </main>
+</body>
+</html>

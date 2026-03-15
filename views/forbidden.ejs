@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>アクセス制限 - B-Faith Portal</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="/logout" class="btn-logout">ログアウト</a>
+    </div>
+  </header>
+
+  <main class="coming-soon-page">
+    <div class="coming-soon-msg" style="max-width: 400px;">
+      <div style="font-size: 64px; margin-bottom: 16px;">🔒</div>
+      <h2 style="margin-bottom: 12px; color: #333;">アクセス権限がありません</h2>
+      <p style="margin-bottom: 24px;">このツールを使用する権限がありません。<br>管理者にお問い合わせください。</p>
+      <a href="/" style="display: inline-block; padding: 10px 24px; background: #0f3460; color: #fff; border-radius: 8px; text-decoration: none;">ダッシュボードに戻る</a>
+    </div>
+  </main>
+</body>
+</html>

@@ -1,0 +1,13 @@
+fastapi==0.115.13
+gunicorn==23.0.0
+uvicorn==0.34.3
+python-jose==3.5.0
+passlib==1.7.4
+bcrypt==4.3.0
+python-multipart==0.0.20
+PyMuPDF==1.26.1
+opencv-python-headless==4.10.0.84
+pyzbar==0.1.9
+Jinja2==3.1.6
+python-dotenv==1.1.1
+tqdm==4.66.1

@@ -1,0 +1,9 @@
+node_modules/
+.env
+sessions.db
+apps/mercari-sync/settings.db
+apps/linegift-sync/linegift_images/
+venv/
+__pycache__/
+*.pyc
+data/
