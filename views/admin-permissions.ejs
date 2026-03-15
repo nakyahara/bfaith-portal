@@ -41,12 +41,12 @@
             <tr>
               <td class="user-cell">
                 <strong><%= user.displayName %></strong>
-                <span class="user-id">(<%= user.username %>)</span>
+                <span class="user-id">(<%= user.email %>)</span>
               </td>
               <% apps.forEach(app => { %>
                 <td class="check-cell">
                   <input type="checkbox"
-                    name="permissions[<%= user.username %>][]"
+                    name="permissions[<%= user.email %>][]"
                     value="<%= app.id %>"
                     <%= user.allowedApps.includes(app.id) ? 'checked' : '' %>
                   >

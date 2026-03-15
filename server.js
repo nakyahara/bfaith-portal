@@ -16,63 +16,46 @@ const SQLiteStore = connectSqlite3(session);
 // --- 設定 ---
 const PORT = process.env.PORT || 3000;
 const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-secret-change-me';
+const DATA_DIR = path.join(__dirname, 'data');
+const USERS_FILE = path.join(DATA_DIR, 'users.json');
 
-// --- ユーザー定義（ロールベースアクセス制御） ---
-const users = [
-  {
-    username: 'admin',
-    passwordHash: bcrypt.hashSync(process.env.PORTAL_PASS || 'changeme', 10),
-    displayName: '管理者',
-    role: 'admin',
-    allowedApps: '*', // 全アプリ
-  },
-  {
-    username: 'shipping',
-    passwordHash: bcrypt.hashSync(process.env.SHIPPING_PASS || 'shipping123', 10),
-    displayName: '出荷担当',
-    role: 'shipping',
-    allowedApps: ['aes-pdf-sorter'],
-  },
-  {
-    username: 'product',
-    passwordHash: bcrypt.hashSync(process.env.PRODUCT_PASS || 'product123', 10),
-    displayName: '商品担当',
-    role: 'product',
-    allowedApps: ['linegift-sync', 'mercari-sync', 'ranking-checker'],
-  },
-];
+// --- ユーザー永続化 ---
+function ensureDataDir() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+}
 
-// --- 権限永続化 ---
-const PERMISSIONS_FILE = path.join(__dirname, 'data', 'permissions.json');
-
-function loadPermissions() {
+function loadUsers() {
   try {
-    if (fs.existsSync(PERMISSIONS_FILE)) {
-      const saved = JSON.parse(fs.readFileSync(PERMISSIONS_FILE, 'utf-8'));
-      users.forEach(user => {
-        if (user.role !== 'admin' && saved[user.username]) {
-          user.allowedApps = saved[user.username];
-        }
-      });
+    if (fs.existsSync(USERS_FILE)) {
+      return JSON.parse(fs.readFileSync(USERS_FILE, 'utf-8'));
     }
   } catch (e) {
-    console.warn('[Permissions] 読み込み失敗:', e.message);
+    console.warn('[Users] 読み込み失敗:', e.message);
   }
+  return null;
 }
 
-function savePermissions() {
-  const data = {};
-  users.forEach(user => {
-    if (user.role !== 'admin') {
-      data[user.username] = user.allowedApps;
-    }
-  });
-  const dir = path.dirname(PERMISSIONS_FILE);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(PERMISSIONS_FILE, JSON.stringify(data, null, 2), 'utf-8');
+function saveUsers(users) {
+  ensureDataDir();
+  fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), 'utf-8');
 }
 
-loadPermissions();
+// 初期ユーザー or ファイルから読み込み
+let users = loadUsers();
+if (!users) {
+  // 初回起動: 管理者ユーザーを作成
+  users = [
+    {
+      email: 'd.nakahara@b-faith.biz',
+      passwordHash: bcrypt.hashSync(process.env.PORTAL_PASS || 'changeme', 10),
+      displayName: '中原 大輔',
+      role: 'admin',
+      allowedApps: '*',
+    },
+  ];
+  saveUsers(users);
+  console.log('[Users] 初期管理者ユーザーを作成しました');
+}
 
 // --- ミドルウェア ---
 app.set('view engine', 'ejs');
@@ -106,7 +89,7 @@ function requireAppAccess(appId) {
     if (allowed === '*' || (Array.isArray(allowed) && allowed.includes(appId))) {
       return next();
     }
-    res.status(403).render('forbidden', { username: req.session.username, displayName: req.session.displayName });
+    res.status(403).render('forbidden', { username: req.session.email, displayName: req.session.displayName });
   };
 }
 
@@ -114,7 +97,7 @@ function requireAppAccess(appId) {
 function requireAdmin(req, res, next) {
   if (!req.session || !req.session.authenticated) return res.redirect('/login');
   if (req.session.role !== 'admin') {
-    return res.status(403).render('forbidden', { username: req.session.username, displayName: req.session.displayName });
+    return res.status(403).render('forbidden', { username: req.session.email, displayName: req.session.displayName });
   }
   next();
 }
@@ -126,7 +109,7 @@ const categories = [
   { id: 'analysis', name: '商品分析', icon: '📊' },
 ];
 
-// --- アプリ一覧（ここに追加していく） ---
+// --- アプリ一覧 ---
 const apps = [
   {
     id: 'linegift-sync',
@@ -172,7 +155,7 @@ const externalLinks = [
     name: '発注条件参照ツール',
     description: '商品コード/名前で発注条件・在庫を検索',
     icon: '📦',
-    url: '#', // 後でURL設定
+    url: '#',
   },
   {
     name: 'ピッキングKPIダッシュボード',
@@ -192,17 +175,17 @@ app.get('/login', (req, res) => {
 
 // ログイン処理
 app.post('/login', (req, res) => {
-  const { username, password } = req.body;
-  const user = users.find(u => u.username === username);
+  const { email, password } = req.body;
+  const user = users.find(u => u.email.toLowerCase() === email.toLowerCase());
   if (user && bcrypt.compareSync(password, user.passwordHash)) {
     req.session.authenticated = true;
-    req.session.username = user.username;
+    req.session.email = user.email;
     req.session.displayName = user.displayName;
     req.session.role = user.role;
     req.session.allowedApps = user.allowedApps;
     return res.redirect('/');
   }
-  res.render('login', { error: 'ユーザー名またはパスワードが正しくありません' });
+  res.render('login', { error: 'メールアドレスまたはパスワードが正しくありません' });
 });
 
 // ログアウト
@@ -210,27 +193,65 @@ app.get('/logout', (req, res) => {
   req.session.destroy(() => res.redirect('/login'));
 });
 
-// ダッシュボード（認証必須）
+// ダッシュボード
 app.get('/', requireAuth, (req, res) => {
   const allowed = req.session.allowedApps;
   if (!allowed) {
-    // 古いセッション（ロール情報なし）→ 再ログイン
     return req.session.destroy(() => res.redirect('/login'));
   }
   const visibleApps = allowed === '*' ? apps : apps.filter(a => allowed.includes(a.id));
   const visibleExtLinks = allowed === '*' ? externalLinks : [];
   res.render('dashboard', {
     apps: visibleApps, categories, externalLinks: visibleExtLinks,
-    username: req.session.username, displayName: req.session.displayName,
+    username: req.session.email, displayName: req.session.displayName,
     role: req.session.role,
   });
 });
 
-// アプリルート（認証 + アプリ別アクセス制御）
+// --- パスワード変更 ---
+app.get('/change-password', requireAuth, (req, res) => {
+  res.render('change-password', {
+    displayName: req.session.displayName,
+    username: req.session.email,
+    error: null, success: false,
+  });
+});
+
+app.post('/change-password', requireAuth, (req, res) => {
+  const { currentPassword, newPassword, confirmPassword } = req.body;
+  const user = users.find(u => u.email === req.session.email);
+
+  if (!user || !bcrypt.compareSync(currentPassword, user.passwordHash)) {
+    return res.render('change-password', {
+      displayName: req.session.displayName, username: req.session.email,
+      error: '現在のパスワードが正しくありません', success: false,
+    });
+  }
+  if (newPassword.length < 6) {
+    return res.render('change-password', {
+      displayName: req.session.displayName, username: req.session.email,
+      error: 'パスワードは6文字以上で設定してください', success: false,
+    });
+  }
+  if (newPassword !== confirmPassword) {
+    return res.render('change-password', {
+      displayName: req.session.displayName, username: req.session.email,
+      error: '新しいパスワードが一致しません', success: false,
+    });
+  }
+
+  user.passwordHash = bcrypt.hashSync(newPassword, 10);
+  saveUsers(users);
+  res.render('change-password', {
+    displayName: req.session.displayName, username: req.session.email,
+    error: null, success: true,
+  });
+});
+
+// アプリルート
 app.use('/apps/linegift-sync', requireAppAccess('linegift-sync'), linegiftRouter);
 app.use('/apps/mercari-sync', requireAppAccess('mercari-sync'), mercariRouter);
 app.use('/apps/aes-pdf-sorter', requireAppAccess('aes-pdf-sorter'), aesRouter);
-// app.use('/apps/ranking-checker', requireAppAccess('ranking-checker'), rankingRouter);
 
 // 未実装アプリのプレースホルダー
 app.get('/apps/:appId', requireAuth, (req, res) => {
@@ -239,12 +260,12 @@ app.get('/apps/:appId', requireAuth, (req, res) => {
   res.render('coming-soon', { app: appInfo });
 });
 
-// --- 管理者ルート ---
+// --- 管理者ルート: 権限管理 ---
 app.get('/admin/permissions', requireAdmin, (req, res) => {
   const nonAdminUsers = users.filter(u => u.role !== 'admin');
   res.render('admin-permissions', {
     users: nonAdminUsers, apps,
-    username: req.session.username, displayName: req.session.displayName,
+    username: req.session.email, displayName: req.session.displayName,
     success: req.query.success === '1',
   });
 });
@@ -253,19 +274,79 @@ app.post('/admin/permissions', requireAdmin, (req, res) => {
   const perms = req.body.permissions || {};
   users.forEach(user => {
     if (user.role !== 'admin') {
-      const val = perms[user.username];
+      const val = perms[user.email];
       user.allowedApps = Array.isArray(val) ? val : (val ? [val] : []);
     }
   });
-  savePermissions();
+  saveUsers(users);
   res.redirect('/admin/permissions?success=1');
+});
+
+// --- 管理者ルート: ユーザー管理 ---
+app.get('/admin/users', requireAdmin, (req, res) => {
+  res.render('admin-users', {
+    users, apps,
+    username: req.session.email, displayName: req.session.displayName,
+    success: req.query.success, error: req.query.error,
+  });
+});
+
+app.post('/admin/users/add', requireAdmin, (req, res) => {
+  const { email, displayName, password, role } = req.body;
+
+  if (!email || !displayName || !password) {
+    return res.redirect('/admin/users?error=' + encodeURIComponent('全項目を入力してください'));
+  }
+  if (users.find(u => u.email.toLowerCase() === email.toLowerCase())) {
+    return res.redirect('/admin/users?error=' + encodeURIComponent('このメールアドレスは既に登録されています'));
+  }
+  if (password.length < 6) {
+    return res.redirect('/admin/users?error=' + encodeURIComponent('パスワードは6文字以上で設定してください'));
+  }
+
+  users.push({
+    email: email.toLowerCase(),
+    passwordHash: bcrypt.hashSync(password, 10),
+    displayName,
+    role: role || 'user',
+    allowedApps: [],
+  });
+  saveUsers(users);
+  res.redirect('/admin/users?success=' + encodeURIComponent(`${displayName} を追加しました`));
+});
+
+app.post('/admin/users/delete', requireAdmin, (req, res) => {
+  const { email } = req.body;
+  if (email === req.session.email) {
+    return res.redirect('/admin/users?error=' + encodeURIComponent('自分自身は削除できません'));
+  }
+  const idx = users.findIndex(u => u.email === email);
+  if (idx === -1) {
+    return res.redirect('/admin/users?error=' + encodeURIComponent('ユーザーが見つかりません'));
+  }
+  const removed = users.splice(idx, 1)[0];
+  saveUsers(users);
+  res.redirect('/admin/users?success=' + encodeURIComponent(`${removed.displayName} を削除しました`));
+});
+
+app.post('/admin/users/reset-password', requireAdmin, (req, res) => {
+  const { email, newPassword } = req.body;
+  const user = users.find(u => u.email === email);
+  if (!user) {
+    return res.redirect('/admin/users?error=' + encodeURIComponent('ユーザーが見つかりません'));
+  }
+  if (!newPassword || newPassword.length < 6) {
+    return res.redirect('/admin/users?error=' + encodeURIComponent('パスワードは6文字以上で設定してください'));
+  }
+  user.passwordHash = bcrypt.hashSync(newPassword, 10);
+  saveUsers(users);
+  res.redirect('/admin/users?success=' + encodeURIComponent(`${user.displayName} のパスワードをリセットしました`));
 });
 
 // --- 起動 ---
 app.listen(PORT, () => {
   console.log(`B-Faith Portal running at http://localhost:${PORT}`);
 
-  // AES PDF Sorter Pythonバックエンド起動
   try {
     startPythonBackend();
   } catch (e) {
@@ -274,6 +355,5 @@ app.listen(PORT, () => {
   }
 });
 
-// プロセス終了時にPythonバックエンドも停止
 process.on('SIGTERM', () => { stopPythonBackend(); process.exit(0); });
 process.on('SIGINT', () => { stopPythonBackend(); process.exit(0); });

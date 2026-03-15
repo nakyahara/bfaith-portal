@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ユーザー管理 - B-Faith Portal</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <a href="/" class="back-link">← ダッシュボード</a>
+      <h1>ユーザー管理</h1>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= displayName %></span>
+      <a href="/admin/permissions" class="btn-admin">権限管理</a>
+      <a href="/logout" class="btn-logout">ログアウト</a>
+    </div>
+  </header>
+
+  <main class="admin-page">
+    <% if (success) { %>
+      <div class="success-msg"><%= success %></div>
+    <% } %>
+    <% if (error) { %>
+      <div class="error-msg"><%= error %></div>
+    <% } %>
+
+    <!-- ユーザー追加フォーム -->
+    <div class="form-card" style="margin-bottom: 32px;">
+      <h2 class="section-title">ユーザー追加</h2>
+      <form method="POST" action="/admin/users/add">
+        <div class="form-row">
+          <div class="form-group">
+            <label for="email">メールアドレス</label>
+            <input type="email" id="email" name="email" required placeholder="user@b-faith.biz">
+          </div>
+          <div class="form-group">
+            <label for="displayName">表示名</label>
+            <input type="text" id="displayName" name="displayName" required placeholder="山田 太郎">
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label for="password">初期パスワード（6文字以上）</label>
+            <input type="password" id="password" name="password" required minlength="6">
+          </div>
+          <div class="form-group">
+            <label for="role">権限</label>
+            <select id="role" name="role" class="form-select">
+              <option value="user">一般ユーザー</option>
+              <option value="admin">管理者</option>
+            </select>
+          </div>
+        </div>
+        <button type="submit" class="btn-save">追加</button>
+      </form>
+    </div>
+
+    <!-- ユーザー一覧 -->
+    <h2 class="section-title">登録ユーザー一覧</h2>
+    <table class="permissions-table">
+      <thead>
+        <tr>
+          <th>表示名</th>
+          <th>メールアドレス</th>
+          <th>権限</th>
+          <th>アクセス可能アプリ</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        <% users.forEach(user => { %>
+          <tr>
+            <td><strong><%= user.displayName %></strong></td>
+            <td><%= user.email %></td>
+            <td><span class="role-badge role-<%= user.role %>"><%= user.role === 'admin' ? '管理者' : '一般' %></span></td>
+            <td>
+              <% if (user.allowedApps === '*') { %>
+                <span class="role-badge role-admin">全アプリ</span>
+              <% } else if (Array.isArray(user.allowedApps) && user.allowedApps.length > 0) { %>
+                <% user.allowedApps.forEach(appId => { %>
+                  <% const appInfo = apps.find(a => a.id === appId); %>
+                  <% if (appInfo) { %>
+                    <span class="app-tag"><%= appInfo.icon %> <%= appInfo.name %></span>
+                  <% } %>
+                <% }) %>
+              <% } else { %>
+                <span style="color: #999; font-size: 13px;">なし</span>
+              <% } %>
+            </td>
+            <td>
+              <% if (user.email !== username) { %>
+                <div class="action-buttons">
+                  <!-- パスワードリセット -->
+                  <form method="POST" action="/admin/users/reset-password" class="inline-form">
+                    <input type="hidden" name="email" value="<%= user.email %>">
+                    <input type="password" name="newPassword" placeholder="新パスワード" minlength="6" required class="inline-input">
+                    <button type="submit" class="btn-small btn-reset">PW変更</button>
+                  </form>
+                  <!-- 削除 -->
+                  <form method="POST" action="/admin/users/delete" class="inline-form"
+                    onsubmit="return confirm('<%= user.displayName %> を削除しますか？')">
+                    <input type="hidden" name="email" value="<%= user.email %>">
+                    <button type="submit" class="btn-small btn-danger">削除</button>
+                  </form>
+                </div>
+              <% } else { %>
+                <span style="color: #999; font-size: 13px;">自分自身</span>
+              <% } %>
+            </td>
+          </tr>
+        <% }) %>
+      </tbody>
+    </table>
+  </main>
+</body>
+</html>

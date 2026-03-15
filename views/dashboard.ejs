@@ -13,7 +13,9 @@
     </div>
     <div class="header-right">
       <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="/change-password" class="btn-logout">パスワード変更</a>
       <% if (typeof role !== 'undefined' && role === 'admin') { %>
+        <a href="/admin/users" class="btn-admin">ユーザー管理</a>
         <a href="/admin/permissions" class="btn-admin">権限管理</a>
       <% } %>
       <a href="/logout" class="btn-logout">ログアウト</a>
