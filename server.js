@@ -157,13 +157,13 @@ const externalLinks = [
     name: '発注条件参照ツール',
     description: '商品コード/名前で発注条件・在庫を検索',
     icon: '📦',
-    url: '#',
+    url: 'https://script.google.com/a/macros/b-faith.biz/s/AKfycbxxn6HcHZKgAKAww1k-AFMER6SVt_-PRTQp1EJoPEclBczvUKEw1VBOWPhAo0O9Z1VO1Q/exec',
   },
   {
     name: 'ピッキングKPIダッシュボード',
     description: 'ピッキング作業のKPI・パフォーマンス分析',
     icon: '📈',
-    url: '#',
+    url: 'https://script.google.com/a/macros/b-faith.biz/s/AKfycbxKrVwCJWtZOr1lS_-rzEvamatfpZ3UV2NCDwnwlO083Vhx3Gn2T2N6H5GfPPuZCIkUhw/exec',
   },
 ];
 
