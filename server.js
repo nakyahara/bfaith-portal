@@ -9,6 +9,7 @@ import linegiftRouter from './apps/linegift-sync/router.js';
 import mercariRouter from './apps/mercari-sync/router.js';
 import aesRouter, { startPythonBackend, stopPythonBackend } from './apps/aes-pdf-sorter/router.js';
 import rankingRouter from './apps/ranking-checker/router.js';
+import { startScheduler } from './apps/ranking-checker/scheduler.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -355,6 +356,9 @@ app.listen(PORT, () => {
     console.warn(`[AES-Python] 起動スキップ: ${e.message}`);
     console.warn('[AES-Python] Python環境がない場合、AESラベル並び替え機能は使用できません');
   }
+
+  // 楽天順位チェッカー スケジューラー
+  startScheduler();
 });
 
 process.on('SIGTERM', () => { stopPythonBackend(); process.exit(0); });
