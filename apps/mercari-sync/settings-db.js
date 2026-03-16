@@ -8,11 +8,13 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DB_FILE = process.env.MERCARI_DB_PATH || path.join(__dirname, 'settings.db');
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', '..', 'data');
+const DB_FILE = process.env.MERCARI_DB_PATH || path.join(DATA_DIR, 'mercari-settings.db');
 
 let db = null;
 
 export async function initDb() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   const SQL = await initSqlJs();
   if (fs.existsSync(DB_FILE)) {
     const buf = fs.readFileSync(DB_FILE);

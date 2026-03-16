@@ -28,7 +28,7 @@ const AMAZON_SERVICE = 'ProductAdvertisingAPI';
 const AMAZON_ENDPOINT = `https://${AMAZON_HOST}/paapi5/searchitems`;
 
 // Data file — stored in portal's data/ directory for persistence
-const DATA_DIR = path.join(__dirname, '..', '..', 'data');
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', '..', 'data');
 const DATA_FILE = path.join(DATA_DIR, 'ranking-checker.json');
 
 function ensureDataDir() {

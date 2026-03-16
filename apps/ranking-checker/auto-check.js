@@ -25,7 +25,7 @@ const API_DELAY = 1100;
 const KW_DELAY = 500;
 const CONCURRENCY = 3;
 
-const DATA_DIR = path.join(__dirname, '..', '..', 'data');
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', '..', 'data');
 const DATA_FILE = path.join(DATA_DIR, 'ranking-checker.json');
 const LOG_FILE = path.join(DATA_DIR, 'ranking-checker.log');
 
