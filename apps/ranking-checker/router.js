@@ -125,6 +125,11 @@ router.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'index.html'));
 });
 
+// Serve static assets (logo, etc.)
+router.get('/rakuten-logo.svg', (req, res) => {
+  res.sendFile(path.join(__dirname, 'rakuten-logo.svg'));
+});
+
 // Rakuten API proxy
 router.get('/api/rakuten', async (req, res) => {
   const query = new URL(req.url, 'http://localhost').search?.slice(1) || '';

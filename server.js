@@ -145,8 +145,8 @@ const apps = [
   },
   {
     id: 'ranking-checker',
-    name: '楽天順位チェッカー',
-    description: 'キーワード別の楽天・Yahoo・Amazon順位確認',
+    name: '楽天検索順位チェッカー',
+    description: 'キーワード別の楽天検索順位確認',
     icon: '📊',
     path: '/apps/ranking-checker',
     status: 'active',
