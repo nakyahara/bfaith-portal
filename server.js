@@ -21,10 +21,13 @@ const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-secret-change-me';
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
 
-// --- ユーザー永続化 ---
+// --- データディレクトリ初期化 ---
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 }
+ensureDataDir();
+
+// --- ユーザー永続化 ---
 
 function loadUsers() {
   try {
