@@ -233,9 +233,10 @@ table.unreg-table tbody tr:nth-child(even) { background: #faf7f2; }
     <h2>&#x1f6d2; 商品を登録する</h2>
     <div class="form-row"><label>検索ワード *</label><input type="text" id="reg-keyword" placeholder="例: アロマオイル 天然"></div>
     <div class="form-row"><label>商品コード *</label><input type="text" id="reg-code" placeholder="例: abc-123"></div>
-    <div class="hint" style="font-size:11px;color:#888;margin-top:-6px;margin-bottom:10px;padding-left:150px;">※ 楽天・Yahoo!共通の商品コード</div>
+    <div class="hint" style="font-size:11px;color:#888;margin-top:-6px;margin-bottom:10px;padding-left:150px;">※ 楽天の商品コード</div>
     <div class="form-row"><label>楽天URL（任意）</label><input type="text" id="reg-rakuten-url" placeholder="空欄 → 商品コードから自動生成"></div>
-    <div class="form-row"><label>Yahoo!URL（任意）</label><input type="text" id="reg-yahoo-url" placeholder="空欄 → 商品コードから自動生成"></div>
+    <!-- Yahoo!URL（機能は実装済み、現在無効化中） -->
+    <div class="form-row" style="display:none"><label>Yahoo!URL（任意）</label><input type="text" id="reg-yahoo-url" placeholder="空欄 → 商品コードから自動生成"></div>
     <div class="form-row" style="display:none"><label>Amazon ASIN（任意）</label><input type="text" id="reg-amazon-asin" placeholder="例: B0XXXXXXXXXX"></div>
     <div class="hint" style="display:none">※ AmazonのASINコード（商品ページURLの /dp/XXXX 部分）</div>
     <div class="form-row"><label>競合URL&#x2460;（任意）</label><input type="text" id="reg-comp1"></div>
@@ -272,6 +273,9 @@ table.unreg-table tbody tr:nth-child(even) { background: #faf7f2; }
         <option value="registered">登録順</option>
       </select>
     </label>
+    <div class="sep"></div>
+    <input type="text" id="list-search" placeholder="商品コード・検索ワードで絞り込み" oninput="onSearchChange()" style="padding:5px 10px;border:1px solid #ccc;border-radius:4px;font-size:12px;font-family:inherit;width:260px;">
+    <button class="btn btn-secondary btn-sm" onclick="document.getElementById('list-search').value='';onSearchChange();" style="font-size:11px;">クリア</button>
     <div style="margin-left:auto; font-size:13px; color:#555;" id="list-total"></div>
   </div>
 
@@ -339,9 +343,12 @@ table.unreg-table tbody tr:nth-child(even) { background: #faf7f2; }
     <div class="form-row"><label>アクセスキー *</label><input type="text" id="cfg-accesskey" placeholder="楽天Webサービスで取得"></div>
     <div class="form-row"><label>ショップコード</label><input type="text" id="cfg-shopcode" placeholder="未登録商品取得に必要"></div>
     <div class="hint">※ ショップコード = 商品URLの item.rakuten.co.jp/<b>XXXX</b>/ の XXXX 部分</div>
+    <!-- Yahoo!ショッピング設定（機能は実装済み、現在無効化中） -->
+    <div style="display:none">
     <h4 style="margin:16px 0 8px;font-size:13px;color:#e60033;">Yahoo!ショッピング</h4>
     <div class="form-row"><label>Client ID (appid)</label><input type="text" id="cfg-yahoo-appid" placeholder="Yahoo!デベロッパーで取得"></div>
     <div class="hint">※ Yahoo!デベロッパーネットワークでアプリケーション登録して取得</div>
+    </div>
     <!-- Amazon設定（PA-API利用条件未達のため一時非表示） -->
     <div style="display:none">
     <h4 style="margin:16px 0 8px;font-size:13px;color:#ff9900;">Amazon</h4>
@@ -365,7 +372,8 @@ table.unreg-table tbody tr:nth-child(even) { background: #faf7f2; }
     <div class="form-row"><label>検索ワード *</label><input type="text" id="edit-keyword"></div>
     <div class="form-row"><label>商品コード *</label><input type="text" id="edit-code"></div>
     <div class="form-row"><label>楽天URL（任意）</label><input type="text" id="edit-rakuten-url" placeholder="空欄 → 商品コードから自動生成"></div>
-    <div class="form-row"><label>Yahoo!URL（任意）</label><input type="text" id="edit-yahoo-url" placeholder="空欄 → 商品コードから自動生成"></div>
+    <!-- Yahoo!URL（機能は実装済み、現在無効化中） -->
+    <div class="form-row" style="display:none"><label>Yahoo!URL（任意）</label><input type="text" id="edit-yahoo-url" placeholder="空欄 → 商品コードから自動生成"></div>
     <div class="form-row" style="display:none"><label>Amazon ASIN（任意）</label><input type="text" id="edit-amazon-asin" placeholder="例: B0XXXXXXXXXX"></div>
     <div class="form-row"><label>競合URL&#x2460;</label><input type="text" id="edit-comp1"></div>
     <div class="form-row"><label>競合URL&#x2461;</label><input type="text" id="edit-comp2"></div>
@@ -763,19 +771,31 @@ function getSortedProducts() {
 }
 
 function onSortChange() { listPage = 0; renderList(); }
+function onSearchChange() { listPage = 0; renderList(); }
+
+function getFilteredProducts(sorted) {
+  const q = (document.getElementById('list-search') || {}).value || '';
+  if (!q.trim()) return sorted;
+  const terms = q.trim().toLowerCase().split(/\s+/);
+  return sorted.filter(p => {
+    const text = ((p.product_code || '') + ' ' + (p.keyword || '')).toLowerCase();
+    return terms.every(t => text.includes(t));
+  });
+}
 
 function renderList() {
   const sorted = getSortedProducts();
+  const filtered = getFilteredProducts(sorted);
   const container = document.getElementById('list-container');
   container.innerHTML = '';
 
-  const total = sorted.length;
+  const total = filtered.length;
   const totalPages = Math.max(1, Math.ceil(total / LIST_PER_PAGE));
   if (listPage >= totalPages) listPage = Math.max(0, totalPages - 1);
 
   const start = listPage * LIST_PER_PAGE;
-  const pageItems = sorted.slice(start, start + LIST_PER_PAGE);
-  document.getElementById('list-total').textContent = `全 ${total} 件`;
+  const pageItems = filtered.slice(start, start + LIST_PER_PAGE);
+  document.getElementById('list-total').textContent = filtered.length === sorted.length ? `全 ${total} 件` : `${filtered.length} / ${sorted.length} 件`;
 
   for (const product of pageItems) {
     container.appendChild(buildProductCard(product));
@@ -820,7 +840,8 @@ function buildProductCard(product) {
 
   // Build sub-rows
   const subRows = [{ label: '楽天', cls: 'badge-own', field: 'own_rank', rank: latest ? latest.own_rank : null, url: '' }];
-  if (getYahooUrl(product)) subRows.push({ label: 'Yahoo!', cls: 'badge-yahoo', field: 'yahoo_own_rank', rank: latest ? latest.yahoo_own_rank : null, url: '' });
+  // Yahoo!表示は一時無効化（楽天のみ表示）バックエンドは維持
+  // if (getYahooUrl(product)) subRows.push({ label: 'Yahoo!', cls: 'badge-yahoo', field: 'yahoo_own_rank', rank: latest ? latest.yahoo_own_rank : null, url: '' });
   // Amazon表示は一時無効化（PA-API利用条件未達）バックエンドは維持
   // if (getAmazonAsin(product)) subRows.push({ label: 'Amazon', cls: 'badge-amazon', field: 'amazon_own_rank', rank: latest ? latest.amazon_own_rank : null, url: getAmazonUrl(product) });
   if (product.competitor1_url) subRows.push({ label: '競合①', cls: 'badge-comp', field: 'competitor1_rank', rank: latest ? latest.competitor1_rank : null, url: product.competitor1_url });
@@ -922,10 +943,10 @@ async function startCheck() {
       c2_r = product.competitor2_url ? 'error' : null;
     }
 
-    // --- Yahoo!チェック ---
+    // --- Yahoo!チェック（一時無効化: Renderでは楽天のみ検索）---
     let yahoo_r = null;
     const yahooUrl = getYahooUrl(product);
-    if (yahooUrl && cfg.yahooAppId) {
+    if (false && yahooUrl && cfg.yahooAppId) {
       try {
         if (!checkAbort) await delay(API_DELAY);
         yahoo_r = await checkYahooRank(product.keyword, yahooUrl, cfg.yahooAppId);

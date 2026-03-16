@@ -383,10 +383,10 @@ export async function runAutoCheck() {
         result = { own_rank: 'error', competitor1_rank: product.competitor1_url ? 'error' : null, competitor2_rank: product.competitor2_url ? 'error' : null };
       }
 
-      // Yahoo
+      // Yahoo（一時無効化: 楽天のみチェック）
       let yahooRank = null;
       const yahooUrl = getYahooUrl(product);
-      if (yahooUrl && yahooAppId) {
+      if (false && yahooUrl && yahooAppId) {
         await sleep(API_DELAY);
         try { yahooRank = await checkYahoo(product.keyword, yahooUrl, yahooAppId); }
         catch (e) { yahooRank = 'error'; }
