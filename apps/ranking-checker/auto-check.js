@@ -216,6 +216,14 @@ async function checkRakuten(product, appId, accessKey) {
   if (ownUrl) targets.own = ownUrl;
   if (comp1Url) targets.comp1 = comp1Url;
   if (comp2Url) targets.comp2 = comp2Url;
+
+  // デバッグ: 商品データと比較対象URLをログ出力
+  log(`  product_code="${product.product_code || ''}", own_url="${product.own_url || ''}"`);
+  log(`  target_own="${ownUrl ? normalizeUrl(ownUrl) : '(なし)'}"`);
+  if (!Object.keys(targets).length) {
+    log(`  ⚠ 比較対象URLなし → 圏外になります`);
+  }
+
   const found = {};
   let organicRank = 0;
   let ownReviewCount = null;
@@ -233,7 +241,14 @@ async function checkRakuten(product, appId, accessKey) {
     }
     const items = data.Items || [];
     if (!items.length) break;
-    if (page === 1) log(`  楽天API応答: count=${data.count || 0}`);
+    if (page === 1) {
+      log(`  楽天API応答: count=${data.count || 0}, pages=${data.pageCount || 0}`);
+      // 最初の3件のURLをログ出力（デバッグ用）
+      for (let i = 0; i < Math.min(3, items.length); i++) {
+        const u = (items[i].Item || {}).itemUrl || '';
+        log(`  #${i + 1}: ${normalizeUrl(u)}`);
+      }
+    }
 
     for (const wrapper of items) {
       if (organicRank >= MAX_RANK) break;
@@ -257,6 +272,7 @@ async function checkRakuten(product, appId, accessKey) {
     if (page >= (data.pageCount || 0)) break;
   }
 
+  log(`  探索完了: ${organicRank}件チェック, 発見=${JSON.stringify(found)}`);
   return {
     own_rank: found.own || null,
     competitor1_rank: comp1Url ? (found.comp1 || null) : null,

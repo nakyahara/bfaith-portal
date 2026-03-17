@@ -220,4 +220,15 @@ router.get('/logs', (req, res) => {
   }
 });
 
+// 手動で自動チェックをテスト実行
+router.post('/run-check', async (req, res) => {
+  try {
+    const { runAutoCheck } = await import('./auto-check.js');
+    res.json({ ok: true, message: '自動チェック開始（バックグラウンド実行）' });
+    runAutoCheck().catch(e => console.error('[RankCheck] テスト実行エラー:', e.message));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 export default router;
