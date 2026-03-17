@@ -61,7 +61,7 @@ function normalizeUrl(url) {
   if (!url) return '';
   url = url.trim().replace(/^https?:\/\//, '');
   if (url.startsWith('www.')) url = url.slice(4);
-  url = url.replace(/\/+$/, '').split('?')[0].split('#')[0];
+  url = url.split('?')[0].split('#')[0].replace(/\/+$/, '');
   return url.toLowerCase();
 }
 
