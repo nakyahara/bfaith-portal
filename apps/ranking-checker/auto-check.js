@@ -334,9 +334,9 @@ async function checkAmazon(keyword, targetAsin, accessKey, secretKey, partnerTag
 
 // ── Main export ──
 
-export async function runAutoCheck() {
+export async function runAutoCheck({ force = false } = {}) {
   log('='.repeat(50));
-  log('自動順位チェック開始');
+  log(`自動順位チェック開始${force ? '（強制再チェック）' : ''}`);
 
   const config = getConfig();
   const { applicationId: appId, accessKey, yahooAppId } = config;
@@ -369,7 +369,7 @@ export async function runAutoCheck() {
   const todayStr = today();
   log(`対象: ${products.length} 件, 日付: ${todayStr}`);
 
-  const unchecked = products.filter(p => {
+  const unchecked = force ? products : products.filter(p => {
     const h = p.history || [];
     return !h.length || h[h.length - 1].date !== todayStr;
   });
