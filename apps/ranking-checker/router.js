@@ -206,4 +206,18 @@ router.post('/config', (req, res) => {
   res.json({ ok: true, note: 'Config is managed via environment variables on Render' });
 });
 
+// Log viewer (auto-check log)
+router.get('/logs', (req, res) => {
+  const LOG_FILE = path.join(DATA_DIR, 'ranking-checker.log');
+  const lines = parseInt(req.query.lines || '200', 10);
+  try {
+    const content = fs.readFileSync(LOG_FILE, 'utf-8');
+    const allLines = content.split('\n');
+    const tail = allLines.slice(-lines).join('\n');
+    res.type('text/plain; charset=utf-8').send(tail);
+  } catch {
+    res.type('text/plain').send('(ログファイルなし)');
+  }
+});
+
 export default router;
