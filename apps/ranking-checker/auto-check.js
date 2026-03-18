@@ -332,9 +332,22 @@ async function checkAmazon(keyword, targetAsin, accessKey, secretKey, partnerTag
   return null;
 }
 
+// ── Progress tracking ──
+
+const checkProgress = { running: false, total: 0, done: 0, current: '', startedAt: null };
+
+function getCheckProgress() {
+  return { ...checkProgress };
+}
+
 // ── Main export ──
 
 export async function runAutoCheck({ force = false } = {}) {
+  if (checkProgress.running) {
+    log('既にチェック実行中です');
+    return;
+  }
+
   log('='.repeat(50));
   log(`自動順位チェック開始${force ? '（強制再チェック）' : ''}`);
 
@@ -380,60 +393,75 @@ export async function runAutoCheck({ force = false } = {}) {
   }
 
   log(`未チェック: ${unchecked.length} 件`);
+
+  // 進捗トラッキング開始
+  checkProgress.running = true;
+  checkProgress.total = unchecked.length;
+  checkProgress.done = 0;
+  checkProgress.current = '';
+  checkProgress.startedAt = new Date().toISOString();
+
   let checked = 0;
 
-  for (let i = 0; i < unchecked.length; i += CONCURRENCY) {
-    const batch = unchecked.slice(i, i + CONCURRENCY);
-    await Promise.all(batch.map(async (product) => {
-      const idx = products.indexOf(product);
-      const label = `[${idx + 1}/${products.length}]`;
-      log(`${label} "${product.keyword}"`);
+  try {
+    for (let i = 0; i < unchecked.length; i += CONCURRENCY) {
+      const batch = unchecked.slice(i, i + CONCURRENCY);
+      await Promise.all(batch.map(async (product) => {
+        const idx = products.indexOf(product);
+        const label = `[${idx + 1}/${products.length}]`;
+        checkProgress.current = product.keyword;
+        log(`${label} "${product.keyword}"`);
 
-      // Rakuten
-      let result;
-      try {
-        result = await checkRakuten(product, appId, accessKey);
-        if (result.review_count != null) product.review_count = result.review_count;
-      } catch (e) {
-        log(`  ${label} 楽天エラー: ${e.message}`);
-        result = { own_rank: 'error', competitor1_rank: product.competitor1_url ? 'error' : null, competitor2_rank: product.competitor2_url ? 'error' : null };
-      }
+        // Rakuten
+        let result;
+        try {
+          result = await checkRakuten(product, appId, accessKey);
+          if (result.review_count != null) product.review_count = result.review_count;
+        } catch (e) {
+          log(`  ${label} 楽天エラー: ${e.message}`);
+          result = { own_rank: 'error', competitor1_rank: product.competitor1_url ? 'error' : null, competitor2_rank: product.competitor2_url ? 'error' : null };
+        }
 
-      // Yahoo（一時無効化: 楽天のみチェック）
-      let yahooRank = null;
-      const yahooUrl = getYahooUrl(product);
-      if (false && yahooUrl && yahooAppId) {
-        await sleep(API_DELAY);
-        try { yahooRank = await checkYahoo(product.keyword, yahooUrl, yahooAppId); }
-        catch (e) { yahooRank = 'error'; }
-      }
+        // Yahoo（一時無効化: 楽天のみチェック）
+        let yahooRank = null;
+        const yahooUrl = getYahooUrl(product);
+        if (false && yahooUrl && yahooAppId) {
+          await sleep(API_DELAY);
+          try { yahooRank = await checkYahoo(product.keyword, yahooUrl, yahooAppId); }
+          catch (e) { yahooRank = 'error'; }
+        }
 
-      // Amazon
-      let amazonRank = null;
-      const amazonAsin = getAmazonAsin(product);
-      if (amazonAsin && amazonAccessKey) {
-        await sleep(API_DELAY);
-        try { amazonRank = await checkAmazon(product.keyword, amazonAsin, amazonAccessKey, amazonSecretKey, amazonPartnerTag); }
-        catch (e) { amazonRank = 'error'; }
-      }
+        // Amazon
+        let amazonRank = null;
+        const amazonAsin = getAmazonAsin(product);
+        if (amazonAsin && amazonAccessKey) {
+          await sleep(API_DELAY);
+          try { amazonRank = await checkAmazon(product.keyword, amazonAsin, amazonAccessKey, amazonSecretKey, amazonPartnerTag); }
+          catch (e) { amazonRank = 'error'; }
+        }
 
-      // Save history
-      if (!product.history) product.history = [];
-      const entry = { date: todayStr, ...result };
-      if (yahooUrl) entry.yahoo_own_rank = yahooRank;
-      if (amazonAsin) entry.amazon_own_rank = amazonRank;
-      const todayIdx = product.history.findIndex(e => e.date === todayStr);
-      if (todayIdx >= 0) product.history[todayIdx] = entry;
-      else product.history.push(entry);
-    }));
+        // Save history
+        if (!product.history) product.history = [];
+        const entry = { date: todayStr, ...result };
+        if (yahooUrl) entry.yahoo_own_rank = yahooRank;
+        if (amazonAsin) entry.amazon_own_rank = amazonRank;
+        const todayIdx = product.history.findIndex(e => e.date === todayStr);
+        if (todayIdx >= 0) product.history[todayIdx] = entry;
+        else product.history.push(entry);
+      }));
 
-    checked += batch.length;
-    writeJson(DATA_FILE, { products });
-    if (i + CONCURRENCY < unchecked.length) await sleep(KW_DELAY);
+      checked += batch.length;
+      checkProgress.done = checked;
+      writeJson(DATA_FILE, { products });
+      if (i + CONCURRENCY < unchecked.length) await sleep(KW_DELAY);
+    }
+
+    log(`自動順位チェック完了: ${checked} 件`);
+    log('='.repeat(50));
+  } finally {
+    checkProgress.running = false;
+    checkProgress.current = '';
   }
-
-  log(`自動順位チェック完了: ${checked} 件`);
-  log('='.repeat(50));
 }
 
-export { DATA_FILE, readJson, writeJson, getRakutenUrl, getYahooUrl, getAmazonAsin, today, log };
+export { DATA_FILE, readJson, writeJson, getRakutenUrl, getYahooUrl, getAmazonAsin, today, log, getCheckProgress };

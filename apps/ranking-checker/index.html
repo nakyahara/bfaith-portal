@@ -442,9 +442,15 @@ async function loadData() {
     try { const raw = localStorage.getItem(STORAGE_KEY); if (raw) products = JSON.parse(raw); } catch(e2) { products = []; }
   }
 }
-function saveData() {
+async function saveData() {
   const obj = { products };
-  fetch(BASE_PATH + '/data', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(obj) }).catch(() => {});
+  try {
+    const resp = await fetch(BASE_PATH + '/data', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(obj) });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+  } catch(e) {
+    console.error('サーバー保存失敗:', e);
+    alert('データのサーバー保存に失敗しました。ネットワーク接続を確認してください。');
+  }
   // ローカルにもバックアップ
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(products)); } catch(e) {}
 }
@@ -891,120 +897,86 @@ function buildProductCard(product) {
   return card;
 }
 
-/* ═══ Ranking Check ══════════════════════════════════════════════════════ */
+/* ═══ Ranking Check（サーバー側実行 — タブを閉じても継続） ═══════════════ */
+let pollTimer = null;
+
 async function startCheck() {
   if (checkRunning) return;
   if (products.length === 0) return alert('登録商品がありません。');
-  const cfg = loadConfig();
-  if (!cfg.applicationId || !cfg.accessKey) return alert('楽天APIのアプリケーションIDとアクセスキーが設定されていません。\n右上の「API設定」で設定してください。');
 
   checkRunning = true;
-  checkAbort = false;
   document.getElementById('btn-check-start').disabled = true;
-  document.getElementById('btn-check-stop').disabled = false;
+  document.getElementById('btn-check-stop').style.display = 'none';
   document.getElementById('progress-area').style.display = 'flex';
   document.getElementById('progress-fill').style.width = '0%';
-  document.getElementById('progress-text').textContent = '準備中...';
+  document.getElementById('progress-text').textContent = 'サーバーに送信中...';
   document.getElementById('debug-panel').textContent = '';
 
-  const total = products.length;
-  const today = new Date().toISOString().slice(0, 10);
-  const appId = cfg.applicationId;
+  debugLog('サーバー側で順位チェックを開始します...');
+  debugLog('※ タブを閉じてもサーバー側で処理が継続します');
 
-  debugLog(`チェック開始: ${total} 件, appId=${appId.slice(0,8)}...`);
+  try {
+    const resp = await fetch(BASE_PATH + '/run-check', { method: 'POST' });
+    const result = await resp.json();
 
-  for (let i = 0; i < products.length; i++) {
-    if (checkAbort) break;
-    const product = products[i];
-
-    if (i > 0) await delay(KW_DELAY);
-    if (checkAbort) break;
-
-    debugLog(`--- [${i+1}/${total}] キーワード: "${product.keyword}" ---`);
-    debugLog(`  自社URL: ${getRakutenUrl(product)}`);
-
-    // --- 楽天チェック ---
-    let own_r = null, c1_r = null, c2_r = null;
-    try {
-      const result = await checkOneKeyword(product, appId);
-      own_r = result.own;
-      c1_r = result.comp1;
-      c2_r = result.comp2;
-      if (result.ownThumb) product._thumbUrl = result.ownThumb;
-      if (result.comp1Thumb) product['_compThumb_competitor1_rank'] = result.comp1Thumb;
-      if (result.comp2Thumb) product['_compThumb_competitor2_rank'] = result.comp2Thumb;
-      if (result.ownReviewCount != null) product.review_count = result.ownReviewCount;
-
-      debugLog(`  楽天結果: 自社=${displayRank(own_r)}, 競合①=${displayRank(c1_r)}, 競合②=${displayRank(c2_r)}`);
-    } catch (e) {
-      debugLog(`  楽天エラー: ${e.message}`);
-      own_r = 'error';
-      c1_r = product.competitor1_url ? 'error' : null;
-      c2_r = product.competitor2_url ? 'error' : null;
-    }
-
-    // --- Yahoo!チェック（一時無効化: Renderでは楽天のみ検索）---
-    let yahoo_r = null;
-    const yahooUrl = getYahooUrl(product);
-    if (false && yahooUrl && cfg.yahooAppId) {
-      try {
-        if (!checkAbort) await delay(API_DELAY);
-        yahoo_r = await checkYahooRank(product.keyword, yahooUrl, cfg.yahooAppId);
-        debugLog(`  Yahoo!結果: ${displayRank(yahoo_r)}`);
-      } catch (e) {
-        debugLog(`  Yahoo!エラー: ${e.message}`);
-        yahoo_r = 'error';
-      }
-    }
-
-    // --- Amazonチェック（一時無効化: PA-API利用条件未達）---
-    let amazon_r = null;
-    const amazonAsin = getAmazonAsin(product);
-    if (false && amazonAsin && cfg.amazonAccessKey) {
-      try {
-        if (!checkAbort) await delay(API_DELAY);
-        debugLog(`  Amazon ASIN: ${amazonAsin}`);
-        amazon_r = await checkAmazonRank(product.keyword, amazonAsin);
-        debugLog(`  Amazon結果: ${displayRank(amazon_r)}`);
-      } catch (e) {
-        debugLog(`  Amazonエラー: ${e.message}`);
-        amazon_r = 'error';
-      }
-    }
-
-    // 同日のエントリがあれば上書き、なければ追加
-    const newEntry = {
-      date: today,
-      own_rank: own_r,
-      competitor1_rank: product.competitor1_url ? c1_r : null,
-      competitor2_rank: product.competitor2_url ? c2_r : null,
-      yahoo_own_rank: yahooUrl ? yahoo_r : null,
-      amazon_own_rank: amazonAsin ? amazon_r : null,
-    };
-    const todayIdx = product.history.findIndex(e => e.date === today);
-    if (todayIdx >= 0) {
-      product.history[todayIdx] = newEntry;
+    if (!result.ok && result.progress && result.progress.running) {
+      debugLog('既にサーバー側でチェック実行中です。進捗を表示します。');
+    } else if (result.ok) {
+      debugLog('✔ サーバー側でチェック開始しました');
     } else {
-      product.history.push(newEntry);
+      throw new Error(result.message || 'サーバーエラー');
     }
 
-    const pct = ((i + 1) / total * 100).toFixed(0);
-    document.getElementById('progress-fill').style.width = pct + '%';
-    document.getElementById('progress-text').textContent = `${i + 1} / ${total} 完了`;
-    saveData();
-
-    // Update the display for this product immediately
-    renderList();
+    // 進捗ポーリング開始（3秒ごと）
+    startProgressPolling();
+  } catch (e) {
+    debugLog('エラー: ' + e.message);
+    alert('チェック開始に失敗しました: ' + e.message);
+    checkRunning = false;
+    document.getElementById('btn-check-start').disabled = false;
   }
+}
 
+function startProgressPolling() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(async () => {
+    try {
+      const resp = await fetch(BASE_PATH + '/check-progress');
+      const p = await resp.json();
+
+      if (p.total > 0) {
+        const pct = (p.done / p.total * 100).toFixed(0);
+        document.getElementById('progress-fill').style.width = pct + '%';
+        document.getElementById('progress-text').textContent =
+          p.running ? `${p.done} / ${p.total} 完了（処理中: ${p.current}）` : `${p.done} / ${p.total} ✔ 完了`;
+      }
+
+      if (!p.running) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+        checkRunning = false;
+        document.getElementById('btn-check-start').disabled = false;
+        document.getElementById('progress-text').textContent = `${p.done} / ${p.total} ✔ 完了`;
+        debugLog('サーバー側チェック完了。データを再読み込みします...');
+        // サーバーの最新データを取得して表示更新
+        await loadData();
+        renderList();
+        debugLog('✔ データ更新完了');
+      }
+    } catch (e) {
+      debugLog('進捗取得エラー: ' + e.message);
+    }
+  }, 3000);
+}
+
+function stopCheck() {
+  // サーバー側実行のため、ブラウザからの停止は不要
+  // ポーリングだけ停止
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   checkRunning = false;
   document.getElementById('btn-check-start').disabled = false;
-  document.getElementById('btn-check-stop').disabled = true;
-  document.getElementById('progress-text').textContent += checkAbort ? '  (中断)' : '  ✔ 完了';
-  debugLog(checkAbort ? 'チェック中断' : 'チェック完了');
-  renderList();
+  document.getElementById('progress-text').textContent += ' (監視停止 — サーバー側は継続中)';
 }
-function stopCheck() { checkAbort = true; }
 
 async function checkOneKeyword(product, appId) {
   const targets = {};
@@ -1188,13 +1160,13 @@ function handleImport(event) {
   if (!file) return;
   if (!confirm('現在のデータをインポートしたファイルで上書きしますか？')) { event.target.value = ''; return; }
   const reader = new FileReader();
-  reader.onload = (e) => {
+  reader.onload = async (e) => {
     try {
       const data = JSON.parse(e.target.result);
       if (Array.isArray(data)) products = data;
       else if (data.products && Array.isArray(data.products)) products = data.products;
       else throw new Error('Invalid format');
-      saveData(); renderList(); alert('インポートしました。');
+      await saveData(); renderList(); alert('インポートしました（サーバー保存済み）。');
     } catch(err) { alert('インポートに失敗しました:\n' + err.message); }
     event.target.value = '';
   };
@@ -1208,7 +1180,7 @@ function handleCSVImport(event) {
   const file = event.target.files[0];
   if (!file) return;
   const reader = new FileReader();
-  reader.onload = (e) => {
+  reader.onload = async (e) => {
     try {
       const text = e.target.result;
       const lines = text.split(/\r?\n/).filter(l => l.trim());
@@ -1250,9 +1222,9 @@ function handleCSVImport(event) {
         added++;
       }
 
-      saveData();
+      await saveData();
       renderList();
-      alert(`CSV一括登録完了\n\n追加: ${added} 件\nスキップ（重複）: ${skipped} 件`);
+      alert(`CSV一括登録完了（サーバー保存済み）\n\n追加: ${added} 件\nスキップ（重複）: ${skipped} 件`);
     } catch (err) { alert('CSVインポートに失敗しました:\n' + err.message); }
     event.target.value = '';
   };
@@ -1532,6 +1504,19 @@ function downloadFile(content, filename, type) {
   }
   if (updated) saveData();
   updateRegCount();
+
+  // ページ読み込み時にサーバー側チェックが実行中か確認
+  fetch(BASE_PATH + '/check-progress').then(r => r.json()).then(p => {
+    if (p.running) {
+      checkRunning = true;
+      document.getElementById('btn-check-start').disabled = true;
+      document.getElementById('progress-area').style.display = 'flex';
+      document.getElementById('progress-text').textContent = `${p.done} / ${p.total} 完了（処理中: ${p.current}）`;
+      const pct = p.total > 0 ? (p.done / p.total * 100).toFixed(0) : '0';
+      document.getElementById('progress-fill').style.width = pct + '%';
+      startProgressPolling();
+    }
+  }).catch(() => {});
 })();
 </script>
 </body>

@@ -220,12 +220,26 @@ router.get('/logs', (req, res) => {
   }
 });
 
-// 手動で自動チェックをテスト実行（強制再チェック）
+// サーバー側で順位チェックを実行（タブを閉じても継続）
 router.post('/run-check', async (req, res) => {
   try {
-    const { runAutoCheck } = await import('./auto-check.js');
-    res.json({ ok: true, message: '自動チェック開始（強制再チェック・バックグラウンド実行）' });
-    runAutoCheck({ force: true }).catch(e => console.error('[RankCheck] テスト実行エラー:', e.message));
+    const { runAutoCheck, getCheckProgress } = await import('./auto-check.js');
+    const progress = getCheckProgress();
+    if (progress.running) {
+      return res.json({ ok: false, message: '既にチェック実行中です', progress });
+    }
+    res.json({ ok: true, message: 'サーバー側で順位チェック開始（タブを閉じても継続します）' });
+    runAutoCheck({ force: true }).catch(e => console.error('[RankCheck] チェック実行エラー:', e.message));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// チェック進捗確認
+router.get('/check-progress', async (req, res) => {
+  try {
+    const { getCheckProgress } = await import('./auto-check.js');
+    res.json(getCheckProgress());
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
