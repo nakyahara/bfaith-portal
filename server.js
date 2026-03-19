@@ -10,6 +10,7 @@ import mercariRouter from './apps/mercari-sync/router.js';
 import aesRouter, { startPythonBackend, stopPythonBackend } from './apps/aes-pdf-sorter/router.js';
 import rankingRouter from './apps/ranking-checker/router.js';
 import { startScheduler } from './apps/ranking-checker/scheduler.js';
+import profitRouter from './apps/profit-calculator/router.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -112,6 +113,7 @@ const categories = [
   { id: 'product-sync', name: '商品登録・同期', icon: '🔄' },
   { id: 'shipping', name: '出荷・伝票', icon: '🚚' },
   { id: 'analysis', name: '商品分析', icon: '📊' },
+  { id: 'purchasing', name: '仕入れ', icon: '💰' },
 ];
 
 // --- アプリ一覧 ---
@@ -151,6 +153,15 @@ const apps = [
     path: '/apps/ranking-checker',
     status: 'active',
     category: 'analysis',
+  },
+  {
+    id: 'profit-calculator',
+    name: 'FBA仕入れ利益計算',
+    description: 'SP-APIで手数料自動取得・利益シミュレーション・Notion登録',
+    icon: '💰',
+    path: '/apps/profit-calculator/',
+    status: 'active',
+    category: 'purchasing',
   },
 ];
 
@@ -258,6 +269,7 @@ app.use('/apps/linegift-sync', requireAppAccess('linegift-sync'), linegiftRouter
 app.use('/apps/mercari-sync', requireAppAccess('mercari-sync'), mercariRouter);
 app.use('/apps/aes-pdf-sorter', requireAppAccess('aes-pdf-sorter'), aesRouter);
 app.use('/apps/ranking-checker', requireAppAccess('ranking-checker'), rankingRouter);
+app.use('/apps/profit-calculator', requireAppAccess('profit-calculator'), profitRouter);
 
 // 未実装アプリのプレースホルダー
 app.get('/apps/:appId', requireAuth, (req, res) => {

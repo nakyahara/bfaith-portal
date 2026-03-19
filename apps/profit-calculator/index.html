@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FBA仕入れ利益計算 — B-Faith Portal</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Segoe UI', 'Hiragino Sans', 'Meiryo', sans-serif; background: #eaeded; color: #0f1111; font-size: 14px; }
+    a { color: #0066c0; text-decoration: none; }
+    a:hover { color: #c45500; text-decoration: underline; }
+
+    .header { background: #232f3e; color: #fff; padding: 10px 24px; display: flex; align-items: center; justify-content: space-between; }
+    .header h1 { font-size: 17px; font-weight: bold; }
+    .header h1 span { color: #ff9900; }
+    .header a { color: #ddd; font-size: 13px; }
+    .container { max-width: 960px; margin: 16px auto; padding: 0 16px; }
+
+    .panel { background: #fff; border: 1px solid #d5d9d9; border-radius: 8px; padding: 16px 20px; margin-bottom: 14px; }
+    .panel-title { font-size: 14px; font-weight: bold; margin-bottom: 12px; padding-bottom: 6px; border-bottom: 2px solid #ff9900; }
+
+    .form-row { display: flex; gap: 12px; align-items: flex-end; margin-bottom: 10px; flex-wrap: wrap; }
+    .form-group { display: flex; flex-direction: column; gap: 3px; }
+    .form-group label { font-size: 12px; font-weight: bold; color: #565959; }
+    .form-group input, .form-group select { padding: 6px 8px; border: 1px solid #888; border-radius: 4px; font-size: 13px; }
+    .form-group input:focus, .form-group select:focus { border-color: #e77600; outline: none; box-shadow: 0 0 3px #e77600; }
+    .form-group.wide { flex: 1; min-width: 200px; }
+    .form-group.narrow { width: 110px; }
+    .form-group.medium { width: 150px; }
+
+    .btn { padding: 7px 18px; border-radius: 4px; font-size: 13px; font-weight: bold; cursor: pointer; border: 1px solid; }
+    .btn-primary { background: #f0c14b; border-color: #a88734; color: #0f1111; }
+    .btn-primary:hover { background: #e7b83c; }
+    .btn-save { background: #ff9900; border-color: #c77600; color: #0f1111; font-size: 15px; padding: 10px 32px; }
+    .btn-save:hover { background: #e88b00; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    /* 商品カード */
+    .product-card { display: none; gap: 16px; margin-top: 14px; padding-top: 14px; border-top: 1px solid #eee; }
+    .product-card img { width: 100px; height: 100px; object-fit: contain; border: 1px solid #d5d9d9; border-radius: 4px; flex-shrink: 0; }
+    .product-info { flex: 1; }
+    .product-name { font-size: 14px; font-weight: bold; margin-bottom: 6px; line-height: 1.4; }
+    .meta-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 3px 20px; font-size: 12px; color: #565959; }
+    .meta-grid .m-label { font-weight: bold; color: #0f1111; }
+    .product-price { text-align: center; flex-shrink: 0; }
+    .product-price .p-label { font-size: 11px; color: #565959; }
+    .product-price .p-value { font-size: 18px; font-weight: bold; }
+
+    /* 手数料表 */
+    .fee-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+    .fee-table td { padding: 5px 8px; }
+    .fee-table td:first-child { color: #565959; }
+    .fee-table td:last-child { text-align: right; font-weight: bold; width: 120px; }
+    .fee-table tr.section-header td { font-weight: bold; color: #0f1111; font-size: 13px; padding-top: 10px; border-bottom: 1px solid #eee; }
+    .fee-table tr.sub td:first-child { padding-left: 20px; font-size: 12px; }
+    .fee-table tr.total td { border-top: 2px solid #232f3e; font-weight: bold; font-size: 14px; color: #0f1111; padding-top: 10px; }
+
+    /* FBA/FBM切り替え */
+    .fulfillment-toggle { display: inline-flex; gap: 0; margin-bottom: 10px; }
+    .fulfillment-toggle label { padding: 6px 18px; border: 1px solid #888; font-size: 13px; cursor: pointer; font-weight: bold; }
+    .fulfillment-toggle label:first-of-type { border-radius: 4px 0 0 4px; }
+    .fulfillment-toggle label:last-of-type { border-radius: 0 4px 4px 0; border-left: none; }
+    .fulfillment-toggle input { display: none; }
+    .fulfillment-toggle input:checked + label { background: #232f3e; color: #fff; border-color: #232f3e; }
+
+    /* 在庫保管 */
+    .storage-box { background: #f0f6ff; border-radius: 4px; padding: 10px 14px; margin: 8px 0; }
+    .storage-box .s-title { font-weight: bold; font-size: 12px; margin-bottom: 6px; }
+    .period-tabs { display: inline-flex; gap: 4px; margin-bottom: 6px; }
+    .period-tab { padding: 2px 10px; font-size: 11px; border: 1px solid #d5d9d9; border-radius: 3px; cursor: pointer; background: #fff; }
+    .period-tab.active { background: #232f3e; color: #fff; border-color: #232f3e; }
+    .storage-row { display: flex; gap: 12px; align-items: center; font-size: 12px; flex-wrap: wrap; }
+    .storage-row label { color: #565959; }
+    .storage-row input { width: 50px; padding: 3px 6px; border: 1px solid #aaa; border-radius: 3px; font-size: 12px; text-align: center; }
+    .storage-row .s-result { font-weight: bold; margin-left: auto; }
+
+    /* 利益サマリー */
+    .profit-summary { background: #f7fdf7; border: 2px solid #067D62; border-radius: 8px; padding: 16px; margin: 14px 0; }
+    .profit-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; text-align: center; }
+    .profit-item .pi-label { font-size: 11px; color: #565959; }
+    .profit-item .pi-value { font-size: 22px; font-weight: bold; }
+    .pi-value.positive { color: #007600; }
+    .pi-value.negative { color: #b12704; }
+    .judgment-badge { display: inline-block; width: 36px; height: 36px; line-height: 36px; border-radius: 50%; font-size: 20px; font-weight: bold; text-align: center; color: #fff; }
+    .judgment-badge.excellent { background: #007600; }
+    .judgment-badge.good { background: #0066c0; }
+    .judgment-badge.fair { background: #c7511f; }
+    .judgment-badge.poor { background: #b12704; }
+
+    /* ストッパー */
+    .stopper-row { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; margin-top: 12px; padding-top: 12px; border-top: 1px solid #ddd; }
+    .stopper-item { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+    .stopper-item label { font-weight: bold; white-space: nowrap; }
+    .stopper-item input, .stopper-item select { width: 100px; padding: 5px 6px; border: 1px solid #888; border-radius: 4px; font-size: 13px; }
+    .stopper-auto { background: #f0f6ff; padding: 3px 8px; border-radius: 4px; font-size: 11px; color: #0066c0; }
+
+    .toast { position: fixed; top: 20px; right: 20px; background: #067D62; color: #fff; padding: 12px 20px; border-radius: 8px; font-size: 14px; display: none; z-index: 100; box-shadow: 0 2px 8px rgba(0,0,0,0.3); }
+    .loading { display: none; align-items: center; gap: 6px; color: #565959; font-size: 13px; }
+    .spinner { width: 14px; height: 14px; border: 2px solid #d5d9d9; border-top-color: #ff9900; border-radius: 50%; animation: spin 0.6s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .error-msg { background: #fff0f0; border: 1px solid #d13212; border-radius: 4px; padding: 8px 12px; color: #d13212; font-size: 13px; margin-top: 8px; display: none; }
+    .actions { display: flex; gap: 12px; align-items: center; margin-bottom: 24px; }
+    .hidden { display: none !important; }
+
+    @media (max-width: 600px) {
+      .form-row { flex-direction: column; }
+      .profit-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1><span>💰</span> FBA仕入れ利益計算</h1>
+    <a href="/">← ポータルに戻る</a>
+  </div>
+
+  <div class="container">
+
+    <!-- ========== セクション1: ASIN検索 + 商品情報 ========== -->
+    <div class="panel">
+      <div class="panel-title">商品検索</div>
+      <div class="form-row">
+        <div class="form-group medium">
+          <label>ASIN</label>
+          <input type="text" id="asinInput" placeholder="B000FQK36A" maxlength="10">
+        </div>
+        <button class="btn btn-primary" id="btnSearch" onclick="searchProduct()">検索</button>
+        <div class="loading" id="loadingSearch"><div class="spinner"></div>取得中...</div>
+      </div>
+      <div class="error-msg" id="errorMsg"></div>
+      <div class="product-card" id="productCard">
+        <img id="productImage" src="" alt="">
+        <div class="product-info">
+          <div class="product-name" id="productName"></div>
+          <div class="meta-grid">
+            <div><span class="m-label">ASIN</span> <span id="metaAsin">-</span></div>
+            <div><span class="m-label">重量</span> <span id="metaWeight">-</span></div>
+            <div><span class="m-label">寸法</span> <span id="metaDims">-</span></div>
+            <div><span class="m-label">ランキング</span> <span id="metaRank">-</span></div>
+            <div><span class="m-label">出品者</span> <span id="metaOffers">-</span></div>
+            <div><span class="m-label">カテゴリー</span> <span id="metaCategory">-</span></div>
+          </div>
+        </div>
+        <div class="product-price">
+          <div class="p-label">現在価格</div>
+          <div class="p-value" id="metaPrice">-</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ========== セクション2: 仕入れ先情報 ========== -->
+    <div class="panel hidden" id="supplierPanel">
+      <div class="panel-title" style="cursor:pointer;" onclick="toggleSupplier()">
+        仕入れ先情報 <span id="supplierToggle" style="float:right; font-size:12px; color:#0066c0;">▲ 閉じる</span>
+      </div>
+      <div id="supplierBody">
+        <div class="form-row">
+          <div class="form-group medium">
+            <label>仕入れ先</label>
+            <select id="supplierSelect" onchange="onSupplierChange()">
+              <option value="">選択してください</option>
+            </select>
+          </div>
+          <div class="form-group wide">
+            <label>メーカー/問屋名</label>
+            <input type="text" id="supplierName" placeholder="SP-APIから自動取得 or 手入力">
+          </div>
+          <button class="btn btn-primary" onclick="saveNewSupplier()" style="font-size:12px;">追加</button>
+        </div>
+        <div class="form-row">
+          <div class="form-group medium"><label>型番</label><input type="text" id="modelNumber" placeholder="SP-APIから自動取得"></div>
+          <div class="form-group medium"><label>JAN</label><input type="text" id="janCode" placeholder="SP-APIから自動取得"></div>
+          <div class="form-group medium"><label>内容量</label><input type="text" id="quantity"></div>
+        </div>
+        <div class="form-row">
+          <div class="form-group wide"><label>メーカーURL</label><input type="url" id="makerUrl" placeholder="https://..."></div>
+          <div class="form-group wide"><label>見積書URL</label><input type="url" id="quoteUrl" placeholder="https://..."></div>
+        </div>
+        <div class="form-row">
+          <div class="form-group wide"><label>コメント</label><input type="text" id="comment" placeholder="備考"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ========== セクション3: 価格・手数料計算（メイン） ========== -->
+    <div class="panel hidden" id="calcPanel">
+      <div class="panel-title">価格・手数料計算</div>
+
+      <!-- 販売価格 + FBA/FBM -->
+      <div class="form-row">
+        <div class="form-group narrow">
+          <label>商品価格（税込）</label>
+          <input type="number" id="sellingPrice" value="0" min="0" oninput="debounceFetchFees()">
+        </div>
+        <div class="fulfillment-toggle">
+          <input type="radio" name="fulfillment" id="fba" value="FBA" checked onchange="onFulfillmentChange()">
+          <label for="fba">FBA</label>
+          <input type="radio" name="fulfillment" id="fbm" value="FBM" onchange="onFulfillmentChange()">
+          <label for="fbm">自社出荷</label>
+        </div>
+        <div class="loading" id="loadingFees"><div class="spinner"></div>手数料取得中...</div>
+      </div>
+
+      <!-- 手数料テーブル -->
+      <table class="fee-table" id="feeTable">
+        <tr class="section-header"><td>Amazon手数料</td><td id="dispAmazonTotal">-</td></tr>
+        <tr class="sub"><td>販売手数料</td><td id="dispReferralFee">-</td></tr>
+        <tr class="sub"><td>基本成約料</td><td id="dispPerItemFee">-</td></tr>
+        <tr class="sub"><td>カテゴリー別成約料</td><td id="dispClosingFee">-</td></tr>
+        <tr class="section-header"><td id="shippingLabel">出荷費用（FBA配送料）</td><td id="dispShippingTotal">-</td></tr>
+        <tr class="sub" id="fbaFeeRow"><td>FBA配送料</td><td id="dispFbaFee">-</td></tr>
+        <tr class="sub hidden" id="fbmShippingRow">
+          <td>配送料（自社）</td>
+          <td><input type="number" id="fbmShipping" value="0" min="0" style="width:80px; text-align:right; padding:3px 6px; border:1px solid #888; border-radius:3px; font-size:12px;" oninput="recalcAll()"></td>
+        </tr>
+      </table>
+
+      <!-- 在庫保管手数料 -->
+      <div class="storage-box" id="storageSection">
+        <div class="s-title">在庫保管手数料</div>
+        <div class="period-tabs">
+          <div class="period-tab active" onclick="setStoragePeriod('jan_sep', this)">1月〜9月</div>
+          <div class="period-tab" onclick="setStoragePeriod('oct_dec', this)">10月〜12月</div>
+        </div>
+        <div class="storage-row">
+          <label>月額保管:</label> <span id="dispMonthlyStorage">¥0</span>
+          <label>平均在庫</label><input type="number" id="avgInventory" value="1" min="1" oninput="recalcStorage(); recalcAll()">
+          <label>月間販売</label><input type="number" id="monthlySales" value="1" min="1" oninput="recalcStorage(); recalcAll()">
+          <span class="s-result">1個あたり: <span id="dispStoragePerUnit">¥0</span></span>
+        </div>
+      </div>
+
+      <!-- 合計手数料 -->
+      <table class="fee-table">
+        <tr class="total"><td>合計手数料</td><td id="dispTotalFee">-</td></tr>
+      </table>
+
+      <!-- 仕入れ価格入力 -->
+      <div style="margin-top: 14px; padding-top: 14px; border-top: 1px dashed #ccc;">
+        <div class="form-row">
+          <div class="form-group narrow">
+            <label>卸価格（税抜）</label>
+            <input type="number" id="wholesalePrice" value="0" min="0" oninput="recalcAll()">
+          </div>
+          <div class="form-group" style="width:80px;">
+            <label>税率</label>
+            <select id="taxRate" onchange="recalcAll()">
+              <option value="10">10%</option>
+              <option value="8">8%</option>
+            </select>
+          </div>
+          <div class="form-group narrow">
+            <label>卸価格税込み</label>
+            <input type="number" id="wholesalePriceWithTax" readonly style="background:#f7f8f8;">
+          </div>
+          <div class="form-group" style="width:80px;">
+            <label>ロット</label>
+            <input type="number" id="lot" value="1" min="1">
+          </div>
+        </div>
+      </div>
+
+      <!-- 利益サマリー -->
+      <div class="profit-summary" id="profitSummary">
+        <div class="profit-grid">
+          <div class="profit-item"><div class="pi-label">商品あたりの費用</div><div class="pi-value" id="sumFee">-</div></div>
+          <div class="profit-item"><div class="pi-label">純利益</div><div class="pi-value" id="sumProfit">-</div></div>
+          <div class="profit-item"><div class="pi-label">純利益率</div><div class="pi-value" id="sumRate">-</div></div>
+          <div class="profit-item"><div class="pi-label">判定</div><div class="pi-value" id="sumJudgment">-</div></div>
+        </div>
+        <div class="stopper-row">
+          <div class="stopper-item">
+            <label>赤字ストッパー</label>
+            <input type="number" id="lossStopper" readonly style="background:#fff0f0;">
+            <span class="stopper-auto">自動（利益率10%）</span>
+          </div>
+          <div class="stopper-item">
+            <label>高値ストッパー</label>
+            <input type="number" id="highStopper" value="0" min="0">
+          </div>
+          <div class="stopper-item">
+            <label>価格追従</label>
+            <select id="priceTracking">
+              <option value="カート">カート</option>
+              <option value="最安値">最安値</option>
+              <option value="手動">手動</option>
+            </select>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ========== セクション4: 登録ボタン ========== -->
+    <div class="actions hidden" id="actionButtons">
+      <button class="btn btn-save" id="btnSave" onclick="saveAll()" disabled>リサーチDBに保存</button>
+      <a href="./list" class="btn" style="background:#f0f2f2; text-decoration:none; color:#0f1111;">一覧画面</a>
+      <button class="btn" style="background:#fff;" onclick="resetAll()">リセット</button>
+      <div class="loading" id="loadingSave"><div class="spinner"></div>保存中...</div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    let productData = null;
+    let feeData = null;
+    let storagePeriod = 'jan_sep';
+    let debounceTimer = null;
+    const STORAGE_RATE = { jan_sep: 5676 / 1000000, oct_dec: 9170 / 1000000 };
+
+    // ===== 初期化 =====
+    document.addEventListener('DOMContentLoaded', loadSupplierList);
+
+    async function loadSupplierList() {
+      try {
+        const res = await fetch('./api/suppliers');
+        const list = await res.json();
+        const sel = document.getElementById('supplierSelect');
+        sel.innerHTML = '<option value="">選択してください</option>';
+        list.forEach(s => {
+          const opt = document.createElement('option');
+          opt.value = s.code;
+          opt.textContent = `${s.code} - ${s.name}`;
+          opt.dataset.name = s.name;
+          sel.appendChild(opt);
+        });
+      } catch (e) { console.error('仕入れ先読み込みエラー:', e); }
+    }
+
+    function onSupplierChange() {
+      const sel = document.getElementById('supplierSelect');
+      const opt = sel.options[sel.selectedIndex];
+      if (opt.dataset.name) document.getElementById('supplierName').value = opt.dataset.name;
+    }
+
+    function toggleSupplier() {
+      const body = document.getElementById('supplierBody');
+      const toggle = document.getElementById('supplierToggle');
+      if (body.style.display === 'none') {
+        body.style.display = '';
+        toggle.textContent = '▲ 閉じる';
+      } else {
+        body.style.display = 'none';
+        toggle.textContent = '▼ 開く';
+      }
+    }
+
+    async function saveNewSupplier() {
+      const name = document.getElementById('supplierName').value.trim();
+      if (!name) { showError('メーカー/問屋名を入力してください'); return; }
+      const code = String(Date.now()).slice(-4);
+      try {
+        await fetch('./api/suppliers', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code, name }),
+        });
+        await loadSupplierList();
+        document.getElementById('supplierSelect').value = code;
+        showToast('仕入れ先を追加しました');
+      } catch (e) { showError('追加失敗: ' + e.message); }
+    }
+
+    // ===== 商品検索 =====
+    async function searchProduct() {
+      const asin = document.getElementById('asinInput').value.trim();
+      if (!asin.match(/^B[0-9A-Z]{9}$/)) { showError('ASINの形式が正しくありません'); return; }
+
+      hideError();
+      setLoading('loadingSearch', true);
+      document.getElementById('btnSearch').disabled = true;
+
+      try {
+        const res = await fetch(`./api/product/${asin}`);
+        const data = await res.json();
+        if (!res.ok) { showError(data.error); return; }
+
+        productData = data;
+        displayProduct(data);
+        showPanels();
+
+        if (data.currentPrice > 0) {
+          document.getElementById('sellingPrice').value = data.currentPrice;
+          fetchFees(asin, data.currentPrice);
+        }
+      } catch (err) {
+        showError('通信エラー: ' + err.message);
+      } finally {
+        setLoading('loadingSearch', false);
+        document.getElementById('btnSearch').disabled = false;
+      }
+    }
+
+    function displayProduct(d) {
+      document.getElementById('productCard').style.display = 'flex';
+      document.getElementById('productImage').src = d.image || '';
+      const url = `https://www.amazon.co.jp/dp/${d.asin}`;
+      document.getElementById('productName').innerHTML = `<a href="${url}" target="_blank">${esc(d.itemName)}</a>`;
+      document.getElementById('metaAsin').textContent = d.asin;
+      document.getElementById('metaWeight').textContent = d.dimensions.weight + ' kg';
+      document.getElementById('metaDims').textContent = `${d.dimensions.length} x ${d.dimensions.width} x ${d.dimensions.height} cm`;
+      document.getElementById('metaRank').textContent = d.salesRank !== '-' ? `#${Number(d.salesRank).toLocaleString()} (${d.category})` : '-';
+      document.getElementById('metaOffers').textContent = d.offerCount > 0 ? `${d.offerCount}件` : '-';
+      document.getElementById('metaCategory').textContent = d.category || '-';
+      document.getElementById('metaPrice').textContent = d.currentPrice > 0 ? `¥${d.currentPrice.toLocaleString()}` : '-';
+
+      // JAN・型番・メーカー名を自動セット
+      if (d.jan) document.getElementById('janCode').value = d.jan;
+      if (d.partNumber) document.getElementById('modelNumber').value = d.partNumber;
+      if (d.manufacturer) document.getElementById('supplierName').value = d.manufacturer;
+    }
+
+    function showPanels() {
+      document.getElementById('calcPanel').classList.remove('hidden');
+      document.getElementById('supplierPanel').classList.remove('hidden');
+      document.getElementById('actionButtons').classList.remove('hidden');
+    }
+
+    // ===== 手数料取得 =====
+    function debounceFetchFees() {
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        const asin = document.getElementById('asinInput').value.trim();
+        const price = parseInt(document.getElementById('sellingPrice').value) || 0;
+        if (asin.match(/^B[0-9A-Z]{9}$/) && price > 0) fetchFees(asin, price);
+      }, 500);
+    }
+
+    function onFulfillmentChange() {
+      const isFba = document.getElementById('fba').checked;
+      document.getElementById('fbaFeeRow').classList.toggle('hidden', !isFba);
+      document.getElementById('fbmShippingRow').classList.toggle('hidden', isFba);
+      document.getElementById('storageSection').classList.toggle('hidden', !isFba);
+      document.getElementById('shippingLabel').textContent = isFba ? '出荷費用（FBA配送料）' : '出荷費用';
+
+      const asin = document.getElementById('asinInput').value.trim();
+      const price = parseInt(document.getElementById('sellingPrice').value) || 0;
+      if (asin && price > 0) fetchFees(asin, price);
+    }
+
+    async function fetchFees(asin, price) {
+      const isFba = document.getElementById('fba').checked;
+      setLoading('loadingFees', true);
+      try {
+        const res = await fetch('./api/fees', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ asin, price, isFba }),
+        });
+        const data = await res.json();
+        if (!res.ok) { showError(data.error); return; }
+
+        feeData = data;
+        document.getElementById('btnSave').disabled = false;
+
+        // 手数料表示
+        document.getElementById('dispReferralFee').textContent = yen(data.referralFee);
+        document.getElementById('dispPerItemFee').textContent = yen(data.perItemFee);
+        document.getElementById('dispClosingFee').textContent = yen(data.variableClosingFee);
+        document.getElementById('dispAmazonTotal').textContent = yen(data.referralFee + data.perItemFee + data.variableClosingFee);
+        document.getElementById('dispFbaFee').textContent = yen(data.fbaFee);
+        document.getElementById('dispShippingTotal').textContent = yen(isFba ? data.fbaFee : 0);
+
+        recalcStorage();
+        recalcAll();
+      } catch (err) {
+        showError('手数料取得エラー: ' + err.message);
+      } finally {
+        setLoading('loadingFees', false);
+      }
+    }
+
+    // ===== 在庫保管手数料 =====
+    function setStoragePeriod(period, el) {
+      storagePeriod = period;
+      el.parentElement.querySelectorAll('.period-tab').forEach(t => t.classList.remove('active'));
+      el.classList.add('active');
+      recalcStorage();
+      recalcAll();
+    }
+
+    function recalcStorage() {
+      if (!productData) return;
+      const vol = productData.volumeCm3 || 0;
+      const monthly = vol * STORAGE_RATE[storagePeriod];
+      const avgInv = parseInt(document.getElementById('avgInventory').value) || 1;
+      const sales = parseInt(document.getElementById('monthlySales').value) || 1;
+      const perUnit = (monthly * avgInv) / sales;
+      document.getElementById('dispMonthlyStorage').textContent = yen(monthly);
+      document.getElementById('dispStoragePerUnit').textContent = yen(perUnit);
+    }
+
+    function getStoragePerUnit() {
+      if (!productData) return 0;
+      const vol = productData.volumeCm3 || 0;
+      const monthly = vol * STORAGE_RATE[storagePeriod];
+      const avgInv = parseInt(document.getElementById('avgInventory').value) || 1;
+      const sales = parseInt(document.getElementById('monthlySales').value) || 1;
+      return (monthly * avgInv) / sales;
+    }
+
+    // ===== 利益計算 =====
+    function recalcAll() {
+      // 卸価格税込み
+      const wholesale = parseInt(document.getElementById('wholesalePrice').value) || 0;
+      const taxRate = parseInt(document.getElementById('taxRate').value) || 10;
+      const withTax = Math.ceil(wholesale * (1 + taxRate / 100));
+      document.getElementById('wholesalePriceWithTax').value = withTax;
+
+      if (!feeData) return;
+
+      const isFba = document.getElementById('fba').checked;
+      const price = parseInt(document.getElementById('sellingPrice').value) || 0;
+      const storageFee = isFba ? getStoragePerUnit() : 0;
+      const fbmShipping = isFba ? 0 : (parseInt(document.getElementById('fbmShipping').value) || 0);
+      const totalFee = feeData.totalFee + storageFee + fbmShipping;
+
+      document.getElementById('dispTotalFee').textContent = yen(totalFee);
+      document.getElementById('dispShippingTotal').textContent = yen(isFba ? feeData.fbaFee : fbmShipping);
+
+      // 利益計算（卸価格が0のときは販売価格ベース）
+      const cost = withTax > 0 ? withTax : 0;
+      const profit = price - cost - totalFee;
+      const profitRate = price > 0 ? profit / price : 0;
+
+      let judgment, jClass;
+      if (profitRate >= 0.3) { judgment = '◎'; jClass = 'excellent'; }
+      else if (profitRate >= 0.2) { judgment = '○'; jClass = 'good'; }
+      else if (profitRate >= 0.1) { judgment = '△'; jClass = 'fair'; }
+      else { judgment = '×'; jClass = 'poor'; }
+
+      document.getElementById('sumFee').textContent = yen(totalFee);
+      const sp = document.getElementById('sumProfit');
+      sp.textContent = yen(profit);
+      sp.className = 'pi-value ' + (profit >= 0 ? 'positive' : 'negative');
+      const sr = document.getElementById('sumRate');
+      sr.textContent = (profitRate * 100).toFixed(1) + '%';
+      sr.className = 'pi-value ' + (profit >= 0 ? 'positive' : 'negative');
+      document.getElementById('sumJudgment').innerHTML = `<span class="judgment-badge ${jClass}">${judgment}</span>`;
+
+      // 赤字ストッパー自動算出
+      if (price > 0 && feeData.referralFee > 0) {
+        const refRate = feeData.referralFee / price;
+        const fixedFees = (isFba ? feeData.fbaFee : fbmShipping) + storageFee + feeData.perItemFee + feeData.variableClosingFee;
+        const stopper = Math.ceil((cost + fixedFees) / (1 - refRate - 0.10));
+        document.getElementById('lossStopper').value = stopper > 0 ? stopper : 0;
+      }
+    }
+
+    // ===== Notion保存 =====
+    async function saveAll() {
+      if (!productData || !feeData) return;
+
+      const isFba = document.getElementById('fba').checked;
+      const price = parseInt(document.getElementById('sellingPrice').value) || 0;
+      const wholesale = parseInt(document.getElementById('wholesalePrice').value) || 0;
+      const taxRate = parseInt(document.getElementById('taxRate').value) || 10;
+      const withTax = Math.ceil(wholesale * (1 + taxRate / 100));
+      const storageFee = isFba ? getStoragePerUnit() : 0;
+      const fbmShipping = isFba ? 0 : (parseInt(document.getElementById('fbmShipping').value) || 0);
+      const totalFee = feeData.totalFee + storageFee + fbmShipping;
+      const profit = price - withTax - totalFee;
+      const profitRate = price > 0 ? profit / price : 0;
+
+      let judgment;
+      if (profitRate >= 0.3) judgment = '◎';
+      else if (profitRate >= 0.2) judgment = '○';
+      else if (profitRate >= 0.1) judgment = '△';
+      else judgment = '×';
+
+      const sel = document.getElementById('supplierSelect');
+      const body = {
+        asin: productData.asin,
+        productName: productData.itemName,
+        amazonUrl: `https://www.amazon.co.jp/dp/${productData.asin}`,
+        imageUrl: productData.image || '',
+        category: productData.category,
+        salesRank: productData.salesRank !== '-' ? Number(productData.salesRank) : null,
+        offerCount: productData.offerCount || null,
+        supplierCode: sel.value || '',
+        supplierName: document.getElementById('supplierName').value,
+        modelNumber: document.getElementById('modelNumber').value,
+        jan: document.getElementById('janCode').value,
+        quantity: document.getElementById('quantity').value,
+        makerUrl: document.getElementById('makerUrl').value || null,
+        quoteUrl: document.getElementById('quoteUrl').value || null,
+        comment: document.getElementById('comment').value,
+        wholesalePrice: wholesale,
+        taxRate: taxRate + '%',
+        wholesalePriceWithTax: withTax,
+        lot: parseInt(document.getElementById('lot').value) || 1,
+        sellingPrice: price,
+        referralFee: feeData.referralFee,
+        fbaFee: isFba ? feeData.fbaFee : 0,
+        storageFee: Math.round(storageFee),
+        totalFee: Math.round(totalFee),
+        profit: Math.round(profit),
+        profitRate,
+        judgment,
+        fulfillment: isFba ? 'FBA' : '自社出荷',
+        lossStopper: parseInt(document.getElementById('lossStopper').value) || null,
+        highStopper: parseInt(document.getElementById('highStopper').value) || null,
+        priceTracking: document.getElementById('priceTracking').value,
+        status: 'リサーチ',
+      };
+
+      document.getElementById('btnSave').disabled = true;
+      setLoading('loadingSave', true);
+
+      try {
+        const res = await fetch('./api/research', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const result = await res.json();
+        if (res.ok) showToast(`リサーチDBに保存しました (ID: ${result.id})`);
+        else showError('保存失敗: ' + (result.error || ''));
+      } catch (err) {
+        showError('通信エラー: ' + err.message);
+      } finally {
+        document.getElementById('btnSave').disabled = false;
+        setLoading('loadingSave', false);
+      }
+    }
+
+    // ===== リセット =====
+    function resetAll() {
+      productData = null; feeData = null;
+      document.getElementById('asinInput').value = '';
+      document.getElementById('productCard').style.display = 'none';
+      document.getElementById('calcPanel').classList.add('hidden');
+      document.getElementById('supplierPanel').classList.add('hidden');
+      document.getElementById('actionButtons').classList.add('hidden');
+      document.getElementById('btnSave').disabled = true;
+      ['wholesalePrice', 'sellingPrice', 'fbmShipping', 'lossStopper', 'highStopper'].forEach(id => document.getElementById(id).value = '0');
+      ['modelNumber', 'janCode', 'quantity', 'makerUrl', 'quoteUrl', 'comment', 'supplierName'].forEach(id => document.getElementById(id).value = '');
+      document.getElementById('supplierSelect').selectedIndex = 0;
+      document.getElementById('lot').value = '1';
+      document.getElementById('fba').checked = true;
+      onFulfillmentChange();
+      hideError();
+    }
+
+    // ===== ユーティリティ =====
+    function yen(n) { return '¥' + Math.round(n).toLocaleString(); }
+    function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+    function showError(m) { const e = document.getElementById('errorMsg'); e.textContent = m; e.style.display = 'block'; }
+    function hideError() { document.getElementById('errorMsg').style.display = 'none'; }
+    function setLoading(id, s) { document.getElementById(id).style.display = s ? 'flex' : 'none'; }
+    function showToast(m) { const e = document.getElementById('toast'); e.textContent = m; e.style.display = 'block'; setTimeout(() => e.style.display = 'none', 3000); }
+
+    document.getElementById('asinInput').addEventListener('keypress', e => { if (e.key === 'Enter') searchProduct(); });
+  </script>
+</body>
+</html>

@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>一覧管理 — FBA仕入れ利益計算</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Segoe UI', 'Hiragino Sans', 'Meiryo', sans-serif; background: #eaeded; color: #0f1111; font-size: 13px; }
+    a { color: #0066c0; text-decoration: none; }
+
+    .header { background: #232f3e; color: #fff; padding: 10px 24px; display: flex; align-items: center; justify-content: space-between; }
+    .header h1 { font-size: 17px; font-weight: bold; }
+    .header h1 span { color: #ff9900; }
+    .header-links { display: flex; gap: 16px; }
+    .header-links a { color: #ddd; font-size: 13px; }
+    .container { max-width: 1400px; margin: 16px auto; padding: 0 16px; }
+
+    /* タブ */
+    .tabs { display: flex; gap: 0; margin-bottom: 16px; }
+    .tab { padding: 10px 24px; font-size: 14px; font-weight: bold; cursor: pointer; border: 1px solid #d5d9d9; background: #f0f2f2; color: #565959; }
+    .tab:first-child { border-radius: 6px 0 0 6px; }
+    .tab:last-child { border-radius: 0 6px 6px 0; border-left: none; }
+    .tab.active { background: #232f3e; color: #fff; border-color: #232f3e; }
+
+    /* フィルタバー */
+    .filter-bar { background: #fff; border: 1px solid #d5d9d9; border-radius: 6px; padding: 10px 16px; margin-bottom: 12px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    .filter-bar select, .filter-bar input { padding: 5px 8px; border: 1px solid #888; border-radius: 4px; font-size: 13px; }
+    .filter-bar input { width: 200px; }
+    .filter-bar .count { margin-left: auto; font-size: 12px; color: #565959; }
+    .btn { padding: 6px 14px; border-radius: 4px; font-size: 12px; font-weight: bold; cursor: pointer; border: 1px solid; }
+    .btn-sm { padding: 3px 10px; font-size: 11px; }
+    .btn-primary { background: #f0c14b; border-color: #a88734; }
+    .btn-danger { background: #fff0f0; border-color: #d13212; color: #d13212; }
+    .btn-success { background: #f0fff0; border-color: #007600; color: #007600; }
+    .btn-export { background: #fff; border-color: #0066c0; color: #0066c0; }
+
+    /* テーブル */
+    .data-table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #d5d9d9; border-radius: 6px; overflow: hidden; }
+    .data-table th { background: #f7f8f8; padding: 8px 10px; text-align: left; font-size: 11px; color: #565959; border-bottom: 2px solid #d5d9d9; white-space: nowrap; }
+    .data-table td { padding: 7px 10px; border-bottom: 1px solid #eee; vertical-align: middle; }
+    .data-table tr:hover { background: #fafafa; }
+    .data-table .thumb { width: 40px; height: 40px; object-fit: contain; border-radius: 3px; }
+    .data-table .asin-link { font-weight: bold; font-size: 12px; }
+    .data-table .product-name-cell { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+    .data-table .num { text-align: right; font-variant-numeric: tabular-nums; }
+    .data-table .positive { color: #007600; }
+    .data-table .negative { color: #b12704; }
+
+    /* ステータスバッジ */
+    .status-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: bold; white-space: nowrap; }
+    .status-badge.リサーチ { background: #e3e6e8; color: #444; }
+    .status-badge.見積もり依頼中 { background: #fff3cd; color: #856404; }
+    .status-badge.回答済 { background: #ffd8a8; color: #a55000; }
+    .status-badge.判断中 { background: #d0ebff; color: #1864ab; }
+    .status-badge.却下 { background: #ffe0e0; color: #b12704; }
+    .status-badge.発注済 { background: #e8d5f5; color: #6741d9; }
+    .status-badge.入荷待ち { background: #fcc2d7; color: #c2255c; }
+    .status-badge.NE登録済 { background: #d3f9d8; color: #2b8a3e; }
+    .status-badge.出品済 { background: #b2f2bb; color: #087f23; }
+
+    .judgment-sm { display: inline-block; width: 22px; height: 22px; line-height: 22px; border-radius: 50%; font-size: 13px; font-weight: bold; text-align: center; color: #fff; }
+    .judgment-sm.◎ { background: #007600; }
+    .judgment-sm.○ { background: #0066c0; }
+    .judgment-sm.△ { background: #c7511f; }
+    .judgment-sm.× { background: #b12704; }
+
+    .empty-msg { text-align: center; padding: 40px; color: #888; font-size: 14px; }
+    .toast { position: fixed; top: 20px; right: 20px; background: #067D62; color: #fff; padding: 12px 20px; border-radius: 8px; font-size: 14px; display: none; z-index: 100; box-shadow: 0 2px 8px rgba(0,0,0,0.3); }
+    .actions-cell { display: flex; gap: 4px; flex-wrap: wrap; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1><span>💰</span> 一覧管理</h1>
+    <div class="header-links">
+      <a href="./">計算画面</a>
+      <a href="/">ポータル</a>
+    </div>
+  </div>
+
+  <div class="container">
+    <!-- タブ -->
+    <div class="tabs">
+      <div class="tab active" onclick="switchTab('research')">リサーチ・見積もり</div>
+      <div class="tab" onclick="switchTab('products')">商品登録</div>
+    </div>
+
+    <!-- フィルタ -->
+    <div class="filter-bar">
+      <select id="statusFilter" onchange="loadData()">
+        <option value="">全ステータス</option>
+      </select>
+      <input type="text" id="searchInput" placeholder="ASIN・商品名で検索" oninput="debounceLoad()">
+      <button class="btn btn-export" id="btnExport" onclick="exportCsv()" style="display:none;">CSV出力</button>
+      <span class="count" id="countDisplay">-</span>
+    </div>
+
+    <!-- データテーブル -->
+    <div id="tableContainer"></div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    let currentTab = 'research';
+    let debounceTimer = null;
+
+    const RESEARCH_STATUSES = ['リサーチ', '見積もり依頼中', '回答済', '判断中', '却下'];
+    const PRODUCT_STATUSES = ['発注済', '入荷待ち', 'NE登録済', '出品済'];
+
+    // ===== 初期化 =====
+    document.addEventListener('DOMContentLoaded', () => {
+      updateStatusFilter();
+      loadData();
+    });
+
+    function switchTab(tab) {
+      currentTab = tab;
+      document.querySelectorAll('.tab').forEach((t, i) => {
+        t.classList.toggle('active', (i === 0 && tab === 'research') || (i === 1 && tab === 'products'));
+      });
+      document.getElementById('btnExport').style.display = tab === 'products' ? '' : 'none';
+      document.getElementById('statusFilter').value = '';
+      document.getElementById('searchInput').value = '';
+      updateStatusFilter();
+      loadData();
+    }
+
+    function updateStatusFilter() {
+      const sel = document.getElementById('statusFilter');
+      const statuses = currentTab === 'research' ? RESEARCH_STATUSES : PRODUCT_STATUSES;
+      sel.innerHTML = '<option value="">全ステータス</option>' +
+        statuses.map(s => `<option value="${s}">${s}</option>`).join('');
+    }
+
+    function debounceLoad() {
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(loadData, 300);
+    }
+
+    // ===== データ読み込み =====
+    async function loadData() {
+      const status = document.getElementById('statusFilter').value;
+      const search = document.getElementById('searchInput').value.trim();
+      const endpoint = currentTab === 'research' ? './api/research' : './api/products';
+      const params = new URLSearchParams();
+      if (status) params.set('status', status);
+      if (search) params.set('search', search);
+
+      try {
+        const res = await fetch(`${endpoint}?${params}`);
+        const data = await res.json();
+        document.getElementById('countDisplay').textContent = `${data.length}件`;
+
+        if (currentTab === 'research') renderResearchTable(data);
+        else renderProductsTable(data);
+      } catch (err) {
+        document.getElementById('tableContainer').innerHTML = `<div class="empty-msg">エラー: ${err.message}</div>`;
+      }
+    }
+
+    // ===== リサーチテーブル =====
+    function renderResearchTable(data) {
+      if (data.length === 0) {
+        document.getElementById('tableContainer').innerHTML = '<div class="empty-msg">データがありません</div>';
+        return;
+      }
+
+      const html = `<table class="data-table">
+        <thead><tr>
+          <th></th><th>ASIN</th><th>商品名</th><th>仕入れ先</th>
+          <th>卸価格</th><th>販売価格</th><th>利益</th><th>利益率</th><th>判定</th>
+          <th>ステータス</th><th>登録日</th><th>操作</th>
+        </tr></thead>
+        <tbody>${data.map(r => `<tr>
+          <td>${r.image_url ? `<img class="thumb" src="${esc(r.image_url)}">` : ''}</td>
+          <td><a class="asin-link" href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank">${r.asin}</a></td>
+          <td class="product-name-cell" title="${esc(r.product_name || '')}">${esc(r.product_name || '-')}</td>
+          <td>${esc(r.supplier_name || '-')}</td>
+          <td class="num">${r.wholesale_price_with_tax ? '¥'+Number(r.wholesale_price_with_tax).toLocaleString() : '-'}</td>
+          <td class="num">${r.selling_price ? '¥'+Number(r.selling_price).toLocaleString() : '-'}</td>
+          <td class="num ${r.profit >= 0 ? 'positive' : 'negative'}">${r.profit != null ? '¥'+Number(r.profit).toLocaleString() : '-'}</td>
+          <td class="num ${r.profit >= 0 ? 'positive' : 'negative'}">${r.profit_rate != null ? (r.profit_rate*100).toFixed(1)+'%' : '-'}</td>
+          <td>${r.judgment ? `<span class="judgment-sm ${r.judgment}">${r.judgment}</span>` : '-'}</td>
+          <td><span class="status-badge ${r.status || ''}">${r.status || '-'}</span></td>
+          <td style="font-size:11px;">${r.created_at ? r.created_at.slice(0,10) : '-'}</td>
+          <td><div class="actions-cell">
+            ${r.status !== '却下' && r.status !== '発注済' ? `<select class="btn-sm" onchange="changeResearchStatus(${r.id}, this.value)" style="font-size:11px;">
+              <option value="">変更</option>
+              ${RESEARCH_STATUSES.filter(s => s !== r.status).map(s => `<option value="${s}">${s}</option>`).join('')}
+            </select>` : ''}
+            ${r.status === '判断中' ? `<button class="btn btn-sm btn-success" onclick="promote(${r.id})">商品登録へ</button>` : ''}
+          </div></td>
+        </tr>`).join('')}</tbody>
+      </table>`;
+      document.getElementById('tableContainer').innerHTML = html;
+    }
+
+    // ===== 商品登録テーブル =====
+    function renderProductsTable(data) {
+      if (data.length === 0) {
+        document.getElementById('tableContainer').innerHTML = '<div class="empty-msg">データがありません</div>';
+        return;
+      }
+
+      const html = `<table class="data-table">
+        <thead><tr>
+          <th>ASIN</th><th>商品名</th><th>仕入れ先</th>
+          <th>仕入価格</th><th>販売価格</th><th>利益</th><th>利益率</th>
+          <th>FBA/FBM</th><th>ステータス</th><th>登録日</th><th>操作</th>
+        </tr></thead>
+        <tbody>${data.map(p => `<tr>
+          <td><a class="asin-link" href="https://www.amazon.co.jp/dp/${p.asin}" target="_blank">${p.asin}</a></td>
+          <td class="product-name-cell" title="${esc(p.product_name || '')}">${esc(p.product_name || '-')}</td>
+          <td>${esc(p.supplier_name || '-')}</td>
+          <td class="num">${p.wholesale_price_with_tax ? '¥'+Number(p.wholesale_price_with_tax).toLocaleString() : '-'}</td>
+          <td class="num">${p.selling_price ? '¥'+Number(p.selling_price).toLocaleString() : '-'}</td>
+          <td class="num ${p.profit >= 0 ? 'positive' : 'negative'}">${p.profit != null ? '¥'+Number(p.profit).toLocaleString() : '-'}</td>
+          <td class="num ${p.profit >= 0 ? 'positive' : 'negative'}">${p.profit_rate != null ? (p.profit_rate*100).toFixed(1)+'%' : '-'}</td>
+          <td>${p.fulfillment || '-'}</td>
+          <td><span class="status-badge ${p.status || ''}">${p.status || '-'}</span></td>
+          <td style="font-size:11px;">${p.created_at ? p.created_at.slice(0,10) : '-'}</td>
+          <td><select class="btn-sm" onchange="changeProductStatus(${p.id}, this.value)" style="font-size:11px;">
+            <option value="">変更</option>
+            ${PRODUCT_STATUSES.filter(s => s !== p.status).map(s => `<option value="${s}">${s}</option>`).join('')}
+          </select></td>
+        </tr>`).join('')}</tbody>
+      </table>`;
+      document.getElementById('tableContainer').innerHTML = html;
+    }
+
+    // ===== ステータス変更 =====
+    async function changeResearchStatus(id, status) {
+      if (!status) return;
+      await fetch(`./api/research/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status }),
+      });
+      showToast(`ステータスを「${status}」に変更`);
+      loadData();
+    }
+
+    async function changeProductStatus(id, status) {
+      if (!status) return;
+      await fetch(`./api/products/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status }),
+      });
+      showToast(`ステータスを「${status}」に変更`);
+      loadData();
+    }
+
+    // ===== 商品登録へ転送 =====
+    async function promote(id) {
+      if (!confirm('この商品を「商品登録」に転送しますか？')) return;
+      const res = await fetch(`./api/research/${id}/promote`, { method: 'POST' });
+      if (res.ok) {
+        showToast('商品登録DBに転送しました');
+        loadData();
+      }
+    }
+
+    // ===== CSV出力 =====
+    function exportCsv() {
+      const status = document.getElementById('statusFilter').value;
+      const url = `./api/products/csv/ne${status ? '?status=' + encodeURIComponent(status) : ''}`;
+      window.location.href = url;
+    }
+
+    // ===== ユーティリティ =====
+    function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+    function showToast(m) { const e = document.getElementById('toast'); e.textContent = m; e.style.display = 'block'; setTimeout(() => e.style.display = 'none', 3000); }
+  </script>
+</body>
+</html>
