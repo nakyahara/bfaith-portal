@@ -939,6 +939,7 @@ async function startCheck() {
 
 function startProgressPolling() {
   if (pollTimer) clearInterval(pollTimer);
+  let lastDone = -1;
   pollTimer = setInterval(async () => {
     try {
       const resp = await fetch(BASE_PATH + '/check-progress');
@@ -949,6 +950,13 @@ function startProgressPolling() {
         document.getElementById('progress-fill').style.width = pct + '%';
         document.getElementById('progress-text').textContent =
           p.running ? `${p.done} / ${p.total} 完了（処理中: ${p.current}）` : `${p.done} / ${p.total} ✔ 完了`;
+
+        // 進捗が進んだときだけデータ再取得＆画面更新
+        if (p.done !== lastDone) {
+          lastDone = p.done;
+          await loadData();
+          renderList();
+        }
       }
 
       if (!p.running) {
@@ -957,11 +965,7 @@ function startProgressPolling() {
         checkRunning = false;
         document.getElementById('btn-check-start').disabled = false;
         document.getElementById('progress-text').textContent = `${p.done} / ${p.total} ✔ 完了`;
-        debugLog('サーバー側チェック完了。データを再読み込みします...');
-        // サーバーの最新データを取得して表示更新
-        await loadData();
-        renderList();
-        debugLog('✔ データ更新完了');
+        debugLog('サーバー側チェック完了');
       }
     } catch (e) {
       debugLog('進捗取得エラー: ' + e.message);
