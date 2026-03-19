@@ -94,6 +94,12 @@
     .stopper-item input, .stopper-item select { width: 100px; padding: 5px 6px; border: 1px solid #888; border-radius: 4px; font-size: 13px; }
     .stopper-auto { background: #f0f6ff; padding: 3px 8px; border-radius: 4px; font-size: 11px; color: #0066c0; }
 
+    /* ページタブ */
+    .page-tabs { display: flex; background: #37475a; padding: 0 24px; }
+    .page-tab { padding: 10px 20px; color: #ccc; font-size: 13px; font-weight: bold; text-decoration: none; border-bottom: 3px solid transparent; }
+    .page-tab:hover { color: #fff; text-decoration: none; }
+    .page-tab.active { color: #fff; border-bottom-color: #ff9900; }
+
     .toast { position: fixed; top: 20px; right: 20px; background: #067D62; color: #fff; padding: 12px 20px; border-radius: 8px; font-size: 14px; display: none; z-index: 100; box-shadow: 0 2px 8px rgba(0,0,0,0.3); }
     .loading { display: none; align-items: center; gap: 6px; color: #565959; font-size: 13px; }
     .spinner { width: 14px; height: 14px; border: 2px solid #d5d9d9; border-top-color: #ff9900; border-radius: 50%; animation: spin 0.6s linear infinite; }
@@ -112,6 +118,10 @@
   <div class="header">
     <h1><span>💰</span> FBA仕入れ利益計算</h1>
     <a href="/">← ポータルに戻る</a>
+  </div>
+  <div class="page-tabs">
+    <a href="./" class="page-tab active">商品検索・計算</a>
+    <a href="./list" class="page-tab">一覧管理</a>
   </div>
 
   <div class="container">
@@ -293,7 +303,6 @@
     <!-- ========== セクション4: 登録ボタン ========== -->
     <div class="actions hidden" id="actionButtons">
       <button class="btn btn-save" id="btnSave" onclick="saveAll()" disabled>リサーチDBに保存</button>
-      <a href="./list" class="btn" style="background:#f0f2f2; text-decoration:none; color:#0f1111;">一覧画面</a>
       <button class="btn" style="background:#fff;" onclick="resetAll()">リセット</button>
       <div class="loading" id="loadingSave"><div class="spinner"></div>保存中...</div>
     </div>

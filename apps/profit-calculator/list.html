@@ -66,17 +66,23 @@
     .judgment-sm.× { background: #b12704; }
 
     .empty-msg { text-align: center; padding: 40px; color: #888; font-size: 14px; }
+    .page-tabs { display: flex; background: #37475a; padding: 0 24px; }
+    .page-tab { padding: 10px 20px; color: #ccc; font-size: 13px; font-weight: bold; text-decoration: none; border-bottom: 3px solid transparent; }
+    .page-tab:hover { color: #fff; text-decoration: none; }
+    .page-tab.active { color: #fff; border-bottom-color: #ff9900; }
+
     .toast { position: fixed; top: 20px; right: 20px; background: #067D62; color: #fff; padding: 12px 20px; border-radius: 8px; font-size: 14px; display: none; z-index: 100; box-shadow: 0 2px 8px rgba(0,0,0,0.3); }
     .actions-cell { display: flex; gap: 4px; flex-wrap: wrap; }
   </style>
 </head>
 <body>
   <div class="header">
-    <h1><span>💰</span> 一覧管理</h1>
-    <div class="header-links">
-      <a href="./">計算画面</a>
-      <a href="/">ポータル</a>
-    </div>
+    <h1><span>💰</span> FBA仕入れ利益計算</h1>
+    <a href="/" style="color:#ddd; font-size:13px; text-decoration:none;">← ポータルに戻る</a>
+  </div>
+  <div class="page-tabs">
+    <a href="./" class="page-tab">商品検索・計算</a>
+    <a href="./list" class="page-tab active">一覧管理</a>
   </div>
 
   <div class="container">
