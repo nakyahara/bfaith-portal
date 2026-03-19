@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>リサーチ・見積もり — FBA仕入れ利益計算</title>
+  <title>商品登録 — FBA仕入れ利益計算</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: 'Segoe UI', 'Hiragino Sans', 'Meiryo', sans-serif; background: #eaeded; color: #0f1111; font-size: 13px; }
@@ -24,13 +24,12 @@
     .filter-bar .count { margin-left: auto; font-size: 12px; color: #565959; }
     .btn { padding: 6px 14px; border-radius: 4px; font-size: 12px; font-weight: bold; cursor: pointer; border: 1px solid; }
     .btn-sm { padding: 3px 10px; font-size: 11px; }
-    .btn-success { background: #f0fff0; border-color: #007600; color: #007600; }
+    .btn-export { background: #fff; border-color: #0066c0; color: #0066c0; }
 
     .data-table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #d5d9d9; border-radius: 6px; overflow: hidden; }
     .data-table th { background: #f7f8f8; padding: 8px 10px; text-align: left; font-size: 11px; color: #565959; border-bottom: 2px solid #d5d9d9; white-space: nowrap; }
     .data-table td { padding: 7px 10px; border-bottom: 1px solid #eee; vertical-align: middle; }
     .data-table tr:hover { background: #fafafa; }
-    .data-table .thumb { width: 40px; height: 40px; object-fit: contain; border-radius: 3px; }
     .data-table .asin-link { font-weight: bold; font-size: 12px; }
     .data-table .product-name-cell { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
     .data-table .num { text-align: right; font-variant-numeric: tabular-nums; }
@@ -38,21 +37,13 @@
     .data-table .negative { color: #b12704; }
 
     .status-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: bold; white-space: nowrap; }
-    .status-badge.リサーチ { background: #e3e6e8; color: #444; }
-    .status-badge.見積もり依頼中 { background: #fff3cd; color: #856404; }
-    .status-badge.回答済 { background: #ffd8a8; color: #a55000; }
-    .status-badge.判断中 { background: #d0ebff; color: #1864ab; }
-    .status-badge.却下 { background: #ffe0e0; color: #b12704; }
-
-    .judgment-sm { display: inline-block; width: 22px; height: 22px; line-height: 22px; border-radius: 50%; font-size: 13px; font-weight: bold; text-align: center; color: #fff; }
-    .judgment-sm.◎ { background: #007600; }
-    .judgment-sm.○ { background: #0066c0; }
-    .judgment-sm.△ { background: #c7511f; }
-    .judgment-sm.× { background: #b12704; }
+    .status-badge.発注済 { background: #e8d5f5; color: #6741d9; }
+    .status-badge.入荷待ち { background: #fcc2d7; color: #c2255c; }
+    .status-badge.NE登録済 { background: #d3f9d8; color: #2b8a3e; }
+    .status-badge.出品済 { background: #b2f2bb; color: #087f23; }
 
     .empty-msg { text-align: center; padding: 40px; color: #888; font-size: 14px; }
     .toast { position: fixed; top: 20px; right: 20px; background: #067D62; color: #fff; padding: 12px 20px; border-radius: 8px; font-size: 14px; display: none; z-index: 100; box-shadow: 0 2px 8px rgba(0,0,0,0.3); }
-    .actions-cell { display: flex; gap: 4px; flex-wrap: wrap; }
   </style>
 </head>
 <body>
@@ -61,22 +52,22 @@
     <a href="/" style="color:#ddd; font-size:13px; text-decoration:none;">← ポータルに戻る</a>
   </div>
   <div class="page-tabs">
-    <a href="./research" class="page-tab active">リサーチ・見積もり</a>
+    <a href="./research" class="page-tab">リサーチ・見積もり</a>
     <a href="./" class="page-tab">商品計算</a>
-    <a href="./products" class="page-tab">商品登録</a>
+    <a href="./products" class="page-tab active">商品登録</a>
   </div>
 
   <div class="container">
     <div class="filter-bar">
       <select id="statusFilter" onchange="loadData()">
         <option value="">全ステータス</option>
-        <option value="リサーチ">リサーチ</option>
-        <option value="見積もり依頼中">見積もり依頼中</option>
-        <option value="回答済">回答済</option>
-        <option value="判断中">判断中</option>
-        <option value="却下">却下</option>
+        <option value="発注済">発注済</option>
+        <option value="入荷待ち">入荷待ち</option>
+        <option value="NE登録済">NE登録済</option>
+        <option value="出品済">出品済</option>
       </select>
-      <input type="text" id="searchInput" placeholder="ASIN・商品名・仕入れ先で検索" oninput="debounceLoad()">
+      <input type="text" id="searchInput" placeholder="ASIN・商品名で検索" oninput="debounceLoad()">
+      <button class="btn btn-export" onclick="exportCsv()">NE用CSV出力</button>
       <span class="count" id="countDisplay">-</span>
     </div>
     <div id="tableContainer"></div>
@@ -86,7 +77,7 @@
 
   <script>
     let debounceTimer = null;
-    const STATUSES = ['リサーチ', '見積もり依頼中', '回答済', '判断中', '却下'];
+    const STATUSES = ['発注済', '入荷待ち', 'NE登録済', '出品済'];
 
     document.addEventListener('DOMContentLoaded', loadData);
 
@@ -103,7 +94,7 @@
       if (search) params.set('search', search);
 
       try {
-        const res = await fetch(`./api/research?${params}`);
+        const res = await fetch(`./api/products?${params}`);
         const data = await res.json();
         document.getElementById('countDisplay').textContent = `${data.length}件`;
         renderTable(data);
@@ -114,35 +105,31 @@
 
     function renderTable(data) {
       if (data.length === 0) {
-        document.getElementById('tableContainer').innerHTML = '<div class="empty-msg">データがありません</div>';
+        document.getElementById('tableContainer').innerHTML = '<div class="empty-msg">データがありません<br><small>「リサーチ・見積もり」画面で判断中→「商品登録へ」で転送されます</small></div>';
         return;
       }
 
       const html = `<table class="data-table">
         <thead><tr>
-          <th></th><th>ASIN</th><th>商品名</th><th>仕入れ先</th>
-          <th>卸価格</th><th>販売価格</th><th>利益</th><th>利益率</th><th>判定</th>
-          <th>ステータス</th><th>登録日</th><th>操作</th>
+          <th>ASIN</th><th>商品名</th><th>仕入れ先</th>
+          <th>仕入価格</th><th>販売価格</th><th>利益</th><th>利益率</th>
+          <th>FBA/FBM</th><th>ステータス</th><th>登録日</th><th>操作</th>
         </tr></thead>
-        <tbody>${data.map(r => `<tr>
-          <td>${r.image_url ? `<img class="thumb" src="${esc(r.image_url)}">` : ''}</td>
-          <td><a class="asin-link" href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank">${r.asin}</a></td>
-          <td class="product-name-cell" title="${esc(r.product_name || '')}">${esc(r.product_name || '-')}</td>
-          <td>${esc(r.supplier_name || '-')}</td>
-          <td class="num">${r.wholesale_price_with_tax ? '¥'+Number(r.wholesale_price_with_tax).toLocaleString() : '-'}</td>
-          <td class="num">${r.selling_price ? '¥'+Number(r.selling_price).toLocaleString() : '-'}</td>
-          <td class="num ${(r.profit||0) >= 0 ? 'positive' : 'negative'}">${r.profit != null ? '¥'+Number(r.profit).toLocaleString() : '-'}</td>
-          <td class="num ${(r.profit||0) >= 0 ? 'positive' : 'negative'}">${r.profit_rate != null ? (r.profit_rate*100).toFixed(1)+'%' : '-'}</td>
-          <td>${r.judgment ? `<span class="judgment-sm ${r.judgment}">${r.judgment}</span>` : '-'}</td>
-          <td><span class="status-badge ${r.status || ''}">${r.status || '-'}</span></td>
-          <td style="font-size:11px;">${r.created_at ? r.created_at.slice(0,10) : '-'}</td>
-          <td><div class="actions-cell">
-            ${r.status !== '却下' && r.status !== '発注済' ? `<select class="btn-sm" onchange="changeStatus(${r.id}, this.value)" style="font-size:11px;">
-              <option value="">変更</option>
-              ${STATUSES.filter(s => s !== r.status).map(s => `<option value="${s}">${s}</option>`).join('')}
-            </select>` : ''}
-            ${r.status === '判断中' ? `<button class="btn btn-sm btn-success" onclick="promote(${r.id})">商品登録へ</button>` : ''}
-          </div></td>
+        <tbody>${data.map(p => `<tr>
+          <td><a class="asin-link" href="https://www.amazon.co.jp/dp/${p.asin}" target="_blank">${p.asin}</a></td>
+          <td class="product-name-cell" title="${esc(p.product_name || '')}">${esc(p.product_name || '-')}</td>
+          <td>${esc(p.supplier_name || '-')}</td>
+          <td class="num">${p.wholesale_price_with_tax ? '¥'+Number(p.wholesale_price_with_tax).toLocaleString() : '-'}</td>
+          <td class="num">${p.selling_price ? '¥'+Number(p.selling_price).toLocaleString() : '-'}</td>
+          <td class="num ${(p.profit||0) >= 0 ? 'positive' : 'negative'}">${p.profit != null ? '¥'+Number(p.profit).toLocaleString() : '-'}</td>
+          <td class="num ${(p.profit||0) >= 0 ? 'positive' : 'negative'}">${p.profit_rate != null ? (p.profit_rate*100).toFixed(1)+'%' : '-'}</td>
+          <td>${p.fulfillment || '-'}</td>
+          <td><span class="status-badge ${p.status || ''}">${p.status || '-'}</span></td>
+          <td style="font-size:11px;">${p.created_at ? p.created_at.slice(0,10) : '-'}</td>
+          <td><select class="btn-sm" onchange="changeStatus(${p.id}, this.value)" style="font-size:11px;">
+            <option value="">変更</option>
+            ${STATUSES.filter(s => s !== p.status).map(s => `<option value="${s}">${s}</option>`).join('')}
+          </select></td>
         </tr>`).join('')}</tbody>
       </table>`;
       document.getElementById('tableContainer').innerHTML = html;
@@ -150,7 +137,7 @@
 
     async function changeStatus(id, status) {
       if (!status) return;
-      await fetch(`./api/research/${id}`, {
+      await fetch(`./api/products/${id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ status }),
@@ -159,13 +146,10 @@
       loadData();
     }
 
-    async function promote(id) {
-      if (!confirm('この商品を「商品登録」に転送しますか？')) return;
-      const res = await fetch(`./api/research/${id}/promote`, { method: 'POST' });
-      if (res.ok) {
-        showToast('商品登録に転送しました');
-        loadData();
-      }
+    function exportCsv() {
+      const status = document.getElementById('statusFilter').value;
+      const url = `./api/products/csv/ne${status ? '?status=' + encodeURIComponent(status) : ''}`;
+      window.location.href = url;
     }
 
     function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }

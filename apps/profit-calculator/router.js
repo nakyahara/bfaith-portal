@@ -25,8 +25,17 @@ router.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-router.get('/list', (req, res) => {
+router.get('/research', (req, res) => {
   res.sendFile(path.join(__dirname, 'list.html'));
+});
+
+router.get('/products', (req, res) => {
+  res.sendFile(path.join(__dirname, 'products.html'));
+});
+
+// 旧URL互換
+router.get('/list', (req, res) => {
+  res.redirect('./research');
 });
 
 // ── API: 商品情報取得 ──
