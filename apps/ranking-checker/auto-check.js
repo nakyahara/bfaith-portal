@@ -23,7 +23,9 @@ const MAX_RANK = 100;
 const YAHOO_MAX_RANK = 100;
 const API_DELAY = 1100;
 const KW_DELAY = 500;
-const CONCURRENCY = 3;
+const CONCURRENCY = 1;
+const RETRY_MAX = 3;
+const RETRY_DELAY = 2000;
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', '..', 'data');
 const DATA_FILE = path.join(DATA_DIR, 'ranking-checker.json');
@@ -109,17 +111,33 @@ function getConfig() {
 // ── API callers ──
 
 async function fetchJson(url, options = {}) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 20000);
-  try {
-    const resp = await fetch(url, { ...options, signal: controller.signal });
-    if (!resp.ok) {
-      const body = await resp.text();
-      throw new Error(`HTTP ${resp.status}: ${body.slice(0, 200)}`);
+  for (let attempt = 1; attempt <= RETRY_MAX; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 20000);
+    try {
+      const resp = await fetch(url, { ...options, signal: controller.signal });
+      if (resp.status === 429 && attempt < RETRY_MAX) {
+        log(`  ⚠ 429 Rate Limit, ${RETRY_DELAY}ms待ってリトライ (${attempt}/${RETRY_MAX})`);
+        clearTimeout(timeout);
+        await sleep(RETRY_DELAY);
+        continue;
+      }
+      if (!resp.ok) {
+        const body = await resp.text();
+        throw new Error(`HTTP ${resp.status}: ${body.slice(0, 200)}`);
+      }
+      return await resp.json();
+    } catch (e) {
+      clearTimeout(timeout);
+      if (attempt < RETRY_MAX && e.message && e.message.includes('abort')) {
+        log(`  ⚠ タイムアウト, リトライ (${attempt}/${RETRY_MAX})`);
+        await sleep(RETRY_DELAY);
+        continue;
+      }
+      throw e;
+    } finally {
+      clearTimeout(timeout);
     }
-    return await resp.json();
-  } finally {
-    clearTimeout(timeout);
   }
 }
 
