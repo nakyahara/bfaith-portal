@@ -33,6 +33,10 @@ router.get('/products', (req, res) => {
   res.sendFile(path.join(__dirname, 'products.html'));
 });
 
+router.get('/suppliers', (req, res) => {
+  res.sendFile(path.join(__dirname, 'suppliers.html'));
+});
+
 // 旧URL互換
 router.get('/list', (req, res) => {
   res.redirect('./research');

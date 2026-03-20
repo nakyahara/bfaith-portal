@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>仕入れ先管理 — FBA仕入れ利益計算</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Segoe UI', 'Hiragino Sans', 'Meiryo', sans-serif; background: #eaeded; color: #0f1111; font-size: 13px; }
+    a { color: #0066c0; text-decoration: none; }
+
+    .header { background: #232f3e; color: #fff; padding: 10px 24px; display: flex; align-items: center; justify-content: space-between; }
+    .header h1 { font-size: 17px; font-weight: bold; }
+    .header h1 span { color: #ff9900; }
+    .page-tabs { display: flex; background: #37475a; padding: 0 24px; }
+    .page-tab { padding: 10px 20px; color: #ccc; font-size: 13px; font-weight: bold; text-decoration: none; border-bottom: 3px solid transparent; }
+    .page-tab:hover { color: #fff; text-decoration: none; }
+    .page-tab.active { color: #fff; border-bottom-color: #ff9900; }
+    .container { max-width: 800px; margin: 16px auto; padding: 0 16px; }
+
+    .panel { background: #fff; border: 1px solid #d5d9d9; border-radius: 8px; padding: 16px 20px; margin-bottom: 14px; }
+    .panel-title { font-size: 14px; font-weight: bold; margin-bottom: 12px; padding-bottom: 6px; border-bottom: 2px solid #ff9900; }
+
+    .add-form { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+    .form-field { display: flex; flex-direction: column; gap: 3px; }
+    .form-field label { font-size: 11px; font-weight: bold; color: #565959; }
+    .form-field input { padding: 6px 8px; border: 1px solid #888; border-radius: 4px; font-size: 13px; }
+    .form-field input:focus { border-color: #e77600; outline: none; box-shadow: 0 0 3px #e77600; }
+
+    .btn { padding: 6px 14px; border-radius: 4px; font-size: 12px; font-weight: bold; cursor: pointer; border: 1px solid; }
+    .btn-sm { padding: 3px 10px; font-size: 11px; }
+    .btn-primary { background: #f0c14b; border-color: #a88734; color: #0f1111; }
+    .btn-primary:hover { background: #e7b83c; }
+    .btn-danger { background: #fff0f0; border-color: #b12704; color: #b12704; }
+
+    .search-bar { margin-bottom: 12px; display: flex; gap: 12px; align-items: center; }
+    .search-bar input { padding: 5px 8px; border: 1px solid #888; border-radius: 4px; font-size: 13px; width: 250px; }
+    .search-bar .count { font-size: 12px; color: #565959; }
+
+    .data-table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #d5d9d9; border-radius: 6px; overflow: hidden; }
+    .data-table th { background: #f7f8f8; padding: 8px 10px; text-align: left; font-size: 11px; color: #565959; border-bottom: 2px solid #d5d9d9; }
+    .data-table td { padding: 7px 10px; border-bottom: 1px solid #eee; }
+    .data-table tr:hover { background: #fafafa; }
+    .data-table .code { font-weight: bold; font-variant-numeric: tabular-nums; }
+
+    .toast { position: fixed; top: 20px; right: 20px; background: #067D62; color: #fff; padding: 12px 20px; border-radius: 8px; font-size: 14px; display: none; z-index: 100; box-shadow: 0 2px 8px rgba(0,0,0,0.3); }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1><span>💰</span> FBA仕入れ利益計算</h1>
+    <a href="/" style="color:#ddd; font-size:13px; text-decoration:none;">← ポータルに戻る</a>
+  </div>
+  <div class="page-tabs">
+    <a href="./research" class="page-tab">リサーチ・見積もり</a>
+    <a href="./" class="page-tab">商品計算</a>
+    <a href="./products" class="page-tab">商品登録</a>
+    <a href="./suppliers" class="page-tab active" style="margin-left:auto;">仕入れ先管理</a>
+  </div>
+
+  <div class="container">
+    <!-- 新規追加 -->
+    <div class="panel">
+      <div class="panel-title">仕入れ先を追加</div>
+      <div class="add-form">
+        <div class="form-field" style="width:100px;">
+          <label>コード</label>
+          <input type="text" id="addCode" placeholder="0048" maxlength="4">
+        </div>
+        <div class="form-field" style="flex:1; min-width:200px;">
+          <label>仕入れ先名</label>
+          <input type="text" id="addName" placeholder="例: 新規メーカー様">
+        </div>
+        <button class="btn btn-primary" onclick="addSupplier()">追加</button>
+      </div>
+    </div>
+
+    <!-- 一覧 -->
+    <div class="panel">
+      <div class="panel-title">仕入れ先一覧</div>
+      <div class="search-bar">
+        <input type="text" id="searchInput" placeholder="コード・名前で検索" oninput="renderTable()">
+        <span class="count" id="countDisplay"></span>
+      </div>
+      <table class="data-table">
+        <thead><tr><th style="width:80px;">コード</th><th>仕入れ先名</th><th style="width:60px;"></th></tr></thead>
+        <tbody id="tableBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    let suppliers = [];
+
+    document.addEventListener('DOMContentLoaded', loadSuppliers);
+
+    // Enter で追加
+    document.getElementById('addName').addEventListener('keypress', e => { if (e.key === 'Enter') addSupplier(); });
+    document.getElementById('addCode').addEventListener('keypress', e => { if (e.key === 'Enter') document.getElementById('addName').focus(); });
+
+    async function loadSuppliers() {
+      try {
+        const res = await fetch('./api/suppliers');
+        suppliers = await res.json();
+        renderTable();
+      } catch (e) { console.error(e); }
+    }
+
+    function renderTable() {
+      const q = document.getElementById('searchInput').value.trim().toLowerCase();
+      let list = suppliers;
+      if (q) list = list.filter(s => s.code.includes(q) || s.name.toLowerCase().includes(q));
+
+      document.getElementById('countDisplay').textContent = `${list.length}件`;
+      document.getElementById('tableBody').innerHTML = list.map(s => `<tr>
+        <td class="code">${esc(s.code)}</td>
+        <td>${esc(s.name)}</td>
+        <td><button class="btn btn-sm btn-danger" onclick="del('${esc(s.code)}','${esc(s.name)}')">削除</button></td>
+      </tr>`).join('');
+    }
+
+    async function addSupplier() {
+      const code = document.getElementById('addCode').value.trim();
+      const name = document.getElementById('addName').value.trim();
+      if (!code || !name) { showToast('コードと名前を入力してください'); return; }
+      if (suppliers.find(s => s.code === code)) { showToast('このコードは既に登録されています'); return; }
+
+      try {
+        const res = await fetch('./api/suppliers', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code, name }),
+        });
+        if (res.ok) {
+          suppliers = await res.json();
+          document.getElementById('addCode').value = '';
+          document.getElementById('addName').value = '';
+          renderTable();
+          showToast(`「${name}」を追加しました`);
+        }
+      } catch (err) { showToast('エラー: ' + err.message); }
+    }
+
+    async function del(code, name) {
+      if (!confirm(`「${name}」を削除しますか？`)) return;
+      try {
+        const res = await fetch('./api/suppliers', {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code }),
+        });
+        if (res.ok) {
+          suppliers = await res.json();
+          renderTable();
+          showToast('削除しました');
+        }
+      } catch (err) { showToast('エラー: ' + err.message); }
+    }
+
+    function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+    function showToast(m) { const e = document.getElementById('toast'); e.textContent = m; e.style.display = 'block'; setTimeout(() => e.style.display = 'none', 3000); }
+  </script>
+</body>
+</html>
