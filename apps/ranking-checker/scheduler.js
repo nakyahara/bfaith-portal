@@ -2,7 +2,7 @@
  * 楽天順位チェッカー スケジューラー
  *
  * node-cron で以下を実行:
- *   - 毎日 12:00 JST (03:00 UTC) → 順位自動チェック
+ *   - 毎日 13:00 JST (04:00 UTC) → 順位自動チェック
  *   - 毎日 09:00 JST (00:00 UTC) → CSV生成 + Google Drive保存
  *   - チェック完了後 → 365日超の古いデータを削除
  */
@@ -41,9 +41,9 @@ function cleanupOldData() {
 // ── スケジューラー起動 ──
 
 export function startScheduler() {
-  // 毎日 12:00 JST = 03:00 UTC
-  cron.schedule('0 3 * * *', async () => {
-    log('--- スケジュール実行: 順位自動チェック (12:00 JST) ---');
+  // 毎日 13:00 JST = 04:00 UTC
+  cron.schedule('0 4 * * *', async () => {
+    log('--- スケジュール実行: 順位自動チェック (13:00 JST) ---');
     try {
       await runAutoCheck();
       cleanupOldData();
@@ -63,6 +63,6 @@ export function startScheduler() {
   }, { timezone: 'UTC' });
 
   console.log('[Scheduler] 楽天順位チェッカー スケジュール登録完了');
-  console.log('[Scheduler]   12:00 JST → 順位自動チェック + データクリーンアップ');
+  console.log('[Scheduler]   13:00 JST → 順位自動チェック + データクリーンアップ');
   console.log('[Scheduler]   09:00 JST → CSV出力 → Google Drive');
 }
