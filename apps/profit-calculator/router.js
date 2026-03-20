@@ -5,7 +5,7 @@ import { Router } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { getProduct, getFees } from './sp-api.js';
-import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, promoteToProduct, getProducts, updateProductStatus, updateProduct } from './db.js';
+import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, getProducts, updateProductStatus, updateProduct } from './db.js';
 import { loadSuppliers, addSupplier } from './suppliers.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -99,9 +99,16 @@ router.get('/api/research/:id', async (req, res) => {
 router.put('/api/research/:id', async (req, res) => {
   try {
     await ensureDb();
-    const { status } = req.body;
-    updateResearchStatus(parseInt(req.params.id), status);
-    res.json({ ok: true });
+    const id = parseInt(req.params.id);
+    const body = req.body;
+    // statusのみの場合は従来通り
+    if (Object.keys(body).length === 1 && body.status) {
+      updateResearchStatus(id, body.status);
+    } else {
+      updateResearch(id, body);
+    }
+    const updated = getResearchById(id);
+    res.json(updated || { ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

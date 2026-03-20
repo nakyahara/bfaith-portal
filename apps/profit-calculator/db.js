@@ -13,6 +13,18 @@ const DB_FILE = path.join(DATA_DIR, 'profit.db');
 
 let db = null;
 
+// ===== ヘルパー =====
+function queryAll(sql, params = []) {
+  const stmt = db.prepare(sql);
+  if (params.length > 0) stmt.bind(params);
+  const results = [];
+  while (stmt.step()) {
+    results.push(stmt.getAsObject());
+  }
+  stmt.free();
+  return results;
+}
+
 function saveToFile() {
   if (!db) return;
   const data = db.export();
@@ -64,11 +76,37 @@ export async function initDb() {
       loss_stopper INTEGER,
       high_stopper INTEGER,
       price_tracking TEXT DEFAULT 'カート',
+      quantity TEXT,
+      expiry_date TEXT,
+      variation_flag INTEGER DEFAULT 0,
+      ama_single_or_set TEXT,
+      purchase_flag INTEGER DEFAULT 0,
+      quote_requested_at TEXT,
+      quote_responded_at TEXT,
+      quote_note TEXT,
       status TEXT DEFAULT 'リサーチ',
       created_at TEXT DEFAULT (datetime('now','localtime')),
       updated_at TEXT DEFAULT (datetime('now','localtime'))
     )
   `);
+
+  // マイグレーション: 既存テーブルに新カラムを追加
+  const existingCols = queryAll('PRAGMA table_info(research)').map(r => r.name);
+  const newCols = [
+    ['quantity', 'TEXT'],
+    ['expiry_date', 'TEXT'],
+    ['variation_flag', 'INTEGER DEFAULT 0'],
+    ['ama_single_or_set', 'TEXT'],
+    ['purchase_flag', 'INTEGER DEFAULT 0'],
+    ['quote_requested_at', 'TEXT'],
+    ['quote_responded_at', 'TEXT'],
+    ['quote_note', 'TEXT'],
+  ];
+  for (const [col, type] of newCols) {
+    if (!existingCols.includes(col)) {
+      db.run(`ALTER TABLE research ADD COLUMN ${col} ${type}`);
+    }
+  }
 
   db.run(`
     CREATE TABLE IF NOT EXISTS products (
@@ -99,18 +137,6 @@ export async function initDb() {
   saveToFile();
 }
 
-// ===== ヘルパー =====
-function queryAll(sql, params = []) {
-  const stmt = db.prepare(sql);
-  if (params.length > 0) stmt.bind(params);
-  const results = [];
-  while (stmt.step()) {
-    results.push(stmt.getAsObject());
-  }
-  stmt.free();
-  return results;
-}
-
 // ===== Research =====
 
 export function saveResearch(data) {
@@ -122,8 +148,11 @@ export function saveResearch(data) {
       wholesale_price, tax_rate, wholesale_price_with_tax, lot,
       selling_price, referral_fee, fba_fee, storage_fee, total_fee,
       profit, profit_rate, judgment,
-      fulfillment, loss_stopper, high_stopper, price_tracking, status
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      fulfillment, loss_stopper, high_stopper, price_tracking,
+      quantity, expiry_date, variation_flag, ama_single_or_set, purchase_flag,
+      quote_requested_at, quote_responded_at, quote_note,
+      status
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `, [
     n(data.asin), n(data.productName), n(data.amazonUrl), n(data.imageUrl),
     n(data.category), n(data.salesRank), n(data.offerCount),
@@ -133,6 +162,8 @@ export function saveResearch(data) {
     n(data.sellingPrice), n(data.referralFee), n(data.fbaFee), n(data.storageFee), n(data.totalFee),
     n(data.profit), n(data.profitRate), n(data.judgment),
     n(data.fulfillment), n(data.lossStopper), n(data.highStopper), n(data.priceTracking),
+    n(data.quantity), n(data.expiryDate), n(data.variationFlag), n(data.amaSingleOrSet), n(data.purchaseFlag),
+    n(data.quoteRequestedAt), n(data.quoteRespondedAt), n(data.quoteNote),
     data.status || 'リサーチ',
   ]);
   saveToFile();
@@ -169,6 +200,34 @@ export function getResearchById(id) {
 
 export function updateResearchStatus(id, status) {
   db.run("UPDATE research SET status = ?, updated_at = datetime('now','localtime') WHERE id = ?", [status, id]);
+  saveToFile();
+}
+
+// 許可されたカラムのみ更新
+const RESEARCH_EDITABLE = new Set([
+  'supplier_code', 'supplier_name', 'maker_url', 'quote_url', 'comment',
+  'wholesale_price', 'tax_rate', 'wholesale_price_with_tax', 'lot',
+  'selling_price', 'referral_fee', 'fba_fee', 'storage_fee', 'total_fee',
+  'profit', 'profit_rate', 'judgment',
+  'fulfillment', 'loss_stopper', 'high_stopper', 'price_tracking',
+  'quantity', 'expiry_date', 'variation_flag', 'ama_single_or_set', 'purchase_flag',
+  'quote_requested_at', 'quote_responded_at', 'quote_note', 'status',
+  'jan', 'part_number',
+]);
+
+export function updateResearch(id, data) {
+  const fields = [];
+  const params = [];
+  for (const [key, value] of Object.entries(data)) {
+    if (RESEARCH_EDITABLE.has(key)) {
+      fields.push(`${key} = ?`);
+      params.push(value === undefined ? null : value);
+    }
+  }
+  if (fields.length === 0) return;
+  fields.push("updated_at = datetime('now','localtime')");
+  params.push(id);
+  db.run(`UPDATE research SET ${fields.join(', ')} WHERE id = ?`, params);
   saveToFile();
 }
 

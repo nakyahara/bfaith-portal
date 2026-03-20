@@ -16,7 +16,7 @@
     .page-tab { padding: 10px 20px; color: #ccc; font-size: 13px; font-weight: bold; text-decoration: none; border-bottom: 3px solid transparent; }
     .page-tab:hover { color: #fff; text-decoration: none; }
     .page-tab.active { color: #fff; border-bottom-color: #ff9900; }
-    .container { max-width: 1400px; margin: 16px auto; padding: 0 16px; }
+    .container { max-width: 1500px; margin: 16px auto; padding: 0 16px; }
 
     .filter-bar { background: #fff; border: 1px solid #d5d9d9; border-radius: 6px; padding: 10px 16px; margin-bottom: 12px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
     .filter-bar select, .filter-bar input { padding: 5px 8px; border: 1px solid #888; border-radius: 4px; font-size: 13px; }
@@ -24,12 +24,19 @@
     .filter-bar .count { margin-left: auto; font-size: 12px; color: #565959; }
     .btn { padding: 6px 14px; border-radius: 4px; font-size: 12px; font-weight: bold; cursor: pointer; border: 1px solid; }
     .btn-sm { padding: 3px 10px; font-size: 11px; }
+    .btn-primary { background: #f0c14b; border-color: #a88734; color: #0f1111; }
+    .btn-primary:hover { background: #e7b83c; }
     .btn-success { background: #f0fff0; border-color: #007600; color: #007600; }
+    .btn-quote { background: #fff8e6; border-color: #b8860b; color: #856404; }
+    .btn-answer { background: #e6f3ff; border-color: #0066c0; color: #1864ab; }
+    .btn-danger { background: #fff0f0; border-color: #b12704; color: #b12704; }
 
     .data-table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #d5d9d9; border-radius: 6px; overflow: hidden; }
     .data-table th { background: #f7f8f8; padding: 8px 10px; text-align: left; font-size: 11px; color: #565959; border-bottom: 2px solid #d5d9d9; white-space: nowrap; }
     .data-table td { padding: 7px 10px; border-bottom: 1px solid #eee; vertical-align: middle; }
-    .data-table tr:hover { background: #fafafa; }
+    .data-table tr.data-row { cursor: pointer; }
+    .data-table tr.data-row:hover { background: #fafafa; }
+    .data-table tr.data-row.expanded { background: #f0f6ff; }
     .data-table .thumb { width: 40px; height: 40px; object-fit: contain; border-radius: 3px; }
     .data-table .asin-link { font-weight: bold; font-size: 12px; }
     .data-table .product-name-cell { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
@@ -43,6 +50,7 @@
     .status-badge.回答済 { background: #ffd8a8; color: #a55000; }
     .status-badge.判断中 { background: #d0ebff; color: #1864ab; }
     .status-badge.却下 { background: #ffe0e0; color: #b12704; }
+    .status-badge.発注済 { background: #e8d5f5; color: #6741d9; }
 
     .judgment-sm { display: inline-block; width: 22px; height: 22px; line-height: 22px; border-radius: 50%; font-size: 13px; font-weight: bold; text-align: center; color: #fff; }
     .judgment-sm.◎ { background: #007600; }
@@ -50,9 +58,43 @@
     .judgment-sm.△ { background: #c7511f; }
     .judgment-sm.× { background: #b12704; }
 
+    /* 展開パネル */
+    .detail-row { display: none; }
+    .detail-row.open { display: table-row; }
+    .detail-panel { padding: 16px 20px; background: #fafcff; border-bottom: 2px solid #d5d9d9; }
+    .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .detail-section { background: #fff; border: 1px solid #d5d9d9; border-radius: 6px; padding: 12px 16px; }
+    .detail-section h3 { font-size: 13px; font-weight: bold; margin-bottom: 10px; padding-bottom: 5px; border-bottom: 2px solid #ff9900; }
+    .detail-form { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; }
+    .detail-form.single-col { grid-template-columns: 1fr; }
+    .detail-field { display: flex; flex-direction: column; gap: 2px; }
+    .detail-field label { font-size: 11px; font-weight: bold; color: #565959; }
+    .detail-field input, .detail-field select, .detail-field textarea { padding: 5px 8px; border: 1px solid #aaa; border-radius: 4px; font-size: 13px; }
+    .detail-field input:focus, .detail-field select:focus, .detail-field textarea:focus { border-color: #e77600; outline: none; box-shadow: 0 0 3px #e77600; }
+    .detail-field textarea { resize: vertical; min-height: 50px; }
+    .detail-field .readonly { background: #f7f8f8; color: #565959; }
+    .detail-field .info-val { font-size: 13px; padding: 4px 0; }
+    .detail-actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; align-items: center; }
+    .detail-actions .saved-msg { color: #067D62; font-size: 12px; font-weight: bold; display: none; }
+
+    /* 見積もり依頼ハイライト */
+    .quote-highlight { background: #fffbeb; border-color: #f0c14b; }
+    .answer-highlight { background: #f0f8ff; border-color: #0066c0; }
+
+    /* 商品情報ヘッダー */
+    .product-header { display: flex; gap: 14px; align-items: flex-start; margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid #eee; }
+    .product-header img { width: 70px; height: 70px; object-fit: contain; border: 1px solid #d5d9d9; border-radius: 4px; }
+    .product-header-info { flex: 1; }
+    .product-header-info .ph-name { font-size: 14px; font-weight: bold; line-height: 1.4; margin-bottom: 4px; }
+    .product-header-info .ph-meta { font-size: 12px; color: #565959; display: flex; gap: 16px; flex-wrap: wrap; }
+    .product-header-info .ph-meta span { white-space: nowrap; }
+    .product-header-info .ph-meta b { color: #0f1111; }
+
     .empty-msg { text-align: center; padding: 40px; color: #888; font-size: 14px; }
     .toast { position: fixed; top: 20px; right: 20px; background: #067D62; color: #fff; padding: 12px 20px; border-radius: 8px; font-size: 14px; display: none; z-index: 100; box-shadow: 0 2px 8px rgba(0,0,0,0.3); }
     .actions-cell { display: flex; gap: 4px; flex-wrap: wrap; }
+    .expand-icon { font-size: 10px; color: #888; transition: transform 0.2s; display: inline-block; width: 16px; text-align: center; }
+    .expanded .expand-icon { transform: rotate(90deg); }
   </style>
 </head>
 <body>
@@ -86,6 +128,8 @@
 
   <script>
     let debounceTimer = null;
+    let allData = [];
+    let expandedId = null;
     const STATUSES = ['リサーチ', '見積もり依頼中', '回答済', '判断中', '却下'];
 
     document.addEventListener('DOMContentLoaded', loadData);
@@ -104,9 +148,9 @@
 
       try {
         const res = await fetch(`./api/research?${params}`);
-        const data = await res.json();
-        document.getElementById('countDisplay').textContent = `${data.length}件`;
-        renderTable(data);
+        allData = await res.json();
+        document.getElementById('countDisplay').textContent = `${allData.length}件`;
+        renderTable(allData);
       } catch (err) {
         document.getElementById('tableContainer').innerHTML = `<div class="empty-msg">エラー: ${err.message}</div>`;
       }
@@ -118,15 +162,20 @@
         return;
       }
 
-      const html = `<table class="data-table">
+      let html = `<table class="data-table">
         <thead><tr>
-          <th></th><th>ASIN</th><th>商品名</th><th>仕入れ先</th>
+          <th style="width:20px;"></th><th></th><th>ASIN</th><th>商品名</th><th>仕入れ先</th>
           <th>卸価格</th><th>販売価格</th><th>利益</th><th>利益率</th><th>判定</th>
           <th>ステータス</th><th>登録日</th><th>操作</th>
         </tr></thead>
-        <tbody>${data.map(r => `<tr>
+        <tbody>`;
+
+      for (const r of data) {
+        const isExp = expandedId === r.id;
+        html += `<tr class="data-row ${isExp ? 'expanded' : ''}" onclick="toggleRow(${r.id}, event)">
+          <td><span class="expand-icon">${isExp ? '▼' : '▶'}</span></td>
           <td>${r.image_url ? `<img class="thumb" src="${esc(r.image_url)}">` : ''}</td>
-          <td><a class="asin-link" href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank">${r.asin}</a></td>
+          <td><a class="asin-link" href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" onclick="event.stopPropagation()">${r.asin}</a></td>
           <td class="product-name-cell" title="${esc(r.product_name || '')}">${esc(r.product_name || '-')}</td>
           <td>${esc(r.supplier_name || '-')}</td>
           <td class="num">${r.wholesale_price_with_tax ? '¥'+Number(r.wholesale_price_with_tax).toLocaleString() : '-'}</td>
@@ -136,27 +185,364 @@
           <td>${r.judgment ? `<span class="judgment-sm ${r.judgment}">${r.judgment}</span>` : '-'}</td>
           <td><span class="status-badge ${r.status || ''}">${r.status || '-'}</span></td>
           <td style="font-size:11px;">${r.created_at ? r.created_at.slice(0,10) : '-'}</td>
-          <td><div class="actions-cell">
+          <td onclick="event.stopPropagation()"><div class="actions-cell">
             ${r.status !== '却下' && r.status !== '発注済' ? `<select class="btn-sm" onchange="changeStatus(${r.id}, this.value)" style="font-size:11px;">
               <option value="">変更</option>
               ${STATUSES.filter(s => s !== r.status).map(s => `<option value="${s}">${s}</option>`).join('')}
             </select>` : ''}
             ${r.status === '判断中' ? `<button class="btn btn-sm btn-success" onclick="promote(${r.id})">商品登録へ</button>` : ''}
           </div></td>
-        </tr>`).join('')}</tbody>
-      </table>`;
+        </tr>`;
+
+        // 展開パネル
+        html += `<tr class="detail-row ${isExp ? 'open' : ''}" id="detail-${r.id}">
+          <td colspan="13">
+            <div class="detail-panel">
+              ${renderDetailPanel(r)}
+            </div>
+          </td>
+        </tr>`;
+      }
+
+      html += '</tbody></table>';
       document.getElementById('tableContainer').innerHTML = html;
     }
 
+    function renderDetailPanel(r) {
+      const today = new Date().toISOString().slice(0, 10);
+      return `
+        <!-- 商品ヘッダー -->
+        <div class="product-header">
+          ${r.image_url ? `<img src="${esc(r.image_url)}" alt="">` : ''}
+          <div class="product-header-info">
+            <div class="ph-name"><a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank">${esc(r.product_name || r.asin)}</a></div>
+            <div class="ph-meta">
+              <span><b>ASIN:</b> ${r.asin}</span>
+              <span><b>JAN:</b> ${r.jan || '-'}</span>
+              <span><b>型番:</b> ${r.part_number || '-'}</span>
+              <span><b>カテゴリ:</b> ${r.category || '-'}</span>
+              <span><b>ランキング:</b> ${r.sales_rank && r.sales_rank !== '-' ? '#'+Number(r.sales_rank).toLocaleString() : '-'}</span>
+              <span><b>出品者:</b> ${r.offer_count || '-'}</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="detail-grid">
+          <!-- 左: 見積もり依頼セクション -->
+          <div class="detail-section ${r.status === 'リサーチ' || r.status === '見積もり依頼中' ? 'quote-highlight' : ''}">
+            <h3>見積もり依頼</h3>
+            <div class="detail-form">
+              <div class="detail-field">
+                <label>仕入れ先コード</label>
+                <input type="text" id="d-supplier-code-${r.id}" value="${esc(r.supplier_code || '')}" placeholder="0001">
+              </div>
+              <div class="detail-field">
+                <label>メーカー/問屋名</label>
+                <input type="text" id="d-supplier-name-${r.id}" value="${esc(r.supplier_name || '')}">
+              </div>
+              <div class="detail-field">
+                <label>型番</label>
+                <input type="text" id="d-part-number-${r.id}" value="${esc(r.part_number || '')}">
+              </div>
+              <div class="detail-field">
+                <label>JAN</label>
+                <input type="text" id="d-jan-${r.id}" value="${esc(r.jan || '')}">
+              </div>
+              <div class="detail-field">
+                <label>内容量</label>
+                <input type="text" id="d-quantity-${r.id}" value="${esc(r.quantity || '')}">
+              </div>
+              <div class="detail-field">
+                <label>賞味期限</label>
+                <input type="text" id="d-expiry-${r.id}" value="${esc(r.expiry_date || '')}" placeholder="例: 12ヶ月">
+              </div>
+              <div class="detail-field">
+                <label>メーカーURL</label>
+                <input type="url" id="d-maker-url-${r.id}" value="${esc(r.maker_url || '')}">
+              </div>
+              <div class="detail-field">
+                <label>見積書URL</label>
+                <input type="url" id="d-quote-url-${r.id}" value="${esc(r.quote_url || '')}">
+              </div>
+            </div>
+            <div class="detail-form single-col" style="margin-top: 8px;">
+              <div class="detail-field">
+                <label>見積もり依頼メモ（依頼先・内容など）</label>
+                <textarea id="d-quote-note-${r.id}" placeholder="例: アメージングクラフト様に見積もり依頼。100個ロットで打診。">${esc(r.quote_note || '')}</textarea>
+              </div>
+              <div class="detail-field">
+                <label>依頼日</label>
+                <input type="date" id="d-quote-requested-${r.id}" value="${r.quote_requested_at || ''}">
+              </div>
+            </div>
+            <div class="detail-actions">
+              <button class="btn btn-quote" onclick="requestQuote(${r.id})">
+                見積もり依頼として登録
+              </button>
+              <span class="saved-msg" id="d-saved-quote-${r.id}">保存しました</span>
+              ${r.quote_requested_at ? `<span style="font-size:11px; color:#856404;">依頼済: ${r.quote_requested_at}</span>` : ''}
+            </div>
+          </div>
+
+          <!-- 右: 回答・卸価格入力セクション -->
+          <div class="detail-section ${r.status === '見積もり依頼中' || r.status === '回答済' ? 'answer-highlight' : ''}">
+            <h3>見積もり回答・卸価格登録</h3>
+            <div class="detail-form">
+              <div class="detail-field">
+                <label>卸価格（税抜）</label>
+                <input type="number" id="d-wholesale-${r.id}" value="${r.wholesale_price || ''}" min="0" oninput="recalcDetail(${r.id})">
+              </div>
+              <div class="detail-field">
+                <label>税率</label>
+                <select id="d-taxrate-${r.id}" onchange="recalcDetail(${r.id})">
+                  <option value="10" ${(r.tax_rate == 10 || !r.tax_rate) ? 'selected' : ''}>10%</option>
+                  <option value="8" ${r.tax_rate == 8 ? 'selected' : ''}>8%</option>
+                </select>
+              </div>
+              <div class="detail-field">
+                <label>卸価格（税込）</label>
+                <input type="text" id="d-wholesale-tax-${r.id}" value="${r.wholesale_price_with_tax || ''}" class="readonly" readonly>
+              </div>
+              <div class="detail-field">
+                <label>ロット</label>
+                <input type="number" id="d-lot-${r.id}" value="${r.lot || 1}" min="1">
+              </div>
+              <div class="detail-field">
+                <label>販売価格</label>
+                <input type="number" id="d-selling-${r.id}" value="${r.selling_price || ''}" min="0" oninput="recalcDetail(${r.id})">
+              </div>
+              <div class="detail-field">
+                <label>回答日</label>
+                <input type="date" id="d-quote-responded-${r.id}" value="${r.quote_responded_at || ''}">
+              </div>
+            </div>
+
+            <!-- 計算結果 -->
+            <div style="margin-top: 10px; padding: 10px; background: #f7fdf7; border: 1px solid #d5d9d9; border-radius: 4px;">
+              <div style="display: flex; gap: 20px; flex-wrap: wrap; font-size: 13px;">
+                <span>合計手数料: <b id="d-totalfee-${r.id}">${r.total_fee != null ? '¥'+Number(r.total_fee).toLocaleString() : '-'}</b></span>
+                <span>利益: <b id="d-profit-${r.id}" class="${(r.profit||0) >= 0 ? 'positive' : 'negative'}">${r.profit != null ? '¥'+Number(r.profit).toLocaleString() : '-'}</b></span>
+                <span>利益率: <b id="d-rate-${r.id}" class="${(r.profit||0) >= 0 ? 'positive' : 'negative'}">${r.profit_rate != null ? (r.profit_rate*100).toFixed(1)+'%' : '-'}</b></span>
+                <span>判定: <b id="d-judgment-${r.id}">${r.judgment || '-'}</b></span>
+              </div>
+            </div>
+
+            <div class="detail-form single-col" style="margin-top: 8px;">
+              <div class="detail-field">
+                <label>コメント</label>
+                <textarea id="d-comment-${r.id}" placeholder="備考">${esc(r.comment || '')}</textarea>
+              </div>
+            </div>
+            <div class="detail-actions">
+              <button class="btn btn-answer" onclick="saveAnswer(${r.id})">
+                卸価格・回答を保存
+              </button>
+              <button class="btn btn-primary" onclick="saveAllDetail(${r.id})">
+                全項目を保存
+              </button>
+              ${r.status === '回答済' || r.status === '判断中' ? `<button class="btn btn-sm btn-success" onclick="promote(${r.id})">商品登録へ転送</button>` : ''}
+              <span class="saved-msg" id="d-saved-answer-${r.id}">保存しました</span>
+              ${r.quote_responded_at ? `<span style="font-size:11px; color:#1864ab;">回答日: ${r.quote_responded_at}</span>` : ''}
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    // === 行展開 ===
+    function toggleRow(id, event) {
+      if (expandedId === id) {
+        expandedId = null;
+      } else {
+        expandedId = id;
+      }
+      renderTable(allData);
+    }
+
+    // === 見積もり依頼登録 ===
+    async function requestQuote(id) {
+      const today = new Date().toISOString().slice(0, 10);
+      const data = {
+        supplier_code: document.getElementById(`d-supplier-code-${id}`).value,
+        supplier_name: document.getElementById(`d-supplier-name-${id}`).value,
+        part_number: document.getElementById(`d-part-number-${id}`).value,
+        jan: document.getElementById(`d-jan-${id}`).value,
+        quantity: document.getElementById(`d-quantity-${id}`).value,
+        expiry_date: document.getElementById(`d-expiry-${id}`).value,
+        maker_url: document.getElementById(`d-maker-url-${id}`).value,
+        quote_url: document.getElementById(`d-quote-url-${id}`).value,
+        quote_note: document.getElementById(`d-quote-note-${id}`).value,
+        quote_requested_at: document.getElementById(`d-quote-requested-${id}`).value || today,
+        status: '見積もり依頼中',
+      };
+
+      try {
+        const res = await fetch(`./api/research/${id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(data),
+        });
+        if (res.ok) {
+          const updated = await res.json();
+          updateLocalData(id, updated);
+          showSavedMsg(`d-saved-quote-${id}`);
+          showToast(`見積もり依頼として登録しました`);
+        }
+      } catch (err) { showToast('エラー: ' + err.message); }
+    }
+
+    // === 卸価格・回答保存 ===
+    async function saveAnswer(id) {
+      const today = new Date().toISOString().slice(0, 10);
+      const wholesale = parseInt(document.getElementById(`d-wholesale-${id}`).value) || 0;
+      const taxRate = parseInt(document.getElementById(`d-taxrate-${id}`).value) || 10;
+      const withTax = Math.ceil(wholesale * (1 + taxRate / 100));
+      const selling = parseInt(document.getElementById(`d-selling-${id}`).value) || 0;
+      const row = allData.find(r => r.id === id);
+      const totalFee = row ? (row.total_fee || 0) : 0;
+      const profit = selling - withTax - totalFee;
+      const profitRate = selling > 0 ? profit / selling : 0;
+      let judgment;
+      if (profitRate >= 0.3) judgment = '◎';
+      else if (profitRate >= 0.2) judgment = '○';
+      else if (profitRate >= 0.1) judgment = '△';
+      else judgment = '×';
+
+      const data = {
+        wholesale_price: wholesale,
+        tax_rate: taxRate,
+        wholesale_price_with_tax: withTax,
+        lot: parseInt(document.getElementById(`d-lot-${id}`).value) || 1,
+        selling_price: selling,
+        profit: Math.round(profit),
+        profit_rate: profitRate,
+        judgment: judgment,
+        comment: document.getElementById(`d-comment-${id}`).value,
+        quote_responded_at: document.getElementById(`d-quote-responded-${id}`).value || today,
+        status: '回答済',
+      };
+
+      try {
+        const res = await fetch(`./api/research/${id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(data),
+        });
+        if (res.ok) {
+          const updated = await res.json();
+          updateLocalData(id, updated);
+          showSavedMsg(`d-saved-answer-${id}`);
+          showToast(`卸価格を登録し、ステータスを「回答済」に変更しました`);
+        }
+      } catch (err) { showToast('エラー: ' + err.message); }
+    }
+
+    // === 全項目保存 ===
+    async function saveAllDetail(id) {
+      const wholesale = parseInt(document.getElementById(`d-wholesale-${id}`).value) || 0;
+      const taxRate = parseInt(document.getElementById(`d-taxrate-${id}`).value) || 10;
+      const withTax = Math.ceil(wholesale * (1 + taxRate / 100));
+      const selling = parseInt(document.getElementById(`d-selling-${id}`).value) || 0;
+      const row = allData.find(r => r.id === id);
+      const totalFee = row ? (row.total_fee || 0) : 0;
+      const profit = selling - withTax - totalFee;
+      const profitRate = selling > 0 ? profit / selling : 0;
+      let judgment;
+      if (profitRate >= 0.3) judgment = '◎';
+      else if (profitRate >= 0.2) judgment = '○';
+      else if (profitRate >= 0.1) judgment = '△';
+      else judgment = '×';
+
+      const data = {
+        supplier_code: document.getElementById(`d-supplier-code-${id}`).value,
+        supplier_name: document.getElementById(`d-supplier-name-${id}`).value,
+        part_number: document.getElementById(`d-part-number-${id}`).value,
+        jan: document.getElementById(`d-jan-${id}`).value,
+        quantity: document.getElementById(`d-quantity-${id}`).value,
+        expiry_date: document.getElementById(`d-expiry-${id}`).value,
+        maker_url: document.getElementById(`d-maker-url-${id}`).value,
+        quote_url: document.getElementById(`d-quote-url-${id}`).value,
+        quote_note: document.getElementById(`d-quote-note-${id}`).value,
+        quote_requested_at: document.getElementById(`d-quote-requested-${id}`).value,
+        wholesale_price: wholesale,
+        tax_rate: taxRate,
+        wholesale_price_with_tax: withTax,
+        lot: parseInt(document.getElementById(`d-lot-${id}`).value) || 1,
+        selling_price: selling,
+        profit: wholesale > 0 && selling > 0 ? Math.round(profit) : (row ? row.profit : null),
+        profit_rate: wholesale > 0 && selling > 0 ? profitRate : (row ? row.profit_rate : null),
+        judgment: wholesale > 0 && selling > 0 ? judgment : (row ? row.judgment : null),
+        comment: document.getElementById(`d-comment-${id}`).value,
+        quote_responded_at: document.getElementById(`d-quote-responded-${id}`).value,
+      };
+
+      try {
+        const res = await fetch(`./api/research/${id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(data),
+        });
+        if (res.ok) {
+          const updated = await res.json();
+          updateLocalData(id, updated);
+          showSavedMsg(`d-saved-answer-${id}`);
+          showToast('全項目を保存しました');
+        }
+      } catch (err) { showToast('エラー: ' + err.message); }
+    }
+
+    // === 詳細パネル内の即時再計算 ===
+    function recalcDetail(id) {
+      const wholesale = parseInt(document.getElementById(`d-wholesale-${id}`).value) || 0;
+      const taxRate = parseInt(document.getElementById(`d-taxrate-${id}`).value) || 10;
+      const withTax = Math.ceil(wholesale * (1 + taxRate / 100));
+      document.getElementById(`d-wholesale-tax-${id}`).value = withTax;
+
+      const selling = parseInt(document.getElementById(`d-selling-${id}`).value) || 0;
+      const row = allData.find(r => r.id === id);
+      const totalFee = row ? (row.total_fee || 0) : 0;
+
+      if (wholesale > 0 && selling > 0) {
+        const profit = selling - withTax - totalFee;
+        const profitRate = selling > 0 ? profit / selling : 0;
+        let judgment;
+        if (profitRate >= 0.3) judgment = '◎';
+        else if (profitRate >= 0.2) judgment = '○';
+        else if (profitRate >= 0.1) judgment = '△';
+        else judgment = '×';
+
+        const cls = profit >= 0 ? 'positive' : 'negative';
+        document.getElementById(`d-totalfee-${id}`).textContent = '¥' + totalFee.toLocaleString();
+        const pe = document.getElementById(`d-profit-${id}`);
+        pe.textContent = '¥' + Math.round(profit).toLocaleString();
+        pe.className = cls;
+        const re = document.getElementById(`d-rate-${id}`);
+        re.textContent = (profitRate * 100).toFixed(1) + '%';
+        re.className = cls;
+        document.getElementById(`d-judgment-${id}`).textContent = judgment;
+      }
+    }
+
+    // === ローカルデータ更新 ===
+    function updateLocalData(id, updated) {
+      const idx = allData.findIndex(r => r.id === id);
+      if (idx >= 0) allData[idx] = updated;
+      renderTable(allData);
+    }
+
+    // === ステータス変更 ===
     async function changeStatus(id, status) {
       if (!status) return;
-      await fetch(`./api/research/${id}`, {
+      const res = await fetch(`./api/research/${id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ status }),
       });
-      showToast(`ステータスを「${status}」に変更`);
-      loadData();
+      if (res.ok) {
+        const updated = await res.json();
+        updateLocalData(id, updated);
+        showToast(`ステータスを「${status}」に変更`);
+      }
     }
 
     async function promote(id) {
@@ -170,6 +556,10 @@
 
     function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
     function showToast(m) { const e = document.getElementById('toast'); e.textContent = m; e.style.display = 'block'; setTimeout(() => e.style.display = 'none', 3000); }
+    function showSavedMsg(elId) {
+      const el = document.getElementById(elId);
+      if (el) { el.style.display = 'inline'; setTimeout(() => el.style.display = 'none', 2000); }
+    }
   </script>
 </body>
 </html>
