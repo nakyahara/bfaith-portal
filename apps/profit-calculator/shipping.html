@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>送料管理 — FBA仕入れ利益計算</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Segoe UI', 'Hiragino Sans', 'Meiryo', sans-serif; background: #eaeded; color: #0f1111; font-size: 13px; }
+    a { color: #0066c0; text-decoration: none; }
+
+    .header { background: #232f3e; color: #fff; padding: 10px 24px; display: flex; align-items: center; justify-content: space-between; }
+    .header h1 { font-size: 17px; font-weight: bold; }
+    .header h1 span { color: #ff9900; }
+    .page-tabs { display: flex; background: #37475a; padding: 0 24px; }
+    .page-tab { padding: 10px 20px; color: #ccc; font-size: 13px; font-weight: bold; text-decoration: none; border-bottom: 3px solid transparent; }
+    .page-tab:hover { color: #fff; text-decoration: none; }
+    .page-tab.active { color: #fff; border-bottom-color: #ff9900; }
+    .container { max-width: 1100px; margin: 16px auto; padding: 0 16px; }
+
+    .panel { background: #fff; border: 1px solid #d5d9d9; border-radius: 8px; padding: 16px 20px; margin-bottom: 14px; }
+    .panel-title { font-size: 14px; font-weight: bold; margin-bottom: 12px; padding-bottom: 6px; border-bottom: 2px solid #ff9900; }
+
+    .add-form { display: flex; gap: 8px; align-items: flex-end; flex-wrap: wrap; }
+    .form-field { display: flex; flex-direction: column; gap: 3px; }
+    .form-field label { font-size: 11px; font-weight: bold; color: #565959; }
+    .form-field input, .form-field select { padding: 5px 7px; border: 1px solid #888; border-radius: 4px; font-size: 12px; }
+    .form-field input:focus { border-color: #e77600; outline: none; box-shadow: 0 0 3px #e77600; }
+
+    .btn { padding: 5px 12px; border-radius: 4px; font-size: 11px; font-weight: bold; cursor: pointer; border: 1px solid; }
+    .btn-sm { padding: 3px 8px; font-size: 11px; }
+    .btn-primary { background: #f0c14b; border-color: #a88734; color: #0f1111; }
+    .btn-primary:hover { background: #e7b83c; }
+    .btn-danger { background: #fff0f0; border-color: #b12704; color: #b12704; }
+    .btn-edit { background: #f0f6ff; border-color: #0066c0; color: #1864ab; }
+    .btn-save-edit { background: #f0fff0; border-color: #007600; color: #007600; }
+    .actions-cell { display: flex; gap: 4px; white-space: nowrap; }
+
+    .search-bar { margin-bottom: 12px; display: flex; gap: 12px; align-items: center; }
+    .search-bar input { padding: 5px 8px; border: 1px solid #888; border-radius: 4px; font-size: 13px; width: 250px; }
+    .search-bar .count { font-size: 12px; color: #565959; }
+
+    .data-table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #d5d9d9; border-radius: 6px; overflow: hidden; }
+    .data-table th { background: #f7f8f8; padding: 7px 8px; text-align: left; font-size: 11px; color: #565959; border-bottom: 2px solid #d5d9d9; white-space: nowrap; }
+    .data-table td { padding: 6px 8px; border-bottom: 1px solid #eee; font-size: 12px; }
+    .data-table tr:hover { background: #fafafa; }
+    .data-table .num { text-align: right; font-variant-numeric: tabular-nums; font-weight: bold; }
+
+    .toast { position: fixed; top: 20px; right: 20px; background: #067D62; color: #fff; padding: 12px 20px; border-radius: 8px; font-size: 14px; display: none; z-index: 100; box-shadow: 0 2px 8px rgba(0,0,0,0.3); }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1><span>💰</span> FBA仕入れ利益計算</h1>
+    <a href="/" style="color:#ddd; font-size:13px; text-decoration:none;">← ポータルに戻る</a>
+  </div>
+  <div class="page-tabs">
+    <a href="./research" class="page-tab">リサーチ・見積もり</a>
+    <a href="./" class="page-tab">商品計算</a>
+    <a href="./products" class="page-tab">商品登録</a>
+    <a href="./suppliers" class="page-tab" style="margin-left:auto;">仕入れ先管理</a>
+    <a href="./shipping" class="page-tab active">送料管理</a>
+  </div>
+
+  <div class="container">
+    <!-- 新規追加 -->
+    <div class="panel">
+      <div class="panel-title">送料を追加</div>
+      <div class="add-form">
+        <div class="form-field" style="flex:1; min-width:180px;">
+          <label>名前</label>
+          <input type="text" id="addName" placeholder="例: ゆうパケット">
+        </div>
+        <div class="form-field" style="width:80px;">
+          <label>送料(税込)</label>
+          <input type="number" id="addShipping" value="0" min="0">
+        </div>
+        <div class="form-field" style="width:80px;">
+          <label>出荷作業料</label>
+          <input type="number" id="addWork" value="0" min="0">
+        </div>
+        <div class="form-field" style="width:80px;">
+          <label>梱包資材費</label>
+          <input type="number" id="addMaterial" value="0" min="0">
+        </div>
+        <div class="form-field" style="width:80px;">
+          <label>人件費</label>
+          <input type="number" id="addLabor" value="0" min="0">
+        </div>
+        <div class="form-field" style="width:80px;">
+          <label>合計</label>
+          <input type="number" id="addTotal" value="0" readonly style="background:#f7f8f8; font-weight:bold;">
+        </div>
+        <button class="btn btn-primary" onclick="addItem()">追加</button>
+      </div>
+      <div class="add-form" style="margin-top:8px;">
+        <div class="form-field" style="flex:1; min-width:200px;">
+          <label>梱包サイズ</label>
+          <input type="text" id="addSize" placeholder="3辺の長さが60cm以内">
+        </div>
+        <div class="form-field" style="width:80px;">
+          <label>最大重量(g)</label>
+          <input type="text" id="addWeight" placeholder="2000">
+        </div>
+        <div class="form-field" style="width:100px;">
+          <label>配達方法</label>
+          <select id="addDelivery">
+            <option value="ポスト投函">ポスト投函</option>
+            <option value="手渡し">手渡し</option>
+            <option value="置き配">置き配</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <!-- 一覧 -->
+    <div class="panel">
+      <div class="panel-title">送料一覧（配送関係費合計 昇順）</div>
+      <div class="search-bar">
+        <input type="text" id="searchInput" placeholder="名前で検索" oninput="renderTable()">
+        <span class="count" id="countDisplay"></span>
+      </div>
+      <div id="tableContainer"></div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    let items = [];
+    let editingName = null;
+
+    document.addEventListener('DOMContentLoaded', loadItems);
+
+    // 合計自動計算
+    ['addShipping','addWork','addMaterial','addLabor'].forEach(id => {
+      document.getElementById(id).addEventListener('input', calcAddTotal);
+    });
+
+    function calcAddTotal() {
+      const s = parseInt(document.getElementById('addShipping').value) || 0;
+      const w = parseInt(document.getElementById('addWork').value) || 0;
+      const m = parseInt(document.getElementById('addMaterial').value) || 0;
+      const l = parseInt(document.getElementById('addLabor').value) || 0;
+      document.getElementById('addTotal').value = s + w + m + l;
+    }
+
+    async function loadItems() {
+      try {
+        const res = await fetch('./api/shipping');
+        items = await res.json();
+        renderTable();
+      } catch (e) { console.error(e); }
+    }
+
+    function renderTable() {
+      const q = document.getElementById('searchInput').value.trim().toLowerCase();
+      let list = items;
+      if (q) list = list.filter(s => s.name.toLowerCase().includes(q));
+      document.getElementById('countDisplay').textContent = `${list.length}件`;
+
+      if (list.length === 0) {
+        document.getElementById('tableContainer').innerHTML = '<div style="text-align:center; padding:20px; color:#888;">データがありません</div>';
+        return;
+      }
+
+      const html = `<table class="data-table">
+        <thead><tr>
+          <th>名前</th><th>送料</th><th>作業料</th><th>資材費</th><th>人件費</th>
+          <th>合計</th><th>サイズ</th><th>重量</th><th>配達</th><th></th>
+        </tr></thead>
+        <tbody>${list.map(s => {
+          if (editingName === s.name) {
+            return `<tr style="background:#fffbf0;">
+              <td><input type="text" id="e-name" value="${esc(s.name)}" style="width:100%; padding:3px 5px; border:1px solid #e77600; border-radius:3px; font-size:12px;"></td>
+              <td><input type="number" id="e-shipping" value="${s.shipping||0}" style="width:60px; padding:3px; font-size:12px;" oninput="calcEditTotal()"></td>
+              <td><input type="number" id="e-work" value="${s.work||0}" style="width:60px; padding:3px; font-size:12px;" oninput="calcEditTotal()"></td>
+              <td><input type="number" id="e-material" value="${s.material||0}" style="width:60px; padding:3px; font-size:12px;" oninput="calcEditTotal()"></td>
+              <td><input type="number" id="e-labor" value="${s.labor||0}" style="width:60px; padding:3px; font-size:12px;" oninput="calcEditTotal()"></td>
+              <td class="num" id="e-total">${s.total||0}</td>
+              <td><input type="text" id="e-size" value="${esc(s.size||'')}" style="width:120px; padding:3px; font-size:11px;"></td>
+              <td><input type="text" id="e-weight" value="${esc(s.weight||'')}" style="width:50px; padding:3px; font-size:12px;"></td>
+              <td><select id="e-delivery" style="font-size:11px; padding:2px;">
+                <option ${s.delivery==='ポスト投函'?'selected':''}>ポスト投函</option>
+                <option ${s.delivery==='手渡し'?'selected':''}>手渡し</option>
+                <option ${s.delivery==='置き配'?'selected':''}>置き配</option>
+              </select></td>
+              <td><div class="actions-cell">
+                <button class="btn btn-sm btn-save-edit" onclick="saveEdit()">保存</button>
+                <button class="btn btn-sm" style="background:#fff; border-color:#888;" onclick="cancelEdit()">取消</button>
+              </div></td>
+            </tr>`;
+          }
+          return `<tr>
+            <td>${esc(s.name)}</td>
+            <td class="num">¥${(s.shipping||0).toLocaleString()}</td>
+            <td class="num">¥${(s.work||0).toLocaleString()}</td>
+            <td class="num">¥${(s.material||0).toLocaleString()}</td>
+            <td class="num">¥${(s.labor||0).toLocaleString()}</td>
+            <td class="num" style="color:#c45500; font-size:13px;">¥${(s.total||0).toLocaleString()}</td>
+            <td style="font-size:11px; max-width:150px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${esc(s.size||'')}">${esc(s.size||'-')}</td>
+            <td>${esc(s.weight||'-')}g</td>
+            <td style="font-size:11px;">${esc(s.delivery||'-')}</td>
+            <td><div class="actions-cell">
+              <button class="btn btn-sm btn-edit" onclick="startEdit('${esc(s.name)}')">編集</button>
+              <button class="btn btn-sm btn-danger" onclick="del('${esc(s.name)}')">削除</button>
+            </div></td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table>`;
+      document.getElementById('tableContainer').innerHTML = html;
+    }
+
+    function calcEditTotal() {
+      const s = parseInt(document.getElementById('e-shipping').value)||0;
+      const w = parseInt(document.getElementById('e-work').value)||0;
+      const m = parseInt(document.getElementById('e-material').value)||0;
+      const l = parseInt(document.getElementById('e-labor').value)||0;
+      document.getElementById('e-total').textContent = s+w+m+l;
+    }
+
+    function startEdit(name) { editingName = name; renderTable(); }
+    function cancelEdit() { editingName = null; renderTable(); }
+
+    async function saveEdit() {
+      const item = {
+        originalName: editingName,
+        name: document.getElementById('e-name').value.trim(),
+        shipping: parseInt(document.getElementById('e-shipping').value)||0,
+        work: parseInt(document.getElementById('e-work').value)||0,
+        material: parseInt(document.getElementById('e-material').value)||0,
+        labor: parseInt(document.getElementById('e-labor').value)||0,
+        total: (parseInt(document.getElementById('e-shipping').value)||0) + (parseInt(document.getElementById('e-work').value)||0) + (parseInt(document.getElementById('e-material').value)||0) + (parseInt(document.getElementById('e-labor').value)||0),
+        size: document.getElementById('e-size').value.trim(),
+        weight: document.getElementById('e-weight').value.trim(),
+        delivery: document.getElementById('e-delivery').value,
+      };
+      try {
+        const res = await fetch('./api/shipping', { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(item) });
+        if (res.ok) { items = await res.json(); editingName = null; renderTable(); showToast('更新しました'); }
+      } catch (e) { showToast('エラー: ' + e.message); }
+    }
+
+    async function addItem() {
+      const name = document.getElementById('addName').value.trim();
+      if (!name) { showToast('名前を入力してください'); return; }
+      const item = {
+        name,
+        shipping: parseInt(document.getElementById('addShipping').value)||0,
+        work: parseInt(document.getElementById('addWork').value)||0,
+        material: parseInt(document.getElementById('addMaterial').value)||0,
+        labor: parseInt(document.getElementById('addLabor').value)||0,
+        total: parseInt(document.getElementById('addTotal').value)||0,
+        size: document.getElementById('addSize').value.trim(),
+        weight: document.getElementById('addWeight').value.trim(),
+        delivery: document.getElementById('addDelivery').value,
+      };
+      try {
+        const res = await fetch('./api/shipping', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(item) });
+        if (res.ok) {
+          items = await res.json();
+          ['addName','addSize','addWeight'].forEach(id => document.getElementById(id).value = '');
+          ['addShipping','addWork','addMaterial','addLabor','addTotal'].forEach(id => document.getElementById(id).value = '0');
+          renderTable();
+          showToast(`「${name}」を追加しました`);
+        }
+      } catch (e) { showToast('エラー: ' + e.message); }
+    }
+
+    async function del(name) {
+      if (!confirm(`「${name}」を削除しますか？`)) return;
+      try {
+        const res = await fetch('./api/shipping', { method: 'DELETE', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ name }) });
+        if (res.ok) { items = await res.json(); renderTable(); showToast('削除しました'); }
+      } catch (e) { showToast('エラー: ' + e.message); }
+    }
+
+    function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+    function showToast(m) { const e = document.getElementById('toast'); e.textContent = m; e.style.display = 'block'; setTimeout(() => e.style.display = 'none', 3000); }
+  </script>
+</body>
+</html>

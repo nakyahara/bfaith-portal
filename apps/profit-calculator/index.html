@@ -124,6 +124,7 @@
     <a href="./" class="page-tab active">商品計算</a>
     <a href="./products" class="page-tab">商品登録</a>
     <a href="./suppliers" class="page-tab" style="margin-left:auto;">仕入れ先管理</a>
+    <a href="./shipping" class="page-tab">送料管理</a>
   </div>
 
   <div class="container">
@@ -224,7 +225,7 @@
           </div>
         </div>
         <div class="form-row">
-          <div class="form-group narrow"><label>NE発注ロット</label><input type="number" id="neOrderLot" value="1" min="1"></div>
+          <div class="form-group narrow"><label>NE発注ロット</label><input type="number" id="neOrderLot" value="1" min="1" oninput="syncLotFromNe()"></div>
           <div class="form-group narrow">
             <label>NE販売価格</label>
             <input type="number" id="neSellingPrice" value="0" min="0">
@@ -298,6 +299,7 @@
         <div class="form-group narrow">
           <label>商品価格（税込）</label>
           <input type="number" id="sellingPrice" value="0" min="0" oninput="debounceFetchFees()">
+          <span id="priceSourceLabel" style="font-size:10px; color:#0066c0; display:none;"></span>
         </div>
         <div class="fulfillment-toggle">
           <input type="radio" name="fulfillment" id="fba" value="FBA" checked onchange="onFulfillmentChange()">
@@ -360,10 +362,7 @@
             <label>卸価格税込み</label>
             <input type="number" id="wholesalePriceWithTax" readonly style="background:#f7f8f8;">
           </div>
-          <div class="form-group" style="width:80px;">
-            <label>ロット</label>
-            <input type="number" id="lot" value="1" min="1" oninput="syncLotToNe()">
-          </div>
+          <input type="hidden" id="lot" value="1">
         </div>
       </div>
 
@@ -448,8 +447,8 @@
       document.getElementById('neRegistrationType').addEventListener('change', toggleNeVariation);
     });
 
-    function syncLotToNe() {
-      document.getElementById('neOrderLot').value = document.getElementById('lot').value;
+    function syncLotFromNe() {
+      document.getElementById('lot').value = document.getElementById('neOrderLot').value;
     }
 
     function toggleNeVariation() {
@@ -528,6 +527,9 @@
 
         if (data.currentPrice > 0) {
           document.getElementById('sellingPrice').value = data.currentPrice;
+          const label = document.getElementById('priceSourceLabel');
+          label.textContent = 'カート価格/最安値から自動取得';
+          label.style.display = '';
           fetchFees(asin, data.currentPrice);
         }
       } catch (err) {

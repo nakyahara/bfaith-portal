@@ -131,6 +131,7 @@
     <a href="./" class="page-tab">商品計算</a>
     <a href="./products" class="page-tab">商品登録</a>
     <a href="./suppliers" class="page-tab" style="margin-left:auto;">仕入れ先管理</a>
+    <a href="./shipping" class="page-tab">送料管理</a>
   </div>
 
   <div class="container">
@@ -480,7 +481,7 @@
               <button class="btn btn-primary" onclick="saveAllDetail(${r.id})">
                 全項目を保存
               </button>
-              <button class="btn btn-sm" style="background:#fff8e6; border-color:#b8860b; color:#856404;" onclick="goToCalc(${r.id})">商品計算へ →</button>
+              <button class="btn btn-primary" style="background:#d9534f; border-color:#c9302c; color:#fff; padding:6px 16px; font-size:13px;" onclick="goToCalc(${r.id})">商品計算へ →</button>
               <span class="saved-msg" id="d-saved-answer-${r.id}">保存しました</span>
               ${r.quote_responded_at ? `<span style="font-size:11px; color:#1864ab;">回答日: ${r.quote_responded_at}</span>` : ''}
             </div>

@@ -83,8 +83,12 @@ export async function getProduct(asin) {
     });
     const product = pricing?.[0]?.Product;
     if (product) {
-      const cp = product.CompetitivePricing?.CompetitivePrices?.[0];
-      currentPrice = cp?.Price?.ListingPrice?.Amount || 0;
+      const cps = product.CompetitivePricing?.CompetitivePrices || [];
+      // カート価格（BuyBoxPrice）を優先、なければ最安値
+      const buyBox = cps.find(c => c.CompetitivePriceId === '1' && c.condition === 'New');
+      const lowest = cps.find(c => c.CompetitivePriceId === '2' && c.condition === 'New');
+      const bestPrice = buyBox || lowest || cps[0];
+      currentPrice = bestPrice?.Price?.ListingPrice?.Amount || 0;
       salesRank = product.SalesRankings?.[0]?.Rank || '-';
       offerCount = product.CompetitivePricing?.NumberOfOfferListings
         ?.find(n => n.condition === 'New')?.Count || 0;

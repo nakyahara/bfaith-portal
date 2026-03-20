@@ -36,11 +36,40 @@ const DEFAULT_DATA = [
   {"name":"宅急便140サイズ","total":945,"shipping":715,"work":0,"material":200,"labor":30,"size":"3辺の長さが140cm以内","weight":"15000","delivery":"手渡し"},
 ];
 
+function save(data) {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(FILE, JSON.stringify(data, null, 2), 'utf-8');
+}
+
 export function loadShipping() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!fs.existsSync(FILE)) {
-    fs.writeFileSync(FILE, JSON.stringify(DEFAULT_DATA, null, 2), 'utf-8');
+    save(DEFAULT_DATA);
     return DEFAULT_DATA;
   }
   return JSON.parse(fs.readFileSync(FILE, 'utf-8'));
+}
+
+export function addShipping(item) {
+  const data = loadShipping();
+  data.push(item);
+  data.sort((a, b) => (a.total || 0) - (b.total || 0));
+  save(data);
+  return data;
+}
+
+export function updateShipping(name, item) {
+  const data = loadShipping();
+  const idx = data.findIndex(s => s.name === name);
+  if (idx >= 0) data[idx] = { ...data[idx], ...item };
+  data.sort((a, b) => (a.total || 0) - (b.total || 0));
+  save(data);
+  return data;
+}
+
+export function deleteShipping(name) {
+  let data = loadShipping();
+  data = data.filter(s => s.name !== name);
+  save(data);
+  return data;
 }

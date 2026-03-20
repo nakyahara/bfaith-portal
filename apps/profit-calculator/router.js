@@ -7,7 +7,7 @@ import { fileURLToPath } from 'url';
 import { getProduct, getFees } from './sp-api.js';
 import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, updateProductStatus, updateProduct } from './db.js';
 import { loadSuppliers, addSupplier, deleteSupplier } from './suppliers.js';
-import { loadShipping } from './shipping.js';
+import { loadShipping, addShipping, updateShipping, deleteShipping } from './shipping.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -36,6 +36,10 @@ router.get('/products', (req, res) => {
 
 router.get('/suppliers', (req, res) => {
   res.sendFile(path.join(__dirname, 'suppliers.html'));
+});
+
+router.get('/shipping', (req, res) => {
+  res.sendFile(path.join(__dirname, 'shipping.html'));
 });
 
 // 旧URL互換
@@ -221,6 +225,29 @@ router.delete('/api/suppliers', (req, res) => {
 // ── API: 送料テーブル ──
 router.get('/api/shipping', (req, res) => {
   res.json(loadShipping());
+});
+
+router.post('/api/shipping', (req, res) => {
+  try {
+    const data = addShipping(req.body);
+    res.json(data);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.put('/api/shipping', (req, res) => {
+  try {
+    const { originalName, ...item } = req.body;
+    const data = updateShipping(originalName, item);
+    res.json(data);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.delete('/api/shipping', (req, res) => {
+  try {
+    const { name } = req.body;
+    const data = deleteShipping(name);
+    res.json(data);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 export default router;
