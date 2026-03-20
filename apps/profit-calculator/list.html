@@ -319,7 +319,7 @@
       let html = `<table class="data-table">
         <thead><tr>
           <th style="width:20px;"></th><th></th><th>ASIN</th><th>商品名</th><th>仕入れ先</th>
-          <th>卸価格</th><th>販売価格</th><th>利益</th><th>利益率</th><th>判定</th>
+          <th>卸価格(税込)</th><th>ロット</th>
           <th>ステータス</th><th>登録日</th><th>操作</th>
         </tr></thead>
         <tbody>`;
@@ -333,10 +333,7 @@
           <td class="product-name-cell" title="${esc(r.product_name || '')}">${esc(r.product_name || '-')}</td>
           <td>${esc(r.supplier_name || '-')}</td>
           <td class="num">${r.wholesale_price_with_tax ? '¥'+Number(r.wholesale_price_with_tax).toLocaleString() : '-'}</td>
-          <td class="num">${r.selling_price ? '¥'+Number(r.selling_price).toLocaleString() : '-'}</td>
-          <td class="num ${(r.profit||0) >= 0 ? 'positive' : 'negative'}">${r.profit != null ? '¥'+Number(r.profit).toLocaleString() : '-'}</td>
-          <td class="num ${(r.profit||0) >= 0 ? 'positive' : 'negative'}">${r.profit_rate != null ? (r.profit_rate*100).toFixed(1)+'%' : '-'}</td>
-          <td>${r.judgment ? `<span class="judgment-sm ${r.judgment}">${r.judgment}</span>` : '-'}</td>
+          <td class="num">${r.lot || '-'}</td>
           <td><span class="status-badge ${r.status || ''}">${r.status || '-'}</span></td>
           <td style="font-size:11px;">${r.created_at ? r.created_at.slice(0,10) : '-'}</td>
           <td onclick="event.stopPropagation()"><div class="actions-cell">
@@ -344,13 +341,13 @@
               <option value="">変更</option>
               ${STATUSES.filter(s => s !== r.status).map(s => `<option value="${s}">${s}</option>`).join('')}
             </select>` : ''}
-            ${r.status === '判断中' ? `<button class="btn btn-sm btn-success" onclick="promote(${r.id})">商品登録へ</button>` : ''}
+            ${r.asin && r.asin !== 'UNKNOWN' ? `<button class="btn btn-sm" style="background:#fff8e6; border-color:#b8860b; color:#856404; font-size:10px;" onclick="goToCalc('${r.asin}')">計算</button>` : ''}
           </div></td>
         </tr>`;
 
         // 展開パネル
         html += `<tr class="detail-row ${isExp ? 'open' : ''}" id="detail-${r.id}">
-          <td colspan="13">
+          <td colspan="10">
             <div class="detail-panel">
               ${renderDetailPanel(r)}
             </div>
@@ -465,22 +462,8 @@
                 <input type="number" id="d-lot-${r.id}" value="${r.lot || 1}" min="1">
               </div>
               <div class="detail-field">
-                <label>販売価格</label>
-                <input type="number" id="d-selling-${r.id}" value="${r.selling_price || ''}" min="0" oninput="recalcDetail(${r.id})">
-              </div>
-              <div class="detail-field">
                 <label>回答日</label>
                 <input type="date" id="d-quote-responded-${r.id}" value="${r.quote_responded_at || ''}">
-              </div>
-            </div>
-
-            <!-- 計算結果 -->
-            <div style="margin-top: 10px; padding: 10px; background: #f7fdf7; border: 1px solid #d5d9d9; border-radius: 4px;">
-              <div style="display: flex; gap: 20px; flex-wrap: wrap; font-size: 13px;">
-                <span>合計手数料: <b id="d-totalfee-${r.id}">${r.total_fee != null ? '¥'+Number(r.total_fee).toLocaleString() : '-'}</b></span>
-                <span>利益: <b id="d-profit-${r.id}" class="${(r.profit||0) >= 0 ? 'positive' : 'negative'}">${r.profit != null ? '¥'+Number(r.profit).toLocaleString() : '-'}</b></span>
-                <span>利益率: <b id="d-rate-${r.id}" class="${(r.profit||0) >= 0 ? 'positive' : 'negative'}">${r.profit_rate != null ? (r.profit_rate*100).toFixed(1)+'%' : '-'}</b></span>
-                <span>判定: <b id="d-judgment-${r.id}">${r.judgment || '-'}</b></span>
               </div>
             </div>
 
@@ -497,7 +480,7 @@
               <button class="btn btn-primary" onclick="saveAllDetail(${r.id})">
                 全項目を保存
               </button>
-              ${r.status === '回答済' || r.status === '判断中' ? `<button class="btn btn-sm btn-success" onclick="promote(${r.id})">商品登録へ転送</button>` : ''}
+              ${r.asin && r.asin !== 'UNKNOWN' ? `<button class="btn btn-sm" style="background:#fff8e6; border-color:#b8860b; color:#856404;" onclick="goToCalc('${r.asin}')">商品計算へ →</button>` : ''}
               <span class="saved-msg" id="d-saved-answer-${r.id}">保存しました</span>
               ${r.quote_responded_at ? `<span style="font-size:11px; color:#1864ab;">回答日: ${r.quote_responded_at}</span>` : ''}
             </div>
@@ -563,26 +546,12 @@
       const wholesale = parseInt(document.getElementById(`d-wholesale-${id}`).value) || 0;
       const taxRate = parseInt(document.getElementById(`d-taxrate-${id}`).value) || 10;
       const withTax = Math.ceil(wholesale * (1 + taxRate / 100));
-      const selling = parseInt(document.getElementById(`d-selling-${id}`).value) || 0;
-      const row = allData.find(r => r.id === id);
-      const totalFee = row ? (row.total_fee || 0) : 0;
-      const profit = selling - withTax - totalFee;
-      const profitRate = selling > 0 ? profit / selling : 0;
-      let judgment;
-      if (profitRate >= 0.3) judgment = '◎';
-      else if (profitRate >= 0.2) judgment = '○';
-      else if (profitRate >= 0.1) judgment = '△';
-      else judgment = '×';
 
       const data = {
         wholesale_price: wholesale,
         tax_rate: taxRate,
         wholesale_price_with_tax: withTax,
         lot: parseInt(document.getElementById(`d-lot-${id}`).value) || 1,
-        selling_price: selling,
-        profit: Math.round(profit),
-        profit_rate: profitRate,
-        judgment: judgment,
         comment: document.getElementById(`d-comment-${id}`).value,
         quote_responded_at: document.getElementById(`d-quote-responded-${id}`).value || today,
         status: '回答済',
@@ -608,16 +577,6 @@
       const wholesale = parseInt(document.getElementById(`d-wholesale-${id}`).value) || 0;
       const taxRate = parseInt(document.getElementById(`d-taxrate-${id}`).value) || 10;
       const withTax = Math.ceil(wholesale * (1 + taxRate / 100));
-      const selling = parseInt(document.getElementById(`d-selling-${id}`).value) || 0;
-      const row = allData.find(r => r.id === id);
-      const totalFee = row ? (row.total_fee || 0) : 0;
-      const profit = selling - withTax - totalFee;
-      const profitRate = selling > 0 ? profit / selling : 0;
-      let judgment;
-      if (profitRate >= 0.3) judgment = '◎';
-      else if (profitRate >= 0.2) judgment = '○';
-      else if (profitRate >= 0.1) judgment = '△';
-      else judgment = '×';
 
       const data = {
         supplier_code: document.getElementById(`d-supplier-code-${id}`).value,
@@ -634,10 +593,6 @@
         tax_rate: taxRate,
         wholesale_price_with_tax: withTax,
         lot: parseInt(document.getElementById(`d-lot-${id}`).value) || 1,
-        selling_price: selling,
-        profit: wholesale > 0 && selling > 0 ? Math.round(profit) : (row ? row.profit : null),
-        profit_rate: wholesale > 0 && selling > 0 ? profitRate : (row ? row.profit_rate : null),
-        judgment: wholesale > 0 && selling > 0 ? judgment : (row ? row.judgment : null),
         comment: document.getElementById(`d-comment-${id}`).value,
         quote_responded_at: document.getElementById(`d-quote-responded-${id}`).value,
       };
@@ -657,36 +612,17 @@
       } catch (err) { showToast('エラー: ' + err.message); }
     }
 
-    // === 詳細パネル内の即時再計算 ===
+    // === 商品計算へ遷移 ===
+    function goToCalc(asin) {
+      window.location.href = `./?asin=${encodeURIComponent(asin)}`;
+    }
+
+    // === 詳細パネル内の即時再計算（税込のみ） ===
     function recalcDetail(id) {
       const wholesale = parseInt(document.getElementById(`d-wholesale-${id}`).value) || 0;
       const taxRate = parseInt(document.getElementById(`d-taxrate-${id}`).value) || 10;
       const withTax = Math.ceil(wholesale * (1 + taxRate / 100));
       document.getElementById(`d-wholesale-tax-${id}`).value = withTax;
-
-      const selling = parseInt(document.getElementById(`d-selling-${id}`).value) || 0;
-      const row = allData.find(r => r.id === id);
-      const totalFee = row ? (row.total_fee || 0) : 0;
-
-      if (wholesale > 0 && selling > 0) {
-        const profit = selling - withTax - totalFee;
-        const profitRate = selling > 0 ? profit / selling : 0;
-        let judgment;
-        if (profitRate >= 0.3) judgment = '◎';
-        else if (profitRate >= 0.2) judgment = '○';
-        else if (profitRate >= 0.1) judgment = '△';
-        else judgment = '×';
-
-        const cls = profit >= 0 ? 'positive' : 'negative';
-        document.getElementById(`d-totalfee-${id}`).textContent = '¥' + totalFee.toLocaleString();
-        const pe = document.getElementById(`d-profit-${id}`);
-        pe.textContent = '¥' + Math.round(profit).toLocaleString();
-        pe.className = cls;
-        const re = document.getElementById(`d-rate-${id}`);
-        re.textContent = (profitRate * 100).toFixed(1) + '%';
-        re.className = cls;
-        document.getElementById(`d-judgment-${id}`).textContent = judgment;
-      }
     }
 
     // === ローカルデータ更新 ===
@@ -711,14 +647,6 @@
       }
     }
 
-    async function promote(id) {
-      if (!confirm('この商品を「商品登録」に転送しますか？')) return;
-      const res = await fetch(`./api/research/${id}/promote`, { method: 'POST' });
-      if (res.ok) {
-        showToast('商品登録に転送しました');
-        loadData();
-      }
-    }
 
     // === 仕入れ先マスタ読み込み ===
     async function loadSupplierList() {
