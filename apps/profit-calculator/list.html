@@ -46,6 +46,7 @@
 
     .status-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: bold; white-space: nowrap; }
     .status-badge.リサーチ { background: #e3e6e8; color: #444; }
+    .status-badge.見積もり依頼予定 { background: #fce4ec; color: #ad1457; }
     .status-badge.見積もり依頼中 { background: #fff3cd; color: #856404; }
     .status-badge.回答済 { background: #ffd8a8; color: #a55000; }
     .status-badge.判断中 { background: #d0ebff; color: #1864ab; }
@@ -134,6 +135,7 @@
       <select id="statusFilter" onchange="loadData()">
         <option value="">全ステータス</option>
         <option value="リサーチ">リサーチ</option>
+        <option value="見積もり依頼予定">見積もり依頼予定</option>
         <option value="見積もり依頼中">見積もり依頼中</option>
         <option value="回答済">回答済</option>
         <option value="判断中">判断中</option>
@@ -158,8 +160,11 @@
         <div class="modal-form">
           <div class="modal-field">
             <label>ASIN</label>
-            <input type="text" id="new-asin" placeholder="B000FQK36A" maxlength="10">
-            <span class="hint">入力するとSP-APIから商品情報を自動取得</span>
+            <div style="display:flex; gap:6px;">
+              <input type="text" id="new-asin" placeholder="B000FQK36A" maxlength="10" style="flex:1;">
+              <button class="btn btn-primary" onclick="fetchProductForNew()" id="btn-asin-search" style="white-space:nowrap;">検索</button>
+            </div>
+            <span class="hint" id="asin-search-status">ASINを入力して検索 → 商品名・型番・JAN自動取得</span>
           </div>
           <div class="modal-field">
             <label>商品名</label>
@@ -168,20 +173,22 @@
 
           <div class="modal-section">仕入れ先情報</div>
           <div class="modal-field">
-            <label>仕入れ先コード</label>
-            <input type="text" id="new-supplier-code" placeholder="0001">
+            <label>仕入れ先</label>
+            <select id="new-supplier-code" onchange="onNewSupplierChange()">
+              <option value="">選択してください</option>
+            </select>
           </div>
           <div class="modal-field">
             <label>メーカー/問屋名</label>
-            <input type="text" id="new-supplier-name">
+            <input type="text" id="new-supplier-name" placeholder="仕入れ先選択で自動入力 or 手入力">
           </div>
           <div class="modal-field">
             <label>型番</label>
-            <input type="text" id="new-part-number">
+            <input type="text" id="new-part-number" placeholder="ASIN検索で自動取得">
           </div>
           <div class="modal-field">
             <label>JAN</label>
-            <input type="text" id="new-jan">
+            <input type="text" id="new-jan" placeholder="ASIN検索で自動取得">
           </div>
           <div class="modal-field">
             <label>内容量</label>
@@ -212,16 +219,15 @@
             <textarea id="new-comment" placeholder="備考"></textarea>
           </div>
         </div>
-        <div style="margin-top: 12px; padding: 10px; background: #f7f8f8; border-radius: 4px; font-size: 12px; color: #565959;">
-          <b>登録方法:</b><br>
-          <b>「リサーチとして登録」</b> — まず商品情報だけ保存（ステータス: リサーチ）<br>
-          <b>「見積もり依頼として登録」</b> — 仕入れ先情報と一緒に保存（ステータス: 見積もり依頼中）
-        </div>
       </div>
       <div class="modal-footer">
         <button class="btn" style="background:#fff;" onclick="closeNewModal()">キャンセル</button>
-        <button class="btn btn-primary" onclick="submitNew('リサーチ')">リサーチとして登録</button>
-        <button class="btn btn-quote" onclick="submitNew('見積もり依頼中')">見積もり依頼として登録</button>
+        <select id="new-status" style="padding:6px 10px; border:1px solid #aaa; border-radius:4px; font-size:13px;">
+          <option value="リサーチ">リサーチ</option>
+          <option value="見積もり依頼予定">見積もり依頼予定</option>
+          <option value="見積もり依頼中" selected>見積もり依頼中</option>
+        </select>
+        <button class="btn btn-add" onclick="submitNew()">登録</button>
       </div>
     </div>
   </div>
@@ -230,9 +236,13 @@
     let debounceTimer = null;
     let allData = [];
     let expandedId = null;
-    const STATUSES = ['リサーチ', '見積もり依頼中', '回答済', '判断中', '却下'];
+    const STATUSES = ['リサーチ', '見積もり依頼予定', '見積もり依頼中', '回答済', '判断中', '却下'];
+    let supplierList = [];
 
-    document.addEventListener('DOMContentLoaded', loadData);
+    document.addEventListener('DOMContentLoaded', () => {
+      loadData();
+      loadSupplierList();
+    });
 
     function debounceLoad() {
       clearTimeout(debounceTimer);
@@ -333,12 +343,15 @@
             <h3>見積もり依頼</h3>
             <div class="detail-form">
               <div class="detail-field">
-                <label>仕入れ先コード</label>
-                <input type="text" id="d-supplier-code-${r.id}" value="${esc(r.supplier_code || '')}" placeholder="0001">
+                <label>仕入れ先</label>
+                <select id="d-supplier-code-${r.id}" onchange="onDetailSupplierChange(${r.id})">
+                  <option value="">選択してください</option>
+                  ${supplierList.map(s => `<option value="${s.code}" data-name="${esc(s.name)}" ${s.code === r.supplier_code ? 'selected' : ''}>${s.code} - ${esc(s.name)}</option>`).join('')}
+                </select>
               </div>
               <div class="detail-field">
                 <label>メーカー/問屋名</label>
-                <input type="text" id="d-supplier-name-${r.id}" value="${esc(r.supplier_name || '')}">
+                <input type="text" id="d-supplier-name-${r.id}" value="${esc(r.supplier_name || '')}" placeholder="仕入れ先選択で自動入力 or 手入力">
               </div>
               <div class="detail-field">
                 <label>型番</label>
@@ -447,6 +460,15 @@
           </div>
         </div>
       `;
+    }
+
+    // === 展開パネル内の仕入れ先連動 ===
+    function onDetailSupplierChange(id) {
+      const sel = document.getElementById(`d-supplier-code-${id}`);
+      const opt = sel.options[sel.selectedIndex];
+      if (opt && opt.dataset.name) {
+        document.getElementById(`d-supplier-name-${id}`).value = opt.dataset.name;
+      }
     }
 
     // === 行展開 ===
@@ -654,6 +676,38 @@
       }
     }
 
+    // === 仕入れ先マスタ読み込み ===
+    async function loadSupplierList() {
+      try {
+        const res = await fetch('./api/suppliers');
+        supplierList = await res.json();
+        populateSupplierDropdown('new-supplier-code');
+      } catch (e) { console.error('仕入れ先読み込みエラー:', e); }
+    }
+
+    function populateSupplierDropdown(selectId) {
+      const sel = document.getElementById(selectId);
+      if (!sel) return;
+      const current = sel.value;
+      sel.innerHTML = '<option value="">選択してください</option>';
+      supplierList.forEach(s => {
+        const opt = document.createElement('option');
+        opt.value = s.code;
+        opt.textContent = `${s.code} - ${s.name}`;
+        opt.dataset.name = s.name;
+        sel.appendChild(opt);
+      });
+      if (current) sel.value = current;
+    }
+
+    function onNewSupplierChange() {
+      const sel = document.getElementById('new-supplier-code');
+      const opt = sel.options[sel.selectedIndex];
+      if (opt && opt.dataset.name) {
+        document.getElementById('new-supplier-name').value = opt.dataset.name;
+      }
+    }
+
     // === 新規登録モーダル ===
     function openNewModal() {
       document.getElementById('newModal').classList.add('open');
@@ -663,44 +717,52 @@
       document.getElementById('newModal').classList.remove('open');
     }
 
-    // ASIN入力でEnter → SP-APIから商品情報取得
+    // ASIN入力でEnter → 検索
     document.addEventListener('DOMContentLoaded', () => {
       const asinEl = document.getElementById('new-asin');
       if (asinEl) {
-        asinEl.addEventListener('keypress', async e => {
-          if (e.key === 'Enter') {
-            e.preventDefault();
-            await fetchProductForNew();
-          }
-        });
-        asinEl.addEventListener('blur', async () => {
-          const val = asinEl.value.trim();
-          if (val.match(/^B[0-9A-Z]{9}$/) && !document.getElementById('new-product-name').value) {
-            await fetchProductForNew();
-          }
+        asinEl.addEventListener('keypress', e => {
+          if (e.key === 'Enter') { e.preventDefault(); fetchProductForNew(); }
         });
       }
     });
 
     async function fetchProductForNew() {
       const asin = document.getElementById('new-asin').value.trim();
-      if (!asin.match(/^B[0-9A-Z]{9}$/)) return;
+      if (!asin.match(/^B[0-9A-Z]{9}$/)) {
+        showToast('ASINの形式が正しくありません（例: B000FQK36A）');
+        return;
+      }
+      const btn = document.getElementById('btn-asin-search');
+      const hint = document.getElementById('asin-search-status');
+      btn.disabled = true;
+      btn.textContent = '取得中...';
+      hint.textContent = '商品情報を取得中...';
       try {
-        showToast('商品情報を取得中...');
         const res = await fetch(`./api/product/${asin}`);
-        if (!res.ok) return;
+        if (!res.ok) {
+          const err = await res.json();
+          hint.textContent = '取得失敗: ' + (err.error || '不明なエラー');
+          return;
+        }
         const d = await res.json();
         if (d.itemName) document.getElementById('new-product-name').value = d.itemName;
         if (d.jan) document.getElementById('new-jan').value = d.jan;
         if (d.partNumber) document.getElementById('new-part-number').value = d.partNumber;
         if (d.manufacturer) document.getElementById('new-supplier-name').value = d.manufacturer;
+        hint.textContent = '取得完了: ' + (d.itemName || asin);
+        hint.style.color = '#007600';
         showToast('商品情報を取得しました');
       } catch (err) {
-        showToast('商品情報の取得に失敗: ' + err.message);
+        hint.textContent = '通信エラー: ' + err.message;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '検索';
       }
     }
 
-    async function submitNew(status) {
+    async function submitNew() {
+      const status = document.getElementById('new-status').value;
       const asin = document.getElementById('new-asin').value.trim();
       const productName = document.getElementById('new-product-name').value.trim();
       if (!asin && !productName) {
@@ -709,11 +771,12 @@
       }
 
       const today = new Date().toISOString().slice(0, 10);
+      const sel = document.getElementById('new-supplier-code');
       const body = {
         asin: asin || 'UNKNOWN',
         productName: productName,
-        amazonUrl: asin ? `https://www.amazon.co.jp/dp/${asin}` : '',
-        supplierCode: document.getElementById('new-supplier-code').value,
+        amazonUrl: asin && asin !== 'UNKNOWN' ? `https://www.amazon.co.jp/dp/${asin}` : '',
+        supplierCode: sel.value,
         supplierName: document.getElementById('new-supplier-name').value,
         partNumber: document.getElementById('new-part-number').value,
         jan: document.getElementById('new-jan').value,
@@ -723,7 +786,7 @@
         quoteUrl: document.getElementById('new-quote-url').value,
         quoteNote: document.getElementById('new-quote-note').value,
         comment: document.getElementById('new-comment').value,
-        quoteRequestedAt: status === '見積もり依頼中' ? today : null,
+        quoteRequestedAt: (status === '見積もり依頼中' || status === '見積もり依頼予定') ? today : null,
         status: status,
       };
 
@@ -737,9 +800,7 @@
           const result = await res.json();
           closeNewModal();
           clearNewForm();
-          showToast(status === '見積もり依頼中'
-            ? `見積もり依頼として登録しました (ID: ${result.id})`
-            : `リサーチに登録しました (ID: ${result.id})`);
+          showToast(`「${status}」として登録しました (ID: ${result.id})`);
           loadData();
         }
       } catch (err) {
@@ -748,11 +809,16 @@
     }
 
     function clearNewForm() {
-      ['new-asin','new-product-name','new-supplier-code','new-supplier-name',
+      ['new-product-name','new-supplier-name',
        'new-part-number','new-jan','new-quantity','new-expiry',
        'new-maker-url','new-quote-url','new-quote-note','new-comment'].forEach(id => {
         document.getElementById(id).value = '';
       });
+      document.getElementById('new-asin').value = '';
+      document.getElementById('new-supplier-code').selectedIndex = 0;
+      const hint = document.getElementById('asin-search-status');
+      hint.textContent = 'ASINを入力して検索 → 商品名・型番・JAN自動取得';
+      hint.style.color = '';
     }
 
     function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
