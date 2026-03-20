@@ -137,9 +137,17 @@
           <input type="text" id="asinInput" placeholder="B000FQK36A" maxlength="10">
         </div>
         <button class="btn btn-primary" id="btnSearch" onclick="searchProduct()">検索</button>
+        <button class="btn" style="background:#fff; border-color:#888; color:#565959;" onclick="startManual()">ASINなしで入力</button>
         <div class="loading" id="loadingSearch"><div class="spinner"></div>取得中...</div>
       </div>
       <div class="error-msg" id="errorMsg"></div>
+      <!-- 手入力用の商品名 -->
+      <div class="form-row hidden" id="manualNameRow" style="margin-top:8px;">
+        <div class="form-group wide">
+          <label>商品名</label>
+          <input type="text" id="manualProductName" placeholder="商品名を手入力">
+        </div>
+      </div>
       <div class="product-card" id="productCard">
         <img id="productImage" src="" alt="">
         <div class="product-info">
@@ -320,7 +328,16 @@
     const STORAGE_RATE = { jan_sep: 5676 / 1000000, oct_dec: 9170 / 1000000 };
 
     // ===== 初期化 =====
-    document.addEventListener('DOMContentLoaded', loadSupplierList);
+    document.addEventListener('DOMContentLoaded', () => {
+      loadSupplierList();
+      // URLパラメータでASINが渡された場合、自動検索
+      const params = new URLSearchParams(window.location.search);
+      const asin = params.get('asin');
+      if (asin) {
+        document.getElementById('asinInput').value = asin;
+        searchProduct();
+      }
+    });
 
     async function loadSupplierList() {
       try {
@@ -427,6 +444,16 @@
       document.getElementById('actionButtons').classList.remove('hidden');
     }
 
+    // ===== ASINなしで手入力モード =====
+    function startManual() {
+      productData = { asin: '', itemName: '', image: '', category: '', salesRank: '-', offerCount: 0, volumeCm3: 0, dimensions: { length: '-', width: '-', height: '-', weight: '-' }, jan: '', partNumber: '', manufacturer: '', currentPrice: 0 };
+      document.getElementById('productCard').style.display = 'none';
+      document.getElementById('manualNameRow').classList.remove('hidden');
+      showPanels();
+      document.getElementById('btnSave').disabled = false;
+      document.getElementById('manualProductName').focus();
+    }
+
     // ===== 手数料取得 =====
     function debounceFetchFees() {
       clearTimeout(debounceTimer);
@@ -518,16 +545,17 @@
       const withTax = Math.ceil(wholesale * (1 + taxRate / 100));
       document.getElementById('wholesalePriceWithTax').value = withTax;
 
-      if (!feeData) return;
+      if (!feeData && !productData) return;
 
       const isFba = document.getElementById('fba').checked;
       const price = parseInt(document.getElementById('sellingPrice').value) || 0;
       const storageFee = isFba ? getStoragePerUnit() : 0;
       const fbmShipping = isFba ? 0 : (parseInt(document.getElementById('fbmShipping').value) || 0);
-      const totalFee = feeData.totalFee + storageFee + fbmShipping;
+      const baseFee = feeData ? feeData.totalFee : 0;
+      const totalFee = baseFee + storageFee + fbmShipping;
 
       document.getElementById('dispTotalFee').textContent = yen(totalFee);
-      document.getElementById('dispShippingTotal').textContent = yen(isFba ? feeData.fbaFee : fbmShipping);
+      document.getElementById('dispShippingTotal').textContent = yen(isFba && feeData ? feeData.fbaFee : fbmShipping);
 
       // 利益計算（卸価格が0のときは販売価格ベース）
       const cost = withTax > 0 ? withTax : 0;
@@ -550,7 +578,7 @@
       document.getElementById('sumJudgment').innerHTML = `<span class="judgment-badge ${jClass}">${judgment}</span>`;
 
       // 赤字ストッパー自動算出
-      if (price > 0 && feeData.referralFee > 0) {
+      if (price > 0 && feeData && feeData.referralFee > 0) {
         const refRate = feeData.referralFee / price;
         const fixedFees = (isFba ? feeData.fbaFee : fbmShipping) + storageFee + feeData.perItemFee + feeData.variableClosingFee;
         const stopper = Math.ceil((cost + fixedFees) / (1 - refRate - 0.10));
@@ -558,9 +586,9 @@
       }
     }
 
-    // ===== Notion保存 =====
+    // ===== DB保存 =====
     async function saveAll() {
-      if (!productData || !feeData) return;
+      if (!productData) return;
 
       const isFba = document.getElementById('fba').checked;
       const price = parseInt(document.getElementById('sellingPrice').value) || 0;
@@ -569,7 +597,8 @@
       const withTax = Math.ceil(wholesale * (1 + taxRate / 100));
       const storageFee = isFba ? getStoragePerUnit() : 0;
       const fbmShipping = isFba ? 0 : (parseInt(document.getElementById('fbmShipping').value) || 0);
-      const totalFee = feeData.totalFee + storageFee + fbmShipping;
+      const baseFee = feeData ? feeData.totalFee : 0;
+      const totalFee = baseFee + storageFee + fbmShipping;
       const profit = price - withTax - totalFee;
       const profitRate = price > 0 ? profit / price : 0;
 
@@ -579,13 +608,15 @@
       else if (profitRate >= 0.1) judgment = '△';
       else judgment = '×';
 
+      const asin = productData.asin || document.getElementById('asinInput').value.trim();
+      const productName = productData.itemName || document.getElementById('manualProductName').value.trim();
       const sel = document.getElementById('supplierSelect');
       const body = {
-        asin: productData.asin,
-        productName: productData.itemName,
-        amazonUrl: `https://www.amazon.co.jp/dp/${productData.asin}`,
+        asin: asin || 'MANUAL',
+        productName: productName,
+        amazonUrl: asin && asin !== 'MANUAL' ? `https://www.amazon.co.jp/dp/${asin}` : '',
         imageUrl: productData.image || '',
-        category: productData.category,
+        category: productData.category || '',
         salesRank: productData.salesRank !== '-' ? Number(productData.salesRank) : null,
         offerCount: productData.offerCount || null,
         supplierCode: sel.value || '',
@@ -601,8 +632,8 @@
         wholesalePriceWithTax: withTax,
         lot: parseInt(document.getElementById('lot').value) || 1,
         sellingPrice: price,
-        referralFee: feeData.referralFee,
-        fbaFee: isFba ? feeData.fbaFee : 0,
+        referralFee: feeData ? feeData.referralFee : 0,
+        fbaFee: feeData && isFba ? feeData.fbaFee : 0,
         storageFee: Math.round(storageFee),
         totalFee: Math.round(totalFee),
         profit: Math.round(profit),
@@ -640,6 +671,8 @@
       productData = null; feeData = null;
       document.getElementById('asinInput').value = '';
       document.getElementById('productCard').style.display = 'none';
+      document.getElementById('manualNameRow').classList.add('hidden');
+      document.getElementById('manualProductName').value = '';
       document.getElementById('calcPanel').classList.add('hidden');
       document.getElementById('supplierPanel').classList.add('hidden');
       document.getElementById('actionButtons').classList.add('hidden');
