@@ -32,6 +32,9 @@
     .btn-primary { background: #f0c14b; border-color: #a88734; color: #0f1111; }
     .btn-primary:hover { background: #e7b83c; }
     .btn-danger { background: #fff0f0; border-color: #b12704; color: #b12704; }
+    .btn-edit { background: #f0f6ff; border-color: #0066c0; color: #1864ab; }
+    .btn-save-edit { background: #f0fff0; border-color: #007600; color: #007600; }
+    .actions-cell { display: flex; gap: 4px; white-space: nowrap; }
 
     .search-bar { margin-bottom: 12px; display: flex; gap: 12px; align-items: center; }
     .search-bar input { padding: 5px 8px; border: 1px solid #888; border-radius: 4px; font-size: 13px; width: 250px; }
@@ -83,7 +86,7 @@
         <span class="count" id="countDisplay"></span>
       </div>
       <table class="data-table">
-        <thead><tr><th style="width:80px;">コード</th><th>仕入れ先名</th><th style="width:60px;"></th></tr></thead>
+        <thead><tr><th style="width:80px;">コード</th><th>仕入れ先名</th><th style="width:100px;"></th></tr></thead>
         <tbody id="tableBody"></tbody>
       </table>
     </div>
@@ -108,17 +111,66 @@
       } catch (e) { console.error(e); }
     }
 
+    let editingCode = null;
+
     function renderTable() {
       const q = document.getElementById('searchInput').value.trim().toLowerCase();
       let list = suppliers;
       if (q) list = list.filter(s => s.code.includes(q) || s.name.toLowerCase().includes(q));
 
       document.getElementById('countDisplay').textContent = `${list.length}件`;
-      document.getElementById('tableBody').innerHTML = list.map(s => `<tr>
-        <td class="code">${esc(s.code)}</td>
-        <td>${esc(s.name)}</td>
-        <td><button class="btn btn-sm btn-danger" onclick="del('${esc(s.code)}','${esc(s.name)}')">削除</button></td>
-      </tr>`).join('');
+      document.getElementById('tableBody').innerHTML = list.map(s => {
+        if (editingCode === s.code) {
+          return `<tr>
+            <td class="code">${esc(s.code)}</td>
+            <td><input type="text" id="edit-name-${s.code}" value="${esc(s.name)}" style="width:100%; padding:4px 6px; border:1px solid #e77600; border-radius:3px; font-size:13px;"></td>
+            <td><div class="actions-cell">
+              <button class="btn btn-sm btn-save-edit" onclick="saveEdit('${esc(s.code)}')">保存</button>
+              <button class="btn btn-sm" style="background:#fff; border-color:#888;" onclick="cancelEdit()">取消</button>
+            </div></td>
+          </tr>`;
+        }
+        return `<tr>
+          <td class="code">${esc(s.code)}</td>
+          <td>${esc(s.name)}</td>
+          <td><div class="actions-cell">
+            <button class="btn btn-sm btn-edit" onclick="startEdit('${esc(s.code)}')">編集</button>
+            <button class="btn btn-sm btn-danger" onclick="del('${esc(s.code)}','${esc(s.name)}')">削除</button>
+          </div></td>
+        </tr>`;
+      }).join('');
+
+      if (editingCode) {
+        const el = document.getElementById(`edit-name-${editingCode}`);
+        if (el) { el.focus(); el.select(); }
+      }
+    }
+
+    function startEdit(code) {
+      editingCode = code;
+      renderTable();
+    }
+    function cancelEdit() {
+      editingCode = null;
+      renderTable();
+    }
+    async function saveEdit(code) {
+      const el = document.getElementById(`edit-name-${code}`);
+      const name = el ? el.value.trim() : '';
+      if (!name) { showToast('名前を入力してください'); return; }
+      try {
+        const res = await fetch('./api/suppliers', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code, name }),
+        });
+        if (res.ok) {
+          suppliers = await res.json();
+          editingCode = null;
+          renderTable();
+          showToast(`「${name}」に更新しました`);
+        }
+      } catch (err) { showToast('エラー: ' + err.message); }
     }
 
     async function addSupplier() {
@@ -158,6 +210,11 @@
         }
       } catch (err) { showToast('エラー: ' + err.message); }
     }
+
+    // 編集中にEnterで保存
+    document.getElementById('tableBody').addEventListener('keypress', e => {
+      if (e.key === 'Enter' && editingCode) saveEdit(editingCode);
+    });
 
     function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
     function showToast(m) { const e = document.getElementById('toast'); e.textContent = m; e.style.display = 'block'; setTimeout(() => e.style.display = 'none', 3000); }
