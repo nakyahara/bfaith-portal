@@ -104,16 +104,19 @@
     .modal-header { background: #232f3e; color: #fff; padding: 12px 20px; border-radius: 8px 8px 0 0; display: flex; justify-content: space-between; align-items: center; }
     .modal-header h2 { font-size: 15px; }
     .modal-close { background: none; border: none; color: #fff; font-size: 20px; cursor: pointer; padding: 0 4px; }
-    .modal-body { padding: 20px; }
-    .modal-form { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 16px; }
+    .modal-body { padding: 14px 20px; }
+    .modal-form { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px 12px; }
+    .modal-form.col2 { grid-template-columns: 1fr 1fr; }
     .modal-form.full { grid-template-columns: 1fr; }
-    .modal-field { display: flex; flex-direction: column; gap: 3px; }
+    .modal-field { display: flex; flex-direction: column; gap: 2px; }
+    .modal-field.span2 { grid-column: span 2; }
+    .modal-field.span3 { grid-column: span 3; }
     .modal-field label { font-size: 11px; font-weight: bold; color: #565959; }
-    .modal-field input, .modal-field select, .modal-field textarea { padding: 6px 8px; border: 1px solid #aaa; border-radius: 4px; font-size: 13px; }
+    .modal-field input, .modal-field select, .modal-field textarea { padding: 4px 7px; border: 1px solid #aaa; border-radius: 4px; font-size: 13px; }
     .modal-field input:focus, .modal-field select:focus, .modal-field textarea:focus { border-color: #e77600; outline: none; box-shadow: 0 0 3px #e77600; }
-    .modal-field textarea { resize: vertical; min-height: 60px; }
+    .modal-field textarea { resize: vertical; min-height: 40px; }
     .modal-field .hint { font-size: 10px; color: #888; }
-    .modal-section { font-size: 13px; font-weight: bold; margin-top: 10px; padding-top: 10px; border-top: 1px solid #eee; grid-column: 1 / -1; color: #232f3e; }
+    .modal-section { font-size: 12px; font-weight: bold; margin-top: 6px; padding-top: 6px; border-top: 1px solid #eee; grid-column: 1 / -1; color: #232f3e; }
     .modal-footer { padding: 12px 20px; border-top: 1px solid #eee; display: flex; gap: 10px; justify-content: flex-end; }
     .btn-add { background: #ff9900; border-color: #c77600; color: #0f1111; font-size: 14px; padding: 8px 24px; }
   </style>
@@ -158,22 +161,24 @@
         <button class="modal-close" onclick="closeNewModal()">&times;</button>
       </div>
       <div class="modal-body">
+        <!-- ASIN + 商品名 -->
         <div class="modal-form">
           <div class="modal-field">
             <label>ASIN</label>
-            <div style="display:flex; gap:6px;">
+            <div style="display:flex; gap:4px;">
               <input type="text" id="new-asin" placeholder="B000FQK36A" maxlength="10" style="flex:1;">
-              <button class="btn btn-primary" onclick="fetchProductForNew()" id="btn-asin-search" style="white-space:nowrap;">検索</button>
+              <button class="btn btn-primary btn-sm" onclick="fetchProductForNew()" id="btn-asin-search">検索</button>
             </div>
-            <span class="hint" id="asin-search-status">ASINを入力して検索 → 商品名・型番・JAN自動取得</span>
+            <span class="hint" id="asin-search-status">Enter or 検索で自動取得</span>
           </div>
-          <div class="modal-field">
+          <div class="modal-field span2">
             <label>商品名</label>
-            <input type="text" id="new-product-name" placeholder="商品名（ASIN検索で自動取得可）">
+            <input type="text" id="new-product-name" placeholder="ASIN検索で自動取得 or 手入力">
           </div>
 
-          <div class="modal-section">仕入れ先情報</div>
-          <div class="modal-field">
+          <!-- 仕入れ先 -->
+          <div class="modal-section">仕入れ先</div>
+          <div class="modal-field span2">
             <label>仕入れ先</label>
             <select id="new-supplier-code" onchange="onNewSupplierChange()">
               <option value="">選択してください</option>
@@ -181,25 +186,22 @@
           </div>
           <div class="modal-field">
             <label>メーカー/問屋名</label>
-            <input type="text" id="new-supplier-name" placeholder="仕入れ先選択で自動入力 or 手入力">
+            <input type="text" id="new-supplier-name" placeholder="自動入力 or 手入力">
           </div>
           <div class="modal-field">
             <label>型番</label>
-            <input type="text" id="new-part-number" placeholder="ASIN検索で自動取得">
+            <input type="text" id="new-part-number" placeholder="自動取得">
           </div>
           <div class="modal-field">
             <label>JAN</label>
-            <input type="text" id="new-jan" placeholder="ASIN検索で自動取得">
+            <input type="text" id="new-jan" placeholder="自動取得">
           </div>
           <div class="modal-field">
             <label>内容量</label>
             <input type="text" id="new-quantity">
           </div>
-          <div class="modal-field">
-            <label>賞味期限</label>
-            <input type="text" id="new-expiry" placeholder="例: 12ヶ月">
-          </div>
 
+          <!-- 見積もり -->
           <div class="modal-section">見積もり</div>
           <div class="modal-field">
             <label>メーカーURL</label>
@@ -209,15 +211,17 @@
             <label>見積書URL</label>
             <input type="url" id="new-quote-url" placeholder="https://...">
           </div>
-        </div>
-        <div class="modal-form full" style="margin-top: 8px;">
           <div class="modal-field">
-            <label>見積もり依頼メモ</label>
-            <textarea id="new-quote-note" placeholder="例: アメージングクラフト様に見積もり依頼。100個ロットで打診。"></textarea>
+            <label>賞味期限</label>
+            <input type="text" id="new-expiry" placeholder="例: 12ヶ月">
           </div>
-          <div class="modal-field">
+          <div class="modal-field span3">
+            <label>依頼メモ</label>
+            <textarea id="new-quote-note" rows="2" placeholder="例: アメージングクラフト様に100個ロットで打診"></textarea>
+          </div>
+          <div class="modal-field span3">
             <label>コメント</label>
-            <textarea id="new-comment" placeholder="備考"></textarea>
+            <input type="text" id="new-comment" placeholder="備考">
           </div>
         </div>
       </div>
