@@ -7,6 +7,7 @@ import { fileURLToPath } from 'url';
 import { getProduct, getFees } from './sp-api.js';
 import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, updateProductStatus, updateProduct } from './db.js';
 import { loadSuppliers, addSupplier, deleteSupplier } from './suppliers.js';
+import { loadShipping } from './shipping.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -215,6 +216,11 @@ router.delete('/api/suppliers', (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// ── API: 送料テーブル ──
+router.get('/api/shipping', (req, res) => {
+  res.json(loadShipping());
 });
 
 export default router;

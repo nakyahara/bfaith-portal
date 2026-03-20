@@ -201,12 +201,61 @@
       </div>
     </div>
 
-    <!-- ========== セクション3: NE・Amazon登録情報 ========== -->
+    <!-- ========== セクション3: NextEngine登録情報 ========== -->
     <div class="panel hidden" id="nePanel">
       <div class="panel-title" style="cursor:pointer;" onclick="toggleNe()">
-        NE・Amazon登録情報 <span id="neToggle" style="float:right; font-size:12px; color:#0066c0;">▲ 閉じる</span>
+        NextEngine登録情報 <span id="neToggle" style="float:right; font-size:12px; color:#0066c0;">▲ 閉じる</span>
       </div>
       <div id="neBody">
+        <div class="form-row">
+          <div class="form-group medium"><label>NE商品コード</label><input type="text" id="neProductCode" placeholder="NE商品コード"></div>
+          <div class="form-group medium">
+            <label>配送方法</label>
+            <select id="neShippingMethod" onchange="calcNeSellingPrice()">
+              <option value="">選択してください</option>
+            </select>
+          </div>
+          <div class="form-group narrow">
+            <label>送料</label>
+            <input type="number" id="neShippingCost" value="0" readonly style="background:#f7f8f8;">
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group narrow">
+            <label>NE販売価格</label>
+            <input type="number" id="neSellingPrice" value="0" min="0">
+            <span style="font-size:10px; color:#0066c0;">利益率20%で自動算出</span>
+          </div>
+          <div class="form-group narrow"><label>NE発注ロット</label><input type="number" id="neOrderLot" value="1" min="1"></div>
+          <div class="form-group medium">
+            <label>NE税率</label>
+            <select id="neTaxRate">
+              <option value="10%">10%</option>
+              <option value="8%">8%</option>
+            </select>
+          </div>
+          <div class="form-group medium">
+            <label>NE登録 単or複</label>
+            <select id="neRegistrationType">
+              <option value="単品">単品</option>
+              <option value="複数">複数</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-row" id="neVariationFields" style="display:none;">
+          <div class="form-group medium"><label>NE代表コード(バリのみ)</label><input type="text" id="neRepresentativeCode"></div>
+          <div class="form-group medium"><label>NE内訳コード(複数のみ)</label><input type="text" id="neBreakdownCode"></div>
+          <div class="form-group narrow"><label>NE内訳数量</label><input type="number" id="neBreakdownQty" value="0" min="0"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ========== セクション3.5: Amazon登録情報 ========== -->
+    <div class="panel hidden" id="amaPanel">
+      <div class="panel-title" style="cursor:pointer;" onclick="toggleAma()">
+        Amazon登録情報 <span id="amaToggle" style="float:right; font-size:12px; color:#0066c0;">▲ 閉じる</span>
+      </div>
+      <div id="amaBody">
         <div class="form-row">
           <div class="form-group medium">
             <label>Ama 単or複</label>
@@ -232,35 +281,6 @@
               <option value="5倍">5倍</option>
               <option value="10倍">10倍</option>
             </select>
-          </div>
-        </div>
-        <div style="border-top:1px solid #eee; padding-top:10px; margin-top:10px;">
-          <div style="font-size:12px; font-weight:bold; color:#565959; margin-bottom:8px;">NextEngine情報</div>
-          <div class="form-row">
-            <div class="form-group medium"><label>NE商品コード</label><input type="text" id="neProductCode" placeholder="NE商品コード"></div>
-            <div class="form-group narrow"><label>NE販売価格</label><input type="number" id="neSellingPrice" value="0" min="0"></div>
-            <div class="form-group narrow"><label>NE発注ロット</label><input type="number" id="neOrderLot" value="1" min="1"></div>
-          </div>
-          <div class="form-row">
-            <div class="form-group medium">
-              <label>NE税率</label>
-              <select id="neTaxRate">
-                <option value="10%">10%</option>
-                <option value="8%">8%</option>
-              </select>
-            </div>
-            <div class="form-group medium">
-              <label>NE登録 単or複</label>
-              <select id="neRegistrationType">
-                <option value="単品">単品</option>
-                <option value="複数">複数</option>
-              </select>
-            </div>
-          </div>
-          <div class="form-row" id="neVariationFields" style="display:none;">
-            <div class="form-group medium"><label>NE代表コード(バリのみ)</label><input type="text" id="neRepresentativeCode"></div>
-            <div class="form-group medium"><label>NE内訳コード(複数のみ)</label><input type="text" id="neBreakdownCode"></div>
-            <div class="form-group narrow"><label>NE内訳数量</label><input type="number" id="neBreakdownQty" value="0" min="0"></div>
           </div>
         </div>
       </div>
@@ -324,11 +344,11 @@
         <div class="form-row">
           <div class="form-group narrow">
             <label>卸価格（税抜）</label>
-            <input type="number" id="wholesalePrice" value="0" min="0" oninput="recalcAll()">
+            <input type="number" id="wholesalePrice" value="0" min="0" oninput="recalcAll(); calcNeSellingPrice()">
           </div>
           <div class="form-group" style="width:80px;">
             <label>税率</label>
-            <select id="taxRate" onchange="recalcAll()">
+            <select id="taxRate" onchange="recalcAll(); calcNeSellingPrice()">
               <option value="10">10%</option>
               <option value="8">8%</option>
             </select>
@@ -394,6 +414,7 @@
     // ===== 初期化 =====
     document.addEventListener('DOMContentLoaded', () => {
       loadSupplierList();
+      loadShippingList();
       // URLパラメータでASINが渡された場合、自動検索
       const params = new URLSearchParams(window.location.search);
       const asin = params.get('asin');
@@ -515,22 +536,61 @@
       if (d.manufacturer) document.getElementById('supplierName').value = d.manufacturer;
     }
 
+    let shippingData = [];
+
     function showPanels() {
-      document.getElementById('calcPanel').classList.remove('hidden');
       document.getElementById('supplierPanel').classList.remove('hidden');
       document.getElementById('nePanel').classList.remove('hidden');
+      document.getElementById('amaPanel').classList.remove('hidden');
+      document.getElementById('calcPanel').classList.remove('hidden');
       document.getElementById('actionButtons').classList.remove('hidden');
     }
 
     function toggleNe() {
       const body = document.getElementById('neBody');
       const toggle = document.getElementById('neToggle');
-      if (body.style.display === 'none') {
-        body.style.display = '';
-        toggle.textContent = '▲ 閉じる';
-      } else {
-        body.style.display = 'none';
-        toggle.textContent = '▼ 開く';
+      if (body.style.display === 'none') { body.style.display = ''; toggle.textContent = '▲ 閉じる'; }
+      else { body.style.display = 'none'; toggle.textContent = '▼ 開く'; }
+    }
+
+    function toggleAma() {
+      const body = document.getElementById('amaBody');
+      const toggle = document.getElementById('amaToggle');
+      if (body.style.display === 'none') { body.style.display = ''; toggle.textContent = '▲ 閉じる'; }
+      else { body.style.display = 'none'; toggle.textContent = '▼ 開く'; }
+    }
+
+    async function loadShippingList() {
+      try {
+        const res = await fetch('./api/shipping');
+        shippingData = await res.json();
+        const sel = document.getElementById('neShippingMethod');
+        sel.innerHTML = '<option value="">選択してください</option>';
+        shippingData.forEach((s, i) => {
+          const opt = document.createElement('option');
+          opt.value = i;
+          opt.textContent = `${s.name}（¥${s.total}）`;
+          sel.appendChild(opt);
+        });
+      } catch (e) { console.error('送料読み込みエラー:', e); }
+    }
+
+    // NE販売価格自動計算: 利益率20%
+    // 販売価格 * 0.9 - 原価税込 - 送料 = 販売価格 * 0.2
+    // 販売価格 = (原価税込 + 送料) / 0.7
+    function calcNeSellingPrice() {
+      const idx = document.getElementById('neShippingMethod').value;
+      if (idx === '') { document.getElementById('neShippingCost').value = 0; return; }
+      const shippingCost = shippingData[parseInt(idx)].total;
+      document.getElementById('neShippingCost').value = shippingCost;
+
+      const wholesale = parseInt(document.getElementById('wholesalePrice').value) || 0;
+      const taxRate = parseInt(document.getElementById('taxRate').value) || 10;
+      const costWithTax = Math.ceil(wholesale * (1 + taxRate / 100));
+
+      if (costWithTax > 0) {
+        const nePrice = Math.ceil((costWithTax + shippingCost) / 0.7);
+        document.getElementById('neSellingPrice').value = nePrice;
       }
     }
 
@@ -780,6 +840,7 @@
       document.getElementById('calcPanel').classList.add('hidden');
       document.getElementById('supplierPanel').classList.add('hidden');
       document.getElementById('nePanel').classList.add('hidden');
+      document.getElementById('amaPanel').classList.add('hidden');
       document.getElementById('actionButtons').classList.add('hidden');
       document.getElementById('btnSave').disabled = true;
       ['wholesalePrice', 'sellingPrice', 'fbmShipping', 'lossStopper', 'highStopper'].forEach(id => document.getElementById(id).value = '0');
@@ -795,6 +856,8 @@
       document.getElementById('pointRate').value = '1倍';
       document.getElementById('neRegistrationType').value = '単品';
       document.getElementById('neTaxRate').value = '10%';
+      document.getElementById('neShippingMethod').selectedIndex = 0;
+      document.getElementById('neShippingCost').value = '0';
       document.getElementById('neVariationFields').style.display = 'none';
       onFulfillmentChange();
       hideError();
