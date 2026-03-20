@@ -6,7 +6,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { getProduct, getFees } from './sp-api.js';
 import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, getProducts, updateProductStatus, updateProduct } from './db.js';
-import { loadSuppliers, addSupplier } from './suppliers.js';
+import { loadSuppliers, addSupplier, deleteSupplier } from './suppliers.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -184,6 +184,17 @@ router.post('/api/suppliers', (req, res) => {
     const { code, name } = req.body;
     if (!code || !name) return res.status(400).json({ error: 'コードと名前は必須です' });
     const suppliers = addSupplier({ code, name });
+    res.json(suppliers);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.delete('/api/suppliers', (req, res) => {
+  try {
+    const { code } = req.body;
+    if (!code) return res.status(400).json({ error: 'コードは必須です' });
+    const suppliers = deleteSupplier(code);
     res.json(suppliers);
   } catch (err) {
     res.status(500).json({ error: err.message });

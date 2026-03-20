@@ -37,6 +37,14 @@ export function addSupplier(supplier) {
   } else {
     suppliers.push(supplier);
   }
+  suppliers.sort((a, b) => a.code.localeCompare(b.code));
   saveSuppliers(suppliers);
   return suppliers;
+}
+
+export function deleteSupplier(code) {
+  const suppliers = loadSuppliers();
+  const filtered = suppliers.filter(s => s.code !== code);
+  saveSuppliers(filtered);
+  return filtered;
 }

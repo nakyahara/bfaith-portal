@@ -132,6 +132,7 @@
   <div class="container">
     <div class="filter-bar">
       <button class="btn btn-add" onclick="openNewModal()">+ 新規登録</button>
+      <button class="btn" style="background:#fff; border-color:#888; color:#565959;" onclick="openSupplierModal()">仕入れ先管理</button>
       <select id="statusFilter" onchange="loadData()">
         <option value="">全ステータス</option>
         <option value="リサーチ">リサーチ</option>
@@ -228,6 +229,45 @@
           <option value="見積もり依頼中" selected>見積もり依頼中</option>
         </select>
         <button class="btn btn-add" onclick="submitNew()">登録</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 仕入れ先管理モーダル -->
+  <div class="modal-overlay" id="supplierModal" onclick="if(event.target===this)closeSupplierModal()">
+    <div class="modal">
+      <div class="modal-header">
+        <h2>仕入れ先マスタ管理</h2>
+        <button class="modal-close" onclick="closeSupplierModal()">&times;</button>
+      </div>
+      <div class="modal-body">
+        <!-- 新規追加フォーム -->
+        <div style="background:#f7f8f8; border:1px solid #d5d9d9; border-radius:6px; padding:12px 16px; margin-bottom:14px;">
+          <div style="font-size:13px; font-weight:bold; margin-bottom:8px;">新しい仕入れ先を追加</div>
+          <div style="display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap;">
+            <div class="modal-field" style="width:100px;">
+              <label>コード</label>
+              <input type="text" id="sup-new-code" placeholder="0048" maxlength="4">
+            </div>
+            <div class="modal-field" style="flex:1; min-width:200px;">
+              <label>仕入れ先名</label>
+              <input type="text" id="sup-new-name" placeholder="例: 新規メーカー様">
+            </div>
+            <button class="btn btn-primary" onclick="addNewSupplier()">追加</button>
+          </div>
+        </div>
+        <!-- 検索 -->
+        <div style="margin-bottom:10px;">
+          <input type="text" id="sup-search" placeholder="コード・名前で検索" oninput="filterSupplierTable()" style="padding:5px 8px; border:1px solid #aaa; border-radius:4px; font-size:13px; width:250px;">
+          <span id="sup-count" style="margin-left:8px; font-size:12px; color:#565959;"></span>
+        </div>
+        <!-- 一覧テーブル -->
+        <div style="max-height:400px; overflow-y:auto; border:1px solid #d5d9d9; border-radius:4px;">
+          <table class="data-table" style="margin:0; border:none;">
+            <thead><tr><th style="width:80px;">コード</th><th>仕入れ先名</th><th style="width:60px;">操作</th></tr></thead>
+            <tbody id="sup-table-body"></tbody>
+          </table>
+        </div>
       </div>
     </div>
   </div>
@@ -706,6 +746,80 @@
       if (opt && opt.dataset.name) {
         document.getElementById('new-supplier-name').value = opt.dataset.name;
       }
+    }
+
+    // === 仕入れ先管理モーダル ===
+    function openSupplierModal() {
+      document.getElementById('supplierModal').classList.add('open');
+      renderSupplierTable();
+    }
+    function closeSupplierModal() {
+      document.getElementById('supplierModal').classList.remove('open');
+      // ドロップダウンを最新に更新
+      populateSupplierDropdown('new-supplier-code');
+      // 展開パネルがあれば再描画
+      if (expandedId) renderTable(allData);
+    }
+
+    function renderSupplierTable(filter) {
+      const tbody = document.getElementById('sup-table-body');
+      let list = supplierList;
+      if (filter) {
+        const q = filter.toLowerCase();
+        list = list.filter(s => s.code.includes(q) || s.name.toLowerCase().includes(q));
+      }
+      document.getElementById('sup-count').textContent = `${list.length}件`;
+      tbody.innerHTML = list.map(s => `<tr>
+        <td style="font-weight:bold;">${esc(s.code)}</td>
+        <td>${esc(s.name)}</td>
+        <td><button class="btn btn-sm btn-danger" onclick="deleteSupplier('${esc(s.code)}')" style="font-size:10px;">削除</button></td>
+      </tr>`).join('');
+    }
+
+    function filterSupplierTable() {
+      const q = document.getElementById('sup-search').value.trim();
+      renderSupplierTable(q);
+    }
+
+    async function addNewSupplier() {
+      const code = document.getElementById('sup-new-code').value.trim();
+      const name = document.getElementById('sup-new-name').value.trim();
+      if (!code || !name) { showToast('コードと名前を入力してください'); return; }
+      if (supplierList.find(s => s.code === code)) { showToast('このコードは既に登録されています'); return; }
+
+      try {
+        const res = await fetch('./api/suppliers', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code, name }),
+        });
+        if (res.ok) {
+          supplierList = await res.json();
+          document.getElementById('sup-new-code').value = '';
+          document.getElementById('sup-new-name').value = '';
+          renderSupplierTable();
+          showToast(`仕入れ先「${name}」を追加しました`);
+        }
+      } catch (err) { showToast('追加エラー: ' + err.message); }
+    }
+
+    async function deleteSupplier(code) {
+      const s = supplierList.find(x => x.code === code);
+      if (!confirm(`「${s ? s.name : code}」を削除しますか？`)) return;
+      try {
+        const res = await fetch('./api/suppliers', {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code }),
+        });
+        if (res.ok) {
+          supplierList = await res.json();
+          renderSupplierTable(document.getElementById('sup-search').value.trim());
+          showToast('削除しました');
+        } else {
+          showToast('削除に失敗しました');
+        }
+      } catch (err) { showToast('削除エラー: ' + err.message); }
     }
 
     // === 新規登録モーダル ===
