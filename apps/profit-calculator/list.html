@@ -480,7 +480,7 @@
               <button class="btn btn-primary" onclick="saveAllDetail(${r.id})">
                 全項目を保存
               </button>
-              ${r.asin && r.asin !== 'UNKNOWN' ? `<button class="btn btn-sm" style="background:#fff8e6; border-color:#b8860b; color:#856404;" onclick="goToCalc('${r.asin}')">商品計算へ →</button>` : ''}
+              <button class="btn btn-sm" style="background:#fff8e6; border-color:#b8860b; color:#856404;" onclick="goToCalc(${r.id})">商品計算へ →</button>
               <span class="saved-msg" id="d-saved-answer-${r.id}">保存しました</span>
               ${r.quote_responded_at ? `<span style="font-size:11px; color:#1864ab;">回答日: ${r.quote_responded_at}</span>` : ''}
             </div>
@@ -612,9 +612,17 @@
       } catch (err) { showToast('エラー: ' + err.message); }
     }
 
-    // === 商品計算へ遷移 ===
-    function goToCalc(asin) {
-      window.location.href = `./?asin=${encodeURIComponent(asin)}`;
+    // === 商品計算へ遷移（リサーチデータを引き継ぎ） ===
+    function goToCalc(id) {
+      const r = allData.find(d => d.id === id);
+      if (!r) return;
+      const params = new URLSearchParams();
+      if (r.asin && r.asin !== 'UNKNOWN') params.set('asin', r.asin);
+      if (r.wholesale_price) params.set('wholesale', r.wholesale_price);
+      if (r.tax_rate) params.set('tax', String(r.tax_rate).replace('%', ''));
+      if (r.lot) params.set('lot', r.lot);
+      if (r.supplier_code) params.set('supplier', r.supplier_code);
+      window.location.href = `./?${params.toString()}`;
     }
 
     // === 詳細パネル内の即時再計算（税込のみ） ===

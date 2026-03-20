@@ -185,7 +185,7 @@
             <label>メーカー/問屋名</label>
             <input type="text" id="supplierName" placeholder="SP-APIから自動取得 or 手入力">
           </div>
-          <button class="btn btn-primary" onclick="saveNewSupplier()" style="font-size:12px;">追加</button>
+          <button class="btn btn-primary" onclick="saveNewSupplier()" style="font-size:12px;" title="仕入れ先マスタに新規追加">仕入れ先を新規追加</button>
         </div>
         <div class="form-row">
           <div class="form-group medium"><label>型番</label><input type="text" id="modelNumber" placeholder="SP-APIから自動取得"></div>
@@ -195,8 +195,11 @@
         <div class="form-row">
           <div class="form-group wide"><label>メーカーURL</label><input type="url" id="makerUrl" placeholder="https://..."></div>
         </div>
-        <div class="form-row">
-          <div class="form-group wide"><label>コメント</label><input type="text" id="comment" placeholder="備考"></div>
+        <div style="margin-top:6px;">
+          <span style="font-size:12px; color:#0066c0; cursor:pointer;" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'':'none'; this.textContent=this.nextElementSibling.style.display==='none'?'▼ コメント':'▲ コメント'">▼ コメント</span>
+          <div class="form-row" style="display:none; margin-top:4px;">
+            <div class="form-group wide"><input type="text" id="comment" placeholder="備考"></div>
+          </div>
         </div>
       </div>
     </div>
@@ -221,12 +224,12 @@
           </div>
         </div>
         <div class="form-row">
+          <div class="form-group narrow"><label>NE発注ロット</label><input type="number" id="neOrderLot" value="1" min="1"></div>
           <div class="form-group narrow">
             <label>NE販売価格</label>
             <input type="number" id="neSellingPrice" value="0" min="0">
-            <span style="font-size:10px; color:#0066c0;">利益率20%で自動算出</span>
           </div>
-          <div class="form-group narrow"><label>NE発注ロット</label><input type="number" id="neOrderLot" value="1" min="1"></div>
+          <span style="font-size:10px; color:#0066c0; align-self:flex-end; padding-bottom:6px;">利益率20%で自動算出</span>
           <div class="form-group medium">
             <label>NE税率</label>
             <select id="neTaxRate">
@@ -315,7 +318,7 @@
         <tr class="sub" id="fbaFeeRow"><td>FBA配送料</td><td id="dispFbaFee">-</td></tr>
         <tr class="sub hidden" id="fbmShippingRow">
           <td>配送料（自社）</td>
-          <td><input type="number" id="fbmShipping" value="0" min="0" style="width:80px; text-align:right; padding:3px 6px; border:1px solid #888; border-radius:3px; font-size:12px;" oninput="recalcAll()"></td>
+          <td><input type="number" id="fbmShipping" value="0" min="0" style="width:120px; text-align:right; padding:5px 8px; border:1px solid #888; border-radius:4px; font-size:13px;" oninput="recalcAll()"></td>
         </tr>
       </table>
 
@@ -395,10 +398,10 @@
     </div>
 
     <!-- ========== セクション5: 登録ボタン ========== -->
-    <div class="actions hidden" id="actionButtons">
-      <button class="btn btn-save" id="btnSave" onclick="saveAll()" disabled>商品登録DBに保存</button>
-      <button class="btn" style="background:#fff;" onclick="resetAll()">リセット</button>
+    <div class="actions hidden" id="actionButtons" style="justify-content:flex-end;">
       <div class="loading" id="loadingSave"><div class="spinner"></div>保存中...</div>
+      <button class="btn" style="background:#fff;" onclick="resetAll()">リセット</button>
+      <button class="btn btn-save" id="btnSave" onclick="saveAll()" disabled>商品登録DBに保存</button>
     </div>
   </div>
 
@@ -421,6 +424,24 @@
       if (asin) {
         document.getElementById('asinInput').value = asin;
         searchProduct();
+      }
+      // リサーチからの引き継ぎパラメータ
+      const taxParam = params.get('tax');
+      if (taxParam) document.getElementById('taxRate').value = taxParam;
+      const lotParam = params.get('lot');
+      if (lotParam) {
+        document.getElementById('lot').value = lotParam;
+        document.getElementById('neOrderLot').value = lotParam;
+      }
+      const wholesaleParam = params.get('wholesale');
+      if (wholesaleParam) document.getElementById('wholesalePrice').value = wholesaleParam;
+      const supplierParam = params.get('supplier');
+      if (supplierParam) {
+        // 仕入れ先リスト読み込み後にセット
+        setTimeout(() => {
+          document.getElementById('supplierSelect').value = supplierParam;
+          onSupplierChange();
+        }, 500);
       }
       // バリエーション/複数の条件付きフィールド表示制御
       document.getElementById('variationFlag').addEventListener('change', toggleNeVariation);
@@ -564,12 +585,14 @@
       try {
         const res = await fetch('./api/shipping');
         shippingData = await res.json();
+        // 配送関係費合計の小さい順にソート
+        shippingData.sort((a, b) => (a.total || 0) - (b.total || 0));
         const sel = document.getElementById('neShippingMethod');
         sel.innerHTML = '<option value="">選択してください</option>';
         shippingData.forEach((s, i) => {
           const opt = document.createElement('option');
           opt.value = i;
-          opt.textContent = `${s.name}（¥${s.total}）`;
+          opt.textContent = `${s.name}（¥${s.total.toLocaleString()}）`;
           sel.appendChild(opt);
         });
       } catch (e) { console.error('送料読み込みエラー:', e); }
