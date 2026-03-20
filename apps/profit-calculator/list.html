@@ -95,6 +95,26 @@
     .actions-cell { display: flex; gap: 4px; flex-wrap: wrap; }
     .expand-icon { font-size: 10px; color: #888; transition: transform 0.2s; display: inline-block; width: 16px; text-align: center; }
     .expanded .expand-icon { transform: rotate(90deg); }
+
+    /* 新規登録モーダル */
+    .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 200; justify-content: center; align-items: flex-start; padding-top: 40px; }
+    .modal-overlay.open { display: flex; }
+    .modal { background: #fff; border-radius: 8px; width: 700px; max-width: 95vw; max-height: 85vh; overflow-y: auto; box-shadow: 0 4px 20px rgba(0,0,0,0.3); }
+    .modal-header { background: #232f3e; color: #fff; padding: 12px 20px; border-radius: 8px 8px 0 0; display: flex; justify-content: space-between; align-items: center; }
+    .modal-header h2 { font-size: 15px; }
+    .modal-close { background: none; border: none; color: #fff; font-size: 20px; cursor: pointer; padding: 0 4px; }
+    .modal-body { padding: 20px; }
+    .modal-form { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 16px; }
+    .modal-form.full { grid-template-columns: 1fr; }
+    .modal-field { display: flex; flex-direction: column; gap: 3px; }
+    .modal-field label { font-size: 11px; font-weight: bold; color: #565959; }
+    .modal-field input, .modal-field select, .modal-field textarea { padding: 6px 8px; border: 1px solid #aaa; border-radius: 4px; font-size: 13px; }
+    .modal-field input:focus, .modal-field select:focus, .modal-field textarea:focus { border-color: #e77600; outline: none; box-shadow: 0 0 3px #e77600; }
+    .modal-field textarea { resize: vertical; min-height: 60px; }
+    .modal-field .hint { font-size: 10px; color: #888; }
+    .modal-section { font-size: 13px; font-weight: bold; margin-top: 10px; padding-top: 10px; border-top: 1px solid #eee; grid-column: 1 / -1; color: #232f3e; }
+    .modal-footer { padding: 12px 20px; border-top: 1px solid #eee; display: flex; gap: 10px; justify-content: flex-end; }
+    .btn-add { background: #ff9900; border-color: #c77600; color: #0f1111; font-size: 14px; padding: 8px 24px; }
   </style>
 </head>
 <body>
@@ -110,6 +130,7 @@
 
   <div class="container">
     <div class="filter-bar">
+      <button class="btn btn-add" onclick="openNewModal()">+ 新規登録</button>
       <select id="statusFilter" onchange="loadData()">
         <option value="">全ステータス</option>
         <option value="リサーチ">リサーチ</option>
@@ -125,6 +146,85 @@
   </div>
 
   <div class="toast" id="toast"></div>
+
+  <!-- 新規登録モーダル -->
+  <div class="modal-overlay" id="newModal" onclick="if(event.target===this)closeNewModal()">
+    <div class="modal">
+      <div class="modal-header">
+        <h2>リサーチ新規登録</h2>
+        <button class="modal-close" onclick="closeNewModal()">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-form">
+          <div class="modal-field">
+            <label>ASIN</label>
+            <input type="text" id="new-asin" placeholder="B000FQK36A" maxlength="10">
+            <span class="hint">入力するとSP-APIから商品情報を自動取得</span>
+          </div>
+          <div class="modal-field">
+            <label>商品名</label>
+            <input type="text" id="new-product-name" placeholder="商品名（ASIN検索で自動取得可）">
+          </div>
+
+          <div class="modal-section">仕入れ先情報</div>
+          <div class="modal-field">
+            <label>仕入れ先コード</label>
+            <input type="text" id="new-supplier-code" placeholder="0001">
+          </div>
+          <div class="modal-field">
+            <label>メーカー/問屋名</label>
+            <input type="text" id="new-supplier-name">
+          </div>
+          <div class="modal-field">
+            <label>型番</label>
+            <input type="text" id="new-part-number">
+          </div>
+          <div class="modal-field">
+            <label>JAN</label>
+            <input type="text" id="new-jan">
+          </div>
+          <div class="modal-field">
+            <label>内容量</label>
+            <input type="text" id="new-quantity">
+          </div>
+          <div class="modal-field">
+            <label>賞味期限</label>
+            <input type="text" id="new-expiry" placeholder="例: 12ヶ月">
+          </div>
+
+          <div class="modal-section">見積もり</div>
+          <div class="modal-field">
+            <label>メーカーURL</label>
+            <input type="url" id="new-maker-url" placeholder="https://...">
+          </div>
+          <div class="modal-field">
+            <label>見積書URL</label>
+            <input type="url" id="new-quote-url" placeholder="https://...">
+          </div>
+        </div>
+        <div class="modal-form full" style="margin-top: 8px;">
+          <div class="modal-field">
+            <label>見積もり依頼メモ</label>
+            <textarea id="new-quote-note" placeholder="例: アメージングクラフト様に見積もり依頼。100個ロットで打診。"></textarea>
+          </div>
+          <div class="modal-field">
+            <label>コメント</label>
+            <textarea id="new-comment" placeholder="備考"></textarea>
+          </div>
+        </div>
+        <div style="margin-top: 12px; padding: 10px; background: #f7f8f8; border-radius: 4px; font-size: 12px; color: #565959;">
+          <b>登録方法:</b><br>
+          <b>「リサーチとして登録」</b> — まず商品情報だけ保存（ステータス: リサーチ）<br>
+          <b>「見積もり依頼として登録」</b> — 仕入れ先情報と一緒に保存（ステータス: 見積もり依頼中）
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" style="background:#fff;" onclick="closeNewModal()">キャンセル</button>
+        <button class="btn btn-primary" onclick="submitNew('リサーチ')">リサーチとして登録</button>
+        <button class="btn btn-quote" onclick="submitNew('見積もり依頼中')">見積もり依頼として登録</button>
+      </div>
+    </div>
+  </div>
 
   <script>
     let debounceTimer = null;
@@ -552,6 +652,107 @@
         showToast('商品登録に転送しました');
         loadData();
       }
+    }
+
+    // === 新規登録モーダル ===
+    function openNewModal() {
+      document.getElementById('newModal').classList.add('open');
+      document.getElementById('new-asin').focus();
+    }
+    function closeNewModal() {
+      document.getElementById('newModal').classList.remove('open');
+    }
+
+    // ASIN入力でEnter → SP-APIから商品情報取得
+    document.addEventListener('DOMContentLoaded', () => {
+      const asinEl = document.getElementById('new-asin');
+      if (asinEl) {
+        asinEl.addEventListener('keypress', async e => {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            await fetchProductForNew();
+          }
+        });
+        asinEl.addEventListener('blur', async () => {
+          const val = asinEl.value.trim();
+          if (val.match(/^B[0-9A-Z]{9}$/) && !document.getElementById('new-product-name').value) {
+            await fetchProductForNew();
+          }
+        });
+      }
+    });
+
+    async function fetchProductForNew() {
+      const asin = document.getElementById('new-asin').value.trim();
+      if (!asin.match(/^B[0-9A-Z]{9}$/)) return;
+      try {
+        showToast('商品情報を取得中...');
+        const res = await fetch(`./api/product/${asin}`);
+        if (!res.ok) return;
+        const d = await res.json();
+        if (d.itemName) document.getElementById('new-product-name').value = d.itemName;
+        if (d.jan) document.getElementById('new-jan').value = d.jan;
+        if (d.partNumber) document.getElementById('new-part-number').value = d.partNumber;
+        if (d.manufacturer) document.getElementById('new-supplier-name').value = d.manufacturer;
+        showToast('商品情報を取得しました');
+      } catch (err) {
+        showToast('商品情報の取得に失敗: ' + err.message);
+      }
+    }
+
+    async function submitNew(status) {
+      const asin = document.getElementById('new-asin').value.trim();
+      const productName = document.getElementById('new-product-name').value.trim();
+      if (!asin && !productName) {
+        showToast('ASINまたは商品名を入力してください');
+        return;
+      }
+
+      const today = new Date().toISOString().slice(0, 10);
+      const body = {
+        asin: asin || 'UNKNOWN',
+        productName: productName,
+        amazonUrl: asin ? `https://www.amazon.co.jp/dp/${asin}` : '',
+        supplierCode: document.getElementById('new-supplier-code').value,
+        supplierName: document.getElementById('new-supplier-name').value,
+        partNumber: document.getElementById('new-part-number').value,
+        jan: document.getElementById('new-jan').value,
+        quantity: document.getElementById('new-quantity').value,
+        expiryDate: document.getElementById('new-expiry').value,
+        makerUrl: document.getElementById('new-maker-url').value,
+        quoteUrl: document.getElementById('new-quote-url').value,
+        quoteNote: document.getElementById('new-quote-note').value,
+        comment: document.getElementById('new-comment').value,
+        quoteRequestedAt: status === '見積もり依頼中' ? today : null,
+        status: status,
+      };
+
+      try {
+        const res = await fetch('./api/research', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (res.ok) {
+          const result = await res.json();
+          closeNewModal();
+          clearNewForm();
+          showToast(status === '見積もり依頼中'
+            ? `見積もり依頼として登録しました (ID: ${result.id})`
+            : `リサーチに登録しました (ID: ${result.id})`);
+          loadData();
+        }
+      } catch (err) {
+        showToast('エラー: ' + err.message);
+      }
+    }
+
+    function clearNewForm() {
+      ['new-asin','new-product-name','new-supplier-code','new-supplier-name',
+       'new-part-number','new-jan','new-quantity','new-expiry',
+       'new-maker-url','new-quote-url','new-quote-note','new-comment'].forEach(id => {
+        document.getElementById(id).value = '';
+      });
     }
 
     function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
