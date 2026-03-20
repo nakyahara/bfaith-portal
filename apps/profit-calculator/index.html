@@ -201,7 +201,72 @@
       </div>
     </div>
 
-    <!-- ========== セクション3: 価格・手数料計算（メイン） ========== -->
+    <!-- ========== セクション3: NE・Amazon登録情報 ========== -->
+    <div class="panel hidden" id="nePanel">
+      <div class="panel-title" style="cursor:pointer;" onclick="toggleNe()">
+        NE・Amazon登録情報 <span id="neToggle" style="float:right; font-size:12px; color:#0066c0;">▲ 閉じる</span>
+      </div>
+      <div id="neBody">
+        <div class="form-row">
+          <div class="form-group medium">
+            <label>Ama 単or複</label>
+            <select id="amaSingleOrSet">
+              <option value="単品" selected>単品</option>
+              <option value="セット">セット</option>
+              <option value="アソート">アソート</option>
+            </select>
+          </div>
+          <div class="form-group medium">
+            <label>バリエーション有無</label>
+            <select id="variationFlag">
+              <option value="なし" selected>なし</option>
+              <option value="あり">あり</option>
+            </select>
+          </div>
+          <div class="form-group medium">
+            <label>Amazonポイント倍率</label>
+            <select id="pointRate">
+              <option value="1倍" selected>1倍</option>
+              <option value="2倍">2倍</option>
+              <option value="3倍">3倍</option>
+              <option value="5倍">5倍</option>
+              <option value="10倍">10倍</option>
+            </select>
+          </div>
+        </div>
+        <div style="border-top:1px solid #eee; padding-top:10px; margin-top:10px;">
+          <div style="font-size:12px; font-weight:bold; color:#565959; margin-bottom:8px;">NextEngine情報</div>
+          <div class="form-row">
+            <div class="form-group medium"><label>NE商品コード</label><input type="text" id="neProductCode" placeholder="NE商品コード"></div>
+            <div class="form-group narrow"><label>NE販売価格</label><input type="number" id="neSellingPrice" value="0" min="0"></div>
+            <div class="form-group narrow"><label>NE発注ロット</label><input type="number" id="neOrderLot" value="1" min="1"></div>
+          </div>
+          <div class="form-row">
+            <div class="form-group medium">
+              <label>NE税率</label>
+              <select id="neTaxRate">
+                <option value="10%">10%</option>
+                <option value="8%">8%</option>
+              </select>
+            </div>
+            <div class="form-group medium">
+              <label>NE登録 単or複</label>
+              <select id="neRegistrationType">
+                <option value="単品">単品</option>
+                <option value="複数">複数</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-row" id="neVariationFields" style="display:none;">
+            <div class="form-group medium"><label>NE代表コード(バリのみ)</label><input type="text" id="neRepresentativeCode"></div>
+            <div class="form-group medium"><label>NE内訳コード(複数のみ)</label><input type="text" id="neBreakdownCode"></div>
+            <div class="form-group narrow"><label>NE内訳数量</label><input type="number" id="neBreakdownQty" value="0" min="0"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ========== セクション4: 価格・手数料計算（メイン） ========== -->
     <div class="panel hidden" id="calcPanel">
       <div class="panel-title">価格・手数料計算</div>
 
@@ -274,7 +339,7 @@
           </div>
           <div class="form-group" style="width:80px;">
             <label>ロット</label>
-            <input type="number" id="lot" value="1" min="1">
+            <input type="number" id="lot" value="1" min="1" oninput="syncLotToNe()">
           </div>
         </div>
       </div>
@@ -304,73 +369,6 @@
               <option value="最安値">最安値</option>
               <option value="手動">手動</option>
             </select>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- ========== セクション4: NE・Amazon登録情報 ========== -->
-    <div class="panel hidden" id="nePanel">
-      <div class="panel-title" style="cursor:pointer;" onclick="toggleNe()">
-        NE・Amazon登録情報 <span id="neToggle" style="float:right; font-size:12px; color:#0066c0;">▲ 閉じる</span>
-      </div>
-      <div id="neBody">
-        <div class="form-row">
-          <div class="form-group medium">
-            <label>Ama 単or複</label>
-            <select id="amaSingleOrSet">
-              <option value="単品" selected>単品</option>
-              <option value="セット">セット</option>
-              <option value="アソート">アソート</option>
-            </select>
-          </div>
-          <div class="form-group medium">
-            <label>バリエーション有無</label>
-            <select id="variationFlag">
-              <option value="なし" selected>なし</option>
-              <option value="あり">あり</option>
-            </select>
-          </div>
-          <div class="form-group medium">
-            <label>ポイント倍率</label>
-            <select id="pointRate">
-              <option value="1倍" selected>1倍</option>
-              <option value="2倍">2倍</option>
-              <option value="3倍">3倍</option>
-              <option value="5倍">5倍</option>
-              <option value="10倍">10倍</option>
-            </select>
-          </div>
-        </div>
-        <div style="border-top:1px solid #eee; padding-top:10px; margin-top:10px;">
-          <div style="font-size:12px; font-weight:bold; color:#565959; margin-bottom:8px;">NextEngine情報</div>
-          <div class="form-row">
-            <div class="form-group medium"><label>NE商品コード</label><input type="text" id="neProductCode" placeholder="NE商品コード"></div>
-            <div class="form-group medium"><label>NE仕入先コード</label><input type="text" id="neSupplierCode" placeholder="仕入先コード"></div>
-            <div class="form-group narrow"><label>NE仕入価格(税抜)</label><input type="number" id="neCostExclTax" value="0" min="0"></div>
-          </div>
-          <div class="form-row">
-            <div class="form-group narrow"><label>NE販売価格</label><input type="number" id="neSellingPrice" value="0" min="0"></div>
-            <div class="form-group narrow"><label>NE発注ロット</label><input type="number" id="neOrderLot" value="1" min="1"></div>
-            <div class="form-group medium">
-              <label>NE税率</label>
-              <select id="neTaxRate">
-                <option value="10%">10%</option>
-                <option value="8%">8%</option>
-              </select>
-            </div>
-            <div class="form-group medium">
-              <label>NE登録 単or複</label>
-              <select id="neRegistrationType">
-                <option value="単品">単品</option>
-                <option value="複数">複数</option>
-              </select>
-            </div>
-          </div>
-          <div class="form-row" id="neVariationFields" style="display:none;">
-            <div class="form-group medium"><label>NE代表コード(バリのみ)</label><input type="text" id="neRepresentativeCode"></div>
-            <div class="form-group medium"><label>NE内訳コード(複数のみ)</label><input type="text" id="neBreakdownCode"></div>
-            <div class="form-group narrow"><label>NE内訳数量</label><input type="number" id="neBreakdownQty" value="0" min="0"></div>
           </div>
         </div>
       </div>
@@ -407,6 +405,10 @@
       document.getElementById('variationFlag').addEventListener('change', toggleNeVariation);
       document.getElementById('neRegistrationType').addEventListener('change', toggleNeVariation);
     });
+
+    function syncLotToNe() {
+      document.getElementById('neOrderLot').value = document.getElementById('lot').value;
+    }
 
     function toggleNeVariation() {
       const hasVariation = document.getElementById('variationFlag').value === 'あり';
@@ -733,10 +735,10 @@
         amaSingleOrSet: document.getElementById('amaSingleOrSet').value,
         variationFlag: document.getElementById('variationFlag').value,
         neProductCode: document.getElementById('neProductCode').value || null,
-        neSupplierCode: document.getElementById('neSupplierCode').value || null,
-        neCostExclTax: parseInt(document.getElementById('neCostExclTax').value) || 0,
+        neSupplierCode: sel.value || null,
+        neCostExclTax: wholesale,
         neSellingPrice: parseInt(document.getElementById('neSellingPrice').value) || 0,
-        neOrderLot: parseInt(document.getElementById('neOrderLot').value) || 1,
+        neOrderLot: parseInt(document.getElementById('neOrderLot').value) || parseInt(document.getElementById('lot').value) || 1,
         neTaxRate: document.getElementById('neTaxRate').value,
         neRegistrationType: document.getElementById('neRegistrationType').value,
         neRepresentativeCode: document.getElementById('neRepresentativeCode').value || null,
@@ -782,8 +784,8 @@
       document.getElementById('btnSave').disabled = true;
       ['wholesalePrice', 'sellingPrice', 'fbmShipping', 'lossStopper', 'highStopper'].forEach(id => document.getElementById(id).value = '0');
       ['modelNumber', 'janCode', 'quantity', 'makerUrl', 'comment', 'supplierName'].forEach(id => document.getElementById(id).value = '');
-      ['neProductCode', 'neSupplierCode', 'neRepresentativeCode', 'neBreakdownCode'].forEach(id => document.getElementById(id).value = '');
-      ['neCostExclTax', 'neSellingPrice', 'neBreakdownQty'].forEach(id => document.getElementById(id).value = '0');
+      ['neProductCode', 'neRepresentativeCode', 'neBreakdownCode'].forEach(id => document.getElementById(id).value = '');
+      ['neSellingPrice', 'neBreakdownQty'].forEach(id => document.getElementById(id).value = '0');
       document.getElementById('neOrderLot').value = '1';
       document.getElementById('supplierSelect').selectedIndex = 0;
       document.getElementById('lot').value = '1';
