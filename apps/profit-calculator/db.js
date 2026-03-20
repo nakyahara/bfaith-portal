@@ -112,27 +112,75 @@ export async function initDb() {
     CREATE TABLE IF NOT EXISTS products (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       research_id INTEGER REFERENCES research(id),
-      asin TEXT NOT NULL,
+      asin TEXT,
       product_name TEXT,
+      amazon_url TEXT,
+      image_url TEXT,
       jan TEXT,
       part_number TEXT,
       supplier_code TEXT,
       supplier_name TEXT,
+      maker_url TEXT,
+      category TEXT,
+      sales_rank INTEGER,
+      offer_count INTEGER,
+      comment TEXT,
+      wholesale_price INTEGER,
+      tax_rate TEXT,
       wholesale_price_with_tax INTEGER,
+      lot INTEGER DEFAULT 1,
       selling_price INTEGER,
+      referral_fee INTEGER,
+      fba_fee INTEGER,
+      storage_fee INTEGER,
       total_fee INTEGER,
       profit INTEGER,
       profit_rate REAL,
+      judgment TEXT,
       fulfillment TEXT DEFAULT 'FBA',
       loss_stopper INTEGER,
       high_stopper INTEGER,
       price_tracking TEXT DEFAULT 'カート',
+      point_rate TEXT DEFAULT '1倍',
+      ama_single_or_set TEXT DEFAULT '単品',
+      variation_flag TEXT DEFAULT 'なし',
       ne_product_code TEXT,
+      ne_supplier_code TEXT,
+      ne_cost_excl_tax INTEGER,
+      ne_selling_price INTEGER,
+      ne_order_lot INTEGER,
+      ne_tax_rate TEXT DEFAULT '10%',
+      ne_registration_type TEXT DEFAULT '単品',
+      ne_representative_code TEXT,
+      ne_breakdown_code TEXT,
+      ne_breakdown_qty INTEGER,
       status TEXT DEFAULT '発注済',
       created_at TEXT DEFAULT (datetime('now','localtime')),
       updated_at TEXT DEFAULT (datetime('now','localtime'))
     )
   `);
+
+  // productsテーブルのマイグレーション
+  const prodCols = queryAll('PRAGMA table_info(products)').map(r => r.name);
+  const newProdCols = [
+    ['amazon_url', 'TEXT'], ['image_url', 'TEXT'], ['maker_url', 'TEXT'],
+    ['category', 'TEXT'], ['sales_rank', 'INTEGER'], ['offer_count', 'INTEGER'],
+    ['comment', 'TEXT'], ['wholesale_price', 'INTEGER'], ['tax_rate', 'TEXT'],
+    ['lot', 'INTEGER DEFAULT 1'], ['referral_fee', 'INTEGER'], ['fba_fee', 'INTEGER'],
+    ['storage_fee', 'INTEGER'], ['judgment', 'TEXT'],
+    ['point_rate', "TEXT DEFAULT '1倍'"], ['ama_single_or_set', "TEXT DEFAULT '単品'"],
+    ['variation_flag', "TEXT DEFAULT 'なし'"],
+    ['ne_supplier_code', 'TEXT'], ['ne_cost_excl_tax', 'INTEGER'],
+    ['ne_selling_price', 'INTEGER'], ['ne_order_lot', 'INTEGER'],
+    ['ne_tax_rate', "TEXT DEFAULT '10%'"], ['ne_registration_type', "TEXT DEFAULT '単品'"],
+    ['ne_representative_code', 'TEXT'], ['ne_breakdown_code', 'TEXT'],
+    ['ne_breakdown_qty', 'INTEGER'],
+  ];
+  for (const [col, type] of newProdCols) {
+    if (!prodCols.includes(col)) {
+      db.run(`ALTER TABLE products ADD COLUMN ${col} ${type}`);
+    }
+  }
 
   saveToFile();
 }
@@ -254,6 +302,43 @@ export function promoteToProduct(researchId) {
   updateResearchStatus(researchId, '発注済');
   saveToFile();
 
+  const result = db.exec('SELECT last_insert_rowid() as id');
+  return result[0].values[0][0];
+}
+
+// 商品を直接保存（商品計算ページから）
+export function saveProduct(data) {
+  const n = (v) => v === undefined ? null : v;
+  db.run(`
+    INSERT INTO products (
+      research_id, asin, product_name, amazon_url, image_url, jan, part_number,
+      supplier_code, supplier_name, maker_url, category, sales_rank, offer_count, comment,
+      wholesale_price, tax_rate, wholesale_price_with_tax, lot,
+      selling_price, referral_fee, fba_fee, storage_fee, total_fee,
+      profit, profit_rate, judgment,
+      fulfillment, loss_stopper, high_stopper, price_tracking, point_rate,
+      ama_single_or_set, variation_flag,
+      ne_product_code, ne_supplier_code, ne_cost_excl_tax, ne_selling_price,
+      ne_order_lot, ne_tax_rate, ne_registration_type,
+      ne_representative_code, ne_breakdown_code, ne_breakdown_qty,
+      status
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+  `, [
+    n(data.researchId), n(data.asin), n(data.productName), n(data.amazonUrl), n(data.imageUrl),
+    n(data.jan), n(data.partNumber),
+    n(data.supplierCode), n(data.supplierName), n(data.makerUrl),
+    n(data.category), n(data.salesRank), n(data.offerCount), n(data.comment),
+    n(data.wholesalePrice), n(data.taxRate), n(data.wholesalePriceWithTax), n(data.lot),
+    n(data.sellingPrice), n(data.referralFee), n(data.fbaFee), n(data.storageFee), n(data.totalFee),
+    n(data.profit), n(data.profitRate), n(data.judgment),
+    n(data.fulfillment), n(data.lossStopper), n(data.highStopper), n(data.priceTracking), n(data.pointRate),
+    n(data.amaSingleOrSet), n(data.variationFlag),
+    n(data.neProductCode), n(data.neSupplierCode), n(data.neCostExclTax), n(data.neSellingPrice),
+    n(data.neOrderLot), n(data.neTaxRate), n(data.neRegistrationType),
+    n(data.neRepresentativeCode), n(data.neBreakdownCode), n(data.neBreakdownQty),
+    data.status || '発注済',
+  ]);
+  saveToFile();
   const result = db.exec('SELECT last_insert_rowid() as id');
   return result[0].values[0][0];
 }

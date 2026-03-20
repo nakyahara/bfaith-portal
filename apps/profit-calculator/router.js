@@ -5,7 +5,7 @@ import { Router } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { getProduct, getFees } from './sp-api.js';
-import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, getProducts, updateProductStatus, updateProduct } from './db.js';
+import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, updateProductStatus, updateProduct } from './db.js';
 import { loadSuppliers, addSupplier, deleteSupplier } from './suppliers.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -126,6 +126,18 @@ router.post('/api/research/:id/promote', async (req, res) => {
     res.json({ productId });
   } catch (err) {
     console.error('[ProfitCalc] 転送エラー:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 商品を直接保存（商品計算ページから）
+router.post('/api/products', async (req, res) => {
+  try {
+    await ensureDb();
+    const id = saveProduct(req.body);
+    res.json({ id });
+  } catch (err) {
+    console.error('[ProfitCalc] 商品保存エラー:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
