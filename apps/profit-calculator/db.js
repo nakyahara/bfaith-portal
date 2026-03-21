@@ -439,6 +439,12 @@ export function saveSetItems(productId, items) {
   saveToFile();
 }
 
+export function deleteProduct(id) {
+  db.run('DELETE FROM product_set_items WHERE product_id = ?', [id]);
+  db.run('DELETE FROM products WHERE id = ?', [id]);
+  saveToFile();
+}
+
 export function getProductById(id) {
   const rows = queryAll('SELECT * FROM products WHERE id = ?', [id]);
   return rows.length > 0 ? rows[0] : null;

@@ -264,6 +264,7 @@
           </div>
         </div>
         <div class="detail-actions">
+          <button class="btn" style="background:#fff0f0; border-color:#b12704; color:#b12704; margin-right:auto;" onclick="deleteProduct(${p.id}, '${esc(p.product_name || '')}')">削除</button>
           <button class="btn btn-save" onclick="saveDetail(${p.id})">保存</button>
         </div>
       </div>`;
@@ -361,6 +362,21 @@
 
     function getSelectedIds() {
       return Array.from(document.querySelectorAll('.row-check:checked')).map(cb => cb.value);
+    }
+
+    async function deleteProduct(id, name) {
+      if (!confirm(`「${name}」を削除しますか？\nこの操作は取り消せません。`)) return;
+      try {
+        const res = await fetch(`./api/products/${id}`, { method: 'DELETE' });
+        if (res.ok) {
+          expandedId = null;
+          showToast('削除しました');
+          loadData();
+        } else {
+          const err = await res.json();
+          alert('削除失敗: ' + (err.error || ''));
+        }
+      } catch (e) { alert('エラー: ' + e.message); }
     }
 
     async function exportNeCsv(type) {

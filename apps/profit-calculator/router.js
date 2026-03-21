@@ -5,7 +5,7 @@ import { Router } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { getProduct, getFees } from './sp-api.js';
-import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, getSetItems, saveSetItems } from './db.js';
+import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, deleteProduct, getSetItems, saveSetItems } from './db.js';
 import { loadSuppliers, addSupplier, deleteSupplier } from './suppliers.js';
 import { loadShipping, addShipping, updateShipping, deleteShipping } from './shipping.js';
 
@@ -183,6 +183,14 @@ router.put('/api/products/:id', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+router.delete('/api/products/:id', async (req, res) => {
+  try {
+    await ensureDb();
+    deleteProduct(parseInt(req.params.id));
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ── API: NE用CSVエクスポート ──
