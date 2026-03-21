@@ -230,7 +230,8 @@ router.get('/api/products/csv/ne', async (req, res) => {
           }
         }
       }
-      csv = [header, ...rows].map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
+      const csvQuote = (c) => { const s = String(c); return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s.replace(/"/g, '""')}"` : s; };
+      csv = header.join(',') + '\n' + rows.map(r => r.map(csvQuote).join(',')).join('\n');
       filename = `set_syohin_ikkatsu_${date}.csv`;
     } else {
       // 単品CSV: ne_registration_type = '単品' のみ
@@ -244,7 +245,8 @@ router.get('/api/products/csv/ne', async (req, res) => {
         p.ne_selling_price || '',
         p.ne_representative_code || '',
       ]);
-      csv = [header, ...rows].map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
+      const csvQuote = (c) => { const s = String(c); return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s.replace(/"/g, '""')}"` : s; };
+      csv = header.join(',') + '\n' + rows.map(r => r.map(csvQuote).join(',')).join('\n');
       filename = `syohin_ikkatsu_${date}.csv`;
     }
 
@@ -281,7 +283,7 @@ router.get('/api/products/csv/ne', async (req, res) => {
 
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.send('\uFEFF' + csv);
+    res.send(csv);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
