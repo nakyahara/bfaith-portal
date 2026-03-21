@@ -199,7 +199,7 @@
           <td class="num ${(p.profit_rate||0) >= 0.1 ? 'positive' : 'negative'}">${p.profit_rate != null ? (p.profit_rate*100).toFixed(1)+'%' : '-'}</td>
           <td onclick="event.stopPropagation()">
             <select class="status-select" onchange="changeStatus(${p.id}, this.value)" style="font-size:11px; padding:2px 4px; border-radius:4px;">
-              ${['入荷待ち','Amazon出品済','Amazon出品エラー'].map(s => `<option value="${s}" ${p.status===s?'selected':''}>${s}</option>`).join('')}
+              ${STATUSES.map(s => `<option value="${s}" ${p.status===s?'selected':''}>${s}</option>`).join('')}
             </select>
           </td>
           <td style="font-size:11px;">${p.created_at ? p.created_at.slice(0,10) : '-'}</td>
