@@ -200,13 +200,8 @@ export async function createListing({ asin, price, isFba, sku, condition = 'new_
     }],
   };
 
-  // 自社出荷: 代引・コンビニ不可 + ネコポスマケプレプライム配送
-  if (!isFba) {
-    attributes.merchant_shipping_group = [{ value: 'ネコポスマケプレプライム', marketplace_id: marketplaceId }];
-    // 代引・コンビニ不可
-    attributes.cash_on_delivery_unavailable = [{ marketplace_id: marketplaceId }];
-    attributes.payment_option_exclusion = [{ value: 'COD', marketplace_id: marketplaceId }, { value: 'CVS', marketplace_id: marketplaceId }];
-  }
+  // 自社出荷の配送・決済設定はセラーセントラル側で管理
+  // （LISTING_OFFER_ONLYモードではこれらの属性は使用不可）
 
   const body = {
     productType: 'PRODUCT',
