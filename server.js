@@ -269,6 +269,43 @@ app.use('/apps/linegift-sync', requireAppAccess('linegift-sync'), linegiftRouter
 app.use('/apps/mercari-sync', requireAppAccess('mercari-sync'), mercariRouter);
 app.use('/apps/aes-pdf-sorter', requireAppAccess('aes-pdf-sorter'), aesRouter);
 app.use('/apps/ranking-checker', requireAppAccess('ranking-checker'), rankingRouter);
+// 一時: Listings API権限テスト
+app.get('/api/test-listings', async (req, res) => {
+  try {
+    const { getProduct } = await import('./apps/profit-calculator/sp-api.js');
+    const SellingPartner = (await import('amazon-sp-api')).default;
+    const sp = new SellingPartner({
+      region: 'fe',
+      refresh_token: process.env.SP_API_REFRESH_TOKEN,
+      credentials: {
+        SELLING_PARTNER_APP_CLIENT_ID: process.env.SP_API_CLIENT_ID,
+        SELLING_PARTNER_APP_CLIENT_SECRET: process.env.SP_API_CLIENT_SECRET,
+        AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID,
+        AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY,
+      },
+    });
+    const sellerId = 'A12Y1HFMZNA9GI';
+    const result = await sp.callAPI({
+      operation: 'getListingsItem',
+      endpoint: 'listingsItems',
+      path: { sellerId, sku: 'test-check-permission' },
+      query: { marketplaceIds: ['A1VC38T7YXB528'] },
+      options: { version: '2021-08-01' },
+    });
+    res.json({ status: 'OK', result });
+  } catch (e) {
+    const msg = e.message || '';
+    let diagnosis = '要確認';
+    if (msg.includes('403') || msg.includes('Unauthorized') || msg.includes('Access Denied')) {
+      diagnosis = 'Listings APIの権限なし。SP-APIアプリにProduct Listingロールの追加が必要';
+    } else if (msg.includes('404') || msg.includes('NOT_FOUND')) {
+      diagnosis = 'Listings API権限あり（SKUが存在しないだけ）';
+    } else if (msg.includes('400') || msg.includes('Bad Request')) {
+      diagnosis = 'Listings API権限あり（パラメータエラー）';
+    }
+    res.json({ status: 'error', code: e.code || e.statusCode, message: msg.substring(0, 500), diagnosis });
+  }
+});
 app.use('/apps/profit-calculator', requireAppAccess('profit-calculator'), profitRouter);
 
 // 未実装アプリのプレースホルダー
