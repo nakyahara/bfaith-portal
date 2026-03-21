@@ -208,14 +208,19 @@ router.post('/api/products/:id/list-amazon', async (req, res) => {
       sku,
     });
 
-    // 成功時にステータスを「Amazon出品済」に更新、SKUを保存
+    // 成功時にステータスを「Amazon出品済」に更新
     if (result.status === 'ACCEPTED') {
       updateProduct(id, { status: 'Amazon出品済' });
+    } else {
+      // ACCEPTED以外（INVALID等）はエラー扱い
+      updateProduct(id, { status: 'Amazon出品エラー' });
     }
 
     res.json(result);
   } catch (err) {
     console.error('[ProfitCalc] Amazon出品エラー:', err.message);
+    // API呼び出し自体が失敗した場合もエラーステータスに
+    try { updateProduct(id, { status: 'Amazon出品エラー' }); } catch (_) {}
     res.status(500).json({ error: err.message });
   }
 });

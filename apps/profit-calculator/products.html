@@ -49,6 +49,10 @@
     .status-badge.Amazon出品済 { background: #b2f2bb; color: #087f23; }
     .status-badge.発注済 { background: #e8d5f5; color: #6741d9; }
     .status-badge.出品済 { background: #b2f2bb; color: #087f23; }
+    .status-badge.Amazon出品エラー { background: #ffe0e0; color: #b12704; }
+    .fulfillment-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: bold; }
+    .fulfillment-badge.FBA { background: #fff3cd; color: #856404; }
+    .fulfillment-badge.FBM { background: #d1ecf1; color: #0c5460; }
 
     /* 詳細パネル */
     .detail-panel { background: #fafafa; border-top: 2px solid #ff9900; padding: 16px 20px; }
@@ -92,6 +96,7 @@
         <option value="NE登録済">NE登録済</option>
         <option value="入荷待ち">入荷待ち</option>
         <option value="Amazon出品済">Amazon出品済</option>
+        <option value="Amazon出品エラー">Amazon出品エラー</option>
       </select>
       <input type="text" id="searchInput" placeholder="ASIN・商品名で検索" oninput="debounceLoad()">
       <select id="bulkStatusSelect" style="padding:5px 8px; border:1px solid #888; border-radius:4px; font-size:12px;">
@@ -100,6 +105,7 @@
         <option value="NE登録済">NE登録済</option>
         <option value="入荷待ち">入荷待ち</option>
         <option value="Amazon出品済">Amazon出品済</option>
+        <option value="Amazon出品エラー">Amazon出品エラー</option>
       </select>
       <button class="btn btn-primary" onclick="bulkChangeStatus()" style="font-size:11px;">適用</button>
       <button class="btn" style="background:#fff0f0; border-color:#b12704; color:#b12704; font-size:11px;" onclick="bulkDelete()">一括削除</button>
@@ -117,8 +123,8 @@
     let debounceTimer = null;
     let allData = [];
     let expandedId = null;
-    const STATUSES = ['NE登録前', 'NE登録済', '入荷待ち', 'Amazon出品済'];
-    const STATUS_ORDER = { 'NE登録前': 0, 'NE登録済': 1, '入荷待ち': 2, 'Amazon出品済': 3, '発注済': 0, '出品済': 3 };
+    const STATUSES = ['NE登録前', 'NE登録済', '入荷待ち', 'Amazon出品済', 'Amazon出品エラー'];
+    const STATUS_ORDER = { 'NE登録前': 0, 'NE登録済': 1, '入荷待ち': 2, 'Amazon出品済': 3, 'Amazon出品エラー': 4, '発注済': 0, '出品済': 3 };
 
     let suppliers = [];
 
@@ -165,12 +171,12 @@
         return;
       }
 
-      const colCount = 12;
+      const colCount = 13;
       let html = `<table class="data-table">
         <thead><tr>
           <th style="width:30px;"><input type="checkbox" id="checkAll" onclick="toggleCheckAll(this)"></th>
           <th style="width:20px;"></th>
-          <th>NE登録</th><th>NE商品コード</th><th>ASIN</th><th>商品名</th><th>仕入れ先</th>
+          <th>NE登録</th><th>FBA/FBM</th><th>NE商品コード</th><th>ASIN</th><th>商品名</th><th>仕入れ先</th>
           <th>仕入価格</th><th>NE販売価格</th><th>利益率</th><th>ステータス</th><th>登録日</th>
         </tr></thead><tbody>`;
 
@@ -181,6 +187,7 @@
           <td onclick="event.stopPropagation()"><input type="checkbox" class="row-check" value="${p.id}"></td>
           <td><span class="expand-arrow ${isOpen?'open':''}">▶</span></td>
           <td><span class="ne-type-badge ${neType}">${neType}</span></td>
+          <td><span class="fulfillment-badge ${p.fulfillment === 'FBA' ? 'FBA' : 'FBM'}">${p.fulfillment === 'FBA' ? 'FBA' : '自社出荷'}</span></td>
           <td style="font-size:11px;">${esc(p.ne_product_code || '-')}</td>
           <td>${p.asin ? `<a class="asin-link" href="https://www.amazon.co.jp/dp/${p.asin}" target="_blank" onclick="event.stopPropagation()">${p.asin}</a>` : '-'}</td>
           <td class="product-name-cell" title="${esc(p.product_name || '')}">${esc(p.product_name || '-')}</td>
