@@ -34,6 +34,10 @@ router.get('/products', (req, res) => {
   res.sendFile(path.join(__dirname, 'products.html'));
 });
 
+router.get('/amazon', (req, res) => {
+  res.sendFile(path.join(__dirname, 'amazon.html'));
+});
+
 router.get('/suppliers', (req, res) => {
   res.sendFile(path.join(__dirname, 'suppliers.html'));
 });

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>NE商品登録 — リサーチ仕入れツール</title>
+  <title>Amazon出品 — リサーチ仕入れツール</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: 'Segoe UI', 'Hiragino Sans', 'Meiryo', sans-serif; background: #eaeded; color: #0f1111; font-size: 13px; }
@@ -83,8 +83,8 @@
   <div class="page-tabs">
     <a href="./research" class="page-tab">リサーチ・見積もり</a>
     <a href="./" class="page-tab">商品計算</a>
-    <a href="./products" class="page-tab active">NE商品登録</a>
-    <a href="./amazon" class="page-tab">Amazon出品</a>
+    <a href="./products" class="page-tab">NE商品登録</a>
+    <a href="./amazon" class="page-tab active">Amazon出品</a>
     <a href="./suppliers" class="page-tab" style="margin-left:auto;">仕入れ先管理</a>
     <a href="./shipping" class="page-tab">送料管理</a>
   </div>
@@ -93,19 +93,19 @@
     <div class="filter-bar">
       <select id="statusFilter" onchange="loadData()">
         <option value="">全ステータス</option>
-        <option value="NE登録前">NE登録前</option>
-        <option value="NE登録済">NE登録済</option>
+        <option value="入荷待ち">入荷待ち</option>
+        <option value="Amazon出品済">Amazon出品済</option>
+        <option value="Amazon出品エラー">Amazon出品エラー</option>
       </select>
       <input type="text" id="searchInput" placeholder="ASIN・商品名で検索" oninput="debounceLoad()">
       <select id="bulkStatusSelect" style="padding:5px 8px; border:1px solid #888; border-radius:4px; font-size:12px;">
         <option value="">一括ステータス変更</option>
-        <option value="NE登録前">NE登録前</option>
-        <option value="NE登録済">NE登録済</option>
+        <option value="入荷待ち">入荷待ち</option>
+        <option value="Amazon出品済">Amazon出品済</option>
+        <option value="Amazon出品エラー">Amazon出品エラー</option>
       </select>
       <button class="btn btn-primary" onclick="bulkChangeStatus()" style="font-size:11px;">適用</button>
-      <button class="btn" style="background:#fff0f0; border-color:#b12704; color:#b12704; font-size:11px;" onclick="bulkDelete()">一括削除</button>
-      <button class="btn btn-export" onclick="exportNeCsv('single')">NE単品CSV</button>
-      <button class="btn btn-export" onclick="exportNeCsv('set')">NEセット商品CSV</button>
+      <button class="btn" style="background:#232f3e; border-color:#232f3e; color:#ff9900; font-size:11px; font-weight:bold;" onclick="bulkListOnAmazon()">Amazon一括出品</button>
       <span class="count" id="countDisplay">-</span>
     </div>
     <div id="tableContainer"></div>
@@ -117,10 +117,9 @@
     let debounceTimer = null;
     let allData = [];
     let expandedId = null;
-    const STATUSES = ['NE登録前', 'NE登録済'];
-    const STATUS_ORDER = { 'NE登録前': 0, 'NE登録済': 1, '発注済': 0 };
-    // NE商品登録ページではNE登録前/NE登録済のみ表示
-    const NE_STATUSES = new Set(['NE登録前', 'NE登録済', '発注済']);
+    const STATUSES = ['入荷待ち', 'Amazon出品済', 'Amazon出品エラー'];
+    const STATUS_ORDER = { '入荷待ち': 0, 'Amazon出品エラー': 1, 'Amazon出品済': 2 };
+    const AMAZON_STATUSES = new Set(['入荷待ち', 'Amazon出品済', 'Amazon出品エラー']);
 
     let suppliers = [];
 
@@ -147,8 +146,8 @@
       try {
         const res = await fetch(`./api/products?${params}`);
         let rawData = await res.json();
-        // NE商品登録ページ: NE登録前/NE登録済のみ表示
-        allData = rawData.filter(p => NE_STATUSES.has(p.status));
+        // Amazon出品ページ: 入荷待ち/Amazon出品済/Amazon出品エラーのみ表示
+        allData = rawData.filter(p => AMAZON_STATUSES.has(p.status));
         // ステータス順 → 登録日新しい順にソート
         allData.sort((a, b) => {
           const sa = STATUS_ORDER[a.status] ?? 99;
@@ -280,6 +279,7 @@
         <div class="detail-actions">
           <button class="btn" style="background:#fff0f0; border-color:#b12704; color:#b12704; margin-right:auto;" onclick="deleteProduct(${p.id}, '${esc(p.product_name || '')}')">削除</button>
           <button class="btn btn-save" onclick="saveDetail(${p.id})">保存</button>
+          ${p.asin ? `<button class="btn" style="background:#232f3e; border-color:#232f3e; color:#ff9900; font-weight:bold;" onclick="listOnAmazon(${p.id})">Amazon出品</button>` : ''}
         </div>
       </div>`;
     }
