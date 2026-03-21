@@ -43,9 +43,11 @@
     .negative { color: #b12704; }
 
     .status-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: bold; white-space: nowrap; }
-    .status-badge.発注済 { background: #e8d5f5; color: #6741d9; }
-    .status-badge.入荷待ち { background: #fcc2d7; color: #c2255c; }
+    .status-badge.NE登録前 { background: #e8d5f5; color: #6741d9; }
     .status-badge.NE登録済 { background: #d3f9d8; color: #2b8a3e; }
+    .status-badge.入荷待ち { background: #fcc2d7; color: #c2255c; }
+    .status-badge.Amazon出品済 { background: #b2f2bb; color: #087f23; }
+    .status-badge.発注済 { background: #e8d5f5; color: #6741d9; }
     .status-badge.出品済 { background: #b2f2bb; color: #087f23; }
 
     /* 詳細パネル */
@@ -86,12 +88,20 @@
     <div class="filter-bar">
       <select id="statusFilter" onchange="loadData()">
         <option value="">全ステータス</option>
-        <option value="発注済">発注済</option>
-        <option value="入荷待ち">入荷待ち</option>
+        <option value="NE登録前">NE登録前</option>
         <option value="NE登録済">NE登録済</option>
-        <option value="出品済">出品済</option>
+        <option value="入荷待ち">入荷待ち</option>
+        <option value="Amazon出品済">Amazon出品済</option>
       </select>
       <input type="text" id="searchInput" placeholder="ASIN・商品名で検索" oninput="debounceLoad()">
+      <select id="bulkStatusSelect" style="padding:5px 8px; border:1px solid #888; border-radius:4px; font-size:12px;">
+        <option value="">一括ステータス変更</option>
+        <option value="NE登録前">NE登録前</option>
+        <option value="NE登録済">NE登録済</option>
+        <option value="入荷待ち">入荷待ち</option>
+        <option value="Amazon出品済">Amazon出品済</option>
+      </select>
+      <button class="btn btn-primary" onclick="bulkChangeStatus()" style="font-size:11px;">適用</button>
       <button class="btn btn-export" onclick="exportNeCsv('single')">NE単品CSV</button>
       <button class="btn btn-export" onclick="exportNeCsv('set')">NEセット商品CSV</button>
       <span class="count" id="countDisplay">-</span>
@@ -105,7 +115,8 @@
     let debounceTimer = null;
     let allData = [];
     let expandedId = null;
-    const STATUSES = ['発注済', '入荷待ち', 'NE登録済', '出品済'];
+    const STATUSES = ['NE登録前', 'NE登録済', '入荷待ち', 'Amazon出品済'];
+    const STATUS_ORDER = { 'NE登録前': 0, 'NE登録済': 1, '入荷待ち': 2, 'Amazon出品済': 3, '発注済': 0, '出品済': 3 };
 
     document.addEventListener('DOMContentLoaded', loadData);
 
@@ -124,6 +135,13 @@
       try {
         const res = await fetch(`./api/products?${params}`);
         allData = await res.json();
+        // ステータス順 → 登録日新しい順にソート
+        allData.sort((a, b) => {
+          const sa = STATUS_ORDER[a.status] ?? 99;
+          const sb = STATUS_ORDER[b.status] ?? 99;
+          if (sa !== sb) return sa - sb;
+          return (b.id || 0) - (a.id || 0);
+        });
         document.getElementById('countDisplay').textContent = `${allData.length}件`;
         renderTable();
       } catch (err) {
@@ -314,6 +332,27 @@
         renderTable();
         showToast('保存しました');
       } catch (e) { showToast('エラー: ' + e.message); }
+    }
+
+    async function bulkChangeStatus() {
+      const status = document.getElementById('bulkStatusSelect').value;
+      if (!status) { alert('変更先のステータスを選択してください'); return; }
+      const ids = getSelectedIds();
+      if (ids.length === 0) { alert('対象の商品をチェックボックスで選択してください'); return; }
+      if (!confirm(`${ids.length}件のステータスを「${status}」に変更しますか？`)) return;
+
+      try {
+        await Promise.all(ids.map(id =>
+          fetch(`./api/products/${id}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ status }),
+          })
+        ));
+        document.getElementById('bulkStatusSelect').value = '';
+        showToast(`${ids.length}件を「${status}」に変更しました`);
+        loadData();
+      } catch (e) { alert('エラー: ' + e.message); }
     }
 
     function toggleCheckAll(el) {
