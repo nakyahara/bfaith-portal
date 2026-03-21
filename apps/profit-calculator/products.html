@@ -118,7 +118,15 @@
     const STATUSES = ['NE登録前', 'NE登録済', '入荷待ち', 'Amazon出品済'];
     const STATUS_ORDER = { 'NE登録前': 0, 'NE登録済': 1, '入荷待ち': 2, 'Amazon出品済': 3, '発注済': 0, '出品済': 3 };
 
-    document.addEventListener('DOMContentLoaded', loadData);
+    let suppliers = [];
+
+    document.addEventListener('DOMContentLoaded', async () => {
+      try {
+        const res = await fetch('./api/suppliers');
+        suppliers = await res.json();
+      } catch (e) { console.error('仕入先読み込みエラー:', e); }
+      loadData();
+    });
 
     function debounceLoad() {
       clearTimeout(debounceTimer);
@@ -214,15 +222,15 @@
             ${dRow('ASIN', 'asin', p.asin, p.id)}
             ${dRow('JAN', 'jan', p.jan, p.id)}
             ${dRow('型番', 'part_number', p.part_number, p.id)}
-            ${dRow('仕入先名', 'supplier_name', p.supplier_name, p.id)}
+            ${dSupplierSelect(p.supplier_code, p.supplier_name, p.id)}
             ${dRow('メーカーURL', 'maker_url', p.maker_url, p.id)}
             ${dRow('コメント', 'comment', p.comment, p.id)}
             ${dSelect('ステータス', 'status', p.status, STATUSES, p.id)}
           </div>
           <div class="detail-section">
             <div class="detail-section-title">価格・利益</div>
-            ${dRow('卸価格(税抜)', 'wholesale_price', p.wholesale_price, p.id, 'number')}
-            ${dRow('卸価格(税込)', 'wholesale_price_with_tax', p.wholesale_price_with_tax, p.id, 'number')}
+            ${dRowWithEvent('卸価格(税抜)', 'wholesale_price', p.wholesale_price, p.id, 'number', `oninput="calcTaxIncl(${p.id})"` )}
+            ${dRowReadonly('卸価格(税込)', 'wholesale_price_with_tax', p.wholesale_price_with_tax, p.id)}
             ${dRow('Amazon販売価格', 'selling_price', p.selling_price, p.id, 'number')}
             ${dRow('利益', 'profit', p.profit, p.id, 'number')}
             ${dSelect('FBA/FBM', 'fulfillment', p.fulfillment, ['FBA','自社出荷'], p.id)}
@@ -240,7 +248,7 @@
             ${dRow('NE仕入価格(税抜)', 'ne_cost_excl_tax', p.ne_cost_excl_tax, p.id, 'number')}
             ${dRow('NE販売価格', 'ne_selling_price', p.ne_selling_price, p.id, 'number')}
             ${dRow('NE発注ロット', 'ne_order_lot', p.ne_order_lot, p.id, 'number')}
-            ${dSelect('NE税率', 'ne_tax_rate', p.ne_tax_rate, ['10%','8%'], p.id)}
+            ${dSelectWithEvent('NE税率', 'ne_tax_rate', p.ne_tax_rate, ['10%','8%'], p.id, `onchange="calcTaxIncl(${p.id})"`)}
             ${dSelect('NE登録 単or複', 'ne_registration_type', p.ne_registration_type, ['単品','複数'], p.id)}
             ${dRow('NE代表コード', 'ne_representative_code', p.ne_representative_code, p.id)}
           </div>
@@ -277,6 +285,20 @@
       </div>`;
     }
 
+    function dRowWithEvent(label, key, value, id, type='text', extra='') {
+      return `<div class="detail-row">
+        <span class="detail-label">${label}</span>
+        <input class="detail-input" type="${type}" id="d-${key}-${id}" value="${value != null ? esc(String(value)) : ''}" data-field="${key}" ${extra}>
+      </div>`;
+    }
+
+    function dRowReadonly(label, key, value, id) {
+      return `<div class="detail-row">
+        <span class="detail-label">${label}</span>
+        <input class="detail-input" type="number" id="d-${key}-${id}" value="${value != null ? value : ''}" data-field="${key}" readonly style="background:#f7f8f8;">
+      </div>`;
+    }
+
     function dSelect(label, key, value, options, id) {
       return `<div class="detail-row">
         <span class="detail-label">${label}</span>
@@ -284,6 +306,55 @@
           ${options.map(o => `<option value="${o}" ${value===o?'selected':''}>${o}</option>`).join('')}
         </select>
       </div>`;
+    }
+
+    function dSelectWithEvent(label, key, value, options, id, extra='') {
+      return `<div class="detail-row">
+        <span class="detail-label">${label}</span>
+        <select class="detail-select" id="d-${key}-${id}" data-field="${key}" ${extra}>
+          ${options.map(o => `<option value="${o}" ${value===o?'selected':''}>${o}</option>`).join('')}
+        </select>
+      </div>`;
+    }
+
+    function dSupplierSelect(currentCode, currentName, id) {
+      let opts = '<option value="">選択してください</option>';
+      let matched = false;
+      for (const s of suppliers) {
+        const sel = (s.code === currentCode) ? 'selected' : '';
+        if (sel) matched = true;
+        opts += `<option value="${s.code}" data-name="${esc(s.name)}" ${sel}>${s.code} - ${esc(s.name)}</option>`;
+      }
+      if (!matched && currentName) {
+        opts += `<option value="" selected>${esc(currentName)}</option>`;
+      }
+      return `<div class="detail-row">
+        <span class="detail-label">仕入先</span>
+        <select class="detail-select" id="d-supplier-${id}" style="flex:1;" onchange="onDetailSupplierChange(${id})">
+          ${opts}
+        </select>
+        <input type="hidden" id="d-supplier_code-${id}" data-field="supplier_code" value="${esc(currentCode || '')}">
+        <input type="hidden" id="d-supplier_name-${id}" data-field="supplier_name" value="${esc(currentName || '')}">
+      </div>`;
+    }
+
+    function onDetailSupplierChange(id) {
+      const sel = document.getElementById(`d-supplier-${id}`);
+      const opt = sel.options[sel.selectedIndex];
+      document.getElementById(`d-supplier_code-${id}`).value = sel.value;
+      document.getElementById(`d-supplier_name-${id}`).value = opt.dataset.name || opt.textContent;
+      // NE仕入先コードも連動
+      const neEl = document.getElementById(`d-ne_supplier_code-${id}`);
+      if (neEl) neEl.value = sel.value;
+    }
+
+    function calcTaxIncl(id) {
+      const wholesale = parseInt(document.getElementById(`d-wholesale_price-${id}`)?.value) || 0;
+      const taxRateEl = document.getElementById(`d-ne_tax_rate-${id}`);
+      const taxRate = taxRateEl ? parseInt(taxRateEl.value) : 10;
+      const withTax = Math.ceil(wholesale * (1 + taxRate / 100));
+      const taxInclEl = document.getElementById(`d-wholesale_price_with_tax-${id}`);
+      if (taxInclEl) taxInclEl.value = withTax;
     }
 
     function addSetItem(productId) {
