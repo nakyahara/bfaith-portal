@@ -354,21 +354,4 @@ router.delete('/api/shipping', (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 一時的なバルクインポートAPI（初期データ投入用）
-router.post('/api/products/bulk-import', async (req, res) => {
-  try {
-    await ensureDb();
-    const items = req.body;
-    if (!Array.isArray(items)) return res.status(400).json({ error: 'Array required' });
-    const ids = [];
-    for (const item of items) {
-      const id = saveProduct(item);
-      ids.push(id);
-    }
-    res.json({ imported: ids.length, ids });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
 export default router;
