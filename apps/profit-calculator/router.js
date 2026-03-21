@@ -178,18 +178,43 @@ router.get('/api/products/csv/ne', async (req, res) => {
   try {
     await ensureDb();
     const products = getProducts({ status: req.query.status });
+    const type = req.query.type || 'single';
+    const date = new Date().toISOString().slice(0, 10);
+    let csv, filename;
 
-    const header = ['商品コード', 'ASIN', '商品名', 'JAN', '型番', '仕入先', '仕入価格（税込）', '販売価格', 'FBA/FBM'];
-    const rows = products.map(p => [
-      p.ne_product_code || '', p.asin, p.product_name || '', p.jan || '', p.part_number || '',
-      p.supplier_name || '', p.wholesale_price_with_tax || '', p.selling_price || '', p.fulfillment || '',
-    ]);
+    if (type === 'set') {
+      // セット商品CSV: ne_registration_type = '複数' のみ
+      const setProducts = products.filter(p => p.ne_registration_type === '複数');
+      const header = ['set_syohin_code', 'set_syohin_name', 'set_baika_tnk', 'syohin_code', 'suryo', 'daihyo_syohin_code'];
+      const rows = setProducts.map(p => [
+        p.ne_product_code || '',
+        p.product_name || '',
+        p.ne_selling_price || '',
+        p.ne_breakdown_code || '',
+        p.ne_breakdown_qty || '',
+        p.ne_representative_code || '',
+      ]);
+      csv = [header, ...rows].map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
+      filename = `set_syohin_ikkatsu_${date}.csv`;
+    } else {
+      // 単品CSV: ne_registration_type = '単品' のみ
+      const singleProducts = products.filter(p => !p.ne_registration_type || p.ne_registration_type === '単品');
+      const header = ['syohin_code', 'syohin_name', 'sire_code', 'genka_tnk', 'baika_tnk', 'daihyo_syohin_code'];
+      const rows = singleProducts.map(p => [
+        p.ne_product_code || '',
+        p.product_name || '',
+        p.ne_supplier_code || p.supplier_code || '',
+        p.ne_cost_excl_tax || p.wholesale_price || '',
+        p.ne_selling_price || '',
+        p.ne_representative_code || '',
+      ]);
+      csv = [header, ...rows].map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
+      filename = `syohin_ikkatsu_${date}.csv`;
+    }
 
-    const csv = [header, ...rows].map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
-    const bom = '\uFEFF';
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="ne_products_${new Date().toISOString().slice(0,10)}.csv"`);
-    res.send(bom + csv);
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send('\uFEFF' + csv);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

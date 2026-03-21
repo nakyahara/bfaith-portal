@@ -69,7 +69,8 @@
         <option value="出品済">出品済</option>
       </select>
       <input type="text" id="searchInput" placeholder="ASIN・商品名で検索" oninput="debounceLoad()">
-      <button class="btn btn-export" onclick="exportCsv()">NE用CSV出力</button>
+      <button class="btn btn-export" onclick="exportNeCsv('single')">NE単品CSV</button>
+      <button class="btn btn-export" onclick="exportNeCsv('set')">NEセット商品CSV</button>
       <span class="count" id="countDisplay">-</span>
     </div>
     <div id="tableContainer"></div>
@@ -150,10 +151,12 @@
       loadData();
     }
 
-    function exportCsv() {
+    function exportNeCsv(type) {
       const status = document.getElementById('statusFilter').value;
-      const url = `./api/products/csv/ne${status ? '?status=' + encodeURIComponent(status) : ''}`;
-      window.location.href = url;
+      const params = new URLSearchParams();
+      if (status) params.set('status', status);
+      params.set('type', type);
+      window.location.href = `./api/products/csv/ne?${params}`;
     }
 
     function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
