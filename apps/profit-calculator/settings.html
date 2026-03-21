@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>設定 — リサーチ仕入れツール</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Segoe UI', 'Hiragino Sans', 'Meiryo', sans-serif; background: #eaeded; color: #0f1111; font-size: 13px; }
+    a { color: #0066c0; text-decoration: none; }
+
+    .header { background: #232f3e; color: #fff; padding: 10px 24px; display: flex; align-items: center; justify-content: space-between; }
+    .header h1 { font-size: 17px; font-weight: bold; }
+    .header h1 span { color: #ff9900; }
+    .page-tabs { display: flex; background: #37475a; padding: 0 24px; }
+    .page-tab { padding: 10px 20px; color: #ccc; font-size: 13px; font-weight: bold; text-decoration: none; border-bottom: 3px solid transparent; }
+    .page-tab:hover { color: #fff; text-decoration: none; }
+    .page-tab.active { color: #fff; border-bottom-color: #ff9900; }
+    .container { max-width: 900px; margin: 16px auto; padding: 0 16px; }
+
+    .panel { background: #fff; border: 1px solid #d5d9d9; border-radius: 8px; padding: 16px 20px; margin-bottom: 14px; }
+    .panel-title { font-size: 14px; font-weight: bold; margin-bottom: 12px; padding-bottom: 6px; border-bottom: 2px solid #ff9900; }
+    .panel-desc { font-size: 12px; color: #565959; margin-bottom: 14px; }
+
+    .setting-row { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+    .setting-label { font-size: 13px; font-weight: bold; width: 160px; flex-shrink: 0; }
+    .setting-value { flex: 1; display: flex; gap: 8px; align-items: center; }
+    .setting-value select, .setting-value input { padding: 6px 8px; border: 1px solid #888; border-radius: 4px; font-size: 13px; flex: 1; min-width: 200px; }
+    .setting-value select:focus, .setting-value input:focus { border-color: #e77600; outline: none; box-shadow: 0 0 3px #e77600; }
+    .setting-current { font-size: 12px; color: #565959; margin-top: 4px; }
+    .setting-current .val { color: #007600; font-weight: bold; }
+
+    .btn { padding: 6px 14px; border-radius: 4px; font-size: 12px; font-weight: bold; cursor: pointer; border: 1px solid; white-space: nowrap; }
+    .btn-primary { background: #f0c14b; border-color: #a88734; color: #0f1111; }
+    .btn-primary:hover { background: #e7b83c; }
+    .btn-save { background: #ff9900; border-color: #c77600; color: #0f1111; }
+    .btn-save:hover { background: #e88b00; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .status-msg { font-size: 12px; margin-top: 6px; }
+    .status-msg.success { color: #007600; }
+    .status-msg.error { color: #b12704; }
+    .status-msg.info { color: #565959; }
+
+    .toast { position: fixed; top: 20px; right: 20px; background: #067D62; color: #fff; padding: 12px 20px; border-radius: 8px; font-size: 14px; display: none; z-index: 100; box-shadow: 0 2px 8px rgba(0,0,0,0.3); }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1><span>💰</span> リサーチ仕入れツール</h1>
+    <a href="/" style="color:#ddd; font-size:13px; text-decoration:none;">← ポータルに戻る</a>
+  </div>
+  <div class="page-tabs">
+    <a href="./research" class="page-tab">リサーチ・見積もり</a>
+    <a href="./" class="page-tab">商品計算</a>
+    <a href="./products" class="page-tab">NE商品登録</a>
+    <a href="./amazon" class="page-tab">Amazon出品</a>
+    <a href="./suppliers" class="page-tab" style="margin-left:auto;">仕入れ先管理</a>
+    <a href="./shipping" class="page-tab">送料管理</a>
+    <a href="./settings" class="page-tab active">設定</a>
+  </div>
+
+  <div class="container">
+    <!-- Amazon出品設定 -->
+    <div class="panel">
+      <div class="panel-title">Amazon出品設定</div>
+      <div class="panel-desc">FBM（自社出荷）でAmazon出品する際の配送テンプレートを設定します。<br>セラーセントラルで作成した配送テンプレートを選択してください。</div>
+
+      <div class="setting-row">
+        <div class="setting-label">配送テンプレート</div>
+        <div class="setting-value">
+          <select id="shippingTemplateSelect">
+            <option value="">未設定（デフォルト）</option>
+          </select>
+          <button class="btn btn-primary" onclick="fetchTemplates()" id="btnFetch">Amazonから取得</button>
+        </div>
+      </div>
+      <div class="setting-current" id="currentTemplate"></div>
+      <div class="status-msg" id="fetchStatus"></div>
+
+      <div style="margin-top: 14px; padding-top: 12px; border-top: 1px solid #eee;">
+        <div class="setting-row">
+          <div class="setting-label">手動入力</div>
+          <div class="setting-value">
+            <input type="text" id="manualTemplate" placeholder="テンプレート名を直接入力（例: necopos marketplace prime設定）">
+            <button class="btn btn-primary" onclick="applyManual()">適用</button>
+          </div>
+        </div>
+        <div style="font-size:11px; color:#565959; margin-left:172px;">Amazonから取得できない場合はセラーセントラルのテンプレート名を直接入力してください</div>
+      </div>
+
+      <div style="margin-top: 16px; text-align: right;">
+        <button class="btn btn-save" onclick="saveTemplate()">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    let savedValue = '';
+
+    document.addEventListener('DOMContentLoaded', loadCurrentSetting);
+
+    async function loadCurrentSetting() {
+      try {
+        const res = await fetch('./api/settings/amazon_shipping_template');
+        const data = await res.json();
+        savedValue = data.value || '';
+        updateCurrentDisplay();
+        if (savedValue) {
+          const sel = document.getElementById('shippingTemplateSelect');
+          addOptionIfMissing(sel, savedValue);
+          sel.value = savedValue;
+        }
+      } catch (e) { console.error('設定読み込みエラー:', e); }
+    }
+
+    function updateCurrentDisplay() {
+      const el = document.getElementById('currentTemplate');
+      if (savedValue) {
+        el.innerHTML = `現在の設定: <span class="val">${esc(savedValue)}</span>`;
+      } else {
+        el.innerHTML = '現在の設定: <span style="color:#888;">未設定</span>';
+      }
+    }
+
+    async function fetchTemplates() {
+      const btn = document.getElementById('btnFetch');
+      const status = document.getElementById('fetchStatus');
+      btn.disabled = true;
+      status.className = 'status-msg info';
+      status.textContent = 'Amazonから取得中...';
+
+      try {
+        const res = await fetch('./api/amazon/shipping-templates');
+        const data = await res.json();
+        if (!res.ok) {
+          status.className = 'status-msg error';
+          status.textContent = 'エラー: ' + (data.error || '取得失敗');
+          return;
+        }
+
+        const sel = document.getElementById('shippingTemplateSelect');
+        const current = sel.value || savedValue;
+        sel.innerHTML = '<option value="">未設定（デフォルト）</option>';
+        data.forEach(t => {
+          const opt = document.createElement('option');
+          opt.value = t.value;
+          opt.textContent = t.label || t.value;
+          sel.appendChild(opt);
+        });
+        if (current) {
+          addOptionIfMissing(sel, current);
+          sel.value = current;
+        }
+
+        status.className = 'status-msg success';
+        status.textContent = `${data.length}件の配送テンプレートを取得しました`;
+      } catch (e) {
+        status.className = 'status-msg error';
+        status.textContent = '通信エラー: ' + e.message;
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    function applyManual() {
+      const val = document.getElementById('manualTemplate').value.trim();
+      if (!val) { alert('テンプレート名を入力してください'); return; }
+      const sel = document.getElementById('shippingTemplateSelect');
+      addOptionIfMissing(sel, val);
+      sel.value = val;
+      document.getElementById('manualTemplate').value = '';
+      showToast(`「${val}」を選択しました。「保存」を押して確定してください。`);
+    }
+
+    async function saveTemplate() {
+      const value = document.getElementById('shippingTemplateSelect').value;
+      try {
+        await fetch('./api/settings/amazon_shipping_template', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ value: value || null }),
+        });
+        savedValue = value || '';
+        updateCurrentDisplay();
+        if (value) {
+          showToast(`配送テンプレート「${value}」を保存しました`);
+        } else {
+          showToast('配送テンプレート設定を解除しました');
+        }
+      } catch (e) { alert('保存エラー: ' + e.message); }
+    }
+
+    function addOptionIfMissing(sel, val) {
+      if (!Array.from(sel.options).some(o => o.value === val)) {
+        const opt = document.createElement('option');
+        opt.value = val;
+        opt.textContent = val;
+        sel.appendChild(opt);
+      }
+    }
+
+    function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+    function showToast(m) { const e = document.getElementById('toast'); e.textContent = m; e.style.display = 'block'; setTimeout(() => e.style.display = 'none', 3000); }
+  </script>
+</body>
+</html>

@@ -47,6 +47,10 @@ router.get('/shipping', (req, res) => {
   res.sendFile(path.join(__dirname, 'shipping.html'));
 });
 
+router.get('/settings', (req, res) => {
+  res.sendFile(path.join(__dirname, 'settings.html'));
+});
+
 // 旧URL互換
 router.get('/list', (req, res) => {
   res.redirect('./research');

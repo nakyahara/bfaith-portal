@@ -182,7 +182,7 @@ export async function getShippingTemplates() {
   // Product Type Definitions APIでスキーマ取得
   const result = await sp.callAPI({
     operation: 'getDefinitionsProductType',
-    endpoint: 'definitionsProductType',
+    endpoint: 'productTypeDefinitions',
     path: { productType: 'PRODUCT' },
     query: {
       marketplaceIds: [marketplaceId],
