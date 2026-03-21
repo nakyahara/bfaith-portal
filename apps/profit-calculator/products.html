@@ -25,22 +25,40 @@
     .btn { padding: 6px 14px; border-radius: 4px; font-size: 12px; font-weight: bold; cursor: pointer; border: 1px solid; }
     .btn-sm { padding: 3px 10px; font-size: 11px; }
     .btn-export { background: #fff; border-color: #0066c0; color: #0066c0; }
+    .btn-primary { background: #f0c14b; border-color: #a88734; color: #0f1111; }
 
     .data-table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #d5d9d9; border-radius: 6px; overflow: hidden; }
     .data-table th { background: #f7f8f8; padding: 8px 10px; text-align: left; font-size: 11px; color: #565959; border-bottom: 2px solid #d5d9d9; white-space: nowrap; }
     .data-table td { padding: 7px 10px; border-bottom: 1px solid #eee; vertical-align: middle; }
-    .data-table tr:hover { background: #fafafa; }
+    .data-table tr.clickable:hover { background: #fafafa; cursor: pointer; }
     .data-table .asin-link { font-weight: bold; font-size: 12px; }
     .data-table .product-name-cell { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
     .data-table .num { text-align: right; font-variant-numeric: tabular-nums; }
-    .data-table .positive { color: #007600; }
-    .data-table .negative { color: #b12704; }
+    .positive { color: #007600; }
+    .negative { color: #b12704; }
 
     .status-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: bold; white-space: nowrap; }
     .status-badge.発注済 { background: #e8d5f5; color: #6741d9; }
     .status-badge.入荷待ち { background: #fcc2d7; color: #c2255c; }
     .status-badge.NE登録済 { background: #d3f9d8; color: #2b8a3e; }
     .status-badge.出品済 { background: #b2f2bb; color: #087f23; }
+
+    /* 詳細パネル */
+    .detail-panel { background: #fafafa; border-top: 2px solid #ff9900; padding: 16px 20px; }
+    .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .detail-section { background: #fff; border: 1px solid #d5d9d9; border-radius: 6px; padding: 12px 16px; }
+    .detail-section-title { font-size: 12px; font-weight: bold; color: #232f3e; margin-bottom: 8px; padding-bottom: 4px; border-bottom: 1px solid #eee; }
+    .detail-row { display: flex; gap: 8px; margin-bottom: 6px; align-items: center; flex-wrap: wrap; }
+    .detail-label { font-size: 11px; font-weight: bold; color: #565959; width: 100px; flex-shrink: 0; }
+    .detail-input { flex: 1; padding: 4px 6px; border: 1px solid #ccc; border-radius: 3px; font-size: 12px; min-width: 80px; }
+    .detail-input:focus { border-color: #e77600; outline: none; box-shadow: 0 0 3px #e77600; }
+    .detail-select { padding: 4px 6px; border: 1px solid #ccc; border-radius: 3px; font-size: 12px; }
+    .detail-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px; padding-top: 10px; border-top: 1px solid #ddd; }
+    .btn-save { background: #ff9900; border-color: #c77600; color: #0f1111; }
+
+    .set-items-list { margin-top: 6px; }
+    .set-item-row { display: flex; gap: 6px; align-items: center; margin-bottom: 4px; }
+    .set-item-row input { padding: 3px 5px; border: 1px solid #ccc; border-radius: 3px; font-size: 12px; }
 
     .empty-msg { text-align: center; padding: 40px; color: #888; font-size: 14px; }
     .toast { position: fixed; top: 20px; right: 20px; background: #067D62; color: #fff; padding: 12px 20px; border-radius: 8px; font-size: 14px; display: none; z-index: 100; box-shadow: 0 2px 8px rgba(0,0,0,0.3); }
@@ -80,6 +98,8 @@
 
   <script>
     let debounceTimer = null;
+    let allData = [];
+    let expandedId = null;
     const STATUSES = ['発注済', '入荷待ち', 'NE登録済', '出品済'];
 
     document.addEventListener('DOMContentLoaded', loadData);
@@ -98,65 +118,220 @@
 
       try {
         const res = await fetch(`./api/products?${params}`);
-        const data = await res.json();
-        document.getElementById('countDisplay').textContent = `${data.length}件`;
-        renderTable(data);
+        allData = await res.json();
+        document.getElementById('countDisplay').textContent = `${allData.length}件`;
+        renderTable();
       } catch (err) {
         document.getElementById('tableContainer').innerHTML = `<div class="empty-msg">エラー: ${err.message}</div>`;
       }
     }
 
-    function renderTable(data) {
-      if (data.length === 0) {
+    function renderTable() {
+      if (allData.length === 0) {
         document.getElementById('tableContainer').innerHTML = '<div class="empty-msg">データがありません<br><small>「商品計算」画面で計算→保存すると、ここに登録されます</small></div>';
         return;
       }
 
-      const html = `<table class="data-table">
+      let html = `<table class="data-table">
         <thead><tr>
           <th>ASIN</th><th>商品名</th><th>仕入れ先</th>
-          <th>仕入価格</th><th>販売価格</th><th>利益</th><th>利益率</th><th>判定</th>
-          <th>FBA/FBM</th><th>NE商品コード</th><th>ステータス</th><th>登録日</th><th>操作</th>
-        </tr></thead>
-        <tbody>${data.map(p => `<tr>
-          <td>${p.asin ? `<a class="asin-link" href="https://www.amazon.co.jp/dp/${p.asin}" target="_blank">${p.asin}</a>` : '-'}</td>
+          <th>仕入価格</th><th>NE販売価格</th><th>利益率</th><th>判定</th>
+          <th>NE商品コード</th><th>NE登録</th><th>ステータス</th><th>登録日</th>
+        </tr></thead><tbody>`;
+
+      for (const p of allData) {
+        html += `<tr class="clickable" onclick="toggleDetail(${p.id})">
+          <td>${p.asin ? `<a class="asin-link" href="https://www.amazon.co.jp/dp/${p.asin}" target="_blank" onclick="event.stopPropagation()">${p.asin}</a>` : '-'}</td>
           <td class="product-name-cell" title="${esc(p.product_name || '')}">${esc(p.product_name || '-')}</td>
           <td>${esc(p.supplier_name || '-')}</td>
           <td class="num">${p.wholesale_price_with_tax ? '¥'+Number(p.wholesale_price_with_tax).toLocaleString() : '-'}</td>
-          <td class="num">${p.selling_price ? '¥'+Number(p.selling_price).toLocaleString() : '-'}</td>
-          <td class="num ${(p.profit||0) >= 0 ? 'positive' : 'negative'}">${p.profit != null ? '¥'+Number(p.profit).toLocaleString() : '-'}</td>
-          <td class="num ${(p.profit||0) >= 0 ? 'positive' : 'negative'}">${p.profit_rate != null ? (p.profit_rate*100).toFixed(1)+'%' : '-'}</td>
+          <td class="num">${p.ne_selling_price ? '¥'+Number(p.ne_selling_price).toLocaleString() : '-'}</td>
+          <td class="num ${(p.profit_rate||0) >= 0.1 ? 'positive' : 'negative'}">${p.profit_rate != null ? (p.profit_rate*100).toFixed(1)+'%' : '-'}</td>
           <td>${p.judgment || '-'}</td>
-          <td>${p.fulfillment || '-'}</td>
           <td style="font-size:11px;">${esc(p.ne_product_code || '-')}</td>
+          <td style="font-size:11px;">${p.ne_registration_type || '単品'}</td>
           <td><span class="status-badge ${p.status || ''}">${p.status || '-'}</span></td>
           <td style="font-size:11px;">${p.created_at ? p.created_at.slice(0,10) : '-'}</td>
-          <td><select class="btn-sm" onchange="changeStatus(${p.id}, this.value)" style="font-size:11px;">
-            <option value="">変更</option>
-            ${STATUSES.filter(s => s !== p.status).map(s => `<option value="${s}">${s}</option>`).join('')}
-          </select></td>
-        </tr>`).join('')}</tbody>
-      </table>`;
+        </tr>`;
+
+        if (expandedId === p.id) {
+          html += `<tr><td colspan="11" style="padding:0;">${buildDetailPanel(p)}</td></tr>`;
+        }
+      }
+      html += '</tbody></table>';
       document.getElementById('tableContainer').innerHTML = html;
     }
 
-    async function changeStatus(id, status) {
-      if (!status) return;
-      await fetch(`./api/products/${id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status }),
-      });
-      showToast(`ステータスを「${status}」に変更`);
-      loadData();
+    async function toggleDetail(id) {
+      if (expandedId === id) { expandedId = null; renderTable(); return; }
+      // 詳細データ(セット内訳含む)を取得
+      try {
+        const res = await fetch(`./api/products/${id}`);
+        const detail = await res.json();
+        const idx = allData.findIndex(d => d.id === id);
+        if (idx >= 0) allData[idx] = detail;
+        expandedId = id;
+        renderTable();
+      } catch (e) { expandedId = id; renderTable(); }
     }
 
-    function exportNeCsv(type) {
+    function buildDetailPanel(p) {
+      const items = p.set_items || [];
+      const isSet = p.ne_registration_type === '複数';
+      return `<div class="detail-panel">
+        <div class="detail-grid">
+          <div class="detail-section">
+            <div class="detail-section-title">基本情報</div>
+            ${dRow('商品名', 'product_name', p.product_name, p.id)}
+            ${dRow('ASIN', 'asin', p.asin, p.id)}
+            ${dRow('JAN', 'jan', p.jan, p.id)}
+            ${dRow('型番', 'part_number', p.part_number, p.id)}
+            ${dRow('仕入先名', 'supplier_name', p.supplier_name, p.id)}
+            ${dRow('メーカーURL', 'maker_url', p.maker_url, p.id)}
+            ${dRow('コメント', 'comment', p.comment, p.id)}
+            ${dSelect('ステータス', 'status', p.status, STATUSES, p.id)}
+          </div>
+          <div class="detail-section">
+            <div class="detail-section-title">価格・利益</div>
+            ${dRow('卸価格(税抜)', 'wholesale_price', p.wholesale_price, p.id, 'number')}
+            ${dRow('卸価格(税込)', 'wholesale_price_with_tax', p.wholesale_price_with_tax, p.id, 'number')}
+            ${dRow('Amazon販売価格', 'selling_price', p.selling_price, p.id, 'number')}
+            ${dRow('利益', 'profit', p.profit, p.id, 'number')}
+            ${dSelect('FBA/FBM', 'fulfillment', p.fulfillment, ['FBA','自社出荷'], p.id)}
+            ${dRow('赤字ストッパー', 'loss_stopper', p.loss_stopper, p.id, 'number')}
+            ${dRow('高値ストッパー', 'high_stopper', p.high_stopper, p.id, 'number')}
+            ${dSelect('価格追従', 'price_tracking', p.price_tracking, ['カート','最安値','手動'], p.id)}
+            ${dSelect('Amazonポイント倍率', 'point_rate', p.point_rate, ['1倍','2倍','3倍','5倍','10倍'], p.id)}
+          </div>
+        </div>
+        <div class="detail-grid" style="margin-top:12px;">
+          <div class="detail-section">
+            <div class="detail-section-title">NextEngine情報</div>
+            ${dRow('NE商品コード', 'ne_product_code', p.ne_product_code, p.id)}
+            ${dRow('NE仕入先コード', 'ne_supplier_code', p.ne_supplier_code, p.id)}
+            ${dRow('NE仕入価格(税抜)', 'ne_cost_excl_tax', p.ne_cost_excl_tax, p.id, 'number')}
+            ${dRow('NE販売価格', 'ne_selling_price', p.ne_selling_price, p.id, 'number')}
+            ${dRow('NE発注ロット', 'ne_order_lot', p.ne_order_lot, p.id, 'number')}
+            ${dSelect('NE税率', 'ne_tax_rate', p.ne_tax_rate, ['10%','8%'], p.id)}
+            ${dSelect('NE登録 単or複', 'ne_registration_type', p.ne_registration_type, ['単品','複数'], p.id)}
+            ${dRow('NE代表コード', 'ne_representative_code', p.ne_representative_code, p.id)}
+          </div>
+          <div class="detail-section">
+            <div class="detail-section-title">Amazon情報</div>
+            ${dSelect('Ama 単or複', 'ama_single_or_set', p.ama_single_or_set, ['単品','セット','アソート'], p.id)}
+            ${dSelect('バリエーション', 'variation_flag', p.variation_flag, ['なし','あり'], p.id)}
+            <div class="detail-section-title" style="margin-top:12px;">セット内訳商品</div>
+            <div id="set-items-${p.id}" class="set-items-list">
+              ${items.map((item, i) => `
+                <div class="set-item-row" data-set-row>
+                  <span style="font-size:11px; color:#565959;">#${i+1}</span>
+                  <input type="text" value="${esc(item.syohin_code)}" data-set-code style="width:150px;">
+                  <span style="font-size:11px;">×</span>
+                  <input type="number" value="${item.suryo}" data-set-qty style="width:50px;" min="1">
+                  <button class="btn btn-sm" style="background:#fff0f0; border-color:#b12704; color:#b12704;" onclick="this.closest('[data-set-row]').remove()">削除</button>
+                </div>
+              `).join('')}
+            </div>
+            <button class="btn btn-sm" style="background:#f0f6ff; border-color:#0066c0; color:#1864ab; margin-top:4px;" onclick="addSetItem(${p.id})">＋ 内訳追加</button>
+          </div>
+        </div>
+        <div class="detail-actions">
+          <button class="btn btn-save" onclick="saveDetail(${p.id})">保存</button>
+        </div>
+      </div>`;
+    }
+
+    function dRow(label, key, value, id, type='text') {
+      return `<div class="detail-row">
+        <span class="detail-label">${label}</span>
+        <input class="detail-input" type="${type}" id="d-${key}-${id}" value="${value != null ? esc(String(value)) : ''}" data-field="${key}">
+      </div>`;
+    }
+
+    function dSelect(label, key, value, options, id) {
+      return `<div class="detail-row">
+        <span class="detail-label">${label}</span>
+        <select class="detail-select" id="d-${key}-${id}" data-field="${key}">
+          ${options.map(o => `<option value="${o}" ${value===o?'selected':''}>${o}</option>`).join('')}
+        </select>
+      </div>`;
+    }
+
+    function addSetItem(productId) {
+      const container = document.getElementById(`set-items-${productId}`);
+      const cnt = container.querySelectorAll('[data-set-row]').length + 1;
+      const row = document.createElement('div');
+      row.className = 'set-item-row';
+      row.setAttribute('data-set-row', '');
+      row.innerHTML = `
+        <span style="font-size:11px; color:#565959;">#${cnt}</span>
+        <input type="text" data-set-code style="width:150px;" placeholder="内訳商品コード">
+        <span style="font-size:11px;">×</span>
+        <input type="number" value="1" data-set-qty style="width:50px;" min="1">
+        <button class="btn btn-sm" style="background:#fff0f0; border-color:#b12704; color:#b12704;" onclick="this.closest('[data-set-row]').remove()">削除</button>
+      `;
+      container.appendChild(row);
+    }
+
+    async function saveDetail(id) {
+      const panel = document.querySelector(`.detail-panel`);
+      const fields = {};
+      panel.querySelectorAll('[data-field]').forEach(el => {
+        fields[el.dataset.field] = el.type === 'number' ? (el.value ? Number(el.value) : null) : el.value;
+      });
+
+      // セット内訳を収集
+      const setItems = [];
+      const container = document.getElementById(`set-items-${id}`);
+      if (container) {
+        container.querySelectorAll('[data-set-row]').forEach(row => {
+          const code = row.querySelector('[data-set-code]')?.value?.trim();
+          const qty = parseInt(row.querySelector('[data-set-qty]')?.value) || 1;
+          if (code) setItems.push({ syohin_code: code, suryo: qty });
+        });
+      }
+      fields.set_items = setItems;
+
+      try {
+        const res = await fetch(`./api/products/${id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(fields),
+        });
+        const updated = await res.json();
+        const idx = allData.findIndex(d => d.id === id);
+        if (idx >= 0) allData[idx] = updated;
+        renderTable();
+        showToast('保存しました');
+      } catch (e) { showToast('エラー: ' + e.message); }
+    }
+
+    async function exportNeCsv(type) {
       const status = document.getElementById('statusFilter').value;
       const params = new URLSearchParams();
       if (status) params.set('status', status);
       params.set('type', type);
-      window.location.href = `./api/products/csv/ne?${params}`;
+      const url = `./api/products/csv/ne?${params}`;
+
+      try {
+        const res = await fetch(url);
+        if (!res.ok) {
+          const err = await res.json();
+          if (err.details) {
+            const msgs = err.details.map(d => `・${d.name}: ${d.missing.join(', ')}`).join('\n');
+            alert(`必須項目が不足しています:\n\n${msgs}`);
+          } else {
+            alert(err.error || 'エラーが発生しました');
+          }
+          return;
+        }
+        const blob = await res.blob();
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = res.headers.get('Content-Disposition')?.match(/filename="(.+)"/)?.[1] || 'ne_export.csv';
+        a.click();
+        URL.revokeObjectURL(a.href);
+      } catch (e) { alert('通信エラー: ' + e.message); }
     }
 
     function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }

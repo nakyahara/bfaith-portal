@@ -5,7 +5,7 @@ import { Router } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { getProduct, getFees } from './sp-api.js';
-import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, updateProductStatus, updateProduct } from './db.js';
+import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, getSetItems, saveSetItems } from './db.js';
 import { loadSuppliers, addSupplier, deleteSupplier } from './suppliers.js';
 import { loadShipping, addShipping, updateShipping, deleteShipping } from './shipping.js';
 
@@ -158,16 +158,28 @@ router.get('/api/products', async (req, res) => {
   }
 });
 
+router.get('/api/products/:id', async (req, res) => {
+  try {
+    await ensureDb();
+    const product = getProductById(parseInt(req.params.id));
+    if (!product) return res.status(404).json({ error: '見つかりません' });
+    product.set_items = getSetItems(product.id);
+    res.json(product);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 router.put('/api/products/:id', async (req, res) => {
   try {
     await ensureDb();
-    const { status } = req.body;
-    if (status) {
-      updateProductStatus(parseInt(req.params.id), status);
-    } else {
-      updateProduct(parseInt(req.params.id), req.body);
+    const id = parseInt(req.params.id);
+    const { set_items, ...fields } = req.body;
+    updateProduct(id, fields);
+    if (set_items && Array.isArray(set_items)) {
+      saveSetItems(id, set_items);
     }
-    res.json({ ok: true });
+    const updated = getProductById(id);
+    if (updated) updated.set_items = getSetItems(id);
+    res.json(updated || { ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -183,17 +195,28 @@ router.get('/api/products/csv/ne', async (req, res) => {
     let csv, filename;
 
     if (type === 'set') {
-      // セット商品CSV: ne_registration_type = '複数' のみ
+      // セット商品CSV: ne_registration_type = '複数' のみ、内訳テーブルからJOIN
       const setProducts = products.filter(p => p.ne_registration_type === '複数');
       const header = ['set_syohin_code', 'set_syohin_name', 'set_baika_tnk', 'syohin_code', 'suryo', 'daihyo_syohin_code'];
-      const rows = setProducts.map(p => [
-        p.ne_product_code || '',
-        p.product_name || '',
-        p.ne_selling_price || '',
-        p.ne_breakdown_code || '',
-        p.ne_breakdown_qty || '',
-        p.ne_representative_code || '',
-      ]);
+      const rows = [];
+      for (const p of setProducts) {
+        const items = getSetItems(p.id);
+        if (items.length === 0) {
+          // 内訳なしでも1行出す
+          rows.push([p.ne_product_code||'', p.product_name||'', p.ne_selling_price||'', '', '', p.ne_representative_code||'']);
+        } else {
+          for (const item of items) {
+            rows.push([
+              p.ne_product_code || '',
+              p.product_name || '',
+              p.ne_selling_price || '',
+              item.syohin_code || '',
+              item.suryo || '',
+              p.ne_representative_code || '',
+            ]);
+          }
+        }
+      }
       csv = [header, ...rows].map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
       filename = `set_syohin_ikkatsu_${date}.csv`;
     } else {
@@ -210,6 +233,37 @@ router.get('/api/products/csv/ne', async (req, res) => {
       ]);
       csv = [header, ...rows].map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
       filename = `syohin_ikkatsu_${date}.csv`;
+    }
+
+    // 必須項目バリデーション
+    const errors = [];
+    const targetProducts = type === 'set'
+      ? products.filter(p => p.ne_registration_type === '複数')
+      : products.filter(p => !p.ne_registration_type || p.ne_registration_type === '単品');
+
+    for (const p of targetProducts) {
+      const missing = [];
+      if (!p.ne_product_code) missing.push('商品コード(ne_product_code)');
+      if (!p.product_name) missing.push('商品名(product_name)');
+      if (type === 'set') {
+        if (!p.ne_selling_price) missing.push('セット販売価格(ne_selling_price)');
+        const items = getSetItems(p.id);
+        if (items.length === 0) missing.push('内訳商品(set_items)');
+      } else {
+        if (!p.ne_supplier_code && !p.supplier_code) missing.push('仕入先コード(sire_code)');
+        if (!p.ne_cost_excl_tax && !p.wholesale_price) missing.push('原価(genka_tnk)');
+        if (!p.ne_selling_price) missing.push('売価(baika_tnk)');
+      }
+      if (missing.length > 0) {
+        errors.push({ id: p.id, name: p.product_name || p.ne_product_code || `ID:${p.id}`, missing });
+      }
+    }
+
+    if (errors.length > 0) {
+      return res.status(400).json({
+        error: '必須項目が不足しています',
+        details: errors,
+      });
     }
 
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');

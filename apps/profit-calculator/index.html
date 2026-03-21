@@ -253,10 +253,15 @@
             </select>
           </div>
         </div>
-        <div class="form-row" id="neVariationFields" style="display:none;">
-          <div class="form-group medium"><label>NE代表コード(バリのみ)</label><input type="text" id="neRepresentativeCode"></div>
-          <div class="form-group medium"><label>NE内訳コード(複数のみ)</label><input type="text" id="neBreakdownCode"></div>
-          <div class="form-group narrow"><label>NE内訳数量</label><input type="number" id="neBreakdownQty" value="0" min="0"></div>
+        <div id="neVariationFields" style="display:none;">
+          <div class="form-row">
+            <div class="form-group medium"><label>NE代表コード(バリのみ)</label><input type="text" id="neRepresentativeCode"></div>
+          </div>
+          <div style="margin-top:8px;">
+            <div style="font-size:12px; font-weight:bold; color:#565959; margin-bottom:6px;">セット内訳商品</div>
+            <div id="setItemsContainer"></div>
+            <button type="button" class="btn" style="background:#f0f6ff; border-color:#0066c0; color:#1864ab; margin-top:4px; font-size:11px;" onclick="addSetItemRow()">＋ 内訳商品を追加</button>
+          </div>
         </div>
       </div>
     </div>
@@ -529,6 +534,33 @@
 
     function syncLotFromNe() {
       document.getElementById('lot').value = document.getElementById('neOrderLot').value;
+    }
+
+    let setItemCounter = 0;
+
+    function addSetItemRow(code = '', qty = 1) {
+      const container = document.getElementById('setItemsContainer');
+      const id = setItemCounter++;
+      const row = document.createElement('div');
+      row.className = 'form-row';
+      row.id = `set-item-${id}`;
+      row.style.marginBottom = '4px';
+      row.innerHTML = `
+        <div class="form-group medium"><input type="text" placeholder="内訳商品コード" value="${code}" data-set-code></div>
+        <div class="form-group narrow"><input type="number" value="${qty}" min="1" data-set-qty style="width:60px;"></div>
+        <button type="button" class="btn btn-sm" style="background:#fff0f0; border-color:#b12704; color:#b12704;" onclick="document.getElementById('set-item-${id}').remove()">削除</button>
+      `;
+      container.appendChild(row);
+    }
+
+    function collectSetItems() {
+      const items = [];
+      document.querySelectorAll('#setItemsContainer .form-row').forEach(row => {
+        const code = row.querySelector('[data-set-code]')?.value?.trim();
+        const qty = parseInt(row.querySelector('[data-set-qty]')?.value) || 1;
+        if (code) items.push({ syohinCode: code, suryo: qty });
+      });
+      return items;
     }
 
     function toggleNeVariation() {
@@ -908,8 +940,7 @@
         neTaxRate: document.getElementById('neTaxRate').value,
         neRegistrationType: document.getElementById('neRegistrationType').value,
         neRepresentativeCode: document.getElementById('neRepresentativeCode').value || null,
-        neBreakdownCode: document.getElementById('neBreakdownCode').value || null,
-        neBreakdownQty: parseInt(document.getElementById('neBreakdownQty').value) || null,
+        setItems: collectSetItems(),
         status: '発注済',
       };
 
@@ -959,8 +990,9 @@
       document.getElementById('btnSave').disabled = true;
       ['wholesalePrice', 'sellingPrice', 'fbmShipping', 'lossStopper', 'highStopper'].forEach(id => document.getElementById(id).value = '0');
       ['modelNumber', 'janCode', 'quantity', 'makerUrl', 'comment', 'supplierName'].forEach(id => document.getElementById(id).value = '');
-      ['neProductCode', 'neRepresentativeCode', 'neBreakdownCode'].forEach(id => document.getElementById(id).value = '');
-      ['neSellingPrice', 'neBreakdownQty'].forEach(id => document.getElementById(id).value = '0');
+      ['neProductCode', 'neRepresentativeCode'].forEach(id => document.getElementById(id).value = '');
+      document.getElementById('neSellingPrice').value = '0';
+      document.getElementById('setItemsContainer').innerHTML = '';
       document.getElementById('neOrderLot').value = '1';
       document.getElementById('supplierSelect').selectedIndex = 0;
       document.getElementById('lot').value = '1';

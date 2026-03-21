@@ -182,6 +182,17 @@ export async function initDb() {
     }
   }
 
+  // セット商品内訳テーブル
+  db.run(`
+    CREATE TABLE IF NOT EXISTS product_set_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+      syohin_code TEXT NOT NULL,
+      suryo INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT DEFAULT (datetime('now','localtime'))
+    )
+  `);
+
   saveToFile();
 }
 
@@ -320,9 +331,9 @@ export function saveProduct(data) {
       ama_single_or_set, variation_flag,
       ne_product_code, ne_supplier_code, ne_cost_excl_tax, ne_selling_price,
       ne_order_lot, ne_tax_rate, ne_registration_type,
-      ne_representative_code, ne_breakdown_code, ne_breakdown_qty,
+      ne_representative_code,
       status
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `, [
     n(data.researchId), n(data.asin), n(data.productName), n(data.amazonUrl), n(data.imageUrl),
     n(data.jan), n(data.partNumber),
@@ -335,12 +346,24 @@ export function saveProduct(data) {
     n(data.amaSingleOrSet), n(data.variationFlag),
     n(data.neProductCode), n(data.neSupplierCode), n(data.neCostExclTax), n(data.neSellingPrice),
     n(data.neOrderLot), n(data.neTaxRate), n(data.neRegistrationType),
-    n(data.neRepresentativeCode), n(data.neBreakdownCode), n(data.neBreakdownQty),
+    n(data.neRepresentativeCode),
     data.status || '発注済',
   ]);
   saveToFile();
   const result = db.exec('SELECT last_insert_rowid() as id');
-  return result[0].values[0][0];
+  const productId = result[0].values[0][0];
+
+  // セット内訳の保存
+  if (data.setItems && Array.isArray(data.setItems)) {
+    for (const item of data.setItems) {
+      if (item.syohinCode) {
+        db.run('INSERT INTO product_set_items (product_id, syohin_code, suryo) VALUES (?,?,?)',
+          [productId, item.syohinCode, item.suryo || 1]);
+      }
+    }
+    saveToFile();
+  }
+  return productId;
 }
 
 export function getProducts(filters = {}) {
@@ -369,15 +392,54 @@ export function updateProductStatus(id, status) {
   saveToFile();
 }
 
+const PRODUCT_EDITABLE = new Set([
+  'asin', 'product_name', 'amazon_url', 'image_url', 'jan', 'part_number',
+  'supplier_code', 'supplier_name', 'maker_url', 'category', 'comment',
+  'wholesale_price', 'tax_rate', 'wholesale_price_with_tax', 'lot',
+  'selling_price', 'referral_fee', 'fba_fee', 'storage_fee', 'total_fee',
+  'profit', 'profit_rate', 'judgment',
+  'fulfillment', 'loss_stopper', 'high_stopper', 'price_tracking', 'point_rate',
+  'ama_single_or_set', 'variation_flag',
+  'ne_product_code', 'ne_supplier_code', 'ne_cost_excl_tax', 'ne_selling_price',
+  'ne_order_lot', 'ne_tax_rate', 'ne_registration_type', 'ne_representative_code',
+  'status',
+]);
+
 export function updateProduct(id, data) {
   const fields = [];
   const params = [];
   for (const [key, value] of Object.entries(data)) {
-    fields.push(`${key} = ?`);
-    params.push(value);
+    if (PRODUCT_EDITABLE.has(key)) {
+      fields.push(`${key} = ?`);
+      params.push(value === undefined ? null : value);
+    }
   }
-  fields.push("updated_at = datetime('now','localtime')");
-  params.push(id);
-  db.run(`UPDATE products SET ${fields.join(', ')} WHERE id = ?`, params);
+  if (fields.length > 0) {
+    fields.push("updated_at = datetime('now','localtime')");
+    params.push(id);
+    db.run(`UPDATE products SET ${fields.join(', ')} WHERE id = ?`, params);
+    saveToFile();
+  }
+}
+
+// ===== Product Set Items =====
+
+export function getSetItems(productId) {
+  return queryAll('SELECT * FROM product_set_items WHERE product_id = ? ORDER BY id', [productId]);
+}
+
+export function saveSetItems(productId, items) {
+  db.run('DELETE FROM product_set_items WHERE product_id = ?', [productId]);
+  for (const item of items) {
+    if (item.syohinCode || item.syohin_code) {
+      db.run('INSERT INTO product_set_items (product_id, syohin_code, suryo) VALUES (?,?,?)',
+        [productId, item.syohinCode || item.syohin_code, item.suryo || 1]);
+    }
+  }
   saveToFile();
+}
+
+export function getProductById(id) {
+  const rows = queryAll('SELECT * FROM products WHERE id = ?', [id]);
+  return rows.length > 0 ? rows[0] : null;
 }
