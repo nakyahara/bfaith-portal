@@ -102,6 +102,7 @@
         <option value="Amazon出品済">Amazon出品済</option>
       </select>
       <button class="btn btn-primary" onclick="bulkChangeStatus()" style="font-size:11px;">適用</button>
+      <button class="btn" style="background:#fff0f0; border-color:#b12704; color:#b12704; font-size:11px;" onclick="bulkDelete()">一括削除</button>
       <button class="btn btn-export" onclick="exportNeCsv('single')">NE単品CSV</button>
       <button class="btn btn-export" onclick="exportNeCsv('set')">NEセット商品CSV</button>
       <span class="count" id="countDisplay">-</span>
@@ -424,6 +425,21 @@
         ));
         document.getElementById('bulkStatusSelect').value = '';
         showToast(`${ids.length}件を「${status}」に変更しました`);
+        loadData();
+      } catch (e) { alert('エラー: ' + e.message); }
+    }
+
+    async function bulkDelete() {
+      const ids = getSelectedIds();
+      if (ids.length === 0) { alert('削除する商品をチェックボックスで選択してください'); return; }
+      if (!confirm(`${ids.length}件の商品を削除しますか？\nこの操作は取り消せません。`)) return;
+
+      try {
+        await Promise.all(ids.map(id =>
+          fetch(`./api/products/${id}`, { method: 'DELETE' })
+        ));
+        expandedId = null;
+        showToast(`${ids.length}件を削除しました`);
         loadData();
       } catch (e) { alert('エラー: ' + e.message); }
     }
