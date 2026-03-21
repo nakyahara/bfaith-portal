@@ -210,8 +210,9 @@ router.post('/api/products/:id/list-amazon', async (req, res) => {
     const sku = isFba ? null : (product.ne_product_code || null);
     if (!isFba && !sku) return res.status(400).json({ error: 'NE商品コード（SKU）が設定されていません' });
 
-    // FBM: 保存済み配送テンプレートを取得
+    // FBM: 保存済み設定を取得
     const shippingTemplate = !isFba ? getSetting('amazon_shipping_template') : null;
+    const paymentRestriction = !isFba ? (getSetting('amazon_payment_restriction') || 'none') : 'none';
 
     const result = await createListing({
       asin: product.asin,
@@ -219,6 +220,7 @@ router.post('/api/products/:id/list-amazon', async (req, res) => {
       isFba,
       sku,
       shippingTemplate,
+      paymentRestriction,
     });
 
     // 成功時にステータスを「Amazon出品済」に更新

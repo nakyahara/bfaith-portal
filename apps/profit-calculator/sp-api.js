@@ -222,7 +222,7 @@ export async function getShippingTemplates() {
 /**
  * Amazon出品登録（Listings Items API）
  */
-export async function createListing({ asin, price, isFba, sku, condition = 'new_new', shippingTemplate = null }) {
+export async function createListing({ asin, price, isFba, sku, condition = 'new_new', shippingTemplate = null, paymentRestriction = 'none' }) {
   const sp = getClient();
   const marketplaceId = MARKETPLACE_ID();
   const sellerId = SELLER_ID();
@@ -248,9 +248,23 @@ export async function createListing({ asin, price, isFba, sku, condition = 'new_
     }],
   };
 
-  // FBM: 配送テンプレートが設定されている場合のみ付与
-  if (!isFba && shippingTemplate) {
-    attributes.merchant_shipping_group = [{ value: shippingTemplate, marketplace_id: marketplaceId }];
+  // FBM: 配送テンプレート・支払方法制限
+  if (!isFba) {
+    if (shippingTemplate) {
+      attributes.merchant_shipping_group = [{ value: shippingTemplate, marketplace_id: marketplaceId }];
+    }
+    if (paymentRestriction && paymentRestriction !== 'none') {
+      const exclusions = [];
+      if (paymentRestriction === 'cod' || paymentRestriction === 'cod_cvs') {
+        exclusions.push({ value: 'COD', marketplace_id: marketplaceId });
+      }
+      if (paymentRestriction === 'cvs' || paymentRestriction === 'cod_cvs') {
+        exclusions.push({ value: 'CVS', marketplace_id: marketplaceId });
+      }
+      if (exclusions.length > 0) {
+        attributes.payment_option_exclusion = exclusions;
+      }
+    }
   }
 
   const body = {

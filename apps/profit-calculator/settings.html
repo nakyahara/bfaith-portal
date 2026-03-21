@@ -19,15 +19,18 @@
     .container { max-width: 900px; margin: 16px auto; padding: 0 16px; }
 
     .panel { background: #fff; border: 1px solid #d5d9d9; border-radius: 8px; padding: 16px 20px; margin-bottom: 14px; }
-    .panel-title { font-size: 14px; font-weight: bold; margin-bottom: 12px; padding-bottom: 6px; border-bottom: 2px solid #ff9900; }
+    .panel-title { font-size: 14px; font-weight: bold; margin-bottom: 12px; padding-bottom: 6px; border-bottom: 2px solid #ff9900; display: flex; align-items: center; gap: 8px; }
+    .panel-title .badge { font-size: 11px; padding: 2px 8px; border-radius: 10px; font-weight: bold; }
+    .badge-fbm { background: #d1ecf1; color: #0c5460; }
+    .badge-fba { background: #fff3cd; color: #856404; }
     .panel-desc { font-size: 12px; color: #565959; margin-bottom: 14px; }
 
-    .setting-row { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+    .setting-row { display: flex; gap: 12px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
     .setting-label { font-size: 13px; font-weight: bold; width: 160px; flex-shrink: 0; }
     .setting-value { flex: 1; display: flex; gap: 8px; align-items: center; }
     .setting-value select, .setting-value input { padding: 6px 8px; border: 1px solid #888; border-radius: 4px; font-size: 13px; flex: 1; min-width: 200px; }
     .setting-value select:focus, .setting-value input:focus { border-color: #e77600; outline: none; box-shadow: 0 0 3px #e77600; }
-    .setting-current { font-size: 12px; color: #565959; margin-top: 4px; }
+    .setting-current { font-size: 12px; color: #565959; margin-top: 4px; margin-bottom: 8px; }
     .setting-current .val { color: #007600; font-weight: bold; }
 
     .btn { padding: 6px 14px; border-radius: 4px; font-size: 12px; font-weight: bold; cursor: pointer; border: 1px solid; white-space: nowrap; }
@@ -41,6 +44,9 @@
     .status-msg.success { color: #007600; }
     .status-msg.error { color: #b12704; }
     .status-msg.info { color: #565959; }
+
+    .divider { margin: 14px 0; padding-top: 12px; border-top: 1px solid #eee; }
+    .sub-note { font-size: 11px; color: #565959; margin-left: 172px; margin-top: -8px; margin-bottom: 10px; }
 
     .toast { position: fixed; top: 20px; right: 20px; background: #067D62; color: #fff; padding: 12px 20px; border-radius: 8px; font-size: 14px; display: none; z-index: 100; box-shadow: 0 2px 8px rgba(0,0,0,0.3); }
   </style>
@@ -61,11 +67,13 @@
   </div>
 
   <div class="container">
-    <!-- Amazon出品設定 -->
-    <div class="panel">
-      <div class="panel-title">Amazon出品設定</div>
-      <div class="panel-desc">FBM（自社出荷）でAmazon出品する際の配送テンプレートを設定します。<br>セラーセントラルで作成した配送テンプレートを選択してください。</div>
 
+    <!-- ========== FBM（自社出荷）設定 ========== -->
+    <div class="panel">
+      <div class="panel-title">Amazon出品設定 <span class="badge badge-fbm">FBM・自社出荷</span></div>
+      <div class="panel-desc">FBM（自社出荷）でAmazon出品する際の初期設定です。ここで設定した内容が出品時に自動適用されます。</div>
+
+      <!-- 配送テンプレート -->
       <div class="setting-row">
         <div class="setting-label">配送テンプレート</div>
         <div class="setting-value">
@@ -78,7 +86,7 @@
       <div class="setting-current" id="currentTemplate"></div>
       <div class="status-msg" id="fetchStatus"></div>
 
-      <div style="margin-top: 14px; padding-top: 12px; border-top: 1px solid #eee;">
+      <div class="divider">
         <div class="setting-row">
           <div class="setting-label">手動入力</div>
           <div class="setting-value">
@@ -86,45 +94,87 @@
             <button class="btn btn-primary" onclick="applyManual()">適用</button>
           </div>
         </div>
-        <div style="font-size:11px; color:#565959; margin-left:172px;">Amazonから取得できない場合はセラーセントラルのテンプレート名を直接入力してください</div>
+        <div class="sub-note">Amazonから取得できない場合はセラーセントラルのテンプレート名を直接入力してください</div>
+      </div>
+
+      <!-- 支払い方法の制限 -->
+      <div class="divider">
+        <div class="setting-row">
+          <div class="setting-label">支払い方法の制限</div>
+          <div class="setting-value">
+            <select id="paymentRestriction">
+              <option value="none">全ての支払い方法を許可する</option>
+              <option value="cod">代引換を選べないようにする</option>
+              <option value="cvs">コンビニ決済を選べないようにする</option>
+              <option value="cod_cvs">代引換とコンビニ決済を選べないようにする</option>
+            </select>
+          </div>
+        </div>
+        <div class="setting-current" id="currentPayment"></div>
       </div>
 
       <div style="margin-top: 16px; text-align: right;">
-        <button class="btn btn-save" onclick="saveTemplate()">保存</button>
+        <button class="btn btn-save" onclick="saveFbmSettings()">FBM設定を保存</button>
       </div>
     </div>
+
+    <!-- ========== FBA設定 ========== -->
+    <div class="panel">
+      <div class="panel-title">Amazon出品設定 <span class="badge badge-fba">FBA</span></div>
+      <div class="panel-desc">FBA（Amazonから発送）でAmazon出品する際の初期設定です。</div>
+
+      <div style="padding: 20px; text-align: center; color: #888; font-size: 13px;">
+        FBA固有の設定は今後追加予定です
+      </div>
+    </div>
+
   </div>
 
   <div class="toast" id="toast"></div>
 
   <script>
-    let savedValue = '';
+    const PAYMENT_LABELS = {
+      none: '全ての支払い方法を許可する',
+      cod: '代引換を選べないようにする',
+      cvs: 'コンビニ決済を選べないようにする',
+      cod_cvs: '代引換とコンビニ決済を選べないようにする',
+    };
 
-    document.addEventListener('DOMContentLoaded', loadCurrentSetting);
+    document.addEventListener('DOMContentLoaded', loadAllSettings);
 
-    async function loadCurrentSetting() {
+    async function loadAllSettings() {
       try {
-        const res = await fetch('./api/settings/amazon_shipping_template');
-        const data = await res.json();
-        savedValue = data.value || '';
-        updateCurrentDisplay();
-        if (savedValue) {
+        const res = await fetch('./api/settings');
+        const settings = await res.json();
+
+        // 配送テンプレート
+        const tmpl = settings.amazon_shipping_template || '';
+        if (tmpl) {
           const sel = document.getElementById('shippingTemplateSelect');
-          addOptionIfMissing(sel, savedValue);
-          sel.value = savedValue;
+          addOptionIfMissing(sel, tmpl);
+          sel.value = tmpl;
         }
+        updateDisplay('currentTemplate', tmpl, '配送テンプレート');
+
+        // 支払い方法の制限
+        const pay = settings.amazon_payment_restriction || 'none';
+        document.getElementById('paymentRestriction').value = pay;
+        updateDisplay('currentPayment', PAYMENT_LABELS[pay] || pay, '支払い方法');
       } catch (e) { console.error('設定読み込みエラー:', e); }
     }
 
-    function updateCurrentDisplay() {
-      const el = document.getElementById('currentTemplate');
-      if (savedValue) {
-        el.innerHTML = `現在の設定: <span class="val">${esc(savedValue)}</span>`;
+    function updateDisplay(elId, value, label) {
+      const el = document.getElementById(elId);
+      if (value && value !== 'none') {
+        el.innerHTML = `現在の設定: <span class="val">${esc(value)}</span>`;
+      } else if (label === '支払い方法') {
+        el.innerHTML = '現在の設定: <span class="val">全ての支払い方法を許可する</span>';
       } else {
         el.innerHTML = '現在の設定: <span style="color:#888;">未設定</span>';
       }
     }
 
+    // ── 配送テンプレート取得 ──
     async function fetchTemplates() {
       const btn = document.getElementById('btnFetch');
       const status = document.getElementById('fetchStatus');
@@ -137,12 +187,12 @@
         const data = await res.json();
         if (!res.ok) {
           status.className = 'status-msg error';
-          status.textContent = 'エラー: ' + (data.error || '取得失敗');
+          status.textContent = 'エラー: ' + (data.error || '取得失敗') + '（手動入力をお使いください）';
           return;
         }
 
         const sel = document.getElementById('shippingTemplateSelect');
-        const current = sel.value || savedValue;
+        const current = sel.value;
         sel.innerHTML = '<option value="">未設定（デフォルト）</option>';
         data.forEach(t => {
           const opt = document.createElement('option');
@@ -172,27 +222,35 @@
       addOptionIfMissing(sel, val);
       sel.value = val;
       document.getElementById('manualTemplate').value = '';
-      showToast(`「${val}」を選択しました。「保存」を押して確定してください。`);
+      showToast(`「${val}」を選択しました。「FBM設定を保存」を押して確定してください。`);
     }
 
-    async function saveTemplate() {
-      const value = document.getElementById('shippingTemplateSelect').value;
+    // ── FBM設定保存 ──
+    async function saveFbmSettings() {
+      const template = document.getElementById('shippingTemplateSelect').value;
+      const payment = document.getElementById('paymentRestriction').value;
+
       try {
-        await fetch('./api/settings/amazon_shipping_template', {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ value: value || null }),
-        });
-        savedValue = value || '';
-        updateCurrentDisplay();
-        if (value) {
-          showToast(`配送テンプレート「${value}」を保存しました`);
-        } else {
-          showToast('配送テンプレート設定を解除しました');
-        }
+        await Promise.all([
+          fetch('./api/settings/amazon_shipping_template', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ value: template || null }),
+          }),
+          fetch('./api/settings/amazon_payment_restriction', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ value: payment }),
+          }),
+        ]);
+
+        updateDisplay('currentTemplate', template, '配送テンプレート');
+        updateDisplay('currentPayment', PAYMENT_LABELS[payment] || payment, '支払い方法');
+        showToast('FBM設定を保存しました');
       } catch (e) { alert('保存エラー: ' + e.message); }
     }
 
+    // ── ユーティリティ ──
     function addOptionIfMissing(sel, val) {
       if (!Array.from(sel.options).some(o => o.value === val)) {
         const opt = document.createElement('option');
