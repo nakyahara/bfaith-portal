@@ -222,6 +222,26 @@ router.delete('/api/suppliers', (req, res) => {
   }
 });
 
+// ── API: 日→英変換（商品コード用） ──
+router.get('/api/translate', async (req, res) => {
+  const word = req.query.word;
+  if (!word) return res.json({ english: '' });
+
+  // Google Translate の非公式API（無料・軽量）
+  try {
+    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=ja&tl=en&dt=t&q=${encodeURIComponent(word)}`;
+    const resp = await fetch(url);
+    const data = await resp.json();
+    const translated = data?.[0]?.[0]?.[0] || '';
+    // 英語に変換してケバブケースに
+    const english = translated.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    res.json({ english, raw: translated });
+  } catch (err) {
+    console.error('[Translate]', err.message);
+    res.json({ english: '', error: err.message });
+  }
+});
+
 // ── API: 送料テーブル ──
 router.get('/api/shipping', (req, res) => {
   res.json(loadShipping());

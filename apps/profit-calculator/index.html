@@ -210,8 +210,16 @@
         NextEngine登録情報 <span id="neToggle" style="float:right; font-size:12px; color:#0066c0;">▲ 閉じる</span>
       </div>
       <div id="neBody">
-        <div class="form-row">
-          <div class="form-group medium"><label>NE商品コード</label><input type="text" id="neProductCode" placeholder="NE商品コード"></div>
+        <div class="form-row" style="align-items:flex-start;">
+          <div class="form-group medium"><label>NE商品コード</label><input type="text" id="neProductCode" placeholder="例: salt001"></div>
+          <div style="display:flex; flex-direction:column; gap:3px;">
+            <label style="font-size:11px; font-weight:bold; color:#565959;">日→英変換</label>
+            <div style="display:flex; gap:4px; align-items:center;">
+              <input type="text" id="codeTranslateInput" placeholder="日本語" style="width:100px; padding:5px 7px; border:1px solid #888; border-radius:4px; font-size:12px;">
+              <button class="btn" style="background:#f0f6ff; border-color:#0066c0; color:#1864ab; padding:5px 8px; font-size:11px;" onclick="translateForCode()">変換</button>
+            </div>
+            <div id="codeTranslateResult" style="font-size:11px; color:#0066c0; min-height:16px;"></div>
+          </div>
           <div class="form-group medium">
             <label>配送方法</label>
             <select id="neShippingMethod" onchange="calcNeSellingPrice()">
@@ -448,6 +456,76 @@
       document.getElementById('variationFlag').addEventListener('change', toggleNeVariation);
       document.getElementById('neRegistrationType').addEventListener('change', toggleNeVariation);
     });
+
+    // === 日→英変換（商品コード用） ===
+    const CODE_DICT = {
+      '塩':'salt','醤油':'soy-sauce','味噌':'miso','酢':'vinegar','砂糖':'sugar',
+      '油':'oil','酒':'sake','みりん':'mirin','だし':'dashi','海苔':'nori',
+      '昆布':'kombu','鰹節':'katsuobushi','わかめ':'wakame','ひじき':'hijiki',
+      'ごま':'sesame','きな粉':'kinako','片栗粉':'katakuriko','小麦粉':'flour',
+      '米':'rice','パン':'bread','麺':'noodle','うどん':'udon','そば':'soba',
+      'ラーメン':'ramen','パスタ':'pasta','カレー':'curry','スープ':'soup',
+      'ジャム':'jam','はちみつ':'honey','バター':'butter','チーズ':'cheese',
+      'ヨーグルト':'yogurt','牛乳':'milk','豆腐':'tofu','納豆':'natto',
+      '茶':'tea','コーヒー':'coffee','ジュース':'juice','水':'water',
+      'お菓子':'snack','チョコ':'chocolate','クッキー':'cookie','飴':'candy',
+      'ナッツ':'nuts','ドライフルーツ':'dried-fruit',
+      '石鹸':'soap','シャンプー':'shampoo','洗剤':'detergent','歯磨き':'toothpaste',
+      'タオル':'towel','ブラシ':'brush','スポンジ':'sponge',
+      'クリーム':'cream','ローション':'lotion','オイル':'oil',
+      '化粧水':'toner','乳液':'emulsion','美容液':'serum',
+      'リップ':'lip','ハンドクリーム':'hand-cream',
+      'サプリ':'supplement','ビタミン':'vitamin','プロテイン':'protein',
+      '袋':'bag','箱':'box','ボトル':'bottle','缶':'can','瓶':'jar',
+      'セット':'set','詰め合わせ':'assort','ギフト':'gift',
+      '調味料':'seasoning','食品':'food','飲料':'drink','日用品':'daily',
+      '雑貨':'goods','キッチン':'kitchen','収納':'storage','文具':'stationery',
+      'おもちゃ':'toy','ペット':'pet','ベビー':'baby','介護':'care',
+      'アロマ':'aroma','キャンドル':'candle','インセンス':'incense',
+      'マスク':'mask','除菌':'sanitize','消臭':'deodorize',
+    };
+
+    async function translateForCode() {
+      const input = document.getElementById('codeTranslateInput').value.trim();
+      if (!input) return;
+      const resultEl = document.getElementById('codeTranslateResult');
+
+      // 辞書チェック
+      if (CODE_DICT[input]) {
+        const eng = CODE_DICT[input];
+        resultEl.innerHTML = `<span style="cursor:pointer;" onclick="applyCodeTranslation('${eng}')" title="クリックでNE商品コードに挿入">→ <b>${eng}</b> (クリックで挿入)</span>`;
+        return;
+      }
+
+      // サーバーAPI経由で翻訳
+      resultEl.textContent = '変換中...';
+      try {
+        const res = await fetch(`./api/translate?word=${encodeURIComponent(input)}`);
+        const data = await res.json();
+        if (data.english) {
+          resultEl.innerHTML = `<span style="cursor:pointer;" onclick="applyCodeTranslation('${data.english}')" title="クリックでNE商品コードに挿入">→ <b>${data.english}</b> (クリックで挿入)</span>`;
+        } else {
+          resultEl.textContent = '変換できませんでした';
+        }
+      } catch (e) {
+        resultEl.textContent = 'エラー';
+      }
+    }
+
+    function applyCodeTranslation(eng) {
+      const codeEl = document.getElementById('neProductCode');
+      const current = codeEl.value;
+      if (current) {
+        // 既存の値がある場合は末尾に追加
+        codeEl.value = current + '-' + eng;
+      } else {
+        codeEl.value = eng;
+      }
+      codeEl.focus();
+    }
+
+    // Enter で変換
+    document.getElementById('codeTranslateInput').addEventListener('keypress', e => { if (e.key === 'Enter') translateForCode(); });
 
     function syncLotFromNe() {
       document.getElementById('lot').value = document.getElementById('neOrderLot').value;
