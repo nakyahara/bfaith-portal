@@ -158,3 +158,76 @@ export async function getFees(asin, price, isFba = true) {
     totalFee: r.FeesEstimate.TotalFeesEstimate.Amount,
   };
 }
+
+const SELLER_ID = () => process.env.SP_API_SELLER_ID || 'A12Y1HFMZNA9GI';
+
+/**
+ * SKU自動採番（FBA用）: pr_YYYYMMDD_連番
+ */
+function generateFbaSku() {
+  const d = new Date();
+  const date = d.toISOString().slice(0, 10).replace(/-/g, '');
+  const serial = String(d.getTime()).slice(-4);
+  return `pr_${date}_${serial}`;
+}
+
+/**
+ * Amazon出品登録（Listings Items API）
+ */
+export async function createListing({ asin, price, isFba, sku, condition = 'new_new' }) {
+  const sp = getClient();
+  const marketplaceId = MARKETPLACE_ID();
+  const sellerId = SELLER_ID();
+
+  // SKU決定
+  const finalSku = sku || (isFba ? generateFbaSku() : null);
+  if (!finalSku) throw new Error('SKUが必要です（FBMの場合はNE商品コードを指定）');
+  if (!asin) throw new Error('ASINが必要です');
+  if (!price || price <= 0) throw new Error('販売価格が必要です');
+
+  // Listings Items API - putListingsItem
+  const attributes = {
+    condition_type: [{ value: condition, marketplace_id: marketplaceId }],
+    merchant_suggested_asin: [{ value: asin, marketplace_id: marketplaceId }],
+    purchasable_offer: [{
+      marketplace_id: marketplaceId,
+      currency: 'JPY',
+      our_price: [{ schedule: [{ value_with_tax: price }] }],
+    }],
+    fulfillment_availability: [{
+      fulfillment_channel_code: isFba ? 'AMAZON_JP' : 'DEFAULT',
+      marketplace_id: marketplaceId,
+    }],
+  };
+
+  // 自社出荷: 代引・コンビニ不可 + ネコポスマケプレプライム配送
+  if (!isFba) {
+    attributes.merchant_shipping_group = [{ value: 'ネコポスマケプレプライム', marketplace_id: marketplaceId }];
+    // 代引・コンビニ不可
+    attributes.cash_on_delivery_unavailable = [{ marketplace_id: marketplaceId }];
+    attributes.payment_option_exclusion = [{ value: 'COD', marketplace_id: marketplaceId }, { value: 'CVS', marketplace_id: marketplaceId }];
+  }
+
+  const body = {
+    productType: 'PRODUCT',
+    requirements: 'LISTING_OFFER_ONLY',
+    attributes,
+  };
+
+  const result = await sp.callAPI({
+    operation: 'putListingsItem',
+    endpoint: 'listingsItems',
+    path: { sellerId, sku: finalSku },
+    query: { marketplaceIds: [marketplaceId] },
+    body,
+    options: { version: '2021-08-01' },
+  });
+
+  return {
+    sku: finalSku,
+    asin,
+    status: result.status,
+    submissionId: result.submissionId,
+    issues: result.issues || [],
+  };
+}

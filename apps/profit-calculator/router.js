@@ -4,7 +4,7 @@
 import { Router } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { getProduct, getFees } from './sp-api.js';
+import { getProduct, getFees, createListing } from './sp-api.js';
 import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, deleteProduct, getSetItems, saveSetItems } from './db.js';
 import { loadSuppliers, addSupplier, deleteSupplier } from './suppliers.js';
 import { loadShipping, addShipping, updateShipping, deleteShipping } from './shipping.js';
@@ -181,6 +181,41 @@ router.put('/api/products/:id', async (req, res) => {
     if (updated) updated.set_items = getSetItems(id);
     res.json(updated || { ok: true });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── API: Amazon出品登録 ──
+router.post('/api/products/:id/list-amazon', async (req, res) => {
+  try {
+    await ensureDb();
+    const id = parseInt(req.params.id);
+    const product = getProductById(id);
+    if (!product) return res.status(404).json({ error: '商品が見つかりません' });
+
+    const isFba = product.fulfillment === 'FBA';
+    const price = product.selling_price || product.ne_selling_price;
+    if (!price) return res.status(400).json({ error: '販売価格が設定されていません' });
+    if (!product.asin) return res.status(400).json({ error: 'ASINが設定されていません' });
+
+    const sku = isFba ? null : (product.ne_product_code || null);
+    if (!isFba && !sku) return res.status(400).json({ error: 'NE商品コード（SKU）が設定されていません' });
+
+    const result = await createListing({
+      asin: product.asin,
+      price,
+      isFba,
+      sku,
+    });
+
+    // 成功時にステータスを「Amazon出品済」に更新、SKUを保存
+    if (result.status === 'ACCEPTED') {
+      updateProduct(id, { status: 'Amazon出品済' });
+    }
+
+    res.json(result);
+  } catch (err) {
+    console.error('[ProfitCalc] Amazon出品エラー:', err.message);
     res.status(500).json({ error: err.message });
   }
 });

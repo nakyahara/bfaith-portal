@@ -103,6 +103,7 @@
       </select>
       <button class="btn btn-primary" onclick="bulkChangeStatus()" style="font-size:11px;">適用</button>
       <button class="btn" style="background:#fff0f0; border-color:#b12704; color:#b12704; font-size:11px;" onclick="bulkDelete()">一括削除</button>
+      <button class="btn" style="background:#232f3e; border-color:#232f3e; color:#ff9900; font-size:11px; font-weight:bold;" onclick="bulkListOnAmazon()">Amazon一括出品</button>
       <button class="btn btn-export" onclick="exportNeCsv('single')">NE単品CSV</button>
       <button class="btn btn-export" onclick="exportNeCsv('set')">NEセット商品CSV</button>
       <span class="count" id="countDisplay">-</span>
@@ -274,6 +275,7 @@
         <div class="detail-actions">
           <button class="btn" style="background:#fff0f0; border-color:#b12704; color:#b12704; margin-right:auto;" onclick="deleteProduct(${p.id}, '${esc(p.product_name || '')}')">削除</button>
           <button class="btn btn-save" onclick="saveDetail(${p.id})">保存</button>
+          ${p.asin ? `<button class="btn" style="background:#232f3e; border-color:#232f3e; color:#ff9900; font-weight:bold;" onclick="listOnAmazon(${p.id})">Amazon出品</button>` : ''}
         </div>
       </div>`;
     }
@@ -450,6 +452,52 @@
 
     function getSelectedIds() {
       return Array.from(document.querySelectorAll('.row-check:checked')).map(cb => cb.value);
+    }
+
+    async function listOnAmazon(id) {
+      const p = allData.find(d => d.id === id);
+      if (!p) return;
+      const isFba = p.fulfillment === 'FBA';
+      const skuInfo = isFba ? '自動採番(pr_日付_連番)' : (p.ne_product_code || '未設定');
+      if (!confirm(`「${p.product_name}」をAmazonに出品しますか？\n\n種別: ${p.fulfillment}\nSKU: ${skuInfo}\n価格: ¥${(p.selling_price || p.ne_selling_price || 0).toLocaleString()}`)) return;
+
+      try {
+        const res = await fetch(`./api/products/${id}/list-amazon`, { method: 'POST' });
+        const result = await res.json();
+        if (!res.ok) { alert('出品エラー: ' + result.error); return; }
+        if (result.issues && result.issues.length > 0) {
+          alert('出品に問題があります:\n' + result.issues.map(i => `・${i.message}`).join('\n'));
+        }
+        showToast(`Amazon出品完了 (SKU: ${result.sku}, ステータス: ${result.status})`);
+        loadData();
+      } catch (e) { alert('通信エラー: ' + e.message); }
+    }
+
+    async function bulkListOnAmazon() {
+      const ids = getSelectedIds();
+      if (ids.length === 0) { alert('出品する商品をチェックボックスで選択してください'); return; }
+
+      // ASINがない商品を除外
+      const validProducts = ids.filter(id => {
+        const p = allData.find(d => String(d.id) === String(id));
+        return p && p.asin;
+      });
+      if (validProducts.length === 0) { alert('選択した商品にASINが設定されていません'); return; }
+      if (validProducts.length < ids.length) {
+        alert(`${ids.length - validProducts.length}件はASIN未設定のためスキップします`);
+      }
+
+      if (!confirm(`${validProducts.length}件をAmazonに出品しますか？`)) return;
+
+      let ok = 0, ng = 0;
+      for (const id of validProducts) {
+        try {
+          const res = await fetch(`./api/products/${id}/list-amazon`, { method: 'POST' });
+          if (res.ok) { ok++; } else { ng++; }
+        } catch { ng++; }
+      }
+      showToast(`Amazon出品完了: ${ok}件成功, ${ng}件エラー`);
+      loadData();
     }
 
     async function deleteProduct(id, name) {
