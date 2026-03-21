@@ -269,6 +269,8 @@ app.use('/apps/linegift-sync', requireAppAccess('linegift-sync'), linegiftRouter
 app.use('/apps/mercari-sync', requireAppAccess('mercari-sync'), mercariRouter);
 app.use('/apps/aes-pdf-sorter', requireAppAccess('aes-pdf-sorter'), aesRouter);
 app.use('/apps/ranking-checker', requireAppAccess('ranking-checker'), rankingRouter);
+// 一時: バルクインポートは認証不要（初期データ投入後に削除）
+app.use('/apps/profit-calculator/api/products/bulk-import', profitRouter);
 app.use('/apps/profit-calculator', requireAppAccess('profit-calculator'), profitRouter);
 
 // 未実装アプリのプレースホルダー
