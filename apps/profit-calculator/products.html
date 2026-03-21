@@ -493,6 +493,25 @@
         a.download = res.headers.get('Content-Disposition')?.match(/filename="(.+)"/)?.[1] || 'ne_export.csv';
         a.click();
         URL.revokeObjectURL(a.href);
+
+        // NE登録前の商品をNE登録済に変更するか確認
+        const neBeforeIds = ids.filter(id => {
+          const p = allData.find(d => String(d.id) === String(id));
+          return p && p.status === 'NE登録前';
+        });
+        if (neBeforeIds.length > 0) {
+          if (confirm(`CSV出力した${neBeforeIds.length}件の「NE登録前」をステータス「NE登録済」に変更しますか？`)) {
+            await Promise.all(neBeforeIds.map(id =>
+              fetch(`./api/products/${id}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ status: 'NE登録済' }),
+              })
+            ));
+            showToast(`${neBeforeIds.length}件を「NE登録済」に変更しました`);
+            loadData();
+          }
+        }
       } catch (e) { alert('通信エラー: ' + e.message); }
     }
 
