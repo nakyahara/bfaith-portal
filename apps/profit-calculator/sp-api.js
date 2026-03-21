@@ -256,10 +256,10 @@ export async function createListing({ asin, price, isFba, sku, condition = 'new_
     if (paymentRestriction && paymentRestriction !== 'none') {
       const exclusions = [];
       if (paymentRestriction === 'cod' || paymentRestriction === 'cod_cvs') {
-        exclusions.push({ value: 'COD', marketplace_id: marketplaceId });
+        exclusions.push({ value: '代引引換（商品代引）不可', marketplace_id: marketplaceId });
       }
       if (paymentRestriction === 'cvs' || paymentRestriction === 'cod_cvs') {
-        exclusions.push({ value: 'CVS', marketplace_id: marketplaceId });
+        exclusions.push({ value: 'コンビニ決済不可', marketplace_id: marketplaceId });
       }
       if (exclusions.length > 0) {
         attributes.payment_option_exclusion = exclusions;
