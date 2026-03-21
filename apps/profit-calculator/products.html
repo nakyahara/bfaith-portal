@@ -245,7 +245,6 @@
             <div class="detail-section-title">NextEngine情報</div>
             ${dRow('NE商品コード', 'ne_product_code', p.ne_product_code, p.id)}
             ${dRow('NE仕入先コード', 'ne_supplier_code', p.ne_supplier_code, p.id)}
-            ${dRow('NE仕入価格(税抜)', 'ne_cost_excl_tax', p.ne_cost_excl_tax, p.id, 'number')}
             ${dRow('NE販売価格', 'ne_selling_price', p.ne_selling_price, p.id, 'number')}
             ${dRow('NE発注ロット', 'ne_order_lot', p.ne_order_lot, p.id, 'number')}
             ${dSelectWithEvent('NE税率', 'ne_tax_rate', p.ne_tax_rate, ['10%','8%'], p.id, `onchange="calcTaxIncl(${p.id})"`)}
@@ -391,6 +390,8 @@
         });
       }
       fields.set_items = setItems;
+      // NE仕入価格 = 卸価格と同値
+      if (fields.wholesale_price != null) fields.ne_cost_excl_tax = fields.wholesale_price;
 
       try {
         const res = await fetch(`./api/products/${id}`, {
