@@ -101,6 +101,7 @@
         <option value="">一括ステータス変更</option>
         <option value="NE登録前">NE登録前</option>
         <option value="NE登録済">NE登録済</option>
+        <option value="入荷待ち">入荷待ち</option>
       </select>
       <button class="btn btn-primary" onclick="bulkChangeStatus()" style="font-size:11px;">適用</button>
       <button class="btn" style="background:#fff0f0; border-color:#b12704; color:#b12704; font-size:11px;" onclick="bulkDelete()">一括削除</button>
@@ -193,7 +194,11 @@
           <td class="num">${p.wholesale_price_with_tax ? '¥'+Number(p.wholesale_price_with_tax).toLocaleString() : '-'}</td>
           <td class="num">${p.ne_selling_price ? '¥'+Number(p.ne_selling_price).toLocaleString() : '-'}</td>
           <td class="num ${(p.profit_rate||0) >= 0.1 ? 'positive' : 'negative'}">${p.profit_rate != null ? (p.profit_rate*100).toFixed(1)+'%' : '-'}</td>
-          <td><span class="status-badge ${p.status || ''}">${p.status || '-'}</span></td>
+          <td onclick="event.stopPropagation()">
+            <select class="status-select" onchange="changeStatus(${p.id}, this.value)" style="font-size:11px; padding:2px 4px; border-radius:4px;">
+              ${['NE登録前','NE登録済','入荷待ち'].map(s => `<option value="${s}" ${p.status===s?'selected':''}>${s}</option>`).join('')}
+            </select>
+          </td>
           <td style="font-size:11px;">${p.created_at ? p.created_at.slice(0,10) : '-'}</td>
         </tr>`;
 
@@ -412,6 +417,17 @@
         renderTable();
         showToast('保存しました');
       } catch (e) { showToast('エラー: ' + e.message); }
+    }
+
+    async function changeStatus(id, status) {
+      if (!status) return;
+      await fetch(`./api/products/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status }),
+      });
+      showToast(`ステータスを「${status}」に変更`);
+      loadData();
     }
 
     async function bulkChangeStatus() {
