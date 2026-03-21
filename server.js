@@ -270,7 +270,17 @@ app.use('/apps/mercari-sync', requireAppAccess('mercari-sync'), mercariRouter);
 app.use('/apps/aes-pdf-sorter', requireAppAccess('aes-pdf-sorter'), aesRouter);
 app.use('/apps/ranking-checker', requireAppAccess('ranking-checker'), rankingRouter);
 // 一時: バルクインポートは認証不要（初期データ投入後に削除）
-app.use('/apps/profit-calculator/api/products/bulk-import', profitRouter);
+app.post('/apps/profit-calculator/api/products/bulk-import', async (req, res) => {
+  try {
+    const { initDb, saveProduct } = await import('./apps/profit-calculator/db.js');
+    await initDb();
+    const items = req.body;
+    if (!Array.isArray(items)) return res.status(400).json({ error: 'Array required' });
+    const ids = [];
+    for (const item of items) { ids.push(saveProduct(item)); }
+    res.json({ imported: ids.length, ids });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 app.use('/apps/profit-calculator', requireAppAccess('profit-calculator'), profitRouter);
 
 // 未実装アプリのプレースホルダー
