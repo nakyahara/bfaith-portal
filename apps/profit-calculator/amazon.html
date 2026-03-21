@@ -50,6 +50,7 @@
     .status-badge.発注済 { background: #e8d5f5; color: #6741d9; }
     .status-badge.出品済 { background: #b2f2bb; color: #087f23; }
     .status-badge.Amazon出品エラー { background: #ffe0e0; color: #b12704; }
+    .status-badge.NE在庫連携済 { background: #d0f0fd; color: #0c5460; }
     .fulfillment-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: bold; }
     .fulfillment-badge.FBA { background: #fff3cd; color: #856404; }
     .fulfillment-badge.FBM { background: #d1ecf1; color: #0c5460; }
@@ -97,6 +98,7 @@
         <option value="入荷待ち">入荷待ち</option>
         <option value="Amazon出品済">Amazon出品済</option>
         <option value="Amazon出品エラー">Amazon出品エラー</option>
+        <option value="NE在庫連携済">NE在庫連携済</option>
       </select>
       <input type="text" id="searchInput" placeholder="ASIN・商品名で検索" oninput="debounceLoad()">
       <select id="bulkStatusSelect" style="padding:5px 8px; border:1px solid #888; border-radius:4px; font-size:12px;">
@@ -104,9 +106,11 @@
         <option value="入荷待ち">入荷待ち</option>
         <option value="Amazon出品済">Amazon出品済</option>
         <option value="Amazon出品エラー">Amazon出品エラー</option>
+        <option value="NE在庫連携済">NE在庫連携済</option>
       </select>
       <button class="btn btn-primary" onclick="bulkChangeStatus()" style="font-size:11px;">適用</button>
       <button class="btn" style="background:#232f3e; border-color:#232f3e; color:#ff9900; font-size:11px; font-weight:bold;" onclick="bulkListOnAmazon()">Amazon一括出品</button>
+      <button class="btn" style="background:#fff; border-color:#0066c0; color:#0066c0; font-size:11px; font-weight:bold;" onclick="exportNeStockCsv()">NE在庫連携CSV</button>
       <span class="count" id="countDisplay">-</span>
     </div>
     <div id="tableContainer"></div>
@@ -118,9 +122,9 @@
     let debounceTimer = null;
     let allData = [];
     let expandedId = null;
-    const STATUSES = ['入荷待ち', 'Amazon出品済', 'Amazon出品エラー'];
-    const STATUS_ORDER = { '入荷待ち': 0, 'Amazon出品エラー': 1, 'Amazon出品済': 2 };
-    const AMAZON_STATUSES = new Set(['入荷待ち', 'Amazon出品済', 'Amazon出品エラー']);
+    const STATUSES = ['入荷待ち', 'Amazon出品済', 'Amazon出品エラー', 'NE在庫連携済'];
+    const STATUS_ORDER = { '入荷待ち': 0, 'Amazon出品エラー': 1, 'Amazon出品済': 2, 'NE在庫連携済': 3 };
+    const AMAZON_STATUSES = new Set(['入荷待ち', 'Amazon出品済', 'Amazon出品エラー', 'NE在庫連携済']);
 
     let suppliers = [];
 
@@ -593,6 +597,65 @@
             showToast(`${neBeforeIds.length}件を「NE登録済」に変更しました`);
             loadData();
           }
+        }
+      } catch (e) { alert('通信エラー: ' + e.message); }
+    }
+
+    async function exportNeStockCsv() {
+      const ids = getSelectedIds();
+      if (ids.length === 0) { alert('CSV出力する商品をチェックボックスで選択してください'); return; }
+
+      // FBM（自社出荷）かつAmazon出品済のみ対象
+      const invalidProducts = [];
+      const fbmListedIds = [];
+      for (const id of ids) {
+        const p = allData.find(d => String(d.id) === String(id));
+        if (!p) continue;
+        if (p.fulfillment === 'FBA') {
+          invalidProducts.push(`${p.product_name || p.asin}: FBA出荷のため在庫連携不要`);
+        } else if (p.status !== 'Amazon出品済') {
+          invalidProducts.push(`${p.product_name || p.asin}: Amazon出品済みになっておりません（現在: ${p.status || '不明'}）`);
+        } else {
+          fbmListedIds.push(id);
+        }
+      }
+
+      if (invalidProducts.length > 0 && fbmListedIds.length === 0) {
+        alert('対象の商品がありません:\n\n' + invalidProducts.join('\n'));
+        return;
+      }
+      if (invalidProducts.length > 0) {
+        if (!confirm(`${invalidProducts.length}件はスキップされます:\n\n${invalidProducts.join('\n')}\n\n残り${fbmListedIds.length}件のCSVを出力しますか？`)) return;
+      }
+
+      try {
+        const params = new URLSearchParams();
+        params.set('ids', fbmListedIds.join(','));
+        const res = await fetch(`./api/products/csv/ne-stock?${params}`);
+        if (!res.ok) {
+          const err = await res.json();
+          alert(err.error || 'CSV出力エラー');
+          return;
+        }
+
+        const blob = await res.blob();
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = res.headers.get('Content-Disposition')?.match(/filename="(.+)"/)?.[1] || 'ne_stock.csv';
+        a.click();
+        URL.revokeObjectURL(a.href);
+
+        // ステータスをNE在庫連携済に変更
+        if (confirm(`${fbmListedIds.length}件のステータスを「NE在庫連携済」に変更しますか？`)) {
+          await Promise.all(fbmListedIds.map(id =>
+            fetch(`./api/products/${id}`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ status: 'NE在庫連携済' }),
+            })
+          ));
+          showToast(`${fbmListedIds.length}件を「NE在庫連携済」に変更しました`);
+          loadData();
         }
       } catch (e) { alert('通信エラー: ' + e.message); }
     }

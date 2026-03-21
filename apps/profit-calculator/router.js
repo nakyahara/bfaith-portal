@@ -249,6 +249,56 @@ router.delete('/api/products/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── API: NE在庫連携用CSVエクスポート（Shift_JIS） ──
+router.get('/api/products/csv/ne-stock', async (req, res) => {
+  try {
+    await ensureDb();
+    const ids = (req.query.ids || '').split(',').map(Number).filter(n => !isNaN(n));
+    if (ids.length === 0) return res.status(400).json({ error: '対象商品が選択されていません' });
+
+    let products = getProducts({});
+    products = products.filter(p => ids.includes(p.id));
+
+    // バリデーション: FBM + Amazon出品済のみ
+    const invalid = products.filter(p => p.fulfillment === 'FBA' || p.status !== 'Amazon出品済');
+    if (invalid.length === products.length) {
+      return res.status(400).json({ error: '対象の商品がありません（FBMかつAmazon出品済が必要です）' });
+    }
+    const valid = products.filter(p => p.fulfillment !== 'FBA' && p.status === 'Amazon出品済');
+
+    // NE汎用モール商品CSV: 商品コード,商品名,売価
+    const header = '商品コード,商品名,売価';
+    const csvQuote = (c) => { const s = String(c ?? ''); return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s.replace(/"/g, '""')}"` : s; };
+    const rows = valid.map(p => [
+      csvQuote(p.ne_product_code || ''),
+      csvQuote(p.product_name || ''),
+      csvQuote(p.selling_price || p.ne_selling_price || ''),
+    ].join(','));
+
+    const csvUtf8 = header + '\r\n' + rows.join('\r\n') + '\r\n';
+
+    // Shift_JISに変換
+    const encoder = new TextEncoder();
+    // Shift_JIS変換テーブルがないため、iconv-liteがあれば使う、なければBOM付きUTF-8
+    let csvBuffer;
+    try {
+      const iconv = await import('iconv-lite');
+      csvBuffer = iconv.default.encode(csvUtf8, 'Shift_JIS');
+    } catch {
+      // iconv-liteがなければBOM付きUTF-8
+      csvBuffer = Buffer.from('\uFEFF' + csvUtf8, 'utf-8');
+    }
+
+    const date = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Type', 'text/csv; charset=Shift_JIS');
+    res.setHeader('Content-Disposition', `attachment; filename="hanyo-mallshouhin_${date}.csv"`);
+    res.send(csvBuffer);
+  } catch (err) {
+    console.error('[ProfitCalc] NE在庫連携CSV:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── API: NE用CSVエクスポート ──
 router.get('/api/products/csv/ne', async (req, res) => {
   try {
