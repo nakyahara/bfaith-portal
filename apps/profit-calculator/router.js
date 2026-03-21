@@ -189,7 +189,12 @@ router.put('/api/products/:id', async (req, res) => {
 router.get('/api/products/csv/ne', async (req, res) => {
   try {
     await ensureDb();
-    const products = getProducts({ status: req.query.status });
+    let products = getProducts({ status: req.query.status });
+    // チェックボックス選択対応
+    if (req.query.ids) {
+      const ids = req.query.ids.split(',').map(Number).filter(n => !isNaN(n));
+      products = products.filter(p => ids.includes(p.id));
+    }
     const type = req.query.type || 'single';
     const date = new Date().toISOString().slice(0, 10);
     let csv, filename;
