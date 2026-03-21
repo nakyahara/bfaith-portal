@@ -215,12 +215,13 @@ router.post('/api/products/:id/list-amazon', async (req, res) => {
     // 成功時にステータスを「Amazon出品済」に更新
     if (result.status === 'ACCEPTED') {
       updateProduct(id, { status: 'Amazon出品済' });
+      res.json(result);
     } else {
       // ACCEPTED以外（INVALID等）はエラー扱い
       updateProduct(id, { status: 'Amazon出品エラー' });
+      const issueMsg = (result.issues || []).map(i => i.message || i.code || JSON.stringify(i)).join('; ');
+      res.status(422).json({ error: `出品ステータス: ${result.status}${issueMsg ? ' — ' + issueMsg : ''}`, ...result });
     }
-
-    res.json(result);
   } catch (err) {
     console.error('[ProfitCalc] Amazon出品エラー:', err.message);
     // API呼び出し自体が失敗した場合もエラーステータスに

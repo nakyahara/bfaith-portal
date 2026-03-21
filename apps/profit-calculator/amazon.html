@@ -509,13 +509,27 @@
       if (!confirm(`${validProducts.length}件をAmazonに出品しますか？`)) return;
 
       let ok = 0, ng = 0;
+      const errors = [];
       for (const id of validProducts) {
         try {
           const res = await fetch(`./api/products/${id}/list-amazon`, { method: 'POST' });
-          if (res.ok) { ok++; } else { ng++; }
-        } catch { ng++; }
+          const result = await res.json();
+          if (res.ok && result.status === 'ACCEPTED') {
+            ok++;
+          } else {
+            ng++;
+            const p = allData.find(d => String(d.id) === String(id));
+            errors.push(`${p?.product_name || id}: ${result.error || result.status || '不明なエラー'}`);
+          }
+        } catch (e) {
+          ng++;
+          errors.push(`ID ${id}: ${e.message}`);
+        }
       }
-      showToast(`Amazon出品完了: ${ok}件成功, ${ng}件エラー`);
+      if (errors.length > 0) {
+        alert(`${ng}件エラー:\n\n${errors.join('\n')}`);
+      }
+      showToast(`Amazon出品: ${ok}件成功, ${ng}件エラー`);
       loadData();
     }
 
