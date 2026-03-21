@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>FBA仕入れ利益計算 — B-Faith Portal</title>
+  <title>リサーチ仕入れツール — B-Faith Portal</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: 'Segoe UI', 'Hiragino Sans', 'Meiryo', sans-serif; background: #eaeded; color: #0f1111; font-size: 14px; }
@@ -116,7 +116,7 @@
 </head>
 <body>
   <div class="header">
-    <h1><span>💰</span> FBA仕入れ利益計算</h1>
+    <h1><span>💰</span> リサーチ仕入れツール</h1>
     <a href="/">← ポータルに戻る</a>
   </div>
   <div class="page-tabs">
@@ -191,7 +191,6 @@
         <div class="form-row">
           <div class="form-group medium"><label>型番</label><input type="text" id="modelNumber" placeholder="SP-APIから自動取得"></div>
           <div class="form-group medium"><label>JAN</label><input type="text" id="janCode" placeholder="SP-APIから自動取得"></div>
-          <div class="form-group medium"><label>内容量</label><input type="text" id="quantity"></div>
         </div>
         <div class="form-row">
           <div class="form-group wide"><label>メーカーURL</label><input type="url" id="makerUrl" placeholder="https://..."></div>
@@ -409,6 +408,7 @@
   <script>
     let productData = null;
     let feeData = null;
+    let linkedResearchId = null;
     let storagePeriod = 'jan_sep';
     let debounceTimer = null;
     const STORAGE_RATE = { jan_sep: 5676 / 1000000, oct_dec: 9170 / 1000000 };
@@ -425,6 +425,8 @@
         searchProduct();
       }
       // リサーチからの引き継ぎパラメータ
+      const researchIdParam = params.get('research_id');
+      if (researchIdParam) linkedResearchId = parseInt(researchIdParam);
       const taxParam = params.get('tax');
       if (taxParam) document.getElementById('taxRate').value = taxParam;
       const lotParam = params.get('lot');
@@ -787,6 +789,7 @@
       const productName = productData.itemName || document.getElementById('manualProductName').value.trim();
       const sel = document.getElementById('supplierSelect');
       const body = {
+        researchId: linkedResearchId || null,
         asin: asin || null,
         productName: productName,
         amazonUrl: asin ? `https://www.amazon.co.jp/dp/${asin}` : '',
@@ -843,6 +846,14 @@
         });
         const result = await res.json();
         if (res.ok) {
+          // リサーチから来た場合、元データのステータスを「商品登録済」に更新
+          if (linkedResearchId) {
+            fetch(`./api/research/${linkedResearchId}`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ status: '商品登録済' }),
+            }).catch(() => {});
+          }
           showToast(`商品登録DBに保存しました (ID: ${result.id})`);
           setTimeout(() => { window.location.href = './products'; }, 1500);
         }

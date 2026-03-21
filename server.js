@@ -156,8 +156,8 @@ const apps = [
   },
   {
     id: 'profit-calculator',
-    name: 'FBA仕入れ利益計算',
-    description: 'SP-APIで手数料自動取得・利益シミュレーション・Notion登録',
+    name: 'リサーチ仕入れツール',
+    description: 'リサーチ・見積もり・利益計算・商品登録の一元管理',
     icon: '💰',
     path: '/apps/profit-calculator/',
     status: 'active',

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>リサーチ・見積もり — FBA仕入れ利益計算</title>
+  <title>リサーチ・見積もり — リサーチ仕入れツール</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: 'Segoe UI', 'Hiragino Sans', 'Meiryo', sans-serif; background: #eaeded; color: #0f1111; font-size: 13px; }
@@ -49,6 +49,7 @@
     .status-badge.見積もり依頼予定 { background: #fce4ec; color: #ad1457; }
     .status-badge.見積もり依頼中 { background: #fff3cd; color: #856404; }
     .status-badge.回答済 { background: #ffd8a8; color: #a55000; }
+    .status-badge.商品登録済 { background: #b2f2bb; color: #087f23; }
     .status-badge.判断中 { background: #d0ebff; color: #1864ab; }
     .status-badge.却下 { background: #ffe0e0; color: #b12704; }
     .status-badge.発注済 { background: #e8d5f5; color: #6741d9; }
@@ -123,7 +124,7 @@
 </head>
 <body>
   <div class="header">
-    <h1><span>💰</span> FBA仕入れ利益計算</h1>
+    <h1><span>💰</span> リサーチ仕入れツール</h1>
     <a href="/" style="color:#ddd; font-size:13px; text-decoration:none;">← ポータルに戻る</a>
   </div>
   <div class="page-tabs">
@@ -143,6 +144,7 @@
         <option value="見積もり依頼予定">見積もり依頼予定</option>
         <option value="見積もり依頼中">見積もり依頼中</option>
         <option value="回答済">回答済</option>
+        <option value="商品登録済">商品登録済</option>
         <option value="判断中">判断中</option>
         <option value="却下">却下</option>
       </select>
@@ -618,6 +620,7 @@
       const r = allData.find(d => d.id === id);
       if (!r) return;
       const params = new URLSearchParams();
+      params.set('research_id', id);
       if (r.asin && r.asin !== 'UNKNOWN') params.set('asin', r.asin);
       if (r.wholesale_price) params.set('wholesale', r.wholesale_price);
       if (r.tax_rate) params.set('tax', String(r.tax_rate).replace('%', ''));
