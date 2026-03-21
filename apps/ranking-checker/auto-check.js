@@ -22,10 +22,10 @@ const AMAZON_HITS = 10;
 const MAX_RANK = 100;
 const YAHOO_MAX_RANK = 100;
 const API_DELAY = 1100;
-const KW_DELAY = 500;
+const KW_DELAY = 1200;
 const CONCURRENCY = 1;
-const RETRY_MAX = 3;
-const RETRY_DELAY = 2000;
+const RETRY_MAX = 5;
+const RETRY_DELAY = 3000;
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', '..', 'data');
 const DATA_FILE = path.join(DATA_DIR, 'ranking-checker.json');
@@ -255,7 +255,19 @@ async function checkRakuten(product, appId, accessKey) {
       data = await rakutenApiSearch(keyword, page, appId, accessKey);
     } catch (e) {
       log(`  楽天API失敗 page=${page}: ${e.message}`);
-      break;
+      // page=1で失敗した場合、追加で待ってもう1回だけ試す
+      if (page === 1 && e.message && e.message.includes('429')) {
+        log(`  ⚠ page=1失敗のため5秒待って再試行...`);
+        await sleep(5000);
+        try {
+          data = await rakutenApiSearch(keyword, page, appId, accessKey);
+        } catch (e2) {
+          log(`  楽天API再試行も失敗: ${e2.message}`);
+          break;
+        }
+      } else {
+        break;
+      }
     }
     const items = data.Items || [];
     if (!items.length) break;
