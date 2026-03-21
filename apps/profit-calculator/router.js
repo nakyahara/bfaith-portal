@@ -191,9 +191,9 @@ router.put('/api/products/:id', async (req, res) => {
 
 // ── API: Amazon出品登録 ──
 router.post('/api/products/:id/list-amazon', async (req, res) => {
+  const id = parseInt(req.params.id);
   try {
     await ensureDb();
-    const id = parseInt(req.params.id);
     const product = getProductById(id);
     if (!product) return res.status(404).json({ error: '商品が見つかりません' });
 

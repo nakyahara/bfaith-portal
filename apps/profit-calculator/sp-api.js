@@ -159,7 +159,7 @@ export async function getFees(asin, price, isFba = true) {
   };
 }
 
-const SELLER_ID = () => process.env.SP_API_SELLER_ID || 'A12Y1HFMZNA9GI';
+const SELLER_ID = () => process.env.SP_API_SELLER_ID || 'A6HMLHKUUJC27';
 
 /**
  * SKU自動採番（FBA用）: pr_YYYYMMDD_連番
@@ -214,6 +214,8 @@ export async function createListing({ asin, price, isFba, sku, condition = 'new_
     attributes,
   };
 
+  console.log(`[SP-API] putListingsItem: ASIN=${asin}, SKU=${finalSku}, price=${price}, fulfillment=${isFba ? 'FBA' : 'FBM'}, sellerId=${sellerId}`);
+
   const result = await sp.callAPI({
     operation: 'putListingsItem',
     endpoint: 'listingsItems',
@@ -222,6 +224,8 @@ export async function createListing({ asin, price, isFba, sku, condition = 'new_
     body,
     options: { version: '2021-08-01' },
   });
+
+  console.log(`[SP-API] putListingsItem result:`, JSON.stringify(result, null, 2));
 
   return {
     sku: finalSku,
