@@ -90,6 +90,16 @@
   </div>
 
   <div class="container">
+    <!-- 配送テンプレート設定 -->
+    <div class="filter-bar" style="background:#fff8e1; border-color:#f0c14b; margin-bottom:8px;">
+      <span style="font-size:12px; font-weight:bold; color:#232f3e;">FBM配送テンプレート:</span>
+      <select id="shippingTemplateSelect" onchange="saveShippingTemplate(this.value)" style="min-width:250px;">
+        <option value="">未設定（デフォルト）</option>
+      </select>
+      <button class="btn btn-primary" onclick="fetchShippingTemplates()" style="font-size:11px;" id="btnFetchTemplates">Amazonから取得</button>
+      <span id="templateStatus" style="font-size:11px; color:#565959;"></span>
+    </div>
+
     <div class="filter-bar">
       <select id="statusFilter" onchange="loadData()">
         <option value="">全ステータス</option>
@@ -129,7 +139,85 @@
         suppliers = await res.json();
       } catch (e) { console.error('仕入先読み込みエラー:', e); }
       loadData();
+      loadSavedTemplate();
     });
+
+    // ── 配送テンプレート設定 ──
+    async function loadSavedTemplate() {
+      try {
+        const res = await fetch('./api/settings/amazon_shipping_template');
+        const data = await res.json();
+        if (data.value) {
+          const sel = document.getElementById('shippingTemplateSelect');
+          // 保存済みの値がオプションになければ追加
+          if (!Array.from(sel.options).some(o => o.value === data.value)) {
+            const opt = document.createElement('option');
+            opt.value = data.value;
+            opt.textContent = data.value;
+            sel.appendChild(opt);
+          }
+          sel.value = data.value;
+          document.getElementById('templateStatus').textContent = `現在: ${data.value}`;
+        }
+      } catch (e) { console.error('設定読み込みエラー:', e); }
+    }
+
+    async function fetchShippingTemplates() {
+      const btn = document.getElementById('btnFetchTemplates');
+      const status = document.getElementById('templateStatus');
+      btn.disabled = true;
+      status.textContent = '取得中...';
+
+      try {
+        const res = await fetch('./api/amazon/shipping-templates');
+        const templates = await res.json();
+        if (!res.ok) {
+          status.textContent = 'エラー: ' + (templates.error || '取得失敗');
+          status.style.color = '#b12704';
+          return;
+        }
+
+        const sel = document.getElementById('shippingTemplateSelect');
+        const current = sel.value;
+        sel.innerHTML = '<option value="">未設定（デフォルト）</option>';
+        templates.forEach(t => {
+          const opt = document.createElement('option');
+          opt.value = t.value;
+          opt.textContent = t.label || t.value;
+          sel.appendChild(opt);
+        });
+        if (current) sel.value = current;
+
+        status.textContent = `${templates.length}件の配送テンプレートを取得`;
+        status.style.color = '#007600';
+        showToast(`配送テンプレート${templates.length}件を取得しました`);
+      } catch (e) {
+        status.textContent = '通信エラー: ' + e.message;
+        status.style.color = '#b12704';
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function saveShippingTemplate(value) {
+      try {
+        await fetch('./api/settings/amazon_shipping_template', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ value: value || null }),
+        });
+        const status = document.getElementById('templateStatus');
+        if (value) {
+          status.textContent = `保存: ${value}`;
+          status.style.color = '#007600';
+          showToast(`配送テンプレート「${value}」を設定しました`);
+        } else {
+          status.textContent = '未設定';
+          status.style.color = '#565959';
+          showToast('配送テンプレート設定を解除しました');
+        }
+      } catch (e) { alert('設定保存エラー: ' + e.message); }
+    }
 
     function debounceLoad() {
       clearTimeout(debounceTimer);

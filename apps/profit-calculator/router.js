@@ -4,10 +4,11 @@
 import { Router } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { getProduct, getFees, createListing } from './sp-api.js';
+import { getProduct, getFees, createListing, getShippingTemplates } from './sp-api.js';
 import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, deleteProduct, getSetItems, saveSetItems } from './db.js';
 import { loadSuppliers, addSupplier, deleteSupplier } from './suppliers.js';
 import { loadShipping, addShipping, updateShipping, deleteShipping } from './shipping.js';
+import { getSetting, setSetting, getAllSettings } from './settings.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -205,11 +206,15 @@ router.post('/api/products/:id/list-amazon', async (req, res) => {
     const sku = isFba ? null : (product.ne_product_code || null);
     if (!isFba && !sku) return res.status(400).json({ error: 'NE商品コード（SKU）が設定されていません' });
 
+    // FBM: 保存済み配送テンプレートを取得
+    const shippingTemplate = !isFba ? getSetting('amazon_shipping_template') : null;
+
     const result = await createListing({
       asin: product.asin,
       price,
       isFba,
       sku,
+      shippingTemplate,
     });
 
     // 成功時にステータスを「Amazon出品済」に更新
@@ -407,6 +412,33 @@ router.delete('/api/shipping', (req, res) => {
     const data = deleteShipping(name);
     res.json(data);
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── API: アプリ設定 ──
+router.get('/api/settings', (req, res) => {
+  res.json(getAllSettings());
+});
+
+router.get('/api/settings/:key', (req, res) => {
+  res.json({ key: req.params.key, value: getSetting(req.params.key) });
+});
+
+router.put('/api/settings/:key', (req, res) => {
+  try {
+    setSetting(req.params.key, req.body.value);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── API: Amazon配送テンプレート取得 ──
+router.get('/api/amazon/shipping-templates', async (req, res) => {
+  try {
+    const templates = await getShippingTemplates();
+    res.json(templates);
+  } catch (err) {
+    console.error('[ProfitCalc] 配送テンプレート取得エラー:', err.message, err.stack);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 export default router;

@@ -172,9 +172,57 @@ function generateFbaSku() {
 }
 
 /**
+ * 配送テンプレート一覧取得（Product Type Definitions API）
+ */
+export async function getShippingTemplates() {
+  const sp = getClient();
+  const marketplaceId = MARKETPLACE_ID();
+  const sellerId = SELLER_ID();
+
+  // Product Type Definitions APIでスキーマ取得
+  const result = await sp.callAPI({
+    operation: 'getDefinitionsProductType',
+    endpoint: 'definitionsProductType',
+    path: { productType: 'PRODUCT' },
+    query: {
+      marketplaceIds: [marketplaceId],
+      sellerId,
+      requirements: 'LISTING',
+      locale: 'ja_JP',
+    },
+    options: { version: '2020-09-01' },
+  });
+
+  console.log('[SP-API] getDefinitionsProductType: schema link =', result.schema?.link?.resource);
+
+  // スキーマURLからJSONスキーマを取得
+  const schemaUrl = result.schema?.link?.resource;
+  if (!schemaUrl) throw new Error('スキーマURLが取得できません');
+
+  const schemaRes = await fetch(schemaUrl);
+  const schema = await schemaRes.json();
+
+  // merchant_shipping_group の有効値を探索
+  const prop = schema.properties?.merchant_shipping_group;
+  if (!prop) {
+    console.log('[SP-API] merchant_shipping_group not found in schema. Available keys:', Object.keys(schema.properties || {}).filter(k => k.includes('shipping')));
+    throw new Error('配送テンプレート定義がスキーマに見つかりません');
+  }
+
+  // items.properties.value にenum/enumNamesがある想定
+  const valueProp = prop.items?.properties?.value || prop.properties?.value || {};
+  const values = valueProp.enum || [];
+  const names = valueProp.enumNames || values;
+
+  console.log(`[SP-API] 配送テンプレート: ${values.length}件取得`);
+
+  return values.map((v, i) => ({ value: v, label: names[i] || v }));
+}
+
+/**
  * Amazon出品登録（Listings Items API）
  */
-export async function createListing({ asin, price, isFba, sku, condition = 'new_new' }) {
+export async function createListing({ asin, price, isFba, sku, condition = 'new_new', shippingTemplate = null }) {
   const sp = getClient();
   const marketplaceId = MARKETPLACE_ID();
   const sellerId = SELLER_ID();
@@ -200,8 +248,10 @@ export async function createListing({ asin, price, isFba, sku, condition = 'new_
     }],
   };
 
-  // 自社出荷の配送・決済設定はセラーセントラル側で管理
-  // （LISTING_OFFER_ONLYモードではこれらの属性は使用不可）
+  // FBM: 配送テンプレートが設定されている場合のみ付与
+  if (!isFba && shippingTemplate) {
+    attributes.merchant_shipping_group = [{ value: shippingTemplate, marketplace_id: marketplaceId }];
+  }
 
   const body = {
     productType: 'PRODUCT',
