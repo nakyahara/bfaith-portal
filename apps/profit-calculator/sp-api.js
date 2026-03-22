@@ -438,25 +438,27 @@ export async function getActiveListingsReport() {
     options: { version: '2021-06-30' },
   });
 
-  // ドキュメントダウンロード（GZIP圧縮対応）
+  // ドキュメントダウンロード（GZIP圧縮 + Shift_JIS対応）
   const response = await fetch(doc.url);
-  let text;
+  const rawBuf = Buffer.from(await response.arrayBuffer());
+
+  let dataBuf = rawBuf;
   if (doc.compressionAlgorithm === 'GZIP') {
-    const { createGunzip } = await import('zlib');
-    const { Readable } = await import('stream');
-    const { pipeline } = await import('stream/promises');
-    const buf = Buffer.from(await response.arrayBuffer());
-    text = await new Promise((resolve, reject) => {
-      const gunzip = createGunzip();
-      const chunks = [];
-      gunzip.on('data', chunk => chunks.push(chunk));
-      gunzip.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
-      gunzip.on('error', reject);
-      gunzip.end(buf);
-    });
-    console.log('[SP-API] GZIP解凍完了, サイズ:', text.length);
-  } else {
-    text = await response.text();
+    const { gunzipSync } = await import('zlib');
+    dataBuf = gunzipSync(rawBuf);
+    console.log('[SP-API] GZIP解凍完了, サイズ:', dataBuf.length);
+  }
+
+  // エンコーディング判定: UTF-8で読めなければShift_JISとして変換
+  let text;
+  try {
+    const iconv = await import('iconv-lite');
+    // まずShift_JISとして試す（日本のAmazonレポートはShift_JIS）
+    text = iconv.default.decode(dataBuf, 'Shift_JIS');
+    console.log('[SP-API] Shift_JISとしてデコード');
+  } catch {
+    text = dataBuf.toString('utf-8');
+    console.log('[SP-API] UTF-8としてデコード');
   }
 
   // TSV解析（ヘッダーを正規化: 小文字・ハイフン統一）

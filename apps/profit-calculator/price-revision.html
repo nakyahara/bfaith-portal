@@ -258,7 +258,10 @@ async function doSync(){
   el.textContent=`同期完了: ${r.total}件(新規${r.inserted} 更新${r.updated})`;
   if(r.debug && r.inserted===0 && r.updated===0){
     console.log('[Sync Debug]', r.debug);
-    alert('同期デバッグ情報:\n\nキー: '+((r.debug.allKeys||[]).join(', '))+'\n\n検出ASIN: '+(r.debug.detectedAsin||'なし')+'\n検出SKU: '+(r.debug.detectedSku||'なし')+'\n\n1行目: '+JSON.stringify(r.debug.sampleRow||{}).slice(0,500));
+    const dbgText='同期デバッグ情報\n\nキー:\n'+((r.debug.allKeys||[]).join('\n'))+'\n\n検出ASIN: '+(r.debug.detectedAsin||'なし')+'\n検出SKU: '+(r.debug.detectedSku||'なし')+'\n\n1行目:\n'+JSON.stringify(r.debug.sampleRow||{},null,2).slice(0,1000);
+    const w=window.open('','_blank','width=600,height=500');
+    w.document.write('<pre style="font-size:12px;white-space:pre-wrap;padding:16px;">'+dbgText.replace(/</g,'&lt;')+'</pre>');
+    w.document.title='同期デバッグ';
   }
   loadP();
   fetch(B+'/api/price-revision/refresh-cache',{method:'POST'});
