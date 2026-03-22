@@ -555,7 +555,17 @@ export function syncProductsFromListings(listings) {
 
   saveToFile();
   console.log(`[Sync] 結果: 全${listings.length}件, 新規${inserted}, 更新${updated}, スキップ${skipped}`);
-  return { inserted, updated, skipped, total: listings.length };
+
+  // デバッグ情報
+  const debug = {};
+  if (listings.length > 0) {
+    debug.allKeys = Object.keys(listings[0]);
+    debug.sampleRow = listings[0];
+    debug.detectedAsin = findVal(listings[0], ['asin1', 'asin', 'ASIN1', 'ASIN']);
+    debug.detectedSku = findVal(listings[0], ['seller-sku', 'seller_sku', 'sellersku', 'sku', 'SKU']);
+  }
+
+  return { inserted, updated, skipped, total: listings.length, debug };
 }
 
 // ===== Price History (価格改定) =====

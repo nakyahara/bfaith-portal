@@ -255,7 +255,12 @@ async function doSync(){
   el.innerHTML='<span class="sp"></span>同期中...';
   try{const r=await(await fetch(B+'/api/price-revision/sync',{method:'POST'})).json();
   if(r.error)throw new Error(r.error);
-  el.textContent=`同期完了: ${r.total}件(新規${r.inserted} 更新${r.updated})`;loadP();
+  el.textContent=`同期完了: ${r.total}件(新規${r.inserted} 更新${r.updated})`;
+  if(r.debug && r.inserted===0 && r.updated===0){
+    console.log('[Sync Debug]', r.debug);
+    alert('同期デバッグ情報:\n\nキー: '+((r.debug.allKeys||[]).join(', '))+'\n\n検出ASIN: '+(r.debug.detectedAsin||'なし')+'\n検出SKU: '+(r.debug.detectedSku||'なし')+'\n\n1行目: '+JSON.stringify(r.debug.sampleRow||{}).slice(0,500));
+  }
+  loadP();
   fetch(B+'/api/price-revision/refresh-cache',{method:'POST'});
   }catch(e){el.textContent='エラー: '+e.message;}
 }
