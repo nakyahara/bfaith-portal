@@ -6,140 +6,154 @@
   <title>価格改定 — リサーチ仕入れツール</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: 'Segoe UI', 'Hiragino Sans', 'Meiryo', sans-serif; background: #f5f5f5; color: #333; font-size: 13px; }
+    body { font-family: 'Segoe UI', 'Hiragino Sans', 'Meiryo', sans-serif; background: #f0f0f0; color: #333; font-size: 12px; }
     a { color: #0066c0; text-decoration: none; }
+    a:hover { text-decoration: underline; }
 
     .header { background: #232f3e; color: #fff; padding: 10px 24px; display: flex; align-items: center; justify-content: space-between; }
     .header h1 { font-size: 17px; font-weight: bold; }
     .header h1 span { color: #ff9900; }
     .page-tabs { display: flex; background: #37475a; padding: 0 24px; }
     .page-tab { padding: 10px 20px; color: #ccc; font-size: 13px; font-weight: bold; text-decoration: none; border-bottom: 3px solid transparent; }
-    .page-tab:hover { color: #fff; }
+    .page-tab:hover { color: #fff; text-decoration: none; }
     .page-tab.active { color: #fff; border-bottom-color: #ff9900; }
 
     /* ツールバー */
-    .toolbar { background: #fff; border-bottom: 2px solid #e0e0e0; padding: 8px 16px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-    .toolbar .status-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
-    .toolbar .status-dot.active { background: #2ecc71; }
-    .toolbar .status-dot.inactive { background: #ccc; }
-    .toolbar .stats { font-size: 11px; color: #888; }
-    .toolbar .sync-status { font-size: 11px; color: #888; margin-left: 8px; }
-    .toolbar .controls { display: flex; gap: 6px; margin-left: auto; align-items: center; }
-    .btn { padding: 4px 10px; border-radius: 3px; font-size: 11px; font-weight: bold; cursor: pointer; border: 1px solid #ccc; background: #f7f7f7; }
-    .btn:hover { background: #eee; }
+    .toolbar { background: #fff; border-bottom: 1px solid #ddd; padding: 6px 12px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 11px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+    .dot.on { background: #2ecc71; }
+    .dot.off { background: #ccc; }
+    .toolbar .right { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+    .tbtn { padding: 3px 8px; border: 1px solid #ccc; border-radius: 3px; background: #fafafa; cursor: pointer; font-size: 11px; }
+    .tbtn:hover { background: #eee; }
 
     /* 検索バー */
-    .search-bar { background: #4a6fa5; padding: 8px 16px; display: flex; align-items: center; gap: 8px; }
-    .search-bar input { padding: 6px 10px; border: none; border-radius: 3px; font-size: 13px; width: 300px; }
-    .search-bar button { padding: 6px 16px; background: #ff9900; border: none; border-radius: 3px; color: #fff; font-weight: bold; cursor: pointer; }
-    .search-bar select { padding: 5px 8px; border: none; border-radius: 3px; font-size: 12px; }
+    .search-bar { background: #5b7daa; padding: 6px 12px; display: flex; gap: 8px; align-items: center; }
+    .search-bar input[type=text] { padding: 5px 10px; border: none; border-radius: 3px; font-size: 13px; width: 280px; }
+    .search-bar .sbtn { padding: 5px 16px; background: #ff9900; border: none; border-radius: 3px; color: #fff; font-weight: bold; font-size: 13px; cursor: pointer; }
+    .search-bar select { padding: 4px; border: none; border-radius: 3px; font-size: 11px; }
 
     /* 結果バー */
-    .result-bar { background: #fff; border-bottom: 1px solid #ddd; padding: 6px 16px; font-size: 12px; display: flex; align-items: center; gap: 12px; }
-    .result-bar .count { font-weight: bold; }
-    .result-bar .badge { background: #ff9900; color: #fff; padding: 1px 8px; border-radius: 3px; font-size: 11px; }
-
-    /* テーブルヘッダー */
-    .tbl-header { display: grid; grid-template-columns: 30px 60px 1fr 130px 130px 170px 110px 130px 100px; background: #f7f7f7; border-bottom: 2px solid #ddd; font-size: 11px; font-weight: bold; color: #666; }
-    .tbl-header > div { padding: 8px 6px; border-right: 1px solid #eee; text-align: center; }
-
-    /* 商品行 */
-    .product-row { display: grid; grid-template-columns: 30px 60px 1fr 130px 130px 170px 110px 130px 100px; border-bottom: 1px solid #e8e8e8; background: #fff; min-height: 90px; }
-    .product-row:hover { background: #fffdf5; }
-    .product-row > div { padding: 6px; border-right: 1px solid #f0f0f0; display: flex; flex-direction: column; justify-content: center; }
-    .product-row > div:last-child { border-right: none; }
-
-    /* チェックボックス */
-    .col-check { align-items: center; }
-    .col-check input { width: 16px; height: 16px; }
-
-    /* 画像 */
-    .col-img { align-items: center; }
-    .col-img img { width: 50px; height: 50px; object-fit: contain; }
-
-    /* 商品情報 */
-    .col-info { padding: 6px 8px !important; min-width: 0; gap: 2px; }
-    .col-info .pname { font-size: 12px; font-weight: bold; color: #333; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .col-info .asin { font-size: 11px; color: #0066c0; }
-    .col-info .sku { font-size: 10px; color: #999; }
-
-    /* 出品価格 */
-    .col-price { gap: 2px; }
-    .col-price .label { font-size: 9px; color: #999; }
-    .col-price input { width: 80px; padding: 3px 5px; border: 1px solid #ccc; border-radius: 3px; font-size: 13px; text-align: right; }
-    .col-price input:focus { border-color: #ff9900; outline: none; }
-    .col-price .sub { font-size: 10px; color: #888; }
-
-    /* 競合・カート価格 */
-    .col-comp { gap: 2px; font-size: 11px; }
-    .col-comp .comp-title { font-size: 9px; color: #999; font-weight: bold; }
-    .col-comp .comp-price { font-size: 14px; font-weight: bold; color: #b12704; }
-    .col-comp .comp-detail { font-size: 10px; color: #666; }
-    .col-comp .comp-time { font-size: 9px; color: #aaa; }
-
-    /* モードボタン */
-    .col-mode { gap: 2px; align-items: stretch; }
-    .mode-btn { padding: 3px 4px; border: 1px solid #ccc; border-radius: 3px; font-size: 10px; font-weight: bold; cursor: pointer; text-align: center; background: #f7f7f7; }
-    .mode-btn:hover { border-color: #ff9900; background: #fff8ee; }
-    .mode-btn.active { color: #fff; border-color: transparent; }
-    .mode-btn.active[data-mode="FBA最安値"] { background: #4a90d9; }
-    .mode-btn.active[data-mode="最安値"] { background: #e67e22; }
-    .mode-btn.active[data-mode="カート"] { background: #27ae60; }
-    .mode-btn.active[data-mode="カスタム"] { background: #8e44ad; }
-    .mode-btn.active[data-mode="しない"] { background: #95a5a6; }
-
-    /* 仕入れ価格 */
-    .col-cost { gap: 4px; }
-    .col-cost .label { font-size: 9px; color: #999; }
-    .col-cost input { width: 75px; padding: 3px 5px; border: 1px solid #ccc; border-radius: 3px; font-size: 12px; text-align: right; color: #c0392b; }
-    .col-cost input:focus { border-color: #ff9900; outline: none; }
-
-    /* ストッパー */
-    .col-stopper { gap: 3px; }
-    .col-stopper .s-group { display: flex; align-items: center; gap: 3px; }
-    .col-stopper .s-label { font-size: 9px; color: #999; min-width: 28px; }
-    .col-stopper input { width: 60px; padding: 2px 4px; border: 1px solid #ccc; border-radius: 3px; font-size: 11px; text-align: right; }
-    .col-stopper input:focus { border-color: #ff9900; outline: none; }
-    .col-stopper .profit { font-size: 10px; margin-top: 2px; }
-    .col-stopper .profit.pos { color: #27ae60; }
-    .col-stopper .profit.neg { color: #c0392b; }
-
-    /* 手数料・粗利 */
-    .col-profit { gap: 2px; text-align: center; font-size: 11px; }
-    .col-profit .profit-val { font-size: 14px; font-weight: bold; }
-    .col-profit .profit-val.pos { color: #27ae60; }
-    .col-profit .profit-val.neg { color: #c0392b; }
-    .col-profit .profit-rate { font-size: 10px; color: #888; }
-
-    .saved-flash { animation: flashGreen 0.5s; }
-    @keyframes flashGreen { 0% { background: #d4edda; } 100% { background: transparent; } }
-
-    .empty-state { text-align: center; padding: 60px 20px; color: #999; background: #fff; font-size: 14px; }
-    /* ページネーション */
-    .pagination { display: flex; justify-content: center; align-items: center; gap: 4px; padding: 12px; background: #fff; border-top: 1px solid #ddd; }
-    .pagination button { padding: 6px 12px; border: 1px solid #ccc; border-radius: 3px; background: #fff; cursor: pointer; font-size: 12px; }
-    .pagination button:hover { background: #f0f0f0; }
-    .pagination button.active { background: #4a90d9; color: #fff; border-color: #4a90d9; }
-    .pagination button:disabled { opacity: 0.4; cursor: default; }
-    .pagination .page-info { font-size: 12px; color: #666; margin: 0 8px; }
-
-    .loading { text-align: center; padding: 30px; color: #888; }
-    .spinner { display: inline-block; width: 18px; height: 18px; border: 2px solid #ddd; border-top-color: #ff9900; border-radius: 50%; animation: spin 0.6s linear infinite; vertical-align: middle; margin-right: 6px; }
-    @keyframes spin { to { transform: rotate(360deg); } }
+    .result-bar { background: #fff; border-bottom: 1px solid #ddd; padding: 4px 12px; font-size: 11px; display: flex; align-items: center; gap: 8px; }
+    .result-bar b { font-size: 12px; }
+    .badge { background: #ff9900; color: #fff; padding: 1px 8px; border-radius: 3px; font-size: 10px; font-weight: bold; }
 
     /* タブ */
-    .view-tabs { display: flex; gap: 0; padding: 8px 16px 0; }
-    .view-tab { padding: 8px 20px; background: #e8e8e8; border: 1px solid #ddd; border-bottom: none; border-radius: 6px 6px 0 0; cursor: pointer; font-size: 12px; font-weight: bold; color: #666; }
-    .view-tab.active { background: #fff; color: #333; border-bottom: 1px solid #fff; margin-bottom: -1px; z-index: 1; }
+    .vtabs { display: flex; gap: 0; padding: 6px 12px 0; }
+    .vtab { padding: 6px 16px; background: #e0e0e0; border: 1px solid #ccc; border-bottom: none; border-radius: 5px 5px 0 0; cursor: pointer; font-size: 11px; font-weight: bold; color: #666; }
+    .vtab.active { background: #fff; color: #333; }
     .tab-body { display: none; }
     .tab-body.active { display: block; }
 
-    .history-table { width: 100%; border-collapse: collapse; font-size: 11px; background: #fff; }
-    .history-table th { background: #f7f7f7; padding: 6px 8px; text-align: left; border-bottom: 2px solid #ddd; }
-    .history-table td { padding: 5px 8px; border-bottom: 1px solid #eee; }
-    .history-table .num { text-align: right; }
-    .positive { color: #27ae60; }
-    .negative { color: #c0392b; }
+    /* テーブルヘッダー */
+    .t-head { display: grid; grid-template-columns: 28px 50px 80px minmax(180px,1fr) 120px 130px 160px 95px 120px 90px; background: #f5f5f5; border: 1px solid #ddd; border-bottom: 2px solid #ccc; font-size: 10px; font-weight: bold; color: #666; text-align: center; }
+    .t-head > div { padding: 6px 4px; border-right: 1px solid #e0e0e0; line-height: 1.3; }
+
+    /* 商品行 */
+    .p-row { display: grid; grid-template-columns: 28px 50px 80px minmax(180px,1fr) 120px 130px 160px 95px 120px 90px; border: 1px solid #ddd; border-top: none; background: #fff; min-height: 100px; }
+    .p-row:nth-child(even) { background: #fcfcfc; }
+    .p-row:hover { background: #fffff0; }
+    .p-row > div { padding: 5px 4px; border-right: 1px solid #f0f0f0; font-size: 11px; }
+    .p-row > div:last-child { border-right: none; }
+
+    /* チェック */
+    .c-chk { display: flex; align-items: center; justify-content: center; }
+    .c-chk input { width: 15px; height: 15px; }
+
+    /* ステータス */
+    .c-status { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; font-size: 10px; }
+    .c-status .st-label { font-weight: bold; color: #333; }
+    .c-status button { font-size: 9px; padding: 1px 6px; border: 1px solid #ccc; border-radius: 3px; background: #f7f7f7; cursor: pointer; }
+
+    /* 画像 */
+    .c-img { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; }
+    .c-img img { width: 60px; height: 60px; object-fit: contain; }
+    .c-img .var-badge { background: #ff6600; color: #fff; font-size: 8px; padding: 1px 4px; border-radius: 2px; font-weight: bold; }
+
+    /* 商品情報 */
+    .c-info { display: flex; flex-direction: column; justify-content: center; gap: 2px; padding: 5px 6px !important; min-width: 0; }
+    .c-info .pname { font-size: 11px; color: #0066c0; font-weight: bold; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; line-height: 1.3; }
+    .c-info .sku { font-size: 10px; color: #888; }
+    .c-info .asin { font-size: 10px; color: #0066c0; }
+
+    /* 出品価格 */
+    .c-price { display: flex; flex-direction: column; gap: 2px; justify-content: center; }
+    .c-price .lbl { font-size: 9px; color: #999; }
+    .c-price .p-input { display: flex; align-items: center; gap: 2px; }
+    .c-price .p-input span { font-size: 11px; color: #666; }
+    .c-price input { width: 70px; padding: 3px 4px; border: 1px solid #bbb; font-size: 13px; text-align: right; }
+    .c-price input:focus { border-color: #ff9900; outline: none; }
+    .c-price .sub { font-size: 9px; color: #888; }
+    .c-price .cond { font-size: 10px; color: #333; }
+
+    /* カート価格 */
+    .c-comp { display: flex; flex-direction: column; gap: 1px; justify-content: center; font-size: 10px; }
+    .c-comp .ct { font-weight: bold; color: #333; }
+    .c-comp .cv { font-size: 13px; font-weight: bold; color: #333; }
+    .c-comp .cd { color: #666; }
+    .c-comp .ct-time { font-size: 9px; color: #999; }
+
+    /* モードボタン */
+    .c-mode { display: flex; flex-direction: column; gap: 2px; justify-content: center; padding: 4px 3px !important; }
+    .mbtn { padding: 4px 2px; border: 2px solid #ddd; border-radius: 4px; font-size: 10px; font-weight: bold; cursor: pointer; text-align: center; background: #fff; color: #555; }
+    .mbtn:hover { border-color: #ff9900; }
+    .mbtn.on { color: #fff; border-color: transparent; }
+    .mbtn.on[data-m="FBA最安値"] { background: #5b9bd5; }
+    .mbtn.on[data-m="最安値"] { background: #e07020; }
+    .mbtn.on[data-m="カート"] { background: #4caf50; }
+    .mbtn.on[data-m="カスタム"] { background: #9c27b0; }
+    .mbtn.on[data-m="しない"] { background: #9e9e9e; }
+
+    /* 仕入れ価格 */
+    .c-cost { display: flex; flex-direction: column; gap: 3px; justify-content: center; align-items: center; }
+    .c-cost .cost-input { display: flex; align-items: center; gap: 1px; }
+    .c-cost .cost-input span { color: #c0392b; font-size: 13px; font-weight: bold; }
+    .c-cost input { width: 60px; padding: 3px 4px; border: 1px solid #bbb; font-size: 13px; text-align: right; color: #c0392b; font-weight: bold; }
+    .c-cost input:focus { border-color: #ff9900; outline: none; }
+
+    /* ストッパー */
+    .c-stop { display: flex; flex-direction: column; gap: 4px; justify-content: center; font-size: 10px; }
+    .c-stop .sg { display: flex; align-items: center; gap: 2px; }
+    .c-stop .sg .sl { font-size: 9px; min-width: 40px; }
+    .c-stop .sg .sl.hi { color: #5b9bd5; font-weight: bold; }
+    .c-stop .sg .sl.lo { color: #c0392b; font-weight: bold; }
+    .c-stop input { width: 55px; padding: 2px 3px; border: 1px solid #bbb; font-size: 11px; text-align: right; }
+    .c-stop input:focus { border-color: #ff9900; outline: none; }
+    .c-stop .profit-line { font-size: 10px; margin-top: 2px; }
+    .c-stop .profit-line.pos { color: #4caf50; font-weight: bold; }
+    .c-stop .profit-line.neg { color: #c0392b; font-weight: bold; }
+
+    /* 手数料・粗利 */
+    .c-profit { display: flex; flex-direction: column; gap: 2px; justify-content: center; text-align: center; font-size: 10px; }
+    .c-profit .fee-lbl { font-size: 9px; color: #999; }
+    .c-profit .fee-val { font-size: 11px; }
+    .c-profit .pv { font-size: 14px; font-weight: bold; }
+    .c-profit .pv.pos { color: #4caf50; }
+    .c-profit .pv.neg { color: #c0392b; }
+    .c-profit .pr { font-size: 10px; color: #888; }
+    .c-profit .recalc { font-size: 9px; color: #0066c0; cursor: pointer; }
+
+    .flash { animation: bg-flash 0.5s; }
+    @keyframes bg-flash { 0%{background:#d4edda;} 100%{background:inherit;} }
+    .empty { text-align: center; padding: 50px; background: #fff; color: #999; font-size: 13px; border: 1px solid #ddd; }
+    .loading { text-align: center; padding: 30px; color: #888; }
+    .sp { display: inline-block; width: 16px; height: 16px; border: 2px solid #ddd; border-top-color: #ff9900; border-radius: 50%; animation: spin 0.5s linear infinite; vertical-align: middle; margin-right: 4px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ページネーション */
+    .pager { display: flex; justify-content: center; gap: 3px; padding: 10px; background: #fff; border: 1px solid #ddd; border-top: none; }
+    .pager button { padding: 5px 12px; border: 1px solid #ccc; border-radius: 3px; background: #fff; cursor: pointer; font-size: 11px; }
+    .pager button:hover { background: #f0f0f0; }
+    .pager button.cur { background: #5b9bd5; color: #fff; border-color: #5b9bd5; }
+    .pager button:disabled { opacity: 0.3; cursor: default; }
+
+    /* 履歴 */
+    .htbl { width: 100%; border-collapse: collapse; font-size: 11px; background: #fff; }
+    .htbl th { background: #f5f5f5; padding: 5px 6px; text-align: left; border-bottom: 2px solid #ddd; font-size: 10px; }
+    .htbl td { padding: 4px 6px; border-bottom: 1px solid #eee; }
+    .htbl .n { text-align: right; }
+    .pos { color: #4caf50; }
+    .neg { color: #c0392b; }
   </style>
 </head>
 <body>
@@ -159,297 +173,225 @@
     <a href="./settings" class="page-tab">設定</a>
   </div>
 
-  <!-- ツールバー -->
   <div class="toolbar">
-    <span class="status-dot" id="workerDot"></span>
-    <span id="workerLabel" style="font-size:12px;">確認中...</span>
-    <span class="stats" id="statsInfo"></span>
-    <span class="sync-status" id="syncStatus"></span>
-    <div class="controls">
-      <button class="btn" onclick="startWorker()">開始</button>
-      <button class="btn" onclick="stopWorker()">停止</button>
-      <button class="btn" onclick="manualSync()">手動同期</button>
+    <span class="dot" id="wDot"></span>
+    <span id="wLabel">-</span>
+    <span style="color:#999;" id="wStats"></span>
+    <span style="color:#999;" id="syncSt"></span>
+    <div class="right">
+      <button class="tbtn" onclick="startW()">開始</button>
+      <button class="tbtn" onclick="stopW()">停止</button>
+      <button class="tbtn" onclick="doSync()">商品同期</button>
     </div>
   </div>
 
-  <!-- 検索バー -->
   <div class="search-bar">
-    <input type="text" id="searchInput" placeholder="キーワード, JAN, SKU, ASIN" oninput="filterProducts()">
-    <button onclick="filterProducts()">検索</button>
-    <select id="modeFilter" onchange="filterProducts()">
+    <input type="text" id="q" placeholder="キーワード, JAN, SKU, ASIN" oninput="doFilter()">
+    <button class="sbtn" onclick="doFilter()">検索</button>
+    <select id="fMode" onchange="doFilter()">
       <option value="">価格の自動変更 ▼</option>
       <option value="FBA最安値">FBA最安値</option>
       <option value="最安値">最安値</option>
       <option value="カート">カート</option>
       <option value="カスタム">カスタム</option>
       <option value="しない">しない</option>
-      <option value="_none">未設定</option>
+      <option value="_no">未設定</option>
     </select>
-    <select id="fulfillmentFilter" onchange="filterProducts()">
-      <option value="">配送方法 ▼</option>
+    <select id="fFul" onchange="doFilter()">
+      <option value="">配送 ▼</option>
       <option value="FBA">FBA</option>
       <option value="FBM">自己発送</option>
     </select>
+    <span style="color:#fff;font-size:11px;">表示件数</span>
+    <select id="perPage" onchange="pg=1;doFilter()">
+      <option value="50">50件</option>
+      <option value="150" selected>150件</option>
+      <option value="300">300件</option>
+    </select>
   </div>
 
-  <!-- 結果バー -->
   <div class="result-bar">
-    <span>検索結果：<span class="count" id="productCount">-</span></span>
-    <span class="badge" id="statusBadge">出品中</span>
+    検索結果：<b id="cnt">-</b> &nbsp; <span class="badge">出品中</span>
   </div>
 
-  <!-- タブ -->
-  <div class="view-tabs">
-    <div class="view-tab active" onclick="switchTab('list')">在庫一覧</div>
-    <div class="view-tab" onclick="switchTab('history')">価格変動履歴</div>
+  <div class="vtabs">
+    <div class="vtab active" onclick="stab('list',this)">在庫一覧</div>
+    <div class="vtab" onclick="stab('hist',this)">価格変動履歴</div>
   </div>
 
-  <!-- 在庫一覧 -->
   <div class="tab-body active" id="tab-list">
-    <div class="tbl-header">
+    <div class="t-head">
       <div></div>
-      <div>画像</div>
-      <div style="text-align:left;">商品名 / ASIN / SKU</div>
+      <div>ステータス</div>
+      <div>画像<br>ASIN</div>
+      <div style="text-align:left;">商品名<br>SKU</div>
       <div>出品価格<br>+配送料</div>
       <div>最低価格<br>+配送料</div>
       <div>価格の自動変更</div>
       <div>仕入れ価格</div>
-      <div>高値ストッパー<br>赤字ストッパー</div>
-      <div>手数料<br>粗利益</div>
+      <div>高値ストッパー<br><span style="color:#c0392b">赤字ストッパー</span></div>
+      <div>手数料<br><span style="color:#4caf50">粗利益</span></div>
     </div>
-    <div id="productsContainer">
-      <div class="loading"><span class="spinner"></span>読み込み中...</div>
-    </div>
-    <div class="pagination" id="pagination"></div>
+    <div id="pList"><div class="loading"><span class="sp"></span>読み込み中...</div></div>
+    <div class="pager" id="pager"></div>
   </div>
 
-  <!-- 履歴 -->
-  <div class="tab-body" id="tab-history">
-    <div id="historyContainer" style="padding:8px 16px;">
-      <div class="loading"><span class="spinner"></span>読み込み中...</div>
-    </div>
+  <div class="tab-body" id="tab-hist">
+    <div id="hList" style="padding:8px;"><div class="loading"><span class="sp"></span>読み込み中...</div></div>
   </div>
 
-  <script>
-    const BASE = '.';
-    let allProducts = [];
-    let filteredProducts = [];
-    let currentPage = 1;
-    const PER_PAGE = 150;
+<script>
+const B='.';
+let all=[],filtered=[],pg=1;
+function stab(t,el){document.querySelectorAll('.vtab').forEach(v=>v.classList.remove('active'));document.querySelectorAll('.tab-body').forEach(v=>v.classList.remove('active'));el.classList.add('active');document.getElementById('tab-'+t).classList.add('active');}
 
-    function switchTab(tab) {
-      document.querySelectorAll('.view-tab').forEach(t => t.classList.remove('active'));
-      document.querySelectorAll('.tab-body').forEach(t => t.classList.remove('active'));
-      document.getElementById('tab-' + tab).classList.add('active');
-      event.target.classList.add('active');
-    }
+// Worker
+async function loadW(){try{const r=await(await fetch(B+'/api/price-revision/worker')).json();document.getElementById('wDot').className='dot '+(r.running?'on':'off');document.getElementById('wLabel').textContent=!r.enabled?'SQS未設定':r.running?'稼働中':'停止';const s=r.stats;document.getElementById('wStats').textContent=`受信:${s.received} 処理:${s.processed} 更新:${s.updated} エラー:${s.errors}`;}catch(e){}}
+async function startW(){await fetch(B+'/api/price-revision/worker/start',{method:'POST'});loadW();}
+async function stopW(){await fetch(B+'/api/price-revision/worker/stop',{method:'POST'});loadW();}
+async function doSync(){
+  if(!confirm('Amazon商品一覧を同期します（1〜2分）。実行しますか？'))return;
+  const el=document.getElementById('syncSt');
+  el.innerHTML='<span class="sp"></span>同期中...';
+  try{const r=await(await fetch(B+'/api/price-revision/sync',{method:'POST'})).json();
+  if(r.error)throw new Error(r.error);
+  el.textContent=`同期完了: ${r.total}件(新規${r.inserted} 更新${r.updated})`;loadP();
+  fetch(B+'/api/price-revision/refresh-cache',{method:'POST'});
+  }catch(e){el.textContent='エラー: '+e.message;}
+}
 
-    // === ワーカー ===
-    async function loadWorkerStatus() {
-      try {
-        const res = await fetch(`${BASE}/api/price-revision/worker`);
-        const d = await res.json();
-        document.getElementById('workerDot').className = 'status-dot ' + (d.running ? 'active' : 'inactive');
-        document.getElementById('workerLabel').textContent = !d.enabled ? 'SQS未設定' : d.running ? '稼働中' : '停止';
-        const s = d.stats;
-        document.getElementById('statsInfo').textContent =
-          `受信:${s.received} 処理:${s.processed} 更新:${s.updated} エラー:${s.errors}`;
-      } catch(e) {}
-    }
-    async function startWorker() { await fetch(`${BASE}/api/price-revision/worker/start`,{method:'POST'}); loadWorkerStatus(); }
-    async function stopWorker() { await fetch(`${BASE}/api/price-revision/worker/stop`,{method:'POST'}); loadWorkerStatus(); }
+// Products
+async function loadP(){try{all=await(await fetch(B+'/api/price-revision/products')).json();doFilter();}catch(e){document.getElementById('pList').innerHTML='<div class="empty">読み込みエラー</div>';}}
 
-    // === 商品同期（手動のみ。価格データはワーカーが常時更新） ===
-    async function manualSync() {
-      const el = document.getElementById('syncStatus');
-      if (!confirm('Amazon商品一覧を同期します（1〜2分かかります）。実行しますか？')) return;
-      el.innerHTML = '<span class="spinner" style="width:14px;height:14px;"></span>商品一覧を同期中...';
-      try {
-        const res = await fetch(`${BASE}/api/price-revision/sync`, { method: 'POST' });
-        const data = await res.json();
-        if (data.error) throw new Error(data.error);
-        el.textContent = `同期完了: ${data.total}件 (新規${data.inserted} 更新${data.updated})`;
-        loadProducts();
-        fetch(`${BASE}/api/price-revision/refresh-cache`, { method: 'POST' });
-      } catch (e) {
-        el.textContent = '同期エラー: ' + e.message;
-      }
-    }
+function doFilter(){
+  const q=document.getElementById('q').value.toLowerCase(),mf=document.getElementById('fMode').value,ff=document.getElementById('fFul').value;
+  filtered=all.filter(p=>{
+    if(q&&!`${p.product_name||''} ${p.asin||''} ${p.sku||''} ${p.ne_product_code||''} ${p.jan||''}`.toLowerCase().includes(q))return false;
+    if(ff&&p.fulfillment!==ff)return false;
+    if(mf==='_no'&&p.price_tracking&&p.price_tracking!==''&&p.price_tracking!=='しない')return false;
+    if(mf&&mf!=='_no'&&p.price_tracking!==mf)return false;
+    return true;
+  });
+  pg=1;
+  document.getElementById('cnt').textContent='約'+filtered.length+'件';
+  renderPg();
+}
 
-    // === 商品読み込み ===
-    async function loadProducts() {
-      try {
-        const res = await fetch(`${BASE}/api/price-revision/products`);
-        allProducts = await res.json();
-        filterProducts();
-      } catch (e) {
-        document.getElementById('productsContainer').innerHTML = '<div class="empty-state">読み込みエラー</div>';
-      }
-    }
+function renderPg(){
+  const pp=parseInt(document.getElementById('perPage').value);
+  const tp=Math.ceil(filtered.length/pp);
+  const items=filtered.slice((pg-1)*pp,pg*pp);
+  render(items);
+  // pager
+  const pe=document.getElementById('pager');
+  if(tp<=1){pe.innerHTML='';return;}
+  let h=`<button ${pg===1?'disabled':''} onclick="pg=1;renderPg()">最初のページ...</button>`;
+  const s=Math.max(1,pg-3),e=Math.min(tp,pg+3);
+  for(let i=s;i<=e;i++)h+=`<button class="${i===pg?'cur':''}" onclick="pg=${i};renderPg()">${i}</button>`;
+  if(e<tp)h+='<span style="padding:0 4px;">...</span>';
+  h+=`<button ${pg>=tp?'disabled':''} onclick="pg=${pg+1};renderPg()">次の${pp}件</button>`;
+  pe.innerHTML=h;
+  window.scrollTo(0,0);
+}
 
-    function filterProducts() {
-      const q = document.getElementById('searchInput').value.toLowerCase();
-      const mf = document.getElementById('modeFilter').value;
-      const ff = document.getElementById('fulfillmentFilter').value;
-      filteredProducts = allProducts.filter(p => {
-        if (q && !`${p.product_name||''} ${p.asin||''} ${p.sku||''} ${p.ne_product_code||''} ${p.jan||''}`.toLowerCase().includes(q)) return false;
-        if (ff && p.fulfillment !== ff) return false;
-        if (mf === '_none' && p.price_tracking && p.price_tracking !== '' && p.price_tracking !== 'しない') return false;
-        if (mf && mf !== '_none' && p.price_tracking !== mf) return false;
-        return true;
-      });
-      currentPage = 1;
-      document.getElementById('productCount').textContent = `約${filteredProducts.length}件`;
-      renderPage();
-    }
+function aImg(a){return a?`https://images-na.ssl-images-amazon.com/images/P/${a}.09.LZZZZZZZ.jpg`:'';}
 
-    function renderPage() {
-      const totalPages = Math.ceil(filteredProducts.length / PER_PAGE);
-      const start = (currentPage - 1) * PER_PAGE;
-      const pageItems = filteredProducts.slice(start, start + PER_PAGE);
-      renderProducts(pageItems);
-      renderPagination(totalPages);
-    }
+function render(ps){
+  const c=document.getElementById('pList');
+  if(!ps.length){c.innerHTML='<div class="empty">商品がありません</div>';return;}
+  let h='';
+  for(const p of ps){
+    const m=p.price_tracking||'';
+    const img=p.image_url||aImg(p.asin);
+    const cost=p.wholesale_price_with_tax||p.wholesale_price||'';
+    const fee=p.total_fee||0;
+    const sp=p.selling_price||0;
+    const profit=sp&&cost?sp-cost-fee:null;
+    const pRate=profit!==null&&sp?Math.round(profit/sp*100):null;
+    const isFba=p.fulfillment==='FBA';
+    h+=`<div class="p-row" data-id="${p.id}">
+      <div class="c-chk"><input type="checkbox"></div>
+      <div class="c-status">
+        <div class="st-label">出品中</div>
+        <button onclick="window.open('https://www.amazon.co.jp/dp/${p.asin}','_blank')">詳細</button>
+      </div>
+      <div class="c-img">
+        <img src="${E(img)}" onerror="this.style.display='none'" alt="">
+        <a class="asin" href="https://www.amazon.co.jp/dp/${p.asin}" target="_blank" style="font-size:10px;">${p.asin||'-'}</a>
+      </div>
+      <div class="c-info">
+        <div class="pname" title="${E(p.product_name||'')}">${E(p.product_name||'-')}</div>
+        <div class="sku">${E(p.sku||p.ne_product_code||'-')}</div>
+      </div>
+      <div class="c-price">
+        <div class="lbl">出品価格</div>
+        <div class="p-input"><span>¥</span><input type="number" value="${sp||''}" onchange="sv(${p.id},'selling_price',this.value,this)"></div>
+        <div class="sub">送料 ¥${isFba?'0':'別'}</div>
+        <div class="sub">合計 ¥${sp?sp.toLocaleString():'-'}</div>
+        <div class="cond">${isFba?'新品<br>FBA':'新品<br>自己発送'}</div>
+      </div>
+      <div class="c-comp">
+        <div class="ct">カート価格</div>
+        <div class="cv">¥${p.competitor_price?p.competitor_price.toLocaleString():'-'}</div>
+        <div class="cd">(送料 0)</div>
+        <div class="cd">(合計 ${p.competitor_price||'-'})</div>
+        <div class="cd">新品</div>
+        <div class="ct-time">${p.last_checked_at?'('+p.last_checked_at+')':''}</div>
+      </div>
+      <div class="c-mode">
+        ${['FBA最安値','最安値','カート','カスタム','しない'].map(v=>
+          `<div class="mbtn${m===v?' on':''}" data-m="${v}" onclick="setM(this,${p.id},'${v}')">${v}</div>`
+        ).join('')}
+      </div>
+      <div class="c-cost">
+        <div class="cost-input"><span>¥</span><input type="number" value="${cost}" onchange="sv(${p.id},'wholesale_price_with_tax',this.value,this)"></div>
+      </div>
+      <div class="c-stop">
+        <div class="sg"><span class="sl hi">高値ストッパー</span></div>
+        <div class="sg"><span>¥</span><input type="number" value="${p.high_stopper||''}" onchange="sv(${p.id},'high_stopper',this.value,this)"></div>
+        <div class="sg" style="margin-top:4px;"><span class="sl lo">赤字ストッパー</span></div>
+        <div class="sg"><span>¥</span><input type="number" value="${p.loss_stopper||''}" onchange="sv(${p.id},'loss_stopper',this.value,this)"></div>
+        ${profit!==null?`<div class="profit-line ${profit>=0?'pos':'neg'}">粗利益<br>¥${profit.toLocaleString()}</div>`:''}
+      </div>
+      <div class="c-profit">
+        <div class="fee-lbl">手数料</div>
+        <div class="fee-val">${fee?'¥'+fee.toLocaleString():'-'}</div>
+        <div class="fee-lbl" style="margin-top:4px;">粗利益</div>
+        <div class="pv ${profit!==null?(profit>=0?'pos':'neg'):''}">¥${profit!==null?profit.toLocaleString():'-'}</div>
+        ${pRate!==null?`<div class="pr">(${pRate}%)</div>`:''}
+      </div>
+    </div>`;
+  }
+  c.innerHTML=h;
+}
 
-    function goToPage(page) {
-      currentPage = page;
-      renderPage();
-      window.scrollTo(0, 0);
-    }
+async function setM(el,id,m){
+  el.closest('.c-mode').querySelectorAll('.mbtn').forEach(b=>b.classList.remove('on'));
+  el.classList.add('on');
+  await fetch(B+'/api/products/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({price_tracking:m==='しない'?'':m})});
+  fl(el);fetch(B+'/api/price-revision/refresh-cache',{method:'POST'});
+}
+async function sv(id,f,v,el){
+  const d={};d[f]=v?parseInt(v):null;
+  await fetch(B+'/api/products/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});
+  fl(el);
+}
+function fl(el){const r=el.closest('.p-row');if(r){r.classList.add('flash');setTimeout(()=>r.classList.remove('flash'),600);}}
 
-    function renderPagination(totalPages) {
-      const el = document.getElementById('pagination');
-      if (totalPages <= 1) { el.innerHTML = ''; return; }
-      let html = '';
-      html += `<button ${currentPage===1?'disabled':''} onclick="goToPage(1)">最初のページ...</button>`;
-      const startP = Math.max(1, currentPage - 2);
-      const endP = Math.min(totalPages, currentPage + 2);
-      for (let i = startP; i <= endP; i++) {
-        html += `<button class="${i===currentPage?'active':''}" onclick="goToPage(${i})">${i}</button>`;
-      }
-      if (endP < totalPages) html += `<span class="page-info">...</span>`;
-      html += `<button ${currentPage===totalPages?'disabled':''} onclick="goToPage(${currentPage+1})">次の${PER_PAGE}件</button>`;
-      el.innerHTML = html;
-    }
+// History
+async function loadH(){try{
+  const h=await(await fetch(B+'/api/price-revision/history?limit=100')).json();
+  const c=document.getElementById('hList');
+  if(!h.length){c.innerHTML='<div class="empty">履歴がありません</div>';return;}
+  let t='<table class="htbl"><thead><tr><th>日時</th><th>ASIN</th><th>SKU</th><th>モード</th><th class="n">旧価格</th><th class="n">新価格</th><th class="n">差額</th><th class="n">競合</th><th>理由</th></tr></thead><tbody>';
+  for(const r of h){const d=(r.new_price||0)-(r.old_price||0);
+    t+=`<tr><td style="white-space:nowrap">${r.created_at||'-'}</td><td><a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank">${r.asin}</a></td><td>${E(r.sku||'-')}</td><td>${r.mode||'-'}</td><td class="n">${r.old_price?'¥'+r.old_price.toLocaleString():'-'}</td><td class="n">${r.new_price?'¥'+r.new_price.toLocaleString():'-'}</td><td class="n ${d>0?'pos':d<0?'neg':''}">${d>0?'+':''}${d.toLocaleString()}</td><td class="n">${r.competitor_price?'¥'+r.competitor_price.toLocaleString():'-'}</td><td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${E(r.reason||'')}">${E(r.reason||'-')}</td></tr>`;}
+  t+='</tbody></table>';c.innerHTML=t;
+}catch(e){document.getElementById('hList').innerHTML='<div class="empty">読み込みエラー</div>';}}
 
-    function getAmazonImage(asin) {
-      if (!asin) return '';
-      return `https://images-na.ssl-images-amazon.com/images/P/${asin}.09.LZZZZZZZ.jpg`;
-    }
+function E(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 
-    function renderProducts(products) {
-      const c = document.getElementById('productsContainer');
-      if (!products.length) { c.innerHTML = '<div class="empty-state">商品がありません</div>'; return; }
-
-      let html = '';
-      for (const p of products) {
-        const mode = p.price_tracking || '';
-        const img = p.image_url || getAmazonImage(p.asin);
-        const cost = p.wholesale_price_with_tax || p.wholesale_price || '';
-        const fee = p.total_fee || 0;
-        const profit = p.selling_price && cost ? p.selling_price - cost - fee : null;
-        const profitRate = profit !== null && p.selling_price ? Math.round(profit / p.selling_price * 100) : null;
-        const shipping = p.fulfillment === 'FBA' ? '送料¥0' : '送料別';
-
-        html += `<div class="product-row" data-id="${p.id}">
-          <div class="col-check"><input type="checkbox"></div>
-          <div class="col-img"><img src="${esc(img)}" onerror="this.style.display='none'" alt=""></div>
-          <div class="col-info">
-            <div class="pname" title="${esc(p.product_name||'')}">${esc(p.product_name||'-')}</div>
-            <div><a class="asin" href="https://www.amazon.co.jp/dp/${p.asin}" target="_blank">${p.asin||'-'}</a></div>
-            <div class="sku">${esc(p.sku || p.ne_product_code || '-')}</div>
-          </div>
-          <div class="col-price">
-            <div class="label">出品価格</div>
-            <div>¥ <input type="number" value="${p.selling_price||''}" onchange="saveField(${p.id},'selling_price',this.value,this)"></div>
-            <div class="sub">${shipping}</div>
-            <div class="sub">合計 ¥${p.selling_price||'-'}</div>
-          </div>
-          <div class="col-comp">
-            <div class="comp-title">カート価格</div>
-            <div class="comp-price">${p.competitor_price ? '¥'+p.competitor_price.toLocaleString() : '-'}</div>
-            <div class="comp-detail">${p.fulfillment==='FBA'?'FBA':'自己発送'}</div>
-            <div class="comp-time">${p.last_checked_at ? '('+p.last_checked_at+')' : ''}</div>
-          </div>
-          <div class="col-mode">
-            ${['FBA最安値','最安値','カート','カスタム','しない'].map(m =>
-              `<div class="mode-btn${mode===m?' active':''}" data-mode="${m}" onclick="setMode(this,${p.id},'${m}')">${m}</div>`
-            ).join('')}
-          </div>
-          <div class="col-cost">
-            <div class="label">仕入れ価格</div>
-            <div style="color:#c0392b;">¥ <input type="number" value="${cost}" onchange="saveField(${p.id},'wholesale_price_with_tax',this.value,this)"></div>
-          </div>
-          <div class="col-stopper">
-            <div class="s-group"><span class="s-label">高値</span>¥ <input type="number" value="${p.high_stopper||''}" onchange="saveField(${p.id},'high_stopper',this.value,this)"></div>
-            <div class="s-group"><span class="s-label" style="color:#c0392b;">赤字</span>¥ <input type="number" value="${p.loss_stopper||''}" onchange="saveField(${p.id},'loss_stopper',this.value,this)"></div>
-            ${profit !== null ? `<div class="profit ${profit>=0?'pos':'neg'}">粗利益 ¥${profit.toLocaleString()}</div>` : ''}
-          </div>
-          <div class="col-profit">
-            <div class="label" style="font-size:9px;color:#999;">手数料</div>
-            <div style="font-size:11px;">${fee ? '¥'+fee.toLocaleString() : '-'}</div>
-            <div class="label" style="font-size:9px;color:#999;margin-top:4px;">粗利益</div>
-            <div class="profit-val ${profit!==null?(profit>=0?'pos':'neg'):''}">${profit!==null?'¥'+profit.toLocaleString():'-'}</div>
-            ${profitRate!==null?`<div class="profit-rate">(${profitRate}%)</div>`:''}
-          </div>
-        </div>`;
-      }
-      c.innerHTML = html;
-    }
-
-    // === モード変更 ===
-    async function setMode(el, id, mode) {
-      el.closest('.col-mode').querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
-      el.classList.add('active');
-      const val = mode === 'しない' ? '' : mode;
-      await fetch(`${BASE}/api/products/${id}`, {
-        method: 'PUT', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ price_tracking: val }),
-      });
-      flashRow(el);
-      fetch(`${BASE}/api/price-revision/refresh-cache`, { method: 'POST' });
-    }
-
-    // === フィールド保存 ===
-    async function saveField(id, field, value, inputEl) {
-      const data = {};
-      data[field] = value ? parseInt(value) : null;
-      await fetch(`${BASE}/api/products/${id}`, {
-        method: 'PUT', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify(data),
-      });
-      flashRow(inputEl);
-    }
-
-    function flashRow(el) {
-      const row = el.closest('.product-row');
-      if (row) { row.classList.add('saved-flash'); setTimeout(() => row.classList.remove('saved-flash'), 600); }
-    }
-
-    // === 履歴 ===
-    async function loadHistory() {
-      try {
-        const res = await fetch(`${BASE}/api/price-revision/history?limit=100`);
-        const hist = await res.json();
-        const c = document.getElementById('historyContainer');
-        if (!hist.length) { c.innerHTML = '<div class="empty-state">履歴がありません</div>'; return; }
-        let h = '<table class="history-table"><thead><tr><th>日時</th><th>ASIN</th><th>SKU</th><th>モード</th><th class="num">旧価格</th><th class="num">新価格</th><th class="num">差額</th><th class="num">競合</th><th>理由</th></tr></thead><tbody>';
-        for (const r of hist) {
-          const d = (r.new_price||0)-(r.old_price||0);
-          h += `<tr><td style="white-space:nowrap">${r.created_at||'-'}</td><td><a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank">${r.asin}</a></td><td>${esc(r.sku||'-')}</td><td>${r.mode||'-'}</td><td class="num">${r.old_price?'¥'+r.old_price.toLocaleString():'-'}</td><td class="num">${r.new_price?'¥'+r.new_price.toLocaleString():'-'}</td><td class="num ${d>0?'positive':d<0?'negative':''}">${d>0?'+':''}${d.toLocaleString()}</td><td class="num">${r.competitor_price?'¥'+r.competitor_price.toLocaleString():'-'}</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.reason||'')}">${esc(r.reason||'-')}</td></tr>`;
-        }
-        h += '</tbody></table>';
-        c.innerHTML = h;
-      } catch(e) { document.getElementById('historyContainer').innerHTML = '<div class="empty-state">読み込みエラー</div>'; }
-    }
-
-    function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
-
-    // === 初期化（DBから即表示。価格データはワーカーが裏で常時更新済み） ===
-    loadWorkerStatus();
-    loadProducts();
-    loadHistory();
-    setInterval(loadWorkerStatus, 30000);
-  </script>
+loadW();loadP();loadH();setInterval(loadW,30000);
+</script>
 </body>
 </html>
