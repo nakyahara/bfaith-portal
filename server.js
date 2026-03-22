@@ -11,6 +11,7 @@ import aesRouter, { startPythonBackend, stopPythonBackend } from './apps/aes-pdf
 import rankingRouter from './apps/ranking-checker/router.js';
 import { startScheduler } from './apps/ranking-checker/scheduler.js';
 import profitRouter from './apps/profit-calculator/router.js';
+import { startPriceWorker } from './apps/profit-calculator/price-scheduler.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -391,6 +392,9 @@ app.listen(PORT, () => {
 
   // 楽天順位チェッカー スケジューラー
   startScheduler();
+
+  // 価格改定ワーカー（SQS通知ベース）
+  startPriceWorker();
 });
 
 process.on('SIGTERM', () => { stopPythonBackend(); process.exit(0); });

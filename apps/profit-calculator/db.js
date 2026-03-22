@@ -193,6 +193,39 @@ export async function initDb() {
     )
   `);
 
+  // 価格変動履歴テーブル（価格改定機能用）
+  db.run(`
+    CREATE TABLE IF NOT EXISTS price_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+      asin TEXT NOT NULL,
+      sku TEXT,
+      old_price INTEGER,
+      new_price INTEGER,
+      reason TEXT,
+      mode TEXT,
+      competitor_price INTEGER,
+      buy_box_price INTEGER,
+      created_at TEXT DEFAULT (datetime('now','localtime'))
+    )
+  `);
+
+  // productsテーブル: 価格改定用カラム追加
+  const priceRevisionCols = [
+    ['last_checked_at', 'TEXT'],
+    ['last_price_changed_at', 'TEXT'],
+    ['competitor_price', 'INTEGER'],
+    ['price_change_count_today', 'INTEGER DEFAULT 0'],
+    ['price_change_count_date', 'TEXT'],
+    ['sku', 'TEXT'],
+  ];
+  const prodCols2 = queryAll('PRAGMA table_info(products)').map(r => r.name);
+  for (const [col, type] of priceRevisionCols) {
+    if (!prodCols2.includes(col)) {
+      db.run(`ALTER TABLE products ADD COLUMN ${col} ${type}`);
+    }
+  }
+
   saveToFile();
 }
 
@@ -448,4 +481,43 @@ export function deleteProduct(id) {
 export function getProductById(id) {
   const rows = queryAll('SELECT * FROM products WHERE id = ?', [id]);
   return rows.length > 0 ? rows[0] : null;
+}
+
+// ===== Price History (価格改定) =====
+
+export function savePriceHistory({ productId, asin, sku, oldPrice, newPrice, reason, mode, competitorPrice, buyBoxPrice }) {
+  db.run(`
+    INSERT INTO price_history (product_id, asin, sku, old_price, new_price, reason, mode, competitor_price, buy_box_price)
+    VALUES (?,?,?,?,?,?,?,?,?)
+  `, [productId, asin, sku, oldPrice, newPrice, reason, mode, competitorPrice, buyBoxPrice]);
+  saveToFile();
+}
+
+export function getPriceHistory(productId, limit = 50) {
+  return queryAll('SELECT * FROM price_history WHERE product_id = ? ORDER BY id DESC LIMIT ?', [productId, limit]);
+}
+
+export function getRecentPriceHistory(limit = 100) {
+  return queryAll('SELECT * FROM price_history ORDER BY id DESC LIMIT ?', [limit]);
+}
+
+export function getTrackingProducts() {
+  return queryAll("SELECT * FROM products WHERE price_tracking IS NOT NULL AND price_tracking != '' AND sku IS NOT NULL AND sku != ''");
+}
+
+export function updateProductPriceInfo(id, data) {
+  const fields = [];
+  const params = [];
+  const allowed = ['selling_price', 'competitor_price', 'last_checked_at', 'last_price_changed_at', 'price_change_count_today', 'price_change_count_date'];
+  for (const [key, value] of Object.entries(data)) {
+    if (allowed.includes(key)) {
+      fields.push(`${key} = ?`);
+      params.push(value === undefined ? null : value);
+    }
+  }
+  if (fields.length === 0) return;
+  fields.push("updated_at = datetime('now','localtime')");
+  params.push(id);
+  db.run(`UPDATE products SET ${fields.join(', ')} WHERE id = ?`, params);
+  saveToFile();
 }

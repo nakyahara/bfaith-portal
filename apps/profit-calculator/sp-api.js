@@ -387,6 +387,78 @@ export async function updatePrice({ sku, price }) {
   };
 }
 
+/**
+ * 出品中の全商品レポートを取得（SKU数の確認用）
+ * GET_MERCHANT_LISTINGS_ALL_DATA レポート
+ */
+export async function getActiveListingsReport() {
+  const sp = getClient();
+  const marketplaceId = MARKETPLACE_ID();
+
+  // レポート作成リクエスト
+  const createResult = await sp.callAPI({
+    operation: 'createReport',
+    endpoint: 'reports',
+    body: {
+      reportType: 'GET_MERCHANT_LISTINGS_DATA',
+      marketplaceIds: [marketplaceId],
+    },
+    options: { version: '2021-06-30' },
+  });
+
+  const reportId = createResult.reportId;
+  console.log(`[SP-API] レポート作成: reportId=${reportId}`);
+
+  // レポート完了を待機（最大2分）
+  let report;
+  for (let i = 0; i < 24; i++) {
+    await new Promise(r => setTimeout(r, 5000));
+    report = await sp.callAPI({
+      operation: 'getReport',
+      endpoint: 'reports',
+      path: { reportId },
+      options: { version: '2021-06-30' },
+    });
+    console.log(`[SP-API] レポートステータス: ${report.processingStatus}`);
+    if (report.processingStatus === 'DONE') break;
+    if (report.processingStatus === 'FATAL' || report.processingStatus === 'CANCELLED') {
+      throw new Error(`レポート処理失敗: ${report.processingStatus}`);
+    }
+  }
+
+  if (report.processingStatus !== 'DONE') {
+    throw new Error('レポート取得タイムアウト');
+  }
+
+  // レポートドキュメント取得
+  const doc = await sp.callAPI({
+    operation: 'getReportDocument',
+    endpoint: 'reports',
+    path: { reportDocumentId: report.reportDocumentId },
+    options: { version: '2021-06-30' },
+  });
+
+  // ドキュメントダウンロード
+  const response = await fetch(doc.url);
+  const text = await response.text();
+
+  // TSV解析
+  const lines = text.split('\n').filter(l => l.trim());
+  const headers = lines[0].split('\t');
+  const rows = lines.slice(1).map(line => {
+    const values = line.split('\t');
+    const obj = {};
+    headers.forEach((h, i) => { obj[h.trim()] = (values[i] || '').trim(); });
+    return obj;
+  });
+
+  return {
+    totalCount: rows.length,
+    headers: headers.map(h => h.trim()),
+    listings: rows,
+  };
+}
+
 export async function patchListing({ sku, patches }) {
   const sp = getClient();
   const marketplaceId = MARKETPLACE_ID();

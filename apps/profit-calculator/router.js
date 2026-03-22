@@ -4,11 +4,12 @@
 import { Router } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { getProduct, getFees, createListing, patchListing, getShippingTemplates, getItemOffers, updatePrice } from './sp-api.js';
-import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, deleteProduct, getSetItems, saveSetItems } from './db.js';
+import { getProduct, getFees, createListing, patchListing, getShippingTemplates, getItemOffers, updatePrice, getActiveListingsReport } from './sp-api.js';
+import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, deleteProduct, getSetItems, saveSetItems, getTrackingProducts, getPriceHistory, getRecentPriceHistory, savePriceHistory, updateProductPriceInfo } from './db.js';
 import { loadSuppliers, addSupplier, deleteSupplier } from './suppliers.js';
 import { loadShipping, addShipping, updateShipping, deleteShipping } from './shipping.js';
 import { getSetting, setSetting, getAllSettings } from './settings.js';
+import { startPriceWorker, stopPriceWorker, getWorkerStatus, refreshProductCache } from './price-scheduler.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -53,6 +54,10 @@ router.get('/shipping', (req, res) => {
 
 router.get('/settings', (req, res) => {
   res.sendFile(path.join(__dirname, 'settings.html'));
+});
+
+router.get('/price-revision', (req, res) => {
+  res.sendFile(path.join(__dirname, 'price-revision.html'));
 });
 
 // 旧URL互換
@@ -723,6 +728,86 @@ router.post('/api/amazon/update-price', async (req, res) => {
     console.error('[ProfitCalc] 価格更新エラー:', err.message, err.stack);
     res.status(500).json({ error: err.message });
   }
+});
+
+// ── API: Amazon出品商品レポート（SKU数確認用） ──
+router.get('/api/amazon/listings-report', async (req, res) => {
+  try {
+    const report = await getActiveListingsReport();
+    // サマリー情報を返す（全データは大きいのでカウントと概要のみ）
+    const statusCounts = {};
+    for (const row of report.listings) {
+      const status = row['status'] || row['Status'] || 'unknown';
+      statusCounts[status] = (statusCounts[status] || 0) + 1;
+    }
+    res.json({
+      totalCount: report.totalCount,
+      statusCounts,
+      sampleHeaders: report.headers.slice(0, 20),
+      sample: report.listings.slice(0, 5),
+    });
+  } catch (err) {
+    console.error('[ProfitCalc] 出品レポート取得エラー:', err.message, err.stack);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── API: 価格改定機能 ──
+
+// 価格追従中の商品一覧
+router.get('/api/price-revision/products', async (req, res) => {
+  try {
+    await ensureDb();
+    const products = getTrackingProducts();
+    res.json(products);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 価格変動履歴（全体）
+router.get('/api/price-revision/history', async (req, res) => {
+  try {
+    await ensureDb();
+    const limit = parseInt(req.query.limit) || 100;
+    const history = getRecentPriceHistory(limit);
+    res.json(history);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 商品別の価格変動履歴
+router.get('/api/price-revision/history/:productId', async (req, res) => {
+  try {
+    await ensureDb();
+    const limit = parseInt(req.query.limit) || 50;
+    const history = getPriceHistory(parseInt(req.params.productId), limit);
+    res.json(history);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ワーカー制御
+router.get('/api/price-revision/worker', (req, res) => {
+  res.json(getWorkerStatus());
+});
+
+router.post('/api/price-revision/worker/start', (req, res) => {
+  startPriceWorker();
+  res.json({ ok: true });
+});
+
+router.post('/api/price-revision/worker/stop', (req, res) => {
+  stopPriceWorker();
+  res.json({ ok: true });
+});
+
+// 商品キャッシュ手動リフレッシュ
+router.post('/api/price-revision/refresh-cache', (req, res) => {
+  refreshProductCache();
+  res.json({ ok: true });
 });
 
 export default router;
