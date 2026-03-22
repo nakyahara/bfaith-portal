@@ -549,4 +549,60 @@ router.get('/api/amazon/shipping-templates', async (req, res) => {
   }
 });
 
+// ── API: 支払い制限の有効値を取得（診断用） ──
+router.get('/api/amazon/payment-options', async (req, res) => {
+  try {
+    const { getShippingTemplates: _unused, ...rest } = {};
+    // スキーマを直接取得
+    const sp = (await import('./sp-api.js'));
+    // getShippingTemplatesと同じスキーマを使う
+    const SellingPartner = (await import('amazon-sp-api')).default;
+    const client = new SellingPartner({
+      region: 'fe',
+      refresh_token: process.env.SP_API_REFRESH_TOKEN,
+      credentials: {
+        SELLING_PARTNER_APP_CLIENT_ID: process.env.SP_API_CLIENT_ID,
+        SELLING_PARTNER_APP_CLIENT_SECRET: process.env.SP_API_CLIENT_SECRET,
+        AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID,
+        AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY,
+      },
+    });
+    const marketplaceId = process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
+    const sellerId = process.env.SP_API_SELLER_ID || 'A6HMLHKUUJC27';
+
+    const result = await client.callAPI({
+      operation: 'getDefinitionsProductType',
+      endpoint: 'productTypeDefinitions',
+      path: { productType: 'PRODUCT' },
+      query: { marketplaceIds: [marketplaceId], sellerId, requirements: 'LISTING', locale: 'ja_JP' },
+      options: { version: '2020-09-01' },
+    });
+
+    const schemaUrl = result.schema?.link?.resource;
+    if (!schemaUrl) return res.status(500).json({ error: 'スキーマURL取得失敗' });
+
+    const schemaRes = await fetch(schemaUrl);
+    const schema = await schemaRes.json();
+
+    const prop = schema.properties?.optional_payment_type_exclusion;
+    if (!prop) {
+      // 近い名前のプロパティを探す
+      const paymentKeys = Object.keys(schema.properties || {}).filter(k => k.includes('payment') || k.includes('exclusion') || k.includes('cod') || k.includes('cvs'));
+      return res.json({ found: false, paymentRelatedKeys: paymentKeys });
+    }
+
+    const valueProp = prop.items?.properties?.value || prop.properties?.value || {};
+    res.json({
+      found: true,
+      attribute: 'optional_payment_type_exclusion',
+      enum: valueProp.enum || [],
+      enumNames: valueProp.enumNames || [],
+      rawProp: prop,
+    });
+  } catch (err) {
+    console.error('[ProfitCalc] 支払いオプション取得エラー:', err.message, err.stack);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 export default router;
