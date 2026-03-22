@@ -10,9 +10,10 @@
  *   6. price_history に記録
  */
 import { SQSClient, ReceiveMessageCommand, DeleteMessageCommand } from '@aws-sdk/client-sqs';
-import { updatePrice } from './sp-api.js';
+import cron from 'node-cron';
+import { updatePrice, getItemOffers, getActiveListingsReport } from './sp-api.js';
 import { calculateNewPrice, parseNotificationPayload } from './price-engine.js';
-import { initDb, updateProductPriceInfo, savePriceHistory } from './db.js';
+import { initDb, updateProductPriceInfo, savePriceHistory, getStaleTrackingProducts, cleanupOldPriceHistory, syncProductsFromListings } from './db.js';
 
 const QUEUE_URL = process.env.AWS_SQS_QUEUE_URL;
 const REGION = process.env.AWS_SQS_REGION || 'ap-northeast-1';
@@ -274,4 +275,129 @@ export function getWorkerStatus() {
     enabled: !!QUEUE_URL,
     stats: { ...stats },
   };
+}
+
+// ============================================================
+// 定期メンテナンスジョブ（SQSワーカーとは独立）
+// ============================================================
+
+const API_DELAY = 300;
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+/**
+ * フォールバックポーリング: 通知が来ていない商品の競合価格を補完取得
+ * 24時間以上チェックされていない追従対象商品を対象
+ */
+async function runFallbackPolling() {
+  try {
+    await initDb();
+    const staleProducts = getStaleTrackingProducts(24);
+    if (staleProducts.length === 0) {
+      console.log('[Fallback] 補完対象の商品なし');
+      return;
+    }
+
+    console.log(`[Fallback] ${staleProducts.length}件の補完ポーリング開始`);
+    let checked = 0, updated = 0, errors = 0;
+
+    for (const product of staleProducts) {
+      try {
+        const offersData = await getItemOffers(product.asin);
+        await sleep(API_DELAY);
+
+        const { newPrice, reason, competitorPrice, buyBoxPrice } = calculateNewPrice(product, offersData);
+
+        const updateData = {
+          last_checked_at: new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }),
+          competitor_price: competitorPrice,
+        };
+
+        if (newPrice !== null) {
+          const result = await updatePrice({ sku: product.sku, price: newPrice });
+          await sleep(API_DELAY);
+
+          if (result.status === 'ACCEPTED') {
+            updateData.selling_price = newPrice;
+            updateData.last_price_changed_at = updateData.last_checked_at;
+
+            savePriceHistory({
+              productId: product.id, asin: product.asin, sku: product.sku,
+              oldPrice: product.selling_price, newPrice,
+              reason: '[Fallback] ' + reason, mode: product.price_tracking,
+              competitorPrice, buyBoxPrice,
+            });
+            updated++;
+            console.log(`[Fallback] ${product.asin}: ¥${product.selling_price} → ¥${newPrice}`);
+          } else { errors++; }
+        }
+
+        updateProductPriceInfo(product.id, updateData);
+        checked++;
+      } catch (err) {
+        console.error(`[Fallback] ${product.asin} エラー:`, err.message);
+        errors++;
+        await sleep(API_DELAY);
+      }
+    }
+
+    console.log(`[Fallback] 完了: ${checked}チェック, ${updated}更新, ${errors}エラー`);
+  } catch (err) {
+    console.error('[Fallback] 全体エラー:', err.message);
+  }
+}
+
+/**
+ * 商品一覧の自動同期（SP-APIレポート）
+ */
+async function runDailySync() {
+  try {
+    await initDb();
+    console.log('[DailySync] Amazon商品一覧の同期開始...');
+    const report = await getActiveListingsReport();
+    const result = syncProductsFromListings(report.listings);
+    console.log(`[DailySync] 完了: 全${result.total}件 (新規${result.inserted} 更新${result.updated})`);
+    refreshProductCache();
+  } catch (err) {
+    console.error('[DailySync] エラー:', err.message);
+  }
+}
+
+/**
+ * 古い価格履歴の削除
+ */
+async function runCleanup() {
+  try {
+    await initDb();
+    const deleted = cleanupOldPriceHistory(30);
+    if (deleted > 0) {
+      console.log(`[Cleanup] ${deleted}件の古い価格履歴を削除`);
+    }
+  } catch (err) {
+    console.error('[Cleanup] エラー:', err.message);
+  }
+}
+
+/**
+ * 定期ジョブの開始（サーバー起動時に呼ばれる）
+ */
+export function startMaintenanceJobs() {
+  // 毎日 3:00 JST — 商品一覧同期
+  cron.schedule('0 3 * * *', () => {
+    console.log('[Cron] 商品一覧の日次同期');
+    runDailySync();
+  }, { timezone: 'Asia/Tokyo' });
+
+  // 毎日 4:00 JST — フォールバックポーリング
+  cron.schedule('0 4 * * *', () => {
+    console.log('[Cron] フォールバックポーリング');
+    runFallbackPolling();
+  }, { timezone: 'Asia/Tokyo' });
+
+  // 毎日 5:00 JST — 古い履歴のクリーンアップ
+  cron.schedule('0 5 * * *', () => {
+    console.log('[Cron] 価格履歴クリーンアップ');
+    runCleanup();
+  }, { timezone: 'Asia/Tokyo' });
+
+  console.log('[Cron] メンテナンスジョブ登録完了 (同期3:00, フォールバック4:00, クリーンアップ5:00)');
 }

@@ -557,6 +557,33 @@ export function getRecentPriceHistory(limit = 100) {
   return queryAll('SELECT * FROM price_history ORDER BY id DESC LIMIT ?', [limit]);
 }
 
+/**
+ * 通知が来ていない商品を取得（フォールバック対象）
+ * last_checked_at が NULL または24時間以上前の、追従設定済み商品
+ */
+export function getStaleTrackingProducts(hoursThreshold = 24) {
+  return queryAll(`
+    SELECT * FROM products
+    WHERE price_tracking IS NOT NULL AND price_tracking != '' AND price_tracking != 'しない'
+      AND sku IS NOT NULL AND sku != ''
+      AND (last_checked_at IS NULL OR last_checked_at < datetime('now', 'localtime', '-${hoursThreshold} hours'))
+    ORDER BY last_checked_at ASC
+  `);
+}
+
+/**
+ * 30日以上前の価格履歴を削除
+ */
+export function cleanupOldPriceHistory(days = 30) {
+  const result = queryAll(`SELECT COUNT(*) as cnt FROM price_history WHERE created_at < datetime('now', 'localtime', '-${days} days')`);
+  const count = result[0]?.cnt || 0;
+  if (count > 0) {
+    db.run(`DELETE FROM price_history WHERE created_at < datetime('now', 'localtime', '-${days} days')`);
+    saveToFile();
+  }
+  return count;
+}
+
 export function getTrackingProducts() {
   return queryAll("SELECT * FROM products WHERE price_tracking IS NOT NULL AND price_tracking != '' AND sku IS NOT NULL AND sku != ''");
 }
