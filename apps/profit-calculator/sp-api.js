@@ -409,9 +409,9 @@ export async function getActiveListingsReport() {
   const reportId = createResult.reportId;
   console.log(`[SP-API] レポート作成: reportId=${reportId}`);
 
-  // レポート完了を待機（最大2分）
+  // レポート完了を待機（最大5分）
   let report;
-  for (let i = 0; i < 24; i++) {
+  for (let i = 0; i < 60; i++) {
     await new Promise(r => setTimeout(r, 5000));
     report = await sp.callAPI({
       operation: 'getReport',
