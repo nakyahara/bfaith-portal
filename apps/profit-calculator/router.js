@@ -769,14 +769,22 @@ router.get('/api/price-revision/diagnostics', async (req, res) => {
     });
     const dupes = Object.entries(duplicateAsins).filter(([, v]) => v.length > 1);
 
+    // ASIN形式の分析
+    const realAsins = all.filter(p => p.asin && /^[A-Z0-9]{10}$/.test(p.asin)); // 10桁英数字
+    const janCodes = all.filter(p => p.asin && /^\d{13}$/.test(p.asin));        // 13桁数字（JAN/EAN）
+    const otherIds = all.filter(p => p.asin && !/^[A-Z0-9]{10}$/.test(p.asin) && !/^\d{13}$/.test(p.asin));
+
     res.json({
       totalProducts: all.length,
       uniqueAsins: uniqueAsins.size,
       uniqueSkus: uniqueSkus.size,
+      realAsinCount: realAsins.length,
+      janCodeCount: janCodes.length,
+      otherIdCount: otherIds.length,
       noAsinCount: noAsin.length,
-      noAsinSamples: noAsin.slice(0, 5).map(p => ({ id: p.id, asin: p.asin, sku: p.sku, name: p.product_name?.slice(0, 30) })),
+      janSamples: janCodes.slice(0, 3).map(p => ({ id: p.id, asin: p.asin, sku: p.sku, name: p.product_name?.slice(0, 30) })),
+      otherSamples: otherIds.slice(0, 3).map(p => ({ id: p.id, asin: p.asin, sku: p.sku, name: p.product_name?.slice(0, 30) })),
       duplicateAsinCount: dupes.length,
-      duplicateSamples: dupes.slice(0, 5).map(([asin, entries]) => ({ asin, count: entries.length, skus: entries.map(e => e.sku) })),
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
