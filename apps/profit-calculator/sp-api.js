@@ -287,6 +287,106 @@ export async function createListing({ asin, price, isFba, sku, condition = 'new_
 /**
  * 既存出品の属性をパッチ更新（支払い制限・配送設定等）
  */
+/**
+ * 競合出品者のオファー一覧取得（価格改定用）
+ * ItemCondition: New, Used, Collectible, Refurbished, Club
+ */
+export async function getItemOffers(asin, itemCondition = 'New') {
+  const sp = getClient();
+  const marketplaceId = MARKETPLACE_ID();
+
+  const result = await sp.callAPI({
+    operation: 'getItemOffers',
+    endpoint: 'productPricing',
+    path: { Asin: asin },
+    query: {
+      MarketplaceId: marketplaceId,
+      ItemCondition: itemCondition,
+    },
+  });
+
+  const summary = result.Summary || {};
+  const offers = result.Offers || [];
+
+  // オファーを整理
+  const parsedOffers = offers.map(o => ({
+    sellerId: o.SellerId,
+    subCondition: o.SubCondition,
+    isFba: o.IsFulfilledByAmazon,
+    isBuyBoxWinner: o.IsBuyBoxWinner,
+    isFeaturedMerchant: o.IsFeaturedMerchantByAmazon || o.IsFeaturedMerchant,
+    listingPrice: o.ListingPrice?.Amount || 0,
+    shipping: o.Shipping?.Amount || 0,
+    totalPrice: (o.ListingPrice?.Amount || 0) + (o.Shipping?.Amount || 0),
+    points: o.Points?.PointsNumber || 0,
+    sellerFeedbackRating: o.SellerFeedbackRating?.SellerPositiveFeedbackRating || null,
+    sellerFeedbackCount: o.SellerFeedbackRating?.FeedbackCount || 0,
+    shipsFrom: o.ShipsFrom?.Country || 'JP',
+    shipsDomestically: (o.ShipsFrom?.Country || 'JP') === 'JP',
+  }));
+
+  // FBA・FBMに分離
+  const fbaOffers = parsedOffers.filter(o => o.isFba);
+  const fbmOffers = parsedOffers.filter(o => !o.isFba);
+
+  return {
+    asin,
+    totalOfferCount: summary.TotalOfferCount || offers.length,
+    buyBoxPrice: summary.BuyBoxPrices?.find(b => b.condition === 'New')?.LandedPrice?.Amount || null,
+    buyBoxShipping: summary.BuyBoxPrices?.find(b => b.condition === 'New')?.Shipping?.Amount || null,
+    lowestFbaPrice: summary.LowestPrices?.find(p => p.condition === 'New' && p.fulfillmentChannel === 'Amazon')?.LandedPrice?.Amount || null,
+    lowestFbmPrice: summary.LowestPrices?.find(p => p.condition === 'New' && p.fulfillmentChannel === 'Merchant')?.LandedPrice?.Amount || null,
+    numberOfOffers: {
+      fbaNew: summary.NumberOfOffers?.find(n => n.condition === 'New' && n.fulfillmentChannel === 'Amazon')?.OfferCount || 0,
+      fbmNew: summary.NumberOfOffers?.find(n => n.condition === 'New' && n.fulfillmentChannel === 'Merchant')?.OfferCount || 0,
+    },
+    listPrice: summary.ListPrice?.Amount || null,
+    offers: parsedOffers,
+    fbaOffers,
+    fbmOffers,
+  };
+}
+
+/**
+ * 出品価格を更新（価格改定用）
+ */
+export async function updatePrice({ sku, price }) {
+  const sp = getClient();
+  const marketplaceId = MARKETPLACE_ID();
+  const sellerId = SELLER_ID();
+
+  if (!sku) throw new Error('SKUが必要です');
+  if (!price || price <= 0) throw new Error('価格が正の数である必要があります');
+
+  const result = await sp.callAPI({
+    operation: 'patchListingsItem',
+    endpoint: 'listingsItems',
+    path: { sellerId, sku },
+    query: { marketplaceIds: [marketplaceId] },
+    body: {
+      productType: 'PRODUCT',
+      patches: [{
+        op: 'replace',
+        path: '/attributes/purchasable_offer',
+        value: [{
+          marketplace_id: marketplaceId,
+          currency: 'JPY',
+          our_price: [{ schedule: [{ value_with_tax: price }] }],
+        }],
+      }],
+    },
+    options: { version: '2021-08-01' },
+  });
+
+  return {
+    sku,
+    newPrice: price,
+    status: result.status,
+    submissionId: result.submissionId,
+    issues: result.issues || [],
+  };
+}
+
 export async function patchListing({ sku, patches }) {
   const sp = getClient();
   const marketplaceId = MARKETPLACE_ID();

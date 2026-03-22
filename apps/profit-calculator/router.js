@@ -4,7 +4,7 @@
 import { Router } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { getProduct, getFees, createListing, patchListing, getShippingTemplates } from './sp-api.js';
+import { getProduct, getFees, createListing, patchListing, getShippingTemplates, getItemOffers, updatePrice } from './sp-api.js';
 import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, deleteProduct, getSetItems, saveSetItems } from './db.js';
 import { loadSuppliers, addSupplier, deleteSupplier } from './suppliers.js';
 import { loadShipping, addShipping, updateShipping, deleteShipping } from './shipping.js';
@@ -696,6 +696,31 @@ router.get('/api/amazon/payment-options', async (req, res) => {
     });
   } catch (err) {
     console.error('[ProfitCalc] 支払いオプション取得エラー:', err.message, err.stack);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── API: 競合オファー取得（価格改定用・技術検証） ──
+router.get('/api/amazon/offers/:asin', async (req, res) => {
+  try {
+    const { asin } = req.params;
+    const condition = req.query.condition || 'New';
+    const offers = await getItemOffers(asin, condition);
+    res.json(offers);
+  } catch (err) {
+    console.error('[ProfitCalc] オファー取得エラー:', err.message, err.stack);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── API: 価格更新（価格改定用・技術検証） ──
+router.post('/api/amazon/update-price', async (req, res) => {
+  try {
+    const { sku, price } = req.body;
+    const result = await updatePrice({ sku, price: Number(price) });
+    res.json(result);
+  } catch (err) {
+    console.error('[ProfitCalc] 価格更新エラー:', err.message, err.stack);
     res.status(500).json({ error: err.message });
   }
 });
