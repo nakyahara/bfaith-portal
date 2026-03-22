@@ -752,6 +752,37 @@ router.get('/api/amazon/listings-report', async (req, res) => {
   }
 });
 
+// ── API: 商品数診断 ──
+router.get('/api/price-revision/diagnostics', async (req, res) => {
+  try {
+    await ensureDb();
+    const all = getProducts({});
+    const uniqueAsins = new Set(all.map(p => p.asin).filter(Boolean));
+    const uniqueSkus = new Set(all.map(p => p.sku).filter(Boolean));
+    const noAsin = all.filter(p => !p.asin || p.asin.length < 5);
+    const duplicateAsins = {};
+    all.forEach(p => {
+      if (p.asin) {
+        if (!duplicateAsins[p.asin]) duplicateAsins[p.asin] = [];
+        duplicateAsins[p.asin].push({ id: p.id, sku: p.sku, status: p.status });
+      }
+    });
+    const dupes = Object.entries(duplicateAsins).filter(([, v]) => v.length > 1);
+
+    res.json({
+      totalProducts: all.length,
+      uniqueAsins: uniqueAsins.size,
+      uniqueSkus: uniqueSkus.size,
+      noAsinCount: noAsin.length,
+      noAsinSamples: noAsin.slice(0, 5).map(p => ({ id: p.id, asin: p.asin, sku: p.sku, name: p.product_name?.slice(0, 30) })),
+      duplicateAsinCount: dupes.length,
+      duplicateSamples: dupes.slice(0, 5).map(([asin, entries]) => ({ asin, count: entries.length, skus: entries.map(e => e.sku) })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── API: Amazon商品同期 ──
 router.post('/api/price-revision/sync', async (req, res) => {
   try {
