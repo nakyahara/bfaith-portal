@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Amazon出品手動 — リサーチ仕入れツール</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Segoe UI', 'Hiragino Sans', 'Meiryo', sans-serif; background: #eaeded; color: #0f1111; font-size: 13px; }
+    a { color: #0066c0; text-decoration: none; }
+
+    .header { background: #232f3e; color: #fff; padding: 10px 24px; display: flex; align-items: center; justify-content: space-between; }
+    .header h1 { font-size: 17px; font-weight: bold; }
+    .header h1 span { color: #ff9900; }
+    .page-tabs { display: flex; background: #37475a; padding: 0 24px; }
+    .page-tab { padding: 10px 20px; color: #ccc; font-size: 13px; font-weight: bold; text-decoration: none; border-bottom: 3px solid transparent; }
+    .page-tab:hover { color: #fff; text-decoration: none; }
+    .page-tab.active { color: #fff; border-bottom-color: #ff9900; }
+    .container { max-width: 1100px; margin: 16px auto; padding: 0 16px; }
+
+    .panel { background: #fff; border: 1px solid #d5d9d9; border-radius: 8px; padding: 16px 20px; margin-bottom: 14px; }
+    .panel-title { font-size: 14px; font-weight: bold; margin-bottom: 12px; padding-bottom: 6px; border-bottom: 2px solid #ff9900; display: flex; align-items: center; gap: 8px; }
+    .panel-desc { font-size: 12px; color: #565959; margin-bottom: 14px; }
+
+    .form-row { display: flex; gap: 12px; align-items: flex-end; margin-bottom: 10px; flex-wrap: wrap; }
+    .form-group { display: flex; flex-direction: column; gap: 3px; }
+    .form-group label { font-size: 12px; font-weight: bold; color: #565959; }
+    .form-group input, .form-group select, .form-group textarea { padding: 6px 8px; border: 1px solid #888; border-radius: 4px; font-size: 13px; }
+    .form-group input:focus, .form-group select:focus { border-color: #e77600; outline: none; box-shadow: 0 0 3px #e77600; }
+    .form-group.wide { flex: 1; min-width: 200px; }
+    .form-group.narrow { width: 110px; }
+    .form-group.medium { width: 160px; }
+
+    .btn { padding: 7px 18px; border-radius: 4px; font-size: 13px; font-weight: bold; cursor: pointer; border: 1px solid; }
+    .btn-primary { background: #f0c14b; border-color: #a88734; color: #0f1111; }
+    .btn-primary:hover { background: #e7b83c; }
+    .btn-submit { background: #ff9900; border-color: #c77600; color: #0f1111; font-size: 14px; padding: 10px 32px; }
+    .btn-submit:hover { background: #e88b00; }
+    .btn-danger { background: #fff0f0; border-color: #b12704; color: #b12704; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .product-card { display: none; gap: 16px; margin-top: 14px; padding-top: 14px; border-top: 1px solid #eee; }
+    .product-card img { width: 100px; height: 100px; object-fit: contain; border: 1px solid #d5d9d9; border-radius: 4px; flex-shrink: 0; }
+    .product-info { flex: 1; }
+    .product-name { font-size: 14px; font-weight: bold; margin-bottom: 6px; line-height: 1.4; }
+    .meta-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 3px 20px; font-size: 12px; color: #565959; }
+    .meta-grid .m-label { font-weight: bold; color: #0f1111; }
+    .product-price { text-align: center; flex-shrink: 0; }
+    .product-price .p-label { font-size: 11px; color: #565959; }
+    .product-price .p-value { font-size: 18px; font-weight: bold; }
+
+    .fulfillment-toggle { display: inline-flex; gap: 0; margin-bottom: 10px; }
+    .fulfillment-toggle label { padding: 6px 18px; border: 1px solid #888; font-size: 13px; cursor: pointer; font-weight: bold; }
+    .fulfillment-toggle label:first-of-type { border-radius: 4px 0 0 4px; }
+    .fulfillment-toggle label:last-of-type { border-radius: 0 4px 4px 0; border-left: none; }
+    .fulfillment-toggle input { display: none; }
+    .fulfillment-toggle input:checked + label { background: #232f3e; color: #fff; border-color: #232f3e; }
+
+    .listing-form { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 24px; }
+    .listing-form .full-row { grid-column: 1 / -1; }
+
+    .condition-row { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+    .condition-row label { font-size: 13px; cursor: pointer; display: flex; align-items: center; gap: 4px; }
+    .condition-row input[type="radio"] { accent-color: #ff9900; }
+
+    .result-box { margin-top: 14px; padding: 14px; border-radius: 6px; display: none; }
+    .result-box.success { background: #f0fff4; border: 2px solid #067D62; }
+    .result-box.error { background: #fff0f0; border: 2px solid #d13212; color: #d13212; }
+    .result-box h3 { font-size: 14px; margin-bottom: 8px; }
+
+    .loading { display: none; align-items: center; gap: 6px; color: #565959; font-size: 13px; }
+    .spinner { width: 14px; height: 14px; border: 2px solid #d5d9d9; border-top-color: #ff9900; border-radius: 50%; animation: spin 0.6s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .fee-summary { background: #f7f8f8; border-radius: 6px; padding: 12px 16px; margin-top: 12px; display: none; }
+    .fee-summary table { width: 100%; font-size: 12px; border-collapse: collapse; }
+    .fee-summary td { padding: 3px 8px; }
+    .fee-summary td:last-child { text-align: right; font-weight: bold; }
+    .fee-summary .total td { border-top: 2px solid #232f3e; font-size: 13px; font-weight: bold; padding-top: 6px; }
+
+    .toast { position: fixed; top: 20px; right: 20px; background: #067D62; color: #fff; padding: 12px 20px; border-radius: 8px; font-size: 14px; display: none; z-index: 100; box-shadow: 0 2px 8px rgba(0,0,0,0.3); }
+
+    .history-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .history-table th { background: #f7f8f8; padding: 6px 10px; text-align: left; font-size: 11px; color: #565959; border-bottom: 2px solid #d5d9d9; }
+    .history-table td { padding: 6px 10px; border-bottom: 1px solid #eee; }
+    .history-table .status-ok { color: #067D62; font-weight: bold; }
+    .history-table .status-ng { color: #d13212; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1><span>💰</span> リサーチ仕入れツール</h1>
+    <a href="/" style="color:#ddd; font-size:13px; text-decoration:none;">← ポータルに戻る</a>
+  </div>
+  <div class="page-tabs">
+    <a href="./research" class="page-tab">リサーチ・見積もり</a>
+    <a href="./" class="page-tab">商品計算</a>
+    <a href="./products" class="page-tab">NE商品登録</a>
+    <a href="./amazon" class="page-tab">Amazon出品</a>
+    <a href="./amazon-manual" class="page-tab active">Amazon出品手動</a>
+    <a href="./suppliers" class="page-tab" style="margin-left:auto;">仕入れ先管理</a>
+    <a href="./shipping" class="page-tab">送料管理</a>
+    <a href="./settings" class="page-tab">設定</a>
+  </div>
+
+  <div class="container">
+
+    <!-- ========== 商品検索 ========== -->
+    <div class="panel">
+      <div class="panel-title">商品検索</div>
+      <div class="panel-desc">ASINを入力して商品情報を取得します。取得した情報を元にAmazonに直接出品できます。</div>
+      <div class="form-row">
+        <div class="form-group medium">
+          <label>ASIN</label>
+          <input type="text" id="asinInput" placeholder="B000FQK36A" maxlength="10">
+        </div>
+        <button class="btn btn-primary" id="btnSearch" onclick="searchProduct()">検索</button>
+        <div class="loading" id="loadingSearch"><div class="spinner"></div>取得中...</div>
+      </div>
+      <div id="errorMsg" style="background:#fff0f0; border:1px solid #d13212; border-radius:4px; padding:8px 12px; color:#d13212; font-size:13px; margin-top:8px; display:none;"></div>
+
+      <div class="product-card" id="productCard">
+        <img id="productImage" src="" alt="">
+        <div class="product-info">
+          <div class="product-name" id="productName"></div>
+          <div class="meta-grid">
+            <div><span class="m-label">ASIN</span> <span id="metaAsin">-</span></div>
+            <div><span class="m-label">JAN</span> <span id="metaJan">-</span></div>
+            <div><span class="m-label">ランキング</span> <span id="metaRank">-</span></div>
+            <div><span class="m-label">出品者</span> <span id="metaOffers">-</span></div>
+            <div><span class="m-label">カテゴリー</span> <span id="metaCategory">-</span></div>
+            <div><span class="m-label">寸法</span> <span id="metaDims">-</span></div>
+          </div>
+        </div>
+        <div class="product-price">
+          <div class="p-label">現在価格</div>
+          <div class="p-value" id="metaPrice">-</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ========== 出品設定 ========== -->
+    <div class="panel" id="listingPanel" style="display:none;">
+      <div class="panel-title">出品設定</div>
+
+      <!-- コンディション -->
+      <div style="margin-bottom: 14px;">
+        <label style="font-size:12px; font-weight:bold; color:#565959; display:block; margin-bottom:6px;">商品のコンディション</label>
+        <div class="condition-row">
+          <label><input type="radio" name="condition" value="new_new" checked> 新品</label>
+          <label><input type="radio" name="condition" value="used_like_new"> 中古 - ほぼ新品</label>
+          <label><input type="radio" name="condition" value="used_very_good"> 中古 - 非常に良い</label>
+          <label><input type="radio" name="condition" value="used_good"> 中古 - 良い</label>
+          <label><input type="radio" name="condition" value="used_acceptable"> 中古 - 可</label>
+        </div>
+      </div>
+
+      <!-- FBA/FBM -->
+      <div class="fulfillment-toggle">
+        <input type="radio" name="fulfillment" value="FBA" id="fulFba" checked>
+        <label for="fulFba">FBA</label>
+        <input type="radio" name="fulfillment" value="FBM" id="fulFbm">
+        <label for="fulFbm">自社出荷</label>
+      </div>
+
+      <div class="listing-form">
+        <!-- SKU -->
+        <div class="form-group">
+          <label>SKU</label>
+          <div style="display:flex; gap:6px; align-items:center;">
+            <input type="text" id="skuInput" placeholder="空白でも可（FBA: 自動採番）" style="flex:1;">
+          </div>
+        </div>
+
+        <!-- 出品価格 -->
+        <div class="form-group">
+          <label>出品価格（税込）</label>
+          <div style="display:flex; gap:4px; align-items:center;">
+            <span>¥</span>
+            <input type="number" id="priceInput" placeholder="0" min="1" style="flex:1;" onchange="calcFees()">
+          </div>
+        </div>
+
+        <!-- 仕入価格 -->
+        <div class="form-group">
+          <label>仕入価格（税込）</label>
+          <div style="display:flex; gap:4px; align-items:center;">
+            <span>¥</span>
+            <input type="number" id="costInput" placeholder="0" min="0" style="flex:1;" onchange="calcProfit()">
+          </div>
+        </div>
+
+        <!-- ポイント -->
+        <div class="form-group">
+          <label>ポイント</label>
+          <div style="display:flex; gap:4px; align-items:center;">
+            <input type="number" id="pointInput" value="0" min="0" style="width:80px;" onchange="calcProfit()">
+            <span>pt</span>
+          </div>
+        </div>
+
+        <!-- コンディション説明 -->
+        <div class="form-group full-row" style="grid-column: 1 / -1;">
+          <label>コンディション説明</label>
+          <textarea id="conditionNote" rows="3" style="width:100%; font-size:13px; border:1px solid #888; border-radius:4px; padding:6px 8px;" placeholder="【代引き・コンビニ・ATM・ネットバンキング・電子マネー払い可能】【新品未開封・正規品です】アマゾン配送センターより配送しますので、迅速、安全にお届けします。"></textarea>
+        </div>
+      </div>
+
+      <!-- 手数料サマリー -->
+      <div class="fee-summary" id="feeSummary">
+        <table>
+          <tr><td>販売手数料</td><td id="feeReferral">-</td></tr>
+          <tr><td>FBA手数料</td><td id="feeFba">-</td></tr>
+          <tr><td>想定粗利</td><td id="feeProfit">-</td></tr>
+          <tr><td>利益率</td><td id="feeProfitRate">-</td></tr>
+          <tr class="total"><td>手数料合計</td><td id="feeTotal">-</td></tr>
+        </table>
+      </div>
+
+      <!-- 出品ボタン -->
+      <div style="margin-top: 18px; display:flex; gap:12px; align-items:center;">
+        <button class="btn btn-submit" id="btnList" onclick="submitListing()">FBA商品登録</button>
+        <div class="loading" id="loadingList"><div class="spinner"></div>出品中...</div>
+      </div>
+
+      <!-- 結果 -->
+      <div class="result-box" id="resultBox">
+        <h3 id="resultTitle"></h3>
+        <div id="resultBody"></div>
+      </div>
+    </div>
+
+    <!-- ========== 出品履歴（セッション内） ========== -->
+    <div class="panel" id="historyPanel" style="display:none;">
+      <div class="panel-title">出品履歴（このセッション）</div>
+      <table class="history-table">
+        <thead>
+          <tr><th>ASIN</th><th>SKU</th><th>価格</th><th>種別</th><th>ステータス</th><th>時刻</th></tr>
+        </thead>
+        <tbody id="historyBody"></tbody>
+      </table>
+    </div>
+
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    let currentProduct = null;
+    let currentFees = null;
+    const history = [];
+
+    // Enter キーで検索
+    document.getElementById('asinInput').addEventListener('keydown', e => {
+      if (e.key === 'Enter') searchProduct();
+    });
+
+    // FBA/FBM切り替え時にボタンテキスト変更
+    document.querySelectorAll('input[name="fulfillment"]').forEach(r => {
+      r.addEventListener('change', () => {
+        const isFba = document.querySelector('input[name="fulfillment"]:checked').value === 'FBA';
+        document.getElementById('btnList').textContent = isFba ? 'FBA商品登録' : '自己発送で出品';
+        calcFees();
+      });
+    });
+
+    // ── 商品検索 ──
+    async function searchProduct() {
+      const asin = document.getElementById('asinInput').value.trim().toUpperCase();
+      if (!asin) { showError('ASINを入力してください'); return; }
+
+      hideError();
+      setLoading('loadingSearch', true);
+      document.getElementById('btnSearch').disabled = true;
+      document.getElementById('productCard').style.display = 'none';
+      document.getElementById('listingPanel').style.display = 'none';
+
+      try {
+        const res = await fetch(`./api/product/${asin}`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || '取得失敗');
+
+        currentProduct = data;
+        document.getElementById('productImage').src = data.image || '';
+        document.getElementById('productName').textContent = data.itemName || '-';
+        document.getElementById('metaAsin').textContent = data.asin;
+        document.getElementById('metaJan').textContent = data.jan || '-';
+        document.getElementById('metaRank').textContent = data.salesRank ? Number(data.salesRank).toLocaleString() + '位' : '-';
+        document.getElementById('metaOffers').textContent = data.offerCount || '-';
+        document.getElementById('metaCategory').textContent = data.category || '-';
+        const d = data.dimensions || {};
+        document.getElementById('metaDims').textContent = `${d.length||'-'}×${d.width||'-'}×${d.height||'-'}cm / ${d.weight||'-'}kg`;
+        document.getElementById('metaPrice').textContent = data.currentPrice ? '¥' + Number(data.currentPrice).toLocaleString() : '-';
+
+        document.getElementById('productCard').style.display = 'flex';
+
+        // 価格を自動セット
+        if (data.currentPrice) {
+          document.getElementById('priceInput').value = data.currentPrice;
+        }
+
+        document.getElementById('listingPanel').style.display = '';
+        calcFees();
+      } catch (e) {
+        showError(e.message);
+      } finally {
+        setLoading('loadingSearch', false);
+        document.getElementById('btnSearch').disabled = false;
+      }
+    }
+
+    // ── 手数料計算 ──
+    async function calcFees() {
+      if (!currentProduct) return;
+      const price = parseInt(document.getElementById('priceInput').value) || 0;
+      if (price <= 0) return;
+
+      const isFba = document.querySelector('input[name="fulfillment"]:checked').value === 'FBA';
+
+      try {
+        const res = await fetch(`./api/fees/${currentProduct.asin}?price=${price}&fulfillment=${isFba ? 'FBA' : 'FBM'}`);
+        const data = await res.json();
+        if (!res.ok) return;
+
+        currentFees = data;
+        document.getElementById('feeReferral').textContent = '¥' + Number(data.referralFee || 0).toLocaleString();
+        document.getElementById('feeFba').textContent = isFba ? '¥' + Number(data.fbaFee || 0).toLocaleString() : '-';
+        document.getElementById('feeTotal').textContent = '¥' + Number(data.totalFee || 0).toLocaleString();
+        document.getElementById('feeSummary').style.display = '';
+        calcProfit();
+      } catch (e) { console.error('手数料取得:', e); }
+    }
+
+    function calcProfit() {
+      const price = parseInt(document.getElementById('priceInput').value) || 0;
+      const cost = parseInt(document.getElementById('costInput').value) || 0;
+      const point = parseInt(document.getElementById('pointInput').value) || 0;
+      const totalFee = currentFees ? (currentFees.totalFee || 0) : 0;
+
+      const profit = price - cost - totalFee - point;
+      const profitRate = price > 0 ? (profit / price * 100) : 0;
+
+      document.getElementById('feeProfit').textContent = '¥' + profit.toLocaleString();
+      document.getElementById('feeProfit').style.color = profit >= 0 ? '#067D62' : '#d13212';
+      document.getElementById('feeProfitRate').textContent = profitRate.toFixed(1) + '%';
+      document.getElementById('feeProfitRate').style.color = profitRate >= 10 ? '#067D62' : '#d13212';
+    }
+
+    // ── 出品実行 ──
+    async function submitListing() {
+      if (!currentProduct) { showError('先に商品を検索してください'); return; }
+
+      const asin = currentProduct.asin;
+      const price = parseInt(document.getElementById('priceInput').value) || 0;
+      const sku = document.getElementById('skuInput').value.trim() || '';
+      const condition = document.querySelector('input[name="condition"]:checked').value;
+      const isFba = document.querySelector('input[name="fulfillment"]:checked').value === 'FBA';
+
+      if (price <= 0) { alert('出品価格を入力してください'); return; }
+      if (!isFba && !sku) { alert('自社出荷の場合はSKUを入力してください'); return; }
+
+      const typeLabel = isFba ? 'FBA' : '自社出荷';
+      if (!confirm(`以下の内容でAmazonに出品しますか？\n\nASIN: ${asin}\nSKU: ${sku || '自動採番'}\n価格: ¥${price.toLocaleString()}\n種別: ${typeLabel}`)) return;
+
+      setLoading('loadingList', true);
+      document.getElementById('btnList').disabled = true;
+      hideResult();
+
+      try {
+        const res = await fetch('./api/amazon/manual-list', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ asin, price, sku, condition, isFba }),
+        });
+        const result = await res.json();
+
+        if (res.ok && result.status === 'ACCEPTED') {
+          showResult('success', '出品が受け付けられました', `
+            <div>SKU: <strong>${esc(result.sku)}</strong></div>
+            <div>ASIN: ${esc(asin)}</div>
+            <div>ステータス: ${result.status}</div>
+            ${result.paymentPatch ? `<div style="margin-top:6px; font-size:12px; color:#565959;">支払い制限patch: ${result.paymentPatch.status}</div>` : ''}
+            ${result.issues && result.issues.length > 0 ? `<div style="margin-top:6px; color:#856404;">注意: ${result.issues.map(i=>esc(i.message)).join(', ')}</div>` : ''}
+          `);
+          addHistory(asin, result.sku, price, isFba ? 'FBA' : 'FBM', 'ACCEPTED');
+          showToast('出品完了: ' + result.sku);
+        } else {
+          const errMsg = result.error || `ステータス: ${result.status}`;
+          const issues = (result.issues || []).map(i => `・${i.message || JSON.stringify(i)}`).join('\n');
+          showResult('error', '出品エラー', `<div>${esc(errMsg)}</div>${issues ? `<pre style="margin-top:6px; font-size:11px; white-space:pre-wrap;">${esc(issues)}</pre>` : ''}`);
+          addHistory(asin, sku || '-', price, isFba ? 'FBA' : 'FBM', 'ERROR');
+        }
+      } catch (e) {
+        showResult('error', '通信エラー', esc(e.message));
+        addHistory(asin, sku || '-', price, isFba ? 'FBA' : 'FBM', 'ERROR');
+      } finally {
+        setLoading('loadingList', false);
+        document.getElementById('btnList').disabled = false;
+      }
+    }
+
+    // ── 出品履歴 ──
+    function addHistory(asin, sku, price, type, status) {
+      const now = new Date().toLocaleTimeString('ja-JP');
+      history.unshift({ asin, sku, price, type, status, time: now });
+      renderHistory();
+    }
+
+    function renderHistory() {
+      if (history.length === 0) return;
+      document.getElementById('historyPanel').style.display = '';
+      const tbody = document.getElementById('historyBody');
+      tbody.innerHTML = history.map(h => `
+        <tr>
+          <td><a href="https://www.amazon.co.jp/dp/${esc(h.asin)}" target="_blank">${esc(h.asin)}</a></td>
+          <td>${esc(h.sku)}</td>
+          <td>¥${Number(h.price).toLocaleString()}</td>
+          <td>${esc(h.type)}</td>
+          <td class="${h.status === 'ACCEPTED' ? 'status-ok' : 'status-ng'}">${h.status}</td>
+          <td>${h.time}</td>
+        </tr>
+      `).join('');
+    }
+
+    // ── UI ──
+    function showError(msg) { const e = document.getElementById('errorMsg'); e.textContent = msg; e.style.display = ''; }
+    function hideError() { document.getElementById('errorMsg').style.display = 'none'; }
+    function setLoading(id, on) { document.getElementById(id).style.display = on ? 'flex' : 'none'; }
+    function showResult(type, title, body) {
+      const box = document.getElementById('resultBox');
+      box.className = `result-box ${type}`;
+      document.getElementById('resultTitle').textContent = title;
+      document.getElementById('resultBody').innerHTML = body;
+      box.style.display = '';
+    }
+    function hideResult() { document.getElementById('resultBox').style.display = 'none'; }
+    function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+    function showToast(m) { const e = document.getElementById('toast'); e.textContent = m; e.style.display = 'block'; setTimeout(() => e.style.display = 'none', 3000); }
+  </script>
+</body>
+</html>

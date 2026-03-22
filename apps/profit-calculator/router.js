@@ -39,6 +39,10 @@ router.get('/amazon', (req, res) => {
   res.sendFile(path.join(__dirname, 'amazon.html'));
 });
 
+router.get('/amazon-manual', (req, res) => {
+  res.sendFile(path.join(__dirname, 'amazon-manual.html'));
+});
+
 router.get('/suppliers', (req, res) => {
   res.sendFile(path.join(__dirname, 'suppliers.html'));
 });
@@ -321,6 +325,65 @@ router.post('/api/amazon/patch-payment', async (req, res) => {
     res.json(result);
   } catch (err) {
     console.error('[ProfitCalc] Amazon支払い制限パッチエラー:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── API: Amazon手動出品（DBを経由しない直接出品） ──
+router.post('/api/amazon/manual-list', async (req, res) => {
+  try {
+    const { asin, price, sku, condition, isFba } = req.body;
+    if (!asin) return res.status(400).json({ error: 'ASINが必要です' });
+    if (!price || price <= 0) return res.status(400).json({ error: '出品価格が必要です' });
+    if (!isFba && !sku) return res.status(400).json({ error: '自社出荷の場合はSKUが必要です' });
+
+    // 設定から配送テンプレート・支払い制限を取得（Amazon出品と共通設定）
+    const shippingTemplate = !isFba ? getSetting('amazon_shipping_template') : null;
+    const paymentRestriction = isFba
+      ? (getSetting('amazon_fba_payment_restriction') || 'none')
+      : (getSetting('amazon_payment_restriction') || 'none');
+
+    const result = await createListing({
+      asin,
+      price: parseInt(price),
+      isFba: !!isFba,
+      sku: sku || null,
+      condition: condition || 'new_new',
+      shippingTemplate,
+      paymentRestriction,
+    });
+
+    // 出品成功時に支払い制限をpatchで後追い設定
+    if (result.status === 'ACCEPTED' && paymentRestriction && paymentRestriction !== 'none') {
+      try {
+        const marketplaceId = process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
+        const exclusions = [];
+        if (paymentRestriction === 'cvs' || paymentRestriction === 'cod_cvs') {
+          exclusions.push({ value: 'cvs', marketplace_id: marketplaceId });
+        }
+        if (paymentRestriction === 'cod' || paymentRestriction === 'cod_cvs') {
+          exclusions.push({ value: 'cash_on_delivery', marketplace_id: marketplaceId });
+        }
+        if (exclusions.length > 0) {
+          const patches = [{ op: 'replace', path: '/attributes/optional_payment_type_exclusion', value: exclusions }];
+          const patchResult = await patchListing({ sku: result.sku, patches });
+          result.paymentPatch = patchResult;
+          console.log(`[SP-API] 手動出品 支払い制限patch: SKU=${result.sku}, status=${patchResult.status}`);
+        }
+      } catch (patchErr) {
+        console.error('[SP-API] 手動出品 支払い制限patch失敗:', patchErr.message);
+        result.paymentPatchError = patchErr.message;
+      }
+    }
+
+    if (result.status === 'ACCEPTED') {
+      res.json(result);
+    } else {
+      const issueMsg = (result.issues || []).map(i => i.message || i.code || JSON.stringify(i)).join('; ');
+      res.status(422).json({ error: `出品ステータス: ${result.status}${issueMsg ? ' — ' + issueMsg : ''}`, ...result });
+    }
+  } catch (err) {
+    console.error('[ProfitCalc] Amazon手動出品エラー:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
