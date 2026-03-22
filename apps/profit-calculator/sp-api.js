@@ -248,30 +248,17 @@ export async function createListing({ asin, price, isFba, sku, condition = 'new_
     }],
   };
 
-  // FBM: 配送テンプレート・支払方法制限
+  // FBM: 配送テンプレートのみputで設定（LISTING_OFFER_ONLYモード）
+  // 支払い制限はLISTING_OFFER_ONLYでは適用されないため、出品後にpatchListingsItemで設定する
   if (!isFba) {
     if (shippingTemplate) {
       attributes.merchant_shipping_group = [{ value: shippingTemplate, marketplace_id: marketplaceId }];
-    }
-    // 正しいattribute名: optional_payment_type_exclusion
-    // 有効値: 'cvs'(コンビニ決済不可), 'cash_on_delivery'(代引不可) — maxUniqueItems:2で両方指定可
-    if (paymentRestriction && paymentRestriction !== 'none') {
-      const exclusions = [];
-      if (paymentRestriction === 'cvs' || paymentRestriction === 'cod_cvs') {
-        exclusions.push({ value: 'cvs', marketplace_id: marketplaceId });
-      }
-      if (paymentRestriction === 'cod' || paymentRestriction === 'cod_cvs') {
-        exclusions.push({ value: 'cash_on_delivery', marketplace_id: marketplaceId });
-      }
-      if (exclusions.length > 0) {
-        attributes.optional_payment_type_exclusion = exclusions;
-      }
     }
   }
 
   const body = {
     productType: 'PRODUCT',
-    requirements: 'LISTING',
+    requirements: 'LISTING_OFFER_ONLY',
     attributes,
   };
 

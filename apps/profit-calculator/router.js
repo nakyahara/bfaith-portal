@@ -226,6 +226,33 @@ router.post('/api/products/:id/list-amazon', async (req, res) => {
     // 成功時にステータスを「Amazon出品済」に更新
     if (result.status === 'ACCEPTED') {
       updateProduct(id, { status: 'Amazon出品済' });
+
+      // FBM: LISTING_OFFER_ONLYでは支払い制限が適用されないため、patchで後追い設定
+      if (!isFba && paymentRestriction && paymentRestriction !== 'none') {
+        try {
+          const marketplaceId = process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
+          const patches = [];
+          if (paymentRestriction === 'cvs' || paymentRestriction === 'cod_cvs') {
+            patches.push({ op: 'replace', path: '/attributes/optional_payment_type_exclusion', value: [{ value: 'cvs', marketplace_id: marketplaceId }] });
+          }
+          if (paymentRestriction === 'cod' || paymentRestriction === 'cod_cvs') {
+            const val = patches.length > 0 ? patches[0].value : [];
+            val.push({ value: 'cash_on_delivery', marketplace_id: marketplaceId });
+            if (patches.length === 0) {
+              patches.push({ op: 'replace', path: '/attributes/optional_payment_type_exclusion', value: val });
+            }
+          }
+          if (patches.length > 0) {
+            const patchResult = await patchListing({ sku: result.sku, patches });
+            result.paymentPatch = patchResult;
+            console.log(`[SP-API] 支払い制限patch: SKU=${result.sku}, status=${patchResult.status}`);
+          }
+        } catch (patchErr) {
+          console.error('[SP-API] 支払い制限patch失敗:', patchErr.message);
+          result.paymentPatchError = patchErr.message;
+        }
+      }
+
       res.json(result);
     } else {
       // ACCEPTED以外（INVALID等）はエラー扱い
