@@ -247,22 +247,33 @@
     async function startWorker() { await fetch(`${BASE}/api/price-revision/worker/start`,{method:'POST'}); loadWorkerStatus(); }
     async function stopWorker() { await fetch(`${BASE}/api/price-revision/worker/stop`,{method:'POST'}); loadWorkerStatus(); }
 
-    // === 自動同期（ページ読み込み時） ===
-    async function autoSync() {
+    // === 自動同期（1時間に1回だけ） ===
+    const SYNC_INTERVAL = 60 * 60 * 1000; // 1時間
+    async function autoSync(force = false) {
       const el = document.getElementById('syncStatus');
+      const lastSync = parseInt(localStorage.getItem('lastSyncTime') || '0');
+      const elapsed = Date.now() - lastSync;
+
+      if (!force && elapsed < SYNC_INTERVAL) {
+        const mins = Math.round((SYNC_INTERVAL - elapsed) / 60000);
+        el.textContent = `最終同期: ${new Date(lastSync).toLocaleTimeString('ja-JP')}（次回: ${mins}分後）`;
+        return;
+      }
+
       el.innerHTML = '<span class="spinner" style="width:14px;height:14px;"></span>Amazon同期中...';
       try {
         const res = await fetch(`${BASE}/api/price-revision/sync`, { method: 'POST' });
         const data = await res.json();
         if (data.error) throw new Error(data.error);
-        el.textContent = `同期完了: ${data.total}件 (新規${data.inserted} 更新${data.updated})`;
+        localStorage.setItem('lastSyncTime', String(Date.now()));
+        el.textContent = `同期完了: ${data.total}件 (新規${data.inserted} 更新${data.updated}) ${new Date().toLocaleTimeString('ja-JP')}`;
         loadProducts();
         fetch(`${BASE}/api/price-revision/refresh-cache`, { method: 'POST' });
       } catch (e) {
         el.textContent = '同期エラー: ' + e.message;
       }
     }
-    async function manualSync() { autoSync(); }
+    async function manualSync() { autoSync(true); }
 
     // === 商品読み込み ===
     async function loadProducts() {
