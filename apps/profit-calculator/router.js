@@ -5,7 +5,7 @@ import { Router } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { getProduct, getFees, createListing, patchListing, getShippingTemplates, getItemOffers, updatePrice, getActiveListingsReport } from './sp-api.js';
-import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, deleteProduct, getSetItems, saveSetItems, getTrackingProducts, getPriceHistory, getRecentPriceHistory, savePriceHistory, updateProductPriceInfo } from './db.js';
+import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, deleteProduct, getSetItems, saveSetItems, getTrackingProducts, getPriceHistory, getRecentPriceHistory, savePriceHistory, updateProductPriceInfo, syncProductsFromListings } from './db.js';
 import { loadSuppliers, addSupplier, deleteSupplier } from './suppliers.js';
 import { loadShipping, addShipping, updateShipping, deleteShipping } from './shipping.js';
 import { getSetting, setSetting, getAllSettings } from './settings.js';
@@ -748,6 +748,22 @@ router.get('/api/amazon/listings-report', async (req, res) => {
     });
   } catch (err) {
     console.error('[ProfitCalc] 出品レポート取得エラー:', err.message, err.stack);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── API: Amazon商品同期 ──
+router.post('/api/price-revision/sync', async (req, res) => {
+  try {
+    await ensureDb();
+    console.log('[PriceRevision] Amazon商品同期開始...');
+    const report = await getActiveListingsReport();
+    console.log(`[PriceRevision] レポート取得完了: ${report.totalCount}件`);
+    const result = syncProductsFromListings(report.listings);
+    console.log(`[PriceRevision] 同期完了: 新規${result.inserted}件, 更新${result.updated}件`);
+    res.json(result);
+  } catch (err) {
+    console.error('[PriceRevision] 同期エラー:', err.message, err.stack);
     res.status(500).json({ error: err.message });
   }
 });

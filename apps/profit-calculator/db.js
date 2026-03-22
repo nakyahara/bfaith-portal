@@ -483,6 +483,62 @@ export function getProductById(id) {
   return rows.length > 0 ? rows[0] : null;
 }
 
+// ===== Amazon商品同期 =====
+
+/**
+ * Amazonレポートから全商品をDBに同期（upsert）
+ * @param {Array} listings - getActiveListingsReport().listings
+ * @returns {{ inserted: number, updated: number, total: number }}
+ */
+export function syncProductsFromListings(listings) {
+  let inserted = 0;
+  let updated = 0;
+
+  for (const row of listings) {
+    const asin = row['asin1'] || row['ASIN1'] || row['asin'] || '';
+    const sku = row['seller-sku'] || row['Seller SKU'] || '';
+    if (!asin && !sku) continue;
+
+    const productName = row['item-name'] || row['Item Name'] || '';
+    const price = parseFloat(row['price'] || row['Price'] || '0') || null;
+    const fulfillmentRaw = row['fulfillment-channel'] || row['Fulfillment Channel'] || '';
+    const fulfillment = fulfillmentRaw.includes('AMAZON') ? 'FBA' : 'FBM';
+    const imageUrl = row['image-url'] || row['Image URL'] || '';
+    const quantity = parseInt(row['quantity'] || row['Quantity'] || '0') || 0;
+
+    // 既存チェック（ASIN + SKU で照合）
+    const existing = queryAll(
+      'SELECT id FROM products WHERE asin = ? AND (sku = ? OR ne_product_code = ?)',
+      [asin, sku, sku]
+    );
+
+    if (existing.length > 0) {
+      // 更新（価格追従設定やストッパーは上書きしない）
+      db.run(`
+        UPDATE products SET
+          product_name = COALESCE(NULLIF(?, ''), product_name),
+          selling_price = COALESCE(?, selling_price),
+          fulfillment = ?,
+          image_url = COALESCE(NULLIF(?, ''), image_url),
+          sku = COALESCE(NULLIF(?, ''), sku),
+          updated_at = datetime('now','localtime')
+        WHERE id = ?
+      `, [productName, price, fulfillment, imageUrl, sku, existing[0].id]);
+      updated++;
+    } else {
+      // 新規挿入
+      db.run(`
+        INSERT INTO products (asin, product_name, selling_price, fulfillment, image_url, sku, ne_product_code, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, '出品中')
+      `, [asin, productName, price, fulfillment, imageUrl, sku, sku]);
+      inserted++;
+    }
+  }
+
+  saveToFile();
+  return { inserted, updated, total: listings.length };
+}
+
 // ===== Price History (価格改定) =====
 
 export function savePriceHistory({ productId, asin, sku, oldPrice, newPrice, reason, mode, competitorPrice, buyBoxPrice }) {

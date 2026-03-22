@@ -147,6 +147,7 @@
         <button class="btn btn-success btn-sm" onclick="startWorker()">開始</button>
         <button class="btn btn-danger btn-sm" onclick="stopWorker()">停止</button>
         <button class="btn btn-primary btn-sm" onclick="refreshCache()">キャッシュ更新</button>
+        <button class="btn btn-sm" style="background:#3498db;border-color:#2980b9;color:#fff;" id="btnSync" onclick="syncProducts()">Amazon商品同期</button>
       </div>
     </div>
 
@@ -247,6 +248,25 @@
     async function refreshCache() {
       await fetch(`${BASE}/api/price-revision/refresh-cache`, { method: 'POST' });
       loadProducts();
+    }
+
+    async function syncProducts() {
+      const btn = document.getElementById('btnSync');
+      btn.disabled = true;
+      btn.textContent = '同期中...（数分かかります）';
+      try {
+        const res = await fetch(`${BASE}/api/price-revision/sync`, { method: 'POST' });
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+        alert(`同期完了!\n全${data.total}件: 新規${data.inserted}件, 更新${data.updated}件`);
+        loadProducts();
+        refreshCache();
+      } catch (e) {
+        alert('同期エラー: ' + e.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Amazon商品同期';
+      }
     }
 
     // --- 商品一覧 ---
