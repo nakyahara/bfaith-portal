@@ -115,6 +115,14 @@
     @keyframes flashGreen { 0% { background: #d4edda; } 100% { background: transparent; } }
 
     .empty-state { text-align: center; padding: 60px 20px; color: #999; background: #fff; font-size: 14px; }
+    /* ページネーション */
+    .pagination { display: flex; justify-content: center; align-items: center; gap: 4px; padding: 12px; background: #fff; border-top: 1px solid #ddd; }
+    .pagination button { padding: 6px 12px; border: 1px solid #ccc; border-radius: 3px; background: #fff; cursor: pointer; font-size: 12px; }
+    .pagination button:hover { background: #f0f0f0; }
+    .pagination button.active { background: #4a90d9; color: #fff; border-color: #4a90d9; }
+    .pagination button:disabled { opacity: 0.4; cursor: default; }
+    .pagination .page-info { font-size: 12px; color: #666; margin: 0 8px; }
+
     .loading { text-align: center; padding: 30px; color: #888; }
     .spinner { display: inline-block; width: 18px; height: 18px; border: 2px solid #ddd; border-top-color: #ff9900; border-radius: 50%; animation: spin 0.6s linear infinite; vertical-align: middle; margin-right: 6px; }
     @keyframes spin { to { transform: rotate(360deg); } }
@@ -212,6 +220,7 @@
     <div id="productsContainer">
       <div class="loading"><span class="spinner"></span>読み込み中...</div>
     </div>
+    <div class="pagination" id="pagination"></div>
   </div>
 
   <!-- 履歴 -->
@@ -224,6 +233,9 @@
   <script>
     const BASE = '.';
     let allProducts = [];
+    let filteredProducts = [];
+    let currentPage = 1;
+    const PER_PAGE = 150;
 
     function switchTab(tab) {
       document.querySelectorAll('.view-tab').forEach(t => t.classList.remove('active'));
@@ -247,33 +259,22 @@
     async function startWorker() { await fetch(`${BASE}/api/price-revision/worker/start`,{method:'POST'}); loadWorkerStatus(); }
     async function stopWorker() { await fetch(`${BASE}/api/price-revision/worker/stop`,{method:'POST'}); loadWorkerStatus(); }
 
-    // === 自動同期（1時間に1回だけ） ===
-    const SYNC_INTERVAL = 60 * 60 * 1000; // 1時間
-    async function autoSync(force = false) {
+    // === 商品同期（手動のみ。価格データはワーカーが常時更新） ===
+    async function manualSync() {
       const el = document.getElementById('syncStatus');
-      const lastSync = parseInt(localStorage.getItem('lastSyncTime') || '0');
-      const elapsed = Date.now() - lastSync;
-
-      if (!force && elapsed < SYNC_INTERVAL) {
-        const mins = Math.round((SYNC_INTERVAL - elapsed) / 60000);
-        el.textContent = `最終同期: ${new Date(lastSync).toLocaleTimeString('ja-JP')}（次回: ${mins}分後）`;
-        return;
-      }
-
-      el.innerHTML = '<span class="spinner" style="width:14px;height:14px;"></span>Amazon同期中...';
+      if (!confirm('Amazon商品一覧を同期します（1〜2分かかります）。実行しますか？')) return;
+      el.innerHTML = '<span class="spinner" style="width:14px;height:14px;"></span>商品一覧を同期中...';
       try {
         const res = await fetch(`${BASE}/api/price-revision/sync`, { method: 'POST' });
         const data = await res.json();
         if (data.error) throw new Error(data.error);
-        localStorage.setItem('lastSyncTime', String(Date.now()));
-        el.textContent = `同期完了: ${data.total}件 (新規${data.inserted} 更新${data.updated}) ${new Date().toLocaleTimeString('ja-JP')}`;
+        el.textContent = `同期完了: ${data.total}件 (新規${data.inserted} 更新${data.updated})`;
         loadProducts();
         fetch(`${BASE}/api/price-revision/refresh-cache`, { method: 'POST' });
       } catch (e) {
         el.textContent = '同期エラー: ' + e.message;
       }
     }
-    async function manualSync() { autoSync(true); }
 
     // === 商品読み込み ===
     async function loadProducts() {
@@ -290,15 +291,45 @@
       const q = document.getElementById('searchInput').value.toLowerCase();
       const mf = document.getElementById('modeFilter').value;
       const ff = document.getElementById('fulfillmentFilter').value;
-      let list = allProducts.filter(p => {
+      filteredProducts = allProducts.filter(p => {
         if (q && !`${p.product_name||''} ${p.asin||''} ${p.sku||''} ${p.ne_product_code||''} ${p.jan||''}`.toLowerCase().includes(q)) return false;
         if (ff && p.fulfillment !== ff) return false;
         if (mf === '_none' && p.price_tracking && p.price_tracking !== '' && p.price_tracking !== 'しない') return false;
         if (mf && mf !== '_none' && p.price_tracking !== mf) return false;
         return true;
       });
-      document.getElementById('productCount').textContent = `約${list.length}件`;
-      renderProducts(list);
+      currentPage = 1;
+      document.getElementById('productCount').textContent = `約${filteredProducts.length}件`;
+      renderPage();
+    }
+
+    function renderPage() {
+      const totalPages = Math.ceil(filteredProducts.length / PER_PAGE);
+      const start = (currentPage - 1) * PER_PAGE;
+      const pageItems = filteredProducts.slice(start, start + PER_PAGE);
+      renderProducts(pageItems);
+      renderPagination(totalPages);
+    }
+
+    function goToPage(page) {
+      currentPage = page;
+      renderPage();
+      window.scrollTo(0, 0);
+    }
+
+    function renderPagination(totalPages) {
+      const el = document.getElementById('pagination');
+      if (totalPages <= 1) { el.innerHTML = ''; return; }
+      let html = '';
+      html += `<button ${currentPage===1?'disabled':''} onclick="goToPage(1)">最初のページ...</button>`;
+      const startP = Math.max(1, currentPage - 2);
+      const endP = Math.min(totalPages, currentPage + 2);
+      for (let i = startP; i <= endP; i++) {
+        html += `<button class="${i===currentPage?'active':''}" onclick="goToPage(${i})">${i}</button>`;
+      }
+      if (endP < totalPages) html += `<span class="page-info">...</span>`;
+      html += `<button ${currentPage===totalPages?'disabled':''} onclick="goToPage(${currentPage+1})">次の${PER_PAGE}件</button>`;
+      el.innerHTML = html;
     }
 
     function getAmazonImage(asin) {
@@ -414,11 +445,10 @@
 
     function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
-    // === 初期化 ===
+    // === 初期化（DBから即表示。価格データはワーカーが裏で常時更新済み） ===
     loadWorkerStatus();
     loadProducts();
     loadHistory();
-    autoSync(); // ページを開いたら自動同期
     setInterval(loadWorkerStatus, 30000);
   </script>
 </body>
