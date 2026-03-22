@@ -493,27 +493,34 @@ export function getProductById(id) {
 export function syncProductsFromListings(listings) {
   let inserted = 0;
   let updated = 0;
+  let skipped = 0;
+
+  // 最初の1件のキーをログに出す（デバッグ用）
+  if (listings.length > 0) {
+    console.log('[Sync] レポート1行目のキー:', Object.keys(listings[0]).slice(0, 30).join(', '));
+    console.log('[Sync] レポート1行目の値(先頭5):', JSON.stringify(listings[0]).slice(0, 500));
+  }
 
   for (const row of listings) {
-    const asin = row['asin1'] || row['ASIN1'] || row['asin'] || '';
-    const sku = row['seller-sku'] || row['Seller SKU'] || '';
-    if (!asin && !sku) continue;
+    // 複数のカラム名パターンに対応（大文字小文字・ハイフン・スペース混在）
+    const asin = row['asin1'] || row['ASIN1'] || row['asin'] || row['Asin1'] || row['ASIN'] || '';
+    const sku = row['seller-sku'] || row['Seller SKU'] || row['seller_sku'] || row['sku'] || row['SKU'] || '';
 
-    const productName = row['item-name'] || row['Item Name'] || '';
-    const price = parseFloat(row['price'] || row['Price'] || '0') || null;
-    const fulfillmentRaw = row['fulfillment-channel'] || row['Fulfillment Channel'] || '';
-    const fulfillment = fulfillmentRaw.includes('AMAZON') ? 'FBA' : 'FBM';
-    const imageUrl = row['image-url'] || row['Image URL'] || '';
-    const quantity = parseInt(row['quantity'] || row['Quantity'] || '0') || 0;
+    if (!asin && !sku) { skipped++; continue; }
 
-    // 既存チェック（ASIN + SKU で照合）
-    const existing = queryAll(
-      'SELECT id FROM products WHERE asin = ? AND (sku = ? OR ne_product_code = ?)',
-      [asin, sku, sku]
-    );
+    const productName = row['item-name'] || row['Item Name'] || row['item_name'] || row['商品名'] || '';
+    const price = parseFloat(row['price'] || row['Price'] || row['価格'] || '0') || null;
+    const fulfillmentRaw = row['fulfillment-channel'] || row['Fulfillment Channel'] || row['fulfillment_channel'] || '';
+    const fulfillment = fulfillmentRaw.toUpperCase().includes('AMAZON') ? 'FBA' : 'FBM';
+    const imageUrl = row['image-url'] || row['Image URL'] || row['image_url'] || '';
+
+    // 既存チェック: ASINのみで照合（SKU違いの重複を防ぐ）、なければSKUでも照合
+    let existing = queryAll('SELECT id FROM products WHERE asin = ? LIMIT 1', [asin]);
+    if (existing.length === 0 && sku) {
+      existing = queryAll('SELECT id FROM products WHERE sku = ? OR ne_product_code = ? LIMIT 1', [sku, sku]);
+    }
 
     if (existing.length > 0) {
-      // 更新（価格追従設定やストッパーは上書きしない）
       db.run(`
         UPDATE products SET
           product_name = COALESCE(NULLIF(?, ''), product_name),
@@ -526,7 +533,6 @@ export function syncProductsFromListings(listings) {
       `, [productName, price, fulfillment, imageUrl, sku, existing[0].id]);
       updated++;
     } else {
-      // 新規挿入
       db.run(`
         INSERT INTO products (asin, product_name, selling_price, fulfillment, image_url, sku, ne_product_code, status)
         VALUES (?, ?, ?, ?, ?, ?, ?, '出品中')
@@ -536,7 +542,8 @@ export function syncProductsFromListings(listings) {
   }
 
   saveToFile();
-  return { inserted, updated, total: listings.length };
+  console.log(`[Sync] 結果: 全${listings.length}件, 新規${inserted}, 更新${updated}, スキップ${skipped}`);
+  return { inserted, updated, skipped, total: listings.length };
 }
 
 // ===== Price History (価格改定) =====

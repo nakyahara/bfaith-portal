@@ -442,13 +442,20 @@ export async function getActiveListingsReport() {
   const response = await fetch(doc.url);
   const text = await response.text();
 
-  // TSV解析
+  // TSV解析（ヘッダーを正規化: 小文字・ハイフン統一）
   const lines = text.split('\n').filter(l => l.trim());
-  const headers = lines[0].split('\t');
+  const rawHeaders = lines[0].split('\t').map(h => h.trim());
+  console.log('[SP-API] レポートヘッダー:', rawHeaders.join(', '));
+
   const rows = lines.slice(1).map(line => {
     const values = line.split('\t');
     const obj = {};
-    headers.forEach((h, i) => { obj[h.trim()] = (values[i] || '').trim(); });
+    rawHeaders.forEach((h, i) => {
+      const val = (values[i] || '').trim();
+      obj[h] = val;                          // オリジナルキー
+      obj[h.toLowerCase()] = val;            // 小文字キー
+      obj[h.toLowerCase().replace(/\s+/g, '-')] = val; // スペース→ハイフン
+    });
     return obj;
   });
 
