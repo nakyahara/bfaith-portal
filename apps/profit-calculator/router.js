@@ -754,11 +754,17 @@ router.get('/api/amazon/listings-report', async (req, res) => {
 
 // ── API: 価格改定機能 ──
 
-// 価格追従中の商品一覧
+// 価格改定: 全商品一覧（追従設定の有無に関わらず）
 router.get('/api/price-revision/products', async (req, res) => {
   try {
     await ensureDb();
-    const products = getTrackingProducts();
+    const { tracking } = req.query;
+    let products;
+    if (tracking === 'true') {
+      products = getTrackingProducts();
+    } else {
+      products = getProducts({});
+    }
     res.json(products);
   } catch (err) {
     res.status(500).json({ error: err.message });
