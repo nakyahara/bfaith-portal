@@ -785,6 +785,19 @@ router.get('/api/price-revision/diagnostics', async (req, res) => {
       janSamples: janCodes.slice(0, 3).map(p => ({ id: p.id, asin: p.asin, sku: p.sku, name: p.product_name?.slice(0, 30) })),
       otherSamples: otherIds.slice(0, 3).map(p => ({ id: p.id, asin: p.asin, sku: p.sku, name: p.product_name?.slice(0, 30) })),
       duplicateAsinCount: dupes.length,
+      // 在庫・価格による分析
+      withPrice: all.filter(p => p.selling_price > 0).length,
+      withoutPrice: all.filter(p => !p.selling_price || p.selling_price === 0).length,
+      statusBreakdown: (() => {
+        const sb = {};
+        all.forEach(p => { const s = p.status || '不明'; sb[s] = (sb[s] || 0) + 1; });
+        return sb;
+      })(),
+      fulfillmentBreakdown: (() => {
+        const fb = {};
+        all.forEach(p => { const f = p.fulfillment || '不明'; fb[f] = (fb[f] || 0) + 1; });
+        return fb;
+      })(),
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
