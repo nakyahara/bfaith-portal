@@ -51,6 +51,7 @@
     .status-badge.出品済 { background: #b2f2bb; color: #087f23; }
     .status-badge.Amazon出品エラー { background: #ffe0e0; color: #b12704; }
     .status-badge.NE在庫連携済 { background: #d0f0fd; color: #0c5460; }
+    .status-badge.全て完了 { background: #e0e0e0; color: #666; }
     .fulfillment-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: bold; }
     .fulfillment-badge.FBA { background: #fff3cd; color: #856404; }
     .fulfillment-badge.FBM { background: #d1ecf1; color: #0c5460; }
@@ -99,6 +100,7 @@
         <option value="Amazon出品済">Amazon出品済</option>
         <option value="Amazon出品エラー">Amazon出品エラー</option>
         <option value="NE在庫連携済">NE在庫連携済</option>
+        <option value="全て完了">全て完了</option>
       </select>
       <input type="text" id="searchInput" placeholder="ASIN・商品名で検索" oninput="debounceLoad()">
       <select id="bulkStatusSelect" style="padding:5px 8px; border:1px solid #888; border-radius:4px; font-size:12px;">
@@ -107,6 +109,7 @@
         <option value="Amazon出品済">Amazon出品済</option>
         <option value="Amazon出品エラー">Amazon出品エラー</option>
         <option value="NE在庫連携済">NE在庫連携済</option>
+        <option value="全て完了">全て完了</option>
       </select>
       <button class="btn btn-primary" onclick="bulkChangeStatus()" style="font-size:11px;">適用</button>
       <button class="btn" style="background:#232f3e; border-color:#232f3e; color:#ff9900; font-size:11px; font-weight:bold;" onclick="bulkListOnAmazon()">Amazon一括出品</button>
@@ -123,9 +126,9 @@
     let debounceTimer = null;
     let allData = [];
     let expandedId = null;
-    const STATUSES = ['入荷待ち', 'Amazon出品済', 'Amazon出品エラー', 'NE在庫連携済'];
-    const STATUS_ORDER = { '入荷待ち': 0, 'Amazon出品エラー': 1, 'Amazon出品済': 2, 'NE在庫連携済': 3 };
-    const AMAZON_STATUSES = new Set(['入荷待ち', 'Amazon出品済', 'Amazon出品エラー', 'NE在庫連携済']);
+    const STATUSES = ['入荷待ち', 'Amazon出品済', 'Amazon出品エラー', 'NE在庫連携済', '全て完了'];
+    const STATUS_ORDER = { '入荷待ち': 0, 'Amazon出品エラー': 1, 'Amazon出品済': 2, 'NE在庫連携済': 3, '全て完了': 4 };
+    const AMAZON_STATUSES = new Set(['入荷待ち', 'Amazon出品済', 'Amazon出品エラー', 'NE在庫連携済', '全て完了']);
 
     let suppliers = [];
 
@@ -152,8 +155,12 @@
       try {
         const res = await fetch(`./api/products?${params}`);
         let rawData = await res.json();
-        // Amazon出品ページ: 入荷待ち/Amazon出品済/Amazon出品エラーのみ表示
-        allData = rawData.filter(p => AMAZON_STATUSES.has(p.status));
+        // Amazon出品ページ: 該当ステータスのみ表示（「全ステータス」時は「全て完了」を除外）
+        allData = rawData.filter(p => {
+          if (!AMAZON_STATUSES.has(p.status)) return false;
+          if (!status && p.status === '全て完了') return false;
+          return true;
+        });
         // ステータス順 → 登録日新しい順にソート
         allData.sort((a, b) => {
           const sa = STATUS_ORDER[a.status] ?? 99;
