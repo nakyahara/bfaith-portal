@@ -503,27 +503,32 @@ export function syncProductsFromListings(listings) {
     console.log('[Sync] 1行目:', JSON.stringify(listings[0]).slice(0, 800));
   }
 
-  // キー名を動的検索するヘルパー
+  // キー名を動的検索するヘルパー（完全一致 → 正規化一致の順で検索）
   function findVal(row, patterns) {
+    // まず完全一致
+    for (const p of patterns) {
+      if (row[p] !== undefined && row[p] !== '') return row[p];
+    }
+    // 次に正規化一致（小文字化 + 記号除去）
     for (const key of Object.keys(row)) {
-      const lk = key.toLowerCase().replace(/[\s_-]/g, '');
+      const lk = key.toLowerCase().replace(/[\s_\-・]/g, '');
       for (const p of patterns) {
-        if (lk === p.toLowerCase().replace(/[\s_-]/g, '')) return row[key];
+        if (lk === p.toLowerCase().replace(/[\s_\-・]/g, '')) return row[key];
       }
     }
     return '';
   }
 
   for (const row of listings) {
-    const asin = findVal(row, ['asin1', 'asin', 'ASIN1', 'ASIN']);
-    const sku = findVal(row, ['seller-sku', 'seller_sku', 'sellersku', 'sku', 'SKU']);
+    const asin = findVal(row, ['asin1', 'asin', 'ASIN1', 'ASIN', '商品ID', '商品id']);
+    const sku = findVal(row, ['seller-sku', 'seller_sku', 'sellersku', 'sku', 'SKU', '出品者SKU', '出品者sku']);
 
     if (!asin && !sku) { skipped++; continue; }
 
     const productName = findVal(row, ['item-name', 'item_name', 'itemname', '商品名']);
     const price = parseFloat(findVal(row, ['price', 'Price', '価格']) || '0') || null;
-    const fulfillmentRaw = findVal(row, ['fulfillment-channel', 'fulfillment_channel', 'fulfillmentchannel']);
-    const fulfillment = fulfillmentRaw.toUpperCase().includes('AMAZON') ? 'FBA' : 'FBM';
+    const fulfillmentRaw = findVal(row, ['fulfillment-channel', 'fulfillment_channel', 'fulfillmentchannel', 'フルフィルメント・チャンネル']);
+    const fulfillment = fulfillmentRaw.includes('Amazon') || fulfillmentRaw.includes('AMAZON') ? 'FBA' : 'FBM';
     const imageUrl = findVal(row, ['image-url', 'image_url', 'imageurl']);
 
     // 既存チェック: ASINのみで照合（SKU違いの重複を防ぐ）、なければSKUでも照合
