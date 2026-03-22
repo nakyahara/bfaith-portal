@@ -438,9 +438,26 @@ export async function getActiveListingsReport() {
     options: { version: '2021-06-30' },
   });
 
-  // ドキュメントダウンロード
+  // ドキュメントダウンロード（GZIP圧縮対応）
   const response = await fetch(doc.url);
-  const text = await response.text();
+  let text;
+  if (doc.compressionAlgorithm === 'GZIP') {
+    const { createGunzip } = await import('zlib');
+    const { Readable } = await import('stream');
+    const { pipeline } = await import('stream/promises');
+    const buf = Buffer.from(await response.arrayBuffer());
+    text = await new Promise((resolve, reject) => {
+      const gunzip = createGunzip();
+      const chunks = [];
+      gunzip.on('data', chunk => chunks.push(chunk));
+      gunzip.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
+      gunzip.on('error', reject);
+      gunzip.end(buf);
+    });
+    console.log('[SP-API] GZIP解凍完了, サイズ:', text.length);
+  } else {
+    text = await response.text();
+  }
 
   // TSV解析（ヘッダーを正規化: 小文字・ハイフン統一）
   const lines = text.split('\n').filter(l => l.trim());
