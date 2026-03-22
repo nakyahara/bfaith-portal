@@ -253,15 +253,18 @@ export async function createListing({ asin, price, isFba, sku, condition = 'new_
     if (shippingTemplate) {
       attributes.merchant_shipping_group = [{ value: shippingTemplate, marketplace_id: marketplaceId }];
     }
-    // 正しいattribute名: optional_payment_type_exclusion（代引きは2024年6月にAmazon JPで廃止済み）
+    // 正しいattribute名: optional_payment_type_exclusion
+    // 有効値: 'cvs'(コンビニ決済不可), 'cash_on_delivery'(代引不可) — maxUniqueItems:2で両方指定可
     if (paymentRestriction && paymentRestriction !== 'none') {
-      const exclusionMap = {
-        'cvs': 'exclude_cvs',
-        'cod_cvs': 'exclude_cvs',  // CODは廃止済みなのでCVSのみ
-      };
-      const exclusionValue = exclusionMap[paymentRestriction];
-      if (exclusionValue) {
-        attributes.optional_payment_type_exclusion = [{ value: exclusionValue, marketplace_id: marketplaceId }];
+      const exclusions = [];
+      if (paymentRestriction === 'cvs' || paymentRestriction === 'cod_cvs') {
+        exclusions.push({ value: 'cvs', marketplace_id: marketplaceId });
+      }
+      if (paymentRestriction === 'cod' || paymentRestriction === 'cod_cvs') {
+        exclusions.push({ value: 'cash_on_delivery', marketplace_id: marketplaceId });
+      }
+      if (exclusions.length > 0) {
+        attributes.optional_payment_type_exclusion = exclusions;
       }
     }
   }

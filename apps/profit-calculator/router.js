@@ -258,7 +258,7 @@ router.post('/api/products/:id/patch-amazon', async (req, res) => {
       {
         op: 'replace',
         path: '/attributes/optional_payment_type_exclusion',
-        value: [{ value: 'exclude_cvs', marketplace_id: marketplaceId }],
+        value: [{ value: 'cvs', marketplace_id: marketplaceId }],
       },
     ];
 
@@ -281,7 +281,7 @@ router.post('/api/amazon/patch-payment', async (req, res) => {
       {
         op: 'replace',
         path: '/attributes/optional_payment_type_exclusion',
-        value: [{ value: 'exclude_cvs', marketplace_id: marketplaceId }],
+        value: [{ value: 'cvs', marketplace_id: marketplaceId }],
       },
     ];
 
