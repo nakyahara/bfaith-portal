@@ -6,7 +6,7 @@
   <title>価格改定 — リサーチ仕入れツール</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: 'Segoe UI', 'Hiragino Sans', 'Meiryo', sans-serif; background: #eaeded; color: #0f1111; font-size: 13px; }
+    body { font-family: 'Segoe UI', 'Hiragino Sans', 'Meiryo', sans-serif; background: #f5f5f5; color: #333; font-size: 13px; }
     a { color: #0066c0; text-decoration: none; }
 
     .header { background: #232f3e; color: #fff; padding: 10px 24px; display: flex; align-items: center; justify-content: space-between; }
@@ -16,105 +16,122 @@
     .page-tab { padding: 10px 20px; color: #ccc; font-size: 13px; font-weight: bold; text-decoration: none; border-bottom: 3px solid transparent; }
     .page-tab:hover { color: #fff; }
     .page-tab.active { color: #fff; border-bottom-color: #ff9900; }
-    .container { max-width: 100%; margin: 0 auto; padding: 8px 12px; }
 
-    /* ステータスバー */
-    .toolbar { background: #fff; border: 1px solid #d5d9d9; border-radius: 6px; padding: 8px 12px; margin-bottom: 8px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-    .toolbar .status-item { display: flex; align-items: center; gap: 5px; }
-    .status-dot { width: 10px; height: 10px; border-radius: 50%; }
-    .status-dot.active { background: #2ecc71; }
-    .status-dot.inactive { background: #e74c3c; }
-    .toolbar .stats { font-size: 11px; color: #565959; }
-    .toolbar .controls { display: flex; gap: 6px; align-items: center; margin-left: auto; }
-    .toolbar .count { font-size: 13px; font-weight: bold; color: #0f1111; }
+    /* ツールバー */
+    .toolbar { background: #fff; border-bottom: 2px solid #e0e0e0; padding: 8px 16px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .toolbar .status-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+    .toolbar .status-dot.active { background: #2ecc71; }
+    .toolbar .status-dot.inactive { background: #ccc; }
+    .toolbar .stats { font-size: 11px; color: #888; }
+    .toolbar .sync-status { font-size: 11px; color: #888; margin-left: 8px; }
+    .toolbar .controls { display: flex; gap: 6px; margin-left: auto; align-items: center; }
+    .btn { padding: 4px 10px; border-radius: 3px; font-size: 11px; font-weight: bold; cursor: pointer; border: 1px solid #ccc; background: #f7f7f7; }
+    .btn:hover { background: #eee; }
 
-    .btn { padding: 4px 10px; border-radius: 4px; font-size: 11px; font-weight: bold; cursor: pointer; border: 1px solid; }
-    .btn-success { background: #2ecc71; border-color: #27ae60; color: #fff; }
-    .btn-danger { background: #fff; border-color: #e74c3c; color: #e74c3c; }
-    .btn-primary { background: #f0c14b; border-color: #a88734; color: #0f1111; }
-    .btn-sm { padding: 3px 8px; font-size: 10px; }
+    /* 検索バー */
+    .search-bar { background: #4a6fa5; padding: 8px 16px; display: flex; align-items: center; gap: 8px; }
+    .search-bar input { padding: 6px 10px; border: none; border-radius: 3px; font-size: 13px; width: 300px; }
+    .search-bar button { padding: 6px 16px; background: #ff9900; border: none; border-radius: 3px; color: #fff; font-weight: bold; cursor: pointer; }
+    .search-bar select { padding: 5px 8px; border: none; border-radius: 3px; font-size: 12px; }
 
-    /* フィルター */
-    .filter-bar { background: #fff; border: 1px solid #d5d9d9; border-radius: 6px; padding: 8px 12px; margin-bottom: 8px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-    .filter-bar input { padding: 4px 8px; border: 1px solid #aaa; border-radius: 4px; font-size: 12px; width: 200px; }
-    .filter-bar select { padding: 4px 8px; border: 1px solid #aaa; border-radius: 4px; font-size: 12px; }
-    .filter-bar label { font-size: 12px; color: #565959; }
+    /* 結果バー */
+    .result-bar { background: #fff; border-bottom: 1px solid #ddd; padding: 6px 16px; font-size: 12px; display: flex; align-items: center; gap: 12px; }
+    .result-bar .count { font-weight: bold; }
+    .result-bar .badge { background: #ff9900; color: #fff; padding: 1px 8px; border-radius: 3px; font-size: 11px; }
 
-    /* 商品カード（プライスター風） */
-    .product-row { background: #fff; border: 1px solid #d5d9d9; border-radius: 4px; margin-bottom: 4px; display: grid; grid-template-columns: 70px 1fr 140px 150px 200px 160px 120px; gap: 0; align-items: stretch; font-size: 12px; }
-    .product-row:hover { border-color: #ff9900; }
-    .product-row > div { padding: 8px; border-right: 1px solid #eee; display: flex; flex-direction: column; justify-content: center; }
+    /* テーブルヘッダー */
+    .tbl-header { display: grid; grid-template-columns: 30px 60px 1fr 130px 130px 170px 110px 130px 100px; background: #f7f7f7; border-bottom: 2px solid #ddd; font-size: 11px; font-weight: bold; color: #666; }
+    .tbl-header > div { padding: 8px 6px; border-right: 1px solid #eee; text-align: center; }
+
+    /* 商品行 */
+    .product-row { display: grid; grid-template-columns: 30px 60px 1fr 130px 130px 170px 110px 130px 100px; border-bottom: 1px solid #e8e8e8; background: #fff; min-height: 90px; }
+    .product-row:hover { background: #fffdf5; }
+    .product-row > div { padding: 6px; border-right: 1px solid #f0f0f0; display: flex; flex-direction: column; justify-content: center; }
     .product-row > div:last-child { border-right: none; }
 
+    /* チェックボックス */
+    .col-check { align-items: center; }
+    .col-check input { width: 16px; height: 16px; }
+
     /* 画像 */
-    .col-image img { width: 54px; height: 54px; object-fit: contain; border: 1px solid #eee; border-radius: 4px; }
-    .col-image { align-items: center; }
+    .col-img { align-items: center; }
+    .col-img img { width: 50px; height: 50px; object-fit: contain; }
 
     /* 商品情報 */
-    .col-info { min-width: 0; }
-    .col-info .product-name { font-size: 12px; font-weight: bold; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-bottom: 2px; }
+    .col-info { padding: 6px 8px !important; min-width: 0; gap: 2px; }
+    .col-info .pname { font-size: 12px; font-weight: bold; color: #333; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .col-info .asin { font-size: 11px; color: #0066c0; }
-    .col-info .sku { font-size: 10px; color: #888; }
-    .col-info .fulfillment { display: inline-block; padding: 1px 6px; border-radius: 8px; font-size: 10px; font-weight: bold; }
-    .col-info .fulfillment.FBA { background: #fff3cd; color: #856404; }
-    .col-info .fulfillment.FBM { background: #d1ecf1; color: #0c5460; }
+    .col-info .sku { font-size: 10px; color: #999; }
 
     /* 出品価格 */
-    .col-price .price-label { font-size: 10px; color: #888; }
-    .col-price .price-value { font-size: 16px; font-weight: bold; color: #b12704; }
-    .col-price .price-sub { font-size: 10px; color: #565959; }
+    .col-price { gap: 2px; }
+    .col-price .label { font-size: 9px; color: #999; }
+    .col-price input { width: 80px; padding: 3px 5px; border: 1px solid #ccc; border-radius: 3px; font-size: 13px; text-align: right; }
+    .col-price input:focus { border-color: #ff9900; outline: none; }
+    .col-price .sub { font-size: 10px; color: #888; }
 
-    /* 競合価格 */
-    .col-competitor .comp-label { font-size: 10px; color: #888; }
-    .col-competitor .comp-value { font-size: 13px; font-weight: bold; }
-    .col-competitor .comp-detail { font-size: 10px; color: #565959; }
-    .col-competitor .comp-time { font-size: 9px; color: #aaa; }
+    /* 競合・カート価格 */
+    .col-comp { gap: 2px; font-size: 11px; }
+    .col-comp .comp-title { font-size: 9px; color: #999; font-weight: bold; }
+    .col-comp .comp-price { font-size: 14px; font-weight: bold; color: #b12704; }
+    .col-comp .comp-detail { font-size: 10px; color: #666; }
+    .col-comp .comp-time { font-size: 9px; color: #aaa; }
 
-    /* モード選択 */
-    .col-mode { align-items: stretch; gap: 3px; }
-    .mode-btn { padding: 3px 2px; border: 1px solid #ccc; border-radius: 4px; font-size: 10px; font-weight: bold; cursor: pointer; text-align: center; background: #f7f7f7; transition: all 0.15s; }
-    .mode-btn:hover { border-color: #ff9900; }
+    /* モードボタン */
+    .col-mode { gap: 2px; align-items: stretch; }
+    .mode-btn { padding: 3px 4px; border: 1px solid #ccc; border-radius: 3px; font-size: 10px; font-weight: bold; cursor: pointer; text-align: center; background: #f7f7f7; }
+    .mode-btn:hover { border-color: #ff9900; background: #fff8ee; }
     .mode-btn.active { color: #fff; border-color: transparent; }
-    .mode-btn.active[data-mode="FBA最安値"] { background: #e74c3c; }
+    .mode-btn.active[data-mode="FBA最安値"] { background: #4a90d9; }
     .mode-btn.active[data-mode="最安値"] { background: #e67e22; }
     .mode-btn.active[data-mode="カート"] { background: #27ae60; }
     .mode-btn.active[data-mode="カスタム"] { background: #8e44ad; }
     .mode-btn.active[data-mode="しない"] { background: #95a5a6; }
 
+    /* 仕入れ価格 */
+    .col-cost { gap: 4px; }
+    .col-cost .label { font-size: 9px; color: #999; }
+    .col-cost input { width: 75px; padding: 3px 5px; border: 1px solid #ccc; border-radius: 3px; font-size: 12px; text-align: right; color: #c0392b; }
+    .col-cost input:focus { border-color: #ff9900; outline: none; }
+
     /* ストッパー */
-    .col-stopper { gap: 4px; }
-    .stopper-group { display: flex; align-items: center; gap: 4px; }
-    .stopper-group label { font-size: 10px; color: #888; white-space: nowrap; min-width: 42px; }
-    .stopper-group input { width: 65px; padding: 2px 4px; border: 1px solid #ccc; border-radius: 3px; font-size: 11px; text-align: right; }
-    .stopper-group input:focus { border-color: #ff9900; outline: none; }
+    .col-stopper { gap: 3px; }
+    .col-stopper .s-group { display: flex; align-items: center; gap: 3px; }
+    .col-stopper .s-label { font-size: 9px; color: #999; min-width: 28px; }
+    .col-stopper input { width: 60px; padding: 2px 4px; border: 1px solid #ccc; border-radius: 3px; font-size: 11px; text-align: right; }
+    .col-stopper input:focus { border-color: #ff9900; outline: none; }
+    .col-stopper .profit { font-size: 10px; margin-top: 2px; }
+    .col-stopper .profit.pos { color: #27ae60; }
+    .col-stopper .profit.neg { color: #c0392b; }
 
-    /* ヘッダー行 */
-    .product-header { background: #f7f8f8; border: 1px solid #d5d9d9; border-radius: 4px 4px 0 0; margin-bottom: 0; font-size: 11px; font-weight: bold; color: #565959; }
-    .product-header > div { padding: 6px 8px; }
+    /* 手数料・粗利 */
+    .col-profit { gap: 2px; text-align: center; font-size: 11px; }
+    .col-profit .profit-val { font-size: 14px; font-weight: bold; }
+    .col-profit .profit-val.pos { color: #27ae60; }
+    .col-profit .profit-val.neg { color: #c0392b; }
+    .col-profit .profit-rate { font-size: 10px; color: #888; }
 
-    .empty-state { text-align: center; padding: 40px; color: #565959; background: #fff; border: 1px solid #d5d9d9; border-radius: 6px; }
-    .loading { text-align: center; padding: 20px; color: #888; }
-    .spinner { display: inline-block; width: 20px; height: 20px; border: 2px solid #ddd; border-top-color: #ff9900; border-radius: 50%; animation: spin 0.6s linear infinite; vertical-align: middle; margin-right: 8px; }
+    .saved-flash { animation: flashGreen 0.5s; }
+    @keyframes flashGreen { 0% { background: #d4edda; } 100% { background: transparent; } }
+
+    .empty-state { text-align: center; padding: 60px 20px; color: #999; background: #fff; font-size: 14px; }
+    .loading { text-align: center; padding: 30px; color: #888; }
+    .spinner { display: inline-block; width: 18px; height: 18px; border: 2px solid #ddd; border-top-color: #ff9900; border-radius: 50%; animation: spin 0.6s linear infinite; vertical-align: middle; margin-right: 6px; }
     @keyframes spin { to { transform: rotate(360deg); } }
 
-    .save-indicator { font-size: 10px; color: #27ae60; opacity: 0; transition: opacity 0.3s; }
-    .save-indicator.show { opacity: 1; }
+    /* タブ */
+    .view-tabs { display: flex; gap: 0; padding: 8px 16px 0; }
+    .view-tab { padding: 8px 20px; background: #e8e8e8; border: 1px solid #ddd; border-bottom: none; border-radius: 6px 6px 0 0; cursor: pointer; font-size: 12px; font-weight: bold; color: #666; }
+    .view-tab.active { background: #fff; color: #333; border-bottom: 1px solid #fff; margin-bottom: -1px; z-index: 1; }
+    .tab-body { display: none; }
+    .tab-body.active { display: block; }
 
-    /* 履歴モーダル */
-    .tab-toggle { display: flex; gap: 0; margin-bottom: 8px; }
-    .tab-toggle button { padding: 8px 20px; border: 1px solid #d5d9d9; background: #f7f8f8; font-size: 12px; font-weight: bold; cursor: pointer; color: #565959; }
-    .tab-toggle button:first-child { border-radius: 6px 0 0 6px; }
-    .tab-toggle button:last-child { border-radius: 0 6px 6px 0; }
-    .tab-toggle button.active { background: #232f3e; color: #fff; border-color: #232f3e; }
-    .tab-content { display: none; }
-    .tab-content.active { display: block; }
-
-    .history-table { width: 100%; border-collapse: collapse; font-size: 11px; }
-    .history-table th { background: #f7f8f8; padding: 6px 8px; text-align: left; border-bottom: 2px solid #d5d9d9; }
+    .history-table { width: 100%; border-collapse: collapse; font-size: 11px; background: #fff; }
+    .history-table th { background: #f7f7f7; padding: 6px 8px; text-align: left; border-bottom: 2px solid #ddd; }
     .history-table td { padding: 5px 8px; border-bottom: 1px solid #eee; }
     .history-table .num { text-align: right; }
-    .positive { color: #007600; }
-    .negative { color: #b12704; }
+    .positive { color: #27ae60; }
+    .negative { color: #c0392b; }
   </style>
 </head>
 <body>
@@ -122,7 +139,6 @@
     <h1><span>B-Faith</span> リサーチ仕入れツール</h1>
     <a href="/" style="color:#ff9900;font-size:13px;">ポータルに戻る</a>
   </div>
-
   <div class="page-tabs">
     <a href="./research" class="page-tab">リサーチ・見積もり</a>
     <a href="./" class="page-tab">商品計算</a>
@@ -135,70 +151,73 @@
     <a href="./settings" class="page-tab">設定</a>
   </div>
 
-  <div class="container">
-    <!-- ツールバー -->
-    <div class="toolbar">
-      <div class="status-item">
-        <div class="status-dot" id="workerDot"></div>
-        <span id="workerLabel" style="font-size:12px;">確認中...</span>
-      </div>
-      <div class="stats" id="statsInfo"></div>
-      <div class="controls">
-        <button class="btn btn-success btn-sm" onclick="startWorker()">開始</button>
-        <button class="btn btn-danger btn-sm" onclick="stopWorker()">停止</button>
-        <button class="btn btn-primary btn-sm" onclick="refreshCache()">キャッシュ更新</button>
-        <button class="btn btn-sm" style="background:#3498db;border-color:#2980b9;color:#fff;" id="btnSync" onclick="syncProducts()">Amazon商品同期</button>
-      </div>
+  <!-- ツールバー -->
+  <div class="toolbar">
+    <span class="status-dot" id="workerDot"></span>
+    <span id="workerLabel" style="font-size:12px;">確認中...</span>
+    <span class="stats" id="statsInfo"></span>
+    <span class="sync-status" id="syncStatus"></span>
+    <div class="controls">
+      <button class="btn" onclick="startWorker()">開始</button>
+      <button class="btn" onclick="stopWorker()">停止</button>
+      <button class="btn" onclick="manualSync()">手動同期</button>
     </div>
+  </div>
 
-    <!-- タブ切替 -->
-    <div class="tab-toggle">
-      <button class="active" onclick="switchTab('products')">在庫一覧</button>
-      <button onclick="switchTab('history')">価格変動履歴</button>
+  <!-- 検索バー -->
+  <div class="search-bar">
+    <input type="text" id="searchInput" placeholder="キーワード, JAN, SKU, ASIN" oninput="filterProducts()">
+    <button onclick="filterProducts()">検索</button>
+    <select id="modeFilter" onchange="filterProducts()">
+      <option value="">価格の自動変更 ▼</option>
+      <option value="FBA最安値">FBA最安値</option>
+      <option value="最安値">最安値</option>
+      <option value="カート">カート</option>
+      <option value="カスタム">カスタム</option>
+      <option value="しない">しない</option>
+      <option value="_none">未設定</option>
+    </select>
+    <select id="fulfillmentFilter" onchange="filterProducts()">
+      <option value="">配送方法 ▼</option>
+      <option value="FBA">FBA</option>
+      <option value="FBM">自己発送</option>
+    </select>
+  </div>
+
+  <!-- 結果バー -->
+  <div class="result-bar">
+    <span>検索結果：<span class="count" id="productCount">-</span></span>
+    <span class="badge" id="statusBadge">出品中</span>
+  </div>
+
+  <!-- タブ -->
+  <div class="view-tabs">
+    <div class="view-tab active" onclick="switchTab('list')">在庫一覧</div>
+    <div class="view-tab" onclick="switchTab('history')">価格変動履歴</div>
+  </div>
+
+  <!-- 在庫一覧 -->
+  <div class="tab-body active" id="tab-list">
+    <div class="tbl-header">
+      <div></div>
+      <div>画像</div>
+      <div style="text-align:left;">商品名 / ASIN / SKU</div>
+      <div>出品価格<br>+配送料</div>
+      <div>最低価格<br>+配送料</div>
+      <div>価格の自動変更</div>
+      <div>仕入れ価格</div>
+      <div>高値ストッパー<br>赤字ストッパー</div>
+      <div>手数料<br>粗利益</div>
     </div>
-
-    <!-- 在庫一覧タブ -->
-    <div class="tab-content active" id="tab-products">
-      <div class="filter-bar">
-        <input type="text" id="searchInput" placeholder="商品名・ASIN・SKUで検索" oninput="filterProducts()">
-        <select id="modeFilter" onchange="filterProducts()">
-          <option value="">全モード</option>
-          <option value="FBA最安値">FBA最安値</option>
-          <option value="最安値">最安値</option>
-          <option value="カート">カート</option>
-          <option value="カスタム">カスタム</option>
-          <option value="しない">しない</option>
-          <option value="未設定">未設定</option>
-        </select>
-        <select id="fulfillmentFilter" onchange="filterProducts()">
-          <option value="">全配送</option>
-          <option value="FBA">FBA</option>
-          <option value="FBM">FBM</option>
-        </select>
-        <span class="count" id="productCount">-</span>
-      </div>
-
-      <!-- ヘッダー -->
-      <div class="product-row product-header">
-        <div></div>
-        <div>商品名 / ASIN / SKU</div>
-        <div>出品価格</div>
-        <div>競合・カート価格</div>
-        <div>価格の自動変更</div>
-        <div>ストッパー</div>
-        <div>最終チェック</div>
-      </div>
-
-      <div id="productsContainer">
-        <div class="loading"><span class="spinner"></span>読み込み中...</div>
-      </div>
+    <div id="productsContainer">
+      <div class="loading"><span class="spinner"></span>読み込み中...</div>
     </div>
+  </div>
 
-    <!-- 履歴タブ -->
-    <div class="tab-content" id="tab-history">
-      <div id="historyContainer">
-        <div class="loading"><span class="spinner"></span>読み込み中...</div>
-      </div>
+  <!-- 履歴 -->
+  <div class="tab-body" id="tab-history">
+    <div id="historyContainer" style="padding:8px 16px;">
+      <div class="loading"><span class="spinner"></span>読み込み中...</div>
     </div>
   </div>
 
@@ -206,245 +225,189 @@
     const BASE = '.';
     let allProducts = [];
 
-    // --- タブ切替 ---
     function switchTab(tab) {
-      document.querySelectorAll('.tab-toggle button').forEach(b => b.classList.remove('active'));
-      document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+      document.querySelectorAll('.view-tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.tab-body').forEach(t => t.classList.remove('active'));
       document.getElementById('tab-' + tab).classList.add('active');
       event.target.classList.add('active');
     }
 
-    // --- ワーカー制御 ---
+    // === ワーカー ===
     async function loadWorkerStatus() {
       try {
         const res = await fetch(`${BASE}/api/price-revision/worker`);
-        const data = await res.json();
-        const dot = document.getElementById('workerDot');
-        const label = document.getElementById('workerLabel');
-        const info = document.getElementById('statsInfo');
-        if (!data.enabled) {
-          dot.className = 'status-dot inactive';
-          label.textContent = 'SQS未設定';
-        } else if (data.running) {
-          dot.className = 'status-dot active';
-          label.textContent = '稼働中';
-        } else {
-          dot.className = 'status-dot inactive';
-          label.textContent = '停止中';
-        }
-        const s = data.stats;
-        info.textContent = `受信:${s.received} 処理:${s.processed} 更新:${s.updated} スキップ:${s.skipped} エラー:${s.errors}${s.lastProcessedAt ? ' 最終:' + s.lastProcessedAt : ''}`;
-      } catch (e) { console.error(e); }
+        const d = await res.json();
+        document.getElementById('workerDot').className = 'status-dot ' + (d.running ? 'active' : 'inactive');
+        document.getElementById('workerLabel').textContent = !d.enabled ? 'SQS未設定' : d.running ? '稼働中' : '停止';
+        const s = d.stats;
+        document.getElementById('statsInfo').textContent =
+          `受信:${s.received} 処理:${s.processed} 更新:${s.updated} エラー:${s.errors}`;
+      } catch(e) {}
     }
+    async function startWorker() { await fetch(`${BASE}/api/price-revision/worker/start`,{method:'POST'}); loadWorkerStatus(); }
+    async function stopWorker() { await fetch(`${BASE}/api/price-revision/worker/stop`,{method:'POST'}); loadWorkerStatus(); }
 
-    async function startWorker() {
-      await fetch(`${BASE}/api/price-revision/worker/start`, { method: 'POST' });
-      loadWorkerStatus();
-    }
-    async function stopWorker() {
-      await fetch(`${BASE}/api/price-revision/worker/stop`, { method: 'POST' });
-      loadWorkerStatus();
-    }
-    async function refreshCache() {
-      await fetch(`${BASE}/api/price-revision/refresh-cache`, { method: 'POST' });
-      loadProducts();
-    }
-
-    async function syncProducts() {
-      const btn = document.getElementById('btnSync');
-      btn.disabled = true;
-      btn.textContent = '同期中...（数分かかります）';
+    // === 自動同期（ページ読み込み時） ===
+    async function autoSync() {
+      const el = document.getElementById('syncStatus');
+      el.innerHTML = '<span class="spinner" style="width:14px;height:14px;"></span>Amazon同期中...';
       try {
         const res = await fetch(`${BASE}/api/price-revision/sync`, { method: 'POST' });
         const data = await res.json();
         if (data.error) throw new Error(data.error);
-        alert(`同期完了!\n全${data.total}件: 新規${data.inserted}件, 更新${data.updated}件`);
+        el.textContent = `同期完了: ${data.total}件 (新規${data.inserted} 更新${data.updated})`;
         loadProducts();
-        refreshCache();
+        fetch(`${BASE}/api/price-revision/refresh-cache`, { method: 'POST' });
       } catch (e) {
-        alert('同期エラー: ' + e.message);
-      } finally {
-        btn.disabled = false;
-        btn.textContent = 'Amazon商品同期';
+        el.textContent = '同期エラー: ' + e.message;
       }
     }
+    async function manualSync() { autoSync(); }
 
-    // --- 商品一覧 ---
+    // === 商品読み込み ===
     async function loadProducts() {
       try {
         const res = await fetch(`${BASE}/api/price-revision/products`);
         allProducts = await res.json();
         filterProducts();
       } catch (e) {
-        document.getElementById('productsContainer').innerHTML =
-          `<div class="empty-state">読み込みエラー: ${e.message}</div>`;
+        document.getElementById('productsContainer').innerHTML = '<div class="empty-state">読み込みエラー</div>';
       }
     }
 
     function filterProducts() {
-      const search = document.getElementById('searchInput').value.toLowerCase();
-      const modeFilter = document.getElementById('modeFilter').value;
-      const fulfFilter = document.getElementById('fulfillmentFilter').value;
-
-      let filtered = allProducts.filter(p => {
-        if (search && !((p.product_name || '').toLowerCase().includes(search) ||
-            (p.asin || '').toLowerCase().includes(search) ||
-            (p.sku || '').toLowerCase().includes(search) ||
-            (p.ne_product_code || '').toLowerCase().includes(search))) return false;
-        if (fulfFilter && p.fulfillment !== fulfFilter) return false;
-        if (modeFilter === '未設定' && p.price_tracking && p.price_tracking !== 'しない') return false;
-        if (modeFilter && modeFilter !== '未設定' && p.price_tracking !== modeFilter) return false;
+      const q = document.getElementById('searchInput').value.toLowerCase();
+      const mf = document.getElementById('modeFilter').value;
+      const ff = document.getElementById('fulfillmentFilter').value;
+      let list = allProducts.filter(p => {
+        if (q && !`${p.product_name||''} ${p.asin||''} ${p.sku||''} ${p.ne_product_code||''} ${p.jan||''}`.toLowerCase().includes(q)) return false;
+        if (ff && p.fulfillment !== ff) return false;
+        if (mf === '_none' && p.price_tracking && p.price_tracking !== '' && p.price_tracking !== 'しない') return false;
+        if (mf && mf !== '_none' && p.price_tracking !== mf) return false;
         return true;
       });
+      document.getElementById('productCount').textContent = `約${list.length}件`;
+      renderProducts(list);
+    }
 
-      document.getElementById('productCount').textContent = `${filtered.length}件 / ${allProducts.length}件`;
-      renderProducts(filtered);
+    function getAmazonImage(asin) {
+      if (!asin) return '';
+      return `https://images-na.ssl-images-amazon.com/images/P/${asin}.09.LZZZZZZZ.jpg`;
     }
 
     function renderProducts(products) {
-      const container = document.getElementById('productsContainer');
-      if (products.length === 0) {
-        container.innerHTML = '<div class="empty-state">商品がありません</div>';
-        return;
-      }
+      const c = document.getElementById('productsContainer');
+      if (!products.length) { c.innerHTML = '<div class="empty-state">商品がありません</div>'; return; }
 
       let html = '';
       for (const p of products) {
         const mode = p.price_tracking || '';
-        const imgSrc = p.image_url || `https://images-na.ssl-images-amazon.com/images/I/placeholder.jpg`;
-        const hasImage = !!p.image_url;
+        const img = p.image_url || getAmazonImage(p.asin);
+        const cost = p.wholesale_price_with_tax || p.wholesale_price || '';
+        const fee = p.total_fee || 0;
+        const profit = p.selling_price && cost ? p.selling_price - cost - fee : null;
+        const profitRate = profit !== null && p.selling_price ? Math.round(profit / p.selling_price * 100) : null;
+        const shipping = p.fulfillment === 'FBA' ? '送料¥0' : '送料別';
 
-        html += `
-        <div class="product-row" data-id="${p.id}">
-          <div class="col-image">
-            ${hasImage ? `<img src="${esc(p.image_url)}" alt="">` : `<div style="width:54px;height:54px;background:#f5f5f5;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:9px;color:#aaa;">No Image</div>`}
-          </div>
+        html += `<div class="product-row" data-id="${p.id}">
+          <div class="col-check"><input type="checkbox"></div>
+          <div class="col-img"><img src="${esc(img)}" onerror="this.style.display='none'" alt=""></div>
           <div class="col-info">
-            <div class="product-name" title="${esc(p.product_name || '')}">${esc(p.product_name || '-')}</div>
-            <div>
-              <a class="asin" href="https://www.amazon.co.jp/dp/${p.asin}" target="_blank">${p.asin || '-'}</a>
-              <span class="fulfillment ${p.fulfillment || ''}">${p.fulfillment || '-'}</span>
-            </div>
-            <div class="sku">SKU: ${esc(p.sku || p.ne_product_code || '未設定')}</div>
+            <div class="pname" title="${esc(p.product_name||'')}">${esc(p.product_name||'-')}</div>
+            <div><a class="asin" href="https://www.amazon.co.jp/dp/${p.asin}" target="_blank">${p.asin||'-'}</a></div>
+            <div class="sku">${esc(p.sku || p.ne_product_code || '-')}</div>
           </div>
           <div class="col-price">
-            <div class="price-label">出品価格</div>
-            <div class="price-value">${p.selling_price ? '¥' + p.selling_price.toLocaleString() : '-'}</div>
-            <div class="price-sub">${p.fulfillment === 'FBA' ? '送料¥0 FBA' : '自己発送'}</div>
+            <div class="label">出品価格</div>
+            <div>¥ <input type="number" value="${p.selling_price||''}" onchange="saveField(${p.id},'selling_price',this.value,this)"></div>
+            <div class="sub">${shipping}</div>
+            <div class="sub">合計 ¥${p.selling_price||'-'}</div>
           </div>
-          <div class="col-competitor">
-            <div class="comp-label">カート価格</div>
-            <div class="comp-value">${p.competitor_price ? '¥' + p.competitor_price.toLocaleString() : '-'}</div>
-            <div class="comp-time">${p.last_checked_at ? '(' + p.last_checked_at + ')' : ''}</div>
+          <div class="col-comp">
+            <div class="comp-title">カート価格</div>
+            <div class="comp-price">${p.competitor_price ? '¥'+p.competitor_price.toLocaleString() : '-'}</div>
+            <div class="comp-detail">${p.fulfillment==='FBA'?'FBA':'自己発送'}</div>
+            <div class="comp-time">${p.last_checked_at ? '('+p.last_checked_at+')' : ''}</div>
           </div>
           <div class="col-mode">
             ${['FBA最安値','最安値','カート','カスタム','しない'].map(m =>
-              `<div class="mode-btn ${mode === m ? 'active' : ''}" data-mode="${m}" data-id="${p.id}" onclick="setMode(this, ${p.id}, '${m}')">${m}</div>`
+              `<div class="mode-btn${mode===m?' active':''}" data-mode="${m}" onclick="setMode(this,${p.id},'${m}')">${m}</div>`
             ).join('')}
           </div>
-          <div class="col-stopper">
-            <div class="stopper-group">
-              <label>高値</label>
-              <input type="number" value="${p.high_stopper || ''}" placeholder="-" onchange="saveStopper(${p.id}, 'high_stopper', this.value)">
-            </div>
-            <div class="stopper-group">
-              <label style="color:#b12704;">赤字</label>
-              <input type="number" value="${p.loss_stopper || ''}" placeholder="-" onchange="saveStopper(${p.id}, 'loss_stopper', this.value)">
-            </div>
-            <div class="save-indicator" id="save-${p.id}">保存済</div>
+          <div class="col-cost">
+            <div class="label">仕入れ価格</div>
+            <div style="color:#c0392b;">¥ <input type="number" value="${cost}" onchange="saveField(${p.id},'wholesale_price_with_tax',this.value,this)"></div>
           </div>
-          <div style="font-size:10px;color:#888;text-align:center;">
-            ${p.last_price_changed_at ? '<div style="color:#007600;">最終更新</div><div>' + p.last_price_changed_at + '</div>' : '<div>未更新</div>'}
+          <div class="col-stopper">
+            <div class="s-group"><span class="s-label">高値</span>¥ <input type="number" value="${p.high_stopper||''}" onchange="saveField(${p.id},'high_stopper',this.value,this)"></div>
+            <div class="s-group"><span class="s-label" style="color:#c0392b;">赤字</span>¥ <input type="number" value="${p.loss_stopper||''}" onchange="saveField(${p.id},'loss_stopper',this.value,this)"></div>
+            ${profit !== null ? `<div class="profit ${profit>=0?'pos':'neg'}">粗利益 ¥${profit.toLocaleString()}</div>` : ''}
+          </div>
+          <div class="col-profit">
+            <div class="label" style="font-size:9px;color:#999;">手数料</div>
+            <div style="font-size:11px;">${fee ? '¥'+fee.toLocaleString() : '-'}</div>
+            <div class="label" style="font-size:9px;color:#999;margin-top:4px;">粗利益</div>
+            <div class="profit-val ${profit!==null?(profit>=0?'pos':'neg'):''}">${profit!==null?'¥'+profit.toLocaleString():'-'}</div>
+            ${profitRate!==null?`<div class="profit-rate">(${profitRate}%)</div>`:''}
           </div>
         </div>`;
       }
-      container.innerHTML = html;
+      c.innerHTML = html;
     }
 
-    // --- モード変更 ---
-    async function setMode(el, productId, mode) {
-      // UI即時更新
-      const row = el.closest('.product-row');
-      row.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
+    // === モード変更 ===
+    async function setMode(el, id, mode) {
+      el.closest('.col-mode').querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
       el.classList.add('active');
-
-      // DB保存
-      try {
-        const trackingValue = mode === 'しない' ? '' : mode;
-        await fetch(`${BASE}/api/products/${productId}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ price_tracking: trackingValue }),
-        });
-        showSaved(productId);
-        refreshCache();
-      } catch (e) { console.error('モード保存エラー:', e); }
+      const val = mode === 'しない' ? '' : mode;
+      await fetch(`${BASE}/api/products/${id}`, {
+        method: 'PUT', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ price_tracking: val }),
+      });
+      flashRow(el);
+      fetch(`${BASE}/api/price-revision/refresh-cache`, { method: 'POST' });
     }
 
-    // --- ストッパー保存 ---
-    async function saveStopper(productId, field, value) {
-      try {
-        const data = {};
-        data[field] = value ? parseInt(value) : null;
-        await fetch(`${BASE}/api/products/${productId}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(data),
-        });
-        showSaved(productId);
-      } catch (e) { console.error('ストッパー保存エラー:', e); }
+    // === フィールド保存 ===
+    async function saveField(id, field, value, inputEl) {
+      const data = {};
+      data[field] = value ? parseInt(value) : null;
+      await fetch(`${BASE}/api/products/${id}`, {
+        method: 'PUT', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(data),
+      });
+      flashRow(inputEl);
     }
 
-    function showSaved(id) {
-      const el = document.getElementById('save-' + id);
-      if (el) { el.classList.add('show'); setTimeout(() => el.classList.remove('show'), 1500); }
+    function flashRow(el) {
+      const row = el.closest('.product-row');
+      if (row) { row.classList.add('saved-flash'); setTimeout(() => row.classList.remove('saved-flash'), 600); }
     }
 
-    // --- 履歴 ---
+    // === 履歴 ===
     async function loadHistory() {
       try {
         const res = await fetch(`${BASE}/api/price-revision/history?limit=100`);
-        const history = await res.json();
-        const container = document.getElementById('historyContainer');
-        if (history.length === 0) {
-          container.innerHTML = '<div class="empty-state">履歴がありません</div>';
-          return;
+        const hist = await res.json();
+        const c = document.getElementById('historyContainer');
+        if (!hist.length) { c.innerHTML = '<div class="empty-state">履歴がありません</div>'; return; }
+        let h = '<table class="history-table"><thead><tr><th>日時</th><th>ASIN</th><th>SKU</th><th>モード</th><th class="num">旧価格</th><th class="num">新価格</th><th class="num">差額</th><th class="num">競合</th><th>理由</th></tr></thead><tbody>';
+        for (const r of hist) {
+          const d = (r.new_price||0)-(r.old_price||0);
+          h += `<tr><td style="white-space:nowrap">${r.created_at||'-'}</td><td><a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank">${r.asin}</a></td><td>${esc(r.sku||'-')}</td><td>${r.mode||'-'}</td><td class="num">${r.old_price?'¥'+r.old_price.toLocaleString():'-'}</td><td class="num">${r.new_price?'¥'+r.new_price.toLocaleString():'-'}</td><td class="num ${d>0?'positive':d<0?'negative':''}">${d>0?'+':''}${d.toLocaleString()}</td><td class="num">${r.competitor_price?'¥'+r.competitor_price.toLocaleString():'-'}</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.reason||'')}">${esc(r.reason||'-')}</td></tr>`;
         }
-        let html = `<table class="history-table"><thead><tr>
-          <th>日時</th><th>ASIN</th><th>SKU</th><th>モード</th>
-          <th class="num">旧価格</th><th class="num">新価格</th><th class="num">差額</th>
-          <th class="num">競合</th><th class="num">カート</th><th>理由</th>
-        </tr></thead><tbody>`;
-        for (const h of history) {
-          const diff = (h.new_price || 0) - (h.old_price || 0);
-          const cls = diff > 0 ? 'positive' : diff < 0 ? 'negative' : '';
-          html += `<tr>
-            <td style="white-space:nowrap">${h.created_at || '-'}</td>
-            <td><a href="https://www.amazon.co.jp/dp/${h.asin}" target="_blank">${h.asin}</a></td>
-            <td>${esc(h.sku || '-')}</td>
-            <td>${h.mode || '-'}</td>
-            <td class="num">${h.old_price ? '¥'+h.old_price.toLocaleString() : '-'}</td>
-            <td class="num">${h.new_price ? '¥'+h.new_price.toLocaleString() : '-'}</td>
-            <td class="num ${cls}">${diff > 0 ? '+' : ''}${diff.toLocaleString()}</td>
-            <td class="num">${h.competitor_price ? '¥'+h.competitor_price.toLocaleString() : '-'}</td>
-            <td class="num">${h.buy_box_price ? '¥'+h.buy_box_price.toLocaleString() : '-'}</td>
-            <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${esc(h.reason || '')}">${esc(h.reason || '-')}</td>
-          </tr>`;
-        }
-        html += '</tbody></table>';
-        container.innerHTML = html;
-      } catch (e) {
-        document.getElementById('historyContainer').innerHTML =
-          `<div class="empty-state">読み込みエラー: ${e.message}</div>`;
-      }
+        h += '</tbody></table>';
+        c.innerHTML = h;
+      } catch(e) { document.getElementById('historyContainer').innerHTML = '<div class="empty-state">読み込みエラー</div>'; }
     }
 
     function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
-    // 初期読み込み
+    // === 初期化 ===
     loadWorkerStatus();
     loadProducts();
     loadHistory();
+    autoSync(); // ページを開いたら自動同期
     setInterval(loadWorkerStatus, 30000);
   </script>
 </body>
