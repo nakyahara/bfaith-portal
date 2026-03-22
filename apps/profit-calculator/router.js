@@ -231,18 +231,15 @@ router.post('/api/products/:id/list-amazon', async (req, res) => {
       if (!isFba && paymentRestriction && paymentRestriction !== 'none') {
         try {
           const marketplaceId = process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
-          const patches = [];
+          const exclusions = [];
           if (paymentRestriction === 'cvs' || paymentRestriction === 'cod_cvs') {
-            patches.push({ op: 'replace', path: '/attributes/optional_payment_type_exclusion', value: [{ value: 'cvs', marketplace_id: marketplaceId }] });
+            exclusions.push({ value: 'cvs', marketplace_id: marketplaceId });
           }
           if (paymentRestriction === 'cod' || paymentRestriction === 'cod_cvs') {
-            const val = patches.length > 0 ? patches[0].value : [];
-            val.push({ value: 'cash_on_delivery', marketplace_id: marketplaceId });
-            if (patches.length === 0) {
-              patches.push({ op: 'replace', path: '/attributes/optional_payment_type_exclusion', value: val });
-            }
+            exclusions.push({ value: 'cash_on_delivery', marketplace_id: marketplaceId });
           }
-          if (patches.length > 0) {
+          if (exclusions.length > 0) {
+            const patches = [{ op: 'replace', path: '/attributes/optional_payment_type_exclusion', value: exclusions }];
             const patchResult = await patchListing({ sku: result.sku, patches });
             result.paymentPatch = patchResult;
             console.log(`[SP-API] 支払い制限patch: SKU=${result.sku}, status=${patchResult.status}`);
@@ -285,7 +282,10 @@ router.post('/api/products/:id/patch-amazon', async (req, res) => {
       {
         op: 'replace',
         path: '/attributes/optional_payment_type_exclusion',
-        value: [{ value: 'cvs', marketplace_id: marketplaceId }],
+        value: [
+          { value: 'cvs', marketplace_id: marketplaceId },
+          { value: 'cash_on_delivery', marketplace_id: marketplaceId },
+        ],
       },
     ];
 
@@ -308,7 +308,10 @@ router.post('/api/amazon/patch-payment', async (req, res) => {
       {
         op: 'replace',
         path: '/attributes/optional_payment_type_exclusion',
-        value: [{ value: 'cvs', marketplace_id: marketplaceId }],
+        value: [
+          { value: 'cvs', marketplace_id: marketplaceId },
+          { value: 'cash_on_delivery', marketplace_id: marketplaceId },
+        ],
       },
     ];
 
