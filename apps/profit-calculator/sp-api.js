@@ -253,23 +253,22 @@ export async function createListing({ asin, price, isFba, sku, condition = 'new_
     if (shippingTemplate) {
       attributes.merchant_shipping_group = [{ value: shippingTemplate, marketplace_id: marketplaceId }];
     }
+    // 正しいattribute名: optional_payment_type_exclusion（代引きは2024年6月にAmazon JPで廃止済み）
     if (paymentRestriction && paymentRestriction !== 'none') {
-      const exclusions = [];
-      if (paymentRestriction === 'cod' || paymentRestriction === 'cod_cvs') {
-        exclusions.push({ value: '代引引換（商品代引）不可', marketplace_id: marketplaceId });
-      }
-      if (paymentRestriction === 'cvs' || paymentRestriction === 'cod_cvs') {
-        exclusions.push({ value: 'コンビニ決済不可', marketplace_id: marketplaceId });
-      }
-      if (exclusions.length > 0) {
-        attributes.payment_option_exclusion = exclusions;
+      const exclusionMap = {
+        'cvs': 'exclude_cvs',
+        'cod_cvs': 'exclude_cvs',  // CODは廃止済みなのでCVSのみ
+      };
+      const exclusionValue = exclusionMap[paymentRestriction];
+      if (exclusionValue) {
+        attributes.optional_payment_type_exclusion = [{ value: exclusionValue, marketplace_id: marketplaceId }];
       }
     }
   }
 
   const body = {
     productType: 'PRODUCT',
-    requirements: 'LISTING_OFFER_ONLY',
+    requirements: 'LISTING',
     attributes,
   };
 
@@ -289,6 +288,38 @@ export async function createListing({ asin, price, isFba, sku, condition = 'new_
   return {
     sku: finalSku,
     asin,
+    status: result.status,
+    submissionId: result.submissionId,
+    issues: result.issues || [],
+  };
+}
+
+/**
+ * 既存出品の属性をパッチ更新（支払い制限・配送設定等）
+ */
+export async function patchListing({ sku, patches }) {
+  const sp = getClient();
+  const marketplaceId = MARKETPLACE_ID();
+  const sellerId = SELLER_ID();
+
+  if (!sku) throw new Error('SKUが必要です');
+
+  const body = {
+    productType: 'PRODUCT',
+    patches,
+  };
+
+  const result = await sp.callAPI({
+    operation: 'patchListingsItem',
+    endpoint: 'listingsItems',
+    path: { sellerId, sku },
+    query: { marketplaceIds: [marketplaceId] },
+    body,
+    options: { version: '2021-08-01' },
+  });
+
+  return {
+    sku,
     status: result.status,
     submissionId: result.submissionId,
     issues: result.issues || [],

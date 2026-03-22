@@ -4,7 +4,7 @@
 import { Router } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { getProduct, getFees, createListing, getShippingTemplates } from './sp-api.js';
+import { getProduct, getFees, createListing, patchListing, getShippingTemplates } from './sp-api.js';
 import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, deleteProduct, getSetItems, saveSetItems } from './db.js';
 import { loadSuppliers, addSupplier, deleteSupplier } from './suppliers.js';
 import { loadShipping, addShipping, updateShipping, deleteShipping } from './shipping.js';
@@ -237,6 +237,58 @@ router.post('/api/products/:id/list-amazon', async (req, res) => {
     console.error('[ProfitCalc] Amazon出品エラー:', err.message);
     // API呼び出し自体が失敗した場合もエラーステータスに
     try { updateProduct(id, { status: 'Amazon出品エラー' }); } catch (_) {}
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── API: 既存出品の支払い制限を修正（patchListingsItem） ──
+router.post('/api/products/:id/patch-amazon', async (req, res) => {
+  try {
+    await ensureDb();
+    const id = parseInt(req.params.id);
+    const product = getProductById(id);
+    if (!product) return res.status(404).json({ error: '商品が見つかりません' });
+
+    const isFba = product.fulfillment === 'FBA';
+    const sku = isFba ? null : (product.ne_product_code || null);
+    if (!sku) return res.status(400).json({ error: 'SKUが特定できません' });
+
+    const marketplaceId = process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
+    const patches = [
+      {
+        op: 'replace',
+        path: '/attributes/optional_payment_type_exclusion',
+        value: [{ value: 'exclude_cvs', marketplace_id: marketplaceId }],
+      },
+    ];
+
+    const result = await patchListing({ sku, patches });
+    res.json(result);
+  } catch (err) {
+    console.error('[ProfitCalc] Amazon出品パッチエラー:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── API: SKU直接指定で支払い制限を修正 ──
+router.post('/api/amazon/patch-payment', async (req, res) => {
+  try {
+    const { sku } = req.body;
+    if (!sku) return res.status(400).json({ error: 'SKUが必要です' });
+
+    const marketplaceId = process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
+    const patches = [
+      {
+        op: 'replace',
+        path: '/attributes/optional_payment_type_exclusion',
+        value: [{ value: 'exclude_cvs', marketplace_id: marketplaceId }],
+      },
+    ];
+
+    const result = await patchListing({ sku, patches });
+    res.json(result);
+  } catch (err) {
+    console.error('[ProfitCalc] Amazon支払い制限パッチエラー:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
