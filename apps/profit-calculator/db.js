@@ -497,22 +497,34 @@ export function syncProductsFromListings(listings) {
 
   // 最初の1件のキーをログに出す（デバッグ用）
   if (listings.length > 0) {
-    console.log('[Sync] レポート1行目のキー:', Object.keys(listings[0]).slice(0, 30).join(', '));
-    console.log('[Sync] レポート1行目の値(先頭5):', JSON.stringify(listings[0]).slice(0, 500));
+    const keys = Object.keys(listings[0]);
+    console.log('[Sync] レポートキー数:', keys.length);
+    console.log('[Sync] 全キー:', keys.join(' | '));
+    console.log('[Sync] 1行目:', JSON.stringify(listings[0]).slice(0, 800));
+  }
+
+  // キー名を動的検索するヘルパー
+  function findVal(row, patterns) {
+    for (const key of Object.keys(row)) {
+      const lk = key.toLowerCase().replace(/[\s_-]/g, '');
+      for (const p of patterns) {
+        if (lk === p.toLowerCase().replace(/[\s_-]/g, '')) return row[key];
+      }
+    }
+    return '';
   }
 
   for (const row of listings) {
-    // 複数のカラム名パターンに対応（大文字小文字・ハイフン・スペース混在）
-    const asin = row['asin1'] || row['ASIN1'] || row['asin'] || row['Asin1'] || row['ASIN'] || '';
-    const sku = row['seller-sku'] || row['Seller SKU'] || row['seller_sku'] || row['sku'] || row['SKU'] || '';
+    const asin = findVal(row, ['asin1', 'asin', 'ASIN1', 'ASIN']);
+    const sku = findVal(row, ['seller-sku', 'seller_sku', 'sellersku', 'sku', 'SKU']);
 
     if (!asin && !sku) { skipped++; continue; }
 
-    const productName = row['item-name'] || row['Item Name'] || row['item_name'] || row['商品名'] || '';
-    const price = parseFloat(row['price'] || row['Price'] || row['価格'] || '0') || null;
-    const fulfillmentRaw = row['fulfillment-channel'] || row['Fulfillment Channel'] || row['fulfillment_channel'] || '';
+    const productName = findVal(row, ['item-name', 'item_name', 'itemname', '商品名']);
+    const price = parseFloat(findVal(row, ['price', 'Price', '価格']) || '0') || null;
+    const fulfillmentRaw = findVal(row, ['fulfillment-channel', 'fulfillment_channel', 'fulfillmentchannel']);
     const fulfillment = fulfillmentRaw.toUpperCase().includes('AMAZON') ? 'FBA' : 'FBM';
-    const imageUrl = row['image-url'] || row['Image URL'] || row['image_url'] || '';
+    const imageUrl = findVal(row, ['image-url', 'image_url', 'imageurl']);
 
     // 既存チェック: ASINのみで照合（SKU違いの重複を防ぐ）、なければSKUでも照合
     let existing = queryAll('SELECT id FROM products WHERE asin = ? LIMIT 1', [asin]);
