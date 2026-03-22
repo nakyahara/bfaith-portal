@@ -461,7 +461,7 @@ export async function getActiveListingsReport() {
 
   return {
     totalCount: rows.length,
-    headers: headers.map(h => h.trim()),
+    headers: rawHeaders,
     listings: rows,
   };
 }
