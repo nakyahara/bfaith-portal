@@ -415,7 +415,7 @@ export function getProducts(filters = {}) {
   }
 
   if (conditions.length > 0) sql += ' WHERE ' + conditions.join(' AND ');
-  sql += ' ORDER BY id DESC';
+  sql += ' ORDER BY created_at DESC, id DESC';
 
   return queryAll(sql, params);
 }
