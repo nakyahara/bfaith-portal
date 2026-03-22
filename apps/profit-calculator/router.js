@@ -210,9 +210,11 @@ router.post('/api/products/:id/list-amazon', async (req, res) => {
     const sku = isFba ? null : (product.ne_product_code || null);
     if (!isFba && !sku) return res.status(400).json({ error: 'NE商品コード（SKU）が設定されていません' });
 
-    // FBM: 保存済み設定を取得
+    // 保存済み設定を取得（FBM/FBAで別設定）
     const shippingTemplate = !isFba ? getSetting('amazon_shipping_template') : null;
-    const paymentRestriction = !isFba ? (getSetting('amazon_payment_restriction') || 'none') : 'none';
+    const paymentRestriction = isFba
+      ? (getSetting('amazon_fba_payment_restriction') || 'none')
+      : (getSetting('amazon_payment_restriction') || 'none');
 
     const result = await createListing({
       asin: product.asin,
@@ -227,8 +229,8 @@ router.post('/api/products/:id/list-amazon', async (req, res) => {
     if (result.status === 'ACCEPTED') {
       updateProduct(id, { status: 'Amazon出品済' });
 
-      // FBM: LISTING_OFFER_ONLYでは支払い制限が適用されないため、patchで後追い設定
-      if (!isFba && paymentRestriction && paymentRestriction !== 'none') {
+      // LISTING_OFFER_ONLYでは支払い制限が適用されないため、patchで後追い設定（FBA/FBM共通）
+      if (paymentRestriction && paymentRestriction !== 'none') {
         try {
           const marketplaceId = process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
           const exclusions = [];

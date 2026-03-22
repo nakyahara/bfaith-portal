@@ -121,10 +121,24 @@
     <!-- ========== FBA設定 ========== -->
     <div class="panel">
       <div class="panel-title">Amazon出品設定 <span class="badge badge-fba">FBA</span></div>
-      <div class="panel-desc">FBA（Amazonから発送）でAmazon出品する際の初期設定です。</div>
+      <div class="panel-desc">FBA（Amazonから発送）でAmazon出品する際の初期設定です。ここで設定した内容が出品時に自動適用されます。</div>
 
-      <div style="padding: 20px; text-align: center; color: #888; font-size: 13px;">
-        FBA固有の設定は今後追加予定です
+      <!-- 支払い方法の制限 -->
+      <div class="setting-row">
+        <div class="setting-label">支払い方法の制限</div>
+        <div class="setting-value">
+          <select id="fbaPaymentRestriction">
+            <option value="none">すべての支払い方法を許可する</option>
+            <option value="cod">代引換を選べないようにする</option>
+            <option value="cvs">コンビニ決済を選べないようにする</option>
+            <option value="cod_cvs">代引換とコンビニ決済を選べないようにする</option>
+          </select>
+        </div>
+      </div>
+      <div class="setting-current" id="currentFbaPayment"></div>
+
+      <div style="margin-top: 16px; text-align: right;">
+        <button class="btn btn-save" onclick="saveFbaSettings()">FBA設定を保存</button>
       </div>
     </div>
 
@@ -156,10 +170,15 @@
         }
         updateDisplay('currentTemplate', tmpl, '配送テンプレート');
 
-        // 支払い方法の制限
+        // FBM 支払い方法の制限
         const pay = settings.amazon_payment_restriction || 'none';
         document.getElementById('paymentRestriction').value = pay;
         updateDisplay('currentPayment', PAYMENT_LABELS[pay] || pay, '支払い方法');
+
+        // FBA 支払い方法の制限
+        const fbaPay = settings.amazon_fba_payment_restriction || 'none';
+        document.getElementById('fbaPaymentRestriction').value = fbaPay;
+        updateDisplay('currentFbaPayment', PAYMENT_LABELS[fbaPay] || fbaPay, '支払い方法');
       } catch (e) { console.error('設定読み込みエラー:', e); }
     }
 
@@ -247,6 +266,20 @@
         updateDisplay('currentTemplate', template, '配送テンプレート');
         updateDisplay('currentPayment', PAYMENT_LABELS[payment] || payment, '支払い方法');
         showToast('FBM設定を保存しました');
+      } catch (e) { alert('保存エラー: ' + e.message); }
+    }
+
+    // ── FBA設定保存 ──
+    async function saveFbaSettings() {
+      const payment = document.getElementById('fbaPaymentRestriction').value;
+      try {
+        await fetch('./api/settings/amazon_fba_payment_restriction', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ value: payment }),
+        });
+        updateDisplay('currentFbaPayment', PAYMENT_LABELS[payment] || payment, '支払い方法');
+        showToast('FBA設定を保存しました');
       } catch (e) { alert('保存エラー: ' + e.message); }
     }
 
