@@ -388,99 +388,101 @@ export async function updatePrice({ sku, price }) {
 }
 
 /**
- * セラー出品レポート取得（全出品データ）
- * GET_MERCHANT_LISTINGS_ALL_DATA レポートをダウンロードしてパース
- * 返り値: [{sku, asin, price, quantity, status, product_name, open_date, fulfillment, ...}, ...]
+ * 出品中の全商品レポートを取得（SKU数の確認用）
+ * GET_MERCHANT_LISTINGS_DATA レポート
  */
-export async function getMerchantListingsReport() {
+export async function getActiveListingsReport() {
   const sp = getClient();
   const marketplaceId = MARKETPLACE_ID();
 
-  console.log('[SP-API] セラー出品レポート取得開始...');
-
   // レポート作成リクエスト
-  const createRes = await sp.callAPI({
+  const createResult = await sp.callAPI({
     operation: 'createReport',
     endpoint: 'reports',
     body: {
-      reportType: 'GET_MERCHANT_LISTINGS_ALL_DATA',
+      reportType: 'GET_MERCHANT_LISTINGS_DATA',
       marketplaceIds: [marketplaceId],
     },
     options: { version: '2021-06-30' },
   });
 
-  const reportId = createRes.reportId;
-  console.log('[SP-API] レポートID:', reportId);
+  const reportId = createResult.reportId;
+  console.log(`[SP-API] レポート作成: reportId=${reportId}`);
 
-  // レポート完了をポーリング（最大5分）
-  let reportDoc = null;
-  for (let i = 0; i < 30; i++) {
-    await sleep(10000); // 10秒待機
-    const status = await sp.callAPI({
+  // レポート完了を待機（最大5分）
+  let report;
+  for (let i = 0; i < 60; i++) {
+    await sleep(5000);
+    report = await sp.callAPI({
       operation: 'getReport',
       endpoint: 'reports',
       path: { reportId },
       options: { version: '2021-06-30' },
     });
-
-    console.log(`[SP-API] レポートステータス: ${status.processingStatus} (${i + 1}/30)`);
-
-    if (status.processingStatus === 'DONE') {
-      reportDoc = status.reportDocumentId;
-      break;
-    }
-    if (status.processingStatus === 'CANCELLED' || status.processingStatus === 'FATAL') {
-      throw new Error(`レポート生成失敗: ${status.processingStatus}`);
+    console.log(`[SP-API] レポートステータス: ${report.processingStatus}`);
+    if (report.processingStatus === 'DONE') break;
+    if (report.processingStatus === 'FATAL' || report.processingStatus === 'CANCELLED') {
+      throw new Error(`レポート処理失敗: ${report.processingStatus}`);
     }
   }
 
-  if (!reportDoc) throw new Error('レポート生成タイムアウト（5分）');
+  if (report.processingStatus !== 'DONE') {
+    throw new Error('レポート取得タイムアウト');
+  }
 
   // レポートドキュメント取得
-  const docInfo = await sp.callAPI({
+  const doc = await sp.callAPI({
     operation: 'getReportDocument',
     endpoint: 'reports',
-    path: { reportDocumentId: reportDoc },
+    path: { reportDocumentId: report.reportDocumentId },
     options: { version: '2021-06-30' },
   });
 
-  // レポートダウンロード
-  const response = await sp.download(docInfo, { json: false });
+  // ドキュメントダウンロード（GZIP圧縮 + Shift_JIS対応）
+  const response = await fetch(doc.url);
+  const rawBuf = Buffer.from(await response.arrayBuffer());
 
-  // TSVパース
-  const lines = response.split('\n');
-  const headers = lines[0].split('\t').map(h => h.trim());
-  const listings = [];
-
-  for (let i = 1; i < lines.length; i++) {
-    const cols = lines[i].split('\t');
-    if (cols.length < 3) continue;
-
-    const row = {};
-    headers.forEach((h, idx) => { row[h] = (cols[idx] || '').trim(); });
-
-    listings.push({
-      product_name: row['item-name'] || '',
-      sku: row['seller-sku'] || '',
-      asin: row['asin1'] || row['asin'] || '',
-      price: parseFloat(row['price']) || 0,
-      quantity: parseInt(row['quantity']) || 0,
-      status: row['status'] || '',
-      condition: row['item-condition'] || '',
-      open_date: row['open-date'] || '',
-      image_url: row['image-url'] || '',
-      fulfillment: (row['fulfillment-channel'] || '').includes('AMAZON') ? 'FBA' : 'FBM',
-      item_description: row['item-description'] || '',
-      listing_id: row['listing-id'] || '',
-      product_id: row['product-id'] || '',
-      product_id_type: row['product-id-type'] || '',
-      shipping_price: parseFloat(row['expedited-shipping']) || 0,
-      will_ship_internationally: row['will-ship-internationally'] || '',
-    });
+  let dataBuf = rawBuf;
+  if (doc.compressionAlgorithm === 'GZIP') {
+    const { gunzipSync } = await import('zlib');
+    dataBuf = gunzipSync(rawBuf);
+    console.log('[SP-API] GZIP解凍完了, サイズ:', dataBuf.length);
   }
 
-  console.log(`[SP-API] レポート取得完了: ${listings.length}件`);
-  return listings;
+  // エンコーディング判定: UTF-8で読めなければShift_JISとして変換
+  let text;
+  try {
+    const iconv = await import('iconv-lite');
+    // まずShift_JISとして試す（日本のAmazonレポートはShift_JIS）
+    text = iconv.default.decode(dataBuf, 'Shift_JIS');
+    console.log('[SP-API] Shift_JISとしてデコード');
+  } catch {
+    text = dataBuf.toString('utf-8');
+    console.log('[SP-API] UTF-8としてデコード');
+  }
+
+  // TSV解析（ヘッダーを正規化: 小文字・ハイフン統一）
+  const lines = text.split('\n').filter(l => l.trim());
+  const rawHeaders = lines[0].split('\t').map(h => h.trim());
+  console.log('[SP-API] レポートヘッダー:', rawHeaders.join(', '));
+
+  const rows = lines.slice(1).map(line => {
+    const values = line.split('\t');
+    const obj = {};
+    rawHeaders.forEach((h, i) => {
+      const val = (values[i] || '').trim();
+      obj[h] = val;                          // オリジナルキー
+      obj[h.toLowerCase()] = val;            // 小文字キー
+      obj[h.toLowerCase().replace(/\s+/g, '-')] = val; // スペース→ハイフン
+    });
+    return obj;
+  });
+
+  return {
+    totalCount: rows.length,
+    headers: rawHeaders,
+    listings: rows,
+  };
 }
 
 function sleep(ms) {

@@ -265,6 +265,39 @@ export async function initDb() {
     )
   `);
 
+  // 価格変動履歴テーブル（価格改定機能用）
+  db.run(`
+    CREATE TABLE IF NOT EXISTS price_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+      asin TEXT NOT NULL,
+      sku TEXT,
+      old_price INTEGER,
+      new_price INTEGER,
+      reason TEXT,
+      mode TEXT,
+      competitor_price INTEGER,
+      buy_box_price INTEGER,
+      created_at TEXT DEFAULT (datetime('now','localtime'))
+    )
+  `);
+
+  // productsテーブル: 価格改定用カラム追加
+  const priceRevisionCols = [
+    ['last_checked_at', 'TEXT'],
+    ['last_price_changed_at', 'TEXT'],
+    ['competitor_price', 'INTEGER'],
+    ['price_change_count_today', 'INTEGER DEFAULT 0'],
+    ['price_change_count_date', 'TEXT'],
+    ['sku', 'TEXT'],
+  ];
+  const prodCols2 = queryAll('PRAGMA table_info(products)').map(r => r.name);
+  for (const [col, type] of priceRevisionCols) {
+    if (!prodCols2.includes(col)) {
+      db.run(`ALTER TABLE products ADD COLUMN ${col} ${type}`);
+    }
+  }
+
   saveToFile();
 }
 
@@ -454,7 +487,7 @@ export function getProducts(filters = {}) {
   }
 
   if (conditions.length > 0) sql += ' WHERE ' + conditions.join(' AND ');
-  sql += ' ORDER BY id DESC';
+  sql += ' ORDER BY created_at DESC, id DESC';
 
   return queryAll(sql, params);
 }
@@ -613,5 +646,161 @@ export function getSyncMeta(key) {
 
 export function setSyncMeta(key, value) {
   db.run('INSERT OR REPLACE INTO sync_meta (key, value) VALUES (?, ?)', [key, value]);
+  saveToFile();
+}
+
+// ===== Amazon商品同期 =====
+
+/**
+ * Amazonレポートから全商品をDBに同期（upsert）
+ * @param {Array} listings - getActiveListingsReport().listings
+ * @returns {{ inserted: number, updated: number, total: number }}
+ */
+export function syncProductsFromListings(listings) {
+  let inserted = 0;
+  let updated = 0;
+  let skipped = 0;
+
+  // 最初の1件のキーをログに出す（デバッグ用）
+  if (listings.length > 0) {
+    const keys = Object.keys(listings[0]);
+    console.log('[Sync] レポートキー数:', keys.length);
+    console.log('[Sync] 全キー:', keys.join(' | '));
+    console.log('[Sync] 1行目:', JSON.stringify(listings[0]).slice(0, 800));
+  }
+
+  // キー名を動的検索するヘルパー（完全一致 → 正規化一致の順で検索）
+  function findVal(row, patterns) {
+    // まず完全一致
+    for (const p of patterns) {
+      if (row[p] !== undefined && row[p] !== '') return row[p];
+    }
+    // 次に正規化一致（小文字化 + 記号除去）
+    for (const key of Object.keys(row)) {
+      const lk = key.toLowerCase().replace(/[\s_\-・]/g, '');
+      for (const p of patterns) {
+        if (lk === p.toLowerCase().replace(/[\s_\-・]/g, '')) return row[key];
+      }
+    }
+    return '';
+  }
+
+  for (const row of listings) {
+    const asin = findVal(row, ['asin1', 'asin', 'ASIN1', 'ASIN', '商品ID', '商品id']);
+    const sku = findVal(row, ['seller-sku', 'seller_sku', 'sellersku', 'sku', 'SKU', '出品者SKU', '出品者sku']);
+
+    if (!asin && !sku) { skipped++; continue; }
+
+    const productName = findVal(row, ['item-name', 'item_name', 'itemname', '商品名']);
+    const price = parseFloat(findVal(row, ['price', 'Price', '価格']) || '0') || null;
+    const fulfillmentRaw = findVal(row, ['fulfillment-channel', 'fulfillment_channel', 'fulfillmentchannel', 'フルフィルメント・チャンネル']);
+    const fulfillment = fulfillmentRaw.includes('Amazon') || fulfillmentRaw.includes('AMAZON') ? 'FBA' : 'FBM';
+    const imageUrl = findVal(row, ['image-url', 'image_url', 'imageurl']);
+
+    // 既存チェック: ASINのみで照合（SKU違いの重複を防ぐ）、なければSKUでも照合
+    let existing = queryAll('SELECT id FROM products WHERE asin = ? LIMIT 1', [asin]);
+    if (existing.length === 0 && sku) {
+      existing = queryAll('SELECT id FROM products WHERE sku = ? OR ne_product_code = ? LIMIT 1', [sku, sku]);
+    }
+
+    if (existing.length > 0) {
+      db.run(`
+        UPDATE products SET
+          product_name = COALESCE(NULLIF(?, ''), product_name),
+          selling_price = COALESCE(?, selling_price),
+          fulfillment = ?,
+          image_url = COALESCE(NULLIF(?, ''), image_url),
+          sku = COALESCE(NULLIF(?, ''), sku),
+          updated_at = datetime('now','localtime')
+        WHERE id = ?
+      `, [productName, price, fulfillment, imageUrl, sku, existing[0].id]);
+      updated++;
+    } else {
+      db.run(`
+        INSERT INTO products (asin, product_name, selling_price, fulfillment, image_url, sku, ne_product_code, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, '出品中')
+      `, [asin, productName, price, fulfillment, imageUrl, sku, sku]);
+      inserted++;
+    }
+  }
+
+  saveToFile();
+  console.log(`[Sync] 結果: 全${listings.length}件, 新規${inserted}, 更新${updated}, スキップ${skipped}`);
+
+  // デバッグ情報
+  const debug = {};
+  if (listings.length > 0) {
+    debug.allKeys = Object.keys(listings[0]);
+    debug.sampleRow = listings[0];
+    debug.detectedAsin = findVal(listings[0], ['asin1', 'asin', 'ASIN1', 'ASIN']);
+    debug.detectedSku = findVal(listings[0], ['seller-sku', 'seller_sku', 'sellersku', 'sku', 'SKU']);
+  }
+
+  return { inserted, updated, skipped, total: listings.length, debug };
+}
+
+// ===== Price History (価格改定) =====
+
+export function savePriceHistory({ productId, asin, sku, oldPrice, newPrice, reason, mode, competitorPrice, buyBoxPrice }) {
+  db.run(`
+    INSERT INTO price_history (product_id, asin, sku, old_price, new_price, reason, mode, competitor_price, buy_box_price)
+    VALUES (?,?,?,?,?,?,?,?,?)
+  `, [productId, asin, sku, oldPrice, newPrice, reason, mode, competitorPrice, buyBoxPrice]);
+  saveToFile();
+}
+
+export function getPriceHistory(productId, limit = 50) {
+  return queryAll('SELECT * FROM price_history WHERE product_id = ? ORDER BY id DESC LIMIT ?', [productId, limit]);
+}
+
+export function getRecentPriceHistory(limit = 100) {
+  return queryAll('SELECT * FROM price_history ORDER BY id DESC LIMIT ?', [limit]);
+}
+
+/**
+ * 通知が来ていない商品を取得（フォールバック対象）
+ * last_checked_at が NULL または24時間以上前の、追従設定済み商品
+ */
+export function getStaleTrackingProducts(hoursThreshold = 24) {
+  return queryAll(`
+    SELECT * FROM products
+    WHERE price_tracking IS NOT NULL AND price_tracking != '' AND price_tracking != 'しない'
+      AND sku IS NOT NULL AND sku != ''
+      AND (last_checked_at IS NULL OR last_checked_at < datetime('now', 'localtime', '-${hoursThreshold} hours'))
+    ORDER BY last_checked_at ASC
+  `);
+}
+
+/**
+ * 30日以上前の価格履歴を削除
+ */
+export function cleanupOldPriceHistory(days = 30) {
+  const result = queryAll(`SELECT COUNT(*) as cnt FROM price_history WHERE created_at < datetime('now', 'localtime', '-${days} days')`);
+  const count = result[0]?.cnt || 0;
+  if (count > 0) {
+    db.run(`DELETE FROM price_history WHERE created_at < datetime('now', 'localtime', '-${days} days')`);
+    saveToFile();
+  }
+  return count;
+}
+
+export function getTrackingProducts() {
+  return queryAll("SELECT * FROM products WHERE price_tracking IS NOT NULL AND price_tracking != '' AND sku IS NOT NULL AND sku != ''");
+}
+
+export function updateProductPriceInfo(id, data) {
+  const fields = [];
+  const params = [];
+  const allowed = ['selling_price', 'competitor_price', 'last_checked_at', 'last_price_changed_at', 'price_change_count_today', 'price_change_count_date'];
+  for (const [key, value] of Object.entries(data)) {
+    if (allowed.includes(key)) {
+      fields.push(`${key} = ?`);
+      params.push(value === undefined ? null : value);
+    }
+  }
+  if (fields.length === 0) return;
+  fields.push("updated_at = datetime('now','localtime')");
+  params.push(id);
+  db.run(`UPDATE products SET ${fields.join(', ')} WHERE id = ?`, params);
   saveToFile();
 }

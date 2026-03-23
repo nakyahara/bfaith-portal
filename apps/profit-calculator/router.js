@@ -4,11 +4,12 @@
 import { Router } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { getProduct, getFees, createListing, patchListing, getShippingTemplates, getItemOffers, updatePrice, getMerchantListingsReport } from './sp-api.js';
-import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, deleteProduct, getSetItems, saveSetItems, syncListings as dbSyncListings, getListings, updateListing, getSyncMeta } from './db.js';
+import { getProduct, getFees, createListing, patchListing, getShippingTemplates, getItemOffers, updatePrice, getActiveListingsReport } from './sp-api.js';
+import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, deleteProduct, getSetItems, saveSetItems, syncListings as dbSyncListings, getListings, updateListing, getSyncMeta, getTrackingProducts, getPriceHistory, getRecentPriceHistory, savePriceHistory, updateProductPriceInfo, syncProductsFromListings } from './db.js';
 import { loadSuppliers, addSupplier, deleteSupplier } from './suppliers.js';
 import { loadShipping, addShipping, updateShipping, deleteShipping } from './shipping.js';
 import { getSetting, setSetting, getAllSettings } from './settings.js';
+import { startPriceWorker, stopPriceWorker, getWorkerStatus, refreshProductCache } from './price-scheduler.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -57,6 +58,10 @@ router.get('/shipping', (req, res) => {
 
 router.get('/settings', (req, res) => {
   res.sendFile(path.join(__dirname, 'settings.html'));
+});
+
+router.get('/price-revision', (req, res) => {
+  res.sendFile(path.join(__dirname, 'price-revision.html'));
 });
 
 // 旧URL互換
@@ -722,10 +727,28 @@ router.post('/api/listings/sync', async (req, res) => {
   try {
     await ensureDb();
     console.log('[ProfitCalc] Amazon出品レポート同期開始...');
-    const listings = await getMerchantListingsReport();
-    dbSyncListings(listings);
-    console.log(`[ProfitCalc] 同期完了: ${listings.length}件`);
-    res.json({ count: listings.length, message: '同期完了' });
+    const report = await getActiveListingsReport();
+
+    // TSVヘッダーキー → listingsテーブルのキーにマッピング
+    const mapped = report.listings.map(row => ({
+      sku: row['seller-sku'] || '',
+      asin: row['asin1'] || row['asin'] || '',
+      product_name: row['item-name'] || '',
+      image_url: row['image-url'] || '',
+      price: parseFloat(row['price']) || 0,
+      shipping_price: parseFloat(row['expedited-shipping']) || 0,
+      quantity: parseInt(row['quantity']) || 0,
+      status: row['status'] || 'Active',
+      condition: row['item-condition'] || '',
+      fulfillment: (row['fulfillment-channel'] || '').includes('AMAZON') ? 'FBA' : 'FBM',
+      open_date: row['open-date'] || '',
+      listing_id: row['listing-id'] || '',
+      item_description: row['item-description'] || '',
+    })).filter(item => item.sku);
+
+    dbSyncListings(mapped);
+    console.log(`[ProfitCalc] 同期完了: ${mapped.length}件`);
+    res.json({ count: mapped.length, message: '同期完了' });
   } catch (err) {
     console.error('[ProfitCalc] 同期エラー:', err.message, err.stack);
     res.status(500).json({ error: err.message });
@@ -769,6 +792,160 @@ router.post('/api/amazon/update-price', async (req, res) => {
     console.error('[ProfitCalc] 価格更新エラー:', err.message, err.stack);
     res.status(500).json({ error: err.message });
   }
+});
+
+// ── API: Amazon出品商品レポート（SKU数確認用） ──
+router.get('/api/amazon/listings-report', async (req, res) => {
+  try {
+    const report = await getActiveListingsReport();
+    // サマリー情報を返す（全データは大きいのでカウントと概要のみ）
+    const statusCounts = {};
+    for (const row of report.listings) {
+      const status = row['status'] || row['Status'] || 'unknown';
+      statusCounts[status] = (statusCounts[status] || 0) + 1;
+    }
+    res.json({
+      totalCount: report.totalCount,
+      statusCounts,
+      sampleHeaders: report.headers.slice(0, 20),
+      sample: report.listings.slice(0, 5),
+    });
+  } catch (err) {
+    console.error('[ProfitCalc] 出品レポート取得エラー:', err.message, err.stack);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── API: 商品数診断 ──
+router.get('/api/price-revision/diagnostics', async (req, res) => {
+  try {
+    await ensureDb();
+    const all = getProducts({});
+    const uniqueAsins = new Set(all.map(p => p.asin).filter(Boolean));
+    const uniqueSkus = new Set(all.map(p => p.sku).filter(Boolean));
+    const noAsin = all.filter(p => !p.asin || p.asin.length < 5);
+    const duplicateAsins = {};
+    all.forEach(p => {
+      if (p.asin) {
+        if (!duplicateAsins[p.asin]) duplicateAsins[p.asin] = [];
+        duplicateAsins[p.asin].push({ id: p.id, sku: p.sku, status: p.status });
+      }
+    });
+    const dupes = Object.entries(duplicateAsins).filter(([, v]) => v.length > 1);
+
+    // ASIN形式の分析
+    const realAsins = all.filter(p => p.asin && /^[A-Z0-9]{10}$/.test(p.asin)); // 10桁英数字
+    const janCodes = all.filter(p => p.asin && /^\d{13}$/.test(p.asin));        // 13桁数字（JAN/EAN）
+    const otherIds = all.filter(p => p.asin && !/^[A-Z0-9]{10}$/.test(p.asin) && !/^\d{13}$/.test(p.asin));
+
+    res.json({
+      totalProducts: all.length,
+      uniqueAsins: uniqueAsins.size,
+      uniqueSkus: uniqueSkus.size,
+      realAsinCount: realAsins.length,
+      janCodeCount: janCodes.length,
+      otherIdCount: otherIds.length,
+      noAsinCount: noAsin.length,
+      janSamples: janCodes.slice(0, 3).map(p => ({ id: p.id, asin: p.asin, sku: p.sku, name: p.product_name?.slice(0, 30) })),
+      otherSamples: otherIds.slice(0, 3).map(p => ({ id: p.id, asin: p.asin, sku: p.sku, name: p.product_name?.slice(0, 30) })),
+      duplicateAsinCount: dupes.length,
+      // 在庫・価格による分析
+      withPrice: all.filter(p => p.selling_price > 0).length,
+      withoutPrice: all.filter(p => !p.selling_price || p.selling_price === 0).length,
+      statusBreakdown: (() => {
+        const sb = {};
+        all.forEach(p => { const s = p.status || '不明'; sb[s] = (sb[s] || 0) + 1; });
+        return sb;
+      })(),
+      fulfillmentBreakdown: (() => {
+        const fb = {};
+        all.forEach(p => { const f = p.fulfillment || '不明'; fb[f] = (fb[f] || 0) + 1; });
+        return fb;
+      })(),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── API: Amazon商品同期 ──
+router.post('/api/price-revision/sync', async (req, res) => {
+  try {
+    await ensureDb();
+    console.log('[PriceRevision] Amazon商品同期開始...');
+    const report = await getActiveListingsReport();
+    console.log(`[PriceRevision] レポート取得完了: ${report.totalCount}件`);
+    const result = syncProductsFromListings(report.listings);
+    console.log(`[PriceRevision] 同期完了: 新規${result.inserted}件, 更新${result.updated}件`);
+    res.json(result);
+  } catch (err) {
+    console.error('[PriceRevision] 同期エラー:', err.message, err.stack);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── API: 価格改定機能 ──
+
+// 価格改定: 全商品一覧（追従設定の有無に関わらず）
+router.get('/api/price-revision/products', async (req, res) => {
+  try {
+    await ensureDb();
+    const { tracking } = req.query;
+    let products;
+    if (tracking === 'true') {
+      products = getTrackingProducts();
+    } else {
+      products = getProducts({});
+    }
+    res.json(products);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 価格変動履歴（全体）
+router.get('/api/price-revision/history', async (req, res) => {
+  try {
+    await ensureDb();
+    const limit = parseInt(req.query.limit) || 100;
+    const history = getRecentPriceHistory(limit);
+    res.json(history);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 商品別の価格変動履歴
+router.get('/api/price-revision/history/:productId', async (req, res) => {
+  try {
+    await ensureDb();
+    const limit = parseInt(req.query.limit) || 50;
+    const history = getPriceHistory(parseInt(req.params.productId), limit);
+    res.json(history);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ワーカー制御
+router.get('/api/price-revision/worker', (req, res) => {
+  res.json(getWorkerStatus());
+});
+
+router.post('/api/price-revision/worker/start', (req, res) => {
+  startPriceWorker();
+  res.json({ ok: true });
+});
+
+router.post('/api/price-revision/worker/stop', (req, res) => {
+  stopPriceWorker();
+  res.json({ ok: true });
+});
+
+// 商品キャッシュ手動リフレッシュ
+router.post('/api/price-revision/refresh-cache', (req, res) => {
+  refreshProductCache();
+  res.json({ ok: true });
 });
 
 export default router;
