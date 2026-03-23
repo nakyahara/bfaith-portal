@@ -629,7 +629,7 @@ export function getListings() {
 export function updateListing(sku, data, skipSave = false) {
   const EDITABLE = new Set([
     'price', 'quantity', 'cost_price', 'loss_stopper', 'high_stopper',
-    'price_tracking', 'point', 'status',
+    'price_tracking', 'point', 'status', 'total_sold',
   ]);
   const fields = [];
   const params = [];

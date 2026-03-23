@@ -489,6 +489,124 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+/**
+ * 注文レポートからSKU別販売個数を集計
+ * @param {number} days - 過去何日分（デフォルト30日）
+ * @returns {Object} { [sku]: totalQuantity, ... }
+ */
+export async function getSalesCountBySku(days = 30) {
+  const sp = getClient();
+  const marketplaceId = MARKETPLACE_ID();
+
+  const now = new Date();
+  const start = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
+  const startStr = start.toISOString();
+  const endStr = now.toISOString();
+
+  console.log(`[SP-API] 注文レポート取得: ${startStr} ～ ${endStr} (${days}日間)`);
+
+  const createResult = await sp.callAPI({
+    operation: 'createReport',
+    endpoint: 'reports',
+    body: {
+      reportType: 'GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE',
+      marketplaceIds: [marketplaceId],
+      dataStartTime: startStr,
+      dataEndTime: endStr,
+    },
+    options: { version: '2021-06-30' },
+  });
+
+  const reportId = createResult.reportId;
+  console.log(`[SP-API] 注文レポートID: ${reportId}`);
+
+  // ポーリング
+  let report;
+  for (let i = 0; i < 60; i++) {
+    await sleep(5000);
+    report = await sp.callAPI({
+      operation: 'getReport',
+      endpoint: 'reports',
+      path: { reportId },
+      options: { version: '2021-06-30' },
+    });
+    console.log(`[SP-API] 注文レポートステータス: ${report.processingStatus}`);
+    if (report.processingStatus === 'DONE') break;
+    if (report.processingStatus === 'FATAL' || report.processingStatus === 'CANCELLED') {
+      throw new Error(`注文レポート生成失敗: ${report.processingStatus}`);
+    }
+  }
+
+  if (report.processingStatus !== 'DONE') {
+    throw new Error('注文レポート取得タイムアウト');
+  }
+
+  const doc = await sp.callAPI({
+    operation: 'getReportDocument',
+    endpoint: 'reports',
+    path: { reportDocumentId: report.reportDocumentId },
+    options: { version: '2021-06-30' },
+  });
+
+  const response = await fetch(doc.url);
+  const rawBuf = Buffer.from(await response.arrayBuffer());
+
+  let dataBuf = rawBuf;
+  if (doc.compressionAlgorithm === 'GZIP') {
+    const { gunzipSync } = await import('zlib');
+    dataBuf = gunzipSync(rawBuf);
+  }
+
+  let text;
+  try {
+    const iconv = await import('iconv-lite');
+    text = iconv.default.decode(dataBuf, 'Shift_JIS');
+  } catch {
+    text = dataBuf.toString('utf-8');
+  }
+
+  const lines = text.split('\n').filter(l => l.trim());
+  const headers = lines[0].split('\t').map(h => h.trim());
+  console.log(`[SP-API] 注文レポートヘッダー: ${headers.join(', ')}`);
+
+  // SKU列とquantity列を探す
+  const findIdx = (...candidates) => {
+    for (const c of candidates) {
+      const idx = headers.findIndex(h => h.toLowerCase().replace(/\s+/g, '-') === c.toLowerCase());
+      if (idx >= 0) return idx;
+    }
+    return -1;
+  };
+
+  const skuIdx = findIdx('sku', 'seller-sku');
+  const qtyIdx = findIdx('quantity', 'quantity-purchased');
+  const statusIdx = findIdx('order-status', 'item-status');
+
+  if (skuIdx < 0 || qtyIdx < 0) {
+    console.log(`[SP-API] SKU列=${skuIdx}, 数量列=${qtyIdx} — ヘッダー不一致`);
+    // フォールバック: 全ヘッダーをインデックスで探す
+    console.log('[SP-API] ヘッダー詳細:', JSON.stringify(headers));
+    throw new Error('注文レポートのSKUまたは数量列が見つかりません');
+  }
+
+  // SKU別に数量を集計（キャンセル除外）
+  const salesMap = {};
+  for (let i = 1; i < lines.length; i++) {
+    const cols = lines[i].split('\t');
+    const sku = (cols[skuIdx] || '').trim();
+    const qty = parseInt(cols[qtyIdx]) || 0;
+    const status = statusIdx >= 0 ? (cols[statusIdx] || '').trim().toLowerCase() : '';
+
+    if (!sku || qty <= 0) continue;
+    if (status === 'cancelled' || status === 'キャンセル') continue;
+
+    salesMap[sku] = (salesMap[sku] || 0) + qty;
+  }
+
+  console.log(`[SP-API] 販売集計完了: ${Object.keys(salesMap).length}SKU, 合計${Object.values(salesMap).reduce((a, b) => a + b, 0)}個`);
+  return salesMap;
+}
+
 export async function patchListing({ sku, patches }) {
   const sp = getClient();
   const marketplaceId = MARKETPLACE_ID();

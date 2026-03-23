@@ -198,6 +198,7 @@
     <!-- 同期バー -->
     <div class="sync-bar">
       <button class="btn btn-sync" id="btnSync" onclick="syncListings()">Amazonから同期</button>
+      <button class="btn" style="background:#5a4230; border-color:#3d2b1a; color:#f7a94b; font-size:12px; font-weight:bold;" id="btnSaleSync" onclick="syncSales()">販売データ同期</button>
       <div class="sync-status">
         最終同期: <span class="sync-date" id="lastSyncDate">未同期</span>
       </div>
@@ -378,6 +379,7 @@
           <th>仕入れ価格</th>
           <th>高値ストッパー<br>赤字ストッパー</th>
           <th>手数料<br>利益率</th>
+          <th class="sortable" onclick="toggleSort('total_sold')">売れた<br>個数${sortIcon('total_sold')}</th>
         </tr></thead><tbody>`;
 
       for (const item of pageData) {
@@ -516,6 +518,10 @@
             </div>
           </td>
 
+          <!-- 売れた個数 -->
+          <td class="sales-cell">
+            <div class="sales-count">${item.total_sold || 0}<span style="font-size:10px; font-weight:normal;">個</span></div>
+          </td>
         </tr>`;
       }
 
@@ -599,6 +605,30 @@
         setTimeout(() => {
           document.getElementById('syncProgress').style.display = 'none';
         }, 3000);
+      }
+    }
+
+    // ── 販売データ同期 ──
+    async function syncSales() {
+      const btn = document.getElementById('btnSaleSync');
+      const days = prompt('過去何日分の販売データを取得しますか？', '30');
+      if (!days) return;
+
+      btn.disabled = true;
+      btn.textContent = '取得中...';
+      showToast('販売データを取得中...(1-3分かかります)');
+
+      try {
+        const res = await fetch(`./api/listings/sync-sales?days=${parseInt(days)}`, { method: 'POST' });
+        const result = await res.json();
+        if (!res.ok) throw new Error(result.error);
+        showToast(`販売データ同期完了: ${result.updated}SKU更新 (過去${result.days}日)`);
+        await loadListings();
+      } catch (err) {
+        showToast('販売データ同期エラー: ' + err.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '販売データ同期';
       }
     }
 

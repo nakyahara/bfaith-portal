@@ -4,7 +4,7 @@
 import { Router } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { getProduct, getFees, createListing, patchListing, getShippingTemplates, getItemOffers, updatePrice, getActiveListingsReport } from './sp-api.js';
+import { getProduct, getFees, createListing, patchListing, getShippingTemplates, getItemOffers, updatePrice, getActiveListingsReport, getSalesCountBySku } from './sp-api.js';
 import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, deleteProduct, getSetItems, saveSetItems, syncListings as dbSyncListings, getListings, updateListing, bulkSave, getSyncMeta, getTrackingProducts, getPriceHistory, getRecentPriceHistory, savePriceHistory, updateProductPriceInfo, syncProductsFromListings } from './db.js';
 import { loadSuppliers, addSupplier, deleteSupplier } from './suppliers.js';
 import { loadShipping, addShipping, updateShipping, deleteShipping } from './shipping.js';
@@ -825,6 +825,29 @@ router.get('/api/listings/debug', async (req, res) => {
       sample,
     });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── API: 販売個数同期（注文レポートから集計） ──
+router.post('/api/listings/sync-sales', async (req, res) => {
+  try {
+    await ensureDb();
+    const days = parseInt(req.query.days) || 30;
+    console.log(`[ProfitCalc] 販売個数同期開始 (過去${days}日)...`);
+
+    const salesMap = await getSalesCountBySku(days);
+    let updated = 0;
+    for (const [sku, count] of Object.entries(salesMap)) {
+      const changes = updateListing(sku, { total_sold: count }, true);
+      if (changes > 0) updated++;
+    }
+    bulkSave();
+
+    console.log(`[ProfitCalc] 販売個数同期完了: ${updated}SKU更新`);
+    res.json({ updated, totalSkus: Object.keys(salesMap).length, days });
+  } catch (err) {
+    console.error('[ProfitCalc] 販売個数同期エラー:', err.message, err.stack);
     res.status(500).json({ error: err.message });
   }
 });
