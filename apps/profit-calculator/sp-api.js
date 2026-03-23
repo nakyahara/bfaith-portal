@@ -576,7 +576,7 @@ export async function getSalesCountBySku(days = 365) {
     operation: 'createReport',
     endpoint: 'reports',
     body: {
-      reportType: 'GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE',
+      reportType: 'GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL',
       marketplaceIds: [marketplaceId],
       dataStartTime: startStr,
       dataEndTime: endStr,
