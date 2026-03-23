@@ -220,6 +220,73 @@ export async function getShippingTemplates() {
 }
 
 /**
+ * JANコード or キーワードで Amazon商品を検索 → ASIN取得
+ */
+export async function searchByJan(jan) {
+  const sp = getClient();
+  const marketplaceId = MARKETPLACE_ID();
+
+  const result = await sp.callAPI({
+    operation: 'searchCatalogItems',
+    endpoint: 'catalogItems',
+    query: {
+      marketplaceIds: [marketplaceId],
+      identifiers: [jan],
+      identifiersType: 'EAN',
+      includedData: ['summaries', 'images'],
+      pageSize: 5,
+    },
+    options: { version: '2022-04-01' },
+  });
+
+  const items = result.items || [];
+  return items.map(item => ({
+    asin: item.asin,
+    itemName: item.summaries?.[0]?.itemName || '',
+    image: item.images?.[0]?.images?.find(i => i.variant === 'MAIN')?.link || '',
+  }));
+}
+
+/**
+ * キーワードで Amazon商品を検索
+ */
+export async function searchByKeyword(keyword) {
+  const sp = getClient();
+  const marketplaceId = MARKETPLACE_ID();
+
+  const result = await sp.callAPI({
+    operation: 'searchCatalogItems',
+    endpoint: 'catalogItems',
+    query: {
+      marketplaceIds: [marketplaceId],
+      keywords: [keyword],
+      includedData: ['summaries', 'images'],
+      pageSize: 3,
+    },
+    options: { version: '2022-04-01' },
+  });
+
+  const items = result.items || [];
+  return items.map(item => ({
+    asin: item.asin,
+    itemName: item.summaries?.[0]?.itemName || '',
+    image: item.images?.[0]?.images?.find(i => i.variant === 'MAIN')?.link || '',
+  }));
+}
+
+/**
+ * BSR（ランキング）から月間販売数を推定
+ * Amazon Japan向けの概算式（あくまで目安）
+ */
+export function estimateMonthlySales(rank) {
+  if (!rank || rank <= 0 || rank === '-') return null;
+  const r = Number(rank);
+  if (isNaN(r)) return null;
+  // 対数スケールの概算式
+  return Math.max(1, Math.round(Math.pow(10, 3.8 - 0.7 * Math.log10(r))));
+}
+
+/**
  * Amazon出品登録（Listings Items API）
  */
 export async function createListing({ asin, price, isFba, sku, condition = 'new_new', shippingTemplate = null, paymentRestriction = 'none' }) {

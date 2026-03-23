@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>一括リサーチ — リサーチ仕入れツール</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Segoe UI', 'Hiragino Sans', 'Meiryo', sans-serif; background: #eaeded; color: #0f1111; font-size: 13px; }
+    a { color: #0066c0; text-decoration: none; }
+
+    .header { background: #232f3e; color: #fff; padding: 10px 24px; display: flex; align-items: center; justify-content: space-between; }
+    .header h1 { font-size: 17px; font-weight: bold; }
+    .header h1 span { color: #ff9900; }
+    .header a { color: #ddd; font-size: 13px; }
+    .page-tabs { display: flex; background: #37475a; padding: 0 24px; }
+    .page-tab { padding: 10px 20px; color: #ccc; font-size: 13px; font-weight: bold; text-decoration: none; border-bottom: 3px solid transparent; }
+    .page-tab:hover { color: #fff; text-decoration: none; }
+    .page-tab.active { color: #fff; border-bottom-color: #ff9900; }
+    .container { max-width: 1500px; margin: 16px auto; padding: 0 16px; }
+
+    .panel { background: #fff; border: 1px solid #d5d9d9; border-radius: 8px; padding: 16px 20px; margin-bottom: 14px; }
+    .panel-title { font-size: 14px; font-weight: bold; margin-bottom: 12px; padding-bottom: 6px; border-bottom: 2px solid #ff9900; }
+
+    .btn { padding: 6px 14px; border-radius: 4px; font-size: 12px; font-weight: bold; cursor: pointer; border: 1px solid; }
+    .btn-sm { padding: 3px 10px; font-size: 11px; }
+    .btn-primary { background: #f0c14b; border-color: #a88734; color: #0f1111; }
+    .btn-primary:hover { background: #e7b83c; }
+    .btn-success { background: #f0fff0; border-color: #007600; color: #007600; }
+    .btn-danger { background: #fff0f0; border-color: #b12704; color: #b12704; }
+    .btn-start { background: #ff9900; border-color: #c77600; color: #0f1111; font-size: 14px; padding: 10px 32px; }
+    .btn-start:hover { background: #e88b00; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    /* CSV入力エリア */
+    .upload-area { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+    .upload-box { flex: 1; min-width: 300px; }
+    .upload-box textarea { width: 100%; height: 160px; border: 2px dashed #aaa; border-radius: 6px; padding: 12px; font-family: monospace; font-size: 12px; resize: vertical; }
+    .upload-box textarea:focus { border-color: #ff9900; outline: none; }
+    .upload-box .hint { font-size: 11px; color: #565959; margin-top: 4px; }
+    .upload-box input[type=file] { margin-top: 8px; font-size: 12px; }
+
+    .settings-box { width: 280px; background: #f7f8f8; border: 1px solid #d5d9d9; border-radius: 6px; padding: 14px; }
+    .settings-box h3 { font-size: 13px; font-weight: bold; margin-bottom: 10px; }
+    .setting-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; font-size: 12px; }
+    .setting-row label { color: #565959; }
+    .setting-row input, .setting-row select { width: 100px; padding: 4px 6px; border: 1px solid #aaa; border-radius: 4px; font-size: 12px; }
+
+    /* カラムマッピング */
+    .mapping-bar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 12px; padding-top: 12px; border-top: 1px solid #eee; }
+    .mapping-bar label { font-size: 11px; font-weight: bold; color: #565959; }
+    .mapping-bar select { padding: 4px 6px; border: 1px solid #aaa; border-radius: 4px; font-size: 12px; }
+
+    /* プログレス */
+    .progress-box { display: none; margin-top: 12px; }
+    .progress-bar { width: 100%; height: 24px; background: #eee; border-radius: 12px; overflow: hidden; }
+    .progress-fill { height: 100%; background: linear-gradient(90deg, #ff9900, #f0c14b); transition: width 0.3s; width: 0%; }
+    .progress-text { text-align: center; margin-top: 4px; font-size: 12px; color: #565959; }
+
+    /* 結果テーブル */
+    .results-panel { display: none; }
+    .filter-bar { background: #fff; border: 1px solid #d5d9d9; border-radius: 6px; padding: 10px 16px; margin-bottom: 12px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    .filter-bar select, .filter-bar input { padding: 5px 8px; border: 1px solid #888; border-radius: 4px; font-size: 13px; }
+    .filter-bar .count { margin-left: auto; font-size: 12px; color: #565959; }
+
+    .data-table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #d5d9d9; border-radius: 6px; overflow: hidden; }
+    .data-table th { background: #f7f8f8; padding: 8px 10px; text-align: left; font-size: 11px; color: #565959; border-bottom: 2px solid #d5d9d9; white-space: nowrap; cursor: pointer; user-select: none; }
+    .data-table th:hover { background: #eef0f2; }
+    .data-table th .sort-icon { font-size: 10px; margin-left: 3px; }
+    .data-table td { padding: 7px 10px; border-bottom: 1px solid #eee; vertical-align: middle; }
+    .data-table .thumb { width: 40px; height: 40px; object-fit: contain; border-radius: 3px; }
+    .data-table .num { text-align: right; font-variant-numeric: tabular-nums; }
+    .data-table .positive { color: #007600; }
+    .data-table .negative { color: #b12704; }
+    .data-table .product-name-cell { max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+
+    .judgment-sm { display: inline-block; width: 22px; height: 22px; line-height: 22px; border-radius: 50%; font-size: 13px; font-weight: bold; text-align: center; color: #fff; }
+    .judgment-sm.j-excellent { background: #007600; }
+    .judgment-sm.j-good { background: #0066c0; }
+    .judgment-sm.j-fair { background: #c7511f; }
+    .judgment-sm.j-poor { background: #b12704; }
+
+    .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+    .status-dot.ok { background: #007600; }
+    .status-dot.not_found { background: #888; }
+    .status-dot.no_price { background: #c7511f; }
+    .status-dot.error { background: #b12704; }
+
+    .est-sales { font-weight: bold; }
+    .est-sales.high { color: #007600; }
+    .est-sales.medium { color: #c7511f; }
+    .est-sales.low { color: #888; }
+
+    /* サマリーカード */
+    .summary-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin-bottom: 12px; }
+    .summary-card { background: #fff; border: 1px solid #d5d9d9; border-radius: 6px; padding: 12px; text-align: center; }
+    .summary-card .sc-value { font-size: 24px; font-weight: bold; }
+    .summary-card .sc-label { font-size: 11px; color: #565959; margin-top: 2px; }
+    .summary-card.good .sc-value { color: #007600; }
+    .summary-card.warn .sc-value { color: #c7511f; }
+    .summary-card.bad .sc-value { color: #b12704; }
+
+    .row-highlight { background: #f0fff0 !important; }
+    .row-dim { opacity: 0.4; }
+
+    /* チェックボックス */
+    .cb { width: 16px; height: 16px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1><span>B-Faith</span> リサーチ仕入れツール</h1>
+    <a href="/apps/profit-calculator/">← ポータルに戻る</a>
+  </div>
+  <div class="page-tabs">
+    <a href="./bulk-research" class="page-tab active">一括リサーチ</a>
+    <a href="./research" class="page-tab">リサーチ・見積もり</a>
+    <a href="./" class="page-tab">商品計算</a>
+    <a href="./products" class="page-tab">NE商品登録</a>
+    <a href="./amazon" class="page-tab">Amazon出品</a>
+    <a href="./suppliers" class="page-tab" style="margin-left:auto;">仕入れ先管理</a>
+    <a href="./shipping" class="page-tab">送料管理</a>
+  </div>
+
+  <div class="container">
+    <!-- Step 1: CSV入力 -->
+    <div class="panel" id="inputPanel">
+      <div class="panel-title">一括リサーチ — メーカー価格表をアップロード</div>
+      <div class="upload-area">
+        <div class="upload-box">
+          <textarea id="csvText" placeholder="CSVデータをここに貼り付け、またはファイルをアップロード
+
+例:
+JANコード,商品名,卸価格
+4901234567890,○○シャンプー 500ml,800
+4901234567891,○○コンディショナー 500ml,750"></textarea>
+          <div class="hint">ヘッダー行あり。JAN（またはEAN/バーコード）と卸価格が含まれるCSVを貼り付けてください。</div>
+          <input type="file" id="csvFile" accept=".csv,.tsv,.txt">
+        </div>
+        <div class="settings-box">
+          <h3>設定</h3>
+          <div class="setting-row">
+            <label>税率</label>
+            <select id="taxRate">
+              <option value="10" selected>10%</option>
+              <option value="8">8%（軽減税率）</option>
+              <option value="0">0%（税込入力）</option>
+            </select>
+          </div>
+          <div class="setting-row">
+            <label>利益率フィルタ</label>
+            <select id="profitFilter">
+              <option value="0">すべて表示</option>
+              <option value="10" selected>10%以上</option>
+              <option value="20">20%以上</option>
+              <option value="30">30%以上</option>
+            </select>
+          </div>
+          <div class="setting-row">
+            <label>出品者数上限</label>
+            <input type="number" id="maxSellers" value="15" min="1">
+          </div>
+          <div class="setting-row">
+            <label>仕入先コード</label>
+            <input type="text" id="supplierCode" placeholder="例: 0001" maxlength="4">
+          </div>
+          <div class="setting-row">
+            <label>仕入先名</label>
+            <input type="text" id="supplierName" placeholder="例: ○○メーカー" style="width: 140px;">
+          </div>
+        </div>
+      </div>
+
+      <!-- カラムマッピング -->
+      <div class="mapping-bar" id="mappingBar" style="display: none;">
+        <label>JAN列:</label>
+        <select id="colJan"></select>
+        <label>商品名列:</label>
+        <select id="colName"></select>
+        <label>卸価格列:</label>
+        <select id="colPrice"></select>
+        <span style="margin-left: auto; font-size: 12px; color: #565959;" id="previewCount"></span>
+        <button class="btn btn-start" id="startBtn" onclick="startResearch()">リサーチ開始</button>
+      </div>
+
+      <!-- プログレス -->
+      <div class="progress-box" id="progressBox">
+        <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+        <div class="progress-text" id="progressText">処理中...</div>
+      </div>
+    </div>
+
+    <!-- Step 2: 結果表示 -->
+    <div class="results-panel" id="resultsPanel">
+      <!-- サマリー -->
+      <div class="summary-cards" id="summaryCards">
+        <div class="summary-card"><div class="sc-value" id="sumTotal">0</div><div class="sc-label">全件数</div></div>
+        <div class="summary-card good"><div class="sc-value" id="sumGood">0</div><div class="sc-label">利益率10%+</div></div>
+        <div class="summary-card"><div class="sc-value" id="sumExcellent">0</div><div class="sc-label">◎ 30%+</div></div>
+        <div class="summary-card"><div class="sc-value" id="sumNotFound">0</div><div class="sc-label">未発見</div></div>
+        <div class="summary-card"><div class="sc-value" id="sumErrors">0</div><div class="sc-label">エラー</div></div>
+      </div>
+
+      <!-- フィルタ & アクション -->
+      <div class="filter-bar">
+        <select id="resultFilter" onchange="applyFilter()">
+          <option value="all">すべて</option>
+          <option value="profitable" selected>利益あり (フィルタ適用)</option>
+          <option value="excellent">◎ 30%以上</option>
+          <option value="good">○ 20%以上</option>
+          <option value="fair">△ 10%以上</option>
+          <option value="ok">取得成功のみ</option>
+          <option value="not_found">未発見のみ</option>
+        </select>
+        <select id="sortBy" onchange="applyFilter()">
+          <option value="profitRate-desc">利益率 高い順</option>
+          <option value="profitRate-asc">利益率 低い順</option>
+          <option value="profit-desc">利益額 高い順</option>
+          <option value="estSales-desc">推定販売数 多い順</option>
+          <option value="salesRank-asc">ランキング 高い順</option>
+          <option value="offerCount-asc">出品者数 少ない順</option>
+          <option value="idx-asc">CSV順</option>
+        </select>
+        <button class="btn btn-success btn-sm" onclick="saveSelected()">選択をリサーチに保存</button>
+        <button class="btn btn-primary btn-sm" onclick="exportCsv()">結果CSVダウンロード</button>
+        <span class="count" id="resultCount"></span>
+      </div>
+
+      <!-- テーブル -->
+      <table class="data-table" id="resultTable">
+        <thead>
+          <tr>
+            <th><input type="checkbox" class="cb" id="cbAll" onchange="toggleAll(this.checked)"></th>
+            <th></th>
+            <th>ASIN</th>
+            <th>商品名</th>
+            <th>JAN</th>
+            <th class="num">卸価格</th>
+            <th class="num">販売価格</th>
+            <th class="num">手数料</th>
+            <th class="num">利益</th>
+            <th class="num">利益率</th>
+            <th>判定</th>
+            <th class="num">ランキング</th>
+            <th class="num">推定月販</th>
+            <th class="num">出品者</th>
+            <th>ステータス</th>
+          </tr>
+        </thead>
+        <tbody id="resultBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+<script>
+// ===== State =====
+let allResults = [];
+let parsedRows = [];
+let headers = [];
+
+// ===== CSV パース =====
+document.getElementById('csvFile').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (ev) => {
+    document.getElementById('csvText').value = ev.target.result;
+    parseCsv(ev.target.result);
+  };
+  reader.readAsText(file, 'UTF-8');
+});
+
+document.getElementById('csvText').addEventListener('input', (e) => {
+  parseCsv(e.target.value);
+});
+
+function parseCsv(text) {
+  if (!text.trim()) {
+    document.getElementById('mappingBar').style.display = 'none';
+    return;
+  }
+
+  // タブ区切り or カンマ区切り 自動判定
+  const sep = text.includes('\t') ? '\t' : ',';
+  const lines = text.trim().split('\n').map(l => l.trim()).filter(l => l);
+  if (lines.length < 2) return;
+
+  headers = lines[0].split(sep).map(h => h.replace(/^["']|["']$/g, '').trim());
+  parsedRows = lines.slice(1).map(line => {
+    const vals = line.split(sep).map(v => v.replace(/^["']|["']$/g, '').trim());
+    const row = {};
+    headers.forEach((h, i) => { row[h] = vals[i] || ''; });
+    return row;
+  });
+
+  // カラムマッピングのselect生成
+  populateMapping('colJan', headers, ['JAN', 'jan', 'JANコード', 'EAN', 'ean', 'バーコード', 'barcode', 'GTIN']);
+  populateMapping('colName', headers, ['商品名', '品名', 'Name', 'name', 'product_name', '品番', '名称']);
+  populateMapping('colPrice', headers, ['卸価格', '仕入価格', '単価', '原価', '卸値', 'cost', 'price', '仕入れ価格', '税抜単価', '税抜', '掛率後単価']);
+
+  document.getElementById('mappingBar').style.display = 'flex';
+  document.getElementById('previewCount').textContent = `${parsedRows.length} 件検出`;
+}
+
+function populateMapping(selectId, cols, prefixes) {
+  const sel = document.getElementById(selectId);
+  sel.innerHTML = '<option value="">(未選択)</option>';
+  cols.forEach(c => {
+    const opt = document.createElement('option');
+    opt.value = c;
+    opt.textContent = c;
+    sel.appendChild(opt);
+  });
+
+  // 自動マッチ
+  for (const pf of prefixes) {
+    const match = cols.find(c => c.toLowerCase().includes(pf.toLowerCase()));
+    if (match) { sel.value = match; break; }
+  }
+}
+
+// ===== リサーチ実行 =====
+async function startResearch() {
+  const colJan = document.getElementById('colJan').value;
+  const colName = document.getElementById('colName').value;
+  const colPrice = document.getElementById('colPrice').value;
+
+  if (!colPrice) {
+    alert('卸価格の列を選択してください');
+    return;
+  }
+  if (!colJan && !colName) {
+    alert('JANコードまたは商品名の列を選択してください');
+    return;
+  }
+
+  const items = parsedRows.map(row => ({
+    jan: colJan ? row[colJan] : '',
+    productName: colName ? row[colName] : '',
+    wholesalePrice: parseFloat(String(row[colPrice]).replace(/[,，]/g, '')) || 0,
+  })).filter(item => item.wholesalePrice > 0 && (item.jan || item.productName));
+
+  if (items.length === 0) {
+    alert('有効なデータがありません（卸価格が0または空の行は除外されます）');
+    return;
+  }
+
+  // UI更新
+  document.getElementById('startBtn').disabled = true;
+  document.getElementById('progressBox').style.display = 'block';
+  document.getElementById('resultsPanel').style.display = 'block';
+  allResults = [];
+  document.getElementById('resultBody').innerHTML = '';
+  updateSummary();
+
+  const taxRate = parseInt(document.getElementById('taxRate').value);
+
+  try {
+    const response = await fetch('./api/bulk-research/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items, taxRate }),
+    });
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop(); // 未完了の行を残す
+
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          const data = JSON.parse(line.slice(6));
+          const eventLine = lines[lines.indexOf(line) - 1];
+          // event行を探す
+          handleEvent(data);
+        } else if (line.startsWith('event: ')) {
+          // 次のdata行と一緒に処理される
+        }
+      }
+    }
+  } catch (err) {
+    console.error('SSE error:', err);
+    alert('通信エラー: ' + err.message);
+  }
+
+  document.getElementById('startBtn').disabled = false;
+}
+
+function handleEvent(data) {
+  if (data.current !== undefined && data.total !== undefined && data.status === undefined) {
+    // progress
+    const pct = Math.round((data.current / data.total) * 100);
+    document.getElementById('progressFill').style.width = pct + '%';
+    document.getElementById('progressText').textContent =
+      `処理中... ${data.current}/${data.total} (${data.jan || data.productName || ''})`;
+  } else if (data.status !== undefined) {
+    // result
+    allResults.push(data);
+    updateSummary();
+    applyFilter();
+    // スクロール
+    if (data.total) {
+      const pct = Math.round((data.idx / data.total) * 100);
+      document.getElementById('progressFill').style.width = pct + '%';
+    }
+  } else if (data.total !== undefined && data.current === undefined) {
+    // complete or start
+    if (allResults.length > 0) {
+      document.getElementById('progressText').textContent =
+        `完了! ${allResults.length} 件処理しました`;
+    }
+  }
+}
+
+// ===== 結果テーブル =====
+function applyFilter() {
+  const filter = document.getElementById('resultFilter').value;
+  const sortBy = document.getElementById('sortBy').value;
+  const profitMin = parseInt(document.getElementById('profitFilter').value);
+  const maxSellers = parseInt(document.getElementById('maxSellers').value) || 999;
+
+  let filtered = [...allResults];
+
+  // ステータスフィルタ
+  switch (filter) {
+    case 'profitable':
+      filtered = filtered.filter(r => r.status === 'ok' && r.profitRate >= profitMin && r.offerCount <= maxSellers);
+      break;
+    case 'excellent':
+      filtered = filtered.filter(r => r.status === 'ok' && r.profitRate >= 30);
+      break;
+    case 'good':
+      filtered = filtered.filter(r => r.status === 'ok' && r.profitRate >= 20);
+      break;
+    case 'fair':
+      filtered = filtered.filter(r => r.status === 'ok' && r.profitRate >= 10);
+      break;
+    case 'ok':
+      filtered = filtered.filter(r => r.status === 'ok');
+      break;
+    case 'not_found':
+      filtered = filtered.filter(r => r.status === 'not_found');
+      break;
+  }
+
+  // ソート
+  const [key, dir] = sortBy.split('-');
+  filtered.sort((a, b) => {
+    let va = a[key] ?? (dir === 'asc' ? Infinity : -Infinity);
+    let vb = b[key] ?? (dir === 'asc' ? Infinity : -Infinity);
+    if (typeof va === 'string') va = va === '-' ? (dir === 'asc' ? Infinity : -Infinity) : Number(va) || 0;
+    if (typeof vb === 'string') vb = vb === '-' ? (dir === 'asc' ? Infinity : -Infinity) : Number(vb) || 0;
+    return dir === 'asc' ? va - vb : vb - va;
+  });
+
+  renderTable(filtered);
+  document.getElementById('resultCount').textContent = `${filtered.length} / ${allResults.length} 件`;
+}
+
+function renderTable(rows) {
+  const tbody = document.getElementById('resultBody');
+  tbody.innerHTML = '';
+
+  for (const r of rows) {
+    const tr = document.createElement('tr');
+    if (r.status !== 'ok') tr.classList.add('row-dim');
+
+    const jClass = r.judgment === '◎' ? 'j-excellent' : r.judgment === '○' ? 'j-good' : r.judgment === '△' ? 'j-fair' : 'j-poor';
+    const profitClass = (r.profit || 0) >= 0 ? 'positive' : 'negative';
+
+    // 推定月販の色分け
+    let estClass = 'low';
+    if (r.estMonthlySales >= 30) estClass = 'high';
+    else if (r.estMonthlySales >= 10) estClass = 'medium';
+
+    tr.innerHTML = `
+      <td><input type="checkbox" class="cb row-cb" data-idx="${r.idx}" ${r.status === 'ok' && (r.profitRate||0) >= 10 ? '' : ''}></td>
+      <td>${r.image ? `<img src="${r.image}" class="thumb" loading="lazy">` : '-'}</td>
+      <td>${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="font-weight:bold;font-size:12px;">${r.asin}</a>` : '-'}</td>
+      <td class="product-name-cell" title="${escHtml(r.amazonName || r.productName || '')}">${escHtml(r.amazonName || r.productName || '')}</td>
+      <td style="font-size:11px;">${r.jan || '-'}</td>
+      <td class="num">${r.wholesalePrice ? '¥' + fmt(r.wholesalePrice) : '-'}</td>
+      <td class="num">${r.sellingPrice ? '¥' + fmt(r.sellingPrice) : '-'}</td>
+      <td class="num" style="font-size:11px;">${r.totalFee ? '¥' + fmt(r.totalFee) : '-'}</td>
+      <td class="num ${profitClass}" style="font-weight:bold;">${r.profit !== undefined ? (r.profit >= 0 ? '¥' : '-¥') + fmt(Math.abs(r.profit || 0)) : '-'}</td>
+      <td class="num ${profitClass}" style="font-weight:bold;">${r.profitRate !== undefined ? r.profitRate + '%' : '-'}</td>
+      <td>${r.judgment ? `<span class="judgment-sm ${jClass}">${r.judgment}</span>` : '-'}</td>
+      <td class="num" style="font-size:11px;">${r.salesRank && r.salesRank !== '-' ? '#' + fmt(r.salesRank) : '-'}</td>
+      <td class="num"><span class="est-sales ${estClass}">${r.estMonthlySales ? '~' + r.estMonthlySales + '個/月' : '-'}</span></td>
+      <td class="num">${r.offerCount !== undefined ? r.offerCount + '人' : '-'}</td>
+      <td><span class="status-dot ${r.status}"></span>${statusLabel(r.status, r.message)}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
+
+function statusLabel(status, msg) {
+  switch (status) {
+    case 'ok': return 'OK';
+    case 'not_found': return '未発見';
+    case 'no_price': return '価格なし';
+    case 'error': return `エラー`;
+    default: return status;
+  }
+}
+
+// ===== サマリー更新 =====
+function updateSummary() {
+  const ok = allResults.filter(r => r.status === 'ok');
+  document.getElementById('sumTotal').textContent = allResults.length;
+  document.getElementById('sumGood').textContent = ok.filter(r => (r.profitRate || 0) >= 10).length;
+  document.getElementById('sumExcellent').textContent = ok.filter(r => (r.profitRate || 0) >= 30).length;
+  document.getElementById('sumNotFound').textContent = allResults.filter(r => r.status === 'not_found').length;
+  document.getElementById('sumErrors').textContent = allResults.filter(r => r.status === 'error').length;
+}
+
+// ===== リサーチDB保存 =====
+async function saveSelected() {
+  const checked = [...document.querySelectorAll('.row-cb:checked')].map(cb => parseInt(cb.dataset.idx));
+  if (checked.length === 0) {
+    alert('保存する商品を選択してください');
+    return;
+  }
+
+  const supplierCode = document.getElementById('supplierCode').value;
+  const supplierName = document.getElementById('supplierName').value;
+  const taxRate = parseInt(document.getElementById('taxRate').value);
+
+  let saved = 0;
+  for (const idx of checked) {
+    const r = allResults.find(x => x.idx === idx);
+    if (!r || r.status !== 'ok') continue;
+
+    try {
+      await fetch('./api/research', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          asin: r.asin,
+          productName: r.amazonName || r.productName,
+          amazonUrl: `https://www.amazon.co.jp/dp/${r.asin}`,
+          imageUrl: r.image,
+          category: r.category,
+          salesRank: r.salesRank,
+          offerCount: r.offerCount,
+          jan: r.jan,
+          supplierCode,
+          supplierName,
+          wholesalePrice: r.wholesalePrice,
+          taxRate,
+          wholesalePriceWithTax: r.wholesalePriceWithTax,
+          sellingPrice: r.sellingPrice,
+          referralFee: r.referralFee,
+          fbaFee: r.fbaFee,
+          totalFee: r.totalFee,
+          profit: r.profit,
+          profitRate: r.profitRate,
+          judgment: r.judgment,
+          fulfillment: 'FBA',
+        }),
+      });
+      saved++;
+    } catch (e) {
+      console.error('保存エラー:', e);
+    }
+  }
+  alert(`${saved} 件をリサーチに保存しました`);
+}
+
+// ===== CSV エクスポート =====
+function exportCsv() {
+  const ok = allResults.filter(r => r.status === 'ok');
+  if (ok.length === 0) { alert('エクスポートするデータがありません'); return; }
+
+  const header = ['JAN', 'ASIN', '商品名', 'カテゴリ', '卸価格(税抜)', '卸価格(税込)', '販売価格', '手数料合計', '利益', '利益率%', '判定', 'ランキング', '推定月販', '出品者数', 'メーカー'];
+  const rows = ok.map(r => [
+    r.jan, r.asin, r.amazonName || r.productName, r.category,
+    r.wholesalePrice, r.wholesalePriceWithTax, r.sellingPrice,
+    r.totalFee, r.profit, r.profitRate, r.judgment,
+    r.salesRank, r.estMonthlySales, r.offerCount, r.manufacturer,
+  ]);
+
+  const csvQ = (v) => { const s = String(v ?? ''); return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s.replace(/"/g, '""')}"` : s; };
+  const csv = '\uFEFF' + header.join(',') + '\n' + rows.map(r => r.map(csvQ).join(',')).join('\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `一括リサーチ結果_${new Date().toISOString().slice(0,10)}.csv`;
+  a.click();
+}
+
+// ===== ユーティリティ =====
+function fmt(n) { return Number(n).toLocaleString(); }
+function escHtml(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+function toggleAll(checked) { document.querySelectorAll('.row-cb').forEach(cb => { cb.checked = checked; }); }
+</script>
+</body>
+</html>
