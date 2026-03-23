@@ -611,7 +611,7 @@ export function getListings() {
   return queryAll('SELECT * FROM listings ORDER BY product_name');
 }
 
-export function updateListing(sku, data) {
+export function updateListing(sku, data, skipSave = false) {
   const EDITABLE = new Set([
     'price', 'quantity', 'cost_price', 'loss_stopper', 'high_stopper',
     'price_tracking', 'point', 'status',
@@ -624,10 +624,16 @@ export function updateListing(sku, data) {
       params.push(value === undefined ? null : value);
     }
   }
-  if (fields.length === 0) return;
+  if (fields.length === 0) return 0;
   fields.push("last_updated = datetime('now','localtime')");
   params.push(sku);
   db.run(`UPDATE listings SET ${fields.join(', ')} WHERE sku = ?`, params);
+  const changes = db.getRowsModified();
+  if (!skipSave) saveToFile();
+  return changes;
+}
+
+export function bulkSave() {
   saveToFile();
 }
 

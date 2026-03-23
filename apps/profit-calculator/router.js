@@ -5,7 +5,7 @@ import { Router } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { getProduct, getFees, createListing, patchListing, getShippingTemplates, getItemOffers, updatePrice, getActiveListingsReport } from './sp-api.js';
-import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, deleteProduct, getSetItems, saveSetItems, syncListings as dbSyncListings, getListings, updateListing, getSyncMeta, getTrackingProducts, getPriceHistory, getRecentPriceHistory, savePriceHistory, updateProductPriceInfo, syncProductsFromListings } from './db.js';
+import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, deleteProduct, getSetItems, saveSetItems, syncListings as dbSyncListings, getListings, updateListing, bulkSave, getSyncMeta, getTrackingProducts, getPriceHistory, getRecentPriceHistory, savePriceHistory, updateProductPriceInfo, syncProductsFromListings } from './db.js';
 import { loadSuppliers, addSupplier, deleteSupplier } from './suppliers.js';
 import { loadShipping, addShipping, updateShipping, deleteShipping } from './shipping.js';
 import { getSetting, setSetting, getAllSettings } from './settings.js';
@@ -852,31 +852,38 @@ router.post('/api/listings/import-csv', csvUpload.single('file'), async (req, re
     let updated = 0, skipped = 0;
     for (let i = 1; i < lines.length; i++) {
       const cols = parseCSVLine(lines[i]);
-      const sku = (cols[skuIdx] || '').replace(/^="/, '').replace(/"$/, '').trim();
+      // プライスターCSVは ="値" 形式 → = と " を全て除去
+      const cleanVal = (v) => (v || '').replace(/^[="]+/, '').replace(/[="]+$/, '').trim();
+      const sku = cleanVal(cols[skuIdx]);
       if (!sku) continue;
 
       const updates = {};
       if (costIdx >= 0) {
-        const cost = parseFloat(cols[costIdx]) || 0;
+        const cost = parseFloat(cleanVal(cols[costIdx])) || 0;
         if (cost > 0) updates.cost_price = cost;
       }
       if (akajiIdx >= 0) {
-        const akaji = parseFloat(cols[akajiIdx]) || 0;
+        const akaji = parseFloat(cleanVal(cols[akajiIdx])) || 0;
         if (akaji > 0) updates.loss_stopper = akaji;
       }
       if (takaneIdx >= 0) {
-        const takane = parseFloat(cols[takaneIdx]) || 0;
+        const takane = parseFloat(cleanVal(cols[takaneIdx])) || 0;
         if (takane > 0) updates.high_stopper = takane;
       }
 
       if (Object.keys(updates).length > 0) {
-        updateListing(sku, updates);
-        updated++;
+        const changes = updateListing(sku, updates, true); // skipSave=true for bulk
+        if (changes > 0) {
+          updated++;
+        } else {
+          skipped++; // SKUがDBに存在しない
+        }
       } else {
         skipped++;
       }
     }
 
+    bulkSave(); // 一括保存
     console.log(`[ProfitCalc] CSVインポート完了: 更新${updated}件, スキップ${skipped}件`);
     res.json({ updated, skipped, total: lines.length - 1 });
   } catch (err) {
