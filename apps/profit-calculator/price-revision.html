@@ -783,9 +783,17 @@
 
         const result = await res.json();
         document.getElementById('progressFill').style.width = '100%';
-        const salesMsg = result.sales && !result.sales.error ? ` + 販売データ${result.sales.salesUpdated}SKU` : '';
-        document.getElementById('syncMsg').textContent = `完了: ${result.count}件取得${salesMsg}`;
 
+        let salesMsg = '';
+        if (result.sales && !result.sales.error) {
+          salesMsg = ` + 販売データ${result.sales.salesUpdated}SKU更新`;
+        } else if (result.sales && result.sales.error) {
+          salesMsg = ` ⚠ 販売データ取得失敗: ${result.sales.error}`;
+        } else {
+          salesMsg = ' ⚠ 販売データ未取得';
+        }
+
+        document.getElementById('syncMsg').textContent = `完了: ${result.count}件取得${salesMsg}`;
         showToast(`Amazon同期完了: ${result.count}件${salesMsg}`);
         await loadListings();
       } catch (err) {
@@ -797,7 +805,7 @@
         btn.textContent = 'Amazonから同期';
         setTimeout(() => {
           document.getElementById('syncProgress').style.display = 'none';
-        }, 3000);
+        }, 5000);
       }
     }
 

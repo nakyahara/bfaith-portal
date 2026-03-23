@@ -975,7 +975,7 @@ router.post('/api/listings/sync', async (req, res) => {
       salesResult = { salesUpdated, totalSkus: Object.keys(salesMap).length };
       console.log(`[ProfitCalc] 販売データ同期完了: ${salesUpdated}SKU更新`);
     } catch (salesErr) {
-      console.error('[ProfitCalc] 販売データ取得エラー (続行):', salesErr.message);
+      console.error('[ProfitCalc] 販売データ取得エラー (続行):', salesErr.message, salesErr.stack);
       salesResult = { error: salesErr.message };
     }
 
