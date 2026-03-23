@@ -962,8 +962,8 @@ router.post('/api/listings/sync', async (req, res) => {
     // 販売データも同時に取得（バックグラウンドで実行、レスポンスは先に返す）
     let salesResult = null;
     try {
-      console.log('[ProfitCalc] 販売データ取得開始 (過去365日)...');
-      const salesMap = await getSalesCountBySku(365);
+      console.log('[ProfitCalc] 販売データ取得開始 (過去30日)...');
+      const salesMap = await getSalesCountBySku(30);
       let salesUpdated = 0;
       for (const [sku, data] of Object.entries(salesMap)) {
         const updates = { total_sold: data.count };
