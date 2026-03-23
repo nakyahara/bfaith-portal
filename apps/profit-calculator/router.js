@@ -728,29 +728,76 @@ router.post('/api/listings/sync', async (req, res) => {
     await ensureDb();
     console.log('[ProfitCalc] Amazon出品レポート同期開始...');
     const report = await getActiveListingsReport();
+    console.log('[ProfitCalc] レポートヘッダー:', report.headers.join(', '));
+    console.log('[ProfitCalc] レポート行数:', report.totalCount);
+
+    // サンプル1行目のキーと値をログ出力（デバッグ用）
+    if (report.listings.length > 0) {
+      const sample = report.listings[0];
+      console.log('[ProfitCalc] サンプル行キー:', Object.keys(sample).join(', '));
+      console.log('[ProfitCalc] サンプル行値:', JSON.stringify(sample).slice(0, 500));
+    }
 
     // TSVヘッダーキー → listingsテーブルのキーにマッピング
-    const mapped = report.listings.map(row => ({
-      sku: row['seller-sku'] || '',
-      asin: row['asin1'] || row['asin'] || '',
-      product_name: row['item-name'] || '',
-      image_url: row['image-url'] || '',
-      price: parseFloat(row['price']) || 0,
-      shipping_price: parseFloat(row['expedited-shipping']) || 0,
-      quantity: parseInt(row['quantity']) || 0,
-      status: row['status'] || 'Active',
-      condition: row['item-condition'] || '',
-      fulfillment: (row['fulfillment-channel'] || '').includes('AMAZON') ? 'FBA' : 'FBM',
-      open_date: row['open-date'] || '',
-      listing_id: row['listing-id'] || '',
-      item_description: row['item-description'] || '',
-    })).filter(item => item.sku);
+    // ヘッダーは英語の場合もShift_JIS日本語の場合もあるので、
+    // 各行のキーを柔軟にマッチさせる
+    const mapped = report.listings.map(row => {
+      // ヘッダー名候補を試してマッチさせるヘルパー
+      const get = (...keys) => {
+        for (const k of keys) {
+          if (row[k] !== undefined && row[k] !== '') return row[k];
+        }
+        return '';
+      };
+
+      return {
+        sku: get('seller-sku', 'Seller SKU', 'seller_sku', '出品者SKU'),
+        asin: get('asin1', 'ASIN1', 'asin', 'ASIN'),
+        product_name: get('item-name', 'Item Name', 'item_name', '商品名'),
+        image_url: get('image-url', 'Image URL', 'image_url', '画像URL'),
+        price: parseFloat(get('price', 'Price', '価格')) || 0,
+        shipping_price: parseFloat(get('expedited-shipping', 'Expedited Shipping', '配送料')) || 0,
+        quantity: parseInt(get('quantity', 'Quantity', '数量')) || 0,
+        status: get('status', 'Status', 'ステータス') || 'Active',
+        condition: get('item-condition', 'Item Condition', 'コンディション') || '',
+        fulfillment: (get('fulfillment-channel', 'Fulfillment Channel', 'フルフィルメントチャネル') || '').toUpperCase().includes('AMAZON') ? 'FBA' : 'FBM',
+        open_date: get('open-date', 'Open Date', 'open_date', '出品日'),
+        listing_id: get('listing-id', 'Listing ID', 'listing_id'),
+        item_description: get('item-description', 'Item Description', 'item_description', '商品説明'),
+      };
+    }).filter(item => item.sku);
+
+    console.log(`[ProfitCalc] マッピング後: ${mapped.length}件 (SKUあり)`);
+    if (mapped.length > 0) {
+      console.log('[ProfitCalc] マッピング例:', JSON.stringify(mapped[0]));
+    }
 
     dbSyncListings(mapped);
-    console.log(`[ProfitCalc] 同期完了: ${mapped.length}件`);
+    console.log(`[ProfitCalc] DB保存完了: ${mapped.length}件`);
     res.json({ count: mapped.length, message: '同期完了' });
   } catch (err) {
     console.error('[ProfitCalc] 同期エラー:', err.message, err.stack);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── API: listings デバッグ情報 ──
+router.get('/api/listings/debug', async (req, res) => {
+  try {
+    await ensureDb();
+    const listings = getListings();
+    const withQty = listings.filter(l => (l.quantity || 0) > 0);
+    const sample = listings.slice(0, 3).map(l => ({
+      sku: l.sku, asin: l.asin, product_name: (l.product_name || '').slice(0, 30),
+      price: l.price, quantity: l.quantity, status: l.status, fulfillment: l.fulfillment,
+    }));
+    res.json({
+      total: listings.length,
+      withQuantity: withQty.length,
+      lastSync: getSyncMeta('listings_last_sync'),
+      sample,
+    });
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });

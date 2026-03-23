@@ -558,53 +558,45 @@ export function getProductById(id) {
 // ===== Listings（在庫一覧・価格改定用） =====
 
 export function upsertListing(item) {
-  db.run(`
-    INSERT OR REPLACE INTO listings (
-      sku, asin, product_name, image_url, price, shipping_price,
-      quantity, status, condition, fulfillment, open_date,
-      listing_id, item_description,
-      cost_price, loss_stopper, high_stopper, price_tracking, point,
-      referral_fee, fba_fee,
-      buybox_price, buybox_shipping, buybox_points, buybox_condition, offers_updated,
-      total_sold, last_updated, old_price, price_changed,
-      synced_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,
-      COALESCE(?, (SELECT cost_price FROM listings WHERE sku = ?)),
-      COALESCE(?, (SELECT loss_stopper FROM listings WHERE sku = ?)),
-      COALESCE(?, (SELECT high_stopper FROM listings WHERE sku = ?)),
-      COALESCE(?, (SELECT price_tracking FROM listings WHERE sku = ?)),
-      COALESCE(?, (SELECT point FROM listings WHERE sku = ?)),
-      ?,?,
-      COALESCE(?, (SELECT buybox_price FROM listings WHERE sku = ?)),
-      COALESCE(?, (SELECT buybox_shipping FROM listings WHERE sku = ?)),
-      COALESCE(?, (SELECT buybox_points FROM listings WHERE sku = ?)),
-      COALESCE(?, (SELECT buybox_condition FROM listings WHERE sku = ?)),
-      COALESCE(?, (SELECT offers_updated FROM listings WHERE sku = ?)),
-      COALESCE(?, (SELECT total_sold FROM listings WHERE sku = ?)),
-      datetime('now','localtime'),
-      (SELECT price FROM listings WHERE sku = ?),
-      CASE WHEN (SELECT price FROM listings WHERE sku = ?) IS NOT NULL AND (SELECT price FROM listings WHERE sku = ?) != ? THEN 1 ELSE 0 END,
-      datetime('now','localtime')
-    )
-  `, [
-    item.sku, item.asin, item.product_name, item.image_url, item.price, item.shipping_price || 0,
-    item.quantity, item.status, item.condition, item.fulfillment, item.open_date,
-    item.listing_id, item.item_description,
-    item.cost_price || null, item.sku,
-    item.loss_stopper || null, item.sku,
-    item.high_stopper || null, item.sku,
-    item.price_tracking || null, item.sku,
-    item.point || null, item.sku,
-    item.referral_fee || 0, item.fba_fee || 0,
-    item.buybox_price || null, item.sku,
-    item.buybox_shipping || null, item.sku,
-    item.buybox_points || null, item.sku,
-    item.buybox_condition || null, item.sku,
-    item.offers_updated || null, item.sku,
-    item.total_sold || null, item.sku,
-    item.sku,
-    item.sku, item.sku, item.price,
-  ]);
+  // 既存レコードがあるか確認
+  const existing = queryAll('SELECT * FROM listings WHERE sku = ?', [item.sku]);
+
+  if (existing.length > 0) {
+    const old = existing[0];
+    // 既存レコードの場合: レポートで更新されるフィールドだけ上書き、ユーザー設定は保持
+    db.run(`
+      UPDATE listings SET
+        asin = ?, product_name = ?, image_url = ?, price = ?, shipping_price = ?,
+        quantity = ?, status = ?, condition = ?, fulfillment = ?, open_date = ?,
+        listing_id = ?, item_description = ?,
+        old_price = CASE WHEN price != ? THEN price ELSE old_price END,
+        price_changed = CASE WHEN price != ? THEN 1 ELSE 0 END,
+        last_updated = datetime('now','localtime'),
+        synced_at = datetime('now','localtime')
+      WHERE sku = ?
+    `, [
+      item.asin, item.product_name, item.image_url, item.price, item.shipping_price || 0,
+      item.quantity, item.status, item.condition, item.fulfillment, item.open_date,
+      item.listing_id, item.item_description,
+      item.price, item.price,
+      item.sku,
+    ]);
+  } else {
+    // 新規レコード
+    db.run(`
+      INSERT INTO listings (
+        sku, asin, product_name, image_url, price, shipping_price,
+        quantity, status, condition, fulfillment, open_date,
+        listing_id, item_description,
+        price_tracking, synced_at
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'))
+    `, [
+      item.sku, item.asin, item.product_name, item.image_url, item.price, item.shipping_price || 0,
+      item.quantity, item.status, item.condition, item.fulfillment, item.open_date,
+      item.listing_id, item.item_description,
+      'しない',
+    ]);
+  }
 }
 
 export function syncListings(listings) {
