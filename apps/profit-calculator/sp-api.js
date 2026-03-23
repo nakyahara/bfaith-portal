@@ -633,27 +633,35 @@ export async function getSalesCountBySku(days = 365) {
   }
 
   const lines = text.split('\n').filter(l => l.trim());
-  const headers = lines[0].split('\t').map(h => h.trim());
-  console.log(`[SP-API] 注文レポートヘッダー: ${headers.join(', ')}`);
+  // BOM除去 + 全角半角・記号差異を吸収
+  const headers = lines[0].replace(/^\uFEFF/, '').split('\t').map(h => h.trim());
+  console.log(`[SP-API] 注文レポートヘッダー(${headers.length}列): ${headers.join(', ')}`);
 
-  // SKU列とquantity列を探す
+  // カラム名検索: 部分一致も試みる
   const findIdx = (...candidates) => {
+    // 完全一致（大文字小文字・空白→ハイフン変換）
     for (const c of candidates) {
-      const idx = headers.findIndex(h => h.toLowerCase().replace(/\s+/g, '-') === c.toLowerCase());
+      const idx = headers.findIndex(h => h.toLowerCase().replace(/[\s_]+/g, '-') === c.toLowerCase().replace(/[\s_]+/g, '-'));
+      if (idx >= 0) return idx;
+    }
+    // 部分一致フォールバック
+    for (const c of candidates) {
+      const idx = headers.findIndex(h => h.toLowerCase().includes(c.toLowerCase()));
       if (idx >= 0) return idx;
     }
     return -1;
   };
 
-  const skuIdx = findIdx('sku', 'seller-sku');
-  const qtyIdx = findIdx('quantity', 'quantity-purchased');
-  const statusIdx = findIdx('order-status', 'item-status');
-  const dateIdx = findIdx('purchase-date', 'last-updated-date', 'payments-date');
+  // 日本語・英語両方のカラム名に対応
+  const skuIdx = findIdx('sku', 'seller-sku', '出品者SKU');
+  const qtyIdx = findIdx('quantity', 'quantity-purchased', '数量');
+  const statusIdx = findIdx('order-status', 'item-status', '注文ステータス', '商品ステータス');
+  const dateIdx = findIdx('purchase-date', 'last-updated-date', 'payments-date', '購入日', '購入日時', '最終更新日');
 
   if (skuIdx < 0 || qtyIdx < 0) {
     console.log(`[SP-API] SKU列=${skuIdx}, 数量列=${qtyIdx} — ヘッダー不一致`);
     console.log('[SP-API] ヘッダー詳細:', JSON.stringify(headers));
-    throw new Error('注文レポートのSKUまたは数量列が見つかりません');
+    throw new Error(`注文レポートのSKUまたは数量列が見つかりません。ヘッダー: ${headers.slice(0, 20).join(', ')}`);
   }
 
   // SKU別に数量＋最終販売日を集計（キャンセル除外）
