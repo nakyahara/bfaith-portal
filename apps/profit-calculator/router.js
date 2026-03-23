@@ -4,7 +4,7 @@
 import { Router } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { getProduct, getFees, createListing, patchListing, getShippingTemplates, getItemOffers, updatePrice, getActiveListingsReport, getSalesCountBySku } from './sp-api.js';
+import { getProduct, getFees, createListing, patchListing, getShippingTemplates, getItemOffers, updatePrice, getActiveListingsReport, getSalesCountBySku, searchByJan, searchByKeyword, estimateMonthlySales } from './sp-api.js';
 import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, deleteProduct, getSetItems, saveSetItems, syncListings as dbSyncListings, getListings, updateListing, bulkSave, getSyncMeta, getTrackingProducts, getPriceHistory, getRecentPriceHistory, savePriceHistory, updateProductPriceInfo, syncProductsFromListings } from './db.js';
 import { loadSuppliers, addSupplier, deleteSupplier } from './suppliers.js';
 import { loadShipping, addShipping, updateShipping, deleteShipping } from './shipping.js';
@@ -623,6 +623,135 @@ router.get('/api/translate', async (req, res) => {
     console.error('[Translate]', err.message);
     res.json({ english: '', error: err.message });
   }
+});
+
+// ── ページ: 一括リサーチ ──
+router.get('/bulk-research', (req, res) => {
+  res.sendFile(path.join(__dirname, 'bulk-research.html'));
+});
+
+// ── API: 一括リサーチ（SSE ストリーミング） ──
+router.post('/api/bulk-research/stream', async (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+  });
+
+  const send = (event, data) => {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+
+  const { items, taxRate = 10 } = req.body;
+  if (!items || !Array.isArray(items) || items.length === 0) {
+    send('error', { message: 'アイテムが指定されていません' });
+    res.end();
+    return;
+  }
+
+  send('start', { total: items.length });
+
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    const { jan, productName, wholesalePrice } = item;
+    const idx = i + 1;
+
+    try {
+      send('progress', { current: idx, total: items.length, jan, productName });
+
+      // Step 1: JANコードでASIN検索（JANがなければキーワード検索）
+      let candidates = [];
+      if (jan) {
+        candidates = await searchByJan(jan);
+      }
+      if (candidates.length === 0 && productName) {
+        candidates = await searchByKeyword(productName);
+      }
+
+      if (candidates.length === 0) {
+        send('result', {
+          idx, jan, productName, wholesalePrice,
+          status: 'not_found', message: 'Amazon商品が見つかりません',
+        });
+        continue;
+      }
+
+      // Step 2: 最初の候補のASINで詳細取得
+      const asin = candidates[0].asin;
+
+      // 少し待機（レート制限対策）
+      await new Promise(r => setTimeout(r, 300));
+
+      const product = await getProduct(asin);
+
+      // Step 3: 手数料取得
+      const sellingPrice = product.currentPrice;
+      if (!sellingPrice || sellingPrice <= 0) {
+        send('result', {
+          idx, jan, productName: productName || product.itemName,
+          wholesalePrice, asin,
+          image: product.image,
+          amazonName: product.itemName,
+          status: 'no_price', message: '販売価格が取得できません',
+        });
+        await new Promise(r => setTimeout(r, 300));
+        continue;
+      }
+
+      await new Promise(r => setTimeout(r, 300));
+      const fees = await getFees(asin, sellingPrice, true);
+
+      // Step 4: 利益計算
+      const rate = taxRate / 100;
+      const wholesalePriceWithTax = Math.round(wholesalePrice * (1 + rate));
+      const profit = sellingPrice - wholesalePriceWithTax - fees.totalFee;
+      const profitRate = sellingPrice > 0 ? (profit / sellingPrice * 100) : 0;
+
+      let judgment = '×';
+      if (profitRate >= 30) judgment = '◎';
+      else if (profitRate >= 20) judgment = '○';
+      else if (profitRate >= 10) judgment = '△';
+
+      // Step 5: 月間販売数推定
+      const estSales = estimateMonthlySales(product.salesRank);
+
+      send('result', {
+        idx, jan, productName: productName || product.itemName,
+        wholesalePrice, wholesalePriceWithTax,
+        asin,
+        image: product.image,
+        amazonName: product.itemName,
+        category: product.category,
+        sellingPrice,
+        salesRank: product.salesRank,
+        offerCount: product.offerCount,
+        referralFee: fees.referralFee,
+        fbaFee: fees.fbaFee,
+        totalFee: fees.totalFee,
+        profit,
+        profitRate: Math.round(profitRate * 10) / 10,
+        judgment,
+        estMonthlySales: estSales,
+        manufacturer: product.manufacturer,
+        status: 'ok',
+      });
+
+      // レート制限対策: 各アイテム間で待機
+      await new Promise(r => setTimeout(r, 500));
+
+    } catch (err) {
+      console.error(`[BulkResearch] エラー (${jan || productName}):`, err.message);
+      send('result', {
+        idx, jan, productName, wholesalePrice,
+        status: 'error', message: err.message,
+      });
+      // エラー後も少し待機
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+
+  send('complete', { total: items.length });
+  res.end();
 });
 
 // ── API: 送料テーブル ──
