@@ -293,8 +293,9 @@
       perPage = parseInt(document.getElementById('perPage').value);
 
       filteredListings = allListings.filter(item => {
-        // 在庫ありのみ（数量 > 0）
-        if ((item.quantity || 0) <= 0) return false;
+        // 出品中の商品を表示（FBA商品はquantity=0でもActive）
+        const isActive = (item.status || '').toLowerCase() === 'active' || item.status === '出品中';
+        if (!isActive && (item.quantity || 0) <= 0) return false;
         if (!q) return true;
         return (item.product_name || '').toLowerCase().includes(q)
           || (item.sku || '').toLowerCase().includes(q)

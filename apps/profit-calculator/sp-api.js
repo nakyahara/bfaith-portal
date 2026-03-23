@@ -400,7 +400,7 @@ export async function getActiveListingsReport() {
     operation: 'createReport',
     endpoint: 'reports',
     body: {
-      reportType: 'GET_MERCHANT_LISTINGS_DATA',
+      reportType: 'GET_MERCHANT_LISTINGS_ALL_DATA',
       marketplaceIds: [marketplaceId],
     },
     options: { version: '2021-06-30' },
