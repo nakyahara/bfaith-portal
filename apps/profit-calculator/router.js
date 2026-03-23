@@ -642,7 +642,7 @@ router.post('/api/bulk-research/stream', async (req, res) => {
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   };
 
-  const { items, taxRate = 10 } = req.body;
+  const { items, taxRate = 10, fulfillmentMode = 'both' } = req.body;
   if (!items || !Array.isArray(items) || items.length === 0) {
     send('error', { message: 'アイテムが指定されていません' });
     res.end();
@@ -698,21 +698,43 @@ router.post('/api/bulk-research/stream', async (req, res) => {
         continue;
       }
 
-      await new Promise(r => setTimeout(r, 300));
-      const fees = await getFees(asin, sellingPrice, true);
+      // Step 4: FBA手数料取得
+      let fbaFees = null;
+      if (fulfillmentMode !== 'fbm_only') {
+        await new Promise(r => setTimeout(r, 300));
+        fbaFees = await getFees(asin, sellingPrice, true);
+      }
 
-      // Step 4: 利益計算
+      // Step 4b: FBM手数料取得（自社出荷用）
+      let fbmFees = null;
+      if (fulfillmentMode !== 'fba_only') {
+        await new Promise(r => setTimeout(r, 300));
+        fbmFees = await getFees(asin, sellingPrice, false);
+      }
+
+      // Step 5: 利益計算
       const rate = taxRate / 100;
       const wholesalePriceWithTax = Math.round(wholesalePrice * (1 + rate));
-      const profit = sellingPrice - wholesalePriceWithTax - fees.totalFee;
-      const profitRate = sellingPrice > 0 ? (profit / sellingPrice * 100) : 0;
 
-      let judgment = '×';
-      if (profitRate >= 30) judgment = '◎';
-      else if (profitRate >= 20) judgment = '○';
-      else if (profitRate >= 10) judgment = '△';
+      // FBA利益
+      let profit = 0, profitRate = 0, judgment = '-';
+      if (fbaFees) {
+        profit = sellingPrice - wholesalePriceWithTax - fbaFees.totalFee;
+        profitRate = sellingPrice > 0 ? (profit / sellingPrice * 100) : 0;
+        judgment = profitRate >= 30 ? '◎' : profitRate >= 20 ? '○' : profitRate >= 10 ? '△' : '×';
+      }
 
-      // Step 5: 月間販売数推定
+      // FBM利益（送料はフロント側で計算するため、Amazon手数料のみ返す）
+      let fbmProfit = null, fbmProfitRate = null, fbmJudgment = null;
+      if (fbmFees) {
+        // FBMのAmazon手数料（販売手数料のみ、FBA配送手数料なし）
+        // 送料はフロント側で送料テーブルから自動計算するため、ここでは送料0で計算
+        fbmProfit = sellingPrice - wholesalePriceWithTax - fbmFees.totalFee;
+        fbmProfitRate = sellingPrice > 0 ? (fbmProfit / sellingPrice * 100) : 0;
+        fbmJudgment = fbmProfitRate >= 30 ? '◎' : fbmProfitRate >= 20 ? '○' : fbmProfitRate >= 10 ? '△' : '×';
+      }
+
+      // Step 6: 月間販売数推定
       const estSales = estimateMonthlySales(product.salesRank);
 
       send('result', {
@@ -725,12 +747,18 @@ router.post('/api/bulk-research/stream', async (req, res) => {
         sellingPrice,
         salesRank: product.salesRank,
         offerCount: product.offerCount,
-        referralFee: fees.referralFee,
-        fbaFee: fees.fbaFee,
-        totalFee: fees.totalFee,
-        profit,
-        profitRate: Math.round(profitRate * 10) / 10,
-        judgment,
+        // FBA
+        referralFee: fbaFees?.referralFee ?? fbmFees?.referralFee ?? 0,
+        fbaFee: fbaFees?.fbaFee ?? 0,
+        totalFee: fbaFees?.totalFee ?? 0,
+        profit: fbaFees ? profit : null,
+        profitRate: fbaFees ? Math.round(profitRate * 10) / 10 : null,
+        judgment: fbaFees ? judgment : null,
+        // FBM（Amazon手数料のみ。送料はフロントで加算）
+        fbmAmazonFee: fbmFees?.totalFee ?? null,
+        fbmReferralFee: fbmFees?.referralFee ?? null,
+        // 寸法情報（フロントで送料自動判定に使用）
+        dimensions: product.dimensions,
         estMonthlySales: estSales,
         manufacturer: product.manufacturer,
         status: 'ok',
