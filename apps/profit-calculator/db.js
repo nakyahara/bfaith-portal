@@ -235,6 +235,7 @@ export async function initDb() {
       ['buybox_condition', 'TEXT'],
       ['offers_updated', 'TEXT'],
       ['total_sold', 'INTEGER DEFAULT 0'],
+      ['last_sold_date', 'TEXT'],
       ['last_updated', 'TEXT'],
       ['old_price', 'REAL'],
       ['price_changed', 'INTEGER DEFAULT 0'],
@@ -629,7 +630,7 @@ export function getListings() {
 export function updateListing(sku, data, skipSave = false) {
   const EDITABLE = new Set([
     'price', 'quantity', 'cost_price', 'loss_stopper', 'high_stopper',
-    'price_tracking', 'point', 'status', 'total_sold',
+    'price_tracking', 'point', 'status', 'total_sold', 'last_sold_date',
   ]);
   const fields = [];
   const params = [];

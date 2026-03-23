@@ -490,11 +490,11 @@ function sleep(ms) {
 }
 
 /**
- * 注文レポートからSKU別販売個数を集計
- * @param {number} days - 過去何日分（デフォルト30日）
- * @returns {Object} { [sku]: totalQuantity, ... }
+ * 注文レポートからSKU別販売個数・最終販売日を集計
+ * @param {number} days - 過去何日分（デフォルト365日＝累計に近い）
+ * @returns {Object} { [sku]: { count, lastDate }, ... }
  */
-export async function getSalesCountBySku(days = 30) {
+export async function getSalesCountBySku(days = 365) {
   const sp = getClient();
   const marketplaceId = MARKETPLACE_ID();
 
@@ -581,29 +581,38 @@ export async function getSalesCountBySku(days = 30) {
   const skuIdx = findIdx('sku', 'seller-sku');
   const qtyIdx = findIdx('quantity', 'quantity-purchased');
   const statusIdx = findIdx('order-status', 'item-status');
+  const dateIdx = findIdx('purchase-date', 'last-updated-date', 'payments-date');
 
   if (skuIdx < 0 || qtyIdx < 0) {
     console.log(`[SP-API] SKU列=${skuIdx}, 数量列=${qtyIdx} — ヘッダー不一致`);
-    // フォールバック: 全ヘッダーをインデックスで探す
     console.log('[SP-API] ヘッダー詳細:', JSON.stringify(headers));
     throw new Error('注文レポートのSKUまたは数量列が見つかりません');
   }
 
-  // SKU別に数量を集計（キャンセル除外）
+  // SKU別に数量＋最終販売日を集計（キャンセル除外）
   const salesMap = {};
   for (let i = 1; i < lines.length; i++) {
     const cols = lines[i].split('\t');
     const sku = (cols[skuIdx] || '').trim();
     const qty = parseInt(cols[qtyIdx]) || 0;
     const status = statusIdx >= 0 ? (cols[statusIdx] || '').trim().toLowerCase() : '';
+    const orderDate = dateIdx >= 0 ? (cols[dateIdx] || '').trim() : '';
 
     if (!sku || qty <= 0) continue;
     if (status === 'cancelled' || status === 'キャンセル') continue;
 
-    salesMap[sku] = (salesMap[sku] || 0) + qty;
+    if (!salesMap[sku]) {
+      salesMap[sku] = { count: 0, lastDate: '' };
+    }
+    salesMap[sku].count += qty;
+    // 最終販売日を更新（より新しい日付を保持）
+    if (orderDate && orderDate > salesMap[sku].lastDate) {
+      salesMap[sku].lastDate = orderDate.slice(0, 10); // YYYY-MM-DD
+    }
   }
 
-  console.log(`[SP-API] 販売集計完了: ${Object.keys(salesMap).length}SKU, 合計${Object.values(salesMap).reduce((a, b) => a + b, 0)}個`);
+  const totalItems = Object.values(salesMap).reduce((a, b) => a + b.count, 0);
+  console.log(`[SP-API] 販売集計完了: ${Object.keys(salesMap).length}SKU, 合計${totalItems}個`);
   return salesMap;
 }
 

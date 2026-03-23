@@ -198,7 +198,6 @@
     <!-- 同期バー -->
     <div class="sync-bar">
       <button class="btn btn-sync" id="btnSync" onclick="syncListings()">Amazonから同期</button>
-      <button class="btn" style="background:#5a4230; border-color:#3d2b1a; color:#f7a94b; font-size:12px; font-weight:bold;" id="btnSaleSync" onclick="syncSales()">販売データ同期</button>
       <div class="sync-status">
         最終同期: <span class="sync-date" id="lastSyncDate">未同期</span>
       </div>
@@ -521,6 +520,7 @@
           <!-- 売れた個数 -->
           <td class="sales-cell">
             <div class="sales-count">${item.total_sold || 0}<span style="font-size:10px; font-weight:normal;">個</span></div>
+            ${item.last_sold_date ? `<div style="font-size:10px; color:#888; margin-top:2px;">最後に売れた日<br>から<br><b>${daysSince(item.last_sold_date)}</b>日</div>` : '<div style="font-size:10px; color:#aaa;">売上なし</div>'}
           </td>
         </tr>`;
       }
@@ -591,9 +591,10 @@
 
         const result = await res.json();
         document.getElementById('progressFill').style.width = '100%';
-        document.getElementById('syncMsg').textContent = `完了: ${result.count}件取得`;
+        const salesMsg = result.sales && !result.sales.error ? ` + 販売データ${result.sales.salesUpdated}SKU` : '';
+        document.getElementById('syncMsg').textContent = `完了: ${result.count}件取得${salesMsg}`;
 
-        showToast(`Amazon同期完了: ${result.count}件の出品データを取得しました`);
+        showToast(`Amazon同期完了: ${result.count}件${salesMsg}`);
         await loadListings();
       } catch (err) {
         showToast('同期エラー: ' + err.message);
@@ -605,30 +606,6 @@
         setTimeout(() => {
           document.getElementById('syncProgress').style.display = 'none';
         }, 3000);
-      }
-    }
-
-    // ── 販売データ同期 ──
-    async function syncSales() {
-      const btn = document.getElementById('btnSaleSync');
-      const days = prompt('過去何日分の販売データを取得しますか？', '30');
-      if (!days) return;
-
-      btn.disabled = true;
-      btn.textContent = '取得中...';
-      showToast('販売データを取得中...(1-3分かかります)');
-
-      try {
-        const res = await fetch(`./api/listings/sync-sales?days=${parseInt(days)}`, { method: 'POST' });
-        const result = await res.json();
-        if (!res.ok) throw new Error(result.error);
-        showToast(`販売データ同期完了: ${result.updated}SKU更新 (過去${result.days}日)`);
-        await loadListings();
-      } catch (err) {
-        showToast('販売データ同期エラー: ' + err.message);
-      } finally {
-        btn.disabled = false;
-        btn.textContent = '販売データ同期';
       }
     }
 
@@ -704,6 +681,14 @@
       return `${(dt.getMonth()+1).toString().padStart(2,'0')}-${dt.getDate().toString().padStart(2,'0')} ${dt.getHours().toString().padStart(2,'0')}:${dt.getMinutes().toString().padStart(2,'0')}`;
     }
     function toggleAdvanced() { showToast('詳細検索は今後実装予定です'); }
+
+    function daysSince(dateStr) {
+      if (!dateStr) return '-';
+      const d = new Date(dateStr);
+      const now = new Date();
+      const diff = Math.floor((now - d) / (1000 * 60 * 60 * 24));
+      return diff >= 0 ? diff : 0;
+    }
 
     // ── コンディションコード → 日本語変換 ──
     function conditionLabel(code) {

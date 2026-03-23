@@ -801,7 +801,28 @@ router.post('/api/listings/sync', async (req, res) => {
 
     dbSyncListings(mapped);
     console.log(`[ProfitCalc] DB保存完了: ${mapped.length}件`);
-    res.json({ count: mapped.length, message: '同期完了' });
+
+    // 販売データも同時に取得（バックグラウンドで実行、レスポンスは先に返す）
+    let salesResult = null;
+    try {
+      console.log('[ProfitCalc] 販売データ取得開始 (過去365日)...');
+      const salesMap = await getSalesCountBySku(365);
+      let salesUpdated = 0;
+      for (const [sku, data] of Object.entries(salesMap)) {
+        const updates = { total_sold: data.count };
+        if (data.lastDate) updates.last_sold_date = data.lastDate;
+        const changes = updateListing(sku, updates, true);
+        if (changes > 0) salesUpdated++;
+      }
+      bulkSave();
+      salesResult = { salesUpdated, totalSkus: Object.keys(salesMap).length };
+      console.log(`[ProfitCalc] 販売データ同期完了: ${salesUpdated}SKU更新`);
+    } catch (salesErr) {
+      console.error('[ProfitCalc] 販売データ取得エラー (続行):', salesErr.message);
+      salesResult = { error: salesErr.message };
+    }
+
+    res.json({ count: mapped.length, message: '同期完了', sales: salesResult });
   } catch (err) {
     console.error('[ProfitCalc] 同期エラー:', err.message, err.stack);
     res.status(500).json({ error: err.message });
@@ -833,13 +854,15 @@ router.get('/api/listings/debug', async (req, res) => {
 router.post('/api/listings/sync-sales', async (req, res) => {
   try {
     await ensureDb();
-    const days = parseInt(req.query.days) || 30;
+    const days = parseInt(req.query.days) || 365;
     console.log(`[ProfitCalc] 販売個数同期開始 (過去${days}日)...`);
 
     const salesMap = await getSalesCountBySku(days);
     let updated = 0;
-    for (const [sku, count] of Object.entries(salesMap)) {
-      const changes = updateListing(sku, { total_sold: count }, true);
+    for (const [sku, data] of Object.entries(salesMap)) {
+      const updates = { total_sold: data.count };
+      if (data.lastDate) updates.last_sold_date = data.lastDate;
+      const changes = updateListing(sku, updates, true);
       if (changes > 0) updated++;
     }
     bulkSave();
