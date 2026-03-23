@@ -261,7 +261,7 @@
             ${dSelect('FBA/FBM', 'fulfillment', p.fulfillment, ['FBA','自社出荷'], p.id)}
             ${dRow('赤字ストッパー', 'loss_stopper', p.loss_stopper, p.id, 'number')}
             ${dRow('高値ストッパー', 'high_stopper', p.high_stopper, p.id, 'number')}
-            ${dSelect('価格追従', 'price_tracking', p.price_tracking, ['カート','最安値','手動'], p.id)}
+            ${dSelect('価格追従', 'price_tracking', p.price_tracking, ['FBA最安値','最安値','カート','カスタム','しない'], p.id)}
             ${dSelect('Amazonポイント倍率', 'point_rate', p.point_rate, ['1倍','2倍','3倍','5倍','10倍'], p.id)}
           </div>
         </div>

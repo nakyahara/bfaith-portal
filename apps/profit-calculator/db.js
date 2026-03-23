@@ -564,37 +564,52 @@ export function upsertListing(item) {
   if (existing.length > 0) {
     const old = existing[0];
     // 既存レコードの場合: レポートで更新されるフィールドだけ上書き、ユーザー設定は保持
+    // ただし、出品時に仕入価格等が渡された場合はそちらで上書き
+    const setCost = item.cost_price ? ', cost_price = ?' : '';
+    const setLoss = item.loss_stopper ? ', loss_stopper = ?' : '';
+    const setHigh = item.high_stopper ? ', high_stopper = ?' : '';
+    const setTrack = item.price_tracking ? ', price_tracking = ?' : '';
+
+    const params = [
+      item.asin, item.product_name, item.image_url, item.price, item.shipping_price || 0,
+      item.quantity, item.status, item.condition, item.fulfillment, item.open_date,
+      item.listing_id, item.item_description,
+      item.price, item.price,
+    ];
+    if (item.cost_price) params.push(item.cost_price);
+    if (item.loss_stopper) params.push(item.loss_stopper);
+    if (item.high_stopper) params.push(item.high_stopper);
+    if (item.price_tracking) params.push(item.price_tracking);
+    params.push(item.sku);
+
     db.run(`
       UPDATE listings SET
         asin = ?, product_name = ?, image_url = ?, price = ?, shipping_price = ?,
         quantity = ?, status = ?, condition = ?, fulfillment = ?, open_date = ?,
         listing_id = ?, item_description = ?,
         old_price = CASE WHEN price != ? THEN price ELSE old_price END,
-        price_changed = CASE WHEN price != ? THEN 1 ELSE 0 END,
+        price_changed = CASE WHEN price != ? THEN 1 ELSE 0 END
+        ${setCost}${setLoss}${setHigh}${setTrack},
         last_updated = datetime('now','localtime'),
         synced_at = datetime('now','localtime')
       WHERE sku = ?
-    `, [
-      item.asin, item.product_name, item.image_url, item.price, item.shipping_price || 0,
-      item.quantity, item.status, item.condition, item.fulfillment, item.open_date,
-      item.listing_id, item.item_description,
-      item.price, item.price,
-      item.sku,
-    ]);
+    `, params);
   } else {
-    // 新規レコード
+    // 新規レコード — 仕入価格・ストッパー・価格追従も含めて登録
     db.run(`
       INSERT INTO listings (
         sku, asin, product_name, image_url, price, shipping_price,
         quantity, status, condition, fulfillment, open_date,
         listing_id, item_description,
-        price_tracking, synced_at
-      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'))
+        cost_price, loss_stopper, high_stopper, price_tracking,
+        synced_at
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'))
     `, [
       item.sku, item.asin, item.product_name, item.image_url, item.price, item.shipping_price || 0,
       item.quantity, item.status, item.condition, item.fulfillment, item.open_date,
       item.listing_id, item.item_description,
-      'しない',
+      item.cost_price || null, item.loss_stopper || null, item.high_stopper || null,
+      item.price_tracking || 'しない',
     ]);
   }
 }

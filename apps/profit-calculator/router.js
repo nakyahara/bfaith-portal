@@ -242,6 +242,33 @@ router.post('/api/products/:id/list-amazon', async (req, res) => {
     if (result.status === 'ACCEPTED') {
       updateProduct(id, { status: 'Amazon出品済' });
 
+      // 在庫一覧（listings）テーブルに自動登録 — ASIN/SKUで連携
+      try {
+        const { upsertListing } = await import('./db.js');
+        upsertListing({
+          sku: result.sku,
+          asin: product.asin,
+          product_name: product.product_name || '',
+          image_url: product.image_url || '',
+          price: price,
+          quantity: 0,
+          status: 'Active',
+          condition: '新品',
+          fulfillment: isFba ? 'FBA' : 'FBM',
+          open_date: new Date().toISOString().slice(0, 10),
+          listing_id: '',
+          item_description: '',
+          // productsテーブルから仕入価格・ストッパー・価格追従を引き継ぎ
+          cost_price: product.wholesale_price_with_tax || 0,
+          loss_stopper: product.loss_stopper || 0,
+          high_stopper: product.high_stopper || 0,
+          price_tracking: product.price_tracking || 'しない',
+        });
+        console.log(`[ProfitCalc] listings連携: SKU=${result.sku}, 仕入=${product.wholesale_price_with_tax}, 追従=${product.price_tracking}`);
+      } catch (linkErr) {
+        console.error('[ProfitCalc] listings連携エラー:', linkErr.message);
+      }
+
       // LISTING_OFFER_ONLYでは支払い制限が適用されないため、patchで後追い設定（FBA/FBM共通）
       if (paymentRestriction && paymentRestriction !== 'none') {
         try {
