@@ -816,6 +816,148 @@ router.put('/api/listings/update', async (req, res) => {
   }
 });
 
+// ── API: プライスターCSVアップロード（仕入価格インポート） ──
+import multer from 'multer';
+const csvUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+
+router.post('/api/listings/import-csv', csvUpload.single('file'), async (req, res) => {
+  try {
+    await ensureDb();
+    if (!req.file) return res.status(400).json({ error: 'ファイルが必要です' });
+
+    // Shift_JIS → UTF-8 変換
+    let text;
+    try {
+      const iconv = await import('iconv-lite');
+      text = iconv.default.decode(req.file.buffer, 'Shift_JIS');
+    } catch {
+      text = req.file.buffer.toString('utf-8');
+    }
+
+    const lines = text.split('\n').filter(l => l.trim());
+    if (lines.length < 2) return res.status(400).json({ error: 'CSVが空です' });
+
+    // ヘッダー解析
+    const headers = lines[0].split(',').map(h => h.trim().replace(/^"/, '').replace(/"$/, ''));
+    console.log('[ProfitCalc] CSV import headers:', headers.join(', '));
+
+    const skuIdx = headers.indexOf('SKU');
+    const costIdx = headers.indexOf('cost');
+    const akajiIdx = headers.indexOf('akaji');
+    const takaneIdx = headers.indexOf('takane');
+    const priceTraceIdx = headers.indexOf('priceTrace');
+
+    if (skuIdx < 0) return res.status(400).json({ error: 'SKU列が見つかりません' });
+
+    let updated = 0, skipped = 0;
+    for (let i = 1; i < lines.length; i++) {
+      const cols = parseCSVLine(lines[i]);
+      const sku = (cols[skuIdx] || '').replace(/^="/, '').replace(/"$/, '').trim();
+      if (!sku) continue;
+
+      const updates = {};
+      if (costIdx >= 0) {
+        const cost = parseFloat(cols[costIdx]) || 0;
+        if (cost > 0) updates.cost_price = cost;
+      }
+      if (akajiIdx >= 0) {
+        const akaji = parseFloat(cols[akajiIdx]) || 0;
+        if (akaji > 0) updates.loss_stopper = akaji;
+      }
+      if (takaneIdx >= 0) {
+        const takane = parseFloat(cols[takaneIdx]) || 0;
+        if (takane > 0) updates.high_stopper = takane;
+      }
+
+      if (Object.keys(updates).length > 0) {
+        updateListing(sku, updates);
+        updated++;
+      } else {
+        skipped++;
+      }
+    }
+
+    console.log(`[ProfitCalc] CSVインポート完了: 更新${updated}件, スキップ${skipped}件`);
+    res.json({ updated, skipped, total: lines.length - 1 });
+  } catch (err) {
+    console.error('[ProfitCalc] CSVインポートエラー:', err.message, err.stack);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// CSVの1行をパース（ダブルクォート対応）
+function parseCSVLine(line) {
+  const result = [];
+  let current = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"' && !inQuotes) { inQuotes = true; continue; }
+    if (ch === '"' && inQuotes) {
+      if (line[i + 1] === '"') { current += '"'; i++; continue; }
+      inQuotes = false; continue;
+    }
+    if (ch === ',' && !inQuotes) { result.push(current.trim()); current = ''; continue; }
+    current += ch;
+  }
+  result.push(current.trim());
+  return result;
+}
+
+// ── API: 在庫CSVダウンロード（FBA/自己発送別） ──
+router.get('/api/listings/download-csv', async (req, res) => {
+  try {
+    await ensureDb();
+    const type = req.query.type || 'all'; // 'fba', 'fbm', 'all'
+    let listings = getListings();
+
+    if (type === 'fba') {
+      listings = listings.filter(l => l.fulfillment === 'FBA');
+    } else if (type === 'fbm') {
+      listings = listings.filter(l => l.fulfillment !== 'FBA');
+    }
+
+    // プライスター互換CSVフォーマット
+    const header = 'SKU,ASIN,商品名,数量,出品価格,仕入価格,赤字ストッパー,高値ストッパー,コンディション,価格追従,FBA/自己発送,手数料,利益';
+    const rows = listings.map(l => {
+      const profit = (l.price || 0) - (l.cost_price || 0) - (l.referral_fee || 0) - (l.fba_fee || 0);
+      return [
+        csvEscape(l.sku),
+        csvEscape(l.asin),
+        csvEscape(l.product_name),
+        l.quantity || 0,
+        l.price || 0,
+        l.cost_price || 0,
+        l.loss_stopper || 0,
+        l.high_stopper || 0,
+        csvEscape(l.condition || '新品'),
+        csvEscape(l.price_tracking || 'しない'),
+        l.fulfillment === 'FBA' ? 'FBA' : '自己発送',
+        (l.referral_fee || 0) + (l.fba_fee || 0),
+        profit,
+      ].join(',');
+    });
+
+    const csv = '\uFEFF' + header + '\n' + rows.join('\n'); // BOM付きUTF-8
+    const label = type === 'fba' ? 'FBA' : type === 'fbm' ? '自己発送' : '全商品';
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="inventory_${label}_${new Date().toISOString().slice(0,10)}.csv"`);
+    res.send(csv);
+  } catch (err) {
+    console.error('[ProfitCalc] CSVダウンロードエラー:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+function csvEscape(val) {
+  if (val == null) return '';
+  const s = String(val);
+  if (s.includes(',') || s.includes('"') || s.includes('\n')) {
+    return '"' + s.replace(/"/g, '""') + '"';
+  }
+  return s;
+}
+
 // ── API: 競合オファー取得（価格改定用・技術検証） ──
 router.get('/api/amazon/offers/:asin', async (req, res) => {
   try {

@@ -211,6 +211,18 @@
       </span>
     </div>
 
+    <!-- CSV操作バー -->
+    <div class="sync-bar" style="gap:8px;">
+      <span class="label" style="font-size:12px; color:#5a4230; font-weight:bold;">CSV操作</span>
+      <button class="btn btn-outline" onclick="downloadCsv('fba')">FBA ダウンロード</button>
+      <button class="btn btn-outline" onclick="downloadCsv('fbm')">自己発送 ダウンロード</button>
+      <button class="btn btn-outline" onclick="downloadCsv('all')">全商品 ダウンロード</button>
+      <span style="border-left:1px solid #d5c9b8; height:24px; margin:0 4px;"></span>
+      <button class="btn" style="background:#f9f3ec; border-color:#d5c9b8; color:#5a4230;" onclick="document.getElementById('csvFileInput').click()">仕入価格CSVアップロード</button>
+      <input type="file" id="csvFileInput" accept=".csv" style="display:none;" onchange="uploadCostCsv(this)">
+      <span id="csvStatus" style="font-size:11px; color:#888;"></span>
+    </div>
+
     <!-- 検索バー -->
     <div class="search-bar">
       <input type="text" id="searchInput" placeholder="キーワード, JAN, SKU, ASIN">
@@ -665,6 +677,38 @@
       return `${(dt.getMonth()+1).toString().padStart(2,'0')}-${dt.getDate().toString().padStart(2,'0')} ${dt.getHours().toString().padStart(2,'0')}:${dt.getMinutes().toString().padStart(2,'0')}`;
     }
     function toggleAdvanced() { showToast('詳細検索は今後実装予定です'); }
+
+    // ── CSVダウンロード ──
+    function downloadCsv(type) {
+      window.location.href = `./api/listings/download-csv?type=${type}`;
+    }
+
+    // ── 仕入価格CSVアップロード ──
+    async function uploadCostCsv(input) {
+      const file = input.files[0];
+      if (!file) return;
+      const statusEl = document.getElementById('csvStatus');
+      statusEl.textContent = 'アップロード中...';
+
+      const formData = new FormData();
+      formData.append('file', file);
+
+      try {
+        const res = await fetch('./api/listings/import-csv', {
+          method: 'POST',
+          body: formData,
+        });
+        const result = await res.json();
+        if (!res.ok) throw new Error(result.error);
+        statusEl.textContent = `完了: ${result.updated}件更新, ${result.skipped}件スキップ (全${result.total}件)`;
+        showToast(`仕入価格インポート完了: ${result.updated}件更新`);
+        await loadListings();
+      } catch (err) {
+        statusEl.textContent = 'エラー: ' + err.message;
+        showToast('アップロードエラー: ' + err.message);
+      }
+      input.value = '';
+    }
   </script>
 </body>
 </html>
