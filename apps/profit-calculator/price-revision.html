@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>在庫一覧 — 価格改定ツール</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Segoe UI', 'Hiragino Sans', 'Meiryo', sans-serif; background: #f5f0eb; color: #333; font-size: 13px; }
+    a { color: #0066c0; text-decoration: none; }
+
+    /* ── ヘッダー（プライスター風オレンジ系） ── */
+    .header { background: linear-gradient(180deg, #f7a94b 0%, #e8922a 100%); color: #fff; padding: 10px 20px; display: flex; align-items: center; justify-content: space-between; border-bottom: 2px solid #d07a1a; }
+    .header h1 { font-size: 18px; font-weight: bold; text-shadow: 0 1px 2px rgba(0,0,0,0.2); }
+    .header h1 .icon { font-size: 20px; margin-right: 6px; }
+    .header-right { display: flex; align-items: center; gap: 16px; }
+    .header-right a { color: #fff; font-size: 13px; }
+
+    /* ── ナビタブ ── */
+    .nav-tabs { display: flex; background: #5a4230; padding: 0 20px; }
+    .nav-tab { padding: 10px 18px; color: #ddc8a8; font-size: 13px; font-weight: bold; text-decoration: none; border-bottom: 3px solid transparent; transition: all 0.2s; }
+    .nav-tab:hover { color: #fff; background: rgba(255,255,255,0.08); }
+    .nav-tab.active { color: #fff; border-bottom-color: #f7a94b; background: rgba(255,255,255,0.05); }
+
+    .container { max-width: 1600px; margin: 0 auto; padding: 12px 16px; }
+
+    /* ── 検索バー ── */
+    .search-bar { background: #fff; border: 1px solid #d5c9b8; border-radius: 6px; padding: 10px 16px; margin-bottom: 10px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+    .search-bar input[type="text"] { padding: 6px 10px; border: 2px solid #e8922a; border-radius: 4px; font-size: 13px; width: 280px; outline: none; }
+    .search-bar input[type="text"]:focus { border-color: #d07a1a; box-shadow: 0 0 4px rgba(232,146,42,0.3); }
+    .btn { padding: 6px 14px; border-radius: 4px; font-size: 12px; font-weight: bold; cursor: pointer; border: 1px solid; transition: opacity 0.2s; }
+    .btn:hover { opacity: 0.85; }
+    .btn-search { background: #e8922a; border-color: #d07a1a; color: #fff; padding: 6px 20px; font-size: 13px; }
+    .btn-outline { background: #fff; border-color: #bbb; color: #555; }
+    .search-bar .search-info { margin-left: auto; font-size: 12px; color: #888; }
+    .search-bar .count-badge { background: #e8922a; color: #fff; padding: 2px 10px; border-radius: 10px; font-weight: bold; font-size: 12px; }
+
+    /* ── アクションバー ── */
+    .action-bar { background: #fff; border: 1px solid #d5c9b8; border-radius: 6px; padding: 8px 16px; margin-bottom: 10px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+    .action-bar .label { font-size: 12px; color: #888; margin-right: 4px; }
+    .btn-action { background: #f9f3ec; border: 1px solid #d5c9b8; color: #5a4230; padding: 5px 12px; font-size: 12px; font-weight: bold; border-radius: 4px; cursor: pointer; }
+    .btn-action:hover { background: #f0e6d8; }
+    .btn-action.active { background: #e8922a; border-color: #d07a1a; color: #fff; }
+    .action-bar .spacer { flex: 1; }
+    .action-bar select { padding: 4px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 12px; }
+
+    /* ── データテーブル ── */
+    .data-table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #d5c9b8; border-radius: 6px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+    .data-table th { background: #faf5ef; padding: 6px 8px; text-align: center; font-size: 11px; color: #5a4230; border-bottom: 2px solid #d5c9b8; white-space: nowrap; position: sticky; top: 0; }
+    .data-table th.sortable { cursor: pointer; }
+    .data-table th.sortable:hover { background: #f0e6d8; }
+    .data-table td { padding: 6px 8px; border-bottom: 1px solid #eee; vertical-align: top; font-size: 12px; }
+    .data-table tr:hover { background: #fdfbf8; }
+    .data-table tr.row-updated { background: #fff8e8; }
+
+    /* ステータス列 */
+    .status-cell { text-align: center; min-width: 56px; }
+    .status-active { color: #2e7d32; font-weight: bold; font-size: 11px; }
+    .status-inactive { color: #b71c1c; font-weight: bold; font-size: 11px; }
+    .status-sub { font-size: 10px; color: #888; margin-top: 2px; }
+
+    /* 更新列 */
+    .update-cell { min-width: 80px; font-size: 11px; }
+    .update-date { color: #555; }
+    .update-price-change { font-size: 10px; margin-top: 2px; }
+    .price-label { color: #888; }
+    .price-old { color: #888; text-decoration: line-through; }
+    .price-arrow { color: #888; margin: 0 2px; }
+
+    /* ASIN列 */
+    .asin-cell { min-width: 100px; text-align: center; }
+    .asin-cell img { width: 50px; height: 50px; object-fit: contain; border: 1px solid #eee; border-radius: 4px; display: block; margin: 0 auto 4px; }
+    .asin-link { font-size: 11px; color: #0066c0; word-break: break-all; }
+
+    /* 商品名・SKU列 */
+    .product-cell { min-width: 180px; max-width: 260px; }
+    .product-name { font-size: 12px; line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+    .product-sku { font-size: 10px; color: #888; margin-top: 3px; }
+
+    /* 数量列 */
+    .qty-cell { text-align: center; min-width: 40px; }
+    .qty-input { width: 50px; padding: 3px 4px; border: 1px solid #ccc; border-radius: 3px; text-align: center; font-size: 12px; }
+
+    /* コンディション列 */
+    .condition-cell { text-align: center; font-size: 11px; min-width: 50px; }
+
+    /* 出品価格列 */
+    .price-cell { min-width: 100px; }
+    .price-input-group { display: flex; flex-direction: column; gap: 3px; }
+    .price-input-row { display: flex; align-items: center; gap: 4px; font-size: 11px; }
+    .price-input-row label { color: #888; font-size: 10px; min-width: 36px; }
+    .price-input { width: 70px; padding: 3px 4px; border: 1px solid #ccc; border-radius: 3px; text-align: right; font-size: 12px; }
+    .price-input:focus { border-color: #e8922a; outline: none; }
+    .price-total { font-size: 11px; color: #555; margin-top: 1px; }
+    .btn-ship-setting { font-size: 10px; border: 1px solid #ccc; background: #f9f9f9; padding: 1px 6px; border-radius: 3px; cursor: pointer; margin-top: 2px; }
+
+    /* ポイント列 */
+    .point-cell { text-align: center; min-width: 50px; }
+    .point-input { width: 40px; padding: 3px 4px; border: 1px solid #ccc; border-radius: 3px; text-align: center; font-size: 12px; }
+
+    /* 最低価格列 */
+    .lowest-cell { min-width: 110px; font-size: 11px; }
+    .lowest-label { font-weight: bold; }
+    .lowest-price { font-size: 13px; font-weight: bold; }
+    .lowest-detail { font-size: 10px; color: #888; margin-top: 2px; line-height: 1.4; }
+    .lowest-date { font-size: 10px; color: #aaa; margin-top: 2px; }
+
+    /* 価格自動変更列 */
+    .auto-price-cell { min-width: 90px; text-align: center; }
+    .auto-price-btns { display: flex; flex-direction: column; gap: 3px; }
+    .btn-mode { padding: 3px 8px; font-size: 10px; font-weight: bold; border: 1px solid #ccc; border-radius: 3px; cursor: pointer; background: #fff; text-align: center; transition: all 0.15s; }
+    .btn-mode:hover { opacity: 0.8; }
+    .btn-mode.fba-lowest { background: #d4edda; border-color: #82c88e; color: #1b5e20; }
+    .btn-mode.lowest { background: #d4edda; border-color: #82c88e; color: #1b5e20; }
+    .btn-mode.cart { background: #fff3cd; border-color: #ddb54b; color: #856404; }
+    .btn-mode.custom { background: #e8d5f5; border-color: #b39ddb; color: #4a148c; }
+    .btn-mode.off { background: #f5f5f5; border-color: #ccc; color: #888; }
+    .btn-mode.selected { box-shadow: inset 0 0 0 2px #333; font-weight: 900; }
+
+    /* 仕入れ価格列 */
+    .cost-cell { text-align: center; min-width: 60px; }
+    .cost-input { width: 60px; padding: 3px 4px; border: 1px solid #ccc; border-radius: 3px; text-align: right; font-size: 12px; }
+
+    /* ストッパー列 */
+    .stopper-cell { min-width: 70px; font-size: 11px; }
+    .stopper-row { display: flex; align-items: center; gap: 3px; margin-bottom: 3px; }
+    .stopper-label { font-size: 10px; color: #888; min-width: 50px; }
+    .stopper-input { width: 55px; padding: 2px 4px; border: 1px solid #ccc; border-radius: 3px; text-align: right; font-size: 11px; }
+    .stopper-loss { border-color: #e57373; }
+    .stopper-high { border-color: #e57373; }
+
+    /* 手数料列 */
+    .fee-cell { min-width: 70px; font-size: 11px; text-align: right; }
+    .fee-amount { font-size: 12px; }
+    .fee-detail { font-size: 10px; color: #888; }
+    .fee-profit { margin-top: 3px; }
+    .fee-profit-positive { color: #2e7d32; font-weight: bold; }
+    .fee-profit-negative { color: #b71c1c; font-weight: bold; }
+
+    /* 売れた個数列 */
+    .sales-cell { text-align: center; min-width: 55px; }
+    .sales-count { font-size: 14px; font-weight: bold; }
+    .sales-label { font-size: 10px; color: #888; }
+    .sales-last { font-size: 10px; color: #aaa; margin-top: 2px; }
+
+    /* Keepaリンク */
+    .keepa-btn { display: inline-block; background: #1e88e5; color: #fff; padding: 3px 8px; border-radius: 4px; font-size: 10px; font-weight: bold; cursor: pointer; text-decoration: none; }
+
+    /* ── 同期バー ── */
+    .sync-bar { background: #fff; border: 1px solid #d5c9b8; border-radius: 6px; padding: 10px 16px; margin-bottom: 10px; display: flex; gap: 12px; align-items: center; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+    .sync-bar .sync-status { font-size: 12px; color: #888; }
+    .sync-bar .sync-date { font-weight: bold; color: #5a4230; }
+    .btn-sync { background: #e8922a; border-color: #d07a1a; color: #fff; padding: 6px 16px; font-size: 12px; font-weight: bold; }
+    .btn-sync:disabled { background: #ccc; border-color: #aaa; cursor: not-allowed; }
+    .sync-progress { flex: 1; }
+    .progress-bar { height: 6px; background: #eee; border-radius: 3px; overflow: hidden; }
+    .progress-fill { height: 100%; background: #e8922a; border-radius: 3px; transition: width 0.3s; }
+
+    /* ── ページネーション ── */
+    .pagination { display: flex; justify-content: center; align-items: center; gap: 8px; margin-top: 12px; padding: 10px; }
+    .pagination button { padding: 5px 12px; border: 1px solid #d5c9b8; background: #fff; border-radius: 4px; cursor: pointer; font-size: 12px; }
+    .pagination button:hover { background: #f0e6d8; }
+    .pagination button.active { background: #e8922a; color: #fff; border-color: #d07a1a; }
+    .pagination button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .pagination .page-info { font-size: 12px; color: #888; }
+
+    /* ── トースト ── */
+    .toast { position: fixed; top: 20px; right: 20px; background: #5a4230; color: #fff; padding: 12px 20px; border-radius: 8px; font-size: 14px; display: none; z-index: 100; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
+
+    /* ── ローディング ── */
+    .loading-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.3); display: flex; align-items: center; justify-content: center; z-index: 200; }
+    .loading-box { background: #fff; padding: 30px 40px; border-radius: 10px; text-align: center; box-shadow: 0 4px 20px rgba(0,0,0,0.2); }
+    .loading-spinner { width: 40px; height: 40px; border: 4px solid #eee; border-top-color: #e8922a; border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 12px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .empty-msg { text-align: center; padding: 60px; color: #888; font-size: 14px; background: #fff; border: 1px solid #d5c9b8; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1><span class="icon">&#x1f4b0;</span> 価格改定ツール — 在庫一覧</h1>
+    <div class="header-right">
+      <a href="/">← ポータルに戻る</a>
+    </div>
+  </div>
+  <div class="nav-tabs">
+    <a href="./research" class="nav-tab">リサーチ</a>
+    <a href="./" class="nav-tab">商品計算</a>
+    <a href="./products" class="nav-tab">NE商品登録</a>
+    <a href="./amazon" class="nav-tab">Amazon出品</a>
+    <a href="./price-revision" class="nav-tab active">在庫一覧</a>
+    <a href="./suppliers" class="nav-tab" style="margin-left:auto;">仕入れ先管理</a>
+    <a href="./shipping" class="nav-tab">送料管理</a>
+    <a href="./settings" class="nav-tab">設定</a>
+  </div>
+
+  <div class="container">
+    <!-- 同期バー -->
+    <div class="sync-bar">
+      <button class="btn btn-sync" id="btnSync" onclick="syncListings()">Amazonから同期</button>
+      <div class="sync-status">
+        最終同期: <span class="sync-date" id="lastSyncDate">未同期</span>
+      </div>
+      <div class="sync-progress" id="syncProgress" style="display:none;">
+        <div class="progress-bar"><div class="progress-fill" id="progressFill" style="width:0%"></div></div>
+        <div style="font-size:11px; color:#888; margin-top:2px;" id="syncMsg">同期中...</div>
+      </div>
+      <span class="search-info">
+        検索結果: 約<span id="totalCount">0</span>件 &nbsp; 選択SKU数: <span id="selectedCount">0</span>件
+        &nbsp; <span class="count-badge" id="statusBadge">出品中</span>
+      </span>
+    </div>
+
+    <!-- 検索バー -->
+    <div class="search-bar">
+      <input type="text" id="searchInput" placeholder="キーワード, JAN, SKU, ASIN">
+      <button class="btn btn-search" onclick="applyFilters()">検索</button>
+      <button class="btn btn-outline" onclick="toggleAdvanced()">詳細検索 ≡</button>
+      <div class="search-info" style="margin-left:auto;">
+        表示件数
+        <select id="perPage" onchange="applyFilters()">
+          <option value="50">50件</option>
+          <option value="100">100件</option>
+          <option value="150" selected>150件</option>
+          <option value="300">300件</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- アクションバー -->
+    <div class="action-bar">
+      <span class="label">チェックの付いた商品を</span>
+      <button class="btn-action" onclick="bulkAction('stop')">出品停止</button>
+      <button class="btn-action" onclick="bulkAction('resume')">出品再開</button>
+      <button class="btn-action" onclick="bulkAction('fba')">FBA納品</button>
+      <button class="btn-action" onclick="bulkAutoPrice()">価格の自動変更</button>
+      <span class="spacer"></span>
+      <span class="label">最低価格の表示方法</span>
+      <select id="lowestPriceMode">
+        <option value="cart_ship">= カート価格+配送料</option>
+        <option value="lowest_ship">= 最安値+配送料</option>
+        <option value="fba_lowest">= FBA最安値+配送料</option>
+      </select>
+    </div>
+
+    <!-- テーブル -->
+    <div id="tableContainer">
+      <div class="empty-msg">
+        「Amazonから同期」ボタンを押して、出品中の商品を取得してください。
+      </div>
+    </div>
+
+    <!-- ページネーション -->
+    <div class="pagination" id="pagination" style="display:none;"></div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    // ── State ──
+    let allListings = [];
+    let filteredListings = [];
+    let currentPage = 1;
+    let perPage = 150;
+    let sortField = 'product_name';
+    let sortDir = 'asc';
+    let syncing = false;
+
+    document.addEventListener('DOMContentLoaded', () => {
+      loadListings();
+      // Enter キーで検索
+      document.getElementById('searchInput').addEventListener('keydown', e => {
+        if (e.key === 'Enter') applyFilters();
+      });
+    });
+
+    // ── データ読み込み ──
+    async function loadListings() {
+      try {
+        const res = await fetch('./api/listings');
+        const data = await res.json();
+        allListings = data.listings || [];
+        document.getElementById('lastSyncDate').textContent = data.lastSync || '未同期';
+        applyFilters();
+      } catch (err) {
+        console.error('読み込みエラー:', err);
+      }
+    }
+
+    // ── フィルタ・検索 ──
+    function applyFilters() {
+      const q = document.getElementById('searchInput').value.trim().toLowerCase();
+      perPage = parseInt(document.getElementById('perPage').value);
+
+      filteredListings = allListings.filter(item => {
+        // 在庫ありのみ（数量 > 0）
+        if ((item.quantity || 0) <= 0) return false;
+        if (!q) return true;
+        return (item.product_name || '').toLowerCase().includes(q)
+          || (item.sku || '').toLowerCase().includes(q)
+          || (item.asin || '').toLowerCase().includes(q)
+          || (item.jan || '').toLowerCase().includes(q);
+      });
+
+      // ソート
+      filteredListings.sort((a, b) => {
+        let va = a[sortField], vb = b[sortField];
+        if (typeof va === 'string') va = va.toLowerCase();
+        if (typeof vb === 'string') vb = vb.toLowerCase();
+        if (va < vb) return sortDir === 'asc' ? -1 : 1;
+        if (va > vb) return sortDir === 'asc' ? 1 : -1;
+        return 0;
+      });
+
+      document.getElementById('totalCount').textContent = filteredListings.length.toLocaleString();
+      currentPage = 1;
+      renderTable();
+      renderPagination();
+      updateSelectedCount();
+    }
+
+    // ── ソート ──
+    function toggleSort(field) {
+      if (sortField === field) {
+        sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+      } else {
+        sortField = field;
+        sortDir = 'asc';
+      }
+      applyFilters();
+    }
+
+    function sortIcon(field) {
+      if (sortField !== field) return '';
+      return sortDir === 'asc' ? ' ▲' : ' ▼';
+    }
+
+    // ── テーブル描画 ──
+    function renderTable() {
+      if (filteredListings.length === 0) {
+        document.getElementById('tableContainer').innerHTML = allListings.length === 0
+          ? '<div class="empty-msg">「Amazonから同期」ボタンを押して、出品中の商品を取得してください。</div>'
+          : '<div class="empty-msg">検索条件に一致する商品がありません。</div>';
+        document.getElementById('pagination').style.display = 'none';
+        return;
+      }
+
+      const start = (currentPage - 1) * perPage;
+      const pageData = filteredListings.slice(start, start + perPage);
+
+      let html = `<table class="data-table">
+        <thead><tr>
+          <th style="width:28px;"><input type="checkbox" id="checkAll" onclick="toggleCheckAll(this)"></th>
+          <th class="sortable" onclick="toggleSort('status')">ステータス${sortIcon('status')}</th>
+          <th>更新</th>
+          <th>ASIN/ISBN</th>
+          <th class="sortable" onclick="toggleSort('product_name')">商品名${sortIcon('product_name')}<br>SKU</th>
+          <th class="sortable" onclick="toggleSort('open_date')">出品情報<br>作成日${sortIcon('open_date')}</th>
+          <th class="sortable" onclick="toggleSort('quantity')">数量${sortIcon('quantity')}</th>
+          <th>コンディション</th>
+          <th>出品価格<br>+配送料</th>
+          <th>ポイント</th>
+          <th>最低価格<br>+配送料</th>
+          <th>価格の自動変更</th>
+          <th>仕入れ価格</th>
+          <th>高値ストッパー<br>赤字ストッパー</th>
+          <th>手数料<br>利益率</th>
+          <th>売れた<br>個数<br>(通算)</th>
+        </tr></thead><tbody>`;
+
+      for (const item of pageData) {
+        const isActive = item.status === 'Active' || item.status === '出品中';
+        const trackMode = item.price_tracking || 'しない';
+        const profit = calcProfit(item);
+
+        html += `<tr>
+          <td><input type="checkbox" class="row-check" value="${esc(item.sku)}" onchange="updateSelectedCount()"></td>
+
+          <!-- ステータス -->
+          <td class="status-cell">
+            <div class="${isActive ? 'status-active' : 'status-inactive'}">${isActive ? '出品中' : '停止'}</div>
+            ${item.fulfillment === 'FBA' ? '<div class="status-sub">FBA</div>' : '<div class="status-sub">自己発送</div>'}
+          </td>
+
+          <!-- 更新 -->
+          <td class="update-cell">
+            <div class="update-date">${item.last_updated ? formatDate(item.last_updated) : '-'}</div>
+            ${item.price_changed ? `<div class="update-price-change">
+              <span class="price-label">価格</span>
+              <span class="price-old">${item.old_price || ''}</span>
+              <span class="price-arrow">↓</span>
+              <span>${item.price || ''}</span>
+            </div>` : ''}
+          </td>
+
+          <!-- ASIN -->
+          <td class="asin-cell">
+            ${item.image_url ? `<img src="${esc(item.image_url)}" alt="" onerror="this.style.display='none'">` : '<div style="width:50px;height:50px;background:#f5f5f5;border-radius:4px;margin:0 auto 4px;display:flex;align-items:center;justify-content:center;color:#ccc;font-size:20px;">?</div>'}
+            <a class="asin-link" href="https://www.amazon.co.jp/dp/${esc(item.asin)}" target="_blank">${esc(item.asin || '-')}</a>
+          </td>
+
+          <!-- 商品名 / SKU -->
+          <td class="product-cell">
+            <div class="product-name" title="${esc(item.product_name || '')}">${esc(item.product_name || '-')}</div>
+            <div class="product-sku">${esc(item.sku || '-')}</div>
+          </td>
+
+          <!-- 出品日 -->
+          <td style="text-align:center; font-size:11px;">${item.open_date ? item.open_date.slice(0, 10) : '-'}</td>
+
+          <!-- 数量 -->
+          <td class="qty-cell">
+            <input type="number" class="qty-input" value="${item.quantity || 0}" min="0"
+              onchange="updateField('${esc(item.sku)}', 'quantity', this.value)">
+          </td>
+
+          <!-- コンディション -->
+          <td class="condition-cell">${esc(item.condition || '新品')}<br>${item.fulfillment === 'FBA' ? 'FBA発送' : '自己発送'}</td>
+
+          <!-- 出品価格 -->
+          <td class="price-cell">
+            <div class="price-input-group">
+              <div class="price-input-row">
+                <label>出品価格</label>
+                <span>¥</span>
+                <input type="number" class="price-input" value="${item.price || ''}"
+                  onchange="updateField('${esc(item.sku)}', 'price', this.value)">
+              </div>
+              <div class="price-input-row">
+                <label>送料</label>
+                <span>¥</span><span>${item.shipping_price || 0}</span>
+              </div>
+              <div class="price-total">合計 ¥${((item.price || 0) + (item.shipping_price || 0)).toLocaleString()}</div>
+            </div>
+          </td>
+
+          <!-- ポイント -->
+          <td class="point-cell">
+            <input type="number" class="point-input" value="${item.point || 0}" min="0"
+              onchange="updateField('${esc(item.sku)}', 'point', this.value)">
+            <div style="font-size:10px; color:#888;">%</div>
+          </td>
+
+          <!-- 最低価格 -->
+          <td class="lowest-cell">
+            ${item.buybox_price ? `
+              <div><span class="lowest-label">カート価格</span></div>
+              <div class="lowest-price">¥${Number(item.buybox_price).toLocaleString()}</div>
+              <div class="lowest-detail">
+                (送料 ${item.buybox_shipping || 0})<br>
+                (${item.buybox_points || 0} pt)<br>
+                (合計 ${((item.buybox_price || 0) + (item.buybox_shipping || 0)).toLocaleString()})<br>
+                ${item.buybox_condition || '新品'}
+              </div>
+              <div class="lowest-date">(${item.offers_updated || '-'})</div>
+            ` : '<div style="color:#aaa; text-align:center;">—</div>'}
+          </td>
+
+          <!-- 価格自動変更 -->
+          <td class="auto-price-cell">
+            <div class="auto-price-btns">
+              <button class="btn-mode fba-lowest ${trackMode === 'FBA最安値' ? 'selected' : ''}" onclick="setTrackMode('${esc(item.sku)}', 'FBA最安値')">FBA最安値</button>
+              <button class="btn-mode lowest ${trackMode === '最安値' ? 'selected' : ''}" onclick="setTrackMode('${esc(item.sku)}', '最安値')">最安値</button>
+              <button class="btn-mode cart ${trackMode === 'カート' ? 'selected' : ''}" onclick="setTrackMode('${esc(item.sku)}', 'カート')">カート</button>
+              <button class="btn-mode custom ${trackMode === 'カスタム' ? 'selected' : ''}" onclick="setTrackMode('${esc(item.sku)}', 'カスタム')">カスタム</button>
+              <button class="btn-mode off ${trackMode === 'しない' ? 'selected' : ''}" onclick="setTrackMode('${esc(item.sku)}', 'しない')">しない</button>
+            </div>
+          </td>
+
+          <!-- 仕入れ価格 -->
+          <td class="cost-cell">
+            <span>¥</span>
+            <input type="number" class="cost-input" value="${item.cost_price || ''}"
+              onchange="updateField('${esc(item.sku)}', 'cost_price', this.value)">
+          </td>
+
+          <!-- ストッパー -->
+          <td class="stopper-cell">
+            <div class="stopper-row">
+              <span class="stopper-label">高値ストッパー</span>
+              <span>¥</span>
+              <input type="number" class="stopper-input stopper-high" value="${item.high_stopper || ''}"
+                onchange="updateField('${esc(item.sku)}', 'high_stopper', this.value)">
+            </div>
+            <div class="stopper-row">
+              <span class="stopper-label" style="color:#b71c1c;">赤字ストッパー</span>
+              <span style="color:#b71c1c;">¥</span>
+              <input type="number" class="stopper-input stopper-loss" value="${item.loss_stopper || ''}" style="color:#b71c1c;"
+                onchange="updateField('${esc(item.sku)}', 'loss_stopper', this.value)">
+            </div>
+          </td>
+
+          <!-- 手数料 -->
+          <td class="fee-cell">
+            <div class="fee-amount">手数料<br>¥${(item.referral_fee || 0).toLocaleString()}</div>
+            <div class="fee-detail">再計算</div>
+            <div class="fee-profit">
+              <div>利益額</div>
+              <div class="${profit >= 0 ? 'fee-profit-positive' : 'fee-profit-negative'}">¥${profit.toLocaleString()}</div>
+              <div style="font-size:10px; color:#888;">(${item.price ? ((profit / item.price) * 100).toFixed(1) : '0.0'}%)</div>
+            </div>
+          </td>
+
+          <!-- 売れた個数 -->
+          <td class="sales-cell">
+            <div class="sales-count">${item.total_sold || 0}<span style="font-size:10px; font-weight:normal;">個</span></div>
+            <a class="keepa-btn" href="https://keepa.com/#!product/5-${esc(item.asin)}" target="_blank">Keepa</a>
+          </td>
+        </tr>`;
+      }
+
+      html += '</tbody></table>';
+      document.getElementById('tableContainer').innerHTML = html;
+      document.getElementById('pagination').style.display = 'flex';
+    }
+
+    // ── ページネーション ──
+    function renderPagination() {
+      const totalPages = Math.ceil(filteredListings.length / perPage);
+      if (totalPages <= 1) {
+        document.getElementById('pagination').style.display = 'none';
+        return;
+      }
+
+      let html = `<button ${currentPage <= 1 ? 'disabled' : ''} onclick="goPage(${currentPage - 1})">← 前</button>`;
+
+      const range = 3;
+      let start = Math.max(1, currentPage - range);
+      let end = Math.min(totalPages, currentPage + range);
+
+      if (start > 1) html += `<button onclick="goPage(1)">1</button>`;
+      if (start > 2) html += `<span class="page-info">...</span>`;
+
+      for (let i = start; i <= end; i++) {
+        html += `<button class="${i === currentPage ? 'active' : ''}" onclick="goPage(${i})">${i}</button>`;
+      }
+
+      if (end < totalPages - 1) html += `<span class="page-info">...</span>`;
+      if (end < totalPages) html += `<button onclick="goPage(${totalPages})">${totalPages}</button>`;
+
+      html += `<button ${currentPage >= totalPages ? 'disabled' : ''} onclick="goPage(${currentPage + 1})">次 →</button>`;
+      html += `<span class="page-info">(${currentPage}/${totalPages}ページ)</span>`;
+
+      document.getElementById('pagination').innerHTML = html;
+      document.getElementById('pagination').style.display = 'flex';
+    }
+
+    function goPage(p) {
+      currentPage = p;
+      renderTable();
+      renderPagination();
+      window.scrollTo(0, 0);
+    }
+
+    // ── Amazon同期 ──
+    async function syncListings() {
+      if (syncing) return;
+      syncing = true;
+      const btn = document.getElementById('btnSync');
+      btn.disabled = true;
+      btn.textContent = '同期中...';
+      document.getElementById('syncProgress').style.display = 'block';
+      document.getElementById('progressFill').style.width = '10%';
+      document.getElementById('syncMsg').textContent = 'Amazonからレポートを取得中...';
+
+      try {
+        const res = await fetch('./api/listings/sync', { method: 'POST' });
+        if (!res.ok) {
+          const err = await res.json();
+          throw new Error(err.error || '同期に失敗しました');
+        }
+
+        document.getElementById('progressFill').style.width = '80%';
+        document.getElementById('syncMsg').textContent = 'データを保存中...';
+
+        const result = await res.json();
+        document.getElementById('progressFill').style.width = '100%';
+        document.getElementById('syncMsg').textContent = `完了: ${result.count}件取得`;
+
+        showToast(`Amazon同期完了: ${result.count}件の出品データを取得しました`);
+        await loadListings();
+      } catch (err) {
+        showToast('同期エラー: ' + err.message);
+        document.getElementById('syncMsg').textContent = 'エラー: ' + err.message;
+      } finally {
+        syncing = false;
+        btn.disabled = false;
+        btn.textContent = 'Amazonから同期';
+        setTimeout(() => {
+          document.getElementById('syncProgress').style.display = 'none';
+        }, 3000);
+      }
+    }
+
+    // ── フィールド更新 ──
+    async function updateField(sku, field, value) {
+      try {
+        await fetch('./api/listings/update', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sku, [field]: value }),
+        });
+        // ローカルデータも更新
+        const item = allListings.find(l => l.sku === sku);
+        if (item) {
+          item[field] = isNaN(value) ? value : Number(value);
+        }
+      } catch (err) {
+        showToast('更新エラー: ' + err.message);
+      }
+    }
+
+    // ── 価格追従モード変更 ──
+    async function setTrackMode(sku, mode) {
+      await updateField(sku, 'price_tracking', mode);
+      const item = allListings.find(l => l.sku === sku);
+      if (item) item.price_tracking = mode;
+      renderTable();
+      renderPagination();
+      showToast(`${sku} → 価格追従「${mode}」に変更`);
+    }
+
+    // ── 利益計算 ──
+    function calcProfit(item) {
+      const price = item.price || 0;
+      const cost = item.cost_price || 0;
+      const fee = item.referral_fee || 0;
+      const fbaFee = item.fba_fee || 0;
+      return price - cost - fee - fbaFee;
+    }
+
+    // ── 一括操作 ──
+    function getSelectedSkus() {
+      return Array.from(document.querySelectorAll('.row-check:checked')).map(cb => cb.value);
+    }
+
+    function toggleCheckAll(el) {
+      document.querySelectorAll('.row-check').forEach(cb => cb.checked = el.checked);
+      updateSelectedCount();
+    }
+
+    function updateSelectedCount() {
+      document.getElementById('selectedCount').textContent = getSelectedSkus().length;
+    }
+
+    function bulkAction(action) {
+      const skus = getSelectedSkus();
+      if (skus.length === 0) { alert('対象の商品をチェックボックスで選択してください'); return; }
+      showToast(`${action}: ${skus.length}件 — (実装予定)`);
+    }
+
+    function bulkAutoPrice() {
+      const skus = getSelectedSkus();
+      if (skus.length === 0) { alert('対象の商品をチェックボックスで選択してください'); return; }
+      showToast(`価格自動変更: ${skus.length}件 — (実装予定)`);
+    }
+
+    // ── ユーティリティ ──
+    function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+    function showToast(m) { const e = document.getElementById('toast'); e.textContent = m; e.style.display = 'block'; setTimeout(() => e.style.display = 'none', 3000); }
+    function formatDate(d) {
+      if (!d) return '';
+      const dt = new Date(d);
+      return `${(dt.getMonth()+1).toString().padStart(2,'0')}-${dt.getDate().toString().padStart(2,'0')} ${dt.getHours().toString().padStart(2,'0')}:${dt.getMinutes().toString().padStart(2,'0')}`;
+    }
+    function toggleAdvanced() { showToast('詳細検索は今後実装予定です'); }
+  </script>
+</body>
+</html>

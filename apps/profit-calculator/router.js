@@ -4,8 +4,8 @@
 import { Router } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { getProduct, getFees, createListing, patchListing, getShippingTemplates, getItemOffers, updatePrice } from './sp-api.js';
-import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, deleteProduct, getSetItems, saveSetItems } from './db.js';
+import { getProduct, getFees, createListing, patchListing, getShippingTemplates, getItemOffers, updatePrice, getMerchantListingsReport } from './sp-api.js';
+import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, deleteProduct, getSetItems, saveSetItems, syncListings as dbSyncListings, getListings, updateListing, getSyncMeta } from './db.js';
 import { loadSuppliers, addSupplier, deleteSupplier } from './suppliers.js';
 import { loadShipping, addShipping, updateShipping, deleteShipping } from './shipping.js';
 import { getSetting, setSetting, getAllSettings } from './settings.js';
@@ -41,6 +41,10 @@ router.get('/amazon', (req, res) => {
 
 router.get('/amazon-manual', (req, res) => {
   res.sendFile(path.join(__dirname, 'amazon-manual.html'));
+});
+
+router.get('/price-revision', (req, res) => {
+  res.sendFile(path.join(__dirname, 'price-revision.html'));
 });
 
 router.get('/suppliers', (req, res) => {
@@ -696,6 +700,48 @@ router.get('/api/amazon/payment-options', async (req, res) => {
     });
   } catch (err) {
     console.error('[ProfitCalc] 支払いオプション取得エラー:', err.message, err.stack);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── API: 在庫一覧（価格改定ツール） ──
+router.get('/api/listings', async (req, res) => {
+  try {
+    await ensureDb();
+    const listings = getListings();
+    const lastSync = getSyncMeta('listings_last_sync');
+    res.json({ listings, lastSync: lastSync ? new Date(lastSync).toLocaleString('ja-JP') : null });
+  } catch (err) {
+    console.error('[ProfitCalc] listings取得エラー:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── API: Amazon同期（出品レポート取得） ──
+router.post('/api/listings/sync', async (req, res) => {
+  try {
+    await ensureDb();
+    console.log('[ProfitCalc] Amazon出品レポート同期開始...');
+    const listings = await getMerchantListingsReport();
+    dbSyncListings(listings);
+    console.log(`[ProfitCalc] 同期完了: ${listings.length}件`);
+    res.json({ count: listings.length, message: '同期完了' });
+  } catch (err) {
+    console.error('[ProfitCalc] 同期エラー:', err.message, err.stack);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── API: listing個別更新 ──
+router.put('/api/listings/update', async (req, res) => {
+  try {
+    await ensureDb();
+    const { sku, ...fields } = req.body;
+    if (!sku) return res.status(400).json({ error: 'SKUは必須です' });
+    updateListing(sku, fields);
+    res.json({ ok: true, sku });
+  } catch (err) {
+    console.error('[ProfitCalc] listing更新エラー:', err.message);
     res.status(500).json({ error: err.message });
   }
 });

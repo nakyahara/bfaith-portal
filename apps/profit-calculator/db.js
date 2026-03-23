@@ -182,6 +182,78 @@ export async function initDb() {
     }
   }
 
+  // 在庫一覧テーブル（価格改定ツール用）
+  db.run(`
+    CREATE TABLE IF NOT EXISTS listings (
+      sku TEXT PRIMARY KEY,
+      asin TEXT,
+      product_name TEXT,
+      image_url TEXT,
+      price REAL,
+      shipping_price REAL DEFAULT 0,
+      quantity INTEGER DEFAULT 0,
+      status TEXT DEFAULT 'Active',
+      condition TEXT DEFAULT '新品',
+      fulfillment TEXT DEFAULT 'FBM',
+      open_date TEXT,
+      listing_id TEXT,
+      item_description TEXT,
+      cost_price REAL,
+      loss_stopper REAL,
+      high_stopper REAL,
+      price_tracking TEXT DEFAULT 'しない',
+      point INTEGER DEFAULT 0,
+      referral_fee REAL DEFAULT 0,
+      fba_fee REAL DEFAULT 0,
+      buybox_price REAL,
+      buybox_shipping REAL,
+      buybox_points INTEGER DEFAULT 0,
+      buybox_condition TEXT,
+      offers_updated TEXT,
+      total_sold INTEGER DEFAULT 0,
+      last_updated TEXT,
+      old_price REAL,
+      price_changed INTEGER DEFAULT 0,
+      synced_at TEXT DEFAULT (datetime('now','localtime'))
+    )
+  `);
+
+  // listings マイグレーション
+  const listingsCols = queryAll('PRAGMA table_info(listings)').map(r => r.name);
+  if (listingsCols.length > 0) {
+    const newListingCols = [
+      ['cost_price', 'REAL'],
+      ['loss_stopper', 'REAL'],
+      ['high_stopper', 'REAL'],
+      ['price_tracking', "TEXT DEFAULT 'しない'"],
+      ['point', 'INTEGER DEFAULT 0'],
+      ['referral_fee', 'REAL DEFAULT 0'],
+      ['fba_fee', 'REAL DEFAULT 0'],
+      ['buybox_price', 'REAL'],
+      ['buybox_shipping', 'REAL'],
+      ['buybox_points', 'INTEGER DEFAULT 0'],
+      ['buybox_condition', 'TEXT'],
+      ['offers_updated', 'TEXT'],
+      ['total_sold', 'INTEGER DEFAULT 0'],
+      ['last_updated', 'TEXT'],
+      ['old_price', 'REAL'],
+      ['price_changed', 'INTEGER DEFAULT 0'],
+    ];
+    for (const [col, type] of newListingCols) {
+      if (!listingsCols.includes(col)) {
+        try { db.run(`ALTER TABLE listings ADD COLUMN ${col} ${type}`); } catch (e) {}
+      }
+    }
+  }
+
+  // 同期メタ情報テーブル
+  db.run(`
+    CREATE TABLE IF NOT EXISTS sync_meta (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    )
+  `);
+
   // セット商品内訳テーブル
   db.run(`
     CREATE TABLE IF NOT EXISTS product_set_items (
@@ -448,4 +520,98 @@ export function deleteProduct(id) {
 export function getProductById(id) {
   const rows = queryAll('SELECT * FROM products WHERE id = ?', [id]);
   return rows.length > 0 ? rows[0] : null;
+}
+
+// ===== Listings（在庫一覧・価格改定用） =====
+
+export function upsertListing(item) {
+  db.run(`
+    INSERT OR REPLACE INTO listings (
+      sku, asin, product_name, image_url, price, shipping_price,
+      quantity, status, condition, fulfillment, open_date,
+      listing_id, item_description,
+      cost_price, loss_stopper, high_stopper, price_tracking, point,
+      referral_fee, fba_fee,
+      buybox_price, buybox_shipping, buybox_points, buybox_condition, offers_updated,
+      total_sold, last_updated, old_price, price_changed,
+      synced_at
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,
+      COALESCE(?, (SELECT cost_price FROM listings WHERE sku = ?)),
+      COALESCE(?, (SELECT loss_stopper FROM listings WHERE sku = ?)),
+      COALESCE(?, (SELECT high_stopper FROM listings WHERE sku = ?)),
+      COALESCE(?, (SELECT price_tracking FROM listings WHERE sku = ?)),
+      COALESCE(?, (SELECT point FROM listings WHERE sku = ?)),
+      ?,?,
+      COALESCE(?, (SELECT buybox_price FROM listings WHERE sku = ?)),
+      COALESCE(?, (SELECT buybox_shipping FROM listings WHERE sku = ?)),
+      COALESCE(?, (SELECT buybox_points FROM listings WHERE sku = ?)),
+      COALESCE(?, (SELECT buybox_condition FROM listings WHERE sku = ?)),
+      COALESCE(?, (SELECT offers_updated FROM listings WHERE sku = ?)),
+      COALESCE(?, (SELECT total_sold FROM listings WHERE sku = ?)),
+      datetime('now','localtime'),
+      (SELECT price FROM listings WHERE sku = ?),
+      CASE WHEN (SELECT price FROM listings WHERE sku = ?) IS NOT NULL AND (SELECT price FROM listings WHERE sku = ?) != ? THEN 1 ELSE 0 END,
+      datetime('now','localtime')
+    )
+  `, [
+    item.sku, item.asin, item.product_name, item.image_url, item.price, item.shipping_price || 0,
+    item.quantity, item.status, item.condition, item.fulfillment, item.open_date,
+    item.listing_id, item.item_description,
+    item.cost_price || null, item.sku,
+    item.loss_stopper || null, item.sku,
+    item.high_stopper || null, item.sku,
+    item.price_tracking || null, item.sku,
+    item.point || null, item.sku,
+    item.referral_fee || 0, item.fba_fee || 0,
+    item.buybox_price || null, item.sku,
+    item.buybox_shipping || null, item.sku,
+    item.buybox_points || null, item.sku,
+    item.buybox_condition || null, item.sku,
+    item.offers_updated || null, item.sku,
+    item.total_sold || null, item.sku,
+    item.sku,
+    item.sku, item.sku, item.price,
+  ]);
+}
+
+export function syncListings(listings) {
+  for (const item of listings) {
+    upsertListing(item);
+  }
+  setSyncMeta('listings_last_sync', new Date().toISOString());
+  saveToFile();
+}
+
+export function getListings() {
+  return queryAll('SELECT * FROM listings ORDER BY product_name');
+}
+
+export function updateListing(sku, data) {
+  const EDITABLE = new Set([
+    'price', 'quantity', 'cost_price', 'loss_stopper', 'high_stopper',
+    'price_tracking', 'point', 'status',
+  ]);
+  const fields = [];
+  const params = [];
+  for (const [key, value] of Object.entries(data)) {
+    if (EDITABLE.has(key)) {
+      fields.push(`${key} = ?`);
+      params.push(value === undefined ? null : value);
+    }
+  }
+  if (fields.length === 0) return;
+  fields.push("last_updated = datetime('now','localtime')");
+  params.push(sku);
+  db.run(`UPDATE listings SET ${fields.join(', ')} WHERE sku = ?`, params);
+  saveToFile();
+}
+
+export function getSyncMeta(key) {
+  const rows = queryAll('SELECT value FROM sync_meta WHERE key = ?', [key]);
+  return rows.length > 0 ? rows[0].value : null;
+}
+
+export function setSyncMeta(key, value) {
+  db.run('INSERT OR REPLACE INTO sync_meta (key, value) VALUES (?, ?)', [key, value]);
+  saveToFile();
 }

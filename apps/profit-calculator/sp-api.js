@@ -387,6 +387,106 @@ export async function updatePrice({ sku, price }) {
   };
 }
 
+/**
+ * セラー出品レポート取得（全出品データ）
+ * GET_MERCHANT_LISTINGS_ALL_DATA レポートをダウンロードしてパース
+ * 返り値: [{sku, asin, price, quantity, status, product_name, open_date, fulfillment, ...}, ...]
+ */
+export async function getMerchantListingsReport() {
+  const sp = getClient();
+  const marketplaceId = MARKETPLACE_ID();
+
+  console.log('[SP-API] セラー出品レポート取得開始...');
+
+  // レポート作成リクエスト
+  const createRes = await sp.callAPI({
+    operation: 'createReport',
+    endpoint: 'reports',
+    body: {
+      reportType: 'GET_MERCHANT_LISTINGS_ALL_DATA',
+      marketplaceIds: [marketplaceId],
+    },
+    options: { version: '2021-06-30' },
+  });
+
+  const reportId = createRes.reportId;
+  console.log('[SP-API] レポートID:', reportId);
+
+  // レポート完了をポーリング（最大5分）
+  let reportDoc = null;
+  for (let i = 0; i < 30; i++) {
+    await sleep(10000); // 10秒待機
+    const status = await sp.callAPI({
+      operation: 'getReport',
+      endpoint: 'reports',
+      path: { reportId },
+      options: { version: '2021-06-30' },
+    });
+
+    console.log(`[SP-API] レポートステータス: ${status.processingStatus} (${i + 1}/30)`);
+
+    if (status.processingStatus === 'DONE') {
+      reportDoc = status.reportDocumentId;
+      break;
+    }
+    if (status.processingStatus === 'CANCELLED' || status.processingStatus === 'FATAL') {
+      throw new Error(`レポート生成失敗: ${status.processingStatus}`);
+    }
+  }
+
+  if (!reportDoc) throw new Error('レポート生成タイムアウト（5分）');
+
+  // レポートドキュメント取得
+  const docInfo = await sp.callAPI({
+    operation: 'getReportDocument',
+    endpoint: 'reports',
+    path: { reportDocumentId: reportDoc },
+    options: { version: '2021-06-30' },
+  });
+
+  // レポートダウンロード
+  const response = await sp.download(docInfo, { json: false });
+
+  // TSVパース
+  const lines = response.split('\n');
+  const headers = lines[0].split('\t').map(h => h.trim());
+  const listings = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    const cols = lines[i].split('\t');
+    if (cols.length < 3) continue;
+
+    const row = {};
+    headers.forEach((h, idx) => { row[h] = (cols[idx] || '').trim(); });
+
+    listings.push({
+      product_name: row['item-name'] || '',
+      sku: row['seller-sku'] || '',
+      asin: row['asin1'] || row['asin'] || '',
+      price: parseFloat(row['price']) || 0,
+      quantity: parseInt(row['quantity']) || 0,
+      status: row['status'] || '',
+      condition: row['item-condition'] || '',
+      open_date: row['open-date'] || '',
+      image_url: row['image-url'] || '',
+      fulfillment: (row['fulfillment-channel'] || '').includes('AMAZON') ? 'FBA' : 'FBM',
+      item_description: row['item-description'] || '',
+      listing_id: row['listing-id'] || '',
+      product_id: row['product-id'] || '',
+      product_id_type: row['product-id-type'] || '',
+      shipping_price: parseFloat(row['expedited-shipping']) || 0,
+      will_ship_internationally: row['will-ship-internationally'] || '',
+    });
+  }
+
+  console.log(`[SP-API] レポート取得完了: ${listings.length}件`);
+  return listings;
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 export async function patchListing({ sku, patches }) {
   const sp = getClient();
   const marketplaceId = MARKETPLACE_ID();
