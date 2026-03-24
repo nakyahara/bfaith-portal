@@ -203,6 +203,9 @@ router.post('/api/warehouse/upload', upload.single('csv'), async (req, res) => {
         barcode: obj['バーコード'] || '',
         is_y_location: (block === 'YYY' || location.toUpperCase().startsWith('Y')) ? 1 : 0,
         last_arrival_date: lastArrivalDate,
+        location_biz_type: obj['ロケ業務区分'] || '',
+        block_alloc_order: parseInt(obj['ブロック引当順'] || 9999),
+        biz_priority: obj['指定した業態を優先して取り置く'] || '',
       });
     }
 

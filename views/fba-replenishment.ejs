@@ -49,7 +49,7 @@
     .urgency-high { background: #fee2e2; }
     .urgency-mid { background: #fef3c7; }
     .rec-qty { font-weight: bold; font-size: 14px; color: #2563eb; }
-    #recTable td:nth-child(n+6):not(:nth-child(19)) { text-align: right; }
+    #recTable td:nth-child(n+6):not(:nth-child(21)) { text-align: right; }
     .sortable-rec { cursor: pointer; user-select: none; white-space: nowrap; }
     .sortable-rec:hover { background: #e5e7eb; }
     .sortable-rec::after { content: ' ⇅'; font-size: 10px; color: #999; }
@@ -203,6 +203,8 @@
               <th class="sortable-rec" data-key="warehouse_available" data-type="num">FBA用</th>
               <th class="sortable-rec" data-key="non_fba_reserve" data-type="num">他CH確保</th>
               <th class="sortable-rec" data-key="recommended_qty" data-type="num">推奨数</th>
+              <th class="sortable-rec" data-key="adjusted_qty" data-type="num">補正後</th>
+              <th data-type="num">差分</th>
               <th>アラート</th>
             </tr>
           </thead>
@@ -549,7 +551,7 @@
 
     function renderRecList(data) {
       const tbody = document.getElementById('recBody');
-      if (!data.length) { tbody.innerHTML = '<tr><td colspan="19">該当なし</td></tr>'; return; }
+      if (!data.length) { tbody.innerHTML = '<tr><td colspan="21">該当なし</td></tr>'; return; }
 
       // ソート
       data.sort((a, b) => {
@@ -586,7 +588,7 @@
         const isChecked = selectedSkus.has(r.amazon_sku);
         const urgTag = r.urgency_score >= 80 ? 'red' : r.urgency_score >= 40 ? 'yellow' : 'white';
         return `<tr class="${urgCls}" ${manualCls}>
-          <td style="text-align:center;"><input type="checkbox" class="rec-check" data-sku="${r.amazon_sku}" data-qty="${r.recommended_qty || 0}" data-urg="${urgTag}" ${isChecked ? 'checked' : ''} onchange="onCheckChange(this)"></td>
+          <td style="text-align:center;"><input type="checkbox" class="rec-check" data-sku="${r.amazon_sku}" data-qty="${r.adjusted_qty || 0}" data-urg="${urgTag}" ${isChecked ? 'checked' : ''} onchange="onCheckChange(this)"></td>
           <td style="text-align:center;font-size:11px;color:#666;">${rowNum}</td>
           <td>${r._manual ? '手動' : r.urgency_score}</td>
           <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')">${r.amazon_sku}</span></td>
@@ -603,7 +605,9 @@
           <td>${r.warehouse_raw || r.warehouse_available}</td>
           <td style="color:#2563eb;font-weight:bold">${r.warehouse_available}</td>
           <td style="${(r.non_fba_reserve || 0) > 0 ? 'font-weight:bold;color:#dc2626' : 'color:#999'}">${r.non_fba_reserve || 0}</td>
-          <td class="rec-qty">${r.recommended_qty || '-'}</td>
+          <td class="rec-qty" style="${r.recommended_qty !== r.adjusted_qty ? 'color:#999;font-size:12px;text-decoration:line-through' : ''}">${r.recommended_qty || '-'}</td>
+          <td class="rec-qty">${r.adjusted_qty || '-'}</td>
+          <td style="font-size:11px;color:${Math.abs(r.adjust_diff_pct || 0) > 0 ? '#d97706' : '#999'}">${r.adjust_diff_pct ? (r.adjust_diff_pct > 0 ? '+' : '') + r.adjust_diff_pct + '%' : '-'}</td>
           <td>${alertsHtml}</td>
         </tr>`;
       }).join('');
@@ -700,7 +704,9 @@
         group: 'フィルター（推奨リストの絞り込み）',
         desc: '少量すぎる推奨や、低在庫手数料リスクの判定に使います。',
         items: [
-          { key: 'min_shipment_cover_days', label: '最低出荷カバー日数', unit: '日', desc: '推奨数がこの日数分に満たない場合は除外。少量を何度も送る二度手間を防止。FBA在庫0の緊急時は除外しない。' },
+          { key: 'min_shipment_cover_days', label: '最低出荷カバー日数', unit: '日', desc: '推奨数がこの日数分に満たない場合は除外。少量を何度も送る二度手間を防止。FBA在庫0でも1日分未満は除外。' },
+          { key: 'round_unit', label: '数量丸め単位', unit: '個', desc: '推奨数がround_thresholdを超えた場合、この単位で丸める。ピッキング時の数えやすさ向上。' },
+          { key: 'round_threshold', label: '丸め適用閾値', unit: '個', desc: 'この数量以下は丸めない（そのまま）。21個以上で丸め適用。' },
           { key: 'fba_weekly_threshold', label: '低在庫手数料 週間売上閾値', unit: '個/7日', desc: 'FBA 7日売上がこれ以上なら中回転扱いに引き上げ。Amazon免除ライン(20個)より低く設定してバッファを確保。' },
           { key: 'daily_sku_limit', label: '日次SKU上限', unit: 'SKU', desc: '参考値。推奨リストの表示上限ではなく運用目安。' },
         ]

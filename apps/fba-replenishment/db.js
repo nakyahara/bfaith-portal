@@ -116,7 +116,7 @@ export async function initDb() {
 
   // マイグレーション: warehouse_inventory新カラム
   const whCols = queryAll('PRAGMA table_info(warehouse_inventory)').map(r => r.name);
-  for (const [col, type] of [['block','TEXT'],['reserved','INTEGER DEFAULT 0'],['available_qty','INTEGER DEFAULT 0'],['barcode','TEXT'],['last_arrival_date','TEXT']]) {
+  for (const [col, type] of [['block','TEXT'],['reserved','INTEGER DEFAULT 0'],['available_qty','INTEGER DEFAULT 0'],['barcode','TEXT'],['last_arrival_date','TEXT'],['location_biz_type','TEXT'],['block_alloc_order','INTEGER DEFAULT 9999'],['biz_priority','TEXT']]) {
     if (!whCols.includes(col)) {
       db.run(`ALTER TABLE warehouse_inventory ADD COLUMN ${col} ${type}`);
     }
@@ -273,6 +273,8 @@ export async function initDb() {
     ['large_volume_cm3', '5000'],
     ['fba_weekly_threshold', '10'],  // 7日売上がこれ以上→低在庫手数料リスク→中回転扱い
     ['min_shipment_cover_days', '7'],  // 推奨数がこの日数分に満たない場合は除外（FBA在庫0は例外）
+    ['round_unit', '5'],              // 丸め単位（個）
+    ['round_threshold', '20'],        // この数量を超えたら丸め適用
     ['weekday_boost_thu_fri', '1.5'],
     ['low_inventory_fee_threshold_days', '14'],
     ['excess_inventory_dos_threshold', '90'],
@@ -421,8 +423,9 @@ export function replaceWarehouseInventory(items) {
       db.run(`
         INSERT INTO warehouse_inventory
           (logizard_code, product_name, location, block, quantity, reserved, available_qty,
-           expiry_date, barcode, lot_no, is_y_location, last_arrival_date)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           expiry_date, barcode, lot_no, is_y_location, last_arrival_date,
+           location_biz_type, block_alloc_order, biz_priority)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
         item.logizard_code, item.product_name || null, item.location || null,
         item.block || null,
@@ -430,6 +433,9 @@ export function replaceWarehouseInventory(items) {
         item.expiry_date || null, item.barcode || null, item.lot_no || null,
         item.is_y_location ? 1 : 0,
         item.last_arrival_date || null,
+        item.location_biz_type || null,
+        parseInt(item.block_alloc_order || 9999),
+        item.biz_priority || null,
       ]);
     }
     db.run('COMMIT');
