@@ -16,7 +16,7 @@
  * 同じSKUが複数行 = セット商品（例: SKU-A → NE商品X x1 + NE商品Y x2）
  */
 import { google } from 'googleapis';
-import { upsertSkuMappings } from './db.js';
+import { upsertSkuMappings, saveNonFbaSalesSnapshot } from './db.js';
 
 const SPREADSHEET_ID = process.env.FBA_SPREADSHEET_ID || '1NruozyuL_lwdnk3WqtlRvwpB1frrbqSRVEDN9l6Uh50';
 const SHEET_NAME = '商品コード変換テーブル';
@@ -110,11 +110,15 @@ export async function syncSkuMappings() {
 
   // DB同期（全件UPSERT）
   const count = upsertSkuMappings(mappings);
-  console.log(`[Sheets] SKUマッピング同期完了: ${count}件 (セット商品: ${mappings.filter(m => m.is_set).length}件)`);
+
+  // 他CH売上スナップショット保存（UPSERT: 手動同期時はその日のデータを上書き）
+  const snapCount = saveNonFbaSalesSnapshot(mappings);
+  console.log(`[Sheets] SKUマッピング同期完了: ${count}件 (セット商品: ${mappings.filter(m => m.is_set).length}件, 売上スナップショット: ${snapCount}件)`);
 
   return {
     total: count,
     sets: mappings.filter(m => m.is_set).length,
     singles: mappings.filter(m => !m.is_set).length,
+    snapshots: snapCount,
   };
 }

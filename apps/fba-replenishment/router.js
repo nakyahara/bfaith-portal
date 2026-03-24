@@ -1,8 +1,9 @@
 /**
- * FBA在庫補充システム — ルーター (Phase 1a)
+ * FBA在庫補充システム — ルーター
  */
 import express from 'express';
 import multer from 'multer';
+import cron from 'node-cron';
 import { initDb, savePlanningData, getLatestSnapshots, getSettings, updateSetting,
          getSkuMappings, getSkuExceptions, upsertSkuException, deleteSkuException,
          getWarehouseInventory, replaceWarehouseInventory, getWarehouseSummary,
@@ -16,7 +17,21 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 // DB初期化
 let dbReady = false;
-initDb().then(() => { dbReady = true; }).catch(e => console.error('[FBA] DB初期化エラー:', e));
+initDb().then(() => {
+  dbReady = true;
+
+  // 毎日06:00 JST (21:00 UTC) にSKUマッピング同期（他CH売上スナップショット蓄積）
+  cron.schedule('0 21 * * *', async () => {
+    console.log('[FBA-Cron] SKUマッピング定期同期開始...');
+    try {
+      const result = await syncSkuMappings();
+      console.log(`[FBA-Cron] 完了: ${result.total}件 (スナップショット: ${result.snapshots}件)`);
+    } catch (e) {
+      console.error('[FBA-Cron] SKUマッピング同期エラー:', e);
+    }
+  });
+  console.log('[FBA] 定期同期スケジュール設定: 毎日06:00 JST');
+}).catch(e => console.error('[FBA] DB初期化エラー:', e));
 
 function ensureDb(req, res, next) {
   if (!dbReady) return res.status(503).json({ error: 'DB初期化中' });
@@ -169,6 +184,12 @@ router.post('/api/warehouse/upload', upload.single('csv'), async (req, res) => {
       const qty = parseInt(obj['在庫数(引当数を含む)'] || obj['在庫数'] || 0);
       const reserved = parseInt(obj['引当数'] || 0);
 
+      // 最終入荷日: YYYYMMDD → YYYY-MM-DD に正規化
+      const rawNyuka = obj['最終入荷日'] || '';
+      const lastArrivalDate = rawNyuka.length === 8
+        ? `${rawNyuka.slice(0,4)}-${rawNyuka.slice(4,6)}-${rawNyuka.slice(6,8)}`
+        : rawNyuka;
+
       items.push({
         logizard_code: obj['商品ID'] || obj['商品コード'] || '',
         product_name: obj['商品名'] || '',
@@ -181,6 +202,7 @@ router.post('/api/warehouse/upload', upload.single('csv'), async (req, res) => {
         lot_no: obj['ロット'] || '',
         barcode: obj['バーコード'] || '',
         is_y_location: (block === 'YYY' || location.toUpperCase().startsWith('Y')) ? 1 : 0,
+        last_arrival_date: lastArrivalDate,
       });
     }
 

@@ -116,7 +116,7 @@ export async function initDb() {
 
   // マイグレーション: warehouse_inventory新カラム
   const whCols = queryAll('PRAGMA table_info(warehouse_inventory)').map(r => r.name);
-  for (const [col, type] of [['block','TEXT'],['reserved','INTEGER DEFAULT 0'],['available_qty','INTEGER DEFAULT 0'],['barcode','TEXT']]) {
+  for (const [col, type] of [['block','TEXT'],['reserved','INTEGER DEFAULT 0'],['available_qty','INTEGER DEFAULT 0'],['barcode','TEXT'],['last_arrival_date','TEXT']]) {
     if (!whCols.includes(col)) {
       db.run(`ALTER TABLE warehouse_inventory ADD COLUMN ${col} ${type}`);
     }
@@ -229,7 +229,19 @@ export async function initDb() {
     db.run(`ALTER TABLE daily_snapshots ADD COLUMN product_name TEXT`);
   }
 
-  // --- 8. settings: 設定値 ---
+  // --- 8. non_fba_sales_snapshots: 他CH売上の日次スナップショット（60日保持） ---
+  db.run(`
+    CREATE TABLE IF NOT EXISTS non_fba_sales_snapshots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      snapshot_date TEXT NOT NULL,
+      amazon_sku TEXT NOT NULL,
+      non_fba_sales_7d INTEGER DEFAULT 0,
+      non_fba_sales_30d INTEGER DEFAULT 0,
+      UNIQUE(snapshot_date, amazon_sku)
+    )
+  `);
+
+  // --- 9. settings: 設定値 ---
   db.run(`
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY,
@@ -268,7 +280,7 @@ export async function initDb() {
     ['cart_alert_level3_ratio', '0.5'],
     ['missing_bsr_threshold', '5000'],
     ['working_expiry_days', '7'],
-    ['non_fba_reserve_days', '14'],
+    ['non_fba_reserve_days', '60'],
   ];
   for (const [key, value] of defaults) {
     db.run(`INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)`, [key, value]);
@@ -278,6 +290,7 @@ export async function initDb() {
   const migrations = [
     ['target_days_low_volume_small', '120', '180'],  // 120日→180日（半年分）
     ['target_days_low_volume_large', '60', '90'],     // 60日→90日（3ヶ月分）
+    ['non_fba_reserve_days', '14', '60'],             // 14日→60日（他CH確保を強化）
   ];
   for (const [key, oldVal, newVal] of migrations) {
     db.run(`UPDATE settings SET value = ?, updated_at = datetime('now','localtime') WHERE key = ? AND value = ?`, [newVal, key, oldVal]);
@@ -404,14 +417,15 @@ export function replaceWarehouseInventory(items) {
       db.run(`
         INSERT INTO warehouse_inventory
           (logizard_code, product_name, location, block, quantity, reserved, available_qty,
-           expiry_date, barcode, lot_no, is_y_location)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           expiry_date, barcode, lot_no, is_y_location, last_arrival_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
         item.logizard_code, item.product_name || null, item.location || null,
         item.block || null,
         parseInt(item.quantity || 0), parseInt(item.reserved || 0), parseInt(item.available_qty || 0),
         item.expiry_date || null, item.barcode || null, item.lot_no || null,
         item.is_y_location ? 1 : 0,
+        item.last_arrival_date || null,
       ]);
     }
     db.run('COMMIT');
@@ -469,6 +483,7 @@ export function getWarehouseSummary() {
       SUM(CASE WHEN is_y_location = 0 THEN available_qty ELSE 0 END) as warehouse_available,
       SUM(CASE WHEN is_y_location = 1 THEN quantity ELSE 0 END) as y_location_qty,
       MIN(CASE WHEN expiry_date != '' AND expiry_date IS NOT NULL THEN expiry_date END) as earliest_expiry,
+      MAX(last_arrival_date) as last_arrival_date,
       COUNT(DISTINCT location) as location_count
     FROM warehouse_inventory
     GROUP BY logizard_code
@@ -578,4 +593,63 @@ export function upsertSkuException(amazonSku, exceptionType, keepMinimumQty, rea
 export function deleteSkuException(amazonSku) {
   db.run('DELETE FROM sku_exceptions WHERE amazon_sku = ?', [amazonSku]);
   saveToFile();
+}
+
+// ===== 他CH売上スナップショット =====
+
+/**
+ * SKUマッピング同期時に他CH売上を日次スナップショットとして保存（UPSERT）
+ * 手動同期時はその日のデータを上書き
+ */
+export function saveNonFbaSalesSnapshot(mappings, snapshotDate) {
+  const today = snapshotDate || new Date().toISOString().slice(0, 10);
+
+  db.run('BEGIN TRANSACTION');
+  try {
+    for (const m of mappings) {
+      if (!m.amazon_sku) continue;
+      db.run(`
+        INSERT INTO non_fba_sales_snapshots (snapshot_date, amazon_sku, non_fba_sales_7d, non_fba_sales_30d)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(snapshot_date, amazon_sku) DO UPDATE SET
+          non_fba_sales_7d = excluded.non_fba_sales_7d,
+          non_fba_sales_30d = excluded.non_fba_sales_30d
+      `, [today, m.amazon_sku, m.non_fba_sales_7d || 0, m.non_fba_sales_30d || 0]);
+    }
+
+    // 60日超のデータを削除
+    db.run(`DELETE FROM non_fba_sales_snapshots WHERE snapshot_date < date('now', '-60 days')`);
+
+    db.run('COMMIT');
+    saveToFile();
+    return mappings.length;
+  } catch (e) {
+    db.run('ROLLBACK');
+    throw e;
+  }
+}
+
+/**
+ * SKUの他CH売上の60日間最大値を取得
+ * 欠品期間の0を無視して、実力値を返す
+ */
+export function getNonFbaMax60d(amazonSku) {
+  const row = queryOne(`
+    SELECT MAX(non_fba_sales_30d) as max_30d, MAX(non_fba_sales_7d) as max_7d
+    FROM non_fba_sales_snapshots
+    WHERE amazon_sku = ? AND snapshot_date >= date('now', '-60 days')
+  `, [amazonSku]);
+  return { max_30d: row?.max_30d || 0, max_7d: row?.max_7d || 0 };
+}
+
+/**
+ * 全SKUの60日間最大値を一括取得（推奨リスト生成用）
+ */
+export function getAllNonFbaMax60d() {
+  return queryAll(`
+    SELECT amazon_sku, MAX(non_fba_sales_30d) as max_30d, MAX(non_fba_sales_7d) as max_7d
+    FROM non_fba_sales_snapshots
+    WHERE snapshot_date >= date('now', '-60 days')
+    GROUP BY amazon_sku
+  `);
 }
