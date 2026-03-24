@@ -116,6 +116,7 @@ const categories = [
   { id: 'shipping', name: '出荷・伝票', icon: '🚚' },
   { id: 'analysis', name: '商品分析', icon: '📊' },
   { id: 'purchasing', name: '仕入れ', icon: '💰' },
+  { id: 'fba', name: 'FBA管理', icon: '📦' },
 ];
 
 // --- アプリ一覧 ---
