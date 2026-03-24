@@ -9,6 +9,9 @@
  * C: 商品名（作業指示含む）
  * D: NE商品コード（= ロジザードの商品ID）
  * E: 数量（セット商品の場合の個数）
+ * ...
+ * M: FBA以外 直近7日 売上数（ARRAYFORMULA+VLOOKUP）
+ * N: FBA以外 直近30日 売上数（ARRAYFORMULA+VLOOKUP）
  *
  * 同じSKUが複数行 = セット商品（例: SKU-A → NE商品X x1 + NE商品Y x2）
  */
@@ -17,7 +20,7 @@ import { upsertSkuMappings } from './db.js';
 
 const SPREADSHEET_ID = process.env.FBA_SPREADSHEET_ID || '1NruozyuL_lwdnk3WqtlRvwpB1frrbqSRVEDN9l6Uh50';
 const SHEET_NAME = '商品コード変換テーブル';
-const RANGE = `${SHEET_NAME}!A:E`;
+const RANGE = `${SHEET_NAME}!A:N`;
 
 async function getAuth() {
   const keyBase64 = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
@@ -61,6 +64,9 @@ export async function syncSkuMappings() {
     const productName = (row[2] || '').trim();
     const neCode = (row[3] || '').trim();
     const qty = parseInt(row[4] || 1);
+    // M列(index 12) = FBA以外7日売上, N列(index 13) = FBA以外30日売上
+    const nonFbaSales7d = parseInt(row[12] || 0);
+    const nonFbaSales30d = parseInt(row[13] || 0);
 
     if (!sku) continue;
 
@@ -69,6 +75,8 @@ export async function syncSkuMappings() {
         amazon_sku: sku,
         asin: asin,
         product_name: productName,
+        non_fba_sales_7d: nonFbaSales7d,
+        non_fba_sales_30d: nonFbaSales30d,
         components: [],
       };
     }
@@ -95,6 +103,8 @@ export async function syncSkuMappings() {
       logizard_code: primaryComponent.ne_code || null, // NE商品コード = ロジザード商品ID
       is_set: isSet,
       set_components: isSet ? group.components : null,
+      non_fba_sales_7d: group.non_fba_sales_7d || 0,
+      non_fba_sales_30d: group.non_fba_sales_30d || 0,
     };
   });
 
