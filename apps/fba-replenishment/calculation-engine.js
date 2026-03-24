@@ -16,7 +16,7 @@ import { getLatestSnapshots, getSkuMappings, getSkuExceptions, getSettings,
  *   2. 目標日数(target_days) — 推奨に上がった時に何日分送るかの量
  *   → 低回転商品は発注点30日、目標180日（半年分）= たまに推奨に上がるが、上がったらまとめて送る
  *
- * 日次SKU上限(daily_sku_limit) — 緊急度スコア順で上位N件のみ「今日の推奨」
+ * 発注点で自然に絞り込み、ハードリミットは設けない
  */
 export function generateRecommendations(debug = false) {
   const settings = getSettings();
@@ -40,8 +40,6 @@ export function generateRecommendations(debug = false) {
 
   const snapshotDate = snapshots[0]?.snapshot_date;
   const workingExpiryDays = parseInt(settings.working_expiry_days || 7);
-  const dailySkuLimit = parseInt(settings.daily_sku_limit || 100);
-
   const items = [];
 
   for (const snap of snapshots) {
@@ -203,30 +201,16 @@ export function generateRecommendations(debug = false) {
   // 緊急度スコア降順でソート
   items.sort((a, b) => b.urgency_score - a.urgency_score);
 
-  // 補充が必要なSKU（発注点を下回ったもの）
-  const needsItems = items.filter(i => i.recommended_qty > 0);
-
-  // 今日の推奨: 緊急度上位N件に絞る
-  const todayItems = needsItems.slice(0, dailySkuLimit);
-  const todaySkus = new Set(todayItems.map(i => i.amazon_sku));
-
-  // 各アイテムに「今日の推奨」フラグを付与
-  for (const item of items) {
-    item.is_today = todaySkus.has(item.amazon_sku);
-  }
+  // 補充推奨SKU（発注点を下回ったもの）
+  const recommendedItems = items.filter(i => i.recommended_qty > 0);
 
   return {
     items,
     generated_at: new Date().toISOString(),
     snapshot_date: snapshotDate,
     total_skus: items.length,
-    // 発注点を下回った全SKU数
-    needs_replenishment_skus: needsItems.length,
-    needs_replenishment_units: needsItems.reduce((s, i) => s + i.recommended_qty, 0),
-    // 今日の推奨（上限適用後）
-    today_skus: todayItems.length,
-    today_units: todayItems.reduce((s, i) => s + i.recommended_qty, 0),
-    daily_sku_limit: dailySkuLimit,
+    recommended_skus: recommendedItems.length,
+    recommended_units: recommendedItems.reduce((s, i) => s + i.recommended_qty, 0),
     errors: [],
   };
 }

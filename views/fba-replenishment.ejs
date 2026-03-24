@@ -108,22 +108,16 @@
       <!-- サマリーカード -->
       <div class="status-row" style="margin-bottom:16px;">
         <div class="stat" style="border-left:4px solid #2563eb;">
-          <div class="label">今日の推奨</div>
-          <div class="value" id="todaySkus" style="color:#2563eb;">-</div>
-          <div class="label"><span id="todayUnits">-</span> 個</div>
+          <div class="label">推奨SKU数</div>
+          <div class="value" id="recSkus" style="color:#2563eb;">-</div>
         </div>
-        <div class="stat">
-          <div class="label">補充必要 全体</div>
-          <div class="value" id="needsSkus">-</div>
-          <div class="label"><span id="needsUnits">-</span> 個</div>
+        <div class="stat" style="border-left:4px solid #16a34a;">
+          <div class="label">推奨合計数量</div>
+          <div class="value" id="recUnits" style="color:#16a34a;">-</div>
         </div>
         <div class="stat">
           <div class="label">全SKU</div>
           <div class="value" id="totalSkus">-</div>
-        </div>
-        <div class="stat">
-          <div class="label">日次SKU上限</div>
-          <div class="value" id="dailyLimit">-</div>
         </div>
         <div class="stat">
           <div class="label">データ日付</div>
@@ -133,8 +127,7 @@
 
       <!-- フィルター -->
       <div style="margin-bottom:8px; display:flex; gap:16px; align-items:center; flex-wrap:wrap;">
-        <label style="font-weight:bold;"><input type="radio" name="recFilter" value="today" checked onchange="filterRecList()"> 今日の推奨のみ</label>
-        <label><input type="radio" name="recFilter" value="needs" onchange="filterRecList()"> 補充必要 全件</label>
+        <label style="font-weight:bold;"><input type="radio" name="recFilter" value="recommended" checked onchange="filterRecList()"> 推奨のみ</label>
         <label><input type="radio" name="recFilter" value="all" onchange="filterRecList()"> 全SKU</label>
         <span style="margin-left:auto;color:#666;font-size:12px;" id="recFilterCount"></span>
       </div>
@@ -370,7 +363,7 @@
         recData = d.items || [];
         recMeta = d;
         manualItems = [];
-        log(`完了! 全${d.total_skus}SKU / 補充必要${d.needs_replenishment_skus}SKU / 今日の推奨${d.today_skus}SKU(${d.today_units}個) / 上限${d.daily_sku_limit}SKU`);
+        log(`完了! 全${d.total_skus}SKU / 推奨${d.recommended_skus}SKU / 合計${d.recommended_units}個`);
         document.getElementById('recSection').style.display = '';
         updateRecSummary();
         filterRecList();
@@ -382,20 +375,16 @@
     }
 
     function updateRecSummary() {
-      document.getElementById('todaySkus').textContent = (recMeta.today_skus || 0) + ' SKU';
-      document.getElementById('todayUnits').textContent = (recMeta.today_units || 0).toLocaleString();
-      document.getElementById('needsSkus').textContent = (recMeta.needs_replenishment_skus || 0) + ' SKU';
-      document.getElementById('needsUnits').textContent = (recMeta.needs_replenishment_units || 0).toLocaleString();
+      document.getElementById('recSkus').textContent = (recMeta.recommended_skus || 0) + ' SKU';
+      document.getElementById('recUnits').textContent = (recMeta.recommended_units || 0).toLocaleString() + ' 個';
       document.getElementById('totalSkus').textContent = recMeta.total_skus || 0;
-      document.getElementById('dailyLimit').textContent = recMeta.daily_sku_limit || 100;
       document.getElementById('snapshotDateDisp').textContent = recMeta.snapshot_date || '-';
     }
 
     function filterRecList() {
-      const mode = document.querySelector('input[name="recFilter"]:checked')?.value || 'today';
+      const mode = document.querySelector('input[name="recFilter"]:checked')?.value || 'recommended';
       let filtered = recData;
-      if (mode === 'today') filtered = filtered.filter(r => r.is_today || r._manual);
-      else if (mode === 'needs') filtered = filtered.filter(r => r.recommended_qty > 0 || r._manual);
+      if (mode === 'recommended') filtered = filtered.filter(r => r.recommended_qty > 0 || r._manual);
       // 手動追加アイテムを先頭に含める
       const combined = [...manualItems.filter(m => !filtered.find(r => r.amazon_sku === m.amazon_sku)), ...filtered];
       renderRecList(combined);
@@ -443,10 +432,10 @@
       skuInput.value = '';
       qtyInput.value = '';
       filterRecList();
-      // サマリー更新
-      const todayFiltered = [...recData.filter(r => r.is_today), ...manualItems];
-      recMeta.today_skus = todayFiltered.length;
-      recMeta.today_units = todayFiltered.reduce((s, i) => s + (i.recommended_qty || 0), 0);
+      // サマリー更新（手動追加を含む）
+      const allRec = [...recData.filter(r => r.recommended_qty > 0), ...manualItems];
+      recMeta.recommended_skus = allRec.length;
+      recMeta.recommended_units = allRec.reduce((s, i) => s + (i.recommended_qty || 0), 0);
       updateRecSummary();
     }
 
