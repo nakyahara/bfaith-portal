@@ -35,6 +35,12 @@
     .working-warn { color: #d97706; background: #fef3c7; }
     .working-expired { color: #dc2626; background: #fee2e2; text-decoration: line-through; }
     .working-days { font-size: 11px; color: #666; }
+    .sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+    .sortable:hover { background: #e5e7eb; }
+    .sortable::after { content: ' ⇅'; font-size: 10px; color: #999; }
+    .sortable.asc::after { content: ' ▲'; color: #2563eb; }
+    .sortable.desc::after { content: ' ▼'; color: #2563eb; }
+    .product-name { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
   </style>
 </head>
 <body>
@@ -79,14 +85,21 @@
         <table class="data-table" id="snapshotTable">
           <thead>
             <tr>
-              <th>SKU</th><th>FBA在庫</th>
-              <th>準備中</th><th>輸送中</th><th>受領中</th>
-              <th>供給日数</th>
-              <th>7日売上</th><th>30日売上</th><th>順位</th>
-              <th>自社価格</th><th>カート価格</th>
+              <th class="sortable" data-key="amazon_sku">SKU</th>
+              <th class="sortable" data-key="product_name">商品名</th>
+              <th class="sortable" data-key="fba_available" data-type="num">FBA在庫</th>
+              <th class="sortable" data-key="fba_inbound_working" data-type="num">準備中</th>
+              <th class="sortable" data-key="fba_inbound_shipped" data-type="num">輸送中</th>
+              <th class="sortable" data-key="fba_inbound_received" data-type="num">受領中</th>
+              <th class="sortable" data-key="days_of_supply" data-type="num">供給日数</th>
+              <th class="sortable" data-key="units_sold_7d" data-type="num">7日売上</th>
+              <th class="sortable" data-key="units_sold_30d" data-type="num">30日売上</th>
+              <th class="sortable" data-key="sales_rank" data-type="num">順位</th>
+              <th class="sortable" data-key="your_price" data-type="num">自社価格</th>
+              <th class="sortable" data-key="featured_offer_price" data-type="num">カート価格</th>
             </tr>
           </thead>
-          <tbody id="snapshotBody"><tr><td colspan="11">データなし — レポートを取得してください</td></tr></tbody>
+          <tbody id="snapshotBody"><tr><td colspan="12">データなし — レポートを取得してください</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -117,21 +130,59 @@
       try {
         const res = await fetch(`${BASE}/api/snapshots/latest`);
         const d = await res.json();
-        const tbody = document.getElementById('snapshotBody');
-        if (!d.data || d.data.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="11">データなし</td></tr>';
-          return;
+        snapshotData = d.data || [];
+        if (sortKey) {
+          sortAndRender();
+        } else {
+          renderSnapshot(snapshotData);
         }
-        tbody.innerHTML = d.data.map(r => {
-          const w = r.fba_inbound_working || 0;
-          let workingHtml = String(w);
-          if (w > 0 && r.working_first_seen) {
-            const days = Math.floor((new Date(d.data[0]?.snapshot_date || new Date()) - new Date(r.working_first_seen)) / 86400000);
-            const cls = days >= 7 ? 'working-expired' : days >= 4 ? 'working-warn' : 'working-fresh';
-            workingHtml = `<span class="${cls}">${w}</span> <span class="working-days">${days}日</span>`;
-          }
-          return `<tr>
+      } catch (e) { log('スナップショット読込エラー: ' + e.message); }
+    }
+
+    // ソート機能
+    let snapshotData = [];
+    let sortKey = null;
+    let sortDir = 'asc';
+
+    function sortAndRender() {
+      if (!sortKey || !snapshotData.length) return;
+      const th = document.querySelector(`th[data-key="${sortKey}"]`);
+      const isNum = th?.dataset.type === 'num';
+
+      snapshotData.sort((a, b) => {
+        let va = a[sortKey], vb = b[sortKey];
+        if (isNum) {
+          va = parseFloat(va) || 0;
+          vb = parseFloat(vb) || 0;
+        } else {
+          va = String(va || '');
+          vb = String(vb || '');
+        }
+        if (va < vb) return sortDir === 'asc' ? -1 : 1;
+        if (va > vb) return sortDir === 'asc' ? 1 : -1;
+        return 0;
+      });
+      renderSnapshot(snapshotData);
+    }
+
+    function renderSnapshot(data) {
+      const tbody = document.getElementById('snapshotBody');
+      if (!data || data.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="12">データなし</td></tr>';
+        return;
+      }
+      const snapDate = data[0]?.snapshot_date;
+      tbody.innerHTML = data.map(r => {
+        const w = r.fba_inbound_working || 0;
+        let workingHtml = String(w);
+        if (w > 0 && r.working_first_seen) {
+          const days = Math.floor((new Date(snapDate || new Date()) - new Date(r.working_first_seen)) / 86400000);
+          const cls = days >= 7 ? 'working-expired' : days >= 4 ? 'working-warn' : 'working-fresh';
+          workingHtml = `<span class="${cls}">${w}</span> <span class="working-days">${days}日</span>`;
+        }
+        return `<tr>
           <td>${r.amazon_sku}</td>
+          <td class="product-name" title="${r.product_name || ''}">${r.product_name || ''}</td>
           <td>${r.fba_available}</td>
           <td>${workingHtml}</td>
           <td>${r.fba_inbound_shipped || 0}</td>
@@ -143,9 +194,23 @@
           <td>${r.your_price ? '¥' + Number(r.your_price).toLocaleString() : '-'}</td>
           <td>${r.featured_offer_price ? '¥' + Number(r.featured_offer_price).toLocaleString() : '-'}</td>
         </tr>`;
-        }).join('');
-      } catch (e) { log('スナップショット読込エラー: ' + e.message); }
+      }).join('');
     }
+
+    document.addEventListener('click', e => {
+      const th = e.target.closest('th.sortable');
+      if (!th) return;
+      const key = th.dataset.key;
+      if (sortKey === key) {
+        sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+      } else {
+        sortKey = key;
+        sortDir = 'asc';
+      }
+      document.querySelectorAll('th.sortable').forEach(t => t.classList.remove('asc', 'desc'));
+      th.classList.add(sortDir);
+      sortAndRender();
+    });
 
     async function fetchReports() {
       const btn = document.getElementById('btnFetchAll');

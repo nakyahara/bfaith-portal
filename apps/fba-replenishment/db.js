@@ -177,6 +177,7 @@ export async function initDb() {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       snapshot_date TEXT NOT NULL,
       amazon_sku TEXT NOT NULL,
+      product_name TEXT,
       fba_available INTEGER DEFAULT 0,
       fba_inbound_working INTEGER DEFAULT 0,
       fba_inbound_shipped INTEGER DEFAULT 0,
@@ -201,6 +202,9 @@ export async function initDb() {
   }
   if (!snapCols.includes('working_first_seen')) {
     db.run(`ALTER TABLE daily_snapshots ADD COLUMN working_first_seen TEXT`);
+  }
+  if (!snapCols.includes('product_name')) {
+    db.run(`ALTER TABLE daily_snapshots ADD COLUMN product_name TEXT`);
   }
 
   // --- 8. settings: 設定値 ---
@@ -281,15 +285,16 @@ export function savePlanningData(rows, snapshotDate) {
 
       db.run(`
         INSERT OR REPLACE INTO daily_snapshots
-          (snapshot_date, amazon_sku, fba_available,
+          (snapshot_date, amazon_sku, product_name, fba_available,
            fba_inbound_working, fba_inbound_shipped, fba_inbound_received,
            working_first_seen,
            days_of_supply, units_sold_7d, units_sold_30d,
            sales_rank, your_price, featured_offer_price)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
         today,
         sku,
+        row.product_name || '',
         row.fba_available || 0,
         workingQty,
         row.fba_inbound_shipped || 0,
