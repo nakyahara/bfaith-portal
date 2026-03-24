@@ -53,6 +53,13 @@
     .sortable-rec::after { content: ' ⇅'; font-size: 10px; color: #999; }
     .sortable-rec.asc::after { content: ' ▲'; color: #2563eb; }
     .sortable-rec.desc::after { content: ' ▼'; color: #2563eb; }
+    .sku-link { color: #2563eb; cursor: pointer; text-decoration: underline; }
+    .sku-link:hover { color: #1d4ed8; }
+    .debug-modal { position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%); background: white; border-radius: 12px; padding: 24px; box-shadow: 0 8px 32px rgba(0,0,0,0.3); max-width: 800px; width: 90%; max-height: 80vh; overflow-y: auto; z-index: 1000; }
+    .debug-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.4); z-index: 999; }
+    .debug-step { font-family: monospace; font-size: 13px; padding: 4px 0; border-bottom: 1px solid #f0f0f0; }
+    .debug-step:last-child { border-bottom: none; }
+    .debug-close { position: absolute; top: 12px; right: 16px; font-size: 24px; cursor: pointer; color: #666; }
   </style>
 </head>
 <body>
@@ -314,7 +321,7 @@
       log('推奨リスト生成中...');
 
       try {
-        const res = await fetch(`${BASE}/api/recommendations`);
+        const res = await fetch(`${BASE}/api/recommendations?debug=1`);
         const d = await res.json();
         if (d.error) { log('エラー: ' + d.error); return; }
         if (d.errors && d.errors.length) { d.errors.forEach(e => log('警告: ' + e)); }
@@ -363,7 +370,7 @@
         const dosColor = r.days_of_supply < 7 ? 'color:#dc2626;font-weight:bold' : r.days_of_supply < 14 ? 'color:#d97706' : '';
         return `<tr class="${urgCls}">
           <td>${r.urgency_score}</td>
-          <td>${r.amazon_sku}</td>
+          <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')">${r.amazon_sku}</span></td>
           <td class="product-name" title="${r.product_name}">${r.product_name}</td>
           <td>${r.fba_available}</td>
           <td>${r.effective_fba_stock}</td>
@@ -399,6 +406,29 @@
       th2.classList.add(sortDir);
       sortAndRender();
     });
+
+    function showCalcDetail(sku) {
+      const item = recData.find(r => r.amazon_sku === sku);
+      if (!item) return;
+      const steps = item.calc_steps || ['デバッグ情報なし'];
+      const html = `
+        <div class="debug-overlay" onclick="this.parentElement.remove()"></div>
+        <div class="debug-modal">
+          <span class="debug-close" onclick="this.parentElement.parentElement.remove()">&times;</span>
+          <h3 style="margin:0 0 8px">${sku}</h3>
+          <p style="color:#666;margin:0 0 12px;font-size:13px">${item.product_name || ''}</p>
+          <div style="margin-bottom:12px;">
+            <strong>NE商品コード:</strong> ${item.ne_code || '-'} |
+            <strong>ASIN:</strong> ${item.asin || '-'} |
+            <strong>セット:</strong> ${item.is_set ? 'はい' : 'いいえ'}
+          </div>
+          <h4 style="margin:12px 0 8px;">計算過程</h4>
+          ${steps.map(s => `<div class="debug-step">${s}</div>`).join('')}
+        </div>`;
+      const div = document.createElement('div');
+      div.innerHTML = html;
+      document.body.appendChild(div);
+    }
 
     async function syncSkuMappings() {
       const btn = document.getElementById('btnSyncSku');

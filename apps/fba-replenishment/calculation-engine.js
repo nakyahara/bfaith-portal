@@ -9,8 +9,9 @@ import { getLatestSnapshots, getSkuMappings, getSkuExceptions, getSettings,
 
 /**
  * 推奨リストを生成
+ * @param {boolean} debug - trueの場合、各SKUの計算過程をcalc_stepsに記録
  */
-export function generateRecommendations() {
+export function generateRecommendations(debug = false) {
   const settings = getSettings();
   const snapshots = getLatestSnapshots();
   const mappings = getSkuMappings();
@@ -125,6 +126,25 @@ export function generateRecommendations() {
     // --- SKU例外処理 ---
     const exception = exceptionMap[sku];
 
+    // --- デバッグ: 計算過程の記録 ---
+    let calc_steps = null;
+    if (debug) {
+      const perUnitVol = snap.per_unit_volume || mapping.per_unit_volume || 0;
+      const whRaw = mapping.is_set ? '(セット)' : (warehouseMap[mapping.logizard_code || mapping.ne_code]?.warehouse_available || 0);
+      calc_steps = [
+        `[Step1] 実質FBA在庫 = ${fbaAvailable}(販売可能) + ${inboundShipped}(輸送中) + ${inboundReceived}(受領中) + ${inboundWorking}(準備中${snap.fba_inbound_working > 0 && inboundWorking === 0 ? ',7日超で除外' : ''}) = ${effectiveFbaStock}`,
+        `[Step2] 1日あたり販売数 = ${sold30d}(30日売上) ÷ 30 = ${(dailySales).toFixed(2)}個/日`,
+        `[Step3] 目標日数 = ${targetDays}日 (30日売上:${sold30d}個, サイズ:${perUnitVol}cm³${perUnitVol > 5000 ? '→大型' : perUnitVol > 500 ? '→中型' : perUnitVol > 0 ? '→小型' : '→不明'})`,
+        `[Step4] 供給日数 = ${effectiveFbaStock} ÷ ${dailySales.toFixed(2)} = ${daysOfSupply === 999 ? '∞(販売0,在庫あり)' : daysOfSupply.toFixed(1) + '日'}`,
+        `[Step5] 必要補充数 = ceil(${dailySales.toFixed(2)} × ${targetDays}) - ${effectiveFbaStock} = ${targetStock} - ${effectiveFbaStock} = ${rawNeeded}`,
+        `[Step6] 倉庫在庫 = ${whRaw}(倉庫,Yロケ除外) - ${nonFbaDailyReserve}(他CH確保: ${nonFbaSales30d}÷30×${settings.non_fba_reserve_days || 14}日) = ${warehouseAvailable}`,
+        `[Step7] 推奨数 = min(${rawNeeded}(必要数), ${warehouseAvailable}(送れる数)) = ${recommendedQty}`,
+        `[Step8] 曜日調整 = ${recommendedQty} × ${weekdayMultiplier}(${dayOfWeek === 4 ? '木' : dayOfWeek === 5 ? '金' : '平日'}) = ${adjustedQty}${!skuDayMatch ? ' ※今日は対象外(SKU分散)' : ''}`,
+        `[Step9] 緊急度 = ${urgencyScore.toFixed(1)} (基本:${Math.max(0, 100 - (daysOfSupply * 100 / 40)).toFixed(0)}, 月商W:${Math.min((snap.your_price || 0) * sold30d / 100000, 5).toFixed(1)}, トレンド:${sold30d > 0 ? ((sold7d / 7 * 30) / sold30d).toFixed(1) : '-'})`,
+        `[Step10] アラート: ${alerts.length > 0 ? alerts.map(a => a.message).join(' / ') : 'なし'}`,
+      ];
+    }
+
     items.push({
       amazon_sku: sku,
       asin: mapping.asin || '',
@@ -176,6 +196,9 @@ export function generateRecommendations() {
 
       // 例外
       exception_type: exception?.exception_type || null,
+
+      // デバッグ
+      calc_steps: calc_steps,
     });
   }
 

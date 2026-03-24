@@ -237,10 +237,24 @@ router.get('/api/plans/:id/items', (req, res) => {
 // ===== 推奨リスト =====
 router.get('/api/recommendations', (req, res) => {
   try {
-    const result = generateRecommendations();
+    const debug = req.query.debug === '1' || req.query.debug === 'true';
+    const result = generateRecommendations(debug);
     res.json(result);
   } catch (e) {
     console.error('[FBA] 推奨リスト生成エラー:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 個別SKUの計算詳細
+router.get('/api/recommendations/:sku', (req, res) => {
+  try {
+    const result = generateRecommendations(true);
+    const item = result.items.find(i => i.amazon_sku === req.params.sku);
+    if (!item) return res.status(404).json({ error: 'SKUが見つかりません' });
+    res.json(item);
+  } catch (e) {
+    console.error('[FBA] SKU詳細エラー:', e);
     res.status(500).json({ error: e.message });
   }
 });
