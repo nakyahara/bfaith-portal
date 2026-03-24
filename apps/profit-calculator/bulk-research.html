@@ -103,6 +103,11 @@
     .row-highlight { background: #f0fff0 !important; }
     .row-dim { opacity: 0.4; }
 
+    /* 自社出荷列 */
+    .fbm-col { background: #fffde7 !important; }
+    td.fbm-col { background: #fffdf0 !important; }
+    .shipping-method { font-size: 10px; color: #565959; display: block; }
+
     /* チェックボックス */
     .cb { width: 16px; height: 16px; cursor: pointer; }
   </style>
@@ -135,7 +140,10 @@ JANコード,商品名,卸価格
 4901234567890,○○シャンプー 500ml,800
 4901234567891,○○コンディショナー 500ml,750"></textarea>
           <div class="hint">ヘッダー行あり。JAN（またはEAN/バーコード）と卸価格が含まれるCSVを貼り付けてください。</div>
-          <input type="file" id="csvFile" accept=".csv,.tsv,.txt">
+          <div style="display: flex; gap: 8px; align-items: center; margin-top: 8px;">
+            <input type="file" id="csvFile" accept=".csv,.tsv,.txt">
+            <button class="btn btn-sm btn-success" onclick="downloadTemplate()" title="CSVテンプレートをダウンロード">📄 テンプレートDL</button>
+          </div>
         </div>
         <div class="settings-box">
           <h3>設定</h3>
@@ -159,6 +167,41 @@ JANコード,商品名,卸価格
           <div class="setting-row">
             <label>出品者数上限</label>
             <input type="number" id="maxSellers" value="15" min="1">
+          </div>
+          <div class="setting-row">
+            <label>出荷方法比較</label>
+            <select id="fulfillmentMode">
+              <option value="fba_only">FBAのみ</option>
+              <option value="both" selected>FBA＋自社出荷</option>
+              <option value="fbm_only">自社出荷のみ</option>
+            </select>
+          </div>
+          <div id="fbmShippingSettings">
+            <div class="setting-row">
+              <label>自社送料判定</label>
+              <select id="fbmShippingMode">
+                <option value="easyship" selected>Amazon EasyShip</option>
+                <option value="auto">サイズ自動判定(フルコスト)</option>
+                <option value="fixed">固定額を指定</option>
+              </select>
+            </div>
+            <div id="easyshipInfo" style="margin-top:4px;">
+              <div style="font-size:11px; color:#565959; padding:4px 0;">厚さ3cm以下: ¥165 / 超: ¥210</div>
+              <div class="setting-row">
+                <label>小型(3cm以下)</label>
+                <input type="number" id="easyshipSmall" value="165" min="0" style="width: 70px;">円
+              </div>
+              <div class="setting-row">
+                <label>大型(3cm超)</label>
+                <input type="number" id="easyshipLarge" value="210" min="0" style="width: 70px;">円
+              </div>
+            </div>
+            <div id="fixedShippingRow" style="display:none;">
+              <div class="setting-row">
+                <label>固定送料</label>
+                <input type="number" id="fixedShipping" value="237" min="0" style="width: 80px;">円
+              </div>
+            </div>
           </div>
           <div class="setting-row">
             <label>仕入先コード</label>
@@ -195,8 +238,9 @@ JANコード,商品名,卸価格
       <!-- サマリー -->
       <div class="summary-cards" id="summaryCards">
         <div class="summary-card"><div class="sc-value" id="sumTotal">0</div><div class="sc-label">全件数</div></div>
-        <div class="summary-card good"><div class="sc-value" id="sumGood">0</div><div class="sc-label">利益率10%+</div></div>
-        <div class="summary-card"><div class="sc-value" id="sumExcellent">0</div><div class="sc-label">◎ 30%+</div></div>
+        <div class="summary-card good"><div class="sc-value" id="sumGood">0</div><div class="sc-label">FBA利益率10%+</div></div>
+        <div class="summary-card"><div class="sc-value" id="sumExcellent">0</div><div class="sc-label">FBA ◎ 30%+</div></div>
+        <div class="summary-card good fbm-summary" style="background:#fffdf0;"><div class="sc-value" id="sumFbmGood">0</div><div class="sc-label">自社利益率10%+</div></div>
         <div class="summary-card"><div class="sc-value" id="sumNotFound">0</div><div class="sc-label">未発見</div></div>
         <div class="summary-card"><div class="sc-value" id="sumErrors">0</div><div class="sc-label">エラー</div></div>
       </div>
@@ -213,9 +257,11 @@ JANコード,商品名,卸価格
           <option value="not_found">未発見のみ</option>
         </select>
         <select id="sortBy" onchange="applyFilter()">
-          <option value="profitRate-desc">利益率 高い順</option>
-          <option value="profitRate-asc">利益率 低い順</option>
-          <option value="profit-desc">利益額 高い順</option>
+          <option value="profitRate-desc">FBA利益率 高い順</option>
+          <option value="profitRate-asc">FBA利益率 低い順</option>
+          <option value="profit-desc">FBA利益額 高い順</option>
+          <option value="_fbmProfitRate-desc">自社利益率 高い順</option>
+          <option value="_fbmProfit-desc">自社利益額 高い順</option>
           <option value="estSales-desc">推定販売数 多い順</option>
           <option value="salesRank-asc">ランキング 高い順</option>
           <option value="offerCount-asc">出品者数 少ない順</option>
@@ -237,10 +283,14 @@ JANコード,商品名,卸価格
             <th>JAN</th>
             <th class="num">卸価格</th>
             <th class="num">販売価格</th>
-            <th class="num">手数料</th>
-            <th class="num">利益</th>
-            <th class="num">利益率</th>
-            <th>判定</th>
+            <th class="num">FBA手数料</th>
+            <th class="num">FBA利益</th>
+            <th class="num">FBA利益率</th>
+            <th>FBA判定</th>
+            <th class="num fbm-col" style="background:#fff8e1;">自社送料</th>
+            <th class="num fbm-col" style="background:#fff8e1;">自社利益</th>
+            <th class="num fbm-col" style="background:#fff8e1;">自社利益率</th>
+            <th class="fbm-col" style="background:#fff8e1;">自社判定</th>
             <th class="num">ランキング</th>
             <th class="num">推定月販</th>
             <th class="num">出品者</th>
@@ -257,6 +307,128 @@ JANコード,商品名,卸価格
 let allResults = [];
 let parsedRows = [];
 let headers = [];
+let shippingTable = [];
+
+// ===== 送料テーブル読み込み =====
+(async function loadShippingTable() {
+  try {
+    const res = await fetch('./api/shipping');
+    shippingTable = await res.json();
+  } catch (e) { console.error('送料テーブル読み込みエラー:', e); }
+})();
+
+// ===== 自社出荷設定UI連動 =====
+document.getElementById('fbmShippingMode').addEventListener('change', (e) => {
+  document.getElementById('fixedShippingRow').style.display = e.target.value === 'fixed' ? '' : 'none';
+  document.getElementById('easyshipInfo').style.display = e.target.value === 'easyship' ? '' : 'none';
+});
+document.getElementById('fulfillmentMode').addEventListener('change', (e) => {
+  document.getElementById('fbmShippingSettings').style.display = e.target.value === 'fba_only' ? 'none' : '';
+  toggleFbmColumns(e.target.value !== 'fba_only');
+});
+function toggleFbmColumns(show) {
+  document.querySelectorAll('.fbm-col').forEach(el => { el.style.display = show ? '' : 'none'; });
+}
+
+// ===== CSVテンプレートDL =====
+function downloadTemplate() {
+  const bom = '\uFEFF';
+  const header = 'JANコード,商品名,卸価格(税抜)';
+  const sample = [
+    '4901234567890,○○シャンプー 500ml,800',
+    '4901234567891,○○コンディショナー 500ml,750',
+    '4901234567892,○○トリートメント 300g,1200',
+  ];
+  const csv = bom + header + '\n' + sample.join('\n') + '\n';
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = '一括リサーチ_テンプレート.csv';
+  a.click();
+}
+
+// ===== 送料自動判定 =====
+function calcFbmShipping(dims) {
+  const mode = document.getElementById('fbmShippingMode').value;
+
+  // Amazon EasyShipモード
+  if (mode === 'easyship') {
+    const smallCost = parseInt(document.getElementById('easyshipSmall').value) || 165;
+    const largeCost = parseInt(document.getElementById('easyshipLarge').value) || 210;
+    const h = parseFloat(dims?.height) || 0;
+    const l = parseFloat(dims?.length) || 0;
+    const w = parseFloat(dims?.width) || 0;
+    // 最小辺を厚さとみなす（Amazonの寸法は長い順でない場合がある）
+    const minDim = (l > 0 && w > 0 && h > 0) ? Math.min(l, w, h) : h;
+
+    if (minDim === 0) {
+      // 寸法不明 → 小型(165円)をデフォルト
+      return { cost: smallCost, method: 'EasyShip小型(寸法不明)' };
+    }
+    if (minDim <= 3) {
+      return { cost: smallCost, method: 'EasyShip小型' };
+    }
+    return { cost: largeCost, method: 'EasyShip大型' };
+  }
+
+  // 固定額モード
+  if (mode === 'fixed') {
+    return { cost: parseInt(document.getElementById('fixedShipping').value) || 0, method: '固定額' };
+  }
+
+  // サイズ自動判定(フルコスト): dims = { length, width, height, weight } (cm, kg)
+  const l = parseFloat(dims?.length) || 0;
+  const w = parseFloat(dims?.width) || 0;
+  const h = parseFloat(dims?.height) || 0;
+  const weightG = (parseFloat(dims?.weight) || 0) * 1000; // kg→g
+  const threeSum = l + w + h;
+
+  if (l === 0 && w === 0 && h === 0) {
+    // 寸法不明 → ネコポス（237円）をデフォルト
+    return { cost: 237, method: 'ネコポス(寸法不明)' };
+  }
+
+  // 送料テーブルから条件マッチ（コスト昇順でソート済み）
+  for (const s of shippingTable) {
+    // サイズ条件パース
+    if (s.name.includes('定形内') && l <= 23.5 && w <= 12 && h <= 1 && weightG <= parseInt(s.weight || 0)) {
+      return { cost: s.total, method: s.name };
+    }
+    if (s.name === 'ネコポス' && l <= 31.2 && w <= 22.8 && h <= 3 && weightG <= 1000) {
+      return { cost: s.total, method: s.name };
+    }
+    if (s.name === 'クリックポスト' && l <= 34 && w <= 25 && h <= 3 && weightG <= 1000) {
+      return { cost: s.total, method: s.name };
+    }
+    if (s.name.includes('定形外規格内') && l <= 34 && w <= 25 && h <= 3 && weightG <= parseInt(s.weight || 0)) {
+      return { cost: s.total, method: s.name };
+    }
+    if (s.name.includes('定形外規格外') && l <= 60 && threeSum <= 90 && weightG <= parseInt(s.weight || 0)) {
+      return { cost: s.total, method: s.name };
+    }
+    if (s.name === 'ゆうパケットパフ' && h <= 7 && weightG <= 1000) {
+      return { cost: s.total, method: s.name };
+    }
+    if (s.name === '宅急便50サイズ' && threeSum <= 50 && weightG <= 2000) {
+      return { cost: s.total, method: s.name };
+    }
+    if (s.name === '宅急便60サイズ' && threeSum <= 60 && weightG <= 2000) {
+      return { cost: s.total, method: s.name };
+    }
+    if (s.name === '宅急便80サイズ' && threeSum <= 80 && weightG <= 5000) {
+      return { cost: s.total, method: s.name };
+    }
+    if (s.name === '宅急便100サイズ' && threeSum <= 100 && weightG <= 10000) {
+      return { cost: s.total, method: s.name };
+    }
+    if (s.name === '宅急便140サイズ' && threeSum <= 140 && weightG <= 15000) {
+      return { cost: s.total, method: s.name };
+    }
+  }
+
+  // どの条件にも当てはまらない場合
+  return { cost: 945, method: '宅急便140(該当なし)' };
+}
 
 // ===== CSV パース =====
 document.getElementById('csvFile').addEventListener('change', (e) => {
@@ -354,12 +526,16 @@ async function startResearch() {
   updateSummary();
 
   const taxRate = parseInt(document.getElementById('taxRate').value);
+  const fulfillmentMode = document.getElementById('fulfillmentMode').value;
+
+  // FBM列の表示切り替え
+  toggleFbmColumns(fulfillmentMode !== 'fba_only');
 
   try {
     const response = await fetch('./api/bulk-research/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ items, taxRate }),
+      body: JSON.stringify({ items, taxRate, fulfillmentMode }),
     });
 
     const reader = response.body.getReader();
@@ -467,6 +643,7 @@ function applyFilter() {
 function renderTable(rows) {
   const tbody = document.getElementById('resultBody');
   tbody.innerHTML = '';
+  const showFbm = document.getElementById('fulfillmentMode').value !== 'fba_only';
 
   for (const r of rows) {
     const tr = document.createElement('tr');
@@ -480,6 +657,36 @@ function renderTable(rows) {
     if (r.estMonthlySales >= 30) estClass = 'high';
     else if (r.estMonthlySales >= 10) estClass = 'medium';
 
+    // FBM利益計算（Amazon手数料 + 送料テーブルから算出）
+    let fbmHtml = '';
+    if (showFbm) {
+      if (r.status === 'ok' && r.fbmAmazonFee !== null && r.fbmAmazonFee !== undefined) {
+        const shipping = calcFbmShipping(r.dimensions);
+        const fbmTotalCost = r.fbmAmazonFee + shipping.cost;
+        const fbmProfit = r.sellingPrice - (r.wholesalePriceWithTax || 0) - fbmTotalCost;
+        const fbmProfitRate = r.sellingPrice > 0 ? Math.round((fbmProfit / r.sellingPrice * 100) * 10) / 10 : 0;
+        const fbmJudgment = fbmProfitRate >= 30 ? '◎' : fbmProfitRate >= 20 ? '○' : fbmProfitRate >= 10 ? '△' : '×';
+        const fbmJClass = fbmJudgment === '◎' ? 'j-excellent' : fbmJudgment === '○' ? 'j-good' : fbmJudgment === '△' ? 'j-fair' : 'j-poor';
+        const fbmProfitClass = fbmProfit >= 0 ? 'positive' : 'negative';
+
+        // FBMデータをr自体に付けておく（CSV出力用）
+        r._fbmShippingCost = shipping.cost;
+        r._fbmShippingMethod = shipping.method;
+        r._fbmProfit = fbmProfit;
+        r._fbmProfitRate = fbmProfitRate;
+        r._fbmJudgment = fbmJudgment;
+
+        fbmHtml = `
+          <td class="num fbm-col" style="font-size:11px;">¥${fmt(shipping.cost)}<span class="shipping-method">${escHtml(shipping.method)}</span></td>
+          <td class="num fbm-col ${fbmProfitClass}" style="font-weight:bold;">${fbmProfit >= 0 ? '¥' : '-¥'}${fmt(Math.abs(fbmProfit))}</td>
+          <td class="num fbm-col ${fbmProfitClass}" style="font-weight:bold;">${fbmProfitRate}%</td>
+          <td class="fbm-col"><span class="judgment-sm ${fbmJClass}">${fbmJudgment}</span></td>
+        `;
+      } else {
+        fbmHtml = `<td class="fbm-col">-</td><td class="fbm-col">-</td><td class="fbm-col">-</td><td class="fbm-col">-</td>`;
+      }
+    }
+
     tr.innerHTML = `
       <td><input type="checkbox" class="cb row-cb" data-idx="${r.idx}" ${r.status === 'ok' && (r.profitRate||0) >= 10 ? '' : ''}></td>
       <td>${r.image ? `<img src="${r.image}" class="thumb" loading="lazy">` : '-'}</td>
@@ -489,9 +696,10 @@ function renderTable(rows) {
       <td class="num">${r.wholesalePrice ? '¥' + fmt(r.wholesalePrice) : '-'}</td>
       <td class="num">${r.sellingPrice ? '¥' + fmt(r.sellingPrice) : '-'}</td>
       <td class="num" style="font-size:11px;">${r.totalFee ? '¥' + fmt(r.totalFee) : '-'}</td>
-      <td class="num ${profitClass}" style="font-weight:bold;">${r.profit !== undefined ? (r.profit >= 0 ? '¥' : '-¥') + fmt(Math.abs(r.profit || 0)) : '-'}</td>
-      <td class="num ${profitClass}" style="font-weight:bold;">${r.profitRate !== undefined ? r.profitRate + '%' : '-'}</td>
+      <td class="num ${profitClass}" style="font-weight:bold;">${r.profit !== undefined && r.profit !== null ? (r.profit >= 0 ? '¥' : '-¥') + fmt(Math.abs(r.profit || 0)) : '-'}</td>
+      <td class="num ${profitClass}" style="font-weight:bold;">${r.profitRate !== undefined && r.profitRate !== null ? r.profitRate + '%' : '-'}</td>
       <td>${r.judgment ? `<span class="judgment-sm ${jClass}">${r.judgment}</span>` : '-'}</td>
+      ${fbmHtml}
       <td class="num" style="font-size:11px;">${r.salesRank && r.salesRank !== '-' ? '#' + fmt(r.salesRank) : '-'}</td>
       <td class="num"><span class="est-sales ${estClass}">${r.estMonthlySales ? '~' + r.estMonthlySales + '個/月' : '-'}</span></td>
       <td class="num">${r.offerCount !== undefined ? r.offerCount + '人' : '-'}</td>
@@ -517,8 +725,13 @@ function updateSummary() {
   document.getElementById('sumTotal').textContent = allResults.length;
   document.getElementById('sumGood').textContent = ok.filter(r => (r.profitRate || 0) >= 10).length;
   document.getElementById('sumExcellent').textContent = ok.filter(r => (r.profitRate || 0) >= 30).length;
+  document.getElementById('sumFbmGood').textContent = ok.filter(r => (r._fbmProfitRate || 0) >= 10).length;
   document.getElementById('sumNotFound').textContent = allResults.filter(r => r.status === 'not_found').length;
   document.getElementById('sumErrors').textContent = allResults.filter(r => r.status === 'error').length;
+
+  // FBMサマリーの表示制御
+  const showFbm = document.getElementById('fulfillmentMode').value !== 'fba_only';
+  document.querySelector('.fbm-summary').style.display = showFbm ? '' : 'none';
 }
 
 // ===== リサーチDB保存 =====
@@ -579,13 +792,22 @@ function exportCsv() {
   const ok = allResults.filter(r => r.status === 'ok');
   if (ok.length === 0) { alert('エクスポートするデータがありません'); return; }
 
-  const header = ['JAN', 'ASIN', '商品名', 'カテゴリ', '卸価格(税抜)', '卸価格(税込)', '販売価格', '手数料合計', '利益', '利益率%', '判定', 'ランキング', '推定月販', '出品者数', 'メーカー'];
-  const rows = ok.map(r => [
-    r.jan, r.asin, r.amazonName || r.productName, r.category,
-    r.wholesalePrice, r.wholesalePriceWithTax, r.sellingPrice,
-    r.totalFee, r.profit, r.profitRate, r.judgment,
-    r.salesRank, r.estMonthlySales, r.offerCount, r.manufacturer,
-  ]);
+  const showFbm = document.getElementById('fulfillmentMode').value !== 'fba_only';
+  const baseHeader = ['JAN', 'ASIN', '商品名', 'カテゴリ', '卸価格(税抜)', '卸価格(税込)', '販売価格', 'FBA手数料', 'FBA利益', 'FBA利益率%', 'FBA判定'];
+  const fbmHeader = showFbm ? ['自社送料', '配送方法', '自社利益', '自社利益率%', '自社判定'] : [];
+  const tailHeader = ['ランキング', '推定月販', '出品者数', 'メーカー'];
+  const header = [...baseHeader, ...fbmHeader, ...tailHeader];
+
+  const rows = ok.map(r => {
+    const base = [
+      r.jan, r.asin, r.amazonName || r.productName, r.category,
+      r.wholesalePrice, r.wholesalePriceWithTax, r.sellingPrice,
+      r.totalFee, r.profit, r.profitRate, r.judgment,
+    ];
+    const fbm = showFbm ? [r._fbmShippingCost || '', r._fbmShippingMethod || '', r._fbmProfit || '', r._fbmProfitRate || '', r._fbmJudgment || ''] : [];
+    const tail = [r.salesRank, r.estMonthlySales, r.offerCount, r.manufacturer];
+    return [...base, ...fbm, ...tail];
+  });
 
   const csvQ = (v) => { const s = String(v ?? ''); return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s.replace(/"/g, '""')}"` : s; };
   const csv = '\uFEFF' + header.join(',') + '\n' + rows.map(r => r.map(csvQ).join(',')).join('\n');

@@ -558,25 +558,69 @@ function sleep(ms) {
 
 /**
  * 注文レポートからSKU別販売個数・最終販売日を集計
- * @param {number} days - 過去何日分（デフォルト365日＝累計に近い）
+ * _GENERALレポートは最大30日制限のため、30日ずつ分割取得して合算
+ * @param {number} days - 過去何日分（デフォルト365日）
  * @returns {Object} { [sku]: { count, lastDate }, ... }
  */
 export async function getSalesCountBySku(days = 365) {
   const sp = getClient();
   const marketplaceId = MARKETPLACE_ID();
+  const MAX_DAYS_PER_REQUEST = 30;
 
   const now = new Date();
-  const start = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
-  const startStr = start.toISOString();
-  const endStr = now.toISOString();
+  const salesMap = {};
 
-  console.log(`[SP-API] 注文レポート取得: ${startStr} ～ ${endStr} (${days}日間)`);
+  // 30日ごとの期間リストを作成
+  const periods = [];
+  let end = now;
+  let remaining = days;
+  while (remaining > 0) {
+    const chunkDays = Math.min(remaining, MAX_DAYS_PER_REQUEST);
+    const start = new Date(end.getTime() - chunkDays * 24 * 60 * 60 * 1000);
+    periods.push({ start, end: new Date(end) });
+    end = start;
+    remaining -= chunkDays;
+  }
 
+  console.log(`[SP-API] 販売データ取得: 過去${days}日を${periods.length}回に分割`);
+
+  for (let p = 0; p < periods.length; p++) {
+    const { start, end: periodEnd } = periods[p];
+    const startStr = start.toISOString();
+    const endStr = periodEnd.toISOString();
+    console.log(`[SP-API] 注文レポート (${p + 1}/${periods.length}): ${startStr.slice(0, 10)} ～ ${endStr.slice(0, 10)}`);
+
+    try {
+      const reportData = await fetchOrderReport(sp, marketplaceId, startStr, endStr);
+      // 結果をsalesMapにマージ
+      for (const [sku, data] of Object.entries(reportData)) {
+        if (!salesMap[sku]) {
+          salesMap[sku] = { count: 0, lastDate: '' };
+        }
+        salesMap[sku].count += data.count;
+        if (data.lastDate && data.lastDate > salesMap[sku].lastDate) {
+          salesMap[sku].lastDate = data.lastDate;
+        }
+      }
+    } catch (err) {
+      console.error(`[SP-API] 期間 ${p + 1} エラー (続行):`, err.message);
+    }
+  }
+
+  const totalItems = Object.values(salesMap).reduce((a, b) => a + b.count, 0);
+  console.log(`[SP-API] 販売集計完了: ${Object.keys(salesMap).length}SKU, 合計${totalItems}個`);
+  return salesMap;
+}
+
+/**
+ * 単一期間の注文レポートを取得してSKU別に集計
+ */
+async function fetchOrderReport(sp, marketplaceId, startStr, endStr) {
   const createResult = await sp.callAPI({
     operation: 'createReport',
     endpoint: 'reports',
     body: {
-      reportType: 'GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE',
+      reportType: 'GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL',
       marketplaceIds: [marketplaceId],
       dataStartTime: startStr,
       dataEndTime: endStr,
@@ -585,7 +629,6 @@ export async function getSalesCountBySku(days = 365) {
   });
 
   const reportId = createResult.reportId;
-  console.log(`[SP-API] 注文レポートID: ${reportId}`);
 
   // ポーリング
   let report;
@@ -597,7 +640,6 @@ export async function getSalesCountBySku(days = 365) {
       path: { reportId },
       options: { version: '2021-06-30' },
     });
-    console.log(`[SP-API] 注文レポートステータス: ${report.processingStatus}`);
     if (report.processingStatus === 'DONE') break;
     if (report.processingStatus === 'FATAL' || report.processingStatus === 'CANCELLED') {
       throw new Error(`注文レポート生成失敗: ${report.processingStatus}`);
@@ -633,31 +675,40 @@ export async function getSalesCountBySku(days = 365) {
   }
 
   const lines = text.split('\n').filter(l => l.trim());
-  const headers = lines[0].split('\t').map(h => h.trim());
-  console.log(`[SP-API] 注文レポートヘッダー: ${headers.join(', ')}`);
+  if (lines.length <= 1) {
+    console.log('[SP-API] この期間の注文データ: 0件');
+    return {};
+  }
 
-  // SKU列とquantity列を探す
+  // BOM除去
+  const headers = lines[0].replace(/^\uFEFF/, '').split('\t').map(h => h.trim());
+
+  // カラム名検索
   const findIdx = (...candidates) => {
     for (const c of candidates) {
-      const idx = headers.findIndex(h => h.toLowerCase().replace(/\s+/g, '-') === c.toLowerCase());
+      const idx = headers.findIndex(h => h.toLowerCase().replace(/[\s_]+/g, '-') === c.toLowerCase().replace(/[\s_]+/g, '-'));
+      if (idx >= 0) return idx;
+    }
+    for (const c of candidates) {
+      const idx = headers.findIndex(h => h.toLowerCase().includes(c.toLowerCase()));
       if (idx >= 0) return idx;
     }
     return -1;
   };
 
-  const skuIdx = findIdx('sku', 'seller-sku');
-  const qtyIdx = findIdx('quantity', 'quantity-purchased');
-  const statusIdx = findIdx('order-status', 'item-status');
-  const dateIdx = findIdx('purchase-date', 'last-updated-date', 'payments-date');
+  const skuIdx = findIdx('sku', 'seller-sku', '出品者SKU');
+  const qtyIdx = findIdx('quantity', 'quantity-purchased', '数量');
+  const statusIdx = findIdx('order-status', 'item-status', '注文ステータス', '商品ステータス');
+  const dateIdx = findIdx('purchase-date', 'last-updated-date', 'payments-date', '購入日', '購入日時', '最終更新日');
 
   if (skuIdx < 0 || qtyIdx < 0) {
-    console.log(`[SP-API] SKU列=${skuIdx}, 数量列=${qtyIdx} — ヘッダー不一致`);
     console.log('[SP-API] ヘッダー詳細:', JSON.stringify(headers));
-    throw new Error('注文レポートのSKUまたは数量列が見つかりません');
+    throw new Error(`SKUまたは数量列が見つかりません。ヘッダー: ${headers.slice(0, 15).join(', ')}`);
   }
 
-  // SKU別に数量＋最終販売日を集計（キャンセル除外）
-  const salesMap = {};
+  console.log(`[SP-API] レポートヘッダーOK (${headers.length}列): SKU=${skuIdx}, qty=${qtyIdx}, status=${statusIdx}, date=${dateIdx}`);
+
+  const chunkMap = {};
   for (let i = 1; i < lines.length; i++) {
     const cols = lines[i].split('\t');
     const sku = (cols[skuIdx] || '').trim();
@@ -668,19 +719,17 @@ export async function getSalesCountBySku(days = 365) {
     if (!sku || qty <= 0) continue;
     if (status === 'cancelled' || status === 'キャンセル') continue;
 
-    if (!salesMap[sku]) {
-      salesMap[sku] = { count: 0, lastDate: '' };
+    if (!chunkMap[sku]) {
+      chunkMap[sku] = { count: 0, lastDate: '' };
     }
-    salesMap[sku].count += qty;
-    // 最終販売日を更新（より新しい日付を保持）
-    if (orderDate && orderDate > salesMap[sku].lastDate) {
-      salesMap[sku].lastDate = orderDate.slice(0, 10); // YYYY-MM-DD
+    chunkMap[sku].count += qty;
+    if (orderDate && orderDate > chunkMap[sku].lastDate) {
+      chunkMap[sku].lastDate = orderDate.slice(0, 10);
     }
   }
 
-  const totalItems = Object.values(salesMap).reduce((a, b) => a + b.count, 0);
-  console.log(`[SP-API] 販売集計完了: ${Object.keys(salesMap).length}SKU, 合計${totalItems}個`);
-  return salesMap;
+  console.log(`[SP-API] この期間: ${Object.keys(chunkMap).length}SKU, ${Object.values(chunkMap).reduce((a, b) => a + b.count, 0)}個`);
+  return chunkMap;
 }
 
 export async function patchListing({ sku, patches }) {

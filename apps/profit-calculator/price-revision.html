@@ -174,6 +174,27 @@
     @keyframes spin { to { transform: rotate(360deg); } }
 
     .empty-msg { text-align: center; padding: 60px; color: #888; font-size: 14px; background: #fff; border: 1px solid #d5c9b8; border-radius: 6px; }
+
+    /* ── 詳細検索パネル ── */
+    .advanced-panel { display: none; background: #fff; border: 1px solid #d5c9b8; border-radius: 6px; padding: 16px 20px; margin-bottom: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+    .advanced-panel.open { display: block; }
+    .advanced-panel h3 { font-size: 14px; color: #5a4230; margin-bottom: 12px; border-bottom: 1px solid #eee; padding-bottom: 6px; }
+    .filter-group { margin-bottom: 12px; }
+    .filter-group label { display: block; font-size: 12px; font-weight: bold; color: #555; margin-bottom: 6px; }
+    .filter-btns { display: flex; flex-wrap: wrap; gap: 4px; }
+    .filter-btn { padding: 5px 14px; font-size: 12px; border: 1px solid #ccc; border-radius: 4px; background: #fff; cursor: pointer; transition: all 0.15s; color: #555; }
+    .filter-btn:hover { background: #f0f0f0; }
+    .filter-btn.active { background: #4a90d9; border-color: #3a7cc0; color: #fff; font-weight: bold; }
+    .filter-range { display: flex; align-items: center; gap: 6px; }
+    .filter-range input { width: 100px; padding: 5px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 12px; }
+    .filter-range span { color: #888; font-size: 12px; }
+    .filter-days { display: flex; align-items: center; gap: 6px; }
+    .filter-days input { width: 80px; padding: 5px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 12px; }
+    .filter-days span { font-size: 12px; color: #555; }
+    .btn-filter-search { background: #4a90d9; border: none; color: #fff; padding: 8px 30px; border-radius: 4px; font-size: 14px; font-weight: bold; cursor: pointer; margin-top: 8px; }
+    .btn-filter-search:hover { background: #3a7cc0; }
+    .btn-filter-reset { background: #fff; border: 1px solid #ccc; color: #555; padding: 8px 20px; border-radius: 4px; font-size: 12px; cursor: pointer; margin-top: 8px; margin-left: 8px; }
+    .btn-filter-reset:hover { background: #f0f0f0; }
   </style>
 </head>
 <body>
@@ -236,6 +257,100 @@
           <option value="150" selected>150件</option>
           <option value="300">300件</option>
         </select>
+      </div>
+    </div>
+
+    <!-- 詳細検索パネル -->
+    <div class="advanced-panel" id="advancedPanel">
+      <h3>詳細検索</h3>
+
+      <div class="filter-group">
+        <label>[検索キーワード]</label>
+        <input type="text" id="advKeyword" placeholder="キーワード, JAN, SKU, ASIN" style="padding:5px 10px; border:1px solid #ccc; border-radius:4px; font-size:13px; width:350px;">
+      </div>
+
+      <div class="filter-group">
+        <label>[出品ステータス状態]</label>
+        <div class="filter-btns" data-filter="status">
+          <button class="filter-btn active" data-value="all">すべて</button>
+          <button class="filter-btn" data-value="active">出品中</button>
+          <button class="filter-btn" data-value="preparing">出品準備中</button>
+          <button class="filter-btn" data-value="inactive">停止中</button>
+          <button class="filter-btn" data-value="error">出品エラー</button>
+        </div>
+      </div>
+
+      <div class="filter-group">
+        <label>[価格追従設定]</label>
+        <div class="filter-btns" data-filter="tracking">
+          <button class="filter-btn active" data-value="all">すべての商品</button>
+          <button class="filter-btn" data-value="tracking_on">価格の自動変更をする</button>
+          <button class="filter-btn" data-value="tracking_off">価格の自動変更をしない</button>
+          <button class="filter-btn" data-value="FBA状態合わせ">FBA状態合わせ</button>
+          <button class="filter-btn" data-value="状態合わせ">状態合わせ</button>
+          <button class="filter-btn" data-value="FBA最安値">FBA最安値</button>
+          <button class="filter-btn" data-value="最安値">最安値</button>
+          <button class="filter-btn" data-value="カート">カート価格</button>
+          <button class="filter-btn" data-value="カスタム">カスタム</button>
+        </div>
+      </div>
+
+      <div class="filter-group">
+        <label>[配送区分]</label>
+        <div class="filter-btns" data-filter="fulfillment">
+          <button class="filter-btn active" data-value="all">全て</button>
+          <button class="filter-btn" data-value="FBA">FBAのみ</button>
+          <button class="filter-btn" data-value="FBM">自己発送のみ</button>
+        </div>
+      </div>
+
+      <div class="filter-group">
+        <label>[状態]</label>
+        <div class="filter-btns" data-filter="condition">
+          <button class="filter-btn active" data-value="all">全て</button>
+          <button class="filter-btn" data-value="新品">新品</button>
+          <button class="filter-btn" data-value="中古-ほぼ新品">中古-ほぼ新品</button>
+          <button class="filter-btn" data-value="中古-非常に良い">中古-非常に良い</button>
+          <button class="filter-btn" data-value="中古-良い">中古-良い</button>
+          <button class="filter-btn" data-value="中古-可">中古品-可</button>
+          <button class="filter-btn" data-value="コレクター-ほぼ新品">コレクター商品-ほぼ新品</button>
+          <button class="filter-btn" data-value="コレクター-非常に良い">コレクター商品-非常に良い</button>
+          <button class="filter-btn" data-value="コレクター-良い">コレクター商品-良い</button>
+          <button class="filter-btn" data-value="コレクター-可">コレクター商品-可</button>
+        </div>
+      </div>
+
+      <div class="filter-group">
+        <label>[こだわり検索]</label>
+        <div class="filter-btns" data-filter="special">
+          <button class="filter-btn active" data-value="none">こだわり条件を設定しない</button>
+          <button class="filter-btn" data-value="loss_stopper">赤字ストッパーで下げ止まっている商品を表示</button>
+          <button class="filter-btn" data-value="never_sold">一度も売れていない商品を表示</button>
+          <button class="filter-btn" data-value="oversized">大型商品を表示</button>
+        </div>
+      </div>
+
+      <div class="filter-group">
+        <label>[出品価格]</label>
+        <div class="filter-range">
+          <input type="number" id="priceMin" placeholder="下限">
+          <span>〜</span>
+          <input type="number" id="priceMax" placeholder="上限">
+          <span>円</span>
+        </div>
+      </div>
+
+      <div class="filter-group">
+        <label>[売れた日付〜最後に売れてから]</label>
+        <div class="filter-days">
+          <input type="number" id="daysSinceLastSold" placeholder="例)3">
+          <span>日以上経過している商品を表示する</span>
+        </div>
+      </div>
+
+      <div>
+        <button class="btn-filter-search" onclick="applyAdvancedFilters()">検索</button>
+        <button class="btn-filter-reset" onclick="resetAdvancedFilters()">条件をリセット</button>
       </div>
     </div>
 
@@ -304,15 +419,89 @@
       const q = document.getElementById('searchInput').value.trim().toLowerCase();
       perPage = parseInt(document.getElementById('perPage').value);
 
+      // 詳細検索の値を取得
+      const panelOpen = document.getElementById('advancedPanel').classList.contains('open');
+      const fStatus = panelOpen ? getFilterValue('status') : 'all';
+      const fTracking = panelOpen ? getFilterValue('tracking') : 'all';
+      const fFulfillment = panelOpen ? getFilterValue('fulfillment') : 'all';
+      const fCondition = panelOpen ? getFilterValue('condition') : 'all';
+      const fSpecial = panelOpen ? getFilterValue('special') : 'none';
+      const fPriceMin = panelOpen ? (parseInt(document.getElementById('priceMin').value) || 0) : 0;
+      const fPriceMax = panelOpen ? (parseInt(document.getElementById('priceMax').value) || 0) : 0;
+      const fDaysSince = panelOpen ? (parseInt(document.getElementById('daysSinceLastSold').value) || 0) : 0;
+
       filteredListings = allListings.filter(item => {
-        // 出品中の商品を表示（FBA商品はquantity=0でもActive）
         const isActive = (item.status || '').toLowerCase() === 'active' || item.status === '出品中';
-        if (!isActive && (item.quantity || 0) <= 0) return false;
-        if (!q) return true;
-        return (item.product_name || '').toLowerCase().includes(q)
-          || (item.sku || '').toLowerCase().includes(q)
-          || (item.asin || '').toLowerCase().includes(q)
-          || (item.jan || '').toLowerCase().includes(q);
+
+        // ── 出品ステータスフィルタ ──
+        if (fStatus !== 'all') {
+          const statusLower = (item.status || '').toLowerCase();
+          if (fStatus === 'active' && !isActive) return false;
+          if (fStatus === 'inactive' && isActive) return false;
+          if (fStatus === 'preparing' && statusLower !== 'preparing' && item.status !== '出品準備中') return false;
+          if (fStatus === 'error' && statusLower !== 'error' && item.status !== '出品エラー') return false;
+        } else {
+          // デフォルト：非アクティブかつ在庫0は非表示
+          if (!isActive && (item.quantity || 0) <= 0) return false;
+        }
+
+        // ── キーワードフィルタ ──
+        if (q) {
+          const match = (item.product_name || '').toLowerCase().includes(q)
+            || (item.sku || '').toLowerCase().includes(q)
+            || (item.asin || '').toLowerCase().includes(q)
+            || (item.jan || '').toLowerCase().includes(q);
+          if (!match) return false;
+        }
+
+        // ── 価格追従フィルタ ──
+        if (fTracking !== 'all') {
+          const mode = item.price_tracking || 'しない';
+          if (fTracking === 'tracking_on' && mode === 'しない') return false;
+          if (fTracking === 'tracking_off' && mode !== 'しない') return false;
+          if (fTracking !== 'tracking_on' && fTracking !== 'tracking_off' && mode !== fTracking) return false;
+        }
+
+        // ── 配送区分フィルタ ──
+        if (fFulfillment !== 'all') {
+          const ful = (item.fulfillment || 'FBM').toUpperCase();
+          if (fFulfillment === 'FBA' && ful !== 'FBA' && ful !== 'AMAZON_JP') return false;
+          if (fFulfillment === 'FBM' && (ful === 'FBA' || ful === 'AMAZON_JP')) return false;
+        }
+
+        // ── コンディションフィルタ ──
+        if (fCondition !== 'all') {
+          const cond = conditionLabel(item.condition);
+          if (fCondition === '新品' && cond !== '新品') return false;
+          if (fCondition !== '新品' && !cond.includes(fCondition.replace('コレクター-', 'コレクター商品-'))) return false;
+        }
+
+        // ── こだわり検索 ──
+        if (fSpecial === 'loss_stopper') {
+          // 赤字ストッパーで下げ止まっている = 出品価格 <= 赤字ストッパー
+          if (!item.loss_stopper || (item.price || 0) > item.loss_stopper) return false;
+        }
+        if (fSpecial === 'never_sold') {
+          if ((item.total_sold || 0) > 0) return false;
+        }
+        if (fSpecial === 'oversized') {
+          // 大型商品（FBA手数料が高い or 商品名に大型を含む等で判定）
+          const name = (item.product_name || '').toLowerCase();
+          if (!name.includes('大型') && !item.is_oversized) return false;
+        }
+
+        // ── 出品価格範囲 ──
+        if (fPriceMin > 0 && (item.price || 0) < fPriceMin) return false;
+        if (fPriceMax > 0 && (item.price || 0) > fPriceMax) return false;
+
+        // ── 最後に売れてからX日以上 ──
+        if (fDaysSince > 0) {
+          if (!item.last_sold_date) return true; // 売上記録なし = 条件に該当
+          const days = parseInt(daysSince(item.last_sold_date));
+          if (days < fDaysSince) return false;
+        }
+
+        return true;
       });
 
       // ソート
@@ -326,6 +515,9 @@
       });
 
       document.getElementById('totalCount').textContent = filteredListings.length.toLocaleString();
+      // ステータスバッジ更新
+      const statusLabels = { all: 'すべて', active: '出品中', preparing: '出品準備中', inactive: '停止中', error: '出品エラー' };
+      document.getElementById('statusBadge').textContent = statusLabels[fStatus] || '出品中';
       currentPage = 1;
       renderTable();
       renderPagination();
@@ -591,9 +783,17 @@
 
         const result = await res.json();
         document.getElementById('progressFill').style.width = '100%';
-        const salesMsg = result.sales && !result.sales.error ? ` + 販売データ${result.sales.salesUpdated}SKU` : '';
-        document.getElementById('syncMsg').textContent = `完了: ${result.count}件取得${salesMsg}`;
 
+        let salesMsg = '';
+        if (result.sales && !result.sales.error) {
+          salesMsg = ` + 販売データ${result.sales.salesUpdated}SKU更新`;
+        } else if (result.sales && result.sales.error) {
+          salesMsg = ` ⚠ 販売データ取得失敗: ${result.sales.error}`;
+        } else {
+          salesMsg = ' ⚠ 販売データ未取得';
+        }
+
+        document.getElementById('syncMsg').textContent = `完了: ${result.count}件取得${salesMsg}`;
         showToast(`Amazon同期完了: ${result.count}件${salesMsg}`);
         await loadListings();
       } catch (err) {
@@ -605,7 +805,7 @@
         btn.textContent = 'Amazonから同期';
         setTimeout(() => {
           document.getElementById('syncProgress').style.display = 'none';
-        }, 3000);
+        }, 5000);
       }
     }
 
@@ -680,7 +880,55 @@
       const dt = new Date(d);
       return `${(dt.getMonth()+1).toString().padStart(2,'0')}-${dt.getDate().toString().padStart(2,'0')} ${dt.getHours().toString().padStart(2,'0')}:${dt.getMinutes().toString().padStart(2,'0')}`;
     }
-    function toggleAdvanced() { showToast('詳細検索は今後実装予定です'); }
+    // ── 詳細検索 ──
+    function toggleAdvanced() {
+      const panel = document.getElementById('advancedPanel');
+      panel.classList.toggle('open');
+    }
+
+    // フィルタボタンのクリックハンドラ
+    document.addEventListener('DOMContentLoaded', () => {
+      document.querySelectorAll('.filter-btns').forEach(group => {
+        group.addEventListener('click', e => {
+          const btn = e.target.closest('.filter-btn');
+          if (!btn) return;
+          // 同グループ内で排他選択
+          group.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+          btn.classList.add('active');
+        });
+      });
+    });
+
+    function getFilterValue(filterName) {
+      const group = document.querySelector(`.filter-btns[data-filter="${filterName}"]`);
+      if (!group) return 'all';
+      const active = group.querySelector('.filter-btn.active');
+      return active ? active.dataset.value : 'all';
+    }
+
+    function applyAdvancedFilters() {
+      // 詳細検索のキーワードを通常の検索バーにも反映
+      const advKeyword = document.getElementById('advKeyword').value.trim();
+      if (advKeyword) {
+        document.getElementById('searchInput').value = advKeyword;
+      }
+      applyFilters();
+    }
+
+    function resetAdvancedFilters() {
+      // 全フィルタボタンをリセット（最初のボタンをactive）
+      document.querySelectorAll('.filter-btns').forEach(group => {
+        group.querySelectorAll('.filter-btn').forEach((b, i) => {
+          b.classList.toggle('active', i === 0);
+        });
+      });
+      document.getElementById('advKeyword').value = '';
+      document.getElementById('priceMin').value = '';
+      document.getElementById('priceMax').value = '';
+      document.getElementById('daysSinceLastSold').value = '';
+      document.getElementById('searchInput').value = '';
+      applyFilters();
+    }
 
     function daysSince(dateStr) {
       if (!dateStr) return '-';
