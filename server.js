@@ -12,6 +12,7 @@ import rankingRouter from './apps/ranking-checker/router.js';
 import { startScheduler } from './apps/ranking-checker/scheduler.js';
 import profitRouter from './apps/profit-calculator/router.js';
 import { startPriceWorker, startMaintenanceJobs } from './apps/profit-calculator/price-scheduler.js';
+import fbaRouter from './apps/fba-replenishment/router.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -164,6 +165,15 @@ const apps = [
     status: 'active',
     category: 'purchasing',
   },
+  {
+    id: 'fba-replenishment',
+    name: 'FBA在庫補充',
+    description: 'FBA納品の推奨数量計算・納品プラン作成',
+    icon: '📦',
+    path: '/apps/fba-replenishment',
+    status: 'active',
+    category: 'fba',
+  },
 ];
 
 // 外部リンク
@@ -271,6 +281,7 @@ app.use('/apps/mercari-sync', requireAppAccess('mercari-sync'), mercariRouter);
 app.use('/apps/aes-pdf-sorter', requireAppAccess('aes-pdf-sorter'), aesRouter);
 app.use('/apps/ranking-checker', requireAppAccess('ranking-checker'), rankingRouter);
 app.use('/apps/profit-calculator', requireAppAccess('profit-calculator'), profitRouter);
+app.use('/apps/fba-replenishment', requireAppAccess('fba-replenishment'), fbaRouter);
 
 // 未実装アプリのプレースホルダー
 app.get('/apps/:appId', requireAuth, (req, res) => {

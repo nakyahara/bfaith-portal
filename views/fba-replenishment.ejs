@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FBA在庫補充 - B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png"><link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    .fba-container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+    .status-card { background: #f8f9fa; border-radius: 8px; padding: 16px; margin-bottom: 20px; }
+    .status-card h3 { margin: 0 0 8px; }
+    .status-row { display: flex; gap: 16px; flex-wrap: wrap; }
+    .stat { background: white; border-radius: 6px; padding: 12px 16px; min-width: 140px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    .stat .label { font-size: 12px; color: #666; }
+    .stat .value { font-size: 24px; font-weight: bold; margin-top: 4px; }
+    .btn { display: inline-block; padding: 10px 20px; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500; }
+    .btn-primary { background: #2563eb; color: white; }
+    .btn-primary:hover { background: #1d4ed8; }
+    .btn-primary:disabled { background: #93c5fd; cursor: not-allowed; }
+    .btn-secondary { background: #e5e7eb; color: #374151; }
+    .actions { display: flex; gap: 12px; margin: 20px 0; flex-wrap: wrap; }
+    .log { background: #1e1e1e; color: #d4d4d4; padding: 16px; border-radius: 8px; font-family: monospace; font-size: 13px; max-height: 300px; overflow-y: auto; white-space: pre-wrap; }
+    .data-table { width: 100%; border-collapse: collapse; margin-top: 16px; font-size: 13px; }
+    .data-table th, .data-table td { border: 1px solid #e5e7eb; padding: 6px 10px; text-align: left; }
+    .data-table th { background: #f3f4f6; position: sticky; top: 0; }
+    .data-table tr:hover { background: #f9fafb; }
+    .table-wrap { max-height: 500px; overflow: auto; border: 1px solid #e5e7eb; border-radius: 8px; }
+    .upload-area { border: 2px dashed #d1d5db; border-radius: 8px; padding: 24px; text-align: center; margin: 12px 0; }
+    .section { margin-top: 24px; }
+    .section h3 { border-bottom: 2px solid #2563eb; padding-bottom: 8px; }
+    .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #fff; border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; margin-right: 6px; vertical-align: middle; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <a href="/" class="back-link">&larr; Portal</a>
+      <h1>FBA在庫補充</h1>
+    </div>
+    <div class="header-right">
+      <span><%= displayName || username %></span>
+    </div>
+  </header>
+
+  <div class="fba-container">
+    <!-- ステータス -->
+    <div class="status-card">
+      <h3>システムステータス</h3>
+      <div class="status-row" id="statusRow">
+        <div class="stat"><div class="label">最終データ取得</div><div class="value" id="lastFetch">-</div></div>
+        <div class="stat"><div class="label">SKU数</div><div class="value" id="skuCount">-</div></div>
+        <div class="stat"><div class="label">レポート取得</div><div class="value" id="fetchStatus">待機中</div></div>
+      </div>
+    </div>
+
+    <!-- アクション -->
+    <div class="actions">
+      <button class="btn btn-primary" id="btnFetchAll" onclick="fetchReports()">SP-APIレポート全取得</button>
+      <button class="btn btn-secondary" id="btnFetchPlanning" onclick="fetchPlanning()">PLANNINGのみ取得</button>
+      <label class="btn btn-secondary" style="cursor:pointer;">
+        ロジザードCSVアップロード
+        <input type="file" accept=".csv" id="csvFile" onchange="uploadCsv(this)" style="display:none;">
+      </label>
+    </div>
+
+    <!-- ログ -->
+    <div class="log" id="log">FBA在庫補充システム Phase 1a — 準備完了</div>
+
+    <!-- 最新データ -->
+    <div class="section">
+      <h3>最新スナップショット</h3>
+      <div class="table-wrap">
+        <table class="data-table" id="snapshotTable">
+          <thead>
+            <tr>
+              <th>SKU</th><th>FBA在庫</th><th>入荷中</th><th>供給日数</th>
+              <th>7日売上</th><th>30日売上</th><th>順位</th>
+              <th>自社価格</th><th>カート価格</th>
+            </tr>
+          </thead>
+          <tbody id="snapshotBody"><tr><td colspan="9">データなし — レポートを取得してください</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const BASE = '/apps/fba-replenishment';
+
+    function log(msg) {
+      const el = document.getElementById('log');
+      const ts = new Date().toLocaleTimeString('ja-JP');
+      el.textContent += `\n[${ts}] ${msg}`;
+      el.scrollTop = el.scrollHeight;
+    }
+
+    async function loadStatus() {
+      try {
+        const res = await fetch(`${BASE}/api/status`);
+        const d = await res.json();
+        document.getElementById('lastFetch').textContent = d.latestSnapshotDate || '-';
+        document.getElementById('skuCount').textContent = d.snapshotCount || 0;
+        document.getElementById('fetchStatus').textContent = d.fetchInProgress ? '取得中...' : '待機中';
+        if (d.snapshotCount > 0) loadSnapshots();
+      } catch (e) { log('ステータス取得エラー: ' + e.message); }
+    }
+
+    async function loadSnapshots() {
+      try {
+        const res = await fetch(`${BASE}/api/snapshots/latest`);
+        const d = await res.json();
+        const tbody = document.getElementById('snapshotBody');
+        if (!d.data || d.data.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="9">データなし</td></tr>';
+          return;
+        }
+        tbody.innerHTML = d.data.map(r => `<tr>
+          <td>${r.amazon_sku}</td>
+          <td>${r.fba_available}</td>
+          <td>${r.fba_inbound}</td>
+          <td>${r.days_of_supply || '-'}</td>
+          <td>${r.units_sold_7d}</td>
+          <td>${r.units_sold_30d}</td>
+          <td>${r.sales_rank || '-'}</td>
+          <td>${r.your_price ? '¥' + Number(r.your_price).toLocaleString() : '-'}</td>
+          <td>${r.featured_offer_price ? '¥' + Number(r.featured_offer_price).toLocaleString() : '-'}</td>
+        </tr>`).join('');
+      } catch (e) { log('スナップショット読込エラー: ' + e.message); }
+    }
+
+    async function fetchReports() {
+      const btn = document.getElementById('btnFetchAll');
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span>取得中...';
+      log('SP-API 3レポート取得開始...(最大5分かかります)');
+
+      try {
+        const res = await fetch(`${BASE}/api/fetch-reports`, { method: 'POST' });
+        const d = await res.json();
+        if (d.error) { log('エラー: ' + d.error); return; }
+        log(`完了! PLANNING: ${d.planning.count}件, RESTOCK: ${d.restock.count}件, INVENTORY: ${d.inventory.count}件`);
+        if (d.errors.length > 0) {
+          d.errors.forEach(e => log(`警告: ${e.report} - ${e.error}`));
+        }
+        loadStatus();
+      } catch (e) { log('エラー: ' + e.message); }
+      finally {
+        btn.disabled = false;
+        btn.textContent = 'SP-APIレポート全取得';
+      }
+    }
+
+    async function fetchPlanning() {
+      const btn = document.getElementById('btnFetchPlanning');
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span>取得中...';
+      log('PLANNINGデータ取得開始...');
+
+      try {
+        const res = await fetch(`${BASE}/api/fetch-planning`, { method: 'POST' });
+        const d = await res.json();
+        if (d.error) { log('エラー: ' + d.error); return; }
+        log(`完了! ${d.count}件取得, ${d.saved}件保存`);
+        loadStatus();
+      } catch (e) { log('エラー: ' + e.message); }
+      finally {
+        btn.disabled = false;
+        btn.textContent = 'PLANNINGのみ取得';
+      }
+    }
+
+    async function uploadCsv(input) {
+      if (!input.files[0]) return;
+      const form = new FormData();
+      form.append('csv', input.files[0]);
+      log(`CSVアップロード中: ${input.files[0].name}`);
+
+      try {
+        const res = await fetch(`${BASE}/api/warehouse/upload`, { method: 'POST', body: form });
+        const d = await res.json();
+        if (d.error) { log('エラー: ' + d.error); return; }
+        log(`完了! ${d.count}件の倉庫在庫を更新`);
+      } catch (e) { log('エラー: ' + e.message); }
+      input.value = '';
+    }
+
+    // 初期ロード
+    loadStatus();
+  </script>
+</body>
+</html>
