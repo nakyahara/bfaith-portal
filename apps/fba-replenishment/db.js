@@ -239,7 +239,7 @@ export function savePlanningData(rows, snapshotDate) {
   db.run('BEGIN TRANSACTION');
   try {
     for (const row of rows) {
-      // daily_snapshots に保存
+      // daily_snapshots に保存（正規化済みデータを受け取る）
       db.run(`
         INSERT OR REPLACE INTO daily_snapshots
           (snapshot_date, amazon_sku, fba_available, fba_inbound, days_of_supply,
@@ -247,15 +247,15 @@ export function savePlanningData(rows, snapshotDate) {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
         today,
-        row.sku || row['merchant-sku'] || '',
-        parseInt(row['available'] || row['afn-fulfillable-quantity'] || 0),
-        parseInt(row['inbound-shipped'] || 0) + parseInt(row['inbound-working'] || 0) + parseInt(row['inbound-received'] || 0),
-        parseFloat(row['days-of-supply'] || 0),
-        parseInt(row['units-shipped-t7'] || 0),
-        parseInt(row['units-shipped-t30'] || 0),
-        parseInt(row['sales-rank'] || 0),
-        parseFloat(row['your-price'] || 0),
-        parseFloat(row['featuredoffer-price'] || 0),
+        row.sku || '',
+        row.fba_available || 0,
+        (row.fba_inbound_working || 0) + (row.fba_inbound_shipped || 0) + (row.fba_inbound_received || 0),
+        row.days_of_supply || 0,
+        row.units_sold_7d || 0,
+        row.units_sold_30d || 0,
+        row.sales_rank || 0,
+        row.your_price || 0,
+        row.featured_offer_price || 0,
       ]);
     }
     db.run('COMMIT');
