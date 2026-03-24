@@ -78,12 +78,14 @@ async function fetchReport(reportType, options = {}) {
     dataBuf = gunzipSync(rawBuf);
   }
 
-  // Shift_JIS → UTF-8 変換（日本語マーケットプレイス）
+  // 文字コード判定: UTF-8を優先、無効ならShift_JIS
   let text;
-  try {
+  const utf8Text = dataBuf.toString('utf-8');
+  if (utf8Text.includes('\ufffd') || /[\x80-\xff]/.test(utf8Text.slice(0, 500).replace(/[\u0080-\uffff]/g, ''))) {
+    // UTF-8で不正文字がある → Shift_JISとしてデコード
     text = iconv.decode(dataBuf, 'Shift_JIS');
-  } catch {
-    text = dataBuf.toString('utf-8');
+  } else {
+    text = utf8Text;
   }
 
   return parseTsv(text);
