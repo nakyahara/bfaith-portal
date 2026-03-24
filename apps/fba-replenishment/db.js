@@ -485,7 +485,7 @@ export function getWarehouseYQtyByCode(logizardCode) {
 // ロケーション在庫を引当優先順で取得（卸し→通販、ブロック引当順昇順、ロケ昇順）
 export function getWarehouseLocationsByCode(logizardCode) {
   return queryAll(`
-    SELECT location, block, available_qty, location_biz_type, block_alloc_order
+    SELECT location, block, available_qty, location_biz_type, block_alloc_order, expiry_date
     FROM warehouse_inventory
     WHERE logizard_code = ? AND is_y_location = 0 AND available_qty > 0
     ORDER BY

@@ -176,6 +176,35 @@ export function generateRecommendations(debug = false) {
     // --- 送れる数 ---
     let recommendedQty = Math.min(rawNeeded, warehouseAvailable);
 
+    // --- 有効期限チェック: 同一期限のものしか1回の納品で送れない ---
+    let expiryLimited = false;
+    let expiryDate = '';
+    let expirySameQty = 0;
+    if (recommendedQty > 0 && mapping.logizard_code) {
+      const locations = getWarehouseLocationsByCode(mapping.logizard_code);
+      // 有効期限があるロケが1つでもあるかチェック
+      const locsWithExpiry = locations.filter(l => l.expiry_date && l.expiry_date.trim() !== '');
+      if (locsWithExpiry.length > 0) {
+        // 引当優先順で最初に引き当たる有効期限を基準とする
+        const baseExpiry = locsWithExpiry[0].expiry_date.trim();
+        // 同一期限のロケ在庫を合算
+        let sameExpiryTotal = 0;
+        for (const loc of locations) {
+          const locExpiry = (loc.expiry_date || '').trim();
+          // 期限なしのロケは「期限に関係なく送れる」扱い → 合算対象
+          if (!locExpiry || locExpiry === baseExpiry) {
+            sameExpiryTotal += loc.available_qty;
+          }
+        }
+        if (sameExpiryTotal < recommendedQty) {
+          expiryLimited = true;
+          expiryDate = baseExpiry;
+          expirySameQty = sameExpiryTotal;
+          recommendedQty = sameExpiryTotal;
+        }
+      }
+    }
+
     // --- 最低出荷日数フィルター: 送っても○日分に満たない場合は除外（入荷待ちの方が効率的） ---
     // FBA在庫0でも1日分未満なら送る意味がないので除外
     const minShipmentDays = parseInt(settings.min_shipment_cover_days || 7);
@@ -267,6 +296,7 @@ export function generateRecommendations(debug = false) {
         `[Step5] 必要補充数 = ${needsReplenishment ? `ceil(${dailySales.toFixed(2)} × ${targetDays}) - ${effectiveFbaStock} = ${targetStock} - ${effectiveFbaStock} = ${rawNeeded}` : '0(発注点以上のため)'}`,
         `[Step6] 倉庫在庫按分 = ${warehouseRaw}個(倉庫,Yロケ除外) × FBA比率${effectiveTotalDailySales > 0 ? (dailySales / effectiveTotalDailySales * 100).toFixed(0) : 100}% = FBA用${warehouseAvailable}個 / 他CH確保${nonFbaReserve}個${recentArrivalAdjusted ? ` [補正: 他CH実効日販${effectiveNonFbaDailySales.toFixed(2)}${max60d?.max_30d > nonFbaSales30d ? `(60日最大値${max60d.max_30d}ベース)` : daysSinceArrival !== null ? `(入荷${daysSinceArrival}日目推定)` : ''}]` : ''}${lastArrivalDate ? ` (最終入荷: ${lastArrivalDate})` : ''}`,
         `[Step7] 推奨数 = min(${rawNeeded}(必要数), ${warehouseAvailable}(FBA用在庫)) = ${skippedByMinDays ? `0 (元${Math.min(rawNeeded, warehouseAvailable)}個→${(Math.min(rawNeeded, warehouseAvailable) / dailySales).toFixed(1)}日分 < 最低${minShipmentDays}日 → 入荷待ち)` : rawRecommendedQty}`,
+        `[Step7.5] 有効期限: ${expiryLimited ? '基準期限' + expiryDate + ' → 同一期限在庫' + expirySameQty + '個 → 推奨数を' + expirySameQty + '個に制限' : '制限なし(期限データなし or 同一期限)'}`,
         `[Step8] 補正: ${rawRecommendedQty === adjustedQty ? 'なし' : rawRecommendedQty + ' → ' + (roundedQty !== rawRecommendedQty ? roundedQty + '(' + roundUnit + '個丸め)' : String(rawRecommendedQty)) + (locationAdjusted ? ' → ' + adjustedQty + '(ロケ補正: ' + locationDetail + ')' : '') + ' = 最終' + adjustedQty + '個 (' + (rawRecommendedQty > 0 ? ((adjustedQty - rawRecommendedQty) / rawRecommendedQty * 100).toFixed(0) : 0) + '%)'}`,
         `[Step9] 緊急度 = ${urgencyScore.toFixed(1)} (基本:${Math.max(0, 100 - (daysOfSupply * 100 / 40)).toFixed(0)}, 月商W:${Math.min((snap.your_price || 0) * sold30d / 100000, 5).toFixed(1)}, トレンド:${sold30d > 0 ? ((sold7d / 7 * 30) / sold30d).toFixed(1) : '-'})`,
         `[Step10] アラート: ${alerts.length > 0 ? alerts.map(a => a.message).join(' / ') : 'なし'}`,
@@ -317,6 +347,9 @@ export function generateRecommendations(debug = false) {
 
       // 推奨
       recommended_qty: rawRecommendedQty,
+      expiry_limited: expiryLimited,
+      expiry_date: expiryDate,
+      expiry_same_qty: expirySameQty,
       rounded_qty: roundedQty,
       adjusted_qty: adjustedQty,
       adjust_diff_pct: rawRecommendedQty > 0 ? Math.round((adjustedQty - rawRecommendedQty) / rawRecommendedQty * 100) : 0,

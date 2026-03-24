@@ -572,9 +572,12 @@
       tbody.innerHTML = data.map(r => {
         const urgCls = r.urgency_score >= 80 ? 'urgency-high' : r.urgency_score >= 40 ? 'urgency-mid' : '';
         const manualCls = r._manual ? 'style="background:#eff6ff;"' : '';
-        const alertsHtml = (r.alerts || []).map(a =>
+        let alertsHtml = (r.alerts || []).map(a =>
           `<span class="alert-badge alert-${a.level}" title="${a.message}">${a.type === 'cart_block' ? '🔴' : a.type === 'missing' ? '🔴' : a.level === 2 ? '⚠' : 'ℹ'} ${a.message.slice(0,15)}</span>`
         ).join('');
+        if (r.expiry_limited) {
+          alertsHtml += `<span class="alert-badge alert-2" title="有効期限制限: ${r.expiry_date} 同一期限${r.expiry_same_qty}個">⚠ 期限制限${r.expiry_same_qty}個</span>`;
+        }
         const dosVal = r.days_of_supply;
         const dosColor = typeof dosVal === 'number' && dosVal < 7 ? 'color:#dc2626;font-weight:bold' : typeof dosVal === 'number' && dosVal < 14 ? 'color:#d97706' : '';
         const reorderVal = r.reorder_point;
@@ -809,6 +812,10 @@ Step6: 倉庫在庫の按分
 Step7: 推奨数 = min(必要補充数, FBA用在庫)
   ※ 最低出荷カバー日数に満たない場合は除外
 
+Step7.5: 有効期限チェック
+  FBAは同一商品で期限違いを同梱不可
+  → 引当優先の最古期限のみ送れる → 推奨数を制限
+
 Step8: 数量補正（2段階）
   A. 5個単位丸め（20個超の場合）
   B. ロケーション補正（±10%以内でロケ在庫区切りに寄せ）
@@ -834,6 +841,7 @@ Step10: アラート判定</pre>
             <table style="width:100%;font-size:12px;border-collapse:collapse;">
               <tr style="background:#f3f4f6;"><th style="padding:6px;border:1px solid #e5e7eb;">機能</th><th style="padding:6px;border:1px solid #e5e7eb;">条件</th><th style="padding:6px;border:1px solid #e5e7eb;">効果</th></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">最低出荷カバー日数</td><td style="padding:6px;border:1px solid #e5e7eb;">推奨数÷日販 < 7日</td><td style="padding:6px;border:1px solid #e5e7eb;">除外（少量の二度手間防止）<br>FBA在庫0でも1日分未満は除外</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">有効期限チェック</td><td style="padding:6px;border:1px solid #e5e7eb;">複数期限がある場合</td><td style="padding:6px;border:1px solid #e5e7eb;">最古期限の在庫のみ送れる（FBAルール）<br>翌日は送った分が減り次の期限が引き当たる</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">5個単位丸め</td><td style="padding:6px;border:1px solid #e5e7eb;">推奨数 > 20個</td><td style="padding:6px;border:1px solid #e5e7eb;">5の倍数に丸め（ピッキングの数えやすさ）</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">ロケーション補正</td><td style="padding:6px;border:1px solid #e5e7eb;">丸め後 ±10%以内</td><td style="padding:6px;border:1px solid #e5e7eb;">引当優先ロケの累積在庫に寄せる（棚まるごとピック可能に）</td></tr>
             </table>
