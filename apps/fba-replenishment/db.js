@@ -178,7 +178,9 @@ export async function initDb() {
       snapshot_date TEXT NOT NULL,
       amazon_sku TEXT NOT NULL,
       fba_available INTEGER DEFAULT 0,
-      fba_inbound INTEGER DEFAULT 0,
+      fba_inbound_working INTEGER DEFAULT 0,
+      fba_inbound_shipped INTEGER DEFAULT 0,
+      fba_inbound_received INTEGER DEFAULT 0,
       days_of_supply REAL,
       units_sold_7d INTEGER DEFAULT 0,
       units_sold_30d INTEGER DEFAULT 0,
@@ -188,6 +190,14 @@ export async function initDb() {
       UNIQUE(snapshot_date, amazon_sku)
     )
   `);
+
+  // マイグレーション: fba_inbound → 3列に分割
+  const snapCols = queryAll('PRAGMA table_info(daily_snapshots)').map(r => r.name);
+  for (const col of ['fba_inbound_working', 'fba_inbound_shipped', 'fba_inbound_received']) {
+    if (!snapCols.includes(col)) {
+      db.run(`ALTER TABLE daily_snapshots ADD COLUMN ${col} INTEGER DEFAULT 0`);
+    }
+  }
 
   // --- 8. settings: 設定値 ---
   db.run(`
@@ -242,14 +252,18 @@ export function savePlanningData(rows, snapshotDate) {
       // daily_snapshots に保存（正規化済みデータを受け取る）
       db.run(`
         INSERT OR REPLACE INTO daily_snapshots
-          (snapshot_date, amazon_sku, fba_available, fba_inbound, days_of_supply,
-           units_sold_7d, units_sold_30d, sales_rank, your_price, featured_offer_price)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          (snapshot_date, amazon_sku, fba_available,
+           fba_inbound_working, fba_inbound_shipped, fba_inbound_received,
+           days_of_supply, units_sold_7d, units_sold_30d,
+           sales_rank, your_price, featured_offer_price)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
         today,
         row.sku || '',
         row.fba_available || 0,
-        (row.fba_inbound_working || 0) + (row.fba_inbound_shipped || 0) + (row.fba_inbound_received || 0),
+        row.fba_inbound_working || 0,
+        row.fba_inbound_shipped || 0,
+        row.fba_inbound_received || 0,
         row.days_of_supply || 0,
         row.units_sold_7d || 0,
         row.units_sold_30d || 0,

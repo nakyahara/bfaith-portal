@@ -75,12 +75,14 @@
         <table class="data-table" id="snapshotTable">
           <thead>
             <tr>
-              <th>SKU</th><th>FBA在庫</th><th>入荷中</th><th>供給日数</th>
+              <th>SKU</th><th>FBA在庫</th>
+              <th>準備中</th><th>輸送中</th><th>受領中</th>
+              <th>供給日数</th>
               <th>7日売上</th><th>30日売上</th><th>順位</th>
               <th>自社価格</th><th>カート価格</th>
             </tr>
           </thead>
-          <tbody id="snapshotBody"><tr><td colspan="9">データなし — レポートを取得してください</td></tr></tbody>
+          <tbody id="snapshotBody"><tr><td colspan="11">データなし — レポートを取得してください</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -113,13 +115,15 @@
         const d = await res.json();
         const tbody = document.getElementById('snapshotBody');
         if (!d.data || d.data.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="9">データなし</td></tr>';
+          tbody.innerHTML = '<tr><td colspan="11">データなし</td></tr>';
           return;
         }
         tbody.innerHTML = d.data.map(r => `<tr>
           <td>${r.amazon_sku}</td>
           <td>${r.fba_available}</td>
-          <td>${r.fba_inbound}</td>
+          <td>${r.fba_inbound_working || 0}</td>
+          <td>${r.fba_inbound_shipped || 0}</td>
+          <td>${r.fba_inbound_received || 0}</td>
           <td>${r.days_of_supply || '-'}</td>
           <td>${r.units_sold_7d}</td>
           <td>${r.units_sold_30d}</td>
