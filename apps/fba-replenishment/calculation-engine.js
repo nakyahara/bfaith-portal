@@ -10,6 +10,13 @@ import { getLatestSnapshots, getSkuMappings, getSkuExceptions, getSettings,
 /**
  * 推奨リストを生成
  * @param {boolean} debug - trueの場合、各SKUの計算過程をcalc_stepsに記録
+ *
+ * 2段階ロジック:
+ *   1. 発注点(reorder_point) — 供給日数がこの閾値を下回ったら推奨に上がる
+ *   2. 目標日数(target_days) — 推奨に上がった時に何日分送るかの量
+ *   → 低回転商品は発注点30日、目標180日（半年分）= たまに推奨に上がるが、上がったらまとめて送る
+ *
+ * 日次SKU上限(daily_sku_limit) — 緊急度スコア順で上位N件のみ「今日の推奨」
  */
 export function generateRecommendations(debug = false) {
   const settings = getSettings();
@@ -33,6 +40,7 @@ export function generateRecommendations(debug = false) {
 
   const snapshotDate = snapshots[0]?.snapshot_date;
   const workingExpiryDays = parseInt(settings.working_expiry_days || 7);
+  const dailySkuLimit = parseInt(settings.daily_sku_limit || 100);
 
   const items = [];
 
@@ -64,15 +72,20 @@ export function generateRecommendations(debug = false) {
     const sold30d = snap.units_sold_30d || 0;
     const dailySales = sold30d / 30;
 
-    // --- 動的在庫日数目標 ---
-    const targetDays = calcTargetDays(sold30d, snap.per_unit_volume || mapping.per_unit_volume || 0, snap, settings);
+    // --- 動的在庫日数目標 & 発注点 ---
+    const perUnitVolume = snap.per_unit_volume || mapping.per_unit_volume || 0;
+    const targetDays = calcTargetDays(sold30d, perUnitVolume, snap, settings);
+    const reorderPoint = calcReorderPoint(sold30d, perUnitVolume, snap, settings);
 
     // --- 供給日数 ---
     const daysOfSupply = dailySales > 0 ? effectiveFbaStock / dailySales : (effectiveFbaStock > 0 ? 999 : 0);
 
+    // --- 発注点チェック: 供給日数 < 発注点 の場合のみ補充推奨 ---
+    const needsReplenishment = daysOfSupply < reorderPoint;
+
     // --- 必要補充数 ---
     const targetStock = Math.ceil(dailySales * targetDays);
-    const rawNeeded = Math.max(0, targetStock - effectiveFbaStock);
+    const rawNeeded = needsReplenishment ? Math.max(0, targetStock - effectiveFbaStock) : 0;
 
     // --- 倉庫在庫確認 ---
     let warehouseAvailable = 0;
@@ -103,20 +116,6 @@ export function generateRecommendations(debug = false) {
     // --- 送れる数 ---
     const recommendedQty = Math.min(rawNeeded, warehouseAvailable);
 
-    // --- 曜日平準化 ---
-    const dayOfWeek = new Date().getDay(); // 0=日, 1=月, ..., 5=金, 6=土
-    const weekdayBoost = parseFloat(settings.weekday_boost_thu_fri || 1.5);
-    const weekdayMultiplier = (dayOfWeek === 4 || dayOfWeek === 5) ? weekdayBoost : 1.0; // 木金
-    const adjustedQty = Math.ceil(recommendedQty * weekdayMultiplier);
-
-    // --- 少量商品のSKU分散（曜日ハッシュ） ---
-    let skuDayMatch = true;
-    if (sold30d <= parseInt(settings.low_volume_threshold || 20) && sold30d > 0) {
-      const hash = hashCode(sku) % 5; // 月〜金に振り分け
-      const workday = dayOfWeek >= 1 && dayOfWeek <= 5 ? dayOfWeek - 1 : -1; // 0=月,...,4=金
-      skuDayMatch = (workday === hash);
-    }
-
     // --- アラート ---
     const alerts = calcAlerts(snap, mapping, effectiveFbaStock, daysOfSupply, warehouseAvailable, settings);
 
@@ -134,14 +133,13 @@ export function generateRecommendations(debug = false) {
       calc_steps = [
         `[Step1] 実質FBA在庫 = ${fbaAvailable}(販売可能) + ${inboundShipped}(輸送中) + ${inboundReceived}(受領中) + ${inboundWorking}(準備中${snap.fba_inbound_working > 0 && inboundWorking === 0 ? ',7日超で除外' : ''}) = ${effectiveFbaStock}`,
         `[Step2] 1日あたり販売数 = ${sold30d}(30日売上) ÷ 30 = ${(dailySales).toFixed(2)}個/日`,
-        `[Step3] 目標日数 = ${targetDays}日 (30日売上:${sold30d}個, サイズ:${perUnitVol}cm³${perUnitVol > 5000 ? '→大型' : perUnitVol > 500 ? '→中型' : perUnitVol > 0 ? '→小型' : '→不明'})`,
-        `[Step4] 供給日数 = ${effectiveFbaStock} ÷ ${dailySales.toFixed(2)} = ${daysOfSupply === 999 ? '∞(販売0,在庫あり)' : daysOfSupply.toFixed(1) + '日'}`,
-        `[Step5] 必要補充数 = ceil(${dailySales.toFixed(2)} × ${targetDays}) - ${effectiveFbaStock} = ${targetStock} - ${effectiveFbaStock} = ${rawNeeded}`,
+        `[Step3] 発注点 = ${reorderPoint}日 / 目標日数 = ${targetDays}日 (30日売上:${sold30d}個, サイズ:${perUnitVol}cm³${perUnitVol > 5000 ? '→大型' : perUnitVol > 500 ? '→中型' : perUnitVol > 0 ? '→小型' : '→不明'})`,
+        `[Step4] 供給日数 = ${effectiveFbaStock} ÷ ${dailySales.toFixed(2)} = ${daysOfSupply === 999 ? '∞(販売0,在庫あり)' : daysOfSupply.toFixed(1) + '日'} ${needsReplenishment ? '→ 発注点' + reorderPoint + '日を下回り → 補充推奨' : '→ 発注点以上 → 補充不要'}`,
+        `[Step5] 必要補充数 = ${needsReplenishment ? `ceil(${dailySales.toFixed(2)} × ${targetDays}) - ${effectiveFbaStock} = ${targetStock} - ${effectiveFbaStock} = ${rawNeeded}` : '0(発注点以上のため)'}`,
         `[Step6] 倉庫在庫 = ${whRaw}(倉庫,Yロケ除外) - ${nonFbaDailyReserve}(他CH確保: ${nonFbaSales30d}÷30×${settings.non_fba_reserve_days || 14}日) = ${warehouseAvailable}`,
         `[Step7] 推奨数 = min(${rawNeeded}(必要数), ${warehouseAvailable}(送れる数)) = ${recommendedQty}`,
-        `[Step8] 曜日調整 = ${recommendedQty} × ${weekdayMultiplier}(${dayOfWeek === 4 ? '木' : dayOfWeek === 5 ? '金' : '平日'}) = ${adjustedQty}${!skuDayMatch ? ' ※今日は対象外(SKU分散)' : ''}`,
-        `[Step9] 緊急度 = ${urgencyScore.toFixed(1)} (基本:${Math.max(0, 100 - (daysOfSupply * 100 / 40)).toFixed(0)}, 月商W:${Math.min((snap.your_price || 0) * sold30d / 100000, 5).toFixed(1)}, トレンド:${sold30d > 0 ? ((sold7d / 7 * 30) / sold30d).toFixed(1) : '-'})`,
-        `[Step10] アラート: ${alerts.length > 0 ? alerts.map(a => a.message).join(' / ') : 'なし'}`,
+        `[Step8] 緊急度 = ${urgencyScore.toFixed(1)} (基本:${Math.max(0, 100 - (daysOfSupply * 100 / 40)).toFixed(0)}, 月商W:${Math.min((snap.your_price || 0) * sold30d / 100000, 5).toFixed(1)}, トレンド:${sold30d > 0 ? ((sold7d / 7 * 30) / sold30d).toFixed(1) : '-'})`,
+        `[Step9] アラート: ${alerts.length > 0 ? alerts.map(a => a.message).join(' / ') : 'なし'}`,
       ];
     }
 
@@ -169,10 +167,12 @@ export function generateRecommendations(debug = false) {
       non_fba_sales_30d: nonFbaSales30d,
 
       // 在庫計画
+      reorder_point: reorderPoint,
       target_days: targetDays,
       days_of_supply: Math.round(daysOfSupply * 10) / 10,
       target_stock: targetStock,
       raw_needed: rawNeeded,
+      needs_replenishment: needsReplenishment,
 
       // 倉庫
       warehouse_available: warehouseAvailable,
@@ -180,9 +180,7 @@ export function generateRecommendations(debug = false) {
       non_fba_reserve: nonFbaDailyReserve,
 
       // 推奨
-      recommended_qty: adjustedQty,
-      sku_day_match: skuDayMatch,
-      weekday_multiplier: weekdayMultiplier,
+      recommended_qty: recommendedQty,
 
       // 価格
       your_price: snap.your_price || 0,
@@ -205,22 +203,38 @@ export function generateRecommendations(debug = false) {
   // 緊急度スコア降順でソート
   items.sort((a, b) => b.urgency_score - a.urgency_score);
 
+  // 補充が必要なSKU（発注点を下回ったもの）
+  const needsItems = items.filter(i => i.recommended_qty > 0);
+
+  // 今日の推奨: 緊急度上位N件に絞る
+  const todayItems = needsItems.slice(0, dailySkuLimit);
+  const todaySkus = new Set(todayItems.map(i => i.amazon_sku));
+
+  // 各アイテムに「今日の推奨」フラグを付与
+  for (const item of items) {
+    item.is_today = todaySkus.has(item.amazon_sku);
+  }
+
   return {
     items,
     generated_at: new Date().toISOString(),
     snapshot_date: snapshotDate,
     total_skus: items.length,
-    recommended_skus: items.filter(i => i.recommended_qty > 0).length,
-    total_units: items.reduce((s, i) => s + i.recommended_qty, 0),
+    // 発注点を下回った全SKU数
+    needs_replenishment_skus: needsItems.length,
+    needs_replenishment_units: needsItems.reduce((s, i) => s + i.recommended_qty, 0),
+    // 今日の推奨（上限適用後）
+    today_skus: todayItems.length,
+    today_units: todayItems.reduce((s, i) => s + i.recommended_qty, 0),
+    daily_sku_limit: dailySkuLimit,
     errors: [],
   };
 }
 
-// ===== 動的在庫日数目標 =====
+// ===== 動的在庫日数目標（推奨に上がった時に何日分送るか） =====
 function calcTargetDays(sold30d, perUnitVolume, snap, settings) {
   const highVol = parseInt(settings.high_volume_threshold || 100);
   const lowVol = parseInt(settings.low_volume_threshold || 20);
-  const smallVol = parseFloat(settings.small_volume_cm3 || 500);
   const largeVol = parseFloat(settings.large_volume_cm3 || 5000);
 
   // 季節商品チェック
@@ -234,7 +248,29 @@ function calcTargetDays(sold30d, perUnitVolume, snap, settings) {
   } else if (sold30d >= lowVol) {
     return parseInt(settings.target_days_medium || 35);
   } else {
-    return parseInt(isLarge ? settings.target_days_low_volume_large || 60 : settings.target_days_low_volume_small || 120);
+    // 低回転: 半年分（180日）まとめて送る → 頻繁に推奨に上がらない
+    return parseInt(isLarge ? settings.target_days_low_volume_large || 90 : settings.target_days_low_volume_small || 180);
+  }
+}
+
+// ===== 発注点（供給日数がこの閾値を下回ったら推奨に上がる） =====
+function calcReorderPoint(sold30d, perUnitVolume, snap, settings) {
+  const highVol = parseInt(settings.high_volume_threshold || 100);
+  const lowVol = parseInt(settings.low_volume_threshold || 20);
+
+  // 季節商品
+  const isSeasonal = snap.is_seasonal === 'Yes' || snap.is_seasonal === 'TRUE';
+  if (isSeasonal) return parseInt(settings.reorder_point_seasonal || 21);
+
+  // 売上0の商品 → 発注点0（推奨に上がらない、手動追加で対応）
+  if (sold30d === 0) return 0;
+
+  if (sold30d > highVol) {
+    return parseInt(settings.reorder_point_high_volume || 14);
+  } else if (sold30d >= lowVol) {
+    return parseInt(settings.reorder_point_medium || 21);
+  } else {
+    return parseInt(settings.reorder_point_low_volume || 30);
   }
 }
 

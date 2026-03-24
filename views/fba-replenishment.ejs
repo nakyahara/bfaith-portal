@@ -103,10 +103,49 @@
 
     <!-- 推奨リスト -->
     <div class="section" id="recSection" style="display:none;">
-      <h3>推奨納品リスト <span id="recSummary" style="font-size:13px;font-weight:normal;color:#666;"></span></h3>
-      <div style="margin-bottom:8px;">
-        <label><input type="checkbox" id="filterRecommended" checked onchange="filterRecList()"> 推奨数>0のみ</label>
-        <label style="margin-left:12px;"><input type="checkbox" id="filterDayMatch" onchange="filterRecList()"> 今日の対象SKUのみ</label>
+      <h3>推奨納品リスト</h3>
+
+      <!-- サマリーカード -->
+      <div class="status-row" style="margin-bottom:16px;">
+        <div class="stat" style="border-left:4px solid #2563eb;">
+          <div class="label">今日の推奨</div>
+          <div class="value" id="todaySkus" style="color:#2563eb;">-</div>
+          <div class="label"><span id="todayUnits">-</span> 個</div>
+        </div>
+        <div class="stat">
+          <div class="label">補充必要 全体</div>
+          <div class="value" id="needsSkus">-</div>
+          <div class="label"><span id="needsUnits">-</span> 個</div>
+        </div>
+        <div class="stat">
+          <div class="label">全SKU</div>
+          <div class="value" id="totalSkus">-</div>
+        </div>
+        <div class="stat">
+          <div class="label">日次SKU上限</div>
+          <div class="value" id="dailyLimit">-</div>
+        </div>
+        <div class="stat">
+          <div class="label">データ日付</div>
+          <div class="value" id="snapshotDateDisp" style="font-size:16px;">-</div>
+        </div>
+      </div>
+
+      <!-- フィルター -->
+      <div style="margin-bottom:8px; display:flex; gap:16px; align-items:center; flex-wrap:wrap;">
+        <label style="font-weight:bold;"><input type="radio" name="recFilter" value="today" checked onchange="filterRecList()"> 今日の推奨のみ</label>
+        <label><input type="radio" name="recFilter" value="needs" onchange="filterRecList()"> 補充必要 全件</label>
+        <label><input type="radio" name="recFilter" value="all" onchange="filterRecList()"> 全SKU</label>
+        <span style="margin-left:auto;color:#666;font-size:12px;" id="recFilterCount"></span>
+      </div>
+
+      <!-- 手動追加 -->
+      <div style="margin-bottom:12px; padding:10px 16px; background:#f0f9ff; border:1px solid #bfdbfe; border-radius:6px; display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+        <span style="font-weight:bold; font-size:13px;">手動追加:</span>
+        <input type="text" id="manualSku" placeholder="SKU" style="padding:5px 8px; border:1px solid #aaa; border-radius:4px; width:180px; font-size:13px;">
+        <input type="number" id="manualQty" placeholder="数量" min="1" style="padding:5px 8px; border:1px solid #aaa; border-radius:4px; width:80px; font-size:13px;">
+        <button class="btn btn-primary" onclick="addManualItem()" style="padding:6px 16px;">追加</button>
+        <span id="manualMsg" style="font-size:12px; color:#666;"></span>
       </div>
       <div class="table-wrap" style="max-height:600px;">
         <table class="data-table" id="recTable">
@@ -118,9 +157,9 @@
               <th class="sortable-rec" data-key="fba_available" data-type="num">FBA在庫</th>
               <th class="sortable-rec" data-key="effective_fba_stock" data-type="num">実質在庫</th>
               <th class="sortable-rec" data-key="days_of_supply" data-type="num">供給日数</th>
+              <th class="sortable-rec" data-key="reorder_point" data-type="num">発注点</th>
               <th class="sortable-rec" data-key="target_days" data-type="num">目標日数</th>
               <th class="sortable-rec" data-key="units_sold_30d" data-type="num">FBA30日</th>
-              <th class="sortable-rec" data-key="non_fba_sales_30d" data-type="num">他CH30日</th>
               <th class="sortable-rec" data-key="warehouse_available" data-type="num">倉庫在庫</th>
               <th class="sortable-rec" data-key="recommended_qty" data-type="num">推奨数</th>
               <th>アラート</th>
@@ -314,6 +353,9 @@
     let recSortKey = 'urgency_score';
     let recSortDir = 'desc';
 
+    let recMeta = {}; // APIレスポンスのメタ情報
+    let manualItems = []; // 手動追加アイテム
+
     async function calcRecommendations() {
       const btn = document.getElementById('btnCalc');
       btn.disabled = true;
@@ -326,9 +368,11 @@
         if (d.error) { log('エラー: ' + d.error); return; }
         if (d.errors && d.errors.length) { d.errors.forEach(e => log('警告: ' + e)); }
         recData = d.items || [];
-        log(`完了! ${d.total_skus}SKU中 ${d.recommended_skus}SKU推奨 / 合計${d.total_units}個`);
+        recMeta = d;
+        manualItems = [];
+        log(`完了! 全${d.total_skus}SKU / 補充必要${d.needs_replenishment_skus}SKU / 今日の推奨${d.today_skus}SKU(${d.today_units}個) / 上限${d.daily_sku_limit}SKU`);
         document.getElementById('recSection').style.display = '';
-        document.getElementById('recSummary').textContent = `(${d.snapshot_date} / ${d.recommended_skus}SKU / ${d.total_units}個)`;
+        updateRecSummary();
         filterRecList();
       } catch (e) { log('エラー: ' + e.message); }
       finally {
@@ -337,13 +381,73 @@
       }
     }
 
+    function updateRecSummary() {
+      document.getElementById('todaySkus').textContent = (recMeta.today_skus || 0) + ' SKU';
+      document.getElementById('todayUnits').textContent = (recMeta.today_units || 0).toLocaleString();
+      document.getElementById('needsSkus').textContent = (recMeta.needs_replenishment_skus || 0) + ' SKU';
+      document.getElementById('needsUnits').textContent = (recMeta.needs_replenishment_units || 0).toLocaleString();
+      document.getElementById('totalSkus').textContent = recMeta.total_skus || 0;
+      document.getElementById('dailyLimit').textContent = recMeta.daily_sku_limit || 100;
+      document.getElementById('snapshotDateDisp').textContent = recMeta.snapshot_date || '-';
+    }
+
     function filterRecList() {
-      const onlyRec = document.getElementById('filterRecommended').checked;
-      const onlyDay = document.getElementById('filterDayMatch').checked;
+      const mode = document.querySelector('input[name="recFilter"]:checked')?.value || 'today';
       let filtered = recData;
-      if (onlyRec) filtered = filtered.filter(r => r.recommended_qty > 0);
-      if (onlyDay) filtered = filtered.filter(r => r.sku_day_match);
-      renderRecList(filtered);
+      if (mode === 'today') filtered = filtered.filter(r => r.is_today || r._manual);
+      else if (mode === 'needs') filtered = filtered.filter(r => r.recommended_qty > 0 || r._manual);
+      // 手動追加アイテムを先頭に含める
+      const combined = [...manualItems.filter(m => !filtered.find(r => r.amazon_sku === m.amazon_sku)), ...filtered];
+      renderRecList(combined);
+      document.getElementById('recFilterCount').textContent = `表示: ${combined.length} 件`;
+    }
+
+    function addManualItem() {
+      const skuInput = document.getElementById('manualSku');
+      const qtyInput = document.getElementById('manualQty');
+      const msgEl = document.getElementById('manualMsg');
+      const sku = skuInput.value.trim();
+      const qty = parseInt(qtyInput.value) || 0;
+      if (!sku) { msgEl.textContent = 'SKUを入力してください'; return; }
+      if (qty <= 0) { msgEl.textContent = '数量を入力してください'; return; }
+
+      // 既存データから探す
+      const existing = recData.find(r => r.amazon_sku === sku);
+      if (existing) {
+        existing.recommended_qty = qty;
+        existing.is_today = true;
+        existing._manual = true;
+        msgEl.textContent = `${sku} の推奨数を ${qty} に設定しました`;
+      } else {
+        // データにないSKUでも手動追加
+        const item = {
+          amazon_sku: sku,
+          asin: '',
+          product_name: '(手動追加)',
+          fba_available: '-',
+          effective_fba_stock: '-',
+          days_of_supply: '-',
+          reorder_point: '-',
+          target_days: '-',
+          units_sold_30d: '-',
+          warehouse_available: '-',
+          recommended_qty: qty,
+          urgency_score: 999,
+          alerts: [],
+          is_today: true,
+          _manual: true,
+        };
+        manualItems.push(item);
+        msgEl.textContent = `${sku} を ${qty} 個で追加しました`;
+      }
+      skuInput.value = '';
+      qtyInput.value = '';
+      filterRecList();
+      // サマリー更新
+      const todayFiltered = [...recData.filter(r => r.is_today), ...manualItems];
+      recMeta.today_skus = todayFiltered.length;
+      recMeta.today_units = todayFiltered.reduce((s, i) => s + (i.recommended_qty || 0), 0);
+      updateRecSummary();
     }
 
     function renderRecList(data) {
@@ -364,20 +468,24 @@
 
       tbody.innerHTML = data.map(r => {
         const urgCls = r.urgency_score >= 80 ? 'urgency-high' : r.urgency_score >= 40 ? 'urgency-mid' : '';
+        const manualCls = r._manual ? 'style="background:#eff6ff;"' : '';
         const alertsHtml = (r.alerts || []).map(a =>
           `<span class="alert-badge alert-${a.level}" title="${a.message}">${a.type === 'cart_block' ? '🔴' : a.type === 'missing' ? '🔴' : a.level === 2 ? '⚠' : 'ℹ'} ${a.message.slice(0,15)}</span>`
         ).join('');
-        const dosColor = r.days_of_supply < 7 ? 'color:#dc2626;font-weight:bold' : r.days_of_supply < 14 ? 'color:#d97706' : '';
-        return `<tr class="${urgCls}">
-          <td>${r.urgency_score}</td>
+        const dosVal = r.days_of_supply;
+        const dosColor = typeof dosVal === 'number' && dosVal < 7 ? 'color:#dc2626;font-weight:bold' : typeof dosVal === 'number' && dosVal < 14 ? 'color:#d97706' : '';
+        const reorderVal = r.reorder_point;
+        const belowReorder = typeof dosVal === 'number' && typeof reorderVal === 'number' && dosVal < reorderVal;
+        return `<tr class="${urgCls}" ${manualCls}>
+          <td>${r._manual ? '手動' : r.urgency_score}</td>
           <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')">${r.amazon_sku}</span></td>
-          <td class="product-name" title="${r.product_name}">${r.product_name}</td>
+          <td class="product-name" title="${r.product_name || ''}">${r.product_name || ''}</td>
           <td>${r.fba_available}</td>
           <td>${r.effective_fba_stock}</td>
-          <td style="${dosColor}">${r.days_of_supply}</td>
+          <td style="${dosColor}">${dosVal}${belowReorder ? ' ⚠' : ''}</td>
+          <td>${reorderVal}</td>
           <td>${r.target_days}</td>
           <td>${r.units_sold_30d}</td>
-          <td>${r.non_fba_sales_30d}</td>
           <td>${r.warehouse_available}</td>
           <td class="rec-qty">${r.recommended_qty || '-'}</td>
           <td>${alertsHtml}</td>

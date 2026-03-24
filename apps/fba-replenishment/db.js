@@ -240,12 +240,21 @@ export async function initDb() {
 
   // デフォルト設定を投入
   const defaults = [
+    // 目標日数（推奨に上がった時に何日分送るか）
     ['target_days_high_volume_small', '40'],
     ['target_days_high_volume_large', '30'],
     ['target_days_medium', '35'],
-    ['target_days_low_volume_small', '120'],
-    ['target_days_low_volume_large', '60'],
+    ['target_days_low_volume_small', '180'],  // 低回転小型: 半年分
+    ['target_days_low_volume_large', '90'],    // 低回転大型: 3ヶ月分
     ['target_days_seasonal', '50'],
+    // 発注点（供給日数がこれを下回ったら推奨に上がる）
+    ['reorder_point_high_volume', '14'],
+    ['reorder_point_medium', '21'],
+    ['reorder_point_low_volume', '30'],
+    ['reorder_point_seasonal', '21'],
+    // 日次SKU上限
+    ['daily_sku_limit', '100'],
+    // 販売量閾値
     ['high_volume_threshold', '100'],
     ['low_volume_threshold', '20'],
     ['small_volume_cm3', '500'],
@@ -263,6 +272,15 @@ export async function initDb() {
   ];
   for (const [key, value] of defaults) {
     db.run(`INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)`, [key, value]);
+  }
+
+  // マイグレーション: 旧デフォルト値を新デフォルト値に更新
+  const migrations = [
+    ['target_days_low_volume_small', '120', '180'],  // 120日→180日（半年分）
+    ['target_days_low_volume_large', '60', '90'],     // 60日→90日（3ヶ月分）
+  ];
+  for (const [key, oldVal, newVal] of migrations) {
+    db.run(`UPDATE settings SET value = ?, updated_at = datetime('now','localtime') WHERE key = ? AND value = ?`, [newVal, key, oldVal]);
   }
 
   saveToFile();
