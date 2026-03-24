@@ -275,6 +275,7 @@ export async function initDb() {
     ['min_shipment_cover_days', '7'],  // 推奨数がこの日数分に満たない場合は除外（FBA在庫0は例外）
     ['round_unit', '5'],              // 丸め単位（個）
     ['round_threshold', '20'],        // この数量を超えたら丸め適用
+    ['location_adjust_pct', '10'],    // ロケ補正の許容範囲（%）
     ['weekday_boost_thu_fri', '1.5'],
     ['low_inventory_fee_threshold_days', '14'],
     ['excess_inventory_dos_threshold', '90'],
@@ -479,6 +480,21 @@ export function getWarehouseYQtyByCode(logizardCode) {
     [logizardCode]
   );
   return row?.total || 0;
+}
+
+// ロケーション在庫を引当優先順で取得（卸し→通販、ブロック引当順昇順、ロケ昇順）
+export function getWarehouseLocationsByCode(logizardCode) {
+  return queryAll(`
+    SELECT location, block, available_qty, location_biz_type, block_alloc_order
+    FROM warehouse_inventory
+    WHERE logizard_code = ? AND is_y_location = 0 AND available_qty > 0
+    ORDER BY
+      CASE WHEN location_biz_type = '卸し' THEN 0
+           WHEN location_biz_type = '通販' THEN 1
+           ELSE 2 END,
+      block_alloc_order ASC,
+      location ASC
+  `, [logizardCode]);
 }
 
 /**

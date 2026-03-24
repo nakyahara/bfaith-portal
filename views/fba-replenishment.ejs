@@ -89,6 +89,7 @@
       <h1>FBA在庫補充</h1>
     </div>
     <div class="header-right" style="display:flex;align-items:center;gap:12px;">
+      <button class="settings-btn" onclick="openManual()">📖<span>マニュアル</span></button>
       <button class="settings-btn" onclick="openSettings()">⚙<span>設定</span></button>
       <span><%= displayName || username %></span>
     </div>
@@ -607,7 +608,7 @@
           <td style="${(r.non_fba_reserve || 0) > 0 ? 'font-weight:bold;color:#dc2626' : 'color:#999'}">${r.non_fba_reserve || 0}</td>
           <td class="rec-qty" style="${r.recommended_qty !== r.adjusted_qty ? 'color:#999;font-size:12px;text-decoration:line-through' : ''}">${r.recommended_qty || '-'}</td>
           <td class="rec-qty">${r.adjusted_qty || '-'}</td>
-          <td style="font-size:11px;color:${Math.abs(r.adjust_diff_pct || 0) > 0 ? '#d97706' : '#999'}">${r.adjust_diff_pct ? (r.adjust_diff_pct > 0 ? '+' : '') + r.adjust_diff_pct + '%' : '-'}</td>
+          <td style="font-size:11px;color:${r.location_adjusted ? '#2563eb' : Math.abs(r.adjust_diff_pct || 0) > 0 ? '#d97706' : '#999'}">${r.adjust_diff_pct ? (r.adjust_diff_pct > 0 ? '+' : '') + r.adjust_diff_pct + '%' : '-'}${r.location_adjusted ? ' 📍ロケ' : ''}</td>
           <td>${alertsHtml}</td>
         </tr>`;
       }).join('');
@@ -707,6 +708,7 @@
           { key: 'min_shipment_cover_days', label: '最低出荷カバー日数', unit: '日', desc: '推奨数がこの日数分に満たない場合は除外。少量を何度も送る二度手間を防止。FBA在庫0でも1日分未満は除外。' },
           { key: 'round_unit', label: '数量丸め単位', unit: '個', desc: '推奨数がround_thresholdを超えた場合、この単位で丸める。ピッキング時の数えやすさ向上。' },
           { key: 'round_threshold', label: '丸め適用閾値', unit: '個', desc: 'この数量以下は丸めない（そのまま）。21個以上で丸め適用。' },
+          { key: 'location_adjust_pct', label: 'ロケ補正許容範囲', unit: '%', desc: '丸め後の数量に対し±この範囲内で、ロケーション在庫の区切りに寄せる。棚まるごとピッキング可能に。' },
           { key: 'fba_weekly_threshold', label: '低在庫手数料 週間売上閾値', unit: '個/7日', desc: 'FBA 7日売上がこれ以上なら中回転扱いに引き上げ。Amazon免除ライン(20個)より低く設定してバッファを確保。' },
           { key: 'daily_sku_limit', label: '日次SKU上限', unit: 'SKU', desc: '参考値。推奨リストの表示上限ではなく運用目安。' },
         ]
@@ -770,6 +772,143 @@
       div.id = 'settingsContainer';
       div.innerHTML = html;
       document.body.appendChild(div);
+    }
+
+    function openManual() {
+      const html = `<div class="settings-overlay" onclick="closeManual()"></div>
+        <div class="settings-modal" id="manualModal" style="max-width:850px;">
+          <span class="settings-close" onclick="closeManual()">&times;</span>
+          <h3 style="margin:0 0 16px;">📖 FBA在庫補充 計算マニュアル</h3>
+
+          <div class="settings-group">
+            <h4>計算フロー全体像</h4>
+            <pre style="font-size:12px;line-height:1.6;background:#f8f9fa;padding:12px;border-radius:6px;overflow-x:auto;">
+Step1: 実質FBA在庫の算出
+  = 販売可能 + 輸送中 + 受領中 + 準備中(7日超は除外)
+
+Step2: 日販の算出
+  FBA日販 = FBA30日売上 ÷ 30
+  他CH日販 = 他CH30日売上 ÷ 30（NEデータ）
+
+Step3: 発注点・目標日数の決定
+  30日売上で回転率を分類 → サイズで目標日数を分岐
+  発注点は日数で設定し、個数換算(日数×FBA日販)で比較
+
+Step4: 発注点チェック（ゲートキーパー）
+  FBA在庫 < 発注点(個数) → 推奨に上がる
+  FBA在庫 ≧ 発注点(個数) → 補充不要
+
+Step5: 必要補充数
+  = ceil(FBA日販 × 目標日数) - 実質FBA在庫
+
+Step6: 倉庫在庫の按分
+  FBA比率 = FBA日販 ÷ (FBA日販 + 他CH実効日販)
+  FBA用在庫 = 倉庫在庫 × FBA比率
+  ※ 他CH売上の欠品補正あり（60日最大値 or 入荷日推定）
+
+Step7: 推奨数 = min(必要補充数, FBA用在庫)
+  ※ 最低出荷カバー日数に満たない場合は除外
+
+Step8: 数量補正（2段階）
+  A. 5個単位丸め（20個超の場合）
+  B. ロケーション補正（±10%以内でロケ在庫区切りに寄せ）
+
+Step9: 緊急度スコア算出
+Step10: アラート判定</pre>
+          </div>
+
+          <div class="settings-group">
+            <h4>回転率の分類と設定値</h4>
+            <table style="width:100%;font-size:12px;border-collapse:collapse;">
+              <tr style="background:#f3f4f6;"><th style="padding:6px;border:1px solid #e5e7eb;">分類</th><th style="padding:6px;border:1px solid #e5e7eb;">条件</th><th style="padding:6px;border:1px solid #e5e7eb;">発注点</th><th style="padding:6px;border:1px solid #e5e7eb;">目標日数(小型)</th><th style="padding:6px;border:1px solid #e5e7eb;">目標日数(大型/不明)</th></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">高回転</td><td style="padding:6px;border:1px solid #e5e7eb;">月100個超</td><td style="padding:6px;border:1px solid #e5e7eb;">21日</td><td style="padding:6px;border:1px solid #e5e7eb;">40日</td><td style="padding:6px;border:1px solid #e5e7eb;">30日</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">中回転</td><td style="padding:6px;border:1px solid #e5e7eb;">月20〜100個</td><td style="padding:6px;border:1px solid #e5e7eb;">21日</td><td style="padding:6px;border:1px solid #e5e7eb;" colspan="2">35日</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">低回転</td><td style="padding:6px;border:1px solid #e5e7eb;">月20個未満</td><td style="padding:6px;border:1px solid #e5e7eb;">14日</td><td style="padding:6px;border:1px solid #e5e7eb;">180日</td><td style="padding:6px;border:1px solid #e5e7eb;">90日</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">売上0</td><td style="padding:6px;border:1px solid #e5e7eb;">月0個</td><td style="padding:6px;border:1px solid #e5e7eb;" colspan="3">推奨に上がらない（手動追加で対応）</td></tr>
+            </table>
+            <p style="font-size:11px;color:#666;margin-top:8px;">※ 7日売上が10個以上の場合は低回転でも中回転扱い（低在庫手数料リスク回避）<br>※ サイズ不明(0cm³)は大型扱い（保管料リスク回避）</p>
+          </div>
+
+          <div class="settings-group">
+            <h4>フィルターと補正</h4>
+            <table style="width:100%;font-size:12px;border-collapse:collapse;">
+              <tr style="background:#f3f4f6;"><th style="padding:6px;border:1px solid #e5e7eb;">機能</th><th style="padding:6px;border:1px solid #e5e7eb;">条件</th><th style="padding:6px;border:1px solid #e5e7eb;">効果</th></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">最低出荷カバー日数</td><td style="padding:6px;border:1px solid #e5e7eb;">推奨数÷日販 < 7日</td><td style="padding:6px;border:1px solid #e5e7eb;">除外（少量の二度手間防止）<br>FBA在庫0でも1日分未満は除外</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">5個単位丸め</td><td style="padding:6px;border:1px solid #e5e7eb;">推奨数 > 20個</td><td style="padding:6px;border:1px solid #e5e7eb;">5の倍数に丸め（ピッキングの数えやすさ）</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">ロケーション補正</td><td style="padding:6px;border:1px solid #e5e7eb;">丸め後 ±10%以内</td><td style="padding:6px;border:1px solid #e5e7eb;">引当優先ロケの累積在庫に寄せる（棚まるごとピック可能に）</td></tr>
+            </table>
+          </div>
+
+          <div class="settings-group">
+            <h4>ロケーション引当順位</h4>
+            <pre style="font-size:12px;line-height:1.6;background:#f8f9fa;padding:12px;border-radius:6px;">
+第1優先: ロケ業務区分 =「卸し」
+  → ブロック引当順（若い順）
+    → ロケーションコード（若い順）
+第2優先: ロケ業務区分 =「通販」
+  → 同じくブロック引当順 → ロケ順
+
+ロケ在庫を上から累積し、丸め後の±10%以内に
+入る区切り点があれば、その数量に補正します。</pre>
+          </div>
+
+          <div class="settings-group">
+            <h4>テーブルの色の意味</h4>
+            <div class="legend-box">
+              <div class="legend-item"><div class="legend-color" style="background:#fee2e2;"></div><strong>赤（緊急度80以上）</strong>：全部送る。一括チェックで選択。</div>
+              <div class="legend-item"><div class="legend-color" style="background:#fef3c7;"></div><strong>黄（緊急度40〜79）</strong>：翌日回しOK。必要なものだけ個別チェック。</div>
+              <div class="legend-item"><div class="legend-color" style="background:white;border:1px solid #ccc;"></div><strong>白（緊急度40未満）</strong>：余裕あり。</div>
+            </div>
+          </div>
+
+          <div class="settings-group">
+            <h4>運用フロー</h4>
+            <ol style="font-size:13px;line-height:1.8;margin:0;padding-left:20px;">
+              <li>SP-APIレポート取得 + ロジザードCSVアップロード</li>
+              <li>「推奨リスト生成」をクリック</li>
+              <li>サマリーで赤/黄のSKU数・数量を確認</li>
+              <li>「🔴 緊急を全選択」で赤を一括チェック</li>
+              <li>黄色を上から見て、必要なものだけ個別チェック</li>
+              <li>選択中のSKU数・数量を確認して納品作業へ</li>
+            </ol>
+            <p style="font-size:11px;color:#666;margin-top:8px;">※ 初回は300+SKUが推奨に上がりますが、低回転商品に半年分を送ると2〜3週間で50〜80SKU/日に収束します。</p>
+          </div>
+
+          <div class="settings-group">
+            <h4>緊急度スコアの計算</h4>
+            <pre style="font-size:12px;line-height:1.6;background:#f8f9fa;padding:12px;border-radius:6px;">
+基本スコア = max(0, 100 - (供給日数 × 100 / 40))
+  → 供給日数0日=100点, 40日以上=0点
+
+月商ウェイト = min(自社価格 × 30日売上 / 100,000, 5)
+トレンド倍率 = (7日売上/7×30) / 30日売上（0.5〜3.0にクリップ）
+手数料ブースト = 低在庫手数料発生中なら2倍
+
+緊急度 = 基本 × (1 + 月商W × 0.2) × トレンド × 手数料ブースト</pre>
+          </div>
+
+          <div class="settings-group">
+            <h4>アラート一覧</h4>
+            <table style="width:100%;font-size:12px;border-collapse:collapse;">
+              <tr style="background:#f3f4f6;"><th style="padding:6px;border:1px solid #e5e7eb;">アラート</th><th style="padding:6px;border:1px solid #e5e7eb;">条件</th></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">カート価格下落</td><td style="padding:6px;border:1px solid #e5e7eb;">カート価格 < 自社価格（3段階）</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">低在庫手数料</td><td style="padding:6px;border:1px solid #e5e7eb;">短期供給日数 < 14日</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">過剰在庫</td><td style="padding:6px;border:1px solid #e5e7eb;">超過数量あり or 供給90日超</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">送り漏れ</td><td style="padding:6px;border:1px solid #e5e7eb;">FBA在庫0 + BSR5000位以内 + 倉庫に在庫あり</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">急上昇/急停止</td><td style="padding:6px;border:1px solid #e5e7eb;">7日→30日比が2倍超 or 7日間売上0</td></tr>
+            </table>
+          </div>
+        </div>`;
+
+      const div = document.createElement('div');
+      div.id = 'manualContainer';
+      div.innerHTML = html;
+      document.body.appendChild(div);
+    }
+
+    function closeManual() {
+      const c = document.getElementById('manualContainer');
+      if (c) c.remove();
     }
 
     function closeSettings() {

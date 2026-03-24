@@ -5,7 +5,8 @@
  * 出力: SKUごとの推奨納品数 + 緊急度スコア + アラート
  */
 import { getLatestSnapshots, getSkuMappings, getSkuExceptions, getSettings,
-         getWarehouseSummary, getDailySnapshots, getAllNonFbaMax60d } from './db.js';
+         getWarehouseSummary, getDailySnapshots, getAllNonFbaMax60d,
+         getWarehouseLocationsByCode } from './db.js';
 
 /**
  * 推奨リストを生成
@@ -190,19 +191,59 @@ export function generateRecommendations(debug = false) {
       }
     }
 
-    // --- 5個単位丸め（20個超の場合） ---
+    // --- Step A: 5個単位丸め（20個超の場合） ---
     const rawRecommendedQty = recommendedQty; // 丸め前の推奨数を保持
     let adjustedQty = recommendedQty;
     const roundUnit = parseInt(settings.round_unit || 5);
     const roundThreshold = parseInt(settings.round_threshold || 20);
+    let roundedQty = recommendedQty; // 丸めのみの数（ロケ補正前）
     if (adjustedQty > roundThreshold) {
       adjustedQty = Math.round(adjustedQty / roundUnit) * roundUnit;
-      // 丸めた結果が倉庫在庫を超えないように
       if (adjustedQty > warehouseAvailable) {
         adjustedQty = Math.floor(warehouseAvailable / roundUnit) * roundUnit;
       }
-      // 丸めた結果0になるのを防止
       if (adjustedQty <= 0 && recommendedQty > 0) adjustedQty = recommendedQty;
+      roundedQty = adjustedQty;
+    }
+
+    // --- Step B: ロケーション補正（±10%以内でロケ在庫の区切りに寄せる） ---
+    let locationAdjusted = false;
+    let locationDetail = '';
+    const locAdjustPct = parseFloat(settings.location_adjust_pct || 10) / 100;
+    if (adjustedQty > 0 && mapping.logizard_code) {
+      const locations = getWarehouseLocationsByCode(mapping.logizard_code);
+      if (locations.length > 0) {
+        const lower = adjustedQty * (1 - locAdjustPct);
+        const upper = adjustedQty * (1 + locAdjustPct);
+        let cumulative = 0;
+        const breakpoints = []; // 各ロケ累積の区切り点
+        for (const loc of locations) {
+          cumulative += loc.available_qty;
+          breakpoints.push({
+            cumulative,
+            location: loc.location,
+            biz_type: loc.location_biz_type,
+            qty: loc.available_qty,
+          });
+        }
+        // ±10%以内の区切り点から、丸め後に最も近いものを選択
+        let bestMatch = null;
+        let bestDiff = Infinity;
+        for (const bp of breakpoints) {
+          if (bp.cumulative >= lower && bp.cumulative <= upper) {
+            const diff = Math.abs(bp.cumulative - adjustedQty);
+            if (diff < bestDiff) {
+              bestDiff = diff;
+              bestMatch = bp;
+            }
+          }
+        }
+        if (bestMatch && bestMatch.cumulative !== adjustedQty) {
+          adjustedQty = bestMatch.cumulative;
+          locationAdjusted = true;
+          locationDetail = `${bestMatch.location}まで累積${bestMatch.cumulative}個`;
+        }
+      }
     }
 
     // --- アラート ---
@@ -225,9 +266,10 @@ export function generateRecommendations(debug = false) {
         `[Step4] FBA在庫 ${effectiveFbaStock}個 ${needsReplenishment ? '< 発注点' + reorderPointUnits + '個 → 補充推奨' : '≧ 発注点' + reorderPointUnits + '個 → 補充不要'} (供給日数: ${daysOfSupply === 999 ? '∞' : daysOfSupply.toFixed(1) + '日'})`,
         `[Step5] 必要補充数 = ${needsReplenishment ? `ceil(${dailySales.toFixed(2)} × ${targetDays}) - ${effectiveFbaStock} = ${targetStock} - ${effectiveFbaStock} = ${rawNeeded}` : '0(発注点以上のため)'}`,
         `[Step6] 倉庫在庫按分 = ${warehouseRaw}個(倉庫,Yロケ除外) × FBA比率${effectiveTotalDailySales > 0 ? (dailySales / effectiveTotalDailySales * 100).toFixed(0) : 100}% = FBA用${warehouseAvailable}個 / 他CH確保${nonFbaReserve}個${recentArrivalAdjusted ? ` [補正: 他CH実効日販${effectiveNonFbaDailySales.toFixed(2)}${max60d?.max_30d > nonFbaSales30d ? `(60日最大値${max60d.max_30d}ベース)` : daysSinceArrival !== null ? `(入荷${daysSinceArrival}日目推定)` : ''}]` : ''}${lastArrivalDate ? ` (最終入荷: ${lastArrivalDate})` : ''}`,
-        `[Step7] 推奨数 = min(${rawNeeded}(必要数), ${warehouseAvailable}(FBA用在庫)) = ${skippedByMinDays ? `0 (元${Math.min(rawNeeded, warehouseAvailable)}個→${(Math.min(rawNeeded, warehouseAvailable) / dailySales).toFixed(1)}日分 < 最低${minShipmentDays}日 → 入荷待ち)` : rawRecommendedQty}${!skippedByMinDays && adjustedQty !== rawRecommendedQty ? ` → 補正後: ${adjustedQty}個 (${roundUnit}個単位丸め, ${rawRecommendedQty > 0 ? ((adjustedQty - rawRecommendedQty) / rawRecommendedQty * 100).toFixed(0) : 0}%)` : ''}`,
-        `[Step8] 緊急度 = ${urgencyScore.toFixed(1)} (基本:${Math.max(0, 100 - (daysOfSupply * 100 / 40)).toFixed(0)}, 月商W:${Math.min((snap.your_price || 0) * sold30d / 100000, 5).toFixed(1)}, トレンド:${sold30d > 0 ? ((sold7d / 7 * 30) / sold30d).toFixed(1) : '-'})`,
-        `[Step9] アラート: ${alerts.length > 0 ? alerts.map(a => a.message).join(' / ') : 'なし'}`,
+        `[Step7] 推奨数 = min(${rawNeeded}(必要数), ${warehouseAvailable}(FBA用在庫)) = ${skippedByMinDays ? `0 (元${Math.min(rawNeeded, warehouseAvailable)}個→${(Math.min(rawNeeded, warehouseAvailable) / dailySales).toFixed(1)}日分 < 最低${minShipmentDays}日 → 入荷待ち)` : rawRecommendedQty}`,
+        `[Step8] 補正: ${rawRecommendedQty === adjustedQty ? 'なし' : rawRecommendedQty + ' → ' + (roundedQty !== rawRecommendedQty ? roundedQty + '(' + roundUnit + '個丸め)' : String(rawRecommendedQty)) + (locationAdjusted ? ' → ' + adjustedQty + '(ロケ補正: ' + locationDetail + ')' : '') + ' = 最終' + adjustedQty + '個 (' + (rawRecommendedQty > 0 ? ((adjustedQty - rawRecommendedQty) / rawRecommendedQty * 100).toFixed(0) : 0) + '%)'}`,
+        `[Step9] 緊急度 = ${urgencyScore.toFixed(1)} (基本:${Math.max(0, 100 - (daysOfSupply * 100 / 40)).toFixed(0)}, 月商W:${Math.min((snap.your_price || 0) * sold30d / 100000, 5).toFixed(1)}, トレンド:${sold30d > 0 ? ((sold7d / 7 * 30) / sold30d).toFixed(1) : '-'})`,
+        `[Step10] アラート: ${alerts.length > 0 ? alerts.map(a => a.message).join(' / ') : 'なし'}`,
       ];
     }
 
@@ -275,8 +317,11 @@ export function generateRecommendations(debug = false) {
 
       // 推奨
       recommended_qty: rawRecommendedQty,
+      rounded_qty: roundedQty,
       adjusted_qty: adjustedQty,
       adjust_diff_pct: rawRecommendedQty > 0 ? Math.round((adjustedQty - rawRecommendedQty) / rawRecommendedQty * 100) : 0,
+      location_adjusted: locationAdjusted,
+      location_detail: locationDetail,
       skipped_min_days: skippedByMinDays,
 
       // 価格
