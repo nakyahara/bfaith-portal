@@ -805,6 +805,7 @@ Step5: 必要補充数
   = ceil(FBA日販 × 目標日数) - 実質FBA在庫
 
 Step6: 倉庫在庫の按分
+  倉庫在庫 = Yロケ以外の在庫のみ（Yロケは出庫禁止のため除外）
   FBA比率 = FBA日販 ÷ (FBA日販 + 他CH実効日販)
   FBA用在庫 = 倉庫在庫 × FBA比率
   ※ 他CH売上の欠品補正あり（60日最大値 or 入荷日推定）
@@ -844,6 +845,19 @@ Step10: アラート判定</pre>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">有効期限チェック</td><td style="padding:6px;border:1px solid #e5e7eb;">複数期限がある場合</td><td style="padding:6px;border:1px solid #e5e7eb;">最古期限の在庫のみ送れる（FBAルール）<br>翌日は送った分が減り次の期限が引き当たる</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">5個単位丸め</td><td style="padding:6px;border:1px solid #e5e7eb;">推奨数 > 20個</td><td style="padding:6px;border:1px solid #e5e7eb;">5の倍数に丸め（ピッキングの数えやすさ）</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">ロケーション補正</td><td style="padding:6px;border:1px solid #e5e7eb;">丸め後 ±10%以内</td><td style="padding:6px;border:1px solid #e5e7eb;">引当優先ロケの累積在庫に寄せる（棚まるごとピック可能に）</td></tr>
+            </table>
+          </div>
+
+          <div class="settings-group">
+            <h4>Yロケ（出庫禁止ロケーション）</h4>
+            <p style="font-size:13px;line-height:1.7;margin:0;">
+              Yロケは<strong>出庫禁止ロケーション</strong>です。外部の福祉施設（いろは）に商品を預けて作業（セット組み・検品等）を行い、作業完了後にYロケ以外の通常ロケーションに戻してから出荷可能になります。
+            </p>
+            <table style="width:100%;font-size:12px;border-collapse:collapse;margin-top:8px;">
+              <tr style="background:#f3f4f6;"><th style="padding:6px;border:1px solid #e5e7eb;">項目</th><th style="padding:6px;border:1px solid #e5e7eb;">扱い</th></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">倉庫在庫（計算対象）</td><td style="padding:6px;border:1px solid #e5e7eb;">Yロケ<strong>以外</strong>の在庫のみ。FBA推奨・他CH按分すべてにこの値を使用。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">Yロケ在庫</td><td style="padding:6px;border:1px solid #e5e7eb;">参考値として別途記録。計算には使わない。作業完了後にCSV再アップロードで通常在庫に反映される。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">判定条件</td><td style="padding:6px;border:1px solid #e5e7eb;">ブロック略称が「YYY」またはロケーションコードが「Y」始まり。</td></tr>
             </table>
           </div>
 
