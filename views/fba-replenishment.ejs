@@ -41,6 +41,7 @@
     .sortable.asc::after { content: ' ▲'; color: #2563eb; }
     .sortable.desc::after { content: ' ▼'; color: #2563eb; }
     .product-name { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+    .product-name a:hover { color: #2563eb !important; text-decoration: underline !important; }
     .alert-badge { display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 4px; margin: 1px 2px; white-space: nowrap; }
     .alert-1 { background: #e0f2fe; color: #0369a1; }
     .alert-2 { background: #fef3c7; color: #92400e; }
@@ -164,10 +165,11 @@
         <span style="font-size:12px; color:#666;">※ 黄色は翌日回しOK。必要なものだけ個別にチェック。</span>
       </div>
 
-      <!-- フィルター -->
+      <!-- フィルター + 検索 -->
       <div style="margin-bottom:8px; display:flex; gap:16px; align-items:center; flex-wrap:wrap;">
         <label style="font-weight:bold;"><input type="radio" name="recFilter" value="recommended" checked onchange="filterRecList()"> 推奨のみ</label>
         <label><input type="radio" name="recFilter" value="all" onchange="filterRecList()"> 全SKU</label>
+        <input type="text" id="recSearch" placeholder="商品名・SKU・NE商品コードで検索" oninput="filterRecList()" style="padding:5px 10px; border:1px solid #d1d5db; border-radius:4px; font-size:13px; width:280px;">
         <span style="margin-left:auto;color:#666;font-size:12px;" id="recFilterCount"></span>
       </div>
 
@@ -479,8 +481,17 @@
 
     function filterRecList() {
       const mode = document.querySelector('input[name="recFilter"]:checked')?.value || 'recommended';
+      const searchQuery = (document.getElementById('recSearch')?.value || '').trim().toLowerCase();
       let filtered = recData;
       if (mode === 'recommended') filtered = filtered.filter(r => r.recommended_qty > 0 || r._manual);
+      // 検索フィルター
+      if (searchQuery) {
+        filtered = filtered.filter(r =>
+          (r.product_name || '').toLowerCase().includes(searchQuery) ||
+          (r.amazon_sku || '').toLowerCase().includes(searchQuery) ||
+          (r.ne_code || '').toLowerCase().includes(searchQuery)
+        );
+      }
       // 手動追加アイテムを先頭に含める
       const combined = [...manualItems.filter(m => !filtered.find(r => r.amazon_sku === m.amazon_sku)), ...filtered];
       renderRecList(combined);
@@ -579,7 +590,7 @@
           <td style="text-align:center;font-size:11px;color:#666;">${rowNum}</td>
           <td>${r._manual ? '手動' : r.urgency_score}</td>
           <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')">${r.amazon_sku}</span></td>
-          <td class="product-name" title="${r.product_name || ''}">${r.product_name || ''}</td>
+          <td class="product-name" title="${r.product_name || ''}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${r.product_name || ''}</a>` : (r.product_name || '')}</td>
           <td>${r.fba_available}</td>
           <td>${r.effective_fba_stock}</td>
           <td style="${dosColor}">${dosVal}${belowReorder ? ' ⚠' : ''}</td>

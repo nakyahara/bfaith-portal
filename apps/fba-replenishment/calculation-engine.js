@@ -176,12 +176,15 @@ export function generateRecommendations(debug = false) {
     let recommendedQty = Math.min(rawNeeded, warehouseAvailable);
 
     // --- 最低出荷日数フィルター: 送っても○日分に満たない場合は除外（入荷待ちの方が効率的） ---
-    // ただしFBA在庫0は緊急なので除外しない
+    // FBA在庫0でも1日分未満なら送る意味がないので除外
     const minShipmentDays = parseInt(settings.min_shipment_cover_days || 7);
     let skippedByMinDays = false;
-    if (recommendedQty > 0 && dailySales > 0 && effectiveFbaStock > 0) {
+    if (recommendedQty > 0 && dailySales > 0) {
       const coverDays = recommendedQty / dailySales;
-      if (coverDays < minShipmentDays) {
+      // FBA在庫0: 最低1日分は必要（それ未満は焼け石に水）
+      // FBA在庫あり: 設定日数分が必要（二度手間防止）
+      const threshold = effectiveFbaStock === 0 ? Math.min(minShipmentDays, 1) : minShipmentDays;
+      if (coverDays < threshold) {
         skippedByMinDays = true;
         recommendedQty = 0;
       }
