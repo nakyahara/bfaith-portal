@@ -173,7 +173,19 @@ export function generateRecommendations(debug = false) {
     }
 
     // --- 送れる数 ---
-    const recommendedQty = Math.min(rawNeeded, warehouseAvailable);
+    let recommendedQty = Math.min(rawNeeded, warehouseAvailable);
+
+    // --- 最低出荷日数フィルター: 送っても○日分に満たない場合は除外（入荷待ちの方が効率的） ---
+    // ただしFBA在庫0は緊急なので除外しない
+    const minShipmentDays = parseInt(settings.min_shipment_cover_days || 7);
+    let skippedByMinDays = false;
+    if (recommendedQty > 0 && dailySales > 0 && effectiveFbaStock > 0) {
+      const coverDays = recommendedQty / dailySales;
+      if (coverDays < minShipmentDays) {
+        skippedByMinDays = true;
+        recommendedQty = 0;
+      }
+    }
 
     // --- アラート ---
     const alerts = calcAlerts(snap, mapping, effectiveFbaStock, daysOfSupply, warehouseAvailable, settings);
@@ -195,7 +207,7 @@ export function generateRecommendations(debug = false) {
         `[Step4] FBA在庫 ${effectiveFbaStock}個 ${needsReplenishment ? '< 発注点' + reorderPointUnits + '個 → 補充推奨' : '≧ 発注点' + reorderPointUnits + '個 → 補充不要'} (供給日数: ${daysOfSupply === 999 ? '∞' : daysOfSupply.toFixed(1) + '日'})`,
         `[Step5] 必要補充数 = ${needsReplenishment ? `ceil(${dailySales.toFixed(2)} × ${targetDays}) - ${effectiveFbaStock} = ${targetStock} - ${effectiveFbaStock} = ${rawNeeded}` : '0(発注点以上のため)'}`,
         `[Step6] 倉庫在庫按分 = ${warehouseRaw}個(倉庫,Yロケ除外) × FBA比率${effectiveTotalDailySales > 0 ? (dailySales / effectiveTotalDailySales * 100).toFixed(0) : 100}% = FBA用${warehouseAvailable}個 / 他CH確保${nonFbaReserve}個${recentArrivalAdjusted ? ` [補正: 他CH実効日販${effectiveNonFbaDailySales.toFixed(2)}${max60d?.max_30d > nonFbaSales30d ? `(60日最大値${max60d.max_30d}ベース)` : daysSinceArrival !== null ? `(入荷${daysSinceArrival}日目推定)` : ''}]` : ''}${lastArrivalDate ? ` (最終入荷: ${lastArrivalDate})` : ''}`,
-        `[Step7] 推奨数 = min(${rawNeeded}(必要数), ${warehouseAvailable}(FBA用在庫)) = ${recommendedQty}`,
+        `[Step7] 推奨数 = min(${rawNeeded}(必要数), ${warehouseAvailable}(FBA用在庫)) = ${skippedByMinDays ? `0 (元${Math.min(rawNeeded, warehouseAvailable)}個→${(Math.min(rawNeeded, warehouseAvailable) / dailySales).toFixed(1)}日分 < 最低${minShipmentDays}日 → 入荷待ち)` : recommendedQty}`,
         `[Step8] 緊急度 = ${urgencyScore.toFixed(1)} (基本:${Math.max(0, 100 - (daysOfSupply * 100 / 40)).toFixed(0)}, 月商W:${Math.min((snap.your_price || 0) * sold30d / 100000, 5).toFixed(1)}, トレンド:${sold30d > 0 ? ((sold7d / 7 * 30) / sold30d).toFixed(1) : '-'})`,
         `[Step9] アラート: ${alerts.length > 0 ? alerts.map(a => a.message).join(' / ') : 'なし'}`,
       ];
@@ -245,6 +257,7 @@ export function generateRecommendations(debug = false) {
 
       // 推奨
       recommended_qty: recommendedQty,
+      skipped_min_days: skippedByMinDays,
 
       // 価格
       your_price: snap.your_price || 0,

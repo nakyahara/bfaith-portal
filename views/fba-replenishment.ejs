@@ -61,6 +61,24 @@
     .debug-step { font-family: monospace; font-size: 13px; padding: 4px 0; border-bottom: 1px solid #f0f0f0; }
     .debug-step:last-child { border-bottom: none; }
     .debug-close { position: absolute; top: 12px; right: 16px; font-size: 24px; cursor: pointer; color: #666; }
+    /* 設定パネル */
+    .settings-btn { background: none; border: 1px solid #d1d5db; border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 18px; display: flex; align-items: center; gap: 6px; color: #374151; }
+    .settings-btn:hover { background: #f3f4f6; }
+    .settings-btn span { font-size: 13px; }
+    .settings-modal { position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%); background: white; border-radius: 12px; padding: 28px; box-shadow: 0 8px 32px rgba(0,0,0,0.3); max-width: 700px; width: 90%; max-height: 85vh; overflow-y: auto; z-index: 1001; }
+    .settings-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.4); z-index: 1000; }
+    .settings-close { position: absolute; top: 12px; right: 16px; font-size: 24px; cursor: pointer; color: #666; }
+    .settings-group { margin-bottom: 20px; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px; }
+    .settings-group h4 { margin: 0 0 4px; font-size: 14px; color: #1e40af; }
+    .settings-group .group-desc { font-size: 12px; color: #666; margin: 0 0 12px; }
+    .setting-row { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+    .setting-row label { flex: 1; font-size: 13px; font-weight: 500; }
+    .setting-row .setting-desc { font-size: 11px; color: #888; font-weight: normal; display: block; }
+    .setting-row input { width: 80px; padding: 4px 8px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 13px; text-align: right; }
+    .setting-saved { color: #16a34a; font-size: 12px; opacity: 0; transition: opacity 0.3s; }
+    .legend-box { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 12px; }
+    .legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+    .legend-color { width: 16px; height: 16px; border-radius: 3px; border: 1px solid #d1d5db; }
   </style>
 </head>
 <body>
@@ -69,7 +87,8 @@
       <a href="/" class="back-link">&larr; Portal</a>
       <h1>FBA在庫補充</h1>
     </div>
-    <div class="header-right">
+    <div class="header-right" style="display:flex;align-items:center;gap:12px;">
+      <button class="settings-btn" onclick="openSettings()">⚙<span>設定</span></button>
       <span><%= displayName || username %></span>
     </div>
   </header>
@@ -556,6 +575,118 @@
         btn.disabled = false;
         btn.textContent = 'SKUマッピング同期';
       }
+    }
+
+    // ===== 設定パネル =====
+    const SETTINGS_SCHEMA = [
+      {
+        group: '発注点（いつ推奨に上げるか）',
+        desc: 'FBA在庫が発注点（個数換算）を下回ったら推奨リストに上がります。日数×FBA日販で個数に変換されます。',
+        items: [
+          { key: 'reorder_point_high_volume', label: '高回転（月100個超）', unit: '日', desc: '回転が速い商品。短めに設定して頻繁に補充。' },
+          { key: 'reorder_point_medium', label: '中回転（月20〜100個）', unit: '日', desc: '標準的な商品の発注点。' },
+          { key: 'reorder_point_low_volume', label: '低回転（月20個未満）', unit: '日', desc: '売れにくい商品。低めに設定して推奨頻度を抑える。' },
+          { key: 'reorder_point_seasonal', label: '季節商品', unit: '日', desc: 'SP-APIで季節フラグがついた商品。' },
+        ]
+      },
+      {
+        group: '目標日数（推奨に上がった時に何日分送るか）',
+        desc: '推奨に上がった時、この日数分のFBA在庫を目標に補充量を計算します。',
+        items: [
+          { key: 'target_days_high_volume_small', label: '高回転・小型', unit: '日', desc: '' },
+          { key: 'target_days_high_volume_large', label: '高回転・大型', unit: '日', desc: '大型は保管料が高いため短め。' },
+          { key: 'target_days_medium', label: '中回転', unit: '日', desc: '' },
+          { key: 'target_days_low_volume_small', label: '低回転・小型', unit: '日', desc: '半年分まとめて送ることで推奨頻度を減らす。' },
+          { key: 'target_days_low_volume_large', label: '低回転・大型/不明', unit: '日', desc: 'サイズ不明は大型扱い（保管料リスク回避）。' },
+        ]
+      },
+      {
+        group: 'フィルター（推奨リストの絞り込み）',
+        desc: '少量すぎる推奨や、低在庫手数料リスクの判定に使います。',
+        items: [
+          { key: 'min_shipment_cover_days', label: '最低出荷カバー日数', unit: '日', desc: '推奨数がこの日数分に満たない場合は除外。少量を何度も送る二度手間を防止。FBA在庫0の緊急時は除外しない。' },
+          { key: 'fba_weekly_threshold', label: '低在庫手数料 週間売上閾値', unit: '個/7日', desc: 'FBA 7日売上がこれ以上なら中回転扱いに引き上げ。Amazon免除ライン(20個)より低く設定してバッファを確保。' },
+          { key: 'daily_sku_limit', label: '日次SKU上限', unit: 'SKU', desc: '参考値。推奨リストの表示上限ではなく運用目安。' },
+        ]
+      },
+      {
+        group: '販売量の分類閾値',
+        desc: '30日売上で高回転/中回転/低回転を分類します。',
+        items: [
+          { key: 'high_volume_threshold', label: '高回転の閾値', unit: '個/30日', desc: 'この値超で高回転扱い。' },
+          { key: 'low_volume_threshold', label: '中回転の閾値', unit: '個/30日', desc: 'この値以上で中回転、未満で低回転。' },
+          { key: 'large_volume_cm3', label: '大型の閾値', unit: 'cm³', desc: 'この値超で大型扱い。0は不明→大型。' },
+        ]
+      },
+      {
+        group: 'アラート',
+        desc: '',
+        items: [
+          { key: 'trend_surge_ratio', label: '急上昇アラート倍率', unit: '倍', desc: '7日→30日比がこの倍率を超えたら急上昇アラート。' },
+          { key: 'trend_stop_ratio', label: '急停止アラート倍率', unit: '倍', desc: '7日→30日比がこの倍率未満なら急停止アラート。' },
+          { key: 'missing_bsr_threshold', label: '送り漏れBSR閾値', unit: '位', desc: 'BSRがこの順位以内でFBA在庫0なら送り漏れアラート。' },
+        ]
+      },
+    ];
+
+    let currentSettings = {};
+
+    async function openSettings() {
+      try {
+        const res = await fetch(`${BASE}/api/settings`);
+        currentSettings = await res.json();
+      } catch(e) { currentSettings = {}; }
+
+      let html = `<div class="settings-overlay" onclick="closeSettings()"></div>
+        <div class="settings-modal" id="settingsModal">
+          <span class="settings-close" onclick="closeSettings()">&times;</span>
+          <h3 style="margin:0 0 16px;">⚙ 計算ロジック設定</h3>
+          <div class="legend-box" style="margin-bottom:16px; padding:10px; background:#f8f9fa; border-radius:6px;">
+            <span style="font-size:12px; font-weight:bold; margin-right:8px;">テーブル色の意味:</span>
+            <div class="legend-item"><div class="legend-color" style="background:#fee2e2;"></div>緊急度80以上（早急に送る）</div>
+            <div class="legend-item"><div class="legend-color" style="background:#fef3c7;"></div>緊急度40〜79（近いうちに送る）</div>
+            <div class="legend-item"><div class="legend-color" style="background:white;"></div>緊急度40未満（余裕あり）</div>
+          </div>`;
+
+      for (const g of SETTINGS_SCHEMA) {
+        html += `<div class="settings-group"><h4>${g.group}</h4>`;
+        if (g.desc) html += `<p class="group-desc">${g.desc}</p>`;
+        for (const item of g.items) {
+          const val = currentSettings[item.key] || '';
+          html += `<div class="setting-row">
+            <label>${item.label}<span class="setting-desc">${item.desc}</span></label>
+            <input type="text" value="${val}" data-key="${item.key}" onchange="saveSetting(this)">
+            <span style="font-size:12px;color:#666;min-width:50px;">${item.unit}</span>
+            <span class="setting-saved" id="saved_${item.key}">保存済</span>
+          </div>`;
+        }
+        html += `</div>`;
+      }
+      html += `<p style="font-size:11px;color:#999;margin-top:12px;">※ 設定変更後は「推奨リスト生成」を再実行してください。</p></div>`;
+
+      const div = document.createElement('div');
+      div.id = 'settingsContainer';
+      div.innerHTML = html;
+      document.body.appendChild(div);
+    }
+
+    function closeSettings() {
+      const c = document.getElementById('settingsContainer');
+      if (c) c.remove();
+    }
+
+    async function saveSetting(input) {
+      const key = input.dataset.key;
+      const value = input.value.trim();
+      try {
+        await fetch(`${BASE}/api/settings`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key, value })
+        });
+        const saved = document.getElementById('saved_' + key);
+        if (saved) { saved.style.opacity = '1'; setTimeout(() => saved.style.opacity = '0', 2000); }
+      } catch(e) { alert('設定保存エラー: ' + e.message); }
     }
 
     // 初期ロード

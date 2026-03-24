@@ -272,6 +272,7 @@ export async function initDb() {
     ['small_volume_cm3', '500'],
     ['large_volume_cm3', '5000'],
     ['fba_weekly_threshold', '10'],  // 7日売上がこれ以上→低在庫手数料リスク→中回転扱い
+    ['min_shipment_cover_days', '7'],  // 推奨数がこの日数分に満たない場合は除外（FBA在庫0は例外）
     ['weekday_boost_thu_fri', '1.5'],
     ['low_inventory_fee_threshold_days', '14'],
     ['excess_inventory_dos_threshold', '90'],
