@@ -309,6 +309,80 @@ let parsedRows = [];
 let headers = [];
 let shippingTable = [];
 
+// ===== sessionStorage復元 =====
+const STORAGE_KEY = 'bulkResearchResults';
+const STORAGE_CSV_KEY = 'bulkResearchCsv';
+const STORAGE_SETTINGS_KEY = 'bulkResearchSettings';
+
+function saveToSession() {
+  try {
+    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(allResults));
+  } catch (e) { console.warn('sessionStorage保存失敗:', e); }
+}
+
+function restoreFromSession() {
+  try {
+    const saved = sessionStorage.getItem(STORAGE_KEY);
+    if (!saved) return false;
+    const data = JSON.parse(saved);
+    if (!Array.isArray(data) || data.length === 0) return false;
+    allResults = data;
+
+    // 設定の復元
+    const settings = sessionStorage.getItem(STORAGE_SETTINGS_KEY);
+    if (settings) {
+      const s = JSON.parse(settings);
+      if (s.taxRate) document.getElementById('taxRate').value = s.taxRate;
+      if (s.fulfillmentMode) {
+        document.getElementById('fulfillmentMode').value = s.fulfillmentMode;
+        document.getElementById('fbmShippingSettings').style.display = s.fulfillmentMode === 'fba_only' ? 'none' : '';
+        toggleFbmColumns(s.fulfillmentMode !== 'fba_only');
+      }
+      if (s.fbmShippingMode) document.getElementById('fbmShippingMode').value = s.fbmShippingMode;
+      if (s.supplierCode) document.getElementById('supplierCode').value = s.supplierCode;
+      if (s.supplierName) document.getElementById('supplierName').value = s.supplierName;
+    }
+
+    // CSV入力の復元
+    const csvText = sessionStorage.getItem(STORAGE_CSV_KEY);
+    if (csvText) {
+      document.getElementById('csvText').value = csvText;
+      parseCsv(csvText);
+    }
+
+    // 結果表示
+    document.getElementById('resultsPanel').style.display = 'block';
+    document.getElementById('progressBox').style.display = 'block';
+    document.getElementById('progressFill').style.width = '100%';
+    document.getElementById('progressText').textContent =
+      `前回の結果を復元しました（${allResults.length} 件）`;
+    updateSummary();
+    applyFilter();
+    return true;
+  } catch (e) {
+    console.warn('sessionStorage復元失敗:', e);
+    return false;
+  }
+}
+
+function saveSettingsToSession() {
+  try {
+    sessionStorage.setItem(STORAGE_SETTINGS_KEY, JSON.stringify({
+      taxRate: document.getElementById('taxRate').value,
+      fulfillmentMode: document.getElementById('fulfillmentMode').value,
+      fbmShippingMode: document.getElementById('fbmShippingMode').value,
+      supplierCode: document.getElementById('supplierCode').value,
+      supplierName: document.getElementById('supplierName').value,
+    }));
+  } catch (e) {}
+}
+
+function clearSession() {
+  sessionStorage.removeItem(STORAGE_KEY);
+  sessionStorage.removeItem(STORAGE_CSV_KEY);
+  sessionStorage.removeItem(STORAGE_SETTINGS_KEY);
+}
+
 // ===== 送料テーブル読み込み =====
 (async function loadShippingTable() {
   try {
@@ -522,8 +596,13 @@ async function startResearch() {
   document.getElementById('progressBox').style.display = 'block';
   document.getElementById('resultsPanel').style.display = 'block';
   allResults = [];
+  clearSession(); // 前回データをクリア
   document.getElementById('resultBody').innerHTML = '';
   updateSummary();
+
+  // CSV・設定を保存
+  sessionStorage.setItem(STORAGE_CSV_KEY, document.getElementById('csvText').value);
+  saveSettingsToSession();
 
   const taxRate = parseInt(document.getElementById('taxRate').value);
   const fulfillmentMode = document.getElementById('fulfillmentMode').value;
@@ -579,6 +658,7 @@ function handleEvent(data) {
   } else if (data.status !== undefined) {
     // result
     allResults.push(data);
+    saveToSession();
     updateSummary();
     applyFilter();
     // スクロール
@@ -785,6 +865,7 @@ async function saveSelected() {
     }
   }
   alert(`${saved} 件をリサーチに保存しました`);
+  // 保存済みデータはセッションから削除しない（保存後も結果を確認できるように）
 }
 
 // ===== CSV エクスポート =====
@@ -819,6 +900,12 @@ function exportCsv() {
 }
 
 // ===== ユーティリティ =====
+// ===== ページロード時に前回結果を復元 =====
+window.addEventListener('DOMContentLoaded', () => {
+  // 送料テーブル読み込み完了後に復元（少し待つ）
+  setTimeout(() => restoreFromSession(), 300);
+});
+
 function fmt(n) { return Number(n).toLocaleString(); }
 function escHtml(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
 function toggleAll(checked) { document.querySelectorAll('.row-cb').forEach(cb => { cb.checked = checked; }); }
