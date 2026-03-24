@@ -262,7 +262,7 @@ export async function initDb() {
     // 発注点（供給日数がこれを下回ったら推奨に上がる）
     ['reorder_point_high_volume', '14'],
     ['reorder_point_medium', '21'],
-    ['reorder_point_low_volume', '30'],
+    ['reorder_point_low_volume', '14'],
     ['reorder_point_seasonal', '21'],
     // 日次SKU上限
     ['daily_sku_limit', '100'],
@@ -271,6 +271,7 @@ export async function initDb() {
     ['low_volume_threshold', '20'],
     ['small_volume_cm3', '500'],
     ['large_volume_cm3', '5000'],
+    ['fba_weekly_threshold', '10'],  // 7日売上がこれ以上→低在庫手数料リスク→中回転扱い
     ['weekday_boost_thu_fri', '1.5'],
     ['low_inventory_fee_threshold_days', '14'],
     ['excess_inventory_dos_threshold', '90'],

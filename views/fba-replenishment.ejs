@@ -150,13 +150,14 @@
               <th class="sortable-rec" data-key="fba_available" data-type="num">FBA在庫</th>
               <th class="sortable-rec" data-key="effective_fba_stock" data-type="num">実質在庫</th>
               <th class="sortable-rec" data-key="days_of_supply" data-type="num">供給日数</th>
-              <th class="sortable-rec" data-key="reorder_point" data-type="num">発注点</th>
+              <th class="sortable-rec" data-key="reorder_point" data-type="num">発注点(個)</th>
               <th class="sortable-rec" data-key="target_days" data-type="num">目標日数</th>
               <th class="sortable-rec" data-key="units_sold_7d" data-type="num">FBA7日</th>
               <th class="sortable-rec" data-key="units_sold_30d" data-type="num">FBA30日</th>
               <th class="sortable-rec" data-key="non_fba_sales_7d" data-type="num">他CH7日</th>
               <th class="sortable-rec" data-key="non_fba_sales_30d" data-type="num">他CH30日</th>
-              <th class="sortable-rec" data-key="warehouse_available" data-type="num">倉庫在庫</th>
+              <th class="sortable-rec" data-key="warehouse_raw" data-type="num">倉庫在庫</th>
+              <th class="sortable-rec" data-key="warehouse_available" data-type="num">FBA用</th>
               <th class="sortable-rec" data-key="non_fba_reserve" data-type="num">他CH確保</th>
               <th class="sortable-rec" data-key="recommended_qty" data-type="num">推奨数</th>
               <th>アラート</th>
@@ -423,6 +424,7 @@
           reorder_point: '-',
           target_days: '-',
           units_sold_30d: '-',
+          warehouse_raw: '-',
           warehouse_available: '-',
           recommended_qty: qty,
           urgency_score: 999,
@@ -445,7 +447,7 @@
 
     function renderRecList(data) {
       const tbody = document.getElementById('recBody');
-      if (!data.length) { tbody.innerHTML = '<tr><td colspan="16">該当なし</td></tr>'; return; }
+      if (!data.length) { tbody.innerHTML = '<tr><td colspan="17">該当なし</td></tr>'; return; }
 
       // ソート
       data.sort((a, b) => {
@@ -468,7 +470,7 @@
         const dosVal = r.days_of_supply;
         const dosColor = typeof dosVal === 'number' && dosVal < 7 ? 'color:#dc2626;font-weight:bold' : typeof dosVal === 'number' && dosVal < 14 ? 'color:#d97706' : '';
         const reorderVal = r.reorder_point;
-        const belowReorder = typeof dosVal === 'number' && typeof reorderVal === 'number' && dosVal < reorderVal;
+        const belowReorder = typeof r.effective_fba_stock === 'number' && typeof reorderVal === 'number' && r.effective_fba_stock < reorderVal;
         return `<tr class="${urgCls}" ${manualCls}>
           <td>${r._manual ? '手動' : r.urgency_score}</td>
           <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')">${r.amazon_sku}</span></td>
@@ -482,7 +484,8 @@
           <td>${r.units_sold_30d}</td>
           <td>${r.non_fba_sales_7d || 0}</td>
           <td style="${(r.non_fba_sales_30d || 0) > 0 ? 'font-weight:bold;color:#7c3aed' : ''}">${r.non_fba_sales_30d || 0}</td>
-          <td>${r.warehouse_available}</td>
+          <td>${r.warehouse_raw || r.warehouse_available}</td>
+          <td style="color:#2563eb;font-weight:bold">${r.warehouse_available}</td>
           <td style="${(r.non_fba_reserve || 0) > 0 ? 'font-weight:bold;color:#dc2626' : 'color:#999'}">${r.non_fba_reserve || 0}</td>
           <td class="rec-qty">${r.recommended_qty || '-'}</td>
           <td>${alertsHtml}</td>

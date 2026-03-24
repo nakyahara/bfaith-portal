@@ -12,9 +12,10 @@ import { getLatestSnapshots, getSkuMappings, getSkuExceptions, getSettings,
  * @param {boolean} debug - trueの場合、各SKUの計算過程をcalc_stepsに記録
  *
  * 2段階ロジック:
- *   1. 発注点(reorder_point) — 供給日数がこの閾値を下回ったら推奨に上がる
+ *   1. 発注点(reorder_point) — FBA在庫が発注点(個数)を下回ったら推奨に上がる
+ *      ※ 発注点は日数で設定し、個数換算(日数×FBA日販)で比較
  *   2. 目標日数(target_days) — 推奨に上がった時に何日分送るかの量
- *   → 低回転商品は発注点30日、目標180日（半年分）= たまに推奨に上がるが、上がったらまとめて送る
+ *   → 低回転商品は発注点14日、目標180日（半年分）= たまに推奨に上がるが、上がったらまとめて送る
  *
  * 発注点で自然に絞り込み、ハードリミットは設けない
  */
@@ -78,13 +79,17 @@ export function generateRecommendations(debug = false) {
     // --- 動的在庫日数目標 & 発注点 ---
     const perUnitVolume = snap.per_unit_volume || mapping.per_unit_volume || 0;
     const targetDays = calcTargetDays(sold30d, perUnitVolume, snap, settings);
-    const reorderPoint = calcReorderPoint(sold30d, perUnitVolume, snap, settings);
+    const reorderPointDays = calcReorderPoint(sold30d, sold7d, perUnitVolume, snap, settings);
+    // 発注点を個数換算（日数 × FBA日販、最低1個 ※日販>0の場合）
+    const reorderPointUnits = reorderPointDays > 0 && dailySales > 0
+      ? Math.max(1, Math.ceil(dailySales * reorderPointDays))
+      : 0;
 
     // --- 供給日数 ---
     const daysOfSupply = dailySales > 0 ? effectiveFbaStock / dailySales : (effectiveFbaStock > 0 ? 999 : 0);
 
-    // --- 発注点チェック: 供給日数 < 発注点 の場合のみ補充推奨 ---
-    const needsReplenishment = daysOfSupply < reorderPoint;
+    // --- 発注点チェック: FBA在庫 < 発注点(個数) の場合のみ補充推奨 ---
+    const needsReplenishment = effectiveFbaStock < reorderPointUnits;
 
     // --- 必要補充数 ---
     const targetStock = Math.ceil(dailySales * targetDays);
@@ -186,8 +191,8 @@ export function generateRecommendations(debug = false) {
       calc_steps = [
         `[Step1] 実質FBA在庫 = ${fbaAvailable}(販売可能) + ${inboundShipped}(輸送中) + ${inboundReceived}(受領中) + ${inboundWorking}(準備中${snap.fba_inbound_working > 0 && inboundWorking === 0 ? ',7日超で除外' : ''}) = ${effectiveFbaStock}`,
         `[Step2] 1日あたり販売数 = FBA ${dailySales.toFixed(2)}個/日 (${sold30d}個/30日) + 他CH ${nonFbaDailySales.toFixed(2)}個/日 (${nonFbaSales30d}個/30日) = 合計 ${totalDailySales.toFixed(2)}個/日`,
-        `[Step3] 発注点 = ${reorderPoint}日 / 目標日数 = ${targetDays}日 (30日売上:${sold30d}個, サイズ:${perUnitVol}cm³${perUnitVol > 5000 ? '→大型' : perUnitVol > 500 ? '→中型' : perUnitVol > 0 ? '→小型' : '→不明'})`,
-        `[Step4] 供給日数 = ${effectiveFbaStock} ÷ ${dailySales.toFixed(2)} = ${daysOfSupply === 999 ? '∞(販売0,在庫あり)' : daysOfSupply.toFixed(1) + '日'} ${needsReplenishment ? '→ 発注点' + reorderPoint + '日を下回り → 補充推奨' : '→ 発注点以上 → 補充不要'}`,
+        `[Step3] 発注点 = ${reorderPointUnits}個 (${reorderPointDays}日×${dailySales.toFixed(2)}個/日) / 目標日数 = ${targetDays}日 (30日売上:${sold30d}個, サイズ:${perUnitVol}cm³${perUnitVol > 5000 ? '→大型' : perUnitVol > 500 ? '→中型' : perUnitVol > 0 ? '→小型' : '→不明'})`,
+        `[Step4] FBA在庫 ${effectiveFbaStock}個 ${needsReplenishment ? '< 発注点' + reorderPointUnits + '個 → 補充推奨' : '≧ 発注点' + reorderPointUnits + '個 → 補充不要'} (供給日数: ${daysOfSupply === 999 ? '∞' : daysOfSupply.toFixed(1) + '日'})`,
         `[Step5] 必要補充数 = ${needsReplenishment ? `ceil(${dailySales.toFixed(2)} × ${targetDays}) - ${effectiveFbaStock} = ${targetStock} - ${effectiveFbaStock} = ${rawNeeded}` : '0(発注点以上のため)'}`,
         `[Step6] 倉庫在庫按分 = ${warehouseRaw}個(倉庫,Yロケ除外) × FBA比率${effectiveTotalDailySales > 0 ? (dailySales / effectiveTotalDailySales * 100).toFixed(0) : 100}% = FBA用${warehouseAvailable}個 / 他CH確保${nonFbaReserve}個${recentArrivalAdjusted ? ` [補正: 他CH実効日販${effectiveNonFbaDailySales.toFixed(2)}${max60d?.max_30d > nonFbaSales30d ? `(60日最大値${max60d.max_30d}ベース)` : daysSinceArrival !== null ? `(入荷${daysSinceArrival}日目推定)` : ''}]` : ''}${lastArrivalDate ? ` (最終入荷: ${lastArrivalDate})` : ''}`,
         `[Step7] 推奨数 = min(${rawNeeded}(必要数), ${warehouseAvailable}(FBA用在庫)) = ${recommendedQty}`,
@@ -220,7 +225,8 @@ export function generateRecommendations(debug = false) {
       non_fba_sales_30d: nonFbaSales30d,
 
       // 在庫計画
-      reorder_point: reorderPoint,
+      reorder_point: reorderPointUnits,
+      reorder_point_days: reorderPointDays,
       target_days: targetDays,
       days_of_supply: Math.round(daysOfSupply * 10) / 10,
       target_stock: targetStock,
@@ -285,22 +291,24 @@ function calcTargetDays(sold30d, perUnitVolume, snap, settings) {
   const isSeasonal = snap.is_seasonal === 'Yes' || snap.is_seasonal === 'TRUE';
   if (isSeasonal) return parseInt(settings.target_days_seasonal || 50);
 
-  const isLarge = perUnitVolume > largeVol;
+  // サイズ不明(0)は大型扱い（保管料リスク回避）
+  const isLarge = perUnitVolume === 0 || perUnitVolume > largeVol;
 
   if (sold30d > highVol) {
     return parseInt(isLarge ? settings.target_days_high_volume_large || 30 : settings.target_days_high_volume_small || 40);
   } else if (sold30d >= lowVol) {
     return parseInt(settings.target_days_medium || 35);
   } else {
-    // 低回転: 半年分（180日）まとめて送る → 頻繁に推奨に上がらない
+    // 低回転: 大型/不明=90日、小型=180日
     return parseInt(isLarge ? settings.target_days_low_volume_large || 90 : settings.target_days_low_volume_small || 180);
   }
 }
 
-// ===== 発注点（供給日数がこの閾値を下回ったら推奨に上がる） =====
-function calcReorderPoint(sold30d, perUnitVolume, snap, settings) {
+// ===== 発注点（FBA在庫がこの個数を下回ったら推奨に上がる） =====
+function calcReorderPoint(sold30d, sold7d, perUnitVolume, snap, settings) {
   const highVol = parseInt(settings.high_volume_threshold || 100);
   const lowVol = parseInt(settings.low_volume_threshold || 20);
+  const fbaWeeklyThreshold = parseInt(settings.fba_weekly_threshold || 10);
 
   // 季節商品
   const isSeasonal = snap.is_seasonal === 'Yes' || snap.is_seasonal === 'TRUE';
@@ -309,12 +317,17 @@ function calcReorderPoint(sold30d, perUnitVolume, snap, settings) {
   // 売上0の商品 → 発注点0（推奨に上がらない、手動追加で対応）
   if (sold30d === 0) return 0;
 
+  // 7日売上が閾値以上 → 低在庫手数料リスクあり → 最低でも中回転扱い
+  if (sold7d >= fbaWeeklyThreshold && sold30d < lowVol) {
+    return parseInt(settings.reorder_point_medium || 21);
+  }
+
   if (sold30d > highVol) {
     return parseInt(settings.reorder_point_high_volume || 14);
   } else if (sold30d >= lowVol) {
     return parseInt(settings.reorder_point_medium || 21);
   } else {
-    return parseInt(settings.reorder_point_low_volume || 30);
+    return parseInt(settings.reorder_point_low_volume || 14);
   }
 }
 
