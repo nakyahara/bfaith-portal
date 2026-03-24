@@ -48,7 +48,7 @@
     .urgency-high { background: #fee2e2; }
     .urgency-mid { background: #fef3c7; }
     .rec-qty { font-weight: bold; font-size: 14px; color: #2563eb; }
-    #recTable td:nth-child(n+4):not(:nth-child(17)) { text-align: right; }
+    #recTable td:nth-child(n+6):not(:nth-child(19)) { text-align: right; }
     .sortable-rec { cursor: pointer; user-select: none; white-space: nowrap; }
     .sortable-rec:hover { background: #e5e7eb; }
     .sortable-rec::after { content: ' ⇅'; font-size: 10px; color: #999; }
@@ -126,14 +126,26 @@
       <h3>推奨納品リスト</h3>
 
       <!-- サマリーカード -->
-      <div class="status-row" style="margin-bottom:16px;">
+      <div class="status-row" style="margin-bottom:8px;">
+        <div class="stat" style="border-left:4px solid #dc2626; background:#fee2e2;">
+          <div class="label">🔴 緊急（80以上）</div>
+          <div class="value" id="recRedSkus" style="color:#dc2626;font-size:20px;">-</div>
+          <div style="font-size:12px;color:#666;" id="recRedUnits">-</div>
+        </div>
+        <div class="stat" style="border-left:4px solid #d97706; background:#fef3c7;">
+          <div class="label">🟡 注意（40〜79）</div>
+          <div class="value" id="recYellowSkus" style="color:#d97706;font-size:20px;">-</div>
+          <div style="font-size:12px;color:#666;" id="recYellowUnits">-</div>
+        </div>
         <div class="stat" style="border-left:4px solid #2563eb;">
-          <div class="label">推奨SKU数</div>
+          <div class="label">推奨合計</div>
           <div class="value" id="recSkus" style="color:#2563eb;">-</div>
+          <div style="font-size:12px;color:#666;" id="recUnits">-</div>
         </div>
         <div class="stat" style="border-left:4px solid #16a34a;">
-          <div class="label">推奨合計数量</div>
-          <div class="value" id="recUnits" style="color:#16a34a;">-</div>
+          <div class="label">✅ 選択中</div>
+          <div class="value" id="selectedCount" style="color:#16a34a;font-size:20px;">0 SKU</div>
+          <div style="font-size:12px;color:#666;" id="selectedUnits">0 個</div>
         </div>
         <div class="stat">
           <div class="label">全SKU</div>
@@ -143,6 +155,13 @@
           <div class="label">データ日付</div>
           <div class="value" id="snapshotDateDisp" style="font-size:16px;">-</div>
         </div>
+      </div>
+
+      <!-- 選択アクション -->
+      <div style="margin-bottom:8px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+        <button class="btn btn-primary" onclick="checkAllRed()" style="background:#dc2626; padding:6px 14px; font-size:13px;">🔴 緊急を全選択</button>
+        <button class="btn btn-secondary" onclick="uncheckAll()" style="padding:6px 14px; font-size:13px;">選択解除</button>
+        <span style="font-size:12px; color:#666;">※ 黄色は翌日回しOK。必要なものだけ個別にチェック。</span>
       </div>
 
       <!-- フィルター -->
@@ -164,6 +183,8 @@
         <table class="data-table" id="recTable" style="table-layout:auto;">
           <thead>
             <tr>
+              <th style="width:30px;text-align:center;">✓</th>
+              <th style="width:30px;text-align:center;">#</th>
               <th class="sortable-rec" data-key="urgency_score" data-type="num">緊急度</th>
               <th class="sortable-rec" data-key="amazon_sku">SKU</th>
               <th class="sortable-rec" data-key="product_name">商品名</th>
@@ -399,11 +420,61 @@
       }
     }
 
+    // 選択管理
+    const selectedSkus = new Set();
+
     function updateRecSummary() {
+      // 全体
       document.getElementById('recSkus').textContent = (recMeta.recommended_skus || 0) + ' SKU';
       document.getElementById('recUnits').textContent = (recMeta.recommended_units || 0).toLocaleString() + ' 個';
       document.getElementById('totalSkus').textContent = recMeta.total_skus || 0;
       document.getElementById('snapshotDateDisp').textContent = recMeta.snapshot_date || '-';
+
+      // 赤/黄の内訳
+      const allRec = [...recData.filter(r => r.recommended_qty > 0), ...manualItems];
+      const redItems = allRec.filter(r => r.urgency_score >= 80);
+      const yellowItems = allRec.filter(r => r.urgency_score >= 40 && r.urgency_score < 80);
+      document.getElementById('recRedSkus').textContent = redItems.length + ' SKU';
+      document.getElementById('recRedUnits').textContent = redItems.reduce((s, r) => s + (r.recommended_qty || 0), 0).toLocaleString() + ' 個';
+      document.getElementById('recYellowSkus').textContent = yellowItems.length + ' SKU';
+      document.getElementById('recYellowUnits').textContent = yellowItems.reduce((s, r) => s + (r.recommended_qty || 0), 0).toLocaleString() + ' 個';
+
+      updateSelectedCount();
+    }
+
+    function updateSelectedCount() {
+      let count = 0, units = 0;
+      document.querySelectorAll('.rec-check:checked').forEach(cb => {
+        count++;
+        units += parseInt(cb.dataset.qty) || 0;
+      });
+      document.getElementById('selectedCount').textContent = count + ' SKU';
+      document.getElementById('selectedUnits').textContent = units.toLocaleString() + ' 個';
+    }
+
+    function onCheckChange(cb) {
+      if (cb.checked) {
+        selectedSkus.add(cb.dataset.sku);
+      } else {
+        selectedSkus.delete(cb.dataset.sku);
+      }
+      updateSelectedCount();
+    }
+
+    function checkAllRed() {
+      document.querySelectorAll('.rec-check[data-urg="red"]').forEach(cb => {
+        cb.checked = true;
+        selectedSkus.add(cb.dataset.sku);
+      });
+      updateSelectedCount();
+    }
+
+    function uncheckAll() {
+      document.querySelectorAll('.rec-check').forEach(cb => {
+        cb.checked = false;
+      });
+      selectedSkus.clear();
+      updateSelectedCount();
     }
 
     function filterRecList() {
@@ -467,7 +538,7 @@
 
     function renderRecList(data) {
       const tbody = document.getElementById('recBody');
-      if (!data.length) { tbody.innerHTML = '<tr><td colspan="17">該当なし</td></tr>'; return; }
+      if (!data.length) { tbody.innerHTML = '<tr><td colspan="19">該当なし</td></tr>'; return; }
 
       // ソート
       data.sort((a, b) => {
@@ -481,6 +552,9 @@
         return 0;
       });
 
+      // グループ内ナンバリング用カウンター
+      let redNum = 0, yellowNum = 0, whiteNum = 0;
+
       tbody.innerHTML = data.map(r => {
         const urgCls = r.urgency_score >= 80 ? 'urgency-high' : r.urgency_score >= 40 ? 'urgency-mid' : '';
         const manualCls = r._manual ? 'style="background:#eff6ff;"' : '';
@@ -491,7 +565,18 @@
         const dosColor = typeof dosVal === 'number' && dosVal < 7 ? 'color:#dc2626;font-weight:bold' : typeof dosVal === 'number' && dosVal < 14 ? 'color:#d97706' : '';
         const reorderVal = r.reorder_point;
         const belowReorder = typeof r.effective_fba_stock === 'number' && typeof reorderVal === 'number' && r.effective_fba_stock < reorderVal;
+        // ナンバリング
+        let rowNum = '';
+        if (r._manual) { rowNum = '手動'; }
+        else if (r.urgency_score >= 80) { redNum++; rowNum = `🔴${redNum}`; }
+        else if (r.urgency_score >= 40) { yellowNum++; rowNum = `🟡${yellowNum}`; }
+        else { whiteNum++; rowNum = `${whiteNum}`; }
+        // チェック状態
+        const isChecked = selectedSkus.has(r.amazon_sku);
+        const urgTag = r.urgency_score >= 80 ? 'red' : r.urgency_score >= 40 ? 'yellow' : 'white';
         return `<tr class="${urgCls}" ${manualCls}>
+          <td style="text-align:center;"><input type="checkbox" class="rec-check" data-sku="${r.amazon_sku}" data-qty="${r.recommended_qty || 0}" data-urg="${urgTag}" ${isChecked ? 'checked' : ''} onchange="onCheckChange(this)"></td>
+          <td style="text-align:center;font-size:11px;color:#666;">${rowNum}</td>
           <td>${r._manual ? '手動' : r.urgency_score}</td>
           <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')">${r.amazon_sku}</span></td>
           <td class="product-name" title="${r.product_name || ''}">${r.product_name || ''}</td>
