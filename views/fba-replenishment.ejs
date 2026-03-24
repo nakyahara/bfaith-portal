@@ -61,6 +61,8 @@
       <div class="status-row" id="statusRow">
         <div class="stat"><div class="label">最終データ取得</div><div class="value" id="lastFetch">-</div></div>
         <div class="stat"><div class="label">SKU数</div><div class="value" id="skuCount">-</div></div>
+        <div class="stat"><div class="label">SKUマッピング</div><div class="value" id="mappingCount">-</div></div>
+        <div class="stat"><div class="label">倉庫在庫</div><div class="value" id="warehouseCount">-</div></div>
         <div class="stat"><div class="label">レポート取得</div><div class="value" id="fetchStatus">待機中</div></div>
       </div>
     </div>
@@ -73,6 +75,7 @@
         ロジザードCSVアップロード
         <input type="file" accept=".csv" id="csvFile" onchange="uploadCsv(this)" style="display:none;">
       </label>
+      <button class="btn btn-secondary" id="btnSyncSku" onclick="syncSkuMappings()">SKUマッピング同期</button>
     </div>
 
     <!-- ログ -->
@@ -121,6 +124,8 @@
         const d = await res.json();
         document.getElementById('lastFetch').textContent = d.latestSnapshotDate || '-';
         document.getElementById('skuCount').textContent = d.snapshotCount || 0;
+        document.getElementById('mappingCount').textContent = d.mappingCount || 0;
+        document.getElementById('warehouseCount').textContent = d.warehouseProducts ? `${d.warehouseProducts}商品` : '-';
         document.getElementById('fetchStatus').textContent = d.fetchInProgress ? '取得中...' : '待機中';
         if (d.snapshotCount > 0) loadSnapshots();
       } catch (e) { log('ステータス取得エラー: ' + e.message); }
@@ -267,6 +272,25 @@
         log(`完了! ${d.count}行取込 / ${s.uniqueProducts || '?'}商品 / 倉庫在庫: ${s.totalQty || '?'}個 / Yロケ(施設): ${s.yLocationProducts || 0}商品 ${s.yLocationQty || 0}個`);
       } catch (e) { log('エラー: ' + e.message); }
       input.value = '';
+    }
+
+    async function syncSkuMappings() {
+      const btn = document.getElementById('btnSyncSku');
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span>同期中...';
+      log('SKUマッピング同期開始...');
+
+      try {
+        const res = await fetch(`${BASE}/api/sync-sku-mappings`, { method: 'POST' });
+        const d = await res.json();
+        if (d.error) { log('エラー: ' + d.error); return; }
+        log(`完了! ${d.total}件同期 (単品: ${d.singles}件, セット: ${d.sets}件)`);
+        loadStatus();
+      } catch (e) { log('エラー: ' + e.message); }
+      finally {
+        btn.disabled = false;
+        btn.textContent = 'SKUマッピング同期';
+      }
     }
 
     // 初期ロード

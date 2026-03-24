@@ -8,6 +8,7 @@ import { initDb, savePlanningData, getLatestSnapshots, getSettings, updateSettin
          getWarehouseInventory, replaceWarehouseInventory, getWarehouseSummary,
          getShipmentPlans, getShipmentPlanItems, getDailySnapshots } from './db.js';
 import { fetchAllReports, fetchPlanningData, normalizePlanningRow } from './sp-api-reports.js';
+import { syncSkuMappings } from './sheets-sync.js';
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -98,6 +99,17 @@ router.get('/api/snapshots/:sku', (req, res) => {
 // ===== SKUマッピング =====
 router.get('/api/sku-mappings', (req, res) => {
   res.json(getSkuMappings());
+});
+
+// ===== スプレッドシート同期 =====
+router.post('/api/sync-sku-mappings', async (req, res) => {
+  try {
+    const result = await syncSkuMappings();
+    res.json({ success: true, ...result });
+  } catch (e) {
+    console.error('[FBA] SKUマッピング同期エラー:', e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ===== SKU例外マスタ =====
@@ -223,11 +235,17 @@ router.get('/api/plans/:id/items', (req, res) => {
 // ===== ステータス =====
 router.get('/api/status', (req, res) => {
   const snapshots = getLatestSnapshots();
+  const mappings = getSkuMappings();
+  const warehouse = getWarehouseInventory();
+  const warehouseProducts = new Set(warehouse.map(w => w.logizard_code)).size;
   res.json({
     dbReady,
     fetchInProgress,
     latestSnapshotDate: snapshots[0]?.snapshot_date || null,
     snapshotCount: snapshots.length,
+    mappingCount: mappings.length,
+    warehouseProducts,
+    warehouseRows: warehouse.length,
   });
 });
 
