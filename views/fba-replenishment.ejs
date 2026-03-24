@@ -31,6 +31,10 @@
     .section h3 { border-bottom: 2px solid #2563eb; padding-bottom: 8px; }
     .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #fff; border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; margin-right: 6px; vertical-align: middle; }
     @keyframes spin { to { transform: rotate(360deg); } }
+    .working-fresh { color: #16a34a; }
+    .working-warn { color: #d97706; background: #fef3c7; }
+    .working-expired { color: #dc2626; background: #fee2e2; text-decoration: line-through; }
+    .working-days { font-size: 11px; color: #666; }
   </style>
 </head>
 <body>
@@ -118,10 +122,18 @@
           tbody.innerHTML = '<tr><td colspan="11">データなし</td></tr>';
           return;
         }
-        tbody.innerHTML = d.data.map(r => `<tr>
+        tbody.innerHTML = d.data.map(r => {
+          const w = r.fba_inbound_working || 0;
+          let workingHtml = String(w);
+          if (w > 0 && r.working_first_seen) {
+            const days = Math.floor((new Date(d.data[0]?.snapshot_date || new Date()) - new Date(r.working_first_seen)) / 86400000);
+            const cls = days >= 7 ? 'working-expired' : days >= 4 ? 'working-warn' : 'working-fresh';
+            workingHtml = `<span class="${cls}">${w}</span> <span class="working-days">${days}日</span>`;
+          }
+          return `<tr>
           <td>${r.amazon_sku}</td>
           <td>${r.fba_available}</td>
-          <td>${r.fba_inbound_working || 0}</td>
+          <td>${workingHtml}</td>
           <td>${r.fba_inbound_shipped || 0}</td>
           <td>${r.fba_inbound_received || 0}</td>
           <td>${r.days_of_supply || '-'}</td>
@@ -130,7 +142,8 @@
           <td>${r.sales_rank || '-'}</td>
           <td>${r.your_price ? '¥' + Number(r.your_price).toLocaleString() : '-'}</td>
           <td>${r.featured_offer_price ? '¥' + Number(r.featured_offer_price).toLocaleString() : '-'}</td>
-        </tr>`).join('');
+        </tr>`;
+        }).join('');
       } catch (e) { log('スナップショット読込エラー: ' + e.message); }
     }
 

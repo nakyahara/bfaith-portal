@@ -181,6 +181,7 @@ export async function initDb() {
       fba_inbound_working INTEGER DEFAULT 0,
       fba_inbound_shipped INTEGER DEFAULT 0,
       fba_inbound_received INTEGER DEFAULT 0,
+      working_first_seen TEXT,
       days_of_supply REAL,
       units_sold_7d INTEGER DEFAULT 0,
       units_sold_30d INTEGER DEFAULT 0,
@@ -191,12 +192,15 @@ export async function initDb() {
     )
   `);
 
-  // マイグレーション: fba_inbound → 3列に分割
+  // マイグレーション: 既存テーブルに新カラム追加
   const snapCols = queryAll('PRAGMA table_info(daily_snapshots)').map(r => r.name);
   for (const col of ['fba_inbound_working', 'fba_inbound_shipped', 'fba_inbound_received']) {
     if (!snapCols.includes(col)) {
       db.run(`ALTER TABLE daily_snapshots ADD COLUMN ${col} INTEGER DEFAULT 0`);
     }
+  }
+  if (!snapCols.includes('working_first_seen')) {
+    db.run(`ALTER TABLE daily_snapshots ADD COLUMN working_first_seen TEXT`);
   }
 
   // --- 8. settings: 設定値 ---
@@ -228,6 +232,7 @@ export async function initDb() {
     ['cart_alert_level2_ratio', '0.8'],
     ['cart_alert_level3_ratio', '0.5'],
     ['missing_bsr_threshold', '5000'],
+    ['working_expiry_days', '7'],
   ];
   for (const [key, value] of defaults) {
     db.run(`INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)`, [key, value]);
@@ -249,21 +254,47 @@ export function savePlanningData(rows, snapshotDate) {
   db.run('BEGIN TRANSACTION');
   try {
     for (const row of rows) {
-      // daily_snapshots に保存（正規化済みデータを受け取る）
+      const sku = row.sku || '';
+      const workingQty = row.fba_inbound_working || 0;
+
+      // working_first_seen の自動判定:
+      // - 今回 working > 0 で、前回も working > 0 → 前回の first_seen を引き継ぐ
+      // - 今回 working > 0 で、前回は working = 0 → 今日が初検知
+      // - 今回 working = 0 → null
+      let workingFirstSeen = null;
+      if (workingQty > 0) {
+        const prev = queryOne(
+          `SELECT working_first_seen, fba_inbound_working
+           FROM daily_snapshots
+           WHERE amazon_sku = ? AND snapshot_date < ?
+           ORDER BY snapshot_date DESC LIMIT 1`,
+          [sku, today]
+        );
+        if (prev && prev.fba_inbound_working > 0 && prev.working_first_seen) {
+          // 前回もworking中 → 初検知日を引き継ぐ
+          workingFirstSeen = prev.working_first_seen;
+        } else {
+          // 新たにworkingが発生 → 今日が初検知
+          workingFirstSeen = today;
+        }
+      }
+
       db.run(`
         INSERT OR REPLACE INTO daily_snapshots
           (snapshot_date, amazon_sku, fba_available,
            fba_inbound_working, fba_inbound_shipped, fba_inbound_received,
+           working_first_seen,
            days_of_supply, units_sold_7d, units_sold_30d,
            sales_rank, your_price, featured_offer_price)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
         today,
-        row.sku || '',
+        sku,
         row.fba_available || 0,
-        row.fba_inbound_working || 0,
+        workingQty,
         row.fba_inbound_shipped || 0,
         row.fba_inbound_received || 0,
+        workingFirstSeen,
         row.days_of_supply || 0,
         row.units_sold_7d || 0,
         row.units_sold_30d || 0,
