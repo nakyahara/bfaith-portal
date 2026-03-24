@@ -659,19 +659,28 @@ router.post('/api/bulk-research/stream', async (req, res) => {
     try {
       send('progress', { current: idx, total: items.length, jan, productName });
 
-      // Step 1: JANコードでASIN検索（JANがなければキーワード検索）
+      // Step 1: JANコードでASIN検索 → キーワード検索でフォールバック
+      // matchType: 何で一致したかを記録
       let candidates = [];
+      let matchType = 'unknown';
+
+      // 1a: JANコード（EAN）で検索 — 最も信頼性が高い
       if (jan) {
         candidates = await searchByJan(jan);
+        if (candidates.length > 0) matchType = 'jan';
       }
+
+      // 1b: JANで見つからなければ商品名でキーワード検索
       if (candidates.length === 0 && productName) {
         candidates = await searchByKeyword(productName);
+        if (candidates.length > 0) matchType = 'keyword';
       }
 
       if (candidates.length === 0) {
         send('result', {
           idx, jan, productName, wholesalePrice,
           status: 'not_found', message: 'Amazon商品が見つかりません',
+          matchType: 'none',
         });
         continue;
       }
@@ -693,6 +702,7 @@ router.post('/api/bulk-research/stream', async (req, res) => {
           image: product.image,
           amazonName: product.itemName,
           status: 'no_price', message: '販売価格が取得できません',
+          matchType,
         });
         await new Promise(r => setTimeout(r, 300));
         continue;
@@ -761,6 +771,7 @@ router.post('/api/bulk-research/stream', async (req, res) => {
         dimensions: product.dimensions,
         estMonthlySales: estSales,
         manufacturer: product.manufacturer,
+        matchType,
         status: 'ok',
       });
 

@@ -110,6 +110,12 @@
 
     /* チェックボックス */
     .cb { width: 16px; height: 16px; cursor: pointer; }
+
+    /* 一致方法バッジ */
+    .match-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 10px; font-weight: bold; white-space: nowrap; }
+    .match-badge.match-jan { background: #e3f2fd; color: #1565c0; border: 1px solid #90caf9; }
+    .match-badge.match-keyword { background: #fff3e0; color: #e65100; border: 1px solid #ffcc80; }
+    .match-badge.match-none { background: #f5f5f5; color: #888; border: 1px solid #ddd; }
   </style>
 </head>
 <body>
@@ -241,6 +247,8 @@ JANコード,商品名,卸価格
         <div class="summary-card good"><div class="sc-value" id="sumGood">0</div><div class="sc-label">FBA利益率10%+</div></div>
         <div class="summary-card"><div class="sc-value" id="sumExcellent">0</div><div class="sc-label">FBA ◎ 30%+</div></div>
         <div class="summary-card good fbm-summary" style="background:#fffdf0;"><div class="sc-value" id="sumFbmGood">0</div><div class="sc-label">自社利益率10%+</div></div>
+        <div class="summary-card" style="border-left:3px solid #1565c0;"><div class="sc-value" id="sumJanMatch">0</div><div class="sc-label">JAN一致</div></div>
+        <div class="summary-card" style="border-left:3px solid #e65100;"><div class="sc-value" id="sumKeywordMatch">0</div><div class="sc-label">商品名一致</div></div>
         <div class="summary-card"><div class="sc-value" id="sumNotFound">0</div><div class="sc-label">未発見</div></div>
         <div class="summary-card"><div class="sc-value" id="sumErrors">0</div><div class="sc-label">エラー</div></div>
       </div>
@@ -267,6 +275,11 @@ JANコード,商品名,卸価格
           <option value="offerCount-asc">出品者数 少ない順</option>
           <option value="idx-asc">CSV順</option>
         </select>
+        <select id="matchFilter" onchange="applyFilter()" style="border-color:#90caf9;">
+          <option value="all">一致方法: すべて</option>
+          <option value="jan">JAN一致のみ</option>
+          <option value="keyword">商品名一致のみ</option>
+        </select>
         <button class="btn btn-success btn-sm" onclick="saveSelected()">選択をリサーチに保存</button>
         <button class="btn btn-primary btn-sm" onclick="exportCsv()">結果CSVダウンロード</button>
         <span class="count" id="resultCount"></span>
@@ -280,6 +293,7 @@ JANコード,商品名,卸価格
             <th></th>
             <th>ASIN</th>
             <th>商品名</th>
+            <th>一致</th>
             <th>JAN</th>
             <th class="num">卸価格</th>
             <th class="num">販売価格</th>
@@ -706,6 +720,12 @@ function applyFilter() {
       break;
   }
 
+  // 一致方法フィルタ
+  const matchFilter = document.getElementById('matchFilter').value;
+  if (matchFilter !== 'all') {
+    filtered = filtered.filter(r => r.matchType === matchFilter);
+  }
+
   // ソート
   const [key, dir] = sortBy.split('-');
   filtered.sort((a, b) => {
@@ -772,6 +792,7 @@ function renderTable(rows) {
       <td>${r.image ? `<img src="${r.image}" class="thumb" loading="lazy">` : '-'}</td>
       <td>${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="font-weight:bold;font-size:12px;">${r.asin}</a>` : '-'}</td>
       <td class="product-name-cell" title="${escHtml(r.amazonName || r.productName || '')}">${escHtml(r.amazonName || r.productName || '')}</td>
+      <td>${matchTypeBadge(r.matchType)}</td>
       <td style="font-size:11px;">${r.jan || '-'}</td>
       <td class="num">${r.wholesalePrice ? '¥' + fmt(r.wholesalePrice) : '-'}</td>
       <td class="num">${r.sellingPrice ? '¥' + fmt(r.sellingPrice) : '-'}</td>
@@ -786,6 +807,15 @@ function renderTable(rows) {
       <td><span class="status-dot ${r.status}"></span>${statusLabel(r.status, r.message)}</td>
     `;
     tbody.appendChild(tr);
+  }
+}
+
+function matchTypeBadge(matchType) {
+  switch (matchType) {
+    case 'jan': return '<span class="match-badge match-jan">JAN一致</span>';
+    case 'keyword': return '<span class="match-badge match-keyword">商品名</span>';
+    case 'none': return '<span class="match-badge match-none">未一致</span>';
+    default: return '-';
   }
 }
 
@@ -806,6 +836,8 @@ function updateSummary() {
   document.getElementById('sumGood').textContent = ok.filter(r => (r.profitRate || 0) >= 10).length;
   document.getElementById('sumExcellent').textContent = ok.filter(r => (r.profitRate || 0) >= 30).length;
   document.getElementById('sumFbmGood').textContent = ok.filter(r => (r._fbmProfitRate || 0) >= 10).length;
+  document.getElementById('sumJanMatch').textContent = allResults.filter(r => r.matchType === 'jan').length;
+  document.getElementById('sumKeywordMatch').textContent = allResults.filter(r => r.matchType === 'keyword').length;
   document.getElementById('sumNotFound').textContent = allResults.filter(r => r.status === 'not_found').length;
   document.getElementById('sumErrors').textContent = allResults.filter(r => r.status === 'error').length;
 
@@ -874,14 +906,14 @@ function exportCsv() {
   if (ok.length === 0) { alert('エクスポートするデータがありません'); return; }
 
   const showFbm = document.getElementById('fulfillmentMode').value !== 'fba_only';
-  const baseHeader = ['JAN', 'ASIN', '商品名', 'カテゴリ', '卸価格(税抜)', '卸価格(税込)', '販売価格', 'FBA手数料', 'FBA利益', 'FBA利益率%', 'FBA判定'];
+  const baseHeader = ['JAN', 'ASIN', '商品名', '一致方法', 'カテゴリ', '卸価格(税抜)', '卸価格(税込)', '販売価格', 'FBA手数料', 'FBA利益', 'FBA利益率%', 'FBA判定'];
   const fbmHeader = showFbm ? ['自社送料', '配送方法', '自社利益', '自社利益率%', '自社判定'] : [];
   const tailHeader = ['ランキング', '推定月販', '出品者数', 'メーカー'];
   const header = [...baseHeader, ...fbmHeader, ...tailHeader];
 
   const rows = ok.map(r => {
     const base = [
-      r.jan, r.asin, r.amazonName || r.productName, r.category,
+      r.jan, r.asin, r.amazonName || r.productName, r.matchType === 'jan' ? 'JAN一致' : r.matchType === 'keyword' ? '商品名' : '-', r.category,
       r.wholesalePrice, r.wholesalePriceWithTax, r.sellingPrice,
       r.totalFee, r.profit, r.profitRate, r.judgment,
     ];
