@@ -260,9 +260,9 @@ export async function initDb() {
     ['target_days_low_volume_large', '90'],    // 低回転大型: 3ヶ月分
     ['target_days_seasonal', '50'],
     // 発注点（供給日数がこれを下回ったら推奨に上がる）
-    ['reorder_point_high_volume', '14'],
+    ['reorder_point_high_volume', '21'],  // 高回転: 売れるのが速いので早めにトリガー
     ['reorder_point_medium', '21'],
-    ['reorder_point_low_volume', '14'],
+    ['reorder_point_low_volume', '14'],  // 低回転: ゆっくり売れるので短めでOK
     ['reorder_point_seasonal', '21'],
     // 日次SKU上限
     ['daily_sku_limit', '100'],
@@ -293,6 +293,8 @@ export async function initDb() {
     ['target_days_low_volume_small', '120', '180'],  // 120日→180日（半年分）
     ['target_days_low_volume_large', '60', '90'],     // 60日→90日（3ヶ月分）
     ['non_fba_reserve_days', '14', '60'],             // 14日→60日（他CH確保を強化）
+    ['reorder_point_high_volume', '14', '21'],        // 高回転: 14日→21日（売れるのが速いので早めにトリガー）
+    ['reorder_point_low_volume', '30', '14'],         // 低回転: 30日→14日（ゆっくり売れるので短めでOK）
   ];
   for (const [key, oldVal, newVal] of migrations) {
     db.run(`UPDATE settings SET value = ?, updated_at = datetime('now','localtime') WHERE key = ? AND value = ?`, [newVal, key, oldVal]);

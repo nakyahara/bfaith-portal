@@ -336,7 +336,7 @@ function calcReorderPoint(sold30d, sold7d, perUnitVolume, snap, settings) {
   }
 
   if (sold30d > highVol) {
-    return parseInt(settings.reorder_point_high_volume || 14);
+    return parseInt(settings.reorder_point_high_volume || 21);
   } else if (sold30d >= lowVol) {
     return parseInt(settings.reorder_point_medium || 21);
   } else {
