@@ -221,12 +221,13 @@ export function generateRecommendations(debug = false) {
     }
 
     // --- Step A: 5個単位丸め（20個超の場合） ---
+    // ※ 有効期限で制限された場合はスキップ（期限在庫をそのまま送る）
     const rawRecommendedQty = recommendedQty; // 丸め前の推奨数を保持
     let adjustedQty = recommendedQty;
     const roundUnit = parseInt(settings.round_unit || 5);
     const roundThreshold = parseInt(settings.round_threshold || 20);
     let roundedQty = recommendedQty; // 丸めのみの数（ロケ補正前）
-    if (adjustedQty > roundThreshold) {
+    if (!expiryLimited && adjustedQty > roundThreshold) {
       adjustedQty = Math.round(adjustedQty / roundUnit) * roundUnit;
       if (adjustedQty > warehouseAvailable) {
         adjustedQty = Math.floor(warehouseAvailable / roundUnit) * roundUnit;
@@ -236,10 +237,11 @@ export function generateRecommendations(debug = false) {
     }
 
     // --- Step B: ロケーション補正（±10%以内でロケ在庫の区切りに寄せる） ---
+    // ※ 有効期限で制限された場合はスキップ（期限が数量を決定済み）
     let locationAdjusted = false;
     let locationDetail = '';
     const locAdjustPct = parseFloat(settings.location_adjust_pct || 10) / 100;
-    if (adjustedQty > 0 && mapping.logizard_code) {
+    if (!expiryLimited && adjustedQty > 0 && mapping.logizard_code) {
       const locations = getWarehouseLocationsByCode(mapping.logizard_code);
       if (locations.length > 0) {
         const lower = adjustedQty * (1 - locAdjustPct);
@@ -297,7 +299,7 @@ export function generateRecommendations(debug = false) {
         `[Step6] 倉庫在庫按分 = ${warehouseRaw}個(倉庫,Yロケ除外) × FBA比率${effectiveTotalDailySales > 0 ? (dailySales / effectiveTotalDailySales * 100).toFixed(0) : 100}% = FBA用${warehouseAvailable}個 / 他CH確保${nonFbaReserve}個${recentArrivalAdjusted ? ` [補正: 他CH実効日販${effectiveNonFbaDailySales.toFixed(2)}${max60d?.max_30d > nonFbaSales30d ? `(60日最大値${max60d.max_30d}ベース)` : daysSinceArrival !== null ? `(入荷${daysSinceArrival}日目推定)` : ''}]` : ''}${lastArrivalDate ? ` (最終入荷: ${lastArrivalDate})` : ''}`,
         `[Step7] 推奨数 = min(${rawNeeded}(必要数), ${warehouseAvailable}(FBA用在庫)) = ${skippedByMinDays ? `0 (元${Math.min(rawNeeded, warehouseAvailable)}個→${(Math.min(rawNeeded, warehouseAvailable) / dailySales).toFixed(1)}日分 < 最低${minShipmentDays}日 → 入荷待ち)` : rawRecommendedQty}`,
         `[Step7.5] 有効期限: ${expiryLimited ? '基準期限' + expiryDate + ' → 同一期限在庫' + expirySameQty + '個 → 推奨数を' + expirySameQty + '個に制限' : '制限なし(期限データなし or 同一期限)'}`,
-        `[Step8] 補正: ${rawRecommendedQty === adjustedQty ? 'なし' : rawRecommendedQty + ' → ' + (roundedQty !== rawRecommendedQty ? roundedQty + '(' + roundUnit + '個丸め)' : String(rawRecommendedQty)) + (locationAdjusted ? ' → ' + adjustedQty + '(ロケ補正: ' + locationDetail + ')' : '') + ' = 最終' + adjustedQty + '個 (' + (rawRecommendedQty > 0 ? ((adjustedQty - rawRecommendedQty) / rawRecommendedQty * 100).toFixed(0) : 0) + '%)'}`,
+        `[Step8] 補正: ${expiryLimited ? 'スキップ(有効期限制限済み → ' + adjustedQty + '個をそのまま送る)' : rawRecommendedQty === adjustedQty ? 'なし' : rawRecommendedQty + ' → ' + (roundedQty !== rawRecommendedQty ? roundedQty + '(' + roundUnit + '個丸め)' : String(rawRecommendedQty)) + (locationAdjusted ? ' → ' + adjustedQty + '(ロケ補正: ' + locationDetail + ')' : '') + ' = 最終' + adjustedQty + '個 (' + (rawRecommendedQty > 0 ? ((adjustedQty - rawRecommendedQty) / rawRecommendedQty * 100).toFixed(0) : 0) + '%)'}`,
         `[Step9] 緊急度 = ${urgencyScore.toFixed(1)} (基本:${Math.max(0, 100 - (daysOfSupply * 100 / 40)).toFixed(0)}, 月商W:${Math.min((snap.your_price || 0) * sold30d / 100000, 5).toFixed(1)}, トレンド:${sold30d > 0 ? ((sold7d / 7 * 30) / sold30d).toFixed(1) : '-'})`,
         `[Step10] アラート: ${alerts.length > 0 ? alerts.map(a => a.message).join(' / ') : 'なし'}`,
       ];
