@@ -7,7 +7,7 @@
   <link rel="icon" type="image/png" href="/favicon.png"><link rel="icon" type="image/x-icon" href="/favicon.ico">
   <link rel="stylesheet" href="/style.css">
   <style>
-    .fba-container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+    .fba-container { max-width: 100%; margin: 0 auto; padding: 12px 20px; }
     .status-card { background: #f8f9fa; border-radius: 8px; padding: 16px; margin-bottom: 20px; }
     .status-card h3 { margin: 0 0 8px; }
     .status-row { display: flex; gap: 16px; flex-wrap: wrap; }
@@ -21,9 +21,9 @@
     .btn-secondary { background: #e5e7eb; color: #374151; }
     .actions { display: flex; gap: 12px; margin: 20px 0; flex-wrap: wrap; }
     .log { background: #1e1e1e; color: #d4d4d4; padding: 16px; border-radius: 8px; font-family: monospace; font-size: 13px; max-height: 300px; overflow-y: auto; white-space: pre-wrap; }
-    .data-table { width: 100%; border-collapse: collapse; margin-top: 16px; font-size: 13px; }
-    .data-table th, .data-table td { border: 1px solid #e5e7eb; padding: 6px 10px; text-align: left; }
-    .data-table th { background: #f3f4f6; position: sticky; top: 0; }
+    .data-table { width: 100%; border-collapse: collapse; margin-top: 16px; font-size: 12px; }
+    .data-table th, .data-table td { border: 1px solid #e5e7eb; padding: 4px 6px; text-align: left; white-space: nowrap; }
+    .data-table th { background: #f3f4f6; position: sticky; top: 0; z-index: 10; }
     .data-table tr:hover { background: #f9fafb; }
     .table-wrap { max-height: 500px; overflow: auto; border: 1px solid #e5e7eb; border-radius: 8px; }
     .upload-area { border: 2px dashed #d1d5db; border-radius: 8px; padding: 24px; text-align: center; margin: 12px 0; }
@@ -40,20 +40,21 @@
     .sortable::after { content: ' ⇅'; font-size: 10px; color: #999; }
     .sortable.asc::after { content: ' ▲'; color: #2563eb; }
     .sortable.desc::after { content: ' ▼'; color: #2563eb; }
-    .product-name { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+    .product-name { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
     .alert-badge { display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 4px; margin: 1px 2px; white-space: nowrap; }
     .alert-1 { background: #e0f2fe; color: #0369a1; }
     .alert-2 { background: #fef3c7; color: #92400e; }
     .alert-3 { background: #fee2e2; color: #dc2626; font-weight: bold; }
     .urgency-high { background: #fee2e2; }
     .urgency-mid { background: #fef3c7; }
-    .rec-qty { font-weight: bold; font-size: 15px; color: #2563eb; }
+    .rec-qty { font-weight: bold; font-size: 14px; color: #2563eb; }
+    #recTable td:nth-child(n+4):not(:nth-child(17)) { text-align: right; }
     .sortable-rec { cursor: pointer; user-select: none; white-space: nowrap; }
     .sortable-rec:hover { background: #e5e7eb; }
     .sortable-rec::after { content: ' ⇅'; font-size: 10px; color: #999; }
     .sortable-rec.asc::after { content: ' ▲'; color: #2563eb; }
     .sortable-rec.desc::after { content: ' ▼'; color: #2563eb; }
-    .sku-link { color: #2563eb; cursor: pointer; text-decoration: underline; }
+    .sku-link { color: #2563eb; cursor: pointer; text-decoration: underline; font-size: 11px; max-width: 160px; display: inline-block; overflow: hidden; text-overflow: ellipsis; }
     .sku-link:hover { color: #1d4ed8; }
     .debug-modal { position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%); background: white; border-radius: 12px; padding: 24px; box-shadow: 0 8px 32px rgba(0,0,0,0.3); max-width: 800px; width: 90%; max-height: 80vh; overflow-y: auto; z-index: 1000; }
     .debug-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.4); z-index: 999; }
@@ -140,8 +141,8 @@
         <button class="btn btn-primary" onclick="addManualItem()" style="padding:6px 16px;">追加</button>
         <span id="manualMsg" style="font-size:12px; color:#666;"></span>
       </div>
-      <div class="table-wrap" style="max-height:600px;">
-        <table class="data-table" id="recTable">
+      <div class="table-wrap" style="max-height:calc(100vh - 280px);">
+        <table class="data-table" id="recTable" style="table-layout:auto;">
           <thead>
             <tr>
               <th class="sortable-rec" data-key="urgency_score" data-type="num">緊急度</th>
