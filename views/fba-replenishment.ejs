@@ -263,7 +263,8 @@
         const res = await fetch(`${BASE}/api/warehouse/upload`, { method: 'POST', body: form });
         const d = await res.json();
         if (d.error) { log('エラー: ' + d.error); return; }
-        log(`完了! ${d.count}件の倉庫在庫を更新`);
+        const s = d.summary || {};
+        log(`完了! ${d.count}行取込 / ${s.uniqueProducts || '?'}商品 / 倉庫在庫: ${s.totalQty || '?'}個 / Yロケ(施設): ${s.yLocationProducts || 0}商品 ${s.yLocationQty || 0}個`);
       } catch (e) { log('エラー: ' + e.message); }
       input.value = '';
     }

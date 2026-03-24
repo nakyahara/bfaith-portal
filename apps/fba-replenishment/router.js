@@ -5,7 +5,7 @@ import express from 'express';
 import multer from 'multer';
 import { initDb, savePlanningData, getLatestSnapshots, getSettings, updateSetting,
          getSkuMappings, getSkuExceptions, upsertSkuException, deleteSkuException,
-         getWarehouseInventory, replaceWarehouseInventory,
+         getWarehouseInventory, replaceWarehouseInventory, getWarehouseSummary,
          getShipmentPlans, getShipmentPlanItems, getDailySnapshots } from './db.js';
 import { fetchAllReports, fetchPlanningData, normalizePlanningRow } from './sp-api-reports.js';
 
@@ -122,6 +122,10 @@ router.get('/api/warehouse', (req, res) => {
   res.json(getWarehouseInventory());
 });
 
+router.get('/api/warehouse/summary', (req, res) => {
+  res.json(getWarehouseSummary());
+});
+
 router.post('/api/warehouse/upload', upload.single('csv'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'CSVファイルが必要です' });
 
@@ -146,19 +150,45 @@ router.post('/api/warehouse/upload', upload.single('csv'), async (req, res) => {
       const obj = {};
       headers.forEach((h, j) => { obj[h] = cols[j] || ''; });
 
+      // ロジザードCSV実データ列名に対応
+      const block = obj['ブロック略称'] || '';
+      const location = obj['ロケ'] || obj['ロケーション'] || '';
+      const qty = parseInt(obj['在庫数(引当数を含む)'] || obj['在庫数'] || 0);
+      const reserved = parseInt(obj['引当数'] || 0);
+
       items.push({
-        logizard_code: obj['商品コード'] || obj['品番'] || cols[0] || '',
-        product_name: obj['商品名'] || cols[1] || '',
-        location: obj['ロケーション'] || obj['棚番'] || '',
-        quantity: parseInt(obj['数量'] || obj['在庫数'] || 0),
-        expiry_date: obj['期限'] || obj['賞味期限'] || '',
-        lot_no: obj['ロット'] || obj['ロットNo'] || '',
-        is_y_location: (obj['ロケーション'] || '').startsWith('Y') ? 1 : 0,
+        logizard_code: obj['商品ID'] || obj['商品コード'] || '',
+        product_name: obj['商品名'] || '',
+        location: location,
+        block: block,
+        quantity: qty,
+        reserved: reserved,
+        available_qty: qty - reserved,
+        expiry_date: obj['有効期限'] || '',
+        lot_no: obj['ロット'] || '',
+        barcode: obj['バーコード'] || '',
+        is_y_location: (block === 'YYY' || location.toUpperCase().startsWith('Y')) ? 1 : 0,
       });
     }
 
     const count = replaceWarehouseInventory(items);
-    res.json({ success: true, count });
+
+    // 集計情報を返す
+    const uniqueProducts = new Set(items.map(i => i.logizard_code)).size;
+    const yItems = items.filter(i => i.is_y_location);
+    const totalQty = items.reduce((s, i) => s + i.quantity, 0);
+    const yQty = yItems.reduce((s, i) => s + i.quantity, 0);
+
+    res.json({
+      success: true,
+      count,
+      summary: {
+        uniqueProducts,
+        totalQty,
+        yLocationProducts: new Set(yItems.map(i => i.logizard_code)).size,
+        yLocationQty: yQty,
+      }
+    });
   } catch (e) {
     console.error('[FBA] CSVアップロードエラー:', e);
     res.status(500).json({ error: e.message });

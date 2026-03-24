@@ -92,13 +92,25 @@ export async function initDb() {
       logizard_code TEXT NOT NULL,
       product_name TEXT,
       location TEXT,
+      block TEXT,
       quantity INTEGER DEFAULT 0,
+      reserved INTEGER DEFAULT 0,
+      available_qty INTEGER DEFAULT 0,
       expiry_date TEXT,
+      barcode TEXT,
       lot_no TEXT,
       is_y_location INTEGER DEFAULT 0,
       uploaded_at TEXT DEFAULT (datetime('now','localtime'))
     )
   `);
+
+  // マイグレーション: warehouse_inventory新カラム
+  const whCols = queryAll('PRAGMA table_info(warehouse_inventory)').map(r => r.name);
+  for (const [col, type] of [['block','TEXT'],['reserved','INTEGER DEFAULT 0'],['available_qty','INTEGER DEFAULT 0'],['barcode','TEXT']]) {
+    if (!whCols.includes(col)) {
+      db.run(`ALTER TABLE warehouse_inventory ADD COLUMN ${col} ${type}`);
+    }
+  }
 
   // --- 4. facility_inventory: 施設在庫（スプシ同期） ---
   db.run(`
@@ -359,11 +371,15 @@ export function replaceWarehouseInventory(items) {
     db.run('DELETE FROM warehouse_inventory');
     for (const item of items) {
       db.run(`
-        INSERT INTO warehouse_inventory (logizard_code, product_name, location, quantity, expiry_date, lot_no, is_y_location)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO warehouse_inventory
+          (logizard_code, product_name, location, block, quantity, reserved, available_qty,
+           expiry_date, barcode, lot_no, is_y_location)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
         item.logizard_code, item.product_name || null, item.location || null,
-        parseInt(item.quantity || 0), item.expiry_date || null, item.lot_no || null,
+        item.block || null,
+        parseInt(item.quantity || 0), parseInt(item.reserved || 0), parseInt(item.available_qty || 0),
+        item.expiry_date || null, item.barcode || null, item.lot_no || null,
         item.is_y_location ? 1 : 0,
       ]);
     }
@@ -396,10 +412,37 @@ export function getWarehouseInventory() {
 
 export function getWarehouseQtyByCode(logizardCode) {
   const row = queryOne(
-    'SELECT SUM(quantity) as total FROM warehouse_inventory WHERE logizard_code = ?',
+    'SELECT SUM(quantity) as total, SUM(available_qty) as available FROM warehouse_inventory WHERE logizard_code = ? AND is_y_location = 0',
+    [logizardCode]
+  );
+  return { total: row?.total || 0, available: row?.available || 0 };
+}
+
+export function getWarehouseYQtyByCode(logizardCode) {
+  const row = queryOne(
+    'SELECT SUM(quantity) as total FROM warehouse_inventory WHERE logizard_code = ? AND is_y_location = 1',
     [logizardCode]
   );
   return row?.total || 0;
+}
+
+/**
+ * 商品コード別の在庫サマリー（倉庫在庫 + Yロケ在庫）
+ */
+export function getWarehouseSummary() {
+  return queryAll(`
+    SELECT
+      logizard_code,
+      MAX(product_name) as product_name,
+      SUM(CASE WHEN is_y_location = 0 THEN quantity ELSE 0 END) as warehouse_qty,
+      SUM(CASE WHEN is_y_location = 0 THEN available_qty ELSE 0 END) as warehouse_available,
+      SUM(CASE WHEN is_y_location = 1 THEN quantity ELSE 0 END) as y_location_qty,
+      MIN(CASE WHEN expiry_date != '' AND expiry_date IS NOT NULL THEN expiry_date END) as earliest_expiry,
+      COUNT(DISTINCT location) as location_count
+    FROM warehouse_inventory
+    GROUP BY logizard_code
+    ORDER BY logizard_code
+  `);
 }
 
 export function getSettings() {
