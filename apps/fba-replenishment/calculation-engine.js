@@ -86,10 +86,11 @@ export function generateRecommendations(debug = false) {
     const rawNeeded = needsReplenishment ? Math.max(0, targetStock - effectiveFbaStock) : 0;
 
     // --- 倉庫在庫確認 ---
-    let warehouseAvailable = 0;
+    let warehouseRaw = 0;
     let warehouseYQty = 0;
     const nonFbaSales30d = mapping.non_fba_sales_30d || 0;
-    const nonFbaDailyReserve = Math.ceil((nonFbaSales30d / 30) * parseInt(settings.non_fba_reserve_days || 14));
+    const nonFbaDailySales = nonFbaSales30d / 30;
+    const totalDailySales = dailySales + nonFbaDailySales;
 
     if (mapping.is_set && mapping.set_components) {
       // セット商品: 構成商品の最小在庫がボトルネック
@@ -98,17 +99,27 @@ export function generateRecommendations(debug = false) {
       let minSets = Infinity;
       for (const comp of components) {
         const wh = warehouseMap[comp.ne_code];
-        const compAvailable = (wh?.warehouse_available || 0) - nonFbaDailyReserve;
-        const setsFromComp = Math.floor(Math.max(0, compAvailable) / (comp.qty || 1));
+        const compRaw = wh?.warehouse_available || 0;
+        const setsFromComp = Math.floor(compRaw / (comp.qty || 1));
         minSets = Math.min(minSets, setsFromComp);
         warehouseYQty += wh?.y_location_qty || 0;
       }
-      warehouseAvailable = minSets === Infinity ? 0 : minSets;
+      warehouseRaw = minSets === Infinity ? 0 : minSets;
     } else {
       // 単品
       const wh = warehouseMap[mapping.logizard_code || mapping.ne_code];
-      warehouseAvailable = Math.max(0, (wh?.warehouse_available || 0) - nonFbaDailyReserve);
+      warehouseRaw = wh?.warehouse_available || 0;
       warehouseYQty = wh?.y_location_qty || 0;
+    }
+
+    // --- 販売比率で倉庫在庫を按分（FBAに送れる分を算出） ---
+    // 他CHで売れているなら、その販売比率分は倉庫に確保する
+    // 例: FBA 0.1個/日, 他CH 0.2個/日 → FBA比率33% → 倉庫18個中6個がFBA用
+    let nonFbaReserve = 0;
+    let warehouseAvailable = warehouseRaw;
+    if (totalDailySales > 0 && nonFbaDailySales > 0) {
+      nonFbaReserve = Math.ceil(warehouseRaw * (nonFbaDailySales / totalDailySales));
+      warehouseAvailable = Math.max(0, warehouseRaw - nonFbaReserve);
     }
 
     // --- 送れる数 ---
@@ -127,15 +138,14 @@ export function generateRecommendations(debug = false) {
     let calc_steps = null;
     if (debug) {
       const perUnitVol = snap.per_unit_volume || mapping.per_unit_volume || 0;
-      const whRaw = mapping.is_set ? '(セット)' : (warehouseMap[mapping.logizard_code || mapping.ne_code]?.warehouse_available || 0);
       calc_steps = [
         `[Step1] 実質FBA在庫 = ${fbaAvailable}(販売可能) + ${inboundShipped}(輸送中) + ${inboundReceived}(受領中) + ${inboundWorking}(準備中${snap.fba_inbound_working > 0 && inboundWorking === 0 ? ',7日超で除外' : ''}) = ${effectiveFbaStock}`,
-        `[Step2] 1日あたり販売数 = ${sold30d}(30日売上) ÷ 30 = ${(dailySales).toFixed(2)}個/日`,
+        `[Step2] 1日あたり販売数 = FBA ${dailySales.toFixed(2)}個/日 (${sold30d}個/30日) + 他CH ${nonFbaDailySales.toFixed(2)}個/日 (${nonFbaSales30d}個/30日) = 合計 ${totalDailySales.toFixed(2)}個/日`,
         `[Step3] 発注点 = ${reorderPoint}日 / 目標日数 = ${targetDays}日 (30日売上:${sold30d}個, サイズ:${perUnitVol}cm³${perUnitVol > 5000 ? '→大型' : perUnitVol > 500 ? '→中型' : perUnitVol > 0 ? '→小型' : '→不明'})`,
         `[Step4] 供給日数 = ${effectiveFbaStock} ÷ ${dailySales.toFixed(2)} = ${daysOfSupply === 999 ? '∞(販売0,在庫あり)' : daysOfSupply.toFixed(1) + '日'} ${needsReplenishment ? '→ 発注点' + reorderPoint + '日を下回り → 補充推奨' : '→ 発注点以上 → 補充不要'}`,
         `[Step5] 必要補充数 = ${needsReplenishment ? `ceil(${dailySales.toFixed(2)} × ${targetDays}) - ${effectiveFbaStock} = ${targetStock} - ${effectiveFbaStock} = ${rawNeeded}` : '0(発注点以上のため)'}`,
-        `[Step6] 倉庫在庫 = ${whRaw}(倉庫,Yロケ除外) - ${nonFbaDailyReserve}(他CH確保: ${nonFbaSales30d}÷30×${settings.non_fba_reserve_days || 14}日) = ${warehouseAvailable}`,
-        `[Step7] 推奨数 = min(${rawNeeded}(必要数), ${warehouseAvailable}(送れる数)) = ${recommendedQty}`,
+        `[Step6] 倉庫在庫按分 = ${warehouseRaw}個(倉庫,Yロケ除外) × FBA比率${totalDailySales > 0 ? (dailySales / totalDailySales * 100).toFixed(0) : 100}% = FBA用${warehouseAvailable}個 / 他CH確保${nonFbaReserve}個`,
+        `[Step7] 推奨数 = min(${rawNeeded}(必要数), ${warehouseAvailable}(FBA用在庫)) = ${recommendedQty}`,
         `[Step8] 緊急度 = ${urgencyScore.toFixed(1)} (基本:${Math.max(0, 100 - (daysOfSupply * 100 / 40)).toFixed(0)}, 月商W:${Math.min((snap.your_price || 0) * sold30d / 100000, 5).toFixed(1)}, トレンド:${sold30d > 0 ? ((sold7d / 7 * 30) / sold30d).toFixed(1) : '-'})`,
         `[Step9] アラート: ${alerts.length > 0 ? alerts.map(a => a.message).join(' / ') : 'なし'}`,
       ];
@@ -175,7 +185,9 @@ export function generateRecommendations(debug = false) {
       // 倉庫
       warehouse_available: warehouseAvailable,
       warehouse_y_qty: warehouseYQty,
-      non_fba_reserve: nonFbaDailyReserve,
+      non_fba_reserve: nonFbaReserve,
+      warehouse_raw: warehouseRaw,
+      fba_share_pct: totalDailySales > 0 ? Math.round(dailySales / totalDailySales * 100) : 100,
 
       // 推奨
       recommended_qty: recommendedQty,
