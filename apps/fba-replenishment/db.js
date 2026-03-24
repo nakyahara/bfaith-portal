@@ -259,6 +259,7 @@ export async function initDb() {
     ['cart_alert_level3_ratio', '0.5'],
     ['missing_bsr_threshold', '5000'],
     ['working_expiry_days', '7'],
+    ['non_fba_reserve_days', '14'],
   ];
   for (const [key, value] of defaults) {
     db.run(`INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)`, [key, value]);

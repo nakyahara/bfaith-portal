@@ -9,6 +9,7 @@ import { initDb, savePlanningData, getLatestSnapshots, getSettings, updateSettin
          getShipmentPlans, getShipmentPlanItems, getDailySnapshots } from './db.js';
 import { fetchAllReports, fetchPlanningData, normalizePlanningRow } from './sp-api-reports.js';
 import { syncSkuMappings } from './sheets-sync.js';
+import { generateRecommendations } from './calculation-engine.js';
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -230,6 +231,18 @@ router.get('/api/plans', (req, res) => {
 router.get('/api/plans/:id/items', (req, res) => {
   const items = getShipmentPlanItems(parseInt(req.params.id));
   res.json(items);
+});
+
+// ===== ステータス =====
+// ===== 推奨リスト =====
+router.get('/api/recommendations', (req, res) => {
+  try {
+    const result = generateRecommendations();
+    res.json(result);
+  } catch (e) {
+    console.error('[FBA] 推奨リスト生成エラー:', e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ===== ステータス =====

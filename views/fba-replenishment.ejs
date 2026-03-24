@@ -41,6 +41,18 @@
     .sortable.asc::after { content: ' ▲'; color: #2563eb; }
     .sortable.desc::after { content: ' ▼'; color: #2563eb; }
     .product-name { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+    .alert-badge { display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 4px; margin: 1px 2px; white-space: nowrap; }
+    .alert-1 { background: #e0f2fe; color: #0369a1; }
+    .alert-2 { background: #fef3c7; color: #92400e; }
+    .alert-3 { background: #fee2e2; color: #dc2626; font-weight: bold; }
+    .urgency-high { background: #fee2e2; }
+    .urgency-mid { background: #fef3c7; }
+    .rec-qty { font-weight: bold; font-size: 15px; color: #2563eb; }
+    .sortable-rec { cursor: pointer; user-select: none; white-space: nowrap; }
+    .sortable-rec:hover { background: #e5e7eb; }
+    .sortable-rec::after { content: ' ⇅'; font-size: 10px; color: #999; }
+    .sortable-rec.asc::after { content: ' ▲'; color: #2563eb; }
+    .sortable-rec.desc::after { content: ' ▼'; color: #2563eb; }
   </style>
 </head>
 <body>
@@ -76,10 +88,41 @@
         <input type="file" accept=".csv" id="csvFile" onchange="uploadCsv(this)" style="display:none;">
       </label>
       <button class="btn btn-secondary" id="btnSyncSku" onclick="syncSkuMappings()">SKUマッピング同期</button>
+      <button class="btn btn-primary" id="btnCalc" onclick="calcRecommendations()" style="background:#16a34a;">推奨リスト生成</button>
     </div>
 
     <!-- ログ -->
-    <div class="log" id="log">FBA在庫補充システム Phase 1a — 準備完了</div>
+    <div class="log" id="log">FBA在庫補充システム — 準備完了</div>
+
+    <!-- 推奨リスト -->
+    <div class="section" id="recSection" style="display:none;">
+      <h3>推奨納品リスト <span id="recSummary" style="font-size:13px;font-weight:normal;color:#666;"></span></h3>
+      <div style="margin-bottom:8px;">
+        <label><input type="checkbox" id="filterRecommended" checked onchange="filterRecList()"> 推奨数>0のみ</label>
+        <label style="margin-left:12px;"><input type="checkbox" id="filterDayMatch" onchange="filterRecList()"> 今日の対象SKUのみ</label>
+      </div>
+      <div class="table-wrap" style="max-height:600px;">
+        <table class="data-table" id="recTable">
+          <thead>
+            <tr>
+              <th class="sortable-rec" data-key="urgency_score" data-type="num">緊急度</th>
+              <th class="sortable-rec" data-key="amazon_sku">SKU</th>
+              <th class="sortable-rec" data-key="product_name">商品名</th>
+              <th class="sortable-rec" data-key="fba_available" data-type="num">FBA在庫</th>
+              <th class="sortable-rec" data-key="effective_fba_stock" data-type="num">実質在庫</th>
+              <th class="sortable-rec" data-key="days_of_supply" data-type="num">供給日数</th>
+              <th class="sortable-rec" data-key="target_days" data-type="num">目標日数</th>
+              <th class="sortable-rec" data-key="units_sold_30d" data-type="num">FBA30日</th>
+              <th class="sortable-rec" data-key="non_fba_sales_30d" data-type="num">他CH30日</th>
+              <th class="sortable-rec" data-key="warehouse_available" data-type="num">倉庫在庫</th>
+              <th class="sortable-rec" data-key="recommended_qty" data-type="num">推奨数</th>
+              <th>アラート</th>
+            </tr>
+          </thead>
+          <tbody id="recBody"></tbody>
+        </table>
+      </div>
+    </div>
 
     <!-- 最新データ -->
     <div class="section">
@@ -202,21 +245,6 @@
       }).join('');
     }
 
-    document.addEventListener('click', e => {
-      const th = e.target.closest('th.sortable');
-      if (!th) return;
-      const key = th.dataset.key;
-      if (sortKey === key) {
-        sortDir = sortDir === 'asc' ? 'desc' : 'asc';
-      } else {
-        sortKey = key;
-        sortDir = 'asc';
-      }
-      document.querySelectorAll('th.sortable').forEach(t => t.classList.remove('asc', 'desc'));
-      th.classList.add(sortDir);
-      sortAndRender();
-    });
-
     async function fetchReports() {
       const btn = document.getElementById('btnFetchAll');
       btn.disabled = true;
@@ -273,6 +301,104 @@
       } catch (e) { log('エラー: ' + e.message); }
       input.value = '';
     }
+
+    // ===== 推奨リスト =====
+    let recData = [];
+    let recSortKey = 'urgency_score';
+    let recSortDir = 'desc';
+
+    async function calcRecommendations() {
+      const btn = document.getElementById('btnCalc');
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span>計算中...';
+      log('推奨リスト生成中...');
+
+      try {
+        const res = await fetch(`${BASE}/api/recommendations`);
+        const d = await res.json();
+        if (d.error) { log('エラー: ' + d.error); return; }
+        if (d.errors && d.errors.length) { d.errors.forEach(e => log('警告: ' + e)); }
+        recData = d.items || [];
+        log(`完了! ${d.total_skus}SKU中 ${d.recommended_skus}SKU推奨 / 合計${d.total_units}個`);
+        document.getElementById('recSection').style.display = '';
+        document.getElementById('recSummary').textContent = `(${d.snapshot_date} / ${d.recommended_skus}SKU / ${d.total_units}個)`;
+        filterRecList();
+      } catch (e) { log('エラー: ' + e.message); }
+      finally {
+        btn.disabled = false;
+        btn.textContent = '推奨リスト生成';
+      }
+    }
+
+    function filterRecList() {
+      const onlyRec = document.getElementById('filterRecommended').checked;
+      const onlyDay = document.getElementById('filterDayMatch').checked;
+      let filtered = recData;
+      if (onlyRec) filtered = filtered.filter(r => r.recommended_qty > 0);
+      if (onlyDay) filtered = filtered.filter(r => r.sku_day_match);
+      renderRecList(filtered);
+    }
+
+    function renderRecList(data) {
+      const tbody = document.getElementById('recBody');
+      if (!data.length) { tbody.innerHTML = '<tr><td colspan="12">該当なし</td></tr>'; return; }
+
+      // ソート
+      data.sort((a, b) => {
+        const th = document.querySelector(`th.sortable-rec[data-key="${recSortKey}"]`);
+        const isNum = th?.dataset.type === 'num';
+        let va = a[recSortKey], vb = b[recSortKey];
+        if (isNum) { va = parseFloat(va) || 0; vb = parseFloat(vb) || 0; }
+        else { va = String(va || ''); vb = String(vb || ''); }
+        if (va < vb) return recSortDir === 'asc' ? -1 : 1;
+        if (va > vb) return recSortDir === 'asc' ? 1 : -1;
+        return 0;
+      });
+
+      tbody.innerHTML = data.map(r => {
+        const urgCls = r.urgency_score >= 80 ? 'urgency-high' : r.urgency_score >= 40 ? 'urgency-mid' : '';
+        const alertsHtml = (r.alerts || []).map(a =>
+          `<span class="alert-badge alert-${a.level}" title="${a.message}">${a.type === 'cart_block' ? '🔴' : a.type === 'missing' ? '🔴' : a.level === 2 ? '⚠' : 'ℹ'} ${a.message.slice(0,15)}</span>`
+        ).join('');
+        const dosColor = r.days_of_supply < 7 ? 'color:#dc2626;font-weight:bold' : r.days_of_supply < 14 ? 'color:#d97706' : '';
+        return `<tr class="${urgCls}">
+          <td>${r.urgency_score}</td>
+          <td>${r.amazon_sku}</td>
+          <td class="product-name" title="${r.product_name}">${r.product_name}</td>
+          <td>${r.fba_available}</td>
+          <td>${r.effective_fba_stock}</td>
+          <td style="${dosColor}">${r.days_of_supply}</td>
+          <td>${r.target_days}</td>
+          <td>${r.units_sold_30d}</td>
+          <td>${r.non_fba_sales_30d}</td>
+          <td>${r.warehouse_available}</td>
+          <td class="rec-qty">${r.recommended_qty || '-'}</td>
+          <td>${alertsHtml}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    document.addEventListener('click', e => {
+      const th = e.target.closest('th.sortable-rec');
+      if (th) {
+        const key = th.dataset.key;
+        if (recSortKey === key) recSortDir = recSortDir === 'asc' ? 'desc' : 'asc';
+        else { recSortKey = key; recSortDir = 'desc'; }
+        document.querySelectorAll('th.sortable-rec').forEach(t => t.classList.remove('asc', 'desc'));
+        th.classList.add(recSortDir);
+        filterRecList();
+        return;
+      }
+      // スナップショットテーブルのソート
+      const th2 = e.target.closest('th.sortable');
+      if (!th2) return;
+      const key = th2.dataset.key;
+      if (sortKey === key) sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+      else { sortKey = key; sortDir = 'asc'; }
+      document.querySelectorAll('th.sortable').forEach(t => t.classList.remove('asc', 'desc'));
+      th2.classList.add(sortDir);
+      sortAndRender();
+    });
 
     async function syncSkuMappings() {
       const btn = document.getElementById('btnSyncSku');
