@@ -281,6 +281,7 @@ JANコード,商品名,卸価格
           <option value="keyword">商品名一致のみ</option>
         </select>
         <button class="btn btn-success btn-sm" onclick="saveSelected()">選択をリサーチに保存</button>
+        <button class="btn btn-danger btn-sm" onclick="deleteSelected()">選択を削除</button>
         <button class="btn btn-primary btn-sm" onclick="exportCsv()">結果CSVダウンロード</button>
         <span class="count" id="resultCount"></span>
       </div>
@@ -313,6 +314,34 @@ JANコード,商品名,卸価格
         </thead>
         <tbody id="resultBody"></tbody>
       </table>
+
+      <!-- 未一致リスト -->
+      <div class="panel" id="unmatchedPanel" style="display:none; margin-top: 14px;">
+        <div class="panel-title" style="display:flex; justify-content:space-between; align-items:center;">
+          未一致リスト（JAN/型番で見つからなかった商品）
+          <div>
+            <button class="btn btn-primary btn-sm" onclick="copyUnmatchedList()">リストをコピー</button>
+            <button class="btn btn-sm" onclick="toggleUnmatchedPanel()" style="margin-left:4px;">折りたたむ</button>
+          </div>
+        </div>
+        <div id="unmatchedBody">
+          <table class="data-table" style="margin-top: 8px;">
+            <thead>
+              <tr>
+                <th style="width:40px;">#</th>
+                <th>JAN/EAN</th>
+                <th>商品名</th>
+                <th>卸価格</th>
+                <th>ステータス</th>
+              </tr>
+            </thead>
+            <tbody id="unmatchedTbody"></tbody>
+          </table>
+        </div>
+        <div style="font-size:11px; color:#565959; margin-top: 8px;">
+          ※ JAN未登録・廃番・Amazon未出品の可能性があります。型番や商品名でAmazon/メーカーサイトを手動検索してください。
+        </div>
+      </div>
     </div>
   </div>
 
@@ -372,6 +401,7 @@ function restoreFromSession() {
       `前回の結果を復元しました（${allResults.length} 件）`;
     updateSummary();
     applyFilter();
+    updateUnmatchedPanel();
     return true;
   } catch (e) {
     console.warn('sessionStorage復元失敗:', e);
@@ -685,6 +715,7 @@ function handleEvent(data) {
     if (allResults.length > 0) {
       document.getElementById('progressText').textContent =
         `完了! ${allResults.length} 件処理しました`;
+      updateUnmatchedPanel();
     }
   }
 }
@@ -937,6 +968,68 @@ window.addEventListener('DOMContentLoaded', () => {
   // 送料テーブル読み込み完了後に復元（少し待つ）
   setTimeout(() => restoreFromSession(), 300);
 });
+
+// ===== 選択を削除 =====
+function deleteSelected() {
+  const checked = [...document.querySelectorAll('.row-cb:checked')].map(cb => parseInt(cb.dataset.idx));
+  if (checked.length === 0) {
+    alert('削除する商品を選択してください');
+    return;
+  }
+  if (!confirm(`${checked.length} 件を結果から削除しますか？`)) return;
+
+  const idxSet = new Set(checked);
+  allResults = allResults.filter(r => !idxSet.has(r.idx));
+  saveToSession();
+  updateSummary();
+  applyFilter();
+  updateUnmatchedPanel();
+  document.getElementById('cbAll').checked = false;
+}
+
+// ===== 未一致リスト =====
+function updateUnmatchedPanel() {
+  const unmatched = allResults.filter(r => r.status === 'not_found' || r.status === 'no_price' || r.status === 'error');
+  const panel = document.getElementById('unmatchedPanel');
+  if (unmatched.length === 0) {
+    panel.style.display = 'none';
+    return;
+  }
+  panel.style.display = 'block';
+  const tbody = document.getElementById('unmatchedTbody');
+  tbody.innerHTML = '';
+  for (let i = 0; i < unmatched.length; i++) {
+    const r = unmatched[i];
+    const tr = document.createElement('tr');
+    const statusText = r.status === 'not_found' ? '未発見' : r.status === 'no_price' ? '価格なし' : 'エラー';
+    tr.innerHTML = `
+      <td>${i + 1}</td>
+      <td style="font-family:monospace; font-size:12px;">${escHtml(r.jan || '-')}</td>
+      <td style="font-size:12px;">${escHtml(r.productName || '-')}</td>
+      <td class="num">${r.wholesalePrice ? '¥' + fmt(r.wholesalePrice) : '-'}</td>
+      <td><span class="status-dot ${r.status}"></span>${statusText}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
+
+function toggleUnmatchedPanel() {
+  const body = document.getElementById('unmatchedBody');
+  body.style.display = body.style.display === 'none' ? '' : 'none';
+}
+
+function copyUnmatchedList() {
+  const unmatched = allResults.filter(r => r.status === 'not_found' || r.status === 'no_price' || r.status === 'error');
+  if (unmatched.length === 0) { alert('未一致データがありません'); return; }
+  const lines = ['JAN\t商品名\t卸価格\tステータス'];
+  for (const r of unmatched) {
+    const statusText = r.status === 'not_found' ? '未発見' : r.status === 'no_price' ? '価格なし' : 'エラー';
+    lines.push(`${r.jan || ''}\t${r.productName || ''}\t${r.wholesalePrice || ''}\t${statusText}`);
+  }
+  navigator.clipboard.writeText(lines.join('\n')).then(() => {
+    alert(`${unmatched.length} 件をクリップボードにコピーしました（タブ区切り）`);
+  });
+}
 
 function fmt(n) { return Number(n).toLocaleString(); }
 function escHtml(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }

@@ -248,30 +248,85 @@ export async function searchByJan(jan) {
 }
 
 /**
- * キーワードで Amazon商品を検索
+ * 商品名のノイズを除去してコアキーワードを抽出
+ */
+function cleanKeyword(raw) {
+  let kw = raw;
+  // 括弧内の付属情報を除去: （旧品番XXX）、【ケース販売】等
+  kw = kw.replace(/[（(][^）)]*[）)]/g, ' ');
+  kw = kw.replace(/[【\[][^】\]]*[】\]]/g, ' ');
+  // 容量・入数パターンを除去: 500ml, 300g, 1.5L, 10個入, ×12, x24本 等
+  kw = kw.replace(/[\d.,]+\s*(ml|mL|ML|ℓ|l|L|g|kg|KG|Kg|mg|cc|CC)\b/g, ' ');
+  kw = kw.replace(/[\d.,]+\s*(個入|個入り|本入|本入り|枚入|枚入り|袋入|包入|粒入|錠入|個|本|枚|袋|包|粒|錠|カプセル|シート|巻|丁)\b/g, ' ');
+  kw = kw.replace(/[×x]\s*\d+/gi, ' ');
+  // JANっぽい13桁数字を除去
+  kw = kw.replace(/\b\d{13}\b/g, ' ');
+  // 記号を除去（ハイフン・スラッシュ・ドットは残す）
+  kw = kw.replace(/[★☆●◆■□◇△▲※♪#＃&＆!！?？〜~]/g, ' ');
+  // 連続スペースを整理
+  kw = kw.replace(/\s+/g, ' ').trim();
+  // 空になったら元の文字列を返す
+  return kw || raw.trim();
+}
+
+/**
+ * 2つの文字列の類似度スコア（0〜1）
+ * 共通する文字のbigram(2文字組)の割合で判定
+ */
+function similarityScore(a, b) {
+  if (!a || !b) return 0;
+  const normalize = s => s.toLowerCase().replace(/[\s\-\/・,、。]/g, '');
+  const na = normalize(a);
+  const nb = normalize(b);
+  if (na === nb) return 1;
+  if (na.length < 2 || nb.length < 2) return 0;
+  const bigrams = s => { const bg = new Set(); for (let i = 0; i < s.length - 1; i++) bg.add(s.slice(i, i + 2)); return bg; };
+  const ba = bigrams(na);
+  const bb = bigrams(nb);
+  let common = 0;
+  for (const b of ba) { if (bb.has(b)) common++; }
+  return (2 * common) / (ba.size + bb.size);
+}
+
+/**
+ * キーワードで Amazon商品を検索（精度向上版）
+ * - ノイズ除去した検索クエリ
+ * - 候補5件取得 → 元の商品名との類似度でベスト候補を選定
  */
 export async function searchByKeyword(keyword) {
   const sp = getClient();
   const marketplaceId = MARKETPLACE_ID();
+
+  const cleanedKw = cleanKeyword(keyword);
 
   const result = await sp.callAPI({
     operation: 'searchCatalogItems',
     endpoint: 'catalogItems',
     query: {
       marketplaceIds: [marketplaceId],
-      keywords: [keyword],
+      keywords: [cleanedKw],
       includedData: ['summaries', 'images'],
-      pageSize: 3,
+      pageSize: 5,
     },
     options: { version: '2022-04-01' },
   });
 
   const items = result.items || [];
-  return items.map(item => ({
-    asin: item.asin,
-    itemName: item.summaries?.[0]?.itemName || '',
-    image: item.images?.[0]?.images?.find(i => i.variant === 'MAIN')?.link || '',
-  }));
+  if (items.length === 0) return [];
+
+  // 類似度スコアで並べ替え（元の商品名に近い順）
+  const scored = items.map(item => {
+    const itemName = item.summaries?.[0]?.itemName || '';
+    return {
+      asin: item.asin,
+      itemName,
+      image: item.images?.[0]?.images?.find(i => i.variant === 'MAIN')?.link || '',
+      score: similarityScore(keyword, itemName),
+    };
+  });
+  scored.sort((a, b) => b.score - a.score);
+
+  return scored.map(({ asin, itemName, image }) => ({ asin, itemName, image }));
 }
 
 /**
