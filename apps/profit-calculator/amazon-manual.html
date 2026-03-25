@@ -86,8 +86,16 @@
     .fee-detail td:last-child { text-align: right; font-weight: bold; }
     .fee-detail .total td { border-top: 2px solid #232f3e; font-weight: bold; padding-top: 6px; }
 
-    /* 価格自動変更ボタン群 */
-    .price-buttons { display: flex; gap: 6px; flex-direction: column; align-items: flex-end; }
+    /* 価格改定モード トグル */
+    .price-mode-toggle { display: flex; gap: 0; }
+    .price-mode-toggle input { display: none; }
+    .price-mode-toggle label { padding: 6px 14px; font-size: 12px; font-weight: bold; cursor: pointer; border: 1px solid #888; margin-left: -1px; }
+    .price-mode-toggle label:first-of-type { margin-left: 0; border-radius: 4px 0 0 4px; }
+    .price-mode-toggle label:last-of-type { border-radius: 0 4px 4px 0; }
+    .price-mode-toggle input:checked + label.fba-best { background: #232f3e; color: #ff9900; border-color: #232f3e; }
+    .price-mode-toggle input:checked + label.lowest { background: #0066c0; color: #fff; border-color: #0066c0; }
+    .price-mode-toggle input:checked + label.cart { background: #f0c14b; color: #0f1111; border-color: #a88734; }
+    .price-mode-toggle input:checked + label.none { background: #565959; color: #fff; border-color: #565959; }
 
     .result-box { margin-top: 14px; padding: 14px; border-radius: 6px; display: none; }
     .result-box.success { background: #f0fff4; border: 2px solid #067D62; }
@@ -203,27 +211,41 @@
           </div>
         </div>
 
-        <!-- 価格自動変更ボタン -->
-        <div class="price-buttons">
-          <button class="btn-price fba-best" onclick="setPrice('fbaBest')">FBA最安値</button>
-          <button class="btn-price lowest" onclick="setPrice('lowest')">最安値</button>
-          <button class="btn-price cart" onclick="setPrice('cart')">カート</button>
-          <button class="btn-price none" onclick="setPrice('none')">しない</button>
+        <!-- 価格改定モード -->
+        <div class="form-group">
+          <label>価格改定モード</label>
+          <div class="price-mode-toggle">
+            <input type="radio" name="priceMode" value="fbaBest" id="pmFbaBest">
+            <label for="pmFbaBest" class="btn-price fba-best">FBA最安値</label>
+            <input type="radio" name="priceMode" value="lowest" id="pmLowest">
+            <label for="pmLowest" class="btn-price lowest">最安値</label>
+            <input type="radio" name="priceMode" value="cart" id="pmCart">
+            <label for="pmCart" class="btn-price cart">カート</label>
+            <input type="radio" name="priceMode" value="none" id="pmNone" checked>
+            <label for="pmNone" class="btn-price none">しない</label>
+          </div>
         </div>
 
-        <!-- 仕入価格 -->
+        <!-- 仕入価格（税抜き入力→税込み自動計算） -->
         <div class="form-group">
-          <label>仕入価格（税込）</label>
+          <label>仕入価格（税抜き）</label>
           <div style="display:flex; gap:4px; align-items:center;">
             <span>¥</span>
-            <input type="number" id="costInput" placeholder="0" min="0" style="flex:1;" oninput="calcAll()">
+            <input type="number" id="costExTaxInput" placeholder="0" min="0" style="flex:1;" oninput="calcCostInclTax()">
+          </div>
+        </div>
+        <div class="form-group">
+          <label>仕入価格（税込み）<span style="font-size:10px; color:#565959; font-weight:normal;">自動計算</span></label>
+          <div style="display:flex; gap:4px; align-items:center;">
+            <span>¥</span>
+            <input type="number" id="costInput" placeholder="0" min="0" style="flex:1; background:#f7f8f8;" readonly>
           </div>
         </div>
 
         <!-- 税率 -->
         <div class="form-group">
           <label>税率区分</label>
-          <select id="taxRateSelect" onchange="calcAll()">
+          <select id="taxRateSelect" onchange="calcCostInclTax()">
             <option value="0.10">標準税率 10%（一般商品）</option>
             <option value="0.08">軽減税率 8%（食品・飲料・新聞）</option>
           </select>
@@ -234,8 +256,8 @@
           <label>ポイント</label>
           <div style="display:flex; gap:6px; align-items:center;">
             <select id="pointRate" onchange="calcAll()" style="width:80px;">
-              <option value="0">なし</option>
-              <option value="1" selected>1%</option>
+              <option value="0" selected>なし</option>
+              <option value="1">1%</option>
               <option value="2">2%</option>
               <option value="3">3%</option>
               <option value="4">4%</option>
@@ -417,21 +439,26 @@
       }
     }
 
-    // ── 価格ボタン ──
-    function setPrice(type) {
-      if (!currentProduct) return;
-      const cp = currentProduct.currentPrice || 0;
-      let price = 0;
-      switch (type) {
-        case 'fbaBest': price = cp; break;        // FBA最安値 = 現在のカート/最安値
-        case 'lowest': price = cp; break;          // 最安値
-        case 'cart': price = cp; break;            // カート価格
-        case 'none': return;                       // しない
-      }
-      if (price > 0) {
-        document.getElementById('priceInput').value = price;
-        onPriceChange();
-      }
+    // ── 価格改定モード切り替え ──
+    document.querySelectorAll('input[name="priceMode"]').forEach(r => {
+      r.addEventListener('change', () => {
+        const mode = r.value;
+        if (mode === 'none' || !currentProduct) return;
+        const cp = currentProduct.currentPrice || 0;
+        if (cp > 0) {
+          document.getElementById('priceInput').value = cp;
+          onPriceChange();
+        }
+      });
+    });
+
+    // ── 仕入価格（税抜き→税込み自動計算） ──
+    function calcCostInclTax() {
+      const exTax = parseInt(document.getElementById('costExTaxInput').value) || 0;
+      const taxRate = parseFloat(document.getElementById('taxRateSelect').value) || 0.10;
+      const inclTax = Math.ceil(exTax * (1 + taxRate));
+      document.getElementById('costInput').value = exTax > 0 ? inclTax : '';
+      calcAll();
     }
 
     // ── 価格変更時のデバウンス付き手数料計算 ──
@@ -532,7 +559,7 @@
         const res = await fetch('./api/amazon/manual-list', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ asin, price, sku, condition, isFba }),
+          body: JSON.stringify({ asin, price, sku, condition, isFba, pointRate, conditionNote: document.getElementById('conditionNote').value.trim() }),
         });
         const result = await res.json();
 

@@ -289,7 +289,7 @@ export function estimateMonthlySales(rank) {
 /**
  * Amazon出品登録（Listings Items API）
  */
-export async function createListing({ asin, price, isFba, sku, condition = 'new_new', shippingTemplate = null, paymentRestriction = 'none' }) {
+export async function createListing({ asin, price, isFba, sku, condition = 'new_new', shippingTemplate = null, paymentRestriction = 'none', pointRate = 0, conditionNote = '' }) {
   const sp = getClient();
   const marketplaceId = MARKETPLACE_ID();
   const sellerId = SELLER_ID();
@@ -308,12 +308,18 @@ export async function createListing({ asin, price, isFba, sku, condition = 'new_
       marketplace_id: marketplaceId,
       currency: 'JPY',
       our_price: [{ schedule: [{ value_with_tax: price }] }],
+      ...(pointRate > 0 ? { points: [{ points_number: Math.floor(price * pointRate / 100) }] } : {}),
     }],
     fulfillment_availability: [{
       fulfillment_channel_code: isFba ? 'AMAZON_JP' : 'DEFAULT',
       marketplace_id: marketplaceId,
     }],
   };
+
+  // コンディション説明（中古品の場合のみ — LISTING_OFFER_ONLYモードでは新品にcondition_noteを付けるとエラーになる場合がある）
+  if (conditionNote && condition !== 'new_new') {
+    attributes.condition_note = [{ value: conditionNote, marketplace_id: marketplaceId }];
+  }
 
   // FBM: 配送テンプレートのみputで設定（LISTING_OFFER_ONLYモード）
   // 支払い制限はLISTING_OFFER_ONLYでは適用されないため、出品後にpatchListingsItemで設定する

@@ -368,7 +368,7 @@ router.post('/api/amazon/patch-payment', async (req, res) => {
 // ── API: Amazon手動出品（DBを経由しない直接出品） ──
 router.post('/api/amazon/manual-list', async (req, res) => {
   try {
-    const { asin, price, sku, condition, isFba } = req.body;
+    const { asin, price, sku, condition, isFba, pointRate, conditionNote } = req.body;
     if (!asin) return res.status(400).json({ error: 'ASINが必要です' });
     if (!price || price <= 0) return res.status(400).json({ error: '出品価格が必要です' });
     if (!isFba && !sku) return res.status(400).json({ error: '自社出荷の場合はSKUが必要です' });
@@ -387,6 +387,8 @@ router.post('/api/amazon/manual-list', async (req, res) => {
       condition: condition || 'new_new',
       shippingTemplate,
       paymentRestriction,
+      pointRate: parseInt(pointRate) || 0,
+      conditionNote: conditionNote || '',
     });
 
     // 出品成功時に支払い制限をpatchで後追い設定
