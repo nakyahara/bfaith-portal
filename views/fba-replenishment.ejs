@@ -195,6 +195,7 @@
               <th class="sortable-rec" data-key="effective_fba_stock" data-type="num">実質在庫</th>
               <th class="sortable-rec" data-key="days_of_supply" data-type="num">供給日数</th>
               <th class="sortable-rec" data-key="reorder_point" data-type="num">発注点(個)</th>
+              <th class="sortable-rec" data-key="raw_needed" data-type="num">必要補充数</th>
               <th class="sortable-rec" data-key="target_days" data-type="num">目標日数</th>
               <th class="sortable-rec" data-key="units_sold_7d" data-type="num">FBA7日</th>
               <th class="sortable-rec" data-key="units_sold_30d" data-type="num">FBA30日</th>
@@ -527,6 +528,7 @@
           effective_fba_stock: '-',
           days_of_supply: '-',
           reorder_point: '-',
+          raw_needed: '-',
           target_days: '-',
           units_sold_30d: '-',
           warehouse_raw: '-',
@@ -601,6 +603,7 @@
           <td>${r.effective_fba_stock}</td>
           <td style="${dosColor}">${dosVal}${belowReorder ? ' ⚠' : ''}</td>
           <td>${reorderVal}</td>
+          <td>${r.raw_needed || 0}</td>
           <td>${r.target_days}</td>
           <td>${r.units_sold_7d}</td>
           <td>${r.units_sold_30d}</td>
