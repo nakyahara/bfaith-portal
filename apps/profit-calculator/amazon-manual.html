@@ -86,16 +86,17 @@
     .fee-detail td:last-child { text-align: right; font-weight: bold; }
     .fee-detail .total td { border-top: 2px solid #232f3e; font-weight: bold; padding-top: 6px; }
 
-    /* 価格改定モード トグル */
+    /* 価格改定モード トグル — 未選択はグレー、選択時のみ色付き */
     .price-mode-toggle { display: flex; gap: 0; }
     .price-mode-toggle input { display: none; }
-    .price-mode-toggle label { padding: 6px 14px; font-size: 12px; font-weight: bold; cursor: pointer; border: 1px solid #888; margin-left: -1px; }
+    .price-mode-toggle label { padding: 7px 16px; font-size: 12px; font-weight: bold; cursor: pointer; border: 1px solid #d5d9d9; margin-left: -1px; background: #f7f8f8; color: #888; transition: all 0.15s; }
     .price-mode-toggle label:first-of-type { margin-left: 0; border-radius: 4px 0 0 4px; }
     .price-mode-toggle label:last-of-type { border-radius: 0 4px 4px 0; }
-    .price-mode-toggle input:checked + label.fba-best { background: #232f3e; color: #ff9900; border-color: #232f3e; }
-    .price-mode-toggle input:checked + label.lowest { background: #0066c0; color: #fff; border-color: #0066c0; }
-    .price-mode-toggle input:checked + label.cart { background: #f0c14b; color: #0f1111; border-color: #a88734; }
-    .price-mode-toggle input:checked + label.none { background: #565959; color: #fff; border-color: #565959; }
+    .price-mode-toggle label:hover { background: #eee; color: #333; }
+    .price-mode-toggle input:checked + label { background: #232f3e; color: #ff9900; border-color: #232f3e; z-index: 1; position: relative; }
+    .price-mode-toggle input[value="lowest"]:checked + label { background: #0066c0; color: #fff; border-color: #0066c0; }
+    .price-mode-toggle input[value="cart"]:checked + label { background: #f0c14b; color: #0f1111; border-color: #a88734; }
+    .price-mode-toggle input[value="none"]:checked + label { background: #565959; color: #fff; border-color: #565959; }
 
     .result-box { margin-top: 14px; padding: 14px; border-radius: 6px; display: none; }
     .result-box.success { background: #f0fff4; border: 2px solid #067D62; }
@@ -216,13 +217,13 @@
           <label>価格改定モード</label>
           <div class="price-mode-toggle">
             <input type="radio" name="priceMode" value="fbaBest" id="pmFbaBest">
-            <label for="pmFbaBest" class="btn-price fba-best">FBA最安値</label>
+            <label for="pmFbaBest">FBA最安値</label>
             <input type="radio" name="priceMode" value="lowest" id="pmLowest">
-            <label for="pmLowest" class="btn-price lowest">最安値</label>
+            <label for="pmLowest">最安値</label>
             <input type="radio" name="priceMode" value="cart" id="pmCart">
-            <label for="pmCart" class="btn-price cart">カート</label>
+            <label for="pmCart">カート</label>
             <input type="radio" name="priceMode" value="none" id="pmNone" checked>
-            <label for="pmNone" class="btn-price none">しない</label>
+            <label for="pmNone">しない</label>
           </div>
         </div>
 
@@ -575,13 +576,14 @@
           showToast('出品完了: ' + result.sku);
         } else {
           const errMsg = result.error || `ステータス: ${result.status}`;
-          const issues = (result.issues || []).map(i => `・${i.message || JSON.stringify(i)}`).join('\n');
-          showResult('error', '出品エラー', `<div>${esc(errMsg)}</div>${issues ? `<pre style="margin-top:6px; font-size:11px; white-space:pre-wrap;">${esc(issues)}</pre>` : ''}`);
-          addHistory(asin, sku || '-', price, isFba ? 'FBA' : 'FBM', 'ERROR', 0);
+          const issues = (result.issues || []).map(i => `・${i.message || i.code || JSON.stringify(i)}`).join('\n');
+          const fullDetail = result.details ? `\n\n詳細: ${JSON.stringify(result.details)}` : '';
+          showResult('error', '出品エラー', `<div style="font-size:14px; font-weight:bold;">${esc(errMsg)}</div>${issues ? `<pre style="margin-top:6px; font-size:11px; white-space:pre-wrap;">${esc(issues)}</pre>` : ''}${fullDetail ? `<pre style="margin-top:6px; font-size:10px; white-space:pre-wrap; color:#888;">${esc(fullDetail)}</pre>` : ''}`);
+          addHistory(asin, sku || '-', price, isFba ? 'FBA' : 'FBM', 'ERROR: ' + errMsg, 0);
         }
       } catch (e) {
-        showResult('error', '通信エラー', esc(e.message));
-        addHistory(asin, sku || '-', price, isFba ? 'FBA' : 'FBM', 'ERROR', 0);
+        showResult('error', '通信エラー', `<div style="font-size:14px;">${esc(e.message)}</div>`);
+        addHistory(asin, sku || '-', price, isFba ? 'FBA' : 'FBM', 'ERROR: ' + e.message, 0);
       } finally {
         setLoading('loadingList', false);
         document.getElementById('btnList').disabled = false;
@@ -605,7 +607,7 @@
           <td>${esc(h.sku)}</td>
           <td>¥${Number(h.price).toLocaleString()}</td>
           <td>${esc(h.type)}</td>
-          <td class="${h.status === 'ACCEPTED' ? 'status-ok' : 'status-ng'}">${h.status}</td>
+          <td class="${h.status === 'ACCEPTED' ? 'status-ok' : 'status-ng'}" style="max-width:300px; word-break:break-all;">${esc(h.status)}</td>
           <td style="color:${h.profit >= 0 ? '#067D62' : '#d13212'}; font-weight:bold;">¥${Number(h.profit).toLocaleString()}</td>
           <td>${h.time}</td>
         </tr>
@@ -623,6 +625,7 @@
       document.getElementById('resultTitle').textContent = title;
       document.getElementById('resultBody').innerHTML = body;
       box.style.display = '';
+      box.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
     function hideResult() { document.getElementById('resultBox').style.display = 'none'; }
     function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }

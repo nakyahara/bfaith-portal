@@ -421,8 +421,11 @@ router.post('/api/amazon/manual-list', async (req, res) => {
       res.status(422).json({ error: `出品ステータス: ${result.status}${issueMsg ? ' — ' + issueMsg : ''}`, ...result });
     }
   } catch (err) {
-    console.error('[ProfitCalc] Amazon手動出品エラー:', err.message);
-    res.status(500).json({ error: err.message });
+    console.error('[ProfitCalc] Amazon手動出品エラー:', err.message, err.stack);
+    // SP-APIエラーの詳細を含める
+    const details = err.details || err.body || err.response?.data || null;
+    if (details) console.error('[ProfitCalc] Amazon手動出品エラー詳細:', JSON.stringify(details));
+    res.status(500).json({ error: err.message, details });
   }
 });
 
