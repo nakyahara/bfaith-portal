@@ -296,6 +296,24 @@
           </div>
         </div>
 
+        <!-- 電池・危険物（SP-API必須属性） -->
+        <div class="form-group">
+          <label>電池</label>
+          <select id="batteriesRequired" style="font-size:12px;">
+            <option value="false" selected>電池なし</option>
+            <option value="true">電池あり</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>危険物規制</label>
+          <select id="hazmatRegulation" style="font-size:12px;">
+            <option value="not_applicable" selected>該当なし</option>
+            <option value="ghs">GHS（危険物）</option>
+            <option value="transportation">輸送規制あり</option>
+            <option value="storage">保管規制あり</option>
+          </select>
+        </div>
+
         <!-- コンディション説明 -->
         <div class="form-group span3">
           <label>コンディション説明</label>
@@ -560,7 +578,12 @@
         const res = await fetch('./api/amazon/manual-list', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ asin, price, sku, condition, isFba, pointRate, conditionNote: document.getElementById('conditionNote').value.trim() }),
+          body: JSON.stringify({
+            asin, price, sku, condition, isFba, pointRate,
+            conditionNote: document.getElementById('conditionNote').value.trim(),
+            batteriesRequired: document.getElementById('batteriesRequired').value,
+            hazmatRegulation: document.getElementById('hazmatRegulation').value,
+          }),
         });
         const result = await res.json();
 

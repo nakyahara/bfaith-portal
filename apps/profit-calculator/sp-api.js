@@ -289,7 +289,7 @@ export function estimateMonthlySales(rank) {
 /**
  * Amazon出品登録（Listings Items API）
  */
-export async function createListing({ asin, price, isFba, sku, condition = 'new_new', shippingTemplate = null, paymentRestriction = 'none', pointRate = 0, conditionNote = '' }) {
+export async function createListing({ asin, price, isFba, sku, condition = 'new_new', shippingTemplate = null, paymentRestriction = 'none', pointRate = 0, conditionNote = '', batteriesRequired = 'false', hazmatRegulation = 'not_applicable' }) {
   const sp = getClient();
   const marketplaceId = MARKETPLACE_ID();
   const sellerId = SELLER_ID();
@@ -315,6 +315,15 @@ export async function createListing({ asin, price, isFba, sku, condition = 'new_
       marketplace_id: marketplaceId,
     }],
   };
+
+  // 安全関連属性（電池・危険物）— LISTING_OFFER_ONLYでも必須の場合がある
+  // batteriesRequired / hazmatRegulation が明示指定されていなければデフォルト値を設定
+  if (!attributes.batteries_required) {
+    attributes.batteries_required = [{ value: batteriesRequired || 'false', marketplace_id: marketplaceId }];
+  }
+  if (!attributes.supplier_declared_dg_hz_regulation) {
+    attributes.supplier_declared_dg_hz_regulation = [{ value: hazmatRegulation || 'not_applicable', marketplace_id: marketplaceId }];
+  }
 
   // コンディション説明（中古品の場合のみ — LISTING_OFFER_ONLYモードでは新品にcondition_noteを付けるとエラーになる場合がある）
   if (conditionNote && condition !== 'new_new') {
