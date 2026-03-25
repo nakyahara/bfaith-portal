@@ -281,6 +281,8 @@
             <div class="detail-section-title">Amazon情報</div>
             ${dSelect('Ama 単or複', 'ama_single_or_set', p.ama_single_or_set, ['単品','セット','アソート'], p.id)}
             ${dSelect('バリエーション', 'variation_flag', p.variation_flag, ['なし','あり'], p.id)}
+            ${dSelect('電池', 'batteries_required', p.batteries_required || '電池なし', ['電池なし','電池あり'], p.id)}
+            ${dSelect('危険物規制', 'hazmat_regulation', p.hazmat_regulation || '該当なし', ['該当なし','GHS（危険物）','輸送規制あり','保管規制あり'], p.id)}
             <div class="detail-section-title" style="margin-top:12px;">セット内訳商品</div>
             <div id="set-items-${p.id}" class="set-items-list">
               ${items.map((item, i) => `
@@ -496,8 +498,20 @@
       const skuInfo = isFba ? '自動採番(pr_日付_連番)' : (p.ne_product_code || '未設定');
       if (!confirm(`「${p.product_name}」をAmazonに出品しますか？\n\n種別: ${p.fulfillment}\nSKU: ${skuInfo}\n価格: ¥${(p.selling_price || p.ne_selling_price || 0).toLocaleString()}`)) return;
 
+      // 詳細パネルから電池・危険物の値を取得（開いている場合）
+      const batEl = document.getElementById(`d-batteries_required-${id}`);
+      const hazEl = document.getElementById(`d-hazmat_regulation-${id}`);
+      const batMap = { '電池なし': 'false', '電池あり': 'true' };
+      const hazMap = { '該当なし': 'not_applicable', 'GHS（危険物）': 'ghs', '輸送規制あり': 'transportation', '保管規制あり': 'storage' };
+      const batteriesRequired = batEl ? (batMap[batEl.value] || 'false') : 'false';
+      const hazmatRegulation = hazEl ? (hazMap[hazEl.value] || 'not_applicable') : 'not_applicable';
+
       try {
-        const res = await fetch(`./api/products/${id}/list-amazon`, { method: 'POST' });
+        const res = await fetch(`./api/products/${id}/list-amazon`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ batteriesRequired, hazmatRegulation }),
+        });
         const result = await res.json();
         if (!res.ok) { alert('出品エラー: ' + result.error); return; }
         if (result.issues && result.issues.length > 0) {
@@ -528,7 +542,11 @@
       const errors = [];
       for (const id of validProducts) {
         try {
-          const res = await fetch(`./api/products/${id}/list-amazon`, { method: 'POST' });
+          const res = await fetch(`./api/products/${id}/list-amazon`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ batteriesRequired: 'false', hazmatRegulation: 'not_applicable' }),
+          });
           const result = await res.json();
           if (res.ok && result.status === 'ACCEPTED') {
             ok++;

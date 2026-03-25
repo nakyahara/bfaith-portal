@@ -229,6 +229,10 @@ router.post('/api/products/:id/list-amazon', async (req, res) => {
       ? (getSetting('amazon_fba_payment_restriction') || 'none')
       : (getSetting('amazon_payment_restriction') || 'none');
 
+    // リクエストボディから電池・危険物情報を取得（デフォルトあり）
+    const batteriesRequired = req.body?.batteriesRequired || 'false';
+    const hazmatRegulation = req.body?.hazmatRegulation || 'not_applicable';
+
     const result = await createListing({
       asin: product.asin,
       price,
@@ -236,6 +240,8 @@ router.post('/api/products/:id/list-amazon', async (req, res) => {
       sku,
       shippingTemplate,
       paymentRestriction,
+      batteriesRequired,
+      hazmatRegulation,
     });
 
     // 成功時にステータスを「Amazon出品済」に更新
