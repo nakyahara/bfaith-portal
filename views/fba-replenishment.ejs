@@ -515,7 +515,8 @@
       const mode = document.querySelector('input[name="recFilter"]:checked')?.value || 'recommended';
       const searchQuery = (document.getElementById('recSearch')?.value || '').trim().toLowerCase();
       let filtered = recData;
-      if (mode === 'recommended') filtered = filtered.filter(r => r.recommended_qty > 0 || r._manual);
+      // 検索中は全SKUから検索（推奨のみフィルターをバイパス）
+      if (!searchQuery && mode === 'recommended') filtered = filtered.filter(r => r.recommended_qty > 0 || r._manual);
       // 検索フィルター
       if (searchQuery) {
         filtered = filtered.filter(r =>
