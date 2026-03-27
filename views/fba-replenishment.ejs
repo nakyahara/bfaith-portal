@@ -49,7 +49,8 @@
     .urgency-high { background: #fee2e2; }
     .urgency-mid { background: #fef3c7; }
     .rec-qty { font-weight: bold; font-size: 14px; color: #2563eb; }
-    #recTable td:nth-child(n+6):not(:nth-child(21)) { text-align: right; }
+    #recTable td:nth-child(n+6):not(:nth-child(22)) { text-align: right; }
+    .ship-qty-input::-webkit-inner-spin-button { opacity: 1; }
     .sortable-rec { cursor: pointer; user-select: none; white-space: nowrap; }
     .sortable-rec:hover { background: #e5e7eb; }
     .sortable-rec::after { content: ' ⇅'; font-size: 10px; color: #999; }
@@ -242,7 +243,7 @@
               <th class="sortable-rec" data-key="non_fba_reserve" data-type="num">他CH確保</th>
               <th class="sortable-rec" data-key="recommended_qty" data-type="num">推奨数</th>
               <th class="sortable-rec" data-key="adjusted_qty" data-type="num">補正後</th>
-              <th data-type="num">差分</th>
+              <th style="background:#e0f2fe;color:#1e40af;min-width:70px;">納品数量</th>
               <th>アラート</th>
             </tr>
           </thead>
@@ -283,15 +284,21 @@
                 <th class="sortable-order" data-key="urgency_score" data-type="num">緊急度</th>
                 <th class="sortable-order" data-key="amazon_sku">SKU</th>
                 <th class="sortable-order" data-key="product_name">商品名</th>
+                <th class="sortable-order" data-key="fba_available" data-type="num">FBA在庫</th>
+                <th class="sortable-order" data-key="effective_fba_stock" data-type="num">実質在庫</th>
+                <th class="sortable-order" data-key="days_of_supply" data-type="num">供給日数</th>
+                <th class="sortable-order" data-key="reorder_point" data-type="num">発注点(個)</th>
+                <th class="sortable-order" data-key="raw_needed" data-type="num">必要補充数</th>
+                <th class="sortable-order" data-key="target_days" data-type="num">目標日数</th>
                 <th class="sortable-order" data-key="units_sold_7d" data-type="num">FBA7日</th>
                 <th class="sortable-order" data-key="units_sold_30d" data-type="num">FBA30日</th>
                 <th class="sortable-order" data-key="non_fba_sales_7d" data-type="num">他CH7日</th>
                 <th class="sortable-order" data-key="non_fba_sales_30d" data-type="num">他CH30日</th>
-                <th class="sortable-order" data-key="your_price" data-type="num">自社価格</th>
-                <th class="sortable-order" data-key="sales_rank" data-type="num">順位</th>
-                <th class="sortable-order" data-key="days_of_supply" data-type="num">供給日数</th>
-                <th class="sortable-order" data-key="fba_available" data-type="num">FBA在庫</th>
                 <th class="sortable-order" data-key="warehouse_raw" data-type="num">倉庫在庫</th>
+                <th class="sortable-order" data-key="warehouse_available" data-type="num">FBA用</th>
+                <th class="sortable-order" data-key="non_fba_reserve" data-type="num">他CH確保</th>
+                <th class="sortable-order" data-key="recommended_qty" data-type="num">推奨数</th>
+                <th class="sortable-order" data-key="adjusted_qty" data-type="num">補正後</th>
                 <th>アラート</th>
               </tr>
             </thead>
@@ -524,6 +531,7 @@
 
     // 選択管理
     const selectedSkus = new Set();
+    const shipQtyMap = {}; // SKU→手動変更した納品数量
 
     function updateRecSummary() {
       // 全体
@@ -548,10 +556,33 @@
       let count = 0, units = 0;
       document.querySelectorAll('.rec-check:checked').forEach(cb => {
         count++;
-        units += parseInt(cb.dataset.qty) || 0;
+        const sku = cb.dataset.sku;
+        // 納品数量入力値を優先、なければ補正後の値
+        const qtyInput = document.querySelector(`.ship-qty-input[data-sku="${sku}"]`);
+        units += parseInt(qtyInput?.value || cb.dataset.qty) || 0;
       });
       document.getElementById('selectedCount').textContent = count + ' SKU';
       document.getElementById('selectedUnits').textContent = units.toLocaleString() + ' 個';
+    }
+
+    function onShipQtyChange(input) {
+      const sku = input.dataset.sku;
+      const val = parseInt(input.value) || 0;
+      const item = recData.find(r => r.amazon_sku === sku);
+      const defaultVal = item?.adjusted_qty || 0;
+      // 変更されたかどうかでスタイル切り替え
+      if (val !== defaultVal) {
+        shipQtyMap[sku] = val;
+        input.style.background = '#fef3c7';
+        input.style.borderColor = '#d97706';
+        input.style.fontWeight = 'bold';
+      } else {
+        delete shipQtyMap[sku];
+        input.style.background = '';
+        input.style.borderColor = '#d1d5db';
+        input.style.fontWeight = '';
+      }
+      updateSelectedCount();
     }
 
     function onCheckChange(cb) {
@@ -662,7 +693,7 @@
 
     function renderRecList(data) {
       const tbody = document.getElementById('recBody');
-      if (!data.length) { tbody.innerHTML = '<tr><td colspan="21">該当なし</td></tr>'; return; }
+      if (!data.length) { tbody.innerHTML = '<tr><td colspan="22">該当なし</td></tr>'; return; }
 
       // ソート
       data.sort((a, b) => {
@@ -702,7 +733,7 @@
         const isChecked = selectedSkus.has(r.amazon_sku);
         const urgTag = r.urgency_score >= 80 ? 'red' : r.urgency_score >= 40 ? 'yellow' : 'white';
         return `<tr class="${urgCls}" ${manualCls}>
-          <td style="text-align:center;"><input type="checkbox" class="rec-check" data-sku="${r.amazon_sku}" data-qty="${r.adjusted_qty || 0}" data-urg="${urgTag}" ${isChecked ? 'checked' : ''} onchange="onCheckChange(this)"></td>
+          <td style="text-align:center;"><input type="checkbox" class="rec-check" data-sku="${r.amazon_sku}" data-qty="${shipQtyMap[r.amazon_sku] ?? (r.adjusted_qty || 0)}" data-urg="${urgTag}" ${isChecked ? 'checked' : ''} onchange="onCheckChange(this)"></td>
           <td style="text-align:center;font-size:11px;color:#666;">${rowNum}</td>
           <td>${r._manual ? '手動' : r.urgency_score}</td>
           <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')">${r.amazon_sku}</span></td>
@@ -721,8 +752,8 @@
           <td style="color:#2563eb;font-weight:bold">${r.warehouse_available}</td>
           <td style="${(r.non_fba_reserve || 0) > 0 ? 'font-weight:bold;color:#dc2626' : 'color:#999'}">${r.non_fba_reserve || 0}</td>
           <td class="rec-qty" style="${r.recommended_qty !== r.adjusted_qty ? 'color:#999;font-size:12px;text-decoration:line-through' : ''}">${r.recommended_qty || '-'}</td>
-          <td class="rec-qty">${r.adjusted_qty || '-'}</td>
-          <td style="font-size:11px;color:${r.location_adjusted ? '#2563eb' : Math.abs(r.adjust_diff_pct || 0) > 0 ? '#d97706' : '#999'}">${r.adjust_diff_pct ? (r.adjust_diff_pct > 0 ? '+' : '') + r.adjust_diff_pct + '%' : '-'}${r.location_adjusted ? ' 📍ロケ' : ''}</td>
+          <td class="rec-qty" style="font-size:11px;color:#666;">${r.adjusted_qty || '-'}${r.location_adjusted ? ' 📍' : ''}</td>
+          <td style="padding:2px 4px;"><input type="number" class="ship-qty-input" data-sku="${r.amazon_sku}" value="${shipQtyMap[r.amazon_sku] ?? (r.adjusted_qty || 0)}" min="0" onchange="onShipQtyChange(this)" onfocus="this.select()" style="width:60px;padding:3px 4px;border:1px solid #d1d5db;border-radius:4px;font-size:13px;text-align:right;${(shipQtyMap[r.amazon_sku] !== undefined && shipQtyMap[r.amazon_sku] !== (r.adjusted_qty || 0)) ? 'background:#fef3c7;border-color:#d97706;font-weight:bold;' : ''}"></td>
           <td>${alertsHtml}</td>
         </tr>`;
       }).join('');
@@ -1130,7 +1161,7 @@ Step10: アラート判定</pre>
 
     function renderOrderList(data) {
       const tbody = document.getElementById('orderBody');
-      if (!data.length) { tbody.innerHTML = '<tr><td colspan="14">該当なし</td></tr>'; return; }
+      if (!data.length) { tbody.innerHTML = '<tr><td colspan="20">該当なし</td></tr>'; return; }
 
       // ソート
       data.sort((a, b) => {
@@ -1149,6 +1180,8 @@ Step10: アラート判定</pre>
         num++;
         const hasSales = (r.units_sold_30d || 0) > 0 || (r.non_fba_sales_30d || 0) > 0;
         const rowBg = hasSales ? 'background:#fee2e2;' : '';
+        const dosVal = r.days_of_supply;
+        const dosColor = typeof dosVal === 'number' && dosVal < 7 ? 'color:#dc2626;font-weight:bold' : typeof dosVal === 'number' && dosVal < 14 ? 'color:#d97706' : '';
         let alertsHtml = (r.alerts || []).map(a =>
           `<span class="alert-badge alert-${a.level}" title="${a.message}">${a.level >= 2 ? '⚠' : 'ℹ'} ${a.message.slice(0,15)}</span>`
         ).join('');
@@ -1157,15 +1190,21 @@ Step10: アラート判定</pre>
           <td>${r.urgency_score}</td>
           <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')">${r.amazon_sku}</span></td>
           <td class="product-name" title="${r.product_name || ''}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;">${r.product_name || ''}</a>` : (r.product_name || '')}</td>
-          <td>${r.units_sold_7d || 0}</td>
-          <td style="${(r.units_sold_30d || 0) > 0 ? 'font-weight:bold' : ''}">${r.units_sold_30d || 0}</td>
+          <td>${r.fba_available}</td>
+          <td>${r.effective_fba_stock}</td>
+          <td style="${dosColor}">${dosVal}</td>
+          <td>${r.reorder_point}</td>
+          <td>${r.raw_needed || 0}</td>
+          <td>${r.target_days}</td>
+          <td>${r.units_sold_7d}</td>
+          <td>${r.units_sold_30d}</td>
           <td>${r.non_fba_sales_7d || 0}</td>
           <td style="${(r.non_fba_sales_30d || 0) > 0 ? 'font-weight:bold;color:#7c3aed' : ''}">${r.non_fba_sales_30d || 0}</td>
-          <td>${r.your_price ? '¥' + Number(r.your_price).toLocaleString() : '-'}</td>
-          <td>${r.sales_rank || '-'}</td>
-          <td>${r.days_of_supply || '-'}</td>
-          <td>${r.fba_available || 0}</td>
           <td>${r.warehouse_raw || 0}</td>
+          <td style="color:#2563eb;font-weight:bold">${r.warehouse_available}</td>
+          <td style="${(r.non_fba_reserve || 0) > 0 ? 'font-weight:bold;color:#dc2626' : 'color:#999'}">${r.non_fba_reserve || 0}</td>
+          <td class="rec-qty">${r.recommended_qty || '-'}</td>
+          <td class="rec-qty">${r.adjusted_qty || '-'}</td>
           <td>${alertsHtml}</td>
         </tr>`;
       }).join('');
