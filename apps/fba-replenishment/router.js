@@ -8,7 +8,7 @@ import { initDb, savePlanningData, getLatestSnapshots, getSettings, updateSettin
          getSkuMappings, getSkuExceptions, upsertSkuException, deleteSkuException,
          getWarehouseInventory, replaceWarehouseInventory, getWarehouseSummary,
          getShipmentPlans, getShipmentPlanItems, getDailySnapshots } from './db.js';
-import { fetchAllReports, fetchPlanningData, normalizePlanningRow } from './sp-api-reports.js';
+import { fetchAllReports, normalizePlanningRow } from './sp-api-reports.js';
 import { syncSkuMappings } from './sheets-sync.js';
 import { generateRecommendations } from './calculation-engine.js';
 
@@ -76,24 +76,6 @@ router.post('/api/fetch-reports', async (req, res) => {
     });
   } catch (e) {
     console.error('[FBA] レポート取得エラー:', e);
-    res.status(500).json({ error: e.message });
-  } finally {
-    fetchInProgress = false;
-  }
-});
-
-// PLANNINGデータのみ取得
-router.post('/api/fetch-planning', async (req, res) => {
-  if (fetchInProgress) return res.status(409).json({ error: 'レポート取得中です' });
-
-  fetchInProgress = true;
-  try {
-    const rows = await fetchPlanningData();
-    const normalized = rows.map(normalizePlanningRow);
-    const saved = savePlanningData(normalized);
-    res.json({ success: true, count: rows.length, saved });
-  } catch (e) {
-    console.error('[FBA] PLANNINGデータ取得エラー:', e);
     res.status(500).json({ error: e.message });
   } finally {
     fetchInProgress = false;

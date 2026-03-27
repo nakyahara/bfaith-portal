@@ -80,6 +80,11 @@
     .legend-box { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 12px; }
     .legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; }
     .legend-color { width: 16px; height: 16px; border-radius: 3px; border: 1px solid #d1d5db; }
+    .step-badge { display: inline-block; background: #e5e7eb; color: #6b7280; font-size: 12px; font-weight: bold; padding: 4px 10px; border-radius: 12px; min-width: 56px; text-align: center; }
+    .step-badge.active { background: #2563eb; color: white; }
+    .step-badge.done { background: #16a34a; color: white; }
+    .step-status { font-size: 12px; color: #666; }
+    .step-status.done { color: #16a34a; font-weight: bold; }
   </style>
 </head>
 <body>
@@ -108,16 +113,31 @@
       </div>
     </div>
 
-    <!-- アクション -->
-    <div class="actions">
-      <button class="btn btn-primary" id="btnFetchAll" onclick="fetchReports()">SP-APIレポート全取得</button>
-      <button class="btn btn-secondary" id="btnFetchPlanning" onclick="fetchPlanning()">PLANNINGのみ取得</button>
-      <label class="btn btn-secondary" style="cursor:pointer;">
-        ロジザードCSVアップロード
-        <input type="file" accept=".csv" id="csvFile" onchange="uploadCsv(this)" style="display:none;">
-      </label>
-      <button class="btn btn-secondary" id="btnSyncSku" onclick="syncSkuMappings()">SKUマッピング同期</button>
-      <button class="btn btn-primary" id="btnCalc" onclick="calcRecommendations()" style="background:#16a34a;">推奨リスト生成</button>
+    <!-- ワークフロー（ステップ式） -->
+    <div class="actions" style="flex-direction:column;gap:0;">
+      <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
+        <span class="step-badge" id="stepBadge1">Step 1</span>
+        <button class="btn btn-primary" id="btnFetchAll" onclick="fetchReports()">SP-APIレポート全取得</button>
+        <span class="step-status" id="stepStatus1"></span>
+      </div>
+      <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:8px;">
+        <span class="step-badge" id="stepBadge2">Step 2</span>
+        <label class="btn btn-secondary" id="btnCsvLabel" style="cursor:pointer;opacity:0.5;pointer-events:none;">
+          ロジザードCSVアップロード
+          <input type="file" accept=".csv" id="csvFile" onchange="uploadCsv(this)" style="display:none;">
+        </label>
+        <span class="step-status" id="stepStatus2"></span>
+      </div>
+      <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:8px;">
+        <span class="step-badge" id="stepBadge3">Step 3</span>
+        <button class="btn btn-secondary" id="btnSyncSku" onclick="syncSkuMappings()" disabled>SKUマッピング同期</button>
+        <span class="step-status" id="stepStatus3"></span>
+      </div>
+      <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:8px;">
+        <span class="step-badge" id="stepBadge4">Step 4</span>
+        <button class="btn btn-primary" id="btnCalc" onclick="calcRecommendations()" style="background:#16a34a;" disabled>推奨リスト生成</button>
+        <span class="step-status" id="stepStatus4"></span>
+      </div>
     </div>
 
     <!-- ログ -->
@@ -265,11 +285,27 @@
       } catch (e) { log('ステータス取得エラー: ' + e.message); }
     }
 
+    let skuMappingMap = {}; // SKU→ASIN等のマッピング
+
+    async function loadSkuMappingMap() {
+      try {
+        const res = await fetch(`${BASE}/api/sku-mappings`);
+        const mappings = await res.json();
+        skuMappingMap = {};
+        for (const m of mappings) skuMappingMap[m.amazon_sku] = m;
+      } catch(e) { /* 無視 */ }
+    }
+
     async function loadSnapshots() {
       try {
         const res = await fetch(`${BASE}/api/snapshots/latest`);
         const d = await res.json();
         snapshotData = d.data || [];
+        // ASINを紐付け
+        if (Object.keys(skuMappingMap).length === 0) await loadSkuMappingMap();
+        for (const s of snapshotData) {
+          if (!s.asin && skuMappingMap[s.amazon_sku]) s.asin = skuMappingMap[s.amazon_sku].asin;
+        }
         if (sortKey) {
           sortAndRender();
         } else {
@@ -321,7 +357,7 @@
         }
         return `<tr>
           <td>${r.amazon_sku}</td>
-          <td class="product-name" title="${r.product_name || ''}">${r.product_name || ''}</td>
+          <td class="product-name" title="${r.product_name || ''}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${r.product_name || ''}</a>` : (r.product_name || '')}</td>
           <td>${r.fba_available}</td>
           <td>${workingHtml}</td>
           <td>${r.fba_inbound_shipped || 0}</td>
@@ -351,6 +387,7 @@
           d.errors.forEach(e => log(`警告: ${e.report} - ${e.error}`));
         }
         loadStatus();
+        completeStep(1);
       } catch (e) { log('エラー: ' + e.message); }
       finally {
         btn.disabled = false;
@@ -358,27 +395,17 @@
       }
     }
 
-    async function fetchPlanning() {
-      const btn = document.getElementById('btnFetchPlanning');
-      btn.disabled = true;
-      btn.innerHTML = '<span class="spinner"></span>取得中...';
-      log('PLANNINGデータ取得開始...');
-
-      try {
-        const res = await fetch(`${BASE}/api/fetch-planning`, { method: 'POST' });
-        const d = await res.json();
-        if (d.error) { log('エラー: ' + d.error); return; }
-        log(`完了! ${d.count}件取得, ${d.saved}件保存`);
-        loadStatus();
-      } catch (e) { log('エラー: ' + e.message); }
-      finally {
-        btn.disabled = false;
-        btn.textContent = 'PLANNINGのみ取得';
-      }
-    }
-
     async function uploadCsv(input) {
       if (!input.files[0]) return;
+
+      // SP-APIデータが今日の日付か確認
+      const today = new Date().toISOString().slice(0, 10);
+      const snapDate = document.getElementById('lastFetch').textContent.trim();
+      if (snapDate && snapDate !== today) {
+        const ok = confirm(`SP-APIデータの日付が「${snapDate}」です（今日は${today}）。\nデータが古い可能性があります。このまま続けますか？`);
+        if (!ok) { input.value = ''; return; }
+      }
+
       const form = new FormData();
       form.append('csv', input.files[0]);
       log(`CSVアップロード中: ${input.files[0].name}`);
@@ -389,6 +416,7 @@
         if (d.error) { log('エラー: ' + d.error); return; }
         const s = d.summary || {};
         log(`完了! ${d.count}行取込 / ${s.uniqueProducts || '?'}商品 / 倉庫在庫: ${s.totalQty || '?'}個 / Yロケ(施設): ${s.yLocationProducts || 0}商品 ${s.yLocationQty || 0}個`);
+        completeStep(2);
       } catch (e) { log('エラー: ' + e.message); }
       input.value = '';
     }
@@ -677,6 +705,7 @@
         if (d.error) { log('エラー: ' + d.error); return; }
         log(`完了! ${d.total}件同期 (単品: ${d.singles}件, セット: ${d.sets}件)`);
         loadStatus();
+        completeStep(3);
       } catch (e) { log('エラー: ' + e.message); }
       finally {
         btn.disabled = false;
@@ -955,6 +984,35 @@ Step10: アラート判定</pre>
         if (saved) { saved.style.opacity = '1'; setTimeout(() => saved.style.opacity = '0', 2000); }
       } catch(e) { alert('設定保存エラー: ' + e.message); }
     }
+
+    // ===== ステップ制御 =====
+    const stepCompleted = [false, false, false, false]; // Step 1~4
+
+    function completeStep(n) {
+      stepCompleted[n - 1] = true;
+      const badge = document.getElementById('stepBadge' + n);
+      const status = document.getElementById('stepStatus' + n);
+      if (badge) { badge.classList.remove('active'); badge.classList.add('done'); badge.textContent = '✓ Step ' + n; }
+      if (status) { status.classList.add('done'); status.textContent = '完了'; }
+
+      // 次のステップをアンロック
+      if (n < 4) {
+        const nextBadge = document.getElementById('stepBadge' + (n + 1));
+        if (nextBadge) { nextBadge.classList.add('active'); }
+      }
+      if (n === 1) {
+        const csvLabel = document.getElementById('btnCsvLabel');
+        csvLabel.style.opacity = '1';
+        csvLabel.style.pointerEvents = 'auto';
+      } else if (n === 2) {
+        document.getElementById('btnSyncSku').disabled = false;
+      } else if (n === 3) {
+        document.getElementById('btnCalc').disabled = false;
+      }
+    }
+
+    // 初期状態: Step 1 をアクティブに
+    document.getElementById('stepBadge1').classList.add('active');
 
     // 初期ロード
     loadStatus();
