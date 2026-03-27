@@ -116,6 +116,21 @@
     .match-badge.match-jan { background: #e3f2fd; color: #1565c0; border: 1px solid #90caf9; }
     .match-badge.match-keyword { background: #fff3e0; color: #e65100; border: 1px solid #ffcc80; }
     .match-badge.match-none { background: #f5f5f5; color: #888; border: 1px solid #ddd; }
+
+    /* セッション管理 */
+    .session-panel { background: #f0f4ff; border: 1px solid #90caf9; border-radius: 8px; padding: 14px 20px; margin-bottom: 14px; }
+    .session-panel .panel-title { border-bottom-color: #1565c0; }
+    .session-list { max-height: 200px; overflow-y: auto; margin-top: 8px; }
+    .session-item { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; border: 1px solid #d5d9d9; border-radius: 4px; margin-bottom: 6px; background: #fff; cursor: pointer; transition: background 0.15s; }
+    .session-item:hover { background: #e3f2fd; }
+    .session-item .session-name { font-weight: bold; font-size: 13px; }
+    .session-item .session-meta { font-size: 11px; color: #565959; }
+    .session-item .session-actions { display: flex; gap: 6px; }
+    .session-badge { display: inline-block; padding: 2px 6px; border-radius: 8px; font-size: 10px; font-weight: bold; }
+    .session-badge.done { background: #e8f5e9; color: #2e7d32; }
+    .session-badge.progress { background: #fff3e0; color: #e65100; }
+    .session-save-bar { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+    .session-save-bar input { flex: 1; padding: 6px 10px; border: 1px solid #aaa; border-radius: 4px; font-size: 13px; }
   </style>
 </head>
 <body>
@@ -134,6 +149,19 @@
   </div>
 
   <div class="container">
+    <!-- セッション管理パネル -->
+    <div class="session-panel" id="sessionPanel">
+      <div class="panel-title" style="border-bottom-color: #1565c0;">保存済みリサーチセッション</div>
+      <div class="session-list" id="sessionList">
+        <div style="color:#888; font-size:12px; padding:8px;">読み込み中...</div>
+      </div>
+      <div class="session-save-bar" id="sessionSaveBar" style="display:none;">
+        <input type="text" id="sessionName" placeholder="セッション名（例: ○○メーカー 3月価格表）">
+        <button class="btn btn-primary" onclick="saveCurrentSession()">現在の結果を保存</button>
+        <button class="btn btn-sm" onclick="updateCurrentSession()" id="btnUpdateSession" style="display:none;">上書き保存</button>
+      </div>
+    </div>
+
     <!-- Step 1: CSV入力 -->
     <div class="panel" id="inputPanel">
       <div class="panel-title">一括リサーチ — メーカー価格表をアップロード</div>
@@ -142,10 +170,10 @@
           <textarea id="csvText" placeholder="CSVデータをここに貼り付け、またはファイルをアップロード
 
 例:
-JANコード,商品名,卸価格
-4901234567890,○○シャンプー 500ml,800
-4901234567891,○○コンディショナー 500ml,750"></textarea>
-          <div class="hint">ヘッダー行あり。JAN（またはEAN/バーコード）と卸価格が含まれるCSVを貼り付けてください。</div>
+JANコード,型番,商品名,卸価格
+4901234567890,ABC-123,○○シャンプー 500ml,800
+4901234567891,DEF-456,○○コンディショナー 500ml,750"></textarea>
+          <div class="hint">ヘッダー行あり。JAN・型番・商品名・卸価格が含まれるCSVを貼り付けてください。JANコードと型番で優先検索します。</div>
           <div style="display: flex; gap: 8px; align-items: center; margin-top: 8px;">
             <input type="file" id="csvFile" accept=".csv,.tsv,.txt">
             <button class="btn btn-sm btn-success" onclick="downloadTemplate()" title="CSVテンプレートをダウンロード">📄 テンプレートDL</button>
@@ -224,6 +252,8 @@ JANコード,商品名,卸価格
       <div class="mapping-bar" id="mappingBar" style="display: none;">
         <label>JAN列:</label>
         <select id="colJan"></select>
+        <label>型番列:</label>
+        <select id="colPartNumber"></select>
         <label>商品名列:</label>
         <select id="colName"></select>
         <label>卸価格列:</label>
@@ -248,6 +278,7 @@ JANコード,商品名,卸価格
         <div class="summary-card"><div class="sc-value" id="sumExcellent">0</div><div class="sc-label">FBA ◎ 30%+</div></div>
         <div class="summary-card good fbm-summary" style="background:#fffdf0;"><div class="sc-value" id="sumFbmGood">0</div><div class="sc-label">自社利益率10%+</div></div>
         <div class="summary-card" style="border-left:3px solid #1565c0;"><div class="sc-value" id="sumJanMatch">0</div><div class="sc-label">JAN一致</div></div>
+        <div class="summary-card" style="border-left:3px solid #2e7d32;"><div class="sc-value" id="sumPartNumberMatch">0</div><div class="sc-label">型番一致</div></div>
         <div class="summary-card" style="border-left:3px solid #e65100;"><div class="sc-value" id="sumKeywordMatch">0</div><div class="sc-label">商品名一致</div></div>
         <div class="summary-card"><div class="sc-value" id="sumNotFound">0</div><div class="sc-label">未発見</div></div>
         <div class="summary-card"><div class="sc-value" id="sumErrors">0</div><div class="sc-label">エラー</div></div>
@@ -278,6 +309,7 @@ JANコード,商品名,卸価格
         <select id="matchFilter" onchange="applyFilter()" style="border-color:#90caf9;">
           <option value="all">一致方法: すべて</option>
           <option value="jan">JAN一致のみ</option>
+          <option value="part_number">型番一致のみ</option>
           <option value="keyword">商品名一致のみ</option>
         </select>
         <button class="btn btn-success btn-sm" onclick="saveSelected()">選択をリサーチに保存</button>
@@ -296,6 +328,7 @@ JANコード,商品名,卸価格
             <th>商品名</th>
             <th>一致</th>
             <th>JAN</th>
+            <th>型番</th>
             <th class="num">卸価格</th>
             <th class="num">販売価格</th>
             <th class="num">FBA手数料</th>
@@ -452,11 +485,11 @@ function toggleFbmColumns(show) {
 // ===== CSVテンプレートDL =====
 function downloadTemplate() {
   const bom = '\uFEFF';
-  const header = 'JANコード,商品名,卸価格(税抜)';
+  const header = 'JANコード,型番,商品名,卸価格(税抜)';
   const sample = [
-    '4901234567890,○○シャンプー 500ml,800',
-    '4901234567891,○○コンディショナー 500ml,750',
-    '4901234567892,○○トリートメント 300g,1200',
+    '4901234567890,ABC-123,○○シャンプー 500ml,800',
+    '4901234567891,DEF-456,○○コンディショナー 500ml,750',
+    '4901234567892,GHI-789,○○トリートメント 300g,1200',
   ];
   const csv = bom + header + '\n' + sample.join('\n') + '\n';
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
@@ -586,7 +619,8 @@ function parseCsv(text) {
 
   // カラムマッピングのselect生成
   populateMapping('colJan', headers, ['JAN', 'jan', 'JANコード', 'EAN', 'ean', 'バーコード', 'barcode', 'GTIN']);
-  populateMapping('colName', headers, ['商品名', '品名', 'Name', 'name', 'product_name', '品番', '名称']);
+  populateMapping('colPartNumber', headers, ['型番', '品番', 'model', 'Model', 'part_number', 'PartNumber', 'SKU', 'sku', '型式', '製品番号', '品目コード']);
+  populateMapping('colName', headers, ['商品名', '品名', 'Name', 'name', 'product_name', '名称']);
   populateMapping('colPrice', headers, ['卸価格', '仕入価格', '単価', '原価', '卸値', 'cost', 'price', '仕入れ価格', '税抜単価', '税抜', '掛率後単価']);
 
   document.getElementById('mappingBar').style.display = 'flex';
@@ -613,6 +647,7 @@ function populateMapping(selectId, cols, prefixes) {
 // ===== リサーチ実行 =====
 async function startResearch() {
   const colJan = document.getElementById('colJan').value;
+  const colPartNumber = document.getElementById('colPartNumber').value;
   const colName = document.getElementById('colName').value;
   const colPrice = document.getElementById('colPrice').value;
 
@@ -620,16 +655,17 @@ async function startResearch() {
     alert('卸価格の列を選択してください');
     return;
   }
-  if (!colJan && !colName) {
-    alert('JANコードまたは商品名の列を選択してください');
+  if (!colJan && !colPartNumber && !colName) {
+    alert('JANコード、型番、または商品名の列を少なくとも1つ選択してください');
     return;
   }
 
   const items = parsedRows.map(row => ({
     jan: colJan ? row[colJan] : '',
+    partNumber: colPartNumber ? row[colPartNumber] : '',
     productName: colName ? row[colName] : '',
     wholesalePrice: parseFloat(String(row[colPrice]).replace(/[,，]/g, '')) || 0,
-  })).filter(item => item.wholesalePrice > 0 && (item.jan || item.productName));
+  })).filter(item => item.wholesalePrice > 0 && (item.jan || item.partNumber || item.productName));
 
   if (items.length === 0) {
     alert('有効なデータがありません（卸価格が0または空の行は除外されます）');
@@ -717,6 +753,13 @@ function handleEvent(data) {
       document.getElementById('progressText').textContent =
         `完了! ${allResults.length} 件処理しました`;
       updateUnmatchedPanel();
+      // セッション保存バーを表示
+      document.getElementById('sessionSaveBar').style.display = 'flex';
+      if (!document.getElementById('sessionName').value) {
+        const today = new Date().toISOString().slice(0, 10);
+        const supplier = document.getElementById('supplierName').value;
+        document.getElementById('sessionName').value = `${supplier ? supplier + ' ' : ''}リサーチ ${today}`;
+      }
     }
   }
 }
@@ -826,6 +869,7 @@ function renderTable(rows) {
       <td class="product-name-cell" title="${escHtml(r.amazonName || r.productName || '')}">${escHtml(r.amazonName || r.productName || '')}</td>
       <td>${matchTypeBadge(r.matchType)}</td>
       <td style="font-size:11px;">${r.jan || '-'}</td>
+      <td style="font-size:11px;">${r.partNumber || '-'}</td>
       <td class="num">${r.wholesalePrice ? '¥' + fmt(r.wholesalePrice) : '-'}</td>
       <td class="num">${r.sellingPrice ? '¥' + fmt(r.sellingPrice) : '-'}</td>
       <td class="num" style="font-size:11px;">${r.totalFee ? '¥' + fmt(r.totalFee) : '-'}</td>
@@ -845,6 +889,7 @@ function renderTable(rows) {
 function matchTypeBadge(matchType) {
   switch (matchType) {
     case 'jan': return '<span class="match-badge match-jan">JAN一致</span>';
+    case 'part_number': return '<span class="match-badge match-keyword" style="background:#e8f5e9;color:#2e7d32;border-color:#a5d6a7;">型番一致</span>';
     case 'keyword': return '<span class="match-badge match-keyword">商品名</span>';
     case 'none': return '<span class="match-badge match-none">未一致</span>';
     default: return '-';
@@ -869,6 +914,7 @@ function updateSummary() {
   document.getElementById('sumExcellent').textContent = ok.filter(r => (r.profitRate || 0) >= 30).length;
   document.getElementById('sumFbmGood').textContent = ok.filter(r => (r._fbmProfitRate || 0) >= 10).length;
   document.getElementById('sumJanMatch').textContent = allResults.filter(r => r.matchType === 'jan').length;
+  document.getElementById('sumPartNumberMatch').textContent = allResults.filter(r => r.matchType === 'part_number').length;
   document.getElementById('sumKeywordMatch').textContent = allResults.filter(r => r.matchType === 'keyword').length;
   document.getElementById('sumNotFound').textContent = allResults.filter(r => r.status === 'not_found').length;
   document.getElementById('sumErrors').textContent = allResults.filter(r => r.status === 'error').length;
@@ -938,18 +984,19 @@ function exportCsv() {
   if (ok.length === 0) { alert('エクスポートするデータがありません'); return; }
 
   const showFbm = document.getElementById('fulfillmentMode').value !== 'fba_only';
-  const baseHeader = ['JAN', 'ASIN', '商品名', '一致方法', 'カテゴリ', '卸価格(税抜)', '卸価格(税込)', '販売価格', 'FBA手数料', 'FBA利益', 'FBA利益率%', 'FBA判定'];
+  const baseHeader = ['JAN', '型番', 'ASIN', '商品名', '一致方法', 'カテゴリ', '卸価格(税抜)', '卸価格(税込)', '販売価格', 'FBA手数料', 'FBA利益', 'FBA利益率%', 'FBA判定'];
   const fbmHeader = showFbm ? ['自社送料', '配送方法', '自社利益', '自社利益率%', '自社判定'] : [];
   const tailHeader = ['ランキング', '推定月販', '出品者数', 'メーカー'];
   const header = [...baseHeader, ...fbmHeader, ...tailHeader];
 
   const rows = ok.map(r => {
+    const matchLabel = r.matchType === 'jan' ? 'JAN一致' : r.matchType === 'part_number' ? '型番一致' : r.matchType === 'keyword' ? '商品名' : '-';
     const base = [
-      r.jan, r.asin, r.amazonName || r.productName, r.matchType === 'jan' ? 'JAN一致' : r.matchType === 'keyword' ? '商品名' : '-', r.category,
+      r.jan, r.partNumber || '', r.asin, r.amazonName || r.productName, matchLabel, r.category,
       r.wholesalePrice, r.wholesalePriceWithTax, r.sellingPrice,
       r.totalFee, r.profit, r.profitRate, r.judgment,
     ];
-    const fbm = showFbm ? [r._fbmShippingCost || '', r._fbmShippingMethod || '', r._fbmProfit || '', r._fbmProfitRate || '', r._fbmJudgment || ''] : [];
+    const fbm = showFbm ? [r._fbmShippingCost ?? '', r._fbmShippingMethod || '', r._fbmProfit ?? '', r._fbmProfitRate ?? '', r._fbmJudgment || ''] : [];
     const tail = [r.salesRank, r.estMonthlySales, r.offerCount, r.manufacturer];
     return [...base, ...fbm, ...tail];
   });
@@ -963,9 +1010,180 @@ function exportCsv() {
   a.click();
 }
 
+// ===== サーバー側セッション管理 =====
+let currentSessionId = null;
+
+async function loadSessionList() {
+  try {
+    const res = await fetch('./api/bulk-sessions');
+    const sessions = await res.json();
+    const list = document.getElementById('sessionList');
+    if (sessions.length === 0) {
+      list.innerHTML = '<div style="color:#888; font-size:12px; padding:8px;">保存済みセッションはありません。リサーチ実行後に保存できます。</div>';
+      return;
+    }
+    list.innerHTML = '';
+    for (const s of sessions) {
+      const div = document.createElement('div');
+      div.className = 'session-item';
+      const statusBadge = s.status === '完了'
+        ? '<span class="session-badge done">完了</span>'
+        : `<span class="session-badge progress">${s.processed_count}/${s.total_count}</span>`;
+      const date = s.updated_at ? new Date(s.updated_at).toLocaleString('ja-JP') : '';
+      div.innerHTML = `
+        <div>
+          <span class="session-name">${escHtml(s.name)}</span>
+          ${statusBadge}
+          <span class="session-meta" style="margin-left:8px;">${s.total_count}件 | ${date}</span>
+        </div>
+        <div class="session-actions">
+          <button class="btn btn-sm btn-primary" onclick="event.stopPropagation(); loadSession(${s.id})">読み込み</button>
+          <button class="btn btn-sm btn-danger" onclick="event.stopPropagation(); deleteSession(${s.id}, '${escHtml(s.name)}')">削除</button>
+        </div>
+      `;
+      list.appendChild(div);
+    }
+  } catch (e) {
+    console.error('セッション一覧取得エラー:', e);
+  }
+}
+
+async function loadSession(id) {
+  try {
+    const res = await fetch(`./api/bulk-sessions/${id}`);
+    const session = await res.json();
+    if (!session || !session.results) {
+      alert('セッションデータの読み込みに失敗しました');
+      return;
+    }
+
+    // 結果を復元
+    allResults = session.results;
+    currentSessionId = id;
+
+    // 設定を復元
+    if (session.settings) {
+      const s = session.settings;
+      if (s.taxRate) document.getElementById('taxRate').value = s.taxRate;
+      if (s.fulfillmentMode) {
+        document.getElementById('fulfillmentMode').value = s.fulfillmentMode;
+        document.getElementById('fbmShippingSettings').style.display = s.fulfillmentMode === 'fba_only' ? 'none' : '';
+        toggleFbmColumns(s.fulfillmentMode !== 'fba_only');
+      }
+      if (s.fbmShippingMode) document.getElementById('fbmShippingMode').value = s.fbmShippingMode;
+      if (s.supplierCode) document.getElementById('supplierCode').value = s.supplierCode;
+      if (s.supplierName) document.getElementById('supplierName').value = s.supplierName;
+    }
+
+    // UI更新
+    document.getElementById('resultsPanel').style.display = 'block';
+    document.getElementById('progressBox').style.display = 'block';
+    document.getElementById('progressFill').style.width = '100%';
+    document.getElementById('progressText').textContent =
+      `セッション「${session.name}」を読み込みました（${allResults.length} 件）`;
+    updateSummary();
+    applyFilter();
+    updateUnmatchedPanel();
+
+    // 保存バー更新
+    document.getElementById('sessionSaveBar').style.display = 'flex';
+    document.getElementById('sessionName').value = session.name;
+    document.getElementById('btnUpdateSession').style.display = '';
+  } catch (e) {
+    alert('読み込みエラー: ' + e.message);
+  }
+}
+
+async function saveCurrentSession() {
+  if (allResults.length === 0) {
+    alert('保存するリサーチ結果がありません。先にリサーチを実行してください。');
+    return;
+  }
+  const name = document.getElementById('sessionName').value.trim();
+  if (!name) {
+    alert('セッション名を入力してください');
+    document.getElementById('sessionName').focus();
+    return;
+  }
+
+  try {
+    const settings = {
+      taxRate: document.getElementById('taxRate').value,
+      fulfillmentMode: document.getElementById('fulfillmentMode').value,
+      fbmShippingMode: document.getElementById('fbmShippingMode').value,
+      supplierCode: document.getElementById('supplierCode').value,
+      supplierName: document.getElementById('supplierName').value,
+    };
+
+    const res = await fetch('./api/bulk-sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name,
+        settings,
+        results: allResults,
+        totalCount: allResults.length,
+        processedCount: allResults.length,
+        status: '完了',
+      }),
+    });
+    const data = await res.json();
+    currentSessionId = data.id;
+    document.getElementById('btnUpdateSession').style.display = '';
+    alert(`セッション「${name}」を保存しました`);
+    loadSessionList();
+  } catch (e) {
+    alert('保存エラー: ' + e.message);
+  }
+}
+
+async function updateCurrentSession() {
+  if (!currentSessionId) {
+    saveCurrentSession();
+    return;
+  }
+  try {
+    const settings = {
+      taxRate: document.getElementById('taxRate').value,
+      fulfillmentMode: document.getElementById('fulfillmentMode').value,
+      fbmShippingMode: document.getElementById('fbmShippingMode').value,
+      supplierCode: document.getElementById('supplierCode').value,
+      supplierName: document.getElementById('supplierName').value,
+    };
+    await fetch(`./api/bulk-sessions/${currentSessionId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: document.getElementById('sessionName').value.trim(),
+        settings,
+        results: allResults,
+        totalCount: allResults.length,
+        processedCount: allResults.length,
+        status: '完了',
+      }),
+    });
+    alert('セッションを上書き保存しました');
+    loadSessionList();
+  } catch (e) {
+    alert('更新エラー: ' + e.message);
+  }
+}
+
+async function deleteSession(id, name) {
+  if (!confirm(`セッション「${name}」を削除しますか？`)) return;
+  try {
+    await fetch(`./api/bulk-sessions/${id}`, { method: 'DELETE' });
+    if (currentSessionId === id) currentSessionId = null;
+    loadSessionList();
+  } catch (e) {
+    alert('削除エラー: ' + e.message);
+  }
+}
+
 // ===== ユーティリティ =====
 // ===== ページロード時に前回結果を復元 =====
 window.addEventListener('DOMContentLoaded', () => {
+  loadSessionList();
   // 送料テーブル読み込み完了後に復元（少し待つ）
   setTimeout(() => restoreFromSession(), 300);
 });

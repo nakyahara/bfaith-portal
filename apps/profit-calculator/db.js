@@ -283,6 +283,21 @@ export async function initDb() {
     )
   `);
 
+  // 一括リサーチセッションテーブル（結果永続化用）
+  db.run(`
+    CREATE TABLE IF NOT EXISTS bulk_research_sessions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      settings TEXT,
+      results TEXT,
+      total_count INTEGER DEFAULT 0,
+      processed_count INTEGER DEFAULT 0,
+      status TEXT DEFAULT '処理中',
+      created_at TEXT DEFAULT (datetime('now','localtime')),
+      updated_at TEXT DEFAULT (datetime('now','localtime'))
+    )
+  `);
+
   // productsテーブル: 価格改定用カラム追加
   const priceRevisionCols = [
     ['last_checked_at', 'TEXT'],
@@ -816,5 +831,58 @@ export function updateProductPriceInfo(id, data) {
   fields.push("updated_at = datetime('now','localtime')");
   params.push(id);
   db.run(`UPDATE products SET ${fields.join(', ')} WHERE id = ?`, params);
+  saveToFile();
+}
+
+// ===== Bulk Research Sessions =====
+
+export function saveBulkSession(data) {
+  db.run(`
+    INSERT INTO bulk_research_sessions (name, settings, results, total_count, processed_count, status)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `, [
+    data.name,
+    JSON.stringify(data.settings || {}),
+    JSON.stringify(data.results || []),
+    data.totalCount || 0,
+    data.processedCount || 0,
+    data.status || '完了',
+  ]);
+  saveToFile();
+  const result = db.exec('SELECT last_insert_rowid() as id');
+  return result[0].values[0][0];
+}
+
+export function updateBulkSession(id, data) {
+  const fields = [];
+  const params = [];
+  if (data.name !== undefined) { fields.push('name = ?'); params.push(data.name); }
+  if (data.settings !== undefined) { fields.push('settings = ?'); params.push(JSON.stringify(data.settings)); }
+  if (data.results !== undefined) { fields.push('results = ?'); params.push(JSON.stringify(data.results)); }
+  if (data.totalCount !== undefined) { fields.push('total_count = ?'); params.push(data.totalCount); }
+  if (data.processedCount !== undefined) { fields.push('processed_count = ?'); params.push(data.processedCount); }
+  if (data.status !== undefined) { fields.push('status = ?'); params.push(data.status); }
+  if (fields.length === 0) return;
+  fields.push("updated_at = datetime('now','localtime')");
+  params.push(id);
+  db.run(`UPDATE bulk_research_sessions SET ${fields.join(', ')} WHERE id = ?`, params);
+  saveToFile();
+}
+
+export function getBulkSessions() {
+  return queryAll('SELECT id, name, total_count, processed_count, status, created_at, updated_at FROM bulk_research_sessions ORDER BY updated_at DESC');
+}
+
+export function getBulkSessionById(id) {
+  const rows = queryAll('SELECT * FROM bulk_research_sessions WHERE id = ?', [id]);
+  if (rows.length === 0) return null;
+  const row = rows[0];
+  try { row.settings = JSON.parse(row.settings || '{}'); } catch { row.settings = {}; }
+  try { row.results = JSON.parse(row.results || '[]'); } catch { row.results = []; }
+  return row;
+}
+
+export function deleteBulkSession(id) {
+  db.run('DELETE FROM bulk_research_sessions WHERE id = ?', [id]);
   saveToFile();
 }

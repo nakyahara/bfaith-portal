@@ -5,7 +5,7 @@ import { Router } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { getProduct, getFees, createListing, patchListing, getShippingTemplates, getItemOffers, updatePrice, getActiveListingsReport, getSalesCountBySku, searchByJan, searchByKeyword, estimateMonthlySales } from './sp-api.js';
-import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, deleteProduct, getSetItems, saveSetItems, syncListings as dbSyncListings, getListings, updateListing, bulkSave, getSyncMeta, getTrackingProducts, getPriceHistory, getRecentPriceHistory, savePriceHistory, updateProductPriceInfo, syncProductsFromListings } from './db.js';
+import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, deleteProduct, getSetItems, saveSetItems, syncListings as dbSyncListings, getListings, updateListing, bulkSave, getSyncMeta, getTrackingProducts, getPriceHistory, getRecentPriceHistory, savePriceHistory, updateProductPriceInfo, syncProductsFromListings, saveBulkSession, updateBulkSession, getBulkSessions, getBulkSessionById, deleteBulkSession } from './db.js';
 import { loadSuppliers, addSupplier, deleteSupplier } from './suppliers.js';
 import { loadShipping, addShipping, updateShipping, deleteShipping } from './shipping.js';
 import { getSetting, setSetting, getAllSettings } from './settings.js';
@@ -666,13 +666,13 @@ router.post('/api/bulk-research/stream', async (req, res) => {
 
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
-    const { jan, productName, wholesalePrice } = item;
+    const { jan, partNumber, productName, wholesalePrice } = item;
     const idx = i + 1;
 
     try {
-      send('progress', { current: idx, total: items.length, jan, productName });
+      send('progress', { current: idx, total: items.length, jan, partNumber, productName });
 
-      // Step 1: JANコードでASIN検索 → キーワード検索でフォールバック
+      // Step 1: JAN → 型番 → 商品名 の優先順でASIN検索
       // matchType: 何で一致したかを記録
       let candidates = [];
       let matchType = 'unknown';
@@ -683,7 +683,13 @@ router.post('/api/bulk-research/stream', async (req, res) => {
         if (candidates.length > 0) matchType = 'jan';
       }
 
-      // 1b: JANで見つからなければ商品名でキーワード検索
+      // 1b: JANで見つからなければ型番でキーワード検索
+      if (candidates.length === 0 && partNumber) {
+        candidates = await searchByKeyword(partNumber);
+        if (candidates.length > 0) matchType = 'part_number';
+      }
+
+      // 1c: 型番でも見つからなければ商品名でキーワード検索
       if (candidates.length === 0 && productName) {
         candidates = await searchByKeyword(productName);
         if (candidates.length > 0) matchType = 'keyword';
@@ -691,7 +697,7 @@ router.post('/api/bulk-research/stream', async (req, res) => {
 
       if (candidates.length === 0) {
         send('result', {
-          idx, jan, productName, wholesalePrice,
+          idx, jan, partNumber, productName, wholesalePrice,
           status: 'not_found', message: 'Amazon商品が見つかりません',
           matchType: 'none',
         });
@@ -710,7 +716,7 @@ router.post('/api/bulk-research/stream', async (req, res) => {
       const sellingPrice = product.currentPrice;
       if (!sellingPrice || sellingPrice <= 0) {
         send('result', {
-          idx, jan, productName: productName || product.itemName,
+          idx, jan, partNumber, productName: productName || product.itemName,
           wholesalePrice, asin,
           image: product.image,
           amazonName: product.itemName,
@@ -761,7 +767,7 @@ router.post('/api/bulk-research/stream', async (req, res) => {
       const estSales = estimateMonthlySales(product.salesRank);
 
       send('result', {
-        idx, jan, productName: productName || product.itemName,
+        idx, jan, partNumber, productName: productName || product.itemName,
         wholesalePrice, wholesalePriceWithTax,
         asin,
         image: product.image,
@@ -792,9 +798,9 @@ router.post('/api/bulk-research/stream', async (req, res) => {
       await new Promise(r => setTimeout(r, 500));
 
     } catch (err) {
-      console.error(`[BulkResearch] エラー (${jan || productName}):`, err.message);
+      console.error(`[BulkResearch] エラー (${jan || partNumber || productName}):`, err.message);
       send('result', {
-        idx, jan, productName, wholesalePrice,
+        idx, jan, partNumber, productName, wholesalePrice,
         status: 'error', message: err.message,
       });
       // エラー後も少し待機
@@ -1396,6 +1402,64 @@ router.post('/api/price-revision/worker/stop', (req, res) => {
 router.post('/api/price-revision/refresh-cache', (req, res) => {
   refreshProductCache();
   res.json({ ok: true });
+});
+
+// ── API: 一括リサーチセッション管理 ──
+
+// セッション一覧取得
+router.get('/api/bulk-sessions', async (req, res) => {
+  try {
+    await ensureDb();
+    const sessions = getBulkSessions();
+    res.json(sessions);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// セッション詳細取得（結果データ含む）
+router.get('/api/bulk-sessions/:id', async (req, res) => {
+  try {
+    await ensureDb();
+    const session = getBulkSessionById(parseInt(req.params.id));
+    if (!session) return res.status(404).json({ error: 'セッションが見つかりません' });
+    res.json(session);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// セッション保存（新規）
+router.post('/api/bulk-sessions', async (req, res) => {
+  try {
+    await ensureDb();
+    const id = saveBulkSession(req.body);
+    res.json({ id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// セッション更新
+router.put('/api/bulk-sessions/:id', async (req, res) => {
+  try {
+    await ensureDb();
+    updateBulkSession(parseInt(req.params.id), req.body);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// セッション削除
+router.delete('/api/bulk-sessions/:id', async (req, res) => {
+  try {
+    await ensureDb();
+    deleteBulkSession(parseInt(req.params.id));
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 export default router;
