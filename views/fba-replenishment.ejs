@@ -528,6 +528,17 @@
       const combined = [...manualItems.filter(m => !filtered.find(r => r.amazon_sku === m.amazon_sku)), ...filtered];
       renderRecList(combined);
       document.getElementById('recFilterCount').textContent = `表示: ${combined.length} 件`;
+
+      // スナップショットテーブルも同じ検索語でフィルター
+      if (searchQuery) {
+        const filteredSnap = snapshotData.filter(r =>
+          (r.product_name || '').toLowerCase().includes(searchQuery) ||
+          (r.amazon_sku || '').toLowerCase().includes(searchQuery)
+        );
+        renderSnapshot(filteredSnap);
+      } else {
+        renderSnapshot(snapshotData);
+      }
     }
 
     function addManualItem() {
