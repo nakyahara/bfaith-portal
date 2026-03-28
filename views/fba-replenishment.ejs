@@ -2385,18 +2385,37 @@ Step10: アラート判定</pre>
         const successCount = data.totalItems - problems.length;
         const problemsHtml = problems.map(p => {
           const sku = p.msku || p.sku || '-';
+          const name = p.product_name || '';
           const code = p.code || '-';
           const reason = translateError(code, p.message || p.details);
           return `<tr>
-            <td style="padding:4px 8px;border:1px solid #e5e7eb;font-size:12px;">${sku}</td>
-            <td style="padding:4px 8px;border:1px solid #e5e7eb;font-size:12px;">${code}</td>
+            <td style="padding:4px 8px;border:1px solid #e5e7eb;font-size:11px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${sku}</td>
+            <td style="padding:4px 8px;border:1px solid #e5e7eb;font-size:11px;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${name}">${name || '-'}</td>
+            <td style="padding:4px 8px;border:1px solid #e5e7eb;font-size:11px;">${code}</td>
             <td style="padding:4px 8px;border:1px solid #e5e7eb;font-size:12px;">${reason}</td>
           </tr>`;
         }).join('');
 
+        // SKUが不明なエラーがある場合、全送信アイテムを参考表示
+        const hasUnknownSku = problems.some(p => (p.msku || p.sku || '-') === '-');
+        const submittedItems = data.submittedItems || [];
+        let submittedHtml = '';
+        if (hasUnknownSku && submittedItems.length > 0) {
+          submittedHtml = `
+            <details style="margin-top:12px;">
+              <summary style="cursor:pointer;font-size:12px;color:#666;">送信した全商品リスト（${submittedItems.length}件）を表示</summary>
+              <div style="max-height:150px;overflow-y:auto;margin-top:4px;">
+                <table style="width:100%;border-collapse:collapse;">
+                  <tr style="background:#f3f4f6;"><th style="padding:3px 6px;border:1px solid #e5e7eb;font-size:11px;">SKU</th><th style="padding:3px 6px;border:1px solid #e5e7eb;font-size:11px;">商品名</th><th style="padding:3px 6px;border:1px solid #e5e7eb;font-size:11px;">数量</th></tr>
+                  ${submittedItems.map(i => `<tr><td style="padding:3px 6px;border:1px solid #e5e7eb;font-size:10px;">${i.amazon_sku}</td><td style="padding:3px 6px;border:1px solid #e5e7eb;font-size:10px;">${i.product_name}</td><td style="padding:3px 6px;border:1px solid #e5e7eb;font-size:10px;">${i.ship_qty}</td></tr>`).join('')}
+                </table>
+              </div>
+            </details>`;
+        }
+
         html = `
           <div class="debug-overlay" onclick="closeInboundModal()"></div>
-          <div class="debug-modal" style="max-width:700px;">
+          <div class="debug-modal" style="max-width:750px;">
             <span class="debug-close" onclick="closeInboundModal()">&times;</span>
             <h3 style="margin:0 0 16px;color:#dc2626;">❌ 納品プラン作成失敗</h3>
             <div style="background:#fee2e2;padding:12px;border-radius:6px;margin-bottom:16px;">
@@ -2408,10 +2427,11 @@ Step10: アラート判定</pre>
               <h4 style="margin:0 0 8px;">エラー詳細</h4>
               <div style="max-height:200px;overflow-y:auto;">
                 <table style="width:100%;border-collapse:collapse;">
-                  <tr style="background:#f3f4f6;"><th style="padding:4px 8px;border:1px solid #e5e7eb;font-size:12px;">SKU</th><th style="padding:4px 8px;border:1px solid #e5e7eb;font-size:12px;">コード</th><th style="padding:4px 8px;border:1px solid #e5e7eb;font-size:12px;">理由</th></tr>
+                  <tr style="background:#f3f4f6;"><th style="padding:4px 8px;border:1px solid #e5e7eb;font-size:11px;">SKU</th><th style="padding:4px 8px;border:1px solid #e5e7eb;font-size:11px;">商品名</th><th style="padding:4px 8px;border:1px solid #e5e7eb;font-size:11px;">コード</th><th style="padding:4px 8px;border:1px solid #e5e7eb;font-size:11px;">理由</th></tr>
                   ${problemsHtml}
                 </table>
               </div>
+              ${submittedHtml}
             ` : '<p style="color:#666;">エラー詳細が返されませんでした。</p>'}
             <div style="display:flex;gap:8px;margin-top:16px;">
               ${errorSkus.length > 0 && successCount > 0 ? `<button class="btn btn-primary" onclick="retryWithoutErrors(${JSON.stringify(errorSkus)})" style="background:#dc2626;">エラーを除いて再作成（${successCount} SKU）</button>` : ''}

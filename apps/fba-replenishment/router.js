@@ -398,17 +398,40 @@ router.post('/api/create-inbound-plan', express.json(), async (req, res) => {
       };
     });
 
+    // problemsにSKU情報がない場合、送信アイテムから補完を試みる
+    const enrichedProblems = (result.problems || []).map(p => {
+      // details/messageからSKUを抽出する試み
+      const allText = [p.message, p.details, p.code].filter(Boolean).join(' ');
+      let matchedSku = p.msku || p.sku || null;
+      if (!matchedSku) {
+        // 送信したSKUリストとメッセージ内容を照合
+        for (const item of items) {
+          if (allText.includes(item.amazon_sku)) {
+            matchedSku = item.amazon_sku;
+            break;
+          }
+        }
+      }
+      const matchedItem = matchedSku ? items.find(i => i.amazon_sku === matchedSku) : null;
+      return {
+        ...p,
+        msku: matchedSku || '-',
+        product_name: matchedItem?.product_name || '',
+      };
+    });
+
     res.json({
       success: result.status === 'SUCCESS',
       inboundPlanId: result.inboundPlanId,
       operationId: result.operationId,
       status: result.status,
-      problems: result.problems,
+      problems: enrichedProblems,
       totalItems: items.length,
       successItems: result.status === 'SUCCESS' ? items.length : 0,
-      errorItems: result.problems.length,
+      errorItems: enrichedProblems.length,
       retried: prepCorrections.length > 0,
       prepCorrections,
+      submittedItems: items.map(i => ({ amazon_sku: i.amazon_sku, product_name: i.product_name, ship_qty: i.ship_qty })),
     });
   } catch (e) {
     console.error('[Inbound] プラン作成エラー:', e);
