@@ -398,27 +398,50 @@ router.post('/api/create-inbound-plan', express.json(), async (req, res) => {
       };
     });
 
-    // problemsにSKU情報がない場合、送信アイテムから補完を試みる
-    const enrichedProblems = (result.problems || []).map(p => {
-      // details/messageからSKUを抽出する試み
-      const allText = [p.message, p.details, p.code].filter(Boolean).join(' ');
-      let matchedSku = p.msku || p.sku || null;
-      if (!matchedSku) {
-        // 送信したSKUリストとメッセージ内容を照合
-        for (const item of items) {
-          if (allText.includes(item.amazon_sku)) {
-            matchedSku = item.amazon_sku;
-            break;
+    // planItemsからエラーSKUを特定（送信したSKUとプランに残ったSKUの差分 = エラーSKU）
+    const planItems = result.planItems || [];
+    const planSkuSet = new Set(planItems.map(pi => pi.msku));
+    const sentSkuSet = new Set(items.map(i => i.amazon_sku));
+    // プランに入らなかったSKU = エラーで弾かれたSKU
+    const rejectedSkus = items.filter(i => !planSkuSet.has(i.amazon_sku));
+
+    let enrichedProblems;
+    if (rejectedSkus.length > 0 && (result.problems || []).some(p => !(p.msku || p.sku))) {
+      // APIのproblemsにSKU情報がない場合、rejectedSkusで補完
+      // エラー数と弾かれたSKU数が一致すれば1対1で対応
+      if (rejectedSkus.length === (result.problems || []).length) {
+        enrichedProblems = (result.problems || []).map((p, i) => ({
+          ...p,
+          msku: rejectedSkus[i].amazon_sku,
+          product_name: rejectedSkus[i].product_name || '',
+        }));
+      } else {
+        // 数が合わない場合: problemsにrejectedSkus情報を追加
+        enrichedProblems = rejectedSkus.map(rej => {
+          const matchingProblem = (result.problems || [])[0] || {};
+          return {
+            ...matchingProblem,
+            msku: rej.amazon_sku,
+            product_name: rej.product_name || '',
+          };
+        });
+      }
+    } else {
+      // APIにSKU情報がある場合 or planItems取得失敗
+      enrichedProblems = (result.problems || []).map(p => {
+        const allText = [p.message, p.details, p.code].filter(Boolean).join(' ');
+        let matchedSku = p.msku || p.sku || null;
+        if (!matchedSku) {
+          for (const item of items) {
+            if (allText.includes(item.amazon_sku)) { matchedSku = item.amazon_sku; break; }
           }
         }
-      }
-      const matchedItem = matchedSku ? items.find(i => i.amazon_sku === matchedSku) : null;
-      return {
-        ...p,
-        msku: matchedSku || '-',
-        product_name: matchedItem?.product_name || '',
-      };
-    });
+        const matchedItem = matchedSku ? items.find(i => i.amazon_sku === matchedSku) : null;
+        return { ...p, msku: matchedSku || '-', product_name: matchedItem?.product_name || '' };
+      });
+    }
+
+    console.log(`[Inbound] 送信${sentSkuSet.size}件, プラン内${planSkuSet.size}件, 弾かれた${rejectedSkus.length}件`);
 
     res.json({
       success: result.status === 'SUCCESS',

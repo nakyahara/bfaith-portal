@@ -65,9 +65,23 @@ export async function createInboundPlan(sourceAddress, items, planName) {
   // ポーリング（最大3分）
   const result = await pollOperation(operationId);
 
-  // エラー詳細をログに出力（問題構造の確認用）
+  // エラー詳細をログに出力
   if (result.operationProblems && result.operationProblems.length > 0) {
     console.log('[Inbound] operationProblems:', JSON.stringify(result.operationProblems, null, 2));
+  }
+
+  // FAILEDの場合、プランのアイテム一覧を取得してエラーSKUを特定
+  let planItems = [];
+  if (result.operationStatus === 'FAILED' && inboundPlanId) {
+    try {
+      planItems = await listPlanItems(inboundPlanId);
+      console.log(`[Inbound] プランアイテム取得: ${planItems.length}件`);
+      if (planItems.length > 0) {
+        console.log('[Inbound] planItems[0]:', JSON.stringify(planItems[0], null, 2));
+      }
+    } catch (e) {
+      console.log('[Inbound] プランアイテム取得失敗（プランが存在しない可能性）:', e.message);
+    }
   }
 
   return {
@@ -75,7 +89,29 @@ export async function createInboundPlan(sourceAddress, items, planName) {
     operationId,
     status: result.operationStatus,
     problems: result.operationProblems || [],
+    planItems,
   };
+}
+
+/**
+ * プランのアイテム一覧を取得（エラー特定用）
+ */
+async function listPlanItems(inboundPlanId) {
+  const sp = getClient();
+  const allItems = [];
+  let nextToken = null;
+
+  do {
+    const params = nextToken ? `?pageToken=${encodeURIComponent(nextToken)}` : '';
+    const result = await sp.callAPI({
+      api_path: `/inbound/fba/2024-03-20/inboundPlans/${inboundPlanId}/items${params}`,
+      method: 'GET',
+    });
+    if (result.items) allItems.push(...result.items);
+    nextToken = result.pagination?.token || null;
+  } while (nextToken);
+
+  return allItems;
 }
 
 /**
