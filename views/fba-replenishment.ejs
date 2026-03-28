@@ -90,6 +90,15 @@
     .sortable-order::after { content: ' ⇅'; font-size: 10px; color: #999; }
     .sortable-order.asc::after { content: ' ▲'; color: #2563eb; }
     .sortable-order.desc::after { content: ' ▼'; color: #2563eb; }
+    .sortable-stockout { cursor: pointer; user-select: none; white-space: nowrap; }
+    .sortable-stockout:hover { background: #e5e7eb; }
+    .sortable-stockout::after { content: ' ⇅'; font-size: 10px; color: #999; }
+    .sortable-stockout.asc::after { content: ' ▲'; color: #2563eb; }
+    .sortable-stockout.desc::after { content: ' ▼'; color: #2563eb; }
+    .stockout-badge { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
+    .stockout-sendable { background: #fee2e2; color: #dc2626; }
+    .stockout-already { background: #fef3c7; color: #92400e; }
+    .stockout-nostock { background: #f3f4f6; color: #6b7280; }
     .step-badge { display: inline-block; background: #e5e7eb; color: #6b7280; font-size: 12px; font-weight: bold; padding: 4px 10px; border-radius: 12px; min-width: 56px; text-align: center; }
     .step-badge.active { background: #2563eb; color: white; }
     .step-badge.done { background: #16a34a; color: white; }
@@ -158,6 +167,7 @@
       <!-- タブ切り替え -->
       <div style="display:flex;gap:0;margin-bottom:0;">
         <button class="tab-btn active" id="tabShip" onclick="switchTab('ship')">納品推奨</button>
+        <button class="tab-btn" id="tabStockout" onclick="switchTab('stockout')">FBA欠品<span class="tab-count" id="stockoutTabCount" style="display:none;"></span></button>
         <button class="tab-btn" id="tabOrder" onclick="switchTab('order')">発注推奨（在庫0）<span class="tab-count" id="orderTabCount"></span></button>
       </div>
 
@@ -251,6 +261,66 @@
         </table>
       </div>
       </div><!-- /tabShipContent -->
+
+      <!-- === FBA欠品タブ === -->
+      <div id="tabStockoutContent" style="display:none;">
+        <div class="status-row" style="margin-bottom:8px;">
+          <div class="stat" style="border-left:4px solid #dc2626; background:#fee2e2;">
+            <div class="label">倉庫在庫あり（送り漏れ）</div>
+            <div class="value" id="stockoutSendableCount" style="color:#dc2626;font-size:20px;">-</div>
+          </div>
+          <div class="stat" style="border-left:4px solid #d97706; background:#fef3c7;">
+            <div class="label">納品推奨済み</div>
+            <div class="value" id="stockoutAlreadyCount" style="color:#d97706;font-size:20px;">-</div>
+          </div>
+          <div class="stat" style="border-left:4px solid #6b7280;">
+            <div class="label">在庫なし（仕入れ待ち）</div>
+            <div class="value" id="stockoutNoStockCount" style="color:#6b7280;font-size:20px;">-</div>
+          </div>
+          <div class="stat" style="border-left:4px solid #7c3aed; background:#f5f3ff;">
+            <div class="label">FBA欠品 合計</div>
+            <div class="value" id="stockoutTotalCount" style="color:#7c3aed;font-size:20px;">-</div>
+          </div>
+        </div>
+
+        <div style="margin-bottom:8px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+          <button class="btn btn-primary" onclick="addStockoutToShip()" style="background:#dc2626; padding:6px 14px; font-size:13px;">チェック済みを納品推奨に追加</button>
+          <span style="font-size:12px; color:#666;" id="stockoutActionMsg"></span>
+        </div>
+
+        <div style="margin-bottom:8px; display:flex; gap:16px; align-items:center; flex-wrap:wrap;">
+          <label style="font-weight:bold;"><input type="radio" name="stockoutFilter" value="sendable" checked onchange="filterStockoutList()"> 倉庫在庫ありのみ</label>
+          <label><input type="radio" name="stockoutFilter" value="all" onchange="filterStockoutList()"> 全て</label>
+          <input type="text" id="stockoutSearch" placeholder="商品名・SKU・NE商品コードで検索" oninput="filterStockoutList()" style="padding:5px 10px; border:1px solid #d1d5db; border-radius:4px; font-size:13px; width:280px;">
+          <span style="margin-left:auto;color:#666;font-size:12px;" id="stockoutFilterCount"></span>
+        </div>
+
+        <div class="table-wrap" style="max-height:calc(100vh - 280px);">
+          <table class="data-table" id="stockoutTable" style="table-layout:auto;">
+            <thead>
+              <tr>
+                <th style="width:30px;text-align:center;">✓</th>
+                <th style="width:30px;text-align:center;">#</th>
+                <th class="sortable-stockout" data-key="stockout_status">状態</th>
+                <th class="sortable-stockout" data-key="amazon_sku">SKU</th>
+                <th class="sortable-stockout" data-key="product_name">商品名</th>
+                <th class="sortable-stockout" data-key="fba_inbound_shipped" data-type="num">輸送中</th>
+                <th class="sortable-stockout" data-key="fba_inbound_working" data-type="num">準備中</th>
+                <th class="sortable-stockout" data-key="units_sold_7d" data-type="num">FBA7日</th>
+                <th class="sortable-stockout" data-key="units_sold_30d" data-type="num">FBA30日</th>
+                <th class="sortable-stockout" data-key="non_fba_sales_7d" data-type="num">他CH7日</th>
+                <th class="sortable-stockout" data-key="non_fba_sales_30d" data-type="num">他CH30日</th>
+                <th class="sortable-stockout" data-key="warehouse_raw" data-type="num">倉庫在庫</th>
+                <th class="sortable-stockout" data-key="warehouse_available" data-type="num">FBA用</th>
+                <th class="sortable-stockout" data-key="non_fba_reserve" data-type="num">他CH確保</th>
+                <th class="sortable-stockout" data-key="last_arrival_date">最終入荷日</th>
+                <th>アラート</th>
+              </tr>
+            </thead>
+            <tbody id="stockoutBody"></tbody>
+          </table>
+        </div>
+      </div><!-- /tabStockoutContent -->
 
       <!-- === 発注推奨タブ === -->
       <div id="tabOrderContent" style="display:none;">
@@ -522,6 +592,7 @@
         updateRecSummary();
         filterRecList();
         updateOrderList();
+        updateStockoutList();
       } catch (e) { log('エラー: ' + e.message); }
       finally {
         btn.disabled = false;
@@ -725,7 +796,8 @@
         const belowReorder = typeof r.effective_fba_stock === 'number' && typeof reorderVal === 'number' && r.effective_fba_stock < reorderVal;
         // ナンバリング
         let rowNum = '';
-        if (r._manual) { rowNum = '手動'; }
+        if (r._fromStockout) { rowNum = '欠品'; }
+        else if (r._manual) { rowNum = '手動'; }
         else if (r.urgency_score >= 80) { redNum++; rowNum = `🔴${redNum}`; }
         else if (r.urgency_score >= 40) { yellowNum++; rowNum = `🟡${yellowNum}`; }
         else { whiteNum++; rowNum = `${whiteNum}`; }
@@ -768,6 +840,17 @@
         document.querySelectorAll('th.sortable-rec').forEach(t => t.classList.remove('asc', 'desc'));
         th.classList.add(recSortDir);
         filterRecList();
+        return;
+      }
+      // FBA欠品テーブルのソート
+      const th4 = e.target.closest('th.sortable-stockout');
+      if (th4) {
+        const key = th4.dataset.key;
+        if (stockoutSortKey === key) stockoutSortDir = stockoutSortDir === 'asc' ? 'desc' : 'asc';
+        else { stockoutSortKey = key; stockoutSortDir = 'desc'; }
+        document.querySelectorAll('th.sortable-stockout').forEach(t => t.classList.remove('asc', 'desc'));
+        th4.classList.add(stockoutSortDir);
+        filterStockoutList();
         return;
       }
       // 発注推奨テーブルのソート
@@ -1110,8 +1193,10 @@ Step10: アラート判定</pre>
     // ===== タブ切り替え =====
     function switchTab(tab) {
       document.getElementById('tabShip').classList.toggle('active', tab === 'ship');
+      document.getElementById('tabStockout').classList.toggle('active', tab === 'stockout');
       document.getElementById('tabOrder').classList.toggle('active', tab === 'order');
       document.getElementById('tabShipContent').style.display = tab === 'ship' ? '' : 'none';
+      document.getElementById('tabStockoutContent').style.display = tab === 'stockout' ? '' : 'none';
       document.getElementById('tabOrderContent').style.display = tab === 'order' ? '' : 'none';
     }
 
@@ -1208,6 +1293,237 @@ Step10: アラート判定</pre>
           <td>${alertsHtml}</td>
         </tr>`;
       }).join('');
+    }
+
+    // ===== FBA欠品リスト =====
+    let stockoutData = [];
+    let stockoutSortKey = 'stockout_status';
+    let stockoutSortDir = 'asc';
+    const stockoutCheckedSkus = new Set();
+
+    function updateStockoutList() {
+      // FBA販売可能在庫 = 0 の全商品（SKUマッピングありのみ = recDataに含まれるもの）
+      stockoutData = recData.filter(r => r.fba_available === 0).map(r => {
+        // ステータス判定
+        let stockout_status, stockout_status_num;
+        if (r.recommended_qty > 0 || manualItems.find(m => m.amazon_sku === r.amazon_sku)) {
+          stockout_status = 'already'; // 納品推奨済み
+          stockout_status_num = 2;
+        } else if ((r.warehouse_raw || 0) > 0) {
+          stockout_status = 'sendable'; // 倉庫在庫あり → 送れる
+          stockout_status_num = 1;
+        } else {
+          stockout_status = 'nostock'; // 在庫なし
+          stockout_status_num = 3;
+        }
+        return { ...r, stockout_status, stockout_status_num };
+      });
+
+      // タブカウント更新
+      const countEl = document.getElementById('stockoutTabCount');
+      const sendableCount = stockoutData.filter(r => r.stockout_status === 'sendable').length;
+      if (stockoutData.length > 0) {
+        countEl.textContent = stockoutData.length;
+        countEl.style.display = '';
+      } else {
+        countEl.style.display = 'none';
+      }
+
+      // サマリー更新
+      document.getElementById('stockoutTotalCount').textContent = stockoutData.length + ' SKU';
+      document.getElementById('stockoutSendableCount').textContent = sendableCount + ' SKU';
+      document.getElementById('stockoutAlreadyCount').textContent = stockoutData.filter(r => r.stockout_status === 'already').length + ' SKU';
+      document.getElementById('stockoutNoStockCount').textContent = stockoutData.filter(r => r.stockout_status === 'nostock').length + ' SKU';
+
+      filterStockoutList();
+    }
+
+    function filterStockoutList() {
+      const mode = document.querySelector('input[name="stockoutFilter"]:checked')?.value || 'sendable';
+      const searchQuery = (document.getElementById('stockoutSearch')?.value || '').trim().toLowerCase();
+      let filtered = stockoutData;
+      if (mode === 'sendable') {
+        filtered = filtered.filter(r => r.stockout_status === 'sendable');
+      }
+      if (searchQuery) {
+        filtered = filtered.filter(r =>
+          (r.product_name || '').toLowerCase().includes(searchQuery) ||
+          (r.amazon_sku || '').toLowerCase().includes(searchQuery) ||
+          (r.ne_code || '').toLowerCase().includes(searchQuery)
+        );
+      }
+      renderStockoutList(filtered);
+      document.getElementById('stockoutFilterCount').textContent = `表示: ${filtered.length} 件`;
+    }
+
+    function renderStockoutList(data) {
+      const tbody = document.getElementById('stockoutBody');
+      if (!data.length) { tbody.innerHTML = '<tr><td colspan="16">該当なし</td></tr>'; return; }
+
+      // ソート
+      data.sort((a, b) => {
+        const th = document.querySelector(`th.sortable-stockout[data-key="${stockoutSortKey}"]`);
+        const isNum = th?.dataset.type === 'num' || stockoutSortKey === 'stockout_status';
+        let va, vb;
+        if (stockoutSortKey === 'stockout_status') {
+          va = a.stockout_status_num; vb = b.stockout_status_num;
+        } else if (isNum) {
+          va = parseFloat(a[stockoutSortKey]) || 0; vb = parseFloat(b[stockoutSortKey]) || 0;
+        } else {
+          va = String(a[stockoutSortKey] || ''); vb = String(b[stockoutSortKey] || '');
+        }
+        if (va < vb) return stockoutSortDir === 'asc' ? -1 : 1;
+        if (va > vb) return stockoutSortDir === 'asc' ? 1 : -1;
+        return 0;
+      });
+
+      let num = 0;
+      tbody.innerHTML = data.map(r => {
+        num++;
+        const isSendable = r.stockout_status === 'sendable';
+        const isAlready = r.stockout_status === 'already';
+        const isNostock = r.stockout_status === 'nostock';
+
+        // ステータスバッジ
+        let statusHtml;
+        if (isAlready) {
+          statusHtml = '<span class="stockout-badge stockout-already">納品推奨済み ✓</span>';
+        } else if (isSendable) {
+          statusHtml = '<span class="stockout-badge stockout-sendable">送り漏れ</span>';
+        } else {
+          statusHtml = '<span class="stockout-badge stockout-nostock">在庫なし</span>';
+        }
+
+        // チェックボックス
+        const checkDisabled = !isSendable;
+        const isChecked = stockoutCheckedSkus.has(r.amazon_sku);
+        const checkHtml = checkDisabled
+          ? `<input type="checkbox" disabled style="opacity:0.3;">`
+          : `<input type="checkbox" class="stockout-check" data-sku="${r.amazon_sku}" ${isChecked ? 'checked' : ''} onchange="onStockoutCheckChange(this)">`;
+
+        // 行の背景色
+        const rowBg = isSendable ? 'background:#fff5f5;' : isAlready ? 'background:#fffbeb;' : '';
+
+        // アラート
+        let alertsHtml = (r.alerts || []).map(a =>
+          `<span class="alert-badge alert-${a.level}" title="${a.message}">${a.level >= 2 ? '⚠' : 'ℹ'} ${a.message.slice(0,15)}</span>`
+        ).join('');
+
+        // 輸送中/準備中があれば補足
+        const inTransit = (r.fba_inbound_shipped || 0) + (r.fba_inbound_working || 0);
+        if (inTransit > 0 && !isAlready) {
+          alertsHtml += `<span class="alert-badge alert-1">輸送/準備中 ${inTransit}個</span>`;
+        }
+
+        return `<tr style="${rowBg}">
+          <td style="text-align:center;">${checkHtml}</td>
+          <td style="text-align:center;color:#666;font-size:11px;">${num}</td>
+          <td>${statusHtml}</td>
+          <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')">${r.amazon_sku}</span></td>
+          <td class="product-name" title="${r.product_name || ''}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${r.product_name || ''}</a>` : (r.product_name || '')}</td>
+          <td>${r.fba_inbound_shipped || 0}</td>
+          <td>${r.fba_inbound_working || 0}</td>
+          <td>${r.units_sold_7d}</td>
+          <td>${r.units_sold_30d}</td>
+          <td>${r.non_fba_sales_7d || 0}</td>
+          <td style="${(r.non_fba_sales_30d || 0) > 0 ? 'font-weight:bold;color:#7c3aed' : ''}">${r.non_fba_sales_30d || 0}</td>
+          <td>${r.warehouse_raw || 0}</td>
+          <td style="color:#2563eb;font-weight:bold">${r.warehouse_available}</td>
+          <td style="${(r.non_fba_reserve || 0) > 0 ? 'font-weight:bold;color:#dc2626' : 'color:#999'}">${r.non_fba_reserve || 0}</td>
+          <td style="font-size:11px;">${r.last_arrival_date || '-'}</td>
+          <td>${alertsHtml}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    function onStockoutCheckChange(cb) {
+      if (cb.checked) {
+        stockoutCheckedSkus.add(cb.dataset.sku);
+      } else {
+        stockoutCheckedSkus.delete(cb.dataset.sku);
+      }
+    }
+
+    function addStockoutToShip() {
+      const msgEl = document.getElementById('stockoutActionMsg');
+      if (stockoutCheckedSkus.size === 0) {
+        msgEl.textContent = 'チェックされた商品がありません';
+        msgEl.style.color = '#d97706';
+        return;
+      }
+
+      let addedCount = 0;
+      let alreadyCount = 0;
+      for (const sku of stockoutCheckedSkus) {
+        // 既に納品推奨にあるか確認
+        const existing = recData.find(r => r.amazon_sku === sku);
+        const existsInManual = manualItems.find(m => m.amazon_sku === sku);
+
+        if (existing && existing.recommended_qty > 0) {
+          alreadyCount++;
+          continue;
+        }
+        if (existsInManual) {
+          alreadyCount++;
+          continue;
+        }
+
+        if (existing) {
+          // recDataに存在するが推奨数0 → 推奨数0のまま手動追加扱いにする
+          existing.recommended_qty = 0;
+          existing.adjusted_qty = 0;
+          existing._manual = true;
+          existing._fromStockout = true;
+          addedCount++;
+        } else {
+          // recDataにない場合（通常はありえないが念のため）
+          const item = {
+            amazon_sku: sku,
+            asin: '',
+            product_name: '(FBA欠品から追加)',
+            fba_available: 0,
+            effective_fba_stock: 0,
+            days_of_supply: 0,
+            reorder_point: '-',
+            raw_needed: '-',
+            target_days: '-',
+            units_sold_7d: 0,
+            units_sold_30d: 0,
+            non_fba_sales_7d: 0,
+            non_fba_sales_30d: 0,
+            warehouse_raw: 0,
+            warehouse_available: 0,
+            recommended_qty: 0,
+            adjusted_qty: 0,
+            urgency_score: 0,
+            alerts: [],
+            _manual: true,
+            _fromStockout: true,
+          };
+          manualItems.push(item);
+          addedCount++;
+        }
+      }
+
+      // チェックをクリア
+      stockoutCheckedSkus.clear();
+
+      // メッセージ
+      let msg = '';
+      if (addedCount > 0) msg += `${addedCount}件を納品推奨に追加しました（数量0 → 手動入力してください）`;
+      if (alreadyCount > 0) msg += `${alreadyCount > 0 && addedCount > 0 ? '、' : ''}${alreadyCount}件は既に納品推奨済みです`;
+      msgEl.textContent = msg;
+      msgEl.style.color = addedCount > 0 ? '#16a34a' : '#d97706';
+
+      // リスト更新
+      updateRecSummary();
+      filterRecList();
+      updateStockoutList(); // ステータス再計算
+
+      // 追加があれば納品推奨タブに切り替え
+      if (addedCount > 0) {
+        setTimeout(() => switchTab('ship'), 500);
+      }
     }
 
     // ===== ステップ制御 =====
