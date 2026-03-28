@@ -468,29 +468,63 @@ router.post('/api/create-inbound-plan', express.json(), async (req, res) => {
       });
     }
 
-    // 方式C: まだSKU不明なら、二分探索でエラーSKUを特定
+    // 方式C: まだSKU不明なら、Eligibility APIで各アイテムを個別チェック（二分探索より高速）
     const hasUnknownSku = enrichedProblems.some(p => p.msku === '-');
     if (hasUnknownSku && result.status === 'FAILED') {
-      console.log('[Inbound] SKU不明エラーあり → 高速二分探索でエラーSKU特定...');
+      console.log('[Inbound] SKU不明エラーあり → Eligibility APIで個別チェック...');
       try {
-        const apiItems = buildApiItems(items, prepOverrides);
-        const errorMskus = await findErrorSkusByBinarySearch(sourceAddress, apiItems);
-        console.log(`[Inbound] 二分探索結果: ${errorMskus.length}件 → ${errorMskus.join(', ')}`);
+        const mappings = getSkuMappings();
+        const mappingMap = {};
+        for (const m of mappings) mappingMap[m.amazon_sku] = m;
 
-        if (errorMskus.length > 0) {
-          const originalError = enrichedProblems[0] || {};
-          enrichedProblems = errorMskus.map(msku => {
-            const item = items.find(i => i.amazon_sku === msku);
+        const checkItems = items.map(i => ({
+          asin: mappingMap[i.amazon_sku]?.asin || i.asin || '',
+          msku: i.amazon_sku,
+        })).filter(i => i.asin);
+
+        const ineligible = await checkInboundEligibility(checkItems);
+        console.log(`[Inbound] Eligibility結果: ${ineligible.length}件が不適格`);
+
+        if (ineligible.length > 0) {
+          enrichedProblems = ineligible.map(ie => {
+            const item = items.find(i => i.amazon_sku === ie.msku);
+            const originalError = (result.problems || [])[0] || {};
             return {
-              msku,
+              msku: ie.msku,
               product_name: item?.product_name || '',
-              code: originalError.code || 'UNKNOWN',
-              message: originalError.message || 'プラン作成エラー',
+              code: originalError.code || ie.reasons?.[0]?.code || 'INELIGIBLE',
+              message: originalError.message || ie.reasons?.map(r => r.message || r.code).join(', ') || '受入不可',
             };
           });
         }
-      } catch (searchErr) {
-        console.error('[Inbound] 二分探索失敗:', searchErr.message);
+      } catch (eligErr) {
+        console.error('[Inbound] Eligibilityチェック失敗:', eligErr.message);
+
+        // 最終手段: 二分探索（タイムアウト付き）
+        console.log('[Inbound] 二分探索にフォールバック...');
+        try {
+          const apiItems = buildApiItems(items, prepOverrides);
+          const searchPromise = findErrorSkusByBinarySearch(sourceAddress, apiItems);
+          const timeoutPromise = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('二分探索タイムアウト（60秒）')), 60000));
+          const errorMskus = await Promise.race([searchPromise, timeoutPromise]);
+          console.log(`[Inbound] 二分探索結果: ${errorMskus.length}件 → ${errorMskus.join(', ')}`);
+
+          if (errorMskus.length > 0) {
+            const originalError = enrichedProblems[0] || {};
+            enrichedProblems = errorMskus.map(msku => {
+              const item = items.find(i => i.amazon_sku === msku);
+              return {
+                msku,
+                product_name: item?.product_name || '',
+                code: originalError.code || 'UNKNOWN',
+                message: originalError.message || 'プラン作成エラー',
+              };
+            });
+          }
+        } catch (searchErr) {
+          console.error('[Inbound] 二分探索も失敗:', searchErr.message);
+        }
       }
     }
 
