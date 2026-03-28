@@ -115,6 +115,40 @@ async function listPlanItems(inboundPlanId) {
 }
 
 /**
+ * FBA Inbound Eligibility APIでASINの受入可否をチェック
+ * @param {Array} asins - [{asin, msku}]
+ * @returns {Array} 不適格アイテム [{asin, msku, reasons}]
+ */
+export async function checkInboundEligibility(items) {
+  const sp = getClient();
+  const marketplaceId = process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
+  const ineligible = [];
+
+  for (const item of items) {
+    if (!item.asin) continue;
+    try {
+      const result = await sp.callAPI({
+        api_path: `/fba/inbound/v1/eligibility/itemPreview?asin=${item.asin}&program=INBOUND&marketplaceIds=${marketplaceId}`,
+        method: 'GET',
+      });
+      if (result.isEligibleForProgram === false) {
+        ineligible.push({
+          asin: item.asin,
+          msku: item.msku,
+          reasons: result.ineligibilityReasonList || [],
+        });
+      }
+      // API制限回避
+      await sleep(200);
+    } catch (e) {
+      console.log(`[Eligibility] ${item.asin} チェック失敗: ${e.message}`);
+    }
+  }
+
+  return ineligible;
+}
+
+/**
  * オペレーションステータスをポーリング
  */
 async function pollOperation(operationId) {

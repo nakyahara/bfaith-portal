@@ -2212,6 +2212,7 @@ Step10: アラート判定</pre>
           amazon_sku: sku,
           ship_qty: qty,
           product_name: item?.product_name || sku,
+          asin: item?.asin || '',
           expiry_date: item?.expiry_date || '',
         });
       });

@@ -14,7 +14,7 @@ import { initDb, savePlanningData, getLatestSnapshots, getSettings, updateSettin
 import { fetchAllReports, normalizePlanningRow } from './sp-api-reports.js';
 import { syncSkuMappings } from './sheets-sync.js';
 import { generateRecommendations } from './calculation-engine.js';
-import { createInboundPlan } from './inbound-plans.js';
+import { createInboundPlan, checkInboundEligibility } from './inbound-plans.js';
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -442,6 +442,36 @@ router.post('/api/create-inbound-plan', express.json(), async (req, res) => {
     }
 
     console.log(`[Inbound] 送信${sentSkuSet.size}件, プラン内${planSkuSet.size}件, 弾かれた${rejectedSkus.length}件`);
+
+    // SKU不明のエラーが残っている場合、Eligibility APIでチェック
+    const hasUnknownSku = enrichedProblems.some(p => p.msku === '-');
+    if (hasUnknownSku && result.status === 'FAILED') {
+      console.log('[Inbound] SKU不明エラーあり → Eligibility APIで全アイテムチェック...');
+      try {
+        const eligibilityItems = items
+          .filter(i => i.asin)
+          .map(i => ({ asin: i.asin, msku: i.amazon_sku }));
+        const ineligible = await checkInboundEligibility(eligibilityItems);
+        console.log(`[Inbound] Eligibility結果: ${ineligible.length}件が不適格`);
+
+        if (ineligible.length > 0) {
+          // Eligibility結果でproblemsを上書き
+          enrichedProblems = ineligible.map(ie => {
+            const item = items.find(i => i.amazon_sku === ie.msku);
+            const reasonCodes = ie.reasons.map(r => r.code || r).join(', ');
+            const reasonMsgs = ie.reasons.map(r => r.message || r.code || r).join('; ');
+            return {
+              msku: ie.msku,
+              product_name: item?.product_name || '',
+              code: reasonCodes || 'INELIGIBLE',
+              message: reasonMsgs || 'FBA受入不可',
+            };
+          });
+        }
+      } catch (eligErr) {
+        console.error('[Inbound] Eligibilityチェック失敗:', eligErr.message);
+      }
+    }
 
     res.json({
       success: result.status === 'SUCCESS',
