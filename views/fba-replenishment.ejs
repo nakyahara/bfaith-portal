@@ -185,6 +185,11 @@
         <button class="btn btn-primary" id="btnCalc" onclick="calcRecommendations()" style="background:#16a34a;">推奨リスト生成</button>
         <span class="step-status" id="stepStatus4"></span>
       </div>
+      <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:8px;">
+        <span class="step-badge" style="background:#d97706;">任意</span>
+        <button class="btn btn-secondary" onclick="runEligibilityCheck()" style="border-color:#d97706;color:#d97706;">🔍 FBA受入適格性チェック</button>
+        <span class="step-status" id="eligibilityStatus" style="font-size:11px;color:#666;"></span>
+      </div>
     </div>
     </details>
 
@@ -560,6 +565,20 @@
         document.getElementById('warehouseCount').textContent = d.warehouseProducts ? `${d.warehouseProducts}商品` : '-';
         document.getElementById('fetchStatus').textContent = d.fetchInProgress ? '取得中...' : '待機中';
         if (d.snapshotCount > 0) loadSnapshots();
+        // 適格性チェック状況も取得
+        try {
+          const eligRes = await fetch(`${BASE}/api/eligibility/status`);
+          const elig = await eligRes.json();
+          const el = document.getElementById('eligibilityStatus');
+          if (el) {
+            if (elig.total > 0) {
+              el.textContent = `チェック済: ${elig.total}件（NG: ${elig.ineligible}件）${elig.checkInProgress ? ' 🔄実行中...' : ''}`;
+              if (elig.ineligible > 0) el.style.color = '#dc2626';
+            } else {
+              el.textContent = '未実行';
+            }
+          }
+        } catch {}
       } catch (e) { log('ステータス取得エラー: ' + e.message); }
     }
 
@@ -2256,7 +2275,11 @@ Step10: アラート判定</pre>
           return;
         }
 
-        if (d.success) {
+        if (d.status === 'BLOCKED_BY_ELIGIBILITY') {
+          // 事前チェックでNG商品検出
+          showInboundModal('eligibility_blocked', d);
+          log(`NG商品検出: ${d.ineligibleItems.length}件 → 除外して再実行してください`);
+        } else if (d.success) {
           showInboundModal('success', d);
           log(`納品プラン作成成功: プランID ${d.inboundPlanId}`);
           // 成功したSKUにフラグを立てる
@@ -2303,6 +2326,39 @@ Step10: アラート判定</pre>
       await createInboundPlanAction();
     }
 
+    // NG商品を除外して再作成
+    async function removeNgAndRetry(ngSkus) {
+      const ngSet = new Set(ngSkus);
+      document.querySelectorAll('.rec-check:checked').forEach(cb => {
+        if (ngSet.has(cb.dataset.sku)) {
+          cb.checked = false;
+          selectedSkus.delete(cb.dataset.sku);
+        }
+      });
+      updateSelectedCount();
+      closeInboundModal();
+      await createInboundPlanAction();
+    }
+
+    // 適格性チェック実行
+    async function runEligibilityCheck() {
+      log('適格性チェック開始...');
+      try {
+        const res = await fetch(`${BASE}/api/eligibility/check-all`, { method: 'POST' });
+        const d = await res.json();
+        if (d.error) {
+          log('適格性チェックエラー: ' + d.error);
+          alert(d.error);
+        } else {
+          log(`適格性チェック: ${d.message}`);
+          alert(`${d.message}\n\n完了まで約${Math.ceil(d.estimatedSeconds / 60)}分かかります。\n完了後、次回の納品プラン作成時にNG商品が自動除外されます。`);
+        }
+      } catch (e) {
+        log('適格性チェックエラー: ' + e.message);
+        alert('適格性チェック開始に失敗しました: ' + e.message);
+      }
+    }
+
     // FBA_INBエラーコードの日本語翻訳
     const FBA_ERROR_JP = {
       'FBA_INB_0004': '危険物（Hazmat）として規制されている商品',
@@ -2338,6 +2394,37 @@ Step10: アラート判定</pre>
           <div class="debug-modal" style="max-width:500px;">
             <h3 style="margin:0 0 16px;">📦 納品プラン作成中...</h3>
             <p><span class="spinner" style="border-color:#2563eb;border-top-color:transparent;width:20px;height:20px;"></span> ${data.totalItems} SKUを処理中（最大3分かかります）</p>
+          </div>`;
+      } else if (type === 'eligibility_blocked') {
+        const ngItems = data.ineligibleItems || [];
+        const ngHtml = ngItems.map(item => {
+          const reasons = (item.reasons || []).map(r => r.message || r.code || '不明').join(', ');
+          return `<tr>
+            <td style="padding:4px 8px;border:1px solid #e5e7eb;font-size:11px;">${item.msku}</td>
+            <td style="padding:4px 8px;border:1px solid #e5e7eb;font-size:11px;">${item.product_name || '-'}</td>
+            <td style="padding:4px 8px;border:1px solid #e5e7eb;font-size:12px;">${translateError('', reasons) || reasons || '受入不可'}</td>
+          </tr>`;
+        }).join('');
+
+        html = `
+          <div class="debug-overlay" onclick="closeInboundModal()"></div>
+          <div class="debug-modal" style="max-width:700px;">
+            <span class="debug-close" onclick="closeInboundModal()">&times;</span>
+            <h3 style="margin:0 0 16px;color:#d97706;">⚠ NG商品が含まれています</h3>
+            <div style="background:#fef3c7;padding:12px;border-radius:6px;margin-bottom:16px;">
+              <div>${ngItems.length}件のNG商品が適格性チェックで検出されました。</div>
+              <div>これらを除外してから納品プランを作成してください。</div>
+            </div>
+            <div style="max-height:200px;overflow-y:auto;">
+              <table style="width:100%;border-collapse:collapse;">
+                <tr style="background:#f3f4f6;"><th style="padding:4px 8px;border:1px solid #e5e7eb;font-size:11px;">SKU</th><th style="padding:4px 8px;border:1px solid #e5e7eb;font-size:11px;">商品名</th><th style="padding:4px 8px;border:1px solid #e5e7eb;font-size:11px;">理由</th></tr>
+                ${ngHtml}
+              </table>
+            </div>
+            <div style="display:flex;gap:8px;margin-top:16px;">
+              <button class="btn btn-primary" onclick="removeNgAndRetry(${JSON.stringify(ngItems.map(i => i.msku))})" style="background:#dc2626;">NG商品を除外して再作成（${data.eligibleCount} SKU）</button>
+              <button class="btn btn-secondary" onclick="closeInboundModal()">閉じる</button>
+            </div>
           </div>`;
       } else if (type === 'success') {
         const corrections = data.prepCorrections || [];
@@ -2397,21 +2484,19 @@ Step10: アラート判定</pre>
           </tr>`;
         }).join('');
 
-        // SKUが不明なエラーがある場合、全送信アイテムを参考表示
-        const hasUnknownSku = problems.some(p => (p.msku || p.sku || '-') === '-');
-        const submittedItems = data.submittedItems || [];
-        let submittedHtml = '';
-        if (hasUnknownSku && submittedItems.length > 0) {
-          submittedHtml = `
-            <details style="margin-top:12px;">
-              <summary style="cursor:pointer;font-size:12px;color:#666;">送信した全商品リスト（${submittedItems.length}件）を表示</summary>
-              <div style="max-height:150px;overflow-y:auto;margin-top:4px;">
-                <table style="width:100%;border-collapse:collapse;">
-                  <tr style="background:#f3f4f6;"><th style="padding:3px 6px;border:1px solid #e5e7eb;font-size:11px;">SKU</th><th style="padding:3px 6px;border:1px solid #e5e7eb;font-size:11px;">商品名</th><th style="padding:3px 6px;border:1px solid #e5e7eb;font-size:11px;">数量</th></tr>
-                  ${submittedItems.map(i => `<tr><td style="padding:3px 6px;border:1px solid #e5e7eb;font-size:10px;">${i.amazon_sku}</td><td style="padding:3px 6px;border:1px solid #e5e7eb;font-size:10px;">${i.product_name}</td><td style="padding:3px 6px;border:1px solid #e5e7eb;font-size:10px;">${i.ship_qty}</td></tr>`).join('')}
-                </table>
+        // SKUが不明なエラーがある場合
+        const hasUnknownSku = data.hasUnknownSku || problems.some(p => (p.msku || p.sku || '-') === '-');
+        let unknownSkuHtml = '';
+        if (hasUnknownSku) {
+          unknownSkuHtml = `
+            <div style="background:#fef3c7;padding:10px;border-radius:6px;margin-top:12px;font-size:12px;">
+              <strong>⚠ エラーの原因SKUを特定できませんでした</strong><br>
+              Amazon APIの制限により、どの商品がエラーの原因か特定できません。<br>
+              「適格性チェック」を実行すると、NG商品を事前に検出できます。
+              <div style="margin-top:8px;">
+                <button class="btn btn-primary" onclick="closeInboundModal(); runEligibilityCheck();" style="background:#d97706; padding:6px 14px; font-size:12px;">🔍 適格性チェックを実行</button>
               </div>
-            </details>`;
+            </div>`;
         }
 
         html = `
@@ -2432,7 +2517,7 @@ Step10: アラート判定</pre>
                   ${problemsHtml}
                 </table>
               </div>
-              ${submittedHtml}
+              ${unknownSkuHtml}
             ` : '<p style="color:#666;">エラー詳細が返されませんでした。</p>'}
             <div style="display:flex;gap:8px;margin-top:16px;">
               ${errorSkus.length > 0 && successCount > 0 ? `<button class="btn btn-primary" onclick="retryWithoutErrors(${JSON.stringify(errorSkus)})" style="background:#dc2626;">エラーを除いて再作成（${successCount} SKU）</button>` : ''}

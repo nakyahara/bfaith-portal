@@ -286,6 +286,18 @@ export async function initDb() {
     )
   `);
 
+  // --- 12. inbound_eligibility: FBA受入適格性キャッシュ ---
+  db.run(`
+    CREATE TABLE IF NOT EXISTS inbound_eligibility (
+      asin TEXT PRIMARY KEY,
+      amazon_sku TEXT,
+      product_name TEXT DEFAULT '',
+      is_eligible INTEGER DEFAULT 1,
+      reasons TEXT DEFAULT '[]',
+      checked_at TEXT DEFAULT (datetime('now','localtime'))
+    )
+  `);
+
   // デフォルト設定を投入
   const defaults = [
     // 目標日数（推奨に上がった時に何日分送るか）
@@ -825,4 +837,54 @@ export function clearDraft() {
   db.run('DELETE FROM shipment_draft');
   db.run('DELETE FROM shipment_draft_meta');
   saveToFile();
+}
+
+// ===== FBA受入適格性キャッシュ =====
+
+export function upsertEligibility(asin, amazonSku, productName, isEligible, reasons) {
+  db.run(`
+    INSERT INTO inbound_eligibility (asin, amazon_sku, product_name, is_eligible, reasons, checked_at)
+    VALUES (?, ?, ?, ?, ?, datetime('now','localtime'))
+    ON CONFLICT(asin) DO UPDATE SET
+      amazon_sku = excluded.amazon_sku,
+      product_name = excluded.product_name,
+      is_eligible = excluded.is_eligible,
+      reasons = excluded.reasons,
+      checked_at = excluded.checked_at
+  `, [asin, amazonSku, productName, isEligible ? 1 : 0, JSON.stringify(reasons)]);
+}
+
+export function saveEligibilityBatch(items) {
+  db.run('BEGIN TRANSACTION');
+  try {
+    for (const item of items) {
+      upsertEligibility(item.asin, item.amazon_sku, item.product_name, item.is_eligible, item.reasons);
+    }
+    db.run('COMMIT');
+    saveToFile();
+  } catch (e) {
+    db.run('ROLLBACK');
+    throw e;
+  }
+}
+
+export function getIneligibleSkus() {
+  return queryAll('SELECT * FROM inbound_eligibility WHERE is_eligible = 0');
+}
+
+export function getEligibilityBySkus(skus) {
+  if (!skus.length) return [];
+  const placeholders = skus.map(() => '?').join(',');
+  return queryAll(`SELECT * FROM inbound_eligibility WHERE amazon_sku IN (${placeholders})`, skus);
+}
+
+export function getEligibilityStatus() {
+  const total = queryOne('SELECT COUNT(*) as cnt FROM inbound_eligibility');
+  const ineligible = queryOne('SELECT COUNT(*) as cnt FROM inbound_eligibility WHERE is_eligible = 0');
+  const oldest = queryOne('SELECT MIN(checked_at) as oldest FROM inbound_eligibility');
+  return {
+    total: total?.cnt || 0,
+    ineligible: ineligible?.cnt || 0,
+    oldestCheck: oldest?.oldest || null,
+  };
 }
