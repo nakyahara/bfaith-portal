@@ -308,20 +308,59 @@ router.post('/api/create-inbound-plan', express.json(), async (req, res) => {
     return null; // フォーマット不明は除外
   }
 
-  const apiItems = items.map(i => {
-    const exp = formatExpiration(i.expiry_date);
-    return {
-      msku: i.amazon_sku,
-      quantity: i.ship_qty,
-      labelOwner,
-      prepOwner,
-      ...(exp ? { expiration: exp } : {}),
-    };
-  });
+  // prepOwnerの自動判定:
+  // まずNONEで試す → "requires prepOwner"エラーのSKUはSELLERに変えてリトライ
+  // まずSELLERで試す → "does not require prepOwner"エラーのSKUはNONEに変えてリトライ
+  // → 両方混在するので、エラーメッセージからSKUごとに判定して1回のリトライで解決する
+
+  function buildApiItems(itemList, prepOverrides = {}) {
+    return itemList.map(i => {
+      const exp = formatExpiration(i.expiry_date);
+      const skuPrepOwner = prepOverrides[i.amazon_sku] || prepOwner;
+      return {
+        msku: i.amazon_sku,
+        quantity: i.ship_qty,
+        labelOwner,
+        prepOwner: skuPrepOwner,
+        ...(exp ? { expiration: exp } : {}),
+      };
+    });
+  }
+
+  // prepOwnerエラーを解析してSKUごとの正しい値を返す
+  function parsePrepErrors(errorMessage) {
+    const overrides = {};
+    // "SKU requires prepOwner but NONE was assigned" → SELLER
+    const requiresPattern = /(\S+)\s+requires prepOwner but NONE was assigned/g;
+    let match;
+    while ((match = requiresPattern.exec(errorMessage)) !== null) {
+      overrides[match[1]] = 'SELLER';
+    }
+    // "SKU does not require prepOwner but SELLER was assigned" → NONE
+    const notRequiresPattern = /(\S+)\s+does not require prepOwner but SELLER was assigned/g;
+    while ((match = notRequiresPattern.exec(errorMessage)) !== null) {
+      overrides[match[1]] = 'NONE';
+    }
+    return overrides;
+  }
 
   inboundPlanInProgress = true;
   try {
-    const result = await createInboundPlan(sourceAddress, apiItems, planName);
+    const apiItems = buildApiItems(items);
+    let result = await createInboundPlan(sourceAddress, apiItems, planName);
+
+    // prepOwnerエラーがあれば自動リトライ
+    if (result.status === 'FAILED' || (result.problems && result.problems.length > 0)) {
+      const errorMsg = result.problems.map(p => p.message || '').join(' ');
+      const prepOverrides = parsePrepErrors(errorMsg);
+
+      if (Object.keys(prepOverrides).length > 0) {
+        console.log(`[Inbound] prepOwnerエラー検出、${Object.keys(prepOverrides).length}件を修正してリトライ...`);
+        const retryItems = buildApiItems(items, prepOverrides);
+        result = await createInboundPlan(sourceAddress, retryItems, planName);
+      }
+    }
+
     res.json({
       success: result.status === 'SUCCESS',
       inboundPlanId: result.inboundPlanId,
@@ -333,6 +372,35 @@ router.post('/api/create-inbound-plan', express.json(), async (req, res) => {
       errorItems: result.problems.length,
     });
   } catch (e) {
+    // catchでもprepOwnerエラーを検出（API例外として飛んでくる場合）
+    const errorMsg = e.message || '';
+    const prepOverrides = parsePrepErrors(errorMsg);
+
+    if (Object.keys(prepOverrides).length > 0) {
+      try {
+        console.log(`[Inbound] 例外からprepOwnerエラー検出、${Object.keys(prepOverrides).length}件を修正してリトライ...`);
+        const retryItems = buildApiItems(items, prepOverrides);
+        const result = await createInboundPlan(sourceAddress, retryItems, planName);
+        res.json({
+          success: result.status === 'SUCCESS',
+          inboundPlanId: result.inboundPlanId,
+          operationId: result.operationId,
+          status: result.status,
+          problems: result.problems,
+          totalItems: items.length,
+          successItems: result.status === 'SUCCESS' ? items.length : 0,
+          errorItems: result.problems.length,
+          retried: true,
+          prepOverrides,
+        });
+        return;
+      } catch (retryErr) {
+        console.error('[Inbound] リトライも失敗:', retryErr);
+        res.status(500).json({ error: retryErr.message });
+        return;
+      }
+    }
+
     console.error('[Inbound] プラン作成エラー:', e);
     res.status(500).json({ error: e.message });
   } finally {
