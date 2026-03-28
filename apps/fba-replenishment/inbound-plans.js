@@ -32,7 +32,7 @@ function sleep(ms) {
  * @param {string} planName - プラン名（省略可）
  * @returns {Object} { inboundPlanId, operationId, status, problems }
  */
-export async function createInboundPlan(sourceAddress, items, planName) {
+export async function createInboundPlan(sourceAddress, items, planName, pollOpts = {}) {
   const sp = getClient();
   const marketplaceId = process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
 
@@ -62,8 +62,8 @@ export async function createInboundPlan(sourceAddress, items, planName) {
   const operationId = createResult.operationId;
   console.log(`[Inbound] プランID: ${inboundPlanId}, オペレーションID: ${operationId}`);
 
-  // ポーリング（最大3分）
-  const result = await pollOperation(operationId);
+  // ポーリング
+  const result = await pollOperation(operationId, pollOpts);
 
   // エラー詳細をログに出力
   if (result.operationProblems && result.operationProblems.length > 0) {
@@ -123,47 +123,52 @@ async function listPlanItems(inboundPlanId) {
  * 二分探索でエラーを起こすSKUを特定
  * アイテムを半分に分けてプラン作成 → 失敗した方をさらに分割 → 1件に絞り込む
  * @param {Object} sourceAddress
- * @param {Array} items - APIに送るアイテム配列 [{msku, quantity, labelOwner, prepOwner, ...}]
- * @returns {Array} エラーSKUのリスト
+/**
+ * 高速二分探索でエラーSKUを特定
+ * ポーリング: 3秒間隔、最大15回（45秒）、ログ抑制
+ * 両半分を並列実行して高速化
  */
-export async function findErrorSkusByBinarySearch(sourceAddress, items) {
-  console.log(`[BinarySearch] ${items.length}件から問題SKUを探索開始`);
+const FAST_POLL = { interval: 3000, maxAttempts: 15, silent: true };
+
+export async function findErrorSkusByBinarySearch(sourceAddress, items, depth = 0) {
+  if (depth === 0) console.log(`[BinarySearch] ${items.length}件から問題SKU探索開始`);
 
   if (items.length <= 1) {
     return items.map(i => i.msku);
   }
 
+  // バッチが小さくなったら1件ずつテスト（再帰しない）
+  if (items.length <= 3) {
+    const errorSkus = [];
+    for (const item of items) {
+      try {
+        const r = await createInboundPlan(sourceAddress, [item], `探索-単品`, FAST_POLL);
+        if (r.status === 'FAILED') errorSkus.push(item.msku);
+      } catch {
+        errorSkus.push(item.msku);
+      }
+    }
+    return errorSkus;
+  }
+
   const mid = Math.ceil(items.length / 2);
-  const firstHalf = items.slice(0, mid);
-  const secondHalf = items.slice(mid);
+  const halves = [items.slice(0, mid), items.slice(mid)];
+
+  // 両半分を並列実行
+  const results = await Promise.allSettled(
+    halves.map(batch => createInboundPlan(sourceAddress, batch, `探索-${batch.length}件`, FAST_POLL))
+  );
 
   const errorSkus = [];
+  for (let i = 0; i < 2; i++) {
+    const batch = halves[i];
+    const r = results[i];
+    const failed = r.status === 'rejected' || r.value?.status === 'FAILED';
 
-  for (const [label, batch] of [['前半', firstHalf], ['後半', secondHalf]]) {
-    try {
-      console.log(`[BinarySearch] ${label} ${batch.length}件を試行...`);
-      const result = await createInboundPlan(sourceAddress, batch, `探索-${label}`);
-
-      if (result.status === 'FAILED') {
-        console.log(`[BinarySearch] ${label} → FAILED、さらに分割`);
-        if (batch.length <= 1) {
-          errorSkus.push(batch[0].msku);
-        } else {
-          const found = await findErrorSkusByBinarySearch(sourceAddress, batch);
-          errorSkus.push(...found);
-        }
-      } else {
-        console.log(`[BinarySearch] ${label} → SUCCESS（問題なし）`);
-      }
-    } catch (e) {
-      // 例外（バリデーションエラー等）→ このバッチに問題がある
-      console.log(`[BinarySearch] ${label} → 例外: ${e.message}`);
-      if (batch.length <= 1) {
-        errorSkus.push(batch[0].msku);
-      } else {
-        const found = await findErrorSkusByBinarySearch(sourceAddress, batch);
-        errorSkus.push(...found);
-      }
+    if (failed) {
+      console.log(`[BinarySearch] ${batch.length}件バッチ → FAILED（depth=${depth}）`);
+      const found = await findErrorSkusByBinarySearch(sourceAddress, batch, depth + 1);
+      errorSkus.push(...found);
     }
   }
 
@@ -217,20 +222,25 @@ export async function checkInboundEligibility(items) {
 
 /**
  * オペレーションステータスをポーリング
+ * @param {string} operationId
+ * @param {Object} opts - { interval: ms, maxAttempts: number, silent: boolean }
  */
-async function pollOperation(operationId) {
+async function pollOperation(operationId, opts = {}) {
   const sp = getClient();
+  const interval = opts.interval || 5000;
+  const maxAttempts = opts.maxAttempts || 36;
+  const silent = opts.silent || false;
 
-  for (let i = 0; i < 36; i++) {
-    await sleep(5000);
+  for (let i = 0; i < maxAttempts; i++) {
+    await sleep(interval);
     const status = await sp.callAPI({
       api_path: `/inbound/fba/2024-03-20/operations/${operationId}`,
       method: 'GET',
     });
-    console.log(`[Inbound] ポーリング ${i + 1}: ${status.operationStatus}`);
+    if (!silent) console.log(`[Inbound] ポーリング ${i + 1}: ${status.operationStatus}`);
     if (['SUCCESS', 'FAILED'].includes(status.operationStatus)) {
       return status;
     }
   }
-  throw new Error('オペレーションがタイムアウトしました（3分超）');
+  throw new Error(`ポーリングタイムアウト（${maxAttempts}回×${interval}ms）`);
 }
