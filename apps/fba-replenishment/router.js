@@ -16,6 +16,7 @@ import { fetchAllReports, normalizePlanningRow } from './sp-api-reports.js';
 import { syncSkuMappings } from './sheets-sync.js';
 import { generateRecommendations } from './calculation-engine.js';
 import { createInboundPlan, checkInboundEligibility } from './inbound-plans.js';
+// checkInboundEligibility: 1件チェックAPI用（フロントエンド駆動、サーバーはバルク処理しない）
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -303,36 +304,10 @@ router.post('/api/create-inbound-plan', express.json(), async (req, res) => {
   const { items, planName } = req.body;
   if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items[] が必要です' });
 
-  // NG商品をリアルタイム再チェック → OKに復帰していれば含める
+  // キャッシュ済みNG商品を自動除外（DBキャッシュのみ、APIコールなし）
   const skus = items.map(i => i.amazon_sku);
   const eligData = getEligibilityBySkus(skus);
-  const cachedNgItems = eligData.filter(e => !e.is_eligible);
-
-  let ngSkuSet = new Set();
-  if (cachedNgItems.length > 0) {
-    console.log(`[Inbound] キャッシュNG ${cachedNgItems.length}件をリアルタイム再チェック...`);
-    const mappings = getSkuMappings();
-    const mappingMap = {};
-    for (const m of mappings) mappingMap[m.amazon_sku] = m;
-
-    for (const ng of cachedNgItems) {
-      const asin = mappingMap[ng.amazon_sku]?.asin || '';
-      if (!asin) { ngSkuSet.add(ng.amazon_sku); continue; }
-      try {
-        const result = await checkInboundEligibility([{ asin, msku: ng.amazon_sku }]);
-        if (result.length > 0) {
-          ngSkuSet.add(ng.amazon_sku); // まだNG
-        } else {
-          // OKに復帰 → DB更新
-          console.log(`[Inbound] ${ng.amazon_sku} → OKに復帰！`);
-          saveEligibilityBatch([{ asin, amazon_sku: ng.amazon_sku, product_name: ng.product_name, is_eligible: true, reasons: [] }]);
-        }
-      } catch {
-        ngSkuSet.add(ng.amazon_sku); // エラー時は安全側でNG維持
-      }
-    }
-  }
-
+  const ngSkuSet = new Set(eligData.filter(e => !e.is_eligible).map(e => e.amazon_sku));
   const excludedItems = items.filter(i => ngSkuSet.has(i.amazon_sku));
   const filteredItems = ngSkuSet.size > 0 ? items.filter(i => !ngSkuSet.has(i.amazon_sku)) : items;
 
@@ -525,73 +500,7 @@ router.post('/api/create-inbound-plan', express.json(), async (req, res) => {
       });
     }
 
-    // SKU不明エラー時: Eligibilityチェック → NG特定 → 自動リトライ
     const hasUnknownSku = enrichedProblems.some(p => p.msku === '-');
-    if (hasUnknownSku && result.status === 'FAILED') {
-      console.log('[Inbound] SKU不明エラー → Eligibilityチェックで原因SKU特定中...');
-
-      try {
-        const mappings = getSkuMappings();
-        const mappingMap = {};
-        for (const m of mappings) mappingMap[m.amazon_sku] = m;
-
-        const checkItems = filteredItems
-          .map(i => ({ asin: mappingMap[i.amazon_sku]?.asin || i.asin || '', msku: i.amazon_sku }))
-          .filter(i => i.asin);
-
-        const ineligible = await checkInboundEligibility(checkItems);
-        console.log(`[Inbound] Eligibility結果: ${ineligible.length}件がNG`);
-
-        if (ineligible.length > 0) {
-          // NG商品をDBに保存
-          const eligResults = ineligible.map(ie => ({
-            asin: checkItems.find(c => c.msku === ie.msku)?.asin || '',
-            amazon_sku: ie.msku,
-            product_name: filteredItems.find(i => i.amazon_sku === ie.msku)?.product_name || '',
-            is_eligible: false,
-            reasons: ie.reasons || [],
-          }));
-          saveEligibilityBatch(eligResults);
-
-          // NG商品を除外してリトライ
-          const newNgSet = new Set(ineligible.map(ie => ie.msku));
-          const retryItems = filteredItems.filter(i => !newNgSet.has(i.amazon_sku));
-          const newExcluded = filteredItems.filter(i => newNgSet.has(i.amazon_sku));
-
-          console.log(`[Inbound] NG ${newExcluded.length}件を除外 → ${retryItems.length}件でリトライ`);
-
-          if (retryItems.length > 0) {
-            const { result: retryResult, prepOverrides: retryPrepOverrides } = await attemptWithPrepRetry(retryItems);
-
-            const allExcluded = [...excludedItems, ...newExcluded];
-            const retryPrepCorrections = Object.entries(retryPrepOverrides).map(([sku, newVal]) => {
-              const item = retryItems.find(i => i.amazon_sku === sku);
-              return { sku, product_name: item?.product_name || sku, original: newVal === 'SELLER' ? 'NONE' : 'SELLER', corrected: newVal, reason: newVal === 'SELLER' ? 'prep必要' : 'prep不要' };
-            });
-
-            res.json({
-              success: retryResult.status === 'SUCCESS',
-              inboundPlanId: retryResult.inboundPlanId,
-              operationId: retryResult.operationId,
-              status: retryResult.status,
-              problems: retryResult.problems || [],
-              totalItems: retryItems.length,
-              successItems: retryResult.status === 'SUCCESS' ? retryItems.length : 0,
-              errorItems: (retryResult.problems || []).length,
-              retried: true,
-              prepCorrections: retryPrepCorrections,
-              submittedItems: retryItems.map(i => ({ amazon_sku: i.amazon_sku, product_name: i.product_name, ship_qty: i.ship_qty })),
-              hasUnknownSku: false,
-              excludedItems: allExcluded.map(i => ({ amazon_sku: i.amazon_sku, product_name: i.product_name })),
-              autoRetried: true,
-            });
-            return;
-          }
-        }
-      } catch (eligErr) {
-        console.error('[Inbound] Eligibilityチェック失敗:', eligErr.message);
-      }
-    }
 
     res.json({
       success: result.status === 'SUCCESS',
@@ -689,15 +598,30 @@ router.get('/api/status', (req, res) => {
   });
 });
 
+// 1件だけEligibilityチェック（フロントエンド駆動）
+router.get('/api/eligibility/check-one', async (req, res) => {
+  const { asin, msku, product_name } = req.query;
+  if (!asin) return res.status(400).json({ error: 'asin必須' });
+
+  try {
+    const ineligible = await checkInboundEligibility([{ asin, msku: msku || '' }]);
+    const isEligible = ineligible.length === 0;
+    const reasons = ineligible.length > 0 ? (ineligible[0].reasons || []) : [];
+
+    // DBにキャッシュ
+    if (msku) {
+      saveEligibilityBatch([{ asin, amazon_sku: msku, product_name: product_name || '', is_eligible: isEligible, reasons }]);
+    }
+
+    res.json({ asin, msku, is_eligible: isEligible, reasons });
+  } catch (e) {
+    res.json({ asin, msku, is_eligible: true, reasons: [], error: e.message });
+  }
+});
+
 // NG商品リスト
 router.get('/api/eligibility/ineligible', (req, res) => {
   res.json(getIneligibleSkus());
-});
-
-// 適格性チェック状況
-router.get('/api/eligibility/status', (req, res) => {
-  const status = getEligibilityStatus();
-  res.json({ ...status, checkInProgress: eligibilityCheckInProgress });
 });
 
 export default router;

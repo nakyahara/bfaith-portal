@@ -2335,6 +2335,61 @@ Step10: アラート判定</pre>
       await createInboundPlanAction();
     }
 
+    // NG商品調査 → 除外して再作成（フロントエンド駆動で1件ずつチェック）
+    async function investigateAndRetry() {
+      const progEl = document.getElementById('investigateProgress');
+      const checkedSkus = [];
+      document.querySelectorAll('.rec-check:checked').forEach(cb => checkedSkus.push(cb.dataset.sku));
+
+      // チェック済みアイテムのASINを取得
+      const itemsToCheck = checkedSkus.map(sku => {
+        const rec = recData.find(r => r.amazon_sku === sku) || manualItems.find(m => m.amazon_sku === sku);
+        return { sku, asin: rec?.asin || '', product_name: rec?.product_name || '' };
+      }).filter(i => i.asin);
+
+      if (itemsToCheck.length === 0) {
+        alert('ASINのある商品がありません');
+        return;
+      }
+
+      const ngSkus = [];
+      for (let i = 0; i < itemsToCheck.length; i++) {
+        const item = itemsToCheck[i];
+        if (progEl) progEl.textContent = `チェック中... ${i + 1}/${itemsToCheck.length}`;
+        try {
+          const res = await fetch(`${BASE}/api/eligibility/check-one?asin=${encodeURIComponent(item.asin)}&msku=${encodeURIComponent(item.sku)}&product_name=${encodeURIComponent(item.product_name)}`);
+          const d = await res.json();
+          if (!d.is_eligible) {
+            ngSkus.push(item.sku);
+            log(`⛔ NG検出: ${item.product_name || item.sku}`);
+          }
+        } catch {}
+        // レート制限待機はサーバー側で処理済み
+      }
+
+      if (progEl) progEl.textContent = '';
+
+      if (ngSkus.length === 0) {
+        log('NG商品は見つかりませんでした（Eligibility APIでは検出不可の制限かもしれません）');
+        alert('NG商品を特定できませんでした。Seller Centralで確認してください。');
+        return;
+      }
+
+      log(`NG商品 ${ngSkus.length}件を特定: ${ngSkus.join(', ')} → 除外して再作成します`);
+
+      // NG商品のチェックを外して再作成
+      const ngSet = new Set(ngSkus);
+      document.querySelectorAll('.rec-check:checked').forEach(cb => {
+        if (ngSet.has(cb.dataset.sku)) {
+          cb.checked = false;
+          selectedSkus.delete(cb.dataset.sku);
+        }
+      });
+      updateSelectedCount();
+      closeInboundModal();
+      await createInboundPlanAction();
+    }
+
     // FBA_INBエラーコードの日本語翻訳
     const FBA_ERROR_JP = {
       'FBA_INB_0004': '危険物（Hazmat）として規制されている商品',
@@ -2438,7 +2493,11 @@ Step10: アラート判定</pre>
           unknownSkuHtml = `
             <div style="background:#fef3c7;padding:10px;border-radius:6px;margin-top:12px;font-size:12px;">
               <strong>⚠ エラーの原因SKUを特定できませんでした</strong><br>
-              Amazon APIの制限により特定できません。SKUマッピング同期を実行すると、次回から自動的にNG商品が除外されます。
+              「NG商品を調査」で原因を特定し、除外して再作成できます。
+              <div style="margin-top:8px;">
+                <button class="btn btn-primary" onclick="investigateAndRetry()" style="background:#d97706; padding:6px 14px; font-size:12px;">🔍 NG商品を調査して再作成</button>
+                <span id="investigateProgress" style="margin-left:8px;font-size:11px;color:#666;"></span>
+              </div>
             </div>`;
         }
 
