@@ -377,9 +377,15 @@
           </div>
         </div>
 
+        <div style="margin-bottom:8px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+          <button class="btn btn-secondary" onclick="hideNewProductChecked()" style="padding:6px 14px; font-size:13px;">チェック済みを非表示</button>
+          <span style="font-size:12px; color:#666;" id="newActionMsg"></span>
+        </div>
+
         <div style="margin-bottom:8px; display:flex; gap:16px; align-items:center; flex-wrap:wrap;">
           <label style="font-weight:bold;"><input type="radio" name="newFilter" value="ready" checked onchange="filterNewList()"> 倉庫在庫ありのみ</label>
           <label><input type="radio" name="newFilter" value="all" onchange="filterNewList()"> 全て</label>
+          <label style="margin-left:8px; color:#666;"><input type="checkbox" id="newShowHidden" onchange="filterNewList()"> 非表示も含める <span id="newHiddenCount" style="font-size:11px;"></span></label>
           <input type="text" id="newSearch" placeholder="商品名・SKU・NE商品コードで検索" oninput="filterNewList()" style="padding:5px 10px; border:1px solid #d1d5db; border-radius:4px; font-size:13px; width:280px;">
           <span style="margin-left:auto;color:#666;font-size:12px;" id="newFilterCount"></span>
         </div>
@@ -388,6 +394,7 @@
           <table class="data-table" id="newTable" style="table-layout:auto;">
             <thead>
               <tr>
+                <th style="width:30px;text-align:center;">✓</th>
                 <th style="width:30px;text-align:center;">#</th>
                 <th class="sortable-new" data-key="amazon_sku">SKU</th>
                 <th class="sortable-new" data-key="product_name">商品名</th>
@@ -1752,29 +1759,35 @@ Step10: アラート判定</pre>
     let newProductData = [];
     let newSortKey = 'warehouse_qty';
     let newSortDir = 'desc';
+    let newHiddenSet = new Set();
+    const newCheckedSkus = new Set();
+
+    async function loadNewProductHidden() {
+      try {
+        const res = await fetch(`${BASE}/api/new-product-hidden`);
+        const list = await res.json();
+        newHiddenSet = new Set(list.map(r => r.amazon_sku));
+        document.getElementById('newHiddenCount').textContent = `(${newHiddenSet.size}件)`;
+      } catch(e) { /* ignore */ }
+    }
 
     async function updateNewProductList() {
-      // SKUマッピングの全SKUを取得
       if (Object.keys(skuMappingMap).length === 0) await loadSkuMappingMap();
+      await loadNewProductHidden();
 
-      // SP-APIスナップショットに存在するSKUセット
       const snapshotSkuSet = new Set(recData.map(r => r.amazon_sku));
 
-      // マッピングにあってスナップショットにないSKU = 新規商品
       newProductData = [];
       for (const [sku, mapping] of Object.entries(skuMappingMap)) {
-        if (snapshotSkuSet.has(sku)) continue; // SP-APIに存在 → 新規ではない
+        if (snapshotSkuSet.has(sku)) continue;
 
-        // 倉庫在庫を確認
         let warehouseQty = 0;
         let yQty = 0;
-        // set_componentsからNEコードを取得して倉庫在庫を参照
         const comps = mapping.set_components
           ? (typeof mapping.set_components === 'string' ? JSON.parse(mapping.set_components) : mapping.set_components)
           : null;
 
         if (comps && comps.length > 0) {
-          // 構成商品の最小在庫
           let minSets = Infinity;
           for (const comp of comps) {
             const whRows = warehouseSummaryMap[comp.ne_code];
@@ -1798,23 +1811,25 @@ Step10: アラート判定</pre>
           is_set: mapping.is_set ? true : false,
           warehouse_qty: warehouseQty,
           y_qty: yQty,
+          is_hidden: newHiddenSet.has(sku),
         });
       }
 
-      // タブカウント
+      // タブカウント（非表示除外 + 倉庫在庫ありのみ）
+      const visibleData = newProductData.filter(r => !r.is_hidden);
+      const readyCount = visibleData.filter(r => r.warehouse_qty > 0).length;
       const countEl = document.getElementById('newTabCount');
-      if (newProductData.length > 0) {
-        countEl.textContent = newProductData.length;
+      if (readyCount > 0) {
+        countEl.textContent = readyCount;
         countEl.style.display = '';
       } else {
         countEl.style.display = 'none';
       }
 
-      // サマリー
-      const readyCount = newProductData.filter(r => r.warehouse_qty > 0).length;
-      document.getElementById('newTotalCount').textContent = newProductData.length + ' SKU';
+      // サマリー（非表示除外）
+      document.getElementById('newTotalCount').textContent = visibleData.length + ' SKU';
       document.getElementById('newReadyCount').textContent = readyCount + ' SKU';
-      document.getElementById('newNoStockCount').textContent = (newProductData.length - readyCount) + ' SKU';
+      document.getElementById('newNoStockCount').textContent = (visibleData.length - readyCount) + ' SKU';
 
       filterNewList();
     }
@@ -1822,7 +1837,12 @@ Step10: アラート判定</pre>
     function filterNewList() {
       const mode = document.querySelector('input[name="newFilter"]:checked')?.value || 'ready';
       const searchQuery = (document.getElementById('newSearch')?.value || '').trim().toLowerCase();
+      const showHidden = document.getElementById('newShowHidden')?.checked || false;
+
       let filtered = newProductData;
+      if (!showHidden) {
+        filtered = filtered.filter(r => !r.is_hidden);
+      }
       if (mode === 'ready') {
         filtered = filtered.filter(r => r.warehouse_qty > 0);
       }
@@ -1839,9 +1859,8 @@ Step10: アラート判定</pre>
 
     function renderNewList(data) {
       const tbody = document.getElementById('newBody');
-      if (!data.length) { tbody.innerHTML = '<tr><td colspan="8">該当なし</td></tr>'; return; }
+      if (!data.length) { tbody.innerHTML = '<tr><td colspan="9">該当なし</td></tr>'; return; }
 
-      // ソート
       data.sort((a, b) => {
         const th = document.querySelector(`th.sortable-new[data-key="${newSortKey}"]`);
         const isNum = th?.dataset.type === 'num';
@@ -1857,11 +1876,24 @@ Step10: アラート判定</pre>
       tbody.innerHTML = data.map(r => {
         num++;
         const hasStock = r.warehouse_qty > 0;
-        const rowBg = hasStock ? 'background:#f0fdf4;' : '';
-        const statusHtml = hasStock
-          ? '<span class="stockout-badge" style="background:#dcfce7;color:#16a34a;">送れる</span>'
-          : '<span class="stockout-badge stockout-nostock">在庫なし</span>';
+        const isHidden = r.is_hidden;
+        const rowBg = isHidden ? 'background:#f3f4f6;opacity:0.7;' : hasStock ? 'background:#f0fdf4;' : '';
+
+        let statusHtml;
+        if (isHidden) {
+          statusHtml = '<span class="stockout-badge" style="background:#e5e7eb;color:#6b7280;">非表示</span>';
+          statusHtml += ` <span style="font-size:11px;color:#2563eb;cursor:pointer;text-decoration:underline;" onclick="unhideNewProduct('${r.amazon_sku}')">復元</span>`;
+        } else if (hasStock) {
+          statusHtml = '<span class="stockout-badge" style="background:#dcfce7;color:#16a34a;">送れる</span>';
+        } else {
+          statusHtml = '<span class="stockout-badge stockout-nostock">在庫なし</span>';
+        }
+
+        const isChecked = newCheckedSkus.has(r.amazon_sku);
+        const checkHtml = `<input type="checkbox" class="new-check" data-sku="${r.amazon_sku}" ${isChecked ? 'checked' : ''} onchange="onNewCheckChange(this)">`;
+
         return `<tr style="${rowBg}">
+          <td style="text-align:center;">${checkHtml}</td>
           <td style="text-align:center;color:#666;font-size:11px;">${num}</td>
           <td style="font-size:11px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${r.amazon_sku}</td>
           <td class="product-name" title="${r.product_name || ''}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${r.product_name || ''}</a>` : (r.product_name || '')}</td>
@@ -1872,6 +1904,47 @@ Step10: アラート判定</pre>
           <td>${statusHtml}</td>
         </tr>`;
       }).join('');
+    }
+
+    function onNewCheckChange(cb) {
+      if (cb.checked) newCheckedSkus.add(cb.dataset.sku);
+      else newCheckedSkus.delete(cb.dataset.sku);
+    }
+
+    async function hideNewProductChecked() {
+      const msgEl = document.getElementById('newActionMsg');
+      if (newCheckedSkus.size === 0) {
+        msgEl.textContent = 'チェックされた商品がありません';
+        msgEl.style.color = '#d97706';
+        return;
+      }
+      try {
+        const res = await fetch(`${BASE}/api/new-product-hidden`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ skus: [...newCheckedSkus] }),
+        });
+        const d = await res.json();
+        msgEl.textContent = `${d.count}件を非表示にしました`;
+        msgEl.style.color = '#16a34a';
+        newCheckedSkus.clear();
+        await updateNewProductList();
+      } catch(e) {
+        msgEl.textContent = 'エラー: ' + e.message;
+        msgEl.style.color = '#dc2626';
+      }
+    }
+
+    async function unhideNewProduct(sku) {
+      try {
+        await fetch(`${BASE}/api/new-product-hidden/${encodeURIComponent(sku)}`, { method: 'DELETE' });
+        newHiddenSet.delete(sku);
+        newProductData = newProductData.map(r =>
+          r.amazon_sku === sku ? { ...r, is_hidden: false } : r
+        );
+        document.getElementById('newHiddenCount').textContent = `(${newHiddenSet.size}件)`;
+        filterNewList();
+      } catch(e) { /* ignore */ }
     }
 
     // ===== ステップ制御 =====

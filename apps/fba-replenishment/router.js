@@ -9,6 +9,7 @@ import { initDb, savePlanningData, getLatestSnapshots, getSettings, updateSettin
          getWarehouseInventory, replaceWarehouseInventory, getWarehouseSummary,
          getShipmentPlans, getShipmentPlanItems, getDailySnapshots,
          getStockoutHidden, hideStockoutSku, unhideStockoutSku, hideStockoutSkuBulk,
+         getNewProductHidden, hideNewProductSkuBulk, unhideNewProductSku,
          saveDraft, getDraft, clearDraft } from './db.js';
 import { fetchAllReports, normalizePlanningRow } from './sp-api-reports.js';
 import { syncSkuMappings } from './sheets-sync.js';
@@ -282,6 +283,23 @@ router.post('/api/draft', express.json(), (req, res) => {
 
 router.delete('/api/draft', (req, res) => {
   clearDraft();
+  res.json({ success: true });
+});
+
+// ===== 新規商品 非表示管理 =====
+router.get('/api/new-product-hidden', (req, res) => {
+  res.json(getNewProductHidden());
+});
+
+router.post('/api/new-product-hidden', express.json(), (req, res) => {
+  const { skus, reason } = req.body;
+  if (!Array.isArray(skus) || skus.length === 0) return res.status(400).json({ error: 'skus[] が必要です' });
+  const count = hideNewProductSkuBulk(skus, reason);
+  res.json({ success: true, count });
+});
+
+router.delete('/api/new-product-hidden/:sku', (req, res) => {
+  unhideNewProductSku(req.params.sku);
   res.json({ success: true });
 });
 

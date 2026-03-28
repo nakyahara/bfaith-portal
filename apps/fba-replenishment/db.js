@@ -250,7 +250,16 @@ export async function initDb() {
     )
   `);
 
-  // --- 10. shipment_draft: 納品作業ドラフト（1つだけ保持） ---
+  // --- 10. new_product_hidden: 新規商品リストの非表示SKU ---
+  db.run(`
+    CREATE TABLE IF NOT EXISTS new_product_hidden (
+      amazon_sku TEXT PRIMARY KEY,
+      reason TEXT,
+      hidden_at TEXT DEFAULT (datetime('now','localtime'))
+    )
+  `);
+
+  // --- 11. shipment_draft: 納品作業ドラフト（1つだけ保持） ---
   db.run(`
     CREATE TABLE IF NOT EXISTS shipment_draft (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -738,6 +747,33 @@ export function hideStockoutSkuBulk(skus, reason) {
     db.run('ROLLBACK');
     throw e;
   }
+}
+
+// ===== 新規商品 非表示管理 =====
+
+export function getNewProductHidden() {
+  return queryAll('SELECT * FROM new_product_hidden ORDER BY hidden_at DESC');
+}
+
+export function hideNewProductSkuBulk(skus, reason) {
+  db.run('BEGIN TRANSACTION');
+  try {
+    for (const sku of skus) {
+      db.run(`INSERT OR REPLACE INTO new_product_hidden (amazon_sku, reason, hidden_at) VALUES (?, ?, datetime('now','localtime'))`,
+        [sku, reason || null]);
+    }
+    db.run('COMMIT');
+    saveToFile();
+    return skus.length;
+  } catch (e) {
+    db.run('ROLLBACK');
+    throw e;
+  }
+}
+
+export function unhideNewProductSku(amazonSku) {
+  db.run('DELETE FROM new_product_hidden WHERE amazon_sku = ?', [amazonSku]);
+  saveToFile();
 }
 
 // ===== 納品作業ドラフト =====
