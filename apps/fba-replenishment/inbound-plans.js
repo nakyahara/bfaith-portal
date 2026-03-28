@@ -124,27 +124,43 @@ export async function checkInboundEligibility(items) {
   const marketplaceId = process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
   const ineligible = [];
 
+  console.log(`[Eligibility] ${items.length}件のASINをチェック開始...`);
+
   for (const item of items) {
     if (!item.asin) continue;
     try {
       const result = await sp.callAPI({
-        api_path: `/fba/inbound/v1/eligibility/itemPreview?asin=${item.asin}&program=INBOUND&marketplaceIds=${marketplaceId}`,
+        api_path: '/fba/inbound/v1/eligibility/itemPreview',
         method: 'GET',
+        query: {
+          asin: item.asin,
+          program: 'INBOUND',
+          marketplaceIds: marketplaceId,
+        },
       });
       if (result.isEligibleForProgram === false) {
+        console.log(`[Eligibility] NG: ${item.asin} (${item.msku}) - ${JSON.stringify(result.ineligibilityReasonList)}`);
         ineligible.push({
           asin: item.asin,
           msku: item.msku,
           reasons: result.ineligibilityReasonList || [],
         });
       }
-      // API制限回避
       await sleep(200);
     } catch (e) {
-      console.log(`[Eligibility] ${item.asin} チェック失敗: ${e.message}`);
+      console.log(`[Eligibility] ${item.asin} (${item.msku}) チェック失敗: ${e.message}`);
+      // APIエラーでも不適格として記録（安全側）
+      if (e.message && (e.message.includes('INELIGIBLE') || e.message.includes('dangerous'))) {
+        ineligible.push({
+          asin: item.asin,
+          msku: item.msku,
+          reasons: [{ code: 'API_ERROR', message: e.message }],
+        });
+      }
     }
   }
 
+  console.log(`[Eligibility] 完了: ${ineligible.length}件が不適格`);
   return ineligible;
 }
 
