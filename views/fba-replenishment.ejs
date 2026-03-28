@@ -931,6 +931,11 @@
 
       // ソート
       data.sort((a, b) => {
+        // 他タブから追加されたアイテムは常に先頭
+        const aAdded = a._fromStockout || a._fromNewProduct ? 1 : 0;
+        const bAdded = b._fromStockout || b._fromNewProduct ? 1 : 0;
+        if (aAdded !== bAdded) return bAdded - aAdded;
+
         const th = document.querySelector(`th.sortable-rec[data-key="${recSortKey}"]`);
         const isNum = th?.dataset.type === 'num';
         let va = a[recSortKey], vb = b[recSortKey];
