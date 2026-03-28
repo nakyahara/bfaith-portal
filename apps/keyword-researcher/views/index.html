@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Amazon キーワードリサーチャー — B-Faith Portal</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Segoe UI', 'Hiragino Sans', 'Meiryo', sans-serif; background: #eaeded; color: #0f1111; font-size: 14px; }
+    a { color: #0066c0; text-decoration: none; }
+    a:hover { color: #c45500; text-decoration: underline; }
+
+    .header { background: #232f3e; color: #fff; padding: 10px 24px; display: flex; align-items: center; justify-content: space-between; }
+    .header h1 { font-size: 17px; font-weight: bold; }
+    .header h1 span { color: #ff9900; }
+    .header a { color: #ddd; font-size: 13px; }
+    .container { max-width: 1200px; margin: 16px auto; padding: 0 16px; }
+
+    .panel { background: #fff; border: 1px solid #d5d9d9; border-radius: 8px; padding: 16px 20px; margin-bottom: 14px; }
+    .panel-title { font-size: 14px; font-weight: bold; margin-bottom: 12px; padding-bottom: 6px; border-bottom: 2px solid #ff9900; }
+
+    .tabs { display: flex; gap: 0; margin-bottom: 14px; }
+    .tab { padding: 10px 20px; border: 1px solid #d5d9d9; background: #f3f3f3; cursor: pointer; font-size: 13px; font-weight: bold; }
+    .tab:first-child { border-radius: 8px 0 0 8px; }
+    .tab:last-child { border-radius: 0 8px 8px 0; }
+    .tab.active { background: #fff; border-bottom-color: #fff; color: #e77600; }
+
+    .form-row { display: flex; gap: 12px; align-items: flex-end; margin-bottom: 10px; flex-wrap: wrap; }
+    .form-group { display: flex; flex-direction: column; gap: 3px; }
+    .form-group label { font-size: 12px; font-weight: bold; color: #565959; }
+    .form-group input { padding: 6px 8px; border: 1px solid #888; border-radius: 4px; font-size: 13px; }
+    .form-group input:focus { border-color: #e77600; outline: none; box-shadow: 0 0 3px #e77600; }
+    .form-group.wide { flex: 1; min-width: 200px; }
+
+    .checkbox-row { display: flex; gap: 16px; align-items: center; margin-bottom: 10px; font-size: 13px; }
+    .checkbox-row label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+
+    .btn { padding: 7px 18px; border-radius: 4px; font-size: 13px; font-weight: bold; cursor: pointer; border: 1px solid; }
+    .btn-primary { background: #f0c14b; border-color: #a88734; color: #0f1111; }
+    .btn-primary:hover { background: #e7b83c; }
+    .btn-secondary { background: #fff; border-color: #888; color: #0f1111; }
+    .btn-secondary:hover { background: #f5f5f5; }
+    .btn-ads { background: #232f3e; border-color: #232f3e; color: #ff9900; }
+    .btn-ads:hover { background: #37475a; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .progress-bar { width: 100%; height: 6px; background: #eee; border-radius: 3px; margin: 10px 0; display: none; }
+    .progress-bar .fill { height: 100%; background: #ff9900; border-radius: 3px; transition: width 0.3s; width: 0%; }
+    .status-text { font-size: 12px; color: #565959; margin-bottom: 8px; }
+
+    .result-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+    .result-table th { background: #f3f3f3; border: 1px solid #d5d9d9; padding: 8px 10px; text-align: left; font-size: 12px; white-space: nowrap; cursor: pointer; }
+    .result-table th:hover { background: #e8e8e8; }
+    .result-table td { border: 1px solid #d5d9d9; padding: 6px 10px; }
+    .result-table tr:hover { background: #fafafa; }
+    .result-table .check-col { width: 30px; text-align: center; }
+    .result-table .bid-col { text-align: right; font-family: monospace; }
+    .result-table .match-col { font-size: 11px; }
+
+    .stats { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 12px; }
+    .stat-card { background: #f7f7f7; border: 1px solid #d5d9d9; border-radius: 6px; padding: 10px 16px; text-align: center; min-width: 120px; }
+    .stat-card .num { font-size: 22px; font-weight: bold; color: #ff9900; }
+    .stat-card .label { font-size: 11px; color: #565959; }
+
+    .action-bar { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+    .action-bar .count { font-size: 12px; color: #565959; }
+
+    .ads-badge { display: inline-block; background: #232f3e; color: #ff9900; font-size: 10px; padding: 2px 6px; border-radius: 3px; font-weight: bold; }
+    .match-broad { color: #0066c0; }
+    .match-phrase { color: #008577; }
+    .match-exact { color: #c45500; }
+
+    .hidden { display: none; }
+    .hint { font-size: 11px; color: #888; margin-top: 4px; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1><span>Amazon</span> キーワードリサーチャー</h1>
+    <div>
+      <span id="adsStatus" style="font-size:11px; margin-right:12px;"></span>
+      <a href="/">ダッシュボードに戻る</a>
+    </div>
+  </div>
+
+  <div class="container">
+    <!-- タブ切り替え -->
+    <div class="tabs">
+      <div class="tab active" onclick="switchTab('suggest')">サジェスト調査</div>
+      <div class="tab" onclick="switchTab('ads')">広告キーワード推奨</div>
+    </div>
+
+    <!-- サジェストパネル -->
+    <div class="panel" id="suggestPanel">
+      <div class="panel-title">サジェスト取得</div>
+      <div class="form-row">
+        <div class="form-group wide">
+          <label>シードキーワード</label>
+          <input type="text" id="seedInput" placeholder="例: イヤホン bluetooth" />
+        </div>
+        <button class="btn btn-primary" id="suggestBtn" onclick="startSuggest()">サジェスト取得</button>
+      </div>
+      <div class="checkbox-row">
+        <label><input type="checkbox" id="chkHiragana" checked /> 五十音掛け合わせ</label>
+        <label><input type="checkbox" id="chkAlphabet" /> アルファベット掛け合わせ</label>
+      </div>
+      <div class="progress-bar" id="suggestProgress"><div class="fill" id="suggestFill"></div></div>
+      <div class="status-text" id="suggestStatus"></div>
+    </div>
+
+    <!-- 広告キーワード推奨パネル -->
+    <div class="panel hidden" id="adsPanel">
+      <div class="panel-title">広告キーワード推奨 <span class="ads-badge">Ads API</span></div>
+      <div class="form-row">
+        <div class="form-group wide">
+          <label>ASIN（カンマ区切りで複数指定可、最大10個）</label>
+          <input type="text" id="asinInput" placeholder="例: B0XXXXXXXX, B0YYYYYYYY" />
+        </div>
+        <button class="btn btn-ads" id="adsBtn" onclick="startAdsRecommendation()">キーワード推奨取得</button>
+      </div>
+      <div class="hint">対象商品のASINを入力すると、Amazonの広告APIが推奨するキーワードと入札額を取得します。</div>
+      <div class="progress-bar" id="adsProgress"><div class="fill" id="adsFill"></div></div>
+      <div class="status-text" id="adsStatus2"></div>
+    </div>
+
+    <!-- 結果パネル -->
+    <div class="panel hidden" id="resultPanel">
+      <div class="panel-title" id="resultTitle">結果</div>
+      <div class="stats" id="statsArea"></div>
+
+      <div class="action-bar">
+        <label><input type="checkbox" id="selectAll" onchange="toggleSelectAll()" /> 全選択</label>
+        <span class="count" id="selectedCount">0件選択中</span>
+        <button class="btn btn-secondary" onclick="exportCSV()">CSV出力</button>
+      </div>
+
+      <div style="overflow-x:auto;">
+        <table class="result-table" id="resultTable">
+          <thead id="resultHead"></thead>
+          <tbody id="resultBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let currentData = [];
+    let currentMode = 'suggest'; // 'suggest' or 'ads'
+    let sortCol = null;
+    let sortAsc = true;
+
+    const BASE = location.pathname.replace(/\/$/, '');
+
+    // ── Ads API ステータス確認 ──
+    async function checkAdsStatus() {
+      try {
+        const res = await fetch(`${BASE}/api/ads-status`);
+        const data = await res.json();
+        const el = document.getElementById('adsStatus');
+        if (data.configured && data.ok) {
+          el.innerHTML = '<span style="color:#0a0">● Ads API接続済み</span>';
+        } else if (data.configured) {
+          el.innerHTML = '<span style="color:#c00">● Ads API接続エラー</span>';
+        } else {
+          el.innerHTML = '<span style="color:#888">○ Ads API未設定</span>';
+        }
+      } catch (e) { /* ignore */ }
+    }
+    checkAdsStatus();
+
+    // ── タブ切り替え ──
+    function switchTab(mode) {
+      currentMode = mode;
+      document.querySelectorAll('.tab').forEach((t, i) => {
+        t.classList.toggle('active', (i === 0 && mode === 'suggest') || (i === 1 && mode === 'ads'));
+      });
+      document.getElementById('suggestPanel').classList.toggle('hidden', mode !== 'suggest');
+      document.getElementById('adsPanel').classList.toggle('hidden', mode !== 'ads');
+    }
+
+    // ── サジェスト取得 ──
+    async function startSuggest() {
+      const seed = document.getElementById('seedInput').value.trim();
+      if (!seed) return alert('キーワードを入力してください');
+
+      const btn = document.getElementById('suggestBtn');
+      btn.disabled = true;
+      btn.textContent = '取得中...';
+
+      const bar = document.getElementById('suggestProgress');
+      const fill = document.getElementById('suggestFill');
+      const status = document.getElementById('suggestStatus');
+      bar.style.display = 'block';
+      fill.style.width = '10%';
+      status.textContent = 'サジェストを取得しています...';
+
+      try {
+        const res = await fetch(`${BASE}/api/suggest`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            seed,
+            hiragana: document.getElementById('chkHiragana').checked,
+            alphabet: document.getElementById('chkAlphabet').checked,
+          }),
+        });
+
+        fill.style.width = '100%';
+
+        if (!res.ok) {
+          const err = await res.json();
+          throw new Error(err.error || 'エラーが発生しました');
+        }
+
+        const data = await res.json();
+        currentData = data.suggestions.map(s => ({
+          keyword: s.keyword,
+          source: s.source,
+          depth: s.depth,
+          selected: false,
+        }));
+
+        status.textContent = `${data.total}件のサジェストを取得しました`;
+        currentMode = 'suggest';
+        renderResults();
+        document.getElementById('resultPanel').classList.remove('hidden');
+      } catch (err) {
+        status.textContent = `エラー: ${err.message}`;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'サジェスト取得';
+      }
+    }
+
+    // ── 広告キーワード推奨取得 ──
+    async function startAdsRecommendation() {
+      const asinStr = document.getElementById('asinInput').value.trim();
+      if (!asinStr) return alert('ASINを入力してください');
+
+      const asins = asinStr.split(/[,\s、]+/).map(s => s.trim().toUpperCase()).filter(Boolean);
+      if (asins.length === 0) return alert('有効なASINを入力してください');
+
+      const btn = document.getElementById('adsBtn');
+      btn.disabled = true;
+      btn.textContent = '取得中...';
+
+      const bar = document.getElementById('adsProgress');
+      const fill = document.getElementById('adsFill');
+      const status = document.getElementById('adsStatus2');
+      bar.style.display = 'block';
+      fill.style.width = '30%';
+      status.textContent = 'キーワード推奨を取得しています...';
+
+      try {
+        // キーワード推奨とテーマ推奨を並列取得
+        const [kwRes, themeRes] = await Promise.all([
+          fetch(`${BASE}/api/keyword-recommendations`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ asins, maxRecommendations: 200 }),
+          }),
+          fetch(`${BASE}/api/theme-recommendations`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ asins }),
+          }),
+        ]);
+
+        fill.style.width = '90%';
+
+        const kwData = kwRes.ok ? await kwRes.json() : { keywords: [] };
+        const themeData = themeRes.ok ? await themeRes.json() : { keywords: [] };
+
+        // 重複除去してマージ（キーワード推奨を優先）
+        const seen = new Set();
+        const merged = [];
+
+        for (const kw of kwData.keywords || []) {
+          const key = `${kw.keyword}|${kw.matchType}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            merged.push({ ...kw, source: 'keyword-rec', selected: false });
+          }
+        }
+
+        for (const kw of themeData.keywords || []) {
+          const key = `${kw.keyword}|${kw.matchType}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            merged.push({ ...kw, source: 'theme', selected: false });
+          }
+        }
+
+        // 入札額降順でソート
+        merged.sort((a, b) => (b.bid || 0) - (a.bid || 0));
+
+        currentData = merged;
+        fill.style.width = '100%';
+        status.textContent = `${merged.length}件のキーワード推奨を取得しました`;
+        currentMode = 'ads';
+        renderResults();
+        document.getElementById('resultPanel').classList.remove('hidden');
+      } catch (err) {
+        status.textContent = `エラー: ${err.message}`;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'キーワード推奨取得';
+      }
+    }
+
+    // ── 結果表示 ──
+    function renderResults() {
+      const total = currentData.length;
+      const isAds = currentMode === 'ads';
+
+      document.getElementById('resultTitle').textContent = isAds ? '広告キーワード推奨結果' : 'サジェスト結果';
+
+      // 統計
+      let statsHtml = `<div class="stat-card"><div class="num">${total}</div><div class="label">キーワード数</div></div>`;
+      if (isAds) {
+        const avgBid = total > 0 ? (currentData.reduce((s, d) => s + (d.bid || 0), 0) / total).toFixed(1) : 0;
+        const maxBid = total > 0 ? Math.max(...currentData.map(d => d.bid || 0)).toFixed(1) : 0;
+        statsHtml += `
+          <div class="stat-card"><div class="num">¥${avgBid}</div><div class="label">平均推奨入札額</div></div>
+          <div class="stat-card"><div class="num">¥${maxBid}</div><div class="label">最高入札額</div></div>
+        `;
+      }
+      document.getElementById('statsArea').innerHTML = statsHtml;
+
+      // テーブルヘッダー
+      const thead = document.getElementById('resultHead');
+      if (isAds) {
+        thead.innerHTML = `<tr>
+          <th class="check-col"></th>
+          <th onclick="sortBy('keyword')">キーワード</th>
+          <th onclick="sortBy('matchType')">マッチタイプ</th>
+          <th onclick="sortBy('bid')">推奨入札額</th>
+          <th onclick="sortBy('source')">ソース</th>
+        </tr>`;
+      } else {
+        thead.innerHTML = `<tr>
+          <th class="check-col"></th>
+          <th onclick="sortBy('keyword')">キーワード</th>
+          <th onclick="sortBy('source')">ソース</th>
+        </tr>`;
+      }
+
+      // テーブルボディ
+      const tbody = document.getElementById('resultBody');
+      tbody.innerHTML = currentData.map((d, i) => {
+        if (isAds) {
+          const matchClass = d.matchType === 'BROAD' ? 'match-broad' : d.matchType === 'PHRASE' ? 'match-phrase' : 'match-exact';
+          const matchLabel = d.matchType === 'BROAD' ? '部分一致' : d.matchType === 'PHRASE' ? 'フレーズ' : '完全一致';
+          return `<tr>
+            <td class="check-col"><input type="checkbox" data-idx="${i}" ${d.selected ? 'checked' : ''} onchange="toggleSelect(${i})" /></td>
+            <td><a href="https://www.amazon.co.jp/s?k=${encodeURIComponent(d.keyword)}" target="_blank">${esc(d.keyword)}</a></td>
+            <td class="match-col"><span class="${matchClass}">${matchLabel}</span></td>
+            <td class="bid-col">${d.bid ? '¥' + d.bid.toFixed(1) : '-'}</td>
+            <td style="font-size:11px;color:#888">${d.source === 'theme' ? 'テーマ推奨' : 'キーワード推奨'}</td>
+          </tr>`;
+        } else {
+          return `<tr>
+            <td class="check-col"><input type="checkbox" data-idx="${i}" ${d.selected ? 'checked' : ''} onchange="toggleSelect(${i})" /></td>
+            <td><a href="https://www.amazon.co.jp/s?k=${encodeURIComponent(d.keyword)}" target="_blank">${esc(d.keyword)}</a></td>
+            <td style="font-size:11px;color:#888">${formatSource(d.source)}</td>
+          </tr>`;
+        }
+      }).join('');
+
+      updateSelectedCount();
+    }
+
+    // ── ソート ──
+    function sortBy(col) {
+      if (sortCol === col) {
+        sortAsc = !sortAsc;
+      } else {
+        sortCol = col;
+        sortAsc = true;
+      }
+
+      currentData.sort((a, b) => {
+        let va = a[col] || '';
+        let vb = b[col] || '';
+        if (typeof va === 'number' && typeof vb === 'number') {
+          return sortAsc ? va - vb : vb - va;
+        }
+        va = String(va);
+        vb = String(vb);
+        return sortAsc ? va.localeCompare(vb, 'ja') : vb.localeCompare(va, 'ja');
+      });
+
+      renderResults();
+    }
+
+    function formatSource(source) {
+      if (!source) return '';
+      if (source === 'base') return 'ベース';
+      if (source.startsWith('hiragana:')) return source.replace('hiragana:', '');
+      if (source.startsWith('alphabet:')) return source.replace('alphabet:', '');
+      if (source.startsWith('deep:')) return '深掘り';
+      return source;
+    }
+
+    function toggleSelect(idx) {
+      currentData[idx].selected = !currentData[idx].selected;
+      updateSelectedCount();
+    }
+
+    function toggleSelectAll() {
+      const checked = document.getElementById('selectAll').checked;
+      currentData.forEach(d => d.selected = checked);
+      document.querySelectorAll('#resultBody input[type="checkbox"]').forEach(cb => cb.checked = checked);
+      updateSelectedCount();
+    }
+
+    function updateSelectedCount() {
+      const count = currentData.filter(d => d.selected).length;
+      document.getElementById('selectedCount').textContent = `${count}件選択中`;
+    }
+
+    async function exportCSV() {
+      const dataToExport = currentData.filter(d => d.selected).length > 0
+        ? currentData.filter(d => d.selected)
+        : currentData;
+
+      try {
+        const res = await fetch(`${BASE}/api/export-csv`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ keywords: dataToExport }),
+        });
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `keyword-research-${Date.now()}.csv`;
+        a.click();
+        URL.revokeObjectURL(url);
+      } catch (err) {
+        alert('CSV出力エラー: ' + err.message);
+      }
+    }
+
+    function esc(str) {
+      const d = document.createElement('div');
+      d.textContent = str;
+      return d.innerHTML;
+    }
+
+    // Enterキーで検索
+    document.getElementById('seedInput').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') startSuggest();
+    });
+    document.getElementById('asinInput').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') startAdsRecommendation();
+    });
+  </script>
+</body>
+</html>

@@ -189,7 +189,7 @@ export async function checkInboundEligibility(items) {
           marketplaceIds: marketplaceId,
         },
       });
-      if (result && result.isEligibleForProgram === false) {
+      if (result.isEligibleForProgram === false) {
         console.log(`[Eligibility] NG: ${item.asin} (${item.msku}) - ${JSON.stringify(result.ineligibilityReasonList)}`);
         ineligible.push({
           asin: item.asin,
@@ -197,21 +197,15 @@ export async function checkInboundEligibility(items) {
           reasons: result.ineligibilityReasonList || [],
         });
       }
-      await sleep(1100); // レート制限: 1リクエスト/秒
+      await sleep(200);
     } catch (e) {
-      const msg = e.message || '';
-      // HTMLレスポンス（レート制限等）はスキップ
-      if (msg.includes('<!DOCTYPE') || msg.includes('Unexpected token')) {
-        console.log(`[Eligibility] ${item.asin} → レート制限、3秒待機...`);
-        await sleep(3000);
-        continue;
-      }
-      console.log(`[Eligibility] ${item.asin} (${item.msku}) チェック失敗: ${msg}`);
-      if (msg.includes('INELIGIBLE') || msg.includes('dangerous')) {
+      console.log(`[Eligibility] ${item.asin} (${item.msku}) チェック失敗: ${e.message}`);
+      // APIエラーでも不適格として記録（安全側）
+      if (e.message && (e.message.includes('INELIGIBLE') || e.message.includes('dangerous'))) {
         ineligible.push({
           asin: item.asin,
           msku: item.msku,
-          reasons: [{ code: 'API_ERROR', message: msg }],
+          reasons: [{ code: 'API_ERROR', message: e.message }],
         });
       }
     }

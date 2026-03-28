@@ -229,7 +229,6 @@ app.get('/', requireAuth, (req, res) => {
   }
   const visibleApps = allowed === '*' ? apps : apps.filter(a => allowed.includes(a.id));
   const visibleExtLinks = allowed === '*' ? externalLinks : [];
-
   res.render('dashboard', {
     apps: visibleApps, categories, externalLinks: visibleExtLinks,
     username: req.session.email, displayName: req.session.displayName,

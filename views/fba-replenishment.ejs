@@ -185,7 +185,6 @@
         <button class="btn btn-primary" id="btnCalc" onclick="calcRecommendations()" style="background:#16a34a;">推奨リスト生成</button>
         <span class="step-status" id="stepStatus4"></span>
       </div>
-      <div style="font-size:11px;color:#888;margin-top:4px;margin-left:4px;" id="eligibilityStatus"></div>
     </div>
     </details>
 
@@ -561,20 +560,6 @@
         document.getElementById('warehouseCount').textContent = d.warehouseProducts ? `${d.warehouseProducts}商品` : '-';
         document.getElementById('fetchStatus').textContent = d.fetchInProgress ? '取得中...' : '待機中';
         if (d.snapshotCount > 0) loadSnapshots();
-        // 適格性チェック状況も取得
-        try {
-          const eligRes = await fetch(`${BASE}/api/eligibility/status`);
-          const elig = await eligRes.json();
-          const el = document.getElementById('eligibilityStatus');
-          if (el) {
-            if (elig.total > 0) {
-              el.textContent = `チェック済: ${elig.total}件（NG: ${elig.ineligible}件）${elig.checkInProgress ? ' 🔄実行中...' : ''}`;
-              if (elig.ineligible > 0) el.style.color = '#dc2626';
-            } else {
-              el.textContent = '未実行';
-            }
-          }
-        } catch {}
       } catch (e) { log('ステータス取得エラー: ' + e.message); }
     }
 
@@ -996,13 +981,11 @@
         // チェック状態
         const isChecked = selectedSkus.has(r.amazon_sku);
         const urgTag = r.urgency_score >= 80 ? 'red' : r.urgency_score >= 40 ? 'yellow' : 'white';
-        const ngMark = r._ineligible ? ' ⛔' : '';
-        const ngTitle = r._ineligible ? `title="納品不可: ${(r._ineligible_reasons || []).map(x => x.message || x.code || '').join(', ') || '危険物等'}"` : '';
         return `<tr class="${urgCls}" ${manualCls}>
           <td style="text-align:center;"><input type="checkbox" class="rec-check" data-sku="${r.amazon_sku}" data-qty="${shipQtyMap[r.amazon_sku] ?? (r.adjusted_qty || 0)}" data-urg="${urgTag}" ${isChecked ? 'checked' : ''} onchange="onCheckChange(this)"></td>
           <td style="text-align:center;font-size:11px;color:#666;">${rowNum}</td>
-          <td>${r._manual ? '手動' : r.urgency_score}${ngMark}</td>
-          <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')" ${ngTitle}>${r.amazon_sku}</span></td>
+          <td>${r._manual ? '手動' : r.urgency_score}</td>
+          <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')">${r.amazon_sku}</span></td>
           <td class="product-name" title="${r.product_name || ''}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${r.product_name || ''}</a>` : (r.product_name || '')}</td>
           ${renderComponentCell(r)}
           <td>${r.fba_available}</td>
@@ -2273,24 +2256,9 @@ Step10: アラート判定</pre>
           return;
         }
 
-        // NG商品が自動除外された場合ログに記録
-        if (d.excludedItems && d.excludedItems.length > 0) {
-          log(`⚠ NG商品${d.excludedItems.length}件を自動除外: ${d.excludedItems.map(i => i.product_name || i.amazon_sku).join(', ')}`);
-          // 除外されたSKUのチェックを外す
-          for (const ex of d.excludedItems) {
-            const cb = document.querySelector(`.rec-check[data-sku="${ex.amazon_sku}"]`);
-            if (cb) { cb.checked = false; selectedSkus.delete(ex.amazon_sku); }
-          }
-          updateSelectedCount();
-        }
-
         if (d.success) {
           showInboundModal('success', d);
-          if (d.autoRetried) {
-            log(`納品プラン作成成功（NG商品を自動検出→除外→リトライ）: プランID ${d.inboundPlanId}`);
-          } else {
-            log(`納品プラン作成成功: プランID ${d.inboundPlanId}`);
-          }
+          log(`納品プラン作成成功: プランID ${d.inboundPlanId}`);
           // 成功したSKUにフラグを立てる
           for (const item of checkedItems) {
             const rec = recData.find(r => r.amazon_sku === item.amazon_sku);
@@ -2335,61 +2303,6 @@ Step10: アラート判定</pre>
       await createInboundPlanAction();
     }
 
-    // NG商品調査 → 除外して再作成（フロントエンド駆動で1件ずつチェック）
-    async function investigateAndRetry() {
-      const progEl = document.getElementById('investigateProgress');
-      const checkedSkus = [];
-      document.querySelectorAll('.rec-check:checked').forEach(cb => checkedSkus.push(cb.dataset.sku));
-
-      // チェック済みアイテムのASINを取得
-      const itemsToCheck = checkedSkus.map(sku => {
-        const rec = recData.find(r => r.amazon_sku === sku) || manualItems.find(m => m.amazon_sku === sku);
-        return { sku, asin: rec?.asin || '', product_name: rec?.product_name || '' };
-      }).filter(i => i.asin);
-
-      if (itemsToCheck.length === 0) {
-        alert('ASINのある商品がありません');
-        return;
-      }
-
-      const ngSkus = [];
-      for (let i = 0; i < itemsToCheck.length; i++) {
-        const item = itemsToCheck[i];
-        if (progEl) progEl.textContent = `チェック中... ${i + 1}/${itemsToCheck.length}`;
-        try {
-          const res = await fetch(`${BASE}/api/eligibility/check-one?asin=${encodeURIComponent(item.asin)}&msku=${encodeURIComponent(item.sku)}&product_name=${encodeURIComponent(item.product_name)}`);
-          const d = await res.json();
-          if (!d.is_eligible) {
-            ngSkus.push(item.sku);
-            log(`⛔ NG検出: ${item.product_name || item.sku}`);
-          }
-        } catch {}
-        // レート制限待機はサーバー側で処理済み
-      }
-
-      if (progEl) progEl.textContent = '';
-
-      if (ngSkus.length === 0) {
-        log('NG商品は見つかりませんでした（Eligibility APIでは検出不可の制限かもしれません）');
-        alert('NG商品を特定できませんでした。Seller Centralで確認してください。');
-        return;
-      }
-
-      log(`NG商品 ${ngSkus.length}件を特定: ${ngSkus.join(', ')} → 除外して再作成します`);
-
-      // NG商品のチェックを外して再作成
-      const ngSet = new Set(ngSkus);
-      document.querySelectorAll('.rec-check:checked').forEach(cb => {
-        if (ngSet.has(cb.dataset.sku)) {
-          cb.checked = false;
-          selectedSkus.delete(cb.dataset.sku);
-        }
-      });
-      updateSelectedCount();
-      closeInboundModal();
-      await createInboundPlanAction();
-    }
-
     // FBA_INBエラーコードの日本語翻訳
     const FBA_ERROR_JP = {
       'FBA_INB_0004': '危険物（Hazmat）として規制されている商品',
@@ -2424,8 +2337,7 @@ Step10: アラート判定</pre>
           <div class="debug-overlay"></div>
           <div class="debug-modal" style="max-width:500px;">
             <h3 style="margin:0 0 16px;">📦 納品プラン作成中...</h3>
-            <p><span class="spinner" style="border-color:#2563eb;border-top-color:transparent;width:20px;height:20px;"></span> ${data.totalItems} SKUを処理中</p>
-            <p style="font-size:12px;color:#666;">※ エラー発生時は自動で原因特定→リトライします（最大5分）</p>
+            <p><span class="spinner" style="border-color:#2563eb;border-top-color:transparent;width:20px;height:20px;"></span> ${data.totalItems} SKUを処理中（最大3分かかります）</p>
           </div>`;
       } else if (type === 'success') {
         const corrections = data.prepCorrections || [];
@@ -2459,7 +2371,6 @@ Step10: アラート判定</pre>
             <div style="background:#f0fdf4;padding:12px;border-radius:6px;margin-bottom:16px;">
               <div><strong>プランID:</strong> ${data.inboundPlanId}</div>
               <div><strong>SKU数:</strong> ${data.totalItems} SKU</div>
-              ${data.excludedItems?.length > 0 ? `<div style="color:#d97706;font-size:12px;margin-top:4px;">⚠ NG商品 ${data.excludedItems.length}件を自動除外しました（${data.excludedItems.map(i => i.product_name || i.amazon_sku).join('、')}）</div>` : ''}
               ${data.retried ? '<div style="color:#d97706;font-size:12px;margin-top:4px;">※ prep設定を自動修正してリトライしました</div>' : ''}
             </div>
             ${correctionsHtml}
@@ -2486,19 +2397,21 @@ Step10: アラート判定</pre>
           </tr>`;
         }).join('');
 
-        // SKUが不明なエラーがある場合
-        const hasUnknownSku = data.hasUnknownSku || problems.some(p => (p.msku || p.sku || '-') === '-');
-        let unknownSkuHtml = '';
-        if (hasUnknownSku) {
-          unknownSkuHtml = `
-            <div style="background:#fef3c7;padding:10px;border-radius:6px;margin-top:12px;font-size:12px;">
-              <strong>⚠ エラーの原因SKUを特定できませんでした</strong><br>
-              「NG商品を調査」で原因を特定し、除外して再作成できます。
-              <div style="margin-top:8px;">
-                <button class="btn btn-primary" onclick="investigateAndRetry()" style="background:#d97706; padding:6px 14px; font-size:12px;">🔍 NG商品を調査して再作成</button>
-                <span id="investigateProgress" style="margin-left:8px;font-size:11px;color:#666;"></span>
+        // SKUが不明なエラーがある場合、全送信アイテムを参考表示
+        const hasUnknownSku = problems.some(p => (p.msku || p.sku || '-') === '-');
+        const submittedItems = data.submittedItems || [];
+        let submittedHtml = '';
+        if (hasUnknownSku && submittedItems.length > 0) {
+          submittedHtml = `
+            <details style="margin-top:12px;">
+              <summary style="cursor:pointer;font-size:12px;color:#666;">送信した全商品リスト（${submittedItems.length}件）を表示</summary>
+              <div style="max-height:150px;overflow-y:auto;margin-top:4px;">
+                <table style="width:100%;border-collapse:collapse;">
+                  <tr style="background:#f3f4f6;"><th style="padding:3px 6px;border:1px solid #e5e7eb;font-size:11px;">SKU</th><th style="padding:3px 6px;border:1px solid #e5e7eb;font-size:11px;">商品名</th><th style="padding:3px 6px;border:1px solid #e5e7eb;font-size:11px;">数量</th></tr>
+                  ${submittedItems.map(i => `<tr><td style="padding:3px 6px;border:1px solid #e5e7eb;font-size:10px;">${i.amazon_sku}</td><td style="padding:3px 6px;border:1px solid #e5e7eb;font-size:10px;">${i.product_name}</td><td style="padding:3px 6px;border:1px solid #e5e7eb;font-size:10px;">${i.ship_qty}</td></tr>`).join('')}
+                </table>
               </div>
-            </div>`;
+            </details>`;
         }
 
         html = `
@@ -2519,7 +2432,7 @@ Step10: アラート判定</pre>
                   ${problemsHtml}
                 </table>
               </div>
-              ${unknownSkuHtml}
+              ${submittedHtml}
             ` : '<p style="color:#666;">エラー詳細が返されませんでした。</p>'}
             <div style="display:flex;gap:8px;margin-top:16px;">
               ${errorSkus.length > 0 && successCount > 0 ? `<button class="btn btn-primary" onclick="retryWithoutErrors(${JSON.stringify(errorSkus)})" style="background:#dc2626;">エラーを除いて再作成（${successCount} SKU）</button>` : ''}
