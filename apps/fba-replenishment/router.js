@@ -350,11 +350,24 @@ router.post('/api/create-inbound-plan', express.json(), async (req, res) => {
     let result = await createInboundPlan(sourceAddress, apiItems, planName);
 
     // prepOwnerエラーがあれば自動リトライ
+    let prepOverrides = {};
+    let originalPrepErrors = [];
     if (result.status === 'FAILED' || (result.problems && result.problems.length > 0)) {
       const errorMsg = result.problems.map(p => p.message || '').join(' ');
-      const prepOverrides = parsePrepErrors(errorMsg);
+      prepOverrides = parsePrepErrors(errorMsg);
 
       if (Object.keys(prepOverrides).length > 0) {
+        // リトライ前のエラー情報を保存
+        originalPrepErrors = Object.entries(prepOverrides).map(([sku, newVal]) => {
+          const item = items.find(i => i.amazon_sku === sku);
+          return {
+            sku,
+            product_name: item?.product_name || sku,
+            original: newVal === 'SELLER' ? 'NONE' : 'SELLER',
+            corrected: newVal,
+            reason: newVal === 'SELLER' ? 'prep（梱包準備）が必要な商品' : 'prep不要な商品',
+          };
+        });
         console.log(`[Inbound] prepOwnerエラー検出、${Object.keys(prepOverrides).length}件を修正してリトライ...`);
         const retryItems = buildApiItems(items, prepOverrides);
         result = await createInboundPlan(sourceAddress, retryItems, planName);
@@ -370,6 +383,8 @@ router.post('/api/create-inbound-plan', express.json(), async (req, res) => {
       totalItems: items.length,
       successItems: result.status === 'SUCCESS' ? items.length : 0,
       errorItems: result.problems.length,
+      retried: originalPrepErrors.length > 0,
+      prepCorrections: originalPrepErrors,
     });
   } catch (e) {
     // catchでもprepOwnerエラーを検出（API例外として飛んでくる場合）

@@ -2314,15 +2314,40 @@ Step10: アラート判定</pre>
             <p><span class="spinner" style="border-color:#2563eb;border-top-color:transparent;width:20px;height:20px;"></span> ${data.totalItems} SKUを処理中（最大3分かかります）</p>
           </div>`;
       } else if (type === 'success') {
+        const corrections = data.prepCorrections || [];
+        let correctionsHtml = '';
+        if (corrections.length > 0) {
+          const rows = corrections.map(c =>
+            `<tr>
+              <td style="padding:4px 8px;border:1px solid #e5e7eb;font-size:11px;">${c.sku}</td>
+              <td style="padding:4px 8px;border:1px solid #e5e7eb;font-size:11px;">${c.product_name}</td>
+              <td style="padding:4px 8px;border:1px solid #e5e7eb;font-size:11px;">${c.reason}</td>
+              <td style="padding:4px 8px;border:1px solid #e5e7eb;font-size:11px;">${c.original} → ${c.corrected}</td>
+            </tr>`
+          ).join('');
+          correctionsHtml = `
+            <div style="background:#fef3c7;padding:12px;border-radius:6px;margin-bottom:16px;">
+              <h4 style="margin:0 0 8px;color:#92400e;">⚠ 自動修正（${corrections.length}件）</h4>
+              <p style="font-size:12px;color:#666;margin:0 0 8px;">以下のSKUはprepOwnerを自動修正してリトライしました。</p>
+              <div style="max-height:150px;overflow-y:auto;">
+                <table style="width:100%;border-collapse:collapse;">
+                  <tr style="background:#f3f4f6;"><th style="padding:4px 8px;border:1px solid #e5e7eb;font-size:11px;">SKU</th><th style="padding:4px 8px;border:1px solid #e5e7eb;font-size:11px;">商品名</th><th style="padding:4px 8px;border:1px solid #e5e7eb;font-size:11px;">理由</th><th style="padding:4px 8px;border:1px solid #e5e7eb;font-size:11px;">修正</th></tr>
+                  ${rows}
+                </table>
+              </div>
+            </div>`;
+        }
         html = `
           <div class="debug-overlay" onclick="closeInboundModal()"></div>
-          <div class="debug-modal" style="max-width:600px;">
+          <div class="debug-modal" style="max-width:700px;">
             <span class="debug-close" onclick="closeInboundModal()">&times;</span>
             <h3 style="margin:0 0 16px;color:#16a34a;">✅ 納品プラン作成成功</h3>
             <div style="background:#f0fdf4;padding:12px;border-radius:6px;margin-bottom:16px;">
               <div><strong>プランID:</strong> ${data.inboundPlanId}</div>
               <div><strong>SKU数:</strong> ${data.totalItems} SKU</div>
+              ${data.retried ? '<div style="color:#d97706;font-size:12px;margin-top:4px;">※ prep設定を自動修正してリトライしました</div>' : ''}
             </div>
+            ${correctionsHtml}
             <p style="font-size:13px;color:#666;">Seller Centralで続きの操作を行ってください（梱包・配送先選択・ラベル印刷）</p>
             <div style="display:flex;gap:8px;margin-top:16px;">
               <a href="https://sellercentral-japan.amazon.com/fba/sendtoamazon" target="_blank" class="btn btn-primary" style="text-decoration:none;">Seller Centralを開く</a>
