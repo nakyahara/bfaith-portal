@@ -712,6 +712,7 @@
         input.style.fontWeight = '';
       }
       updateSelectedCount();
+      scheduleAutoSave();
     }
 
     function onCheckChange(cb) {
@@ -721,6 +722,7 @@
         selectedSkus.delete(cb.dataset.sku);
       }
       updateSelectedCount();
+      scheduleAutoSave();
     }
 
     function checkAllRed() {
@@ -729,6 +731,7 @@
         selectedSkus.add(cb.dataset.sku);
       });
       updateSelectedCount();
+      scheduleAutoSave();
     }
 
     function uncheckAll() {
@@ -737,6 +740,7 @@
       });
       selectedSkus.clear();
       updateSelectedCount();
+      scheduleAutoSave();
     }
 
     function filterRecList() {
@@ -1687,7 +1691,19 @@ Step10: アラート判定</pre>
 
     // ===== ドラフト保存/復元 =====
 
-    async function saveDraftAction() {
+    // 自動保存（デバウンス: 最後の操作から2秒後に保存）
+    let autoSaveTimer = null;
+    function scheduleAutoSave() {
+      if (autoSaveTimer) clearTimeout(autoSaveTimer);
+      const msgEl = document.getElementById('draftSaveMsg');
+      if (msgEl) { msgEl.textContent = '保存待ち...'; msgEl.style.color = '#999'; }
+      autoSaveTimer = setTimeout(() => {
+        autoSaveTimer = null;
+        saveDraftAction(true);
+      }, 2000);
+    }
+
+    async function saveDraftAction(isAuto = false) {
       const msgEl = document.getElementById('draftSaveMsg');
       // 全行の状態を収集（チェック有無 + 数量変更 + 欠品から追加）
       const items = [];
@@ -1721,8 +1737,8 @@ Step10: アラート判定</pre>
       }
 
       if (items.length === 0) {
-        msgEl.textContent = '保存するデータがありません';
-        msgEl.style.color = '#d97706';
+        if (!isAuto) { msgEl.textContent = '保存するデータがありません'; msgEl.style.color = '#d97706'; }
+        else { msgEl.textContent = ''; }
         return;
       }
 
@@ -1735,10 +1751,15 @@ Step10: アラート判定</pre>
         const d = await res.json();
         const checkedCount = items.filter(i => i.checked).length;
         const totalQty = items.filter(i => i.checked).reduce((s, i) => s + i.ship_qty, 0);
-        msgEl.textContent = `保存しました（${checkedCount} SKU / ${totalQty.toLocaleString()} 個）`;
-        msgEl.style.color = '#16a34a';
+        const now = new Date().toLocaleTimeString('ja-JP');
+        if (isAuto) {
+          msgEl.textContent = `自動保存 ${now}`;
+          msgEl.style.color = '#999';
+        } else {
+          msgEl.textContent = `保存しました（${checkedCount} SKU / ${totalQty.toLocaleString()} 個）`;
+          msgEl.style.color = '#16a34a';
+        }
         updateDraftLastSaved();
-        setTimeout(() => { msgEl.textContent = ''; }, 5000);
       } catch(e) {
         msgEl.textContent = 'エラー: ' + e.message;
         msgEl.style.color = '#dc2626';
