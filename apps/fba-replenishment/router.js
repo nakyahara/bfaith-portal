@@ -569,8 +569,8 @@ router.post('/api/export-manifest', express.json(), async (req, res) => {
   if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items[] が必要です' });
 
   const settings = getSettings();
-  const prepOwner = (settings.inbound_prep_owner || 'NONE') === 'NONE' ? 'Amazon' : 'Seller';
-  const labelOwner = (settings.inbound_label_owner || 'AMAZON') === 'AMAZON' ? 'Amazon' : 'Seller';
+  const prepOwner = 'Seller';
+  const labelOwner = 'Seller';
 
   try {
     const ExcelJS = (await import('exceljs')).default;
