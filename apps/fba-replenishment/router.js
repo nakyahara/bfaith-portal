@@ -15,8 +15,8 @@ import { initDb, savePlanningData, getLatestSnapshots, getSettings, updateSettin
 import { fetchAllReports, normalizePlanningRow } from './sp-api-reports.js';
 import { syncSkuMappings } from './sheets-sync.js';
 import { generateRecommendations } from './calculation-engine.js';
-import { createInboundPlan, checkInboundEligibility } from './inbound-plans.js';
-// checkInboundEligibility: 1件チェックAPI用（フロントエンド駆動、サーバーはバルク処理しない）
+import { createInboundPlan } from './inbound-plans.js';
+import SellingPartner from 'amazon-sp-api';
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -282,17 +282,6 @@ router.get('/api/recommendations/:sku', (req, res) => {
   } catch (e) {
     console.error('[FBA] SKU詳細エラー:', e);
     res.status(500).json({ error: e.message });
-  }
-});
-
-// ===== 診断: Eligibility API テスト =====
-router.get('/api/debug/eligibility/:asin', async (req, res) => {
-  try {
-    const items = [{ asin: req.params.asin, msku: 'TEST' }];
-    const result = await checkInboundEligibility(items);
-    res.json({ asin: req.params.asin, result, raw: 'check server logs for details' });
-  } catch (e) {
-    res.json({ asin: req.params.asin, error: e.message, stack: e.stack?.split('\n').slice(0, 5) });
   }
 });
 
@@ -604,18 +593,32 @@ router.get('/api/eligibility/check-one', async (req, res) => {
   if (!asin) return res.status(400).json({ error: 'asin必須' });
 
   try {
-    const ineligible = await checkInboundEligibility([{ asin, msku: msku || '' }]);
-    const isEligible = ineligible.length === 0;
-    const reasons = ineligible.length > 0 ? (ineligible[0].reasons || []) : [];
+    const sp = new SellingPartner({
+      region: 'fe',
+      refresh_token: process.env.SP_API_REFRESH_TOKEN,
+      credentials: {
+        SELLING_PARTNER_APP_CLIENT_ID: process.env.SP_API_CLIENT_ID,
+        SELLING_PARTNER_APP_CLIENT_SECRET: process.env.SP_API_CLIENT_SECRET,
+        AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID,
+        AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY,
+      },
+    });
+    const result = await sp.callAPI({
+      api_path: '/fba/inbound/v1/eligibility/itemPreview',
+      method: 'GET',
+      query: { asin, program: 'INBOUND', marketplaceIds: process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528' },
+    });
 
-    // DBにキャッシュ
+    const isEligible = result.isEligibleForProgram !== false;
+    const reasons = result.ineligibilityReasonList || [];
+
     if (msku) {
       saveEligibilityBatch([{ asin, amazon_sku: msku, product_name: product_name || '', is_eligible: isEligible, reasons }]);
     }
 
     res.json({ asin, msku, is_eligible: isEligible, reasons });
   } catch (e) {
-    res.json({ asin, msku, is_eligible: true, reasons: [], error: e.message });
+    res.json({ asin, msku, is_eligible: true, reasons: [], error: (e.message || '').slice(0, 200) });
   }
 });
 
