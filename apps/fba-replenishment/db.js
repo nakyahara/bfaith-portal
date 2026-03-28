@@ -826,3 +826,20 @@ export function clearDraft() {
   db.run('DELETE FROM shipment_draft_meta');
   saveToFile();
 }
+
+// ===== FNSKU一括更新 =====
+export function updateFnskuBatch(items) {
+  db.run('BEGIN TRANSACTION');
+  try {
+    for (const item of items) {
+      if (item.sku && item.fnsku) {
+        db.run('UPDATE sku_mapping SET fnsku = ? WHERE amazon_sku = ?', [item.fnsku, item.sku]);
+      }
+    }
+    db.run('COMMIT');
+    saveToFile();
+  } catch (e) {
+    db.run('ROLLBACK');
+    throw e;
+  }
+}

@@ -10,7 +10,7 @@ import { initDb, savePlanningData, getLatestSnapshots, getSettings, updateSettin
          getShipmentPlans, getShipmentPlanItems, getDailySnapshots,
          getStockoutHidden, hideStockoutSku, unhideStockoutSku, hideStockoutSkuBulk,
          getNewProductHidden, hideNewProductSkuBulk, unhideNewProductSku,
-         saveDraft, getDraft, clearDraft } from './db.js';
+         saveDraft, getDraft, clearDraft, updateFnskuBatch } from './db.js';
 import { fetchAllReports, normalizePlanningRow } from './sp-api-reports.js';
 import { syncSkuMappings } from './sheets-sync.js';
 import { generateRecommendations } from './calculation-engine.js';
@@ -71,11 +71,24 @@ router.post('/api/fetch-reports', async (req, res) => {
       savedCount = savePlanningData(normalized);
     }
 
+    // INVENTORYデータからFNSKUを抽出してsku_mappingに保存
+    let fnskuCount = 0;
+    if (results.inventory && results.inventory.length > 0) {
+      const fnskuItems = results.inventory
+        .filter(r => (r['sku'] || r['seller-sku']) && (r['fnsku'] || r['fulfillment-channel-sku']))
+        .map(r => ({ sku: r['sku'] || r['seller-sku'], fnsku: r['fnsku'] || r['fulfillment-channel-sku'] }));
+      if (fnskuItems.length > 0) {
+        updateFnskuBatch(fnskuItems);
+        fnskuCount = fnskuItems.length;
+        console.log(`[FBA] FNSKU更新: ${fnskuCount}件`);
+      }
+    }
+
     res.json({
       success: true,
       planning: { count: results.planning?.length || 0, saved: savedCount },
       restock: { count: results.restock?.length || 0 },
-      inventory: { count: results.inventory?.length || 0 },
+      inventory: { count: results.inventory?.length || 0, fnskuUpdated: fnskuCount },
       errors: results.errors,
     });
   } catch (e) {
@@ -250,6 +263,13 @@ router.get('/api/recommendations', (req, res) => {
   try {
     const debug = req.query.debug === '1' || req.query.debug === 'true';
     const result = generateRecommendations(debug);
+    // FNSKU情報を付与
+    const mappings = getSkuMappings();
+    const fnskuMap = {};
+    for (const m of mappings) if (m.fnsku) fnskuMap[m.amazon_sku] = m.fnsku;
+    for (const item of result.items) {
+      item.fnsku = fnskuMap[item.amazon_sku] || '';
+    }
     res.json(result);
   } catch (e) {
     console.error('[FBA] 推奨リスト生成エラー:', e);
