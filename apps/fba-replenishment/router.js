@@ -14,6 +14,7 @@ import { initDb, savePlanningData, getLatestSnapshots, getSettings, updateSettin
 import { fetchAllReports, normalizePlanningRow } from './sp-api-reports.js';
 import { syncSkuMappings } from './sheets-sync.js';
 import { generateRecommendations } from './calculation-engine.js';
+import { createInboundPlan } from './inbound-plans.js';
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -266,6 +267,63 @@ router.get('/api/recommendations/:sku', (req, res) => {
   } catch (e) {
     console.error('[FBA] SKU詳細エラー:', e);
     res.status(500).json({ error: e.message });
+  }
+});
+
+// ===== 納品プラン作成 =====
+let inboundPlanInProgress = false;
+router.post('/api/create-inbound-plan', express.json(), async (req, res) => {
+  if (inboundPlanInProgress) return res.status(409).json({ error: '納品プラン作成中です。しばらくお待ちください。' });
+
+  const { items, planName } = req.body;
+  if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items[] が必要です' });
+
+  // 設定から住所・ラベル設定を取得
+  const settings = getSettings();
+  const sourceAddress = {
+    name: settings.inbound_ship_from_name || '',
+    addressLine1: settings.inbound_ship_from_address1 || '',
+    addressLine2: settings.inbound_ship_from_address2 || '',
+    city: settings.inbound_ship_from_city || '',
+    stateOrProvinceCode: settings.inbound_ship_from_state || '',
+    postalCode: settings.inbound_ship_from_postal_code || '',
+    countryCode: settings.inbound_ship_from_country || 'JP',
+  };
+
+  // 住所チェック
+  if (!sourceAddress.name || !sourceAddress.addressLine1 || !sourceAddress.postalCode) {
+    return res.status(400).json({ error: '送り元住所が未設定です。設定画面で住所を入力してください。' });
+  }
+
+  const labelOwner = settings.inbound_label_owner || 'AMAZON';
+  const prepOwner = settings.inbound_prep_owner || 'SELLER';
+
+  const apiItems = items.map(i => ({
+    msku: i.amazon_sku,
+    quantity: i.ship_qty,
+    labelOwner,
+    prepOwner,
+    ...(i.expiry_date ? { expiration: i.expiry_date } : {}),
+  }));
+
+  inboundPlanInProgress = true;
+  try {
+    const result = await createInboundPlan(sourceAddress, apiItems, planName);
+    res.json({
+      success: result.status === 'SUCCESS',
+      inboundPlanId: result.inboundPlanId,
+      operationId: result.operationId,
+      status: result.status,
+      problems: result.problems,
+      totalItems: items.length,
+      successItems: result.status === 'SUCCESS' ? items.length : 0,
+      errorItems: result.problems.length,
+    });
+  } catch (e) {
+    console.error('[Inbound] プラン作成エラー:', e);
+    res.status(500).json({ error: e.message });
+  } finally {
+    inboundPlanInProgress = false;
   }
 });
 

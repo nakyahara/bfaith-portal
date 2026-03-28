@@ -243,6 +243,7 @@
         <span style="flex:1;"></span>
         <button class="btn btn-primary" onclick="saveDraftAction()" style="background:#16a34a; padding:6px 16px; font-size:13px;">💾 作業状態を保存</button>
         <button class="btn btn-secondary" onclick="clearDraftConfirm()" style="padding:6px 12px; font-size:12px;">保存クリア</button>
+        <button class="btn btn-primary" onclick="createInboundPlanAction()" style="background:#7c3aed; padding:6px 16px; font-size:13px;">📦 納品プラン作成</button>
         <span style="font-size:11px; color:#666;" id="draftSaveMsg"></span>
       </div>
       <div style="font-size:12px; color:#888; margin-bottom:4px;">※ 黄色は翌日回しOK。必要なものだけ個別にチェック。<span id="draftLastSaved" style="margin-left:12px; color:#2563eb;"></span></div>
@@ -962,6 +963,9 @@
         if (r.expiry_limited) {
           alertsHtml += `<span class="alert-badge alert-2" title="有効期限制限: ${r.expiry_date} 同一期限${r.expiry_same_qty}個">⚠ 期限制限${r.expiry_same_qty}個</span>`;
         }
+        if (r._planCreated) {
+          alertsHtml += `<span class="alert-badge" style="background:#dcfce7;color:#16a34a;font-weight:bold;">プラン作成済み ✅</span>`;
+        }
         const dosVal = r.days_of_supply;
         const dosColor = typeof dosVal === 'number' && dosVal < 7 ? 'color:#dc2626;font-weight:bold' : typeof dosVal === 'number' && dosVal < 14 ? 'color:#d97706' : '';
         const reorderVal = r.reorder_point;
@@ -1156,6 +1160,21 @@
           { key: 'missing_bsr_threshold', label: '送り漏れBSR閾値', unit: '位', desc: 'BSRがこの順位以内でFBA在庫0なら送り漏れアラート。' },
         ]
       },
+      {
+        group: '納品プラン（送り元住所）',
+        desc: 'SP-APIで納品プランを作成する時の送り元住所です。',
+        items: [
+          { key: 'inbound_ship_from_name', label: '名前（会社名）', unit: '', desc: '倉庫・会社名' },
+          { key: 'inbound_ship_from_address1', label: '住所1', unit: '', desc: '' },
+          { key: 'inbound_ship_from_address2', label: '住所2', unit: '', desc: '建物名・部屋番号等' },
+          { key: 'inbound_ship_from_city', label: '市区町村', unit: '', desc: '' },
+          { key: 'inbound_ship_from_state', label: '都道府県', unit: '', desc: '例: 大阪府' },
+          { key: 'inbound_ship_from_postal_code', label: '郵便番号', unit: '', desc: '例: 123-4567' },
+          { key: 'inbound_ship_from_country', label: '国コード', unit: '', desc: '通常はJP' },
+          { key: 'inbound_label_owner', label: 'ラベル貼り', unit: '', desc: 'AMAZON（Amazon貼付）またはSELLER（自社貼付）' },
+          { key: 'inbound_prep_owner', label: '梱包準備', unit: '', desc: 'AMAZON（Amazon対応）またはSELLER（自社対応）またはNONE' },
+        ]
+      },
     ];
 
     let currentSettings = {};
@@ -1184,7 +1203,7 @@
           const val = currentSettings[item.key] || '';
           html += `<div class="setting-row">
             <label>${item.label}<span class="setting-desc">${item.desc}</span></label>
-            <input type="text" value="${val}" data-key="${item.key}" onchange="saveSetting(this)">
+            <input type="text" value="${val}" data-key="${item.key}" onchange="saveSetting(this)" ${item.key.startsWith('inbound_') ? 'style="width:200px"' : ''}>
             <span style="font-size:12px;color:#666;min-width:50px;">${item.unit}</span>
             <span class="setting-saved" id="saved_${item.key}">保存済</span>
           </div>`;
@@ -2177,6 +2196,195 @@ Step10: アラート判定</pre>
 
     // 初期状態: Step 1 をアクティブに
     document.getElementById('stepBadge1').classList.add('active');
+
+    // ===== 納品プラン作成 =====
+    async function createInboundPlanAction() {
+      // チェック済みのSKUを収集
+      const checkedItems = [];
+      document.querySelectorAll('.rec-check:checked').forEach(cb => {
+        const sku = cb.dataset.sku;
+        const qtyInput = document.querySelector(`.ship-qty-input[data-sku="${sku}"]`);
+        const qty = parseInt(qtyInput?.value) || 0;
+        if (qty <= 0) return; // 数量0は除外
+        const item = recData.find(r => r.amazon_sku === sku) || manualItems.find(m => m.amazon_sku === sku);
+        checkedItems.push({
+          amazon_sku: sku,
+          ship_qty: qty,
+          product_name: item?.product_name || sku,
+          expiry_date: item?.expiry_date || '',
+        });
+      });
+
+      if (checkedItems.length === 0) {
+        alert('チェック済みで数量が入力されている商品がありません。');
+        return;
+      }
+
+      // 数量0のチェック済みを警告
+      let zeroQtySkus = [];
+      document.querySelectorAll('.rec-check:checked').forEach(cb => {
+        const sku = cb.dataset.sku;
+        const qtyInput = document.querySelector(`.ship-qty-input[data-sku="${sku}"]`);
+        const qty = parseInt(qtyInput?.value) || 0;
+        if (qty <= 0) zeroQtySkus.push(sku);
+      });
+
+      let confirmMsg = `${checkedItems.length} SKU（合計 ${checkedItems.reduce((s, i) => s + i.ship_qty, 0).toLocaleString()} 個）で納品プランを作成します。`;
+      if (zeroQtySkus.length > 0) {
+        confirmMsg += `\n\n※ 数量0の ${zeroQtySkus.length} SKUは除外されます。`;
+      }
+      confirmMsg += '\n\nよろしいですか？';
+      if (!confirm(confirmMsg)) return;
+
+      // 作成中モーダル表示
+      showInboundModal('creating', { totalItems: checkedItems.length });
+      log(`納品プラン作成中... ${checkedItems.length} SKU`);
+
+      try {
+        const res = await fetch(`${BASE}/api/create-inbound-plan`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items: checkedItems }),
+        });
+        const d = await res.json();
+
+        if (d.error) {
+          showInboundModal('error', { error: d.error });
+          log('納品プラン作成エラー: ' + d.error);
+          return;
+        }
+
+        if (d.success) {
+          showInboundModal('success', d);
+          log(`納品プラン作成成功: プランID ${d.inboundPlanId}`);
+          // 成功したSKUにフラグを立てる
+          for (const item of checkedItems) {
+            const rec = recData.find(r => r.amazon_sku === item.amazon_sku);
+            if (rec) rec._planCreated = true;
+          }
+          filterRecList();
+        } else {
+          // FAILED — エラー詳細を表示
+          showInboundModal('failed', { ...d, items: checkedItems });
+          log(`納品プラン作成失敗: ${d.problems?.length || 0} 件のエラー`);
+          // エラーSKUにアラートを追加
+          if (d.problems) {
+            for (const p of d.problems) {
+              const rec = recData.find(r => r.amazon_sku === p.msku);
+              if (rec && rec.alerts) {
+                rec.alerts.push({ type: 'plan_error', level: 3, message: `プランエラー: ${p.message || p.code}` });
+              }
+            }
+            filterRecList();
+          }
+        }
+      } catch (e) {
+        showInboundModal('error', { error: e.message });
+        log('納品プラン作成エラー: ' + e.message);
+      }
+    }
+
+    // エラーSKUを除いて再作成
+    async function retryWithoutErrors(errorSkus) {
+      const errorSet = new Set(errorSkus);
+      // エラーSKUのチェックを外す
+      document.querySelectorAll('.rec-check:checked').forEach(cb => {
+        if (errorSet.has(cb.dataset.sku)) {
+          cb.checked = false;
+          selectedSkus.delete(cb.dataset.sku);
+        }
+      });
+      updateSelectedCount();
+      // モーダルを閉じる
+      closeInboundModal();
+      // 再作成
+      await createInboundPlanAction();
+    }
+
+    function showInboundModal(type, data) {
+      closeInboundModal();
+
+      let html = '';
+      if (type === 'creating') {
+        html = `
+          <div class="debug-overlay"></div>
+          <div class="debug-modal" style="max-width:500px;">
+            <h3 style="margin:0 0 16px;">📦 納品プラン作成中...</h3>
+            <p><span class="spinner" style="border-color:#2563eb;border-top-color:transparent;width:20px;height:20px;"></span> ${data.totalItems} SKUを処理中（最大3分かかります）</p>
+          </div>`;
+      } else if (type === 'success') {
+        html = `
+          <div class="debug-overlay" onclick="closeInboundModal()"></div>
+          <div class="debug-modal" style="max-width:600px;">
+            <span class="debug-close" onclick="closeInboundModal()">&times;</span>
+            <h3 style="margin:0 0 16px;color:#16a34a;">✅ 納品プラン作成成功</h3>
+            <div style="background:#f0fdf4;padding:12px;border-radius:6px;margin-bottom:16px;">
+              <div><strong>プランID:</strong> ${data.inboundPlanId}</div>
+              <div><strong>SKU数:</strong> ${data.totalItems} SKU</div>
+            </div>
+            <p style="font-size:13px;color:#666;">Seller Centralで続きの操作を行ってください（梱包・配送先選択・ラベル印刷）</p>
+            <div style="display:flex;gap:8px;margin-top:16px;">
+              <a href="https://sellercentral-japan.amazon.com/fba/sendtoamazon" target="_blank" class="btn btn-primary" style="text-decoration:none;">Seller Centralを開く</a>
+              <button class="btn btn-secondary" onclick="closeInboundModal()">閉じる</button>
+            </div>
+          </div>`;
+      } else if (type === 'failed') {
+        const problems = data.problems || [];
+        const errorSkus = problems.map(p => p.msku || p.code).filter(Boolean);
+        const successCount = data.totalItems - problems.length;
+        const problemsHtml = problems.map(p =>
+          `<tr>
+            <td style="padding:4px 8px;border:1px solid #e5e7eb;font-size:12px;">${p.msku || '-'}</td>
+            <td style="padding:4px 8px;border:1px solid #e5e7eb;font-size:12px;">${p.code || '-'}</td>
+            <td style="padding:4px 8px;border:1px solid #e5e7eb;font-size:12px;">${p.message || p.details || '-'}</td>
+          </tr>`
+        ).join('');
+
+        html = `
+          <div class="debug-overlay" onclick="closeInboundModal()"></div>
+          <div class="debug-modal" style="max-width:700px;">
+            <span class="debug-close" onclick="closeInboundModal()">&times;</span>
+            <h3 style="margin:0 0 16px;color:#dc2626;">❌ 納品プラン作成失敗</h3>
+            <div style="background:#fee2e2;padding:12px;border-radius:6px;margin-bottom:16px;">
+              <div><strong>ステータス:</strong> ${data.status}</div>
+              <div><strong>エラー:</strong> ${problems.length} 件</div>
+              ${data.inboundPlanId ? `<div><strong>プランID:</strong> ${data.inboundPlanId}</div>` : ''}
+            </div>
+            ${problems.length > 0 ? `
+              <h4 style="margin:0 0 8px;">エラー詳細</h4>
+              <div style="max-height:200px;overflow-y:auto;">
+                <table style="width:100%;border-collapse:collapse;">
+                  <tr style="background:#f3f4f6;"><th style="padding:4px 8px;border:1px solid #e5e7eb;font-size:12px;">SKU</th><th style="padding:4px 8px;border:1px solid #e5e7eb;font-size:12px;">コード</th><th style="padding:4px 8px;border:1px solid #e5e7eb;font-size:12px;">理由</th></tr>
+                  ${problemsHtml}
+                </table>
+              </div>
+            ` : '<p style="color:#666;">エラー詳細が返されませんでした。</p>'}
+            <div style="display:flex;gap:8px;margin-top:16px;">
+              ${errorSkus.length > 0 && successCount > 0 ? `<button class="btn btn-primary" onclick="retryWithoutErrors(${JSON.stringify(errorSkus)})" style="background:#dc2626;">エラーを除いて再作成（${successCount} SKU）</button>` : ''}
+              <button class="btn btn-secondary" onclick="closeInboundModal()">閉じる</button>
+            </div>
+          </div>`;
+      } else if (type === 'error') {
+        html = `
+          <div class="debug-overlay" onclick="closeInboundModal()"></div>
+          <div class="debug-modal" style="max-width:500px;">
+            <span class="debug-close" onclick="closeInboundModal()">&times;</span>
+            <h3 style="margin:0 0 16px;color:#dc2626;">❌ エラー</h3>
+            <p>${data.error}</p>
+            <button class="btn btn-secondary" onclick="closeInboundModal()" style="margin-top:16px;">閉じる</button>
+          </div>`;
+      }
+
+      const div = document.createElement('div');
+      div.id = 'inboundModalContainer';
+      div.innerHTML = html;
+      document.body.appendChild(div);
+    }
+
+    function closeInboundModal() {
+      const c = document.getElementById('inboundModalContainer');
+      if (c) c.remove();
+    }
 
     // ===== ドラフト保存/復元 =====
 

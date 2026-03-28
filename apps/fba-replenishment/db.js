@@ -322,6 +322,16 @@ export async function initDb() {
     ['missing_bsr_threshold', '5000'],
     ['working_expiry_days', '7'],
     ['non_fba_reserve_days', '60'],
+    // 納品プラン設定
+    ['inbound_ship_from_name', ''],
+    ['inbound_ship_from_address1', ''],
+    ['inbound_ship_from_address2', ''],
+    ['inbound_ship_from_city', ''],
+    ['inbound_ship_from_state', ''],
+    ['inbound_ship_from_postal_code', ''],
+    ['inbound_ship_from_country', 'JP'],
+    ['inbound_label_owner', 'AMAZON'],
+    ['inbound_prep_owner', 'SELLER'],
   ];
   for (const [key, value] of defaults) {
     db.run(`INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)`, [key, value]);
