@@ -409,17 +409,43 @@ router.post('/api/create-inbound-plan', express.json(), async (req, res) => {
       };
     });
 
-    // planItemsからエラーSKUを特定（送信したSKUとプランに残ったSKUの差分 = エラーSKU）
+    // --- エラーSKU特定（3段階） ---
     const planItems = result.planItems || [];
     const planSkuSet = new Set(planItems.map(pi => pi.msku));
     const sentSkuSet = new Set(items.map(i => i.amazon_sku));
-    // プランに入らなかったSKU = エラーで弾かれたSKU
     const rejectedSkus = items.filter(i => !planSkuSet.has(i.amazon_sku));
 
+    console.log(`[Inbound] 送信${sentSkuSet.size}件, プラン内${planSkuSet.size}件, 弾かれた${rejectedSkus.length}件`);
+    if (result.problems?.length > 0) {
+      console.log('[Inbound] problems raw:', JSON.stringify(result.problems, null, 2));
+    }
+
+    // problemからSKUを抽出するヘルパー（details オブジェクト対応）
+    function extractSkuFromProblem(p) {
+      // 1. トップレベルのmsku/sku
+      if (p.msku) return p.msku;
+      if (p.sku) return p.sku;
+      // 2. details オブジェクト内のmsku/sku
+      if (p.details && typeof p.details === 'object') {
+        if (p.details.msku) return p.details.msku;
+        if (p.details.sku) return p.details.sku;
+      }
+      // 3. メッセージ/details文字列からSKUをテキストマッチ
+      const detailsStr = (p.details && typeof p.details === 'object')
+        ? JSON.stringify(p.details)
+        : String(p.details || '');
+      const allText = [p.message || '', detailsStr, p.code || ''].join(' ');
+      for (const item of items) {
+        if (allText.includes(item.amazon_sku)) return item.amazon_sku;
+      }
+      return null;
+    }
+
     let enrichedProblems;
-    if (rejectedSkus.length > 0 && (result.problems || []).some(p => !(p.msku || p.sku))) {
-      // APIのproblemsにSKU情報がない場合、rejectedSkusで補完
-      // エラー数と弾かれたSKU数が一致すれば1対1で対応
+
+    // 方式A: planItems差分でエラーSKUを特定
+    if (rejectedSkus.length > 0 && (result.problems || []).some(p => !extractSkuFromProblem(p))) {
+      console.log(`[Inbound] 方式A: planItems差分 → 弾かれた${rejectedSkus.length}件`);
       if (rejectedSkus.length === (result.problems || []).length) {
         enrichedProblems = (result.problems || []).map((p, i) => ({
           ...p,
@@ -427,56 +453,78 @@ router.post('/api/create-inbound-plan', express.json(), async (req, res) => {
           product_name: rejectedSkus[i].product_name || '',
         }));
       } else {
-        // 数が合わない場合: problemsにrejectedSkus情報を追加
-        enrichedProblems = rejectedSkus.map(rej => {
-          const matchingProblem = (result.problems || [])[0] || {};
-          return {
-            ...matchingProblem,
-            msku: rej.amazon_sku,
-            product_name: rej.product_name || '',
-          };
-        });
+        enrichedProblems = rejectedSkus.map(rej => ({
+          ...((result.problems || [])[0] || {}),
+          msku: rej.amazon_sku,
+          product_name: rej.product_name || '',
+        }));
       }
     } else {
-      // APIにSKU情報がある場合 or planItems取得失敗
+      // 方式B: problem自体からSKU抽出（details オブジェクト対応版）
       enrichedProblems = (result.problems || []).map(p => {
-        const allText = [p.message, p.details, p.code].filter(Boolean).join(' ');
-        let matchedSku = p.msku || p.sku || null;
-        if (!matchedSku) {
-          for (const item of items) {
-            if (allText.includes(item.amazon_sku)) { matchedSku = item.amazon_sku; break; }
-          }
-        }
+        const matchedSku = extractSkuFromProblem(p);
         const matchedItem = matchedSku ? items.find(i => i.amazon_sku === matchedSku) : null;
         return { ...p, msku: matchedSku || '-', product_name: matchedItem?.product_name || '' };
       });
     }
 
-    console.log(`[Inbound] 送信${sentSkuSet.size}件, プラン内${planSkuSet.size}件, 弾かれた${rejectedSkus.length}件`);
-
-    // SKU不明のエラーが残っている場合、二分探索でエラーSKUを特定
+    // 方式C: まだSKU不明なら、Eligibility APIで各アイテムを個別チェック（二分探索より高速）
     const hasUnknownSku = enrichedProblems.some(p => p.msku === '-');
     if (hasUnknownSku && result.status === 'FAILED') {
-      console.log('[Inbound] SKU不明エラーあり → 二分探索でエラーSKU特定開始...');
+      console.log('[Inbound] SKU不明エラーあり → Eligibility APIで個別チェック...');
       try {
-        const apiItems = buildApiItems(items, prepOverrides);
-        const errorMskus = await findErrorSkusByBinarySearch(sourceAddress, apiItems);
-        console.log(`[Inbound] 二分探索結果: ${errorMskus.length}件のエラーSKU特定 → ${errorMskus.join(', ')}`);
+        const mappings = getSkuMappings();
+        const mappingMap = {};
+        for (const m of mappings) mappingMap[m.amazon_sku] = m;
 
-        if (errorMskus.length > 0) {
-          const originalError = enrichedProblems[0] || {};
-          enrichedProblems = errorMskus.map(msku => {
-            const item = items.find(i => i.amazon_sku === msku);
+        const checkItems = items.map(i => ({
+          asin: mappingMap[i.amazon_sku]?.asin || i.asin || '',
+          msku: i.amazon_sku,
+        })).filter(i => i.asin);
+
+        const ineligible = await checkInboundEligibility(checkItems);
+        console.log(`[Inbound] Eligibility結果: ${ineligible.length}件が不適格`);
+
+        if (ineligible.length > 0) {
+          enrichedProblems = ineligible.map(ie => {
+            const item = items.find(i => i.amazon_sku === ie.msku);
+            const originalError = (result.problems || [])[0] || {};
             return {
-              msku,
+              msku: ie.msku,
               product_name: item?.product_name || '',
-              code: originalError.code || 'UNKNOWN',
-              message: originalError.message || 'プラン作成エラー',
+              code: originalError.code || ie.reasons?.[0]?.code || 'INELIGIBLE',
+              message: originalError.message || ie.reasons?.map(r => r.message || r.code).join(', ') || '受入不可',
             };
           });
         }
-      } catch (searchErr) {
-        console.error('[Inbound] 二分探索失敗:', searchErr.message);
+      } catch (eligErr) {
+        console.error('[Inbound] Eligibilityチェック失敗:', eligErr.message);
+
+        // 最終手段: 二分探索（タイムアウト付き）
+        console.log('[Inbound] 二分探索にフォールバック...');
+        try {
+          const apiItems = buildApiItems(items, prepOverrides);
+          const searchPromise = findErrorSkusByBinarySearch(sourceAddress, apiItems);
+          const timeoutPromise = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('二分探索タイムアウト（60秒）')), 60000));
+          const errorMskus = await Promise.race([searchPromise, timeoutPromise]);
+          console.log(`[Inbound] 二分探索結果: ${errorMskus.length}件 → ${errorMskus.join(', ')}`);
+
+          if (errorMskus.length > 0) {
+            const originalError = enrichedProblems[0] || {};
+            enrichedProblems = errorMskus.map(msku => {
+              const item = items.find(i => i.amazon_sku === msku);
+              return {
+                msku,
+                product_name: item?.product_name || '',
+                code: originalError.code || 'UNKNOWN',
+                message: originalError.message || 'プラン作成エラー',
+              };
+            });
+          }
+        } catch (searchErr) {
+          console.error('[Inbound] 二分探索も失敗:', searchErr.message);
+        }
       }
     }
 
