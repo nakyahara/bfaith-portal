@@ -575,6 +575,7 @@
     }
 
     async function fetchReports() {
+      if (!confirm('SP-APIレポートを取得すると、保存済みの作業データがリセットされます。よろしいですか？')) return;
       const btn = document.getElementById('btnFetchAll');
       btn.disabled = true;
       btn.innerHTML = '<span class="spinner"></span>取得中...';
@@ -590,6 +591,9 @@
         }
         loadStatus();
         completeStep(1);
+        // データが変わったのでドラフトをクリア
+        try { await fetch(`${BASE}/api/draft`, { method: 'DELETE' }); } catch(e) {}
+        document.getElementById('draftBanner').style.display = 'none';
       } catch (e) { log('エラー: ' + e.message); }
       finally {
         btn.disabled = false;
@@ -632,10 +636,16 @@
     let manualItems = []; // 手動追加アイテム
 
     async function calcRecommendations() {
+      if (!confirm('推奨リストを再計算すると、保存済みの作業データ（チェック・数量変更）がリセットされます。よろしいですか？')) return;
       const btn = document.getElementById('btnCalc');
       btn.disabled = true;
       btn.innerHTML = '<span class="spinner"></span>計算中...';
       log('推奨リスト生成中...');
+
+      // ドラフトをクリア
+      try { await fetch(`${BASE}/api/draft`, { method: 'DELETE' }); } catch(e) {}
+      selectedSkus.clear();
+      Object.keys(shipQtyMap).forEach(k => delete shipQtyMap[k]);
 
       try {
         const res = await fetch(`${BASE}/api/recommendations?debug=1`);
@@ -651,6 +661,10 @@
         filterRecList();
         updateOrderList();
         updateStockoutList();
+        document.getElementById('draftBanner').style.display = 'none';
+        document.getElementById('draftLastSaved').textContent = '';
+        const msgEl = document.getElementById('draftSaveMsg');
+        if (msgEl) msgEl.textContent = '';
       } catch (e) { log('エラー: ' + e.message); }
       finally {
         btn.disabled = false;
