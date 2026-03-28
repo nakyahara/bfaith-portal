@@ -307,10 +307,36 @@ router.post('/api/create-inbound-plan', express.json(), async (req, res) => {
   const { items, planName } = req.body;
   if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items[] が必要です' });
 
-  // NG商品を自動除外
+  // NG商品をリアルタイム再チェック → OKに復帰していれば含める
   const skus = items.map(i => i.amazon_sku);
   const eligData = getEligibilityBySkus(skus);
-  const ngSkuSet = new Set(eligData.filter(e => !e.is_eligible).map(e => e.amazon_sku));
+  const cachedNgItems = eligData.filter(e => !e.is_eligible);
+
+  let ngSkuSet = new Set();
+  if (cachedNgItems.length > 0) {
+    console.log(`[Inbound] キャッシュNG ${cachedNgItems.length}件をリアルタイム再チェック...`);
+    const mappings = getSkuMappings();
+    const mappingMap = {};
+    for (const m of mappings) mappingMap[m.amazon_sku] = m;
+
+    for (const ng of cachedNgItems) {
+      const asin = mappingMap[ng.amazon_sku]?.asin || '';
+      if (!asin) { ngSkuSet.add(ng.amazon_sku); continue; }
+      try {
+        const result = await checkInboundEligibility([{ asin, msku: ng.amazon_sku }]);
+        if (result.length > 0) {
+          ngSkuSet.add(ng.amazon_sku); // まだNG
+        } else {
+          // OKに復帰 → DB更新
+          console.log(`[Inbound] ${ng.amazon_sku} → OKに復帰！`);
+          saveEligibilityBatch([{ asin, amazon_sku: ng.amazon_sku, product_name: ng.product_name, is_eligible: true, reasons: [] }]);
+        }
+      } catch {
+        ngSkuSet.add(ng.amazon_sku); // エラー時は安全側でNG維持
+      }
+    }
+  }
+
   const excludedItems = items.filter(i => ngSkuSet.has(i.amazon_sku));
   const filteredItems = ngSkuSet.size > 0 ? items.filter(i => !ngSkuSet.has(i.amazon_sku)) : items;
 
