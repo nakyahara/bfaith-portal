@@ -65,6 +65,11 @@ export async function createInboundPlan(sourceAddress, items, planName) {
   // ポーリング（最大3分）
   const result = await pollOperation(operationId);
 
+  // エラー詳細をログに出力（問題構造の確認用）
+  if (result.operationProblems && result.operationProblems.length > 0) {
+    console.log('[Inbound] operationProblems:', JSON.stringify(result.operationProblems, null, 2));
+  }
+
   return {
     inboundPlanId,
     operationId,

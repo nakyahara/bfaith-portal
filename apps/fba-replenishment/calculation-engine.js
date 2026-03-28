@@ -183,27 +183,30 @@ export function generateRecommendations(debug = false) {
     let expiryLimited = false;
     let expiryDate = '';
     let expirySameQty = 0;
-    if (recommendedQty > 0 && mapping.logizard_code) {
+    if (mapping.logizard_code) {
       const locations = getWarehouseLocationsByCode(mapping.logizard_code);
       // 有効期限があるロケが1つでもあるかチェック
       const locsWithExpiry = locations.filter(l => l.expiry_date && l.expiry_date.trim() !== '');
       if (locsWithExpiry.length > 0) {
         // 引当優先順で最初に引き当たる有効期限を基準とする
         const baseExpiry = locsWithExpiry[0].expiry_date.trim();
-        // 同一期限のロケ在庫を合算
-        let sameExpiryTotal = 0;
-        for (const loc of locations) {
-          const locExpiry = (loc.expiry_date || '').trim();
-          // 期限なしのロケは「期限に関係なく送れる」扱い → 合算対象
-          if (!locExpiry || locExpiry === baseExpiry) {
-            sameExpiryTotal += loc.available_qty;
+        expiryDate = baseExpiry; // 常に有効期限を保持（納品プラン作成時に必要）
+
+        if (recommendedQty > 0) {
+          // 同一期限のロケ在庫を合算
+          let sameExpiryTotal = 0;
+          for (const loc of locations) {
+            const locExpiry = (loc.expiry_date || '').trim();
+            // 期限なしのロケは「期限に関係なく送れる」扱い → 合算対象
+            if (!locExpiry || locExpiry === baseExpiry) {
+              sameExpiryTotal += loc.available_qty;
+            }
           }
-        }
-        if (sameExpiryTotal < recommendedQty) {
-          expiryLimited = true;
-          expiryDate = baseExpiry;
-          expirySameQty = sameExpiryTotal;
-          recommendedQty = sameExpiryTotal;
+          if (sameExpiryTotal < recommendedQty) {
+            expiryLimited = true;
+            expirySameQty = sameExpiryTotal;
+            recommendedQty = sameExpiryTotal;
+          }
         }
       }
     }

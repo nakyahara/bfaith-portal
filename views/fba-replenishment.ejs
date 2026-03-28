@@ -2302,6 +2302,31 @@ Step10: アラート判定</pre>
       await createInboundPlanAction();
     }
 
+    // FBA_INBエラーコードの日本語翻訳
+    const FBA_ERROR_JP = {
+      'FBA_INB_0004': '危険物（Hazmat）として規制されている商品',
+      'FBA_INB_0006': '危険物審査中（Hazmat情報が未入力）',
+      'FBA_INB_0076': 'この商品はFBAで取扱不可',
+      'FBA_INB_0086': '出品停止中の商品',
+      'FBA_INB_0095': '要期限管理商品の期限情報不備',
+      'FBA_INB_0098': '使用不可のFNSKU',
+      'FBA_INB_0120': '有効期限が短すぎる（FBA受入基準未満）',
+      'FBA_INB_0154': 'リコール対象商品',
+      'FBA_INB_0180': '有効期限の入力が必要（要期限管理商品）',
+      'FBA_INB_0182': 'Prep（梱包準備）の分類情報が未設定',
+      'FBA_INB_0342': '製造元バーコードが使用不可',
+    };
+
+    function translateError(code, message) {
+      const jp = FBA_ERROR_JP[code];
+      if (jp) return jp;
+      // 英語メッセージの簡易翻訳
+      if (message?.includes('Expiration date required')) return '有効期限の入力が必要（要期限管理商品）';
+      if (message?.includes('dangerous good')) return '危険物として規制されている商品';
+      if (message?.includes('prepOwner')) return 'Prep設定エラー';
+      return message || code || '不明なエラー';
+    }
+
     function showInboundModal(type, data) {
       closeInboundModal();
 
@@ -2358,13 +2383,16 @@ Step10: アラート判定</pre>
         const problems = data.problems || [];
         const errorSkus = problems.map(p => p.msku || p.code).filter(Boolean);
         const successCount = data.totalItems - problems.length;
-        const problemsHtml = problems.map(p =>
-          `<tr>
-            <td style="padding:4px 8px;border:1px solid #e5e7eb;font-size:12px;">${p.msku || '-'}</td>
-            <td style="padding:4px 8px;border:1px solid #e5e7eb;font-size:12px;">${p.code || '-'}</td>
-            <td style="padding:4px 8px;border:1px solid #e5e7eb;font-size:12px;">${p.message || p.details || '-'}</td>
-          </tr>`
-        ).join('');
+        const problemsHtml = problems.map(p => {
+          const sku = p.msku || p.sku || '-';
+          const code = p.code || '-';
+          const reason = translateError(code, p.message || p.details);
+          return `<tr>
+            <td style="padding:4px 8px;border:1px solid #e5e7eb;font-size:12px;">${sku}</td>
+            <td style="padding:4px 8px;border:1px solid #e5e7eb;font-size:12px;">${code}</td>
+            <td style="padding:4px 8px;border:1px solid #e5e7eb;font-size:12px;">${reason}</td>
+          </tr>`;
+        }).join('');
 
         html = `
           <div class="debug-overlay" onclick="closeInboundModal()"></div>
