@@ -119,6 +119,57 @@ async function listPlanItems(inboundPlanId) {
  * @param {Array} asins - [{asin, msku}]
  * @returns {Array} 不適格アイテム [{asin, msku, reasons}]
  */
+/**
+ * 二分探索でエラーを起こすSKUを特定
+ * アイテムを半分に分けてプラン作成 → 失敗した方をさらに分割 → 1件に絞り込む
+ * @param {Object} sourceAddress
+ * @param {Array} items - APIに送るアイテム配列 [{msku, quantity, labelOwner, prepOwner, ...}]
+ * @returns {Array} エラーSKUのリスト
+ */
+export async function findErrorSkusByBinarySearch(sourceAddress, items) {
+  console.log(`[BinarySearch] ${items.length}件から問題SKUを探索開始`);
+
+  if (items.length <= 1) {
+    return items.map(i => i.msku);
+  }
+
+  const mid = Math.ceil(items.length / 2);
+  const firstHalf = items.slice(0, mid);
+  const secondHalf = items.slice(mid);
+
+  const errorSkus = [];
+
+  for (const [label, batch] of [['前半', firstHalf], ['後半', secondHalf]]) {
+    try {
+      console.log(`[BinarySearch] ${label} ${batch.length}件を試行...`);
+      const result = await createInboundPlan(sourceAddress, batch, `探索-${label}`);
+
+      if (result.status === 'FAILED') {
+        console.log(`[BinarySearch] ${label} → FAILED、さらに分割`);
+        if (batch.length <= 1) {
+          errorSkus.push(batch[0].msku);
+        } else {
+          const found = await findErrorSkusByBinarySearch(sourceAddress, batch);
+          errorSkus.push(...found);
+        }
+      } else {
+        console.log(`[BinarySearch] ${label} → SUCCESS（問題なし）`);
+      }
+    } catch (e) {
+      // 例外（バリデーションエラー等）→ このバッチに問題がある
+      console.log(`[BinarySearch] ${label} → 例外: ${e.message}`);
+      if (batch.length <= 1) {
+        errorSkus.push(batch[0].msku);
+      } else {
+        const found = await findErrorSkusByBinarySearch(sourceAddress, batch);
+        errorSkus.push(...found);
+      }
+    }
+  }
+
+  return errorSkus;
+}
+
 export async function checkInboundEligibility(items) {
   const sp = getClient();
   const marketplaceId = process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';

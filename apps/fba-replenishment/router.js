@@ -14,7 +14,7 @@ import { initDb, savePlanningData, getLatestSnapshots, getSettings, updateSettin
 import { fetchAllReports, normalizePlanningRow } from './sp-api-reports.js';
 import { syncSkuMappings } from './sheets-sync.js';
 import { generateRecommendations } from './calculation-engine.js';
-import { createInboundPlan, checkInboundEligibility } from './inbound-plans.js';
+import { createInboundPlan, checkInboundEligibility, findErrorSkusByBinarySearch } from './inbound-plans.js';
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -454,33 +454,29 @@ router.post('/api/create-inbound-plan', express.json(), async (req, res) => {
 
     console.log(`[Inbound] 送信${sentSkuSet.size}件, プラン内${planSkuSet.size}件, 弾かれた${rejectedSkus.length}件`);
 
-    // SKU不明のエラーが残っている場合、Eligibility APIでチェック
+    // SKU不明のエラーが残っている場合、二分探索でエラーSKUを特定
     const hasUnknownSku = enrichedProblems.some(p => p.msku === '-');
     if (hasUnknownSku && result.status === 'FAILED') {
-      console.log('[Inbound] SKU不明エラーあり → Eligibility APIで全アイテムチェック...');
+      console.log('[Inbound] SKU不明エラーあり → 二分探索でエラーSKU特定開始...');
       try {
-        const eligibilityItems = items
-          .filter(i => i.asin)
-          .map(i => ({ asin: i.asin, msku: i.amazon_sku }));
-        const ineligible = await checkInboundEligibility(eligibilityItems);
-        console.log(`[Inbound] Eligibility結果: ${ineligible.length}件が不適格`);
+        const apiItems = buildApiItems(items, prepOverrides);
+        const errorMskus = await findErrorSkusByBinarySearch(sourceAddress, apiItems);
+        console.log(`[Inbound] 二分探索結果: ${errorMskus.length}件のエラーSKU特定 → ${errorMskus.join(', ')}`);
 
-        if (ineligible.length > 0) {
-          // Eligibility結果でproblemsを上書き
-          enrichedProblems = ineligible.map(ie => {
-            const item = items.find(i => i.amazon_sku === ie.msku);
-            const reasonCodes = ie.reasons.map(r => r.code || r).join(', ');
-            const reasonMsgs = ie.reasons.map(r => r.message || r.code || r).join('; ');
+        if (errorMskus.length > 0) {
+          const originalError = enrichedProblems[0] || {};
+          enrichedProblems = errorMskus.map(msku => {
+            const item = items.find(i => i.amazon_sku === msku);
             return {
-              msku: ie.msku,
+              msku,
               product_name: item?.product_name || '',
-              code: reasonCodes || 'INELIGIBLE',
-              message: reasonMsgs || 'FBA受入不可',
+              code: originalError.code || 'UNKNOWN',
+              message: originalError.message || 'プラン作成エラー',
             };
           });
         }
-      } catch (eligErr) {
-        console.error('[Inbound] Eligibilityチェック失敗:', eligErr.message);
+      } catch (searchErr) {
+        console.error('[Inbound] 二分探索失敗:', searchErr.message);
       }
     }
 
