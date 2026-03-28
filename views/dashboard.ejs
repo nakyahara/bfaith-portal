@@ -38,6 +38,8 @@
               </div>
               <% if (app.status === 'coming-soon') { %>
                 <span class="badge-soon">準備中</span>
+              <% } else if (typeof taskCounts !== 'undefined' && taskCounts[app.id] > 0) { %>
+                <span class="badge-task-count"><%= taskCounts[app.id] %> 件</span>
               <% } else { %>
                 <span class="badge-active">稼働中</span>
               <% } %>
