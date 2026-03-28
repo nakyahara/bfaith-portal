@@ -288,23 +288,36 @@ router.post('/api/create-inbound-plan', express.json(), async (req, res) => {
     stateOrProvinceCode: settings.inbound_ship_from_state || '',
     postalCode: settings.inbound_ship_from_postal_code || '',
     countryCode: settings.inbound_ship_from_country || 'JP',
+    phoneNumber: settings.inbound_ship_from_phone || '',
   };
 
   // 住所チェック
-  if (!sourceAddress.name || !sourceAddress.addressLine1 || !sourceAddress.postalCode) {
-    return res.status(400).json({ error: '送り元住所が未設定です。設定画面で住所を入力してください。' });
+  if (!sourceAddress.name || !sourceAddress.addressLine1 || !sourceAddress.postalCode || !sourceAddress.phoneNumber) {
+    return res.status(400).json({ error: '送り元住所または電話番号が未設定です。設定画面で入力してください。' });
   }
 
   const labelOwner = settings.inbound_label_owner || 'AMAZON';
   const prepOwner = settings.inbound_prep_owner || 'SELLER';
 
-  const apiItems = items.map(i => ({
-    msku: i.amazon_sku,
-    quantity: i.ship_qty,
-    labelOwner,
-    prepOwner,
-    ...(i.expiry_date ? { expiration: i.expiry_date } : {}),
-  }));
+  // 有効期限フォーマット変換: YYYYMMDD or YYYY/MM/DD → YYYY-MM-DD
+  function formatExpiration(raw) {
+    if (!raw) return null;
+    const s = raw.replace(/\//g, '').replace(/-/g, '');
+    if (s.length === 8) return `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}`;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+    return null; // フォーマット不明は除外
+  }
+
+  const apiItems = items.map(i => {
+    const exp = formatExpiration(i.expiry_date);
+    return {
+      msku: i.amazon_sku,
+      quantity: i.ship_qty,
+      labelOwner,
+      prepOwner,
+      ...(exp ? { expiration: exp } : {}),
+    };
+  });
 
   inboundPlanInProgress = true;
   try {

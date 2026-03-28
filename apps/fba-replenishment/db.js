@@ -329,6 +329,7 @@ export async function initDb() {
     ['inbound_ship_from_city', ''],
     ['inbound_ship_from_state', ''],
     ['inbound_ship_from_postal_code', ''],
+    ['inbound_ship_from_phone', ''],
     ['inbound_ship_from_country', 'JP'],
     ['inbound_label_owner', 'AMAZON'],
     ['inbound_prep_owner', 'SELLER'],
