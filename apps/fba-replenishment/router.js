@@ -454,31 +454,7 @@ router.post('/api/create-inbound-plan', express.json(), async (req, res) => {
 
     console.log(`[Inbound] 送信${sentSkuSet.size}件, プラン内${planSkuSet.size}件, 弾かれた${rejectedSkus.length}件`);
 
-    // SKU不明のエラーが残っている場合、二分探索でエラーSKUを特定
     const hasUnknownSku = enrichedProblems.some(p => p.msku === '-');
-    if (hasUnknownSku && result.status === 'FAILED') {
-      console.log('[Inbound] SKU不明エラーあり → 二分探索でエラーSKU特定開始...');
-      try {
-        const apiItems = buildApiItems(items, prepOverrides);
-        const errorMskus = await findErrorSkusByBinarySearch(sourceAddress, apiItems);
-        console.log(`[Inbound] 二分探索結果: ${errorMskus.length}件のエラーSKU特定 → ${errorMskus.join(', ')}`);
-
-        if (errorMskus.length > 0) {
-          const originalError = enrichedProblems[0] || {};
-          enrichedProblems = errorMskus.map(msku => {
-            const item = items.find(i => i.amazon_sku === msku);
-            return {
-              msku,
-              product_name: item?.product_name || '',
-              code: originalError.code || 'UNKNOWN',
-              message: originalError.message || 'プラン作成エラー',
-            };
-          });
-        }
-      } catch (searchErr) {
-        console.error('[Inbound] 二分探索失敗:', searchErr.message);
-      }
-    }
 
     res.json({
       success: result.status === 'SUCCESS',
