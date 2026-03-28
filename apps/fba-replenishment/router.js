@@ -503,10 +503,72 @@ router.post('/api/create-inbound-plan', express.json(), async (req, res) => {
       });
     }
 
-    // SKU不明時: 適格性チェック実行を案内（リアルタイム探索はしない）
+    // SKU不明エラー時: Eligibilityチェック → NG特定 → 自動リトライ
     const hasUnknownSku = enrichedProblems.some(p => p.msku === '-');
-    if (hasUnknownSku) {
-      console.log('[Inbound] SKU不明エラーあり → 適格性チェックの実行を推奨');
+    if (hasUnknownSku && result.status === 'FAILED') {
+      console.log('[Inbound] SKU不明エラー → Eligibilityチェックで原因SKU特定中...');
+
+      try {
+        const mappings = getSkuMappings();
+        const mappingMap = {};
+        for (const m of mappings) mappingMap[m.amazon_sku] = m;
+
+        const checkItems = filteredItems
+          .map(i => ({ asin: mappingMap[i.amazon_sku]?.asin || i.asin || '', msku: i.amazon_sku }))
+          .filter(i => i.asin);
+
+        const ineligible = await checkInboundEligibility(checkItems);
+        console.log(`[Inbound] Eligibility結果: ${ineligible.length}件がNG`);
+
+        if (ineligible.length > 0) {
+          // NG商品をDBに保存
+          const eligResults = ineligible.map(ie => ({
+            asin: checkItems.find(c => c.msku === ie.msku)?.asin || '',
+            amazon_sku: ie.msku,
+            product_name: filteredItems.find(i => i.amazon_sku === ie.msku)?.product_name || '',
+            is_eligible: false,
+            reasons: ie.reasons || [],
+          }));
+          saveEligibilityBatch(eligResults);
+
+          // NG商品を除外してリトライ
+          const newNgSet = new Set(ineligible.map(ie => ie.msku));
+          const retryItems = filteredItems.filter(i => !newNgSet.has(i.amazon_sku));
+          const newExcluded = filteredItems.filter(i => newNgSet.has(i.amazon_sku));
+
+          console.log(`[Inbound] NG ${newExcluded.length}件を除外 → ${retryItems.length}件でリトライ`);
+
+          if (retryItems.length > 0) {
+            const { result: retryResult, prepOverrides: retryPrepOverrides } = await attemptWithPrepRetry(retryItems);
+
+            const allExcluded = [...excludedItems, ...newExcluded];
+            const retryPrepCorrections = Object.entries(retryPrepOverrides).map(([sku, newVal]) => {
+              const item = retryItems.find(i => i.amazon_sku === sku);
+              return { sku, product_name: item?.product_name || sku, original: newVal === 'SELLER' ? 'NONE' : 'SELLER', corrected: newVal, reason: newVal === 'SELLER' ? 'prep必要' : 'prep不要' };
+            });
+
+            res.json({
+              success: retryResult.status === 'SUCCESS',
+              inboundPlanId: retryResult.inboundPlanId,
+              operationId: retryResult.operationId,
+              status: retryResult.status,
+              problems: retryResult.problems || [],
+              totalItems: retryItems.length,
+              successItems: retryResult.status === 'SUCCESS' ? retryItems.length : 0,
+              errorItems: (retryResult.problems || []).length,
+              retried: true,
+              prepCorrections: retryPrepCorrections,
+              submittedItems: retryItems.map(i => ({ amazon_sku: i.amazon_sku, product_name: i.product_name, ship_qty: i.ship_qty })),
+              hasUnknownSku: false,
+              excludedItems: allExcluded.map(i => ({ amazon_sku: i.amazon_sku, product_name: i.product_name })),
+              autoRetried: true,
+            });
+            return;
+          }
+        }
+      } catch (eligErr) {
+        console.error('[Inbound] Eligibilityチェック失敗:', eligErr.message);
+      }
     }
 
     res.json({

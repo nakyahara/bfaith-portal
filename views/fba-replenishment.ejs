@@ -2286,7 +2286,11 @@ Step10: アラート判定</pre>
 
         if (d.success) {
           showInboundModal('success', d);
-          log(`納品プラン作成成功: プランID ${d.inboundPlanId}`);
+          if (d.autoRetried) {
+            log(`納品プラン作成成功（NG商品を自動検出→除外→リトライ）: プランID ${d.inboundPlanId}`);
+          } else {
+            log(`納品プラン作成成功: プランID ${d.inboundPlanId}`);
+          }
           // 成功したSKUにフラグを立てる
           for (const item of checkedItems) {
             const rec = recData.find(r => r.amazon_sku === item.amazon_sku);
@@ -2365,7 +2369,8 @@ Step10: アラート判定</pre>
           <div class="debug-overlay"></div>
           <div class="debug-modal" style="max-width:500px;">
             <h3 style="margin:0 0 16px;">📦 納品プラン作成中...</h3>
-            <p><span class="spinner" style="border-color:#2563eb;border-top-color:transparent;width:20px;height:20px;"></span> ${data.totalItems} SKUを処理中（最大3分かかります）</p>
+            <p><span class="spinner" style="border-color:#2563eb;border-top-color:transparent;width:20px;height:20px;"></span> ${data.totalItems} SKUを処理中</p>
+            <p style="font-size:12px;color:#666;">※ エラー発生時は自動で原因特定→リトライします（最大5分）</p>
           </div>`;
       } else if (type === 'success') {
         const corrections = data.prepCorrections || [];
