@@ -270,6 +270,17 @@ router.get('/api/recommendations/:sku', (req, res) => {
   }
 });
 
+// ===== 診断: Eligibility API テスト =====
+router.get('/api/debug/eligibility/:asin', async (req, res) => {
+  try {
+    const items = [{ asin: req.params.asin, msku: 'TEST' }];
+    const result = await checkInboundEligibility(items);
+    res.json({ asin: req.params.asin, result, raw: 'check server logs for details' });
+  } catch (e) {
+    res.json({ asin: req.params.asin, error: e.message, stack: e.stack?.split('\n').slice(0, 5) });
+  }
+});
+
 // ===== 納品プラン作成 =====
 let inboundPlanInProgress = false;
 router.post('/api/create-inbound-plan', express.json(), async (req, res) => {
