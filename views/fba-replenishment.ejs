@@ -1314,6 +1314,46 @@ Step10: アラート判定</pre>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">急上昇/急停止</td><td style="padding:6px;border:1px solid #e5e7eb;">7日→30日比が2倍超 or 7日間売上0</td></tr>
             </table>
           </div>
+
+          <div class="settings-group">
+            <h4>4つのタブの違い</h4>
+            <table style="width:100%;font-size:12px;border-collapse:collapse;">
+              <tr style="background:#f3f4f6;">
+                <th style="padding:8px;border:1px solid #e5e7eb;">タブ</th>
+                <th style="padding:8px;border:1px solid #e5e7eb;">対象</th>
+                <th style="padding:8px;border:1px solid #e5e7eb;">意味</th>
+                <th style="padding:8px;border:1px solid #e5e7eb;">アクション</th>
+              </tr>
+              <tr>
+                <td style="padding:8px;border:1px solid #e5e7eb;font-weight:bold;">納品推奨</td>
+                <td style="padding:8px;border:1px solid #e5e7eb;">発注点を下回ったSKU</td>
+                <td style="padding:8px;border:1px solid #e5e7eb;">FBA在庫が減ってきた商品。計算ロジックに基づいて推奨数・緊急度が算出される。</td>
+                <td style="padding:8px;border:1px solid #e5e7eb;">今日送るものをチェック→納品作業</td>
+              </tr>
+              <tr style="background:#fff5f5;">
+                <td style="padding:8px;border:1px solid #e5e7eb;font-weight:bold;">FBA欠品</td>
+                <td style="padding:8px;border:1px solid #e5e7eb;">FBA販売可能在庫 = 0 のSKU</td>
+                <td style="padding:8px;border:1px solid #e5e7eb;">SP-APIレポートに存在する（＝過去にFBAに送ったことがある）が、<strong>現在Amazonで販売できない状態</strong>の商品。30日以上欠品すると売上データが0になり、納品推奨タブの計算ロジックに上がってこなくなるため、この一覧で送り漏れを発見する。</td>
+                <td style="padding:8px;border:1px solid #e5e7eb;">倉庫在庫があれば納品推奨に追加して送る。価格が合わない等の理由で送らない商品は「非表示」にする。</td>
+              </tr>
+              <tr style="background:#f0fdf4;">
+                <td style="padding:8px;border:1px solid #e5e7eb;font-weight:bold;">新規商品</td>
+                <td style="padding:8px;border:1px solid #e5e7eb;">SP-APIレポートに出てこないSKU</td>
+                <td style="padding:8px;border:1px solid #e5e7eb;">スプレッドシートの商品コード変換テーブルに登録されているが、<strong>SP-APIレポートに一度も出てこなかった</strong>SKU。つまりFBAに在庫を送ったことがない商品。<br><br>※ このシステムでSP-APIレポート取得を開始する以前に在庫が尽きてレポートから消えた古い商品も含まれる可能性があるため、廃盤・販売終了のSKUは「非表示」にしてください。</td>
+                <td style="padding:8px;border:1px solid #e5e7eb;">倉庫在庫があれば初回納品の候補。廃盤SKUは非表示にする。</td>
+              </tr>
+              <tr>
+                <td style="padding:8px;border:1px solid #e5e7eb;font-weight:bold;">発注推奨（在庫0）</td>
+                <td style="padding:8px;border:1px solid #e5e7eb;">FBA在庫 0 かつ 倉庫在庫 0 のSKU</td>
+                <td style="padding:8px;border:1px solid #e5e7eb;">Amazonでも自社倉庫でも在庫がない商品。<strong>送りたくても送る在庫がない</strong>状態。仕入れ先への発注が必要。</td>
+                <td style="padding:8px;border:1px solid #e5e7eb;">売上があるものを優先して仕入れ先に発注する。</td>
+              </tr>
+            </table>
+            <p style="font-size:11px;color:#666;margin-top:8px;">
+              <strong>FBA欠品と新規商品の違い:</strong> FBA欠品はAmazonがそのSKUを認識している（SP-APIレポートに在庫0で記録がある）。新規商品はAmazonにそのSKUの記録自体がない。<br>
+              <strong>FBA欠品と発注推奨の違い:</strong> FBA欠品は倉庫在庫の有無を問わない（倉庫に在庫があるなら送り漏れ）。発注推奨はFBA在庫0＋倉庫在庫0の商品だけ（仕入れが必要）。
+            </p>
+          </div>
         </div>`;
 
       const div = document.createElement('div');
