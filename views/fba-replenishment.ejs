@@ -342,8 +342,12 @@
                 <th class="sortable-stockout" data-key="amazon_sku">SKU</th>
                 <th class="sortable-stockout" data-key="product_name">商品名</th>
                 <th>構成</th>
-                <th class="sortable-stockout" data-key="fba_inbound_shipped" data-type="num">輸送中</th>
-                <th class="sortable-stockout" data-key="fba_inbound_working" data-type="num">準備中</th>
+                <th class="sortable-stockout" data-key="fba_available" data-type="num">FBA在庫</th>
+                <th class="sortable-stockout" data-key="effective_fba_stock" data-type="num">実質在庫</th>
+                <th class="sortable-stockout" data-key="days_of_supply" data-type="num">供給日数</th>
+                <th class="sortable-stockout" data-key="reorder_point" data-type="num">発注点(個)</th>
+                <th class="sortable-stockout" data-key="raw_needed" data-type="num">必要補充数</th>
+                <th class="sortable-stockout" data-key="target_days" data-type="num">目標日数</th>
                 <th class="sortable-stockout" data-key="units_sold_7d" data-type="num">FBA7日</th>
                 <th class="sortable-stockout" data-key="units_sold_30d" data-type="num">FBA30日</th>
                 <th class="sortable-stockout" data-key="non_fba_sales_7d" data-type="num">他CH7日</th>
@@ -351,7 +355,8 @@
                 <th class="sortable-stockout" data-key="warehouse_raw" data-type="num">倉庫在庫</th>
                 <th class="sortable-stockout" data-key="warehouse_available" data-type="num">FBA用</th>
                 <th class="sortable-stockout" data-key="non_fba_reserve" data-type="num">他CH確保</th>
-                <th class="sortable-stockout" data-key="last_arrival_date">最終入荷日</th>
+                <th class="sortable-stockout" data-key="recommended_qty" data-type="num">推奨数</th>
+                <th class="sortable-stockout" data-key="adjusted_qty" data-type="num">補正後</th>
                 <th>アラート</th>
               </tr>
             </thead>
@@ -378,6 +383,7 @@
         </div>
 
         <div style="margin-bottom:8px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+          <button class="btn btn-primary" onclick="addNewProductToShip()" style="background:#dc2626; padding:6px 14px; font-size:13px;">チェック済みを納品推奨に追加</button>
           <button class="btn btn-secondary" onclick="hideNewProductChecked()" style="padding:6px 14px; font-size:13px;">チェック済みを非表示</button>
           <span style="font-size:12px; color:#666;" id="newActionMsg"></span>
         </div>
@@ -396,13 +402,26 @@
               <tr>
                 <th style="width:30px;text-align:center;">✓</th>
                 <th style="width:30px;text-align:center;">#</th>
+                <th>状態</th>
                 <th class="sortable-new" data-key="amazon_sku">SKU</th>
                 <th class="sortable-new" data-key="product_name">商品名</th>
                 <th>構成</th>
+                <th class="sortable-new" data-key="fba_available" data-type="num">FBA在庫</th>
+                <th class="sortable-new" data-key="effective_fba_stock" data-type="num">実質在庫</th>
+                <th class="sortable-new" data-key="days_of_supply" data-type="num">供給日数</th>
+                <th class="sortable-new" data-key="reorder_point" data-type="num">発注点(個)</th>
+                <th class="sortable-new" data-key="raw_needed" data-type="num">必要補充数</th>
+                <th class="sortable-new" data-key="target_days" data-type="num">目標日数</th>
+                <th class="sortable-new" data-key="units_sold_7d" data-type="num">FBA7日</th>
+                <th class="sortable-new" data-key="units_sold_30d" data-type="num">FBA30日</th>
+                <th class="sortable-new" data-key="non_fba_sales_7d" data-type="num">他CH7日</th>
+                <th class="sortable-new" data-key="non_fba_sales_30d" data-type="num">他CH30日</th>
                 <th class="sortable-new" data-key="warehouse_qty" data-type="num">倉庫在庫</th>
-                <th class="sortable-new" data-key="y_qty" data-type="num">Yロケ在庫</th>
-                <th class="sortable-new" data-key="ne_code">NE商品コード</th>
-                <th>状態</th>
+                <th class="sortable-new" data-key="warehouse_available" data-type="num">FBA用</th>
+                <th class="sortable-new" data-key="non_fba_reserve" data-type="num">他CH確保</th>
+                <th class="sortable-new" data-key="recommended_qty" data-type="num">推奨数</th>
+                <th class="sortable-new" data-key="adjusted_qty" data-type="num">補正後</th>
+                <th>アラート</th>
               </tr>
             </thead>
             <tbody id="newBody"></tbody>
@@ -940,7 +959,8 @@
         const belowReorder = typeof r.effective_fba_stock === 'number' && typeof reorderVal === 'number' && r.effective_fba_stock < reorderVal;
         // ナンバリング
         let rowNum = '';
-        if (r._fromStockout) { rowNum = '欠品'; }
+        if (r._fromNewProduct) { rowNum = '新規'; }
+        else if (r._fromStockout) { rowNum = '欠品'; }
         else if (r._manual) { rowNum = '手動'; }
         else if (r.urgency_score >= 80) { redNum++; rowNum = `🔴${redNum}`; }
         else if (r.urgency_score >= 40) { yellowNum++; rowNum = `🟡${yellowNum}`; }
@@ -1579,7 +1599,7 @@ Step10: アラート判定</pre>
 
     function renderStockoutList(data) {
       const tbody = document.getElementById('stockoutBody');
-      if (!data.length) { tbody.innerHTML = '<tr><td colspan="17">該当なし</td></tr>'; return; }
+      if (!data.length) { tbody.innerHTML = '<tr><td colspan="22">該当なし</td></tr>'; return; }
 
       // ソート
       data.sort((a, b) => {
@@ -1644,6 +1664,11 @@ Step10: アラート判定</pre>
           alertsHtml += `<span class="alert-badge alert-1">輸送/準備中 ${inTransit}個</span>`;
         }
 
+        const dosVal = r.days_of_supply;
+        const dosColor = typeof dosVal === 'number' && dosVal < 7 ? 'color:#dc2626;font-weight:bold' : typeof dosVal === 'number' && dosVal < 14 ? 'color:#d97706' : '';
+        const reorderVal = r.reorder_point;
+        const belowReorder = typeof r.effective_fba_stock === 'number' && typeof reorderVal === 'number' && r.effective_fba_stock < reorderVal;
+
         return `<tr style="${rowBg}">
           <td style="text-align:center;">${checkHtml}</td>
           <td style="text-align:center;color:#666;font-size:11px;">${num}</td>
@@ -1651,8 +1676,12 @@ Step10: アラート判定</pre>
           <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')">${r.amazon_sku}</span></td>
           <td class="product-name" title="${r.product_name || ''}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${r.product_name || ''}</a>` : (r.product_name || '')}</td>
           ${renderComponentCell(r)}
-          <td>${r.fba_inbound_shipped || 0}</td>
-          <td>${r.fba_inbound_working || 0}</td>
+          <td>${r.fba_available}</td>
+          <td>${r.effective_fba_stock}</td>
+          <td style="${dosColor}">${dosVal}${belowReorder ? ' ⚠' : ''}</td>
+          <td>${reorderVal}</td>
+          <td>${r.raw_needed || 0}</td>
+          <td>${r.target_days}</td>
           <td>${r.units_sold_7d}</td>
           <td>${r.units_sold_30d}</td>
           <td>${r.non_fba_sales_7d || 0}</td>
@@ -1660,7 +1689,8 @@ Step10: アラート判定</pre>
           <td>${r.warehouse_raw || 0}</td>
           <td style="color:#2563eb;font-weight:bold">${r.warehouse_available}</td>
           <td style="${(r.non_fba_reserve || 0) > 0 ? 'font-weight:bold;color:#dc2626' : 'color:#999'}">${r.non_fba_reserve || 0}</td>
-          <td style="font-size:11px;">${r.last_arrival_date || '-'}</td>
+          <td class="rec-qty" style="${r.recommended_qty !== r.adjusted_qty ? 'color:#999;font-size:12px;text-decoration:line-through' : ''}">${r.recommended_qty || '-'}</td>
+          <td class="rec-qty" style="font-size:11px;color:#666;">${r.adjusted_qty || '-'}${r.location_adjusted ? ' 📍' : ''}</td>
           <td>${alertsHtml}</td>
         </tr>`;
       }).join('');
@@ -1850,8 +1880,24 @@ Step10: アラート判定</pre>
           set_components: comps,
           is_set: mapping.is_set ? true : false,
           warehouse_qty: warehouseQty,
+          warehouse_available: warehouseQty,
           y_qty: yQty,
           is_hidden: newHiddenSet.has(sku),
+          // SP-API fields not available for new products
+          fba_available: '-',
+          effective_fba_stock: '-',
+          days_of_supply: '-',
+          reorder_point: '-',
+          raw_needed: '-',
+          target_days: '-',
+          units_sold_7d: '-',
+          units_sold_30d: '-',
+          non_fba_sales_7d: mapping.non_fba_sales_7d || 0,
+          non_fba_sales_30d: mapping.non_fba_sales_30d || 0,
+          non_fba_reserve: '-',
+          recommended_qty: '-',
+          adjusted_qty: '-',
+          alerts: [],
         });
       }
 
@@ -1899,7 +1945,7 @@ Step10: アラート判定</pre>
 
     function renderNewList(data) {
       const tbody = document.getElementById('newBody');
-      if (!data.length) { tbody.innerHTML = '<tr><td colspan="9">該当なし</td></tr>'; return; }
+      if (!data.length) { tbody.innerHTML = '<tr><td colspan="22">該当なし</td></tr>'; return; }
 
       data.sort((a, b) => {
         const th = document.querySelector(`th.sortable-new[data-key="${newSortKey}"]`);
@@ -1932,16 +1978,34 @@ Step10: アラート判定</pre>
         const isChecked = newCheckedSkus.has(r.amazon_sku);
         const checkHtml = `<input type="checkbox" class="new-check" data-sku="${r.amazon_sku}" ${isChecked ? 'checked' : ''} onchange="onNewCheckChange(this)">`;
 
+        // アラート
+        let alertsHtml = (r.alerts || []).map(a =>
+          `<span class="alert-badge alert-${a.level}" title="${a.message}">${a.level >= 2 ? '⚠' : 'ℹ'} ${a.message.slice(0,15)}</span>`
+        ).join('');
+
         return `<tr style="${rowBg}">
           <td style="text-align:center;">${checkHtml}</td>
           <td style="text-align:center;color:#666;font-size:11px;">${num}</td>
-          <td style="font-size:11px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${r.amazon_sku}</td>
+          <td>${statusHtml}</td>
+          <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')">${r.amazon_sku}</span></td>
           <td class="product-name" title="${r.product_name || ''}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${r.product_name || ''}</a>` : (r.product_name || '')}</td>
           ${renderComponentCell(r)}
+          <td>${r.fba_available ?? '-'}</td>
+          <td>${r.effective_fba_stock ?? '-'}</td>
+          <td>${r.days_of_supply ?? '-'}</td>
+          <td>${r.reorder_point ?? '-'}</td>
+          <td>${r.raw_needed ?? '-'}</td>
+          <td>${r.target_days ?? '-'}</td>
+          <td>${r.units_sold_7d ?? '-'}</td>
+          <td>${r.units_sold_30d ?? '-'}</td>
+          <td>${r.non_fba_sales_7d ?? '-'}</td>
+          <td style="${(r.non_fba_sales_30d || 0) > 0 ? 'font-weight:bold;color:#7c3aed' : ''}">${r.non_fba_sales_30d ?? '-'}</td>
           <td style="font-weight:bold;${hasStock ? 'color:#16a34a' : 'color:#999'}">${r.warehouse_qty}</td>
-          <td style="color:#666;">${r.y_qty || 0}</td>
-          <td style="font-size:11px;">${r.ne_code || '-'}</td>
-          <td>${statusHtml}</td>
+          <td style="color:#2563eb;font-weight:bold">${r.warehouse_available ?? '-'}</td>
+          <td style="${(r.non_fba_reserve || 0) > 0 ? 'font-weight:bold;color:#dc2626' : 'color:#999'}">${r.non_fba_reserve ?? '-'}</td>
+          <td class="rec-qty">${r.recommended_qty ?? '-'}</td>
+          <td class="rec-qty" style="font-size:11px;color:#666;">${r.adjusted_qty ?? '-'}</td>
+          <td>${alertsHtml}</td>
         </tr>`;
       }).join('');
     }
@@ -1985,6 +2049,92 @@ Step10: アラート判定</pre>
         document.getElementById('newHiddenCount').textContent = `(${newHiddenSet.size}件)`;
         filterNewList();
       } catch(e) { /* ignore */ }
+    }
+
+    function addNewProductToShip() {
+      const msgEl = document.getElementById('newActionMsg');
+      if (newCheckedSkus.size === 0) {
+        msgEl.textContent = 'チェックされた商品がありません';
+        msgEl.style.color = '#d97706';
+        return;
+      }
+
+      let addedCount = 0;
+      let alreadyCount = 0;
+      for (const sku of newCheckedSkus) {
+        // 既に納品推奨にあるか確認
+        const existing = recData.find(r => r.amazon_sku === sku);
+        const existsInManual = manualItems.find(m => m.amazon_sku === sku);
+
+        if (existing && existing.recommended_qty > 0) {
+          alreadyCount++;
+          continue;
+        }
+        if (existsInManual) {
+          alreadyCount++;
+          continue;
+        }
+
+        // 新規商品データから情報を取得
+        const newProd = newProductData.find(r => r.amazon_sku === sku);
+
+        if (existing) {
+          existing.recommended_qty = 0;
+          existing.adjusted_qty = 0;
+          existing._manual = true;
+          existing._fromNewProduct = true;
+          addedCount++;
+        } else {
+          const item = {
+            amazon_sku: sku,
+            asin: newProd?.asin || '',
+            product_name: newProd?.product_name || '(新規商品から追加)',
+            ne_code: newProd?.ne_code || '',
+            set_components: newProd?.set_components || null,
+            is_set: newProd?.is_set || false,
+            fba_available: '-',
+            effective_fba_stock: '-',
+            days_of_supply: '-',
+            reorder_point: '-',
+            raw_needed: '-',
+            target_days: '-',
+            units_sold_7d: '-',
+            units_sold_30d: '-',
+            non_fba_sales_7d: newProd?.non_fba_sales_7d || 0,
+            non_fba_sales_30d: newProd?.non_fba_sales_30d || 0,
+            warehouse_raw: newProd?.warehouse_qty || 0,
+            warehouse_available: newProd?.warehouse_qty || 0,
+            recommended_qty: 0,
+            adjusted_qty: 0,
+            urgency_score: 0,
+            alerts: [],
+            _manual: true,
+            _fromNewProduct: true,
+          };
+          manualItems.push(item);
+          addedCount++;
+        }
+      }
+
+      // チェックをクリア
+      newCheckedSkus.clear();
+
+      // メッセージ
+      let msg = '';
+      if (addedCount > 0) msg += `${addedCount}件を納品推奨に追加しました（数量0 → 手動入力してください）`;
+      if (alreadyCount > 0) msg += `${alreadyCount > 0 && addedCount > 0 ? '、' : ''}${alreadyCount}件は既に納品推奨済みです`;
+      msgEl.textContent = msg;
+      msgEl.style.color = addedCount > 0 ? '#16a34a' : '#d97706';
+
+      // リスト更新
+      updateRecSummary();
+      filterRecList();
+      updateNewProductList();
+
+      // 追加があれば納品推奨タブに切り替え
+      if (addedCount > 0) {
+        setTimeout(() => switchTab('ship'), 500);
+      }
     }
 
     // ===== ステップ制御 =====
