@@ -1427,7 +1427,7 @@ Step10: アラート判定</pre>
         await fetch(`${BASE}/api/settings`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ key, value })
+          body: JSON.stringify({ [key]: value })
         });
         const saved = document.getElementById('saved_' + key);
         if (saved) { saved.style.opacity = '1'; setTimeout(() => saved.style.opacity = '0', 2000); }
