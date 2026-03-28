@@ -344,8 +344,8 @@ router.post('/api/create-inbound-plan', express.json(), async (req, res) => {
     return overrides;
   }
 
-  // prepOwnerを自動判定しながら最大3回リトライ
-  async function attemptWithPrepRetry(itemList, maxRetries = 3) {
+  // prepOwnerを自動判定しながらリトライ（APIが1件ずつしかエラーを返さないため回数多め）
+  async function attemptWithPrepRetry(itemList, maxRetries = 30) {
     const allPrepOverrides = {}; // SKUごとのprepOwner修正を蓄積
     let lastError = null;
 
