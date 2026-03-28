@@ -252,7 +252,7 @@
       <!-- FNSKU除外 -->
       <div style="margin-bottom:4px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
         <label style="font-size:12px; color:#666; white-space:nowrap;">除外FNSKU:</label>
-        <input type="text" id="excludeFnsku" placeholder="FNSKU をカンマ区切りで入力（例: X000ABC123, X000DEF456）" style="flex:1; min-width:300px; padding:5px 10px; border:1px solid #d1d5db; border-radius:4px; font-size:12px;">
+        <textarea id="excludeFnsku" placeholder="FNSKUを貼り付け（Excelの列コピーOK）" rows="2" style="flex:1; min-width:300px; padding:5px 10px; border:1px solid #d1d5db; border-radius:4px; font-size:12px; resize:vertical;"></textarea>
         <button class="btn btn-secondary" onclick="excludeFnskuFromSelection()" style="padding:4px 12px; font-size:12px;">選択から除外</button>
       </div>
 
