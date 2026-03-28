@@ -468,6 +468,7 @@ router.post('/api/create-inbound-plan', express.json(), async (req, res) => {
       retried: prepCorrections.length > 0,
       prepCorrections,
       submittedItems: items.map(i => ({ amazon_sku: i.amazon_sku, product_name: i.product_name, ship_qty: i.ship_qty })),
+      hasUnknownSku,
     });
   } catch (e) {
     console.error('[Inbound] プラン作成エラー:', e);
@@ -548,6 +549,18 @@ router.get('/api/status', (req, res) => {
     warehouseProducts,
     warehouseRows: warehouse.length,
   });
+});
+
+// ===== 1件Eligibilityチェック（フロントエンド駆動） =====
+router.get('/api/eligibility/check-one', async (req, res) => {
+  const { asin, msku } = req.query;
+  if (!asin) return res.status(400).json({ error: 'asin必須' });
+  try {
+    const result = await checkInboundEligibility([{ asin, msku: msku || '' }]);
+    res.json({ asin, msku, is_eligible: result.length === 0, reasons: result.length > 0 ? (result[0].reasons || []) : [] });
+  } catch (e) {
+    res.json({ asin, msku, is_eligible: true, reasons: [], error: (e.message || '').slice(0, 200) });
+  }
 });
 
 export default router;

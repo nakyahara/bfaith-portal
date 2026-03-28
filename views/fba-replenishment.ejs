@@ -2303,6 +2303,49 @@ Step10: アラート判定</pre>
       await createInboundPlanAction();
     }
 
+    // NG商品調査→除外→再作成（フロントエンドから1件ずつチェック）
+    async function investigateAndRetry() {
+      const progEl = document.getElementById('investigateProgress');
+      const checkedSkus = [];
+      document.querySelectorAll('.rec-check:checked').forEach(cb => checkedSkus.push(cb.dataset.sku));
+
+      const itemsToCheck = checkedSkus.map(sku => {
+        const rec = recData.find(r => r.amazon_sku === sku) || manualItems.find(m => m.amazon_sku === sku);
+        return { sku, asin: rec?.asin || '', name: rec?.product_name || '' };
+      }).filter(i => i.asin);
+
+      if (!itemsToCheck.length) { alert('ASINのある商品がありません'); return; }
+
+      const ngSkus = [];
+      for (let i = 0; i < itemsToCheck.length; i++) {
+        const item = itemsToCheck[i];
+        if (progEl) progEl.textContent = `${i + 1}/${itemsToCheck.length} チェック中...`;
+        try {
+          const r = await fetch(`${BASE}/api/eligibility/check-one?asin=${encodeURIComponent(item.asin)}&msku=${encodeURIComponent(item.sku)}`);
+          const d = await r.json();
+          if (!d.is_eligible) {
+            ngSkus.push(item.sku);
+            log(`⛔ NG: ${item.name || item.sku}`);
+          }
+        } catch {}
+      }
+      if (progEl) progEl.textContent = '';
+
+      if (!ngSkus.length) {
+        alert('Eligibility APIではNG商品を特定できませんでした。\nSeller Centralで確認してください。');
+        return;
+      }
+
+      log(`NG ${ngSkus.length}件を除外して再作成: ${ngSkus.join(', ')}`);
+      const ngSet = new Set(ngSkus);
+      document.querySelectorAll('.rec-check:checked').forEach(cb => {
+        if (ngSet.has(cb.dataset.sku)) { cb.checked = false; selectedSkus.delete(cb.dataset.sku); }
+      });
+      updateSelectedCount();
+      closeInboundModal();
+      await createInboundPlanAction();
+    }
+
     // FBA_INBエラーコードの日本語翻訳
     const FBA_ERROR_JP = {
       'FBA_INB_0004': '危険物（Hazmat）として規制されている商品',
@@ -2397,21 +2440,18 @@ Step10: アラート判定</pre>
           </tr>`;
         }).join('');
 
-        // SKUが不明なエラーがある場合、全送信アイテムを参考表示
-        const hasUnknownSku = problems.some(p => (p.msku || p.sku || '-') === '-');
-        const submittedItems = data.submittedItems || [];
-        let submittedHtml = '';
-        if (hasUnknownSku && submittedItems.length > 0) {
-          submittedHtml = `
-            <details style="margin-top:12px;">
-              <summary style="cursor:pointer;font-size:12px;color:#666;">送信した全商品リスト（${submittedItems.length}件）を表示</summary>
-              <div style="max-height:150px;overflow-y:auto;margin-top:4px;">
-                <table style="width:100%;border-collapse:collapse;">
-                  <tr style="background:#f3f4f6;"><th style="padding:3px 6px;border:1px solid #e5e7eb;font-size:11px;">SKU</th><th style="padding:3px 6px;border:1px solid #e5e7eb;font-size:11px;">商品名</th><th style="padding:3px 6px;border:1px solid #e5e7eb;font-size:11px;">数量</th></tr>
-                  ${submittedItems.map(i => `<tr><td style="padding:3px 6px;border:1px solid #e5e7eb;font-size:10px;">${i.amazon_sku}</td><td style="padding:3px 6px;border:1px solid #e5e7eb;font-size:10px;">${i.product_name}</td><td style="padding:3px 6px;border:1px solid #e5e7eb;font-size:10px;">${i.ship_qty}</td></tr>`).join('')}
-                </table>
+        const hasUnknownSku = data.hasUnknownSku || problems.some(p => (p.msku || p.sku || '-') === '-');
+        let unknownSkuHtml = '';
+        if (hasUnknownSku) {
+          unknownSkuHtml = `
+            <div style="background:#fef3c7;padding:10px;border-radius:6px;margin-top:12px;font-size:12px;">
+              <strong>⚠ Amazon APIの制限でエラー原因のSKUが不明です</strong><br>
+              下のボタンで全商品を1件ずつチェックし、NG商品を除外して再作成します。
+              <div style="margin-top:8px;">
+                <button class="btn btn-primary" onclick="investigateAndRetry()" style="background:#d97706;padding:6px 14px;font-size:12px;">🔍 NG商品を調査して再作成</button>
+                <span id="investigateProgress" style="margin-left:8px;font-size:11px;color:#666;"></span>
               </div>
-            </details>`;
+            </div>`;
         }
 
         html = `
@@ -2432,7 +2472,7 @@ Step10: アラート判定</pre>
                   ${problemsHtml}
                 </table>
               </div>
-              ${submittedHtml}
+              ${unknownSkuHtml}
             ` : '<p style="color:#666;">エラー詳細が返されませんでした。</p>'}
             <div style="display:flex;gap:8px;margin-top:16px;">
               ${errorSkus.length > 0 && successCount > 0 ? `<button class="btn btn-primary" onclick="retryWithoutErrors(${JSON.stringify(errorSkus)})" style="background:#dc2626;">エラーを除いて再作成（${successCount} SKU）</button>` : ''}
