@@ -31,8 +31,6 @@ initDb().then(() => {
     try {
       const result = await syncSkuMappings();
       console.log(`[FBA-Cron] 完了: ${result.total}件 (スナップショット: ${result.snapshots}件)`);
-      // Eligibilityチェックも実行
-      await runEligibilityCheckBackground();
     } catch (e) {
       console.error('[FBA-Cron] SKUマッピング同期エラー:', e);
     }
@@ -111,8 +109,6 @@ router.post('/api/sync-sku-mappings', async (req, res) => {
   try {
     const result = await syncSkuMappings();
     res.json({ success: true, ...result });
-    // バックグラウンドでEligibilityチェック実行
-    runEligibilityCheckBackground();
   } catch (e) {
     console.error('[FBA] SKUマッピング同期エラー:', e);
     res.status(500).json({ error: e.message });
@@ -692,83 +688,6 @@ router.get('/api/status', (req, res) => {
     warehouseRows: warehouse.length,
   });
 });
-
-// ===== FBA受入適格性チェック（自動） =====
-
-let eligibilityCheckInProgress = false;
-
-/**
- * バックグラウンドでEligibilityチェック実行
- * - NG商品: 毎回再チェック（OKに復帰するか確認）
- * - 未チェックの新規SKU: チェック
- * - OK商品: スキップ（少数なのでNGと新規だけで十分高速）
- */
-async function runEligibilityCheckBackground() {
-  if (eligibilityCheckInProgress) {
-    console.log('[Eligibility] 既に実行中 → スキップ');
-    return;
-  }
-  eligibilityCheckInProgress = true;
-
-  try {
-    const mappings = getSkuMappings();
-    const existingElig = getEligibilityBySkus(mappings.map(m => m.amazon_sku));
-    const eligMap = {};
-    for (const e of existingElig) eligMap[e.amazon_sku] = e;
-
-    // チェック対象: NG商品（再チェック） + 未チェックの新規SKU
-    const checkTargets = mappings.filter(m => {
-      if (!m.asin) return false;
-      const existing = eligMap[m.amazon_sku];
-      if (!existing) return true;           // 未チェック → チェック
-      if (!existing.is_eligible) return true; // NG → 再チェック
-      return false;                          // OK → スキップ
-    });
-
-    if (checkTargets.length === 0) {
-      console.log('[Eligibility] チェック対象なし（全SKUチェック済み＆NGなし）');
-      return;
-    }
-
-    console.log(`[Eligibility] チェック開始: ${checkTargets.length}件（NG再チェック + 新規）`);
-
-    const results = [];
-    for (let i = 0; i < checkTargets.length; i++) {
-      const m = checkTargets[i];
-      try {
-        const ineligible = await checkInboundEligibility([{ asin: m.asin, msku: m.amazon_sku }]);
-        results.push({
-          asin: m.asin,
-          amazon_sku: m.amazon_sku,
-          product_name: m.product_name || '',
-          is_eligible: ineligible.length === 0,
-          reasons: ineligible.length > 0 ? (ineligible[0].reasons || []) : [],
-        });
-      } catch {
-        // APIエラー時はスキップ（既存の状態を維持）
-      }
-
-      // 20件ごとにDB保存
-      if (results.length > 0 && results.length % 20 === 0) {
-        saveEligibilityBatch(results.slice(-20));
-        console.log(`[Eligibility] 進捗: ${i + 1}/${checkTargets.length}`);
-      }
-    }
-
-    // 残りを保存
-    if (results.length % 20 !== 0) {
-      saveEligibilityBatch(results.slice(-(results.length % 20)));
-    }
-
-    const ngCount = results.filter(r => !r.is_eligible).length;
-    const recoveredCount = results.filter(r => r.is_eligible && eligMap[r.amazon_sku] && !eligMap[r.amazon_sku].is_eligible).length;
-    console.log(`[Eligibility] 完了: ${results.length}件チェック, NG=${ngCount}件, 復帰=${recoveredCount}件`);
-  } catch (e) {
-    console.error('[Eligibility] チェックエラー:', e.message);
-  } finally {
-    eligibilityCheckInProgress = false;
-  }
-}
 
 // NG商品リスト
 router.get('/api/eligibility/ineligible', (req, res) => {
