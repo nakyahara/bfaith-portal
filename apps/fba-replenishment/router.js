@@ -563,4 +563,69 @@ router.get('/api/eligibility/check-one', async (req, res) => {
   }
 });
 
+// ===== 納品Excel出力 =====
+router.post('/api/export-manifest', express.json(), async (req, res) => {
+  const { items } = req.body;
+  if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items[] が必要です' });
+
+  const settings = getSettings();
+  const prepOwner = (settings.inbound_prep_owner || 'NONE') === 'NONE' ? 'Amazon' : 'Seller';
+  const labelOwner = (settings.inbound_label_owner || 'AMAZON') === 'AMAZON' ? 'Amazon' : 'Seller';
+
+  try {
+    const ExcelJS = (await import('exceljs')).default;
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet('Create workflow – template');
+
+    // Row1: 注意書き
+    ws.getCell('A1').value = 'このシートに記入する前にExampleタブを確認してください';
+    // Row3-4: デフォルト設定
+    ws.getCell('A3').value = 'Default prep owner';
+    ws.getCell('B3').value = prepOwner;
+    ws.getCell('A4').value = 'Default labeling owner';
+    ws.getCell('B4').value = labelOwner;
+    // Row7: 任意列ラベル
+    ws.getCell('C7').value = '任意';
+    ws.getCell('F7').value = '任意：メーカー梱包のSKUにのみ使用';
+    // Row8: ヘッダー
+    const headers = ['Merchant SKU', 'Quantity', 'Prep owner', 'Labeling owner', 'Expiration date (MM/DD/YYYY)', 'Units per box ', 'Number of boxes', 'Box length (cm)', 'Box width (cm)', 'Box height (cm)', 'Box weight (kg)'];
+    headers.forEach((h, i) => {
+      const cell = ws.getCell(8, i + 1);
+      cell.value = h;
+      cell.font = { bold: true };
+    });
+
+    // Row9〜: データ行
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      const row = 9 + i;
+      ws.getCell(row, 1).value = item.amazon_sku;
+      ws.getCell(row, 2).value = item.ship_qty;
+      // 有効期限: YYYYMMDD or YYYY-MM-DD or YYYY/MM/DD → MM/DD/YYYY
+      if (item.expiry_date) {
+        const raw = item.expiry_date.replace(/[\/\-]/g, '');
+        if (raw.length === 8) {
+          const m = raw.slice(4, 6), d = raw.slice(6, 8), y = raw.slice(0, 4);
+          ws.getCell(row, 5).value = `${m}/${d}/${y}`;
+        } else {
+          ws.getCell(row, 5).value = item.expiry_date;
+        }
+      }
+    }
+
+    // 列幅調整
+    ws.getColumn(1).width = 30;
+    ws.getColumn(2).width = 10;
+    ws.getColumn(5).width = 25;
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename=FBA_Manifest.xlsx');
+    await wb.xlsx.write(res);
+    res.end();
+  } catch (e) {
+    console.error('[FBA] Excel出力エラー:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 export default router;

@@ -244,6 +244,7 @@
         <button class="btn btn-primary" onclick="saveDraftAction()" style="background:#16a34a; padding:6px 16px; font-size:13px;">💾 作業状態を保存</button>
         <button class="btn btn-secondary" onclick="clearDraftConfirm()" style="padding:6px 12px; font-size:12px;">保存クリア</button>
         <button class="btn btn-primary" onclick="createInboundPlanAction()" style="background:#7c3aed; padding:6px 16px; font-size:13px;">📦 納品プラン作成</button>
+        <button class="btn btn-secondary" onclick="exportManifestExcel()" style="padding:6px 14px; font-size:13px;">📄 納品Excel出力</button>
         <span style="font-size:11px; color:#666;" id="draftSaveMsg"></span>
       </div>
       <div style="font-size:12px; color:#888; margin-bottom:4px;">※ 黄色は翌日回しOK。必要なものだけ個別にチェック。<span id="draftLastSaved" style="margin-left:12px; color:#2563eb;"></span></div>
@@ -2197,6 +2198,53 @@ Step10: アラート判定</pre>
 
     // 初期状態: Step 1 をアクティブに
     document.getElementById('stepBadge1').classList.add('active');
+
+    // ===== 納品Excel出力 =====
+    async function exportManifestExcel() {
+      const checkedItems = [];
+      document.querySelectorAll('.rec-check:checked').forEach(cb => {
+        const sku = cb.dataset.sku;
+        const qtyInput = document.querySelector(`.ship-qty-input[data-sku="${sku}"]`);
+        const qty = parseInt(qtyInput?.value) || 0;
+        if (qty <= 0) return;
+        const item = recData.find(r => r.amazon_sku === sku) || manualItems.find(m => m.amazon_sku === sku);
+        checkedItems.push({
+          amazon_sku: sku,
+          ship_qty: qty,
+          expiry_date: item?.expiry_date || '',
+        });
+      });
+
+      if (checkedItems.length === 0) {
+        alert('チェック済みで数量が入力されている商品がありません。');
+        return;
+      }
+
+      log(`納品Excel出力: ${checkedItems.length} SKU`);
+
+      try {
+        const res = await fetch(`${BASE}/api/export-manifest`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items: checkedItems }),
+        });
+        if (!res.ok) {
+          const err = await res.json();
+          alert('Excel出力エラー: ' + (err.error || '不明なエラー'));
+          return;
+        }
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `FBA_Manifest_${new Date().toISOString().slice(0,10)}.xlsx`;
+        a.click();
+        URL.revokeObjectURL(url);
+        log(`Excel出力完了: ${checkedItems.length} SKU`);
+      } catch (e) {
+        alert('Excel出力エラー: ' + e.message);
+      }
+    }
 
     // ===== 納品プラン作成 =====
     async function createInboundPlanAction() {
