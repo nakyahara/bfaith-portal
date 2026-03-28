@@ -13,7 +13,6 @@ import { startScheduler } from './apps/ranking-checker/scheduler.js';
 import profitRouter from './apps/profit-calculator/router.js';
 import { startPriceWorker, startMaintenanceJobs } from './apps/profit-calculator/price-scheduler.js';
 import fbaRouter from './apps/fba-replenishment/router.js';
-import { generateRecommendations } from './apps/fba-replenishment/calculation-engine.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -231,17 +230,10 @@ app.get('/', requireAuth, (req, res) => {
   const visibleApps = allowed === '*' ? apps : apps.filter(a => allowed.includes(a.id));
   const visibleExtLinks = allowed === '*' ? externalLinks : [];
 
-  // FBA作業数を取得（エラー時は0）
-  const taskCounts = {};
-  try {
-    const recs = generateRecommendations(false);
-    taskCounts['fba-replenishment'] = recs.recommended_skus || 0;
-  } catch { /* DB未初期化時等 */ }
-
   res.render('dashboard', {
     apps: visibleApps, categories, externalLinks: visibleExtLinks,
     username: req.session.email, displayName: req.session.displayName,
-    role: req.session.role, taskCounts,
+    role: req.session.role,
   });
 });
 
