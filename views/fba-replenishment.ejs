@@ -185,11 +185,7 @@
         <button class="btn btn-primary" id="btnCalc" onclick="calcRecommendations()" style="background:#16a34a;">推奨リスト生成</button>
         <span class="step-status" id="stepStatus4"></span>
       </div>
-      <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:8px;">
-        <span class="step-badge" style="background:#d97706;">任意</span>
-        <button class="btn btn-secondary" onclick="runEligibilityCheck()" style="border-color:#d97706;color:#d97706;">🔍 FBA受入適格性チェック</button>
-        <span class="step-status" id="eligibilityStatus" style="font-size:11px;color:#666;"></span>
-      </div>
+      <div style="font-size:11px;color:#888;margin-top:4px;margin-left:4px;" id="eligibilityStatus"></div>
     </div>
     </details>
 
@@ -1000,11 +996,13 @@
         // チェック状態
         const isChecked = selectedSkus.has(r.amazon_sku);
         const urgTag = r.urgency_score >= 80 ? 'red' : r.urgency_score >= 40 ? 'yellow' : 'white';
+        const ngMark = r._ineligible ? ' ⛔' : '';
+        const ngTitle = r._ineligible ? `title="納品不可: ${(r._ineligible_reasons || []).map(x => x.message || x.code || '').join(', ') || '危険物等'}"` : '';
         return `<tr class="${urgCls}" ${manualCls}>
           <td style="text-align:center;"><input type="checkbox" class="rec-check" data-sku="${r.amazon_sku}" data-qty="${shipQtyMap[r.amazon_sku] ?? (r.adjusted_qty || 0)}" data-urg="${urgTag}" ${isChecked ? 'checked' : ''} onchange="onCheckChange(this)"></td>
           <td style="text-align:center;font-size:11px;color:#666;">${rowNum}</td>
-          <td>${r._manual ? '手動' : r.urgency_score}</td>
-          <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')">${r.amazon_sku}</span></td>
+          <td>${r._manual ? '手動' : r.urgency_score}${ngMark}</td>
+          <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')" ${ngTitle}>${r.amazon_sku}</span></td>
           <td class="product-name" title="${r.product_name || ''}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${r.product_name || ''}</a>` : (r.product_name || '')}</td>
           ${renderComponentCell(r)}
           <td>${r.fba_available}</td>
@@ -2275,11 +2273,18 @@ Step10: アラート判定</pre>
           return;
         }
 
-        if (d.status === 'BLOCKED_BY_ELIGIBILITY') {
-          // 事前チェックでNG商品検出
-          showInboundModal('eligibility_blocked', d);
-          log(`NG商品検出: ${d.ineligibleItems.length}件 → 除外して再実行してください`);
-        } else if (d.success) {
+        // NG商品が自動除外された場合ログに記録
+        if (d.excludedItems && d.excludedItems.length > 0) {
+          log(`⚠ NG商品${d.excludedItems.length}件を自動除外: ${d.excludedItems.map(i => i.product_name || i.amazon_sku).join(', ')}`);
+          // 除外されたSKUのチェックを外す
+          for (const ex of d.excludedItems) {
+            const cb = document.querySelector(`.rec-check[data-sku="${ex.amazon_sku}"]`);
+            if (cb) { cb.checked = false; selectedSkus.delete(ex.amazon_sku); }
+          }
+          updateSelectedCount();
+        }
+
+        if (d.success) {
           showInboundModal('success', d);
           log(`納品プラン作成成功: プランID ${d.inboundPlanId}`);
           // 成功したSKUにフラグを立てる
@@ -2326,39 +2331,6 @@ Step10: アラート判定</pre>
       await createInboundPlanAction();
     }
 
-    // NG商品を除外して再作成
-    async function removeNgAndRetry(ngSkus) {
-      const ngSet = new Set(ngSkus);
-      document.querySelectorAll('.rec-check:checked').forEach(cb => {
-        if (ngSet.has(cb.dataset.sku)) {
-          cb.checked = false;
-          selectedSkus.delete(cb.dataset.sku);
-        }
-      });
-      updateSelectedCount();
-      closeInboundModal();
-      await createInboundPlanAction();
-    }
-
-    // 適格性チェック実行
-    async function runEligibilityCheck() {
-      log('適格性チェック開始...');
-      try {
-        const res = await fetch(`${BASE}/api/eligibility/check-all`, { method: 'POST' });
-        const d = await res.json();
-        if (d.error) {
-          log('適格性チェックエラー: ' + d.error);
-          alert(d.error);
-        } else {
-          log(`適格性チェック: ${d.message}`);
-          alert(`${d.message}\n\n完了まで約${Math.ceil(d.estimatedSeconds / 60)}分かかります。\n完了後、次回の納品プラン作成時にNG商品が自動除外されます。`);
-        }
-      } catch (e) {
-        log('適格性チェックエラー: ' + e.message);
-        alert('適格性チェック開始に失敗しました: ' + e.message);
-      }
-    }
-
     // FBA_INBエラーコードの日本語翻訳
     const FBA_ERROR_JP = {
       'FBA_INB_0004': '危険物（Hazmat）として規制されている商品',
@@ -2395,37 +2367,6 @@ Step10: アラート判定</pre>
             <h3 style="margin:0 0 16px;">📦 納品プラン作成中...</h3>
             <p><span class="spinner" style="border-color:#2563eb;border-top-color:transparent;width:20px;height:20px;"></span> ${data.totalItems} SKUを処理中（最大3分かかります）</p>
           </div>`;
-      } else if (type === 'eligibility_blocked') {
-        const ngItems = data.ineligibleItems || [];
-        const ngHtml = ngItems.map(item => {
-          const reasons = (item.reasons || []).map(r => r.message || r.code || '不明').join(', ');
-          return `<tr>
-            <td style="padding:4px 8px;border:1px solid #e5e7eb;font-size:11px;">${item.msku}</td>
-            <td style="padding:4px 8px;border:1px solid #e5e7eb;font-size:11px;">${item.product_name || '-'}</td>
-            <td style="padding:4px 8px;border:1px solid #e5e7eb;font-size:12px;">${translateError('', reasons) || reasons || '受入不可'}</td>
-          </tr>`;
-        }).join('');
-
-        html = `
-          <div class="debug-overlay" onclick="closeInboundModal()"></div>
-          <div class="debug-modal" style="max-width:700px;">
-            <span class="debug-close" onclick="closeInboundModal()">&times;</span>
-            <h3 style="margin:0 0 16px;color:#d97706;">⚠ NG商品が含まれています</h3>
-            <div style="background:#fef3c7;padding:12px;border-radius:6px;margin-bottom:16px;">
-              <div>${ngItems.length}件のNG商品が適格性チェックで検出されました。</div>
-              <div>これらを除外してから納品プランを作成してください。</div>
-            </div>
-            <div style="max-height:200px;overflow-y:auto;">
-              <table style="width:100%;border-collapse:collapse;">
-                <tr style="background:#f3f4f6;"><th style="padding:4px 8px;border:1px solid #e5e7eb;font-size:11px;">SKU</th><th style="padding:4px 8px;border:1px solid #e5e7eb;font-size:11px;">商品名</th><th style="padding:4px 8px;border:1px solid #e5e7eb;font-size:11px;">理由</th></tr>
-                ${ngHtml}
-              </table>
-            </div>
-            <div style="display:flex;gap:8px;margin-top:16px;">
-              <button class="btn btn-primary" onclick="removeNgAndRetry(${JSON.stringify(ngItems.map(i => i.msku))})" style="background:#dc2626;">NG商品を除外して再作成（${data.eligibleCount} SKU）</button>
-              <button class="btn btn-secondary" onclick="closeInboundModal()">閉じる</button>
-            </div>
-          </div>`;
       } else if (type === 'success') {
         const corrections = data.prepCorrections || [];
         let correctionsHtml = '';
@@ -2458,6 +2399,7 @@ Step10: アラート判定</pre>
             <div style="background:#f0fdf4;padding:12px;border-radius:6px;margin-bottom:16px;">
               <div><strong>プランID:</strong> ${data.inboundPlanId}</div>
               <div><strong>SKU数:</strong> ${data.totalItems} SKU</div>
+              ${data.excludedItems?.length > 0 ? `<div style="color:#d97706;font-size:12px;margin-top:4px;">⚠ NG商品 ${data.excludedItems.length}件を自動除外しました（${data.excludedItems.map(i => i.product_name || i.amazon_sku).join('、')}）</div>` : ''}
               ${data.retried ? '<div style="color:#d97706;font-size:12px;margin-top:4px;">※ prep設定を自動修正してリトライしました</div>' : ''}
             </div>
             ${correctionsHtml}
@@ -2491,11 +2433,7 @@ Step10: アラート判定</pre>
           unknownSkuHtml = `
             <div style="background:#fef3c7;padding:10px;border-radius:6px;margin-top:12px;font-size:12px;">
               <strong>⚠ エラーの原因SKUを特定できませんでした</strong><br>
-              Amazon APIの制限により、どの商品がエラーの原因か特定できません。<br>
-              「適格性チェック」を実行すると、NG商品を事前に検出できます。
-              <div style="margin-top:8px;">
-                <button class="btn btn-primary" onclick="closeInboundModal(); runEligibilityCheck();" style="background:#d97706; padding:6px 14px; font-size:12px;">🔍 適格性チェックを実行</button>
-              </div>
+              Amazon APIの制限により特定できません。SKUマッピング同期を実行すると、次回から自動的にNG商品が除外されます。
             </div>`;
         }
 
