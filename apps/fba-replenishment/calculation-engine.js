@@ -103,10 +103,13 @@ export function generateRecommendations(debug = false) {
     const nonFbaDailySales = nonFbaSales30d / 30;
     const totalDailySales = dailySales + nonFbaDailySales;
 
-    if (mapping.is_set && mapping.set_components) {
-      // セット商品: 構成商品の最小在庫がボトルネック
-      const components = typeof mapping.set_components === 'string'
-        ? JSON.parse(mapping.set_components) : mapping.set_components;
+    // set_componentsがあれば常にcomponentsロジックを使う（単品qty>1にも対応）
+    const components = mapping.set_components
+      ? (typeof mapping.set_components === 'string' ? JSON.parse(mapping.set_components) : mapping.set_components)
+      : null;
+
+    if (components && components.length > 0) {
+      // 構成商品の最小在庫がボトルネック（qty倍率を考慮）
       let minSets = Infinity;
       for (const comp of components) {
         const wh = warehouseMap[comp.ne_code];
@@ -117,14 +120,14 @@ export function generateRecommendations(debug = false) {
       }
       warehouseRaw = minSets === Infinity ? 0 : minSets;
     } else {
-      // 単品
+      // componentsなし（マッピングにNE商品コードがない場合など）
       const wh = warehouseMap[mapping.logizard_code || mapping.ne_code];
       warehouseRaw = wh?.warehouse_available || 0;
       warehouseYQty = wh?.y_location_qty || 0;
     }
 
     // --- 最終入荷日から入荷経過日数を算出 ---
-    const whLookup = mapping.is_set ? null : warehouseMap[mapping.logizard_code || mapping.ne_code];
+    const whLookup = (components && components.length > 1) ? null : warehouseMap[mapping.logizard_code || mapping.ne_code];
     const lastArrivalDate = whLookup?.last_arrival_date || null;
     let daysSinceArrival = null;
     if (lastArrivalDate) {
@@ -317,6 +320,7 @@ export function generateRecommendations(debug = false) {
       product_name: mapping.product_name || snap.product_name || '',
       ne_code: mapping.ne_code || '',
       is_set: mapping.is_set ? true : false,
+      set_components: components || null,
 
       // FBA在庫
       fba_available: fbaAvailable,

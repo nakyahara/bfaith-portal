@@ -99,6 +99,12 @@
     .stockout-sendable { background: #fee2e2; color: #dc2626; }
     .stockout-already { background: #fef3c7; color: #92400e; }
     .stockout-nostock { background: #f3f4f6; color: #6b7280; }
+    .comp-cell { font-size: 11px; white-space: nowrap; }
+    .comp-toggle { cursor: pointer; color: #2563eb; user-select: none; }
+    .comp-toggle:hover { text-decoration: underline; }
+    .comp-detail { display: none; margin-top: 2px; padding: 3px 6px; background: #f8f9fa; border-radius: 3px; font-size: 10px; white-space: normal; }
+    .comp-detail.open { display: block; }
+    .comp-tag { display: inline-block; background: #e0e7ff; color: #3730a3; padding: 1px 5px; border-radius: 3px; margin: 1px 0; }
     .step-badge { display: inline-block; background: #e5e7eb; color: #6b7280; font-size: 12px; font-weight: bold; padding: 4px 10px; border-radius: 12px; min-width: 56px; text-align: center; }
     .step-badge.active { background: #2563eb; color: white; }
     .step-badge.done { background: #16a34a; color: white; }
@@ -238,6 +244,7 @@
               <th class="sortable-rec" data-key="urgency_score" data-type="num">緊急度</th>
               <th class="sortable-rec" data-key="amazon_sku">SKU</th>
               <th class="sortable-rec" data-key="product_name">商品名</th>
+              <th>構成</th>
               <th class="sortable-rec" data-key="fba_available" data-type="num">FBA在庫</th>
               <th class="sortable-rec" data-key="effective_fba_stock" data-type="num">実質在庫</th>
               <th class="sortable-rec" data-key="days_of_supply" data-type="num">供給日数</th>
@@ -304,6 +311,7 @@
                 <th class="sortable-stockout" data-key="stockout_status">状態</th>
                 <th class="sortable-stockout" data-key="amazon_sku">SKU</th>
                 <th class="sortable-stockout" data-key="product_name">商品名</th>
+                <th>構成</th>
                 <th class="sortable-stockout" data-key="fba_inbound_shipped" data-type="num">輸送中</th>
                 <th class="sortable-stockout" data-key="fba_inbound_working" data-type="num">準備中</th>
                 <th class="sortable-stockout" data-key="units_sold_7d" data-type="num">FBA7日</th>
@@ -354,6 +362,7 @@
                 <th class="sortable-order" data-key="urgency_score" data-type="num">緊急度</th>
                 <th class="sortable-order" data-key="amazon_sku">SKU</th>
                 <th class="sortable-order" data-key="product_name">商品名</th>
+                <th>構成</th>
                 <th class="sortable-order" data-key="fba_available" data-type="num">FBA在庫</th>
                 <th class="sortable-order" data-key="effective_fba_stock" data-type="num">実質在庫</th>
                 <th class="sortable-order" data-key="days_of_supply" data-type="num">供給日数</th>
@@ -408,6 +417,31 @@
 
   <script>
     const BASE = '/apps/fba-replenishment';
+
+    // 構成列のHTML生成
+    function renderComponentCell(r) {
+      const comps = r.set_components;
+      if (!comps || comps.length === 0) {
+        // componentsなし → NE商品コードだけ表示
+        return `<td class="comp-cell">${r.ne_code || '-'}</td>`;
+      }
+      if (comps.length === 1 && (comps[0].qty || 1) === 1) {
+        // 単品×1 → シンプル表示
+        return `<td class="comp-cell">${comps[0].ne_code}</td>`;
+      }
+      if (comps.length === 1) {
+        // 単品×N → 数量表示
+        return `<td class="comp-cell"><span class="comp-tag">${comps[0].ne_code} ×${comps[0].qty}</span></td>`;
+      }
+      // 複数構成 → アコーディオン
+      const id = 'comp_' + r.amazon_sku.replace(/[^a-zA-Z0-9]/g, '_');
+      const summary = `${comps.length}種`;
+      const details = comps.map(c => `<span class="comp-tag">${c.ne_code} ×${c.qty}</span>`).join(' ');
+      return `<td class="comp-cell">
+        <span class="comp-toggle" onclick="document.getElementById('${id}').classList.toggle('open')">${summary} ▸</span>
+        <div class="comp-detail" id="${id}">${details}</div>
+      </td>`;
+    }
 
     function log(msg) {
       const el = document.getElementById('log');
@@ -764,7 +798,7 @@
 
     function renderRecList(data) {
       const tbody = document.getElementById('recBody');
-      if (!data.length) { tbody.innerHTML = '<tr><td colspan="22">該当なし</td></tr>'; return; }
+      if (!data.length) { tbody.innerHTML = '<tr><td colspan="23">該当なし</td></tr>'; return; }
 
       // ソート
       data.sort((a, b) => {
@@ -810,6 +844,7 @@
           <td>${r._manual ? '手動' : r.urgency_score}</td>
           <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')">${r.amazon_sku}</span></td>
           <td class="product-name" title="${r.product_name || ''}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${r.product_name || ''}</a>` : (r.product_name || '')}</td>
+          ${renderComponentCell(r)}
           <td>${r.fba_available}</td>
           <td>${r.effective_fba_stock}</td>
           <td style="${dosColor}">${dosVal}${belowReorder ? ' ⚠' : ''}</td>
@@ -1246,7 +1281,7 @@ Step10: アラート判定</pre>
 
     function renderOrderList(data) {
       const tbody = document.getElementById('orderBody');
-      if (!data.length) { tbody.innerHTML = '<tr><td colspan="20">該当なし</td></tr>'; return; }
+      if (!data.length) { tbody.innerHTML = '<tr><td colspan="21">該当なし</td></tr>'; return; }
 
       // ソート
       data.sort((a, b) => {
@@ -1275,6 +1310,7 @@ Step10: アラート判定</pre>
           <td>${r.urgency_score}</td>
           <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')">${r.amazon_sku}</span></td>
           <td class="product-name" title="${r.product_name || ''}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;">${r.product_name || ''}</a>` : (r.product_name || '')}</td>
+          ${renderComponentCell(r)}
           <td>${r.fba_available}</td>
           <td>${r.effective_fba_stock}</td>
           <td style="${dosColor}">${dosVal}</td>
@@ -1358,7 +1394,7 @@ Step10: アラート判定</pre>
 
     function renderStockoutList(data) {
       const tbody = document.getElementById('stockoutBody');
-      if (!data.length) { tbody.innerHTML = '<tr><td colspan="16">該当なし</td></tr>'; return; }
+      if (!data.length) { tbody.innerHTML = '<tr><td colspan="17">該当なし</td></tr>'; return; }
 
       // ソート
       data.sort((a, b) => {
@@ -1421,6 +1457,7 @@ Step10: アラート判定</pre>
           <td>${statusHtml}</td>
           <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')">${r.amazon_sku}</span></td>
           <td class="product-name" title="${r.product_name || ''}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${r.product_name || ''}</a>` : (r.product_name || '')}</td>
+          ${renderComponentCell(r)}
           <td>${r.fba_inbound_shipped || 0}</td>
           <td>${r.fba_inbound_working || 0}</td>
           <td>${r.units_sold_7d}</td>

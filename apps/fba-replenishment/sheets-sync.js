@@ -92,8 +92,11 @@ export async function syncSkuMappings() {
 
   // DB用のマッピングデータに変換
   const mappings = Object.values(skuGroups).map(group => {
-    const isSet = group.components.length > 1;
     const primaryComponent = group.components[0] || {};
+    // 複数商品コード or 単品でもqty>1 → セット扱い
+    const hasMultipleComponents = group.components.length > 1;
+    const hasQtyMultiplier = group.components.length === 1 && (primaryComponent.qty || 1) > 1;
+    const isSet = hasMultipleComponents || hasQtyMultiplier;
 
     return {
       amazon_sku: group.amazon_sku,
@@ -102,7 +105,8 @@ export async function syncSkuMappings() {
       ne_code: primaryComponent.ne_code || null,
       logizard_code: primaryComponent.ne_code || null, // NE商品コード = ロジザード商品ID
       is_set: isSet,
-      set_components: isSet ? group.components : null,
+      // 常にcomponentsを保存（qty情報を保持するため）
+      set_components: group.components.length > 0 ? group.components : null,
       non_fba_sales_7d: group.non_fba_sales_7d || 0,
       non_fba_sales_30d: group.non_fba_sales_30d || 0,
     };
