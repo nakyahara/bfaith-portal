@@ -863,11 +863,15 @@
       renderRecList(combined);
       document.getElementById('recFilterCount').textContent = `表示: ${combined.length} 件`;
 
-      // スナップショットテーブルも同じ検索語でフィルター
-      if (searchQuery) {
+      syncSnapshotSearch(searchQuery);
+    }
+
+    // スナップショットテーブルを検索語で連動フィルター（全タブ共通）
+    function syncSnapshotSearch(query) {
+      if (query) {
         const filteredSnap = snapshotData.filter(r =>
-          (r.product_name || '').toLowerCase().includes(searchQuery) ||
-          (r.amazon_sku || '').toLowerCase().includes(searchQuery)
+          (r.product_name || '').toLowerCase().includes(query) ||
+          (r.amazon_sku || '').toLowerCase().includes(query)
         );
         renderSnapshot(filteredSnap);
       } else {
@@ -1465,6 +1469,7 @@ Step10: アラート判定</pre>
       }
       renderOrderList(filtered);
       document.getElementById('orderFilterCount').textContent = `表示: ${filtered.length} 件`;
+      syncSnapshotSearch(searchQuery);
     }
 
     function renderOrderList(data) {
@@ -1600,6 +1605,7 @@ Step10: アラート判定</pre>
       }
       renderStockoutList(filtered);
       document.getElementById('stockoutFilterCount').textContent = `表示: ${filtered.length} 件`;
+      syncSnapshotSearch(searchQuery);
     }
 
     function renderStockoutList(data) {
@@ -1946,6 +1952,7 @@ Step10: アラート判定</pre>
       }
       renderNewList(filtered);
       document.getElementById('newFilterCount').textContent = `表示: ${filtered.length} 件`;
+      syncSnapshotSearch(searchQuery);
     }
 
     function renderNewList(data) {
