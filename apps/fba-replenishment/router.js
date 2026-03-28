@@ -7,7 +7,8 @@ import cron from 'node-cron';
 import { initDb, savePlanningData, getLatestSnapshots, getSettings, updateSetting,
          getSkuMappings, getSkuExceptions, upsertSkuException, deleteSkuException,
          getWarehouseInventory, replaceWarehouseInventory, getWarehouseSummary,
-         getShipmentPlans, getShipmentPlanItems, getDailySnapshots } from './db.js';
+         getShipmentPlans, getShipmentPlanItems, getDailySnapshots,
+         getStockoutHidden, hideStockoutSku, unhideStockoutSku, hideStockoutSkuBulk } from './db.js';
 import { fetchAllReports, normalizePlanningRow } from './sp-api-reports.js';
 import { syncSkuMappings } from './sheets-sync.js';
 import { generateRecommendations } from './calculation-engine.js';
@@ -264,6 +265,28 @@ router.get('/api/recommendations/:sku', (req, res) => {
     console.error('[FBA] SKU詳細エラー:', e);
     res.status(500).json({ error: e.message });
   }
+});
+
+// ===== FBA欠品 非表示管理 =====
+router.get('/api/stockout-hidden', (req, res) => {
+  res.json(getStockoutHidden());
+});
+
+router.post('/api/stockout-hidden', express.json(), (req, res) => {
+  const { skus, reason } = req.body;
+  if (Array.isArray(skus) && skus.length > 0) {
+    const count = hideStockoutSkuBulk(skus, reason);
+    return res.json({ success: true, count });
+  }
+  const { amazon_sku } = req.body;
+  if (!amazon_sku) return res.status(400).json({ error: 'amazon_sku または skus[] が必要です' });
+  hideStockoutSku(amazon_sku, reason);
+  res.json({ success: true });
+});
+
+router.delete('/api/stockout-hidden/:sku', (req, res) => {
+  unhideStockoutSku(req.params.sku);
+  res.json({ success: true });
 });
 
 // ===== ステータス =====

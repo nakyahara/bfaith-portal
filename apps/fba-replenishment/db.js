@@ -241,7 +241,16 @@ export async function initDb() {
     )
   `);
 
-  // --- 9. settings: 設定値 ---
+  // --- 9. stockout_hidden: FBA欠品リストの非表示SKU ---
+  db.run(`
+    CREATE TABLE IF NOT EXISTS stockout_hidden (
+      amazon_sku TEXT PRIMARY KEY,
+      reason TEXT,
+      hidden_at TEXT DEFAULT (datetime('now','localtime'))
+    )
+  `);
+
+  // --- 10. settings: 設定値 ---
   db.run(`
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY,
@@ -678,4 +687,37 @@ export function getAllNonFbaMax60d() {
     WHERE snapshot_date >= date('now', '-60 days')
     GROUP BY amazon_sku
   `);
+}
+
+// ===== FBA欠品 非表示管理 =====
+
+export function getStockoutHidden() {
+  return queryAll('SELECT * FROM stockout_hidden ORDER BY hidden_at DESC');
+}
+
+export function hideStockoutSku(amazonSku, reason) {
+  db.run(`INSERT OR REPLACE INTO stockout_hidden (amazon_sku, reason, hidden_at) VALUES (?, ?, datetime('now','localtime'))`,
+    [amazonSku, reason || null]);
+  saveToFile();
+}
+
+export function unhideStockoutSku(amazonSku) {
+  db.run('DELETE FROM stockout_hidden WHERE amazon_sku = ?', [amazonSku]);
+  saveToFile();
+}
+
+export function hideStockoutSkuBulk(skus, reason) {
+  db.run('BEGIN TRANSACTION');
+  try {
+    for (const sku of skus) {
+      db.run(`INSERT OR REPLACE INTO stockout_hidden (amazon_sku, reason, hidden_at) VALUES (?, ?, datetime('now','localtime'))`,
+        [sku, reason || null]);
+    }
+    db.run('COMMIT');
+    saveToFile();
+    return skus.length;
+  } catch (e) {
+    db.run('ROLLBACK');
+    throw e;
+  }
 }

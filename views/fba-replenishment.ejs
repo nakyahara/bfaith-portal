@@ -292,12 +292,14 @@
 
         <div style="margin-bottom:8px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
           <button class="btn btn-primary" onclick="addStockoutToShip()" style="background:#dc2626; padding:6px 14px; font-size:13px;">チェック済みを納品推奨に追加</button>
+          <button class="btn btn-secondary" onclick="hideStockoutChecked()" style="padding:6px 14px; font-size:13px;">チェック済みを非表示</button>
           <span style="font-size:12px; color:#666;" id="stockoutActionMsg"></span>
         </div>
 
         <div style="margin-bottom:8px; display:flex; gap:16px; align-items:center; flex-wrap:wrap;">
           <label style="font-weight:bold;"><input type="radio" name="stockoutFilter" value="sendable" checked onchange="filterStockoutList()"> 倉庫在庫ありのみ</label>
           <label><input type="radio" name="stockoutFilter" value="all" onchange="filterStockoutList()"> 全て</label>
+          <label style="margin-left:8px; color:#666;"><input type="checkbox" id="stockoutShowHidden" onchange="filterStockoutList()"> 非表示も含める <span id="stockoutHiddenCount" style="font-size:11px;"></span></label>
           <input type="text" id="stockoutSearch" placeholder="商品名・SKU・NE商品コードで検索" oninput="filterStockoutList()" style="padding:5px 10px; border:1px solid #d1d5db; border-radius:4px; font-size:13px; width:280px;">
           <span style="margin-left:auto;color:#666;font-size:12px;" id="stockoutFilterCount"></span>
         </div>
@@ -1336,8 +1338,22 @@ Step10: アラート判定</pre>
     let stockoutSortKey = 'stockout_status';
     let stockoutSortDir = 'asc';
     const stockoutCheckedSkus = new Set();
+    let stockoutHiddenSet = new Set(); // 非表示SKUセット
 
-    function updateStockoutList() {
+    // 非表示リストをDBから読み込み
+    async function loadStockoutHidden() {
+      try {
+        const res = await fetch(`${BASE}/api/stockout-hidden`);
+        const list = await res.json();
+        stockoutHiddenSet = new Set(list.map(r => r.amazon_sku));
+        document.getElementById('stockoutHiddenCount').textContent = `(${stockoutHiddenSet.size}件)`;
+      } catch(e) { /* ignore */ }
+    }
+
+    async function updateStockoutList() {
+      // 非表示リストを先に読み込む
+      await loadStockoutHidden();
+
       // FBA販売可能在庫 = 0 の全商品（SKUマッピングありのみ = recDataに含まれるもの）
       stockoutData = recData.filter(r => r.fba_available === 0).map(r => {
         // ステータス判定
@@ -1352,24 +1368,26 @@ Step10: アラート判定</pre>
           stockout_status = 'nostock'; // 在庫なし
           stockout_status_num = 3;
         }
-        return { ...r, stockout_status, stockout_status_num };
+        const is_hidden = stockoutHiddenSet.has(r.amazon_sku);
+        return { ...r, stockout_status, stockout_status_num, is_hidden };
       });
 
-      // タブカウント更新
+      // タブカウント（非表示を除いた数）
+      const visibleData = stockoutData.filter(r => !r.is_hidden);
       const countEl = document.getElementById('stockoutTabCount');
-      const sendableCount = stockoutData.filter(r => r.stockout_status === 'sendable').length;
-      if (stockoutData.length > 0) {
-        countEl.textContent = stockoutData.length;
+      if (visibleData.length > 0) {
+        countEl.textContent = visibleData.length;
         countEl.style.display = '';
       } else {
         countEl.style.display = 'none';
       }
 
-      // サマリー更新
-      document.getElementById('stockoutTotalCount').textContent = stockoutData.length + ' SKU';
+      // サマリー（非表示を除いた数）
+      const sendableCount = visibleData.filter(r => r.stockout_status === 'sendable').length;
+      document.getElementById('stockoutTotalCount').textContent = visibleData.length + ' SKU';
       document.getElementById('stockoutSendableCount').textContent = sendableCount + ' SKU';
-      document.getElementById('stockoutAlreadyCount').textContent = stockoutData.filter(r => r.stockout_status === 'already').length + ' SKU';
-      document.getElementById('stockoutNoStockCount').textContent = stockoutData.filter(r => r.stockout_status === 'nostock').length + ' SKU';
+      document.getElementById('stockoutAlreadyCount').textContent = visibleData.filter(r => r.stockout_status === 'already').length + ' SKU';
+      document.getElementById('stockoutNoStockCount').textContent = visibleData.filter(r => r.stockout_status === 'nostock').length + ' SKU';
 
       filterStockoutList();
     }
@@ -1377,7 +1395,13 @@ Step10: アラート判定</pre>
     function filterStockoutList() {
       const mode = document.querySelector('input[name="stockoutFilter"]:checked')?.value || 'sendable';
       const searchQuery = (document.getElementById('stockoutSearch')?.value || '').trim().toLowerCase();
+      const showHidden = document.getElementById('stockoutShowHidden')?.checked || false;
+
       let filtered = stockoutData;
+      // 非表示フィルター（デフォルトは非表示を除外）
+      if (!showHidden) {
+        filtered = filtered.filter(r => !r.is_hidden);
+      }
       if (mode === 'sendable') {
         filtered = filtered.filter(r => r.stockout_status === 'sendable');
       }
@@ -1419,10 +1443,13 @@ Step10: アラート判定</pre>
         const isSendable = r.stockout_status === 'sendable';
         const isAlready = r.stockout_status === 'already';
         const isNostock = r.stockout_status === 'nostock';
+        const isHidden = r.is_hidden;
 
         // ステータスバッジ
         let statusHtml;
-        if (isAlready) {
+        if (isHidden) {
+          statusHtml = '<span class="stockout-badge" style="background:#e5e7eb;color:#6b7280;">非表示</span>';
+        } else if (isAlready) {
           statusHtml = '<span class="stockout-badge stockout-already">納品推奨済み ✓</span>';
         } else if (isSendable) {
           statusHtml = '<span class="stockout-badge stockout-sendable">送り漏れ</span>';
@@ -1430,15 +1457,20 @@ Step10: アラート判定</pre>
           statusHtml = '<span class="stockout-badge stockout-nostock">在庫なし</span>';
         }
 
-        // チェックボックス
-        const checkDisabled = !isSendable;
+        // 非表示の場合は復元ボタン
+        if (isHidden) {
+          statusHtml += ` <span style="font-size:11px;color:#2563eb;cursor:pointer;text-decoration:underline;" onclick="unhideStockoutSku('${r.amazon_sku}')">復元</span>`;
+        }
+
+        // チェックボックス: 送り漏れ or 非表示(復元チェック用)で有効
+        const checkEnabled = isSendable || isHidden || isNostock;
         const isChecked = stockoutCheckedSkus.has(r.amazon_sku);
-        const checkHtml = checkDisabled
+        const checkHtml = !checkEnabled
           ? `<input type="checkbox" disabled style="opacity:0.3;">`
           : `<input type="checkbox" class="stockout-check" data-sku="${r.amazon_sku}" ${isChecked ? 'checked' : ''} onchange="onStockoutCheckChange(this)">`;
 
         // 行の背景色
-        const rowBg = isSendable ? 'background:#fff5f5;' : isAlready ? 'background:#fffbeb;' : '';
+        const rowBg = isHidden ? 'background:#f3f4f6;opacity:0.7;' : isSendable ? 'background:#fff5f5;' : isAlready ? 'background:#fffbeb;' : '';
 
         // アラート
         let alertsHtml = (r.alerts || []).map(a =>
@@ -1479,6 +1511,45 @@ Step10: アラート判定</pre>
       } else {
         stockoutCheckedSkus.delete(cb.dataset.sku);
       }
+    }
+
+    // チェック済みを非表示にする
+    async function hideStockoutChecked() {
+      const msgEl = document.getElementById('stockoutActionMsg');
+      if (stockoutCheckedSkus.size === 0) {
+        msgEl.textContent = 'チェックされた商品がありません';
+        msgEl.style.color = '#d97706';
+        return;
+      }
+      try {
+        const res = await fetch(`${BASE}/api/stockout-hidden`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ skus: [...stockoutCheckedSkus] }),
+        });
+        const d = await res.json();
+        msgEl.textContent = `${d.count}件を非表示にしました`;
+        msgEl.style.color = '#16a34a';
+        stockoutCheckedSkus.clear();
+        await updateStockoutList();
+      } catch(e) {
+        msgEl.textContent = 'エラー: ' + e.message;
+        msgEl.style.color = '#dc2626';
+      }
+    }
+
+    // 個別SKUの非表示を復元
+    async function unhideStockoutSku(sku) {
+      try {
+        await fetch(`${BASE}/api/stockout-hidden/${encodeURIComponent(sku)}`, { method: 'DELETE' });
+        stockoutHiddenSet.delete(sku);
+        // データを再計算して再描画
+        stockoutData = stockoutData.map(r =>
+          r.amazon_sku === sku ? { ...r, is_hidden: false } : r
+        );
+        document.getElementById('stockoutHiddenCount').textContent = `(${stockoutHiddenSet.size}件)`;
+        filterStockoutList();
+      } catch(e) { /* ignore */ }
     }
 
     function addStockoutToShip() {
