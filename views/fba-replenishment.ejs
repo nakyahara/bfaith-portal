@@ -95,6 +95,11 @@
     .sortable-stockout::after { content: ' ⇅'; font-size: 10px; color: #999; }
     .sortable-stockout.asc::after { content: ' ▲'; color: #2563eb; }
     .sortable-stockout.desc::after { content: ' ▼'; color: #2563eb; }
+    .sortable-new { cursor: pointer; user-select: none; white-space: nowrap; }
+    .sortable-new:hover { background: #e5e7eb; }
+    .sortable-new::after { content: ' ⇅'; font-size: 10px; color: #999; }
+    .sortable-new.asc::after { content: ' ▲'; color: #2563eb; }
+    .sortable-new.desc::after { content: ' ▼'; color: #2563eb; }
     .stockout-badge { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
     .stockout-sendable { background: #fee2e2; color: #dc2626; }
     .stockout-already { background: #fef3c7; color: #92400e; }
@@ -192,6 +197,7 @@
       <div style="display:flex;gap:0;margin-bottom:0;">
         <button class="tab-btn active" id="tabShip" onclick="switchTab('ship')">納品推奨</button>
         <button class="tab-btn" id="tabStockout" onclick="switchTab('stockout')">FBA欠品<span class="tab-count" id="stockoutTabCount" style="display:none;"></span></button>
+        <button class="tab-btn" id="tabNew" onclick="switchTab('new')">新規商品<span class="tab-count" id="newTabCount" style="display:none;"></span></button>
         <button class="tab-btn" id="tabOrder" onclick="switchTab('order')">発注推奨（在庫0）<span class="tab-count" id="orderTabCount"></span></button>
       </div>
 
@@ -354,6 +360,49 @@
         </div>
       </div><!-- /tabStockoutContent -->
 
+      <!-- === 新規商品タブ === -->
+      <div id="tabNewContent" style="display:none;">
+        <div class="status-row" style="margin-bottom:8px;">
+          <div class="stat" style="border-left:4px solid #16a34a; background:#f0fdf4;">
+            <div class="label">倉庫在庫あり（すぐ送れる）</div>
+            <div class="value" id="newReadyCount" style="color:#16a34a;font-size:20px;">-</div>
+          </div>
+          <div class="stat" style="border-left:4px solid #6b7280;">
+            <div class="label">在庫なし</div>
+            <div class="value" id="newNoStockCount" style="color:#6b7280;font-size:20px;">-</div>
+          </div>
+          <div class="stat" style="border-left:4px solid #7c3aed; background:#f5f3ff;">
+            <div class="label">新規商品 合計</div>
+            <div class="value" id="newTotalCount" style="color:#7c3aed;font-size:20px;">-</div>
+          </div>
+        </div>
+
+        <div style="margin-bottom:8px; display:flex; gap:16px; align-items:center; flex-wrap:wrap;">
+          <label style="font-weight:bold;"><input type="radio" name="newFilter" value="ready" checked onchange="filterNewList()"> 倉庫在庫ありのみ</label>
+          <label><input type="radio" name="newFilter" value="all" onchange="filterNewList()"> 全て</label>
+          <input type="text" id="newSearch" placeholder="商品名・SKU・NE商品コードで検索" oninput="filterNewList()" style="padding:5px 10px; border:1px solid #d1d5db; border-radius:4px; font-size:13px; width:280px;">
+          <span style="margin-left:auto;color:#666;font-size:12px;" id="newFilterCount"></span>
+        </div>
+
+        <div class="table-wrap" style="max-height:calc(100vh - 280px);">
+          <table class="data-table" id="newTable" style="table-layout:auto;">
+            <thead>
+              <tr>
+                <th style="width:30px;text-align:center;">#</th>
+                <th class="sortable-new" data-key="amazon_sku">SKU</th>
+                <th class="sortable-new" data-key="product_name">商品名</th>
+                <th>構成</th>
+                <th class="sortable-new" data-key="warehouse_qty" data-type="num">倉庫在庫</th>
+                <th class="sortable-new" data-key="y_qty" data-type="num">Yロケ在庫</th>
+                <th class="sortable-new" data-key="ne_code">NE商品コード</th>
+                <th>状態</th>
+              </tr>
+            </thead>
+            <tbody id="newBody"></tbody>
+          </table>
+        </div>
+      </div><!-- /tabNewContent -->
+
       <!-- === 発注推奨タブ === -->
       <div id="tabOrderContent" style="display:none;">
         <div class="status-row" style="margin-bottom:8px;">
@@ -488,6 +537,7 @@
     }
 
     let skuMappingMap = {}; // SKU→ASIN等のマッピング
+    let warehouseSummaryMap = {}; // 商品コード→倉庫サマリー
 
     async function loadSkuMappingMap() {
       try {
@@ -495,6 +545,15 @@
         const mappings = await res.json();
         skuMappingMap = {};
         for (const m of mappings) skuMappingMap[m.amazon_sku] = m;
+      } catch(e) { /* 無視 */ }
+    }
+
+    async function loadWarehouseSummaryMap() {
+      try {
+        const res = await fetch(`${BASE}/api/warehouse/summary`);
+        const data = await res.json();
+        warehouseSummaryMap = {};
+        for (const w of data) warehouseSummaryMap[w.logizard_code] = w;
       } catch(e) { /* 無視 */ }
     }
 
@@ -661,6 +720,8 @@
         filterRecList();
         updateOrderList();
         updateStockoutList();
+        await loadWarehouseSummaryMap();
+        await updateNewProductList();
         document.getElementById('draftBanner').style.display = 'none';
         document.getElementById('draftLastSaved').textContent = '';
         const msgEl = document.getElementById('draftSaveMsg');
@@ -917,6 +978,17 @@
         document.querySelectorAll('th.sortable-rec').forEach(t => t.classList.remove('asc', 'desc'));
         th.classList.add(recSortDir);
         filterRecList();
+        return;
+      }
+      // 新規商品テーブルのソート
+      const th5 = e.target.closest('th.sortable-new');
+      if (th5) {
+        const key = th5.dataset.key;
+        if (newSortKey === key) newSortDir = newSortDir === 'asc' ? 'desc' : 'asc';
+        else { newSortKey = key; newSortDir = 'desc'; }
+        document.querySelectorAll('th.sortable-new').forEach(t => t.classList.remove('asc', 'desc'));
+        th5.classList.add(newSortDir);
+        filterNewList();
         return;
       }
       // FBA欠品テーブルのソート
@@ -1271,9 +1343,11 @@ Step10: アラート判定</pre>
     function switchTab(tab) {
       document.getElementById('tabShip').classList.toggle('active', tab === 'ship');
       document.getElementById('tabStockout').classList.toggle('active', tab === 'stockout');
+      document.getElementById('tabNew').classList.toggle('active', tab === 'new');
       document.getElementById('tabOrder').classList.toggle('active', tab === 'order');
       document.getElementById('tabShipContent').style.display = tab === 'ship' ? '' : 'none';
       document.getElementById('tabStockoutContent').style.display = tab === 'stockout' ? '' : 'none';
+      document.getElementById('tabNewContent').style.display = tab === 'new' ? '' : 'none';
       document.getElementById('tabOrderContent').style.display = tab === 'order' ? '' : 'none';
     }
 
@@ -1674,6 +1748,132 @@ Step10: アラート判定</pre>
       }
     }
 
+    // ===== 新規商品リスト =====
+    let newProductData = [];
+    let newSortKey = 'warehouse_qty';
+    let newSortDir = 'desc';
+
+    async function updateNewProductList() {
+      // SKUマッピングの全SKUを取得
+      if (Object.keys(skuMappingMap).length === 0) await loadSkuMappingMap();
+
+      // SP-APIスナップショットに存在するSKUセット
+      const snapshotSkuSet = new Set(recData.map(r => r.amazon_sku));
+
+      // マッピングにあってスナップショットにないSKU = 新規商品
+      newProductData = [];
+      for (const [sku, mapping] of Object.entries(skuMappingMap)) {
+        if (snapshotSkuSet.has(sku)) continue; // SP-APIに存在 → 新規ではない
+
+        // 倉庫在庫を確認
+        let warehouseQty = 0;
+        let yQty = 0;
+        // set_componentsからNEコードを取得して倉庫在庫を参照
+        const comps = mapping.set_components
+          ? (typeof mapping.set_components === 'string' ? JSON.parse(mapping.set_components) : mapping.set_components)
+          : null;
+
+        if (comps && comps.length > 0) {
+          // 構成商品の最小在庫
+          let minSets = Infinity;
+          for (const comp of comps) {
+            const whRows = warehouseSummaryMap[comp.ne_code];
+            const available = whRows?.warehouse_available || 0;
+            minSets = Math.min(minSets, Math.floor(available / (comp.qty || 1)));
+            yQty += whRows?.y_location_qty || 0;
+          }
+          warehouseQty = minSets === Infinity ? 0 : minSets;
+        } else {
+          const whRows = warehouseSummaryMap[mapping.logizard_code || mapping.ne_code];
+          warehouseQty = whRows?.warehouse_available || 0;
+          yQty = whRows?.y_location_qty || 0;
+        }
+
+        newProductData.push({
+          amazon_sku: sku,
+          asin: mapping.asin || '',
+          product_name: mapping.product_name || '',
+          ne_code: mapping.ne_code || '',
+          set_components: comps,
+          is_set: mapping.is_set ? true : false,
+          warehouse_qty: warehouseQty,
+          y_qty: yQty,
+        });
+      }
+
+      // タブカウント
+      const countEl = document.getElementById('newTabCount');
+      if (newProductData.length > 0) {
+        countEl.textContent = newProductData.length;
+        countEl.style.display = '';
+      } else {
+        countEl.style.display = 'none';
+      }
+
+      // サマリー
+      const readyCount = newProductData.filter(r => r.warehouse_qty > 0).length;
+      document.getElementById('newTotalCount').textContent = newProductData.length + ' SKU';
+      document.getElementById('newReadyCount').textContent = readyCount + ' SKU';
+      document.getElementById('newNoStockCount').textContent = (newProductData.length - readyCount) + ' SKU';
+
+      filterNewList();
+    }
+
+    function filterNewList() {
+      const mode = document.querySelector('input[name="newFilter"]:checked')?.value || 'ready';
+      const searchQuery = (document.getElementById('newSearch')?.value || '').trim().toLowerCase();
+      let filtered = newProductData;
+      if (mode === 'ready') {
+        filtered = filtered.filter(r => r.warehouse_qty > 0);
+      }
+      if (searchQuery) {
+        filtered = filtered.filter(r =>
+          (r.product_name || '').toLowerCase().includes(searchQuery) ||
+          (r.amazon_sku || '').toLowerCase().includes(searchQuery) ||
+          (r.ne_code || '').toLowerCase().includes(searchQuery)
+        );
+      }
+      renderNewList(filtered);
+      document.getElementById('newFilterCount').textContent = `表示: ${filtered.length} 件`;
+    }
+
+    function renderNewList(data) {
+      const tbody = document.getElementById('newBody');
+      if (!data.length) { tbody.innerHTML = '<tr><td colspan="8">該当なし</td></tr>'; return; }
+
+      // ソート
+      data.sort((a, b) => {
+        const th = document.querySelector(`th.sortable-new[data-key="${newSortKey}"]`);
+        const isNum = th?.dataset.type === 'num';
+        let va = a[newSortKey], vb = b[newSortKey];
+        if (isNum) { va = parseFloat(va) || 0; vb = parseFloat(vb) || 0; }
+        else { va = String(va || ''); vb = String(vb || ''); }
+        if (va < vb) return newSortDir === 'asc' ? -1 : 1;
+        if (va > vb) return newSortDir === 'asc' ? 1 : -1;
+        return 0;
+      });
+
+      let num = 0;
+      tbody.innerHTML = data.map(r => {
+        num++;
+        const hasStock = r.warehouse_qty > 0;
+        const rowBg = hasStock ? 'background:#f0fdf4;' : '';
+        const statusHtml = hasStock
+          ? '<span class="stockout-badge" style="background:#dcfce7;color:#16a34a;">送れる</span>'
+          : '<span class="stockout-badge stockout-nostock">在庫なし</span>';
+        return `<tr style="${rowBg}">
+          <td style="text-align:center;color:#666;font-size:11px;">${num}</td>
+          <td style="font-size:11px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${r.amazon_sku}</td>
+          <td class="product-name" title="${r.product_name || ''}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${r.product_name || ''}</a>` : (r.product_name || '')}</td>
+          ${renderComponentCell(r)}
+          <td style="font-weight:bold;${hasStock ? 'color:#16a34a' : 'color:#999'}">${r.warehouse_qty}</td>
+          <td style="color:#666;">${r.y_qty || 0}</td>
+          <td style="font-size:11px;">${r.ne_code || '-'}</td>
+          <td>${statusHtml}</td>
+        </tr>`;
+      }).join('');
+    }
+
     // ===== ステップ制御 =====
     const stepCompleted = [false, false, false, false]; // Step 1~4
 
@@ -1824,6 +2024,8 @@ Step10: アラート判定</pre>
       filterRecList();
       updateOrderList();
       await updateStockoutList();
+      await loadWarehouseSummaryMap();
+      await updateNewProductList();
       updateDraftLastSaved();
       log('復元完了');
     }
@@ -1908,6 +2110,8 @@ Step10: アラート判定</pre>
               filterRecList();
               updateOrderList();
               await updateStockoutList();
+              await loadWarehouseSummaryMap();
+              await updateNewProductList();
             }
           }
         } catch(e) { /* ignore */ }
