@@ -332,7 +332,7 @@ export async function initDb() {
     ['inbound_ship_from_phone', ''],
     ['inbound_ship_from_country', 'JP'],
     ['inbound_label_owner', 'AMAZON'],
-    ['inbound_prep_owner', 'SELLER'],
+    ['inbound_prep_owner', 'NONE'],
   ];
   for (const [key, value] of defaults) {
     db.run(`INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)`, [key, value]);
@@ -345,6 +345,7 @@ export async function initDb() {
     ['non_fba_reserve_days', '14', '60'],             // 14日→60日（他CH確保を強化）
     ['reorder_point_high_volume', '14', '21'],        // 高回転: 14日→21日（売れるのが速いので早めにトリガー）
     ['reorder_point_low_volume', '30', '14'],         // 低回転: 30日→14日（ゆっくり売れるので短めでOK）
+    ['inbound_prep_owner', 'SELLER', 'NONE'],          // prep不要な商品でエラーになるためNONEに変更
   ];
   for (const [key, oldVal, newVal] of migrations) {
     db.run(`UPDATE settings SET value = ?, updated_at = datetime('now','localtime') WHERE key = ? AND value = ?`, [newVal, key, oldVal]);

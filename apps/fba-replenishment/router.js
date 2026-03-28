@@ -297,7 +297,7 @@ router.post('/api/create-inbound-plan', express.json(), async (req, res) => {
   }
 
   const labelOwner = settings.inbound_label_owner || 'AMAZON';
-  const prepOwner = settings.inbound_prep_owner || 'SELLER';
+  const prepOwner = settings.inbound_prep_owner || 'NONE';
 
   // 有効期限フォーマット変換: YYYYMMDD or YYYY/MM/DD → YYYY-MM-DD
   function formatExpiration(raw) {
