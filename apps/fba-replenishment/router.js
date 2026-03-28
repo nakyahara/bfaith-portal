@@ -8,7 +8,8 @@ import { initDb, savePlanningData, getLatestSnapshots, getSettings, updateSettin
          getSkuMappings, getSkuExceptions, upsertSkuException, deleteSkuException,
          getWarehouseInventory, replaceWarehouseInventory, getWarehouseSummary,
          getShipmentPlans, getShipmentPlanItems, getDailySnapshots,
-         getStockoutHidden, hideStockoutSku, unhideStockoutSku, hideStockoutSkuBulk } from './db.js';
+         getStockoutHidden, hideStockoutSku, unhideStockoutSku, hideStockoutSkuBulk,
+         saveDraft, getDraft, clearDraft } from './db.js';
 import { fetchAllReports, normalizePlanningRow } from './sp-api-reports.js';
 import { syncSkuMappings } from './sheets-sync.js';
 import { generateRecommendations } from './calculation-engine.js';
@@ -265,6 +266,23 @@ router.get('/api/recommendations/:sku', (req, res) => {
     console.error('[FBA] SKU詳細エラー:', e);
     res.status(500).json({ error: e.message });
   }
+});
+
+// ===== 納品作業ドラフト =====
+router.get('/api/draft', (req, res) => {
+  res.json(getDraft());
+});
+
+router.post('/api/draft', express.json(), (req, res) => {
+  const { items, memo } = req.body;
+  if (!Array.isArray(items)) return res.status(400).json({ error: 'items[] が必要です' });
+  const count = saveDraft(items, memo);
+  res.json({ success: true, count });
+});
+
+router.delete('/api/draft', (req, res) => {
+  clearDraft();
+  res.json({ success: true });
 });
 
 // ===== FBA欠品 非表示管理 =====

@@ -138,8 +138,25 @@
       </div>
     </div>
 
-    <!-- ワークフロー（ステップ式） -->
-    <div class="actions" style="flex-direction:column;gap:0;">
+    <!-- 保存済みドラフト情報 -->
+    <div id="draftBanner" style="display:none; background:#eff6ff; border:1px solid #bfdbfe; border-radius:8px; padding:12px 16px; margin-bottom:12px;">
+      <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+        <span style="font-size:20px;">💾</span>
+        <div>
+          <div style="font-weight:bold; font-size:14px;">保存済みの作業データがあります</div>
+          <div style="font-size:12px; color:#666;" id="draftInfo"></div>
+        </div>
+        <div style="margin-left:auto; display:flex; gap:8px;">
+          <button class="btn btn-primary" onclick="loadDraftAndShow()" style="padding:6px 16px; font-size:13px;">復元して表示</button>
+          <button class="btn btn-secondary" onclick="clearDraftConfirm()" style="padding:6px 16px; font-size:13px;">破棄</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ワークフロー（データ更新） -->
+    <details id="workflowDetails">
+      <summary style="cursor:pointer; font-weight:bold; font-size:14px; padding:8px 0; color:#374151;">▶ データ更新（SP-API / CSV / SKU同期）</summary>
+    <div class="actions" style="flex-direction:column;gap:0;margin-top:8px;">
       <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
         <span class="step-badge" id="stepBadge1">Step 1</span>
         <button class="btn btn-primary" id="btnFetchAll" onclick="fetchReports()">SP-APIレポート全取得</button>
@@ -147,7 +164,7 @@
       </div>
       <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:8px;">
         <span class="step-badge" id="stepBadge2">Step 2</span>
-        <label class="btn btn-secondary" id="btnCsvLabel" style="cursor:pointer;opacity:0.5;pointer-events:none;">
+        <label class="btn btn-secondary" id="btnCsvLabel" style="cursor:pointer;">
           ロジザードCSVアップロード
           <input type="file" accept=".csv" id="csvFile" onchange="uploadCsv(this)" style="display:none;">
         </label>
@@ -155,15 +172,16 @@
       </div>
       <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:8px;">
         <span class="step-badge" id="stepBadge3">Step 3</span>
-        <button class="btn btn-secondary" id="btnSyncSku" onclick="syncSkuMappings()" disabled>SKUマッピング同期</button>
+        <button class="btn btn-secondary" id="btnSyncSku" onclick="syncSkuMappings()">SKUマッピング同期</button>
         <span class="step-status" id="stepStatus3"></span>
       </div>
       <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:8px;">
         <span class="step-badge" id="stepBadge4">Step 4</span>
-        <button class="btn btn-primary" id="btnCalc" onclick="calcRecommendations()" style="background:#16a34a;" disabled>推奨リスト生成</button>
+        <button class="btn btn-primary" id="btnCalc" onclick="calcRecommendations()" style="background:#16a34a;">推奨リスト生成</button>
         <span class="step-status" id="stepStatus4"></span>
       </div>
     </div>
+    </details>
 
     <!-- ログ -->
     <div class="log" id="log">FBA在庫補充システム — 準備完了</div>
@@ -216,8 +234,12 @@
       <div style="margin-bottom:8px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
         <button class="btn btn-primary" onclick="checkAllRed()" style="background:#dc2626; padding:6px 14px; font-size:13px;">🔴 緊急を全選択</button>
         <button class="btn btn-secondary" onclick="uncheckAll()" style="padding:6px 14px; font-size:13px;">選択解除</button>
-        <span style="font-size:12px; color:#666;">※ 黄色は翌日回しOK。必要なものだけ個別にチェック。</span>
+        <span style="flex:1;"></span>
+        <button class="btn btn-primary" onclick="saveDraftAction()" style="background:#16a34a; padding:6px 16px; font-size:13px;">💾 作業状態を保存</button>
+        <button class="btn btn-secondary" onclick="clearDraftConfirm()" style="padding:6px 12px; font-size:12px;">保存クリア</button>
+        <span style="font-size:11px; color:#666;" id="draftSaveMsg"></span>
       </div>
+      <div style="font-size:12px; color:#888; margin-bottom:4px;">※ 黄色は翌日回しOK。必要なものだけ個別にチェック。<span id="draftLastSaved" style="margin-left:12px; color:#2563eb;"></span></div>
 
       <!-- フィルター + 検索 -->
       <div style="margin-bottom:8px; display:flex; gap:16px; align-items:center; flex-wrap:wrap;">
@@ -1663,8 +1685,202 @@ Step10: アラート判定</pre>
     // 初期状態: Step 1 をアクティブに
     document.getElementById('stepBadge1').classList.add('active');
 
+    // ===== ドラフト保存/復元 =====
+
+    async function saveDraftAction() {
+      const msgEl = document.getElementById('draftSaveMsg');
+      // 全行の状態を収集（チェック有無 + 数量変更 + 欠品から追加）
+      const items = [];
+
+      // チェックされたアイテム
+      document.querySelectorAll('.rec-check').forEach(cb => {
+        const sku = cb.dataset.sku;
+        const qtyInput = document.querySelector(`.ship-qty-input[data-sku="${sku}"]`);
+        const qty = parseInt(qtyInput?.value) || 0;
+        const item = recData.find(r => r.amazon_sku === sku) || manualItems.find(m => m.amazon_sku === sku);
+        items.push({
+          amazon_sku: sku,
+          ship_qty: qty,
+          checked: cb.checked,
+          from_stockout: item?._fromStockout || false,
+        });
+      });
+
+      // 数量が変更されたが未チェックのもの
+      for (const [sku, qty] of Object.entries(shipQtyMap)) {
+        if (!items.find(i => i.amazon_sku === sku)) {
+          items.push({ amazon_sku: sku, ship_qty: qty, checked: false, from_stockout: false });
+        }
+      }
+
+      // 欠品から追加されたが上記に含まれないもの
+      for (const m of manualItems) {
+        if (!items.find(i => i.amazon_sku === m.amazon_sku)) {
+          items.push({ amazon_sku: m.amazon_sku, ship_qty: 0, checked: false, from_stockout: m._fromStockout || false });
+        }
+      }
+
+      if (items.length === 0) {
+        msgEl.textContent = '保存するデータがありません';
+        msgEl.style.color = '#d97706';
+        return;
+      }
+
+      try {
+        const res = await fetch(`${BASE}/api/draft`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items }),
+        });
+        const d = await res.json();
+        const checkedCount = items.filter(i => i.checked).length;
+        const totalQty = items.filter(i => i.checked).reduce((s, i) => s + i.ship_qty, 0);
+        msgEl.textContent = `保存しました（${checkedCount} SKU / ${totalQty.toLocaleString()} 個）`;
+        msgEl.style.color = '#16a34a';
+        updateDraftLastSaved();
+        setTimeout(() => { msgEl.textContent = ''; }, 5000);
+      } catch(e) {
+        msgEl.textContent = 'エラー: ' + e.message;
+        msgEl.style.color = '#dc2626';
+      }
+    }
+
+    async function checkDraftOnLoad() {
+      try {
+        const res = await fetch(`${BASE}/api/draft`);
+        const draft = await res.json();
+        if (draft.items && draft.items.length > 0 && draft.meta.saved_at) {
+          const savedAt = draft.meta.saved_at;
+          const count = draft.meta.item_count || draft.items.length;
+          const totalQty = draft.meta.total_qty || 0;
+          const checkedCount = draft.items.filter(i => i.checked).length;
+          document.getElementById('draftBanner').style.display = '';
+          document.getElementById('draftInfo').textContent =
+            `保存日時: ${savedAt} / ${checkedCount} SKU チェック済み / 合計 ${Number(totalQty).toLocaleString()} 個`;
+          return draft;
+        }
+      } catch(e) { /* ignore */ }
+      return null;
+    }
+
+    async function loadDraftAndShow() {
+      document.getElementById('draftBanner').style.display = 'none';
+      log('保存済みデータを復元中...');
+
+      // 推奨リストを先に生成
+      try {
+        const res = await fetch(`${BASE}/api/recommendations?debug=1`);
+        const d = await res.json();
+        if (d.error) { log('エラー: ' + d.error); return; }
+        recData = d.items || [];
+        recMeta = d;
+        manualItems = [];
+      } catch(e) { log('エラー: ' + e.message); return; }
+
+      // ドラフトを読み込み
+      try {
+        const res = await fetch(`${BASE}/api/draft`);
+        const draft = await res.json();
+        applyDraft(draft);
+      } catch(e) { log('ドラフト復元エラー: ' + e.message); }
+
+      document.getElementById('recSection').style.display = '';
+      updateRecSummary();
+      filterRecList();
+      updateOrderList();
+      await updateStockoutList();
+      updateDraftLastSaved();
+      log('復元完了');
+    }
+
+    function applyDraft(draft) {
+      if (!draft || !draft.items) return;
+
+      // まず欠品から追加されたアイテムを復元
+      for (const di of draft.items) {
+        if (di.from_stockout) {
+          const existing = recData.find(r => r.amazon_sku === di.amazon_sku);
+          if (existing) {
+            existing._manual = true;
+            existing._fromStockout = true;
+            existing.recommended_qty = existing.recommended_qty || 0;
+          }
+        }
+      }
+
+      // チェック状態と数量を復元
+      selectedSkus.clear();
+      for (const di of draft.items) {
+        if (di.checked) selectedSkus.add(di.amazon_sku);
+        if (di.ship_qty > 0) {
+          const item = recData.find(r => r.amazon_sku === di.amazon_sku);
+          const defaultQty = item?.adjusted_qty || 0;
+          if (di.ship_qty !== defaultQty) {
+            shipQtyMap[di.amazon_sku] = di.ship_qty;
+          }
+        }
+      }
+    }
+
+    async function clearDraftConfirm() {
+      if (!confirm('保存済みの作業データを破棄しますか？')) return;
+      try {
+        await fetch(`${BASE}/api/draft`, { method: 'DELETE' });
+        document.getElementById('draftBanner').style.display = 'none';
+        document.getElementById('draftLastSaved').textContent = '';
+        const msgEl = document.getElementById('draftSaveMsg');
+        if (msgEl) { msgEl.textContent = '保存データを破棄しました'; msgEl.style.color = '#666'; }
+        log('保存データを破棄しました');
+      } catch(e) { /* ignore */ }
+    }
+
+    async function updateDraftLastSaved() {
+      try {
+        const res = await fetch(`${BASE}/api/draft`);
+        const draft = await res.json();
+        const el = document.getElementById('draftLastSaved');
+        if (draft.meta?.saved_at) {
+          el.textContent = `最終保存: ${draft.meta.saved_at}`;
+        } else {
+          el.textContent = '';
+        }
+      } catch(e) { /* ignore */ }
+    }
+
+    // ===== 自動ロード =====
+    async function autoLoad() {
+      await loadStatus();
+
+      // ドラフトがあるか確認
+      const draft = await checkDraftOnLoad();
+
+      // ドラフトがなくてもデータがあれば自動で推奨リスト生成
+      if (!draft) {
+        try {
+          const statusRes = await fetch(`${BASE}/api/status`);
+          const status = await statusRes.json();
+          if (status.snapshotCount > 0 && status.mappingCount > 0) {
+            log('データが存在するため自動で推奨リスト生成中...');
+            const res = await fetch(`${BASE}/api/recommendations?debug=1`);
+            const d = await res.json();
+            if (!d.error && d.items && d.items.length > 0) {
+              recData = d.items || [];
+              recMeta = d;
+              manualItems = [];
+              log(`自動生成完了: 全${d.total_skus}SKU / 推奨${d.recommended_skus}SKU`);
+              document.getElementById('recSection').style.display = '';
+              updateRecSummary();
+              filterRecList();
+              updateOrderList();
+              await updateStockoutList();
+            }
+          }
+        } catch(e) { /* ignore */ }
+      }
+    }
+
     // 初期ロード
-    loadStatus();
+    autoLoad();
   </script>
 </body>
 </html>

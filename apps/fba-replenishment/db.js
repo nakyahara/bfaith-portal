@@ -250,7 +250,25 @@ export async function initDb() {
     )
   `);
 
-  // --- 10. settings: 設定値 ---
+  // --- 10. shipment_draft: 納品作業ドラフト（1つだけ保持） ---
+  db.run(`
+    CREATE TABLE IF NOT EXISTS shipment_draft (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      amazon_sku TEXT NOT NULL,
+      ship_qty INTEGER DEFAULT 0,
+      checked INTEGER DEFAULT 0,
+      from_stockout INTEGER DEFAULT 0,
+      UNIQUE(amazon_sku)
+    )
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS shipment_draft_meta (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    )
+  `);
+
+  // --- 11. settings: 設定値 ---
   db.run(`
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY,
@@ -720,4 +738,43 @@ export function hideStockoutSkuBulk(skus, reason) {
     db.run('ROLLBACK');
     throw e;
   }
+}
+
+// ===== 納品作業ドラフト =====
+
+export function saveDraft(items, memo) {
+  db.run('BEGIN TRANSACTION');
+  try {
+    db.run('DELETE FROM shipment_draft');
+    for (const item of items) {
+      db.run(`INSERT INTO shipment_draft (amazon_sku, ship_qty, checked, from_stockout) VALUES (?, ?, ?, ?)`,
+        [item.amazon_sku, item.ship_qty || 0, item.checked ? 1 : 0, item.from_stockout ? 1 : 0]);
+    }
+    // メタ情報を保存
+    db.run(`INSERT OR REPLACE INTO shipment_draft_meta (key, value) VALUES ('saved_at', datetime('now','localtime'))`);
+    db.run(`INSERT OR REPLACE INTO shipment_draft_meta (key, value) VALUES ('memo', ?)`, [memo || '']);
+    db.run(`INSERT OR REPLACE INTO shipment_draft_meta (key, value) VALUES ('item_count', ?)`, [String(items.length)]);
+    db.run(`INSERT OR REPLACE INTO shipment_draft_meta (key, value) VALUES ('total_qty', ?)`,
+      [String(items.reduce((s, i) => s + (i.ship_qty || 0), 0))]);
+    db.run('COMMIT');
+    saveToFile();
+    return items.length;
+  } catch (e) {
+    db.run('ROLLBACK');
+    throw e;
+  }
+}
+
+export function getDraft() {
+  const items = queryAll('SELECT * FROM shipment_draft ORDER BY amazon_sku');
+  const metaRows = queryAll('SELECT * FROM shipment_draft_meta');
+  const meta = {};
+  for (const r of metaRows) meta[r.key] = r.value;
+  return { items, meta };
+}
+
+export function clearDraft() {
+  db.run('DELETE FROM shipment_draft');
+  db.run('DELETE FROM shipment_draft_meta');
+  saveToFile();
 }
