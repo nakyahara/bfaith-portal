@@ -3146,26 +3146,22 @@ Step10: アラート判定</pre>
 
     // ===== NE受注CSV出力 =====
     async function exportNeCsv() {
-      const checkedItems = [];
-      document.querySelectorAll('.prov-check:checked').forEach(cb => {
-        const sku = cb.dataset.sku;
-        const qtyInput = document.querySelector(`.prov-qty-input[data-sku="${sku}"]`);
-        const item = provisionalData.find(i => i.amazon_sku === sku);
-        if (item) {
-          checkedItems.push({
-            amazon_sku: sku,
-            ship_qty: parseInt(qtyInput?.value) || item.ship_qty || 0,
-          });
-        }
+      // 仮確定リスト全件を出力（数量は画面上の入力値を反映）
+      const allItems = provisionalData.map(item => {
+        const qtyInput = document.querySelector(`.prov-qty-input[data-sku="${item.amazon_sku}"]`);
+        return {
+          amazon_sku: item.amazon_sku,
+          ship_qty: parseInt(qtyInput?.value) || item.ship_qty || 0,
+        };
       });
-      if (checkedItems.length === 0) { alert('商品を選択してください'); return; }
-      if (!confirm(`${checkedItems.length}件のSKUからNE受注CSVを出力します。\nSKU→NE商品コード変換・数量按分が行われます。`)) return;
+      if (allItems.length === 0) { alert('仮確定リストが空です'); return; }
+      if (!confirm(`仮確定リスト全${allItems.length}件からNE受注CSVを出力します。\nSKU→NE商品コード変換・数量按分が行われます。`)) return;
 
       try {
         const res = await fetch(`${BASE}/api/export-ne-csv`, {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({items: checkedItems}),
+          body: JSON.stringify({items: allItems}),
         });
         if (!res.ok) {
           const err = await res.json().catch(() => ({}));
@@ -3182,7 +3178,7 @@ Step10: アラート判定</pre>
         a.download = `hanyo-jyuchu_invoice_${new Date().toISOString().slice(0,10)}.csv`;
         a.click();
         URL.revokeObjectURL(url);
-        log(`NE受注CSV出力: ${checkedItems.length} SKU → NE商品コードに変換済み`);
+        log(`NE受注CSV出力: ${allItems.length} SKU → NE商品コードに変換済み`);
       } catch(e) { alert('エラー: ' + e.message); }
     }
 
