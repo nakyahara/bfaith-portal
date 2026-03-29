@@ -432,6 +432,14 @@ router.post('/api/create-inbound-plan', express.json(), async (req, res) => {
 
   inboundPlanInProgress = true;
   try {
+    // デバッグ: 受信データのexpiry_dateを確認
+    const itemsWithExpiry = items.filter(i => i.expiry_date);
+    console.log(`[Inbound] 受信items: ${items.length}件, expiry_date有り: ${itemsWithExpiry.length}件`);
+    if (itemsWithExpiry.length > 0) {
+      console.log(`[Inbound] expiry_dateサンプル:`, itemsWithExpiry.slice(0, 3).map(i => ({ sku: i.amazon_sku, expiry: i.expiry_date })));
+    } else if (items.length > 0) {
+      console.log(`[Inbound] items[0]のキー:`, Object.keys(items[0]));
+    }
     const { result, prepOverrides } = await attemptWithPrepRetry(items);
 
     // 修正情報を生成
