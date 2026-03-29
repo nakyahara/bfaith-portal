@@ -434,19 +434,19 @@ export function upsertSkuMappings(mappings) {
   try {
     for (const m of mappings) {
       db.run(`
-        INSERT INTO sku_mapping (amazon_sku, asin, product_name, ne_code, logizard_code, fnsku, jan, is_set, set_components, per_unit_volume, storage_type, non_fba_sales_7d, non_fba_sales_30d, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now','localtime'))
+        INSERT INTO sku_mapping (amazon_sku, asin, product_name, ne_code, logizard_code, jan, is_set, set_components, per_unit_volume, storage_type, non_fba_sales_7d, non_fba_sales_30d, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now','localtime'))
         ON CONFLICT(amazon_sku) DO UPDATE SET
           asin=excluded.asin, product_name=excluded.product_name,
           ne_code=excluded.ne_code, logizard_code=excluded.logizard_code,
-          fnsku=COALESCE(excluded.fnsku, sku_mapping.fnsku), jan=excluded.jan,
+          jan=excluded.jan,
           is_set=excluded.is_set, set_components=excluded.set_components,
           per_unit_volume=excluded.per_unit_volume, storage_type=excluded.storage_type,
           non_fba_sales_7d=excluded.non_fba_sales_7d, non_fba_sales_30d=excluded.non_fba_sales_30d,
           updated_at=datetime('now','localtime')
       `, [
         m.amazon_sku, m.asin || null, m.product_name || null,
-        m.ne_code || null, m.logizard_code || null, m.fnsku || null, m.jan || null,
+        m.ne_code || null, m.logizard_code || null, m.jan || null,
         m.is_set ? 1 : 0, m.set_components ? JSON.stringify(m.set_components) : null,
         m.per_unit_volume || null, m.storage_type || null,
         m.non_fba_sales_7d || 0, m.non_fba_sales_30d || 0,
