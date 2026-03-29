@@ -616,7 +616,9 @@
     function log(msg) {
       const el = document.getElementById('log');
       const ts = new Date().toLocaleTimeString('ja-JP');
-      el.textContent += `\n[${ts}] ${msg}`;
+      const line = document.createElement('div');
+      line.innerHTML = `[${ts}] ${msg}`;
+      el.appendChild(line);
       el.scrollTop = el.scrollHeight;
     }
 
@@ -2436,7 +2438,8 @@ Step10: アラート判定</pre>
 
         if (d.success) {
           showInboundModal('success', d);
-          log(`納品プラン作成成功: プランID ${d.inboundPlanId}`);
+          const planUrl2 = `https://sellercentral-japan.amazon.com/fba/sendtoamazon/confirm_content_step?wf=${d.inboundPlanId}`;
+          log(`納品プラン作成成功: <a href="${planUrl2}" target="_blank" style="color:#2563eb;">Seller Centralで開く ↗</a> (プランID: ${d.inboundPlanId})`);
           // 成功したSKUにフラグを立てる
           for (const item of checkedItems) {
             const rec = recData.find(r => r.amazon_sku === item.amazon_sku);
@@ -3112,7 +3115,8 @@ Step10: アラート判定</pre>
           }
           return;
         }
-        log(`納品プラン作成成功! プランID: ${d.inboundPlanId}`);
+        const planUrl = `https://sellercentral-japan.amazon.com/fba/sendtoamazon/confirm_content_step?wf=${d.inboundPlanId}`;
+        log(`納品プラン作成成功! <a href="${planUrl}" target="_blank" style="color:#2563eb;">Seller Centralで開く ↗</a> (プランID: ${d.inboundPlanId})`);
         if (d.shipments) {
           d.shipments.forEach(s => log(`  出荷先: ${s.destination} / ${s.skuCount} SKU / ${s.totalQty} 個`));
         }
