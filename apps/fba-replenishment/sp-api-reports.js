@@ -137,10 +137,22 @@ export async function fetchRestockRecommendations() {
 // レポート3: FBA在庫内訳（全SKU、22列）
 // ======================================================
 export async function fetchFbaInventory() {
-  console.log('[SP-API] FBA在庫内訳を取得中...');
-  const rows = await fetchReport('GET_FBA_MYI_ALL_INVENTORY_DATA');
-  console.log(`[SP-API] FBA在庫内訳: ${rows.length}件取得`);
-  return rows;
+  // ALL_INVENTORY_DATAがFATALになることがあるのでフォールバック付き
+  const reportTypes = [
+    'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA',
+    'GET_FBA_MYI_ALL_INVENTORY_DATA',
+  ];
+  for (const reportType of reportTypes) {
+    try {
+      console.log(`[SP-API] FBA在庫内訳を取得中... (${reportType})`);
+      const rows = await fetchReport(reportType);
+      console.log(`[SP-API] FBA在庫内訳: ${rows.length}件取得 (${reportType})`);
+      return rows;
+    } catch (e) {
+      console.error(`[SP-API] ${reportType} 失敗: ${e.message}、次のレポートを試行`);
+    }
+  }
+  throw new Error('FBA在庫内訳: すべてのレポートタイプが失敗');
 }
 
 // ======================================================
