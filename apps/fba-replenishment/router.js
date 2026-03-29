@@ -708,7 +708,7 @@ router.post('/api/export-manifest', express.json(), async (req, res) => {
 });
 
 // ===== NE受注CSV出力 =====
-router.post('/api/export-ne-csv', express.json(), (req, res) => {
+router.post('/api/export-ne-csv', express.json(), async (req, res) => {
   const { items } = req.body;
   if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items[] が必要です' });
 
