@@ -200,6 +200,7 @@
         <button class="tab-btn" id="tabNew" onclick="switchTab('new')">新規商品<span class="tab-count" id="newTabCount" style="display:none;"></span></button>
         <button class="tab-btn" id="tabOrder" onclick="switchTab('order')">発注推奨（在庫0）<span class="tab-count" id="orderTabCount"></span></button>
         <button class="tab-btn" id="tabProvisional" onclick="switchTab('provisional')">Amazon仮確定<span class="tab-count" id="provisionalTabCount" style="display:none;"></span></button>
+        <button class="tab-btn" id="tabPicking" onclick="switchTab('picking')" style="background:#f0fdf4;border-color:#86efac;">ピッキングリスト(試験)</button>
       </div>
 
       <!-- === 納品推奨タブ === -->
@@ -576,6 +577,20 @@
           </table>
         </div>
       </div><!-- /tabProvisionalContent -->
+
+      <!-- === ピッキングリスト(試験)タブ === -->
+      <div id="tabPickingContent" style="display:none;">
+        <div style="padding:16px 0;">
+          <div style="margin-bottom:12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+            <label style="font-weight:bold; font-size:13px;">プランID:</label>
+            <input type="text" id="pickingPlanId" placeholder="wfxxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" style="padding:6px 10px; border:1px solid #d1d5db; border-radius:4px; font-size:13px; width:400px;">
+            <button class="btn btn-primary" onclick="fetchPickingList()" style="padding:6px 16px; font-size:13px;">取得</button>
+            <span id="pickingStatus" style="font-size:12px; color:#666;"></span>
+          </div>
+          <div style="font-size:12px; color:#888; margin-bottom:12px;">※ Seller CentralのURLからプランIDをコピーしてください（wf〜で始まる文字列）</div>
+          <div id="pickingResults"></div>
+        </div>
+      </div><!-- /tabPickingContent -->
 
     </div>
 
@@ -1530,11 +1545,13 @@ Step10: アラート判定</pre>
       document.getElementById('tabNew').classList.toggle('active', tab === 'new');
       document.getElementById('tabOrder').classList.toggle('active', tab === 'order');
       document.getElementById('tabProvisional').classList.toggle('active', tab === 'provisional');
+      document.getElementById('tabPicking').classList.toggle('active', tab === 'picking');
       document.getElementById('tabShipContent').style.display = tab === 'ship' ? '' : 'none';
       document.getElementById('tabStockoutContent').style.display = tab === 'stockout' ? '' : 'none';
       document.getElementById('tabNewContent').style.display = tab === 'new' ? '' : 'none';
       document.getElementById('tabOrderContent').style.display = tab === 'order' ? '' : 'none';
       document.getElementById('tabProvisionalContent').style.display = tab === 'provisional' ? '' : 'none';
+      document.getElementById('tabPickingContent').style.display = tab === 'picking' ? '' : 'none';
     }
 
     // ===== 発注推奨リスト =====
@@ -3231,6 +3248,57 @@ Step10: アラート判定</pre>
         URL.revokeObjectURL(url);
         log(`NE受注CSV出力: ${allItems.length} SKU → NE商品コードに変換済み`);
       } catch(e) { alert('エラー: ' + e.message); }
+    }
+
+    // ===== ピッキングリスト(試験) =====
+    async function fetchPickingList() {
+      const planId = document.getElementById('pickingPlanId').value.trim();
+      if (!planId) { alert('プランIDを入力してください'); return; }
+      const statusEl = document.getElementById('pickingStatus');
+      const resultsEl = document.getElementById('pickingResults');
+      statusEl.textContent = '取得中...';
+      statusEl.style.color = '#2563eb';
+      resultsEl.innerHTML = '';
+
+      try {
+        const res = await fetch(`${BASE}/api/picking-list/${encodeURIComponent(planId)}`);
+        const d = await res.json();
+        if (d.error) { statusEl.textContent = 'エラー: ' + d.error; statusEl.style.color = '#dc2626'; return; }
+
+        statusEl.textContent = `${d.shipments.length}件のshipment取得完了`;
+        statusEl.style.color = '#16a34a';
+
+        let html = '';
+        for (const shipment of d.shipments) {
+          const totalQty = shipment.items.reduce((s, i) => s + (i.quantity || 0), 0);
+          html += `<div style="margin-bottom:16px; border:1px solid #d1d5db; border-radius:8px; overflow:hidden;">`;
+          html += `<div style="background:#f3f4f6; padding:8px 12px; font-weight:bold; font-size:13px;">`;
+          html += `Shipment: ${shipment.shipmentId} — ${shipment.destination || '不明'} — ${shipment.items.length} SKU / ${totalQty} 個 — ${shipment.status}`;
+          html += `</div>`;
+          html += `<div class="table-wrap" style="max-height:400px;"><table class="data-table" style="font-size:12px;"><thead><tr>`;
+          html += `<th>#</th><th>SKU</th><th>FNSKU</th><th>ASIN</th><th>商品名</th><th>NE商品コード</th><th>数量</th><th>有効期限</th><th>ラベル</th><th>Prep</th>`;
+          html += `</tr></thead><tbody>`;
+          shipment.items.forEach((item, i) => {
+            html += `<tr>`;
+            html += `<td>${i+1}</td>`;
+            html += `<td style="font-size:11px;">${item.msku}</td>`;
+            html += `<td style="font-size:11px;">${item.fnsku}</td>`;
+            html += `<td style="font-size:11px;">${item.asin}</td>`;
+            html += `<td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${item.product_name}">${item.product_name}</td>`;
+            html += `<td style="font-size:11px;">${item.ne_code}</td>`;
+            html += `<td style="text-align:right;font-weight:bold;">${item.quantity}</td>`;
+            html += `<td style="font-size:11px;">${item.expiration || ''}</td>`;
+            html += `<td style="font-size:11px;">${item.labelOwner}</td>`;
+            html += `<td style="font-size:11px;">${item.prepOwner}</td>`;
+            html += `</tr>`;
+          });
+          html += `</tbody></table></div></div>`;
+        }
+        resultsEl.innerHTML = html;
+      } catch(e) {
+        statusEl.textContent = 'エラー: ' + e.message;
+        statusEl.style.color = '#dc2626';
+      }
     }
 
     function provCheckAll() {

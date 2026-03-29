@@ -115,6 +115,48 @@ async function listPlanItems(inboundPlanId) {
 }
 
 /**
+ * 納品プランのshipment一覧を取得
+ */
+export async function listShipments(inboundPlanId) {
+  const sp = getClient();
+  const allShipments = [];
+  let nextToken = null;
+
+  do {
+    const params = nextToken ? `?pageToken=${encodeURIComponent(nextToken)}` : '';
+    const result = await sp.callAPI({
+      api_path: `/inbound/fba/2024-03-20/inboundPlans/${inboundPlanId}/shipments${params}`,
+      method: 'GET',
+    });
+    if (result.shipments) allShipments.push(...result.shipments);
+    nextToken = result.pagination?.token || null;
+  } while (nextToken);
+
+  return allShipments;
+}
+
+/**
+ * shipmentのアイテム一覧を取得
+ */
+export async function listShipmentItems(inboundPlanId, shipmentId) {
+  const sp = getClient();
+  const allItems = [];
+  let nextToken = null;
+
+  do {
+    const params = nextToken ? `?pageToken=${encodeURIComponent(nextToken)}` : '';
+    const result = await sp.callAPI({
+      api_path: `/inbound/fba/2024-03-20/inboundPlans/${inboundPlanId}/shipments/${shipmentId}/items${params}`,
+      method: 'GET',
+    });
+    if (result.items) allItems.push(...result.items);
+    nextToken = result.pagination?.token || null;
+  } while (nextToken);
+
+  return allItems;
+}
+
+/**
  * FBA Inbound Eligibility APIでASINの受入可否をチェック
  * @param {Array} asins - [{asin, msku}]
  * @returns {Array} 不適格アイテム [{asin, msku, reasons}]

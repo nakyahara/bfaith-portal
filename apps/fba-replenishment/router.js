@@ -17,7 +17,7 @@ import { initDb, savePlanningData, getLatestSnapshots, getSettings, updateSettin
 import { fetchAllReports, normalizePlanningRow } from './sp-api-reports.js';
 import { syncSkuMappings } from './sheets-sync.js';
 import { generateRecommendations } from './calculation-engine.js';
-import { createInboundPlan, checkInboundEligibility, findErrorSkusByBinarySearch } from './inbound-plans.js';
+import { createInboundPlan, checkInboundEligibility, findErrorSkusByBinarySearch, listShipments, listShipmentItems } from './inbound-plans.js';
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -710,6 +710,50 @@ router.post('/api/export-manifest', express.json(), async (req, res) => {
     res.send(Buffer.from(buffer));
   } catch (e) {
     console.error('[FBA] Excel出力エラー:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===== ピッキングリスト取得（試験） =====
+router.get('/api/picking-list/:planId', async (req, res) => {
+  const { planId } = req.params;
+  try {
+    console.log(`[Picking] プラン ${planId} のshipment一覧取得中...`);
+    const shipments = await listShipments(planId);
+    console.log(`[Picking] ${shipments.length}件のshipment`);
+
+    const result = [];
+    const mappings = getSkuMappings();
+    const mappingMap = {};
+    for (const m of mappings) mappingMap[m.amazon_sku] = m;
+
+    for (const shipment of shipments) {
+      const items = await listShipmentItems(planId, shipment.shipmentId);
+      console.log(`[Picking] shipment ${shipment.shipmentId}: ${items.length}アイテム`);
+      result.push({
+        shipmentId: shipment.shipmentId,
+        destination: shipment.destination || '',
+        status: shipment.status || '',
+        items: items.map(item => {
+          const mapping = mappingMap[item.msku] || {};
+          return {
+            msku: item.msku,
+            fnsku: item.fnsku || '',
+            asin: item.asin || '',
+            quantity: item.quantity || 0,
+            expiration: item.expiration || '',
+            labelOwner: item.labelOwner || '',
+            prepOwner: item.prepOwner || '',
+            product_name: mapping.product_name || '',
+            ne_code: mapping.ne_code || '',
+          };
+        }),
+      });
+    }
+
+    res.json({ planId, shipments: result });
+  } catch (e) {
+    console.error('[Picking] エラー:', e);
     res.status(500).json({ error: e.message });
   }
 });
