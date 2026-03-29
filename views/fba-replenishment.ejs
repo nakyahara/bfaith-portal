@@ -200,7 +200,7 @@
         <button class="tab-btn" id="tabNew" onclick="switchTab('new')">新規商品<span class="tab-count" id="newTabCount" style="display:none;"></span></button>
         <button class="tab-btn" id="tabOrder" onclick="switchTab('order')">発注推奨（在庫0）<span class="tab-count" id="orderTabCount"></span></button>
         <button class="tab-btn" id="tabProvisional" onclick="switchTab('provisional')">Amazon仮確定<span class="tab-count" id="provisionalTabCount" style="display:none;"></span></button>
-        <button class="tab-btn" id="tabPicking" onclick="switchTab('picking')" style="background:#f0fdf4;border-color:#86efac;">ピッキングリスト(試験)</button>
+        <!-- ピッキングリスト(試験)タブは廃止: CSVアップロードで作ったプランはSP-API経由でアクセス不可のため -->
       </div>
 
       <!-- === 納品推奨タブ === -->
@@ -578,19 +578,7 @@
         </div>
       </div><!-- /tabProvisionalContent -->
 
-      <!-- === ピッキングリスト(試験)タブ === -->
-      <div id="tabPickingContent" style="display:none;">
-        <div style="padding:16px 0;">
-          <div style="margin-bottom:12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-            <label style="font-weight:bold; font-size:13px;">プランID:</label>
-            <input type="text" id="pickingPlanId" placeholder="wfxxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" style="padding:6px 10px; border:1px solid #d1d5db; border-radius:4px; font-size:13px; width:400px;">
-            <button class="btn btn-primary" onclick="fetchPickingList()" style="padding:6px 16px; font-size:13px;">取得</button>
-            <span id="pickingStatus" style="font-size:12px; color:#666;"></span>
-          </div>
-          <div style="font-size:12px; color:#888; margin-bottom:12px;">※ Seller CentralのURLからプランIDをコピーしてください（wf〜で始まる文字列）</div>
-          <div id="pickingResults"></div>
-        </div>
-      </div><!-- /tabPickingContent -->
+      <!-- ピッキングリスト(試験)タブは廃止済み -->
 
     </div>
 
@@ -1601,13 +1589,14 @@ Amazon SKU → NE商品コードに変換（set_componentsで展開）
       document.getElementById('tabNew').classList.toggle('active', tab === 'new');
       document.getElementById('tabOrder').classList.toggle('active', tab === 'order');
       document.getElementById('tabProvisional').classList.toggle('active', tab === 'provisional');
-      document.getElementById('tabPicking').classList.toggle('active', tab === 'picking');
+      // tabPicking廃止済み
+      // document.getElementById('tabPicking').classList.toggle('active', tab === 'picking');
       document.getElementById('tabShipContent').style.display = tab === 'ship' ? '' : 'none';
       document.getElementById('tabStockoutContent').style.display = tab === 'stockout' ? '' : 'none';
       document.getElementById('tabNewContent').style.display = tab === 'new' ? '' : 'none';
       document.getElementById('tabOrderContent').style.display = tab === 'order' ? '' : 'none';
       document.getElementById('tabProvisionalContent').style.display = tab === 'provisional' ? '' : 'none';
-      document.getElementById('tabPickingContent').style.display = tab === 'picking' ? '' : 'none';
+      // document.getElementById('tabPickingContent').style.display = tab === 'picking' ? '' : 'none';
     }
 
     // ===== 発注推奨リスト =====
