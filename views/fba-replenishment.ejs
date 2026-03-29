@@ -2886,6 +2886,8 @@ Step10: アラート判定</pre>
           recommended_qty: rec.recommended_qty || 0,
           urgency_score: rec.urgency_score || 0,
           set_components: rec.set_components || '',
+          asin: rec.asin || '',
+          expiry_date: rec.expiry_date || '',
         });
       });
 
@@ -3104,7 +3106,16 @@ Step10: アラート判定</pre>
         const res = await fetch(`${BASE}/api/create-inbound-plan`, {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({items: checkedItems.map(i => ({amazon_sku: i.sku, ship_qty: i.qty}))}),
+          body: JSON.stringify({items: checkedItems.map(i => {
+          const item = provisionalData.find(p => p.amazon_sku === i.sku);
+          return {
+            amazon_sku: i.sku,
+            ship_qty: i.qty,
+            product_name: item?.product_name || i.sku,
+            asin: item?.asin || '',
+            expiry_date: item?.expiry_date || '',
+          };
+        })}),
         });
         const d = await res.json();
         if (d.error) {

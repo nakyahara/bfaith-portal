@@ -366,9 +366,16 @@ export async function initDb() {
       recommended_qty INTEGER DEFAULT 0,
       urgency_score REAL DEFAULT 0,
       set_components TEXT,
+      asin TEXT,
+      expiry_date TEXT,
       created_at TEXT DEFAULT (datetime('now','localtime'))
     )
   `);
+
+  // マイグレーション: provisional_items新カラム
+  const provCols = queryAll('PRAGMA table_info(provisional_items)').map(r => r.name);
+  if (!provCols.includes('asin')) db.run('ALTER TABLE provisional_items ADD COLUMN asin TEXT');
+  if (!provCols.includes('expiry_date')) db.run('ALTER TABLE provisional_items ADD COLUMN expiry_date TEXT');
 
   db.run(`
     CREATE TABLE IF NOT EXISTS provisional_meta (
@@ -882,8 +889,8 @@ export function saveProvisionalItems(items) {
         INSERT INTO provisional_items
           (amazon_sku, product_name, fnsku, ship_qty, fba_available,
            units_sold_7d, units_sold_30d, warehouse_raw,
-           recommended_qty, urgency_score, set_components)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           recommended_qty, urgency_score, set_components, asin, expiry_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
         item.amazon_sku,
         item.product_name || null,
@@ -896,6 +903,8 @@ export function saveProvisionalItems(items) {
         parseInt(item.recommended_qty || 0),
         parseFloat(item.urgency_score || 0),
         item.set_components || null,
+        item.asin || null,
+        item.expiry_date || null,
       ]);
     }
     // メタ情報を保存
