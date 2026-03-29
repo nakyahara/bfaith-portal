@@ -50,10 +50,10 @@ async function fetchReport(reportType, options = {}) {
   const sp = getClient();
   const body = { reportType, marketplaceIds: [MARKETPLACE_ID()], ...options };
 
-  // レポート作成（30秒タイムアウト）
+  // レポート作成（60秒タイムアウト）
   const createResult = await withTimeout(
     sp.callAPI({ operation: 'createReport', endpoint: 'reports', body, options: { version: '2021-06-30' } }),
-    30000, `${reportType} createReport`
+    60000, `${reportType} createReport`
   );
   const reportId = createResult.reportId;
   console.log(`[SP-API] ${reportType} レポートID: ${reportId}`);
