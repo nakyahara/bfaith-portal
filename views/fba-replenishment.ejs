@@ -532,6 +532,26 @@
           <button class="btn btn-secondary" onclick="selectOnlyFnskuProvisional()" style="padding:4px 12px; font-size:12px; background:#7c3aed; color:#fff; border-color:#7c3aed;">このFNSKUだけ選択</button>
         </div>
 
+        <!-- 出力履歴 -->
+        <details style="margin-bottom:8px;" ontoggle="if(this.open) loadExportHistory()">
+          <summary style="cursor:pointer; font-size:13px; color:#2563eb; font-weight:bold;">📋 出力履歴（過去100件）</summary>
+          <div id="exportHistoryContent" style="margin-top:8px; max-height:300px; overflow-y:auto;">
+            <table class="data-table" id="exportHistoryTable" style="font-size:12px;">
+              <thead>
+                <tr>
+                  <th>日時</th>
+                  <th>種類</th>
+                  <th>ファイル名</th>
+                  <th>件数</th>
+                  <th>合計数量</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="exportHistoryBody"></tbody>
+            </table>
+          </div>
+        </details>
+
         <!-- テーブル -->
         <div class="table-wrap" style="max-height:calc(100vh - 280px);">
           <table class="data-table" id="provTable" style="table-layout:auto;">
@@ -2862,6 +2882,37 @@ Step10: アラート判定</pre>
           el.textContent = '';
         }
       } catch(e) { /* ignore */ }
+    }
+
+    // ===== 出力履歴 =====
+    async function loadExportHistory() {
+      try {
+        const res = await fetch(`${BASE}/api/export-history`);
+        const data = await res.json();
+        const tbody = document.getElementById('exportHistoryBody');
+        if (!data || data.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#888;padding:12px;">履歴はありません</td></tr>';
+          return;
+        }
+        tbody.innerHTML = data.map(h => {
+          const typeLabel = h.type === 'manifest_excel' ? '📄 納品Excel' : '📋 NE受注CSV';
+          return `<tr>
+            <td style="white-space:nowrap;">${h.created_at}</td>
+            <td>${typeLabel}</td>
+            <td style="font-size:11px;">${h.filename}</td>
+            <td style="text-align:right;">${h.item_count}</td>
+            <td style="text-align:right;">${(h.total_qty||0).toLocaleString()}</td>
+            <td><button onclick="downloadHistory(${h.id}, '${h.filename}')" style="background:#2563eb;color:#fff;border:none;border-radius:4px;padding:2px 8px;cursor:pointer;font-size:11px;">DL</button></td>
+          </tr>`;
+        }).join('');
+      } catch(e) { console.error('履歴読み込みエラー:', e); }
+    }
+
+    function downloadHistory(id, filename) {
+      const a = document.createElement('a');
+      a.href = `${BASE}/api/export-history/${id}/download`;
+      a.download = filename;
+      a.click();
     }
 
     // ===== 仮確定タブ =====

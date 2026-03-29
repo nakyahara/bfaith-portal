@@ -12,7 +12,8 @@ import { initDb, savePlanningData, getLatestSnapshots, getSettings, updateSettin
          getNewProductHidden, hideNewProductSkuBulk, unhideNewProductSku,
          saveDraft, getDraft, clearDraft, updateFnskuBatch,
          saveProvisionalItems, getProvisionalItems, clearProvisionalItems,
-         updateProvisionalItemQty, removeProvisionalItem } from './db.js';
+         updateProvisionalItemQty, removeProvisionalItem,
+         saveExportHistory, getExportHistoryList, getExportHistoryFile } from './db.js';
 import { fetchAllReports, normalizePlanningRow } from './sp-api-reports.js';
 import { syncSkuMappings } from './sheets-sync.js';
 import { generateRecommendations } from './calculation-engine.js';
@@ -697,10 +698,16 @@ router.post('/api/export-manifest', express.json(), async (req, res) => {
     ws.getColumn(2).width = 10;
     ws.getColumn(5).width = 25;
 
+    const buffer = await wb.xlsx.writeBuffer();
+    const now = new Date();
+    const dateStr = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
+    const filename = `FBA_Manifest_${dateStr}.xlsx`;
+    const totalQty = items.reduce((sum, it) => sum + (parseInt(it.ship_qty) || 0), 0);
+    try { saveExportHistory('manifest_excel', filename, items.length, totalQty, Buffer.from(buffer)); } catch(he) { console.error('[FBA] 履歴保存エラー:', he); }
+
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', 'attachment; filename=FBA_Manifest.xlsx');
-    await wb.xlsx.write(res);
-    res.end();
+    res.setHeader('Content-Disposition', `attachment; filename=${filename}`);
+    res.send(Buffer.from(buffer));
   } catch (e) {
     console.error('[FBA] Excel出力エラー:', e);
     res.status(500).json({ error: e.message });
@@ -841,13 +848,43 @@ router.post('/api/export-ne-csv', express.json(), async (req, res) => {
   try {
     const iconv = (await import('iconv-lite')).default;
     const encoded = iconv.encode(csvContent, 'Shift_JIS');
+    const csvFilename = `hanyo-jyuchu_invoice_${dateStr}.csv`;
+    const totalQty = neItems.reduce((sum, it) => sum + (parseInt(it.qty) || 0), 0);
+    try { saveExportHistory('ne_csv', csvFilename, neItems.length, totalQty, encoded); } catch(he) { console.error('[FBA] 履歴保存エラー:', he); }
     res.setHeader('Content-Type', 'text/csv; charset=Shift_JIS');
-    res.setHeader('Content-Disposition', `attachment; filename=hanyo-jyuchu_invoice_${dateStr}.csv`);
+    res.setHeader('Content-Disposition', `attachment; filename=${csvFilename}`);
     res.send(encoded);
     console.log(`[FBA] NE CSV出力: ${neItems.length}件 (警告: ${warnings.length}件)`);
     if (warnings.length > 0) console.log(`[FBA] NE CSV警告:`, warnings);
   } catch (e) {
     console.error('[FBA] NE CSV出力エラー:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===== 出力履歴 =====
+router.get('/api/export-history', (req, res) => {
+  try {
+    const list = getExportHistoryList();
+    res.json(list);
+  } catch (e) {
+    console.error('[FBA] 出力履歴取得エラー:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.get('/api/export-history/:id/download', (req, res) => {
+  try {
+    const record = getExportHistoryFile(parseInt(req.params.id));
+    if (!record || !record.file_data) return res.status(404).json({ error: '履歴が見つかりません' });
+    const contentType = record.type === 'manifest_excel'
+      ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      : 'text/csv; charset=Shift_JIS';
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Disposition', `attachment; filename=${record.filename}`);
+    res.send(Buffer.from(record.file_data));
+  } catch (e) {
+    console.error('[FBA] 履歴DLエラー:', e);
     res.status(500).json({ error: e.message });
   }
 });

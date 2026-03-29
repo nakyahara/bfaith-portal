@@ -385,8 +385,21 @@ export async function initDb() {
     )
   `);
 
+  // --- 13. export_history: 出力履歴 ---
+  db.run(`
+    CREATE TABLE IF NOT EXISTS export_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      type TEXT NOT NULL,
+      filename TEXT NOT NULL,
+      item_count INTEGER DEFAULT 0,
+      total_qty INTEGER DEFAULT 0,
+      file_data BLOB,
+      created_at TEXT DEFAULT (datetime('now','localtime'))
+    )
+  `);
+
   saveToFile();
-  console.log('[FBA-DB] 初期化完了 — テーブル8個');
+  console.log('[FBA-DB] 初期化完了 — テーブル9個');
 }
 
 // ===== SP-APIレポートデータの一括保存 =====
@@ -951,4 +964,32 @@ export function removeProvisionalItem(amazonSku) {
   db.run(`INSERT OR REPLACE INTO provisional_meta (key, value) VALUES ('item_count', ?)`, [String(count?.cnt || 0)]);
   db.run(`INSERT OR REPLACE INTO provisional_meta (key, value) VALUES ('total_qty', ?)`, [String(total?.total || 0)]);
   saveToFile();
+}
+
+// ===== 出力履歴 =====
+
+export function saveExportHistory(type, filename, itemCount, totalQty, fileData) {
+  db.run(
+    `INSERT INTO export_history (type, filename, item_count, total_qty, file_data) VALUES (?, ?, ?, ?, ?)`,
+    [type, filename, itemCount, totalQty, fileData]
+  );
+  // タイプ別に100件を超えたら古いものを削除
+  const oldest = queryAll(
+    `SELECT id FROM export_history WHERE type = ? ORDER BY created_at DESC LIMIT -1 OFFSET 100`,
+    [type]
+  );
+  for (const row of oldest) {
+    db.run(`DELETE FROM export_history WHERE id = ?`, [row.id]);
+  }
+  saveToFile();
+}
+
+export function getExportHistoryList() {
+  return queryAll(
+    `SELECT id, type, filename, item_count, total_qty, created_at FROM export_history ORDER BY created_at DESC LIMIT 100`
+  );
+}
+
+export function getExportHistoryFile(id) {
+  return queryOne(`SELECT * FROM export_history WHERE id = ?`, [id]);
 }
