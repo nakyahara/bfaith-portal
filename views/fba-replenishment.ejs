@@ -1430,16 +1430,72 @@ Step10: アラート判定</pre>
           </div>
 
           <div class="settings-group">
-            <h4>運用フロー</h4>
-            <ol style="font-size:13px;line-height:1.8;margin:0;padding-left:20px;">
-              <li>SP-APIレポート取得 + ロジザードCSVアップロード</li>
-              <li>「推奨リスト生成」をクリック</li>
-              <li>サマリーで赤/黄のSKU数・数量を確認</li>
-              <li>「🔴 緊急を全選択」で赤を一括チェック</li>
-              <li>黄色を上から見て、必要なものだけ個別チェック</li>
-              <li>選択中のSKU数・数量を確認して納品作業へ</li>
-            </ol>
+            <h4>毎日の作業フロー（全体）</h4>
+            <pre style="font-size:12px;line-height:1.8;background:#f0fdf4;padding:12px;border-radius:6px;overflow-x:auto;">
+【データ準備】Step1〜4を順番に実行
+  Step1: SP-APIレポート全取得（1〜3分）
+  Step2: ロジザードCSVアップロード
+  Step3: SKUマッピング同期
+  Step4: 推奨リスト生成
+    ↓
+【納品推奨タブ】送る商品を選ぶ
+  ① 「緊急を全選択」で赤を一括チェック
+  ② 黄色を必要なものだけ個別チェック
+  ③ 数量調整が必要なら納品数量を変更
+  ④ 「仮確定に移動」ボタン
+    ↓
+【Amazon仮確定タブ】確定・出力・管理
+  ⑤ 全商品のExcelを出力
+  ⑥ セラセンにCSVアップロード → プラン作成
+  ⑦ 梱包グループ確認 → 危険物等で分かれるFNSKUを把握
+  ⑧ ツールに戻り、危険物FNSKUを「選択から除外」
+  ⑨ 通常商品だけのExcelを出力 → セラセン取り込み → 確定
+  ⑩ 数量調整が必要なら：
+     - セラセンのプランを削除
+     - ツールで数量変更
+     - 再度Excel出力 → セラセン取り込み
+  ⑪ 危険物FNSKUを「このFNSKUだけ選択」→ Excel出力 → 別プラン確定
+  ⑫ 全プラン確定後「NE受注CSV出力」→ NextEngineにアップロード</pre>
             <p style="font-size:11px;color:#666;margin-top:8px;">※ 初回は300+SKUが推奨に上がりますが、低回転商品に半年分を送ると2〜3週間で50〜80SKU/日に収束します。</p>
+          </div>
+
+          <div class="settings-group">
+            <h4>Amazon仮確定タブの使い方</h4>
+            <table style="width:100%;font-size:12px;border-collapse:collapse;">
+              <tr style="background:#f3f4f6;"><th style="padding:6px;border:1px solid #e5e7eb;">操作</th><th style="padding:6px;border:1px solid #e5e7eb;">説明</th></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;font-weight:bold;">納品Excel出力</td><td style="padding:6px;border:1px solid #e5e7eb;">チェック済み商品のExcelを出力。セラセンの「ファイルをアップロード」で取り込む。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;font-weight:bold;">NE受注CSV出力</td><td style="padding:6px;border:1px solid #e5e7eb;">仮確定リスト<strong>全件</strong>をNE受注伝票CSVとして出力。SKU→NE商品コード変換+数量按分が自動。プラン分割に関係なく1伝票。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;font-weight:bold;">FNSKU除外</td><td style="padding:6px;border:1px solid #e5e7eb;">入力したFNSKUに該当する商品のチェックを外す。危険物プラン分けに使用。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;font-weight:bold;">このFNSKUだけ選択</td><td style="padding:6px;border:1px solid #e5e7eb;">全チェック解除→入力FNSKUだけチェック。危険物だけでExcel出力したい時に使用。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;font-weight:bold;">数量変更</td><td style="padding:6px;border:1px solid #e5e7eb;">各行の納品数量を直接変更（即保存）。セラセンで梱包グループ確認後の調整に使用。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;font-weight:bold;">✕ 削除</td><td style="padding:6px;border:1px solid #e5e7eb;">商品を仮確定リストから削除（確認ダイアログあり）。送らない商品の除外に使用。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;font-weight:bold;">出力履歴</td><td style="padding:6px;border:1px solid #e5e7eb;">クリックで展開。過去のExcel/CSVを再ダウンロード可能（各100件保存）。</td></tr>
+            </table>
+          </div>
+
+          <div class="settings-group">
+            <h4>NE受注CSVの数量変換ルール</h4>
+            <pre style="font-size:12px;line-height:1.6;background:#f8f9fa;padding:12px;border-radius:6px;">
+Amazon SKU → NE商品コードに変換（set_componentsで展開）
+数量 = ship_qty × 構成数
+同一NE商品コードは合算
+
+例: SKU "setA" (ship_qty=10)
+  構成: [{ne_code:"aa", qty:1}, {ne_code:"bb", qty:2}]
+  → NE商品コード "aa": 10 × 1 = 10個
+  → NE商品コード "bb": 10 × 2 = 20個</pre>
+          </div>
+
+          <div class="settings-group">
+            <h4>よくある問題と対処法</h4>
+            <table style="width:100%;font-size:12px;border-collapse:collapse;">
+              <tr style="background:#f3f4f6;"><th style="padding:6px;border:1px solid #e5e7eb;">問題</th><th style="padding:6px;border:1px solid #e5e7eb;">対処</th></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">FNSKU除外が「一致なし」になる</td><td style="padding:6px;border:1px solid #e5e7eb;">SP-APIレポート全取得を実行してFNSKUをDBに保存 → 推奨リスト再生成。デプロイ後はFNSKUがリセットされるため再取得が必要。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">INVENTORYレポートがFATAL</td><td style="padding:6px;border:1px solid #e5e7eb;">リトライで解消。UNSUPPRESSED→ALL_INVENTORYのフォールバック実装済み。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">「レポート取得中です」エラー</td><td style="padding:6px;border:1px solid #e5e7eb;">前回のフェッチ未完了。1〜2分待ってリトライ。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">昨日送った商品がまた推奨に上がる</td><td style="padding:6px;border:1px solid #e5e7eb;">セラセンでプラン作成済みなら、翌日のSP-APIレポートで「準備中」に反映される。Step1を毎日実行すれば問題なし。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">仮確定データが消えた</td><td style="padding:6px;border:1px solid #e5e7eb;">「仮確定に移動」で上書きされる仕様。NE CSV出力前に誤って移動しないよう注意。</td></tr>
+            </table>
           </div>
 
           <div class="settings-group">
