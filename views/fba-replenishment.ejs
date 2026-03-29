@@ -754,10 +754,8 @@
         updateStockoutList();
         await loadWarehouseSummaryMap();
         await updateNewProductList();
-        document.getElementById('draftBanner').style.display = 'none';
-        document.getElementById('draftLastSaved').textContent = '';
-        const msgEl = document.getElementById('draftSaveMsg');
-        if (msgEl) msgEl.textContent = '';
+        // ドラフトがあれば復元バナーを表示
+        await checkDraftOnLoad();
       } catch (e) { log('エラー: ' + e.message); }
       finally {
         btn.disabled = false;
