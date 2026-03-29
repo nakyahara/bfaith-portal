@@ -519,6 +519,7 @@
           <span style="flex:1;"></span>
           <button class="btn btn-primary" onclick="createPlanFromProvisional()" style="background:#7c3aed; padding:6px 16px; font-size:13px;">📦 納品プラン作成</button>
           <button class="btn btn-primary" onclick="exportProvisionalExcel()" style="background:#e67e22; padding:6px 16px; font-size:13px;">📄 納品Excel出力</button>
+          <button class="btn btn-primary" onclick="exportNeCsv()" style="background:#16a34a; padding:6px 16px; font-size:13px;">📋 NE受注CSV出力</button>
           <a href="https://sellercentral-japan.amazon.com/fba/sendtoamazon" target="_blank" rel="noopener" style="font-size:12px; color:#2563eb; text-decoration:none; margin-left:4px;">Seller Central納品画面 ↗</a>
           <button class="btn btn-secondary" onclick="clearProvisionalConfirm()" style="padding:4px 12px; font-size:12px; color:#dc2626; border-color:#dc2626;">クリア</button>
         </div>
@@ -3141,6 +3142,48 @@ Step10: アラート判定</pre>
         btn.disabled = false;
         btn.textContent = '📦 納品プラン作成';
       }
+    }
+
+    // ===== NE受注CSV出力 =====
+    async function exportNeCsv() {
+      const checkedItems = [];
+      document.querySelectorAll('.prov-check:checked').forEach(cb => {
+        const sku = cb.dataset.sku;
+        const qtyInput = document.querySelector(`.prov-qty-input[data-sku="${sku}"]`);
+        const item = provisionalData.find(i => i.amazon_sku === sku);
+        if (item) {
+          checkedItems.push({
+            amazon_sku: sku,
+            ship_qty: parseInt(qtyInput?.value) || item.ship_qty || 0,
+          });
+        }
+      });
+      if (checkedItems.length === 0) { alert('商品を選択してください'); return; }
+      if (!confirm(`${checkedItems.length}件のSKUからNE受注CSVを出力します。\nSKU→NE商品コード変換・数量按分が行われます。`)) return;
+
+      try {
+        const res = await fetch(`${BASE}/api/export-ne-csv`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({items: checkedItems}),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          if (err.warnings && err.warnings.length > 0) {
+            err.warnings.forEach(w => log(`NE CSV警告: ${w}`));
+          }
+          alert('エラー: ' + (err.error || 'CSV出力に失敗'));
+          return;
+        }
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `hanyo-jyuchu_invoice_${new Date().toISOString().slice(0,10)}.csv`;
+        a.click();
+        URL.revokeObjectURL(url);
+        log(`NE受注CSV出力: ${checkedItems.length} SKU → NE商品コードに変換済み`);
+      } catch(e) { alert('エラー: ' + e.message); }
     }
 
     function provCheckAll() {

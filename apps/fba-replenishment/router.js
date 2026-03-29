@@ -707,4 +707,149 @@ router.post('/api/export-manifest', express.json(), async (req, res) => {
   }
 });
 
+// ===== NE受注CSV出力 =====
+router.post('/api/export-ne-csv', express.json(), (req, res) => {
+  const { items } = req.body;
+  if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items[] が必要です' });
+
+  const mappings = getSkuMappings();
+  const mappingMap = {};
+  for (const m of mappings) mappingMap[m.amazon_sku] = m;
+
+  // SKU → NE商品コードに展開し、同一NE商品コードは合算
+  const neAggregated = {};
+  const warnings = [];
+
+  for (const item of items) {
+    const mapping = mappingMap[item.amazon_sku];
+    if (!mapping) {
+      warnings.push(`${item.amazon_sku}: SKUマッピングなし（スキップ）`);
+      continue;
+    }
+
+    let components = [];
+    if (mapping.set_components) {
+      try {
+        components = typeof mapping.set_components === 'string'
+          ? JSON.parse(mapping.set_components)
+          : mapping.set_components;
+      } catch (e) {
+        components = [];
+      }
+    }
+
+    // componentsがない場合はne_codeをqty=1として使用
+    if (!components || components.length === 0) {
+      if (mapping.ne_code) {
+        components = [{ ne_code: mapping.ne_code, qty: 1 }];
+      } else {
+        warnings.push(`${item.amazon_sku} (${mapping.product_name || ''}): NE商品コードなし（スキップ）`);
+        continue;
+      }
+    }
+
+    const shipQty = parseInt(item.ship_qty) || 0;
+    for (const comp of components) {
+      const neCode = comp.ne_code;
+      if (!neCode) continue;
+      const neQty = shipQty * (parseInt(comp.qty) || 1);
+      if (neAggregated[neCode]) {
+        neAggregated[neCode].qty += neQty;
+      } else {
+        // 商品名はNE商品コードに対応するmappingから取得
+        const neMapping = Object.values(mappingMap).find(m => m.ne_code === neCode);
+        neAggregated[neCode] = {
+          ne_code: neCode,
+          product_name: neMapping?.product_name || mapping.product_name || '',
+          qty: neQty,
+        };
+      }
+    }
+  }
+
+  const neItems = Object.values(neAggregated).sort((a, b) => a.ne_code.localeCompare(b.ne_code));
+
+  if (neItems.length === 0) {
+    return res.status(400).json({ error: 'NE商品コードに変換できる商品がありません', warnings });
+  }
+
+  // CSV生成（SHIFT-JIS、61列のインボイス形式）
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const dateStr = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`;
+  const timeStr = `${pad(now.getHours())}${pad(now.getMinutes())}`;
+  const orderNo = `FBA${dateStr}${timeStr}`;
+  const orderName = `${dateStr}FBA納品`;
+
+  // ヘッダー（61列）
+  const headers = [
+    '店舗伝票番号','受注日','受注郵便番号','受注住所１','受注住所２','受注名','受注名カナ',
+    '受注電話番号','受注メールアドレス','発送郵便番号','発送先住所１','発送先住所２','発送先名',
+    '発送先カナ','発送電話番号','支払方法','発送方法','商品計','税金','発送料','手数料',
+    '手数料(0%対象)','手数料(8%対象)','手数料(10%対象)','ポイント','ポイント(0%対象)',
+    'ポイント(8%対象)','ポイント(10%対象)','ポイント(按分)','ポイント(支払い)','その他費用',
+    'その他費用(0%対象)','その他費用(8%対象)','その他費用(10%対象)','クーポン割引額',
+    'クーポン割引額(0%対象)','クーポン割引額(8%対象)','クーポン割引額(10%対象)',
+    'クーポン割引額(按分)','請求金額(0%対象)','請求金額(8%対象)','請求額に対する税額(8%対象)',
+    '請求金額(10%対象)','請求額に対する税額(10%対象)','合計金額','ギフトフラグ','時間帯指定',
+    '日付指定','作業者欄','備考','商品名','商品コード','商品価格','受注数量','商品オプション',
+    '出荷済フラグ','顧客区分','顧客コード','消費税率（%）','のし','ラッピング'
+  ];
+
+  function csvEscape(val) {
+    const s = String(val ?? '');
+    if (s.includes(',') || s.includes('"') || s.includes('\n')) {
+      return '"' + s.replace(/"/g, '""') + '"';
+    }
+    return s;
+  }
+
+  const rows = [headers.map(csvEscape).join(',')];
+
+  for (const item of neItems) {
+    const row = new Array(61).fill('');
+    row[0] = orderNo;           // A: 店舗伝票番号
+    row[1] = dateStr;           // B: 受注日
+    row[2] = '5640038';         // C: 受注郵便番号
+    row[3] = '大阪府吹田市南清和園町41‐36'; // D: 受注住所１
+    row[4] = 'Amazon倉庫';     // E: 受注住所２
+    row[5] = orderName;        // F: 受注名
+    row[7] = '09085325647';    // H: 受注電話番号
+    row[9] = '5640038';        // J: 発送郵便番号
+    row[10] = '大阪府吹田市南清和園町41‐36'; // K: 発送先住所１
+    row[11] = 'Amazon倉庫';   // L: 発送先住所２
+    row[12] = orderName;       // M: 発送先名
+    row[14] = '09085325647';   // O: 発送電話番号
+    row[15] = '支払済';        // P: 支払方法
+    row[16] = '西濃運輸カンガルm2'; // Q: 発送方法
+    row[17] = '0';             // R: 商品計
+    row[44] = '0';             // AS: 合計金額
+    row[45] = '0';             // AT: ギフトフラグ
+    row[49] = 'FBA納品用の伝票です。納品した日に伝票を出荷確定してください。'; // AX: 備考
+    row[50] = item.product_name; // AY: 商品名
+    row[51] = item.ne_code;    // AZ: 商品コード
+    row[52] = '0';             // BA: 商品価格
+    row[53] = String(item.qty); // BB: 受注数量
+    row[55] = '0';             // BD: 出荷済フラグ
+    row[56] = '0';             // BE: 顧客区分
+    rows.push(row.map(csvEscape).join(','));
+  }
+
+  const csvContent = rows.join('\r\n');
+
+  // SHIFT-JISにエンコード
+  try {
+    const iconv = (await import('iconv-lite')).default;
+    const encoded = iconv.encode(csvContent, 'Shift_JIS');
+    res.setHeader('Content-Type', 'text/csv; charset=Shift_JIS');
+    res.setHeader('Content-Disposition', `attachment; filename=hanyo-jyuchu_invoice_${dateStr}.csv`);
+    res.send(encoded);
+    console.log(`[FBA] NE CSV出力: ${neItems.length}件 (警告: ${warnings.length}件)`);
+    if (warnings.length > 0) console.log(`[FBA] NE CSV警告:`, warnings);
+  } catch (e) {
+    console.error('[FBA] NE CSV出力エラー:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 export default router;
