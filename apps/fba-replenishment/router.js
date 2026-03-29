@@ -10,7 +10,9 @@ import { initDb, savePlanningData, getLatestSnapshots, getSettings, updateSettin
          getShipmentPlans, getShipmentPlanItems, getDailySnapshots,
          getStockoutHidden, hideStockoutSku, unhideStockoutSku, hideStockoutSkuBulk,
          getNewProductHidden, hideNewProductSkuBulk, unhideNewProductSku,
-         saveDraft, getDraft, clearDraft, updateFnskuBatch } from './db.js';
+         saveDraft, getDraft, clearDraft, updateFnskuBatch,
+         saveProvisionalItems, getProvisionalItems, clearProvisionalItems,
+         updateProvisionalItemQty, removeProvisionalItem } from './db.js';
 import { fetchAllReports, normalizePlanningRow } from './sp-api-reports.js';
 import { syncSkuMappings } from './sheets-sync.js';
 import { generateRecommendations } from './calculation-engine.js';
@@ -596,6 +598,40 @@ router.get('/api/eligibility/check-one', async (req, res) => {
   } catch (e) {
     res.json({ asin, msku, is_eligible: true, reasons: [], error: (e.message || '').slice(0, 200) });
   }
+});
+
+// ===== Amazon仮確定 =====
+router.get('/api/provisional', (req, res) => {
+  res.json(getProvisionalItems());
+});
+
+router.post('/api/provisional', express.json(), (req, res) => {
+  const { items } = req.body;
+  if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items[] が必要です' });
+  try {
+    const count = saveProvisionalItems(items);
+    res.json({ success: true, count });
+  } catch (e) {
+    console.error('[FBA] 仮確定保存エラー:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.delete('/api/provisional', (req, res) => {
+  clearProvisionalItems();
+  res.json({ success: true });
+});
+
+router.patch('/api/provisional/:sku/qty', express.json(), (req, res) => {
+  const { qty } = req.body;
+  if (qty === undefined) return res.status(400).json({ error: 'qty が必要です' });
+  updateProvisionalItemQty(req.params.sku, qty);
+  res.json({ success: true });
+});
+
+router.delete('/api/provisional/:sku', (req, res) => {
+  removeProvisionalItem(req.params.sku);
+  res.json({ success: true });
 });
 
 // ===== 納品Excel出力 =====

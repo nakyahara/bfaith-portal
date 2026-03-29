@@ -351,6 +351,33 @@ export async function initDb() {
     db.run(`UPDATE settings SET value = ?, updated_at = datetime('now','localtime') WHERE key = ? AND value = ?`, [newVal, key, oldVal]);
   }
 
+  // --- 12. provisional_items: Amazon仮確定 ---
+  db.run(`
+    CREATE TABLE IF NOT EXISTS provisional_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      amazon_sku TEXT NOT NULL UNIQUE,
+      product_name TEXT,
+      fnsku TEXT,
+      ship_qty INTEGER DEFAULT 0,
+      fba_available INTEGER DEFAULT 0,
+      units_sold_7d INTEGER DEFAULT 0,
+      units_sold_30d INTEGER DEFAULT 0,
+      warehouse_raw INTEGER DEFAULT 0,
+      recommended_qty INTEGER DEFAULT 0,
+      urgency_score REAL DEFAULT 0,
+      set_components TEXT,
+      created_at TEXT DEFAULT (datetime('now','localtime'))
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS provisional_meta (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      key TEXT UNIQUE NOT NULL,
+      value TEXT
+    )
+  `);
+
   saveToFile();
   console.log('[FBA-DB] 初期化完了 — テーブル8個');
 }
@@ -842,4 +869,77 @@ export function updateFnskuBatch(items) {
     db.run('ROLLBACK');
     throw e;
   }
+}
+
+// ===== Amazon仮確定 =====
+
+export function saveProvisionalItems(items) {
+  db.run('BEGIN TRANSACTION');
+  try {
+    db.run('DELETE FROM provisional_items');
+    for (const item of items) {
+      db.run(`
+        INSERT INTO provisional_items
+          (amazon_sku, product_name, fnsku, ship_qty, fba_available,
+           units_sold_7d, units_sold_30d, warehouse_raw,
+           recommended_qty, urgency_score, set_components)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        item.amazon_sku,
+        item.product_name || null,
+        item.fnsku || null,
+        parseInt(item.ship_qty || 0),
+        parseInt(item.fba_available || 0),
+        parseInt(item.units_sold_7d || 0),
+        parseInt(item.units_sold_30d || 0),
+        parseInt(item.warehouse_raw || 0),
+        parseInt(item.recommended_qty || 0),
+        parseFloat(item.urgency_score || 0),
+        item.set_components || null,
+      ]);
+    }
+    // メタ情報を保存
+    db.run(`INSERT OR REPLACE INTO provisional_meta (key, value) VALUES ('saved_at', datetime('now','localtime'))`);
+    db.run(`INSERT OR REPLACE INTO provisional_meta (key, value) VALUES ('item_count', ?)`, [String(items.length)]);
+    db.run(`INSERT OR REPLACE INTO provisional_meta (key, value) VALUES ('total_qty', ?)`,
+      [String(items.reduce((s, i) => s + (parseInt(i.ship_qty) || 0), 0))]);
+    db.run('COMMIT');
+    saveToFile();
+    return items.length;
+  } catch (e) {
+    db.run('ROLLBACK');
+    throw e;
+  }
+}
+
+export function getProvisionalItems() {
+  const items = queryAll('SELECT * FROM provisional_items ORDER BY urgency_score DESC');
+  const metaRows = queryAll('SELECT * FROM provisional_meta');
+  const meta = {};
+  for (const r of metaRows) meta[r.key] = r.value;
+  return { items, meta };
+}
+
+export function clearProvisionalItems() {
+  db.run('DELETE FROM provisional_items');
+  db.run('DELETE FROM provisional_meta');
+  saveToFile();
+}
+
+export function updateProvisionalItemQty(amazonSku, qty) {
+  db.run('UPDATE provisional_items SET ship_qty = ? WHERE amazon_sku = ?', [parseInt(qty) || 0, amazonSku]);
+  // メタの合計数量も更新
+  const total = queryOne('SELECT SUM(ship_qty) as total FROM provisional_items');
+  db.run(`INSERT OR REPLACE INTO provisional_meta (key, value) VALUES ('total_qty', ?)`, [String(total?.total || 0)]);
+  saveToFile();
+}
+
+export function removeProvisionalItem(amazonSku) {
+  db.run('DELETE FROM provisional_items WHERE amazon_sku = ?', [amazonSku]);
+  // メタ更新
+  const count = queryOne('SELECT COUNT(*) as cnt FROM provisional_items');
+  const total = queryOne('SELECT SUM(ship_qty) as total FROM provisional_items');
+  db.run(`INSERT OR REPLACE INTO provisional_meta (key, value) VALUES ('item_count', ?)`, [String(count?.cnt || 0)]);
+  db.run(`INSERT OR REPLACE INTO provisional_meta (key, value) VALUES ('total_qty', ?)`, [String(total?.total || 0)]);
+  saveToFile();
 }

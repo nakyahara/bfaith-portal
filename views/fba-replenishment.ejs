@@ -199,6 +199,7 @@
         <button class="tab-btn" id="tabStockout" onclick="switchTab('stockout')">FBA欠品<span class="tab-count" id="stockoutTabCount" style="display:none;"></span></button>
         <button class="tab-btn" id="tabNew" onclick="switchTab('new')">新規商品<span class="tab-count" id="newTabCount" style="display:none;"></span></button>
         <button class="tab-btn" id="tabOrder" onclick="switchTab('order')">発注推奨（在庫0）<span class="tab-count" id="orderTabCount"></span></button>
+        <button class="tab-btn" id="tabProvisional" onclick="switchTab('provisional')">Amazon仮確定<span class="tab-count" id="provisionalTabCount" style="display:none;"></span></button>
       </div>
 
       <!-- === 納品推奨タブ === -->
@@ -243,9 +244,7 @@
         <span style="flex:1;"></span>
         <button class="btn btn-primary" onclick="saveDraftAction()" style="background:#16a34a; padding:6px 16px; font-size:13px;">💾 作業状態を保存</button>
         <button class="btn btn-secondary" onclick="clearDraftConfirm()" style="padding:6px 12px; font-size:12px;">保存クリア</button>
-        <button class="btn btn-primary" onclick="createInboundPlanAction()" style="background:#7c3aed; padding:6px 16px; font-size:13px;">📦 納品プラン作成</button>
-        <button class="btn btn-primary" onclick="exportManifestExcel()" style="background:#e67e22; padding:6px 16px; font-size:13px;">📄 納品Excel出力</button>
-        <a href="https://sellercentral-japan.amazon.com/fba/sendtoamazon" target="_blank" rel="noopener" style="font-size:12px; color:#2563eb; text-decoration:none; margin-left:4px;">Seller Central納品画面 ↗</a>
+        <button class="btn btn-primary" onclick="moveToProvisional()" style="background:#7c3aed; padding:6px 16px; font-size:13px;">📦 仮確定に移動</button>
         <span style="font-size:11px; color:#666;" id="draftSaveMsg"></span>
       </div>
       <div style="font-size:12px; color:#888; margin-bottom:4px;">※ 黄色は翌日回しOK。必要なものだけ個別にチェック。<span id="draftLastSaved" style="margin-left:12px; color:#2563eb;"></span></div>
@@ -494,6 +493,68 @@
           </table>
         </div>
       </div><!-- /tabOrderContent -->
+
+      <!-- === Amazon仮確定タブ === -->
+      <div id="tabProvisionalContent" style="display:none;">
+        <!-- サマリー -->
+        <div class="status-row" style="margin-bottom:8px;">
+          <div class="stat" style="border-left:4px solid #7c3aed; background:#f5f3ff;">
+            <div class="label">仮確定SKU</div>
+            <div class="value" id="provSkuCount" style="color:#7c3aed;font-size:20px;">0 SKU</div>
+          </div>
+          <div class="stat" style="border-left:4px solid #7c3aed; background:#f5f3ff;">
+            <div class="label">合計数量</div>
+            <div class="value" id="provTotalQty" style="color:#7c3aed;font-size:20px;">0 個</div>
+          </div>
+          <div class="stat">
+            <div class="label">保存日時</div>
+            <div class="value" id="provSavedAt" style="font-size:14px;">-</div>
+          </div>
+        </div>
+
+        <!-- アクションボタン -->
+        <div style="margin-bottom:8px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+          <button class="btn btn-secondary" onclick="provCheckAll()" style="padding:4px 12px; font-size:12px;">全選択</button>
+          <button class="btn btn-secondary" onclick="provUncheckAll()" style="padding:4px 12px; font-size:12px;">選択解除</button>
+          <span style="flex:1;"></span>
+          <button class="btn btn-primary" onclick="createPlanFromProvisional()" style="background:#7c3aed; padding:6px 16px; font-size:13px;">📦 納品プラン作成</button>
+          <button class="btn btn-primary" onclick="exportProvisionalExcel()" style="background:#e67e22; padding:6px 16px; font-size:13px;">📄 納品Excel出力</button>
+          <a href="https://sellercentral-japan.amazon.com/fba/sendtoamazon" target="_blank" rel="noopener" style="font-size:12px; color:#2563eb; text-decoration:none; margin-left:4px;">Seller Central納品画面 ↗</a>
+          <button class="btn btn-secondary" onclick="clearProvisionalConfirm()" style="padding:4px 12px; font-size:12px; color:#dc2626; border-color:#dc2626;">クリア</button>
+        </div>
+
+        <!-- FNSKU操作 -->
+        <div style="margin-bottom:8px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+          <label style="font-size:12px; color:#666; white-space:nowrap;">FNSKU:</label>
+          <textarea id="provExcludeFnsku" placeholder="FNSKUを貼り付け（Excelの列コピーOK）" rows="2" style="flex:1; min-width:300px; padding:5px 10px; border:1px solid #d1d5db; border-radius:4px; font-size:12px; resize:vertical;"></textarea>
+          <button class="btn btn-secondary" onclick="excludeFnskuFromProvisional()" style="padding:4px 12px; font-size:12px;">選択から除外</button>
+          <button class="btn btn-secondary" onclick="selectOnlyFnskuProvisional()" style="padding:4px 12px; font-size:12px; background:#7c3aed; color:#fff; border-color:#7c3aed;">このFNSKUだけ選択</button>
+        </div>
+
+        <!-- テーブル -->
+        <div class="table-wrap" style="max-height:calc(100vh - 280px);">
+          <table class="data-table" id="provTable" style="table-layout:auto;">
+            <thead>
+              <tr>
+                <th style="width:30px;text-align:center;">✓</th>
+                <th style="width:30px;text-align:center;">#</th>
+                <th>緊急度</th>
+                <th>SKU</th>
+                <th>商品名</th>
+                <th>構成</th>
+                <th>FBA在庫</th>
+                <th>FBA7日</th>
+                <th>FBA30日</th>
+                <th>倉庫在庫</th>
+                <th>推奨数</th>
+                <th style="background:#e0f2fe;color:#1e40af;min-width:70px;">納品数量</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="provBody"></tbody>
+          </table>
+        </div>
+      </div><!-- /tabProvisionalContent -->
 
     </div>
 
@@ -1445,10 +1506,12 @@ Step10: アラート判定</pre>
       document.getElementById('tabStockout').classList.toggle('active', tab === 'stockout');
       document.getElementById('tabNew').classList.toggle('active', tab === 'new');
       document.getElementById('tabOrder').classList.toggle('active', tab === 'order');
+      document.getElementById('tabProvisional').classList.toggle('active', tab === 'provisional');
       document.getElementById('tabShipContent').style.display = tab === 'ship' ? '' : 'none';
       document.getElementById('tabStockoutContent').style.display = tab === 'stockout' ? '' : 'none';
       document.getElementById('tabNewContent').style.display = tab === 'new' ? '' : 'none';
       document.getElementById('tabOrderContent').style.display = tab === 'order' ? '' : 'none';
+      document.getElementById('tabProvisionalContent').style.display = tab === 'provisional' ? '' : 'none';
     }
 
     // ===== 発注推奨リスト =====
@@ -2797,12 +2860,297 @@ Step10: アラート判定</pre>
       } catch(e) { /* ignore */ }
     }
 
+    // ===== 仮確定タブ =====
+    let provisionalData = [];
+
+    async function moveToProvisional() {
+      const checkedItems = [];
+      document.querySelectorAll('.rec-check:checked').forEach(cb => {
+        const sku = cb.dataset.sku;
+        const rec = recData.find(r => r.amazon_sku === sku) || manualItems.find(m => m.amazon_sku === sku);
+        if (!rec) return;
+        const qtyInput = document.querySelector(`.ship-qty-input[data-sku="${sku}"]`);
+        const qty = parseInt(qtyInput?.value) || rec.recommended_qty || 0;
+        checkedItems.push({
+          amazon_sku: rec.amazon_sku,
+          product_name: rec.product_name || '',
+          fnsku: rec.fnsku || '',
+          ship_qty: qty,
+          fba_available: rec.fba_available || 0,
+          units_sold_7d: rec.units_sold_7d || 0,
+          units_sold_30d: rec.units_sold_30d || 0,
+          warehouse_raw: rec.warehouse_raw || 0,
+          recommended_qty: rec.recommended_qty || 0,
+          urgency_score: rec.urgency_score || 0,
+          set_components: rec.set_components || '',
+        });
+      });
+
+      if (checkedItems.length === 0) {
+        alert('商品を選択してください');
+        return;
+      }
+
+      if (!confirm(`${checkedItems.length}件を仮確定に移動します。納品推奨のチェックはリセットされます。よろしいですか？`)) return;
+
+      try {
+        const res = await fetch(`${BASE}/api/provisional`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({items: checkedItems}),
+        });
+        const d = await res.json();
+        if (d.error) { alert('エラー: ' + d.error); return; }
+
+        document.querySelectorAll('.rec-check:checked').forEach(cb => cb.checked = false);
+        selectedSkus.clear();
+        Object.keys(shipQtyMap).forEach(k => delete shipQtyMap[k]);
+        updateSelectedCount();
+
+        await loadProvisionalData();
+        switchTab('provisional');
+        log(`仮確定に${checkedItems.length}件移動しました`);
+      } catch(e) {
+        alert('エラー: ' + e.message);
+      }
+    }
+
+    async function loadProvisionalData() {
+      try {
+        const res = await fetch(`${BASE}/api/provisional`);
+        const d = await res.json();
+        provisionalData = d.items || [];
+        renderProvisionalTable();
+        updateProvisionalSummary(d.meta);
+        const countEl = document.getElementById('provisionalTabCount');
+        if (provisionalData.length > 0) {
+          countEl.textContent = provisionalData.length;
+          countEl.style.display = '';
+        } else {
+          countEl.style.display = 'none';
+        }
+      } catch(e) { console.error('仮確定読み込みエラー:', e); }
+    }
+
+    function updateProvisionalSummary(meta) {
+      document.getElementById('provSkuCount').textContent = provisionalData.length + ' SKU';
+      const totalQty = provisionalData.reduce((s, i) => s + (i.ship_qty || 0), 0);
+      document.getElementById('provTotalQty').textContent = totalQty.toLocaleString() + ' 個';
+      document.getElementById('provSavedAt').textContent = meta?.saved_at || '-';
+    }
+
+    function renderProvisionalTable() {
+      const tbody = document.getElementById('provBody');
+      if (!tbody) return;
+      if (provisionalData.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="13" style="text-align:center;padding:24px;color:#888;">仮確定商品はありません。納品推奨タブで商品を選択して「仮確定に移動」してください。</td></tr>';
+        return;
+      }
+      tbody.innerHTML = provisionalData.map((item, i) => {
+        const urgColor = (item.urgency_score || 0) >= 80 ? '#dc2626' : (item.urgency_score || 0) >= 40 ? '#d97706' : '#666';
+        return `<tr>
+          <td style="text-align:center;"><input type="checkbox" class="prov-check" data-sku="${item.amazon_sku}" checked></td>
+          <td style="text-align:center;">${i+1}</td>
+          <td style="color:${urgColor};font-weight:bold;text-align:center;">${(item.urgency_score||0).toFixed(1)}</td>
+          <td style="font-size:11px;">${item.amazon_sku}</td>
+          <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${(item.product_name||'').replace(/"/g,'&quot;')}">${item.product_name||''}</td>
+          <td style="font-size:11px;">${item.set_components||''}</td>
+          <td style="text-align:right;">${item.fba_available||0}</td>
+          <td style="text-align:right;">${item.units_sold_7d||0}</td>
+          <td style="text-align:right;">${item.units_sold_30d||0}</td>
+          <td style="text-align:right;">${item.warehouse_raw||0}</td>
+          <td style="text-align:right;">${item.recommended_qty||0}</td>
+          <td style="text-align:center;background:#e0f2fe;">
+            <input type="number" class="prov-qty-input" data-sku="${item.amazon_sku}" value="${item.ship_qty||0}" min="0" style="width:60px;text-align:center;border:1px solid #93c5fd;border-radius:4px;padding:2px 4px;font-size:13px;font-weight:bold;color:#1e40af;" onchange="updateProvQty('${item.amazon_sku}', this.value)">
+          </td>
+          <td style="text-align:center;">
+            <button onclick="removeProvItem('${item.amazon_sku}')" style="background:none;border:none;color:#dc2626;cursor:pointer;font-size:16px;" title="削除">✕</button>
+          </td>
+        </tr>`;
+      }).join('');
+    }
+
+    async function updateProvQty(sku, qty) {
+      try {
+        await fetch(`${BASE}/api/provisional/${encodeURIComponent(sku)}/qty`, {
+          method: 'PATCH',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({qty: parseInt(qty) || 0}),
+        });
+        const item = provisionalData.find(i => i.amazon_sku === sku);
+        if (item) item.ship_qty = parseInt(qty) || 0;
+        updateProvisionalSummary({});
+      } catch(e) { console.error(e); }
+    }
+
+    async function removeProvItem(sku) {
+      try {
+        await fetch(`${BASE}/api/provisional/${encodeURIComponent(sku)}`, {method: 'DELETE'});
+        provisionalData = provisionalData.filter(i => i.amazon_sku !== sku);
+        renderProvisionalTable();
+        updateProvisionalSummary({});
+        const countEl = document.getElementById('provisionalTabCount');
+        if (provisionalData.length > 0) {
+          countEl.textContent = provisionalData.length;
+        } else {
+          countEl.style.display = 'none';
+        }
+      } catch(e) { console.error(e); }
+    }
+
+    function excludeFnskuFromProvisional() {
+      const input = document.getElementById('provExcludeFnsku').value.trim();
+      if (!input) { alert('FNSKUを入力してください'); return; }
+      const fnskuList = input.split(/[,\s\n]+/).map(s => s.trim()).filter(Boolean);
+      const fnskuSet = new Set(fnskuList);
+      let removed = 0;
+      document.querySelectorAll('.prov-check:checked').forEach(cb => {
+        const sku = cb.dataset.sku;
+        const item = provisionalData.find(i => i.amazon_sku === sku);
+        if (item && item.fnsku && fnskuSet.has(item.fnsku)) {
+          cb.checked = false;
+          removed++;
+        }
+      });
+      if (removed > 0) {
+        log(`仮確定FNSKU除外: ${removed}件のチェックを外しました`);
+      } else {
+        alert('入力されたFNSKUに一致するチェック済み商品はありませんでした');
+      }
+    }
+
+    function selectOnlyFnskuProvisional() {
+      const input = document.getElementById('provExcludeFnsku').value.trim();
+      if (!input) { alert('FNSKUを入力してください'); return; }
+      const fnskuList = input.split(/[,\s\n]+/).map(s => s.trim()).filter(Boolean);
+      const fnskuSet = new Set(fnskuList);
+      document.querySelectorAll('.prov-check').forEach(cb => cb.checked = false);
+      let selected = 0;
+      document.querySelectorAll('.prov-check').forEach(cb => {
+        const sku = cb.dataset.sku;
+        const item = provisionalData.find(i => i.amazon_sku === sku);
+        if (item && item.fnsku && fnskuSet.has(item.fnsku)) {
+          cb.checked = true;
+          selected++;
+        }
+      });
+      if (selected > 0) {
+        log(`仮確定FNSKU選択: ${selected}件をチェックしました`);
+      } else {
+        alert('入力されたFNSKUに一致する商品がありませんでした');
+      }
+    }
+
+    async function exportProvisionalExcel() {
+      const checkedItems = [];
+      document.querySelectorAll('.prov-check:checked').forEach(cb => {
+        const sku = cb.dataset.sku;
+        const qtyInput = document.querySelector(`.prov-qty-input[data-sku="${sku}"]`);
+        const item = provisionalData.find(i => i.amazon_sku === sku);
+        if (item) {
+          checkedItems.push({
+            amazon_sku: sku,
+            product_name: item.product_name || '',
+            ship_qty: parseInt(qtyInput?.value) || item.ship_qty || 0,
+            fnsku: item.fnsku || '',
+          });
+        }
+      });
+      if (checkedItems.length === 0) { alert('商品を選択してください'); return; }
+
+      try {
+        const res = await fetch(`${BASE}/api/export-manifest`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({items: checkedItems}),
+        });
+        if (!res.ok) throw new Error('Excel出力に失敗しました');
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `FBA納品_仮確定_${new Date().toISOString().slice(0,10)}.xlsx`;
+        a.click();
+        URL.revokeObjectURL(url);
+        log(`仮確定Excel出力: ${checkedItems.length}件`);
+      } catch(e) { alert('エラー: ' + e.message); }
+    }
+
+    async function createPlanFromProvisional() {
+      const checkedItems = [];
+      document.querySelectorAll('.prov-check:checked').forEach(cb => {
+        const sku = cb.dataset.sku;
+        const qtyInput = document.querySelector(`.prov-qty-input[data-sku="${sku}"]`);
+        const item = provisionalData.find(i => i.amazon_sku === sku);
+        if (item) {
+          checkedItems.push({
+            sku: sku,
+            qty: parseInt(qtyInput?.value) || item.ship_qty || 0,
+          });
+        }
+      });
+      if (checkedItems.length === 0) { alert('商品を選択してください'); return; }
+      if (!confirm(`${checkedItems.length}件で納品プランを作成します。よろしいですか？`)) return;
+
+      const btn = event.target;
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span>作成中...';
+      log(`仮確定から納品プラン作成: ${checkedItems.length} SKU`);
+
+      try {
+        const res = await fetch(`${BASE}/api/create-inbound-plan`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({items: checkedItems.map(i => ({amazon_sku: i.sku, ship_qty: i.qty}))}),
+        });
+        const d = await res.json();
+        if (d.error) {
+          log('エラー: ' + d.error);
+          if (d.details) log('詳細: ' + JSON.stringify(d.details));
+          if (d.errorSkus && d.errorSkus.length > 0) {
+            log('エラーSKU: ' + d.errorSkus.map(s => `${s.sku} (${s.name || ''})`).join(', '));
+          }
+          return;
+        }
+        log(`納品プラン作成成功! プランID: ${d.inboundPlanId}`);
+        if (d.shipments) {
+          d.shipments.forEach(s => log(`  出荷先: ${s.destination} / ${s.skuCount} SKU / ${s.totalQty} 個`));
+        }
+      } catch(e) { log('エラー: ' + e.message); }
+      finally {
+        btn.disabled = false;
+        btn.textContent = '📦 納品プラン作成';
+      }
+    }
+
+    function provCheckAll() {
+      document.querySelectorAll('.prov-check').forEach(cb => cb.checked = true);
+    }
+    function provUncheckAll() {
+      document.querySelectorAll('.prov-check').forEach(cb => cb.checked = false);
+    }
+
+    async function clearProvisionalConfirm() {
+      if (!confirm('仮確定データをクリアしますか？')) return;
+      try {
+        await fetch(`${BASE}/api/provisional`, {method: 'DELETE'});
+        provisionalData = [];
+        renderProvisionalTable();
+        updateProvisionalSummary({});
+        document.getElementById('provisionalTabCount').style.display = 'none';
+        log('仮確定データをクリアしました');
+      } catch(e) { alert('エラー: ' + e.message); }
+    }
+
     // ===== 自動ロード =====
     async function autoLoad() {
       await loadStatus();
 
       // ドラフトがあるか確認
       const draft = await checkDraftOnLoad();
+
+      // 仮確定データを読み込み
+      await loadProvisionalData();
 
       // ドラフトがなくてもデータがあれば自動で推奨リスト生成
       if (!draft) {
