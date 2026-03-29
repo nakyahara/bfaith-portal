@@ -254,6 +254,7 @@
         <label style="font-size:12px; color:#666; white-space:nowrap;">除外FNSKU:</label>
         <textarea id="excludeFnsku" placeholder="FNSKUを貼り付け（Excelの列コピーOK）" rows="2" style="flex:1; min-width:300px; padding:5px 10px; border:1px solid #d1d5db; border-radius:4px; font-size:12px; resize:vertical;"></textarea>
         <button class="btn btn-secondary" onclick="excludeFnskuFromSelection()" style="padding:4px 12px; font-size:12px;">選択から除外</button>
+        <button class="btn btn-secondary" onclick="selectOnlyFnsku()" style="padding:4px 12px; font-size:12px; background:#7c3aed; color:#fff; border-color:#7c3aed;">このFNSKUだけ選択</button>
       </div>
 
       <!-- フィルター + 検索 -->
@@ -2200,6 +2201,38 @@ Step10: アラート判定</pre>
 
     // 初期状態: Step 1 をアクティブに
     document.getElementById('stepBadge1').classList.add('active');
+
+    // ===== FNSKUだけ選択 =====
+    function selectOnlyFnsku() {
+      const input = document.getElementById('excludeFnsku').value.trim();
+      if (!input) { alert('FNSKUを入力してください'); return; }
+      const fnskuList = input.split(/[,\s\n]+/).map(s => s.trim()).filter(Boolean);
+      const fnskuSet = new Set(fnskuList);
+
+      // まず全チェックを外す
+      document.querySelectorAll('.rec-check:checked').forEach(cb => {
+        cb.checked = false;
+      });
+      selectedSkus.clear();
+
+      // FNSKU一致するSKUだけチェック
+      let selected = 0;
+      document.querySelectorAll('.rec-check').forEach(cb => {
+        const sku = cb.dataset.sku;
+        const rec = recData.find(r => r.amazon_sku === sku) || manualItems.find(m => m.amazon_sku === sku);
+        if (rec && rec.fnsku && fnskuSet.has(rec.fnsku)) {
+          cb.checked = true;
+          selectedSkus.add(sku);
+          selected++;
+        }
+      });
+      updateSelectedCount();
+      if (selected > 0) {
+        log(`FNSKU選択: ${selected}件をチェックしました（他は全て解除）`);
+      } else {
+        alert('入力されたFNSKUに一致する商品がありませんでした');
+      }
+    }
 
     // ===== FNSKU除外 =====
     function excludeFnskuFromSelection() {
