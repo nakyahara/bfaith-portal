@@ -669,7 +669,7 @@
     }
 
     async function fetchReports() {
-      if (!confirm('SP-APIレポートを取得すると、保存済みの作業データがリセットされます。よろしいですか？')) return;
+      if (!confirm('SP-APIレポートを取得します。完了後「復元して表示」で作業状態を戻せます。よろしいですか？')) return;
       const btn = document.getElementById('btnFetchAll');
       btn.disabled = true;
       btn.innerHTML = '<span class="spinner"></span>取得中...';
@@ -685,9 +685,7 @@
         }
         loadStatus();
         completeStep(1);
-        // データが変わったのでドラフトをクリア
-        try { await fetch(`${BASE}/api/draft`, { method: 'DELETE' }); } catch(e) {}
-        document.getElementById('draftBanner').style.display = 'none';
+        // データ取得後もドラフトは保持（復元ボタンで戻せる）
       } catch (e) { log('エラー: ' + e.message); }
       finally {
         btn.disabled = false;
@@ -730,14 +728,13 @@
     let manualItems = []; // 手動追加アイテム
 
     async function calcRecommendations() {
-      if (!confirm('推奨リストを再計算すると、保存済みの作業データ（チェック・数量変更）がリセットされます。よろしいですか？')) return;
+      if (!confirm('推奨リストを再計算します。完了後「復元して表示」で作業状態を戻せます。よろしいですか？')) return;
       const btn = document.getElementById('btnCalc');
       btn.disabled = true;
       btn.innerHTML = '<span class="spinner"></span>計算中...';
       log('推奨リスト生成中...');
 
-      // ドラフトをクリア
-      try { await fetch(`${BASE}/api/draft`, { method: 'DELETE' }); } catch(e) {}
+      // ドラフトは保持（復元ボタンで戻せる）
       selectedSkus.clear();
       Object.keys(shipQtyMap).forEach(k => delete shipQtyMap[k]);
 

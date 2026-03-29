@@ -74,13 +74,20 @@ router.post('/api/fetch-reports', async (req, res) => {
     // INVENTORYデータからFNSKUを抽出してsku_mappingに保存
     let fnskuCount = 0;
     if (results.inventory && results.inventory.length > 0) {
+      // デバッグ: INVENTORYレポートの列名を出力
+      const sampleRow = results.inventory[0];
+      console.log(`[FBA] INVENTORYヘッダー: ${Object.keys(sampleRow).join(', ')}`);
+      console.log(`[FBA] INVENTORYサンプル行:`, JSON.stringify(sampleRow).slice(0, 500));
       const fnskuItems = results.inventory
         .filter(r => (r['sku'] || r['seller-sku']) && (r['fnsku'] || r['fulfillment-channel-sku']))
         .map(r => ({ sku: r['sku'] || r['seller-sku'], fnsku: r['fnsku'] || r['fulfillment-channel-sku'] }));
+      console.log(`[FBA] FNSKU候補: ${fnskuItems.length}件 / INVENTORY全体: ${results.inventory.length}件`);
       if (fnskuItems.length > 0) {
         updateFnskuBatch(fnskuItems);
         fnskuCount = fnskuItems.length;
         console.log(`[FBA] FNSKU更新: ${fnskuCount}件`);
+      } else {
+        console.log(`[FBA] ⚠ FNSKUが0件。列名にfnsku/fulfillment-channel-skuが存在しない可能性`);
       }
     }
 
