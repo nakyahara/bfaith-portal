@@ -274,9 +274,17 @@ router.get('/api/recommendations', (req, res) => {
     const mappings = getSkuMappings();
     const fnskuMap = {};
     for (const m of mappings) if (m.fnsku) fnskuMap[m.amazon_sku] = m.fnsku;
+    const fnskuCount = Object.keys(fnskuMap).length;
+    console.log(`[FBA] 推奨API: mappings=${mappings.length}, fnsku有り=${fnskuCount}`);
+    if (fnskuCount > 0) {
+      const sample = Object.entries(fnskuMap).slice(0, 3);
+      console.log(`[FBA] FNSKUサンプル:`, sample);
+    }
     for (const item of result.items) {
       item.fnsku = fnskuMap[item.amazon_sku] || '';
     }
+    const itemsWithFnsku = result.items.filter(i => i.fnsku).length;
+    console.log(`[FBA] 推奨items: ${result.items.length}件, fnsku付与=${itemsWithFnsku}件`);
     res.json(result);
   } catch (e) {
     console.error('[FBA] 推奨リスト生成エラー:', e);
