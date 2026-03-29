@@ -34,6 +34,15 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function withTimeout(promise, ms, label = '') {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`タイムアウト (${ms/1000}秒): ${label}`)), ms)
+    ),
+  ]);
+}
+
 /**
  * レポートをリクエスト → ポーリング → ダウンロード → TSV解析
  */
@@ -41,22 +50,23 @@ async function fetchReport(reportType, options = {}) {
   const sp = getClient();
   const body = { reportType, marketplaceIds: [MARKETPLACE_ID()], ...options };
 
-  // レポート作成
-  const createResult = await sp.callAPI({
-    operation: 'createReport', endpoint: 'reports', body,
-    options: { version: '2021-06-30' },
-  });
+  // レポート作成（30秒タイムアウト）
+  const createResult = await withTimeout(
+    sp.callAPI({ operation: 'createReport', endpoint: 'reports', body, options: { version: '2021-06-30' } }),
+    30000, `${reportType} createReport`
+  );
   const reportId = createResult.reportId;
   console.log(`[SP-API] ${reportType} レポートID: ${reportId}`);
 
-  // ポーリング（最大5分）
+  // ポーリング（最大5分、各API呼び出し15秒タイムアウト）
   let report;
   for (let i = 0; i < 60; i++) {
     await sleep(5000);
-    report = await sp.callAPI({
-      operation: 'getReport', endpoint: 'reports',
-      path: { reportId }, options: { version: '2021-06-30' },
-    });
+    report = await withTimeout(
+      sp.callAPI({ operation: 'getReport', endpoint: 'reports', path: { reportId }, options: { version: '2021-06-30' } }),
+      15000, `${reportType} getReport`
+    );
+    console.log(`[SP-API] ${reportType} ポーリング ${i+1}/60: ${report.processingStatus}`);
     if (['DONE', 'FATAL', 'CANCELLED'].includes(report.processingStatus)) break;
   }
 
@@ -64,14 +74,13 @@ async function fetchReport(reportType, options = {}) {
     throw new Error(`レポート失敗: ${reportType} → ${report.processingStatus}`);
   }
 
-  // ドキュメント取得
-  const doc = await sp.callAPI({
-    operation: 'getReportDocument', endpoint: 'reports',
-    path: { reportDocumentId: report.reportDocumentId },
-    options: { version: '2021-06-30' },
-  });
+  // ドキュメント取得（30秒タイムアウト）
+  const doc = await withTimeout(
+    sp.callAPI({ operation: 'getReportDocument', endpoint: 'reports', path: { reportDocumentId: report.reportDocumentId }, options: { version: '2021-06-30' } }),
+    30000, `${reportType} getReportDocument`
+  );
 
-  const response = await fetch(doc.url);
+  const response = await fetch(doc.url, { signal: AbortSignal.timeout(60000) });
   const rawBuf = Buffer.from(await response.arrayBuffer());
   let dataBuf = rawBuf;
   if (doc.compressionAlgorithm === 'GZIP') {
