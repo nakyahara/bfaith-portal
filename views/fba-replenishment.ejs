@@ -2989,8 +2989,12 @@ Step10: アラート判定</pre>
     }
 
     async function removeProvItem(sku) {
+      const item = provisionalData.find(i => i.amazon_sku === sku);
+      const name = item?.product_name || sku;
+      if (!confirm(`この商品を仮確定リストから削除しますか？\n\n${name}\n(${sku})`)) return;
       try {
         await fetch(`${BASE}/api/provisional/${encodeURIComponent(sku)}`, {method: 'DELETE'});
+        log(`仮確定から削除: ${name} (${sku})`);
         provisionalData = provisionalData.filter(i => i.amazon_sku !== sku);
         renderProvisionalTable();
         updateProvisionalSummary({});
