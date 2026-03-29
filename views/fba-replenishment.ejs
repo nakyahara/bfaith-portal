@@ -2208,9 +2208,16 @@ Step10: アラート判定</pre>
       const fnskuList = input.split(/[,\s\n]+/).map(s => s.trim()).filter(Boolean);
       const fnskuSet = new Set(fnskuList);
       let removed = 0;
+      // デバッグ: recDataのFNSKU保持状況
+      const withFnsku = recData.filter(r => r.fnsku);
+      console.log(`[FNSKU除外] recData: ${recData.length}件, fnsku有り: ${withFnsku.length}件`);
+      console.log(`[FNSKU除外] 入力FNSKU:`, [...fnskuSet]);
+      if (withFnsku.length > 0) {
+        console.log(`[FNSKU除外] recDataサンプル:`, withFnsku.slice(0, 3).map(r => ({ sku: r.amazon_sku, fnsku: r.fnsku })));
+      }
       document.querySelectorAll('.rec-check:checked').forEach(cb => {
         const sku = cb.dataset.sku;
-        const rec = recData.find(r => r.amazon_sku === sku);
+        const rec = recData.find(r => r.amazon_sku === sku) || manualItems.find(m => m.amazon_sku === sku);
         if (rec && rec.fnsku && fnskuSet.has(rec.fnsku)) {
           cb.checked = false;
           selectedSkus.delete(sku);
@@ -2221,6 +2228,7 @@ Step10: アラート判定</pre>
       if (removed > 0) {
         log(`FNSKU除外: ${removed}件のチェックを外しました`);
       } else {
+        log(`FNSKU除外失敗: recData ${recData.length}件中 fnsku有り ${withFnsku.length}件。入力: ${[...fnskuSet].join(', ')}`);
         alert('入力されたFNSKUに一致するチェック済み商品はありませんでした');
       }
     }
