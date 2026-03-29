@@ -439,7 +439,7 @@ export function upsertSkuMappings(mappings) {
         ON CONFLICT(amazon_sku) DO UPDATE SET
           asin=excluded.asin, product_name=excluded.product_name,
           ne_code=excluded.ne_code, logizard_code=excluded.logizard_code,
-          fnsku=excluded.fnsku, jan=excluded.jan,
+          fnsku=COALESCE(excluded.fnsku, sku_mapping.fnsku), jan=excluded.jan,
           is_set=excluded.is_set, set_components=excluded.set_components,
           per_unit_volume=excluded.per_unit_volume, storage_type=excluded.storage_type,
           non_fba_sales_7d=excluded.non_fba_sales_7d, non_fba_sales_30d=excluded.non_fba_sales_30d,
