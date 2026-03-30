@@ -13,6 +13,7 @@ import { startScheduler } from './apps/ranking-checker/scheduler.js';
 import profitRouter from './apps/profit-calculator/router.js';
 import { startPriceWorker, startMaintenanceJobs } from './apps/profit-calculator/price-scheduler.js';
 import fbaRouter from './apps/fba-replenishment/router.js';
+import warehouseRouter from './apps/warehouse/router.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -117,6 +118,7 @@ const categories = [
   { id: 'analysis', name: '商品分析', icon: '📊' },
   { id: 'purchasing', name: '仕入れ', icon: '💰' },
   { id: 'fba', name: 'FBA管理', icon: '📦' },
+  { id: 'data', name: 'データ基盤', icon: '🗄️' },
 ];
 
 // --- アプリ一覧 ---
@@ -174,6 +176,15 @@ const apps = [
     path: '/apps/fba-replenishment',
     status: 'active',
     category: 'fba',
+  },
+  {
+    id: 'warehouse',
+    name: 'データウェアハウス',
+    description: '社内マスターデータ基盤・販売データ蓄積・AI分析用',
+    icon: '🗄️',
+    path: '/apps/warehouse',
+    status: 'active',
+    category: 'data',
   },
 ];
 
@@ -283,6 +294,7 @@ app.use('/apps/aes-pdf-sorter', requireAppAccess('aes-pdf-sorter'), aesRouter);
 app.use('/apps/ranking-checker', requireAppAccess('ranking-checker'), rankingRouter);
 app.use('/apps/profit-calculator', requireAppAccess('profit-calculator'), profitRouter);
 app.use('/apps/fba-replenishment', requireAppAccess('fba-replenishment'), fbaRouter);
+app.use('/apps/warehouse', requireAppAccess('warehouse'), warehouseRouter);
 
 // 未実装アプリのプレースホルダー
 app.get('/apps/:appId', requireAuth, (req, res) => {
@@ -405,11 +417,11 @@ app.listen(PORT, () => {
   // 楽天順位チェッカー スケジューラー
   startScheduler();
 
-  // 価格改定ワーカー（SQS通知ベース）
-  startPriceWorker();
+  // 価格改定ワーカー — 安全装置未実装のため無効化 (2026-03-30)
+  // startPriceWorker();
 
-  // 価格改定メンテナンスジョブ（日次同期・フォールバック・クリーンアップ）
-  startMaintenanceJobs();
+  // 価格改定メンテナンスジョブ — 同上理由で無効化 (2026-03-30)
+  // startMaintenanceJobs();
 });
 
 process.on('SIGTERM', () => { stopPythonBackend(); process.exit(0); });
