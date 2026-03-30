@@ -975,7 +975,7 @@
       }
     }
 
-    function addManualItem() {
+    async function addManualItem() {
       const skuInput = document.getElementById('manualSku');
       const qtyInput = document.getElementById('manualQty');
       const msgEl = document.getElementById('manualMsg');
@@ -992,28 +992,51 @@
         existing._manual = true;
         msgEl.textContent = `${sku} の推奨数を ${qty} に設定しました`;
       } else {
-        // データにないSKUでも手動追加
+        // SKUマッピングから商品情報を取得
+        let mapping = null;
+        try {
+          const res = await fetch(`${BASE}/api/sku-mappings`);
+          const mappings = await res.json();
+          mapping = mappings.find(m => m.amazon_sku === sku);
+        } catch (e) {
+          console.warn('SKUマッピング取得失敗:', e);
+        }
+
+        // スナップショットからFBA在庫情報も取得
+        const snap = snapshotData.find(s => s.amazon_sku === sku);
+
         const item = {
           amazon_sku: sku,
-          asin: '',
-          product_name: '(手動追加)',
-          fba_available: '-',
-          effective_fba_stock: '-',
-          days_of_supply: '-',
+          asin: mapping?.asin || snap?.asin || '',
+          product_name: mapping?.product_name || snap?.product_name || '(不明)',
+          ne_code: mapping?.ne_code || '',
+          fnsku: mapping?.fnsku || '',
+          fba_available: snap?.fba_available ?? '-',
+          fba_inbound_working: snap?.fba_inbound_working ?? 0,
+          fba_inbound_working_source: '',
+          effective_fba_stock: snap?.effective_fba_stock ?? '-',
+          days_of_supply: snap?.days_of_supply ?? '-',
           reorder_point: '-',
           raw_needed: '-',
           target_days: '-',
-          units_sold_30d: '-',
+          units_sold_7d: snap?.units_sold_7d ?? '-',
+          units_sold_30d: snap?.units_sold_30d ?? '-',
+          non_fba_sales_7d: mapping?.non_fba_sales_7d || 0,
+          non_fba_sales_30d: mapping?.non_fba_sales_30d || 0,
           warehouse_raw: '-',
           warehouse_available: '-',
           recommended_qty: qty,
+          adjusted_qty: qty,
           urgency_score: 999,
           alerts: [],
           is_today: true,
           _manual: true,
+          set_components: mapping?.set_components || null,
         };
         manualItems.push(item);
-        msgEl.textContent = `${sku} を ${qty} 個で追加しました`;
+        msgEl.textContent = mapping
+          ? `${sku}（${mapping.product_name}）を ${qty} 個で追加しました`
+          : `${sku} を ${qty} 個で追加しました（商品情報なし）`;
       }
       skuInput.value = '';
       qtyInput.value = '';
@@ -2016,27 +2039,34 @@ Step10: アラート判定</pre>
           existing._fromStockout = true;
           addedCount++;
         } else {
-          // recDataにない場合（通常はありえないが念のため）
+          // recDataにない場合 — stockoutDataから商品情報を取得
+          const soItem = stockoutData.find(s => s.amazon_sku === sku);
+          const snap = snapshotData.find(s => s.amazon_sku === sku);
           const item = {
             amazon_sku: sku,
-            asin: '',
-            product_name: '(FBA欠品から追加)',
-            fba_available: 0,
-            effective_fba_stock: 0,
-            days_of_supply: 0,
-            reorder_point: '-',
-            raw_needed: '-',
-            target_days: '-',
-            units_sold_7d: 0,
-            units_sold_30d: 0,
-            non_fba_sales_7d: 0,
-            non_fba_sales_30d: 0,
-            warehouse_raw: 0,
-            warehouse_available: 0,
+            asin: soItem?.asin || snap?.asin || '',
+            product_name: soItem?.product_name || snap?.product_name || '(FBA欠品から追加)',
+            ne_code: soItem?.ne_code || '',
+            fnsku: soItem?.fnsku || '',
+            fba_available: soItem?.fba_available ?? 0,
+            fba_inbound_working: soItem?.fba_inbound_working ?? 0,
+            fba_inbound_working_source: soItem?.fba_inbound_working_source || '',
+            effective_fba_stock: soItem?.effective_fba_stock ?? 0,
+            days_of_supply: soItem?.days_of_supply ?? 0,
+            reorder_point: soItem?.reorder_point ?? '-',
+            raw_needed: soItem?.raw_needed ?? '-',
+            target_days: soItem?.target_days ?? '-',
+            units_sold_7d: soItem?.units_sold_7d ?? 0,
+            units_sold_30d: soItem?.units_sold_30d ?? 0,
+            non_fba_sales_7d: soItem?.non_fba_sales_7d ?? 0,
+            non_fba_sales_30d: soItem?.non_fba_sales_30d ?? 0,
+            warehouse_raw: soItem?.warehouse_raw ?? 0,
+            warehouse_available: soItem?.warehouse_available ?? 0,
             recommended_qty: 0,
             adjusted_qty: 0,
-            urgency_score: 0,
-            alerts: [],
+            urgency_score: soItem?.urgency_score ?? 0,
+            alerts: soItem?.alerts || [],
+            set_components: soItem?.set_components || null,
             _manual: true,
             _fromStockout: true,
           };
@@ -2333,24 +2363,27 @@ Step10: アラート判定</pre>
             asin: newProd?.asin || '',
             product_name: newProd?.product_name || '(新規商品から追加)',
             ne_code: newProd?.ne_code || '',
+            fnsku: newProd?.fnsku || '',
             set_components: newProd?.set_components || null,
             is_set: newProd?.is_set || false,
-            fba_available: '-',
-            effective_fba_stock: '-',
-            days_of_supply: '-',
-            reorder_point: '-',
-            raw_needed: '-',
-            target_days: '-',
-            units_sold_7d: '-',
-            units_sold_30d: '-',
+            fba_available: newProd?.fba_available ?? '-',
+            fba_inbound_working: newProd?.fba_inbound_working ?? 0,
+            fba_inbound_working_source: newProd?.fba_inbound_working_source || '',
+            effective_fba_stock: newProd?.effective_fba_stock ?? '-',
+            days_of_supply: newProd?.days_of_supply ?? '-',
+            reorder_point: newProd?.reorder_point ?? '-',
+            raw_needed: newProd?.raw_needed ?? '-',
+            target_days: newProd?.target_days ?? '-',
+            units_sold_7d: newProd?.units_sold_7d ?? '-',
+            units_sold_30d: newProd?.units_sold_30d ?? '-',
             non_fba_sales_7d: newProd?.non_fba_sales_7d || 0,
             non_fba_sales_30d: newProd?.non_fba_sales_30d || 0,
             warehouse_raw: newProd?.warehouse_qty || 0,
             warehouse_available: newProd?.warehouse_qty || 0,
             recommended_qty: 0,
             adjusted_qty: 0,
-            urgency_score: 0,
-            alerts: [],
+            urgency_score: newProd?.urgency_score ?? 0,
+            alerts: newProd?.alerts || [],
             _manual: true,
             _fromNewProduct: true,
           };
