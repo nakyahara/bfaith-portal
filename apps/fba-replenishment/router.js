@@ -17,7 +17,7 @@ import { initDb, savePlanningData, getLatestSnapshots, getSettings, updateSettin
 import { fetchAllReports, normalizePlanningRow } from './sp-api-reports.js';
 import { syncSkuMappings } from './sheets-sync.js';
 import { generateRecommendations } from './calculation-engine.js';
-import { createInboundPlan, checkInboundEligibility, findErrorSkusByBinarySearch, listShipments, listShipmentItems } from './inbound-plans.js';
+import { createInboundPlan, checkInboundEligibility, findErrorSkusByBinarySearch, listShipments, listShipmentItems, fetchActiveInboundQuantities } from './inbound-plans.js';
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -267,18 +267,51 @@ router.get('/api/plans/:id/items', (req, res) => {
   res.json(items);
 });
 
+// ===== 準備中数量キャッシュ（listInboundPlansから取得） =====
+let inboundWorkingCache = null;
+let inboundWorkingCacheTime = 0;
+const INBOUND_CACHE_TTL = 10 * 60 * 1000; // 10分
+
+async function getInboundWorkingData() {
+  const now = Date.now();
+  if (inboundWorkingCache && (now - inboundWorkingCacheTime) < INBOUND_CACHE_TTL) {
+    return inboundWorkingCache;
+  }
+  try {
+    inboundWorkingCache = await fetchActiveInboundQuantities();
+    inboundWorkingCacheTime = now;
+    console.log(`[FBA] 準備中数量キャッシュ更新: ${Object.keys(inboundWorkingCache).length} SKU`);
+    return inboundWorkingCache;
+  } catch (e) {
+    console.error('[FBA] 準備中数量取得エラー（キャッシュを使用）:', e.message);
+    return inboundWorkingCache; // エラー時は古いキャッシュを返す（nullの場合もある）
+  }
+}
+
+// 手動リフレッシュ用
+router.post('/api/refresh-inbound-working', async (req, res) => {
+  try {
+    inboundWorkingCache = null; // キャッシュクリア
+    const data = await getInboundWorkingData();
+    res.json({ ok: true, skuCount: data ? Object.keys(data).length : 0 });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ===== ステータス =====
 // ===== 推奨リスト =====
-router.get('/api/recommendations', (req, res) => {
+router.get('/api/recommendations', async (req, res) => {
   try {
     const debug = req.query.debug === '1' || req.query.debug === 'true';
-    const result = generateRecommendations(debug);
+    const inboundOverride = await getInboundWorkingData();
+    const result = generateRecommendations(debug, inboundOverride);
     // FNSKU情報を付与
     const mappings = getSkuMappings();
     const fnskuMap = {};
     for (const m of mappings) if (m.fnsku) fnskuMap[m.amazon_sku] = m.fnsku;
     const fnskuCount = Object.keys(fnskuMap).length;
-    console.log(`[FBA] 推奨API: mappings=${mappings.length}, fnsku有り=${fnskuCount}`);
+    console.log(`[FBA] 推奨API: mappings=${mappings.length}, fnsku有り=${fnskuCount}, inboundOverride=${inboundOverride ? Object.keys(inboundOverride).length + ' SKU' : 'なし'}`);
     if (fnskuCount > 0) {
       const sample = Object.entries(fnskuMap).slice(0, 3);
       console.log(`[FBA] FNSKUサンプル:`, sample);
@@ -296,9 +329,10 @@ router.get('/api/recommendations', (req, res) => {
 });
 
 // 個別SKUの計算詳細
-router.get('/api/recommendations/:sku', (req, res) => {
+router.get('/api/recommendations/:sku', async (req, res) => {
   try {
-    const result = generateRecommendations(true);
+    const inboundOverride = await getInboundWorkingData();
+    const result = generateRecommendations(true, inboundOverride);
     const item = result.items.find(i => i.amazon_sku === req.params.sku);
     if (!item) return res.status(404).json({ error: 'SKUが見つかりません' });
     res.json(item);

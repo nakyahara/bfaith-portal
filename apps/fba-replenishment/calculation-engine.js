@@ -20,7 +20,7 @@ import { getLatestSnapshots, getSkuMappings, getSkuExceptions, getSettings,
  *
  * 発注点で自然に絞り込み、ハードリミットは設けない
  */
-export function generateRecommendations(debug = false) {
+export function generateRecommendations(debug = false, inboundWorkingOverride = null) {
   const settings = getSettings();
   const snapshots = getLatestSnapshots();
   const mappings = getSkuMappings();
@@ -58,15 +58,29 @@ export function generateRecommendations(debug = false) {
     const fbaAvailable = snap.fba_available || 0;
     const inboundShipped = snap.fba_inbound_shipped || 0;
     const inboundReceived = snap.fba_inbound_received || 0;
-    let inboundWorking = snap.fba_inbound_working || 0;
+    const reportWorking = snap.fba_inbound_working || 0;
 
-    // working_first_seenが7日超なら除外
-    if (inboundWorking > 0 && snap.working_first_seen) {
-      const daysSinceFirstSeen = Math.floor(
-        (new Date(snapshotDate) - new Date(snap.working_first_seen)) / 86400000
-      );
-      if (daysSinceFirstSeen > workingExpiryDays) {
-        inboundWorking = 0; // 放置プラン扱い
+    // inboundWorkingOverride（listInboundPlansからのリアルタイムデータ）がある場合はそちらを優先
+    // レポートの値より大きい方を採用（レポートに反映済みのものもあるため、max で二重計上を防ぐ）
+    let inboundWorking;
+    let workingSource; // デバッグ用: データソース
+    if (inboundWorkingOverride && inboundWorkingOverride[sku] !== undefined) {
+      const apiQty = inboundWorkingOverride[sku];
+      inboundWorking = Math.max(reportWorking, apiQty);
+      workingSource = apiQty > reportWorking ? 'API' : (apiQty === reportWorking ? 'same' : 'report');
+    } else {
+      inboundWorking = reportWorking;
+      workingSource = 'report';
+
+      // レポートのみの場合: working_first_seenが7日超なら除外
+      if (inboundWorking > 0 && snap.working_first_seen) {
+        const daysSinceFirstSeen = Math.floor(
+          (new Date(snapshotDate) - new Date(snap.working_first_seen)) / 86400000
+        );
+        if (daysSinceFirstSeen > workingExpiryDays) {
+          inboundWorking = 0; // 放置プラン扱い
+          workingSource = 'report(7日超除外)';
+        }
       }
     }
 
@@ -303,7 +317,7 @@ export function generateRecommendations(debug = false) {
     if (debug) {
       const perUnitVol = snap.per_unit_volume || mapping.per_unit_volume || 0;
       calc_steps = [
-        `[Step1] 実質FBA在庫 = ${fbaAvailable}(販売可能) + ${inboundShipped}(輸送中) + ${inboundReceived}(受領中) + ${inboundWorking}(準備中${snap.fba_inbound_working > 0 && inboundWorking === 0 ? ',7日超で除外' : ''}) = ${effectiveFbaStock}`,
+        `[Step1] 実質FBA在庫 = ${fbaAvailable}(販売可能) + ${inboundShipped}(輸送中) + ${inboundReceived}(受領中) + ${inboundWorking}(準備中[${workingSource}]${reportWorking !== inboundWorking ? `,レポート=${reportWorking}` : ''}) = ${effectiveFbaStock}`,
         `[Step2] 1日あたり販売数 = FBA ${dailySales.toFixed(2)}個/日 (${sold30d}個/30日) + 他CH ${nonFbaDailySales.toFixed(2)}個/日 (${nonFbaSales30d}個/30日) = 合計 ${totalDailySales.toFixed(2)}個/日`,
         `[Step3] 発注点 = ${reorderPointUnits}個 (${reorderPointDays}日×${dailySales.toFixed(2)}個/日) / 目標日数 = ${targetDays}日 (30日売上:${sold30d}個, サイズ:${perUnitVol}cm³${perUnitVol > 5000 ? '→大型' : perUnitVol > 500 ? '→中型' : perUnitVol > 0 ? '→小型' : '→不明'})`,
         `[Step4] FBA在庫 ${effectiveFbaStock}個 ${needsReplenishment ? '< 発注点' + reorderPointUnits + '個 → 補充推奨' : '≧ 発注点' + reorderPointUnits + '個 → 補充不要'} (供給日数: ${daysOfSupply === 999 ? '∞' : daysOfSupply.toFixed(1) + '日'})`,
@@ -327,11 +341,13 @@ export function generateRecommendations(debug = false) {
 
       // FBA在庫
       fba_available: fbaAvailable,
-      fba_inbound_working: snap.fba_inbound_working || 0,
+      fba_inbound_working: inboundWorking,
+      fba_inbound_working_report: reportWorking,
+      fba_inbound_working_source: workingSource,
       fba_inbound_shipped: inboundShipped,
       fba_inbound_received: inboundReceived,
       working_first_seen: snap.working_first_seen || null,
-      working_expired: inboundWorking === 0 && (snap.fba_inbound_working || 0) > 0,
+      working_expired: inboundWorking === 0 && reportWorking > 0,
       effective_fba_stock: effectiveFbaStock,
 
       // 販売

@@ -258,6 +258,75 @@ export async function checkInboundEligibility(items) {
 }
 
 /**
+ * ACTIVEな納品プランから、SKU別の準備中数量を集計
+ * （7日以内に作成されたプランのみ対象）
+ * @returns {Object} { [msku]: quantity, ... }
+ */
+export async function fetchActiveInboundQuantities() {
+  const sp = getClient();
+  const sevenDaysAgo = new Date(Date.now() - 7 * 86400000);
+
+  // 1. ACTIVEプラン一覧を取得
+  const allPlans = [];
+  let nextToken = null;
+
+  do {
+    const params = new URLSearchParams();
+    params.set('status', 'ACTIVE');
+    params.set('pageSize', '10');
+    params.set('sortBy', 'LAST_UPDATED_TIME');
+    params.set('sortOrder', 'DESC');
+    if (nextToken) params.set('paginationToken', nextToken);
+
+    const result = await sp.callAPI({
+      api_path: `/inbound/fba/2024-03-20/inboundPlans?${params.toString()}`,
+      method: 'GET',
+    });
+
+    if (result.inboundPlans) allPlans.push(...result.inboundPlans);
+    nextToken = result.pagination?.token || null;
+  } while (nextToken);
+
+  console.log(`[Inbound] ACTIVEプラン: ${allPlans.length}件`);
+
+  // 2. 7日以内のプランだけフィルタ
+  const recentPlans = allPlans.filter(p => new Date(p.createdAt) >= sevenDaysAgo);
+  console.log(`[Inbound] 7日以内: ${recentPlans.length}件`);
+
+  // 3. 各プランのアイテムを取得してSKU別に集計
+  const skuQtyMap = {};
+  let totalItems = 0;
+
+  for (const plan of recentPlans) {
+    const items = [];
+    let itemToken = null;
+
+    do {
+      const params = itemToken ? `?pageToken=${encodeURIComponent(itemToken)}` : '';
+      const result = await sp.callAPI({
+        api_path: `/inbound/fba/2024-03-20/inboundPlans/${plan.inboundPlanId}/items${params}`,
+        method: 'GET',
+      });
+      if (result.items) items.push(...result.items);
+      itemToken = result.pagination?.token || null;
+    } while (itemToken);
+
+    if (items.length === 0) continue;
+
+    for (const item of items) {
+      const msku = item.msku;
+      const qty = item.quantity || 0;
+      skuQtyMap[msku] = (skuQtyMap[msku] || 0) + qty;
+    }
+    totalItems += items.length;
+    console.log(`[Inbound] ${plan.name || plan.inboundPlanId}: ${items.length}アイテム`);
+  }
+
+  console.log(`[Inbound] 準備中集計完了: ${Object.keys(skuQtyMap).length} SKU, ${totalItems}アイテム`);
+  return skuQtyMap;
+}
+
+/**
  * オペレーションステータスをポーリング
  */
 async function pollOperation(operationId) {
