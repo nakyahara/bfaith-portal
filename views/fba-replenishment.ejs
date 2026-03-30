@@ -284,6 +284,7 @@
               <th class="sortable-rec" data-key="product_name">商品名</th>
               <th>構成</th>
               <th class="sortable-rec" data-key="fba_available" data-type="num">FBA在庫</th>
+              <th class="sortable-rec" data-key="fba_inbound_working" data-type="num">準備中</th>
               <th class="sortable-rec" data-key="effective_fba_stock" data-type="num">実質在庫</th>
               <th class="sortable-rec" data-key="days_of_supply" data-type="num">供給日数</th>
               <th class="sortable-rec" data-key="reorder_point" data-type="num">発注点(個)</th>
@@ -353,6 +354,7 @@
                 <th class="sortable-stockout" data-key="product_name">商品名</th>
                 <th>構成</th>
                 <th class="sortable-stockout" data-key="fba_available" data-type="num">FBA在庫</th>
+                <th class="sortable-stockout" data-key="fba_inbound_working" data-type="num">準備中</th>
                 <th class="sortable-stockout" data-key="effective_fba_stock" data-type="num">実質在庫</th>
                 <th class="sortable-stockout" data-key="days_of_supply" data-type="num">供給日数</th>
                 <th class="sortable-stockout" data-key="reorder_point" data-type="num">発注点(個)</th>
@@ -417,6 +419,7 @@
                 <th class="sortable-new" data-key="product_name">商品名</th>
                 <th>構成</th>
                 <th class="sortable-new" data-key="fba_available" data-type="num">FBA在庫</th>
+                <th class="sortable-new" data-key="fba_inbound_working" data-type="num">準備中</th>
                 <th class="sortable-new" data-key="effective_fba_stock" data-type="num">実質在庫</th>
                 <th class="sortable-new" data-key="days_of_supply" data-type="num">供給日数</th>
                 <th class="sortable-new" data-key="reorder_point" data-type="num">発注点(個)</th>
@@ -473,6 +476,7 @@
                 <th class="sortable-order" data-key="product_name">商品名</th>
                 <th>構成</th>
                 <th class="sortable-order" data-key="fba_available" data-type="num">FBA在庫</th>
+                <th class="sortable-order" data-key="fba_inbound_working" data-type="num">準備中</th>
                 <th class="sortable-order" data-key="effective_fba_stock" data-type="num">実質在庫</th>
                 <th class="sortable-order" data-key="days_of_supply" data-type="num">供給日数</th>
                 <th class="sortable-order" data-key="reorder_point" data-type="num">発注点(個)</th>
@@ -1023,7 +1027,7 @@
 
     function renderRecList(data) {
       const tbody = document.getElementById('recBody');
-      if (!data.length) { tbody.innerHTML = '<tr><td colspan="23">該当なし</td></tr>'; return; }
+      if (!data.length) { tbody.innerHTML = '<tr><td colspan="24">該当なし</td></tr>'; return; }
 
       // ソート
       data.sort((a, b) => {
@@ -1080,6 +1084,7 @@
           <td class="product-name" title="${r.product_name || ''}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${r.product_name || ''}</a>` : (r.product_name || '')}</td>
           ${renderComponentCell(r)}
           <td>${r.fba_available}</td>
+          <td style="${r.fba_inbound_working > 0 ? (r.fba_inbound_working_source === 'API' ? 'color:#2563eb;font-weight:bold' : 'color:#16a34a') : 'color:#ccc'}" title="${r.fba_inbound_working_source === 'API' ? 'APIから取得（リアルタイム）' : r.fba_inbound_working_source === 'report(7日超除外)' ? 'レポート値（7日超で除外済み）' : 'レポートから取得'}">${r.fba_inbound_working || 0}${r.fba_inbound_working_source === 'API' ? '<span style="font-size:9px;color:#2563eb;"> ⚡</span>' : ''}</td>
           <td>${r.effective_fba_stock}</td>
           <td style="${dosColor}">${dosVal}${belowReorder ? ' ⚠' : ''}</td>
           <td>${reorderVal}</td>
@@ -1697,7 +1702,7 @@ Step10: アラート判定</pre>
 
     function renderOrderList(data) {
       const tbody = document.getElementById('orderBody');
-      if (!data.length) { tbody.innerHTML = '<tr><td colspan="21">該当なし</td></tr>'; return; }
+      if (!data.length) { tbody.innerHTML = '<tr><td colspan="22">該当なし</td></tr>'; return; }
 
       // ソート
       data.sort((a, b) => {
@@ -1728,6 +1733,7 @@ Step10: アラート判定</pre>
           <td class="product-name" title="${r.product_name || ''}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;">${r.product_name || ''}</a>` : (r.product_name || '')}</td>
           ${renderComponentCell(r)}
           <td>${r.fba_available}</td>
+          <td style="${r.fba_inbound_working > 0 ? (r.fba_inbound_working_source === 'API' ? 'color:#2563eb;font-weight:bold' : 'color:#16a34a') : 'color:#ccc'}">${r.fba_inbound_working || 0}${r.fba_inbound_working_source === 'API' ? '<span style="font-size:9px;color:#2563eb;"> ⚡</span>' : ''}</td>
           <td>${r.effective_fba_stock}</td>
           <td style="${dosColor}">${dosVal}</td>
           <td>${r.reorder_point}</td>
@@ -1833,7 +1839,7 @@ Step10: アラート判定</pre>
 
     function renderStockoutList(data) {
       const tbody = document.getElementById('stockoutBody');
-      if (!data.length) { tbody.innerHTML = '<tr><td colspan="22">該当なし</td></tr>'; return; }
+      if (!data.length) { tbody.innerHTML = '<tr><td colspan="23">該当なし</td></tr>'; return; }
 
       // ソート
       data.sort((a, b) => {
@@ -1911,6 +1917,7 @@ Step10: アラート判定</pre>
           <td class="product-name" title="${r.product_name || ''}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${r.product_name || ''}</a>` : (r.product_name || '')}</td>
           ${renderComponentCell(r)}
           <td>${r.fba_available}</td>
+          <td style="${r.fba_inbound_working > 0 ? (r.fba_inbound_working_source === 'API' ? 'color:#2563eb;font-weight:bold' : 'color:#16a34a') : 'color:#ccc'}">${r.fba_inbound_working || 0}${r.fba_inbound_working_source === 'API' ? '<span style="font-size:9px;color:#2563eb;"> ⚡</span>' : ''}</td>
           <td>${r.effective_fba_stock}</td>
           <td style="${dosColor}">${dosVal}${belowReorder ? ' ⚠' : ''}</td>
           <td>${reorderVal}</td>
@@ -2180,7 +2187,7 @@ Step10: アラート判定</pre>
 
     function renderNewList(data) {
       const tbody = document.getElementById('newBody');
-      if (!data.length) { tbody.innerHTML = '<tr><td colspan="22">該当なし</td></tr>'; return; }
+      if (!data.length) { tbody.innerHTML = '<tr><td colspan="23">該当なし</td></tr>'; return; }
 
       data.sort((a, b) => {
         const th = document.querySelector(`th.sortable-new[data-key="${newSortKey}"]`);
@@ -2226,6 +2233,7 @@ Step10: アラート判定</pre>
           <td class="product-name" title="${r.product_name || ''}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${r.product_name || ''}</a>` : (r.product_name || '')}</td>
           ${renderComponentCell(r)}
           <td>${r.fba_available ?? '-'}</td>
+          <td style="${r.fba_inbound_working > 0 ? (r.fba_inbound_working_source === 'API' ? 'color:#2563eb;font-weight:bold' : 'color:#16a34a') : 'color:#ccc'}">${r.fba_inbound_working || 0}${r.fba_inbound_working_source === 'API' ? '<span style="font-size:9px;color:#2563eb;"> ⚡</span>' : ''}</td>
           <td>${r.effective_fba_stock ?? '-'}</td>
           <td>${r.days_of_supply ?? '-'}</td>
           <td>${r.reorder_point ?? '-'}</td>
