@@ -437,6 +437,112 @@ router.get('/api/query', (req, res) => {
   }
 });
 
+// ─── GET /api/master ───
+// 統合商品マスタ（v_product_master）
+
+router.get('/api/master', (req, res) => {
+  const { search, status, cost_source, has_shipping, limit = '100', offset = '0' } = req.query;
+  let sql = 'SELECT * FROM v_product_master WHERE 1=1';
+  const params = [];
+  if (search) { sql += ' AND (商品コード LIKE ? OR 商品名 LIKE ?)'; const t = `%${search}%`; params.push(t, t); }
+  if (status) { sql += ' AND 取扱区分 = ?'; params.push(status); }
+  if (cost_source) { sql += ' AND 原価ソース = ?'; params.push(cost_source); }
+  if (has_shipping === '0') { sql += ' AND 送料 IS NULL'; }
+  if (has_shipping === '1') { sql += ' AND 送料 IS NOT NULL'; }
+  const countSql = sql.replace('SELECT *', 'SELECT COUNT(*) as cnt');
+  const total = execQuery(countSql, params)[0]?.cnt || 0;
+  sql += ' ORDER BY 商品コード LIMIT ? OFFSET ?';
+  params.push(parseInt(limit), parseInt(offset));
+  const rows = execQuery(sql, params);
+  res.json({ rows, total });
+});
+
+// ─── GET /api/sales ───
+// 商品別販売集計
+
+router.get('/api/sales', (req, res) => {
+  const { product, platform, month, limit = '100' } = req.query;
+  let sql = 'SELECT 商品コード, 商品名, platform, SUM(数量) as total_qty, ROUND(SUM(売上金額)) as total_sales, SUM(注文数) as total_orders, data_source FROM v_sales_by_product WHERE 1=1';
+  const params = [];
+  if (product) { sql += ' AND 商品コード LIKE ?'; params.push(`%${product}%`); }
+  if (platform) { sql += ' AND platform = ?'; params.push(platform); }
+  if (month) { sql += ' AND month = ?'; params.push(month); }
+  sql += ' GROUP BY 商品コード, platform ORDER BY total_sales DESC LIMIT ?';
+  params.push(parseInt(limit));
+  res.json(execQuery(sql, params));
+});
+
+// ─── GET /api/sales/monthly ───
+// モール別月次売上
+
+router.get('/api/sales/monthly', (req, res) => {
+  const { months = '6' } = req.query;
+  const rows = execQuery(`
+    SELECT month, platform, data_source, SUM(数量) as total_qty, ROUND(SUM(売上金額)) as total_sales, SUM(注文数) as total_orders
+    FROM v_sales_by_product
+    GROUP BY month, platform
+    ORDER BY month DESC, total_sales DESC
+    LIMIT ?
+  `, [parseInt(months) * 10]);
+  res.json(rows);
+});
+
+// ─── GET /api/missing ───
+// 未登録データ一覧
+
+router.get('/api/missing', (req, res) => {
+  const { type } = req.query;
+  let sql = 'SELECT * FROM v_missing_data';
+  const params = [];
+  if (type) { sql += ' WHERE missing_type = ?'; params.push(type); }
+  sql += ' ORDER BY missing_type, 商品コード';
+  const rows = execQuery(sql, params);
+  const summary = execQuery('SELECT missing_type, COUNT(*) as cnt FROM v_missing_data GROUP BY missing_type');
+  res.json({ rows, summary });
+});
+
+// ─── POST /api/shipping ───
+// 送料登録（個別）
+
+router.post('/api/shipping', (req, res) => {
+  const { sku, shipping_code, ship_method, ship_cost } = req.body;
+  if (!sku || !ship_cost) return res.status(400).json({ error: 'sku と ship_cost は必須です' });
+  const db = getDB();
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  db.prepare('INSERT OR REPLACE INTO product_shipping (sku, product_name, shipping_code, ship_method, ship_cost, note, synced_at) VALUES (?, (SELECT 商品名 FROM raw_ne_products WHERE 商品コード = ?), ?, ?, ?, ?, ?)').run(sku, sku, shipping_code || '', ship_method || '', parseFloat(ship_cost), '', now);
+  res.json({ ok: true, sku, ship_cost });
+});
+
+// ─── POST /api/genka ───
+// 原価登録（例外原価）
+
+router.post('/api/genka', (req, res) => {
+  const { sku, genka, product_name } = req.body;
+  if (!sku || genka === undefined) return res.status(400).json({ error: 'sku と genka は必須です' });
+  const db = getDB();
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  db.prepare('INSERT OR REPLACE INTO exception_genka (sku, genka, 商品名, synced_at) VALUES (?, ?, ?, ?)').run(sku, parseFloat(genka), product_name || '', now);
+  res.json({ ok: true, sku, genka });
+});
+
+// ─── POST /api/skumap ───
+// SKUマップ登録（個別）
+
+router.post('/api/skumap', (req, res) => {
+  const { seller_sku, asin, product_name, ne_code, quantity } = req.body;
+  if (!seller_sku || !ne_code) return res.status(400).json({ error: 'seller_sku と ne_code は必須です' });
+  const db = getDB();
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  db.prepare('INSERT OR REPLACE INTO sku_map (seller_sku, asin, 商品名, ne_code, 数量, synced_at) VALUES (?, ?, ?, ?, ?, ?)').run(seller_sku, asin || '', product_name || '', ne_code, parseInt(quantity) || 1, now);
+  res.json({ ok: true, seller_sku, ne_code });
+});
+
+// ─── GET /api/shipping_rates ───
+
+router.get('/api/shipping_rates', (req, res) => {
+  res.json(execQuery('SELECT * FROM shipping_rates ORDER BY shipping_code'));
+});
+
 // ─── ダッシュボード（HTML）───
 
 router.get('/', (req, res) => {
@@ -445,6 +551,18 @@ router.get('/', (req, res) => {
 });
 
 function renderDashboard(stats) {
+  // 未登録データ件数
+  const db = getDB();
+  let missingCounts = {};
+  try {
+    const rows = db.prepare('SELECT missing_type, COUNT(*) as cnt FROM v_missing_data GROUP BY missing_type').all();
+    for (const r of rows) missingCounts[r.missing_type] = r.cnt;
+  } catch {}
+
+  // 配送区分一覧（フォーム用）
+  let shippingRates = [];
+  try { shippingRates = db.prepare('SELECT shipping_code, 小分類区分名称, 配送関係費合計 FROM shipping_rates ORDER BY shipping_code').all(); } catch {}
+
   return `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -453,54 +571,234 @@ function renderDashboard(stats) {
   <title>データウェアハウス - B-Faith</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; color: #333; }
-    .header { background: #1a5276; color: white; padding: 16px 24px; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; color: #333; font-size: 14px; }
+    .header { background: #1a5276; color: white; padding: 16px 24px; display: flex; align-items: center; gap: 24px; }
     .header h1 { font-size: 20px; }
-    .container { max-width: 1000px; margin: 24px auto; padding: 0 24px; }
+    .header nav a { color: #aed6f1; text-decoration: none; font-size: 13px; }
+    .header nav a:hover { color: white; }
+    .container { max-width: 1200px; margin: 24px auto; padding: 0 24px; }
     .card { background: white; border-radius: 8px; padding: 24px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
     .card h2 { font-size: 16px; color: #555; margin-bottom: 12px; }
-    .stats { display: flex; gap: 16px; flex-wrap: wrap; }
-    .stat { background: #f8f9fa; border-radius: 6px; padding: 16px; text-align: center; min-width: 150px; }
-    .stat .label { font-size: 12px; color: #888; }
-    .stat .value { font-size: 28px; font-weight: 700; color: #1a5276; }
-    .endpoints { font-size: 13px; }
-    .endpoints table { width: 100%; border-collapse: collapse; }
-    .endpoints td, .endpoints th { padding: 6px 8px; border-bottom: 1px solid #eee; text-align: left; }
-    .endpoints code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px; font-size: 12px; }
-    .meta { font-size: 13px; color: #666; margin-top: 8px; }
+    .stats { display: flex; gap: 12px; flex-wrap: wrap; }
+    .stat { background: #f8f9fa; border-radius: 6px; padding: 12px; text-align: center; min-width: 120px; }
+    .stat .label { font-size: 11px; color: #888; }
+    .stat .value { font-size: 24px; font-weight: 700; color: #1a5276; }
+    .stat.warn .value { color: #c0392b; }
+    table.data { width: 100%; border-collapse: collapse; font-size: 13px; }
+    table.data th { background: #f0f0f0; padding: 8px; text-align: left; position: sticky; top: 0; }
+    table.data td { padding: 6px 8px; border-bottom: 1px solid #eee; }
+    table.data tr:hover { background: #f8f9fa; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+    .badge.shipping { background: #fadbd8; color: #c0392b; }
+    .badge.genka { background: #fdebd0; color: #d35400; }
+    .badge.sku_map { background: #d5f5e3; color: #27ae60; }
+    .btn { padding: 6px 16px; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; }
+    .btn-primary { background: #2980b9; color: white; }
+    .btn-primary:hover { background: #1a6da0; }
+    .btn-sm { padding: 3px 10px; font-size: 12px; }
+    input, select { padding: 6px 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 13px; }
+    .form-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+    .tab-nav { display: flex; gap: 4px; margin-bottom: 16px; }
+    .tab-nav button { padding: 8px 16px; border: 1px solid #ddd; background: white; cursor: pointer; border-radius: 4px 4px 0 0; }
+    .tab-nav button.active { background: #1a5276; color: white; border-color: #1a5276; }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+    .meta { font-size: 12px; color: #888; margin-top: 8px; }
+    #toast { position: fixed; bottom: 20px; right: 20px; padding: 12px 24px; background: #27ae60; color: white; border-radius: 6px; display: none; z-index: 999; }
   </style>
 </head>
 <body>
-  <div class="header"><h1>Data Warehouse API</h1></div>
+  <div class="header">
+    <h1>Data Warehouse</h1>
+    <nav>
+      <a href="#" onclick="showTab('overview')">概要</a> |
+      <a href="#" onclick="showTab('missing')">未登録 (${(missingCounts.shipping||0)+(missingCounts.genka||0)+(missingCounts.sku_map||0)})</a> |
+      <a href="#" onclick="showTab('master')">商品マスタ</a> |
+      <a href="#" onclick="showTab('sales')">売上分析</a>
+    </nav>
+  </div>
   <div class="container">
-    <div class="card">
-      <h2>DB統計</h2>
-      <div class="stats">
-        <div class="stat"><div class="label">商品マスタ</div><div class="value">${stats.raw_ne_products}</div></div>
-        <div class="stat"><div class="label">受注明細</div><div class="value">${stats.raw_ne_orders}</div></div>
-        <div class="stat"><div class="label">セット商品</div><div class="value">${stats.raw_ne_set_products}</div></div>
-        <div class="stat"><div class="label">店舗</div><div class="value">${stats.shops}</div></div>
-      </div>
-      <div class="meta">
-        ${stats.sync_meta?.products_last_import ? '商品最終同期: ' + stats.sync_meta.products_last_import : ''}
-        ${stats.order_date_range ? ' | 受注期間: ' + stats.order_date_range.min + ' ~ ' + stats.order_date_range.max : ''}
+
+    <!-- 概要タブ -->
+    <div id="tab-overview" class="tab-content active">
+      <div class="card">
+        <h2>DB統計</h2>
+        <div class="stats">
+          <div class="stat"><div class="label">NE商品</div><div class="value">${stats.raw_ne_products||0}</div></div>
+          <div class="stat"><div class="label">NE受注</div><div class="value">${(stats.raw_ne_orders||0).toLocaleString()}</div></div>
+          <div class="stat"><div class="label">Amazon注文</div><div class="value">${(stats.raw_sp_orders||0).toLocaleString()}</div></div>
+          <div class="stat"><div class="label">楽天注文</div><div class="value">${(stats.raw_rakuten_orders||0).toLocaleString()}</div></div>
+          <div class="stat"><div class="label">ロジザード</div><div class="value">${stats.raw_lz_inventory||0}</div></div>
+          <div class="stat"><div class="label">SKUマップ</div><div class="value">${stats.sku_map||0}</div></div>
+        </div>
+        <div class="stats" style="margin-top:12px">
+          <div class="stat warn"><div class="label">送料未登録</div><div class="value">${missingCounts.shipping||0}</div></div>
+          <div class="stat warn"><div class="label">原価未登録</div><div class="value">${missingCounts.genka||0}</div></div>
+          <div class="stat warn"><div class="label">SKU未登録</div><div class="value">${missingCounts.sku_map||0}</div></div>
+        </div>
+        <div class="meta">
+          NE受注: ${stats.ne_order_date_range ? stats.ne_order_date_range.min?.slice(0,10) + ' ~ ' + stats.ne_order_date_range.max?.slice(0,10) : '-'}
+          | Amazon: ${stats.sp_order_date_range ? stats.sp_order_date_range.min?.slice(0,10) + ' ~ ' + stats.sp_order_date_range.max?.slice(0,10) : '-'}
+        </div>
       </div>
     </div>
-    <div class="card endpoints">
-      <h2>APIエンドポイント</h2>
-      <table>
-        <tr><th>メソッド</th><th>パス</th><th>説明</th></tr>
-        <tr><td>GET</td><td><code>/api/stats</code></td><td>DB統計</td></tr>
-        <tr><td>GET</td><td><code>/api/products?search=&status=&limit=</code></td><td>商品検索</td></tr>
-        <tr><td>GET</td><td><code>/api/products/:code</code></td><td>商品詳細</td></tr>
-        <tr><td>GET</td><td><code>/api/orders?product=&shop=&from=&to=</code></td><td>受注検索</td></tr>
-        <tr><td>GET</td><td><code>/api/orders/daily?from=&to=&platform=</code></td><td>日別販売数集計</td></tr>
-        <tr><td>GET</td><td><code>/api/orders/summary?group_by=shop|product|month</code></td><td>サマリー</td></tr>
-        <tr><td>GET</td><td><code>/api/shops</code></td><td>店舗一覧</td></tr>
-        <tr><td>GET</td><td><code>/api/query?sql=SELECT...</code></td><td>任意SQL（SELECT限定）</td></tr>
-      </table>
+
+    <!-- 未登録タブ -->
+    <div id="tab-missing" class="tab-content">
+      <div class="card">
+        <h2>未登録データ</h2>
+        <div class="tab-nav">
+          <button class="active" onclick="loadMissing('shipping', this)">送料未登録 (${missingCounts.shipping||0})</button>
+          <button onclick="loadMissing('genka', this)">原価未登録 (${missingCounts.genka||0})</button>
+          <button onclick="loadMissing('sku_map', this)">SKU未登録 (${missingCounts.sku_map||0})</button>
+        </div>
+        <div id="missing-list"></div>
+      </div>
+    </div>
+
+    <!-- 商品マスタタブ -->
+    <div id="tab-master" class="tab-content">
+      <div class="card">
+        <h2>統合商品マスタ</h2>
+        <div class="form-row">
+          <input id="master-search" placeholder="商品コード or 商品名" style="width:300px">
+          <select id="master-status"><option value="">全て</option><option value="取扱中" selected>取扱中</option><option value="取扱中止">取扱中止</option></select>
+          <select id="master-shipping"><option value="">送料全て</option><option value="0">送料なし</option><option value="1">送料あり</option></select>
+          <button class="btn btn-primary" onclick="loadMaster()">検索</button>
+        </div>
+        <div id="master-list"></div>
+      </div>
+    </div>
+
+    <!-- 売上分析タブ -->
+    <div id="tab-sales" class="tab-content">
+      <div class="card">
+        <h2>モール別月次売上</h2>
+        <div id="sales-monthly"></div>
+      </div>
+      <div class="card">
+        <h2>商品別売上</h2>
+        <div class="form-row">
+          <input id="sales-product" placeholder="商品コード">
+          <select id="sales-platform"><option value="">全モール</option><option value="amazon">Amazon</option><option value="rakuten">楽天</option><option value="yahoo">Yahoo</option></select>
+          <input id="sales-month" placeholder="月 (例: 2026-03)" value="${new Date().toISOString().slice(0,7)}">
+          <button class="btn btn-primary" onclick="loadSales()">検索</button>
+        </div>
+        <div id="sales-list"></div>
+      </div>
     </div>
   </div>
+
+  <div id="toast"></div>
+
+  <script>
+    const BASE = location.pathname.replace(/\\/$/, '');
+    const RATES = ${JSON.stringify(shippingRates)};
+
+    function showTab(name) {
+      document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+      document.getElementById('tab-' + name).classList.add('active');
+      if (name === 'missing') loadMissing('shipping');
+      if (name === 'master') loadMaster();
+      if (name === 'sales') { loadMonthlySales(); loadSales(); }
+    }
+
+    function toast(msg) {
+      const el = document.getElementById('toast');
+      el.textContent = msg; el.style.display = 'block';
+      setTimeout(() => el.style.display = 'none', 3000);
+    }
+
+    async function api(path, opts) {
+      const res = await fetch(BASE + path, opts);
+      return res.json();
+    }
+
+    // 未登録データ
+    async function loadMissing(type, btn) {
+      if (btn) { document.querySelectorAll('.tab-nav button').forEach(b => b.classList.remove('active')); btn.classList.add('active'); }
+      const data = await api('/api/missing?type=' + type);
+      const rows = data.rows || [];
+      let html = '<table class="data"><tr><th>商品コード</th><th>商品名</th><th>売価</th><th>原価</th><th>アクション</th></tr>';
+      for (const r of rows.slice(0, 100)) {
+        html += '<tr><td>' + r.商品コード + '</td><td>' + (r.商品名||'').slice(0,40) + '</td><td>' + (r.売価||'-') + '</td><td>' + (r.原価||'-') + '</td><td>';
+        if (type === 'shipping') {
+          html += '<select id="rate-' + r.商品コード + '">' + RATES.map(rt => '<option value="' + rt.shipping_code + '|' + rt.小分類区分名称 + '|' + rt.配送関係費合計 + '">' + rt.小分類区分名称 + ' (' + rt.配送関係費合計 + '円)</option>').join('') + '</select> ';
+          html += '<button class="btn btn-sm btn-primary" onclick="registerShipping(\\'' + r.商品コード + '\\')">登録</button>';
+        } else if (type === 'genka') {
+          html += '<input id="genka-' + r.商品コード + '" placeholder="原価" style="width:80px"> ';
+          html += '<button class="btn btn-sm btn-primary" onclick="registerGenka(\\'' + r.商品コード + '\\', \\'' + (r.商品名||'').replace(/'/g,'') + '\\')">登録</button>';
+        } else if (type === 'sku_map') {
+          html += '<input id="ne-' + r.商品コード + '" placeholder="NE商品コード" style="width:120px"> ';
+          html += '<button class="btn btn-sm btn-primary" onclick="registerSkuMap(\\'' + r.商品コード + '\\', \\'' + (r.商品名||'').replace(/'/g,'') + '\\')">登録</button>';
+        }
+        html += '</td></tr>';
+      }
+      html += '</table>';
+      if (rows.length > 100) html += '<div class="meta">' + rows.length + '件中100件表示</div>';
+      document.getElementById('missing-list').innerHTML = html;
+    }
+
+    async function registerShipping(sku) {
+      const val = document.getElementById('rate-' + sku).value.split('|');
+      await api('/api/shipping', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ sku, shipping_code: val[0], ship_method: val[1], ship_cost: val[2] }) });
+      toast(sku + ' の送料を登録しました');
+      loadMissing('shipping');
+    }
+    async function registerGenka(sku, name) {
+      const genka = document.getElementById('genka-' + sku).value;
+      if (!genka) return;
+      await api('/api/genka', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ sku, genka, product_name: name }) });
+      toast(sku + ' の原価を登録しました');
+      loadMissing('genka');
+    }
+    async function registerSkuMap(sku, name) {
+      const ne = document.getElementById('ne-' + sku).value;
+      if (!ne) return;
+      await api('/api/skumap', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ seller_sku: sku, ne_code: ne, product_name: name }) });
+      toast(sku + ' のSKUマップを登録しました');
+      loadMissing('sku_map');
+    }
+
+    // 商品マスタ
+    async function loadMaster() {
+      const search = document.getElementById('master-search').value;
+      const status = document.getElementById('master-status').value;
+      const ship = document.getElementById('master-shipping').value;
+      const data = await api('/api/master?search=' + encodeURIComponent(search) + '&status=' + status + '&has_shipping=' + ship + '&limit=100');
+      let html = '<div class="meta">' + data.total + '件</div><table class="data"><tr><th>商品コード</th><th>商品名</th><th>売価</th><th>原価</th><th>ソース</th><th>送料</th><th>粗利</th><th>粗利率</th></tr>';
+      for (const r of data.rows) {
+        const profitClass = r.粗利率 !== null && r.粗利率 < 10 ? ' style="color:#c0392b;font-weight:bold"' : '';
+        html += '<tr><td>' + r.商品コード + '</td><td>' + (r.商品名||'').slice(0,35) + '</td><td>' + r.売価 + '</td><td>' + (r.原価||'-') + '</td><td>' + r.原価ソース + '</td><td>' + (r.送料||'-') + '</td><td' + profitClass + '>' + (r.粗利??'-') + '</td><td' + profitClass + '>' + (r.粗利率!==null?r.粗利率+'%':'-') + '</td></tr>';
+      }
+      html += '</table>';
+      document.getElementById('master-list').innerHTML = html;
+    }
+
+    // 売上分析
+    async function loadMonthlySales() {
+      const data = await api('/api/sales/monthly?months=6');
+      const months = [...new Set(data.map(r => r.month))].sort().reverse();
+      let html = '<table class="data"><tr><th>月</th><th>モール</th><th>データソース</th><th>数量</th><th>売上</th></tr>';
+      for (const r of data) {
+        html += '<tr><td>' + r.month + '</td><td>' + r.platform + '</td><td>' + r.data_source + '</td><td>' + (r.total_qty||0).toLocaleString() + '</td><td>' + (r.total_sales||0).toLocaleString() + '円</td></tr>';
+      }
+      html += '</table>';
+      document.getElementById('sales-monthly').innerHTML = html;
+    }
+    async function loadSales() {
+      const product = document.getElementById('sales-product').value;
+      const platform = document.getElementById('sales-platform').value;
+      const month = document.getElementById('sales-month').value;
+      const data = await api('/api/sales?product=' + encodeURIComponent(product) + '&platform=' + platform + '&month=' + month + '&limit=50');
+      let html = '<table class="data"><tr><th>商品コード</th><th>商品名</th><th>モール</th><th>数量</th><th>売上</th><th>注文数</th></tr>';
+      for (const r of data) {
+        html += '<tr><td>' + r.商品コード + '</td><td>' + (r.商品名||'').slice(0,35) + '</td><td>' + r.platform + '</td><td>' + (r.total_qty||0).toLocaleString() + '</td><td>' + (r.total_sales||0).toLocaleString() + '円</td><td>' + (r.total_orders||0) + '</td></tr>';
+      }
+      html += '</table>';
+      document.getElementById('sales-list').innerHTML = html;
+    }
+  </script>
 </body>
 </html>`;
 }

@@ -252,6 +252,135 @@ function createTables() {
   db.exec('DELETE FROM shops');
   insertDefaultShops();
 
+  // ─── VIEWs ───
+
+  // 統合商品マスタビュー（利益計算用）
+  db.exec('DROP VIEW IF EXISTS v_product_master');
+  db.exec(`
+    CREATE VIEW v_product_master AS
+    WITH
+    set_costs AS (
+      SELECT
+        s.セット商品コード as 商品コード,
+        ROUND(SUM(COALESCE(p.原価, 0) * s.数量), 2) as セット原価合計,
+        MIN(CASE WHEN p.取扱区分 = '取扱中' THEN 1 ELSE 0 END) as 全構成品取扱中,
+        MIN(COALESCE(p.消費税率, 10)) as セット消費税率
+      FROM raw_ne_set_products s
+      LEFT JOIN raw_ne_products p ON s.商品コード = p.商品コード
+      GROUP BY s.セット商品コード
+    ),
+    resolved AS (
+      SELECT
+        p.商品コード,
+        p.商品名,
+        p.売価,
+        CASE
+          WHEN sc.商品コード IS NOT NULL AND sc.全構成品取扱中 = 0 THEN '取扱中止'
+          ELSE p.取扱区分
+        END as 取扱区分,
+        p.仕入先コード,
+        CASE
+          WHEN sc.商品コード IS NOT NULL THEN sc.セット消費税率
+          ELSE p.消費税率
+        END as 消費税率,
+        p.在庫数,
+        p.引当数,
+        p.代表商品コード,
+        p.ロケーションコード,
+        p.発注ロット単位,
+        CASE
+          WHEN p.原価 > 0 THEN p.原価
+          WHEN sc.セット原価合計 IS NOT NULL THEN sc.セット原価合計
+          WHEN eg.genka IS NOT NULL THEN eg.genka
+          ELSE NULL
+        END as 原価,
+        CASE
+          WHEN p.原価 > 0 THEN 'NE'
+          WHEN sc.セット原価合計 IS NOT NULL THEN 'セット'
+          WHEN eg.genka IS NOT NULL THEN '例外'
+          ELSE '不明'
+        END as 原価ソース,
+        ps.ship_cost as 送料,
+        ps.ship_method as 配送方法,
+        ps.shipping_code as 配送コード,
+        CASE WHEN sc.商品コード IS NOT NULL THEN 1 ELSE 0 END as is_set
+      FROM raw_ne_products p
+      LEFT JOIN set_costs sc ON p.商品コード = sc.商品コード
+      LEFT JOIN exception_genka eg ON p.商品コード = eg.sku
+      LEFT JOIN product_shipping ps ON p.商品コード = ps.sku
+    )
+    SELECT
+      *,
+      CASE WHEN 原価 IS NOT NULL THEN ROUND(売価 - 原価 - COALESCE(送料, 0), 2) ELSE NULL END as 粗利,
+      CASE WHEN 売価 > 0 AND 原価 IS NOT NULL THEN ROUND((売価 - 原価 - COALESCE(送料, 0)) * 100.0 / 売価, 1) ELSE NULL END as 粗利率
+    FROM resolved
+  `);
+
+  // 商品別販売集計VIEW
+  db.exec('DROP VIEW IF EXISTS v_sales_by_product');
+  db.exec(`
+    CREATE VIEW v_sales_by_product AS
+    SELECT
+      COALESCE(sm.ne_code, o.seller_sku) as 商品コード,
+      o.title as 商品名,
+      'amazon' as platform,
+      CASE WHEN o.fulfillment_channel = 'Amazon' THEN 'FBA' ELSE 'FBM' END as channel,
+      SUBSTR(o.purchase_date, 1, 7) as month,
+      SUBSTR(o.purchase_date, 1, 10) as date,
+      SUM(o.quantity) as 数量,
+      SUM(o.item_price) as 売上金額,
+      COUNT(DISTINCT o.amazon_order_id) as 注文数,
+      'sp_api' as data_source
+    FROM raw_sp_orders o
+    LEFT JOIN sku_map sm ON o.seller_sku = sm.seller_sku
+    WHERE o.order_status NOT IN ('Cancelled')
+    GROUP BY COALESCE(sm.ne_code, o.seller_sku), o.title, platform, channel, month, date
+    UNION ALL
+    SELECT
+      r.item_number as 商品コード, r.item_name as 商品名,
+      'rakuten' as platform, 'rakuten' as channel,
+      SUBSTR(r.order_date, 1, 7) as month, SUBSTR(r.order_date, 1, 10) as date,
+      SUM(r.units) as 数量, SUM(r.price_tax_incl * r.units) as 売上金額,
+      COUNT(DISTINCT r.order_number) as 注文数, 'rakuten_api' as data_source
+    FROM raw_rakuten_orders r
+    WHERE r.delete_item_flag = 0 AND r.order_status != 900
+    GROUP BY r.item_number, r.item_name, platform, channel, month, date
+    UNION ALL
+    SELECT
+      o.商品コード, o.商品名, s.platform, s.platform as channel,
+      SUBSTR(o.受注日, 1, 7) as month, SUBSTR(o.受注日, 1, 10) as date,
+      SUM(o.受注数) as 数量, SUM(o.小計金額) as 売上金額,
+      COUNT(DISTINCT o.伝票番号) as 注文数, 'ne' as data_source
+    FROM raw_ne_orders o
+    LEFT JOIN shops s ON o.店舗コード = s.shop_code
+    WHERE o.キャンセル区分 = '有効'
+      AND COALESCE(s.platform, '') NOT IN ('_ignore', 'amazon_fbm', 'rakuten')
+    GROUP BY o.商品コード, o.商品名, s.platform, channel, month, date
+  `);
+
+  // 未登録データ検出VIEW
+  db.exec('DROP VIEW IF EXISTS v_missing_data');
+  db.exec(`
+    CREATE VIEW v_missing_data AS
+    SELECT 'shipping' as missing_type, p.商品コード, p.商品名, p.売価, p.原価, p.取扱区分, NULL as last_sold
+    FROM raw_ne_products p
+    LEFT JOIN product_shipping ps ON p.商品コード = ps.sku
+    WHERE p.取扱区分 = '取扱中' AND ps.sku IS NULL
+    UNION ALL
+    SELECT 'genka' as missing_type, p.商品コード, p.商品名, p.売価, p.原価, p.取扱区分, NULL as last_sold
+    FROM raw_ne_products p
+    LEFT JOIN exception_genka eg ON p.商品コード = eg.sku
+    LEFT JOIN raw_ne_set_products sp ON p.商品コード = sp.セット商品コード
+    WHERE p.取扱区分 = '取扱中' AND (p.原価 IS NULL OR p.原価 = 0) AND eg.sku IS NULL AND sp.セット商品コード IS NULL
+    UNION ALL
+    SELECT DISTINCT 'sku_map' as missing_type, o.seller_sku as 商品コード, o.title as 商品名,
+      NULL as 売価, NULL as 原価, NULL as 取扱区分, MAX(SUBSTR(o.purchase_date, 1, 10)) as last_sold
+    FROM raw_sp_orders o
+    LEFT JOIN sku_map sm ON o.seller_sku = sm.seller_sku
+    WHERE sm.seller_sku IS NULL AND o.order_status NOT IN ('Cancelled')
+    GROUP BY o.seller_sku, o.title
+  `);
+
   // 12. 同期メタデータ
   db.exec(`CREATE TABLE IF NOT EXISTS sync_meta (
     key                 TEXT PRIMARY KEY,
