@@ -371,31 +371,71 @@ async function runPeriod(startDate, endDate) {
 async function runBackfill(startFrom) {
   console.log(`[楽天] バックフィル開始: ${startFrom} 〜 現在`);
 
+  // 既存の楽天データをクリア（再取得のため）
+  const db = getDB();
+  db.exec('DELETE FROM raw_rakuten_orders');
+  db.exec('DELETE FROM raw_rakuten_orders_log');
+  console.log('[楽天] 既存データクリア完了');
+
+  const queue = []; // 取得待ちの期間キュー
   const start = new Date(startFrom);
   const today = new Date();
   let current = new Date(start);
 
+  // 30日チャンクでキューを作成
   while (current < today) {
     const chunkStart = current.toISOString().slice(0, 10);
     const chunkEndDate = new Date(Math.min(
-      current.getTime() + 62 * 24 * 60 * 60 * 1000, // 63日
+      current.getTime() + 29 * 24 * 60 * 60 * 1000, // 30日
       today.getTime()
     ));
     const chunkEnd = chunkEndDate.toISOString().slice(0, 10);
-    const batchId = `backfill_rakuten_${chunkStart}_${chunkEnd}`;
-
-    await fetchAndImport(chunkStart, chunkEnd, batchId);
-
+    queue.push({ start: chunkStart, end: chunkEnd });
     current = new Date(chunkEndDate.getTime() + 1 * 24 * 60 * 60 * 1000);
+  }
 
-    if (current < today) {
-      console.log('[楽天] 30秒待機（レート制限回避）...');
-      await sleep(30000);
+  console.log(`[楽天] ${queue.length}チャンク予定`);
+
+  for (let i = 0; i < queue.length; i++) {
+    const chunk = queue[i];
+    await fetchChunkWithSplit(chunk.start, chunk.end, i + 1, queue.length);
+
+    if (i + 1 < queue.length) {
+      console.log('[楽天] 10秒待機...');
+      await sleep(10000);
     }
   }
 
   updateSyncMeta('rakuten_last_backfill', now());
   console.log('[楽天] バックフィル完了');
+}
+
+// 15,000件超過時に期間を半分に自動分割
+async function fetchChunkWithSplit(startDate, endDate, chunkNum, totalChunks) {
+  console.log(`[楽天] チャンク ${chunkNum}/${totalChunks}: ${startDate} 〜 ${endDate}`);
+
+  // まずsearchOrderで件数だけ確認
+  const check = await searchOrders(startDate, endDate, 1);
+
+  if (check.totalRecords > 14000) {
+    // 14,000件超 → 期間を半分に分割して再帰
+    const startMs = new Date(startDate).getTime();
+    const endMs = new Date(endDate).getTime();
+    const midMs = startMs + Math.floor((endMs - startMs) / 2);
+    const midDate = new Date(midMs).toISOString().slice(0, 10);
+    const midNextDate = new Date(midMs + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+    console.log(`[楽天] ${check.totalRecords}件 > 14,000 → 分割: ${startDate}~${midDate} + ${midNextDate}~${endDate}`);
+    await sleep(5000);
+    await fetchChunkWithSplit(startDate, midDate, chunkNum, totalChunks);
+    await sleep(5000);
+    await fetchChunkWithSplit(midNextDate, endDate, chunkNum, totalChunks);
+    return;
+  }
+
+  // 14,000件以下 → 通常取得
+  const batchId = `backfill_rakuten_${startDate}_${endDate}`;
+  await fetchAndImport(startDate, endDate, batchId);
 }
 
 main().catch(e => {
