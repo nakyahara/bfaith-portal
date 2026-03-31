@@ -60,28 +60,12 @@ router.use(ensureDB);
 
 function execQuery(sql, params = []) {
   const db = getDB();
-  const result = db.exec(sql, params);
-  if (!result[0]) return [];
-
-  const cols = result[0].columns;
-  return result[0].values.map(row => {
-    const obj = {};
-    cols.forEach((c, i) => obj[c] = row[i]);
-    return obj;
-  });
+  return db.prepare(sql).all(...params);
 }
 
 function preparedQuery(sql, params = []) {
   const db = getDB();
-  const stmt = db.prepare(sql);
-  if (params.length > 0) stmt.bind(params);
-
-  const rows = [];
-  while (stmt.step()) {
-    rows.push(stmt.getAsObject());
-  }
-  stmt.free();
-  return rows;
+  return db.prepare(sql).all(...params);
 }
 
 // ─── GET /api/stats ───
