@@ -243,6 +243,7 @@ router.get('/api/orders/daily', (req, res) => {
     FROM raw_ne_orders o
     LEFT JOIN shops s ON o.店舗コード = s.shop_code
     WHERE o.キャンセル区分 = '有効'
+      AND COALESCE(s.platform, '') != '_ignore'
   `;
   const params = [];
 
@@ -282,20 +283,24 @@ router.get('/api/orders/daily', (req, res) => {
 router.get('/api/orders/summary', (req, res) => {
   const { from, to, group_by = 'shop' } = req.query;
 
-  let dateCond = "WHERE o.キャンセル区分 = '有効'";
+  let baseCond = "WHERE o.キャンセル区分 = '有効'";
   const params = [];
 
   if (from) {
-    dateCond += ' AND o.受注日 >= ?';
+    baseCond += ' AND o.受注日 >= ?';
     params.push(from);
   }
   if (to) {
-    dateCond += ' AND o.受注日 <= ?';
+    baseCond += ' AND o.受注日 <= ?';
     params.push(to);
   }
 
+  // shops JOINがあるクエリでは _ignore を除外
+  const dateCondWithIgnore = baseCond + " AND COALESCE(s.platform, '') != '_ignore'";
+
   let sql;
   if (group_by === 'product') {
+    // product集計はshops JOINなし → _ignore除外は店舗コードで直接指定
     sql = `
       SELECT
         o.商品コード,
@@ -305,7 +310,7 @@ router.get('/api/orders/summary', (req, res) => {
         MIN(DATE(o.受注日)) as first_order,
         MAX(DATE(o.受注日)) as last_order
       FROM raw_ne_orders o
-      ${dateCond}
+      ${baseCond} AND o.店舗コード NOT IN ('7', '15')
       GROUP BY o.商品コード
       ORDER BY total_units DESC
     `;
@@ -318,7 +323,7 @@ router.get('/api/orders/summary', (req, res) => {
         COUNT(DISTINCT o.伝票番号) as order_count
       FROM raw_ne_orders o
       LEFT JOIN shops s ON o.店舗コード = s.shop_code
-      ${dateCond}
+      ${dateCondWithIgnore}
       GROUP BY month, s.platform
       ORDER BY month DESC, total_units DESC
     `;
@@ -333,7 +338,7 @@ router.get('/api/orders/summary', (req, res) => {
         COUNT(DISTINCT o.伝票番号) as order_count
       FROM raw_ne_orders o
       LEFT JOIN shops s ON o.店舗コード = s.shop_code
-      ${dateCond}
+      ${dateCondWithIgnore}
       GROUP BY o.店舗コード
       ORDER BY total_units DESC
     `;

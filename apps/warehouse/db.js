@@ -125,11 +125,9 @@ function createTables() {
     platform            TEXT
   )`);
 
-  // 初期データ投入（店舗マスタ）
-  const shopCount = db.exec('SELECT COUNT(*) FROM shops');
-  if (shopCount[0]?.values[0][0] === 0) {
-    insertDefaultShops();
-  }
+  // 店舗マスタは毎回洗い替え（マスタ更新を確実に反映）
+  db.run('DELETE FROM shops');
+  insertDefaultShops();
 
   // 同期メタデータ
   db.run(`CREATE TABLE IF NOT EXISTS sync_meta (
@@ -141,19 +139,28 @@ function createTables() {
 
 function insertDefaultShops() {
   // NEの店舗コード一覧（設計書より）
+  // NE店舗コード一覧（2026-03-31確認）
+  // 集計時の注意:
+  //   - コード7（ライジングAmazon）: 集計対象外（使用していない）
+  //   - コード15（FBA納品）: 集計対象外（FBA納品プラン用の内部伝票。実売上ではない）
+  //   - コード4（Amazon店）: FBM（自社出荷）のみ。FBA販売はNEを経由しないためSP-APIから別途取得が必要
+  //   - コード11/14（LINEギフト）: 途中で切替があり2つ存在。現在はどちらか片方のみ使用
   const shops = [
-    ['1', 'Amazon', 'amazon'],
-    ['2', 'Amazon FBA', 'amazon'],
-    ['3', '楽天市場', 'rakuten'],
-    ['4', 'Yahoo!ショッピング', 'yahoo'],
-    ['5', 'au PAY マーケット', 'aupay'],
-    ['6', 'Qoo10', 'qoo10'],
-    ['7', 'メルカリShops', 'mercari'],
-    ['8', 'LINEギフト', 'linegift'],
-    ['9', 'ヤフオク', 'yahoo_auction'],
+    ['1', '雑貨イズム楽天市場店', 'rakuten'],
+    ['2', '雑貨イズムYahoo!店', 'yahoo'],
+    ['3', 'ヤフオク店', 'yahoo_auction'],
+    ['4', '雑貨イズムAmazon店', 'amazon_fbm'],
+    ['5', '雑貨イズムauPay!店', 'aupay'],
+    ['6', '雑貨イズムQoo10店', 'qoo10'],
+    ['7', 'ライジングAmazon', '_ignore'],
+    ['8', '雑貨イズムメルカリshops', 'mercari'],
+    ['9', 'ラクマ', 'rakuma'],
     ['10', '卸', 'wholesale'],
-    ['11', 'Dショッピング', 'dshopping'],
-    ['14', '楽天2号店', 'rakuten'],
+    ['11', 'LINEギフト', 'linegift'],
+    ['12', '雑貨イズムMy Smart Store店', 'mysmartstore'],
+    ['13', '雑貨イズムdショッピング', 'dshopping'],
+    ['14', 'LINE ギフト', 'linegift'],
+    ['15', 'FBA納品', '_ignore'],
   ];
 
   const stmt = db.prepare('INSERT OR IGNORE INTO shops (shop_code, shop_name, platform) VALUES (?, ?, ?)');
