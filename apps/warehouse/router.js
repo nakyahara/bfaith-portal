@@ -551,15 +551,11 @@ router.get('/', (req, res) => {
 });
 
 function renderDashboard(stats) {
-  // 未登録データ件数
-  const db = getDB();
-  let missingCounts = {};
-  try {
-    const rows = db.prepare('SELECT missing_type, COUNT(*) as cnt FROM v_missing_data GROUP BY missing_type').all();
-    for (const r of rows) missingCounts[r.missing_type] = r.cnt;
-  } catch {}
+  // 未登録データ件数は重いのでダッシュボード初期表示では取得しない（JSで非同期取得）
+  const missingCounts = {};
 
-  // 配送区分一覧（フォーム用）
+  // 配送区分一覧（フォーム用、軽い）
+  const db = getDB();
   let shippingRates = [];
   try { shippingRates = db.prepare('SELECT shipping_code, 小分類区分名称, 配送関係費合計 FROM shipping_rates ORDER BY shipping_code').all(); } catch {}
 
@@ -612,7 +608,7 @@ function renderDashboard(stats) {
     <h1>Data Warehouse</h1>
     <nav>
       <a href="#" onclick="showTab('overview')">概要</a> |
-      <a href="#" onclick="showTab('missing')">未登録 (${(missingCounts.shipping||0)+(missingCounts.genka||0)+(missingCounts.sku_map||0)})</a> |
+      <a href="#" onclick="showTab('missing')">未登録 (<span id="nav-missing-total">...</span>)</a> |
       <a href="#" onclick="showTab('master')">商品マスタ</a> |
       <a href="#" onclick="showTab('sales')">売上分析</a>
     </nav>
@@ -632,9 +628,9 @@ function renderDashboard(stats) {
           <div class="stat"><div class="label">SKUマップ</div><div class="value">${stats.sku_map||0}</div></div>
         </div>
         <div class="stats" style="margin-top:12px">
-          <div class="stat warn"><div class="label">送料未登録</div><div class="value">${missingCounts.shipping||0}</div></div>
-          <div class="stat warn"><div class="label">原価未登録</div><div class="value">${missingCounts.genka||0}</div></div>
-          <div class="stat warn"><div class="label">SKU未登録</div><div class="value">${missingCounts.sku_map||0}</div></div>
+          <div class="stat warn"><div class="label">送料未登録</div><div class="value" id="missing-shipping">...</div></div>
+          <div class="stat warn"><div class="label">原価未登録</div><div class="value" id="missing-genka">...</div></div>
+          <div class="stat warn"><div class="label">SKU未登録</div><div class="value" id="missing-sku">...</div></div>
         </div>
         <div class="meta">
           NE受注: ${stats.ne_order_date_range ? stats.ne_order_date_range.min?.slice(0,10) + ' ~ ' + stats.ne_order_date_range.max?.slice(0,10) : '-'}
@@ -694,6 +690,19 @@ function renderDashboard(stats) {
   <script>
     const BASE = location.pathname.replace(/\\/$/, '');
     const RATES = ${JSON.stringify(shippingRates)};
+
+    // 初期表示時に未登録件数を非同期取得
+    (async function() {
+      try {
+        const data = await api('/api/missing');
+        const counts = {};
+        for (const s of (data.summary || [])) counts[s.missing_type] = s.cnt;
+        document.getElementById('missing-shipping').textContent = counts.shipping || 0;
+        document.getElementById('missing-genka').textContent = counts.genka || 0;
+        document.getElementById('missing-sku').textContent = counts.sku_map || 0;
+        document.getElementById('nav-missing-total').textContent = (counts.shipping||0) + (counts.genka||0) + (counts.sku_map||0);
+      } catch {}
+    })();
 
     function showTab(name) {
       document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
