@@ -859,10 +859,10 @@ function renderDashboard(stats) {
     <div id="tab-missing" class="tab-content">
       <div class="card">
         <h2>未登録データ</h2>
-        <div class="tab-nav">
-          <button class="active" onclick="loadMissing('shipping', this)">送料未登録 (${missingCounts.shipping||0})</button>
-          <button onclick="loadMissing('genka', this)">原価未登録 (${missingCounts.genka||0})</button>
-          <button onclick="loadMissing('sku_map', this)">SKU未登録 (${missingCounts.sku_map||0})</button>
+        <div class="tab-nav" id="missing-tabs">
+          <button class="active" onclick="loadMissing('shipping', this)">送料未登録 (<span id="mc-shipping">...</span>)</button>
+          <button onclick="loadMissing('genka', this)">原価未登録 (<span id="mc-genka">...</span>)</button>
+          <button onclick="loadMissing('sku_map', this)">SKU未登録 (<span id="mc-sku">...</span>)</button>
         </div>
         <div id="missing-list"></div>
       </div>
@@ -1030,6 +1030,15 @@ function renderDashboard(stats) {
     async function loadMissing(type, btn) {
       currentMissingType = type;
       if (btn) { document.querySelectorAll('#tab-missing .tab-nav button').forEach(b => b.classList.remove('active')); btn.classList.add('active'); }
+      // タブ件数を非同期更新（全type分のsummary取得）
+      api('/api/missing/prioritized').then(all => {
+        if (all.summary) {
+          const s = all.summary;
+          const el1 = document.getElementById('mc-shipping'); if (el1) el1.textContent = s.shipping || 0;
+          const el2 = document.getElementById('mc-genka'); if (el2) el2.textContent = s.genka || 0;
+          const el3 = document.getElementById('mc-sku'); if (el3) el3.textContent = s.sku_map || 0;
+        }
+      }).catch(() => {});
       const data = await api('/api/missing/prioritized?type=' + type);
       const rows = data.rows || [];
       let html = '<table class="data"><tr><th>優先度</th><th>商品コード</th><th>商品名</th><th>売価</th><th>7日/30日</th><th>最終販売</th><th>アクション</th></tr>';
