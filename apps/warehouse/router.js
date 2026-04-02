@@ -913,10 +913,11 @@ function renderDashboard(stats) {
 
   <script>
     const BASE = location.pathname.replace(/\\/$/, '');
-    const RATES = ${JSON.stringify(shippingRates)};
+    let RATES = [];
 
-    // 初期表示時に未登録件数を非同期取得
+    // 初期表示時にRATES + 未登録件数を非同期取得
     (async function() {
+      try { RATES = await api('/api/shipping_rates'); } catch {}
       try {
         const data = await api('/api/missing');
         const counts = {};
@@ -950,55 +951,93 @@ function renderDashboard(stats) {
       return res.json();
     }
 
-    // 未登録データ（売上実績で優先順位付け）
+    // イベント委譲（data属性でパラメータを渡す。onclickの文字列エスケープ問題を根本解決）
+    document.addEventListener('click', async (ev) => {
+      const btn = ev.target.closest('[data-action]');
+      if (!btn) return;
+      const action = btn.dataset.action;
+      const sku = btn.dataset.sku || '';
+      const name = btn.dataset.name || '';
+      const type = btn.dataset.type || '';
+
+      if (action === 'reg-shipping') {
+        const sel = btn.closest('tr')?.querySelector('select');
+        if (!sel) return;
+        const val = sel.value.split('|');
+        await api('/api/shipping', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ sku, shipping_code: val[0], ship_method: val[1], ship_cost: val[2] }) });
+        toast(sku + ' の送料を登録しました');
+        loadMissing(currentMissingType);
+      } else if (action === 'reg-genka') {
+        const inp = btn.closest('tr')?.querySelector('input');
+        if (!inp || !inp.value) return;
+        await api('/api/genka', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ sku, genka: inp.value, product_name: name }) });
+        toast(sku + ' の原価を登録しました');
+        loadMissing(currentMissingType);
+      } else if (action === 'reg-skumap') {
+        const inp = btn.closest('tr')?.querySelector('input');
+        if (!inp || !inp.value) return;
+        await api('/api/skumap', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ seller_sku: sku, ne_code: inp.value, product_name: name }) });
+        toast(sku + ' のSKUマップを登録しました');
+        loadMissing(currentMissingType);
+      } else if (action === 'update-shipping') {
+        const sel = btn.closest('tr')?.querySelector('select');
+        if (!sel) return;
+        const val = sel.value.split('|');
+        await api('/api/shipping', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ sku, shipping_code: val[0], ship_method: val[1], ship_cost: val[2] }) });
+        toast(sku + ' の送料を更新しました');
+        loadManage(currentManageType);
+      } else if (action === 'update-genka') {
+        const inp = btn.closest('tr')?.querySelector('input');
+        if (!inp) return;
+        await api('/api/genka', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ sku, genka: inp.value, product_name: name }) });
+        toast(sku + ' の原価を更新しました');
+        loadManage(currentManageType);
+      } else if (action === 'update-skumap') {
+        const inputs = btn.closest('tr')?.querySelectorAll('input');
+        if (!inputs || inputs.length < 2) return;
+        await api('/api/skumap', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ seller_sku: sku, ne_code: inputs[0].value, product_name: name, quantity: inputs[1].value }) });
+        toast(sku + ' のSKUマップを更新しました');
+        loadManage(currentManageType);
+      } else if (action === 'delete') {
+        if (!confirm(sku + ' を削除しますか？')) return;
+        const endpoint = type === 'shipping' ? '/api/shipping/' : type === 'genka' ? '/api/genka/' : '/api/skumap/';
+        await api(endpoint + encodeURIComponent(sku), { method: 'DELETE' });
+        toast(sku + ' を削除しました');
+        loadManage(currentManageType);
+      }
+    });
+
+    let currentMissingType = 'shipping';
+
+    // 未登録データ
     async function loadMissing(type, btn) {
+      currentMissingType = type;
       if (btn) { document.querySelectorAll('#tab-missing .tab-nav button').forEach(b => b.classList.remove('active')); btn.classList.add('active'); }
       const data = await api('/api/missing/prioritized?type=' + type);
       const rows = data.rows || [];
-      let html = '<table class="data"><tr><th>優先度</th><th>商品コード</th><th>商品名</th><th>売価</th><th>7日</th><th>30日</th><th>最終販売</th><th>アクション</th></tr>';
+      let html = '<table class="data"><tr><th>優先度</th><th>商品コード</th><th>商品名</th><th>売価</th><th>7日/30日</th><th>最終販売</th><th>アクション</th></tr>';
       for (const r of rows.slice(0, 100)) {
-        const priorityBadge = r.priority === 'A_7日以内' ? '<span style="background:#e74c3c;color:white;padding:2px 6px;border-radius:3px;font-size:11px">7日</span>'
+        const pb = r.priority === 'A_7日以内' ? '<span style="background:#e74c3c;color:white;padding:2px 6px;border-radius:3px;font-size:11px">7日</span>'
           : r.priority === 'B_30日以内' ? '<span style="background:#f39c12;color:white;padding:2px 6px;border-radius:3px;font-size:11px">30日</span>'
           : '<span style="color:#aaa;font-size:11px">-</span>';
-        const salesBadge = (r.sales_7d || 0) + '/' + (r.sales_30d || 0);
-        const esc = (s) => (s||'').replace(/'/g, "\\'").replace(/"/g, '&quot;');
-        html += '<tr><td>' + priorityBadge + '</td><td>' + r.商品コード + '</td><td>' + (r.商品名||'').slice(0,30) + '</td><td>' + (r.売価||'-') + '</td><td>' + salesBadge + '</td><td>' + (r.last_sold||'-') + '</td><td>';
+        const sb = (r.sales_7d||0) + '/' + (r.sales_30d||0);
+        const he = (s) => (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;');
+        html += '<tr><td>' + pb + '</td><td>' + he(r.商品コード) + '</td><td>' + he((r.商品名||'').slice(0,30)) + '</td><td>' + (r.売価||'-') + '</td><td>' + sb + '</td><td>' + (r.last_sold||'-') + '</td><td>';
         if (type === 'shipping') {
-          html += '<select id="rate-' + r.商品コード + '">' + RATES.map(rt => '<option value="' + rt.shipping_code + '|' + rt.小分類区分名称 + '|' + rt.配送関係費合計 + '">' + rt.小分類区分名称 + ' (' + rt.配送関係費合計 + '円)</option>').join('') + '</select> ';
-          html += '<button class="btn btn-sm btn-primary" onclick="registerShipping(\'' + esc(r.商品コード) + '\')">登録</button>';
+          html += '<select>' + RATES.map(rt => '<option value="' + rt.shipping_code + '|' + he(rt.小分類区分名称||'') + '|' + rt.配送関係費合計 + '">' + (rt.小分類区分名称||rt.shipping_code) + ' (' + rt.配送関係費合計 + '円)</option>').join('') + '</select> ';
+          html += '<button class="btn btn-sm btn-primary" data-action="reg-shipping" data-sku="' + he(r.商品コード) + '">登録</button>';
         } else if (type === 'genka') {
-          html += '<input id="genka-' + r.商品コード + '" placeholder="原価" style="width:80px"> ';
-          html += '<button class="btn btn-sm btn-primary" onclick="registerGenka(\'' + esc(r.商品コード) + '\', \'' + esc(r.商品名) + '\')">登録</button>';
+          html += '<input placeholder="原価" style="width:80px"> ';
+          html += '<button class="btn btn-sm btn-primary" data-action="reg-genka" data-sku="' + he(r.商品コード) + '" data-name="' + he(r.商品名) + '">登録</button>';
         } else if (type === 'sku_map') {
-          html += '<input id="ne-' + r.商品コード + '" placeholder="NE商品コード" style="width:120px"> ';
-          html += '<button class="btn btn-sm btn-primary" onclick="registerSkuMap(\'' + esc(r.商品コード) + '\', \'' + esc(r.商品名) + '\')">登録</button>';
+          html += '<input placeholder="NE商品コード" style="width:120px"> ';
+          html += '<button class="btn btn-sm btn-primary" data-action="reg-skumap" data-sku="' + he(r.商品コード) + '" data-name="' + he(r.商品名) + '">登録</button>';
         }
         html += '</td></tr>';
       }
       html += '</table>';
       if (rows.length > 100) html += '<div class="meta">' + rows.length + '件中100件表示</div>';
       document.getElementById('missing-list').innerHTML = html;
-    }
-
-    async function registerShipping(sku) {
-      const val = document.getElementById('rate-' + sku).value.split('|');
-      await api('/api/shipping', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ sku, shipping_code: val[0], ship_method: val[1], ship_cost: val[2] }) });
-      toast(sku + ' の送料を登録しました');
-      loadMissing('shipping');
-    }
-    async function registerGenka(sku, name) {
-      const genka = document.getElementById('genka-' + sku).value;
-      if (!genka) return;
-      await api('/api/genka', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ sku, genka, product_name: name }) });
-      toast(sku + ' の原価を登録しました');
-      loadMissing('genka');
-    }
-    async function registerSkuMap(sku, name) {
-      const ne = document.getElementById('ne-' + sku).value;
-      if (!ne) return;
-      await api('/api/skumap', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ seller_sku: sku, ne_code: ne, product_name: name }) });
-      toast(sku + ' のSKUマップを登録しました');
-      loadMissing('sku_map');
     }
 
     // マスタ管理（CRUD）
@@ -1009,61 +1048,35 @@ function renderDashboard(stats) {
       const endpoint = type === 'shipping' ? '/api/shipping/list' : type === 'genka' ? '/api/genka/list' : '/api/skumap/list';
       const data = await api(endpoint + '?search=' + encodeURIComponent(search) + '&limit=100');
       const rows = data.rows || [];
+      const he = (s) => (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;');
       let html = '<div class="meta">' + (data.total||0) + '件</div>';
 
       if (type === 'shipping') {
         html += '<table class="data"><tr><th>商品コード</th><th>商品名</th><th>配送方法</th><th>送料</th><th>操作</th></tr>';
         for (const r of rows) {
-          html += '<tr id="row-' + r.sku + '"><td>' + r.sku + '</td><td>' + (r.product_name||'').slice(0,30) + '</td>';
-          html += '<td><select id="edit-method-' + r.sku + '">' + RATES.map(rt => '<option value="' + rt.shipping_code + '|' + rt.小分類区分名称 + '|' + rt.配送関係費合計 + '"' + (rt.配送関係費合計 == r.ship_cost ? ' selected' : '') + '>' + rt.小分類区分名称 + ' (' + rt.配送関係費合計 + '円)</option>').join('') + '</select></td>';
+          html += '<tr><td>' + he(r.sku) + '</td><td>' + he((r.product_name||'').slice(0,30)) + '</td>';
+          html += '<td><select>' + RATES.map(rt => '<option value="' + rt.shipping_code + '|' + he(rt.小分類区分名称||'') + '|' + rt.配送関係費合計 + '"' + (rt.配送関係費合計 == r.ship_cost ? ' selected' : '') + '>' + (rt.小分類区分名称||rt.shipping_code) + ' (' + rt.配送関係費合計 + '円)</option>').join('') + '</select></td>';
           html += '<td>' + r.ship_cost + '円</td>';
-          html += '<td><button class="btn btn-sm btn-primary" onclick="updateShipping(\'' + r.sku + '\')">更新</button> <button class="btn btn-sm" style="background:#e74c3c;color:white" onclick="deleteItem(\'shipping\',\'' + r.sku + '\')">削除</button></td></tr>';
+          html += '<td><button class="btn btn-sm btn-primary" data-action="update-shipping" data-sku="' + he(r.sku) + '">更新</button> <button class="btn btn-sm" style="background:#e74c3c;color:white" data-action="delete" data-type="shipping" data-sku="' + he(r.sku) + '">削除</button></td></tr>';
         }
       } else if (type === 'genka') {
         html += '<table class="data"><tr><th>SKU</th><th>商品名</th><th>原価</th><th>操作</th></tr>';
         for (const r of rows) {
-          html += '<tr><td>' + r.sku + '</td><td>' + (r.商品名||'').slice(0,30) + '</td>';
-          html += '<td><input id="edit-genka-' + r.sku + '" value="' + r.genka + '" style="width:80px"></td>';
-          html += '<td><button class="btn btn-sm btn-primary" onclick="updateGenka(\'' + r.sku + '\', \'' + (r.商品名||'').replace(/'/g,'') + '\')">更新</button> <button class="btn btn-sm" style="background:#e74c3c;color:white" onclick="deleteItem(\'genka\',\'' + r.sku + '\')">削除</button></td></tr>';
+          html += '<tr><td>' + he(r.sku) + '</td><td>' + he((r.商品名||'').slice(0,30)) + '</td>';
+          html += '<td><input value="' + r.genka + '" style="width:80px"></td>';
+          html += '<td><button class="btn btn-sm btn-primary" data-action="update-genka" data-sku="' + he(r.sku) + '" data-name="' + he(r.商品名) + '">更新</button> <button class="btn btn-sm" style="background:#e74c3c;color:white" data-action="delete" data-type="genka" data-sku="' + he(r.sku) + '">削除</button></td></tr>';
         }
       } else if (type === 'skumap') {
         html += '<table class="data"><tr><th>Amazon SKU</th><th>ASIN</th><th>商品名</th><th>NE商品コード</th><th>数量</th><th>操作</th></tr>';
         for (const r of rows) {
-          html += '<tr><td>' + r.seller_sku + '</td><td>' + (r.asin||'') + '</td><td>' + (r.商品名||'').slice(0,25) + '</td>';
-          html += '<td><input id="edit-ne-' + r.seller_sku + '" value="' + (r.ne_code||'') + '" style="width:120px"></td>';
-          html += '<td><input id="edit-qty-' + r.seller_sku + '" value="' + (r.数量||1) + '" style="width:40px"></td>';
-          html += '<td><button class="btn btn-sm btn-primary" onclick="updateSkuMap(\'' + r.seller_sku + '\', \'' + (r.商品名||'').replace(/'/g,'') + '\')">更新</button> <button class="btn btn-sm" style="background:#e74c3c;color:white" onclick="deleteItem(\'skumap\',\'' + r.seller_sku + '\')">削除</button></td></tr>';
+          html += '<tr><td>' + he(r.seller_sku) + '</td><td>' + he(r.asin||'') + '</td><td>' + he((r.商品名||'').slice(0,25)) + '</td>';
+          html += '<td><input value="' + he(r.ne_code||'') + '" style="width:120px"></td>';
+          html += '<td><input value="' + (r.数量||1) + '" style="width:40px"></td>';
+          html += '<td><button class="btn btn-sm btn-primary" data-action="update-skumap" data-sku="' + he(r.seller_sku) + '" data-name="' + he(r.商品名) + '">更新</button> <button class="btn btn-sm" style="background:#e74c3c;color:white" data-action="delete" data-type="skumap" data-sku="' + he(r.seller_sku) + '">削除</button></td></tr>';
         }
       }
       html += '</table>';
       document.getElementById('manage-list').innerHTML = html;
-    }
-
-    async function updateShipping(sku) {
-      const val = document.getElementById('edit-method-' + sku).value.split('|');
-      await api('/api/shipping', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ sku, shipping_code: val[0], ship_method: val[1], ship_cost: val[2] }) });
-      toast(sku + ' の送料を更新しました');
-      loadManage(currentManageType);
-    }
-    async function updateGenka(sku, name) {
-      const genka = document.getElementById('edit-genka-' + sku).value;
-      await api('/api/genka', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ sku, genka, product_name: name }) });
-      toast(sku + ' の原価を更新しました');
-      loadManage(currentManageType);
-    }
-    async function updateSkuMap(sku, name) {
-      const ne = document.getElementById('edit-ne-' + sku).value;
-      const qty = document.getElementById('edit-qty-' + sku).value;
-      await api('/api/skumap', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ seller_sku: sku, ne_code: ne, product_name: name, quantity: qty }) });
-      toast(sku + ' のSKUマップを更新しました');
-      loadManage(currentManageType);
-    }
-    async function deleteItem(type, sku) {
-      if (!confirm(sku + ' を削除しますか？')) return;
-      const endpoint = type === 'shipping' ? '/api/shipping/' : type === 'genka' ? '/api/genka/' : '/api/skumap/';
-      await api(endpoint + encodeURIComponent(sku), { method: 'DELETE' });
-      toast(sku + ' を削除しました');
-      loadManage(currentManageType);
     }
 
     // 商品マスタ
