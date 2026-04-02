@@ -268,7 +268,7 @@ function createTables() {
         MIN(CASE WHEN p.取扱区分 = '取扱中' THEN 1 ELSE 0 END) as 全構成品取扱中,
         MIN(COALESCE(p.消費税率, 10)) as セット消費税率
       FROM raw_ne_set_products s
-      LEFT JOIN raw_ne_products p ON s.商品コード = p.商品コード
+      LEFT JOIN raw_ne_products p ON s.商品コード = p.商品コード COLLATE NOCASE
       GROUP BY s.セット商品コード
     ),
     resolved AS (
@@ -307,9 +307,9 @@ function createTables() {
         ps.shipping_code as 配送コード,
         CASE WHEN sc.商品コード IS NOT NULL THEN 1 ELSE 0 END as is_set
       FROM raw_ne_products p
-      LEFT JOIN set_costs sc ON p.商品コード = sc.商品コード
-      LEFT JOIN exception_genka eg ON p.商品コード = eg.sku
-      LEFT JOIN product_shipping ps ON p.商品コード = ps.sku
+      LEFT JOIN set_costs sc ON p.商品コード = sc.商品コード COLLATE NOCASE
+      LEFT JOIN exception_genka eg ON p.商品コード = eg.sku COLLATE NOCASE
+      LEFT JOIN product_shipping ps ON p.商品コード = ps.sku COLLATE NOCASE
     )
     SELECT
       *,
@@ -334,7 +334,7 @@ function createTables() {
       COUNT(DISTINCT o.amazon_order_id) as 注文数,
       'sp_api' as data_source
     FROM raw_sp_orders o
-    LEFT JOIN sku_map sm ON o.seller_sku = sm.seller_sku
+    LEFT JOIN sku_map sm ON o.seller_sku = sm.seller_sku COLLATE NOCASE
     WHERE o.order_status NOT IN ('Cancelled')
     GROUP BY COALESCE(sm.ne_code, o.seller_sku), o.title, platform, channel, month, date
     UNION ALL
@@ -366,19 +366,19 @@ function createTables() {
     CREATE VIEW v_missing_data AS
     SELECT 'shipping' as missing_type, p.商品コード, p.商品名, p.売価, p.原価, p.取扱区分, NULL as last_sold
     FROM raw_ne_products p
-    LEFT JOIN product_shipping ps ON p.商品コード = ps.sku
+    LEFT JOIN product_shipping ps ON p.商品コード = ps.sku COLLATE NOCASE
     WHERE p.取扱区分 = '取扱中' AND ps.sku IS NULL
     UNION ALL
     SELECT 'genka' as missing_type, p.商品コード, p.商品名, p.売価, p.原価, p.取扱区分, NULL as last_sold
     FROM raw_ne_products p
-    LEFT JOIN exception_genka eg ON p.商品コード = eg.sku
+    LEFT JOIN exception_genka eg ON p.商品コード = eg.sku COLLATE NOCASE
     LEFT JOIN raw_ne_set_products sp ON p.商品コード = sp.セット商品コード
     WHERE p.取扱区分 = '取扱中' AND (p.原価 IS NULL OR p.原価 = 0) AND eg.sku IS NULL AND sp.セット商品コード IS NULL
     UNION ALL
     SELECT DISTINCT 'sku_map' as missing_type, o.seller_sku as 商品コード, o.title as 商品名,
       NULL as 売価, NULL as 原価, NULL as 取扱区分, MAX(SUBSTR(o.purchase_date, 1, 10)) as last_sold
     FROM raw_sp_orders o
-    LEFT JOIN sku_map sm ON o.seller_sku = sm.seller_sku
+    LEFT JOIN sku_map sm ON o.seller_sku = sm.seller_sku COLLATE NOCASE
     WHERE sm.seller_sku IS NULL AND o.order_status NOT IN ('Cancelled')
     GROUP BY o.seller_sku, o.title
   `);

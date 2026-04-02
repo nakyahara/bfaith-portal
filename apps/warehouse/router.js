@@ -365,7 +365,7 @@ router.get('/api/sets', (req, res) => {
       p.売価 as 構成品売価,
       ROUND(COALESCE(p.原価, 0) * s.数量, 2) as セット原価
     FROM raw_ne_set_products s
-    LEFT JOIN raw_ne_products p ON s.商品コード = p.商品コード
+    LEFT JOIN raw_ne_products p ON s.商品コード = p.商品コード COLLATE NOCASE
     ${where}
     ORDER BY s.セット商品コード
     LIMIT ? OFFSET ?
@@ -393,7 +393,7 @@ router.get('/api/sets/:code', (req, res) => {
       p.仕入先コード,
       ROUND(COALESCE(p.原価, 0) * s.数量, 2) as セット原価
     FROM raw_ne_set_products s
-    LEFT JOIN raw_ne_products p ON s.商品コード = p.商品コード
+    LEFT JOIN raw_ne_products p ON s.商品コード = p.商品コード COLLATE NOCASE
     WHERE s.セット商品コード = ?
   `, [req.params.code]);
 
@@ -670,7 +670,7 @@ router.get('/api/missing/prioritized', (req, res) => {
         s30.last_sold,
         CASE WHEN s7.qty > 0 THEN 'A_7日以内' WHEN s30.qty > 0 THEN 'B_30日以内' ELSE 'C_実績なし' END as priority
       FROM raw_ne_products p
-      LEFT JOIN product_shipping ps ON p.商品コード = ps.sku
+      LEFT JOIN product_shipping ps ON p.商品コード = ps.sku COLLATE NOCASE
       LEFT JOIN (
         SELECT 商品コード, SUM(受注数) as qty FROM raw_ne_orders
         WHERE キャンセル区分 = '有効' AND SUBSTR(受注日,1,10) >= ? GROUP BY 商品コード
@@ -694,7 +694,7 @@ router.get('/api/missing/prioritized', (req, res) => {
         s30.last_sold,
         CASE WHEN s7.qty > 0 THEN 'A_7日以内' WHEN s30.qty > 0 THEN 'B_30日以内' ELSE 'C_実績なし' END as priority
       FROM raw_ne_products p
-      LEFT JOIN exception_genka eg ON p.商品コード = eg.sku
+      LEFT JOIN exception_genka eg ON p.商品コード = eg.sku COLLATE NOCASE
       LEFT JOIN raw_ne_set_products sp ON p.商品コード = sp.セット商品コード
       LEFT JOIN (
         SELECT 商品コード, SUM(受注数) as qty FROM raw_ne_orders
@@ -721,7 +721,7 @@ router.get('/api/missing/prioritized', (req, res) => {
         CASE WHEN SUM(CASE WHEN SUBSTR(o.purchase_date,1,10) >= ? THEN o.quantity ELSE 0 END) > 0 THEN 'A_7日以内'
           ELSE 'B_30日以内' END as priority
       FROM raw_sp_orders o
-      LEFT JOIN sku_map sm ON o.seller_sku = sm.seller_sku
+      LEFT JOIN sku_map sm ON o.seller_sku = sm.seller_sku COLLATE NOCASE
       WHERE sm.seller_sku IS NULL AND o.order_status NOT IN ('Cancelled')
         AND SUBSTR(o.purchase_date, 1, 10) >= ?
       GROUP BY o.seller_sku, o.title
