@@ -760,7 +760,7 @@ async function startResearch() {
     partNumber: colPartNumber ? row[colPartNumber] : '',
     productName: colName ? row[colName] : '',
     wholesalePrice: parseFloat(String(row[colPrice]).replace(/[,，]/g, '')) || 0,
-  })).filter(item => item.wholesalePrice > 0 && (item.jan || item.partNumber || item.productName));
+  })).filter(item => item.wholesalePrice >= 0 && (item.jan || item.partNumber || item.productName));
 
   if (items.length === 0) {
     alert('有効なデータがありません（卸価格が0または空の行は除外されます）');
