@@ -114,8 +114,43 @@
     /* 一致方法バッジ */
     .match-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 10px; font-weight: bold; white-space: nowrap; }
     .match-badge.match-jan { background: #e3f2fd; color: #1565c0; border: 1px solid #90caf9; }
+    .match-badge.match-part_number { background: #e8f5e9; color: #2e7d32; border: 1px solid #a5d6a7; }
     .match-badge.match-keyword { background: #fff3e0; color: #e65100; border: 1px solid #ffcc80; }
     .match-badge.match-none { background: #f5f5f5; color: #888; border: 1px solid #ddd; }
+
+    /* v2.1: 信頼度別行スタイル */
+    tr.row-confidence-medium { background: #fffde7 !important; }
+    tr.row-confidence-low { background: #fff8e1 !important; }
+    tr.row-confidence-low td { position: relative; }
+    .confidence-label { font-size: 9px; color: #e65100; font-weight: bold; white-space: nowrap; }
+
+    /* v2.1: 総合スコアバッジ */
+    .score-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; text-align: center; min-width: 32px; }
+    .score-badge.rank-S { background: #c62828; color: #fff; }
+    .score-badge.rank-A { background: #e65100; color: #fff; }
+    .score-badge.rank-B { background: #f9a825; color: #333; }
+    .score-badge.rank-C { background: #e0e0e0; color: #555; }
+    .score-badge.rank-D { background: #f5f5f5; color: #999; }
+
+    /* v2.1: 競合強度バッジ */
+    .comp-badge { display: inline-block; padding: 1px 6px; border-radius: 8px; font-size: 10px; font-weight: bold; }
+    .comp-badge.comp-low { background: #e8f5e9; color: #2e7d32; }
+    .comp-badge.comp-mid { background: #fff8e1; color: #f57f17; }
+    .comp-badge.comp-high { background: #fff3e0; color: #e65100; }
+    .comp-badge.comp-extreme { background: #ffebee; color: #c62828; }
+    .amazon-seller-badge { display: inline-block; padding: 1px 6px; border-radius: 8px; font-size: 10px; font-weight: bold; background: #ffcdd2; color: #b71c1c; margin-left: 4px; }
+
+    /* v2.1: 売れ行き目安 */
+    .sales-level { font-weight: bold; font-size: 11px; }
+    .sales-level.sl-5 { color: #c62828; }
+    .sales-level.sl-4 { color: #e65100; }
+    .sales-level.sl-3 { color: #f9a825; }
+    .sales-level.sl-2 { color: #888; }
+    .sales-level.sl-1 { color: #bbb; }
+
+    /* v2.1: スクリーニング注意バナー */
+    .screening-banner { background: #fff3e0; border: 1px solid #ffcc80; border-radius: 8px; padding: 10px 16px; margin-bottom: 14px; font-size: 12px; color: #e65100; display: flex; align-items: center; gap: 8px; }
+    .screening-banner strong { font-size: 13px; }
 
     /* セッション管理 */
     .session-panel { background: #f0f4ff; border: 1px solid #90caf9; border-radius: 8px; padding: 14px 20px; margin-bottom: 14px; }
@@ -149,6 +184,12 @@
   </div>
 
   <div class="container">
+    <!-- v2.1: スクリーニング注意バナー -->
+    <div class="screening-banner">
+      <strong>⚠</strong>
+      <span>このツールは<strong>一次スクリーニング用</strong>です。利益額・利益率は<strong>概算値</strong>です。仕入れ決定前に、必ず「商品計算」画面で精密な利益計算を行ってください。</span>
+    </div>
+
     <!-- セッション管理パネル -->
     <div class="session-panel" id="sessionPanel">
       <div class="panel-title" style="border-bottom-color: #1565c0;">保存済みリサーチセッション</div>
@@ -175,7 +216,7 @@ JANコード,型番,商品名,卸価格
 4901234567891,DEF-456,○○コンディショナー 500ml,750"></textarea>
           <div class="hint">ヘッダー行あり。JAN・型番・商品名・卸価格が含まれるCSVを貼り付けてください。JANコードと型番で優先検索します。</div>
           <div style="display: flex; gap: 8px; align-items: center; margin-top: 8px;">
-            <input type="file" id="csvFile" accept=".csv,.tsv,.txt">
+            <input type="file" id="csvFile" accept=".csv,.tsv,.txt,.xlsx,.xls">
             <button class="btn btn-sm btn-success" onclick="downloadTemplate()" title="CSVテンプレートをダウンロード">📄 テンプレートDL</button>
           </div>
         </div>
@@ -237,6 +278,17 @@ JANコード,型番,商品名,卸価格
               </div>
             </div>
           </div>
+          <div class="setting-row" title="メーカー→自社倉庫の1商品あたり概算配送コスト">
+            <label>概算仕入送料</label>
+            <input type="number" id="shippingCostPerItem" value="0" min="0" style="width: 80px;">円
+          </div>
+          <div class="setting-row" title="ONにするとAmazon本体出品・FBA比率を取得（処理時間増）">
+            <label>競合詳細分析</label>
+            <select id="enableCompetitorAnalysis">
+              <option value="0" selected>OFF（高速）</option>
+              <option value="1">ON（詳細）</option>
+            </select>
+          </div>
           <div class="setting-row">
             <label>仕入先コード</label>
             <input type="text" id="supplierCode" placeholder="例: 0001" maxlength="4">
@@ -274,12 +326,14 @@ JANコード,型番,商品名,卸価格
       <!-- サマリー -->
       <div class="summary-cards" id="summaryCards">
         <div class="summary-card"><div class="sc-value" id="sumTotal">0</div><div class="sc-label">全件数</div></div>
-        <div class="summary-card good"><div class="sc-value" id="sumGood">0</div><div class="sc-label">FBA利益率10%+</div></div>
+        <div class="summary-card" style="border-left:3px solid #c62828;"><div class="sc-value" id="sumTopRank">0</div><div class="sc-label">S+Aランク</div></div>
+        <div class="summary-card good"><div class="sc-value" id="sumGood">0</div><div class="sc-label">FBA概算利益10%+</div></div>
         <div class="summary-card"><div class="sc-value" id="sumExcellent">0</div><div class="sc-label">FBA ◎ 30%+</div></div>
         <div class="summary-card good fbm-summary" style="background:#fffdf0;"><div class="sc-value" id="sumFbmGood">0</div><div class="sc-label">自社利益率10%+</div></div>
         <div class="summary-card" style="border-left:3px solid #1565c0;"><div class="sc-value" id="sumJanMatch">0</div><div class="sc-label">JAN一致</div></div>
         <div class="summary-card" style="border-left:3px solid #2e7d32;"><div class="sc-value" id="sumPartNumberMatch">0</div><div class="sc-label">型番一致</div></div>
         <div class="summary-card" style="border-left:3px solid #e65100;"><div class="sc-value" id="sumKeywordMatch">0</div><div class="sc-label">商品名一致</div></div>
+        <div class="summary-card" id="sumAmazonSellerCard" style="display:none; border-left:3px solid #b71c1c;"><div class="sc-value" id="sumAmazonSeller">0</div><div class="sc-label">Amazon出品あり</div></div>
         <div class="summary-card"><div class="sc-value" id="sumNotFound">0</div><div class="sc-label">未発見</div></div>
         <div class="summary-card"><div class="sc-value" id="sumErrors">0</div><div class="sc-label">エラー</div></div>
       </div>
@@ -288,6 +342,7 @@ JANコード,型番,商品名,卸価格
       <div class="filter-bar">
         <select id="resultFilter" onchange="applyFilter()">
           <option value="all">すべて</option>
+          <option value="top_rank">S+Aランクのみ</option>
           <option value="profitable" selected>利益あり (フィルタ適用)</option>
           <option value="excellent">◎ 30%以上</option>
           <option value="good">○ 20%以上</option>
@@ -296,13 +351,15 @@ JANコード,型番,商品名,卸価格
           <option value="not_found">未発見のみ</option>
         </select>
         <select id="sortBy" onchange="applyFilter()">
-          <option value="profitRate-desc">FBA利益率 高い順</option>
-          <option value="profitRate-asc">FBA利益率 低い順</option>
-          <option value="profit-desc">FBA利益額 高い順</option>
+          <option value="compositeScore-desc" selected>総合スコア 高い順</option>
+          <option value="profitRate-desc">FBA概算利益率 高い順</option>
+          <option value="profitRate-asc">FBA概算利益率 低い順</option>
+          <option value="profit-desc">FBA概算利益額 高い順</option>
           <option value="_fbmProfitRate-desc">自社利益率 高い順</option>
           <option value="_fbmProfit-desc">自社利益額 高い順</option>
-          <option value="estSales-desc">推定販売数 多い順</option>
+          <option value="salesLevel-desc">売れ行き 良い順</option>
           <option value="salesRank-asc">ランキング 高い順</option>
+          <option value="competitionScore-asc">競合 弱い順</option>
           <option value="offerCount-asc">出品者数 少ない順</option>
           <option value="idx-asc">CSV順</option>
         </select>
@@ -323,6 +380,7 @@ JANコード,型番,商品名,卸価格
         <thead>
           <tr>
             <th><input type="checkbox" class="cb" id="cbAll" onchange="toggleAll(this.checked)"></th>
+            <th>スコア</th>
             <th></th>
             <th>ASIN</th>
             <th>商品名</th>
@@ -332,16 +390,17 @@ JANコード,型番,商品名,卸価格
             <th class="num">卸価格</th>
             <th class="num">販売価格</th>
             <th class="num">FBA手数料</th>
-            <th class="num">FBA利益</th>
-            <th class="num">FBA利益率</th>
-            <th>FBA判定</th>
+            <th class="num" title="概算値（仕入送料・保管コスト含む）">概算利益</th>
+            <th class="num" title="概算値">概算利益率</th>
+            <th>判定</th>
             <th class="num fbm-col" style="background:#fff8e1;">自社送料</th>
             <th class="num fbm-col" style="background:#fff8e1;">自社利益</th>
             <th class="num fbm-col" style="background:#fff8e1;">自社利益率</th>
             <th class="fbm-col" style="background:#fff8e1;">自社判定</th>
             <th class="num">ランキング</th>
-            <th class="num">推定月販</th>
+            <th>売れ行き</th>
             <th class="num">出品者</th>
+            <th>競合</th>
             <th>ステータス</th>
           </tr>
         </thead>
@@ -378,6 +437,9 @@ JANコード,型番,商品名,卸価格
       </div>
     </div>
   </div>
+
+<!-- SheetJS (xlsx) CDN for Excel file support -->
+<script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
 
 <script>
 // ===== State =====
@@ -582,16 +644,49 @@ function calcFbmShipping(dims) {
   return { cost: 945, method: '宅急便140(該当なし)' };
 }
 
-// ===== CSV パース =====
+// ===== CSV/Excel パース =====
 document.getElementById('csvFile').addEventListener('change', (e) => {
   const file = e.target.files[0];
   if (!file) return;
-  const reader = new FileReader();
-  reader.onload = (ev) => {
-    document.getElementById('csvText').value = ev.target.result;
-    parseCsv(ev.target.result);
-  };
-  reader.readAsText(file, 'UTF-8');
+
+  const ext = file.name.split('.').pop().toLowerCase();
+
+  if (ext === 'xlsx' || ext === 'xls') {
+    // v2.1: Excelファイル対応（SheetJS）
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const wb = XLSX.read(ev.target.result, { type: 'array' });
+        // 複数シートの場合は選択UI（ここではsheet_to_csvで最初のシートを使用）
+        let sheetName = wb.SheetNames[0];
+        if (wb.SheetNames.length > 1) {
+          const choice = prompt(
+            `複数シートがあります。使用するシート名を入力してください:\n${wb.SheetNames.map((n, i) => `${i + 1}. ${n}`).join('\n')}`,
+            sheetName
+          );
+          if (choice && wb.SheetNames.includes(choice)) sheetName = choice;
+          else if (choice) {
+            const idx = parseInt(choice) - 1;
+            if (idx >= 0 && idx < wb.SheetNames.length) sheetName = wb.SheetNames[idx];
+          }
+        }
+        const csvText = XLSX.utils.sheet_to_csv(wb.Sheets[sheetName]);
+        document.getElementById('csvText').value = csvText;
+        parseCsv(csvText);
+      } catch (err) {
+        alert('Excelファイルの読み込みに失敗しました: ' + err.message);
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  } else {
+    // CSV/TSV/TXT
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      document.getElementById('csvText').value = ev.target.result;
+      parseCsv(ev.target.result);
+    };
+    reader.readAsText(file, 'UTF-8');
+  }
 });
 
 document.getElementById('csvText').addEventListener('input', (e) => {
@@ -687,6 +782,8 @@ async function startResearch() {
 
   const taxRate = parseInt(document.getElementById('taxRate').value);
   const fulfillmentMode = document.getElementById('fulfillmentMode').value;
+  const shippingCostPerItem = parseInt(document.getElementById('shippingCostPerItem').value) || 0;
+  const enableCompetitorAnalysis = document.getElementById('enableCompetitorAnalysis').value === '1';
 
   // FBM列の表示切り替え
   toggleFbmColumns(fulfillmentMode !== 'fba_only');
@@ -695,7 +792,7 @@ async function startResearch() {
     const response = await fetch('./api/bulk-research/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ items, taxRate, fulfillmentMode }),
+      body: JSON.stringify({ items, taxRate, fulfillmentMode, shippingCostPerItem, enableCompetitorAnalysis }),
     });
 
     const reader = response.body.getReader();
@@ -775,6 +872,9 @@ function applyFilter() {
 
   // ステータスフィルタ
   switch (filter) {
+    case 'top_rank':
+      filtered = filtered.filter(r => r.status === 'ok' && (r.compositeRank === 'S' || r.compositeRank === 'A'));
+      break;
     case 'profitable':
       filtered = filtered.filter(r => r.status === 'ok' && r.profitRate >= profitMin && r.offerCount <= maxSellers);
       break;
@@ -824,13 +924,12 @@ function renderTable(rows) {
     const tr = document.createElement('tr');
     if (r.status !== 'ok') tr.classList.add('row-dim');
 
+    // v2.1: 信頼度別行スタイル
+    if (r.matchConfidence === 'medium' || r.matchType === 'part_number') tr.classList.add('row-confidence-medium');
+    if (r.matchConfidence === 'low' || r.matchType === 'keyword') tr.classList.add('row-confidence-low');
+
     const jClass = r.judgment === '◎' ? 'j-excellent' : r.judgment === '○' ? 'j-good' : r.judgment === '△' ? 'j-fair' : 'j-poor';
     const profitClass = (r.profit || 0) >= 0 ? 'positive' : 'negative';
-
-    // 推定月販の色分け
-    let estClass = 'low';
-    if (r.estMonthlySales >= 30) estClass = 'high';
-    else if (r.estMonthlySales >= 10) estClass = 'medium';
 
     // FBM利益計算（Amazon手数料 + 送料テーブルから算出）
     let fbmHtml = '';
@@ -844,7 +943,6 @@ function renderTable(rows) {
         const fbmJClass = fbmJudgment === '◎' ? 'j-excellent' : fbmJudgment === '○' ? 'j-good' : fbmJudgment === '△' ? 'j-fair' : 'j-poor';
         const fbmProfitClass = fbmProfit >= 0 ? 'positive' : 'negative';
 
-        // FBMデータをr自体に付けておく（CSV出力用）
         r._fbmShippingCost = shipping.cost;
         r._fbmShippingMethod = shipping.method;
         r._fbmProfit = fbmProfit;
@@ -862,12 +960,37 @@ function renderTable(rows) {
       }
     }
 
+    // v2.1: 総合スコアバッジ
+    const scoreHtml = r.compositeRank
+      ? `<span class="score-badge rank-${r.compositeRank}" title="総合スコア: ${r.compositeScore || 0}点">${r.compositeRank}</span>`
+      : '-';
+
+    // v2.1: 売れ行き目安
+    const slLevel = r.salesLevel || 0;
+    const slLabel = r.salesLevelLabel || '-';
+    const salesLevelHtml = slLevel
+      ? `<span class="sales-level sl-${slLevel}" title="BSR: ${r.salesRank && r.salesRank !== '-' ? '#' + fmt(r.salesRank) : '-'}&#10;カテゴリーにより売れ行きは異なります">${slLabel}</span>`
+      : '-';
+
+    // v2.1: 競合強度
+    let compHtml = r.offerCount !== undefined ? r.offerCount + '人' : '-';
+    if (r.competitionScore !== undefined && r.competitionScore !== null) {
+      const compClass = r.competitionScore <= 30 ? 'comp-low' : r.competitionScore <= 60 ? 'comp-mid' : r.competitionScore <= 80 ? 'comp-high' : 'comp-extreme';
+      compHtml = `<span class="comp-badge ${compClass}">${r.competitionLabel || ''}</span>`;
+      if (r.amazonSeller) compHtml += `<span class="amazon-seller-badge">Amazon</span>`;
+    }
+
+    // v2.1: 信頼度ラベル
+    const confidenceLabel = r.matchType === 'keyword' ? '<br><span class="confidence-label">概算・要確認</span>' :
+                           r.matchType === 'part_number' ? '<br><span class="confidence-label">要確認</span>' : '';
+
     tr.innerHTML = `
       <td><input type="checkbox" class="cb row-cb" data-idx="${r.idx}" ${r.status === 'ok' && (r.profitRate||0) >= 10 ? '' : ''}></td>
+      <td>${scoreHtml}</td>
       <td>${r.image ? `<img src="${r.image}" class="thumb" loading="lazy">` : '-'}</td>
       <td>${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="font-weight:bold;font-size:12px;">${r.asin}</a>` : '-'}</td>
       <td class="product-name-cell" title="${escHtml(r.amazonName || r.productName || '')}">${escHtml(r.amazonName || r.productName || '')}</td>
-      <td>${matchTypeBadge(r.matchType)}</td>
+      <td>${matchTypeBadge(r.matchType)}${confidenceLabel}</td>
       <td style="font-size:11px;">${r.jan || '-'}</td>
       <td style="font-size:11px;">${r.partNumber || '-'}</td>
       <td class="num">${r.wholesalePrice ? '¥' + fmt(r.wholesalePrice) : '-'}</td>
@@ -878,8 +1001,9 @@ function renderTable(rows) {
       <td>${r.judgment ? `<span class="judgment-sm ${jClass}">${r.judgment}</span>` : '-'}</td>
       ${fbmHtml}
       <td class="num" style="font-size:11px;">${r.salesRank && r.salesRank !== '-' ? '#' + fmt(r.salesRank) : '-'}</td>
-      <td class="num"><span class="est-sales ${estClass}">${r.estMonthlySales ? '~' + r.estMonthlySales + '個/月' : '-'}</span></td>
+      <td>${salesLevelHtml}</td>
       <td class="num">${r.offerCount !== undefined ? r.offerCount + '人' : '-'}</td>
+      <td>${compHtml}</td>
       <td><span class="status-dot ${r.status}"></span>${statusLabel(r.status, r.message)}</td>
     `;
     tbody.appendChild(tr);
@@ -889,7 +1013,7 @@ function renderTable(rows) {
 function matchTypeBadge(matchType) {
   switch (matchType) {
     case 'jan': return '<span class="match-badge match-jan">JAN一致</span>';
-    case 'part_number': return '<span class="match-badge match-keyword" style="background:#e8f5e9;color:#2e7d32;border-color:#a5d6a7;">型番一致</span>';
+    case 'part_number': return '<span class="match-badge match-part_number">型番一致</span>';
     case 'keyword': return '<span class="match-badge match-keyword">商品名</span>';
     case 'none': return '<span class="match-badge match-none">未一致</span>';
     default: return '-';
@@ -910,6 +1034,7 @@ function statusLabel(status, msg) {
 function updateSummary() {
   const ok = allResults.filter(r => r.status === 'ok');
   document.getElementById('sumTotal').textContent = allResults.length;
+  document.getElementById('sumTopRank').textContent = ok.filter(r => r.compositeRank === 'S' || r.compositeRank === 'A').length;
   document.getElementById('sumGood').textContent = ok.filter(r => (r.profitRate || 0) >= 10).length;
   document.getElementById('sumExcellent').textContent = ok.filter(r => (r.profitRate || 0) >= 30).length;
   document.getElementById('sumFbmGood').textContent = ok.filter(r => (r._fbmProfitRate || 0) >= 10).length;
@@ -919,12 +1044,17 @@ function updateSummary() {
   document.getElementById('sumNotFound').textContent = allResults.filter(r => r.status === 'not_found').length;
   document.getElementById('sumErrors').textContent = allResults.filter(r => r.status === 'error').length;
 
+  // v2.1: Amazon本体出品数
+  const amazonSellerCount = ok.filter(r => r.amazonSeller).length;
+  document.getElementById('sumAmazonSeller').textContent = amazonSellerCount;
+  document.getElementById('sumAmazonSellerCard').style.display = amazonSellerCount > 0 ? '' : 'none';
+
   // FBMサマリーの表示制御
   const showFbm = document.getElementById('fulfillmentMode').value !== 'fba_only';
   document.querySelector('.fbm-summary').style.display = showFbm ? '' : 'none';
 }
 
-// ===== リサーチDB保存 =====
+// ===== リサーチDB保存（v2.1: 信頼度別保存対応） =====
 async function saveSelected() {
   const checked = [...document.querySelectorAll('.row-cb:checked')].map(cb => parseInt(cb.dataset.idx));
   if (checked.length === 0) {
@@ -936,10 +1066,34 @@ async function saveSelected() {
   const supplierName = document.getElementById('supplierName').value;
   const taxRate = parseInt(document.getElementById('taxRate').value);
 
+  // v2.1: 商品名一致の商品があるか確認
+  const selectedResults = checked.map(idx => allResults.find(x => x.idx === idx)).filter(r => r && r.status === 'ok');
+  const keywordItems = selectedResults.filter(r => r.matchType === 'keyword');
+  const reliableItems = selectedResults.filter(r => r.matchType !== 'keyword');
+
+  if (keywordItems.length > 0) {
+    const proceed = confirm(
+      `⚠ 商品名一致の商品が ${keywordItems.length} 件含まれています。\n` +
+      `商品名一致は誤マッチの可能性があります。「仮保存」として登録され、\n` +
+      `目視確認後に「リサーチ」に昇格する必要があります。\n\n` +
+      `・JAN/型番一致: ${reliableItems.length} 件 → 「リサーチ」で保存\n` +
+      `・商品名一致: ${keywordItems.length} 件 → 「仮保存」で保存\n\n` +
+      `続行しますか？`
+    );
+    if (!proceed) return;
+  }
+
   let saved = 0;
-  for (const idx of checked) {
-    const r = allResults.find(x => x.idx === idx);
-    if (!r || r.status !== 'ok') continue;
+  for (const r of selectedResults) {
+    // v2.1: 信頼度に応じたステータスとコメント
+    let status = 'リサーチ';
+    let comment = '';
+    if (r.matchType === 'keyword') {
+      status = '仮保存';
+      comment = '商品名一致・要目視確認';
+    } else if (r.matchType === 'part_number') {
+      comment = '型番一致・ASIN要確認';
+    }
 
     try {
       await fetch('./api/research', {
@@ -954,6 +1108,7 @@ async function saveSelected() {
           salesRank: r.salesRank,
           offerCount: r.offerCount,
           jan: r.jan,
+          partNumber: r.partNumber,
           supplierCode,
           supplierName,
           wholesalePrice: r.wholesalePrice,
@@ -967,6 +1122,15 @@ async function saveSelected() {
           profitRate: r.profitRate,
           judgment: r.judgment,
           fulfillment: 'FBA',
+          comment,
+          // v2.1: 新カラム
+          matchType: r.matchType,
+          matchConfidence: r.matchConfidence,
+          compositeScore: r.compositeScore,
+          competitionScore: r.competitionScore,
+          amazonSeller: r.amazonSeller ? 1 : 0,
+          source: 'bulk-research',
+          status,
         }),
       });
       saved++;
@@ -974,8 +1138,12 @@ async function saveSelected() {
       console.error('保存エラー:', e);
     }
   }
-  alert(`${saved} 件をリサーチに保存しました`);
-  // 保存済みデータはセッションから削除しない（保存後も結果を確認できるように）
+
+  const karisaved = selectedResults.filter(r => r.matchType === 'keyword').length;
+  const msg = karisaved > 0
+    ? `${saved} 件を保存しました（うち ${karisaved} 件は「仮保存」）`
+    : `${saved} 件をリサーチに保存しました`;
+  alert(msg);
 }
 
 // ===== CSV エクスポート =====

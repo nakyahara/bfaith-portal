@@ -101,6 +101,13 @@ export async function initDb() {
     ['quote_requested_at', 'TEXT'],
     ['quote_responded_at', 'TEXT'],
     ['quote_note', 'TEXT'],
+    // v2.1: 一括リサーチ品質管理カラム
+    ['match_type', 'TEXT'],           // jan / part_number / keyword / none
+    ['match_confidence', 'TEXT'],     // high / medium / low
+    ['composite_score', 'INTEGER'],   // 総合スコア（0〜85）
+    ['competition_score', 'INTEGER'], // 競合強度スコア（0〜100）
+    ['amazon_seller', 'INTEGER DEFAULT 0'], // Amazon本体出品（0 or 1）
+    ['source', 'TEXT'],              // データ元（bulk-research / manual）
   ];
   for (const [col, type] of newCols) {
     if (!existingCols.includes(col)) {
@@ -331,8 +338,9 @@ export function saveResearch(data) {
       fulfillment, loss_stopper, high_stopper, price_tracking,
       quantity, expiry_date, variation_flag, ama_single_or_set, purchase_flag,
       quote_requested_at, quote_responded_at, quote_note,
+      match_type, match_confidence, composite_score, competition_score, amazon_seller, source,
       status
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `, [
     n(data.asin), n(data.productName), n(data.amazonUrl), n(data.imageUrl),
     n(data.category), n(data.salesRank), n(data.offerCount),
@@ -344,6 +352,7 @@ export function saveResearch(data) {
     n(data.fulfillment), n(data.lossStopper), n(data.highStopper), n(data.priceTracking),
     n(data.quantity), n(data.expiryDate), n(data.variationFlag), n(data.amaSingleOrSet), n(data.purchaseFlag),
     n(data.quoteRequestedAt), n(data.quoteRespondedAt), n(data.quoteNote),
+    n(data.matchType), n(data.matchConfidence), n(data.compositeScore), n(data.competitionScore), n(data.amazonSeller), n(data.source),
     data.status || 'リサーチ',
   ]);
   saveToFile();

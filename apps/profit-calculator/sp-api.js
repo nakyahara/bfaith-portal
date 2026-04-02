@@ -342,6 +342,86 @@ export function estimateMonthlySales(rank) {
 }
 
 /**
+ * BSRから売れ行き目安レベル（1〜5）を算出
+ * カテゴリー差を考慮しない概算なので「目安」表示用
+ */
+export function getSalesLevel(rank) {
+  if (!rank || rank <= 0 || rank === '-') return { level: 0, label: '不明' };
+  const r = Number(rank);
+  if (isNaN(r)) return { level: 0, label: '不明' };
+  if (r <= 500)    return { level: 5, label: '爆売れ' };
+  if (r <= 3000)   return { level: 4, label: 'よく売れる' };
+  if (r <= 15000)  return { level: 3, label: '普通' };
+  if (r <= 50000)  return { level: 2, label: '少ない' };
+  return { level: 1, label: 'ほぼ売れない' };
+}
+
+/**
+ * 型番を正規化（比較用）
+ * 全角→半角、ハイフン類除去、スペース除去、大文字統一
+ */
+export function normalizePartNumber(pn) {
+  if (!pn) return '';
+  let s = pn;
+  // 全角英数字→半角
+  s = s.replace(/[Ａ-Ｚａ-ｚ０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
+  // ハイフン類を除去（‐ ー − ‑ - ）
+  s = s.replace(/[\u002D\u2010\u2011\u2012\u2013\u2014\u2015\u2212\u30FC\uFF0D\uFF70]/g, '');
+  // スペース除去
+  s = s.replace(/\s+/g, '');
+  // 大文字統一
+  s = s.toUpperCase();
+  return s;
+}
+
+/**
+ * 型番で Amazon商品を検索（正規化対応版）
+ * 返却時に matchConfidence を含む: 'exact'(完全一致) or 'partial'(部分一致→keyword降格)
+ */
+export async function searchByPartNumber(partNumber) {
+  const sp = getClient();
+  const marketplaceId = MARKETPLACE_ID();
+
+  const result = await sp.callAPI({
+    operation: 'searchCatalogItems',
+    endpoint: 'catalogItems',
+    query: {
+      marketplaceIds: [marketplaceId],
+      keywords: [partNumber],
+      includedData: ['summaries', 'images', 'identifiers', 'attributes'],
+      pageSize: 5,
+    },
+    options: { version: '2022-04-01' },
+  });
+
+  const items = result.items || [];
+  if (items.length === 0) return [];
+
+  const normalizedInput = normalizePartNumber(partNumber);
+
+  return items.map(item => {
+    const attrs = item.attributes || {};
+    const amazonPn = attrs.part_number?.[0]?.value || '';
+    const itemName = item.summaries?.[0]?.itemName || '';
+    const normalizedAmazon = normalizePartNumber(amazonPn);
+
+    // 完全一致判定（正規化後）
+    let matchConfidence = 'partial';
+    if (normalizedInput && normalizedAmazon && normalizedInput === normalizedAmazon) {
+      matchConfidence = 'exact';
+    }
+
+    return {
+      asin: item.asin,
+      itemName,
+      image: item.images?.[0]?.images?.find(i => i.variant === 'MAIN')?.link || '',
+      amazonPartNumber: amazonPn,
+      matchConfidence,
+    };
+  });
+}
+
+/**
  * Amazon出品登録（Listings Items API）
  */
 export async function createListing({ asin, price, isFba, sku, condition = 'new_new', shippingTemplate = null, paymentRestriction = 'none', pointRate = 0, conditionNote = '', batteriesRequired = 'false', hazmatRegulation = 'not_applicable' }) {

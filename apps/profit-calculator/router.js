@@ -4,7 +4,7 @@
 import { Router } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { getProduct, getFees, createListing, patchListing, getShippingTemplates, getItemOffers, updatePrice, getActiveListingsReport, getSalesCountBySku, searchByJan, searchByKeyword, estimateMonthlySales } from './sp-api.js';
+import { getProduct, getFees, createListing, patchListing, getShippingTemplates, getItemOffers, updatePrice, getActiveListingsReport, getSalesCountBySku, searchByJan, searchByKeyword, searchByPartNumber, normalizePartNumber, estimateMonthlySales, getSalesLevel } from './sp-api.js';
 import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, deleteProduct, getSetItems, saveSetItems, syncListings as dbSyncListings, getListings, updateListing, bulkSave, getSyncMeta, getTrackingProducts, getPriceHistory, getRecentPriceHistory, savePriceHistory, updateProductPriceInfo, syncProductsFromListings, saveBulkSession, updateBulkSession, getBulkSessions, getBulkSessionById, deleteBulkSession } from './db.js';
 import { loadSuppliers, addSupplier, deleteSupplier } from './suppliers.js';
 import { loadShipping, addShipping, updateShipping, deleteShipping } from './shipping.js';
@@ -643,7 +643,90 @@ router.get('/bulk-research', (req, res) => {
   res.sendFile(path.join(__dirname, 'bulk-research.html'));
 });
 
-// ── API: 一括リサーチ（SSE ストリーミング） ──
+// ── 一括リサーチ: ヘルパー関数群（v2.1） ──
+
+/** 概算保管コスト（月額、寸法情報から簡易推定） */
+function estimateStorageCost(dimensions) {
+  if (!dimensions) return 50; // 不明時のデフォルト
+  const l = dimensions.lengthCm || 0;
+  const w = dimensions.widthCm || 0;
+  const h = dimensions.heightCm || 0;
+  const total = l + w + h;
+  if (total <= 0) return 50;
+  if (total <= 60) return 30;   // 小型
+  if (total <= 100) return 80;  // 標準
+  return 250;                   // 大型
+}
+
+/** 競合強度スコア算出（0〜100） */
+function calcCompetitionScore(offerCount, competitorData) {
+  // 基礎点（出品者数ベース）
+  let base = 10;
+  if (offerCount >= 16) base = 70;
+  else if (offerCount >= 8) base = 50;
+  else if (offerCount >= 4) base = 30;
+
+  if (!competitorData) return base; // 競合詳細分析OFF時
+
+  // Amazon本体ペナルティ
+  const amazonPenalty = competitorData.amazonSeller ? 25 : 0;
+
+  // FBA密度ペナルティ
+  const totalOffers = (competitorData.fbaCount || 0) + (competitorData.fbmCount || 0);
+  const fbaRate = totalOffers > 0 ? (competitorData.fbaCount / totalOffers) : 0;
+  let fbaPenalty = 0;
+  if (fbaRate >= 0.8) fbaPenalty = 20;
+  else if (fbaRate >= 0.5) fbaPenalty = 10;
+
+  return Math.min(100, base + amazonPenalty + fbaPenalty);
+}
+
+/** 競合強度ラベル */
+function getCompetitionLabel(score) {
+  if (score <= 30) return '低競合';
+  if (score <= 60) return '中競合';
+  if (score <= 80) return '高競合';
+  return '超高競合';
+}
+
+/** 総合スコア算出（加重和方式、0〜85点） */
+function calcCompositeScore({ profitRate, profit, salesLevel, competitionScore, matchType }) {
+  // 利益点（0〜40）
+  let profitPt = 0;
+  if (profitRate >= 30 && profit >= 500) profitPt = 40;
+  else if (profitRate >= 20 && profit >= 300) profitPt = 30;
+  else if (profitRate >= 10 && profit >= 200) profitPt = 20;
+  else if (profitRate >= 10) profitPt = 15;
+  else if (profitRate >= 5) profitPt = 5;
+
+  // 売れ行き点（0〜25）
+  const salesPtMap = { 5: 25, 4: 20, 3: 12, 2: 4, 1: 0, 0: 0 };
+  const salesPt = salesPtMap[salesLevel] ?? 0;
+
+  // 競合点（0〜20）
+  let compPt = 20;
+  if (competitionScore > 80) compPt = 0;
+  else if (competitionScore > 60) compPt = 5;
+  else if (competitionScore > 30) compPt = 12;
+
+  // 信頼度減点（0〜15）
+  let trustPenalty = 0;
+  if (matchType === 'keyword') trustPenalty = 15;
+  else if (matchType === 'part_number') trustPenalty = 5;
+
+  return Math.max(0, profitPt + salesPt + compPt - trustPenalty);
+}
+
+/** 総合スコアランク */
+function getCompositeRank(score) {
+  if (score >= 60) return 'S';
+  if (score >= 45) return 'A';
+  if (score >= 25) return 'B';
+  if (score >= 10) return 'C';
+  return 'D';
+}
+
+// ── API: 一括リサーチ（SSE ストリーミング）v2.1 ──
 router.post('/api/bulk-research/stream', async (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -655,7 +738,14 @@ router.post('/api/bulk-research/stream', async (req, res) => {
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   };
 
-  const { items, taxRate = 10, fulfillmentMode = 'both' } = req.body;
+  const {
+    items,
+    taxRate = 10,
+    fulfillmentMode = 'both',
+    shippingCostPerItem = 0,       // v2.1: 概算仕入送料
+    enableCompetitorAnalysis = false, // v2.1: 競合詳細分析ON/OFF
+  } = req.body;
+
   if (!items || !Array.isArray(items) || items.length === 0) {
     send('error', { message: 'アイテムが指定されていません' });
     res.end();
@@ -672,47 +762,72 @@ router.post('/api/bulk-research/stream', async (req, res) => {
     try {
       send('progress', { current: idx, total: items.length, jan, partNumber, productName });
 
-      // Step 1: JAN → 型番 → 商品名 の優先順でASIN検索
-      // matchType: 何で一致したかを記録
+      // === Step 1: 3段階検索（JAN→型番→商品名）v2.1対応 ===
       let candidates = [];
       let matchType = 'unknown';
+      let matchConfidence = 'low';
+      let keywordCandidates = null; // 商品名一致時の複数候補
 
-      // 1a: JANコード（EAN）で検索 — 最も信頼性が高い
+      // 1a: JANコード（EAN）で検索 — 信頼度:高
       if (jan) {
         candidates = await searchByJan(jan);
-        if (candidates.length > 0) matchType = 'jan';
+        if (candidates.length > 0) {
+          matchType = 'jan';
+          matchConfidence = 'high';
+        }
       }
 
-      // 1b: JANで見つからなければ型番でキーワード検索
+      // 1b: JANで見つからなければ型番で検索 — 正規化対応（v2.1）
       if (candidates.length === 0 && partNumber) {
-        candidates = await searchByKeyword(partNumber);
-        if (candidates.length > 0) matchType = 'part_number';
+        const pnResults = await searchByPartNumber(partNumber);
+        if (pnResults.length > 0) {
+          // 完全一致があれば信頼度:中、部分一致のみならkeyword降格
+          const exactMatch = pnResults.find(r => r.matchConfidence === 'exact');
+          if (exactMatch) {
+            candidates = [exactMatch];
+            matchType = 'part_number';
+            matchConfidence = 'medium';
+          } else {
+            // 部分一致のみ → keyword扱いに降格
+            candidates = pnResults;
+            matchType = 'keyword';
+            matchConfidence = 'low';
+          }
+        }
       }
 
-      // 1c: 型番でも見つからなければ商品名でキーワード検索
+      // 1c: 型番でも見つからなければ商品名でキーワード検索 — 信頼度:低
       if (candidates.length === 0 && productName) {
         candidates = await searchByKeyword(productName);
-        if (candidates.length > 0) matchType = 'keyword';
+        if (candidates.length > 0) {
+          matchType = 'keyword';
+          matchConfidence = 'low';
+          // 商品名一致時は複数候補を保持
+          if (candidates.length > 1) {
+            keywordCandidates = candidates.slice(0, 5).map(c => ({
+              asin: c.asin,
+              productName: c.itemName,
+              image: c.image,
+            }));
+          }
+        }
       }
 
       if (candidates.length === 0) {
         send('result', {
           idx, jan, partNumber, productName, wholesalePrice,
           status: 'not_found', message: 'Amazon商品が見つかりません',
-          matchType: 'none',
+          matchType: 'none', matchConfidence: 'none',
         });
         continue;
       }
 
-      // Step 2: 最初の候補のASINで詳細取得
+      // === Step 2: 最初の候補のASINで詳細取得 ===
       const asin = candidates[0].asin;
-
-      // 少し待機（レート制限対策）
       await new Promise(r => setTimeout(r, 300));
-
       const product = await getProduct(asin);
 
-      // Step 3: 手数料取得
+      // Step 3: 販売価格チェック
       const sellingPrice = product.currentPrice;
       if (!sellingPrice || sellingPrice <= 0) {
         send('result', {
@@ -721,50 +836,89 @@ router.post('/api/bulk-research/stream', async (req, res) => {
           image: product.image,
           amazonName: product.itemName,
           status: 'no_price', message: '販売価格が取得できません',
-          matchType,
+          matchType, matchConfidence,
         });
         await new Promise(r => setTimeout(r, 300));
         continue;
       }
 
-      // Step 4: FBA手数料取得
+      // === Step 4: FBA手数料取得 ===
       let fbaFees = null;
       if (fulfillmentMode !== 'fbm_only') {
         await new Promise(r => setTimeout(r, 300));
         fbaFees = await getFees(asin, sellingPrice, true);
       }
 
-      // Step 4b: FBM手数料取得（自社出荷用）
+      // Step 4b: FBM手数料取得
       let fbmFees = null;
       if (fulfillmentMode !== 'fba_only') {
         await new Promise(r => setTimeout(r, 300));
         fbmFees = await getFees(asin, sellingPrice, false);
       }
 
-      // Step 5: 利益計算
+      // === Step 5: 概算利益計算（v2.1: 送料+保管コスト追加） ===
       const rate = taxRate / 100;
       const wholesalePriceWithTax = Math.round(wholesalePrice * (1 + rate));
+      const estimatedShipping = shippingCostPerItem || 0;
+      const estimatedStorage = estimateStorageCost(product.dimensions);
 
-      // FBA利益
+      // FBA概算利益
       let profit = 0, profitRate = 0, judgment = '-';
       if (fbaFees) {
-        profit = sellingPrice - wholesalePriceWithTax - fbaFees.totalFee;
+        profit = sellingPrice - wholesalePriceWithTax - fbaFees.totalFee - estimatedShipping - estimatedStorage;
         profitRate = sellingPrice > 0 ? (profit / sellingPrice * 100) : 0;
         judgment = profitRate >= 30 ? '◎' : profitRate >= 20 ? '○' : profitRate >= 10 ? '△' : '×';
       }
 
-      // FBM利益（送料はフロント側で計算するため、Amazon手数料のみ返す）
+      // FBM概算利益
       let fbmProfit = null, fbmProfitRate = null, fbmJudgment = null;
       if (fbmFees) {
-        // FBMのAmazon手数料（販売手数料のみ、FBA配送手数料なし）
-        // 送料はフロント側で送料テーブルから自動計算するため、ここでは送料0で計算
-        fbmProfit = sellingPrice - wholesalePriceWithTax - fbmFees.totalFee;
+        fbmProfit = sellingPrice - wholesalePriceWithTax - fbmFees.totalFee - estimatedShipping;
         fbmProfitRate = sellingPrice > 0 ? (fbmProfit / sellingPrice * 100) : 0;
         fbmJudgment = fbmProfitRate >= 30 ? '◎' : fbmProfitRate >= 20 ? '○' : fbmProfitRate >= 10 ? '△' : '×';
       }
 
-      // Step 6: 月間販売数推定
+      // === Step 6: 競合詳細分析（v2.1 ON/OFF対応） ===
+      let competitorData = null;
+      let competitionScore = calcCompetitionScore(product.offerCount, null); // 簡易版（出品者数のみ）
+
+      if (enableCompetitorAnalysis) {
+        try {
+          await new Promise(r => setTimeout(r, 300));
+          const offers = await getItemOffers(asin);
+          const amazonSeller = offers.offers?.some(o =>
+            o.sellerId === 'A3GZEOZTLONXO1' || // Amazon.co.jp のセラーID
+            (o.isFba && o.isBuyBoxWinner && o.listingPrice === 0) // もしくはカート価格が異様に安いAmazon本体
+          ) || false;
+
+          competitorData = {
+            amazonSeller,
+            fbaCount: offers.numberOfOffers?.fbaNew || 0,
+            fbmCount: offers.numberOfOffers?.fbmNew || 0,
+            lowestFbaPrice: offers.lowestFbaPrice,
+            lowestFbmPrice: offers.lowestFbmPrice,
+            buyBoxPrice: offers.buyBoxPrice,
+          };
+          competitionScore = calcCompetitionScore(product.offerCount, competitorData);
+        } catch (err) {
+          console.error(`[BulkResearch] 競合分析エラー (${asin}):`, err.message);
+          // 競合分析失敗時は簡易版のスコアを維持
+        }
+      }
+
+      // === Step 7: 売れ行き目安（v2.1 5段階表示） ===
       const estSales = estimateMonthlySales(product.salesRank);
+      const salesLevelInfo = getSalesLevel(product.salesRank);
+
+      // === Step 8: 総合スコア（v2.1 加重和方式） ===
+      const compositeScore = calcCompositeScore({
+        profitRate: fbaFees ? profitRate : (fbmProfitRate || 0),
+        profit: fbaFees ? profit : (fbmProfit || 0),
+        salesLevel: salesLevelInfo.level,
+        competitionScore,
+        matchType,
+      });
+      const compositeRank = getCompositeRank(compositeScore);
 
       send('result', {
         idx, jan, partNumber, productName: productName || product.itemName,
@@ -790,7 +944,25 @@ router.post('/api/bulk-research/stream', async (req, res) => {
         dimensions: product.dimensions,
         estMonthlySales: estSales,
         manufacturer: product.manufacturer,
+        // v2.1: マッチング信頼度
         matchType,
+        matchConfidence,
+        keywordCandidates,
+        // v2.1: 概算コスト
+        estimatedShipping,
+        estimatedStorage,
+        // v2.1: 競合詳細
+        competitionScore,
+        competitionLabel: getCompetitionLabel(competitionScore),
+        amazonSeller: competitorData?.amazonSeller ?? null,
+        fbaSellerCount: competitorData?.fbaCount ?? null,
+        fbmSellerCount: competitorData?.fbmCount ?? null,
+        // v2.1: 売れ行き目安
+        salesLevel: salesLevelInfo.level,
+        salesLevelLabel: salesLevelInfo.label,
+        // v2.1: 総合スコア
+        compositeScore,
+        compositeRank,
         status: 'ok',
       });
 
@@ -802,6 +974,7 @@ router.post('/api/bulk-research/stream', async (req, res) => {
       send('result', {
         idx, jan, partNumber, productName, wholesalePrice,
         status: 'error', message: err.message,
+        matchType: 'none', matchConfidence: 'none',
       });
       // エラー後も少し待機
       await new Promise(r => setTimeout(r, 1000));

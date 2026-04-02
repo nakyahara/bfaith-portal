@@ -45,7 +45,15 @@
     .data-table .negative { color: #b12704; }
 
     .status-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: bold; white-space: nowrap; }
+    .status-badge.仮保存 { background: #fff3e0; color: #e65100; border: 1px dashed #ffcc80; }
     .status-badge.リサーチ { background: #e3e6e8; color: #444; }
+
+    /* v2.1: 仮保存→昇格チェックリスト */
+    .promote-checklist { background: #fff8e1; border: 1px solid #ffcc80; border-radius: 6px; padding: 12px; margin-top: 8px; }
+    .promote-checklist h4 { font-size: 12px; color: #e65100; margin-bottom: 8px; }
+    .promote-checklist label { display: block; font-size: 12px; margin-bottom: 6px; cursor: pointer; }
+    .promote-checklist input[type=checkbox] { margin-right: 6px; }
+    .promote-checklist .promote-btn { margin-top: 10px; }
     .status-badge.見積もり依頼予定 { background: #fce4ec; color: #ad1457; }
     .status-badge.見積もり依頼中 { background: #fff3cd; color: #856404; }
     .status-badge.回答済 { background: #ffd8a8; color: #a55000; }
@@ -145,6 +153,7 @@
       <button class="btn btn-add" onclick="openNewModal()">+ 新規登録</button>
       <select id="statusFilter" onchange="loadData()">
         <option value="">全ステータス</option>
+        <option value="仮保存">仮保存（要目視確認）</option>
         <option value="リサーチ">リサーチ</option>
         <option value="見積もり依頼予定">見積もり依頼予定</option>
         <option value="見積もり依頼中">見積もり依頼中</option>
@@ -288,7 +297,7 @@
     let debounceTimer = null;
     let allData = [];
     let expandedId = null;
-    const STATUSES = ['リサーチ', '見積もり依頼予定', '見積もり依頼中', '回答済', '判断中', '却下'];
+    const STATUSES = ['仮保存', 'リサーチ', '見積もり依頼予定', '見積もり依頼中', '回答済', '判断中', '却下'];
     let supplierList = [];
 
     document.addEventListener('DOMContentLoaded', () => {
@@ -385,6 +394,25 @@
             </div>
           </div>
         </div>
+
+        ${r.status === '仮保存' ? `
+        <!-- v2.1: 仮保存→昇格チェックリスト -->
+        <div class="promote-checklist">
+          <h4>⚠ この商品は「仮保存」です — 目視確認して昇格してください</h4>
+          <p style="font-size:11px; color:#555; margin-bottom:8px;">
+            一括リサーチで「商品名一致」で登録されたデータです。
+            <a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:#0066c0;">Amazonページを確認</a>し、
+            以下3項目をチェックしてから「リサーチに昇格」してください。
+          </p>
+          <label><input type="checkbox" class="promote-check" data-id="${r.id}" onchange="checkPromoteReady(${r.id})"> 商品が同一であること（商品名・画像がメーカー資料と一致）</label>
+          <label><input type="checkbox" class="promote-check" data-id="${r.id}" onchange="checkPromoteReady(${r.id})"> 容量・規格・セット内容が一致すること</label>
+          <label><input type="checkbox" class="promote-check" data-id="${r.id}" onchange="checkPromoteReady(${r.id})"> ブランド・メーカーが一致すること</label>
+          <div class="promote-btn">
+            <button class="btn" style="background:#e8f5e9; border-color:#2e7d32; color:#2e7d32;" onclick="promoteToResearch(${r.id})" id="promoteBtn-${r.id}" disabled>リサーチに昇格</button>
+            <button class="btn" style="background:#ffebee; border-color:#b71c1c; color:#b71c1c; margin-left:8px;" onclick="changeStatus(${r.id}, '却下')">削除（誤マッチ）</button>
+          </div>
+        </div>
+        ` : ''}
 
         <div class="detail-grid">
           <!-- 左: 見積もり依頼セクション -->
@@ -632,6 +660,36 @@
       if (r.lot) params.set('lot', r.lot);
       if (r.supplier_code) params.set('supplier', r.supplier_code);
       window.location.href = `./?${params.toString()}`;
+    }
+
+    // === v2.1: 仮保存→昇格チェック ===
+    function checkPromoteReady(id) {
+      const checks = document.querySelectorAll(`.promote-check[data-id="${id}"]`);
+      const allChecked = [...checks].every(cb => cb.checked);
+      const btn = document.getElementById(`promoteBtn-${id}`);
+      if (btn) btn.disabled = !allChecked;
+    }
+
+    async function promoteToResearch(id) {
+      const checks = document.querySelectorAll(`.promote-check[data-id="${id}"]`);
+      const allChecked = [...checks].every(cb => cb.checked);
+      if (!allChecked) { alert('3項目すべてにチェックを入れてください'); return; }
+
+      try {
+        const today = new Date().toISOString().slice(0, 10);
+        await fetch(`./api/research/${id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            status: 'リサーチ',
+            comment: `目視確認済み（${today}）- 商品同一性・規格・ブランド確認OK`,
+          }),
+        });
+        alert('「リサーチ」に昇格しました');
+        loadData();
+      } catch (e) {
+        alert('昇格に失敗しました: ' + e.message);
+      }
     }
 
     // === 詳細パネル内の即時再計算（税込のみ） ===
