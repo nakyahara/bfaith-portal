@@ -28,10 +28,12 @@ async function notify(text) {
 }
 
 function runScript(scriptPath, label) {
-  const fullPath = path.join(PROJECT_DIR, scriptPath);
+  const parts = scriptPath.split(' ');
+  const filePath = path.join(PROJECT_DIR, parts[0]);
+  const args = parts.slice(1).join(' ') || '7';
   console.log(`\n=== ${label} ===`);
   try {
-    const output = execSync(`node "${fullPath}" 7`, {
+    const output = execSync(`node "${filePath}" ${args}`, {
       cwd: PROJECT_DIR,
       timeout: 600000, // 10分タイムアウト
       encoding: 'utf-8',
@@ -54,6 +56,10 @@ async function main() {
   console.log(`[DailySync] 開始: ${startTime.toISOString()}`);
 
   const results = [];
+
+  // NE API（商品マスタ + セット商品 + 受注7日分）
+  const neResult = runScript('apps/warehouse/ne-api.js sync', 'NE API');
+  results.push({ name: 'NE', ...neResult });
 
   // SP-API
   const spResult = runScript('apps/warehouse/sp-api-orders.js', 'Amazon SP-API');
