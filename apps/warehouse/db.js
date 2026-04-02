@@ -381,7 +381,22 @@ function createTables() {
     GROUP BY o.seller_sku, o.title
   `);
 
-  // 12. 同期メタデータ
+  // 12. 変更履歴ログ（手動管理テーブルのCRUD操作を記録）
+  db.exec(`CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT,
+    table_name TEXT NOT NULL,
+    record_key TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    old_data TEXT,
+    new_data TEXT,
+    operator TEXT DEFAULT 'admin'
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_audit_table ON audit_log(table_name)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_audit_key ON audit_log(record_key)');
+
+  // 13. 同期メタデータ
   db.exec(`CREATE TABLE IF NOT EXISTS sync_meta (
     key                 TEXT PRIMARY KEY,
     value               TEXT,

@@ -501,39 +501,59 @@ router.get('/api/missing', (req, res) => {
   res.json({ rows, summary });
 });
 
+// ─── 監査ログ ヘルパー ───
+
+function auditLog(db, tableName, recordKey, operation, oldData, newData) {
+  const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  db.prepare('INSERT INTO audit_log (timestamp, table_name, record_key, operation, old_data, new_data) VALUES (?,?,?,?,?,?)').run(
+    ts, tableName, recordKey, operation,
+    oldData ? JSON.stringify(oldData) : null,
+    newData ? JSON.stringify(newData) : null
+  );
+}
+
 // ─── POST /api/shipping ───
-// 送料登録（個別）
+// 送料登録・更新
 
 router.post('/api/shipping', (req, res) => {
   const { sku, shipping_code, ship_method, ship_cost } = req.body;
   if (!sku || !ship_cost) return res.status(400).json({ error: 'sku と ship_cost は必須です' });
   const db = getDB();
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
-  db.prepare('INSERT OR REPLACE INTO product_shipping (sku, product_name, shipping_code, ship_method, ship_cost, note, synced_at) VALUES (?, (SELECT 商品名 FROM raw_ne_products WHERE 商品コード = ?), ?, ?, ?, ?, ?)').run(sku, sku, shipping_code || '', ship_method || '', parseFloat(ship_cost), '', now);
+  const old = db.prepare('SELECT * FROM product_shipping WHERE sku = ?').get(sku);
+  const newData = { sku, shipping_code: shipping_code || '', ship_method: ship_method || '', ship_cost: parseFloat(ship_cost) };
+  db.prepare('INSERT OR REPLACE INTO product_shipping (sku, product_name, shipping_code, ship_method, ship_cost, note, synced_at) VALUES (?, COALESCE((SELECT 商品名 FROM raw_ne_products WHERE 商品コード = ?), ?), ?, ?, ?, ?, ?)').run(sku, sku, old?.product_name || '', shipping_code || '', ship_method || '', parseFloat(ship_cost), old?.note || '', now);
+  auditLog(db, 'product_shipping', sku, old ? 'UPDATE' : 'INSERT', old || null, newData);
   res.json({ ok: true, sku, ship_cost });
 });
 
 // ─── POST /api/genka ───
-// 原価登録（例外原価）
+// 原価登録・更新
 
 router.post('/api/genka', (req, res) => {
   const { sku, genka, product_name } = req.body;
   if (!sku || genka === undefined) return res.status(400).json({ error: 'sku と genka は必須です' });
   const db = getDB();
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const old = db.prepare('SELECT * FROM exception_genka WHERE sku = ?').get(sku);
+  const newData = { sku, genka: parseFloat(genka), product_name: product_name || '' };
   db.prepare('INSERT OR REPLACE INTO exception_genka (sku, genka, 商品名, synced_at) VALUES (?, ?, ?, ?)').run(sku, parseFloat(genka), product_name || '', now);
+  auditLog(db, 'exception_genka', sku, old ? 'UPDATE' : 'INSERT', old || null, newData);
   res.json({ ok: true, sku, genka });
 });
 
 // ─── POST /api/skumap ───
-// SKUマップ登録（個別）
+// SKUマップ登録・更新
 
 router.post('/api/skumap', (req, res) => {
   const { seller_sku, asin, product_name, ne_code, quantity } = req.body;
   if (!seller_sku || !ne_code) return res.status(400).json({ error: 'seller_sku と ne_code は必須です' });
   const db = getDB();
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const old = db.prepare('SELECT * FROM sku_map WHERE seller_sku = ?').get(seller_sku);
+  const newData = { seller_sku, asin: asin || '', ne_code, quantity: parseInt(quantity) || 1 };
   db.prepare('INSERT OR REPLACE INTO sku_map (seller_sku, asin, 商品名, ne_code, 数量, synced_at) VALUES (?, ?, ?, ?, ?, ?)').run(seller_sku, asin || '', product_name || '', ne_code, parseInt(quantity) || 1, now);
+  auditLog(db, 'sku_map', seller_sku, old ? 'UPDATE' : 'INSERT', old || null, newData);
   res.json({ ok: true, seller_sku, ne_code });
 });
 
@@ -541,7 +561,9 @@ router.post('/api/skumap', (req, res) => {
 
 router.delete('/api/shipping/:sku', (req, res) => {
   const db = getDB();
+  const old = db.prepare('SELECT * FROM product_shipping WHERE sku = ?').get(req.params.sku);
   const result = db.prepare('DELETE FROM product_shipping WHERE sku = ?').run(req.params.sku);
+  if (old) auditLog(db, 'product_shipping', req.params.sku, 'DELETE', old, null);
   res.json({ ok: true, deleted: result.changes });
 });
 
@@ -549,7 +571,9 @@ router.delete('/api/shipping/:sku', (req, res) => {
 
 router.delete('/api/genka/:sku', (req, res) => {
   const db = getDB();
+  const old = db.prepare('SELECT * FROM exception_genka WHERE sku = ?').get(req.params.sku);
   const result = db.prepare('DELETE FROM exception_genka WHERE sku = ?').run(req.params.sku);
+  if (old) auditLog(db, 'exception_genka', req.params.sku, 'DELETE', old, null);
   res.json({ ok: true, deleted: result.changes });
 });
 
@@ -557,7 +581,9 @@ router.delete('/api/genka/:sku', (req, res) => {
 
 router.delete('/api/skumap/:sku', (req, res) => {
   const db = getDB();
+  const old = db.prepare('SELECT * FROM sku_map WHERE seller_sku = ?').get(req.params.sku);
   const result = db.prepare('DELETE FROM sku_map WHERE seller_sku = ?').run(req.params.sku);
+  if (old) auditLog(db, 'sku_map', req.params.sku, 'DELETE', old, null);
   res.json({ ok: true, deleted: result.changes });
 });
 
@@ -678,6 +704,20 @@ router.get('/api/missing/prioritized', (req, res) => {
   }
 
   res.json({ rows, summary });
+});
+
+// ─── GET /api/audit ───
+// 変更履歴ログ
+
+router.get('/api/audit', (req, res) => {
+  const { table_name, record_key, limit = '50' } = req.query;
+  let sql = 'SELECT * FROM audit_log WHERE 1=1';
+  const params = [];
+  if (table_name) { sql += ' AND table_name = ?'; params.push(table_name); }
+  if (record_key) { sql += ' AND record_key LIKE ?'; params.push(`%${record_key}%`); }
+  sql += ' ORDER BY id DESC LIMIT ?';
+  params.push(parseInt(limit));
+  res.json(execQuery(sql, params));
 });
 
 // ─── GET /api/shipping_rates ───
