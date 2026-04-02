@@ -29,12 +29,13 @@ function readCsvFile(filePath) {
     // UTF-8 BOM
     text = buf.toString('utf-8').substring(1);
   } else {
-    // まずUTF-8として試す。日本語が化けたらcp932
+    // まずUTF-8として試す
     const utf8 = buf.toString('utf-8');
-    // cp932の典型的なバイト列を検出
-    const hasHighBytes = buf.some((b, i) => b >= 0x80 && b <= 0xFC && i + 1 < buf.length && buf[i+1] >= 0x40);
-    const hasReplacementChar = utf8.includes('\ufffd');
-    if (hasReplacementChar || (hasHighBytes && !utf8.includes('商品') && !utf8.includes('受注'))) {
+    // replacement charの出現率で判定（少数なら部分的な文字化けでUTF-8が正しい）
+    const replacementCount = (utf8.match(/\ufffd/g) || []).length;
+    const totalChars = utf8.length;
+    if (replacementCount > totalChars * 0.01) {
+      // 1%以上化ける → cp932
       text = iconv.decode(buf, 'cp932');
     } else {
       text = utf8;
