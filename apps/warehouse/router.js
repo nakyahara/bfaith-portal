@@ -558,10 +558,10 @@ router.post('/api/skumap', (req, res) => {
   if (!seller_sku || !ne_code) return res.status(400).json({ error: 'seller_sku と ne_code は必須です' });
   const db = getDB();
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
-  const old = db.prepare('SELECT * FROM sku_map WHERE seller_sku = ?').get(seller_sku);
+  const old = db.prepare('SELECT * FROM sku_map WHERE seller_sku = ? AND ne_code = ?').get(seller_sku, ne_code);
   const newData = { seller_sku, asin: asin || '', ne_code, quantity: parseInt(quantity) || 1 };
   db.prepare('INSERT OR REPLACE INTO sku_map (seller_sku, asin, 商品名, ne_code, 数量, synced_at) VALUES (?, ?, ?, ?, ?, ?)').run(seller_sku, asin || '', product_name || '', ne_code, parseInt(quantity) || 1, now);
-  auditLog(db, 'sku_map', seller_sku, old ? 'UPDATE' : 'INSERT', old || null, newData);
+  auditLog(db, 'sku_map', seller_sku + ':' + ne_code, old ? 'UPDATE' : 'INSERT', old || null, newData);
   res.json({ ok: true, seller_sku, ne_code });
 });
 
@@ -586,13 +586,22 @@ router.delete('/api/genka/:sku', (req, res) => {
 });
 
 // ─── DELETE /api/skumap/:sku ───
+// ne_codeが指定されていればその1行、なければSKU全行を削除
 
 router.delete('/api/skumap/:sku', (req, res) => {
   const db = getDB();
-  const old = db.prepare('SELECT * FROM sku_map WHERE seller_sku = ?').get(req.params.sku);
-  const result = db.prepare('DELETE FROM sku_map WHERE seller_sku = ?').run(req.params.sku);
-  if (old) auditLog(db, 'sku_map', req.params.sku, 'DELETE', old, null);
-  res.json({ ok: true, deleted: result.changes });
+  const ne_code = req.query.ne_code;
+  if (ne_code) {
+    const old = db.prepare('SELECT * FROM sku_map WHERE seller_sku = ? AND ne_code = ?').get(req.params.sku, ne_code);
+    const result = db.prepare('DELETE FROM sku_map WHERE seller_sku = ? AND ne_code = ?').run(req.params.sku, ne_code);
+    if (old) auditLog(db, 'sku_map', req.params.sku + ':' + ne_code, 'DELETE', old, null);
+    res.json({ ok: true, deleted: result.changes });
+  } else {
+    const olds = db.prepare('SELECT * FROM sku_map WHERE seller_sku = ?').all(req.params.sku);
+    const result = db.prepare('DELETE FROM sku_map WHERE seller_sku = ?').run(req.params.sku);
+    for (const old of olds) auditLog(db, 'sku_map', req.params.sku + ':' + old.ne_code, 'DELETE', old, null);
+    res.json({ ok: true, deleted: result.changes });
+  }
 });
 
 // ─── GET /api/shipping/list ───
@@ -995,13 +1004,21 @@ function renderDashboard(stats) {
       } else if (action === 'update-skumap') {
         const inputs = btn.closest('tr')?.querySelectorAll('input');
         if (!inputs || inputs.length < 2) return;
+        const oldNe = btn.dataset.ne || '';
+        // 古いレコードを削除してから新しいのを挿入（ne_codeが変わる可能性）
+        if (oldNe && oldNe !== inputs[0].value) {
+          await api('/api/skumap/' + encodeURIComponent(sku) + '?ne_code=' + encodeURIComponent(oldNe), { method: 'DELETE' });
+        }
         await api('/api/skumap', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ seller_sku: sku, ne_code: inputs[0].value, product_name: name, quantity: inputs[1].value }) });
         toast(sku + ' のSKUマップを更新しました');
         loadManage(currentManageType);
       } else if (action === 'delete') {
         if (!confirm(sku + ' を削除しますか？')) return;
-        const endpoint = type === 'shipping' ? '/api/shipping/' : type === 'genka' ? '/api/genka/' : '/api/skumap/';
-        await api(endpoint + encodeURIComponent(sku), { method: 'DELETE' });
+        const ne = btn.dataset.ne || '';
+        let endpoint = type === 'shipping' ? '/api/shipping/' : type === 'genka' ? '/api/genka/' : '/api/skumap/';
+        let url = endpoint + encodeURIComponent(sku);
+        if (type === 'skumap' && ne) url += '?ne_code=' + encodeURIComponent(ne);
+        await api(url, { method: 'DELETE' });
         toast(sku + ' を削除しました');
         loadManage(currentManageType);
       }
@@ -1072,7 +1089,7 @@ function renderDashboard(stats) {
           html += '<tr><td>' + he(r.seller_sku) + '</td><td>' + he(r.asin||'') + '</td><td>' + he((r.商品名||'').slice(0,25)) + '</td>';
           html += '<td><input value="' + he(r.ne_code||'') + '" style="width:120px"></td>';
           html += '<td><input value="' + (r.数量||1) + '" style="width:40px"></td>';
-          html += '<td><button class="btn btn-sm btn-primary" data-action="update-skumap" data-sku="' + he(r.seller_sku) + '" data-name="' + he(r.商品名) + '">更新</button> <button class="btn btn-sm" style="background:#e74c3c;color:white" data-action="delete" data-type="skumap" data-sku="' + he(r.seller_sku) + '">削除</button></td></tr>';
+          html += '<td><button class="btn btn-sm btn-primary" data-action="update-skumap" data-sku="' + he(r.seller_sku) + '" data-ne="' + he(r.ne_code) + '" data-name="' + he(r.商品名) + '">更新</button> <button class="btn btn-sm" style="background:#e74c3c;color:white" data-action="delete" data-type="skumap" data-sku="' + he(r.seller_sku) + '" data-ne="' + he(r.ne_code) + '">削除</button></td></tr>';
         }
       }
       html += '</table>';

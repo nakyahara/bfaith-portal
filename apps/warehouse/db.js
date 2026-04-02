@@ -131,17 +131,19 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_lz_product ON raw_lz_inventory(商品ID)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_lz_expiry ON raw_lz_inventory(有効期限)');
 
-  // 5. SKUマッピング（Amazon SKU ↔ NE商品コード）
+  // 5. SKUマッピング（Amazon SKU ↔ NE商品コード、1 SKU = 複数NE商品コード可）
   db.exec(`CREATE TABLE IF NOT EXISTS sku_map (
-    seller_sku          TEXT PRIMARY KEY,
+    seller_sku          TEXT NOT NULL,
     asin                TEXT,
     商品名              TEXT,
-    ne_code             TEXT,
+    ne_code             TEXT NOT NULL,
     数量                INTEGER DEFAULT 1,
-    synced_at           TEXT
+    synced_at           TEXT,
+    PRIMARY KEY (seller_sku, ne_code)
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_sku_map_asin ON sku_map(asin)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_sku_map_ne ON sku_map(ne_code)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_sku_map_sku ON sku_map(seller_sku)');
 
   // 6. 配送区分マスタ
   db.exec(`CREATE TABLE IF NOT EXISTS shipping_rates (
