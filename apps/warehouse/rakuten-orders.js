@@ -128,7 +128,7 @@ async function getOrderDetails(orderNumbers) {
         items.push({
           ...orderInfo,
           itemDetailId: item.itemDetailId || 0,
-          itemNumber: item.itemNumber || '',
+          itemNumber: (item.itemNumber || '').toLowerCase(),
           itemName: item.itemName || '',
           price: item.price ?? 0,
           priceTaxIncl: item.priceTaxIncl ?? 0,

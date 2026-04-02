@@ -89,7 +89,7 @@ function importProducts(filePath) {
   const tx = db.transaction(() => {
     let count = 0;
     for (const row of rows) {
-      const code = row[0]?.trim();
+      const code = (row[0]?.trim() || '').toLowerCase();
       if (!code) continue;
       stmt.run(code, row[1]||'', row[2]||'', parseFloat(row[3])||0, parseFloat(row[4])||0,
         row[5]||'', row[6]||'', row[7]||'', row[8]||'', parseInt(row[9])||0,
@@ -121,7 +121,7 @@ function importOrders(filePath) {
       try {
         stmt.run(denpyo, row[1]||'', row[2]||'', row[3]||'', row[4]||'',
           row[5]||'', row[6]||'', row[7]||'', row[8]||'',
-          lineNo, row[10]||'', row[11]||'', row[12]||'', row[13]||'',
+          lineNo, row[10]||'', row[11]||'', (row[12] || '').toLowerCase(), row[13]||'',
           row[14]||'', parseInt(row[15])||0, parseInt(row[16])||0, parseFloat(row[17])||0, now());
         inserted++;
       } catch { skipped++; }
@@ -140,8 +140,8 @@ function importSetProducts(filePath) {
   const tx = db.transaction(() => {
     let count = 0;
     for (const row of rows) {
-      const setCode = row[0]?.trim();
-      const childCode = row[3]?.trim();
+      const setCode = (row[0]?.trim() || '').toLowerCase();
+      const childCode = (row[3]?.trim() || '').toLowerCase();
       if (!setCode || !childCode) continue;
       stmt.run(setCode, row[1]||'', parseFloat(row[2])||0, childCode,
         parseInt(row[4])||1, parseInt(row[5])||0, row[6]||'', now());
@@ -173,9 +173,10 @@ function importSkuMap(filePath) {
   const tx = db.transaction(() => {
     let count = 0;
     for (const row of rows) {
-      const sku = row[0]?.trim();
+      const sku = (row[0]?.trim() || '').toLowerCase();
       if (!sku) continue;
-      stmt.run(sku, row[1]||'', row[2]||'', row[3]||'', parseInt(row[4])||1, now());
+      const neCode = (row[3] || '').toLowerCase();
+      stmt.run(sku, row[1]||'', row[2]||'', neCode, parseInt(row[4])||1, now());
       count++;
     }
     return count;
@@ -198,7 +199,7 @@ function importLogizard(filePath) {
   const tx = db.transaction(() => {
     let count = 0;
     for (const row of rows) {
-      const productId = row[col('商品ID')]?.trim();
+      const productId = (row[col('商品ID')]?.trim() || '').toLowerCase();
       if (!productId) continue;
       stmt.run(productId, row[col('商品名')]||'', row[col('バーコード')]||'',
         row[col('ブロック略称')]||'', row[col('ロケ')]||'', row[col('品質区分名')]||'',

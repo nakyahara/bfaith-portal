@@ -524,7 +524,8 @@ function auditLog(db, tableName, recordKey, operation, oldData, newData) {
 // 送料登録・更新
 
 router.post('/api/shipping', (req, res) => {
-  const { sku, shipping_code, ship_method, ship_cost } = req.body;
+  const sku = (req.body.sku || '').toLowerCase();
+  const { shipping_code, ship_method, ship_cost } = req.body;
   if (!sku || !ship_cost) return res.status(400).json({ error: 'sku と ship_cost は必須です' });
   const db = getDB();
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
@@ -539,7 +540,8 @@ router.post('/api/shipping', (req, res) => {
 // 原価登録・更新
 
 router.post('/api/genka', (req, res) => {
-  const { sku, genka, product_name } = req.body;
+  const sku = (req.body.sku || '').toLowerCase();
+  const { genka, product_name } = req.body;
   if (!sku || genka === undefined) return res.status(400).json({ error: 'sku と genka は必須です' });
   const db = getDB();
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
@@ -554,7 +556,9 @@ router.post('/api/genka', (req, res) => {
 // SKUマップ登録・更新
 
 router.post('/api/skumap', (req, res) => {
-  const { seller_sku, asin, product_name, ne_code, quantity } = req.body;
+  const seller_sku = (req.body.seller_sku || '').toLowerCase();
+  const ne_code = (req.body.ne_code || '').toLowerCase();
+  const { asin, product_name, quantity } = req.body;
   if (!seller_sku || !ne_code) return res.status(400).json({ error: 'seller_sku と ne_code は必須です' });
   const db = getDB();
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
