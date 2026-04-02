@@ -412,7 +412,7 @@ router.get('/api/shops', (req, res) => {
 // 任意SQLクエリ（SELECT限定、AI分析用）
 
 router.get('/api/query', (req, res) => {
-  const { sql } = req.query;
+  let { sql } = req.query;
   if (!sql) return res.status(400).json({ error: 'sql パラメータが必要です' });
 
   // SELECT文のみ許可
@@ -422,14 +422,22 @@ router.get('/api/query', (req, res) => {
   }
 
   // 危険なキーワードチェック
-  const forbidden = ['DROP', 'DELETE', 'UPDATE', 'INSERT', 'ALTER', 'CREATE', 'ATTACH', 'DETACH'];
+  const forbidden = ['DROP', 'DELETE', 'UPDATE', 'INSERT', 'ALTER', 'CREATE', 'ATTACH', 'DETACH', 'PRAGMA'];
   for (const kw of forbidden) {
     if (normalized.includes(kw)) {
       return res.status(403).json({ error: `${kw} は使用できません` });
     }
   }
 
+  // LIMIT強制（指定がなければ500件に制限）
+  if (!normalized.includes('LIMIT')) {
+    sql = sql.trim().replace(/;$/, '') + ' LIMIT 500';
+  }
+
   try {
+    const db = getDB();
+    // 5秒タイムアウト（重いクエリ防止）
+    db.pragma('busy_timeout = 5000');
     const rows = execQuery(sql);
     res.json({ rows, count: rows.length });
   } catch (e) {
@@ -634,52 +642,63 @@ router.get('/api/skumap/list', (req, res) => {
 // 未登録データ（直近売上のある商品を優先）
 
 router.get('/api/missing/prioritized', (req, res) => {
-  const { type, days = '30' } = req.query;
+  const { type } = req.query;
   const db = getDB();
-  const cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() - parseInt(days));
-  const cutoffStr = cutoff.toISOString().slice(0, 10);
+  const now = new Date();
+  const cutoff7 = new Date(now); cutoff7.setDate(cutoff7.getDate() - 7);
+  const cutoff30 = new Date(now); cutoff30.setDate(cutoff30.getDate() - 30);
+  const cutoff7Str = cutoff7.toISOString().slice(0, 10);
+  const cutoff30Str = cutoff30.toISOString().slice(0, 10);
 
   let rows = [];
 
   if (!type || type === 'shipping') {
-    // 送料未登録で直近売れた商品
     rows = rows.concat(db.prepare(`
       SELECT 'shipping' as missing_type, p.商品コード, p.商品名, p.売価, p.原価, p.取扱区分,
-        COALESCE(s.qty, 0) as recent_sales_qty,
-        s.last_sold
+        COALESCE(s30.qty, 0) as recent_sales_qty,
+        COALESCE(s7.qty, 0) as sales_7d,
+        COALESCE(s30.qty, 0) as sales_30d,
+        s30.last_sold,
+        CASE WHEN s7.qty > 0 THEN 'A_7日以内' WHEN s30.qty > 0 THEN 'B_30日以内' ELSE 'C_実績なし' END as priority
       FROM raw_ne_products p
       LEFT JOIN product_shipping ps ON p.商品コード = ps.sku
       LEFT JOIN (
-        SELECT 商品コード, SUM(受注数) as qty, MAX(SUBSTR(受注日,1,10)) as last_sold
-        FROM raw_ne_orders
-        WHERE キャンセル区分 = '有効' AND SUBSTR(受注日,1,10) >= ?
-        GROUP BY 商品コード
-      ) s ON p.商品コード = s.商品コード
+        SELECT 商品コード, SUM(受注数) as qty FROM raw_ne_orders
+        WHERE キャンセル区分 = '有効' AND SUBSTR(受注日,1,10) >= ? GROUP BY 商品コード
+      ) s7 ON p.商品コード = s7.商品コード
+      LEFT JOIN (
+        SELECT 商品コード, SUM(受注数) as qty, MAX(SUBSTR(受注日,1,10)) as last_sold FROM raw_ne_orders
+        WHERE キャンセル区分 = '有効' AND SUBSTR(受注日,1,10) >= ? GROUP BY 商品コード
+      ) s30 ON p.商品コード = s30.商品コード
       WHERE p.取扱区分 = '取扱中' AND ps.sku IS NULL
-      ORDER BY COALESCE(s.qty, 0) DESC, p.商品コード
+      ORDER BY priority, COALESCE(s7.qty, 0) DESC, COALESCE(s30.qty, 0) DESC
       LIMIT 200
-    `).all(cutoffStr));
+    `).all(cutoff7Str, cutoff30Str));
   }
 
   if (!type || type === 'genka') {
     rows = rows.concat(db.prepare(`
       SELECT 'genka' as missing_type, p.商品コード, p.商品名, p.売価, p.原価, p.取扱区分,
-        COALESCE(s.qty, 0) as recent_sales_qty,
-        s.last_sold
+        COALESCE(s30.qty, 0) as recent_sales_qty,
+        COALESCE(s7.qty, 0) as sales_7d,
+        COALESCE(s30.qty, 0) as sales_30d,
+        s30.last_sold,
+        CASE WHEN s7.qty > 0 THEN 'A_7日以内' WHEN s30.qty > 0 THEN 'B_30日以内' ELSE 'C_実績なし' END as priority
       FROM raw_ne_products p
       LEFT JOIN exception_genka eg ON p.商品コード = eg.sku
       LEFT JOIN raw_ne_set_products sp ON p.商品コード = sp.セット商品コード
       LEFT JOIN (
-        SELECT 商品コード, SUM(受注数) as qty, MAX(SUBSTR(受注日,1,10)) as last_sold
-        FROM raw_ne_orders
-        WHERE キャンセル区分 = '有効' AND SUBSTR(受注日,1,10) >= ?
-        GROUP BY 商品コード
-      ) s ON p.商品コード = s.商品コード
+        SELECT 商品コード, SUM(受注数) as qty FROM raw_ne_orders
+        WHERE キャンセル区分 = '有効' AND SUBSTR(受注日,1,10) >= ? GROUP BY 商品コード
+      ) s7 ON p.商品コード = s7.商品コード
+      LEFT JOIN (
+        SELECT 商品コード, SUM(受注数) as qty, MAX(SUBSTR(受注日,1,10)) as last_sold FROM raw_ne_orders
+        WHERE キャンセル区分 = '有効' AND SUBSTR(受注日,1,10) >= ? GROUP BY 商品コード
+      ) s30 ON p.商品コード = s30.商品コード
       WHERE p.取扱区分 = '取扱中' AND (p.原価 IS NULL OR p.原価 = 0) AND eg.sku IS NULL AND sp.セット商品コード IS NULL
-      ORDER BY COALESCE(s.qty, 0) DESC, p.商品コード
+      ORDER BY priority, COALESCE(s7.qty, 0) DESC, COALESCE(s30.qty, 0) DESC
       LIMIT 200
-    `).all(cutoffStr));
+    `).all(cutoff7Str, cutoff30Str));
   }
 
   if (!type || type === 'sku_map') {
@@ -687,15 +706,19 @@ router.get('/api/missing/prioritized', (req, res) => {
       SELECT DISTINCT 'sku_map' as missing_type, o.seller_sku as 商品コード, o.title as 商品名,
         NULL as 売価, NULL as 原価, NULL as 取扱区分,
         SUM(o.quantity) as recent_sales_qty,
-        MAX(SUBSTR(o.purchase_date, 1, 10)) as last_sold
+        SUM(CASE WHEN SUBSTR(o.purchase_date,1,10) >= ? THEN o.quantity ELSE 0 END) as sales_7d,
+        SUM(o.quantity) as sales_30d,
+        MAX(SUBSTR(o.purchase_date, 1, 10)) as last_sold,
+        CASE WHEN SUM(CASE WHEN SUBSTR(o.purchase_date,1,10) >= ? THEN o.quantity ELSE 0 END) > 0 THEN 'A_7日以内'
+          ELSE 'B_30日以内' END as priority
       FROM raw_sp_orders o
       LEFT JOIN sku_map sm ON o.seller_sku = sm.seller_sku
       WHERE sm.seller_sku IS NULL AND o.order_status NOT IN ('Cancelled')
         AND SUBSTR(o.purchase_date, 1, 10) >= ?
       GROUP BY o.seller_sku, o.title
-      ORDER BY SUM(o.quantity) DESC
+      ORDER BY priority, sales_7d DESC, sales_30d DESC
       LIMIT 200
-    `).all(cutoffStr));
+    `).all(cutoff7Str, cutoff7Str, cutoff30Str));
   }
 
   const summary = {};
@@ -930,13 +953,16 @@ function renderDashboard(stats) {
     // 未登録データ（売上実績で優先順位付け）
     async function loadMissing(type, btn) {
       if (btn) { document.querySelectorAll('#tab-missing .tab-nav button').forEach(b => b.classList.remove('active')); btn.classList.add('active'); }
-      const data = await api('/api/missing/prioritized?type=' + type + '&days=30');
+      const data = await api('/api/missing/prioritized?type=' + type);
       const rows = data.rows || [];
-      let html = '<table class="data"><tr><th>商品コード</th><th>商品名</th><th>売価</th><th>原価</th><th>直近30日売上</th><th>最終販売日</th><th>アクション</th></tr>';
+      let html = '<table class="data"><tr><th>優先度</th><th>商品コード</th><th>商品名</th><th>売価</th><th>7日</th><th>30日</th><th>最終販売</th><th>アクション</th></tr>';
       for (const r of rows.slice(0, 100)) {
-        const salesBadge = r.recent_sales_qty > 0 ? '<span style="color:#c0392b;font-weight:bold">' + r.recent_sales_qty + '個</span>' : '<span style="color:#aaa">0</span>';
+        const priorityBadge = r.priority === 'A_7日以内' ? '<span style="background:#e74c3c;color:white;padding:2px 6px;border-radius:3px;font-size:11px">7日</span>'
+          : r.priority === 'B_30日以内' ? '<span style="background:#f39c12;color:white;padding:2px 6px;border-radius:3px;font-size:11px">30日</span>'
+          : '<span style="color:#aaa;font-size:11px">-</span>';
+        const salesBadge = (r.sales_7d || 0) + '/' + (r.sales_30d || 0);
         const esc = (s) => (s||'').replace(/'/g, "\\'").replace(/"/g, '&quot;');
-        html += '<tr><td>' + r.商品コード + '</td><td>' + (r.商品名||'').slice(0,35) + '</td><td>' + (r.売価||'-') + '</td><td>' + (r.原価||'-') + '</td><td>' + salesBadge + '</td><td>' + (r.last_sold||'-') + '</td><td>';
+        html += '<tr><td>' + priorityBadge + '</td><td>' + r.商品コード + '</td><td>' + (r.商品名||'').slice(0,30) + '</td><td>' + (r.売価||'-') + '</td><td>' + salesBadge + '</td><td>' + (r.last_sold||'-') + '</td><td>';
         if (type === 'shipping') {
           html += '<select id="rate-' + r.商品コード + '">' + RATES.map(rt => '<option value="' + rt.shipping_code + '|' + rt.小分類区分名称 + '|' + rt.配送関係費合計 + '">' + rt.小分類区分名称 + ' (' + rt.配送関係費合計 + '円)</option>').join('') + '</select> ';
           html += '<button class="btn btn-sm btn-primary" onclick="registerShipping(\'' + esc(r.商品コード) + '\')">登録</button>';
