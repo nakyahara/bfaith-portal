@@ -206,7 +206,73 @@ async function fetchProducts() {
   return total;
 }
 
-// ─── 受注データ取得 ───
+// ─── セット商品取得 ───
+
+async function fetchSetProducts() {
+  console.log('[NE] セット商品取得開始');
+  await initDB();
+  const db = getDB();
+  const ts = now();
+
+  const fields = 'set_goods_id,set_goods_name,set_goods_selling_price,set_goods_detail_goods_id,set_goods_detail_quantity,set_goods_representation_id';
+
+  // 全件洗い替え
+  db.exec('DELETE FROM raw_ne_set_products');
+
+  const stmt = db.prepare(`
+    INSERT OR REPLACE INTO raw_ne_set_products (
+      セット商品コード, セット商品名, セット販売価格,
+      商品コード, 数量, セット在庫数, 代表商品コード, synced_at
+    ) VALUES (?,?,?,?,?,?,?,?)
+  `);
+
+  let offset = 0;
+  let total = 0;
+  const LIMIT = 1000;
+
+  while (true) {
+    const data = await callNE('/api_v1_master_setgoods/search', {
+      fields,
+      limit: String(LIMIT),
+      offset: String(offset),
+    });
+
+    const items = data.data || [];
+    if (items.length === 0) break;
+
+    const tx = db.transaction(() => {
+      for (const item of items) {
+        const setCode = (item.set_goods_id || '').toLowerCase();
+        const childCode = (item.set_goods_detail_goods_id || '').toLowerCase();
+        if (!setCode || !childCode) continue;
+        stmt.run(
+          setCode,
+          item.set_goods_name || '',
+          parseFloat(item.set_goods_selling_price) || 0,
+          childCode,
+          parseInt(item.set_goods_detail_quantity) || 1,
+          0,  // セット在庫数（APIでは取得不可、stock APIが必要）
+          (item.set_goods_representation_id || '').toLowerCase(),
+          ts
+        );
+        total++;
+      }
+    });
+    tx();
+
+    console.log(`[NE] セット商品: ${total}件取得 (offset: ${offset})`);
+    offset += LIMIT;
+
+    if (items.length < LIMIT) break;
+  }
+
+  updateSyncMeta('ne_api_setproducts_last', now());
+  updateSyncMeta('ne_api_setproducts_count', String(total));
+  console.log(`[NE] セット商品取得完了: ${total}件`);
+  return total;
+}
+
+// ─── 受注データ取得（base + row JOIN）───
 
 async function fetchOrders(days = 7) {
   console.log(`[NE] 受注データ取得開始（直近${days}日）`);
@@ -220,7 +286,35 @@ async function fetchOrders(days = 7) {
   const startStr = startDate.toISOString().slice(0, 10) + ' 00:00:00';
   const endStr = endDate.toISOString().slice(0, 10) + ' 23:59:59';
 
-  const fields = 'receive_order_row_receive_order_id,receive_order_row_shop_cut_form_id,receive_order_row_no,receive_order_row_goods_id,receive_order_row_goods_name,receive_order_row_goods_option,receive_order_row_quantity,receive_order_row_stock_allocation_quantity,receive_order_row_sub_total_price,receive_order_row_cancel_flag,receive_order_row_received_time_first_cost';
+  // Step 1: 受注ベース（伝票レベル）を取得 → Mapに保持
+  console.log('[NE] Step 1: 受注ベース取得');
+  const baseFields = 'receive_order_id,receive_order_shop_cut_form_id,receive_order_date,receive_order_shop_id,receive_order_order_status_id,receive_order_order_status_name,receive_order_send_date,receive_order_cancel_type_id,receive_order_cancel_date';
+  const baseMap = new Map(); // 伝票番号 → base情報
+
+  let baseOffset = 0;
+  while (true) {
+    const data = await callNE('/api_v1_receiveorder_base/search', {
+      fields: baseFields,
+      'receive_order_date-gte': startStr,
+      'receive_order_date-lte': endStr,
+      limit: '1000',
+      offset: String(baseOffset),
+    });
+    const items = data.data || [];
+    if (items.length === 0) break;
+
+    for (const item of items) {
+      const id = item.receive_order_id || '';
+      if (id) baseMap.set(id, item);
+    }
+    console.log(`[NE] 受注ベース: ${baseMap.size}件 (offset: ${baseOffset})`);
+    baseOffset += 1000;
+    if (items.length < 1000) break;
+  }
+
+  // Step 2: 受注明細を取得し、baseとJOINしてINSERT
+  console.log('[NE] Step 2: 受注明細取得 + JOIN');
+  const rowFields = 'receive_order_row_receive_order_id,receive_order_row_shop_cut_form_id,receive_order_row_no,receive_order_row_goods_id,receive_order_row_goods_name,receive_order_row_goods_option,receive_order_row_quantity,receive_order_row_stock_allocation_quantity,receive_order_row_sub_total_price,receive_order_row_cancel_flag';
 
   const stmt = db.prepare(`
     INSERT OR IGNORE INTO raw_ne_orders (
@@ -231,18 +325,17 @@ async function fetchOrders(days = 7) {
     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `);
 
-  let offset = 0;
+  let rowOffset = 0;
   let total = 0;
   let inserted = 0;
-  const LIMIT = 1000;
 
   while (true) {
     const data = await callNE('/api_v1_receiveorder_row/search', {
-      fields,
+      fields: rowFields,
       'receive_order_date-gte': startStr,
       'receive_order_date-lte': endStr,
-      limit: String(LIMIT),
-      offset: String(offset),
+      limit: '1000',
+      offset: String(rowOffset),
     });
 
     const items = data.data || [];
@@ -254,17 +347,20 @@ async function fetchOrders(days = 7) {
         const lineNo = parseInt(item.receive_order_row_no) || 0;
         if (!denpyo || !lineNo) continue;
 
+        // baseからJOIN
+        const base = baseMap.get(denpyo) || {};
+
         try {
           stmt.run(
             denpyo,
-            item.receive_order_row_shop_cut_form_id || '',
-            '',  // 受注状態区分（明細APIでは取得不可）
-            '',  // 受注状態
-            '',  // 受注キャンセル
-            '',  // 受注キャンセル日
-            '',  // 受注日（明細APIでは取得不可、検索条件の日付範囲で代替）
-            '',  // 店舗コード
-            '',  // 出荷確定日
+            item.receive_order_row_shop_cut_form_id || base.receive_order_shop_cut_form_id || '',
+            base.receive_order_order_status_id || '',
+            base.receive_order_order_status_name || '',
+            base.receive_order_cancel_type_id ? 'キャンセル' : '有効な受注です。',
+            base.receive_order_cancel_date || '',
+            base.receive_order_date || '',
+            base.receive_order_shop_id || '',
+            base.receive_order_send_date || '',
             lineNo,
             '',  // レコードナンバー
             item.receive_order_row_cancel_flag === '1' ? 'キャンセル' : '有効',
@@ -285,15 +381,14 @@ async function fetchOrders(days = 7) {
     });
     tx();
 
-    console.log(`[NE] 受注データ: ${total}件処理, ${inserted}件挿入 (offset: ${offset})`);
-    offset += LIMIT;
-
-    if (items.length < LIMIT) break;
+    console.log(`[NE] 受注明細: ${total}件処理, ${inserted}件挿入 (offset: ${rowOffset})`);
+    rowOffset += 1000;
+    if (items.length < 1000) break;
   }
 
   updateSyncMeta('ne_api_orders_last', now());
   updateSyncMeta('ne_api_orders_range', `${startStr} ~ ${endStr}`);
-  console.log(`[NE] 受注データ取得完了: ${total}件処理, ${inserted}件挿入`);
+  console.log(`[NE] 受注データ取得完了: base ${baseMap.size}件, row ${total}件処理, ${inserted}件挿入`);
   return { total, inserted };
 }
 
@@ -325,15 +420,19 @@ async function main() {
   } else if (command === 'orders') {
     const days = parseInt(args[1]) || 7;
     await fetchOrders(days);
+  } else if (command === 'setproducts') {
+    await fetchSetProducts();
   } else if (command === 'sync') {
     await fetchProducts();
+    await fetchSetProducts();
     await fetchOrders(7);
   } else {
     console.log('使い方:');
     console.log('  node apps/warehouse/ne-api.js auth <callback_url>  → 初回認証');
     console.log('  node apps/warehouse/ne-api.js products             → 商品マスタ取得');
+    console.log('  node apps/warehouse/ne-api.js setproducts          → セット商品取得');
     console.log('  node apps/warehouse/ne-api.js orders [days]        → 受注データ取得');
-    console.log('  node apps/warehouse/ne-api.js sync                 → 商品+受注7日分');
+    console.log('  node apps/warehouse/ne-api.js sync                 → 全て（商品+セット+受注7日分）');
     process.exit(1);
   }
 }
