@@ -108,7 +108,10 @@ async function fetchQoo10(days = 7) {
   return total;
 }
 
-// ─── au PAY Market ───
+// ─── au PAY Market（Wow! manager API — wmshopapi） ───
+
+const AUPAY_SHOP_ID = process.env.AUPAY_SHOP_ID || '54318092';
+const AUPAY_BASE = 'https://api.manager.wowma.jp/wmshopapi';
 
 async function fetchAuPay(days = 7) {
   const apiKey = process.env.AUPAY_API_KEY;
@@ -119,8 +122,8 @@ async function fetchAuPay(days = 7) {
   const ts = now();
   const end = new Date();
   const start = new Date(); start.setDate(start.getDate() - days);
-  const startStr = start.toISOString().slice(0, 10).replace(/-/g, '') + '000000';
-  const endStr = end.toISOString().slice(0, 10).replace(/-/g, '') + '235959';
+  const startDate = start.toISOString().slice(0, 10).replace(/-/g, '');
+  const endDate = end.toISOString().slice(0, 10).replace(/-/g, '');
 
   const stmt = db.prepare(`
     INSERT OR REPLACE INTO raw_aupay_orders (order_id, order_date, order_status, item_code, item_name, quantity, unit_price, total_price, option_info, synced_at)
@@ -128,44 +131,67 @@ async function fetchAuPay(days = 7) {
   `);
 
   let total = 0;
-  let offset = 0;
+  let startCount = 1;
+  const pageSize = 100;
 
   while (true) {
-    const params = new URLSearchParams({
-      searchStartDate: startStr,
-      searchEndDate: endStr,
-      searchDateType: '1',
-      tradeStatus: '1,2,3,4',
-      limit: '1000',
-      offset: String(offset),
+    const qs = new URLSearchParams({
+      shopId: AUPAY_SHOP_ID,
+      totalCount: String(pageSize),
+      startCount: String(startCount),
+      startDate,
+      endDate,
+      dateType: '0',  // 0=受注日
     });
 
-    const res = await fetch('https://api.manager.wowma.jp/wmopen/searchTradeInfo', {
-      method: 'POST',
+    const url = `${AUPAY_BASE}/searchTradeInfoListProc?${qs}`;
+    const res = await fetch(url, {
+      method: 'GET',
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/x-www-form-urlencoded',
       },
-      body: params.toString(),
     });
 
-    const data = await res.json();
-    if (data.resultCode !== 'N000' || !data.tradeInfoList) break;
+    const xml = await res.text();
+    const parsed = await parseStringPromise(xml, { explicitArray: false });
+    const response = parsed.response;
+
+    if (response.result?.status !== '0') {
+      const err = response.result?.error;
+      console.log(`[auPay] APIエラー: ${err?.code} ${err?.message}`);
+      break;
+    }
+
+    const resultCount = parseInt(response.resultCount) || 0;
+    if (resultCount === 0) break;
+
+    // orderInfoが1件の場合はオブジェクト、複数の場合は配列
+    const orders = Array.isArray(response.orderInfo) ? response.orderInfo : [response.orderInfo];
 
     const tx = db.transaction(() => {
-      for (const trade of data.tradeInfoList) {
-        const details = trade.tradeDetailList || [];
+      for (const order of orders) {
+        if (!order) continue;
+        const orderId = order.orderId || '';
+        const orderDate = order.orderDate || '';
+        const orderStatus = order.orderStatus || '';
+
+        // detailが1件の場合はオブジェクト、複数の場合は配列
+        const details = order.detail
+          ? (Array.isArray(order.detail) ? order.detail : [order.detail])
+          : [];
+
         for (const detail of details) {
           stmt.run(
-            trade.tradeId || '',
-            trade.orderDate || '',
-            String(trade.tradeStatus || ''),
+            orderId,
+            orderDate,
+            orderStatus,
             (detail.itemCode || '').toLowerCase(),
             detail.itemName || '',
-            parseInt(detail.quantity) || 0,
+            parseInt(detail.unit) || 0,
             parseFloat(detail.itemPrice) || 0,
-            parseFloat(detail.itemPrice) * (parseInt(detail.quantity) || 0),
-            detail.optionName || '',
+            parseFloat(detail.totalItemPrice) || 0,
+            detail.itemOption || '',
             ts
           );
           total++;
@@ -174,9 +200,10 @@ async function fetchAuPay(days = 7) {
     });
     tx();
 
-    console.log(`[auPay] ${total}件取得 (offset: ${offset})`);
-    offset += 1000;
-    if (!data.hasNext) break;
+    console.log(`[auPay] ${total}件取得 (startCount: ${startCount}, resultCount: ${resultCount})`);
+
+    if (resultCount < pageSize) break;
+    startCount += pageSize;
     await sleep(2000);
   }
 
