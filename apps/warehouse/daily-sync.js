@@ -69,6 +69,10 @@ async function main() {
   const rkResult = runScript('apps/warehouse/rakuten-orders.js', '楽天 RMS API');
   results.push({ name: '楽天', ...rkResult });
 
+  // 小規模モール（Qoo10/auPay/メルカリ/LINEギフト）
+  const mallResult = runScript('apps/warehouse/mall-orders.js all', '小規模モール');
+  results.push({ name: '小規模モール', ...mallResult });
+
   const endTime = new Date();
   const duration = Math.round((endTime - startTime) / 1000);
 
