@@ -314,16 +314,16 @@ async function fetchLineGift(days = 7) {
   `);
 
   // トークンリフレッシュ
-  if (refreshToken) {
+  if (refreshToken && clientId && clientSecret) {
     try {
-      const tokenRes = await fetch('https://api.line.me/oauth2/v2.1/token', {
+      const tokenRes = await fetch('https://gift-shop-cms.line.biz/api/v1/oauth2/token/refresh', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        headers: { 'Accept': 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({
           grant_type: 'refresh_token',
-          refresh_token: refreshToken,
           client_id: clientId,
           client_secret: clientSecret,
+          refresh_token: refreshToken,
         }).toString(),
       });
       const tokenData = await tokenRes.json();
@@ -337,24 +337,15 @@ async function fetchLineGift(days = 7) {
   }
 
   let total = 0;
-  let cursor = null;
+  let page = 1;
 
   while (true) {
     try {
-      const params = new URLSearchParams({
-        orderedFrom: start.toISOString(),
-        limit: '100',
-      });
-      if (cursor) params.set('cursor', cursor);
-
-      const res = await fetch(`https://api.gift.line.me/v1/shop/orders?${params.toString()}`, {
-        headers: { 'Authorization': `Bearer ${accessToken}` },
-      });
+      const url = `https://shop-mall.line.me/shop/api/1/order/search?access_token=${accessToken}&page=${page}&per_page=100`;
+      const res = await fetch(url);
 
       if (!res.ok) {
         console.log('[LINEギフト] HTTP', res.status);
-        const text = await res.text();
-        console.log('[LINEギフト] Response:', text.slice(0, 200));
         break;
       }
 
@@ -364,18 +355,39 @@ async function fetchLineGift(days = 7) {
 
       const tx = db.transaction(() => {
         for (const order of orders) {
+          // 日付フィルタ（bought_onがUnixTimestamp）
+          const orderDate = order.bought_on ? new Date(order.bought_on * 1000) : null;
+          if (orderDate && orderDate < start) continue;
+
           const items = order.items || [];
-          for (const item of items) {
+          if (items.length > 0) {
+            for (const item of items) {
+              stmt.run(
+                String(order.id || ''),
+                orderDate ? orderDate.toISOString() : '',
+                order.status || '',
+                (item.variation_code || item.item_code || '').toLowerCase(),
+                item.item_name || '',
+                parseInt(item.quantity) || 1,
+                parseFloat(item.selling_price || item.price) || 0,
+                parseFloat(item.selling_price || item.price) * (parseInt(item.quantity) || 1),
+                item.variation_name || '',
+                ts
+              );
+              total++;
+            }
+          } else {
+            // itemsがない場合は注文レベルで1行
             stmt.run(
-              order.orderId || '',
-              order.orderDate || '',
+              String(order.id || ''),
+              orderDate ? orderDate.toISOString() : '',
               order.status || '',
-              (item.skuCode || item.itemId || '').toLowerCase(),
-              item.itemName || '',
-              parseInt(item.quantity) || 0,
-              parseFloat(item.price) || 0,
-              parseFloat(item.price) * (parseInt(item.quantity) || 0),
-              item.options || '',
+              '',
+              '',
+              1,
+              parseFloat(order.selling_price) || 0,
+              parseFloat(order.selling_price) || 0,
+              '',
               ts
             );
             total++;
@@ -384,8 +396,9 @@ async function fetchLineGift(days = 7) {
       });
       tx();
 
-      if (!data.hasNext) break;
-      cursor = data.nextCursor;
+      const paging = data.paging;
+      if (!paging || page >= paging.total_pages) break;
+      page++;
       await sleep(1000);
     } catch (e) {
       console.log('[LINEギフト] エラー:', e.message);
