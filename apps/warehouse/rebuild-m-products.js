@@ -58,8 +58,19 @@ export async function rebuildMProducts() {
     shippingMap.set(ps.sku?.toLowerCase(), ps);
   }
 
+  // 送料取得ヘルパー: 自分のコード → 代表商品コード の順で検索
+  function getShipping(code, repCode) {
+    const ps = shippingMap.get(code);
+    if (ps) return ps;
+    if (repCode && repCode.toLowerCase() !== code) {
+      return shippingMap.get(repCode.toLowerCase()) || null;
+    }
+    return null;
+  }
+
   let countSingle = 0;
-  let countSetAsNE = 0; // NEにもセットにもある商品（セットとして投入するのでスキップ）
+  let countSetAsNE = 0;
+  let countShipInherited = 0; // 代表コードから送料継承した件数
 
   for (const p of neProducts) {
     const code = p.商品コード?.toLowerCase();
@@ -72,7 +83,8 @@ export async function rebuildMProducts() {
     }
 
     const eg = exceptionMap.get(code);
-    const ps = shippingMap.get(code);
+    const ps = getShipping(code, p.代表商品コード);
+    if (ps && !shippingMap.get(code)) countShipInherited++;
 
     let genka = null, genkaSource = '不明', genkaStatus = 'MISSING';
     if (p.原価 > 0) {
@@ -99,7 +111,7 @@ export async function rebuildMProducts() {
     );
     countSingle++;
   }
-  log.push(`単品: ${countSingle}件（NE兼セット除外: ${countSetAsNE}件）`);
+  log.push(`単品: ${countSingle}件（NE兼セット除外: ${countSetAsNE}件、送料継承: ${countShipInherited}件）`);
 
   // A2: セット商品を投入
   const setHeaders = db.prepare(`
@@ -126,8 +138,8 @@ export async function rebuildMProducts() {
 
     const components = setComponentsQuery.all(sh.セット商品コード);
     const eg = exceptionMap.get(setCode);
-    const ps = shippingMap.get(setCode);
     const neInfo = db.prepare('SELECT * FROM raw_ne_products WHERE 商品コード = ? COLLATE NOCASE').get(setCode);
+    const ps = getShipping(setCode, neInfo?.代表商品コード);
 
     // 原価計算
     let totalGenka = 0;
