@@ -124,11 +124,17 @@ async function fetchQoo10(days = 7) {
 // ─── au PAY Market（Wow! manager API — wmshopapi） ───
 
 const AUPAY_SHOP_ID = process.env.AUPAY_SHOP_ID || '54318092';
-const AUPAY_BASE = 'https://api.manager.wowma.jp/wmshopapi';
+// VPSプロキシ経由の場合: AUPAY_PROXY_URL=http://133.167.122.198:8080 + AUPAY_PROXY_SECRET
+// 直接アクセスの場合: AUPAY_API_KEY のみ設定
+const AUPAY_PROXY_URL = process.env.AUPAY_PROXY_URL || '';
+const AUPAY_PROXY_SECRET = process.env.AUPAY_PROXY_SECRET || '';
+const AUPAY_BASE = AUPAY_PROXY_URL
+  ? `${AUPAY_PROXY_URL}/wmshopapi`
+  : 'https://api.manager.wowma.jp/wmshopapi';
 
 async function fetchAuPay(days = 7) {
   const apiKey = process.env.AUPAY_API_KEY;
-  if (!apiKey) { console.log('[auPay] AUPAY_API_KEY未設定'); return; }
+  if (!apiKey && !AUPAY_PROXY_URL) { console.log('[auPay] AUPAY_API_KEY または AUPAY_PROXY_URL が未設定'); return; }
 
   console.log(`[auPay] 受注取得開始（直近${days}日）`);
   const db = getDB();
@@ -158,13 +164,10 @@ async function fetchAuPay(days = 7) {
     });
 
     const url = `${AUPAY_BASE}/searchTradeInfoListProc?${qs}`;
-    const res = await fetch(url, {
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-    });
+    const headers = AUPAY_PROXY_URL
+      ? { 'X-Proxy-Secret': AUPAY_PROXY_SECRET }
+      : { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/x-www-form-urlencoded' };
+    const res = await fetch(url, { method: 'GET', headers });
 
     const xml = await res.text();
     const parsed = await parseStringPromise(xml, { explicitArray: false });
