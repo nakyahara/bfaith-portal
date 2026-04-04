@@ -891,6 +891,65 @@ router.get('/api/shipping_rates', (req, res) => {
   res.json(execQuery('SELECT * FROM shipping_rates ORDER BY shipping_code'));
 });
 
+// ─── GET /api/missing/download ───
+// 未登録データCSVダウンロード
+
+router.get('/api/missing/download', (req, res) => {
+  const { type } = req.query;
+  const db = getDB();
+  let rows = [];
+  let filename = 'missing.csv';
+  let header = '';
+
+  try {
+    if (type === 'shipping') {
+      rows = db.prepare(`
+        SELECT m.商品コード, m.商品名, m.商品区分, m.標準売価, m.原価, m.原価状態,
+          COALESCE(p.代表商品コード, '') as 代表商品コード
+        FROM m_products m
+        LEFT JOIN raw_ne_products p ON m.商品コード = p.商品コード COLLATE NOCASE
+        WHERE m.取扱区分 = '取扱中' AND m.送料 IS NULL
+        ORDER BY m.商品区分, m.商品コード
+      `).all();
+      header = '商品コード,商品名,商品区分,標準売価,原価,原価状態,代表商品コード';
+      filename = 'shipping_missing.csv';
+    } else if (type === 'genka') {
+      rows = db.prepare(`
+        SELECT m.商品コード, m.商品名, m.商品区分, m.標準売価, m.原価状態
+        FROM m_products m
+        WHERE m.取扱区分 = '取扱中' AND m.原価状態 IN ('MISSING','PARTIAL')
+        ORDER BY m.商品区分, m.商品コード
+      `).all();
+      header = '商品コード,商品名,商品区分,標準売価,原価状態';
+      filename = 'genka_missing.csv';
+    } else if (type === 'sku_map') {
+      rows = db.prepare('SELECT モール商品コード, 商品名, SUM(数量) as 数量, MAX(日付) as 最終日付 FROM unmapped_sales GROUP BY モール商品コード, 商品名 ORDER BY SUM(数量) DESC').all();
+      header = 'モール商品コード,商品名,数量,最終日付';
+      filename = 'sku_missing.csv';
+    } else {
+      return res.status(400).json({ error: 'type パラメータが必要です（shipping / genka / sku_map）' });
+    }
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+
+  // CSV生成（BOM付きUTF-8）
+  const escapeCsv = v => {
+    const s = String(v ?? '');
+    return s.includes(',') || s.includes('"') || s.includes('\n') ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const csvLines = [header];
+  for (const row of rows) {
+    csvLines.push(Object.values(row).map(escapeCsv).join(','));
+  }
+  const bom = '\uFEFF';
+  const csv = bom + csvLines.join('\r\n');
+
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.send(csv);
+});
+
 // ─── GET /api/missing/counts ───
 // m_productsベースの未登録件数（超軽量、5,000件テーブルからCOUNT）
 
@@ -1009,7 +1068,10 @@ function renderRegisterPage(shippingRates) {
       <div class="scroll-area">
         <table><thead id="table-head"></thead><tbody id="table-body"></tbody></table>
       </div>
-      <div class="meta" id="list-meta"></div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px">
+        <div class="meta" id="list-meta"></div>
+        <button class="btn btn-p" style="font-size:12px" onclick="downloadMissing()">CSVダウンロード</button>
+      </div>
     </div>
 
     <!-- マスタ検索・編集 -->
@@ -1363,6 +1425,10 @@ function renderRegisterPage(shippingRates) {
       document.getElementById('csv-result').textContent = '';
     }
     switchCsvType('shipping', document.getElementById('csv-tab-shipping'));
+
+    function downloadMissing() {
+      window.location.href = B + '/api/missing/download?type=' + curType;
+    }
 
     async function uploadCsv() {
       const fileInput = document.getElementById('csv-file');
