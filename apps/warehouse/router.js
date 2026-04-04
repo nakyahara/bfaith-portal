@@ -585,6 +585,128 @@ router.post('/api/skumap', (req, res) => {
   res.json({ ok: true, seller_sku, ne_code });
 });
 
+// ─── CSV アップロード（送料・原価・SKUマップ共通） ───
+
+function parseCsvBuffer(buf) {
+  // UTF-8 BOM or Shift-JIS 自動判定
+  let text;
+  if (buf[0] === 0xEF && buf[1] === 0xBB && buf[2] === 0xBF) {
+    text = buf.toString('utf-8');
+  } else {
+    // Shift-JIS判定: 0x80以上のバイトが多ければcp932
+    const highBytes = [...buf.slice(0, 1000)].filter(b => b > 0x7F).length;
+    text = highBytes > 5 ? iconv.decode(buf, 'cp932') : buf.toString('utf-8');
+  }
+  const lines = text.split(/\r?\n/).filter(l => l.trim());
+  return lines.map(l => l.split(',').map(c => c.replace(/^"|"$/g, '').trim()));
+}
+
+// POST /api/csv/shipping — 送料CSV一括登録（追加・更新、既存は消さない）
+// CSV形式: 商品コード, 送料コード, 配送方法, 送料
+router.post('/api/csv/shipping', upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'ファイルが必要です' });
+  const db = getDB();
+  const buf = fs.readFileSync(req.file.path);
+  fs.unlinkSync(req.file.path);
+  const rows = parseCsvBuffer(buf);
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+
+  // ヘッダー行スキップ（1行目に「商品コード」「sku」等が含まれる場合）
+  let dataRows = rows;
+  if (dataRows.length > 0 && /商品コード|sku|SKU/i.test(dataRows[0][0])) dataRows = dataRows.slice(1);
+
+  const stmt = db.prepare('INSERT OR REPLACE INTO product_shipping (sku, product_name, shipping_code, ship_method, ship_cost, note, synced_at) VALUES (?, COALESCE((SELECT product_name FROM product_shipping WHERE sku = ?), (SELECT 商品名 FROM raw_ne_products WHERE 商品コード = ? COLLATE NOCASE), ?), ?, ?, ?, ?, ?)');
+  const updateMp = db.prepare('UPDATE m_products SET 送料 = ?, 送料コード = ?, 配送方法 = ?, updated_at = ? WHERE 商品コード = ?');
+  const updateVariants = db.prepare(`UPDATE m_products SET 送料 = ?, 送料コード = ?, 配送方法 = ?, updated_at = ?
+    WHERE 商品コード IN (SELECT 商品コード FROM raw_ne_products WHERE 代表商品コード = ? COLLATE NOCASE) AND 送料 IS NULL`);
+
+  let count = 0, skipped = 0;
+  const tx = db.transaction(() => {
+    for (const row of dataRows) {
+      const sku = (row[0] || '').toLowerCase().trim();
+      if (!sku) { skipped++; continue; }
+      const shippingCode = (row[1] || '').trim();
+      const shipMethod = (row[2] || '').trim();
+      const shipCost = parseFloat(row[3]) || 0;
+      if (!shipCost) { skipped++; continue; }
+      stmt.run(sku, sku, sku, '', shippingCode, shipMethod, shipCost, '', now);
+      try {
+        updateMp.run(shipCost, shippingCode, shipMethod, now, sku);
+        updateVariants.run(shipCost, shippingCode, shipMethod, now, sku);
+      } catch {}
+      count++;
+    }
+  });
+  tx();
+  res.json({ ok: true, imported: count, skipped, total: dataRows.length });
+});
+
+// POST /api/csv/genka — 原価CSV一括登録
+// CSV形式: 商品コード, 原価, 商品名（任意）
+router.post('/api/csv/genka', upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'ファイルが必要です' });
+  const db = getDB();
+  const buf = fs.readFileSync(req.file.path);
+  fs.unlinkSync(req.file.path);
+  const rows = parseCsvBuffer(buf);
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+
+  let dataRows = rows;
+  if (dataRows.length > 0 && /商品コード|sku|SKU/i.test(dataRows[0][0])) dataRows = dataRows.slice(1);
+
+  const stmt = db.prepare('INSERT OR REPLACE INTO exception_genka (sku, genka, 商品名, synced_at) VALUES (?, ?, ?, ?)');
+  const updateMp = db.prepare("UPDATE m_products SET 原価 = ?, 原価ソース = '例外', 原価状態 = 'OVERRIDDEN', updated_at = ? WHERE 商品コード = ?");
+
+  let count = 0, skipped = 0;
+  const tx = db.transaction(() => {
+    for (const row of dataRows) {
+      const sku = (row[0] || '').toLowerCase().trim();
+      if (!sku) { skipped++; continue; }
+      const genka = parseFloat(row[1]);
+      if (isNaN(genka)) { skipped++; continue; }
+      const name = (row[2] || '').trim();
+      stmt.run(sku, genka, name, now);
+      try { updateMp.run(genka, now, sku); } catch {}
+      count++;
+    }
+  });
+  tx();
+  res.json({ ok: true, imported: count, skipped, total: dataRows.length });
+});
+
+// POST /api/csv/skumap — SKUマップCSV一括登録
+// CSV形式: seller_sku, ne_code, 数量（任意、デフォルト1）, ASIN（任意）
+router.post('/api/csv/skumap', upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'ファイルが必要です' });
+  const db = getDB();
+  const buf = fs.readFileSync(req.file.path);
+  fs.unlinkSync(req.file.path);
+  const rows = parseCsvBuffer(buf);
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+
+  let dataRows = rows;
+  if (dataRows.length > 0 && /seller_sku|SKU|商品コード/i.test(dataRows[0][0])) dataRows = dataRows.slice(1);
+
+  const stmt = db.prepare('INSERT OR REPLACE INTO sku_map (seller_sku, asin, 商品名, ne_code, 数量, synced_at) VALUES (?, ?, ?, ?, ?, ?)');
+  const delUnmapped = db.prepare('DELETE FROM unmapped_sales WHERE モール商品コード = ?');
+
+  let count = 0, skipped = 0;
+  const tx = db.transaction(() => {
+    for (const row of dataRows) {
+      const sellerSku = (row[0] || '').toLowerCase().trim();
+      const neCode = (row[1] || '').toLowerCase().trim();
+      if (!sellerSku || !neCode) { skipped++; continue; }
+      const qty = parseInt(row[2]) || 1;
+      const asin = (row[3] || '').trim();
+      stmt.run(sellerSku, asin, '', neCode, qty, now);
+      try { delUnmapped.run(sellerSku); } catch {}
+      count++;
+    }
+  });
+  tx();
+  res.json({ ok: true, imported: count, skipped, total: dataRows.length });
+});
+
 // ─── DELETE /api/shipping/:sku ───
 
 router.delete('/api/shipping/:sku', (req, res) => {
@@ -907,6 +1029,22 @@ function renderRegisterPage(shippingRates) {
       </div>
       <div class="meta" id="m-meta"></div>
     </div>
+
+    <!-- CSV一括アップロード -->
+    <div class="card">
+      <h2>CSV一括アップロード</h2>
+      <div class="tabs">
+        <button class="active" id="csv-tab-shipping" onclick="switchCsvType('shipping',this)">送料</button>
+        <button id="csv-tab-genka" onclick="switchCsvType('genka',this)">原価</button>
+        <button id="csv-tab-skumap" onclick="switchCsvType('skumap',this)">SKUマップ</button>
+      </div>
+      <div id="csv-format" style="font-size:12px;color:#666;margin-bottom:8px"></div>
+      <div class="row">
+        <input type="file" id="csv-file" accept=".csv,.txt" style="font-size:13px">
+        <button class="btn btn-s" id="csv-upload-btn" onclick="uploadCsv()">アップロード</button>
+      </div>
+      <div id="csv-result" class="meta"></div>
+    </div>
   </div>
 
   <div id="toast"></div>
@@ -1210,7 +1348,56 @@ function renderRegisterPage(shippingRates) {
       }).catch(() => { document.getElementById('c-sku').textContent = '-'; });
     })();
 
-    // renderMissingRows は loadMissing() に統合済み（未使用）
+    // ── CSV一括アップロード ──
+    let curCsvType = 'shipping';
+    const csvFormats = {
+      shipping: 'CSV形式: 商品コード, 送料コード, 配送方法, 送料',
+      genka: 'CSV形式: 商品コード, 原価, 商品名（任意）',
+      skumap: 'CSV形式: seller_sku, ne_code, 数量（任意）, ASIN（任意）'
+    };
+    function switchCsvType(type, el) {
+      curCsvType = type;
+      document.querySelectorAll('.card:last-of-type .tabs button').forEach(b => b.classList.remove('active'));
+      if (el) el.classList.add('active');
+      document.getElementById('csv-format').textContent = csvFormats[type] || '';
+      document.getElementById('csv-result').textContent = '';
+    }
+    switchCsvType('shipping', document.getElementById('csv-tab-shipping'));
+
+    async function uploadCsv() {
+      const fileInput = document.getElementById('csv-file');
+      if (!fileInput.files.length) { toast('ファイルを選択してください', true); return; }
+      const btn = document.getElementById('csv-upload-btn');
+      btn.disabled = true;
+      btn.textContent = 'アップロード中...';
+      const formData = new FormData();
+      formData.append('file', fileInput.files[0]);
+      try {
+        const endpoint = '/api/csv/' + curCsvType;
+        const r = await fetch(B + endpoint, { method: 'POST', body: formData });
+        const data = await r.json();
+        if (data.ok) {
+          document.getElementById('csv-result').textContent = '✅ ' + data.imported + '件登録 / ' + data.skipped + '件スキップ（全' + data.total + '行）';
+          toast(data.imported + '件を一括登録しました');
+          // 件数を再取得
+          try {
+            const c = await api('/api/missing/counts');
+            document.getElementById('c-ship').textContent = c.shipping || 0;
+            document.getElementById('c-genka').textContent = c.genka || 0;
+            document.getElementById('c-sku').textContent = c.sku_map || 0;
+          } catch {}
+        } else {
+          document.getElementById('csv-result').textContent = '❌ エラー: ' + (data.error || '不明');
+          toast('アップロード失敗', true);
+        }
+      } catch(e) {
+        document.getElementById('csv-result').textContent = '❌ エラー: ' + e.message;
+        toast('アップロード失敗', true);
+      }
+      btn.disabled = false;
+      btn.textContent = 'アップロード';
+      fileInput.value = '';
+    }
   </script>
 </body>
 </html>`;
