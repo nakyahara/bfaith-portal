@@ -652,7 +652,7 @@ router.get('/api/skumap/list', (req, res) => {
 });
 
 // ─── GET /api/missing/prioritized ───
-// 未登録データ（直近売上のある商品を優先）
+// m_productsベースの未登録データ（f_sales_by_productで売上優先度付け）
 
 router.get('/api/missing/prioritized', (req, res) => {
   const { type } = req.query;
@@ -665,73 +665,64 @@ router.get('/api/missing/prioritized', (req, res) => {
 
   let rows = [];
 
-  if (!type || type === 'shipping') {
-    rows = rows.concat(db.prepare(`
-      SELECT 'shipping' as missing_type, p.商品コード, p.商品名, p.売価, p.原価, p.取扱区分,
-        COALESCE(s30.qty, 0) as recent_sales_qty,
-        COALESCE(s7.qty, 0) as sales_7d,
-        COALESCE(s30.qty, 0) as sales_30d,
-        s30.last_sold,
-        CASE WHEN s7.qty > 0 THEN 'A_7日以内' WHEN s30.qty > 0 THEN 'B_30日以内' ELSE 'C_実績なし' END as priority
-      FROM raw_ne_products p
-      LEFT JOIN product_shipping ps ON p.商品コード = ps.sku COLLATE NOCASE
-      LEFT JOIN (
-        SELECT 商品コード, SUM(受注数) as qty FROM raw_ne_orders
-        WHERE キャンセル区分 = '有効' AND SUBSTR(受注日,1,10) >= ? GROUP BY 商品コード
-      ) s7 ON p.商品コード = s7.商品コード
-      LEFT JOIN (
-        SELECT 商品コード, SUM(受注数) as qty, MAX(SUBSTR(受注日,1,10)) as last_sold FROM raw_ne_orders
-        WHERE キャンセル区分 = '有効' AND SUBSTR(受注日,1,10) >= ? GROUP BY 商品コード
-      ) s30 ON p.商品コード = s30.商品コード
-      WHERE p.取扱区分 = '取扱中' AND ps.sku IS NULL
-      ORDER BY priority, COALESCE(s7.qty, 0) DESC, COALESCE(s30.qty, 0) DESC
-      LIMIT 200
-    `).all(cutoff7Str, cutoff30Str));
-  }
+  try {
+    if (!type || type === 'shipping') {
+      rows = rows.concat(db.prepare(`
+        SELECT 'shipping' as missing_type, m.商品コード, m.商品名, m.標準売価 as 売価, m.原価,
+          m.取扱区分, m.商品区分,
+          COALESCE(s7.qty, 0) as sales_7d,
+          COALESCE(s30.qty, 0) as sales_30d,
+          s30.last_sold,
+          CASE WHEN COALESCE(s7.qty, 0) > 0 THEN 'A_7日以内' WHEN COALESCE(s30.qty, 0) > 0 THEN 'B_30日以内' ELSE 'C_実績なし' END as priority
+        FROM m_products m
+        LEFT JOIN (
+          SELECT 商品コード, SUM(数量) as qty FROM f_sales_by_product WHERE 日付 >= ? GROUP BY 商品コード
+        ) s7 ON m.商品コード = s7.商品コード
+        LEFT JOIN (
+          SELECT 商品コード, SUM(数量) as qty, MAX(日付) as last_sold FROM f_sales_by_product WHERE 日付 >= ? GROUP BY 商品コード
+        ) s30 ON m.商品コード = s30.商品コード
+        WHERE m.取扱区分 = '取扱中' AND m.送料 IS NULL
+        ORDER BY priority, sales_7d DESC, sales_30d DESC
+        LIMIT 200
+      `).all(cutoff7Str, cutoff30Str));
+    }
 
-  if (!type || type === 'genka') {
-    rows = rows.concat(db.prepare(`
-      SELECT 'genka' as missing_type, p.商品コード, p.商品名, p.売価, p.原価, p.取扱区分,
-        COALESCE(s30.qty, 0) as recent_sales_qty,
-        COALESCE(s7.qty, 0) as sales_7d,
-        COALESCE(s30.qty, 0) as sales_30d,
-        s30.last_sold,
-        CASE WHEN s7.qty > 0 THEN 'A_7日以内' WHEN s30.qty > 0 THEN 'B_30日以内' ELSE 'C_実績なし' END as priority
-      FROM raw_ne_products p
-      LEFT JOIN exception_genka eg ON p.商品コード = eg.sku COLLATE NOCASE
-      LEFT JOIN raw_ne_set_products sp ON p.商品コード = sp.セット商品コード
-      LEFT JOIN (
-        SELECT 商品コード, SUM(受注数) as qty FROM raw_ne_orders
-        WHERE キャンセル区分 = '有効' AND SUBSTR(受注日,1,10) >= ? GROUP BY 商品コード
-      ) s7 ON p.商品コード = s7.商品コード
-      LEFT JOIN (
-        SELECT 商品コード, SUM(受注数) as qty, MAX(SUBSTR(受注日,1,10)) as last_sold FROM raw_ne_orders
-        WHERE キャンセル区分 = '有効' AND SUBSTR(受注日,1,10) >= ? GROUP BY 商品コード
-      ) s30 ON p.商品コード = s30.商品コード
-      WHERE p.取扱区分 = '取扱中' AND (p.原価 IS NULL OR p.原価 = 0) AND eg.sku IS NULL AND sp.セット商品コード IS NULL
-      ORDER BY priority, COALESCE(s7.qty, 0) DESC, COALESCE(s30.qty, 0) DESC
-      LIMIT 200
-    `).all(cutoff7Str, cutoff30Str));
-  }
+    if (!type || type === 'genka') {
+      rows = rows.concat(db.prepare(`
+        SELECT 'genka' as missing_type, m.商品コード, m.商品名, m.標準売価 as 売価, m.原価,
+          m.取扱区分, m.商品区分,
+          COALESCE(s7.qty, 0) as sales_7d,
+          COALESCE(s30.qty, 0) as sales_30d,
+          s30.last_sold,
+          CASE WHEN COALESCE(s7.qty, 0) > 0 THEN 'A_7日以内' WHEN COALESCE(s30.qty, 0) > 0 THEN 'B_30日以内' ELSE 'C_実績なし' END as priority
+        FROM m_products m
+        LEFT JOIN (
+          SELECT 商品コード, SUM(数量) as qty FROM f_sales_by_product WHERE 日付 >= ? GROUP BY 商品コード
+        ) s7 ON m.商品コード = s7.商品コード
+        LEFT JOIN (
+          SELECT 商品コード, SUM(数量) as qty, MAX(日付) as last_sold FROM f_sales_by_product WHERE 日付 >= ? GROUP BY 商品コード
+        ) s30 ON m.商品コード = s30.商品コード
+        WHERE m.取扱区分 = '取扱中' AND m.原価状態 IN ('MISSING', 'PARTIAL')
+        ORDER BY priority, sales_7d DESC, sales_30d DESC
+        LIMIT 200
+      `).all(cutoff7Str, cutoff30Str));
+    }
 
-  if (!type || type === 'sku_map') {
-    rows = rows.concat(db.prepare(`
-      SELECT DISTINCT 'sku_map' as missing_type, o.seller_sku as 商品コード, o.title as 商品名,
-        NULL as 売価, NULL as 原価, NULL as 取扱区分,
-        SUM(o.quantity) as recent_sales_qty,
-        SUM(CASE WHEN SUBSTR(o.purchase_date,1,10) >= ? THEN o.quantity ELSE 0 END) as sales_7d,
-        SUM(o.quantity) as sales_30d,
-        MAX(SUBSTR(o.purchase_date, 1, 10)) as last_sold,
-        CASE WHEN SUM(CASE WHEN SUBSTR(o.purchase_date,1,10) >= ? THEN o.quantity ELSE 0 END) > 0 THEN 'A_7日以内'
-          ELSE 'B_30日以内' END as priority
-      FROM raw_sp_orders o
-      LEFT JOIN sku_map sm ON o.seller_sku = sm.seller_sku COLLATE NOCASE
-      WHERE sm.seller_sku IS NULL AND o.order_status NOT IN ('Cancelled')
-        AND SUBSTR(o.purchase_date, 1, 10) >= ?
-      GROUP BY o.seller_sku, o.title
-      ORDER BY priority, sales_7d DESC, sales_30d DESC
-      LIMIT 200
-    `).all(cutoff7Str, cutoff7Str, cutoff30Str));
+    if (!type || type === 'sku_map') {
+      rows = rows.concat(db.prepare(`
+        SELECT 'sku_map' as missing_type, モール商品コード as 商品コード, 商品名,
+          NULL as 売価, NULL as 原価, NULL as 取扱区分, NULL as 商品区分,
+          SUM(数量) as sales_7d, SUM(数量) as sales_30d,
+          MAX(日付) as last_sold,
+          'B_30日以内' as priority
+        FROM unmapped_sales
+        GROUP BY モール商品コード, 商品名
+        ORDER BY sales_30d DESC
+        LIMIT 200
+      `).all());
+    }
+  } catch (e) {
+    console.error('[missing/prioritized] m_products未構築?', e.message);
   }
 
   const summary = {};
@@ -763,30 +754,19 @@ router.get('/api/shipping_rates', (req, res) => {
 });
 
 // ─── GET /api/missing/counts ───
-// 未登録件数のみ（軽量、VIEWを使わず直接COUNT）
-// type=fast: 送料・原価のみ即座に返す（SKUは重いので別リクエスト）
+// m_productsベースの未登録件数（超軽量、5,000件テーブルからCOUNT）
 
 router.get('/api/missing/counts', (req, res) => {
   const db = getDB();
-  const fast = req.query.fast === '1';
-  const shipping = db.prepare(`
-    SELECT COUNT(*) as cnt FROM raw_ne_products p
-    LEFT JOIN product_shipping ps ON p.商品コード = ps.sku COLLATE NOCASE
-    WHERE p.取扱区分 = '取扱中' AND ps.sku IS NULL
-  `).get().cnt;
-  const genka = db.prepare(`
-    SELECT COUNT(*) as cnt FROM raw_ne_products p
-    LEFT JOIN exception_genka eg ON p.商品コード = eg.sku COLLATE NOCASE
-    LEFT JOIN raw_ne_set_products sp ON p.商品コード = sp.セット商品コード
-    WHERE p.取扱区分 = '取扱中' AND (p.原価 IS NULL OR p.原価 = 0) AND eg.sku IS NULL AND sp.セット商品コード IS NULL
-  `).get().cnt;
-  if (fast) return res.json({ shipping, genka, sku_map: null });
-  const sku_map = db.prepare(`
-    SELECT COUNT(DISTINCT o.seller_sku) as cnt FROM raw_sp_orders o
-    LEFT JOIN sku_map sm ON o.seller_sku = sm.seller_sku COLLATE NOCASE
-    WHERE sm.seller_sku IS NULL AND o.order_status NOT IN ('Cancelled')
-  `).get().cnt;
-  res.json({ shipping, genka, sku_map });
+  try {
+    const shipping = db.prepare("SELECT COUNT(*) as cnt FROM m_products WHERE 取扱区分 = '取扱中' AND 送料 IS NULL").get().cnt;
+    const genka = db.prepare("SELECT COUNT(*) as cnt FROM m_products WHERE 取扱区分 = '取扱中' AND 原価状態 IN ('MISSING','PARTIAL')").get().cnt;
+    const sku_map = db.prepare("SELECT COUNT(*) as cnt FROM unmapped_sales").get().cnt;
+    res.json({ shipping, genka, sku_map });
+  } catch {
+    // m_productsが未構築の場合はフォールバック
+    res.json({ shipping: 0, genka: 0, sku_map: 0 });
+  }
 });
 
 // ─── GET /api/products/suggest ───
@@ -969,7 +949,7 @@ function renderRegisterPage(shippingRates) {
       }
 
       // ヘッダー
-      let head = '<tr><th>優先度</th><th>商品コード</th><th>商品名</th><th>売価</th><th>7日</th><th>30日</th><th>最終販売</th><th style="min-width:220px">アクション</th></tr>';
+      let head = '<tr><th>優先度</th><th>区分</th><th>商品コード</th><th>商品名</th><th>売価</th><th>7日</th><th>30日</th><th>最終販売</th><th style="min-width:220px">アクション</th></tr>';
       document.getElementById('table-head').innerHTML = head;
 
       // ボディ
@@ -978,8 +958,12 @@ function renderRegisterPage(shippingRates) {
         const pri = r.priority === 'A_7日以内' ? '<span class="pri-a">7日</span>'
           : r.priority === 'B_30日以内' ? '<span class="pri-b">30日</span>'
           : '<span class="pri-c">-</span>';
+        const typeBadge = r.商品区分 === 'セット' ? '<span style="background:#3498db;color:white;padding:1px 6px;border-radius:3px;font-size:11px">セット</span>'
+          : r.商品区分 === '例外' ? '<span style="background:#9b59b6;color:white;padding:1px 6px;border-radius:3px;font-size:11px">例外</span>'
+          : '<span style="color:#888;font-size:11px">単品</span>';
         html += '<tr id="row-'+he(r.商品コード)+'">';
         html += '<td>'+pri+'</td>';
+        html += '<td>'+typeBadge+'</td>';
         html += '<td>'+he(r.商品コード)+'</td>';
         html += '<td>'+he((r.商品名||'').slice(0,35))+'</td>';
         html += '<td>'+(r.売価||'-')+'</td>';
@@ -1001,7 +985,7 @@ function renderRegisterPage(shippingRates) {
         }
         html += '</td></tr>';
       }
-      if (!rows.length) html = '<tr><td colspan="8" style="text-align:center;padding:20px;color:#27ae60">全て登録済み ✓</td></tr>';
+      if (!rows.length) html = '<tr><td colspan="9" style="text-align:center;padding:20px;color:#27ae60">全て登録済み ✓</td></tr>';
       document.getElementById('table-body').innerHTML = html;
       document.getElementById('list-meta').textContent = rows.length + '件';
     }
@@ -1173,28 +1157,7 @@ function renderRegisterPage(shippingRates) {
       }).catch(() => { document.getElementById('c-sku').textContent = '-'; });
     })();
 
-    function renderMissingRows(rows) {
-      const titles = { shipping: '送料未登録', genka: '原価未登録', sku_map: 'SKU未登録' };
-      document.getElementById('list-title').textContent = titles[curType] || '';
-      let head = '<tr><th>優先度</th><th>商品コード</th><th>商品名</th><th>売価</th><th>7日</th><th>30日</th><th>最終販売</th><th style="min-width:220px">アクション</th></tr>';
-      document.getElementById('table-head').innerHTML = head;
-      let html = '';
-      for (const r of rows.slice(0,150)) {
-        const pri = r.priority==='A_7日以内' ? '<span class="pri-a">7日</span>' : r.priority==='B_30日以内' ? '<span class="pri-b">30日</span>' : '<span class="pri-c">-</span>';
-        html += '<tr><td>'+pri+'</td><td>'+he(r.商品コード)+'</td><td>'+he((r.商品名||'').slice(0,35))+'</td><td>'+(r.売価||'-')+'</td><td>'+(r.sales_7d||0)+'</td><td>'+(r.sales_30d||0)+'</td><td>'+(r.last_sold||'-')+'</td><td>';
-        if (curType==='shipping') {
-          html += '<select style="max-width:160px">'+rateOptions()+'</select> <button class="btn btn-p" data-act="reg-ship" data-sku="'+he(r.商品コード)+'">登録</button>';
-        } else if (curType==='genka') {
-          html += '<input placeholder="原価" style="width:80px" type="number" step="0.01"> <button class="btn btn-p" data-act="reg-genka" data-sku="'+he(r.商品コード)+'" data-name="'+he(r.商品名)+'">登録</button>';
-        } else {
-          html += '<div class="suggest-wrap" style="display:inline-block"><input placeholder="NE商品コード" style="width:140px" data-suggest="1" autocomplete="off"><div class="suggest-list"></div></div> <button class="btn btn-p" data-act="reg-sku" data-sku="'+he(r.商品コード)+'" data-name="'+he(r.商品名)+'">登録</button>';
-        }
-        html += '</td></tr>';
-      }
-      if (!rows.length) html = '<tr><td colspan="8" style="text-align:center;padding:20px;color:#27ae60">全て登録済み</td></tr>';
-      document.getElementById('table-body').innerHTML = html;
-      document.getElementById('list-meta').textContent = rows.length + '件';
-    }
+    // renderMissingRows は loadMissing() に統合済み（未使用）
   </script>
 </body>
 </html>`;
