@@ -764,9 +764,11 @@ router.get('/api/shipping_rates', (req, res) => {
 
 // ─── GET /api/missing/counts ───
 // 未登録件数のみ（軽量、VIEWを使わず直接COUNT）
+// type=fast: 送料・原価のみ即座に返す（SKUは重いので別リクエスト）
 
 router.get('/api/missing/counts', (req, res) => {
   const db = getDB();
+  const fast = req.query.fast === '1';
   const shipping = db.prepare(`
     SELECT COUNT(*) as cnt FROM raw_ne_products p
     LEFT JOIN product_shipping ps ON p.商品コード = ps.sku COLLATE NOCASE
@@ -778,6 +780,7 @@ router.get('/api/missing/counts', (req, res) => {
     LEFT JOIN raw_ne_set_products sp ON p.商品コード = sp.セット商品コード
     WHERE p.取扱区分 = '取扱中' AND (p.原価 IS NULL OR p.原価 = 0) AND eg.sku IS NULL AND sp.セット商品コード IS NULL
   `).get().cnt;
+  if (fast) return res.json({ shipping, genka, sku_map: null });
   const sku_map = db.prepare(`
     SELECT COUNT(DISTINCT o.seller_sku) as cnt FROM raw_sp_orders o
     LEFT JOIN sku_map sm ON o.seller_sku = sm.seller_sku COLLATE NOCASE
@@ -1155,15 +1158,19 @@ function renderRegisterPage(shippingRates) {
       document.getElementById('m-meta').textContent = (data.total||0) + '件';
     }
 
-    // ── 初期読込（軽量カウントAPIのみ、リストはボタン押下で読み込み）──
+    // ── 初期読込（2段階: 送料・原価は即表示、SKUは遅延取得）──
     (async () => {
       document.getElementById('table-body').innerHTML = '<tr><td colspan="8" style="text-align:center;padding:30px;color:#888">上のタブをクリックすると未登録データを読み込みます</td></tr>';
+      // 1段目: 送料・原価のカウント（軽い、即表示）
       try {
-        const c = await api('/api/missing/counts');
+        const c = await api('/api/missing/counts?fast=1');
         document.getElementById('c-ship').textContent = c.shipping || 0;
         document.getElementById('c-genka').textContent = c.genka || 0;
-        document.getElementById('c-sku').textContent = c.sku_map || 0;
       } catch(e) { console.error(e); }
+      // 2段目: SKUカウント（重い、バックグラウンド）
+      api('/api/missing/counts').then(c => {
+        document.getElementById('c-sku').textContent = c.sku_map || 0;
+      }).catch(() => { document.getElementById('c-sku').textContent = '-'; });
     })();
 
     function renderMissingRows(rows) {
