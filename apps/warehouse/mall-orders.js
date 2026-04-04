@@ -54,8 +54,6 @@ async function fetchQoo10(days = 7) {
   const ts = now();
   const end = new Date();
   const start = new Date(); start.setDate(start.getDate() - days);
-  const startStr = start.toISOString().slice(0, 10).replace(/-/g, '');
-  const endStr = end.toISOString().slice(0, 10).replace(/-/g, '');
 
   const stmt = db.prepare(`
     INSERT OR REPLACE INTO raw_qoo10_orders (order_id, order_date, order_status, item_code, item_name, quantity, unit_price, total_price, option_info, synced_at)
@@ -63,18 +61,27 @@ async function fetchQoo10(days = 7) {
   `);
 
   let total = 0;
-  // ステータス1-5を全取得
-  for (const stat of ['1', '2', '3', '4', '5']) {
-    let page = 1;
-    while (true) {
-      const url = `https://api.qoo10.jp/GMKT.INC.Front.QAPIService/ebayjapan.qapi/ShippingBasic.GetShippingInfo_v2?key=${apiKey}&ShippingStat=${stat}&search_Sdate=${startStr}&search_Edate=${endStr}&Page=${page}&PageSize=200`;
+
+  // Qoo10 APIは日付範囲90日上限 → 90日チャンクで分割取得
+  // またページングが機能しない（Page1で全件返る）ためPage=1のみ取得
+  let chunkEnd = new Date(end);
+  while (chunkEnd > start) {
+    let chunkStart = new Date(chunkEnd);
+    chunkStart.setDate(chunkStart.getDate() - 89);
+    if (chunkStart < start) chunkStart = new Date(start);
+
+    const startStr = chunkStart.toISOString().slice(0, 10).replace(/-/g, '');
+    const endStr = chunkEnd.toISOString().slice(0, 10).replace(/-/g, '');
+    let chunkTotal = 0;
+
+    for (const stat of ['1', '2', '3', '4', '5']) {
+      const url = `https://api.qoo10.jp/GMKT.INC.Front.QAPIService/ebayjapan.qapi/ShippingBasic.GetShippingInfo_v2?key=${apiKey}&ShippingStat=${stat}&search_Sdate=${startStr}&search_Edate=${endStr}&Page=1&PageSize=200`;
       const res = await fetch(url);
       const data = await res.json();
 
-      if (data.ResultCode !== 0 || !data.ResultObject) break;
+      if (data.ResultCode !== 0 || !data.ResultObject) continue;
 
       const items = Array.isArray(data.ResultObject) ? data.ResultObject : [data.ResultObject];
-      if (items.length === 0) break;
 
       const tx = db.transaction(() => {
         for (const item of items) {
@@ -92,15 +99,20 @@ async function fetchQoo10(days = 7) {
             item.option || '',
             ts
           );
-          total++;
+          chunkTotal++;
         }
       });
       tx();
 
-      page++;
-      await sleep(1000);
-      if (items.length < 200) break;
+      await sleep(300);
     }
+
+    total += chunkTotal;
+    console.log(`[Qoo10] ${startStr}-${endStr}: ${chunkTotal}件 (累計${total})`);
+
+    chunkEnd = new Date(chunkStart);
+    chunkEnd.setDate(chunkEnd.getDate() - 1);
+    await sleep(300);
   }
 
   updateSyncMeta('qoo10_last_sync', now());
