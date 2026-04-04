@@ -533,6 +533,14 @@ router.post('/api/shipping', (req, res) => {
   const newData = { sku, shipping_code: shipping_code || '', ship_method: ship_method || '', ship_cost: parseFloat(ship_cost) };
   db.prepare('INSERT OR REPLACE INTO product_shipping (sku, product_name, shipping_code, ship_method, ship_cost, note, synced_at) VALUES (?, COALESCE((SELECT 商品名 FROM raw_ne_products WHERE 商品コード = ?), ?), ?, ?, ?, ?, ?)').run(sku, sku, old?.product_name || '', shipping_code || '', ship_method || '', parseFloat(ship_cost), old?.note || '', now);
   auditLog(db, 'product_shipping', sku, old ? 'UPDATE' : 'INSERT', old || null, newData);
+  // m_productsにリアルタイム反映（該当行 + 代表コードが同じバリエーション）
+  try {
+    db.prepare('UPDATE m_products SET 送料 = ?, 送料コード = ?, 配送方法 = ?, updated_at = ? WHERE 商品コード = ?').run(parseFloat(ship_cost), shipping_code || '', ship_method || '', now, sku);
+    // 代表商品コード経由でバリエーションにも反映
+    db.prepare(`UPDATE m_products SET 送料 = ?, 送料コード = ?, 配送方法 = ?, updated_at = ?
+      WHERE 商品コード IN (SELECT 商品コード FROM raw_ne_products WHERE 代表商品コード = ? COLLATE NOCASE)
+      AND 送料 IS NULL`).run(parseFloat(ship_cost), shipping_code || '', ship_method || '', now, sku);
+  } catch {}
   res.json({ ok: true, sku, ship_cost });
 });
 
@@ -549,6 +557,10 @@ router.post('/api/genka', (req, res) => {
   const newData = { sku, genka: parseFloat(genka), product_name: product_name || '' };
   db.prepare('INSERT OR REPLACE INTO exception_genka (sku, genka, 商品名, synced_at) VALUES (?, ?, ?, ?)').run(sku, parseFloat(genka), product_name || '', now);
   auditLog(db, 'exception_genka', sku, old ? 'UPDATE' : 'INSERT', old || null, newData);
+  // m_productsにリアルタイム反映
+  try {
+    db.prepare("UPDATE m_products SET 原価 = ?, 原価ソース = '例外', 原価状態 = 'OVERRIDDEN', updated_at = ? WHERE 商品コード = ?").run(parseFloat(genka), now, sku);
+  } catch {}
   res.json({ ok: true, sku, genka });
 });
 
