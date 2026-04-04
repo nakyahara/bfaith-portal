@@ -249,6 +249,9 @@ export async function rebuildFSales() {
   });
   insertTx();
 
+  // WAL肥大化防止
+  try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch {}
+
   const totalProduct = db.prepare('SELECT COUNT(*) as cnt FROM f_sales_by_product').get().cnt;
   log.push(`f_sales_by_product 合計: ${totalProduct}行`);
   log.push(`未マッピング退避: ${unmappedCount}件`);

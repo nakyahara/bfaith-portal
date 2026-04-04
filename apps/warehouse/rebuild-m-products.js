@@ -310,6 +310,9 @@ export async function rebuildMProducts() {
   });
   tx();
 
+  // WAL肥大化防止
+  try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch {}
+
   const finalCount = db.prepare('SELECT COUNT(*) as cnt FROM m_products').get().cnt;
   const compCount = db.prepare('SELECT COUNT(*) as cnt FROM m_set_components').get().cnt;
   console.log(`[m_products] ✅ 反映完了: ${finalCount}件 (構成品: ${compCount}件)`);
