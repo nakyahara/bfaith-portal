@@ -1030,6 +1030,10 @@ function renderRegisterPage(shippingRates) {
           tr.classList.add('done-row');
           setTimeout(() => tr.remove(), 600);
           updateCount('genka', -1);
+        } else if (act === 'remove-sku-row') {
+          btn.closest('.sku-row')?.remove();
+          btn.disabled = false;
+          return;
         } else if (act === 'add-sku-row') {
           // +構成品ボタン: 入力行を追加
           const container = tr.querySelector('.sku-mapping-rows');
@@ -1037,7 +1041,7 @@ function renderRegisterPage(shippingRates) {
           const newRow = document.createElement('div');
           newRow.className = 'sku-row';
           newRow.style = 'display:flex;gap:4px;align-items:center;margin-bottom:3px';
-          newRow.innerHTML = '<div class="suggest-wrap" style="display:inline-block"><input placeholder="NE商品コード" style="width:130px" data-suggest="1" autocomplete="off"><div class="suggest-list"></div></div><input placeholder="数量" style="width:45px" type="number" value="1" min="1"><button class="btn" style="font-size:10px;padding:1px 5px;background:#e74c3c;color:white" onclick="this.closest(\'.sku-row\').remove()">×</button>';
+          newRow.innerHTML = '<div class="suggest-wrap" style="display:inline-block"><input placeholder="NE商品コード" style="width:130px" data-suggest="1" autocomplete="off"><div class="suggest-list"></div></div><input placeholder="数量" style="width:45px" type="number" value="1" min="1"><button class="btn" style="font-size:10px;padding:1px 5px;background:#e74c3c;color:white" data-act="remove-sku-row">×</button>';
           container.appendChild(newRow);
           btn.disabled = false;
           return;
