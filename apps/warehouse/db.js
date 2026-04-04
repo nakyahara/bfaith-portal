@@ -398,7 +398,134 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_audit_table ON audit_log(table_name)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_audit_key ON audit_log(record_key)');
 
-  // 13. 同期メタデータ
+  // ─── 統合商品マスタ系 ───
+
+  // 13. m_products（統合商品マスタ）
+  db.exec(`CREATE TABLE IF NOT EXISTS m_products (
+    product_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    商品コード        TEXT UNIQUE NOT NULL,
+    商品名            TEXT,
+    商品区分          TEXT NOT NULL,
+    取扱区分          TEXT,
+    標準売価          REAL,
+    原価              REAL,
+    原価ソース        TEXT,
+    原価状態          TEXT NOT NULL,
+    送料              REAL,
+    送料コード        TEXT,
+    配送方法          TEXT,
+    消費税率          REAL,
+    税区分            TEXT,
+    在庫数            INTEGER,
+    引当数            INTEGER,
+    仕入先コード      TEXT,
+    セット構成品数    INTEGER,
+    updated_at        TEXT NOT NULL
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mp_sku ON m_products(商品コード)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mp_status ON m_products(取扱区分)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mp_type ON m_products(商品区分)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mp_cost_status ON m_products(原価状態)');
+
+  // 14. m_products_staging（常設staging）
+  db.exec(`CREATE TABLE IF NOT EXISTS m_products_staging (
+    product_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    商品コード        TEXT UNIQUE NOT NULL,
+    商品名            TEXT,
+    商品区分          TEXT NOT NULL,
+    取扱区分          TEXT,
+    標準売価          REAL,
+    原価              REAL,
+    原価ソース        TEXT,
+    原価状態          TEXT NOT NULL,
+    送料              REAL,
+    送料コード        TEXT,
+    配送方法          TEXT,
+    消費税率          REAL,
+    税区分            TEXT,
+    在庫数            INTEGER,
+    引当数            INTEGER,
+    仕入先コード      TEXT,
+    セット構成品数    INTEGER,
+    updated_at        TEXT NOT NULL
+  )`);
+
+  // 15. m_set_components（セット構成マスタ）
+  db.exec(`CREATE TABLE IF NOT EXISTS m_set_components (
+    セット商品コード  TEXT NOT NULL,
+    構成商品コード    TEXT NOT NULL,
+    数量              INTEGER NOT NULL DEFAULT 1,
+    構成商品名        TEXT,
+    構成商品原価      REAL,
+    updated_at        TEXT NOT NULL,
+    PRIMARY KEY (セット商品コード, 構成商品コード)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_msc_parent ON m_set_components(セット商品コード)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_msc_child ON m_set_components(構成商品コード)');
+
+  // 16. m_set_components_staging（常設staging）
+  db.exec(`CREATE TABLE IF NOT EXISTS m_set_components_staging (
+    セット商品コード  TEXT NOT NULL,
+    構成商品コード    TEXT NOT NULL,
+    数量              INTEGER NOT NULL DEFAULT 1,
+    構成商品名        TEXT,
+    構成商品原価      REAL,
+    updated_at        TEXT NOT NULL,
+    PRIMARY KEY (セット商品コード, 構成商品コード)
+  )`);
+
+  // 17. f_sales_by_listing（モール別・ページ単位の日次集計）
+  db.exec(`CREATE TABLE IF NOT EXISTS f_sales_by_listing (
+    日付              TEXT NOT NULL,
+    月                TEXT NOT NULL,
+    モール            TEXT NOT NULL,
+    モール商品コード  TEXT NOT NULL,
+    チャネル          TEXT NOT NULL DEFAULT '',
+    商品名            TEXT,
+    数量              INTEGER NOT NULL DEFAULT 0,
+    売上金額          REAL,
+    注文数            INTEGER,
+    データソース      TEXT,
+    updated_at        TEXT NOT NULL,
+    PRIMARY KEY (日付, モール, モール商品コード, チャネル)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_fsl_month ON f_sales_by_listing(月)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_fsl_mall ON f_sales_by_listing(モール)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_fsl_item ON f_sales_by_listing(モール商品コード)');
+
+  // 18. f_sales_by_product（NE商品コード単位・全モール横断の日次集計、縦持ち）
+  db.exec(`CREATE TABLE IF NOT EXISTS f_sales_by_product (
+    日付              TEXT NOT NULL,
+    商品コード        TEXT NOT NULL,
+    モール            TEXT NOT NULL,
+    商品名            TEXT,
+    数量              INTEGER NOT NULL DEFAULT 0,
+    直接販売数        INTEGER DEFAULT 0,
+    セット経由数      INTEGER DEFAULT 0,
+    updated_at        TEXT NOT NULL,
+    PRIMARY KEY (日付, 商品コード, モール)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_fsp_month ON f_sales_by_product(SUBSTR(日付, 1, 7))');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_fsp_sku ON f_sales_by_product(商品コード)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_fsp_mall ON f_sales_by_product(モール)');
+
+  // 19. unmapped_sales（マッピング失敗退避）
+  db.exec(`CREATE TABLE IF NOT EXISTS unmapped_sales (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    日付              TEXT NOT NULL,
+    モール            TEXT NOT NULL,
+    モール商品コード  TEXT NOT NULL,
+    商品名            TEXT,
+    数量              INTEGER,
+    売上金額          REAL,
+    失敗理由          TEXT,
+    created_at        TEXT NOT NULL
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_unmapped_date ON unmapped_sales(日付)');
+
+  // ─── その他メタ ───
+
+  // 20. 同期メタデータ
   db.exec(`CREATE TABLE IF NOT EXISTS sync_meta (
     key                 TEXT PRIMARY KEY,
     value               TEXT,
@@ -441,7 +568,7 @@ function insertDefaultShops() {
 // ─── 統計取得 ───
 
 export function getStats() {
-  const tables = ['raw_ne_products', 'raw_ne_orders', 'raw_ne_set_products', 'raw_sp_orders', 'raw_sp_orders_log', 'raw_rakuten_orders', 'raw_rakuten_orders_log', 'raw_lz_inventory', 'sku_map', 'product_shipping', 'shipping_rates', 'exception_genka', 'shops'];
+  const tables = ['raw_ne_products', 'raw_ne_orders', 'raw_ne_set_products', 'raw_sp_orders', 'raw_sp_orders_log', 'raw_rakuten_orders', 'raw_rakuten_orders_log', 'raw_lz_inventory', 'sku_map', 'product_shipping', 'shipping_rates', 'exception_genka', 'shops', 'm_products', 'm_set_components', 'f_sales_by_listing', 'f_sales_by_product', 'unmapped_sales'];
   const stats = {};
 
   for (const table of tables) {

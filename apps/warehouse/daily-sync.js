@@ -73,6 +73,14 @@ async function main() {
   const mallResult = runScript('apps/warehouse/mall-orders.js all', '小規模モール');
   results.push({ name: '小規模モール', ...mallResult });
 
+  // 統合商品マスタ再構築
+  const mProductResult = runScript('apps/warehouse/rebuild-m-products.js', 'm_products 再構築');
+  results.push({ name: 'm_products', ...mProductResult });
+
+  // 販売集計テーブル再構築
+  const fSalesResult = runScript('apps/warehouse/rebuild-f-sales.js', 'f_sales 再構築');
+  results.push({ name: 'f_sales', ...fSalesResult });
+
   const endTime = new Date();
   const duration = Math.round((endTime - startTime) / 1000);
 
