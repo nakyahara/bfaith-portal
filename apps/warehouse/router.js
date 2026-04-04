@@ -578,6 +578,10 @@ router.post('/api/skumap', (req, res) => {
   const newData = { seller_sku, asin: asin || '', ne_code, quantity: parseInt(quantity) || 1 };
   db.prepare('INSERT OR REPLACE INTO sku_map (seller_sku, asin, 商品名, ne_code, 数量, synced_at) VALUES (?, ?, ?, ?, ?, ?)').run(seller_sku, asin || '', product_name || '', ne_code, parseInt(quantity) || 1, now);
   auditLog(db, 'sku_map', seller_sku + ':' + ne_code, old ? 'UPDATE' : 'INSERT', old || null, newData);
+  // unmapped_salesから該当SKUを削除（リアルタイム反映）
+  try {
+    db.prepare('DELETE FROM unmapped_sales WHERE モール商品コード = ?').run(seller_sku);
+  } catch {}
   res.json({ ok: true, seller_sku, ne_code });
 });
 
