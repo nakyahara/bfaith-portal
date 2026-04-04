@@ -117,9 +117,10 @@ export async function rebuildFSales() {
       'ne' as データソース,
       ? as updated_at
     FROM raw_ne_orders o
-    LEFT JOIN shops s ON o.店舗コード = s.shop_code
+    INNER JOIN shops s ON o.店舗コード = s.shop_code
     WHERE o.キャンセル区分 = '有効'
-      AND COALESCE(s.platform, '') NOT IN ('_ignore', 'amazon_fbm', 'rakuten')
+      AND s.platform IS NOT NULL
+      AND s.platform NOT IN ('_ignore', 'amazon_fbm', 'rakuten')
     GROUP BY 日付, s.platform, モール商品コード
   `).run(ts);
   log.push(`NE listing: ${neListingCount.changes}行`);
@@ -207,9 +208,10 @@ export async function rebuildFSales() {
     SELECT SUBSTR(o.受注日, 1, 10) as date, LOWER(o.商品コード) as code, s.platform as mall,
            MAX(o.商品名) as title, SUM(o.受注数) as qty
     FROM raw_ne_orders o
-    LEFT JOIN shops s ON o.店舗コード = s.shop_code
+    INNER JOIN shops s ON o.店舗コード = s.shop_code
     WHERE o.キャンセル区分 = '有効'
-      AND COALESCE(s.platform, '') NOT IN ('_ignore', 'amazon_fbm', 'rakuten')
+      AND s.platform IS NOT NULL
+      AND s.platform NOT IN ('_ignore', 'amazon_fbm', 'rakuten')
     GROUP BY date, code, mall
   `).all();
 
