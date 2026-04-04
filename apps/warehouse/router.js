@@ -1131,19 +1131,18 @@ function renderRegisterPage(shippingRates) {
       document.getElementById('m-meta').textContent = (data.total||0) + '件';
     }
 
-    // ── 初期読込（未登録件数のみ）──
+    // ── 初期読込（件数だけ軽いAPIで取得、リストはボタン押下で読み込み）──
     (async () => {
       try {
-        const data = await api('/api/missing/prioritized');
-        const s = data.summary || {};
-        document.getElementById('c-ship').textContent = s.shipping || 0;
-        document.getElementById('c-genka').textContent = s.genka || 0;
-        document.getElementById('c-sku').textContent = s.sku_map || 0;
-        // 初回は送料未登録をそのまま表示
-        const rows = (data.rows || []).filter(r => r.missing_type === 'shipping');
-        curType = 'shipping';
-        renderMissingRows(rows);
+        const data = await api('/api/missing');
+        const counts = {};
+        for (const s of (data.summary || [])) counts[s.missing_type] = s.cnt;
+        document.getElementById('c-ship').textContent = counts.shipping || 0;
+        document.getElementById('c-genka').textContent = counts.genka || 0;
+        document.getElementById('c-sku').textContent = counts.sku_map || 0;
       } catch(e) { console.error(e); }
+      // リストは自動読み込みしない（ボタン押下で読み込む）
+      document.getElementById('table-body').innerHTML = '<tr><td colspan="8" style="text-align:center;padding:30px;color:#888">上のタブをクリックすると未登録データを読み込みます</td></tr>';
     })();
 
     function renderMissingRows(rows) {
