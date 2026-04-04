@@ -762,12 +762,416 @@ router.get('/api/shipping_rates', (req, res) => {
   res.json(execQuery('SELECT * FROM shipping_rates ORDER BY shipping_code'));
 });
 
+// ─── GET /api/products/suggest ───
+// 商品コードサジェスト（軽量、10件まで）
+
+router.get('/api/products/suggest', (req, res) => {
+  const q = (req.query.q || '').trim();
+  if (!q || q.length < 2) return res.json([]);
+  const term = `%${q}%`;
+  const rows = execQuery(
+    'SELECT 商品コード, 商品名, 原価, 売価, 取扱区分 FROM raw_ne_products WHERE (商品コード LIKE ? OR 商品名 LIKE ?) ORDER BY 取扱区分, 商品コード LIMIT 10',
+    [term, term]
+  );
+  res.json(rows);
+});
+
+// ─── 登録専用ライトUI ───
+
+router.get('/register', (req, res) => {
+  const db = getDB();
+  let shippingRates = [];
+  try { shippingRates = db.prepare('SELECT shipping_code, 小分類区分名称, 配送関係費合計 FROM shipping_rates ORDER BY shipping_code').all(); } catch {}
+  res.send(renderRegisterPage(shippingRates));
+});
+
 // ─── ダッシュボード（HTML）───
 
 router.get('/', (req, res) => {
   const stats = getStats();
   res.send(renderDashboard(stats));
 });
+
+function renderRegisterPage(shippingRates) {
+  const ratesJson = JSON.stringify(shippingRates);
+  return `<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>マスタ登録 - Data Warehouse</title>
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f5f5;color:#333;font-size:14px}
+    .header{background:#1a5276;color:white;padding:12px 24px;display:flex;align-items:center;gap:16px}
+    .header h1{font-size:18px}
+    .header a{color:#aed6f1;text-decoration:none;font-size:13px}
+    .header a:hover{color:white}
+    .wrap{max-width:1100px;margin:16px auto;padding:0 16px}
+    .card{background:white;border-radius:8px;padding:20px;margin-bottom:12px;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+    .card h2{font-size:15px;color:#555;margin-bottom:10px}
+    .counts{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+    .cnt{padding:8px 16px;border-radius:6px;font-size:13px;cursor:pointer;border:2px solid transparent;transition:.15s}
+    .cnt.active{border-color:#1a5276}
+    .cnt-ship{background:#fadbd8;color:#c0392b}.cnt-genka{background:#fdebd0;color:#d35400}.cnt-sku{background:#d5f5e3;color:#27ae60}
+    table{width:100%;border-collapse:collapse;font-size:13px}
+    th{background:#f0f0f0;padding:7px 8px;text-align:left;position:sticky;top:0;z-index:1}
+    td{padding:5px 8px;border-bottom:1px solid #eee}
+    tr:hover{background:#f8f9fa}
+    .pri-a{background:#e74c3c;color:white;padding:2px 6px;border-radius:3px;font-size:11px}
+    .pri-b{background:#f39c12;color:white;padding:2px 6px;border-radius:3px;font-size:11px}
+    .pri-c{color:#aaa;font-size:11px}
+    .btn{padding:5px 14px;border:none;border-radius:4px;cursor:pointer;font-size:12px}
+    .btn-p{background:#2980b9;color:white}.btn-p:hover{background:#1a6da0}
+    .btn-d{background:#e74c3c;color:white}.btn-d:hover{background:#c0392b}
+    .btn-s{background:#27ae60;color:white}.btn-s:hover{background:#1e8449}
+    .btn:disabled{opacity:.5;cursor:default}
+    input,select{padding:5px 8px;border:1px solid #ddd;border-radius:4px;font-size:13px}
+    .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+    .meta{font-size:12px;color:#888;margin-top:6px}
+    #toast{position:fixed;bottom:20px;right:20px;padding:12px 24px;background:#27ae60;color:white;border-radius:6px;display:none;z-index:999;font-size:14px}
+    #toast.err{background:#e74c3c}
+    .suggest-wrap{position:relative}
+    .suggest-list{position:absolute;top:100%;left:0;background:white;border:1px solid #ddd;border-radius:4px;width:350px;max-height:200px;overflow-y:auto;z-index:10;display:none;box-shadow:0 4px 12px rgba(0,0,0,.15)}
+    .suggest-list div{padding:6px 10px;cursor:pointer;font-size:12px;border-bottom:1px solid #f0f0f0}
+    .suggest-list div:hover{background:#eaf2f8}
+    .suggest-list .code{font-weight:600;color:#1a5276}
+    .tabs{display:flex;gap:4px;margin-bottom:12px}
+    .tabs button{padding:7px 14px;border:1px solid #ddd;background:white;cursor:pointer;border-radius:4px 4px 0 0;font-size:13px}
+    .tabs button.active{background:#1a5276;color:white;border-color:#1a5276}
+    .done-row{opacity:.4;transition:opacity .3s}
+    .scroll-area{max-height:65vh;overflow-y:auto}
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>マスタ登録</h1>
+    <a href="./">← ダッシュボードに戻る</a>
+  </div>
+  <div class="wrap">
+    <!-- 未登録件数サマリ -->
+    <div class="card">
+      <div class="counts">
+        <div class="cnt cnt-ship active" onclick="switchType('shipping',this)">送料未登録: <b id="c-ship">...</b></div>
+        <div class="cnt cnt-genka" onclick="switchType('genka',this)">原価未登録: <b id="c-genka">...</b></div>
+        <div class="cnt cnt-sku" onclick="switchType('sku_map',this)">SKU未登録: <b id="c-sku">...</b></div>
+      </div>
+    </div>
+
+    <!-- メイン: 未登録リスト -->
+    <div class="card">
+      <h2 id="list-title">送料未登録</h2>
+      <div class="scroll-area">
+        <table><thead id="table-head"></thead><tbody id="table-body"></tbody></table>
+      </div>
+      <div class="meta" id="list-meta"></div>
+    </div>
+
+    <!-- マスタ検索・編集 -->
+    <div class="card">
+      <h2>登録済みマスタ検索</h2>
+      <div class="tabs">
+        <button class="active" onclick="switchManage('shipping',this)">送料</button>
+        <button onclick="switchManage('genka',this)">原価</button>
+        <button onclick="switchManage('skumap',this)">SKUマップ</button>
+      </div>
+      <div class="row">
+        <input id="m-search" placeholder="商品コード or 商品名" style="width:280px" onkeydown="if(event.key==='Enter')searchManage()">
+        <button class="btn btn-p" onclick="searchManage()">検索</button>
+      </div>
+      <div class="scroll-area">
+        <table><thead id="m-head"></thead><tbody id="m-body"></tbody></table>
+      </div>
+      <div class="meta" id="m-meta"></div>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+
+  <script>
+    const B = location.pathname.replace(/\\/register$/, '');
+    const RATES = ${ratesJson};
+    let curType = 'shipping';
+    let curManage = 'shipping';
+    const he = s => (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+
+    // ── Toast ──
+    function toast(msg, err) {
+      const el = document.getElementById('toast');
+      el.textContent = msg; el.className = err ? 'err' : ''; el.style.display = 'block';
+      setTimeout(() => el.style.display = 'none', 2500);
+    }
+
+    async function api(path, opts) {
+      const r = await fetch(B + path, opts);
+      if (!r.ok) { const e = await r.json().catch(()=>({})); throw new Error(e.error || r.statusText); }
+      return r.json();
+    }
+
+    // ── 配送区分ドロップダウンHTML ──
+    function rateOptions(selected) {
+      return RATES.map(r => {
+        const v = r.shipping_code+'|'+he(r.小分類区分名称||'')+'|'+r.配送関係費合計;
+        const sel = (selected && r.配送関係費合計 == selected) ? ' selected' : '';
+        return '<option value="'+v+'"'+sel+'>'+(r.小分類区分名称||r.shipping_code)+' ('+r.配送関係費合計+'円)</option>';
+      }).join('');
+    }
+
+    // ── 未登録タイプ切替 ──
+    function switchType(type, el) {
+      curType = type;
+      document.querySelectorAll('.cnt').forEach(c => c.classList.remove('active'));
+      if (el) el.classList.add('active');
+      loadMissing();
+    }
+
+    // ── 未登録データ読み込み ──
+    async function loadMissing() {
+      const titles = { shipping: '送料未登録', genka: '原価未登録', sku_map: 'SKU未登録' };
+      document.getElementById('list-title').textContent = titles[curType] || '';
+      document.getElementById('table-body').innerHTML = '<tr><td colspan="8" style="text-align:center;padding:20px;color:#999">読み込み中...</td></tr>';
+
+      const data = await api('/api/missing/prioritized?type=' + curType);
+      const rows = data.rows || [];
+
+      // 件数更新
+      if (data.summary) {
+        document.getElementById('c-ship').textContent = data.summary.shipping || 0;
+        document.getElementById('c-genka').textContent = data.summary.genka || 0;
+        document.getElementById('c-sku').textContent = data.summary.sku_map || 0;
+      }
+
+      // ヘッダー
+      let head = '<tr><th>優先度</th><th>商品コード</th><th>商品名</th><th>売価</th><th>7日</th><th>30日</th><th>最終販売</th><th style="min-width:220px">アクション</th></tr>';
+      document.getElementById('table-head').innerHTML = head;
+
+      // ボディ
+      let html = '';
+      for (const r of rows.slice(0, 150)) {
+        const pri = r.priority === 'A_7日以内' ? '<span class="pri-a">7日</span>'
+          : r.priority === 'B_30日以内' ? '<span class="pri-b">30日</span>'
+          : '<span class="pri-c">-</span>';
+        html += '<tr id="row-'+he(r.商品コード)+'">';
+        html += '<td>'+pri+'</td>';
+        html += '<td>'+he(r.商品コード)+'</td>';
+        html += '<td>'+he((r.商品名||'').slice(0,35))+'</td>';
+        html += '<td>'+(r.売価||'-')+'</td>';
+        html += '<td>'+(r.sales_7d||0)+'</td>';
+        html += '<td>'+(r.sales_30d||0)+'</td>';
+        html += '<td>'+(r.last_sold||'-')+'</td>';
+        html += '<td>';
+        if (curType === 'shipping') {
+          html += '<select style="max-width:160px">'+rateOptions()+'</select> ';
+          html += '<button class="btn btn-p" data-act="reg-ship" data-sku="'+he(r.商品コード)+'">登録</button>';
+        } else if (curType === 'genka') {
+          html += '<input placeholder="原価" style="width:80px" type="number" step="0.01"> ';
+          html += '<button class="btn btn-p" data-act="reg-genka" data-sku="'+he(r.商品コード)+'" data-name="'+he(r.商品名)+'">登録</button>';
+        } else {
+          html += '<div class="suggest-wrap" style="display:inline-block">';
+          html += '<input placeholder="NE商品コード" style="width:140px" data-suggest="1" autocomplete="off"> ';
+          html += '<div class="suggest-list"></div></div>';
+          html += '<button class="btn btn-p" data-act="reg-sku" data-sku="'+he(r.商品コード)+'" data-name="'+he(r.商品名)+'">登録</button>';
+        }
+        html += '</td></tr>';
+      }
+      if (!rows.length) html = '<tr><td colspan="8" style="text-align:center;padding:20px;color:#27ae60">全て登録済み ✓</td></tr>';
+      document.getElementById('table-body').innerHTML = html;
+      document.getElementById('list-meta').textContent = rows.length + '件';
+    }
+
+    // ── イベント委譲（登録ボタン）──
+    document.addEventListener('click', async ev => {
+      const btn = ev.target.closest('[data-act]');
+      if (!btn) return;
+      const act = btn.dataset.act;
+      const sku = btn.dataset.sku;
+      const name = btn.dataset.name || '';
+      const tr = btn.closest('tr');
+      btn.disabled = true;
+
+      try {
+        if (act === 'reg-ship') {
+          const sel = tr.querySelector('select');
+          const v = sel.value.split('|');
+          await api('/api/shipping', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sku,shipping_code:v[0],ship_method:v[1],ship_cost:v[2]})});
+          toast(sku+' の送料を登録');
+          tr.classList.add('done-row');
+          setTimeout(() => tr.remove(), 600);
+          updateCount('shipping', -1);
+        } else if (act === 'reg-genka') {
+          const inp = tr.querySelector('input');
+          if (!inp.value) { btn.disabled=false; return; }
+          await api('/api/genka', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sku,genka:inp.value,product_name:name})});
+          toast(sku+' の原価を登録');
+          tr.classList.add('done-row');
+          setTimeout(() => tr.remove(), 600);
+          updateCount('genka', -1);
+        } else if (act === 'reg-sku') {
+          const inp = tr.querySelector('input[data-suggest]');
+          if (!inp || !inp.value) { btn.disabled=false; return; }
+          await api('/api/skumap', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({seller_sku:sku,ne_code:inp.value,product_name:name})});
+          toast(sku+' のSKUマップを登録');
+          tr.classList.add('done-row');
+          setTimeout(() => tr.remove(), 600);
+          updateCount('sku_map', -1);
+        } else if (act === 'update-ship') {
+          const sel = tr.querySelector('select');
+          const v = sel.value.split('|');
+          await api('/api/shipping', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sku,shipping_code:v[0],ship_method:v[1],ship_cost:v[2]})});
+          toast(sku+' の送料を更新');
+        } else if (act === 'update-genka') {
+          const inp = tr.querySelector('input');
+          await api('/api/genka', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sku,genka:inp.value,product_name:name})});
+          toast(sku+' の原価を更新');
+        } else if (act === 'update-sku') {
+          const inputs = tr.querySelectorAll('input');
+          const oldNe = btn.dataset.ne || '';
+          if (oldNe && oldNe !== inputs[0].value) {
+            await api('/api/skumap/'+encodeURIComponent(sku)+'?ne_code='+encodeURIComponent(oldNe), {method:'DELETE'});
+          }
+          await api('/api/skumap', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({seller_sku:sku,ne_code:inputs[0].value,product_name:name,quantity:inputs[1]?.value||1})});
+          toast(sku+' のSKUマップを更新');
+        } else if (act === 'del') {
+          if (!confirm(sku+' を削除しますか？')) { btn.disabled=false; return; }
+          const type = btn.dataset.type;
+          const ne = btn.dataset.ne || '';
+          let url = '/api/'+(type==='skumap'?'skumap':type)+'/'+encodeURIComponent(sku);
+          if (type === 'skumap' && ne) url += '?ne_code='+encodeURIComponent(ne);
+          await api(url, {method:'DELETE'});
+          toast(sku+' を削除');
+          tr.remove();
+        }
+      } catch(e) { toast('エラー: '+e.message, true); btn.disabled=false; }
+    });
+
+    function updateCount(type, delta) {
+      const map = {shipping:'c-ship',genka:'c-genka',sku_map:'c-sku'};
+      const el = document.getElementById(map[type]);
+      if (el) el.textContent = Math.max(0, parseInt(el.textContent||'0') + delta);
+    }
+
+    // ── NE商品コードサジェスト ──
+    let suggestTimer = null;
+    document.addEventListener('input', ev => {
+      const inp = ev.target;
+      if (!inp.dataset?.suggest) return;
+      clearTimeout(suggestTimer);
+      const wrap = inp.closest('.suggest-wrap');
+      const list = wrap?.querySelector('.suggest-list');
+      if (!list) return;
+      const q = inp.value.trim();
+      if (q.length < 2) { list.style.display = 'none'; return; }
+      suggestTimer = setTimeout(async () => {
+        try {
+          const rows = await api('/api/products/suggest?q='+encodeURIComponent(q));
+          if (!rows.length) { list.style.display = 'none'; return; }
+          list.innerHTML = rows.map(r =>
+            '<div data-code="'+he(r.商品コード)+'"><span class="code">'+he(r.商品コード)+'</span> '+he((r.商品名||'').slice(0,30))+' <span style="color:#888;font-size:11px">'+(r.原価||'-')+'円</span></div>'
+          ).join('');
+          list.style.display = 'block';
+        } catch { list.style.display = 'none'; }
+      }, 250);
+    });
+    document.addEventListener('click', ev => {
+      const item = ev.target.closest('.suggest-list div');
+      if (item) {
+        const code = item.dataset.code;
+        const wrap = item.closest('.suggest-wrap');
+        const inp = wrap?.querySelector('input');
+        if (inp) inp.value = code;
+        item.closest('.suggest-list').style.display = 'none';
+        return;
+      }
+      document.querySelectorAll('.suggest-list').forEach(l => l.style.display = 'none');
+    });
+
+    // ── マスタ検索 ──
+    function switchManage(type, el) {
+      curManage = type;
+      document.querySelectorAll('.tabs button').forEach(b => b.classList.remove('active'));
+      if (el) el.classList.add('active');
+      document.getElementById('m-body').innerHTML = '';
+      document.getElementById('m-head').innerHTML = '';
+      document.getElementById('m-meta').textContent = '';
+    }
+    async function searchManage() {
+      const search = document.getElementById('m-search').value;
+      const ep = curManage === 'shipping' ? '/api/shipping/list' : curManage === 'genka' ? '/api/genka/list' : '/api/skumap/list';
+      const data = await api(ep + '?search=' + encodeURIComponent(search) + '&limit=100');
+      const rows = data.rows || [];
+      let head = '', html = '';
+
+      if (curManage === 'shipping') {
+        head = '<tr><th>商品コード</th><th>商品名</th><th>配送方法</th><th>送料</th><th>操作</th></tr>';
+        for (const r of rows) {
+          html += '<tr><td>'+he(r.sku)+'</td><td>'+he((r.product_name||'').slice(0,30))+'</td>';
+          html += '<td><select>'+rateOptions(r.ship_cost)+'</select></td>';
+          html += '<td>'+r.ship_cost+'円</td>';
+          html += '<td><button class="btn btn-p" data-act="update-ship" data-sku="'+he(r.sku)+'">更新</button> <button class="btn btn-d" data-act="del" data-type="shipping" data-sku="'+he(r.sku)+'">削除</button></td></tr>';
+        }
+      } else if (curManage === 'genka') {
+        head = '<tr><th>SKU</th><th>商品名</th><th>原価</th><th>操作</th></tr>';
+        for (const r of rows) {
+          html += '<tr><td>'+he(r.sku)+'</td><td>'+he((r.商品名||'').slice(0,30))+'</td>';
+          html += '<td><input value="'+r.genka+'" style="width:80px" type="number" step="0.01"></td>';
+          html += '<td><button class="btn btn-p" data-act="update-genka" data-sku="'+he(r.sku)+'" data-name="'+he(r.商品名)+'">更新</button> <button class="btn btn-d" data-act="del" data-type="genka" data-sku="'+he(r.sku)+'">削除</button></td></tr>';
+        }
+      } else {
+        head = '<tr><th>Amazon SKU</th><th>ASIN</th><th>商品名</th><th>NE商品コード</th><th>数量</th><th>操作</th></tr>';
+        for (const r of rows) {
+          html += '<tr><td>'+he(r.seller_sku)+'</td><td>'+he(r.asin||'')+'</td><td>'+he((r.商品名||'').slice(0,25))+'</td>';
+          html += '<td><input value="'+he(r.ne_code||'')+'" style="width:120px"></td>';
+          html += '<td><input value="'+(r.数量||1)+'" style="width:40px" type="number"></td>';
+          html += '<td><button class="btn btn-p" data-act="update-sku" data-sku="'+he(r.seller_sku)+'" data-ne="'+he(r.ne_code)+'" data-name="'+he(r.商品名)+'">更新</button> <button class="btn btn-d" data-act="del" data-type="skumap" data-sku="'+he(r.seller_sku)+'" data-ne="'+he(r.ne_code)+'">削除</button></td></tr>';
+        }
+      }
+      if (!rows.length) html = '<tr><td colspan="6" style="text-align:center;padding:20px;color:#999">該当なし</td></tr>';
+      document.getElementById('m-head').innerHTML = head;
+      document.getElementById('m-body').innerHTML = html;
+      document.getElementById('m-meta').textContent = (data.total||0) + '件';
+    }
+
+    // ── 初期読込（未登録件数のみ）──
+    (async () => {
+      try {
+        const data = await api('/api/missing/prioritized');
+        const s = data.summary || {};
+        document.getElementById('c-ship').textContent = s.shipping || 0;
+        document.getElementById('c-genka').textContent = s.genka || 0;
+        document.getElementById('c-sku').textContent = s.sku_map || 0;
+        // 初回は送料未登録をそのまま表示
+        const rows = (data.rows || []).filter(r => r.missing_type === 'shipping');
+        curType = 'shipping';
+        renderMissingRows(rows);
+      } catch(e) { console.error(e); }
+    })();
+
+    function renderMissingRows(rows) {
+      const titles = { shipping: '送料未登録', genka: '原価未登録', sku_map: 'SKU未登録' };
+      document.getElementById('list-title').textContent = titles[curType] || '';
+      let head = '<tr><th>優先度</th><th>商品コード</th><th>商品名</th><th>売価</th><th>7日</th><th>30日</th><th>最終販売</th><th style="min-width:220px">アクション</th></tr>';
+      document.getElementById('table-head').innerHTML = head;
+      let html = '';
+      for (const r of rows.slice(0,150)) {
+        const pri = r.priority==='A_7日以内' ? '<span class="pri-a">7日</span>' : r.priority==='B_30日以内' ? '<span class="pri-b">30日</span>' : '<span class="pri-c">-</span>';
+        html += '<tr><td>'+pri+'</td><td>'+he(r.商品コード)+'</td><td>'+he((r.商品名||'').slice(0,35))+'</td><td>'+(r.売価||'-')+'</td><td>'+(r.sales_7d||0)+'</td><td>'+(r.sales_30d||0)+'</td><td>'+(r.last_sold||'-')+'</td><td>';
+        if (curType==='shipping') {
+          html += '<select style="max-width:160px">'+rateOptions()+'</select> <button class="btn btn-p" data-act="reg-ship" data-sku="'+he(r.商品コード)+'">登録</button>';
+        } else if (curType==='genka') {
+          html += '<input placeholder="原価" style="width:80px" type="number" step="0.01"> <button class="btn btn-p" data-act="reg-genka" data-sku="'+he(r.商品コード)+'" data-name="'+he(r.商品名)+'">登録</button>';
+        } else {
+          html += '<div class="suggest-wrap" style="display:inline-block"><input placeholder="NE商品コード" style="width:140px" data-suggest="1" autocomplete="off"><div class="suggest-list"></div></div> <button class="btn btn-p" data-act="reg-sku" data-sku="'+he(r.商品コード)+'" data-name="'+he(r.商品名)+'">登録</button>';
+        }
+        html += '</td></tr>';
+      }
+      if (!rows.length) html = '<tr><td colspan="8" style="text-align:center;padding:20px;color:#27ae60">全て登録済み</td></tr>';
+      document.getElementById('table-body').innerHTML = html;
+      document.getElementById('list-meta').textContent = rows.length + '件';
+    }
+  </script>
+</body>
+</html>`;
+}
 
 function renderDashboard(stats) {
   // 未登録データ件数は重いのでダッシュボード初期表示では取得しない（JSで非同期取得）
