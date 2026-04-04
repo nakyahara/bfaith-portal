@@ -642,6 +642,10 @@ export function getLatestSnapshots() {
   return queryAll('SELECT * FROM daily_snapshots WHERE snapshot_date = ?', [latestDate.d]);
 }
 
+export function getAllSnapshotSkus() {
+  return queryAll('SELECT DISTINCT amazon_sku FROM daily_snapshots').map(r => r.amazon_sku);
+}
+
 // ===== 納品計画 =====
 
 export function createShipmentPlan(planDate, items) {

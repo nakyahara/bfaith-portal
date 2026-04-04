@@ -1046,6 +1046,7 @@
       recMeta.recommended_skus = allRec.length;
       recMeta.recommended_units = allRec.reduce((s, i) => s + (i.recommended_qty || 0), 0);
       updateRecSummary();
+      scheduleAutoSave();
     }
 
     function renderRecList(data) {
@@ -2116,7 +2117,16 @@ Step10: アラート判定</pre>
       if (Object.keys(skuMappingMap).length === 0) await loadSkuMappingMap();
       await loadNewProductHidden();
 
-      const snapshotSkuSet = new Set(recData.map(r => r.amazon_sku));
+      // 全期間のスナップショットSKUを取得（過去にFBAに送ったことがあるSKUを除外）
+      let snapshotSkuSet;
+      try {
+        const res = await fetch(`${BASE}/api/all-snapshot-skus`);
+        const skus = await res.json();
+        snapshotSkuSet = new Set(skus);
+      } catch(e) {
+        // フォールバック: recDataから取得
+        snapshotSkuSet = new Set(recData.map(r => r.amazon_sku));
+      }
 
       newProductData = [];
       for (const [sku, mapping] of Object.entries(skuMappingMap)) {
@@ -2887,20 +2897,29 @@ Step10: アラート判定</pre>
           ship_qty: qty,
           checked: cb.checked,
           from_stockout: item?._fromStockout || false,
+          from_new_product: item?._fromNewProduct || false,
+          is_manual: item?._manual || false,
         });
       });
 
       // 数量が変更されたが未チェックのもの
       for (const [sku, qty] of Object.entries(shipQtyMap)) {
         if (!items.find(i => i.amazon_sku === sku)) {
-          items.push({ amazon_sku: sku, ship_qty: qty, checked: false, from_stockout: false });
+          items.push({ amazon_sku: sku, ship_qty: qty, checked: false, from_stockout: false, from_new_product: false, is_manual: false });
         }
       }
 
-      // 欠品から追加されたが上記に含まれないもの
+      // 手動追加アイテム（欠品・新規商品・手動入力）が上記に含まれないもの
       for (const m of manualItems) {
         if (!items.find(i => i.amazon_sku === m.amazon_sku)) {
-          items.push({ amazon_sku: m.amazon_sku, ship_qty: 0, checked: false, from_stockout: m._fromStockout || false });
+          items.push({
+            amazon_sku: m.amazon_sku,
+            ship_qty: m.recommended_qty || 0,
+            checked: false,
+            from_stockout: m._fromStockout || false,
+            from_new_product: m._fromNewProduct || false,
+            is_manual: m._manual || false,
+          });
         }
       }
 
@@ -2987,14 +3006,49 @@ Step10: アラート判定</pre>
     function applyDraft(draft) {
       if (!draft || !draft.items) return;
 
-      // まず欠品から追加されたアイテムを復元
+      // 欠品・新規商品・手動追加アイテムを復元
       for (const di of draft.items) {
-        if (di.from_stockout) {
+        if (di.from_stockout || di.from_new_product || di.is_manual) {
           const existing = recData.find(r => r.amazon_sku === di.amazon_sku);
           if (existing) {
             existing._manual = true;
-            existing._fromStockout = true;
+            if (di.from_stockout) existing._fromStockout = true;
+            if (di.from_new_product) existing._fromNewProduct = true;
             existing.recommended_qty = existing.recommended_qty || 0;
+          } else if (!manualItems.find(m => m.amazon_sku === di.amazon_sku)) {
+            // recDataにないアイテム（新規商品や手動追加）をmanualItemsに復元
+            const mapping = skuMappingMap[di.amazon_sku];
+            const snap = snapshotData.find(s => s.amazon_sku === di.amazon_sku);
+            manualItems.push({
+              amazon_sku: di.amazon_sku,
+              asin: mapping?.asin || snap?.asin || '',
+              product_name: mapping?.product_name || snap?.product_name || '(ドラフトから復元)',
+              ne_code: mapping?.ne_code || '',
+              fnsku: mapping?.fnsku || '',
+              set_components: mapping?.set_components || null,
+              is_set: mapping?.is_set ? true : false,
+              fba_available: snap?.fba_available ?? '-',
+              fba_inbound_working: snap?.fba_inbound_working ?? 0,
+              fba_inbound_working_source: '',
+              effective_fba_stock: snap?.effective_fba_stock ?? '-',
+              days_of_supply: snap?.days_of_supply ?? '-',
+              reorder_point: '-',
+              raw_needed: '-',
+              target_days: '-',
+              units_sold_7d: snap?.units_sold_7d ?? '-',
+              units_sold_30d: snap?.units_sold_30d ?? '-',
+              non_fba_sales_7d: mapping?.non_fba_sales_7d || 0,
+              non_fba_sales_30d: mapping?.non_fba_sales_30d || 0,
+              warehouse_raw: '-',
+              warehouse_available: '-',
+              recommended_qty: di.ship_qty || 0,
+              adjusted_qty: di.ship_qty || 0,
+              urgency_score: 0,
+              alerts: [],
+              _manual: true,
+              _fromStockout: di.from_stockout || false,
+              _fromNewProduct: di.from_new_product || false,
+            });
           }
         }
       }
@@ -3004,7 +3058,7 @@ Step10: アラート判定</pre>
       for (const di of draft.items) {
         if (di.checked) selectedSkus.add(di.amazon_sku);
         if (di.ship_qty > 0) {
-          const item = recData.find(r => r.amazon_sku === di.amazon_sku);
+          const item = recData.find(r => r.amazon_sku === di.amazon_sku) || manualItems.find(m => m.amazon_sku === di.amazon_sku);
           const defaultQty = item?.adjusted_qty || 0;
           if (di.ship_qty !== defaultQty) {
             shipQtyMap[di.amazon_sku] = di.ship_qty;

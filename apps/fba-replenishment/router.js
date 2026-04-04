@@ -4,7 +4,7 @@
 import express from 'express';
 import multer from 'multer';
 import cron from 'node-cron';
-import { initDb, savePlanningData, getLatestSnapshots, getSettings, updateSetting,
+import { initDb, savePlanningData, getLatestSnapshots, getAllSnapshotSkus, getSettings, updateSetting,
          getSkuMappings, getSkuExceptions, upsertSkuException, deleteSkuException,
          getWarehouseInventory, replaceWarehouseInventory, getWarehouseSummary,
          getShipmentPlans, getShipmentPlanItems, getDailySnapshots,
@@ -119,6 +119,11 @@ router.get('/api/snapshots/:sku', (req, res) => {
   const days = parseInt(req.query.days) || 30;
   const data = getDailySnapshots(req.params.sku, days);
   res.json({ sku: req.params.sku, count: data.length, data });
+});
+
+// ===== 全期間スナップショットSKU一覧 =====
+router.get('/api/all-snapshot-skus', (req, res) => {
+  res.json(getAllSnapshotSkus());
 });
 
 // ===== SKUマッピング =====
