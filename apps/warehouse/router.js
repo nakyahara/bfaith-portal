@@ -620,15 +620,29 @@ router.post('/api/csv/shipping', upload.single('file'), (req, res) => {
   const updateVariants = db.prepare(`UPDATE m_products SET 送料 = ?, 送料コード = ?, 配送方法 = ?, updated_at = ?
     WHERE 商品コード IN (SELECT 商品コード FROM raw_ne_products WHERE 代表商品コード = ? COLLATE NOCASE) AND 送料 IS NULL`);
 
+  // ヘッダーから列位置を自動判定（ダウンロードCSVをそのまま編集してアップロード可能）
+  let colSku = 0, colShipCode = 1, colShipMethod = 2, colShipCost = 3;
+  if (dataRows.length > 0 && rows.length > dataRows.length) {
+    // ヘッダー行がスキップされたので、元のrows[0]を参照
+    const hdr = rows[0].map(h => h.toLowerCase().trim());
+    const findCol = (names) => hdr.findIndex(h => names.some(n => h.includes(n)));
+    const ci = findCol(['送料コード', 'shipping_code']);
+    const cm = findCol(['配送方法', 'ship_method']);
+    const cc = findCol(['送料', 'ship_cost']);
+    if (ci >= 0) colShipCode = ci;
+    if (cm >= 0) colShipMethod = cm;
+    if (cc >= 0) colShipCost = cc;
+  }
+
   let count = 0, skipped = 0;
   const tx = db.transaction(() => {
     for (const row of dataRows) {
-      const sku = (row[0] || '').toLowerCase().trim();
+      const sku = (row[colSku] || '').toLowerCase().trim();
       if (!sku) { skipped++; continue; }
-      const shippingCode = (row[1] || '').trim();
-      const shipMethod = (row[2] || '').trim();
-      const shipCost = parseFloat(row[3]) || 0;
+      const shipCost = parseFloat(row[colShipCost]) || 0;
       if (!shipCost) { skipped++; continue; }
+      const shippingCode = (row[colShipCode] || '').trim();
+      const shipMethod = (row[colShipMethod] || '').trim();
       stmt.run(sku, sku, sku, '', shippingCode, shipMethod, shipCost, '', now);
       try {
         updateMp.run(shipCost, shippingCode, shipMethod, now, sku);
@@ -911,7 +925,7 @@ router.get('/api/missing/download', (req, res) => {
         WHERE m.取扱区分 = '取扱中' AND m.送料 IS NULL
         ORDER BY m.商品区分, m.商品コード
       `).all();
-      header = '商品コード,商品名,商品区分,標準売価,原価,原価状態,代表商品コード';
+      header = '商品コード,商品名,商品区分,標準売価,原価,原価状態,代表商品コード,送料コード,配送方法,送料';
       filename = 'shipping_missing.csv';
     } else if (type === 'genka') {
       rows = db.prepare(`
