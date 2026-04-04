@@ -902,6 +902,16 @@ router.get('/api/audit', (req, res) => {
 // ─── GET /api/shipping_rates ───
 
 router.get('/api/shipping_rates', (req, res) => {
+  const { format } = req.query;
+  if (format === 'csv') {
+    const rows = execQuery('SELECT shipping_code, 小分類区分名称, 運送会社, 梱包サイズ, 送料, 出荷作業料, 想定梱包資材費, 想定人件費, 配送関係費合計 FROM shipping_rates ORDER BY shipping_code');
+    const header = '送料コード,区分名称,運送会社,梱包サイズ,送料,出荷作業料,梱包資材費,人件費,配送関係費合計';
+    const escapeCsv = v => { const s = String(v ?? ''); return s.includes(',') || s.includes('"') ? '"' + s.replace(/"/g, '""') + '"' : s; };
+    const lines = [header, ...rows.map(r => Object.values(r).map(escapeCsv).join(','))];
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="shipping_rates.csv"');
+    return res.send('\uFEFF' + lines.join('\r\n'));
+  }
   res.json(execQuery('SELECT * FROM shipping_rates ORDER BY shipping_code'));
 });
 
@@ -1085,6 +1095,7 @@ function renderRegisterPage(shippingRates) {
       <div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px">
         <div class="meta" id="list-meta"></div>
         <button class="btn btn-p" style="font-size:12px" onclick="downloadMissing()">CSVダウンロード</button>
+        <button class="btn" style="font-size:11px;background:#7f8c8d;color:white" onclick="window.location.href=B+'/api/shipping_rates?format=csv'">送料コード一覧</button>
       </div>
     </div>
 
