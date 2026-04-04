@@ -202,4 +202,26 @@ router.get('/api/status', (req, res) => {
   res.json(status);
 });
 
+// ─── GET /api/download/:table ───
+// CSVダウンロード
+
+router.get('/api/download/:table', (req, res) => {
+  const db = getMirrorDB();
+  const table = req.params.table;
+  const allowed = ['products', 'set_components', 'sales_monthly', 'sales_daily'];
+  if (!allowed.includes(table)) return res.status(400).json({ error: '無効なテーブル名' });
+
+  const tableName = 'mirror_' + table;
+  const rows = db.prepare(`SELECT * FROM ${tableName}`).all();
+  if (!rows.length) return res.status(404).json({ error: 'データなし' });
+
+  const headers = Object.keys(rows[0]);
+  const escapeCsv = v => { const s = String(v ?? ''); return s.includes(',') || s.includes('"') || s.includes('\n') ? '"' + s.replace(/"/g, '""') + '"' : s; };
+  const lines = [headers.join(','), ...rows.map(r => headers.map(h => escapeCsv(r[h])).join(','))];
+
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="mirror_${table}.csv"`);
+  res.send('\uFEFF' + lines.join('\r\n'));
+});
+
 export default router;

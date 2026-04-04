@@ -15,6 +15,17 @@ import { getDB } from './db.js';
 
 const RENDER_URL = process.env.RENDER_MIRROR_URL || 'https://bfaith-portal.onrender.com/apps/mirror';
 const SYNC_KEY = process.env.MIRROR_SYNC_KEY || '';
+const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK || 'https://chat.googleapis.com/v1/spaces/AAQAL5zHy-w/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=yER7IJx_9CkKhYnzzre0WcWuqfgXc1oh8ldR35k01zE';
+
+async function notify(text) {
+  try {
+    await fetch(GCHAT_WEBHOOK, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+  } catch (e) { console.error('[通知エラー]', e.message); }
+}
 
 function now() {
   return new Date().toISOString().replace('T', ' ').slice(0, 19);
@@ -135,10 +146,36 @@ export async function syncToRender() {
         sales_monthly_count: sales_monthly.length, sales_daily_count: sales_daily.length }
     }, 'メタデータ');
 
-    console.log(`[Sync→Render] ✅ 全送信完了`);
-    return { ok: true, products: products.length, sales_monthly: sales_monthly.length, sales_daily: sales_daily.length };
+    // Part 5: Render側のデータ件数を検証
+    console.log('[Sync→Render]   検証中...');
+    const statusRes = await fetch(`${RENDER_URL}/api/status`, { signal: AbortSignal.timeout(30000) });
+    const status = await statusRes.json();
+
+    const verify = {
+      products: { sent: products.length, received: status.products_count || 0 },
+      monthly: { sent: sales_monthly.length, received: status.sales_monthly_count || 0 },
+      daily: { sent: sales_daily.length, received: status.sales_daily_count || 0 },
+    };
+
+    const allMatch = verify.products.sent === verify.products.received
+      && verify.monthly.sent === verify.monthly.received
+      && verify.daily.sent === verify.daily.received;
+
+    if (allMatch) {
+      console.log(`[Sync→Render] ✅ 検証OK — 全データ一致`);
+      await notify(`✅ *Render同期完了*\n商品マスタ: ${verify.products.received}件\n月次集計: ${verify.monthly.received}件\n日次集計: ${verify.daily.received}件\n同期時刻: ${ts}`);
+    } else {
+      console.log(`[Sync→Render] ⚠️ 検証NG — データ不一致`);
+      console.log(`  products: 送信${verify.products.sent} / 受信${verify.products.received}`);
+      console.log(`  monthly: 送信${verify.monthly.sent} / 受信${verify.monthly.received}`);
+      console.log(`  daily: 送信${verify.daily.sent} / 受信${verify.daily.received}`);
+      await notify(`⚠️ *Render同期 データ不一致*\n商品: ${verify.products.sent}→${verify.products.received}\n月次: ${verify.monthly.sent}→${verify.monthly.received}\n日次: ${verify.daily.sent}→${verify.daily.received}`);
+    }
+
+    return { ok: true, verify };
   } catch (e) {
     console.error(`[Sync→Render] ❌ 送信失敗:`, e.message);
+    await notify(`❌ *Render同期失敗*\n${e.message.slice(0, 200)}`);
     return { ok: false, error: e.message };
   }
 }
