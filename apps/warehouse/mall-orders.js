@@ -11,6 +11,7 @@
  * デフォルト: 直近7日分
  */
 import 'dotenv/config';
+import { readFileSync, writeFileSync } from 'fs';
 import { parseStringPromise } from 'xml2js';
 import { initDB, getDB, updateSyncMeta } from './db.js';
 
@@ -352,7 +353,7 @@ async function fetchLineGift(days = 7) {
     VALUES (?,?,?,?,?,?,?,?,?,?)
   `);
 
-  // トークンリフレッシュ
+  // トークンリフレッシュ（ワンタイム型: 成功時に新トークンを.envに保存）
   if (refreshToken && clientId && clientSecret) {
     try {
       const tokenRes = await fetch('https://gift-shop-cms.line.biz/api/v1/oauth2/token/refresh', {
@@ -368,10 +369,23 @@ async function fetchLineGift(days = 7) {
       const tokenData = await tokenRes.json();
       if (tokenData.access_token) {
         accessToken = tokenData.access_token;
-        console.log('[LINEギフト] トークンリフレッシュ成功');
+        // 新トークンを.envに書き戻す（リフレッシュトークンはワンタイムなので保存必須）
+        try {
+          const envPath = new URL('../../.env', import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1');
+          let envContent = readFileSync(envPath, 'utf-8');
+          envContent = envContent.replace(/LINEGIFT_ACCESS_TOKEN=.*/, `LINEGIFT_ACCESS_TOKEN=${tokenData.access_token}`);
+          if (tokenData.refresh_token) {
+            envContent = envContent.replace(/LINEGIFT_REFRESH_TOKEN=.*/, `LINEGIFT_REFRESH_TOKEN=${tokenData.refresh_token}`);
+          }
+          writeFileSync(envPath, envContent);
+          console.log('[LINEギフト] トークンリフレッシュ成功 → .env更新済み');
+        } catch (writeErr) {
+          console.log('[LINEギフト] トークンリフレッシュ成功（.env書き込み失敗: ' + writeErr.message + '）');
+        }
       }
     } catch (e) {
       console.log('[LINEギフト] トークンリフレッシュ失敗:', e.message);
+      console.log('[LINEギフト] アクセストークンで直接実行を試みます');
     }
   }
 
