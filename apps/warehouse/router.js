@@ -940,13 +940,8 @@ function renderRegisterPage(shippingRates) {
 
       const data = await api('/api/missing/prioritized?type=' + curType);
       const rows = data.rows || [];
-
-      // 件数更新
-      if (data.summary) {
-        document.getElementById('c-ship').textContent = data.summary.shipping || 0;
-        document.getElementById('c-genka').textContent = data.summary.genka || 0;
-        document.getElementById('c-sku').textContent = data.summary.sku_map || 0;
-      }
+      // ※ 件数バッジは上書きしない（初期表示の /api/missing/counts の値を維持）
+      // prioritized は LIMIT 200 なので件数が不正確になるため
 
       // ヘッダー
       let head = '<tr><th>優先度</th><th>区分</th><th>商品コード</th><th>商品名</th><th>売価</th><th>7日</th><th>30日</th><th>最終販売</th><th style="min-width:220px">アクション</th></tr>';
@@ -987,7 +982,10 @@ function renderRegisterPage(shippingRates) {
       }
       if (!rows.length) html = '<tr><td colspan="9" style="text-align:center;padding:20px;color:#27ae60">全て登録済み ✓</td></tr>';
       document.getElementById('table-body').innerHTML = html;
-      document.getElementById('list-meta').textContent = rows.length + '件';
+      const totalMap = { shipping: 'c-ship', genka: 'c-genka', sku_map: 'c-sku' };
+      const totalEl = document.getElementById(totalMap[curType]);
+      const totalCount = totalEl ? totalEl.textContent : '?';
+      document.getElementById('list-meta').textContent = rows.length >= 200 ? rows.length + '件表示 / 全' + totalCount + '件' : rows.length + '件';
     }
 
     // ── イベント委譲（登録ボタン）──
