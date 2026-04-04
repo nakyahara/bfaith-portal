@@ -81,6 +81,10 @@ async function main() {
   const fSalesResult = runScript('apps/warehouse/rebuild-f-sales.js', 'f_sales 再構築');
   results.push({ name: 'f_sales', ...fSalesResult });
 
+  // Renderにミラーデータ送信
+  const syncResult = runScript('apps/warehouse/sync-to-render.js', 'Render同期');
+  results.push({ name: 'Render同期', ...syncResult });
+
   const endTime = new Date();
   const duration = Math.round((endTime - startTime) / 1000);
 

@@ -14,6 +14,7 @@ import profitRouter from './apps/profit-calculator/router.js';
 import { startPriceWorker, startMaintenanceJobs } from './apps/profit-calculator/price-scheduler.js';
 import fbaRouter from './apps/fba-replenishment/router.js';
 import warehouseRouter from './apps/warehouse/router.js';
+import mirrorRouter from './apps/warehouse-mirror/router.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -295,6 +296,7 @@ app.use('/apps/ranking-checker', requireAppAccess('ranking-checker'), rankingRou
 app.use('/apps/profit-calculator', requireAppAccess('profit-calculator'), profitRouter);
 app.use('/apps/fba-replenishment', requireAppAccess('fba-replenishment'), fbaRouter);
 app.use('/apps/warehouse', requireAppAccess('warehouse'), warehouseRouter);
+app.use('/apps/mirror', express.json({ limit: '100mb' }), mirrorRouter);  // ミラー同期APIはセッション認証不要（APIキー認証）
 
 // 未実装アプリのプレースホルダー
 app.get('/apps/:appId', requireAuth, (req, res) => {
