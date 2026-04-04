@@ -107,12 +107,11 @@ export async function syncToRender() {
     // Part 1: マスタデータ
     await sendPart({ products, set_components }, 'マスタ');
 
-    // Part 2: 月次集計（チャンク分割）
-    const monthlyChunkSize = 50000;
+    // Part 2: 月次集計（チャンク分割、9MB以下に収める）
+    const monthlyChunkSize = 20000;
     for (let i = 0; i < sales_monthly.length; i += monthlyChunkSize) {
       const chunk = sales_monthly.slice(i, i + monthlyChunkSize);
       const isFirst = i === 0;
-      // 最初のチャンクだけDELETEさせる（meta.clear_monthlyフラグ）
       await sendPart(
         { sales_monthly: chunk, meta: isFirst ? { clear_monthly: true } : undefined },
         `月次 ${i + 1}-${Math.min(i + monthlyChunkSize, sales_monthly.length)}`
@@ -120,7 +119,7 @@ export async function syncToRender() {
     }
 
     // Part 3: 日次集計（チャンク分割）
-    const dailyChunkSize = 50000;
+    const dailyChunkSize = 20000;
     for (let i = 0; i < sales_daily.length; i += dailyChunkSize) {
       const chunk = sales_daily.slice(i, i + dailyChunkSize);
       const isFirst = i === 0;
