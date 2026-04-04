@@ -1114,7 +1114,7 @@ function renderRegisterPage(shippingRates) {
         html += '<td>'+pri+'</td>';
         html += '<td>'+typeBadge+'</td>';
         html += '<td>'+he(r.商品コード)+'</td>';
-        html += '<td>'+he((r.商品名||'').slice(0,35))+'</td>';
+        html += '<td>'+he((r.商品名||'').slice(0,60))+'</td>';
         html += '<td>'+(r.売価||'-')+'</td>';
         html += '<td>'+(r.sales_7d||0)+'</td>';
         html += '<td>'+(r.sales_30d||0)+'</td>';
@@ -1752,7 +1752,7 @@ function renderDashboard(stats) {
       let html = '<div class="meta">' + data.total + '件</div><table class="data"><tr><th>商品コード</th><th>商品名</th><th>売価</th><th>原価</th><th>ソース</th><th>送料</th><th>粗利</th><th>粗利率</th></tr>';
       for (const r of data.rows) {
         const profitClass = r.粗利率 !== null && r.粗利率 < 10 ? ' style="color:#c0392b;font-weight:bold"' : '';
-        html += '<tr><td>' + r.商品コード + '</td><td>' + (r.商品名||'').slice(0,35) + '</td><td>' + r.売価 + '</td><td>' + (r.原価||'-') + '</td><td>' + r.原価ソース + '</td><td>' + (r.送料||'-') + '</td><td' + profitClass + '>' + (r.粗利??'-') + '</td><td' + profitClass + '>' + (r.粗利率!==null?r.粗利率+'%':'-') + '</td></tr>';
+        html += '<tr><td>' + r.商品コード + '</td><td>' + (r.商品名||'').slice(0,60) + '</td><td>' + r.売価 + '</td><td>' + (r.原価||'-') + '</td><td>' + r.原価ソース + '</td><td>' + (r.送料||'-') + '</td><td' + profitClass + '>' + (r.粗利??'-') + '</td><td' + profitClass + '>' + (r.粗利率!==null?r.粗利率+'%':'-') + '</td></tr>';
       }
       html += '</table>';
       document.getElementById('master-list').innerHTML = html;
@@ -1776,7 +1776,7 @@ function renderDashboard(stats) {
       const data = await api('/api/sales?product=' + encodeURIComponent(product) + '&platform=' + platform + '&month=' + month + '&limit=50');
       let html = '<table class="data"><tr><th>商品コード</th><th>商品名</th><th>モール</th><th>数量</th><th>売上</th><th>注文数</th></tr>';
       for (const r of data) {
-        html += '<tr><td>' + r.商品コード + '</td><td>' + (r.商品名||'').slice(0,35) + '</td><td>' + r.platform + '</td><td>' + (r.total_qty||0).toLocaleString() + '</td><td>' + (r.total_sales||0).toLocaleString() + '円</td><td>' + (r.total_orders||0) + '</td></tr>';
+        html += '<tr><td>' + r.商品コード + '</td><td>' + (r.商品名||'').slice(0,60) + '</td><td>' + r.platform + '</td><td>' + (r.total_qty||0).toLocaleString() + '</td><td>' + (r.total_sales||0).toLocaleString() + '円</td><td>' + (r.total_orders||0) + '</td></tr>';
       }
       html += '</table>';
       document.getElementById('sales-list').innerHTML = html;
