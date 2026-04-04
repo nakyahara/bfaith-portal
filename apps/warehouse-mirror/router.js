@@ -84,10 +84,10 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
       log.push(`set_components: ${set_components.length}件`);
     }
 
-    // sales_monthly（全件置換）
+    // sales_monthly（初回チャンクでDELETE、以降は追記）
     if (sales_monthly && sales_monthly.length > 0) {
       const tx = db.transaction(() => {
-        db.exec('DELETE FROM mirror_sales_monthly');
+        if (meta?.clear_monthly) db.exec('DELETE FROM mirror_sales_monthly');
         const stmt = db.prepare(`INSERT INTO mirror_sales_monthly (
           月, 商品コード, モール, 商品名, 数量, 直接販売数, セット経由数,
           売上金額, 注文数, データ種別, チャネル, updated_at
@@ -102,10 +102,10 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
       log.push(`sales_monthly: ${sales_monthly.length}件`);
     }
 
-    // sales_daily（全件置換）
+    // sales_daily（初回チャンクでDELETE、以降は追記）
     if (sales_daily && sales_daily.length > 0) {
       const tx = db.transaction(() => {
-        db.exec('DELETE FROM mirror_sales_daily');
+        if (meta?.clear_daily) db.exec('DELETE FROM mirror_sales_daily');
         const stmt = db.prepare(`INSERT INTO mirror_sales_daily (
           日付, 商品コード, モール, 商品名, 数量, 直接販売数, セット経由数,
           売上金額, 注文数, データ種別, チャネル, updated_at

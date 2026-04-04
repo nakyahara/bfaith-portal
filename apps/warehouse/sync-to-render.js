@@ -84,43 +84,60 @@ export async function syncToRender() {
   const sales_daily = [...salesDailyProduct, ...salesDailyListing];
   console.log(`[Sync→Render]   sales_daily: ${sales_daily.length}件 (product: ${salesDailyProduct.length}, listing: ${salesDailyListing.length})`);
 
-  // 送信
-  const payload = {
-    products,
-    set_components,
-    sales_monthly,
-    sales_daily,
-    meta: {
-      source: 'minipc',
-      synced_at: ts,
-      products_count: products.length,
-      sales_monthly_count: sales_monthly.length,
-      sales_daily_count: sales_daily.length,
-    }
-  };
-
-  const payloadJson = JSON.stringify(payload);
-  console.log(`[Sync→Render]   payload size: ${(payloadJson.length / 1024 / 1024).toFixed(1)}MB`);
-
+  // 分割送信（各パートを個別にPOST、8MB以下に収める）
   const headers = { 'Content-Type': 'application/json' };
   if (SYNC_KEY) headers['x-sync-key'] = SYNC_KEY;
 
-  try {
+  async function sendPart(data, label) {
+    const json = JSON.stringify(data);
+    const sizeMB = (json.length / 1024 / 1024).toFixed(1);
+    console.log(`[Sync→Render]   送信: ${label} (${sizeMB}MB)`);
     const response = await fetch(`${RENDER_URL}/api/sync`, {
-      method: 'POST',
-      headers,
-      body: payloadJson,
-      signal: AbortSignal.timeout(120000), // 2分タイムアウト
+      method: 'POST', headers, body: json,
+      signal: AbortSignal.timeout(120000),
     });
-
     if (!response.ok) {
-      const err = await response.text();
-      throw new Error(`HTTP ${response.status}: ${err}`);
+      const err = await response.text().catch(() => '');
+      throw new Error(`${label}: HTTP ${response.status} ${err.slice(0, 200)}`);
+    }
+    return response.json();
+  }
+
+  try {
+    // Part 1: マスタデータ
+    await sendPart({ products, set_components }, 'マスタ');
+
+    // Part 2: 月次集計（チャンク分割）
+    const monthlyChunkSize = 50000;
+    for (let i = 0; i < sales_monthly.length; i += monthlyChunkSize) {
+      const chunk = sales_monthly.slice(i, i + monthlyChunkSize);
+      const isFirst = i === 0;
+      // 最初のチャンクだけDELETEさせる（meta.clear_monthlyフラグ）
+      await sendPart(
+        { sales_monthly: chunk, meta: isFirst ? { clear_monthly: true } : undefined },
+        `月次 ${i + 1}-${Math.min(i + monthlyChunkSize, sales_monthly.length)}`
+      );
     }
 
-    const result = await response.json();
-    console.log(`[Sync→Render] ✅ 完了:`, result.log?.join(', ') || 'OK');
-    return { ok: true, ...result };
+    // Part 3: 日次集計（チャンク分割）
+    const dailyChunkSize = 50000;
+    for (let i = 0; i < sales_daily.length; i += dailyChunkSize) {
+      const chunk = sales_daily.slice(i, i + dailyChunkSize);
+      const isFirst = i === 0;
+      await sendPart(
+        { sales_daily: chunk, meta: isFirst ? { clear_daily: true } : undefined },
+        `日次 ${i + 1}-${Math.min(i + dailyChunkSize, sales_daily.length)}`
+      );
+    }
+
+    // Part 4: 最終メタデータ
+    await sendPart({
+      meta: { source: 'minipc', synced_at: ts, products_count: products.length,
+        sales_monthly_count: sales_monthly.length, sales_daily_count: sales_daily.length }
+    }, 'メタデータ');
+
+    console.log(`[Sync→Render] ✅ 全送信完了`);
+    return { ok: true, products: products.length, sales_monthly: sales_monthly.length, sales_daily: sales_daily.length };
   } catch (e) {
     console.error(`[Sync→Render] ❌ 送信失敗:`, e.message);
     return { ok: false, error: e.message };
