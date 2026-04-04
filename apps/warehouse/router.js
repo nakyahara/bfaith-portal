@@ -620,39 +620,39 @@ router.post('/api/csv/shipping', upload.single('file'), (req, res) => {
   const updateVariants = db.prepare(`UPDATE m_products SET 送料 = ?, 送料コード = ?, 配送方法 = ?, updated_at = ?
     WHERE 商品コード IN (SELECT 商品コード FROM raw_ne_products WHERE 代表商品コード = ? COLLATE NOCASE) AND 送料 IS NULL`);
 
-  // ヘッダーから列位置を自動判定（ダウンロードCSVをそのまま編集してアップロード可能）
-  let colSku = 0, colShipCode = 1, colShipMethod = 2, colShipCost = 3;
+  // ヘッダーから送料コード列を自動判定
+  let colSku = 0, colShipCode = 1;
   if (dataRows.length > 0 && rows.length > dataRows.length) {
-    // ヘッダー行がスキップされたので、元のrows[0]を参照
     const hdr = rows[0].map(h => h.toLowerCase().trim());
-    const findCol = (names) => hdr.findIndex(h => names.some(n => h.includes(n)));
-    const ci = findCol(['送料コード', 'shipping_code']);
-    const cm = findCol(['配送方法', 'ship_method']);
-    const cc = findCol(['送料', 'ship_cost']);
+    const ci = hdr.findIndex(h => h.includes('送料コード') || h.includes('shipping_code'));
     if (ci >= 0) colShipCode = ci;
-    if (cm >= 0) colShipMethod = cm;
-    if (cc >= 0) colShipCost = cc;
   }
 
-  let count = 0, skipped = 0;
+  // shipping_ratesテーブルから送料コード→配送方法・送料を引く
+  const ratesMap = new Map();
+  for (const r of db.prepare('SELECT shipping_code, 小分類区分名称, 配送関係費合計 FROM shipping_rates').all()) {
+    ratesMap.set(r.shipping_code, { method: r.小分類区分名称 || '', cost: r.配送関係費合計 || 0 });
+  }
+
+  let count = 0, skipped = 0, invalidCode = 0;
   const tx = db.transaction(() => {
     for (const row of dataRows) {
       const sku = (row[colSku] || '').toLowerCase().trim();
       if (!sku) { skipped++; continue; }
-      const shipCost = parseFloat(row[colShipCost]) || 0;
-      if (!shipCost) { skipped++; continue; }
       const shippingCode = (row[colShipCode] || '').trim();
-      const shipMethod = (row[colShipMethod] || '').trim();
-      stmt.run(sku, sku, sku, '', shippingCode, shipMethod, shipCost, '', now);
+      if (!shippingCode) { skipped++; continue; }
+      const rate = ratesMap.get(shippingCode);
+      if (!rate) { invalidCode++; skipped++; continue; }
+      stmt.run(sku, sku, sku, '', shippingCode, rate.method, rate.cost, '', now);
       try {
-        updateMp.run(shipCost, shippingCode, shipMethod, now, sku);
-        updateVariants.run(shipCost, shippingCode, shipMethod, now, sku);
+        updateMp.run(rate.cost, shippingCode, rate.method, now, sku);
+        updateVariants.run(rate.cost, shippingCode, rate.method, now, sku);
       } catch {}
       count++;
     }
   });
   tx();
-  res.json({ ok: true, imported: count, skipped, total: dataRows.length });
+  res.json({ ok: true, imported: count, skipped, invalidCode, total: dataRows.length });
 });
 
 // POST /api/csv/genka — 原価CSV一括登録
@@ -925,7 +925,7 @@ router.get('/api/missing/download', (req, res) => {
         WHERE m.取扱区分 = '取扱中' AND m.送料 IS NULL
         ORDER BY m.商品区分, m.商品コード
       `).all();
-      header = '商品コード,商品名,商品区分,標準売価,原価,原価状態,代表商品コード,送料コード,配送方法,送料';
+      header = '商品コード,商品名,商品区分,標準売価,原価,原価状態,代表商品コード,送料コード';
       filename = 'shipping_missing.csv';
     } else if (type === 'genka') {
       rows = db.prepare(`
