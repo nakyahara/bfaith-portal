@@ -42,10 +42,19 @@ export async function rebuildFSales() {
     skuMap.get(key).push({ ne_code: row.ne_code, qty: row.数量 || 1 });
   }
 
-  // m_products のセット判定用
+  // m_products のセット判定用 + 商品コード存在チェック用
   const productTypes = new Map();
   for (const row of db.prepare("SELECT 商品コード, 商品区分 FROM m_products").all()) {
     productTypes.set(row.商品コード, row.商品区分);
+  }
+
+  // Amazon SKU → NE商品コード変換ヘルパー
+  // 1. sku_map → 2. m_products.商品コードと直接一致 → 3. unmapped
+  function resolveAmazonSku(sku) {
+    const mapped = skuMap.get(sku);
+    if (mapped) return { mappings: mapped, source: 'sku_map' };
+    if (productTypes.has(sku)) return { mappings: [{ ne_code: sku, qty: 1 }], source: 'direct' };
+    return null;
   }
 
   // unmapped 退避用
@@ -176,17 +185,20 @@ export async function rebuildFSales() {
     GROUP BY date, sku
   `).all();
 
+  let directMatchCount = 0;
   for (const row of amazonRows) {
-    const mappings = skuMap.get(row.sku);
-    if (!mappings) {
-      insertUnmapped.run(row.date, 'amazon', row.sku, row.title, row.qty, row.amount, 'sku_map未登録', ts);
+    const resolved = resolveAmazonSku(row.sku);
+    if (!resolved) {
+      insertUnmapped.run(row.date, 'amazon', row.sku, row.title, row.qty, row.amount, 'sku_map未登録・商品コード不一致', ts);
       unmappedCount++;
       continue;
     }
-    for (const m of mappings) {
+    if (resolved.source === 'direct') directMatchCount++;
+    for (const m of resolved.mappings) {
       expandToProducts(row.date, m.ne_code, 'amazon', row.title, row.qty * m.qty);
     }
   }
+  log.push(`Amazon直接マッチ（sku_map不要）: ${directMatchCount}件`);
 
   // 2. 楽天 → item_number ≒ NE商品コード → セット展開
   console.log('[f_sales]   楽天 → f_sales_by_product...');
