@@ -762,6 +762,30 @@ router.get('/api/shipping_rates', (req, res) => {
   res.json(execQuery('SELECT * FROM shipping_rates ORDER BY shipping_code'));
 });
 
+// ─── GET /api/missing/counts ───
+// 未登録件数のみ（軽量、VIEWを使わず直接COUNT）
+
+router.get('/api/missing/counts', (req, res) => {
+  const db = getDB();
+  const shipping = db.prepare(`
+    SELECT COUNT(*) as cnt FROM raw_ne_products p
+    LEFT JOIN product_shipping ps ON p.商品コード = ps.sku COLLATE NOCASE
+    WHERE p.取扱区分 = '取扱中' AND ps.sku IS NULL
+  `).get().cnt;
+  const genka = db.prepare(`
+    SELECT COUNT(*) as cnt FROM raw_ne_products p
+    LEFT JOIN exception_genka eg ON p.商品コード = eg.sku COLLATE NOCASE
+    LEFT JOIN raw_ne_set_products sp ON p.商品コード = sp.セット商品コード
+    WHERE p.取扱区分 = '取扱中' AND (p.原価 IS NULL OR p.原価 = 0) AND eg.sku IS NULL AND sp.セット商品コード IS NULL
+  `).get().cnt;
+  const sku_map = db.prepare(`
+    SELECT COUNT(DISTINCT o.seller_sku) as cnt FROM raw_sp_orders o
+    LEFT JOIN sku_map sm ON o.seller_sku = sm.seller_sku COLLATE NOCASE
+    WHERE sm.seller_sku IS NULL AND o.order_status NOT IN ('Cancelled')
+  `).get().cnt;
+  res.json({ shipping, genka, sku_map });
+});
+
 // ─── GET /api/products/suggest ───
 // 商品コードサジェスト（軽量、10件まで）
 
@@ -1131,18 +1155,15 @@ function renderRegisterPage(shippingRates) {
       document.getElementById('m-meta').textContent = (data.total||0) + '件';
     }
 
-    // ── 初期読込（件数だけ軽いAPIで取得、リストはボタン押下で読み込み）──
+    // ── 初期読込（軽量カウントAPIのみ、リストはボタン押下で読み込み）──
     (async () => {
-      try {
-        const data = await api('/api/missing');
-        const counts = {};
-        for (const s of (data.summary || [])) counts[s.missing_type] = s.cnt;
-        document.getElementById('c-ship').textContent = counts.shipping || 0;
-        document.getElementById('c-genka').textContent = counts.genka || 0;
-        document.getElementById('c-sku').textContent = counts.sku_map || 0;
-      } catch(e) { console.error(e); }
-      // リストは自動読み込みしない（ボタン押下で読み込む）
       document.getElementById('table-body').innerHTML = '<tr><td colspan="8" style="text-align:center;padding:30px;color:#888">上のタブをクリックすると未登録データを読み込みます</td></tr>';
+      try {
+        const c = await api('/api/missing/counts');
+        document.getElementById('c-ship').textContent = c.shipping || 0;
+        document.getElementById('c-genka').textContent = c.genka || 0;
+        document.getElementById('c-sku').textContent = c.sku_map || 0;
+      } catch(e) { console.error(e); }
     })();
 
     function renderMissingRows(rows) {
