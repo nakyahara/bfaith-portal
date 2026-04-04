@@ -973,10 +973,13 @@ function renderRegisterPage(shippingRates) {
           html += '<input placeholder="原価" style="width:80px" type="number" step="0.01"> ';
           html += '<button class="btn btn-p" data-act="reg-genka" data-sku="'+he(r.商品コード)+'" data-name="'+he(r.商品名)+'">登録</button>';
         } else {
-          html += '<div class="suggest-wrap" style="display:inline-block">';
-          html += '<input placeholder="NE商品コード" style="width:140px" data-suggest="1" autocomplete="off"> ';
-          html += '<div class="suggest-list"></div></div>';
-          html += '<button class="btn btn-p" data-act="reg-sku" data-sku="'+he(r.商品コード)+'" data-name="'+he(r.商品名)+'">登録</button>';
+          html += '<div class="sku-mapping-rows" data-seller-sku="'+he(r.商品コード)+'" data-name="'+he(r.商品名)+'">';
+          html += '<div class="sku-row" style="display:flex;gap:4px;align-items:center;margin-bottom:3px">';
+          html += '<div class="suggest-wrap" style="display:inline-block"><input placeholder="NE商品コード" style="width:130px" data-suggest="1" autocomplete="off"><div class="suggest-list"></div></div>';
+          html += '<input placeholder="数量" style="width:45px" type="number" value="1" min="1">';
+          html += '</div></div>';
+          html += '<button class="btn btn-s" style="font-size:11px;padding:2px 8px;margin-right:4px" data-act="add-sku-row" data-sku="'+he(r.商品コード)+'">+構成品</button>';
+          html += '<button class="btn btn-p" data-act="reg-sku-multi" data-sku="'+he(r.商品コード)+'" data-name="'+he(r.商品名)+'">登録</button>';
         }
         html += '</td></tr>';
       }
@@ -1015,7 +1018,39 @@ function renderRegisterPage(shippingRates) {
           tr.classList.add('done-row');
           setTimeout(() => tr.remove(), 600);
           updateCount('genka', -1);
+        } else if (act === 'add-sku-row') {
+          // +構成品ボタン: 入力行を追加
+          const container = tr.querySelector('.sku-mapping-rows');
+          if (!container) { btn.disabled=false; return; }
+          const newRow = document.createElement('div');
+          newRow.className = 'sku-row';
+          newRow.style = 'display:flex;gap:4px;align-items:center;margin-bottom:3px';
+          newRow.innerHTML = '<div class="suggest-wrap" style="display:inline-block"><input placeholder="NE商品コード" style="width:130px" data-suggest="1" autocomplete="off"><div class="suggest-list"></div></div><input placeholder="数量" style="width:45px" type="number" value="1" min="1"><button class="btn" style="font-size:10px;padding:1px 5px;background:#e74c3c;color:white" onclick="this.closest(\'.sku-row\').remove()">×</button>';
+          container.appendChild(newRow);
+          btn.disabled = false;
+          return;
+        } else if (act === 'reg-sku-multi') {
+          // 複数NE商品コード一括登録
+          const container = tr.querySelector('.sku-mapping-rows');
+          if (!container) { btn.disabled=false; return; }
+          const rows = container.querySelectorAll('.sku-row');
+          let registered = 0;
+          for (const row of rows) {
+            const neInput = row.querySelector('input[data-suggest]');
+            const qtyInput = row.querySelectorAll('input')[1];
+            const neCode = neInput?.value?.trim();
+            if (!neCode) continue;
+            const qty = parseInt(qtyInput?.value) || 1;
+            await api('/api/skumap', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({seller_sku:sku,ne_code:neCode,product_name:name,quantity:qty})});
+            registered++;
+          }
+          if (registered === 0) { btn.disabled=false; return; }
+          toast(sku+' のSKUマップを'+registered+'件登録');
+          tr.classList.add('done-row');
+          setTimeout(() => tr.remove(), 600);
+          updateCount('sku_map', -1);
         } else if (act === 'reg-sku') {
+          // 旧形式の互換性（マスタ管理画面等から）
           const inp = tr.querySelector('input[data-suggest]');
           if (!inp || !inp.value) { btn.disabled=false; return; }
           await api('/api/skumap', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({seller_sku:sku,ne_code:inp.value,product_name:name})});
