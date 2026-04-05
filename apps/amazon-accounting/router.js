@@ -47,10 +47,10 @@ function parseCsvBuffer(buf) {
 // ─── SKU解決（3段階）───
 
 function resolveSkus(rows, db) {
-  // mirror_productsの商品コードマップ
+  // mirror_productsの商品コードマップ（小文字統一）
   const productsMap = new Map();
   for (const p of db.prepare('SELECT * FROM mirror_products').all()) {
-    productsMap.set(p.商品コード, p);
+    productsMap.set((p.商品コード || '').toLowerCase(), p);
   }
 
   // mirror_sku_mapの変換マップ
