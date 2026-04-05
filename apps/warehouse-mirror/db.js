@@ -52,6 +52,7 @@ function createTables() {
     引当数            INTEGER,
     仕入先コード      TEXT,
     セット構成品数    INTEGER,
+    売上分類          INTEGER,
     updated_at        TEXT NOT NULL
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_sku ON mirror_products(商品コード)');

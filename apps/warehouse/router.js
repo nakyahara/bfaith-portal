@@ -873,6 +873,27 @@ router.get('/api/missing/prioritized', (req, res) => {
         LIMIT 200
       `).all());
     }
+
+    if (!type || type === 'sales_class') {
+      rows = rows.concat(db.prepare(`
+        SELECT 'sales_class' as missing_type, m.商品コード, m.商品名, m.標準売価 as 売価, m.原価,
+          m.取扱区分, m.商品区分,
+          COALESCE(s7.qty, 0) as sales_7d,
+          COALESCE(s30.qty, 0) as sales_30d,
+          s30.last_sold,
+          CASE WHEN COALESCE(s7.qty, 0) > 0 THEN 'A_7日以内' WHEN COALESCE(s30.qty, 0) > 0 THEN 'B_30日以内' ELSE 'C_実績なし' END as priority
+        FROM m_products m
+        LEFT JOIN (
+          SELECT 商品コード, SUM(数量) as qty FROM f_sales_by_product WHERE 日付 >= ? GROUP BY 商品コード
+        ) s7 ON m.商品コード = s7.商品コード
+        LEFT JOIN (
+          SELECT 商品コード, SUM(数量) as qty, MAX(日付) as last_sold FROM f_sales_by_product WHERE 日付 >= ? GROUP BY 商品コード
+        ) s30 ON m.商品コード = s30.商品コード
+        WHERE m.取扱区分 = '取扱中' AND m.売上分類 IS NULL
+        ORDER BY priority, sales_7d DESC, sales_30d DESC
+        LIMIT 200
+      `).all(cutoff7Str, cutoff30Str));
+    }
   } catch (e) {
     console.error('[missing/prioritized] m_products未構築?', e.message);
   }
@@ -915,6 +936,68 @@ router.get('/api/shipping_rates', (req, res) => {
   res.json(execQuery('SELECT * FROM shipping_rates ORDER BY shipping_code'));
 });
 
+// ─── POST /api/sales_class ───
+// 売上分類登録・更新
+
+router.post('/api/sales_class', (req, res) => {
+  const sku = (req.body.sku || '').toLowerCase();
+  const { sales_class, product_name } = req.body;
+  if (!sku || !sales_class) return res.status(400).json({ error: 'sku と sales_class は必須です' });
+  const sc = parseInt(sales_class);
+  if (![1, 2, 3, 4].includes(sc)) return res.status(400).json({ error: 'sales_class は 1〜4 の整数です' });
+  const db = getDB();
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const old = db.prepare('SELECT * FROM product_sales_class WHERE sku = ?').get(sku);
+  db.prepare('INSERT OR REPLACE INTO product_sales_class (sku, sales_class, 商品名, synced_at) VALUES (?, ?, ?, ?)').run(sku, sc, product_name || '', now);
+  auditLog(db, 'product_sales_class', sku, old ? 'UPDATE' : 'INSERT', old || null, { sku, sales_class: sc });
+  // m_productsにリアルタイム反映
+  try { db.prepare('UPDATE m_products SET 売上分類 = ?, updated_at = ? WHERE 商品コード = ?').run(sc, now, sku); } catch {}
+  res.json({ ok: true, sku, sales_class: sc });
+});
+
+// ─── POST /api/csv/sales_class ───
+// 売上分類CSV一括登録
+// CSV形式: 商品コード, 売上分類(1-4)
+
+router.post('/api/csv/sales_class', upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'ファイルが必要です' });
+  const db = getDB();
+  const buf = fs.readFileSync(req.file.path);
+  fs.unlinkSync(req.file.path);
+  const rows = parseCsvBuffer(buf);
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+
+  let dataRows = rows;
+  if (dataRows.length > 0 && /商品コード|sku|SKU/i.test(dataRows[0][0])) dataRows = dataRows.slice(1);
+
+  // ヘッダーから売上分類列を自動判定
+  let colSku = 0, colClass = 1;
+  if (dataRows.length > 0 && rows.length > dataRows.length) {
+    const hdr = rows[0].map(h => h.toLowerCase().trim());
+    const ci = hdr.findIndex(h => h.includes('売上分類') || h.includes('sales_class'));
+    if (ci >= 0) colClass = ci;
+  }
+
+  const stmt = db.prepare('INSERT OR REPLACE INTO product_sales_class (sku, sales_class, 商品名, synced_at) VALUES (?, ?, ?, ?)');
+  const updateMp = db.prepare('UPDATE m_products SET 売上分類 = ?, updated_at = ? WHERE 商品コード = ?');
+
+  let count = 0, skipped = 0, invalid = 0;
+  const tx = db.transaction(() => {
+    for (const row of dataRows) {
+      const sku = (row[colSku] || '').toLowerCase().trim();
+      if (!sku) { skipped++; continue; }
+      const sc = parseInt(row[colClass]);
+      if (![1, 2, 3, 4].includes(sc)) { invalid++; skipped++; continue; }
+      const name = db.prepare('SELECT 商品名 FROM m_products WHERE 商品コード = ?').get(sku)?.商品名 || '';
+      stmt.run(sku, sc, name, now);
+      try { updateMp.run(sc, now, sku); } catch {}
+      count++;
+    }
+  });
+  tx();
+  res.json({ ok: true, imported: count, skipped, invalid, total: dataRows.length });
+});
+
 // ─── GET /api/missing/download ───
 // 未登録データCSVダウンロード
 
@@ -950,8 +1033,17 @@ router.get('/api/missing/download', (req, res) => {
       rows = db.prepare('SELECT モール商品コード, 商品名, SUM(数量) as 数量, MAX(日付) as 最終日付 FROM unmapped_sales GROUP BY モール商品コード, 商品名 ORDER BY SUM(数量) DESC').all();
       header = 'モール商品コード,商品名,数量,最終日付';
       filename = 'sku_missing.csv';
+    } else if (type === 'sales_class') {
+      rows = db.prepare(`
+        SELECT m.商品コード, m.商品名, m.商品区分, m.標準売価, m.原価, m.原価状態, m.売上分類
+        FROM m_products m
+        WHERE m.取扱区分 = '取扱中' AND m.売上分類 IS NULL
+        ORDER BY m.商品区分, m.商品コード
+      `).all();
+      header = '商品コード,商品名,商品区分,標準売価,原価,原価状態,売上分類';
+      filename = 'sales_class_missing.csv';
     } else {
-      return res.status(400).json({ error: 'type パラメータが必要です（shipping / genka / sku_map）' });
+      return res.status(400).json({ error: 'type パラメータが必要です（shipping / genka / sku_map / sales_class）' });
     }
   } catch (e) {
     return res.status(500).json({ error: e.message });
@@ -983,10 +1075,10 @@ router.get('/api/missing/counts', (req, res) => {
     const shipping = db.prepare("SELECT COUNT(*) as cnt FROM m_products WHERE 取扱区分 = '取扱中' AND 送料 IS NULL").get().cnt;
     const genka = db.prepare("SELECT COUNT(*) as cnt FROM m_products WHERE 取扱区分 = '取扱中' AND 原価状態 IN ('MISSING','PARTIAL')").get().cnt;
     const sku_map = db.prepare("SELECT COUNT(*) as cnt FROM unmapped_sales").get().cnt;
-    res.json({ shipping, genka, sku_map });
+    const sales_class = db.prepare("SELECT COUNT(*) as cnt FROM m_products WHERE 取扱区分 = '取扱中' AND 売上分類 IS NULL").get().cnt;
+    res.json({ shipping, genka, sku_map, sales_class });
   } catch {
-    // m_productsが未構築の場合はフォールバック
-    res.json({ shipping: 0, genka: 0, sku_map: 0 });
+    res.json({ shipping: 0, genka: 0, sku_map: 0, sales_class: 0 });
   }
 });
 
@@ -1083,6 +1175,7 @@ function renderRegisterPage(shippingRates) {
         <div class="cnt cnt-ship active" onclick="switchType('shipping',this)">送料未登録: <b id="c-ship">...</b></div>
         <div class="cnt cnt-genka" onclick="switchType('genka',this)">原価未登録: <b id="c-genka">...</b></div>
         <div class="cnt cnt-sku" onclick="switchType('sku_map',this)">SKU未登録: <b id="c-sku">...</b></div>
+        <div class="cnt" style="background:#e8daef;color:#8e44ad" onclick="switchType('sales_class',this)">分類未登録: <b id="c-class">...</b></div>
       </div>
     </div>
 
@@ -1124,6 +1217,7 @@ function renderRegisterPage(shippingRates) {
         <button class="active" id="csv-tab-shipping" onclick="switchCsvType('shipping',this)">送料</button>
         <button id="csv-tab-genka" onclick="switchCsvType('genka',this)">原価</button>
         <button id="csv-tab-skumap" onclick="switchCsvType('skumap',this)">SKUマップ</button>
+        <button id="csv-tab-salesclass" onclick="switchCsvType('sales_class',this)">売上分類</button>
       </div>
       <div id="csv-format" style="font-size:12px;color:#666;margin-bottom:8px"></div>
       <div class="row">
@@ -1175,7 +1269,7 @@ function renderRegisterPage(shippingRates) {
 
     // ── 未登録データ読み込み ──
     async function loadMissing() {
-      const titles = { shipping: '送料未登録', genka: '原価未登録', sku_map: 'SKU未登録' };
+      const titles = { shipping: '送料未登録', genka: '原価未登録', sku_map: 'SKU未登録', sales_class: '分類未登録' };
       document.getElementById('list-title').textContent = titles[curType] || '';
       document.getElementById('table-body').innerHTML = '<tr><td colspan="8" style="text-align:center;padding:20px;color:#999">読み込み中...</td></tr>';
 
@@ -1213,6 +1307,9 @@ function renderRegisterPage(shippingRates) {
         } else if (curType === 'genka') {
           html += '<input placeholder="原価" style="width:80px" type="number" step="0.01"> ';
           html += '<button class="btn btn-p" data-act="reg-genka" data-sku="'+he(r.商品コード)+'" data-name="'+he(r.商品名)+'">登録</button>';
+        } else if (curType === 'sales_class') {
+          html += '<select style="width:120px"><option value="">--</option><option value="1">1:自社商品</option><option value="2">2:取扱限定</option><option value="3">3:仕入れ</option><option value="4">4:その他</option></select> ';
+          html += '<button class="btn btn-p" data-act="reg-class" data-sku="'+he(r.商品コード)+'" data-name="'+he(r.商品名)+'">登録</button>';
         } else {
           html += '<div class="sku-mapping-rows" data-seller-sku="'+he(r.商品コード)+'" data-name="'+he(r.商品名)+'">';
           html += '<div class="sku-row" style="display:flex;gap:4px;align-items:center;margin-bottom:3px">';
@@ -1259,6 +1356,14 @@ function renderRegisterPage(shippingRates) {
           tr.classList.add('done-row');
           setTimeout(() => tr.remove(), 600);
           updateCount('genka', -1);
+        } else if (act === 'reg-class') {
+          const sel = tr.querySelector('select');
+          if (!sel?.value) { btn.disabled=false; return; }
+          await api('/api/sales_class', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sku,sales_class:sel.value,product_name:name})});
+          toast(sku+' の売上分類を登録');
+          tr.classList.add('done-row');
+          setTimeout(() => tr.remove(), 600);
+          updateCount('sales_class', -1);
         } else if (act === 'remove-sku-row') {
           btn.closest('.sku-row')?.remove();
           btn.disabled = false;
@@ -1334,7 +1439,7 @@ function renderRegisterPage(shippingRates) {
     });
 
     function updateCount(type, delta) {
-      const map = {shipping:'c-ship',genka:'c-genka',sku_map:'c-sku'};
+      const map = {shipping:'c-ship',genka:'c-genka',sku_map:'c-sku',sales_class:'c-class'};
       const el = document.getElementById(map[type]);
       if (el) el.textContent = Math.max(0, parseInt(el.textContent||'0') + delta);
     }
@@ -1429,18 +1534,20 @@ function renderRegisterPage(shippingRates) {
         document.getElementById('c-ship').textContent = c.shipping || 0;
         document.getElementById('c-genka').textContent = c.genka || 0;
       } catch(e) { console.error(e); }
-      // 2段目: SKUカウント（重い、バックグラウンド）
+      // 2段目: 全カウント
       api('/api/missing/counts').then(c => {
         document.getElementById('c-sku').textContent = c.sku_map || 0;
-      }).catch(() => { document.getElementById('c-sku').textContent = '-'; });
+        document.getElementById('c-class').textContent = c.sales_class || 0;
+      }).catch(() => { document.getElementById('c-sku').textContent = '-'; document.getElementById('c-class').textContent = '-'; });
     })();
 
     // ── CSV一括アップロード ──
     let curCsvType = 'shipping';
     const csvFormats = {
-      shipping: 'CSV形式: 商品コード, 送料コード, 配送方法, 送料',
+      shipping: 'CSV形式: 商品コード, 送料コード',
       genka: 'CSV形式: 商品コード, 原価, 商品名（任意）',
-      skumap: 'CSV形式: seller_sku, ne_code, 数量（任意）, ASIN（任意）'
+      skumap: 'CSV形式: seller_sku, ne_code, 数量（任意）, ASIN（任意）',
+      sales_class: 'CSV形式: 商品コード, 売上分類(1:自社/2:取扱限定/3:仕入れ/4:その他)'
     };
     function switchCsvType(type, el) {
       curCsvType = type;

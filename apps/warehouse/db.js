@@ -398,6 +398,15 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_audit_table ON audit_log(table_name)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_audit_key ON audit_log(record_key)');
 
+  // 12b. 売上分類マスタ（手動入力）
+  db.exec(`CREATE TABLE IF NOT EXISTS product_sales_class (
+    sku               TEXT PRIMARY KEY,
+    sales_class       INTEGER NOT NULL,
+    商品名            TEXT,
+    synced_at         TEXT
+  )`);
+  // CHECK制約はSQLiteでは制限があるため、取り込み時にバリデーション
+
   // ─── 統合商品マスタ系 ───
 
   // 13. m_products（統合商品マスタ）
@@ -420,6 +429,7 @@ function createTables() {
     引当数            INTEGER,
     仕入先コード      TEXT,
     セット構成品数    INTEGER,
+    売上分類          INTEGER,
     updated_at        TEXT NOT NULL
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_mp_sku ON m_products(商品コード)');
@@ -447,6 +457,7 @@ function createTables() {
     引当数            INTEGER,
     仕入先コード      TEXT,
     セット構成品数    INTEGER,
+    売上分類          INTEGER,
     updated_at        TEXT NOT NULL
   )`);
 
@@ -568,7 +579,7 @@ function insertDefaultShops() {
 // ─── 統計取得 ───
 
 export function getStats() {
-  const tables = ['raw_ne_products', 'raw_ne_orders', 'raw_ne_set_products', 'raw_sp_orders', 'raw_sp_orders_log', 'raw_rakuten_orders', 'raw_rakuten_orders_log', 'raw_lz_inventory', 'sku_map', 'product_shipping', 'shipping_rates', 'exception_genka', 'shops', 'm_products', 'm_set_components', 'f_sales_by_listing', 'f_sales_by_product', 'unmapped_sales'];
+  const tables = ['raw_ne_products', 'raw_ne_orders', 'raw_ne_set_products', 'raw_sp_orders', 'raw_sp_orders_log', 'raw_rakuten_orders', 'raw_rakuten_orders_log', 'raw_lz_inventory', 'sku_map', 'product_shipping', 'shipping_rates', 'exception_genka', 'product_sales_class', 'shops', 'm_products', 'm_set_components', 'f_sales_by_listing', 'f_sales_by_product', 'unmapped_sales'];
   const stats = {};
 
   for (const table of tables) {

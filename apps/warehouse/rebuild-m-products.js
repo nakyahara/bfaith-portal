@@ -44,8 +44,8 @@ export async function rebuildMProducts() {
       標準売価, 原価, 原価ソース, 原価状態,
       送料, 送料コード, 配送方法,
       消費税率, 税区分,
-      在庫数, 引当数, 仕入先コード, セット構成品数, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      在庫数, 引当数, 仕入先コード, セット構成品数, 売上分類, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   const neProducts = db.prepare('SELECT * FROM raw_ne_products').all();
@@ -56,6 +56,11 @@ export async function rebuildMProducts() {
   const shippingMap = new Map();
   for (const ps of db.prepare('SELECT * FROM product_shipping').all()) {
     shippingMap.set(ps.sku?.toLowerCase(), ps);
+  }
+  // 売上分類マップ
+  const salesClassMap = new Map();
+  for (const sc of db.prepare('SELECT * FROM product_sales_class').all()) {
+    salesClassMap.set(sc.sku?.toLowerCase(), sc.sales_class);
   }
 
   // 送料取得ヘルパー: 自分のコード → 代表商品コード の順で検索
@@ -107,7 +112,7 @@ export async function rebuildMProducts() {
       p.売価, genka, genkaSource, genkaStatus,
       ps?.ship_cost ?? null, ps?.shipping_code ?? null, ps?.ship_method ?? null,
       taxRate, taxCategory,
-      p.在庫数, p.引当数, p.仕入先コード, null, ts
+      p.在庫数, p.引当数, p.仕入先コード, null, salesClassMap.get(code) ?? null, ts
     );
     countSingle++;
   }
@@ -197,7 +202,7 @@ export async function rebuildMProducts() {
       ps?.ship_cost ?? null, ps?.shipping_code ?? null, ps?.ship_method ?? null,
       taxRate, taxCategory,
       neInfo?.在庫数 ?? null, neInfo?.引当数 ?? null, neInfo?.仕入先コード ?? null,
-      components.length, ts
+      components.length, salesClassMap.get(setCode) ?? null, ts
     );
     countSet++;
   }
@@ -217,7 +222,7 @@ export async function rebuildMProducts() {
       null, eg.genka, '例外', 'OVERRIDDEN',
       ps?.ship_cost ?? null, ps?.shipping_code ?? null, ps?.ship_method ?? null,
       null, 'UNKNOWN',
-      null, null, null, null, ts
+      null, null, null, null, salesClassMap.get(sku) ?? null, ts
     );
     countException++;
   }
