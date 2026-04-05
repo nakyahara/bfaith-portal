@@ -889,7 +889,7 @@ router.get('/api/missing/prioritized', (req, res) => {
         LEFT JOIN (
           SELECT 商品コード, SUM(数量) as qty, MAX(日付) as last_sold FROM f_sales_by_product WHERE 日付 >= ? GROUP BY 商品コード
         ) s30 ON m.商品コード = s30.商品コード
-        WHERE m.取扱区分 = '取扱中' AND m.売上分類 IS NULL
+        WHERE m.商品区分 = '単品' AND m.売上分類 IS NULL
         ORDER BY priority, sales_7d DESC, sales_30d DESC
         LIMIT 200
       `).all(cutoff7Str, cutoff30Str));
@@ -1035,12 +1035,12 @@ router.get('/api/missing/download', (req, res) => {
       filename = 'sku_missing.csv';
     } else if (type === 'sales_class') {
       rows = db.prepare(`
-        SELECT m.商品コード, m.商品名, m.商品区分, m.標準売価, m.原価, m.原価状態, m.売上分類
+        SELECT m.商品コード, m.商品名, m.商品区分, m.取扱区分, m.標準売価, m.原価, m.原価状態, m.売上分類
         FROM m_products m
-        WHERE m.取扱区分 = '取扱中' AND m.売上分類 IS NULL
-        ORDER BY m.商品区分, m.商品コード
+        WHERE m.商品区分 = '単品' AND m.売上分類 IS NULL
+        ORDER BY m.取扱区分, m.商品コード
       `).all();
-      header = '商品コード,商品名,商品区分,標準売価,原価,原価状態,売上分類';
+      header = '商品コード,商品名,商品区分,取扱区分,標準売価,原価,原価状態,売上分類';
       filename = 'sales_class_missing.csv';
     } else {
       return res.status(400).json({ error: 'type パラメータが必要です（shipping / genka / sku_map / sales_class）' });
@@ -1075,7 +1075,7 @@ router.get('/api/missing/counts', (req, res) => {
     const shipping = db.prepare("SELECT COUNT(*) as cnt FROM m_products WHERE 取扱区分 = '取扱中' AND 送料 IS NULL").get().cnt;
     const genka = db.prepare("SELECT COUNT(*) as cnt FROM m_products WHERE 取扱区分 = '取扱中' AND 原価状態 IN ('MISSING','PARTIAL')").get().cnt;
     const sku_map = db.prepare("SELECT COUNT(*) as cnt FROM unmapped_sales").get().cnt;
-    const sales_class = db.prepare("SELECT COUNT(*) as cnt FROM m_products WHERE 取扱区分 = '取扱中' AND 売上分類 IS NULL").get().cnt;
+    const sales_class = db.prepare("SELECT COUNT(*) as cnt FROM m_products WHERE 商品区分 = '単品' AND 売上分類 IS NULL").get().cnt;
     res.json({ shipping, genka, sku_map, sales_class });
   } catch {
     res.json({ shipping: 0, genka: 0, sku_map: 0, sales_class: 0 });
@@ -1295,7 +1295,8 @@ function renderRegisterPage(shippingRates) {
         html += '<td>'+pri+'</td>';
         html += '<td>'+typeBadge+'</td>';
         html += '<td>'+he(r.商品コード)+'</td>';
-        html += '<td>'+he((r.商品名||''))+'</td>';
+        const statusBadge = r.取扱区分 && r.取扱区分 !== '取扱中' ? ' <span style="background:#e74c3c;color:white;padding:1px 5px;border-radius:3px;font-size:10px">'+he(r.取扱区分)+'</span>' : '';
+        html += '<td>'+he((r.商品名||''))+statusBadge+'</td>';
         html += '<td>'+(r.売価||'-')+'</td>';
         html += '<td>'+(r.sales_7d||0)+'</td>';
         html += '<td>'+(r.sales_30d||0)+'</td>';
@@ -1308,7 +1309,7 @@ function renderRegisterPage(shippingRates) {
           html += '<input placeholder="原価" style="width:80px" type="number" step="0.01"> ';
           html += '<button class="btn btn-p" data-act="reg-genka" data-sku="'+he(r.商品コード)+'" data-name="'+he(r.商品名)+'">登録</button>';
         } else if (curType === 'sales_class') {
-          html += '<select style="width:120px"><option value="">--</option><option value="1">1:自社商品</option><option value="2">2:取扱限定</option><option value="3">3:仕入れ</option><option value="4">4:その他</option></select> ';
+          html += '<select style="width:120px"><option value="">--</option><option value="1">1:自社商品</option><option value="2">2:取扱限定</option><option value="3">3:仕入れ</option><option value="4">4:輸出</option></select> ';
           html += '<button class="btn btn-p" data-act="reg-class" data-sku="'+he(r.商品コード)+'" data-name="'+he(r.商品名)+'">登録</button>';
         } else {
           html += '<div class="sku-mapping-rows" data-seller-sku="'+he(r.商品コード)+'" data-name="'+he(r.商品名)+'">';
@@ -1547,7 +1548,7 @@ function renderRegisterPage(shippingRates) {
       shipping: 'CSV形式: 商品コード, 送料コード',
       genka: 'CSV形式: 商品コード, 原価, 商品名（任意）',
       skumap: 'CSV形式: seller_sku, ne_code, 数量（任意）, ASIN（任意）',
-      sales_class: 'CSV形式: 商品コード, 売上分類(1:自社/2:取扱限定/3:仕入れ/4:その他)'
+      sales_class: 'CSV形式: 商品コード, 売上分類(1:自社/2:取扱限定/3:仕入れ/4:輸出)'
     };
     function switchCsvType(type, el) {
       curCsvType = type;
