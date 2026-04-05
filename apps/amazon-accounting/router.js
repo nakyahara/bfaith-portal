@@ -191,30 +191,42 @@ router.post('/upload', upload.single('file'), (req, res) => {
   }
 
   try {
-  // CSV解析（先頭7行スキップ）
-  const allRows = parseCsvBuffer(buf);
-  const headerRow = allRows[7] || allRows[0];
-  const dataRows = allRows.slice(8); // 8行目以降がデータ（7行スキップ + ヘッダー1行）
+  // CSV解析（テキストベースで軽量処理）
+  const text = buf[0] === 0xEF ? buf.toString('utf-8') : buf.toString('utf-8');
+  const lines = text.split(/\r?\n/);
 
-  // カラム位置を自動判定
-  const colMap = {};
-  const colNames = ['日付', '決済番号', 'トランザクション種類', '注文番号', 'SKU', '説明', '数量',
-    '', '', '', '', '', '',
-    '商品売上', '商品の売上税', '配送料', '配送料の税金', 'ギフト包装手数料', 'ギフト包装の税金',
-    'Amazonポイント費用', 'プロモーション割引額', 'プロモーション割引の税金',
-    '', '手数料', 'FBA手数料', 'トランザクション他', 'その他', '合計'];
+  // 先頭7行スキップ + ヘッダー1行 = 8行目以降がデータ
+  const num = v => { const n = parseFloat((v || '').replace(/"/g, '')); return isNaN(n) ? 0 : n; };
+  const clean = v => (v || '').replace(/^"|"$/g, '').trim();
 
-  // パース済み行データに変換
-  const parsedRows = dataRows.map(cols => {
-    const num = v => parseFloat(v) || 0;
-    return {
-      日付: cols[0] || '',
-      決済番号: cols[1] || '',
-      トランザクション種類: cols[2] || '',
-      注文番号: cols[3] || '',
-      sku: (cols[4] || '').toLowerCase(),
-      説明: cols[5] || '',
-      数量: parseInt(cols[6]) || 0,
+  const parsedRows = [];
+  for (let i = 8; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim()) continue;
+    // CSV行をパース（ダブルクォート対応）
+    const cols = [];
+    let current = '', inQ = false;
+    for (let j = 0; j < line.length; j++) {
+      const ch = line[j];
+      if (ch === '"') inQ = !inQ;
+      else if (ch === ',' && !inQ) { cols.push(current); current = ''; }
+      else current += ch;
+    }
+    cols.push(current);
+
+    const date = clean(cols[0]);
+    if (!date) continue;
+    // 日付から時刻部分を除去
+    const dateOnly = date.replace(/ .+$/, '');
+
+    parsedRows.push({
+      日付: dateOnly,
+      決済番号: clean(cols[1]),
+      トランザクション種類: clean(cols[2]),
+      注文番号: clean(cols[3]),
+      sku: clean(cols[4]).toLowerCase(),
+      説明: clean(cols[5]),
+      数量: parseInt(clean(cols[6])) || 0,
       商品売上: num(cols[13]),
       商品の売上税: num(cols[14]),
       配送料: num(cols[15]),
@@ -229,8 +241,8 @@ router.post('/upload', upload.single('file'), (req, res) => {
       トランザクション他: num(cols[25]),
       その他: num(cols[26]),
       合計: num(cols[27]),
-    };
-  }).filter(r => r.日付); // 空行除外
+    });
+  }
 
   // 対象年月を推定（最初の日付から）
   const firstDate = parsedRows[0]?.日付 || '';
