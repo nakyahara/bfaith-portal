@@ -196,7 +196,7 @@ router.post('/upload', upload.single('file'), (req, res) => {
   const lines = text.split(/\r?\n/);
 
   // 先頭7行スキップ + ヘッダー1行 = 8行目以降がデータ
-  const num = v => { const n = parseFloat((v || '').replace(/"/g, '')); return isNaN(n) ? 0 : n; };
+  const num = v => { const n = parseFloat((v || '').replace(/"/g, '').replace(/,/g, '')); return isNaN(n) ? 0 : n; };
   const clean = v => (v || '').replace(/^"|"$/g, '').trim();
 
   const parsedRows = [];
