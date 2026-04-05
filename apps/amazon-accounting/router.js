@@ -13,7 +13,9 @@ import fs from 'fs';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 
 const router = Router();
-const upload = multer({ dest: 'data/import/' });
+const UPLOAD_DIR = process.env.DATA_DIR ? process.env.DATA_DIR + '/import' : 'data/import';
+if (!fs.existsSync(UPLOAD_DIR)) { try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch {} }
+const upload = multer({ dest: UPLOAD_DIR });
 
 // セグメント名称マップ
 const SEGMENT_NAMES = { 1: '自社商品', 2: '取扱限定', 3: '仕入れ商品', 4: 'その他' };
@@ -175,10 +177,20 @@ router.get('/', (req, res) => {
 router.post('/upload', upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'ファイルが必要です' });
 
-  const db = getMirrorDB();
-  const buf = fs.readFileSync(req.file.path);
-  fs.unlinkSync(req.file.path);
+  let db, buf;
+  try {
+    db = getMirrorDB();
+  } catch (e) {
+    return res.status(500).json({ error: 'ミラーDB未初期化: ' + e.message });
+  }
+  try {
+    buf = fs.readFileSync(req.file.path);
+    fs.unlinkSync(req.file.path);
+  } catch (e) {
+    return res.status(500).json({ error: 'ファイル読み込みエラー: ' + e.message });
+  }
 
+  try {
   // CSV解析（先頭7行スキップ）
   const allRows = parseCsvBuffer(buf);
   const headerRow = allRows[7] || allRows[0];
@@ -245,6 +257,10 @@ router.post('/upload', upload.single('file'), (req, res) => {
     columns,
     segmentNames: SEGMENT_NAMES,
   });
+  } catch (e) {
+    console.error('[AmazonAccounting] エラー:', e.message, e.stack);
+    res.status(500).json({ error: '集計処理エラー: ' + e.message });
+  }
 });
 
 // ─── HTML ───
