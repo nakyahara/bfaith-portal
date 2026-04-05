@@ -84,6 +84,22 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
       log.push(`set_components: ${set_components.length}件`);
     }
 
+    // sku_map（全件置換）
+    if (req.body.sku_map && req.body.sku_map.length > 0) {
+      const skuMapData = req.body.sku_map;
+      const tx = db.transaction(() => {
+        db.exec('DELETE FROM mirror_sku_map');
+        const stmt = db.prepare(`INSERT INTO mirror_sku_map (
+          seller_sku, ne_code, asin, 商品名, 数量, updated_at
+        ) VALUES (?,?,?,?,?,?)`);
+        for (const s of skuMapData) {
+          stmt.run(s.seller_sku, s.ne_code, s.asin || '', s.商品名 || '', s.数量 || 1, now);
+        }
+      });
+      tx();
+      log.push(`sku_map: ${skuMapData.length}件`);
+    }
+
     // sales_monthly（初回チャンクでDELETE、以降は追記）
     if (sales_monthly && sales_monthly.length > 0) {
       const tx = db.transaction(() => {
@@ -198,6 +214,7 @@ router.get('/api/status', (req, res) => {
     status.products_count = db.prepare('SELECT COUNT(*) as cnt FROM mirror_products').get().cnt;
     status.sales_monthly_count = db.prepare('SELECT COUNT(*) as cnt FROM mirror_sales_monthly').get().cnt;
     status.sales_daily_count = db.prepare('SELECT COUNT(*) as cnt FROM mirror_sales_daily').get().cnt;
+    status.sku_map_count = db.prepare('SELECT COUNT(*) as cnt FROM mirror_sku_map').get().cnt;
   } catch {}
   res.json(status);
 });
@@ -208,7 +225,7 @@ router.get('/api/status', (req, res) => {
 router.get('/api/download/:table', (req, res) => {
   const db = getMirrorDB();
   const table = req.params.table;
-  const allowed = ['products', 'set_components', 'sales_monthly', 'sales_daily'];
+  const allowed = ['products', 'set_components', 'sales_monthly', 'sales_daily', 'sku_map'];
   if (!allowed.includes(table)) return res.status(400).json({ error: '無効なテーブル名' });
 
   const tableName = 'mirror_' + table;

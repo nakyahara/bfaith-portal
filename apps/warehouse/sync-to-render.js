@@ -54,6 +54,10 @@ export async function syncToRender() {
   const set_components = db.prepare('SELECT * FROM m_set_components').all();
   console.log(`[Sync→Render]   set_components: ${set_components.length}件`);
 
+  // 2b. sku_map
+  const sku_map = db.prepare('SELECT * FROM sku_map').all();
+  console.log(`[Sync→Render]   sku_map: ${sku_map.length}件`);
+
   // 3. sales_monthly（24ヶ月分、by_product + by_listing）
   const salesMonthlyProduct = db.prepare(`
     SELECT SUBSTR(日付, 1, 7) as 月, 商品コード, モール, MAX(商品名) as 商品名,
@@ -116,7 +120,7 @@ export async function syncToRender() {
 
   try {
     // Part 1: マスタデータ
-    await sendPart({ products, set_components }, 'マスタ');
+    await sendPart({ products, set_components, sku_map }, 'マスタ');
 
     // Part 2: 月次集計（チャンク分割、9MB以下に収める）
     const monthlyChunkSize = 20000;

@@ -70,6 +70,19 @@ function createTables() {
     PRIMARY KEY (セット商品コード, 構成商品コード)
   )`);
 
+  // mirror_sku_map — Amazon SKU→NE商品コード対応
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_sku_map (
+    seller_sku        TEXT NOT NULL,
+    ne_code           TEXT NOT NULL,
+    asin              TEXT,
+    商品名            TEXT,
+    数量              INTEGER DEFAULT 1,
+    updated_at        TEXT NOT NULL,
+    PRIMARY KEY (seller_sku, ne_code)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mirsku_sku ON mirror_sku_map(seller_sku)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mirsku_ne ON mirror_sku_map(ne_code)');
+
   // mirror_sales_monthly — 月次集計（24ヶ月分）
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_sales_monthly (
     月                TEXT NOT NULL,
