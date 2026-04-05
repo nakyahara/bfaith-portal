@@ -58,6 +58,8 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_sku ON mirror_products(商品コード)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_status ON mirror_products(取扱区分)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_type ON mirror_products(商品区分)');
+  // 既存テーブルへのカラム追加（マイグレーション）
+  try { db.exec('ALTER TABLE mirror_products ADD COLUMN 売上分類 INTEGER'); } catch {}
 
   // mirror_set_components — セット構成マスタ
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_set_components (
