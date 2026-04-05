@@ -17,8 +17,10 @@ const UPLOAD_DIR = process.env.DATA_DIR ? process.env.DATA_DIR + '/import' : 'da
 if (!fs.existsSync(UPLOAD_DIR)) { try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch {} }
 const upload = multer({ dest: UPLOAD_DIR });
 
-// セグメント名称マップ
-const SEGMENT_NAMES = { 1: '自社商品', 2: '取扱限定', 3: '仕入れ商品', 4: 'その他' };
+// セグメント名称マップ（1〜3が集計対象）
+const SEGMENT_NAMES = { 1: '自社商品', 2: '取扱限定', 3: '仕入れ商品' };
+// 除外セグメント（4=輸出はセグメント集計に含めない）
+const EXCLUDED_SEGMENTS = { 4: '輸出' };
 
 // ─── CSV解析 ───
 
@@ -147,8 +149,14 @@ function aggregate(resolvedRows) {
   // 税率別
   const byTax = { '10': emptyRow(), '8': emptyRow() };
 
-  // セグメント別
-  const bySegment = { '1': emptyRow(), '2': emptyRow(), '3': emptyRow(), '4': emptyRow(), 'other': emptyRow() };
+  // セグメント別（1〜3 + other。4=輸出は除外）
+  const bySegment = { '1': emptyRow(), '2': emptyRow(), '3': emptyRow(), 'other': emptyRow() };
+
+  // 除外セグメント（4=輸出）
+  const excluded = { '4': emptyRow() };
+
+  // 「その他/未分類」に入った行の明細を記録
+  const otherDetails = new Map();
 
   for (const row of resolvedRows) {
     if (row.解決方法 === 'skip') continue; // 振込み
@@ -159,11 +167,45 @@ function aggregate(resolvedRows) {
 
     // セグメント別
     const segKey = row.売上分類 ? String(row.売上分類) : 'other';
-    if (bySegment[segKey]) addRow(bySegment[segKey], row);
-    else addRow(bySegment['other'], row);
+
+    if (excluded[segKey]) {
+      // 4=輸出 → 除外集計
+      addRow(excluded[segKey], row);
+    } else if (bySegment[segKey]) {
+      addRow(bySegment[segKey], row);
+    } else {
+      addRow(bySegment['other'], row);
+    }
+
+    // 「その他」に入った行の明細を記録
+    if (!row.売上分類 && !excluded[segKey]) {
+      const detailKey = row.商品コード || row.sku || '_no_sku_' + (row.トランザクション種類 || '');
+      const existing = otherDetails.get(detailKey) || {
+        sku: row.sku || '',
+        商品コード: row.商品コード || '',
+        商品名: row.説明 || '',
+        トランザクション種類: row.トランザクション種類 || '',
+        解決方法: row.解決方法,
+        商品売上: 0,
+        合計: 0,
+        数量: 0,
+        count: 0,
+      };
+      existing.商品売上 += row.商品売上 || 0;
+      existing.合計 += row.合計 || 0;
+      existing.数量 += row.数量 || 0;
+      existing.count++;
+      otherDetails.set(detailKey, existing);
+    }
   }
 
-  return { byTax, bySegment, columns };
+  return {
+    byTax,
+    bySegment,
+    excluded,
+    otherDetails: [...otherDetails.values()].sort((a, b) => Math.abs(b.商品売上) - Math.abs(a.商品売上)),
+    columns,
+  };
 }
 
 // ─── GET / — メイン画面 ───
@@ -252,7 +294,7 @@ router.post('/upload', upload.single('file'), (req, res) => {
   const { resolved, unresolved } = resolveSkus(parsedRows, db);
 
   // 集計
-  const { byTax, bySegment, columns } = aggregate(resolved);
+  const { byTax, bySegment, excluded, otherDetails, columns } = aggregate(resolved);
 
   // 未登録税率の件数
   const unresolvedTaxCount = resolved.filter(r => r.解決方法 !== 'skip' && r.解決方法 !== 'no_sku' && r.税率 === null).length;
@@ -266,8 +308,11 @@ router.post('/upload', upload.single('file'), (req, res) => {
     canConfirm: unresolved.length === 0 && unresolvedTaxCount === 0,
     byTax,
     bySegment,
+    excluded,
+    otherDetails,
     columns,
     segmentNames: SEGMENT_NAMES,
+    excludedNames: EXCLUDED_SEGMENTS,
   });
   } catch (e) {
     console.error('[AmazonAccounting] エラー:', e.message, e.stack);
@@ -304,10 +349,13 @@ function renderPage() {
     .warn{background:#fef9e7;border:1px solid #f9e79f;padding:10px;border-radius:4px;margin:8px 0}
     .ok{background:#eafaf1;border:1px solid #a9dfbf;padding:10px;border-radius:4px;margin:8px 0}
     .err{background:#fdedec;border:1px solid #f5b7b1;padding:10px;border-radius:4px;margin:8px 0}
+    .excluded{background:#f4ecf7;border:1px solid #d7bde2;padding:10px;border-radius:4px;margin:8px 0;font-size:13px}
     .meta{font-size:12px;color:#888;margin-top:6px}
     #result{display:none}
     .num{font-family:monospace}
     .negative{color:#e74c3c}
+    .detail-table td{font-size:12px;font-weight:normal}
+    .detail-table th{font-size:11px}
   </style>
 </head>
 <body>
@@ -345,6 +393,13 @@ function renderPage() {
       <div class="card">
         <h2>セグメント別集計（管理会計用）</h2>
         <div id="segmentTable"></div>
+        <div id="excludedInfo"></div>
+      </div>
+
+      <div id="otherDetailCard" class="card" style="display:none">
+        <h2>「その他/未分類」明細</h2>
+        <p class="meta">売上分類が未登録の商品・SKUなし行の内訳</p>
+        <div id="otherDetailList"></div>
       </div>
     </div>
   </div>
@@ -418,13 +473,12 @@ function renderPage() {
         cols.forEach(c => taxHtml += '<td class="num">' + fmt(row[c]) + '</td>');
         taxHtml += '</tr>';
       }
-      // 合計行
       taxHtml += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td>';
       cols.forEach(c => taxHtml += '<td class="num">' + fmt((data.byTax['10'][c] || 0) + (data.byTax['8'][c] || 0)) + '</td>');
       taxHtml += '</tr></table>';
       document.getElementById('taxTable').innerHTML = taxHtml;
 
-      // セグメント別
+      // セグメント別（1〜3 + other。4=輸出は除外）
       let segHtml = '<table><tr><th>セグメント</th>';
       cols.forEach(c => segHtml += '<th>' + c + '</th>');
       segHtml += '<th>原価合計</th></tr>';
@@ -443,6 +497,46 @@ function renderPage() {
       cols.forEach(c => segHtml += '<td class="num">' + fmt(totalRow[c]) + '</td>');
       segHtml += '<td class="num">' + fmt(totalRow.原価合計) + '</td></tr></table>';
       document.getElementById('segmentTable').innerHTML = segHtml;
+
+      // 除外セグメント（4=輸出）
+      let exclHtml = '';
+      if (data.excluded) {
+        for (const [key, row] of Object.entries(data.excluded)) {
+          if (row.行数 > 0) {
+            const label = data.excludedNames[key] || key;
+            exclHtml += '<div class="excluded">';
+            exclHtml += '<b>除外: ' + key + ': ' + label + '</b>（' + row.行数 + '行）';
+            exclHtml += ' — 商品売上: ' + fmt(row['商品売上']) + ' / 合計: ' + fmt(row['合計']) + ' / 原価合計: ' + fmt(row.原価合計);
+            exclHtml += '</div>';
+          }
+        }
+      }
+      document.getElementById('excludedInfo').innerHTML = exclHtml;
+
+      // 「その他/未分類」明細
+      if (data.otherDetails && data.otherDetails.length > 0) {
+        const card = document.getElementById('otherDetailCard');
+        card.style.display = 'block';
+        let html = '<table class="detail-table"><tr><th>SKU</th><th>商品コード</th><th>商品名</th><th>種類</th><th>解決方法</th><th>行数</th><th>数量</th><th>商品売上</th><th>合計</th></tr>';
+        for (const d of data.otherDetails) {
+          const method = { direct: '商品コード一致', sku_map: 'SKUマップ経由', unresolved: '未解決', no_sku: 'SKUなし' }[d.解決方法] || d.解決方法;
+          html += '<tr>';
+          html += '<td style="text-align:left">' + (d.sku || '-') + '</td>';
+          html += '<td style="text-align:left">' + (d.商品コード || '-') + '</td>';
+          html += '<td style="text-align:left">' + (d.商品名 || '').slice(0, 50) + '</td>';
+          html += '<td style="text-align:left">' + (d.トランザクション種類 || '-') + '</td>';
+          html += '<td style="text-align:left">' + method + '</td>';
+          html += '<td class="num">' + d.count + '</td>';
+          html += '<td class="num">' + d.数量 + '</td>';
+          html += '<td class="num">' + fmt(d.商品売上) + '</td>';
+          html += '<td class="num">' + fmt(d.合計) + '</td>';
+          html += '</tr>';
+        }
+        html += '</table>';
+        document.getElementById('otherDetailList').innerHTML = html;
+      } else {
+        document.getElementById('otherDetailCard').style.display = 'none';
+      }
     }
   </script>
 </body>
