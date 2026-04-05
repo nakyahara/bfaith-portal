@@ -199,12 +199,38 @@ function aggregate(resolvedRows) {
     }
   }
 
+  // MF連携用 税込み集計行
+  const t10 = byTax['10'];
+  const t8 = byTax['8'];
+  const mfColumns = ['商品売上(10%)', '商品売上(8%)', '配送料', 'ギフト包装手数料',
+    'Amazonポイントの費用', 'プロモーション割引額', '手数料', 'FBA手数料',
+    'トランザクションに関するその他の手数料+その他', '合計', '端数調整'];
+  const mfRow = {
+    '商品売上(10%)': t10['商品売上'] + t10['商品の売上税'],
+    '商品売上(8%)': t8['商品売上'] + t8['商品の売上税'],
+    '配送料': t10['配送料'] + t10['配送料の税金'] + t8['配送料'] + t8['配送料の税金'],
+    'ギフト包装手数料': t10['ギフト包装手数料'] + t10['ギフト包装の税金'] + t8['ギフト包装手数料'] + t8['ギフト包装の税金'],
+    'Amazonポイントの費用': t10['Amazonポイント費用'] + t8['Amazonポイント費用'],
+    'プロモーション割引額': t10['プロモーション割引額'] + t10['プロモーション割引の税金'] + t8['プロモーション割引額'] + t8['プロモーション割引の税金'],
+    '手数料': t10['手数料'] + t8['手数料'],
+    'FBA手数料': t10['FBA手数料'] + t8['FBA手数料'],
+    'トランザクションに関するその他の手数料+その他': t10['トランザクション他'] + t10['その他'] + t8['トランザクション他'] + t8['その他'],
+    '合計': t10['合計'] + t8['合計'],
+  };
+  // 端数調整 = 合計 - 他全列の合計
+  const mfSubtotal = mfRow['商品売上(10%)'] + mfRow['商品売上(8%)'] + mfRow['配送料']
+    + mfRow['ギフト包装手数料'] + mfRow['Amazonポイントの費用'] + mfRow['プロモーション割引額']
+    + mfRow['手数料'] + mfRow['FBA手数料'] + mfRow['トランザクションに関するその他の手数料+その他'];
+  mfRow['端数調整'] = mfRow['合計'] - mfSubtotal;
+
   return {
     byTax,
     bySegment,
     excluded,
     otherDetails: [...otherDetails.values()].sort((a, b) => Math.abs(b.商品売上) - Math.abs(a.商品売上)),
     columns,
+    mfRow,
+    mfColumns,
   };
 }
 
@@ -294,7 +320,7 @@ router.post('/upload', upload.single('file'), (req, res) => {
   const { resolved, unresolved } = resolveSkus(parsedRows, db);
 
   // 集計
-  const { byTax, bySegment, excluded, otherDetails, columns } = aggregate(resolved);
+  const { byTax, bySegment, excluded, otherDetails, columns, mfRow, mfColumns } = aggregate(resolved);
 
   // 未登録税率の件数
   const unresolvedTaxCount = resolved.filter(r => r.解決方法 !== 'skip' && r.解決方法 !== 'no_sku' && r.税率 === null).length;
@@ -311,6 +337,8 @@ router.post('/upload', upload.single('file'), (req, res) => {
     excluded,
     otherDetails,
     columns,
+    mfRow,
+    mfColumns,
     segmentNames: SEGMENT_NAMES,
     excludedNames: EXCLUDED_SEGMENTS,
   });
@@ -388,6 +416,11 @@ function renderPage() {
       <div class="card">
         <h2>税率別集計</h2>
         <div id="taxTable"></div>
+      </div>
+
+      <div class="card">
+        <h2>MF連携用 税込み集計</h2>
+        <div id="mfTable"></div>
       </div>
 
       <div class="card">
@@ -477,6 +510,16 @@ function renderPage() {
       cols.forEach(c => taxHtml += '<td class="num">' + fmt((data.byTax['10'][c] || 0) + (data.byTax['8'][c] || 0)) + '</td>');
       taxHtml += '</tr></table>';
       document.getElementById('taxTable').innerHTML = taxHtml;
+
+      // MF連携用 税込み集計
+      if (data.mfRow && data.mfColumns) {
+        let mfHtml = '<table><tr><th style="text-align:center" colspan="' + data.mfColumns.length + '">税込み</th></tr><tr>';
+        data.mfColumns.forEach(c => mfHtml += '<th>' + c + '</th>');
+        mfHtml += '</tr><tr>';
+        data.mfColumns.forEach(c => mfHtml += '<td class="num" style="font-weight:bold">' + fmt(data.mfRow[c]) + '</td>');
+        mfHtml += '</tr></table>';
+        document.getElementById('mfTable').innerHTML = mfHtml;
+      }
 
       // セグメント別（1〜3 + other。4=輸出は除外）
       let segHtml = '<table><tr><th>セグメント</th>';
