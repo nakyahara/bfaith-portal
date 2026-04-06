@@ -877,6 +877,10 @@ router.get('/history/:yearMonth', (req, res) => {
 // ─── POST /import-history — ヒストリカルデータ一括投入 ───
 
 router.post('/import-history', (req, res) => {
+  // APIキー認証（一時投入用）
+  const key = req.headers['x-import-key'] || req.query.key;
+  if (key !== 'bfaith-import-2026') return res.status(401).json({ error: 'Invalid key' });
+
   const db = getMirrorDB();
   const { months } = req.body;
   if (!Array.isArray(months)) return res.status(400).json({ error: 'months 配列が必要です' });

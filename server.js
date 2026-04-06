@@ -308,7 +308,10 @@ app.use('/apps/profit-calculator', requireAppAccess('profit-calculator'), profit
 app.use('/apps/fba-replenishment', requireAppAccess('fba-replenishment'), fbaRouter);
 app.use('/apps/warehouse', requireAppAccess('warehouse'), warehouseRouter);
 app.use('/apps/mirror', express.json({ limit: '100mb' }), mirrorRouter);  // ミラー同期APIはセッション認証不要（APIキー認証）
-app.use('/apps/amazon-accounting', requireAuth, amazonAccountingRouter);
+app.use('/apps/amazon-accounting', (req, res, next) => {
+  if (req.path === '/import-history' && req.method === 'POST') return next();  // APIキー認証に委譲
+  requireAuth(req, res, next);
+}, amazonAccountingRouter);
 
 // 未実装アプリのプレースホルダー
 app.get('/apps/:appId', requireAuth, (req, res) => {
