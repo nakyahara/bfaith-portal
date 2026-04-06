@@ -19,6 +19,9 @@ const upload = multer({ dest: UPLOAD_DIR });
 
 // セグメント名称マップ（1〜3が集計対象）
 const SEGMENT_NAMES = { 1: '自社商品', 2: '取扱限定', 3: '仕入れ商品' };
+
+// エビデンスCSV一時保存（yearMonth → { detail, summary }）
+const evidenceStore = new Map();
 // 除外セグメント（4=輸出はセグメント集計に含めない）
 const EXCLUDED_SEGMENTS = { 4: '輸出' };
 
@@ -339,6 +342,46 @@ router.post('/upload', upload.single('file'), (req, res) => {
   // 未登録税率の件数
   const unresolvedTaxCount = resolved.filter(r => r.解決方法 !== 'skip' && r.解決方法 !== 'no_sku' && r.税率 === null).length;
 
+  // ─── エビデンスCSV生成 ───
+  // 1. 明細CSV（元CSVの各行 + 判定結果）
+  const detailCols = ['日付','トランザクション種類','注文番号','sku','説明','数量',
+    '商品売上','商品の売上税','配送料','配送料の税金','ギフト包装手数料','ギフト包装の税金',
+    'Amazonポイント費用','プロモーション割引額','プロモーション割引の税金','手数料','FBA手数料',
+    'トランザクション他','その他','合計','商品コード','税率','売上分類','原価','解決方法'];
+  let detailCsv = '\uFEFF' + detailCols.join(',') + '\n';
+  for (const r of resolved) {
+    const vals = detailCols.map(c => {
+      const v = r[c];
+      if (v === null || v === undefined) return '';
+      if (typeof v === 'string' && (v.includes(',') || v.includes('"'))) return '"' + v.replace(/"/g, '""') + '"';
+      return v;
+    });
+    detailCsv += vals.join(',') + '\n';
+  }
+
+  // 2. 集計サマリーCSV（税率別 + MF税込 + セグメント別）
+  let summaryCsv = '\uFEFF';
+  // 税率別
+  summaryCsv += '【税率別集計】\n';
+  summaryCsv += '税率,' + columns.join(',') + '\n';
+  for (const [key, label] of [['10','10%'],['8','8%']]) {
+    summaryCsv += label + ',' + columns.map(c => byTax[key][c] || 0).join(',') + '\n';
+  }
+  summaryCsv += '合計,' + columns.map(c => (byTax['10'][c] || 0) + (byTax['8'][c] || 0)).join(',') + '\n';
+  // MF税込
+  summaryCsv += '\n【MF連携用 税込み集計】\n';
+  summaryCsv += mfColumns.join(',') + '\n';
+  summaryCsv += mfColumns.map(c => mfRow[c] || 0).join(',') + '\n';
+  // セグメント別
+  summaryCsv += '\n【セグメント別集計（管理会計用）】\n';
+  summaryCsv += 'セグメント,' + columns.join(',') + ',原価合計\n';
+  for (const [key, row] of Object.entries(bySegment)) {
+    const label = SEGMENT_NAMES[key] || (key === 'other' ? 'その他/未分類' : key);
+    summaryCsv += key + ':' + label + ',' + columns.map(c => row[c] || 0).join(',') + ',' + (row.原価合計 || 0) + '\n';
+  }
+
+  evidenceStore.set(yearMonth, { detail: detailCsv, summary: summaryCsv });
+
   res.json({
     yearMonth,
     totalRows: parsedRows.length,
@@ -463,11 +506,16 @@ function renderPage() {
       </div>
 
       <div class="card" id="confirmCard">
-        <h2>確定</h2>
-        <div style="display:flex;gap:12px;align-items:center;margin-bottom:8px">
+        <h2>確定・エビデンス</h2>
+        <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
           <label>広告費（税込）: <input type="number" id="adCost" value="0" style="width:120px;padding:4px" oninput="updateAdCost()"></label>
           <button class="btn btn-s" id="confirmBtn" onclick="doConfirm()">この月の集計を確定</button>
         </div>
+        <div style="display:flex;gap:8px;margin-top:8px">
+          <button class="btn btn-p" onclick="downloadEvidence('detail')">明細エビデンスCSV</button>
+          <button class="btn btn-p" onclick="downloadEvidence('summary')">集計サマリーCSV</button>
+        </div>
+        <p class="meta" style="margin-top:6px">明細: アップロードCSVの全行+税率・分類・原価の判定結果 / 集計: 税率別+MF税込+セグメント別</p>
         <div id="confirmStatus" class="meta"></div>
       </div>
     </div>
@@ -687,6 +735,11 @@ function renderPage() {
       renderSegmentTable('segmentTable', lastData.bySegment, lastData.segmentNames, lastData.columns, null);
     }
 
+    function downloadEvidence(type) {
+      if (!lastData) { alert('先にCSVをアップロードしてください'); return; }
+      window.open(location.pathname + '/evidence/' + type + '/' + lastData.yearMonth);
+    }
+
     async function doConfirm() {
       if (!lastData) { alert('先にCSVをアップロードしてください'); return; }
       if (!confirm(lastData.yearMonth + ' の集計を確定しますか？')) return;
@@ -888,6 +941,24 @@ function renderPage() {
 
 </html>`;
 }
+
+// ─── GET /evidence/:type/:yearMonth — エビデンスCSVダウンロード ───
+
+router.get('/evidence/:type/:yearMonth', (req, res) => {
+  const { type, yearMonth } = req.params;
+  const ev = evidenceStore.get(yearMonth);
+  if (!ev) return res.status(404).json({ error: yearMonth + ' のエビデンスがありません。先にCSVをアップロードしてください。' });
+
+  const csv = type === 'detail' ? ev.detail : ev.summary;
+  if (!csv) return res.status(404).json({ error: 'データが見つかりません' });
+
+  const filename = type === 'detail'
+    ? 'Amazon_' + yearMonth + '_明細エビデンス.csv'
+    : 'Amazon_' + yearMonth + '_集計サマリー.csv';
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="' + encodeURIComponent(filename) + '"');
+  res.send(csv);
+});
 
 // ─── POST /confirm — 集計確定（DB保存） ───
 
