@@ -571,27 +571,23 @@ function renderPage() {
       const ad = adCost !== null ? adCost : (parseFloat(document.getElementById('adCost')?.value) || 0);
       let segHtml = '<table><tr><th>セグメント</th>';
       cols.forEach(c => segHtml += '<th>' + c + '</th>');
-      segHtml += '<th>原価合計</th></tr>';
+      segHtml += '<th>広告費</th><th>原価合計</th></tr>';
       let totalRow = {};
       cols.forEach(c => totalRow[c] = 0);
       totalRow.原価合計 = 0;
       for (const [key, row] of Object.entries(bySegment)) {
         const label = segmentNames[key] || (key === 'other' ? 'その他/未分類' : key);
         segHtml += '<tr><td>' + key + ': ' + label + '</td>';
-        cols.forEach(c => {
-          let v = row[c] || 0;
-          if (key === 'other' && c === 'その他') v -= ad;
-          segHtml += '<td class="num">' + fmt(v) + '</td>';
-          totalRow[c] += v;
-        });
+        cols.forEach(c => { segHtml += '<td class="num">' + fmt(row[c] || 0) + '</td>'; totalRow[c] += (row[c] || 0); });
+        segHtml += '<td class="num">-</td>';
         segHtml += '<td class="num">' + fmt(row.原価合計 || 0) + '</td>';
         totalRow.原価合計 += (row.原価合計 || 0);
         segHtml += '</tr>';
       }
       segHtml += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td>';
       cols.forEach(c => segHtml += '<td class="num">' + fmt(totalRow[c]) + '</td>');
+      segHtml += '<td class="num">' + fmt(ad) + '</td>';
       segHtml += '<td class="num">' + fmt(totalRow.原価合計) + '</td></tr></table>';
-      if (ad) segHtml += '<div class="meta" style="margin-top:4px">※ 広告費 ' + fmt(ad) + ' をその他/未分類の「その他」列に含んでいます</div>';
       document.getElementById(targetId).innerHTML = segHtml;
 
       // 除外セグメント（4=輸出）
@@ -660,7 +656,14 @@ function renderPage() {
 
     function updateAdCost() {
       if (!lastData) return;
-      renderSegmentTable('segmentTable', lastData.bySegment, lastData.segmentNames, lastData.columns, null);
+      const cells = document.querySelectorAll('#segmentTable td');
+      // 合計行の広告費セル = 最後から2番目のtd
+      const allRows = document.querySelectorAll('#segmentTable tr');
+      const lastRow = allRows[allRows.length - 1];
+      if (lastRow) {
+        const tds = lastRow.querySelectorAll('td');
+        if (tds.length >= 2) tds[tds.length - 2].innerHTML = fmt(parseFloat(document.getElementById('adCost').value) || 0);
+      }
     }
 
     async function doConfirm() {
@@ -754,25 +757,21 @@ function renderPage() {
           html += '<h3 style="font-size:13px;color:#555;margin:12px 0 4px">セグメント別集計（管理会計用）</h3>';
           html += '<table><tr><th>セグメント</th>';
           segCols.forEach(c => html += '<th>' + c + '</th>');
-          html += '<th>原価合計</th></tr>';
+          html += '<th>広告費</th><th>原価合計</th></tr>';
           let sTot = {}; segCols.forEach(c => sTot[c] = 0); sTot.原価合計 = 0;
           for (const [key, sr] of Object.entries(seg)) {
             const lb = segNames[key] || (key === 'other' ? 'その他/未分類' : key);
             html += '<tr><td>' + key + ': ' + lb + '</td>';
-            segCols.forEach(c => {
-              let v = sr[c] || 0;
-              if (key === 'other' && c === 'その他') v -= ad;
-              html += '<td class="num">' + fmt(v) + '</td>';
-              sTot[c] += v;
-            });
+            segCols.forEach(c => { html += '<td class="num">' + fmt(sr[c] || 0) + '</td>'; sTot[c] += (sr[c] || 0); });
+            html += '<td class="num">-</td>';
             html += '<td class="num">' + fmt(sr.原価合計 || 0) + '</td>';
             sTot.原価合計 += (sr.原価合計 || 0);
             html += '</tr>';
           }
           html += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td>';
           segCols.forEach(c => html += '<td class="num">' + fmt(sTot[c]) + '</td>');
+          html += '<td class="num">' + fmt(ad) + '</td>';
           html += '<td class="num">' + fmt(sTot.原価合計) + '</td></tr></table>';
-          if (ad) html += '<div class="meta">※ 広告費 ' + fmt(ad) + ' をその他/未分類の「その他」列に含んでいます</div>';
 
           // 除外セグメント
           const excl = row.excluded || {};
