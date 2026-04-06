@@ -121,7 +121,21 @@ function resolveSkus(rows, db) {
     }
   }
 
-  return { resolved, unresolved: [...unresolved.values()] };
+  // 原価ゼロの商品を検出
+  const zeroGenka = new Map();
+  for (const row of resolved) {
+    if (row.解決方法 === 'skip' || row.解決方法 === 'no_sku') continue;
+    if (row.商品コード && (row.原価 === 0 || row.原価 === null)) {
+      const key = row.商品コード;
+      const existing = zeroGenka.get(key) || { 商品コード: key, sku: row.sku || '', 商品名: row.説明 || '', 数量合計: 0, 売上合計: 0, count: 0 };
+      existing.数量合計 += row.数量 || 0;
+      existing.売上合計 += row.商品売上 || 0;
+      existing.count++;
+      zeroGenka.set(key, existing);
+    }
+  }
+
+  return { resolved, unresolved: [...unresolved.values()], zeroGenka: [...zeroGenka.values()] };
 }
 
 // ─── 集計 ───
@@ -317,7 +331,7 @@ router.post('/upload', upload.single('file'), (req, res) => {
   const yearMonth = firstDate.slice(0, 7).replace('/', '-');
 
   // SKU解決
-  const { resolved, unresolved } = resolveSkus(parsedRows, db);
+  const { resolved, unresolved, zeroGenka } = resolveSkus(parsedRows, db);
 
   // 集計
   const { byTax, bySegment, excluded, otherDetails, columns, mfRow, mfColumns } = aggregate(resolved);
@@ -341,6 +355,7 @@ router.post('/upload', upload.single('file'), (req, res) => {
     mfColumns,
     segmentNames: SEGMENT_NAMES,
     excludedNames: EXCLUDED_SEGMENTS,
+    zeroGenka,
   });
   } catch (e) {
     console.error('[AmazonAccounting] エラー:', e.message, e.stack);
@@ -433,6 +448,12 @@ function renderPage() {
         <h2>「その他/未分類」明細</h2>
         <p class="meta">売上分類が未登録の商品・SKUなし行の内訳</p>
         <div id="otherDetailList"></div>
+      </div>
+
+      <div id="zeroGenkaCard" class="card" style="display:none">
+        <h2>⚠️ 原価ゼロで計算された商品</h2>
+        <p class="meta">商品マスタの原価が0またはNULLのため、原価0円で集計されています。正確な粗利計算には原価登録が必要です。</p>
+        <div id="zeroGenkaList"></div>
       </div>
     </div>
   </div>
@@ -579,6 +600,28 @@ function renderPage() {
         document.getElementById('otherDetailList').innerHTML = html;
       } else {
         document.getElementById('otherDetailCard').style.display = 'none';
+      }
+
+      // 原価ゼロ警告
+      if (data.zeroGenka && data.zeroGenka.length > 0) {
+        const card = document.getElementById('zeroGenkaCard');
+        card.style.display = 'block';
+        let html = '<div class="warn" style="margin-bottom:8px"><b>' + data.zeroGenka.length + '商品</b>が原価0円で計算されています</div>';
+        html += '<table class="detail-table"><tr><th>商品コード</th><th>SKU</th><th>商品名</th><th>出現行数</th><th>数量合計</th><th>商品売上合計</th></tr>';
+        for (const z of data.zeroGenka) {
+          html += '<tr>';
+          html += '<td style="text-align:left">' + z.商品コード + '</td>';
+          html += '<td style="text-align:left">' + (z.sku || '-') + '</td>';
+          html += '<td style="text-align:left">' + (z.商品名 || '').slice(0, 50) + '</td>';
+          html += '<td class="num">' + z.count + '</td>';
+          html += '<td class="num">' + z.数量合計 + '</td>';
+          html += '<td class="num">' + fmt(z.売上合計) + '</td>';
+          html += '</tr>';
+        }
+        html += '</table>';
+        document.getElementById('zeroGenkaList').innerHTML = html;
+      } else {
+        document.getElementById('zeroGenkaCard').style.display = 'none';
       }
     }
   </script>
