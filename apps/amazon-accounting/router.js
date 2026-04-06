@@ -570,26 +570,27 @@ function renderPage() {
     function renderSegmentTable(targetId, bySegment, segmentNames, cols, adCost) {
       const ad = adCost !== null ? adCost : (parseFloat(document.getElementById('adCost')?.value) || 0);
 
-      // 広告費を売上按分: セグメント1〜3の商品売上比率で配分
+      // 広告費を売上按分: セグメント1・2の商品売上比率で配分（3とotherは対象外）
+      const adTargets = ['1', '2'];
       const salesByKey = {};
       let totalSales = 0;
       for (const [key, row] of Object.entries(bySegment)) {
         const s = row['商品売上'] || 0;
         salesByKey[key] = s;
-        if (key !== 'other') totalSales += s;
+        if (adTargets.includes(key)) totalSales += s;
       }
       const adByKey = {};
       let adSum = 0;
       const keys = Object.keys(bySegment);
       for (const key of keys) {
-        if (key === 'other' || totalSales === 0) { adByKey[key] = 0; continue; }
+        if (!adTargets.includes(key) || totalSales === 0) { adByKey[key] = 0; continue; }
         const share = Math.round(ad * salesByKey[key] / totalSales);
         adByKey[key] = share;
         adSum += share;
       }
       // 丸め誤差を最大セグメントに調整
       if (ad && totalSales > 0) {
-        const maxKey = keys.filter(k => k !== 'other').sort((a, b) => (salesByKey[b] || 0) - (salesByKey[a] || 0))[0];
+        const maxKey = keys.filter(k => adTargets.includes(k)).sort((a, b) => (salesByKey[b] || 0) - (salesByKey[a] || 0))[0];
         if (maxKey) adByKey[maxKey] += (ad - adSum);
       }
 
@@ -774,17 +775,18 @@ function renderPage() {
             'プロモーション割引額', 'プロモーション割引の税金', '手数料', 'FBA手数料',
             'トランザクション他', 'その他', '合計'];
           html += '<h3 style="font-size:13px;color:#555;margin:12px 0 4px">セグメント別集計（管理会計用）</h3>';
-          // 広告費を売上按分
+          // 広告費を売上按分（セグメント1・2のみ）
+          const hAdTargets = ['1', '2'];
           const hSales = {}; let hTotalSales = 0;
-          for (const [k, sr] of Object.entries(seg)) { const s = sr['商品売上'] || 0; hSales[k] = s; if (k !== 'other') hTotalSales += s; }
+          for (const [k, sr] of Object.entries(seg)) { const s = sr['商品売上'] || 0; hSales[k] = s; if (hAdTargets.includes(k)) hTotalSales += s; }
           const hAd = {}; let hAdSum = 0;
           const segKeys = Object.keys(seg);
           for (const k of segKeys) {
-            if (k === 'other' || hTotalSales === 0) { hAd[k] = 0; continue; }
+            if (!hAdTargets.includes(k) || hTotalSales === 0) { hAd[k] = 0; continue; }
             hAd[k] = Math.round(ad * hSales[k] / hTotalSales); hAdSum += hAd[k];
           }
           if (ad && hTotalSales > 0) {
-            const mk = segKeys.filter(k => k !== 'other').sort((a, b) => (hSales[b]||0) - (hSales[a]||0))[0];
+            const mk = segKeys.filter(k => hAdTargets.includes(k)).sort((a, b) => (hSales[b]||0) - (hSales[a]||0))[0];
             if (mk) hAd[mk] += (ad - hAdSum);
           }
 
