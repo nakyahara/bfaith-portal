@@ -126,6 +126,8 @@ function resolveSkus(rows, db) {
 
   // 原価ゼロの商品を検出
   const zeroGenka = new Map();
+  // 税率未登録の商品を検出
+  const unresolvedTax = new Map();
   for (const row of resolved) {
     if (row.解決方法 === 'skip' || row.解決方法 === 'no_sku') continue;
     if (row.商品コード && (row.原価 === 0 || row.原価 === null)) {
@@ -136,9 +138,17 @@ function resolveSkus(rows, db) {
       existing.count++;
       zeroGenka.set(key, existing);
     }
+    if (row.商品コード && row.税率 === null) {
+      const key = row.商品コード;
+      const existing = unresolvedTax.get(key) || { 商品コード: key, sku: row.sku || '', 商品名: row.説明 || '', 数量合計: 0, 売上合計: 0, count: 0 };
+      existing.数量合計 += row.数量 || 0;
+      existing.売上合計 += row.商品売上 || 0;
+      existing.count++;
+      unresolvedTax.set(key, existing);
+    }
   }
 
-  return { resolved, unresolved: [...unresolved.values()], zeroGenka: [...zeroGenka.values()] };
+  return { resolved, unresolved: [...unresolved.values()], zeroGenka: [...zeroGenka.values()], unresolvedTax: [...unresolvedTax.values()] };
 }
 
 // ─── 集計 ───
@@ -178,9 +188,14 @@ function aggregate(resolvedRows) {
   for (const row of resolvedRows) {
     if (row.解決方法 === 'skip') continue; // 振込み
 
-    // 税率別
-    const taxKey = row.税率 === 8 ? '8' : '10'; // 未登録は10%仮扱い
-    addRow(byTax[taxKey], row);
+    // 税率別（税率未登録は集計しない）
+    if (row.税率 === 10 || row.税率 === 8) {
+      addRow(byTax[String(row.税率)], row);
+    } else if (row.解決方法 === 'no_sku' || row.解決方法 === 'unresolved') {
+      // SKUなし・未解決は10%扱い（手数料等は税率情報がない）
+      addRow(byTax['10'], row);
+    }
+    // 税率未登録（商品は解決済みだが税率がない）→ 税率別集計に含めない
 
     // セグメント別
     const segKey = row.売上分類 ? String(row.売上分類) : 'other';
@@ -334,7 +349,7 @@ router.post('/upload', upload.single('file'), (req, res) => {
   const yearMonth = firstDate.slice(0, 7).replace('/', '-');
 
   // SKU解決
-  const { resolved, unresolved, zeroGenka } = resolveSkus(parsedRows, db);
+  const { resolved, unresolved, zeroGenka, unresolvedTax } = resolveSkus(parsedRows, db);
 
   // 集計
   const { byTax, bySegment, excluded, otherDetails, columns, mfRow, mfColumns } = aggregate(resolved);
@@ -388,7 +403,8 @@ router.post('/upload', upload.single('file'), (req, res) => {
     resolvedCount: resolved.filter(r => r.解決方法 !== 'unresolved' && r.解決方法 !== 'skip' && r.解決方法 !== 'no_sku').length,
     unresolvedSkus: unresolved,
     unresolvedTaxCount,
-    canConfirm: unresolved.length === 0 && unresolvedTaxCount === 0,
+    unresolvedTax,
+    canConfirm: unresolved.length === 0 && unresolvedTax.length === 0,
     byTax,
     bySegment,
     excluded,
@@ -490,6 +506,12 @@ function renderPage() {
         <div id="unresolvedList"></div>
       </div>
 
+      <div id="unresolvedTaxCard" class="card" style="display:none">
+        <h2>⚠️ 税率未登録</h2>
+        <p class="meta">以下の商品は商品マスタに消費税率が登録されていません。ミニPCの管理画面で税率を登録してください。税率未登録がある場合、確定できません。</p>
+        <div id="unresolvedTaxList"></div>
+      </div>
+
       <div class="card">
         <h2>税率別集計</h2>
         <div id="taxTable"></div>
@@ -579,9 +601,14 @@ function renderPage() {
       let summaryHtml = '<div class="' + (data.canConfirm ? 'ok' : 'warn') + '">';
       summaryHtml += '<b>対象年月: ' + data.yearMonth + '</b><br>';
       summaryHtml += '総行数: ' + data.totalRows + ' / SKU解決済: ' + data.resolvedCount + ' / 未登録SKU: ' + data.unresolvedSkus.length + '件';
-      if (data.unresolvedTaxCount > 0) summaryHtml += ' / <span class="negative">税率未登録: ' + data.unresolvedTaxCount + '件（10%仮扱い）</span>';
-      if (data.canConfirm) summaryHtml += '<br><b style="color:#27ae60">✅ 全SKU解決済み — 確定可能</b>';
-      else summaryHtml += '<br><b style="color:#e74c3c">❌ 未登録SKUあり — 確定不可</b>';
+      if (data.unresolvedTax && data.unresolvedTax.length > 0) summaryHtml += ' / <span class="negative">税率未登録: ' + data.unresolvedTax.length + '商品</span>';
+      if (data.canConfirm) summaryHtml += '<br><b style="color:#27ae60">✅ 全て解決済み — 確定可能</b>';
+      else {
+        const reasons = [];
+        if (data.unresolvedSkus.length > 0) reasons.push('未登録SKU');
+        if (data.unresolvedTax && data.unresolvedTax.length > 0) reasons.push('税率未登録');
+        summaryHtml += '<br><b style="color:#e74c3c">❌ ' + reasons.join('・') + 'あり — 確定不可</b>';
+      }
       summaryHtml += '</div>';
       document.getElementById('summary').innerHTML = summaryHtml;
 
@@ -597,6 +624,28 @@ function renderPage() {
         document.getElementById('unresolvedList').innerHTML = html;
       } else {
         document.getElementById('unresolvedCard').style.display = 'none';
+      }
+
+      // 税率未登録
+      if (data.unresolvedTax && data.unresolvedTax.length > 0) {
+        const card = document.getElementById('unresolvedTaxCard');
+        card.style.display = 'block';
+        let html = '<div class="warn" style="margin-bottom:8px"><b>' + data.unresolvedTax.length + '商品</b>の税率が未登録です。税率別集計に含まれません。</div>';
+        html += '<table class="detail-table"><tr><th>商品コード</th><th>SKU</th><th>商品名</th><th>出現行数</th><th>数量合計</th><th>商品売上合計</th></tr>';
+        for (const t of data.unresolvedTax) {
+          html += '<tr>';
+          html += '<td style="text-align:left">' + t.商品コード + '</td>';
+          html += '<td style="text-align:left">' + (t.sku || '-') + '</td>';
+          html += '<td style="text-align:left">' + (t.商品名 || '').slice(0, 50) + '</td>';
+          html += '<td class="num">' + t.count + '</td>';
+          html += '<td class="num">' + t.数量合計 + '</td>';
+          html += '<td class="num">' + fmt(t.売上合計) + '</td>';
+          html += '</tr>';
+        }
+        html += '</table>';
+        document.getElementById('unresolvedTaxList').innerHTML = html;
+      } else {
+        document.getElementById('unresolvedTaxCard').style.display = 'none';
       }
 
       // 税率別
@@ -1076,7 +1125,7 @@ function renderPage() {
       <h2>11. 注意事項</h2>
       <ul>
         <li>CSV金額のカンマ区切り（例: <code>3,200</code>）は自動除去されます</li>
-        <li>税率未登録の商品は<b>10%仮扱い</b>（概要に件数表示）</li>
+        <li>税率未登録の商品は<b>税率別集計から除外</b>（税率未登録リストに表示、確定不可）</li>
         <li>原価0の商品は「原価ゼロ警告」タブに一覧表示</li>
         <li>未登録SKUがあると確定不可（先にミニPC管理画面で登録）</li>
         <li>2022/7〜2026/2のヒストリカルデータは旧スプレッドシートから移行済み</li>
