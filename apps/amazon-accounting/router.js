@@ -399,6 +399,12 @@ function renderPage() {
     .negative{color:#e74c3c}
     .detail-table td{font-size:12px;font-weight:normal}
     .detail-table th{font-size:11px}
+    .acc-header{cursor:pointer;padding:10px 12px;background:#f8f9fa;border:1px solid #dee2e6;border-radius:4px;margin-bottom:2px;display:flex;justify-content:space-between;align-items:center;font-size:13px}
+    .acc-header:hover{background:#e9ecef}
+    .acc-header .arrow{transition:transform .2s;font-size:10px}
+    .acc-header.open .arrow{transform:rotate(90deg)}
+    .acc-body{display:none;padding:12px;border:1px solid #eee;border-top:none;margin-bottom:8px;background:#fff}
+    .acc-body.open{display:block}
   </style>
 </head>
 <body>
@@ -459,7 +465,7 @@ function renderPage() {
       <div class="card" id="confirmCard">
         <h2>確定</h2>
         <div style="display:flex;gap:12px;align-items:center;margin-bottom:8px">
-          <label>広告費（税込）: <input type="number" id="adCost" value="0" style="width:120px;padding:4px"></label>
+          <label>広告費（税込）: <input type="number" id="adCost" value="0" style="width:120px;padding:4px" oninput="updateAdCost()"></label>
           <button class="btn btn-s" id="confirmBtn" onclick="doConfirm()">この月の集計を確定</button>
         </div>
         <div id="confirmStatus" class="meta"></div>
@@ -558,24 +564,31 @@ function renderPage() {
       }
 
       // セグメント別（1〜3 + other。4=輸出は除外）
+      renderSegmentTable('segmentTable', data.bySegment, data.segmentNames, cols, null);
+    }
+
+    function renderSegmentTable(targetId, bySegment, segmentNames, cols, adCost) {
       let segHtml = '<table><tr><th>セグメント</th>';
       cols.forEach(c => segHtml += '<th>' + c + '</th>');
-      segHtml += '<th>原価合計</th></tr>';
+      segHtml += '<th>広告費</th><th>原価合計</th></tr>';
       let totalRow = {};
       cols.forEach(c => totalRow[c] = 0);
       totalRow.原価合計 = 0;
-      for (const [key, row] of Object.entries(data.bySegment)) {
-        const label = data.segmentNames[key] || (key === 'other' ? 'その他/未分類' : key);
+      for (const [key, row] of Object.entries(bySegment)) {
+        const label = segmentNames[key] || (key === 'other' ? 'その他/未分類' : key);
         segHtml += '<tr><td>' + key + ': ' + label + '</td>';
         cols.forEach(c => { segHtml += '<td class="num">' + fmt(row[c]) + '</td>'; totalRow[c] += row[c]; });
+        segHtml += '<td class="num">-</td>';
         segHtml += '<td class="num">' + fmt(row.原価合計) + '</td>';
         totalRow.原価合計 += row.原価合計;
         segHtml += '</tr>';
       }
+      const ad = adCost !== null ? adCost : (parseFloat(document.getElementById('adCost')?.value) || 0);
       segHtml += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td>';
       cols.forEach(c => segHtml += '<td class="num">' + fmt(totalRow[c]) + '</td>');
+      segHtml += '<td class="num" id="segAdCost">' + fmt(ad) + '</td>';
       segHtml += '<td class="num">' + fmt(totalRow.原価合計) + '</td></tr></table>';
-      document.getElementById('segmentTable').innerHTML = segHtml;
+      document.getElementById(targetId).innerHTML = segHtml;
 
       // 除外セグメント（4=輸出）
       let exclHtml = '';
@@ -641,6 +654,11 @@ function renderPage() {
     }
     let lastData = null;
 
+    function updateAdCost() {
+      const el = document.getElementById('segAdCost');
+      if (el) el.innerHTML = fmt(parseFloat(document.getElementById('adCost').value) || 0);
+    }
+
     async function doConfirm() {
       if (!lastData) { alert('先にCSVをアップロードしてください'); return; }
       if (!confirm(lastData.yearMonth + ' の集計を確定しますか？')) return;
@@ -686,27 +704,81 @@ function renderPage() {
           document.getElementById('historyList').innerHTML = '<span class="meta">確定データはまだありません</span>';
           return;
         }
-        let html = '<table><tr><th>年月</th><th>総行数</th><th>SKU解決</th><th>商品売上(税込)</th><th>合計</th><th>広告費</th><th>確定日時</th></tr>';
-        for (const row of rows) {
+        let html = '';
+        for (let i = 0; i < rows.length; i++) {
+          const row = rows[i];
           const mf = row.mf_row || {};
           const sales10 = mf['商品売上(10%)'] || 0;
           const sales8 = mf['商品売上(8%)'] || 0;
           const total = mf['合計'] || 0;
-          html += '<tr>';
-          html += '<td>' + row.year_month + '</td>';
-          html += '<td class="num">' + (row.total_rows || 0).toLocaleString() + '</td>';
-          html += '<td class="num">' + (row.resolved_count || 0).toLocaleString() + '</td>';
-          html += '<td class="num">' + Math.round(sales10 + sales8).toLocaleString() + '</td>';
-          html += '<td class="num">' + Math.round(total).toLocaleString() + '</td>';
-          html += '<td class="num">' + Math.round(row.ad_cost || 0).toLocaleString() + '</td>';
-          html += '<td>' + (row.confirmed_at || '') + '</td>';
-          html += '</tr>';
+          const ad = Math.round(row.ad_cost || 0);
+
+          html += '<div class="acc-header" onclick="toggleAcc(this)" data-idx="' + i + '">';
+          html += '<span><b>' + row.year_month + '</b> — 商品売上: \\u00a5' + Math.round(sales10 + sales8).toLocaleString()
+            + ' / 合計: \\u00a5' + Math.round(total).toLocaleString()
+            + ' / 広告費: \\u00a5' + ad.toLocaleString()
+            + ' <span class="meta">（' + (row.confirmed_at || '') + '）</span></span>';
+          html += '<span class="arrow">&#9654;</span></div>';
+          html += '<div class="acc-body" id="acc-' + i + '">';
+
+          // MF連携用 税込み集計
+          const mfCols = ['商品売上(10%)', '商品売上(8%)', '配送料', 'ギフト包装手数料',
+            'Amazonポイントの費用', 'プロモーション割引額', '手数料', 'FBA手数料',
+            'トランザクションに関するその他の手数料+その他', '合計', '端数調整'];
+          html += '<h3 style="font-size:13px;color:#555;margin-bottom:4px">MF連携用 税込み集計</h3>';
+          html += '<table><tr><th style="text-align:center" colspan="' + mfCols.length + '">税込み</th></tr><tr>';
+          mfCols.forEach(c => html += '<th>' + c + '</th>');
+          html += '</tr><tr>';
+          mfCols.forEach(c => html += '<td class="num" style="font-weight:bold">' + fmt(mf[c] || 0) + '</td>');
+          html += '</tr></table>';
+
+          // セグメント別集計
+          const seg = row.by_segment || {};
+          const segNames = {1:'自社商品', 2:'取扱限定', 3:'仕入れ商品'};
+          const segCols = ['商品売上', '商品の売上税', '配送料', '配送料の税金',
+            'ギフト包装手数料', 'ギフト包装の税金', 'Amazonポイント費用',
+            'プロモーション割引額', 'プロモーション割引の税金', '手数料', 'FBA手数料',
+            'トランザクション他', 'その他', '合計'];
+          html += '<h3 style="font-size:13px;color:#555;margin:12px 0 4px">セグメント別集計（管理会計用）</h3>';
+          html += '<table><tr><th>セグメント</th>';
+          segCols.forEach(c => html += '<th>' + c + '</th>');
+          html += '<th>広告費</th><th>原価合計</th></tr>';
+          let sTot = {}; segCols.forEach(c => sTot[c] = 0); sTot.原価合計 = 0;
+          for (const [key, sr] of Object.entries(seg)) {
+            const lb = segNames[key] || (key === 'other' ? 'その他/未分類' : key);
+            html += '<tr><td>' + key + ': ' + lb + '</td>';
+            segCols.forEach(c => { html += '<td class="num">' + fmt(sr[c] || 0) + '</td>'; sTot[c] += (sr[c] || 0); });
+            html += '<td class="num">-</td>';
+            html += '<td class="num">' + fmt(sr.原価合計 || 0) + '</td>';
+            sTot.原価合計 += (sr.原価合計 || 0);
+            html += '</tr>';
+          }
+          html += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td>';
+          segCols.forEach(c => html += '<td class="num">' + fmt(sTot[c]) + '</td>');
+          html += '<td class="num">' + fmt(ad) + '</td>';
+          html += '<td class="num">' + fmt(sTot.原価合計) + '</td></tr></table>';
+
+          // 除外セグメント
+          const excl = row.excluded || {};
+          for (const [ek, er] of Object.entries(excl)) {
+            if ((er.行数 || 0) > 0) {
+              html += '<div class="excluded"><b>除外: ' + ek + ': 輸出</b>（' + er.行数 + '行） — 商品売上: ' + fmt(er['商品売上'] || 0) + ' / 合計: ' + fmt(er['合計'] || 0) + '</div>';
+            }
+          }
+
+          html += '</div>';
         }
-        html += '</table>';
         document.getElementById('historyList').innerHTML = html;
       } catch(e) {
         document.getElementById('historyList').innerHTML = '<span class="meta">読み込みエラー</span>';
       }
+    }
+
+    function toggleAcc(el) {
+      const idx = el.dataset.idx;
+      const body = document.getElementById('acc-' + idx);
+      el.classList.toggle('open');
+      body.classList.toggle('open');
     }
 
     loadHistory();
