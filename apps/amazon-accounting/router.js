@@ -918,10 +918,15 @@ function renderPage() {
             if (mk) adMap[mk] += (ad - adSum);
           }
 
+          // 集計月を yyyy/mm/dd（月末日）形式に変換
+          const [y, m] = row.year_month.split('-');
+          const lastDay = new Date(parseInt(y), parseInt(m), 0).getDate();
+          const ymStr = y + '/' + m + '/' + String(lastDay).padStart(2, '0');
+
           for (const [key, sr] of Object.entries(seg)) {
             const label = segNames[key] || key;
             const vals = segCols.map(c => sr[c] || 0);
-            csv += row.year_month + ',' + key + ':' + label + ',' + vals.join(',') + ',' + (adMap[key] || 0) + ',' + (sr.原価合計 || 0) + '\\n';
+            csv += ymStr + ',' + key + ':' + label + ',' + vals.join(',') + ',' + (adMap[key] || 0) + ',' + (sr.原価合計 || 0) + '\\n';
           }
         }
 
