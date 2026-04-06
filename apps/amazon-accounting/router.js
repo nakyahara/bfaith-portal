@@ -378,14 +378,14 @@ function renderPage() {
     .header{background:#1a5276;color:white;padding:12px 24px;display:flex;align-items:center;gap:16px}
     .header h1{font-size:18px}
     .header a{color:#aed6f1;text-decoration:none;font-size:13px}
-    .wrap{max-width:1200px;margin:16px auto;padding:0 16px}
-    .card{background:white;border-radius:8px;padding:20px;margin-bottom:12px;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+    .wrap{max-width:1800px;margin:16px auto;padding:0 16px}
+    .card{background:white;border-radius:8px;padding:20px;margin-bottom:12px;box-shadow:0 1px 3px rgba(0,0,0,.1);overflow-x:auto}
     .card h2{font-size:15px;color:#555;margin-bottom:10px}
     .btn{padding:8px 20px;border:none;border-radius:4px;cursor:pointer;font-size:14px}
     .btn-p{background:#2980b9;color:white}.btn-p:hover{background:#1a6da0}
     .btn-s{background:#27ae60;color:white}.btn-s:hover{background:#1e8449}
     .btn:disabled{opacity:.5;cursor:default}
-    table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px}
+    table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px;white-space:nowrap}
     th{background:#f0f0f0;padding:6px 8px;text-align:left;font-size:12px}
     td{padding:5px 8px;border-bottom:1px solid #eee;text-align:right}
     td:first-child{text-align:left;font-weight:600}
@@ -569,24 +569,50 @@ function renderPage() {
 
     function renderSegmentTable(targetId, bySegment, segmentNames, cols, adCost) {
       const ad = adCost !== null ? adCost : (parseFloat(document.getElementById('adCost')?.value) || 0);
+
+      // 広告費を売上按分: セグメント1〜3の商品売上比率で配分
+      const salesByKey = {};
+      let totalSales = 0;
+      for (const [key, row] of Object.entries(bySegment)) {
+        const s = row['商品売上'] || 0;
+        salesByKey[key] = s;
+        if (key !== 'other') totalSales += s;
+      }
+      const adByKey = {};
+      let adSum = 0;
+      const keys = Object.keys(bySegment);
+      for (const key of keys) {
+        if (key === 'other' || totalSales === 0) { adByKey[key] = 0; continue; }
+        const share = Math.round(ad * salesByKey[key] / totalSales);
+        adByKey[key] = share;
+        adSum += share;
+      }
+      // 丸め誤差を最大セグメントに調整
+      if (ad && totalSales > 0) {
+        const maxKey = keys.filter(k => k !== 'other').sort((a, b) => (salesByKey[b] || 0) - (salesByKey[a] || 0))[0];
+        if (maxKey) adByKey[maxKey] += (ad - adSum);
+      }
+
       let segHtml = '<table><tr><th>セグメント</th>';
       cols.forEach(c => segHtml += '<th>' + c + '</th>');
       segHtml += '<th>広告費</th><th>原価合計</th></tr>';
       let totalRow = {};
       cols.forEach(c => totalRow[c] = 0);
       totalRow.原価合計 = 0;
+      let totalAd = 0;
       for (const [key, row] of Object.entries(bySegment)) {
         const label = segmentNames[key] || (key === 'other' ? 'その他/未分類' : key);
         segHtml += '<tr><td>' + key + ': ' + label + '</td>';
         cols.forEach(c => { segHtml += '<td class="num">' + fmt(row[c] || 0) + '</td>'; totalRow[c] += (row[c] || 0); });
-        segHtml += '<td class="num">-</td>';
+        segHtml += '<td class="num">' + fmt(adByKey[key] || 0) + '</td>';
+        totalAd += (adByKey[key] || 0);
         segHtml += '<td class="num">' + fmt(row.原価合計 || 0) + '</td>';
         totalRow.原価合計 += (row.原価合計 || 0);
         segHtml += '</tr>';
       }
       segHtml += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td>';
       cols.forEach(c => segHtml += '<td class="num">' + fmt(totalRow[c]) + '</td>');
-      segHtml += '<td class="num">' + fmt(ad) + '</td>';
+      segHtml += '<td class="num">' + fmt(totalAd) + '</td>';
       segHtml += '<td class="num">' + fmt(totalRow.原価合計) + '</td></tr></table>';
       document.getElementById(targetId).innerHTML = segHtml;
 
@@ -656,14 +682,7 @@ function renderPage() {
 
     function updateAdCost() {
       if (!lastData) return;
-      const cells = document.querySelectorAll('#segmentTable td');
-      // 合計行の広告費セル = 最後から2番目のtd
-      const allRows = document.querySelectorAll('#segmentTable tr');
-      const lastRow = allRows[allRows.length - 1];
-      if (lastRow) {
-        const tds = lastRow.querySelectorAll('td');
-        if (tds.length >= 2) tds[tds.length - 2].innerHTML = fmt(parseFloat(document.getElementById('adCost').value) || 0);
-      }
+      renderSegmentTable('segmentTable', lastData.bySegment, lastData.segmentNames, lastData.columns, null);
     }
 
     async function doConfirm() {
@@ -755,22 +774,37 @@ function renderPage() {
             'プロモーション割引額', 'プロモーション割引の税金', '手数料', 'FBA手数料',
             'トランザクション他', 'その他', '合計'];
           html += '<h3 style="font-size:13px;color:#555;margin:12px 0 4px">セグメント別集計（管理会計用）</h3>';
+          // 広告費を売上按分
+          const hSales = {}; let hTotalSales = 0;
+          for (const [k, sr] of Object.entries(seg)) { const s = sr['商品売上'] || 0; hSales[k] = s; if (k !== 'other') hTotalSales += s; }
+          const hAd = {}; let hAdSum = 0;
+          const segKeys = Object.keys(seg);
+          for (const k of segKeys) {
+            if (k === 'other' || hTotalSales === 0) { hAd[k] = 0; continue; }
+            hAd[k] = Math.round(ad * hSales[k] / hTotalSales); hAdSum += hAd[k];
+          }
+          if (ad && hTotalSales > 0) {
+            const mk = segKeys.filter(k => k !== 'other').sort((a, b) => (hSales[b]||0) - (hSales[a]||0))[0];
+            if (mk) hAd[mk] += (ad - hAdSum);
+          }
+
           html += '<table><tr><th>セグメント</th>';
           segCols.forEach(c => html += '<th>' + c + '</th>');
           html += '<th>広告費</th><th>原価合計</th></tr>';
-          let sTot = {}; segCols.forEach(c => sTot[c] = 0); sTot.原価合計 = 0;
+          let sTot = {}; segCols.forEach(c => sTot[c] = 0); sTot.原価合計 = 0; let sAdTot = 0;
           for (const [key, sr] of Object.entries(seg)) {
             const lb = segNames[key] || (key === 'other' ? 'その他/未分類' : key);
             html += '<tr><td>' + key + ': ' + lb + '</td>';
             segCols.forEach(c => { html += '<td class="num">' + fmt(sr[c] || 0) + '</td>'; sTot[c] += (sr[c] || 0); });
-            html += '<td class="num">-</td>';
+            html += '<td class="num">' + fmt(hAd[key] || 0) + '</td>';
+            sAdTot += (hAd[key] || 0);
             html += '<td class="num">' + fmt(sr.原価合計 || 0) + '</td>';
             sTot.原価合計 += (sr.原価合計 || 0);
             html += '</tr>';
           }
           html += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td>';
           segCols.forEach(c => html += '<td class="num">' + fmt(sTot[c]) + '</td>');
-          html += '<td class="num">' + fmt(ad) + '</td>';
+          html += '<td class="num">' + fmt(sAdTot) + '</td>';
           html += '<td class="num">' + fmt(sTot.原価合計) + '</td></tr></table>';
 
           // 除外セグメント
