@@ -575,10 +575,12 @@ function renderPage() {
     <!-- 工程1: 注文データCSVアップロード -->
     <div class="card">
       <h2>工程1: 楽天注文データCSVアップロード</h2>
-      <p class="meta">楽天RMS → 注文データダウンロード → 決済確定日指定・楽天売上集計用テンプレート（Shift_JIS）※最大10ファイル</p>
-      <div style="margin-top:12px;display:flex;gap:8px;align-items:center">
+      <p class="meta">楽天RMS → 注文データダウンロード → 決済確定日指定・楽天売上集計用テンプレート（Shift_JIS）</p>
+      <p class="meta" style="color:#bf0000;font-weight:bold">複数ファイル選択可（最大10ファイル） — Ctrl+クリックまたはShift+クリックで複数選択</p>
+      <div style="margin-top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <input type="file" id="csvFiles" accept=".csv" multiple>
         <button class="btn btn-p" id="uploadBtn" onclick="doUpload()">アップロード＆集計</button>
+        <span id="fileCount" class="meta"></span>
       </div>
       <div id="uploadStatus" class="meta" style="margin-top:8px"></div>
     </div>
@@ -629,17 +631,6 @@ function renderPage() {
         <div id="zeroGenkaList"></div>
       </div>
 
-      <!-- 工程6: 店舗別仕訳書 -->
-      <div class="card">
-        <h2>工程6: 店舗別仕訳書CSV取り込み</h2>
-        <p class="meta">楽天RMS → 支払明細 からダウンロードしたCSV（Shift_JIS）</p>
-        <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
-          <input type="file" id="billingFile" accept=".csv">
-          <button class="btn btn-w" id="billingBtn" onclick="doBillingUpload()">仕訳書取り込み</button>
-        </div>
-        <div id="billingResult" style="margin-top:8px"></div>
-      </div>
-
       <!-- 確定 -->
       <div class="card" id="confirmCard">
         <h2>確定</h2>
@@ -649,6 +640,17 @@ function renderPage() {
         </div>
         <div id="confirmStatus" class="meta"></div>
       </div>
+    </div>
+
+    <!-- 工程6: 店舗別仕訳書（常時表示） -->
+    <div class="card">
+      <h2>工程6: 店舗別仕訳書CSV取り込み</h2>
+      <p class="meta">楽天RMS → 支払明細 からダウンロードしたCSV（Shift_JIS）</p>
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+        <input type="file" id="billingFile" accept=".csv">
+        <button class="btn btn-w" id="billingBtn" onclick="doBillingUpload()">仕訳書取り込み</button>
+      </div>
+      <div id="billingResult" style="margin-top:8px"></div>
     </div>
 
     <!-- 過去の確定データ -->
@@ -1114,6 +1116,12 @@ function renderPage() {
         alert('ダウンロードエラー: ' + e.message);
       }
     }
+
+    // ファイル選択数表示
+    document.getElementById('csvFiles').addEventListener('change', function() {
+      const n = this.files.length;
+      document.getElementById('fileCount').textContent = n > 0 ? n + 'ファイル選択中' : '';
+    });
 
     loadHistory();
   </script>
