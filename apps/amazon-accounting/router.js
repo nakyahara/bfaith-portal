@@ -251,6 +251,12 @@ function aggregate(resolvedRows) {
   };
 }
 
+// ─── GET /manual — マニュアル ───
+
+router.get('/manual', (req, res) => {
+  res.send(renderManual());
+});
+
 // ─── GET / — メイン画面 ───
 
 router.get('/', (req, res) => {
@@ -454,6 +460,7 @@ function renderPage() {
   <div class="header">
     <h1>Amazon売上集計</h1>
     <a href="/">← ポータルに戻る</a>
+    <a href="manual" target="_blank" style="margin-left:auto;background:rgba(255,255,255,.2);padding:4px 12px;border-radius:4px">マニュアル</a>
   </div>
   <div class="wrap">
     <div class="card">

@@ -16,6 +16,7 @@ import fbaRouter from './apps/fba-replenishment/router.js';
 import warehouseRouter from './apps/warehouse/router.js';
 import mirrorRouter from './apps/warehouse-mirror/router.js';
 import amazonAccountingRouter from './apps/amazon-accounting/router.js';
+import rakutenAccountingRouter from './apps/rakuten-accounting/router.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -198,6 +199,15 @@ const apps = [
     status: 'active',
     category: 'accounting',
   },
+  {
+    id: 'rakuten-accounting',
+    name: '楽天売上集計',
+    description: '楽天RMS注文データCSVから税率別・セグメント別の売上集計を自動計算',
+    icon: '📕',
+    path: '/apps/rakuten-accounting',
+    status: 'active',
+    category: 'accounting',
+  },
 ];
 
 // 外部リンク
@@ -312,6 +322,7 @@ app.use('/apps/amazon-accounting', (req, res, next) => {
   if (req.path === '/import-history' && req.method === 'POST') return next();  // APIキー認証に委譲
   requireAuth(req, res, next);
 }, amazonAccountingRouter);
+app.use('/apps/rakuten-accounting', requireAuth, rakutenAccountingRouter);
 
 // 未実装アプリのプレースホルダー
 app.get('/apps/:appId', requireAuth, (req, res) => {
