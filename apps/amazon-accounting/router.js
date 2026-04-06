@@ -568,26 +568,30 @@ function renderPage() {
     }
 
     function renderSegmentTable(targetId, bySegment, segmentNames, cols, adCost) {
+      const ad = adCost !== null ? adCost : (parseFloat(document.getElementById('adCost')?.value) || 0);
       let segHtml = '<table><tr><th>セグメント</th>';
       cols.forEach(c => segHtml += '<th>' + c + '</th>');
-      segHtml += '<th>広告費</th><th>原価合計</th></tr>';
+      segHtml += '<th>原価合計</th></tr>';
       let totalRow = {};
       cols.forEach(c => totalRow[c] = 0);
       totalRow.原価合計 = 0;
       for (const [key, row] of Object.entries(bySegment)) {
         const label = segmentNames[key] || (key === 'other' ? 'その他/未分類' : key);
         segHtml += '<tr><td>' + key + ': ' + label + '</td>';
-        cols.forEach(c => { segHtml += '<td class="num">' + fmt(row[c]) + '</td>'; totalRow[c] += row[c]; });
-        segHtml += '<td class="num">-</td>';
-        segHtml += '<td class="num">' + fmt(row.原価合計) + '</td>';
-        totalRow.原価合計 += row.原価合計;
+        cols.forEach(c => {
+          let v = row[c] || 0;
+          if (key === 'other' && c === 'その他') v -= ad;
+          segHtml += '<td class="num">' + fmt(v) + '</td>';
+          totalRow[c] += v;
+        });
+        segHtml += '<td class="num">' + fmt(row.原価合計 || 0) + '</td>';
+        totalRow.原価合計 += (row.原価合計 || 0);
         segHtml += '</tr>';
       }
-      const ad = adCost !== null ? adCost : (parseFloat(document.getElementById('adCost')?.value) || 0);
       segHtml += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td>';
       cols.forEach(c => segHtml += '<td class="num">' + fmt(totalRow[c]) + '</td>');
-      segHtml += '<td class="num" id="segAdCost">' + fmt(ad) + '</td>';
       segHtml += '<td class="num">' + fmt(totalRow.原価合計) + '</td></tr></table>';
+      if (ad) segHtml += '<div class="meta" style="margin-top:4px">※ 広告費 ' + fmt(ad) + ' をその他/未分類の「その他」列に含んでいます</div>';
       document.getElementById(targetId).innerHTML = segHtml;
 
       // 除外セグメント（4=輸出）
@@ -655,8 +659,8 @@ function renderPage() {
     let lastData = null;
 
     function updateAdCost() {
-      const el = document.getElementById('segAdCost');
-      if (el) el.innerHTML = fmt(parseFloat(document.getElementById('adCost').value) || 0);
+      if (!lastData) return;
+      renderSegmentTable('segmentTable', lastData.bySegment, lastData.segmentNames, lastData.columns, null);
     }
 
     async function doConfirm() {
@@ -713,24 +717,32 @@ function renderPage() {
           const total = mf['合計'] || 0;
           const ad = Math.round(row.ad_cost || 0);
 
+          // ヘッダーの合計: セグメント全体の商品売上と合計を集計
+          const segAll = row.by_segment || {};
+          let hdrSales = 0, hdrTotal = 0;
+          for (const sr of Object.values(segAll)) { hdrSales += (sr['商品売上'] || 0) + (sr['商品の売上税'] || 0); hdrTotal += (sr['合計'] || 0); }
+
           html += '<div class="acc-header" onclick="toggleAcc(this)" data-idx="' + i + '">';
-          html += '<span><b>' + row.year_month + '</b> — 商品売上: \\u00a5' + Math.round(sales10 + sales8).toLocaleString()
-            + ' / 合計: \\u00a5' + Math.round(total).toLocaleString()
-            + ' / 広告費: \\u00a5' + ad.toLocaleString()
+          html += '<span><b>' + row.year_month + '</b> — 商品売上(税込): \\u00a5' + Math.round(hdrSales).toLocaleString()
+            + ' / 合計: \\u00a5' + Math.round(hdrTotal).toLocaleString()
+            + (ad ? ' / 広告費: \\u00a5' + ad.toLocaleString() : '')
             + ' <span class="meta">（' + (row.confirmed_at || '') + '）</span></span>';
           html += '<span class="arrow">&#9654;</span></div>';
           html += '<div class="acc-body" id="acc-' + i + '">';
 
-          // MF連携用 税込み集計
-          const mfCols = ['商品売上(10%)', '商品売上(8%)', '配送料', 'ギフト包装手数料',
-            'Amazonポイントの費用', 'プロモーション割引額', '手数料', 'FBA手数料',
-            'トランザクションに関するその他の手数料+その他', '合計', '端数調整'];
-          html += '<h3 style="font-size:13px;color:#555;margin-bottom:4px">MF連携用 税込み集計</h3>';
-          html += '<table><tr><th style="text-align:center" colspan="' + mfCols.length + '">税込み</th></tr><tr>';
-          mfCols.forEach(c => html += '<th>' + c + '</th>');
-          html += '</tr><tr>';
-          mfCols.forEach(c => html += '<td class="num" style="font-weight:bold">' + fmt(mf[c] || 0) + '</td>');
-          html += '</tr></table>';
+          // MF連携用 税込み集計（データがある場合のみ）
+          const hasMf = mf && Object.keys(mf).length > 0 && (mf['合計'] || 0) !== 0;
+          if (hasMf) {
+            const mfCols = ['商品売上(10%)', '商品売上(8%)', '配送料', 'ギフト包装手数料',
+              'Amazonポイントの費用', 'プロモーション割引額', '手数料', 'FBA手数料',
+              'トランザクションに関するその他の手数料+その他', '合計', '端数調整'];
+            html += '<h3 style="font-size:13px;color:#555;margin-bottom:4px">MF連携用 税込み集計</h3>';
+            html += '<table><tr><th style="text-align:center" colspan="' + mfCols.length + '">税込み</th></tr><tr>';
+            mfCols.forEach(c => html += '<th>' + c + '</th>');
+            html += '</tr><tr>';
+            mfCols.forEach(c => html += '<td class="num" style="font-weight:bold">' + fmt(mf[c] || 0) + '</td>');
+            html += '</tr></table>';
+          }
 
           // セグメント別集計
           const seg = row.by_segment || {};
@@ -742,21 +754,25 @@ function renderPage() {
           html += '<h3 style="font-size:13px;color:#555;margin:12px 0 4px">セグメント別集計（管理会計用）</h3>';
           html += '<table><tr><th>セグメント</th>';
           segCols.forEach(c => html += '<th>' + c + '</th>');
-          html += '<th>広告費</th><th>原価合計</th></tr>';
+          html += '<th>原価合計</th></tr>';
           let sTot = {}; segCols.forEach(c => sTot[c] = 0); sTot.原価合計 = 0;
           for (const [key, sr] of Object.entries(seg)) {
             const lb = segNames[key] || (key === 'other' ? 'その他/未分類' : key);
             html += '<tr><td>' + key + ': ' + lb + '</td>';
-            segCols.forEach(c => { html += '<td class="num">' + fmt(sr[c] || 0) + '</td>'; sTot[c] += (sr[c] || 0); });
-            html += '<td class="num">-</td>';
+            segCols.forEach(c => {
+              let v = sr[c] || 0;
+              if (key === 'other' && c === 'その他') v -= ad;
+              html += '<td class="num">' + fmt(v) + '</td>';
+              sTot[c] += v;
+            });
             html += '<td class="num">' + fmt(sr.原価合計 || 0) + '</td>';
             sTot.原価合計 += (sr.原価合計 || 0);
             html += '</tr>';
           }
           html += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td>';
           segCols.forEach(c => html += '<td class="num">' + fmt(sTot[c]) + '</td>');
-          html += '<td class="num">' + fmt(ad) + '</td>';
           html += '<td class="num">' + fmt(sTot.原価合計) + '</td></tr></table>';
+          if (ad) html += '<div class="meta">※ 広告費 ' + fmt(ad) + ' をその他/未分類の「その他」列に含んでいます</div>';
 
           // 除外セグメント
           const excl = row.excluded || {};
@@ -853,6 +869,38 @@ router.get('/history/:yearMonth', (req, res) => {
       excluded: JSON.parse(row.excluded || '{}'),
       mf_row: JSON.parse(row.mf_row || '{}'),
     });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── POST /import-history — ヒストリカルデータ一括投入 ───
+
+router.post('/import-history', (req, res) => {
+  const db = getMirrorDB();
+  const { months } = req.body;
+  if (!Array.isArray(months)) return res.status(400).json({ error: 'months 配列が必要です' });
+
+  try {
+    const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+    const stmt = db.prepare(`INSERT OR IGNORE INTO mart_amazon_monthly_summary
+      (year_month, total_rows, resolved_count, unresolved_count,
+       by_tax, by_segment, excluded, mf_row, ad_cost, confirmed_at, csv_filename)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
+
+    let inserted = 0;
+    const tx = db.transaction(() => {
+      for (const m of months) {
+        const r = stmt.run(
+          m.yearMonth, 0, 0, 0,
+          '{}', JSON.stringify(m.bySegment || {}), '{}', '{}',
+          m.adCost || 0, now, 'historical-import'
+        );
+        if (r.changes > 0) inserted++;
+      }
+    });
+    tx();
+    res.json({ ok: true, inserted, total: months.length });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
