@@ -251,12 +251,6 @@ function aggregate(resolvedRows) {
   };
 }
 
-// ─── GET /manual — マニュアル ───
-
-router.get('/manual', (req, res) => {
-  res.send(renderManual());
-});
-
 // ─── GET / — メイン画面 ───
 
 router.get('/', (req, res) => {
@@ -448,6 +442,18 @@ function renderPage() {
     .negative{color:#e74c3c}
     .detail-table td{font-size:12px;font-weight:normal}
     .detail-table th{font-size:11px}
+    .modal-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.5);z-index:1000;justify-content:center;align-items:flex-start;padding:30px}
+    .modal-content{background:white;border-radius:8px;max-width:900px;width:100%;max-height:calc(100vh - 60px);overflow-y:auto;padding:24px;position:relative;line-height:1.8}
+    .modal-close{position:sticky;top:0;float:right;background:#e74c3c;color:white;border:none;border-radius:50%;width:32px;height:32px;font-size:18px;cursor:pointer;z-index:1}
+    .modal-content h2{font-size:16px;color:#1a5276;margin:20px 0 6px;border-bottom:2px solid #aed6f1;padding-bottom:4px}
+    .modal-content h3{font-size:13px;color:#555;margin:12px 0 4px}
+    .modal-content .m-tbl{border-collapse:collapse;font-size:12px;margin:6px 0;width:auto}
+    .modal-content .m-tbl th,.modal-content .m-tbl td{border:1px solid #ddd;padding:4px 8px}
+    .modal-content .m-tbl th{background:#f0f0f0}
+    .modal-content .flow{background:#eaf2f8;padding:10px;border-radius:6px;font-family:monospace;font-size:12px;margin:6px 0;white-space:pre-line}
+    .modal-content .note{background:#fef9e7;border-left:4px solid #f39c12;padding:6px 10px;margin:6px 0;font-size:12px}
+    .modal-content ul{margin:4px 0 4px 18px;font-size:13px}
+    .modal-content code{background:#f4f4f4;padding:1px 4px;border-radius:3px;font-size:11px}
     .acc-header{cursor:pointer;padding:10px 12px;background:#f8f9fa;border:1px solid #dee2e6;border-radius:4px;margin-bottom:2px;display:flex;justify-content:space-between;align-items:center;font-size:13px}
     .acc-header:hover{background:#e9ecef}
     .acc-header .arrow{transition:transform .2s;font-size:10px}
@@ -460,7 +466,7 @@ function renderPage() {
   <div class="header">
     <h1>Amazon売上集計</h1>
     <a href="/">← ポータルに戻る</a>
-    <a href="manual" target="_blank" style="margin-left:auto;background:rgba(255,255,255,.2);padding:4px 12px;border-radius:4px">マニュアル</a>
+    <a href="#" onclick="document.getElementById('manualModal').style.display='flex';return false" style="margin-left:auto;background:rgba(255,255,255,.2);padding:4px 12px;border-radius:4px">マニュアル</a>
   </div>
   <div class="wrap">
     <div class="card">
@@ -949,6 +955,134 @@ function renderPage() {
 
     loadHistory();
   </script>
+
+  <div class="modal-overlay" id="manualModal" onclick="if(event.target===this)this.style.display='none'">
+    <div class="modal-content">
+      <button class="modal-close" onclick="document.getElementById('manualModal').style.display='none'">&times;</button>
+
+      <h2>1. 概要</h2>
+      <p>Amazonセラーセントラルのペイメントレポート（CSV）をアップロードすると、以下を自動計算するツールです。</p>
+      <ul>
+        <li><b>税率別集計</b> — 10%/8%に分類して集計（MF連携用）</li>
+        <li><b>MF連携用 税込み集計</b> — マネーフォワードに入力する金額</li>
+        <li><b>セグメント別集計</b> — 管理会計用（自社商品/取扱限定/仕入れ商品/その他）</li>
+      </ul>
+      <p>従来GAS（Google Apps Script）で7工程かけていた月次売上集計を、CSV1回のアップロードで完了します。</p>
+
+      <h2>2. 全体の処理フロー</h2>
+      <div class="flow">セラセンからCSVダウンロード
+  ↓
+ツールにアップロード
+  ↓
+① CSV解析（先頭7行スキップ、8行目以降がデータ）
+  ↓
+② SKU解決（3段階照合 → 商品コード・原価・税率・売上分類を特定）
+  ↓
+③ 集計（税率別・MF税込・セグメント別）
+  ↓
+④ プレビュー確認 → エビデンスCSVダウンロード
+  ↓
+⑤ 広告費入力 → 確定保存</div>
+
+      <h2>3. CSVの取得方法</h2>
+      <p>セラーセントラル → <b>ペイメント</b> → <b>レポートリポジトリ</b> → 対象月のペイメントレポートをダウンロード。</p>
+      <div class="note">CSVは先頭7行が説明文、8行目がヘッダー、9行目以降がデータです。ツールが自動的にスキップします。</div>
+
+      <h2>4. SKU解決（3段階）</h2>
+      <p>CSVの各行のSKUから商品マスタを照合し、原価・税率・売上分類を特定します。</p>
+      <table class="m-tbl">
+        <tr><th>段階</th><th>処理</th><th>参照先</th></tr>
+        <tr><td>Stage 1</td><td>SKUが商品コードと直接一致するか</td><td>mirror_products</td></tr>
+        <tr><td>Stage 2</td><td>SKUマップで変換してから商品コードを検索</td><td>mirror_sku_map → mirror_products</td></tr>
+        <tr><td>Stage 3</td><td>どちらにも一致しない → <b>未登録SKU</b></td><td>—</td></tr>
+      </table>
+      <div class="note">SKUと商品コードは全て<b>小文字に統一</b>して照合しています。</div>
+
+      <h3>解決結果の列（エビデンスCSVに出力）</h3>
+      <table class="m-tbl">
+        <tr><th>列</th><th>内容</th></tr>
+        <tr><td>商品コード</td><td>照合で特定されたNE商品コード（未解決の場合は空）</td></tr>
+        <tr><td>税率</td><td>10 or 8（商品マスタの消費税率から判定）</td></tr>
+        <tr><td>売上分類</td><td>1:自社 / 2:取扱限定 / 3:仕入れ / 4:輸出 / 空:未分類</td></tr>
+        <tr><td>原価</td><td>商品マスタの原価（未解決 or 原価未登録の場合は0）</td></tr>
+        <tr><td>解決方法</td><td>direct / sku_map / unresolved / no_sku / skip</td></tr>
+      </table>
+
+      <h2>5. 税率別集計</h2>
+      <table class="m-tbl">
+        <tr><th>分類</th><th>条件</th></tr>
+        <tr><td><b>10%</b></td><td>消費税率=0.10 の商品、または税率未登録の商品（10%仮扱い）</td></tr>
+        <tr><td><b>8%</b></td><td>消費税率=0.08 の商品</td></tr>
+      </table>
+      <div class="note">トランザクション種類が「振込み」の行は集計から除外されます。</div>
+
+      <h2>6. MF連携用 税込み集計</h2>
+      <p>マネーフォワードへの入力用に、税込み金額に変換して集計します。</p>
+      <table class="m-tbl">
+        <tr><th>項目</th><th>計算方法</th></tr>
+        <tr><td>商品売上(10%)</td><td>10%の商品売上 + 商品の売上税</td></tr>
+        <tr><td>商品売上(8%)</td><td>8%の商品売上 + 商品の売上税</td></tr>
+        <tr><td>配送料</td><td>全税率の配送料 + 配送料の税金</td></tr>
+        <tr><td>ギフト包装手数料</td><td>全税率のギフト包装手数料 + 税金</td></tr>
+        <tr><td>Amazonポイント</td><td>全税率合計</td></tr>
+        <tr><td>プロモーション割引額</td><td>全税率の割引額 + 税金</td></tr>
+        <tr><td>手数料 / FBA手数料</td><td>全税率合計</td></tr>
+        <tr><td>トランザクション他+その他</td><td>全税率合計</td></tr>
+        <tr><td>端数調整</td><td>合計 − 各項目の合計（丸め誤差の吸収）</td></tr>
+      </table>
+
+      <h2>7. セグメント別集計（管理会計用）</h2>
+      <table class="m-tbl">
+        <tr><th>セグメント</th><th>売上分類</th><th>内容</th><th>広告費</th></tr>
+        <tr><td><b>1: 自社商品</b></td><td>1</td><td>自社ブランド・独占商品</td><td>売上按分あり</td></tr>
+        <tr><td><b>2: 取扱限定</b></td><td>2</td><td>取扱限定品</td><td>売上按分あり</td></tr>
+        <tr><td><b>3: 仕入れ商品</b></td><td>3</td><td>一般仕入れ商品</td><td>なし</td></tr>
+        <tr><td><b>other: その他</b></td><td>空/未登録</td><td>SKUなし行（FBA保管手数料等）+ 分類未登録商品</td><td>なし</td></tr>
+      </table>
+      <div class="note"><b>セグメント4（輸出）</b>は集計テーブルから除外、別枠で表示されます。</div>
+
+      <h3>広告費の按分</h3>
+      <p>Amazon広告はクレカ払い（ペイメントCSVに含まれない）のため手入力で追加。セグメント1と2の<b>商品売上比率</b>で按分します。</p>
+      <p>例: 広告費100万、セグメント1売上4,000万、セグメント2売上1,000万 → 1に80万、2に20万</p>
+
+      <h3>原価合計</h3>
+      <p>各行の <code>原価 × 数量</code> をセグメントごとに合算（税抜）。</p>
+
+      <h2>8. エビデンスCSV</h2>
+      <p>アップロード後に2種類ダウンロード可能:</p>
+      <table class="m-tbl">
+        <tr><th>種類</th><th>内容</th></tr>
+        <tr><td><b>明細エビデンス</b></td><td>元CSVの全行 + 商品コード・税率・売上分類・原価・解決方法</td></tr>
+        <tr><td><b>集計サマリー</b></td><td>税率別 + MF税込 + セグメント別の集計表</td></tr>
+      </table>
+      <div class="note">エビデンスはアップロード時にメモリに一時保存。ページを離れると再アップロードが必要です。</div>
+
+      <h2>9. 確定保存・過去データ</h2>
+      <ul>
+        <li>広告費を入力して「確定」→ DBに保存</li>
+        <li>同じ年月で再確定すると上書き</li>
+        <li>確定済みデータはアコーディオンで展開表示</li>
+        <li>「セグメント別集計CSVダウンロード」で全月分を一括CSV出力（集計月は各月末日 yyyy/mm/dd）</li>
+      </ul>
+
+      <h2>10. データソース・更新</h2>
+      <table class="m-tbl">
+        <tr><th>データ</th><th>ソース</th><th>更新</th></tr>
+        <tr><td>商品マスタ / SKUマップ</td><td>ミニPC → Render</td><td>毎朝7時自動同期</td></tr>
+        <tr><td>ペイメントCSV</td><td>セラセン手動DL</td><td>月次</td></tr>
+        <tr><td>広告費</td><td>手入力（クレカ払い）</td><td>月次</td></tr>
+      </table>
+
+      <h2>11. 注意事項</h2>
+      <ul>
+        <li>CSV金額のカンマ区切り（例: <code>3,200</code>）は自動除去されます</li>
+        <li>税率未登録の商品は<b>10%仮扱い</b>（概要に件数表示）</li>
+        <li>原価0の商品は「原価ゼロ警告」タブに一覧表示</li>
+        <li>未登録SKUがあると確定不可（先にミニPC管理画面で登録）</li>
+        <li>2022/7〜2026/2のヒストリカルデータは旧スプレッドシートから移行済み</li>
+      </ul>
+    </div>
+  </div>
 </body>
 
 </html>`;
@@ -1078,189 +1212,5 @@ router.post('/import-history', (req, res) => {
   }
 });
 
-// ─── マニュアルページ ───
-
-function renderManual() {
-  return `<!DOCTYPE html>
-<html lang="ja">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>マニュアル - Amazon売上集計</title>
-  <style>
-    *{margin:0;padding:0;box-sizing:border-box}
-    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f5f5;color:#333;font-size:14px;line-height:1.8}
-    .header{background:#1a5276;color:white;padding:12px 24px;display:flex;align-items:center;gap:16px}
-    .header h1{font-size:18px}
-    .header a{color:#aed6f1;text-decoration:none;font-size:13px}
-    .wrap{max-width:900px;margin:16px auto;padding:0 16px 60px}
-    .card{background:white;border-radius:8px;padding:24px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.1)}
-    h2{font-size:17px;color:#1a5276;margin:24px 0 8px;border-bottom:2px solid #aed6f1;padding-bottom:4px}
-    h3{font-size:14px;color:#555;margin:16px 0 6px}
-    table{border-collapse:collapse;font-size:13px;margin:8px 0}
-    th,td{border:1px solid #ddd;padding:5px 10px;text-align:left}
-    th{background:#f0f0f0}
-    code{background:#f4f4f4;padding:1px 5px;border-radius:3px;font-size:12px}
-    .flow{background:#eaf2f8;padding:12px;border-radius:6px;font-family:monospace;font-size:13px;margin:8px 0;white-space:pre-line}
-    ul{margin:4px 0 4px 20px}
-    .note{background:#fef9e7;border-left:4px solid #f39c12;padding:8px 12px;margin:8px 0;font-size:13px}
-  </style>
-</head>
-<body>
-  <div class="header">
-    <h1>Amazon売上集計 マニュアル</h1>
-    <a href="./">← ツールに戻る</a>
-  </div>
-  <div class="wrap">
-
-    <div class="card">
-      <h2>1. 概要</h2>
-      <p>Amazonセラーセントラルのペイメントレポート（CSV）をアップロードすると、以下を自動計算するツールです。</p>
-      <ul>
-        <li><b>税率別集計</b> — 10%/8%に分類して集計（MF連携用）</li>
-        <li><b>MF連携用 税込み集計</b> — マネーフォワードに入力する金額</li>
-        <li><b>セグメント別集計</b> — 管理会計用（自社商品/取扱限定/仕入れ商品/その他）</li>
-      </ul>
-      <p>従来GAS（Google Apps Script）で7工程かけていた月次売上集計を、CSV1回のアップロードで完了します。</p>
-
-      <h2>2. 全体の処理フロー</h2>
-      <div class="flow">セラセンからCSVダウンロード
-　↓
-ツールにアップロード
-　↓
-① CSV解析（先頭7行スキップ、8行目以降がデータ）
-　↓
-② SKU解決（3段階照合 → 商品コード・原価・税率・売上分類を特定）
-　↓
-③ 集計（税率別・MF税込・セグメント別）
-　↓
-④ プレビュー確認 → エビデンスCSVダウンロード
-　↓
-⑤ 広告費入力 → 確定保存</div>
-
-      <h2>3. CSVの取得方法</h2>
-      <p>セラーセントラル → <b>ペイメント</b> → <b>レポートリポジトリ</b> → 対象月のペイメントレポートをダウンロード。</p>
-      <div class="note">CSVは先頭7行が説明文、8行目がヘッダー、9行目以降がデータです。ツールが自動的にスキップします。</div>
-
-      <h2>4. SKU解決（3段階）</h2>
-      <p>CSVの各行のSKUから商品マスタを照合し、原価・税率・売上分類を特定します。</p>
-      <table>
-        <tr><th>段階</th><th>処理</th><th>参照先</th></tr>
-        <tr><td>Stage 1</td><td>SKUが商品コードと直接一致するか</td><td>mirror_products</td></tr>
-        <tr><td>Stage 2</td><td>SKUマップで変換してから商品コードを検索</td><td>mirror_sku_map → mirror_products</td></tr>
-        <tr><td>Stage 3</td><td>どちらにも一致しない → <b>未登録SKU</b></td><td>—</td></tr>
-      </table>
-      <div class="note">SKUと商品コードは全て<b>小文字に統一</b>して照合しています（大文字小文字の違いで不一致になるのを防止）。</div>
-
-      <h3>解決結果の列（エビデンスCSVに出力）</h3>
-      <table>
-        <tr><th>列</th><th>内容</th></tr>
-        <tr><td>商品コード</td><td>照合で特定されたNE商品コード（未解決の場合は空）</td></tr>
-        <tr><td>税率</td><td>10 or 8（商品マスタの消費税率から判定）</td></tr>
-        <tr><td>売上分類</td><td>1:自社 / 2:取扱限定 / 3:仕入れ / 4:輸出 / 空:未分類</td></tr>
-        <tr><td>原価</td><td>商品マスタの原価（未解決 or 原価未登録の場合は0）</td></tr>
-        <tr><td>解決方法</td><td>direct / sku_map / unresolved / no_sku / skip</td></tr>
-      </table>
-
-      <h2>5. 税率別集計</h2>
-      <table>
-        <tr><th>分類</th><th>条件</th></tr>
-        <tr><td><b>10%</b></td><td>商品マスタの消費税率=0.10 の商品 <b>または</b> 税率未登録の商品（10%仮扱い）</td></tr>
-        <tr><td><b>8%</b></td><td>商品マスタの消費税率=0.08 の商品</td></tr>
-      </table>
-      <div class="note">トランザクション種類が「振込み」の行は税率別・セグメント別の両方から除外されます。</div>
-
-      <h2>6. MF連携用 税込み集計</h2>
-      <p>マネーフォワードへの入力用に、税込み金額に変換して集計します。</p>
-      <table>
-        <tr><th>項目</th><th>計算方法</th></tr>
-        <tr><td>商品売上(10%)</td><td>10%の商品売上 + 10%の商品の売上税</td></tr>
-        <tr><td>商品売上(8%)</td><td>8%の商品売上 + 8%の商品の売上税</td></tr>
-        <tr><td>配送料</td><td>全税率の配送料 + 配送料の税金</td></tr>
-        <tr><td>ギフト包装手数料</td><td>全税率のギフト包装手数料 + ギフト包装の税金</td></tr>
-        <tr><td>Amazonポイントの費用</td><td>全税率合計</td></tr>
-        <tr><td>プロモーション割引額</td><td>全税率の割引額 + 割引の税金</td></tr>
-        <tr><td>手数料</td><td>全税率合計</td></tr>
-        <tr><td>FBA手数料</td><td>全税率合計</td></tr>
-        <tr><td>トランザクション他+その他</td><td>全税率のトランザクション他 + その他</td></tr>
-        <tr><td>合計</td><td>全体合計</td></tr>
-        <tr><td>端数調整</td><td>合計 − 上記各項目の合計（丸め誤差の吸収）</td></tr>
-      </table>
-
-      <h2>7. セグメント別集計（管理会計用）</h2>
-      <p>売上分類に基づいて、管理会計用のセグメントに分けて集計します。</p>
-      <table>
-        <tr><th>セグメント</th><th>売上分類</th><th>内容</th><th>広告費</th></tr>
-        <tr><td><b>1: 自社商品</b></td><td>1</td><td>自社ブランド・独占商品</td><td>売上按分あり</td></tr>
-        <tr><td><b>2: 取扱限定</b></td><td>2</td><td>取扱限定品</td><td>売上按分あり</td></tr>
-        <tr><td><b>3: 仕入れ商品</b></td><td>3</td><td>一般仕入れ商品</td><td>なし</td></tr>
-        <tr><td><b>other: その他/未分類</b></td><td>空 or 未登録</td><td>SKUなし行（FBA保管手数料、月額登録料等）+ 分類未登録商品</td><td>なし</td></tr>
-      </table>
-      <div class="note"><b>セグメント4（輸出）</b>はセグメント別集計テーブルからは除外され、別枠で表示されます。</div>
-
-      <h3>広告費の按分</h3>
-      <p>Amazon広告はクレジットカード払い（ペイメントレポートに含まれない）のため、手入力で追加します。</p>
-      <ul>
-        <li>広告はセグメント1（自社商品）とセグメント2（取扱限定）にのみ出稿</li>
-        <li>セグメント1と2の<b>商品売上の比率</b>で広告費を按分</li>
-        <li>セグメント3・otherの広告費は常に0</li>
-      </ul>
-      <p>例: 広告費100万円、セグメント1の商品売上が4,000万、セグメント2が1,000万の場合</p>
-      <ul>
-        <li>セグメント1: 100万 × 4,000万 / 5,000万 = <b>80万円</b></li>
-        <li>セグメント2: 100万 × 1,000万 / 5,000万 = <b>20万円</b></li>
-      </ul>
-
-      <h3>原価合計の計算</h3>
-      <p>各行の <code>原価 × 数量</code> をセグメントごとに合算。原価は商品マスタから取得（税抜）。</p>
-
-      <h2>8. エビデンスCSV</h2>
-      <p>CSVアップロード後に2種類のエビデンスをダウンロードできます。</p>
-      <table>
-        <tr><th>種類</th><th>内容</th><th>用途</th></tr>
-        <tr><td><b>明細エビデンスCSV</b></td><td>元CSVの全行 + 商品コード・税率・売上分類・原価・解決方法</td><td>各行がどの税率・分類で集計されたかの根拠</td></tr>
-        <tr><td><b>集計サマリーCSV</b></td><td>税率別集計 + MF税込集計 + セグメント別集計</td><td>MF入力用・管理会計用の集計数値</td></tr>
-      </table>
-      <div class="note">エビデンスCSVはアップロード時にサーバーメモリに一時保存されます。ページを離れると再アップロードが必要です。</div>
-
-      <h2>9. 確定保存</h2>
-      <p>集計結果を確認し、広告費を入力したら「この月の集計を確定」で保存。</p>
-      <ul>
-        <li>確定データはRender上のDBに保存（<code>mart_amazon_monthly_summary</code>テーブル）</li>
-        <li>同じ年月で再確定すると上書き</li>
-        <li>確定済みデータは「過去の確定データ」セクションでアコーディオン表示</li>
-      </ul>
-
-      <h2>10. ヒストリカルCSVダウンロード</h2>
-      <p>「過去の確定データ」セクションの「セグメント別集計CSVダウンロード」ボタンで全月分を一括ダウンロード。</p>
-      <ul>
-        <li>集計月は <code>yyyy/mm/dd</code>（各月の最終日）形式</li>
-        <li>各月×セグメント（1, 2, 3, other）の4行で構成</li>
-        <li>広告費はセグメント1・2に売上按分済み</li>
-      </ul>
-
-      <h2>11. データソース</h2>
-      <table>
-        <tr><th>データ</th><th>ソース</th><th>更新タイミング</th></tr>
-        <tr><td>商品マスタ（mirror_products）</td><td>ミニPC warehouse.db → Render</td><td>毎朝7時に自動同期</td></tr>
-        <tr><td>SKUマップ（mirror_sku_map）</td><td>同上</td><td>同上</td></tr>
-        <tr><td>ペイメントCSV</td><td>セラーセントラルから手動DL</td><td>月次</td></tr>
-        <tr><td>広告費</td><td>手入力（クレカ払いのため）</td><td>月次</td></tr>
-      </table>
-
-      <h2>12. 注意事項</h2>
-      <ul>
-        <li>CSVの金額にカンマ区切り（例: <code>3,200</code>）が含まれる場合があります。ツールが自動除去します。</li>
-        <li>税率未登録の商品は<b>10%仮扱い</b>で集計されます。概要に「税率未登録: N件」と表示されます。</li>
-        <li>原価が0またはNULLの商品は「原価ゼロで計算された商品」タブに一覧表示されます。</li>
-        <li>未登録SKUがある場合は確定できません。先にミニPCの管理画面（/register）でSKUマップを登録してください。</li>
-        <li>2022年7月〜2026年2月のヒストリカルデータは、旧スプレッドシートから移行済みです。</li>
-      </ul>
-    </div>
-  </div>
-</body>
-</html>`;
-}
 
 export default router;
-
