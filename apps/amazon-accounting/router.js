@@ -455,6 +455,20 @@ function renderPage() {
         <p class="meta">商品マスタの原価が0またはNULLのため、原価0円で集計されています。正確な粗利計算には原価登録が必要です。</p>
         <div id="zeroGenkaList"></div>
       </div>
+
+      <div class="card" id="confirmCard">
+        <h2>確定</h2>
+        <div style="display:flex;gap:12px;align-items:center;margin-bottom:8px">
+          <label>広告費（税込）: <input type="number" id="adCost" value="0" style="width:120px;padding:4px"></label>
+          <button class="btn btn-s" id="confirmBtn" onclick="doConfirm()">この月の集計を確定</button>
+        </div>
+        <div id="confirmStatus" class="meta"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>過去の確定データ</h2>
+      <div id="historyList"><span class="meta">読み込み中...</span></div>
     </div>
   </div>
 
@@ -489,6 +503,7 @@ function renderPage() {
     }
 
     function showResult(data) {
+      lastData = data;
       document.getElementById('result').style.display = 'block';
       document.getElementById('uploadStatus').textContent = '';
 
@@ -624,9 +639,152 @@ function renderPage() {
         document.getElementById('zeroGenkaCard').style.display = 'none';
       }
     }
+    let lastData = null;
+
+    async function doConfirm() {
+      if (!lastData) { alert('先にCSVをアップロードしてください'); return; }
+      if (!confirm(lastData.yearMonth + ' の集計を確定しますか？')) return;
+      const btn = document.getElementById('confirmBtn');
+      btn.disabled = true;
+      btn.textContent = '保存中...';
+      try {
+        const adCost = parseFloat(document.getElementById('adCost').value) || 0;
+        const r = await fetch(location.pathname + '/confirm', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            yearMonth: lastData.yearMonth,
+            totalRows: lastData.totalRows,
+            resolvedCount: lastData.resolvedCount,
+            unresolvedCount: lastData.unresolvedSkus?.length || 0,
+            byTax: lastData.byTax,
+            bySegment: lastData.bySegment,
+            excluded: lastData.excluded,
+            mfRow: lastData.mfRow,
+            adCost,
+          }),
+        });
+        const result = await r.json();
+        if (result.ok) {
+          document.getElementById('confirmStatus').innerHTML = '<span style="color:#27ae60">OK ' + lastData.yearMonth + ' 確定済（' + result.confirmed_at + '）</span>';
+          loadHistory();
+        } else {
+          document.getElementById('confirmStatus').innerHTML = '<span class="negative">エラー: ' + (result.error || '') + '</span>';
+        }
+      } catch(e) {
+        document.getElementById('confirmStatus').innerHTML = '<span class="negative">エラー: ' + e.message + '</span>';
+      }
+      btn.disabled = false;
+      btn.textContent = 'この月の集計を確定';
+    }
+
+    async function loadHistory() {
+      try {
+        const r = await fetch(location.pathname + '/history');
+        const rows = await r.json();
+        if (!rows.length) {
+          document.getElementById('historyList').innerHTML = '<span class="meta">確定データはまだありません</span>';
+          return;
+        }
+        let html = '<table><tr><th>年月</th><th>総行数</th><th>SKU解決</th><th>商品売上(税込)</th><th>合計</th><th>広告費</th><th>確定日時</th></tr>';
+        for (const row of rows) {
+          const mf = row.mf_row || {};
+          const sales10 = mf['商品売上(10%)'] || 0;
+          const sales8 = mf['商品売上(8%)'] || 0;
+          const total = mf['合計'] || 0;
+          html += '<tr>';
+          html += '<td>' + row.year_month + '</td>';
+          html += '<td class="num">' + (row.total_rows || 0).toLocaleString() + '</td>';
+          html += '<td class="num">' + (row.resolved_count || 0).toLocaleString() + '</td>';
+          html += '<td class="num">' + Math.round(sales10 + sales8).toLocaleString() + '</td>';
+          html += '<td class="num">' + Math.round(total).toLocaleString() + '</td>';
+          html += '<td class="num">' + Math.round(row.ad_cost || 0).toLocaleString() + '</td>';
+          html += '<td>' + (row.confirmed_at || '') + '</td>';
+          html += '</tr>';
+        }
+        html += '</table>';
+        document.getElementById('historyList').innerHTML = html;
+      } catch(e) {
+        document.getElementById('historyList').innerHTML = '<span class="meta">読み込みエラー</span>';
+      }
+    }
+
+    loadHistory();
   </script>
 </body>
+
 </html>`;
 }
 
+// ─── POST /confirm — 集計確定（DB保存） ───
+
+router.post('/confirm', (req, res) => {
+  const db = getMirrorDB();
+  const { yearMonth, totalRows, resolvedCount, unresolvedCount,
+    byTax, bySegment, excluded, mfRow, adCost, csvFilename } = req.body;
+
+  if (!yearMonth) return res.status(400).json({ error: 'yearMonth は必須です' });
+
+  try {
+    const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+    db.prepare(`INSERT OR REPLACE INTO mart_amazon_monthly_summary
+      (year_month, total_rows, resolved_count, unresolved_count,
+       by_tax, by_segment, excluded, mf_row, ad_cost, confirmed_at, csv_filename)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)
+    `).run(
+      yearMonth, totalRows || 0, resolvedCount || 0, unresolvedCount || 0,
+      JSON.stringify(byTax), JSON.stringify(bySegment), JSON.stringify(excluded),
+      JSON.stringify(mfRow), adCost || 0, now, csvFilename || ''
+    );
+
+    db.prepare(`INSERT INTO mart_amazon_upload_log
+      (year_month, filename, total_rows, resolved_count, unresolved_count, uploaded_at)
+      VALUES (?,?,?,?,?,?)
+    `).run(yearMonth, csvFilename || '', totalRows || 0, resolvedCount || 0, unresolvedCount || 0, now);
+
+    res.json({ ok: true, yearMonth, confirmed_at: now });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── GET /history — 過去月一覧 ───
+
+router.get('/history', (req, res) => {
+  const db = getMirrorDB();
+  try {
+    const rows = db.prepare('SELECT * FROM mart_amazon_monthly_summary ORDER BY year_month DESC').all();
+    const parsed = rows.map(r => ({
+      ...r,
+      by_tax: JSON.parse(r.by_tax || '{}'),
+      by_segment: JSON.parse(r.by_segment || '{}'),
+      excluded: JSON.parse(r.excluded || '{}'),
+      mf_row: JSON.parse(r.mf_row || '{}'),
+    }));
+    res.json(parsed);
+  } catch (e) {
+    res.json([]);
+  }
+});
+
+// ─── GET /history/:yearMonth — 特定月の詳細 ───
+
+router.get('/history/:yearMonth', (req, res) => {
+  const db = getMirrorDB();
+  try {
+    const row = db.prepare('SELECT * FROM mart_amazon_monthly_summary WHERE year_month = ?').get(req.params.yearMonth);
+    if (!row) return res.status(404).json({ error: '該当月のデータがありません' });
+    res.json({
+      ...row,
+      by_tax: JSON.parse(row.by_tax || '{}'),
+      by_segment: JSON.parse(row.by_segment || '{}'),
+      excluded: JSON.parse(row.excluded || '{}'),
+      mf_row: JSON.parse(row.mf_row || '{}'),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 export default router;
+
