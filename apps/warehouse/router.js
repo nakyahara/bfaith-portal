@@ -535,7 +535,7 @@ router.post('/api/shipping', (req, res) => {
   auditLog(db, 'product_shipping', sku, old ? 'UPDATE' : 'INSERT', old || null, newData);
   // m_productsにリアルタイム反映（該当行 + 代表コードが同じバリエーション）
   try {
-    db.prepare('UPDATE m_products SET 送料 = ?, 送料コード = ?, 配送方法 = ?, updated_at = ? WHERE 商品コード = ?').run(parseFloat(ship_cost), shipping_code || '', ship_method || '', now, sku);
+    db.prepare('UPDATE m_products SET 送料 = ?, 送料コード = ?, 配送方法 = ?, updated_at = ? WHERE 商品コード = ? COLLATE NOCASE').run(parseFloat(ship_cost), shipping_code || '', ship_method || '', now, sku);
     // 代表商品コード経由でバリエーションにも反映
     db.prepare(`UPDATE m_products SET 送料 = ?, 送料コード = ?, 配送方法 = ?, updated_at = ?
       WHERE 商品コード IN (SELECT 商品コード FROM raw_ne_products WHERE 代表商品コード = ? COLLATE NOCASE)
@@ -559,7 +559,7 @@ router.post('/api/genka', (req, res) => {
   auditLog(db, 'exception_genka', sku, old ? 'UPDATE' : 'INSERT', old || null, newData);
   // m_productsにリアルタイム反映
   try {
-    db.prepare("UPDATE m_products SET 原価 = ?, 原価ソース = '例外', 原価状態 = 'OVERRIDDEN', updated_at = ? WHERE 商品コード = ?").run(parseFloat(genka), now, sku);
+    db.prepare("UPDATE m_products SET 原価 = ?, 原価ソース = '例外', 原価状態 = 'OVERRIDDEN', updated_at = ? WHERE 商品コード = ? COLLATE NOCASE").run(parseFloat(genka), now, sku);
   } catch {}
   res.json({ ok: true, sku, genka });
 });
@@ -616,7 +616,7 @@ router.post('/api/csv/shipping', upload.single('file'), (req, res) => {
   if (dataRows.length > 0 && /商品コード|sku|SKU/i.test(dataRows[0][0])) dataRows = dataRows.slice(1);
 
   const stmt = db.prepare('INSERT OR REPLACE INTO product_shipping (sku, product_name, shipping_code, ship_method, ship_cost, note, synced_at) VALUES (?, COALESCE((SELECT product_name FROM product_shipping WHERE sku = ?), (SELECT 商品名 FROM raw_ne_products WHERE 商品コード = ? COLLATE NOCASE), ?), ?, ?, ?, ?, ?)');
-  const updateMp = db.prepare('UPDATE m_products SET 送料 = ?, 送料コード = ?, 配送方法 = ?, updated_at = ? WHERE 商品コード = ?');
+  const updateMp = db.prepare('UPDATE m_products SET 送料 = ?, 送料コード = ?, 配送方法 = ?, updated_at = ? WHERE 商品コード = ? COLLATE NOCASE');
   const updateVariants = db.prepare(`UPDATE m_products SET 送料 = ?, 送料コード = ?, 配送方法 = ?, updated_at = ?
     WHERE 商品コード IN (SELECT 商品コード FROM raw_ne_products WHERE 代表商品コード = ? COLLATE NOCASE) AND 送料 IS NULL`);
 
@@ -669,7 +669,7 @@ router.post('/api/csv/genka', upload.single('file'), (req, res) => {
   if (dataRows.length > 0 && /商品コード|sku|SKU/i.test(dataRows[0][0])) dataRows = dataRows.slice(1);
 
   const stmt = db.prepare('INSERT OR REPLACE INTO exception_genka (sku, genka, 商品名, synced_at) VALUES (?, ?, ?, ?)');
-  const updateMp = db.prepare("UPDATE m_products SET 原価 = ?, 原価ソース = '例外', 原価状態 = 'OVERRIDDEN', updated_at = ? WHERE 商品コード = ?");
+  const updateMp = db.prepare("UPDATE m_products SET 原価 = ?, 原価ソース = '例外', 原価状態 = 'OVERRIDDEN', updated_at = ? WHERE 商品コード = ? COLLATE NOCASE");
 
   let count = 0, skipped = 0;
   const tx = db.transaction(() => {
@@ -951,7 +951,7 @@ router.post('/api/sales_class', (req, res) => {
   db.prepare('INSERT OR REPLACE INTO product_sales_class (sku, sales_class, 商品名, synced_at) VALUES (?, ?, ?, ?)').run(sku, sc, product_name || '', now);
   auditLog(db, 'product_sales_class', sku, old ? 'UPDATE' : 'INSERT', old || null, { sku, sales_class: sc });
   // m_productsにリアルタイム反映
-  try { db.prepare('UPDATE m_products SET 売上分類 = ?, updated_at = ? WHERE 商品コード = ?').run(sc, now, sku); } catch {}
+  try { db.prepare('UPDATE m_products SET 売上分類 = ?, updated_at = ? WHERE 商品コード = ? COLLATE NOCASE').run(sc, now, sku); } catch {}
   res.json({ ok: true, sku, sales_class: sc });
 });
 
@@ -979,7 +979,7 @@ router.post('/api/csv/sales_class', upload.single('file'), (req, res) => {
   }
 
   const stmt = db.prepare('INSERT OR REPLACE INTO product_sales_class (sku, sales_class, 商品名, synced_at) VALUES (?, ?, ?, ?)');
-  const updateMp = db.prepare('UPDATE m_products SET 売上分類 = ?, updated_at = ? WHERE 商品コード = ?');
+  const updateMp = db.prepare('UPDATE m_products SET 売上分類 = ?, updated_at = ? WHERE 商品コード = ? COLLATE NOCASE');
 
   let count = 0, skipped = 0, invalid = 0;
   const tx = db.transaction(() => {
@@ -988,7 +988,7 @@ router.post('/api/csv/sales_class', upload.single('file'), (req, res) => {
       if (!sku) { skipped++; continue; }
       const sc = parseInt(row[colClass]);
       if (![1, 2, 3, 4].includes(sc)) { invalid++; skipped++; continue; }
-      const name = db.prepare('SELECT 商品名 FROM m_products WHERE 商品コード = ?').get(sku)?.商品名 || '';
+      const name = db.prepare('SELECT 商品名 FROM m_products WHERE 商品コード = ? COLLATE NOCASE').get(sku)?.商品名 || '';
       stmt.run(sku, sc, name, now);
       try { updateMp.run(sc, now, sku); } catch {}
       count++;
