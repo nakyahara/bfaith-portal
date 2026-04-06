@@ -121,6 +121,7 @@ const categories = [
   { id: 'purchasing', name: '仕入れ', icon: '💰' },
   { id: 'fba', name: 'FBA管理', icon: '📦' },
   { id: 'data', name: 'データ基盤', icon: '🗄️' },
+  { id: 'accounting', name: '売上・会計', icon: '📒' },
 ];
 
 // --- アプリ一覧 ---
@@ -187,6 +188,15 @@ const apps = [
     path: '/apps/warehouse',
     status: 'active',
     category: 'data',
+  },
+  {
+    id: 'amazon-accounting',
+    name: 'Amazon売上集計',
+    description: 'ペイメントレポートCSVから税率別・セグメント別の売上集計を自動計算',
+    icon: '📒',
+    path: '/apps/amazon-accounting',
+    status: 'active',
+    category: 'accounting',
   },
 ];
 
