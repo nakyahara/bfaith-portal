@@ -474,6 +474,7 @@ function renderPage() {
 
     <div class="card">
       <h2>過去の確定データ</h2>
+      <div style="margin-bottom:8px"><button class="btn btn-p" onclick="downloadHistoryCsv()">セグメント別集計CSVダウンロード</button></div>
       <div id="historyList"><span class="meta">読み込み中...</span></div>
     </div>
   </div>
@@ -830,6 +831,55 @@ function renderPage() {
       const body = document.getElementById('acc-' + idx);
       el.classList.toggle('open');
       body.classList.toggle('open');
+    }
+
+    async function downloadHistoryCsv() {
+      try {
+        const r = await fetch(location.pathname + '/history');
+        const rows = await r.json();
+        if (!rows.length) { alert('確定データがありません'); return; }
+
+        const segNames = {1:'自社商品', 2:'取扱限定', 3:'仕入れ商品', other:'その他/未分類'};
+        const segCols = ['商品売上','商品の売上税','配送料','配送料の税金','ギフト包装手数料','ギフト包装の税金','Amazonポイント費用','プロモーション割引額','プロモーション割引の税金','手数料','FBA手数料','トランザクション他','その他','合計'];
+        const adTargets = ['1','2'];
+
+        let csv = '\\uFEFF'; // BOM
+        csv += '集計月,セグメント,' + segCols.join(',') + ',広告費,原価合計\\n';
+
+        for (const row of rows) {
+          const seg = row.by_segment || {};
+          const ad = row.ad_cost || 0;
+          // 按分計算
+          let tSales = 0;
+          const sales = {};
+          for (const [k, sr] of Object.entries(seg)) { sales[k] = sr['商品売上'] || 0; if (adTargets.includes(k)) tSales += sales[k]; }
+          const adMap = {};
+          let adSum = 0;
+          const keys = Object.keys(seg);
+          for (const k of keys) {
+            if (!adTargets.includes(k) || tSales === 0) { adMap[k] = 0; continue; }
+            adMap[k] = Math.round(ad * sales[k] / tSales); adSum += adMap[k];
+          }
+          if (ad && tSales > 0) {
+            const mk = keys.filter(k => adTargets.includes(k)).sort((a,b) => (sales[b]||0)-(sales[a]||0))[0];
+            if (mk) adMap[mk] += (ad - adSum);
+          }
+
+          for (const [key, sr] of Object.entries(seg)) {
+            const label = segNames[key] || key;
+            const vals = segCols.map(c => sr[c] || 0);
+            csv += row.year_month + ',' + key + ':' + label + ',' + vals.join(',') + ',' + (adMap[key] || 0) + ',' + (sr.原価合計 || 0) + '\\n';
+          }
+        }
+
+        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'Amazon_segment_history.csv';
+        a.click();
+      } catch(e) {
+        alert('ダウンロードエラー: ' + e.message);
+      }
     }
 
     loadHistory();
