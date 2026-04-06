@@ -833,7 +833,7 @@ router.get('/api/missing/prioritized', (req, res) => {
         LEFT JOIN (
           SELECT 商品コード, SUM(数量) as qty, MAX(日付) as last_sold FROM f_sales_by_product WHERE 日付 >= ? GROUP BY 商品コード
         ) s30 ON m.商品コード = s30.商品コード
-        WHERE m.取扱区分 = '取扱中' AND m.送料 IS NULL
+        WHERE m.商品区分 = '単品' AND m.送料 IS NULL
         ORDER BY priority, sales_7d DESC, sales_30d DESC
         LIMIT 200
       `).all(cutoff7Str, cutoff30Str));
@@ -854,7 +854,7 @@ router.get('/api/missing/prioritized', (req, res) => {
         LEFT JOIN (
           SELECT 商品コード, SUM(数量) as qty, MAX(日付) as last_sold FROM f_sales_by_product WHERE 日付 >= ? GROUP BY 商品コード
         ) s30 ON m.商品コード = s30.商品コード
-        WHERE m.取扱区分 = '取扱中' AND m.原価状態 IN ('MISSING', 'PARTIAL')
+        WHERE m.商品区分 = '単品' AND m.原価状態 IN ('MISSING', 'PARTIAL')
         ORDER BY priority, sales_7d DESC, sales_30d DESC
         LIMIT 200
       `).all(cutoff7Str, cutoff30Str));
@@ -1011,23 +1011,23 @@ router.get('/api/missing/download', (req, res) => {
   try {
     if (type === 'shipping') {
       rows = db.prepare(`
-        SELECT m.商品コード, m.商品名, m.商品区分, m.標準売価, m.原価, m.原価状態,
+        SELECT m.商品コード, m.商品名, m.商品区分, m.取扱区分, m.標準売価, m.原価, m.原価状態,
           COALESCE(p.代表商品コード, '') as 代表商品コード
         FROM m_products m
         LEFT JOIN raw_ne_products p ON m.商品コード = p.商品コード COLLATE NOCASE
-        WHERE m.取扱区分 = '取扱中' AND m.送料 IS NULL
-        ORDER BY m.商品区分, m.商品コード
+        WHERE m.商品区分 = '単品' AND m.送料 IS NULL
+        ORDER BY m.取扱区分, m.商品コード
       `).all();
-      header = '商品コード,商品名,商品区分,標準売価,原価,原価状態,代表商品コード,送料コード';
+      header = '商品コード,商品名,商品区分,取扱区分,標準売価,原価,原価状態,代表商品コード,送料コード';
       filename = 'shipping_missing.csv';
     } else if (type === 'genka') {
       rows = db.prepare(`
-        SELECT m.商品コード, m.商品名, m.商品区分, m.標準売価, m.原価状態
+        SELECT m.商品コード, m.商品名, m.商品区分, m.取扱区分, m.標準売価, m.原価状態
         FROM m_products m
-        WHERE m.取扱区分 = '取扱中' AND m.原価状態 IN ('MISSING','PARTIAL')
-        ORDER BY m.商品区分, m.商品コード
+        WHERE m.商品区分 = '単品' AND m.原価状態 IN ('MISSING','PARTIAL')
+        ORDER BY m.取扱区分, m.商品コード
       `).all();
-      header = '商品コード,商品名,商品区分,標準売価,原価状態';
+      header = '商品コード,商品名,商品区分,取扱区分,標準売価,原価状態';
       filename = 'genka_missing.csv';
     } else if (type === 'sku_map') {
       rows = db.prepare('SELECT モール商品コード, 商品名, SUM(数量) as 数量, MAX(日付) as 最終日付 FROM unmapped_sales GROUP BY モール商品コード, 商品名 ORDER BY SUM(数量) DESC').all();
@@ -1072,8 +1072,8 @@ router.get('/api/missing/download', (req, res) => {
 router.get('/api/missing/counts', (req, res) => {
   const db = getDB();
   try {
-    const shipping = db.prepare("SELECT COUNT(*) as cnt FROM m_products WHERE 取扱区分 = '取扱中' AND 送料 IS NULL").get().cnt;
-    const genka = db.prepare("SELECT COUNT(*) as cnt FROM m_products WHERE 取扱区分 = '取扱中' AND 原価状態 IN ('MISSING','PARTIAL')").get().cnt;
+    const shipping = db.prepare("SELECT COUNT(*) as cnt FROM m_products WHERE 商品区分 = '単品' AND 送料 IS NULL").get().cnt;
+    const genka = db.prepare("SELECT COUNT(*) as cnt FROM m_products WHERE 商品区分 = '単品' AND 原価状態 IN ('MISSING','PARTIAL')").get().cnt;
     const sku_map = db.prepare("SELECT COUNT(*) as cnt FROM unmapped_sales").get().cnt;
     const sales_class = db.prepare("SELECT COUNT(*) as cnt FROM m_products WHERE 商品区分 = '単品' AND 売上分類 IS NULL").get().cnt;
     res.json({ shipping, genka, sku_map, sales_class });
