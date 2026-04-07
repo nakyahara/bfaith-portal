@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FBA収益性分析 - B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png"><link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    .container { max-width: 100%; margin: 0 auto; padding: 12px 20px; }
+    .header-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
+    .header-row h2 { margin: 0; }
+
+    /* サマリーカード */
+    .summary-cards { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+    .card { background: white; border-radius: 8px; padding: 14px 18px; min-width: 150px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    .card .label { font-size: 12px; color: #666; }
+    .card .value { font-size: 26px; font-weight: bold; margin-top: 4px; }
+    .card.danger .value { color: #dc2626; }
+    .card.warning .value { color: #f59e0b; }
+    .card.success .value { color: #16a34a; }
+
+    /* ボタン */
+    .btn { display: inline-flex; align-items: center; gap: 6px; padding: 10px 20px; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500; }
+    .btn-primary { background: #2563eb; color: white; }
+    .btn-primary:hover { background: #1d4ed8; }
+    .btn-primary:disabled { background: #93c5fd; cursor: not-allowed; }
+    .btn-secondary { background: #e5e7eb; color: #374151; }
+    .btn-secondary:hover { background: #d1d5db; }
+    .btn-sm { padding: 4px 10px; font-size: 12px; }
+    .btn-export { background: #059669; color: white; }
+    .btn-export:hover { background: #047857; }
+    .actions { display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; align-items: center; }
+
+    /* プログレス */
+    .progress-wrap { display: none; margin-bottom: 16px; }
+    .progress-wrap.show { display: block; }
+    .progress-bar-outer { background: #e5e7eb; border-radius: 6px; height: 24px; overflow: hidden; }
+    .progress-bar-inner { background: #2563eb; height: 100%; transition: width 0.3s; display: flex; align-items: center; justify-content: center; color: white; font-size: 12px; font-weight: 600; min-width: 40px; }
+    .progress-text { font-size: 13px; color: #666; margin-top: 4px; }
+
+    /* フィルター */
+    .filters { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+    .filters label { font-size: 13px; color: #555; }
+    .filters select, .filters input { padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 13px; }
+    .filter-tag { display: inline-flex; align-items: center; gap: 4px; padding: 4px 10px; border-radius: 12px; font-size: 12px; cursor: pointer; border: 1px solid #d1d5db; background: white; }
+    .filter-tag.active { background: #2563eb; color: white; border-color: #2563eb; }
+
+    /* テーブル */
+    .table-wrap { max-height: calc(100vh - 360px); overflow: auto; border: 1px solid #e5e7eb; border-radius: 8px; }
+    .data-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .data-table th, .data-table td { border: 1px solid #e5e7eb; padding: 5px 8px; text-align: right; white-space: nowrap; }
+    .data-table th { background: #f3f4f6; position: sticky; top: 0; z-index: 10; text-align: center; font-size: 11px; }
+    .data-table td:nth-child(1), .data-table td:nth-child(2), .data-table td:nth-child(3) { text-align: left; }
+    .data-table tr:hover { background: #f0f7ff; }
+
+    /* 利益率による行色分け */
+    .row-danger { background: #fef2f2 !important; }
+    .row-danger:hover { background: #fee2e2 !important; }
+    .row-warning { background: #fffbeb !important; }
+    .row-warning:hover { background: #fef3c7 !important; }
+    .row-no-cost { background: #f5f5f5 !important; color: #999; }
+
+    .badge { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 600; }
+    .badge-danger { background: #fecaca; color: #991b1b; }
+    .badge-warning { background: #fde68a; color: #92400e; }
+    .badge-ok { background: #bbf7d0; color: #166534; }
+    .badge-good { background: #a5f3fc; color: #155e75; }
+    .badge-na { background: #e5e7eb; color: #6b7280; }
+
+    .text-right { text-align: right; }
+    .text-muted { color: #999; }
+    .product-name { max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
+
+    /* 原価入力モーダル */
+    .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 100; align-items: center; justify-content: center; }
+    .modal-overlay.show { display: flex; }
+    .modal { background: white; border-radius: 12px; padding: 24px; min-width: 360px; box-shadow: 0 8px 32px rgba(0,0,0,0.2); }
+    .modal h3 { margin: 0 0 16px; }
+    .modal .form-group { margin-bottom: 12px; }
+    .modal .form-group label { display: block; font-size: 13px; margin-bottom: 4px; color: #555; }
+    .modal .form-group input { width: 100%; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; box-sizing: border-box; }
+    .modal .btn-row { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <a href="/" class="back-link">&larr; Portal</a>
+      <h1>FBA収益性分析</h1>
+    </div>
+    <div class="header-right" style="display:flex;align-items:center;gap:12px;">
+      <span><%= displayName || username %></span>
+    </div>
+  </header>
+
+  <div class="container">
+    <div class="header-row">
+      <h2>FBA収益性分析</h2>
+      <div style="font-size:13px; color:#888;">warehouse.db の原価データ + SP-API 手数料で利益率を算出</div>
+    </div>
+
+    <!-- アクション -->
+    <div class="actions">
+      <button class="btn btn-primary" id="btnAnalyze" onclick="startAnalysis()">分析開始</button>
+      <button class="btn btn-export" id="btnExport" onclick="exportCsv()" disabled>CSV出力</button>
+      <span id="statusText" style="font-size:13px; color:#666;"></span>
+    </div>
+
+    <!-- プログレスバー -->
+    <div class="progress-wrap" id="progressWrap">
+      <div class="progress-bar-outer">
+        <div class="progress-bar-inner" id="progressBar" style="width:0%">0%</div>
+      </div>
+      <div class="progress-text" id="progressText"></div>
+    </div>
+
+    <!-- サマリーカード -->
+    <div class="summary-cards" id="summaryCards" style="display:none;">
+      <div class="card"><div class="label">FBA出品数</div><div class="value" id="statTotal">-</div></div>
+      <div class="card danger"><div class="label">利益率10%未満</div><div class="value" id="statDanger">-</div></div>
+      <div class="card warning"><div class="label">利益率10-20%</div><div class="value" id="statWarning">-</div></div>
+      <div class="card success"><div class="label">利益率20%以上</div><div class="value" id="statOk">-</div></div>
+      <div class="card"><div class="label">原価未登録</div><div class="value" id="statNoCost">-</div></div>
+    </div>
+
+    <!-- フィルター -->
+    <div class="filters" id="filtersArea" style="display:none;">
+      <label>表示:</label>
+      <button class="filter-tag active" data-filter="all" onclick="setFilter('all', this)">全て</button>
+      <button class="filter-tag" data-filter="danger" onclick="setFilter('danger', this)">10%未満</button>
+      <button class="filter-tag" data-filter="warning" onclick="setFilter('warning', this)">10-20%</button>
+      <button class="filter-tag" data-filter="ok" onclick="setFilter('ok', this)">20%以上</button>
+      <button class="filter-tag" data-filter="no-cost" onclick="setFilter('no-cost', this)">原価未登録</button>
+      <span style="margin-left: auto;">
+        <input type="text" id="searchBox" placeholder="SKU / ASIN / 商品名で検索" style="width:240px;" oninput="applyFilters()">
+      </span>
+    </div>
+
+    <!-- データテーブル -->
+    <div class="table-wrap" id="tableWrap" style="display:none;">
+      <table class="data-table" id="dataTable">
+        <thead>
+          <tr>
+            <th style="cursor:pointer;" onclick="sortBy('sku')">SKU</th>
+            <th style="cursor:pointer;" onclick="sortBy('asin')">ASIN</th>
+            <th style="cursor:pointer;" onclick="sortBy('productName')">商品名</th>
+            <th style="cursor:pointer;" onclick="sortBy('price')">販売価格</th>
+            <th style="cursor:pointer;" onclick="sortBy('costWithTax')">原価(税込)</th>
+            <th style="cursor:pointer;" onclick="sortBy('totalFee')">手数料</th>
+            <th style="cursor:pointer;" onclick="sortBy('profit')">利益</th>
+            <th style="cursor:pointer;" onclick="sortBy('profitRate')">利益率</th>
+            <th style="cursor:pointer;" onclick="sortBy('quantity')">在庫数</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="tableBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- 原価入力モーダル -->
+  <div class="modal-overlay" id="costModal">
+    <div class="modal">
+      <h3>原価を登録</h3>
+      <div style="font-size:12px; color:#888; margin-bottom:12px;" id="modalSku"></div>
+      <div class="form-group">
+        <label>原価（税抜）</label>
+        <input type="number" id="modalCost" placeholder="例: 500">
+      </div>
+      <div class="form-group">
+        <label>消費税率 (%)</label>
+        <input type="number" id="modalTaxRate" value="10">
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-secondary" onclick="closeModal()">キャンセル</button>
+        <button class="btn btn-primary" onclick="saveCost()">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let allData = [];       // 全分析結果
+    let currentFilter = 'all';
+    let currentSort = { key: 'profitRate', asc: true };
+    let editingSku = null;
+
+    // ===== 分析開始 =====
+    async function startAnalysis() {
+      const btn = document.getElementById('btnAnalyze');
+      btn.disabled = true;
+      btn.textContent = '取得中...';
+      setStatus('FBA出品一覧を取得中...');
+      showProgress(true);
+      updateProgress(0, 'SP-APIからレポート取得中（1-2分かかります）...');
+
+      try {
+        // Step 1: 出品一覧 + 原価取得
+        const listRes = await fetch('/apps/fba-profitability/api/listings', { method: 'POST' });
+        const listData = await listRes.json();
+        if (!listData.success) throw new Error(listData.error);
+
+        const items = listData.items;
+        setStatus(`${items.length}件のFBA出品を取得。手数料を計算中...`);
+        updateProgress(10, `${items.length}件取得完了。手数料計算開始...`);
+
+        // Step 2: 手数料をバッチ取得（5件ずつ）
+        const BATCH_SIZE = 5;
+        const feeMap = new Map();
+        const itemsWithPrice = items.filter(i => i.price > 0 && i.asin);
+
+        for (let i = 0; i < itemsWithPrice.length; i += BATCH_SIZE) {
+          const batch = itemsWithPrice.slice(i, i + BATCH_SIZE).map(it => ({ asin: it.asin, price: it.price }));
+          const feeRes = await fetch('/apps/fba-profitability/api/fees', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ items: batch }),
+          });
+          const feeData = await feeRes.json();
+          for (const r of feeData.results) {
+            if (r.success) feeMap.set(r.asin, r);
+          }
+
+          const pct = 10 + Math.round(((i + BATCH_SIZE) / itemsWithPrice.length) * 85);
+          updateProgress(Math.min(pct, 95), `手数料計算中... ${Math.min(i + BATCH_SIZE, itemsWithPrice.length)}/${itemsWithPrice.length}`);
+        }
+
+        // Step 3: 利益計算
+        allData = items.map(item => {
+          const fee = feeMap.get(item.asin);
+          const totalFee = fee ? fee.totalFee : null;
+          let costWithTax = null;
+          let profit = null;
+          let profitRate = null;
+
+          if (item.cost != null && item.taxRate != null) {
+            costWithTax = Math.ceil(item.cost * (1 + item.taxRate / 100));
+          }
+          if (costWithTax != null && totalFee != null && item.price > 0) {
+            profit = item.price - costWithTax - totalFee;
+            profitRate = (profit / item.price) * 100;
+          }
+
+          return {
+            ...item,
+            costWithTax,
+            referralFee: fee?.referralFee ?? null,
+            fbaFee: fee?.fbaFee ?? null,
+            totalFee,
+            profit,
+            profitRate,
+          };
+        });
+
+        updateProgress(100, '完了');
+        renderSummary();
+        renderTable();
+
+        document.getElementById('summaryCards').style.display = 'flex';
+        document.getElementById('filtersArea').style.display = 'flex';
+        document.getElementById('tableWrap').style.display = 'block';
+        document.getElementById('btnExport').disabled = false;
+
+        setStatus(`分析完了: ${allData.length}件`);
+      } catch (e) {
+        setStatus('エラー: ' + e.message);
+        alert('エラー: ' + e.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '分析開始';
+        setTimeout(() => showProgress(false), 2000);
+      }
+    }
+
+    // ===== サマリー =====
+    function renderSummary() {
+      const withRate = allData.filter(d => d.profitRate != null);
+      const danger = withRate.filter(d => d.profitRate < 10);
+      const warning = withRate.filter(d => d.profitRate >= 10 && d.profitRate < 20);
+      const ok = withRate.filter(d => d.profitRate >= 20);
+      const noCost = allData.filter(d => d.cost == null);
+
+      document.getElementById('statTotal').textContent = allData.length;
+      document.getElementById('statDanger').textContent = danger.length;
+      document.getElementById('statWarning').textContent = warning.length;
+      document.getElementById('statOk').textContent = ok.length;
+      document.getElementById('statNoCost').textContent = noCost.length;
+    }
+
+    // ===== テーブル描画 =====
+    function renderTable() {
+      const filtered = getFilteredData();
+      const sorted = sortData(filtered);
+      const tbody = document.getElementById('tableBody');
+
+      tbody.innerHTML = sorted.map(d => {
+        let rowClass = '';
+        let badge = '';
+        if (d.profitRate == null) {
+          rowClass = 'row-no-cost';
+          badge = '<span class="badge badge-na">--</span>';
+        } else if (d.profitRate < 10) {
+          rowClass = 'row-danger';
+          badge = `<span class="badge badge-danger">${d.profitRate.toFixed(1)}%</span>`;
+        } else if (d.profitRate < 20) {
+          rowClass = 'row-warning';
+          badge = `<span class="badge badge-warning">${d.profitRate.toFixed(1)}%</span>`;
+        } else if (d.profitRate < 30) {
+          badge = `<span class="badge badge-ok">${d.profitRate.toFixed(1)}%</span>`;
+        } else {
+          badge = `<span class="badge badge-good">${d.profitRate.toFixed(1)}%</span>`;
+        }
+
+        const yen = v => v != null ? '&yen;' + Math.round(v).toLocaleString() : '<span class="text-muted">-</span>';
+
+        return `<tr class="${rowClass}">
+          <td>${esc(d.sku)}</td>
+          <td><a href="https://www.amazon.co.jp/dp/${d.asin}" target="_blank" rel="noopener">${d.asin}</a></td>
+          <td class="product-name" title="${esc(d.productName)}">${esc(d.productName)}</td>
+          <td>${yen(d.price)}</td>
+          <td>${d.costWithTax != null ? yen(d.costWithTax) : '<span class="text-muted">未登録</span>'}</td>
+          <td>${yen(d.totalFee)}</td>
+          <td>${yen(d.profit)}</td>
+          <td>${badge}</td>
+          <td>${d.quantity}</td>
+          <td><button class="btn btn-sm btn-secondary" onclick="openCostModal('${esc(d.sku)}', '${esc(d.neCode || d.sku)}', ${d.cost ?? ''})">原価</button></td>
+        </tr>`;
+      }).join('');
+    }
+
+    // ===== フィルター =====
+    function setFilter(filter, el) {
+      currentFilter = filter;
+      document.querySelectorAll('.filter-tag').forEach(t => t.classList.remove('active'));
+      el.classList.add('active');
+      applyFilters();
+    }
+
+    function applyFilters() {
+      renderTable();
+    }
+
+    function getFilteredData() {
+      let data = allData;
+      const q = document.getElementById('searchBox')?.value?.toLowerCase() || '';
+
+      if (q) {
+        data = data.filter(d =>
+          d.sku.toLowerCase().includes(q) ||
+          d.asin.toLowerCase().includes(q) ||
+          d.productName.toLowerCase().includes(q)
+        );
+      }
+
+      switch (currentFilter) {
+        case 'danger': return data.filter(d => d.profitRate != null && d.profitRate < 10);
+        case 'warning': return data.filter(d => d.profitRate != null && d.profitRate >= 10 && d.profitRate < 20);
+        case 'ok': return data.filter(d => d.profitRate != null && d.profitRate >= 20);
+        case 'no-cost': return data.filter(d => d.cost == null);
+        default: return data;
+      }
+    }
+
+    // ===== ソート =====
+    function sortBy(key) {
+      if (currentSort.key === key) {
+        currentSort.asc = !currentSort.asc;
+      } else {
+        currentSort = { key, asc: true };
+      }
+      renderTable();
+    }
+
+    function sortData(data) {
+      const { key, asc } = currentSort;
+      return [...data].sort((a, b) => {
+        let va = a[key], vb = b[key];
+        if (va == null && vb == null) return 0;
+        if (va == null) return 1;
+        if (vb == null) return -1;
+        if (typeof va === 'string') {
+          return asc ? va.localeCompare(vb) : vb.localeCompare(va);
+        }
+        return asc ? va - vb : vb - va;
+      });
+    }
+
+    // ===== 原価モーダル =====
+    function openCostModal(sku, neCode, currentCost) {
+      editingSku = neCode || sku;
+      document.getElementById('modalSku').textContent = `SKU: ${sku}` + (neCode && neCode !== sku ? ` / NE: ${neCode}` : '');
+      document.getElementById('modalCost').value = currentCost || '';
+      document.getElementById('costModal').classList.add('show');
+      document.getElementById('modalCost').focus();
+    }
+
+    function closeModal() {
+      document.getElementById('costModal').classList.remove('show');
+      editingSku = null;
+    }
+
+    async function saveCost() {
+      const cost = parseFloat(document.getElementById('modalCost').value);
+      const taxRate = parseFloat(document.getElementById('modalTaxRate').value) || 10;
+      if (isNaN(cost) || cost < 0) { alert('有効な原価を入力してください'); return; }
+
+      try {
+        const res = await fetch('/apps/fba-profitability/api/update-cost', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sku: editingSku, cost, taxRate }),
+        });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error);
+
+        // ローカルデータ更新
+        const costWithTax = Math.ceil(cost * (1 + taxRate / 100));
+        for (const item of allData) {
+          if ((item.neCode || item.sku) === editingSku || item.sku === editingSku) {
+            item.cost = cost;
+            item.taxRate = taxRate;
+            item.costWithTax = costWithTax;
+            if (item.totalFee != null && item.price > 0) {
+              item.profit = item.price - costWithTax - item.totalFee;
+              item.profitRate = (item.profit / item.price) * 100;
+            }
+          }
+        }
+        renderSummary();
+        renderTable();
+        closeModal();
+      } catch (e) {
+        alert('保存エラー: ' + e.message);
+      }
+    }
+
+    // ===== CSV出力 =====
+    function exportCsv() {
+      const filtered = getFilteredData();
+      const sorted = sortData(filtered);
+      const bom = '\uFEFF';
+      const header = ['SKU','ASIN','商品名','販売価格','原価(税込)','販売手数料','FBA手数料','手数料合計','利益','利益率(%)','FBA在庫数','NE商品コード'];
+      const rows = sorted.map(d => [
+        d.sku, d.asin, `"${(d.productName || '').replace(/"/g, '""')}"`,
+        d.price, d.costWithTax ?? '', d.referralFee ?? '', d.fbaFee ?? '',
+        d.totalFee != null ? Math.round(d.totalFee) : '',
+        d.profit != null ? Math.round(d.profit) : '',
+        d.profitRate != null ? d.profitRate.toFixed(1) : '',
+        d.quantity, d.neCode || '',
+      ]);
+
+      const csv = bom + [header.join(','), ...rows.map(r => r.join(','))].join('\n');
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `fba-profitability-${new Date().toISOString().slice(0,10)}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    // ===== ヘルパー =====
+    function esc(s) { return (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+    function setStatus(msg) { document.getElementById('statusText').textContent = msg; }
+    function showProgress(show) { document.getElementById('progressWrap').classList.toggle('show', show); }
+    function updateProgress(pct, text) {
+      const bar = document.getElementById('progressBar');
+      bar.style.width = pct + '%';
+      bar.textContent = pct + '%';
+      document.getElementById('progressText').textContent = text || '';
+    }
+  </script>
+</body>
+</html>

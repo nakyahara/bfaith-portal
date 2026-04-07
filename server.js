@@ -17,6 +17,7 @@ import warehouseRouter from './apps/warehouse/router.js';
 import mirrorRouter from './apps/warehouse-mirror/router.js';
 import amazonAccountingRouter from './apps/amazon-accounting/router.js';
 import rakutenAccountingRouter from './apps/rakuten-accounting/router.js';
+import fbaProfitabilityRouter from './apps/fba-profitability/router.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -208,6 +209,15 @@ const apps = [
     status: 'active',
     category: 'accounting',
   },
+  {
+    id: 'fba-profitability',
+    name: 'FBA収益性分析',
+    description: 'FBA全商品の利益率を分析・低利益率商品を検出',
+    icon: '📉',
+    path: '/apps/fba-profitability',
+    status: 'active',
+    category: 'fba',
+  },
 ];
 
 // 外部リンク
@@ -323,6 +333,7 @@ app.use('/apps/amazon-accounting', (req, res, next) => {
   requireAuth(req, res, next);
 }, amazonAccountingRouter);
 app.use('/apps/rakuten-accounting', requireAuth, rakutenAccountingRouter);
+app.use('/apps/fba-profitability', requireAppAccess('fba-profitability'), fbaProfitabilityRouter);
 
 // 未実装アプリのプレースホルダー
 app.get('/apps/:appId', requireAuth, (req, res) => {
