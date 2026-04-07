@@ -7,7 +7,7 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { getActiveListingsReport, getFees } from '../profit-calculator/sp-api.js';
-import { getDB } from '../warehouse/db.js';
+import { getMirrorDB } from '../warehouse-mirror/db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
@@ -28,20 +28,24 @@ router.post('/api/listings', async (req, res) => {
     const report = await getActiveListingsReport();
     console.log(`[FBA-Profit] 全出品: ${report.totalCount}件`);
 
-    // FBA出品のみフィルタ
+    // FBA出品のみフィルタ（日本語ヘッダー「フルフィルメント・チャンネル」にも対応）
     const fbaListings = report.listings.filter(r => {
-      const fc = (r['fulfillment-channel'] || r['fulfillment channel'] || '').toLowerCase();
-      return fc.includes('amazon') || fc === 'afn' || fc.includes('fba');
+      const fc = (
+        r['fulfillment-channel'] || r['fulfillment channel'] ||
+        r['フルフィルメント・チャンネル'] || r['フルフィルメントチャンネル'] || ''
+      ).toLowerCase();
+      return fc.includes('amazon') || fc === 'afn' || fc.includes('fba') ||
+             fc.includes('default') || fc === 'amazon_na' || fc === 'amazon_jp';
     });
     console.log(`[FBA-Profit] FBA出品: ${fbaListings.length}件`);
 
-    // warehouse.db から原価データ取得
+    // warehouse-mirror.db から原価データ取得
     let costMap = new Map();
     try {
-      const db = getDB();
+      const db = getMirrorDB();
 
-      // sku_map: seller_sku → ne_code
-      const skuMappings = db.prepare('SELECT seller_sku, ne_code, 数量 FROM sku_map').all();
+      // mirror_sku_map: seller_sku → ne_code
+      const skuMappings = db.prepare('SELECT seller_sku, ne_code, 数量 FROM mirror_sku_map').all();
       const skuToNe = new Map();
       for (const m of skuMappings) {
         if (!skuToNe.has(m.seller_sku?.toLowerCase())) {
@@ -50,8 +54,8 @@ router.post('/api/listings', async (req, res) => {
         skuToNe.get(m.seller_sku?.toLowerCase()).push({ ne_code: m.ne_code, qty: m.数量 || 1 });
       }
 
-      // m_products: 商品コード → 原価, 消費税率
-      const products = db.prepare('SELECT 商品コード, 原価, 原価ソース, 原価状態, 消費税率 FROM m_products').all();
+      // mirror_products: 商品コード → 原価, 消費税率
+      const products = db.prepare('SELECT 商品コード, 原価, 原価ソース, 原価状態, 消費税率 FROM mirror_products').all();
       const productMap = new Map();
       for (const p of products) {
         productMap.set(p.商品コード?.toLowerCase(), p);
@@ -59,7 +63,7 @@ router.post('/api/listings', async (req, res) => {
 
       // FBA SKU ごとに原価を計算
       for (const listing of fbaListings) {
-        const sku = (listing['seller-sku'] || listing['sku'] || '').trim();
+        const sku = (listing['seller-sku'] || listing['seller sku'] || listing['出品者SKU'] || listing['sku'] || '').trim();
         if (!sku) continue;
 
         const neEntries = skuToNe.get(sku.toLowerCase());
@@ -107,13 +111,13 @@ router.post('/api/listings', async (req, res) => {
       console.error('[FBA-Profit] warehouse.db アクセスエラー:', e.message);
     }
 
-    // レスポンス組み立て
+    // レスポンス組み立て（日本語ヘッダー対応）
     const items = fbaListings.map(listing => {
-      const sku = (listing['seller-sku'] || listing['sku'] || '').trim();
-      const asin = (listing['asin1'] || listing['asin'] || '').trim();
-      const price = parseFloat(listing['price'] || listing['your-price'] || '0') || 0;
-      const productName = listing['item-name'] || listing['product-name'] || listing['商品名'] || '';
-      const quantity = parseInt(listing['quantity'] || listing['afn-fulfillable-quantity'] || '0') || 0;
+      const sku = (listing['seller-sku'] || listing['seller sku'] || listing['出品者SKU'] || listing['sku'] || '').trim();
+      const asin = (listing['asin1'] || listing['asin'] || listing['商品ID'] || '').trim();
+      const price = parseFloat(listing['price'] || listing['your-price'] || listing['価格'] || '0') || 0;
+      const productName = listing['item-name'] || listing['item name'] || listing['product-name'] || listing['商品名'] || '';
+      const quantity = parseInt(listing['quantity'] || listing['afn-fulfillable-quantity'] || listing['在庫数'] || listing['数量'] || '0') || 0;
 
       const costData = costMap.get(sku.toLowerCase());
 
@@ -179,22 +183,33 @@ router.post('/api/update-cost', (req, res) => {
   }
 
   try {
-    const db = getDB();
+    const db = getMirrorDB();
     const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
 
-    // exception_genka に登録（warehouse.db の原価例外テーブル）
+    // mirror_products に即時反映
     db.prepare(
-      'INSERT OR REPLACE INTO exception_genka (sku, genka, 商品名, synced_at) VALUES (?, ?, ?, ?)'
-    ).run(sku, parseFloat(cost), '', now);
-
-    // m_products にも即時反映
-    db.prepare(
-      "UPDATE m_products SET 原価 = ?, 原価ソース = '例外', 原価状態 = 'OVERRIDDEN', updated_at = ? WHERE 商品コード = ?"
+      "UPDATE mirror_products SET 原価 = ?, 原価ソース = '例外', 原価状態 = 'OVERRIDDEN', updated_at = ? WHERE 商品コード = ?"
     ).run(parseFloat(cost), now, sku);
 
     res.json({ ok: true, sku, cost: parseFloat(cost) });
   } catch (e) {
     console.error('[FBA-Profit] 原価更新エラー:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===== デバッグ: ヘッダー確認用 =====
+router.get('/api/debug-headers', async (req, res) => {
+  try {
+    const report = await getActiveListingsReport();
+    const sample = report.listings[0] || {};
+    res.json({
+      totalCount: report.totalCount,
+      headers: report.headers,
+      sampleKeys: Object.keys(sample).slice(0, 30),
+      sampleValues: Object.fromEntries(Object.entries(sample).slice(0, 20)),
+    });
+  } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
