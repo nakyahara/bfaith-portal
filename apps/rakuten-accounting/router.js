@@ -65,11 +65,15 @@ function resolveProducts(rows, db) {
   const unresolvedTax = new Map(); // 税率未登録
   const unresolvedSegment = new Map(); // セグメント未登録
 
+  // AL列で無意味な値（商品コードとして使えない）をスキップするセット
+  const INVALID_AL = new Set(['normal-inventory', 'normal-size', 'normal', '']);
+
   for (const row of rows) {
     const amCode = (row.システム連携用SKU番号 || '').toLowerCase();
     const alCode = (row.SKU管理番号 || '').toLowerCase();
+    const wCode = (row.商品番号 || '').toLowerCase();
 
-    if (!amCode && !alCode) {
+    if (!amCode && INVALID_AL.has(alCode) && !wCode) {
       resolved.push({ ...row, 原価: 0, 税率: null, 売上分類: null, 解決方法: 'no_code' });
       continue;
     }
@@ -78,10 +82,16 @@ function resolveProducts(rows, db) {
     let product = amCode ? productsMap.get(amCode) : null;
     let resolveMethod = amCode ? 'am_direct' : null;
 
-    // Stage 2: AM列が空の場合、AL列（SKU管理番号）で検索
-    if (!product && !amCode && alCode) {
+    // Stage 2: AM列が空の場合、AL列（SKU管理番号）で検索（無意味な値はスキップ）
+    if (!product && !amCode && !INVALID_AL.has(alCode)) {
       product = productsMap.get(alCode);
       resolveMethod = 'al_fallback';
+    }
+
+    // Stage 3: AL列も無意味な値の場合、W列（商品番号）で検索
+    if (!product && !amCode && INVALID_AL.has(alCode) && wCode) {
+      product = productsMap.get(wCode);
+      resolveMethod = 'w_fallback';
     }
 
     if (product) {
@@ -122,7 +132,7 @@ function resolveProducts(rows, db) {
         売上分類: null,
         解決方法: 'unresolved',
       });
-      const key = amCode || alCode;
+      const key = amCode || (INVALID_AL.has(alCode) ? wCode : alCode) || wCode;
       const existing = unresolved.get(key) || { code: key, name: row.商品名 || '', count: 0, amount: 0 };
       existing.count++;
       existing.amount += row.売上合計 || 0;
@@ -801,7 +811,7 @@ function renderPage() {
         document.getElementById('otherDetailCard').style.display = 'block';
         let html = '<table class="detail-table"><tr><th>商品番号</th><th>商品コード</th><th>商品名</th><th>解決方法</th><th>行数</th><th>個数</th><th>売上合計</th></tr>';
         for (const d of data.otherDetails) {
-          const method = { am_direct: 'AM列一致', al_fallback: 'AL列一致', unresolved: '未解決', no_code: 'コードなし' }[d.解決方法] || d.解決方法;
+          const method = { am_direct: 'AM列一致', al_fallback: 'AL列一致', w_fallback: 'W列一致', unresolved: '未解決', no_code: 'コードなし' }[d.解決方法] || d.解決方法;
           html += '<tr><td style="text-align:left">' + (d.商品番号 || '-') + '</td><td style="text-align:left">' + (d.商品コード || '-') + '</td><td style="text-align:left">' + (d.商品名 || '').slice(0, 50) + '</td><td style="text-align:left">' + method + '</td><td class="num">' + d.count + '</td><td class="num">' + d.個数 + '</td><td class="num">' + fmt(d.売上合計) + '</td></tr>';
         }
         html += '</table>';
