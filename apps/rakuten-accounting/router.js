@@ -66,22 +66,22 @@ function resolveProducts(rows, db) {
   const unresolvedSegment = new Map(); // セグメント未登録
 
   for (const row of rows) {
-    const code = (row.商品番号 || '').toLowerCase();
-    const skuCode = (row.SKU管理番号 || '').toLowerCase();
+    const amCode = (row.システム連携用SKU番号 || '').toLowerCase();
+    const alCode = (row.SKU管理番号 || '').toLowerCase();
 
-    if (!code && !skuCode) {
+    if (!amCode && !alCode) {
       resolved.push({ ...row, 原価: 0, 税率: null, 売上分類: null, 解決方法: 'no_code' });
       continue;
     }
 
-    // Stage 1: 商品番号で直一致
-    let product = productsMap.get(code);
-    let resolveMethod = 'direct';
+    // Stage 1: AM列（システム連携用SKU番号）で検索
+    let product = amCode ? productsMap.get(amCode) : null;
+    let resolveMethod = amCode ? 'am_direct' : null;
 
-    // Stage 2: SKU管理番号でフォールバック
-    if (!product && skuCode) {
-      product = productsMap.get(skuCode);
-      resolveMethod = 'sku_fallback';
+    // Stage 2: AM列が空の場合、AL列（SKU管理番号）で検索
+    if (!product && !amCode && alCode) {
+      product = productsMap.get(alCode);
+      resolveMethod = 'al_fallback';
     }
 
     if (product) {
@@ -122,7 +122,7 @@ function resolveProducts(rows, db) {
         売上分類: null,
         解決方法: 'unresolved',
       });
-      const key = code || skuCode;
+      const key = amCode || alCode;
       const existing = unresolved.get(key) || { code: key, name: row.商品名 || '', count: 0, amount: 0 };
       existing.count++;
       existing.amount += row.売上合計 || 0;
@@ -301,10 +301,11 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
         const confirmDate = cols[5] || '';
         const totalAmount = num(cols[15]); // 合計金額(P列)
         const storeCoupon = num(cols[18]); // 店舗発行クーポン利用額(S列)
-        const productCode = cols[22] || ''; // 商品番号(W列)
+        const productCode = cols[22] || ''; // 商品番号(W列)※表示用のみ
         const unitPrice = num(cols[24]); // 単価(Y列)
         const quantity = parseInt(cols[25]) || 0; // 個数(Z列)
-        const skuCode = cols.length > 37 ? (cols[37] || '') : ''; // SKU管理番号
+        const skuCode = cols.length > 37 ? (cols[37] || '') : ''; // SKU管理番号(AL列)
+        const systemSku = cols.length > 38 ? (cols[38] || '') : ''; // システム連携用SKU番号(AM列)
         const productName = cols[21] || ''; // 商品名(V列)
 
         // セグメント計算用売上合計: 単価 × 個数
@@ -327,6 +328,7 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
           按分クーポン: couponShare,
           合計金額: totalAmount,
           店舗発行クーポン: storeCoupon,
+          システム連携用SKU番号: systemSku,
           SKU管理番号: skuCode,
         });
       }
@@ -799,7 +801,7 @@ function renderPage() {
         document.getElementById('otherDetailCard').style.display = 'block';
         let html = '<table class="detail-table"><tr><th>商品番号</th><th>商品コード</th><th>商品名</th><th>解決方法</th><th>行数</th><th>個数</th><th>売上合計</th></tr>';
         for (const d of data.otherDetails) {
-          const method = { direct: '商品コード一致', sku_fallback: 'SKU管理番号', unresolved: '未解決', no_code: 'コードなし' }[d.解決方法] || d.解決方法;
+          const method = { am_direct: 'AM列一致', al_fallback: 'AL列一致', unresolved: '未解決', no_code: 'コードなし' }[d.解決方法] || d.解決方法;
           html += '<tr><td style="text-align:left">' + (d.商品番号 || '-') + '</td><td style="text-align:left">' + (d.商品コード || '-') + '</td><td style="text-align:left">' + (d.商品名 || '').slice(0, 50) + '</td><td style="text-align:left">' + method + '</td><td class="num">' + d.count + '</td><td class="num">' + d.個数 + '</td><td class="num">' + fmt(d.売上合計) + '</td></tr>';
         }
         html += '</table>';
