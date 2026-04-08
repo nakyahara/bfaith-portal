@@ -320,7 +320,7 @@ export async function initDb() {
     ['cart_alert_level2_ratio', '0.8'],
     ['cart_alert_level3_ratio', '0.5'],
     ['missing_bsr_threshold', '5000'],
-    ['working_expiry_days', '7'],
+    ['working_expiry_days', '3'],
     ['non_fba_reserve_days', '60'],
     // 納品プラン設定
     ['inbound_ship_from_name', ''],
@@ -346,6 +346,7 @@ export async function initDb() {
     ['reorder_point_high_volume', '14', '21'],        // 高回転: 14日→21日（売れるのが速いので早めにトリガー）
     ['reorder_point_low_volume', '30', '14'],         // 低回転: 30日→14日（ゆっくり売れるので短めでOK）
     ['inbound_prep_owner', 'SELLER', 'NONE'],          // prep不要な商品でエラーになるためNONEに変更
+    ['working_expiry_days', '7', '3'],                  // 準備中在庫の有効日数: 7日→3日（放置プラン判定を早める）
   ];
   for (const [key, oldVal, newVal] of migrations) {
     db.run(`UPDATE settings SET value = ?, updated_at = datetime('now','localtime') WHERE key = ? AND value = ?`, [newVal, key, oldVal]);

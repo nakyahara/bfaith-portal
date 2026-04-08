@@ -984,13 +984,20 @@
       if (!sku) { msgEl.textContent = 'SKUを入力してください'; return; }
       if (qty <= 0) { msgEl.textContent = '数量を入力してください'; return; }
 
-      // 既存データから探す
+      // 既存データから探す（recData + manualItems）
       const existing = recData.find(r => r.amazon_sku === sku);
+      const existingManual = manualItems.find(m => m.amazon_sku === sku);
       if (existing) {
         existing.recommended_qty = qty;
+        existing.adjusted_qty = qty;
         existing.is_today = true;
         existing._manual = true;
         msgEl.textContent = `${sku} の推奨数を ${qty} に設定しました`;
+      } else if (existingManual) {
+        // 既にmanualItemsにあるSKU → 数量を更新
+        existingManual.recommended_qty = qty;
+        existingManual.adjusted_qty = qty;
+        msgEl.textContent = `${sku} の数量を ${qty} に更新しました`;
       } else {
         // SKUマッピングから商品情報を取得
         let mapping = null;
@@ -1108,7 +1115,7 @@
           <td class="product-name" title="${r.product_name || ''}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${r.product_name || ''}</a>` : (r.product_name || '')}</td>
           ${renderComponentCell(r)}
           <td>${r.fba_available}</td>
-          <td style="${r.fba_inbound_working > 0 ? (r.fba_inbound_working_source === 'API' ? 'color:#2563eb;font-weight:bold' : 'color:#16a34a') : 'color:#ccc'}" title="${r.fba_inbound_working_source === 'API' ? 'APIから取得（リアルタイム）' : r.fba_inbound_working_source === 'report(7日超除外)' ? 'レポート値（7日超で除外済み）' : 'レポートから取得'}">${r.fba_inbound_working || 0}${r.fba_inbound_working_source === 'API' ? '<span style="font-size:9px;color:#2563eb;"> ⚡</span>' : ''}</td>
+          <td style="${r.fba_inbound_working > 0 ? (r.fba_inbound_working_source === 'API' ? 'color:#2563eb;font-weight:bold' : 'color:#16a34a') : 'color:#ccc'}" title="${r.fba_inbound_working_source === 'API' ? 'APIから取得（リアルタイム）' : r.fba_inbound_working_source?.startsWith('report(') && r.fba_inbound_working_source.includes('日超除外)') ? `レポート値（${r.fba_inbound_working_source.match(/\d+/)?.[0] || '3'}日超で除外済み）` : 'レポートから取得'}">${r.fba_inbound_working || 0}${r.fba_inbound_working_source === 'API' ? '<span style="font-size:9px;color:#2563eb;"> ⚡</span>' : ''}</td>
           <td>${r.effective_fba_stock}</td>
           <td style="${dosColor}">${dosVal}${belowReorder ? ' ⚠' : ''}</td>
           <td>${reorderVal}</td>
@@ -1421,7 +1428,7 @@ Amazon SKU → NE商品コードに変換（set_componentsで展開）
             <h4>計算フロー全体像</h4>
             <pre style="font-size:12px;line-height:1.6;background:#f8f9fa;padding:12px;border-radius:6px;overflow-x:auto;">
 Step1: 実質FBA在庫の算出
-  = 販売可能 + 輸送中 + 受領中 + 準備中(7日超は除外)
+  = 販売可能 + 輸送中 + 受領中 + 準備中(3日超は除外)
 
 Step2: 日販の算出
   FBA日販 = FBA30日売上 ÷ 30
@@ -1610,7 +1617,7 @@ Step10: アラート判定</pre>
             <table style="width:100%;font-size:12px;border-collapse:collapse;">
               <tr style="background:#f3f4f6;"><th style="padding:6px;border:1px solid #e5e7eb;width:30%;">用語</th><th style="padding:6px;border:1px solid #e5e7eb;">意味</th></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">FNSKU</td><td style="padding:6px;border:1px solid #e5e7eb;">AmazonがFBA商品に付与するバーコード。SKUと1対1。危険物判定で梱包グループが分かれる際の識別に使用。</td></tr>
-              <tr><td style="padding:6px;border:1px solid #e5e7eb;">準備中(inbound_working)</td><td style="padding:6px;border:1px solid #e5e7eb;">セラセンで納品プランを作成済みだがまだ発送していない状態の数量。実質FBA在庫に加算される。7日超で除外。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">準備中(inbound_working)</td><td style="padding:6px;border:1px solid #e5e7eb;">セラセンで納品プランを作成済みだがまだ発送していない状態の数量。実質FBA在庫に加算される。3日超で除外。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">発注点</td><td style="padding:6px;border:1px solid #e5e7eb;">FBA在庫がこの日数分を下回ったら推奨に上がる閾値。回転率で変動。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">目標日数</td><td style="padding:6px;border:1px solid #e5e7eb;">推奨に上がった時に何日分送るか。回転率×サイズで決定。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">按分</td><td style="padding:6px;border:1px solid #e5e7eb;">倉庫在庫をFBAと他CH（楽天等）の販売比率で配分すること。FBAに送りすぎて他CHの販売機会を逃さないため。</td></tr>
