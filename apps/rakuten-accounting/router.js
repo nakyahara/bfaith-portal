@@ -643,15 +643,6 @@ function renderPage() {
         <div id="zeroGenkaList"></div>
       </div>
 
-      <!-- 確定 -->
-      <div class="card" id="confirmCard">
-        <h2>確定</h2>
-        <div style="display:flex;gap:12px;align-items:center;margin-bottom:8px">
-          <label>広告費（税込）: <input type="number" id="adCost" value="0" style="width:120px;padding:4px" oninput="updateAdCost()"></label>
-          <button class="btn btn-s" id="confirmBtn" onclick="doConfirm()">この月の集計を確定</button>
-        </div>
-        <div id="confirmStatus" class="meta"></div>
-      </div>
     </div>
 
     <!-- 工程6: 店舗別仕訳書（常時表示） -->
@@ -663,6 +654,17 @@ function renderPage() {
         <button class="btn btn-w" id="billingBtn" onclick="doBillingUpload()">仕訳書取り込み</button>
       </div>
       <div id="billingResult" style="margin-top:8px"></div>
+    </div>
+
+    <!-- 確定（工程6の後） -->
+    <div class="card" id="confirmCard">
+      <h2>確定</h2>
+      <div id="confirmPreCheck" class="warn" style="margin-bottom:8px">注文データCSVと店舗別仕訳書CSVの両方をアップロードしてから確定してください</div>
+      <div style="display:flex;gap:12px;align-items:center;margin-bottom:8px">
+        <span id="adCostDisplay" class="meta"></span>
+        <button class="btn btn-s" id="confirmBtn" onclick="doConfirm()" disabled>この月の集計を確定</button>
+      </div>
+      <div id="confirmStatus" class="meta"></div>
     </div>
 
     <!-- 過去の確定データ -->
@@ -833,10 +835,40 @@ function renderPage() {
       } else {
         document.getElementById('zeroGenkaCard').style.display = 'none';
       }
+      updateConfirmState();
+    }
+
+    function getAdCostFromBilling() {
+      if (!billingData || !billingData.byCategory) return 0;
+      let ad = 0;
+      for (const cat of billingData.byCategory) {
+        if (cat.品目 && cat.品目.includes('広告')) {
+          ad += (cat.金額 || 0) + (cat.消費税額 || 0);
+        }
+      }
+      return ad;
+    }
+
+    function updateConfirmState() {
+      const ready = lastData && billingData;
+      document.getElementById('confirmBtn').disabled = !ready;
+      const pre = document.getElementById('confirmPreCheck');
+      if (ready) {
+        const ad = getAdCostFromBilling();
+        pre.className = 'ok';
+        pre.innerHTML = '注文データ: <b>' + lastData.yearMonth + '</b>（' + lastData.totalRows + '行） / 仕訳書: <b>' + billingData.totalRows + '行</b>' + (ad ? ' / 広告費（税込）: <b>\\u00a5' + Math.round(ad).toLocaleString() + '</b>' : '');
+        document.getElementById('adCostDisplay').textContent = '';
+      } else {
+        pre.className = 'warn';
+        let missing = [];
+        if (!lastData) missing.push('注文データCSV');
+        if (!billingData) missing.push('店舗別仕訳書CSV');
+        pre.innerHTML = missing.join('と') + 'をアップロードしてから確定してください';
+      }
     }
 
     function renderSegmentTable(data) {
-      const ad = parseFloat(document.getElementById('adCost')?.value) || 0;
+      const ad = getAdCostFromBilling();
       const seg = data.bySegment;
 
       // 広告費をセグメント1・2の売上按分
@@ -896,7 +928,7 @@ function renderPage() {
       document.getElementById('excludedInfo').innerHTML = exclHtml;
     }
 
-    function updateAdCost() { if (lastData) renderSegmentTable(lastData); }
+    function updateAdCost() { /* legacy: no-op */ }
 
     function switchTab(el, tabId) {
       el.parentElement.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
@@ -928,6 +960,8 @@ function renderPage() {
         }
         html += '</table>';
         document.getElementById('billingResult').innerHTML = html;
+        updateConfirmState();
+        if (lastData) renderSegmentTable(lastData); // 広告費反映でセグメント再描画
       } catch(e) {
         document.getElementById('billingResult').innerHTML = '<div class="err">エラー: ' + e.message + '</div>';
       }
@@ -937,13 +971,14 @@ function renderPage() {
 
     // ─── 確定 ───
     async function doConfirm() {
-      if (!lastData) { alert('先にCSVをアップロードしてください'); return; }
+      if (!lastData) { alert('先に注文データCSVをアップロードしてください'); return; }
+      if (!billingData) { alert('先に店舗別仕訳書CSVをアップロードしてください'); return; }
       if (!confirm(lastData.yearMonth + ' の集計を確定しますか？')) return;
       const btn = document.getElementById('confirmBtn');
       btn.disabled = true;
       btn.textContent = '保存中...';
       try {
-        const adCost = parseFloat(document.getElementById('adCost').value) || 0;
+        const adCost = getAdCostFromBilling();
         const r = await fetch(location.pathname + '/confirm', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
