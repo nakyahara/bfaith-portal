@@ -616,6 +616,12 @@
   <script>
     const BASE = '/apps/fba-replenishment';
 
+    // HTMLエスケープ（商品名等をHTML属性・テキストに安全に埋め込む）
+    function esc(s) {
+      if (!s) return '';
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+    }
+
     // 構成列のHTML生成
     function renderComponentCell(r) {
       const comps = r.set_components;
@@ -745,7 +751,7 @@
         }
         return `<tr>
           <td>${r.amazon_sku}</td>
-          <td class="product-name" title="${r.product_name || ''}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${r.product_name || ''}</a>` : (r.product_name || '')}</td>
+          <td class="product-name" title="${esc(r.product_name)}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${esc(r.product_name)}</a>` : esc(r.product_name)}</td>
           <td>${r.fba_available}</td>
           <td>${workingHtml}</td>
           <td>${r.fba_inbound_shipped || 0}</td>
@@ -1113,7 +1119,7 @@
           <td style="text-align:center;font-size:11px;color:#666;">${rowNum}</td>
           <td>${r._manual ? '手動' : r.urgency_score}</td>
           <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')">${r.amazon_sku}</span></td>
-          <td class="product-name" title="${r.product_name || ''}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${r.product_name || ''}</a>` : (r.product_name || '')}</td>
+          <td class="product-name" title="${esc(r.product_name)}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${esc(r.product_name)}</a>` : esc(r.product_name)}</td>
           ${renderComponentCell(r)}
           <td>${r.fba_available}</td>
           <td style="${r.fba_inbound_working > 0 ? (r.fba_inbound_working_source === 'API' ? 'color:#2563eb;font-weight:bold' : 'color:#16a34a') : 'color:#ccc'}" title="${r.fba_inbound_working_source === 'API' ? 'APIから取得（リアルタイム）' : r.fba_inbound_working_source?.startsWith('report(') && r.fba_inbound_working_source.includes('日超除外)') ? `レポート値（${r.fba_inbound_working_source.match(/\d+/)?.[0] || '3'}日超で除外済み）` : 'レポートから取得'}">${r.fba_inbound_working || 0}${r.fba_inbound_working_source === 'API' ? '<span style="font-size:9px;color:#2563eb;"> ⚡</span>' : ''}</td>
@@ -1762,7 +1768,7 @@ Step10: アラート判定</pre>
           <td style="text-align:center;color:#666;">${num}</td>
           <td>${r.urgency_score}</td>
           <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')">${r.amazon_sku}</span></td>
-          <td class="product-name" title="${r.product_name || ''}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;">${r.product_name || ''}</a>` : (r.product_name || '')}</td>
+          <td class="product-name" title="${esc(r.product_name)}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;">${esc(r.product_name)}</a>` : esc(r.product_name)}</td>
           ${renderComponentCell(r)}
           <td>${r.fba_available}</td>
           <td style="${r.fba_inbound_working > 0 ? (r.fba_inbound_working_source === 'API' ? 'color:#2563eb;font-weight:bold' : 'color:#16a34a') : 'color:#ccc'}">${r.fba_inbound_working || 0}${r.fba_inbound_working_source === 'API' ? '<span style="font-size:9px;color:#2563eb;"> ⚡</span>' : ''}</td>
@@ -1946,7 +1952,7 @@ Step10: アラート判定</pre>
           <td style="text-align:center;color:#666;font-size:11px;">${num}</td>
           <td>${statusHtml}</td>
           <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')">${r.amazon_sku}</span></td>
-          <td class="product-name" title="${r.product_name || ''}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${r.product_name || ''}</a>` : (r.product_name || '')}</td>
+          <td class="product-name" title="${esc(r.product_name)}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${esc(r.product_name)}</a>` : esc(r.product_name)}</td>
           ${renderComponentCell(r)}
           <td>${r.fba_available}</td>
           <td style="${r.fba_inbound_working > 0 ? (r.fba_inbound_working_source === 'API' ? 'color:#2563eb;font-weight:bold' : 'color:#16a34a') : 'color:#ccc'}">${r.fba_inbound_working || 0}${r.fba_inbound_working_source === 'API' ? '<span style="font-size:9px;color:#2563eb;"> ⚡</span>' : ''}</td>
@@ -2279,7 +2285,7 @@ Step10: アラート判定</pre>
           <td style="text-align:center;color:#666;font-size:11px;">${num}</td>
           <td>${statusHtml}</td>
           <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')">${r.amazon_sku}</span></td>
-          <td class="product-name" title="${r.product_name || ''}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${r.product_name || ''}</a>` : (r.product_name || '')}</td>
+          <td class="product-name" title="${esc(r.product_name)}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${esc(r.product_name)}</a>` : esc(r.product_name)}</td>
           ${renderComponentCell(r)}
           <td>${r.fba_available ?? '-'}</td>
           <td style="${r.fba_inbound_working > 0 ? (r.fba_inbound_working_source === 'API' ? 'color:#2563eb;font-weight:bold' : 'color:#16a34a') : 'color:#ccc'}">${r.fba_inbound_working || 0}${r.fba_inbound_working_source === 'API' ? '<span style="font-size:9px;color:#2563eb;"> ⚡</span>' : ''}</td>
