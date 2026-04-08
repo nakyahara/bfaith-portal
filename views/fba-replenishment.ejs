@@ -1047,6 +1047,7 @@
       }
       skuInput.value = '';
       qtyInput.value = '';
+      document.getElementById('recSection').style.display = '';
       filterRecList();
       // サマリー更新（手動追加を含む）
       const allRec = [...recData.filter(r => r.recommended_qty > 0), ...manualItems];
@@ -2100,6 +2101,7 @@ Step10: アラート判定</pre>
 
       // 追加があれば納品推奨タブに切り替え
       if (addedCount > 0) {
+        document.getElementById('recSection').style.display = '';
         setTimeout(() => switchTab('ship'), 500);
       }
     }
@@ -2426,6 +2428,7 @@ Step10: アラート判定</pre>
 
       // 追加があれば納品推奨タブに切り替え
       if (addedCount > 0) {
+        document.getElementById('recSection').style.display = '';
         setTimeout(() => switchTab('ship'), 500);
       }
     }
