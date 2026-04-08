@@ -630,6 +630,13 @@ function renderPage() {
         <div id="excludedInfo"></div>
       </div>
 
+      <!-- 変動費サマリー -->
+      <div class="card">
+        <h2>変動費サマリー</h2>
+        <div id="costSummary"><span class="meta">店舗別仕訳書CSVを取り込むと表示されます</span></div>
+        <div id="costBySegment" style="margin-top:12px"></div>
+      </div>
+
       <!-- その他明細 -->
       <div id="otherDetailCard" class="card" style="display:none">
         <h2>「その他/未分類」明細</h2>
@@ -849,6 +856,21 @@ function renderPage() {
       return ad;
     }
 
+    function getBillingTotals() {
+      if (!billingData || !billingData.rows) return null;
+      // 請求行のみの合計（= 楽天から請求される経費合計）
+      let seikyuTotal = 0;
+      for (const row of billingData.rows) {
+        if (row['支払/相殺区分'] === '請求') {
+          seikyuTotal += (row.金額 || 0);
+        }
+      }
+      const adCost = getAdCostFromBilling();
+      const coupon = lastData ? (lastData.byTax['10'].クーポン値引額 + lastData.byTax['8'].クーポン値引額) : 0;
+      const pfFee = seikyuTotal - adCost - coupon;
+      return { seikyuTotal, adCost, coupon, pfFee };
+    }
+
     function updateConfirmState() {
       const ready = lastData && billingData;
       document.getElementById('confirmBtn').disabled = !ready;
@@ -867,48 +889,61 @@ function renderPage() {
       }
     }
 
-    function renderSegmentTable(data) {
-      const ad = getAdCostFromBilling();
-      const seg = data.bySegment;
-
-      // 広告費をセグメント1・2の売上按分
-      const adTargets = ['1', '2'];
+    // 按分計算ヘルパー（丸め誤差を最大セグメントに吸収）
+    function allocateByRatio(amount, salesByKey, targets) {
       let totalSales = 0;
-      const salesByKey = {};
-      for (const [key, row] of Object.entries(seg)) { salesByKey[key] = row.売上合計 || 0; if (adTargets.includes(key)) totalSales += salesByKey[key]; }
-      const adByKey = {};
-      let adSum = 0;
-      for (const key of Object.keys(seg)) {
-        if (!adTargets.includes(key) || totalSales === 0) { adByKey[key] = 0; continue; }
-        adByKey[key] = Math.round(ad * salesByKey[key] / totalSales); adSum += adByKey[key];
+      for (const k of targets) totalSales += (salesByKey[k] || 0);
+      const result = {};
+      let sum = 0;
+      for (const k of Object.keys(salesByKey)) {
+        if (!targets.includes(k) || totalSales === 0) { result[k] = 0; continue; }
+        result[k] = Math.round(amount * salesByKey[k] / totalSales);
+        sum += result[k];
       }
-      if (ad && totalSales > 0) {
-        const maxKey = Object.keys(seg).filter(k => adTargets.includes(k)).sort((a, b) => (salesByKey[b]||0) - (salesByKey[a]||0))[0];
-        if (maxKey) adByKey[maxKey] += (ad - adSum);
+      if (amount && totalSales > 0) {
+        const maxKey = targets.sort((a, b) => (salesByKey[b]||0) - (salesByKey[a]||0))[0];
+        if (maxKey) result[maxKey] += (amount - sum);
       }
+      return result;
+    }
 
-      let html = '<table><tr><th>セグメント</th><th>売上合計</th><th>クーポン値引額</th><th>クーポン値引後売上</th><th>広告費</th><th>原価合計</th><th>粗利率</th><th>行数</th></tr>';
+    function renderSegmentTable(data) {
+      const seg = data.bySegment;
+      const bt = getBillingTotals();
+      const ad = bt ? bt.adCost : 0;
+      const pf = bt ? bt.pfFee : 0;
+
+      // セグメント1・2・3の売上按分
+      const allocTargets = ['1', '2', '3'];
+      const salesByKey = {};
+      for (const [key, row] of Object.entries(seg)) { salesByKey[key] = row.売上合計 || 0; }
+      const adByKey = allocateByRatio(ad, salesByKey, allocTargets);
+      const pfByKey = allocateByRatio(pf, salesByKey, allocTargets);
+
+      let html = '<table><tr><th>セグメント</th><th>売上合計</th><th>クーポン値引額</th><th>クーポン値引後売上</th><th>PF手数料</th><th>広告費</th><th>原価合計</th><th>粗利率</th><th>行数</th></tr>';
       let tot = { 売上合計: 0, クーポン値引額: 0, クーポン値引後売上: 0, 原価合計: 0, 行数: 0 };
-      let totAd = 0;
+      let totAd = 0, totPf = 0;
       for (const [key, row] of Object.entries(seg)) {
         const label = data.segmentNames[key] || (key === 'other' ? 'その他/未分類' : key);
         html += '<tr><td>' + key + ': ' + label + '</td>';
         html += '<td class="num">' + fmt(row.売上合計) + '</td>';
         html += '<td class="num">' + fmt(row.クーポン値引額) + '</td>';
         html += '<td class="num">' + fmt(row.クーポン値引後売上) + '</td>';
+        html += '<td class="num">' + fmt(pfByKey[key] || 0) + '</td>';
         html += '<td class="num">' + fmt(adByKey[key] || 0) + '</td>';
         html += '<td class="num">' + fmt(row.原価合計) + '</td>';
         html += '<td class="num">' + (row.粗利率 || '0.0') + '%</td>';
         html += '<td class="num">' + row.行数 + '</td></tr>';
         tot.売上合計 += row.売上合計; tot.クーポン値引額 += row.クーポン値引額;
         tot.クーポン値引後売上 += row.クーポン値引後売上; tot.原価合計 += row.原価合計; tot.行数 += row.行数;
-        totAd += (adByKey[key] || 0);
+        totAd += (adByKey[key] || 0); totPf += (pfByKey[key] || 0);
       }
       const totGross = tot.クーポン値引後売上 > 0 ? ((tot.クーポン値引後売上 - tot.原価合計) / tot.クーポン値引後売上 * 100).toFixed(1) : '0.0';
       html += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td>';
       html += '<td class="num">' + fmt(tot.売上合計) + '</td>';
       html += '<td class="num">' + fmt(tot.クーポン値引額) + '</td>';
       html += '<td class="num">' + fmt(tot.クーポン値引後売上) + '</td>';
+      html += '<td class="num">' + fmt(totPf) + '</td>';
       html += '<td class="num">' + fmt(totAd) + '</td>';
       html += '<td class="num">' + fmt(tot.原価合計) + '</td>';
       html += '<td class="num">' + totGross + '%</td>';
@@ -926,6 +961,45 @@ function renderPage() {
         }
       }
       document.getElementById('excludedInfo').innerHTML = exclHtml;
+
+      // 変動費サマリー
+      if (bt) {
+        let csHtml = '<table><tr><th>PF手数料</th><th>運賃</th><th>広告費</th><th>店舗発行クーポン利用分</th><th>合計</th></tr>';
+        csHtml += '<tr>';
+        csHtml += '<td class="num" style="font-weight:bold">' + fmt(bt.pfFee) + '</td>';
+        csHtml += '<td class="num" style="color:#aaa">-</td>';
+        csHtml += '<td class="num" style="font-weight:bold">' + fmt(bt.adCost) + '</td>';
+        csHtml += '<td class="num" style="font-weight:bold">' + fmt(bt.coupon) + '</td>';
+        csHtml += '<td class="num" style="font-weight:bold">' + fmt(bt.seikyuTotal) + '</td>';
+        csHtml += '</tr></table>';
+        csHtml += '<p class="meta" style="margin-top:4px">PF手数料 = 請求合計(' + fmt(bt.seikyuTotal) + ') − 広告費(' + fmt(bt.adCost) + ') − クーポン(' + fmt(bt.coupon) + ')</p>';
+        document.getElementById('costSummary').innerHTML = csHtml;
+
+        // セグメント別変動費按分テーブル
+        let cbHtml = '<table><tr><th>セグメント</th><th>売上比率</th><th>PF手数料</th><th>広告費</th><th>変動費合計</th></tr>';
+        let cbTotPf = 0, cbTotAd = 0;
+        for (const [key, row] of Object.entries(seg)) {
+          const label = data.segmentNames[key] || (key === 'other' ? 'その他/未分類' : key);
+          const ratio = tot.売上合計 > 0 ? (row.売上合計 / tot.売上合計 * 100).toFixed(1) : '0.0';
+          const segPf = pfByKey[key] || 0;
+          const segAd = adByKey[key] || 0;
+          cbHtml += '<tr><td>' + key + ': ' + label + '</td>';
+          cbHtml += '<td class="num">' + ratio + '%</td>';
+          cbHtml += '<td class="num">' + fmt(segPf) + '</td>';
+          cbHtml += '<td class="num">' + fmt(segAd) + '</td>';
+          cbHtml += '<td class="num" style="font-weight:bold">' + fmt(segPf + segAd) + '</td></tr>';
+          cbTotPf += segPf; cbTotAd += segAd;
+        }
+        cbHtml += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td>';
+        cbHtml += '<td class="num">100%</td>';
+        cbHtml += '<td class="num">' + fmt(cbTotPf) + '</td>';
+        cbHtml += '<td class="num">' + fmt(cbTotAd) + '</td>';
+        cbHtml += '<td class="num">' + fmt(cbTotPf + cbTotAd) + '</td></tr></table>';
+        document.getElementById('costBySegment').innerHTML = cbHtml;
+      } else {
+        document.getElementById('costSummary').innerHTML = '<span class="meta">店舗別仕訳書CSVを取り込むと表示されます</span>';
+        document.getElementById('costBySegment').innerHTML = '';
+      }
     }
 
     function updateAdCost() { /* legacy: no-op */ }
