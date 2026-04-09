@@ -1612,7 +1612,7 @@ Step10: アラート判定</pre>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">INVENTORYレポートがFATAL</td><td style="padding:6px;border:1px solid #e5e7eb;">リトライで解消。UNSUPPRESSED→ALL_INVENTORYのフォールバック実装済み。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">「レポート取得中です」エラー</td><td style="padding:6px;border:1px solid #e5e7eb;">前回のフェッチ未完了。1〜2分待ってリトライ。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">昨日送った商品がまた推奨に上がる</td><td style="padding:6px;border:1px solid #e5e7eb;">セラセンでプラン作成済みなら、翌日のSP-APIレポートで「準備中」に反映される。Step1を毎日実行すれば問題なし。反映にタイムラグあり（数時間〜翌日）。</td></tr>
-              <tr><td style="padding:6px;border:1px solid #e5e7eb;">仮確定データが消えた</td><td style="padding:6px;border:1px solid #e5e7eb;">「仮確定に移動」で上書きされる仕様。NE CSV出力前に誤って移動しないよう注意。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">仮確定データが消えた</td><td style="padding:6px;border:1px solid #e5e7eb;">「仮確定に移動」は差分マージ方式（既存データを保持して追加・更新）。全件クリアしたい場合は仮確定タブの「クリア」ボタンを使用。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">NE CSVの商品コードが空</td><td style="padding:6px;border:1px solid #e5e7eb;">SKUマッピングにNE商品コードがない。Google Sheetsの変換テーブルにD列（NE商品コード）を追加。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">セラセンで数量変更したい</td><td style="padding:6px;border:1px solid #e5e7eb;">セラセンで直接変更、またはプラン削除→ツールで数量変更→再度Excel出力。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">デプロイ後にデータが消えた</td><td style="padding:6px;border:1px solid #e5e7eb;">RenderデプロイでSQLiteがリセットされる。Step1〜3を再実行すれば復元。仮確定データ・出力履歴も消えるので注意。</td></tr>
@@ -3172,10 +3172,22 @@ Step10: アラート判定</pre>
         return;
       }
 
-      if (!confirm(`${checkedItems.length}件を仮確定に移動します。納品推奨のチェックはリセットされます。よろしいですか？`)) return;
+      // 既存の仮確定データがあるか確認
+      let existingCount = 0;
+      try {
+        const pRes = await fetch(`${BASE}/api/provisional`);
+        const pData = await pRes.json();
+        existingCount = (pData.items || []).length;
+      } catch(e) { /* ignore */ }
+
+      const msg = existingCount > 0
+        ? `${checkedItems.length}件を仮確定に追加します（既存${existingCount}件は保持）。納品推奨のチェックはリセットされます。よろしいですか？`
+        : `${checkedItems.length}件を仮確定に移動します。納品推奨のチェックはリセットされます。よろしいですか？`;
+      if (!confirm(msg)) return;
 
       try {
-        const res = await fetch(`${BASE}/api/provisional`, {
+        // マージAPI（既存データを保持しつつ追加・更新）
+        const res = await fetch(`${BASE}/api/provisional/merge`, {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({items: checkedItems}),
@@ -3190,7 +3202,10 @@ Step10: アラート判定</pre>
 
         await loadProvisionalData();
         switchTab('provisional');
-        log(`仮確定に${checkedItems.length}件移動しました`);
+        const mergeMsg = existingCount > 0
+          ? `${checkedItems.length}件を追加しました（合計${d.total}件）`
+          : `仮確定に${checkedItems.length}件移動しました`;
+        log(mergeMsg);
       } catch(e) {
         alert('エラー: ' + e.message);
       }

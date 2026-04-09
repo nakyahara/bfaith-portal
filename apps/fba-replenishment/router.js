@@ -11,7 +11,7 @@ import { initDb, savePlanningData, getLatestSnapshots, getAllSnapshotSkus, getSe
          getStockoutHidden, hideStockoutSku, unhideStockoutSku, hideStockoutSkuBulk,
          getNewProductHidden, hideNewProductSkuBulk, unhideNewProductSku,
          saveDraft, getDraft, clearDraft, updateFnskuBatch,
-         saveProvisionalItems, getProvisionalItems, clearProvisionalItems,
+         saveProvisionalItems, mergeProvisionalItems, getProvisionalItems, clearProvisionalItems,
          updateProvisionalItemQty, removeProvisionalItem,
          saveExportHistory, getExportHistoryList, getExportHistoryFile } from './db.js';
 import { fetchAllReports, normalizePlanningRow } from './sp-api-reports.js';
@@ -661,6 +661,20 @@ router.post('/api/provisional', express.json(), (req, res) => {
     res.json({ success: true, count });
   } catch (e) {
     console.error('[FBA] 仮確定保存エラー:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 仮確定データに差分マージ（既存データを保持しつつ追加・更新）
+router.post('/api/provisional/merge', express.json(), (req, res) => {
+  const { items } = req.body;
+  if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items[] が必要です' });
+  try {
+    const count = mergeProvisionalItems(items);
+    const result = getProvisionalItems();
+    res.json({ success: true, merged: count, total: result.items.length });
+  } catch (e) {
+    console.error('[FBA] 仮確定マージエラー:', e);
     res.status(500).json({ error: e.message });
   }
 });

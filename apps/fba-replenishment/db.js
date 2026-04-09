@@ -939,6 +939,63 @@ export function saveProvisionalItems(items) {
   }
 }
 
+/**
+ * 既存の仮確定データに差分マージ（同一SKUは更新、新規は追加）
+ */
+export function mergeProvisionalItems(items) {
+  db.run('BEGIN TRANSACTION');
+  try {
+    for (const item of items) {
+      db.run(`
+        INSERT INTO provisional_items
+          (amazon_sku, product_name, fnsku, ship_qty, fba_available,
+           units_sold_7d, units_sold_30d, warehouse_raw,
+           recommended_qty, urgency_score, set_components, asin, expiry_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(amazon_sku) DO UPDATE SET
+          product_name=excluded.product_name,
+          fnsku=excluded.fnsku,
+          ship_qty=excluded.ship_qty,
+          fba_available=excluded.fba_available,
+          units_sold_7d=excluded.units_sold_7d,
+          units_sold_30d=excluded.units_sold_30d,
+          warehouse_raw=excluded.warehouse_raw,
+          recommended_qty=excluded.recommended_qty,
+          urgency_score=excluded.urgency_score,
+          set_components=excluded.set_components,
+          asin=excluded.asin,
+          expiry_date=excluded.expiry_date
+      `, [
+        item.amazon_sku,
+        item.product_name || null,
+        item.fnsku || null,
+        parseInt(item.ship_qty || 0),
+        parseInt(item.fba_available || 0),
+        parseInt(item.units_sold_7d || 0),
+        parseInt(item.units_sold_30d || 0),
+        parseInt(item.warehouse_raw || 0),
+        parseInt(item.recommended_qty || 0),
+        parseFloat(item.urgency_score || 0),
+        item.set_components || null,
+        item.asin || null,
+        item.expiry_date || null,
+      ]);
+    }
+    // メタ情報を更新
+    const count = queryOne('SELECT COUNT(*) as cnt FROM provisional_items');
+    const total = queryOne('SELECT SUM(ship_qty) as total FROM provisional_items');
+    db.run(`INSERT OR REPLACE INTO provisional_meta (key, value) VALUES ('saved_at', datetime('now','localtime'))`);
+    db.run(`INSERT OR REPLACE INTO provisional_meta (key, value) VALUES ('item_count', ?)`, [String(count?.cnt || 0)]);
+    db.run(`INSERT OR REPLACE INTO provisional_meta (key, value) VALUES ('total_qty', ?)`, [String(total?.total || 0)]);
+    db.run('COMMIT');
+    saveToFile();
+    return items.length;
+  } catch (e) {
+    db.run('ROLLBACK');
+    throw e;
+  }
+}
+
 export function getProvisionalItems() {
   const items = queryAll('SELECT * FROM provisional_items ORDER BY urgency_score DESC');
   const metaRows = queryAll('SELECT * FROM provisional_meta');
