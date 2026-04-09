@@ -1397,7 +1397,12 @@
      - ツールで数量変更
      - 再度Excel出力 → セラセン取り込み
   ⑪ 危険物FNSKUを「このFNSKUだけ選択」→ Excel出力 → 別プラン確定
-  ⑫ 全プラン確定後「NE受注CSV出力」→ NextEngineにアップロード</pre>
+  ⑫ 全プラン確定後「NE受注CSV出力」→ NextEngineにアップロード
+
+★ 入れ忘れ・追加が発生した場合
+  → 納品推奨タブに戻って追加商品を選択
+  → 「仮確定に移動」で既存の仮確定に追加される（前回分は消えません）
+  → 同じSKUは数量が更新、新しいSKUは追加されます</pre>
             <p style="font-size:11px;color:#666;margin-top:8px;">※ 初回は300+SKUが推奨に上がりますが、低回転商品に半年分を送ると2〜3週間で50〜80SKU/日に収束します。</p>
           </div>
 
@@ -1405,6 +1410,7 @@
             <h4>Amazon仮確定タブの使い方</h4>
             <table style="width:100%;font-size:12px;border-collapse:collapse;">
               <tr style="background:#f3f4f6;"><th style="padding:6px;border:1px solid #e5e7eb;">操作</th><th style="padding:6px;border:1px solid #e5e7eb;">説明</th></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;font-weight:bold;color:#7c3aed;">商品を追加</td><td style="padding:6px;border:1px solid #e5e7eb;">納品推奨タブで追加商品を選んで「仮確定に移動」→ <strong>既存データを保持したまま追加</strong>されます。同じSKUは数量が上書き更新されます。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;font-weight:bold;">納品Excel出力</td><td style="padding:6px;border:1px solid #e5e7eb;">チェック済み商品のExcelを出力。セラセンの「ファイルをアップロード」で取り込む。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;font-weight:bold;">NE受注CSV出力</td><td style="padding:6px;border:1px solid #e5e7eb;">仮確定リスト<strong>全件</strong>をNE受注伝票CSVとして出力。SKU→NE商品コード変換+数量按分が自動。プラン分割に関係なく1伝票。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;font-weight:bold;">FNSKU除外</td><td style="padding:6px;border:1px solid #e5e7eb;">入力したFNSKUに該当する商品のチェックを外す。危険物プラン分けに使用。</td></tr>
