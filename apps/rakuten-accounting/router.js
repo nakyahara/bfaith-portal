@@ -691,6 +691,33 @@ function renderPage() {
       return n < 0 ? '<span class="negative">' + s + '</span>' : s;
     };
 
+    // ─── リトライ付きfetchヘルパー（Renderスリープ復帰対応）───
+    async function fetchWithRetry(url, options, maxRetries = 2) {
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+          const r = await fetch(url, options);
+          // セッション切れ（ログインページへリダイレクト）を検出
+          if (r.redirected && r.url.includes('/login')) {
+            throw new Error('セッションが切れました。ページを再読み込みしてログインし直してください。');
+          }
+          // サーバーエラー（502/503はRenderのスリープ復帰中の可能性）
+          if ((r.status === 502 || r.status === 503) && attempt < maxRetries) {
+            await new Promise(ok => setTimeout(ok, 3000));
+            continue;
+          }
+          return r;
+        } catch(e) {
+          if (e.message.includes('セッション')) throw e;
+          // ネットワークエラー（Failed to fetch）はリトライ
+          if (attempt < maxRetries) {
+            await new Promise(ok => setTimeout(ok, 3000));
+            continue;
+          }
+          throw new Error('サーバーに接続できません（' + e.message + '）。Renderがスリープ中の可能性があります。ページを再読み込みしてから再度お試しください。');
+        }
+      }
+    }
+
     // ─── 工程1: アップロード ───
     async function doUpload() {
       const fileInput = document.getElementById('csvFiles');
@@ -704,7 +731,13 @@ function renderPage() {
       for (const f of fileInput.files) formData.append('files', f);
 
       try {
-        const r = await fetch(location.pathname + '/upload', { method: 'POST', body: formData });
+        const r = await fetchWithRetry(location.pathname + '/upload', { method: 'POST', body: formData });
+        if (!r.ok) {
+          const text = await r.text();
+          try { const j = JSON.parse(text); document.getElementById('uploadStatus').innerHTML = '<span class="negative">エラー: ' + (j.error || r.status) + '</span>'; }
+          catch { document.getElementById('uploadStatus').innerHTML = '<span class="negative">サーバーエラー (HTTP ' + r.status + ')</span>'; }
+          return;
+        }
         const data = await r.json();
         if (data.error) { document.getElementById('uploadStatus').innerHTML = '<span class="negative">エラー: ' + data.error + '</span>'; return; }
         showResult(data);
@@ -1023,7 +1056,13 @@ function renderPage() {
       formData.append('file', fileInput.files[0]);
 
       try {
-        const r = await fetch(location.pathname + '/upload-billing', { method: 'POST', body: formData });
+        const r = await fetchWithRetry(location.pathname + '/upload-billing', { method: 'POST', body: formData });
+        if (!r.ok) {
+          const text = await r.text();
+          try { const j = JSON.parse(text); document.getElementById('billingResult').innerHTML = '<div class="err">' + (j.error || r.status) + '</div>'; }
+          catch { document.getElementById('billingResult').innerHTML = '<div class="err">サーバーエラー (HTTP ' + r.status + ')</div>'; }
+          return;
+        }
         const data = await r.json();
         if (data.error) { document.getElementById('billingResult').innerHTML = '<div class="err">' + data.error + '</div>'; return; }
         billingData = data;
@@ -1053,7 +1092,7 @@ function renderPage() {
       btn.textContent = '保存中...';
       try {
         const adCost = getAdCostFromBilling();
-        const r = await fetch(location.pathname + '/confirm', {
+        const r = await fetchWithRetry(location.pathname + '/confirm', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1086,7 +1125,7 @@ function renderPage() {
     // ─── 過去データ ───
     async function loadHistory() {
       try {
-        const r = await fetch(location.pathname + '/history');
+        const r = await fetchWithRetry(location.pathname + '/history', {});
         const rows = await r.json();
         if (!rows.length) {
           document.getElementById('historyList').innerHTML = '<span class="meta">確定データはまだありません</span>';
@@ -1196,7 +1235,7 @@ function renderPage() {
 
     async function downloadHistoryCsv() {
       try {
-        const r = await fetch(location.pathname + '/history');
+        const r = await fetchWithRetry(location.pathname + '/history', {});
         const rows = await r.json();
         if (!rows.length) { alert('確定データがありません'); return; }
 
