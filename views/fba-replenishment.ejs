@@ -616,6 +616,24 @@
   <script>
     const BASE = '/apps/fba-replenishment';
 
+    // ジョブポーリング（ミニPC側のジョブマネージャー対応）
+    async function pollJob(jobId, { intervalMs = 3000, maxWaitMs = 300000, onProgress } = {}) {
+      const start = Date.now();
+      while (Date.now() - start < maxWaitMs) {
+        await new Promise(r => setTimeout(r, intervalMs));
+        try {
+          const res = await fetch(`${BASE}/api/jobs/${jobId}`);
+          const d = await res.json();
+          if (d.status === 'completed') return d;
+          if (d.status === 'failed') return { error: d.error || 'ジョブが失敗しました', message: d.message };
+          if (onProgress) onProgress(Math.round((Date.now() - start) / 1000), d);
+        } catch (e) {
+          // 一時的な通信エラーは無視してリトライ
+        }
+      }
+      return { error: 'タイムアウト: ジョブが完了しませんでした（5分）' };
+    }
+
     // HTMLエスケープ（商品名等をHTML属性・テキストに安全に埋め込む）
     function esc(s) {
       if (!s) return '';
@@ -776,10 +794,29 @@
       try {
         const res = await fetch(`${BASE}/api/fetch-reports`, { method: 'POST' });
         const d = await res.json();
-        if (d.error) { log('エラー: ' + d.error); return; }
-        log(`完了! PLANNING: ${d.planning.count}件, RESTOCK: ${d.restock.count}件, INVENTORY: ${d.inventory.count}件`);
-        if (d.errors.length > 0) {
-          d.errors.forEach(e => log(`警告: ${e.report} - ${e.error}`));
+        if (d.error) { log('エラー: ' + (d.message || d.error)); return; }
+
+        let result = d;
+
+        // ジョブ方式: jobIdが返ってきたらポーリング
+        if (d.jobId) {
+          log(`ジョブ開始 (${d.jobId.slice(0, 8)}...)  SP-APIレポート取得中...`);
+          const jobResult = await pollJob(d.jobId, {
+            onProgress: (sec) => log(`SP-APIレポート取得中... (${sec}秒経過)`),
+          });
+          if (jobResult.error) {
+            log('エラー: ' + (jobResult.message || jobResult.error));
+            return;
+          }
+          result = jobResult.result || jobResult;
+        }
+
+        const planning = result.planning || {};
+        const restock = result.restock || {};
+        const inventory = result.inventory || {};
+        log(`完了! PLANNING: ${planning.count ?? 0}件, RESTOCK: ${restock.count ?? 0}件, INVENTORY: ${inventory.count ?? 0}件`);
+        if (result.errors && result.errors.length > 0) {
+          result.errors.forEach(e => log(`警告: ${e.report} - ${e.error}`));
         }
         loadStatus();
         completeStep(1);
@@ -2635,12 +2672,28 @@ Step10: アラート判定</pre>
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ items: checkedItems }),
         });
-        const d = await res.json();
+        let d = await res.json();
 
         if (d.error) {
-          showInboundModal('error', { error: d.error });
-          log('納品プラン作成エラー: ' + d.error);
+          showInboundModal('error', { error: d.message || d.error });
+          log('納品プラン作成エラー: ' + (d.message || d.error));
           return;
+        }
+
+        // ジョブ方式: jobIdが返ってきたらポーリング
+        if (d.jobId) {
+          log(`納品プラン作成ジョブ開始...`);
+          const jobResult = await pollJob(d.jobId, {
+            intervalMs: 2000,
+            maxWaitMs: 120000,
+            onProgress: (sec) => log(`納品プラン作成中... (${sec}秒経過)`),
+          });
+          if (jobResult.error) {
+            showInboundModal('error', { error: jobResult.message || jobResult.error });
+            log('納品プラン作成エラー: ' + (jobResult.message || jobResult.error));
+            return;
+          }
+          d = jobResult.result || jobResult;
         }
 
         if (d.success) {
@@ -3419,14 +3472,21 @@ Step10: アラート判定</pre>
           };
         })}),
         });
-        const d = await res.json();
+        let d = await res.json();
         if (d.error) {
-          log('エラー: ' + d.error);
+          log('エラー: ' + (d.message || d.error));
           if (d.details) log('詳細: ' + JSON.stringify(d.details));
           if (d.errorSkus && d.errorSkus.length > 0) {
             log('エラーSKU: ' + d.errorSkus.map(s => `${s.sku} (${s.name || ''})`).join(', '));
           }
           return;
+        }
+        // ジョブ方式対応
+        if (d.jobId) {
+          log('納品プラン作成ジョブ開始...');
+          const jobResult = await pollJob(d.jobId, { intervalMs: 2000, maxWaitMs: 120000 });
+          if (jobResult.error) { log('エラー: ' + (jobResult.message || jobResult.error)); return; }
+          d = jobResult.result || jobResult;
         }
         const planUrl = `https://sellercentral-japan.amazon.com/fba/sendtoamazon/confirm_content_step?wf=${d.inboundPlanId}`;
         log(`納品プラン作成成功! <a href="${planUrl}" target="_blank" style="color:#2563eb;">Seller Centralで開く ↗</a> (プランID: ${d.inboundPlanId})`);
