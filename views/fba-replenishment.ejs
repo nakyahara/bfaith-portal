@@ -624,9 +624,11 @@
         try {
           const res = await fetch(`${BASE}/api/jobs/${jobId}`);
           const d = await res.json();
-          if (d.status === 'completed') return d;
-          if (d.status === 'failed') return { error: d.error || 'ジョブが失敗しました', message: d.message };
-          if (onProgress) onProgress(Math.round((Date.now() - start) / 1000), d);
+          // レスポンスは { ok, job: { status, result, ... } } の形式
+          const job = d.job || d;
+          if (job.status === 'completed') return job;
+          if (job.status === 'failed') return { error: job.error?.message || job.error || 'ジョブが失敗しました' };
+          if (onProgress) onProgress(Math.round((Date.now() - start) / 1000), job);
         } catch (e) {
           // 一時的な通信エラーは無視してリトライ
         }
