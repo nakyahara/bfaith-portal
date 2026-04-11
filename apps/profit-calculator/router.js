@@ -80,8 +80,9 @@ router.get('/amazon-manual', (req, res) => {
   res.sendFile(path.join(__dirname, 'amazon-manual.html'));
 });
 
+// 価格改定ツール: 凍結中（2026-04-11）
 router.get('/price-revision', (req, res) => {
-  res.sendFile(path.join(__dirname, 'price-revision.html'));
+  res.status(503).send('<h2>価格改定ツールは現在凍結中です</h2><p><a href="/apps/profit-calculator/">リサーチツールに戻る</a></p>');
 });
 
 router.get('/suppliers', (req, res) => {
@@ -96,8 +97,9 @@ router.get('/settings', (req, res) => {
   res.sendFile(path.join(__dirname, 'settings.html'));
 });
 
+// 価格改定ツール: 凍結中（2026-04-11）
 router.get('/price-revision', (req, res) => {
-  res.sendFile(path.join(__dirname, 'price-revision.html'));
+  res.status(503).send('<h2>価格改定ツールは現在凍結中です</h2><p><a href="/apps/profit-calculator/">リサーチツールに戻る</a></p>');
 });
 
 // 旧URL互換
