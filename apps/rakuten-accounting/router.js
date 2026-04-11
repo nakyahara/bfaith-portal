@@ -1335,11 +1335,11 @@ function renderPage() {
     function downloadDetailCsv() {
       if (!lastData || !lastData.detailRows) { alert('先に注文データCSVをアップロードしてください'); return; }
       const rows = lastData.detailRows;
-      let csv = '\uFEFF';
-      csv += '注文番号,注文確定日時,商品コード,商品名,単価,個数,売上合計,按分クーポン,クーポン値引後売上,原価,原価合計,税率,セグメント\n';
+      let csv = '\\uFEFF';
+      csv += '注文番号,注文確定日時,商品コード,商品名,単価,個数,売上合計,按分クーポン,クーポン値引後売上,原価,原価合計,税率,セグメント\\n';
       for (const r of rows) {
         const name = (r.商品名 || '').replace(/"/g, '""');
-        csv += r.注文番号 + ',' + r.注文確定日時 + ',' + r.商品コード + ',"' + name + '",' + r.単価 + ',' + r.個数 + ',' + r.売上合計 + ',' + r.按分クーポン + ',' + r.クーポン値引後売上 + ',' + r.原価 + ',' + r.原価合計 + ',' + r.税率 + ',' + r.セグメント + '\n';
+        csv += r.注文番号 + ',' + r.注文確定日時 + ',' + r.商品コード + ',"' + name + '",' + r.単価 + ',' + r.個数 + ',' + r.売上合計 + ',' + r.按分クーポン + ',' + r.クーポン値引後売上 + ',' + r.原価 + ',' + r.原価合計 + ',' + r.税率 + ',' + r.セグメント + '\\n';
       }
       const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
       const a = document.createElement('a');
@@ -1352,28 +1352,28 @@ function renderPage() {
     function downloadSummaryCsv() {
       if (!lastData) { alert('先に注文データCSVをアップロードしてください'); return; }
       const data = lastData;
-      let csv = '\uFEFF';
+      let csv = '\\uFEFF';
 
       // 税率別集計
-      csv += '【税率別集計】\n';
-      csv += '税率,売上合計,クーポン値引額,クーポン値引後売上,原価合計,行数\n';
+      csv += '【税率別集計】\\n';
+      csv += '税率,売上合計,クーポン値引額,クーポン値引後売上,原価合計,行数\\n';
       const bt = data.byTax;
       let tTot = { s:0, c:0, a:0, g:0, n:0 };
       for (const [key, row] of Object.entries(bt)) {
-        csv += key + '%,' + Math.round(row.売上合計) + ',' + Math.round(row.クーポン値引額) + ',' + Math.round(row.クーポン値引後売上) + ',' + Math.round(row.原価合計) + ',' + row.行数 + '\n';
+        csv += key + '%,' + Math.round(row.売上合計) + ',' + Math.round(row.クーポン値引額) + ',' + Math.round(row.クーポン値引後売上) + ',' + Math.round(row.原価合計) + ',' + row.行数 + '\\n';
         tTot.s += row.売上合計; tTot.c += row.クーポン値引額; tTot.a += row.クーポン値引後売上; tTot.g += row.原価合計; tTot.n += row.行数;
       }
-      csv += '合計,' + Math.round(tTot.s) + ',' + Math.round(tTot.c) + ',' + Math.round(tTot.a) + ',' + Math.round(tTot.g) + ',' + tTot.n + '\n';
+      csv += '合計,' + Math.round(tTot.s) + ',' + Math.round(tTot.c) + ',' + Math.round(tTot.a) + ',' + Math.round(tTot.g) + ',' + tTot.n + '\\n';
 
       // MF連携用
-      csv += '\n【MF連携用 税込み集計】\n';
-      csv += '商品売上(10%),商品売上(8%),合計\n';
+      csv += '\\n【MF連携用 税込み集計】\\n';
+      csv += '商品売上(10%),商品売上(8%),合計\\n';
       const mf = data.mfRow;
-      csv += (mf['商品売上(10%)']||0) + ',' + (mf['商品売上(8%)']||0) + ',' + (mf['合計']||0) + '\n';
+      csv += (mf['商品売上(10%)']||0) + ',' + (mf['商品売上(8%)']||0) + ',' + (mf['合計']||0) + '\\n';
 
       // セグメント別集計
-      csv += '\n【セグメント別集計】\n';
-      csv += 'セグメント,売上合計,クーポン値引額,クーポン値引後売上,原価合計,原価率,行数\n';
+      csv += '\\n【セグメント別集計】\\n';
+      csv += 'セグメント,売上合計,クーポン値引額,クーポン値引後売上,原価合計,原価率,行数\\n';
       const seg = data.bySegment;
       const segNames = data.segmentNames || {};
       let sTot = { s:0, c:0, a:0, g:0, n:0 };
@@ -1381,11 +1381,11 @@ function renderPage() {
         const label = segNames[key] || (key === 'other' ? 'その他/未分類' : key);
         const s = row.売上合計||0, g = row.原価合計||0;
         const genkaRate = s > 0 ? (g/s*100).toFixed(1) : '0.0';
-        csv += key + ':' + label + ',' + Math.round(s) + ',' + Math.round(row.クーポン値引額||0) + ',' + Math.round(row.クーポン値引後売上||0) + ',' + Math.round(g) + ',' + genkaRate + ',' + row.行数 + '\n';
+        csv += key + ':' + label + ',' + Math.round(s) + ',' + Math.round(row.クーポン値引額||0) + ',' + Math.round(row.クーポン値引後売上||0) + ',' + Math.round(g) + ',' + genkaRate + ',' + row.行数 + '\\n';
         sTot.s += s; sTot.c += (row.クーポン値引額||0); sTot.a += (row.クーポン値引後売上||0); sTot.g += g; sTot.n += row.行数;
       }
       const totRate = sTot.s > 0 ? (sTot.g/sTot.s*100).toFixed(1) : '0.0';
-      csv += '合計,' + Math.round(sTot.s) + ',' + Math.round(sTot.c) + ',' + Math.round(sTot.a) + ',' + Math.round(sTot.g) + ',' + totRate + ',' + sTot.n + '\n';
+      csv += '合計,' + Math.round(sTot.s) + ',' + Math.round(sTot.c) + ',' + Math.round(sTot.a) + ',' + Math.round(sTot.g) + ',' + totRate + ',' + sTot.n + '\\n';
 
       const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
       const a = document.createElement('a');
