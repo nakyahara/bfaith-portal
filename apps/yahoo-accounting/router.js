@@ -444,10 +444,10 @@ router.post('/upload-billing', upload.array('files', 10), (req, res) => {
       totalTaxIncl += row['金額(税込)'];
     }
 
-    // 広告費とPF手数料の分離
+    // 広告費 = クリック課金型広告利用料のみ。PF手数料 = 請求合計 - 広告費
     let adCost = 0;
     for (const cat of Object.values(byCategory)) {
-      if (cat.品目.includes('広告') || cat.品目.includes('アフィリエイト')) {
+      if (cat.品目 === 'クリック課金型広告利用料') {
         adCost += cat['金額(税込)'];
       }
     }
@@ -1029,29 +1029,29 @@ function renderPage() {
       const adByKey = allocateByRatio(ad, salesByKey, adTargets);
       const pfByKey = allocateByRatio(pf, salesByKey, allocTargets);
 
-      let html = '<table><tr><th>セグメント</th><th>売上（税込）</th><th>PF手数料</th><th>広告費</th><th>原価合計</th><th>粗利率</th><th>件数</th></tr>';
+      let html = '<table><tr><th>セグメント</th><th>売上（税込）</th><th>PF手数料</th><th>広告費</th><th>原価合計</th><th>原価率</th><th>件数</th></tr>';
       let tot = { 売上: 0, 原価: 0, 件数: 0 };
       let totAd = 0, totPf = 0;
       for (const [key, row] of Object.entries(bySegment)) {
         const label = segNames[key] || (key === 'other' ? 'その他/未分類' : key);
-        const gross = row.売上 > 0 ? ((row.売上 - Math.round(row.原価)) / row.売上 * 100).toFixed(1) : '0.0';
+        const costRate = row.売上 > 0 ? (Math.round(row.原価) / row.売上 * 100).toFixed(1) : '0.0';
         html += '<tr><td>' + key + ': ' + label + '</td>';
         html += '<td class="num">' + fmt(row.売上) + '</td>';
         html += '<td class="num">' + fmt(pfByKey[key] || 0) + '</td>';
         html += '<td class="num">' + fmt(adByKey[key] || 0) + '</td>';
         html += '<td class="num">' + fmt(row.原価) + '</td>';
-        html += '<td class="num">' + gross + '%</td>';
+        html += '<td class="num">' + costRate + '%</td>';
         html += '<td class="num">' + row.件数 + '</td></tr>';
         tot.売上 += row.売上; tot.原価 += row.原価; tot.件数 += row.件数;
         totAd += (adByKey[key] || 0); totPf += (pfByKey[key] || 0);
       }
-      const totGross = tot.売上 > 0 ? ((tot.売上 - Math.round(tot.原価)) / tot.売上 * 100).toFixed(1) : '0.0';
+      const totCostRate = tot.売上 > 0 ? (Math.round(tot.原価) / tot.売上 * 100).toFixed(1) : '0.0';
       html += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td>';
       html += '<td class="num">' + fmt(tot.売上) + '</td>';
       html += '<td class="num">' + fmt(totPf) + '</td>';
       html += '<td class="num">' + fmt(totAd) + '</td>';
       html += '<td class="num">' + fmt(tot.原価) + '</td>';
-      html += '<td class="num">' + totGross + '%</td>';
+      html += '<td class="num">' + totCostRate + '%</td>';
       html += '<td class="num">' + tot.件数 + '</td></tr></table>';
       document.getElementById('segmentTable').innerHTML = html;
 
@@ -1191,7 +1191,7 @@ function renderPage() {
       const om = lastData.orderMap;
 
       // 受取明細の入金行をフィルタし、注文IDでNE_Items_Proと紐付けて集計
-      const byTax = { '10': { 売上: 0, 件数: 0 }, '8': { 売上: 0, 件数: 0 }, 'unknown': { 売上: 0, 件数: 0 } };
+      const byTax = { '10': { 売上: 0, 件数: 0 }, '8': { 売上: 0, 件数: 0 } };
       const bySegment = { '1': { 売上: 0, 原価: 0, 件数: 0 }, '2': { 売上: 0, 原価: 0, 件数: 0 }, '3': { 売上: 0, 原価: 0, 件数: 0 }, 'other': { 売上: 0, 原価: 0, 件数: 0 } };
       const excluded = { '4': { 売上: 0, 原価: 0, 件数: 0 } };
       let unmatchedOrders = 0;
@@ -1233,11 +1233,11 @@ function renderPage() {
             }
           }
         } else {
-          // NE_Items_Proに該当注文なし → 不明
-          byTax['unknown'].売上 += amount;
-          byTax['unknown'].件数++;
-          bySegment['other'].売上 += amount;
-          bySegment['other'].件数++;
+          // NE_Items_Proに該当注文なし → 10%/自社商品(1)に分類
+          byTax['10'].売上 += amount;
+          byTax['10'].件数++;
+          bySegment['1'].売上 += amount;
+          bySegment['1'].件数++;
           unmatchedOrders++;
         }
       }
@@ -1252,20 +1252,17 @@ function renderPage() {
       let taxHtml = '<table><tr><th>税率</th><th>金額（税込）</th><th>件数</th></tr>';
       taxHtml += '<tr><td>10%</td><td class="num">' + fmt(byTax['10'].売上) + '</td><td class="num">' + byTax['10'].件数 + '</td></tr>';
       taxHtml += '<tr><td>8%</td><td class="num">' + fmt(byTax['8'].売上) + '</td><td class="num">' + byTax['8'].件数 + '</td></tr>';
-      if (byTax['unknown'].件数 > 0) {
-        taxHtml += '<tr><td>不明（10%仮扱い）</td><td class="num">' + fmt(byTax['unknown'].売上) + '</td><td class="num">' + byTax['unknown'].件数 + '</td></tr>';
-      }
-      const totalSales = byTax['10'].売上 + byTax['8'].売上 + byTax['unknown'].売上;
-      const totalCount = byTax['10'].件数 + byTax['8'].件数 + byTax['unknown'].件数;
+      const totalSales = byTax['10'].売上 + byTax['8'].売上;
+      const totalCount = byTax['10'].件数 + byTax['8'].件数;
       taxHtml += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td><td class="num">' + fmt(totalSales) + '</td><td class="num">' + totalCount + '</td></tr>';
       taxHtml += '</table>';
       if (unmatchedOrders > 0) {
-        taxHtml += '<p class="meta" style="color:#e67e22">注文データに該当がない受取明細: ' + unmatchedOrders + '件（「その他」に分類）</p>';
+        taxHtml += '<p class="meta" style="color:#e67e22">注文データに該当がない受取明細 ' + unmatchedOrders + '件 → 10%/自社商品に分類</p>';
       }
       document.getElementById('receiptTaxTable').innerHTML = taxHtml;
 
       // ─── MF連携用 ───
-      const mf10 = byTax['10'].売上 + byTax['unknown'].売上;
+      const mf10 = byTax['10'].売上;
       const mf8 = byTax['8'].売上;
       document.getElementById('mfCard').style.display = 'block';
       let mfHtml = '<table><tr><th>商品売上(10%税込)</th><th>商品売上(8%税込)</th><th>合計</th></tr>';
