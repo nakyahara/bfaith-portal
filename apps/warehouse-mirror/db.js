@@ -187,4 +187,32 @@ function createTables() {
     unresolved_count  INTEGER,
     uploaded_at       TEXT NOT NULL
   )`);
+
+  // ─── mart_yahoo: Yahoo!売上集計ツール用 ───
+
+  // mart_yahoo_monthly_summary — 月次確定集計
+  db.exec(`CREATE TABLE IF NOT EXISTS mart_yahoo_monthly_summary (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    year_month        TEXT NOT NULL UNIQUE,
+    total_rows        INTEGER,
+    resolved_count    INTEGER,
+    unresolved_count  INTEGER,
+    by_tax            TEXT,
+    by_segment        TEXT,
+    excluded          TEXT,
+    mf_row            TEXT,
+    ad_cost           REAL DEFAULT 0,
+    billing           TEXT,
+    confirmed_at      TEXT NOT NULL
+  )`);
+
+  // mart_yahoo_upload_log — アップロード履歴
+  db.exec(`CREATE TABLE IF NOT EXISTS mart_yahoo_upload_log (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    year_month        TEXT NOT NULL,
+    total_rows        INTEGER,
+    resolved_count    INTEGER,
+    unresolved_count  INTEGER,
+    uploaded_at       TEXT NOT NULL
+  )`);
 }
