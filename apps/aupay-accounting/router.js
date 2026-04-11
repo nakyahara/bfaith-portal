@@ -53,14 +53,21 @@ function parseShiftJisCsv(buf) {
 
 function resolveProducts(rows, db) {
   const productsMap = new Map();
+  // 代表商品コードで引けるマップ（複数商品が同じ代表コードを持つ場合は最初の1件）
+  const repCodeMap = new Map();
   for (const p of db.prepare('SELECT * FROM mirror_products').all()) {
     productsMap.set((p.商品コード || '').toLowerCase(), p);
+    const rep = (p.代表商品コード || '').toLowerCase();
+    if (rep && rep !== (p.商品コード || '').toLowerCase() && !repCodeMap.has(rep)) {
+      repCodeMap.set(rep, p);
+    }
   }
 
   const resolved = [];
   const unresolved = new Map();
   const unresolvedTax = new Map();
   const unresolvedSegment = new Map();
+  const resolvedByRepCode = new Map(); // 代表商品コードで紐付けた商品リスト
 
   for (const row of rows) {
     const itemCode = (row.商品コード || '').toLowerCase();
@@ -71,7 +78,7 @@ function resolveProducts(rows, db) {
       continue;
     }
 
-    // F列(itemManagementId)がある場合: itemCode+mgmtId で先に検索、なければ itemCode だけ
+    // Stage 1: F列ありの場合 itemCode+mgmtId で検索
     let product = null;
     let resolveMethod = null;
     if (mgmtId) {
@@ -79,9 +86,15 @@ function resolveProducts(rows, db) {
       product = productsMap.get(combinedCode);
       if (product) resolveMethod = 'combined';
     }
+    // Stage 2: itemCode のみで検索
     if (!product) {
       product = productsMap.get(itemCode);
       if (product) resolveMethod = 'direct';
+    }
+    // Stage 3: itemCode を代表商品コードとして検索
+    if (!product) {
+      product = repCodeMap.get(itemCode);
+      if (product) resolveMethod = 'rep_code';
     }
 
     if (product) {
@@ -94,6 +107,19 @@ function resolveProducts(rows, db) {
         売上分類: product.売上分類,
         解決方法: resolveMethod,
       });
+
+      // 代表商品コードで紐付けた場合、リストに記録
+      if (resolveMethod === 'rep_code') {
+        const key = itemCode;
+        const existing = resolvedByRepCode.get(key) || {
+          auPayCode: row.商品コード || '', matchedCode: product.商品コード,
+          matchedName: product.商品名 || '', name: row.商品名 || '',
+          count: 0, amount: 0,
+        };
+        existing.count++;
+        existing.amount += row.売上合計 || 0;
+        resolvedByRepCode.set(key, existing);
+      }
 
       if (taxRate === null) {
         const key = product.商品コード.toLowerCase();
@@ -155,6 +181,7 @@ function resolveProducts(rows, db) {
     unresolvedTax: [...unresolvedTax.values()],
     unresolvedSegment: [...unresolvedSegment.values()],
     zeroGenka: [...zeroGenka.values()],
+    resolvedByRepCode: [...resolvedByRepCode.values()],
   };
 }
 
@@ -348,7 +375,7 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
     }
 
     // 商品コード解決
-    const { resolved, unresolved, unresolvedTax, unresolvedSegment, zeroGenka } = resolveProducts(allRows, db);
+    const { resolved, unresolved, unresolvedTax, unresolvedSegment, zeroGenka, resolvedByRepCode } = resolveProducts(allRows, db);
 
     // 集計
     const agg = aggregate(resolved);
@@ -365,6 +392,7 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
       segmentNames: SEGMENT_NAMES,
       excludedNames: EXCLUDED_SEGMENTS,
       zeroGenka,
+      resolvedByRepCode,
       byTax: agg.byTax,
       bySegment: agg.bySegment,
       excluded: agg.excluded,
@@ -660,6 +688,13 @@ function renderPage() {
         </div>
       </div>
 
+      <!-- 代表商品コードで紐付けた商品 -->
+      <div id="repCodeCard" class="card" style="display:none">
+        <h2>代表商品コードで紐付けた商品</h2>
+        <p class="meta">auペイ側の商品コードがマスタに直接存在せず、代表商品コード経由で紐付けました。auペイ管理画面の商品コード登録ミスの可能性があります。</p>
+        <div id="repCodeList"></div>
+      </div>
+
       <!-- 原価ゼロ警告 -->
       <div id="zeroGenkaCard" class="card" style="display:none">
         <h2>原価ゼロで計算された商品</h2>
@@ -828,6 +863,20 @@ function renderPage() {
       renderMfTable(data);
       // セグメント別集計
       renderSegmentTable(data);
+
+      // 代表商品コードで紐付けた商品
+      if (data.resolvedByRepCode && data.resolvedByRepCode.length > 0) {
+        document.getElementById('repCodeCard').style.display = 'block';
+        let html = '<div class="warn" style="margin-bottom:8px"><b>' + data.resolvedByRepCode.length + '商品</b>を代表商品コード経由で紐付けました</div>';
+        html += '<table class="detail-table"><tr><th>auペイ商品コード</th><th>auペイ商品名</th><th>紐付先マスタコード</th><th>マスタ商品名</th><th>出現数</th><th>売上合計</th></tr>';
+        for (const r of data.resolvedByRepCode) {
+          html += '<tr><td style="text-align:left">' + r.auPayCode + '</td><td style="text-align:left">' + (r.name || '').slice(0, 40) + '</td><td style="text-align:left;color:#e85514;font-weight:bold">' + r.matchedCode + '</td><td style="text-align:left">' + (r.matchedName || '').slice(0, 40) + '</td><td class="num">' + r.count + '</td><td class="num">' + fmt(r.amount) + '</td></tr>';
+        }
+        html += '</table>';
+        document.getElementById('repCodeList').innerHTML = html;
+      } else {
+        document.getElementById('repCodeCard').style.display = 'none';
+      }
 
       // 原価ゼロ警告
       if (data.zeroGenka && data.zeroGenka.length > 0) {
