@@ -332,10 +332,7 @@ app.use('/apps/amazon-accounting', (req, res, next) => {
   if (req.path === '/import-history' && req.method === 'POST') return next();  // APIキー認証に委譲
   requireAuth(req, res, next);
 }, amazonAccountingRouter);
-app.use('/apps/rakuten-accounting', (req, res, next) => {
-  if (req.path === '/import-historical' && req.method === 'POST') return next();  // 一時的：過去データ投入用
-  requireAuth(req, res, next);
-}, rakutenAccountingRouter);
+app.use('/apps/rakuten-accounting', requireAuth, rakutenAccountingRouter);
 app.use('/apps/fba-profitability', requireAppAccess('fba-profitability'), fbaProfitabilityRouter);
 
 // 未実装アプリのプレースホルダー

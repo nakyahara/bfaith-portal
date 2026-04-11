@@ -579,32 +579,6 @@ router.get('/history/:yearMonth', (req, res) => {
   }
 });
 
-// ─── POST /import-historical — 過去データ一括インポート ───
-
-router.post('/import-historical', (req, res) => {
-  const db = getMirrorDB();
-  try {
-    const rows = req.body.rows;
-    if (!Array.isArray(rows)) return res.status(400).json({ error: 'rows配列が必要です' });
-    const insert = db.prepare(`INSERT OR IGNORE INTO mart_rakuten_monthly_summary
-      (year_month, total_rows, resolved_count, unresolved_count,
-       by_tax, by_segment, excluded, mf_row, ad_cost, billing, confirmed_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
-    let count = 0;
-    for (const r of rows) {
-      count += insert.run(
-        r.year_month, r.total_rows || 0, r.resolved_count || 0, r.unresolved_count || 0,
-        r.by_tax || '{}', r.by_segment || '{}', r.excluded || '{}',
-        r.mf_row || '{}', r.ad_cost || 0, r.billing || '{}', r.confirmed_at || ''
-      ).changes;
-    }
-    const total = db.prepare('SELECT COUNT(*) as c FROM mart_rakuten_monthly_summary').get();
-    res.json({ imported: count, total: total.c });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
 // ─── HTML ───
 
 function renderPage() {
