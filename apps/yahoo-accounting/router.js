@@ -348,26 +348,25 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
     // 商品コード解決
     const { resolved, unresolved, unresolvedTax, unresolvedSegment, zeroGenka } = resolveProducts(allRows, db);
 
-    // 集計
-    const { byTax, bySegment, excluded, otherDetails, columns, mfRow, mfColumns } = aggregate(resolved);
-
-    // 明細行データ（CSVダウンロード用）
-    const detailRows = resolved
-      .filter(r => r.解決方法 !== 'no_code')
-      .map(r => ({
-        注文番号: r.注文番号,
+    // 注文IDベースのルックアップマップ（受取明細との紐付け用）
+    // 1注文に複数明細がある場合は全行分の情報を保持
+    const orderMap = {};
+    for (const r of resolved) {
+      if (r.解決方法 === 'no_code' || r.解決方法 === 'unresolved') continue;
+      const oid = r.注文番号;
+      if (!oid) continue;
+      if (!orderMap[oid]) orderMap[oid] = [];
+      orderMap[oid].push({
         商品コード: r.商品コード_resolved || r.商品コード || '',
         商品名: r.商品名 || '',
-        単価: r.単価 || 0,
-        個数: r.個数 || 0,
-        売上合計: r.売上合計 || 0,
-        クーポン値引額: Math.round(r.クーポン値引額 || 0),
-        クーポン値引後売上: Math.round((r.売上合計 || 0) - (r.クーポン値引額 || 0)),
+        税率: r.税率 || r.CSV税率 || 10,
+        売上分類: r.売上分類 || null,
         原価: r.原価 || 0,
-        原価合計: Math.round((r.原価 || 0) * (r.個数 || 1)),
-        税率: r.税率 != null ? r.税率 + '%' : (r.CSV税率 ? r.CSV税率 + '%(CSV)' : '未登録'),
-        セグメント: r.売上分類 ? r.売上分類 + ':' + (SEGMENT_NAMES[r.売上分類] || EXCLUDED_SEGMENTS[r.売上分類] || '') : '未分類',
-      }));
+        個数: r.個数 || 0,
+        単価: r.単価 || 0,
+        売上合計: r.売上合計 || 0,
+      });
+    }
 
     res.json({
       yearMonth,
@@ -378,11 +377,10 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
       unresolvedProducts: unresolved,
       unresolvedTax,
       unresolvedSegment,
-      byTax, bySegment, excluded, otherDetails,
-      columns, mfRow, mfColumns,
       segmentNames: SEGMENT_NAMES,
       excludedNames: EXCLUDED_SEGMENTS,
-      zeroGenka, detailRows,
+      zeroGenka,
+      orderMap,
     });
   } catch (e) {
     console.error('[YahooAccounting] エラー:', e.message, e.stack);
@@ -870,7 +868,7 @@ function renderPage() {
       lastData = data;
       document.getElementById('result').style.display = 'block';
       document.getElementById('uploadStatus').textContent = '';
-      document.getElementById('csvDownloadArea').style.display = data.detailRows ? 'block' : 'none';
+      document.getElementById('csvDownloadArea').style.display = (receiptData && billingData) ? 'block' : 'none';
 
       const hasUnresolved = data.unresolvedProducts.length > 0;
       const hasUnresTax = data.unresolvedTax && data.unresolvedTax.length > 0;
@@ -945,26 +943,9 @@ function renderPage() {
         document.getElementById('unresolvedArea').style.display = 'none';
       }
 
-      // 受取明細が既に取り込まれていれば、紐付けて税率別集計を表示
+      // 受取明細が既に取り込まれていれば、紐付けて集計を表示
       if (receiptData) {
-        renderReceiptTax();
-      }
-
-      // セグメント別
-      renderSegmentTable(data);
-
-      // その他明細
-      if (data.otherDetails && data.otherDetails.length > 0) {
-        document.getElementById('otherDetailCard').style.display = 'block';
-        let html = '<table class="detail-table"><tr><th>商品コード</th><th>商品名</th><th>解決方法</th><th>行数</th><th>個数</th><th>売上合計</th></tr>';
-        for (const d of data.otherDetails) {
-          const method = { subcode: 'SubCode一致', itemid: 'ItemId一致', auction_auto: 'オークション自動', unresolved: '未解決', no_code: 'コードなし' }[d.解決方法] || d.解決方法;
-          html += '<tr><td style="text-align:left">' + (d.商品コード || '-') + '</td><td style="text-align:left">' + (d.商品名 || '').slice(0, 50) + '</td><td style="text-align:left">' + method + '</td><td class="num">' + d.count + '</td><td class="num">' + d.個数 + '</td><td class="num">' + fmt(d.売上合計) + '</td></tr>';
-        }
-        html += '</table>';
-        document.getElementById('otherDetailList').innerHTML = html;
-      } else {
-        document.getElementById('otherDetailCard').style.display = 'none';
+        renderReceiptBasedAggregation();
       }
 
       // 原価ゼロ警告
@@ -1032,8 +1013,8 @@ function renderPage() {
       return result;
     }
 
-    function renderSegmentTable(data) {
-      const seg = data.bySegment;
+    function renderSegmentTableFromReceipt(bySegment, excludedSeg) {
+      const segNames = { 1: '自社商品', 2: '取扱限定', 3: '仕入れ商品' };
       const bt = getBillingTotals();
       const ad = bt ? bt.adCost : 0;
       const pf = bt ? bt.pfFee : 0;
@@ -1041,48 +1022,41 @@ function renderPage() {
       const allocTargets = ['1', '2', '3'];
       const adTargets = ['1', '2'];
       const salesByKey = {};
-      for (const [key, row] of Object.entries(seg)) { salesByKey[key] = row.売上合計 || 0; }
+      for (const [key, row] of Object.entries(bySegment)) { salesByKey[key] = row.売上 || 0; }
       const adByKey = allocateByRatio(ad, salesByKey, adTargets);
       const pfByKey = allocateByRatio(pf, salesByKey, allocTargets);
 
-      let html = '<table><tr><th>セグメント</th><th>売上合計</th><th>クーポン値引額</th><th>クーポン値引後売上</th><th>PF手数料</th><th>広告費</th><th>原価合計</th><th>粗利率</th><th>行数</th></tr>';
-      let tot = { 売上合計: 0, クーポン値引額: 0, クーポン値引後売上: 0, 原価合計: 0, 行数: 0 };
+      let html = '<table><tr><th>セグメント</th><th>売上（税込）</th><th>PF手数料</th><th>広告費</th><th>原価合計</th><th>粗利率</th><th>件数</th></tr>';
+      let tot = { 売上: 0, 原価: 0, 件数: 0 };
       let totAd = 0, totPf = 0;
-      for (const [key, row] of Object.entries(seg)) {
-        const label = data.segmentNames[key] || (key === 'other' ? 'その他/未分類' : key);
+      for (const [key, row] of Object.entries(bySegment)) {
+        const label = segNames[key] || (key === 'other' ? 'その他/未分類' : key);
+        const gross = row.売上 > 0 ? ((row.売上 - Math.round(row.原価)) / row.売上 * 100).toFixed(1) : '0.0';
         html += '<tr><td>' + key + ': ' + label + '</td>';
-        html += '<td class="num">' + fmt(row.売上合計) + '</td>';
-        html += '<td class="num">' + fmt(row.クーポン値引額) + '</td>';
-        html += '<td class="num">' + fmt(row.クーポン値引後売上) + '</td>';
+        html += '<td class="num">' + fmt(row.売上) + '</td>';
         html += '<td class="num">' + fmt(pfByKey[key] || 0) + '</td>';
         html += '<td class="num">' + fmt(adByKey[key] || 0) + '</td>';
-        html += '<td class="num">' + fmt(row.原価合計) + '</td>';
-        html += '<td class="num">' + (row.粗利率 || '0.0') + '%</td>';
-        html += '<td class="num">' + row.行数 + '</td></tr>';
-        tot.売上合計 += row.売上合計; tot.クーポン値引額 += row.クーポン値引額;
-        tot.クーポン値引後売上 += row.クーポン値引後売上; tot.原価合計 += row.原価合計; tot.行数 += row.行数;
+        html += '<td class="num">' + fmt(row.原価) + '</td>';
+        html += '<td class="num">' + gross + '%</td>';
+        html += '<td class="num">' + row.件数 + '</td></tr>';
+        tot.売上 += row.売上; tot.原価 += row.原価; tot.件数 += row.件数;
         totAd += (adByKey[key] || 0); totPf += (pfByKey[key] || 0);
       }
-      const totGross = tot.クーポン値引後売上 > 0 ? ((tot.クーポン値引後売上 - tot.原価合計) / tot.クーポン値引後売上 * 100).toFixed(1) : '0.0';
+      const totGross = tot.売上 > 0 ? ((tot.売上 - Math.round(tot.原価)) / tot.売上 * 100).toFixed(1) : '0.0';
       html += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td>';
-      html += '<td class="num">' + fmt(tot.売上合計) + '</td>';
-      html += '<td class="num">' + fmt(tot.クーポン値引額) + '</td>';
-      html += '<td class="num">' + fmt(tot.クーポン値引後売上) + '</td>';
+      html += '<td class="num">' + fmt(tot.売上) + '</td>';
       html += '<td class="num">' + fmt(totPf) + '</td>';
       html += '<td class="num">' + fmt(totAd) + '</td>';
-      html += '<td class="num">' + fmt(tot.原価合計) + '</td>';
+      html += '<td class="num">' + fmt(tot.原価) + '</td>';
       html += '<td class="num">' + totGross + '%</td>';
-      html += '<td class="num">' + tot.行数 + '</td></tr></table>';
+      html += '<td class="num">' + tot.件数 + '</td></tr></table>';
       document.getElementById('segmentTable').innerHTML = html;
 
       // 除外セグメント
       let exclHtml = '';
-      if (data.excluded) {
-        for (const [key, row] of Object.entries(data.excluded)) {
-          if (row.行数 > 0) {
-            const label = data.excludedNames[key] || key;
-            exclHtml += '<div class="excluded"><b>除外: ' + key + ': ' + label + '</b>（' + row.行数 + '行） \\u2014 売上合計: ' + fmt(row.売上合計) + ' / クーポン値引後: ' + fmt(row.クーポン値引後売上) + ' / 原価: ' + fmt(row.原価合計) + '</div>';
-          }
+      for (const [key, row] of Object.entries(excludedSeg)) {
+        if (row.件数 > 0) {
+          exclHtml += '<div class="excluded"><b>除外: ' + key + ': 輸出</b>（' + row.件数 + '件） \\u2014 売上: ' + fmt(row.売上) + ' / 原価: ' + fmt(row.原価) + '</div>';
         }
       }
       document.getElementById('excludedInfo').innerHTML = exclHtml;
@@ -1101,9 +1075,9 @@ function renderPage() {
         // セグメント別変動費按分
         let cbHtml = '<table><tr><th>セグメント</th><th>売上比率</th><th>PF手数料</th><th>広告費</th><th>変動費合計</th></tr>';
         let cbTotPf = 0, cbTotAd = 0;
-        for (const [key, row] of Object.entries(seg)) {
-          const label = data.segmentNames[key] || (key === 'other' ? 'その他/未分類' : key);
-          const ratio = tot.売上合計 > 0 ? (row.売上合計 / tot.売上合計 * 100).toFixed(1) : '0.0';
+        for (const [key, row] of Object.entries(bySegment)) {
+          const label = segNames[key] || (key === 'other' ? 'その他/未分類' : key);
+          const ratio = tot.売上 > 0 ? (row.売上 / tot.売上 * 100).toFixed(1) : '0.0';
           const segPf = pfByKey[key] || 0;
           const segAd = adByKey[key] || 0;
           cbHtml += '<tr><td>' + key + ': ' + label + '</td>';
@@ -1208,26 +1182,88 @@ function renderPage() {
       btn.textContent = '受取明細取り込み';
     }
 
-    // ─── 受取明細の税率別集計を表示（NE_Items_Pro取込後に呼ばれる）───
-    function renderReceiptTax() {
-      if (!receiptData || !lastData) return;
-      const taxMap = buildTaxMap();
-      const rbt = aggregateReceiptByTax(receiptData.rows, taxMap);
-      receiptData.receiptByTax = rbt;
+    // ─── 受取明細ベースの全集計（NE_Items_Pro取込後に呼ばれる）───
+    function renderReceiptBasedAggregation() {
+      if (!receiptData || !lastData || !lastData.orderMap) return;
+      const om = lastData.orderMap;
 
-      document.getElementById('receiptTaxCard').style.display = 'block';
-      let html = '<table><tr><th>税率</th><th>金額（税込）</th><th>件数</th></tr>';
-      html += '<tr><td>10%</td><td class="num">' + fmt(rbt.tax10) + '</td><td class="num">' + rbt.count10 + '</td></tr>';
-      html += '<tr><td>8%</td><td class="num">' + fmt(rbt.tax8) + '</td><td class="num">' + rbt.count8 + '</td></tr>';
-      if (rbt.countUnknown > 0) {
-        html += '<tr><td>不明（10%仮扱い）</td><td class="num">' + fmt(rbt.taxUnknown) + '</td><td class="num">' + rbt.countUnknown + '</td></tr>';
+      // 受取明細の入金行をフィルタし、注文IDでNE_Items_Proと紐付けて集計
+      const byTax = { '10': { 売上: 0, 件数: 0 }, '8': { 売上: 0, 件数: 0 }, 'unknown': { 売上: 0, 件数: 0 } };
+      const bySegment = { '1': { 売上: 0, 原価: 0, 件数: 0 }, '2': { 売上: 0, 原価: 0, 件数: 0 }, '3': { 売上: 0, 原価: 0, 件数: 0 }, 'other': { 売上: 0, 原価: 0, 件数: 0 } };
+      const excluded = { '4': { 売上: 0, 原価: 0, 件数: 0 } };
+      let unmatchedOrders = 0;
+
+      for (const row of receiptData.rows) {
+        const amount = row['金額(税込)'] || 0;
+        if (amount === 0) continue;
+        const item = row.利用項目 || '';
+        // 入金系のみ（決済金額）。手数料等は除外
+        if (item.includes('手数料') || item.includes('原資') || item.includes('利用料')
+            || item.includes('報酬') || item.includes('プラン')) continue;
+
+        const orderId = row.注文ID || '';
+        const orderItems = om[orderId];
+
+        if (orderItems && orderItems.length > 0) {
+          // 注文内の最初の商品の税率で判定（1注文=同一税率が基本）
+          const taxRate = orderItems[0].税率;
+          const taxKey = taxRate === 8 ? '8' : '10';
+          byTax[taxKey].売上 += amount;
+          byTax[taxKey].件数++;
+
+          // セグメント: 注文内商品の売上按分でセグメント別に振り分け
+          const totalOrderSales = orderItems.reduce((s, i) => s + (i.売上合計 || 0), 0);
+          for (const oi of orderItems) {
+            const ratio = totalOrderSales > 0 ? (oi.売上合計 || 0) / totalOrderSales : 1 / orderItems.length;
+            const segKey = oi.売上分類 ? String(oi.売上分類) : 'other';
+            const segAmount = amount * ratio;
+            const genka = (oi.原価 || 0) * (oi.個数 || 1) * ratio;
+            if (excluded[segKey]) {
+              excluded[segKey].売上 += segAmount;
+              excluded[segKey].原価 += genka;
+              excluded[segKey].件数++;
+            } else {
+              const target = bySegment[segKey] || bySegment['other'];
+              target.売上 += segAmount;
+              target.原価 += genka;
+              target.件数++;
+            }
+          }
+        } else {
+          // NE_Items_Proに該当注文なし → 不明
+          byTax['unknown'].売上 += amount;
+          byTax['unknown'].件数++;
+          bySegment['other'].売上 += amount;
+          bySegment['other'].件数++;
+          unmatchedOrders++;
+        }
       }
-      html += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td><td class="num">' + fmt(rbt.tax10 + rbt.tax8 + rbt.taxUnknown) + '</td><td class="num">' + (rbt.count10 + rbt.count8 + rbt.countUnknown) + '</td></tr>';
-      html += '</table>';
 
-      // MF連携用
-      const mf10 = rbt.tax10 + rbt.taxUnknown;
-      const mf8 = rbt.tax8;
+      // 集計結果を保存（確定時に使う）
+      lastData.receiptByTax = byTax;
+      lastData.receiptBySegment = bySegment;
+      lastData.receiptExcluded = excluded;
+
+      // ─── 税率別集計表示 ───
+      document.getElementById('receiptTaxCard').style.display = 'block';
+      let taxHtml = '<table><tr><th>税率</th><th>金額（税込）</th><th>件数</th></tr>';
+      taxHtml += '<tr><td>10%</td><td class="num">' + fmt(byTax['10'].売上) + '</td><td class="num">' + byTax['10'].件数 + '</td></tr>';
+      taxHtml += '<tr><td>8%</td><td class="num">' + fmt(byTax['8'].売上) + '</td><td class="num">' + byTax['8'].件数 + '</td></tr>';
+      if (byTax['unknown'].件数 > 0) {
+        taxHtml += '<tr><td>不明（10%仮扱い）</td><td class="num">' + fmt(byTax['unknown'].売上) + '</td><td class="num">' + byTax['unknown'].件数 + '</td></tr>';
+      }
+      const totalSales = byTax['10'].売上 + byTax['8'].売上 + byTax['unknown'].売上;
+      const totalCount = byTax['10'].件数 + byTax['8'].件数 + byTax['unknown'].件数;
+      taxHtml += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td><td class="num">' + fmt(totalSales) + '</td><td class="num">' + totalCount + '</td></tr>';
+      taxHtml += '</table>';
+      if (unmatchedOrders > 0) {
+        taxHtml += '<p class="meta" style="color:#e67e22">注文データに該当がない受取明細: ' + unmatchedOrders + '件（「その他」に分類）</p>';
+      }
+      document.getElementById('receiptTaxTable').innerHTML = taxHtml;
+
+      // ─── MF連携用 ───
+      const mf10 = byTax['10'].売上 + byTax['unknown'].売上;
+      const mf8 = byTax['8'].売上;
       document.getElementById('mfCard').style.display = 'block';
       let mfHtml = '<table><tr><th>商品売上(10%税込)</th><th>商品売上(8%税込)</th><th>合計</th></tr>';
       mfHtml += '<tr><td class="num" style="font-weight:bold">' + fmt(mf10) + '</td>';
@@ -1235,56 +1271,11 @@ function renderPage() {
       mfHtml += '<td class="num" style="font-weight:bold">' + fmt(mf10 + mf8) + '</td></tr></table>';
       document.getElementById('mfTable').innerHTML = mfHtml;
 
-      document.getElementById('receiptTaxTable').innerHTML = html;
-    }
+      // ─── セグメント別集計 ───
+      renderSegmentTableFromReceipt(bySegment, excluded);
 
-    // NE_Items_Proの注文ID→税率マップを構築
-    function buildTaxMap() {
-      const map = new Map(); // 注文ID → 税率(10 or 8)
-      if (!lastData || !lastData.detailRows) return map;
-      for (const row of lastData.detailRows) {
-        const orderId = row.注文番号;
-        if (!orderId) continue;
-        const taxStr = row.税率 || '';
-        let rate = null;
-        if (taxStr.includes('8')) rate = 8;
-        else if (taxStr.includes('10')) rate = 10;
-        if (rate && !map.has(orderId)) {
-          map.set(orderId, rate);
-        }
-      }
-      return map;
-    }
-
-    // 受取明細の行を注文IDベースで税率別に集計
-    function aggregateReceiptByTax(rows, taxMap) {
-      let tax10 = 0, tax8 = 0, taxUnknown = 0;
-      let count10 = 0, count8 = 0, countUnknown = 0;
-      for (const row of rows) {
-        const amount = row['金額(税込)'] || 0;
-        if (amount === 0) continue;
-
-        // 入金系の利用項目のみ集計（決済金額系）
-        const item = row.利用項目 || '';
-        // 手数料やキャンセル分は除外（請求明細側で処理）
-        if (item.includes('手数料') || item.includes('原資') || item.includes('利用料')
-            || item.includes('報酬') || item.includes('プラン')) continue;
-
-        const orderId = row.注文ID || '';
-        const rate = taxMap.get(orderId);
-        if (rate === 8) {
-          tax8 += amount;
-          count8++;
-        } else if (rate === 10) {
-          tax10 += amount;
-          count10++;
-        } else {
-          // 税率不明 → 10%仮扱い
-          taxUnknown += amount;
-          countUnknown++;
-        }
-      }
-      return { tax10, tax8, taxUnknown, count10, count8, countUnknown };
+      // CSVダウンロードも表示
+      document.getElementById('csvDownloadArea').style.display = 'block';
     }
 
     // ─── 工程2: 請求明細取り込み ───
@@ -1354,13 +1345,12 @@ function renderPage() {
             totalRows: lastData.totalRows,
             resolvedCount: lastData.resolvedCount,
             unresolvedCount: lastData.unresolvedProducts?.length || 0,
-            byTax: lastData.byTax,
-            bySegment: lastData.bySegment,
-            excluded: lastData.excluded,
-            mfRow: lastData.mfRow,
+            byTax: lastData.receiptByTax || {},
+            bySegment: lastData.receiptBySegment || {},
+            excluded: lastData.receiptExcluded || {},
+            mfRow: {},
             adCost: billingData.adCost || 0,
             billing: billingData.byCategory || null,
-            receiptByTax: receiptData?.receiptByTax || null,
           }),
         });
         const result = await r.json();
