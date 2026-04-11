@@ -4,7 +4,43 @@
 import { Router } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { getProduct, getFees, createListing, patchListing, getShippingTemplates, getItemOffers, updatePrice, getActiveListingsReport, getSalesCountBySku, searchByJan, searchByKeyword, searchByPartNumber, normalizePartNumber, estimateMonthlySales, getSalesLevel } from './sp-api.js';
+// SP-API関連はミニPC経由で実行（APIキーはミニPC側に一元管理）
+// import { getProduct, getFees, createListing, patchListing, getShippingTemplates, getItemOffers, updatePrice, getActiveListingsReport, getSalesCountBySku, searchByJan, searchByKeyword, searchByPartNumber } from './sp-api.js';
+import { normalizePartNumber, estimateMonthlySales, getSalesLevel } from './sp-api.js'; // ローカル関数のみ残す
+
+// --- ミニPC接続（SP-API実行用） ---
+const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
+function getServiceHeaders() {
+  return {
+    'CF-Access-Client-Id': process.env.CF_ACCESS_CLIENT_ID || '',
+    'CF-Access-Client-Secret': process.env.CF_ACCESS_CLIENT_SECRET || '',
+    'Authorization': `Bearer ${process.env.WAREHOUSE_SERVICE_TOKEN || ''}`,
+    'Content-Type': 'application/json',
+  };
+}
+async function callMiniPC(path, { method = 'GET', body, timeout = 60000 } = {}) {
+  const url = `${WAREHOUSE_URL}/service-api/research${path}`;
+  const options = { method, headers: getServiceHeaders(), signal: AbortSignal.timeout(timeout) };
+  if (body) options.body = JSON.stringify(body);
+  const res = await fetch(url, options);
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.message || data.error || 'ミニPC API error');
+  return data.result;
+}
+
+// SP-API関数をミニPC経由のラッパーに置き換え
+async function getProduct(asin) { return callMiniPC(`/product/${encodeURIComponent(asin)}`); }
+async function getFees(asin, price, isFba = true) { return callMiniPC(`/fees?asin=${encodeURIComponent(asin)}&price=${price}&isFba=${isFba}`); }
+async function createListing(params) { return callMiniPC('/listing', { method: 'POST', body: params }); }
+async function patchListing(params) { return callMiniPC('/listing', { method: 'PATCH', body: params }); }
+async function getShippingTemplates() { return callMiniPC('/shipping-templates'); }
+async function getItemOffers(asin, condition = 'New') { return callMiniPC(`/offers/${encodeURIComponent(asin)}?condition=${encodeURIComponent(condition)}`); }
+async function updatePrice(params) { return callMiniPC('/price', { method: 'POST', body: params }); }
+async function getActiveListingsReport() { return callMiniPC('/active-listings-report', { timeout: 180000 }); }
+async function getSalesCountBySku(days = 365) { return callMiniPC(`/sales-count?days=${days}`, { timeout: 180000 }); }
+async function searchByJan(jan) { return callMiniPC(`/search/jan/${encodeURIComponent(jan)}`); }
+async function searchByKeyword(keyword) { return callMiniPC(`/search/keyword?q=${encodeURIComponent(keyword)}`); }
+async function searchByPartNumber(pn) { return callMiniPC(`/search/part-number?q=${encodeURIComponent(pn)}`); }
 import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, deleteProduct, getSetItems, saveSetItems, syncListings as dbSyncListings, getListings, updateListing, bulkSave, getSyncMeta, getTrackingProducts, getPriceHistory, getRecentPriceHistory, savePriceHistory, updateProductPriceInfo, syncProductsFromListings, saveBulkSession, updateBulkSession, getBulkSessions, getBulkSessionById, deleteBulkSession } from './db.js';
 import { loadSuppliers, addSupplier, deleteSupplier } from './suppliers.js';
 import { loadShipping, addShipping, updateShipping, deleteShipping } from './shipping.js';
