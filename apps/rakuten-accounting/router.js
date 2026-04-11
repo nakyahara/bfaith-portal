@@ -603,7 +603,8 @@ function renderPage() {
     .btn-w{background:#e67e22;color:white}.btn-w:hover{background:#d35400}
     .btn:disabled{opacity:.5;cursor:default}
     table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px;white-space:nowrap}
-    th{background:#f0f0f0;padding:6px 8px;text-align:left;font-size:12px}
+    th{background:#f0f0f0;padding:6px 8px;text-align:right;font-size:12px}
+    th:first-child{text-align:left}
     td{padding:5px 8px;border-bottom:1px solid #eee;text-align:right}
     td:first-child{text-align:left;font-weight:600}
     .warn{background:#fef9e7;border:1px solid #f9e79f;padding:10px;border-radius:4px;margin:8px 0}
