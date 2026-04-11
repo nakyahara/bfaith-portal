@@ -1387,6 +1387,24 @@ function renderPage() {
       const totRate = sTot.s > 0 ? (sTot.g/sTot.s*100).toFixed(1) : '0.0';
       csv += '合計,' + Math.round(sTot.s) + ',' + Math.round(sTot.c) + ',' + Math.round(sTot.a) + ',' + Math.round(sTot.g) + ',' + totRate + ',' + sTot.n + '\\n';
 
+      // 変動費サマリー（仕訳書取り込み済みの場合）
+      const bt2 = getBillingTotals();
+      if (bt2) {
+        csv += '\\n【変動費サマリー】\\n';
+        csv += 'PF手数料,運賃,広告費,店舗発行クーポン利用分,合計\\n';
+        csv += Math.round(bt2.pfFee) + ',-,' + Math.round(bt2.adCost) + ',' + Math.round(bt2.coupon) + ',' + Math.round(bt2.seikyuTotal) + '\\n';
+        csv += '\\nPF手数料 = 請求合計(' + Math.round(bt2.seikyuTotal) + ') - 広告費(' + Math.round(bt2.adCost) + ') - クーポン(' + Math.round(bt2.coupon) + ')\\n';
+      }
+
+      // 仕訳書明細（仕訳書取り込み済みの場合）
+      if (billingData && billingData.byCategory && billingData.byCategory.length > 0) {
+        csv += '\\n【店舗別仕訳書明細】\\n';
+        csv += '品目,金額,消費税額,税込合計\\n';
+        for (const cat of billingData.byCategory) {
+          csv += cat.品目 + ',' + Math.round(cat.金額) + ',' + Math.round(cat.消費税額) + ',' + Math.round(cat.税込合計) + '\\n';
+        }
+      }
+
       const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
