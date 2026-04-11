@@ -1480,13 +1480,32 @@ function renderPage() {
 
     // ─── 明細データCSVダウンロード ───
     function downloadDetailCsv() {
-      if (!lastData || !lastData.detailRows) { alert('先に注文データCSVをアップロードしてください'); return; }
-      const rows = lastData.detailRows;
+      if (!receiptData || !lastData || !lastData.orderMap) { alert('受取明細CSVと注文データCSVの両方をアップロードしてください'); return; }
+      const om = lastData.orderMap;
+      const segNames = { 1: '自社商品', 2: '取扱限定', 3: '仕入れ商品', 4: '輸出' };
       let csv = '\\uFEFF';
-      csv += '注文番号,商品コード,商品名,単価,個数,売上合計,クーポン値引額,クーポン値引後売上,原価,原価合計,税率,セグメント\\n';
-      for (const r of rows) {
-        const name = (r.商品名 || '').replace(/"/g, '""');
-        csv += r.注文番号 + ',' + r.商品コード + ',"' + name + '",' + r.単価 + ',' + r.個数 + ',' + r.売上合計 + ',' + r.クーポン値引額 + ',' + r.クーポン値引後売上 + ',' + r.原価 + ',' + r.原価合計 + ',' + r.税率 + ',' + r.セグメント + '\\n';
+      csv += '利用日,注文ID,利用項目,金額(税込),税率,セグメント,商品コード,商品名,原価\\n';
+      for (const row of receiptData.rows) {
+        const amount = row['金額(税込)'] || 0;
+        const item = row.利用項目 || '';
+        // 入金系のみ
+        if (item.includes('手数料') || item.includes('原資') || item.includes('利用料')
+            || item.includes('報酬') || item.includes('プラン')) continue;
+        if (amount === 0) continue;
+
+        const orderId = row.注文ID || '';
+        const orderItems = om[orderId];
+        if (orderItems && orderItems.length > 0) {
+          const oi = orderItems[0];
+          const taxRate = oi.税率 || 10;
+          const seg = oi.売上分類 ? oi.売上分類 + ':' + (segNames[oi.売上分類] || '') : '1:自社商品';
+          const codes = orderItems.map(i => i.商品コード).join(';');
+          const names = orderItems.map(i => i.商品名).join(';').replace(/"/g, '""');
+          const totalGenka = orderItems.reduce((s, i) => s + (i.原価 || 0) * (i.個数 || 1), 0);
+          csv += (row.利用日||'') + ',' + orderId + ',"' + item.replace(/"/g,'""') + '",' + amount + ',' + taxRate + '%,' + seg + ',' + codes + ',"' + names + '",' + Math.round(totalGenka) + '\\n';
+        } else {
+          csv += (row.利用日||'') + ',' + orderId + ',"' + item.replace(/"/g,'""') + '",' + amount + ',10%,1:自社商品,,,\\n';
+        }
       }
       const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
       const a = document.createElement('a');
@@ -1497,47 +1516,47 @@ function renderPage() {
 
     // ─── 集計サマリーCSVダウンロード ───
     function downloadSummaryCsv() {
-      if (!lastData) { alert('先に注文データCSVをアップロードしてください'); return; }
-      const data = lastData;
+      if (!lastData || !lastData.receiptByTax) { alert('集計が完了してからダウンロードしてください'); return; }
+      const segNames = { 1: '自社商品', 2: '取扱限定', 3: '仕入れ商品' };
       let csv = '\\uFEFF';
 
-      csv += '【税率別集計】\\n';
-      csv += '税率,売上合計,クーポン値引額,クーポン値引後売上,原価合計,行数\\n';
-      const bt = data.byTax;
-      let tTot = { s:0, c:0, a:0, g:0, n:0 };
-      for (const [key, row] of Object.entries(bt)) {
-        csv += key + '%,' + Math.round(row.売上合計) + ',' + Math.round(row.クーポン値引額) + ',' + Math.round(row.クーポン値引後売上) + ',' + Math.round(row.原価合計) + ',' + row.行数 + '\\n';
-        tTot.s += row.売上合計; tTot.c += row.クーポン値引額; tTot.a += row.クーポン値引後売上; tTot.g += row.原価合計; tTot.n += row.行数;
-      }
-      csv += '合計,' + Math.round(tTot.s) + ',' + Math.round(tTot.c) + ',' + Math.round(tTot.a) + ',' + Math.round(tTot.g) + ',' + tTot.n + '\\n';
+      // 税率別集計（受取明細ベース）
+      csv += '【税率別売上集計（受取明細ベース）】\\n';
+      csv += '税率,金額(税込),件数\\n';
+      const rbt = lastData.receiptByTax;
+      csv += '10%,' + Math.round(rbt['10'].売上) + ',' + rbt['10'].件数 + '\\n';
+      csv += '8%,' + Math.round(rbt['8'].売上) + ',' + rbt['8'].件数 + '\\n';
+      csv += '合計,' + Math.round(rbt['10'].売上 + rbt['8'].売上) + ',' + (rbt['10'].件数 + rbt['8'].件数) + '\\n';
 
+      // MF連携用
       csv += '\\n【MF連携用 税込み集計】\\n';
-      csv += '商品売上(10%),商品売上(8%),合計\\n';
-      const mf = data.mfRow;
-      csv += (mf['商品売上(10%)']||0) + ',' + (mf['商品売上(8%)']||0) + ',' + (mf['合計']||0) + '\\n';
+      csv += '商品売上(10%税込),商品売上(8%税込),合計\\n';
+      csv += Math.round(rbt['10'].売上) + ',' + Math.round(rbt['8'].売上) + ',' + Math.round(rbt['10'].売上 + rbt['8'].売上) + '\\n';
 
+      // セグメント別集計（受取明細ベース）
       csv += '\\n【セグメント別集計】\\n';
-      csv += 'セグメント,売上合計,クーポン値引額,クーポン値引後売上,原価合計,原価率,行数\\n';
-      const seg = data.bySegment;
-      const segNames = data.segmentNames || {};
-      let sTot = { s:0, c:0, a:0, g:0, n:0 };
+      csv += 'セグメント,売上(税込),原価合計,原価率,件数\\n';
+      const seg = lastData.receiptBySegment || {};
+      let sTot = { s: 0, g: 0, n: 0 };
       for (const [key, row] of Object.entries(seg)) {
         const label = segNames[key] || (key === 'other' ? 'その他/未分類' : key);
-        const s = row.売上合計||0, g = row.原価合計||0;
-        const genkaRate = s > 0 ? (g/s*100).toFixed(1) : '0.0';
-        csv += key + ':' + label + ',' + Math.round(s) + ',' + Math.round(row.クーポン値引額||0) + ',' + Math.round(row.クーポン値引後売上||0) + ',' + Math.round(g) + ',' + genkaRate + ',' + row.行数 + '\\n';
-        sTot.s += s; sTot.c += (row.クーポン値引額||0); sTot.a += (row.クーポン値引後売上||0); sTot.g += g; sTot.n += row.行数;
+        const s = row.売上 || 0, g = Math.round(row.原価 || 0);
+        const costRate = s > 0 ? (g / s * 100).toFixed(1) : '0.0';
+        csv += key + ':' + label + ',' + Math.round(s) + ',' + g + ',' + costRate + ',' + row.件数 + '\\n';
+        sTot.s += s; sTot.g += g; sTot.n += row.件数;
       }
-      const totRate = sTot.s > 0 ? (sTot.g/sTot.s*100).toFixed(1) : '0.0';
-      csv += '合計,' + Math.round(sTot.s) + ',' + Math.round(sTot.c) + ',' + Math.round(sTot.a) + ',' + Math.round(sTot.g) + ',' + totRate + ',' + sTot.n + '\\n';
+      const totRate = sTot.s > 0 ? (sTot.g / sTot.s * 100).toFixed(1) : '0.0';
+      csv += '合計,' + Math.round(sTot.s) + ',' + Math.round(sTot.g) + ',' + totRate + ',' + sTot.n + '\\n';
 
-      const bt2 = getBillingTotals();
-      if (bt2) {
+      // 変動費
+      const bt = getBillingTotals();
+      if (bt) {
         csv += '\\n【変動費サマリー】\\n';
-        csv += 'PF手数料,広告費,合計\\n';
-        csv += Math.round(bt2.pfFee) + ',' + Math.round(bt2.adCost) + ',' + Math.round(bt2.totalBilling) + '\\n';
+        csv += 'PF手数料,広告費,請求合計\\n';
+        csv += Math.round(bt.pfFee) + ',' + Math.round(bt.adCost) + ',' + Math.round(bt.totalBilling) + '\\n';
       }
 
+      // 請求明細
       if (billingData && billingData.byCategory) {
         csv += '\\n【請求明細】\\n';
         csv += '利用項目,金額（税抜）,消費税,金額（税込）\\n';
@@ -1549,7 +1568,7 @@ function renderPage() {
       const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
-      a.download = 'Yahoo_summary_' + (data.yearMonth || 'unknown') + '.csv';
+      a.download = 'Yahoo_summary_' + (lastData.yearMonth || 'unknown') + '.csv';
       a.click();
     }
 
