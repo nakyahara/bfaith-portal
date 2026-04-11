@@ -432,15 +432,64 @@ router.post('/upload-billing', upload.single('file'), (req, res) => {
       }
     }
 
-    // カテゴリ別集計
-    const byCategory = {};
+    // 消費税行を分離し、各費目に按分
+    // CSVの「消費税」品目行は税率10%費目の消費税合計額を表す
+    let taxLineAmount = 0;
+    const normalRows = [];
     for (const row of billingRows) {
+      if (row.品目 === '消費税' && row['支払/相殺区分'] === '請求') {
+        taxLineAmount += row.金額; // 消費税合計額（例: 175,886）
+      } else if (row.品目 === '消費税' && row['支払/相殺区分'].includes('支払')) {
+        // 支払控除の消費税行（例: 行5の -750）はそのまま残す
+        normalRows.push(row);
+      } else {
+        normalRows.push(row);
+      }
+    }
+
+    // 税率10%の請求費目の金額合計（按分の母数）
+    let taxable10Total = 0;
+    for (const row of normalRows) {
+      if (row['支払/相殺区分'] === '請求' && row.税率 === '10') {
+        taxable10Total += row.金額;
+      }
+    }
+
+    // カテゴリ別集計（消費税を按分）
+    const byCategory = {};
+    let taxAllocated = 0;
+    const taxableEntries = [];
+    for (const row of normalRows) {
       const cat = row.品目 || '(空)';
       if (!byCategory[cat]) byCategory[cat] = { 品目: cat, 金額: 0, 消費税額: 0, 税込合計: 0, 件数: 0 };
       byCategory[cat].金額 += row.金額;
-      byCategory[cat].消費税額 += row.消費税額;
-      byCategory[cat].税込合計 += row.金額 + row.消費税額;
       byCategory[cat].件数++;
+
+      // 税率10%の請求行には消費税を按分
+      if (row['支払/相殺区分'] === '請求' && row.税率 === '10' && taxable10Total !== 0) {
+        taxableEntries.push(cat);
+      }
+    }
+
+    // 消費税按分（端数は最後のカテゴリに調整）
+    if (taxLineAmount > 0 && taxable10Total !== 0) {
+      for (const cat of [...new Set(taxableEntries)]) {
+        const ratio = byCategory[cat].金額 / taxable10Total;
+        const tax = Math.round(taxLineAmount * ratio);
+        byCategory[cat].消費税額 = tax;
+        taxAllocated += tax;
+      }
+      // 端数調整（最後の税率10%カテゴリに差分を加算）
+      const diff = taxLineAmount - taxAllocated;
+      if (diff !== 0) {
+        const lastCat = [...new Set(taxableEntries)].pop();
+        byCategory[lastCat].消費税額 += diff;
+      }
+    }
+
+    // 税込合計を計算
+    for (const cat of Object.values(byCategory)) {
+      cat.税込合計 = cat.金額 + cat.消費税額;
     }
 
     res.json({
@@ -449,6 +498,7 @@ router.post('/upload-billing', upload.single('file'), (req, res) => {
       byCategory: Object.values(byCategory),
       totalPayment,
       totalOffset,
+      消費税合計: taxLineAmount,
       発行日: billingRows[0]?.発行日 || '',
     });
   } catch (e) {
@@ -891,17 +941,20 @@ function renderPage() {
 
     function getBillingTotals() {
       if (!billingData || !billingData.rows) return null;
-      // 請求行のみの合計（= 楽天から請求される経費合計）
+      // 請求行のみの合計（消費税行は除外 — 按分済みのbyCategoryから取る）
       let seikyuTotal = 0;
+      const taxAmount = billingData.消費税合計 || 0;
       for (const row of billingData.rows) {
-        if (row['支払/相殺区分'] === '請求') {
+        if (row['支払/相殺区分'] === '請求' && row.品目 !== '消費税') {
           seikyuTotal += (row.金額 || 0);
         }
       }
+      // 税込の請求合計 = 税抜合計 + 消費税
+      const seikyuTotalWithTax = seikyuTotal + taxAmount;
       const adCost = getAdCostFromBilling();
       const coupon = lastData ? (lastData.byTax['10'].クーポン値引額 + lastData.byTax['8'].クーポン値引額) : 0;
-      const pfFee = seikyuTotal - adCost - coupon;
-      return { seikyuTotal, adCost, coupon, pfFee };
+      const pfFee = seikyuTotalWithTax - adCost - coupon;
+      return { seikyuTotal: seikyuTotalWithTax, adCost, coupon, pfFee, 消費税合計: taxAmount };
     }
 
     function updateConfirmState() {
