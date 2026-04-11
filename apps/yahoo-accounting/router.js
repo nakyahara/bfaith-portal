@@ -72,6 +72,9 @@ function resolveProducts(rows, db) {
       continue;
     }
 
+    // オークション自動採番コード判定（AUCTIONで始まる = 毎回変わるので登録不要）
+    const isAuction = lookupCode.startsWith('auction');
+
     // Stage 1: SubCodeで検索、なければ Stage 2: ItemIdで検索
     let product = subCode ? productsMap.get(subCode) : null;
     let resolveMethod = subCode ? 'subcode' : null;
@@ -113,6 +116,16 @@ function resolveProducts(rows, db) {
         existing.amount += row.売上合計 || 0;
         unresolvedSegment.set(key, existing);
       }
+    } else if (isAuction) {
+      // オークション自動採番: CSV税率を使用、セグメント=1（自社商品）、原価=0
+      resolved.push({
+        ...row,
+        商品コード_resolved: lookupCode,
+        原価: 0,
+        税率: row.CSV税率 || 10,
+        売上分類: 1,
+        解決方法: 'auction_auto',
+      });
     } else {
       resolved.push({
         ...row,
@@ -127,7 +140,7 @@ function resolveProducts(rows, db) {
       };
       existing.count++;
       existing.amount += row.売上合計 || 0;
-      unresolved.set(itemId, existing);
+      unresolved.set(key, existing);
     }
   }
 
@@ -966,7 +979,7 @@ function renderPage() {
         document.getElementById('otherDetailCard').style.display = 'block';
         let html = '<table class="detail-table"><tr><th>商品コード</th><th>商品名</th><th>解決方法</th><th>行数</th><th>個数</th><th>売上合計</th></tr>';
         for (const d of data.otherDetails) {
-          const method = { subcode: 'SubCode一致', itemid: 'ItemId一致', unresolved: '未解決', no_code: 'コードなし' }[d.解決方法] || d.解決方法;
+          const method = { subcode: 'SubCode一致', itemid: 'ItemId一致', auction_auto: 'オークション自動', unresolved: '未解決', no_code: 'コードなし' }[d.解決方法] || d.解決方法;
           html += '<tr><td style="text-align:left">' + (d.商品コード || '-') + '</td><td style="text-align:left">' + (d.商品名 || '').slice(0, 50) + '</td><td style="text-align:left">' + method + '</td><td class="num">' + d.count + '</td><td class="num">' + d.個数 + '</td><td class="num">' + fmt(d.売上合計) + '</td></tr>';
         }
         html += '</table>';
