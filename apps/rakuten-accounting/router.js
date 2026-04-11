@@ -1309,7 +1309,14 @@ function renderPage() {
         const segNames = {1:'自社商品', 2:'取扱限定', 3:'仕入れ商品', other:'その他/未分類'};
         const adTargets = ['1','2'];
         let csv = '\\uFEFF';
-        csv += '集計月,セグメント,売上合計,クーポン値引額,クーポン値引後売上,広告費,原価合計,粗利率,行数\\n';
+        csv += '集計月,セグメント,売上合計,クーポン値引額,クーポン値引後売上,広告費,原価合計,原価率\\n';
+
+        // yyyy-mm → yyyy-mm-dd（月末日）変換
+        function toLastDay(ym) {
+          const [y, m] = ym.split('-').map(Number);
+          const last = new Date(y, m, 0).getDate();
+          return ym + '-' + String(last).padStart(2, '0');
+        }
 
         for (const row of rows) {
           const seg = row.by_segment || {};
@@ -1328,9 +1335,13 @@ function renderPage() {
             if (mk) adMap[mk] += (ad - adSum);
           }
 
+          const ymDate = toLastDay(row.year_month);
           for (const [key, sr] of Object.entries(seg)) {
             const label = segNames[key] || key;
-            csv += row.year_month + ',' + key + ':' + label + ',' + Math.round(sr.売上合計||0) + ',' + Math.round(sr.クーポン値引額||0) + ',' + Math.round(sr.クーポン値引後売上||0) + ',' + (adMap[key]||0) + ',' + Math.round(sr.原価合計||0) + ',' + (sr.粗利率||'0.0') + ',' + (sr.行数||0) + '\\n';
+            const s = sr.売上合計 || 0;
+            const g = sr.原価合計 || 0;
+            const genkaRate = s > 0 ? (g / s * 100).toFixed(1) : '0.0';
+            csv += ymDate + ',' + key + ':' + label + ',' + Math.round(s) + ',' + Math.round(sr.クーポン値引額||0) + ',' + Math.round(sr.クーポン値引後売上||0) + ',' + (adMap[key]||0) + ',' + Math.round(g) + ',' + genkaRate + '\\n';
           }
         }
 
