@@ -63,14 +63,23 @@ function resolveProducts(rows, db) {
   const unresolvedSegment = new Map();
 
   for (const row of rows) {
+    const subCode = (row.サブコード || '').toLowerCase();
     const itemId = (row.商品コード || '').toLowerCase();
+    const lookupCode = subCode || itemId;
 
-    if (!itemId) {
+    if (!lookupCode) {
       resolved.push({ ...row, 原価: 0, 税率: null, 売上分類: null, 解決方法: 'no_code' });
       continue;
     }
 
-    const product = productsMap.get(itemId);
+    // Stage 1: SubCodeで検索、なければ Stage 2: ItemIdで検索
+    let product = subCode ? productsMap.get(subCode) : null;
+    let resolveMethod = subCode ? 'subcode' : null;
+
+    if (!product) {
+      product = productsMap.get(itemId);
+      resolveMethod = 'itemid';
+    }
 
     if (product) {
       const taxRate = product.消費税率 ? Math.round(product.消費税率 * 100) : null;
@@ -80,7 +89,7 @@ function resolveProducts(rows, db) {
         原価: product.原価 || 0,
         税率: taxRate,
         売上分類: product.売上分類,
-        解決方法: 'direct',
+        解決方法: resolveMethod,
       });
 
       if (taxRate === null) {
@@ -111,8 +120,9 @@ function resolveProducts(rows, db) {
         原価: 0, 税率: null, 売上分類: null,
         解決方法: 'unresolved',
       });
-      const existing = unresolved.get(itemId) || {
-        code: itemId, name: row.商品名 || '',
+      const key = subCode || itemId;
+      const existing = unresolved.get(key) || {
+        code: key, name: row.商品名 || '',
         csvTaxRate: row.CSV税率 || null, count: 0, amount: 0,
       };
       existing.count++;
@@ -279,6 +289,7 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
         if (!orderId) continue;
 
         const itemId = cols[4] || '';
+        const subCode = cols[5] || '';
         const quantity = parseInt(cols[3]) || 0;
         const unitPrice = num(cols[15]);
         const lineSubTotal = num(cols[18]) || unitPrice * quantity;
@@ -296,6 +307,7 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
         allRows.push({
           注文番号: orderId,
           商品コード: itemId,
+          サブコード: subCode,
           商品名: title,
           単価: unitPrice,
           個数: quantity,
@@ -954,7 +966,7 @@ function renderPage() {
         document.getElementById('otherDetailCard').style.display = 'block';
         let html = '<table class="detail-table"><tr><th>商品コード</th><th>商品名</th><th>解決方法</th><th>行数</th><th>個数</th><th>売上合計</th></tr>';
         for (const d of data.otherDetails) {
-          const method = { direct: 'マスター一致', unresolved: '未解決', no_code: 'コードなし' }[d.解決方法] || d.解決方法;
+          const method = { subcode: 'SubCode一致', itemid: 'ItemId一致', unresolved: '未解決', no_code: 'コードなし' }[d.解決方法] || d.解決方法;
           html += '<tr><td style="text-align:left">' + (d.商品コード || '-') + '</td><td style="text-align:left">' + (d.商品名 || '').slice(0, 50) + '</td><td style="text-align:left">' + method + '</td><td class="num">' + d.count + '</td><td class="num">' + d.個数 + '</td><td class="num">' + fmt(d.売上合計) + '</td></tr>';
         }
         html += '</table>';

@@ -9,9 +9,34 @@ import { fileURLToPath } from 'url';
 import archiver from 'archiver';
 
 import * as settingsDb from './settings-db.js';
-import * as rakuten from './rakuten.js';
+import * as rakutenLocal from './rakuten.js';
 import * as mapper from './mapper.js';
 import * as csvExporter from './csv-exporter.js';
+
+// --- ミニPC経由で楽天RMS API実行 ---
+const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
+function getServiceHeaders() {
+  return {
+    'CF-Access-Client-Id': process.env.CF_ACCESS_CLIENT_ID || '',
+    'CF-Access-Client-Secret': process.env.CF_ACCESS_CLIENT_SECRET || '',
+    'Authorization': `Bearer ${process.env.WAREHOUSE_SERVICE_TOKEN || ''}`,
+    'Content-Type': 'application/json',
+  };
+}
+const rakuten = {
+  async getAllItemCodes() {
+    const res = await fetch(`${WAREHOUSE_URL}/service-api/rakuten-rms/items/all-codes`, { headers: getServiceHeaders(), signal: AbortSignal.timeout(120000) });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.message || 'RMS API error');
+    return data.mapping;
+  },
+  async getItemDetailsBulk(serviceSecret, licenseKey, itemCodes) {
+    const res = await fetch(`${WAREHOUSE_URL}/service-api/rakuten-rms/items/details-bulk`, { method: 'POST', headers: getServiceHeaders(), body: JSON.stringify({ itemCodes }), signal: AbortSignal.timeout(120000) });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.message || 'RMS API error');
+    return data.items;
+  },
+};
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -140,16 +165,9 @@ router.post('/api/registered-items/clear', async (req, res) => {
 router.post('/api/check-csv', async (req, res) => {
   await ensureDb();
   const cfg = settingsDb.getAllConfig();
-  const serviceSecret = cfg.service_secret || '';
-  const licenseKey = cfg.license_key || '';
-
-  if (!serviceSecret || !licenseKey) {
-    return res.json({ error: '楽天RMS APIの認証情報が設定されていません。設定ページで入力してください。' });
-  }
-
   let rakutenMapping;
   try {
-    rakutenMapping = await rakuten.getAllItemCodes(serviceSecret, licenseKey);
+    rakutenMapping = await rakuten.getAllItemCodes();
   } catch (e) {
     return res.json({ error: `楽天RMS API エラー: ${e.message}` });
   }
@@ -179,7 +197,7 @@ router.post('/api/check-csv', async (req, res) => {
 
   let details;
   try {
-    details = await rakuten.getItemDetailsBulk(serviceSecret, licenseKey, apiCodes);
+    details = await rakuten.getItemDetailsBulk(null, null, apiCodes);
   } catch (e) {
     return res.json({ error: `楽天RMS API エラー（詳細取得）: ${e.message}` });
   }
@@ -280,7 +298,7 @@ router.post('/api/export-csv', async (req, res) => {
   const apiCodes = item_codes.map(c => manage_numbers[c] || c);
   let details;
   try {
-    details = await rakuten.getItemDetailsBulk(serviceSecret, licenseKey, apiCodes);
+    details = await rakuten.getItemDetailsBulk(null, null, apiCodes);
   } catch (e) {
     return res.json({ error: `楽天RMS API エラー: ${e.message}` });
   }

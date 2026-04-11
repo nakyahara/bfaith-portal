@@ -48,15 +48,7 @@
   <div class="card mb-4">
     <div class="card-header fw-bold">楽天 RMS API 認証情報</div>
     <div class="card-body">
-      <div class="mb-3">
-        <label class="form-label">Service Secret <small class="text-muted">（SP〜 で始まる）</small></label>
-        <input type="password" class="form-control" name="service_secret" value="<%= cfg.service_secret || '' %>" placeholder="SPxxxxxxxxxxxxxxxx">
-      </div>
-      <div class="mb-3">
-        <label class="form-label">License Key <small class="text-muted">（SL〜 で始まる）</small></label>
-        <input type="password" class="form-control" name="license_key" value="<%= cfg.license_key || '' %>" placeholder="SLxxxxxxxxxxxxxxxx">
-        <div class="form-text text-warning">ライセンスキーは3ヶ月で失効します。期限切れの場合はRMS管理画面で再発行してください。</div>
-      </div>
+      <p class="text-success fw-bold">✓ APIキーはサーバー側で管理されています（入力不要）</p>
       <div class="mb-3">
         <label class="form-label">楽天店舗URL <small class="text-muted">（例: b-faith ※ドメイン部分のみ）</small></label>
         <input type="text" class="form-control" name="shop_url" value="<%= cfg.shop_url || '' %>" placeholder="b-faith">
@@ -150,8 +142,7 @@
     <div class="card-header fw-bold">メルカリShops API <span class="badge bg-secondary ms-2">APIモード用</span></div>
     <div class="card-body">
       <div class="mb-3">
-        <label class="form-label">アクセストークン</label>
-        <input type="password" class="form-control" name="mercari_token" value="<%= cfg.mercari_token || '' %>">
+        <p class="text-success fw-bold">✓ APIトークンはサーバー側で管理されています（入力不要）</p>
       </div>
       <div class="mb-3">
         <div class="form-check">
