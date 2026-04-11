@@ -117,11 +117,11 @@ function resolveProducts(rows, db) {
         unresolvedSegment.set(key, existing);
       }
     } else if (isAuction) {
-      // オークション自動採番: CSV税率を使用、セグメント=1（自社商品）、原価=0
+      // オークション自動採番: CSV税率を使用、セグメント=1（自社商品）、原価=1000
       resolved.push({
         ...row,
         商品コード_resolved: lookupCode,
-        原価: 0,
+        原価: 1000,
         税率: row.CSV税率 || 10,
         売上分類: 1,
         解決方法: 'auction_auto',
