@@ -301,6 +301,7 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
         const orderId = cols[0] || '';
         if (!orderId) continue;
 
+        const neId = cols[2] || ''; // C列: Id（b-faith01-XXXXX形式、受取明細の注文IDと紐付け用）
         const itemId = cols[4] || '';
         const subCode = cols[5] || '';
         const quantity = parseInt(cols[3]) || 0;
@@ -319,6 +320,7 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
 
         allRows.push({
           注文番号: orderId,
+          注文ID: neId,
           商品コード: itemId,
           サブコード: subCode,
           商品名: title,
@@ -349,11 +351,12 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
     const { resolved, unresolved, unresolvedTax, unresolvedSegment, zeroGenka } = resolveProducts(allRows, db);
 
     // 注文IDベースのルックアップマップ（受取明細との紐付け用）
+    // キー: C列のId（b-faith01-XXXXX形式）= 受取明細の注文ID
     // 1注文に複数明細がある場合は全行分の情報を保持
     const orderMap = {};
     for (const r of resolved) {
       if (r.解決方法 === 'no_code' || r.解決方法 === 'unresolved') continue;
-      const oid = r.注文番号;
+      const oid = r.注文ID; // C列のId
       if (!oid) continue;
       if (!orderMap[oid]) orderMap[oid] = [];
       orderMap[oid].push({
