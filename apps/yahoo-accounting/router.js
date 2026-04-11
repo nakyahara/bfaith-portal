@@ -878,8 +878,10 @@ function renderPage() {
       const hasUnresSeg = data.unresolvedSegment && data.unresolvedSegment.length > 0;
       const canConfirm = !hasUnresolved;
 
+      // 対象年月は受取明細から取得
+      const targetYearMonth = (receiptData && receiptData.receiptYearMonth) ? receiptData.receiptYearMonth : (data.yearMonth || '不明');
       let summaryHtml = '<div class="' + (canConfirm ? 'ok' : 'warn') + '">';
-      summaryHtml += '<b>対象年月: ' + (data.yearMonth || '不明') + '</b> （' + data.fileCount + 'ファイル）<br>';
+      summaryHtml += '<b>対象年月: ' + targetYearMonth + '</b> （NE_Items_Pro: ' + data.fileCount + 'ファイル）<br>';
       summaryHtml += '総行数: ' + data.totalRows + ' / 解決済: ' + data.resolvedCount + ' / 未登録商品: ' + data.unresolvedProducts.length + '件';
       if (hasUnresTax) summaryHtml += ' / <span class="negative">税率未登録: ' + data.unresolvedTax.length + '件（CSV税率 or 10%仮扱い）</span>';
       if (hasUnresSeg) summaryHtml += ' / <span class="negative">セグメント未登録: ' + data.unresolvedSegment.length + '件</span>';
@@ -983,8 +985,10 @@ function renderPage() {
       if (ready) {
         const bt = getBillingTotals();
         pre.className = 'ok';
-        pre.innerHTML = 'NE_Items_Pro: <b>' + (lastData.yearMonth || '不明') + '</b>（' + lastData.totalRows + '行）'
+        const confirmYm = (receiptData && receiptData.receiptYearMonth) || '不明';
+        pre.innerHTML = '対象年月: <b>' + confirmYm + '</b>'
           + ' / 受取明細: <b>' + receiptData.totalRows + '行</b>'
+          + ' / NE_Items_Pro: <b>' + lastData.totalRows + '行</b>'
           + ' / 請求明細: <b>' + billingData.totalRows + '行</b>'
           + ' / PF手数料: <b>\\u00a5' + Math.round(bt.pfFee).toLocaleString() + '</b>'
           + (bt.adCost ? ' / 広告費: <b>\\u00a5' + Math.round(bt.adCost).toLocaleString() + '</b>' : '');
@@ -1329,7 +1333,7 @@ function renderPage() {
       if (!receiptData) { alert('先に受取明細CSVをアップロードしてください'); return; }
       if (!billingData) { alert('先に請求明細CSVをアップロードしてください'); return; }
 
-      const ym = lastData.yearMonth || '';
+      const ym = (receiptData && receiptData.receiptYearMonth) ? receiptData.receiptYearMonth : (lastData.yearMonth || '');
       if (!ym) { alert('対象年月が検出できません'); return; }
       if (!confirm(ym + ' の集計を確定しますか？')) return;
 
