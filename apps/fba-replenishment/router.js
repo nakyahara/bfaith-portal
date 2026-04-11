@@ -78,6 +78,7 @@ router.get('/', (req, res) => {
 
 // ===== SP-APIレポート取得 =====
 
+let fetchInProgress = false; // ステータス表示用フラグ
 // 全レポート取得 → ミニPC経由でSP-APIを実行（ジョブ化）
 router.post('/api/fetch-reports', async (req, res) => {
   try {
