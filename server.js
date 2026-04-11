@@ -18,6 +18,7 @@ import mirrorRouter from './apps/warehouse-mirror/router.js';
 import amazonAccountingRouter from './apps/amazon-accounting/router.js';
 import rakutenAccountingRouter from './apps/rakuten-accounting/router.js';
 import yahooAccountingRouter from './apps/yahoo-accounting/router.js';
+import aupayAccountingRouter from './apps/aupay-accounting/router.js';
 import fbaProfitabilityRouter from './apps/fba-profitability/router.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -220,6 +221,15 @@ const apps = [
     category: 'accounting',
   },
   {
+    id: 'aupay-accounting',
+    name: 'auペイ売上集計',
+    description: 'auペイマーケット注文データCSVから税率別・セグメント別の売上集計を自動計算',
+    icon: '📙',
+    path: '/apps/aupay-accounting',
+    status: 'active',
+    category: 'accounting',
+  },
+  {
     id: 'fba-profitability',
     name: 'FBA収益性分析',
     description: 'FBA全商品の利益率を分析・低利益率商品を検出',
@@ -344,6 +354,7 @@ app.use('/apps/amazon-accounting', (req, res, next) => {
 }, amazonAccountingRouter);
 app.use('/apps/rakuten-accounting', requireAuth, rakutenAccountingRouter);
 app.use('/apps/yahoo-accounting', requireAuth, yahooAccountingRouter);
+app.use('/apps/aupay-accounting', requireAuth, aupayAccountingRouter);
 app.use('/apps/fba-profitability', requireAppAccess('fba-profitability'), fbaProfitabilityRouter);
 
 // 未実装アプリのプレースホルダー

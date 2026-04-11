@@ -183,6 +183,14 @@ function createTables() {
     synced_at           TEXT
   )`);
 
+  // 8b. 商品別消費税率（手動登録、例外商品等NE税率がない場合用）
+  db.exec(`CREATE TABLE IF NOT EXISTS product_tax_rate (
+    sku                 TEXT PRIMARY KEY,
+    tax_rate            REAL NOT NULL,
+    商品名              TEXT,
+    synced_at           TEXT
+  )`);
+
   // 9. SP-API注文ログ（append-only）
   db.exec(`CREATE TABLE IF NOT EXISTS raw_sp_orders_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -243,7 +251,68 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_sp_orders_asin ON raw_sp_orders(asin)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_sp_orders_channel ON raw_sp_orders(fulfillment_channel)');
 
-  // 11. 店舗マスタ
+  // 11. Yahoo!ショッピング受注ログ（append-only）
+  db.exec(`CREATE TABLE IF NOT EXISTS raw_yahoo_orders_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id            TEXT NOT NULL,
+    source_window_start TEXT,
+    source_window_end   TEXT,
+    order_id            TEXT NOT NULL,
+    order_time          TEXT,
+    last_update_time    TEXT,
+    order_status        TEXT,
+    pay_status          TEXT,
+    ship_status         TEXT,
+    total_price         REAL,
+    pay_charge          REAL,
+    ship_charge         REAL,
+    discount            REAL,
+    use_point           REAL,
+    line_id             INTEGER,
+    item_id             TEXT,
+    title               TEXT,
+    sub_code            TEXT,
+    unit_price          REAL,
+    original_price      REAL,
+    quantity            INTEGER,
+    item_tax_ratio      REAL,
+    coupon_discount     REAL,
+    ingested_at         TEXT
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_yh_log_batch ON raw_yahoo_orders_log(batch_id)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_yh_log_order ON raw_yahoo_orders_log(order_id)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_yh_log_date ON raw_yahoo_orders_log(order_time)');
+
+  // 12. Yahoo!ショッピング受注（最新状態、order_id+line_id単位）
+  db.exec(`CREATE TABLE IF NOT EXISTS raw_yahoo_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id            TEXT NOT NULL,
+    order_time          TEXT,
+    last_update_time    TEXT,
+    order_status        TEXT,
+    pay_status          TEXT,
+    ship_status         TEXT,
+    total_price         REAL,
+    pay_charge          REAL,
+    ship_charge         REAL,
+    discount            REAL,
+    use_point           REAL,
+    line_id             INTEGER,
+    item_id             TEXT,
+    title               TEXT,
+    sub_code            TEXT,
+    unit_price          REAL,
+    original_price      REAL,
+    quantity            INTEGER,
+    item_tax_ratio      REAL,
+    coupon_discount     REAL,
+    synced_at           TEXT
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_yh_orders_order ON raw_yahoo_orders(order_id)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_yh_orders_date ON raw_yahoo_orders(order_time)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_yh_orders_item ON raw_yahoo_orders(item_id)');
+
+  // 13. 店舗マスタ
   db.exec(`CREATE TABLE IF NOT EXISTS shops (
     shop_code           TEXT PRIMARY KEY,
     shop_name           TEXT,
