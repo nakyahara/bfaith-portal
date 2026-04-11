@@ -813,10 +813,11 @@
           result = jobResult.result || jobResult;
         }
 
-        const planning = result.planning || {};
-        const restock = result.restock || {};
-        const inventory = result.inventory || {};
-        log(`完了! PLANNING: ${planning.count ?? 0}件, RESTOCK: ${restock.count ?? 0}件, INVENTORY: ${inventory.count ?? 0}件`);
+        // result.planning は数値(ミニPC経由) or オブジェクト{count}(旧直接版) の両方に対応
+        const pCount = typeof result.planning === 'number' ? result.planning : (result.planning?.count ?? 0);
+        const rCount = typeof result.restock === 'number' ? result.restock : (result.restock?.count ?? 0);
+        const iCount = typeof result.inventory === 'number' ? result.inventory : (result.inventory?.count ?? 0);
+        log(`完了! PLANNING: ${pCount}件, RESTOCK: ${rCount}件, INVENTORY: ${iCount}件`);
         if (result.errors && result.errors.length > 0) {
           result.errors.forEach(e => log(`警告: ${e.report} - ${e.error}`));
         }
