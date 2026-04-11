@@ -683,10 +683,32 @@ function renderPage() {
     <a href="/">\\u2190 \\u30dd\\u30fc\\u30bf\\u30eb\\u306b\\u623b\\u308b</a>
   </div>
   <div class="wrap">
-    <!-- 工程1: 注文データCSVアップロード -->
+    <!-- 工程1: 受取明細CSV -->
     <div class="card">
-      <h2>工程1: Yahoo注文データCSVアップロード（NE_Items_Pro）</h2>
-      <p class="meta">Store Creator Pro → NE_Items_Pro CSV（Shift_JIS）</p>
+      <h2>工程1: 受取明細CSV取り込み</h2>
+      <p class="meta">Store Creator Pro → 受取明細タブ → CSV（Shift_JIS）— 複数ファイル対応</p>
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+        <input type="file" id="receiptFiles" accept=".csv" multiple>
+        <button class="btn btn-p" id="receiptBtn" onclick="doReceiptUpload()">受取明細取り込み</button>
+      </div>
+      <div id="receiptResult" style="margin-top:8px"></div>
+    </div>
+
+    <!-- 工程2: 請求明細CSV -->
+    <div class="card">
+      <h2>工程2: 請求明細CSV取り込み</h2>
+      <p class="meta">Store Creator Pro → 請求明細タブ → CSV（Shift_JIS）— 複数ファイル対応</p>
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+        <input type="file" id="billingFiles" accept=".csv" multiple>
+        <button class="btn btn-w" id="billingBtn" onclick="doBillingUpload()">請求明細取り込み</button>
+      </div>
+      <div id="billingResult" style="margin-top:8px"></div>
+    </div>
+
+    <!-- 工程3: NE_Items_Pro CSV（注文データ） -->
+    <div class="card">
+      <h2>工程3: 注文データCSVアップロード（NE_Items_Pro）</h2>
+      <p class="meta">NE_Items_Pro CSV（Shift_JIS）— 受取明細と紐付けて税率別・セグメント別集計を実行</p>
       <p class="meta" style="color:#6001d2;font-weight:bold">複数ファイル選択可（最大10ファイル）</p>
       <div style="margin-top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <input type="file" id="csvFiles" accept=".csv" multiple>
@@ -703,15 +725,6 @@ function renderPage() {
         <div id="summary"></div>
       </div>
 
-      <!-- CSVダウンロード -->
-      <div class="card" id="csvDownloadArea" style="display:none">
-        <h2>CSVダウンロード</h2>
-        <div style="display:flex;gap:12px;flex-wrap:wrap">
-          <button class="btn btn-s" onclick="downloadDetailCsv()">明細データCSV（税率・セグメント付き）</button>
-          <button class="btn btn-w" onclick="downloadSummaryCsv()">集計サマリーCSV</button>
-        </div>
-      </div>
-
       <!-- 未登録情報 -->
       <div id="unresolvedArea" class="card" style="display:none">
         <h2>未登録情報</h2>
@@ -722,14 +735,14 @@ function renderPage() {
         </div>
       </div>
 
-      <!-- 税率別集計 -->
-      <div class="card">
-        <h2>税率別集計</h2>
-        <div id="taxTable"></div>
+      <!-- 税率別集計（受取明細ベース） -->
+      <div class="card" id="receiptTaxCard" style="display:none">
+        <h2>税率別売上集計（受取明細ベース）</h2>
+        <div id="receiptTaxTable"></div>
       </div>
 
       <!-- MF連携用 -->
-      <div class="card">
+      <div class="card" id="mfCard" style="display:none">
         <h2>MF連携用 税込み集計</h2>
         <div id="mfTable"></div>
       </div>
@@ -748,6 +761,15 @@ function renderPage() {
         <div id="costBySegment" style="margin-top:12px"></div>
       </div>
 
+      <!-- CSVダウンロード -->
+      <div class="card" id="csvDownloadArea" style="display:none">
+        <h2>CSVダウンロード</h2>
+        <div style="display:flex;gap:12px;flex-wrap:wrap">
+          <button class="btn btn-s" onclick="downloadDetailCsv()">明細データCSV（税率・セグメント付き）</button>
+          <button class="btn btn-w" onclick="downloadSummaryCsv()">集計サマリーCSV</button>
+        </div>
+      </div>
+
       <!-- その他明細 -->
       <div id="otherDetailCard" class="card" style="display:none">
         <h2>「その他/未分類」明細</h2>
@@ -762,33 +784,10 @@ function renderPage() {
       </div>
     </div>
 
-    <!-- 工程4: 受取明細CSV -->
-    <div class="card">
-      <h2>工程4: 受取明細CSV取り込み</h2>
-      <p class="meta">Store Creator Pro → 受取明細CSV（Shift_JIS）— 複数ファイル対応</p>
-      <p class="meta">受取明細の注文IDとNE_Items_Proの税率を紐付けて、税率別売上を集計します</p>
-      <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
-        <input type="file" id="receiptFiles" accept=".csv" multiple>
-        <button class="btn btn-p" id="receiptBtn" onclick="doReceiptUpload()">受取明細取り込み</button>
-      </div>
-      <div id="receiptResult" style="margin-top:8px"></div>
-    </div>
-
-    <!-- 工程5: 請求明細CSV -->
-    <div class="card">
-      <h2>工程5: 請求明細CSV取り込み</h2>
-      <p class="meta">Store Creator Pro → 請求明細CSV（Shift_JIS）— 複数ファイル対応</p>
-      <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
-        <input type="file" id="billingFiles" accept=".csv" multiple>
-        <button class="btn btn-w" id="billingBtn" onclick="doBillingUpload()">請求明細取り込み</button>
-      </div>
-      <div id="billingResult" style="margin-top:8px"></div>
-    </div>
-
     <!-- 確定 -->
     <div class="card" id="confirmCard">
       <h2>確定</h2>
-      <div id="confirmPreCheck" class="warn" style="margin-bottom:8px">NE_Items_Pro CSV、受取明細CSV、請求明細CSVの3つをアップロードしてから確定してください</div>
+      <div id="confirmPreCheck" class="warn" style="margin-bottom:8px">受取明細CSV、請求明細CSV、NE_Items_Pro CSVの3つをアップロードしてから確定してください</div>
       <div style="display:flex;gap:12px;align-items:center;margin-bottom:8px">
         <button class="btn btn-s" id="confirmBtn" onclick="doConfirm()" disabled>この月の集計を確定</button>
       </div>
@@ -946,29 +945,9 @@ function renderPage() {
         document.getElementById('unresolvedArea').style.display = 'none';
       }
 
-      // 税率別集計
-      let taxHtml = '<table><tr><th>税率</th><th>売上合計</th><th>クーポン値引額</th><th>クーポン値引後売上</th><th>原価合計</th><th>行数</th></tr>';
-      for (const [key, label] of [['10', '10%'], ['8', '8%']]) {
-        const row = data.byTax[key];
-        taxHtml += '<tr><td>' + label + '</td><td class="num">' + fmt(row.売上合計) + '</td><td class="num">' + fmt(row.クーポン値引額) + '</td><td class="num">' + fmt(row.クーポン値引後売上) + '</td><td class="num">' + fmt(row.原価合計) + '</td><td class="num">' + row.行数 + '</td></tr>';
-      }
-      const t10 = data.byTax['10'], t8 = data.byTax['8'];
-      taxHtml += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td>';
-      taxHtml += '<td class="num">' + fmt(t10.売上合計 + t8.売上合計) + '</td>';
-      taxHtml += '<td class="num">' + fmt(t10.クーポン値引額 + t8.クーポン値引額) + '</td>';
-      taxHtml += '<td class="num">' + fmt(t10.クーポン値引後売上 + t8.クーポン値引後売上) + '</td>';
-      taxHtml += '<td class="num">' + fmt(t10.原価合計 + t8.原価合計) + '</td>';
-      taxHtml += '<td class="num">' + (t10.行数 + t8.行数) + '</td></tr></table>';
-      document.getElementById('taxTable').innerHTML = taxHtml;
-
-      // MF連携用
-      if (data.mfRow) {
-        let mfHtml = '<table><tr>';
-        data.mfColumns.forEach(c => mfHtml += '<th>' + c + '</th>');
-        mfHtml += '</tr><tr>';
-        data.mfColumns.forEach(c => mfHtml += '<td class="num" style="font-weight:bold">' + fmt(data.mfRow[c]) + '</td>');
-        mfHtml += '</tr></table>';
-        document.getElementById('mfTable').innerHTML = mfHtml;
+      // 受取明細が既に取り込まれていれば、紐付けて税率別集計を表示
+      if (receiptData) {
+        renderReceiptTax();
       }
 
       // セグメント別
@@ -1028,9 +1007,9 @@ function renderPage() {
       } else {
         pre.className = 'warn';
         let missing = [];
-        if (!lastData) missing.push('NE_Items_Pro CSV');
         if (!receiptData) missing.push('受取明細CSV');
         if (!billingData) missing.push('請求明細CSV');
+        if (!lastData) missing.push('NE_Items_Pro CSV');
         pre.innerHTML = missing.join('、') + 'をアップロードしてから確定してください';
       }
     }
@@ -1195,7 +1174,7 @@ function renderPage() {
       btn.textContent = '選択した税率・セグメントを登録して再集計';
     }
 
-    // ─── 工程4: 受取明細取り込み ───
+    // ─── 工程1: 受取明細取り込み ───
     async function doReceiptUpload() {
       const fileInput = document.getElementById('receiptFiles');
       if (!fileInput.files.length) { alert('ファイルを選択してください'); return; }
@@ -1218,31 +1197,8 @@ function renderPage() {
         if (data.error) { document.getElementById('receiptResult').innerHTML = '<div class="err">' + data.error + '</div>'; return; }
         receiptData = data;
 
-        // NE_Items_Proの注文ID→税率マップで受取明細を税率別に集計
-        const taxMap = buildTaxMap();
-        const receiptByTax = aggregateReceiptByTax(data.rows, taxMap);
-        receiptData.receiptByTax = receiptByTax;
-
         let html = '<div class="ok">受取明細取り込み完了: ' + data.totalRows + '行（' + data.fileCount + 'ファイル）</div>';
-
-        // 税率別受取集計
-        html += '<h3 style="font-size:13px;color:#555;margin:12px 0 4px">税率別受取集計</h3>';
-        html += '<table><tr><th>税率</th><th>金額（税込）</th><th>件数</th><th>税率不明件数</th></tr>';
-        html += '<tr><td>10%</td><td class="num">' + fmt(receiptByTax.tax10) + '</td><td class="num">' + receiptByTax.count10 + '</td><td></td></tr>';
-        html += '<tr><td>8%</td><td class="num">' + fmt(receiptByTax.tax8) + '</td><td class="num">' + receiptByTax.count8 + '</td><td></td></tr>';
-        html += '<tr><td>不明（10%仮扱い）</td><td class="num">' + fmt(receiptByTax.taxUnknown) + '</td><td></td><td class="num">' + receiptByTax.countUnknown + '</td></tr>';
-        html += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td><td class="num">' + fmt(receiptByTax.tax10 + receiptByTax.tax8 + receiptByTax.taxUnknown) + '</td><td class="num">' + (receiptByTax.count10 + receiptByTax.count8 + receiptByTax.countUnknown) + '</td><td></td></tr>';
-        html += '</table>';
-
-        // MF連携用
-        html += '<h3 style="font-size:13px;color:#555;margin:12px 0 4px">MF連携用（受取明細ベース）</h3>';
-        const mf10 = receiptByTax.tax10 + receiptByTax.taxUnknown; // 不明は10%扱い
-        const mf8 = receiptByTax.tax8;
-        html += '<table><tr><th>商品売上(10%税込)</th><th>商品売上(8%税込)</th><th>合計</th></tr>';
-        html += '<tr><td class="num" style="font-weight:bold">' + fmt(mf10) + '</td>';
-        html += '<td class="num" style="font-weight:bold">' + fmt(mf8) + '</td>';
-        html += '<td class="num" style="font-weight:bold">' + fmt(mf10 + mf8) + '</td></tr></table>';
-
+        html += '<p class="meta">工程3のNE_Items_Pro取り込み後に、注文IDで紐付けて税率別集計を表示します</p>';
         document.getElementById('receiptResult').innerHTML = html;
         updateConfirmState();
       } catch(e) {
@@ -1250,6 +1206,36 @@ function renderPage() {
       }
       btn.disabled = false;
       btn.textContent = '受取明細取り込み';
+    }
+
+    // ─── 受取明細の税率別集計を表示（NE_Items_Pro取込後に呼ばれる）───
+    function renderReceiptTax() {
+      if (!receiptData || !lastData) return;
+      const taxMap = buildTaxMap();
+      const rbt = aggregateReceiptByTax(receiptData.rows, taxMap);
+      receiptData.receiptByTax = rbt;
+
+      document.getElementById('receiptTaxCard').style.display = 'block';
+      let html = '<table><tr><th>税率</th><th>金額（税込）</th><th>件数</th></tr>';
+      html += '<tr><td>10%</td><td class="num">' + fmt(rbt.tax10) + '</td><td class="num">' + rbt.count10 + '</td></tr>';
+      html += '<tr><td>8%</td><td class="num">' + fmt(rbt.tax8) + '</td><td class="num">' + rbt.count8 + '</td></tr>';
+      if (rbt.countUnknown > 0) {
+        html += '<tr><td>不明（10%仮扱い）</td><td class="num">' + fmt(rbt.taxUnknown) + '</td><td class="num">' + rbt.countUnknown + '</td></tr>';
+      }
+      html += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td><td class="num">' + fmt(rbt.tax10 + rbt.tax8 + rbt.taxUnknown) + '</td><td class="num">' + (rbt.count10 + rbt.count8 + rbt.countUnknown) + '</td></tr>';
+      html += '</table>';
+
+      // MF連携用
+      const mf10 = rbt.tax10 + rbt.taxUnknown;
+      const mf8 = rbt.tax8;
+      document.getElementById('mfCard').style.display = 'block';
+      let mfHtml = '<table><tr><th>商品売上(10%税込)</th><th>商品売上(8%税込)</th><th>合計</th></tr>';
+      mfHtml += '<tr><td class="num" style="font-weight:bold">' + fmt(mf10) + '</td>';
+      mfHtml += '<td class="num" style="font-weight:bold">' + fmt(mf8) + '</td>';
+      mfHtml += '<td class="num" style="font-weight:bold">' + fmt(mf10 + mf8) + '</td></tr></table>';
+      document.getElementById('mfTable').innerHTML = mfHtml;
+
+      document.getElementById('receiptTaxTable').innerHTML = html;
     }
 
     // NE_Items_Proの注文ID→税率マップを構築
@@ -1301,7 +1287,7 @@ function renderPage() {
       return { tax10, tax8, taxUnknown, count10, count8, countUnknown };
     }
 
-    // ─── 工程5: 請求明細取り込み ───
+    // ─── 工程2: 請求明細取り込み ───
     async function doBillingUpload() {
       const fileInput = document.getElementById('billingFiles');
       if (!fileInput.files.length) { alert('ファイルを選択してください'); return; }
