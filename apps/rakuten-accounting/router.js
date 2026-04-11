@@ -1261,9 +1261,22 @@ function renderPage() {
             }
           }
 
-          // 仕訳書
+          // 変動費サマリー（仕訳書 or Excel過去データ）
           const bill = row.billing;
-          if (bill && Array.isArray(bill) && bill.length > 0) {
+          if (bill && bill.変動費) {
+            // Excel過去データ形式
+            const vc = bill.変動費;
+            html += '<h3 style="font-size:13px;color:#555;margin:12px 0 4px">変動費サマリー</h3>';
+            html += '<table><tr><th>PF手数料</th><th>運賃</th><th>広告費</th><th>店舗発行クーポン利用分</th><th>合計</th></tr>';
+            html += '<tr>';
+            html += '<td class="num" style="font-weight:bold">' + fmt(vc.PF手数料||0) + '</td>';
+            html += '<td class="num" style="font-weight:bold">' + fmt(vc.運賃||0) + '</td>';
+            html += '<td class="num" style="font-weight:bold">' + fmt(vc.広告費||0) + '</td>';
+            html += '<td class="num" style="font-weight:bold">' + fmt(vc.クーポン||0) + '</td>';
+            html += '<td class="num" style="font-weight:bold">' + fmt(vc.合計||0) + '</td>';
+            html += '</tr></table>';
+          } else if (bill && Array.isArray(bill) && bill.length > 0) {
+            // 仕訳書CSV形式
             html += '<h3 style="font-size:13px;color:#555;margin:12px 0 4px">店舗別仕訳</h3>';
             html += '<table><tr><th>品目</th><th>金額</th><th>消費税額</th><th>税込合計</th></tr>';
             for (const cat of bill) {
