@@ -587,6 +587,56 @@ router.post('/confirm', (req, res) => {
   }
 });
 
+// ─── POST /import-history — 過去データ一括投入 ───
+
+router.post('/import-history', (req, res) => {
+  const importKey = req.headers['x-import-key'];
+  if (importKey !== 'bfaith-import-2026') return res.status(403).json({ error: '認証エラー' });
+
+  const db = getMirrorDB();
+  const data = req.body;
+  if (!Array.isArray(data)) return res.status(400).json({ error: 'JSON配列が必要です' });
+
+  try {
+    const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+    const stmt = db.prepare(`INSERT OR IGNORE INTO mart_yahoo_monthly_summary
+      (year_month, total_rows, resolved_count, unresolved_count,
+       by_tax, by_segment, excluded, mf_row, ad_cost, billing, confirmed_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)
+    `);
+
+    const tx = db.transaction(() => {
+      let count = 0;
+      for (const entry of data) {
+        const ym = entry.yearMonth;
+        if (!ym) continue;
+
+        // bySegmentをmart形式に変換
+        const bySegment = {};
+        for (const [seg, val] of Object.entries(entry.bySegment || {})) {
+          bySegment[seg] = { 売上: val.売上 || 0, 原価: val.原価 || 0, 件数: 0 };
+        }
+
+        const billing = entry.billing || {};
+        const adCost = entry.adCost || 0;
+
+        const r = stmt.run(
+          ym, 0, 0, 0,
+          JSON.stringify({}), JSON.stringify(bySegment), JSON.stringify({}),
+          JSON.stringify({}), adCost, JSON.stringify({ 変動費: billing }), now
+        );
+        if (r.changes > 0) count++;
+      }
+      return count;
+    });
+
+    const inserted = tx();
+    res.json({ ok: true, inserted, total: data.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ─── GET /history — 過去月一覧 ───
 
 router.get('/history', (req, res) => {

@@ -353,7 +353,10 @@ app.use('/apps/amazon-accounting', (req, res, next) => {
   requireAuth(req, res, next);
 }, amazonAccountingRouter);
 app.use('/apps/rakuten-accounting', requireAuth, rakutenAccountingRouter);
-app.use('/apps/yahoo-accounting', requireAuth, yahooAccountingRouter);
+app.use('/apps/yahoo-accounting', (req, res, next) => {
+  if (req.path === '/import-history' && req.method === 'POST') return next();
+  requireAuth(req, res, next);
+}, yahooAccountingRouter);
 app.use('/apps/aupay-accounting', requireAuth, aupayAccountingRouter);
 app.use('/apps/fba-profitability', requireAppAccess('fba-profitability'), fbaProfitabilityRouter);
 
