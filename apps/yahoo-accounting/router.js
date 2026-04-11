@@ -1253,10 +1253,6 @@ function renderPage() {
       for (const row of receiptData.rows) {
         const amount = row['金額(税込)'] || 0;
         if (amount === 0) continue;
-        const item = row.利用項目 || '';
-        // 入金系のみ（決済金額）。手数料等は除外
-        if (item.includes('手数料') || item.includes('原資') || item.includes('利用料')
-            || item.includes('報酬') || item.includes('プラン')) continue;
 
         const orderId = row.注文ID || '';
         const orderItems = om[orderId];
@@ -1542,9 +1538,6 @@ function renderPage() {
       for (const row of receiptData.rows) {
         const amount = row['金額(税込)'] || 0;
         const item = row.利用項目 || '';
-        // 入金系のみ
-        if (item.includes('手数料') || item.includes('原資') || item.includes('利用料')
-            || item.includes('報酬') || item.includes('プラン')) continue;
         if (amount === 0) continue;
 
         const orderId = row.注文ID || '';
