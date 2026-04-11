@@ -64,13 +64,25 @@ function resolveProducts(rows, db) {
 
   for (const row of rows) {
     const itemCode = (row.商品コード || '').toLowerCase();
+    const mgmtId = (row.管理コード || '').toLowerCase();
 
     if (!itemCode) {
       resolved.push({ ...row, 原価: 0, 税率: null, 売上分類: null, 解決方法: 'no_code' });
       continue;
     }
 
-    const product = productsMap.get(itemCode);
+    // F列(itemManagementId)がある場合: itemCode+mgmtId で先に検索、なければ itemCode だけ
+    let product = null;
+    let resolveMethod = null;
+    if (mgmtId) {
+      const combinedCode = itemCode + mgmtId;
+      product = productsMap.get(combinedCode);
+      if (product) resolveMethod = 'combined';
+    }
+    if (!product) {
+      product = productsMap.get(itemCode);
+      if (product) resolveMethod = 'direct';
+    }
 
     if (product) {
       const taxRate = product.消費税率 ? Math.round(product.消費税率 * 100) : null;
@@ -80,7 +92,7 @@ function resolveProducts(rows, db) {
         原価: product.原価 || 0,
         税率: taxRate,
         売上分類: product.売上分類,
-        解決方法: 'direct',
+        解決方法: resolveMethod,
       });
 
       if (taxRate === null) {
@@ -111,13 +123,14 @@ function resolveProducts(rows, db) {
         原価: 0, 税率: null, 売上分類: null,
         解決方法: 'unresolved',
       });
-      const existing = unresolved.get(itemCode) || {
-        code: itemCode, name: row.商品名 || '',
+      const unresolvedKey = mgmtId ? itemCode + mgmtId : itemCode;
+      const existing = unresolved.get(unresolvedKey) || {
+        code: unresolvedKey, name: row.商品名 || '',
         csvTaxRate: row.CSV税率 || null, count: 0, amount: 0,
       };
       existing.count++;
       existing.amount += row.売上合計 || 0;
-      unresolved.set(itemCode, existing);
+      unresolved.set(unresolvedKey, existing);
     }
   }
 
@@ -286,6 +299,7 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
         if (cancelStatus === 'C') continue;
 
         const itemCode = col('itemCode');
+        const itemManagementId = col('itemManagementId');
         const quantity = parseInt(col('unit')) || 0;
         const unitPrice = num(col('itemPrice'));
         const totalItemPrice = num(col('totalItemPrice')) || unitPrice * quantity;
@@ -307,6 +321,7 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
         allRows.push({
           注文番号: orderId,
           商品コード: itemCode,
+          管理コード: itemManagementId,
           商品名: title,
           単価: unitPrice,
           個数: quantity,
