@@ -447,6 +447,61 @@ router.post('/upload-billing', upload.array('files', 10), (req, res) => {
   }
 });
 
+// ─── POST /upload-receipt — 受取明細CSVアップロード ───
+
+router.post('/upload-receipt', upload.array('files', 10), (req, res) => {
+  if (!req.files || req.files.length === 0) return res.status(400).json({ error: 'ファイルが必要です' });
+
+  try {
+    const num = v => { const n = parseFloat((v || '').replace(/,/g, '')); return isNaN(n) ? 0 : n; };
+    const allReceiptRows = [];
+
+    for (const file of req.files) {
+      const buf = fs.readFileSync(file.path);
+      fs.unlinkSync(file.path);
+
+      const csvRows = parseShiftJisCsv(buf);
+      if (csvRows.length < 2) continue;
+
+      // 受取明細CSV: 利用日, 注文ID, 利用項目, 備考, 金額（税抜き）, 消費税, 金額（税込）
+      for (let i = 1; i < csvRows.length; i++) {
+        const cols = csvRows[i];
+        if (cols.length < 7) continue;
+
+        allReceiptRows.push({
+          利用日: cols[0] || '',
+          注文ID: cols[1] || '',
+          利用項目: cols[2] || '',
+          備考: cols[3] || '',
+          '金額(税抜)': num(cols[4]),
+          消費税: num(cols[5]),
+          '金額(税込)': num(cols[6]),
+        });
+      }
+    }
+
+    if (allReceiptRows.length === 0) {
+      return res.status(400).json({ error: 'CSVからデータを読み取れませんでした' });
+    }
+
+    // 利用日から年月推定
+    let receiptYearMonth = '';
+    if (allReceiptRows[0]?.利用日) {
+      receiptYearMonth = allReceiptRows[0].利用日.slice(0, 7).replace(/\//g, '-');
+    }
+
+    res.json({
+      totalRows: allReceiptRows.length,
+      fileCount: req.files.length,
+      rows: allReceiptRows,
+      receiptYearMonth,
+    });
+  } catch (e) {
+    console.error('[YahooAccounting] 受取明細エラー:', e.message, e.stack);
+    res.status(500).json({ error: '受取明細取込エラー: ' + e.message });
+  }
+});
+
 // ─── POST /register — 税率・セグメント登録 ───
 
 router.post('/register', (req, res) => {
@@ -682,9 +737,21 @@ function renderPage() {
       </div>
     </div>
 
-    <!-- 工程4: 請求明細CSV（常時表示） -->
+    <!-- 工程4: 受取明細CSV -->
     <div class="card">
-      <h2>工程4: 請求明細CSV取り込み</h2>
+      <h2>工程4: 受取明細CSV取り込み</h2>
+      <p class="meta">Store Creator Pro → 受取明細CSV（Shift_JIS）— 複数ファイル対応</p>
+      <p class="meta">受取明細の注文IDとNE_Items_Proの税率を紐付けて、税率別売上を集計します</p>
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+        <input type="file" id="receiptFiles" accept=".csv" multiple>
+        <button class="btn btn-p" id="receiptBtn" onclick="doReceiptUpload()">受取明細取り込み</button>
+      </div>
+      <div id="receiptResult" style="margin-top:8px"></div>
+    </div>
+
+    <!-- 工程5: 請求明細CSV -->
+    <div class="card">
+      <h2>工程5: 請求明細CSV取り込み</h2>
       <p class="meta">Store Creator Pro → 請求明細CSV（Shift_JIS）— 複数ファイル対応</p>
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
         <input type="file" id="billingFiles" accept=".csv" multiple>
@@ -696,7 +763,7 @@ function renderPage() {
     <!-- 確定 -->
     <div class="card" id="confirmCard">
       <h2>確定</h2>
-      <div id="confirmPreCheck" class="warn" style="margin-bottom:8px">注文データCSVと請求明細CSVの両方をアップロードしてから確定してください</div>
+      <div id="confirmPreCheck" class="warn" style="margin-bottom:8px">NE_Items_Pro CSV、受取明細CSV、請求明細CSVの3つをアップロードしてから確定してください</div>
       <div style="display:flex;gap:12px;align-items:center;margin-bottom:8px">
         <button class="btn btn-s" id="confirmBtn" onclick="doConfirm()" disabled>この月の集計を確定</button>
       </div>
@@ -713,6 +780,7 @@ function renderPage() {
 
   <script>
     let lastData = null;
+    let receiptData = null;
     let billingData = null;
     const fmt = n => {
       if (n === 0) return '0';
@@ -921,21 +989,24 @@ function renderPage() {
     }
 
     function updateConfirmState() {
-      const ready = lastData && billingData;
+      const ready = lastData && receiptData && billingData;
       document.getElementById('confirmBtn').disabled = !ready;
       const pre = document.getElementById('confirmPreCheck');
       if (ready) {
         const bt = getBillingTotals();
         pre.className = 'ok';
-        pre.innerHTML = '注文データ: <b>' + (lastData.yearMonth || '不明') + '</b>（' + lastData.totalRows + '行） / 請求明細: <b>' + billingData.totalRows + '行</b>'
+        pre.innerHTML = 'NE_Items_Pro: <b>' + (lastData.yearMonth || '不明') + '</b>（' + lastData.totalRows + '行）'
+          + ' / 受取明細: <b>' + receiptData.totalRows + '行</b>'
+          + ' / 請求明細: <b>' + billingData.totalRows + '行</b>'
           + ' / PF手数料: <b>\\u00a5' + Math.round(bt.pfFee).toLocaleString() + '</b>'
           + (bt.adCost ? ' / 広告費: <b>\\u00a5' + Math.round(bt.adCost).toLocaleString() + '</b>' : '');
       } else {
         pre.className = 'warn';
         let missing = [];
-        if (!lastData) missing.push('注文データCSV');
+        if (!lastData) missing.push('NE_Items_Pro CSV');
+        if (!receiptData) missing.push('受取明細CSV');
         if (!billingData) missing.push('請求明細CSV');
-        pre.innerHTML = missing.join('と') + 'をアップロードしてから確定してください';
+        pre.innerHTML = missing.join('、') + 'をアップロードしてから確定してください';
       }
     }
 
@@ -1099,7 +1170,113 @@ function renderPage() {
       btn.textContent = '選択した税率・セグメントを登録して再集計';
     }
 
-    // ─── 工程4: 請求明細取り込み ───
+    // ─── 工程4: 受取明細取り込み ───
+    async function doReceiptUpload() {
+      const fileInput = document.getElementById('receiptFiles');
+      if (!fileInput.files.length) { alert('ファイルを選択してください'); return; }
+      const btn = document.getElementById('receiptBtn');
+      btn.disabled = true;
+      btn.textContent = '処理中...';
+
+      const formData = new FormData();
+      for (const f of fileInput.files) formData.append('files', f);
+
+      try {
+        const r = await fetchWithRetry(location.pathname + '/upload-receipt', { method: 'POST', body: formData });
+        if (!r.ok) {
+          const text = await r.text();
+          try { const j = JSON.parse(text); document.getElementById('receiptResult').innerHTML = '<div class="err">' + (j.error || r.status) + '</div>'; }
+          catch { document.getElementById('receiptResult').innerHTML = '<div class="err">サーバーエラー (HTTP ' + r.status + ')</div>'; }
+          return;
+        }
+        const data = await r.json();
+        if (data.error) { document.getElementById('receiptResult').innerHTML = '<div class="err">' + data.error + '</div>'; return; }
+        receiptData = data;
+
+        // NE_Items_Proの注文ID→税率マップで受取明細を税率別に集計
+        const taxMap = buildTaxMap();
+        const receiptByTax = aggregateReceiptByTax(data.rows, taxMap);
+        receiptData.receiptByTax = receiptByTax;
+
+        let html = '<div class="ok">受取明細取り込み完了: ' + data.totalRows + '行（' + data.fileCount + 'ファイル）</div>';
+
+        // 税率別受取集計
+        html += '<h3 style="font-size:13px;color:#555;margin:12px 0 4px">税率別受取集計</h3>';
+        html += '<table><tr><th>税率</th><th>金額（税込）</th><th>件数</th><th>税率不明件数</th></tr>';
+        html += '<tr><td>10%</td><td class="num">' + fmt(receiptByTax.tax10) + '</td><td class="num">' + receiptByTax.count10 + '</td><td></td></tr>';
+        html += '<tr><td>8%</td><td class="num">' + fmt(receiptByTax.tax8) + '</td><td class="num">' + receiptByTax.count8 + '</td><td></td></tr>';
+        html += '<tr><td>不明（10%仮扱い）</td><td class="num">' + fmt(receiptByTax.taxUnknown) + '</td><td></td><td class="num">' + receiptByTax.countUnknown + '</td></tr>';
+        html += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td><td class="num">' + fmt(receiptByTax.tax10 + receiptByTax.tax8 + receiptByTax.taxUnknown) + '</td><td class="num">' + (receiptByTax.count10 + receiptByTax.count8 + receiptByTax.countUnknown) + '</td><td></td></tr>';
+        html += '</table>';
+
+        // MF連携用
+        html += '<h3 style="font-size:13px;color:#555;margin:12px 0 4px">MF連携用（受取明細ベース）</h3>';
+        const mf10 = receiptByTax.tax10 + receiptByTax.taxUnknown; // 不明は10%扱い
+        const mf8 = receiptByTax.tax8;
+        html += '<table><tr><th>商品売上(10%税込)</th><th>商品売上(8%税込)</th><th>合計</th></tr>';
+        html += '<tr><td class="num" style="font-weight:bold">' + fmt(mf10) + '</td>';
+        html += '<td class="num" style="font-weight:bold">' + fmt(mf8) + '</td>';
+        html += '<td class="num" style="font-weight:bold">' + fmt(mf10 + mf8) + '</td></tr></table>';
+
+        document.getElementById('receiptResult').innerHTML = html;
+        updateConfirmState();
+      } catch(e) {
+        document.getElementById('receiptResult').innerHTML = '<div class="err">エラー: ' + e.message + '</div>';
+      }
+      btn.disabled = false;
+      btn.textContent = '受取明細取り込み';
+    }
+
+    // NE_Items_Proの注文ID→税率マップを構築
+    function buildTaxMap() {
+      const map = new Map(); // 注文ID → 税率(10 or 8)
+      if (!lastData || !lastData.detailRows) return map;
+      for (const row of lastData.detailRows) {
+        const orderId = row.注文番号;
+        if (!orderId) continue;
+        const taxStr = row.税率 || '';
+        let rate = null;
+        if (taxStr.includes('8')) rate = 8;
+        else if (taxStr.includes('10')) rate = 10;
+        if (rate && !map.has(orderId)) {
+          map.set(orderId, rate);
+        }
+      }
+      return map;
+    }
+
+    // 受取明細の行を注文IDベースで税率別に集計
+    function aggregateReceiptByTax(rows, taxMap) {
+      let tax10 = 0, tax8 = 0, taxUnknown = 0;
+      let count10 = 0, count8 = 0, countUnknown = 0;
+      for (const row of rows) {
+        const amount = row['金額(税込)'] || 0;
+        if (amount === 0) continue;
+
+        // 入金系の利用項目のみ集計（決済金額系）
+        const item = row.利用項目 || '';
+        // 手数料やキャンセル分は除外（請求明細側で処理）
+        if (item.includes('手数料') || item.includes('原資') || item.includes('利用料')
+            || item.includes('報酬') || item.includes('プラン')) continue;
+
+        const orderId = row.注文ID || '';
+        const rate = taxMap.get(orderId);
+        if (rate === 8) {
+          tax8 += amount;
+          count8++;
+        } else if (rate === 10) {
+          tax10 += amount;
+          count10++;
+        } else {
+          // 税率不明 → 10%仮扱い
+          taxUnknown += amount;
+          countUnknown++;
+        }
+      }
+      return { tax10, tax8, taxUnknown, count10, count8, countUnknown };
+    }
+
+    // ─── 工程5: 請求明細取り込み ───
     async function doBillingUpload() {
       const fileInput = document.getElementById('billingFiles');
       if (!fileInput.files.length) { alert('ファイルを選択してください'); return; }
@@ -1146,7 +1323,8 @@ function renderPage() {
 
     // ─── 確定 ───
     async function doConfirm() {
-      if (!lastData) { alert('先に注文データCSVをアップロードしてください'); return; }
+      if (!lastData) { alert('先にNE_Items_Pro CSVをアップロードしてください'); return; }
+      if (!receiptData) { alert('先に受取明細CSVをアップロードしてください'); return; }
       if (!billingData) { alert('先に請求明細CSVをアップロードしてください'); return; }
 
       const ym = lastData.yearMonth || '';
@@ -1171,6 +1349,7 @@ function renderPage() {
             mfRow: lastData.mfRow,
             adCost: billingData.adCost || 0,
             billing: billingData.byCategory || null,
+            receiptByTax: receiptData?.receiptByTax || null,
           }),
         });
         const result = await r.json();
