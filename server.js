@@ -17,9 +17,7 @@ import warehouseRouter from './apps/warehouse/router.js';
 import mirrorRouter from './apps/warehouse-mirror/router.js';
 import amazonAccountingRouter from './apps/amazon-accounting/router.js';
 import rakutenAccountingRouter from './apps/rakuten-accounting/router.js';
-import yahooAccountingRouter from './apps/yahoo-accounting/router.js';
-import aupayAccountingRouter from './apps/aupay-accounting/router.js';
-import fbaProfitabilityRouter from './apps/fba-profitability/router.js';
+import serviceRouter from './apps/warehouse/service-router.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -73,6 +71,7 @@ if (!users) {
 }
 
 // --- ミドルウェア ---
+app.set('trust proxy', 1); // Cloudflare Tunnel経由
 app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
 app.use(express.urlencoded({ extended: true }));
@@ -85,8 +84,10 @@ app.use(session({
   resave: false,
   saveUninitialized: false,
   cookie: {
-    maxAge: 7 * 24 * 60 * 60 * 1000, // 7日間
+    maxAge: 1 * 24 * 60 * 60 * 1000, // 1日間
     httpOnly: true,
+    secure: true,
+    sameSite: 'lax',
   }
 }));
 
@@ -211,33 +212,6 @@ const apps = [
     status: 'active',
     category: 'accounting',
   },
-  {
-    id: 'yahoo-accounting',
-    name: 'Yahoo!売上集計',
-    description: 'Yahoo注文データCSVから税率別・セグメント別の売上集計を自動計算',
-    icon: '📘',
-    path: '/apps/yahoo-accounting',
-    status: 'active',
-    category: 'accounting',
-  },
-  {
-    id: 'aupay-accounting',
-    name: 'auペイ売上集計',
-    description: 'auペイマーケット注文データCSVから税率別・セグメント別の売上集計を自動計算',
-    icon: '📙',
-    path: '/apps/aupay-accounting',
-    status: 'active',
-    category: 'accounting',
-  },
-  {
-    id: 'fba-profitability',
-    name: 'FBA収益性分析',
-    description: 'FBA全商品の利益率を分析・低利益率商品を検出',
-    icon: '📉',
-    path: '/apps/fba-profitability',
-    status: 'active',
-    category: 'fba',
-  },
 ];
 
 // 外部リンク
@@ -348,17 +322,12 @@ app.use('/apps/profit-calculator', requireAppAccess('profit-calculator'), profit
 app.use('/apps/fba-replenishment', requireAppAccess('fba-replenishment'), fbaRouter);
 app.use('/apps/warehouse', requireAppAccess('warehouse'), warehouseRouter);
 app.use('/apps/mirror', express.json({ limit: '100mb' }), mirrorRouter);  // ミラー同期APIはセッション認証不要（APIキー認証）
+app.use('/service-api', express.json(), serviceRouter);  // サービスAPI（Render→ミニPC、トークン認証）
 app.use('/apps/amazon-accounting', (req, res, next) => {
   if (req.path === '/import-history' && req.method === 'POST') return next();  // APIキー認証に委譲
   requireAuth(req, res, next);
 }, amazonAccountingRouter);
 app.use('/apps/rakuten-accounting', requireAuth, rakutenAccountingRouter);
-app.use('/apps/yahoo-accounting', (req, res, next) => {
-  if (req.path === '/import-history' && req.method === 'POST') return next();
-  requireAuth(req, res, next);
-}, yahooAccountingRouter);
-app.use('/apps/aupay-accounting', requireAuth, aupayAccountingRouter);
-app.use('/apps/fba-profitability', requireAppAccess('fba-profitability'), fbaProfitabilityRouter);
 
 // 未実装アプリのプレースホルダー
 app.get('/apps/:appId', requireAuth, (req, res) => {

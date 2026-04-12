@@ -168,20 +168,21 @@ function insertOrders(db, orders, batchId, windowStart, windowEnd) {
         continue;
       }
 
-      const orderInfo = resultSet?.OrderInfo || resultSet?.Order || resultSet;
+      const orderInfo = result?.OrderInfo || resultSet?.OrderInfo || resultSet?.Order || resultSet;
       if (!orderInfo) continue;
 
       // 注文レベルの情報
       const orderTime = orderInfo.OrderTime || '';
       const lastUpdateTime = orderInfo.LastUpdateTime || '';
       const orderStatus = orderInfo.OrderStatus || '';
-      const payStatus = orderInfo.PayStatus || '';
-      const shipStatus = orderInfo.ShipStatus || '';
-      const totalPrice = parseFloat(orderInfo.TotalPrice) || 0;
-      const payCharge = parseFloat(orderInfo.PayCharge) || 0;
-      const shipCharge = parseFloat(orderInfo.ShipCharge) || 0;
-      const discount = parseFloat(orderInfo.Discount) || 0;
-      const usePoint = parseFloat(orderInfo.UsePoint) || 0;
+      const payStatus = orderInfo.Pay?.PayStatus || orderInfo.PayStatus || '';
+      const shipStatus = orderInfo.Ship?.ShipStatus || orderInfo.ShipStatus || '';
+      const detail = orderInfo.Detail || {};
+      const totalPrice = parseFloat(detail.TotalPrice || orderInfo.TotalPrice) || 0;
+      const payCharge = parseFloat(detail.PayCharge || orderInfo.PayCharge) || 0;
+      const shipCharge = parseFloat(detail.ShipCharge || orderInfo.ShipCharge) || 0;
+      const discount = parseFloat(detail.Discount || orderInfo.Discount) || 0;
+      const usePoint = parseFloat(detail.UsePoint || orderInfo.UsePoint) || 0;
 
       // 商品明細
       let items = orderInfo.Item || orderInfo.Items?.Item || [];

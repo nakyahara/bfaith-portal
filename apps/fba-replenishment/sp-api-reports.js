@@ -170,7 +170,9 @@ export async function fetchFbaInventory() {
 export async function fetchAllReports() {
   const results = { planning: null, restock: null, inventory: null, errors: [] };
 
-  // 順番に取得（API制限回避のため並列にしない）
+  // 順次実行（SP-APIのcreateReport競合を完全に回避）
+  console.log('[SP-API] 3種レポートを順次取得開始...');
+
   try {
     results.planning = await fetchPlanningData();
   } catch (e) {
@@ -192,6 +194,7 @@ export async function fetchAllReports() {
     results.errors.push({ report: 'inventory', error: e.message });
   }
 
+  console.log('[SP-API] 順次取得完了');
   return results;
 }
 
