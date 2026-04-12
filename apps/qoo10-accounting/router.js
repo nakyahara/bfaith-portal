@@ -300,9 +300,9 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
         const cols = csvRows[i];
         if (cols.length < 20) continue;
 
-        // 決済の理由が「決済」のみ対象（キャンセル・返品は除外）
+        // キャンセル・返品・払い戻しは除外
         const reason = (cols[1] || '').trim();
-        if (reason !== '決済') continue;
+        if (reason.includes('キャンセル') || reason.includes('返品') || reason.includes('戻し')) continue;
 
         const settlementNo = (cols[2] || '').trim();
         if (!settlementNo) continue;
@@ -335,7 +335,7 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
     }
 
     if (allRows.length === 0) {
-      return res.status(400).json({ error: 'CSVからデータを読み取れませんでした（「決済」行が0件）' });
+      return res.status(400).json({ error: 'CSVからデータを読み取れませんでした（全行がキャンセル/返品 または 列数不足）' });
     }
 
     // 対象年月を推定（決済完了日から）
