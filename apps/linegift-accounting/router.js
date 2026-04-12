@@ -490,6 +490,51 @@ router.get('/history', (req, res) => {
   }
 });
 
+// ─── POST /import-history — ヒストリカルデータ一括投入 ───
+
+router.post('/import-history', (req, res) => {
+  const key = req.headers['x-import-key'] || req.query.key;
+  if (key !== 'bfaith-import-2026') return res.status(401).json({ error: 'Invalid key' });
+
+  const db = getMirrorDB();
+  const { months } = req.body;
+  if (!Array.isArray(months)) return res.status(400).json({ error: 'months 配列が必要です' });
+
+  try {
+    const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+    const stmt = db.prepare(`INSERT OR IGNORE INTO mart_linegift_monthly_summary
+      (year_month, total_rows, resolved_count, unresolved_count,
+       by_tax, by_segment, excluded, mf_row, pf_fee, ad_cost, confirmed_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
+
+    let inserted = 0;
+    const tx = db.transaction(() => {
+      for (const m of months) {
+        const totalSales = Object.values(m.bySegment || {}).reduce((s, v) => s + (v.売上合計 || 0), 0);
+        const totalCost = Object.values(m.bySegment || {}).reduce((s, v) => s + (v.原価合計 || 0), 0);
+        const byTax = {
+          '10': { 売上合計: totalSales, クーポン値引額: 0, クーポン値引後売上: totalSales, 原価合計: totalCost, 行数: 0 },
+          '8': { 売上合計: 0, クーポン値引額: 0, クーポン値引後売上: 0, 原価合計: 0, 行数: 0 },
+        };
+        const mfRow = { '商品売上(10%)': Math.round(totalSales * 1.1), '商品売上(8%)': 0, '合計': Math.round(totalSales * 1.1) };
+        const excluded = { '4': { 売上合計: 0, クーポン値引額: 0, クーポン値引後売上: 0, 原価合計: 0, 行数: 0 } };
+
+        const r = stmt.run(
+          m.yearMonth, 0, 0, 0,
+          JSON.stringify(byTax), JSON.stringify(m.bySegment || {}),
+          JSON.stringify(excluded), JSON.stringify(mfRow),
+          m.pfFee || 0, 0, now + ' [historical]'
+        );
+        if (r.changes > 0) inserted++;
+      }
+    });
+    tx();
+    res.json({ ok: true, inserted, total: months.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ─── HTML ───
 
 function renderPage() {
