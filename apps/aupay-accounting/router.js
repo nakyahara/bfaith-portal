@@ -557,6 +557,41 @@ router.get('/history', (req, res) => {
   }
 });
 
+// ─── POST /import-history — ヒストリカルデータ一括投入 ───
+
+router.post('/import-history', (req, res) => {
+  const key = req.headers['x-import-key'] || req.query.key;
+  if (key !== 'bfaith-import-2026') return res.status(401).json({ error: 'Invalid key' });
+
+  const db = getMirrorDB();
+  const { months } = req.body;
+  if (!Array.isArray(months)) return res.status(400).json({ error: 'months 配列が必要です' });
+
+  try {
+    const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+    const stmt = db.prepare(`INSERT OR IGNORE INTO mart_aupay_monthly_summary
+      (year_month, total_rows, resolved_count, unresolved_count,
+       by_tax, by_segment, excluded, mf_row, pf_fee, ad_cost, confirmed_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
+
+    let inserted = 0;
+    const tx = db.transaction(() => {
+      for (const m of months) {
+        const r = stmt.run(
+          m.yearMonth, 0, 0, 0,
+          '{}', JSON.stringify(m.bySegment || {}), '{}', '{}',
+          m.pfFee || 0, m.adCost || 0, now
+        );
+        if (r.changes > 0) inserted++;
+      }
+    });
+    tx();
+    res.json({ ok: true, inserted, total: months.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ─── HTML ───
 
 function renderPage() {
