@@ -357,6 +357,29 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
     // 集計
     const agg = aggregate(resolved);
 
+    // 詳細CSV出力用の行データ
+    const detailRows = resolved.map(r => {
+      const effectiveTax = r.税率 || r.CSV税率 || 10;
+      const genka = (r.原価 || 0) * (r.個数 || 1);
+      return {
+        注文番号: r.注文番号 || '',
+        商品コード: r.商品コード || '',
+        商品コード_resolved: r.商品コード_resolved || '',
+        商品名: r.商品名 || '',
+        個数: r.個数 || 0,
+        売上合計: r.売上合計 || 0,
+        クーポン値引額: r.クーポン値引額 || 0,
+        原価単価: r.原価 || 0,
+        原価合計: genka,
+        税率: effectiveTax,
+        CSV税率: r.CSV税率 || '',
+        売上分類: r.売上分類 == null ? '' : r.売上分類,
+        解決方法: r.解決方法 || '',
+        決済完了日: r.決済完了日 || '',
+        購入日: r.購入日 || '',
+      };
+    });
+
     res.json({
       yearMonth,
       totalRows: allRows.length,
@@ -375,6 +398,7 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
       excluded: agg.excluded,
       otherDetails: agg.otherDetails,
       mfRow: agg.mfRow,
+      detailRows,
     });
   } catch (e) {
     console.error('[Qoo10Accounting] エラー:', e.message, e.stack);
@@ -613,13 +637,6 @@ function renderPage() {
         <div id="mfTable"></div>
       </div>
 
-      <!-- セグメント別集計 -->
-      <div class="card">
-        <h2>セグメント別集計（管理会計用）</h2>
-        <div id="segmentTable"></div>
-        <div id="excludedInfo"></div>
-      </div>
-
       <!-- PF手数料 -->
       <div class="card">
         <h2>工程2: PF手数料・広告費</h2>
@@ -631,6 +648,13 @@ function renderPage() {
         </div>
         <p class="meta" style="margin-top:4px">※ PF手数料 = D.合計 - 外部広告手数料。外部広告手数料がある場合は広告費に入力してください。</p>
         <div id="costSummary" style="margin-top:8px"></div>
+      </div>
+
+      <!-- セグメント別集計 -->
+      <div class="card">
+        <h2>セグメント別集計（管理会計用）</h2>
+        <div id="segmentTable"></div>
+        <div id="excludedInfo"></div>
         <div id="costBySegment" style="margin-top:12px"></div>
       </div>
 
@@ -639,7 +663,9 @@ function renderPage() {
         <h2>CSVダウンロード</h2>
         <div style="display:flex;gap:12px;flex-wrap:wrap">
           <button class="btn btn-s" onclick="downloadSummaryCsv()">集計サマリーCSV</button>
+          <button class="btn btn-s" onclick="downloadDetailCsv()">詳細データCSV（全行）</button>
         </div>
+        <p class="meta" style="margin-top:4px">詳細データCSV: アップロードされた全行の税率・セグメント・売上・原価を1行1商品で出力</p>
       </div>
 
       <!-- 代表商品コードで紐付けた商品 -->
@@ -1188,6 +1214,44 @@ function renderPage() {
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
       a.download = 'Qoo10_summary_' + (data.yearMonth || 'unknown') + '.csv';
+      a.click();
+    }
+
+    // ─── 詳細データCSV（全行）───
+    function downloadDetailCsv() {
+      if (!lastData || !lastData.detailRows) { alert('先にセリングレポートCSVをアップロードしてください'); return; }
+      const segNames = { 1:'自社商品', 2:'取扱限定', 3:'仕入れ商品', 4:'輸出' };
+
+      let csv = '\\uFEFF';
+      csv += '注文番号,商品コード(Qoo10),商品コード(解決後),商品名,数量,売上合計,クーポン値引額,原価単価,原価合計,税率,CSV税率,売上分類,セグメント名,解決方法,決済完了日,購入日\\n';
+
+      for (const r of lastData.detailRows) {
+        const segLabel = r.売上分類 ? (segNames[r.売上分類] || '') : '未分類';
+        const name = (r.商品名 || '').replace(/"/g, '""').replace(/,/g, '、');
+        csv += [
+          r.注文番号,
+          r.商品コード,
+          r.商品コード_resolved,
+          '"' + name + '"',
+          r.個数,
+          Math.round(r.売上合計),
+          Math.round(r.クーポン値引額),
+          Math.round(r.原価単価),
+          Math.round(r.原価合計),
+          r.税率 + '%',
+          r.CSV税率 ? r.CSV税率 + '%' : '',
+          r.売上分類,
+          segLabel,
+          r.解決方法,
+          r.決済完了日,
+          r.購入日,
+        ].join(',') + '\\n';
+      }
+
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'Qoo10_detail_' + (lastData.yearMonth || 'unknown') + '.csv';
       a.click();
     }
 
