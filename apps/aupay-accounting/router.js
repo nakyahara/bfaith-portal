@@ -393,6 +393,7 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
       excludedNames: EXCLUDED_SEGMENTS,
       zeroGenka,
       resolvedByRepCode,
+      resolvedRows: resolved,
       byTax: agg.byTax,
       bySegment: agg.bySegment,
       excluded: agg.excluded,
@@ -686,6 +687,7 @@ function renderPage() {
         <h2>CSVダウンロード</h2>
         <div style="display:flex;gap:12px;flex-wrap:wrap">
           <button class="btn btn-s" onclick="downloadSummaryCsv()">集計サマリーCSV</button>
+          <button class="btn btn-s" onclick="downloadDetailCsv()">注文明細CSV</button>
         </div>
       </div>
 
@@ -1281,6 +1283,46 @@ function renderPage() {
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
       a.download = 'auPay_summary_' + (data.yearMonth || 'unknown') + '.csv';
+      a.click();
+    }
+
+    // ─── 注文明細CSV ───
+    function downloadDetailCsv() {
+      if (!lastData) { alert('先に注文データCSVをアップロードしてください'); return; }
+      const data = lastData;
+      const rows = data.resolvedRows || [];
+      if (!rows.length) { alert('明細データがありません'); return; }
+
+      const segNames = { 1:'自社商品', 2:'取扱限定', 3:'仕入れ商品', 4:'輸出' };
+      let csv = '\\uFEFF';
+      csv += '注文番号,商品コード,商品コード(マスタ),商品名,単価,個数,売上合計(税込),クーポン値引額,税率,売上分類,原価(単価),原価(小計),解決方法\\n';
+      for (const r of rows) {
+        const taxRate = r.税率 || r.CSV税率 || '';
+        const segLabel = r.売上分類 ? (r.売上分類 + ':' + (segNames[r.売上分類] || '')) : '';
+        const genkaUnit = r.原価 || 0;
+        const genkaTotal = genkaUnit * (r.個数 || 1);
+        const cols = [
+          r.注文番号 || '',
+          r.商品コード || '',
+          r.商品コード_resolved || '',
+          '"' + (r.商品名 || '').replace(/"/g, '""') + '"',
+          r.単価 || 0,
+          r.個数 || 0,
+          Math.round(r.売上合計 || 0),
+          Math.round(r.クーポン値引額 || 0),
+          taxRate ? taxRate + '%' : '',
+          segLabel,
+          genkaUnit,
+          Math.round(genkaTotal),
+          r.解決方法 || '',
+        ];
+        csv += cols.join(',') + '\\n';
+      }
+
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'auPay_detail_' + (data.yearMonth || 'unknown') + '.csv';
       a.click();
     }
 
