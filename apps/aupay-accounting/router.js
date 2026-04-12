@@ -245,12 +245,12 @@ function aggregate(resolvedRows) {
     }
   }
 
-  // MF連携用: 税込み集計
+  // MF連携用: CSVの金額は税込みなのでそのまま使う
   const t10 = byTax['10'];
   const t8 = byTax['8'];
   const mfRow = {
-    '商品売上(10%)': Math.round(t10.クーポン値引後売上 * 1.1),
-    '商品売上(8%)': Math.round(t8.クーポン値引後売上 * 1.08),
+    '商品売上(10%)': Math.round(t10.クーポン値引後売上),
+    '商品売上(8%)': Math.round(t8.クーポン値引後売上),
   };
   mfRow['合計'] = mfRow['商品売上(10%)'] + mfRow['商品売上(8%)'];
 
@@ -645,7 +645,7 @@ function renderPage() {
 
       <!-- 税率別集計 -->
       <div class="card">
-        <h2>税率別売上集計（税抜）</h2>
+        <h2>税率別売上集計（税込）</h2>
         <div id="taxTable"></div>
       </div>
 
@@ -1248,7 +1248,7 @@ function renderPage() {
       const data = lastData;
       let csv = '\\uFEFF';
 
-      csv += '【税率別集計（税抜）】\\n';
+      csv += '【税率別集計（税込）】\\n';
       csv += '税率,売上合計,クーポン値引額,クーポン値引後売上,原価合計,行数\\n';
       const bt = data.byTax;
       let tTot = { s:0, c:0, a:0, g:0, n:0 };
