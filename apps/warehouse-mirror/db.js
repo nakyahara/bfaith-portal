@@ -274,6 +274,34 @@ function createTables() {
     uploaded_at       TEXT NOT NULL
   )`);
 
+  // ─── mart_qoo10: Qoo10売上集計ツール用 ───
+
+  // mart_qoo10_monthly_summary — 月次確定集計
+  db.exec(`CREATE TABLE IF NOT EXISTS mart_qoo10_monthly_summary (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    year_month        TEXT NOT NULL UNIQUE,
+    total_rows        INTEGER,
+    resolved_count    INTEGER,
+    unresolved_count  INTEGER,
+    by_tax            TEXT,
+    by_segment        TEXT,
+    excluded          TEXT,
+    mf_row            TEXT,
+    pf_fee            REAL DEFAULT 0,
+    ad_cost           REAL DEFAULT 0,
+    confirmed_at      TEXT NOT NULL
+  )`);
+
+  // mart_qoo10_upload_log — アップロード履歴
+  db.exec(`CREATE TABLE IF NOT EXISTS mart_qoo10_upload_log (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    year_month        TEXT NOT NULL,
+    total_rows        INTEGER,
+    resolved_count    INTEGER,
+    unresolved_count  INTEGER,
+    uploaded_at       TEXT NOT NULL
+  )`);
+
   // ─── 管理会計用 統合テーブル ───
 
   // mart_monthly_segment_sales — 全モール統合月次セグメント別集計（税抜）
