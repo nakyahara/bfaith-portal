@@ -422,8 +422,8 @@ router.post('/upload-pdf', upload.single('file'), async (req, res) => {
       return res.status(500).json({ error: 'pdf-parseモジュールが見つかりません' });
     }
 
-    const parser = new PDFParse({});
-    await parser.load(buf);
+    const parser = new PDFParse({ data: buf });
+    await parser.load();
     const text = await parser.getText();
 
     // ご請求額(A+B) の金額を抽出
