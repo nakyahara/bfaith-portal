@@ -998,16 +998,41 @@ function renderPage() {
 
     function downloadSummaryCsv() {
       if (!lastData) { alert('先にCSVをアップロードしてください'); return; }
+      let csv = '\\uFEFF';
+
+      // 税率別売上
+      csv += '--- 税率別売上（税抜）---\\n';
+      csv += '税率,売上合計,原価合計,行数\\n';
+      const bt = lastData.byTax;
+      let taxTotS = 0, taxTotG = 0, taxTotN = 0;
+      for (const [k, v] of Object.entries(bt)) {
+        csv += k + '%,' + Math.round(v.売上合計) + ',' + Math.round(v.原価合計) + ',' + v.行数 + '\\n';
+        taxTotS += v.売上合計; taxTotG += v.原価合計; taxTotN += v.行数;
+      }
+      csv += '合計,' + Math.round(taxTotS) + ',' + Math.round(taxTotG) + ',' + taxTotN + '\\n';
+      csv += '\\n';
+
+      // セグメント別集計
       const seg = lastData.bySegment;
       const segNames = { '1': '自社商品', '2': '取扱限定', '3': '仕入れ商品', 'other': 'その他' };
-      let csv = '\\uFEFF年月,セグメント,売上合計,原価合計,PF手数料\\n';
       const pf = pfFeeData.pfFee || 0;
       const salesByKey = {};
       for (const [k, v] of Object.entries(seg)) salesByKey[k] = v.クーポン値引後売上 || 0;
       const pfByKey = allocateByRatio(pf, salesByKey, ['1','2','3']);
+
+      csv += '--- セグメント別集計 ---\\n';
+      csv += 'セグメント,売上合計,原価合計,PF手数料,原価率\\n';
       for (const [k, v] of Object.entries(seg)) {
-        csv += lastData.yearMonth + ',' + (segNames[k] || k) + ',' + Math.round(v.売上合計) + ',' + Math.round(v.原価合計) + ',' + (pfByKey[k] || 0) + '\\n';
+        csv += (segNames[k] || k) + ',' + Math.round(v.売上合計) + ',' + Math.round(v.原価合計) + ',' + (pfByKey[k] || 0) + ',' + (v.原価率 || '0.0') + '%\\n';
       }
+      csv += '\\n';
+
+      // MF連携用
+      const mf = lastData.mfRow;
+      csv += '--- MF連携用（税込）---\\n';
+      csv += '商品売上(10%税込),商品売上(8%税込),合計\\n';
+      csv += mf['商品売上(10%)'] + ',' + mf['商品売上(8%)'] + ',' + mf['合計'] + '\\n';
+
       const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
