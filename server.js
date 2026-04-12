@@ -360,7 +360,10 @@ app.use('/apps/amazon-accounting', (req, res, next) => {
 app.use('/apps/rakuten-accounting', requireAuth, rakutenAccountingRouter);
 app.use('/apps/aupay-accounting', requireAuth, aupayAccountingRouter);
 app.use('/apps/yahoo-accounting', requireAuth, yahooAccountingRouter);
-app.use('/apps/linegift-accounting', requireAuth, linegiftAccountingRouter);
+app.use('/apps/linegift-accounting', (req, res, next) => {
+  if (req.path === '/import-history' && req.method === 'POST') return next();
+  requireAuth(req, res, next);
+}, linegiftAccountingRouter);
 
 // 未実装アプリのプレースホルダー
 app.get('/apps/:appId', requireAuth, (req, res) => {
