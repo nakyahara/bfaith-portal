@@ -62,6 +62,13 @@ export async function rebuildMProducts() {
   for (const sc of db.prepare('SELECT * FROM product_sales_class').all()) {
     salesClassMap.set(sc.sku?.toLowerCase(), sc.sales_class);
   }
+  // 手動税率マップ（例外商品等、NE税率がない場合用）
+  const taxRateMap = new Map();
+  try {
+    for (const tr of db.prepare('SELECT * FROM product_tax_rate').all()) {
+      taxRateMap.set(tr.sku?.toLowerCase(), tr.tax_rate);
+    }
+  } catch {} // テーブル未作成時はスキップ
 
   // 送料取得ヘルパー: 自分のコード → 代表商品コード の順で検索
   function getShipping(code, repCode) {
@@ -217,11 +224,20 @@ export async function rebuildMProducts() {
 
     const ps = shippingMap.get(sku);
 
+    // 手動登録税率を参照
+    const manualTaxRate = taxRateMap.get(sku) ?? null;
+    let exTaxRate = null, exTaxCategory = 'UNKNOWN';
+    if (manualTaxRate !== null) {
+      exTaxRate = manualTaxRate;
+      if (manualTaxRate === 0.1) exTaxCategory = 'STANDARD_10';
+      else if (manualTaxRate === 0.08) exTaxCategory = 'REDUCED_8';
+    }
+
     insertStaging.run(
       sku, eg.商品名 || '', '例外', '取扱中',
       null, eg.genka, '例外', 'OVERRIDDEN',
       ps?.ship_cost ?? null, ps?.shipping_code ?? null, ps?.ship_method ?? null,
-      null, 'UNKNOWN',
+      exTaxRate, exTaxCategory,
       null, null, null, null, salesClassMap.get(sku) ?? null, ts
     );
     countException++;

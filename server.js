@@ -17,6 +17,7 @@ import warehouseRouter from './apps/warehouse/router.js';
 import mirrorRouter from './apps/warehouse-mirror/router.js';
 import amazonAccountingRouter from './apps/amazon-accounting/router.js';
 import rakutenAccountingRouter from './apps/rakuten-accounting/router.js';
+import serviceRouter from './apps/warehouse/service-router.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -70,6 +71,7 @@ if (!users) {
 }
 
 // --- ミドルウェア ---
+app.set('trust proxy', 1); // Cloudflare Tunnel経由
 app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
 app.use(express.urlencoded({ extended: true }));
@@ -82,8 +84,10 @@ app.use(session({
   resave: false,
   saveUninitialized: false,
   cookie: {
-    maxAge: 7 * 24 * 60 * 60 * 1000, // 7日間
+    maxAge: 1 * 24 * 60 * 60 * 1000, // 1日間
     httpOnly: true,
+    secure: true,
+    sameSite: 'lax',
   }
 }));
 
@@ -318,6 +322,7 @@ app.use('/apps/profit-calculator', requireAppAccess('profit-calculator'), profit
 app.use('/apps/fba-replenishment', requireAppAccess('fba-replenishment'), fbaRouter);
 app.use('/apps/warehouse', requireAppAccess('warehouse'), warehouseRouter);
 app.use('/apps/mirror', express.json({ limit: '100mb' }), mirrorRouter);  // ミラー同期APIはセッション認証不要（APIキー認証）
+app.use('/service-api', express.json(), serviceRouter);  // サービスAPI（Render→ミニPC、トークン認証）
 app.use('/apps/amazon-accounting', (req, res, next) => {
   if (req.path === '/import-history' && req.method === 'POST') return next();  // APIキー認証に委譲
   requireAuth(req, res, next);
