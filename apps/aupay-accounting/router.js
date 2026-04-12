@@ -414,16 +414,17 @@ router.post('/upload-pdf', upload.single('file'), async (req, res) => {
     const buf = fs.readFileSync(req.file.path);
     fs.unlinkSync(req.file.path);
 
-    // pdf-parseでテキスト抽出
-    let pdfParse;
+    // pdf-parse v2でテキスト抽出
+    let PDFParse;
     try {
-      pdfParse = (await import('pdf-parse')).default;
+      PDFParse = (await import('pdf-parse')).PDFParse;
     } catch {
       return res.status(500).json({ error: 'pdf-parseモジュールが見つかりません' });
     }
 
-    const pdfData = await pdfParse(buf);
-    const text = pdfData.text;
+    const parser = new PDFParse({});
+    await parser.load(buf);
+    const text = await parser.getText();
 
     // ご請求額(A+B) の金額を抽出
     // PDF text pattern: "ご請求額（A+B）" followed by amount like ￥146,054 or 146,054
