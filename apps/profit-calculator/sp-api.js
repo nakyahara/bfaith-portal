@@ -666,16 +666,23 @@ export async function getActiveListingsReport() {
     console.log('[SP-API] GZIP解凍完了, サイズ:', dataBuf.length);
   }
 
-  // エンコーディング判定: UTF-8で読めなければShift_JISとして変換
+  // エンコーディング判定: UTF-8 BOMがあればUTF-8、なければShift_JISとして変換
   let text;
-  try {
-    const iconv = await import('iconv-lite');
-    // まずShift_JISとして試す（日本のAmazonレポートはShift_JIS）
-    text = iconv.default.decode(dataBuf, 'Shift_JIS');
-    console.log('[SP-API] Shift_JISとしてデコード');
-  } catch {
+  const hasBOM = dataBuf[0] === 0xEF && dataBuf[1] === 0xBB && dataBuf[2] === 0xBF;
+  if (hasBOM || isValidUtf8(dataBuf)) {
     text = dataBuf.toString('utf-8');
+    // BOM除去
+    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
     console.log('[SP-API] UTF-8としてデコード');
+  } else {
+    try {
+      const iconv = await import('iconv-lite');
+      text = iconv.default.decode(dataBuf, 'Shift_JIS');
+      console.log('[SP-API] Shift_JISとしてデコード');
+    } catch {
+      text = dataBuf.toString('utf-8');
+      console.log('[SP-API] フォールバック: UTF-8としてデコード');
+    }
   }
 
   // TSV解析（ヘッダーを正規化: 小文字・ハイフン統一）
@@ -704,6 +711,22 @@ export async function getActiveListingsReport() {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/** UTF-8として有効なバイト列か簡易チェック（先頭1024バイトを検査） */
+function isValidUtf8(buf) {
+  const len = Math.min(buf.length, 1024);
+  for (let i = 0; i < len;) {
+    const b = buf[i];
+    if (b <= 0x7F) { i++; continue; }
+    let extra = b < 0xE0 ? 1 : b < 0xF0 ? 2 : b < 0xF8 ? 3 : -1;
+    if (extra < 0 || i + extra >= len) return false;
+    for (let j = 1; j <= extra; j++) {
+      if ((buf[i + j] & 0xC0) !== 0x80) return false;
+    }
+    i += extra + 1;
+  }
+  return true;
 }
 
 /**

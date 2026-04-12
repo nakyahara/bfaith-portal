@@ -11,13 +11,33 @@ import { initDb, savePlanningData, getLatestSnapshots, getAllSnapshotSkus, getSe
          getStockoutHidden, hideStockoutSku, unhideStockoutSku, hideStockoutSkuBulk,
          getNewProductHidden, hideNewProductSkuBulk, unhideNewProductSku,
          saveDraft, getDraft, clearDraft, updateFnskuBatch,
-         saveProvisionalItems, getProvisionalItems, clearProvisionalItems,
+         saveProvisionalItems, mergeProvisionalItems, getProvisionalItems, clearProvisionalItems,
          updateProvisionalItemQty, removeProvisionalItem,
          saveExportHistory, getExportHistoryList, getExportHistoryFile } from './db.js';
-import { fetchAllReports, normalizePlanningRow } from './sp-api-reports.js';
+// SP-API関連はミニPC経由で実行（APIキーはミニPC側に一元管理）
+// import { fetchAllReports, normalizePlanningRow } from './sp-api-reports.js';
+// import { createInboundPlan, checkInboundEligibility, findErrorSkusByBinarySearch, listShipments, listShipmentItems, fetchActiveInboundQuantities } from './inbound-plans.js';
 import { syncSkuMappings } from './sheets-sync.js';
 import { generateRecommendations } from './calculation-engine.js';
-import { createInboundPlan, checkInboundEligibility, findErrorSkusByBinarySearch, listShipments, listShipmentItems, fetchActiveInboundQuantities } from './inbound-plans.js';
+import { normalizePlanningRow } from './sp-api-reports.js';
+
+// --- ミニPC接続（SP-API実行用） ---
+const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
+function getServiceHeaders() {
+  return {
+    'CF-Access-Client-Id': process.env.CF_ACCESS_CLIENT_ID || '',
+    'CF-Access-Client-Secret': process.env.CF_ACCESS_CLIENT_SECRET || '',
+    'Authorization': `Bearer ${process.env.WAREHOUSE_SERVICE_TOKEN || ''}`,
+    'Content-Type': 'application/json',
+  };
+}
+async function callMiniPC(path, { method = 'GET', body, timeout = 300000 } = {}) {
+  const url = `${WAREHOUSE_URL}/service-api/fba${path}`;
+  const options = { method, headers: getServiceHeaders(), signal: AbortSignal.timeout(timeout) };
+  if (body) options.body = JSON.stringify(body);
+  const res = await fetch(url, options);
+  return res.json();
+}
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -58,54 +78,27 @@ router.get('/', (req, res) => {
 
 // ===== SP-APIレポート取得 =====
 
-// 全レポート取得（PLANNING + RESTOCK + INVENTORY）
-let fetchInProgress = false;
+let fetchInProgress = false; // ステータス表示用フラグ
+// 全レポート取得 → ミニPC経由でSP-APIを実行（ジョブ化）
 router.post('/api/fetch-reports', async (req, res) => {
-  if (fetchInProgress) return res.status(409).json({ error: 'レポート取得中です。しばらくお待ちください。' });
-
-  fetchInProgress = true;
   try {
-    const results = await fetchAllReports();
-
-    // PLANNINGデータをDBに保存
-    let savedCount = 0;
-    if (results.planning && results.planning.length > 0) {
-      const normalized = results.planning.map(normalizePlanningRow);
-      savedCount = savePlanningData(normalized);
-    }
-
-    // INVENTORYデータからFNSKUを抽出してsku_mappingに保存
-    let fnskuCount = 0;
-    if (results.inventory && results.inventory.length > 0) {
-      // デバッグ: INVENTORYレポートの列名を出力
-      const sampleRow = results.inventory[0];
-      console.log(`[FBA] INVENTORYヘッダー: ${Object.keys(sampleRow).join(', ')}`);
-      console.log(`[FBA] INVENTORYサンプル行:`, JSON.stringify(sampleRow).slice(0, 500));
-      const fnskuItems = results.inventory
-        .filter(r => (r['sku'] || r['seller-sku']) && (r['fnsku'] || r['fulfillment-channel-sku']))
-        .map(r => ({ sku: r['sku'] || r['seller-sku'], fnsku: r['fnsku'] || r['fulfillment-channel-sku'] }));
-      console.log(`[FBA] FNSKU候補: ${fnskuItems.length}件 / INVENTORY全体: ${results.inventory.length}件`);
-      if (fnskuItems.length > 0) {
-        updateFnskuBatch(fnskuItems);
-        fnskuCount = fnskuItems.length;
-        console.log(`[FBA] FNSKU更新: ${fnskuCount}件`);
-      } else {
-        console.log(`[FBA] ⚠ FNSKUが0件。列名にfnsku/fulfillment-channel-skuが存在しない可能性`);
-      }
-    }
-
-    res.json({
-      success: true,
-      planning: { count: results.planning?.length || 0, saved: savedCount },
-      restock: { count: results.restock?.length || 0 },
-      inventory: { count: results.inventory?.length || 0, fnskuUpdated: fnskuCount },
-      errors: results.errors,
-    });
+    const result = await callMiniPC('/fetch-reports', { method: 'POST' });
+    res.json(result);
   } catch (e) {
     console.error('[FBA] レポート取得エラー:', e);
-    res.status(500).json({ error: e.message });
-  } finally {
-    fetchInProgress = false;
+    res.status(502).json({ error: 'ミニPCへの接続に失敗: ' + e.message });
+  }
+});
+
+// ジョブ状態確認（ミニPC側のジョブマネージャー）
+router.get('/api/jobs/:jobId', async (req, res) => {
+  try {
+    const url = `${WAREHOUSE_URL}/service-api/jobs/${req.params.jobId}`;
+    const response = await fetch(url, { headers: getServiceHeaders(), signal: AbortSignal.timeout(15000) });
+    const data = await response.json();
+    res.status(response.status).json(data);
+  } catch (e) {
+    res.status(502).json({ error: 'ジョブ状態の取得に失敗', detail: e.message });
   }
 });
 
@@ -283,20 +276,29 @@ async function getInboundWorkingData() {
     return inboundWorkingCache;
   }
   try {
-    inboundWorkingCache = await fetchActiveInboundQuantities();
+    // ミニPC経由でSP-APIからACTIVEプラン数量を取得
+    const result = await callMiniPC('/refresh-inbound-working', { method: 'POST', timeout: 60000 });
+    if (result.ok && result.count !== undefined) {
+      // ミニPC側でキャッシュされているので、改めてデータを取得
+      const dataResult = await callMiniPC('/recommendations-inbound-cache', { timeout: 15000 }).catch(() => null);
+      // キャッシュが取れない場合は空オブジェクトで進める（推奨リスト自体は動く）
+      inboundWorkingCache = dataResult?.data || {};
+    } else {
+      inboundWorkingCache = {};
+    }
     inboundWorkingCacheTime = now;
     console.log(`[FBA] 準備中数量キャッシュ更新: ${Object.keys(inboundWorkingCache).length} SKU`);
     return inboundWorkingCache;
   } catch (e) {
     console.error('[FBA] 準備中数量取得エラー（キャッシュを使用）:', e.message);
-    return inboundWorkingCache; // エラー時は古いキャッシュを返す（nullの場合もある）
+    return inboundWorkingCache || {};
   }
 }
 
 // 手動リフレッシュ用
 router.post('/api/refresh-inbound-working', async (req, res) => {
   try {
-    inboundWorkingCache = null; // キャッシュクリア
+    inboundWorkingCache = null;
     const data = await getInboundWorkingData();
     res.json({ ok: true, skuCount: data ? Object.keys(data).length : 0 });
   } catch (e) {
@@ -351,8 +353,8 @@ router.get('/api/recommendations/:sku', async (req, res) => {
 router.get('/api/debug/eligibility/:asin', async (req, res) => {
   try {
     const items = [{ asin: req.params.asin, msku: 'TEST' }];
-    const result = await checkInboundEligibility(items);
-    res.json({ asin: req.params.asin, result, raw: 'check server logs for details' });
+    const miniResult = await callMiniPC(`/eligibility/check-one?asin=${encodeURIComponent(req.params.asin)}&msku=TEST`, { timeout: 15000 });
+    res.json({ asin: req.params.asin, result: miniResult.result || miniResult, raw: 'via miniPC' });
   } catch (e) {
     res.json({ asin: req.params.asin, error: e.message, stack: e.stack?.split('\n').slice(0, 5) });
   }
@@ -440,7 +442,7 @@ router.post('/api/create-inbound-plan', express.json(), async (req, res) => {
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       const apiItems = buildApiItems(itemList, allPrepOverrides);
       try {
-        const result = await createInboundPlan(sourceAddress, apiItems, planName);
+        const result = await callMiniPC('/create-inbound-plan', { method: 'POST', body: { sourceAddress, items: apiItems, planName }, timeout: 180000 }).then(r => r.ok ? (r.result || r) : r);
 
         // ポーリング結果のエラーチェック
         if (result.status === 'FAILED' && result.problems && result.problems.length > 0) {
@@ -641,8 +643,9 @@ router.get('/api/eligibility/check-one', async (req, res) => {
   const { asin, msku } = req.query;
   if (!asin) return res.status(400).json({ error: 'asin必須' });
   try {
-    const result = await checkInboundEligibility([{ asin, msku: msku || '' }]);
-    res.json({ asin, msku, is_eligible: result.length === 0, reasons: result.length > 0 ? (result[0].reasons || []) : [] });
+    const miniResult = await callMiniPC(`/eligibility/check-one?asin=${encodeURIComponent(asin)}&msku=${encodeURIComponent(msku || '')}`, { timeout: 15000 });
+    const ineligible = miniResult.result || [];
+    res.json({ asin, msku, is_eligible: ineligible.length === 0, reasons: ineligible.length > 0 ? (ineligible[0].reasons || []) : [] });
   } catch (e) {
     res.json({ asin, msku, is_eligible: true, reasons: [], error: (e.message || '').slice(0, 200) });
   }
@@ -661,6 +664,20 @@ router.post('/api/provisional', express.json(), (req, res) => {
     res.json({ success: true, count });
   } catch (e) {
     console.error('[FBA] 仮確定保存エラー:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 仮確定データに差分マージ（既存データを保持しつつ追加・更新）
+router.post('/api/provisional/merge', express.json(), (req, res) => {
+  const { items } = req.body;
+  if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items[] が必要です' });
+  try {
+    const count = mergeProvisionalItems(items);
+    const result = getProvisionalItems();
+    res.json({ success: true, merged: count, total: result.items.length });
+  } catch (e) {
+    console.error('[FBA] 仮確定マージエラー:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -757,17 +774,19 @@ router.post('/api/export-manifest', express.json(), async (req, res) => {
 router.get('/api/picking-list/:planId', async (req, res) => {
   const { planId } = req.params;
   try {
-    console.log(`[Picking] プラン ${planId} のshipment一覧取得中...`);
-    const shipments = await listShipments(planId);
-    console.log(`[Picking] ${shipments.length}件のshipment`);
+    console.log(`[Picking] プラン ${planId} のshipment一覧をミニPC経由で取得中...`);
+    const miniResult = await callMiniPC(`/picking-list/${encodeURIComponent(planId)}`, { timeout: 60000 });
+    const shipmentData = miniResult.shipments || [];
+    console.log(`[Picking] ${shipmentData.length}件のshipment`);
 
     const result = [];
     const mappings = getSkuMappings();
     const mappingMap = {};
     for (const m of mappings) mappingMap[m.amazon_sku] = m;
 
-    for (const shipment of shipments) {
-      const items = await listShipmentItems(planId, shipment.shipmentId);
+    for (const sd of shipmentData) {
+      const shipment = sd.shipment;
+      const items = sd.items;
       console.log(`[Picking] shipment ${shipment.shipmentId}: ${items.length}アイテム`);
       result.push({
         shipmentId: shipment.shipmentId,

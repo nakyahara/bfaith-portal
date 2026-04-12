@@ -60,6 +60,8 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_type ON mirror_products(商品区分)');
   // 既存テーブルへのカラム追加（マイグレーション）
   try { db.exec('ALTER TABLE mirror_products ADD COLUMN 売上分類 INTEGER'); } catch {}
+  try { db.exec('ALTER TABLE mirror_products ADD COLUMN 代表商品コード TEXT'); } catch {}
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_rep ON mirror_products(代表商品コード)');
 
   // mirror_set_components — セット構成マスタ
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_set_components (
@@ -186,5 +188,92 @@ function createTables() {
     resolved_count    INTEGER,
     unresolved_count  INTEGER,
     uploaded_at       TEXT NOT NULL
+  )`);
+
+  // ─── mart_yahoo: Yahoo!売上集計ツール用 ───
+
+  // mart_yahoo_monthly_summary — 月次確定集計
+  db.exec(`CREATE TABLE IF NOT EXISTS mart_yahoo_monthly_summary (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    year_month        TEXT NOT NULL UNIQUE,
+    total_rows        INTEGER,
+    resolved_count    INTEGER,
+    unresolved_count  INTEGER,
+    by_tax            TEXT,
+    by_segment        TEXT,
+    excluded          TEXT,
+    mf_row            TEXT,
+    ad_cost           REAL DEFAULT 0,
+    billing           TEXT,
+    confirmed_at      TEXT NOT NULL
+  )`);
+
+  // mart_yahoo_upload_log — アップロード履歴
+  db.exec(`CREATE TABLE IF NOT EXISTS mart_yahoo_upload_log (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    year_month        TEXT NOT NULL,
+    total_rows        INTEGER,
+    resolved_count    INTEGER,
+    unresolved_count  INTEGER,
+    uploaded_at       TEXT NOT NULL
+  )`);
+
+  // ─── mart_aupay: auペイマーケット売上集計ツール用 ───
+
+  // mart_aupay_monthly_summary — 月次確定集計
+  db.exec(`CREATE TABLE IF NOT EXISTS mart_aupay_monthly_summary (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    year_month        TEXT NOT NULL UNIQUE,
+    total_rows        INTEGER,
+    resolved_count    INTEGER,
+    unresolved_count  INTEGER,
+    by_tax            TEXT,
+    by_segment        TEXT,
+    excluded          TEXT,
+    mf_row            TEXT,
+    pf_fee            REAL DEFAULT 0,
+    ad_cost           REAL DEFAULT 0,
+    confirmed_at      TEXT NOT NULL
+  )`);
+
+  // mart_aupay_upload_log — アップロード履歴
+  db.exec(`CREATE TABLE IF NOT EXISTS mart_aupay_upload_log (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    year_month        TEXT NOT NULL,
+    total_rows        INTEGER,
+    resolved_count    INTEGER,
+    unresolved_count  INTEGER,
+    uploaded_at       TEXT NOT NULL
+  )`);
+
+  // ─── 管理会計用 統合テーブル ───
+
+  // mart_monthly_segment_sales — 全モール統合月次セグメント別集計（税抜）
+  db.exec(`CREATE TABLE IF NOT EXISTS mart_monthly_segment_sales (
+    year_month      TEXT NOT NULL,
+    mall_id         TEXT NOT NULL,
+    segment         INTEGER NOT NULL,
+    sales           REAL NOT NULL DEFAULT 0,
+    cost            REAL NOT NULL DEFAULT 0,
+    pf_fee          REAL NOT NULL DEFAULT 0,
+    ad_cost         REAL NOT NULL DEFAULT 0,
+    confirmed_at    TEXT,
+    confirmed_by    TEXT,
+    source_file     TEXT,
+    source_hash     TEXT,
+    import_run_id   TEXT,
+    logic_version   TEXT DEFAULT 'v1',
+    PRIMARY KEY (year_month, mall_id, segment)
+  )`);
+
+  // mart_monthly_shared_costs — 月次共通費用（運賃・資材費）
+  db.exec(`CREATE TABLE IF NOT EXISTS mart_monthly_shared_costs (
+    year_month      TEXT PRIMARY KEY,
+    freight_total   REAL NOT NULL DEFAULT 0,
+    material_total  REAL NOT NULL DEFAULT 0,
+    confirmed_at    TEXT,
+    source_file     TEXT,
+    freight_detail  TEXT DEFAULT '{}',
+    material_detail TEXT DEFAULT '{}'
   )`);
 }

@@ -616,6 +616,32 @@
   <script>
     const BASE = '/apps/fba-replenishment';
 
+    // ジョブポーリング（ミニPC側のジョブマネージャー対応）
+    async function pollJob(jobId, { intervalMs = 3000, maxWaitMs = 300000, onProgress } = {}) {
+      const start = Date.now();
+      while (Date.now() - start < maxWaitMs) {
+        await new Promise(r => setTimeout(r, intervalMs));
+        try {
+          const res = await fetch(`${BASE}/api/jobs/${jobId}`);
+          const d = await res.json();
+          // レスポンスは { ok, job: { status, result, ... } } の形式
+          const job = d.job || d;
+          if (job.status === 'completed') return job;
+          if (job.status === 'failed') return { error: job.error?.message || job.error || 'ジョブが失敗しました' };
+          if (onProgress) onProgress(Math.round((Date.now() - start) / 1000), job);
+        } catch (e) {
+          // 一時的な通信エラーは無視してリトライ
+        }
+      }
+      return { error: 'タイムアウト: ジョブが完了しませんでした（5分）' };
+    }
+
+    // HTMLエスケープ（商品名等をHTML属性・テキストに安全に埋め込む）
+    function esc(s) {
+      if (!s) return '';
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+    }
+
     // 構成列のHTML生成
     function renderComponentCell(r) {
       const comps = r.set_components;
@@ -745,7 +771,7 @@
         }
         return `<tr>
           <td>${r.amazon_sku}</td>
-          <td class="product-name" title="${r.product_name || ''}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${r.product_name || ''}</a>` : (r.product_name || '')}</td>
+          <td class="product-name" title="${esc(r.product_name)}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${esc(r.product_name)}</a>` : esc(r.product_name)}</td>
           <td>${r.fba_available}</td>
           <td>${workingHtml}</td>
           <td>${r.fba_inbound_shipped || 0}</td>
@@ -770,10 +796,30 @@
       try {
         const res = await fetch(`${BASE}/api/fetch-reports`, { method: 'POST' });
         const d = await res.json();
-        if (d.error) { log('エラー: ' + d.error); return; }
-        log(`完了! PLANNING: ${d.planning.count}件, RESTOCK: ${d.restock.count}件, INVENTORY: ${d.inventory.count}件`);
-        if (d.errors.length > 0) {
-          d.errors.forEach(e => log(`警告: ${e.report} - ${e.error}`));
+        if (d.error) { log('エラー: ' + (d.message || d.error)); return; }
+
+        let result = d;
+
+        // ジョブ方式: jobIdが返ってきたらポーリング
+        if (d.jobId) {
+          log(`ジョブ開始 (${d.jobId.slice(0, 8)}...)  SP-APIレポート取得中...`);
+          const jobResult = await pollJob(d.jobId, {
+            onProgress: (sec) => log(`SP-APIレポート取得中... (${sec}秒経過)`),
+          });
+          if (jobResult.error) {
+            log('エラー: ' + (jobResult.message || jobResult.error));
+            return;
+          }
+          result = jobResult.result || jobResult;
+        }
+
+        // result.planning は数値(ミニPC経由) or オブジェクト{count}(旧直接版) の両方に対応
+        const pCount = typeof result.planning === 'number' ? result.planning : (result.planning?.count ?? 0);
+        const rCount = typeof result.restock === 'number' ? result.restock : (result.restock?.count ?? 0);
+        const iCount = typeof result.inventory === 'number' ? result.inventory : (result.inventory?.count ?? 0);
+        log(`完了! PLANNING: ${pCount}件, RESTOCK: ${rCount}件, INVENTORY: ${iCount}件`);
+        if (result.errors && result.errors.length > 0) {
+          result.errors.forEach(e => log(`警告: ${e.report} - ${e.error}`));
         }
         loadStatus();
         completeStep(1);
@@ -984,13 +1030,20 @@
       if (!sku) { msgEl.textContent = 'SKUを入力してください'; return; }
       if (qty <= 0) { msgEl.textContent = '数量を入力してください'; return; }
 
-      // 既存データから探す
+      // 既存データから探す（recData + manualItems）
       const existing = recData.find(r => r.amazon_sku === sku);
+      const existingManual = manualItems.find(m => m.amazon_sku === sku);
       if (existing) {
         existing.recommended_qty = qty;
+        existing.adjusted_qty = qty;
         existing.is_today = true;
         existing._manual = true;
         msgEl.textContent = `${sku} の推奨数を ${qty} に設定しました`;
+      } else if (existingManual) {
+        // 既にmanualItemsにあるSKU → 数量を更新
+        existingManual.recommended_qty = qty;
+        existingManual.adjusted_qty = qty;
+        msgEl.textContent = `${sku} の数量を ${qty} に更新しました`;
       } else {
         // SKUマッピングから商品情報を取得
         let mapping = null;
@@ -1040,6 +1093,7 @@
       }
       skuInput.value = '';
       qtyInput.value = '';
+      document.getElementById('recSection').style.display = '';
       filterRecList();
       // サマリー更新（手動追加を含む）
       const allRec = [...recData.filter(r => r.recommended_qty > 0), ...manualItems];
@@ -1105,10 +1159,10 @@
           <td style="text-align:center;font-size:11px;color:#666;">${rowNum}</td>
           <td>${r._manual ? '手動' : r.urgency_score}</td>
           <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')">${r.amazon_sku}</span></td>
-          <td class="product-name" title="${r.product_name || ''}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${r.product_name || ''}</a>` : (r.product_name || '')}</td>
+          <td class="product-name" title="${esc(r.product_name)}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${esc(r.product_name)}</a>` : esc(r.product_name)}</td>
           ${renderComponentCell(r)}
           <td>${r.fba_available}</td>
-          <td style="${r.fba_inbound_working > 0 ? (r.fba_inbound_working_source === 'API' ? 'color:#2563eb;font-weight:bold' : 'color:#16a34a') : 'color:#ccc'}" title="${r.fba_inbound_working_source === 'API' ? 'APIから取得（リアルタイム）' : r.fba_inbound_working_source === 'report(7日超除外)' ? 'レポート値（7日超で除外済み）' : 'レポートから取得'}">${r.fba_inbound_working || 0}${r.fba_inbound_working_source === 'API' ? '<span style="font-size:9px;color:#2563eb;"> ⚡</span>' : ''}</td>
+          <td style="${r.fba_inbound_working > 0 ? (r.fba_inbound_working_source === 'API' ? 'color:#2563eb;font-weight:bold' : 'color:#16a34a') : 'color:#ccc'}" title="${r.fba_inbound_working_source === 'API' ? 'APIから取得（リアルタイム）' : r.fba_inbound_working_source?.startsWith('report(') && r.fba_inbound_working_source.includes('日超除外)') ? `レポート値（${r.fba_inbound_working_source.match(/\d+/)?.[0] || '3'}日超で除外済み）` : 'レポートから取得'}">${r.fba_inbound_working || 0}${r.fba_inbound_working_source === 'API' ? '<span style="font-size:9px;color:#2563eb;"> ⚡</span>' : ''}</td>
           <td>${r.effective_fba_stock}</td>
           <td style="${dosColor}">${dosVal}${belowReorder ? ' ⚠' : ''}</td>
           <td>${reorderVal}</td>
@@ -1383,7 +1437,12 @@
      - ツールで数量変更
      - 再度Excel出力 → セラセン取り込み
   ⑪ 危険物FNSKUを「このFNSKUだけ選択」→ Excel出力 → 別プラン確定
-  ⑫ 全プラン確定後「NE受注CSV出力」→ NextEngineにアップロード</pre>
+  ⑫ 全プラン確定後「NE受注CSV出力」→ NextEngineにアップロード
+
+★ 入れ忘れ・追加が発生した場合
+  → 納品推奨タブに戻って追加商品を選択
+  → 「仮確定に移動」で既存の仮確定に追加される（前回分は消えません）
+  → 同じSKUは数量が更新、新しいSKUは追加されます</pre>
             <p style="font-size:11px;color:#666;margin-top:8px;">※ 初回は300+SKUが推奨に上がりますが、低回転商品に半年分を送ると2〜3週間で50〜80SKU/日に収束します。</p>
           </div>
 
@@ -1391,6 +1450,7 @@
             <h4>Amazon仮確定タブの使い方</h4>
             <table style="width:100%;font-size:12px;border-collapse:collapse;">
               <tr style="background:#f3f4f6;"><th style="padding:6px;border:1px solid #e5e7eb;">操作</th><th style="padding:6px;border:1px solid #e5e7eb;">説明</th></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;font-weight:bold;color:#7c3aed;">商品を追加</td><td style="padding:6px;border:1px solid #e5e7eb;">納品推奨タブで追加商品を選んで「仮確定に移動」→ <strong>既存データを保持したまま追加</strong>されます。同じSKUは数量が上書き更新されます。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;font-weight:bold;">納品Excel出力</td><td style="padding:6px;border:1px solid #e5e7eb;">チェック済み商品のExcelを出力。セラセンの「ファイルをアップロード」で取り込む。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;font-weight:bold;">NE受注CSV出力</td><td style="padding:6px;border:1px solid #e5e7eb;">仮確定リスト<strong>全件</strong>をNE受注伝票CSVとして出力。SKU→NE商品コード変換+数量按分が自動。プラン分割に関係なく1伝票。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;font-weight:bold;">FNSKU除外</td><td style="padding:6px;border:1px solid #e5e7eb;">入力したFNSKUに該当する商品のチェックを外す。危険物プラン分けに使用。</td></tr>
@@ -1421,7 +1481,7 @@ Amazon SKU → NE商品コードに変換（set_componentsで展開）
             <h4>計算フロー全体像</h4>
             <pre style="font-size:12px;line-height:1.6;background:#f8f9fa;padding:12px;border-radius:6px;overflow-x:auto;">
 Step1: 実質FBA在庫の算出
-  = 販売可能 + 輸送中 + 受領中 + 準備中(7日超は除外)
+  = 販売可能 + 輸送中 + 受領中 + 準備中(3日超は除外)
 
 Step2: 日販の算出
   FBA日販 = FBA30日売上 ÷ 30
@@ -1598,7 +1658,7 @@ Step10: アラート判定</pre>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">INVENTORYレポートがFATAL</td><td style="padding:6px;border:1px solid #e5e7eb;">リトライで解消。UNSUPPRESSED→ALL_INVENTORYのフォールバック実装済み。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">「レポート取得中です」エラー</td><td style="padding:6px;border:1px solid #e5e7eb;">前回のフェッチ未完了。1〜2分待ってリトライ。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">昨日送った商品がまた推奨に上がる</td><td style="padding:6px;border:1px solid #e5e7eb;">セラセンでプラン作成済みなら、翌日のSP-APIレポートで「準備中」に反映される。Step1を毎日実行すれば問題なし。反映にタイムラグあり（数時間〜翌日）。</td></tr>
-              <tr><td style="padding:6px;border:1px solid #e5e7eb;">仮確定データが消えた</td><td style="padding:6px;border:1px solid #e5e7eb;">「仮確定に移動」で上書きされる仕様。NE CSV出力前に誤って移動しないよう注意。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">仮確定データが消えた</td><td style="padding:6px;border:1px solid #e5e7eb;">「仮確定に移動」は差分マージ方式（既存データを保持して追加・更新）。全件クリアしたい場合は仮確定タブの「クリア」ボタンを使用。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">NE CSVの商品コードが空</td><td style="padding:6px;border:1px solid #e5e7eb;">SKUマッピングにNE商品コードがない。Google Sheetsの変換テーブルにD列（NE商品コード）を追加。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">セラセンで数量変更したい</td><td style="padding:6px;border:1px solid #e5e7eb;">セラセンで直接変更、またはプラン削除→ツールで数量変更→再度Excel出力。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">デプロイ後にデータが消えた</td><td style="padding:6px;border:1px solid #e5e7eb;">RenderデプロイでSQLiteがリセットされる。Step1〜3を再実行すれば復元。仮確定データ・出力履歴も消えるので注意。</td></tr>
@@ -1610,7 +1670,7 @@ Step10: アラート判定</pre>
             <table style="width:100%;font-size:12px;border-collapse:collapse;">
               <tr style="background:#f3f4f6;"><th style="padding:6px;border:1px solid #e5e7eb;width:30%;">用語</th><th style="padding:6px;border:1px solid #e5e7eb;">意味</th></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">FNSKU</td><td style="padding:6px;border:1px solid #e5e7eb;">AmazonがFBA商品に付与するバーコード。SKUと1対1。危険物判定で梱包グループが分かれる際の識別に使用。</td></tr>
-              <tr><td style="padding:6px;border:1px solid #e5e7eb;">準備中(inbound_working)</td><td style="padding:6px;border:1px solid #e5e7eb;">セラセンで納品プランを作成済みだがまだ発送していない状態の数量。実質FBA在庫に加算される。7日超で除外。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">準備中(inbound_working)</td><td style="padding:6px;border:1px solid #e5e7eb;">セラセンで納品プランを作成済みだがまだ発送していない状態の数量。実質FBA在庫に加算される。3日超で除外。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">発注点</td><td style="padding:6px;border:1px solid #e5e7eb;">FBA在庫がこの日数分を下回ったら推奨に上がる閾値。回転率で変動。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">目標日数</td><td style="padding:6px;border:1px solid #e5e7eb;">推奨に上がった時に何日分送るか。回転率×サイズで決定。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">按分</td><td style="padding:6px;border:1px solid #e5e7eb;">倉庫在庫をFBAと他CH（楽天等）の販売比率で配分すること。FBAに送りすぎて他CHの販売機会を逃さないため。</td></tr>
@@ -1754,7 +1814,7 @@ Step10: アラート判定</pre>
           <td style="text-align:center;color:#666;">${num}</td>
           <td>${r.urgency_score}</td>
           <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')">${r.amazon_sku}</span></td>
-          <td class="product-name" title="${r.product_name || ''}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;">${r.product_name || ''}</a>` : (r.product_name || '')}</td>
+          <td class="product-name" title="${esc(r.product_name)}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;">${esc(r.product_name)}</a>` : esc(r.product_name)}</td>
           ${renderComponentCell(r)}
           <td>${r.fba_available}</td>
           <td style="${r.fba_inbound_working > 0 ? (r.fba_inbound_working_source === 'API' ? 'color:#2563eb;font-weight:bold' : 'color:#16a34a') : 'color:#ccc'}">${r.fba_inbound_working || 0}${r.fba_inbound_working_source === 'API' ? '<span style="font-size:9px;color:#2563eb;"> ⚡</span>' : ''}</td>
@@ -1938,7 +1998,7 @@ Step10: アラート判定</pre>
           <td style="text-align:center;color:#666;font-size:11px;">${num}</td>
           <td>${statusHtml}</td>
           <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')">${r.amazon_sku}</span></td>
-          <td class="product-name" title="${r.product_name || ''}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${r.product_name || ''}</a>` : (r.product_name || '')}</td>
+          <td class="product-name" title="${esc(r.product_name)}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${esc(r.product_name)}</a>` : esc(r.product_name)}</td>
           ${renderComponentCell(r)}
           <td>${r.fba_available}</td>
           <td style="${r.fba_inbound_working > 0 ? (r.fba_inbound_working_source === 'API' ? 'color:#2563eb;font-weight:bold' : 'color:#16a34a') : 'color:#ccc'}">${r.fba_inbound_working || 0}${r.fba_inbound_working_source === 'API' ? '<span style="font-size:9px;color:#2563eb;"> ⚡</span>' : ''}</td>
@@ -2093,6 +2153,7 @@ Step10: アラート判定</pre>
 
       // 追加があれば納品推奨タブに切り替え
       if (addedCount > 0) {
+        document.getElementById('recSection').style.display = '';
         setTimeout(() => switchTab('ship'), 500);
       }
     }
@@ -2270,7 +2331,7 @@ Step10: アラート判定</pre>
           <td style="text-align:center;color:#666;font-size:11px;">${num}</td>
           <td>${statusHtml}</td>
           <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')">${r.amazon_sku}</span></td>
-          <td class="product-name" title="${r.product_name || ''}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${r.product_name || ''}</a>` : (r.product_name || '')}</td>
+          <td class="product-name" title="${esc(r.product_name)}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${esc(r.product_name)}</a>` : esc(r.product_name)}</td>
           ${renderComponentCell(r)}
           <td>${r.fba_available ?? '-'}</td>
           <td style="${r.fba_inbound_working > 0 ? (r.fba_inbound_working_source === 'API' ? 'color:#2563eb;font-weight:bold' : 'color:#16a34a') : 'color:#ccc'}">${r.fba_inbound_working || 0}${r.fba_inbound_working_source === 'API' ? '<span style="font-size:9px;color:#2563eb;"> ⚡</span>' : ''}</td>
@@ -2419,6 +2480,7 @@ Step10: アラート判定</pre>
 
       // 追加があれば納品推奨タブに切り替え
       if (addedCount > 0) {
+        document.getElementById('recSection').style.display = '';
         setTimeout(() => switchTab('ship'), 500);
       }
     }
@@ -2613,12 +2675,28 @@ Step10: アラート判定</pre>
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ items: checkedItems }),
         });
-        const d = await res.json();
+        let d = await res.json();
 
         if (d.error) {
-          showInboundModal('error', { error: d.error });
-          log('納品プラン作成エラー: ' + d.error);
+          showInboundModal('error', { error: d.message || d.error });
+          log('納品プラン作成エラー: ' + (d.message || d.error));
           return;
+        }
+
+        // ジョブ方式: jobIdが返ってきたらポーリング
+        if (d.jobId) {
+          log(`納品プラン作成ジョブ開始...`);
+          const jobResult = await pollJob(d.jobId, {
+            intervalMs: 2000,
+            maxWaitMs: 120000,
+            onProgress: (sec) => log(`納品プラン作成中... (${sec}秒経過)`),
+          });
+          if (jobResult.error) {
+            showInboundModal('error', { error: jobResult.message || jobResult.error });
+            log('納品プラン作成エラー: ' + (jobResult.message || jobResult.error));
+            return;
+          }
+          d = jobResult.result || jobResult;
         }
 
         if (d.success) {
@@ -3156,10 +3234,22 @@ Step10: アラート判定</pre>
         return;
       }
 
-      if (!confirm(`${checkedItems.length}件を仮確定に移動します。納品推奨のチェックはリセットされます。よろしいですか？`)) return;
+      // 既存の仮確定データがあるか確認
+      let existingCount = 0;
+      try {
+        const pRes = await fetch(`${BASE}/api/provisional`);
+        const pData = await pRes.json();
+        existingCount = (pData.items || []).length;
+      } catch(e) { /* ignore */ }
+
+      const msg = existingCount > 0
+        ? `${checkedItems.length}件を仮確定に追加します（既存${existingCount}件は保持）。納品推奨のチェックはリセットされます。よろしいですか？`
+        : `${checkedItems.length}件を仮確定に移動します。納品推奨のチェックはリセットされます。よろしいですか？`;
+      if (!confirm(msg)) return;
 
       try {
-        const res = await fetch(`${BASE}/api/provisional`, {
+        // マージAPI（既存データを保持しつつ追加・更新）
+        const res = await fetch(`${BASE}/api/provisional/merge`, {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({items: checkedItems}),
@@ -3174,7 +3264,10 @@ Step10: アラート判定</pre>
 
         await loadProvisionalData();
         switchTab('provisional');
-        log(`仮確定に${checkedItems.length}件移動しました`);
+        const mergeMsg = existingCount > 0
+          ? `${checkedItems.length}件を追加しました（合計${d.total}件）`
+          : `仮確定に${checkedItems.length}件移動しました`;
+        log(mergeMsg);
       } catch(e) {
         alert('エラー: ' + e.message);
       }
@@ -3382,14 +3475,21 @@ Step10: アラート判定</pre>
           };
         })}),
         });
-        const d = await res.json();
+        let d = await res.json();
         if (d.error) {
-          log('エラー: ' + d.error);
+          log('エラー: ' + (d.message || d.error));
           if (d.details) log('詳細: ' + JSON.stringify(d.details));
           if (d.errorSkus && d.errorSkus.length > 0) {
             log('エラーSKU: ' + d.errorSkus.map(s => `${s.sku} (${s.name || ''})`).join(', '));
           }
           return;
+        }
+        // ジョブ方式対応
+        if (d.jobId) {
+          log('納品プラン作成ジョブ開始...');
+          const jobResult = await pollJob(d.jobId, { intervalMs: 2000, maxWaitMs: 120000 });
+          if (jobResult.error) { log('エラー: ' + (jobResult.message || jobResult.error)); return; }
+          d = jobResult.result || jobResult;
         }
         const planUrl = `https://sellercentral-japan.amazon.com/fba/sendtoamazon/confirm_content_step?wf=${d.inboundPlanId}`;
         log(`納品プラン作成成功! <a href="${planUrl}" target="_blank" style="color:#2563eb;">Seller Centralで開く ↗</a> (プランID: ${d.inboundPlanId})`);

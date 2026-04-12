@@ -46,8 +46,12 @@ export async function syncToRender() {
   days90ago.setDate(days90ago.getDate() - 90);
   const days90agoStr = days90ago.toISOString().slice(0, 10); // YYYY-MM-DD
 
-  // 1. products
-  const products = db.prepare('SELECT * FROM m_products').all();
+  // 1. products（代表商品コードをraw_ne_productsからJOIN）
+  const products = db.prepare(`
+    SELECT p.*, n.代表商品コード
+    FROM m_products p
+    LEFT JOIN raw_ne_products n ON p.商品コード = n.商品コード COLLATE NOCASE
+  `).all();
   console.log(`[Sync→Render]   products: ${products.length}件`);
 
   // 2. set_components

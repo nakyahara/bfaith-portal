@@ -62,45 +62,29 @@ router.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// 楽天RMS APIプロキシ
-router.get('/proxy', (req, res) => {
-  const auth = req.headers['authorization'];
-  if (!auth) {
-    return res.status(401).json({ error: 'Authorization header required' });
-  }
+// 楽天RMS APIプロキシ → ミニPC経由（APIキーはミニPC側で管理）
+const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
+function getServiceHeaders() {
+  return {
+    'CF-Access-Client-Id': process.env.CF_ACCESS_CLIENT_ID || '',
+    'CF-Access-Client-Secret': process.env.CF_ACCESS_CLIENT_SECRET || '',
+    'Authorization': `Bearer ${process.env.WAREHOUSE_SERVICE_TOKEN || ''}`,
+  };
+}
 
+router.get('/proxy', async (req, res) => {
+  // フロントからのAuthorizationヘッダーは無視（ミニPC側のキーを使う）
   const cursorMark = req.query.cursorMark || '*';
   const hits = req.query.hits || '100';
-  const rmsPath = `/es/2.0/items/search?cursorMark=${encodeURIComponent(cursorMark)}&hits=${hits}`;
 
-  const opts = {
-    hostname: 'api.rms.rakuten.co.jp',
-    path: rmsPath,
-    headers: { 'Authorization': auth }
-  };
-
-  https.get(opts, (apiRes) => {
-    let body = '';
-    apiRes.on('data', d => body += d);
-    apiRes.on('end', () => {
-      try {
-        const d = JSON.parse(body);
-        const results = d.results || d.items || [];
-        const isFirstPage = decodeURIComponent(cursorMark) === '*';
-        if (isFirstPage && results[0]) {
-          const firstItem = (results[0].item) || results[0];
-          console.log(`[RMS API] HTTP ${apiRes.statusCode} | numFound:${d.numFound} results:${results.length}`);
-        } else {
-          console.log(`[RMS API] HTTP ${apiRes.statusCode} | results:${results.length}`);
-        }
-      } catch (e) {
-        console.log(`[RMS API] HTTP ${apiRes.statusCode} | parse error: ${e.message}`);
-      }
-      res.status(apiRes.statusCode).type('json').send(body);
-    });
-  }).on('error', e => {
-    res.status(502).json({ error: e.message });
-  });
+  try {
+    const url = `${WAREHOUSE_URL}/service-api/rakuten-rms/items/search?cursorMark=${encodeURIComponent(cursorMark)}&hits=${hits}`;
+    const response = await fetch(url, { headers: getServiceHeaders(), signal: AbortSignal.timeout(30000) });
+    const data = await response.json();
+    res.status(response.status).json(data);
+  } catch (e) {
+    res.status(502).json({ error: 'ミニPCへの接続に失敗: ' + e.message });
+  }
 });
 
 // 画像ダウンロード開始

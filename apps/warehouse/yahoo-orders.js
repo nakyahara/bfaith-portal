@@ -168,7 +168,7 @@ function insertOrders(db, orders, batchId, windowStart, windowEnd) {
         continue;
       }
 
-      const orderInfo = resultSet?.OrderInfo || resultSet?.Order || resultSet;
+      const orderInfo = result?.OrderInfo || resultSet?.OrderInfo || resultSet?.Order || resultSet;
       if (!orderInfo) continue;
 
       // 注文レベルの情報

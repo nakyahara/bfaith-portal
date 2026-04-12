@@ -17,6 +17,7 @@ import warehouseRouter from './apps/warehouse/router.js';
 import mirrorRouter from './apps/warehouse-mirror/router.js';
 import amazonAccountingRouter from './apps/amazon-accounting/router.js';
 import rakutenAccountingRouter from './apps/rakuten-accounting/router.js';
+import aupayAccountingRouter from './apps/aupay-accounting/router.js';
 import serviceRouter from './apps/warehouse/service-router.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -212,6 +213,15 @@ const apps = [
     status: 'active',
     category: 'accounting',
   },
+  {
+    id: 'aupay-accounting',
+    name: 'auペイマーケット売上集計',
+    description: 'auペイマーケット会計用注文データCSVから税率別・セグメント別の売上集計を自動計算',
+    icon: '📙',
+    path: '/apps/aupay-accounting',
+    status: 'active',
+    category: 'accounting',
+  },
 ];
 
 // 外部リンク
@@ -328,6 +338,7 @@ app.use('/apps/amazon-accounting', (req, res, next) => {
   requireAuth(req, res, next);
 }, amazonAccountingRouter);
 app.use('/apps/rakuten-accounting', requireAuth, rakutenAccountingRouter);
+app.use('/apps/aupay-accounting', requireAuth, aupayAccountingRouter);
 
 // 未実装アプリのプレースホルダー
 app.get('/apps/:appId', requireAuth, (req, res) => {

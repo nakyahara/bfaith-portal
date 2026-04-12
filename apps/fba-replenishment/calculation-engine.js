@@ -46,7 +46,7 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
   for (const r of nonFbaMax60dList) nonFbaMax60dMap[r.amazon_sku] = r;
 
   const snapshotDate = snapshots[0]?.snapshot_date;
-  const workingExpiryDays = parseInt(settings.working_expiry_days || 7);
+  const workingExpiryDays = parseInt(settings.working_expiry_days || 3);
   const items = [];
 
   for (const snap of snapshots) {
@@ -72,14 +72,14 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
       inboundWorking = reportWorking;
       workingSource = 'report';
 
-      // レポートのみの場合: working_first_seenが7日超なら除外
+      // レポートのみの場合: working_first_seenが設定日数(デフォルト3日)超なら除外
       if (inboundWorking > 0 && snap.working_first_seen) {
         const daysSinceFirstSeen = Math.floor(
           (new Date(snapshotDate) - new Date(snap.working_first_seen)) / 86400000
         );
         if (daysSinceFirstSeen > workingExpiryDays) {
           inboundWorking = 0; // 放置プラン扱い
-          workingSource = 'report(7日超除外)';
+          workingSource = `report(${workingExpiryDays}日超除外)`;
         }
       }
     }
