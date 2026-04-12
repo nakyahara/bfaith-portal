@@ -320,19 +320,18 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
         const orderId = col('注文ID');
         if (!orderId) continue;
 
-        // 注文ステータスが「決済済み」以外はスキップ（キャンセル等除外）
+        // 注文ステータスが「取引完了」または「決済済み」以外はスキップ（キャンセル等除外）
         const status = col('注文ステータス');
-        if (status !== '決済済み') continue;
+        if (status !== '取引完了' && status !== '決済済み') continue;
 
         const itemCode = col('商品コード');
         const varCode = col('バリエーションコード');
         const quantity = parseInt(col('数量')) || 1;
         const unitPrice = num(col('商品単価'));
-        const totalPrice = num(col('商品計金額')) || unitPrice * quantity;
+        const totalPrice = num(col('商品合計金額')) || unitPrice * quantity;
         const title = col('商品名');
-        const deliveryDate = col('発送可能日');
-        // 注文日時から年月を取得
-        const orderDate = col('注文マト');
+        const deliveryDate = col('発送可能日時');
+        const orderDate = '';
 
         allRows.push({
           注文番号: orderId,
