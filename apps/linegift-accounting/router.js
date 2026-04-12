@@ -1,14 +1,14 @@
 /**
- * auペイマーケット売上集計ツール
+ * LINEギフト売上集計ツール
  *
- * auペイマーケットの「会計用注文データDL項目」CSVをアップロードし、
+ * LINEギフトの注文CSVをアップロードし、
  * mirror_products を使って税率別・セグメント別の売上集計を自動計算する。
- * 口座振替通知書PDF（任意）からPF手数料を自動読み取り。
+ * PF手数料は手入力（LINEギフト振込通知PDFから目視確認）。
  *
  * 工程1: 注文データCSVアップロード（Shift_JIS、複数対応）
  * 工程2: 未登録商品の税率・セグメント登録
  * 工程3: 税率別・セグメント別集計
- * 工程4: PF手数料入力（PDF or 手入力）
+ * 工程4: PF手数料入力（手入力）
  * 工程5: 確定
  */
 import { Router } from 'express';
@@ -53,7 +53,6 @@ function parseShiftJisCsv(buf) {
 
 function resolveProducts(rows, db) {
   const productsMap = new Map();
-  // 代表商品コードで引けるマップ（複数商品が同じ代表コードを持つ場合は最初の1件）
   const repCodeMap = new Map();
   for (const p of db.prepare('SELECT * FROM mirror_products').all()) {
     productsMap.set((p.商品コード || '').toLowerCase(), p);
@@ -67,33 +66,34 @@ function resolveProducts(rows, db) {
   const unresolved = new Map();
   const unresolvedTax = new Map();
   const unresolvedSegment = new Map();
-  const resolvedByRepCode = new Map(); // 代表商品コードで紐付けた商品リスト
+  const resolvedByRepCode = new Map();
 
   for (const row of rows) {
+    const varCode = (row.バリエーションコード || '').toLowerCase();
     const itemCode = (row.商品コード || '').toLowerCase();
-    const mgmtId = (row.管理コード || '').toLowerCase();
+    // LINEギフトCSV: バリエーションコード > 商品コードの優先順
+    const primaryCode = varCode || itemCode;
 
-    if (!itemCode) {
+    if (!primaryCode) {
       resolved.push({ ...row, 原価: 0, 税率: null, 売上分類: null, 解決方法: 'no_code' });
       continue;
     }
 
-    // Stage 1: F列ありの場合 itemCode+mgmtId で検索
+    // Stage 1: バリエーションコードで検索
     let product = null;
     let resolveMethod = null;
-    if (mgmtId) {
-      const combinedCode = itemCode + mgmtId;
-      product = productsMap.get(combinedCode);
-      if (product) resolveMethod = 'combined';
+    if (varCode) {
+      product = productsMap.get(varCode);
+      if (product) resolveMethod = 'variation';
     }
-    // Stage 2: itemCode のみで検索
-    if (!product) {
+    // Stage 2: 商品コードで検索
+    if (!product && itemCode) {
       product = productsMap.get(itemCode);
       if (product) resolveMethod = 'direct';
     }
-    // Stage 3: itemCode を代表商品コードとして検索
+    // Stage 3: 代表商品コードとして検索
     if (!product) {
-      product = repCodeMap.get(itemCode);
+      product = repCodeMap.get(primaryCode);
       if (product) resolveMethod = 'rep_code';
     }
 
@@ -108,11 +108,11 @@ function resolveProducts(rows, db) {
         解決方法: resolveMethod,
       });
 
-      // 代表商品コードで紐付けた場合、リストに記録
       if (resolveMethod === 'rep_code') {
-        const key = itemCode;
+        const key = primaryCode;
         const existing = resolvedByRepCode.get(key) || {
-          auPayCode: row.商品コード || '', matchedCode: product.商品コード,
+          lineCode: row.バリエーションコード || row.商品コード || '',
+          matchedCode: product.商品コード,
           matchedName: product.商品名 || '', name: row.商品名 || '',
           count: 0, amount: 0,
         };
@@ -125,7 +125,7 @@ function resolveProducts(rows, db) {
         const key = product.商品コード.toLowerCase();
         const existing = unresolvedTax.get(key) || {
           code: product.商品コード, name: row.商品名 || '',
-          csvTaxRate: row.CSV税率 || null, count: 0, amount: 0,
+          csvTaxRate: null, count: 0, amount: 0,
         };
         existing.count++;
         existing.amount += row.売上合計 || 0;
@@ -149,14 +149,13 @@ function resolveProducts(rows, db) {
         原価: 0, 税率: null, 売上分類: null,
         解決方法: 'unresolved',
       });
-      const unresolvedKey = mgmtId ? itemCode + mgmtId : itemCode;
-      const existing = unresolved.get(unresolvedKey) || {
-        code: unresolvedKey, name: row.商品名 || '',
-        csvTaxRate: row.CSV税率 || null, count: 0, amount: 0,
+      const existing = unresolved.get(primaryCode) || {
+        code: primaryCode, name: row.商品名 || '',
+        csvTaxRate: null, count: 0, amount: 0,
       };
       existing.count++;
       existing.amount += row.売上合計 || 0;
-      unresolved.set(unresolvedKey, existing);
+      unresolved.set(primaryCode, existing);
     }
   }
 
@@ -201,12 +200,12 @@ function aggregate(resolvedRows) {
     if (row.解決方法 === 'no_code') continue;
 
     const sale = row.売上合計 || 0;
-    const coupon = row.クーポン値引額 || 0;
+    const coupon = 0; // LINEギフトCSVにクーポン値引は含まれない
     const afterCoupon = sale - coupon;
     const genka = (row.原価 || 0) * (row.個数 || 1);
 
-    // 税率別: マスター税率 > CSV税率 > 10%仮扱い
-    const taxRate = row.税率 || row.CSV税率 || 10;
+    // 税率別: マスター税率 > 10%仮扱い
+    const taxRate = row.税率 || 10;
     const taxKey = taxRate === 8 ? '8' : '10';
     byTax[taxKey].売上合計 += sale;
     byTax[taxKey].クーポン値引額 += coupon;
@@ -245,12 +244,12 @@ function aggregate(resolvedRows) {
     }
   }
 
-  // MF連携用: CSVの金額は税込みなのでそのまま使う
+  // MF連携用: 税込み集計
   const t10 = byTax['10'];
   const t8 = byTax['8'];
   const mfRow = {
-    '商品売上(10%)': Math.round(t10.クーポン値引後売上),
-    '商品売上(8%)': Math.round(t8.クーポン値引後売上),
+    '商品売上(10%)': Math.round(t10.クーポン値引後売上 * 1.1),
+    '商品売上(8%)': Math.round(t8.クーポン値引後売上 * 1.08),
   };
   mfRow['合計'] = mfRow['商品売上(10%)'] + mfRow['商品売上(8%)'];
 
@@ -300,10 +299,10 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
       const csvRows = parseShiftJisCsv(buf);
       if (csvRows.length < 2) continue;
 
-      // ヘッダー確認（先頭列=controlType）
+      // ヘッダー確認（LINEギフト形式: 先頭列=ショップID）
       const header = csvRows[0];
-      if (header[0] !== 'controlType') {
-        return res.status(400).json({ error: file.originalname + ' はauペイマーケット形式ではありません（先頭列: ' + header[0] + '）' });
+      if (header[0] !== 'ショップID') {
+        return res.status(400).json({ error: file.originalname + ' はLINEギフト形式ではありません（先頭列: ' + header[0] + '）' });
       }
 
       const num = v => { const n = parseFloat((v || '').replace(/,/g, '')); return isNaN(n) ? 0 : n; };
@@ -314,48 +313,38 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
 
       for (let i = 1; i < csvRows.length; i++) {
         const cols = csvRows[i];
-        if (cols.length < 20) continue;
+        if (cols.length < 10) continue;
 
         const col = name => cols[colIdx[name]] || '';
 
-        const orderId = col('orderId');
+        const orderId = col('注文ID');
         if (!orderId) continue;
 
-        // キャンセル行を除外
-        const cancelStatus = col('cancelStatus');
-        if (cancelStatus === 'C') continue;
+        // 注文ステータスが「決済済み」以外はスキップ（キャンセル等除外）
+        const status = col('注文ステータス');
+        if (status !== '決済済み') continue;
 
-        const itemCode = col('itemCode');
-        const itemManagementId = col('itemManagementId');
-        const quantity = parseInt(col('unit')) || 0;
-        const unitPrice = num(col('itemPrice'));
-        const totalItemPrice = num(col('totalItemPrice')) || unitPrice * quantity;
-        const taxRate = parseFloat(col('taxRate')) || 0;
-        const csvTaxRate = taxRate === 0.08 ? 8 : 10;
-        const title = col('itemName');
-        const shipDate = col('shipDate');
-
-        // クーポン: couponType D/M = モール負担（店舗負担0）、U = 店舗負担
-        const couponTotal = num(col('couponTotalPrice'));
-        const totalPrice = num(col('totalPrice'));
-        const couponType = col('couponType');
-        // 店舗負担クーポン: couponType=Uの場合、注文合計に対する明細の按分
-        let shopCoupon = 0;
-        if (couponType === 'U' && totalPrice > 0) {
-          shopCoupon = couponTotal * (unitPrice * quantity) / totalPrice;
-        }
+        const itemCode = col('商品コード');
+        const varCode = col('バリエーションコード');
+        const quantity = parseInt(col('数量')) || 1;
+        const unitPrice = num(col('商品単価'));
+        const totalPrice = num(col('商品計金額')) || unitPrice * quantity;
+        const title = col('商品名');
+        const deliveryDate = col('発送可能日');
+        // 注文日時から年月を取得
+        const orderDate = col('注文マト');
 
         allRows.push({
           注文番号: orderId,
           商品コード: itemCode,
-          管理コード: itemManagementId,
+          バリエーションコード: varCode,
           商品名: title,
           単価: unitPrice,
           個数: quantity,
-          売上合計: totalItemPrice,
-          クーポン値引額: shopCoupon,
-          発送日: shipDate,
-          CSV税率: csvTaxRate,
+          売上合計: totalPrice,
+          クーポン値引額: 0,
+          発送日: deliveryDate,
+          注文日時: orderDate,
         });
       }
     }
@@ -364,11 +353,12 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
       return res.status(400).json({ error: 'CSVからデータを読み取れませんでした' });
     }
 
-    // 対象年月を推定（発送日から）
+    // 対象年月を推定（発送可能日 or 注文日時から）
     let yearMonth = '';
     for (const row of allRows) {
-      if (row.発送日) {
-        const d = row.発送日.replace(/\//g, '-');
+      const dateStr = row.発送日 || row.注文日時 || '';
+      if (dateStr) {
+        const d = dateStr.replace(/\//g, '-');
         yearMonth = d.slice(0, 7);
         break;
       }
@@ -400,81 +390,8 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
       mfRow: agg.mfRow,
     });
   } catch (e) {
-    console.error('[AuPayAccounting] エラー:', e.message, e.stack);
+    console.error('[LinegiftAccounting] エラー:', e.message, e.stack);
     res.status(500).json({ error: '集計処理エラー: ' + e.message });
-  }
-});
-
-// ─── POST /upload-pdf — 口座振替通知書PDFアップロード ───
-
-router.post('/upload-pdf', upload.single('file'), async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'PDFファイルが必要です' });
-
-  try {
-    const buf = fs.readFileSync(req.file.path);
-    fs.unlinkSync(req.file.path);
-
-    // pdf-parse v2でテキスト抽出
-    let PDFParse;
-    try {
-      PDFParse = (await import('pdf-parse')).PDFParse;
-    } catch {
-      return res.status(500).json({ error: 'pdf-parseモジュールが見つかりません' });
-    }
-
-    const parser = new PDFParse({});
-    await parser.load(buf);
-    const text = await parser.getText();
-
-    // ご請求額(A+B) の金額を抽出
-    // PDF text pattern: "ご請求額（A+B）" followed by amount like ￥146,054 or 146,054
-    let totalFee = null;
-    let adCost = null;
-
-    // パターン1: "ご請求額" 付近の数値
-    const feeMatch = text.match(/ご請求額[^0-9￥]*[￥]?\s*([\d,]+)/);
-    if (feeMatch) {
-      totalFee = parseInt(feeMatch[1].replace(/,/g, ''));
-    }
-
-    // パターン2: 広告掲載料
-    const adMatch = text.match(/広告掲載料[^0-9￥]*[￥]?\s*([\d,]+)/);
-    if (adMatch) {
-      adCost = parseInt(adMatch[1].replace(/,/g, ''));
-    }
-
-    // 年月を抽出（"2026 4" or "2026年4月"パターン）
-    let pdfYearMonth = '';
-    const ymMatch = text.match(/(\d{4})\s+(\d{1,2})\s+ご請求額/);
-    if (ymMatch) {
-      pdfYearMonth = ymMatch[1] + '-' + String(parseInt(ymMatch[2])).padStart(2, '0');
-    }
-
-    // 内訳を抽出
-    const breakdown = {};
-    const items = [
-      { key: '出店料', pattern: /出店料[^0-9￥]*[￥]?\s*([\d,]+)/ },
-      { key: '成約手数料等', pattern: /成約手数料等[^0-9￥]*[￥]?\s*([\d,]+)/ },
-      { key: 'ポイント付与原資', pattern: /ポイント付与原資[^0-9￥]*[￥]?\s*([\d,]+)/ },
-      { key: 'オプション料', pattern: /オプション料[^0-9￥]*[￥]?\s*([\d,]+)/ },
-    ];
-    for (const item of items) {
-      const m = text.match(item.pattern);
-      if (m) breakdown[item.key] = parseInt(m[1].replace(/,/g, ''));
-    }
-
-    res.json({
-      ok: true,
-      totalFee,
-      adCost: adCost || 0,
-      pfFee: totalFee != null ? totalFee - (adCost || 0) : null,
-      pdfYearMonth,
-      breakdown,
-      rawTextPreview: text.slice(0, 500),
-    });
-  } catch (e) {
-    console.error('[AuPayAccounting] PDF解析エラー:', e.message, e.stack);
-    res.status(500).json({ error: 'PDF解析エラー: ' + e.message });
   }
 });
 
@@ -516,7 +433,7 @@ router.post('/confirm', (req, res) => {
 
   try {
     const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
-    db.prepare(`INSERT OR REPLACE INTO mart_aupay_monthly_summary
+    db.prepare(`INSERT OR REPLACE INTO mart_linegift_monthly_summary
       (year_month, total_rows, resolved_count, unresolved_count,
        by_tax, by_segment, excluded, mf_row, pf_fee, ad_cost, confirmed_at)
       VALUES (?,?,?,?,?,?,?,?,?,?,?)
@@ -526,7 +443,7 @@ router.post('/confirm', (req, res) => {
       JSON.stringify(mfRow), pfFee || 0, adCost || 0, now
     );
 
-    db.prepare(`INSERT INTO mart_aupay_upload_log
+    db.prepare(`INSERT INTO mart_linegift_upload_log
       (year_month, total_rows, resolved_count, unresolved_count, uploaded_at)
       VALUES (?,?,?,?,?)
     `).run(yearMonth, totalRows || 0, resolvedCount || 0, unresolvedCount || 0, now);
@@ -542,7 +459,7 @@ router.post('/confirm', (req, res) => {
 router.get('/history', (req, res) => {
   const db = getMirrorDB();
   try {
-    const rows = db.prepare('SELECT * FROM mart_aupay_monthly_summary ORDER BY year_month DESC').all();
+    const rows = db.prepare('SELECT * FROM mart_linegift_monthly_summary ORDER BY year_month DESC').all();
     const parsed = rows.map(r => ({
       ...r,
       by_tax: JSON.parse(r.by_tax || '{}'),
@@ -564,18 +481,18 @@ function renderPage() {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>auペイマーケット売上集計 - B-Faith</title>
+  <title>LINEギフト売上集計 - B-Faith</title>
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
     body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f5f5;color:#333;font-size:14px}
-    .header{background:#e85514;color:white;padding:12px 24px;display:flex;align-items:center;gap:16px}
+    .header{background:#06C755;color:white;padding:12px 24px;display:flex;align-items:center;gap:16px}
     .header h1{font-size:18px}
-    .header a{color:#ffd4c2;text-decoration:none;font-size:13px}
+    .header a{color:#c8f7d8;text-decoration:none;font-size:13px}
     .wrap{max-width:1800px;margin:16px auto;padding:0 16px}
     .card{background:white;border-radius:8px;padding:20px;margin-bottom:12px;box-shadow:0 1px 3px rgba(0,0,0,.1);overflow-x:auto}
     .card h2{font-size:15px;color:#555;margin-bottom:10px}
     .btn{padding:8px 20px;border:none;border-radius:4px;cursor:pointer;font-size:14px}
-    .btn-p{background:#e85514;color:white}.btn-p:hover{background:#c74410}
+    .btn-p{background:#06C755;color:white}.btn-p:hover{background:#05a648}
     .btn-s{background:#27ae60;color:white}.btn-s:hover{background:#1e8449}
     .btn-w{background:#e67e22;color:white}.btn-w:hover{background:#d35400}
     .btn:disabled{opacity:.5;cursor:default}
@@ -594,7 +511,7 @@ function renderPage() {
     .negative{color:#e74c3c}
     .tab-bar{display:flex;gap:4px;margin-bottom:12px;border-bottom:2px solid #ddd;padding-bottom:0}
     .tab-btn{padding:8px 16px;border:none;background:#eee;cursor:pointer;border-radius:4px 4px 0 0;font-size:13px}
-    .tab-btn.active{background:#e85514;color:white}
+    .tab-btn.active{background:#06C755;color:white}
     .tab-content{display:none}.tab-content.active{display:block}
     .acc-header{cursor:pointer;padding:10px 12px;background:#f8f9fa;border:1px solid #dee2e6;border-radius:4px;margin-bottom:2px;display:flex;justify-content:space-between;align-items:center;font-size:13px}
     .acc-header:hover{background:#e9ecef}
@@ -610,15 +527,15 @@ function renderPage() {
 </head>
 <body>
   <div class="header">
-    <h1>auペイマーケット売上集計</h1>
+    <h1>LINEギフト売上集計</h1>
     <a href="/">\\u2190 \\u30dd\\u30fc\\u30bf\\u30eb\\u306b\\u623b\\u308b</a>
   </div>
   <div class="wrap">
     <!-- 工程1: 注文データCSV -->
     <div class="card">
       <h2>工程1: 注文データCSVアップロード</h2>
-      <p class="meta">auペイマーケット管理画面 → 受注管理 → CSVダウンロード（発送日・完了・会計用注文データDL項目）</p>
-      <p class="meta" style="color:#e85514;font-weight:bold">複数ファイル選択可（最大10ファイル）</p>
+      <p class="meta">LINEギフト管理画面 → 注文管理 → CSVダウンロード（注文ステータス: 決済済み）</p>
+      <p class="meta" style="color:#06C755;font-weight:bold">複数ファイル選択可（最大10ファイル）</p>
       <div style="margin-top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <input type="file" id="csvFiles" accept=".csv" multiple>
         <button class="btn btn-p" id="uploadBtn" onclick="doUpload()">アップロード＆集計</button>
@@ -646,7 +563,7 @@ function renderPage() {
 
       <!-- 税率別集計 -->
       <div class="card">
-        <h2>税率別売上集計（税込）</h2>
+        <h2>税率別売上集計（税抜）</h2>
         <div id="taxTable"></div>
       </div>
 
@@ -665,16 +582,11 @@ function renderPage() {
 
       <!-- PF手数料 -->
       <div class="card">
-        <h2>工程2: PF手数料・広告費</h2>
-        <p class="meta">口座振替通知書PDFをアップロードすると自動入力されます。手入力も可。</p>
-        <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-          <input type="file" id="pdfFile" accept=".pdf">
-          <button class="btn btn-w" id="pdfBtn" onclick="doPdfUpload()">PDF読み取り</button>
-        </div>
-        <div id="pdfResult" style="margin-top:8px"></div>
+        <h2>工程2: PF手数料</h2>
+        <p class="meta">LINEギフト管理画面の振込通知から手数料を確認して入力してください。</p>
+        <p class="meta"><a href="https://gift-shop-cms.line.biz/shops/838894/transfers" target="_blank" style="color:#06C755">LINEギフト振込一覧を開く</a></p>
         <div style="margin-top:12px;display:flex;gap:16px;align-items:center;flex-wrap:wrap">
           <label>PF手数料（税込）: <input type="text" id="pfFeeInput" class="pf-input" value="0"></label>
-          <label>広告費（税込）: <input type="text" id="adCostInput" class="pf-input" value="0"></label>
           <button class="btn btn-p" onclick="applyPfFee()">反映</button>
         </div>
         <div id="costSummary" style="margin-top:8px"></div>
@@ -692,7 +604,7 @@ function renderPage() {
       <!-- 代表商品コードで紐付けた商品 -->
       <div id="repCodeCard" class="card" style="display:none">
         <h2>代表商品コードで紐付けた商品</h2>
-        <p class="meta">auペイ側の商品コードがマスタに直接存在せず、代表商品コード経由で紐付けました。auペイ管理画面の商品コード登録ミスの可能性があります。</p>
+        <p class="meta">LINEギフト側の商品コードがマスタに直接存在せず、代表商品コード経由で紐付けました。</p>
         <div id="repCodeList"></div>
       </div>
 
@@ -749,12 +661,11 @@ function renderPage() {
             await new Promise(ok => setTimeout(ok, 3000));
             continue;
           }
-          throw new Error('サーバーに接続できません（' + e.message + '）。ページを再読み込みしてから再度お試しください。');
+          throw new Error('サーバーに接続できません。ページを再読み込みしてください。');
         }
       }
     }
 
-    // ─── 工程1: CSVアップロード ───
     async function doUpload() {
       const fileInput = document.getElementById('csvFiles');
       if (!fileInput.files.length) { alert('ファイルを選択してください'); return; }
@@ -798,7 +709,7 @@ function renderPage() {
       summaryHtml += '総行数: ' + data.totalRows + ' / 解決済: ' + data.resolvedCount + ' / 未登録商品: ' + data.unresolvedProducts.length + '件';
       if (hasUnresTax) summaryHtml += ' / <span class="negative">税率未登録: ' + data.unresolvedTax.length + '件</span>';
       if (hasUnresSeg) summaryHtml += ' / <span class="negative">セグメント未登録: ' + data.unresolvedSegment.length + '件</span>';
-      if (!hasUnresolved) summaryHtml += '<br><b style="color:#27ae60">全商品解決済み — 確定可能</b>';
+      if (!hasUnresolved) summaryHtml += '<br><b style="color:#27ae60">全商品解決済み</b>';
       else summaryHtml += '<br><b style="color:#e74c3c">未登録商品あり — warehouse側で登録後に再アップロード</b>';
       summaryHtml += '</div>';
       document.getElementById('summary').innerHTML = summaryHtml;
@@ -821,9 +732,9 @@ function renderPage() {
         if (hasUnresolved) {
           contentHtml += '<div id="unres-product" class="tab-content active">';
           contentHtml += '<div class="warn">商品マスタに未登録の商品です。warehouse側で登録してから再アップロードしてください。</div>';
-          contentHtml += '<table><tr><th>商品コード</th><th>商品名</th><th>CSV税率</th><th>出現数</th><th>売上合計</th></tr>';
+          contentHtml += '<table><tr><th>商品コード</th><th>商品名</th><th>出現数</th><th>売上合計</th></tr>';
           for (const u of data.unresolvedProducts) {
-            contentHtml += '<tr><td>' + u.code + '</td><td>' + (u.name || '').slice(0, 60) + '</td><td class="num">' + (u.csvTaxRate || '-') + '</td><td class="num">' + u.count + '</td><td class="num">' + fmt(u.amount) + '</td></tr>';
+            contentHtml += '<tr><td>' + u.code + '</td><td>' + (u.name || '').slice(0, 60) + '</td><td class="num">' + u.count + '</td><td class="num">' + fmt(u.amount) + '</td></tr>';
           }
           contentHtml += '</table></div>';
         }
@@ -831,11 +742,11 @@ function renderPage() {
         if (hasUnresTax) {
           showRegisterBtn = true;
           contentHtml += '<div id="unres-tax" class="tab-content' + (!hasUnresolved?' active':'') + '">';
-          contentHtml += '<div class="warn">税率未登録の商品です。下のプルダウンで税率を選択し「登録して再集計」できます。</div>';
-          contentHtml += '<table><tr><th>商品コード</th><th>商品名</th><th>CSV税率</th><th>出現数</th><th>売上合計</th><th>税率登録</th></tr>';
+          contentHtml += '<div class="warn">税率未登録の商品です。プルダウンで税率を選択し「登録して再集計」できます。</div>';
+          contentHtml += '<table><tr><th>商品コード</th><th>商品名</th><th>出現数</th><th>売上合計</th><th>税率登録</th></tr>';
           for (const u of data.unresolvedTax) {
-            contentHtml += '<tr><td>' + u.code + '</td><td>' + (u.name || '').slice(0, 60) + '</td><td class="num">' + (u.csvTaxRate || '-') + '</td><td class="num">' + u.count + '</td><td class="num">' + fmt(u.amount) + '</td>';
-            contentHtml += '<td><select class="reg-sel tax-reg" data-code="' + u.code + '"><option value="">-</option><option value="10"' + (u.csvTaxRate===10?' selected':'') + '>10%</option><option value="8"' + (u.csvTaxRate===8?' selected':'') + '>8%</option></select></td></tr>';
+            contentHtml += '<tr><td>' + u.code + '</td><td>' + (u.name || '').slice(0, 60) + '</td><td class="num">' + u.count + '</td><td class="num">' + fmt(u.amount) + '</td>';
+            contentHtml += '<td><select class="reg-sel tax-reg" data-code="' + u.code + '"><option value="">-</option><option value="10">10%</option><option value="8">8%</option></select></td></tr>';
           }
           contentHtml += '</table></div>';
         }
@@ -843,7 +754,7 @@ function renderPage() {
         if (hasUnresSeg) {
           showRegisterBtn = true;
           contentHtml += '<div id="unres-seg" class="tab-content' + (!hasUnresolved && !hasUnresTax?' active':'') + '">';
-          contentHtml += '<div class="warn">セグメント未登録の商品です。下のプルダウンでセグメントを選択し「登録して再集計」できます。</div>';
+          contentHtml += '<div class="warn">セグメント未登録の商品です。プルダウンでセグメントを選択し「登録して再集計」できます。</div>';
           contentHtml += '<table><tr><th>商品コード</th><th>商品名</th><th>原価</th><th>出現数</th><th>売上合計</th><th>セグメント登録</th></tr>';
           for (const u of data.unresolvedSegment) {
             contentHtml += '<tr><td>' + u.code + '</td><td>' + (u.name || '').slice(0, 60) + '</td><td class="num">' + fmt(u.genka) + '</td><td class="num">' + u.count + '</td><td class="num">' + fmt(u.amount) + '</td>';
@@ -858,28 +769,21 @@ function renderPage() {
         document.getElementById('unresolvedArea').style.display = 'none';
       }
 
-      // 税率別集計
       renderTaxTable(data);
-      // MF連携用
       renderMfTable(data);
-      // セグメント別集計
       renderSegmentTable(data);
 
-      // 代表商品コードで紐付けた商品
       if (data.resolvedByRepCode && data.resolvedByRepCode.length > 0) {
         document.getElementById('repCodeCard').style.display = 'block';
         let html = '<div class="warn" style="margin-bottom:8px"><b>' + data.resolvedByRepCode.length + '商品</b>を代表商品コード経由で紐付けました</div>';
-        html += '<table class="detail-table"><tr><th>auペイ商品コード</th><th>auペイ商品名</th><th>紐付先マスタコード</th><th>マスタ商品名</th><th>出現数</th><th>売上合計</th></tr>';
+        html += '<table class="detail-table"><tr><th>LINEギフト商品コード</th><th>商品名</th><th>紐付先マスタコード</th><th>マスタ商品名</th><th>出現数</th><th>売上合計</th></tr>';
         for (const r of data.resolvedByRepCode) {
-          html += '<tr><td style="text-align:left">' + r.auPayCode + '</td><td style="text-align:left">' + (r.name || '').slice(0, 40) + '</td><td style="text-align:left;color:#e85514;font-weight:bold">' + r.matchedCode + '</td><td style="text-align:left">' + (r.matchedName || '').slice(0, 40) + '</td><td class="num">' + r.count + '</td><td class="num">' + fmt(r.amount) + '</td></tr>';
+          html += '<tr><td style="text-align:left">' + r.lineCode + '</td><td style="text-align:left">' + (r.name || '').slice(0, 40) + '</td><td style="text-align:left;color:#06C755;font-weight:bold">' + r.matchedCode + '</td><td style="text-align:left">' + (r.matchedName || '').slice(0, 40) + '</td><td class="num">' + r.count + '</td><td class="num">' + fmt(r.amount) + '</td></tr>';
         }
         html += '</table>';
         document.getElementById('repCodeList').innerHTML = html;
-      } else {
-        document.getElementById('repCodeCard').style.display = 'none';
-      }
+      } else { document.getElementById('repCodeCard').style.display = 'none'; }
 
-      // 原価ゼロ警告
       if (data.zeroGenka && data.zeroGenka.length > 0) {
         document.getElementById('zeroGenkaCard').style.display = 'block';
         let html = '<div class="warn" style="margin-bottom:8px"><b>' + data.zeroGenka.length + '商品</b>が原価0円で計算されています</div>';
@@ -889,31 +793,27 @@ function renderPage() {
         }
         html += '</table>';
         document.getElementById('zeroGenkaList').innerHTML = html;
-      } else {
-        document.getElementById('zeroGenkaCard').style.display = 'none';
-      }
+      } else { document.getElementById('zeroGenkaCard').style.display = 'none'; }
 
       updateConfirmState();
     }
 
+    function switchTab(btn, tabId) {
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+      document.getElementById(tabId).classList.add('active');
+    }
+
     function renderTaxTable(data) {
       const bt = data.byTax;
-      let html = '<table><tr><th>税率</th><th>売上合計</th><th>クーポン値引額</th><th>クーポン値引後売上</th><th>原価合計</th><th>行数</th></tr>';
-      let tot = { s:0, c:0, a:0, g:0, n:0 };
+      let html = '<table><tr><th>税率</th><th>売上合計</th><th>原価合計</th><th>行数</th></tr>';
+      let tot = { s:0, g:0, n:0 };
       for (const [key, row] of Object.entries(bt)) {
-        const label = key + '%';
-        html += '<tr><td>' + label + '</td>';
-        html += '<td class="num">' + fmt(row.売上合計) + '</td>';
-        html += '<td class="num">' + fmt(row.クーポン値引額) + '</td>';
-        html += '<td class="num">' + fmt(row.クーポン値引後売上) + '</td>';
-        html += '<td class="num">' + fmt(row.原価合計) + '</td>';
-        html += '<td class="num">' + row.行数 + '</td></tr>';
-        tot.s += row.売上合計; tot.c += row.クーポン値引額; tot.a += row.クーポン値引後売上; tot.g += row.原価合計; tot.n += row.行数;
+        html += '<tr><td>' + key + '%</td><td class="num">' + fmt(row.売上合計) + '</td><td class="num">' + fmt(row.原価合計) + '</td><td class="num">' + row.行数 + '</td></tr>';
+        tot.s += row.売上合計; tot.g += row.原価合計; tot.n += row.行数;
       }
-      html += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td>';
-      html += '<td class="num">' + fmt(tot.s) + '</td><td class="num">' + fmt(tot.c) + '</td>';
-      html += '<td class="num">' + fmt(tot.a) + '</td><td class="num">' + fmt(tot.g) + '</td>';
-      html += '<td class="num">' + tot.n + '</td></tr></table>';
+      html += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td><td class="num">' + fmt(tot.s) + '</td><td class="num">' + fmt(tot.g) + '</td><td class="num">' + tot.n + '</td></tr></table>';
       document.getElementById('taxTable').innerHTML = html;
     }
 
@@ -947,392 +847,179 @@ function renderPage() {
       const seg = data.bySegment;
       const segNames = { 1: '自社商品', 2: '取扱限定', 3: '仕入れ商品' };
       const pf = pfFeeData.pfFee || 0;
-      const ad = pfFeeData.adCost || 0;
 
       const allocTargets = ['1', '2', '3'];
-      const adTargets = ['1', '2'];
       const salesByKey = {};
       for (const [key, row] of Object.entries(seg)) { salesByKey[key] = row.クーポン値引後売上 || 0; }
       const pfByKey = allocateByRatio(pf, salesByKey, allocTargets);
-      const adByKey = allocateByRatio(ad, salesByKey, adTargets);
 
-      let html = '<table><tr><th>セグメント</th><th>売上合計</th><th>クーポン値引額</th><th>値引後売上</th><th>PF手数料</th><th>広告費</th><th>原価合計</th><th>粗利率</th><th>行数</th></tr>';
-      let tot = { s:0, c:0, a:0, g:0, n:0 };
-      let totPf = 0, totAd = 0;
+      let html = '<table><tr><th>セグメント</th><th>売上合計</th><th>PF手数料</th><th>原価合計</th><th>粗利率</th><th>行数</th></tr>';
+      let tot = { s:0, g:0, n:0 };
+      let totPf = 0;
       for (const [key, row] of Object.entries(seg)) {
         const label = segNames[key] || (key === 'other' ? 'その他/未分類' : key);
         html += '<tr><td>' + key + ': ' + label + '</td>';
         html += '<td class="num">' + fmt(row.売上合計) + '</td>';
-        html += '<td class="num">' + fmt(row.クーポン値引額) + '</td>';
-        html += '<td class="num">' + fmt(row.クーポン値引後売上) + '</td>';
         html += '<td class="num">' + fmt(pfByKey[key] || 0) + '</td>';
-        html += '<td class="num">' + fmt(adByKey[key] || 0) + '</td>';
         html += '<td class="num">' + fmt(row.原価合計) + '</td>';
         html += '<td class="num">' + (row.粗利率 || '0.0') + '%</td>';
         html += '<td class="num">' + row.行数 + '</td></tr>';
-        tot.s += row.売上合計; tot.c += row.クーポン値引額; tot.a += row.クーポン値引後売上; tot.g += row.原価合計; tot.n += row.行数;
-        totPf += (pfByKey[key] || 0); totAd += (adByKey[key] || 0);
+        tot.s += row.売上合計; tot.g += row.原価合計; tot.n += row.行数;
+        totPf += (pfByKey[key] || 0);
       }
-      const totGross = tot.a > 0 ? ((tot.a - tot.g) / tot.a * 100).toFixed(1) : '0.0';
+      const totGross = tot.s > 0 ? ((tot.s - tot.g) / tot.s * 100).toFixed(1) : '0.0';
       html += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td>';
-      html += '<td class="num">' + fmt(tot.s) + '</td><td class="num">' + fmt(tot.c) + '</td>';
-      html += '<td class="num">' + fmt(tot.a) + '</td>';
-      html += '<td class="num">' + fmt(totPf) + '</td><td class="num">' + fmt(totAd) + '</td>';
-      html += '<td class="num">' + fmt(tot.g) + '</td>';
-      html += '<td class="num">' + totGross + '%</td>';
+      html += '<td class="num">' + fmt(tot.s) + '</td><td class="num">' + fmt(totPf) + '</td>';
+      html += '<td class="num">' + fmt(tot.g) + '</td><td class="num">' + totGross + '%</td>';
       html += '<td class="num">' + tot.n + '</td></tr></table>';
       document.getElementById('segmentTable').innerHTML = html;
 
-      // 除外セグメント
       const excl = data.excluded || {};
       let exclHtml = '';
       for (const [key, row] of Object.entries(excl)) {
-        if (row.行数 > 0) {
-          exclHtml += '<div class="excluded"><b>除外: ' + key + ': 輸出</b>（' + row.行数 + '件） — 売上: ' + fmt(row.売上合計) + ' / 原価: ' + fmt(row.原価合計) + '</div>';
-        }
+        if (row.行数 > 0) exclHtml += '<div class="excluded"><b>除外: ' + key + ': 輸出</b>（' + row.行数 + '件） — 売上: ' + fmt(row.売上合計) + ' / 原価: ' + fmt(row.原価合計) + '</div>';
       }
       document.getElementById('excludedInfo').innerHTML = exclHtml;
-
-      // 変動費サマリー
-      if (pf || ad) {
-        let csHtml = '<table><tr><th>PF手数料</th><th>広告費</th><th>合計</th></tr>';
-        csHtml += '<tr><td class="num" style="font-weight:bold">' + fmt(pf) + '</td>';
-        csHtml += '<td class="num" style="font-weight:bold">' + fmt(ad) + '</td>';
-        csHtml += '<td class="num" style="font-weight:bold">' + fmt(pf + ad) + '</td></tr></table>';
-        document.getElementById('costSummary').innerHTML = csHtml;
-
-        let cbHtml = '<table><tr><th>セグメント</th><th>売上比率</th><th>PF手数料</th><th>広告費</th><th>変動費合計</th></tr>';
-        for (const [key, row] of Object.entries(seg)) {
-          const label = segNames[key] || (key === 'other' ? 'その他' : key);
-          const ratio = tot.a > 0 ? (row.クーポン値引後売上 / tot.a * 100).toFixed(1) : '0.0';
-          cbHtml += '<tr><td>' + key + ': ' + label + '</td>';
-          cbHtml += '<td class="num">' + ratio + '%</td>';
-          cbHtml += '<td class="num">' + fmt(pfByKey[key] || 0) + '</td>';
-          cbHtml += '<td class="num">' + fmt(adByKey[key] || 0) + '</td>';
-          cbHtml += '<td class="num" style="font-weight:bold">' + fmt((pfByKey[key]||0) + (adByKey[key]||0)) + '</td></tr>';
-        }
-        cbHtml += '</table>';
-        document.getElementById('costBySegment').innerHTML = cbHtml;
-      } else {
-        document.getElementById('costSummary').innerHTML = '';
-        document.getElementById('costBySegment').innerHTML = '';
-      }
-    }
-
-    function switchTab(el, tabId) {
-      el.parentElement.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-      el.classList.add('active');
-      document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-      document.getElementById(tabId).classList.add('active');
-    }
-
-    // ─── 税率・セグメント登録 ───
-    async function doRegister() {
-      const items = [];
-      document.querySelectorAll('.tax-reg').forEach(el => {
-        if (el.value) items.push({ code: el.dataset.code, taxRate: parseInt(el.value), segment: null });
-      });
-      document.querySelectorAll('.seg-reg').forEach(el => {
-        if (el.value) {
-          const existing = items.find(i => i.code === el.dataset.code);
-          if (existing) existing.segment = parseInt(el.value);
-          else items.push({ code: el.dataset.code, taxRate: null, segment: parseInt(el.value) });
-        }
-      });
-      if (!items.length) { alert('登録する項目を選択してください'); return; }
-
-      const btn = document.getElementById('registerBtn');
-      btn.disabled = true;
-      btn.textContent = '登録中...';
-      try {
-        const r = await fetchWithRetry(location.pathname + '/register', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ items }),
-        });
-        const result = await r.json();
-        if (result.ok) {
-          alert('登録完了: 税率 ' + result.updatedTax + '件 / セグメント ' + result.updatedSeg + '件\\n\\n再集計を実行します。');
-          doUpload();
-        } else {
-          alert('登録エラー: ' + (result.error || ''));
-        }
-      } catch(e) {
-        alert('登録エラー: ' + e.message);
-      }
-      btn.disabled = false;
-      btn.textContent = '選択した税率・セグメントを登録して再集計';
-    }
-
-    // ─── PDF読み取り ───
-    async function doPdfUpload() {
-      const fileInput = document.getElementById('pdfFile');
-      if (!fileInput.files.length) { alert('PDFファイルを選択してください'); return; }
-      const btn = document.getElementById('pdfBtn');
-      btn.disabled = true;
-      btn.textContent = '読み取り中...';
-
-      const formData = new FormData();
-      formData.append('file', fileInput.files[0]);
-
-      try {
-        const r = await fetchWithRetry(location.pathname + '/upload-pdf', { method: 'POST', body: formData });
-        if (!r.ok) {
-          const text = await r.text();
-          try { const j = JSON.parse(text); document.getElementById('pdfResult').innerHTML = '<div class="err">' + (j.error || r.status) + '</div>'; }
-          catch { document.getElementById('pdfResult').innerHTML = '<div class="err">サーバーエラー (HTTP ' + r.status + ')</div>'; }
-          return;
-        }
-        const data = await r.json();
-        if (data.error) { document.getElementById('pdfResult').innerHTML = '<div class="err">' + data.error + '</div>'; return; }
-
-        if (data.totalFee != null) {
-          document.getElementById('pfFeeInput').value = data.totalFee;
-          document.getElementById('adCostInput').value = data.adCost || 0;
-          let html = '<div class="ok">PDF読み取り成功: ご請求額 \\u00a5' + data.totalFee.toLocaleString();
-          if (data.pdfYearMonth) html += '（' + data.pdfYearMonth + '）';
-          html += '</div>';
-          if (data.breakdown && Object.keys(data.breakdown).length > 0) {
-            html += '<table style="margin-top:4px"><tr><th>項目</th><th>金額</th></tr>';
-            for (const [k, v] of Object.entries(data.breakdown)) {
-              html += '<tr><td>' + k + '</td><td class="num">' + fmt(v) + '</td></tr>';
-            }
-            html += '</table>';
-          }
-          document.getElementById('pdfResult').innerHTML = html;
-          applyPfFee();
-        } else {
-          document.getElementById('pdfResult').innerHTML = '<div class="warn">PDF読み取りできましたが、ご請求額を検出できませんでした。手入力してください。</div>';
-        }
-      } catch(e) {
-        document.getElementById('pdfResult').innerHTML = '<div class="err">エラー: ' + e.message + '</div>';
-      }
-      btn.disabled = false;
-      btn.textContent = 'PDF読み取り';
     }
 
     function applyPfFee() {
-      const pf = parseInt(document.getElementById('pfFeeInput').value.replace(/,/g, '')) || 0;
-      const ad = parseInt(document.getElementById('adCostInput').value.replace(/,/g, '')) || 0;
-      pfFeeData = { pfFee: pf, adCost: ad };
+      pfFeeData.pfFee = parseInt(document.getElementById('pfFeeInput').value.replace(/,/g, '')) || 0;
+      pfFeeData.adCost = 0;
       if (lastData) renderSegmentTable(lastData);
-      updateConfirmState();
+      document.getElementById('costSummary').innerHTML = '<div class="ok">PF手数料 ' + fmt(pfFeeData.pfFee) + ' を反映しました</div>';
     }
 
     function updateConfirmState() {
-      const ready = !!lastData;
-      document.getElementById('confirmBtn').disabled = !ready;
-      const pre = document.getElementById('confirmPreCheck');
-      if (ready) {
-        pre.className = 'ok';
-        pre.innerHTML = '対象年月: <b>' + (lastData.yearMonth || '不明') + '</b>（' + lastData.totalRows + '行）'
-          + ' / PF手数料: <b>\\u00a5' + (pfFeeData.pfFee || 0).toLocaleString() + '</b>'
-          + (pfFeeData.adCost ? ' / 広告費: <b>\\u00a5' + pfFeeData.adCost.toLocaleString() + '</b>' : '');
-      } else {
-        pre.className = 'warn';
-        pre.innerHTML = '注文データCSVをアップロードしてから確定してください';
+      const preCheck = document.getElementById('confirmPreCheck');
+      const confirmBtn = document.getElementById('confirmBtn');
+      if (lastData) {
+        preCheck.className = 'ok';
+        preCheck.innerHTML = '<b>' + (lastData.yearMonth || '不明') + '</b> の集計データを確定できます';
+        confirmBtn.disabled = false;
       }
     }
 
-    // ─── 確定 ───
-    async function doConfirm() {
-      if (!lastData) { alert('先に注文データCSVをアップロードしてください'); return; }
-      const ym = lastData.yearMonth || '';
-      if (!ym) { alert('対象年月が検出できません'); return; }
-      if (!confirm(ym + ' の集計を確定しますか？')) return;
+    async function doRegister() {
+      const items = [];
+      document.querySelectorAll('.tax-reg').forEach(sel => {
+        if (sel.value) items.push({ code: sel.dataset.code, taxRate: parseInt(sel.value) });
+      });
+      document.querySelectorAll('.seg-reg').forEach(sel => {
+        if (sel.value) items.push({ code: sel.dataset.code, segment: parseInt(sel.value) });
+      });
+      if (items.length === 0) { alert('登録項目を選択してください'); return; }
 
-      const btn = document.getElementById('confirmBtn');
-      btn.disabled = true;
-      btn.textContent = '保存中...';
+      try {
+        const r = await fetchWithRetry(location.pathname + '/register', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items }),
+        });
+        const data = await r.json();
+        if (data.ok) {
+          alert('登録完了（税率: ' + (data.updatedTax || 0) + '件, セグメント: ' + (data.updatedSeg || 0) + '件）\\n再アップロードして反映してください');
+          // 自動再アップロード
+          const fileInput = document.getElementById('csvFiles');
+          if (fileInput.files.length > 0) doUpload();
+        }
+      } catch(e) { alert('登録エラー: ' + e.message); }
+    }
+
+    async function doConfirm() {
+      if (!lastData) return;
+      if (!confirm(lastData.yearMonth + ' の集計を確定しますか？')) return;
       try {
         const r = await fetchWithRetry(location.pathname + '/confirm', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            yearMonth: ym,
+            yearMonth: lastData.yearMonth,
             totalRows: lastData.totalRows,
             resolvedCount: lastData.resolvedCount,
-            unresolvedCount: lastData.unresolvedProducts?.length || 0,
+            unresolvedCount: lastData.unresolvedProducts.length,
             byTax: lastData.byTax,
             bySegment: lastData.bySegment,
             excluded: lastData.excluded,
             mfRow: lastData.mfRow,
-            pfFee: pfFeeData.pfFee || 0,
-            adCost: pfFeeData.adCost || 0,
+            pfFee: pfFeeData.pfFee,
+            adCost: 0,
           }),
         });
-        const result = await r.json();
-        if (result.ok) {
-          document.getElementById('confirmStatus').innerHTML = '<span style="color:#27ae60">OK ' + ym + ' 確定済（' + result.confirmed_at + '）</span>';
+        const data = await r.json();
+        if (data.ok) {
+          document.getElementById('confirmStatus').innerHTML = '<div class="ok">確定完了: ' + data.yearMonth + ' (' + data.confirmed_at + ')</div>';
           loadHistory();
         } else {
-          document.getElementById('confirmStatus').innerHTML = '<span class="negative">エラー: ' + (result.error || '') + '</span>';
+          document.getElementById('confirmStatus').innerHTML = '<span class="negative">エラー: ' + (data.error || '不明') + '</span>';
         }
-      } catch(e) {
-        document.getElementById('confirmStatus').innerHTML = '<span class="negative">エラー: ' + e.message + '</span>';
-      }
-      btn.disabled = false;
-      btn.textContent = 'この月の集計を確定';
+      } catch(e) { document.getElementById('confirmStatus').innerHTML = '<span class="negative">エラー: ' + e.message + '</span>'; }
     }
 
-    // ─── 過去データ ───
     async function loadHistory() {
       try {
-        const r = await fetchWithRetry(location.pathname + '/history', {});
+        const r = await fetchWithRetry(location.pathname + '/history');
         const rows = await r.json();
-        if (!rows.length) {
-          document.getElementById('historyList').innerHTML = '<span class="meta">確定データはまだありません</span>';
-          return;
-        }
-        const segNames = {1:'自社商品', 2:'取扱限定', 3:'仕入れ商品'};
+        if (!rows.length) { document.getElementById('historyList').innerHTML = '<span class="meta">確定データなし</span>'; return; }
+        const segNames = { '1': '自社商品', '2': '取扱限定', '3': '仕入れ商品', 'other': 'その他' };
         let html = '';
-        for (let i = 0; i < rows.length; i++) {
-          const row = rows[i];
+        for (const row of rows) {
+          html += '<div class="acc-header" onclick="toggleAcc(this)"><span><b>' + row.year_month + '</b> — 行数: ' + row.total_rows + ' / PF手数料: ' + fmt(row.pf_fee) + ' / 確定: ' + row.confirmed_at + '</span><span class="arrow">\\u25B6</span></div>';
+          html += '<div class="acc-body"><table><tr><th>セグメント</th><th>売上合計</th><th>原価合計</th></tr>';
           const seg = row.by_segment || {};
-          let hdrSales = 0;
-          for (const sr of Object.values(seg)) hdrSales += (sr.クーポン値引後売上 || 0);
-          const pf = Math.round(row.pf_fee || 0);
-          const ad = Math.round(row.ad_cost || 0);
-
-          html += '<div class="acc-header" onclick="toggleAcc(this)" data-idx="' + i + '">';
-          html += '<span><b>' + row.year_month + '</b> — 売上: \\u00a5' + Math.round(hdrSales).toLocaleString()
-            + ' / PF: \\u00a5' + pf.toLocaleString()
-            + (ad ? ' / 広告: \\u00a5' + ad.toLocaleString() : '')
-            + ' <span class="meta">（' + (row.confirmed_at || '') + '）</span></span>';
-          html += '<span class="arrow">&#9654;</span></div>';
-          html += '<div class="acc-body" id="acc-' + i + '">';
-
-          // セグメント別
-          html += '<table><tr><th>セグメント</th><th>売上合計</th><th>クーポン値引額</th><th>値引後売上</th><th>原価合計</th><th>粗利率</th><th>行数</th></tr>';
-          let sTot = { s:0, c:0, a:0, g:0, n:0 };
-          for (const [key, sr] of Object.entries(seg)) {
-            const lb = segNames[key] || (key === 'other' ? 'その他' : key);
-            html += '<tr><td>' + key + ': ' + lb + '</td>';
-            html += '<td class="num">' + fmt(sr.売上合計||0) + '</td>';
-            html += '<td class="num">' + fmt(sr.クーポン値引額||0) + '</td>';
-            html += '<td class="num">' + fmt(sr.クーポン値引後売上||0) + '</td>';
-            html += '<td class="num">' + fmt(sr.原価合計||0) + '</td>';
-            html += '<td class="num">' + (sr.粗利率 || '0.0') + '%</td>';
-            html += '<td class="num">' + (sr.行数||0) + '</td></tr>';
-            sTot.s += (sr.売上合計||0); sTot.c += (sr.クーポン値引額||0); sTot.a += (sr.クーポン値引後売上||0); sTot.g += (sr.原価合計||0); sTot.n += (sr.行数||0);
+          for (const [k, v] of Object.entries(seg)) {
+            html += '<tr><td>' + k + ': ' + (segNames[k] || k) + '</td><td class="num">' + fmt(v.売上合計 || 0) + '</td><td class="num">' + fmt(v.原価合計 || 0) + '</td></tr>';
           }
-          const tg = sTot.a > 0 ? ((sTot.a - sTot.g) / sTot.a * 100).toFixed(1) : '0.0';
-          html += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td>';
-          html += '<td class="num">' + fmt(sTot.s) + '</td><td class="num">' + fmt(sTot.c) + '</td>';
-          html += '<td class="num">' + fmt(sTot.a) + '</td><td class="num">' + fmt(sTot.g) + '</td>';
-          html += '<td class="num">' + tg + '%</td><td class="num">' + sTot.n + '</td></tr></table>';
-
-          // 除外
-          const excl = row.excluded || {};
-          for (const [ek, er] of Object.entries(excl)) {
-            if ((er.行数||0) > 0) html += '<div class="excluded"><b>除外: ' + ek + ': 輸出</b>（' + er.行数 + '行） — 売上: ' + fmt(er.売上合計||0) + '</div>';
-          }
-
-          html += '</div>';
+          html += '</table></div>';
         }
         document.getElementById('historyList').innerHTML = html;
-      } catch(e) {
-        document.getElementById('historyList').innerHTML = '<span class="meta">読み込みエラー</span>';
-      }
+      } catch(e) { document.getElementById('historyList').innerHTML = '<span class="meta">履歴取得エラー</span>'; }
     }
 
     function toggleAcc(el) {
-      const idx = el.dataset.idx;
-      const body = document.getElementById('acc-' + idx);
       el.classList.toggle('open');
+      const body = el.nextElementSibling;
       body.classList.toggle('open');
     }
 
-    // ─── 集計サマリーCSV ───
     function downloadSummaryCsv() {
-      if (!lastData) { alert('先に注文データCSVをアップロードしてください'); return; }
-      const data = lastData;
-      let csv = '\\uFEFF';
-
-      csv += '【税率別集計（税込）】\\n';
-      csv += '税率,売上合計,クーポン値引額,クーポン値引後売上,原価合計,行数\\n';
-      const bt = data.byTax;
-      let tTot = { s:0, c:0, a:0, g:0, n:0 };
-      for (const [key, row] of Object.entries(bt)) {
-        csv += key + '%,' + Math.round(row.売上合計) + ',' + Math.round(row.クーポン値引額) + ',' + Math.round(row.クーポン値引後売上) + ',' + Math.round(row.原価合計) + ',' + row.行数 + '\\n';
-        tTot.s += row.売上合計; tTot.c += row.クーポン値引額; tTot.a += row.クーポン値引後売上; tTot.g += row.原価合計; tTot.n += row.行数;
+      if (!lastData) { alert('先にCSVをアップロードしてください'); return; }
+      const seg = lastData.bySegment;
+      const segNames = { '1': '自社商品', '2': '取扱限定', '3': '仕入れ商品', 'other': 'その他' };
+      let csv = '\\uFEFF年月,セグメント,売上合計,原価合計,PF手数料\\n';
+      const pf = pfFeeData.pfFee || 0;
+      const salesByKey = {};
+      for (const [k, v] of Object.entries(seg)) salesByKey[k] = v.クーポン値引後売上 || 0;
+      const pfByKey = allocateByRatio(pf, salesByKey, ['1','2','3']);
+      for (const [k, v] of Object.entries(seg)) {
+        csv += lastData.yearMonth + ',' + (segNames[k] || k) + ',' + Math.round(v.売上合計) + ',' + Math.round(v.原価合計) + ',' + (pfByKey[k] || 0) + '\\n';
       }
-      csv += '合計,' + Math.round(tTot.s) + ',' + Math.round(tTot.c) + ',' + Math.round(tTot.a) + ',' + Math.round(tTot.g) + ',' + tTot.n + '\\n';
-
-      csv += '\\n【MF連携用 税込み集計】\\n';
-      csv += '商品売上(10%),商品売上(8%),合計\\n';
-      const mf = data.mfRow;
-      csv += (mf['商品売上(10%)']||0) + ',' + (mf['商品売上(8%)']||0) + ',' + (mf['合計']||0) + '\\n';
-
-      csv += '\\n【セグメント別集計】\\n';
-      csv += 'セグメント,売上合計,クーポン値引額,値引後売上,原価合計,粗利率,行数\\n';
-      const seg = data.bySegment;
-      const segNames = { 1:'自社商品', 2:'取扱限定', 3:'仕入れ商品' };
-      for (const [key, row] of Object.entries(seg)) {
-        const label = segNames[key] || (key === 'other' ? 'その他' : key);
-        csv += key + ':' + label + ',' + Math.round(row.売上合計) + ',' + Math.round(row.クーポン値引額) + ',' + Math.round(row.クーポン値引後売上) + ',' + Math.round(row.原価合計) + ',' + (row.粗利率||'0.0') + ',' + row.行数 + '\\n';
-      }
-
-      csv += '\\n【変動費】\\n';
-      csv += 'PF手数料,広告費\\n';
-      csv += (pfFeeData.pfFee||0) + ',' + (pfFeeData.adCost||0) + '\\n';
-
       const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
-      a.download = 'auPay_summary_' + (data.yearMonth || 'unknown') + '.csv';
+      a.download = 'linegift-summary-' + lastData.yearMonth + '.csv';
       a.click();
     }
 
     async function downloadHistoryCsv() {
       try {
-        const r = await fetchWithRetry(location.pathname + '/history', {});
+        const r = await fetchWithRetry(location.pathname + '/history');
         const rows = await r.json();
         if (!rows.length) { alert('確定データがありません'); return; }
-
-        const segNames = {1:'自社商品', 2:'取扱限定', 3:'仕入れ商品', other:'その他'};
-        let csv = '\\uFEFF';
-        csv += '集計月,セグメント,売上合計,クーポン値引額,値引後売上,PF手数料,広告費,原価合計,粗利率\\n';
-
-        function toLastDay(ym) {
-          const [y, m] = ym.split('-').map(Number);
-          const last = new Date(y, m, 0).getDate();
-          return ym + '-' + String(last).padStart(2, '0');
-        }
-
+        const segNames = { '1': '自社商品', '2': '取扱限定', '3': '仕入れ商品', 'other': 'その他' };
+        let csv = '\\uFEFF年月,セグメント,売上合計,原価合計,PF手数料,確定日時\\n';
         for (const row of rows) {
           const seg = row.by_segment || {};
-          const pf = row.pf_fee || 0;
-          const ad = row.ad_cost || 0;
-          const allocTargets = ['1','2','3'];
-          const adTargets = ['1','2'];
-          const salesByKey = {};
-          for (const [k, sr] of Object.entries(seg)) salesByKey[k] = sr.クーポン値引後売上 || 0;
-          const pfByKey = allocateByRatio(pf, salesByKey, allocTargets);
-          const adByKey = allocateByRatio(ad, salesByKey, adTargets);
-
-          const ymDate = toLastDay(row.year_month);
-          for (const [key, sr] of Object.entries(seg)) {
-            const label = segNames[key] || key;
-            csv += ymDate + ',' + key + ':' + label + ',' + Math.round(sr.売上合計||0) + ',' + Math.round(sr.クーポン値引額||0) + ',' + Math.round(sr.クーポン値引後売上||0) + ',' + (pfByKey[key]||0) + ',' + (adByKey[key]||0) + ',' + Math.round(sr.原価合計||0) + ',' + (sr.粗利率||'0.0') + '\\n';
+          for (const [k, v] of Object.entries(seg)) {
+            csv += row.year_month + ',' + (segNames[k] || k) + ',' + Math.round(v.売上合計 || 0) + ',' + Math.round(v.原価合計 || 0) + ',' + (row.pf_fee || 0) + ',' + row.confirmed_at + '\\n';
           }
         }
-
         const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
-        a.download = 'auPay_segment_history.csv';
+        a.download = 'linegift-history.csv';
         a.click();
-      } catch(e) {
-        alert('ダウンロードエラー: ' + e.message);
-      }
+      } catch(e) { alert('エラー: ' + e.message); }
     }
 
-    document.getElementById('csvFiles').addEventListener('change', function() {
-      const n = this.files.length;
-      document.getElementById('fileCount').textContent = n > 0 ? n + 'ファイル選択中' : '';
-    });
-
+    // 起動時に履歴を読み込み
     loadHistory();
   </script>
 </body>
