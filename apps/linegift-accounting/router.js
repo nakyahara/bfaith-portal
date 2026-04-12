@@ -1023,11 +1023,19 @@ function renderPage() {
         const segNames = { '1': '自社商品', '2': '取扱限定', '3': '仕入れ商品', 'other': 'その他' };
         let html = '';
         for (const row of rows) {
-          html += '<div class="acc-header" onclick="toggleAcc(this)"><span><b>' + row.year_month + '</b> — 行数: ' + row.total_rows + ' / PF手数料: ' + fmt(row.pf_fee) + ' / 確定: ' + row.confirmed_at + '</span><span class="arrow">\\u25B6</span></div>';
-          html += '<div class="acc-body"><table><tr><th>セグメント</th><th>売上合計</th><th>原価合計</th></tr>';
           const seg = row.by_segment || {};
+          const pf = row.pf_fee || 0;
+          const salesByKey = {};
+          for (const [k, v] of Object.entries(seg)) salesByKey[k] = v.クーポン値引後売上 || v.売上合計 || 0;
+          const pfByKey = allocateByRatio(pf, salesByKey, ['1','2','3']);
+          const totalSales = Object.values(seg).reduce((s, v) => s + (v.売上合計 || 0), 0);
+          html += '<div class="acc-header" onclick="toggleAcc(this)"><span><b>' + row.year_month + '</b> — 売上: ' + fmt(totalSales) + ' / PF手数料: ' + fmt(pf) + '</span><span class="arrow">\\u25B6</span></div>';
+          html += '<div class="acc-body"><table><tr><th>セグメント</th><th>売上合計</th><th>PF手数料(按分)</th><th>原価合計</th><th>原価率</th></tr>';
           for (const [k, v] of Object.entries(seg)) {
-            html += '<tr><td>' + k + ': ' + (segNames[k] || k) + '</td><td class="num">' + fmt(v.売上合計 || 0) + '</td><td class="num">' + fmt(v.原価合計 || 0) + '</td></tr>';
+            const s = v.売上合計 || 0;
+            const c = v.原価合計 || 0;
+            const rate = s > 0 ? (c / s * 100).toFixed(1) : '0.0';
+            html += '<tr><td>' + k + ': ' + (segNames[k] || k) + '</td><td class="num">' + fmt(s) + '</td><td class="num">' + fmt(pfByKey[k] || 0) + '</td><td class="num">' + fmt(c) + '</td><td class="num">' + rate + '%</td></tr>';
           }
           html += '</table></div>';
         }
@@ -1091,11 +1099,15 @@ function renderPage() {
         const rows = await r.json();
         if (!rows.length) { alert('確定データがありません'); return; }
         const segNames = { '1': '自社商品', '2': '取扱限定', '3': '仕入れ商品', 'other': 'その他' };
-        let csv = '\\uFEFF年月,セグメント,売上合計,原価合計,PF手数料,確定日時\\n';
+        let csv = '\\uFEFF年月,セグメント,売上合計,原価合計,PF手数料(按分),確定日時\\n';
         for (const row of rows) {
           const seg = row.by_segment || {};
+          const pf = row.pf_fee || 0;
+          const salesByKey = {};
+          for (const [k, v] of Object.entries(seg)) salesByKey[k] = v.クーポン値引後売上 || v.売上合計 || 0;
+          const pfByKey = allocateByRatio(pf, salesByKey, ['1','2','3']);
           for (const [k, v] of Object.entries(seg)) {
-            csv += row.year_month + ',' + (segNames[k] || k) + ',' + Math.round(v.売上合計 || 0) + ',' + Math.round(v.原価合計 || 0) + ',' + (row.pf_fee || 0) + ',' + row.confirmed_at + '\\n';
+            csv += row.year_month + ',' + (segNames[k] || k) + ',' + Math.round(v.売上合計 || 0) + ',' + Math.round(v.原価合計 || 0) + ',' + (pfByKey[k] || 0) + ',' + row.confirmed_at + '\\n';
           }
         }
         const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
