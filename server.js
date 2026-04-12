@@ -19,6 +19,7 @@ import amazonAccountingRouter from './apps/amazon-accounting/router.js';
 import rakutenAccountingRouter from './apps/rakuten-accounting/router.js';
 import aupayAccountingRouter from './apps/aupay-accounting/router.js';
 import yahooAccountingRouter from './apps/yahoo-accounting/router.js';
+import linegiftAccountingRouter from './apps/linegift-accounting/router.js';
 import serviceRouter from './apps/warehouse/service-router.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -232,6 +233,15 @@ const apps = [
     status: 'active',
     category: 'accounting',
   },
+  {
+    id: 'linegift-accounting',
+    name: 'LINEギフト売上集計',
+    description: 'LINEギフト注文CSVから税率別・セグメント別の売上集計を自動計算',
+    icon: '💚',
+    path: '/apps/linegift-accounting',
+    status: 'active',
+    category: 'accounting',
+  },
 ];
 
 // 外部リンク
@@ -350,6 +360,7 @@ app.use('/apps/amazon-accounting', (req, res, next) => {
 app.use('/apps/rakuten-accounting', requireAuth, rakutenAccountingRouter);
 app.use('/apps/aupay-accounting', requireAuth, aupayAccountingRouter);
 app.use('/apps/yahoo-accounting', requireAuth, yahooAccountingRouter);
+app.use('/apps/linegift-accounting', requireAuth, linegiftAccountingRouter);
 
 // 未実装アプリのプレースホルダー
 app.get('/apps/:appId', requireAuth, (req, res) => {
