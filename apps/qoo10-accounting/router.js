@@ -242,12 +242,12 @@ function aggregate(resolvedRows) {
   };
   mfRow['合計'] = mfRow['商品売上(10%)'] + mfRow['商品売上(8%)'];
 
-  // 粗利率計算
+  // 原価率計算（値引後売上ベース）
   for (const seg of [...Object.values(bySegment), ...Object.values(excluded)]) {
     if (seg.クーポン値引後売上 > 0) {
-      seg.粗利率 = ((seg.クーポン値引後売上 - seg.原価合計) / seg.クーポン値引後売上 * 100).toFixed(1);
+      seg.原価率 = (seg.原価合計 / seg.クーポン値引後売上 * 100).toFixed(1);
     } else {
-      seg.粗利率 = '0.0';
+      seg.原価率 = '0.0';
     }
   }
 
@@ -935,7 +935,7 @@ function renderPage() {
       const pfByKey = allocateByRatio(pf, salesByKey, allocTargets);
       const adByKey = allocateByRatio(ad, salesByKey, adTargets);
 
-      let html = '<table><tr><th>セグメント</th><th>売上合計</th><th>クーポン値引額</th><th>値引後売上</th><th>PF手数料</th><th>広告費</th><th>原価合計</th><th>粗利率</th><th>行数</th></tr>';
+      let html = '<table><tr><th>セグメント</th><th>売上合計</th><th>クーポン値引額</th><th>値引後売上</th><th>PF手数料</th><th>広告費</th><th>原価合計</th><th>原価率</th><th>行数</th></tr>';
       let tot = { s:0, c:0, a:0, g:0, n:0 };
       let totPf = 0, totAd = 0;
       for (const [key, row] of Object.entries(seg)) {
@@ -947,12 +947,12 @@ function renderPage() {
         html += '<td class="num">' + fmt(pfByKey[key] || 0) + '</td>';
         html += '<td class="num">' + fmt(adByKey[key] || 0) + '</td>';
         html += '<td class="num">' + fmt(row.原価合計) + '</td>';
-        html += '<td class="num">' + (row.粗利率 || '0.0') + '%</td>';
+        html += '<td class="num">' + (row.原価率 || '0.0') + '%</td>';
         html += '<td class="num">' + row.行数 + '</td></tr>';
         tot.s += row.売上合計; tot.c += row.クーポン値引額; tot.a += row.クーポン値引後売上; tot.g += row.原価合計; tot.n += row.行数;
         totPf += (pfByKey[key] || 0); totAd += (adByKey[key] || 0);
       }
-      const totGross = tot.a > 0 ? ((tot.a - tot.g) / tot.a * 100).toFixed(1) : '0.0';
+      const totGross = tot.a > 0 ? (tot.g / tot.a * 100).toFixed(1) : '0.0';
       html += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td>';
       html += '<td class="num">' + fmt(tot.s) + '</td><td class="num">' + fmt(tot.c) + '</td>';
       html += '<td class="num">' + fmt(tot.a) + '</td>';
@@ -1136,7 +1136,7 @@ function renderPage() {
           html += '<div class="acc-body" id="acc-' + i + '">';
 
           // セグメント別
-          html += '<table><tr><th>セグメント</th><th>売上合計</th><th>クーポン値引額</th><th>値引後売上</th><th>原価合計</th><th>粗利率</th><th>行数</th></tr>';
+          html += '<table><tr><th>セグメント</th><th>売上合計</th><th>クーポン値引額</th><th>値引後売上</th><th>原価合計</th><th>原価率</th><th>行数</th></tr>';
           let sTot = { s:0, c:0, a:0, g:0, n:0 };
           for (const [key, sr] of Object.entries(seg)) {
             const lb = segNames[key] || (key === 'other' ? 'その他' : key);
@@ -1145,11 +1145,11 @@ function renderPage() {
             html += '<td class="num">' + fmt(sr.クーポン値引額||0) + '</td>';
             html += '<td class="num">' + fmt(sr.クーポン値引後売上||0) + '</td>';
             html += '<td class="num">' + fmt(sr.原価合計||0) + '</td>';
-            html += '<td class="num">' + (sr.粗利率 || '0.0') + '%</td>';
+            html += '<td class="num">' + (sr.原価率 || (sr.クーポン値引後売上 > 0 ? (sr.原価合計 / sr.クーポン値引後売上 * 100).toFixed(1) : '0.0')) + '%</td>';
             html += '<td class="num">' + (sr.行数||0) + '</td></tr>';
             sTot.s += (sr.売上合計||0); sTot.c += (sr.クーポン値引額||0); sTot.a += (sr.クーポン値引後売上||0); sTot.g += (sr.原価合計||0); sTot.n += (sr.行数||0);
           }
-          const tg = sTot.a > 0 ? ((sTot.a - sTot.g) / sTot.a * 100).toFixed(1) : '0.0';
+          const tg = sTot.a > 0 ? (sTot.g / sTot.a * 100).toFixed(1) : '0.0';
           html += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td>';
           html += '<td class="num">' + fmt(sTot.s) + '</td><td class="num">' + fmt(sTot.c) + '</td>';
           html += '<td class="num">' + fmt(sTot.a) + '</td><td class="num">' + fmt(sTot.g) + '</td>';
@@ -1198,12 +1198,12 @@ function renderPage() {
       csv += (mf['商品売上(10%)']||0) + ',' + (mf['商品売上(8%)']||0) + ',' + (mf['合計']||0) + '\\n';
 
       csv += '\\n【セグメント別集計】\\n';
-      csv += 'セグメント,売上合計,クーポン値引額,値引後売上,原価合計,粗利率,行数\\n';
+      csv += 'セグメント,売上合計,クーポン値引額,値引後売上,原価合計,原価率,行数\\n';
       const seg = data.bySegment;
       const segNames = { 1:'自社商品', 2:'取扱限定', 3:'仕入れ商品' };
       for (const [key, row] of Object.entries(seg)) {
         const label = segNames[key] || (key === 'other' ? 'その他' : key);
-        csv += key + ':' + label + ',' + Math.round(row.売上合計) + ',' + Math.round(row.クーポン値引額) + ',' + Math.round(row.クーポン値引後売上) + ',' + Math.round(row.原価合計) + ',' + (row.粗利率||'0.0') + ',' + row.行数 + '\\n';
+        csv += key + ':' + label + ',' + Math.round(row.売上合計) + ',' + Math.round(row.クーポン値引額) + ',' + Math.round(row.クーポン値引後売上) + ',' + Math.round(row.原価合計) + ',' + (row.原価率||'0.0') + ',' + row.行数 + '\\n';
       }
 
       csv += '\\n【変動費】\\n';
@@ -1263,7 +1263,7 @@ function renderPage() {
 
         const segNames = {1:'自社商品', 2:'取扱限定', 3:'仕入れ商品', other:'その他'};
         let csv = '\\uFEFF';
-        csv += '集計月,セグメント,売上合計,クーポン値引額,値引後売上,PF手数料,広告費,原価合計,粗利率\\n';
+        csv += '集計月,セグメント,売上合計,クーポン値引額,値引後売上,PF手数料,広告費,原価合計,原価率\\n';
 
         function toLastDay(ym) {
           const [y, m] = ym.split('-').map(Number);
@@ -1286,7 +1286,7 @@ function renderPage() {
               + Math.round(sr.売上合計||0) + ',' + Math.round(sr.クーポン値引額||0) + ','
               + Math.round(sr.クーポン値引後売上||0) + ',' + Math.round(pfByKey[key]||0) + ','
               + Math.round(adByKey[key]||0) + ',' + Math.round(sr.原価合計||0) + ','
-              + (sr.粗利率||'0.0') + '\\n';
+              + (sr.原価率 || (sr.クーポン値引後売上 > 0 ? (sr.原価合計 / sr.クーポン値引後売上 * 100).toFixed(1) : '0.0')) + '\\n';
           }
         }
 
