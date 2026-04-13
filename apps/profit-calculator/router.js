@@ -41,7 +41,11 @@ async function getSalesCountBySku(days = 365) { return callMiniPC(`/sales-count?
 async function searchByJan(jan) { return callMiniPC(`/search/jan/${encodeURIComponent(jan)}`); }
 async function searchByKeyword(keyword) { return callMiniPC(`/search/keyword?q=${encodeURIComponent(keyword)}`); }
 async function searchByPartNumber(pn) { return callMiniPC(`/search/part-number?q=${encodeURIComponent(pn)}`); }
-import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, deleteProduct, getSetItems, saveSetItems, syncListings as dbSyncListings, getListings, updateListing, bulkSave, getSyncMeta, getTrackingProducts, getPriceHistory, getRecentPriceHistory, savePriceHistory, updateProductPriceInfo, syncProductsFromListings, saveBulkSession, updateBulkSession, getBulkSessions, getBulkSessionById, deleteBulkSession } from './db.js';
+import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, deleteProduct, getSetItems, saveSetItems, syncListings as dbSyncListings, getListings, updateListing, bulkSave, getSyncMeta, getTrackingProducts, getPriceHistory, getRecentPriceHistory, savePriceHistory, updateProductPriceInfo, syncProductsFromListings, saveBulkSession, updateBulkSession, getBulkSessions, getBulkSessionById, deleteBulkSession,
+  // Phase 1A
+  createBulkSessionWithItems, listBulkSessions, getBulkSession, patchBulkSession,
+  listBulkItems, updateBulkItem, updateBulkItemFromResearch,
+  upsertBookmark, getRecentBookmarks } from './db.js';
 import { loadSuppliers, addSupplier, deleteSupplier } from './suppliers.js';
 import { loadShipping, addShipping, updateShipping, deleteShipping } from './shipping.js';
 import { getSetting, setSetting, getAllSettings } from './settings.js';
@@ -57,6 +61,37 @@ async function ensureDb() {
     await initDb();
     dbReady = true;
   }
+}
+
+// ── Phase 1A: users.json から displayName を引くヘルパー（5分キャッシュ） ──
+import fs from 'fs';
+const USERS_FILE = path.join(__dirname, '..', '..', 'data', 'users.json');
+let _usersCache = null;
+let _usersCacheAt = 0;
+function getUserDisplayName(email) {
+  if (!email) return null;
+  const now = Date.now();
+  if (!_usersCache || now - _usersCacheAt > 5 * 60 * 1000) {
+    try {
+      _usersCache = JSON.parse(fs.readFileSync(USERS_FILE, 'utf-8'));
+      _usersCacheAt = now;
+    } catch {
+      _usersCache = [];
+      _usersCacheAt = now;
+    }
+  }
+  const u = _usersCache.find(x => x.email === email);
+  return u ? u.displayName : null;
+}
+function enrichUserNames(session) {
+  if (!session) return session;
+  if (session.created_by) session.created_by_name = getUserDisplayName(session.created_by);
+  if (session.updated_by) session.updated_by_name = getUserDisplayName(session.updated_by);
+  // 集計カラムを正規名にリネーム
+  if (session.total_count_agg !== undefined) { session.total_count = session.total_count_agg; delete session.total_count_agg; }
+  if (session.processed_count_agg !== undefined) { session.processed_count = session.processed_count_agg; delete session.processed_count_agg; }
+  if (session.error_count_agg !== undefined) { session.error_count = session.error_count_agg; delete session.error_count_agg; }
+  return session;
 }
 
 // ── ページ配信 ──
@@ -1615,60 +1650,161 @@ router.post('/api/price-revision/refresh-cache', (req, res) => {
   res.json({ ok: true });
 });
 
-// ── API: 一括リサーチセッション管理 ──
+// ── API: Phase 1A 一括リサーチセッション管理 ──
+// 仕様: g:/共有ドライブ/AI_reference/システム設計/profit-calculator/Phase1A_実装仕様書_20260413.md
 
-// セッション一覧取得
+// 「続きから」カード用（/:id より先に置く — ルーティング優先順位のため）
+router.get('/api/bulk-sessions/bookmarks/recent', async (req, res) => {
+  try {
+    await ensureDb();
+    const limit = parseInt(req.query.limit) || 3;
+    const items = getRecentBookmarks(req.session.email, limit);
+    res.json(items);
+  } catch (err) {
+    console.error('[ProfitCalc] getRecentBookmarks:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// セッション一覧（タブ別: mine / bookmarked / team）
 router.get('/api/bulk-sessions', async (req, res) => {
   try {
     await ensureDb();
-    const sessions = getBulkSessions();
-    res.json(sessions);
+    const filter = ['mine', 'bookmarked', 'team'].includes(req.query.filter) ? req.query.filter : 'mine';
+    const includeDeleted = req.query.include_deleted === '1';
+    const sessions = listBulkSessions(filter, req.session.email, { includeDeleted });
+    res.json(sessions.map(enrichUserNames));
   } catch (err) {
+    console.error('[ProfitCalc] listBulkSessions:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// セッション詳細取得（結果データ含む）
+// セッション詳細（items は含まない、ブックマーク込み）
 router.get('/api/bulk-sessions/:id', async (req, res) => {
   try {
     await ensureDb();
-    const session = getBulkSessionById(parseInt(req.params.id));
-    if (!session) return res.status(404).json({ error: 'セッションが見つかりません' });
-    res.json(session);
+    const id = parseInt(req.params.id);
+    if (Number.isNaN(id)) return res.status(400).json({ error: 'invalid_id' });
+    const session = getBulkSession(id, req.session.email);
+    if (!session) return res.status(404).json({ error: 'not_found' });
+    res.json(enrichUserNames(session));
   } catch (err) {
+    console.error('[ProfitCalc] getBulkSession:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// セッション保存（新規）
+// セッション作成 + items 一括 INSERT（atomic）
 router.post('/api/bulk-sessions', async (req, res) => {
   try {
     await ensureDb();
-    const id = saveBulkSession(req.body);
-    res.json({ id });
+    const { name, source_filename, settings, visibility, rows } = req.body || {};
+    if (!name || typeof name !== 'string') return res.status(400).json({ error: 'name_required' });
+    const result = createBulkSessionWithItems({
+      name,
+      sourceFilename: source_filename,
+      settings,
+      visibility,
+      rows,
+      userEmail: req.session.email,
+    });
+    res.status(201).json(result);
   } catch (err) {
+    if (err.statusCode) return res.status(err.statusCode).json({ error: err.message });
+    console.error('[ProfitCalc] createBulkSessionWithItems:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// セッション更新
-router.put('/api/bulk-sessions/:id', async (req, res) => {
+// セッションメタ更新（name / visibility / deleted_at）
+router.patch('/api/bulk-sessions/:id', async (req, res) => {
   try {
     await ensureDb();
-    updateBulkSession(parseInt(req.params.id), req.body);
-    res.json({ ok: true });
+    const id = parseInt(req.params.id);
+    if (Number.isNaN(id)) return res.status(400).json({ error: 'invalid_id' });
+    const result = patchBulkSession(id, req.body || {}, req.session.email);
+    res.json(result);
   } catch (err) {
+    if (err.statusCode) return res.status(err.statusCode).json({ error: err.message });
+    console.error('[ProfitCalc] patchBulkSession:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// セッション削除
+// 行一覧（ページング + filter + sort + anchor_item_id）
+router.get('/api/bulk-sessions/:id/items', async (req, res) => {
+  try {
+    await ensureDb();
+    const sessionId = parseInt(req.params.id);
+    if (Number.isNaN(sessionId)) return res.status(400).json({ error: 'invalid_id' });
+    const options = {
+      offset: parseInt(req.query.offset) || 0,
+      limit: parseInt(req.query.limit) || 100,
+      filter: req.query.filter || 'all',
+      sort: req.query.sort || 'row_no',
+      order: req.query.order || 'asc',
+      anchorItemId: req.query.anchor_item_id ? parseInt(req.query.anchor_item_id) : null,
+    };
+    const result = listBulkItems(sessionId, options);
+    res.json(result);
+  } catch (err) {
+    console.error('[ProfitCalc] listBulkItems:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 行単位 PATCH — Phase 1A ではホワイトリストが空のため常に 400
+router.patch('/api/bulk-sessions/:id/items/:itemId', async (req, res) => {
+  try {
+    await ensureDb();
+    const sessionId = parseInt(req.params.id);
+    const itemId = parseInt(req.params.itemId);
+    if (Number.isNaN(sessionId) || Number.isNaN(itemId)) return res.status(400).json({ error: 'invalid_id' });
+    const body = req.body || {};
+    if (body.row_version === undefined) return res.status(400).json({ error: 'row_version_required' });
+    const ALLOWED_FIELDS_1A = [];  // 1A では空
+    const dataFields = Object.keys(body).filter(k => k !== 'row_version');
+    if (dataFields.length === 0) return res.status(400).json({ error: 'no_updatable_fields_in_phase_1a' });
+    const disallowed = dataFields.filter(k => !ALLOWED_FIELDS_1A.includes(k));
+    if (disallowed.length > 0) return res.status(400).json({ error: 'field_not_allowed', fields: disallowed });
+    // 1A ではここに到達しない
+    res.status(500).json({ error: 'unreachable' });
+  } catch (err) {
+    console.error('[ProfitCalc] patch item:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ブックマーク upsert
+router.put('/api/bulk-sessions/:id/bookmark', async (req, res) => {
+  try {
+    await ensureDb();
+    const sessionId = parseInt(req.params.id);
+    if (Number.isNaN(sessionId)) return res.status(400).json({ error: 'invalid_id' });
+    const { last_item_id = null, view_state_json = null } = req.body || {};
+    upsertBookmark(sessionId, req.session.email, {
+      last_item_id: last_item_id !== null ? parseInt(last_item_id) : null,
+      view_state_json: view_state_json,
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[ProfitCalc] upsertBookmark:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 論理削除（互換のため DELETE も残す — 内部で deleted_at を立てる）
 router.delete('/api/bulk-sessions/:id', async (req, res) => {
   try {
     await ensureDb();
-    deleteBulkSession(parseInt(req.params.id));
+    const id = parseInt(req.params.id);
+    if (Number.isNaN(id)) return res.status(400).json({ error: 'invalid_id' });
+    patchBulkSession(id, { deleted_at: new Date().toISOString() }, req.session.email);
     res.json({ ok: true });
   } catch (err) {
+    if (err.statusCode) return res.status(err.statusCode).json({ error: err.message });
+    console.error('[ProfitCalc] soft delete:', err);
     res.status(500).json({ error: err.message });
   }
 });
