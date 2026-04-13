@@ -190,6 +190,33 @@ function createTables() {
     uploaded_at       TEXT NOT NULL
   )`);
 
+  // ─── mart_amazon_usa: 米国Amazon売上集計ツール用 ───
+  // 全売上=セグメント4(輸出)、USD→JPY換算が必要。税率分類なし。
+  db.exec(`CREATE TABLE IF NOT EXISTS mart_amazon_usa_monthly_summary (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    year_month        TEXT NOT NULL UNIQUE,
+    total_rows        INTEGER,
+    resolved_count    INTEGER,
+    unresolved_count  INTEGER,
+    exchange_rate     REAL,      -- 確定時のUSD→JPYレート
+    usd_row           TEXT,      -- JSON: USDベース集計
+    jpy_row           TEXT,      -- JSON: JPY換算後集計
+    mgmt_row          TEXT,      -- JSON: 管理会計用15列集計（セグメント4・円建）
+    cost_total        REAL,      -- 原価合計(税抜・円)
+    confirmed_at      TEXT NOT NULL,
+    csv_filename      TEXT
+  )`);
+
+  db.exec(`CREATE TABLE IF NOT EXISTS mart_amazon_usa_upload_log (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    year_month        TEXT NOT NULL,
+    filename          TEXT,
+    total_rows        INTEGER,
+    resolved_count    INTEGER,
+    unresolved_count  INTEGER,
+    uploaded_at       TEXT NOT NULL
+  )`);
+
   // ─── mart_yahoo: Yahoo!売上集計ツール用 ───
 
   // mart_yahoo_monthly_summary — 月次確定集計
