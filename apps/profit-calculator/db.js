@@ -321,7 +321,92 @@ export async function initDb() {
     }
   }
 
+  // ===== Phase 1A: 途中保存・再開基盤 =====
+  // bulk_research_sessions: 複数担当者運用・可視性・論理削除のためのカラム追加
+  const phase1aSessionCols = [
+    ['created_by', 'TEXT'],
+    ['updated_by', 'TEXT'],
+    ['visibility', "TEXT NOT NULL DEFAULT 'team'"],
+    ['deleted_at', 'TEXT'],
+    ['source_filename', 'TEXT'],
+  ];
+  const sessionCols = queryAll('PRAGMA table_info(bulk_research_sessions)').map(r => r.name);
+  for (const [col, type] of phase1aSessionCols) {
+    if (!sessionCols.includes(col)) {
+      db.run(`ALTER TABLE bulk_research_sessions ADD COLUMN ${col} ${type}`);
+    }
+  }
+
+  // bulk_research_items: 行単位の永続化・楽観ロック
+  db.run(`
+    CREATE TABLE IF NOT EXISTS bulk_research_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id INTEGER NOT NULL,
+      source_row_no INTEGER NOT NULL,
+      jan TEXT,
+      part_number TEXT,
+      product_name TEXT,
+      wholesale_price INTEGER,
+      asin TEXT,
+      amazon_name TEXT,
+      image_url TEXT,
+      category TEXT,
+      sales_rank INTEGER,
+      offer_count INTEGER,
+      selling_price INTEGER,
+      referral_fee INTEGER,
+      fba_fee INTEGER,
+      total_fee INTEGER,
+      profit INTEGER,
+      profit_rate REAL,
+      judgment TEXT,
+      match_type TEXT,
+      match_confidence TEXT,
+      composite_score INTEGER,
+      composite_rank TEXT,
+      competition_score INTEGER,
+      sales_level INTEGER,
+      est_monthly_sales INTEGER,
+      amazon_seller INTEGER,
+      fbm_amazon_fee INTEGER,
+      fbm_shipping_cost INTEGER,
+      fbm_shipping_method TEXT,
+      fbm_profit INTEGER,
+      fbm_profit_rate REAL,
+      fbm_judgment TEXT,
+      research_status TEXT NOT NULL DEFAULT 'pending',
+      research_message TEXT,
+      researched_at TEXT,
+      row_version INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      updated_by TEXT,
+      UNIQUE(session_id, source_row_no)
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_items_session ON bulk_research_items(session_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_items_jan ON bulk_research_items(jan)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_items_asin ON bulk_research_items(asin)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_items_session_status ON bulk_research_items(session_id, research_status)`);
+
+  // user_session_bookmark: 担当者ごとの「続きから」状態
+  db.run(`
+    CREATE TABLE IF NOT EXISTS user_session_bookmark (
+      user_email TEXT NOT NULL,
+      session_id INTEGER NOT NULL,
+      last_accessed_at TEXT NOT NULL,
+      last_item_id INTEGER,
+      view_state_json TEXT,
+      PRIMARY KEY (user_email, session_id)
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_bookmark_user ON user_session_bookmark(user_email, last_accessed_at DESC)`);
+
   saveToFile();
+
+  // 既存セッションの移行（results JSON → items 行展開）
+  // 失敗時は throw してサーバー起動を止める（気づけるように）
+  migrateExistingSessionsToItems();
 }
 
 // ===== Research =====
@@ -894,4 +979,98 @@ export function getBulkSessionById(id) {
 export function deleteBulkSession(id) {
   db.run('DELETE FROM bulk_research_sessions WHERE id = ?', [id]);
   saveToFile();
+}
+
+// ===== Phase 1A: 既存セッションの items 移行 =====
+// 既存 bulk_research_sessions.results JSON を bulk_research_items に展開する。
+// items が 0 件のセッションのみ対象（冪等）。
+// 失敗時は throw して initDb 全体を失敗させる（サーバー起動を止めて気づけるように）。
+export function migrateExistingSessionsToItems() {
+  const targets = queryAll(`
+    SELECT s.id, s.results, s.created_at
+    FROM bulk_research_sessions s
+    LEFT JOIN (
+      SELECT session_id, COUNT(*) AS n FROM bulk_research_items GROUP BY session_id
+    ) i ON i.session_id = s.id
+    WHERE (i.n IS NULL OR i.n = 0)
+      AND s.results IS NOT NULL
+      AND s.deleted_at IS NULL
+  `);
+
+  if (targets.length === 0) {
+    console.log('[ProfitCalc] Phase 1A: 移行対象セッションなし');
+    return { migratedSessions: 0, migratedRows: 0 };
+  }
+
+  console.log(`[ProfitCalc] Phase 1A: 既存セッション移行開始 (${targets.length}件)`);
+
+  let migratedSessions = 0;
+  let migratedRows = 0;
+
+  db.run('BEGIN');
+  try {
+    for (const s of targets) {
+      let results;
+      try {
+        results = JSON.parse(s.results);
+      } catch (e) {
+        console.warn(`[ProfitCalc] セッション ${s.id}: results JSON パース失敗、スキップ`);
+        continue;
+      }
+      if (!Array.isArray(results)) {
+        console.warn(`[ProfitCalc] セッション ${s.id}: results が配列でない、スキップ`);
+        continue;
+      }
+
+      const baseTime = s.created_at || new Date().toISOString();
+
+      for (let i = 0; i < results.length; i++) {
+        const r = results[i] || {};
+        const status = r.status === 'ok' || r.status === 'not_found' || r.status === 'no_price' || r.status === 'error'
+          ? r.status
+          : 'pending';
+        db.run(
+          `INSERT INTO bulk_research_items (
+            session_id, source_row_no,
+            jan, part_number, product_name, wholesale_price,
+            asin, amazon_name, image_url, category,
+            sales_rank, offer_count, selling_price,
+            referral_fee, fba_fee, total_fee, profit, profit_rate,
+            judgment, match_type, match_confidence,
+            composite_score, composite_rank, competition_score,
+            sales_level, est_monthly_sales, amazon_seller,
+            fbm_amazon_fee, fbm_shipping_cost, fbm_shipping_method,
+            fbm_profit, fbm_profit_rate, fbm_judgment,
+            research_status, research_message, researched_at,
+            row_version, created_at, updated_at, updated_by
+          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          [
+            s.id, i,
+            r.jan ?? null, r.partNumber ?? null, r.productName ?? null, r.wholesalePrice ?? null,
+            r.asin ?? null, r.amazonName ?? null, r.image ?? null, r.category ?? null,
+            r.salesRank ?? null, r.offerCount ?? null, r.sellingPrice ?? null,
+            r.referralFee ?? null, r.fbaFee ?? null, r.totalFee ?? null, r.profit ?? null, r.profitRate ?? null,
+            r.judgment ?? null, r.matchType ?? null, r.matchConfidence ?? null,
+            r.compositeScore ?? null, r.compositeRank ?? null, r.competitionScore ?? null,
+            r.salesLevel ?? null, r.estMonthlySales ?? null, r.amazonSeller ? 1 : 0,
+            r.fbmAmazonFee ?? null, r._fbmShippingCost ?? null, r._fbmShippingMethod ?? null,
+            r._fbmProfit ?? null, r._fbmProfitRate ?? null, r._fbmJudgment ?? null,
+            status, r.message ?? null, r.researchedAt ?? baseTime,
+            1, baseTime, baseTime, null,
+          ]
+        );
+        migratedRows++;
+      }
+      migratedSessions++;
+    }
+    db.run('COMMIT');
+    saveToFile();
+  } catch (e) {
+    db.run('ROLLBACK');
+    console.error('[ProfitCalc] Phase 1A 移行失敗:', e.message);
+    throw new Error(`Phase 1A 既存セッション移行に失敗しました: ${e.message}`);
+  }
+
+  console.log(`[ProfitCalc] Phase 1A: 移行完了 ${migratedSessions}セッション / ${migratedRows}行`);
+  return { migratedSessions, migratedRows };
 }
