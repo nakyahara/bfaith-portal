@@ -22,6 +22,7 @@ import yahooAccountingRouter from './apps/yahoo-accounting/router.js';
 import linegiftAccountingRouter from './apps/linegift-accounting/router.js';
 import qoo10AccountingRouter from './apps/qoo10-accounting/router.js';
 import fbaProfitabilityRouter from './apps/fba-profitability/router.js';
+import mercariAccountingRouter from './apps/mercari-accounting/router.js';
 import serviceRouter from './apps/warehouse/service-router.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -262,6 +263,15 @@ const apps = [
     status: 'active',
     category: 'fba',
   },
+  {
+    id: 'mercari-accounting',
+    name: 'メルカリShops売上集計',
+    description: 'メルカリShops売上レポート+注文CSVから税率別・セグメント別の売上集計を自動計算',
+    icon: '🛒',
+    path: '/apps/mercari-accounting',
+    status: 'active',
+    category: 'accounting',
+  },
 ];
 
 // 外部リンク
@@ -392,6 +402,10 @@ app.use('/apps/qoo10-accounting', (req, res, next) => {
   requireAuth(req, res, next);
 }, qoo10AccountingRouter);
 app.use('/apps/fba-profitability', requireAppAccess('fba-profitability'), fbaProfitabilityRouter);
+app.use('/apps/mercari-accounting', (req, res, next) => {
+  if (req.path === '/import-history' && req.method === 'POST') return next();
+  requireAuth(req, res, next);
+}, mercariAccountingRouter);
 
 // 未実装アプリのプレースホルダー
 app.get('/apps/:appId', requireAuth, (req, res) => {
