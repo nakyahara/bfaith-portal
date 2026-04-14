@@ -467,16 +467,20 @@ let currentSessionTab = 'mine';   // 'mine' | 'bookmarked' | 'team'
 let viewState = { filter: 'all', sort: 'row_no', order: 'asc' };
 
 // 旧 sessionStorage の検出（Phase 1A §9.2: 明示ダイアログで取り込み or 破棄）
-function checkLegacySessionStorage() {
+// Codex P1 (3回目) 対応: 移行が成功するまで sessionStorage を消さない（タブ閉じ・通信失敗で
+// 旧データが完全ロストするのを防止）。失敗時は次回起動でもう一度ダイアログが出る。
+async function checkLegacySessionStorage() {
   if (localStorage.getItem('phase1a_migration_done') === '1') return;
   const saved = sessionStorage.getItem('bulkResearchResults');
   if (!saved) {
+    // 元データが無いので「移行完了」マークを立てるのは安全
     localStorage.setItem('phase1a_migration_done', '1');
     return;
   }
   let count = 0;
   try { const d = JSON.parse(saved); if (Array.isArray(d)) count = d.length; } catch {}
   if (count === 0) {
+    // 空配列は破棄して完了マーク
     sessionStorage.removeItem('bulkResearchResults');
     sessionStorage.removeItem('bulkResearchCsv');
     sessionStorage.removeItem('bulkResearchSettings');
@@ -488,20 +492,31 @@ function checkLegacySessionStorage() {
     '新しい「サーバー保存セッション」として取り込みますか？\n\n' +
     '[OK] 新規セッションとして取り込む\n[キャンセル] 破棄する'
   );
-  if (choice) {
-    // 旧 JSON → POST /api/bulk-sessions に変換して取り込む
-    importLegacySession(saved);
+  if (!choice) {
+    // ユーザーが「破棄する」を選んだ時のみ消す + マーク
+    sessionStorage.removeItem('bulkResearchResults');
+    sessionStorage.removeItem('bulkResearchCsv');
+    sessionStorage.removeItem('bulkResearchSettings');
+    localStorage.setItem('phase1a_migration_done', '1');
+    return;
   }
-  sessionStorage.removeItem('bulkResearchResults');
-  sessionStorage.removeItem('bulkResearchCsv');
-  sessionStorage.removeItem('bulkResearchSettings');
-  localStorage.setItem('phase1a_migration_done', '1');
+  // 取込: 成功時のみ削除 + マーク。失敗時は sessionStorage を保持して次回もダイアログを出す。
+  const ok = await importLegacySession(saved);
+  if (ok) {
+    sessionStorage.removeItem('bulkResearchResults');
+    sessionStorage.removeItem('bulkResearchCsv');
+    sessionStorage.removeItem('bulkResearchSettings');
+    localStorage.setItem('phase1a_migration_done', '1');
+  } else {
+    alert('旧データの移行に失敗しました。次回ページ表示時にもう一度ダイアログを出します。');
+  }
 }
 
+// Returns true on success, false on failure (caller keeps sessionStorage intact for retry)
 async function importLegacySession(savedJson) {
   try {
     const data = JSON.parse(savedJson);
-    if (!Array.isArray(data) || data.length === 0) return;
+    if (!Array.isArray(data) || data.length === 0) return true;  // 中身なしは成功扱い
     const today = new Date().toISOString().slice(0, 16).replace(/[T:]/g, '').slice(0, 12);
     const rows = data.map((r, i) => ({
       source_row_no: i,
@@ -521,12 +536,16 @@ async function importLegacySession(savedJson) {
         rows,
       }),
     });
-    if (res.ok) {
-      const body = await res.json();
-      alert(`旧データ ${data.length} 件を新規セッション (id=${body.id}) として取り込みました。`);
+    if (!res.ok) {
+      console.warn('旧データ移行: POST 失敗 status=' + res.status);
+      return false;
     }
+    const body = await res.json();
+    alert(`旧データ ${data.length} 件を新規セッション (id=${body.id}) として取り込みました。`);
+    return true;
   } catch (e) {
-    console.warn('旧データ移行失敗:', e);
+    console.warn('旧データ移行例外:', e);
+    return false;
   }
 }
 
@@ -1567,8 +1586,8 @@ window.addEventListener('beforeunload', () => {
 
 // ===== Phase 1A: ページロード時の初期化 =====
 window.addEventListener('DOMContentLoaded', async () => {
-  // 旧 sessionStorage データのチェックと明示ダイアログ
-  checkLegacySessionStorage();
+  // 旧 sessionStorage データのチェックと明示ダイアログ（非同期: 移行完了まで待つ）
+  await checkLegacySessionStorage();
 
   // 現ログインユーザー情報をポータル共通エンドから取得（あれば）
   try {

@@ -44,7 +44,7 @@ async function searchByPartNumber(pn) { return callMiniPC(`/search/part-number?q
 import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, deleteProduct, getSetItems, saveSetItems, syncListings as dbSyncListings, getListings, updateListing, bulkSave, getSyncMeta, getTrackingProducts, getPriceHistory, getRecentPriceHistory, savePriceHistory, updateProductPriceInfo, syncProductsFromListings, saveBulkSession, updateBulkSession, getBulkSessions, getBulkSessionById, deleteBulkSession,
   // Phase 1A
   createBulkSessionWithItems, listBulkSessions, getBulkSession, patchBulkSession,
-  listBulkItems, updateBulkItem, updateBulkItemFromResearch, persistToDisk,
+  listBulkItems, getAllBulkItems, updateBulkItem, updateBulkItemFromResearch, persistToDisk,
   upsertBookmark, getRecentBookmarks } from './db.js';
 import { loadSuppliers, addSupplier, deleteSupplier } from './suppliers.js';
 import { loadShipping, addShipping, updateShipping, deleteShipping } from './shipping.js';
@@ -887,14 +887,13 @@ router.post('/api/bulk-research/stream', async (req, res) => {
   const userEmail = req.session.email;
 
   // 対象 items を取得: item_ids 指定があればそれ、なければ pending 全件
+  // Codex P1 (3回目) 対応: listBulkItems は limit を 500 にクランプするため、
+  // 500 行超のセッションでも全件リサーチするには getAllBulkItems (ページングなし) を使う
   let targets;
   if (Array.isArray(item_ids) && item_ids.length > 0) {
-    const page = listBulkItems(session_id, { offset: 0, limit: 10000, filter: 'all' });
-    const idSet = new Set(item_ids.map(Number));
-    targets = page.items.filter(it => idSet.has(it.id));
+    targets = getAllBulkItems(session_id, { ids: item_ids.map(Number) });
   } else {
-    const page = listBulkItems(session_id, { offset: 0, limit: 10000, filter: 'pending' });
-    targets = page.items;
+    targets = getAllBulkItems(session_id, { filter: 'pending' });
   }
 
   if (targets.length === 0) {

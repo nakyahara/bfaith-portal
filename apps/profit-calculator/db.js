@@ -1194,14 +1194,20 @@ export function listBulkSessions(filter, userEmail, { includeDeleted = false } =
  * セッション詳細 + 現ユーザーのブックマーク
  * visibility='private' のセッションは作成者以外には 404 相当（null）を返す。
  * visibility='team' は社内誰でも閲覧可。
+ * 論理削除済み (deleted_at IS NOT NULL) は誰にも返さない（Codex P2 3回目対応）。
+ * 管理操作で削除済みも引きたい場合は opts.includeDeleted=true。
  */
-export function getBulkSession(id, userEmail) {
+export function getBulkSession(id, userEmail, opts = {}) {
   const rows = queryAll(
     `SELECT s.*, ${ITEMS_COUNT_FRAGMENT}
      FROM bulk_research_sessions s WHERE s.id = ?`, [id]
   );
   if (rows.length === 0) return null;
   const s = rows[0];
+  // 論理削除済みは誰にも返さない（SSE・items API 経由の再実行を防ぐ）
+  if (s.deleted_at && !opts.includeDeleted) {
+    return null;
+  }
   // アクセス制御: private は作成者のみ閲覧可
   if (s.visibility === 'private' && s.created_by !== userEmail) {
     return null;  // 存在を漏らさないため 404 相当で返す
@@ -1381,6 +1387,29 @@ export function updateBulkItem(sessionId, itemId, allowedFieldsAndValues, rowVer
   saveToFile();
   const updated = queryAll(`SELECT id, row_version, updated_at FROM bulk_research_items WHERE id = ?`, [itemId]);
   return { ok: true, ...updated[0] };
+}
+
+/**
+ * SSE 用: セッション内の items を filter 条件で全件取得（ページングなし）
+ * listBulkItems の 500 行クランプを回避するための専用関数。
+ * Codex P1 (3回目): 501 行以降が pending のまま残る問題の修正。
+ */
+export function getAllBulkItems(sessionId, { filter = 'all', ids = null } = {}) {
+  if (Array.isArray(ids) && ids.length > 0) {
+    const placeholders = ids.map(() => '?').join(',');
+    return queryAll(
+      `SELECT * FROM bulk_research_items WHERE session_id = ? AND id IN (${placeholders}) ORDER BY source_row_no ASC`,
+      [sessionId, ...ids]
+    );
+  }
+  let where = '';
+  if (filter === 'pending') where = `AND research_status = 'pending'`;
+  else if (filter === 'ok') where = `AND research_status = 'ok'`;
+  else if (filter === 'error') where = `AND research_status = 'error'`;
+  return queryAll(
+    `SELECT * FROM bulk_research_items WHERE session_id = ? ${where} ORDER BY source_row_no ASC`,
+    [sessionId]
+  );
 }
 
 /**
