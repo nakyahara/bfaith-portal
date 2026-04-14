@@ -1159,17 +1159,19 @@ export function listBulkSessions(filter, userEmail, { includeDeleted = false } =
     `;
     params = [userEmail];
   } else if (filter === 'bookmarked') {
+    // ブックマーク一覧も visibility チェックを適用（team or 自分の private のみ）
     sql = `
       SELECT s.id, s.name, s.source_filename, s.visibility, s.created_by, s.updated_by,
         s.created_at, s.updated_at, s.status, s.deleted_at,
         ${ITEMS_COUNT_FRAGMENT}
       FROM bulk_research_sessions s
       INNER JOIN user_session_bookmark ub ON ub.session_id = s.id AND ub.user_email = ?
-      WHERE 1=1 ${deletedCond}
+      WHERE (s.visibility = 'team' OR s.created_by = ?)
+        ${deletedCond}
       ORDER BY ub.last_accessed_at DESC
       LIMIT 200
     `;
-    params = [userEmail];
+    params = [userEmail, userEmail];
   } else {
     // team: 全社 = team 可視性 + 自分が作成した private も含む（自分から見える全部）
     sql = `
@@ -1188,7 +1190,11 @@ export function listBulkSessions(filter, userEmail, { includeDeleted = false } =
   return queryAll(sql, params);
 }
 
-/** セッション詳細 + 現ユーザーのブックマーク */
+/**
+ * セッション詳細 + 現ユーザーのブックマーク
+ * visibility='private' のセッションは作成者以外には 404 相当（null）を返す。
+ * visibility='team' は社内誰でも閲覧可。
+ */
 export function getBulkSession(id, userEmail) {
   const rows = queryAll(
     `SELECT s.*, ${ITEMS_COUNT_FRAGMENT}
@@ -1196,6 +1202,10 @@ export function getBulkSession(id, userEmail) {
   );
   if (rows.length === 0) return null;
   const s = rows[0];
+  // アクセス制御: private は作成者のみ閲覧可
+  if (s.visibility === 'private' && s.created_by !== userEmail) {
+    return null;  // 存在を漏らさないため 404 相当で返す
+  }
   try { s.settings = JSON.parse(s.settings || '{}'); } catch { s.settings = {}; }
   // results は参照しない（Phase 1A 以降は items が正）
   delete s.results;
@@ -1208,19 +1218,30 @@ export function getBulkSession(id, userEmail) {
   return s;
 }
 
-/** セッションメタ更新（name / visibility / deleted_at） */
+/**
+ * セッションメタ更新（name / visibility / deleted_at）
+ * セッションメタは作成者のみ編集可能（team セッションでも他者は閲覧のみ）。
+ * 行データ（items）の編集権限とは別管理。
+ */
 export function patchBulkSession(id, data, userEmail) {
-  const session = queryAll('SELECT created_by FROM bulk_research_sessions WHERE id = ?', [id]);
+  const session = queryAll('SELECT created_by, visibility FROM bulk_research_sessions WHERE id = ?', [id]);
   if (session.length === 0) throw Object.assign(new Error('not_found'), { statusCode: 404 });
+
+  // private セッションは作成者以外には存在を漏らさず 404
+  if (session[0].visibility === 'private' && session[0].created_by !== userEmail) {
+    throw Object.assign(new Error('not_found'), { statusCode: 404 });
+  }
+  // セッションメタ更新（name/visibility/deleted_at）は作成者のみ
+  if (session[0].created_by !== userEmail) {
+    throw Object.assign(new Error('forbidden_not_owner'), { statusCode: 403 });
+  }
+
   const fields = [];
   const params = [];
   if (typeof data.name === 'string' && data.name.trim() !== '') {
     fields.push('name = ?'); params.push(data.name.trim());
   }
   if (data.visibility === 'team' || data.visibility === 'private') {
-    if (data.visibility === 'private' && session[0].created_by !== userEmail) {
-      throw Object.assign(new Error('forbidden_visibility_change'), { statusCode: 403 });
-    }
     fields.push('visibility = ?'); params.push(data.visibility);
   }
   if (data.deleted_at === null || typeof data.deleted_at === 'string') {
@@ -1365,8 +1386,12 @@ export function updateBulkItem(sessionId, itemId, allowedFieldsAndValues, rowVer
 /**
  * SSE リサーチ内部から使う特権更新（whitelist 経由せず）
  * Phase 1A §3.13 参照: SP-API 由来のフィールドだけを書き込む
+ *
+ * opts.skipSave=true のとき、saveToFile() を呼ばない。呼び出し側が N 行ごと・
+ * 最後に 1 回 saveToFile() を呼ぶバッチライト戦略を組む用途。
+ * 仕様: 負荷テスト §9.2、Codex レビュー P2 対応。
  */
-export function updateBulkItemFromResearch(sessionId, itemId, fields, userEmail) {
+export function updateBulkItemFromResearch(sessionId, itemId, fields, userEmail, opts = {}) {
   const now = ISO_NOW();
   const setClauses = [];
   const params = [];
@@ -1390,11 +1415,22 @@ export function updateBulkItemFromResearch(sessionId, itemId, fields, userEmail)
     db.run('ROLLBACK');
     throw e;
   }
+  if (!opts.skipSave) saveToFile();
+}
+
+/** 明示的に現在の in-memory DB をディスクに書き出す（SSE バッチライト用の公開 API） */
+export function persistToDisk() {
   saveToFile();
 }
 
-/** ブックマーク upsert */
+/** ブックマーク upsert — 対象セッションが閲覧可能な場合のみ */
 export function upsertBookmark(sessionId, userEmail, { last_item_id = null, view_state_json = null } = {}) {
+  const session = queryAll('SELECT visibility, created_by, deleted_at FROM bulk_research_sessions WHERE id = ?', [sessionId]);
+  if (session.length === 0) throw Object.assign(new Error('not_found'), { statusCode: 404 });
+  if (session[0].deleted_at) throw Object.assign(new Error('not_found'), { statusCode: 404 });
+  if (session[0].visibility === 'private' && session[0].created_by !== userEmail) {
+    throw Object.assign(new Error('not_found'), { statusCode: 404 });
+  }
   const now = ISO_NOW();
   db.run(
     `INSERT INTO user_session_bookmark (user_email, session_id, last_accessed_at, last_item_id, view_state_json)
@@ -1408,7 +1444,7 @@ export function upsertBookmark(sessionId, userEmail, { last_item_id = null, view
   saveToFile();
 }
 
-/** 最近アクセスしたセッション（「続きから」カード用） */
+/** 最近アクセスしたセッション（「続きから」カード用） — visibility チェック込み */
 export function getRecentBookmarks(userEmail, limit = 3) {
   limit = Math.min(Math.max(1, limit), 10);
   return queryAll(
@@ -1417,9 +1453,11 @@ export function getRecentBookmarks(userEmail, limit = 3) {
       (SELECT COUNT(*) FROM bulk_research_items i WHERE i.session_id = s.id AND i.research_status IN ('ok','not_found','no_price','error')) AS processed_count
     FROM user_session_bookmark ub
     INNER JOIN bulk_research_sessions s ON s.id = ub.session_id
-    WHERE ub.user_email = ? AND s.deleted_at IS NULL
+    WHERE ub.user_email = ?
+      AND s.deleted_at IS NULL
+      AND (s.visibility = 'team' OR s.created_by = ?)
     ORDER BY ub.last_accessed_at DESC
     LIMIT ?`,
-    [userEmail, limit]
+    [userEmail, userEmail, limit]
   );
 }

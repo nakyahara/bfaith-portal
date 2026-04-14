@@ -44,7 +44,7 @@ async function searchByPartNumber(pn) { return callMiniPC(`/search/part-number?q
 import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, deleteProduct, getSetItems, saveSetItems, syncListings as dbSyncListings, getListings, updateListing, bulkSave, getSyncMeta, getTrackingProducts, getPriceHistory, getRecentPriceHistory, savePriceHistory, updateProductPriceInfo, syncProductsFromListings, saveBulkSession, updateBulkSession, getBulkSessions, getBulkSessionById, deleteBulkSession,
   // Phase 1A
   createBulkSessionWithItems, listBulkSessions, getBulkSession, patchBulkSession,
-  listBulkItems, updateBulkItem, updateBulkItemFromResearch,
+  listBulkItems, updateBulkItem, updateBulkItemFromResearch, persistToDisk,
   upsertBookmark, getRecentBookmarks } from './db.js';
 import { loadSuppliers, addSupplier, deleteSupplier } from './suppliers.js';
 import { loadShipping, addShipping, updateShipping, deleteShipping } from './shipping.js';
@@ -971,7 +971,7 @@ router.post('/api/bulk-research/stream', async (req, res) => {
           match_type: 'none',
           match_confidence: 'none',
           researched_at: new Date().toISOString(),
-        }, userEmail);
+        }, userEmail, { skipSave: true });
         send('result', {
           item_id: itemId, idx, jan, partNumber, productName, wholesalePrice,
           status: 'not_found', message: 'Amazon商品が見つかりません',
@@ -998,7 +998,7 @@ router.post('/api/bulk-research/stream', async (req, res) => {
           match_type: matchType,
           match_confidence: matchConfidence,
           researched_at: new Date().toISOString(),
-        }, userEmail);
+        }, userEmail, { skipSave: true });
         send('result', {
           item_id: itemId, idx, jan, partNumber, productName: productName || product.itemName,
           wholesalePrice, asin,
@@ -1133,7 +1133,7 @@ router.post('/api/bulk-research/stream', async (req, res) => {
         research_status: 'ok',
         research_message: null,
         researched_at: new Date().toISOString(),
-      }, userEmail);
+      }, userEmail, { skipSave: true });
 
       send('result', {
         item_id: itemId,
@@ -1199,7 +1199,7 @@ router.post('/api/bulk-research/stream', async (req, res) => {
           match_type: 'none',
           match_confidence: 'none',
           researched_at: new Date().toISOString(),
-        }, userEmail);
+        }, userEmail, { skipSave: true });
       } catch (dbErr) {
         console.error(`[BulkResearch] DB UPDATE失敗 (itemId=${itemId}):`, dbErr.message);
       }
@@ -1211,7 +1211,16 @@ router.post('/api/bulk-research/stream', async (req, res) => {
       // エラー後も少し待機
       await new Promise(r => setTimeout(r, 1000));
     }
+
+    // バッチライト: 50 行ごとに永続化（Codex レビュー P2 対応）
+    // 単行ごとの saveToFile は updateBulkItemFromResearch の skipSave:true でスキップ済み
+    if ((i + 1) % 50 === 0) {
+      try { persistToDisk(); } catch (saveErr) { console.error('[BulkResearch] persistToDisk:', saveErr.message); }
+    }
   }
+
+  // 最終永続化（skipSave で残っているバッチを全て書き出す）
+  try { persistToDisk(); } catch (saveErr) { console.error('[BulkResearch] final persistToDisk:', saveErr.message); }
 
   // 進捗集計は items 集計が正（§3.14）— クライアントは完了後に session を再フェッチして取る
   send('complete', { total: targets.length, session_id });
@@ -1898,6 +1907,9 @@ router.get('/api/bulk-sessions/:id/items', async (req, res) => {
     await ensureDb();
     const sessionId = parseInt(req.params.id);
     if (Number.isNaN(sessionId)) return res.status(400).json({ error: 'invalid_id' });
+    // visibility チェック: private セッションは作成者以外に返さない
+    const sessionCheck = getBulkSession(sessionId, req.session.email);
+    if (!sessionCheck) return res.status(404).json({ error: 'not_found' });
     const options = {
       offset: parseInt(req.query.offset) || 0,
       limit: parseInt(req.query.limit) || 100,
@@ -1949,6 +1961,7 @@ router.put('/api/bulk-sessions/:id/bookmark', async (req, res) => {
     });
     res.json({ ok: true });
   } catch (err) {
+    if (err.statusCode) return res.status(err.statusCode).json({ error: err.message });
     console.error('[ProfitCalc] upsertBookmark:', err);
     res.status(500).json({ error: err.message });
   }

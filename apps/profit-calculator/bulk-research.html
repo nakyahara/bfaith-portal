@@ -1375,41 +1375,86 @@ function renderSessionBanner(session) {
   }
 }
 
-// セッション内の items 一覧をロード（resume 用）
+// items 1 行をフロント側の allResults 形状にマッピング
+function mapItemToResult(it, idx) {
+  return {
+    item_id: it.id,
+    idx,
+    jan: it.jan, partNumber: it.part_number, productName: it.product_name,
+    wholesalePrice: it.wholesale_price,
+    wholesalePriceWithTax: it.wholesale_price != null ? Math.round(it.wholesale_price * (1 + (currentSession?.settings?.taxRate || 10) / 100)) : null,
+    asin: it.asin, amazonName: it.amazon_name, image: it.image_url, category: it.category,
+    salesRank: it.sales_rank, offerCount: it.offer_count, sellingPrice: it.selling_price,
+    totalFee: it.total_fee, referralFee: it.referral_fee, fbaFee: it.fba_fee,
+    profit: it.profit, profitRate: it.profit_rate, judgment: it.judgment,
+    fbmAmazonFee: it.fbm_amazon_fee,
+    _fbmShippingCost: it.fbm_shipping_cost, _fbmShippingMethod: it.fbm_shipping_method,
+    _fbmProfit: it.fbm_profit, _fbmProfitRate: it.fbm_profit_rate, _fbmJudgment: it.fbm_judgment,
+    matchType: it.match_type, matchConfidence: it.match_confidence,
+    compositeScore: it.composite_score, compositeRank: it.composite_rank,
+    competitionScore: it.competition_score, competitionLabel: it.competition_score <= 30 ? '低競合' : it.competition_score <= 60 ? '中競合' : it.competition_score <= 80 ? '高競合' : '超高競合',
+    salesLevel: it.sales_level, salesLevelLabel: ({5:'爆売れ',4:'よく売れる',3:'普通',2:'少ない',1:'ほぼ売れない',0:'不明'})[it.sales_level] || '不明',
+    estMonthlySales: it.est_monthly_sales, amazonSeller: it.amazon_seller ? 1 : 0,
+    status: it.research_status, message: it.research_message,
+    _row_version: it.row_version,
+  };
+}
+
+// セッション内の items をすべてロード（resume 用、全件取得 = ページ繰り返し）
 async function loadSessionItems({ anchorItemId = null } = {}) {
   if (!currentSessionId) return;
+  const PAGE_SIZE = 500;
   try {
-    const qs = new URLSearchParams({
-      offset: 0, limit: 500,
+    // 1 ページ目（anchor 指定あり）
+    const firstQs = new URLSearchParams({
+      offset: 0, limit: PAGE_SIZE,
       filter: viewState.filter, sort: viewState.sort, order: viewState.order,
     });
-    if (anchorItemId) qs.set('anchor_item_id', anchorItemId);
-    const res = await fetch(`./api/bulk-sessions/${currentSessionId}/items?${qs}`);
-    if (!res.ok) return;
-    const body = await res.json();
+    if (anchorItemId) firstQs.set('anchor_item_id', anchorItemId);
+    const firstRes = await fetch(`./api/bulk-sessions/${currentSessionId}/items?${firstQs}`);
+    if (!firstRes.ok) return;
+    const first = await firstRes.json();
 
-    // items → allResults にマッピング（SSE event の result 形状に近づける）
-    allResults = body.items.map((it, idx) => ({
-      item_id: it.id,
-      idx,
-      jan: it.jan, partNumber: it.part_number, productName: it.product_name,
-      wholesalePrice: it.wholesale_price,
-      wholesalePriceWithTax: it.wholesale_price != null ? Math.round(it.wholesale_price * (1 + (currentSession?.settings?.taxRate || 10) / 100)) : null,
-      asin: it.asin, amazonName: it.amazon_name, image: it.image_url, category: it.category,
-      salesRank: it.sales_rank, offerCount: it.offer_count, sellingPrice: it.selling_price,
-      totalFee: it.total_fee, referralFee: it.referral_fee, fbaFee: it.fba_fee,
-      profit: it.profit, profitRate: it.profit_rate, judgment: it.judgment,
-      fbmAmazonFee: it.fbm_amazon_fee,
-      _fbmShippingCost: it.fbm_shipping_cost, _fbmShippingMethod: it.fbm_shipping_method,
-      _fbmProfit: it.fbm_profit, _fbmProfitRate: it.fbm_profit_rate, _fbmJudgment: it.fbm_judgment,
-      matchType: it.match_type, matchConfidence: it.match_confidence,
-      compositeScore: it.composite_score, compositeRank: it.composite_rank,
-      competitionScore: it.competition_score, competitionLabel: it.competition_score <= 30 ? '低競合' : it.competition_score <= 60 ? '中競合' : it.competition_score <= 80 ? '高競合' : '超高競合',
-      salesLevel: it.sales_level, salesLevelLabel: ({5:'爆売れ',4:'よく売れる',3:'普通',2:'少ない',1:'ほぼ売れない',0:'不明'})[it.sales_level] || '不明',
-      estMonthlySales: it.est_monthly_sales, amazonSeller: it.amazon_seller ? 1 : 0,
-      status: it.research_status, message: it.research_message,
-      _row_version: it.row_version,  // 楽観ロック用（将来の PATCH で使う）
-    }));
+    allResults = first.items.map((it, i) => mapItemToResult(it, i));
+
+    // 全件取得まで残りページを順次取得（anchor モード時は anchor_page を起点に前後両方）
+    const total = first.filtered ?? first.total ?? first.items.length;
+    const body = first;  // 最初のレスポンス（anchor 関連メタはこれ）
+
+    if (total > allResults.length) {
+      document.getElementById('progressText').textContent = `セッション読込中... ${allResults.length}/${total}`;
+
+      // anchor モードで途中ページが返った場合は、前ページ側と後ページ側の両方を補完する必要あり
+      // 簡略化: anchor_page があれば、それを基準に 0..anchor_page-1 までを前方読み込み、
+      //         anchor_page+1 以降を後方読み込みで埋める
+      if (body.anchor_page && body.anchor_page > 1) {
+        // 前方ページを 0 〜 anchor_page-2 まで順に取得し、前に挿入
+        const prevResults = [];
+        for (let p = 0; p < body.anchor_page - 1; p++) {
+          const qs = new URLSearchParams({ offset: p * PAGE_SIZE, limit: PAGE_SIZE, filter: viewState.filter, sort: viewState.sort, order: viewState.order });
+          const r = await fetch(`./api/bulk-sessions/${currentSessionId}/items?${qs}`);
+          if (!r.ok) break;
+          const j = await r.json();
+          prevResults.push(...j.items);
+        }
+        allResults = [...prevResults.map((it, i) => mapItemToResult(it, i)), ...allResults];
+      }
+
+      // 後方ページを順に取得
+      let offset = allResults.length;
+      while (offset < total) {
+        const qs = new URLSearchParams({ offset, limit: PAGE_SIZE, filter: viewState.filter, sort: viewState.sort, order: viewState.order });
+        const r = await fetch(`./api/bulk-sessions/${currentSessionId}/items?${qs}`);
+        if (!r.ok) break;
+        const j = await r.json();
+        if (!j.items || j.items.length === 0) break;
+        for (const it of j.items) {
+          allResults.push(mapItemToResult(it, allResults.length));
+        }
+        offset = allResults.length;
+        document.getElementById('progressText').textContent = `セッション読込中... ${allResults.length}/${total}`;
+      }
+    }
 
     // アンカー不一致通知
     const bar = document.getElementById('notificationBar');
@@ -1423,9 +1468,11 @@ async function loadSessionItems({ anchorItemId = null } = {}) {
 
     document.getElementById('resultsPanel').style.display = 'block';
     document.getElementById('progressBox').style.display = 'block';
-    const donePct = body.total > 0 ? Math.round((body.items.filter(i => i.research_status !== 'pending').length / body.total) * 100) : 0;
+    // 進捗: 全ロード後の allResults ベースで計算（body.total はフィルタ前、allResults はフィルタ適用後）
+    const doneCount = allResults.filter(r => r.status && r.status !== 'pending').length;
+    const donePct = allResults.length > 0 ? Math.round((doneCount / allResults.length) * 100) : 0;
     document.getElementById('progressFill').style.width = donePct + '%';
-    document.getElementById('progressText').textContent = `セッション読込: ${allResults.length}行`;
+    document.getElementById('progressText').textContent = `セッション読込完了: ${allResults.length}行`;
     updateSummary();
     applyFilter();
     updateUnmatchedPanel();
