@@ -190,17 +190,30 @@
       <span>このツールは<strong>一次スクリーニング用</strong>です。利益額・利益率は<strong>概算値</strong>です。仕入れ決定前に、必ず「商品計算」画面で精密な利益計算を行ってください。</span>
     </div>
 
-    <!-- セッション管理パネル -->
+    <!-- 続きから再開カード（Phase 1A） -->
+    <div id="resumeCards" style="display:none; margin-bottom:12px;">
+      <div class="panel-title" style="border-bottom-color:#1565c0; margin-bottom:8px;">続きから再開</div>
+      <div id="resumeCardList" style="display:flex; gap:8px; flex-wrap:wrap;"></div>
+    </div>
+
+    <!-- セッション管理パネル（Phase 1A: 3タブ） -->
     <div class="session-panel" id="sessionPanel">
-      <div class="panel-title" style="border-bottom-color: #1565c0;">保存済みリサーチセッション</div>
+      <div class="panel-title" style="border-bottom-color: #1565c0;">
+        リサーチセッション
+        <span id="currentSessionIndicator" style="margin-left:12px; font-size:12px; color:#1565c0; display:none;"></span>
+      </div>
+      <div class="session-tabs" id="sessionTabs" style="display:flex; gap:4px; margin-bottom:8px; border-bottom:1px solid #ddd;">
+        <button type="button" class="session-tab active" data-filter="mine" onclick="switchSessionTab('mine')" style="padding:6px 12px; border:none; background:none; border-bottom:2px solid #1565c0; cursor:pointer;">自分のセッション</button>
+        <button type="button" class="session-tab" data-filter="bookmarked" onclick="switchSessionTab('bookmarked')" style="padding:6px 12px; border:none; background:none; border-bottom:2px solid transparent; cursor:pointer;">自分が触ったもの</button>
+        <button type="button" class="session-tab" data-filter="team" onclick="switchSessionTab('team')" style="padding:6px 12px; border:none; background:none; border-bottom:2px solid transparent; cursor:pointer;">全社</button>
+      </div>
       <div class="session-list" id="sessionList">
         <div style="color:#888; font-size:12px; padding:8px;">読み込み中...</div>
       </div>
-      <div class="session-save-bar" id="sessionSaveBar" style="display:none;">
-        <input type="text" id="sessionName" placeholder="セッション名（例: ○○メーカー 3月価格表）">
-        <button class="btn btn-primary" onclick="saveCurrentSession()">現在の結果を保存</button>
-        <button class="btn btn-sm" onclick="updateCurrentSession()" id="btnUpdateSession" style="display:none;">上書き保存</button>
-      </div>
+      <!-- 現セッションの情報表示（作成者・最終更新者バナー） -->
+      <div id="sessionBanner" style="display:none; margin-top:10px; padding:10px; border-radius:4px;"></div>
+      <!-- 通知バー（anchor 不一致など） -->
+      <div id="notificationBar" style="display:none; margin-top:10px; padding:10px; background:#fff3cd; border:1px solid #ffc107; border-radius:4px;"></div>
     </div>
 
     <!-- Step 1: CSV入力 -->
@@ -442,85 +455,79 @@ JANコード,型番,商品名,卸価格
 <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
 
 <script>
-// ===== State =====
-let allResults = [];
-let parsedRows = [];
+// ===== Phase 1A State =====
+let allResults = [];             // 表示用の行配列（items API から取得 or SSE 受信で追加）
+let parsedRows = [];              // CSV パース結果（取込前の一時データ）
 let headers = [];
 let shippingTable = [];
+let currentSessionId = null;      // 現在のセッション ID（URL ?session= 由来 or 新規作成）
+let currentSession = null;        // GET /:id のレスポンス
+let currentUserEmail = null;      // ログインユーザー（セッションバナーの判定用）
+let currentSessionTab = 'mine';   // 'mine' | 'bookmarked' | 'team'
+let viewState = { filter: 'all', sort: 'row_no', order: 'asc' };
 
-// ===== sessionStorage復元 =====
-const STORAGE_KEY = 'bulkResearchResults';
-const STORAGE_CSV_KEY = 'bulkResearchCsv';
-const STORAGE_SETTINGS_KEY = 'bulkResearchSettings';
-
-function saveToSession() {
-  try {
-    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(allResults));
-  } catch (e) { console.warn('sessionStorage保存失敗:', e); }
-}
-
-function restoreFromSession() {
-  try {
-    const saved = sessionStorage.getItem(STORAGE_KEY);
-    if (!saved) return false;
-    const data = JSON.parse(saved);
-    if (!Array.isArray(data) || data.length === 0) return false;
-    allResults = data;
-
-    // 設定の復元
-    const settings = sessionStorage.getItem(STORAGE_SETTINGS_KEY);
-    if (settings) {
-      const s = JSON.parse(settings);
-      if (s.taxRate) document.getElementById('taxRate').value = s.taxRate;
-      if (s.fulfillmentMode) {
-        document.getElementById('fulfillmentMode').value = s.fulfillmentMode;
-        document.getElementById('fbmShippingSettings').style.display = s.fulfillmentMode === 'fba_only' ? 'none' : '';
-        toggleFbmColumns(s.fulfillmentMode !== 'fba_only');
-      }
-      if (s.fbmShippingMode) document.getElementById('fbmShippingMode').value = s.fbmShippingMode;
-      if (s.supplierCode) document.getElementById('supplierCode').value = s.supplierCode;
-      if (s.supplierName) document.getElementById('supplierName').value = s.supplierName;
-    }
-
-    // CSV入力の復元
-    const csvText = sessionStorage.getItem(STORAGE_CSV_KEY);
-    if (csvText) {
-      document.getElementById('csvText').value = csvText;
-      parseCsv(csvText);
-    }
-
-    // 結果表示
-    document.getElementById('resultsPanel').style.display = 'block';
-    document.getElementById('progressBox').style.display = 'block';
-    document.getElementById('progressFill').style.width = '100%';
-    document.getElementById('progressText').textContent =
-      `前回の結果を復元しました（${allResults.length} 件）`;
-    updateSummary();
-    applyFilter();
-    updateUnmatchedPanel();
-    return true;
-  } catch (e) {
-    console.warn('sessionStorage復元失敗:', e);
-    return false;
+// 旧 sessionStorage の検出（Phase 1A §9.2: 明示ダイアログで取り込み or 破棄）
+function checkLegacySessionStorage() {
+  if (localStorage.getItem('phase1a_migration_done') === '1') return;
+  const saved = sessionStorage.getItem('bulkResearchResults');
+  if (!saved) {
+    localStorage.setItem('phase1a_migration_done', '1');
+    return;
   }
+  let count = 0;
+  try { const d = JSON.parse(saved); if (Array.isArray(d)) count = d.length; } catch {}
+  if (count === 0) {
+    sessionStorage.removeItem('bulkResearchResults');
+    sessionStorage.removeItem('bulkResearchCsv');
+    sessionStorage.removeItem('bulkResearchSettings');
+    localStorage.setItem('phase1a_migration_done', '1');
+    return;
+  }
+  const choice = confirm(
+    `旧ブラウザ保存データが見つかりました（${count}件）。\n\n` +
+    '新しい「サーバー保存セッション」として取り込みますか？\n\n' +
+    '[OK] 新規セッションとして取り込む\n[キャンセル] 破棄する'
+  );
+  if (choice) {
+    // 旧 JSON → POST /api/bulk-sessions に変換して取り込む
+    importLegacySession(saved);
+  }
+  sessionStorage.removeItem('bulkResearchResults');
+  sessionStorage.removeItem('bulkResearchCsv');
+  sessionStorage.removeItem('bulkResearchSettings');
+  localStorage.setItem('phase1a_migration_done', '1');
 }
 
-function saveSettingsToSession() {
+async function importLegacySession(savedJson) {
   try {
-    sessionStorage.setItem(STORAGE_SETTINGS_KEY, JSON.stringify({
-      taxRate: document.getElementById('taxRate').value,
-      fulfillmentMode: document.getElementById('fulfillmentMode').value,
-      fbmShippingMode: document.getElementById('fbmShippingMode').value,
-      supplierCode: document.getElementById('supplierCode').value,
-      supplierName: document.getElementById('supplierName').value,
+    const data = JSON.parse(savedJson);
+    if (!Array.isArray(data) || data.length === 0) return;
+    const today = new Date().toISOString().slice(0, 16).replace(/[T:]/g, '').slice(0, 12);
+    const rows = data.map((r, i) => ({
+      source_row_no: i,
+      jan: r.jan || null,
+      part_number: r.partNumber || null,
+      product_name: r.productName || null,
+      wholesale_price: r.wholesalePrice ?? null,
     }));
-  } catch (e) {}
-}
-
-function clearSession() {
-  sessionStorage.removeItem(STORAGE_KEY);
-  sessionStorage.removeItem(STORAGE_CSV_KEY);
-  sessionStorage.removeItem(STORAGE_SETTINGS_KEY);
+    const res = await fetch('./api/bulk-sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: `${today}_旧データ移行`,
+        source_filename: '(旧ブラウザ保存)',
+        settings: {},
+        visibility: 'team',
+        rows,
+      }),
+    });
+    if (res.ok) {
+      const body = await res.json();
+      alert(`旧データ ${data.length} 件を新規セッション (id=${body.id}) として取り込みました。`);
+    }
+  } catch (e) {
+    console.warn('旧データ移行失敗:', e);
+  }
 }
 
 // ===== 送料テーブル読み込み =====
@@ -649,6 +656,7 @@ document.getElementById('csvFile').addEventListener('change', (e) => {
   const file = e.target.files[0];
   if (!file) return;
 
+  window._lastUploadedFileName = file.name;
   const ext = file.name.split('.').pop().toLowerCase();
 
   if (ext === 'xlsx' || ext === 'xls') {
@@ -739,82 +747,111 @@ function populateMapping(selectId, cols, prefixes) {
   }
 }
 
-// ===== リサーチ実行 =====
+// ===== Phase 1A: リサーチ実行 =====
+// 流れ:
+//   1. 現セッションがなければ parsedRows から POST /api/bulk-sessions で atomic 作成
+//   2. POST /api/bulk-research/stream で SSE 開始（session_id ベース）
+//   3. SSE イベント受信 → DOM/state 更新（DB 書き込みはサーバー側が完了済み）
+
 async function startResearch() {
   const colJan = document.getElementById('colJan').value;
   const colPartNumber = document.getElementById('colPartNumber').value;
   const colName = document.getElementById('colName').value;
   const colPrice = document.getElementById('colPrice').value;
 
-  if (!colPrice) {
-    alert('卸価格の列を選択してください');
-    return;
-  }
-  if (!colJan && !colPartNumber && !colName) {
-    alert('JANコード、型番、または商品名の列を少なくとも1つ選択してください');
-    return;
+  if (!colPrice) return alert('卸価格の列を選択してください');
+  if (!colJan && !colPartNumber && !colName) return alert('JANコード、型番、または商品名の列を少なくとも1つ選択してください');
+
+  // セッション未作成時はここで作る
+  if (!currentSessionId) {
+    const rows = parsedRows.map((row, i) => ({
+      source_row_no: i,
+      jan: colJan ? (row[colJan] || null) : null,
+      part_number: colPartNumber ? (row[colPartNumber] || null) : null,
+      product_name: colName ? (row[colName] || null) : null,
+      wholesale_price: parseFloat(String(row[colPrice]).replace(/[,，]/g, '')) || null,
+    })).filter(r => r.jan || r.part_number || r.product_name);
+
+    if (rows.length === 0) return alert('有効なデータがありません');
+    if (rows.length > 10000) return alert('1セッションあたり最大10000行までです。ファイルを分割してください。');
+
+    const today = new Date().toISOString().slice(0, 16).replace(/[T:]/g, '').slice(0, 12);
+    const supplier = document.getElementById('supplierName').value;
+    const fileName = (window._lastUploadedFileName || 'CSV貼付').slice(0, 80);
+    const sessionName = `${today}_${supplier ? supplier + '_' : ''}${fileName}`;
+    const settings = {
+      taxRate: parseInt(document.getElementById('taxRate').value),
+      fulfillmentMode: document.getElementById('fulfillmentMode').value,
+      fbmShippingMode: document.getElementById('fbmShippingMode').value,
+      easyshipSmall: document.getElementById('easyshipSmall')?.value,
+      easyshipLarge: document.getElementById('easyshipLarge')?.value,
+      fixedShipping: document.getElementById('fixedShipping')?.value,
+      supplierCode: document.getElementById('supplierCode').value,
+      supplierName: supplier,
+    };
+
+    try {
+      const res = await fetch('./api/bulk-sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: sessionName, source_filename: fileName, settings, visibility: 'team', rows }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        return alert(`セッション作成失敗: ${err.error || res.status}`);
+      }
+      const body = await res.json();
+      currentSessionId = body.id;
+      history.replaceState(null, '', `?session=${currentSessionId}`);
+      await loadSessionMeta();
+    } catch (e) {
+      return alert('セッション作成エラー: ' + e.message);
+    }
   }
 
-  const items = parsedRows.map(row => ({
-    jan: colJan ? row[colJan] : '',
-    partNumber: colPartNumber ? row[colPartNumber] : '',
-    productName: colName ? row[colName] : '',
-    wholesalePrice: parseFloat(String(row[colPrice]).replace(/[,，]/g, '')) || 0,
-  })).filter(item => item.wholesalePrice >= 0 && (item.jan || item.partNumber || item.productName));
-
-  if (items.length === 0) {
-    alert('有効なデータがありません（卸価格が0または空の行は除外されます）');
-    return;
-  }
-
-  // UI更新
+  // 結果表示エリアリセット
   document.getElementById('startBtn').disabled = true;
   document.getElementById('progressBox').style.display = 'block';
   document.getElementById('resultsPanel').style.display = 'block';
-  allResults = [];
-  clearSession(); // 前回データをクリア
   document.getElementById('resultBody').innerHTML = '';
+  allResults = [];
   updateSummary();
 
-  // CSV・設定を保存
-  sessionStorage.setItem(STORAGE_CSV_KEY, document.getElementById('csvText').value);
-  saveSettingsToSession();
-
-  const taxRate = parseInt(document.getElementById('taxRate').value);
   const fulfillmentMode = document.getElementById('fulfillmentMode').value;
-  const shippingCostPerItem = parseInt(document.getElementById('shippingCostPerItem').value) || 0;
-  const enableCompetitorAnalysis = document.getElementById('enableCompetitorAnalysis').value === '1';
-
-  // FBM列の表示切り替え
   toggleFbmColumns(fulfillmentMode !== 'fba_only');
 
   try {
     const response = await fetch('./api/bulk-research/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ items, taxRate, fulfillmentMode, shippingCostPerItem, enableCompetitorAnalysis }),
+      body: JSON.stringify({
+        session_id: currentSessionId,
+        fulfillmentMode,
+        shippingCostPerItem: parseInt(document.getElementById('shippingCostPerItem').value) || 0,
+        enableCompetitorAnalysis: document.getElementById('enableCompetitorAnalysis').value === '1',
+      }),
     });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    let currentEvent = 'message';
 
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
-      buffer = lines.pop(); // 未完了の行を残す
-
+      buffer = lines.pop();
       for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          const data = JSON.parse(line.slice(6));
-          const eventLine = lines[lines.indexOf(line) - 1];
-          // event行を探す
-          handleEvent(data);
-        } else if (line.startsWith('event: ')) {
-          // 次のdata行と一緒に処理される
+        if (line.startsWith('event: ')) {
+          currentEvent = line.slice(7).trim();
+        } else if (line.startsWith('data: ')) {
+          try {
+            const data = JSON.parse(line.slice(6));
+            handleSSE(currentEvent, data);
+          } catch {}
         }
       }
     }
@@ -824,40 +861,32 @@ async function startResearch() {
   }
 
   document.getElementById('startBtn').disabled = false;
+  // 完了後、最新の集計を再取得
+  await loadSessionMeta();
 }
 
-function handleEvent(data) {
-  if (data.current !== undefined && data.total !== undefined && data.status === undefined) {
-    // progress
+// Phase 1A: SSE 受信 — UI 反映のみ、DB 書き込みはサーバー側が完了済み
+function handleSSE(event, data) {
+  if (event === 'start') {
+    document.getElementById('progressFill').style.width = '0%';
+    document.getElementById('progressText').textContent = `開始: 0/${data.total}`;
+  } else if (event === 'progress') {
     const pct = Math.round((data.current / data.total) * 100);
     document.getElementById('progressFill').style.width = pct + '%';
     document.getElementById('progressText').textContent =
       `処理中... ${data.current}/${data.total} (${data.jan || data.productName || ''})`;
-  } else if (data.status !== undefined) {
-    // result
-    allResults.push(data);
-    saveToSession();
+  } else if (event === 'result') {
+    // allResults に追加 or 既存行を置換（item_id で判定）
+    const existingIdx = allResults.findIndex(r => r.item_id === data.item_id);
+    if (existingIdx >= 0) allResults[existingIdx] = data;
+    else allResults.push(data);
     updateSummary();
     applyFilter();
-    // スクロール
-    if (data.total) {
-      const pct = Math.round((data.idx / data.total) * 100);
-      document.getElementById('progressFill').style.width = pct + '%';
-    }
-  } else if (data.total !== undefined && data.current === undefined) {
-    // complete or start
-    if (allResults.length > 0) {
-      document.getElementById('progressText').textContent =
-        `完了! ${allResults.length} 件処理しました`;
-      updateUnmatchedPanel();
-      // セッション保存バーを表示
-      document.getElementById('sessionSaveBar').style.display = 'flex';
-      if (!document.getElementById('sessionName').value) {
-        const today = new Date().toISOString().slice(0, 10);
-        const supplier = document.getElementById('supplierName').value;
-        document.getElementById('sessionName').value = `${supplier ? supplier + ' ' : ''}リサーチ ${today}`;
-      }
-    }
+  } else if (event === 'complete') {
+    document.getElementById('progressText').textContent = `完了! ${data.total} 件処理`;
+    updateUnmatchedPanel();
+  } else if (event === 'error') {
+    alert('リサーチエラー: ' + (data.message || 'unknown'));
   }
 }
 
@@ -867,6 +896,11 @@ function applyFilter() {
   const sortBy = document.getElementById('sortBy').value;
   const profitMin = parseInt(document.getElementById('profitFilter').value);
   const maxSellers = parseInt(document.getElementById('maxSellers').value) || 999;
+
+  // Phase 1A: viewState に反映してブックマーク保存
+  viewState.filter = filter || 'all';
+  viewState.sort = sortBy || 'row_no';
+  scheduleBookmarkOnViewChange();
 
   let filtered = [...allResults];
 
@@ -922,6 +956,7 @@ function renderTable(rows) {
 
   for (const r of rows) {
     const tr = document.createElement('tr');
+    if (r.item_id) tr.setAttribute('data-item-id', r.item_id);  // Phase 1A: アンカー再開・ブックマーク位置検出用
     if (r.status !== 'ok') tr.classList.add('row-dim');
 
     // v2.1: 信頼度別行スタイル
@@ -1178,35 +1213,53 @@ function exportCsv() {
   a.click();
 }
 
-// ===== サーバー側セッション管理 =====
-let currentSessionId = null;
+// ===== Phase 1A: サーバー側セッション管理 =====
+
+// セッション一覧タブ切り替え
+async function switchSessionTab(filter) {
+  currentSessionTab = filter;
+  document.querySelectorAll('.session-tab').forEach(t => {
+    const active = t.dataset.filter === filter;
+    t.style.borderBottomColor = active ? '#1565c0' : 'transparent';
+    t.classList.toggle('active', active);
+  });
+  await loadSessionList();
+}
 
 async function loadSessionList() {
   try {
-    const res = await fetch('./api/bulk-sessions');
+    const res = await fetch(`./api/bulk-sessions?filter=${currentSessionTab}`);
     const sessions = await res.json();
     const list = document.getElementById('sessionList');
-    if (sessions.length === 0) {
-      list.innerHTML = '<div style="color:#888; font-size:12px; padding:8px;">保存済みセッションはありません。リサーチ実行後に保存できます。</div>';
+    if (!Array.isArray(sessions) || sessions.length === 0) {
+      list.innerHTML = '<div style="color:#888; font-size:12px; padding:8px;">該当するセッションがありません。</div>';
       return;
     }
     list.innerHTML = '';
     for (const s of sessions) {
       const div = document.createElement('div');
       div.className = 'session-item';
-      const statusBadge = s.status === '完了'
-        ? '<span class="session-badge done">完了</span>'
-        : `<span class="session-badge progress">${s.processed_count}/${s.total_count}</span>`;
+      const progress = `${s.processed_count || 0}/${s.total_count || 0}`;
+      const errBadge = (s.error_count > 0) ? `<span class="session-badge" style="background:#fbe9e7; color:#c62828;">エラー${s.error_count}</span>` : '';
       const date = s.updated_at ? new Date(s.updated_at).toLocaleString('ja-JP') : '';
+      const creator = s.created_by_name || s.created_by || '?';
+      const updater = s.updated_by_name || s.updated_by || '?';
+      const visBadge = s.visibility === 'private' ? '<span class="session-badge" style="background:#ede7f6;color:#4527a0;">private</span>' : '';
       div.innerHTML = `
-        <div>
-          <span class="session-name">${escHtml(s.name)}</span>
-          ${statusBadge}
-          <span class="session-meta" style="margin-left:8px;">${s.total_count}件 | ${date}</span>
+        <div style="flex:1;">
+          <div>
+            <span class="session-name">${escHtml(s.name)}</span>
+            ${visBadge}
+            <span class="session-badge" style="background:#e3f2fd;color:#1565c0;">${progress}</span>
+            ${errBadge}
+          </div>
+          <div class="session-meta" style="font-size:11px; color:#666; margin-top:2px;">
+            作成: ${escHtml(creator)} / 最終更新: ${escHtml(updater)} / ${date}
+          </div>
         </div>
         <div class="session-actions">
-          <button class="btn btn-sm btn-primary" onclick="event.stopPropagation(); loadSession(${s.id})">読み込み</button>
-          <button class="btn btn-sm btn-danger" onclick="event.stopPropagation(); deleteSession(${s.id}, '${escHtml(s.name)}')">削除</button>
+          <button class="btn btn-sm btn-primary" onclick="event.stopPropagation(); openSession(${s.id})">開く</button>
+          <button class="btn btn-sm btn-danger" onclick="event.stopPropagation(); softDeleteSession(${s.id}, '${escHtml(s.name)}')">削除</button>
         </div>
       `;
       list.appendChild(div);
@@ -1216,144 +1269,270 @@ async function loadSessionList() {
   }
 }
 
-async function loadSession(id) {
+// 「続きから再開」カード
+async function loadResumeCards() {
   try {
-    const res = await fetch(`./api/bulk-sessions/${id}`);
-    const session = await res.json();
-    if (!session || !session.results) {
-      alert('セッションデータの読み込みに失敗しました');
+    const res = await fetch('./api/bulk-sessions/bookmarks/recent?limit=3');
+    const items = await res.json();
+    const box = document.getElementById('resumeCards');
+    const list = document.getElementById('resumeCardList');
+    if (!Array.isArray(items) || items.length === 0) {
+      box.style.display = 'none';
       return;
     }
-
-    // 結果を復元
-    allResults = session.results;
-    currentSessionId = id;
-
-    // 設定を復元
-    if (session.settings) {
-      const s = session.settings;
-      if (s.taxRate) document.getElementById('taxRate').value = s.taxRate;
-      if (s.fulfillmentMode) {
-        document.getElementById('fulfillmentMode').value = s.fulfillmentMode;
-        document.getElementById('fbmShippingSettings').style.display = s.fulfillmentMode === 'fba_only' ? 'none' : '';
-        toggleFbmColumns(s.fulfillmentMode !== 'fba_only');
-      }
-      if (s.fbmShippingMode) document.getElementById('fbmShippingMode').value = s.fbmShippingMode;
-      if (s.supplierCode) document.getElementById('supplierCode').value = s.supplierCode;
-      if (s.supplierName) document.getElementById('supplierName').value = s.supplierName;
+    list.innerHTML = '';
+    for (const b of items) {
+      const card = document.createElement('div');
+      card.style.cssText = 'flex:1; min-width:200px; padding:10px; background:#e3f2fd; border:1px solid #1565c0; border-radius:4px; cursor:pointer;';
+      card.onclick = () => openSession(b.session_id);
+      const processed = `${b.processed_count || 0}/${b.total_count || 0}`;
+      const when = b.last_accessed_at ? new Date(b.last_accessed_at).toLocaleString('ja-JP') : '';
+      card.innerHTML = `
+        <div style="font-weight:bold; font-size:13px;">${escHtml(b.session_name || '(無題)')}</div>
+        <div style="font-size:11px; color:#555; margin-top:4px;">進捗 ${processed} | ${when}</div>
+      `;
+      list.appendChild(card);
     }
-
-    // UI更新
-    document.getElementById('resultsPanel').style.display = 'block';
-    document.getElementById('progressBox').style.display = 'block';
-    document.getElementById('progressFill').style.width = '100%';
-    document.getElementById('progressText').textContent =
-      `セッション「${session.name}」を読み込みました（${allResults.length} 件）`;
-    updateSummary();
-    applyFilter();
-    updateUnmatchedPanel();
-
-    // 保存バー更新
-    document.getElementById('sessionSaveBar').style.display = 'flex';
-    document.getElementById('sessionName').value = session.name;
-    document.getElementById('btnUpdateSession').style.display = '';
-  } catch (e) {
-    alert('読み込みエラー: ' + e.message);
-  }
+    box.style.display = 'block';
+  } catch (e) { console.warn('recent bookmark 取得失敗:', e); }
 }
 
-async function saveCurrentSession() {
-  if (allResults.length === 0) {
-    alert('保存するリサーチ結果がありません。先にリサーチを実行してください。');
-    return;
-  }
-  const name = document.getElementById('sessionName').value.trim();
-  if (!name) {
-    alert('セッション名を入力してください');
-    document.getElementById('sessionName').focus();
-    return;
-  }
-
-  try {
-    const settings = {
-      taxRate: document.getElementById('taxRate').value,
-      fulfillmentMode: document.getElementById('fulfillmentMode').value,
-      fbmShippingMode: document.getElementById('fbmShippingMode').value,
-      supplierCode: document.getElementById('supplierCode').value,
-      supplierName: document.getElementById('supplierName').value,
-    };
-
-    const res = await fetch('./api/bulk-sessions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name,
-        settings,
-        results: allResults,
-        totalCount: allResults.length,
-        processedCount: allResults.length,
-        status: '完了',
-      }),
-    });
-    const data = await res.json();
-    currentSessionId = data.id;
-    document.getElementById('btnUpdateSession').style.display = '';
-    alert(`セッション「${name}」を保存しました`);
-    loadSessionList();
-  } catch (e) {
-    alert('保存エラー: ' + e.message);
-  }
+// セッションを開く（URL 遷移）
+function openSession(id) {
+  const url = new URL(location.href);
+  url.searchParams.set('session', id);
+  location.href = url.toString();
 }
 
-async function updateCurrentSession() {
-  if (!currentSessionId) {
-    saveCurrentSession();
-    return;
-  }
-  try {
-    const settings = {
-      taxRate: document.getElementById('taxRate').value,
-      fulfillmentMode: document.getElementById('fulfillmentMode').value,
-      fbmShippingMode: document.getElementById('fbmShippingMode').value,
-      supplierCode: document.getElementById('supplierCode').value,
-      supplierName: document.getElementById('supplierName').value,
-    };
-    await fetch(`./api/bulk-sessions/${currentSessionId}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: document.getElementById('sessionName').value.trim(),
-        settings,
-        results: allResults,
-        totalCount: allResults.length,
-        processedCount: allResults.length,
-        status: '完了',
-      }),
-    });
-    alert('セッションを上書き保存しました');
-    loadSessionList();
-  } catch (e) {
-    alert('更新エラー: ' + e.message);
-  }
-}
-
-async function deleteSession(id, name) {
+// 論理削除
+async function softDeleteSession(id, name) {
   if (!confirm(`セッション「${name}」を削除しますか？`)) return;
   try {
     await fetch(`./api/bulk-sessions/${id}`, { method: 'DELETE' });
-    if (currentSessionId === id) currentSessionId = null;
-    loadSessionList();
+    if (currentSessionId === id) {
+      currentSessionId = null;
+      history.replaceState(null, '', location.pathname);
+    }
+    await loadSessionList();
+    await loadResumeCards();
   } catch (e) {
     alert('削除エラー: ' + e.message);
   }
 }
 
-// ===== ユーティリティ =====
-// ===== ページロード時に前回結果を復元 =====
-window.addEventListener('DOMContentLoaded', () => {
-  loadSessionList();
-  // 送料テーブル読み込み完了後に復元（少し待つ）
-  setTimeout(() => restoreFromSession(), 300);
+// セッションメタ情報を取得して UI を更新
+async function loadSessionMeta() {
+  if (!currentSessionId) return;
+  try {
+    const res = await fetch(`./api/bulk-sessions/${currentSessionId}`);
+    if (res.status === 404) {
+      alert('セッションが見つかりません');
+      currentSessionId = null;
+      history.replaceState(null, '', location.pathname);
+      return;
+    }
+    if (!res.ok) return;
+    currentSession = await res.json();
+
+    // 設定復元
+    const s = currentSession.settings || {};
+    if (s.taxRate) document.getElementById('taxRate').value = s.taxRate;
+    if (s.fulfillmentMode) {
+      document.getElementById('fulfillmentMode').value = s.fulfillmentMode;
+      document.getElementById('fbmShippingSettings').style.display = s.fulfillmentMode === 'fba_only' ? 'none' : '';
+      toggleFbmColumns(s.fulfillmentMode !== 'fba_only');
+    }
+    if (s.fbmShippingMode) document.getElementById('fbmShippingMode').value = s.fbmShippingMode;
+    if (s.supplierCode) document.getElementById('supplierCode').value = s.supplierCode;
+    if (s.supplierName) document.getElementById('supplierName').value = s.supplierName;
+
+    // 現セッション表示
+    const indicator = document.getElementById('currentSessionIndicator');
+    indicator.textContent = `開いているセッション: ${currentSession.name} (${currentSession.processed_count}/${currentSession.total_count})`;
+    indicator.style.display = 'inline';
+
+    // 誤編集防止バナー（§4.7）
+    renderSessionBanner(currentSession);
+  } catch (e) { console.error('loadSessionMeta:', e); }
+}
+
+function renderSessionBanner(session) {
+  const banner = document.getElementById('sessionBanner');
+  const msgs = [];
+  if (session.created_by && session.created_by !== currentUserEmail) {
+    msgs.push(`⚠ このセッションは <strong>${escHtml(session.created_by_name || session.created_by)}</strong> さんが作成しました（あなたではありません）`);
+  }
+  if (session.updated_by && session.updated_by !== session.created_by && session.updated_by !== currentUserEmail) {
+    msgs.push(`最終更新: <strong>${escHtml(session.updated_by_name || session.updated_by)}</strong>`);
+  }
+  if (msgs.length > 0) {
+    banner.innerHTML = msgs.join(' / ');
+    banner.style.background = '#fff3cd';
+    banner.style.border = '1px solid #ffc107';
+    banner.style.display = 'block';
+  } else {
+    banner.style.display = 'none';
+  }
+}
+
+// セッション内の items 一覧をロード（resume 用）
+async function loadSessionItems({ anchorItemId = null } = {}) {
+  if (!currentSessionId) return;
+  try {
+    const qs = new URLSearchParams({
+      offset: 0, limit: 500,
+      filter: viewState.filter, sort: viewState.sort, order: viewState.order,
+    });
+    if (anchorItemId) qs.set('anchor_item_id', anchorItemId);
+    const res = await fetch(`./api/bulk-sessions/${currentSessionId}/items?${qs}`);
+    if (!res.ok) return;
+    const body = await res.json();
+
+    // items → allResults にマッピング（SSE event の result 形状に近づける）
+    allResults = body.items.map((it, idx) => ({
+      item_id: it.id,
+      idx,
+      jan: it.jan, partNumber: it.part_number, productName: it.product_name,
+      wholesalePrice: it.wholesale_price,
+      wholesalePriceWithTax: it.wholesale_price != null ? Math.round(it.wholesale_price * (1 + (currentSession?.settings?.taxRate || 10) / 100)) : null,
+      asin: it.asin, amazonName: it.amazon_name, image: it.image_url, category: it.category,
+      salesRank: it.sales_rank, offerCount: it.offer_count, sellingPrice: it.selling_price,
+      totalFee: it.total_fee, referralFee: it.referral_fee, fbaFee: it.fba_fee,
+      profit: it.profit, profitRate: it.profit_rate, judgment: it.judgment,
+      fbmAmazonFee: it.fbm_amazon_fee,
+      _fbmShippingCost: it.fbm_shipping_cost, _fbmShippingMethod: it.fbm_shipping_method,
+      _fbmProfit: it.fbm_profit, _fbmProfitRate: it.fbm_profit_rate, _fbmJudgment: it.fbm_judgment,
+      matchType: it.match_type, matchConfidence: it.match_confidence,
+      compositeScore: it.composite_score, compositeRank: it.composite_rank,
+      competitionScore: it.competition_score, competitionLabel: it.competition_score <= 30 ? '低競合' : it.competition_score <= 60 ? '中競合' : it.competition_score <= 80 ? '高競合' : '超高競合',
+      salesLevel: it.sales_level, salesLevelLabel: ({5:'爆売れ',4:'よく売れる',3:'普通',2:'少ない',1:'ほぼ売れない',0:'不明'})[it.sales_level] || '不明',
+      estMonthlySales: it.est_monthly_sales, amazonSeller: it.amazon_seller ? 1 : 0,
+      status: it.research_status, message: it.research_message,
+      _row_version: it.row_version,  // 楽観ロック用（将来の PATCH で使う）
+    }));
+
+    // アンカー不一致通知
+    const bar = document.getElementById('notificationBar');
+    if (body.anchor_filter_mismatch) {
+      bar.innerHTML = `⚠ 前回の対象行は現在のフィルタ条件「${body.requested_filter}」では見えません。フィルタを解除しました。<button class="btn btn-sm" onclick="revertFilter('${body.requested_filter}')" style="margin-left:8px;">元に戻す</button>`;
+      bar.style.display = 'block';
+      viewState.filter = body.effective_filter;
+    } else {
+      bar.style.display = 'none';
+    }
+
+    document.getElementById('resultsPanel').style.display = 'block';
+    document.getElementById('progressBox').style.display = 'block';
+    const donePct = body.total > 0 ? Math.round((body.items.filter(i => i.research_status !== 'pending').length / body.total) * 100) : 0;
+    document.getElementById('progressFill').style.width = donePct + '%';
+    document.getElementById('progressText').textContent = `セッション読込: ${allResults.length}行`;
+    updateSummary();
+    applyFilter();
+    updateUnmatchedPanel();
+
+    // anchor までスクロール
+    if (anchorItemId && body.anchor_page) {
+      setTimeout(() => {
+        const row = document.querySelector(`[data-item-id="${anchorItemId}"]`);
+        if (row) row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }, 200);
+    }
+  } catch (e) { console.error('loadSessionItems:', e); }
+}
+
+function revertFilter(f) {
+  viewState.filter = f;
+  document.getElementById('notificationBar').style.display = 'none';
+  loadSessionItems();
+}
+
+// ===== ブックマーク保存 (keepalive fetch, sendBeacon は使わない §3.12) =====
+let bookmarkScrollTimer = null;
+let bookmarkViewTimer = null;
+
+async function saveBookmark(patch) {
+  if (!currentSessionId) return;
+  try {
+    await fetch(`./api/bulk-sessions/${currentSessionId}/bookmark`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+  } catch {}
+}
+
+function scheduleBookmarkOnScroll() {
+  if (!currentSessionId) return;
+  clearTimeout(bookmarkScrollTimer);
+  bookmarkScrollTimer = setTimeout(() => {
+    // 画面中央に近い行の item_id を取得
+    const rows = document.querySelectorAll('[data-item-id]');
+    const midY = window.innerHeight / 2;
+    let bestId = null, bestDist = Infinity;
+    for (const r of rows) {
+      const rect = r.getBoundingClientRect();
+      const center = (rect.top + rect.bottom) / 2;
+      const d = Math.abs(center - midY);
+      if (d < bestDist) { bestDist = d; bestId = r.dataset.itemId; }
+    }
+    if (bestId) saveBookmark({ last_item_id: parseInt(bestId) });
+  }, 2000);
+}
+
+function scheduleBookmarkOnViewChange() {
+  if (!currentSessionId) return;
+  clearTimeout(bookmarkViewTimer);
+  bookmarkViewTimer = setTimeout(() => {
+    saveBookmark({ view_state_json: JSON.stringify(viewState) });
+  }, 300);
+}
+
+// ページ離脱時のブックマーク保存（keepalive fetch, not sendBeacon）
+window.addEventListener('beforeunload', () => {
+  if (!currentSessionId) return;
+  try {
+    fetch(`./api/bulk-sessions/${currentSessionId}/bookmark`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ view_state_json: JSON.stringify(viewState) }),
+      keepalive: true,
+    });
+  } catch {}
+});
+
+// ===== Phase 1A: ページロード時の初期化 =====
+window.addEventListener('DOMContentLoaded', async () => {
+  // 旧 sessionStorage データのチェックと明示ダイアログ
+  checkLegacySessionStorage();
+
+  // 現ログインユーザー情報をポータル共通エンドから取得（あれば）
+  try {
+    const me = await fetch('/api/me').then(r => r.ok ? r.json() : null).catch(() => null);
+    if (me) currentUserEmail = me.email;
+  } catch {}
+
+  // URL に ?session=N があれば、そのセッションを開く
+  const urlSession = parseInt(new URLSearchParams(location.search).get('session'));
+  if (urlSession) {
+    currentSessionId = urlSession;
+    await loadSessionMeta();
+    // bookmark から anchor_item_id と view_state を取得して復元
+    const anchor = currentSession?.bookmark?.last_item_id;
+    try {
+      if (currentSession?.bookmark?.view_state_json) {
+        viewState = { ...viewState, ...JSON.parse(currentSession.bookmark.view_state_json) };
+      }
+    } catch {}
+    await loadSessionItems({ anchorItemId: anchor });
+  }
+
+  // セッション一覧と「続きから」カード
+  await loadSessionList();
+  await loadResumeCards();
+
+  // ブックマーク保存トリガー: スクロール + ビュー状態変更
+  const scrollableHost = document.querySelector('.table-wrapper') || document;
+  scrollableHost.addEventListener('scroll', scheduleBookmarkOnScroll, { passive: true });
 });
 
 // ===== 選択を削除 =====
@@ -1367,7 +1546,6 @@ function deleteSelected() {
 
   const idxSet = new Set(checked);
   allResults = allResults.filter(r => !idxSet.has(r.idx));
-  saveToSession();
   updateSummary();
   applyFilter();
   updateUnmatchedPanel();
