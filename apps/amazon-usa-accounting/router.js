@@ -292,7 +292,7 @@ router.post('/upload', upload.single('file'), (req, res) => {
     const yearMonth = firstDate.slice(0, 7);  // YYYY-MM
 
     const { resolved, unresolved, zeroGenka } = resolveSkus(parsedRows, db);
-    const { usd, jpy, mgmt, costTotalJpy, rowCount } = aggregate(resolved, rate);
+    const { usd, jpy, mgmt, costTotalJpy } = aggregate(resolved, rate);
 
     // エビデンスCSV(明細)
     const detailCols = ['日付','type','注文番号','sku','説明','数量',
@@ -330,7 +330,8 @@ router.post('/upload', upload.single('file'), (req, res) => {
       totalRows: parsedRows.length,
       resolvedCount: resolved.filter(r => r.解決方法 !== 'unresolved' && r.解決方法 !== 'no_sku').length,
       unresolvedSkus: unresolved,
-      canConfirm: unresolved.length === 0,
+      // 米国Amazon: 未登録SKUは原価0扱いで集計に含める(GAS互換) → 確定可能
+      canConfirm: true,
       usd, jpy, mgmt,
       costTotalJpy,
       zeroGenka,
@@ -521,6 +522,7 @@ function renderPage() {
 
       <div id="unresolvedCard" class="card" style="display:none">
         <h2>⚠️ 未登録SKU</h2>
+        <p class="meta">以下のSKUは商品マスタに未登録です。<b>原価0円として集計に含まれます</b>(GAS互換)。必要に応じてミニPC管理画面で商品マスタに登録してください。</p>
         <div id="unresolvedList"></div>
       </div>
 
@@ -610,11 +612,12 @@ function renderPage() {
       document.getElementById('result').style.display = 'block';
       document.getElementById('uploadStatus').textContent = '';
 
-      let s = '<div class="' + (data.canConfirm ? 'ok' : 'warn') + '">';
+      const hasUnresolved = data.unresolvedSkus.length > 0;
+      let s = '<div class="' + (hasUnresolved ? 'warn' : 'ok') + '">';
       s += '<b>対象年月: ' + data.yearMonth + '</b> / 為替: 1 USD = ' + data.rate + ' JPY<br>';
       s += '総行数: ' + data.totalRows + ' (Transfer除外済) / SKU解決済: ' + data.resolvedCount + ' / 未登録SKU: ' + data.unresolvedSkus.length + '件';
-      if (data.canConfirm) s += '<br><b style="color:#27ae60">✅ 確定可能</b>';
-      else s += '<br><b style="color:#e74c3c">❌ 未登録SKUあり — 確定不可</b>';
+      if (hasUnresolved) s += '<br><b style="color:#d68910">⚠️ 未登録SKUあり(原価0円で集計に含まれます) — 確定可能</b>';
+      else s += '<br><b style="color:#27ae60">✅ 確定可能</b>';
       s += '</div>';
       document.getElementById('summary').innerHTML = s;
 
@@ -690,8 +693,11 @@ function renderPage() {
 
     async function doConfirm() {
       if (!lastData) { alert('先にCSVをアップロードしてください'); return; }
-      if (!lastData.canConfirm) { alert('未登録SKUがあるため確定できません'); return; }
-      if (!confirm(lastData.yearMonth + ' の集計を確定しますか?\\n為替レート: ' + lastData.rate + ' JPY/USD')) return;
+      let msg = lastData.yearMonth + ' の集計を確定しますか?\\n為替レート: ' + lastData.rate + ' JPY/USD';
+      if (lastData.unresolvedSkus.length > 0) {
+        msg += '\\n\\n⚠️ 未登録SKU ' + lastData.unresolvedSkus.length + '件あり(原価0円で集計に含まれます)';
+      }
+      if (!confirm(msg)) return;
       const btn = document.getElementById('confirmBtn');
       btn.disabled = true;
       btn.textContent = '保存中...';
