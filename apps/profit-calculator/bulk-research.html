@@ -869,8 +869,13 @@ async function startResearch() {
       const body = await res.json();
       currentSessionId = body.id;
       history.replaceState(null, '', `?session=${currentSessionId}`);
-      // セッション作成成功 → parsedRows はクリア（次回「開始」で再度新セッションを作らないため）
+      // 新セッション作成成功 → 古いセッションの allResults / 表示行を完全クリア
+      // （Codex P1 6回目: 既存セッションを開いた状態で新 CSV 取込→開始で
+      //  古い行が残ったまま新セッション結果が append されるのを防止）
       parsedRows = [];
+      allResults = [];
+      document.getElementById('resultBody').innerHTML = '';
+      document.getElementById('notificationBar').style.display = 'none';
       await loadSessionMeta();
     } catch (e) {
       return alert('セッション作成エラー: ' + e.message);
@@ -892,6 +897,30 @@ async function startResearch() {
 
   const fulfillmentMode = document.getElementById('fulfillmentMode').value;
   toggleFbmColumns(fulfillmentMode !== 'fba_only');
+
+  // Codex P2 (6回目) 対応: SSE は session.settings から taxRate/FBM 設定を読むため、
+  // 再リサーチ前に UI で変更された値を session.settings に同期する。
+  // これをしないと「設定変えてから再開」した時、古い設定で計算されてセッション内で
+  // 利益数値が混在する。
+  const currentSettings = {
+    taxRate: parseInt(document.getElementById('taxRate').value),
+    fulfillmentMode,
+    fbmShippingMode: document.getElementById('fbmShippingMode').value,
+    easyshipSmall: document.getElementById('easyshipSmall')?.value,
+    easyshipLarge: document.getElementById('easyshipLarge')?.value,
+    fixedShipping: document.getElementById('fixedShipping')?.value,
+    shippingCostPerItem: parseInt(document.getElementById('shippingCostPerItem').value) || 0,
+    enableCompetitorAnalysis: document.getElementById('enableCompetitorAnalysis').value,
+    supplierCode: document.getElementById('supplierCode').value,
+    supplierName: document.getElementById('supplierName').value,
+  };
+  try {
+    await fetch(`./api/bulk-sessions/${currentSessionId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ settings: currentSettings }),
+    });
+  } catch (e) { console.warn('settings PATCH 失敗 (続行):', e); }
 
   try {
     const response = await fetch('./api/bulk-research/stream', {
@@ -1486,28 +1515,26 @@ function mapItemToResult(it, idx) {
   };
 }
 
-// セッション内の items をすべてロード（resume 用、全件取得 = ページ繰り返し）
+// セッション内の items を **必ず全件** ロード（resume 用）
+// Codex P1 (6回目) 対応: bookmark で filter='ok' などが保存されていても、
+// 全件を allResults に入れる（フィルタ切替や export で部分集合になるのを防止）。
+// 表示時のフィルタは applyFilter() が viewState.filter で行う。
 async function loadSessionItems({ anchorItemId = null } = {}) {
   if (!currentSessionId) return;
   const PAGE_SIZE = 500;
   try {
-    // 1 ページ目（anchor 指定あり）— viewState.filter を要求
-    const requestedFilter = viewState.filter;
+    // 1 ページ目: 必ず filter='all' で取得（anchor 指定時のみ anchor_item_id を渡す）
     const firstQs = new URLSearchParams({
       offset: 0, limit: PAGE_SIZE,
-      filter: requestedFilter, sort: viewState.sort, order: viewState.order,
+      filter: 'all', sort: viewState.sort, order: viewState.order,
     });
     if (anchorItemId) firstQs.set('anchor_item_id', anchorItemId);
     const firstRes = await fetch(`./api/bulk-sessions/${currentSessionId}/items?${firstQs}`);
     if (!firstRes.ok) return;
     const first = await firstRes.json();
 
-    // Codex P2-B: 後続ページ fetch はサーバーが実際に使ったフィルタ (effective_filter) で統一する。
-    // anchor_filter_mismatch の場合は 1 ページ目だけ 'all' で返ってきているので、残りも 'all' で取得しないと不整合になる。
-    const effectiveFilter = first.effective_filter || requestedFilter;
-
-    const firstItems = first.items.map((it, i) => mapItemToResult(it, i));
-    const total = first.filtered ?? first.total ?? firstItems.length;
+    const firstItems = first.items;
+    const total = first.total ?? firstItems.length;  // 全件数
 
     // 収集バッファ（最後に idx を 0..N-1 で振り直す）
     let prevItems = [];
@@ -1517,7 +1544,7 @@ async function loadSessionItems({ anchorItemId = null } = {}) {
       document.getElementById('progressText').textContent = `セッション読込中... ${firstItems.length}/${total}`;
       // 前方ページを 0 〜 anchor_page-2 まで順に取得
       for (let p = 0; p < first.anchor_page - 1; p++) {
-        const qs = new URLSearchParams({ offset: p * PAGE_SIZE, limit: PAGE_SIZE, filter: effectiveFilter, sort: viewState.sort, order: viewState.order });
+        const qs = new URLSearchParams({ offset: p * PAGE_SIZE, limit: PAGE_SIZE, filter: 'all', sort: viewState.sort, order: viewState.order });
         const r = await fetch(`./api/bulk-sessions/${currentSessionId}/items?${qs}`);
         if (!r.ok) break;
         const j = await r.json();
@@ -1530,7 +1557,7 @@ async function loadSessionItems({ anchorItemId = null } = {}) {
     const nextOffset = first.anchor_page ? first.anchor_page * PAGE_SIZE : firstItems.length;
     let offset = nextOffset;
     while (offset < total) {
-      const qs = new URLSearchParams({ offset, limit: PAGE_SIZE, filter: effectiveFilter, sort: viewState.sort, order: viewState.order });
+      const qs = new URLSearchParams({ offset, limit: PAGE_SIZE, filter: 'all', sort: viewState.sort, order: viewState.order });
       const r = await fetch(`./api/bulk-sessions/${currentSessionId}/items?${qs}`);
       if (!r.ok) break;
       const j = await r.json();
@@ -1543,8 +1570,8 @@ async function loadSessionItems({ anchorItemId = null } = {}) {
     // Codex P2-C: idx を 0..N-1 で通し番号に振り直す（前方ページを prepend する時に重複しないように）
     const orderedItems = [
       ...prevItems.map((it, i) => mapItemToResult(it, i)),
-      ...first.items.map((it, i) => mapItemToResult(it, prevItems.length + i)),
-      ...laterItems.map((it, i) => mapItemToResult(it, prevItems.length + first.items.length + i)),
+      ...firstItems.map((it, i) => mapItemToResult(it, prevItems.length + i)),
+      ...laterItems.map((it, i) => mapItemToResult(it, prevItems.length + firstItems.length + i)),
     ];
     allResults = orderedItems;
 

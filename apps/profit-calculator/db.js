@@ -1278,6 +1278,11 @@ export function patchBulkSession(id, data, userEmail) {
   if (data.deleted_at === null || typeof data.deleted_at === 'string') {
     fields.push('deleted_at = ?'); params.push(data.deleted_at);
   }
+  // Codex P2 (6回目) 対応: 再リサーチ時に UI で変更された設定 (taxRate/fbmShippingMode/
+  // shippingCostPerItem 等) を session.settings に反映できるようにする
+  if (data.settings && typeof data.settings === 'object') {
+    fields.push('settings = ?'); params.push(JSON.stringify(data.settings));
+  }
   if (fields.length === 0) return { ok: true };
   fields.push('updated_at = ?'); params.push(ISO_NOW());
   fields.push('updated_by = ?'); params.push(userEmail);
