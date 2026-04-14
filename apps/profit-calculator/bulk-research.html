@@ -518,12 +518,47 @@ async function importLegacySession(savedJson) {
     const data = JSON.parse(savedJson);
     if (!Array.isArray(data) || data.length === 0) return true;  // 中身なしは成功扱い
     const today = new Date().toISOString().slice(0, 16).replace(/[T:]/g, '').slice(0, 12);
+    // Codex P1 (4回目) 対応: ソース 4 列だけでなく、リサーチ済み完了フィールドも一緒に送る。
+    // 旧 sessionStorage には status/asin/profit/judgment/match_type 等の結果が入っているため、
+    // 単純な「再リサーチが必要な空セッション」にしてしまうとデータロストになる。
     const rows = data.map((r, i) => ({
       source_row_no: i,
+      // ソース行
       jan: r.jan || null,
       part_number: r.partNumber || null,
       product_name: r.productName || null,
       wholesale_price: r.wholesalePrice ?? null,
+      // SP-API 由来（完了済みデータがあれば移行）
+      asin: r.asin || null,
+      amazon_name: r.amazonName || null,
+      image_url: r.image || null,
+      category: r.category || null,
+      sales_rank: r.salesRank === '-' ? null : (typeof r.salesRank === 'number' ? r.salesRank : null),
+      offer_count: r.offerCount ?? null,
+      selling_price: r.sellingPrice ?? null,
+      referral_fee: r.referralFee ?? null,
+      fba_fee: r.fbaFee ?? null,
+      total_fee: r.totalFee ?? null,
+      profit: r.profit ?? null,
+      profit_rate: r.profitRate ?? null,
+      judgment: r.judgment || null,
+      match_type: r.matchType || null,
+      match_confidence: r.matchConfidence || null,
+      composite_score: r.compositeScore ?? null,
+      composite_rank: r.compositeRank || null,
+      competition_score: r.competitionScore ?? null,
+      sales_level: r.salesLevel ?? null,
+      est_monthly_sales: r.estMonthlySales ?? null,
+      amazon_seller: r.amazonSeller ? 1 : 0,
+      fbm_amazon_fee: r.fbmAmazonFee ?? null,
+      fbm_shipping_cost: r._fbmShippingCost ?? null,
+      fbm_shipping_method: r._fbmShippingMethod || null,
+      fbm_profit: r._fbmProfit ?? null,
+      fbm_profit_rate: r._fbmProfitRate ?? null,
+      fbm_judgment: r._fbmJudgment || null,
+      research_status: ['ok', 'not_found', 'no_price', 'error'].includes(r.status) ? r.status : 'pending',
+      research_message: r.message || null,
+      researched_at: r.researchedAt || null,
     }));
     const res = await fetch('./api/bulk-sessions', {
       method: 'POST',
@@ -906,6 +941,14 @@ function handleSSE(event, data) {
     document.getElementById('progressText').textContent =
       `処理中... ${data.current}/${data.total} (${data.jan || data.productName || ''})`;
   } else if (event === 'result') {
+    // Codex P2 (4回目) 対応: SSE は FBM 値を fbm* キーで返すが、フロント全体は _fbm* キーで読む
+    // （updateSummary/sortBy/CSV エクスポート）。SSE 受信時に正規化する。
+    if (data.fbmShippingCost !== undefined) data._fbmShippingCost = data.fbmShippingCost;
+    if (data.fbmShippingMethod !== undefined) data._fbmShippingMethod = data.fbmShippingMethod;
+    if (data.fbmProfit !== undefined) data._fbmProfit = data.fbmProfit;
+    if (data.fbmProfitRate !== undefined) data._fbmProfitRate = data.fbmProfitRate;
+    if (data.fbmJudgment !== undefined) data._fbmJudgment = data.fbmJudgment;
+
     // allResults に追加 or 既存行を置換（item_id で判定）
     const existingIdx = allResults.findIndex(r => r.item_id === data.item_id);
     if (existingIdx >= 0) allResults[existingIdx] = data;

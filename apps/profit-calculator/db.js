@@ -1122,12 +1122,37 @@ export function createBulkSessionWithItems({ name, sourceFilename, settings, vis
     sessionId = idResult[0].values[0][0];
 
     for (const r of rows) {
+      // Codex P1 (4回目): rows に SP-API 由来の完了済みフィールドが含まれていれば、
+      // それも一緒に INSERT する（旧 sessionStorage 移行などで完了済みデータを持ち込むケース）。
+      // research_status はデフォルト 'pending'、ただし r.research_status='ok'/'not_found'/'no_price'/'error' なら採用。
+      const status = ['ok', 'not_found', 'no_price', 'error'].includes(r.research_status) ? r.research_status : 'pending';
       db.run(
         `INSERT INTO bulk_research_items (
           session_id, source_row_no, jan, part_number, product_name, wholesale_price,
-          research_status, row_version, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 1, ?, ?)`,
-        [sessionId, r.source_row_no, r.jan ?? null, r.part_number ?? null, r.product_name ?? null, r.wholesale_price ?? null, now, now]
+          asin, amazon_name, image_url, category,
+          sales_rank, offer_count, selling_price,
+          referral_fee, fba_fee, total_fee, profit, profit_rate,
+          judgment, match_type, match_confidence,
+          composite_score, composite_rank, competition_score,
+          sales_level, est_monthly_sales, amazon_seller,
+          fbm_amazon_fee, fbm_shipping_cost, fbm_shipping_method,
+          fbm_profit, fbm_profit_rate, fbm_judgment,
+          research_status, research_message, researched_at,
+          row_version, created_at, updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)`,
+        [
+          sessionId, r.source_row_no, r.jan ?? null, r.part_number ?? null, r.product_name ?? null, r.wholesale_price ?? null,
+          r.asin ?? null, r.amazon_name ?? null, r.image_url ?? null, r.category ?? null,
+          r.sales_rank ?? null, r.offer_count ?? null, r.selling_price ?? null,
+          r.referral_fee ?? null, r.fba_fee ?? null, r.total_fee ?? null, r.profit ?? null, r.profit_rate ?? null,
+          r.judgment ?? null, r.match_type ?? null, r.match_confidence ?? null,
+          r.composite_score ?? null, r.composite_rank ?? null, r.competition_score ?? null,
+          r.sales_level ?? null, r.est_monthly_sales ?? null, r.amazon_seller ?? null,
+          r.fbm_amazon_fee ?? null, r.fbm_shipping_cost ?? null, r.fbm_shipping_method ?? null,
+          r.fbm_profit ?? null, r.fbm_profit_rate ?? null, r.fbm_judgment ?? null,
+          status, r.research_message ?? null, r.researched_at ?? null,
+          now, now,
+        ]
       );
     }
     db.run('COMMIT');
