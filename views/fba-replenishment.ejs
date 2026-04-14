@@ -1555,7 +1555,23 @@ Step10: アラート判定
 
 【設定値の扱い】
 ・non_fba_reserve_days は現在未使用（販売比率按分で均等日数を確保）
-・SKU例外マスタ(send_all/keep_minimum)は手動対応用の表示のみ、計算には反映しない</pre>
+・SKU例外マスタ(send_all/keep_minimum)は手動対応用の表示のみ、計算には反映しない
+
+【⚠ 重要な既知事項: PLANNINGレポートの不安定性】
+・本ツールはAmazon SP-APIの GET_FBA_INVENTORY_PLANNING_DATA レポートを
+  主データソースとして使用している
+・このレポートは Amazon 側で以下のSKUを除外する傾向が強い:
+    - FBA販売可能在庫ゼロのSKU
+    - 補充推奨対象外と判定された十分在庫があるSKU
+    - その他、同じ日でも取得タイミングで件数が変動(ランダム欠損あり)
+・PLANNINGレポートに掲載されないSKUは本画面の推奨計算対象から外れる
+・長期欠品中のSKU、取扱継続中なのに一時的にレポート欠損したSKU、
+  在庫充足のためAmazonが除外したSKUは、本画面の推奨リスト/FBA欠品タブ/
+  新規商品タブのどれにも表示されない可能性がある
+・重要SKUは定期的に Seller Central / ロジザード / 他発注管理ツール で
+  別途確認してください
+・参考: Amazon公式 GitHub Issue #5044
+  https://github.com/amzn/selling-partner-api-models/issues/5044</pre>
           </div>
 
           <div class="settings-group">
