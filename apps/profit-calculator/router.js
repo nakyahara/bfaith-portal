@@ -799,8 +799,52 @@ function getCompositeRank(score) {
   return 'D';
 }
 
-// ── API: 一括リサーチ（SSE ストリーミング）v2.1 ──
+// ── Phase 1A: FBM 送料計算（サーバー側）──
+// クライアント側 calcFbmShipping(dims) と同等のロジック。
+// SSE ハンドラーが items の fbm_* を書き込むために使用する。
+function calcFbmShippingServer(dims, settings, shippingTable) {
+  const mode = settings?.fbmShippingMode || 'auto';
+  const l = parseFloat(dims?.length) || 0;
+  const w = parseFloat(dims?.width) || 0;
+  const h = parseFloat(dims?.height) || 0;
+  const weightG = (parseFloat(dims?.weight) || 0) * 1000;
+  const threeSum = l + w + h;
+
+  if (mode === 'easyship') {
+    const smallCost = parseInt(settings?.easyshipSmall) || 165;
+    const largeCost = parseInt(settings?.easyshipLarge) || 210;
+    const minDim = (l > 0 && w > 0 && h > 0) ? Math.min(l, w, h) : h;
+    if (minDim === 0) return { cost: smallCost, method: 'EasyShip小型(寸法不明)' };
+    if (minDim <= 3) return { cost: smallCost, method: 'EasyShip小型' };
+    return { cost: largeCost, method: 'EasyShip大型' };
+  }
+  if (mode === 'fixed') {
+    return { cost: parseInt(settings?.fixedShipping) || 0, method: '固定額' };
+  }
+  if (l === 0 && w === 0 && h === 0) {
+    return { cost: 237, method: 'ネコポス(寸法不明)' };
+  }
+  for (const s of (shippingTable || [])) {
+    if (s.name.includes('定形内') && l <= 23.5 && w <= 12 && h <= 1 && weightG <= parseInt(s.weight || 0)) return { cost: s.total, method: s.name };
+    if (s.name === 'ネコポス' && l <= 31.2 && w <= 22.8 && h <= 3 && weightG <= 1000) return { cost: s.total, method: s.name };
+    if (s.name === 'クリックポスト' && l <= 34 && w <= 25 && h <= 3 && weightG <= 1000) return { cost: s.total, method: s.name };
+    if (s.name.includes('定形外規格内') && l <= 34 && w <= 25 && h <= 3 && weightG <= parseInt(s.weight || 0)) return { cost: s.total, method: s.name };
+    if (s.name.includes('定形外規格外') && l <= 60 && threeSum <= 90 && weightG <= parseInt(s.weight || 0)) return { cost: s.total, method: s.name };
+    if (s.name === 'ゆうパケットパフ' && h <= 7 && weightG <= 1000) return { cost: s.total, method: s.name };
+    if (s.name === '宅急便50サイズ' && threeSum <= 50 && weightG <= 2000) return { cost: s.total, method: s.name };
+    if (s.name === '宅急便60サイズ' && threeSum <= 60 && weightG <= 2000) return { cost: s.total, method: s.name };
+    if (s.name === '宅急便80サイズ' && threeSum <= 80 && weightG <= 5000) return { cost: s.total, method: s.name };
+    if (s.name === '宅急便100サイズ' && threeSum <= 100 && weightG <= 10000) return { cost: s.total, method: s.name };
+    if (s.name === '宅急便140サイズ' && threeSum <= 140 && weightG <= 15000) return { cost: s.total, method: s.name };
+  }
+  return { cost: 945, method: '宅急便140(該当なし)' };
+}
+
+// ── API: Phase 1A 一括リサーチ（SSE ストリーミング）──
+// 仕様: §3.13 — session_id + item_ids で対象指定、サーバー側で items UPDATE、SSE は UI 反映のみ
 router.post('/api/bulk-research/stream', async (req, res) => {
+  await ensureDb();
+
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -812,28 +856,62 @@ router.post('/api/bulk-research/stream', async (req, res) => {
   };
 
   const {
-    items,
-    taxRate = 10,
+    session_id,
+    item_ids,
     fulfillmentMode = 'both',
-    shippingCostPerItem = 0,       // v2.1: 概算仕入送料
-    enableCompetitorAnalysis = false, // v2.1: 競合詳細分析ON/OFF
-  } = req.body;
+    shippingCostPerItem = 0,
+    enableCompetitorAnalysis = false,
+  } = req.body || {};
 
-  if (!items || !Array.isArray(items) || items.length === 0) {
-    send('error', { message: 'アイテムが指定されていません' });
+  if (!session_id || typeof session_id !== 'number') {
+    send('error', { message: 'session_id が指定されていません' });
     res.end();
     return;
   }
 
-  send('start', { total: items.length });
+  const session = getBulkSession(session_id, req.session.email);
+  if (!session) {
+    send('error', { message: 'セッションが見つかりません' });
+    res.end();
+    return;
+  }
+  if (session.deleted_at) {
+    send('error', { message: 'セッションは削除済みです' });
+    res.end();
+    return;
+  }
 
-  for (let i = 0; i < items.length; i++) {
-    const item = items[i];
-    const { jan, partNumber, productName, wholesalePrice } = item;
+  const settings = session.settings || {};
+  const taxRate = typeof settings.taxRate === 'number' ? settings.taxRate : parseInt(settings.taxRate) || 10;
+  const shippingTable = loadShipping();
+  const userEmail = req.session.email;
+
+  // 対象 items を取得: item_ids 指定があればそれ、なければ pending 全件
+  let targets;
+  if (Array.isArray(item_ids) && item_ids.length > 0) {
+    const page = listBulkItems(session_id, { offset: 0, limit: 10000, filter: 'all' });
+    const idSet = new Set(item_ids.map(Number));
+    targets = page.items.filter(it => idSet.has(it.id));
+  } else {
+    const page = listBulkItems(session_id, { offset: 0, limit: 10000, filter: 'pending' });
+    targets = page.items;
+  }
+
+  if (targets.length === 0) {
+    send('error', { message: '対象行がありません' });
+    res.end();
+    return;
+  }
+
+  send('start', { total: targets.length, session_id });
+
+  for (let i = 0; i < targets.length; i++) {
+    const item = targets[i];
+    const { id: itemId, jan, part_number: partNumber, product_name: productName, wholesale_price: wholesalePrice } = item;
     const idx = i + 1;
 
     try {
-      send('progress', { current: idx, total: items.length, jan, partNumber, productName });
+      send('progress', { current: idx, total: targets.length, item_id: itemId, jan, partNumber, productName });
 
       // === Step 1: 3段階検索（JAN→型番→商品名）v2.1対応 ===
       let candidates = [];
@@ -887,8 +965,15 @@ router.post('/api/bulk-research/stream', async (req, res) => {
       }
 
       if (candidates.length === 0) {
+        updateBulkItemFromResearch(session_id, itemId, {
+          research_status: 'not_found',
+          research_message: 'Amazon商品が見つかりません',
+          match_type: 'none',
+          match_confidence: 'none',
+          researched_at: new Date().toISOString(),
+        }, userEmail);
         send('result', {
-          idx, jan, partNumber, productName, wholesalePrice,
+          item_id: itemId, idx, jan, partNumber, productName, wholesalePrice,
           status: 'not_found', message: 'Amazon商品が見つかりません',
           matchType: 'none', matchConfidence: 'none',
         });
@@ -903,8 +988,19 @@ router.post('/api/bulk-research/stream', async (req, res) => {
       // Step 3: 販売価格チェック
       const sellingPrice = product.currentPrice;
       if (!sellingPrice || sellingPrice <= 0) {
+        updateBulkItemFromResearch(session_id, itemId, {
+          research_status: 'no_price',
+          research_message: '販売価格が取得できません',
+          asin,
+          amazon_name: product.itemName,
+          image_url: product.image,
+          category: product.category || null,
+          match_type: matchType,
+          match_confidence: matchConfidence,
+          researched_at: new Date().toISOString(),
+        }, userEmail);
         send('result', {
-          idx, jan, partNumber, productName: productName || product.itemName,
+          item_id: itemId, idx, jan, partNumber, productName: productName || product.itemName,
           wholesalePrice, asin,
           image: product.image,
           amazonName: product.itemName,
@@ -993,7 +1089,54 @@ router.post('/api/bulk-research/stream', async (req, res) => {
       });
       const compositeRank = getCompositeRank(compositeScore);
 
+      // === Step 9: FBM 送料計算（サーバー側）===
+      let fbmShippingCost = null, fbmShippingMethod = null;
+      let fbmTotalProfit = null, fbmTotalProfitRate = null, fbmTotalJudgment = null;
+      if (fbmFees) {
+        const shipping = calcFbmShippingServer(product.dimensions, settings, shippingTable);
+        fbmShippingCost = shipping.cost;
+        fbmShippingMethod = shipping.method;
+        fbmTotalProfit = sellingPrice - wholesalePriceWithTax - fbmFees.totalFee - fbmShippingCost;
+        fbmTotalProfitRate = sellingPrice > 0 ? Math.round((fbmTotalProfit / sellingPrice * 100) * 10) / 10 : 0;
+        fbmTotalJudgment = fbmTotalProfitRate >= 30 ? '◎' : fbmTotalProfitRate >= 20 ? '○' : fbmTotalProfitRate >= 10 ? '△' : '×';
+      }
+
+      // === DB UPDATE（SSE ハンドラー特権）===
+      updateBulkItemFromResearch(session_id, itemId, {
+        asin,
+        amazon_name: product.itemName,
+        image_url: product.image,
+        category: product.category || null,
+        sales_rank: product.salesRank === '-' ? null : (typeof product.salesRank === 'number' ? product.salesRank : null),
+        offer_count: product.offerCount ?? null,
+        selling_price: sellingPrice,
+        referral_fee: fbaFees?.referralFee ?? fbmFees?.referralFee ?? 0,
+        fba_fee: fbaFees?.fbaFee ?? 0,
+        total_fee: fbaFees?.totalFee ?? 0,
+        profit: fbaFees ? Math.round(profit) : null,
+        profit_rate: fbaFees ? Math.round(profitRate * 10) / 10 : null,
+        judgment: fbaFees ? judgment : null,
+        fbm_amazon_fee: fbmFees?.totalFee ?? null,
+        fbm_shipping_cost: fbmShippingCost,
+        fbm_shipping_method: fbmShippingMethod,
+        fbm_profit: fbmTotalProfit !== null ? Math.round(fbmTotalProfit) : null,
+        fbm_profit_rate: fbmTotalProfitRate,
+        fbm_judgment: fbmTotalJudgment,
+        match_type: matchType,
+        match_confidence: matchConfidence,
+        composite_score: compositeScore,
+        composite_rank: compositeRank,
+        competition_score: competitionScore,
+        sales_level: salesLevelInfo.level,
+        est_monthly_sales: estSales,
+        amazon_seller: competitorData?.amazonSeller ? 1 : 0,
+        research_status: 'ok',
+        research_message: null,
+        researched_at: new Date().toISOString(),
+      }, userEmail);
+
       send('result', {
+        item_id: itemId,
         idx, jan, partNumber, productName: productName || product.itemName,
         wholesalePrice, wholesalePriceWithTax,
         asin,
@@ -1010,10 +1153,15 @@ router.post('/api/bulk-research/stream', async (req, res) => {
         profit: fbaFees ? profit : null,
         profitRate: fbaFees ? Math.round(profitRate * 10) / 10 : null,
         judgment: fbaFees ? judgment : null,
-        // FBM（Amazon手数料のみ。送料はフロントで加算）
+        // FBM（Amazon手数料 + サーバー計算済み送料・利益）
         fbmAmazonFee: fbmFees?.totalFee ?? null,
         fbmReferralFee: fbmFees?.referralFee ?? null,
-        // 寸法情報（フロントで送料自動判定に使用）
+        fbmShippingCost,
+        fbmShippingMethod,
+        fbmProfit: fbmTotalProfit,
+        fbmProfitRate: fbmTotalProfitRate,
+        fbmJudgment: fbmTotalJudgment,
+        // 寸法情報（参考）
         dimensions: product.dimensions,
         estMonthlySales: estSales,
         manufacturer: product.manufacturer,
@@ -1044,8 +1192,19 @@ router.post('/api/bulk-research/stream', async (req, res) => {
 
     } catch (err) {
       console.error(`[BulkResearch] エラー (${jan || partNumber || productName}):`, err.message);
+      try {
+        updateBulkItemFromResearch(session_id, itemId, {
+          research_status: 'error',
+          research_message: err.message?.slice(0, 500) || 'unknown error',
+          match_type: 'none',
+          match_confidence: 'none',
+          researched_at: new Date().toISOString(),
+        }, userEmail);
+      } catch (dbErr) {
+        console.error(`[BulkResearch] DB UPDATE失敗 (itemId=${itemId}):`, dbErr.message);
+      }
       send('result', {
-        idx, jan, partNumber, productName, wholesalePrice,
+        item_id: itemId, idx, jan, partNumber, productName, wholesalePrice,
         status: 'error', message: err.message,
         matchType: 'none', matchConfidence: 'none',
       });
@@ -1054,7 +1213,8 @@ router.post('/api/bulk-research/stream', async (req, res) => {
     }
   }
 
-  send('complete', { total: items.length });
+  // 進捗集計は items 集計が正（§3.14）— クライアントは完了後に session を再フェッチして取る
+  send('complete', { total: targets.length, session_id });
   res.end();
 });
 
