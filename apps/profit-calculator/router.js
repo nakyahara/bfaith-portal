@@ -1095,7 +1095,10 @@ router.post('/api/bulk-research/stream', async (req, res) => {
         const shipping = calcFbmShippingServer(product.dimensions, settings, shippingTable);
         fbmShippingCost = shipping.cost;
         fbmShippingMethod = shipping.method;
-        fbmTotalProfit = sellingPrice - wholesalePriceWithTax - fbmFees.totalFee - fbmShippingCost;
+        // Codex P1 (5回目) 対応: estimatedShipping (仕入送料) も差し引く
+        // FBA の利益計算 (上の Step5) では引いているが、ここで引き忘れていたため
+        // 仕入送料指定時に保存される FBM 利益が過大になっていた
+        fbmTotalProfit = sellingPrice - wholesalePriceWithTax - fbmFees.totalFee - fbmShippingCost - estimatedShipping;
         fbmTotalProfitRate = sellingPrice > 0 ? Math.round((fbmTotalProfit / sellingPrice * 100) * 10) / 10 : 0;
         fbmTotalJudgment = fbmTotalProfitRate >= 30 ? '◎' : fbmTotalProfitRate >= 20 ? '○' : fbmTotalProfitRate >= 10 ? '△' : '×';
       }

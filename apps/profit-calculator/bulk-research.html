@@ -849,6 +849,9 @@ async function startResearch() {
       easyshipSmall: document.getElementById('easyshipSmall')?.value,
       easyshipLarge: document.getElementById('easyshipLarge')?.value,
       fixedShipping: document.getElementById('fixedShipping')?.value,
+      // Codex P2 (5回目) 対応: 仕入送料・競合分析設定もセッション設定として持ち回す
+      shippingCostPerItem: parseInt(document.getElementById('shippingCostPerItem').value) || 0,
+      enableCompetitorAnalysis: document.getElementById('enableCompetitorAnalysis').value,
       supplierCode: document.getElementById('supplierCode').value,
       supplierName: supplier,
     };
@@ -874,12 +877,17 @@ async function startResearch() {
     }
   }
 
-  // 結果表示エリアリセット
+  // 結果表示エリア準備
+  // Codex P1 (5回目) 対応: resume したセッションで startResearch すると pending 行のみが SSE で返るため、
+  // allResults をリセットすると既存の処理済み行が UI/export から消える。
+  // 新規セッション直後 (allResults が空) はそのまま、resume 時 (allResults に既存行あり) は保持。
   document.getElementById('startBtn').disabled = true;
   document.getElementById('progressBox').style.display = 'block';
   document.getElementById('resultsPanel').style.display = 'block';
-  document.getElementById('resultBody').innerHTML = '';
-  allResults = [];
+  // allResults / resultBody は空のときだけリセット（resume 時は保持して merge 方式）
+  if (allResults.length === 0) {
+    document.getElementById('resultBody').innerHTML = '';
+  }
   updateSummary();
 
   const fulfillmentMode = document.getElementById('fulfillmentMode').value;
@@ -1407,7 +1415,7 @@ async function loadSessionMeta() {
     if (!res.ok) return;
     currentSession = await res.json();
 
-    // 設定復元
+    // 設定復元（Codex P2 5回目: shippingCostPerItem / enableCompetitorAnalysis / easyship 系も復元）
     const s = currentSession.settings || {};
     if (s.taxRate) document.getElementById('taxRate').value = s.taxRate;
     if (s.fulfillmentMode) {
@@ -1416,6 +1424,11 @@ async function loadSessionMeta() {
       toggleFbmColumns(s.fulfillmentMode !== 'fba_only');
     }
     if (s.fbmShippingMode) document.getElementById('fbmShippingMode').value = s.fbmShippingMode;
+    if (s.easyshipSmall != null && document.getElementById('easyshipSmall')) document.getElementById('easyshipSmall').value = s.easyshipSmall;
+    if (s.easyshipLarge != null && document.getElementById('easyshipLarge')) document.getElementById('easyshipLarge').value = s.easyshipLarge;
+    if (s.fixedShipping != null && document.getElementById('fixedShipping')) document.getElementById('fixedShipping').value = s.fixedShipping;
+    if (s.shippingCostPerItem != null) document.getElementById('shippingCostPerItem').value = s.shippingCostPerItem;
+    if (s.enableCompetitorAnalysis != null) document.getElementById('enableCompetitorAnalysis').value = s.enableCompetitorAnalysis;
     if (s.supplierCode) document.getElementById('supplierCode').value = s.supplierCode;
     if (s.supplierName) document.getElementById('supplierName').value = s.supplierName;
 
