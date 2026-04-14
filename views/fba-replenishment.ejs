@@ -821,8 +821,27 @@
         if (result.errors && result.errors.length > 0) {
           result.errors.forEach(e => log(`警告: ${e.report} - ${e.error}`));
         }
+
+        // ミニPC→Render DBへ最新スナップショットを同期（必須）
+        log('Render DBへスナップショット同期中...');
+        let syncOk = false;
+        try {
+          const syncRes = await fetch(`${BASE}/api/sync-latest-planning`, { method: 'POST' });
+          const syncJson = await syncRes.json();
+          if (!syncRes.ok || syncJson.error) {
+            log('同期エラー: ' + (syncJson.error || syncRes.status));
+            alert('Render DBへの同期に失敗しました。\nRender側の画面は古いデータのままの可能性があります。\nもう一度「SP-APIレポート全取得」を実行してください。');
+          } else {
+            log(`Render DB同期完了: ${syncJson.rows}件 / FNSKU ${syncJson.fnskus}件 / 日付: ${syncJson.snapshot_date}`);
+            syncOk = true;
+          }
+        } catch (syncErr) {
+          log('同期エラー: ' + syncErr.message);
+          alert('Render DBへの同期に失敗しました (ネットワーク): ' + syncErr.message);
+        }
+
         loadStatus();
-        completeStep(1);
+        if (syncOk) completeStep(1);  // 同期成功時のみ step1 完了マーク
         // データ取得後もドラフトは保持（復元ボタンで戻せる）
       } catch (e) { log('エラー: ' + e.message); }
       finally {
