@@ -762,17 +762,26 @@ async function startResearch() {
   if (!colPrice) return alert('卸価格の列を選択してください');
   if (!colJan && !colPartNumber && !colName) return alert('JANコード、型番、または商品名の列を少なくとも1つ選択してください');
 
-  // セッション未作成時はここで作る
-  if (!currentSessionId) {
-    const rows = parsedRows.map((row, i) => ({
-      source_row_no: i,
-      jan: colJan ? (row[colJan] || null) : null,
-      part_number: colPartNumber ? (row[colPartNumber] || null) : null,
-      product_name: colName ? (row[colName] || null) : null,
-      wholesale_price: parseFloat(String(row[colPrice]).replace(/[,，]/g, '')) || null,
-    })).filter(r => r.jan || r.part_number || r.product_name);
+  // パース済み行がある = 新規 CSV 取込として扱う。既存セッション ID は破棄して新セッションを作る。
+  // （そうしないと「別の CSV をアップして開始」で古い pending 行だけ再実行される — Codex P2-A）
+  if (parsedRows.length > 0) {
+    const rows = parsedRows.map((row, i) => {
+      const priceRaw = String(row[colPrice] ?? '').replace(/[,，\s]/g, '');
+      const price = priceRaw === '' ? null : Number(priceRaw);
+      return {
+        source_row_no: i,
+        jan: colJan ? (row[colJan] || null) : null,
+        part_number: colPartNumber ? (row[colPartNumber] || null) : null,
+        product_name: colName ? (row[colName] || null) : null,
+        wholesale_price: (Number.isFinite(price) && price > 0) ? price : null,
+      };
+    }).filter(r =>
+      // Codex P1: 卸価格が空/非数値/0 の行は除外（後続の利益計算で null→0 扱いされて異常値を出すため）
+      r.wholesale_price != null &&
+      (r.jan || r.part_number || r.product_name)
+    );
 
-    if (rows.length === 0) return alert('有効なデータがありません');
+    if (rows.length === 0) return alert('有効なデータがありません（JAN/型番/商品名と卸価格が両方必要です）');
     if (rows.length > 10000) return alert('1セッションあたり最大10000行までです。ファイルを分割してください。');
 
     const today = new Date().toISOString().slice(0, 16).replace(/[T:]/g, '').slice(0, 12);
@@ -803,6 +812,8 @@ async function startResearch() {
       const body = await res.json();
       currentSessionId = body.id;
       history.replaceState(null, '', `?session=${currentSessionId}`);
+      // セッション作成成功 → parsedRows はクリア（次回「開始」で再度新セッションを作らないため）
+      parsedRows = [];
       await loadSessionMeta();
     } catch (e) {
       return alert('セッション作成エラー: ' + e.message);
@@ -1405,66 +1416,73 @@ async function loadSessionItems({ anchorItemId = null } = {}) {
   if (!currentSessionId) return;
   const PAGE_SIZE = 500;
   try {
-    // 1 ページ目（anchor 指定あり）
+    // 1 ページ目（anchor 指定あり）— viewState.filter を要求
+    const requestedFilter = viewState.filter;
     const firstQs = new URLSearchParams({
       offset: 0, limit: PAGE_SIZE,
-      filter: viewState.filter, sort: viewState.sort, order: viewState.order,
+      filter: requestedFilter, sort: viewState.sort, order: viewState.order,
     });
     if (anchorItemId) firstQs.set('anchor_item_id', anchorItemId);
     const firstRes = await fetch(`./api/bulk-sessions/${currentSessionId}/items?${firstQs}`);
     if (!firstRes.ok) return;
     const first = await firstRes.json();
 
-    allResults = first.items.map((it, i) => mapItemToResult(it, i));
+    // Codex P2-B: 後続ページ fetch はサーバーが実際に使ったフィルタ (effective_filter) で統一する。
+    // anchor_filter_mismatch の場合は 1 ページ目だけ 'all' で返ってきているので、残りも 'all' で取得しないと不整合になる。
+    const effectiveFilter = first.effective_filter || requestedFilter;
 
-    // 全件取得まで残りページを順次取得（anchor モード時は anchor_page を起点に前後両方）
-    const total = first.filtered ?? first.total ?? first.items.length;
-    const body = first;  // 最初のレスポンス（anchor 関連メタはこれ）
+    const firstItems = first.items.map((it, i) => mapItemToResult(it, i));
+    const total = first.filtered ?? first.total ?? firstItems.length;
 
-    if (total > allResults.length) {
-      document.getElementById('progressText').textContent = `セッション読込中... ${allResults.length}/${total}`;
+    // 収集バッファ（最後に idx を 0..N-1 で振り直す）
+    let prevItems = [];
+    let laterItems = [];
 
-      // anchor モードで途中ページが返った場合は、前ページ側と後ページ側の両方を補完する必要あり
-      // 簡略化: anchor_page があれば、それを基準に 0..anchor_page-1 までを前方読み込み、
-      //         anchor_page+1 以降を後方読み込みで埋める
-      if (body.anchor_page && body.anchor_page > 1) {
-        // 前方ページを 0 〜 anchor_page-2 まで順に取得し、前に挿入
-        const prevResults = [];
-        for (let p = 0; p < body.anchor_page - 1; p++) {
-          const qs = new URLSearchParams({ offset: p * PAGE_SIZE, limit: PAGE_SIZE, filter: viewState.filter, sort: viewState.sort, order: viewState.order });
-          const r = await fetch(`./api/bulk-sessions/${currentSessionId}/items?${qs}`);
-          if (!r.ok) break;
-          const j = await r.json();
-          prevResults.push(...j.items);
-        }
-        allResults = [...prevResults.map((it, i) => mapItemToResult(it, i)), ...allResults];
-      }
-
-      // 後方ページを順に取得
-      let offset = allResults.length;
-      while (offset < total) {
-        const qs = new URLSearchParams({ offset, limit: PAGE_SIZE, filter: viewState.filter, sort: viewState.sort, order: viewState.order });
+    if (first.anchor_page && first.anchor_page > 1 && total > firstItems.length) {
+      document.getElementById('progressText').textContent = `セッション読込中... ${firstItems.length}/${total}`;
+      // 前方ページを 0 〜 anchor_page-2 まで順に取得
+      for (let p = 0; p < first.anchor_page - 1; p++) {
+        const qs = new URLSearchParams({ offset: p * PAGE_SIZE, limit: PAGE_SIZE, filter: effectiveFilter, sort: viewState.sort, order: viewState.order });
         const r = await fetch(`./api/bulk-sessions/${currentSessionId}/items?${qs}`);
         if (!r.ok) break;
         const j = await r.json();
-        if (!j.items || j.items.length === 0) break;
-        for (const it of j.items) {
-          allResults.push(mapItemToResult(it, allResults.length));
-        }
-        offset = allResults.length;
-        document.getElementById('progressText').textContent = `セッション読込中... ${allResults.length}/${total}`;
+        for (const it of j.items) prevItems.push(it);
+        document.getElementById('progressText').textContent = `セッション読込中... ${prevItems.length + firstItems.length}/${total}`;
       }
     }
 
+    // 1 ページ目の次 (anchor_page+1) 以降
+    const nextOffset = first.anchor_page ? first.anchor_page * PAGE_SIZE : firstItems.length;
+    let offset = nextOffset;
+    while (offset < total) {
+      const qs = new URLSearchParams({ offset, limit: PAGE_SIZE, filter: effectiveFilter, sort: viewState.sort, order: viewState.order });
+      const r = await fetch(`./api/bulk-sessions/${currentSessionId}/items?${qs}`);
+      if (!r.ok) break;
+      const j = await r.json();
+      if (!j.items || j.items.length === 0) break;
+      for (const it of j.items) laterItems.push(it);
+      offset += j.items.length;
+      document.getElementById('progressText').textContent = `セッション読込中... ${prevItems.length + firstItems.length + laterItems.length}/${total}`;
+    }
+
+    // Codex P2-C: idx を 0..N-1 で通し番号に振り直す（前方ページを prepend する時に重複しないように）
+    const orderedItems = [
+      ...prevItems.map((it, i) => mapItemToResult(it, i)),
+      ...first.items.map((it, i) => mapItemToResult(it, prevItems.length + i)),
+      ...laterItems.map((it, i) => mapItemToResult(it, prevItems.length + first.items.length + i)),
+    ];
+    allResults = orderedItems;
+
     // アンカー不一致通知
     const bar = document.getElementById('notificationBar');
-    if (body.anchor_filter_mismatch) {
-      bar.innerHTML = `⚠ 前回の対象行は現在のフィルタ条件「${body.requested_filter}」では見えません。フィルタを解除しました。<button class="btn btn-sm" onclick="revertFilter('${body.requested_filter}')" style="margin-left:8px;">元に戻す</button>`;
+    if (first.anchor_filter_mismatch) {
+      bar.innerHTML = `⚠ 前回の対象行は現在のフィルタ条件「${first.requested_filter}」では見えません。フィルタを解除しました。<button class="btn btn-sm" onclick="revertFilter('${first.requested_filter}')" style="margin-left:8px;">元に戻す</button>`;
       bar.style.display = 'block';
-      viewState.filter = body.effective_filter;
+      viewState.filter = first.effective_filter;
     } else {
       bar.style.display = 'none';
     }
+    const body = first;  // アンカー関連メタの後方参照用
 
     document.getElementById('resultsPanel').style.display = 'block';
     document.getElementById('progressBox').style.display = 'block';
