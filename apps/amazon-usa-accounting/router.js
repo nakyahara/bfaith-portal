@@ -320,8 +320,8 @@ router.post('/upload', upload.single('file'), (req, res) => {
     summaryCsv += USD_COLS.join(',') + '\n';
     summaryCsv += USD_COLS.map(c => Math.round(jpy[c] || 0)).join(',') + '\n\n';
     summaryCsv += '【管理会計用 セグメント4(輸出)】\n';
-    summaryCsv += 'セグメント,' + MGMT_COLS.join(',') + '\n';
-    summaryCsv += '4:輸出,' + MGMT_COLS.map(c => Math.round(mgmt[c] || 0)).join(',') + '\n';
+    summaryCsv += 'セグメント,' + MGMT_COLS.join(',') + ',広告費\n';
+    summaryCsv += '4:輸出,' + MGMT_COLS.map(c => Math.round(mgmt[c] || 0)).join(',') + ',(確定時に手入力)\n';
 
     evidenceStore.set(yearMonth, { detail: detailCsv, summary: summaryCsv });
 
@@ -365,20 +365,20 @@ router.get('/evidence/:type/:yearMonth', (req, res) => {
 router.post('/confirm', (req, res) => {
   const db = getMirrorDB();
   const { yearMonth, totalRows, resolvedCount, unresolvedCount,
-    exchangeRate, usd, jpy, mgmt, costTotalJpy, csvFilename } = req.body;
+    exchangeRate, usd, jpy, mgmt, costTotalJpy, adCost, csvFilename } = req.body;
   if (!yearMonth) return res.status(400).json({ error: 'yearMonth は必須です' });
 
   try {
     const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
     db.prepare(`INSERT OR REPLACE INTO mart_amazon_usa_monthly_summary
       (year_month, total_rows, resolved_count, unresolved_count,
-       exchange_rate, usd_row, jpy_row, mgmt_row, cost_total, confirmed_at, csv_filename)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?)
+       exchange_rate, usd_row, jpy_row, mgmt_row, cost_total, ad_cost, confirmed_at, csv_filename)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
     `).run(
       yearMonth, totalRows || 0, resolvedCount || 0, unresolvedCount || 0,
       exchangeRate || 0,
       JSON.stringify(usd || {}), JSON.stringify(jpy || {}),
-      JSON.stringify(mgmt || {}), costTotalJpy || 0,
+      JSON.stringify(mgmt || {}), costTotalJpy || 0, adCost || 0,
       now, csvFilename || ''
     );
     db.prepare(`INSERT INTO mart_amazon_usa_upload_log
@@ -538,6 +538,11 @@ function renderPage() {
 
       <div class="card">
         <h2>管理会計用 セグメント4(輸出) — 円建</h2>
+        <div class="rate-box" style="margin-bottom:8px">
+          <label><b>広告費 (税込・円):</b></label>
+          <input type="number" id="adCost" value="0" step="1" style="width:120px" oninput="updateMgmtTable()">
+          <span class="meta">※セグメント4(輸出)行にのみ反映されます</span>
+        </div>
         <div id="mgmtTable"></div>
       </div>
 
@@ -657,12 +662,7 @@ function renderPage() {
       document.getElementById('jpyTable').innerHTML = jpyHtml;
 
       // 管理会計用テーブル
-      let mgHtml = '<table><tr><th>セグメント</th>';
-      data.mgmtCols.forEach(c => mgHtml += '<th>' + c + '</th>');
-      mgHtml += '</tr><tr><td>4: 輸出</td>';
-      data.mgmtCols.forEach(c => mgHtml += '<td class="num">¥' + fmt(data.mgmt[c]) + '</td>');
-      mgHtml += '</tr></table>';
-      document.getElementById('mgmtTable').innerHTML = mgHtml;
+      renderMgmtTable();
 
       // 原価ゼロ
       if (data.zeroGenka && data.zeroGenka.length > 0) {
@@ -686,6 +686,19 @@ function renderPage() {
       }
     }
 
+    function renderMgmtTable() {
+      if (!lastData) return;
+      const ad = parseFloat(document.getElementById('adCost')?.value) || 0;
+      let mgHtml = '<table><tr><th>セグメント</th>';
+      lastData.mgmtCols.forEach(c => mgHtml += '<th>' + c + '</th>');
+      mgHtml += '<th>広告費</th></tr><tr><td>4: 輸出</td>';
+      lastData.mgmtCols.forEach(c => mgHtml += '<td class="num">¥' + fmt(lastData.mgmt[c]) + '</td>');
+      mgHtml += '<td class="num">¥' + fmt(ad) + '</td></tr></table>';
+      document.getElementById('mgmtTable').innerHTML = mgHtml;
+    }
+
+    function updateMgmtTable() { renderMgmtTable(); }
+
     function downloadEvidence(type) {
       if (!lastData) { alert('先にCSVをアップロードしてください'); return; }
       window.open(location.pathname + '/evidence/' + type + '/' + lastData.yearMonth);
@@ -702,6 +715,7 @@ function renderPage() {
       btn.disabled = true;
       btn.textContent = '保存中...';
       try {
+        const adCost = parseFloat(document.getElementById('adCost').value) || 0;
         const r = await fetch(location.pathname + '/confirm', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -715,6 +729,7 @@ function renderPage() {
             jpy: lastData.jpy,
             mgmt: lastData.mgmt,
             costTotalJpy: lastData.costTotalJpy,
+            adCost,
           }),
         });
         const result = await r.json();
@@ -747,11 +762,13 @@ function renderPage() {
           const total = mg['合計'] || 0;
           const sales = mg['商品売上'] || 0;
           const cost = mg['原価合計'] || row.cost_total || 0;
+          const ad = Math.round(row.ad_cost || 0);
 
           html += '<div class="acc-header" onclick="toggleAcc(this)" data-idx="' + i + '">';
           html += '<span><b>' + row.year_month + '</b> — 商品売上: ¥' + Math.round(sales).toLocaleString()
             + ' / 合計: ¥' + Math.round(total).toLocaleString()
             + ' / 原価: ¥' + Math.round(cost).toLocaleString()
+            + (ad ? ' / 広告費: ¥' + ad.toLocaleString() : '')
             + (row.exchange_rate ? ' / 為替: ' + row.exchange_rate : '')
             + ' <span class="meta">(' + (row.confirmed_at || '') + ')</span></span>';
           html += '<span class="arrow">&#9654;</span></div>';
@@ -759,9 +776,9 @@ function renderPage() {
           html += '<h3 style="font-size:13px;color:#555;margin-bottom:4px">管理会計用 セグメント4(輸出) — 円建</h3>';
           html += '<table><tr><th>セグメント</th>';
           mgmtCols.forEach(c => html += '<th>' + c + '</th>');
-          html += '</tr><tr><td>4: 輸出</td>';
+          html += '<th>広告費</th></tr><tr><td>4: 輸出</td>';
           mgmtCols.forEach(c => html += '<td class="num">¥' + fmt(mg[c] || 0) + '</td>');
-          html += '</tr></table>';
+          html += '<td class="num">¥' + fmt(ad) + '</td></tr></table>';
           html += '</div>';
         }
         document.getElementById('historyList').innerHTML = html;
