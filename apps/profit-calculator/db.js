@@ -321,7 +321,92 @@ export async function initDb() {
     }
   }
 
+  // ===== Phase 1A: 途中保存・再開基盤 =====
+  // bulk_research_sessions: 複数担当者運用・可視性・論理削除のためのカラム追加
+  const phase1aSessionCols = [
+    ['created_by', 'TEXT'],
+    ['updated_by', 'TEXT'],
+    ['visibility', "TEXT NOT NULL DEFAULT 'team'"],
+    ['deleted_at', 'TEXT'],
+    ['source_filename', 'TEXT'],
+  ];
+  const sessionCols = queryAll('PRAGMA table_info(bulk_research_sessions)').map(r => r.name);
+  for (const [col, type] of phase1aSessionCols) {
+    if (!sessionCols.includes(col)) {
+      db.run(`ALTER TABLE bulk_research_sessions ADD COLUMN ${col} ${type}`);
+    }
+  }
+
+  // bulk_research_items: 行単位の永続化・楽観ロック
+  db.run(`
+    CREATE TABLE IF NOT EXISTS bulk_research_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id INTEGER NOT NULL,
+      source_row_no INTEGER NOT NULL,
+      jan TEXT,
+      part_number TEXT,
+      product_name TEXT,
+      wholesale_price INTEGER,
+      asin TEXT,
+      amazon_name TEXT,
+      image_url TEXT,
+      category TEXT,
+      sales_rank INTEGER,
+      offer_count INTEGER,
+      selling_price INTEGER,
+      referral_fee INTEGER,
+      fba_fee INTEGER,
+      total_fee INTEGER,
+      profit INTEGER,
+      profit_rate REAL,
+      judgment TEXT,
+      match_type TEXT,
+      match_confidence TEXT,
+      composite_score INTEGER,
+      composite_rank TEXT,
+      competition_score INTEGER,
+      sales_level INTEGER,
+      est_monthly_sales INTEGER,
+      amazon_seller INTEGER,
+      fbm_amazon_fee INTEGER,
+      fbm_shipping_cost INTEGER,
+      fbm_shipping_method TEXT,
+      fbm_profit INTEGER,
+      fbm_profit_rate REAL,
+      fbm_judgment TEXT,
+      research_status TEXT NOT NULL DEFAULT 'pending',
+      research_message TEXT,
+      researched_at TEXT,
+      row_version INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      updated_by TEXT,
+      UNIQUE(session_id, source_row_no)
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_items_session ON bulk_research_items(session_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_items_jan ON bulk_research_items(jan)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_items_asin ON bulk_research_items(asin)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_items_session_status ON bulk_research_items(session_id, research_status)`);
+
+  // user_session_bookmark: 担当者ごとの「続きから」状態
+  db.run(`
+    CREATE TABLE IF NOT EXISTS user_session_bookmark (
+      user_email TEXT NOT NULL,
+      session_id INTEGER NOT NULL,
+      last_accessed_at TEXT NOT NULL,
+      last_item_id INTEGER,
+      view_state_json TEXT,
+      PRIMARY KEY (user_email, session_id)
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_bookmark_user ON user_session_bookmark(user_email, last_accessed_at DESC)`);
+
   saveToFile();
+
+  // 既存セッションの移行（results JSON → items 行展開）
+  // 失敗時は throw してサーバー起動を止める（気づけるように）
+  migrateExistingSessionsToItems();
 }
 
 // ===== Research =====
@@ -894,4 +979,544 @@ export function getBulkSessionById(id) {
 export function deleteBulkSession(id) {
   db.run('DELETE FROM bulk_research_sessions WHERE id = ?', [id]);
   saveToFile();
+}
+
+// ===== Phase 1A: 既存セッションの items 移行 =====
+// 既存 bulk_research_sessions.results JSON を bulk_research_items に展開する。
+// items が 0 件のセッションのみ対象（冪等）。
+// 失敗時は throw して initDb 全体を失敗させる（サーバー起動を止めて気づけるように）。
+export function migrateExistingSessionsToItems() {
+  const targets = queryAll(`
+    SELECT s.id, s.results, s.created_at
+    FROM bulk_research_sessions s
+    LEFT JOIN (
+      SELECT session_id, COUNT(*) AS n FROM bulk_research_items GROUP BY session_id
+    ) i ON i.session_id = s.id
+    WHERE (i.n IS NULL OR i.n = 0)
+      AND s.results IS NOT NULL
+      AND s.deleted_at IS NULL
+  `);
+
+  if (targets.length === 0) {
+    console.log('[ProfitCalc] Phase 1A: 移行対象セッションなし');
+    return { migratedSessions: 0, migratedRows: 0 };
+  }
+
+  console.log(`[ProfitCalc] Phase 1A: 既存セッション移行開始 (${targets.length}件)`);
+
+  let migratedSessions = 0;
+  let migratedRows = 0;
+
+  db.run('BEGIN');
+  try {
+    for (const s of targets) {
+      let results;
+      try {
+        results = JSON.parse(s.results);
+      } catch (e) {
+        console.warn(`[ProfitCalc] セッション ${s.id}: results JSON パース失敗、スキップ`);
+        continue;
+      }
+      if (!Array.isArray(results)) {
+        console.warn(`[ProfitCalc] セッション ${s.id}: results が配列でない、スキップ`);
+        continue;
+      }
+
+      const baseTime = s.created_at || new Date().toISOString();
+
+      for (let i = 0; i < results.length; i++) {
+        const r = results[i] || {};
+        const status = r.status === 'ok' || r.status === 'not_found' || r.status === 'no_price' || r.status === 'error'
+          ? r.status
+          : 'pending';
+        db.run(
+          `INSERT INTO bulk_research_items (
+            session_id, source_row_no,
+            jan, part_number, product_name, wholesale_price,
+            asin, amazon_name, image_url, category,
+            sales_rank, offer_count, selling_price,
+            referral_fee, fba_fee, total_fee, profit, profit_rate,
+            judgment, match_type, match_confidence,
+            composite_score, composite_rank, competition_score,
+            sales_level, est_monthly_sales, amazon_seller,
+            fbm_amazon_fee, fbm_shipping_cost, fbm_shipping_method,
+            fbm_profit, fbm_profit_rate, fbm_judgment,
+            research_status, research_message, researched_at,
+            row_version, created_at, updated_at, updated_by
+          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          [
+            s.id, i,
+            r.jan ?? null, r.partNumber ?? null, r.productName ?? null, r.wholesalePrice ?? null,
+            r.asin ?? null, r.amazonName ?? null, r.image ?? null, r.category ?? null,
+            r.salesRank ?? null, r.offerCount ?? null, r.sellingPrice ?? null,
+            r.referralFee ?? null, r.fbaFee ?? null, r.totalFee ?? null, r.profit ?? null, r.profitRate ?? null,
+            r.judgment ?? null, r.matchType ?? null, r.matchConfidence ?? null,
+            r.compositeScore ?? null, r.compositeRank ?? null, r.competitionScore ?? null,
+            r.salesLevel ?? null, r.estMonthlySales ?? null, r.amazonSeller ? 1 : 0,
+            r.fbmAmazonFee ?? null, r._fbmShippingCost ?? null, r._fbmShippingMethod ?? null,
+            r._fbmProfit ?? null, r._fbmProfitRate ?? null, r._fbmJudgment ?? null,
+            status, r.message ?? null, r.researchedAt ?? baseTime,
+            1, baseTime, baseTime, null,
+          ]
+        );
+        migratedRows++;
+      }
+      migratedSessions++;
+    }
+    db.run('COMMIT');
+    saveToFile();
+  } catch (e) {
+    db.run('ROLLBACK');
+    console.error('[ProfitCalc] Phase 1A 移行失敗:', e.message);
+    throw new Error(`Phase 1A 既存セッション移行に失敗しました: ${e.message}`);
+  }
+
+  console.log(`[ProfitCalc] Phase 1A: 移行完了 ${migratedSessions}セッション / ${migratedRows}行`);
+  return { migratedSessions, migratedRows };
+}
+
+// ===== Phase 1A: セッション・行・ブックマーク操作 =====
+
+const ISO_NOW = () => new Date().toISOString();
+
+/** items 集計カラムをサブクエリで結合するフラグメント */
+const ITEMS_COUNT_FRAGMENT = `
+  (SELECT COUNT(*) FROM bulk_research_items i WHERE i.session_id = s.id) AS total_count_agg,
+  (SELECT COUNT(*) FROM bulk_research_items i WHERE i.session_id = s.id AND i.research_status IN ('ok','not_found','no_price','error')) AS processed_count_agg,
+  (SELECT COUNT(*) FROM bulk_research_items i WHERE i.session_id = s.id AND i.research_status = 'error') AS error_count_agg
+`;
+
+/**
+ * セッション作成 + items 一括 INSERT（atomic）
+ * rows: [{ source_row_no, jan?, part_number?, product_name?, wholesale_price? }, ...]
+ * Returns: { id, itemCount, createdAt }
+ */
+export function createBulkSessionWithItems({ name, sourceFilename, settings, visibility, rows, userEmail }) {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    throw Object.assign(new Error('rows_required'), { statusCode: 400 });
+  }
+  if (rows.length > 10000) {
+    throw Object.assign(new Error('rows_exceeds_limit'), { statusCode: 400 });
+  }
+  // source_row_no の重複チェック
+  const seen = new Set();
+  for (const r of rows) {
+    if (typeof r.source_row_no !== 'number') throw Object.assign(new Error('source_row_no_required'), { statusCode: 400 });
+    if (seen.has(r.source_row_no)) throw Object.assign(new Error('duplicate_source_row_no'), { statusCode: 400 });
+    seen.add(r.source_row_no);
+  }
+
+  const now = ISO_NOW();
+  const vis = visibility === 'private' ? 'private' : 'team';
+
+  let sessionId;
+  db.run('BEGIN');
+  try {
+    db.run(
+      `INSERT INTO bulk_research_sessions (name, settings, source_filename, visibility, created_by, updated_by, total_count, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [name, JSON.stringify(settings || {}), sourceFilename || null, vis, userEmail, userEmail, rows.length, '処理中', now, now]
+    );
+    // INSERT 直後に last_insert_rowid で session_id を確保（items INSERT 前）
+    const idResult = db.exec('SELECT last_insert_rowid() AS id');
+    sessionId = idResult[0].values[0][0];
+
+    for (const r of rows) {
+      // Codex P1 (4回目): rows に SP-API 由来の完了済みフィールドが含まれていれば、
+      // それも一緒に INSERT する（旧 sessionStorage 移行などで完了済みデータを持ち込むケース）。
+      // research_status はデフォルト 'pending'、ただし r.research_status='ok'/'not_found'/'no_price'/'error' なら採用。
+      const status = ['ok', 'not_found', 'no_price', 'error'].includes(r.research_status) ? r.research_status : 'pending';
+      db.run(
+        `INSERT INTO bulk_research_items (
+          session_id, source_row_no, jan, part_number, product_name, wholesale_price,
+          asin, amazon_name, image_url, category,
+          sales_rank, offer_count, selling_price,
+          referral_fee, fba_fee, total_fee, profit, profit_rate,
+          judgment, match_type, match_confidence,
+          composite_score, composite_rank, competition_score,
+          sales_level, est_monthly_sales, amazon_seller,
+          fbm_amazon_fee, fbm_shipping_cost, fbm_shipping_method,
+          fbm_profit, fbm_profit_rate, fbm_judgment,
+          research_status, research_message, researched_at,
+          row_version, created_at, updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)`,
+        [
+          sessionId, r.source_row_no, r.jan ?? null, r.part_number ?? null, r.product_name ?? null, r.wholesale_price ?? null,
+          r.asin ?? null, r.amazon_name ?? null, r.image_url ?? null, r.category ?? null,
+          r.sales_rank ?? null, r.offer_count ?? null, r.selling_price ?? null,
+          r.referral_fee ?? null, r.fba_fee ?? null, r.total_fee ?? null, r.profit ?? null, r.profit_rate ?? null,
+          r.judgment ?? null, r.match_type ?? null, r.match_confidence ?? null,
+          r.composite_score ?? null, r.composite_rank ?? null, r.competition_score ?? null,
+          r.sales_level ?? null, r.est_monthly_sales ?? null, r.amazon_seller ?? null,
+          r.fbm_amazon_fee ?? null, r.fbm_shipping_cost ?? null, r.fbm_shipping_method ?? null,
+          r.fbm_profit ?? null, r.fbm_profit_rate ?? null, r.fbm_judgment ?? null,
+          status, r.research_message ?? null, r.researched_at ?? null,
+          now, now,
+        ]
+      );
+    }
+    db.run('COMMIT');
+  } catch (e) {
+    db.run('ROLLBACK');
+    throw e;
+  }
+  saveToFile();
+
+  return { id: sessionId, itemCount: rows.length, createdAt: now };
+}
+
+/**
+ * セッション一覧（タブ別）
+ * filter: 'mine' | 'bookmarked' | 'team'
+ */
+export function listBulkSessions(filter, userEmail, { includeDeleted = false } = {}) {
+  const deletedCond = includeDeleted ? '' : 'AND s.deleted_at IS NULL';
+  let sql, params;
+  if (filter === 'mine') {
+    sql = `
+      SELECT s.id, s.name, s.source_filename, s.visibility, s.created_by, s.updated_by,
+        s.created_at, s.updated_at, s.status, s.deleted_at,
+        ${ITEMS_COUNT_FRAGMENT}
+      FROM bulk_research_sessions s
+      WHERE s.created_by = ? ${deletedCond}
+      ORDER BY s.updated_at DESC
+      LIMIT 200
+    `;
+    params = [userEmail];
+  } else if (filter === 'bookmarked') {
+    // ブックマーク一覧も visibility チェックを適用（team or 自分の private のみ）
+    sql = `
+      SELECT s.id, s.name, s.source_filename, s.visibility, s.created_by, s.updated_by,
+        s.created_at, s.updated_at, s.status, s.deleted_at,
+        ${ITEMS_COUNT_FRAGMENT}
+      FROM bulk_research_sessions s
+      INNER JOIN user_session_bookmark ub ON ub.session_id = s.id AND ub.user_email = ?
+      WHERE (s.visibility = 'team' OR s.created_by = ?)
+        ${deletedCond}
+      ORDER BY ub.last_accessed_at DESC
+      LIMIT 200
+    `;
+    params = [userEmail, userEmail];
+  } else {
+    // team: 全社 = team 可視性 + 自分が作成した private も含む（自分から見える全部）
+    sql = `
+      SELECT s.id, s.name, s.source_filename, s.visibility, s.created_by, s.updated_by,
+        s.created_at, s.updated_at, s.status, s.deleted_at,
+        ${ITEMS_COUNT_FRAGMENT}
+      FROM bulk_research_sessions s
+      WHERE (s.visibility = 'team' OR s.created_by = ?)
+        ${deletedCond}
+        AND s.updated_at >= datetime('now','-90 day','localtime')
+      ORDER BY s.updated_at DESC
+      LIMIT 200
+    `;
+    params = [userEmail];
+  }
+  return queryAll(sql, params);
+}
+
+/**
+ * セッション詳細 + 現ユーザーのブックマーク
+ * visibility='private' のセッションは作成者以外には 404 相当（null）を返す。
+ * visibility='team' は社内誰でも閲覧可。
+ * 論理削除済み (deleted_at IS NOT NULL) は誰にも返さない（Codex P2 3回目対応）。
+ * 管理操作で削除済みも引きたい場合は opts.includeDeleted=true。
+ */
+export function getBulkSession(id, userEmail, opts = {}) {
+  const rows = queryAll(
+    `SELECT s.*, ${ITEMS_COUNT_FRAGMENT}
+     FROM bulk_research_sessions s WHERE s.id = ?`, [id]
+  );
+  if (rows.length === 0) return null;
+  const s = rows[0];
+  // 論理削除済みは誰にも返さない（SSE・items API 経由の再実行を防ぐ）
+  if (s.deleted_at && !opts.includeDeleted) {
+    return null;
+  }
+  // アクセス制御: private は作成者のみ閲覧可
+  if (s.visibility === 'private' && s.created_by !== userEmail) {
+    return null;  // 存在を漏らさないため 404 相当で返す
+  }
+  try { s.settings = JSON.parse(s.settings || '{}'); } catch { s.settings = {}; }
+  // results は参照しない（Phase 1A 以降は items が正）
+  delete s.results;
+  const bm = queryAll(
+    `SELECT last_item_id, view_state_json, last_accessed_at
+     FROM user_session_bookmark WHERE session_id = ? AND user_email = ?`,
+    [id, userEmail]
+  );
+  s.bookmark = bm.length > 0 ? bm[0] : null;
+  return s;
+}
+
+/**
+ * セッションメタ更新（name / visibility / deleted_at）
+ * セッションメタは作成者のみ編集可能（team セッションでも他者は閲覧のみ）。
+ * 行データ（items）の編集権限とは別管理。
+ */
+export function patchBulkSession(id, data, userEmail) {
+  const session = queryAll('SELECT created_by, visibility FROM bulk_research_sessions WHERE id = ?', [id]);
+  if (session.length === 0) throw Object.assign(new Error('not_found'), { statusCode: 404 });
+
+  // private セッションは作成者以外には存在を漏らさず 404
+  if (session[0].visibility === 'private' && session[0].created_by !== userEmail) {
+    throw Object.assign(new Error('not_found'), { statusCode: 404 });
+  }
+  // セッションメタ更新（name/visibility/deleted_at）は作成者のみ
+  if (session[0].created_by !== userEmail) {
+    throw Object.assign(new Error('forbidden_not_owner'), { statusCode: 403 });
+  }
+
+  const fields = [];
+  const params = [];
+  if (typeof data.name === 'string' && data.name.trim() !== '') {
+    fields.push('name = ?'); params.push(data.name.trim());
+  }
+  if (data.visibility === 'team' || data.visibility === 'private') {
+    fields.push('visibility = ?'); params.push(data.visibility);
+  }
+  if (data.deleted_at === null || typeof data.deleted_at === 'string') {
+    fields.push('deleted_at = ?'); params.push(data.deleted_at);
+  }
+  // Codex P2 (6回目) 対応: 再リサーチ時に UI で変更された設定 (taxRate/fbmShippingMode/
+  // shippingCostPerItem 等) を session.settings に反映できるようにする
+  if (data.settings && typeof data.settings === 'object') {
+    fields.push('settings = ?'); params.push(JSON.stringify(data.settings));
+  }
+  if (fields.length === 0) return { ok: true };
+  fields.push('updated_at = ?'); params.push(ISO_NOW());
+  fields.push('updated_by = ?'); params.push(userEmail);
+  params.push(id);
+  db.run(`UPDATE bulk_research_sessions SET ${fields.join(', ')} WHERE id = ?`, params);
+  saveToFile();
+  return { ok: true };
+}
+
+/**
+ * 行一覧（ページング + filter + sort + anchor）
+ * anchorItemId が指定されたら、その item を含むページを返す。
+ * anchor がフィルタに合致しない場合はフィルタを外して返し、anchor_filter_mismatch を立てる。
+ */
+export function listBulkItems(sessionId, { offset = 0, limit = 100, filter = 'all', sort = 'row_no', order = 'asc', anchorItemId = null } = {}) {
+  limit = Math.min(Math.max(1, limit), 500);
+  offset = Math.max(0, offset);
+
+  const buildWhere = (f) => {
+    if (f === 'all') return '';
+    if (f === 'pending') return `AND research_status = 'pending'`;
+    if (f === 'ok') return `AND research_status = 'ok'`;
+    if (f === 'error') return `AND research_status = 'error'`;
+    if (f === 'unmatched') return `AND research_status IN ('not_found','no_price')`;
+    return '';
+  };
+  const sortCol = ({
+    row_no: 'source_row_no', profit: 'profit', profit_rate: 'profit_rate', composite_score: 'composite_score',
+  })[sort] || 'source_row_no';
+  const sortOrder = order === 'desc' ? 'DESC' : 'ASC';
+
+  const total = queryAll(`SELECT COUNT(*) AS n FROM bulk_research_items WHERE session_id = ?`, [sessionId])[0].n;
+
+  let effectiveFilter = filter;
+  let anchorFilterMismatch = false;
+  let anchorPage = null;
+
+  // アンカー指定時: アンカー行の filter 適合性をチェック
+  if (anchorItemId !== null && anchorItemId !== undefined) {
+    const anchor = queryAll(
+      `SELECT id, research_status, ${sortCol} AS sortval FROM bulk_research_items WHERE session_id = ? AND id = ?`,
+      [sessionId, anchorItemId]
+    );
+    if (anchor.length === 0) {
+      // anchor が存在しない → 通常の offset で返す
+    } else {
+      const matchesFilter = (() => {
+        if (filter === 'all') return true;
+        if (filter === 'pending') return anchor[0].research_status === 'pending';
+        if (filter === 'ok') return anchor[0].research_status === 'ok';
+        if (filter === 'error') return anchor[0].research_status === 'error';
+        if (filter === 'unmatched') return anchor[0].research_status === 'not_found' || anchor[0].research_status === 'no_price';
+        return true;
+      })();
+      if (!matchesFilter) {
+        effectiveFilter = 'all';
+        anchorFilterMismatch = true;
+      }
+      // anchor のオフセットを解決（ソート順での位置）
+      const whereEff = buildWhere(effectiveFilter);
+      const cmp = sortOrder === 'ASC' ? '<' : '>';
+      const beforeCount = queryAll(
+        `SELECT COUNT(*) AS n FROM bulk_research_items WHERE session_id = ? ${whereEff} AND (${sortCol} ${cmp} ? OR (${sortCol} = ? AND id < ?))`,
+        [sessionId, anchor[0].sortval, anchor[0].sortval, anchorItemId]
+      )[0].n;
+      offset = Math.floor(beforeCount / limit) * limit;
+      anchorPage = Math.floor(beforeCount / limit) + 1;
+    }
+  }
+
+  const whereEff = buildWhere(effectiveFilter);
+  const filteredCount = queryAll(
+    `SELECT COUNT(*) AS n FROM bulk_research_items WHERE session_id = ? ${whereEff}`,
+    [sessionId]
+  )[0].n;
+  const items = queryAll(
+    `SELECT * FROM bulk_research_items WHERE session_id = ? ${whereEff}
+     ORDER BY ${sortCol} ${sortOrder}, id ASC
+     LIMIT ? OFFSET ?`,
+    [sessionId, limit, offset]
+  );
+
+  return {
+    items,
+    total,
+    filtered: filteredCount,
+    offset,
+    limit,
+    anchor_page: anchorPage,
+    anchor_filter_mismatch: anchorFilterMismatch,
+    requested_filter: filter,
+    effective_filter: effectiveFilter,
+  };
+}
+
+/**
+ * 行単位 UPDATE（許可フィールド + 自動項目）
+ * allowedFieldsAndValues: { columnName: value, ... }（呼び出し元で whitelist 済み）
+ * rowVersionExpected: 期待する row_version
+ * Returns: { ok: true, newRowVersion } または { conflict: true, server }
+ */
+export function updateBulkItem(sessionId, itemId, allowedFieldsAndValues, rowVersionExpected, userEmail) {
+  const now = ISO_NOW();
+  const setClauses = [];
+  const params = [];
+  for (const [col, val] of Object.entries(allowedFieldsAndValues)) {
+    setClauses.push(`${col} = ?`);
+    params.push(val);
+  }
+  setClauses.push('row_version = row_version + 1', 'updated_at = ?', 'updated_by = ?');
+  params.push(now, userEmail, itemId, sessionId, rowVersionExpected);
+
+  db.run('BEGIN');
+  try {
+    db.run(
+      `UPDATE bulk_research_items SET ${setClauses.join(', ')}
+       WHERE id = ? AND session_id = ? AND row_version = ?`,
+      params
+    );
+    const changes = db.getRowsModified();
+    if (changes === 0) {
+      db.run('ROLLBACK');
+      const server = queryAll(`SELECT * FROM bulk_research_items WHERE id = ? AND session_id = ?`, [itemId, sessionId]);
+      return { conflict: true, server: server[0] || null };
+    }
+    db.run(`UPDATE bulk_research_sessions SET updated_at = ?, updated_by = ? WHERE id = ?`, [now, userEmail, sessionId]);
+    db.run('COMMIT');
+  } catch (e) {
+    db.run('ROLLBACK');
+    throw e;
+  }
+  saveToFile();
+  const updated = queryAll(`SELECT id, row_version, updated_at FROM bulk_research_items WHERE id = ?`, [itemId]);
+  return { ok: true, ...updated[0] };
+}
+
+/**
+ * SSE 用: セッション内の items を filter 条件で全件取得（ページングなし）
+ * listBulkItems の 500 行クランプを回避するための専用関数。
+ * Codex P1 (3回目): 501 行以降が pending のまま残る問題の修正。
+ */
+export function getAllBulkItems(sessionId, { filter = 'all', ids = null } = {}) {
+  if (Array.isArray(ids) && ids.length > 0) {
+    const placeholders = ids.map(() => '?').join(',');
+    return queryAll(
+      `SELECT * FROM bulk_research_items WHERE session_id = ? AND id IN (${placeholders}) ORDER BY source_row_no ASC`,
+      [sessionId, ...ids]
+    );
+  }
+  let where = '';
+  if (filter === 'pending') where = `AND research_status = 'pending'`;
+  else if (filter === 'ok') where = `AND research_status = 'ok'`;
+  else if (filter === 'error') where = `AND research_status = 'error'`;
+  return queryAll(
+    `SELECT * FROM bulk_research_items WHERE session_id = ? ${where} ORDER BY source_row_no ASC`,
+    [sessionId]
+  );
+}
+
+/**
+ * SSE リサーチ内部から使う特権更新（whitelist 経由せず）
+ * Phase 1A §3.13 参照: SP-API 由来のフィールドだけを書き込む
+ *
+ * opts.skipSave=true のとき、saveToFile() を呼ばない。呼び出し側が N 行ごと・
+ * 最後に 1 回 saveToFile() を呼ぶバッチライト戦略を組む用途。
+ * 仕様: 負荷テスト §9.2、Codex レビュー P2 対応。
+ */
+export function updateBulkItemFromResearch(sessionId, itemId, fields, userEmail, opts = {}) {
+  const now = ISO_NOW();
+  const setClauses = [];
+  const params = [];
+  for (const [col, val] of Object.entries(fields)) {
+    setClauses.push(`${col} = ?`);
+    params.push(val);
+  }
+  setClauses.push('row_version = row_version + 1', 'updated_at = ?', 'updated_by = ?');
+  params.push(now, userEmail, itemId, sessionId);
+
+  db.run('BEGIN');
+  try {
+    db.run(
+      `UPDATE bulk_research_items SET ${setClauses.join(', ')}
+       WHERE id = ? AND session_id = ?`,
+      params
+    );
+    db.run(`UPDATE bulk_research_sessions SET updated_at = ?, updated_by = ? WHERE id = ?`, [now, userEmail, sessionId]);
+    db.run('COMMIT');
+  } catch (e) {
+    db.run('ROLLBACK');
+    throw e;
+  }
+  if (!opts.skipSave) saveToFile();
+}
+
+/** 明示的に現在の in-memory DB をディスクに書き出す（SSE バッチライト用の公開 API） */
+export function persistToDisk() {
+  saveToFile();
+}
+
+/** ブックマーク upsert — 対象セッションが閲覧可能な場合のみ */
+export function upsertBookmark(sessionId, userEmail, { last_item_id = null, view_state_json = null } = {}) {
+  const session = queryAll('SELECT visibility, created_by, deleted_at FROM bulk_research_sessions WHERE id = ?', [sessionId]);
+  if (session.length === 0) throw Object.assign(new Error('not_found'), { statusCode: 404 });
+  if (session[0].deleted_at) throw Object.assign(new Error('not_found'), { statusCode: 404 });
+  if (session[0].visibility === 'private' && session[0].created_by !== userEmail) {
+    throw Object.assign(new Error('not_found'), { statusCode: 404 });
+  }
+  const now = ISO_NOW();
+  db.run(
+    `INSERT INTO user_session_bookmark (user_email, session_id, last_accessed_at, last_item_id, view_state_json)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(user_email, session_id) DO UPDATE SET
+       last_accessed_at = excluded.last_accessed_at,
+       last_item_id = COALESCE(excluded.last_item_id, user_session_bookmark.last_item_id),
+       view_state_json = COALESCE(excluded.view_state_json, user_session_bookmark.view_state_json)`,
+    [userEmail, sessionId, now, last_item_id, view_state_json]
+  );
+  saveToFile();
+}
+
+/** 最近アクセスしたセッション（「続きから」カード用） — visibility チェック込み */
+export function getRecentBookmarks(userEmail, limit = 3) {
+  limit = Math.min(Math.max(1, limit), 10);
+  return queryAll(
+    `SELECT ub.session_id, s.name AS session_name, ub.last_accessed_at, ub.last_item_id, ub.view_state_json,
+      (SELECT COUNT(*) FROM bulk_research_items i WHERE i.session_id = s.id) AS total_count,
+      (SELECT COUNT(*) FROM bulk_research_items i WHERE i.session_id = s.id AND i.research_status IN ('ok','not_found','no_price','error')) AS processed_count
+    FROM user_session_bookmark ub
+    INNER JOIN bulk_research_sessions s ON s.id = ub.session_id
+    WHERE ub.user_email = ?
+      AND s.deleted_at IS NULL
+      AND (s.visibility = 'team' OR s.created_by = ?)
+    ORDER BY ub.last_accessed_at DESC
+    LIMIT ?`,
+    [userEmail, userEmail, limit]
+  );
 }
