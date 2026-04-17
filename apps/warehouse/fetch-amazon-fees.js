@@ -39,8 +39,7 @@ function getClient() {
 }
 
 const MARKETPLACE_ID = process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
-const BATCH_SIZE = 20; // SP-API getMyFeesEstimates の上限
-const DELAY_BETWEEN_BATCHES_MS = 2000; // 429回避用
+const DELAY_BETWEEN_BATCHES_MS = 1000; // 429回避用（1件/秒ペース）
 const MAX_RETRIES = 3;
 
 function sleep(ms) {
@@ -129,43 +128,15 @@ function getSpecificSku(db, sku) {
   return order ? [order] : [];
 }
 
-// ─── SP-API バッチ手数料取得 ───
+// ─── SP-API 手数料取得 ───
 
 /**
- * バッチ単位で手数料を取得（最大20件/リクエスト）
- */
-async function fetchFeesBatch(items) {
-  const sp = getClient();
-
-  const feesEstimateRequests = items.map(item => ({
-    MarketplaceId: MARKETPLACE_ID,
-    IdType: 'SellerSKU',
-    SellerId: process.env.SP_API_SELLER_ID || 'A6HMLHKUUJC27',
-    IdValue: item.seller_sku,
-    IsAmazonFulfilled: item.channel === 'FBA',
-    PriceToEstimateFees: {
-      ListingPrice: {
-        CurrencyCode: 'JPY',
-        Amount: item.last_price || 1000, // 価格不明時はフォールバック
-      },
-      Shipping: { CurrencyCode: 'JPY', Amount: 0 },
-    },
-    Identifier: `${item.channel}-${item.seller_sku}`,
-  }));
-
-  const result = await sp.callAPI({
-    operation: 'getMyFeesEstimates',
-    endpoint: 'productFees',
-    body: feesEstimateRequests,
-  });
-
-  return result;
-}
-
-/**
- * 単一SKUのフォールバック取得（ASIN指定）
+ * 単一ASIN指定で手数料取得（実績あるgetMyFeesEstimateForASINを使用）
+ * profit-calculator/sp-api.js の getFees() と同じAPI
  */
 async function fetchFeesSingle(item) {
+  if (!item.asin) return null;
+
   const sp = getClient();
 
   const result = await sp.callAPI({
@@ -180,7 +151,7 @@ async function fetchFeesSingle(item) {
           ListingPrice: { CurrencyCode: 'JPY', Amount: item.last_price || 1000 },
           Shipping: { CurrencyCode: 'JPY', Amount: 0 },
         },
-        Identifier: `${item.channel}-${item.asin}`,
+        Identifier: `${item.channel}-${item.asin}-${Date.now()}`,
       },
     },
   });
@@ -189,15 +160,14 @@ async function fetchFeesSingle(item) {
   if (r.Status !== 'Success') return null;
 
   const feeList = r.FeesEstimate.FeeDetailList;
+  const referralFee = feeList.find(f => f.FeeType === 'ReferralFee')?.FeeAmount?.Amount || 0;
   return {
-    referralFee: feeList.find(f => f.FeeType === 'ReferralFee')?.FeeAmount?.Amount || 0,
+    referralFee,
     fbaFee: feeList.find(f => f.FeeType === 'FBAFees')?.FeeAmount?.Amount || 0,
     variableClosingFee: feeList.find(f => f.FeeType === 'VariableClosingFee')?.FeeAmount?.Amount || 0,
     perItemFee: feeList.find(f => f.FeeType === 'PerItemFee')?.FeeAmount?.Amount || 0,
     totalFee: r.FeesEstimate.TotalFeesEstimate.Amount,
-    referralFeeRate: feeList.find(f => f.FeeType === 'ReferralFee')?.FeePromotion?.Amount
-      ? undefined
-      : (feeList.find(f => f.FeeType === 'ReferralFee')?.FeeAmount?.Amount || 0) / (item.last_price || 1),
+    referralFeeRate: item.last_price > 0 ? referralFee / item.last_price : null,
   };
 }
 
@@ -247,114 +217,74 @@ export async function fetchAmazonFees(mode = 'recent', param = 30) {
       throw new Error(`Unknown mode: ${mode}`);
   }
 
-  console.log(`[FetchFees] モード: ${mode}, 対象SKU: ${targetSkus.length}件`);
+  // ASINがないSKUを除外
+  const withAsin = targetSkus.filter(s => s.asin);
+  const noAsin = targetSkus.filter(s => !s.asin);
 
-  if (targetSkus.length === 0) {
-    console.log('[FetchFees] 対象SKUなし。終了。');
-    return { total: 0, success: 0, failed: 0, errors: [] };
+  console.log(`[FetchFees] モード: ${mode}, 対象SKU: ${targetSkus.length}件 (ASIN有: ${withAsin.length}, ASIN無: ${noAsin.length})`);
+
+  if (withAsin.length === 0) {
+    console.log('[FetchFees] ASIN付きSKUなし。終了。');
+    return { total: targetSkus.length, success: 0, failed: noAsin.length, errors: noAsin.map(s => ({ sku: s.seller_sku, error: 'No ASIN' })) };
   }
 
-  // バッチに分割
-  const batches = [];
-  for (let i = 0; i < targetSkus.length; i += BATCH_SIZE) {
-    batches.push(targetSkus.slice(i, i + BATCH_SIZE));
-  }
-
-  console.log(`[FetchFees] ${batches.length}バッチ（各${BATCH_SIZE}件）で取得開始`);
+  // 1件ずつ取得（getMyFeesEstimateForASIN — 実績あり）
+  const estimatedMin = Math.ceil(withAsin.length * DELAY_BETWEEN_BATCHES_MS / 60000);
+  console.log(`[FetchFees] ${withAsin.length}件を1件ずつ取得開始（推定${estimatedMin}分）`);
 
   let totalSuccess = 0;
-  let totalFailed = 0;
-  const errors = [];
+  let totalFailed = noAsin.length;
+  const errors = noAsin.map(s => ({ sku: s.seller_sku, error: 'No ASIN' }));
+  const saveBuffer = [];
 
-  for (let batchIdx = 0; batchIdx < batches.length; batchIdx++) {
-    const batch = batches[batchIdx];
-    const progress = `[${batchIdx + 1}/${batches.length}]`;
+  for (let i = 0; i < withAsin.length; i++) {
+    const item = withAsin[i];
+    const progress = `[${i + 1}/${withAsin.length}]`;
 
     for (let retry = 0; retry < MAX_RETRIES; retry++) {
       try {
-        const results = await fetchFeesBatch(batch);
-
-        // レスポンス解析
-        const saveRows = [];
-        for (let i = 0; i < results.length; i++) {
-          const est = results[i];
-          const item = batch[i];
-
-          if (est.Status === 'Success' && est.FeesEstimateResult?.FeesEstimate) {
-            const feeList = est.FeesEstimateResult.FeesEstimate.FeeDetailList || [];
-            const referralFee = feeList.find(f => f.FeeType === 'ReferralFee')?.FeeAmount?.Amount || 0;
-            saveRows.push({
-              seller_sku: item.seller_sku,
-              asin: item.asin,
-              channel: item.channel,
-              referralFee,
-              referralFeeRate: item.last_price > 0 ? referralFee / item.last_price : null,
-              fbaFee: feeList.find(f => f.FeeType === 'FBAFees')?.FeeAmount?.Amount || 0,
-              variableClosingFee: feeList.find(f => f.FeeType === 'VariableClosingFee')?.FeeAmount?.Amount || 0,
-              perItemFee: feeList.find(f => f.FeeType === 'PerItemFee')?.FeeAmount?.Amount || 0,
-              totalFee: est.FeesEstimateResult.FeesEstimate.TotalFeesEstimate?.Amount || 0,
-              price_used: item.last_price,
-            });
-          } else {
-            // バッチ失敗時はASIN指定で個別リトライ
-            if (item.asin) {
-              try {
-                const single = await fetchFeesSingle(item);
-                if (single) {
-                  saveRows.push({
-                    seller_sku: item.seller_sku,
-                    asin: item.asin,
-                    channel: item.channel,
-                    ...single,
-                    referralFeeRate: single.referralFeeRate ?? (item.last_price > 0 ? single.referralFee / item.last_price : null),
-                    price_used: item.last_price,
-                  });
-                } else {
-                  totalFailed++;
-                  errors.push({ sku: item.seller_sku, error: 'Single fetch returned null' });
-                }
-              } catch (e) {
-                totalFailed++;
-                errors.push({ sku: item.seller_sku, error: e.message });
-              }
-            } else {
-              totalFailed++;
-              const errMsg = est.FeesEstimateResult?.Error?.Message || 'Unknown error';
-              errors.push({ sku: item.seller_sku, error: errMsg });
-            }
-          }
+        const fees = await fetchFeesSingle(item);
+        if (fees) {
+          saveBuffer.push({
+            seller_sku: item.seller_sku,
+            asin: item.asin,
+            channel: item.channel,
+            ...fees,
+            price_used: item.last_price,
+          });
+          totalSuccess++;
+        } else {
+          totalFailed++;
+          errors.push({ sku: item.seller_sku, error: 'API returned non-Success' });
         }
-
-        if (saveRows.length > 0) {
-          saveFees(db, saveRows);
-          totalSuccess += saveRows.length;
-        }
-
-        console.log(`${progress} ${saveRows.length}件保存 (失敗: ${batch.length - saveRows.length}件)`);
-        break; // 成功したらリトライ不要
-
+        break; // 成功
       } catch (e) {
         if (e.statusCode === 429 || e.code === 'QuotaExceeded') {
           const waitMs = DELAY_BETWEEN_BATCHES_MS * (retry + 2);
-          console.log(`${progress} 429 Rate Limited → ${waitMs}ms 待機後リトライ (${retry + 1}/${MAX_RETRIES})`);
+          console.log(`${progress} 429 Rate Limited → ${waitMs}ms 待機 (${retry + 1}/${MAX_RETRIES})`);
           await sleep(waitMs);
           continue;
         }
         if (retry < MAX_RETRIES - 1) {
-          console.log(`${progress} エラー: ${e.message} → リトライ (${retry + 1}/${MAX_RETRIES})`);
           await sleep(DELAY_BETWEEN_BATCHES_MS);
           continue;
         }
-        console.error(`${progress} 最終失敗:`, e.message);
-        totalFailed += batch.length;
-        for (const item of batch) {
-          errors.push({ sku: item.seller_sku, error: e.message });
-        }
+        totalFailed++;
+        errors.push({ sku: item.seller_sku, error: e.message });
       }
     }
 
-    // バッチ間のウェイト
-    if (batchIdx < batches.length - 1) {
+    // 50件ごとにDB保存 + 進捗表示
+    if (saveBuffer.length >= 50 || i === withAsin.length - 1) {
+      if (saveBuffer.length > 0) {
+        saveFees(db, saveBuffer);
+        console.log(`${progress} ${totalSuccess}件成功 / ${totalFailed}件失敗（バッファ${saveBuffer.length}件保存）`);
+        saveBuffer.length = 0;
+      }
+    }
+
+    // API間隔（429回避）
+    if (i < withAsin.length - 1) {
       await sleep(DELAY_BETWEEN_BATCHES_MS);
     }
   }
