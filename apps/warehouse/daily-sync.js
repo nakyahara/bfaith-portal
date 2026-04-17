@@ -93,6 +93,10 @@ async function main() {
   const fSalesResult = runScript('apps/warehouse/rebuild-f-sales.js', 'f_sales 再構築');
   results.push({ name: 'f_sales', ...fSalesResult });
 
+  // 楽天 AM/AL/W → NE商品コード sku_map 再構築
+  const rakutenSkuMapResult = runScript('apps/warehouse/rebuild-rakuten-sku-map.js', '楽天 sku_map 再構築');
+  results.push({ name: '楽天sku_map', ...rakutenSkuMapResult });
+
   // Renderにミラーデータ送信
   const syncResult = runScript('apps/warehouse/sync-to-render.js', 'Render同期');
   results.push({ name: 'Render同期', ...syncResult });
