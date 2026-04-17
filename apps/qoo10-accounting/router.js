@@ -1,14 +1,13 @@
 /**
- * auペイマーケット売上集計ツール
+ * Qoo10売上集計ツール
  *
- * auペイマーケットの「会計用注文データDL項目」CSVをアップロードし、
+ * Qoo10 QSMのセリングレポートCSVをアップロードし、
  * mirror_products を使って税率別・セグメント別の売上集計を自動計算する。
- * 口座振替通知書PDF（任意）からPF手数料を自動読み取り。
  *
- * 工程1: 注文データCSVアップロード（Shift_JIS、複数対応）
+ * 工程1: セリングレポートCSVアップロード（Shift_JIS、複数対応）
  * 工程2: 未登録商品の税率・セグメント登録
  * 工程3: 税率別・セグメント別集計
- * 工程4: PF手数料入力（PDF or 手入力）
+ * 工程4: PF手数料入力（QSM領収書の D.合計 を手入力）
  * 工程5: 確定
  */
 import { Router } from 'express';
@@ -53,7 +52,6 @@ function parseShiftJisCsv(buf) {
 
 function resolveProducts(rows, db) {
   const productsMap = new Map();
-  // 代表商品コードで引けるマップ（複数商品が同じ代表コードを持つ場合は最初の1件）
   const repCodeMap = new Map();
   for (const p of db.prepare('SELECT * FROM mirror_products').all()) {
     productsMap.set((p.商品コード || '').toLowerCase(), p);
@@ -67,31 +65,23 @@ function resolveProducts(rows, db) {
   const unresolved = new Map();
   const unresolvedTax = new Map();
   const unresolvedSegment = new Map();
-  const resolvedByRepCode = new Map(); // 代表商品コードで紐付けた商品リスト
+  const resolvedByRepCode = new Map();
 
   for (const row of rows) {
     const itemCode = (row.商品コード || '').toLowerCase();
-    const mgmtId = (row.管理コード || '').toLowerCase();
 
     if (!itemCode) {
       resolved.push({ ...row, 原価: 0, 税率: null, 売上分類: null, 解決方法: 'no_code' });
       continue;
     }
 
-    // Stage 1: F列ありの場合 itemCode+mgmtId で検索
+    // Stage 1: 販売者コードで直接検索
     let product = null;
     let resolveMethod = null;
-    if (mgmtId) {
-      const combinedCode = itemCode + mgmtId;
-      product = productsMap.get(combinedCode);
-      if (product) resolveMethod = 'combined';
-    }
-    // Stage 2: itemCode のみで検索
-    if (!product) {
-      product = productsMap.get(itemCode);
-      if (product) resolveMethod = 'direct';
-    }
-    // Stage 3: itemCode を代表商品コードとして検索
+    product = productsMap.get(itemCode);
+    if (product) resolveMethod = 'direct';
+
+    // Stage 2: 代表商品コードとして検索
     if (!product) {
       product = repCodeMap.get(itemCode);
       if (product) resolveMethod = 'rep_code';
@@ -108,11 +98,10 @@ function resolveProducts(rows, db) {
         解決方法: resolveMethod,
       });
 
-      // 代表商品コードで紐付けた場合、リストに記録
       if (resolveMethod === 'rep_code') {
         const key = itemCode;
         const existing = resolvedByRepCode.get(key) || {
-          auPayCode: row.商品コード || '', matchedCode: product.商品コード,
+          qoo10Code: row.商品コード || '', matchedCode: product.商品コード,
           matchedName: product.商品名 || '', name: row.商品名 || '',
           count: 0, amount: 0,
         };
@@ -149,14 +138,13 @@ function resolveProducts(rows, db) {
         原価: 0, 税率: null, 売上分類: null,
         解決方法: 'unresolved',
       });
-      const unresolvedKey = mgmtId ? itemCode + mgmtId : itemCode;
-      const existing = unresolved.get(unresolvedKey) || {
-        code: unresolvedKey, name: row.商品名 || '',
+      const existing = unresolved.get(itemCode) || {
+        code: row.商品コード || '', name: row.商品名 || '',
         csvTaxRate: row.CSV税率 || null, count: 0, amount: 0,
       };
       existing.count++;
       existing.amount += row.売上合計 || 0;
-      unresolved.set(unresolvedKey, existing);
+      unresolved.set(itemCode, existing);
     }
   }
 
@@ -189,7 +177,7 @@ function resolveProducts(rows, db) {
 
 function aggregate(resolvedRows) {
   function emptyRow() {
-    return { 売上合計: 0, クーポン値引額: 0, クーポン値引後売上: 0, 原価合計: 0, 行数: 0 };
+    return { 売上合計: 0, 原価合計: 0, 行数: 0 };
   }
 
   const byTax = { '10': emptyRow(), '8': emptyRow() };
@@ -200,17 +188,14 @@ function aggregate(resolvedRows) {
   for (const row of resolvedRows) {
     if (row.解決方法 === 'no_code') continue;
 
+    // O列 = 商品単価金額 = 既に値引き後の純売上
     const sale = row.売上合計 || 0;
-    const coupon = row.クーポン値引額 || 0;
-    const afterCoupon = sale - coupon;
     const genka = (row.原価 || 0) * (row.個数 || 1);
 
     // 税率別: マスター税率 > CSV税率 > 10%仮扱い
     const taxRate = row.税率 || row.CSV税率 || 10;
     const taxKey = taxRate === 8 ? '8' : '10';
     byTax[taxKey].売上合計 += sale;
-    byTax[taxKey].クーポン値引額 += coupon;
-    byTax[taxKey].クーポン値引後売上 += afterCoupon;
     byTax[taxKey].原価合計 += genka;
     byTax[taxKey].行数++;
 
@@ -219,15 +204,11 @@ function aggregate(resolvedRows) {
 
     if (excluded[segKey]) {
       excluded[segKey].売上合計 += sale;
-      excluded[segKey].クーポン値引額 += coupon;
-      excluded[segKey].クーポン値引後売上 += afterCoupon;
       excluded[segKey].原価合計 += genka;
       excluded[segKey].行数++;
     } else {
       const target = bySegment[segKey] || bySegment['other'];
       target.売上合計 += sale;
-      target.クーポン値引額 += coupon;
-      target.クーポン値引後売上 += afterCoupon;
       target.原価合計 += genka;
       target.行数++;
     }
@@ -245,19 +226,19 @@ function aggregate(resolvedRows) {
     }
   }
 
-  // MF連携用: CSVの金額は税込みなのでそのまま使う
+  // MF連携用: 税込み集計
   const t10 = byTax['10'];
   const t8 = byTax['8'];
   const mfRow = {
-    '商品売上(10%)': Math.round(t10.クーポン値引後売上),
-    '商品売上(8%)': Math.round(t8.クーポン値引後売上),
+    '商品売上(10%)': Math.round(t10.売上合計 * 1.1),
+    '商品売上(8%)': Math.round(t8.売上合計 * 1.08),
   };
   mfRow['合計'] = mfRow['商品売上(10%)'] + mfRow['商品売上(8%)'];
 
-  // 原価率計算
+  // 原価率計算（売上ベース）
   for (const seg of [...Object.values(bySegment), ...Object.values(excluded)]) {
-    if (seg.クーポン値引後売上 > 0) {
-      seg.原価率 = (seg.原価合計 / seg.クーポン値引後売上 * 100).toFixed(1);
+    if (seg.売上合計 > 0) {
+      seg.原価率 = (seg.原価合計 / seg.売上合計 * 100).toFixed(1);
     } else {
       seg.原価率 = '0.0';
     }
@@ -276,7 +257,7 @@ router.get('/', (req, res) => {
   res.send(renderPage());
 });
 
-// ─── POST /upload — 注文データCSVアップロード＆集計 ───
+// ─── POST /upload — セリングレポートCSVアップロード＆集計 ───
 
 router.post('/upload', upload.array('files', 10), (req, res) => {
   if (!req.files || req.files.length === 0) return res.status(400).json({ error: 'ファイルが必要です' });
@@ -300,77 +281,64 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
       const csvRows = parseShiftJisCsv(buf);
       if (csvRows.length < 2) continue;
 
-      // ヘッダー確認（先頭列=controlType）
       const header = csvRows[0];
-      if (header[0] !== 'controlType') {
-        return res.status(400).json({ error: file.originalname + ' はauペイマーケット形式ではありません（先頭列: ' + header[0] + '）' });
+      // ヘッダー検証: Qoo10セリングレポートの先頭列を確認
+      if (!header[0].includes('決済') && !header[0].includes('購入')) {
+        return res.status(400).json({ error: file.originalname + ' はQoo10セリングレポート形式ではありません（先頭列: ' + header[0] + '）' });
       }
 
       const num = v => { const n = parseFloat((v || '').replace(/,/g, '')); return isNaN(n) ? 0 : n; };
-
-      // ヘッダーからインデックスを構築
-      const colIdx = {};
-      header.forEach((h, i) => { colIdx[h] = i; });
 
       for (let i = 1; i < csvRows.length; i++) {
         const cols = csvRows[i];
         if (cols.length < 20) continue;
 
-        const col = name => cols[colIdx[name]] || '';
+        // キャンセル・返品・払い戻しは除外
+        const reason = (cols[1] || '').trim();
+        if (reason.includes('キャンセル') || reason.includes('返品') || reason.includes('戻し')) continue;
 
-        const orderId = col('orderId');
-        if (!orderId) continue;
+        const settlementNo = (cols[2] || '').trim();
+        if (!settlementNo) continue;
 
-        // キャンセル行を除外
-        const cancelStatus = col('cancelStatus');
-        if (cancelStatus === 'C') continue;
+        const sellerCode = (cols[23] || '').trim();   // 販売者コード → 商品コード照合キー
+        const title = (cols[7] || '').trim();          // 商品名
+        const quantity = parseInt(cols[8]) || 1;       // 数量
+        const salesAmount = num(cols[14]);              // 商品単価金額（税抜・割引適用済み）= GAS O列
+        const settlementDate = (cols[5] || '').trim();  // 決済完了日
+        const paymentDate = (cols[0] || '').trim();     // 購入者の決済日
 
-        const itemCode = col('itemCode');
-        const itemManagementId = col('itemManagementId');
-        const quantity = parseInt(col('unit')) || 0;
-        const unitPrice = num(col('itemPrice'));
-        const totalItemPrice = num(col('totalItemPrice')) || unitPrice * quantity;
-        const taxRate = parseFloat(col('taxRate')) || 0;
-        const csvTaxRate = taxRate === 0.08 ? 8 : 10;
-        const title = col('itemName');
-        const shipDate = col('shipDate');
-
-        // クーポン: couponType D/M = モール負担（店舗負担0）、U = 店舗負担
-        const couponTotal = num(col('couponTotalPrice'));
-        const totalPrice = num(col('totalPrice'));
-        const couponType = col('couponType');
-        // 店舗負担クーポン: couponType=Uの場合、注文合計に対する明細の按分
-        let shopCoupon = 0;
-        if (couponType === 'U' && totalPrice > 0) {
-          shopCoupon = couponTotal * (unitPrice * quantity) / totalPrice;
-        }
+        // CSV内の税率（"10%" → 10）
+        const taxStr = (cols[30] || '').replace('%', '').trim();
+        const csvTaxRate = parseInt(taxStr) || 10;
 
         allRows.push({
-          注文番号: orderId,
-          商品コード: itemCode,
-          管理コード: itemManagementId,
+          注文番号: settlementNo,
+          商品コード: sellerCode,
           商品名: title,
-          単価: unitPrice,
+          単価: salesAmount,
           個数: quantity,
-          売上合計: totalItemPrice,
-          クーポン値引額: shopCoupon,
-          発送日: shipDate,
+          売上合計: salesAmount,
+          決済完了日: settlementDate,
+          購入日: paymentDate,
           CSV税率: csvTaxRate,
         });
       }
     }
 
     if (allRows.length === 0) {
-      return res.status(400).json({ error: 'CSVからデータを読み取れませんでした' });
+      return res.status(400).json({ error: 'CSVからデータを読み取れませんでした（全行がキャンセル/返品 または 列数不足）' });
     }
 
-    // 対象年月を推定（発送日から）
+    // 対象年月を推定（決済完了日から）
     let yearMonth = '';
     for (const row of allRows) {
-      if (row.発送日) {
-        const d = row.発送日.replace(/\//g, '-');
-        yearMonth = d.slice(0, 7);
-        break;
+      const d = row.決済完了日 || row.購入日;
+      if (d) {
+        const m = d.match(/(\d{4})[\/\-](\d{1,2})/);
+        if (m) {
+          yearMonth = m[1] + '-' + String(parseInt(m[2])).padStart(2, '0');
+          break;
+        }
       }
     }
 
@@ -379,6 +347,28 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
 
     // 集計
     const agg = aggregate(resolved);
+
+    // 詳細CSV出力用の行データ
+    const detailRows = resolved.map(r => {
+      const effectiveTax = r.税率 || r.CSV税率 || 10;
+      const genka = (r.原価 || 0) * (r.個数 || 1);
+      return {
+        注文番号: r.注文番号 || '',
+        商品コード: r.商品コード || '',
+        商品コード_resolved: r.商品コード_resolved || '',
+        商品名: r.商品名 || '',
+        個数: r.個数 || 0,
+        売上合計: r.売上合計 || 0,
+        原価単価: r.原価 || 0,
+        原価合計: genka,
+        税率: effectiveTax,
+        CSV税率: r.CSV税率 || '',
+        売上分類: r.売上分類 == null ? '' : r.売上分類,
+        解決方法: r.解決方法 || '',
+        決済完了日: r.決済完了日 || '',
+        購入日: r.購入日 || '',
+      };
+    });
 
     res.json({
       yearMonth,
@@ -393,89 +383,16 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
       excludedNames: EXCLUDED_SEGMENTS,
       zeroGenka,
       resolvedByRepCode,
-      resolvedRows: resolved,
       byTax: agg.byTax,
       bySegment: agg.bySegment,
       excluded: agg.excluded,
       otherDetails: agg.otherDetails,
       mfRow: agg.mfRow,
+      detailRows,
     });
   } catch (e) {
-    console.error('[AuPayAccounting] エラー:', e.message, e.stack);
+    console.error('[Qoo10Accounting] エラー:', e.message, e.stack);
     res.status(500).json({ error: '集計処理エラー: ' + e.message });
-  }
-});
-
-// ─── POST /upload-pdf — 口座振替通知書PDFアップロード ───
-
-router.post('/upload-pdf', upload.single('file'), async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'PDFファイルが必要です' });
-
-  try {
-    const buf = fs.readFileSync(req.file.path);
-    fs.unlinkSync(req.file.path);
-
-    // pdf-parseでテキスト抽出
-    let pdfParse;
-    try {
-      const mod = await import('pdf-parse');
-      pdfParse = mod.default || mod;
-    } catch {
-      return res.status(500).json({ error: 'pdf-parseモジュールが見つかりません' });
-    }
-
-    const pdfData = await pdfParse(buf);
-    const text = pdfData.text || '';
-
-    // ご請求額(A+B) の金額を抽出
-    // PDF text pattern: "ご請求額（A+B）" followed by amount like ￥146,054 or 146,054
-    let totalFee = null;
-    let adCost = null;
-
-    // パターン1: "ご請求額" 付近の数値
-    const feeMatch = text.match(/ご請求額[^0-9￥]*[￥]?\s*([\d,]+)/);
-    if (feeMatch) {
-      totalFee = parseInt(feeMatch[1].replace(/,/g, ''));
-    }
-
-    // パターン2: 広告掲載料
-    const adMatch = text.match(/広告掲載料[^0-9￥]*[￥]?\s*([\d,]+)/);
-    if (adMatch) {
-      adCost = parseInt(adMatch[1].replace(/,/g, ''));
-    }
-
-    // 年月を抽出（"2026 4" or "2026年4月"パターン）
-    let pdfYearMonth = '';
-    const ymMatch = text.match(/(\d{4})\s+(\d{1,2})\s+ご請求額/);
-    if (ymMatch) {
-      pdfYearMonth = ymMatch[1] + '-' + String(parseInt(ymMatch[2])).padStart(2, '0');
-    }
-
-    // 内訳を抽出
-    const breakdown = {};
-    const items = [
-      { key: '出店料', pattern: /出店料[^0-9￥]*[￥]?\s*([\d,]+)/ },
-      { key: '成約手数料等', pattern: /成約手数料等[^0-9￥]*[￥]?\s*([\d,]+)/ },
-      { key: 'ポイント付与原資', pattern: /ポイント付与原資[^0-9￥]*[￥]?\s*([\d,]+)/ },
-      { key: 'オプション料', pattern: /オプション料[^0-9￥]*[￥]?\s*([\d,]+)/ },
-    ];
-    for (const item of items) {
-      const m = text.match(item.pattern);
-      if (m) breakdown[item.key] = parseInt(m[1].replace(/,/g, ''));
-    }
-
-    res.json({
-      ok: true,
-      totalFee,
-      adCost: adCost || 0,
-      pfFee: totalFee != null ? totalFee - (adCost || 0) : null,
-      pdfYearMonth,
-      breakdown,
-      rawTextPreview: text.slice(0, 500),
-    });
-  } catch (e) {
-    console.error('[AuPayAccounting] PDF解析エラー:', e.message, e.stack);
-    res.status(500).json({ error: 'PDF解析エラー: ' + e.message });
   }
 });
 
@@ -517,7 +434,7 @@ router.post('/confirm', (req, res) => {
 
   try {
     const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
-    db.prepare(`INSERT OR REPLACE INTO mart_aupay_monthly_summary
+    db.prepare(`INSERT OR REPLACE INTO mart_qoo10_monthly_summary
       (year_month, total_rows, resolved_count, unresolved_count,
        by_tax, by_segment, excluded, mf_row, pf_fee, ad_cost, confirmed_at)
       VALUES (?,?,?,?,?,?,?,?,?,?,?)
@@ -527,7 +444,7 @@ router.post('/confirm', (req, res) => {
       JSON.stringify(mfRow), pfFee || 0, adCost || 0, now
     );
 
-    db.prepare(`INSERT INTO mart_aupay_upload_log
+    db.prepare(`INSERT INTO mart_qoo10_upload_log
       (year_month, total_rows, resolved_count, unresolved_count, uploaded_at)
       VALUES (?,?,?,?,?)
     `).run(yearMonth, totalRows || 0, resolvedCount || 0, unresolvedCount || 0, now);
@@ -543,7 +460,7 @@ router.post('/confirm', (req, res) => {
 router.get('/history', (req, res) => {
   const db = getMirrorDB();
   try {
-    const rows = db.prepare('SELECT * FROM mart_aupay_monthly_summary ORDER BY year_month DESC').all();
+    const rows = db.prepare('SELECT * FROM mart_qoo10_monthly_summary ORDER BY year_month DESC').all();
     const parsed = rows.map(r => ({
       ...r,
       by_tax: JSON.parse(r.by_tax || '{}'),
@@ -557,39 +474,57 @@ router.get('/history', (req, res) => {
   }
 });
 
-// ─── POST /import-history — ヒストリカルデータ一括投入 ───
+// ─── GET /history/:yearMonth ───
 
-router.post('/import-history', (req, res) => {
-  const key = req.headers['x-import-key'] || req.query.key;
-  if (key !== 'bfaith-import-2026') return res.status(401).json({ error: 'Invalid key' });
-
+router.get('/history/:yearMonth', (req, res) => {
   const db = getMirrorDB();
-  const { months } = req.body;
-  if (!Array.isArray(months)) return res.status(400).json({ error: 'months 配列が必要です' });
-
   try {
-    const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
-    const stmt = db.prepare(`INSERT OR IGNORE INTO mart_aupay_monthly_summary
-      (year_month, total_rows, resolved_count, unresolved_count,
-       by_tax, by_segment, excluded, mf_row, pf_fee, ad_cost, confirmed_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
-
-    let inserted = 0;
-    const tx = db.transaction(() => {
-      for (const m of months) {
-        const r = stmt.run(
-          m.yearMonth, 0, 0, 0,
-          '{}', JSON.stringify(m.bySegment || {}), '{}', '{}',
-          m.pfFee || 0, m.adCost || 0, now
-        );
-        if (r.changes > 0) inserted++;
-      }
+    const row = db.prepare('SELECT * FROM mart_qoo10_monthly_summary WHERE year_month = ?').get(req.params.yearMonth);
+    if (!row) return res.status(404).json({ error: 'データが見つかりません' });
+    res.json({
+      ...row,
+      by_tax: JSON.parse(row.by_tax || '{}'),
+      by_segment: JSON.parse(row.by_segment || '{}'),
+      excluded: JSON.parse(row.excluded || '{}'),
+      mf_row: JSON.parse(row.mf_row || '{}'),
     });
-    tx();
-    res.json({ ok: true, inserted, total: months.length });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ─── POST /import-history — 過去データ一括投入 ───
+
+router.post('/import-history', (req, res) => {
+  const importKey = req.headers['x-import-key'];
+  if (importKey !== 'bfaith-import-2026') {
+    return res.status(403).json({ error: '認証エラー' });
+  }
+
+  const db = getMirrorDB();
+  const rows = req.body;
+  if (!Array.isArray(rows)) return res.status(400).json({ error: 'JSON配列が必要です' });
+
+  let inserted = 0;
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+
+  for (const row of rows) {
+    try {
+      db.prepare(`INSERT OR REPLACE INTO mart_qoo10_monthly_summary
+        (year_month, total_rows, resolved_count, unresolved_count,
+         by_tax, by_segment, excluded, mf_row, pf_fee, ad_cost, confirmed_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+      `).run(
+        row.year_month, row.total_rows || 0, row.resolved_count || 0, row.unresolved_count || 0,
+        JSON.stringify(row.by_tax || {}), JSON.stringify(row.by_segment || {}),
+        JSON.stringify(row.excluded || {}), JSON.stringify(row.mf_row || {}),
+        row.pf_fee || 0, row.ad_cost || 0, row.confirmed_at || now
+      );
+      inserted++;
+    } catch {}
+  }
+
+  res.json({ ok: true, inserted, total: rows.length });
 });
 
 // ─── HTML ───
@@ -600,18 +535,18 @@ function renderPage() {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>auペイマーケット売上集計 - B-Faith</title>
+  <title>Qoo10売上集計 - B-Faith</title>
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
     body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f5f5;color:#333;font-size:14px}
-    .header{background:#e85514;color:white;padding:12px 24px;display:flex;align-items:center;gap:16px}
+    .header{background:#e5004f;color:white;padding:12px 24px;display:flex;align-items:center;gap:16px}
     .header h1{font-size:18px}
-    .header a{color:#ffd4c2;text-decoration:none;font-size:13px}
+    .header a{color:#ffd4e0;text-decoration:none;font-size:13px}
     .wrap{max-width:1800px;margin:16px auto;padding:0 16px}
     .card{background:white;border-radius:8px;padding:20px;margin-bottom:12px;box-shadow:0 1px 3px rgba(0,0,0,.1);overflow-x:auto}
     .card h2{font-size:15px;color:#555;margin-bottom:10px}
     .btn{padding:8px 20px;border:none;border-radius:4px;cursor:pointer;font-size:14px}
-    .btn-p{background:#e85514;color:white}.btn-p:hover{background:#c74410}
+    .btn-p{background:#e5004f;color:white}.btn-p:hover{background:#c70044}
     .btn-s{background:#27ae60;color:white}.btn-s:hover{background:#1e8449}
     .btn-w{background:#e67e22;color:white}.btn-w:hover{background:#d35400}
     .btn:disabled{opacity:.5;cursor:default}
@@ -630,7 +565,7 @@ function renderPage() {
     .negative{color:#e74c3c}
     .tab-bar{display:flex;gap:4px;margin-bottom:12px;border-bottom:2px solid #ddd;padding-bottom:0}
     .tab-btn{padding:8px 16px;border:none;background:#eee;cursor:pointer;border-radius:4px 4px 0 0;font-size:13px}
-    .tab-btn.active{background:#e85514;color:white}
+    .tab-btn.active{background:#e5004f;color:white}
     .tab-content{display:none}.tab-content.active{display:block}
     .acc-header{cursor:pointer;padding:10px 12px;background:#f8f9fa;border:1px solid #dee2e6;border-radius:4px;margin-bottom:2px;display:flex;justify-content:space-between;align-items:center;font-size:13px}
     .acc-header:hover{background:#e9ecef}
@@ -646,15 +581,15 @@ function renderPage() {
 </head>
 <body>
   <div class="header">
-    <h1>auペイマーケット売上集計</h1>
+    <h1>Qoo10売上集計</h1>
     <a href="/">\\u2190 \\u30dd\\u30fc\\u30bf\\u30eb\\u306b\\u623b\\u308b</a>
   </div>
   <div class="wrap">
-    <!-- 工程1: 注文データCSV -->
+    <!-- 工程1: セリングレポートCSV -->
     <div class="card">
-      <h2>工程1: 注文データCSVアップロード</h2>
-      <p class="meta">auペイマーケット管理画面 → 受注管理 → CSVダウンロード（発送日・完了・会計用注文データDL項目）</p>
-      <p class="meta" style="color:#e85514;font-weight:bold">複数ファイル選択可（最大10ファイル）</p>
+      <h2>工程1: セリングレポートCSVアップロード</h2>
+      <p class="meta">QSM（Qoo10 Sales Manager）→ 精算管理 → セリングレポート → CSVダウンロード</p>
+      <p class="meta" style="color:#e5004f;font-weight:bold">複数ファイル選択可（最大10ファイル）</p>
       <div style="margin-top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <input type="file" id="csvFiles" accept=".csv" multiple>
         <button class="btn btn-p" id="uploadBtn" onclick="doUpload()">アップロード＆集計</button>
@@ -682,7 +617,7 @@ function renderPage() {
 
       <!-- 税率別集計 -->
       <div class="card">
-        <h2>税率別売上集計（税込）</h2>
+        <h2>税率別売上集計（税抜）</h2>
         <div id="taxTable"></div>
       </div>
 
@@ -695,19 +630,14 @@ function renderPage() {
       <!-- PF手数料 -->
       <div class="card">
         <h2>工程2: PF手数料・広告費</h2>
-        <p class="meta">口座振替通知書PDFをアップロードすると自動入力されます。手入力も可。</p>
-        <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-          <input type="file" id="pdfFile" accept=".pdf">
-          <button class="btn btn-w" id="pdfBtn" onclick="doPdfUpload()">PDF読み取り</button>
-        </div>
-        <div id="pdfResult" style="margin-top:8px"></div>
+        <p class="meta">QSM → 精算管理 → サービス手数料の領収書 → 「D. 合計（10%対象）」の金額を入力</p>
         <div style="margin-top:12px;display:flex;gap:16px;align-items:center;flex-wrap:wrap">
           <label>PF手数料（税込）: <input type="text" id="pfFeeInput" class="pf-input" value="0"></label>
           <label>広告費（税込）: <input type="text" id="adCostInput" class="pf-input" value="0"></label>
           <button class="btn btn-p" onclick="applyPfFee()">反映</button>
         </div>
+        <p class="meta" style="margin-top:4px">※ PF手数料 = D.合計 - 外部広告手数料。外部広告手数料がある場合は広告費に入力してください。</p>
         <div id="costSummary" style="margin-top:8px"></div>
-        <div id="costBySegment" style="margin-top:12px"></div>
       </div>
 
       <!-- セグメント別集計 -->
@@ -715,6 +645,7 @@ function renderPage() {
         <h2>セグメント別集計（管理会計用）</h2>
         <div id="segmentTable"></div>
         <div id="excludedInfo"></div>
+        <div id="costBySegment" style="margin-top:12px"></div>
       </div>
 
       <!-- CSVダウンロード -->
@@ -722,14 +653,15 @@ function renderPage() {
         <h2>CSVダウンロード</h2>
         <div style="display:flex;gap:12px;flex-wrap:wrap">
           <button class="btn btn-s" onclick="downloadSummaryCsv()">集計サマリーCSV</button>
-          <button class="btn btn-s" onclick="downloadDetailCsv()">注文明細CSV</button>
+          <button class="btn btn-s" onclick="downloadDetailCsv()">詳細データCSV（全行）</button>
         </div>
+        <p class="meta" style="margin-top:4px">詳細データCSV: アップロードされた全行の税率・セグメント・売上・原価を1行1商品で出力</p>
       </div>
 
       <!-- 代表商品コードで紐付けた商品 -->
       <div id="repCodeCard" class="card" style="display:none">
         <h2>代表商品コードで紐付けた商品</h2>
-        <p class="meta">auペイ側の商品コードがマスタに直接存在せず、代表商品コード経由で紐付けました。auペイ管理画面の商品コード登録ミスの可能性があります。</p>
+        <p class="meta">Qoo10側の販売者コードがマスタに直接存在せず、代表商品コード経由で紐付けました。</p>
         <div id="repCodeList"></div>
       </div>
 
@@ -744,7 +676,7 @@ function renderPage() {
     <!-- 確定 -->
     <div class="card" id="confirmCard">
       <h2>確定</h2>
-      <div id="confirmPreCheck" class="warn" style="margin-bottom:8px">注文データCSVをアップロードしてから確定してください</div>
+      <div id="confirmPreCheck" class="warn" style="margin-bottom:8px">セリングレポートCSVをアップロードしてから確定してください</div>
       <div style="display:flex;gap:12px;align-items:center;margin-bottom:8px">
         <button class="btn btn-s" id="confirmBtn" onclick="doConfirm()" disabled>この月の集計を確定</button>
       </div>
@@ -858,7 +790,7 @@ function renderPage() {
         if (hasUnresolved) {
           contentHtml += '<div id="unres-product" class="tab-content active">';
           contentHtml += '<div class="warn">商品マスタに未登録の商品です。warehouse側で登録してから再アップロードしてください。</div>';
-          contentHtml += '<table><tr><th>商品コード</th><th>商品名</th><th>CSV税率</th><th>出現数</th><th>売上合計</th></tr>';
+          contentHtml += '<table><tr><th>販売者コード</th><th>商品名</th><th>CSV税率</th><th>出現数</th><th>売上合計</th></tr>';
           for (const u of data.unresolvedProducts) {
             contentHtml += '<tr><td>' + u.code + '</td><td>' + (u.name || '').slice(0, 60) + '</td><td class="num">' + (u.csvTaxRate || '-') + '</td><td class="num">' + u.count + '</td><td class="num">' + fmt(u.amount) + '</td></tr>';
           }
@@ -906,9 +838,9 @@ function renderPage() {
       if (data.resolvedByRepCode && data.resolvedByRepCode.length > 0) {
         document.getElementById('repCodeCard').style.display = 'block';
         let html = '<div class="warn" style="margin-bottom:8px"><b>' + data.resolvedByRepCode.length + '商品</b>を代表商品コード経由で紐付けました</div>';
-        html += '<table class="detail-table"><tr><th>auペイ商品コード</th><th>auペイ商品名</th><th>紐付先マスタコード</th><th>マスタ商品名</th><th>出現数</th><th>売上合計</th></tr>';
+        html += '<table class="detail-table"><tr><th>Qoo10販売者コード</th><th>Qoo10商品名</th><th>紐付先マスタコード</th><th>マスタ商品名</th><th>出現数</th><th>売上合計</th></tr>';
         for (const r of data.resolvedByRepCode) {
-          html += '<tr><td style="text-align:left">' + r.auPayCode + '</td><td style="text-align:left">' + (r.name || '').slice(0, 40) + '</td><td style="text-align:left;color:#e85514;font-weight:bold">' + r.matchedCode + '</td><td style="text-align:left">' + (r.matchedName || '').slice(0, 40) + '</td><td class="num">' + r.count + '</td><td class="num">' + fmt(r.amount) + '</td></tr>';
+          html += '<tr><td style="text-align:left">' + r.qoo10Code + '</td><td style="text-align:left">' + (r.name || '').slice(0, 40) + '</td><td style="text-align:left;color:#e5004f;font-weight:bold">' + r.matchedCode + '</td><td style="text-align:left">' + (r.matchedName || '').slice(0, 40) + '</td><td class="num">' + r.count + '</td><td class="num">' + fmt(r.amount) + '</td></tr>';
         }
         html += '</table>';
         document.getElementById('repCodeList').innerHTML = html;
@@ -935,21 +867,19 @@ function renderPage() {
 
     function renderTaxTable(data) {
       const bt = data.byTax;
-      let html = '<table><tr><th>税率</th><th>売上合計</th><th>クーポン値引額</th><th>クーポン値引後売上</th><th>原価合計</th><th>行数</th></tr>';
-      let tot = { s:0, c:0, a:0, g:0, n:0 };
+      let html = '<table><tr><th>税率</th><th>売上合計</th><th>原価合計</th><th>行数</th></tr>';
+      let tot = { s:0, g:0, n:0 };
       for (const [key, row] of Object.entries(bt)) {
         const label = key + '%';
         html += '<tr><td>' + label + '</td>';
         html += '<td class="num">' + fmt(row.売上合計) + '</td>';
-        html += '<td class="num">' + fmt(row.クーポン値引額) + '</td>';
-        html += '<td class="num">' + fmt(row.クーポン値引後売上) + '</td>';
         html += '<td class="num">' + fmt(row.原価合計) + '</td>';
         html += '<td class="num">' + row.行数 + '</td></tr>';
-        tot.s += row.売上合計; tot.c += row.クーポン値引額; tot.a += row.クーポン値引後売上; tot.g += row.原価合計; tot.n += row.行数;
+        tot.s += row.売上合計; tot.g += row.原価合計; tot.n += row.行数;
       }
       html += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td>';
-      html += '<td class="num">' + fmt(tot.s) + '</td><td class="num">' + fmt(tot.c) + '</td>';
-      html += '<td class="num">' + fmt(tot.a) + '</td><td class="num">' + fmt(tot.g) + '</td>';
+      html += '<td class="num">' + fmt(tot.s) + '</td>';
+      html += '<td class="num">' + fmt(tot.g) + '</td>';
       html += '<td class="num">' + tot.n + '</td></tr></table>';
       document.getElementById('taxTable').innerHTML = html;
     }
@@ -989,31 +919,28 @@ function renderPage() {
       const allocTargets = ['1', '2', '3'];
       const adTargets = ['1', '2'];
       const salesByKey = {};
-      for (const [key, row] of Object.entries(seg)) { salesByKey[key] = row.クーポン値引後売上 || 0; }
+      for (const [key, row] of Object.entries(seg)) { salesByKey[key] = row.売上合計 || 0; }
       const pfByKey = allocateByRatio(pf, salesByKey, allocTargets);
       const adByKey = allocateByRatio(ad, salesByKey, adTargets);
 
-      let html = '<table><tr><th>セグメント</th><th>売上合計</th><th>クーポン値引額</th><th>値引後売上</th><th>PF手数料</th><th>広告費</th><th>原価合計</th><th>原価率</th><th>行数</th></tr>';
-      let tot = { s:0, c:0, a:0, g:0, n:0 };
+      let html = '<table><tr><th>セグメント</th><th>売上合計</th><th>PF手数料</th><th>広告費</th><th>原価合計</th><th>原価率</th><th>行数</th></tr>';
+      let tot = { s:0, g:0, n:0 };
       let totPf = 0, totAd = 0;
       for (const [key, row] of Object.entries(seg)) {
         const label = segNames[key] || (key === 'other' ? 'その他/未分類' : key);
         html += '<tr><td>' + key + ': ' + label + '</td>';
         html += '<td class="num">' + fmt(row.売上合計) + '</td>';
-        html += '<td class="num">' + fmt(row.クーポン値引額) + '</td>';
-        html += '<td class="num">' + fmt(row.クーポン値引後売上) + '</td>';
         html += '<td class="num">' + fmt(pfByKey[key] || 0) + '</td>';
         html += '<td class="num">' + fmt(adByKey[key] || 0) + '</td>';
         html += '<td class="num">' + fmt(row.原価合計) + '</td>';
         html += '<td class="num">' + (row.原価率 || '0.0') + '%</td>';
         html += '<td class="num">' + row.行数 + '</td></tr>';
-        tot.s += row.売上合計; tot.c += row.クーポン値引額; tot.a += row.クーポン値引後売上; tot.g += row.原価合計; tot.n += row.行数;
+        tot.s += row.売上合計; tot.g += row.原価合計; tot.n += row.行数;
         totPf += (pfByKey[key] || 0); totAd += (adByKey[key] || 0);
       }
-      const totGross = tot.a > 0 ? ((tot.a - tot.g) / tot.a * 100).toFixed(1) : '0.0';
+      const totGross = tot.s > 0 ? (tot.g / tot.s * 100).toFixed(1) : '0.0';
       html += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td>';
-      html += '<td class="num">' + fmt(tot.s) + '</td><td class="num">' + fmt(tot.c) + '</td>';
-      html += '<td class="num">' + fmt(tot.a) + '</td>';
+      html += '<td class="num">' + fmt(tot.s) + '</td>';
       html += '<td class="num">' + fmt(totPf) + '</td><td class="num">' + fmt(totAd) + '</td>';
       html += '<td class="num">' + fmt(tot.g) + '</td>';
       html += '<td class="num">' + totGross + '%</td>';
@@ -1041,7 +968,7 @@ function renderPage() {
         let cbHtml = '<table><tr><th>セグメント</th><th>売上比率</th><th>PF手数料</th><th>広告費</th><th>変動費合計</th></tr>';
         for (const [key, row] of Object.entries(seg)) {
           const label = segNames[key] || (key === 'other' ? 'その他' : key);
-          const ratio = tot.a > 0 ? (row.クーポン値引後売上 / tot.a * 100).toFixed(1) : '0.0';
+          const ratio = tot.s > 0 ? (row.売上合計 / tot.s * 100).toFixed(1) : '0.0';
           cbHtml += '<tr><td>' + key + ': ' + label + '</td>';
           cbHtml += '<td class="num">' + ratio + '%</td>';
           cbHtml += '<td class="num">' + fmt(pfByKey[key] || 0) + '</td>';
@@ -1101,53 +1028,7 @@ function renderPage() {
       btn.textContent = '選択した税率・セグメントを登録して再集計';
     }
 
-    // ─── PDF読み取り ───
-    async function doPdfUpload() {
-      const fileInput = document.getElementById('pdfFile');
-      if (!fileInput.files.length) { alert('PDFファイルを選択してください'); return; }
-      const btn = document.getElementById('pdfBtn');
-      btn.disabled = true;
-      btn.textContent = '読み取り中...';
-
-      const formData = new FormData();
-      formData.append('file', fileInput.files[0]);
-
-      try {
-        const r = await fetchWithRetry(location.pathname + '/upload-pdf', { method: 'POST', body: formData });
-        if (!r.ok) {
-          const text = await r.text();
-          try { const j = JSON.parse(text); document.getElementById('pdfResult').innerHTML = '<div class="err">' + (j.error || r.status) + '</div>'; }
-          catch { document.getElementById('pdfResult').innerHTML = '<div class="err">サーバーエラー (HTTP ' + r.status + ')</div>'; }
-          return;
-        }
-        const data = await r.json();
-        if (data.error) { document.getElementById('pdfResult').innerHTML = '<div class="err">' + data.error + '</div>'; return; }
-
-        if (data.totalFee != null) {
-          document.getElementById('pfFeeInput').value = data.totalFee;
-          document.getElementById('adCostInput').value = data.adCost || 0;
-          let html = '<div class="ok">PDF読み取り成功: ご請求額 \\u00a5' + data.totalFee.toLocaleString();
-          if (data.pdfYearMonth) html += '（' + data.pdfYearMonth + '）';
-          html += '</div>';
-          if (data.breakdown && Object.keys(data.breakdown).length > 0) {
-            html += '<table style="margin-top:4px"><tr><th>項目</th><th>金額</th></tr>';
-            for (const [k, v] of Object.entries(data.breakdown)) {
-              html += '<tr><td>' + k + '</td><td class="num">' + fmt(v) + '</td></tr>';
-            }
-            html += '</table>';
-          }
-          document.getElementById('pdfResult').innerHTML = html;
-          applyPfFee();
-        } else {
-          document.getElementById('pdfResult').innerHTML = '<div class="warn">PDF読み取りできましたが、ご請求額を検出できませんでした。手入力してください。</div>';
-        }
-      } catch(e) {
-        document.getElementById('pdfResult').innerHTML = '<div class="err">エラー: ' + e.message + '</div>';
-      }
-      btn.disabled = false;
-      btn.textContent = 'PDF読み取り';
-    }
-
+    // ─── PF手数料反映 ───
     function applyPfFee() {
       const pf = parseInt(document.getElementById('pfFeeInput').value.replace(/,/g, '')) || 0;
       const ad = parseInt(document.getElementById('adCostInput').value.replace(/,/g, '')) || 0;
@@ -1167,13 +1048,13 @@ function renderPage() {
           + (pfFeeData.adCost ? ' / 広告費: <b>\\u00a5' + pfFeeData.adCost.toLocaleString() + '</b>' : '');
       } else {
         pre.className = 'warn';
-        pre.innerHTML = '注文データCSVをアップロードしてから確定してください';
+        pre.innerHTML = 'セリングレポートCSVをアップロードしてから確定してください';
       }
     }
 
     // ─── 確定 ───
     async function doConfirm() {
-      if (!lastData) { alert('先に注文データCSVをアップロードしてください'); return; }
+      if (!lastData) { alert('先にセリングレポートCSVをアップロードしてください'); return; }
       const ym = lastData.yearMonth || '';
       if (!ym) { alert('対象年月が検出できません'); return; }
       if (!confirm(ym + ' の集計を確定しますか？')) return;
@@ -1227,7 +1108,7 @@ function renderPage() {
           const row = rows[i];
           const seg = row.by_segment || {};
           let hdrSales = 0;
-          for (const sr of Object.values(seg)) hdrSales += (sr.クーポン値引後売上 || 0);
+          for (const sr of Object.values(seg)) hdrSales += (sr.売上合計 || 0);
           const pf = Math.round(row.pf_fee || 0);
           const ad = Math.round(row.ad_cost || 0);
 
@@ -1240,23 +1121,21 @@ function renderPage() {
           html += '<div class="acc-body" id="acc-' + i + '">';
 
           // セグメント別
-          html += '<table><tr><th>セグメント</th><th>売上合計</th><th>クーポン値引額</th><th>値引後売上</th><th>原価合計</th><th>原価率</th><th>行数</th></tr>';
-          let sTot = { s:0, c:0, a:0, g:0, n:0 };
+          html += '<table><tr><th>セグメント</th><th>売上合計</th><th>原価合計</th><th>原価率</th><th>行数</th></tr>';
+          let sTot = { s:0, g:0, n:0 };
           for (const [key, sr] of Object.entries(seg)) {
             const lb = segNames[key] || (key === 'other' ? 'その他' : key);
             html += '<tr><td>' + key + ': ' + lb + '</td>';
             html += '<td class="num">' + fmt(sr.売上合計||0) + '</td>';
-            html += '<td class="num">' + fmt(sr.クーポン値引額||0) + '</td>';
-            html += '<td class="num">' + fmt(sr.クーポン値引後売上||0) + '</td>';
             html += '<td class="num">' + fmt(sr.原価合計||0) + '</td>';
-            html += '<td class="num">' + (sr.原価率 || '0.0') + '%</td>';
+            html += '<td class="num">' + (sr.原価率 || (sr.売上合計 > 0 ? (sr.原価合計 / sr.売上合計 * 100).toFixed(1) : '0.0')) + '%</td>';
             html += '<td class="num">' + (sr.行数||0) + '</td></tr>';
-            sTot.s += (sr.売上合計||0); sTot.c += (sr.クーポン値引額||0); sTot.a += (sr.クーポン値引後売上||0); sTot.g += (sr.原価合計||0); sTot.n += (sr.行数||0);
+            sTot.s += (sr.売上合計||0); sTot.g += (sr.原価合計||0); sTot.n += (sr.行数||0);
           }
-          const tg = sTot.a > 0 ? ((sTot.a - sTot.g) / sTot.a * 100).toFixed(1) : '0.0';
+          const tg = sTot.s > 0 ? (sTot.g / sTot.s * 100).toFixed(1) : '0.0';
           html += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td>';
-          html += '<td class="num">' + fmt(sTot.s) + '</td><td class="num">' + fmt(sTot.c) + '</td>';
-          html += '<td class="num">' + fmt(sTot.a) + '</td><td class="num">' + fmt(sTot.g) + '</td>';
+          html += '<td class="num">' + fmt(sTot.s) + '</td>';
+          html += '<td class="num">' + fmt(sTot.g) + '</td>';
           html += '<td class="num">' + tg + '%</td><td class="num">' + sTot.n + '</td></tr></table>';
 
           // 除外
@@ -1282,19 +1161,19 @@ function renderPage() {
 
     // ─── 集計サマリーCSV ───
     function downloadSummaryCsv() {
-      if (!lastData) { alert('先に注文データCSVをアップロードしてください'); return; }
+      if (!lastData) { alert('先にセリングレポートCSVをアップロードしてください'); return; }
       const data = lastData;
       let csv = '\\uFEFF';
 
-      csv += '【税率別集計（税込）】\\n';
-      csv += '税率,売上合計,クーポン値引額,クーポン値引後売上,原価合計,行数\\n';
+      csv += '【税率別集計（税抜）】\\n';
+      csv += '税率,売上合計,原価合計,行数\\n';
       const bt = data.byTax;
-      let tTot = { s:0, c:0, a:0, g:0, n:0 };
+      let tTot = { s:0, g:0, n:0 };
       for (const [key, row] of Object.entries(bt)) {
-        csv += key + '%,' + Math.round(row.売上合計) + ',' + Math.round(row.クーポン値引額) + ',' + Math.round(row.クーポン値引後売上) + ',' + Math.round(row.原価合計) + ',' + row.行数 + '\\n';
-        tTot.s += row.売上合計; tTot.c += row.クーポン値引額; tTot.a += row.クーポン値引後売上; tTot.g += row.原価合計; tTot.n += row.行数;
+        csv += key + '%,' + Math.round(row.売上合計) + ',' + Math.round(row.原価合計) + ',' + row.行数 + '\\n';
+        tTot.s += row.売上合計; tTot.g += row.原価合計; tTot.n += row.行数;
       }
-      csv += '合計,' + Math.round(tTot.s) + ',' + Math.round(tTot.c) + ',' + Math.round(tTot.a) + ',' + Math.round(tTot.g) + ',' + tTot.n + '\\n';
+      csv += '合計,' + Math.round(tTot.s) + ',' + Math.round(tTot.g) + ',' + tTot.n + '\\n';
 
       csv += '\\n【MF連携用 税込み集計】\\n';
       csv += '商品売上(10%),商品売上(8%),合計\\n';
@@ -1302,12 +1181,12 @@ function renderPage() {
       csv += (mf['商品売上(10%)']||0) + ',' + (mf['商品売上(8%)']||0) + ',' + (mf['合計']||0) + '\\n';
 
       csv += '\\n【セグメント別集計】\\n';
-      csv += 'セグメント,売上合計,クーポン値引額,値引後売上,原価合計,原価率,行数\\n';
+      csv += 'セグメント,売上合計,原価合計,原価率,行数\\n';
       const seg = data.bySegment;
       const segNames = { 1:'自社商品', 2:'取扱限定', 3:'仕入れ商品' };
       for (const [key, row] of Object.entries(seg)) {
         const label = segNames[key] || (key === 'other' ? 'その他' : key);
-        csv += key + ':' + label + ',' + Math.round(row.売上合計) + ',' + Math.round(row.クーポン値引額) + ',' + Math.round(row.クーポン値引後売上) + ',' + Math.round(row.原価合計) + ',' + (row.原価率||'0.0') + ',' + row.行数 + '\\n';
+        csv += key + ':' + label + ',' + Math.round(row.売上合計) + ',' + Math.round(row.原価合計) + ',' + (row.原価率||'0.0') + ',' + row.行数 + '\\n';
       }
 
       csv += '\\n【変動費】\\n';
@@ -1317,47 +1196,44 @@ function renderPage() {
       const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
-      a.download = 'auPay_summary_' + (data.yearMonth || 'unknown') + '.csv';
+      a.download = 'Qoo10_summary_' + (data.yearMonth || 'unknown') + '.csv';
       a.click();
     }
 
-    // ─── 注文明細CSV ───
+    // ─── 詳細データCSV（全行）───
     function downloadDetailCsv() {
-      if (!lastData) { alert('先に注文データCSVをアップロードしてください'); return; }
-      const data = lastData;
-      const rows = data.resolvedRows || [];
-      if (!rows.length) { alert('明細データがありません'); return; }
-
+      if (!lastData || !lastData.detailRows) { alert('先にセリングレポートCSVをアップロードしてください'); return; }
       const segNames = { 1:'自社商品', 2:'取扱限定', 3:'仕入れ商品', 4:'輸出' };
+
       let csv = '\\uFEFF';
-      csv += '注文番号,商品コード,商品コード(マスタ),商品名,単価,個数,売上合計(税込),クーポン値引額,税率,売上分類,原価(単価),原価(小計),解決方法\\n';
-      for (const r of rows) {
-        const taxRate = r.税率 || r.CSV税率 || '';
-        const segLabel = r.売上分類 ? (r.売上分類 + ':' + (segNames[r.売上分類] || '')) : '';
-        const genkaUnit = r.原価 || 0;
-        const genkaTotal = genkaUnit * (r.個数 || 1);
-        const cols = [
-          r.注文番号 || '',
-          r.商品コード || '',
-          r.商品コード_resolved || '',
-          '"' + (r.商品名 || '').replace(/"/g, '""') + '"',
-          r.単価 || 0,
-          r.個数 || 0,
-          Math.round(r.売上合計 || 0),
-          Math.round(r.クーポン値引額 || 0),
-          taxRate ? taxRate + '%' : '',
+      csv += '注文番号,商品コード(Qoo10),商品コード(解決後),商品名,数量,売上合計,原価単価,原価合計,税率,CSV税率,売上分類,セグメント名,解決方法,決済完了日,購入日\\n';
+
+      for (const r of lastData.detailRows) {
+        const segLabel = r.売上分類 ? (segNames[r.売上分類] || '') : '未分類';
+        const name = (r.商品名 || '').replace(/"/g, '""').replace(/,/g, '、');
+        csv += [
+          r.注文番号,
+          r.商品コード,
+          r.商品コード_resolved,
+          '"' + name + '"',
+          r.個数,
+          Math.round(r.売上合計),
+          Math.round(r.原価単価),
+          Math.round(r.原価合計),
+          r.税率 + '%',
+          r.CSV税率 ? r.CSV税率 + '%' : '',
+          r.売上分類,
           segLabel,
-          genkaUnit,
-          Math.round(genkaTotal),
-          r.解決方法 || '',
-        ];
-        csv += cols.join(',') + '\\n';
+          r.解決方法,
+          r.決済完了日,
+          r.購入日,
+        ].join(',') + '\\n';
       }
 
       const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
-      a.download = 'auPay_detail_' + (data.yearMonth || 'unknown') + '.csv';
+      a.download = 'Qoo10_detail_' + (lastData.yearMonth || 'unknown') + '.csv';
       a.click();
     }
 
@@ -1369,7 +1245,7 @@ function renderPage() {
 
         const segNames = {1:'自社商品', 2:'取扱限定', 3:'仕入れ商品', other:'その他'};
         let csv = '\\uFEFF';
-        csv += '集計月,セグメント,売上合計,クーポン値引額,値引後売上,PF手数料,広告費,原価合計,原価率\\n';
+        csv += '集計月,セグメント,売上合計,PF手数料,広告費,原価合計,原価率\\n';
 
         function toLastDay(ym) {
           const [y, m] = ym.split('-').map(Number);
@@ -1381,35 +1257,34 @@ function renderPage() {
           const seg = row.by_segment || {};
           const pf = row.pf_fee || 0;
           const ad = row.ad_cost || 0;
-          const allocTargets = ['1','2','3'];
-          const adTargets = ['1','2'];
           const salesByKey = {};
-          for (const [k, sr] of Object.entries(seg)) salesByKey[k] = sr.クーポン値引後売上 || 0;
-          const pfByKey = allocateByRatio(pf, salesByKey, allocTargets);
-          const adByKey = allocateByRatio(ad, salesByKey, adTargets);
-
-          const ymDate = toLastDay(row.year_month);
+          for (const [key, sr] of Object.entries(seg)) { salesByKey[key] = sr.売上合計 || 0; }
+          const pfByKey = allocateByRatio(pf, salesByKey, ['1','2','3']);
+          const adByKey = allocateByRatio(ad, salesByKey, ['1','2']);
+          const ym = toLastDay(row.year_month);
           for (const [key, sr] of Object.entries(seg)) {
-            const label = segNames[key] || key;
-            csv += ymDate + ',' + key + ':' + label + ',' + Math.round(sr.売上合計||0) + ',' + Math.round(sr.クーポン値引額||0) + ',' + Math.round(sr.クーポン値引後売上||0) + ',' + (pfByKey[key]||0) + ',' + (adByKey[key]||0) + ',' + Math.round(sr.原価合計||0) + ',' + (sr.原価率||'0.0') + '\\n';
+            const lb = segNames[key] || key;
+            csv += ym + ',' + key + ':' + lb + ','
+              + Math.round(sr.売上合計||0) + ',' + Math.round(pfByKey[key]||0) + ','
+              + Math.round(adByKey[key]||0) + ',' + Math.round(sr.原価合計||0) + ','
+              + (sr.原価率 || (sr.売上合計 > 0 ? (sr.原価合計 / sr.売上合計 * 100).toFixed(1) : '0.0')) + '\\n';
           }
         }
 
         const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
-        a.download = 'auPay_segment_history.csv';
+        a.download = 'Qoo10_segment_history.csv';
         a.click();
       } catch(e) {
         alert('ダウンロードエラー: ' + e.message);
       }
     }
 
+    // 初期ロード
     document.getElementById('csvFiles').addEventListener('change', function() {
-      const n = this.files.length;
-      document.getElementById('fileCount').textContent = n > 0 ? n + 'ファイル選択中' : '';
+      document.getElementById('fileCount').textContent = this.files.length ? this.files.length + 'ファイル選択中' : '';
     });
-
     loadHistory();
   </script>
 </body>

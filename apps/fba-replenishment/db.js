@@ -475,6 +475,60 @@ export function savePlanningData(rows, snapshotDate) {
 }
 
 /**
+ * ミニPCから同期されたPLANNINGスナップショットをそのままupsertする。
+ *
+ * 通常の savePlanningData() と違い:
+ *   - Render側DBの前日行を参照して working_first_seen を再計算しない
+ *   - payload（ミニPC側で正しく記録された値）をそのまま使う
+ *   → Render DBに履歴ギャップがあっても working_first_seen 判定が狂わない
+ *
+ * rows は getLatestSnapshots() 形式（amazon_sku, working_first_seen を含む）
+ */
+export function savePlanningDataWithHistory(rows, snapshotDate) {
+  if (!rows || rows.length === 0) return 0;
+  const date = snapshotDate || rows[0]?.snapshot_date || new Date().toISOString().slice(0, 10);
+
+  db.run('BEGIN TRANSACTION');
+  try {
+    for (const row of rows) {
+      const sku = row.amazon_sku || row.sku || '';
+      if (!sku) continue;
+
+      db.run(`
+        INSERT OR REPLACE INTO daily_snapshots
+          (snapshot_date, amazon_sku, product_name, fba_available,
+           fba_inbound_working, fba_inbound_shipped, fba_inbound_received,
+           working_first_seen,
+           days_of_supply, units_sold_7d, units_sold_30d,
+           sales_rank, your_price, featured_offer_price)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        date,
+        sku,
+        row.product_name || '',
+        row.fba_available || 0,
+        row.fba_inbound_working || 0,
+        row.fba_inbound_shipped || 0,
+        row.fba_inbound_received || 0,
+        row.working_first_seen || null,
+        row.days_of_supply || 0,
+        row.units_sold_7d || 0,
+        row.units_sold_30d || 0,
+        row.sales_rank || 0,
+        row.your_price || 0,
+        row.featured_offer_price || 0,
+      ]);
+    }
+    db.run('COMMIT');
+    saveToFile();
+    return rows.length;
+  } catch (e) {
+    db.run('ROLLBACK');
+    throw e;
+  }
+}
+
+/**
  * SKUマッピングを一括更新（スプシ同期）
  */
 export function upsertSkuMappings(mappings) {
@@ -887,6 +941,26 @@ export function updateFnskuBatch(items) {
       if (item.sku && item.fnsku) {
         db.run('UPDATE sku_mapping SET fnsku = ? WHERE amazon_sku = ?', [item.fnsku, item.sku]);
       }
+    }
+    db.run('COMMIT');
+    saveToFile();
+  } catch (e) {
+    db.run('ROLLBACK');
+    throw e;
+  }
+}
+
+/**
+ * ミニPCからの同期用: FNSKUの最新状態をそのまま反映（nullなら明示的にクリア）
+ * updateFnskuBatch は falsy を無視するため、旧FNSKUが残り続ける問題があった。
+ * この関数は payload 通りに上書きするので、FNSKUが外された場合も正しく反映される。
+ */
+export function syncFnskuBatch(items) {
+  db.run('BEGIN TRANSACTION');
+  try {
+    for (const item of items) {
+      if (!item.sku) continue;
+      db.run('UPDATE sku_mapping SET fnsku = ? WHERE amazon_sku = ?', [item.fnsku || null, item.sku]);
     }
     db.run('COMMIT');
     saveToFile();

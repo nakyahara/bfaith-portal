@@ -100,6 +100,26 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
       log.push(`sku_map: ${skuMapData.length}件`);
     }
 
+    // amazon_sku_fees（全件置換）
+    if (req.body.amazon_sku_fees && req.body.amazon_sku_fees.length > 0) {
+      const feesData = req.body.amazon_sku_fees;
+      const tx = db.transaction(() => {
+        db.exec('DELETE FROM mirror_amazon_sku_fees');
+        const stmt = db.prepare(`INSERT INTO mirror_amazon_sku_fees (
+          seller_sku, asin, fulfillment_channel, referral_fee, referral_fee_rate,
+          fba_fee, variable_closing_fee, per_item_fee, total_fee, price_used, fetched_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
+        for (const f of feesData) {
+          stmt.run(f.seller_sku, f.asin, f.fulfillment_channel,
+            f.referral_fee, f.referral_fee_rate,
+            f.fba_fee, f.variable_closing_fee, f.per_item_fee,
+            f.total_fee, f.price_used, f.fetched_at);
+        }
+      });
+      tx();
+      log.push(`amazon_sku_fees: ${feesData.length}件`);
+    }
+
     // sales_monthly（初回チャンクでDELETE、以降は追記）
     if (sales_monthly && sales_monthly.length > 0) {
       const tx = db.transaction(() => {
@@ -215,6 +235,7 @@ router.get('/api/status', (req, res) => {
     status.sales_monthly_count = db.prepare('SELECT COUNT(*) as cnt FROM mirror_sales_monthly').get().cnt;
     status.sales_daily_count = db.prepare('SELECT COUNT(*) as cnt FROM mirror_sales_daily').get().cnt;
     status.sku_map_count = db.prepare('SELECT COUNT(*) as cnt FROM mirror_sku_map').get().cnt;
+    try { status.amazon_sku_fees_count = db.prepare('SELECT COUNT(*) as cnt FROM mirror_amazon_sku_fees').get().cnt; } catch { status.amazon_sku_fees_count = 0; }
   } catch {}
   res.json(status);
 });

@@ -60,14 +60,13 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
     const inboundReceived = snap.fba_inbound_received || 0;
     const reportWorking = snap.fba_inbound_working || 0;
 
-    // inboundWorkingOverride（listInboundPlansからのリアルタイムデータ）がある場合はそちらを優先
-    // レポートの値より大きい方を採用（レポートに反映済みのものもあるため、max で二重計上を防ぐ）
+    // inboundWorkingOverride（listInboundPlansからのリアルタイムデータ）がある場合はそれを一次ソースとする
+    // API成功時はapiQtyを採用（PLANNINGレポートは遅延・残骸を含むため信頼しない）
     let inboundWorking;
     let workingSource; // デバッグ用: データソース
     if (inboundWorkingOverride && inboundWorkingOverride[sku] !== undefined) {
-      const apiQty = inboundWorkingOverride[sku];
-      inboundWorking = Math.max(reportWorking, apiQty);
-      workingSource = apiQty > reportWorking ? 'API' : (apiQty === reportWorking ? 'same' : 'report');
+      inboundWorking = inboundWorkingOverride[sku];
+      workingSource = 'API';
     } else {
       inboundWorking = reportWorking;
       workingSource = 'report';
@@ -194,9 +193,12 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
     let recommendedQty = Math.min(rawNeeded, warehouseAvailable);
 
     // --- 有効期限チェック: 同一期限のものしか1回の納品で送れない ---
+    // ※ FBAは同一商品で期限違いを同梱不可 → 必ず同一期限のみ送る
+    // ※ 期限なしロケに在庫がある場合は「期限管理SKUなのに期限未登録」のデータ不備として警告
     let expiryLimited = false;
     let expiryDate = '';
     let expirySameQty = 0;
+    let undatedLocQty = 0; // 期限なしロケにある在庫数（データ不備警告用）
     if (mapping.logizard_code) {
       const locations = getWarehouseLocationsByCode(mapping.logizard_code);
       // 有効期限があるロケが1つでもあるかチェック
@@ -206,21 +208,21 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
         const baseExpiry = locsWithExpiry[0].expiry_date.trim();
         expiryDate = baseExpiry; // 常に有効期限を保持（納品プラン作成時に必要）
 
-        if (recommendedQty > 0) {
-          // 同一期限のロケ在庫を合算
-          let sameExpiryTotal = 0;
-          for (const loc of locations) {
-            const locExpiry = (loc.expiry_date || '').trim();
-            // 期限なしのロケは「期限に関係なく送れる」扱い → 合算対象
-            if (!locExpiry || locExpiry === baseExpiry) {
-              sameExpiryTotal += loc.available_qty;
-            }
+        // 同一期限のロケ在庫のみを合算（期限なしロケは除外し警告対象）
+        let sameExpiryTotal = 0;
+        for (const loc of locations) {
+          const locExpiry = (loc.expiry_date || '').trim();
+          if (locExpiry === baseExpiry) {
+            sameExpiryTotal += loc.available_qty;
+          } else if (!locExpiry && loc.available_qty > 0) {
+            undatedLocQty += loc.available_qty;
           }
-          if (sameExpiryTotal < recommendedQty) {
-            expiryLimited = true;
-            expirySameQty = sameExpiryTotal;
-            recommendedQty = sameExpiryTotal;
-          }
+        }
+
+        if (recommendedQty > 0 && sameExpiryTotal < recommendedQty) {
+          expiryLimited = true;
+          expirySameQty = sameExpiryTotal;
+          recommendedQty = sameExpiryTotal;
         }
       }
     }
@@ -305,6 +307,15 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
 
     // --- アラート ---
     const alerts = calcAlerts(snap, mapping, effectiveFbaStock, daysOfSupply, warehouseAvailable, settings);
+
+    // 期限管理SKUに期限なしロケの在庫がある場合はデータ不備警告（FBA同梱不可のため送れない）
+    if (undatedLocQty > 0) {
+      alerts.push({
+        type: 'expiry_missing',
+        level: 3,
+        message: `期限なしロケに${undatedLocQty}個(期限管理SKU/ロケ期限要登録)`,
+      });
+    }
 
     // --- 緊急度スコア ---
     const urgencyScore = calcUrgencyScore(daysOfSupply, sold30d, sold7d, snap, settings);

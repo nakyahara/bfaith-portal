@@ -16,10 +16,15 @@ import fbaRouter from './apps/fba-replenishment/router.js';
 import warehouseRouter from './apps/warehouse/router.js';
 import mirrorRouter from './apps/warehouse-mirror/router.js';
 import amazonAccountingRouter from './apps/amazon-accounting/router.js';
+import amazonUsaAccountingRouter from './apps/amazon-usa-accounting/router.js';
 import rakutenAccountingRouter from './apps/rakuten-accounting/router.js';
 import aupayAccountingRouter from './apps/aupay-accounting/router.js';
 import yahooAccountingRouter from './apps/yahoo-accounting/router.js';
 import linegiftAccountingRouter from './apps/linegift-accounting/router.js';
+import qoo10AccountingRouter from './apps/qoo10-accounting/router.js';
+import fbaProfitabilityRouter from './apps/fba-profitability/router.js';
+import mercariAccountingRouter from './apps/mercari-accounting/router.js';
+import profitAnalysisRouter from './apps/profit-analysis/router.js';
 import serviceRouter from './apps/warehouse/service-router.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -207,6 +212,15 @@ const apps = [
     category: 'accounting',
   },
   {
+    id: 'amazon-usa-accounting',
+    name: '米国Amazon売上集計',
+    description: 'Monthly Unified Transaction CSVから輸出売上をUSD→JPY換算して集計(全売上=セグメント4)',
+    icon: '🇺🇸',
+    path: '/apps/amazon-usa-accounting',
+    status: 'active',
+    category: 'accounting',
+  },
+  {
     id: 'rakuten-accounting',
     name: '楽天売上集計',
     description: '楽天RMS注文データCSVから税率別・セグメント別の売上集計を自動計算',
@@ -234,6 +248,15 @@ const apps = [
     category: 'accounting',
   },
   {
+    id: 'qoo10-accounting',
+    name: 'Qoo10売上集計',
+    description: 'Qoo10セリングレポートCSVから税率別・セグメント別の売上集計を自動計算',
+    icon: '📔',
+    path: '/apps/qoo10-accounting',
+    status: 'active',
+    category: 'accounting',
+  },
+  {
     id: 'linegift-accounting',
     name: 'LINEギフト売上集計',
     description: 'LINEギフト注文CSVから税率別・セグメント別の売上集計を自動計算',
@@ -241,6 +264,33 @@ const apps = [
     path: '/apps/linegift-accounting',
     status: 'active',
     category: 'accounting',
+  },
+  {
+    id: 'fba-profitability',
+    name: 'FBA収益性分析',
+    description: 'FBA全商品の利益率を分析・低利益率商品を検出',
+    icon: '📉',
+    path: '/apps/fba-profitability',
+    status: 'active',
+    category: 'fba',
+  },
+  {
+    id: 'mercari-accounting',
+    name: 'メルカリShops売上集計',
+    description: 'メルカリShops売上レポート+注文CSVから税率別・セグメント別の売上集計を自動計算',
+    icon: '🛒',
+    path: '/apps/mercari-accounting',
+    status: 'active',
+    category: 'accounting',
+  },
+  {
+    id: 'profit-analysis',
+    name: '粗利分析',
+    description: '全モール横断の商品別粗利率分析・低利益商品の検出',
+    icon: '💹',
+    path: '/apps/profit-analysis',
+    status: 'active',
+    category: 'analysis',
   },
 ];
 
@@ -357,10 +407,30 @@ app.use('/apps/amazon-accounting', (req, res, next) => {
   if (req.path === '/import-history' && req.method === 'POST') return next();  // APIキー認証に委譲
   requireAuth(req, res, next);
 }, amazonAccountingRouter);
+app.use('/apps/amazon-usa-accounting', (req, res, next) => {
+  if (req.path === '/import-history' && req.method === 'POST') return next();
+  requireAuth(req, res, next);
+}, amazonUsaAccountingRouter);
 app.use('/apps/rakuten-accounting', requireAuth, rakutenAccountingRouter);
-app.use('/apps/aupay-accounting', requireAuth, aupayAccountingRouter);
+app.use('/apps/aupay-accounting', (req, res, next) => {
+  if (req.path === '/import-history' && req.method === 'POST') return next();
+  requireAuth(req, res, next);
+}, aupayAccountingRouter);
 app.use('/apps/yahoo-accounting', requireAuth, yahooAccountingRouter);
-app.use('/apps/linegift-accounting', requireAuth, linegiftAccountingRouter);
+app.use('/apps/linegift-accounting', (req, res, next) => {
+  if (req.path === '/import-history' && req.method === 'POST') return next();
+  requireAuth(req, res, next);
+}, linegiftAccountingRouter);
+app.use('/apps/qoo10-accounting', (req, res, next) => {
+  if (req.path === '/import-history' && req.method === 'POST') return next();
+  requireAuth(req, res, next);
+}, qoo10AccountingRouter);
+app.use('/apps/fba-profitability', requireAppAccess('fba-profitability'), fbaProfitabilityRouter);
+app.use('/apps/profit-analysis', requireAppAccess('profit-analysis'), profitAnalysisRouter);
+app.use('/apps/mercari-accounting', (req, res, next) => {
+  if (req.path === '/import-history' && req.method === 'POST') return next();
+  requireAuth(req, res, next);
+}, mercariAccountingRouter);
 
 // 未実装アプリのプレースホルダー
 app.get('/apps/:appId', requireAuth, (req, res) => {

@@ -133,6 +133,23 @@ function createTables() {
     updated_at        TEXT
   )`);
 
+  // mirror_amazon_sku_fees — Amazon手数料キャッシュ（粗利ダッシュボード用）
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_amazon_sku_fees (
+    seller_sku          TEXT PRIMARY KEY,
+    asin                TEXT,
+    fulfillment_channel TEXT,
+    referral_fee        REAL,
+    referral_fee_rate   REAL,
+    fba_fee             REAL,
+    variable_closing_fee REAL,
+    per_item_fee        REAL,
+    total_fee           REAL,
+    price_used          REAL,
+    fetched_at          TEXT NOT NULL
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mirasf_asin ON mirror_amazon_sku_fees(asin)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mirasf_channel ON mirror_amazon_sku_fees(fulfillment_channel)');
+
   // ─── mart_rakuten: 楽天売上集計ツール用 ───
 
   // mart_rakuten_monthly_summary — 月次確定集計
@@ -181,6 +198,41 @@ function createTables() {
 
   // mart_amazon_upload_log — アップロード履歴
   db.exec(`CREATE TABLE IF NOT EXISTS mart_amazon_upload_log (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    year_month        TEXT NOT NULL,
+    filename          TEXT,
+    total_rows        INTEGER,
+    resolved_count    INTEGER,
+    unresolved_count  INTEGER,
+    uploaded_at       TEXT NOT NULL
+  )`);
+
+  // ─── mart_amazon_usa: 米国Amazon売上集計ツール用 ───
+  // 全売上=セグメント4(輸出)、USD→JPY換算が必要。税率分類なし。
+  db.exec(`CREATE TABLE IF NOT EXISTS mart_amazon_usa_monthly_summary (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    year_month        TEXT NOT NULL UNIQUE,
+    total_rows        INTEGER,
+    resolved_count    INTEGER,
+    unresolved_count  INTEGER,
+    exchange_rate     REAL,      -- 確定時のUSD→JPYレート
+    usd_row           TEXT,      -- JSON: USDベース集計
+    jpy_row           TEXT,      -- JSON: JPY換算後集計
+    mgmt_row          TEXT,      -- JSON: 管理会計用15列集計（セグメント4・円建）
+    cost_total        REAL,      -- 原価合計(税抜・円)
+    ad_cost           REAL DEFAULT 0,  -- 広告費(税込・円・手入力)
+    confirmed_at      TEXT NOT NULL,
+    csv_filename      TEXT
+  )`);
+  // 既存テーブルに ad_cost カラムが無ければ追加
+  try {
+    const cols = db.prepare("PRAGMA table_info(mart_amazon_usa_monthly_summary)").all();
+    if (!cols.some(c => c.name === 'ad_cost')) {
+      db.exec('ALTER TABLE mart_amazon_usa_monthly_summary ADD COLUMN ad_cost REAL DEFAULT 0');
+    }
+  } catch {}
+
+  db.exec(`CREATE TABLE IF NOT EXISTS mart_amazon_usa_upload_log (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     year_month        TEXT NOT NULL,
     filename          TEXT,
@@ -266,6 +318,63 @@ function createTables() {
 
   // mart_linegift_upload_log — アップロード履歴
   db.exec(`CREATE TABLE IF NOT EXISTS mart_linegift_upload_log (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    year_month        TEXT NOT NULL,
+    total_rows        INTEGER,
+    resolved_count    INTEGER,
+    unresolved_count  INTEGER,
+    uploaded_at       TEXT NOT NULL
+  )`);
+
+  // ─── mart_qoo10: Qoo10売上集計ツール用 ───
+
+  // mart_qoo10_monthly_summary — 月次確定集計
+  db.exec(`CREATE TABLE IF NOT EXISTS mart_qoo10_monthly_summary (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    year_month        TEXT NOT NULL UNIQUE,
+    total_rows        INTEGER,
+    resolved_count    INTEGER,
+    unresolved_count  INTEGER,
+    by_tax            TEXT,
+    by_segment        TEXT,
+    excluded          TEXT,
+    mf_row            TEXT,
+    pf_fee            REAL DEFAULT 0,
+    ad_cost           REAL DEFAULT 0,
+    confirmed_at      TEXT NOT NULL
+  )`);
+
+  // mart_qoo10_upload_log — アップロード履歴
+  db.exec(`CREATE TABLE IF NOT EXISTS mart_qoo10_upload_log (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    year_month        TEXT NOT NULL,
+    total_rows        INTEGER,
+    resolved_count    INTEGER,
+    unresolved_count  INTEGER,
+    uploaded_at       TEXT NOT NULL
+  )`);
+
+  // ─── mart_mercari: メルカリショップス売上集計ツール用 ───
+
+  // mart_mercari_monthly_summary — 月次確定集計
+  db.exec(`CREATE TABLE IF NOT EXISTS mart_mercari_monthly_summary (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    year_month        TEXT NOT NULL UNIQUE,
+    total_rows        INTEGER,
+    resolved_count    INTEGER,
+    unresolved_count  INTEGER,
+    by_tax            TEXT,
+    by_segment        TEXT,
+    excluded          TEXT,
+    mf_row            TEXT,
+    pf_fee            REAL DEFAULT 0,
+    shipping_fee      REAL DEFAULT 0,
+    coupon_total      REAL DEFAULT 0,
+    confirmed_at      TEXT NOT NULL
+  )`);
+
+  // mart_mercari_upload_log — アップロード履歴
+  db.exec(`CREATE TABLE IF NOT EXISTS mart_mercari_upload_log (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     year_month        TEXT NOT NULL,
     total_rows        INTEGER,

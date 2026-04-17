@@ -4,13 +4,13 @@
 import express from 'express';
 import multer from 'multer';
 import cron from 'node-cron';
-import { initDb, savePlanningData, getLatestSnapshots, getAllSnapshotSkus, getSettings, updateSetting,
+import { initDb, savePlanningData, savePlanningDataWithHistory, getLatestSnapshots, getAllSnapshotSkus, getSettings, updateSetting,
          getSkuMappings, getSkuExceptions, upsertSkuException, deleteSkuException,
          getWarehouseInventory, replaceWarehouseInventory, getWarehouseSummary,
          getShipmentPlans, getShipmentPlanItems, getDailySnapshots,
          getStockoutHidden, hideStockoutSku, unhideStockoutSku, hideStockoutSkuBulk,
          getNewProductHidden, hideNewProductSkuBulk, unhideNewProductSku,
-         saveDraft, getDraft, clearDraft, updateFnskuBatch,
+         saveDraft, getDraft, clearDraft, updateFnskuBatch, syncFnskuBatch,
          saveProvisionalItems, mergeProvisionalItems, getProvisionalItems, clearProvisionalItems,
          updateProvisionalItemQty, removeProvisionalItem,
          saveExportHistory, getExportHistoryList, getExportHistoryFile } from './db.js';
@@ -87,6 +87,48 @@ router.post('/api/fetch-reports', async (req, res) => {
   } catch (e) {
     console.error('[FBA] レポート取得エラー:', e);
     res.status(502).json({ error: 'ミニPCへの接続に失敗: ' + e.message });
+  }
+});
+
+// ミニPCから最新PLANNINGスナップショットをRender DBへ同期
+// （フロントが /api/fetch-reports のジョブ完了後に呼ぶ）
+router.post('/api/sync-latest-planning', async (req, res) => {
+  try {
+    const pull = await callMiniPC('/sync/latest-planning', { timeout: 60000 });
+    if (!pull?.ok) {
+      return res.status(502).json({ error: 'ミニPCからの同期データ取得に失敗', detail: pull });
+    }
+    const rows = pull.rows || [];
+    const fnskus = pull.fnskus || [];
+    const snapshotDate = pull.snapshot_date;
+
+    // 空結果ガード: ミニPC側のジョブは成功したが同期対象データが0件 = 実質失敗
+    if (rows.length === 0 || !snapshotDate) {
+      console.error('[FBA] 同期: 空のスナップショット（rowsなし or snapshot_dateなし）');
+      return res.status(502).json({
+        error: '同期データが空です。ミニPC側のSP-API取得が失敗している可能性があります。',
+        detail: { rowCount: rows.length, snapshotDate },
+      });
+    }
+
+    const savedRows = savePlanningDataWithHistory(rows, snapshotDate);
+    let savedFnskus = 0;
+    if (fnskus.length > 0) {
+      // syncFnskuBatch は null も反映（FNSKUが外された商品を正しく同期）
+      syncFnskuBatch(fnskus);
+      savedFnskus = fnskus.length;
+    }
+
+    console.log(`[FBA] Render DB同期完了: ${savedRows}件 / FNSKU: ${savedFnskus}件 / 日付: ${snapshotDate}`);
+    res.json({
+      ok: true,
+      rows: savedRows,
+      fnskus: savedFnskus,
+      snapshot_date: snapshotDate,
+    });
+  } catch (e) {
+    console.error('[FBA] 同期エラー:', e);
+    res.status(500).json({ error: e.message });
   }
 });
 

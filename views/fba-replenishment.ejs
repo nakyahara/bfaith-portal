@@ -821,8 +821,27 @@
         if (result.errors && result.errors.length > 0) {
           result.errors.forEach(e => log(`警告: ${e.report} - ${e.error}`));
         }
+
+        // ミニPC→Render DBへ最新スナップショットを同期（必須）
+        log('Render DBへスナップショット同期中...');
+        let syncOk = false;
+        try {
+          const syncRes = await fetch(`${BASE}/api/sync-latest-planning`, { method: 'POST' });
+          const syncJson = await syncRes.json();
+          if (!syncRes.ok || syncJson.error) {
+            log('同期エラー: ' + (syncJson.error || syncRes.status));
+            alert('Render DBへの同期に失敗しました。\nRender側の画面は古いデータのままの可能性があります。\nもう一度「SP-APIレポート全取得」を実行してください。');
+          } else {
+            log(`Render DB同期完了: ${syncJson.rows}件 / FNSKU ${syncJson.fnskus}件 / 日付: ${syncJson.snapshot_date}`);
+            syncOk = true;
+          }
+        } catch (syncErr) {
+          log('同期エラー: ' + syncErr.message);
+          alert('Render DBへの同期に失敗しました (ネットワーク): ' + syncErr.message);
+        }
+
         loadStatus();
-        completeStep(1);
+        if (syncOk) completeStep(1);  // 同期成功時のみ step1 完了マーク
         // データ取得後もドラフトは保持（復元ボタンで戻せる）
       } catch (e) { log('エラー: ' + e.message); }
       finally {
@@ -1481,7 +1500,10 @@ Amazon SKU → NE商品コードに変換（set_componentsで展開）
             <h4>計算フロー全体像</h4>
             <pre style="font-size:12px;line-height:1.6;background:#f8f9fa;padding:12px;border-radius:6px;overflow-x:auto;">
 Step1: 実質FBA在庫の算出
-  = 販売可能 + 輸送中 + 受領中 + 準備中(3日超は除外)
+  = 販売可能 + 輸送中 + 受領中 + 準備中
+  ※ 準備中はリアルタイムSP-API(ACTIVEプラン7日以内)の値を一次ソースとする
+  ※ API取得不可時のみPLANNINGレポート由来を使用し、
+     その場合は working_first_seen が3日超のSKUは放置プランとして0扱い
 
 Step2: 日販の算出
   FBA日販 = FBA30日売上 ÷ 30
@@ -1502,22 +1524,54 @@ Step6: 倉庫在庫の按分
   倉庫在庫 = Yロケ以外の在庫のみ（Yロケは出庫禁止のため除外）
   FBA比率 = FBA日販 ÷ (FBA日販 + 他CH実効日販)
   FBA用在庫 = 倉庫在庫 × FBA比率
-  ※ 他CH売上の欠品補正あり（60日最大値 or 入荷日推定）
+  ※ 販売比率で按分することで、FBAと他CHの在庫日数が均等になる
+  ※ 他CH実効日販の補正（優先順位）:
+     1. 蓄積60日最大値 > 直近30日 → 欠品で落ちた実力値を採用
+     2. 入荷30日未満 + 他CH≦3個 → FBA日販×1.5で推定（控えめ）
+     3. 上記以外 → 現在の30日データをそのまま使用
+  ※ 入荷7日未満 + 両CH売上0 → 他CH日販を仮に1にして自社確保優先
 
 Step7: 推奨数 = min(必要補充数, FBA用在庫)
-  ※ 最低出荷カバー日数に満たない場合は除外
+  ※ 最低出荷カバー日数(7日)に満たない場合は除外（二度手間防止）
+  ※ FBA在庫0の場合は最低1日分に緩和（焼け石に水のみ除外）
   ※ 有効期限管理商品はこのフィルターを無効化（古い期限の滞留防止）
 
 Step7.5: 有効期限チェック
   FBAは同一商品で期限違いを同梱不可
   → 引当優先の最古期限のみ送れる → 推奨数を制限
+  ※ 必ず同一期限のみ送る（期限なしロケは合算しない）
+  ※ 期限管理SKUに期限なしロケ在庫がある場合は「データ不備」としてアラート
+     (ロケに期限登録を要求)
 
 Step8: 数量補正（2段階）
   A. 5個単位丸め（20個超の場合）
   B. ロケーション補正（±10%以内でロケ在庫区切りに寄せ）
 
-Step9: 緊急度スコア算出
-Step10: アラート判定</pre>
+Step9: 緊急度スコア算出（補充推奨用、recommended_qty>0のSKUが対象）
+Step10: アラート判定
+  missing(送り漏れ) / expiry_missing(期限データ不備) / excess(過剰在庫) /
+  cart_block(カート価格下落) / surge(急上昇) / stop(急停止)
+  ※ アラートは urgency_score とは独立。FBA欠品タブで別途表示
+
+【設定値の扱い】
+・non_fba_reserve_days は現在未使用（販売比率按分で均等日数を確保）
+・SKU例外マスタ(send_all/keep_minimum)は手動対応用の表示のみ、計算には反映しない
+
+【⚠ 重要な既知事項: PLANNINGレポートの不安定性】
+・本ツールはAmazon SP-APIの GET_FBA_INVENTORY_PLANNING_DATA レポートを
+  主データソースとして使用している
+・このレポートは Amazon 側で以下のSKUを除外する傾向が強い:
+    - FBA販売可能在庫ゼロのSKU
+    - 補充推奨対象外と判定された十分在庫があるSKU
+    - その他、同じ日でも取得タイミングで件数が変動(ランダム欠損あり)
+・PLANNINGレポートに掲載されないSKUは本画面の推奨計算対象から外れる
+・長期欠品中のSKU、取扱継続中なのに一時的にレポート欠損したSKU、
+  在庫充足のためAmazonが除外したSKUは、本画面の推奨リスト/FBA欠品タブ/
+  新規商品タブのどれにも表示されない可能性がある
+・重要SKUは定期的に Seller Central / ロジザード / 他発注管理ツール で
+  別途確認してください
+・参考: Amazon公式 GitHub Issue #5044
+  https://github.com/amzn/selling-partner-api-models/issues/5044</pre>
           </div>
 
           <div class="settings-group">

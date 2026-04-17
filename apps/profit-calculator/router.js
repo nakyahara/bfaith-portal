@@ -41,7 +41,11 @@ async function getSalesCountBySku(days = 365) { return callMiniPC(`/sales-count?
 async function searchByJan(jan) { return callMiniPC(`/search/jan/${encodeURIComponent(jan)}`); }
 async function searchByKeyword(keyword) { return callMiniPC(`/search/keyword?q=${encodeURIComponent(keyword)}`); }
 async function searchByPartNumber(pn) { return callMiniPC(`/search/part-number?q=${encodeURIComponent(pn)}`); }
-import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, deleteProduct, getSetItems, saveSetItems, syncListings as dbSyncListings, getListings, updateListing, bulkSave, getSyncMeta, getTrackingProducts, getPriceHistory, getRecentPriceHistory, savePriceHistory, updateProductPriceInfo, syncProductsFromListings, saveBulkSession, updateBulkSession, getBulkSessions, getBulkSessionById, deleteBulkSession } from './db.js';
+import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatus, updateResearch, promoteToProduct, saveProduct, getProducts, getProductById, updateProductStatus, updateProduct, deleteProduct, getSetItems, saveSetItems, syncListings as dbSyncListings, getListings, updateListing, bulkSave, getSyncMeta, getTrackingProducts, getPriceHistory, getRecentPriceHistory, savePriceHistory, updateProductPriceInfo, syncProductsFromListings, saveBulkSession, updateBulkSession, getBulkSessions, getBulkSessionById, deleteBulkSession,
+  // Phase 1A
+  createBulkSessionWithItems, listBulkSessions, getBulkSession, patchBulkSession,
+  listBulkItems, getAllBulkItems, updateBulkItem, updateBulkItemFromResearch, persistToDisk,
+  upsertBookmark, getRecentBookmarks } from './db.js';
 import { loadSuppliers, addSupplier, deleteSupplier } from './suppliers.js';
 import { loadShipping, addShipping, updateShipping, deleteShipping } from './shipping.js';
 import { getSetting, setSetting, getAllSettings } from './settings.js';
@@ -57,6 +61,37 @@ async function ensureDb() {
     await initDb();
     dbReady = true;
   }
+}
+
+// ── Phase 1A: users.json から displayName を引くヘルパー（5分キャッシュ） ──
+import fs from 'fs';
+const USERS_FILE = path.join(__dirname, '..', '..', 'data', 'users.json');
+let _usersCache = null;
+let _usersCacheAt = 0;
+function getUserDisplayName(email) {
+  if (!email) return null;
+  const now = Date.now();
+  if (!_usersCache || now - _usersCacheAt > 5 * 60 * 1000) {
+    try {
+      _usersCache = JSON.parse(fs.readFileSync(USERS_FILE, 'utf-8'));
+      _usersCacheAt = now;
+    } catch {
+      _usersCache = [];
+      _usersCacheAt = now;
+    }
+  }
+  const u = _usersCache.find(x => x.email === email);
+  return u ? u.displayName : null;
+}
+function enrichUserNames(session) {
+  if (!session) return session;
+  if (session.created_by) session.created_by_name = getUserDisplayName(session.created_by);
+  if (session.updated_by) session.updated_by_name = getUserDisplayName(session.updated_by);
+  // 集計カラムを正規名にリネーム
+  if (session.total_count_agg !== undefined) { session.total_count = session.total_count_agg; delete session.total_count_agg; }
+  if (session.processed_count_agg !== undefined) { session.processed_count = session.processed_count_agg; delete session.processed_count_agg; }
+  if (session.error_count_agg !== undefined) { session.error_count = session.error_count_agg; delete session.error_count_agg; }
+  return session;
 }
 
 // ── ページ配信 ──
@@ -764,8 +799,52 @@ function getCompositeRank(score) {
   return 'D';
 }
 
-// ── API: 一括リサーチ（SSE ストリーミング）v2.1 ──
+// ── Phase 1A: FBM 送料計算（サーバー側）──
+// クライアント側 calcFbmShipping(dims) と同等のロジック。
+// SSE ハンドラーが items の fbm_* を書き込むために使用する。
+function calcFbmShippingServer(dims, settings, shippingTable) {
+  const mode = settings?.fbmShippingMode || 'auto';
+  const l = parseFloat(dims?.length) || 0;
+  const w = parseFloat(dims?.width) || 0;
+  const h = parseFloat(dims?.height) || 0;
+  const weightG = (parseFloat(dims?.weight) || 0) * 1000;
+  const threeSum = l + w + h;
+
+  if (mode === 'easyship') {
+    const smallCost = parseInt(settings?.easyshipSmall) || 165;
+    const largeCost = parseInt(settings?.easyshipLarge) || 210;
+    const minDim = (l > 0 && w > 0 && h > 0) ? Math.min(l, w, h) : h;
+    if (minDim === 0) return { cost: smallCost, method: 'EasyShip小型(寸法不明)' };
+    if (minDim <= 3) return { cost: smallCost, method: 'EasyShip小型' };
+    return { cost: largeCost, method: 'EasyShip大型' };
+  }
+  if (mode === 'fixed') {
+    return { cost: parseInt(settings?.fixedShipping) || 0, method: '固定額' };
+  }
+  if (l === 0 && w === 0 && h === 0) {
+    return { cost: 237, method: 'ネコポス(寸法不明)' };
+  }
+  for (const s of (shippingTable || [])) {
+    if (s.name.includes('定形内') && l <= 23.5 && w <= 12 && h <= 1 && weightG <= parseInt(s.weight || 0)) return { cost: s.total, method: s.name };
+    if (s.name === 'ネコポス' && l <= 31.2 && w <= 22.8 && h <= 3 && weightG <= 1000) return { cost: s.total, method: s.name };
+    if (s.name === 'クリックポスト' && l <= 34 && w <= 25 && h <= 3 && weightG <= 1000) return { cost: s.total, method: s.name };
+    if (s.name.includes('定形外規格内') && l <= 34 && w <= 25 && h <= 3 && weightG <= parseInt(s.weight || 0)) return { cost: s.total, method: s.name };
+    if (s.name.includes('定形外規格外') && l <= 60 && threeSum <= 90 && weightG <= parseInt(s.weight || 0)) return { cost: s.total, method: s.name };
+    if (s.name === 'ゆうパケットパフ' && h <= 7 && weightG <= 1000) return { cost: s.total, method: s.name };
+    if (s.name === '宅急便50サイズ' && threeSum <= 50 && weightG <= 2000) return { cost: s.total, method: s.name };
+    if (s.name === '宅急便60サイズ' && threeSum <= 60 && weightG <= 2000) return { cost: s.total, method: s.name };
+    if (s.name === '宅急便80サイズ' && threeSum <= 80 && weightG <= 5000) return { cost: s.total, method: s.name };
+    if (s.name === '宅急便100サイズ' && threeSum <= 100 && weightG <= 10000) return { cost: s.total, method: s.name };
+    if (s.name === '宅急便140サイズ' && threeSum <= 140 && weightG <= 15000) return { cost: s.total, method: s.name };
+  }
+  return { cost: 945, method: '宅急便140(該当なし)' };
+}
+
+// ── API: Phase 1A 一括リサーチ（SSE ストリーミング）──
+// 仕様: §3.13 — session_id + item_ids で対象指定、サーバー側で items UPDATE、SSE は UI 反映のみ
 router.post('/api/bulk-research/stream', async (req, res) => {
+  await ensureDb();
+
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -777,28 +856,61 @@ router.post('/api/bulk-research/stream', async (req, res) => {
   };
 
   const {
-    items,
-    taxRate = 10,
+    session_id,
+    item_ids,
     fulfillmentMode = 'both',
-    shippingCostPerItem = 0,       // v2.1: 概算仕入送料
-    enableCompetitorAnalysis = false, // v2.1: 競合詳細分析ON/OFF
-  } = req.body;
+    shippingCostPerItem = 0,
+    enableCompetitorAnalysis = false,
+  } = req.body || {};
 
-  if (!items || !Array.isArray(items) || items.length === 0) {
-    send('error', { message: 'アイテムが指定されていません' });
+  if (!session_id || typeof session_id !== 'number') {
+    send('error', { message: 'session_id が指定されていません' });
     res.end();
     return;
   }
 
-  send('start', { total: items.length });
+  const session = getBulkSession(session_id, req.session.email);
+  if (!session) {
+    send('error', { message: 'セッションが見つかりません' });
+    res.end();
+    return;
+  }
+  if (session.deleted_at) {
+    send('error', { message: 'セッションは削除済みです' });
+    res.end();
+    return;
+  }
 
-  for (let i = 0; i < items.length; i++) {
-    const item = items[i];
-    const { jan, partNumber, productName, wholesalePrice } = item;
+  const settings = session.settings || {};
+  const taxRate = typeof settings.taxRate === 'number' ? settings.taxRate : parseInt(settings.taxRate) || 10;
+  const shippingTable = loadShipping();
+  const userEmail = req.session.email;
+
+  // 対象 items を取得: item_ids 指定があればそれ、なければ pending 全件
+  // Codex P1 (3回目) 対応: listBulkItems は limit を 500 にクランプするため、
+  // 500 行超のセッションでも全件リサーチするには getAllBulkItems (ページングなし) を使う
+  let targets;
+  if (Array.isArray(item_ids) && item_ids.length > 0) {
+    targets = getAllBulkItems(session_id, { ids: item_ids.map(Number) });
+  } else {
+    targets = getAllBulkItems(session_id, { filter: 'pending' });
+  }
+
+  if (targets.length === 0) {
+    send('error', { message: '対象行がありません' });
+    res.end();
+    return;
+  }
+
+  send('start', { total: targets.length, session_id });
+
+  for (let i = 0; i < targets.length; i++) {
+    const item = targets[i];
+    const { id: itemId, jan, part_number: partNumber, product_name: productName, wholesale_price: wholesalePrice } = item;
     const idx = i + 1;
 
     try {
-      send('progress', { current: idx, total: items.length, jan, partNumber, productName });
+      send('progress', { current: idx, total: targets.length, item_id: itemId, jan, partNumber, productName });
 
       // === Step 1: 3段階検索（JAN→型番→商品名）v2.1対応 ===
       let candidates = [];
@@ -852,8 +964,15 @@ router.post('/api/bulk-research/stream', async (req, res) => {
       }
 
       if (candidates.length === 0) {
+        updateBulkItemFromResearch(session_id, itemId, {
+          research_status: 'not_found',
+          research_message: 'Amazon商品が見つかりません',
+          match_type: 'none',
+          match_confidence: 'none',
+          researched_at: new Date().toISOString(),
+        }, userEmail, { skipSave: true });
         send('result', {
-          idx, jan, partNumber, productName, wholesalePrice,
+          item_id: itemId, idx, jan, partNumber, productName, wholesalePrice,
           status: 'not_found', message: 'Amazon商品が見つかりません',
           matchType: 'none', matchConfidence: 'none',
         });
@@ -868,8 +987,19 @@ router.post('/api/bulk-research/stream', async (req, res) => {
       // Step 3: 販売価格チェック
       const sellingPrice = product.currentPrice;
       if (!sellingPrice || sellingPrice <= 0) {
+        updateBulkItemFromResearch(session_id, itemId, {
+          research_status: 'no_price',
+          research_message: '販売価格が取得できません',
+          asin,
+          amazon_name: product.itemName,
+          image_url: product.image,
+          category: product.category || null,
+          match_type: matchType,
+          match_confidence: matchConfidence,
+          researched_at: new Date().toISOString(),
+        }, userEmail, { skipSave: true });
         send('result', {
-          idx, jan, partNumber, productName: productName || product.itemName,
+          item_id: itemId, idx, jan, partNumber, productName: productName || product.itemName,
           wholesalePrice, asin,
           image: product.image,
           amazonName: product.itemName,
@@ -958,7 +1088,57 @@ router.post('/api/bulk-research/stream', async (req, res) => {
       });
       const compositeRank = getCompositeRank(compositeScore);
 
+      // === Step 9: FBM 送料計算（サーバー側）===
+      let fbmShippingCost = null, fbmShippingMethod = null;
+      let fbmTotalProfit = null, fbmTotalProfitRate = null, fbmTotalJudgment = null;
+      if (fbmFees) {
+        const shipping = calcFbmShippingServer(product.dimensions, settings, shippingTable);
+        fbmShippingCost = shipping.cost;
+        fbmShippingMethod = shipping.method;
+        // Codex P1 (5回目) 対応: estimatedShipping (仕入送料) も差し引く
+        // FBA の利益計算 (上の Step5) では引いているが、ここで引き忘れていたため
+        // 仕入送料指定時に保存される FBM 利益が過大になっていた
+        fbmTotalProfit = sellingPrice - wholesalePriceWithTax - fbmFees.totalFee - fbmShippingCost - estimatedShipping;
+        fbmTotalProfitRate = sellingPrice > 0 ? Math.round((fbmTotalProfit / sellingPrice * 100) * 10) / 10 : 0;
+        fbmTotalJudgment = fbmTotalProfitRate >= 30 ? '◎' : fbmTotalProfitRate >= 20 ? '○' : fbmTotalProfitRate >= 10 ? '△' : '×';
+      }
+
+      // === DB UPDATE（SSE ハンドラー特権）===
+      updateBulkItemFromResearch(session_id, itemId, {
+        asin,
+        amazon_name: product.itemName,
+        image_url: product.image,
+        category: product.category || null,
+        sales_rank: product.salesRank === '-' ? null : (typeof product.salesRank === 'number' ? product.salesRank : null),
+        offer_count: product.offerCount ?? null,
+        selling_price: sellingPrice,
+        referral_fee: fbaFees?.referralFee ?? fbmFees?.referralFee ?? 0,
+        fba_fee: fbaFees?.fbaFee ?? 0,
+        total_fee: fbaFees?.totalFee ?? 0,
+        profit: fbaFees ? Math.round(profit) : null,
+        profit_rate: fbaFees ? Math.round(profitRate * 10) / 10 : null,
+        judgment: fbaFees ? judgment : null,
+        fbm_amazon_fee: fbmFees?.totalFee ?? null,
+        fbm_shipping_cost: fbmShippingCost,
+        fbm_shipping_method: fbmShippingMethod,
+        fbm_profit: fbmTotalProfit !== null ? Math.round(fbmTotalProfit) : null,
+        fbm_profit_rate: fbmTotalProfitRate,
+        fbm_judgment: fbmTotalJudgment,
+        match_type: matchType,
+        match_confidence: matchConfidence,
+        composite_score: compositeScore,
+        composite_rank: compositeRank,
+        competition_score: competitionScore,
+        sales_level: salesLevelInfo.level,
+        est_monthly_sales: estSales,
+        amazon_seller: competitorData?.amazonSeller ? 1 : 0,
+        research_status: 'ok',
+        research_message: null,
+        researched_at: new Date().toISOString(),
+      }, userEmail, { skipSave: true });
+
       send('result', {
+        item_id: itemId,
         idx, jan, partNumber, productName: productName || product.itemName,
         wholesalePrice, wholesalePriceWithTax,
         asin,
@@ -975,10 +1155,15 @@ router.post('/api/bulk-research/stream', async (req, res) => {
         profit: fbaFees ? profit : null,
         profitRate: fbaFees ? Math.round(profitRate * 10) / 10 : null,
         judgment: fbaFees ? judgment : null,
-        // FBM（Amazon手数料のみ。送料はフロントで加算）
+        // FBM（Amazon手数料 + サーバー計算済み送料・利益）
         fbmAmazonFee: fbmFees?.totalFee ?? null,
         fbmReferralFee: fbmFees?.referralFee ?? null,
-        // 寸法情報（フロントで送料自動判定に使用）
+        fbmShippingCost,
+        fbmShippingMethod,
+        fbmProfit: fbmTotalProfit,
+        fbmProfitRate: fbmTotalProfitRate,
+        fbmJudgment: fbmTotalJudgment,
+        // 寸法情報（参考）
         dimensions: product.dimensions,
         estMonthlySales: estSales,
         manufacturer: product.manufacturer,
@@ -1009,17 +1194,38 @@ router.post('/api/bulk-research/stream', async (req, res) => {
 
     } catch (err) {
       console.error(`[BulkResearch] エラー (${jan || partNumber || productName}):`, err.message);
+      try {
+        updateBulkItemFromResearch(session_id, itemId, {
+          research_status: 'error',
+          research_message: err.message?.slice(0, 500) || 'unknown error',
+          match_type: 'none',
+          match_confidence: 'none',
+          researched_at: new Date().toISOString(),
+        }, userEmail, { skipSave: true });
+      } catch (dbErr) {
+        console.error(`[BulkResearch] DB UPDATE失敗 (itemId=${itemId}):`, dbErr.message);
+      }
       send('result', {
-        idx, jan, partNumber, productName, wholesalePrice,
+        item_id: itemId, idx, jan, partNumber, productName, wholesalePrice,
         status: 'error', message: err.message,
         matchType: 'none', matchConfidence: 'none',
       });
       // エラー後も少し待機
       await new Promise(r => setTimeout(r, 1000));
     }
+
+    // バッチライト: 50 行ごとに永続化（Codex レビュー P2 対応）
+    // 単行ごとの saveToFile は updateBulkItemFromResearch の skipSave:true でスキップ済み
+    if ((i + 1) % 50 === 0) {
+      try { persistToDisk(); } catch (saveErr) { console.error('[BulkResearch] persistToDisk:', saveErr.message); }
+    }
   }
 
-  send('complete', { total: items.length });
+  // 最終永続化（skipSave で残っているバッチを全て書き出す）
+  try { persistToDisk(); } catch (saveErr) { console.error('[BulkResearch] final persistToDisk:', saveErr.message); }
+
+  // 進捗集計は items 集計が正（§3.14）— クライアントは完了後に session を再フェッチして取る
+  send('complete', { total: targets.length, session_id });
   res.end();
 });
 
@@ -1615,60 +1821,165 @@ router.post('/api/price-revision/refresh-cache', (req, res) => {
   res.json({ ok: true });
 });
 
-// ── API: 一括リサーチセッション管理 ──
+// ── API: Phase 1A 一括リサーチセッション管理 ──
+// 仕様: g:/共有ドライブ/AI_reference/システム設計/profit-calculator/Phase1A_実装仕様書_20260413.md
 
-// セッション一覧取得
+// 「続きから」カード用（/:id より先に置く — ルーティング優先順位のため）
+router.get('/api/bulk-sessions/bookmarks/recent', async (req, res) => {
+  try {
+    await ensureDb();
+    const limit = parseInt(req.query.limit) || 3;
+    const items = getRecentBookmarks(req.session.email, limit);
+    res.json(items);
+  } catch (err) {
+    console.error('[ProfitCalc] getRecentBookmarks:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// セッション一覧（タブ別: mine / bookmarked / team）
 router.get('/api/bulk-sessions', async (req, res) => {
   try {
     await ensureDb();
-    const sessions = getBulkSessions();
-    res.json(sessions);
+    const filter = ['mine', 'bookmarked', 'team'].includes(req.query.filter) ? req.query.filter : 'mine';
+    const includeDeleted = req.query.include_deleted === '1';
+    const sessions = listBulkSessions(filter, req.session.email, { includeDeleted });
+    res.json(sessions.map(enrichUserNames));
   } catch (err) {
+    console.error('[ProfitCalc] listBulkSessions:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// セッション詳細取得（結果データ含む）
+// セッション詳細（items は含まない、ブックマーク込み）
 router.get('/api/bulk-sessions/:id', async (req, res) => {
   try {
     await ensureDb();
-    const session = getBulkSessionById(parseInt(req.params.id));
-    if (!session) return res.status(404).json({ error: 'セッションが見つかりません' });
-    res.json(session);
+    const id = parseInt(req.params.id);
+    if (Number.isNaN(id)) return res.status(400).json({ error: 'invalid_id' });
+    const session = getBulkSession(id, req.session.email);
+    if (!session) return res.status(404).json({ error: 'not_found' });
+    res.json(enrichUserNames(session));
   } catch (err) {
+    console.error('[ProfitCalc] getBulkSession:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// セッション保存（新規）
+// セッション作成 + items 一括 INSERT（atomic）
 router.post('/api/bulk-sessions', async (req, res) => {
   try {
     await ensureDb();
-    const id = saveBulkSession(req.body);
-    res.json({ id });
+    const { name, source_filename, settings, visibility, rows } = req.body || {};
+    if (!name || typeof name !== 'string') return res.status(400).json({ error: 'name_required' });
+    const result = createBulkSessionWithItems({
+      name,
+      sourceFilename: source_filename,
+      settings,
+      visibility,
+      rows,
+      userEmail: req.session.email,
+    });
+    res.status(201).json(result);
   } catch (err) {
+    if (err.statusCode) return res.status(err.statusCode).json({ error: err.message });
+    console.error('[ProfitCalc] createBulkSessionWithItems:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// セッション更新
-router.put('/api/bulk-sessions/:id', async (req, res) => {
+// セッションメタ更新（name / visibility / deleted_at）
+router.patch('/api/bulk-sessions/:id', async (req, res) => {
   try {
     await ensureDb();
-    updateBulkSession(parseInt(req.params.id), req.body);
-    res.json({ ok: true });
+    const id = parseInt(req.params.id);
+    if (Number.isNaN(id)) return res.status(400).json({ error: 'invalid_id' });
+    const result = patchBulkSession(id, req.body || {}, req.session.email);
+    res.json(result);
   } catch (err) {
+    if (err.statusCode) return res.status(err.statusCode).json({ error: err.message });
+    console.error('[ProfitCalc] patchBulkSession:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// セッション削除
+// 行一覧（ページング + filter + sort + anchor_item_id）
+router.get('/api/bulk-sessions/:id/items', async (req, res) => {
+  try {
+    await ensureDb();
+    const sessionId = parseInt(req.params.id);
+    if (Number.isNaN(sessionId)) return res.status(400).json({ error: 'invalid_id' });
+    // visibility チェック: private セッションは作成者以外に返さない
+    const sessionCheck = getBulkSession(sessionId, req.session.email);
+    if (!sessionCheck) return res.status(404).json({ error: 'not_found' });
+    const options = {
+      offset: parseInt(req.query.offset) || 0,
+      limit: parseInt(req.query.limit) || 100,
+      filter: req.query.filter || 'all',
+      sort: req.query.sort || 'row_no',
+      order: req.query.order || 'asc',
+      anchorItemId: req.query.anchor_item_id ? parseInt(req.query.anchor_item_id) : null,
+    };
+    const result = listBulkItems(sessionId, options);
+    res.json(result);
+  } catch (err) {
+    console.error('[ProfitCalc] listBulkItems:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 行単位 PATCH — Phase 1A ではホワイトリストが空のため常に 400
+router.patch('/api/bulk-sessions/:id/items/:itemId', async (req, res) => {
+  try {
+    await ensureDb();
+    const sessionId = parseInt(req.params.id);
+    const itemId = parseInt(req.params.itemId);
+    if (Number.isNaN(sessionId) || Number.isNaN(itemId)) return res.status(400).json({ error: 'invalid_id' });
+    const body = req.body || {};
+    if (body.row_version === undefined) return res.status(400).json({ error: 'row_version_required' });
+    const ALLOWED_FIELDS_1A = [];  // 1A では空
+    const dataFields = Object.keys(body).filter(k => k !== 'row_version');
+    if (dataFields.length === 0) return res.status(400).json({ error: 'no_updatable_fields_in_phase_1a' });
+    const disallowed = dataFields.filter(k => !ALLOWED_FIELDS_1A.includes(k));
+    if (disallowed.length > 0) return res.status(400).json({ error: 'field_not_allowed', fields: disallowed });
+    // 1A ではここに到達しない
+    res.status(500).json({ error: 'unreachable' });
+  } catch (err) {
+    console.error('[ProfitCalc] patch item:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ブックマーク upsert
+router.put('/api/bulk-sessions/:id/bookmark', async (req, res) => {
+  try {
+    await ensureDb();
+    const sessionId = parseInt(req.params.id);
+    if (Number.isNaN(sessionId)) return res.status(400).json({ error: 'invalid_id' });
+    const { last_item_id = null, view_state_json = null } = req.body || {};
+    upsertBookmark(sessionId, req.session.email, {
+      last_item_id: last_item_id !== null ? parseInt(last_item_id) : null,
+      view_state_json: view_state_json,
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    if (err.statusCode) return res.status(err.statusCode).json({ error: err.message });
+    console.error('[ProfitCalc] upsertBookmark:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 論理削除（互換のため DELETE も残す — 内部で deleted_at を立てる）
 router.delete('/api/bulk-sessions/:id', async (req, res) => {
   try {
     await ensureDb();
-    deleteBulkSession(parseInt(req.params.id));
+    const id = parseInt(req.params.id);
+    if (Number.isNaN(id)) return res.status(400).json({ error: 'invalid_id' });
+    patchBulkSession(id, { deleted_at: new Date().toISOString() }, req.session.email);
     res.json({ ok: true });
   } catch (err) {
+    if (err.statusCode) return res.status(err.statusCode).json({ error: err.message });
+    console.error('[ProfitCalc] soft delete:', err);
     res.status(500).json({ error: err.message });
   }
 });

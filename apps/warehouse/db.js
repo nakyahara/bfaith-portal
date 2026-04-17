@@ -611,6 +611,26 @@ function createTables() {
     value               TEXT,
     updated_at          TEXT
   )`);
+
+  // 21. Amazon SKU手数料キャッシュ（粗利ダッシュボード用）
+  //     SP-API getMyFeesEstimates でバッチ取得した結果を保存
+  //     更新頻度: 月1全SKU + 週1直近売れたSKU
+  db.exec(`CREATE TABLE IF NOT EXISTS amazon_sku_fees (
+    seller_sku          TEXT NOT NULL,
+    asin                TEXT,
+    fulfillment_channel TEXT,
+    referral_fee        REAL,
+    referral_fee_rate   REAL,
+    fba_fee             REAL,
+    variable_closing_fee REAL,
+    per_item_fee        REAL,
+    total_fee           REAL,
+    price_used          REAL,
+    fetched_at          TEXT NOT NULL,
+    PRIMARY KEY (seller_sku)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_asf_asin ON amazon_sku_fees(asin)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_asf_channel ON amazon_sku_fees(fulfillment_channel)');
 }
 
 function insertDefaultShops() {
@@ -648,7 +668,7 @@ function insertDefaultShops() {
 // ─── 統計取得 ───
 
 export function getStats() {
-  const tables = ['raw_ne_products', 'raw_ne_orders', 'raw_ne_set_products', 'raw_sp_orders', 'raw_sp_orders_log', 'raw_rakuten_orders', 'raw_rakuten_orders_log', 'raw_lz_inventory', 'sku_map', 'product_shipping', 'shipping_rates', 'exception_genka', 'product_sales_class', 'shops', 'm_products', 'm_set_components', 'f_sales_by_listing', 'f_sales_by_product', 'unmapped_sales'];
+  const tables = ['raw_ne_products', 'raw_ne_orders', 'raw_ne_set_products', 'raw_sp_orders', 'raw_sp_orders_log', 'raw_rakuten_orders', 'raw_rakuten_orders_log', 'raw_lz_inventory', 'sku_map', 'product_shipping', 'shipping_rates', 'exception_genka', 'product_sales_class', 'shops', 'm_products', 'm_set_components', 'f_sales_by_listing', 'f_sales_by_product', 'unmapped_sales', 'amazon_sku_fees'];
   const stats = {};
 
   for (const table of tables) {
