@@ -183,7 +183,7 @@
 
     function renderSummary(s) {
       if (!s) return;
-      const fmt = n => n.toLocaleString('ja-JP');
+      const fmt = n => (n || 0).toLocaleString('ja-JP');
       document.getElementById('summary-cards').innerHTML = `
         <div class="card"><div class="label">対象商品</div><div class="value">${fmt(s.count)}</div></div>
         <div class="card"><div class="label">売上合計</div><div class="value">${fmt(s.total_revenue)}</div></div>

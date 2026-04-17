@@ -247,7 +247,7 @@ router.get('/api/profit', (req, res) => {
     const totalRevenue = data.reduce((s, d) => s + d.revenue, 0);
     const totalCost = data.reduce((s, d) => s + d.cost, 0);
     const totalShipping = data.reduce((s, d) => s + d.shipping, 0);
-    const totalFee = data.reduce((s, d) => s + d.total_fee, 0);
+    const totalFee = data.reduce((s, d) => s + d.platform_fee, 0);
     const totalProfit = data.reduce((s, d) => s + d.gross_profit, 0);
 
     res.json({
