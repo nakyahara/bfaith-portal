@@ -430,19 +430,22 @@ function createTables() {
   `);
 
   // 未登録データ検出VIEW
+  // 注: 商品区分は m_products にのみ存在するので INNER JOIN で引く (raw_ne_products にはない)
   db.exec('DROP VIEW IF EXISTS v_missing_data');
   db.exec(`
     CREATE VIEW v_missing_data AS
     SELECT 'shipping' as missing_type, p.商品コード, p.商品名, p.売価, p.原価, p.取扱区分, NULL as last_sold
     FROM raw_ne_products p
+    INNER JOIN m_products mp ON p.商品コード = mp.商品コード COLLATE NOCASE
     LEFT JOIN product_shipping ps ON p.商品コード = ps.sku COLLATE NOCASE
-    WHERE p.商品区分 = '単品' AND ps.sku IS NULL
+    WHERE mp.商品区分 = '単品' AND ps.sku IS NULL
     UNION ALL
     SELECT 'genka' as missing_type, p.商品コード, p.商品名, p.売価, p.原価, p.取扱区分, NULL as last_sold
     FROM raw_ne_products p
+    INNER JOIN m_products mp ON p.商品コード = mp.商品コード COLLATE NOCASE
     LEFT JOIN exception_genka eg ON p.商品コード = eg.sku COLLATE NOCASE
     LEFT JOIN raw_ne_set_products sp ON p.商品コード = sp.セット商品コード
-    WHERE p.商品区分 = '単品' AND (p.原価 IS NULL OR p.原価 = 0) AND eg.sku IS NULL AND sp.セット商品コード IS NULL
+    WHERE mp.商品区分 = '単品' AND (p.原価 IS NULL OR p.原価 = 0) AND eg.sku IS NULL AND sp.セット商品コード IS NULL
     UNION ALL
     SELECT DISTINCT 'sku_map' as missing_type, o.seller_sku as 商品コード, o.title as 商品名,
       NULL as 売価, NULL as 原価, NULL as 取扱区分, MAX(SUBSTR(o.purchase_date, 1, 10)) as last_sold
