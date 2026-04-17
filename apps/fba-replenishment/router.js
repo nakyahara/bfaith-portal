@@ -31,12 +31,60 @@ function getServiceHeaders() {
     'Content-Type': 'application/json',
   };
 }
-async function callMiniPC(path, { method = 'GET', body, timeout = 300000 } = {}) {
+// ミニPCへのサービスAPI呼び出し。
+// - HTML/認証リダイレクト/upstream障害を区別したエラーメッセージを生成
+// - GETはネットワーク系/5xxで指数バックオフ+ジッタでリトライ (最大3回)
+// - POSTは副作用を避けるため自動リトライなし (冪等化できたら retry オプションで有効化可)
+async function callMiniPC(path, { method = 'GET', body, timeout = 60000, retry } = {}) {
   const url = `${WAREHOUSE_URL}/service-api/fba${path}`;
-  const options = { method, headers: getServiceHeaders(), signal: AbortSignal.timeout(timeout) };
-  if (body) options.body = JSON.stringify(body);
-  const res = await fetch(url, options);
-  return res.json();
+  const requestId = `r-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const headers = { ...getServiceHeaders(), 'x-request-id': requestId };
+  const maxAttempts = retry ?? (method === 'GET' ? 3 : 1);
+
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const options = { method, headers, redirect: 'manual', signal: AbortSignal.timeout(timeout) };
+      if (body) options.body = JSON.stringify(body);
+      const res = await fetch(url, options);
+      const ct = res.headers.get('content-type') || '';
+
+      if (res.status === 302 || res.status === 303) {
+        const loc = res.headers.get('location') || '';
+        throw new Error(`CF Access認証構成異常 (${res.status} → ${loc}) req=${requestId}`);
+      }
+      if (res.status === 401 || res.status === 403) {
+        throw new Error(`認証失敗 HTTP ${res.status} req=${requestId}`);
+      }
+      if ([502, 503, 504].includes(res.status)) {
+        lastError = new Error(`upstream障害 HTTP ${res.status} (CF tunnel/warehouse側) req=${requestId}`);
+        if (attempt < maxAttempts) {
+          await new Promise(r => setTimeout(r, Math.min(500 * 2 ** (attempt - 1), 4000) + Math.random() * 300));
+          continue;
+        }
+        throw lastError;
+      }
+      if (!res.ok) {
+        const txt = await res.text().catch(() => '');
+        throw new Error(`ミニPC HTTP ${res.status}: ${txt.slice(0, 200)} req=${requestId}`);
+      }
+      if (!ct.includes('application/json')) {
+        const txt = await res.text().catch(() => '');
+        throw new Error(`レスポンス形式異常 (ct=${ct || 'none'}): ${txt.slice(0, 200)} req=${requestId}`);
+      }
+      return await res.json();
+    } catch (e) {
+      const msg = e?.message || String(e);
+      const isRetryable = e?.name === 'TimeoutError' || /aborted|timeout|ECONNREFUSED|ENOTFOUND|fetch failed|upstream障害/i.test(msg);
+      if (isRetryable && attempt < maxAttempts) {
+        lastError = e;
+        await new Promise(r => setTimeout(r, Math.min(500 * 2 ** (attempt - 1), 4000) + Math.random() * 300));
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastError || new Error('callMiniPC: unknown error');
 }
 
 const router = express.Router();

@@ -10,6 +10,7 @@ import mercariRouter from './apps/mercari-sync/router.js';
 import aesRouter, { startPythonBackend, stopPythonBackend } from './apps/aes-pdf-sorter/router.js';
 import rankingRouter from './apps/ranking-checker/router.js';
 import { startScheduler } from './apps/ranking-checker/scheduler.js';
+import { startWarehouseHealthcheck } from './apps/warehouse/healthcheck.js';
 import profitRouter from './apps/profit-calculator/router.js';
 import { startPriceWorker, startMaintenanceJobs } from './apps/profit-calculator/price-scheduler.js';
 import fbaRouter from './apps/fba-replenishment/router.js';
@@ -552,6 +553,9 @@ app.listen(PORT, () => {
 
   // 楽天順位チェッカー スケジューラー
   startScheduler();
+
+  // ミニPC warehouse死活監視
+  startWarehouseHealthcheck();
 
   // 価格改定ワーカー — 安全装置未実装のため無効化 (2026-03-30)
   // startPriceWorker();
