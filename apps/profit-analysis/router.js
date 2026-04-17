@@ -132,7 +132,7 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
           }
         }
         costExTax = totalCost * qty;
-        // FBA以外（FBM）は送料加算
+        // FBMは商品マスタの送料、FBAは後でfba_feeを送料欄に入れる
         if (channel !== 'FBA') {
           shipping = totalShip * qty;
         }
@@ -158,11 +158,13 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
     let fbaFee = 0;
 
     if (mallId === 'amazon') {
-      // Amazon: 手数料キャッシュから取得
       const feeData = feeMap.get(listingCode);
       if (feeData) {
         platformFee = (feeData.referral_fee || 0) * qty;
-        fbaFee = (feeData.fba_fee || 0) * qty;
+        // FBA: 配送代行手数料を送料欄に入れる
+        if (channel === 'FBA') {
+          shipping = (feeData.fba_fee || 0) * qty;
+        }
       } else {
         platformFee = revenue * 0.15;
       }
@@ -171,9 +173,8 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
       platformFee = revenue * rate;
     }
 
-    const totalFee = platformFee + fbaFee;
-    // 粗利 = 売価 - PF手数料 - FBA手数料 - 送料 - 原価(税込)
-    const grossProfit = revenue - totalFee - shipping - cost;
+    // 粗利 = 売価 - PF手数料 - 送料(FBA配送代行 or 自社送料) - 原価(税込)
+    const grossProfit = revenue - platformFee - shipping - cost;
     const grossMarginRate = revenue > 0 ? (grossProfit / revenue * 100) : 0;
 
     results.push({
@@ -186,8 +187,6 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
       cost: Math.round(cost),
       shipping: Math.round(shipping),
       platform_fee: Math.round(platformFee),
-      fba_fee: Math.round(fbaFee),
-      total_fee: Math.round(totalFee),
       gross_profit: Math.round(grossProfit),
       margin_rate: Math.round(grossMarginRate * 10) / 10,
       cost_source: costSource,

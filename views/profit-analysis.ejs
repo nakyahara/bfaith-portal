@@ -259,7 +259,6 @@
         { key: 'cost', label: '原価(税込)' },
         { key: 'shipping', label: '送料' },
         { key: 'platform_fee', label: 'PF手数料' },
-        { key: 'fba_fee', label: 'FBA手数料' },
         { key: 'gross_profit', label: '粗利額' },
         { key: 'margin_rate', label: '粗利率%' },
       ];
@@ -293,7 +292,6 @@
         html += `<td>${fmt(d.cost)}</td>`;
         html += `<td>${fmt(d.shipping)}</td>`;
         html += `<td>${fmt(d.platform_fee)}</td>`;
-        html += `<td>${fmt(d.fba_fee)}</td>`;
         html += `<td style="color:${d.gross_profit < 0 ? '#dc2626' : '#111'};font-weight:600;">${fmt(d.gross_profit)}</td>`;
         html += `<td style="font-weight:600;color:${d.margin_rate < 5 ? '#dc2626' : d.margin_rate < 10 ? '#f59e0b' : '#16a34a'}">${d.margin_rate}%</td>`;
 
@@ -320,10 +318,10 @@
       const data = currentData.filter(d => d.revenue >= minRevenue);
       if (!data.length) return alert('データがありません');
 
-      const headers = ['コード','商品名','モール','チャネル','数量','売上','原価(税込)','送料','PF手数料','FBA手数料','粗利額','粗利率%','原価ソース'];
+      const headers = ['コード','商品名','モール','チャネル','数量','売上','原価(税込)','送料','PF手数料','粗利額','粗利率%','原価ソース'];
       const rows = data.map(d => [
         d.listing_code, d.product_name, d.mall, d.channel, d.qty,
-        d.revenue, d.cost, d.shipping, d.platform_fee, d.fba_fee, d.gross_profit, d.margin_rate, d.cost_source,
+        d.revenue, d.cost, d.shipping, d.platform_fee, d.gross_profit, d.margin_rate, d.cost_source,
       ]);
 
       const esc = v => { const s = String(v ?? ''); return s.includes(',') || s.includes('"') || s.includes('\n') ? '"' + s.replace(/"/g, '""') + '"' : s; };
