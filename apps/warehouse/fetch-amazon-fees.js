@@ -57,16 +57,22 @@ function now() {
  * 全アクティブSKU（sku_map + raw_sp_orders から取引実績あり）
  */
 function getAllActiveSkus(db) {
+  // sku_mapの全SKUに対して、raw_sp_ordersから最新の価格・チャネルを取得
+  // COLLATE NOCASEを避けてインデックスを効かせる
   return db.prepare(`
-    SELECT DISTINCT sm.seller_sku, sm.asin,
-      CASE WHEN o.fulfillment_channel = 'Amazon' THEN 'FBA' ELSE 'FBM' END as channel,
-      MAX(o.item_price / NULLIF(o.quantity, 0)) as last_price
-    FROM sku_map sm
-    INNER JOIN raw_sp_orders o ON sm.seller_sku = o.seller_sku COLLATE NOCASE
-    WHERE o.order_status NOT IN ('Cancelled')
-      AND o.item_price > 0
-      AND o.quantity > 0
-    GROUP BY sm.seller_sku
+    SELECT sm.seller_sku, sm.asin,
+      COALESCE(sub.channel, 'FBA') as channel,
+      COALESCE(sub.last_price, 0) as last_price
+    FROM (SELECT DISTINCT seller_sku, asin FROM sku_map) sm
+    LEFT JOIN (
+      SELECT seller_sku,
+        CASE WHEN fulfillment_channel = 'Amazon' THEN 'FBA' ELSE 'FBM' END as channel,
+        MAX(item_price / NULLIF(quantity, 0)) as last_price
+      FROM raw_sp_orders
+      WHERE order_status NOT IN ('Cancelled') AND item_price > 0 AND quantity > 0
+      GROUP BY seller_sku
+    ) sub ON sm.seller_sku = sub.seller_sku
+    WHERE sub.last_price > 0
   `).all();
 }
 
@@ -78,17 +84,20 @@ function getRecentSkus(db, days = 30) {
   cutoff.setDate(cutoff.getDate() - days);
   const cutoffStr = cutoff.toISOString().slice(0, 10);
 
+  // 直近N日で注文があったSKUのみ取得（インデックス活用）
   return db.prepare(`
-    SELECT DISTINCT sm.seller_sku, sm.asin,
-      CASE WHEN o.fulfillment_channel = 'Amazon' THEN 'FBA' ELSE 'FBM' END as channel,
-      MAX(o.item_price / NULLIF(o.quantity, 0)) as last_price
-    FROM sku_map sm
-    INNER JOIN raw_sp_orders o ON sm.seller_sku = o.seller_sku COLLATE NOCASE
-    WHERE o.order_status NOT IN ('Cancelled')
-      AND o.purchase_date >= ?
-      AND o.item_price > 0
-      AND o.quantity > 0
-    GROUP BY sm.seller_sku
+    SELECT sm.seller_sku, sm.asin,
+      COALESCE(sub.channel, 'FBA') as channel,
+      COALESCE(sub.last_price, 0) as last_price
+    FROM (SELECT DISTINCT seller_sku, asin FROM sku_map) sm
+    INNER JOIN (
+      SELECT seller_sku,
+        CASE WHEN fulfillment_channel = 'Amazon' THEN 'FBA' ELSE 'FBM' END as channel,
+        MAX(item_price / NULLIF(quantity, 0)) as last_price
+      FROM raw_sp_orders
+      WHERE order_status NOT IN ('Cancelled') AND purchase_date >= ? AND item_price > 0 AND quantity > 0
+      GROUP BY seller_sku
+    ) sub ON sm.seller_sku = sub.seller_sku
   `).all(cutoffStr);
 }
 
@@ -96,31 +105,28 @@ function getRecentSkus(db, days = 30) {
  * 特定SKU
  */
 function getSpecificSku(db, sku) {
-  const row = db.prepare(`
-    SELECT sm.seller_sku, sm.asin,
-      CASE WHEN o.fulfillment_channel = 'Amazon' THEN 'FBA' ELSE 'FBM' END as channel,
-      MAX(o.item_price / NULLIF(o.quantity, 0)) as last_price
-    FROM sku_map sm
-    LEFT JOIN raw_sp_orders o ON sm.seller_sku = o.seller_sku COLLATE NOCASE
-      AND o.order_status NOT IN ('Cancelled')
-    WHERE sm.seller_sku = ? COLLATE NOCASE
-    GROUP BY sm.seller_sku
+  // sku_mapから取得
+  const smRow = db.prepare('SELECT seller_sku, asin FROM sku_map WHERE seller_sku = ? LIMIT 1').get(sku);
+
+  // raw_sp_ordersから最新価格・チャネル
+  const order = db.prepare(`
+    SELECT seller_sku, asin,
+      CASE WHEN fulfillment_channel = 'Amazon' THEN 'FBA' ELSE 'FBM' END as channel,
+      MAX(item_price / NULLIF(quantity, 0)) as last_price
+    FROM raw_sp_orders
+    WHERE seller_sku = ? AND order_status NOT IN ('Cancelled')
+    GROUP BY seller_sku
   `).get(sku);
 
-  if (!row) {
-    // sku_mapになくても直接指定を許可
-    const order = db.prepare(`
-      SELECT seller_sku, asin,
-        CASE WHEN fulfillment_channel = 'Amazon' THEN 'FBA' ELSE 'FBM' END as channel,
-        MAX(item_price / NULLIF(quantity, 0)) as last_price
-      FROM raw_sp_orders
-      WHERE seller_sku = ? COLLATE NOCASE
-        AND order_status NOT IN ('Cancelled')
-      GROUP BY seller_sku
-    `).get(sku);
-    return order ? [order] : [];
+  if (smRow) {
+    return [{
+      seller_sku: smRow.seller_sku,
+      asin: smRow.asin || order?.asin,
+      channel: order?.channel || 'FBA',
+      last_price: order?.last_price || 0,
+    }];
   }
-  return [row];
+  return order ? [order] : [];
 }
 
 // ─── SP-API バッチ手数料取得 ───
