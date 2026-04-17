@@ -69,22 +69,24 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
   prodSalesSql += ' GROUP BY 商品コード, モール';
   const prodSales = db.prepare(prodSalesSql).all(...prodParams);
 
-  // 3. 商品マスタ（原価）
+  // 3. 商品マスタ（原価 + 送料）
   const products = db.prepare(`
-    SELECT 商品コード, 商品名, 原価, 原価ソース, 原価状態, 標準売価, 消費税率, 売上分類
+    SELECT 商品コード, 商品名, 原価, 原価ソース, 原価状態, 標準売価, 消費税率, 売上分類, 送料
     FROM mirror_products
   `).all();
   const productMap = new Map();
   for (const p of products) {
-    productMap.set(p.商品コード, p);
+    // f_sales_by_listingはLOWER()で格納されるのでキーも小文字化
+    productMap.set(p.商品コード?.toLowerCase(), p);
   }
 
-  // 4. SKUマップ
+  // 4. SKUマップ（seller_skuもne_codeも小文字で統一）
   const skuMap = db.prepare('SELECT seller_sku, ne_code, 数量 FROM mirror_sku_map').all();
   const skuToNeMap = new Map();
   for (const m of skuMap) {
-    if (!skuToNeMap.has(m.seller_sku)) skuToNeMap.set(m.seller_sku, []);
-    skuToNeMap.get(m.seller_sku).push({ ne_code: m.ne_code, qty: m.数量 || 1 });
+    const key = m.seller_sku?.toLowerCase();
+    if (!skuToNeMap.has(key)) skuToNeMap.set(key, []);
+    skuToNeMap.get(key).push({ ne_code: m.ne_code?.toLowerCase(), qty: m.数量 || 1 });
   }
 
   // 5. Amazon手数料キャッシュ
@@ -92,7 +94,7 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
   try {
     const fees = db.prepare('SELECT * FROM mirror_amazon_sku_fees').all();
     for (const f of fees) {
-      feeMap.set(f.seller_sku, f);
+      feeMap.set(f.seller_sku?.toLowerCase(), f);
     }
   } catch { /* テーブルがまだない場合 */ }
 
@@ -108,8 +110,11 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
 
     if (revenue <= 0 || qty <= 0) continue;
 
-    // 原価計算: Amazon系はSKUマップ経由、他モールは直接
-    let cost = 0;
+    // 原価計算: 原価(税抜) × 税率 = 原価(税込)
+    // 送料: Amazon FBA以外は送料を加算
+    let costExTax = 0; // 原価(税抜)
+    let taxRate = 1.1;  // デフォルト10%
+    let shipping = 0;
     let costSource = '不明';
     let productName = listingCode;
 
@@ -118,50 +123,60 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
       const neEntries = skuToNeMap.get(listingCode);
       if (neEntries) {
         let totalCost = 0;
+        let totalShip = 0;
         for (const entry of neEntries) {
           const prod = productMap.get(entry.ne_code);
-          if (prod?.原価 != null) {
-            totalCost += prod.原価 * entry.qty;
-            if (!productName || productName === listingCode) productName = prod.商品名;
+          if (prod) {
+            if (prod.原価) totalCost += prod.原価 * entry.qty;
+            taxRate = 1 + (prod.消費税率 || 10) / 100;
+            if (prod.送料) totalShip += prod.送料 * entry.qty;
+            if (productName === listingCode && prod.商品名) productName = prod.商品名;
           }
         }
-        cost = totalCost * qty;
-        costSource = 'SKU→NE';
+        costExTax = totalCost * qty;
+        // FBMは商品マスタの送料、FBAは後でfba_feeを送料欄に入れる
+        if (channel !== 'FBA') {
+          shipping = totalShip * qty;
+        }
+        costSource = neEntries.length > 0 ? 'SKU→NE' : '不明';
       }
     } else {
-      // 非Amazon: listingCodeがNE商品コードのケースもある
-      // by_productの数量と原価で計算
+      // 非Amazon: listingCode = NE商品コード（楽天/Yahoo/auPAY等）
       const prod = productMap.get(listingCode);
-      if (prod?.原価 != null) {
-        cost = prod.原価 * qty;
+      if (prod) {
+        costExTax = (prod.原価 || 0) * qty;
+        taxRate = 1 + (prod.消費税率 || 10) / 100;
+        shipping = (prod.送料 || 0) * qty;
         productName = prod.商品名 || listingCode;
         costSource = prod.原価ソース || 'NE';
       }
     }
+
+    // 原価(税込) = 原価(税抜) × 税率
+    const cost = costExTax * taxRate;
 
     // 手数料計算
     let platformFee = 0;
     let fbaFee = 0;
 
     if (mallId === 'amazon') {
-      // Amazon: 手数料キャッシュから取得
       const feeData = feeMap.get(listingCode);
       if (feeData) {
-        // キャッシュの手数料は1個あたりの金額
         platformFee = (feeData.referral_fee || 0) * qty;
-        fbaFee = (feeData.fba_fee || 0) * qty;
+        // FBA: 配送代行手数料を送料欄に入れる
+        if (channel === 'FBA') {
+          shipping = (feeData.fba_fee || 0) * qty;
+        }
       } else {
-        // フォールバック: 15%概算
         platformFee = revenue * 0.15;
       }
     } else {
-      // 他モール: CASE文料率
       const rate = MALL_FEE_RATES[mallId] || 0.10;
       platformFee = revenue * rate;
     }
 
-    const totalFee = platformFee + fbaFee;
-    const grossProfit = revenue - cost - totalFee;
+    // 粗利 = 売価 - PF手数料 - 送料(FBA配送代行 or 自社送料) - 原価(税込)
+    const grossProfit = revenue - platformFee - shipping - cost;
     const grossMarginRate = revenue > 0 ? (grossProfit / revenue * 100) : 0;
 
     results.push({
@@ -172,9 +187,8 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
       qty,
       revenue: Math.round(revenue),
       cost: Math.round(cost),
+      shipping: Math.round(shipping),
       platform_fee: Math.round(platformFee),
-      fba_fee: Math.round(fbaFee),
-      total_fee: Math.round(totalFee),
       gross_profit: Math.round(grossProfit),
       margin_rate: Math.round(grossMarginRate * 10) / 10,
       cost_source: costSource,
@@ -234,7 +248,8 @@ router.get('/api/profit', (req, res) => {
     // 集計サマリー
     const totalRevenue = data.reduce((s, d) => s + d.revenue, 0);
     const totalCost = data.reduce((s, d) => s + d.cost, 0);
-    const totalFee = data.reduce((s, d) => s + d.total_fee, 0);
+    const totalShipping = data.reduce((s, d) => s + d.shipping, 0);
+    const totalFee = data.reduce((s, d) => s + d.platform_fee, 0);
     const totalProfit = data.reduce((s, d) => s + d.gross_profit, 0);
 
     res.json({
@@ -243,6 +258,7 @@ router.get('/api/profit', (req, res) => {
         count: data.length,
         total_revenue: totalRevenue,
         total_cost: totalCost,
+        total_shipping: totalShipping,
         total_fee: totalFee,
         total_profit: totalProfit,
         avg_margin_rate: totalRevenue > 0 ? Math.round(totalProfit / totalRevenue * 1000) / 10 : 0,

@@ -7,3 +7,8 @@ venv/
 __pycache__/
 *.pyc
 data/
+
+# warehouse デバッグ用の一時スクリプト (scripts/safe-debug.mjs経由で実行する想定)
+check-rakuten*.mjs
+debug-*.mjs
+*.tmp.mjs
