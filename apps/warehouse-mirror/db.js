@@ -220,9 +220,17 @@ function createTables() {
     jpy_row           TEXT,      -- JSON: JPY換算後集計
     mgmt_row          TEXT,      -- JSON: 管理会計用15列集計（セグメント4・円建）
     cost_total        REAL,      -- 原価合計(税抜・円)
+    ad_cost           REAL DEFAULT 0,  -- 広告費(税込・円・手入力)
     confirmed_at      TEXT NOT NULL,
     csv_filename      TEXT
   )`);
+  // 既存テーブルに ad_cost カラムが無ければ追加
+  try {
+    const cols = db.prepare("PRAGMA table_info(mart_amazon_usa_monthly_summary)").all();
+    if (!cols.some(c => c.name === 'ad_cost')) {
+      db.exec('ALTER TABLE mart_amazon_usa_monthly_summary ADD COLUMN ad_cost REAL DEFAULT 0');
+    }
+  } catch {}
 
   db.exec(`CREATE TABLE IF NOT EXISTS mart_amazon_usa_upload_log (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
