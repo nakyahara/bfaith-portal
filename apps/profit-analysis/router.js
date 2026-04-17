@@ -126,11 +126,11 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
         let totalShip = 0;
         for (const entry of neEntries) {
           const prod = productMap.get(entry.ne_code);
-          if (prod?.原価 != null) {
-            totalCost += prod.原価 * entry.qty;
+          if (prod) {
+            if (prod.原価) totalCost += prod.原価 * entry.qty;
             taxRate = 1 + (prod.消費税率 || 10) / 100;
             if (prod.送料) totalShip += prod.送料 * entry.qty;
-            if (!productName || productName === listingCode) productName = prod.商品名;
+            if (productName === listingCode && prod.商品名) productName = prod.商品名;
           }
         }
         costExTax = totalCost * qty;
@@ -138,13 +138,13 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
         if (channel !== 'FBA') {
           shipping = totalShip * qty;
         }
-        costSource = 'SKU→NE';
+        costSource = neEntries.length > 0 ? 'SKU→NE' : '不明';
       }
     } else {
-      // 非Amazon: listingCodeがNE商品コードのケースもある
+      // 非Amazon: listingCode = NE商品コード（楽天/Yahoo/auPAY等）
       const prod = productMap.get(listingCode);
-      if (prod?.原価 != null) {
-        costExTax = prod.原価 * qty;
+      if (prod) {
+        costExTax = (prod.原価 || 0) * qty;
         taxRate = 1 + (prod.消費税率 || 10) / 100;
         shipping = (prod.送料 || 0) * qty;
         productName = prod.商品名 || listingCode;
