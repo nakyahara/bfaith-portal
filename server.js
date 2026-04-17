@@ -11,6 +11,7 @@ import aesRouter, { startPythonBackend, stopPythonBackend } from './apps/aes-pdf
 import rankingRouter from './apps/ranking-checker/router.js';
 import { startScheduler } from './apps/ranking-checker/scheduler.js';
 import { startWarehouseHealthcheck } from './apps/warehouse/healthcheck.js';
+import { startMetrics } from './apps/observability/metrics.js';
 import profitRouter from './apps/profit-calculator/router.js';
 import { startPriceWorker, startMaintenanceJobs } from './apps/profit-calculator/price-scheduler.js';
 import fbaRouter from './apps/fba-replenishment/router.js';
@@ -556,6 +557,9 @@ app.listen(PORT, () => {
 
   // ミニPC warehouse死活監視
   startWarehouseHealthcheck();
+
+  // event loop lag + heap/rss 観測
+  startMetrics();
 
   // 価格改定ワーカー — 安全装置未実装のため無効化 (2026-03-30)
   // startPriceWorker();
