@@ -76,15 +76,17 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
   `).all();
   const productMap = new Map();
   for (const p of products) {
-    productMap.set(p.商品コード, p);
+    // f_sales_by_listingはLOWER()で格納されるのでキーも小文字化
+    productMap.set(p.商品コード?.toLowerCase(), p);
   }
 
-  // 4. SKUマップ
+  // 4. SKUマップ（seller_skuもne_codeも小文字で統一）
   const skuMap = db.prepare('SELECT seller_sku, ne_code, 数量 FROM mirror_sku_map').all();
   const skuToNeMap = new Map();
   for (const m of skuMap) {
-    if (!skuToNeMap.has(m.seller_sku)) skuToNeMap.set(m.seller_sku, []);
-    skuToNeMap.get(m.seller_sku).push({ ne_code: m.ne_code, qty: m.数量 || 1 });
+    const key = m.seller_sku?.toLowerCase();
+    if (!skuToNeMap.has(key)) skuToNeMap.set(key, []);
+    skuToNeMap.get(key).push({ ne_code: m.ne_code?.toLowerCase(), qty: m.数量 || 1 });
   }
 
   // 5. Amazon手数料キャッシュ
@@ -92,7 +94,7 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
   try {
     const fees = db.prepare('SELECT * FROM mirror_amazon_sku_fees').all();
     for (const f of fees) {
-      feeMap.set(f.seller_sku, f);
+      feeMap.set(f.seller_sku?.toLowerCase(), f);
     }
   } catch { /* テーブルがまだない場合 */ }
 
