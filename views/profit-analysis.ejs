@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>粗利分析 - B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png"><link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    .container { max-width: 100%; margin: 0 auto; padding: 12px 20px; }
+    .header-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
+    .header-row h2 { margin: 0; }
+
+    .notice { background: #fffbeb; border: 1px solid #f59e0b; border-radius: 6px; padding: 8px 14px; font-size: 12px; color: #92400e; margin-bottom: 12px; }
+
+    .summary-cards { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+    .card { background: white; border-radius: 8px; padding: 14px 18px; min-width: 140px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    .card .label { font-size: 12px; color: #666; }
+    .card .value { font-size: 24px; font-weight: bold; margin-top: 4px; }
+    .card.danger .value { color: #dc2626; }
+    .card.warning .value { color: #f59e0b; }
+    .card.success .value { color: #16a34a; }
+
+    .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 2px solid #e5e7eb; }
+    .tab { padding: 8px 16px; border: none; background: none; cursor: pointer; font-size: 13px; font-weight: 500; color: #6b7280; border-bottom: 2px solid transparent; margin-bottom: -2px; }
+    .tab.active { color: #2563eb; border-bottom-color: #2563eb; }
+    .tab:hover { color: #1d4ed8; }
+
+    .filters { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+    .filters label { font-size: 13px; color: #555; }
+    .filters select, .filters input { padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 13px; }
+
+    .btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500; }
+    .btn-primary { background: #2563eb; color: white; }
+    .btn-primary:hover { background: #1d4ed8; }
+    .btn-primary:disabled { background: #93c5fd; cursor: not-allowed; }
+    .btn-export { background: #059669; color: white; }
+    .btn-export:hover { background: #047857; }
+
+    .table-wrap { max-height: calc(100vh - 380px); overflow: auto; border: 1px solid #e5e7eb; border-radius: 8px; }
+    .data-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .data-table th, .data-table td { border: 1px solid #e5e7eb; padding: 5px 8px; text-align: right; white-space: nowrap; }
+    .data-table th { background: #f3f4f6; position: sticky; top: 0; z-index: 10; text-align: center; font-size: 11px; cursor: pointer; user-select: none; }
+    .data-table th:hover { background: #e5e7eb; }
+    .data-table td:nth-child(1), .data-table td:nth-child(2), .data-table td:nth-child(3) { text-align: left; }
+    .data-table tr:hover { background: #f0f7ff; }
+
+    .row-danger { background: #fef2f2 !important; }
+    .row-danger:hover { background: #fee2e2 !important; }
+    .row-warning { background: #fffbeb !important; }
+    .row-warning:hover { background: #fef3c7 !important; }
+    .row-success { background: #f0fdf4 !important; }
+
+    .badge { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 600; }
+    .badge-fba { background: #dbeafe; color: #1e40af; }
+    .badge-fbm { background: #fef3c7; color: #92400e; }
+
+    .loading { text-align: center; padding: 40px; color: #6b7280; }
+    .empty { text-align: center; padding: 40px; color: #9ca3af; }
+
+    .fee-status { font-size: 11px; color: #6b7280; margin-bottom: 8px; }
+    .fee-status .ok { color: #16a34a; }
+    .fee-status .warn { color: #f59e0b; }
+  </style>
+</head>
+<body>
+  <nav class="top-nav">
+    <a href="/" class="nav-brand">B-Faith Portal</a>
+    <div class="nav-right">
+      <span class="nav-user"><%= displayName || username %></span>
+      <a href="/logout" class="nav-link">Logout</a>
+    </div>
+  </nav>
+
+  <div class="container">
+    <div class="header-row">
+      <h2>粗利分析</h2>
+      <div style="display:flex;gap:8px;">
+        <button class="btn btn-primary" onclick="loadData()" id="btn-load">データ取得</button>
+        <button class="btn btn-export" onclick="exportCSV()" id="btn-export" disabled>CSV出力</button>
+      </div>
+    </div>
+
+    <div class="notice">
+      粗利分析は現行原価・現行料率ベースの管理指標であり、過去時点の再現値ではありません。
+    </div>
+
+    <div class="tabs">
+      <button class="tab active" data-view="worst" onclick="switchView('worst')">ワースト商品</button>
+      <button class="tab" data-view="border" onclick="switchView('border')">ボーダー帯</button>
+      <button class="tab" data-view="trend" onclick="switchView('trend')">前月比悪化</button>
+      <button class="tab" data-view="mall" onclick="switchView('mall')">モール別比較</button>
+    </div>
+
+    <div class="filters">
+      <label>期間:
+        <select id="filter-days" onchange="loadData()">
+          <option value="30">直近30日</option>
+          <option value="60">直近60日</option>
+          <option value="90">直近90日</option>
+        </select>
+      </label>
+      <label>モール:
+        <select id="filter-mall" onchange="loadData()">
+          <option value="">全モール</option>
+          <option value="amazon">Amazon</option>
+          <option value="rakuten">楽天</option>
+          <option value="yahoo">Yahoo!</option>
+          <option value="aupay">au PAY</option>
+          <option value="qoo10">Qoo10</option>
+          <option value="linegift">LINEギフト</option>
+          <option value="mercari">メルカリ</option>
+        </select>
+      </label>
+      <label>最低売上:
+        <input type="number" id="filter-min-revenue" value="1000" min="0" step="1000" style="width:90px;" onchange="renderTable()">
+      </label>
+    </div>
+
+    <div id="fee-status" class="fee-status"></div>
+
+    <div class="summary-cards" id="summary-cards"></div>
+
+    <div id="table-container">
+      <div class="empty">「データ取得」を押してください</div>
+    </div>
+  </div>
+
+  <script>
+    let currentData = [];
+    let currentView = 'worst';
+    let sortCol = 'margin_rate';
+    let sortAsc = true;
+
+    function switchView(view) {
+      currentView = view;
+      document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.view === view));
+      if (view === 'trend') {
+        loadTrendData();
+      } else {
+        renderTable();
+      }
+    }
+
+    async function loadData() {
+      const days = document.getElementById('filter-days').value;
+      const mall = document.getElementById('filter-mall').value;
+      document.getElementById('table-container').innerHTML = '<div class="loading">データ読み込み中...</div>';
+      document.getElementById('btn-load').disabled = true;
+
+      try {
+        const [profitRes, feeRes] = await Promise.all([
+          fetch(`/apps/profit-analysis/api/profit?days=${days}&mall=${mall}`).then(r => r.json()),
+          fetch('/apps/profit-analysis/api/fee-status').then(r => r.json()),
+        ]);
+
+        currentData = profitRes.items || [];
+        renderSummary(profitRes.summary);
+        renderFeeStatus(feeRes);
+        renderTable();
+        document.getElementById('btn-export').disabled = false;
+      } catch (e) {
+        document.getElementById('table-container').innerHTML = `<div class="empty" style="color:#dc2626;">エラー: ${e.message}</div>`;
+      } finally {
+        document.getElementById('btn-load').disabled = false;
+      }
+    }
+
+    async function loadTrendData() {
+      const mall = document.getElementById('filter-mall').value;
+      document.getElementById('table-container').innerHTML = '<div class="loading">前月比データ計算中...</div>';
+
+      try {
+        const res = await fetch(`/apps/profit-analysis/api/profit/trend?mall=${mall}`).then(r => r.json());
+        currentData = res.items || [];
+        sortCol = 'profit_change_pct';
+        sortAsc = true;
+        renderTable();
+      } catch (e) {
+        document.getElementById('table-container').innerHTML = `<div class="empty" style="color:#dc2626;">エラー: ${e.message}</div>`;
+      }
+    }
+
+    function renderSummary(s) {
+      if (!s) return;
+      const fmt = n => n.toLocaleString('ja-JP');
+      document.getElementById('summary-cards').innerHTML = `
+        <div class="card"><div class="label">対象商品</div><div class="value">${fmt(s.count)}</div></div>
+        <div class="card"><div class="label">売上合計</div><div class="value">${fmt(s.total_revenue)}</div></div>
+        <div class="card"><div class="label">原価合計</div><div class="value">${fmt(s.total_cost)}</div></div>
+        <div class="card"><div class="label">手数料合計</div><div class="value">${fmt(s.total_fee)}</div></div>
+        <div class="card ${s.total_profit < 0 ? 'danger' : 'success'}"><div class="label">粗利合計</div><div class="value">${fmt(s.total_profit)}</div></div>
+        <div class="card ${s.avg_margin_rate < 10 ? 'danger' : s.avg_margin_rate < 15 ? 'warning' : 'success'}"><div class="label">平均粗利率</div><div class="value">${s.avg_margin_rate}%</div></div>
+      `;
+    }
+
+    function renderFeeStatus(f) {
+      const el = document.getElementById('fee-status');
+      if (f.total > 0) {
+        el.innerHTML = `Amazon手数料キャッシュ: <span class="ok">${f.total}件</span> (FBA: ${f.fba}, FBM: ${f.fbm}) | 最古: ${f.oldest_fetch || '-'}`;
+      } else {
+        el.innerHTML = `Amazon手数料キャッシュ: <span class="warn">未取得（概算15%で計算中）</span>`;
+      }
+    }
+
+    function renderTable() {
+      const minRevenue = parseInt(document.getElementById('filter-min-revenue').value) || 0;
+      let data = currentData.filter(d => d.revenue >= minRevenue);
+
+      // ビュー別フィルタ
+      if (currentView === 'worst') {
+        // 粗利率の低い順
+        sortCol = sortCol || 'margin_rate';
+      } else if (currentView === 'border') {
+        // 粗利率10〜15%帯
+        data = data.filter(d => d.margin_rate >= 10 && d.margin_rate <= 15);
+      } else if (currentView === 'mall') {
+        // モール別比較: 同一商品が複数モールにある場合のみ
+        const codeCount = {};
+        for (const d of data) {
+          const key = d.listing_code;
+          if (!codeCount[key]) codeCount[key] = new Set();
+          codeCount[key].add(d.mall);
+        }
+        const multiMall = new Set(Object.keys(codeCount).filter(k => codeCount[k].size > 1));
+        data = data.filter(d => multiMall.has(d.listing_code));
+        data.sort((a, b) => a.listing_code.localeCompare(b.listing_code) || a.margin_rate - b.margin_rate);
+      }
+
+      // ソート
+      if (currentView !== 'mall') {
+        data.sort((a, b) => {
+          let va = a[sortCol], vb = b[sortCol];
+          if (typeof va === 'string') { va = va.toLowerCase(); vb = (vb||'').toLowerCase(); }
+          if (va < vb) return sortAsc ? -1 : 1;
+          if (va > vb) return sortAsc ? 1 : -1;
+          return 0;
+        });
+      }
+
+      if (data.length === 0) {
+        document.getElementById('table-container').innerHTML = '<div class="empty">該当データなし</div>';
+        return;
+      }
+
+      const isTrend = currentView === 'trend';
+      const fmt = n => (n || 0).toLocaleString('ja-JP');
+
+      let html = '<div class="table-wrap"><table class="data-table"><thead><tr>';
+
+      // ヘッダー
+      const cols = [
+        { key: 'listing_code', label: 'コード' },
+        { key: 'product_name', label: '商品名' },
+        { key: 'mall', label: 'モール' },
+        { key: 'qty', label: '数量' },
+        { key: 'revenue', label: '売上' },
+        { key: 'cost', label: '原価' },
+        { key: 'platform_fee', label: 'PF手数料' },
+        { key: 'fba_fee', label: 'FBA手数料' },
+        { key: 'gross_profit', label: '粗利額' },
+        { key: 'margin_rate', label: '粗利率%' },
+      ];
+      if (isTrend) {
+        cols.push({ key: 'prev_profit', label: '前月粗利' });
+        cols.push({ key: 'profit_change_pct', label: '変化率%' });
+      }
+
+      for (const c of cols) {
+        const arrow = sortCol === c.key ? (sortAsc ? ' ▲' : ' ▼') : '';
+        html += `<th onclick="doSort('${c.key}')">${c.label}${arrow}</th>`;
+      }
+      html += '</tr></thead><tbody>';
+
+      for (const d of data) {
+        let rowClass = '';
+        if (d.margin_rate < 5) rowClass = 'row-danger';
+        else if (d.margin_rate < 10) rowClass = 'row-warning';
+        else if (d.margin_rate >= 20) rowClass = 'row-success';
+
+        const mallLabel = { amazon: 'Amazon', rakuten: '楽天', yahoo: 'Yahoo!', aupay: 'au PAY', qoo10: 'Qoo10', linegift: 'LINEギフト', mercari: 'メルカリ' }[d.mall] || d.mall;
+        const channelBadge = d.channel === 'FBA' ? ' <span class="badge badge-fba">FBA</span>' :
+                             d.channel === 'FBM' ? ' <span class="badge badge-fbm">FBM</span>' : '';
+
+        html += `<tr class="${rowClass}">`;
+        html += `<td>${d.listing_code}</td>`;
+        html += `<td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;" title="${(d.product_name||'').replace(/"/g,'&quot;')}">${d.product_name || '-'}</td>`;
+        html += `<td>${mallLabel}${channelBadge}</td>`;
+        html += `<td>${fmt(d.qty)}</td>`;
+        html += `<td>${fmt(d.revenue)}</td>`;
+        html += `<td>${fmt(d.cost)}</td>`;
+        html += `<td>${fmt(d.platform_fee)}</td>`;
+        html += `<td>${fmt(d.fba_fee)}</td>`;
+        html += `<td style="color:${d.gross_profit < 0 ? '#dc2626' : '#111'};font-weight:600;">${fmt(d.gross_profit)}</td>`;
+        html += `<td style="font-weight:600;color:${d.margin_rate < 5 ? '#dc2626' : d.margin_rate < 10 ? '#f59e0b' : '#16a34a'}">${d.margin_rate}%</td>`;
+
+        if (isTrend) {
+          html += `<td>${fmt(d.prev_profit)}</td>`;
+          html += `<td style="color:#dc2626;font-weight:600;">${d.profit_change_pct}%</td>`;
+        }
+        html += '</tr>';
+      }
+
+      html += '</tbody></table></div>';
+      html += `<div style="font-size:11px;color:#9ca3af;margin-top:4px;">${data.length}件表示</div>`;
+      document.getElementById('table-container').innerHTML = html;
+    }
+
+    function doSort(col) {
+      if (sortCol === col) { sortAsc = !sortAsc; }
+      else { sortCol = col; sortAsc = col === 'margin_rate' || col === 'profit_change_pct'; }
+      renderTable();
+    }
+
+    function exportCSV() {
+      const minRevenue = parseInt(document.getElementById('filter-min-revenue').value) || 0;
+      const data = currentData.filter(d => d.revenue >= minRevenue);
+      if (!data.length) return alert('データがありません');
+
+      const headers = ['コード','商品名','モール','チャネル','数量','売上','原価','PF手数料','FBA手数料','粗利額','粗利率%','原価ソース'];
+      const rows = data.map(d => [
+        d.listing_code, d.product_name, d.mall, d.channel, d.qty,
+        d.revenue, d.cost, d.platform_fee, d.fba_fee, d.gross_profit, d.margin_rate, d.cost_source,
+      ]);
+
+      const esc = v => { const s = String(v ?? ''); return s.includes(',') || s.includes('"') || s.includes('\n') ? '"' + s.replace(/"/g, '""') + '"' : s; };
+      const csv = '\uFEFF' + [headers.join(','), ...rows.map(r => r.map(esc).join(','))].join('\r\n');
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `粗利分析_${currentView}_${new Date().toISOString().slice(0,10)}.csv`;
+      a.click();
+    }
+  </script>
+</body>
+</html>

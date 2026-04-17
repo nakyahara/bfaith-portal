@@ -133,6 +133,23 @@ function createTables() {
     updated_at        TEXT
   )`);
 
+  // mirror_amazon_sku_fees — Amazon手数料キャッシュ（粗利ダッシュボード用）
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_amazon_sku_fees (
+    seller_sku          TEXT PRIMARY KEY,
+    asin                TEXT,
+    fulfillment_channel TEXT,
+    referral_fee        REAL,
+    referral_fee_rate   REAL,
+    fba_fee             REAL,
+    variable_closing_fee REAL,
+    per_item_fee        REAL,
+    total_fee           REAL,
+    price_used          REAL,
+    fetched_at          TEXT NOT NULL
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mirasf_asin ON mirror_amazon_sku_fees(asin)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mirasf_channel ON mirror_amazon_sku_fees(fulfillment_channel)');
+
   // ─── mart_rakuten: 楽天売上集計ツール用 ───
 
   // mart_rakuten_monthly_summary — 月次確定集計

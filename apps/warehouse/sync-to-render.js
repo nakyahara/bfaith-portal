@@ -62,6 +62,15 @@ export async function syncToRender() {
   const sku_map = db.prepare('SELECT * FROM sku_map').all();
   console.log(`[Sync→Render]   sku_map: ${sku_map.length}件`);
 
+  // 2c. amazon_sku_fees（手数料キャッシュ）
+  let amazon_sku_fees = [];
+  try {
+    amazon_sku_fees = db.prepare('SELECT * FROM amazon_sku_fees').all();
+    console.log(`[Sync→Render]   amazon_sku_fees: ${amazon_sku_fees.length}件`);
+  } catch {
+    console.log(`[Sync→Render]   amazon_sku_fees: テーブル未作成（スキップ）`);
+  }
+
   // 3. sales_monthly（24ヶ月分、by_product + by_listing）
   const salesMonthlyProduct = db.prepare(`
     SELECT SUBSTR(日付, 1, 7) as 月, 商品コード, モール, MAX(商品名) as 商品名,
@@ -124,7 +133,7 @@ export async function syncToRender() {
 
   try {
     // Part 1: マスタデータ
-    await sendPart({ products, set_components, sku_map }, 'マスタ');
+    await sendPart({ products, set_components, sku_map, amazon_sku_fees }, 'マスタ');
 
     // Part 2: 月次集計（チャンク分割、9MB以下に収める）
     const monthlyChunkSize = 20000;

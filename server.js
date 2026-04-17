@@ -24,6 +24,7 @@ import linegiftAccountingRouter from './apps/linegift-accounting/router.js';
 import qoo10AccountingRouter from './apps/qoo10-accounting/router.js';
 import fbaProfitabilityRouter from './apps/fba-profitability/router.js';
 import mercariAccountingRouter from './apps/mercari-accounting/router.js';
+import profitAnalysisRouter from './apps/profit-analysis/router.js';
 import serviceRouter from './apps/warehouse/service-router.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -282,6 +283,15 @@ const apps = [
     status: 'active',
     category: 'accounting',
   },
+  {
+    id: 'profit-analysis',
+    name: '粗利分析',
+    description: '全モール横断の商品別粗利率分析・低利益商品の検出',
+    icon: '💹',
+    path: '/apps/profit-analysis',
+    status: 'active',
+    category: 'analysis',
+  },
 ];
 
 // 外部リンク
@@ -416,6 +426,7 @@ app.use('/apps/qoo10-accounting', (req, res, next) => {
   requireAuth(req, res, next);
 }, qoo10AccountingRouter);
 app.use('/apps/fba-profitability', requireAppAccess('fba-profitability'), fbaProfitabilityRouter);
+app.use('/apps/profit-analysis', requireAppAccess('profit-analysis'), profitAnalysisRouter);
 app.use('/apps/mercari-accounting', (req, res, next) => {
   if (req.path === '/import-history' && req.method === 'POST') return next();
   requireAuth(req, res, next);
