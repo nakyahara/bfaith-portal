@@ -89,6 +89,14 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
     skuToNeMap.get(key).push({ ne_code: m.ne_code?.toLowerCase(), qty: m.数量 || 1 });
   }
 
+  // 4b. 楽天SKUマップ（rakuten_code → ne_code、AM/AL/W 3段階フォールバック済み）
+  const rakutenSkuMap = new Map();
+  try {
+    for (const m of db.prepare('SELECT rakuten_code, ne_code FROM mirror_rakuten_sku_map').all()) {
+      rakutenSkuMap.set(m.rakuten_code?.toLowerCase(), m.ne_code?.toLowerCase());
+    }
+  } catch { /* テーブル未作成の場合はスキップ */ }
+
   // 5. Amazon手数料キャッシュ
   let feeMap = new Map();
   try {
@@ -142,13 +150,21 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
       }
     } else {
       // 非Amazon: listingCode = NE商品コード（楽天/Yahoo/auPAY等）
-      const prod = productMap.get(listingCode);
+      let prod = productMap.get(listingCode);
+
+      // 楽天のフォールバック: 直接マッチしなければ rakuten_sku_map で解決
+      if (!prod && mallId === 'rakuten' && rakutenSkuMap.has(listingCode)) {
+        const resolvedNeCode = rakutenSkuMap.get(listingCode);
+        prod = productMap.get(resolvedNeCode);
+        if (prod) costSource = 'rakuten_sku_map';
+      }
+
       if (prod) {
         costExTax = (prod.原価 || 0) * qty;
         taxRate = 1 + (prod.消費税率 || 10) / 100;
         shipping = (prod.送料 || 0) * qty;
         productName = prod.商品名 || listingCode;
-        costSource = prod.原価ソース || 'NE';
+        if (costSource === '不明') costSource = prod.原価ソース || 'NE';
       }
     }
 

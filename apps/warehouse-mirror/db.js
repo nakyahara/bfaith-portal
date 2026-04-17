@@ -126,6 +126,15 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_mird_date ON mirror_sales_daily(日付)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mird_sku ON mirror_sales_daily(商品コード)');
 
+  // mirror_rakuten_sku_map — 楽天コード(AM/AL/W) → NE商品コード マッピング
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_rakuten_sku_map (
+    rakuten_code      TEXT PRIMARY KEY,
+    ne_code           TEXT NOT NULL,
+    source            TEXT NOT NULL,     -- 'am' | 'al' | 'w'
+    updated_at        TEXT NOT NULL
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mirr_rskm_ne ON mirror_rakuten_sku_map(ne_code)');
+
   // mirror_sync_status — 同期状態
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_sync_status (
     key               TEXT PRIMARY KEY,

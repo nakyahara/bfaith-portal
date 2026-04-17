@@ -100,6 +100,22 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
       log.push(`sku_map: ${skuMapData.length}件`);
     }
 
+    // rakuten_sku_map（全件置換）
+    if (req.body.rakuten_sku_map && req.body.rakuten_sku_map.length > 0) {
+      const rskmData = req.body.rakuten_sku_map;
+      const tx = db.transaction(() => {
+        db.exec('DELETE FROM mirror_rakuten_sku_map');
+        const stmt = db.prepare(`INSERT INTO mirror_rakuten_sku_map (
+          rakuten_code, ne_code, source, updated_at
+        ) VALUES (?,?,?,?)`);
+        for (const m of rskmData) {
+          stmt.run(m.rakuten_code, m.ne_code, m.source, now);
+        }
+      });
+      tx();
+      log.push(`rakuten_sku_map: ${rskmData.length}件`);
+    }
+
     // amazon_sku_fees（全件置換）
     if (req.body.amazon_sku_fees && req.body.amazon_sku_fees.length > 0) {
       const feesData = req.body.amazon_sku_fees;

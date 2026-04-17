@@ -71,6 +71,15 @@ export async function syncToRender() {
     console.log(`[Sync→Render]   amazon_sku_fees: テーブル未作成（スキップ）`);
   }
 
+  // 2d. rakuten_sku_map（楽天AM/AL/W→NE商品コード マッピング）
+  let rakuten_sku_map = [];
+  try {
+    rakuten_sku_map = db.prepare('SELECT rakuten_code, ne_code, source, updated_at FROM f_rakuten_sku_map').all();
+    console.log(`[Sync→Render]   rakuten_sku_map: ${rakuten_sku_map.length}件`);
+  } catch {
+    console.log(`[Sync→Render]   rakuten_sku_map: テーブル未作成（スキップ）`);
+  }
+
   // 3. sales_monthly（24ヶ月分、by_product + by_listing）
   const salesMonthlyProduct = db.prepare(`
     SELECT SUBSTR(日付, 1, 7) as 月, 商品コード, モール, MAX(商品名) as 商品名,
@@ -133,7 +142,7 @@ export async function syncToRender() {
 
   try {
     // Part 1: マスタデータ
-    await sendPart({ products, set_components, sku_map, amazon_sku_fees }, 'マスタ');
+    await sendPart({ products, set_components, sku_map, amazon_sku_fees, rakuten_sku_map }, 'マスタ');
 
     // Part 2: 月次集計（チャンク分割、9MB以下に収める）
     const monthlyChunkSize = 20000;
