@@ -69,9 +69,9 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
   prodSalesSql += ' GROUP BY 商品コード, モール';
   const prodSales = db.prepare(prodSalesSql).all(...prodParams);
 
-  // 3. 商品マスタ（原価）
+  // 3. 商品マスタ（原価 + 送料）
   const products = db.prepare(`
-    SELECT 商品コード, 商品名, 原価, 原価ソース, 原価状態, 標準売価, 消費税率, 売上分類
+    SELECT 商品コード, 商品名, 原価, 原価ソース, 原価状態, 標準売価, 消費税率, 売上分類, 送料
     FROM mirror_products
   `).all();
   const productMap = new Map();
@@ -108,8 +108,11 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
 
     if (revenue <= 0 || qty <= 0) continue;
 
-    // 原価計算: Amazon系はSKUマップ経由、他モールは直接
-    let cost = 0;
+    // 原価計算: 原価(税抜) × 税率 = 原価(税込)
+    // 送料: Amazon FBA以外は送料を加算
+    let costExTax = 0; // 原価(税抜)
+    let taxRate = 1.1;  // デフォルト10%
+    let shipping = 0;
     let costSource = '不明';
     let productName = listingCode;
 
@@ -118,26 +121,37 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
       const neEntries = skuToNeMap.get(listingCode);
       if (neEntries) {
         let totalCost = 0;
+        let totalShip = 0;
         for (const entry of neEntries) {
           const prod = productMap.get(entry.ne_code);
           if (prod?.原価 != null) {
             totalCost += prod.原価 * entry.qty;
+            taxRate = 1 + (prod.消費税率 || 10) / 100;
+            if (prod.送料) totalShip += prod.送料 * entry.qty;
             if (!productName || productName === listingCode) productName = prod.商品名;
           }
         }
-        cost = totalCost * qty;
+        costExTax = totalCost * qty;
+        // FBA以外（FBM）は送料加算
+        if (channel !== 'FBA') {
+          shipping = totalShip * qty;
+        }
         costSource = 'SKU→NE';
       }
     } else {
       // 非Amazon: listingCodeがNE商品コードのケースもある
-      // by_productの数量と原価で計算
       const prod = productMap.get(listingCode);
       if (prod?.原価 != null) {
-        cost = prod.原価 * qty;
+        costExTax = prod.原価 * qty;
+        taxRate = 1 + (prod.消費税率 || 10) / 100;
+        shipping = (prod.送料 || 0) * qty;
         productName = prod.商品名 || listingCode;
         costSource = prod.原価ソース || 'NE';
       }
     }
+
+    // 原価(税込) = 原価(税抜) × 税率
+    const cost = costExTax * taxRate;
 
     // 手数料計算
     let platformFee = 0;
@@ -147,21 +161,19 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
       // Amazon: 手数料キャッシュから取得
       const feeData = feeMap.get(listingCode);
       if (feeData) {
-        // キャッシュの手数料は1個あたりの金額
         platformFee = (feeData.referral_fee || 0) * qty;
         fbaFee = (feeData.fba_fee || 0) * qty;
       } else {
-        // フォールバック: 15%概算
         platformFee = revenue * 0.15;
       }
     } else {
-      // 他モール: CASE文料率
       const rate = MALL_FEE_RATES[mallId] || 0.10;
       platformFee = revenue * rate;
     }
 
     const totalFee = platformFee + fbaFee;
-    const grossProfit = revenue - cost - totalFee;
+    // 粗利 = 売価 - PF手数料 - FBA手数料 - 送料 - 原価(税込)
+    const grossProfit = revenue - totalFee - shipping - cost;
     const grossMarginRate = revenue > 0 ? (grossProfit / revenue * 100) : 0;
 
     results.push({
@@ -172,6 +184,7 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
       qty,
       revenue: Math.round(revenue),
       cost: Math.round(cost),
+      shipping: Math.round(shipping),
       platform_fee: Math.round(platformFee),
       fba_fee: Math.round(fbaFee),
       total_fee: Math.round(totalFee),
@@ -234,6 +247,7 @@ router.get('/api/profit', (req, res) => {
     // 集計サマリー
     const totalRevenue = data.reduce((s, d) => s + d.revenue, 0);
     const totalCost = data.reduce((s, d) => s + d.cost, 0);
+    const totalShipping = data.reduce((s, d) => s + d.shipping, 0);
     const totalFee = data.reduce((s, d) => s + d.total_fee, 0);
     const totalProfit = data.reduce((s, d) => s + d.gross_profit, 0);
 
@@ -243,6 +257,7 @@ router.get('/api/profit', (req, res) => {
         count: data.length,
         total_revenue: totalRevenue,
         total_cost: totalCost,
+        total_shipping: totalShipping,
         total_fee: totalFee,
         total_profit: totalProfit,
         avg_margin_rate: totalRevenue > 0 ? Math.round(totalProfit / totalRevenue * 1000) / 10 : 0,
