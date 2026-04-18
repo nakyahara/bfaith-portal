@@ -599,31 +599,7 @@
 
     </div>
 
-    <!-- 最新データ -->
-    <div class="section">
-      <h3>最新スナップショット</h3>
-      <div class="table-wrap">
-        <table class="data-table" id="snapshotTable">
-          <thead>
-            <tr>
-              <th class="sortable" data-key="amazon_sku">SKU</th>
-              <th class="sortable" data-key="product_name">商品名</th>
-              <th class="sortable" data-key="fba_available" data-type="num">FBA在庫</th>
-              <th class="sortable" data-key="fba_inbound_working" data-type="num">準備中</th>
-              <th class="sortable" data-key="fba_inbound_shipped" data-type="num">輸送中</th>
-              <th class="sortable" data-key="fba_inbound_received" data-type="num">受領中</th>
-              <th class="sortable" data-key="days_of_supply" data-type="num">供給日数</th>
-              <th class="sortable" data-key="units_sold_7d" data-type="num">7日売上</th>
-              <th class="sortable" data-key="units_sold_30d" data-type="num">30日売上</th>
-              <th class="sortable" data-key="sales_rank" data-type="num">順位</th>
-              <th class="sortable" data-key="your_price" data-type="num">自社価格</th>
-              <th class="sortable" data-key="featured_offer_price" data-type="num">カート価格</th>
-            </tr>
-          </thead>
-          <tbody id="snapshotBody"><tr><td colspan="12">データなし — レポートを取得してください</td></tr></tbody>
-        </table>
-      </div>
-    </div>
+    <!-- 最新スナップショット画面は廃止 (推奨リスト・FBA欠品タブで用が足りるため) -->
   </div>
 
   <script>
@@ -769,6 +745,7 @@
 
     function renderSnapshot(data) {
       const tbody = document.getElementById('snapshotBody');
+      if (!tbody) return; // 最新スナップショット画面は廃止されたので何もしない
       if (!data || data.length === 0) {
         tbody.innerHTML = '<tr><td colspan="12">データなし</td></tr>';
         return;
@@ -826,11 +803,12 @@
           result = jobResult.result || jobResult;
         }
 
-        // result.planning は数値(ミニPC経由) or オブジェクト{count}(旧直接版) の両方に対応
+        // result.planning / restock は数値(ミニPC経由) or オブジェクト{count}(旧直接版) の両方に対応
         const pCount = typeof result.planning === 'number' ? result.planning : (result.planning?.count ?? 0);
         const rCount = typeof result.restock === 'number' ? result.restock : (result.restock?.count ?? 0);
-        const iCount = typeof result.inventory === 'number' ? result.inventory : (result.inventory?.count ?? 0);
-        log(`完了! PLANNING: ${pCount}件, RESTOCK: ${rCount}件, INVENTORY: ${iCount}件`);
+        log(`完了! RESTOCK: ${rCount}件 (主軸), PLANNING: ${pCount}件 (補助)`);
+        if (result.restockGuardSkipped) log('警告: RESTOCK件数急減ガード発動 — 前回データ保持');
+        if (result.planningGuardSkipped) log('警告: PLANNING件数急減ガード発動 — 前回データ保持');
         if (result.errors && result.errors.length > 0) {
           result.errors.forEach(e => log(`警告: ${e.report} - ${e.error}`));
         }
@@ -845,7 +823,15 @@
             log('同期エラー: ' + (syncJson.error || syncRes.status));
             alert('Render DBへの同期に失敗しました。\nRender側の画面は古いデータのままの可能性があります。\nもう一度「SP-APIレポート全取得」を実行してください。');
           } else {
-            log(`Render DB同期完了: ${syncJson.rows}件 / FNSKU ${syncJson.fnskus}件 / 日付: ${syncJson.snapshot_date}`);
+            const parts = [
+              `RESTOCK: ${syncJson.restock ?? 0}件`,
+              `PLANNING: ${syncJson.rows ?? 0}件 (legacy)`,
+              `PLANNING_LATEST: ${syncJson.planning_latest ?? 0}件`,
+              `FNSKU: ${syncJson.fnskus ?? 0}件`,
+            ];
+            log(`Render DB同期完了: ${parts.join(' / ')} / 日付: ${syncJson.snapshot_date}`);
+            if (syncJson.restock_skip_reason) log(`警告: RESTOCK 同期スキップ (${syncJson.restock_skip_reason})`);
+            if (syncJson.planning_latest_skip_reason) log(`警告: PLANNING_LATEST 同期スキップ (${syncJson.planning_latest_skip_reason})`);
             syncOk = true;
           }
         } catch (syncErr) {
