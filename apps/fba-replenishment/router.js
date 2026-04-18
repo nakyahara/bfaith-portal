@@ -14,7 +14,8 @@ import { initDb, savePlanningData, savePlanningDataWithHistory, getLatestSnapsho
          saveProvisionalItems, mergeProvisionalItems, getProvisionalItems, clearProvisionalItems,
          updateProvisionalItemQty, removeProvisionalItem,
          saveExportHistory, getExportHistoryList, getExportHistoryFile,
-         getRestockLatest, getPlanningLatestMap, getAllEverSeenSkus } from './db.js';
+         getRestockLatest, getPlanningLatestMap, getAllEverSeenSkus,
+         saveRestockLatest, savePlanningLatest } from './db.js';
 // SP-API関連はミニPC経由で実行（APIキーはミニPC側に一元管理）
 // import { fetchAllReports, normalizePlanningRow } from './sp-api-reports.js';
 // import { createInboundPlan, checkInboundEligibility, findErrorSkusByBinarySearch, listShipments, listShipmentItems, fetchActiveInboundQuantities } from './inbound-plans.js';
@@ -168,11 +169,41 @@ router.post('/api/sync-latest-planning', async (req, res) => {
       savedFnskus = fnskus.length;
     }
 
-    console.log(`[FBA] Render DB同期完了: ${savedRows}件 / FNSKU: ${savedFnskus}件 / 日付: ${snapshotDate}`);
+    // RESTOCK / PLANNING_LATEST も同期 (ミニPCから送られてくる)
+    let savedRestock = 0, savedPlanningLatest = 0;
+    let restockSkipReason = null, planningLatestSkipReason = null;
+    const restockRows = pull.restock_rows || [];
+    const planningLatestRows = pull.planning_latest_rows || [];
+    if (restockRows.length > 0) {
+      try {
+        const r = saveRestockLatest(restockRows);
+        savedRestock = r.saved;
+        if (r.skipped) restockSkipReason = r.reason;
+      } catch (e) {
+        console.error('[FBA] saveRestockLatest failed:', e.message);
+      }
+    }
+    if (planningLatestRows.length > 0) {
+      try {
+        // planning_latest_rows は DB 形式なので amazon_sku を sku にマップ
+        const normalized = planningLatestRows.map(r => ({ ...r, sku: r.amazon_sku }));
+        const r = savePlanningLatest(normalized);
+        savedPlanningLatest = r.saved;
+        if (r.skipped) planningLatestSkipReason = r.reason;
+      } catch (e) {
+        console.error('[FBA] savePlanningLatest failed:', e.message);
+      }
+    }
+
+    console.log(`[FBA] Render DB同期完了: ${savedRows}件 / FNSKU: ${savedFnskus}件 / RESTOCK: ${savedRestock}件 / PLANNING_LATEST: ${savedPlanningLatest}件 / 日付: ${snapshotDate}`);
     res.json({
       ok: true,
       rows: savedRows,
       fnskus: savedFnskus,
+      restock: savedRestock,
+      restock_skip_reason: restockSkipReason,
+      planning_latest: savedPlanningLatest,
+      planning_latest_skip_reason: planningLatestSkipReason,
       snapshot_date: snapshotDate,
     });
   } catch (e) {
