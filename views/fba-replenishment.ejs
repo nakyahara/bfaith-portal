@@ -320,13 +320,10 @@
             <div class="label">納品推奨済み</div>
             <div class="value" id="stockoutAlreadyCount" style="color:#d97706;font-size:20px;">-</div>
           </div>
-          <div class="stat" style="border-left:4px solid #6b7280;">
-            <div class="label">在庫なし（仕入れ待ち）</div>
-            <div class="value" id="stockoutNoStockCount" style="color:#6b7280;font-size:20px;">-</div>
-          </div>
           <div class="stat" style="border-left:4px solid #7c3aed; background:#f5f3ff;">
-            <div class="label">FBA欠品 合計</div>
+            <div class="label">FBA欠品 表示中</div>
             <div class="value" id="stockoutTotalCount" style="color:#7c3aed;font-size:20px;">-</div>
+            <div style="font-size:10px;color:#888;">※在庫なしは「発注推奨(在庫0)」タブへ</div>
           </div>
         </div>
 
@@ -337,8 +334,8 @@
         </div>
 
         <div style="margin-bottom:8px; display:flex; gap:16px; align-items:center; flex-wrap:wrap;">
-          <label style="font-weight:bold;"><input type="radio" name="stockoutFilter" value="sendable" checked onchange="filterStockoutList()"> 倉庫在庫ありのみ</label>
-          <label><input type="radio" name="stockoutFilter" value="all" onchange="filterStockoutList()"> 全て</label>
+          <label style="font-weight:bold;"><input type="radio" name="stockoutFilter" value="sendable" onchange="filterStockoutList()"> 送り漏れのみ(未推奨)</label>
+          <label><input type="radio" name="stockoutFilter" value="all" checked onchange="filterStockoutList()"> 全て(送り漏れ+推奨済み)</label>
           <label style="margin-left:8px; color:#666;"><input type="checkbox" id="stockoutShowHidden" onchange="filterStockoutList()"> 非表示も含める <span id="stockoutHiddenCount" style="font-size:11px;"></span></label>
           <input type="text" id="stockoutSearch" placeholder="商品名・SKU・NE商品コードで検索" oninput="filterStockoutList()" style="padding:5px 10px; border:1px solid #d1d5db; border-radius:4px; font-size:13px; width:280px;">
           <span style="margin-left:auto;color:#666;font-size:12px;" id="stockoutFilterCount"></span>
@@ -1912,19 +1909,22 @@ Step10: アラート判定
       // 非表示リストを先に読み込む
       await loadStockoutHidden();
 
-      // FBA販売可能在庫 = 0 の全商品（SKUマッピングありのみ = recDataに含まれるもの）
-      stockoutData = recData.filter(r => r.fba_available === 0).map(r => {
+      // FBA販売可能在庫 = 0 かつ 倉庫在庫>0 or 納品推奨済み の商品のみ表示
+      // 在庫なし (FBA=0 & 倉庫=0 & 未推奨) は「発注推奨(在庫0)」タブで扱うので除外
+      stockoutData = recData.filter(r => {
+        if (r.fba_available !== 0) return false;
+        const isAlready = r.recommended_qty > 0 || manualItems.find(m => m.amazon_sku === r.amazon_sku);
+        const hasWarehouse = (r.warehouse_raw || 0) > 0;
+        return isAlready || hasWarehouse;
+      }).map(r => {
         // ステータス判定
         let stockout_status, stockout_status_num;
         if (r.recommended_qty > 0 || manualItems.find(m => m.amazon_sku === r.amazon_sku)) {
           stockout_status = 'already'; // 納品推奨済み
           stockout_status_num = 2;
-        } else if ((r.warehouse_raw || 0) > 0) {
-          stockout_status = 'sendable'; // 倉庫在庫あり → 送れる
-          stockout_status_num = 1;
         } else {
-          stockout_status = 'nostock'; // 在庫なし
-          stockout_status_num = 3;
+          stockout_status = 'sendable'; // 倉庫在庫あり → 送れる (在庫なしはここまで来ない)
+          stockout_status_num = 1;
         }
         const is_hidden = stockoutHiddenSet.has(r.amazon_sku);
         return { ...r, stockout_status, stockout_status_num, is_hidden };
@@ -1945,7 +1945,6 @@ Step10: アラート判定
       document.getElementById('stockoutTotalCount').textContent = visibleData.length + ' SKU';
       document.getElementById('stockoutSendableCount').textContent = sendableCount + ' SKU';
       document.getElementById('stockoutAlreadyCount').textContent = visibleData.filter(r => r.stockout_status === 'already').length + ' SKU';
-      document.getElementById('stockoutNoStockCount').textContent = visibleData.filter(r => r.stockout_status === 'nostock').length + ' SKU';
 
       filterStockoutList();
     }
