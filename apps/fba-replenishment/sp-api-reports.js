@@ -167,19 +167,14 @@ export async function fetchFbaInventory() {
 // ======================================================
 // 全レポートまとめて取得
 // ======================================================
+// INVENTORY レポートは RESTOCK の部分集合で冗長 + 未使用のため取得停止
 export async function fetchAllReports() {
   const results = { planning: null, restock: null, inventory: null, errors: [] };
 
   // 順次実行（SP-APIのcreateReport競合を完全に回避）
-  console.log('[SP-API] 3種レポートを順次取得開始...');
+  console.log('[SP-API] RESTOCK + PLANNING を順次取得開始...');
 
-  try {
-    results.planning = await fetchPlanningData();
-  } catch (e) {
-    console.error('[SP-API] PLANNING_DATA 失敗:', e.message);
-    results.errors.push({ report: 'planning', error: e.message });
-  }
-
+  // 主軸: RESTOCK (必須)
   try {
     results.restock = await fetchRestockRecommendations();
   } catch (e) {
@@ -187,11 +182,12 @@ export async function fetchAllReports() {
     results.errors.push({ report: 'restock', error: e.message });
   }
 
+  // 補助: PLANNING (欠落許容、60/90日販売などの参考情報用)
   try {
-    results.inventory = await fetchFbaInventory();
+    results.planning = await fetchPlanningData();
   } catch (e) {
-    console.error('[SP-API] INVENTORY 失敗:', e.message);
-    results.errors.push({ report: 'inventory', error: e.message });
+    console.error('[SP-API] PLANNING_DATA 失敗:', e.message);
+    results.errors.push({ report: 'planning', error: e.message });
   }
 
   console.log('[SP-API] 順次取得完了');
