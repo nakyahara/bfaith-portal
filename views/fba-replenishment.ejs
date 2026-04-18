@@ -159,7 +159,7 @@
     </div>
 
     <!-- ワークフロー（データ更新） -->
-    <details id="workflowDetails">
+    <details id="workflowDetails" open>
       <summary style="cursor:pointer; font-weight:bold; font-size:14px; padding:8px 0; color:#374151;">▶ データ更新（SP-API / CSV / SKU同期）</summary>
     <div class="actions" style="flex-direction:column;gap:0;margin-top:8px;">
       <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
@@ -881,7 +881,7 @@
     let manualItems = []; // 手動追加アイテム
 
     async function calcRecommendations() {
-      if (!confirm('推奨リストを再計算します。完了後「復元して表示」で作業状態を戻せます。よろしいですか？')) return;
+      if (!confirm('推奨リストを再計算します。\n※「Amazon仮確定」のデータはクリアされます。\n完了後「復元して表示」で作業状態を戻せます。よろしいですか？')) return;
       const btn = document.getElementById('btnCalc');
       btn.disabled = true;
       btn.innerHTML = '<span class="spinner"></span>計算中...';
@@ -890,6 +890,14 @@
       // ドラフトは保持（復元ボタンで戻せる）
       selectedSkus.clear();
       Object.keys(shipQtyMap).forEach(k => delete shipQtyMap[k]);
+
+      // Amazon仮確定データをクリア (Step4クリック時の新規運用)
+      try {
+        await fetch(`${BASE}/api/provisional`, { method: 'DELETE' });
+        log('Amazon仮確定データをクリアしました');
+      } catch (e) {
+        log('仮確定クリア失敗: ' + e.message);
+      }
 
       try {
         const res = await fetch(`${BASE}/api/recommendations?debug=1`);
