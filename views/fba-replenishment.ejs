@@ -289,6 +289,7 @@
               <th class="sortable-rec" data-key="days_of_supply" data-type="num">供給日数</th>
               <th class="sortable-rec" data-key="reorder_point" data-type="num">発注点(個)</th>
               <th class="sortable-rec" data-key="raw_needed" data-type="num">必要補充数</th>
+              <th class="sortable-rec" data-key="amazon_recommended_qty" data-type="num">Amazon推奨</th>
               <th class="sortable-rec" data-key="target_days" data-type="num">目標日数</th>
               <th class="sortable-rec" data-key="units_sold_7d" data-type="num">FBA7日</th>
               <th class="sortable-rec" data-key="units_sold_30d" data-type="num">FBA30日</th>
@@ -343,6 +344,16 @@
           <span style="margin-left:auto;color:#666;font-size:12px;" id="stockoutFilterCount"></span>
         </div>
 
+        <div style="margin-bottom:8px; display:flex; gap:16px; align-items:center; flex-wrap:wrap; padding:6px 10px; background:#f9fafb; border-radius:6px;">
+          <span style="font-size:12px; color:#666;">状態絞り込み:</span>
+          <label><input type="radio" name="stockoutStateFilter" value="all" checked onchange="filterStockoutList()"> 全て</label>
+          <label><input type="radio" name="stockoutStateFilter" value="recent" onchange="filterStockoutList()"> 直近欠品のみ (30日販売>0)</label>
+          <label><input type="radio" name="stockoutStateFilter" value="long" onchange="filterStockoutList()"> 長期欠品のみ (Amazon推奨ベース)</label>
+          <label><input type="radio" name="stockoutStateFilter" value="dead" onchange="filterStockoutList()"> 廃番候補</label>
+          <span style="margin-left:8px; font-size:12px; color:#666;">Amazon推奨数 ≥</span>
+          <input type="number" id="stockoutMinAmazonReco" value="11" min="0" style="width:60px; padding:4px; border:1px solid #d1d5db; border-radius:4px; font-size:13px;" oninput="filterStockoutList()">
+        </div>
+
         <div class="table-wrap" style="max-height:calc(100vh - 280px);">
           <table class="data-table" id="stockoutTable" style="table-layout:auto;">
             <thead>
@@ -350,6 +361,7 @@
                 <th style="width:30px;text-align:center;">✓</th>
                 <th style="width:30px;text-align:center;">#</th>
                 <th class="sortable-stockout" data-key="stockout_status">状態</th>
+                <th class="sortable-stockout" data-key="stock_state">分類</th>
                 <th class="sortable-stockout" data-key="amazon_sku">SKU</th>
                 <th class="sortable-stockout" data-key="product_name">商品名</th>
                 <th>構成</th>
@@ -359,6 +371,7 @@
                 <th class="sortable-stockout" data-key="days_of_supply" data-type="num">供給日数</th>
                 <th class="sortable-stockout" data-key="reorder_point" data-type="num">発注点(個)</th>
                 <th class="sortable-stockout" data-key="raw_needed" data-type="num">必要補充数</th>
+                <th class="sortable-stockout" data-key="amazon_recommended_qty" data-type="num">Amazon推奨</th>
                 <th class="sortable-stockout" data-key="target_days" data-type="num">目標日数</th>
                 <th class="sortable-stockout" data-key="units_sold_7d" data-type="num">FBA7日</th>
                 <th class="sortable-stockout" data-key="units_sold_30d" data-type="num">FBA30日</th>
@@ -1186,6 +1199,7 @@
           <td style="${dosColor}">${dosVal}${belowReorder ? ' ⚠' : ''}</td>
           <td>${reorderVal}</td>
           <td>${r.raw_needed || 0}</td>
+          <td title="${r.amazon_reco_capped ? 'Amazon推奨で切り詰め済み: 自社理論値 ' + (r.raw_needed_before_amazon_cap || 0) + ' → Amazon推奨 ' + r.amazon_recommended_qty : ''}">${typeof r.amazon_recommended_qty === 'number' ? `<span style="${r.amazon_reco_capped ? 'color:#dc2626;font-weight:bold' : 'color:#2563eb'}">${r.amazon_recommended_qty}</span>` : '<span style="color:#ccc">-</span>'}</td>
           <td>${r.target_days}</td>
           <td>${r.units_sold_7d}</td>
           <td>${r.units_sold_30d}</td>
@@ -1952,6 +1966,8 @@ Step10: アラート判定
 
     function filterStockoutList() {
       const mode = document.querySelector('input[name="stockoutFilter"]:checked')?.value || 'sendable';
+      const stateMode = document.querySelector('input[name="stockoutStateFilter"]:checked')?.value || 'all';
+      const minAmazonReco = parseInt(document.getElementById('stockoutMinAmazonReco')?.value || '0') || 0;
       const searchQuery = (document.getElementById('stockoutSearch')?.value || '').trim().toLowerCase();
       const showHidden = document.getElementById('stockoutShowHidden')?.checked || false;
 
@@ -1962,6 +1978,18 @@ Step10: アラート判定
       }
       if (mode === 'sendable') {
         filtered = filtered.filter(r => r.stockout_status === 'sendable');
+      }
+      // 状態分類フィルタ (stock_state: recent_oos / revivable_long_oos / dead_candidate)
+      if (stateMode === 'recent') {
+        filtered = filtered.filter(r => r.stock_state === 'recent_oos');
+      } else if (stateMode === 'long') {
+        filtered = filtered.filter(r => r.stock_state === 'revivable_long_oos');
+      } else if (stateMode === 'dead') {
+        filtered = filtered.filter(r => r.stock_state === 'dead_candidate');
+      }
+      // Amazon推奨数 閾値フィルタ (null と 0 を区別、閾値≥1の時は null を除外)
+      if (minAmazonReco > 0) {
+        filtered = filtered.filter(r => typeof r.amazon_recommended_qty === 'number' && r.amazon_recommended_qty >= minAmazonReco);
       }
       if (searchQuery) {
         filtered = filtered.filter(r =>
@@ -1977,7 +2005,7 @@ Step10: アラート判定
 
     function renderStockoutList(data) {
       const tbody = document.getElementById('stockoutBody');
-      if (!data.length) { tbody.innerHTML = '<tr><td colspan="23">該当なし</td></tr>'; return; }
+      if (!data.length) { tbody.innerHTML = '<tr><td colspan="25">該当なし</td></tr>'; return; }
 
       // ソート
       data.sort((a, b) => {
@@ -2047,10 +2075,26 @@ Step10: アラート判定
         const reorderVal = r.reorder_point;
         const belowReorder = typeof r.effective_fba_stock === 'number' && typeof reorderVal === 'number' && r.effective_fba_stock < reorderVal;
 
+        // stock_state バッジ
+        const stateLabels = {
+          'normal': { label: '通常', bg: '#d1fae5', color: '#065f46' },
+          'recent_oos': { label: '直近欠品', bg: '#fee2e2', color: '#991b1b' },
+          'revivable_long_oos': { label: '長期(復活余地)', bg: '#fef3c7', color: '#92400e' },
+          'dead_candidate': { label: '廃番候補', bg: '#e5e7eb', color: '#4b5563' },
+        };
+        const stateInfo = stateLabels[r.stock_state] || { label: r.stock_state || '-', bg: '#e5e7eb', color: '#4b5563' };
+        const stateBadgeHtml = `<span style="display:inline-block;font-size:10px;padding:1px 6px;border-radius:3px;background:${stateInfo.bg};color:${stateInfo.color};font-weight:bold;">${stateInfo.label}</span>`;
+
+        // Amazon推奨数 (null は "-")
+        const amzRecoHtml = typeof r.amazon_recommended_qty === 'number'
+          ? `<span style="${r.amazon_reco_capped ? 'color:#dc2626;font-weight:bold' : 'color:#2563eb'}">${r.amazon_recommended_qty}</span>`
+          : '<span style="color:#ccc">-</span>';
+
         return `<tr style="${rowBg}">
           <td style="text-align:center;">${checkHtml}</td>
           <td style="text-align:center;color:#666;font-size:11px;">${num}</td>
           <td>${statusHtml}</td>
+          <td>${stateBadgeHtml}${r.is_expiry_managed ? '<span style="font-size:10px;margin-left:3px;color:#7c3aed" title="期限管理商品">⏳</span>' : ''}</td>
           <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')">${r.amazon_sku}</span></td>
           <td class="product-name" title="${esc(r.product_name)}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${esc(r.product_name)}</a>` : esc(r.product_name)}</td>
           ${renderComponentCell(r)}
@@ -2060,6 +2104,7 @@ Step10: アラート判定
           <td style="${dosColor}">${dosVal}${belowReorder ? ' ⚠' : ''}</td>
           <td>${reorderVal}</td>
           <td>${r.raw_needed || 0}</td>
+          <td>${amzRecoHtml}</td>
           <td>${r.target_days}</td>
           <td>${r.units_sold_7d}</td>
           <td>${r.units_sold_30d}</td>

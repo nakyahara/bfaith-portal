@@ -14,7 +14,7 @@ import { okResponse, errorResponse } from './error-handler.js';
 import { createJob } from './job-manager.js';
 
 // --- 既存FBAモジュール ---
-import { fetchAllReports, normalizePlanningRow } from '../fba-replenishment/sp-api-reports.js';
+import { fetchAllReports, normalizePlanningRow, normalizeRestockRow } from '../fba-replenishment/sp-api-reports.js';
 import {
   createInboundPlan as spCreateInboundPlan,
   listShipments,
@@ -78,27 +78,65 @@ router.post('/fetch-reports', rateLimitMiddleware('sp-api'), async (req, res) =>
       const db = await getDb();
 
       let planningCount = 0, restockCount = 0, inventoryCount = 0;
+      let restockGuardSkipped = false, planningGuardSkipped = false;
 
+      // --- RESTOCK (主軸データソース) ---
+      if (results.restock?.length > 0) {
+        updateProgress({ step: 'saving-restock', count: results.restock.length });
+        const normalizedRestock = results.restock.map(normalizeRestockRow).filter(r => r.amazon_sku);
+        const saveRes = db.saveRestockLatest(normalizedRestock);
+        restockCount = saveRes.saved;
+        restockGuardSkipped = saveRes.skipped;
+        if (saveRes.skipped) {
+          console.warn('[FBA-Service] RESTOCK 保存スキップ:', saveRes.reason, saveRes);
+        }
+        // FNSKU 更新 (RESTOCK からも取れる)
+        const fnskuRows = normalizedRestock
+          .filter(r => r.fnsku && r.amazon_sku)
+          .map(r => ({ sku: r.amazon_sku, fnsku: r.fnsku }));
+        if (fnskuRows.length > 0) db.updateFnskuBatch(fnskuRows);
+      }
+
+      // --- PLANNING (補助データソース、取得失敗OK) ---
       if (results.planning?.length > 0) {
         updateProgress({ step: 'saving-planning', count: results.planning.length });
         const normalized = results.planning.map(normalizePlanningRow);
-        db.savePlanningData(normalized);
+        // dual-write: 既存の daily_snapshots 経路と、新 planning_latest の両方に書き込む
+        try {
+          db.savePlanningData(normalized);
+        } catch (e) {
+          console.warn('[FBA-Service] savePlanningData failed (legacy):', e.message);
+        }
+        try {
+          const saveRes = db.savePlanningLatest(normalized);
+          planningGuardSkipped = saveRes.skipped;
+          if (saveRes.skipped) {
+            console.warn('[FBA-Service] PLANNING 保存スキップ:', saveRes.reason, saveRes);
+          }
+        } catch (e) {
+          console.warn('[FBA-Service] savePlanningLatest failed:', e.message);
+        }
         planningCount = normalized.length;
         const fnskuRows = results.planning
           .filter(r => r['fnsku'] && r['sku'])
           .map(r => ({ sku: r['sku'], fnsku: r['fnsku'] }));
         if (fnskuRows.length > 0) db.updateFnskuBatch(fnskuRows);
       }
-      if (results.restock?.length > 0) {
-        updateProgress({ step: 'saving-restock', count: results.restock.length });
-        restockCount = results.restock.length;
-      }
+
+      // --- INVENTORY (Phase1では取得自体は継続、保存はしない) ---
       if (results.inventory?.length > 0) {
         updateProgress({ step: 'saving-inventory', count: results.inventory.length });
         inventoryCount = results.inventory.length;
       }
 
-      return { planning: planningCount, restock: restockCount, inventory: inventoryCount, errors: results.errors };
+      return {
+        planning: planningCount,
+        restock: restockCount,
+        inventory: inventoryCount,
+        restockGuardSkipped,
+        planningGuardSkipped,
+        errors: results.errors,
+      };
     } finally {
       fetchReportsJobId = null;
     }
@@ -120,8 +158,21 @@ router.get('/snapshots/:sku', dbHandler(async (req, res, db) => {
   return { history: db.getDailySnapshots(req.params.sku) };
 }));
 
+// 従来互換: daily_snapshots と ever_seen_skus の和集合
 router.get('/all-snapshot-skus', dbHandler(async (req, res, db) => {
-  return { skus: db.getAllSnapshotSkus() };
+  const legacy = db.getAllSnapshotSkus();
+  const everSeen = db.getAllEverSeenSkus();
+  return { skus: Array.from(new Set([...legacy, ...everSeen])) };
+}));
+
+// 新規商品判定の正: ever_seen_skus のみ
+router.get('/ever-seen-skus', dbHandler(async (req, res, db) => {
+  return { skus: db.getAllEverSeenSkus() };
+}));
+
+// RESTOCK最新データ
+router.get('/restock-latest', dbHandler(async (req, res, db) => {
+  return { rows: db.getRestockLatest() };
 }));
 
 // ==========================================

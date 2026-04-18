@@ -13,7 +13,8 @@ import { initDb, savePlanningData, savePlanningDataWithHistory, getLatestSnapsho
          saveDraft, getDraft, clearDraft, updateFnskuBatch, syncFnskuBatch,
          saveProvisionalItems, mergeProvisionalItems, getProvisionalItems, clearProvisionalItems,
          updateProvisionalItemQty, removeProvisionalItem,
-         saveExportHistory, getExportHistoryList, getExportHistoryFile } from './db.js';
+         saveExportHistory, getExportHistoryList, getExportHistoryFile,
+         getRestockLatest, getPlanningLatestMap, getAllEverSeenSkus } from './db.js';
 // SP-API関連はミニPC経由で実行（APIキーはミニPC側に一元管理）
 // import { fetchAllReports, normalizePlanningRow } from './sp-api-reports.js';
 // import { createInboundPlan, checkInboundEligibility, findErrorSkusByBinarySearch, listShipments, listShipmentItems, fetchActiveInboundQuantities } from './inbound-plans.js';
@@ -205,8 +206,24 @@ router.get('/api/snapshots/:sku', (req, res) => {
 });
 
 // ===== 全期間スナップショットSKU一覧 =====
+// 既存互換: daily_snapshots と ever_seen_skus の和集合を返す
+// (新規商品タブ判定で「過去にFBAで見たことがあるSKU」全てを対象にするため)
 router.get('/api/all-snapshot-skus', (req, res) => {
-  res.json(getAllSnapshotSkus());
+  const legacy = getAllSnapshotSkus();
+  const everSeen = getAllEverSeenSkus();
+  const union = Array.from(new Set([...legacy, ...everSeen]));
+  res.json(union);
+});
+
+// ===== 過去FBA観測SKU一覧 (Phase1+で蓄積、新規商品判定の正) =====
+router.get('/api/ever-seen-skus', (req, res) => {
+  res.json(getAllEverSeenSkus());
+});
+
+// ===== RESTOCK最新データ一覧 =====
+router.get('/api/restock-latest', (req, res) => {
+  const rows = getRestockLatest();
+  res.json({ count: rows.length, data: rows });
 });
 
 // ===== SKUマッピング =====
@@ -714,14 +731,22 @@ router.delete('/api/stockout-hidden/:sku', (req, res) => {
 // ===== ステータス =====
 router.get('/api/status', (req, res) => {
   const snapshots = getLatestSnapshots();
+  const restockRows = getRestockLatest();
   const mappings = getSkuMappings();
   const warehouse = getWarehouseInventory();
   const warehouseProducts = new Set(warehouse.map(w => w.logizard_code)).size;
+  // 新データソース (RESTOCK) があればそれを正、無ければ従来 snapshot を使う
+  const primaryCount = restockRows.length > 0 ? restockRows.length : snapshots.length;
+  const latestDate = restockRows.length > 0
+    ? (restockRows[0]?.updated_at || '').slice(0, 10) || null
+    : snapshots[0]?.snapshot_date || null;
   res.json({
     dbReady,
     fetchInProgress,
-    latestSnapshotDate: snapshots[0]?.snapshot_date || null,
-    snapshotCount: snapshots.length,
+    latestSnapshotDate: latestDate,
+    snapshotCount: primaryCount, // UI互換: RESTOCK件数を優先表示
+    restockCount: restockRows.length,
+    legacySnapshotCount: snapshots.length,
     mappingCount: mappings.length,
     warehouseProducts,
     warehouseRows: warehouse.length,
