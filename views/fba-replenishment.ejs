@@ -1438,35 +1438,42 @@
           <div class="settings-group">
             <h4>毎日の作業フロー（全体）</h4>
             <pre style="font-size:12px;line-height:1.8;background:#f0fdf4;padding:12px;border-radius:6px;overflow-x:auto;">
-【データ準備】Step1〜4を順番に実行
-  Step1: SP-APIレポート全取得（1〜3分）
+【データ準備】Step1〜4を順番に実行（画面上部、デフォルトで展開表示）
+  Step1: SP-APIレポート全取得（RESTOCK + PLANNING、約1分）
   Step2: ロジザードCSVアップロード
   Step3: SKUマッピング同期
   Step4: 推奨リスト生成
+    ⚠ Step4 実行時に Amazon仮確定データは自動でクリアされます
     ↓
 【納品推奨タブ】送る商品を選ぶ
   ① 「緊急を全選択」で赤を一括チェック
   ② 黄色を必要なものだけ個別チェック
   ③ 数量調整が必要なら納品数量を変更
+     ※ Amazon推奨列も参考に (自社計算より小さい場合は採用済み=赤太字)
   ④ 「仮確定に移動」ボタン
     ↓
+【FBA欠品タブ】長期欠品・送り漏れの対応
+  ⑤ 「長期欠品のみ」フィルタ + Amazon推奨数≥11 で絞り込み
+  ⑥ 倉庫在庫ありの行をチェック → 「納品推奨に追加」
+    ↓
 【Amazon仮確定タブ】確定・出力・管理
-  ⑤ 全商品のExcelを出力
-  ⑥ セラセンにCSVアップロード → プラン作成
-  ⑦ 梱包グループ確認 → 危険物等で分かれるFNSKUを把握
-  ⑧ ツールに戻り、危険物FNSKUを「選択から除外」
-  ⑨ 通常商品だけのExcelを出力 → セラセン取り込み → 確定
-  ⑩ 数量調整が必要なら：
+  ⑦ 全商品のExcelを出力
+  ⑧ セラセンにCSVアップロード → プラン作成
+  ⑨ 梱包グループ確認 → 危険物等で分かれるFNSKUを把握
+  ⑩ ツールに戻り、危険物FNSKUを「選択から除外」
+  ⑪ 通常商品だけのExcelを出力 → セラセン取り込み → 確定
+  ⑫ 数量調整が必要なら：
      - セラセンのプランを削除
      - ツールで数量変更
      - 再度Excel出力 → セラセン取り込み
-  ⑪ 危険物FNSKUを「このFNSKUだけ選択」→ Excel出力 → 別プラン確定
-  ⑫ 全プラン確定後「NE受注CSV出力」→ NextEngineにアップロード
+  ⑬ 危険物FNSKUを「このFNSKUだけ選択」→ Excel出力 → 別プラン確定
+  ⑭ 全プラン確定後「NE受注CSV出力」→ NextEngineにアップロード
 
-★ 入れ忘れ・追加が発生した場合
-  → 納品推奨タブに戻って追加商品を選択
+★ 入れ忘れ・追加が発生した場合（同日内）
+  → 納品推奨/FBA欠品タブに戻って追加商品を選択
   → 「仮確定に移動」で既存の仮確定に追加される（前回分は消えません）
-  → 同じSKUは数量が更新、新しいSKUは追加されます</pre>
+  → 同じSKUは数量が更新、新しいSKUは追加されます
+  ※ Step4 を再度実行すると仮確定はクリアされるので注意</pre>
             <p style="font-size:11px;color:#666;margin-top:8px;">※ 初回は300+SKUが推奨に上がりますが、低回転商品に半年分を送ると2〜3週間で50〜80SKU/日に収束します。</p>
           </div>
 
@@ -1502,81 +1509,99 @@ Amazon SKU → NE商品コードに変換（set_componentsで展開）
           <!-- ========== 計算ロジックタブ ========== -->
           <div id="mtCalcContent" style="display:none;">
           <div class="settings-group">
+            <h4>データソース (2026-04 改修済)</h4>
+            <pre style="font-size:12px;line-height:1.6;background:#eff6ff;padding:12px;border-radius:6px;overflow-x:auto;">
+【主軸】 GET_RESTOCK_INVENTORY_RECOMMENDATIONS_REPORT (RESTOCK)
+  ・全FBA登録SKU (約3,700件) を網羅
+  ・30日販売数、FBA在庫内訳、警告(out_of_stock等)、Amazon推奨補充数を取得
+  ・Amazonがメンテしている安定レポート
+
+【補助】 GET_FBA_INVENTORY_PLANNING_DATA (PLANNING)
+  ・60日/90日販売、カート価格、季節性、保管料情報などの追加情報源
+  ・取得失敗・SKU欠落が起きても動作継続 (Amazon側のバグ #5044 対策)
+
+【準備中在庫】 Fulfillment Inbound API v2024-03-20 (リアルタイム)
+  ・過去3日以内に作成されたACTIVEプランのSKU別数量を直接取得
+  ・レポートの Working 列は信頼しない (遅延・残骸を含む)
+  ・期限管理商品は実質在庫から除外 (別期限を送る必要があるため)
+
+【廃止】
+  ・GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA (INVENTORY) — RESTOCKの部分集合で冗長
+  ・他CH販売データの発注判定利用 — 信頼性の問題で停止 (表示のみ継続)
+  ・最新スナップショット画面 — 用途薄のため撤去</pre>
+          </div>
+
+          <div class="settings-group">
+            <h4>SKU状態分類 (stock_state)</h4>
+            <table style="width:100%;font-size:12px;border-collapse:collapse;">
+              <tr style="background:#f3f4f6;"><th style="padding:6px;border:1px solid #e5e7eb;">分類</th><th style="padding:6px;border:1px solid #e5e7eb;">条件</th><th style="padding:6px;border:1px solid #e5e7eb;">扱い</th></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;background:#d1fae5;font-weight:bold;">通常</td><td style="padding:6px;border:1px solid #e5e7eb;">FBA在庫&gt;0</td><td style="padding:6px;border:1px solid #e5e7eb;">通常の発注判定ロジック</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;background:#fee2e2;font-weight:bold;">直近欠品</td><td style="padding:6px;border:1px solid #e5e7eb;">FBA=0 AND 30日販売&gt;0</td><td style="padding:6px;border:1px solid #e5e7eb;">通常の発注判定ロジック (最優先で補充)</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;background:#fef3c7;font-weight:bold;">長期(復活余地)</td><td style="padding:6px;border:1px solid #e5e7eb;">FBA=0 AND 30日=0 AND Amazon推奨≥11</td><td style="padding:6px;border:1px solid #e5e7eb;">FBA欠品タブに表示 (参考情報で手動判断)</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;background:#e5e7eb;font-weight:bold;">廃番候補</td><td style="padding:6px;border:1px solid #e5e7eb;">FBA=0 AND 30日=0 AND Amazon推奨&lt;11</td><td style="padding:6px;border:1px solid #e5e7eb;">FBA欠品タブで「廃番候補」フィルタ時のみ表示</td></tr>
+            </table>
+            <p style="font-size:11px;color:#666;margin-top:8px;">※ Amazon推奨数の閾値 (デフォルト11) は設定から変更可能 (oos_amazon_reco_threshold)</p>
+          </div>
+
+          <div class="settings-group">
             <h4>計算フロー全体像</h4>
             <pre style="font-size:12px;line-height:1.6;background:#f8f9fa;padding:12px;border-radius:6px;overflow-x:auto;">
 Step1: 実質FBA在庫の算出
-  = 販売可能 + 輸送中 + 受領中 + 準備中
-  ※ 準備中はリアルタイムSP-API(ACTIVEプラン7日以内)の値を一次ソースとする
-  ※ API取得不可時のみPLANNINGレポート由来を使用し、
-     その場合は working_first_seen が3日超のSKUは放置プランとして0扱い
+  通常商品: 販売可能 + 輸送中 + 受領中 + 準備中(APIリアルタイム値)
+  期限管理商品: 販売可能 + 輸送中 + 受領中 (準備中は除外)
+    ※ 期限商品は別期限の在庫を送る必要があるため、
+       進行中プランを実質在庫に加算しない
 
 Step2: 日販の算出
-  FBA日販 = FBA30日売上 ÷ 30
-  他CH日販 = 他CH30日売上 ÷ 30（NEデータ）
+  FBA日販 = FBA30日売上(RESTOCK) ÷ 30
+  他CH日販 = 参考表示のみ (発注判定には使わない)
 
 Step3: 発注点・目標日数の決定
-  30日売上で回転率を分類 → サイズで目標日数を分岐
+  30日売上で回転率を分類 → サイズ(PLANNINGのper_unit_volume)で目標日数を分岐
   発注点は日数で設定し、個数換算(日数×FBA日販)で比較
 
 Step4: 発注点チェック（ゲートキーパー）
-  FBA在庫 < 発注点(個数) → 推奨に上がる
+  FBA在庫 &lt; 発注点(個数) → 推奨に上がる
   FBA在庫 ≧ 発注点(個数) → 補充不要
 
-Step5: 必要補充数
+Step5: 必要補充数 (自社理論値)
   = ceil(FBA日販 × 目標日数) - 実質FBA在庫
 
-Step6: 倉庫在庫の按分
-  倉庫在庫 = Yロケ以外の在庫のみ（Yロケは出庫禁止のため除外）
-  FBA比率 = FBA日販 ÷ (FBA日販 + 他CH実効日販)
-  FBA用在庫 = 倉庫在庫 × FBA比率
-  ※ 販売比率で按分することで、FBAと他CHの在庫日数が均等になる
-  ※ 他CH実効日販の補正（優先順位）:
-     1. 蓄積60日最大値 > 直近30日 → 欠品で落ちた実力値を採用
-     2. 入荷30日未満 + 他CH≦3個 → FBA日販×1.5で推定（控えめ）
-     3. 上記以外 → 現在の30日データをそのまま使用
-  ※ 入荷7日未満 + 両CH売上0 → 他CH日販を仮に1にして自社確保優先
+Step6: Amazon推奨数で切り詰め (GAS流 min)
+  Amazon推奨数 &lt; 自社理論値 → Amazon推奨数を採用 (多めに出る傾向を抑制)
+  Amazon推奨数 ≥ 自社理論値 → 自社理論値を採用
+  Amazon推奨数が取得できない (null) → 自社理論値のみ採用
+  ※ 納品推奨タブの「Amazon推奨」列が赤太字の時は切り詰め発動中
 
-Step7: 推奨数 = min(必要補充数, FBA用在庫)
-  ※ 最低出荷カバー日数(7日)に満たない場合は除外（二度手間防止）
-  ※ FBA在庫0の場合は最低1日分に緩和（焼け石に水のみ除外）
-  ※ 有効期限管理商品はこのフィルターを無効化（古い期限の滞留防止）
+Step7: 送れる数 = min(上記, 倉庫在庫)
+  倉庫在庫 = Yロケ以外の在庫のみ (Yロケは出庫禁止)
+  ※ 他CH按分は廃止 (他CH販売データを発注判定に使わない方針)
+  ※ 長期欠品/廃番候補のSKUはここで0固定 (FBA欠品タブで別扱い)
 
-Step7.5: 有効期限チェック
+Step7.5: 最低出荷カバー日数 (7日) フィルタ
+  推奨数÷日販 &lt; 7日 → 除外 (二度手間防止)
+  FBA在庫0は最低1日分に緩和
+  ※ 有効期限管理商品はフィルタ無効 (古い期限の滞留防止)
+
+Step7.6: 有効期限チェック
   FBAは同一商品で期限違いを同梱不可
-  → 引当優先の最古期限のみ送れる → 推奨数を制限
-  ※ 必ず同一期限のみ送る（期限なしロケは合算しない）
-  ※ 期限管理SKUに期限なしロケ在庫がある場合は「データ不備」としてアラート
-     (ロケに期限登録を要求)
+  → 引当優先の最古期限の在庫のみ送れる → 推奨数を制限
+  ※ 期限管理SKUに期限なしロケ在庫がある場合は「データ不備」アラート
 
-Step8: 数量補正（2段階）
-  A. 5個単位丸め（20個超の場合）
-  B. ロケーション補正（±10%以内でロケ在庫区切りに寄せ）
+Step8: 数量補正 (2段階)
+  A. 5個単位丸め (20個超の場合)
+  B. ロケーション補正 (±10%以内でロケ在庫区切りに寄せ)
 
-Step9: 緊急度スコア算出（補充推奨用、recommended_qty>0のSKUが対象）
+Step9: 緊急度スコア算出
 Step10: アラート判定
-  missing(送り漏れ) / expiry_missing(期限データ不備) / excess(過剰在庫) /
-  cart_block(カート価格下落) / surge(急上昇) / stop(急停止)
-  ※ アラートは urgency_score とは独立。FBA欠品タブで別途表示
+  missing / expiry_missing / excess / cart_block / surge / stop
 
-【設定値の扱い】
-・non_fba_reserve_days は現在未使用（販売比率按分で均等日数を確保）
-・SKU例外マスタ(send_all/keep_minimum)は手動対応用の表示のみ、計算には反映しない
-
-【⚠ 重要な既知事項: PLANNINGレポートの不安定性】
-・本ツールはAmazon SP-APIの GET_FBA_INVENTORY_PLANNING_DATA レポートを
-  主データソースとして使用している
-・このレポートは Amazon 側で以下のSKUを除外する傾向が強い:
-    - FBA販売可能在庫ゼロのSKU
-    - 補充推奨対象外と判定された十分在庫があるSKU
-    - その他、同じ日でも取得タイミングで件数が変動(ランダム欠損あり)
-・PLANNINGレポートに掲載されないSKUは本画面の推奨計算対象から外れる
-・長期欠品中のSKU、取扱継続中なのに一時的にレポート欠損したSKU、
-  在庫充足のためAmazonが除外したSKUは、本画面の推奨リスト/FBA欠品タブ/
-  新規商品タブのどれにも表示されない可能性がある
-・重要SKUは定期的に Seller Central / ロジザード / 他発注管理ツール で
-  別途確認してください
-・参考: Amazon公式 GitHub Issue #5044
-  https://github.com/amzn/selling-partner-api-models/issues/5044</pre>
+【データ安定性への対策】
+・RESTOCK取得後、Render DBへ「50%件数急減ガード」付きで保存
+  → 前回比50%以下なら保存をスキップ (障害時のデータ消失防止)
+・PLANNING取得失敗は許容。取れた補助データだけ上書き
+・ever_seen_skus テーブル (過去にFBAで観測したSKU) を自動蓄積
+  → 新規商品タブの判定に使用</pre>
           </div>
 
           <div class="settings-group">
@@ -1683,9 +1708,9 @@ Step10: アラート判定
               </tr>
               <tr style="background:#fff5f5;">
                 <td style="padding:8px;border:1px solid #e5e7eb;font-weight:bold;">FBA欠品</td>
-                <td style="padding:8px;border:1px solid #e5e7eb;">FBA販売可能在庫 = 0 のSKU</td>
-                <td style="padding:8px;border:1px solid #e5e7eb;">SP-APIレポートに存在する（＝過去にFBAに送ったことがある）が、<strong>現在Amazonで販売できない状態</strong>の商品。30日以上欠品すると売上データが0になり、納品推奨タブの計算ロジックに上がってこなくなるため、この一覧で送り漏れを発見する。</td>
-                <td style="padding:8px;border:1px solid #e5e7eb;">倉庫在庫があれば納品推奨に追加して送る。価格が合わない等の理由で送らない商品は「非表示」にする。</td>
+                <td style="padding:8px;border:1px solid #e5e7eb;">FBA販売可能在庫=0 かつ (倉庫在庫あり OR 納品推奨済み)</td>
+                <td style="padding:8px;border:1px solid #e5e7eb;"><strong>今すぐ送れる or 送る予定の欠品商品のみ</strong>を表示。<br>SKU状態分類で <span style="background:#fee2e2;padding:1px 4px;border-radius:3px;">直近欠品</span> (30日販売>0) と <span style="background:#fef3c7;padding:1px 4px;border-radius:3px;">長期(復活余地)</span> (Amazon推奨≥閾値) を区別。<br>長期欠品はサブフィルタ+Amazon推奨数閾値で絞り込み可能 (デフォルト≥11)。<br>※ 在庫なし (倉庫0) は「発注推奨(在庫0)」タブへ</td>
+                <td style="padding:8px;border:1px solid #e5e7eb;">倉庫在庫があれば納品推奨に追加。価格が合わない等の理由で送らない商品は「非表示」にする。<br>長期欠品はAmazon推奨数を参考に、自分で数量を入力して納品。</td>
               </tr>
               <tr style="background:#f0fdf4;">
                 <td style="padding:8px;border:1px solid #e5e7eb;font-weight:bold;">新規商品</td>
@@ -1701,9 +1726,20 @@ Step10: アラート判定
               </tr>
             </table>
             <p style="font-size:11px;color:#666;margin-top:8px;">
-              <strong>FBA欠品と新規商品の違い:</strong> FBA欠品はAmazonがそのSKUを認識している（SP-APIレポートに在庫0で記録がある）。新規商品はAmazonにそのSKUの記録自体がない。<br>
-              <strong>FBA欠品と発注推奨の違い:</strong> FBA欠品は倉庫在庫の有無を問わない（倉庫に在庫があるなら送り漏れ）。発注推奨はFBA在庫0＋倉庫在庫0の商品だけ（仕入れが必要）。
+              <strong>FBA欠品と新規商品の違い:</strong> FBA欠品はever_seen_skusにそのSKUの履歴がある（過去にRESTOCK/PLANNINGで観測された）。新規商品は観測履歴自体がない。<br>
+              <strong>FBA欠品と発注推奨の違い:</strong> FBA欠品は倉庫在庫あり(今すぐ送れる)または推奨済み。発注推奨はFBA在庫0＋倉庫在庫0の商品（仕入れが必要、FBA欠品タブから除外）。
             </p>
+          </div>
+
+          <div class="settings-group">
+            <h4>FBA欠品タブの分類バッジ</h4>
+            <table style="width:100%;font-size:12px;border-collapse:collapse;">
+              <tr style="background:#f3f4f6;"><th style="padding:6px;border:1px solid #e5e7eb;">バッジ</th><th style="padding:6px;border:1px solid #e5e7eb;">条件</th><th style="padding:6px;border:1px solid #e5e7eb;">対応</th></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;"><span style="background:#fee2e2;padding:2px 8px;border-radius:3px;font-weight:bold;color:#991b1b;">直近欠品</span></td><td style="padding:6px;border:1px solid #e5e7eb;">FBA=0 AND 30日販売&gt;0</td><td style="padding:6px;border:1px solid #e5e7eb;">最優先で補充。自動計算された推奨数を送る</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;"><span style="background:#fef3c7;padding:2px 8px;border-radius:3px;font-weight:bold;color:#92400e;">長期(復活余地)</span></td><td style="padding:6px;border:1px solid #e5e7eb;">FBA=0 AND 30日=0 AND Amazon推奨≥11</td><td style="padding:6px;border:1px solid #e5e7eb;">Amazon推奨数と過去実績を参考に手動で数量入力</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;"><span style="background:#e5e7eb;padding:2px 8px;border-radius:3px;font-weight:bold;color:#4b5563;">廃番候補</span></td><td style="padding:6px;border:1px solid #e5e7eb;">FBA=0 AND 30日=0 AND Amazon推奨&lt;11</td><td style="padding:6px;border:1px solid #e5e7eb;">需要消滅の可能性。サブフィルタで「廃番候補」を選んだ時のみ表示、必要なら非表示登録</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">⏳ 期限マーク</td><td style="padding:6px;border:1px solid #e5e7eb;">期限管理商品</td><td style="padding:6px;border:1px solid #e5e7eb;">進行中プランがあっても実質在庫から除外、別期限の再納品を許容</td></tr>
+            </table>
           </div>
           </div><!-- /mtGuideContent -->
 
@@ -1714,13 +1750,18 @@ Step10: アラート判定
             <table style="width:100%;font-size:12px;border-collapse:collapse;">
               <tr style="background:#f3f4f6;"><th style="padding:6px;border:1px solid #e5e7eb;">問題</th><th style="padding:6px;border:1px solid #e5e7eb;">対処</th></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">FNSKU除外が「一致なし」になる</td><td style="padding:6px;border:1px solid #e5e7eb;">SP-APIレポート全取得を実行してFNSKUをDBに保存 → 推奨リスト再生成。デプロイ後はFNSKUがリセットされるため再取得が必要。</td></tr>
-              <tr><td style="padding:6px;border:1px solid #e5e7eb;">INVENTORYレポートがFATAL</td><td style="padding:6px;border:1px solid #e5e7eb;">リトライで解消。UNSUPPRESSED→ALL_INVENTORYのフォールバック実装済み。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">RESTOCK件数が急減した</td><td style="padding:6px;border:1px solid #e5e7eb;">50%件数急減ガードが働き、保存スキップ。ログに「RESTOCK 保存スキップ」と表示される。再度取得でリトライ。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">PLANNING件数が少ない・0</td><td style="padding:6px;border:1px solid #e5e7eb;">PLANNINGは補助データで欠落OK仕様。60/90日販売やカート価格等の一部情報が不足するが、発注判定には影響なし。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">「レポート取得中です」エラー</td><td style="padding:6px;border:1px solid #e5e7eb;">前回のフェッチ未完了。1〜2分待ってリトライ。</td></tr>
-              <tr><td style="padding:6px;border:1px solid #e5e7eb;">昨日送った商品がまた推奨に上がる</td><td style="padding:6px;border:1px solid #e5e7eb;">セラセンでプラン作成済みなら、翌日のSP-APIレポートで「準備中」に反映される。Step1を毎日実行すれば問題なし。反映にタイムラグあり（数時間〜翌日）。</td></tr>
-              <tr><td style="padding:6px;border:1px solid #e5e7eb;">仮確定データが消えた</td><td style="padding:6px;border:1px solid #e5e7eb;">「仮確定に移動」は差分マージ方式（既存データを保持して追加・更新）。全件クリアしたい場合は仮確定タブの「クリア」ボタンを使用。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">昨日送った商品がまた推奨に上がる</td><td style="padding:6px;border:1px solid #e5e7eb;">Inbound APIで過去3日のACTIVEプランをリアルタイム取得。Step1を毎日実行すれば自動反映される。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">長期欠品SKUが納品推奨に混ざらない</td><td style="padding:6px;border:1px solid #e5e7eb;">仕様。30日販売=0で在庫もない商品はFBA欠品タブの「長期(復活余地)」で手動判断。Amazon推奨≥11フィルタで絞れる。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">Amazon推奨列が赤太字になっている</td><td style="padding:6px;border:1px solid #e5e7eb;">GAS流min切り詰め発動中。自社理論値よりAmazon推奨が小さいので、Amazon推奨数を採用して積みすぎを防止。tooltipで切り詰め前の自社理論値を確認可。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">期限管理商品の準備中が反映されない</td><td style="padding:6px;border:1px solid #e5e7eb;">仕様。期限商品は別期限を送るため、進行中のプランを実質在庫に加算しない。同日内の再納品を許容する。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">仮確定データが消えた</td><td style="padding:6px;border:1px solid #e5e7eb;">Step4「推奨リスト生成」実行時に自動クリアされる仕様。同日内の追加は「仮確定に移動」でマージ方式、別日作業はStep4で再計算。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">NE CSVの商品コードが空</td><td style="padding:6px;border:1px solid #e5e7eb;">SKUマッピングにNE商品コードがない。Google Sheetsの変換テーブルにD列（NE商品コード）を追加。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">セラセンで数量変更したい</td><td style="padding:6px;border:1px solid #e5e7eb;">セラセンで直接変更、またはプラン削除→ツールで数量変更→再度Excel出力。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">デプロイ後にデータが消えた</td><td style="padding:6px;border:1px solid #e5e7eb;">RenderデプロイでSQLiteがリセットされる。Step1〜3を再実行すれば復元。仮確定データ・出力履歴も消えるので注意。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">新規商品タブが急に多数表示</td><td style="padding:6px;border:1px solid #e5e7eb;">ever_seen_skusテーブルが空スタートのため、最初のSP-API取得前は「FBA観測履歴なし」扱い。取得を続けると正常化。</td></tr>
             </table>
           </div>
 
@@ -1729,12 +1770,16 @@ Step10: アラート判定
             <table style="width:100%;font-size:12px;border-collapse:collapse;">
               <tr style="background:#f3f4f6;"><th style="padding:6px;border:1px solid #e5e7eb;width:30%;">用語</th><th style="padding:6px;border:1px solid #e5e7eb;">意味</th></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">FNSKU</td><td style="padding:6px;border:1px solid #e5e7eb;">AmazonがFBA商品に付与するバーコード。SKUと1対1。危険物判定で梱包グループが分かれる際の識別に使用。</td></tr>
-              <tr><td style="padding:6px;border:1px solid #e5e7eb;">準備中(inbound_working)</td><td style="padding:6px;border:1px solid #e5e7eb;">セラセンで納品プランを作成済みだがまだ発送していない状態の数量。実質FBA在庫に加算される。3日超で除外。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">RESTOCK</td><td style="padding:6px;border:1px solid #e5e7eb;">GET_RESTOCK_INVENTORY_RECOMMENDATIONS_REPORT。全FBA登録SKUを網羅する主軸レポート。30日販売・在庫内訳・Amazon推奨補充数を含む。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">PLANNING</td><td style="padding:6px;border:1px solid #e5e7eb;">GET_FBA_INVENTORY_PLANNING_DATA。60/90日販売・カート価格・季節性などの補助情報源。SKU欠落バグあり、欠落してもシステムは動作継続。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">Amazon推奨</td><td style="padding:6px;border:1px solid #e5e7eb;">RESTOCKレポートの「推奨される在庫補充数」。Amazon MLが過去履歴・季節性を加味して算出。GAS流minで自社理論値と比較し小さい方を採用。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">stock_state</td><td style="padding:6px;border:1px solid #e5e7eb;">SKUの状態分類 (normal/recent_oos/revivable_long_oos/dead_candidate)。タブ振り分けに使用。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">準備中(inbound_working)</td><td style="padding:6px;border:1px solid #e5e7eb;">Inbound API で取得したACTIVEプランの数量(過去3日以内)。期限管理商品は実質在庫から除外。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">発注点</td><td style="padding:6px;border:1px solid #e5e7eb;">FBA在庫がこの日数分を下回ったら推奨に上がる閾値。回転率で変動。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">目標日数</td><td style="padding:6px;border:1px solid #e5e7eb;">推奨に上がった時に何日分送るか。回転率×サイズで決定。</td></tr>
-              <tr><td style="padding:6px;border:1px solid #e5e7eb;">按分</td><td style="padding:6px;border:1px solid #e5e7eb;">倉庫在庫をFBAと他CH（楽天等）の販売比率で配分すること。FBAに送りすぎて他CHの販売機会を逃さないため。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">Yロケ</td><td style="padding:6px;border:1px solid #e5e7eb;">ロジザードの出庫禁止ロケーション。施設（いろは）に預けている在庫。計算対象外。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">set_components</td><td style="padding:6px;border:1px solid #e5e7eb;">1つのAmazon SKUが複数のNE商品コードで構成されている場合の展開情報。NE CSV出力時に使用。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">ever_seen_skus</td><td style="padding:6px;border:1px solid #e5e7eb;">過去にFBAで観測したSKU一覧。RESTOCK/PLANNING取得時に自動蓄積。新規商品タブ判定に使用。</td></tr>
             </table>
           </div>
           </div><!-- /mtFaqContent -->
