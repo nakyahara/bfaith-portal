@@ -729,16 +729,21 @@ document.getElementById('costMonth').value = defaultYM;
 document.getElementById('plMonth').value = defaultYM;
 
 // ─── タブ1: 運賃・資材費 ───
+// DBは税抜保存、UIは税込表示（税率10%固定）
+const TAX_RATE = 1.1;
+const toTaxIn = v => Math.round((v || 0) * TAX_RATE);
+const toTaxEx = v => Math.round((v || 0) / TAX_RATE);
+
 function buildCostRows(containerId, names, data, keyField) {
   const tbody = document.getElementById(containerId);
   tbody.innerHTML = '';
   for (const name of names) {
     const existing = data.find(d => d[keyField] === name);
-    const amount = existing ? existing.amount : 0;
+    const amountInc = existing ? toTaxIn(existing.amount) : 0; // 税抜→税込表示
     const note = existing ? (existing.note || '') : '';
     const tr = document.createElement('tr');
     tr.innerHTML = '<td>' + name + '</td>'
-      + '<td><input type="number" class="input-amount" data-name="' + name + '" value="' + amount + '" onchange="updateTotals()"></td>'
+      + '<td><input type="number" class="input-amount" data-name="' + name + '" value="' + amountInc + '" onchange="updateTotals()"></td>'
       + '<td><input type="text" style="width:150px;padding:6px;border:1px solid #ddd;border-radius:4px;font-size:13px;" data-note="' + name + '" value="' + note + '"></td>';
     tbody.appendChild(tr);
   }
@@ -781,14 +786,14 @@ async function loadCosts() {
 async function saveCosts() {
   const ym = document.getElementById('costMonth').value;
   if (!ym) return;
-  // 運賃（国内）
+  // 運賃（国内）入力は税込→税抜で保存
   const freightItems = [];
   document.querySelectorAll('#freightBody .input-amount').forEach(i => {
-    freightItems.push({ carrier: i.dataset.name, amount: Number(i.value) || 0, cost_scope: 'shared' });
+    freightItems.push({ carrier: i.dataset.name, amount: toTaxEx(Number(i.value) || 0), cost_scope: 'shared' });
   });
   // 運賃（輸出）
   document.querySelectorAll('#exportFreightBody .input-amount').forEach(i => {
-    freightItems.push({ carrier: i.dataset.name, amount: Number(i.value) || 0, cost_scope: 'export_only', target_segment: 4, target_mall_id: 'amazon_usa' });
+    freightItems.push({ carrier: i.dataset.name, amount: toTaxEx(Number(i.value) || 0), cost_scope: 'export_only', target_segment: 4, target_mall_id: 'amazon_usa' });
   });
   // 備考を追加
   freightItems.forEach(item => {
@@ -797,11 +802,11 @@ async function saveCosts() {
   });
   await fetch(BASE + '/api/freight', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ year_month: ym, items: freightItems }) });
 
-  // 資材費
+  // 資材費: 税込→税抜
   const materialItems = [];
   document.querySelectorAll('#materialBody .input-amount').forEach(i => {
     const noteEl = document.querySelector('#materialBody [data-note="' + i.dataset.name + '"]');
-    materialItems.push({ supplier: i.dataset.name, amount: Number(i.value) || 0, note: noteEl?.value || '' });
+    materialItems.push({ supplier: i.dataset.name, amount: toTaxEx(Number(i.value) || 0), note: noteEl?.value || '' });
   });
   await fetch(BASE + '/api/material', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ year_month: ym, items: materialItems }) });
 
