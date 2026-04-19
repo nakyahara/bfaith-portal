@@ -335,6 +335,47 @@ router.get('/api/annual-pl/:fiscalYear', (req, res) => {
   res.json({ fiscal_year: fy, months, rows, closings, label: `第${fy}期` });
 });
 
+// ヒストリカル統合取得（グラフ用）
+router.get('/api/historical', (req, res) => {
+  const db = getMirrorDB();
+  const limit = parseInt(req.query.months) || 48;
+
+  // 直近N ヶ月の月リストを取得（全データソースを結合）
+  const monthsSet = new Set();
+  for (const t of ['mgmt_freight_costs', 'mgmt_material_costs', 'mart_monthly_segment_sales', 'mgmt_monthly_pl']) {
+    try {
+      const rows = db.prepare(`SELECT DISTINCT year_month FROM ${t}`).all();
+      for (const r of rows) monthsSet.add(r.year_month);
+    } catch {}
+  }
+  const months = Array.from(monthsSet).sort().slice(-limit);
+  if (months.length === 0) return res.json({ months: [], freight: [], material: [], sales: [], pl: [] });
+
+  const placeholders = months.map(() => '?').join(',');
+
+  // 運賃：月×carrier
+  const freight = db.prepare(`SELECT year_month, carrier, cost_scope, SUM(amount) as amount
+    FROM mgmt_freight_costs WHERE year_month IN (${placeholders})
+    GROUP BY year_month, carrier, cost_scope ORDER BY year_month`).all(...months);
+
+  // 資材費：月×supplier
+  const material = db.prepare(`SELECT year_month, supplier, SUM(amount) as amount
+    FROM mgmt_material_costs WHERE year_month IN (${placeholders})
+    GROUP BY year_month, supplier ORDER BY year_month`).all(...months);
+
+  // 売上：月×mall_id
+  const sales = db.prepare(`SELECT year_month, mall_id, SUM(sales) as sales, SUM(cost) as cost, SUM(pf_fee) as pf_fee, SUM(ad_cost) as ad_cost
+    FROM mart_monthly_segment_sales WHERE year_month IN (${placeholders})
+    GROUP BY year_month, mall_id ORDER BY year_month`).all(...months);
+
+  // PL：月×segment（粗利率用）
+  const pl = db.prepare(`SELECT year_month, segment, SUM(sales) as sales, SUM(gross_profit) as gross_profit, SUM(variable_cost) as variable_cost
+    FROM mgmt_monthly_pl WHERE year_month IN (${placeholders})
+    GROUP BY year_month, segment ORDER BY year_month`).all(...months);
+
+  res.json({ months, freight, material, sales, pl });
+});
+
 // 利用可能な会計年度一覧
 router.get('/api/fiscal-years', (req, res) => {
   const db = getMirrorDB();
@@ -424,6 +465,7 @@ tr:hover { background: #f0f4ff; }
   <div class="tab active" data-tab="costs">運賃・資材費入力</div>
   <div class="tab" data-tab="monthly">月次PL</div>
   <div class="tab" data-tab="annual">年間PL</div>
+  <div class="tab" data-tab="history">ヒストリカル</div>
 </div>
 <div class="container">
 
@@ -437,9 +479,6 @@ tr:hover { background: #f0f4ff; }
     <button class="btn btn-outline" onclick="syncSegmentSales()">売上同期</button>
     <button class="btn btn-success" onclick="doCalculate()" id="btnCalc">集計確定</button>
     <span id="closingStatus"></span>
-    <span style="flex-grow:1"></span>
-    <input type="file" id="importFile" accept=".json" style="display:none" onchange="importHistorical()">
-    <button class="btn btn-outline" onclick="document.getElementById('importFile').click()">📥 過去データ投入</button>
   </div>
 
   <div class="card">
@@ -512,8 +551,45 @@ tr:hover { background: #f0f4ff; }
   </div>
 </div>
 
+<!-- ===== タブ4: ヒストリカル ===== -->
+<div id="tab-history" class="hidden">
+  <div class="controls">
+    <label>表示期間:</label>
+    <select id="histMonths">
+      <option value="12">直近12ヶ月</option>
+      <option value="24">直近24ヶ月</option>
+      <option value="48" selected>直近48ヶ月</option>
+      <option value="0">全期間</option>
+    </select>
+    <button class="btn btn-primary" onclick="loadHistorical()">更新</button>
+    <span id="histInfo" style="color:#666;font-size:13px"></span>
+  </div>
+  <div id="histSummary" class="summary-grid"></div>
+  <div class="card">
+    <h3>📈 月次売上推移（モール別）</h3>
+    <div style="position:relative;height:320px;"><canvas id="chartSales"></canvas></div>
+  </div>
+  <div class="card">
+    <h3>📊 月次粗利益・粗利率推移</h3>
+    <div style="position:relative;height:320px;"><canvas id="chartProfit"></canvas></div>
+  </div>
+  <div class="card">
+    <h3>🚚 月次運賃推移（運送会社別）</h3>
+    <div style="position:relative;height:320px;"><canvas id="chartFreight"></canvas></div>
+  </div>
+  <div class="card">
+    <h3>📦 月次資材費推移（仕入先別）</h3>
+    <div style="position:relative;height:320px;"><canvas id="chartMaterial"></canvas></div>
+  </div>
+  <div class="card">
+    <h3>🥧 セグメント別売上シェア（直近月）</h3>
+    <div style="position:relative;height:320px;display:flex;align-items:center;justify-content:center;"><canvas id="chartSegShare" style="max-height:320px;"></canvas></div>
+  </div>
+</div>
+
 </div>
 <div class="toast" id="toast"></div>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 
 <script>
 const MALL_NAMES = ${JSON.stringify(MALL_NAMES)};
@@ -542,6 +618,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     document.querySelectorAll('[id^="tab-"]').forEach(p => p.classList.add('hidden'));
     document.getElementById('tab-' + tab.dataset.tab).classList.remove('hidden');
     if (tab.dataset.tab === 'annual' && !document.getElementById('fySelect').value) loadFiscalYears();
+    if (tab.dataset.tab === 'history' && !window._histLoaded) { window._histLoaded = true; loadHistorical(); }
   });
 });
 
@@ -633,20 +710,6 @@ async function saveCosts() {
   await fetch(BASE + '/api/material', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ year_month: ym, items: materialItems }) });
 
   toast('保存しました');
-}
-
-async function importHistorical() {
-  const file = document.getElementById('importFile').files[0];
-  if (!file) return;
-  if (!confirm('過去データをインポートします。既存データは上書きされます。続行しますか？')) return;
-  const text = await file.text();
-  let data;
-  try { data = JSON.parse(text); } catch (e) { toast('JSON解析失敗: ' + e.message); return; }
-  const res = await fetch(BASE + '/import-historical', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: text });
-  const result = await res.json();
-  if (result.error) { toast('エラー: ' + result.error); return; }
-  toast('投入完了: 運賃 ' + result.freight + '件, 資材 ' + result.material + '件');
-  loadCosts();
 }
 
 async function syncSegmentSales() {
@@ -870,6 +933,194 @@ async function loadAnnualPL() {
     '<div class="summary-item"><div class="label">年間売上</div><div class="value">' + fmt(totalSales) + '</div></div>' +
     '<div class="summary-item"><div class="label">年間粗利</div><div class="value ' + clsVal(totalProfit) + '">' + fmt(totalProfit) + '</div></div>' +
     '<div class="summary-item"><div class="label">粗利率</div><div class="value ' + clsVal(totalMargin) + '">' + fmtPct(totalMargin) + '</div></div>';
+}
+
+// ─── タブ4: ヒストリカル ───
+const CHART_COLORS = ['#1a73e8', '#ea4335', '#fbbc04', '#34a853', '#ff6d01', '#46bdc6', '#9334e8', '#b31412', '#7cb342', '#d81b60', '#00acc1', '#5e35b1', '#8e24aa', '#039be5', '#43a047'];
+const _charts = {};
+
+function destroyChart(key) {
+  if (_charts[key]) { _charts[key].destroy(); delete _charts[key]; }
+}
+
+function groupByMonthAndKey(rows, monthField, keyField, valueField) {
+  // rows: [{year_month, key, value}, ...] → {months: [...], keys: [...], data: {key: [v1, v2, ...]}}
+  const months = [...new Set(rows.map(r => r[monthField]))].sort();
+  const keys = [...new Set(rows.map(r => r[keyField]))];
+  const keyMonthMap = {};
+  for (const r of rows) {
+    const k = r[keyField];
+    if (!keyMonthMap[k]) keyMonthMap[k] = {};
+    keyMonthMap[k][r[monthField]] = (keyMonthMap[k][r[monthField]] || 0) + (r[valueField] || 0);
+  }
+  const data = {};
+  for (const k of keys) data[k] = months.map(m => keyMonthMap[k][m] || 0);
+  return { months, keys, data };
+}
+
+async function loadHistorical() {
+  const monthsLimit = document.getElementById('histMonths').value || '48';
+  const url = BASE + '/api/historical' + (monthsLimit !== '0' ? ('?months=' + monthsLimit) : '');
+  let data;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    data = await res.json();
+  } catch (e) {
+    toast('ヒストリカル取得失敗: ' + e.message);
+    return;
+  }
+
+  if (!data.months || data.months.length === 0) {
+    document.getElementById('histInfo').textContent = 'データがありません';
+    return;
+  }
+  document.getElementById('histInfo').textContent = data.months[0] + ' 〜 ' + data.months[data.months.length - 1] + '（' + data.months.length + 'ヶ月）';
+
+  // サマリー: 期間合計
+  const totalSales = data.sales.reduce((s, r) => s + (r.sales || 0), 0);
+  const totalFreight = data.freight.reduce((s, r) => s + (r.amount || 0), 0);
+  const totalMaterial = data.material.reduce((s, r) => s + (r.amount || 0), 0);
+  const totalProfit = data.pl.reduce((s, r) => s + (r.gross_profit || 0), 0);
+  document.getElementById('histSummary').innerHTML =
+    '<div class="summary-item"><div class="label">期間売上</div><div class="value">' + fmt(totalSales) + '</div></div>' +
+    '<div class="summary-item"><div class="label">期間粗利</div><div class="value ' + clsVal(totalProfit) + '">' + fmt(totalProfit) + '</div></div>' +
+    '<div class="summary-item"><div class="label">期間運賃</div><div class="value">' + fmt(totalFreight) + '</div></div>' +
+    '<div class="summary-item"><div class="label">期間資材費</div><div class="value">' + fmt(totalMaterial) + '</div></div>';
+
+  // ① 売上（モール別積み上げ棒）
+  const salesGrp = groupByMonthAndKey(data.sales, 'year_month', 'mall_id', 'sales');
+  destroyChart('sales');
+  _charts.sales = new Chart(document.getElementById('chartSales'), {
+    type: 'bar',
+    data: {
+      labels: salesGrp.months,
+      datasets: salesGrp.keys.map((k, i) => ({
+        label: MALL_NAMES[k] || k,
+        data: salesGrp.data[k],
+        backgroundColor: CHART_COLORS[i % CHART_COLORS.length],
+      })),
+    },
+    options: {
+      maintainAspectRatio: false,
+      responsive: true,
+      scales: { x: { stacked: true }, y: { stacked: true, ticks: { callback: v => fmt(v) } } },
+      plugins: { tooltip: { callbacks: { label: ctx => ctx.dataset.label + ': ' + fmt(ctx.parsed.y) } } },
+    },
+  });
+
+  // ② 粗利益（セグメント別線）+ 全体粗利率（右軸線）
+  const plGrp = groupByMonthAndKey(data.pl, 'year_month', 'segment', 'gross_profit');
+  const salesBySegGrp = groupByMonthAndKey(data.pl, 'year_month', 'segment', 'sales');
+  const totalGpByMonth = {};
+  const totalSalesByMonth = {};
+  for (const r of data.pl) {
+    totalGpByMonth[r.year_month] = (totalGpByMonth[r.year_month] || 0) + (r.gross_profit || 0);
+    totalSalesByMonth[r.year_month] = (totalSalesByMonth[r.year_month] || 0) + (r.sales || 0);
+  }
+  const marginRates = plGrp.months.map(m => totalSalesByMonth[m] > 0 ? (totalGpByMonth[m] / totalSalesByMonth[m] * 100) : 0);
+  destroyChart('profit');
+  _charts.profit = new Chart(document.getElementById('chartProfit'), {
+    data: {
+      labels: plGrp.months,
+      datasets: [
+        ...plGrp.keys.map((k, i) => ({
+          type: 'bar',
+          label: (SEGMENT_NAMES[k] || 'seg' + k) + ' 粗利',
+          data: plGrp.data[k],
+          backgroundColor: CHART_COLORS[i % CHART_COLORS.length],
+          yAxisID: 'y',
+          stack: 'gp',
+        })),
+        {
+          type: 'line',
+          label: '全体粗利率(%)',
+          data: marginRates,
+          borderColor: '#d93025',
+          backgroundColor: 'rgba(217,48,37,0.1)',
+          yAxisID: 'y1',
+          tension: 0.2,
+          borderWidth: 2,
+        },
+      ],
+    },
+    options: {
+      maintainAspectRatio: false,
+      responsive: true,
+      scales: {
+        x: { stacked: true },
+        y: { stacked: true, position: 'left', ticks: { callback: v => fmt(v) }, title: { display: true, text: '粗利益（円）' } },
+        y1: { position: 'right', grid: { drawOnChartArea: false }, ticks: { callback: v => v.toFixed(1) + '%' }, title: { display: true, text: '粗利率（%）' } },
+      },
+    },
+  });
+
+  // ③ 運賃（運送会社別積み上げ棒）
+  const freightGrp = groupByMonthAndKey(data.freight, 'year_month', 'carrier', 'amount');
+  destroyChart('freight');
+  _charts.freight = new Chart(document.getElementById('chartFreight'), {
+    type: 'bar',
+    data: {
+      labels: freightGrp.months,
+      datasets: freightGrp.keys.map((k, i) => ({
+        label: k,
+        data: freightGrp.data[k],
+        backgroundColor: CHART_COLORS[i % CHART_COLORS.length],
+      })),
+    },
+    options: {
+      maintainAspectRatio: false,
+      responsive: true,
+      scales: { x: { stacked: true }, y: { stacked: true, ticks: { callback: v => fmt(v) } } },
+      plugins: { tooltip: { callbacks: { label: ctx => ctx.dataset.label + ': ' + fmt(ctx.parsed.y) } } },
+    },
+  });
+
+  // ④ 資材費（仕入先別積み上げ棒）
+  const matGrp = groupByMonthAndKey(data.material, 'year_month', 'supplier', 'amount');
+  destroyChart('material');
+  _charts.material = new Chart(document.getElementById('chartMaterial'), {
+    type: 'bar',
+    data: {
+      labels: matGrp.months,
+      datasets: matGrp.keys.map((k, i) => ({
+        label: k,
+        data: matGrp.data[k],
+        backgroundColor: CHART_COLORS[i % CHART_COLORS.length],
+      })),
+    },
+    options: {
+      maintainAspectRatio: false,
+      responsive: true,
+      scales: { x: { stacked: true }, y: { stacked: true, ticks: { callback: v => fmt(v) } } },
+      plugins: { tooltip: { callbacks: { label: ctx => ctx.dataset.label + ': ' + fmt(ctx.parsed.y) } } },
+    },
+  });
+
+  // ⑤ 直近月のセグメント売上シェア（円グラフ）
+  const latest = data.months[data.months.length - 1];
+  const latestSeg = data.pl.filter(r => r.year_month === latest);
+  destroyChart('segShare');
+  if (latestSeg.length > 0) {
+    _charts.segShare = new Chart(document.getElementById('chartSegShare'), {
+      type: 'doughnut',
+      data: {
+        labels: latestSeg.map(r => SEGMENT_NAMES[r.segment] || 'seg' + r.segment),
+        datasets: [{
+          data: latestSeg.map(r => r.sales),
+          backgroundColor: CHART_COLORS,
+        }],
+      },
+      options: {
+        maintainAspectRatio: false,
+        responsive: true,
+        plugins: {
+          title: { display: true, text: latest + ' 売上構成' },
+          tooltip: { callbacks: { label: ctx => ctx.label + ': ' + fmt(ctx.parsed) + ' (' + (ctx.parsed / latestSeg.reduce((s, r) => s + r.sales, 0) * 100).toFixed(1) + '%)' } },
+        },
+      },
+    });
+  }
 }
 
 // 初期読み込み
