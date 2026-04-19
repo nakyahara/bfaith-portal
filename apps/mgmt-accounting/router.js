@@ -93,6 +93,17 @@ router.post('/import-historical', (req, res) => {
   res.json({ ok: true, freight: freight.length, material: material.length, sales: sales.length });
 });
 
+// 無効レコード削除（carrier/supplier に「合計」等が紛れ込んだ場合のクリーンアップ）
+router.post('/cleanup-invalid', (req, res) => {
+  if (!checkAuth(req, res)) return;
+  const db = getMirrorDB();
+  const bad = ['合計', '運賃合計', '運賃合計(輸出)'];
+  const placeholders = bad.map(() => '?').join(',');
+  const f = db.prepare(`DELETE FROM mgmt_freight_costs WHERE carrier IN (${placeholders})`).run(...bad);
+  const m = db.prepare(`DELETE FROM mgmt_material_costs WHERE supplier IN (${placeholders})`).run(...bad);
+  res.json({ ok: true, freight_deleted: f.changes, material_deleted: m.changes });
+});
+
 // 一括確定: 指定月を除く全月について calculate を実行
 router.post('/bulk-calculate', (req, res) => {
   if (!checkAuth(req, res)) return;

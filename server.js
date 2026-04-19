@@ -440,7 +440,9 @@ app.use('/apps/qoo10-accounting', (req, res, next) => {
 app.use('/apps/fba-profitability', requireAppAccess('fba-profitability'), fbaProfitabilityRouter);
 app.use('/apps/profit-analysis', requireAppAccess('profit-analysis'), profitAnalysisRouter);
 app.use('/apps/mgmt-accounting', express.json({ limit: '50mb' }), (req, res, next) => {
-  if (req.path === '/import-historical' && req.method === 'POST') return next();  // APIキー認証に委譲
+  // 管理系APIはセッション認証スキップ（内部で checkAuth により key/session のいずれか必須）
+  const adminPaths = ['/import-historical', '/bulk-calculate', '/cleanup-invalid'];
+  if (req.method === 'POST' && adminPaths.includes(req.path)) return next();
   requireAuth(req, res, next);
 }, mgmtAccountingRouter);
 app.use('/apps/mercari-accounting', (req, res, next) => {
