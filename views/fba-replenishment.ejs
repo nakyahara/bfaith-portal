@@ -1547,10 +1547,9 @@ Amazon SKU → NE商品コードに変換（set_componentsで展開）
             <h4>計算フロー全体像</h4>
             <pre style="font-size:12px;line-height:1.6;background:#f8f9fa;padding:12px;border-radius:6px;overflow-x:auto;">
 Step1: 実質FBA在庫の算出
-  通常商品: 販売可能 + 輸送中 + 受領中 + 準備中(APIリアルタイム値)
-  期限管理商品: 販売可能 + 輸送中 + 受領中 (準備中は除外)
-    ※ 期限商品は別期限の在庫を送る必要があるため、
-       進行中プランを実質在庫に加算しない
+  全商品共通: 販売可能 + 輸送中 + 受領中 + 準備中(APIリアルタイム値)
+    ※ 期限管理商品も準備中を加算 (二重推奨防止)
+    ※ 別期限を送りたい場合は手動追加で対応
 
 Step2: 日販の算出
   FBA日販 = FBA30日売上(RESTOCK) ÷ 30
@@ -1741,7 +1740,7 @@ Step10: アラート判定
               <tr><td style="padding:6px;border:1px solid #e5e7eb;"><span style="background:#fee2e2;padding:2px 8px;border-radius:3px;font-weight:bold;color:#991b1b;">直近欠品</span></td><td style="padding:6px;border:1px solid #e5e7eb;">FBA=0 AND 30日販売&gt;0</td><td style="padding:6px;border:1px solid #e5e7eb;">最優先で補充。自動計算された推奨数を送る</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;"><span style="background:#fef3c7;padding:2px 8px;border-radius:3px;font-weight:bold;color:#92400e;">長期(復活余地)</span></td><td style="padding:6px;border:1px solid #e5e7eb;">FBA=0 AND 30日=0 AND Amazon推奨≥11</td><td style="padding:6px;border:1px solid #e5e7eb;">Amazon推奨数と過去実績を参考に手動で数量入力</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;"><span style="background:#e5e7eb;padding:2px 8px;border-radius:3px;font-weight:bold;color:#4b5563;">廃番候補</span></td><td style="padding:6px;border:1px solid #e5e7eb;">FBA=0 AND 30日=0 AND (Amazon推奨&lt;11 OR 未取得/null)</td><td style="padding:6px;border:1px solid #e5e7eb;">需要消滅の可能性。サブフィルタで「廃番候補」を選んだ時のみ表示、必要なら非表示登録</td></tr>
-              <tr><td style="padding:6px;border:1px solid #e5e7eb;">⏳ 期限マーク</td><td style="padding:6px;border:1px solid #e5e7eb;">期限管理商品</td><td style="padding:6px;border:1px solid #e5e7eb;">進行中プランがあっても実質在庫から除外、別期限の再納品を許容</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">⏳ 期限マーク</td><td style="padding:6px;border:1px solid #e5e7eb;">期限管理商品</td><td style="padding:6px;border:1px solid #e5e7eb;">有効期限チェックあり (同一期限の在庫のみ送付可)。準備中は実質在庫に加算。</td></tr>
             </table>
           </div>
           </div><!-- /mtGuideContent -->
@@ -1761,7 +1760,7 @@ Step10: アラート判定
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">Amazon推奨列が空欄のSKUが廃番候補になる</td><td style="padding:6px;border:1px solid #e5e7eb;">仕様。RESTOCKでAmazon推奨数が返らない(= null / 未取得)SKUも、FBA=0 &amp; 30日販売=0 なら廃番候補として扱う。需要情報が無いため自動では補充候補に上げない。手動で送りたい場合は「長期欠品のみ」を解除し全分類で検索して納品推奨に追加する。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">「PLANNING_LATEST 同期スキップ」と出る</td><td style="padding:6px;border:1px solid #e5e7eb;">PLANNING 件数が前回の30%を下回った時に自動スキップ。PLANNING は補助データなので発注判定には影響なし。60/90日販売や季節性の参考情報が一時的に古くなる程度。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">Amazon推奨列が赤太字になっている</td><td style="padding:6px;border:1px solid #e5e7eb;">GAS流min切り詰め発動中。自社理論値よりAmazon推奨が小さいので、Amazon推奨数を採用して積みすぎを防止。tooltipで切り詰め前の自社理論値を確認可。</td></tr>
-              <tr><td style="padding:6px;border:1px solid #e5e7eb;">期限管理商品の準備中が反映されない</td><td style="padding:6px;border:1px solid #e5e7eb;">仕様。期限商品は別期限を送るため、進行中のプランを実質在庫に加算しない。同日内の再納品を許容する。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">期限管理商品の準備中</td><td style="padding:6px;border:1px solid #e5e7eb;">通常商品と同様に実質在庫に加算される。別期限を送りたい場合は手動追加で対応。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">仮確定データが消えた</td><td style="padding:6px;border:1px solid #e5e7eb;">Step4「推奨リスト生成」実行時に自動クリアされる仕様。同日内の追加は「仮確定に移動」でマージ方式、別日作業はStep4で再計算。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">NE CSVの商品コードが空</td><td style="padding:6px;border:1px solid #e5e7eb;">SKUマッピングにNE商品コードがない。Google Sheetsの変換テーブルにD列（NE商品コード）を追加。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">セラセンで数量変更したい</td><td style="padding:6px;border:1px solid #e5e7eb;">セラセンで直接変更、またはプラン削除→ツールで数量変更→再度Excel出力。</td></tr>
@@ -1779,7 +1778,7 @@ Step10: アラート判定
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">PLANNING</td><td style="padding:6px;border:1px solid #e5e7eb;">GET_FBA_INVENTORY_PLANNING_DATA。60/90日販売・カート価格・季節性などの補助情報源。SKU欠落バグあり、欠落してもシステムは動作継続。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">Amazon推奨</td><td style="padding:6px;border:1px solid #e5e7eb;">RESTOCKレポートの「推奨される在庫補充数」。Amazon MLが過去履歴・季節性を加味して算出。GAS流minで自社理論値と比較し小さい方を採用。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">stock_state</td><td style="padding:6px;border:1px solid #e5e7eb;">SKUの状態分類 (normal/recent_oos/revivable_long_oos/dead_candidate)。タブ振り分けに使用。</td></tr>
-              <tr><td style="padding:6px;border:1px solid #e5e7eb;">準備中(inbound_working)</td><td style="padding:6px;border:1px solid #e5e7eb;">Inbound API で取得したACTIVEプランの数量(過去3日以内)。期限管理商品は実質在庫から除外。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">準備中(inbound_working)</td><td style="padding:6px;border:1px solid #e5e7eb;">Inbound API で取得したACTIVEプランの数量。全商品共通で実質在庫に加算。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">発注点</td><td style="padding:6px;border:1px solid #e5e7eb;">FBA在庫がこの日数分を下回ったら推奨に上がる閾値。回転率で変動。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">目標日数</td><td style="padding:6px;border:1px solid #e5e7eb;">推奨に上がった時に何日分送るか。回転率×サイズで決定。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">Yロケ</td><td style="padding:6px;border:1px solid #e5e7eb;">ロジザードの出庫禁止ロケーション。施設（いろは）に預けている在庫。計算対象外。</td></tr>

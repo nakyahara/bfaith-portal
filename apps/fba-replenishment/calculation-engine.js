@@ -97,10 +97,9 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
       workingSource = 'report';
     }
 
-    // --- 期限商品の例外: 別期限の在庫を送る必要があるため、inboundWorking を effectiveFbaStock から除外する ---
-    // (通常商品は inboundWorking を足して二重推奨防止、期限商品はこの除外ルールを無効化)
-    const effectiveInboundWorking = hasExpiryManagement ? 0 : inboundWorking;
-    const effectiveFbaStock = fbaAvailable + inboundShipped + inboundReceived + effectiveInboundWorking;
+    // --- 実質FBA在庫: 期限管理商品も含め、準備中を加算して二重推奨を防止する ---
+    // (別期限を送りたいケースは手動追加で対応)
+    const effectiveFbaStock = fbaAvailable + inboundShipped + inboundReceived + inboundWorking;
 
     // --- 販売データ ---
     const sold7d = snap.units_sold_7d || 0;
@@ -359,7 +358,7 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
       fba_inbound_working: inboundWorking,
       fba_inbound_working_report: reportWorking,
       fba_inbound_working_source: workingSource,
-      fba_inbound_working_effective: effectiveInboundWorking, // 期限商品は0扱い
+      fba_inbound_working_effective: inboundWorking,
       fba_inbound_shipped: inboundShipped,
       fba_inbound_received: inboundReceived,
       working_first_seen: snap.working_first_seen || null,
