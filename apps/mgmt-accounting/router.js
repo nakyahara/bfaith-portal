@@ -31,10 +31,10 @@ function getFiscalYearMonths(fiscalYear) {
   return months;
 }
 
-// 運送会社・仕入先のプリセット
-const CARRIERS = ['FBA運賃', 'RSL返品', 'ヤマト', 'ヤマト2', '佐川', '日本セラミック', 'ゆうパック', '郵便局(UPSIDER1)', '郵便局(UPSIDER2)', 'クリックポスト'];
-const EXPORT_CARRIERS = ['TNK運賃', 'FBA運賃(米国)'];
-const SUPPLIERS = ['ヤマト', 'ダイナハイテックス', 'UPSIDERカード', 'ダンボールワン', 'アスクル', 'シンジマ', 'レクス', '郵便局(レターパック)', 'イージーパック', 'スズキエビス', 'UPSIDERカード2', '梱洋パッケージ'];
+// 運送会社・仕入先のプリセット（Excel「運賃集計」「輸出運賃」「梱包資材費」シートのヘッダーに合わせる）
+const CARRIERS = ['FBA運賃', 'RSL費用', 'ヤマト', 'ヤマト2', '佐川', '西濃', '福山通運', '郵便局（UPSIDER1）', '郵便局（UPSIDER2）', 'クリックポスト'];
+const EXPORT_CARRIERS = ['TNK運賃(輸出)', 'FBA運賃(輸出)'];
+const SUPPLIERS = ['ヤマト', 'ダイワハイテックス', 'アップサイダーカード', 'ダンボールワン', 'アスクル', 'シモジマ', 'ラクスル', '郵便局（レタパ）', 'イージーパック', 'スズヤエビス堂', 'アップサイダーカード2', '五洋パッケージ'];
 
 const MALL_NAMES = {
   amazon_jp: 'Amazon', rakuten: '楽天', yahoo: 'Yahoo!',
@@ -44,6 +44,40 @@ const MALL_NAMES = {
 const SEGMENT_NAMES = { 1: '自社商品', 2: '取引先限定商品', 3: '仕入れ商品', 4: '米国Amazon輸出' };
 
 // ─── API ───
+
+// 過去データ一括インポート（APIキー認証 or セッション認証）
+router.post('/import-historical', (req, res) => {
+  const key = process.env.MIRROR_SYNC_KEY;
+  const provided = req.headers['x-sync-key'];
+  const apiKeyOK = key && provided === key;
+  const sessionOK = req.session?.authenticated;
+  if (!apiKeyOK && !sessionOK) return res.status(401).json({ error: 'Unauthorized' });
+
+  const db = getMirrorDB();
+  const { freight = [], material = [] } = req.body;
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+
+  const freightStmt = db.prepare(`INSERT INTO mgmt_freight_costs
+    (year_month, carrier, amount, cost_scope, target_segment, target_mall_id, note, entered_by, entered_at, updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(year_month, carrier) DO UPDATE SET amount=excluded.amount, cost_scope=excluded.cost_scope, target_segment=excluded.target_segment, target_mall_id=excluded.target_mall_id, updated_at=excluded.updated_at`);
+  const materialStmt = db.prepare(`INSERT INTO mgmt_material_costs
+    (year_month, supplier, amount, note, entered_by, entered_at, updated_at)
+    VALUES (?,?,?,?,?,?,?)
+    ON CONFLICT(year_month, supplier) DO UPDATE SET amount=excluded.amount, updated_at=excluded.updated_at`);
+
+  const tx = db.transaction(() => {
+    for (const f of freight) {
+      freightStmt.run(f.year_month, f.carrier, Math.round(f.amount || 0), f.cost_scope || 'shared', f.target_segment || null, f.target_mall_id || null, f.note || null, 'historical-import', now, now);
+    }
+    for (const m of material) {
+      materialStmt.run(m.year_month, m.supplier, Math.round(m.amount || 0), m.note || null, 'historical-import', now, now);
+    }
+  });
+  tx();
+
+  res.json({ ok: true, freight: freight.length, material: material.length });
+});
 
 // 運賃・資材費 取得
 router.get('/api/costs/:yearMonth', (req, res) => {
@@ -403,6 +437,9 @@ tr:hover { background: #f0f4ff; }
     <button class="btn btn-outline" onclick="syncSegmentSales()">売上同期</button>
     <button class="btn btn-success" onclick="doCalculate()" id="btnCalc">集計確定</button>
     <span id="closingStatus"></span>
+    <span style="flex-grow:1"></span>
+    <input type="file" id="importFile" accept=".json" style="display:none" onchange="importHistorical()">
+    <button class="btn btn-outline" onclick="document.getElementById('importFile').click()">📥 過去データ投入</button>
   </div>
 
   <div class="card">
@@ -508,6 +545,9 @@ document.querySelectorAll('.tab').forEach(tab => {
   });
 });
 
+// APIベースパス（相対パスだと/apps/mgmt-accountingにtrailing slashが無い時に壊れる）
+const BASE = '/apps/mgmt-accounting';
+
 // 初期値: 先月
 const now = new Date();
 now.setMonth(now.getMonth() - 1);
@@ -544,11 +584,18 @@ function updateTotals() {
 async function loadCosts() {
   const ym = document.getElementById('costMonth').value;
   if (!ym) return;
-  const res = await fetch('api/costs/' + ym);
-  const data = await res.json();
-  buildCostRows('freightBody', CARRIERS, data.freight.filter(f => f.cost_scope === 'shared'), 'carrier');
-  buildCostRows('exportFreightBody', EXPORT_CARRIERS, data.freight.filter(f => f.cost_scope !== 'shared'), 'carrier');
-  buildCostRows('materialBody', SUPPLIERS, data.material, 'supplier');
+  let data;
+  try {
+    const res = await fetch(BASE + '/api/costs/' + ym);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    data = await res.json();
+  } catch (e) {
+    toast('読込失敗: ' + e.message);
+    data = { freight: [], material: [], closing: null };
+  }
+  buildCostRows('freightBody', CARRIERS, (data.freight || []).filter(f => f.cost_scope === 'shared'), 'carrier');
+  buildCostRows('exportFreightBody', EXPORT_CARRIERS, (data.freight || []).filter(f => f.cost_scope !== 'shared'), 'carrier');
+  buildCostRows('materialBody', SUPPLIERS, data.material || [], 'supplier');
   updateTotals();
   const st = document.getElementById('closingStatus');
   if (data.closing) {
@@ -575,7 +622,7 @@ async function saveCosts() {
     const noteEl = document.querySelector('[data-note="' + item.carrier + '"]');
     if (noteEl) item.note = noteEl.value;
   });
-  await fetch('api/freight', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ year_month: ym, items: freightItems }) });
+  await fetch(BASE + '/api/freight', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ year_month: ym, items: freightItems }) });
 
   // 資材費
   const materialItems = [];
@@ -583,15 +630,29 @@ async function saveCosts() {
     const noteEl = document.querySelector('#materialBody [data-note="' + i.dataset.name + '"]');
     materialItems.push({ supplier: i.dataset.name, amount: Number(i.value) || 0, note: noteEl?.value || '' });
   });
-  await fetch('api/material', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ year_month: ym, items: materialItems }) });
+  await fetch(BASE + '/api/material', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ year_month: ym, items: materialItems }) });
 
   toast('保存しました');
+}
+
+async function importHistorical() {
+  const file = document.getElementById('importFile').files[0];
+  if (!file) return;
+  if (!confirm('過去データをインポートします。既存データは上書きされます。続行しますか？')) return;
+  const text = await file.text();
+  let data;
+  try { data = JSON.parse(text); } catch (e) { toast('JSON解析失敗: ' + e.message); return; }
+  const res = await fetch(BASE + '/import-historical', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: text });
+  const result = await res.json();
+  if (result.error) { toast('エラー: ' + result.error); return; }
+  toast('投入完了: 運賃 ' + result.freight + '件, 資材 ' + result.material + '件');
+  loadCosts();
 }
 
 async function syncSegmentSales() {
   const ym = document.getElementById('costMonth').value;
   if (!ym) return;
-  const res = await fetch('api/sync-segment-sales', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ year_month: ym }) });
+  const res = await fetch(BASE + '/api/sync-segment-sales', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ year_month: ym }) });
   const data = await res.json();
   if (data.error) { toast('エラー: ' + data.error); return; }
   toast('売上同期完了（' + data.inserted + '行）');
@@ -602,7 +663,7 @@ async function doCalculate() {
   if (!ym) return;
   if (!confirm(ym + ' の集計を確定しますか？')) return;
   await saveCosts();
-  const res = await fetch('api/calculate', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ year_month: ym }) });
+  const res = await fetch(BASE + '/api/calculate', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ year_month: ym }) });
   const data = await res.json();
   if (data.error) { toast('エラー: ' + data.error); return; }
   toast('確定しました（' + data.rows + '行）');
@@ -613,7 +674,7 @@ async function doCalculate() {
 async function loadMonthlyPL() {
   const ym = document.getElementById('plMonth').value;
   if (!ym) return;
-  const res = await fetch('api/monthly-pl/' + ym);
+  const res = await fetch(BASE + '/api/monthly-pl/' + ym);
   const data = await res.json();
 
   const st = document.getElementById('monthlyStatus');
@@ -683,7 +744,7 @@ async function loadMonthlyPL() {
 
 // ─── タブ3: 年間PL ───
 async function loadFiscalYears() {
-  const res = await fetch('api/fiscal-years');
+  const res = await fetch(BASE + '/api/fiscal-years');
   const years = await res.json();
   const sel = document.getElementById('fySelect');
   sel.innerHTML = years.map(y => '<option value="' + y.value + '">' + y.label + '</option>').join('');
@@ -692,7 +753,7 @@ async function loadFiscalYears() {
 async function loadAnnualPL() {
   const fy = document.getElementById('fySelect').value;
   if (!fy) return;
-  const res = await fetch('api/annual-pl/' + fy);
+  const res = await fetch(BASE + '/api/annual-pl/' + fy);
   const data = await res.json();
 
   document.getElementById('annualTitle').textContent = data.label + ' 売上分類別変動費・粗利益集計';
