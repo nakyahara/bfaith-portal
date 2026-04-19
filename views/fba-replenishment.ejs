@@ -1538,7 +1538,7 @@ Amazon SKU → NE商品コードに変換（set_componentsで展開）
               <tr><td style="padding:6px;border:1px solid #e5e7eb;background:#d1fae5;font-weight:bold;">通常</td><td style="padding:6px;border:1px solid #e5e7eb;">FBA在庫&gt;0</td><td style="padding:6px;border:1px solid #e5e7eb;">通常の発注判定ロジック</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;background:#fee2e2;font-weight:bold;">直近欠品</td><td style="padding:6px;border:1px solid #e5e7eb;">FBA=0 AND 30日販売&gt;0</td><td style="padding:6px;border:1px solid #e5e7eb;">通常の発注判定ロジック (最優先で補充)</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;background:#fef3c7;font-weight:bold;">長期(復活余地)</td><td style="padding:6px;border:1px solid #e5e7eb;">FBA=0 AND 30日=0 AND Amazon推奨≥11</td><td style="padding:6px;border:1px solid #e5e7eb;">FBA欠品タブに表示 (参考情報で手動判断)</td></tr>
-              <tr><td style="padding:6px;border:1px solid #e5e7eb;background:#e5e7eb;font-weight:bold;">廃番候補</td><td style="padding:6px;border:1px solid #e5e7eb;">FBA=0 AND 30日=0 AND Amazon推奨&lt;11</td><td style="padding:6px;border:1px solid #e5e7eb;">FBA欠品タブで「廃番候補」フィルタ時のみ表示</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;background:#e5e7eb;font-weight:bold;">廃番候補</td><td style="padding:6px;border:1px solid #e5e7eb;">FBA=0 AND 30日=0 AND (Amazon推奨&lt;11 OR Amazon推奨が未取得/null)</td><td style="padding:6px;border:1px solid #e5e7eb;">FBA欠品タブで「廃番候補」フィルタ時のみ表示</td></tr>
             </table>
             <p style="font-size:11px;color:#666;margin-top:8px;">※ Amazon推奨数の閾値 (デフォルト11) は設定から変更可能 (oos_amazon_reco_threshold)</p>
           </div>
@@ -1597,9 +1597,12 @@ Step10: アラート判定
   missing / expiry_missing / excess / cart_block / surge / stop
 
 【データ安定性への対策】
-・RESTOCK取得後、Render DBへ「50%件数急減ガード」付きで保存
+・RESTOCK 取得後、Render DB へ「50%件数急減ガード」付きで保存
   → 前回比50%以下なら保存をスキップ (障害時のデータ消失防止)
-・PLANNING取得失敗は許容。取れた補助データだけ上書き
+・PLANNING も取得する場合は「30%件数急減ガード」付きで planning_latest に保存
+  → 前回比30%以下なら保存をスキップ (補助データなので緩め)
+  → スキップ時は UI ログに「PLANNING_LATEST 同期スキップ」警告が出る
+・PLANNING 取得失敗自体は許容。取れた補助データだけ上書き
 ・ever_seen_skus テーブル (過去にFBAで観測したSKU) を自動蓄積
   → 新規商品タブの判定に使用</pre>
           </div>
@@ -1634,7 +1637,7 @@ Step10: アラート判定
             </p>
             <table style="width:100%;font-size:12px;border-collapse:collapse;margin-top:8px;">
               <tr style="background:#f3f4f6;"><th style="padding:6px;border:1px solid #e5e7eb;">項目</th><th style="padding:6px;border:1px solid #e5e7eb;">扱い</th></tr>
-              <tr><td style="padding:6px;border:1px solid #e5e7eb;">倉庫在庫（計算対象）</td><td style="padding:6px;border:1px solid #e5e7eb;">Yロケ<strong>以外</strong>の在庫のみ。FBA推奨・他CH按分すべてにこの値を使用。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">倉庫在庫（計算対象）</td><td style="padding:6px;border:1px solid #e5e7eb;">Yロケ<strong>以外</strong>の在庫のみ。現仕様では倉庫在庫がそのままFBA用に使われる（他CH按分は廃止済み）。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">Yロケ在庫</td><td style="padding:6px;border:1px solid #e5e7eb;">参考値として別途記録。計算には使わない。作業完了後にCSV再アップロードで通常在庫に反映される。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">判定条件</td><td style="padding:6px;border:1px solid #e5e7eb;">ブロック略称が「YYY」またはロケーションコードが「Y」始まり。</td></tr>
             </table>
@@ -1737,7 +1740,7 @@ Step10: アラート判定
               <tr style="background:#f3f4f6;"><th style="padding:6px;border:1px solid #e5e7eb;">バッジ</th><th style="padding:6px;border:1px solid #e5e7eb;">条件</th><th style="padding:6px;border:1px solid #e5e7eb;">対応</th></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;"><span style="background:#fee2e2;padding:2px 8px;border-radius:3px;font-weight:bold;color:#991b1b;">直近欠品</span></td><td style="padding:6px;border:1px solid #e5e7eb;">FBA=0 AND 30日販売&gt;0</td><td style="padding:6px;border:1px solid #e5e7eb;">最優先で補充。自動計算された推奨数を送る</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;"><span style="background:#fef3c7;padding:2px 8px;border-radius:3px;font-weight:bold;color:#92400e;">長期(復活余地)</span></td><td style="padding:6px;border:1px solid #e5e7eb;">FBA=0 AND 30日=0 AND Amazon推奨≥11</td><td style="padding:6px;border:1px solid #e5e7eb;">Amazon推奨数と過去実績を参考に手動で数量入力</td></tr>
-              <tr><td style="padding:6px;border:1px solid #e5e7eb;"><span style="background:#e5e7eb;padding:2px 8px;border-radius:3px;font-weight:bold;color:#4b5563;">廃番候補</span></td><td style="padding:6px;border:1px solid #e5e7eb;">FBA=0 AND 30日=0 AND Amazon推奨&lt;11</td><td style="padding:6px;border:1px solid #e5e7eb;">需要消滅の可能性。サブフィルタで「廃番候補」を選んだ時のみ表示、必要なら非表示登録</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;"><span style="background:#e5e7eb;padding:2px 8px;border-radius:3px;font-weight:bold;color:#4b5563;">廃番候補</span></td><td style="padding:6px;border:1px solid #e5e7eb;">FBA=0 AND 30日=0 AND (Amazon推奨&lt;11 OR 未取得/null)</td><td style="padding:6px;border:1px solid #e5e7eb;">需要消滅の可能性。サブフィルタで「廃番候補」を選んだ時のみ表示、必要なら非表示登録</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">⏳ 期限マーク</td><td style="padding:6px;border:1px solid #e5e7eb;">期限管理商品</td><td style="padding:6px;border:1px solid #e5e7eb;">進行中プランがあっても実質在庫から除外、別期限の再納品を許容</td></tr>
             </table>
           </div>
@@ -1755,6 +1758,8 @@ Step10: アラート判定
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">「レポート取得中です」エラー</td><td style="padding:6px;border:1px solid #e5e7eb;">前回のフェッチ未完了。1〜2分待ってリトライ。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">昨日送った商品がまた推奨に上がる</td><td style="padding:6px;border:1px solid #e5e7eb;">Inbound APIで過去3日のACTIVEプランをリアルタイム取得。Step1を毎日実行すれば自動反映される。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">長期欠品SKUが納品推奨に混ざらない</td><td style="padding:6px;border:1px solid #e5e7eb;">仕様。30日販売=0で在庫もない商品はFBA欠品タブの「長期(復活余地)」で手動判断。Amazon推奨≥11フィルタで絞れる。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">Amazon推奨列が空欄のSKUが廃番候補になる</td><td style="padding:6px;border:1px solid #e5e7eb;">仕様。RESTOCKでAmazon推奨数が返らない(= null / 未取得)SKUも、FBA=0 &amp; 30日販売=0 なら廃番候補として扱う。需要情報が無いため自動では補充候補に上げない。手動で送りたい場合は「長期欠品のみ」を解除し全分類で検索して納品推奨に追加する。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">「PLANNING_LATEST 同期スキップ」と出る</td><td style="padding:6px;border:1px solid #e5e7eb;">PLANNING 件数が前回の30%を下回った時に自動スキップ。PLANNING は補助データなので発注判定には影響なし。60/90日販売や季節性の参考情報が一時的に古くなる程度。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">Amazon推奨列が赤太字になっている</td><td style="padding:6px;border:1px solid #e5e7eb;">GAS流min切り詰め発動中。自社理論値よりAmazon推奨が小さいので、Amazon推奨数を採用して積みすぎを防止。tooltipで切り詰め前の自社理論値を確認可。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">期限管理商品の準備中が反映されない</td><td style="padding:6px;border:1px solid #e5e7eb;">仕様。期限商品は別期限を送るため、進行中のプランを実質在庫に加算しない。同日内の再納品を許容する。</td></tr>
               <tr><td style="padding:6px;border:1px solid #e5e7eb;">仮確定データが消えた</td><td style="padding:6px;border:1px solid #e5e7eb;">Step4「推奨リスト生成」実行時に自動クリアされる仕様。同日内の追加は「仮確定に移動」でマージ方式、別日作業はStep4で再計算。</td></tr>
