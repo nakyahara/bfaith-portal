@@ -412,7 +412,7 @@ function createTables() {
     PRIMARY KEY (year_month, mall_id, segment)
   )`);
 
-  // mart_monthly_shared_costs — 月次共通費用（運賃・資材費）
+  // mart_monthly_shared_costs — 月次共通費用（運賃・資材費）※互換維持
   db.exec(`CREATE TABLE IF NOT EXISTS mart_monthly_shared_costs (
     year_month      TEXT PRIMARY KEY,
     freight_total   REAL NOT NULL DEFAULT 0,
@@ -421,5 +421,70 @@ function createTables() {
     source_file     TEXT,
     freight_detail  TEXT DEFAULT '{}',
     material_detail TEXT DEFAULT '{}'
+  )`);
+
+  // ─── 売上分類別粗利集計（管理会計） ───
+
+  // mgmt_freight_costs — 運賃明細（ヒストリカル保持）
+  db.exec(`CREATE TABLE IF NOT EXISTS mgmt_freight_costs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    year_month      TEXT NOT NULL CHECK(year_month GLOB '????-??'),
+    carrier         TEXT NOT NULL,
+    amount          INTEGER NOT NULL DEFAULT 0,
+    cost_scope      TEXT NOT NULL DEFAULT 'shared',
+    target_segment  INTEGER,
+    target_mall_id  TEXT,
+    note            TEXT,
+    entered_by      TEXT,
+    entered_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now')),
+    UNIQUE(year_month, carrier)
+  )`);
+
+  // mgmt_material_costs — 資材費明細（ヒストリカル保持）
+  db.exec(`CREATE TABLE IF NOT EXISTS mgmt_material_costs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    year_month      TEXT NOT NULL CHECK(year_month GLOB '????-??'),
+    supplier        TEXT NOT NULL,
+    amount          INTEGER NOT NULL DEFAULT 0,
+    note            TEXT,
+    entered_by      TEXT,
+    entered_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now')),
+    UNIQUE(year_month, supplier)
+  )`);
+
+  // mgmt_monthly_closing — 月次締めヘッダ
+  db.exec(`CREATE TABLE IF NOT EXISTS mgmt_monthly_closing (
+    year_month      TEXT PRIMARY KEY CHECK(year_month GLOB '????-??'),
+    fiscal_year     INTEGER NOT NULL,
+    fiscal_month    INTEGER NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'draft',
+    freight_total   INTEGER NOT NULL DEFAULT 0,
+    material_total  INTEGER NOT NULL DEFAULT 0,
+    confirmed_at    TEXT,
+    confirmed_by    TEXT,
+    calc_version    TEXT DEFAULT 'v1',
+    source_hash     TEXT
+  )`);
+
+  // mgmt_monthly_pl — 月次PL（PF×セグメント別確定集計）
+  db.exec(`CREATE TABLE IF NOT EXISTS mgmt_monthly_pl (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    year_month      TEXT NOT NULL CHECK(year_month GLOB '????-??'),
+    mall_id         TEXT NOT NULL,
+    segment         INTEGER NOT NULL,
+    sales           INTEGER NOT NULL DEFAULT 0,
+    sales_ratio     REAL DEFAULT 0,
+    cost            INTEGER NOT NULL DEFAULT 0,
+    pf_fee          INTEGER NOT NULL DEFAULT 0,
+    ad_cost         INTEGER NOT NULL DEFAULT 0,
+    freight         INTEGER NOT NULL DEFAULT 0,
+    material        INTEGER NOT NULL DEFAULT 0,
+    variable_cost   INTEGER NOT NULL DEFAULT 0,
+    gross_profit    INTEGER NOT NULL DEFAULT 0,
+    gross_margin    REAL DEFAULT 0,
+    fiscal_year     INTEGER,
+    UNIQUE(year_month, mall_id, segment)
   )`);
 }

@@ -27,6 +27,7 @@ import qoo10AccountingRouter from './apps/qoo10-accounting/router.js';
 import fbaProfitabilityRouter from './apps/fba-profitability/router.js';
 import mercariAccountingRouter from './apps/mercari-accounting/router.js';
 import profitAnalysisRouter from './apps/profit-analysis/router.js';
+import mgmtAccountingRouter from './apps/mgmt-accounting/router.js';
 import serviceRouter from './apps/warehouse/service-router.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -294,6 +295,15 @@ const apps = [
     status: 'active',
     category: 'analysis',
   },
+  {
+    id: 'mgmt-accounting',
+    name: '売上分類別粗利集計',
+    description: '各モール売上データ+運賃・資材費から売上分類別の変動費・粗利益を管理会計用に集計',
+    icon: '📊',
+    path: '/apps/mgmt-accounting',
+    status: 'active',
+    category: 'accounting',
+  },
 ];
 
 // 外部リンク
@@ -429,6 +439,7 @@ app.use('/apps/qoo10-accounting', (req, res, next) => {
 }, qoo10AccountingRouter);
 app.use('/apps/fba-profitability', requireAppAccess('fba-profitability'), fbaProfitabilityRouter);
 app.use('/apps/profit-analysis', requireAppAccess('profit-analysis'), profitAnalysisRouter);
+app.use('/apps/mgmt-accounting', requireAuth, mgmtAccountingRouter);
 app.use('/apps/mercari-accounting', (req, res, next) => {
   if (req.path === '/import-history' && req.method === 'POST') return next();
   requireAuth(req, res, next);
