@@ -245,10 +245,16 @@ router.post('/api/sync-segment-sales', (req, res) => {
   const { year_month } = req.body;
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
   let totalInserted = 0;
+  let fbaFreightInserted = null;
 
   const insertStmt = db.prepare(`INSERT OR REPLACE INTO mart_monthly_segment_sales
     (year_month, mall_id, segment, sales, cost, pf_fee, ad_cost, confirmed_at, source_file, logic_version)
     VALUES (?,?,?,?,?,?,?,?,?,?)`);
+
+  const freightStmt = db.prepare(`INSERT INTO mgmt_freight_costs
+    (year_month, carrier, amount, cost_scope, target_segment, target_mall_id, note, entered_by, entered_at, updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(year_month, carrier) DO UPDATE SET amount=excluded.amount, cost_scope=excluded.cost_scope, note=excluded.note, updated_at=excluded.updated_at`);
 
   const tx = db.transaction(() => {
     for (const mt of MALL_TABLES) {
@@ -273,6 +279,21 @@ router.post('/api/sync-segment-sales', (req, res) => {
       // PF手数料の全体値（テーブルカラムから取得）
       const pfFeeTotal = mt.feeField ? (row[mt.feeField] || 0) : 0;
 
+      // Amazon JP: FBA手数料は販売手数料ではなく運賃として扱う（Excel運用踏襲）
+      // by_segment の FBA手数料（全セグメント合計、税込負数）を |x|/1.1 で税抜化し
+      // mgmt_freight_costs に carrier='FBA運賃', cost_scope='shared' で自動登録
+      if (mt.mall_id === 'amazon_jp') {
+        // 符号付き合計を取ってから絶対値化（返金 segment が含まれる場合もネットで計算するため）
+        const fbaFeeSigned = Object.values(allSegs).reduce((s, v) => s + (v['FBA手数料'] || 0), 0);
+        const fbaFeeTaxInc = Math.abs(fbaFeeSigned);
+        if (fbaFeeTaxInc > 0) {
+          const fbaFeeTaxEx = Math.round(fbaFeeTaxInc / 1.1);
+          freightStmt.run(year_month, 'FBA運賃', fbaFeeTaxEx, 'shared', null, null,
+            'auto from mart_amazon_monthly_summary.by_segment.FBA手数料', 'system-sync', now, now);
+          fbaFreightInserted = fbaFeeTaxEx;
+        }
+      }
+
       for (const [segKey, segData] of Object.entries(allSegs)) {
         const seg = segKey === 'other' ? null : parseInt(segKey);
         if (seg === null || isNaN(seg)) continue;
@@ -281,9 +302,17 @@ router.post('/api/sync-segment-sales', (req, res) => {
         const sales = segData['売上合計'] || segData['合計'] || segData['商品売上'] || 0;
         const cost = segData['原価合計'] || 0;
 
-        // PF手数料: セグメント内に手数料がある場合はそれ、なければ全体を売上按分
+        // PF手数料計算
         let pfFee = 0;
-        if (segData['手数料'] !== undefined || segData['FBA手数料'] !== undefined) {
+        if (mt.mall_id === 'amazon_jp') {
+          // Amazon: 販売手数料 = |手数料 + プロモーション割引額 + プロモーション割引の税金 + Amazonポイント費用|
+          // （税込符号付き合計を取ってから abs → /1.1 で税抜化）。FBA手数料は運賃として別計上するため含めない。
+          const signed = (segData['手数料'] || 0)
+                       + (segData['プロモーション割引額'] || 0)
+                       + (segData['プロモーション割引の税金'] || 0)
+                       + (segData['Amazonポイント費用'] || 0);
+          pfFee = Math.round(Math.abs(signed) / 1.1);
+        } else if (segData['手数料'] !== undefined || segData['FBA手数料'] !== undefined) {
           pfFee += segData['手数料'] || 0;
           pfFee += segData['FBA手数料'] || 0;
           if (segData['トランザクション他'] !== undefined) pfFee += Math.abs(segData['トランザクション他'] || 0);
@@ -303,7 +332,7 @@ router.post('/api/sync-segment-sales', (req, res) => {
     }
   });
   tx();
-  res.json({ ok: true, inserted: totalInserted });
+  res.json({ ok: true, inserted: totalInserted, fba_freight_tax_excluded: fbaFreightInserted });
 });
 
 // 集計計算＆確定
@@ -819,7 +848,12 @@ async function syncSegmentSales() {
   const res = await fetch(BASE + '/api/sync-segment-sales', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ year_month: ym }) });
   const data = await res.json();
   if (data.error) { toast('エラー: ' + data.error); return; }
-  toast('売上同期完了（' + data.inserted + '行）');
+  let msg = '売上同期完了（' + data.inserted + '行）';
+  if (data.fba_freight_tax_excluded) {
+    msg += ' / FBA運賃 自動登録: ¥' + Math.round(data.fba_freight_tax_excluded * 1.1).toLocaleString() + '（税込）';
+  }
+  toast(msg);
+  await loadCosts();
 }
 
 async function doCalculate() {
