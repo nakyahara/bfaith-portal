@@ -103,19 +103,30 @@ app.use(session({
 }));
 
 // --- 認証ミドルウェア ---
+// /api/ パスへの未認証アクセスはHTMLリダイレクトではなくJSONで401/403を返す
+// (fetch が追従したログインHTMLを res.json() でパースして壊れるのを防ぐ)
+function isApiRequest(req) {
+  return req.path.startsWith('/api/') || req.xhr || (req.get('accept') || '').includes('application/json');
+}
+
 function requireAuth(req, res, next) {
   if (req.session && req.session.authenticated) return next();
+  if (isApiRequest(req)) return res.status(401).json({ error: 'session_expired' });
   res.redirect('/login');
 }
 
 // アプリ別アクセス制御ミドルウェア
 function requireAppAccess(appId) {
   return (req, res, next) => {
-    if (!req.session || !req.session.authenticated) return res.redirect('/login');
+    if (!req.session || !req.session.authenticated) {
+      if (isApiRequest(req)) return res.status(401).json({ error: 'session_expired' });
+      return res.redirect('/login');
+    }
     const allowed = req.session.allowedApps;
     if (allowed === '*' || (Array.isArray(allowed) && allowed.includes(appId))) {
       return next();
     }
+    if (isApiRequest(req)) return res.status(403).json({ error: 'forbidden' });
     res.status(403).render('forbidden', { username: req.session.email, displayName: req.session.displayName });
   };
 }

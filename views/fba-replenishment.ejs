@@ -602,6 +602,25 @@
   <script>
     const BASE = '/apps/fba-replenishment';
 
+    // セッション切れ検知: /api/ 呼び出しが 401 を返したら一度だけ通知してエラーをthrow
+    // (サーバ側が /api/ パスに対して redirect→login HTML ではなく 401 JSON を返す前提)
+    (function() {
+      const origFetch = window.fetch.bind(window);
+      let alerted = false;
+      window.fetch = async function(input, init) {
+        const res = await origFetch(input, init);
+        const url = typeof input === 'string' ? input : (input && input.url) || '';
+        if (res.status === 401 && url.includes('/api/')) {
+          if (!alerted) {
+            alerted = true;
+            alert('セッションが切れました。ページを再読み込みしてログインし直してください。\n※未保存の選択状態は失われます。');
+          }
+          throw new Error('セッション切れ: 再ログインが必要です');
+        }
+        return res;
+      };
+    })();
+
     // ジョブポーリング（ミニPC側のジョブマネージャー対応）
     async function pollJob(jobId, { intervalMs = 3000, maxWaitMs = 300000, onProgress } = {}) {
       const start = Date.now();
