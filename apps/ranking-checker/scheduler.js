@@ -41,16 +41,21 @@ function cleanupOldData() {
 // ── スケジューラー起動 ──
 
 export function startScheduler() {
-  // 毎日 13:00 JST = 04:00 UTC
-  cron.schedule('0 4 * * *', async () => {
-    log('--- スケジュール実行: 順位自動チェック (13:00 JST) ---');
-    try {
-      await runAutoCheck();
-      cleanupOldData();
-    } catch (e) {
-      log(`自動チェックエラー: ${e.message}`);
-    }
-  }, { timezone: 'UTC' });
+  // 毎日 13:00 JST = 04:00 UTC — Renderメモリ超過対策で既定は無効。
+  // 再有効化するには RANKCHECK_AUTO_ENABLED=true を設定する。
+  // Why: 3566件 × 全件JSON常駐で rss が Starter 512MB を超過し再起動が発生する。
+  const autoEnabled = process.env.RANKCHECK_AUTO_ENABLED === 'true';
+  if (autoEnabled) {
+    cron.schedule('0 4 * * *', async () => {
+      log('--- スケジュール実行: 順位自動チェック (13:00 JST) ---');
+      try {
+        await runAutoCheck();
+        cleanupOldData();
+      } catch (e) {
+        log(`自動チェックエラー: ${e.message}`);
+      }
+    }, { timezone: 'UTC' });
+  }
 
   // 毎日 09:00 JST = 00:00 UTC
   cron.schedule('0 0 * * *', async () => {
@@ -63,6 +68,10 @@ export function startScheduler() {
   }, { timezone: 'UTC' });
 
   console.log('[Scheduler] 楽天順位チェッカー スケジュール登録完了');
-  console.log('[Scheduler]   13:00 JST → 順位自動チェック + データクリーンアップ');
+  if (autoEnabled) {
+    console.log('[Scheduler]   13:00 JST → 順位自動チェック + データクリーンアップ (ENABLED)');
+  } else {
+    console.log('[Scheduler]   13:00 JST 自動チェックは無効化中 (RANKCHECK_AUTO_ENABLED=true で有効化)');
+  }
   console.log('[Scheduler]   09:00 JST → CSV出力 → Google Drive');
 }

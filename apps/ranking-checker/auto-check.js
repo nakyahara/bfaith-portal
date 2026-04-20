@@ -31,6 +31,11 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', '..', 'data'
 const DATA_FILE = path.join(DATA_DIR, 'ranking-checker.json');
 const LOG_FILE = path.join(DATA_DIR, 'ranking-checker.log');
 
+// Renderメモリ対策: 詳細ログは既定で抑制。RANKCHECK_DEBUG=true で復活。
+const DEBUG_LOG = process.env.RANKCHECK_DEBUG === 'true';
+// 全件 writeJson の頻度制御。既定50商品ごとにバッチ書き出し。
+const WRITE_BATCH = Math.max(1, parseInt(process.env.RANKCHECK_WRITE_BATCH || '50', 10));
+
 // ── Utilities ──
 
 function log(msg) {
@@ -38,6 +43,10 @@ function log(msg) {
   const line = `[${ts}] ${msg}`;
   console.log('[RankCheck]', msg);
   try { fs.appendFileSync(LOG_FILE, line + '\n', 'utf-8'); } catch {}
+}
+
+function debugLog(msg) {
+  if (DEBUG_LOG) log(msg);
 }
 
 function readJson(filepath, defaultValue) {
@@ -235,9 +244,9 @@ async function checkRakuten(product, appId, accessKey) {
   if (comp1Url) targets.comp1 = comp1Url;
   if (comp2Url) targets.comp2 = comp2Url;
 
-  // デバッグ: 商品データと比較対象URLをログ出力
-  log(`  product_code="${product.product_code || ''}", own_url="${product.own_url || ''}"`);
-  log(`  target_own="${ownUrl ? normalizeUrl(ownUrl) : '(なし)'}"`);
+  // デバッグ: 商品データと比較対象URLをログ出力（RANKCHECK_DEBUG=true時のみ）
+  debugLog(`  product_code="${product.product_code || ''}", own_url="${product.own_url || ''}"`);
+  debugLog(`  target_own="${ownUrl ? normalizeUrl(ownUrl) : '(なし)'}"`);
   if (!Object.keys(targets).length) {
     log(`  ⚠ 比較対象URLなし → 圏外になります`);
   }
@@ -272,11 +281,13 @@ async function checkRakuten(product, appId, accessKey) {
     const items = data.Items || [];
     if (!items.length) break;
     if (page === 1) {
-      log(`  楽天API応答: count=${data.count || 0}, pages=${data.pageCount || 0}`);
-      // 最初の3件のURLをログ出力（デバッグ用）
-      for (let i = 0; i < Math.min(3, items.length); i++) {
-        const u = (items[i].Item || {}).itemUrl || '';
-        log(`  #${i + 1}: ${normalizeUrl(u)}`);
+      debugLog(`  楽天API応答: count=${data.count || 0}, pages=${data.pageCount || 0}`);
+      // 最初の3件のURLはデバッグ時のみ出力
+      if (DEBUG_LOG) {
+        for (let i = 0; i < Math.min(3, items.length); i++) {
+          const u = (items[i].Item || {}).itemUrl || '';
+          debugLog(`  #${i + 1}: ${normalizeUrl(u)}`);
+        }
       }
     }
 
@@ -432,6 +443,8 @@ export async function runAutoCheck({ force = false } = {}) {
   checkProgress.startedAt = new Date().toISOString();
 
   let checked = 0;
+  let sinceLastWrite = 0;
+  let dirty = false;
 
   try {
     for (let i = 0; i < unchecked.length; i += CONCURRENCY) {
@@ -481,14 +494,28 @@ export async function runAutoCheck({ force = false } = {}) {
       }));
 
       checked += batch.length;
+      sinceLastWrite += batch.length;
+      dirty = true;
       checkProgress.done = checked;
-      writeJson(DATA_FILE, { products });
+
+      // WRITE_BATCH 件ごとに書き出し。全件毎回の JSON.stringify を避けてメモリ圧を下げる。
+      if (sinceLastWrite >= WRITE_BATCH) {
+        writeJson(DATA_FILE, { products });
+        sinceLastWrite = 0;
+        dirty = false;
+      }
+
       if (i + CONCURRENCY < unchecked.length) await sleep(KW_DELAY);
     }
 
     log(`自動順位チェック完了: ${checked} 件`);
     log('='.repeat(50));
   } finally {
+    // 途中クラッシュ・途中キャンセル時も必ず最新状態を永続化する。
+    if (dirty) {
+      try { writeJson(DATA_FILE, { products }); }
+      catch (e) { log(`最終書き出し失敗: ${e.message}`); }
+    }
     checkProgress.running = false;
     checkProgress.current = '';
   }
