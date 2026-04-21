@@ -41,6 +41,15 @@ export function saveToFile() {}
 
 // ─── テーブル作成 ───
 
+// 既存テーブルへのカラム追加ヘルパー（冪等、空catchでエラー握り潰さない）
+//   Codex PR1 review Medium #4 反映
+function addColumnIfMissing(table, column, typeClause) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name);
+  if (!cols.includes(column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${typeClause}`);
+  }
+}
+
 function createTables() {
   // 1. NE商品マスタ（UPSERT上書き）
   db.exec(`CREATE TABLE IF NOT EXISTS raw_ne_products (
@@ -483,55 +492,72 @@ function createTables() {
 
   // 13. m_products（統合商品マスタ）
   db.exec(`CREATE TABLE IF NOT EXISTS m_products (
-    product_id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    商品コード        TEXT UNIQUE NOT NULL,
-    商品名            TEXT,
-    商品区分          TEXT NOT NULL,
-    取扱区分          TEXT,
-    標準売価          REAL,
-    原価              REAL,
-    原価ソース        TEXT,
-    原価状態          TEXT NOT NULL,
-    送料              REAL,
-    送料コード        TEXT,
-    配送方法          TEXT,
-    消費税率          REAL,
-    税区分            TEXT,
-    在庫数            INTEGER,
-    引当数            INTEGER,
-    仕入先コード      TEXT,
-    セット構成品数    INTEGER,
-    売上分類          INTEGER,
-    updated_at        TEXT NOT NULL
+    product_id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    商品コード                TEXT UNIQUE NOT NULL,
+    商品名                    TEXT,
+    商品区分                  TEXT NOT NULL,
+    取扱区分                  TEXT,
+    標準売価                  REAL,
+    原価                      REAL,
+    原価ソース                TEXT,
+    原価状態                  TEXT NOT NULL,
+    送料                      REAL,
+    送料コード                TEXT,
+    配送方法                  TEXT,
+    消費税率                  REAL,
+    税区分                    TEXT,
+    在庫数                    INTEGER,
+    引当数                    INTEGER,
+    仕入先コード              TEXT,
+    セット構成品数            INTEGER,
+    売上分類                  INTEGER,
+    seasonality_flag          INTEGER DEFAULT 0,
+    season_months             TEXT,
+    new_product_flag          INTEGER DEFAULT 0,
+    new_product_launch_date   TEXT,
+    updated_at                TEXT NOT NULL
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_mp_sku ON m_products(商品コード)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mp_status ON m_products(取扱区分)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mp_type ON m_products(商品区分)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mp_cost_status ON m_products(原価状態)');
+  // 既存DBへのカラム追加マイグレーション（商品収益性ダッシュボード Phase 1）
+  addColumnIfMissing('m_products', 'seasonality_flag', 'INTEGER DEFAULT 0');
+  addColumnIfMissing('m_products', 'season_months', 'TEXT');
+  addColumnIfMissing('m_products', 'new_product_flag', 'INTEGER DEFAULT 0');
+  addColumnIfMissing('m_products', 'new_product_launch_date', 'TEXT');
 
   // 14. m_products_staging（常設staging）
   db.exec(`CREATE TABLE IF NOT EXISTS m_products_staging (
-    product_id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    商品コード        TEXT UNIQUE NOT NULL,
-    商品名            TEXT,
-    商品区分          TEXT NOT NULL,
-    取扱区分          TEXT,
-    標準売価          REAL,
-    原価              REAL,
-    原価ソース        TEXT,
-    原価状態          TEXT NOT NULL,
-    送料              REAL,
-    送料コード        TEXT,
-    配送方法          TEXT,
-    消費税率          REAL,
-    税区分            TEXT,
-    在庫数            INTEGER,
-    引当数            INTEGER,
-    仕入先コード      TEXT,
-    セット構成品数    INTEGER,
-    売上分類          INTEGER,
-    updated_at        TEXT NOT NULL
+    product_id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    商品コード                TEXT UNIQUE NOT NULL,
+    商品名                    TEXT,
+    商品区分                  TEXT NOT NULL,
+    取扱区分                  TEXT,
+    標準売価                  REAL,
+    原価                      REAL,
+    原価ソース                TEXT,
+    原価状態                  TEXT NOT NULL,
+    送料                      REAL,
+    送料コード                TEXT,
+    配送方法                  TEXT,
+    消費税率                  REAL,
+    税区分                    TEXT,
+    在庫数                    INTEGER,
+    引当数                    INTEGER,
+    仕入先コード              TEXT,
+    セット構成品数            INTEGER,
+    売上分類                  INTEGER,
+    seasonality_flag          INTEGER DEFAULT 0,
+    season_months             TEXT,
+    new_product_flag          INTEGER DEFAULT 0,
+    new_product_launch_date   TEXT,
+    updated_at                TEXT NOT NULL
   )`);
+  addColumnIfMissing('m_products_staging', 'seasonality_flag', 'INTEGER DEFAULT 0');
+  addColumnIfMissing('m_products_staging', 'season_months', 'TEXT');
+  addColumnIfMissing('m_products_staging', 'new_product_flag', 'INTEGER DEFAULT 0');
+  addColumnIfMissing('m_products_staging', 'new_product_launch_date', 'TEXT');
 
   // 15. m_set_components（セット構成マスタ）
   db.exec(`CREATE TABLE IF NOT EXISTS m_set_components (
@@ -634,6 +660,22 @@ function createTables() {
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_asf_asin ON amazon_sku_fees(asin)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_asf_channel ON amazon_sku_fees(fulfillment_channel)');
+
+  // 22. 月末在庫スナップショット（商品収益性ダッシュボード タブB 移動平均計算用）
+  //     ロジザード raw_lz_inventory から月末時点を切り出して保存
+  //     GMROI 計算で「移動平均在庫数 × 原価」の基礎になる
+  db.exec(`CREATE TABLE IF NOT EXISTS stock_monthly_snapshot (
+    年月              TEXT NOT NULL,
+    商品コード        TEXT NOT NULL,
+    月末在庫数        INTEGER NOT NULL DEFAULT 0,
+    月末引当数        INTEGER DEFAULT 0,
+    snapshot_source   TEXT,
+    captured_at       TEXT NOT NULL,
+    updated_at        TEXT NOT NULL,
+    PRIMARY KEY (年月, 商品コード)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_sms_month ON stock_monthly_snapshot(年月)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_sms_sku ON stock_monthly_snapshot(商品コード)');
 }
 
 function insertDefaultShops() {
@@ -671,7 +713,7 @@ function insertDefaultShops() {
 // ─── 統計取得 ───
 
 export function getStats() {
-  const tables = ['raw_ne_products', 'raw_ne_orders', 'raw_ne_set_products', 'raw_sp_orders', 'raw_sp_orders_log', 'raw_rakuten_orders', 'raw_rakuten_orders_log', 'raw_lz_inventory', 'sku_map', 'product_shipping', 'shipping_rates', 'exception_genka', 'product_sales_class', 'shops', 'm_products', 'm_set_components', 'f_sales_by_listing', 'f_sales_by_product', 'unmapped_sales', 'amazon_sku_fees'];
+  const tables = ['raw_ne_products', 'raw_ne_orders', 'raw_ne_set_products', 'raw_sp_orders', 'raw_sp_orders_log', 'raw_rakuten_orders', 'raw_rakuten_orders_log', 'raw_lz_inventory', 'sku_map', 'product_shipping', 'shipping_rates', 'exception_genka', 'product_sales_class', 'shops', 'm_products', 'm_set_components', 'f_sales_by_listing', 'f_sales_by_product', 'unmapped_sales', 'amazon_sku_fees', 'stock_monthly_snapshot'];
   const stats = {};
 
   for (const table of tables) {

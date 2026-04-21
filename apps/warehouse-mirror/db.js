@@ -31,37 +31,58 @@ export function getMirrorDB() {
   return db;
 }
 
+// 既存テーブルへのカラム追加ヘルパー（冪等、空catchでエラー握り潰さない）
+//   Codex PR1 review Medium #4 反映
+function addColumnIfMissing(table, column, typeClause) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name);
+  if (!cols.includes(column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${typeClause}`);
+  }
+}
+
 function createTables() {
   // mirror_products — 統合商品マスタ（m_productsのミラー）
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_products (
-    product_id        INTEGER PRIMARY KEY,
-    商品コード        TEXT UNIQUE NOT NULL,
-    商品名            TEXT,
-    商品区分          TEXT NOT NULL,
-    取扱区分          TEXT,
-    標準売価          REAL,
-    原価              REAL,
-    原価ソース        TEXT,
-    原価状態          TEXT NOT NULL,
-    送料              REAL,
-    送料コード        TEXT,
-    配送方法          TEXT,
-    消費税率          REAL,
-    税区分            TEXT,
-    在庫数            INTEGER,
-    引当数            INTEGER,
-    仕入先コード      TEXT,
-    セット構成品数    INTEGER,
-    売上分類          INTEGER,
-    updated_at        TEXT NOT NULL
+    product_id                INTEGER PRIMARY KEY,
+    商品コード                TEXT UNIQUE NOT NULL,
+    商品名                    TEXT,
+    商品区分                  TEXT NOT NULL,
+    取扱区分                  TEXT,
+    標準売価                  REAL,
+    原価                      REAL,
+    原価ソース                TEXT,
+    原価状態                  TEXT NOT NULL,
+    送料                      REAL,
+    送料コード                TEXT,
+    配送方法                  TEXT,
+    消費税率                  REAL,
+    税区分                    TEXT,
+    在庫数                    INTEGER,
+    引当数                    INTEGER,
+    仕入先コード              TEXT,
+    セット構成品数            INTEGER,
+    売上分類                  INTEGER,
+    代表商品コード            TEXT,
+    seasonality_flag          INTEGER DEFAULT 0,
+    season_months             TEXT,
+    new_product_flag          INTEGER DEFAULT 0,
+    new_product_launch_date   TEXT,
+    updated_at                TEXT NOT NULL
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_sku ON mirror_products(商品コード)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_status ON mirror_products(取扱区分)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_type ON mirror_products(商品区分)');
   // 既存テーブルへのカラム追加（マイグレーション）
-  try { db.exec('ALTER TABLE mirror_products ADD COLUMN 売上分類 INTEGER'); } catch {}
-  try { db.exec('ALTER TABLE mirror_products ADD COLUMN 代表商品コード TEXT'); } catch {}
+  addColumnIfMissing('mirror_products', '売上分類', 'INTEGER');
+  addColumnIfMissing('mirror_products', '代表商品コード', 'TEXT');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_rep ON mirror_products(代表商品コード)');
+  // 商品収益性ダッシュボード Phase 1 追加カラム（季節性・新商品フラグ）
+  addColumnIfMissing('mirror_products', 'seasonality_flag', 'INTEGER DEFAULT 0');
+  addColumnIfMissing('mirror_products', 'season_months', 'TEXT');
+  addColumnIfMissing('mirror_products', 'new_product_flag', 'INTEGER DEFAULT 0');
+  addColumnIfMissing('mirror_products', 'new_product_launch_date', 'TEXT');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_season ON mirror_products(seasonality_flag)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_new ON mirror_products(new_product_flag)');
 
   // mirror_set_components — セット構成マスタ
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_set_components (
@@ -486,5 +507,51 @@ function createTables() {
     gross_margin    REAL DEFAULT 0,
     fiscal_year     INTEGER,
     UNIQUE(year_month, mall_id, segment)
+  )`);
+
+  // ─── 商品収益性ダッシュボード タブB（在庫整理・撤退判断支援） ───
+
+  // mirror_stock_monthly_snapshot — 月末在庫スナップショット（ミニPC→Render同期）
+  //   GMROI計算の「移動平均在庫数」算出に使用
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_stock_monthly_snapshot (
+    年月              TEXT NOT NULL,
+    商品コード        TEXT NOT NULL,
+    月末在庫数        INTEGER NOT NULL DEFAULT 0,
+    月末引当数        INTEGER DEFAULT 0,
+    snapshot_source   TEXT,
+    captured_at       TEXT,
+    updated_at        TEXT NOT NULL,
+    PRIMARY KEY (年月, 商品コード)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_msms_month ON mirror_stock_monthly_snapshot(年月)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_msms_sku ON mirror_stock_monthly_snapshot(商品コード)');
+
+  // product_retirement_status — 撤退判断ステータス
+  //   ★ Render側のみの業務状態テーブル（ミニPC同期対象外）
+  //   ユーザー操作で更新、判断時メトリクス・閾値・処分率をスナップショット保存
+  db.exec(`CREATE TABLE IF NOT EXISTS product_retirement_status (
+    ne_product_code       TEXT PRIMARY KEY,
+    status                TEXT NOT NULL,
+    decided_by            TEXT,
+    decided_at            TEXT,
+    reason                TEXT,
+    next_review_date      TEXT,
+    plan_details_json     TEXT,
+    decision_metrics_json TEXT,
+    thresholds_json       TEXT,
+    disposal_rate         REAL,
+    updated_at            TEXT NOT NULL
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_prs_status ON product_retirement_status(status)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_prs_next_review ON product_retirement_status(next_review_date)');
+
+  // dashboard_settings — ダッシュボード設定（閾値マトリクス・早期警戒設定・処分率デフォルト等）
+  //   Render側のみ、画面から編集可能
+  //   key の例: 'retirement_thresholds', 'early_warning', 'disposal_rate_default'
+  db.exec(`CREATE TABLE IF NOT EXISTS dashboard_settings (
+    key          TEXT PRIMARY KEY,
+    value_json   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    updated_by   TEXT
   )`);
 }

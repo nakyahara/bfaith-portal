@@ -49,6 +49,8 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
 
   try {
     // products（全件置換）
+    //   Codex PR1 review High #2 反映: seasonality_flag/season_months/new_product_flag/
+    //   new_product_launch_date を列リストに含めて、ミニPC側の手動設定値を保持する。
     if (products && products.length > 0) {
       const tx = db.transaction(() => {
         db.exec('DELETE FROM mirror_products');
@@ -56,13 +58,18 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
           product_id, 商品コード, 商品名, 商品区分, 取扱区分,
           標準売価, 原価, 原価ソース, 原価状態,
           送料, 送料コード, 配送方法, 消費税率, 税区分,
-          在庫数, 引当数, 仕入先コード, セット構成品数, 売上分類, 代表商品コード, updated_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+          在庫数, 引当数, 仕入先コード, セット構成品数, 売上分類, 代表商品コード,
+          seasonality_flag, season_months, new_product_flag, new_product_launch_date,
+          updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
         for (const p of products) {
           stmt.run(p.product_id, p.商品コード, p.商品名, p.商品区分, p.取扱区分,
             p.標準売価, p.原価, p.原価ソース, p.原価状態,
             p.送料, p.送料コード, p.配送方法, p.消費税率, p.税区分,
-            p.在庫数, p.引当数, p.仕入先コード, p.セット構成品数, p.売上分類 ?? null, p.代表商品コード ?? null, now);
+            p.在庫数, p.引当数, p.仕入先コード, p.セット構成品数, p.売上分類 ?? null, p.代表商品コード ?? null,
+            p.seasonality_flag ?? 0, p.season_months ?? null,
+            p.new_product_flag ?? 0, p.new_product_launch_date ?? null,
+            now);
         }
       });
       tx();
