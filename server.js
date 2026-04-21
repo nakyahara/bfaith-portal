@@ -12,6 +12,7 @@ import rankingRouter from './apps/ranking-checker/router.js';
 import { startScheduler } from './apps/ranking-checker/scheduler.js';
 import { startWarehouseHealthcheck } from './apps/warehouse/healthcheck.js';
 import { startMetrics } from './apps/observability/metrics.js';
+import { bootStart, bootEnd, bootNote, bootFail } from './apps/observability/boot-log.js';
 import profitRouter from './apps/profit-calculator/router.js';
 import { startPriceWorker, startMaintenanceJobs } from './apps/profit-calculator/price-scheduler.js';
 import fbaRouter from './apps/fba-replenishment/router.js';
@@ -569,12 +570,16 @@ app.post('/admin/users/reset-password', requireAdmin, (req, res) => {
 });
 
 // --- 起動 ---
+bootNote('web', `server.js ロード完了 (Node ${process.version}, PORT=${PORT}, RENDER=${!!process.env.RENDER})`);
+bootStart('web', 'express-listen');
 app.listen(PORT, () => {
+  bootEnd('web', 'express-listen', `port=${PORT}`);
   console.log(`B-Faith Portal running at http://localhost:${PORT}`);
 
   try {
     startPythonBackend();
   } catch (e) {
+    bootFail('aes-python', 'startPythonBackend', e);
     console.warn(`[AES-Python] 起動スキップ: ${e.message}`);
     console.warn('[AES-Python] Python環境がない場合、AESラベル並び替え機能は使用できません');
   }
@@ -595,5 +600,22 @@ app.listen(PORT, () => {
   // startMaintenanceJobs();
 });
 
-process.on('SIGTERM', () => { stopPythonBackend(); process.exit(0); });
-process.on('SIGINT', () => { stopPythonBackend(); process.exit(0); });
+process.on('SIGTERM', () => {
+  bootNote('web', 'SIGTERM受信 → shutdown');
+  stopPythonBackend();
+  process.exit(0);
+});
+process.on('SIGINT', () => {
+  bootNote('web', 'SIGINT受信 → shutdown');
+  stopPythonBackend();
+  process.exit(0);
+});
+process.on('exit', (code) => {
+  bootNote('web', `process.exit code=${code}`);
+});
+process.on('uncaughtException', (err) => {
+  bootFail('web', 'uncaughtException', err);
+});
+process.on('unhandledRejection', (reason) => {
+  bootFail('web', 'unhandledRejection', reason);
+});

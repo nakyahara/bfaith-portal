@@ -14,6 +14,7 @@
  */
 import { monitorEventLoopDelay } from 'perf_hooks';
 import os from 'os';
+import { bootStart, bootEnd } from './boot-log.js';
 
 const LOG_INTERVAL_MS = 5 * 60 * 1000;
 const WARN_LAG_P99_MS = parseInt(process.env.METRICS_WARN_LAG_MS || '1000', 10);
@@ -74,9 +75,11 @@ async function report() {
 }
 
 export function startMetrics() {
+  bootStart('metrics', 'event-loop-observer');
   histogram = monitorEventLoopDelay({ resolution: 20 });
   histogram.enable();
   const timer = setInterval(report, LOG_INTERVAL_MS);
   timer.unref();
   console.log(`[Metrics] 観測開始 (5分毎、warn≥${WARN_LAG_P99_MS}ms alert≥${ALERT_LAG_P99_MS}ms)`);
+  bootEnd('metrics', 'event-loop-observer', `interval=${LOG_INTERVAL_MS}ms`);
 }
