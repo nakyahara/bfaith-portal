@@ -14,7 +14,7 @@
  */
 import { monitorEventLoopDelay } from 'perf_hooks';
 import os from 'os';
-import { bootStart, bootEnd } from './boot-log.js';
+import { bootStart, bootEnd, getBootId, getBootStartedAt } from './boot-log.js';
 
 const LOG_INTERVAL_MS = 5 * 60 * 1000;
 const WARN_LAG_P99_MS = parseInt(process.env.METRICS_WARN_LAG_MS || '1000', 10);
@@ -51,7 +51,8 @@ async function report() {
   const lagP95 = histogram.percentile(95) / 1e6;
   const lagP99 = histogram.percentile(99) / 1e6;
   const lagMax = histogram.max / 1e6;
-  const line = `[Metrics] host=${hostLabel()} heap=${heapMB}MB rss=${rssMB}MB lag(mean/p95/p99/max)=${lagMean.toFixed(1)}/${lagP95.toFixed(1)}/${lagP99.toFixed(1)}/${lagMax.toFixed(1)}ms`;
+  const uptimeSec = Math.round(process.uptime());
+  const line = `[Metrics] boot=${getBootId()} host=${hostLabel()} uptime=${uptimeSec}s heap=${heapMB}MB rss=${rssMB}MB lag(mean/p95/p99/max)=${lagMean.toFixed(1)}/${lagP95.toFixed(1)}/${lagP99.toFixed(1)}/${lagMax.toFixed(1)}ms`;
 
   if (lagP99 >= ALERT_LAG_P99_MS) {
     console.error(line + ' 🚨 SEVERE event loop stall');
@@ -80,6 +81,6 @@ export function startMetrics() {
   histogram.enable();
   const timer = setInterval(report, LOG_INTERVAL_MS);
   timer.unref();
-  console.log(`[Metrics] 観測開始 (5分毎、warn≥${WARN_LAG_P99_MS}ms alert≥${ALERT_LAG_P99_MS}ms)`);
+  console.log(`[Metrics] 観測開始 (5分毎、warn≥${WARN_LAG_P99_MS}ms alert≥${ALERT_LAG_P99_MS}ms) boot=${getBootId()} started_at=${getBootStartedAt()}`);
   bootEnd('metrics', 'event-loop-observer', `interval=${LOG_INTERVAL_MS}ms`);
 }
