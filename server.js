@@ -87,7 +87,21 @@ app.set('trust proxy', 1); // Cloudflare Tunnel経由
 app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
 app.use(express.urlencoded({ extended: true }));
-app.use(express.json({ limit: '10mb' }));
+// グローバル JSON parser (10MB)。ただし大容量受信が必要な endpoint は除外。
+// 除外対象 endpoint は route 側で独自の parser (例: 50MB) を定義する。
+// 単純に全体 limit を上げると未認可リクエストのDoS面が広がるため、例外列挙方式を採る。
+const LARGE_BODY_ROUTES = [
+  '/apps/ranking-checker/data/import', // 履歴付き JSON バックアップ復元 (router 側で 50MB)
+];
+const globalJsonParser = express.json({ limit: '10mb' });
+app.use((req, res, next) => {
+  if (req.method === 'POST') {
+    // trailing slash 差異を許容して比較
+    const normalizedPath = req.path.replace(/\/+$/, '') || '/';
+    if (LARGE_BODY_ROUTES.includes(normalizedPath)) return next();
+  }
+  return globalJsonParser(req, res, next);
+});
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.use(session({
