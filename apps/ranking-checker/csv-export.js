@@ -14,9 +14,9 @@
 import { google } from 'googleapis';
 import { Readable } from 'stream';
 import * as rdb from './db.js';
-import { getRakutenUrl, getYahooUrl, getAmazonAsin, log } from './auto-check.js';
-
-const RANK_ERROR = -1;
+// Phase 3 で auto-check.js を削除する際にこの import が宙吊りにならないよう、
+// 共通ヘルパーは helpers.js 経由で使う。
+import { getRakutenUrl, getYahooUrl, getAmazonAsin, log, RANK_ERROR } from './helpers.js';
 
 function displayRank(rank) {
   if (rank === null || rank === undefined) return '';
@@ -114,6 +114,56 @@ export function generateSummaryCSV() {
   return { csv: parts.join(''), count };
 }
 
+/**
+ * legacy shape (miniPC /service-api/rankcheck/data の返値) から CSV を組み立てる。
+ * legacy の rank 'error' は DB表現の -1 に戻してから buildRowFor に渡す。
+ */
+function normalizeLegacyRank(v) {
+  if (v === 'error') return RANK_ERROR;
+  return v;
+}
+function legacyEntryToDbShape(entry) {
+  return {
+    date: entry.date,
+    own_rank: normalizeLegacyRank(entry.own_rank),
+    competitor1_rank: normalizeLegacyRank(entry.competitor1_rank),
+    competitor2_rank: normalizeLegacyRank(entry.competitor2_rank),
+    yahoo_own_rank: normalizeLegacyRank(entry.yahoo_own_rank),
+    amazon_own_rank: normalizeLegacyRank(entry.amazon_own_rank),
+  };
+}
+export function generateSummaryCSVFromLegacy(legacyShape) {
+  const products = (legacyShape && legacyShape.products) || [];
+  const parts = ['\uFEFF' + csvRow(HEADER) + '\n'];
+  for (const p of products) {
+    const history = (p.history || []).map(legacyEntryToDbShape);
+    parts.push(csvRow(buildRowFor(p, history)) + '\n');
+  }
+  return { csv: parts.join(''), count: products.length };
+}
+
+/**
+ * miniPC /service-api/rankcheck/data から legacy shape を fetch する。
+ * CSV cron が Render で走るとき、DB は miniPC にあるのでこれ経由で取得する。
+ */
+async function fetchLegacyFromMiniPC() {
+  const baseUrl = process.env.RANKCHECK_MINIPC_URL;
+  if (!baseUrl) throw new Error('RANKCHECK_MINIPC_URL 未設定');
+  const headers = {
+    'CF-Access-Client-Id': process.env.CF_ACCESS_CLIENT_ID || '',
+    'CF-Access-Client-Secret': process.env.CF_ACCESS_CLIENT_SECRET || '',
+    'Authorization': `Bearer ${process.env.WAREHOUSE_SERVICE_TOKEN || ''}`,
+  };
+  const res = await fetch(`${baseUrl}/service-api/rankcheck/data`, {
+    headers, signal: AbortSignal.timeout(120000),
+  });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new Error(`miniPC /data HTTP ${res.status}: ${txt.slice(0, 200)}`);
+  }
+  return res.json();
+}
+
 async function getGoogleAuth() {
   const keyBase64 = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
   if (!keyBase64) return null;
@@ -131,13 +181,26 @@ export async function exportCSVToDrive() {
     return;
   }
 
-  const total = rdb.countProducts();
-  if (total === 0) {
-    log('商品データなし。CSV出力スキップ');
-    return;
+  const proxyMode = !!process.env.RANKCHECK_MINIPC_URL;
+  let csv, count;
+
+  if (proxyMode) {
+    log(`CSV生成: miniPC proxy モードで /service-api/rankcheck/data から取得`);
+    const legacy = await fetchLegacyFromMiniPC();
+    if (!legacy.products || legacy.products.length === 0) {
+      log('商品データなし (miniPC)。CSV出力スキップ');
+      return;
+    }
+    ({ csv, count } = generateSummaryCSVFromLegacy(legacy));
+  } else {
+    const total = rdb.countProducts();
+    if (total === 0) {
+      log('商品データなし。CSV出力スキップ');
+      return;
+    }
+    ({ csv, count } = generateSummaryCSV());
   }
 
-  const { csv, count } = generateSummaryCSV();
   log(`CSV生成完了: ${count} 商品, ${csv.length} bytes`);
 
   const auth = await getGoogleAuth();

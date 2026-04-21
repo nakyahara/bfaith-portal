@@ -8,10 +8,18 @@
  *   - POST /data/import  : JSONファイルからの復元専用。history も DB に投入する。
  *   - GET  /run-status   : 最新/実行中 run の状態 (Phase2 miniPC 連携用)
  *
+ * Phase 2 変更点:
+ *   - RANKCHECK_MINIPC_URL が設定されている環境 (Render 本番) では /data, /data/import,
+ *     /run-check, /check-progress, /run-status, /logs を miniPC に proxy する。
+ *   - DB は miniPC 側でのみ開く。Render は UI とプロキシのみ。
+ *
  * Environment variables:
- *   RAKUTEN_APP_ID / RAKUTEN_ACCESS_KEY / RAKUTEN_SHOP_CODE
+ *   RAKUTEN_APP_ID / RAKUTEN_ACCESS_KEY / RAKUTEN_SHOP_CODE  (/api/* proxy 用)
  *   YAHOO_APP_ID
  *   AMAZON_ACCESS_KEY / AMAZON_SECRET_KEY / AMAZON_ASSOCIATE_TAG
+ *   RANKCHECK_MINIPC_URL         — 例: https://wh.bfaith-wh.uk  (未設定 = ローカルDBモード)
+ *   WAREHOUSE_SERVICE_TOKEN      — /service-api/* 認証用 Bearer
+ *   CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET — Cloudflare Access
  */
 import express, { Router } from 'express';
 import fs from 'fs';
@@ -22,6 +30,80 @@ import * as rdb from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
+
+// ── miniPC proxy (Phase2) ──
+// RANKCHECK_MINIPC_URL が設定されているとき、/data 系は miniPC の /service-api/rankcheck へ転送する。
+const MINIPC_URL = process.env.RANKCHECK_MINIPC_URL || '';
+const PROXY_MODE = MINIPC_URL.length > 0;
+
+function minipcHeaders(extra = {}) {
+  return {
+    'CF-Access-Client-Id': process.env.CF_ACCESS_CLIENT_ID || '',
+    'CF-Access-Client-Secret': process.env.CF_ACCESS_CLIENT_SECRET || '',
+    'Authorization': `Bearer ${process.env.WAREHOUSE_SERVICE_TOKEN || ''}`,
+    'Content-Type': 'application/json',
+    ...extra,
+  };
+}
+
+/**
+ * Render→miniPC プロキシ呼び出し。fba-replenishment の callMiniPC と同じ戦略:
+ *   - 5xx/ネットワーク系は指数バックオフ+ジッタでリトライ (GET のみ、POST は副作用回避)
+ *   - HTML応答やCF Access認証リダイレクトを検知して明示エラー化
+ */
+async function proxyToMiniPC(subpath, { method = 'GET', body, timeout = 60000, retry } = {}) {
+  const url = `${MINIPC_URL}/service-api/rankcheck${subpath}`;
+  const requestId = `rc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const headers = minipcHeaders({ 'x-request-id': requestId });
+  const maxAttempts = retry ?? (method === 'GET' ? 3 : 1);
+
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const options = { method, headers, redirect: 'manual', signal: AbortSignal.timeout(timeout) };
+      if (body !== undefined) options.body = JSON.stringify(body);
+      const res = await fetch(url, options);
+      const ct = res.headers.get('content-type') || '';
+
+      if (res.status === 302 || res.status === 303) {
+        const loc = res.headers.get('location') || '';
+        throw new Error(`CF Access認証構成異常 (${res.status} → ${loc}) req=${requestId}`);
+      }
+      if (res.status === 401 || res.status === 403) {
+        throw new Error(`認証失敗 HTTP ${res.status} req=${requestId}`);
+      }
+      if ([502, 503, 504].includes(res.status)) {
+        lastError = new Error(`upstream障害 HTTP ${res.status} req=${requestId}`);
+        if (attempt < maxAttempts) {
+          await new Promise(r => setTimeout(r, Math.min(500 * 2 ** (attempt - 1), 4000) + Math.random() * 300));
+          continue;
+        }
+        throw lastError;
+      }
+
+      const text = await res.text();
+
+      // 4xx (認証除く) は upstream 側の意味のある応答として素通しする。
+      // 例: 400 invalid_product, 429 KICK_COOLDOWN。502 に潰すと誤解を招く。
+      if (ct.includes('application/json')) {
+        const json = text ? JSON.parse(text) : null;
+        return { status: res.status, json };
+      }
+      if (!res.ok) throw new Error(`miniPC HTTP ${res.status}: ${text.slice(0, 200)} req=${requestId}`);
+      return { status: res.status, text };
+    } catch (e) {
+      const msg = e?.message || String(e);
+      const isRetryable = e?.name === 'TimeoutError' || /aborted|timeout|ECONNREFUSED|ENOTFOUND|fetch failed|upstream障害/i.test(msg);
+      if (isRetryable && attempt < maxAttempts) {
+        lastError = e;
+        await new Promise(r => setTimeout(r, Math.min(500 * 2 ** (attempt - 1), 4000) + Math.random() * 300));
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastError || new Error('proxyToMiniPC: unknown error');
+}
 
 // ── Payload validation helpers ──
 // Throws { status, body } on invalid input; caller catches and responds.
@@ -269,7 +351,15 @@ router.get('/api/amazon', async (req, res) => {
 
 // ── Data endpoints (SQLite-backed) ──
 
-router.get('/data', (req, res) => {
+router.get('/data', async (req, res) => {
+  if (PROXY_MODE) {
+    try {
+      const r = await proxyToMiniPC('/data');
+      return res.status(r.status).json(r.json);
+    } catch (e) {
+      return res.status(502).json({ error: 'minipc_unreachable', detail: e.message });
+    }
+  }
   try {
     res.json(rdb.exportLegacyShape());
   } catch (e) {
@@ -291,7 +381,15 @@ router.get('/data', (req, res) => {
  *
  * 1トランザクションに包んで原子的に実行。
  */
-router.post('/data', (req, res) => {
+router.post('/data', async (req, res) => {
+  if (PROXY_MODE) {
+    try {
+      const r = await proxyToMiniPC('/data', { method: 'POST', body: req.body });
+      return res.status(r.status).json(r.json);
+    } catch (e) {
+      return res.status(502).json({ error: 'minipc_unreachable', detail: e.message });
+    }
+  }
   try {
     const body = req.body;
     if (!body || typeof body !== 'object') {
@@ -362,7 +460,15 @@ router.post('/data', (req, res) => {
  *   - replaceAll=false (既定) はマージ、既存商品の履歴は保持
  *   - body は import JSON 相当なので 50mb まで許容
  */
-router.post('/data/import', express.json({ limit: '50mb' }), (req, res) => {
+router.post('/data/import', express.json({ limit: '50mb' }), async (req, res) => {
+  if (PROXY_MODE) {
+    try {
+      const r = await proxyToMiniPC('/data/import', { method: 'POST', body: req.body, timeout: 120000 });
+      return res.status(r.status).json(r.json);
+    } catch (e) {
+      return res.status(502).json({ error: 'minipc_unreachable', detail: e.message });
+    }
+  }
   try {
     const body = req.body;
     if (!body || typeof body !== 'object') {
@@ -459,7 +565,16 @@ function encodeImportRank(v) {
 router.get('/config', (req, res) => { res.json(getConfig()); });
 router.post('/config', (req, res) => { res.json({ ok: true, note: 'Config is managed via environment variables on Render' }); });
 
-router.get('/logs', (req, res) => {
+router.get('/logs', async (req, res) => {
+  if (PROXY_MODE) {
+    try {
+      const lines = parseInt(req.query.lines || '200', 10);
+      const r = await proxyToMiniPC(`/logs?lines=${lines}`);
+      return res.type('text/plain; charset=utf-8').send(r.text || '');
+    } catch (e) {
+      return res.type('text/plain').send(`(miniPC ログ取得失敗: ${e.message})`);
+    }
+  }
   const LOG_FILE = path.join(DATA_DIR, 'ranking-checker.log');
   const lines = parseInt(req.query.lines || '200', 10);
   try {
@@ -473,6 +588,21 @@ router.get('/logs', (req, res) => {
 });
 
 router.post('/run-check', async (req, res) => {
+  if (PROXY_MODE) {
+    try {
+      const r = await proxyToMiniPC('/run-check', { method: 'POST', body: { force: true } });
+      // miniPC 側の status (200/429) を素通し、UI shape に整形して返す。
+      // 429 (KICK_COOLDOWN) は 200 に丸めず、外部観測性を保つ。
+      const started = r.json && r.json.started;
+      const running = r.json && r.json.running;
+      const payload = started
+        ? { ok: true, message: 'miniPCで順位チェック開始' }
+        : { ok: false, message: running ? '既にチェック実行中です' : (r.json?.message || 'run-check拒否'), progress: running };
+      return res.status(r.status).json(payload);
+    } catch (e) {
+      return res.status(502).json({ ok: false, error: 'minipc_unreachable', message: e.message });
+    }
+  }
   try {
     const { runAutoCheck, getCheckProgress } = await import('./auto-check.js');
     const progress = getCheckProgress();
@@ -486,7 +616,37 @@ router.post('/run-check', async (req, res) => {
   }
 });
 
+/**
+ * UI は 3 秒ごとに呼ぶので proxy は軽いのが望ましい。
+ * miniPC 側は /run-status のみを持ち、UI 旧 shape は running/total/done/current を要求する。
+ * run_state から再構成する。
+ */
 router.get('/check-progress', async (req, res) => {
+  if (PROXY_MODE) {
+    try {
+      const r = await proxyToMiniPC('/run-status', { timeout: 10000 });
+      const running = r.json?.running;
+      if (running) {
+        return res.json({
+          running: true,
+          total: running.total,
+          done: running.done,
+          current: '',
+          startedAt: running.started_at,
+        });
+      }
+      const latest = r.json?.latest;
+      return res.json({
+        running: false,
+        total: latest?.total || 0,
+        done: latest?.done || 0,
+        current: '',
+        startedAt: latest?.started_at || null,
+      });
+    } catch (e) {
+      return res.status(502).json({ error: 'minipc_unreachable', detail: e.message });
+    }
+  }
   try {
     const { getCheckProgress } = await import('./auto-check.js');
     res.json(getCheckProgress());
@@ -499,7 +659,15 @@ router.get('/check-progress', async (req, res) => {
  * 最新 run メタ情報。Phase2 以降の miniPC 実行側からの状態参照や、
  * 再開可能性の確認に利用する。
  */
-router.get('/run-status', (req, res) => {
+router.get('/run-status', async (req, res) => {
+  if (PROXY_MODE) {
+    try {
+      const r = await proxyToMiniPC('/run-status');
+      return res.status(r.status).json(r.json);
+    } catch (e) {
+      return res.status(502).json({ error: 'minipc_unreachable', detail: e.message });
+    }
+  }
   try {
     res.json({ latest: rdb.getLatestRun(), running: rdb.getRunningRun() });
   } catch (e) {

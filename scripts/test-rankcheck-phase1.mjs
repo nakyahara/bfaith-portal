@@ -114,12 +114,19 @@ assert.strictEqual(beforeClean - afterClean, removed, '削除件数が一致');
 ok(`cleanup: ${beforeClean} → ${afterClean} (-${removed})`);
 
 section('6. run_state / run_log + stale transition');
-// 明示的に stale running を仕込む
+// 明示的に stale running を仕込む。3時間閾値を超えるため、started_at を人工的に古くする。
 const staleRunId = rdb.startRun(7);
-// 仕込みのまま markStale を呼ぶ → failed に
+rdb.getDb().prepare(`UPDATE run_state SET started_at = datetime('now', '-4 hours') WHERE run_id = ?`).run(staleRunId);
 const fixed = rdb.markStaleRunning();
-assert.ok(fixed >= 1, 'markStaleRunning が 1件以上遷移');
+assert.ok(fixed >= 1, 'markStaleRunning が 1件以上遷移 (4時間前の run)');
 ok(`markStaleRunning 遷移 = ${fixed}`);
+
+// 新しい (fresh) running は markStaleRunning で落ちないことを確認
+const freshRunId = rdb.startRun(3);
+const fixed2 = rdb.markStaleRunning();
+assert.strictEqual(fixed2, 0, '3時間以内の fresh running は保護される');
+rdb.finishRun(freshRunId, 'completed');
+ok(`fresh running 保護 OK`);
 
 const runId = rdb.startRun(10);
 rdb.logRun(runId, 'info', 'テストログ1', firstId);

@@ -30,6 +30,7 @@ import mercariAccountingRouter from './apps/mercari-accounting/router.js';
 import profitAnalysisRouter from './apps/profit-analysis/router.js';
 import mgmtAccountingRouter from './apps/mgmt-accounting/router.js';
 import serviceRouter from './apps/warehouse/service-router.js';
+import { serviceAuth } from './apps/warehouse/service-auth.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -91,13 +92,19 @@ app.use(express.urlencoded({ extended: true }));
 // 除外対象 endpoint は route 側で独自の parser (例: 50MB) を定義する。
 // 単純に全体 limit を上げると未認可リクエストのDoS面が広がるため、例外列挙方式を採る。
 const LARGE_BODY_ROUTES = [
-  '/apps/ranking-checker/data/import', // 履歴付き JSON バックアップ復元 (router 側で 50MB)
+  '/apps/ranking-checker/data/import',      // 履歴付き JSON バックアップ復元 (router 側で 50MB)
+  // /service-api/* は serviceAuth 後に独自 parser が走るため、この配列ではなく
+  // 上記 middleware で startsWith('/service-api/') として一括 exempt している。
 ];
 const globalJsonParser = express.json({ limit: '10mb' });
 app.use((req, res, next) => {
   if (req.method === 'POST') {
     // trailing slash 差異を許容して比較
     const normalizedPath = req.path.replace(/\/+$/, '') || '/';
+    // /service-api/* は serviceAuth + 専用 parser が後段 (app.use('/service-api', ...)) で
+    // 走るためここでは parse しない。Bearer 検証前に body を読まないことで
+    // 未認可 DoS 面を閉じる。
+    if (normalizedPath.startsWith('/service-api/') || normalizedPath === '/service-api') return next();
     if (LARGE_BODY_ROUTES.includes(normalizedPath)) return next();
   }
   return globalJsonParser(req, res, next);
@@ -440,7 +447,11 @@ app.use('/apps/profit-calculator', requireAppAccess('profit-calculator'), profit
 app.use('/apps/fba-replenishment', requireAppAccess('fba-replenishment'), fbaRouter);
 app.use('/apps/warehouse', requireAppAccess('warehouse'), warehouseRouter);
 app.use('/apps/mirror', express.json({ limit: '100mb' }), mirrorRouter);  // ミラー同期APIはセッション認証不要（APIキー認証）
-app.use('/service-api', express.json(), serviceRouter);  // サービスAPI（Render→ミニPC、トークン認証）
+// サービスAPI（Render→ミニPC、トークン認証）。
+// rankcheck の履歴込みインポートで 10MB を超える可能性があるため 50MB まで許容。
+// 未認可 DoS 回避のため、serviceAuth を body parser **より前** に置く。
+// そうしないと token 無しリクエストが最大 50MB を parse してから 401 になる。
+app.use('/service-api', serviceAuth, express.json({ limit: '50mb' }), serviceRouter);
 app.use('/apps/amazon-accounting', (req, res, next) => {
   if (req.path === '/import-history' && req.method === 'POST') return next();  // APIキー認証に委譲
   requireAuth(req, res, next);

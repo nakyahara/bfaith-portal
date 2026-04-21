@@ -2,12 +2,16 @@
  * 楽天順位チェッカー スケジューラー（SQLite版）
  *
  * node-cron:
- *   - 毎日 13:00 JST (04:00 UTC) → 順位自動チェック (RANKCHECK_AUTO_ENABLED=true のときのみ)
+ *   - 毎日 13:00 JST (04:00 UTC) → 順位自動チェック
+ *     [Phase 2 以降] 本番では RANKCHECK_AUTO_ENABLED=false とし、miniPC の Task Scheduler
+ *     + run-rankcheck-safe.ps1 で Runner を起動する。このブランチは dev/fallback 用。
  *   - 毎日 09:00 JST (00:00 UTC) → CSV 生成 + Google Drive 保存
+ *     Render で動作、PROXY_MODE のときは miniPC /service-api/rankcheck/data を fetch。
  *   - チェック完了後 → 365日超データを SQL 1本で削除
  */
 import cron from 'node-cron';
-import { runAutoCheck, log } from './auto-check.js';
+import { runAutoCheck } from './auto-check.js';
+import { log } from './helpers.js';
 import { exportCSVToDrive } from './csv-export.js';
 import * as rdb from './db.js';
 

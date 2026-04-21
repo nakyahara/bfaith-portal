@@ -274,12 +274,18 @@ function prepareStatements(db) {
              error = @error
        WHERE run_id = @run_id
     `),
+    // 3時間以上前に開始された 'running' のみ stale とみなして failed にする。
+    // 別プロセスが活きている run を誤って潰さないための年齢閾値。
+    // 通常実行は 1時間以内に完了する想定 (3566商品 x 1.2秒 ≒ 70分)。
+    // 境界: Runner 側は `ageMs < 3h*ms` を fresh (skip) とするため、SQL は `>= 3h` で
+    //       「ちょうど3時間」を stale 側に寄せる。
     markStaleRunning: db.prepare(`
       UPDATE run_state
          SET status = 'failed',
-             error = COALESCE(error, '') || 'marked stale at next startRun',
+             error = COALESCE(error, '') || 'marked stale at next startRun (>=3h)',
              ended_at = strftime('%Y-%m-%d %H:%M:%S', 'now')
        WHERE status = 'running'
+         AND (julianday('now') - julianday(started_at)) * 24 >= 3
     `),
     getRunningRun: db.prepare(`
       SELECT run_id, started_at, total, done FROM run_state WHERE status = 'running' LIMIT 1
