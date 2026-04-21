@@ -11,8 +11,13 @@
  */
 import { Router } from 'express';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
+import inventoryDecisionRouter from './inventory-decision.js';
 
 const router = Router();
+
+// タブB (在庫整理・撤退判断支援) API
+// feature flag INVENTORY_DECISION_ENABLED でのみ有効化。Dark Launch 段階では OFF 想定。
+router.use('/api/inventory', inventoryDecisionRouter);
 
 // ─── モール別手数料率（設計書確定値、CASE文ハードコード） ───
 const MALL_FEE_RATES = {
