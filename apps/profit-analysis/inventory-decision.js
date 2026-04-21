@@ -24,6 +24,7 @@ import {
   validateEarlyWarning,
   KEYS,
 } from './retirement-thresholds.js';
+import { getCandidates } from './candidates.js';
 
 const router = Router();
 
@@ -235,13 +236,77 @@ router.post('/status', (req, res) => {
   }
 });
 
-// ─── 5分類ビュー（PR2c 実装予定、現状 501） ───
+// ─── 5分類ビュー（PR2c） ───
 
+/**
+ * 候補リスト取得。売上分類を一次軸として必須指定。
+ * Query params:
+ *   sales_class: 1|2|3 （必須）
+ *   period_days: 既定 90（Render mirror の日次制約に合わせる）
+ */
 router.get('/candidates', (req, res) => {
-  res.status(501).json({
-    error: 'not implemented',
-    note: 'PR2c で実装予定（売上分類別 5分類 + 早期警戒 + 分類外理由分解）',
-  });
+  try {
+    const db = getMirrorDB();
+    seedDefaultsIfMissing(db);
+
+    const salesClass = String(req.query.sales_class || '');
+    if (!['1', '2', '3'].includes(salesClass)) {
+      return res.status(400).json({
+        error: 'sales_class は 1|2|3 のいずれか必須',
+        hint: '1=自社, 2=取引先限定, 3=仕入れ',
+      });
+    }
+    // Codex PR2c Round 1 High #1 反映:
+    //   mirror_sales_daily は直近90日分のみ保持するため、period_days は 1〜90 に制限。
+    //   90日超は分子だけ小さく分母だけ大きい不整合計算になる。
+    // Codex PR2c Round 1 Low #5 反映: 未指定のみ default 90、指定済み不正値は 400
+    let periodDays;
+    if (req.query.period_days === undefined) {
+      periodDays = 90;
+    } else {
+      const n = Number(req.query.period_days);
+      if (!Number.isInteger(n) || n <= 0 || n > 90) {
+        return res.status(400).json({
+          error: 'period_days は 1〜90 の整数 (mirror日次データの保持期間に合わせた制約)',
+        });
+      }
+      periodDays = n;
+    }
+
+    const retirement = getRetirementThresholds(db);
+    const classification = getClassificationThresholds(db);
+    const earlyWarning = getEarlyWarning(db);
+
+    const candidates = getCandidates(db, { salesClass, periodDays },
+      { retirement, classification, earlyWarning });
+
+    // 集計サマリー（分類別 + 理由別）
+    //   Codex PR2c Round 1 Medium-Low #4 反映:
+    //     分類外 を 計算不能 / 新商品保留 / 季節性保留 / 閾値外 等に分解してカウント
+    const summary = {};
+    const reason_summary = {};
+    for (const c of candidates) {
+      summary[c.classification] = (summary[c.classification] || 0) + 1;
+      const key = `${c.classification}: ${c.reason}`;
+      reason_summary[key] = (reason_summary[key] || 0) + 1;
+    }
+
+    res.json({
+      meta: {
+        sales_class: parseInt(salesClass, 10),
+        period_days: periodDays,
+        total: candidates.length,
+        summary,
+        reason_summary,
+        generated_at: new Date().toISOString(),
+      },
+      thresholds: { retirement: retirement[salesClass], classification, early_warning: earlyWarning },
+      candidates,
+    });
+  } catch (e) {
+    console.error('[inventory-decision] GET /candidates error:', e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 export default router;

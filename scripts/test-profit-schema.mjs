@@ -17,6 +17,9 @@
  * Test 11: inventory-decision feature flag middleware (PR2b)
  * Test 12: validateStatusBody バリデーション回帰 (PR2b fix)
  * Test 13: product_retirement_status UPSERT + snapshot 保存 (PR2b fix)
+ * Test 14: classifyProduct 分類網羅 (PR2c)
+ * Test 15: applyEarlyWarning ゼロ割・skip・drop (PR2c)
+ * Test 16: fetchCandidatesRaw SQL 統合（売上分類フィルタ + 集計） (PR2c)
  *
  * 注: DATA_DIR はモジュール読込時にキャプチャされるため、1プロセス内で
  *     同じDBファイルに対して "legacy DB 事前作成 → init 呼び出し → マイグレ検証" の順で行う。
@@ -598,6 +601,18 @@ console.log('\n=== Test 10: retirement-thresholds モジュール ===');
   try { validateEarlyWarning(DEFAULT_EARLY_WARNING); } catch { normalOk = false; }
   expectEq(normalOk, true, '10f デフォルト early_warning は通る');
 
+  // 10g: past_period_days != 90 / recent_period_days != 30 を拒否
+  //      Codex PR2c Round 1 Medium #2 反映（applyEarlyWarning の SQL 集計固定制約）
+  throwFlag = false;
+  try { validateEarlyWarning({ ...DEFAULT_EARLY_WARNING, past_period_days: 60 }); }
+  catch { throwFlag = true; }
+  expectEq(throwFlag, true, '10g past_period_days=60 (≠90) で throw');
+
+  throwFlag = false;
+  try { validateEarlyWarning({ ...DEFAULT_EARLY_WARNING, recent_period_days: 14 }); }
+  catch { throwFlag = true; }
+  expectEq(throwFlag, true, '10g recent_period_days=14 (≠30) で throw');
+
   tdb.close();
   console.log('[OK] retirement-thresholds モジュール動作確認');
 }
@@ -774,6 +789,364 @@ console.log('\n=== Test 13: product_retirement_status UPSERT snapshot ===');
 
   mdb13.close();
   console.log('[OK] product_retirement_status UPSERT + snapshot 保存確認');
+}
+
+// ───────────────────────────────────────────────
+// Test 14: classifyProduct 純関数 - 分類網羅（PR2c）
+// ───────────────────────────────────────────────
+console.log('\n=== Test 14: classifyProduct 分類網羅 ===');
+{
+  const { classifyProduct } = await import('../apps/profit-analysis/candidates.js');
+  const {
+    DEFAULT_RETIREMENT_THRESHOLDS,
+    DEFAULT_CLASSIFICATION_THRESHOLDS,
+  } = await import('../apps/profit-analysis/retirement-thresholds.js');
+  const thresholds = {
+    retirement: DEFAULT_RETIREMENT_THRESHOLDS,
+    classification: DEFAULT_CLASSIFICATION_THRESHOLDS,
+  };
+  const opts = { today: '2026-04-21', periodDays: 90 };
+
+  function mkRow(overrides = {}) {
+    return {
+      商品コード: 'TEST', 商品名: 'テスト商品', 売上分類: 1,
+      標準売価: 1000, 原価: 300, 送料: 100, 消費税率: 10,
+      seasonality_flag: 0, season_months: null,
+      new_product_flag: 0, new_product_launch_date: null,
+      仕入先コード: 'S1', 管理在庫数: 100,
+      daily_last_sale: '2026-04-15',
+      sales_period: 50, sales_30d: 20, sales_90d: 50,
+      monthly_last_month: '2026-04',
+      avg_stock: 100, stock_snapshot_months: 6, latest_stock: 100,
+      retirement_status: null,
+      ...overrides,
+    };
+  }
+
+  // 評価不能: 売価 0
+  let r = classifyProduct(mkRow({ 標準売価: 0 }), thresholds, opts);
+  expectEq(r.classification, '評価不能', '14a 売価0 → 評価不能');
+  expectEq(r.reason, '楽天売価未設定', '14a 理由');
+
+  // 計算不能: 原価 0
+  r = classifyProduct(mkRow({ 原価: 0 }), thresholds, opts);
+  expectEq(r.classification, '分類外', '14b 原価0 → 分類外');
+  expectEq(r.reason, '計算不能（原価未登録）', '14b 理由');
+
+  // 新商品保留
+  r = classifyProduct(mkRow({ new_product_flag: 1 }), thresholds, opts);
+  expectEq(r.classification, '分類外', '14c 新商品 → 分類外');
+  expectEq(r.reason, '新商品保留', '14c 理由');
+
+  // 季節性保留（4月は 6,7,8 に含まれない）
+  r = classifyProduct(mkRow({ seasonality_flag: 1, season_months: '6,7,8' }), thresholds, opts);
+  expectEq(r.classification, '分類外', '14d 季節性オフシーズン → 分類外');
+  expectEq(r.reason, '季節性保留（オフシーズン）', '14d 理由');
+
+  // 季節性だが現在月(4月)が season_months に含まれる
+  r = classifyProduct(mkRow({ seasonality_flag: 1, season_months: '3,4,5' }), thresholds, opts);
+  if (r.classification === '分類外' && r.reason.includes('季節性')) {
+    throw new Error('14e 季節性オンシーズンで分類外になった');
+  }
+  console.log(`[OK] 14e 季節性オンシーズン(4月 in 3,4,5) → 分類外扱いされない`);
+
+  // 撤退候補: 自社で 365日販売なし
+  //   実環境では mirror_sales_daily に 90日より前の記録は残らないので daily は null 想定
+  //   monthly_last_month=2025-03 → 月末 2025-03-31、2026-04-21 から 386日後 > 365
+  r = classifyProduct(mkRow({
+    売上分類: 1,
+    daily_last_sale: null,
+    monthly_last_month: '2025-03',
+    sales_period: 0, sales_30d: 0, sales_90d: 0,
+  }), thresholds, opts);
+  expectEq(r.classification, '撤退候補', '14f 自社 ~386日販売なし → 撤退候補');
+
+  // 撤退警戒: 自社で 180-365日販売なし
+  //   monthly_last_month=2025-09 → 月末 2025-09-30、2026-04-21 から ~203日後
+  r = classifyProduct(mkRow({
+    売上分類: 1,
+    daily_last_sale: null,
+    monthly_last_month: '2025-09',
+    sales_period: 0, sales_30d: 0, sales_90d: 0,
+  }), thresholds, opts);
+  expectEq(r.classification, '撤退警戒', '14g 自社 ~203日販売なし → 撤退警戒');
+
+  // 仕入特有: 販売ありでも GMROI<30% AND 回転>180日 で撤退候補
+  r = classifyProduct(mkRow({
+    売上分類: 3,
+    標準売価: 1000, 原価: 900, 送料: 50,  // 利益単価 = 1000*0.9-900-50 = -50（赤字）
+    daily_last_sale: '2026-04-01',
+    sales_period: 1, sales_30d: 0, sales_90d: 1,  // 販売あるが超少ない
+    avg_stock: 100, latest_stock: 100,
+    // 回転 = 100 / (1/90) = 9000日 → 180日超
+    // GMROI = (-50 × 1) / (100 × 900) × 100 ≈ 0% < 30%
+  }), thresholds, opts);
+  // 90日間内だが販売は 1 個のみ → daily_last_sale='2026-04-01' = 20日前、warn=90日には達していない
+  // なので retire_gmroi_lt + retire_turnover_gt 条件がトリガー
+  expectEq(r.classification, '撤退候補', '14h 仕入 GMROI<30% AND 回転>180日 → 撤退候補');
+
+  // 優良在庫: GMROI > 200% AND 回転 30〜90日
+  r = classifyProduct(mkRow({
+    売上分類: 1,
+    標準売価: 1000, 原価: 200, 送料: 50,  // 利益単価 = 900-250 = 650
+    avg_stock: 10, latest_stock: 50,
+    sales_period: 90, sales_30d: 30, sales_90d: 90,
+    daily_last_sale: '2026-04-15',
+    // 回転 = 50 / (90/90) = 50日 (30-90内)
+    // GMROI = (650 × 90) / (10 × 200) × 100 = 29250% > 200%
+  }), thresholds, opts);
+  expectEq(r.classification, '優良在庫', '14i 優良在庫');
+
+  // 観察継続: GMROI 100-200%
+  r = classifyProduct(mkRow({
+    売上分類: 1,
+    標準売価: 1000, 原価: 600, 送料: 100,  // 利益単価 = 900-700 = 200
+    avg_stock: 30, latest_stock: 30,
+    sales_period: 45, sales_30d: 15, sales_90d: 45,
+    daily_last_sale: '2026-04-15',
+    // GMROI = (200 × 45) / (30 × 600) × 100 = 9000/18000 × 100 = 50% - 低すぎる
+  }), thresholds, opts);
+  // 50% は観察（100-200）の範囲外、分類外扱い
+  if (r.classification === '観察継続') {
+    throw new Error('14j 期待値 GMROI 50% だが観察継続になった');
+  }
+
+  // 観察継続 正例: GMROI 150% 狙い
+  r = classifyProduct(mkRow({
+    売上分類: 1,
+    標準売価: 1000, 原価: 300, 送料: 100,  // 利益単価 = 900-400 = 500
+    avg_stock: 15, latest_stock: 200,  // 大量在庫で回転遅め
+    sales_period: 45, sales_30d: 15, sales_90d: 45,
+    daily_last_sale: '2026-04-15',
+    // GMROI = (500 × 45) / (15 × 300) × 100 = 22500/4500 × 100 = 500% (優良範囲)
+    // 回転 = 200 / (45/90) = 400日 (優良範囲外)
+  }), thresholds, opts);
+  // 実際 GMROI 500% は good_stock 範囲 (gmroi_gt: 200) だが turnover 400日 は 30-90の範囲外
+  // → 値下げ候補へ（回転>120日 + 粗利率50%>20%）
+  expectEq(r.classification, '値下げ候補', '14k 高粗利・低回転 → 値下げ候補');
+
+  // 分類外: 販売実績不足 + 在庫あり
+  r = classifyProduct(mkRow({
+    売上分類: 1,
+    daily_last_sale: '2026-04-15',
+    sales_period: 0, sales_30d: 0, sales_90d: 0,
+    latest_stock: 50,
+  }), thresholds, opts);
+  expectEq(r.classification, '分類外', '14l 販売0+在庫あり → 分類外');
+  // days_since_sale は 6日（2026-04-15 → 2026-04-21） → retirement 閾値未達
+  expectEq(r.reason.includes('販売実績不足') || r.reason.includes('閾値外'), true, '14l 理由');
+
+  // 観察継続 正例: GMROI 150%（100-200 範囲）
+  //   売価500 原価200 送料50 → 利益単価 450-250=200
+  //   sales_period 30, avg_stock 20, cost 200 → GMROI = (200×30)/(20×200)×100 = 150%
+  //   latest_stock 20, periodDays 90 → 回転 20/(30/90) = 60日 (good_stock 30-90 内)
+  //   GMROI 150% は good_stock (>200) 条件を満たさないため 観察継続 へ
+  r = classifyProduct(mkRow({
+    売上分類: 1,
+    標準売価: 500, 原価: 200, 送料: 50,
+    daily_last_sale: '2026-04-15',
+    sales_period: 30, sales_30d: 10, sales_90d: 30,
+    avg_stock: 20, latest_stock: 20,
+  }), thresholds, opts);
+  expectEq(r.classification, '観察継続', '14m 観察継続 正例（GMROI 150%）');
+  expectEq(Math.round(r.metrics.gmroi), 150, '14m 実GMROI=150');
+
+  // 仕入 warn_gmroi_lt 単独: 販売ありだが GMROI 14% < 50% (warn) → 撤退警戒
+  //   turnover < 180 を保ち、retire の GMROI+turnover 複合条件にはかからないようにする
+  r = classifyProduct(mkRow({
+    売上分類: 3,
+    標準売価: 1000, 原価: 500, 送料: 50,  // 利益単価 = 350
+    daily_last_sale: '2026-04-15',  // 最近販売あり
+    sales_period: 20, sales_30d: 8, sales_90d: 20,
+    avg_stock: 100, latest_stock: 30,
+    // GMROI = (350×20)/(100×500)×100 = 7000/50000×100 = 14%
+    // 回転 = 30/(20/90) = 135日 (< 180, retire 複合条件スキップ)
+  }), thresholds, opts);
+  expectEq(r.classification, '撤退警戒', '14n 仕入 GMROI<50% 単独 → 撤退警戒');
+  expectEq(r.reason.includes('GMROI') && r.reason.includes('50%'), true, '14n 理由に GMROI/50%');
+
+  console.log('[OK] classifyProduct 分類網羅テスト完了');
+}
+
+// ───────────────────────────────────────────────
+// Test 15: applyEarlyWarning（PR2c）
+// ───────────────────────────────────────────────
+console.log('\n=== Test 15: applyEarlyWarning ===');
+{
+  const { applyEarlyWarning } = await import('../apps/profit-analysis/candidates.js');
+  const ew = { past_period_days: 90, recent_period_days: 30, min_past_sales: 10, drop_ratio: 0.33 };
+
+  function mkCand(overrides) {
+    return {
+      ne_product_code: 'X',
+      sales: { sales_period: 0, sales_30d: 0, sales_90d: 0 },
+      flags: { seasonality_off_season: false, new_product: false },
+      ...overrides,
+    };
+  }
+
+  // drop: 過去30件、直近3件以下で急落（期待値 = 30*30/90 = 10、閾値 = 10*0.33 = 3.3）
+  let [r] = applyEarlyWarning([mkCand({ sales: { sales_period: 30, sales_30d: 3, sales_90d: 30 } })], ew);
+  expectEq(r.early_warning?.type, 'drop', '15a 急落検知');
+
+  // 正常: 直近10件なら閾値超え、drop にならない
+  [r] = applyEarlyWarning([mkCand({ sales: { sales_period: 30, sales_30d: 10, sales_90d: 30 } })], ew);
+  expectEq(r.early_warning, null, '15b 正常範囲は null');
+
+  // insufficient: 過去販売 < 10
+  [r] = applyEarlyWarning([mkCand({ sales: { sales_period: 5, sales_30d: 0, sales_90d: 5 } })], ew);
+  expectEq(r.early_warning?.type, 'insufficient', '15c 判定不足');
+
+  // indeterminate: 過去0、直近のみ販売
+  [r] = applyEarlyWarning([mkCand({ sales: { sales_period: 0, sales_30d: 5, sales_90d: 0 } })], ew);
+  expectEq(r.early_warning?.type, 'indeterminate', '15d 判定不能');
+
+  // 販売なし: 過去0 直近0 → null
+  [r] = applyEarlyWarning([mkCand({ sales: { sales_period: 0, sales_30d: 0, sales_90d: 0 } })], ew);
+  expectEq(r.early_warning, null, '15e 販売なしは null');
+
+  // skip: 季節性 or 新商品
+  [r] = applyEarlyWarning([mkCand({
+    flags: { seasonality_off_season: true, new_product: false },
+    sales: { sales_period: 30, sales_30d: 0, sales_90d: 30 },
+  })], ew);
+  expectEq(r.early_warning?.type, 'skip', '15f 季節性は skip');
+
+  [r] = applyEarlyWarning([mkCand({
+    flags: { seasonality_off_season: false, new_product: true },
+    sales: { sales_period: 30, sales_30d: 0, sales_90d: 30 },
+  })], ew);
+  expectEq(r.early_warning?.type, 'skip', '15g 新商品は skip');
+
+  console.log('[OK] applyEarlyWarning 分岐テスト完了');
+}
+
+// ───────────────────────────────────────────────
+// Test 16: fetchCandidatesRaw SQL 取得（PR2c 統合テスト）
+//   最小構成の mirror DB にデータを投入し、SQL が期待通り JOIN・集計するか検証
+// ───────────────────────────────────────────────
+console.log('\n=== Test 16: fetchCandidatesRaw SQL 統合 ===');
+{
+  const { fetchCandidatesRaw } = await import('../apps/profit-analysis/candidates.js');
+
+  process.env.DATA_DIR = TMP_MIR;
+  initMirrorDB();
+  const mdb16 = getMirrorDB();
+
+  // クリーンアップ
+  mdb16.exec('DELETE FROM mirror_products');
+  mdb16.exec('DELETE FROM mirror_sales_daily');
+  mdb16.exec('DELETE FROM mirror_sales_monthly');
+  mdb16.exec('DELETE FROM mirror_stock_monthly_snapshot');
+  mdb16.exec('DELETE FROM product_retirement_status');
+
+  // 3商品投入: 売上分類 1 が2件、2 が1件
+  const ts = '2026-04-21 10:00:00';
+  const insertP = mdb16.prepare(`INSERT INTO mirror_products
+    (product_id, 商品コード, 商品名, 商品区分, 原価状態, 取扱区分, 標準売価, 原価, 送料, 売上分類,
+     seasonality_flag, new_product_flag, updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  insertP.run(1, 'P001', '自社商品A', '単品', 'COMPLETE', '取扱中', 1000, 300, 100, 1, 0, 0, ts);
+  insertP.run(2, 'P002', '自社商品B', '単品', 'COMPLETE', '取扱中', 2000, 800, 100, 1, 0, 0, ts);
+  insertP.run(3, 'P003', '仕入商品', '単品', 'COMPLETE', '取扱中', 1500, 500, 50, 3, 0, 0, ts);
+  // 取扱中止はフィルタされる
+  insertP.run(4, 'P004', '取扱中止', '単品', 'COMPLETE', '取扱中止', 1000, 300, 100, 1, 0, 0, ts);
+
+  // sales_daily
+  const insertSD = mdb16.prepare(`INSERT INTO mirror_sales_daily
+    (日付, 商品コード, モール, 数量, データ種別, updated_at)
+    VALUES (?, ?, 'rakuten', ?, 'by_product', ?)`);
+  insertSD.run('2026-04-15', 'P001', 10, ts);
+  insertSD.run('2026-04-10', 'P001', 5, ts);
+  insertSD.run('2026-03-20', 'P001', 8, ts);  // 30日より前、90日内
+  insertSD.run('2026-04-18', 'P002', 3, ts);
+
+  // sales_monthly
+  const insertSM = mdb16.prepare(`INSERT INTO mirror_sales_monthly
+    (月, 商品コード, モール, 数量, データ種別, updated_at)
+    VALUES (?, ?, 'rakuten', ?, 'by_product', ?)`);
+  insertSM.run('2025-12', 'P001', 20, ts);  // 4ヶ月前
+
+  // stock_snapshot
+  const insertSS = mdb16.prepare(`INSERT INTO mirror_stock_monthly_snapshot
+    (年月, 商品コード, 月末在庫数, snapshot_source, updated_at)
+    VALUES (?, ?, ?, ?, ?)`);
+  insertSS.run('2026-04', 'P001', 50, 'logizard', ts);
+  insertSS.run('2026-03', 'P001', 60, 'logizard', ts);
+  insertSS.run('2026-02', 'P001', 70, 'logizard', ts);
+
+  // sales_class=1 を取得
+  const rows = fetchCandidatesRaw(mdb16, { salesClass: '1', periodDays: 90, today: '2026-04-21' });
+  expectEq(rows.length, 2, '16a 売上分類1 取扱中 は2件（P001, P002）');
+  expectEq(rows.some(r => r.商品コード === 'P001'), true, '16a P001 含まれる');
+  expectEq(rows.some(r => r.商品コード === 'P004'), false, '16a P004 取扱中止は除外');
+
+  const p001 = rows.find(r => r.商品コード === 'P001');
+  expectEq(p001.sales_period, 23, '16b P001 period 90日販売合計 10+5+8=23');
+  expectEq(p001.sales_30d, 15, '16c P001 30日販売 10+5=15');  // 3/20 は 30日より前
+  expectEq(p001.sales_90d, 23, '16d P001 90日販売 =period');
+  expectEq(p001.daily_last_sale, '2026-04-15', '16e P001 daily_last_sale');
+  expectEq(p001.monthly_last_month, '2025-12', '16f P001 monthly_last_month');
+  expectEq(p001.latest_stock, 50, '16g P001 latest_stock (2026-04)');
+  expectEq(Math.round(p001.avg_stock), 60, '16h P001 avg_stock = (50+60+70)/3');
+  expectEq(p001.stock_snapshot_months, 3, '16i P001 snapshot_months');
+
+  // sales_class=3（仕入）1件のみ
+  const rows3 = fetchCandidatesRaw(mdb16, { salesClass: '3', periodDays: 90, today: '2026-04-21' });
+  expectEq(rows3.length, 1, '16j 売上分類3 1件');
+  expectEq(rows3[0].商品コード, 'P003', '16j P003');
+
+  // 16k: 在庫 6ヶ月境界（Codex PR2c Round 1 Medium #3 反映）
+  //   today=2026-04-21 なら setMonth(-5) → 2025-11 以降 = 6ヶ月（2025-11 〜 2026-04）
+  //   2025-10 の行は除外されるべき
+  mdb16.exec('DELETE FROM mirror_stock_monthly_snapshot');
+  insertSS.run('2025-10', 'P001', 80, 'logizard', ts);   // 境界外（6ヶ月前より前）
+  insertSS.run('2025-11', 'P001', 70, 'logizard', ts);   // 境界内
+  insertSS.run('2025-12', 'P001', 60, 'logizard', ts);
+  insertSS.run('2026-01', 'P001', 55, 'logizard', ts);
+  insertSS.run('2026-02', 'P001', 50, 'logizard', ts);
+  insertSS.run('2026-03', 'P001', 45, 'logizard', ts);
+  insertSS.run('2026-04', 'P001', 40, 'logizard', ts);
+
+  const rowsBoundary = fetchCandidatesRaw(mdb16, { salesClass: '1', periodDays: 90, today: '2026-04-21' });
+  const p001b = rowsBoundary.find(r => r.商品コード === 'P001');
+  expectEq(p001b.stock_snapshot_months, 6, '16k 境界内は6ヶ月（2025-11 〜 2026-04）、2025-10 は除外');
+  expectEq(Math.round(p001b.avg_stock), Math.round((70+60+55+50+45+40)/6),
+    '16k avg_stock = 6ヶ月平均');
+  expectEq(p001b.latest_stock, 40, '16k latest_stock = 2026-04');
+
+  // 16l: 月末日 overflow 対策の回帰検知（Codex PR2c Round 2 Medium 反映）
+  //   today=2026-07-31 だと setMonth(-5) 経由は 2026-02-31 → 2026-03-03 にオーバーフロー。
+  //   月初固定 Date.UTC(y, m-5, 1) で '2026-02' に正しく切れるか検証。
+  //   2月の snapshot があるとき、stock_snapshot_months=6 で 2月が含まれることを確認。
+  mdb16.exec('DELETE FROM mirror_stock_monthly_snapshot');
+  insertSS.run('2026-01', 'P001', 100, 'logizard', ts);  // 境界外
+  insertSS.run('2026-02', 'P001',  90, 'logizard', ts);  // 境界内 ← これが overflow の罠で除外されるバグ
+  insertSS.run('2026-03', 'P001',  80, 'logizard', ts);
+  insertSS.run('2026-04', 'P001',  70, 'logizard', ts);
+  insertSS.run('2026-05', 'P001',  60, 'logizard', ts);
+  insertSS.run('2026-06', 'P001',  50, 'logizard', ts);
+  insertSS.run('2026-07', 'P001',  40, 'logizard', ts);
+
+  const overflowCheck = fetchCandidatesRaw(mdb16, { salesClass: '1', periodDays: 90, today: '2026-07-31' });
+  const p001c = overflowCheck.find(r => r.商品コード === 'P001');
+  expectEq(p001c.stock_snapshot_months, 6, '16l 7/31 でも 2026-02〜07 の6ヶ月（month overflow 回避）');
+  expectEq(Math.round(p001c.avg_stock), Math.round((90+80+70+60+50+40)/6),
+    '16l avg_stock に 2月が含まれる（65）');
+
+  // 16m: module API でも period_days > 90 を reject（Codex PR2c Round 2 Low 反映）
+  let threw16m = false;
+  try { fetchCandidatesRaw(mdb16, { salesClass: '1', periodDays: 180, today: '2026-04-21' }); }
+  catch { threw16m = true; }
+  expectEq(threw16m, true, '16m fetchCandidatesRaw periodDays=180 で throw');
+
+  let threw16m2 = false;
+  try { fetchCandidatesRaw(mdb16, { salesClass: '1', periodDays: 0, today: '2026-04-21' }); }
+  catch { threw16m2 = true; }
+  expectEq(threw16m2, true, '16m fetchCandidatesRaw periodDays=0 で throw');
+
+  mdb16.close();
+  console.log('[OK] fetchCandidatesRaw SQL 統合テスト完了');
 }
 
 // ───────────────────────────────────────────────

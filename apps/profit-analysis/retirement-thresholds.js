@@ -179,6 +179,17 @@ export function validateEarlyWarning(obj) {
   if (obj.recent_period_days >= obj.past_period_days) {
     throw new Error('early_warning.recent_period_days は past_period_days 未満');
   }
+  // Codex PR2c Round 1 Medium #2 反映:
+  //   現状の applyEarlyWarning は sales_90d / sales_30d 固定で集計しているため、
+  //   past_period_days=90 / recent_period_days=30 以外はサポートしない。
+  //   SQL 側に可変集計を追加する改修は Phase 2 送り。
+  //   それまでは設定変更を拒否して期間ミスマッチを防ぐ。
+  if (obj.past_period_days !== 90) {
+    throw new Error('early_warning.past_period_days は現状 90 固定（SQL側の集計列が sales_90d に依存）');
+  }
+  if (obj.recent_period_days !== 30) {
+    throw new Error('early_warning.recent_period_days は現状 30 固定（SQL側の集計列が sales_30d に依存）');
+  }
 }
 
 /** 売上分類の有効値チェック */
