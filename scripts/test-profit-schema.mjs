@@ -8,6 +8,11 @@
  * Test 4: warehouse-mirror.db 2回目 initMirrorDB 呼び出しがエラーにならない（冪等性）
  * Test 5: rebuild-m-products.js の applyStagingToProduction が、物理列順が異なる
  *         staging → 本番テーブルへ正しく値を転記する（明示列INSERTの回帰防止）
+ * Test 6: stock-snapshot.js captureMonthlyStockSnapshot が raw_lz_inventory を
+ *         商品コード単位で集計して stock_monthly_snapshot へ UPSERT する（PR2a）
+ * Test 7: stock_monthly_snapshot → mirror_stock_monthly_snapshot の sync round-trip（PR2a）
+ * Test 8: 空Payload + clear_stock_snapshot で mirror の stale データが消える（PR2a fix Medium #1）
+ * Test 9: SELECT 失敗時は clear を送らず mirror の前回状態を保持（PR2a fix Round 2 Medium）
  *
  * 注: DATA_DIR はモジュール読込時にキャプチャされるため、1プロセス内で
  *     同じDBファイルに対して "legacy DB 事前作成 → init 呼び出し → マイグレ検証" の順で行う。
@@ -189,6 +194,295 @@ mdb.close();
 initMirrorDB();
 console.log('[OK] mirror: 2回目呼び出しもエラーなし');
 getMirrorDB().close();
+
+// ───────────────────────────────────────────────
+// Test 6: stock-snapshot.js captureMonthlyStockSnapshot の動作確認（PR2a）
+//   raw_lz_inventory を事前投入 → captureMonthlyStockSnapshot(YYYY-MM) 実行
+//   → stock_monthly_snapshot に 商品コード単位で集計された結果が入ることを検証
+//   複数ロケ（同一商品IDで複数行）の SUM も正しく行われるか確認
+// ───────────────────────────────────────────────
+console.log('\n=== Test 6: captureMonthlyStockSnapshot (raw_lz_inventory 集計) ===');
+process.env.DATA_DIR = TMP_WH;
+await initWarehouse();
+const db6 = getDB();
+
+// raw_lz_inventory に複数ロケ・複数商品を投入
+db6.prepare('DELETE FROM raw_lz_inventory').run();
+const insertLz = db6.prepare(`INSERT INTO raw_lz_inventory
+  (商品ID, 商品名, ロケ, 在庫数, 引当数, synced_at)
+  VALUES (?, ?, ?, ?, ?, ?)`);
+// SKU_A: ロケ1に100個 + ロケ2に50個 = 150個、引当 10+5=15
+insertLz.run('SKU_A', '商品A', 'LOC1', 100, 10, '2026-04-20 23:00:00');
+insertLz.run('SKU_A', '商品A', 'LOC2', 50, 5, '2026-04-20 23:00:00');
+// SKU_B: ロケ1に30個
+insertLz.run('SKU_B', '商品B', 'LOC1', 30, 0, '2026-04-20 23:00:00');
+// 商品IDなし（集計対象外）
+insertLz.run('', '空ID', 'LOC1', 99, 0, '2026-04-20 23:00:00');
+console.log('[OK] raw_lz_inventory にテストデータ4行投入');
+
+// captureMonthlyStockSnapshot 実行
+const { captureMonthlyStockSnapshot } = await import('../apps/warehouse/stock-snapshot.js');
+const result = captureMonthlyStockSnapshot('2026-04', 'test');
+expectEq(result.ok, true, 'captureMonthlyStockSnapshot 成功');
+expectEq(result.count, 2, '集計商品数（空IDは除外）');
+
+// stock_monthly_snapshot の中身検証
+const snapA = db6.prepare('SELECT * FROM stock_monthly_snapshot WHERE 年月=? AND 商品コード=?').get('2026-04', 'SKU_A');
+expectEq(snapA?.月末在庫数, 150, 'SKU_A 月末在庫数 = 100+50');
+expectEq(snapA?.月末引当数, 15, 'SKU_A 月末引当数 = 10+5');
+expectEq(snapA?.snapshot_source, 'test', 'SKU_A snapshot_source');
+
+const snapB = db6.prepare('SELECT * FROM stock_monthly_snapshot WHERE 年月=? AND 商品コード=?').get('2026-04', 'SKU_B');
+expectEq(snapB?.月末在庫数, 30, 'SKU_B 月末在庫数');
+
+// UPSERT動作確認: 同じ yearMonth + 商品コードに対して再実行して更新されるか
+// raw_lz_inventory を変えずに再実行 → 在庫数は同じ、updated_at だけ更新される想定
+const result2 = captureMonthlyStockSnapshot('2026-04', 'test-retry');
+expectEq(result2.count, 2, '2回目実行も同じ件数');
+const snapAagain = db6.prepare('SELECT snapshot_source FROM stock_monthly_snapshot WHERE 年月=? AND 商品コード=?').get('2026-04', 'SKU_A');
+expectEq(snapAagain?.snapshot_source, 'test-retry', 'UPSERT で source 更新');
+
+// 不正年月形式の拒否
+let threwError = false;
+try { captureMonthlyStockSnapshot('2026/04'); }
+catch { threwError = true; }
+expectEq(threwError, true, '不正年月形式で throw');
+
+// 月範囲外（Codex PR2a review Low #3）
+let threwRange = false;
+try { captureMonthlyStockSnapshot('2026-13'); }
+catch { threwRange = true; }
+expectEq(threwRange, true, '月=13 で throw');
+
+let threwZero = false;
+try { captureMonthlyStockSnapshot('2026-00'); }
+catch { threwZero = true; }
+expectEq(threwZero, true, '月=00 で throw');
+
+db6.close();
+console.log('[OK] captureMonthlyStockSnapshot 動作確認完了');
+
+// ───────────────────────────────────────────────
+// Test 7: sync round-trip 相当（stock_monthly_snapshot → mirror_stock_monthly_snapshot）
+//   /api/sync の受信ロジック相当を直接 DB で実行、データ転送を検証。
+//   （HTTPレイヤーは起動せず、SQL レベルで同等の INSERT を確認）
+// ───────────────────────────────────────────────
+console.log('\n=== Test 7: stock_monthly_snapshot sync round-trip ===');
+process.env.DATA_DIR = TMP_MIR;
+initMirrorDB();
+const mdb7 = getMirrorDB();
+
+// sync payload 相当を取得
+process.env.DATA_DIR = TMP_WH;
+await initWarehouse();
+const db7 = getDB();
+const payload = db7.prepare(`
+  SELECT 年月, 商品コード, 月末在庫数, 月末引当数, snapshot_source, captured_at, updated_at
+  FROM stock_monthly_snapshot
+  WHERE 年月 >= '2024-05'
+`).all();
+expectEq(payload.length, 2, 'sync 送信 payload 件数');
+
+// 受信側ロジック相当（DELETE + INSERT）
+const now7 = new Date().toISOString().replace('T', ' ').slice(0, 19);
+const tx = mdb7.transaction(() => {
+  mdb7.exec('DELETE FROM mirror_stock_monthly_snapshot');
+  const stmt = mdb7.prepare(`INSERT INTO mirror_stock_monthly_snapshot (
+    年月, 商品コード, 月末在庫数, 月末引当数, snapshot_source, captured_at, updated_at
+  ) VALUES (?,?,?,?,?,?,?)`);
+  for (const s of payload) {
+    stmt.run(s.年月, s.商品コード, s.月末在庫数, s.月末引当数, s.snapshot_source, s.captured_at, now7);
+  }
+});
+tx();
+
+// mirror 側に入っているか
+const mirSnap = mdb7.prepare('SELECT COUNT(*) as cnt FROM mirror_stock_monthly_snapshot').get();
+expectEq(mirSnap.cnt, 2, 'mirror 側に 2 件投入');
+
+const mirA = mdb7.prepare('SELECT * FROM mirror_stock_monthly_snapshot WHERE 商品コード=?').get('SKU_A');
+expectEq(mirA?.月末在庫数, 150, 'mirror 側 SKU_A 月末在庫数');
+expectEq(mirA?.snapshot_source, 'test-retry', 'mirror 側 snapshot_source');
+
+db7.close();
+mdb7.close();
+console.log('[OK] stock_monthly_snapshot sync round-trip 成功');
+
+// ───────────────────────────────────────────────
+// Test 8: 空Payload + clear で mirror が stale なく空になる（Codex PR2a Round 1 Medium #1）
+//   ミニPC側で対象月の在庫が0件になったケースで、mirror に古いデータが残らないことを検証。
+//   送信側: stock_monthly_snapshot.length === 0 でも clear_stock_snapshot=true で送る
+//   受信側: meta.clear_stock_snapshot を配列長に関係なく処理する
+// ───────────────────────────────────────────────
+console.log('\n=== Test 8: 空Payload + clear で mirror の stale データが消える ===');
+process.env.DATA_DIR = TMP_MIR;
+initMirrorDB();
+const mdb8 = getMirrorDB();
+
+// Test 7 の残骸を消してから再セットアップ
+mdb8.exec('DELETE FROM mirror_stock_monthly_snapshot');
+
+// 事前状態: mirror に古いデータを2件入れておく
+mdb8.prepare(`INSERT INTO mirror_stock_monthly_snapshot
+  (年月, 商品コード, 月末在庫数, 月末引当数, snapshot_source, captured_at, updated_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?)`)
+  .run('2026-02', 'OLD_SKU', 99, 0, 'logizard', '2026-02-28', '2026-02-28 23:00:00');
+mdb8.prepare(`INSERT INTO mirror_stock_monthly_snapshot
+  (年月, 商品コード, 月末在庫数, 月末引当数, snapshot_source, captured_at, updated_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?)`)
+  .run('2026-03', 'OLD_SKU', 88, 0, 'logizard', '2026-03-31', '2026-03-31 23:00:00');
+
+const beforeCount = mdb8.prepare('SELECT COUNT(*) as cnt FROM mirror_stock_monthly_snapshot').get().cnt;
+expectEq(beforeCount, 2, 'Test 8 事前: mirror に 2件の stale データ');
+
+// /api/sync の受信側ロジック相当を直接実行（空 payload + clear_stock_snapshot=true）
+//   router.js の該当部分を simulate: req.body.stock_monthly_snapshot !== undefined で入る
+{
+  const reqBody = {
+    stock_monthly_snapshot: [],   // 空配列
+    meta: { clear_stock_snapshot: true },
+  };
+  const meta8 = reqBody.meta;
+  const snapshotData = reqBody.stock_monthly_snapshot;
+  const nowStr = new Date().toISOString().replace('T', ' ').slice(0, 19);
+
+  if (snapshotData !== undefined) {
+    const tx = mdb8.transaction(() => {
+      if (meta8?.clear_stock_snapshot) mdb8.exec('DELETE FROM mirror_stock_monthly_snapshot');
+      if (snapshotData.length > 0) {
+        // ここは通らない想定
+        throw new Error('空payload想定なのに INSERT が走ろうとした');
+      }
+    });
+    tx();
+  }
+}
+
+const afterCount = mdb8.prepare('SELECT COUNT(*) as cnt FROM mirror_stock_monthly_snapshot').get().cnt;
+expectEq(afterCount, 0, '空Payload+clearで mirror は 0件（stale が消えた）');
+
+mdb8.close();
+console.log('[OK] 空Payload + clear で stale が消えることを確認（Medium #1 回帰防止）');
+
+// ───────────────────────────────────────────────
+// Test 9: buildStockSnapshotSyncParts 実装直結の回帰テスト（Codex PR2a Round 2-3 反映）
+//   sync-to-render.js から抽出した buildStockSnapshotSyncParts() を直接呼ぶ形式。
+//   PR1 の applyStagingToProduction と同じパターン。
+//   将来 sync-to-render.js 側だけが修正を失っても、このテストが失敗する。
+//
+//   3ケース検証:
+//     (a) SELECT 失敗（テーブル未作成）→ fetched=false, parts=[]
+//     (b) SELECT 成功して 0件 → fetched=true, parts=[clear-only]
+//     (c) SELECT 成功して N件 → fetched=true, parts=[初回clear + chunk]
+// ───────────────────────────────────────────────
+console.log('\n=== Test 9: buildStockSnapshotSyncParts 実装直結の回帰テスト ===');
+{
+  const { buildStockSnapshotSyncParts } = await import('../apps/warehouse/sync-to-render.js');
+
+  // --- Case (a): SELECT 失敗 ---
+  {
+    const fakeDb = new Database(':memory:');
+    // stock_monthly_snapshot テーブルが存在しない状態で呼ぶ
+    const result = buildStockSnapshotSyncParts(fakeDb, '2024-04');
+    expectEq(result.fetched, false, '(a) SELECT 失敗で fetched=false');
+    expectEq(result.parts.length, 0, '(a) parts は空配列（送信なし）');
+    if (!result.error) throw new Error('[FAIL] (a) error メッセージが入っていない');
+    fakeDb.close();
+    console.log('[OK] (a) SELECT 失敗パス: clear も chunk も送られない');
+  }
+
+  // --- Case (b): SELECT 成功、0件 ---
+  {
+    const fakeDb = new Database(':memory:');
+    fakeDb.exec(`CREATE TABLE stock_monthly_snapshot (
+      年月 TEXT, 商品コード TEXT, 月末在庫数 INTEGER, 月末引当数 INTEGER,
+      snapshot_source TEXT, captured_at TEXT, updated_at TEXT,
+      PRIMARY KEY (年月, 商品コード)
+    )`);
+    const result = buildStockSnapshotSyncParts(fakeDb, '2024-04');
+    expectEq(result.fetched, true, '(b) SELECT 成功で fetched=true');
+    expectEq(result.count, 0, '(b) 0件');
+    expectEq(result.parts.length, 1, '(b) parts は clear-only 1件');
+    expectEq(result.parts[0].payload.stock_monthly_snapshot.length, 0, '(b) payload は空配列');
+    expectEq(result.parts[0].payload.meta?.clear_stock_snapshot, true, '(b) meta.clear_stock_snapshot=true');
+    fakeDb.close();
+    console.log('[OK] (b) 0件パス: clear-only part が生成される（stale 消去が機能する）');
+  }
+
+  // --- Case (c): SELECT 成功、複数件（チャンク分割境界確認） ---
+  {
+    const fakeDb = new Database(':memory:');
+    fakeDb.exec(`CREATE TABLE stock_monthly_snapshot (
+      年月 TEXT, 商品コード TEXT, 月末在庫数 INTEGER, 月末引当数 INTEGER,
+      snapshot_source TEXT, captured_at TEXT, updated_at TEXT,
+      PRIMARY KEY (年月, 商品コード)
+    )`);
+    const insertS = fakeDb.prepare(`INSERT INTO stock_monthly_snapshot VALUES (?, ?, ?, ?, ?, ?, ?)`);
+    for (let i = 0; i < 30; i++) {
+      insertS.run('2026-04', `SKU_${i}`, 10, 0, 'test', '2026-04-01', '2026-04-01 10:00:00');
+    }
+    // cutoff より古い行を 1件混入。WHERE 年月 >= ? が正しく効けば result.count=30。
+    // もし将来 WHERE が消えたらこの行が含まれて count=31 になり、テスト失敗で検知できる。
+    // （Codex PR2a Round 4 非ブロッカー #1 反映）
+    insertS.run('2023-01', 'OLD_SKU', 5, 0, 'test', '2023-01-01', '2023-01-01 10:00:00');
+
+    // chunkSize=10 を指定して、30件が3チャンクに分かれるか確認
+    const result = buildStockSnapshotSyncParts(fakeDb, '2024-04', 10);
+    expectEq(result.fetched, true, '(c) SELECT 成功');
+    expectEq(result.count, 30, '(c) 30件（cutoff より古い OLD_SKU は除外される / WHERE 回帰検知）');
+    expectEq(result.parts.length, 3, '(c) 30件は chunkSize=10 で 3 parts');
+    expectEq(result.parts[0].payload.meta?.clear_stock_snapshot, true, '(c) 初回 chunk は clear=true');
+    expectEq(result.parts[1].payload.meta, undefined, '(c) 2番目 chunk は meta なし');
+    expectEq(result.parts[2].payload.meta, undefined, '(c) 3番目 chunk は meta なし');
+    fakeDb.close();
+    console.log('[OK] (c) 複数件パス: 初回 chunk のみ clear、残りは追記用');
+  }
+
+  // --- Case (d): chunkSize ガード（Codex PR2a Round 4 非ブロッカー #2） ---
+  {
+    const fakeDb = new Database(':memory:');
+    fakeDb.exec(`CREATE TABLE stock_monthly_snapshot (
+      年月 TEXT, 商品コード TEXT, 月末在庫数 INTEGER, 月末引当数 INTEGER,
+      snapshot_source TEXT, captured_at TEXT, updated_at TEXT,
+      PRIMARY KEY (年月, 商品コード)
+    )`);
+    let threw0 = false, threwNeg = false, threwFloat = false;
+    try { buildStockSnapshotSyncParts(fakeDb, '2024-04', 0); } catch { threw0 = true; }
+    try { buildStockSnapshotSyncParts(fakeDb, '2024-04', -5); } catch { threwNeg = true; }
+    try { buildStockSnapshotSyncParts(fakeDb, '2024-04', 1.5); } catch { threwFloat = true; }
+    expectEq(threw0, true, '(d) chunkSize=0 で throw');
+    expectEq(threwNeg, true, '(d) chunkSize<0 で throw');
+    expectEq(threwFloat, true, '(d) chunkSize が整数でない場合 throw');
+    fakeDb.close();
+    console.log('[OK] (d) chunkSize ガード: 不正値で無限ループする前に throw');
+  }
+
+  // --- 回帰シナリオの総合: SELECT 失敗で mirror の stale が残る ---
+  process.env.DATA_DIR = TMP_MIR;
+  initMirrorDB();
+  const mdb9 = getMirrorDB();
+  mdb9.exec('DELETE FROM mirror_stock_monthly_snapshot');
+  mdb9.prepare(`INSERT INTO mirror_stock_monthly_snapshot
+    (年月, 商品コード, 月末在庫数, 月末引当数, snapshot_source, captured_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .run('2026-03', 'PREV_SKU', 50, 0, 'logizard', '2026-03-31', '2026-03-31 23:00:00');
+
+  // 本物の buildStockSnapshotSyncParts が fetched=false を返すと、sync-to-render の実ロジックで
+  // 送信 for-loop が parts=[] を反復せず、mirror は未変更
+  const fakeDb = new Database(':memory:');
+  const plan = buildStockSnapshotSyncParts(fakeDb, '2024-04');
+  // 実コードと同じ送信ループを模倣
+  for (const part of plan.parts) {
+    // ここに入ると stale が消える。SELECT 失敗なら parts=[] で入らないはず
+    mdb9.exec('DELETE FROM mirror_stock_monthly_snapshot'); // clear simulation
+  }
+  const after = mdb9.prepare('SELECT COUNT(*) as cnt FROM mirror_stock_monthly_snapshot').get().cnt;
+  expectEq(after, 1, 'SELECT 失敗時 mirror の前回データ（1件）が保持される');
+
+  fakeDb.close();
+  mdb9.close();
+  console.log('[OK] 総合シナリオ: SELECT 失敗で mirror の stale data は消えない');
+}
 
 // ───────────────────────────────────────────────
 // Test 5: applyStagingToProduction 回帰防止（Codex PR1 Round 3 High 反映確認）

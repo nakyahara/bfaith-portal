@@ -179,6 +179,28 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
       log.push(`sales_daily: ${sales_daily.length}件`);
     }
 
+    // stock_monthly_snapshot（PR2a 追加、商品収益性ダッシュボード タブB GMROI用）
+    //   初回チャンクで meta.clear_stock_snapshot=true → DELETE、以降は追記
+    //   Codex PR2a review Medium #1 反映: 空配列でも clear_stock_snapshot だけは処理する
+    //   （ミニPC側で対象月内の在庫が0件になった時に mirror 側の stale を消すため）
+    if (req.body.stock_monthly_snapshot !== undefined) {
+      const snapshotData = req.body.stock_monthly_snapshot;
+      const tx = db.transaction(() => {
+        if (meta?.clear_stock_snapshot) db.exec('DELETE FROM mirror_stock_monthly_snapshot');
+        if (snapshotData.length > 0) {
+          const stmt = db.prepare(`INSERT INTO mirror_stock_monthly_snapshot (
+            年月, 商品コード, 月末在庫数, 月末引当数, snapshot_source, captured_at, updated_at
+          ) VALUES (?,?,?,?,?,?,?)`);
+          for (const s of snapshotData) {
+            stmt.run(s.年月, s.商品コード, s.月末在庫数 ?? 0, s.月末引当数 ?? 0,
+              s.snapshot_source || null, s.captured_at || null, now);
+          }
+        }
+      });
+      tx();
+      log.push(`stock_monthly_snapshot: ${snapshotData.length}件${meta?.clear_stock_snapshot ? ' (clear)' : ''}`);
+    }
+
     // 同期状態更新
     db.prepare('INSERT OR REPLACE INTO mirror_sync_status (key, value, updated_at) VALUES (?,?,?)').run('last_sync', now, now);
     if (meta) {
@@ -260,6 +282,8 @@ router.get('/api/status', (req, res) => {
     status.sku_map_count = db.prepare('SELECT COUNT(*) as cnt FROM mirror_sku_map').get().cnt;
     try { status.amazon_sku_fees_count = db.prepare('SELECT COUNT(*) as cnt FROM mirror_amazon_sku_fees').get().cnt; } catch { status.amazon_sku_fees_count = 0; }
     try { status.rakuten_sku_map_count = db.prepare('SELECT COUNT(*) as cnt FROM mirror_rakuten_sku_map').get().cnt; } catch { status.rakuten_sku_map_count = 0; }
+    // Codex PR2a Round 4 非ブロッカー #3 反映: stock_snapshot 件数も同期検証に乗せる
+    try { status.stock_snapshot_count = db.prepare('SELECT COUNT(*) as cnt FROM mirror_stock_monthly_snapshot').get().cnt; } catch { status.stock_snapshot_count = 0; }
   } catch {}
   res.json(status);
 });
