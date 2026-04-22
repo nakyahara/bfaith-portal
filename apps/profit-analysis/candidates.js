@@ -121,7 +121,9 @@ export function fetchCandidatesRaw(db, { salesClass, periodDays = 90, today }) {
     LEFT JOIN product_retirement_status prs ON p.商品コード = prs.ne_product_code COLLATE NOCASE
     WHERE p.売上分類 = ?
       AND COALESCE(p.取扱区分, '') = '取扱中'
-      AND p.商品区分 IN ('単品', 'セット', '例外')
+      -- 設計書§14「粒度は NE商品コード（構成品単位）、セット扱いは構成品単位で集計（ダブルカウント回避）」
+      -- に従い、セット商品は候補リストに含めない（販売・在庫は構成品側で既に集計されている）
+      AND p.商品区分 IN ('単品', '例外')
   `;
 
   return db.prepare(sql).all(

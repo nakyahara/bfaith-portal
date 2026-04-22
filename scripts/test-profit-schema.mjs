@@ -1105,6 +1105,8 @@ console.log('\n=== Test 16: fetchCandidatesRaw SQL 統合 ===');
   insertP.run(3, 'P003', '仕入商品', '単品', 'COMPLETE', '取扱中', 1500, 500, 50, 3, 0, 0, ts);
   // 取扱中止はフィルタされる
   insertP.run(4, 'P004', '取扱中止', '単品', 'COMPLETE', '取扱中止', 1000, 300, 100, 1, 0, 0, ts);
+  // セット商品: candidates に含めない（構成品単位で集計する設計、設計書§14）
+  insertP.run(5, 'PSET001', '自社セット商品', 'セット', 'COMPLETE', '取扱中', 3000, 1200, 150, 1, 0, 0, ts);
 
   // sales_daily
   const insertSD = mdb16.prepare(`INSERT INTO mirror_sales_daily
@@ -1131,9 +1133,10 @@ console.log('\n=== Test 16: fetchCandidatesRaw SQL 統合 ===');
 
   // sales_class=1 を取得
   const rows = fetchCandidatesRaw(mdb16, { salesClass: '1', periodDays: 90, today: '2026-04-21' });
-  expectEq(rows.length, 2, '16a 売上分類1 取扱中 は2件（P001, P002）');
+  expectEq(rows.length, 2, '16a 売上分類1 取扱中 は2件（P001, P002。P004 取扱中止 / PSET001 セット は除外）');
   expectEq(rows.some(r => r.商品コード === 'P001'), true, '16a P001 含まれる');
   expectEq(rows.some(r => r.商品コード === 'P004'), false, '16a P004 取扱中止は除外');
+  expectEq(rows.some(r => r.商品コード === 'PSET001'), false, '16a PSET001 セット商品は除外（構成品単位で集計するため）');
 
   const p001 = rows.find(r => r.商品コード === 'P001');
   expectEq(p001.sales_period, 23, '16b P001 period 90日販売合計 10+5+8=23');
