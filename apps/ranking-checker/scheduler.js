@@ -1,49 +1,32 @@
 /**
- * 楽天順位チェッカー スケジューラー
+ * 楽天順位チェッカー スケジューラー（SQLite版）
  *
- * node-cron で以下を実行:
+ * node-cron:
  *   - 毎日 13:00 JST (04:00 UTC) → 順位自動チェック
- *   - 毎日 09:00 JST (00:00 UTC) → CSV生成 + Google Drive保存
- *   - チェック完了後 → 365日超の古いデータを削除
+ *     [Phase 2 以降] 本番では RANKCHECK_AUTO_ENABLED=false とし、miniPC の Task Scheduler
+ *     + run-rankcheck-safe.ps1 で Runner を起動する。このブランチは dev/fallback 用。
+ *   - 毎日 09:00 JST (00:00 UTC) → CSV 生成 + Google Drive 保存
+ *     Render で動作、PROXY_MODE のときは miniPC /service-api/rankcheck/data を fetch。
+ *   - チェック完了後 → 365日超データを SQL 1本で削除
  */
 import cron from 'node-cron';
-import { runAutoCheck, DATA_FILE, readJson, writeJson, log } from './auto-check.js';
+import { runAutoCheck } from './auto-check.js';
+import { log } from './helpers.js';
 import { exportCSVToDrive } from './csv-export.js';
+import * as rdb from './db.js';
 
 const DATA_RETENTION_DAYS = 365;
-
-// ── 古いデータ削除 ──
+const RUNMETA_RETENTION_DAYS = 60;
 
 function cleanupOldData() {
-  const data = readJson(DATA_FILE, { products: [] });
-  const products = data.products || [];
-  if (!products.length) return;
+  const removed = rdb.cleanupOldHistory(DATA_RETENTION_DAYS);
+  if (removed > 0) log(`データクリーンアップ: ${removed} 件の古いエントリを削除（${DATA_RETENTION_DAYS}日超）`);
 
-  const now = new Date(Date.now() + 9 * 60 * 60 * 1000); // JST
-  const cutoff = new Date(now);
-  cutoff.setDate(cutoff.getDate() - DATA_RETENTION_DAYS);
-  const cutoffStr = cutoff.toISOString().slice(0, 10);
-
-  let totalRemoved = 0;
-  for (const product of products) {
-    if (!product.history || !product.history.length) continue;
-    const before = product.history.length;
-    product.history = product.history.filter(entry => entry.date >= cutoffStr);
-    totalRemoved += before - product.history.length;
-  }
-
-  if (totalRemoved > 0) {
-    writeJson(DATA_FILE, { products });
-    log(`データクリーンアップ: ${totalRemoved} 件の古いエントリを削除（${DATA_RETENTION_DAYS}日超）`);
-  }
+  const meta = rdb.cleanupOldRunMeta(RUNMETA_RETENTION_DAYS);
+  if (meta.runs + meta.logs > 0) log(`run_state/run_log クリーンアップ: runs=${meta.runs} logs=${meta.logs} (${RUNMETA_RETENTION_DAYS}日超)`);
 }
 
-// ── スケジューラー起動 ──
-
 export function startScheduler() {
-  // 毎日 13:00 JST = 04:00 UTC — Renderメモリ超過対策で既定は無効。
-  // 再有効化するには RANKCHECK_AUTO_ENABLED=true を設定する。
-  // Why: 3566件 × 全件JSON常駐で rss が Starter 512MB を超過し再起動が発生する。
   const autoEnabled = process.env.RANKCHECK_AUTO_ENABLED === 'true';
   if (autoEnabled) {
     cron.schedule('0 4 * * *', async () => {
@@ -57,7 +40,6 @@ export function startScheduler() {
     }, { timezone: 'UTC' });
   }
 
-  // 毎日 09:00 JST = 00:00 UTC
   cron.schedule('0 0 * * *', async () => {
     log('--- スケジュール実行: CSV出力 (09:00 JST) ---');
     try {
@@ -67,7 +49,7 @@ export function startScheduler() {
     }
   }, { timezone: 'UTC' });
 
-  console.log('[Scheduler] 楽天順位チェッカー スケジュール登録完了');
+  console.log('[Scheduler] 楽天順位チェッカー スケジュール登録完了 (SQLite版)');
   if (autoEnabled) {
     console.log('[Scheduler]   13:00 JST → 順位自動チェック + データクリーンアップ (ENABLED)');
   } else {

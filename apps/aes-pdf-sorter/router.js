@@ -6,6 +6,7 @@ import { Router } from 'express';
 import { spawn } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { bootStart, bootEnd, bootNote, bootFail } from '../observability/boot-log.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -19,6 +20,11 @@ let pythonProcess = null;
  * Pythonバックエンドを起動
  */
 export function startPythonBackend() {
+  bootStart('aes-python', 'python-uvicorn');
+  if (pythonProcess) {
+    bootNote('aes-python', `既存child pid=${pythonProcess.pid} が生存中のためspawnスキップ`);
+    return;
+  }
   const pythonDir = path.join(__dirname, 'python');
   // Render (Docker): venv内のpython、ローカル: python/python3
   const venvPython = path.join(__dirname, '..', '..', 'venv', 'bin', 'python3');
@@ -36,25 +42,30 @@ export function startPythonBackend() {
     env: { ...process.env }
   });
 
+  const childPid = pythonProcess.pid;
+
   pythonProcess.stdout.on('data', (data) => {
-    console.log(`[AES-Python] ${data.toString().trim()}`);
+    console.log(`[AES-Python pid=${childPid}] ${data.toString().trim()}`);
   });
 
   pythonProcess.stderr.on('data', (data) => {
     const msg = data.toString().trim();
-    if (msg) console.log(`[AES-Python] ${msg}`);
+    if (msg) console.log(`[AES-Python pid=${childPid}] ${msg}`);
   });
 
   pythonProcess.on('close', (code) => {
+    bootNote('aes-python', `child pid=${childPid} 終了 code=${code}`);
     console.log(`[AES-Python] プロセス終了 (code: ${code})`);
     pythonProcess = null;
   });
 
   pythonProcess.on('error', (err) => {
+    bootFail('aes-python', `child pid=${childPid}`, err);
     console.error(`[AES-Python] 起動エラー: ${err.message}`);
     pythonProcess = null;
   });
 
+  bootEnd('aes-python', 'python-uvicorn', `child_pid=${childPid} port=${PYTHON_PORT}`);
   console.log(`[AES-Python] バックエンド起動中 (port: ${PYTHON_PORT})...`);
 }
 

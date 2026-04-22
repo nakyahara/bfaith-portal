@@ -6,6 +6,7 @@
  * 失敗の種類 (認証/tunnel/app/ネットワーク) を区別する。
  */
 import cron from 'node-cron';
+import { bootStart, bootEnd } from '../observability/boot-log.js';
 
 const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
 const HEALTH_PATH = '/service-api/health';
@@ -110,7 +111,9 @@ async function runCheck() {
 }
 
 export function startWarehouseHealthcheck() {
+  bootStart('healthcheck', 'warehouse-healthcheck');
   cron.schedule('*/5 * * * *', runCheck, { timezone: 'UTC' });
   console.log('[Healthcheck] warehouse死活監視開始 (5分毎、3回連続失敗でGChat通知)');
   setTimeout(runCheck, 30000);
+  bootEnd('healthcheck', 'warehouse-healthcheck', `target=${WAREHOUSE_URL}${HEALTH_PATH}`);
 }

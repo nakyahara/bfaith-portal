@@ -443,7 +443,10 @@ async function loadData() {
   }
 }
 async function saveData() {
-  const obj = { products };
+  // 商品マスタのみ送信。history はサーバー側 DB が真のソースで、UI から上書きしない。
+  // ペイロードが巨大化して 10MB 制限に引っかかるのを防ぐ目的も兼ねる。
+  const masterOnly = products.map(({ history, ...rest }) => rest);
+  const obj = { products: masterOnly, confirmEmpty: masterOnly.length === 0 };
   try {
     const resp = await fetch(BASE_PATH + '/data', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(obj) });
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
@@ -1162,15 +1165,32 @@ function importJSON() { document.getElementById('import-file').click(); }
 function handleImport(event) {
   const file = event.target.files[0];
   if (!file) return;
-  if (!confirm('現在のデータをインポートしたファイルで上書きしますか？')) { event.target.value = ''; return; }
+  if (!confirm('現在のデータをインポートしたファイルで上書きしますか？（履歴も復元されます）')) { event.target.value = ''; return; }
   const reader = new FileReader();
   reader.onload = async (e) => {
     try {
       const data = JSON.parse(e.target.result);
-      if (Array.isArray(data)) products = data;
-      else if (data.products && Array.isArray(data.products)) products = data.products;
+      let incoming;
+      if (Array.isArray(data)) incoming = data;
+      else if (data.products && Array.isArray(data.products)) incoming = data.products;
       else throw new Error('Invalid format');
-      await saveData(); renderList(); alert('インポートしました（サーバー保存済み）。');
+
+      // 通常保存 POST /data は history を無視するため、インポートは専用 endpoint を使う。
+      // replaceAll=true で UI の「上書き」セマンティクスに合わせる。
+      const resp = await fetch(BASE_PATH + '/data/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ products: incoming, replaceAll: true, confirmEmpty: incoming.length === 0 }),
+      });
+      if (!resp.ok) {
+        const err = await resp.text();
+        throw new Error('HTTP ' + resp.status + ': ' + err.slice(0, 200));
+      }
+      const result = await resp.json();
+      // DB から最新状態を読み戻す（サーバーが正）
+      await loadData();
+      renderList();
+      alert(`インポート完了: 商品 ${result.productsUpserted} 件 / 履歴 ${result.historyUpserted} 件 / 削除 ${result.deleted} 件`);
     } catch(err) { alert('インポートに失敗しました:\n' + err.message); }
     event.target.value = '';
   };

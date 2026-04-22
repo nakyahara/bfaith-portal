@@ -3,6 +3,7 @@
  * 長時間処理（>10秒）をジョブ化して進捗を追跡する
  */
 import { randomUUID } from 'crypto';
+import { bootNote } from '../observability/boot-log.js';
 
 // インメモリジョブストア（再起動で消えるが、短期ジョブには十分）
 const jobs = new Map();
@@ -11,6 +12,7 @@ const jobs = new Map();
 const CLEANUP_INTERVAL = 10 * 60 * 1000; // 10分ごと
 const MAX_AGE = 60 * 60 * 1000;          // 1時間
 
+bootNote('job-manager', `cleanup-interval 登録 (every ${CLEANUP_INTERVAL}ms)`);
 setInterval(() => {
   const now = Date.now();
   for (const [id, job] of jobs) {

@@ -12,6 +12,7 @@ import rankingRouter from './apps/ranking-checker/router.js';
 import { startScheduler } from './apps/ranking-checker/scheduler.js';
 import { startWarehouseHealthcheck } from './apps/warehouse/healthcheck.js';
 import { startMetrics } from './apps/observability/metrics.js';
+import { bootStart, bootEnd, bootNote, bootFail } from './apps/observability/boot-log.js';
 import profitRouter from './apps/profit-calculator/router.js';
 import { startPriceWorker, startMaintenanceJobs } from './apps/profit-calculator/price-scheduler.js';
 import fbaRouter from './apps/fba-replenishment/router.js';
@@ -29,6 +30,7 @@ import mercariAccountingRouter from './apps/mercari-accounting/router.js';
 import profitAnalysisRouter from './apps/profit-analysis/router.js';
 import mgmtAccountingRouter from './apps/mgmt-accounting/router.js';
 import serviceRouter from './apps/warehouse/service-router.js';
+import { serviceAuth } from './apps/warehouse/service-auth.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -86,7 +88,27 @@ app.set('trust proxy', 1); // Cloudflare Tunnel経由
 app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
 app.use(express.urlencoded({ extended: true }));
-app.use(express.json({ limit: '10mb' }));
+// グローバル JSON parser (10MB)。ただし大容量受信が必要な endpoint は除外。
+// 除外対象 endpoint は route 側で独自の parser (例: 50MB) を定義する。
+// 単純に全体 limit を上げると未認可リクエストのDoS面が広がるため、例外列挙方式を採る。
+const LARGE_BODY_ROUTES = [
+  '/apps/ranking-checker/data/import',      // 履歴付き JSON バックアップ復元 (router 側で 50MB)
+  // /service-api/* は serviceAuth 後に独自 parser が走るため、この配列ではなく
+  // 上記 middleware で startsWith('/service-api/') として一括 exempt している。
+];
+const globalJsonParser = express.json({ limit: '10mb' });
+app.use((req, res, next) => {
+  if (req.method === 'POST') {
+    // trailing slash 差異を許容して比較
+    const normalizedPath = req.path.replace(/\/+$/, '') || '/';
+    // /service-api/* は serviceAuth + 専用 parser が後段 (app.use('/service-api', ...)) で
+    // 走るためここでは parse しない。Bearer 検証前に body を読まないことで
+    // 未認可 DoS 面を閉じる。
+    if (normalizedPath.startsWith('/service-api/') || normalizedPath === '/service-api') return next();
+    if (LARGE_BODY_ROUTES.includes(normalizedPath)) return next();
+  }
+  return globalJsonParser(req, res, next);
+});
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.use(session({
@@ -425,7 +447,11 @@ app.use('/apps/profit-calculator', requireAppAccess('profit-calculator'), profit
 app.use('/apps/fba-replenishment', requireAppAccess('fba-replenishment'), fbaRouter);
 app.use('/apps/warehouse', requireAppAccess('warehouse'), warehouseRouter);
 app.use('/apps/mirror', express.json({ limit: '100mb' }), mirrorRouter);  // ミラー同期APIはセッション認証不要（APIキー認証）
-app.use('/service-api', express.json(), serviceRouter);  // サービスAPI（Render→ミニPC、トークン認証）
+// サービスAPI（Render→ミニPC、トークン認証）。
+// rankcheck の履歴込みインポートで 10MB を超える可能性があるため 50MB まで許容。
+// 未認可 DoS 回避のため、serviceAuth を body parser **より前** に置く。
+// そうしないと token 無しリクエストが最大 50MB を parse してから 401 になる。
+app.use('/service-api', serviceAuth, express.json({ limit: '50mb' }), serviceRouter);
 app.use('/apps/amazon-accounting', (req, res, next) => {
   if (req.path === '/import-history' && req.method === 'POST') return next();  // APIキー認証に委譲
   requireAuth(req, res, next);
@@ -569,12 +595,16 @@ app.post('/admin/users/reset-password', requireAdmin, (req, res) => {
 });
 
 // --- 起動 ---
+bootNote('web', `server.js ロード完了 (Node ${process.version}, PORT=${PORT}, RENDER=${!!process.env.RENDER})`);
+bootStart('web', 'express-listen');
 app.listen(PORT, () => {
+  bootEnd('web', 'express-listen', `port=${PORT}`);
   console.log(`B-Faith Portal running at http://localhost:${PORT}`);
 
   try {
     startPythonBackend();
   } catch (e) {
+    bootFail('aes-python', 'startPythonBackend', e);
     console.warn(`[AES-Python] 起動スキップ: ${e.message}`);
     console.warn('[AES-Python] Python環境がない場合、AESラベル並び替え機能は使用できません');
   }
@@ -595,5 +625,22 @@ app.listen(PORT, () => {
   // startMaintenanceJobs();
 });
 
-process.on('SIGTERM', () => { stopPythonBackend(); process.exit(0); });
-process.on('SIGINT', () => { stopPythonBackend(); process.exit(0); });
+process.on('SIGTERM', () => {
+  bootNote('web', 'SIGTERM受信 → shutdown');
+  stopPythonBackend();
+  process.exit(0);
+});
+process.on('SIGINT', () => {
+  bootNote('web', 'SIGINT受信 → shutdown');
+  stopPythonBackend();
+  process.exit(0);
+});
+process.on('exit', (code) => {
+  bootNote('web', `process.exit code=${code}`);
+});
+process.on('uncaughtException', (err) => {
+  bootFail('web', 'uncaughtException', err);
+});
+process.on('unhandledRejection', (reason) => {
+  bootFail('web', 'unhandledRejection', reason);
+});

@@ -8,6 +8,7 @@ __pycache__/
 *.pyc
 data/
 data-import/*.json
+data-test/
 
 # warehouse デバッグ用の一時スクリプト (scripts/safe-debug.mjs経由で実行する想定)
 check-rakuten*.mjs

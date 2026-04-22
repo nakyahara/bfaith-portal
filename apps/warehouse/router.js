@@ -20,6 +20,7 @@ import multer from 'multer';
 import fs from 'fs';
 import iconv from 'iconv-lite';
 import { initDB, getDB, getStats, saveToFile, updateSyncMeta } from './db.js';
+import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
 
 const router = Router();
 const upload = multer({ dest: 'data/import/' });
@@ -27,11 +28,14 @@ const upload = multer({ dest: 'data/import/' });
 // ─── DB初期化 ───
 let dbReady = false;
 
+bootStart('warehouse-db', 'warehouse.db');
 (async () => {
   try {
     await initDB();
     dbReady = true;
+    bootEnd('warehouse-db', 'warehouse.db');
   } catch (e) {
+    bootFail('warehouse-db', 'warehouse.db', e);
     console.error('[Warehouse] DB初期化失敗:', e.message);
   }
 })();

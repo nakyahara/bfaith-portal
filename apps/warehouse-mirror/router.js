@@ -13,13 +13,22 @@
  */
 import { Router } from 'express';
 import { initMirrorDB, getMirrorDB } from './db.js';
+import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
 
 const router = Router();
 
 // DB初期化
 let dbReady = false;
+bootStart('mirror-db', 'warehouse-mirror.db');
 (async () => {
-  try { initMirrorDB(); dbReady = true; } catch (e) { console.error('[Mirror] DB初期化失敗:', e.message); }
+  try {
+    initMirrorDB();
+    dbReady = true;
+    bootEnd('mirror-db', 'warehouse-mirror.db');
+  } catch (e) {
+    bootFail('mirror-db', 'warehouse-mirror.db', e);
+    console.error('[Mirror] DB初期化失敗:', e.message);
+  }
 })();
 
 function ensureDB(req, res, next) {

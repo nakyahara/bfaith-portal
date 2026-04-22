@@ -22,6 +22,7 @@ import { initDb, savePlanningData, savePlanningDataWithHistory, getLatestSnapsho
 import { syncSkuMappings } from './sheets-sync.js';
 import { generateRecommendations } from './calculation-engine.js';
 import { normalizePlanningRow } from './sp-api-reports.js';
+import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
 
 // --- ミニPC接続（SP-API実行用） ---
 const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
@@ -94,10 +95,13 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 // DB初期化
 let dbReady = false;
+bootStart('fba-db', 'fba-replenishment.db');
 initDb().then(() => {
   dbReady = true;
+  bootEnd('fba-db', 'fba-replenishment.db');
 
   // 毎日06:00 JST (21:00 UTC) にSKUマッピング同期（他CH売上スナップショット蓄積）
+  bootStart('fba-cron', 'fba-sku-sync-cron');
   cron.schedule('0 21 * * *', async () => {
     console.log('[FBA-Cron] SKUマッピング定期同期開始...');
     try {
@@ -108,7 +112,11 @@ initDb().then(() => {
     }
   });
   console.log('[FBA] 定期同期スケジュール設定: 毎日06:00 JST');
-}).catch(e => console.error('[FBA] DB初期化エラー:', e));
+  bootEnd('fba-cron', 'fba-sku-sync-cron', 'cron=0 21 * * * UTC');
+}).catch(e => {
+  bootFail('fba-db', 'fba-replenishment.db', e);
+  console.error('[FBA] DB初期化エラー:', e);
+});
 
 function ensureDb(req, res, next) {
   if (!dbReady) return res.status(503).json({ error: 'DB初期化中' });
