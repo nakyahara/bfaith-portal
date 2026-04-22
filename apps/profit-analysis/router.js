@@ -32,10 +32,14 @@ const MALL_FEE_RATES = {
 
 // ─── メイン画面 ───
 router.get('/', (req, res) => {
+  // Codex PR3 R1 High 1 反映: feature flag OFF 時は EJS レンダリング時点でタブBを出さない
+  const featureFlagRaw = process.env.INVENTORY_DECISION_ENABLED;
+  const featureFlagEnabled = featureFlagRaw === 'true' || featureFlagRaw === '1';
   res.render('profit-analysis', {
-    title: '粗利分析',
+    title: '商品収益性ダッシュボード',
     username: req.session?.email,
     displayName: req.session?.displayName,
+    featureFlagEnabled,
   });
 });
 

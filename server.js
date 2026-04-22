@@ -299,7 +299,9 @@ const apps = [
   },
   {
     id: 'profit-analysis',
-    name: '粗利分析',
+    name: '商品収益性ダッシュボード',
+    // Codex PR3 実装 R1 High 1 反映: Dark Launch 中は未公開機能（タブB）を示唆する文字列を
+    // ポータルカードに漏らさない。feature flag ON 後の本番公開時に description を更新する方針。
     description: '全モール横断の商品別粗利率分析・低利益商品の検出',
     icon: '💹',
     path: '/apps/profit-analysis',

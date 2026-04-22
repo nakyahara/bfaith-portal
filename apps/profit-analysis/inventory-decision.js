@@ -98,7 +98,7 @@ router.put('/thresholds', (req, res) => {
       if (disposal_rate_default !== undefined) {
         const v = Number(disposal_rate_default);
         if (!Number.isFinite(v) || v <= 0 || v > 1) {
-          throw new Error('disposal_rate_default は 0 〜 1 の数値');
+          throw new Error('disposal_rate_default は 0 より大きく 1 以下の数値');
         }
         setSetting(db, KEYS.DISPOSAL_RATE, { value: v }, who);
       }
@@ -126,6 +126,24 @@ export const REVIEW_REQUIRED_STATUSES = new Set([
 ]);
 
 const RETIREMENT_STATUSES = new Set(['撤退検討', '撤退確定']);
+// 消化計画中: plan_details（target_month, monthly_sales_target）必須
+const PLAN_DETAILS_REQUIRED_STATUSES = new Set(['消化計画中']);
+
+// Codex PR3 実装 R1 Medium 1 反映: 日付形式 regex（client と同じ境界）
+const RE_YYYY_MM_DD = /^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$/;
+const RE_YYYY_MM = /^\d{4}-(0[1-9]|1[0-2])$/;
+
+/**
+ * YYYY-MM-DD 文字列が実在日か検証（Codex PR3 実装 R2 Low-Medium 2 反映）
+ * 2026-02-31 や 2026-04-31 のような無効日を拒否する
+ */
+function isValidRealDate(str) {
+  if (typeof str !== 'string' || !RE_YYYY_MM_DD.test(str)) return false;
+  const [y, m, d] = str.split('-').map(Number);
+  // Date オブジェクトに変換して round-trip 比較
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+}
 
 /**
  * POST /status のリクエスト body を検証する（純関数、Test 12 が直接呼ぶ）
@@ -152,11 +170,45 @@ export function validateStatusBody(body) {
   if (RETIREMENT_STATUSES.has(b.status) && !b.reason) {
     throw new Error(`status=${b.status} は reason 必須`);
   }
+  // Codex PR3 実装 R1 Medium 1 + R2 Low-Medium 2 反映:
+  //   next_review_date が渡されていたら YYYY-MM-DD 形式 + 実在日
+  if (b.next_review_date) {
+    if (!isValidRealDate(b.next_review_date)) {
+      throw new Error('next_review_date は YYYY-MM-DD 形式の実在日');
+    }
+  }
   // Codex PR2b review Medium #2 反映: disposal_rate の範囲チェック（PUT /thresholds と揃える）
   if (b.disposal_rate !== undefined && b.disposal_rate !== null) {
     const v = Number(b.disposal_rate);
     if (!Number.isFinite(v) || v <= 0 || v > 1) {
       throw new Error('disposal_rate は 0 より大きく 1 以下の数値');
+    }
+  }
+  // Codex PR3 実装 R2 Medium 1 反映: 消化計画中 は plan_details 必須（API 直叩きでも担保）
+  if (PLAN_DETAILS_REQUIRED_STATUSES.has(b.status)) {
+    if (!b.plan_details || typeof b.plan_details !== 'object' || Array.isArray(b.plan_details)) {
+      throw new Error(`status=${b.status} は plan_details オブジェクト必須`);
+    }
+    if (!b.plan_details.target_month) throw new Error(`status=${b.status} は plan_details.target_month 必須`);
+    if (b.plan_details.monthly_sales_target === undefined || b.plan_details.monthly_sales_target === null) {
+      throw new Error(`status=${b.status} は plan_details.monthly_sales_target 必須`);
+    }
+  }
+  // plan_details のフィールド検証（渡された場合のみ、フォーマット・値域チェック）
+  if (b.plan_details !== undefined && b.plan_details !== null) {
+    if (typeof b.plan_details !== 'object' || Array.isArray(b.plan_details)) {
+      throw new Error('plan_details はオブジェクト');
+    }
+    if (b.plan_details.target_month !== undefined) {
+      if (typeof b.plan_details.target_month !== 'string' || !RE_YYYY_MM.test(b.plan_details.target_month)) {
+        throw new Error('plan_details.target_month は YYYY-MM 形式（月は 01〜12）');
+      }
+    }
+    if (b.plan_details.monthly_sales_target !== undefined) {
+      const n = Number(b.plan_details.monthly_sales_target);
+      if (!Number.isInteger(n) || n <= 0) {
+        throw new Error('plan_details.monthly_sales_target は正の整数');
+      }
     }
   }
 }
@@ -184,10 +236,12 @@ router.get('/status/:code', (req, res) => {
  * POST /status
  * body: {
  *   ne_product_code, status, decided_by?, reason?, next_review_date?,
- *   plan_details, decision_metrics, thresholds_json,
+ *   plan_details, decision_metrics, thresholds,
  *   disposal_rate
  * }
- * 判断時メトリクス・閾値・処分率をスナップショットとして保存
+ * 判断時メトリクス・閾値・処分率をスナップショットとして保存。
+ * body のキーは `thresholds` / `decision_metrics` / `plan_details`（`*_json` サフィックス無し）、
+ * DB カラムのみ `thresholds_json` / `decision_metrics_json` / `plan_details_json`。
  */
 router.post('/status', (req, res) => {
   try {

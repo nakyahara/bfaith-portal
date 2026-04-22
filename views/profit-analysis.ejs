@@ -3,15 +3,17 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>粗利分析 - B-Faith Portal</title>
+  <title>商品収益性ダッシュボード - B-Faith Portal</title>
   <link rel="icon" type="image/png" href="/favicon.png"><link rel="icon" type="image/x-icon" href="/favicon.ico">
   <link rel="stylesheet" href="/style.css">
   <style>
+    /* ─── 常時 present: タブA（粗利分析）共通スタイル ─── */
     .container { max-width: 100%; margin: 0 auto; padding: 12px 20px; }
     .header-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
     .header-row h2 { margin: 0; }
 
     .notice { background: #fffbeb; border: 1px solid #f59e0b; border-radius: 6px; padding: 8px 14px; font-size: 12px; color: #92400e; margin-bottom: 12px; }
+    .notice-small { font-size: 11px; color: #6b7280; margin-top: 4px; }
 
     .summary-cards { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
     .card { background: white; border-radius: 8px; padding: 14px 18px; min-width: 140px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
@@ -21,10 +23,10 @@
     .card.warning .value { color: #f59e0b; }
     .card.success .value { color: #16a34a; }
 
-    .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 2px solid #e5e7eb; }
-    .tab { padding: 8px 16px; border: none; background: none; cursor: pointer; font-size: 13px; font-weight: 500; color: #6b7280; border-bottom: 2px solid transparent; margin-bottom: -2px; }
-    .tab.active { color: #2563eb; border-bottom-color: #2563eb; }
-    .tab:hover { color: #1d4ed8; }
+    .sub-tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 2px solid #e5e7eb; flex-wrap: wrap; }
+    .sub-tab { padding: 8px 16px; border: none; background: none; cursor: pointer; font-size: 13px; font-weight: 500; color: #6b7280; border-bottom: 2px solid transparent; margin-bottom: -2px; }
+    .sub-tab.active { color: #2563eb; border-bottom-color: #2563eb; }
+    .sub-tab:hover { color: #1d4ed8; }
 
     .filters { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
     .filters label { font-size: 13px; color: #555; }
@@ -32,10 +34,13 @@
 
     .btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500; }
     .btn-primary { background: #2563eb; color: white; }
-    .btn-primary:hover { background: #1d4ed8; }
+    .btn-primary:hover:not(:disabled) { background: #1d4ed8; }
     .btn-primary:disabled { background: #93c5fd; cursor: not-allowed; }
     .btn-export { background: #059669; color: white; }
-    .btn-export:hover { background: #047857; }
+    .btn-export:hover:not(:disabled) { background: #047857; }
+    .btn-export:disabled { background: #86efac; cursor: not-allowed; }
+    .btn-secondary { background: #e5e7eb; color: #374151; }
+    .btn-secondary:hover:not(:disabled) { background: #d1d5db; }
 
     .table-wrap { max-height: calc(100vh - 380px); overflow: auto; border: 1px solid #e5e7eb; border-radius: 8px; }
     .data-table { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -61,6 +66,68 @@
     .fee-status { font-size: 11px; color: #6b7280; margin-bottom: 8px; }
     .fee-status .ok { color: #16a34a; }
     .fee-status .warn { color: #f59e0b; }
+<% if (featureFlagEnabled) { %>
+
+    /* ─── 以下、feature flag ON 時のみ出力（Dark Launch 漏れ防止） ─── */
+    .impact-cards .card .value { font-size: 20px; }
+    .impact-cards .card .sub { font-size: 11px; color: #9ca3af; margin-top: 2px; }
+
+    .pd-mega-tabs { display: flex; gap: 8px; margin-bottom: 16px; border-bottom: 3px solid #1e3a8a; }
+    .pd-mega-tab { padding: 12px 24px; border: none; background: #e5e7eb; cursor: pointer; font-size: 15px; font-weight: 600; color: #4b5563; border-radius: 6px 6px 0 0; margin-bottom: -3px; }
+    .pd-mega-tab.active { color: white; background: #1e3a8a; border-bottom: 3px solid #1e3a8a; }
+    .pd-mega-tab:hover:not(.active) { background: #d1d5db; color: #1f2937; }
+    .pd-tab-panel { display: none; }
+    .pd-tab-panel.active { display: block; }
+
+    .sub-tab .count { font-size: 11px; color: #9ca3af; margin-left: 4px; }
+    .sub-tab.active .count { color: #2563eb; }
+
+    .pd-flag-chip { display: inline-block; padding: 1px 5px; border-radius: 3px; font-size: 10px; font-weight: 600; margin-right: 3px; white-space: nowrap; }
+    .pd-chip-ew-drop { background: #fee2e2; color: #b91c1c; }
+    .pd-chip-ew-insufficient { background: #fef3c7; color: #92400e; }
+    .pd-chip-ew-indeterminate { background: #e0e7ff; color: #3730a3; }
+    .pd-chip-ew-skip { background: #f3f4f6; color: #6b7280; }
+    .pd-chip-data-insufficient { background: #fed7aa; color: #9a3412; }
+    .pd-chip-seasonality { background: #ccfbf1; color: #115e59; }
+    .pd-chip-new-product { background: #ddd6fe; color: #5b21b6; }
+    .pd-chip-status { background: #dbeafe; color: #1e40af; border: 1px dashed #3b82f6; }
+
+    .pd-segmented { display: inline-flex; background: #f3f4f6; border-radius: 8px; padding: 3px; margin-bottom: 12px; }
+    .pd-segmented-item { padding: 8px 16px; border: none; background: transparent; cursor: pointer; font-size: 13px; font-weight: 500; color: #6b7280; border-radius: 6px; }
+    .pd-segmented-item.active { background: white; color: #1e3a8a; box-shadow: 0 1px 2px rgba(0,0,0,0.1); }
+    .pd-segmented-item .pd-segment-count { font-size: 11px; color: #9ca3af; margin-left: 4px; }
+    .pd-segmented-item.active .pd-segment-count { color: #1e3a8a; }
+
+    .pd-modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: none; align-items: center; justify-content: center; z-index: 100; }
+    .pd-modal-backdrop.open { display: flex; }
+    .pd-modal-box { background: white; border-radius: 10px; padding: 24px; max-width: 720px; width: 90%; max-height: 90vh; overflow-y: auto; box-shadow: 0 10px 30px rgba(0,0,0,0.2); }
+    .pd-modal-title { font-size: 16px; font-weight: 700; margin: 0 0 12px; color: #1f2937; }
+    .pd-modal-row { margin-bottom: 12px; font-size: 13px; }
+    .pd-modal-row label { display: block; margin-bottom: 4px; color: #4b5563; font-weight: 500; }
+    .pd-modal-row input[type=text], .pd-modal-row input[type=number], .pd-modal-row input[type=date], .pd-modal-row textarea, .pd-modal-row select {
+      width: 100%; padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 13px; box-sizing: border-box;
+    }
+    .pd-modal-row textarea { min-height: 60px; resize: vertical; }
+    .pd-modal-grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .pd-modal-section { background: #f9fafb; padding: 10px 12px; border-radius: 6px; margin-bottom: 12px; }
+    .pd-modal-error { color: #b91c1c; font-size: 12px; margin-top: 4px; }
+    .pd-modal-footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+    .pd-status-radio-group { display: flex; flex-wrap: wrap; gap: 8px; }
+    .pd-status-radio-group label { display: flex; align-items: center; gap: 4px; padding: 4px 10px; border: 1px solid #e5e7eb; border-radius: 20px; cursor: pointer; }
+    .pd-status-radio-group input[type=radio] { margin: 0; }
+    .pd-status-radio-group label:has(input:checked) { background: #dbeafe; border-color: #3b82f6; color: #1e40af; font-weight: 600; }
+
+    .pd-threshold-panel { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px; margin-bottom: 16px; display: none; }
+    .pd-threshold-panel.open { display: block; }
+    .pd-threshold-row { display: grid; grid-template-columns: 220px 1fr; gap: 10px; align-items: center; margin-bottom: 8px; font-size: 13px; }
+    .pd-threshold-row label { color: #4b5563; }
+    .pd-threshold-row input { padding: 5px 8px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 13px; width: 120px; }
+    .pd-threshold-section { margin-bottom: 14px; padding-bottom: 14px; border-bottom: 1px solid #e5e7eb; }
+    .pd-threshold-section:last-child { border-bottom: none; }
+    .pd-threshold-section h3 { font-size: 13px; font-weight: 700; color: #1f2937; margin: 0 0 8px; }
+
+    .pd-error-banner { background: #fee2e2; border: 1px solid #dc2626; color: #991b1b; border-radius: 6px; padding: 8px 14px; font-size: 12px; margin-bottom: 12px; }
+<% } %>
   </style>
 </head>
 <body>
@@ -74,67 +141,236 @@
 
   <div class="container">
     <div class="header-row">
-      <h2>粗利分析</h2>
+      <h2>商品収益性ダッシュボード</h2>
+<% if (!featureFlagEnabled) { %>
       <div style="display:flex;gap:8px;">
         <button class="btn btn-primary" onclick="loadData()" id="btn-load">データ取得</button>
         <button class="btn btn-export" onclick="exportCSV()" id="btn-export" disabled>CSV出力</button>
       </div>
+<% } %>
     </div>
 
     <div class="notice">
-      粗利分析は現行原価・現行料率ベースの管理指標であり、過去時点の再現値ではありません。
+      本ツールは現行原価・現行料率ベースの管理指標です（過去時点の再現値ではありません）。
     </div>
 
-    <div class="tabs">
-      <button class="tab active" data-view="worst" onclick="switchView('worst')">ワースト商品</button>
-      <button class="tab" data-view="border" onclick="switchView('border')">ボーダー帯</button>
-      <button class="tab" data-view="trend" onclick="switchView('trend')">前月比悪化</button>
-      <button class="tab" data-view="mall" onclick="switchView('mall')">モール別比較</button>
+<% if (featureFlagEnabled) { %>
+    <!-- ─── 大タブ（feature flag ON 時のみ出力） ─── -->
+    <div class="pd-mega-tabs" role="tablist">
+      <button class="pd-mega-tab active" data-section="profit" onclick="switchMegaTab('profit')" role="tab">モール別粗利分析</button>
+      <button class="pd-mega-tab" data-section="inventory" onclick="switchMegaTab('inventory')" role="tab">在庫整理・撤退判断支援</button>
     </div>
 
-    <div class="filters">
-      <label>期間:
-        <select id="filter-days" onchange="loadData()">
-          <option value="30">直近30日</option>
-          <option value="60">直近60日</option>
-          <option value="90">直近90日</option>
-        </select>
-      </label>
-      <label>モール:
-        <select id="filter-mall" onchange="loadData()">
-          <option value="">全モール</option>
-          <option value="amazon">Amazon</option>
-          <option value="rakuten">楽天</option>
-          <option value="yahoo">Yahoo!</option>
-          <option value="aupay">au PAY</option>
-          <option value="qoo10">Qoo10</option>
-          <option value="linegift">LINEギフト</option>
-          <option value="mercari">メルカリ</option>
-        </select>
-      </label>
-      <label>最低売上:
-        <input type="number" id="filter-min-revenue" value="1000" min="0" step="1000" style="width:90px;" onchange="renderTable()">
-      </label>
+    <!-- ─── タブA: モール別粗利分析（flag ON: tab-panel でラップ） ─── -->
+    <div id="pd-tab-a" class="pd-tab-panel active">
+      <div class="header-row" style="margin-bottom: 8px;">
+        <div></div>
+        <div style="display:flex;gap:8px;">
+          <button class="btn btn-primary" onclick="loadData()" id="btn-load">データ取得</button>
+          <button class="btn btn-export" onclick="exportCSV()" id="btn-export" disabled>CSV出力</button>
+        </div>
+      </div>
+<% } %>
+
+      <div class="sub-tabs" id="pd-sub-tabs-a">
+        <button class="sub-tab active" data-view="worst" onclick="switchProfitView('worst')">ワースト商品</button>
+        <button class="sub-tab" data-view="border" onclick="switchProfitView('border')">ボーダー帯</button>
+        <button class="sub-tab" data-view="trend" onclick="switchProfitView('trend')">前月比悪化</button>
+        <button class="sub-tab" data-view="mall" onclick="switchProfitView('mall')">モール別比較</button>
+      </div>
+
+      <div class="filters">
+        <label>期間:
+          <select id="filter-days" onchange="loadData()">
+            <option value="30">直近30日</option>
+            <option value="60">直近60日</option>
+            <option value="90">直近90日</option>
+          </select>
+        </label>
+        <label>モール:
+          <select id="filter-mall" onchange="loadData()">
+            <option value="">全モール</option>
+            <option value="amazon">Amazon</option>
+            <option value="rakuten">楽天</option>
+            <option value="yahoo">Yahoo!</option>
+            <option value="aupay">au PAY</option>
+            <option value="qoo10">Qoo10</option>
+            <option value="linegift">LINEギフト</option>
+            <option value="mercari">メルカリ</option>
+          </select>
+        </label>
+        <label>最低売上:
+          <input type="number" id="filter-min-revenue" value="1000" min="0" step="1000" style="width:90px;" onchange="renderTable()">
+        </label>
+      </div>
+
+      <div id="fee-status" class="fee-status"></div>
+      <div class="summary-cards" id="summary-cards"></div>
+      <div id="table-container">
+        <div class="empty">「データ取得」を押してください</div>
+      </div>
+
+<% if (featureFlagEnabled) { %>
+    </div><!-- /pd-tab-a -->
+
+    <!-- ─── タブB: 在庫整理・撤退判断支援（flag ON 時のみ出力） ─── -->
+    <div id="pd-tab-b" class="pd-tab-panel">
+      <div id="pd-tab-b-error" class="pd-error-banner" style="display:none;"></div>
+
+      <!-- 売上分類セグメント -->
+      <div class="pd-segmented" role="tablist" aria-label="売上分類">
+        <button class="pd-segmented-item active" data-class="1" onclick="switchSalesClass(1)">🔷 自社商品<span class="pd-segment-count" id="pd-seg-count-1"></span></button>
+        <button class="pd-segmented-item" data-class="3" onclick="switchSalesClass(3)">🔶 仕入商品<span class="pd-segment-count" id="pd-seg-count-3"></span></button>
+        <button class="pd-segmented-item" data-class="2" onclick="switchSalesClass(2)">🔸 取扱限定<span class="pd-segment-count" id="pd-seg-count-2"></span></button>
+      </div>
+
+      <div class="summary-cards impact-cards" id="pd-impact-cards"></div>
+
+      <div class="filters">
+        <label>判定期間:
+          <select id="pd-inv-period-days" onchange="refreshCandidates()">
+            <option value="30">直近30日</option>
+            <option value="60">直近60日</option>
+            <option value="90">直近90日</option>
+          </select>
+        </label>
+        <label>処分率(%):
+          <input type="number" id="pd-inv-disposal-rate" min="0.1" max="100" step="0.1" style="width:80px;" onchange="onDisposalRateChange()">
+        </label>
+        <span class="notice-small" id="pd-inv-data-period-note"></span>
+        <button class="btn btn-secondary" onclick="toggleThresholdPanel()">⚙ 閾値調整</button>
+        <button class="btn btn-export" onclick="exportInventoryCSV()" id="pd-btn-export-inv" disabled>CSV出力</button>
+      </div>
+
+      <div class="pd-threshold-panel" id="pd-threshold-panel">
+        <div class="pd-threshold-section">
+          <h3>撤退閾値（売上分類別）<span class="notice-small" id="pd-threshold-class-label"></span></h3>
+          <div class="pd-threshold-row"><label>警戒段階 (日販売ゼロ)</label><input type="number" id="pd-th-warn-days" min="1" step="1"></div>
+          <div class="pd-threshold-row"><label>撤退検討段階 (日販売ゼロ)</label><input type="number" id="pd-th-retire-days" min="1" step="1"></div>
+          <div class="pd-threshold-row" id="pd-th-warn-gmroi-row" style="display:none;"><label>警戒 GMROI 未満 (%)</label><input type="number" id="pd-th-warn-gmroi" min="0" step="1"></div>
+          <div class="pd-threshold-row" id="pd-th-retire-gmroi-row" style="display:none;"><label>撤退検討 GMROI 未満 (%)</label><input type="number" id="pd-th-retire-gmroi" min="0" step="1"></div>
+          <div class="pd-threshold-row" id="pd-th-retire-turnover-row" style="display:none;"><label>撤退検討 回転 超 (日)</label><input type="number" id="pd-th-retire-turnover" min="0" step="1"></div>
+        </div>
+        <div class="pd-threshold-section">
+          <h3>5分類閾値（全売上分類共通）</h3>
+          <div class="pd-threshold-row"><label>優良: GMROI 超 (%)</label><input type="number" id="pd-th-good-gmroi" min="0" step="1"></div>
+          <div class="pd-threshold-row"><label>優良: 回転 最小 (日)</label><input type="number" id="pd-th-good-turn-min" min="0" step="1"></div>
+          <div class="pd-threshold-row"><label>優良: 回転 最大 (日)</label><input type="number" id="pd-th-good-turn-max" min="0" step="1"></div>
+          <div class="pd-threshold-row"><label>観察: GMROI 最小 (%)</label><input type="number" id="pd-th-obs-min" min="0" step="1"></div>
+          <div class="pd-threshold-row"><label>観察: GMROI 最大 (%)</label><input type="number" id="pd-th-obs-max" min="0" step="1"></div>
+          <div class="pd-threshold-row"><label>値下げ: 回転 超 (日)</label><input type="number" id="pd-th-pd-turn" min="0" step="1"></div>
+          <div class="pd-threshold-row"><label>値下げ: 粗利率 超 (%)</label><input type="number" id="pd-th-pd-margin" min="0" step="1"></div>
+          <div class="pd-threshold-row"><label>セット候補: 回転 超 (日)</label><input type="number" id="pd-th-bundle-turn" min="0" step="1"></div>
+        </div>
+        <div class="pd-threshold-section">
+          <h3>早期警戒（固定値、Phase 2 で可変化予定）</h3>
+          <div class="notice-small">過去90日 / 直近30日 / 最低10個 / 1/3 比率（<strong>現状固定</strong>、設計書§14 参照）</div>
+        </div>
+        <div class="pd-threshold-section">
+          <h3>処分率デフォルト</h3>
+          <div class="pd-threshold-row">
+            <label>処分率 (%) — UIは %、API/DB は ratio(0〜1)</label>
+            <input type="number" id="pd-th-disposal-rate" min="0.1" max="100" step="0.1">
+          </div>
+        </div>
+        <div class="pd-modal-footer">
+          <button class="btn btn-primary" onclick="saveThresholds()" id="pd-btn-save-thresholds">保存</button>
+          <button class="btn btn-secondary" onclick="toggleThresholdPanel()">閉じる</button>
+        </div>
+        <div class="pd-modal-error" id="pd-threshold-error"></div>
+      </div>
+
+      <div class="sub-tabs" id="pd-inv-subtabs" role="tablist"></div>
+
+      <div id="pd-inv-table-container">
+        <div class="empty">読み込み中...</div>
+      </div>
+    </div><!-- /pd-tab-b -->
+
+    <!-- ─── 判断ステータス付与モーダル ─── -->
+    <div class="pd-modal-backdrop" id="pd-status-modal" onclick="onStatusModalBackdrop(event)">
+      <div class="pd-modal-box" onclick="event.stopPropagation()" role="dialog" aria-labelledby="pd-status-modal-title">
+        <div class="pd-modal-title" id="pd-status-modal-title">判断ステータス付与</div>
+        <div class="pd-modal-row">
+          <div style="font-size:12px;color:#6b7280;">商品: <span id="pd-status-modal-product"></span></div>
+          <div style="font-size:12px;color:#6b7280;">現在ステータス: <span id="pd-status-modal-current">未設定</span></div>
+        </div>
+        <div class="pd-modal-row">
+          <label>新ステータス</label>
+          <div class="pd-status-radio-group" id="pd-status-radio-group"></div>
+        </div>
+        <div class="pd-modal-row">
+          <label>判断根拠（reason）<span style="color:#dc2626;" id="pd-reason-required-mark"></span></label>
+          <textarea id="pd-status-reason"></textarea>
+        </div>
+        <div class="pd-modal-row">
+          <label>次回レビュー日 <span style="color:#dc2626;" id="pd-review-required-mark"></span></label>
+          <input type="date" id="pd-status-next-review">
+        </div>
+        <div class="pd-modal-section" id="pd-plan-details-section" style="display:none;">
+          <div style="font-size:12px;font-weight:600;margin-bottom:6px;">消化計画（消化計画中のみ）</div>
+          <div class="pd-modal-grid2">
+            <div class="pd-modal-row"><label>完売予測月 (YYYY-MM)</label><input type="text" id="pd-plan-target-month" placeholder="2026-06"></div>
+            <div class="pd-modal-row"><label>月次販売目標 (個)</label><input type="number" id="pd-plan-monthly-target" min="1" step="1"></div>
+          </div>
+        </div>
+        <div class="pd-modal-row">
+          <label>処分率 (%)</label>
+          <input type="number" id="pd-status-disposal-rate" min="0.1" max="100" step="0.1">
+        </div>
+        <div class="pd-modal-error" id="pd-status-error"></div>
+        <div class="pd-modal-footer">
+          <button class="btn btn-secondary" onclick="closeStatusModal()" id="pd-btn-status-cancel">キャンセル</button>
+          <button class="btn btn-primary" onclick="saveStatus()" id="pd-btn-status-save">保存</button>
+        </div>
+      </div>
     </div>
-
-    <div id="fee-status" class="fee-status"></div>
-
-    <div class="summary-cards" id="summary-cards"></div>
-
-    <div id="table-container">
-      <div class="empty">「データ取得」を押してください</div>
-    </div>
+<% } %>
   </div>
 
+  <!-- ─── 常時 present: 共通 helper + タブA ロジック ─── -->
   <script>
+    const HTML_ESCAPE_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+    function escapeHtml(s) {
+      if (s === null || s === undefined) return '';
+      return String(s).replace(/[&<>"']/g, ch => HTML_ESCAPE_MAP[ch]);
+    }
+    function formatNumber(n) {
+      if (n === null || n === undefined || !Number.isFinite(Number(n))) return '-';
+      return Number(n).toLocaleString('ja-JP');
+    }
+    function formatCurrency(n) {
+      if (n === null || n === undefined || !Number.isFinite(Number(n))) return '-';
+      return '¥' + Math.round(Number(n)).toLocaleString('ja-JP');
+    }
+    function localDateString(d) {
+      const date = d instanceof Date ? d : new Date(d || Date.now());
+      return date.toLocaleDateString('sv-SE');
+    }
+    async function fetchJson(url, options) {
+      const res = await fetch(url, options);
+      const text = await res.text();
+      let data = null;
+      try { data = text ? JSON.parse(text) : null; } catch {}
+      if (!res.ok) {
+        const err = new Error((data && data.error) || `HTTP ${res.status}`);
+        err.status = res.status;
+        err.body = data;
+        throw err;
+      }
+      return data;
+    }
+
+    // ─── タブA: モール別粗利分析（既存機能） ───
+    const MALL_FEE_RATES_LABEL = { amazon: 'Amazon', rakuten: '楽天', yahoo: 'Yahoo!', aupay: 'au PAY', qoo10: 'Qoo10', linegift: 'LINEギフト', mercari: 'メルカリ' };
     let currentData = [];
     let currentView = 'worst';
     let sortCol = 'margin_rate';
     let sortAsc = true;
 
-    function switchView(view) {
+    function switchProfitView(view) {
       currentView = view;
-      document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.view === view));
+      document.querySelectorAll('#pd-sub-tabs-a .sub-tab').forEach(t => t.classList.toggle('active', t.dataset.view === view));
       if (view === 'trend') {
         loadTrendData();
       } else {
@@ -147,20 +383,18 @@
       const mall = document.getElementById('filter-mall').value;
       document.getElementById('table-container').innerHTML = '<div class="loading">データ読み込み中...</div>';
       document.getElementById('btn-load').disabled = true;
-
       try {
         const [profitRes, feeRes] = await Promise.all([
-          fetch(`/apps/profit-analysis/api/profit?days=${days}&mall=${mall}`).then(r => r.json()),
-          fetch('/apps/profit-analysis/api/fee-status').then(r => r.json()),
+          fetchJson(`/apps/profit-analysis/api/profit?days=${days}&mall=${mall}`),
+          fetchJson('/apps/profit-analysis/api/fee-status'),
         ]);
-
         currentData = profitRes.items || [];
         renderSummary(profitRes.summary);
         renderFeeStatus(feeRes);
         renderTable();
         document.getElementById('btn-export').disabled = false;
       } catch (e) {
-        document.getElementById('table-container').innerHTML = `<div class="empty" style="color:#dc2626;">エラー: ${e.message}</div>`;
+        document.getElementById('table-container').innerHTML = `<div class="empty" style="color:#dc2626;">エラー: ${escapeHtml(e.message)}</div>`;
       } finally {
         document.getElementById('btn-load').disabled = false;
       }
@@ -169,28 +403,26 @@
     async function loadTrendData() {
       const mall = document.getElementById('filter-mall').value;
       document.getElementById('table-container').innerHTML = '<div class="loading">前月比データ計算中...</div>';
-
       try {
-        const res = await fetch(`/apps/profit-analysis/api/profit/trend?mall=${mall}`).then(r => r.json());
+        const res = await fetchJson(`/apps/profit-analysis/api/profit/trend?mall=${mall}`);
         currentData = res.items || [];
         sortCol = 'profit_change_pct';
         sortAsc = true;
         renderTable();
       } catch (e) {
-        document.getElementById('table-container').innerHTML = `<div class="empty" style="color:#dc2626;">エラー: ${e.message}</div>`;
+        document.getElementById('table-container').innerHTML = `<div class="empty" style="color:#dc2626;">エラー: ${escapeHtml(e.message)}</div>`;
       }
     }
 
     function renderSummary(s) {
       if (!s) return;
-      const fmt = n => (n || 0).toLocaleString('ja-JP');
       document.getElementById('summary-cards').innerHTML = `
-        <div class="card"><div class="label">対象商品</div><div class="value">${fmt(s.count)}</div></div>
-        <div class="card"><div class="label">売上合計</div><div class="value">${fmt(s.total_revenue)}</div></div>
-        <div class="card"><div class="label">原価合計(税込)</div><div class="value">${fmt(s.total_cost)}</div></div>
-        <div class="card"><div class="label">送料合計</div><div class="value">${fmt(s.total_shipping)}</div></div>
-        <div class="card"><div class="label">手数料合計</div><div class="value">${fmt(s.total_fee)}</div></div>
-        <div class="card ${s.total_profit < 0 ? 'danger' : 'success'}"><div class="label">粗利合計</div><div class="value">${fmt(s.total_profit)}</div></div>
+        <div class="card"><div class="label">対象商品</div><div class="value">${formatNumber(s.count)}</div></div>
+        <div class="card"><div class="label">売上合計</div><div class="value">${formatNumber(s.total_revenue)}</div></div>
+        <div class="card"><div class="label">原価合計(税込)</div><div class="value">${formatNumber(s.total_cost)}</div></div>
+        <div class="card"><div class="label">送料合計</div><div class="value">${formatNumber(s.total_shipping)}</div></div>
+        <div class="card"><div class="label">手数料合計</div><div class="value">${formatNumber(s.total_fee)}</div></div>
+        <div class="card ${s.total_profit < 0 ? 'danger' : 'success'}"><div class="label">粗利合計</div><div class="value">${formatNumber(s.total_profit)}</div></div>
         <div class="card ${s.avg_margin_rate < 10 ? 'danger' : s.avg_margin_rate < 15 ? 'warning' : 'success'}"><div class="label">平均粗利率</div><div class="value">${s.avg_margin_rate}%</div></div>
       `;
     }
@@ -198,7 +430,7 @@
     function renderFeeStatus(f) {
       const el = document.getElementById('fee-status');
       if (f.total > 0) {
-        el.innerHTML = `Amazon手数料キャッシュ: <span class="ok">${f.total}件</span> (FBA: ${f.fba}, FBM: ${f.fbm}) | 最古: ${f.oldest_fetch || '-'}`;
+        el.innerHTML = `Amazon手数料キャッシュ: <span class="ok">${f.total}件</span> (FBA: ${f.fba}, FBM: ${f.fbm}) | 最古: ${escapeHtml(f.oldest_fetch || '-')}`;
       } else {
         el.innerHTML = `Amazon手数料キャッシュ: <span class="warn">未取得（概算15%で計算中）</span>`;
       }
@@ -207,16 +439,11 @@
     function renderTable() {
       const minRevenue = parseInt(document.getElementById('filter-min-revenue').value) || 0;
       let data = currentData.filter(d => d.revenue >= minRevenue);
-
-      // ビュー別フィルタ
       if (currentView === 'worst') {
-        // 粗利率の低い順
         sortCol = sortCol || 'margin_rate';
       } else if (currentView === 'border') {
-        // 粗利率10〜15%帯
         data = data.filter(d => d.margin_rate >= 10 && d.margin_rate <= 15);
       } else if (currentView === 'mall') {
-        // モール別比較: 同一商品が複数モールにある場合のみ
         const codeCount = {};
         for (const d of data) {
           const key = d.listing_code;
@@ -227,8 +454,6 @@
         data = data.filter(d => multiMall.has(d.listing_code));
         data.sort((a, b) => a.listing_code.localeCompare(b.listing_code) || a.margin_rate - b.margin_rate);
       }
-
-      // ソート
       if (currentView !== 'mall') {
         data.sort((a, b) => {
           let va = a[sortCol], vb = b[sortCol];
@@ -238,18 +463,11 @@
           return 0;
         });
       }
-
       if (data.length === 0) {
         document.getElementById('table-container').innerHTML = '<div class="empty">該当データなし</div>';
         return;
       }
-
       const isTrend = currentView === 'trend';
-      const fmt = n => (n || 0).toLocaleString('ja-JP');
-
-      let html = '<div class="table-wrap"><table class="data-table"><thead><tr>';
-
-      // ヘッダー
       const cols = [
         { key: 'listing_code', label: 'コード' },
         { key: 'product_name', label: '商品名' },
@@ -266,48 +484,43 @@
         cols.push({ key: 'prev_profit', label: '前月粗利' });
         cols.push({ key: 'profit_change_pct', label: '変化率%' });
       }
-
+      let html = '<div class="table-wrap"><table class="data-table"><thead><tr>';
       for (const c of cols) {
         const arrow = sortCol === c.key ? (sortAsc ? ' ▲' : ' ▼') : '';
-        html += `<th onclick="doSort('${c.key}')">${c.label}${arrow}</th>`;
+        html += `<th data-sort-col="${escapeHtml(c.key)}" onclick="doProfitSort(this.dataset.sortCol)">${escapeHtml(c.label)}${arrow}</th>`;
       }
       html += '</tr></thead><tbody>';
-
       for (const d of data) {
         let rowClass = '';
         if (d.margin_rate < 5) rowClass = 'row-danger';
         else if (d.margin_rate < 10) rowClass = 'row-warning';
         else if (d.margin_rate >= 20) rowClass = 'row-success';
-
-        const mallLabel = { amazon: 'Amazon', rakuten: '楽天', yahoo: 'Yahoo!', aupay: 'au PAY', qoo10: 'Qoo10', linegift: 'LINEギフト', mercari: 'メルカリ' }[d.mall] || d.mall;
+        const mallLabel = MALL_FEE_RATES_LABEL[d.mall] || d.mall;
         const channelBadge = d.channel === 'FBA' ? ' <span class="badge badge-fba">FBA</span>' :
                              d.channel === 'FBM' ? ' <span class="badge badge-fbm">FBM</span>' : '';
-
         html += `<tr class="${rowClass}">`;
-        html += `<td>${d.listing_code}</td>`;
-        html += `<td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;" title="${(d.product_name||'').replace(/"/g,'&quot;')}">${d.product_name || '-'}</td>`;
-        html += `<td>${mallLabel}${channelBadge}</td>`;
-        html += `<td>${fmt(d.qty)}</td>`;
-        html += `<td>${fmt(d.revenue)}</td>`;
-        html += `<td>${fmt(d.cost)}</td>`;
-        html += `<td>${fmt(d.shipping)}</td>`;
-        html += `<td>${fmt(d.platform_fee)}</td>`;
-        html += `<td style="color:${d.gross_profit < 0 ? '#dc2626' : '#111'};font-weight:600;">${fmt(d.gross_profit)}</td>`;
+        html += `<td>${escapeHtml(d.listing_code)}</td>`;
+        html += `<td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;" title="${escapeHtml(d.product_name||'')}">${escapeHtml(d.product_name || '-')}</td>`;
+        html += `<td>${escapeHtml(mallLabel)}${channelBadge}</td>`;
+        html += `<td>${formatNumber(d.qty)}</td>`;
+        html += `<td>${formatNumber(d.revenue)}</td>`;
+        html += `<td>${formatNumber(d.cost)}</td>`;
+        html += `<td>${formatNumber(d.shipping)}</td>`;
+        html += `<td>${formatNumber(d.platform_fee)}</td>`;
+        html += `<td style="color:${d.gross_profit < 0 ? '#dc2626' : '#111'};font-weight:600;">${formatNumber(d.gross_profit)}</td>`;
         html += `<td style="font-weight:600;color:${d.margin_rate < 5 ? '#dc2626' : d.margin_rate < 10 ? '#f59e0b' : '#16a34a'}">${d.margin_rate}%</td>`;
-
         if (isTrend) {
-          html += `<td>${fmt(d.prev_profit)}</td>`;
+          html += `<td>${formatNumber(d.prev_profit)}</td>`;
           html += `<td style="color:#dc2626;font-weight:600;">${d.profit_change_pct}%</td>`;
         }
         html += '</tr>';
       }
-
       html += '</tbody></table></div>';
       html += `<div style="font-size:11px;color:#9ca3af;margin-top:4px;">${data.length}件表示</div>`;
       document.getElementById('table-container').innerHTML = html;
     }
 
-    function doSort(col) {
+    function doProfitSort(col) {
       if (sortCol === col) { sortAsc = !sortAsc; }
       else { sortCol = col; sortAsc = col === 'margin_rate' || col === 'profit_change_pct'; }
       renderTable();
@@ -317,21 +530,625 @@
       const minRevenue = parseInt(document.getElementById('filter-min-revenue').value) || 0;
       const data = currentData.filter(d => d.revenue >= minRevenue);
       if (!data.length) return alert('データがありません');
-
       const headers = ['コード','商品名','モール','チャネル','数量','売上','原価(税込)','送料','PF手数料','粗利額','粗利率%','原価ソース'];
       const rows = data.map(d => [
         d.listing_code, d.product_name, d.mall, d.channel, d.qty,
         d.revenue, d.cost, d.shipping, d.platform_fee, d.gross_profit, d.margin_rate, d.cost_source,
       ]);
-
       const esc = v => { const s = String(v ?? ''); return s.includes(',') || s.includes('"') || s.includes('\n') ? '"' + s.replace(/"/g, '""') + '"' : s; };
       const csv = '\uFEFF' + [headers.join(','), ...rows.map(r => r.map(esc).join(','))].join('\r\n');
       const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
-      a.download = `粗利分析_${currentView}_${new Date().toISOString().slice(0,10)}.csv`;
+      a.download = `商品収益性ダッシュボード_モール別粗利_${currentView}_${localDateString()}.csv`;
       a.click();
     }
+
+    // 処分率単位変換（ratio/percent）— 常時 present（他所でも useful、テストも同等実装）
+    function ratioToPercent(r) {
+      if (r === null || r === undefined || !Number.isFinite(Number(r))) return '';
+      return Math.round(Number(r) * 1000) / 10;
+    }
+    function percentToRatio(p) {
+      const n = Number(p);
+      if (!Number.isFinite(n) || n <= 0 || n > 100) {
+        throw new Error('処分率は 0% より大きく 100% 以下の数値です');
+      }
+      return n / 100;
+    }
   </script>
+
+<% if (featureFlagEnabled) { %>
+  <!-- ─── feature flag ON 時のみ: 大タブ切替 + タブB ロジック ─── -->
+  <script>
+    // 大タブ切替（flag 内に閉じる）
+    function switchMegaTab(section) {
+      document.querySelectorAll('.pd-mega-tab').forEach(t => t.classList.toggle('active', t.dataset.section === section));
+      document.getElementById('pd-tab-a').classList.toggle('active', section === 'profit');
+      document.getElementById('pd-tab-b').classList.toggle('active', section === 'inventory');
+      if (section === 'inventory' && !window.__pdTabBInitialized) {
+        window.__pdTabBInitialized = true;
+        initTabB();
+      }
+    }
+
+    // ==================================================================
+    // タブB: 在庫整理・撤退判断支援
+    // ==================================================================
+    const PD_SALES_CLASS_LABEL = { 1: '🔷 自社商品', 2: '🔸 取扱限定', 3: '🔶 仕入商品' };
+    const PD_INV_SUBTABS = [
+      { key: '優良在庫', label: '🟢 優良', highlight: 'row-success' },
+      { key: '観察継続', label: '🟡 観察' },
+      { key: '値下げ候補', label: '🟠 値下げ' },
+      { key: 'セット候補', label: '🔵 セット' },
+      { key: '撤退警戒', label: '🟠 撤退警戒', highlight: 'row-warning' },
+      { key: '撤退候補', label: '🔴 撤退候補', highlight: 'row-danger' },
+      { key: '評価不能', label: '⚪ 評価不能' },
+      { key: '分類外', label: '⚠ 分類外' },
+    ];
+    const PD_STATUS_COMMON = ['継続', '値下げ検討', '撤退検討', '撤退確定'];
+    const PD_STATUS_SELF = ['消化計画中', 'リブランディング検討', '再生産判断中'];
+    const PD_REVIEW_REQUIRED = new Set(PD_STATUS_SELF);
+    const PD_REASON_REQUIRED = new Set(['撤退検討', '撤退確定', ...PD_STATUS_SELF]);
+    const PD_DEFAULT_DISPOSAL_RATE = 0.5;
+    // Codex R2 Medium 1 反映: client-side 形式 regex
+    const PD_RE_YYYY_MM_DD = /^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$/;
+    const PD_RE_YYYY_MM = /^\d{4}-(0[1-9]|1[0-2])$/;
+    // Codex R2 Low-Medium 2 反映: 形式だけでなく実在日を round-trip で検証（2026-02-31 等を弾く）
+    function pdIsValidRealDate(str) {
+      if (!PD_RE_YYYY_MM_DD.test(str)) return false;
+      const [y, m, d] = str.split('-').map(Number);
+      const dt = new Date(Date.UTC(y, m - 1, d));
+      return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+    }
+
+    const stateB = {
+      salesClass: 1,
+      subtab: '撤退候補',
+      periodDays: 30,
+      candidates: [],
+      meta: null,
+      thresholds: null,           // 全売上分類の閾値マトリクス（UI閾値パネル編集用、/thresholds から取得）
+      appliedThresholds: null,    // Codex PR3 R3 Low-Medium 反映: /candidates レスポンスに含まれる
+                                  //   現サブセットの「実際に分類に適用された」閾値スナップショット用
+      disposalRate: PD_DEFAULT_DISPOSAL_RATE,
+      sortCol: 'metrics.gmroi',
+      sortAsc: true,
+      activeRowCode: null,
+      savingStatus: false,
+      savingThresholds: false,
+    };
+
+    async function initTabB() {
+      try {
+        stateB.thresholds = await fetchJson('/apps/profit-analysis/api/inventory/thresholds');
+        stateB.disposalRate = Number(stateB.thresholds.disposal_rate_default ?? PD_DEFAULT_DISPOSAL_RATE);
+        document.getElementById('pd-inv-disposal-rate').value = ratioToPercent(stateB.disposalRate);
+        populateThresholdInputs();
+        await refreshCandidates();
+      } catch (e) {
+        if (e.status === 503) {
+          const tabB = document.getElementById('pd-tab-b');
+          const megaBtn = document.querySelector('.pd-mega-tab[data-section="inventory"]');
+          if (tabB) tabB.style.display = 'none';
+          if (megaBtn) megaBtn.style.display = 'none';
+        } else {
+          showTabBError(`初期化エラー: ${e.message}`);
+        }
+      }
+    }
+
+    function showTabBError(msg) {
+      const el = document.getElementById('pd-tab-b-error');
+      if (!el) return;
+      el.textContent = msg;
+      el.style.display = 'block';
+    }
+    function clearTabBError() {
+      const el = document.getElementById('pd-tab-b-error');
+      if (el) el.style.display = 'none';
+    }
+
+    async function switchSalesClass(cls) {
+      stateB.salesClass = Number(cls);
+      document.querySelectorAll('#pd-tab-b .pd-segmented-item').forEach(b => {
+        b.classList.toggle('active', Number(b.dataset.class) === stateB.salesClass);
+      });
+      populateThresholdInputs();
+      await refreshCandidates();
+    }
+
+    function toggleThresholdPanel() {
+      const el = document.getElementById('pd-threshold-panel');
+      el.classList.toggle('open');
+    }
+
+    function populateThresholdInputs() {
+      if (!stateB.thresholds) return;
+      const ret = (stateB.thresholds.retirement || {})[String(stateB.salesClass)];
+      if (ret) {
+        document.getElementById('pd-threshold-class-label').textContent = `（${PD_SALES_CLASS_LABEL[stateB.salesClass]}）`;
+        document.getElementById('pd-th-warn-days').value = ret.warn_days_no_sales ?? '';
+        document.getElementById('pd-th-retire-days').value = ret.retire_days_no_sales ?? '';
+        const isPurchase = stateB.salesClass === 3;
+        document.getElementById('pd-th-warn-gmroi-row').style.display = isPurchase ? '' : 'none';
+        document.getElementById('pd-th-retire-gmroi-row').style.display = isPurchase ? '' : 'none';
+        document.getElementById('pd-th-retire-turnover-row').style.display = isPurchase ? '' : 'none';
+        if (isPurchase) {
+          document.getElementById('pd-th-warn-gmroi').value = ret.warn_gmroi_lt ?? '';
+          document.getElementById('pd-th-retire-gmroi').value = ret.retire_gmroi_lt ?? '';
+          document.getElementById('pd-th-retire-turnover').value = ret.retire_turnover_gt ?? '';
+        }
+      }
+      const cls = stateB.thresholds.classification || {};
+      if (cls.good_stock) {
+        document.getElementById('pd-th-good-gmroi').value = cls.good_stock.gmroi_gt ?? '';
+        document.getElementById('pd-th-good-turn-min').value = cls.good_stock.turnover_min ?? '';
+        document.getElementById('pd-th-good-turn-max').value = cls.good_stock.turnover_max ?? '';
+      }
+      if (cls.observe) {
+        document.getElementById('pd-th-obs-min').value = cls.observe.gmroi_min ?? '';
+        document.getElementById('pd-th-obs-max').value = cls.observe.gmroi_max ?? '';
+      }
+      if (cls.price_down) {
+        document.getElementById('pd-th-pd-turn').value = cls.price_down.turnover_gt ?? '';
+        document.getElementById('pd-th-pd-margin').value = cls.price_down.margin_rate_gt ?? '';
+      }
+      if (cls.bundle_candidate) {
+        document.getElementById('pd-th-bundle-turn').value = cls.bundle_candidate.turnover_gt ?? '';
+      }
+      document.getElementById('pd-th-disposal-rate').value = ratioToPercent(stateB.thresholds.disposal_rate_default ?? PD_DEFAULT_DISPOSAL_RATE);
+    }
+
+    async function saveThresholds() {
+      if (stateB.savingThresholds) return;
+      stateB.savingThresholds = true;
+      document.getElementById('pd-btn-save-thresholds').disabled = true;
+      document.getElementById('pd-threshold-error').textContent = '';
+      try {
+        const retirement = JSON.parse(JSON.stringify(stateB.thresholds.retirement || {}));
+        const ret = retirement[String(stateB.salesClass)] || {};
+        ret.warn_days_no_sales = Number(document.getElementById('pd-th-warn-days').value);
+        ret.retire_days_no_sales = Number(document.getElementById('pd-th-retire-days').value);
+        if (stateB.salesClass === 3) {
+          ret.warn_gmroi_lt = Number(document.getElementById('pd-th-warn-gmroi').value);
+          ret.retire_gmroi_lt = Number(document.getElementById('pd-th-retire-gmroi').value);
+          ret.retire_turnover_gt = Number(document.getElementById('pd-th-retire-turnover').value);
+        }
+        retirement[String(stateB.salesClass)] = ret;
+        const classification = {
+          good_stock: {
+            gmroi_gt: Number(document.getElementById('pd-th-good-gmroi').value),
+            turnover_min: Number(document.getElementById('pd-th-good-turn-min').value),
+            turnover_max: Number(document.getElementById('pd-th-good-turn-max').value),
+          },
+          observe: {
+            gmroi_min: Number(document.getElementById('pd-th-obs-min').value),
+            gmroi_max: Number(document.getElementById('pd-th-obs-max').value),
+          },
+          price_down: {
+            turnover_gt: Number(document.getElementById('pd-th-pd-turn').value),
+            margin_rate_gt: Number(document.getElementById('pd-th-pd-margin').value),
+          },
+          bundle_candidate: {
+            turnover_gt: Number(document.getElementById('pd-th-bundle-turn').value),
+          },
+        };
+        const disposal_rate_default = percentToRatio(document.getElementById('pd-th-disposal-rate').value);
+
+        await fetchJson('/apps/profit-analysis/api/inventory/thresholds', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ retirement, classification, disposal_rate_default }),
+        });
+
+        // Codex R1 Medium: 保存後は再 GET してサーバー値を state に反映 + candidates 再取得
+        stateB.thresholds = await fetchJson('/apps/profit-analysis/api/inventory/thresholds');
+        stateB.disposalRate = Number(stateB.thresholds.disposal_rate_default ?? PD_DEFAULT_DISPOSAL_RATE);
+        document.getElementById('pd-inv-disposal-rate').value = ratioToPercent(stateB.disposalRate);
+        populateThresholdInputs();
+        await refreshCandidates();
+        toggleThresholdPanel();
+      } catch (e) {
+        document.getElementById('pd-threshold-error').textContent = e.message;
+      } finally {
+        stateB.savingThresholds = false;
+        document.getElementById('pd-btn-save-thresholds').disabled = false;
+      }
+    }
+
+    async function refreshCandidates() {
+      clearTabBError();
+      const periodDays = Number(document.getElementById('pd-inv-period-days').value) || 30;
+      stateB.periodDays = periodDays;
+      document.getElementById('pd-inv-table-container').innerHTML = '<div class="loading">候補取得中...</div>';
+      try {
+        // Codex PR3 実装 R1 Medium 2 反映: 閾値も毎回再同期して stale を防ぐ
+        // Codex PR3 実装 R2 Low 3 反映: thresholds 失敗は best-effort で警告のみ、候補表示は継続
+        const data = await fetchJson(`/apps/profit-analysis/api/inventory/candidates?sales_class=${stateB.salesClass}&period_days=${periodDays}`);
+        stateB.candidates = Array.isArray(data.candidates) ? data.candidates : [];
+        stateB.meta = data.meta || null;
+        // Codex PR3 R3 Low-Medium 反映: /candidates レスポンスの thresholds は
+        //   「実際に分類に適用された」ものなので、saveStatus の snapshot 用に常に最新保持する
+        // Codex R4 Low 反映: /candidates 成功でも thresholds 欠如時は null に戻す
+        //   （他 salesClass の古い値を snapshot に混入させない防御）
+        stateB.appliedThresholds = data.thresholds ? data.thresholds : null;
+        try {
+          stateB.thresholds = await fetchJson('/apps/profit-analysis/api/inventory/thresholds');
+        } catch (tErr) {
+          // thresholds 取得失敗時は既存 state を保持。画面には警告のみ
+          console.warn('[inventory-decision] thresholds 再取得失敗（既存値を継続利用）:', tErr.message);
+          showTabBError(`閾値の再取得に失敗しました（候補は最新、閾値パネルは前回値、保存時の snapshot は候補適用値を使用）: ${tErr.message}`);
+        }
+        updateSegmentCounts();
+        renderDataPeriodNote();
+        renderImpactCards();
+        renderInventorySubtabs();
+        renderInventoryTable();
+        document.getElementById('pd-btn-export-inv').disabled = stateB.candidates.length === 0;
+      } catch (e) {
+        showTabBError(`候補取得エラー: ${e.message}`);
+        document.getElementById('pd-inv-table-container').innerHTML = '';
+        document.getElementById('pd-btn-export-inv').disabled = true;
+      }
+    }
+
+    function updateSegmentCounts() {
+      const el1 = document.getElementById('pd-seg-count-1');
+      const el2 = document.getElementById('pd-seg-count-2');
+      const el3 = document.getElementById('pd-seg-count-3');
+      const total = stateB.candidates.length;
+      const currentLabel = stateB.salesClass === 1 ? el1 : stateB.salesClass === 2 ? el2 : el3;
+      if (currentLabel) currentLabel.textContent = ` (${total})`;
+      [el1, el2, el3].forEach(el => { if (el && el !== currentLabel) el.textContent = ''; });
+    }
+
+    function renderDataPeriodNote() {
+      const note = document.getElementById('pd-inv-data-period-note');
+      const periodDays = stateB.periodDays;
+      const snapshotMonths = stateB.candidates.reduce((m, c) => Math.max(m, Number(c?.metrics?.stock_snapshot_months) || 0), 0);
+      const warn = snapshotMonths < 6 ? `（在庫スナップショット ${snapshotMonths}/6ヶ月、不足）` : '';
+      note.textContent = `判定期間 ${periodDays}日 ${warn}`;
+    }
+
+    function onDisposalRateChange() {
+      try {
+        const input = document.getElementById('pd-inv-disposal-rate').value;
+        stateB.disposalRate = percentToRatio(input);
+        renderImpactCards();
+      } catch (e) {
+        showTabBError(e.message);
+        document.getElementById('pd-inv-disposal-rate').value = ratioToPercent(stateB.disposalRate);
+      }
+    }
+
+    function renderImpactCards() {
+      const el = document.getElementById('pd-impact-cards');
+      if (!el) return;
+      const subtab = stateB.subtab;
+      const subset = stateB.candidates.filter(c => c.classification === subtab);
+      // 評価損見込み = avg_stock_value × disposal_rate (PR3 §6-A、二重計上しない)
+      const totalImpact = subset.reduce((s, c) => s + (Number(c?.metrics?.avg_stock_value) || 0) * stateB.disposalRate, 0);
+      const totalLostProfit = subset.reduce((s, c) => s + (Number(c?.metrics?.period_profit) || 0), 0);
+      const annualLost = stateB.periodDays > 0 ? totalLostProfit * (365 / stateB.periodDays) : 0;
+      const totalStockValue = subset.reduce((s, c) => s + (Number(c?.metrics?.avg_stock_value) || 0), 0);
+      el.innerHTML = `
+        <div class="card"><div class="label">対象商品数</div><div class="value">${formatNumber(subset.length)}</div><div class="sub">${escapeHtml(subtab)}</div></div>
+        <div class="card"><div class="label">在庫金額合計（平均）</div><div class="value">${formatCurrency(totalStockValue)}</div><div class="sub">avg_stock × 原価</div></div>
+        <div class="card ${totalImpact > 0 ? 'danger' : ''}"><div class="label">評価損見込み</div><div class="value">${formatCurrency(totalImpact)}</div><div class="sub">処分率 ${ratioToPercent(stateB.disposalRate)}% 適用</div></div>
+        <div class="card"><div class="label">年間粗利逸失見込み</div><div class="value">${formatCurrency(annualLost)}</div><div class="sub">期間粗利 × (365/${stateB.periodDays})</div></div>
+      `;
+    }
+
+    function renderInventorySubtabs() {
+      const summary = (stateB.meta && stateB.meta.summary) || {};
+      const container = document.getElementById('pd-inv-subtabs');
+      let html = '';
+      for (const st of PD_INV_SUBTABS) {
+        const count = summary[st.key] || 0;
+        const active = stateB.subtab === st.key ? 'active' : '';
+        html += `<button class="sub-tab ${active}" data-pd-inv-subtab="${escapeHtml(st.key)}">${escapeHtml(st.label)}<span class="count">${formatNumber(count)}</span></button>`;
+      }
+      container.innerHTML = html;
+      // Codex PR3 R1 High 3 反映: inline onclick を廃し event delegation
+      container.querySelectorAll('[data-pd-inv-subtab]').forEach(btn => {
+        btn.addEventListener('click', () => switchInventorySubtab(btn.dataset.pdInvSubtab));
+      });
+    }
+
+    function switchInventorySubtab(key) {
+      stateB.subtab = key;
+      document.querySelectorAll('#pd-tab-b #pd-inv-subtabs .sub-tab').forEach(t => t.classList.toggle('active', t.dataset.pdInvSubtab === key));
+      renderImpactCards();
+      renderInventoryTable();
+    }
+
+    function getByPath(obj, path) {
+      if (!obj || !path) return undefined;
+      return path.split('.').reduce((acc, k) => (acc == null ? acc : acc[k]), obj);
+    }
+
+    function renderInventoryTable() {
+      const container = document.getElementById('pd-inv-table-container');
+      const subset = stateB.candidates.filter(c => c.classification === stateB.subtab);
+      if (subset.length === 0) {
+        container.innerHTML = '<div class="empty">該当なし</div>';
+        return;
+      }
+      subset.sort((a, b) => {
+        let va = getByPath(a, stateB.sortCol);
+        let vb = getByPath(b, stateB.sortCol);
+        if (va === null || va === undefined) return 1;
+        if (vb === null || vb === undefined) return -1;
+        if (typeof va === 'string') { va = va.toLowerCase(); vb = String(vb).toLowerCase(); }
+        if (va < vb) return stateB.sortAsc ? -1 : 1;
+        if (va > vb) return stateB.sortAsc ? 1 : -1;
+        return 0;
+      });
+
+      const cols = [
+        { key: 'ne_product_code', label: 'NE品番' },
+        { key: 'product_name', label: '商品名' },
+        { key: 'supplier_code', label: '仕入先' },
+        { key: 'metrics.latest_stock', label: '現在庫' },
+        { key: 'sales.sales_period', label: `販売(${stateB.periodDays}日)` },
+        { key: 'sales.sales_30d', label: '販売(30日)' },
+        { key: 'sales.sales_90d', label: '販売(90日)' },
+        { key: 'metrics.gmroi', label: 'GMROI%' },
+        { key: 'metrics.turnover_days', label: '回転日数' },
+        { key: 'metrics.rakuten_unit_profit', label: '利益単価' },
+        { key: 'metrics.days_since_sale', label: '最終販売経過' },
+        { key: 'reason', label: '理由/フラグ' },
+        { key: 'action', label: '操作', sortable: false },
+      ];
+
+      let html = '<div class="table-wrap"><table class="data-table"><thead><tr>';
+      for (const c of cols) {
+        if (c.sortable === false) {
+          html += `<th>${escapeHtml(c.label)}</th>`;
+        } else {
+          const arrow = stateB.sortCol === c.key ? (stateB.sortAsc ? ' ▲' : ' ▼') : '';
+          html += `<th data-pd-sort="${escapeHtml(c.key)}">${escapeHtml(c.label)}${arrow}</th>`;
+        }
+      }
+      html += '</tr></thead><tbody>';
+
+      for (const c of subset) {
+        const m = c.metrics || {};
+        const s = c.sales || {};
+        const f = c.flags || {};
+        const st = c.retirement_status;
+        const chips = [];
+        if (c.early_warning && c.early_warning.type) {
+          const ewLabel = {
+            drop: '⚠ 急落', insufficient: '判定不足', indeterminate: '判定不能', skip: 'EW対象外',
+          }[c.early_warning.type];
+          if (ewLabel) chips.push(`<span class="pd-flag-chip pd-chip-ew-${escapeHtml(c.early_warning.type)}" title="${escapeHtml(c.early_warning.reason || '')}">${escapeHtml(ewLabel)}</span>`);
+        }
+        if (f.stock_data_insufficient) chips.push('<span class="pd-flag-chip pd-chip-data-insufficient" title="在庫スナップショット月数不足">📉 在庫データ不足</span>');
+        if (f.seasonality_off_season) chips.push('<span class="pd-flag-chip pd-chip-seasonality" title="季節性オフシーズン">❄ 季節性</span>');
+        if (f.new_product) chips.push('<span class="pd-flag-chip pd-chip-new-product" title="新商品（12ヶ月未満）">🆕 新商品</span>');
+        if (st && st.status) chips.push(`<span class="pd-flag-chip pd-chip-status" title="${escapeHtml(st.next_review_date || '')}">📋 ${escapeHtml(st.status)}</span>`);
+
+        const rowHi = PD_INV_SUBTABS.find(t => t.key === c.classification)?.highlight || '';
+        html += `<tr class="${rowHi}">`;
+        html += `<td>${escapeHtml(c.ne_product_code || '')}</td>`;
+        html += `<td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;" title="${escapeHtml(c.product_name || '')}">${escapeHtml(c.product_name || '-')}</td>`;
+        html += `<td>${escapeHtml(c.supplier_code || '-')}</td>`;
+        html += `<td>${formatNumber(m.latest_stock)}</td>`;
+        html += `<td>${formatNumber(s.sales_period)}</td>`;
+        html += `<td>${formatNumber(s.sales_30d)}</td>`;
+        html += `<td>${formatNumber(s.sales_90d)}</td>`;
+        html += `<td>${m.gmroi == null ? '-' : formatNumber(Math.round(m.gmroi)) + '%'}</td>`;
+        html += `<td>${m.turnover_days == null ? '-' : formatNumber(m.turnover_days)}</td>`;
+        html += `<td>${formatCurrency(m.rakuten_unit_profit)}</td>`;
+        html += `<td>${m.days_since_sale == null ? '-' : formatNumber(m.days_since_sale)}</td>`;
+        html += `<td style="white-space:normal;max-width:220px;">${escapeHtml(c.reason || '')} ${chips.join(' ')}</td>`;
+        // Codex PR3 R1 High 3 反映: inline onclick を廃し data-attribute + event delegation に
+        html += `<td><button class="btn btn-secondary" style="font-size:11px;padding:3px 8px;" data-pd-open-status="${escapeHtml(c.ne_product_code || '')}">判断付与</button></td>`;
+        html += '</tr>';
+      }
+      html += '</tbody></table></div>';
+      html += `<div style="font-size:11px;color:#9ca3af;margin-top:4px;">${subset.length}件表示 / 全体 ${stateB.candidates.length}件</div>`;
+      if (stateB.subtab === '分類外' && stateB.meta && stateB.meta.reason_summary) {
+        const keys = Object.keys(stateB.meta.reason_summary).filter(k => k.startsWith('分類外: '));
+        if (keys.length > 0) {
+          html += '<div style="font-size:11px;color:#6b7280;margin-top:4px;">理由別内訳: ';
+          html += keys.map(k => `${escapeHtml(k.replace('分類外: ', ''))}: ${stateB.meta.reason_summary[k]}件`).join(' / ');
+          html += '</div>';
+        }
+      }
+      container.innerHTML = html;
+      // event delegation: data-pd-sort / data-pd-open-status
+      container.querySelectorAll('th[data-pd-sort]').forEach(th => {
+        th.addEventListener('click', () => doInvSort(th.dataset.pdSort));
+      });
+      container.querySelectorAll('button[data-pd-open-status]').forEach(btn => {
+        btn.addEventListener('click', () => openStatusModal(btn.dataset.pdOpenStatus));
+      });
+    }
+
+    function doInvSort(col) {
+      if (stateB.sortCol === col) { stateB.sortAsc = !stateB.sortAsc; }
+      else { stateB.sortCol = col; stateB.sortAsc = col === 'metrics.gmroi' ? true : false; }
+      renderInventoryTable();
+    }
+
+    // ─── ステータス付与モーダル ───
+
+    async function openStatusModal(code) {
+      if (!code) return;
+      stateB.activeRowCode = code;
+      const candidate = stateB.candidates.find(c => c.ne_product_code === code);
+      if (!candidate) { showTabBError(`商品 ${code} が候補リストにありません`); return; }
+
+      // Codex R1 Medium 2 反映: モーダル開く時にも最新 thresholds を同期
+      try {
+        stateB.thresholds = await fetchJson('/apps/profit-analysis/api/inventory/thresholds');
+      } catch {}
+
+      document.getElementById('pd-status-modal-product').textContent = `${code} / ${candidate.product_name || ''}`;
+      document.getElementById('pd-status-modal-current').textContent = candidate.retirement_status?.status || '未設定';
+      document.getElementById('pd-status-reason').value = candidate.retirement_status?.reason || '';
+      document.getElementById('pd-status-next-review').value = candidate.retirement_status?.next_review_date || '';
+      document.getElementById('pd-plan-target-month').value = '';
+      document.getElementById('pd-plan-monthly-target').value = '';
+      document.getElementById('pd-status-disposal-rate').value = ratioToPercent(candidate.retirement_status?.disposal_rate || stateB.disposalRate);
+      document.getElementById('pd-status-error').textContent = '';
+
+      if (candidate.retirement_status && candidate.retirement_status.status) {
+        try {
+          const latest = await fetchJson(`/apps/profit-analysis/api/inventory/status/${encodeURIComponent(code)}`);
+          if (latest && latest.disposal_rate != null) {
+            document.getElementById('pd-status-disposal-rate').value = ratioToPercent(latest.disposal_rate);
+          }
+        } catch {}
+      }
+
+      const group = document.getElementById('pd-status-radio-group');
+      const options = [...PD_STATUS_COMMON];
+      if (stateB.salesClass === 1) options.push(...PD_STATUS_SELF);
+      group.innerHTML = options.map(st => {
+        const checked = (candidate.retirement_status?.status === st) ? 'checked' : '';
+        return `<label><input type="radio" name="pd-status-radio" value="${escapeHtml(st)}" ${checked}>${escapeHtml(st)}</label>`;
+      }).join('');
+      group.querySelectorAll('input[type=radio]').forEach(r => r.addEventListener('change', onStatusChange));
+      onStatusChange();
+
+      document.getElementById('pd-status-modal').classList.add('open');
+    }
+
+    function onStatusChange() {
+      const sel = document.querySelector('#pd-status-radio-group input[type=radio]:checked');
+      const val = sel ? sel.value : '';
+      document.getElementById('pd-review-required-mark').textContent = PD_REVIEW_REQUIRED.has(val) ? '（必須）' : '';
+      document.getElementById('pd-reason-required-mark').textContent = PD_REASON_REQUIRED.has(val) ? '（必須）' : '';
+      document.getElementById('pd-plan-details-section').style.display = (val === '消化計画中') ? '' : 'none';
+    }
+
+    function closeStatusModal() {
+      document.getElementById('pd-status-modal').classList.remove('open');
+      stateB.activeRowCode = null;
+    }
+    function onStatusModalBackdrop(ev) {
+      if (ev.target.id === 'pd-status-modal') closeStatusModal();
+    }
+
+    async function saveStatus() {
+      if (stateB.savingStatus) return;
+      stateB.savingStatus = true;
+      document.getElementById('pd-btn-status-save').disabled = true;
+      document.getElementById('pd-btn-status-cancel').disabled = true;
+      document.getElementById('pd-status-error').textContent = '';
+      try {
+        const sel = document.querySelector('#pd-status-radio-group input[type=radio]:checked');
+        if (!sel) throw new Error('ステータスを選択してください');
+        const status = sel.value;
+        const reason = document.getElementById('pd-status-reason').value.trim();
+        const next_review_date = document.getElementById('pd-status-next-review').value || null;
+        const disposal_rate = percentToRatio(document.getElementById('pd-status-disposal-rate').value);
+
+        if (PD_REASON_REQUIRED.has(status) && !reason) throw new Error(`${status} は判断根拠 (reason) 必須です`);
+        if (PD_REVIEW_REQUIRED.has(status) && !next_review_date) throw new Error(`${status} は次回レビュー日必須です`);
+        // Codex PR3 R1 Medium 1 + R2 Low-Medium 2 反映: 形式 + 実在日
+        if (next_review_date && !pdIsValidRealDate(next_review_date)) {
+          throw new Error('次回レビュー日は YYYY-MM-DD 形式の実在日');
+        }
+
+        let plan_details;
+        if (status === '消化計画中') {
+          const target_month = document.getElementById('pd-plan-target-month').value.trim();
+          const monthly_sales_target = Number(document.getElementById('pd-plan-monthly-target').value);
+          if (!PD_RE_YYYY_MM.test(target_month)) throw new Error('完売予測月は YYYY-MM 形式（01〜12）');
+          if (!Number.isInteger(monthly_sales_target) || monthly_sales_target <= 0) {
+            throw new Error('月次販売目標は正の整数');
+          }
+          plan_details = { target_month, monthly_sales_target };
+        }
+
+        const c = stateB.candidates.find(x => x.ne_product_code === stateB.activeRowCode);
+        const decision_metrics = c ? {
+          sales_class: c.sales_class,
+          classification: c.classification,
+          gmroi: c.metrics?.gmroi,
+          turnover_days: c.metrics?.turnover_days,
+          latest_stock: c.metrics?.latest_stock,
+          avg_stock: c.metrics?.avg_stock,
+          rakuten_unit_profit: c.metrics?.rakuten_unit_profit,
+          period_days: stateB.periodDays,
+          stock_snapshot_months: c.metrics?.stock_snapshot_months,
+          disposal_rate,
+          early_warning: c.early_warning,
+          stock_data_insufficient: !!(c.flags && c.flags.stock_data_insufficient),
+        } : {};
+        // Codex PR3 R3 Low-Medium 反映: snapshot は /candidates が実際に使った閾値を優先
+        //   （/thresholds 再取得失敗で stateB.thresholds が stale の時、audit で新分類/古閾値の乖離を防ぐ）
+        //   /candidates の thresholds は現在の salesClass に適用された値のみ（retirement は該当クラスのみ）
+        const applied = stateB.appliedThresholds || {};
+        const thresholds = {
+          retirement: applied.retirement || (stateB.thresholds?.retirement?.[String(stateB.salesClass)]) || null,
+          classification: applied.classification || stateB.thresholds?.classification || null,
+          early_warning: applied.early_warning || stateB.thresholds?.early_warning || null,
+        };
+
+        const body = {
+          ne_product_code: stateB.activeRowCode,
+          status,
+          reason: reason || undefined,
+          next_review_date: next_review_date || undefined,
+          disposal_rate,
+          plan_details,
+          thresholds,
+          decision_metrics,
+        };
+        await fetchJson('/apps/profit-analysis/api/inventory/status', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        closeStatusModal();
+        await refreshCandidates();
+      } catch (e) {
+        document.getElementById('pd-status-error').textContent = e.message;
+      } finally {
+        stateB.savingStatus = false;
+        document.getElementById('pd-btn-status-save').disabled = false;
+        document.getElementById('pd-btn-status-cancel').disabled = false;
+      }
+    }
+
+    function exportInventoryCSV() {
+      const subset = stateB.candidates.filter(c => c.classification === stateB.subtab);
+      if (!subset.length) return alert('データがありません');
+      const headers = ['NE品番','商品名','仕入先','現在庫','販売_期間','販売_30日','販売_90日','GMROI%','回転日数','利益単価','最終販売経過','分類','理由','早期警戒','在庫データ不足','季節性','新商品','現ステータス'];
+      const rows = subset.map(c => {
+        const m = c.metrics || {}; const s = c.sales || {}; const f = c.flags || {};
+        return [
+          c.ne_product_code, c.product_name, c.supplier_code, m.latest_stock, s.sales_period, s.sales_30d, s.sales_90d,
+          m.gmroi == null ? '' : Math.round(m.gmroi), m.turnover_days, m.rakuten_unit_profit, m.days_since_sale,
+          c.classification, c.reason,
+          c.early_warning?.type || '', f.stock_data_insufficient ? '1' : '', f.seasonality_off_season ? '1' : '', f.new_product ? '1' : '',
+          c.retirement_status?.status || '',
+        ];
+      });
+      const esc = v => { const s = String(v ?? ''); return s.includes(',') || s.includes('"') || s.includes('\n') ? '"' + s.replace(/"/g, '""') + '"' : s; };
+      const csv = '\uFEFF' + [headers.join(','), ...rows.map(r => r.map(esc).join(','))].join('\r\n');
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      const salesClassSlug = { 1: '自社商品', 2: '取扱限定', 3: '仕入商品' }[stateB.salesClass] || 'unknown';
+      a.download = `商品収益性ダッシュボード_${salesClassSlug}_${stateB.subtab}_${stateB.periodDays}日_${localDateString()}.csv`;
+      a.click();
+    }
+
+    document.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape') {
+        const modal = document.getElementById('pd-status-modal');
+        if (modal && modal.classList.contains('open')) closeStatusModal();
+      }
+    });
+  </script>
+<% } %>
+
 </body>
 </html>
