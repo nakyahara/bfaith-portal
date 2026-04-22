@@ -1389,22 +1389,10 @@ console.log('\n=== Test 19: feature flag ON で タブB DOM が出る ===');
   console.log('[OK] feature flag ON で タブB の全主要要素が HTML に含まれる（inline onclick XSS 対策済み）');
 }
 
-// Test 19-B: server.js のポータルカード description が Dark Launch 漏れていない
-console.log('\n=== Test 19-B: server.js description の Dark Launch 漏れチェック ===');
-{
-  const serverSrc = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
-  // 'profit-analysis' カードの description を抜き出す
-  const m = serverSrc.match(/id:\s*'profit-analysis'[\s\S]*?description:\s*'([^']*)'/);
-  if (!m) throw new Error('19-B profit-analysis description 検出失敗');
-  const desc = m[1];
-  const forbiddenInDesc = ['在庫整理', '撤退判断', '撤退検討', '売上分類', '消化計画'];
-  for (const s of forbiddenInDesc) {
-    if (desc.includes(s)) {
-      throw new Error(`[FAIL] 19-B description にタブB 機能を示唆: "${s}" (desc=${desc})`);
-    }
-  }
-  console.log(`[OK] 19-B ポータルカード description から未公開機能を示唆する語が全て不在`);
-}
+// Test 19-B: PR4 で撤去（Dark Launch 解除、description にタブB 機能名を含めてよくなった）
+//   オリジナルは「description に タブB 機能語が含まれないこと」を検証していたが、
+//   PR4 で description を '商品別粗利分析 + 在庫整理・撤退判断支援' に更新したため役目終了。
+//   Dark Launch 段階での漏れ検知は git 履歴 (PR3 コミット) に残っている。
 
 // Test 20: XSS エスケープ（escapeHtml ヘルパーの回帰防止、EJS の <%= %> 自動エスケープ、注入確認）
 console.log('\n=== Test 20: XSS エスケープ ===');
