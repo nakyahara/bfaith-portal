@@ -31,6 +31,7 @@ import profitAnalysisRouter from './apps/profit-analysis/router.js';
 import mgmtAccountingRouter from './apps/mgmt-accounting/router.js';
 import serviceRouter from './apps/warehouse/service-router.js';
 import { serviceAuth } from './apps/warehouse/service-auth.js';
+import { isWarehouseDbReady } from './apps/warehouse/router.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -96,6 +97,33 @@ if (!users) {
 app.set('trust proxy', 1); // Cloudflare Tunnel経由
 app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
+
+// --- Liveness / Readiness probes (loopback only) ---
+// C:\tools\watchdog\watchdog.ps1 が 30秒毎に http://127.0.0.1:3000/{livez,readyz} を叩く。
+// loopback 限定なので外部からは 404 を返す (情報漏えい / 偵察対策)。
+//
+// trust proxy が有効なので req.ip は X-Forwarded-For を信頼する。実IPは
+// req.socket.remoteAddress を直接見る必要がある。Cloudflare Tunnel経由でも
+// この値は CF のIPであって 127.0.0.1 にはならない。
+function loopbackOnly(req, res, next) {
+  const sock = req.socket?.remoteAddress || '';
+  if (sock === '127.0.0.1' || sock === '::1' || sock === '::ffff:127.0.0.1') return next();
+  return res.status(404).end();
+}
+app.get('/livez', loopbackOnly, (req, res) => {
+  // Express が応答できる = プロセス生存 + event loop 健全。それ以上は判定しない。
+  res.status(200).json({ status: 'alive', pid: process.pid });
+});
+app.get('/readyz', loopbackOnly, (req, res) => {
+  // 「再起動で改善しうる必須初期化」だけを見る。
+  // - warehouse.db: 主要データソース、未init は 503 → watchdog が再起動を打ってよい
+  // - AES-Python など「再起動で直らない」系は readyz には入れない (無意味な再起動ループ防止)
+  if (!isWarehouseDbReady()) {
+    return res.status(503).json({ status: 'not_ready', reason: 'warehouse-db' });
+  }
+  res.status(200).json({ status: 'ready', pid: process.pid });
+});
+
 app.use(express.urlencoded({ extended: true }));
 // グローバル JSON parser (10MB)。ただし大容量受信が必要な endpoint は除外。
 // 除外対象 endpoint は route 側で独自の parser (例: 50MB) を定義する。
@@ -518,7 +546,7 @@ app.use('/apps/mirror', mirrorAccessLog);
 // /api/sync* のみ API キー認証 + 8MB parser + error handler を適用。
 app.use('/apps/mirror/api/sync', requireSyncKeyStrict);
 app.use('/apps/mirror/api/sync', express.json({
-  limit: '8mb',
+  limit: '12mb',                                      // ミニPC sync-to-render.js の 9MB chunk を確実に受ける余裕値
   inflate: false,                                     // gzip は 415 で reject
   verify: (req, res, buf) => { req.rawBodyBytes = buf.length; },
 }));
@@ -531,7 +559,14 @@ app.use('/apps/mirror', mirrorRouter);
 // rankcheck の履歴込みインポートで 10MB を超える可能性があるため 50MB まで許容。
 // 未認可 DoS 回避のため、serviceAuth を body parser **より前** に置く。
 // そうしないと token 無しリクエストが最大 50MB を parse してから 401 になる。
-app.use('/service-api', serviceAuth, express.json({ limit: '50mb' }), serviceRouter);
+//
+// SERVICE_RAW_PATHS にリストした path は body parser を skip して req を
+// stream のまま route に渡す (大容量アップロード用)。
+const SERVICE_RAW_PATHS = ['/rankcheck/upload-legacy-json'];
+app.use('/service-api', serviceAuth, (req, res, next) => {
+  if (req.method === 'POST' && SERVICE_RAW_PATHS.includes(req.path)) return next();
+  return express.json({ limit: '50mb' })(req, res, next);
+}, serviceRouter);
 app.use('/apps/amazon-accounting', (req, res, next) => {
   if (req.path === '/import-history' && req.method === 'POST') return next();  // APIキー認証に委譲
   requireAuth(req, res, next);

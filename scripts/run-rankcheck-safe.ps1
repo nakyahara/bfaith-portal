@@ -1,25 +1,29 @@
 # run-rankcheck-safe.ps1
 #
-# 楽天順位チェッカー Runner (miniPC版) の Task Scheduler ラッパー。
-# 2026-04-17 safe-debug 思想に沿って、以下の安全装置を提供する:
-#   - 単一実行: 既に別インスタンスが動いていたら即失敗 (lockfile方式)
-#   - ログローテ: 日付ごとにファイル分割、終了コードと開始/終了時刻を記録
-#   - 低優先度: BelowNormal で warehouse / 他サービスに負ける
-#   - 終了通知: 失敗時は GChat webhook (任意)
+# Rakuten Ranking Checker Runner (miniPC) - Task Scheduler wrapper.
+# Following 2026-04-17 safe-debug philosophy:
+#   - Single instance: lockfile prevents concurrent runs
+#   - Log rotation: per-day file, exit code + start/end timestamps
+#   - Low priority: BelowNormal, yields to warehouse / other services
+#   - Exit notification: GChat webhook on failure (optional)
 #
-# 配置先 (想定): C:\tools\rankcheck-runner\run-rankcheck-safe.ps1
-#   - C:\tools\rankcheck-runner\bfaith-portal  : git clone
-#   - C:\tools\rankcheck-runner\data           : ranking-checker.db 置き場
-#   - C:\tools\rankcheck-runner\logs           : 実行ログ
-#   - C:\tools\rankcheck-runner\.env           : Runner用env (RAKUTEN_APP_ID 等)
+# NOTE: This file is intentionally ASCII-only.
+# Windows PowerShell 5.1 cannot parse multi-byte chars without BOM.
+# Adding Japanese strings here will break the script when invoked via Task Scheduler.
 #
-# Task Scheduler 登録例:
+# Install location: C:\tools\rankcheck-runner\run-rankcheck-safe.ps1
+#   - C:\Users\bfaith\bfaith-portal           : git clone (shared with WarehouseServer)
+#                                                or set RANKCHECK_REPO_DIR env to override
+#   - C:\tools\rankcheck-runner\data          : ranking-checker.db location
+#   - C:\tools\rankcheck-runner\logs          : execution logs
+#   - C:\tools\rankcheck-runner\.env          : runner env (RAKUTEN_APP_ID etc)
+#
+# Task Scheduler example:
 #   Program:   powershell.exe
 #   Arguments: -NoProfile -ExecutionPolicy Bypass -File "C:\tools\rankcheck-runner\run-rankcheck-safe.ps1"
 #   Trigger:   Daily 13:00 JST
-#   Settings: "Run whether user is logged on or not" + "Do not start a new instance"
 #
-# 手動テスト:
+# Manual test:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File .\run-rankcheck-safe.ps1 -Force
 
 param(
@@ -28,9 +32,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# --- パス構成 ---
+# --- Paths ---
 $root    = 'C:\tools\rankcheck-runner'
-$repo    = Join-Path $root 'bfaith-portal'
+$repo    = if ($env:RANKCHECK_REPO_DIR) { $env:RANKCHECK_REPO_DIR } else { 'C:\Users\bfaith\bfaith-portal' }
 $dataDir = Join-Path $root 'data'
 $logDir  = Join-Path $root 'logs'
 $lockFile = Join-Path $root 'runner.lock'
@@ -51,14 +55,14 @@ function Write-Log {
     Add-Content -Path $logFile -Value $line -Encoding utf8
 }
 
-# --- 単一実行ガード (lockfile) ---
+# --- Single-instance lock ---
 if (Test-Path $lockFile) {
     $existingPid = (Get-Content $lockFile -ErrorAction SilentlyContinue | Select-Object -First 1)
     if ($existingPid -and (Get-Process -Id $existingPid -ErrorAction SilentlyContinue)) {
-        Write-Log "[ERROR] 既に Runner が実行中 (PID $existingPid). 中断します."
+        Write-Log "[ERROR] Runner already running (PID $existingPid). Aborting."
         exit 73
     } else {
-        Write-Log "[WARN] 古い lockfile を検出。PID $existingPid は存在しないので削除します."
+        Write-Log "[WARN] stale lockfile detected. PID $existingPid not alive. Removing."
         Remove-Item $lockFile -Force
     }
 }
@@ -69,14 +73,14 @@ try {
     Write-Log "repo=$repo data=$dataDir log=$logFile"
 
     if (!(Test-Path $repo)) {
-        throw "リポジトリが見つかりません: $repo"
+        throw "repository not found: $repo"
     }
 
-    # --- 環境変数 ---
+    # --- Environment ---
     $env:DATA_DIR = $dataDir
-    $env:RANKCHECK_AUTO_ENABLED = 'false'   # node-cron 二重起動防止
+    $env:RANKCHECK_AUTO_ENABLED = 'false'   # prevent in-proc node-cron from also firing
     if (Test-Path $envFile) {
-        Write-Log ".env を読み込み中: $envFile"
+        Write-Log ".env loading: $envFile"
         Get-Content $envFile | Where-Object { $_ -and $_ -notmatch '^\s*#' } | ForEach-Object {
             $kv = $_ -split '=', 2
             if ($kv.Count -eq 2) {
@@ -86,27 +90,27 @@ try {
             }
         }
     } else {
-        Write-Log "[WARN] .env が見つかりません: $envFile"
+        Write-Log "[WARN] .env not found: $envFile"
     }
 
-    # --- Runner 起動 ---
+    # --- Launch runner ---
     $args = @('apps/ranking-checker-runner/runner.js')
     if ($Force) { $args += '--force' }
 
     Push-Location $repo
     try {
-        # -Wait すると PriorityClass の設定タイミングが遅すぎるので、
-        # 非Wait で起動 → PriorityClass 設定 → WaitForExit() の順。
+        # Order matters: Start-Process without -Wait, then set PriorityClass, then WaitForExit().
+        # If -Wait is used, PriorityClass setting comes after exit (no effect).
         $proc = Start-Process -FilePath 'node.exe' -ArgumentList $args `
             -PassThru -NoNewWindow `
             -RedirectStandardOutput (Join-Path $logDir "runner-$ts.stdout.log") `
             -RedirectStandardError  (Join-Path $logDir "runner-$ts.stderr.log")
-        try { $proc.PriorityClass = 'BelowNormal' } catch { Write-Log "[WARN] PriorityClass 設定失敗: $($_.Exception.Message)" }
+        try { $proc.PriorityClass = 'BelowNormal' } catch { Write-Log "[WARN] PriorityClass set failed: $($_.Exception.Message)" }
         $proc.WaitForExit()
         $exitCode = $proc.ExitCode
         Write-Log "[END] exit=$exitCode"
 
-        # stdout/stderr を日次ログにマージして小さいファイルを削除
+        # Merge stdout/stderr into the daily log, then remove the per-run files
         $stdoutFile = Join-Path $logDir "runner-$ts.stdout.log"
         $stderrFile = Join-Path $logDir "runner-$ts.stderr.log"
         foreach ($f in @($stdoutFile, $stderrFile)) {
@@ -117,16 +121,16 @@ try {
             }
         }
 
-        # --- 失敗通知 (任意) ---
+        # --- Failure notification (optional) ---
         if ($exitCode -ne 0 -and $env:GCHAT_WEBHOOK_URL) {
             $body = @{
-                text = "[rankcheck-runner] 異常終了 exit=$exitCode time=$ts host=$env:COMPUTERNAME"
+                text = "[rankcheck-runner] abnormal exit=$exitCode time=$ts host=$env:COMPUTERNAME"
             } | ConvertTo-Json -Compress
             try {
                 Invoke-RestMethod -Uri $env:GCHAT_WEBHOOK_URL -Method Post -Body $body -ContentType 'application/json' | Out-Null
-                Write-Log "GChat 通知送信完了"
+                Write-Log "GChat notification sent"
             } catch {
-                Write-Log "[WARN] GChat 通知失敗: $($_.Exception.Message)"
+                Write-Log "[WARN] GChat notification failed: $($_.Exception.Message)"
             }
         }
 
