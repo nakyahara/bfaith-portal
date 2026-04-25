@@ -518,7 +518,7 @@ app.use('/apps/mirror', mirrorAccessLog);
 // /api/sync* のみ API キー認証 + 8MB parser + error handler を適用。
 app.use('/apps/mirror/api/sync', requireSyncKeyStrict);
 app.use('/apps/mirror/api/sync', express.json({
-  limit: '8mb',
+  limit: '12mb',                                      // ミニPC sync-to-render.js の 9MB chunk を確実に受ける余裕値
   inflate: false,                                     // gzip は 415 で reject
   verify: (req, res, buf) => { req.rawBodyBytes = buf.length; },
 }));
@@ -531,7 +531,14 @@ app.use('/apps/mirror', mirrorRouter);
 // rankcheck の履歴込みインポートで 10MB を超える可能性があるため 50MB まで許容。
 // 未認可 DoS 回避のため、serviceAuth を body parser **より前** に置く。
 // そうしないと token 無しリクエストが最大 50MB を parse してから 401 になる。
-app.use('/service-api', serviceAuth, express.json({ limit: '50mb' }), serviceRouter);
+//
+// SERVICE_RAW_PATHS にリストした path は body parser を skip して req を
+// stream のまま route に渡す (大容量アップロード用)。
+const SERVICE_RAW_PATHS = ['/rankcheck/upload-legacy-json'];
+app.use('/service-api', serviceAuth, (req, res, next) => {
+  if (req.method === 'POST' && SERVICE_RAW_PATHS.includes(req.path)) return next();
+  return express.json({ limit: '50mb' })(req, res, next);
+}, serviceRouter);
 app.use('/apps/amazon-accounting', (req, res, next) => {
   if (req.path === '/import-history' && req.method === 'POST') return next();  // APIキー認証に委譲
   requireAuth(req, res, next);
