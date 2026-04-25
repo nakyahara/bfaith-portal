@@ -259,12 +259,14 @@ export async function checkInboundEligibility(items) {
 
 /**
  * ACTIVEな納品プランから、SKU別の準備中数量を集計
- * （7日以内に作成されたプランのみ対象）
+ * （3日以内に作成されたプランのみ対象 ※以前は7日）
+ * 期限管理商品もここで取得されるが、calculation-engine 側で「別期限を送るため除外」の例外処理あり
  * @returns {Object} { [msku]: quantity, ... }
  */
 export async function fetchActiveInboundQuantities() {
   const sp = getClient();
-  const sevenDaysAgo = new Date(Date.now() - 7 * 86400000);
+  // 3日以内に作成されたプランのみ対象 (変数名は互換性のため据え置き)
+  const sevenDaysAgo = new Date(Date.now() - 3 * 86400000);
 
   // 1. ACTIVEプラン一覧を取得
   const allPlans = [];
@@ -289,9 +291,9 @@ export async function fetchActiveInboundQuantities() {
 
   console.log(`[Inbound] ACTIVEプラン: ${allPlans.length}件`);
 
-  // 2. 7日以内のプランだけフィルタ
+  // 2. 3日以内のプランだけフィルタ
   const recentPlans = allPlans.filter(p => new Date(p.createdAt) >= sevenDaysAgo);
-  console.log(`[Inbound] 7日以内: ${recentPlans.length}件`);
+  console.log(`[Inbound] 3日以内: ${recentPlans.length}件`);
 
   // 3. 各プランのアイテムを取得してSKU別に集計
   const skuQtyMap = {};

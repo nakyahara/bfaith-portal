@@ -11,8 +11,13 @@
  */
 import { Router } from 'express';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
+import inventoryDecisionRouter from './inventory-decision.js';
 
 const router = Router();
+
+// タブB (在庫整理・撤退判断支援) API
+// feature flag INVENTORY_DECISION_ENABLED でのみ有効化。Dark Launch 段階では OFF 想定。
+router.use('/api/inventory', inventoryDecisionRouter);
 
 // ─── モール別手数料率（設計書確定値、CASE文ハードコード） ───
 const MALL_FEE_RATES = {
@@ -27,10 +32,14 @@ const MALL_FEE_RATES = {
 
 // ─── メイン画面 ───
 router.get('/', (req, res) => {
+  // Codex PR3 R1 High 1 反映: feature flag OFF 時は EJS レンダリング時点でタブBを出さない
+  const featureFlagRaw = process.env.INVENTORY_DECISION_ENABLED;
+  const featureFlagEnabled = featureFlagRaw === 'true' || featureFlagRaw === '1';
   res.render('profit-analysis', {
-    title: '粗利分析',
+    title: '商品収益性ダッシュボード',
     username: req.session?.email,
     displayName: req.session?.displayName,
+    featureFlagEnabled,
   });
 });
 
@@ -89,6 +98,14 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
     skuToNeMap.get(key).push({ ne_code: m.ne_code?.toLowerCase(), qty: m.数量 || 1 });
   }
 
+  // 4b. 楽天SKUマップ（rakuten_code → ne_code、AM/AL/W 3段階フォールバック済み）
+  const rakutenSkuMap = new Map();
+  try {
+    for (const m of db.prepare('SELECT rakuten_code, ne_code FROM mirror_rakuten_sku_map').all()) {
+      rakutenSkuMap.set(m.rakuten_code?.toLowerCase(), m.ne_code?.toLowerCase());
+    }
+  } catch { /* テーブル未作成の場合はスキップ */ }
+
   // 5. Amazon手数料キャッシュ
   let feeMap = new Map();
   try {
@@ -142,13 +159,21 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
       }
     } else {
       // 非Amazon: listingCode = NE商品コード（楽天/Yahoo/auPAY等）
-      const prod = productMap.get(listingCode);
+      let prod = productMap.get(listingCode);
+
+      // 楽天のフォールバック: 直接マッチしなければ rakuten_sku_map で解決
+      if (!prod && mallId === 'rakuten' && rakutenSkuMap.has(listingCode)) {
+        const resolvedNeCode = rakutenSkuMap.get(listingCode);
+        prod = productMap.get(resolvedNeCode);
+        if (prod) costSource = 'rakuten_sku_map';
+      }
+
       if (prod) {
         costExTax = (prod.原価 || 0) * qty;
         taxRate = 1 + (prod.消費税率 || 10) / 100;
         shipping = (prod.送料 || 0) * qty;
         productName = prod.商品名 || listingCode;
-        costSource = prod.原価ソース || 'NE';
+        if (costSource === '不明') costSource = prod.原価ソース || 'NE';
       }
     }
 

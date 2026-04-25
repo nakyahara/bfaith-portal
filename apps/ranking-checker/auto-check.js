@@ -1,12 +1,21 @@
 /**
- * 順位自動チェック（ポータル内蔵版）
- * auto_check.js の ESM + 環境変数対応版
- * scheduler.js から呼ばれる
+ * 順位自動チェック（SQLite版）
+ *
+ * Phase 1 変更点 (2026-04-21):
+ *   - ranking-checker.json の読み書きを全廃、ranking-checker.db に移行
+ *   - 商品 × 履歴を全件メモリ展開していた設計を、1商品ずつ SELECT / UPSERT へ
+ *   - run_state / run_log を追加、途中停止からの再開と事後調査が可能
+ *   - 圏外は null、API失敗は -1 (INTEGER)。文字列 'error' は廃止
+ *
+ * env:
+ *   RANKCHECK_DEBUG=true     詳細ログ復活
+ *   RANKCHECK_PROGRESS_EVERY 進捗 DB 書込間隔 (既定10商品)
  */
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
+import * as rdb from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -28,8 +37,13 @@ const RETRY_MAX = 5;
 const RETRY_DELAY = 3000;
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', '..', 'data');
-const DATA_FILE = path.join(DATA_DIR, 'ranking-checker.json');
 const LOG_FILE = path.join(DATA_DIR, 'ranking-checker.log');
+
+const DEBUG_LOG = process.env.RANKCHECK_DEBUG === 'true';
+const PROGRESS_EVERY = Math.max(1, parseInt(process.env.RANKCHECK_PROGRESS_EVERY || '10', 10));
+
+// 進捗トラッキング（メモリ上、UI用）
+const checkProgress = { running: false, total: 0, done: 0, current: '', startedAt: null, runId: null };
 
 // ── Utilities ──
 
@@ -37,22 +51,17 @@ function log(msg) {
   const ts = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
   const line = `[${ts}] ${msg}`;
   console.log('[RankCheck]', msg);
-  try { fs.appendFileSync(LOG_FILE, line + '\n', 'utf-8'); } catch {}
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.appendFileSync(LOG_FILE, line + '\n', 'utf-8');
+  } catch {}
 }
 
-function readJson(filepath, defaultValue) {
-  try { return JSON.parse(fs.readFileSync(filepath, 'utf-8')); } catch { return defaultValue; }
-}
-
-function writeJson(filepath, obj) {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(filepath, JSON.stringify(obj, null, 2), 'utf-8');
-}
+function debugLog(msg) { if (DEBUG_LOG) log(msg); }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function today() {
-  // JST (UTC+9)
   const d = new Date(Date.now() + 9 * 60 * 60 * 1000);
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
 }
@@ -72,18 +81,16 @@ function codeToRakutenUrl(code) { return `https://item.rakuten.co.jp/b-faith/${c
 function codeToYahooUrl(code) { return `https://store.shopping.yahoo.co.jp/b-faith01/${code.replace(/\/+$/, '')}.html`; }
 
 function codeFromRakutenUrl(url) {
-  const m = url.match(/item\.rakuten\.co\.jp\/b-faith\/([^/?#]+)/i);
+  const m = (url || '').match(/item\.rakuten\.co\.jp\/b-faith\/([^/?#]+)/i);
   return m ? m[1] : '';
 }
 
 function getRakutenUrl(product) {
   return product.own_url || (product.product_code ? codeToRakutenUrl(product.product_code) : '');
 }
-
 function getYahooUrl(product) {
   return product.yahoo_url || (product.product_code ? codeToYahooUrl(product.product_code) : '');
 }
-
 function getAmazonAsin(product) {
   if (product.amazon_asin) return product.amazon_asin;
   const url = product.amazon_url || '';
@@ -225,6 +232,9 @@ async function amazonApiSearch(keyword, itemPage, accessKey, secretKey, partnerT
 
 // ── Ranking check logic ──
 
+// 順位結果の表現: 数値(1..100) = 順位、null = 圏外/対象なし、-1 = APIエラー
+const RANK_ERROR = -1;
+
 async function checkRakuten(product, appId, accessKey) {
   const keyword = product.keyword;
   const ownUrl = getRakutenUrl(product);
@@ -235,9 +245,8 @@ async function checkRakuten(product, appId, accessKey) {
   if (comp1Url) targets.comp1 = comp1Url;
   if (comp2Url) targets.comp2 = comp2Url;
 
-  // デバッグ: 商品データと比較対象URLをログ出力
-  log(`  product_code="${product.product_code || ''}", own_url="${product.own_url || ''}"`);
-  log(`  target_own="${ownUrl ? normalizeUrl(ownUrl) : '(なし)'}"`);
+  debugLog(`  product_code="${product.product_code || ''}", own_url="${product.own_url || ''}"`);
+  debugLog(`  target_own="${ownUrl ? normalizeUrl(ownUrl) : '(なし)'}"`);
   if (!Object.keys(targets).length) {
     log(`  ⚠ 比較対象URLなし → 圏外になります`);
   }
@@ -255,7 +264,6 @@ async function checkRakuten(product, appId, accessKey) {
       data = await rakutenApiSearch(keyword, page, appId, accessKey);
     } catch (e) {
       log(`  楽天API失敗 page=${page}: ${e.message}`);
-      // page=1で失敗した場合、追加で待ってもう1回だけ試す
       if (page === 1 && e.message && e.message.includes('429')) {
         log(`  ⚠ page=1失敗のため5秒待って再試行...`);
         await sleep(5000);
@@ -263,20 +271,22 @@ async function checkRakuten(product, appId, accessKey) {
           data = await rakutenApiSearch(keyword, page, appId, accessKey);
         } catch (e2) {
           log(`  楽天API再試行も失敗: ${e2.message}`);
-          break;
+          return { own_rank: RANK_ERROR, competitor1_rank: comp1Url ? RANK_ERROR : null, competitor2_rank: comp2Url ? RANK_ERROR : null, review_count: null };
         }
       } else {
+        // page=2以降の失敗: これまで見つけたものだけ返す
         break;
       }
     }
     const items = data.Items || [];
     if (!items.length) break;
     if (page === 1) {
-      log(`  楽天API応答: count=${data.count || 0}, pages=${data.pageCount || 0}`);
-      // 最初の3件のURLをログ出力（デバッグ用）
-      for (let i = 0; i < Math.min(3, items.length); i++) {
-        const u = (items[i].Item || {}).itemUrl || '';
-        log(`  #${i + 1}: ${normalizeUrl(u)}`);
+      debugLog(`  楽天API応答: count=${data.count || 0}, pages=${data.pageCount || 0}`);
+      if (DEBUG_LOG) {
+        for (let i = 0; i < Math.min(3, items.length); i++) {
+          const u = (items[i].Item || {}).itemUrl || '';
+          debugLog(`  #${i + 1}: ${normalizeUrl(u)}`);
+        }
       }
     }
 
@@ -291,9 +301,7 @@ async function checkRakuten(product, appId, accessKey) {
         if (urlsMatch(targetUrl, itemUrl)) {
           found[key] = organicRank;
           log(`  ★ 楽天 ${key} 発見! rank=${organicRank}`);
-          if (key === 'own' && item.reviewCount != null) {
-            ownReviewCount = item.reviewCount;
-          }
+          if (key === 'own' && item.reviewCount != null) ownReviewCount = item.reviewCount;
         }
       }
       if (Object.keys(found).length === Object.keys(targets).length) break;
@@ -304,9 +312,9 @@ async function checkRakuten(product, appId, accessKey) {
 
   log(`  探索完了: ${organicRank}件チェック, 発見=${JSON.stringify(found)}`);
   return {
-    own_rank: found.own || null,
-    competitor1_rank: comp1Url ? (found.comp1 || null) : null,
-    competitor2_rank: comp2Url ? (found.comp2 || null) : null,
+    own_rank: found.own != null ? found.own : null,
+    competitor1_rank: comp1Url ? (found.comp1 != null ? found.comp1 : null) : null,
+    competitor2_rank: comp2Url ? (found.comp2 != null ? found.comp2 : null) : null,
     review_count: ownReviewCount,
   };
 }
@@ -320,7 +328,7 @@ async function checkYahoo(keyword, targetUrl, appId) {
       data = await yahooApiSearch(keyword, start, appId);
     } catch (e) {
       log(`  Yahoo API失敗 start=${start}: ${e.message}`);
-      break;
+      return RANK_ERROR;
     }
     const hits = data.hits || [];
     if (!hits.length) break;
@@ -346,7 +354,7 @@ async function checkAmazon(keyword, targetAsin, accessKey, secretKey, partnerTag
       data = await amazonApiSearch(keyword, page, accessKey, secretKey, partnerTag);
     } catch (e) {
       log(`  Amazon API失敗 page=${page}: ${e.message}`);
-      break;
+      return RANK_ERROR;
     }
     const searchResult = data.SearchResult || {};
     const items = searchResult.Items || [];
@@ -362,15 +370,13 @@ async function checkAmazon(keyword, targetAsin, accessKey, secretKey, partnerTag
   return null;
 }
 
-// ── Progress tracking ──
+// ── Progress ──
 
-const checkProgress = { running: false, total: 0, done: 0, current: '', startedAt: null };
-
-function getCheckProgress() {
+export function getCheckProgress() {
   return { ...checkProgress };
 }
 
-// ── Main export ──
+// ── Main ──
 
 export async function runAutoCheck({ force = false } = {}) {
   if (checkProgress.running) {
@@ -381,117 +387,157 @@ export async function runAutoCheck({ force = false } = {}) {
   log('='.repeat(50));
   log(`自動順位チェック開始${force ? '（強制再チェック）' : ''}`);
 
+  // クラッシュ後の stale running は env 検証より前に片付ける。
+  // env不備で return するたびに running が残ると、/run-status が永遠に嘘をつく。
+  const staleFixed = rdb.markStaleRunning();
+  if (staleFixed > 0) log(`stale running ${staleFixed} 件を failed に遷移`);
+
   const config = getConfig();
   const { applicationId: appId, accessKey, yahooAppId } = config;
-
   if (!appId || !accessKey) {
     log('エラー: RAKUTEN_APP_ID / RAKUTEN_ACCESS_KEY が未設定');
     return;
   }
-
   const { amazonAccessKey, amazonSecretKey, amazonAssociateTag: amazonPartnerTag } = config;
   log(yahooAppId ? 'Yahoo!: 有効' : 'Yahoo!: 未設定');
   log(amazonAccessKey ? 'Amazon: 有効' : 'Amazon: 未設定');
 
-  const data = readJson(DATA_FILE, { products: [] });
-  const products = data.products || [];
+  const todayStr = today();
+  const totalAll = rdb.countProducts();
 
-  if (!products.length) {
+  if (totalAll === 0) {
     log('登録商品がありません');
     return;
   }
 
-  // product_code 自動抽出
-  for (const p of products) {
-    if (!p.product_code && p.own_url) {
-      const code = codeFromRakutenUrl(p.own_url);
-      if (code) p.product_code = code;
-    }
-  }
+  // 対象IDを事前 materialize。配列長から totalTarget を決めつつ、
+  // 下流のループでもこの配列をそのまま使う（iteratorを長時間保持しない）。
+  const targetIds = force ? rdb.listAllIds() : rdb.listUncheckedIdsForDate(todayStr);
+  const totalTarget = targetIds.length;
 
-  const todayStr = today();
-  log(`対象: ${products.length} 件, 日付: ${todayStr}`);
+  log(`対象: ${totalAll} 件, 日付: ${todayStr}, 今回処理予定: ${totalTarget} 件`);
 
-  const unchecked = force ? products : products.filter(p => {
-    const h = p.history || [];
-    return !h.length || h[h.length - 1].date !== todayStr;
-  });
-
-  if (!unchecked.length) {
+  if (totalTarget === 0) {
     log('本日は全商品チェック済みです');
     return;
   }
 
-  log(`未チェック: ${unchecked.length} 件`);
+  const runId = rdb.startRun(totalTarget);
+  rdb.logRun(runId, 'info', `run開始 force=${force} target=${totalTarget}`);
 
-  // 進捗トラッキング開始
   checkProgress.running = true;
-  checkProgress.total = unchecked.length;
+  checkProgress.total = totalTarget;
   checkProgress.done = 0;
   checkProgress.current = '';
   checkProgress.startedAt = new Date().toISOString();
+  checkProgress.runId = runId;
 
-  let checked = 0;
+  let done = 0;
+  let finishStatus = 'completed';
+  let finishError = null;
 
   try {
-    for (let i = 0; i < unchecked.length; i += CONCURRENCY) {
-      const batch = unchecked.slice(i, i + CONCURRENCY);
-      await Promise.all(batch.map(async (product) => {
-        const idx = products.indexOf(product);
-        const label = `[${idx + 1}/${products.length}]`;
-        checkProgress.current = product.keyword;
-        log(`${label} "${product.keyword}"`);
-
-        // Rakuten
-        let result;
-        try {
-          result = await checkRakuten(product, appId, accessKey);
-          if (result.review_count != null) product.review_count = result.review_count;
-        } catch (e) {
-          log(`  ${label} 楽天エラー: ${e.message}`);
-          result = { own_rank: 'error', competitor1_rank: product.competitor1_url ? 'error' : null, competitor2_rank: product.competitor2_url ? 'error' : null };
+    // CONCURRENCY=1 前提の逐次処理。並列化するなら chunk で集めて Promise.all。
+    for (const productId of targetIds) {
+      const product = rdb.getProduct(productId);
+      if (!product) {
+        // 実行中に /data で削除されたケース。スキップして進める。
+        rdb.logRun(runId, 'warn', `product消失スキップ id=${productId}`);
+        done++;
+        checkProgress.done = done;
+        continue;
+      }
+      // product_code が空で own_url から取れるなら補完して DB にも反映
+      if (!product.product_code && product.own_url) {
+        const code = codeFromRakutenUrl(product.own_url);
+        if (code) {
+          product.product_code = code;
+          rdb.updateProductCode(product.id, code);
         }
+      }
 
-        // Yahoo（一時無効化: 楽天のみチェック）
-        let yahooRank = null;
-        const yahooUrl = getYahooUrl(product);
-        if (false && yahooUrl && yahooAppId) {
-          await sleep(API_DELAY);
-          try { yahooRank = await checkYahoo(product.keyword, yahooUrl, yahooAppId); }
-          catch (e) { yahooRank = 'error'; }
+      checkProgress.current = product.keyword;
+      log(`[${done + 1}/${totalTarget}] "${product.keyword}"`);
+
+      let result;
+      try {
+        result = await checkRakuten(product, appId, accessKey);
+      } catch (e) {
+        log(`  楽天エラー: ${e.message}`);
+        rdb.logRun(runId, 'error', `楽天エラー: ${e.message}`, product.id);
+        result = {
+          own_rank: RANK_ERROR,
+          competitor1_rank: product.competitor1_url ? RANK_ERROR : null,
+          competitor2_rank: product.competitor2_url ? RANK_ERROR : null,
+          review_count: null,
+        };
+      }
+      // review_count は「取得できたときだけ上書き」ポリシー。
+      // 一時的に検索結果に出なかった日や API 失敗日に古い値を null で消すと、
+      // UIのレビュー数バッジがチラつくため、前日値を据え置きにする意図。
+      if (result.review_count != null) {
+        rdb.updateProductReviewCount(product.id, result.review_count);
+      }
+
+      // Yahoo（サーバーIPからYahoo APIが無効のため意図的に disabled のまま）
+      let yahooRank = null;
+      const yahooUrl = getYahooUrl(product);
+      if (false && yahooUrl && yahooAppId) {
+        await sleep(API_DELAY);
+        try { yahooRank = await checkYahoo(product.keyword, yahooUrl, yahooAppId); }
+        catch (e) {
+          log(`  Yahoo例外: ${e.message}`);
+          rdb.logRun(runId, 'error', `Yahoo例外: ${e.message}`, product.id);
+          yahooRank = RANK_ERROR;
         }
+      }
 
-        // Amazon
-        let amazonRank = null;
-        const amazonAsin = getAmazonAsin(product);
-        if (amazonAsin && amazonAccessKey) {
-          await sleep(API_DELAY);
-          try { amazonRank = await checkAmazon(product.keyword, amazonAsin, amazonAccessKey, amazonSecretKey, amazonPartnerTag); }
-          catch (e) { amazonRank = 'error'; }
+      let amazonRank = null;
+      const amazonAsin = getAmazonAsin(product);
+      if (amazonAsin && amazonAccessKey) {
+        await sleep(API_DELAY);
+        try { amazonRank = await checkAmazon(product.keyword, amazonAsin, amazonAccessKey, amazonSecretKey, amazonPartnerTag); }
+        catch (e) {
+          log(`  Amazon例外: ${e.message}`);
+          rdb.logRun(runId, 'error', `Amazon例外: ${e.message}`, product.id);
+          amazonRank = RANK_ERROR;
         }
+      }
 
-        // Save history
-        if (!product.history) product.history = [];
-        const entry = { date: todayStr, ...result };
-        if (yahooUrl) entry.yahoo_own_rank = yahooRank;
-        if (amazonAsin) entry.amazon_own_rank = amazonRank;
-        const todayIdx = product.history.findIndex(e => e.date === todayStr);
-        if (todayIdx >= 0) product.history[todayIdx] = entry;
-        else product.history.push(entry);
-      }));
+      // 1商品 = 1回の UPSERT。トランザクション不要（既に原子的）。
+      rdb.upsertHistory({
+        product_id: product.id,
+        date: todayStr,
+        own_rank: result.own_rank,
+        competitor1_rank: result.competitor1_rank,
+        competitor2_rank: result.competitor2_rank,
+        yahoo_own_rank: yahooUrl ? yahooRank : null,
+        amazon_own_rank: amazonAsin ? amazonRank : null,
+      });
 
-      checked += batch.length;
-      checkProgress.done = checked;
-      writeJson(DATA_FILE, { products });
-      if (i + CONCURRENCY < unchecked.length) await sleep(KW_DELAY);
+      done++;
+      checkProgress.done = done;
+      if (done % PROGRESS_EVERY === 0 || done === totalTarget) {
+        rdb.updateRunProgress(runId, done);
+      }
+
+      if (done < totalTarget) await sleep(KW_DELAY);
     }
 
-    log(`自動順位チェック完了: ${checked} 件`);
+    log(`自動順位チェック完了: ${done} 件`);
     log('='.repeat(50));
+  } catch (e) {
+    finishStatus = 'failed';
+    finishError = e.message;
+    log(`チェック中断: ${e.message}`);
+    rdb.logRun(runId, 'error', `中断: ${e.message}`);
+    throw e;
   } finally {
+    rdb.updateRunProgress(runId, done);
+    rdb.finishRun(runId, finishStatus, finishError);
     checkProgress.running = false;
     checkProgress.current = '';
   }
 }
 
-export { DATA_FILE, readJson, writeJson, getRakutenUrl, getYahooUrl, getAmazonAsin, today, log, getCheckProgress };
+export { today, log, debugLog, getRakutenUrl, getYahooUrl, getAmazonAsin };

@@ -14,7 +14,7 @@ import { okResponse, errorResponse } from './error-handler.js';
 import { createJob } from './job-manager.js';
 
 // --- 既存FBAモジュール ---
-import { fetchAllReports, normalizePlanningRow } from '../fba-replenishment/sp-api-reports.js';
+import { fetchAllReports, normalizePlanningRow, normalizeRestockRow } from '../fba-replenishment/sp-api-reports.js';
 import {
   createInboundPlan as spCreateInboundPlan,
   listShipments,
@@ -77,28 +77,63 @@ router.post('/fetch-reports', rateLimitMiddleware('sp-api'), async (req, res) =>
       const results = await fetchAllReports();
       const db = await getDb();
 
-      let planningCount = 0, restockCount = 0, inventoryCount = 0;
+      let planningCount = 0, restockCount = 0;
+      let restockGuardSkipped = false, planningGuardSkipped = false;
 
+      // --- RESTOCK (主軸データソース) ---
+      if (results.restock?.length > 0) {
+        updateProgress({ step: 'saving-restock', count: results.restock.length });
+        const normalizedRestock = results.restock.map(normalizeRestockRow).filter(r => r.amazon_sku);
+        const saveRes = db.saveRestockLatest(normalizedRestock);
+        restockCount = saveRes.saved;
+        restockGuardSkipped = saveRes.skipped;
+        if (saveRes.skipped) {
+          console.warn('[FBA-Service] RESTOCK 保存スキップ:', saveRes.reason, saveRes);
+        }
+        // FNSKU 更新 (RESTOCK からも取れる)
+        const fnskuRows = normalizedRestock
+          .filter(r => r.fnsku && r.amazon_sku)
+          .map(r => ({ sku: r.amazon_sku, fnsku: r.fnsku }));
+        if (fnskuRows.length > 0) db.updateFnskuBatch(fnskuRows);
+      }
+
+      // --- PLANNING (補助データソース、取得失敗OK) ---
       if (results.planning?.length > 0) {
         updateProgress({ step: 'saving-planning', count: results.planning.length });
         const normalized = results.planning.map(normalizePlanningRow);
-        db.savePlanningData(normalized);
+        // dual-write: 既存の daily_snapshots 経路と、新 planning_latest の両方に書き込む
+        try {
+          db.savePlanningData(normalized);
+        } catch (e) {
+          console.warn('[FBA-Service] savePlanningData failed (legacy):', e.message);
+        }
+        try {
+          const saveRes = db.savePlanningLatest(normalized);
+          planningGuardSkipped = saveRes.skipped;
+          if (saveRes.skipped) {
+            console.warn('[FBA-Service] PLANNING 保存スキップ:', saveRes.reason, saveRes);
+          }
+        } catch (e) {
+          console.warn('[FBA-Service] savePlanningLatest failed:', e.message);
+        }
         planningCount = normalized.length;
+        // PLANNING報告に含まれる全SKUについて現在のFNSKUを明示同期（nullなら明示的にクリア）
         const fnskuRows = results.planning
-          .filter(r => r['fnsku'] && r['sku'])
-          .map(r => ({ sku: r['sku'], fnsku: r['fnsku'] }));
-        if (fnskuRows.length > 0) db.updateFnskuBatch(fnskuRows);
-      }
-      if (results.restock?.length > 0) {
-        updateProgress({ step: 'saving-restock', count: results.restock.length });
-        restockCount = results.restock.length;
-      }
-      if (results.inventory?.length > 0) {
-        updateProgress({ step: 'saving-inventory', count: results.inventory.length });
-        inventoryCount = results.inventory.length;
+          .filter(r => r['sku'])
+          .map(r => ({ sku: r['sku'], fnsku: r['fnsku'] || null }));
+        if (fnskuRows.length > 0) db.syncFnskuBatch(fnskuRows);
       }
 
-      return { planning: planningCount, restock: restockCount, inventory: inventoryCount, errors: results.errors };
+      // INVENTORY 取得は停止済み (RESTOCK の部分集合で冗長、未使用)
+
+      return {
+        planning: planningCount,
+        restock: restockCount,
+        inventory: 0, // 互換性のため 0 を返す
+        restockGuardSkipped,
+        planningGuardSkipped,
+        errors: results.errors,
+      };
     } finally {
       fetchReportsJobId = null;
     }
@@ -120,8 +155,21 @@ router.get('/snapshots/:sku', dbHandler(async (req, res, db) => {
   return { history: db.getDailySnapshots(req.params.sku) };
 }));
 
+// 従来互換: daily_snapshots と ever_seen_skus の和集合
 router.get('/all-snapshot-skus', dbHandler(async (req, res, db) => {
-  return { skus: db.getAllSnapshotSkus() };
+  const legacy = db.getAllSnapshotSkus();
+  const everSeen = db.getAllEverSeenSkus();
+  return { skus: Array.from(new Set([...legacy, ...everSeen])) };
+}));
+
+// 新規商品判定の正: ever_seen_skus のみ
+router.get('/ever-seen-skus', dbHandler(async (req, res, db) => {
+  return { skus: db.getAllEverSeenSkus() };
+}));
+
+// RESTOCK最新データ
+router.get('/restock-latest', dbHandler(async (req, res, db) => {
+  return { rows: db.getRestockLatest() };
 }));
 
 // ==========================================
@@ -223,6 +271,38 @@ router.post('/refresh-inbound-working', rateLimitMiddleware('sp-api'), async (re
     errorResponse(res, { status: 500, error: 'SP_API_ERROR', message: e.message, requestId: req.requestId });
   }
 });
+
+// キャッシュ済みの準備中数量マップを返す（Renderの推奨計算が参照）
+router.get('/recommendations-inbound-cache', async (req, res) => {
+  try {
+    const data = inboundCache.data || {};
+    const ageMs = inboundCache.at ? Date.now() - inboundCache.at : null;
+    okResponse(res, { data, count: Object.keys(data).length, cachedAt: inboundCache.at || null, ageMs });
+  } catch (e) {
+    errorResponse(res, { status: 500, error: 'CACHE_ERROR', message: e.message, requestId: req.requestId });
+  }
+});
+
+// ミニPC→Render 同期用: 最新日付のPLANNINGスナップショットとFNSKU一覧（全SKU、null含む）を返す
+router.get('/sync/latest-planning', dbHandler(async (req, res, db) => {
+  const rows = db.getLatestSnapshots();
+  const snapshotDate = rows[0]?.snapshot_date || null;
+  const mappings = db.getSkuMappings();
+  // 全SKU対象（fnsku=nullも含む）。Render側で現状に合わせてupsert（null時はクリア）
+  const fnskus = mappings
+    .filter(m => m.amazon_sku)
+    .map(m => ({ sku: m.amazon_sku, fnsku: m.fnsku || null }));
+  // RESTOCK / PLANNING_LATEST も同送 (Render側で saveRestockLatest / savePlanningLatest される)
+  const restockRows = typeof db.getRestockLatest === 'function' ? db.getRestockLatest() : [];
+  const planningLatestRows = typeof db.getPlanningLatest === 'function' ? db.getPlanningLatest() : [];
+  return {
+    snapshot_date: snapshotDate,
+    rows,
+    fnskus,
+    restock_rows: restockRows,
+    planning_latest_rows: planningLatestRows,
+  };
+}));
 
 // ==========================================
 // 納品プラン（ジョブ化）

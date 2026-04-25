@@ -322,6 +322,8 @@ export async function initDb() {
     ['missing_bsr_threshold', '5000'],
     ['working_expiry_days', '3'],
     ['non_fba_reserve_days', '60'],
+    // 長期欠品SKUをFBA欠品タブの「長期(復活余地)」に分類する Amazon推奨数の閾値
+    ['oos_amazon_reco_threshold', '11'],
     // 納品プラン設定
     ['inbound_ship_from_name', ''],
     ['inbound_ship_from_address1', ''],
@@ -399,8 +401,67 @@ export async function initDb() {
     )
   `);
 
+  // --- 14. restock_latest: RESTOCKレポート最新1回分（発注判定の主軸データソース） ---
+  db.run(`
+    CREATE TABLE IF NOT EXISTS restock_latest (
+      amazon_sku TEXT PRIMARY KEY,
+      fnsku TEXT,
+      asin TEXT,
+      product_name TEXT,
+      fba_available INTEGER DEFAULT 0,
+      fba_inbound_working INTEGER DEFAULT 0,
+      fba_inbound_shipped INTEGER DEFAULT 0,
+      fba_inbound_received INTEGER DEFAULT 0,
+      fba_unfulfillable INTEGER DEFAULT 0,
+      units_sold_30d INTEGER DEFAULT 0,
+      amazon_recommended_qty INTEGER,
+      amazon_recommended_date TEXT,
+      alert_type TEXT,
+      your_price REAL,
+      days_of_supply REAL,
+      updated_at TEXT DEFAULT (datetime('now','localtime'))
+    )
+  `);
+
+  // --- 15. planning_latest: PLANNINGレポート最新1回分（補助、取得失敗許容） ---
+  db.run(`
+    CREATE TABLE IF NOT EXISTS planning_latest (
+      amazon_sku TEXT PRIMARY KEY,
+      units_sold_7d INTEGER,
+      units_sold_60d INTEGER,
+      units_sold_90d INTEGER,
+      sales_7d REAL,
+      sales_30d REAL,
+      sales_60d REAL,
+      sales_90d REAL,
+      featured_offer_price REAL,
+      lowest_price REAL,
+      sales_rank INTEGER,
+      is_seasonal TEXT,
+      season_name TEXT,
+      short_term_dos REAL,
+      long_term_dos REAL,
+      low_inv_fee_applied TEXT,
+      low_inv_fee_exempt TEXT,
+      estimated_excess_qty INTEGER,
+      estimated_storage_cost REAL,
+      per_unit_volume REAL,
+      updated_at TEXT DEFAULT (datetime('now','localtime'))
+    )
+  `);
+
+  // --- 16. ever_seen_skus: 過去にFBAで観測したSKU（新規商品タブの判定用） ---
+  // ※ユーザー方針により初期は空スタート。RESTOCK/PLANNING取得毎に追記していく
+  db.run(`
+    CREATE TABLE IF NOT EXISTS ever_seen_skus (
+      amazon_sku TEXT PRIMARY KEY,
+      first_seen_at TEXT DEFAULT (datetime('now','localtime')),
+      last_seen_at TEXT DEFAULT (datetime('now','localtime'))
+    )
+  `);
+
   saveToFile();
-  console.log('[FBA-DB] 初期化完了 — テーブル9個');
+  console.log('[FBA-DB] 初期化完了');
 }
 
 // ===== SP-APIレポートデータの一括保存 =====
@@ -699,6 +760,152 @@ export function getLatestSnapshots() {
 
 export function getAllSnapshotSkus() {
   return queryAll('SELECT DISTINCT amazon_sku FROM daily_snapshots').map(r => r.amazon_sku);
+}
+
+// ===== RESTOCK / PLANNING 最新データ (Phase1: dual-write先) =====
+
+/**
+ * RESTOCKレポート最新データを全入替で保存
+ * 件数急減ガード: 前回件数の50%以下なら破棄して前回データ維持
+ * @param {Array} rows normalizeRestockRow() 済みの配列
+ * @returns {{saved: number, skipped: boolean, reason?: string}}
+ */
+export function saveRestockLatest(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return { saved: 0, skipped: true, reason: 'empty_or_invalid' };
+  }
+  const prevCount = queryOne('SELECT COUNT(*) as c FROM restock_latest')?.c || 0;
+  if (prevCount > 0 && rows.length < prevCount * 0.5) {
+    console.warn(`[FBA-DB] RESTOCK件数急減ガード発動: 新${rows.length} < 前回${prevCount}×0.5、更新スキップ`);
+    return { saved: 0, skipped: true, reason: 'count_guard', prev: prevCount, new: rows.length };
+  }
+  db.run('BEGIN TRANSACTION');
+  try {
+    db.run('DELETE FROM restock_latest');
+    const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+    for (const r of rows) {
+      db.run(`
+        INSERT INTO restock_latest
+          (amazon_sku, fnsku, asin, product_name, fba_available,
+           fba_inbound_working, fba_inbound_shipped, fba_inbound_received,
+           fba_unfulfillable, units_sold_30d, amazon_recommended_qty,
+           amazon_recommended_date, alert_type, your_price, days_of_supply, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        r.amazon_sku, r.fnsku || null, r.asin || null, r.product_name || null,
+        r.fba_available || 0,
+        r.fba_inbound_working || 0, r.fba_inbound_shipped || 0, r.fba_inbound_received || 0,
+        r.fba_unfulfillable || 0, r.units_sold_30d || 0,
+        r.amazon_recommended_qty === null || r.amazon_recommended_qty === undefined ? null : r.amazon_recommended_qty,
+        r.amazon_recommended_date || null, r.alert_type || null,
+        r.your_price || null, r.days_of_supply || null, now,
+      ]);
+      // ever_seen_skus にも記録
+      db.run(`
+        INSERT INTO ever_seen_skus (amazon_sku, first_seen_at, last_seen_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(amazon_sku) DO UPDATE SET last_seen_at = excluded.last_seen_at
+      `, [r.amazon_sku, now, now]);
+    }
+    db.run('COMMIT');
+    saveToFile();
+    return { saved: rows.length, skipped: false };
+  } catch (e) {
+    db.run('ROLLBACK');
+    console.error('[FBA-DB] saveRestockLatest failed:', e.message);
+    throw e;
+  }
+}
+
+export function getRestockLatest() {
+  return queryAll('SELECT * FROM restock_latest');
+}
+
+export function getRestockLatestMap() {
+  const rows = getRestockLatest();
+  const map = {};
+  for (const r of rows) map[r.amazon_sku] = r;
+  return map;
+}
+
+/**
+ * PLANNINGレポート最新データを全入替で保存 (補助データ、取得失敗OK)
+ * 件数ゼロは許容 (PLANNING は欠落しうる)
+ * @param {Array} rows normalizePlanningRow() 済みの配列
+ */
+export function savePlanningLatest(rows) {
+  if (!Array.isArray(rows)) {
+    return { saved: 0, skipped: true, reason: 'invalid' };
+  }
+  // PLANNINGは補助なので件数ガードは緩め (前回の30%以下のみ破棄)
+  const prevCount = queryOne('SELECT COUNT(*) as c FROM planning_latest')?.c || 0;
+  if (prevCount > 0 && rows.length > 0 && rows.length < prevCount * 0.3) {
+    console.warn(`[FBA-DB] PLANNING件数急減: 新${rows.length} < 前回${prevCount}×0.3、更新スキップ`);
+    return { saved: 0, skipped: true, reason: 'count_guard', prev: prevCount, new: rows.length };
+  }
+  db.run('BEGIN TRANSACTION');
+  try {
+    db.run('DELETE FROM planning_latest');
+    const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+    for (const r of rows) {
+      db.run(`
+        INSERT INTO planning_latest
+          (amazon_sku, units_sold_7d, units_sold_60d, units_sold_90d,
+           sales_7d, sales_30d, sales_60d, sales_90d,
+           featured_offer_price, lowest_price, sales_rank,
+           is_seasonal, season_name, short_term_dos, long_term_dos,
+           low_inv_fee_applied, low_inv_fee_exempt,
+           estimated_excess_qty, estimated_storage_cost, per_unit_volume, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        r.sku || r.amazon_sku,
+        r.units_sold_7d ?? null, r.units_sold_60d ?? null, r.units_sold_90d ?? null,
+        r.sales_7d ?? null, r.sales_30d ?? null, r.sales_60d ?? null, r.sales_90d ?? null,
+        r.featured_offer_price ?? null, r.lowest_price ?? null, r.sales_rank ?? null,
+        r.is_seasonal || null, r.season_name || null,
+        r.short_term_dos ?? null, r.long_term_dos ?? null,
+        r.low_inv_fee_applied || null, r.low_inv_fee_exempt || null,
+        r.estimated_excess_qty ?? null, r.estimated_storage_cost ?? null, r.per_unit_volume ?? null, now,
+      ]);
+      // ever_seen_skus にも追記
+      const sku = r.sku || r.amazon_sku;
+      if (sku) {
+        db.run(`
+          INSERT INTO ever_seen_skus (amazon_sku, first_seen_at, last_seen_at)
+          VALUES (?, ?, ?)
+          ON CONFLICT(amazon_sku) DO UPDATE SET last_seen_at = excluded.last_seen_at
+        `, [sku, now, now]);
+      }
+    }
+    db.run('COMMIT');
+    saveToFile();
+    return { saved: rows.length, skipped: false };
+  } catch (e) {
+    db.run('ROLLBACK');
+    console.error('[FBA-DB] savePlanningLatest failed:', e.message);
+    throw e;
+  }
+}
+
+export function getPlanningLatest() {
+  return queryAll('SELECT * FROM planning_latest');
+}
+
+export function getPlanningLatestMap() {
+  const rows = getPlanningLatest();
+  const map = {};
+  for (const r of rows) map[r.amazon_sku] = r;
+  return map;
+}
+
+// ===== ever_seen_skus: 過去にFBAで観測したSKU（新規商品タブ判定用） =====
+
+export function getAllEverSeenSkus() {
+  return queryAll('SELECT amazon_sku FROM ever_seen_skus').map(r => r.amazon_sku);
+}
+
+export function isEverSeenSku(amazonSku) {
+  return !!queryOne('SELECT 1 FROM ever_seen_skus WHERE amazon_sku = ?', [amazonSku]);
 }
 
 // ===== 納品計画 =====

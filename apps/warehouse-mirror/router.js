@@ -13,13 +13,22 @@
  */
 import { Router } from 'express';
 import { initMirrorDB, getMirrorDB } from './db.js';
+import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
 
 const router = Router();
 
 // DB初期化
 let dbReady = false;
+bootStart('mirror-db', 'warehouse-mirror.db');
 (async () => {
-  try { initMirrorDB(); dbReady = true; } catch (e) { console.error('[Mirror] DB初期化失敗:', e.message); }
+  try {
+    initMirrorDB();
+    dbReady = true;
+    bootEnd('mirror-db', 'warehouse-mirror.db');
+  } catch (e) {
+    bootFail('mirror-db', 'warehouse-mirror.db', e);
+    console.error('[Mirror] DB初期化失敗:', e.message);
+  }
 })();
 
 function ensureDB(req, res, next) {
@@ -49,6 +58,8 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
 
   try {
     // products（全件置換）
+    //   Codex PR1 review High #2 反映: seasonality_flag/season_months/new_product_flag/
+    //   new_product_launch_date を列リストに含めて、ミニPC側の手動設定値を保持する。
     if (products && products.length > 0) {
       const tx = db.transaction(() => {
         db.exec('DELETE FROM mirror_products');
@@ -56,13 +67,18 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
           product_id, 商品コード, 商品名, 商品区分, 取扱区分,
           標準売価, 原価, 原価ソース, 原価状態,
           送料, 送料コード, 配送方法, 消費税率, 税区分,
-          在庫数, 引当数, 仕入先コード, セット構成品数, 売上分類, 代表商品コード, updated_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+          在庫数, 引当数, 仕入先コード, セット構成品数, 売上分類, 代表商品コード,
+          seasonality_flag, season_months, new_product_flag, new_product_launch_date,
+          updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
         for (const p of products) {
           stmt.run(p.product_id, p.商品コード, p.商品名, p.商品区分, p.取扱区分,
             p.標準売価, p.原価, p.原価ソース, p.原価状態,
             p.送料, p.送料コード, p.配送方法, p.消費税率, p.税区分,
-            p.在庫数, p.引当数, p.仕入先コード, p.セット構成品数, p.売上分類 ?? null, p.代表商品コード ?? null, now);
+            p.在庫数, p.引当数, p.仕入先コード, p.セット構成品数, p.売上分類 ?? null, p.代表商品コード ?? null,
+            p.seasonality_flag ?? 0, p.season_months ?? null,
+            p.new_product_flag ?? 0, p.new_product_launch_date ?? null,
+            now);
         }
       });
       tx();
@@ -98,6 +114,22 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
       });
       tx();
       log.push(`sku_map: ${skuMapData.length}件`);
+    }
+
+    // rakuten_sku_map（全件置換）
+    if (req.body.rakuten_sku_map && req.body.rakuten_sku_map.length > 0) {
+      const rskmData = req.body.rakuten_sku_map;
+      const tx = db.transaction(() => {
+        db.exec('DELETE FROM mirror_rakuten_sku_map');
+        const stmt = db.prepare(`INSERT INTO mirror_rakuten_sku_map (
+          rakuten_code, ne_code, source, updated_at
+        ) VALUES (?,?,?,?)`);
+        for (const m of rskmData) {
+          stmt.run(m.rakuten_code, m.ne_code, m.source, now);
+        }
+      });
+      tx();
+      log.push(`rakuten_sku_map: ${rskmData.length}件`);
     }
 
     // amazon_sku_fees（全件置換）
@@ -154,6 +186,28 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
       });
       tx();
       log.push(`sales_daily: ${sales_daily.length}件`);
+    }
+
+    // stock_monthly_snapshot（PR2a 追加、商品収益性ダッシュボード タブB GMROI用）
+    //   初回チャンクで meta.clear_stock_snapshot=true → DELETE、以降は追記
+    //   Codex PR2a review Medium #1 反映: 空配列でも clear_stock_snapshot だけは処理する
+    //   （ミニPC側で対象月内の在庫が0件になった時に mirror 側の stale を消すため）
+    if (req.body.stock_monthly_snapshot !== undefined) {
+      const snapshotData = req.body.stock_monthly_snapshot;
+      const tx = db.transaction(() => {
+        if (meta?.clear_stock_snapshot) db.exec('DELETE FROM mirror_stock_monthly_snapshot');
+        if (snapshotData.length > 0) {
+          const stmt = db.prepare(`INSERT INTO mirror_stock_monthly_snapshot (
+            年月, 商品コード, 月末在庫数, 月末引当数, snapshot_source, captured_at, updated_at
+          ) VALUES (?,?,?,?,?,?,?)`);
+          for (const s of snapshotData) {
+            stmt.run(s.年月, s.商品コード, s.月末在庫数 ?? 0, s.月末引当数 ?? 0,
+              s.snapshot_source || null, s.captured_at || null, now);
+          }
+        }
+      });
+      tx();
+      log.push(`stock_monthly_snapshot: ${snapshotData.length}件${meta?.clear_stock_snapshot ? ' (clear)' : ''}`);
     }
 
     // 同期状態更新
@@ -236,6 +290,9 @@ router.get('/api/status', (req, res) => {
     status.sales_daily_count = db.prepare('SELECT COUNT(*) as cnt FROM mirror_sales_daily').get().cnt;
     status.sku_map_count = db.prepare('SELECT COUNT(*) as cnt FROM mirror_sku_map').get().cnt;
     try { status.amazon_sku_fees_count = db.prepare('SELECT COUNT(*) as cnt FROM mirror_amazon_sku_fees').get().cnt; } catch { status.amazon_sku_fees_count = 0; }
+    try { status.rakuten_sku_map_count = db.prepare('SELECT COUNT(*) as cnt FROM mirror_rakuten_sku_map').get().cnt; } catch { status.rakuten_sku_map_count = 0; }
+    // Codex PR2a Round 4 非ブロッカー #3 反映: stock_snapshot 件数も同期検証に乗せる
+    try { status.stock_snapshot_count = db.prepare('SELECT COUNT(*) as cnt FROM mirror_stock_monthly_snapshot').get().cnt; } catch { status.stock_snapshot_count = 0; }
   } catch {}
   res.json(status);
 });

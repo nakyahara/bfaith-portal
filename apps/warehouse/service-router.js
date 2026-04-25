@@ -7,7 +7,7 @@
  */
 import 'dotenv/config';
 import { Router } from 'express';
-import { serviceAuth } from './service-auth.js';
+// serviceAuth は server.js 側で mount (body parser より先) に移動済み
 import { requestLogger } from './request-logger.js';
 import { serviceErrorHandler } from './error-handler.js';
 import { getJob, listJobs } from './job-manager.js';
@@ -17,8 +17,9 @@ import { okResponse, errorResponse } from './error-handler.js';
 const router = Router();
 
 // --- 共通ミドルウェア ---
+// serviceAuth は server.js 側で body parser より先に掛けている (DoS防止)。
+// ここでは requestLogger のみ。
 router.use(requestLogger);
-router.use(serviceAuth);
 
 // --- ヘルスチェック（認証なしでもアクセス可能にしたい場合は上に移動） ---
 router.get('/health', (req, res) => {
@@ -56,9 +57,11 @@ router.get('/rate-limit-status', (req, res) => {
 import fbaServiceRouter from './fba-service.js';
 import researchServiceRouter from './research-service.js';
 import rakutenRmsServiceRouter from './rakuten-rms-service.js';
+import rankcheckServiceRouter from './rankcheck-service.js';
 router.use('/fba', fbaServiceRouter);
 router.use('/research', researchServiceRouter);
 router.use('/rakuten-rms', rakutenRmsServiceRouter);
+router.use('/rankcheck', rankcheckServiceRouter);
 
 // --- エラーハンドラー（最後） ---
 router.use(serviceErrorHandler);

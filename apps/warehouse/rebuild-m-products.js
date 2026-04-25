@@ -12,6 +12,48 @@ function now() {
   return new Date().toISOString().replace('T', ' ').slice(0, 19);
 }
 
+// ─── 本番反映時の列リスト（Codex PR1 Round 3 High 反映: 明示列INSERT） ───
+// 物理的な列順が異なるDBでも値が正しくマップされるよう、
+// DELETE + INSERT INTO target (...) SELECT ... FROM staging で列名を明示する。
+export const MP_COLS = [
+  'product_id', '商品コード', '商品名', '商品区分', '取扱区分',
+  '標準売価', '原価', '原価ソース', '原価状態',
+  '送料', '送料コード', '配送方法',
+  '消費税率', '税区分',
+  '在庫数', '引当数', '仕入先コード', 'セット構成品数', '売上分類',
+  'seasonality_flag', 'season_months', 'new_product_flag', 'new_product_launch_date',
+  'updated_at',
+];
+
+export const MSC_COLS = [
+  'セット商品コード', '構成商品コード', '数量', '構成商品名', '構成商品原価', 'updated_at',
+];
+
+function colList(cols) {
+  return cols.map(c => `"${c}"`).join(', ');
+}
+
+/**
+ * Phase C: staging → 本番テーブル反映
+ *
+ * ★ 重要: 明示列INSERT必須（SELECT * にしてはいけない）
+ * テスト test-profit-schema.mjs Test 5 が回帰検知する。
+ */
+export function applyStagingToProduction(db) {
+  const mpList = colList(MP_COLS);
+  const mscList = colList(MSC_COLS);
+
+  const tx = db.transaction(() => {
+    db.exec('DELETE FROM m_products');
+    db.exec("DELETE FROM sqlite_sequence WHERE name='m_products'");
+    db.exec(`INSERT INTO m_products (${mpList}) SELECT ${mpList} FROM m_products_staging`);
+
+    db.exec('DELETE FROM m_set_components');
+    db.exec(`INSERT INTO m_set_components (${mscList}) SELECT ${mscList} FROM m_set_components_staging`);
+  });
+  tx();
+}
+
 // ─── メイン ───
 
 export async function rebuildMProducts() {
@@ -23,6 +65,39 @@ export async function rebuildMProducts() {
   console.log('[m_products] 再構築開始...');
 
   // ─── Phase A: staging 投入 ───
+
+  // A-carryover: 商品収益性ダッシュボード用の手動付与カラム（seasonality_flag 等）を
+  //   既存 m_products から引き継ぐ。rebuild で上書きされないようにするため。
+  //   （Codex PR1 review High #1 反映 + Round 3 Medium: PRAGMA事前チェックで空catch回避）
+  const CARRYOVER_COLS = ['seasonality_flag', 'season_months', 'new_product_flag', 'new_product_launch_date'];
+  const carryoverMap = new Map();
+  const mpCols = db.prepare('PRAGMA table_info(m_products)').all().map(c => c.name);
+  const hasCarryoverCols = CARRYOVER_COLS.every(c => mpCols.includes(c));
+  if (hasCarryoverCols) {
+    const rows = db.prepare(`
+      SELECT 商品コード, seasonality_flag, season_months,
+             new_product_flag, new_product_launch_date
+      FROM m_products
+    `).all();
+    for (const r of rows) {
+      const code = r.商品コード?.toLowerCase();
+      if (!code) continue;
+      carryoverMap.set(code, {
+        seasonality_flag: r.seasonality_flag ?? 0,
+        season_months: r.season_months ?? null,
+        new_product_flag: r.new_product_flag ?? 0,
+        new_product_launch_date: r.new_product_launch_date ?? null,
+      });
+    }
+  }
+  // 新カラムが未マイグレの旧DBでは carryoverMap は空のまま。デフォルト値で進む。
+
+  function getCarryover(code) {
+    return carryoverMap.get(code) || {
+      seasonality_flag: 0, season_months: null,
+      new_product_flag: 0, new_product_launch_date: null,
+    };
+  }
 
   // A0: staging クリア
   db.exec('DELETE FROM m_products_staging');
@@ -38,14 +113,18 @@ export async function rebuildMProducts() {
   );
 
   // A1: NE単品商品を投入
+  //     seasonality_flag / season_months / new_product_flag / new_product_launch_date は
+  //     carryoverMap から引き継ぐ（Codex PR1 review High #1 反映）
   const insertStaging = db.prepare(`
     INSERT INTO m_products_staging (
       商品コード, 商品名, 商品区分, 取扱区分,
       標準売価, 原価, 原価ソース, 原価状態,
       送料, 送料コード, 配送方法,
       消費税率, 税区分,
-      在庫数, 引当数, 仕入先コード, セット構成品数, 売上分類, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      在庫数, 引当数, 仕入先コード, セット構成品数, 売上分類,
+      seasonality_flag, season_months, new_product_flag, new_product_launch_date,
+      updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   const neProducts = db.prepare('SELECT * FROM raw_ne_products').all();
@@ -114,12 +193,15 @@ export async function rebuildMProducts() {
     if (p.消費税率 === 10) taxCategory = 'STANDARD_10';
     else if (p.消費税率 === 8) taxCategory = 'REDUCED_8';
 
+    const co = getCarryover(code);
     insertStaging.run(
       code, p.商品名, '単品', p.取扱区分,
       p.売価, genka, genkaSource, genkaStatus,
       ps?.ship_cost ?? null, ps?.shipping_code ?? null, ps?.ship_method ?? null,
       taxRate, taxCategory,
-      p.在庫数, p.引当数, p.仕入先コード, null, salesClassMap.get(code) ?? null, ts
+      p.在庫数, p.引当数, p.仕入先コード, null, salesClassMap.get(code) ?? null,
+      co.seasonality_flag, co.season_months, co.new_product_flag, co.new_product_launch_date,
+      ts
     );
     countSingle++;
   }
@@ -202,6 +284,7 @@ export async function rebuildMProducts() {
     // 取扱区分: NEに存在すればそこから、なければ取扱中
     const status = neInfo?.取扱区分 || '取扱中';
 
+    const coSet = getCarryover(setCode);
     insertStaging.run(
       setCode, sh.セット商品名, 'セット', status,
       neInfo?.売価 ?? sh.セット販売価格 ?? null,
@@ -209,7 +292,9 @@ export async function rebuildMProducts() {
       ps?.ship_cost ?? null, ps?.shipping_code ?? null, ps?.ship_method ?? null,
       taxRate, taxCategory,
       neInfo?.在庫数 ?? null, neInfo?.引当数 ?? null, neInfo?.仕入先コード ?? null,
-      components.length, salesClassMap.get(setCode) ?? null, ts
+      components.length, salesClassMap.get(setCode) ?? null,
+      coSet.seasonality_flag, coSet.season_months, coSet.new_product_flag, coSet.new_product_launch_date,
+      ts
     );
     countSet++;
   }
@@ -233,12 +318,15 @@ export async function rebuildMProducts() {
       else if (manualTaxRate === 0.08) exTaxCategory = 'REDUCED_8';
     }
 
+    const coEx = getCarryover(sku);
     insertStaging.run(
       sku, eg.商品名 || '', '例外', '取扱中',
       null, eg.genka, '例外', 'OVERRIDDEN',
       ps?.ship_cost ?? null, ps?.shipping_code ?? null, ps?.ship_method ?? null,
       exTaxRate, exTaxCategory,
-      null, null, null, null, salesClassMap.get(sku) ?? null, ts
+      null, null, null, null, salesClassMap.get(sku) ?? null,
+      coEx.seasonality_flag, coEx.season_months, coEx.new_product_flag, coEx.new_product_launch_date,
+      ts
     );
     countException++;
   }
@@ -321,15 +409,8 @@ export async function rebuildMProducts() {
 
   // ─── Phase C: 本番反映 ───
 
-  const tx = db.transaction(() => {
-    db.exec('DELETE FROM m_products');
-    db.exec("DELETE FROM sqlite_sequence WHERE name='m_products'");
-    db.exec('INSERT INTO m_products SELECT * FROM m_products_staging');
-
-    db.exec('DELETE FROM m_set_components');
-    db.exec('INSERT INTO m_set_components SELECT * FROM m_set_components_staging');
-  });
-  tx();
+  // 本番反映（明示列INSERT、列順破壊耐性あり）
+  applyStagingToProduction(db);
 
   // WAL肥大化防止
   try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch {}

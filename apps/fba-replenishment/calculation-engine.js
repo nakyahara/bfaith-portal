@@ -6,7 +6,8 @@
  */
 import { getLatestSnapshots, getSkuMappings, getSkuExceptions, getSettings,
          getWarehouseSummary, getDailySnapshots, getAllNonFbaMax60d,
-         getWarehouseLocationsByCode } from './db.js';
+         getWarehouseLocationsByCode,
+         getRestockLatest, getPlanningLatestMap } from './db.js';
 
 /**
  * 推奨リストを生成
@@ -22,10 +23,26 @@ import { getLatestSnapshots, getSkuMappings, getSkuExceptions, getSettings,
  */
 export function generateRecommendations(debug = false, inboundWorkingOverride = null) {
   const settings = getSettings();
-  const snapshots = getLatestSnapshots();
   const mappings = getSkuMappings();
   const exceptions = getSkuExceptions();
   const warehouseSummary = getWarehouseSummary();
+
+  // --- データソース: RESTOCK (主軸) + PLANNING (補助、欠落許容) ---
+  // 旧: getLatestSnapshots() → 新: getRestockLatest() をベースに PLANNING を上乗せ
+  const restockRows = getRestockLatest();
+  const planningMap = getPlanningLatestMap();
+
+  // RESTOCK が空 (初回 or 取得失敗) の場合は旧 daily_snapshots にフォールバック (移行期間の保険)
+  let snapshots;
+  let dataSource;
+  if (restockRows.length > 0) {
+    dataSource = 'restock';
+    snapshots = restockRows.map(r => mergeRestockWithPlanning(r, planningMap[r.amazon_sku]));
+  } else {
+    // フォールバック: 旧 daily_snapshots
+    dataSource = 'legacy_snapshots';
+    snapshots = getLatestSnapshots();
+  }
 
   if (!snapshots.length) return { items: [], errors: ['スナップショットがありません。SP-APIレポートを取得してください。'] };
   if (!mappings.length) return { items: [], errors: ['SKUマッピングがありません。スプシ同期してください。'] };
@@ -40,13 +57,13 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
   const warehouseMap = {};
   for (const w of warehouseSummary) warehouseMap[w.logizard_code] = w;
 
-  // 他CH売上の60日間最大値（蓄積データ）
+  // 他CH売上の60日間最大値 (表示用に残す、発注判定には使わない)
   const nonFbaMax60dList = getAllNonFbaMax60d();
   const nonFbaMax60dMap = {};
   for (const r of nonFbaMax60dList) nonFbaMax60dMap[r.amazon_sku] = r;
 
-  const snapshotDate = snapshots[0]?.snapshot_date;
-  const workingExpiryDays = parseInt(settings.working_expiry_days || 3);
+  const snapshotDate = snapshots[0]?.snapshot_date || new Date().toISOString().slice(0, 10);
+  const oosAmazonRecoThreshold = parseInt(settings.oos_amazon_reco_threshold || 11);
   const items = [];
 
   for (const snap of snapshots) {
@@ -54,35 +71,34 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
     const mapping = mappingMap[sku];
     if (!mapping) continue; // マッピングがないSKUはスキップ
 
+    // --- 期限管理商品判定 (effectiveFbaStock 計算と min_shipment_days フィルタで使用) ---
+    const hasExpiryManagement = (() => {
+      if (!mapping.logizard_code) return false;
+      const locations = getWarehouseLocationsByCode(mapping.logizard_code);
+      return locations.some(l => l.expiry_date && l.expiry_date.trim() !== '');
+    })();
+
     // --- 実質FBA在庫 ---
     const fbaAvailable = snap.fba_available || 0;
     const inboundShipped = snap.fba_inbound_shipped || 0;
     const inboundReceived = snap.fba_inbound_received || 0;
     const reportWorking = snap.fba_inbound_working || 0;
 
-    // inboundWorkingOverride（listInboundPlansからのリアルタイムデータ）がある場合はそれを一次ソースとする
-    // API成功時はapiQtyを採用（PLANNINGレポートは遅延・残骸を含むため信頼しない）
+    // inboundWorking: Inbound API のリアルタイムデータを信頼。
+    // レポート側の Working 列は信頼しない (0 のことが多く、遅延・残骸を含むため)
     let inboundWorking;
     let workingSource; // デバッグ用: データソース
     if (inboundWorkingOverride && inboundWorkingOverride[sku] !== undefined) {
       inboundWorking = inboundWorkingOverride[sku];
       workingSource = 'API';
     } else {
+      // API失敗時: レポートの working を参考値として使う (通常商品のみ)
       inboundWorking = reportWorking;
       workingSource = 'report';
-
-      // レポートのみの場合: working_first_seenが設定日数(デフォルト3日)超なら除外
-      if (inboundWorking > 0 && snap.working_first_seen) {
-        const daysSinceFirstSeen = Math.floor(
-          (new Date(snapshotDate) - new Date(snap.working_first_seen)) / 86400000
-        );
-        if (daysSinceFirstSeen > workingExpiryDays) {
-          inboundWorking = 0; // 放置プラン扱い
-          workingSource = `report(${workingExpiryDays}日超除外)`;
-        }
-      }
     }
 
+    // --- 実質FBA在庫: 期限管理商品も含め、準備中を加算して二重推奨を防止する ---
+    // (別期限を送りたいケースは手動追加で対応)
     const effectiveFbaStock = fbaAvailable + inboundShipped + inboundReceived + inboundWorking;
 
     // --- 販売データ ---
@@ -147,50 +163,36 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
       daysSinceArrival = Math.floor((new Date() - new Date(lastArrivalDate)) / 86400000);
     }
 
-    // --- 販売比率で倉庫在庫を按分（FBAに送れる分を算出） ---
-    // 他CHで売れているなら、その販売比率分は倉庫に確保する
-    // 例: FBA 0.1個/日, 他CH 0.2個/日 → FBA比率33% → 倉庫18個中6個がFBA用
-    //
-    // 入荷30日未満 × 他CH30日売上が少ない → 欠品明けの可能性
-    // → 他CH販売データが不完全なので、FBA按分を抑制して自社確保を厚くする
-    let nonFbaReserve = 0;
-    let warehouseAvailable = warehouseRaw;
-    let recentArrivalAdjusted = false;
+    // --- 他CH按分は廃止 (ユーザー方針: 他CH販売データを発注判定に使わない) ---
+    // 非表示データとして他CH売上は表示するが、倉庫在庫引当には一切使わない
+    // recent_arrival_adjusted は UI 互換のため常に false
+    const nonFbaReserve = 0;
+    const warehouseAvailable = warehouseRaw;
+    const recentArrivalAdjusted = false;
+    const effectiveNonFbaDailySales = nonFbaDailySales; // 表示用に計算は残す
+    const effectiveTotalDailySales = dailySales + nonFbaDailySales; // 表示用
+    const max60d = nonFbaMax60dMap[sku]; // 表示用にロードされていれば参照可
 
-    // 実効的な他CH日販を決定
-    // 優先順位:
-    //   1. 蓄積データ（60日最大値）がある → 欠品前の実力値を使う
-    //   2. 蓄積データなし + 入荷30日未満 + 他CH少ない → FBA売上ベースで推定
-    //   3. 上記どちらでもない → 現在の30日データをそのまま使う
-    let effectiveNonFbaDailySales = nonFbaDailySales;
-    const max60d = nonFbaMax60dMap[sku];
+    // --- SKU状態分類 (納品推奨タブとFBA欠品タブの振り分け判定) ---
+    const amazonReco = snap.amazon_recommended_qty; // null | number
+    const stockState = classifyStockState(fbaAvailable, sold30d, amazonReco, oosAmazonRecoThreshold);
 
-    if (max60d && max60d.max_30d > nonFbaSales30d) {
-      // 蓄積データに直近30日より大きい値がある → 欠品で落ちただけ
-      effectiveNonFbaDailySales = max60d.max_30d / 30;
-      recentArrivalAdjusted = true;
-    } else if (daysSinceArrival !== null && daysSinceArrival < 30 && nonFbaSales30d <= 3) {
-      // 蓄積データなし + 入荷30日未満 + 他CH30日売上3個以下 → 欠品明けの可能性
-      // FBA日販の1.5倍を他CH実効日販として按分（控えめ推定）
-      if (dailySales > 0) {
-        effectiveNonFbaDailySales = Math.max(nonFbaDailySales, dailySales * 1.5);
-        recentArrivalAdjusted = true;
-      } else if (daysSinceArrival < 7) {
-        // FBA売上も0、入荷7日未満 → データ不足、FBAに送らない
-        effectiveNonFbaDailySales = 1; // 仮の値で自社確保優先
-        recentArrivalAdjusted = true;
-      }
-    }
-
-    const effectiveTotalDailySales = dailySales + effectiveNonFbaDailySales;
-
-    if (effectiveTotalDailySales > 0 && effectiveNonFbaDailySales > 0) {
-      nonFbaReserve = Math.ceil(warehouseRaw * (effectiveNonFbaDailySales / effectiveTotalDailySales));
-      warehouseAvailable = Math.max(0, warehouseRaw - nonFbaReserve);
+    // --- GAS流: 自社理論値 vs Amazon推奨数の小さい方を採用 (Amazon推奨の多めに出る弱点を抑制) ---
+    // rawNeeded(自社理論)が既にあるのでそれをベースに min(rawNeeded, amazonReco) で切り詰め
+    // ※ amazonReco === null (列欠損) の場合は自社理論のみ採用 (Codex指摘4: 0 vs null を区別)
+    let boundedNeeded = rawNeeded;
+    if (rawNeeded > 0 && amazonReco !== null && amazonReco !== undefined && amazonReco < rawNeeded) {
+      boundedNeeded = amazonReco;
     }
 
     // --- 送れる数 ---
-    let recommendedQty = Math.min(rawNeeded, warehouseAvailable);
+    // stockState が revivable_long_oos / dead_candidate の SKU は推奨数ゼロ固定 (FBA欠品タブで別扱い)
+    let recommendedQty;
+    if (stockState === 'revivable_long_oos' || stockState === 'dead_candidate') {
+      recommendedQty = 0;
+    } else {
+      recommendedQty = Math.min(boundedNeeded, warehouseAvailable);
+    }
 
     // --- 有効期限チェック: 同一期限のものしか1回の納品で送れない ---
     // ※ FBAは同一商品で期限違いを同梱不可 → 必ず同一期限のみ送る
@@ -230,13 +232,9 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
     // --- 最低出荷日数フィルター: 送っても○日分に満たない場合は除外（入荷待ちの方が効率的） ---
     // FBA在庫0でも1日分未満なら送る意味がないので除外
     // ※ 有効期限管理商品は除外しない（古い期限の在庫が滞留して廃棄リスクになるため）
+    // hasExpiryManagement は上位スコープで既定義済み (effectiveFbaStock 計算時に必要だったため)
     const minShipmentDays = parseInt(settings.min_shipment_cover_days || 7);
     let skippedByMinDays = false;
-    const hasExpiryManagement = (() => {
-      if (!mapping.logizard_code) return false;
-      const locations = getWarehouseLocationsByCode(mapping.logizard_code);
-      return locations.some(l => l.expiry_date && l.expiry_date.trim() !== '');
-    })();
     if (recommendedQty > 0 && dailySales > 0 && !hasExpiryManagement) {
       const coverDays = recommendedQty / dailySales;
       // FBA在庫0: 最低1日分は必要（それ未満は焼け石に水）
@@ -344,21 +342,27 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
 
     items.push({
       amazon_sku: sku,
-      asin: mapping.asin || '',
+      asin: mapping.asin || snap.asin || '',
       product_name: mapping.product_name || snap.product_name || '',
       ne_code: mapping.ne_code || '',
       is_set: mapping.is_set ? true : false,
       set_components: components || null,
+
+      // SKU状態分類 (タブ振り分け用)
+      stock_state: stockState,
+      alert_type: snap.alert_type || null,
+      is_expiry_managed: hasExpiryManagement,
 
       // FBA在庫
       fba_available: fbaAvailable,
       fba_inbound_working: inboundWorking,
       fba_inbound_working_report: reportWorking,
       fba_inbound_working_source: workingSource,
+      fba_inbound_working_effective: inboundWorking,
       fba_inbound_shipped: inboundShipped,
       fba_inbound_received: inboundReceived,
       working_first_seen: snap.working_first_seen || null,
-      working_expired: inboundWorking === 0 && reportWorking > 0,
+      working_expired: false, // working_first_seen 機構は廃止
       effective_fba_stock: effectiveFbaStock,
 
       // 販売
@@ -389,6 +393,9 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
 
       // 推奨
       recommended_qty: rawRecommendedQty,
+      amazon_recommended_qty: amazonReco, // null許容 (Codex指摘4: 0 と未取得を区別)
+      raw_needed_before_amazon_cap: rawNeeded, // Amazon推奨で切り詰める前の自社理論値
+      amazon_reco_capped: amazonReco !== null && amazonReco !== undefined && amazonReco < rawNeeded,
       expiry_limited: expiryLimited,
       expiry_date: expiryDate,
       expiry_same_qty: expirySameQty,
@@ -574,4 +581,83 @@ function hashCode(str) {
     hash |= 0;
   }
   return Math.abs(hash);
+}
+
+/**
+ * RESTOCK最新行と PLANNING 最新行 (あれば) をマージして、
+ * 旧 daily_snapshots と互換の snap オブジェクトを生成する
+ *
+ * RESTOCK: 必須、全SKUの主軸 (30日販売、在庫内訳、Amazon推奨数、価格、警告)
+ * PLANNING: 補助、欠落許容 (7/60/90日販売、季節性、サイズ、低在庫手数料情報)
+ */
+function mergeRestockWithPlanning(r, p) {
+  const planning = p || {};
+  return {
+    amazon_sku: r.amazon_sku,
+    product_name: r.product_name || '',
+    asin: r.asin || '',
+    fnsku: r.fnsku || '',
+
+    // FBA在庫 (RESTOCK由来、主軸)
+    fba_available: r.fba_available || 0,
+    fba_inbound_working: r.fba_inbound_working || 0,
+    fba_inbound_shipped: r.fba_inbound_shipped || 0,
+    fba_inbound_received: r.fba_inbound_received || 0,
+    fba_unfulfillable: r.fba_unfulfillable || 0,
+
+    // 販売データ (30d は RESTOCK、7/60/90d は PLANNING 補助)
+    units_sold_30d: r.units_sold_30d || 0,
+    units_sold_7d: planning.units_sold_7d ?? 0,
+    units_sold_60d: planning.units_sold_60d ?? 0,
+    units_sold_90d: planning.units_sold_90d ?? 0,
+
+    // 供給日数 (RESTOCK が主、PLANNING フォールバック)
+    days_of_supply: r.days_of_supply ?? 0,
+
+    // 価格 (RESTOCK=your_price、PLANNING=featured_offer / lowest)
+    your_price: r.your_price ?? planning.featured_offer_price ?? 0,
+    featured_offer_price: planning.featured_offer_price ?? 0,
+    lowest_price: planning.lowest_price ?? 0,
+    sales_rank: planning.sales_rank ?? 0,
+
+    // サイズ・季節 (PLANNING 専用)
+    per_unit_volume: planning.per_unit_volume ?? 0,
+    is_seasonal: planning.is_seasonal || '',
+    season_name: planning.season_name || '',
+
+    // 低在庫手数料・過剰在庫 (PLANNING 専用、アラート用)
+    short_term_dos: planning.short_term_dos ?? 0,
+    long_term_dos: planning.long_term_dos ?? 0,
+    low_inv_fee_applied: planning.low_inv_fee_applied || '',
+    low_inv_fee_exempt: planning.low_inv_fee_exempt || '',
+    estimated_excess_qty: planning.estimated_excess_qty ?? 0,
+    estimated_storage_cost: planning.estimated_storage_cost ?? 0,
+
+    // RESTOCK 固有 (新規)
+    amazon_recommended_qty: r.amazon_recommended_qty,   // null許容
+    amazon_recommended_date: r.amazon_recommended_date || null,
+    alert_type: r.alert_type || null,
+
+    // 互換性用
+    snapshot_date: (r.updated_at || '').slice(0, 10) || new Date().toISOString().slice(0, 10),
+    working_first_seen: null, // 旧 working_first_seen 機構は廃止
+  };
+}
+
+/**
+ * SKU状態を分類 (納品推奨タブとFBA欠品タブの振り分け判定用)
+ *
+ * normal:             在庫あり (通常運転)
+ * recent_oos:         FBA在庫0 + 30日販売あり (直近欠品、通常補充ルート)
+ * revivable_long_oos: FBA在庫0 + 30日販売0 + Amazon推奨>=閾値 (長期欠品だが復活余地あり)
+ * dead_candidate:     FBA在庫0 + 30日販売0 + Amazon推奨0または未取得 (廃番候補)
+ */
+function classifyStockState(fbaAvailable, sold30d, amazonReco, oosThreshold) {
+  if (fbaAvailable > 0) return 'normal';
+  if (sold30d > 0) return 'recent_oos';
+  // fba=0 AND sold30d=0
+  if (typeof amazonReco === 'number' && amazonReco >= oosThreshold) {
+    return 'revivable_long_oos';
+  }
+  return 'dead_candidate';
 }

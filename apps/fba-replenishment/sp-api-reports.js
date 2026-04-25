@@ -167,19 +167,14 @@ export async function fetchFbaInventory() {
 // ======================================================
 // 全レポートまとめて取得
 // ======================================================
+// INVENTORY レポートは RESTOCK の部分集合で冗長 + 未使用のため取得停止
 export async function fetchAllReports() {
   const results = { planning: null, restock: null, inventory: null, errors: [] };
 
   // 順次実行（SP-APIのcreateReport競合を完全に回避）
-  console.log('[SP-API] 3種レポートを順次取得開始...');
+  console.log('[SP-API] RESTOCK + PLANNING を順次取得開始...');
 
-  try {
-    results.planning = await fetchPlanningData();
-  } catch (e) {
-    console.error('[SP-API] PLANNING_DATA 失敗:', e.message);
-    results.errors.push({ report: 'planning', error: e.message });
-  }
-
+  // 主軸: RESTOCK (必須)
   try {
     results.restock = await fetchRestockRecommendations();
   } catch (e) {
@@ -187,11 +182,12 @@ export async function fetchAllReports() {
     results.errors.push({ report: 'restock', error: e.message });
   }
 
+  // 補助: PLANNING (欠落許容、60/90日販売などの参考情報用)
   try {
-    results.inventory = await fetchFbaInventory();
+    results.planning = await fetchPlanningData();
   } catch (e) {
-    console.error('[SP-API] INVENTORY 失敗:', e.message);
-    results.errors.push({ report: 'inventory', error: e.message });
+    console.error('[SP-API] PLANNING_DATA 失敗:', e.message);
+    results.errors.push({ report: 'planning', error: e.message });
   }
 
   console.log('[SP-API] 順次取得完了');
@@ -249,5 +245,67 @@ export function normalizePlanningRow(raw) {
     // サイズ
     per_unit_volume: parseFloat(raw['per-unit-volume'] || 0),
     storage_type: raw['storage-type'] || '',
+  };
+}
+
+/**
+ * RESTOCKデータから必要列を正規化して返す
+ * 列名は英語/日本語どちらでも来るため両対応
+ *
+ * NOTE: amazon_recommended_qty は `null` と `0` を区別する (0は明示的推奨、nullは列欠損)
+ */
+export function normalizeRestockRow(raw) {
+  // 数値フィールドで「空文字は null、それ以外はパース」を区別するユーティリティ
+  const parseIntOrNull = (v) => {
+    if (v === undefined || v === null || v === '') return null;
+    const n = parseInt(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const parseFloatOrNull = (v) => {
+    if (v === undefined || v === null || v === '') return null;
+    const n = parseFloat(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const pick = (...keys) => {
+    for (const k of keys) {
+      if (raw[k] !== undefined && raw[k] !== '') return raw[k];
+    }
+    return undefined;
+  };
+
+  const sku = pick('Merchant SKU', 'sku', 'merchant-sku') || '';
+  const asin = pick('ASIN', 'asin') || '';
+  const fnsku = pick('FNSKU', 'fnsku') || '';
+  const productName = pick('Product Name', '商品名', 'product-name') || '';
+
+  return {
+    amazon_sku: sku,
+    fnsku,
+    asin,
+    product_name: productName,
+
+    // 在庫内訳 (在庫にある = Available)
+    fba_available: parseInt(pick('Available', '在庫にある', 'available') || 0),
+    // 進行中 (Working) — レポート側は信頼せず、Inbound API override で上書き前提
+    fba_inbound_working: parseInt(pick('Working', '進行中', 'working') || 0),
+    fba_inbound_shipped: parseInt(pick('Shipped', '出荷済み', 'shipped') || 0),
+    fba_inbound_received: parseInt(pick('Receiving', '受領中', 'receiving') || 0),
+    fba_unfulfillable: parseInt(pick('Unfulfillable', '販売不可', 'unfulfillable') || 0),
+
+    // 販売データ (RESTOCKは30日のみ、7/60/90日はPLANNING補助)
+    units_sold_30d: parseInt(pick('Units Sold Last 30 Days', '過去30日間に販売されたユニット数', 'units-sold-last-30-days') || 0),
+
+    // Amazon推奨数: null許容 (0 と未取得を区別)
+    amazon_recommended_qty: parseIntOrNull(pick('Recommended replenishment qty', '推奨される在庫補充数', 'recommended-replenishment-qty')),
+    amazon_recommended_date: pick('Recommended ship date', '推奨発送日', 'recommended-ship-date') || null,
+
+    // 警告 (out_of_stock / low_stock / null)
+    alert_type: pick('Alert', '警告', 'alert') || null,
+
+    // 価格
+    your_price: parseFloatOrNull(pick('Price', '価格', 'price')),
+
+    // 供給日数 (AmazonのML計算値)
+    days_of_supply: parseFloatOrNull(pick('Days of Supply at Amazon Fulfillment Network', 'Amazonフルフィルメントセンターでの在庫日数', 'days-of-supply-at-amazon-fulfillment-network')),
   };
 }

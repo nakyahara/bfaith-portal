@@ -96,6 +96,71 @@ router.get('/items/all-codes', rateLimitMiddleware('rakuten'), async (req, res) 
 });
 
 // ==========================================
+// 全SKU取得（粗利分析の sku_map 構築用）
+// ==========================================
+// 各商品のvariantsまで展開し、AM/AL/W 3コードをSKU粒度で返す。
+// AM = merchantDefinedSkuId（システム連携用SKU番号）
+// AL = variants のキー（SKU管理番号）
+// W  = item.itemNumber（商品番号）
+
+router.get('/items/all-skus', rateLimitMiddleware('rakuten'), async (req, res) => {
+  try {
+    const skus = [];
+    let cursorMark = '*';
+    let pageCount = 0;
+
+    for (let page = 0; page < 100; page++) {
+      const apiPath = `/es/2.0/items/search?cursorMark=${encodeURIComponent(cursorMark)}&hits=100`;
+      const result = await rmsRequest(apiPath);
+
+      if (result.status !== 200) {
+        return errorResponse(res, { status: result.status, error: 'RMS_API_ERROR', message: `HTTP ${result.status}`, requestId: req.requestId });
+      }
+
+      const items = result.data.results || result.data.items || [];
+      for (const r of items) {
+        const item = r.item || r;
+        const itemNumber = item.itemNumber || '';
+        const manageNumber = item.manageNumber || '';
+        const variants = item.variants || {};
+        const variantKeys = Object.keys(variants);
+
+        if (variantKeys.length === 0) {
+          // variantが無い商品（単一SKU）はitem情報だけ残す
+          skus.push({
+            itemNumber,
+            manageNumber,
+            skuManageNumber: manageNumber,
+            systemSkuNumber: '',
+          });
+        } else {
+          for (const key of variantKeys) {
+            const v = variants[key] || {};
+            skus.push({
+              itemNumber,
+              manageNumber,
+              skuManageNumber: key,
+              systemSkuNumber: v.merchantDefinedSkuId || '',
+            });
+          }
+        }
+      }
+
+      pageCount++;
+      if (!result.data.nextCursorMark || items.length === 0) break;
+      cursorMark = result.data.nextCursorMark;
+
+      // Rakuten RMS レート制限対策（1req/sec 想定で500ms sleep）
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    okResponse(res, { skus, count: skus.length, pages: pageCount });
+  } catch (e) {
+    errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
+  }
+});
+
+// ==========================================
 // 商品詳細取得（メルカリ同期で使用）
 // ==========================================
 
