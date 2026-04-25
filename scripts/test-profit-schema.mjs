@@ -990,36 +990,150 @@ console.log('\n=== Test 14: classifyProduct 分類網羅 ===');
   // days_since_sale は 6日（2026-04-15 → 2026-04-21） → retirement 閾値未達
   expectEq(r.reason.includes('販売実績不足') || r.reason.includes('閾値外'), true, '14l 理由');
 
-  // 観察継続 正例: GMROI 150%（100-200 範囲）
-  //   売価500 原価200 送料50 → 利益単価 450-250=200
-  //   sales_period 30, avg_stock 20, cost 200 → GMROI = (200×30)/(20×200)×100 = 150%
-  //   latest_stock 20, periodDays 90 → 回転 20/(30/90) = 60日 (good_stock 30-90 内)
-  //   GMROI 150% は good_stock (>200) 条件を満たさないため 観察継続 へ
+  // 観察継続 正例: 年率 GMROI 約 152%（100-200 範囲）
+  //   売価800 原価200 送料50 → 利益単価 470, 粗利率 58.75%
+  //   periodDays=90, sales_period 4, avg_stock 25
+  //   period_profit = 470×4 = 1880
+  //   avg_stock_value = 25×200 = 5000
+  //   period gmroi = 1880/5000 × 100 = 37.6%
+  //   年率 = 37.6 × (365/90) ≈ 152.49%  → 観察 (100-200) 範囲
+  //   latest_stock 25, dailyAvg = 4/90 ≈ 0.0444 → 回転 25/0.0444 ≈ 562日（>120）
+  //   観察 (GMROI 100-200) が 値下げ より先に判定されるので 観察継続 になる
   r = classifyProduct(mkRow({
     売上分類: 1,
-    標準売価: 500, 原価: 200, 送料: 50,
+    標準売価: 800, 原価: 200, 送料: 50,
     daily_last_sale: '2026-04-15',
-    sales_period: 30, sales_30d: 10, sales_90d: 30,
-    avg_stock: 20, latest_stock: 20,
+    sales_period: 4, sales_30d: 1, sales_90d: 4,
+    avg_stock: 25, latest_stock: 25,
   }), thresholds, opts);
-  expectEq(r.classification, '観察継続', '14m 観察継続 正例（GMROI 150%）');
-  expectEq(Math.round(r.metrics.gmroi), 150, '14m 実GMROI=150');
+  expectEq(r.classification, '観察継続', '14m 観察継続 正例（年率 GMROI ≈ 152%）');
+  expectEq(Math.round(r.metrics.gmroi), 152, '14m 年率 GMROI ≈ 152');
 
-  // 仕入 warn_gmroi_lt 単独: 販売ありだが GMROI 14% < 50% (warn) → 撤退警戒
-  //   turnover < 180 を保ち、retire の GMROI+turnover 複合条件にはかからないようにする
+  // 仕入 warn_gmroi_lt 単独: 年率 GMROI 約 28% < 50% (warn) → 撤退警戒
+  //   売価1000 原価500 送料50 → 利益単価 350
+  //   periodDays=90, sales_period 20
+  //   period_profit = 350×20 = 7000
+  //   avg_stock 200 → avg_stock_value = 200×500 = 100000
+  //   period gmroi = 7%、年率 = 7 × 4.0556 ≈ 28%
+  //   - 年率 28 < retire_gmroi_lt 30、turnover 135 < 180 → retire 複合条件 NOT トリガー
+  //   - 年率 28 < warn_gmroi_lt 50 → 撤退警戒
   r = classifyProduct(mkRow({
     売上分類: 3,
-    標準売価: 1000, 原価: 500, 送料: 50,  // 利益単価 = 350
-    daily_last_sale: '2026-04-15',  // 最近販売あり
+    標準売価: 1000, 原価: 500, 送料: 50,
+    daily_last_sale: '2026-04-15',
     sales_period: 20, sales_30d: 8, sales_90d: 20,
-    avg_stock: 100, latest_stock: 30,
-    // GMROI = (350×20)/(100×500)×100 = 7000/50000×100 = 14%
-    // 回転 = 30/(20/90) = 135日 (< 180, retire 複合条件スキップ)
+    avg_stock: 200, latest_stock: 30,  // turnover = 30/(20/90) = 135日
   }), thresholds, opts);
-  expectEq(r.classification, '撤退警戒', '14n 仕入 GMROI<50% 単独 → 撤退警戒');
+  expectEq(r.classification, '撤退警戒', '14n 仕入 年率 GMROI<50% 単独 → 撤退警戒');
   expectEq(r.reason.includes('GMROI') && r.reason.includes('50%'), true, '14n 理由に GMROI/50%');
 
-  console.log('[OK] classifyProduct 分類網羅テスト完了');
+  // ─── Test 14o: annualizeGmroiPercent ヘルパー + 閾値境界（Codex R1 Medium 反映） ───
+  const { annualizeGmroiPercent, DAYS_PER_YEAR } = await import('../apps/profit-analysis/candidates.js');
+  const close = (a, b, eps = 0.01) => Math.abs(a - b) <= eps;
+
+  expectEq(DAYS_PER_YEAR, 365, '14o DAYS_PER_YEAR=365');
+  expectEq(close(annualizeGmroiPercent(100, 100, 365), 100), true, '14o periodDays=365 で annualized = period');
+  expectEq(close(annualizeGmroiPercent(100, 100, 90), 100 * 365 / 90), true, '14o periodDays=90 の年率化');
+  expectEq(close(annualizeGmroiPercent(100, 100, 30), 100 * 365 / 30), true, '14o periodDays=30 の年率化');
+  expectEq(annualizeGmroiPercent(0, 100, 90), 0, '14o period_profit=0');
+  expectEq(annualizeGmroiPercent(100, 0, 90), null, '14o avg_stock_value=0 で null');
+  expectEq(annualizeGmroiPercent(100, -1, 90), null, '14o avg_stock_value<0 で null');
+  expectEq(annualizeGmroiPercent(100, 100, 0), null, '14o periodDays=0 で null');
+  expectEq(annualizeGmroiPercent(100, 100, -5), null, '14o periodDays<0 で null');
+
+  // 境界: GMROI = ちょうど 200 → 優良条件は 「GMROI > 200」strict なので 観察（100〜200 inclusive）へ
+  //   profit 180, avg_stock_value 365, periodDays 90 → annualized 180 × 365/90 / 365 × 100 = 200.000
+  //   売価 300, 原価 1, 送料 89 → 利益単価 = 270-90 = 180
+  //   avg_stock 365, cost 1 → avg_stock_value = 365
+  r = classifyProduct(mkRow({
+    売上分類: 1,
+    標準売価: 300, 原価: 1, 送料: 89,
+    daily_last_sale: '2026-04-15',
+    sales_period: 1, sales_30d: 1, sales_90d: 1,
+    avg_stock: 365, latest_stock: 365,
+  }), thresholds, opts);
+  expectEq(close(r.metrics.gmroi, 200), true, '14o 境界 GMROI = 200.00');
+  // turnover 365 / (1/90) = 32850日 → 30-90 範囲外、観察条件（GMROI 100-200）inclusive でマッチ
+  expectEq(r.classification, '観察継続', '14o GMROI=200（優良は strict >200）→ 観察');
+
+  // 境界: GMROI = ちょうど 100 → 観察下限 inclusive
+  //   profit 90, avg_stock_value 365, periodDays 90 → annualized = 100
+  r = classifyProduct(mkRow({
+    売上分類: 1,
+    標準売価: 200, 原価: 1, 送料: 89,  // 利益単価 = 180-90 = 90
+    daily_last_sale: '2026-04-15',
+    sales_period: 1, sales_30d: 1, sales_90d: 1,
+    avg_stock: 365, latest_stock: 365,
+  }), thresholds, opts);
+  expectEq(close(r.metrics.gmroi, 100), true, '14o 境界 GMROI = 100.00');
+  expectEq(r.classification, '観察継続', '14o GMROI=100（観察下限 inclusive）→ 観察');
+
+  // 境界: GMROI = ちょうど 50 （仕入 warn 境界 strict <） → 警戒条件はトリガーしない
+  //   profit 45, avg_stock_value 365, periodDays 90 → annualized = 50
+  r = classifyProduct(mkRow({
+    売上分類: 3,
+    標準売価: 100, 原価: 1, 送料: 44,  // 利益単価 = 90-45 = 45
+    daily_last_sale: '2026-04-15',  // 最近販売あり、retire 日数条件 NG
+    sales_period: 1, sales_30d: 1, sales_90d: 1,
+    avg_stock: 365, latest_stock: 50,  // turnover 50/(1/90) = 4500 → retire_turnover_gt 180 超
+    // 警戒条件は warn_gmroi_lt=50 vs annualized 50 → NOT < 50 (strict) → warn トリガーしない
+    // retire 条件は retire_gmroi_lt=30 vs 50 → NOT < 30 → retire-gmroi もトリガーしない
+  }), thresholds, opts);
+  expectEq(close(r.metrics.gmroi, 50), true, '14o 境界 GMROI = 50.00 (仕入)');
+  // どの retire/warn もトリガーしない → 回転日数は大きいので 値下げ or セット 候補
+  //   margin_rate = 45/100 * 100 = 45% > 20%、turnover > 120 → 値下げ候補
+  expectEq(r.classification, '値下げ候補', '14o 仕入 GMROI=50（warn strict <50）→ 警戒せず 値下げ候補 へ');
+
+  console.log('[OK] classifyProduct 分類網羅テスト完了（14a-14o）');
+}
+
+// ─── Test 14p: periodDays 一貫性（同じ販売・在庫レートで分類不変） ───
+console.log('\n=== Test 14p: periodDays 30/60/90 で分類と GMROI がほぼ一致 ===');
+{
+  const { classifyProduct } = await import('../apps/profit-analysis/candidates.js');
+  const {
+    DEFAULT_RETIREMENT_THRESHOLDS,
+    DEFAULT_CLASSIFICATION_THRESHOLDS,
+  } = await import('../apps/profit-analysis/retirement-thresholds.js');
+  const thresholds = {
+    retirement: DEFAULT_RETIREMENT_THRESHOLDS,
+    classification: DEFAULT_CLASSIFICATION_THRESHOLDS,
+  };
+  const close = (a, b, eps = 1.0) => Math.abs(a - b) <= eps;
+
+  function run(periodDays, multiplier) {
+    // 販売レート: 30日あたり 10個 を維持、期間に比例して sales_period が増える
+    return classifyProduct({
+      商品コード: 'RATE001', 商品名: 'periodDays一貫性テスト', 売上分類: 1,
+      標準売価: 800, 原価: 200, 送料: 50, 消費税率: 10,
+      seasonality_flag: 0, new_product_flag: 0,
+      仕入先コード: 'S', 管理在庫数: 50,
+      daily_last_sale: '2026-04-15',
+      sales_period: 10 * multiplier,
+      sales_30d: 10, sales_90d: 30,
+      monthly_last_month: '2026-04',
+      avg_stock: 50, stock_snapshot_months: 6, latest_stock: 50,
+      retirement_status: null,
+    }, thresholds, { today: '2026-04-21', periodDays });
+  }
+
+  const r30 = run(30, 1);
+  const r60 = run(60, 2);
+  const r90 = run(90, 3);
+
+  // 同じ販売レート（30日 10個 = 60日 20個 = 90日 30個）で、年率 GMROI はほぼ同じはず
+  expectEq(close(r30.metrics.gmroi, r60.metrics.gmroi), true,
+    `14p GMROI は periodDays 30 (${r30.metrics.gmroi}) と 60 (${r60.metrics.gmroi}) で近い`);
+  expectEq(close(r30.metrics.gmroi, r90.metrics.gmroi), true,
+    `14p GMROI は periodDays 30 (${r30.metrics.gmroi}) と 90 (${r90.metrics.gmroi}) で近い`);
+
+  // 分類も同一（販売レートが同じだから）
+  expectEq(r30.classification === r60.classification, true,
+    `14p 分類は periodDays 30 と 60 で一致（30:${r30.classification} / 60:${r60.classification}）`);
+  expectEq(r30.classification === r90.classification, true,
+    `14p 分類は periodDays 30 と 90 で一致（30:${r30.classification} / 90:${r90.classification}）`);
+
+  console.log(`[OK] periodDays 一貫性：分類=${r30.classification}、年率 GMROI≈${Math.round(r30.metrics.gmroi)}%`);
 }
 
 // ───────────────────────────────────────────────

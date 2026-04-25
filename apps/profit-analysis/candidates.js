@@ -19,6 +19,25 @@
  *   applyEarlyWarning(candidates, earlyWarning)
  */
 
+// ─── 定数・ヘルパー ───
+
+/** GMROI 年率化に使う日数（うるう年 0.27% 差は実務影響なしで定数扱い） */
+export const DAYS_PER_YEAR = 365;
+
+/**
+ * GMROI を年率（%）で算出する。設計書§14 の閾値（優良 >200、観察 100-200、
+ * 仕入 retire <30 / warn <50）は全て industry-standard の年率前提。
+ *
+ *   gmroi(年率) = 期間粗利 × (DAYS_PER_YEAR / periodDays) / 平均在庫金額 × 100
+ *
+ * @returns {number|null} 年率 GMROI（%）、計算不能なら null
+ */
+export function annualizeGmroiPercent(periodProfit, avgStockValue, periodDays) {
+  if (!Number.isFinite(avgStockValue) || avgStockValue <= 0) return null;
+  if (!Number.isFinite(periodDays) || periodDays <= 0) return null;
+  return (Number(periodProfit) * (DAYS_PER_YEAR / periodDays)) / avgStockValue * 100;
+}
+
 // ─── SQL 取得 ───
 
 /**
@@ -191,7 +210,7 @@ export function classifyProduct(row, thresholds, opts = {}) {
 
   const periodProfit = profitPerUnit * salesPeriodQty;
   const avgStockValue = avgStock * cost;
-  const gmroi = avgStockValue > 0 ? (periodProfit / avgStockValue * 100) : null;
+  const gmroi = annualizeGmroiPercent(periodProfit, avgStockValue, periodDays);
 
   const dailyAvg = salesPeriodQty / periodDays;
   const turnoverDays = dailyAvg > 0 ? Math.round(latestStock / dailyAvg) : null;
