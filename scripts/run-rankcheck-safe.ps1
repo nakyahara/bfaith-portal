@@ -29,8 +29,10 @@ param(
 $ErrorActionPreference = 'Stop'
 
 # --- パス構成 ---
+# repo は WarehouseServer と clone を共有する想定で C:\Users\bfaith\bfaith-portal を既定とする。
+# 別位置に置く場合は RANKCHECK_REPO_DIR env で上書き可。
 $root    = 'C:\tools\rankcheck-runner'
-$repo    = Join-Path $root 'bfaith-portal'
+$repo    = if ($env:RANKCHECK_REPO_DIR) { $env:RANKCHECK_REPO_DIR } else { 'C:\Users\bfaith\bfaith-portal' }
 $dataDir = Join-Path $root 'data'
 $logDir  = Join-Path $root 'logs'
 $lockFile = Join-Path $root 'runner.lock'
