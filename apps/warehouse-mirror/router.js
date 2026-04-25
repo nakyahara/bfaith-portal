@@ -36,12 +36,16 @@ function ensureDB(req, res, next) {
   next();
 }
 
-// 同期APIキー認証
+// 同期APIキー認証 (二重防御: server.js 側の requireSyncKeyStrict が一次防御)
 function requireSyncKey(req, res, next) {
   const key = process.env.MIRROR_SYNC_KEY;
-  if (!key) return next(); // 未設定なら認証スキップ（開発用）
+  if (!key) {
+    // dev で明示フラグがあれば skip、そうでなければ拒否
+    if (process.env.ALLOW_INSECURE_MIRROR_SYNC === '1') return next();
+    return res.status(503).json({ error: 'mirror_sync_key_unset' });
+  }
   const provided = req.headers['x-sync-key'] || req.query.sync_key;
-  if (provided !== key) return res.status(401).json({ error: 'Invalid sync key' });
+  if (provided !== key) return res.status(401).json({ error: 'invalid_sync_key' });
   next();
 }
 

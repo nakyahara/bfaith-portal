@@ -12,7 +12,7 @@ import rankingRouter from './apps/ranking-checker/router.js';
 import { startScheduler } from './apps/ranking-checker/scheduler.js';
 import { startWarehouseHealthcheck } from './apps/warehouse/healthcheck.js';
 import { startMetrics } from './apps/observability/metrics.js';
-import { bootStart, bootEnd, bootNote, bootFail } from './apps/observability/boot-log.js';
+import { bootStart, bootEnd, bootNote, bootFail, getBootId } from './apps/observability/boot-log.js';
 import profitRouter from './apps/profit-calculator/router.js';
 import { startPriceWorker, startMaintenanceJobs } from './apps/profit-calculator/price-scheduler.js';
 import fbaRouter from './apps/fba-replenishment/router.js';
@@ -41,6 +41,15 @@ const PORT = process.env.PORT || 3000;
 const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-secret-change-me';
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
+
+// production では MIRROR_SYNC_KEY 未設定だと sync endpoint が無防備になるため即起動失敗。
+// dev で skip したい場合は ALLOW_INSECURE_MIRROR_SYNC=1 を明示する。
+if (process.env.NODE_ENV === 'production'
+    && !process.env.MIRROR_SYNC_KEY
+    && process.env.ALLOW_INSECURE_MIRROR_SYNC !== '1') {
+  console.error('[FATAL] MIRROR_SYNC_KEY 未設定で production 起動不可 (ALLOW_INSECURE_MIRROR_SYNC=1 で回避可)');
+  process.exit(78);
+}
 
 // --- データディレクトリ初期化 ---
 function ensureDataDir() {
@@ -95,6 +104,8 @@ const LARGE_BODY_ROUTES = [
   '/apps/ranking-checker/data/import',      // 履歴付き JSON バックアップ復元 (router 側で 50MB)
   // /service-api/* は serviceAuth 後に独自 parser が走るため、この配列ではなく
   // 上記 middleware で startsWith('/service-api/') として一括 exempt している。
+  // /apps/mirror/api/sync* は requireSyncKey 後に独自 parser (8MB) が走るため、
+  // startsWith 判定で一括 exempt している (下の startsWith 分岐参照)。
 ];
 const globalJsonParser = express.json({ limit: '10mb' });
 app.use((req, res, next) => {
@@ -105,6 +116,8 @@ app.use((req, res, next) => {
     // 走るためここでは parse しない。Bearer 検証前に body を読まないことで
     // 未認可 DoS 面を閉じる。
     if (normalizedPath.startsWith('/service-api/') || normalizedPath === '/service-api') return next();
+    // /apps/mirror/api/sync* も同様に API key 認証前 body parse を避ける。
+    if (normalizedPath.startsWith('/apps/mirror/api/sync')) return next();
     if (LARGE_BODY_ROUTES.includes(normalizedPath)) return next();
   }
   return globalJsonParser(req, res, next);
@@ -446,7 +459,74 @@ app.use('/apps/ranking-checker', requireAppAccess('ranking-checker'), rankingRou
 app.use('/apps/profit-calculator', requireAppAccess('profit-calculator'), profitRouter);
 app.use('/apps/fba-replenishment', requireAppAccess('fba-replenishment'), fbaRouter);
 app.use('/apps/warehouse', requireAppAccess('warehouse'), warehouseRouter);
-app.use('/apps/mirror', express.json({ limit: '100mb' }), mirrorRouter);  // ミラー同期APIはセッション認証不要（APIキー認証）
+
+// === Mirror subtree middleware (Codex 6周レビュー反映) ===
+// accessLog は /apps/mirror 全体に掛ける (401含めて全requestを観測できる)。
+// 認証+8MB parser+parser error handler は /apps/mirror/api/sync* のみ (mutation専用)。
+// 既存の read API (/apps/mirror/api/products など) は従来通り認証なしで素通し。
+function mirrorAccessLog(req, res, next) {
+  const start = Date.now();
+  res.on('finish', () => {
+    const dur = Date.now() - start;
+    const cl = req.headers['content-length'] || '';
+    const rb = req.rawBodyBytes ?? '';
+    const runId = req.headers['x-sync-run-id'] || '';
+    console.log(
+      `[Mirror-IN] boot=${getBootId()} method=${req.method} path=${req.path} ` +
+      `ip=${req.ip} content_length=${cl} raw_bytes=${rb} ` +
+      `status=${res.statusCode} duration_ms=${dur} sync_run_id=${runId}`
+    );
+  });
+  next();
+}
+
+// MIRROR_SYNC_KEY 必須化 (未設定 production は起動失敗で既に弾かれているので、ここは二重防御)。
+// dev で skip したい時は ALLOW_INSECURE_MIRROR_SYNC=1 を明示。
+function requireSyncKeyStrict(req, res, next) {
+  const key = process.env.MIRROR_SYNC_KEY;
+  if (!key) {
+    if (process.env.ALLOW_INSECURE_MIRROR_SYNC === '1') return next();
+    return res.status(503).json({ error: 'mirror_sync_key_unset' });
+  }
+  const provided = req.headers['x-sync-key'] || req.query.sync_key;
+  if (provided !== key) return res.status(401).json({ error: 'invalid_sync_key' });
+  next();
+}
+
+// express.json が投げる parser error を分類して log + 適切な status code で返す。
+function mirrorParserErrorHandler(err, req, res, next) {
+  if (err && err.type === 'entity.too.large') {
+    console.error(
+      `[Mirror-ERR] entity.too.large path=${req.path} ip=${req.ip} ` +
+      `limit=${err.limit} content_length=${err.length}`
+    );
+    return res.status(413).json({ error: 'payload_too_large', limit: err.limit });
+  }
+  if (err && err.type === 'encoding.unsupported') {
+    console.error(`[Mirror-ERR] encoding.unsupported path=${req.path} encoding=${err.encoding}`);
+    return res.status(415).json({ error: 'unsupported_encoding' });
+  }
+  if (err && err.type === 'request.aborted') {
+    console.warn(`[Mirror-ERR] request.aborted path=${req.path} ip=${req.ip}`);
+    return;  // client gone, no response
+  }
+  return next(err);
+}
+
+app.use('/apps/mirror', mirrorAccessLog);
+
+// /api/sync* のみ API キー認証 + 8MB parser + error handler を適用。
+app.use('/apps/mirror/api/sync', requireSyncKeyStrict);
+app.use('/apps/mirror/api/sync', express.json({
+  limit: '8mb',
+  inflate: false,                                     // gzip は 415 で reject
+  verify: (req, res, buf) => { req.rawBodyBytes = buf.length; },
+}));
+app.use('/apps/mirror/api/sync', mirrorParserErrorHandler);
+
+// read API (/api/products 等) は従来通り認証なしで素通し。
+// mirrorRouter 内部の `router.post('/api/sync', requireSyncKey, ...)` が二重防御として残る。
+app.use('/apps/mirror', mirrorRouter);
 // サービスAPI（Render→ミニPC、トークン認証）。
 // rankcheck の履歴込みインポートで 10MB を超える可能性があるため 50MB まで許容。
 // 未認可 DoS 回避のため、serviceAuth を body parser **より前** に置く。
