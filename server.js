@@ -31,6 +31,7 @@ import profitAnalysisRouter from './apps/profit-analysis/router.js';
 import mgmtAccountingRouter from './apps/mgmt-accounting/router.js';
 import serviceRouter from './apps/warehouse/service-router.js';
 import { serviceAuth } from './apps/warehouse/service-auth.js';
+import { isWarehouseDbReady } from './apps/warehouse/router.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -96,6 +97,33 @@ if (!users) {
 app.set('trust proxy', 1); // Cloudflare Tunnel経由
 app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
+
+// --- Liveness / Readiness probes (loopback only) ---
+// C:\tools\watchdog\watchdog.ps1 が 30秒毎に http://127.0.0.1:3000/{livez,readyz} を叩く。
+// loopback 限定なので外部からは 404 を返す (情報漏えい / 偵察対策)。
+//
+// trust proxy が有効なので req.ip は X-Forwarded-For を信頼する。実IPは
+// req.socket.remoteAddress を直接見る必要がある。Cloudflare Tunnel経由でも
+// この値は CF のIPであって 127.0.0.1 にはならない。
+function loopbackOnly(req, res, next) {
+  const sock = req.socket?.remoteAddress || '';
+  if (sock === '127.0.0.1' || sock === '::1' || sock === '::ffff:127.0.0.1') return next();
+  return res.status(404).end();
+}
+app.get('/livez', loopbackOnly, (req, res) => {
+  // Express が応答できる = プロセス生存 + event loop 健全。それ以上は判定しない。
+  res.status(200).json({ status: 'alive', pid: process.pid });
+});
+app.get('/readyz', loopbackOnly, (req, res) => {
+  // 「再起動で改善しうる必須初期化」だけを見る。
+  // - warehouse.db: 主要データソース、未init は 503 → watchdog が再起動を打ってよい
+  // - AES-Python など「再起動で直らない」系は readyz には入れない (無意味な再起動ループ防止)
+  if (!isWarehouseDbReady()) {
+    return res.status(503).json({ status: 'not_ready', reason: 'warehouse-db' });
+  }
+  res.status(200).json({ status: 'ready', pid: process.pid });
+});
+
 app.use(express.urlencoded({ extended: true }));
 // グローバル JSON parser (10MB)。ただし大容量受信が必要な endpoint は除外。
 // 除外対象 endpoint は route 側で独自の parser (例: 50MB) を定義する。
