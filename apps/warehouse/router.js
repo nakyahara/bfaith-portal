@@ -45,6 +45,12 @@ function ensureDB(req, res, next) {
   next();
 }
 
+/**
+ * server.js の /readyz probe から参照する。warehouse.db の async init が完了しているかを返す。
+ * watchdog はこの値が true になるまで restart を打たない (起動直後の false positive 防止)。
+ */
+export function isWarehouseDbReady() { return dbReady; }
+
 // ─── API認証（簡易トークン）───
 function requireApiKey(req, res, next) {
   const apiKey = process.env.WAREHOUSE_API_KEY;
