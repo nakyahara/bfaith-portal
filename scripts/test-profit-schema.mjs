@@ -895,7 +895,9 @@ console.log('\n=== Test 14: classifyProduct 分類網羅 ===');
   // 季節性保留（4月は 6,7,8 に含まれない）
   r = classifyProduct(mkRow({ seasonality_flag: 1, season_months: '6,7,8' }), thresholds, opts);
   expectEq(r.classification, '分類外', '14d 季節性オフシーズン → 分類外');
-  expectEq(r.reason, '季節性保留（オフシーズン）', '14d 理由');
+  expectEq(r.reason.startsWith('季節性保留（オフシーズン'), true, '14d 理由は季節性保留 prefix');
+  expectEq(r.reason.includes('手動'), true, '14d 手動フラグの出所表示');
+  expectEq(r.reason.includes('6,7,8'), true, '14d 販売期月表示');
 
   // 季節性だが現在月(4月)が season_months に含まれる
   r = classifyProduct(mkRow({ seasonality_flag: 1, season_months: '3,4,5' }), thresholds, opts);
@@ -1069,19 +1071,21 @@ console.log('\n=== Test 14: classifyProduct 分類網羅 ===');
   expectEq(r.classification, '観察継続', '14o GMROI=100（観察下限 inclusive）→ 観察');
 
   // 境界: GMROI = ちょうど 50 （仕入 warn 境界 strict <） → 警戒条件はトリガーしない
-  //   profit 45, avg_stock_value 365, periodDays 90 → annualized = 50
+  //   profit 45, avg_stock_value 1825, periodDays 90 → annualized ≈ 50
+  //   値下げ候補強化条件 (turnover_lte=540, sales_90d_min=5) を両方満たすデータに調整
+  //   sales_period=5, period_profit=225, avg_stock=1825 → period_gmroi=12.33% × 4.056 ≈ 50%
+  //   latest_stock=20 → turnover = 20/(5/90) = 360日（120〜540 内）
   r = classifyProduct(mkRow({
     売上分類: 3,
-    標準売価: 100, 原価: 1, 送料: 44,  // 利益単価 = 90-45 = 45
+    標準売価: 100, 原価: 1, 送料: 44,  // 利益単価 = 90-45 = 45、margin_rate 45%
     daily_last_sale: '2026-04-15',  // 最近販売あり、retire 日数条件 NG
-    sales_period: 1, sales_30d: 1, sales_90d: 1,
-    avg_stock: 365, latest_stock: 50,  // turnover 50/(1/90) = 4500 → retire_turnover_gt 180 超
+    sales_period: 5, sales_30d: 2, sales_90d: 5,
+    avg_stock: 1825, latest_stock: 20,
     // 警戒条件は warn_gmroi_lt=50 vs annualized 50 → NOT < 50 (strict) → warn トリガーしない
     // retire 条件は retire_gmroi_lt=30 vs 50 → NOT < 30 → retire-gmroi もトリガーしない
   }), thresholds, opts);
   expectEq(close(r.metrics.gmroi, 50), true, '14o 境界 GMROI = 50.00 (仕入)');
-  // どの retire/warn もトリガーしない → 回転日数は大きいので 値下げ or セット 候補
-  //   margin_rate = 45/100 * 100 = 45% > 20%、turnover > 120 → 値下げ候補
+  // どの retire/warn もトリガーしない → 値下げ強化条件 (turnover ≤ 540, sales_90d ≥ 5) も満たすので 値下げ候補
   expectEq(r.classification, '値下げ候補', '14o 仕入 GMROI=50（warn strict <50）→ 警戒せず 値下げ候補 へ');
 
   // ─── Test 14q: launch_date による新商品自動判定（NE 作成日からの自動コピー想定） ───
@@ -1164,7 +1168,173 @@ console.log('\n=== Test 14: classifyProduct 分類網羅 ===');
   expectEq(r.classification, '分類外', '14q NE 形式 launch_date でも新商品判定');
   expectEq(r.reason, '新商品保留', '14q NE 形式 launch_date 理由');
 
-  console.log('[OK] classifyProduct 分類網羅テスト完了（14a-14q）');
+  // ─── Test 14r: 季節性自動判定（detectSeasonality 単体 + classifyProduct 統合） ───
+  //   過去24ヶ月の月別販売分布から「上位3ヶ月で60%以上 + 合計30個以上」なら自動季節性扱い。
+  //   sweetfloral10 / mimosaincense30 等のような商品が値下げ候補に流入しないこと。
+  const { detectSeasonality, SEASONAL_LOOKBACK_MONTHS, SEASONAL_TOP_MONTHS,
+          SEASONAL_RATIO_THRESHOLD, SEASONAL_MIN_TOTAL } =
+    await import('../apps/profit-analysis/candidates.js');
+
+  expectEq(SEASONAL_LOOKBACK_MONTHS, 24, '14r 遡り月数=24');
+  expectEq(SEASONAL_TOP_MONTHS, 3, '14r 上位月数=3');
+  expectEq(SEASONAL_RATIO_THRESHOLD, 0.6, '14r 比率閾値=0.6');
+  expectEq(SEASONAL_MIN_TOTAL, 30, '14r 最低合計=30');
+
+  // 不正入力
+  expectEq(detectSeasonality(null), null, '14r null → null');
+  expectEq(detectSeasonality([]), null, '14r 空配列 → null');
+  expectEq(detectSeasonality([1,2,3]), null, '14r 12要素未満 → null');
+
+  // 実績不足: 合計 < 30
+  expectEq(detectSeasonality([1,1,1,1,1,1,1,1,1,1,1,1]), null, '14r 合計12 < 30 → null');
+  // 集中度不足: 均等分布（各3個、計36）→ top3=9/36=25% < 60% → null
+  expectEq(detectSeasonality([3,3,3,3,3,3,3,3,3,3,3,3]), null, '14r 均等 → null');
+
+  // 季節性あり: 8月20個、9月15個、10月10個、他1個 (top3=45/56=80%)
+  const auto1 = detectSeasonality([1,1,1,1,1,1,1,20,15,10,1,1]);
+  expectEq(auto1?.seasonality_flag, 1, '14r 夏秋集中 → 季節性 ON');
+  expectEq(auto1?.season_months, '8,9,10', '14r 夏秋 season_months');
+
+  // 安定ソート: 同数の場合は早い月優先
+  const auto2 = detectSeasonality([10,10,10,10,0,0,0,0,0,0,0,0]);
+  // top3 候補は 1〜4月の同数。安定ソートで 1,2,3 が選ばれる（top3=30/40=75%）
+  expectEq(auto2?.season_months, '1,2,3', '14r 同数なら早い月優先');
+
+  // classifyProduct 統合: 自動季節性 ON で現在月(4月)が販売期(8,9,10)外 → 分類外
+  r = classifyProduct(mkRow({
+    seasonality_flag: 0, season_months: null,  // 手動なし
+    m01: 1, m02: 1, m03: 1, m04: 1, m05: 1, m06: 1,
+    m07: 1, m08: 20, m09: 15, m10: 10, m11: 1, m12: 1,
+  }), thresholds, opts);
+  expectEq(r.classification, '分類外', '14r 自動季節性オフシーズン → 分類外');
+  expectEq(r.reason.includes('自動'), true, '14r 自動の出所表示');
+  expectEq(r.reason.includes('8,9,10'), true, '14r 自動 season_months 表示');
+  expectEq(r.flags.seasonality_source, 'auto', '14r flags.seasonality_source=auto');
+
+  // 手動が最優先: 手動 ON の方を採用
+  r = classifyProduct(mkRow({
+    seasonality_flag: 1, season_months: '6,7,8',
+    m01: 1, m02: 1, m03: 1, m04: 1, m05: 1, m06: 1,
+    m07: 1, m08: 20, m09: 15, m10: 10, m11: 1, m12: 1,  // 自動も検出されうる
+  }), thresholds, opts);
+  expectEq(r.flags.seasonality_source, 'manual', '14r 手動が最優先');
+  expectEq(r.flags.season_months, '6,7,8', '14r 手動 season_months 採用');
+
+  // Codex R1 High 反映: 手動 flag=1 でも season_months が空/不正なら自動にフォールバック
+  //   旧実装だと「強い季節性があるのに手動 season_months 未設定で通常商品扱い」になり
+  //   値下げ等へ流入するため、自動判定にフォールバックする仕様に変更。
+  r = classifyProduct(mkRow({
+    seasonality_flag: 1, season_months: null,  // 手動 flag だけ ON
+    m01: 1, m02: 1, m03: 1, m04: 1, m05: 1, m06: 1,
+    m07: 1, m08: 20, m09: 15, m10: 10, m11: 1, m12: 1,
+  }), thresholds, opts);
+  expectEq(r.flags.seasonality_source, 'auto', '14r 手動 season_months 空 → 自動にフォールバック');
+
+  r = classifyProduct(mkRow({
+    seasonality_flag: 1, season_months: '',  // 空文字
+    m01: 1, m02: 1, m03: 1, m04: 1, m05: 1, m06: 1,
+    m07: 1, m08: 20, m09: 15, m10: 10, m11: 1, m12: 1,
+  }), thresholds, opts);
+  expectEq(r.flags.seasonality_source, 'auto', '14r 手動 season_months 空文字 → 自動にフォールバック');
+
+  r = classifyProduct(mkRow({
+    seasonality_flag: 1, season_months: 'invalid,99',  // 範囲外
+    m01: 1, m02: 1, m03: 1, m04: 1, m05: 1, m06: 1,
+    m07: 1, m08: 20, m09: 15, m10: 10, m11: 1, m12: 1,
+  }), thresholds, opts);
+  expectEq(r.flags.seasonality_source, 'auto', '14r 手動 season_months 不正 → 自動にフォールバック');
+
+  // Codex R2 Medium 反映: parseInt の罠 ('1x' を 1 として通さない厳密 regex)
+  r = classifyProduct(mkRow({
+    seasonality_flag: 1, season_months: '1x,2y,abc,99',  // すべて strict regex で弾く
+    m01: 1, m02: 1, m03: 1, m04: 1, m05: 1, m06: 1,
+    m07: 1, m08: 20, m09: 15, m10: 10, m11: 1, m12: 1,
+  }), thresholds, opts);
+  expectEq(r.flags.seasonality_source, 'auto', '14r 手動 season_months "1x,2y" → 厳密 regex で全弾き → 自動');
+
+  // 手動 valid + 不正な月混入 → valid 月だけ採用される
+  r = classifyProduct(mkRow({
+    seasonality_flag: 1, season_months: '6,7,99,abc',  // 6,7 だけ valid
+  }), thresholds, opts);
+  // 4月は 6,7 のオフシーズン → 季節性保留
+  expectEq(r.classification, '分類外', '14r 手動 valid 月混在 → valid のみ採用');
+  expectEq(r.reason.includes('6,7'), true, '14r 採用 month は 6,7');
+
+  // 集中度不足のニッチ商品（kinmokuneil10 想定: 24ヶ月で149個・ほぼ均等）→ 季節性扱いされない
+  r = classifyProduct(mkRow({
+    seasonality_flag: 0, season_months: null,
+    m01: 27, m02: 19, m03: 12, m04: 11, m05: 4, m06: 15,
+    m07: 10, m08: 8, m09: 15, m10: 11, m11: 7, m12: 10,
+    sales_period: 6, sales_30d: 2, sales_90d: 6,
+  }), thresholds, opts);
+  expectEq(r.flags.seasonality_source, null, '14r 集中度不足 → 自動季節性なし');
+
+  // ─── Test 14s: 値下げ候補の強化条件（turnover_lte / sales_90d_min） ───
+  //   死蔵レベル (turnover > 540) や 低速回転ニッチ (sales_90d < 5) は値下げから除外。
+  //   既存ニッチ商品が値下げ候補に大量流入する問題を解消。
+  // ベース行: 利益単価 500、turnover 360、margin 50%（旧条件なら値下げ）
+  function mkPriceDownRow(overrides = {}) {
+    return mkRow({
+      売上分類: 1,
+      標準売価: 1000, 原価: 200, 送料: 100,  // 利益単価 = 900-300 = 600
+      daily_last_sale: '2026-04-15',
+      sales_period: 18, sales_30d: 6, sales_90d: 18,  // turnover = 100/(18/90) = 500
+      avg_stock: 100, latest_stock: 100,
+      ...overrides,
+    });
+  }
+
+  // sales_90d < 5 → 値下げから外れる（旧仕様だと値下げに入っていた死蔵ニッチ商品）
+  r = classifyProduct(mkPriceDownRow({
+    sales_period: 4, sales_30d: 1, sales_90d: 4,  // < 5
+  }), thresholds, opts);
+  if (r.classification === '値下げ候補') {
+    throw new Error('14s sales_90d=4 が値下げ候補になっている (sales_90d_min=5 を満たしていないはず)');
+  }
+  console.log(`[OK] 14s sales_90d=4 (< 5) は値下げ候補から除外 → ${r.classification}`);
+
+  // sales_90d = 5 (境界 inclusive) → 値下げ候補に入る
+  //   sales_period=5 で latest_stock=20 → turnover = 20/(5/90) = 360 (範囲内)
+  //   avg_stock=20 で gmroi 約 304%（優良条件 turnover 30-90 を外すので 値下げ へ）
+  r = classifyProduct(mkPriceDownRow({
+    sales_period: 5, sales_30d: 2, sales_90d: 5,
+    avg_stock: 20, latest_stock: 20,
+  }), thresholds, opts);
+  expectEq(r.classification, '値下げ候補', '14s sales_90d=5 (境界 inclusive) → 値下げ候補');
+
+  // turnover > 540 → 値下げから外れる（死蔵レベル）
+  r = classifyProduct(mkPriceDownRow({
+    sales_period: 10, sales_30d: 3, sales_90d: 10,
+    avg_stock: 100, latest_stock: 600,  // turnover = 600/(10/90) = 5400 → > 540
+  }), thresholds, opts);
+  if (r.classification === '値下げ候補') {
+    throw new Error('14s turnover=5400 が値下げ候補になっている (turnover_lte=540 を超えているはず)');
+  }
+  console.log(`[OK] 14s turnover=5400 (> 540) は値下げ候補から除外 → ${r.classification}`);
+
+  // turnover = 540 (境界 inclusive) → 値下げ候補に入る
+  //   gmroi が観察範囲 (100-200) を外れるよう avg_stock を 200 にして annualized ≈ 60% に下げる
+  r = classifyProduct(mkPriceDownRow({
+    sales_period: 10, sales_30d: 3, sales_90d: 10,
+    avg_stock: 200, latest_stock: 60,  // turnover = 60/(10/90) = 540, gmroi ≈ 60% (< 100)
+  }), thresholds, opts);
+  expectEq(r.classification, '値下げ候補', '14s turnover=540 (境界 inclusive) → 値下げ候補');
+
+  // turnover_lte / sales_90d_min を null に設定 → 旧条件（緩い）に戻る
+  const looseThresholds = {
+    retirement: thresholds.retirement,
+    classification: {
+      ...thresholds.classification,
+      price_down: { turnover_gt: 120, margin_rate_gt: 20 },  // 上限・最低なし
+    },
+  };
+  r = classifyProduct(mkPriceDownRow({
+    sales_period: 1, sales_30d: 0, sales_90d: 1,
+    avg_stock: 100, latest_stock: 1000,  // turnover = 1000/(1/90) = 90000
+  }), looseThresholds, opts);
+  expectEq(r.classification, '値下げ候補', '14s 上限・最低なしの設定なら旧条件で値下げに入る');
+
+  console.log('[OK] classifyProduct 分類網羅テスト完了（14a-14s）');
 }
 
 // ─── Test 14p: periodDays 一貫性（同じ販売・在庫レートで分類不変） ───

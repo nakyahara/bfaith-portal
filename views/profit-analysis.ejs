@@ -269,7 +269,9 @@
           <div class="pd-threshold-row"><label>観察: GMROI 最小 (%)</label><input type="number" id="pd-th-obs-min" min="0" step="1"></div>
           <div class="pd-threshold-row"><label>観察: GMROI 最大 (%)</label><input type="number" id="pd-th-obs-max" min="0" step="1"></div>
           <div class="pd-threshold-row"><label>値下げ: 回転 超 (日)</label><input type="number" id="pd-th-pd-turn" min="0" step="1"></div>
+          <div class="pd-threshold-row"><label>値下げ: 回転 上限 (日、空=制限なし)</label><input type="number" id="pd-th-pd-turn-max" min="0" step="1"></div>
           <div class="pd-threshold-row"><label>値下げ: 粗利率 超 (%)</label><input type="number" id="pd-th-pd-margin" min="0" step="1"></div>
+          <div class="pd-threshold-row"><label>値下げ: 過去90日販売 最低 (個、空=制限なし)</label><input type="number" id="pd-th-pd-sales90-min" min="0" step="1"></div>
           <div class="pd-threshold-row"><label>セット候補: 回転 超 (日)</label><input type="number" id="pd-th-bundle-turn" min="0" step="1"></div>
         </div>
         <div class="pd-threshold-section">
@@ -356,7 +358,7 @@
           <tbody>
             <tr><td>🟢 優良在庫</td><td>GMROI(年率) &gt; 200% かつ 回転30〜90日</td><td>利益効率も回転スピードも良好。継続販売推奨。</td></tr>
             <tr><td>🟡 観察継続</td><td>GMROI(年率) 100〜200%</td><td>標準的な収益性。経過観察でOK。</td></tr>
-            <tr><td>🟠 値下げ候補</td><td>回転 &gt; 120日 かつ 粗利率 &gt; 20%</td><td>在庫が滞留しているが粗利に余裕あり。値下げで回転改善を検討。</td></tr>
+            <tr><td>🟠 値下げ候補</td><td>回転 120〜540日 かつ 粗利率 &gt; 20% かつ 過去90日販売 ≥ 5個</td><td>在庫が滞留しているが粗利に余裕あり。販売実績もあるので値下げで回転改善を検討。<br>540日超は死蔵レベルで値下げ効果薄、5個未満はニッチ需要で値下げ無効と判断。</td></tr>
             <tr><td>🔵 セット候補</td><td>回転 &gt; 120日 かつ 販売実績あり<br>（値下げ候補に該当しない）</td><td>単品では捌けにくい。他商品とセット販売して回転改善を検討。</td></tr>
             <tr><td>🟠 撤退警戒</td><td>売上分類別の警戒閾値<br>例: 自社=180日販売なし / 仕入=GMROI(年率)&lt;50%</td><td>撤退候補に近づきつつある。テコ入れ要検討。</td></tr>
             <tr><td>🔴 撤退候補</td><td>売上分類別の撤退閾値<br>例: 自社=365日販売なし / 仕入=GMROI(年率)&lt;30% かつ 回転&gt;180日</td><td>撤退判断が必要なレベル。</td></tr>
@@ -371,7 +373,13 @@
           <li><strong>新商品保留</strong>: 発売後12ヶ月以内 または 手動で新商品フラグ ON。新商品は撤退判定の対象外。
             <ul><li>自動判定: NE 商品マスタの 作成日 が直近365日以内</li><li>手動: <code>m_products.new_product_flag=1</code></li></ul>
           </li>
-          <li><strong>季節性保留（オフシーズン）</strong>: 季節性フラグ ON で現在月が販売期に含まれない。</li>
+          <li><strong>季節性保留（オフシーズン）</strong>: 季節性フラグ ON で現在月が販売期に含まれない。
+            <ul>
+              <li>手動: <code>m_products.seasonality_flag=1</code> + <code>season_months</code></li>
+              <li>自動: 過去24ヶ月販売 ≥ 30個 かつ 上位3ヶ月で60%以上を占める商品を季節性扱い</li>
+              <li>理由欄に <code>手動</code> / <code>自動</code> と販売期月が表示される</li>
+            </ul>
+          </li>
           <li><strong>販売実績不足（在庫あり）</strong>: 期間販売0 + 在庫あり、かつ撤退閾値日数に達していない。</li>
           <li><strong>計算不能（在庫平均不足）</strong>: 月末在庫スナップショットが6ヶ月分未満で平均が出せない。</li>
           <li><strong>閾値外</strong>: 各分類のいずれの条件にも当てはまらない（例: GMROI 50〜100% など中間帯）。</li>
@@ -778,7 +786,9 @@
       }
       if (cls.price_down) {
         document.getElementById('pd-th-pd-turn').value = cls.price_down.turnover_gt ?? '';
+        document.getElementById('pd-th-pd-turn-max').value = cls.price_down.turnover_lte ?? '';
         document.getElementById('pd-th-pd-margin').value = cls.price_down.margin_rate_gt ?? '';
+        document.getElementById('pd-th-pd-sales90-min').value = cls.price_down.sales_90d_min ?? '';
       }
       if (cls.bundle_candidate) {
         document.getElementById('pd-th-bundle-turn').value = cls.bundle_candidate.turnover_gt ?? '';
@@ -812,10 +822,18 @@
             gmroi_min: Number(document.getElementById('pd-th-obs-min').value),
             gmroi_max: Number(document.getElementById('pd-th-obs-max').value),
           },
-          price_down: {
-            turnover_gt: Number(document.getElementById('pd-th-pd-turn').value),
-            margin_rate_gt: Number(document.getElementById('pd-th-pd-margin').value),
-          },
+          price_down: (() => {
+            const obj = {
+              turnover_gt: Number(document.getElementById('pd-th-pd-turn').value),
+              margin_rate_gt: Number(document.getElementById('pd-th-pd-margin').value),
+            };
+            // 任意項目: 入力が空なら制限なし（フィールドを送らない）
+            const turnLteRaw = document.getElementById('pd-th-pd-turn-max').value.trim();
+            if (turnLteRaw !== '') obj.turnover_lte = Number(turnLteRaw);
+            const sales90MinRaw = document.getElementById('pd-th-pd-sales90-min').value.trim();
+            if (sales90MinRaw !== '') obj.sales_90d_min = Number(sales90MinRaw);
+            return obj;
+          })(),
           bundle_candidate: {
             turnover_gt: Number(document.getElementById('pd-th-bundle-turn').value),
           },
