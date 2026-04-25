@@ -112,6 +112,15 @@
     .pd-modal-section { background: #f9fafb; padding: 10px 12px; border-radius: 6px; margin-bottom: 12px; }
     .pd-modal-error { color: #b91c1c; font-size: 12px; margin-top: 4px; }
     .pd-modal-footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+    .pd-manual-box { max-width: 880px; }
+    .pd-manual-h3 { font-size: 14px; font-weight: 700; margin: 18px 0 8px; color: #1f2937; border-left: 4px solid #2563eb; padding-left: 8px; }
+    .pd-manual-list { margin: 0 0 8px 20px; padding: 0; font-size: 13px; line-height: 1.7; color: #374151; }
+    .pd-manual-list ul { margin: 4px 0 4px 20px; }
+    .pd-manual-list code { background: #f3f4f6; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+    .pd-manual-table { width: 100%; border-collapse: collapse; font-size: 12px; margin: 6px 0; }
+    .pd-manual-table th, .pd-manual-table td { border: 1px solid #e5e7eb; padding: 6px 8px; text-align: left; vertical-align: top; }
+    .pd-manual-table th { background: #f3f4f6; font-weight: 600; }
+    .pd-manual-table td:first-child { white-space: nowrap; font-weight: 600; }
     .pd-status-radio-group { display: flex; flex-wrap: wrap; gap: 8px; }
     .pd-status-radio-group label { display: flex; align-items: center; gap: 4px; padding: 4px 10px; border: 1px solid #e5e7eb; border-radius: 20px; cursor: pointer; }
     .pd-status-radio-group input[type=radio] { margin: 0; }
@@ -221,7 +230,7 @@
       <div class="pd-segmented" role="tablist" aria-label="売上分類">
         <button class="pd-segmented-item active" data-class="1" onclick="switchSalesClass(1)">🔷 自社商品<span class="pd-segment-count" id="pd-seg-count-1"></span></button>
         <button class="pd-segmented-item" data-class="3" onclick="switchSalesClass(3)">🔶 仕入商品<span class="pd-segment-count" id="pd-seg-count-3"></span></button>
-        <button class="pd-segmented-item" data-class="2" onclick="switchSalesClass(2)">🔸 取扱限定<span class="pd-segment-count" id="pd-seg-count-2"></span></button>
+        <button class="pd-segmented-item" data-class="2" onclick="switchSalesClass(2)">🔸 取引先限定<span class="pd-segment-count" id="pd-seg-count-2"></span></button>
       </div>
 
       <div class="summary-cards impact-cards" id="pd-impact-cards"></div>
@@ -239,6 +248,7 @@
         </label>
         <span class="notice-small" id="pd-inv-data-period-note"></span>
         <button class="btn btn-secondary" onclick="toggleThresholdPanel()">⚙ 閾値調整</button>
+        <button class="btn btn-secondary" data-pd-open-manual>📖 マニュアル</button>
         <button class="btn btn-export" onclick="exportInventoryCSV()" id="pd-btn-export-inv" disabled>CSV出力</button>
       </div>
 
@@ -322,6 +332,82 @@
         <div class="pd-modal-footer">
           <button class="btn btn-secondary" onclick="closeStatusModal()" id="pd-btn-status-cancel">キャンセル</button>
           <button class="btn btn-primary" onclick="saveStatus()" id="pd-btn-status-save">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ─── マニュアル モーダル ─── -->
+    <!-- バブリング制御は inline onclick を使わず、delegated click で ev.target === backdrop チェックで実現（XSS 方針）。 -->
+    <div class="pd-modal-backdrop" id="pd-manual-modal" data-pd-manual-backdrop>
+      <div class="pd-modal-box pd-manual-box" role="dialog" aria-labelledby="pd-manual-title">
+        <div class="pd-modal-title" id="pd-manual-title">📖 商品収益性ダッシュボード マニュアル</div>
+
+        <h3 class="pd-manual-h3">リストに入る条件</h3>
+        <ul class="pd-manual-list">
+          <li>取扱区分 = <code>取扱中</code></li>
+          <li>売上分類が設定済み（1=自社商品 / 2=取引先限定 / 3=仕入商品）</li>
+          <li>商品区分が <code>単品</code> または <code>例外</code>（セット商品本体は除外。販売・在庫は構成品単位で集計される）</li>
+          <li><strong>在庫数は条件に含まれない</strong>: 在庫0でも取扱中ならリストに入る</li>
+        </ul>
+
+        <h3 class="pd-manual-h3">8分類の意味</h3>
+        <table class="pd-manual-table">
+          <thead><tr><th>分類</th><th>条件</th><th>意味・運用</th></tr></thead>
+          <tbody>
+            <tr><td>🟢 優良在庫</td><td>GMROI(年率) &gt; 200% かつ 回転30〜90日</td><td>利益効率も回転スピードも良好。継続販売推奨。</td></tr>
+            <tr><td>🟡 観察継続</td><td>GMROI(年率) 100〜200%</td><td>標準的な収益性。経過観察でOK。</td></tr>
+            <tr><td>🟠 値下げ候補</td><td>回転 &gt; 120日 かつ 粗利率 &gt; 20%</td><td>在庫が滞留しているが粗利に余裕あり。値下げで回転改善を検討。</td></tr>
+            <tr><td>🔵 セット候補</td><td>回転 &gt; 120日 かつ 販売実績あり<br>（値下げ候補に該当しない）</td><td>単品では捌けにくい。他商品とセット販売して回転改善を検討。</td></tr>
+            <tr><td>🟠 撤退警戒</td><td>売上分類別の警戒閾値<br>例: 自社=180日販売なし / 仕入=GMROI(年率)&lt;50%</td><td>撤退候補に近づきつつある。テコ入れ要検討。</td></tr>
+            <tr><td>🔴 撤退候補</td><td>売上分類別の撤退閾値<br>例: 自社=365日販売なし / 仕入=GMROI(年率)&lt;30% かつ 回転&gt;180日</td><td>撤退判断が必要なレベル。</td></tr>
+            <tr><td>⚪ 評価不能</td><td>楽天売価が未設定</td><td>利益計算ができない。売価を登録すれば再評価される。</td></tr>
+            <tr><td>⚠ 分類外</td><td>上記いずれにも該当せず</td><td>サブ理由で詳細を確認（下記）。</td></tr>
+          </tbody>
+        </table>
+
+        <h3 class="pd-manual-h3">「分類外」のサブ理由</h3>
+        <ul class="pd-manual-list">
+          <li><strong>計算不能（原価未登録）</strong>: 原価=0。原価を登録すれば再評価。</li>
+          <li><strong>新商品保留</strong>: 発売後12ヶ月以内 または 手動で新商品フラグ ON。新商品は撤退判定の対象外。
+            <ul><li>自動判定: NE 商品マスタの 作成日 が直近365日以内</li><li>手動: <code>m_products.new_product_flag=1</code></li></ul>
+          </li>
+          <li><strong>季節性保留（オフシーズン）</strong>: 季節性フラグ ON で現在月が販売期に含まれない。</li>
+          <li><strong>販売実績不足（在庫あり）</strong>: 期間販売0 + 在庫あり、かつ撤退閾値日数に達していない。</li>
+          <li><strong>計算不能（在庫平均不足）</strong>: 月末在庫スナップショットが6ヶ月分未満で平均が出せない。</li>
+          <li><strong>閾値外</strong>: 各分類のいずれの条件にも当てはまらない（例: GMROI 50〜100% など中間帯）。</li>
+        </ul>
+
+        <h3 class="pd-manual-h3">主要指標の意味</h3>
+        <ul class="pd-manual-list">
+          <li><strong>GMROI(年率)</strong>: 期間粗利を年率換算 ÷ 平均在庫金額 × 100。在庫1円あたり年間何円の粗利を生むか。
+            業界標準で年率なので、判定期間（30/60/90日）を変えても閾値は同じ。</li>
+          <li><strong>回転日数</strong>: 現在在庫 ÷ 1日平均販売数。在庫を売り切るのに何日かかるか。販売0なら算出不能。</li>
+          <li><strong>粗利率</strong>: (売価 × 0.9 − 原価 − 送料) ÷ 売価 × 100。楽天手数料10%控除後の利益率。</li>
+          <li><strong>利益単価（楽天）</strong>: 売価 × 0.9 − 原価 − 送料。楽天統一評価で全モール共通指標として使用。</li>
+        </ul>
+
+        <h3 class="pd-manual-h3">売上分類</h3>
+        <ul class="pd-manual-list">
+          <li>🔷 自社商品 (1) — 自社製造・自社ブランド。撤退閾値は「日販売ゼロ日数」のみ。</li>
+          <li>🔸 取引先限定 (2) — 特定取引先専用の商品。閾値は自社準拠。</li>
+          <li>🔶 仕入商品 (3) — 一般仕入。GMROI と回転の複合条件で厳しめ判定。</li>
+        </ul>
+
+        <h3 class="pd-manual-h3">早期警戒フラグ</h3>
+        <ul class="pd-manual-list">
+          <li>過去90日販売 ≥ 10個 かつ 直近30日販売 ≤ 期待値の1/3 で「急落」フラグ。</li>
+          <li>季節性商品・新商品はスキップ。</li>
+          <li>過去販売0 かつ 直近販売&gt;0 は「判定不能」（販売開始直後など）。</li>
+        </ul>
+
+        <h3 class="pd-manual-h3">判定期間（直近 30/60/90日）</h3>
+        <ul class="pd-manual-list">
+          <li>販売数の集計期間を選ぶ。GMROI は年率化されるので結果は期間でほぼ変わらない。</li>
+          <li>季節商品・販売波が大きい商品は90日推奨。短期動向を見たい場合は30日。</li>
+        </ul>
+
+        <div class="pd-modal-footer">
+          <button class="btn btn-primary" data-pd-close-manual>閉じる</button>
         </div>
       </div>
     </div>
@@ -575,12 +661,12 @@
     // ==================================================================
     // タブB: 在庫整理・撤退判断支援
     // ==================================================================
-    const PD_SALES_CLASS_LABEL = { 1: '🔷 自社商品', 2: '🔸 取扱限定', 3: '🔶 仕入商品' };
+    const PD_SALES_CLASS_LABEL = { 1: '🔷 自社商品', 2: '🔸 取引先限定', 3: '🔶 仕入商品' };
     const PD_INV_SUBTABS = [
-      { key: '優良在庫', label: '🟢 優良', highlight: 'row-success' },
-      { key: '観察継続', label: '🟡 観察' },
-      { key: '値下げ候補', label: '🟠 値下げ' },
-      { key: 'セット候補', label: '🔵 セット' },
+      { key: '優良在庫', label: '🟢 優良在庫', highlight: 'row-success' },
+      { key: '観察継続', label: '🟡 観察継続' },
+      { key: '値下げ候補', label: '🟠 値下げ候補' },
+      { key: 'セット候補', label: '🔵 セット候補' },
       { key: '撤退警戒', label: '🟠 撤退警戒', highlight: 'row-warning' },
       { key: '撤退候補', label: '🔴 撤退候補', highlight: 'row-danger' },
       { key: '評価不能', label: '⚪ 評価不能' },
@@ -1034,6 +1120,23 @@
       if (ev.target.id === 'pd-status-modal') closeStatusModal();
     }
 
+    // ─── マニュアルモーダル ───
+    function openManualModal() {
+      document.getElementById('pd-manual-modal').classList.add('open');
+    }
+    function closeManualModal() {
+      document.getElementById('pd-manual-modal').classList.remove('open');
+    }
+    // 開閉のイベント委譲（XSS 対策で onclick=inline を使わない既存ポリシーに準拠）
+    document.addEventListener('click', (ev) => {
+      const opener = ev.target.closest('[data-pd-open-manual]');
+      if (opener) { ev.preventDefault(); openManualModal(); return; }
+      const closer = ev.target.closest('[data-pd-close-manual]');
+      if (closer) { ev.preventDefault(); closeManualModal(); return; }
+      const backdrop = document.getElementById('pd-manual-modal');
+      if (backdrop && ev.target === backdrop) closeManualModal();
+    });
+
     async function saveStatus() {
       if (stateB.savingStatus) return;
       stateB.savingStatus = true;
@@ -1136,15 +1239,17 @@
       const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
-      const salesClassSlug = { 1: '自社商品', 2: '取扱限定', 3: '仕入商品' }[stateB.salesClass] || 'unknown';
+      const salesClassSlug = { 1: '自社商品', 2: '取引先限定', 3: '仕入商品' }[stateB.salesClass] || 'unknown';
       a.download = `商品収益性ダッシュボード_${salesClassSlug}_${stateB.subtab}_${stateB.periodDays}日_${localDateString()}.csv`;
       a.click();
     }
 
     document.addEventListener('keydown', (ev) => {
       if (ev.key === 'Escape') {
-        const modal = document.getElementById('pd-status-modal');
-        if (modal && modal.classList.contains('open')) closeStatusModal();
+        const sModal = document.getElementById('pd-status-modal');
+        if (sModal && sModal.classList.contains('open')) { closeStatusModal(); return; }
+        const mModal = document.getElementById('pd-manual-modal');
+        if (mModal && mModal.classList.contains('open')) { closeManualModal(); return; }
       }
     });
   </script>

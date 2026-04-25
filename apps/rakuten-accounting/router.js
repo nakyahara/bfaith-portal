@@ -23,7 +23,7 @@ if (!fs.existsSync(UPLOAD_DIR)) { try { fs.mkdirSync(UPLOAD_DIR, { recursive: tr
 const upload = multer({ dest: UPLOAD_DIR });
 
 // セグメント名称マップ
-const SEGMENT_NAMES = { 1: '自社商品', 2: '取扱限定', 3: '仕入れ商品' };
+const SEGMENT_NAMES = { 1: '自社商品', 2: '取引先限定', 3: '仕入れ商品' };
 const EXCLUDED_SEGMENTS = { 4: '輸出' };
 
 // ─── CSV解析（Shift_JIS対応）───
@@ -1245,7 +1245,7 @@ function renderPage() {
           }
 
           // セグメント別
-          const segNames = {1:'自社商品', 2:'取扱限定', 3:'仕入れ商品'};
+          const segNames = {1:'自社商品', 2:'取引先限定', 3:'仕入れ商品'};
           const adTargets = ['1','2'];
           const hSales = {}; let hTotalSales = 0;
           for (const [k, sr] of Object.entries(seg)) { hSales[k] = sr.売上合計 || 0; if (adTargets.includes(k)) hTotalSales += hSales[k]; }
@@ -1418,7 +1418,7 @@ function renderPage() {
         const rows = await r.json();
         if (!rows.length) { alert('確定データがありません'); return; }
 
-        const segNames = {1:'自社商品', 2:'取扱限定', 3:'仕入れ商品', other:'その他/未分類'};
+        const segNames = {1:'自社商品', 2:'取引先限定', 3:'仕入れ商品', other:'その他/未分類'};
         const adTargets = ['1','2'];
         let csv = '\\uFEFF';
         csv += '集計月,セグメント,売上合計,クーポン値引額,クーポン値引後売上,広告費,原価合計,原価率\\n';

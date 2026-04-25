@@ -1402,7 +1402,7 @@ function renderRegisterPage(shippingRates) {
           html += '<input placeholder="原価" style="width:80px" type="number" step="0.01"> ';
           html += '<button class="btn btn-p" data-act="reg-genka" data-sku="'+he(r.商品コード)+'" data-name="'+he(r.商品名)+'">登録</button>';
         } else if (curType === 'sales_class') {
-          html += '<select style="width:120px"><option value="">--</option><option value="1">1:自社商品</option><option value="2">2:取扱限定</option><option value="3">3:仕入れ</option><option value="4">4:輸出</option></select> ';
+          html += '<select style="width:120px"><option value="">--</option><option value="1">1:自社商品</option><option value="2">2:取引先限定</option><option value="3">3:仕入れ</option><option value="4">4:輸出</option></select> ';
           html += '<button class="btn btn-p" data-act="reg-class" data-sku="'+he(r.商品コード)+'" data-name="'+he(r.商品名)+'">登録</button>';
         } else if (curType === 'tax_rate') {
           html += '<select style="width:120px"><option value="">--</option><option value="0.1">10%（標準）</option><option value="0.08">8%（軽減）</option></select> ';
@@ -1653,7 +1653,7 @@ function renderRegisterPage(shippingRates) {
       shipping: 'CSV形式: 商品コード, 送料コード',
       genka: 'CSV形式: 商品コード, 原価, 商品名（任意）',
       skumap: 'CSV形式: seller_sku, ne_code, 数量（任意）, ASIN（任意）',
-      sales_class: 'CSV形式: 商品コード, 売上分類(1:自社/2:取扱限定/3:仕入れ/4:輸出)',
+      sales_class: 'CSV形式: 商品コード, 売上分類(1:自社/2:取引先限定/3:仕入れ/4:輸出)',
       tax_rate: 'CSV形式: 商品コード, 税率(0.1 or 0.08)'
     };
     function switchCsvType(type, el) {

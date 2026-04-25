@@ -18,7 +18,7 @@ if (!fs.existsSync(UPLOAD_DIR)) { try { fs.mkdirSync(UPLOAD_DIR, { recursive: tr
 const upload = multer({ dest: UPLOAD_DIR });
 
 // セグメント名称マップ（1〜3が集計対象）
-const SEGMENT_NAMES = { 1: '自社商品', 2: '取扱限定', 3: '仕入れ商品' };
+const SEGMENT_NAMES = { 1: '自社商品', 2: '取引先限定', 3: '仕入れ商品' };
 
 // エビデンスCSV一時保存（yearMonth → { detail, summary }）
 const evidenceStore = new Map();
@@ -885,7 +885,7 @@ function renderPage() {
 
           // セグメント別集計
           const seg = row.by_segment || {};
-          const segNames = {1:'自社商品', 2:'取扱限定', 3:'仕入れ商品'};
+          const segNames = {1:'自社商品', 2:'取引先限定', 3:'仕入れ商品'};
           const segCols = ['商品売上', '商品の売上税', '配送料', '配送料の税金',
             'ギフト包装手数料', 'ギフト包装の税金', 'Amazonポイント費用',
             'プロモーション割引額', 'プロモーション割引の税金', '手数料', 'FBA手数料',
@@ -954,7 +954,7 @@ function renderPage() {
         const rows = await r.json();
         if (!rows.length) { alert('確定データがありません'); return; }
 
-        const segNames = {1:'自社商品', 2:'取扱限定', 3:'仕入れ商品', other:'その他/未分類'};
+        const segNames = {1:'自社商品', 2:'取引先限定', 3:'仕入れ商品', other:'その他/未分類'};
         const segCols = ['商品売上','商品の売上税','配送料','配送料の税金','ギフト包装手数料','ギフト包装の税金','Amazonポイント費用','プロモーション割引額','プロモーション割引の税金','手数料','FBA手数料','トランザクション他','その他','合計'];
         const adTargets = ['1','2'];
 
@@ -1014,7 +1014,7 @@ function renderPage() {
       <ul>
         <li><b>税率別集計</b> — 10%/8%に分類して集計（MF連携用）</li>
         <li><b>MF連携用 税込み集計</b> — マネーフォワードに入力する金額</li>
-        <li><b>セグメント別集計</b> — 管理会計用（自社商品/取扱限定/仕入れ商品/その他）</li>
+        <li><b>セグメント別集計</b> — 管理会計用（自社商品/取引先限定/仕入れ商品/その他）</li>
       </ul>
       <p>従来GAS（Google Apps Script）で7工程かけていた月次売上集計を、CSV1回のアップロードで完了します。</p>
 
@@ -1052,7 +1052,7 @@ function renderPage() {
         <tr><th>列</th><th>内容</th></tr>
         <tr><td>商品コード</td><td>照合で特定されたNE商品コード（未解決の場合は空）</td></tr>
         <tr><td>税率</td><td>10 or 8（商品マスタの消費税率から判定）</td></tr>
-        <tr><td>売上分類</td><td>1:自社 / 2:取扱限定 / 3:仕入れ / 4:輸出 / 空:未分類</td></tr>
+        <tr><td>売上分類</td><td>1:自社 / 2:取引先限定 / 3:仕入れ / 4:輸出 / 空:未分類</td></tr>
         <tr><td>原価</td><td>商品マスタの原価（未解決 or 原価未登録の場合は0）</td></tr>
         <tr><td>解決方法</td><td>direct / sku_map / unresolved / no_sku / skip</td></tr>
       </table>
@@ -1084,7 +1084,7 @@ function renderPage() {
       <table class="m-tbl">
         <tr><th>セグメント</th><th>売上分類</th><th>内容</th><th>広告費</th></tr>
         <tr><td><b>1: 自社商品</b></td><td>1</td><td>自社ブランド・独占商品</td><td>売上按分あり</td></tr>
-        <tr><td><b>2: 取扱限定</b></td><td>2</td><td>取扱限定品</td><td>売上按分あり</td></tr>
+        <tr><td><b>2: 取引先限定</b></td><td>2</td><td>取引先限定品</td><td>売上按分あり</td></tr>
         <tr><td><b>3: 仕入れ商品</b></td><td>3</td><td>一般仕入れ商品</td><td>なし</td></tr>
         <tr><td><b>other: その他</b></td><td>空/未登録</td><td>SKUなし行（FBA保管手数料等）+ 分類未登録商品</td><td>なし</td></tr>
       </table>
