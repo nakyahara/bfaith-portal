@@ -186,6 +186,66 @@ function rakutenUnitProfit(sellPrice, cost, ship) {
   return sellPrice * 0.9 - cost - ship;
 }
 
+/** 新商品判定に使う期間（日数）。設計書§14: 発売後12ヶ月以内 (strict <) は新商品扱い。 */
+export const NEW_PRODUCT_WINDOW_DAYS = 365;
+
+/**
+ * 入力を「日単位の UTC ミリ秒」に正規化する（時刻成分を捨てる）。
+ *   - Date オブジェクト: ローカル年月日を採用（業務日）
+ *   - 文字列: 先頭の YYYY[-/]MM[-/]DD を抽出し、月末超過/13月などは無効として null
+ *   - null/undefined: 現在のローカル日付を採用
+ *
+ * 実運用 (today 省略) では `new Date()` の "現在ローカル時刻" の年月日を取る。
+ * これにより JST 2026-04-25 00:30 でも `launchUtc(2026,4,25)` と一致する
+ * （UTC ミリ秒同士の単純比較で時間帯のズレが起きない）。
+ */
+function toUtcDayMs(input) {
+  let y, mo, d;
+  if (input instanceof Date) {
+    if (Number.isNaN(input.getTime())) return null;
+    y = input.getFullYear(); mo = input.getMonth() + 1; d = input.getDate();
+  } else if (input == null) {
+    const now = new Date();
+    y = now.getFullYear(); mo = now.getMonth() + 1; d = now.getDate();
+  } else {
+    const m = String(input).match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
+    if (!m) return null;
+    y = parseInt(m[1], 10); mo = parseInt(m[2], 10); d = parseInt(m[3], 10);
+  }
+  if (!y || !mo || !d) return null;
+  // 月末超過・13月などを排除: Date.UTC の繰り上げで別日付になっていないか検査
+  const utc = Date.UTC(y, mo - 1, d);
+  if (!Number.isFinite(utc)) return null;
+  const probe = new Date(utc);
+  if (probe.getUTCFullYear() !== y || probe.getUTCMonth() !== mo - 1 || probe.getUTCDate() !== d) {
+    return null;
+  }
+  return utc;
+}
+
+/**
+ * 発売日（new_product_launch_date / NE 作成日）から新商品か判定する。
+ * NE 商品の 作成日 は "YYYY/MM/DD HH:MM:SS" "YYYY-MM-DD" 等いずれも来うるため、
+ * 先頭の YYYY[-/]MM[-/]DD のみ取り出して安全に Date 化する。
+ *
+ * 比較は「ローカル業務日 (時刻捨て)」同士で行う:
+ *   - 実運用で today 省略時は new Date() のローカル年月日を使うため、
+ *     JST 真夜中など UTC とのズレで当日発売品が「未来」扱いされない。
+ *
+ * @returns {boolean} 発売後 NEW_PRODUCT_WINDOW_DAYS 以内 (strict <) なら true
+ */
+export function isNewProductByLaunchDate(launchDateStr, today) {
+  if (!launchDateStr) return false;
+  const launchUtc = toUtcDayMs(launchDateStr);
+  if (launchUtc == null) return false;
+  const todayUtc = toUtcDayMs(today);
+  if (todayUtc == null) return false;
+  // 未来日付は誤入力扱い → 新商品扱いしない（撤退判定への流入を避けつつ過剰保護も避ける）
+  if (launchUtc > todayUtc) return false;
+  const daysSinceLaunch = Math.round((todayUtc - launchUtc) / 86400000);
+  return daysSinceLaunch < NEW_PRODUCT_WINDOW_DAYS;
+}
+
 /**
  * 商品行を分類。副作用なし。
  * @returns { classification, reason, metrics, sales, flags, retirement_status }
@@ -221,7 +281,15 @@ export function classifyProduct(row, thresholds, opts = {}) {
     : Infinity;
 
   const seasonalityApplicable = isOffSeason(row, today);
-  const newProduct = Boolean(row.new_product_flag);
+  // 設計書§14: new_product_flag=1（手動 ON）または launch_date が直近 365日 以内なら新商品扱い。
+  // 仕様メモ: 手動 flag は ON のみ意味があり、OFF (=0) は「未設定」と区別しない（既定値）。
+  //   現行スキーマ INTEGER DEFAULT 0 ではトライステートを表せないため、明示的な opt-out
+  //   （新商品扱いを外す）を表現したい場合は launch_date を 365日 以前の値に上書きする運用。
+  //   実運用上、launch_date を「365日 以内に意図的に再設定」しつつ「新商品扱いしない」と
+  //   いう要求はほぼ無いため、Phase 1 はこの単純化で問題なし。
+  // 厳密に =1 で判定（DB に CHECK 制約がないため、不正な 2/-1 等で誤分類しないよう防御）
+  const newProduct = Number(row.new_product_flag) === 1
+    || isNewProductByLaunchDate(row.new_product_launch_date, today);
 
   const metrics = {
     rakuten_unit_profit: round2(profitPerUnit),

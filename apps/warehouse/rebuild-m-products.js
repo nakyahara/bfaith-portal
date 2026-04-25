@@ -33,6 +33,51 @@ function colList(cols) {
   return cols.map(c => `"${c}"`).join(', ');
 }
 
+// ─── launch_date 解決ヘルパー（PR ：launch_date 自動検出） ───
+//   設計書§14: candidates.js の NEW_PRODUCT_WINDOW_DAYS と一対。
+//   優先順位: 既存 m_products 値（手動 or 過去の自動引き継ぎ）→ NE 作成日 → null
+//   NE goods_creation_date は "YYYY/MM/DD HH:MM:SS" 形式のことがあるので 'YYYY-MM-DD' へ正規化する。
+
+/**
+ * 任意形式の日付文字列から先頭の YYYY-MM-DD を抽出して正規化する。失敗時は null。
+ * 月末超過 (2026-02-30) や 13月 (2026-13-01) などの不正日付も null に倒す
+ * （Date.UTC の繰り上げで別日付として保存されるとデータ汚染になるため）。
+ */
+export function normalizeNeCreationDate(raw) {
+  if (!raw) return null;
+  const m = String(raw).match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
+  if (!m) return null;
+  const y = parseInt(m[1], 10);
+  const mo = parseInt(m[2], 10);
+  const d = parseInt(m[3], 10);
+  if (!y || !mo || !d) return null;
+  const utc = Date.UTC(y, mo - 1, d);
+  if (!Number.isFinite(utc)) return null;
+  const probe = new Date(utc);
+  if (probe.getUTCFullYear() !== y || probe.getUTCMonth() !== mo - 1 || probe.getUTCDate() !== d) {
+    return null;
+  }
+  const moStr = String(mo).padStart(2, '0');
+  const dStr = String(d).padStart(2, '0');
+  return `${y}-${moStr}-${dStr}`;
+}
+
+/**
+ * launch_date を解決する。優先順位は:
+ *   1. 既存 carryover が valid（normalize 通過）→ それを採用
+ *   2. NE 作成日が valid → それを採用
+ *   3. どちらも invalid/null → null
+ *
+ * carryoverValue を素通しせず必ず normalize するのは、
+ * 過去の実装やマイグレで `'broken'` `'2026-13-01'` 等が入っていた場合に
+ * 永久に NE 作成日へフォールバックできなくなるのを防ぐため (Codex R2 Medium 反映)。
+ */
+export function resolveLaunchDate(carryoverValue, neCreationDate) {
+  const carryoverValid = normalizeNeCreationDate(carryoverValue);
+  if (carryoverValid) return carryoverValid;
+  return normalizeNeCreationDate(neCreationDate);
+}
+
 /**
  * Phase C: staging → 本番テーブル反映
  *
@@ -194,13 +239,14 @@ export async function rebuildMProducts() {
     else if (p.消費税率 === 8) taxCategory = 'REDUCED_8';
 
     const co = getCarryover(code);
+    const launchDate = resolveLaunchDate(co.new_product_launch_date, p.作成日);
     insertStaging.run(
       code, p.商品名, '単品', p.取扱区分,
       p.売価, genka, genkaSource, genkaStatus,
       ps?.ship_cost ?? null, ps?.shipping_code ?? null, ps?.ship_method ?? null,
       taxRate, taxCategory,
       p.在庫数, p.引当数, p.仕入先コード, null, salesClassMap.get(code) ?? null,
-      co.seasonality_flag, co.season_months, co.new_product_flag, co.new_product_launch_date,
+      co.seasonality_flag, co.season_months, co.new_product_flag, launchDate,
       ts
     );
     countSingle++;
@@ -285,6 +331,7 @@ export async function rebuildMProducts() {
     const status = neInfo?.取扱区分 || '取扱中';
 
     const coSet = getCarryover(setCode);
+    const setLaunchDate = resolveLaunchDate(coSet.new_product_launch_date, neInfo?.作成日);
     insertStaging.run(
       setCode, sh.セット商品名, 'セット', status,
       neInfo?.売価 ?? sh.セット販売価格 ?? null,
@@ -293,7 +340,7 @@ export async function rebuildMProducts() {
       taxRate, taxCategory,
       neInfo?.在庫数 ?? null, neInfo?.引当数 ?? null, neInfo?.仕入先コード ?? null,
       components.length, salesClassMap.get(setCode) ?? null,
-      coSet.seasonality_flag, coSet.season_months, coSet.new_product_flag, coSet.new_product_launch_date,
+      coSet.seasonality_flag, coSet.season_months, coSet.new_product_flag, setLaunchDate,
       ts
     );
     countSet++;
@@ -319,13 +366,17 @@ export async function rebuildMProducts() {
     }
 
     const coEx = getCarryover(sku);
+    // 例外商品も resolveLaunchDate を通すことで、carryover に既存の不正値
+    // ('broken' / '2026-13-01' 等) が入っていても staging に汚染が伝播しない。
+    // NE 商品ではないので NE 作成日 のフォールバックはなく、carryover のみを正規化する。
+    const exLaunchDate = resolveLaunchDate(coEx.new_product_launch_date, null);
     insertStaging.run(
       sku, eg.商品名 || '', '例外', '取扱中',
       null, eg.genka, '例外', 'OVERRIDDEN',
       ps?.ship_cost ?? null, ps?.shipping_code ?? null, ps?.ship_method ?? null,
       exTaxRate, exTaxCategory,
       null, null, null, null, salesClassMap.get(sku) ?? null,
-      coEx.seasonality_flag, coEx.season_months, coEx.new_product_flag, coEx.new_product_launch_date,
+      coEx.seasonality_flag, coEx.season_months, coEx.new_product_flag, exLaunchDate,
       ts
     );
     countException++;

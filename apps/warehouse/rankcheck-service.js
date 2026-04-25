@@ -28,6 +28,9 @@ const REPO_ROOT = path.join(__dirname, '..', '..');
 const RUNNER_SCRIPT = path.join(REPO_ROOT, 'apps', 'ranking-checker-runner', 'runner.js');
 const DATA_DIR = process.env.DATA_DIR || path.join(REPO_ROOT, 'data');
 const LOG_FILE = path.join(DATA_DIR, 'ranking-checker.log');
+// Render→miniPC への一時アップロード保存先 (Phase2 デプロイで本番JSONを取り込む用)
+const LEGACY_UPLOAD_DIR = process.env.RANKCHECK_LEGACY_UPLOAD_DIR
+  || (process.platform === 'win32' ? 'C:\\tools\\rankcheck-runner\\data-migrate' : path.join(DATA_DIR, 'data-migrate'));
 
 const router = Router();
 
@@ -268,6 +271,61 @@ router.post('/run-check', (req, res) => {
   } catch (e) {
     errorResponse(res, { status: 500, error: 'RUN_KICK_ERROR', message: e.message, requestId: req.requestId });
   }
+});
+
+// ── 一時アップロード (Phase2 デプロイ専用) ──
+
+/**
+ * POST /service-api/rankcheck/upload-legacy-json
+ *   Render Persistent Disk 上の `data/ranking-checker.json` (80-150MB推定) を
+ *   miniPC へ送り込むための受信口。serviceAuth 配下なので token 必須。
+ *
+ *   server.js 側でこのパスは JSON parser を skip させ、req を直接 stream で
+ *   受けてディスクに書く (メモリにロードしない)。
+ *
+ *   保存先は LEGACY_UPLOAD_DIR (default `C:\tools\rankcheck-runner\data-migrate`)。
+ *   一時ファイル `*.uploading.<ts>` に書いてから atomic rename。
+ *
+ *   Phase 2 デプロイ完了後はこの endpoint は不要。Phase 3 で削除可。
+ */
+router.post('/upload-legacy-json', (req, res) => {
+  try {
+    if (!fs.existsSync(LEGACY_UPLOAD_DIR)) fs.mkdirSync(LEGACY_UPLOAD_DIR, { recursive: true });
+  } catch (e) {
+    return errorResponse(res, { status: 500, error: 'MKDIR_FAILED', message: e.message });
+  }
+
+  const targetPath = path.join(LEGACY_UPLOAD_DIR, 'ranking-checker.json');
+  const tmpPath = `${targetPath}.uploading.${Date.now()}`;
+
+  let bytes = 0;
+  let finished = false;
+  const ws = fs.createWriteStream(tmpPath);
+
+  req.on('data', chunk => { bytes += chunk.length; });
+  req.on('aborted', () => {
+    if (!finished) {
+      ws.destroy();
+      try { fs.unlinkSync(tmpPath); } catch {}
+      if (!res.headersSent) errorResponse(res, { status: 499, error: 'CLIENT_ABORTED' });
+    }
+  });
+  ws.on('error', err => {
+    finished = true;
+    try { fs.unlinkSync(tmpPath); } catch {}
+    if (!res.headersSent) errorResponse(res, { status: 500, error: 'WRITE_ERROR', message: err.message });
+  });
+  ws.on('finish', () => {
+    finished = true;
+    try {
+      fs.renameSync(tmpPath, targetPath);
+      okResponse(res, { bytes, path: targetPath });
+    } catch (e) {
+      try { fs.unlinkSync(tmpPath); } catch {}
+      errorResponse(res, { status: 500, error: 'RENAME_FAILED', message: e.message });
+    }
+  });
+  req.pipe(ws);
 });
 
 // ── ログ尾読み ──
