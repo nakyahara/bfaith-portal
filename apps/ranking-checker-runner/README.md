@@ -92,7 +92,10 @@ $trigger = New-ScheduledTaskTrigger -Daily -At 1:00pm   # 13:00 JST
 $settings = New-ScheduledTaskSettingsSet `
   -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
   -StartWhenAvailable -MultipleInstances IgnoreNew `
-  -ExecutionTimeLimit (New-TimeSpan -Hours 3)
+  -ExecutionTimeLimit (New-TimeSpan -Hours 6)
+# 注意: 3566商品 × 実測 3.3s/商品 ≒ 3.27時間 必要 (KW_DELAY 1200ms + page送り + retry の総和)。
+# 当初 3時間にしていたが時間内完走できず Task Scheduler に kill された (4/26 実測)。
+# 余裕を持って 6時間に拡大。
 $principal = New-ScheduledTaskPrincipal -UserId 'bfaith' -LogonType Password -RunLevel Highest
 Register-ScheduledTask -TaskName 'RankCheckRunner' -Action $action -Trigger $trigger -Settings $settings -Principal $principal
 ```
