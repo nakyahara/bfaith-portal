@@ -21,7 +21,7 @@ const UPLOAD_DIR = process.env.DATA_DIR ? process.env.DATA_DIR + '/import' : 'da
 if (!fs.existsSync(UPLOAD_DIR)) { try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch {} }
 const upload = multer({ dest: UPLOAD_DIR });
 
-const SEGMENT_NAMES = { 1: '自社商品', 2: '取扱限定', 3: '仕入れ商品' };
+const SEGMENT_NAMES = { 1: '自社商品', 2: '取引先限定', 3: '仕入れ商品' };
 const EXCLUDED_SEGMENTS = { 4: '輸出' };
 
 // ─── CSV解析（Shift_JIS対応）───
@@ -816,7 +816,7 @@ function renderPage() {
           contentHtml += '<table><tr><th>商品コード</th><th>商品名</th><th>原価</th><th>出現数</th><th>売上合計</th><th>セグメント登録</th></tr>';
           for (const u of data.unresolvedSegment) {
             contentHtml += '<tr><td>' + u.code + '</td><td>' + (u.name || '').slice(0, 60) + '</td><td class="num">' + fmt(u.genka) + '</td><td class="num">' + u.count + '</td><td class="num">' + fmt(u.amount) + '</td>';
-            contentHtml += '<td><select class="reg-sel seg-reg" data-code="' + u.code + '"><option value="">-</option><option value="1">1:自社商品</option><option value="2">2:取扱限定</option><option value="3">3:仕入れ商品</option><option value="4">4:輸出</option></select></td></tr>';
+            contentHtml += '<td><select class="reg-sel seg-reg" data-code="' + u.code + '"><option value="">-</option><option value="1">1:自社商品</option><option value="2">2:取引先限定</option><option value="3">3:仕入れ商品</option><option value="4">4:輸出</option></select></td></tr>';
           }
           contentHtml += '</table></div>';
         }
@@ -912,7 +912,7 @@ function renderPage() {
 
     function renderSegmentTable(data) {
       const seg = data.bySegment;
-      const segNames = { 1: '自社商品', 2: '取扱限定', 3: '仕入れ商品' };
+      const segNames = { 1: '自社商品', 2: '取引先限定', 3: '仕入れ商品' };
       const pf = pfFeeData.pfFee || 0;
       const ad = pfFeeData.adCost || 0;
 
@@ -1102,7 +1102,7 @@ function renderPage() {
           document.getElementById('historyList').innerHTML = '<span class="meta">確定データはまだありません</span>';
           return;
         }
-        const segNames = {1:'自社商品', 2:'取扱限定', 3:'仕入れ商品'};
+        const segNames = {1:'自社商品', 2:'取引先限定', 3:'仕入れ商品'};
         let html = '';
         for (let i = 0; i < rows.length; i++) {
           const row = rows[i];
@@ -1183,7 +1183,7 @@ function renderPage() {
       csv += '\\n【セグメント別集計】\\n';
       csv += 'セグメント,売上合計,原価合計,原価率,行数\\n';
       const seg = data.bySegment;
-      const segNames = { 1:'自社商品', 2:'取扱限定', 3:'仕入れ商品' };
+      const segNames = { 1:'自社商品', 2:'取引先限定', 3:'仕入れ商品' };
       for (const [key, row] of Object.entries(seg)) {
         const label = segNames[key] || (key === 'other' ? 'その他' : key);
         csv += key + ':' + label + ',' + Math.round(row.売上合計) + ',' + Math.round(row.原価合計) + ',' + (row.原価率||'0.0') + ',' + row.行数 + '\\n';
@@ -1203,7 +1203,7 @@ function renderPage() {
     // ─── 詳細データCSV（全行）───
     function downloadDetailCsv() {
       if (!lastData || !lastData.detailRows) { alert('先にセリングレポートCSVをアップロードしてください'); return; }
-      const segNames = { 1:'自社商品', 2:'取扱限定', 3:'仕入れ商品', 4:'輸出' };
+      const segNames = { 1:'自社商品', 2:'取引先限定', 3:'仕入れ商品', 4:'輸出' };
 
       let csv = '\\uFEFF';
       csv += '注文番号,商品コード(Qoo10),商品コード(解決後),商品名,数量,売上合計,原価単価,原価合計,税率,CSV税率,売上分類,セグメント名,解決方法,決済完了日,購入日\\n';
@@ -1243,7 +1243,7 @@ function renderPage() {
         const rows = await r.json();
         if (!rows.length) { alert('確定データがありません'); return; }
 
-        const segNames = {1:'自社商品', 2:'取扱限定', 3:'仕入れ商品', other:'その他'};
+        const segNames = {1:'自社商品', 2:'取引先限定', 3:'仕入れ商品', other:'その他'};
         let csv = '\\uFEFF';
         csv += '集計月,セグメント,売上合計,PF手数料,広告費,原価合計,原価率\\n';
 

@@ -22,7 +22,7 @@ const UPLOAD_DIR = process.env.DATA_DIR ? process.env.DATA_DIR + '/import' : 'da
 if (!fs.existsSync(UPLOAD_DIR)) { try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch {} }
 const upload = multer({ dest: UPLOAD_DIR });
 
-const SEGMENT_NAMES = { 1: '自社商品', 2: '取扱限定', 3: '仕入れ商品' };
+const SEGMENT_NAMES = { 1: '自社商品', 2: '取引先限定', 3: '仕入れ商品' };
 const EXCLUDED_SEGMENTS = { 4: '輸出' };
 
 // ─── CSV解析（Shift_JIS対応）───
@@ -987,7 +987,7 @@ function renderPage() {
           contentHtml += '<table><tr><th>商品コード</th><th>商品名</th><th>原価</th><th>出現数</th><th>売上合計</th><th>セグメント登録</th></tr>';
           for (const u of data.unresolvedSegment) {
             contentHtml += '<tr><td>' + u.code + '</td><td>' + (u.name || '').slice(0, 60) + '</td><td class="num">' + fmt(u.genka) + '</td><td class="num">' + u.count + '</td><td class="num">' + fmt(u.amount) + '</td>';
-            contentHtml += '<td><select class="reg-sel seg-reg" data-code="' + u.code + '"><option value="">-</option><option value="1">1:自社商品</option><option value="2">2:取扱限定</option><option value="3">3:仕入れ商品</option><option value="4">4:輸出</option></select></td></tr>';
+            contentHtml += '<td><select class="reg-sel seg-reg" data-code="' + u.code + '"><option value="">-</option><option value="1">1:自社商品</option><option value="2">2:取引先限定</option><option value="3">3:仕入れ商品</option><option value="4">4:輸出</option></select></td></tr>';
           }
           contentHtml += '</table></div>';
         }
@@ -1071,7 +1071,7 @@ function renderPage() {
     }
 
     function renderSegmentTableFromReceipt(bySegment, excludedSeg) {
-      const segNames = { 1: '自社商品', 2: '取扱限定', 3: '仕入れ商品' };
+      const segNames = { 1: '自社商品', 2: '取引先限定', 3: '仕入れ商品' };
       const bt = getBillingTotals();
       const ad = bt ? bt.adCost : 0;
       const pf = bt ? bt.pfFee : 0;
@@ -1455,7 +1455,7 @@ function renderPage() {
           }
 
           // セグメント別
-          const segNames = {1:'自社商品', 2:'取扱限定', 3:'仕入れ商品'};
+          const segNames = {1:'自社商品', 2:'取引先限定', 3:'仕入れ商品'};
           const adTargets = ['1','2'];
           const hSales = {}; let hTotalSales = 0;
           for (const [k, sr] of Object.entries(seg)) { hSales[k] = sr.売上合計 || 0; if (adTargets.includes(k)) hTotalSales += hSales[k]; }
@@ -1532,7 +1532,7 @@ function renderPage() {
     function downloadDetailCsv() {
       if (!receiptData || !lastData || !lastData.orderMap) { alert('受取明細CSVと注文データCSVの両方をアップロードしてください'); return; }
       const om = lastData.orderMap;
-      const segNames = { 1: '自社商品', 2: '取扱限定', 3: '仕入れ商品', 4: '輸出' };
+      const segNames = { 1: '自社商品', 2: '取引先限定', 3: '仕入れ商品', 4: '輸出' };
       let csv = '\\uFEFF';
       csv += '利用日,注文ID,利用項目,金額(税込),税率,セグメント,商品コード,商品名,原価\\n';
       for (const row of receiptData.rows) {
@@ -1564,7 +1564,7 @@ function renderPage() {
     // ─── 集計サマリーCSVダウンロード ───
     function downloadSummaryCsv() {
       if (!lastData || !lastData.receiptByTax) { alert('集計が完了してからダウンロードしてください'); return; }
-      const segNames = { 1: '自社商品', 2: '取扱限定', 3: '仕入れ商品' };
+      const segNames = { 1: '自社商品', 2: '取引先限定', 3: '仕入れ商品' };
       let csv = '\\uFEFF';
 
       // 税率別集計（受取明細ベース）
@@ -1625,7 +1625,7 @@ function renderPage() {
         const rows = await r.json();
         if (!rows.length) { alert('確定データがありません'); return; }
 
-        const segNames = {1:'自社商品', 2:'取扱限定', 3:'仕入れ商品', other:'その他/未分類'};
+        const segNames = {1:'自社商品', 2:'取引先限定', 3:'仕入れ商品', other:'その他/未分類'};
         const adTargets = ['1','2'];
         let csv = '\\uFEFF';
         csv += '集計月,セグメント,売上合計,クーポン値引額,クーポン値引後売上,広告費,原価合計,原価率\\n';

@@ -24,6 +24,16 @@
 /** GMROI 年率化に使う日数（うるう年 0.27% 差は実務影響なしで定数扱い） */
 export const DAYS_PER_YEAR = 365;
 
+// ─── 季節性自動判定パラメータ ───
+//   過去 SEASONAL_LOOKBACK_MONTHS の月別販売分布から、
+//   上位 SEASONAL_TOP_MONTHS の合計が SEASONAL_RATIO_THRESHOLD 以上を占めれば季節商品扱い。
+//   total が SEASONAL_MIN_TOTAL 未満（実績不足）の商品は判定不能で auto = なし。
+//   手動の seasonality_flag が立っていればそちらが優先。
+export const SEASONAL_LOOKBACK_MONTHS = 24;
+export const SEASONAL_TOP_MONTHS = 3;
+export const SEASONAL_RATIO_THRESHOLD = 0.6;
+export const SEASONAL_MIN_TOTAL = 30;
+
 /**
  * GMROI を年率（%）で算出する。設計書§14 の閾値（優良 >200、観察 100-200、
  * 仕入 retire <30 / warn <50）は全て industry-standard の年率前提。
@@ -73,10 +83,18 @@ export function fetchCandidatesRaw(db, { salesClass, periodDays = 90, today }) {
   //   今日が 2026-04 のとき「直近6ヶ月」= 2025-11 〜 2026-04 の6ヶ月
   //   Codex PR2c Round 2 Medium 反映: 月末オーバーフロー対策
   //     setMonth(-5) だと 7/31 が 2/31 → 3/03 に流れて2月が除外される不具合
-  //     月初固定 new Date(Date.UTC(y, m-5, 1)) で安全に切る
-  const y = todayDate.getUTCFullYear();
-  const m = todayDate.getUTCMonth(); // 0-indexed
+  //     ローカル年月から始月オブジェクトを作って toISOString().slice(0, 7) で YYYY-MM
+  //
+  //   Codex R1 Medium (本PR) 反映:
+  //     起点はローカル年月で取得する。UTC ベースだと JST 月初数時間で「対象24ヶ月」と
+  //     isOffSeason の current month (ローカル) がズレるため、両方ともローカルに統一。
+  //     YYYY-MM 文字列化のみ UTC を使う（Date.UTC 由来のオブジェクトは TZ 影響を受けない）。
+  const y = todayDate.getFullYear();
+  const m = todayDate.getMonth(); // 0-indexed, ローカル
   const stock6mStartStr = new Date(Date.UTC(y, m - 5, 1)).toISOString().slice(0, 7);
+
+  // 季節性自動判定用の遡り開始月（今日の月初から SEASONAL_LOOKBACK_MONTHS 前）
+  const seasonalStartStr = new Date(Date.UTC(y, m - (SEASONAL_LOOKBACK_MONTHS - 1), 1)).toISOString().slice(0, 7);
 
   const sql = `
     WITH
@@ -113,6 +131,28 @@ export function fetchCandidatesRaw(db, { salesClass, periodDays = 90, today }) {
           FROM mirror_stock_monthly_snapshot
         )
         WHERE rn = 1
+      ),
+      seasonal_dist AS (
+        -- 過去 24ヶ月の月別販売数を 12ヶ月成分（1〜12月）に集計。
+        -- 季節性自動判定（detectSeasonality）が JS 側で 60% 集中をチェックする。
+        SELECT 商品コード,
+               SUM(数量) AS seasonal_total,
+               SUM(CASE WHEN substr(月, 6, 2) = '01' THEN 数量 ELSE 0 END) AS m01,
+               SUM(CASE WHEN substr(月, 6, 2) = '02' THEN 数量 ELSE 0 END) AS m02,
+               SUM(CASE WHEN substr(月, 6, 2) = '03' THEN 数量 ELSE 0 END) AS m03,
+               SUM(CASE WHEN substr(月, 6, 2) = '04' THEN 数量 ELSE 0 END) AS m04,
+               SUM(CASE WHEN substr(月, 6, 2) = '05' THEN 数量 ELSE 0 END) AS m05,
+               SUM(CASE WHEN substr(月, 6, 2) = '06' THEN 数量 ELSE 0 END) AS m06,
+               SUM(CASE WHEN substr(月, 6, 2) = '07' THEN 数量 ELSE 0 END) AS m07,
+               SUM(CASE WHEN substr(月, 6, 2) = '08' THEN 数量 ELSE 0 END) AS m08,
+               SUM(CASE WHEN substr(月, 6, 2) = '09' THEN 数量 ELSE 0 END) AS m09,
+               SUM(CASE WHEN substr(月, 6, 2) = '10' THEN 数量 ELSE 0 END) AS m10,
+               SUM(CASE WHEN substr(月, 6, 2) = '11' THEN 数量 ELSE 0 END) AS m11,
+               SUM(CASE WHEN substr(月, 6, 2) = '12' THEN 数量 ELSE 0 END) AS m12
+        FROM mirror_sales_monthly
+        WHERE データ種別 = 'by_product'
+          AND 月 >= ?
+        GROUP BY 商品コード
       )
     SELECT
       p.商品コード, p.商品名, p.売上分類,
@@ -128,6 +168,9 @@ export function fetchCandidatesRaw(db, { salesClass, periodDays = 90, today }) {
       COALESCE(sr.avg_stock, 0) as avg_stock,
       COALESCE(sr.stock_snapshot_months, 0) as stock_snapshot_months,
       COALESCE(ls.latest_stock, 0) as latest_stock,
+      COALESCE(sd.seasonal_total, 0) as seasonal_total,
+      sd.m01, sd.m02, sd.m03, sd.m04, sd.m05, sd.m06,
+      sd.m07, sd.m08, sd.m09, sd.m10, sd.m11, sd.m12,
       prs.status as retirement_status,
       prs.next_review_date as retirement_next_review,
       prs.decided_at as retirement_decided_at,
@@ -137,6 +180,7 @@ export function fetchCandidatesRaw(db, { salesClass, periodDays = 90, today }) {
     LEFT JOIN monthly_agg ma ON p.商品コード = ma.商品コード COLLATE NOCASE
     LEFT JOIN stock_recent sr ON p.商品コード = sr.商品コード COLLATE NOCASE
     LEFT JOIN latest_stock ls ON p.商品コード = ls.商品コード COLLATE NOCASE
+    LEFT JOIN seasonal_dist sd ON p.商品コード = sd.商品コード COLLATE NOCASE
     LEFT JOIN product_retirement_status prs ON p.商品コード = prs.ne_product_code COLLATE NOCASE
     WHERE p.売上分類 = ?
       AND COALESCE(p.取扱区分, '') = '取扱中'
@@ -148,6 +192,7 @@ export function fetchCandidatesRaw(db, { salesClass, periodDays = 90, today }) {
   return db.prepare(sql).all(
     periodStartStr, d30Str, d90Str,
     stock6mStartStr,
+    seasonalStartStr,
     parseInt(salesClass, 10),
   );
 }
@@ -171,14 +216,67 @@ function computeLastSaleDate(row) {
 }
 
 /**
- * 季節性オフシーズン判定。
- *   - seasonality_flag=1 かつ season_months に現在月を含まない → オフシーズン true
+ * season_months 文字列 ('1,4,12' 等) を 1〜12 の整数配列にパースして返す。
+ * 範囲外・重複・不正トークンは除去。空/null/不正なら空配列。
+ *
+ * Codex R2 Medium 反映: parseInt は '1x' '08abc' を 1/8 として通してしまうため、
+ * 厳密な整数 regex (^(0?[1-9]|1[0-2])$) で 1〜12 の月だけを許容する。
  */
-function isOffSeason(row, today) {
-  if (!row.seasonality_flag || !row.season_months) return false;
+function parseSeasonMonths(seasonMonths) {
+  if (!seasonMonths) return [];
+  const set = new Set();
+  for (const s of String(seasonMonths).split(',')) {
+    const t = s.trim();
+    if (!/^(0?[1-9]|1[0-2])$/.test(t)) continue; // strict 1〜12 のみ
+    set.add(parseInt(t, 10));
+  }
+  return [...set].sort((a, b) => a - b);
+}
+
+/**
+ * 季節性オフシーズン判定。
+ *   - 有効な seasonality_flag=1 かつ season_months に現在月を含まない → オフシーズン true
+ *   - 有効値は手動 (seasonality_flag/season_months) を最優先、なければ自動判定値を使う
+ */
+function isOffSeason(seasonalityFlag, seasonMonths, today) {
+  if (!seasonalityFlag) return false;
+  const validMonths = parseSeasonMonths(seasonMonths);
+  if (validMonths.length === 0) return false;
   const currentMonth = today.getMonth() + 1;
-  const validMonths = String(row.season_months).split(',').map(s => parseInt(s.trim(), 10)).filter(Number.isFinite);
-  return validMonths.length > 0 && !validMonths.includes(currentMonth);
+  return !validMonths.includes(currentMonth);
+}
+
+/**
+ * 過去24ヶ月の月別販売数（m01〜m12）から季節性を自動判定する。
+ *
+ * ロジック:
+ *   1) 全12ヶ月の合計が SEASONAL_MIN_TOTAL 未満 → 実績不足で判定不能 (null)
+ *   2) 上位 SEASONAL_TOP_MONTHS の合計が全体の SEASONAL_RATIO_THRESHOLD 以上 → 季節性あり
+ *   3) seasonMonths は上位 N ヶ月（昇順 'M,M,M' 形式）
+ *
+ * @returns { seasonality_flag, season_months } | null
+ */
+export function detectSeasonality(monthCounts) {
+  if (!Array.isArray(monthCounts) || monthCounts.length !== 12) return null;
+  const counts = monthCounts.map(n => Number(n) || 0);
+  const total = counts.reduce((s, n) => s + n, 0);
+  if (total < SEASONAL_MIN_TOTAL) return null;
+  const indexed = counts.map((q, i) => ({ month: i + 1, qty: q }));
+  // 安定ソート: 数量降順 → 月昇順（同数の場合は早い月を優先）
+  indexed.sort((a, b) => b.qty - a.qty || a.month - b.month);
+  const topN = indexed.slice(0, SEASONAL_TOP_MONTHS);
+  const topSum = topN.reduce((s, e) => s + e.qty, 0);
+  if (topSum / total < SEASONAL_RATIO_THRESHOLD) return null;
+  const seasonMonths = topN.map(e => e.month).sort((a, b) => a - b).join(',');
+  return { seasonality_flag: 1, season_months: seasonMonths };
+}
+
+/** row.m01〜m12 を配列化（SQL から取った 12カラムを纏める） */
+function rowMonthCounts(row) {
+  return [
+    row.m01, row.m02, row.m03, row.m04, row.m05, row.m06,
+    row.m07, row.m08, row.m09, row.m10, row.m11, row.m12,
+  ];
 }
 
 /** 楽天利益単価 = 売価 × 0.9 − 原価 − 送料 */
@@ -280,7 +378,27 @@ export function classifyProduct(row, thresholds, opts = {}) {
     ? Math.floor((today.getTime() - new Date(lastSaleDate).getTime()) / 86400000)
     : Infinity;
 
-  const seasonalityApplicable = isOffSeason(row, today);
+  // 季節性: 「flag=1 かつ season_months が valid」 のときだけ手動値を採用。
+  //   Codex R1 High (本PR) 反映: flag=1 + season_months が空/不正だと、isOffSeason が常に false を返して
+  //   「強い季節性があるのに通常商品」扱いになり値下げ等へ流入するため、手動が壊れていれば自動にフォールバック。
+  // なければ過去24ヶ月分布から自動判定（detectSeasonality）。
+  let seasonalityFlag = 0;
+  let seasonMonths = null;
+  let seasonalitySource = null;
+  const validManualMonths = parseSeasonMonths(row.season_months);
+  if (Number(row.seasonality_flag) === 1 && validManualMonths.length > 0) {
+    seasonalityFlag = 1;
+    seasonMonths = validManualMonths.join(',');
+    seasonalitySource = 'manual';
+  } else {
+    const auto = detectSeasonality(rowMonthCounts(row));
+    if (auto) {
+      seasonalityFlag = auto.seasonality_flag;
+      seasonMonths = auto.season_months;
+      seasonalitySource = 'auto';
+    }
+  }
+  const seasonalityApplicable = isOffSeason(seasonalityFlag, seasonMonths, today);
   // 設計書§14: new_product_flag=1（手動 ON）または launch_date が直近 365日 以内なら新商品扱い。
   // 仕様メモ: 手動 flag は ON のみ意味があり、OFF (=0) は「未設定」と区別しない（既定値）。
   //   現行スキーマ INTEGER DEFAULT 0 ではトライステートを表せないため、明示的な opt-out
@@ -311,6 +429,8 @@ export function classifyProduct(row, thresholds, opts = {}) {
   };
   const flags = {
     seasonality_off_season: seasonalityApplicable,
+    seasonality_source: seasonalitySource,    // 'manual' | 'auto' | null
+    season_months: seasonMonths,              // 適用された season_months 文字列（手動/自動どちらでも）
     new_product: newProduct,
     stock_data_insufficient: (row.stock_snapshot_months || 0) < 6,
   };
@@ -335,9 +455,11 @@ export function classifyProduct(row, thresholds, opts = {}) {
   if (newProduct) {
     return pack('分類外', '新商品保留', metrics, sales, flags, retirement, row);
   }
-  // 季節性保留（オフシーズン）
+  // 季節性保留（オフシーズン）— 手動/自動の出所も理由に含めると運用判断しやすい
   if (seasonalityApplicable) {
-    return pack('分類外', '季節性保留（オフシーズン）', metrics, sales, flags, retirement, row);
+    const src = seasonalitySource === 'auto' ? '自動' : '手動';
+    return pack('分類外', `季節性保留（オフシーズン・${src}・販売期${seasonMonths}月）`,
+      metrics, sales, flags, retirement, row);
   }
 
   // 撤退判定（sales_class別）
@@ -387,12 +509,16 @@ export function classifyProduct(row, thresholds, opts = {}) {
     return pack('観察継続', `GMROI ${Math.round(gmroi)}%`,
       metrics, sales, flags, retirement, row);
   }
-  // 値下げ候補: 回転 > 120日 AND 粗利率 > 20%
+  // 値下げ候補: 回転 > 120日 (上限 turnover_lte) AND 粗利率 > 20% AND 過去90日販売 ≥ sales_90d_min
+  //   - turnover_lte (省略可、デフォ 540日): 死蔵レベルは値下げ対象外で別バケット (撤退/分類外) へ
+  //   - sales_90d_min (省略可、デフォ 5個): ニッチ・低速回転は値下げ提案しても無効
   if (cls.price_down && turnoverDays !== null
       && turnoverDays > cls.price_down.turnover_gt
-      && marginRate > cls.price_down.margin_rate_gt) {
+      && (cls.price_down.turnover_lte == null || turnoverDays <= cls.price_down.turnover_lte)
+      && marginRate > cls.price_down.margin_rate_gt
+      && (cls.price_down.sales_90d_min == null || sales90d >= cls.price_down.sales_90d_min)) {
     return pack('値下げ候補',
-      `回転 ${turnoverDays}日 + 粗利率 ${Math.round(marginRate)}%`,
+      `回転 ${turnoverDays}日 + 粗利率 ${Math.round(marginRate)}% + 過去90日 ${sales90d}個`,
       metrics, sales, flags, retirement, row);
   }
   // セット候補: 回転 > 120日（簡易版、同仕入先サジェストは Phase 2）

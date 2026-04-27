@@ -813,6 +813,76 @@ router.get('/api/skumap/list', (req, res) => {
   res.json({ rows: execQuery(sql, params), total });
 });
 
+// ─── GET /api/sales_class/list ───
+// 売上分類マスタ検索（編集用）
+// ?search=  : sku / 商品名 / 売上分類値（"1"〜"4"）で部分一致
+// ?class=   : 1〜4 で分類フィルタ
+
+router.get('/api/sales_class/list', (req, res) => {
+  const { search, limit = '100', offset = '0', class: classFilter } = req.query;
+  let sql = 'SELECT * FROM product_sales_class WHERE 1=1';
+  const params = [];
+  if (search) { sql += ' AND (sku LIKE ? OR 商品名 LIKE ? OR CAST(sales_class AS TEXT) = ?)'; const t = `%${search}%`; params.push(t, t, search); }
+  if (classFilter) {
+    const sc = parseInt(classFilter);
+    if ([1, 2, 3, 4].includes(sc)) { sql += ' AND sales_class = ?'; params.push(sc); }
+  }
+  const countSql = sql.replace('SELECT *', 'SELECT COUNT(*) as cnt');
+  const total = execQuery(countSql, params)[0]?.cnt || 0;
+  sql += ' ORDER BY sku LIMIT ? OFFSET ?';
+  params.push(parseInt(limit), parseInt(offset));
+  res.json({ rows: execQuery(sql, params), total });
+});
+
+// ─── DELETE /api/sales_class/:sku ───
+// 削除時は m_products.売上分類 も NULL に戻して未登録一覧に再出現させる
+
+router.delete('/api/sales_class/:sku', (req, res) => {
+  const db = getDB();
+  const sku = (req.params.sku || '').toLowerCase();
+  const old = db.prepare('SELECT * FROM product_sales_class WHERE sku = ?').get(sku);
+  const result = db.prepare('DELETE FROM product_sales_class WHERE sku = ?').run(sku);
+  if (old) auditLog(db, 'product_sales_class', sku, 'DELETE', old, null);
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  try { db.prepare('UPDATE m_products SET 売上分類 = NULL, updated_at = ? WHERE 商品コード = ? COLLATE NOCASE').run(now, sku); } catch {}
+  res.json({ ok: true, deleted: result.changes });
+});
+
+// ─── GET /api/tax_rate/list ───
+// 税率マスタ検索（編集用）
+// ?search=  : sku / 商品名 で部分一致
+// ?rate=    : 0.1 または 0.08 で絞り込み
+
+router.get('/api/tax_rate/list', (req, res) => {
+  const { search, limit = '100', offset = '0', rate: rateFilter } = req.query;
+  let sql = 'SELECT * FROM product_tax_rate WHERE 1=1';
+  const params = [];
+  if (search) { sql += ' AND (sku LIKE ? OR 商品名 LIKE ?)'; const t = `%${search}%`; params.push(t, t); }
+  if (rateFilter) {
+    const tr = parseFloat(rateFilter);
+    if ([0.08, 0.1].includes(tr)) { sql += ' AND tax_rate = ?'; params.push(tr); }
+  }
+  const countSql = sql.replace('SELECT *', 'SELECT COUNT(*) as cnt');
+  const total = execQuery(countSql, params)[0]?.cnt || 0;
+  sql += ' ORDER BY sku LIMIT ? OFFSET ?';
+  params.push(parseInt(limit), parseInt(offset));
+  res.json({ rows: execQuery(sql, params), total });
+});
+
+// ─── DELETE /api/tax_rate/:sku ───
+// 削除時は m_products.消費税率 / 税区分 も NULL に戻して未登録一覧に再出現させる
+
+router.delete('/api/tax_rate/:sku', (req, res) => {
+  const db = getDB();
+  const sku = (req.params.sku || '').toLowerCase();
+  const old = db.prepare('SELECT * FROM product_tax_rate WHERE sku = ?').get(sku);
+  const result = db.prepare('DELETE FROM product_tax_rate WHERE sku = ?').run(sku);
+  if (old) auditLog(db, 'product_tax_rate', sku, 'DELETE', old, null);
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  try { db.prepare('UPDATE m_products SET 消費税率 = NULL, 税区分 = NULL, updated_at = ? WHERE 商品コード = ? COLLATE NOCASE').run(now, sku); } catch {}
+  res.json({ ok: true, deleted: result.changes });
+});
+
 // ─── GET /api/missing/prioritized ───
 // m_productsベースの未登録データ（f_sales_by_productで売上優先度付け）
 
@@ -1297,9 +1367,23 @@ function renderRegisterPage(shippingRates) {
         <button class="active" onclick="switchManage('shipping',this)">送料</button>
         <button onclick="switchManage('genka',this)">原価</button>
         <button onclick="switchManage('skumap',this)">SKUマップ</button>
+        <button onclick="switchManage('sales_class',this)">売上分類</button>
+        <button onclick="switchManage('tax_rate',this)">税率</button>
       </div>
       <div class="row">
         <input id="m-search" placeholder="商品コード or 商品名" style="width:280px" onkeydown="if(event.key==='Enter')searchManage()">
+        <select id="m-class-filter" style="display:none" onchange="searchManage()">
+          <option value="">分類: 全て</option>
+          <option value="1">1: 自社商品</option>
+          <option value="2">2: 取扱限定</option>
+          <option value="3">3: 仕入れ</option>
+          <option value="4">4: 輸出</option>
+        </select>
+        <select id="m-rate-filter" style="display:none" onchange="searchManage()">
+          <option value="">税率: 全て</option>
+          <option value="0.1">10%（標準）</option>
+          <option value="0.08">8%（軽減）</option>
+        </select>
         <button class="btn btn-p" onclick="searchManage()">検索</button>
       </div>
       <div class="scroll-area">
@@ -1408,7 +1492,7 @@ function renderRegisterPage(shippingRates) {
           html += '<input placeholder="原価" style="width:80px" type="number" step="0.01"> ';
           html += '<button class="btn btn-p" data-act="reg-genka" data-sku="'+he(r.商品コード)+'" data-name="'+he(r.商品名)+'">登録</button>';
         } else if (curType === 'sales_class') {
-          html += '<select style="width:120px"><option value="">--</option><option value="1">1:自社商品</option><option value="2">2:取扱限定</option><option value="3">3:仕入れ</option><option value="4">4:輸出</option></select> ';
+          html += '<select style="width:120px"><option value="">--</option><option value="1">1:自社商品</option><option value="2">2:取引先限定</option><option value="3">3:仕入れ</option><option value="4">4:輸出</option></select> ';
           html += '<button class="btn btn-p" data-act="reg-class" data-sku="'+he(r.商品コード)+'" data-name="'+he(r.商品名)+'">登録</button>';
         } else if (curType === 'tax_rate') {
           html += '<select style="width:120px"><option value="">--</option><option value="0.1">10%（標準）</option><option value="0.08">8%（軽減）</option></select> ';
@@ -1536,6 +1620,16 @@ function renderRegisterPage(shippingRates) {
           }
           await api('/api/skumap', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({seller_sku:sku,ne_code:inputs[0].value,product_name:name,quantity:inputs[1]?.value||1})});
           toast(sku+' のSKUマップを更新');
+        } else if (act === 'update-class') {
+          const sel = tr.querySelector('select');
+          if (!sel?.value) { btn.disabled=false; return; }
+          await api('/api/sales_class', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sku,sales_class:sel.value,product_name:name})});
+          toast(sku+' の売上分類を更新');
+        } else if (act === 'update-tax') {
+          const sel = tr.querySelector('select');
+          if (!sel?.value) { btn.disabled=false; return; }
+          await api('/api/tax_rate', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sku,tax_rate:sel.value,product_name:name})});
+          toast(sku+' の税率を更新');
         } else if (act === 'del') {
           if (!confirm(sku+' を削除しますか？')) { btn.disabled=false; return; }
           const type = btn.dataset.type;
@@ -1598,13 +1692,34 @@ function renderRegisterPage(shippingRates) {
       document.getElementById('m-body').innerHTML = '';
       document.getElementById('m-head').innerHTML = '';
       document.getElementById('m-meta').textContent = '';
+      const cf = document.getElementById('m-class-filter');
+      const rf = document.getElementById('m-rate-filter');
+      if (cf) cf.style.display = type === 'sales_class' ? '' : 'none';
+      if (rf) rf.style.display = type === 'tax_rate' ? '' : 'none';
+    }
+    function classOptions(selected) {
+      const labels = { '1': '1: 自社商品', '2': '2: 取扱限定', '3': '3: 仕入れ', '4': '4: 輸出' };
+      return Object.keys(labels).map(v => '<option value="'+v+'"'+(String(selected)===v?' selected':'')+'>'+labels[v]+'</option>').join('');
+    }
+    function rateTaxOptions(selected) {
+      const labels = { '0.1': '10%（標準）', '0.08': '8%（軽減）' };
+      return Object.keys(labels).map(v => '<option value="'+v+'"'+(String(selected)===v?' selected':'')+'>'+labels[v]+'</option>').join('');
     }
     async function searchManage() {
       const search = document.getElementById('m-search').value;
-      const ep = curManage === 'shipping' ? '/api/shipping/list' : curManage === 'genka' ? '/api/genka/list' : '/api/skumap/list';
-      const data = await api(ep + '?search=' + encodeURIComponent(search) + '&limit=100');
+      const epMap = { shipping: '/api/shipping/list', genka: '/api/genka/list', skumap: '/api/skumap/list', sales_class: '/api/sales_class/list', tax_rate: '/api/tax_rate/list' };
+      const ep = epMap[curManage] || '/api/shipping/list';
+      let qs = '?search=' + encodeURIComponent(search) + '&limit=100';
+      if (curManage === 'sales_class') {
+        const cf = document.getElementById('m-class-filter')?.value || '';
+        if (cf) qs += '&class=' + encodeURIComponent(cf);
+      } else if (curManage === 'tax_rate') {
+        const rf = document.getElementById('m-rate-filter')?.value || '';
+        if (rf) qs += '&rate=' + encodeURIComponent(rf);
+      }
+      const data = await api(ep + qs);
       const rows = data.rows || [];
-      let head = '', html = '';
+      let head = '', html = '', cols = 5;
 
       if (curManage === 'shipping') {
         head = '<tr><th>商品コード</th><th>商品名</th><th>配送方法</th><th>送料</th><th>操作</th></tr>';
@@ -1615,14 +1730,30 @@ function renderRegisterPage(shippingRates) {
           html += '<td><button class="btn btn-p" data-act="update-ship" data-sku="'+he(r.sku)+'">更新</button> <button class="btn btn-d" data-act="del" data-type="shipping" data-sku="'+he(r.sku)+'">削除</button></td></tr>';
         }
       } else if (curManage === 'genka') {
-        head = '<tr><th>SKU</th><th>商品名</th><th>原価</th><th>操作</th></tr>';
+        head = '<tr><th>SKU</th><th>商品名</th><th>原価</th><th>操作</th></tr>'; cols = 4;
         for (const r of rows) {
           html += '<tr><td>'+he(r.sku)+'</td><td>'+he((r.商品名||'').slice(0,30))+'</td>';
           html += '<td><input value="'+r.genka+'" style="width:80px" type="number" step="0.01"></td>';
           html += '<td><button class="btn btn-p" data-act="update-genka" data-sku="'+he(r.sku)+'" data-name="'+he(r.商品名)+'">更新</button> <button class="btn btn-d" data-act="del" data-type="genka" data-sku="'+he(r.sku)+'">削除</button></td></tr>';
         }
+      } else if (curManage === 'sales_class') {
+        head = '<tr><th>商品コード</th><th>商品名</th><th>売上分類</th><th>更新日時</th><th>操作</th></tr>';
+        for (const r of rows) {
+          html += '<tr><td>'+he(r.sku)+'</td><td>'+he((r.商品名||'').slice(0,30))+'</td>';
+          html += '<td><select style="width:140px">'+classOptions(r.sales_class)+'</select></td>';
+          html += '<td style="font-size:11px;color:#888">'+he(r.synced_at||'')+'</td>';
+          html += '<td><button class="btn btn-p" data-act="update-class" data-sku="'+he(r.sku)+'" data-name="'+he(r.商品名||'')+'">更新</button> <button class="btn btn-d" data-act="del" data-type="sales_class" data-sku="'+he(r.sku)+'">削除</button></td></tr>';
+        }
+      } else if (curManage === 'tax_rate') {
+        head = '<tr><th>商品コード</th><th>商品名</th><th>税率</th><th>更新日時</th><th>操作</th></tr>';
+        for (const r of rows) {
+          html += '<tr><td>'+he(r.sku)+'</td><td>'+he((r.商品名||'').slice(0,30))+'</td>';
+          html += '<td><select style="width:140px">'+rateTaxOptions(r.tax_rate)+'</select></td>';
+          html += '<td style="font-size:11px;color:#888">'+he(r.synced_at||'')+'</td>';
+          html += '<td><button class="btn btn-p" data-act="update-tax" data-sku="'+he(r.sku)+'" data-name="'+he(r.商品名||'')+'">更新</button> <button class="btn btn-d" data-act="del" data-type="tax_rate" data-sku="'+he(r.sku)+'">削除</button></td></tr>';
+        }
       } else {
-        head = '<tr><th>Amazon SKU</th><th>ASIN</th><th>商品名</th><th>NE商品コード</th><th>数量</th><th>操作</th></tr>';
+        head = '<tr><th>Amazon SKU</th><th>ASIN</th><th>商品名</th><th>NE商品コード</th><th>数量</th><th>操作</th></tr>'; cols = 6;
         for (const r of rows) {
           html += '<tr><td>'+he(r.seller_sku)+'</td><td>'+he(r.asin||'')+'</td><td>'+he((r.商品名||'').slice(0,25))+'</td>';
           html += '<td><input value="'+he(r.ne_code||'')+'" style="width:120px"></td>';
@@ -1630,7 +1761,7 @@ function renderRegisterPage(shippingRates) {
           html += '<td><button class="btn btn-p" data-act="update-sku" data-sku="'+he(r.seller_sku)+'" data-ne="'+he(r.ne_code)+'" data-name="'+he(r.商品名)+'">更新</button> <button class="btn btn-d" data-act="del" data-type="skumap" data-sku="'+he(r.seller_sku)+'" data-ne="'+he(r.ne_code)+'">削除</button></td></tr>';
         }
       }
-      if (!rows.length) html = '<tr><td colspan="6" style="text-align:center;padding:20px;color:#999">該当なし</td></tr>';
+      if (!rows.length) html = '<tr><td colspan="'+cols+'" style="text-align:center;padding:20px;color:#999">該当なし</td></tr>';
       document.getElementById('m-head').innerHTML = head;
       document.getElementById('m-body').innerHTML = html;
       document.getElementById('m-meta').textContent = (data.total||0) + '件';
@@ -1659,7 +1790,7 @@ function renderRegisterPage(shippingRates) {
       shipping: 'CSV形式: 商品コード, 送料コード',
       genka: 'CSV形式: 商品コード, 原価, 商品名（任意）',
       skumap: 'CSV形式: seller_sku, ne_code, 数量（任意）, ASIN（任意）',
-      sales_class: 'CSV形式: 商品コード, 売上分類(1:自社/2:取扱限定/3:仕入れ/4:輸出)',
+      sales_class: 'CSV形式: 商品コード, 売上分類(1:自社/2:取引先限定/3:仕入れ/4:輸出)',
       tax_rate: 'CSV形式: 商品コード, 税率(0.1 or 0.08)'
     };
     function switchCsvType(type, el) {

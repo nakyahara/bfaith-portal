@@ -6,7 +6,7 @@
  *
  * 売上分類は m_products.売上分類 の整数値に対応:
  *   1: 自社商品
- *   2: 取引先限定商品 (= 設計書の「取扱限定」)
+ *   2: 取引先限定商品 (= 設計書の「取引先限定」)
  *   3: 仕入れ商品
  *   4: 米国Amazon輸出 (本ダッシュボード対象外)
  */
@@ -39,7 +39,9 @@ export const DEFAULT_RETIREMENT_THRESHOLDS = {
 export const DEFAULT_CLASSIFICATION_THRESHOLDS = {
   good_stock:       { gmroi_gt: 200, turnover_min: 30, turnover_max: 90 },
   observe:          { gmroi_min: 100, gmroi_max: 200 },
-  price_down:       { turnover_gt: 120, margin_rate_gt: 20 },
+  // 値下げ候補: 回転 120-540日 + 粗利率>20% + 過去90日販売≥5個（死蔵・ニッチ品の流入を防ぐ）
+  //   turnover_lte / sales_90d_min は省略可だが、デフォルトは設定する。
+  price_down:       { turnover_gt: 120, turnover_lte: 540, margin_rate_gt: 20, sales_90d_min: 5 },
   bundle_candidate: { turnover_gt: 120 },
 };
 
