@@ -172,9 +172,27 @@ function isApiRequest(req) {
   return req.path.startsWith('/api/') || req.xhr || (req.get('accept') || '').includes('application/json');
 }
 
+// 認証後に元のURLへ戻すための保存ヘルパ
+// オープンリダイレクト防止: 相対パス(`/...`)のみ許可、`//` や `/login` 自身は除外
+function rememberReturnTo(req) {
+  if (req.method !== 'GET') return;
+  const url = req.originalUrl || req.url;
+  if (!url || !url.startsWith('/') || url.startsWith('//')) return;
+  if (url === '/login' || url.startsWith('/login?')) return;
+  req.session.returnTo = url;
+}
+
+function popReturnTo(req) {
+  const dest = req.session && req.session.returnTo;
+  if (req.session) delete req.session.returnTo;
+  if (typeof dest === 'string' && dest.startsWith('/') && !dest.startsWith('//')) return dest;
+  return '/';
+}
+
 function requireAuth(req, res, next) {
   if (req.session && req.session.authenticated) return next();
   if (isApiRequest(req)) return res.status(401).json({ error: 'session_expired' });
+  rememberReturnTo(req);
   res.redirect('/login');
 }
 
@@ -183,6 +201,7 @@ function requireAppAccess(appId) {
   return (req, res, next) => {
     if (!req.session || !req.session.authenticated) {
       if (isApiRequest(req)) return res.status(401).json({ error: 'session_expired' });
+      rememberReturnTo(req);
       return res.redirect('/login');
     }
     const allowed = req.session.allowedApps;
@@ -400,7 +419,7 @@ const externalLinks = [
 
 // ログインページ
 app.get('/login', (req, res) => {
-  if (req.session.authenticated) return res.redirect('/');
+  if (req.session.authenticated) return res.redirect(popReturnTo(req));
   res.render('login', { error: null });
 });
 
@@ -414,7 +433,7 @@ app.post('/login', (req, res) => {
     req.session.displayName = user.displayName;
     req.session.role = user.role;
     req.session.allowedApps = user.allowedApps;
-    return res.redirect('/');
+    return res.redirect(popReturnTo(req));
   }
   res.render('login', { error: 'メールアドレスまたはパスワードが正しくありません' });
 });
