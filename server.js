@@ -29,6 +29,7 @@ import fbaProfitabilityRouter from './apps/fba-profitability/router.js';
 import mercariAccountingRouter from './apps/mercari-accounting/router.js';
 import profitAnalysisRouter from './apps/profit-analysis/router.js';
 import mgmtAccountingRouter from './apps/mgmt-accounting/router.js';
+import crossSellFinderRouter from './apps/cross-sell-finder/router.js';
 import serviceRouter from './apps/warehouse/service-router.js';
 import { serviceAuth } from './apps/warehouse/service-auth.js';
 import { isWarehouseDbReady } from './apps/warehouse/router.js';
@@ -389,6 +390,15 @@ const apps = [
     category: 'analysis',
   },
   {
+    id: 'cross-sell-finder',
+    name: '同梱商品検索',
+    description: 'NE商品コードで過去90日に一緒に買われた商品を全モール横断で表示',
+    icon: '🛍️',
+    path: '/apps/cross-sell-finder',
+    status: 'active',
+    category: 'analysis',
+  },
+  {
     id: 'mgmt-accounting',
     name: '売上分類別粗利集計',
     description: '各モール売上データ+運賃・資材費から売上分類別の変動費・粗利益を管理会計用に集計',
@@ -610,6 +620,7 @@ app.use('/apps/qoo10-accounting', (req, res, next) => {
 }, qoo10AccountingRouter);
 app.use('/apps/fba-profitability', requireAppAccess('fba-profitability'), fbaProfitabilityRouter);
 app.use('/apps/profit-analysis', requireAppAccess('profit-analysis'), profitAnalysisRouter);
+app.use('/apps/cross-sell-finder', requireAppAccess('cross-sell-finder'), crossSellFinderRouter);
 app.use('/apps/mgmt-accounting', express.json({ limit: '50mb' }), (req, res, next) => {
   // 管理系APIはセッション認証スキップ（内部で checkAuth により key/session のいずれか必須）
   const adminPaths = ['/import-historical', '/bulk-calculate', '/cleanup-invalid'];

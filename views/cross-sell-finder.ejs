@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>同梱商品検索 - B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png"><link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    .container { max-width: 1200px; margin: 0 auto; padding: 16px 20px; }
+    .header-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
+    .header-row h2 { margin: 0; }
+    .back-link { font-size: 13px; color: #2563eb; text-decoration: none; }
+    .back-link:hover { text-decoration: underline; }
+
+    .search-box { background: white; padding: 16px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); margin-bottom: 16px; }
+    .search-box form { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .search-box label { font-size: 13px; color: #555; }
+    .search-box input[type="text"] { padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 14px; min-width: 240px; }
+    .search-box select { padding: 8px 10px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 14px; }
+    .btn-primary { background: #2563eb; color: white; border: none; padding: 8px 18px; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500; }
+    .btn-primary:hover:not(:disabled) { background: #1d4ed8; }
+    .btn-primary:disabled { background: #93c5fd; cursor: not-allowed; }
+
+    .meta { background: #f3f4f6; padding: 10px 14px; border-radius: 6px; margin-bottom: 16px; font-size: 13px; color: #374151; }
+    .meta strong { color: #111; }
+
+    .empty { background: #fef3c7; border: 1px solid #fbbf24; padding: 12px 16px; border-radius: 6px; color: #78350f; font-size: 14px; }
+    .error { background: #fee2e2; border: 1px solid #ef4444; padding: 12px 16px; border-radius: 6px; color: #7f1d1d; font-size: 14px; }
+    .loading { color: #6b7280; font-size: 13px; padding: 12px 0; }
+
+    .section { background: white; padding: 16px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); margin-bottom: 16px; }
+    .section h3 { margin: 0 0 12px 0; font-size: 16px; color: #111; }
+    .section h3 .count { color: #6b7280; font-weight: normal; font-size: 13px; margin-left: 8px; }
+
+    table.data { width: 100%; border-collapse: collapse; font-size: 13px; }
+    table.data th, table.data td { border: 1px solid #e5e7eb; padding: 6px 10px; text-align: left; }
+    table.data th { background: #f9fafb; font-weight: 600; color: #374151; }
+    table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    table.data tbody tr:hover { background: #f9fafb; }
+
+    .platform-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 12px; }
+    .platform-card { background: white; padding: 14px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+    .platform-card h4 { margin: 0 0 10px 0; font-size: 14px; color: #111; }
+    .platform-card .platform-tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; background: #e0e7ff; color: #3730a3; margin-left: 6px; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="/" class="btn-logout">ダッシュボード</a>
+      <a href="/logout" class="btn-logout">ログアウト</a>
+    </div>
+  </header>
+
+  <main class="container">
+    <div class="header-row">
+      <h2>🛍️ 同梱商品検索</h2>
+      <a href="/" class="back-link">← ダッシュボードへ戻る</a>
+    </div>
+
+    <div class="search-box">
+      <form id="search-form">
+        <label for="code">NE商品コード:</label>
+        <input type="text" id="code" name="code" placeholder="例: ABC-1234" required autofocus>
+        <label for="days">期間:</label>
+        <select id="days" name="days">
+          <option value="30">30日</option>
+          <option value="90" selected>90日</option>
+          <option value="180">180日</option>
+          <option value="365">365日</option>
+        </select>
+        <button type="submit" class="btn-primary" id="search-btn">検索</button>
+      </form>
+    </div>
+
+    <div id="result"></div>
+  </main>
+
+  <script>
+    const PLATFORM_LABELS = {
+      rakuten: '楽天',
+      yahoo: 'Yahoo!ショッピング',
+      yahoo_auction: 'ヤフオク',
+      mercari: 'メルカリShops',
+      linegift: 'LINEギフト',
+      qoo10: 'Qoo10',
+      aupay: 'auPayマーケット',
+      rakuma: 'ラクマ',
+      wholesale: '卸',
+      mysmartstore: 'My Smart Store',
+      dshopping: 'dショッピング',
+      amazon_fbm: 'Amazon (FBM)',
+      unknown: '(モール不明)',
+    };
+    function platformLabel(pf) { return PLATFORM_LABELS[pf] || pf; }
+
+    const ERROR_LABELS = {
+      warehouse_api_error: 'データソースから不正な応答が返りました',
+      warehouse_api_timeout: 'データソースの応答がタイムアウトしました (30秒)',
+      warehouse_api_unreachable: 'データソースに接続できませんでした',
+      session_expired: 'セッションが切れました。ログインし直してください',
+    };
+    function errorLabel(slug, fallback) {
+      return ERROR_LABELS[slug] || fallback || slug || '不明なエラー';
+    }
+
+    function escapeHtml(s) {
+      return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    function renderTable(rows) {
+      if (!rows || rows.length === 0) {
+        return '<div class="loading">該当なし</div>';
+      }
+      let html = '<table class="data"><thead><tr>'
+        + '<th>順位</th><th>商品コード</th><th>商品名</th>'
+        + '<th class="num">同梱伝票数</th><th class="num">累計数量</th>'
+        + '</tr></thead><tbody>';
+      rows.forEach((r, i) => {
+        html += '<tr>'
+          + '<td class="num">' + (i + 1) + '</td>'
+          + '<td>' + escapeHtml(r.商品コード) + '</td>'
+          + '<td>' + escapeHtml(r.商品名 || '') + '</td>'
+          + '<td class="num">' + (r.同梱伝票数 || 0).toLocaleString() + '</td>'
+          + '<td class="num">' + (r.累計数量 || 0).toLocaleString() + '</td>'
+          + '</tr>';
+      });
+      html += '</tbody></table>';
+      return html;
+    }
+
+    document.getElementById('search-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const code = document.getElementById('code').value.trim();
+      const days = document.getElementById('days').value;
+      if (!code) return;
+
+      const btn = document.getElementById('search-btn');
+      const result = document.getElementById('result');
+      btn.disabled = true;
+      btn.textContent = '検索中...';
+      result.innerHTML = '<div class="loading">問い合わせ中...</div>';
+
+      try {
+        const r = await fetch('/apps/cross-sell-finder/api/search?code=' + encodeURIComponent(code) + '&days=' + encodeURIComponent(days));
+        const data = await r.json();
+        if (!r.ok) {
+          result.innerHTML = '<div class="error">エラー (HTTP ' + r.status + '): '
+            + escapeHtml(errorLabel(data.error, '通信エラー'))
+            + '</div>';
+          return;
+        }
+
+        let html = '';
+        html += '<div class="meta">'
+          + '検索: <strong>' + escapeHtml(data.code) + '</strong>'
+          + (data.商品名 ? ' (' + escapeHtml(data.商品名) + ')' : '')
+          + ' / 期間: <strong>過去' + data.period.days + '日</strong> (' + data.period.from + '〜)'
+          + ' / 対象伝票数: <strong>' + (data.対象伝票数 || 0).toLocaleString() + '件</strong>'
+          + '</div>';
+
+        if (!data.対象伝票数) {
+          html += '<div class="empty">この商品コードは指定期間内の有効受注がありません。</div>';
+          result.innerHTML = html;
+          return;
+        }
+
+        html += '<div class="section">'
+          + '<h3>🌐 全モール横断 ランキング <span class="count">TOP ' + data.global.length + '</span></h3>'
+          + renderTable(data.global)
+          + '</div>';
+
+        const platforms = Object.keys(data.byPlatform).sort((a, b) => {
+          const sa = (data.byPlatform[a][0]?.同梱伝票数) || 0;
+          const sb = (data.byPlatform[b][0]?.同梱伝票数) || 0;
+          return sb - sa;
+        });
+        if (platforms.length > 0) {
+          html += '<div class="section"><h3>🛒 モール別 ランキング</h3>';
+          html += '<div class="platform-grid">';
+          for (const pf of platforms) {
+            html += '<div class="platform-card">'
+              + '<h4>' + escapeHtml(platformLabel(pf)) + '<span class="platform-tag">' + escapeHtml(pf) + '</span></h4>'
+              + renderTable(data.byPlatform[pf])
+              + '</div>';
+          }
+          html += '</div></div>';
+        }
+
+        result.innerHTML = html;
+      } catch (err) {
+        result.innerHTML = '<div class="error">通信エラー: ' + escapeHtml(err.message) + '</div>';
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '検索';
+      }
+    });
+  </script>
+</body>
+</html>
