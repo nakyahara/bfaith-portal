@@ -100,6 +100,9 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_orders_date ON raw_ne_orders(受注日)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_orders_product ON raw_ne_orders(商品コード)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_orders_shop ON raw_ne_orders(店舗コード)');
+  // 同梱商品検索 (cross-sell) の伝票番号 join を安定化させるための明示 index。
+  // PK 先頭列でも equality lookup は効くが、planner の選択が変わるのを避ける。
+  db.exec('CREATE INDEX IF NOT EXISTS idx_orders_voucher ON raw_ne_orders(伝票番号)');
 
   // 3. セット商品マスタ
   db.exec(`CREATE TABLE IF NOT EXISTS raw_ne_set_products (
