@@ -58,10 +58,12 @@ import fbaServiceRouter from './fba-service.js';
 import researchServiceRouter from './research-service.js';
 import rakutenRmsServiceRouter from './rakuten-rms-service.js';
 import rankcheckServiceRouter from './rankcheck-service.js';
+import crossSellServiceRouter from './cross-sell-service.js';
 router.use('/fba', fbaServiceRouter);
 router.use('/research', researchServiceRouter);
 router.use('/rakuten-rms', rakutenRmsServiceRouter);
 router.use('/rankcheck', rankcheckServiceRouter);
+router.use('/cross-sell', crossSellServiceRouter);
 
 // --- エラーハンドラー（最後） ---
 router.use(serviceErrorHandler);

@@ -2,7 +2,9 @@
  * 同梱商品検索 (Cross-Sell Finder)
  *
  * NE商品コードで検索 → 過去90日に同じ伝票で一緒に買われた商品ランキング。
- * 本体ロジックはミニPC側 /apps/warehouse/api/cross-sell。Render側はその中継 + UI。
+ * 本体ロジックはミニPC側 /service-api/cross-sell/search。
+ * Render → ミニPC は CF Access + serviceAuth (Bearer) 経由。
+ * (/apps/warehouse/* はセッション認証必須でサーバ間通信できないため使えない)
  */
 import { Router } from 'express';
 
@@ -10,12 +12,12 @@ const router = Router();
 
 const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
 
-function getApiHeaders() {
-  const h = {};
-  if (process.env.CF_ACCESS_CLIENT_ID) h['CF-Access-Client-Id'] = process.env.CF_ACCESS_CLIENT_ID;
-  if (process.env.CF_ACCESS_CLIENT_SECRET) h['CF-Access-Client-Secret'] = process.env.CF_ACCESS_CLIENT_SECRET;
-  if (process.env.WAREHOUSE_API_KEY) h['X-API-Key'] = process.env.WAREHOUSE_API_KEY;
-  return h;
+function getServiceHeaders() {
+  return {
+    'CF-Access-Client-Id': process.env.CF_ACCESS_CLIENT_ID || '',
+    'CF-Access-Client-Secret': process.env.CF_ACCESS_CLIENT_SECRET || '',
+    'Authorization': `Bearer ${process.env.WAREHOUSE_SERVICE_TOKEN || ''}`,
+  };
 }
 
 router.get('/', (req, res) => {
@@ -31,21 +33,21 @@ router.get('/api/search', async (req, res) => {
   const days = String(req.query.days || '90');
   if (!code) return res.status(400).json({ error: 'code が必要です' });
 
-  const url = `${WAREHOUSE_URL}/apps/warehouse/api/cross-sell`
+  const url = `${WAREHOUSE_URL}/service-api/cross-sell/search`
     + `?code=${encodeURIComponent(code)}&days=${encodeURIComponent(days)}`;
 
   try {
     const r = await fetch(url, {
-      headers: getApiHeaders(),
+      headers: getServiceHeaders(),
       signal: AbortSignal.timeout(30000),
     });
     const text = await r.text();
     const ct = r.headers.get('content-type') || '';
     // CF Access 未認証や upstream エラーで HTML が返ってくるケースを JSON 化。
     // detail はサーバログのみ。レスポンスには内部 HTML / stack を漏らさない。
-    if (!r.ok || !ct.includes('json')) {
+    if (!ct.includes('json')) {
       console.warn(
-        `[CrossSell] upstream non-json response status=${r.status} ct=${ct} `
+        `[CrossSell] upstream non-json status=${r.status} ct=${ct} `
         + `code=${code} body=${text.slice(0, 500).replace(/\s+/g, ' ')}`
       );
       return res.status(r.ok ? 502 : r.status).json({
@@ -53,10 +55,18 @@ router.get('/api/search', async (req, res) => {
         status: r.status,
       });
     }
-    res.type('application/json').send(text);
+    const data = JSON.parse(text);
+    if (!data.ok) {
+      console.warn(`[CrossSell] upstream error status=${r.status} code=${code} `
+        + `error=${data.error} message=${data.message}`);
+      return res.status(r.status || 502).json({
+        error: data.error || 'warehouse_api_error',
+        message: data.message,
+      });
+    }
+    // service API は { ok, result: {...} } 形式 → result を展開して UI に返す
+    res.json(data.result);
   } catch (e) {
-    // AbortSignal.timeout のキャンセルは TimeoutError 名で投げられる。
-    // 上流遅延と Render 側バグを区別するため 504 で返す。
     if (e.name === 'TimeoutError' || e.name === 'AbortError') {
       console.warn(`[CrossSell] upstream timeout code=${code}`);
       return res.status(504).json({ error: 'warehouse_api_timeout' });
