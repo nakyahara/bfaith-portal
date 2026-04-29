@@ -117,6 +117,31 @@ router.get('/search', (req, res) => {
 
   // 全モール横断: 商品コードで集約
   const globalMap = new Map();
+  // platform 別の対象伝票数 (検索商品が含まれる platform 別の伝票数)。
+  // - 全体ランキングの分母: SUM(プラットフォーム別)
+  // - モール別ランキングの分母: その platform の値
+  // 1伝票=1店舗=1 platform なので、SUM で重複なく合算できる。
+  const db = getDB();
+  const platformTargets = db.prepare(
+    `SELECT COALESCE(s.platform, '') AS platform, COUNT(DISTINCT o.伝票番号) AS cnt
+     FROM raw_ne_orders o
+     LEFT JOIN shops s ON o.店舗コード = s.shop_code
+     WHERE o.商品コード = ?
+       AND o.受注日 >= ?
+       AND o.キャンセル区分 = '有効'
+       AND COALESCE(s.platform, '') NOT IN ('_ignore', 'amazon_fbm')
+     GROUP BY COALESCE(s.platform, '')`
+  ).all(code, fromStr);
+
+  const platformTargetMap = {};
+  let totalTarget = 0;
+  for (const r of platformTargets) {
+    platformTargetMap[r.platform || 'unknown'] = r.cnt;
+    totalTarget += r.cnt;
+  }
+
+  const pct = (num, den) => den > 0 ? Math.round((num / den) * 1000) / 10 : 0;
+
   for (const r of rows) {
     const key = r.商品コード;
     if (!globalMap.has(key)) {
@@ -126,9 +151,13 @@ router.get('/search', (req, res) => {
     g.同梱伝票数 += r.同梱伝票数;
     g.累計数量 += r.累計数量;
   }
-  const global = [...globalMap.values()].sort(sortRanking).slice(0, 50);
+  // 全体: 同梱率 = その商品の合算同梱伝票数 / 全モール対象伝票数
+  const global = [...globalMap.values()]
+    .map(g => ({ ...g, 同梱率: pct(g.同梱伝票数, totalTarget) }))
+    .sort(sortRanking)
+    .slice(0, 50);
 
-  // モール別: platform ごとに TOP 30
+  // モール別: platform ごとに TOP 30、同梱率はそのモール内の対象伝票数を分母に
   const platformMap = new Map();
   for (const r of rows) {
     const pf = r.platform || 'unknown';
@@ -137,21 +166,12 @@ router.get('/search', (req, res) => {
   }
   const byPlatform = {};
   for (const [pf, list] of platformMap.entries()) {
-    byPlatform[pf] = list.sort(sortRanking).slice(0, 30);
+    const den = platformTargetMap[pf] || 0;
+    byPlatform[pf] = list
+      .map(r => ({ ...r, 同梱率: pct(r.同梱伝票数, den) }))
+      .sort(sortRanking)
+      .slice(0, 30);
   }
-
-  // 対象伝票数: ランキング本体と同じ除外条件を適用しないと
-  // 「対象伝票数あり / 結果ゼロ」の見え方になる。
-  const db = getDB();
-  const targetCount = db.prepare(
-    `SELECT COUNT(DISTINCT o.伝票番号) AS cnt
-     FROM raw_ne_orders o
-     LEFT JOIN shops s ON o.店舗コード = s.shop_code
-     WHERE o.商品コード = ?
-       AND o.受注日 >= ?
-       AND o.キャンセル区分 = '有効'
-       AND COALESCE(s.platform, '') NOT IN ('_ignore', 'amazon_fbm')`
-  ).get(code, fromStr)?.cnt || 0;
 
   const productRow = db.prepare(
     'SELECT 商品名 FROM raw_ne_products WHERE 商品コード = ?'
@@ -162,7 +182,8 @@ router.get('/search', (req, res) => {
       code,
       商品名: productRow?.商品名 || null,
       period: { days, from: fromStr },
-      対象伝票数: targetCount,
+      対象伝票数: totalTarget,
+      platform対象伝票数: platformTargetMap,
       global,
       byPlatform,
     },
