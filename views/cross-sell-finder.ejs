@@ -16,7 +16,16 @@
     .search-box { background: white; padding: 16px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); margin-bottom: 16px; }
     .search-box form { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
     .search-box label { font-size: 13px; color: #555; }
-    .search-box input[type="text"] { padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 14px; min-width: 240px; }
+    .search-box input[type="text"] { padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 14px; min-width: 320px; }
+    .suggest-wrap { position: relative; }
+    .suggest-list { position: absolute; top: 100%; left: 0; right: 0; background: white; border: 1px solid #d1d5db; border-radius: 4px; box-shadow: 0 4px 12px rgba(0,0,0,0.12); max-height: 320px; overflow-y: auto; z-index: 10; margin-top: 2px; display: none; }
+    .suggest-item { padding: 8px 12px; cursor: pointer; font-size: 13px; border-bottom: 1px solid #f3f4f6; }
+    .suggest-item:last-child { border-bottom: none; }
+    .suggest-item:hover, .suggest-item.active { background: #eff6ff; }
+    .suggest-item .code { font-weight: 600; color: #1d4ed8; font-family: ui-monospace, monospace; }
+    .suggest-item .name { color: #374151; margin-left: 8px; }
+    .suggest-item .stopped { color: #9ca3af; font-size: 11px; margin-left: 6px; }
+    .suggest-empty { padding: 10px 12px; color: #9ca3af; font-size: 13px; }
     .search-box select { padding: 8px 10px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 14px; }
     .btn-primary { background: #2563eb; color: white; border: none; padding: 8px 18px; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500; }
     .btn-primary:hover:not(:disabled) { background: #1d4ed8; }
@@ -64,9 +73,12 @@
     </div>
 
     <div class="search-box">
-      <form id="search-form">
-        <label for="code">NE商品コード:</label>
-        <input type="text" id="code" name="code" placeholder="例: ABC-1234" required autofocus>
+      <form id="search-form" autocomplete="off">
+        <label for="code">商品コード/商品名:</label>
+        <span class="suggest-wrap">
+          <input type="text" id="code" name="code" placeholder="例: 0726-001060 / ボディタオル" required autofocus autocomplete="off">
+          <div class="suggest-list" id="suggest-list"></div>
+        </span>
         <label for="days">期間:</label>
         <select id="days" name="days">
           <option value="30">30日</option>
@@ -133,6 +145,97 @@
       html += '</tbody></table>';
       return html;
     }
+
+    // ─── サジェスト ───
+    const codeInput = document.getElementById('code');
+    const suggestList = document.getElementById('suggest-list');
+    let suggestTimer = null;
+    let suggestSeq = 0;
+    let suggestActive = -1;
+    let suggestItems = [];
+
+    function hideSuggest() {
+      suggestList.style.display = 'none';
+      suggestActive = -1;
+      suggestItems = [];
+    }
+
+    function renderSuggest(rows) {
+      suggestItems = rows;
+      if (!rows || rows.length === 0) {
+        suggestList.innerHTML = '<div class="suggest-empty">候補なし</div>';
+        suggestList.style.display = 'block';
+        return;
+      }
+      suggestList.innerHTML = rows.map((r, i) =>
+        '<div class="suggest-item" data-idx="' + i + '">'
+        + '<span class="code">' + escapeHtml(r.商品コード) + '</span>'
+        + '<span class="name">' + escapeHtml(r.商品名 || '') + '</span>'
+        + (r.取扱区分 && r.取扱区分 !== '取扱中' ? '<span class="stopped">[' + escapeHtml(r.取扱区分) + ']</span>' : '')
+        + '</div>'
+      ).join('');
+      suggestList.style.display = 'block';
+      suggestList.querySelectorAll('.suggest-item').forEach(el => {
+        el.addEventListener('mousedown', (ev) => {
+          ev.preventDefault();
+          const idx = parseInt(el.dataset.idx);
+          chooseSuggest(idx);
+        });
+      });
+    }
+
+    function chooseSuggest(idx) {
+      const r = suggestItems[idx];
+      if (!r) return;
+      codeInput.value = r.商品コード;
+      hideSuggest();
+      document.getElementById('search-form').dispatchEvent(new Event('submit', { cancelable: true }));
+    }
+
+    codeInput.addEventListener('input', () => {
+      const q = codeInput.value.trim();
+      clearTimeout(suggestTimer);
+      if (q.length < 2) {
+        hideSuggest();
+        return;
+      }
+      const seq = ++suggestSeq;
+      suggestTimer = setTimeout(async () => {
+        try {
+          const r = await fetch('/apps/cross-sell-finder/api/suggest?q=' + encodeURIComponent(q));
+          if (seq !== suggestSeq) return;  // 古いレスポンスを破棄
+          const rows = await r.json();
+          renderSuggest(rows);
+        } catch (_) { hideSuggest(); }
+      }, 200);
+    });
+
+    codeInput.addEventListener('keydown', (e) => {
+      if (suggestList.style.display !== 'block' || suggestItems.length === 0) return;
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        suggestActive = Math.min(suggestActive + 1, suggestItems.length - 1);
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        suggestActive = Math.max(suggestActive - 1, 0);
+      } else if (e.key === 'Enter' && suggestActive >= 0) {
+        e.preventDefault();
+        chooseSuggest(suggestActive);
+        return;
+      } else if (e.key === 'Escape') {
+        hideSuggest();
+        return;
+      } else {
+        return;
+      }
+      suggestList.querySelectorAll('.suggest-item').forEach((el, i) => {
+        el.classList.toggle('active', i === suggestActive);
+      });
+    });
+
+    document.addEventListener('click', (e) => {
+      if (!e.target.closest('.suggest-wrap')) hideSuggest();
+    });
 
     document.getElementById('search-form').addEventListener('submit', async (e) => {
       e.preventDefault();

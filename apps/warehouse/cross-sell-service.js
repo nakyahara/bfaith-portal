@@ -20,6 +20,33 @@ function jstDateString(daysAgo) {
   return new Date(t).toISOString().slice(0, 10);
 }
 
+// 商品コード/商品名のサジェスト (UI のオートコンプリート用)
+router.get('/suggest', (req, res) => {
+  const q = (req.query.q || '').trim();
+  if (q.length < 2) {
+    return okResponse(res, { result: [] });
+  }
+  const term = `%${q}%`;
+  try {
+    const db = getDB();
+    const rows = db.prepare(
+      `SELECT 商品コード, 商品名, 取扱区分
+       FROM raw_ne_products
+       WHERE 商品コード LIKE ? OR 商品名 LIKE ?
+       ORDER BY (取扱区分 = '取扱中') DESC, 商品コード
+       LIMIT 15`
+    ).all(term, term);
+    okResponse(res, { result: rows });
+  } catch (e) {
+    return errorResponse(res, {
+      status: 500,
+      error: 'DB_ERROR',
+      message: e.message,
+      requestId: req.requestId,
+    });
+  }
+});
+
 router.get('/search', (req, res) => {
   const code = (req.query.code || '').trim();
   const days = Math.max(1, Math.min(parseInt(req.query.days) || 90, 365));

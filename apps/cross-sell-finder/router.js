@@ -28,6 +28,33 @@ router.get('/', (req, res) => {
   });
 });
 
+router.get('/api/suggest', async (req, res) => {
+  const q = (req.query.q || '').trim();
+  if (q.length < 2) return res.json([]);
+
+  const url = `${WAREHOUSE_URL}/service-api/cross-sell/suggest`
+    + `?q=${encodeURIComponent(q)}`;
+
+  try {
+    const r = await fetch(url, {
+      headers: getServiceHeaders(),
+      signal: AbortSignal.timeout(10000),
+    });
+    const text = await r.text();
+    const ct = r.headers.get('content-type') || '';
+    if (!ct.includes('json')) {
+      console.warn(`[CrossSell suggest] non-json status=${r.status} ct=${ct}`);
+      return res.status(r.ok ? 502 : r.status).json([]);
+    }
+    const data = JSON.parse(text);
+    if (!data.ok) return res.status(r.status || 502).json([]);
+    res.json(data.result || []);
+  } catch (e) {
+    console.warn(`[CrossSell suggest] error q=${q} err=${e.message}`);
+    res.status(502).json([]);
+  }
+});
+
 router.get('/api/search', async (req, res) => {
   const code = (req.query.code || '').trim();
   const days = String(req.query.days || '90');
