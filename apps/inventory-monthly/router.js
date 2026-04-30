@@ -165,6 +165,7 @@ function addPending() {
 }
 
 let saveFlag = '0';
+let lastResult = null; // 直前の集計結果。CSVダウンロードボタンから参照する。
 document.querySelectorAll('#frm button[type=submit]').forEach(btn => {
   btn.addEventListener('click', () => { saveFlag = btn.dataset.save || '0'; });
 });
@@ -193,6 +194,7 @@ document.getElementById('frm').addEventListener('submit', async (e) => {
       result.innerHTML = '<div class="err">' + (data.error || 'エラー') + '</div>';
       return;
     }
+    lastResult = data;
     result.innerHTML = renderResult(data);
   } catch (err) {
     result.innerHTML = '<div class="err">' + err.message + '</div>';
@@ -207,6 +209,93 @@ function esc(s) {
   }[c]));
 }
 
+// ─── クライアント側 CSV 生成 (formula injection 対策付き) ───
+//
+// サーバーの csv-export.js と同じ規則で生成する:
+//   - カンマ・ダブルクオート・改行 を含む値はダブルクオートで囲み、
+//     内部のダブルクオートは2つに重ねる
+//   - = + - @ TAB CR で始まる値は Excel/Sheets が数式として
+//     実行してしまうためアポストロフィを前置してリテラル化
+function csvCell(v) {
+  if (v == null) return '';
+  let s = String(v);
+  if (/^[=+\\-@\\t\\r]/.test(s)) s = "'" + s;
+  if (/[",\\r\\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+function rowsToCsv(rows) {
+  return rows.map(r => r.map(csvCell).join(',')).join('\\r\\n') + '\\r\\n';
+}
+function downloadCsv(filename, content) {
+  const blob = new Blob(['\\uFEFF' + content], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+const CATEGORY_LABEL = {
+  fba_warehouse: 'FBA倉庫内在庫',
+  fba_inbound: 'FBA輸送中在庫',
+  own_warehouse: '自社倉庫在庫',
+  fba_us: '米国FBA在庫',
+};
+const INCOMPLETE_COST_STATUSES = ['MISSING','PARTIAL','PARTIAL_SET','NOT_IN_MASTER'];
+
+function dlSummary() {
+  if (!lastResult) return;
+  const t = lastResult.totals;
+  const rows = [
+    ['区分', '金額（税抜）'],
+    ['FBA倉庫内在庫', t.fba_warehouse],
+    ['FBA輸送中在庫', t.fba_inbound],
+    ['自社倉庫在庫', t.own_warehouse],
+    ['米国FBA在庫', t.fba_us],
+    ['発注後未着商品', t.pending],
+    ['合計', t.total],
+  ];
+  downloadCsv('月末棚卸し_サマリー.csv', rowsToCsv(rows));
+}
+function dlDetails() {
+  if (!lastResult) return;
+  const rows = [['区分','Amazon SKU','商品コード','商品名','数量','原価','金額','原価状態']];
+  for (const x of (lastResult.details || [])) {
+    rows.push([CATEGORY_LABEL[x.category] || x.category, x.seller_sku || '', x.商品コード || '', x.商品名 || '', x.数量, x.原価, x.金額, x.原価状態 || '']);
+  }
+  downloadCsv('月末棚卸し_明細.csv', rowsToCsv(rows));
+}
+function dlUnmapped() {
+  if (!lastResult) return;
+  // details から UNMAPPED_SKU 行を抽出して文脈付きで出す
+  const rows = [['区分','Amazon SKU','商品名','数量']];
+  const seen = new Set();
+  for (const x of (lastResult.details || [])) {
+    if (x.原価状態 !== 'UNMAPPED_SKU') continue;
+    const key = (x.category || '') + '|' + (x.seller_sku || '');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    rows.push([CATEGORY_LABEL[x.category] || x.category, x.seller_sku || '', x.商品名 || '', x.数量]);
+  }
+  downloadCsv('未マップSKU.csv', rowsToCsv(rows));
+}
+function dlMissingCost() {
+  if (!lastResult) return;
+  const rows = [['区分','Amazon SKU','商品コード','商品名','数量','原価状態']];
+  const seen = new Set();
+  for (const x of (lastResult.details || [])) {
+    if (!INCOMPLETE_COST_STATUSES.includes(x.原価状態)) continue;
+    const key = (x.category || '') + '|' + (x.seller_sku || '') + '|' + (x.商品コード || '');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    rows.push([CATEGORY_LABEL[x.category] || x.category, x.seller_sku || '', x.商品コード || '', x.商品名 || '', x.数量, x.原価状態 || '']);
+  }
+  downloadCsv('原価未登録.csv', rowsToCsv(rows));
+}
+
 function renderResult(d) {
   const t = d.totals;
   const rows = [
@@ -217,11 +306,22 @@ function renderResult(d) {
     ['発注後未着商品', t.pending],
   ].map(([k,v]) => '<tr><td>'+esc(k)+'</td><td class="num">'+yen(v)+'</td></tr>').join('');
 
+  // ダウンロードボタン群（集計結果直下）
+  const summaryDl = '<p style="margin:8px 0">'
+    + '<button type="button" class="secondary" onclick="dlSummary()">📥 サマリーCSV</button> '
+    + '<button type="button" class="secondary" onclick="dlDetails()">📥 明細CSV (商品ごと)</button>'
+    + '</p>';
+
   let warnHtml = '';
   const w = d.warnings;
-  const showList = (label, arr) => arr.length ? '<div class="warn"><b>'+esc(label)+': '+arr.length+'件</b><br><small>'+arr.slice(0,30).map(esc).join(', ')+(arr.length>30?' ...':'')+'</small></div>' : '';
-  warnHtml += showList('Amazon SKU → NE商品コード未マップ', w.unmappedSkus);
-  warnHtml += showList('原価未登録の商品コード', w.missingCost);
+  const showList = (label, arr, btnLabel, onclick) => {
+    if (!arr.length) return '';
+    const dlBtn = btnLabel ? ' <button type="button" class="secondary" onclick="'+onclick+'">📥 '+esc(btnLabel)+'</button>' : '';
+    return '<div class="warn"><b>'+esc(label)+': '+arr.length+'件</b>'+dlBtn
+      + '<br><small>'+arr.slice(0,30).map(esc).join(', ')+(arr.length>30?' ...':'')+'</small></div>';
+  };
+  warnHtml += showList('Amazon SKU → NE商品コード未マップ', w.unmappedSkus, '未マップSKU CSV', 'dlUnmapped()');
+  warnHtml += showList('原価未登録の商品コード', w.missingCost, '原価未登録CSV', 'dlMissingCost()');
 
   const savedHtml = d.snapshot_id ? '<div class="card" style="background:#d1e7dd;border-color:#a3cfbb"><b>履歴に保存しました</b> → <a href="history/'+encodeURIComponent(d.snapshot_id)+'">詳細を表示</a></div>' : '';
 
@@ -231,6 +331,7 @@ function renderResult(d) {
     + rows
     + '<tr class="total-row"><td>合計</td><td class="num">'+yen(t.total)+'</td></tr>'
     + '</tbody></table>'
+    + summaryDl
     + warnHtml;
 }
 </script>
