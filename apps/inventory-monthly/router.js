@@ -119,7 +119,8 @@ function renderInputPage() {
   <div class="card">
     <label>① 国内FBA在庫（発注推奨レポートCSV / Shift_JIS）</label>
     <input type="file" name="fba_csv" accept=".csv" required>
-    <small class="hint">Seller Central → 在庫レポート → 「補充」→ 発注推奨レポート の CSV をそのままアップロード</small>
+    <small class="hint">Seller Central → 在庫レポート → 「補充」→ 発注推奨レポート の CSV をそのままアップロード<br>
+    集計内訳: <b>FBA倉庫内</b> = 在庫あり + FC移管中 + FC処理中 + 出荷待ち / <b>FBA輸送中</b> = 進行中 + 出荷済み + 受領中（販売不可は除外）</small>
   </div>
 
   <div class="card">

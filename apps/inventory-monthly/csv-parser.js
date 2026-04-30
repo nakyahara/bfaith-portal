@@ -75,9 +75,18 @@ const num = v => { const n = parseInt((v || '').replace(/,/g, '')); return isNaN
  * 列を解決し、必須カラムが全部揃っているか厳格に検証する。
  */
 // 評価額の算出に必須の列（無ければ集計が破綻するので拒否）
+//
+// FBA倉庫内在庫 (fba_warehouse) =
+//   在庫あり + FC移管中 + (入出荷作業中)FC処理中 + (入出荷作業中)出荷待ち
+// FBA輸送中 (fba_inbound) =
+//   進行中 + 出荷済み + 受領中
+// 「販売不可」は含めない（毀損品・要返品など、棚卸し対象外）
 const RESTOCK_REQUIRED = {
   seller_sku: ['Merchant SKU'],
   warehouse: ['在庫あり', 'Available'],
+  fc_transfer: ['FC移管中', 'FC Transfer'],
+  fc_processing: ['入出荷作業中 - FC処理中', '入出荷作業中-FC処理中', 'FC Processing'],
+  customer_order: ['入出荷作業中 - 出荷待ち', '入出荷作業中-出荷待ち', 'Customer Order'],
   working: ['進行中', 'Working'],
   shipped: ['出荷済み', 'Shipped'],
   receiving: ['受領中', 'Receiving'],
@@ -124,7 +133,17 @@ export function parseRestockReport(buf) {
     const r = rows[i];
     const seller_sku = safeGet(r, idx.seller_sku);
     if (!seller_sku) continue;
-    const fba_warehouse = num(r[idx.warehouse]);
+    // FBA倉庫内在庫: FC内に物理的に存在する全ての数量を合算する
+    //   在庫あり: 即時販売可能
+    //   FC移管中: FC間の移管中（自社所有・FBA内）
+    //   FC処理中: 入出荷の作業中
+    //   出荷待ち: 受注済みで顧客に発送待ち（自社所有・FBA内）
+    const fba_warehouse =
+      num(r[idx.warehouse]) +
+      num(r[idx.fc_transfer]) +
+      num(r[idx.fc_processing]) +
+      num(r[idx.customer_order]);
+    // FBA輸送中: FCにまだ届いていない / 受領処理中の数量
     const fba_inbound = num(r[idx.working]) + num(r[idx.shipped]) + num(r[idx.receiving]);
     if (fba_warehouse === 0 && fba_inbound === 0) continue;
     out.push({
