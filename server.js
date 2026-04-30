@@ -30,6 +30,7 @@ import mercariAccountingRouter from './apps/mercari-accounting/router.js';
 import profitAnalysisRouter from './apps/profit-analysis/router.js';
 import mgmtAccountingRouter from './apps/mgmt-accounting/router.js';
 import crossSellFinderRouter from './apps/cross-sell-finder/router.js';
+import inventoryMonthlyRouter from './apps/inventory-monthly/router.js';
 import serviceRouter from './apps/warehouse/service-router.js';
 import { serviceAuth } from './apps/warehouse/service-auth.js';
 import { isWarehouseDbReady } from './apps/warehouse/router.js';
@@ -407,6 +408,15 @@ const apps = [
     status: 'active',
     category: 'accounting',
   },
+  {
+    id: 'inventory-monthly',
+    name: '月末棚卸しツール',
+    description: 'FBA在庫(発注推奨レポート)・自社倉庫CSV・発注後未着商品を集計し、税抜原価ベースの月末棚卸資産を算出・履歴保存',
+    icon: '📦',
+    path: '/apps/inventory-monthly',
+    status: 'active',
+    category: 'accounting',
+  },
 ];
 
 // 外部リンク
@@ -631,6 +641,7 @@ app.use('/apps/mercari-accounting', (req, res, next) => {
   if (req.path === '/import-history' && req.method === 'POST') return next();
   requireAuth(req, res, next);
 }, mercariAccountingRouter);
+app.use('/apps/inventory-monthly', requireAppAccess('inventory-monthly'), inventoryMonthlyRouter);
 
 // 未実装アプリのプレースホルダー
 app.get('/apps/:appId', requireAuth, (req, res) => {
