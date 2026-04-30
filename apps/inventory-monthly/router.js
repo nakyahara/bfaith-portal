@@ -18,6 +18,7 @@ import { initInventoryMonthly } from './db.js';
 import { parseRestockReport, parseOwnWarehouse } from './csv-parser.js';
 import { aggregateInventory, saveSnapshot, listSnapshots, getSnapshot } from './aggregator.js';
 import { exportSnapshotToXlsx } from './excel-export.js';
+import { buildSnapshotCsv } from './csv-export.js';
 
 const router = Router();
 const UPLOAD_DIR = process.env.DATA_DIR ? process.env.DATA_DIR + '/import' : 'data/import';
@@ -354,7 +355,12 @@ ${snap.pending.map(p => `<tr><td>${esc(p.supplier_name)}</td><td class="num">${y
     <tr class="total-row"><td>合計</td><td class="num">${yen(s.total)}</td></tr>
   </tbody>
 </table>
-<p><a href="export/${id}.xlsx">📥 Excelダウンロード</a> / 明細件数: ${snap.details.length}</p>
+<p>
+  <a href="export/${id}.xlsx">📥 Excelダウンロード</a>
+  &nbsp;|&nbsp;
+  <a href="export/${id}.csv">📥 CSVダウンロード</a>
+  &nbsp;/&nbsp; 明細件数: ${snap.details.length}
+</p>
 ${pendingHtml}
 `));
 });
@@ -368,6 +374,23 @@ router.get('/export/:id.xlsx', async (req, res) => {
     const buf = await exportSnapshotToXlsx(snap);
     const filename = `月末棚卸し_${snap.summary.snapshot_date}.xlsx`;
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
+    res.send(buf);
+  } catch (e) {
+    res.status(500).send('<pre>' + esc(e.message) + '</pre>');
+  }
+});
+
+router.get('/export/:id.csv', (req, res) => {
+  if (!ensureDbOrFailHtml(res)) return;
+  const id = Number(req.params.id);
+  const snap = getSnapshot(id);
+  if (!snap) return res.status(404).send('Not found');
+  try {
+    const buf = buildSnapshotCsv(snap);
+    const filename = `月末棚卸し_${snap.summary.snapshot_date}.csv`;
+    // text/csv は UTF-8 BOM 付きで送る。filename* で日本語ファイル名対応。
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
     res.send(buf);
   } catch (e) {

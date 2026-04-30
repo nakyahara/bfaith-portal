@@ -82,10 +82,15 @@ function resolveCostByNeCode(neCode, lookups) {
     let allOk = true;
     for (const comp of components) {
       if (comp.構成商品原価 != null) {
+        // set_components の構成商品原価は登録時のスナップショット値。null でなければ採用。
         sum += Number(comp.構成商品原価) * (comp.数量 || 1);
       } else {
+        // mirror_products からの解決時は原価が登録されている (COMPLETE/OVERRIDDEN) ものだけ採用。
+        // 原価=0 でも 原価状態が MISSING/PARTIAL のままだと「未登録の0」を有効値として扱って
+        // しまい、セット全体が静かに 0 円扱いになる事故を起こすので明示的に弾く。
         const inner = lookups.products.get(comp.構成商品コード);
-        if (inner && inner.原価 != null) {
+        if (inner && inner.原価 != null
+            && (inner.原価状態 === 'COMPLETE' || inner.原価状態 === 'OVERRIDDEN')) {
           sum += Number(inner.原価) * (comp.数量 || 1);
         } else {
           allOk = false;
@@ -104,7 +109,12 @@ function resolveCostByNeCode(neCode, lookups) {
  * Amazon SKU 1件分の在庫金額（数量×単価原価）を計算する。
  * sku_map が複数ヒット（セット販売SKU）の場合は ne_code 毎に展開して合計。
  */
-// 部分的にしか原価が解決できなかった状態。ユーザー警告の対象。
+// 「原価が解決できなかった」または「部分的にしか取れなかった」状態。警告の対象。
+//   - MISSING / PARTIAL: mirror_products.原価状態 由来
+//   - PARTIAL_SET: 構成品の原価が一部欠落しているセット
+//   - NOT_IN_MASTER: mirror_products にも mirror_set_components にも無い
+// マスタに原価=0 が COMPLETE/OVERRIDDEN として登録されている商品（販促品など、
+// 意図的に0円にしているもの）は警告対象にしない。
 const INCOMPLETE_COST_STATUSES = new Set(['MISSING', 'PARTIAL', 'PARTIAL_SET', 'NOT_IN_MASTER']);
 
 function valueAmazonRow(seller_sku, qty, lookups, warnings) {
@@ -122,9 +132,8 @@ function valueAmazonRow(seller_sku, qty, lookups, warnings) {
     const lineQty = qty * (m.数量 || 1);
     const lineValue = lineQty * r.cost;
     if (r.status === 'NOT_IN_MASTER') warnings.unknownProducts.push(m.ne_code);
-    // 原価未登録 OR 部分原価しか取れなかったセット品も警告にする
-    // （PARTIAL_SET は cost > 0 でも実態として欠落しているため見落としやすい）
-    if (r.cost === 0 || INCOMPLETE_COST_STATUSES.has(r.status)) {
+    // 原価未登録/部分欠落のステータス時のみ警告。COMPLETE で原価=0 は意図された0円。
+    if (INCOMPLETE_COST_STATUSES.has(r.status)) {
       warnings.missingCost.push(`${seller_sku} → ${m.ne_code}${r.status === 'PARTIAL_SET' ? ' (部分原価)' : ''}`);
     }
     total += lineValue;
@@ -183,7 +192,7 @@ export function aggregateInventory({ fbaRows = [], ownRows = [], usFbaAmount = 0
   for (const row of ownRows) {
     const r = resolveCostByNeCode(row.商品コード, lookups);
     if (r.status === 'NOT_IN_MASTER') warnings.unknownProducts.push(row.商品コード);
-    if (r.cost === 0 || INCOMPLETE_COST_STATUSES.has(r.status)) {
+    if (INCOMPLETE_COST_STATUSES.has(r.status)) {
       warnings.missingCost.push(`${row.商品コード}${r.status === 'PARTIAL_SET' ? ' (部分原価)' : ''}`);
     }
     const value = row.在庫数 * r.cost;
