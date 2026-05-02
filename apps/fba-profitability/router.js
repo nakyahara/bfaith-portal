@@ -6,11 +6,228 @@
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { getActiveListingsReport, getFees } from '../profit-calculator/sp-api.js';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
+
+// --- ミニPC接続（SP-API実行用） ---
+const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
+
+// 起動時の env fail-fast: 必須envが空ならログ警告（CF Accessは公開エンドポイントなら任意）
+const REQUIRED_ENV = ['CF_ACCESS_CLIENT_ID', 'CF_ACCESS_CLIENT_SECRET', 'WAREHOUSE_SERVICE_TOKEN'];
+const missingEnv = REQUIRED_ENV.filter(k => !process.env[k]);
+if (missingEnv.length > 0) {
+  console.error(`[FBA-Profit] 必須環境変数が未設定: ${missingEnv.join(', ')} — /api/listings と /api/fees は動作しません`);
+}
+
+function getServiceHeaders() {
+  return {
+    'CF-Access-Client-Id': process.env.CF_ACCESS_CLIENT_ID || '',
+    'CF-Access-Client-Secret': process.env.CF_ACCESS_CLIENT_SECRET || '',
+    'Authorization': `Bearer ${process.env.WAREHOUSE_SERVICE_TOKEN || ''}`,
+    'Content-Type': 'application/json',
+  };
+}
+
+class MiniPCError extends Error {
+  constructor({ message, userMessage, statusCode, errorCode, requestId, upstreamRequestId } = {}) {
+    super(message || 'MiniPCError');
+    this.name = 'MiniPCError';
+    this.userMessage = userMessage || 'バックエンドエラーが発生しました';
+    this.statusCode = Number.isInteger(statusCode) ? statusCode : 502;
+    this.errorCode = errorCode || 'UNKNOWN';
+    this.requestId = requestId || null;
+    this.upstreamRequestId = upstreamRequestId || null;
+  }
+}
+
+// retry: 総試行回数（再試行回数ではない）。省略時は3回試行。retry:1 は再試行なしで1回のみ試行。
+async function callResearchAPI(path, { timeout = 60000, retry } = {}) {
+  if (missingEnv.length > 0) {
+    throw new MiniPCError({
+      message: `Missing env: ${missingEnv.join(',')}`,
+      userMessage: 'バックエンド設定エラー（管理者に連絡してください）',
+      statusCode: 503,
+      errorCode: 'CONFIG_ERROR',
+    });
+  }
+  const url = `${WAREHOUSE_URL}/service-api/research${path}`;
+  const requestId = `r-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const headers = { ...getServiceHeaders(), 'x-request-id': requestId };
+  const maxAttempts = retry ?? 3;
+
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const res = await fetch(url, {
+        method: 'GET',
+        headers,
+        redirect: 'manual',
+        signal: AbortSignal.timeout(timeout),
+      });
+      const ct = res.headers.get('content-type') || '';
+
+      if (res.status === 302 || res.status === 303) {
+        throw new MiniPCError({
+          message: `CF Access redirect ${res.status} → ${res.headers.get('location') || ''} req=${requestId}`,
+          userMessage: 'バックエンド認証エラー（管理者に連絡してください）',
+          statusCode: 502,
+          errorCode: 'CF_ACCESS_ERROR',
+          requestId,
+        });
+      }
+      // 401/403: CF Access 一過性失敗の可能性があるため初回のみリトライ、2回目以降は hard fail
+      if (res.status === 401 || res.status === 403) {
+        if (attempt === 1 && maxAttempts > 1) {
+          lastError = new MiniPCError({
+            message: `認証失敗 HTTP ${res.status} (初回試行) req=${requestId}`,
+            userMessage: 'バックエンド認証エラー（管理者に連絡してください）',
+            statusCode: 502,
+            errorCode: 'AUTH_FAILED',
+            requestId,
+          });
+          await new Promise(r => setTimeout(r, 500 + Math.random() * 300));
+          continue;
+        }
+        throw new MiniPCError({
+          message: `認証失敗 HTTP ${res.status} req=${requestId}`,
+          userMessage: 'バックエンド認証エラー（管理者に連絡してください）',
+          statusCode: 502,
+          errorCode: 'AUTH_FAILED',
+          requestId,
+        });
+      }
+
+      // 4xx/5xx でも JSON なら構造化エラーをパース
+      let upstreamJson = null;
+      if (ct.includes('application/json')) {
+        upstreamJson = await res.json().catch(() => null);
+      }
+
+      // リトライ対象: 429 / 502 / 503 / 504
+      if ([429, 502, 503, 504].includes(res.status)) {
+        const upstreamReqId = upstreamJson?.requestId;
+        const upstreamMsg = upstreamJson?.message || upstreamJson?.error || `HTTP ${res.status}`;
+        lastError = new MiniPCError({
+          message: `upstream ${res.status}: ${upstreamMsg} req=${requestId} upstream=${upstreamReqId || 'n/a'}`,
+          userMessage: 'バックエンド一時障害（時間をおいて再試行してください）',
+          statusCode: 502,
+          errorCode: 'UPSTREAM_UNAVAILABLE',
+          requestId,
+          upstreamRequestId: upstreamReqId,
+        });
+        if (attempt < maxAttempts) {
+          await new Promise(r => setTimeout(r, Math.min(500 * 2 ** (attempt - 1), 4000) + Math.random() * 300));
+          continue;
+        }
+        throw lastError;
+      }
+
+      if (!res.ok) {
+        const upstreamReqId = upstreamJson?.requestId;
+        const upstreamMsg = upstreamJson?.message || upstreamJson?.error || (await res.text().catch(() => '')).slice(0, 200);
+        throw new MiniPCError({
+          message: `ミニPC HTTP ${res.status}: ${upstreamMsg} req=${requestId} upstream=${upstreamReqId || 'n/a'}`,
+          userMessage: 'バックエンド処理エラー（時間をおいて再試行してください）',
+          statusCode: 502,
+          errorCode: 'UPSTREAM_ERROR',
+          requestId,
+          upstreamRequestId: upstreamReqId,
+        });
+      }
+
+      if (!ct.includes('application/json')) {
+        const txt = await res.text().catch(() => '');
+        throw new MiniPCError({
+          message: `レスポンス形式異常 (ct=${ct || 'none'}): ${txt.slice(0, 200)} req=${requestId}`,
+          userMessage: 'バックエンド応答形式エラー',
+          statusCode: 502,
+          errorCode: 'INVALID_RESPONSE',
+          requestId,
+        });
+      }
+
+      // 2xx + JSON: shape検証
+      const json = upstreamJson;
+      if (!json || typeof json !== 'object') {
+        throw new MiniPCError({
+          message: `JSONパース失敗 req=${requestId}`,
+          userMessage: 'バックエンド応答形式エラー',
+          statusCode: 502,
+          errorCode: 'INVALID_RESPONSE',
+          requestId,
+        });
+      }
+      if (json.ok !== true) {
+        throw new MiniPCError({
+          message: `envelope error: ${json.error || ''}: ${json.message || ''} req=${requestId} upstream=${json.requestId || 'n/a'}`,
+          userMessage: 'バックエンド処理エラー',
+          statusCode: 502,
+          errorCode: json.error || 'UPSTREAM_ENVELOPE_ERROR',
+          requestId,
+          upstreamRequestId: json.requestId,
+        });
+      }
+      if (json.result === undefined || json.result === null) {
+        throw new MiniPCError({
+          message: `envelope.result が空 req=${requestId} upstream=${json.requestId || 'n/a'}`,
+          userMessage: 'バックエンド応答形式エラー',
+          statusCode: 502,
+          errorCode: 'EMPTY_RESULT',
+          requestId,
+          upstreamRequestId: json.requestId,
+        });
+      }
+      return json.result;
+    } catch (e) {
+      // MiniPCError 以外のネットワーク例外をリトライ判定
+      if (!(e instanceof MiniPCError)) {
+        const msg = e?.message || String(e);
+        const isRetryable = e?.name === 'TimeoutError' || /aborted|timeout|ECONNREFUSED|ECONNRESET|ENOTFOUND|fetch failed/i.test(msg);
+        if (isRetryable && attempt < maxAttempts) {
+          lastError = e;
+          await new Promise(r => setTimeout(r, Math.min(500 * 2 ** (attempt - 1), 4000) + Math.random() * 300));
+          continue;
+        }
+        throw new MiniPCError({
+          message: `ネットワークエラー: ${msg} req=${requestId}`,
+          userMessage: 'バックエンド通信エラー（時間をおいて再試行してください）',
+          statusCode: 502,
+          errorCode: 'NETWORK_ERROR',
+          requestId,
+        });
+      }
+      throw e;
+    }
+  }
+  throw lastError || new MiniPCError({
+    message: 'callResearchAPI: unknown error',
+    userMessage: 'バックエンド通信エラー',
+    statusCode: 502,
+    errorCode: 'UNKNOWN',
+    requestId,
+  });
+}
+
+// クライアント向けエラーレスポンスを返す（ログ詳細はサーバー側のみ）
+function sendError(res, e, context) {
+  const isMiniPC = e instanceof MiniPCError;
+  const statusCode = isMiniPC ? e.statusCode : 500;
+  const userMessage = isMiniPC ? e.userMessage : 'サーバーエラーが発生しました';
+  const errorCode = isMiniPC ? e.errorCode : 'INTERNAL_ERROR';
+  const reqId = isMiniPC ? e.requestId : null;
+  const upstreamReqId = isMiniPC ? e.upstreamRequestId : null;
+
+  console.error(
+    `[FBA-Profit] ${context} error: ${e.message}` +
+      (reqId ? ` req=${reqId}` : '') +
+      (upstreamReqId ? ` upstream=${upstreamReqId}` : '')
+  );
+  if (!isMiniPC && e.stack) console.error(e.stack);
+
+  res.status(statusCode).json({ error: userMessage, errorCode });
+}
 
 // ===== メイン画面 =====
 router.get('/', (req, res) => {
@@ -25,7 +242,17 @@ router.get('/', (req, res) => {
 router.post('/api/listings', async (req, res) => {
   try {
     console.log('[FBA-Profit] 出品レポート取得開始...');
-    const report = await getActiveListingsReport();
+    // レポート作成→ポーリング(最大5分)→ダウンロードはミニPC側で実行。Render側は最大6分待機
+    // ※ ジョブ化していないため Render の HTTP接続を5-6分専有する。デプロイ/再起動時は中断される
+    const report = await callResearchAPI('/active-listings-report', { timeout: 360000, retry: 1 });
+    if (!Array.isArray(report?.listings)) {
+      throw new MiniPCError({
+        message: `report.listings が配列でない: ${typeof report?.listings}`,
+        userMessage: 'バックエンド応答形式エラー',
+        statusCode: 502,
+        errorCode: 'INVALID_REPORT_SHAPE',
+      });
+    }
     console.log(`[FBA-Profit] 全出品: ${report.totalCount}件`);
 
     // FBA出品のみフィルタ（日本語ヘッダー「フルフィルメント・チャンネル」にも対応）
@@ -136,8 +363,7 @@ router.post('/api/listings', async (req, res) => {
 
     res.json({ success: true, items, total: items.length });
   } catch (e) {
-    console.error('[FBA-Profit] listings取得エラー:', e);
-    res.status(500).json({ error: e.message });
+    sendError(res, e, '/api/listings');
   }
 });
 
@@ -152,18 +378,28 @@ router.post('/api/fees', async (req, res) => {
   const results = [];
   for (const item of items) {
     try {
-      const fees = await getFees(item.asin, item.price, true);
+      const qs = `?asin=${encodeURIComponent(item.asin)}&price=${encodeURIComponent(item.price)}&isFba=true`;
+      // retry: 1 で1件あたりの最悪待ち時間を 30秒に抑える（5件バッチで最悪2.5分）
+      const fees = await callResearchAPI(`/fees${qs}`, { timeout: 30000, retry: 1 });
       results.push({
         asin: item.asin,
         success: true,
         ...fees,
       });
     } catch (e) {
-      console.error(`[FBA-Profit] 手数料取得エラー (${item.asin}):`, e.message);
+      const isMiniPC = e instanceof MiniPCError;
+      const reqId = isMiniPC ? e.requestId : null;
+      const upstreamReqId = isMiniPC ? e.upstreamRequestId : null;
+      console.error(
+        `[FBA-Profit] /api/fees error (${item.asin}): ${e.message}` +
+          (reqId ? ` req=${reqId}` : '') +
+          (upstreamReqId ? ` upstream=${upstreamReqId}` : '')
+      );
       results.push({
         asin: item.asin,
         success: false,
-        error: e.message,
+        error: isMiniPC ? e.userMessage : '手数料取得エラー',
+        errorCode: isMiniPC ? e.errorCode : 'INTERNAL_ERROR',
       });
     }
     // レート制限対策: 1リクエストごとに少し待つ
@@ -193,24 +429,7 @@ router.post('/api/update-cost', (req, res) => {
 
     res.json({ ok: true, sku, cost: parseFloat(cost) });
   } catch (e) {
-    console.error('[FBA-Profit] 原価更新エラー:', e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ===== デバッグ: ヘッダー確認用 =====
-router.get('/api/debug-headers', async (req, res) => {
-  try {
-    const report = await getActiveListingsReport();
-    const sample = report.listings[0] || {};
-    res.json({
-      totalCount: report.totalCount,
-      headers: report.headers,
-      sampleKeys: Object.keys(sample).slice(0, 30),
-      sampleValues: Object.fromEntries(Object.entries(sample).slice(0, 20)),
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+    sendError(res, e, '/api/update-cost');
   }
 });
 
