@@ -131,6 +131,27 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirres_ne ON mirror_sku_resolved(ne_code)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirres_src ON mirror_sku_resolved(source)');
 
+  // mirror_inv_daily_summary — 日次在庫スナップショットの集計結果ミラー
+  // 元: ミニPC warehouse.db.inv_daily_summary
+  // category = 'fba_warehouse' | 'fba_inbound' | 'own_warehouse' | (将来) 'fba_us'
+  // source_status = 'ok' | 'partial' | 'failed' | 'no_source'  (no_source は UI で「データなし」表示)
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_inv_daily_summary (
+    business_date      TEXT NOT NULL,
+    market             TEXT NOT NULL DEFAULT 'jp',
+    category           TEXT NOT NULL,
+    total_qty          INTEGER NOT NULL,
+    total_value        REAL,
+    resolved_count     INTEGER NOT NULL DEFAULT 0,
+    unresolved_count   INTEGER NOT NULL DEFAULT 0,
+    cost_missing_count INTEGER NOT NULL DEFAULT 0,
+    source_status      TEXT NOT NULL,
+    source_row_count   INTEGER,
+    captured_at        TEXT,
+    synced_at          TEXT NOT NULL,
+    PRIMARY KEY (business_date, market, category)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mir_inv_daily_date ON mirror_inv_daily_summary(business_date)');
+
   // mirror_sales_monthly — 月次集計（24ヶ月分）
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_sales_monthly (
     月                TEXT NOT NULL,

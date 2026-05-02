@@ -87,7 +87,7 @@ function renderLayout(title, body) {
 </head>
 <body>
 <h1>📦 月末棚卸しツール</h1>
-<div class="nav"><a href=".">入力</a> <a href="history">履歴</a> <a href="/">ポータルへ戻る</a></div>
+<div class="nav"><a href=".">入力</a> <a href="history">履歴</a> <a href="daily">日次推移</a> <a href="/">ポータルへ戻る</a></div>
 ${body}
 </body>
 </html>`;
@@ -429,6 +429,96 @@ ${list.length === 0 ? '<p>まだ履歴がありません。</p>' : `
   <thead><tr><th>基準日</th><th>FBA倉庫</th><th>FBA輸送中</th><th>自社倉庫</th><th>米国FBA</th><th>発注後未着</th><th>合計</th><th>作成日時</th></tr></thead>
   <tbody>${rows}</tbody>
 </table>`}
+`));
+});
+
+// 日次在庫スナップショット推移 (mirror_inv_daily_summary を読む)
+// PR-A/0/B でミニPC側が毎朝 inv_daily_summary を生成 → sync-to-render で mirror に複製
+router.get('/daily', (req, res) => {
+  if (!ensureDbOrFailHtml(res)) return;
+  const db = getDB();
+  let rows = [];
+  try {
+    rows = db.prepare(`
+      SELECT business_date, market, category, total_qty, total_value,
+             resolved_count, unresolved_count, cost_missing_count,
+             source_status, source_row_count
+      FROM mirror_inv_daily_summary
+      WHERE market = 'jp'
+      ORDER BY business_date DESC, category
+    `).all();
+  } catch (e) {
+    return res.status(503).send(renderLayout('日次推移', `<p>mirror_inv_daily_summary が未作成です: ${esc(e.message)}</p><p>ミニPC からの初回 sync を待ってください。</p>`));
+  }
+
+  // pivot: business_date 単位に行集約
+  const byDate = new Map();
+  for (const r of rows) {
+    if (!byDate.has(r.business_date)) byDate.set(r.business_date, { date: r.business_date });
+    byDate.get(r.business_date)[r.category] = r;
+  }
+  const dates = [...byDate.values()];
+
+  function fmtVal(cell) {
+    if (!cell) return '<td style="color:#999">-</td>';
+    if (cell.source_status === 'no_source') return '<td style="color:#c0392b" title="SP-API 未取得">no data</td>';
+    const v = cell.total_value;
+    const warn = cell.unresolved_count + cell.cost_missing_count;
+    const valueText = v != null ? '¥' + Math.round(v).toLocaleString() : '-';
+    const warnSpan = warn > 0 ? ` <small style="color:#e67e22" title="未解決:${cell.unresolved_count} 原価不明:${cell.cost_missing_count}">⚠️${warn}</small>` : '';
+    return `<td>${valueText}${warnSpan}</td>`;
+  }
+
+  function fmtTotal(d) {
+    const cats = ['fba_warehouse', 'fba_inbound', 'own_warehouse'];
+    let total = 0, anyData = false, anyMissing = false;
+    for (const c of cats) {
+      const cell = d[c];
+      if (cell && cell.source_status !== 'no_source' && cell.total_value != null) {
+        total += cell.total_value;
+        anyData = true;
+      } else {
+        anyMissing = true;
+      }
+    }
+    if (!anyData) return '<td style="color:#999">-</td>';
+    return `<td style="font-weight:600">¥${Math.round(total).toLocaleString()}${anyMissing ? ' <small style="color:#e67e22">部分</small>' : ''}</td>`;
+  }
+
+  const tableRows = dates.map(d => `
+    <tr>
+      <td>${esc(d.date)}</td>
+      ${fmtVal(d.fba_warehouse)}
+      ${fmtVal(d.fba_inbound)}
+      ${fmtVal(d.own_warehouse)}
+      ${fmtTotal(d)}
+    </tr>
+  `).join('');
+
+  res.send(renderLayout('月末棚卸し - 日次推移', `
+<h2>日次在庫推移 (国内)</h2>
+<p style="color:#666;font-size:13px">
+  毎朝 自動で記録された在庫金額の推移。
+  「FBA倉庫」=月末ツールと同じ4カラム合算 (在庫あり+FC移管中+FC処理中+出荷待ち)。
+  「自社倉庫」=NextEngine 在庫数。
+  ⚠️ 表示は警告件数 (未解決SKU + 原価未登録)。
+  「no data」 = SP-API 未取得 (cron 失敗 or 当日未稼働)。
+</p>
+${dates.length === 0 ? '<p>まだデータがありません。ミニPC で daily-sync が走るのを待ってください。</p>' : `
+<table>
+  <thead>
+    <tr>
+      <th>業務日 (JST)</th>
+      <th>FBA倉庫</th>
+      <th>FBA輸送中</th>
+      <th>自社倉庫</th>
+      <th>合計</th>
+    </tr>
+  </thead>
+  <tbody>${tableRows}</tbody>
+</table>
+<p style="color:#888;font-size:11px;margin-top:8px">合計に「部分」と出る日: いずれかのカテゴリが no_source / cost_missing。月末確定値とは異なる可能性あり (月末ツールで確定値を出してください)。</p>
+`}
 `));
 });
 
