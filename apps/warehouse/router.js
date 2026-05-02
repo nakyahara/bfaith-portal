@@ -1408,6 +1408,7 @@ function renderRegisterPage(shippingRates) {
         <button class="active" onclick="switchManage('shipping',this)">送料</button>
         <button onclick="switchManage('genka',this)">原価</button>
         <button onclick="switchManage('skumap',this)">SKUマップ</button>
+        <button onclick="switchManage('m-sku-master',this)">SKUマスタ</button>
         <button onclick="switchManage('sales_class',this)">売上分類</button>
         <button onclick="switchManage('tax_rate',this)">税率</button>
       </div>
@@ -1672,6 +1673,51 @@ function renderRegisterPage(shippingRates) {
           if (!sel?.value) { btn.disabled=false; return; }
           await api('/api/tax_rate', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sku,tax_rate:sel.value,product_name:name})});
           toast(sku+' の税率を更新');
+        } else if (act === 'show-sku-detail') {
+          // 既に展開されてれば閉じる
+          const next = tr.nextElementSibling;
+          if (next && next.classList.contains('sku-detail-row')) {
+            next.remove();
+            btn.disabled = false;
+            return;
+          }
+          // /api/m-sku-master/:sku と /related を並列取得（related失敗は閉じ込めずに記録）
+          let relatedError = null;
+          const [detail, related] = await Promise.all([
+            api('/api/m-sku-master/'+encodeURIComponent(sku)),
+            api('/api/m-sku-master/'+encodeURIComponent(sku)+'/related').catch(e => { relatedError = e.message; return {items:[]}; }),
+          ]);
+          const cols = tr.children.length;
+          const detailTr = document.createElement('tr');
+          detailTr.className = 'sku-detail-row';
+          let body = '<td colspan="'+cols+'" style="background:#f8f9fa;padding:10px 16px">';
+          body += '<div style="font-size:12px;color:#666;margin-bottom:6px">構成 ('+(detail.components?.length||0)+'件)</div>';
+          body += '<table style="width:auto;font-size:12px;margin-bottom:8px;border:1px solid #ddd">';
+          body += '<thead><tr><th style="padding:4px 8px">NE商品コード</th><th style="padding:4px 8px">数量</th><th style="padding:4px 8px">NE側商品名</th><th style="padding:4px 8px">原価</th><th style="padding:4px 8px">状態</th></tr></thead><tbody>';
+          for (const c of (detail.components||[])) {
+            const statusColor = c.cost_status === 'ok' ? '#27ae60' : (c.cost_status === 'ne_missing' ? '#e74c3c' : '#f39c12');
+            body += '<tr><td style="padding:3px 8px;font-family:monospace">'+he(c.ne_code)+'</td>';
+            body += '<td style="padding:3px 8px;text-align:right">'+(c.数量||1)+'</td>';
+            body += '<td style="padding:3px 8px;color:#666">'+he((c.ne_title||'').slice(0,40))+'</td>';
+            body += '<td style="padding:3px 8px;text-align:right">'+(c.単価!=null?c.単価+'円':'-')+'</td>';
+            body += '<td style="padding:3px 8px;color:'+statusColor+';font-size:11px">'+he(c.cost_status||'')+'</td></tr>';
+          }
+          body += '</tbody></table>';
+          if (relatedError) {
+            body += '<div style="font-size:12px;color:#e74c3c;margin-bottom:4px">⚠️ 関連SKUの取得失敗: '+he(relatedError)+'</div>';
+          } else if (related.items?.length) {
+            body += '<div style="font-size:12px;color:#666;margin-bottom:4px">同じNEコードを持つ別SKU ('+related.items.length+'件)</div>';
+            body += '<div style="font-size:11px;line-height:1.6">';
+            body += related.items.slice(0, 10).map(r => '<span style="display:inline-block;background:white;border:1px solid #ddd;padding:2px 8px;margin:2px;border-radius:3px"><code>'+he(r.seller_sku)+'</code> '+he((r.商品名||'').slice(0,25))+'</span>').join('');
+            if (related.items.length > 10) body += '<span style="color:#888">...他'+(related.items.length-10)+'件</span>';
+            body += '</div>';
+          }
+          const m = detail.master || {};
+          body += '<div class="meta" style="margin-top:6px">商品名: <b>'+he(m.商品名||'')+'</b> / created='+he((m.created_at||'').slice(0,16))+' / updated='+he((m.updated_at||'').slice(0,16))+' / by='+he(m.updated_by||'-')+'</div>';
+          body += '</td>';
+          detailTr.innerHTML = body;
+          tr.after(detailTr);
+          btn.disabled = false; // 「再クリックで閉じる」を有効化
         } else if (act === 'del') {
           if (!confirm(sku+' を削除しますか？')) { btn.disabled=false; return; }
           const type = btn.dataset.type;
@@ -1680,6 +1726,9 @@ function renderRegisterPage(shippingRates) {
           if (type === 'skumap' && ne) url += '?ne_code='+encodeURIComponent(ne);
           await api(url, {method:'DELETE'});
           toast(sku+' を削除');
+          // sku-master の場合は詳細展開行も消す
+          const detailTr = tr.nextElementSibling;
+          if (detailTr && detailTr.classList.contains('sku-detail-row')) detailTr.remove();
           tr.remove();
         }
       } catch(e) { toast('エラー: '+e.message, true); btn.disabled=false; }
@@ -1749,9 +1798,11 @@ function renderRegisterPage(shippingRates) {
     }
     async function searchManage() {
       const search = document.getElementById('m-search').value;
-      const epMap = { shipping: '/api/shipping/list', genka: '/api/genka/list', skumap: '/api/skumap/list', sales_class: '/api/sales_class/list', tax_rate: '/api/tax_rate/list' };
+      const epMap = { shipping: '/api/shipping/list', genka: '/api/genka/list', skumap: '/api/skumap/list', sales_class: '/api/sales_class/list', tax_rate: '/api/tax_rate/list', 'm-sku-master': '/api/m-sku-master' };
       const ep = epMap[curManage] || '/api/shipping/list';
-      let qs = '?search=' + encodeURIComponent(search) + '&limit=100';
+      // m-sku-master は q パラメータ、その他は search パラメータ
+      const searchParam = curManage === 'm-sku-master' ? 'q' : 'search';
+      let qs = '?' + searchParam + '=' + encodeURIComponent(search) + '&limit=100';
       if (curManage === 'sales_class') {
         const cf = document.getElementById('m-class-filter')?.value || '';
         if (cf) qs += '&class=' + encodeURIComponent(cf);
@@ -1760,7 +1811,8 @@ function renderRegisterPage(shippingRates) {
         if (rf) qs += '&rate=' + encodeURIComponent(rf);
       }
       const data = await api(ep + qs);
-      const rows = data.rows || [];
+      // m-sku-master は items を返す、その他は rows を返す
+      const rows = data.rows || data.items || [];
       let head = '', html = '', cols = 5;
 
       if (curManage === 'shipping') {
@@ -1793,6 +1845,16 @@ function renderRegisterPage(shippingRates) {
           html += '<td><select style="width:140px">'+rateTaxOptions(r.tax_rate)+'</select></td>';
           html += '<td style="font-size:11px;color:#888">'+he(r.synced_at||'')+'</td>';
           html += '<td><button class="btn btn-p" data-act="update-tax" data-sku="'+he(r.sku)+'" data-name="'+he(r.商品名||'')+'">更新</button> <button class="btn btn-d" data-act="del" data-type="tax_rate" data-sku="'+he(r.sku)+'">削除</button></td></tr>';
+        }
+      } else if (curManage === 'm-sku-master') {
+        head = '<tr><th>seller_sku</th><th>商品名</th><th>構成数</th><th>更新日</th><th>操作</th></tr>'; cols = 5;
+        for (const r of rows) {
+          const upd = (r.updated_at || '').slice(0, 10);
+          html += '<tr data-sku-row="'+he(r.seller_sku)+'"><td style="font-family:monospace;font-size:12px">'+he(r.seller_sku)+'</td>';
+          html += '<td>'+he((r.商品名||'').slice(0,40))+'</td>';
+          html += '<td style="text-align:center">'+(r.構成数||0)+'</td>';
+          html += '<td style="font-size:11px;color:#888">'+he(upd)+'</td>';
+          html += '<td><button class="btn btn-p" data-act="show-sku-detail" data-sku="'+he(r.seller_sku)+'">詳細</button> <button class="btn btn-d" data-act="del" data-type="m-sku-master" data-sku="'+he(r.seller_sku)+'">削除</button></td></tr>';
         }
       } else {
         head = '<tr><th>Amazon SKU</th><th>ASIN</th><th>商品名</th><th>NE商品コード</th><th>数量</th><th>操作</th></tr>'; cols = 6;
