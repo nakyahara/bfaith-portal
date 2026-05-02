@@ -322,6 +322,18 @@ router.get('/api/status', (req, res) => {
     try { status.rakuten_sku_map_count = db.prepare('SELECT COUNT(*) as cnt FROM mirror_rakuten_sku_map').get().cnt; } catch { status.rakuten_sku_map_count = 0; }
     // Codex PR2a Round 4 非ブロッカー #3 反映: stock_snapshot 件数も同期検証に乗せる
     try { status.stock_snapshot_count = db.prepare('SELECT COUNT(*) as cnt FROM mirror_stock_monthly_snapshot').get().cnt; } catch { status.stock_snapshot_count = 0; }
+    try {
+      const r = db.prepare(`SELECT
+        COUNT(*) AS cnt,
+        SUM(CASE WHEN source='master' THEN 1 ELSE 0 END) AS master_cnt,
+        SUM(CASE WHEN source='auto'   THEN 1 ELSE 0 END) AS auto_cnt
+        FROM mirror_sku_resolved`).get();
+      status.sku_resolved_count = r.cnt;
+      status.sku_resolved_master_count = r.master_cnt ?? 0;
+      status.sku_resolved_auto_count = r.auto_cnt ?? 0;
+    } catch {
+      status.sku_resolved_count = 0;
+    }
   } catch {}
   res.json(status);
 });
