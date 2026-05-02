@@ -118,6 +118,22 @@ export async function syncToRender() {
   const sku_map = db.prepare('SELECT * FROM sku_map').all();
   console.log(`[Sync→Render]   sku_map: ${sku_map.length}件`);
 
+  // 2b-3. inv_daily_summary（PR-B: 日次在庫スナップショット集計）
+  //   小規模 (1日3行 × 365日 = 1,095/年)、毎回全件送って Render mirror を完全置換
+  let inv_daily_summary = [];
+  try {
+    inv_daily_summary = db.prepare(`
+      SELECT business_date, market, category, total_qty, total_value,
+             resolved_count, unresolved_count, cost_missing_count,
+             source_status, source_row_count, captured_at
+      FROM inv_daily_summary
+      ORDER BY business_date, market, category
+    `).all();
+    console.log(`[Sync→Render]   inv_daily_summary: ${inv_daily_summary.length}件`);
+  } catch (e) {
+    console.log(`[Sync→Render]   inv_daily_summary: 取得失敗（スキップ）: ${e.message}`);
+  }
+
   // 2b-2. sku_resolved（新、master優先＋fallback解決済みビュー）
   //   v_sku_resolved に商品名と source_updated_at を JOIN/COALESCE して送信
   //   - source='master': m_sku_master.商品名 / m_sku_master.updated_at
@@ -232,7 +248,7 @@ export async function syncToRender() {
 
   try {
     // Part 1: マスタデータ
-    await sendPart({ products, set_components, sku_map, sku_resolved, amazon_sku_fees, rakuten_sku_map }, 'マスタ');
+    await sendPart({ products, set_components, sku_map, sku_resolved, amazon_sku_fees, rakuten_sku_map, inv_daily_summary }, 'マスタ');
 
     // Part 1b: 月末在庫スナップショット（PR2a 追加、タブB GMROI用）
     //   件数は最大 商品数 × 25ヶ月（現在月+過去24ヶ月、sales_monthly と同じ境界扱い）。
