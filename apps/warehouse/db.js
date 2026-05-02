@@ -26,8 +26,23 @@ export async function initDB() {
   db = new Database(DB_FILE);
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
+  // 書き込みロック競合時の待機時間。常駐サーバは短く(5秒)、バッチは
+  // WAREHOUSE_DB_BUSY_TIMEOUT_MS で長め(60秒)に上書きする運用。
+  // 不正値は warning を出して 5000ms にフォールバック（運用事故時に気づけるように）。
+  const DEFAULT_BUSY_TIMEOUT_MS = 5000;
+  const rawBusyTimeout = process.env.WAREHOUSE_DB_BUSY_TIMEOUT_MS;
+  let busyTimeoutMs = DEFAULT_BUSY_TIMEOUT_MS;
+  if (rawBusyTimeout !== undefined && rawBusyTimeout !== '') {
+    const n = Number(rawBusyTimeout);
+    if (Number.isInteger(n) && n >= 0) {
+      busyTimeoutMs = n;
+    } else {
+      console.warn(`[Warehouse] WAREHOUSE_DB_BUSY_TIMEOUT_MS=${JSON.stringify(rawBusyTimeout)} は無効値、${DEFAULT_BUSY_TIMEOUT_MS}ms にフォールバック`);
+    }
+  }
+  db.pragma(`busy_timeout = ${busyTimeoutMs}`);
   createTables();
-  console.log('[Warehouse] 初期化完了');
+  console.log(`[Warehouse] 初期化完了 (busy_timeout=${busyTimeoutMs}ms)`);
   return db;
 }
 

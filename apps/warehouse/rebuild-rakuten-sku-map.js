@@ -79,6 +79,8 @@ async function main() {
   // 1. m_products を読み込み（商品コード小文字化）
   const db = new Database(DB_PATH);
   db.pragma('journal_mode = WAL');
+  // バッチなのでロック競合時は待つ（常駐サーバ側の書き込み中に当たることがある）
+  db.pragma('busy_timeout = 60000');
   const productMap = new Map();
   for (const p of db.prepare('SELECT 商品コード FROM m_products').all()) {
     productMap.set((p.商品コード || '').toLowerCase(), p.商品コード);
