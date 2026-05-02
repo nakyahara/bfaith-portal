@@ -131,8 +131,21 @@ function renderInputPage() {
   </div>
 
   <div class="card">
-    <label>③ 米国FBA在庫金額（円） <small class="hint">直接入力（Phase 1）</small></label>
-    <input type="number" name="us_fba_amount" min="0" step="1" value="0">
+    <label>③ 米国FBA在庫</label>
+    <div style="margin-bottom:6px">
+      <label style="display:inline; font-weight:normal">
+        <input type="radio" name="us_mode" value="amount" checked onchange="toggleUsMode()"> 直接入力（円・税抜）
+      </label>
+      <input type="number" name="us_fba_amount" id="us_amount_input" min="0" step="1" value="0" style="margin-left:8px">
+    </div>
+    <div>
+      <label style="display:inline; font-weight:normal">
+        <input type="radio" name="us_mode" value="csv" onchange="toggleUsMode()"> CSVから自動算出
+      </label>
+      <input type="file" name="us_fba_csv" id="us_csv_input" accept=".csv" disabled style="margin-left:8px">
+      <small class="hint">米国版「発注推奨レポート」CSV (Restock Inventory Recommendations Report)。<br>
+      JP原価マスタで円換算します（米国独自の原価マスタは現状なし）。</small>
+    </div>
   </div>
 
   <div class="card">
@@ -157,6 +170,15 @@ function renderInputPage() {
 <div id="result"></div>
 
 <script>
+// ③ 米国FBA: 「直接入力」と「CSV取込」の入力欄を排他で活性化する。
+// 非アクティブ側を disabled にしておくことで FormData に値が乗らず、
+// サーバー側で「どっちが選ばれたか」を req.body / req.files の有無だけで判定できる。
+function toggleUsMode() {
+  const mode = document.querySelector('input[name="us_mode"]:checked').value;
+  document.getElementById('us_amount_input').disabled = (mode !== 'amount');
+  document.getElementById('us_csv_input').disabled = (mode !== 'csv');
+}
+
 function addPending() {
   const div = document.createElement('div');
   div.className = 'pending-row';
@@ -353,6 +375,7 @@ router.get('/', (req, res) => {
 router.post('/aggregate', upload.fields([
   { name: 'fba_csv', maxCount: 1 },
   { name: 'own_csv', maxCount: 1 },
+  { name: 'us_fba_csv', maxCount: 1 },
 ]), (req, res) => {
   // multer が書き出した一時ファイルはどの分岐を通っても必ず削除する。
   // 早期 return / 例外 / DB エラーいずれの場合も orphan を残さないため、
@@ -360,6 +383,7 @@ router.post('/aggregate', upload.fields([
   const cleanup = () => {
     try { if (req.files?.fba_csv?.[0]?.path) fs.unlinkSync(req.files.fba_csv[0].path); } catch {}
     try { if (req.files?.own_csv?.[0]?.path) fs.unlinkSync(req.files.own_csv[0].path); } catch {}
+    try { if (req.files?.us_fba_csv?.[0]?.path) fs.unlinkSync(req.files.us_fba_csv[0].path); } catch {}
   };
 
   try {
@@ -381,11 +405,16 @@ router.post('/aggregate', upload.fields([
     // パースは DB 不要。ここまでで CSV を読み切って一時ファイルを消す。
     const fbaBuf = fs.readFileSync(fbaFile.path);
     const ownBuf = fs.readFileSync(ownFile.path);
+    // 米国FBA CSV は任意（直接入力モードなら無し）
+    const usFbaFile = req.files?.us_fba_csv?.[0];
+    const usFbaBuf = usFbaFile ? fs.readFileSync(usFbaFile.path) : null;
     cleanup();
 
     const fbaRows = parseRestockReport(fbaBuf);
     const ownRows = parseOwnWarehouse(ownBuf);
-    const usFbaAmount = Number(req.body.us_fba_amount) || 0;
+    // ③ 米国FBA: CSVが来ていればパースしてaggregatorに渡す（金額直入力より優先）
+    const usFbaRows = usFbaBuf ? parseRestockReport(usFbaBuf) : null;
+    const usFbaAmount = usFbaRows ? 0 : (Number(req.body.us_fba_amount) || 0);
 
     const suppliers = [].concat(req.body['pending_supplier[]'] || []);
     const amounts = [].concat(req.body['pending_amount[]'] || []);
@@ -395,7 +424,7 @@ router.post('/aggregate', upload.fields([
 
     // 集計と保存はどちらも mirror DB が必要。
     if (!ensureDbOrFail(res)) return;
-    const result = aggregateInventory({ fbaRows, ownRows, usFbaAmount, pendingRows });
+    const result = aggregateInventory({ fbaRows, ownRows, usFbaRows, usFbaAmount, pendingRows });
 
     let snapshot_id = null;
     if (wantSave) {
