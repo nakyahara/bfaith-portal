@@ -679,6 +679,81 @@ function createTables() {
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_sms_month ON stock_monthly_snapshot(年月)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_sms_sku ON stock_monthly_snapshot(商品コード)');
+
+  // 22. SKUマスタ（人手キュレートの seller_sku 単位の正本）
+  // sku_map（自動検出、毎日DELETE+INSERT）と分離。商品名は社内独自名。
+  db.exec(`CREATE TABLE IF NOT EXISTS m_sku_master (
+    seller_sku  TEXT NOT NULL PRIMARY KEY,
+    商品名      TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    created_by  TEXT,
+    updated_by  TEXT,
+    CHECK (trim(seller_sku) <> ''),
+    CHECK (trim(商品名) <> ''),
+    CHECK (seller_sku = lower(seller_sku) AND trim(seller_sku) = seller_sku)
+  )`);
+
+  // 23. SKU構成（1 SKU = N components、セット商品で複数 ne_code）
+  // FK: seller_sku → m_sku_master.seller_sku（CASCADE削除）
+  // ne_code は raw_ne_products.商品コード に存在することをAPIレベルでバリデート
+  db.exec(`CREATE TABLE IF NOT EXISTS m_sku_components (
+    seller_sku  TEXT NOT NULL,
+    ne_code     TEXT NOT NULL,
+    数量        INTEGER NOT NULL DEFAULT 1,
+    sort_order  INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (seller_sku, ne_code),
+    FOREIGN KEY (seller_sku) REFERENCES m_sku_master(seller_sku) ON DELETE CASCADE,
+    CHECK (数量 > 0),
+    CHECK (trim(seller_sku) <> ''),
+    CHECK (trim(ne_code) <> ''),
+    CHECK (seller_sku = lower(seller_sku) AND trim(seller_sku) = seller_sku),
+    CHECK (ne_code = lower(ne_code) AND trim(ne_code) = ne_code)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_m_sku_components_ne ON m_sku_components(ne_code)');
+
+  // 24. ビュー: SKU紐付け解決（master優先 + sku_map フォールバック）
+  // 既存 sku_map（自動検出）は m_sku_master 未登録の seller_sku のみフォールバック対象
+  // CREATE VIEW は IF NOT EXISTS が SQLite 3.9+ で利用可能
+  db.exec(`CREATE VIEW IF NOT EXISTS v_sku_resolved AS
+    SELECT
+      c.seller_sku,
+      c.ne_code,
+      c.数量,
+      'master' AS source
+    FROM m_sku_components c
+    UNION ALL
+    SELECT
+      s.seller_sku,
+      s.ne_code,
+      s.数量,
+      'auto' AS source
+    FROM sku_map s
+    WHERE NOT EXISTS (
+      SELECT 1 FROM m_sku_master m WHERE m.seller_sku = s.seller_sku
+    )
+  `);
+
+  // 25. ビュー: SKU紐付け＋原価解決
+  // raw_ne_products から原価をJOIN。原価NULLは cost_status='cost_missing' で示す
+  // exception_genka はレガシー、新規参照しない方針
+  db.exec(`CREATE VIEW IF NOT EXISTS v_sku_costed AS
+    SELECT
+      v.seller_sku,
+      v.ne_code,
+      v.数量,
+      v.source,
+      p.原価 AS 単価,
+      CASE
+        WHEN p.商品コード IS NULL THEN 'ne_missing'
+        WHEN p.原価 IS NULL THEN 'cost_missing'
+        ELSE 'ok'
+      END AS cost_status
+    FROM v_sku_resolved v
+    LEFT JOIN raw_ne_products p ON v.ne_code = p.商品コード
+  `);
 }
 
 function insertDefaultShops() {
@@ -716,7 +791,7 @@ function insertDefaultShops() {
 // ─── 統計取得 ───
 
 export function getStats() {
-  const tables = ['raw_ne_products', 'raw_ne_orders', 'raw_ne_set_products', 'raw_sp_orders', 'raw_sp_orders_log', 'raw_rakuten_orders', 'raw_rakuten_orders_log', 'raw_lz_inventory', 'sku_map', 'product_shipping', 'shipping_rates', 'exception_genka', 'product_sales_class', 'shops', 'm_products', 'm_set_components', 'f_sales_by_listing', 'f_sales_by_product', 'unmapped_sales', 'amazon_sku_fees', 'stock_monthly_snapshot'];
+  const tables = ['raw_ne_products', 'raw_ne_orders', 'raw_ne_set_products', 'raw_sp_orders', 'raw_sp_orders_log', 'raw_rakuten_orders', 'raw_rakuten_orders_log', 'raw_lz_inventory', 'sku_map', 'product_shipping', 'shipping_rates', 'exception_genka', 'product_sales_class', 'shops', 'm_products', 'm_set_components', 'f_sales_by_listing', 'f_sales_by_product', 'unmapped_sales', 'amazon_sku_fees', 'stock_monthly_snapshot', 'm_sku_master', 'm_sku_components'];
   const stats = {};
 
   for (const table of tables) {
