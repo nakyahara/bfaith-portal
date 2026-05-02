@@ -731,8 +731,11 @@ function createTables() {
 
   // 24. ビュー: SKU紐付け解決（master優先 + sku_map フォールバック）
   // 既存 sku_map（自動検出）は m_sku_master 未登録の seller_sku のみフォールバック対象
-  // CREATE VIEW は IF NOT EXISTS が SQLite 3.9+ で利用可能
-  db.exec(`CREATE VIEW IF NOT EXISTS v_sku_resolved AS
+  // fallback遮断条件は COLLATE NOCASE で大文字小文字差を吸収（万一データ混入時の二重計上防止）
+  // 依存順 (v_sku_costed → v_sku_resolved) で DROP してから再作成、定義変更を確実に反映
+  db.exec('DROP VIEW IF EXISTS v_sku_costed');
+  db.exec('DROP VIEW IF EXISTS v_sku_resolved');
+  db.exec(`CREATE VIEW v_sku_resolved AS
     SELECT
       c.seller_sku,
       c.ne_code,
@@ -747,14 +750,14 @@ function createTables() {
       'auto' AS source
     FROM sku_map s
     WHERE NOT EXISTS (
-      SELECT 1 FROM m_sku_master m WHERE m.seller_sku = s.seller_sku
+      SELECT 1 FROM m_sku_master m WHERE m.seller_sku = s.seller_sku COLLATE NOCASE
     )
   `);
 
   // 25. ビュー: SKU紐付け＋原価解決
   // raw_ne_products から原価をJOIN。原価NULLは cost_status='cost_missing' で示す
   // exception_genka はレガシー、新規参照しない方針
-  db.exec(`CREATE VIEW IF NOT EXISTS v_sku_costed AS
+  db.exec(`CREATE VIEW v_sku_costed AS
     SELECT
       v.seller_sku,
       v.ne_code,
