@@ -228,6 +228,14 @@ export async function initDb() {
   if (!snapCols.includes('product_name')) {
     db.run(`ALTER TABLE daily_snapshots ADD COLUMN product_name TEXT`);
   }
+  // FBA倉庫内在庫の完全な4分類化 (月末棚卸しツール定義と一致):
+  //   fba_warehouse = fba_available + fba_fc_transfer + fba_fc_processing + fba_customer_order
+  // RESTOCK レポート (GET_RESTOCK_INVENTORY_RECOMMENDATIONS_REPORT) から取得する。
+  for (const col of ['fba_fc_transfer', 'fba_fc_processing', 'fba_customer_order']) {
+    if (!snapCols.includes(col)) {
+      db.run(`ALTER TABLE daily_snapshots ADD COLUMN ${col} INTEGER DEFAULT 0`);
+    }
+  }
 
   // --- 8. non_fba_sales_snapshots: 他CH売上の日次スナップショット（60日保持） ---
   db.run(`
@@ -501,14 +509,30 @@ export function savePlanningData(rows, snapshotDate) {
         }
       }
 
+      // 在庫列のソース優先順位:
+      //   月末棚卸しツールは RESTOCK レポート (4列+3列) で fba_warehouse を計算するので、
+      //   日次も RESTOCK を source of truth とする。
+      //   → PLANNING の ON CONFLICT DO UPDATE では在庫7列 (4既存 + 3新規) を除外し、
+      //     PLANNING 固有列 (sales/price/days_of_supply/sales_rank/working_first_seen) のみ更新。
+      //   新規 INSERT 時はデフォルト 0 が入るが、後続/前段の saveRestockInventoryToDailySnapshot で上書きされる。
+      //   (snapshot-fba-stock.js は RESTOCK→PLANNING の順序で実行)
       db.run(`
-        INSERT OR REPLACE INTO daily_snapshots
+        INSERT INTO daily_snapshots
           (snapshot_date, amazon_sku, product_name, fba_available,
            fba_inbound_working, fba_inbound_shipped, fba_inbound_received,
            working_first_seen,
            days_of_supply, units_sold_7d, units_sold_30d,
            sales_rank, your_price, featured_offer_price)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(snapshot_date, amazon_sku) DO UPDATE SET
+          product_name = excluded.product_name,
+          working_first_seen = excluded.working_first_seen,
+          days_of_supply = excluded.days_of_supply,
+          units_sold_7d = excluded.units_sold_7d,
+          units_sold_30d = excluded.units_sold_30d,
+          sales_rank = excluded.sales_rank,
+          your_price = excluded.your_price,
+          featured_offer_price = excluded.featured_offer_price
       `, [
         today,
         sku,
@@ -536,6 +560,83 @@ export function savePlanningData(rows, snapshotDate) {
 }
 
 /**
+ * RESTOCK レポートから FBA 在庫の追加3区分 (FC移管中・FC処理中・出荷待ち) を
+ * daily_snapshots に書き込む。月末棚卸しツールの fba_warehouse 計算 (4列合算)
+ * と一致させるための補完。
+ *
+ * - PLANNING で先に行を作成済み (savePlanningData) なら、その行の追加列を UPDATE
+ * - PLANNING に無い SKU でも RESTOCK にあれば INSERT (sales/price 列は 0/null)
+ * - 既存の fba_available/fba_inbound_* も RESTOCK の値で上書き (定義一致のため)
+ *
+ * rows: normalizeRestockRow() の戻り値の配列
+ */
+export function saveRestockInventoryToDailySnapshot(rows, snapshotDate) {
+  if (!rows || rows.length === 0) return { updated: 0, inserted: 0 };
+  const today = snapshotDate || new Date().toISOString().slice(0, 10);
+
+  let updated = 0, inserted = 0;
+  db.run('BEGIN TRANSACTION');
+  try {
+    for (const row of rows) {
+      const sku = row.amazon_sku || '';
+      if (!sku) continue;
+      const exists = queryOne(
+        'SELECT 1 FROM daily_snapshots WHERE snapshot_date = ? AND amazon_sku = ?',
+        [today, sku]
+      );
+      if (exists) {
+        db.run(`
+          UPDATE daily_snapshots SET
+            fba_available = ?,
+            fba_inbound_working = ?,
+            fba_inbound_shipped = ?,
+            fba_inbound_received = ?,
+            fba_fc_transfer = ?,
+            fba_fc_processing = ?,
+            fba_customer_order = ?
+          WHERE snapshot_date = ? AND amazon_sku = ?
+        `, [
+          row.fba_available || 0,
+          row.fba_inbound_working || 0,
+          row.fba_inbound_shipped || 0,
+          row.fba_inbound_received || 0,
+          row.fba_fc_transfer || 0,
+          row.fba_fc_processing || 0,
+          row.fba_customer_order || 0,
+          today, sku,
+        ]);
+        updated++;
+      } else {
+        // PLANNING に該当 SKU がない場合: RESTOCK 単独で INSERT (sales/price は0)
+        db.run(`
+          INSERT INTO daily_snapshots
+            (snapshot_date, amazon_sku, product_name,
+             fba_available, fba_inbound_working, fba_inbound_shipped, fba_inbound_received,
+             fba_fc_transfer, fba_fc_processing, fba_customer_order)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, [
+          today, sku, row.product_name || '',
+          row.fba_available || 0,
+          row.fba_inbound_working || 0,
+          row.fba_inbound_shipped || 0,
+          row.fba_inbound_received || 0,
+          row.fba_fc_transfer || 0,
+          row.fba_fc_processing || 0,
+          row.fba_customer_order || 0,
+        ]);
+        inserted++;
+      }
+    }
+    db.run('COMMIT');
+    saveToFile();
+    return { updated, inserted };
+  } catch (e) {
+    db.run('ROLLBACK');
+    throw e;
+  }
+}
+
+/**
  * ミニPCから同期されたPLANNINGスナップショットをそのままupsertする。
  *
  * 通常の savePlanningData() と違い:
@@ -555,14 +656,26 @@ export function savePlanningDataWithHistory(rows, snapshotDate) {
       const sku = row.amazon_sku || row.sku || '';
       if (!sku) continue;
 
+      // savePlanningData と同じ理由で ON CONFLICT DO UPDATE。
+      // 在庫7列 (4既存 + 3新規) は RESTOCK が source of truth なので PLANNING で上書きしない。
+      // PLANNING 固有列のみ更新する。
       db.run(`
-        INSERT OR REPLACE INTO daily_snapshots
+        INSERT INTO daily_snapshots
           (snapshot_date, amazon_sku, product_name, fba_available,
            fba_inbound_working, fba_inbound_shipped, fba_inbound_received,
            working_first_seen,
            days_of_supply, units_sold_7d, units_sold_30d,
            sales_rank, your_price, featured_offer_price)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(snapshot_date, amazon_sku) DO UPDATE SET
+          product_name = excluded.product_name,
+          working_first_seen = excluded.working_first_seen,
+          days_of_supply = excluded.days_of_supply,
+          units_sold_7d = excluded.units_sold_7d,
+          units_sold_30d = excluded.units_sold_30d,
+          sales_rank = excluded.sales_rank,
+          your_price = excluded.your_price,
+          featured_offer_price = excluded.featured_offer_price
       `, [
         date,
         sku,

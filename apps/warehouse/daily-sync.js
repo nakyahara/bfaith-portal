@@ -89,6 +89,12 @@ async function main() {
   const spResult = runScript('apps/warehouse/sp-api-orders.js', 'Amazon SP-API');
   results.push({ name: 'Amazon', ...spResult });
 
+  // FBA 在庫スナップショット (RESTOCK + PLANNING) — daily_snapshots に履歴蓄積
+  // 手動 /fetch-reports と lockfile で排他、既に走ってればスキップ (失敗扱いにしない)
+  // SP-API レポート polling のため最大 15 分余裕
+  const fbaSnapResult = runScript('apps/warehouse/snapshot-fba-stock.js', 'FBA在庫スナップショット', 900000);
+  results.push({ name: 'FBA在庫snapshot', ...fbaSnapResult });
+
   // 楽天
   const rkResult = runScript('apps/warehouse/rakuten-orders.js', '楽天 RMS API');
   results.push({ name: '楽天', ...rkResult });
