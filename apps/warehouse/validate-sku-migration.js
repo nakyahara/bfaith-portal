@@ -25,7 +25,7 @@ export function validateMigration(opts = {}) {
   const oldTotal = db.prepare(`
     SELECT
       date(o.purchase_date) AS 売上日,
-      SUM(CASE WHEN p.原価 IS NULL THEN NULL ELSE o.quantity_purchased * COALESCE(s.数量, 1) * p.原価 END) AS 原価合計,
+      SUM(CASE WHEN p.原価 IS NULL THEN NULL ELSE o.quantity * COALESCE(s.数量, 1) * p.原価 END) AS 原価合計,
       SUM(CASE WHEN p.原価 IS NULL THEN 1 ELSE 0 END) AS 原価unresolved件数,
       COUNT(*) AS 総行数
     FROM raw_sp_orders o
@@ -40,7 +40,7 @@ export function validateMigration(opts = {}) {
   const newTotal = db.prepare(`
     SELECT
       date(o.purchase_date) AS 売上日,
-      SUM(CASE WHEN c.単価 IS NULL THEN NULL ELSE o.quantity_purchased * c.数量 * c.単価 END) AS 原価合計,
+      SUM(CASE WHEN c.単価 IS NULL THEN NULL ELSE o.quantity * c.数量 * c.単価 END) AS 原価合計,
       SUM(CASE WHEN c.単価 IS NULL THEN 1 ELSE 0 END) AS 原価unresolved件数,
       COUNT(*) AS 総行数
     FROM raw_sp_orders o
