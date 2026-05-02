@@ -35,6 +35,15 @@ export async function rebuildFSales() {
   // 別プロセス（WarehouseServer）の書き込みはトランザクション中に進行可能だが、
   // ここで読む結果には反映されない（SQLite のスナップショット分離）。
 
+  // SKU解決ソース選択:
+  //   既定: v_sku_resolved (m_sku_master 優先 + sku_map fallback)
+  //   WAREHOUSE_REBUILD_F_SALES_USE_LEGACY=1: 旧パス (sku_map 直参照)
+  //   並行検証 (validate-sku-migration.js) で退化0/改善+3を確認後、新パスを既定にした。
+  //   何かトラブルが出たら escape hatch として env で旧パスに戻せる。
+  const useLegacy = process.env.WAREHOUSE_REBUILD_F_SALES_USE_LEGACY === '1';
+  const skuResolutionSource = useLegacy ? 'sku_map (legacy)' : 'v_sku_resolved (master+fallback)';
+  console.log(`[f_sales] SKU解決ソース: ${skuResolutionSource}`);
+
   let setComponentsRows, skuMapRows, productMpRows;
   let amazonRows, rakutenRows, neRows;
   let amazonListingRows, rakutenListingRows, neListingRows;
@@ -42,7 +51,10 @@ export async function rebuildFSales() {
   const readTx = db.transaction(() => {
     // ─── マスタ系 ───
     setComponentsRows = db.prepare('SELECT * FROM m_set_components').all();
-    skuMapRows = db.prepare('SELECT * FROM sku_map').all();
+    skuMapRows = useLegacy
+      ? db.prepare('SELECT seller_sku, ne_code, 数量 FROM sku_map').all()
+      // v_sku_resolved は seller_sku + ne_code + 数量 (+ source) を返す。shape は sku_map と互換。
+      : db.prepare('SELECT seller_sku, ne_code, 数量 FROM v_sku_resolved').all();
     productMpRows = db.prepare("SELECT 商品コード, 商品区分 FROM m_products").all();
 
     // ─── product 用 SELECT（粒度: 日付 × SKU/商品コード） ───
@@ -142,7 +154,8 @@ export async function rebuildFSales() {
     setComponents.get(key).push({ code: row.構成商品コード, qty: row.数量 });
   }
 
-  // sku_map（seller_sku → [{ne_code, 数量}]）
+  // SKU解決マップ（seller_sku → [{ne_code, 数量}]）
+  // ソース: v_sku_resolved (新, 既定) または sku_map (旧, env で切替時)
   const skuMap = new Map();
   for (const row of skuMapRows) {
     const key = row.seller_sku?.toLowerCase();
@@ -158,10 +171,10 @@ export async function rebuildFSales() {
   }
 
   // Amazon SKU → NE商品コード変換ヘルパー
-  // 1. sku_map → 2. m_products.商品コードと直接一致 → 3. unmapped
+  // 1. SKU解決マップ (v_sku_resolved or sku_map) → 2. m_products.商品コードと直接一致 → 3. unmapped
   function resolveAmazonSku(sku) {
     const mapped = skuMap.get(sku);
-    if (mapped) return { mappings: mapped, source: 'sku_map' };
+    if (mapped) return { mappings: mapped, source: useLegacy ? 'sku_map' : 'resolved' };
     if (productTypes.has(sku)) return { mappings: [{ ne_code: sku, qty: 1 }], source: 'direct' };
     return null;
   }
@@ -204,7 +217,8 @@ export async function rebuildFSales() {
     if (!resolved) {
       unmappedRows.push({
         date: row.date, mall: 'amazon', sku: row.sku, title: row.title,
-        qty: row.qty, amount: row.amount, reason: 'sku_map未登録・商品コード不一致',
+        qty: row.qty, amount: row.amount,
+        reason: useLegacy ? 'sku_map未登録・商品コード不一致' : 'SKU未解決 (master/sku_map両方になし) ・商品コード不一致',
       });
       unmappedCount++;
       continue;
