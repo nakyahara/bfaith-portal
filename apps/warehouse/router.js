@@ -21,6 +21,7 @@ import fs from 'fs';
 import iconv from 'iconv-lite';
 import { initDB, getDB, getStats, saveToFile, updateSyncMeta } from './db.js';
 import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
+import { mountSkuMasterApi } from './sku-master-api.js';
 
 const router = Router();
 const upload = multer({ dest: 'data/import/' });
@@ -2229,5 +2230,8 @@ function renderDashboard(stats) {
 </body>
 </html>`;
 }
+
+// SKUマスタ CRUD API（人手キュレートの seller_sku ↔ ne_code 紐付け）
+mountSkuMasterApi(router);
 
 export default router;
