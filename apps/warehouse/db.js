@@ -729,7 +729,21 @@ function createTables() {
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_m_sku_components_ne ON m_sku_components(ne_code)');
 
-  // 24. ビュー: SKU紐付け解決（master優先 + sku_map フォールバック）
+  // 24. NE在庫の日次スナップショット
+  // raw_ne_products は毎朝 NE API で全件上書きされるため履歴が消える。
+  // daily-sync.js が NE API 取得成功直後に raw_ne_products を本テーブルへ複製し履歴化する。
+  // 用途: 過去日の自社倉庫在庫金額の再計算 (原価変動があっても遡って計算可能)
+  // business_date は JST 固定 (UTC癖回避)
+  db.exec(`CREATE TABLE IF NOT EXISTS ne_stock_daily_snapshot (
+    business_date  TEXT NOT NULL,
+    商品コード     TEXT NOT NULL,
+    在庫数         INTEGER NOT NULL,
+    captured_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (business_date, 商品コード)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_ne_stock_snap_code ON ne_stock_daily_snapshot(商品コード)');
+
+  // 25. ビュー: SKU紐付け解決（master優先 + sku_map フォールバック）
   // 既存 sku_map（自動検出）は m_sku_master 未登録の seller_sku のみフォールバック対象
   // fallback遮断条件は COLLATE NOCASE で大文字小文字差を吸収（万一データ混入時の二重計上防止）
   // 依存順 (v_sku_costed → v_sku_resolved) で DROP してから再作成、定義変更を確実に反映
