@@ -14,7 +14,7 @@
 import { Router } from 'express';
 import multer from 'multer';
 import fs from 'fs';
-import { initInventoryMonthly } from './db.js';
+import { initInventoryMonthly, getDB } from './db.js';
 import { parseRestockReport, parseOwnWarehouse } from './csv-parser.js';
 import { aggregateInventory, saveSnapshot, listSnapshots, getSnapshot } from './aggregator.js';
 import { exportSnapshotToXlsx } from './excel-export.js';
