@@ -104,7 +104,7 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
       log.push(`set_components: ${set_components.length}件`);
     }
 
-    // sku_map（全件置換）
+    // sku_map（全件置換、旧テーブル、互換維持）
     if (req.body.sku_map && req.body.sku_map.length > 0) {
       const skuMapData = req.body.sku_map;
       const tx = db.transaction(() => {
@@ -118,6 +118,31 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
       });
       tx();
       log.push(`sku_map: ${skuMapData.length}件`);
+    }
+
+    // sku_resolved（全件置換、新規ツールはこちらを参照）
+    // 0件payloadも受け付ける（meta.clear_sku_resolved=trueで明示クリア可、無くても全件置換動作）
+    if (req.body.sku_resolved && Array.isArray(req.body.sku_resolved)) {
+      const resolved = req.body.sku_resolved;
+      const tx = db.transaction(() => {
+        db.exec('DELETE FROM mirror_sku_resolved');
+        const stmt = db.prepare(`INSERT INTO mirror_sku_resolved (
+          seller_sku, ne_code, quantity, source, 商品名, source_updated_at, synced_at
+        ) VALUES (?,?,?,?,?,?,?)`);
+        for (const r of resolved) {
+          stmt.run(
+            r.seller_sku,
+            r.ne_code,
+            r.quantity ?? r.数量 ?? 1,
+            r.source,
+            r.商品名 ?? null,
+            r.source_updated_at ?? null,
+            now
+          );
+        }
+      });
+      tx();
+      log.push(`sku_resolved: ${resolved.length}件`);
     }
 
     // rakuten_sku_map（全件置換）

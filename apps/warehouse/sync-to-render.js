@@ -114,9 +114,32 @@ export async function syncToRender() {
   const set_components = db.prepare('SELECT * FROM m_set_components').all();
   console.log(`[Sync→Render]   set_components: ${set_components.length}件`);
 
-  // 2b. sku_map
+  // 2b. sku_map（旧、互換維持）
   const sku_map = db.prepare('SELECT * FROM sku_map').all();
   console.log(`[Sync→Render]   sku_map: ${sku_map.length}件`);
+
+  // 2b-2. sku_resolved（新、master優先＋fallback解決済みビュー）
+  //   v_sku_resolved に商品名と source_updated_at を JOIN/COALESCE して送信
+  //   - source='master': m_sku_master.商品名 / m_sku_master.updated_at
+  //   - source='auto'  : 商品名NULL / sku_map.synced_at
+  let sku_resolved = [];
+  try {
+    sku_resolved = db.prepare(`
+      SELECT
+        v.seller_sku,
+        v.ne_code,
+        v.数量 AS quantity,
+        v.source,
+        CASE WHEN v.source = 'master' THEN m.商品名 ELSE NULL END AS 商品名,
+        CASE WHEN v.source = 'master' THEN m.updated_at ELSE s.synced_at END AS source_updated_at
+      FROM v_sku_resolved v
+      LEFT JOIN m_sku_master m ON v.source = 'master' AND v.seller_sku = m.seller_sku
+      LEFT JOIN sku_map s      ON v.source = 'auto'   AND v.seller_sku = s.seller_sku AND v.ne_code = s.ne_code
+    `).all();
+    console.log(`[Sync→Render]   sku_resolved: ${sku_resolved.length}件 (master:${sku_resolved.filter(r=>r.source==='master').length} auto:${sku_resolved.filter(r=>r.source==='auto').length})`);
+  } catch (e) {
+    console.log(`[Sync→Render]   sku_resolved: 取得失敗（スキップ）: ${e.message}`);
+  }
 
   // 2c. amazon_sku_fees（手数料キャッシュ）
   let amazon_sku_fees = [];
@@ -209,7 +232,7 @@ export async function syncToRender() {
 
   try {
     // Part 1: マスタデータ
-    await sendPart({ products, set_components, sku_map, amazon_sku_fees, rakuten_sku_map }, 'マスタ');
+    await sendPart({ products, set_components, sku_map, sku_resolved, amazon_sku_fees, rakuten_sku_map }, 'マスタ');
 
     // Part 1b: 月末在庫スナップショット（PR2a 追加、タブB GMROI用）
     //   件数は最大 商品数 × 25ヶ月（現在月+過去24ヶ月、sales_monthly と同じ境界扱い）。

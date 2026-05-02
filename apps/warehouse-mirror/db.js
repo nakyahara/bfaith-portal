@@ -95,7 +95,8 @@ function createTables() {
     PRIMARY KEY (セット商品コード, 構成商品コード)
   )`);
 
-  // mirror_sku_map — Amazon SKU→NE商品コード対応
+  // mirror_sku_map — Amazon SKU→NE商品コード対応（旧、互換維持）
+  // ※新規ツールは mirror_sku_resolved を参照すること。本テーブルは段階廃止予定。
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_sku_map (
     seller_sku        TEXT NOT NULL,
     ne_code           TEXT NOT NULL,
@@ -107,6 +108,28 @@ function createTables() {
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirsku_sku ON mirror_sku_map(seller_sku)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirsku_ne ON mirror_sku_map(ne_code)');
+
+  // mirror_sku_resolved — SKU紐付け解決済みビューのミラー（v_sku_resolved の結果）
+  // 設計:
+  //   - source='master': m_sku_master/m_sku_components 由来（人手キュレート、商品名あり）
+  //   - source='auto'  : sku_map 由来（自動検出、master未登録SKUのみfallback、商品名なし）
+  //   - 商品名はNULL許容（auto時はNULLになる）
+  //   - source_updated_at は元データの更新時刻（master=updated_at, auto=sku_map.synced_at）
+  //   - synced_at はこのミラーへの取り込み時刻
+  // 新規ツールはこのテーブルだけ見ればよい（master優先＋fallbackロジックはミニPC側で確定済み）
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_sku_resolved (
+    seller_sku         TEXT NOT NULL,
+    ne_code            TEXT NOT NULL,
+    quantity           INTEGER NOT NULL,
+    source             TEXT NOT NULL CHECK (source IN ('master', 'auto')),
+    商品名             TEXT,
+    source_updated_at  TEXT,
+    synced_at          TEXT NOT NULL,
+    PRIMARY KEY (seller_sku, ne_code)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mirres_sku ON mirror_sku_resolved(seller_sku)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mirres_ne ON mirror_sku_resolved(ne_code)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mirres_src ON mirror_sku_resolved(source)');
 
   // mirror_sales_monthly — 月次集計（24ヶ月分）
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_sales_monthly (
