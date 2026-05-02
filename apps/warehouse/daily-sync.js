@@ -95,6 +95,11 @@ async function main() {
   const fbaSnapResult = runScript('apps/warehouse/snapshot-fba-stock.js', 'FBA在庫スナップショット', 900000);
   results.push({ name: 'FBA在庫snapshot', ...fbaSnapResult });
 
+  // 在庫スナップショット集計 (FBA + 自社倉庫の金額算出 → inv_daily_summary)
+  // 上の NE/FBA スナップショットの後に必ず走る (失敗時も結果は no_source で記録)
+  const invAggResult = runScript('apps/warehouse/snapshot-inventory-aggregate.js', '在庫スナップショット集計', 120000);
+  results.push({ name: '在庫集計', ...invAggResult });
+
   // 楽天
   const rkResult = runScript('apps/warehouse/rakuten-orders.js', '楽天 RMS API');
   results.push({ name: '楽天', ...rkResult });

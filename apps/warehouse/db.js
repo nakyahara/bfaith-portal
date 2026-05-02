@@ -743,7 +743,29 @@ function createTables() {
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_ne_stock_snap_code ON ne_stock_daily_snapshot(商品コード)');
 
-  // 25. ビュー: SKU紐付け解決（master優先 + sku_map フォールバック）
+  // 25. 在庫スナップショット日次サマリ (UI 推移グラフ用)
+  // ne_stock_daily_snapshot + fba.db.daily_snapshots を SKU解決+原価で金額化した結果。
+  // PR-B 集計スクリプト snapshot-inventory-aggregate.js が毎朝書く。
+  // 米国FBA将来追加に備えて market 列、SP-API 失敗日を欠損として識別するため source_status・row_count を持つ。
+  db.exec(`CREATE TABLE IF NOT EXISTS inv_daily_summary (
+    business_date     TEXT NOT NULL,
+    market            TEXT NOT NULL DEFAULT 'jp',
+    category          TEXT NOT NULL,
+    total_qty         INTEGER NOT NULL,
+    total_value       REAL,
+    resolved_count    INTEGER NOT NULL DEFAULT 0,
+    unresolved_count  INTEGER NOT NULL DEFAULT 0,
+    cost_missing_count INTEGER NOT NULL DEFAULT 0,
+    source_status     TEXT NOT NULL,
+    source_row_count  INTEGER,
+    captured_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (business_date, market, category),
+    CHECK (category IN ('fba_warehouse', 'fba_inbound', 'own_warehouse', 'fba_us')),
+    CHECK (source_status IN ('ok', 'partial', 'failed', 'no_source'))
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_inv_daily_summary_date ON inv_daily_summary(business_date)');
+
+  // 26. ビュー: SKU紐付け解決（master優先 + sku_map フォールバック）
   // 既存 sku_map（自動検出）は m_sku_master 未登録の seller_sku のみフォールバック対象
   // fallback遮断条件は COLLATE NOCASE で大文字小文字差を吸収（万一データ混入時の二重計上防止）
   // 依存順 (v_sku_costed → v_sku_resolved) で DROP してから再作成、定義変更を確実に反映
