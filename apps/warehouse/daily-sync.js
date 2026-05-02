@@ -37,7 +37,13 @@ function runScript(scriptPath, label, timeoutMs = 600000) {
       cwd: PROJECT_DIR,
       timeout: timeoutMs,
       encoding: 'utf-8',
-      env: { ...process.env, PATH: process.env.PATH },
+      env: {
+        ...process.env,
+        PATH: process.env.PATH,
+        // 子プロセス側のSQLite busy_timeout を 60秒 に上書き（バッチ用）。
+        // db.js の initDB() がこの env を参照する。
+        WAREHOUSE_DB_BUSY_TIMEOUT_MS: process.env.WAREHOUSE_DB_BUSY_TIMEOUT_MS || '60000',
+      },
     });
     console.log(output);
     // 最後の行から結果を抽出
