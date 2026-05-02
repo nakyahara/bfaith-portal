@@ -22,9 +22,11 @@ import iconv from 'iconv-lite';
 import { initDB, getDB, getStats, saveToFile, updateSyncMeta } from './db.js';
 import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
 import { mountSkuMasterApi } from './sku-master-api.js';
+import { importSkuMasterCSV } from './import-sku-master.js';
 
 const router = Router();
 const upload = multer({ dest: 'data/import/' });
+const uploadSkuMaster = multer({ dest: 'data/import/', limits: { fileSize: 10 * 1024 * 1024 } });
 
 // ─── DB初期化 ───
 let dbReady = false;
@@ -732,6 +734,44 @@ router.post('/api/csv/skumap', upload.single('file'), (req, res) => {
   res.json({ ok: true, imported: count, skipped, total: dataRows.length });
 });
 
+// POST /api/csv/m-sku-master — SKUマスタ（商品コード変換テーブル）CSV一括登録
+// CSV形式: sku, asin, 商品名, NE商品コード, 数量, ...（19列、先頭4列を使用）UTF-8固定、最大10MB
+// A案: 同一skuの商品名が複数あれば最初の行採用
+function uploadSkuMasterMw(req, res, next) {
+  uploadSkuMaster.single('file')(req, res, (err) => {
+    if (!err) return next();
+    if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'ファイルサイズが上限(10MB)を超えています' });
+    console.error('[m-sku-master upload] multer error:', err);
+    return res.status(400).json({ error: 'アップロード処理に失敗しました' });
+  });
+}
+router.post('/api/csv/m-sku-master', uploadSkuMasterMw, (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'ファイルが必要です' });
+  const csvPath = req.file.path;
+  const dryRun = req.query.dry_run === '1';
+  try {
+    const result = importSkuMasterCSV(csvPath, { dryRun, encoding: 'utf-8' });
+    res.json({
+      ok: true,
+      dryRun,
+      masterCount: result.masterCount,
+      componentCount: result.componentCount,
+      skipped: result.skipped,
+      nameConflicts: result.nameConflicts.length,
+      missingNeCodes: result.missingNeCodes.length,
+      dupComponents: result.dupComponents.length,
+      sampleNameConflicts: result.nameConflicts.slice(0, 5),
+      sampleMissingNeCodes: result.missingNeCodes.slice(0, 5),
+      warningsTotal: result.warnings.length,
+    });
+  } catch (e) {
+    console.error('[m-sku-master upload] failed:', e);
+    res.status(500).json({ error: 'SKUマスタCSV取込に失敗しました。サーバログを確認してください。' });
+  } finally {
+    try { fs.unlinkSync(csvPath); } catch {}
+  }
+});
+
 // ─── DELETE /api/shipping/:sku ───
 
 router.delete('/api/shipping/:sku', (req, res) => {
@@ -1400,6 +1440,7 @@ function renderRegisterPage(shippingRates) {
         <button class="active" id="csv-tab-shipping" onclick="switchCsvType('shipping',this)">送料</button>
         <button id="csv-tab-genka" onclick="switchCsvType('genka',this)">原価</button>
         <button id="csv-tab-skumap" onclick="switchCsvType('skumap',this)">SKUマップ</button>
+        <button id="csv-tab-msku" onclick="switchCsvType('m-sku-master',this)">SKUマスタ</button>
         <button id="csv-tab-salesclass" onclick="switchCsvType('sales_class',this)">売上分類</button>
         <button id="csv-tab-taxrate" onclick="switchCsvType('tax_rate',this)">税率</button>
       </div>
@@ -1791,6 +1832,7 @@ function renderRegisterPage(shippingRates) {
       shipping: 'CSV形式: 商品コード, 送料コード',
       genka: 'CSV形式: 商品コード, 原価, 商品名（任意）',
       skumap: 'CSV形式: seller_sku, ne_code, 数量（任意）, ASIN（任意）',
+      'm-sku-master': 'CSV形式: sku, asin, 商品名(社内独自), NE商品コード, 数量, ... (商品コード変換テーブルCSV / 19列、UTF-8)',
       sales_class: 'CSV形式: 商品コード, 売上分類(1:自社/2:取引先限定/3:仕入れ/4:輸出)',
       tax_rate: 'CSV形式: 商品コード, 税率(0.1 or 0.08)'
     };
@@ -1820,8 +1862,26 @@ function renderRegisterPage(shippingRates) {
         const r = await fetch(B + endpoint, { method: 'POST', body: formData });
         const data = await r.json();
         if (data.ok) {
-          document.getElementById('csv-result').textContent = '✅ ' + data.imported + '件登録 / ' + data.skipped + '件スキップ（全' + data.total + '行）';
-          toast(data.imported + '件を一括登録しました');
+          let msg;
+          let hasWarning = false;
+          if (curCsvType === 'm-sku-master') {
+            const warnCount = (data.skipped || 0) + (data.nameConflicts || 0) + (data.missingNeCodes || 0) + (data.dupComponents || 0);
+            hasWarning = warnCount > 0;
+            const icon = hasWarning ? '⚠️' : '✅';
+            msg = icon + ' master ' + data.masterCount + ' / components ' + data.componentCount + ' / skip ' + data.skipped
+                + ' | 商品名conflict ' + data.nameConflicts + ' / NE欠落 ' + data.missingNeCodes + ' / 構成重複 ' + data.dupComponents;
+            if (data.sampleMissingNeCodes && data.sampleMissingNeCodes.length) {
+              msg += ' | NE欠落例: ' + data.sampleMissingNeCodes.map(m => m.seller_sku + '→' + m.ne_code).join(', ');
+            }
+            console.log('[m-sku-master upload result]', data);
+            toast(hasWarning
+              ? '取込完了: master ' + data.masterCount + '件（要確認 ' + warnCount + '件）'
+              : 'master ' + data.masterCount + '件を一括登録しました', hasWarning);
+          } else {
+            msg = '✅ ' + data.imported + '件登録 / ' + data.skipped + '件スキップ（全' + data.total + '行）';
+            toast(data.imported + '件を一括登録しました');
+          }
+          document.getElementById('csv-result').textContent = msg;
           // 件数を再取得
           try {
             const c = await api('/api/missing/counts');
