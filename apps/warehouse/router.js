@@ -1369,6 +1369,17 @@ function renderRegisterPage(shippingRates) {
     .tabs button.active{background:#1a5276;color:white;border-color:#1a5276}
     .done-row{opacity:.4;transition:opacity .3s}
     .scroll-area{max-height:65vh;overflow-y:auto}
+    .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:998;display:none;align-items:center;justify-content:center}
+    .modal-bg.show{display:flex}
+    .modal{background:white;border-radius:8px;padding:20px;width:640px;max-width:92vw;max-height:90vh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,.2)}
+    .modal h3{font-size:16px;margin-bottom:12px;color:#333}
+    .modal label{display:block;font-size:11px;color:#666;margin-top:10px;margin-bottom:3px}
+    .modal input[type=text],.modal input:not([type]){width:100%;padding:6px 8px;font-size:13px;border:1px solid #ccc;border-radius:4px}
+    .modal-comp-row{display:flex;gap:6px;align-items:center;margin-bottom:4px}
+    .modal-related{font-size:11px;color:#666;margin-top:6px;line-height:1.6}
+    .modal-related .pill{display:inline-block;background:#f0f0f0;padding:2px 8px;margin:2px;border-radius:3px}
+    .modal-error{color:#e74c3c;font-size:12px;margin:8px 0;min-height:1em}
+    .modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px;padding-top:12px;border-top:1px solid #eee}
   </style>
 </head>
 <body>
@@ -1427,6 +1438,7 @@ function renderRegisterPage(shippingRates) {
           <option value="0.08">8%（軽減）</option>
         </select>
         <button class="btn btn-p" onclick="searchManage()">検索</button>
+        <button id="m-sku-master-new-btn" class="btn btn-s" style="display:none" onclick="openSkuModal('new')">+ 新規登録</button>
       </div>
       <div class="scroll-area">
         <table><thead id="m-head"></thead><tbody id="m-body"></tbody></table>
@@ -1451,6 +1463,26 @@ function renderRegisterPage(shippingRates) {
         <button class="btn btn-s" id="csv-upload-btn" onclick="uploadCsv()">アップロード</button>
       </div>
       <div id="csv-result" class="meta"></div>
+    </div>
+  </div>
+
+  <!-- SKUマスタ 登録/編集モーダル -->
+  <div id="sku-modal-bg" class="modal-bg" onclick="if(event.target===this)closeSkuModal()">
+    <div class="modal">
+      <h3 id="sku-modal-title">SKUマスタ 新規登録</h3>
+      <label>seller_sku</label>
+      <input id="sku-modal-sku" placeholder="例: pr_1272115_f_20260207_29520089_0001" autocomplete="off">
+      <label>商品名 (社内独自表示名)</label>
+      <input id="sku-modal-name" placeholder="例: 男性用練り香水 LIFE BOOSTER" autocomplete="off">
+      <label>構成 (NE商品コード + 数量)</label>
+      <div id="sku-modal-comps"></div>
+      <button class="btn btn-s" style="font-size:11px;margin-top:6px" onclick="addModalRow()">+ 構成品を追加</button>
+      <div id="sku-modal-related" class="modal-related"></div>
+      <div id="sku-modal-error" class="modal-error"></div>
+      <div class="modal-actions">
+        <button class="btn" style="background:#bdc3c7" onclick="closeSkuModal()">キャンセル</button>
+        <button id="sku-modal-submit" class="btn btn-p" onclick="submitSkuModal()">登録</button>
+      </div>
     </div>
   </div>
 
@@ -1687,37 +1719,47 @@ function renderRegisterPage(shippingRates) {
             api('/api/m-sku-master/'+encodeURIComponent(sku)),
             api('/api/m-sku-master/'+encodeURIComponent(sku)+'/related').catch(e => { relatedError = e.message; return {items:[]}; }),
           ]);
-          const cols = tr.children.length;
+          const cols = Number(tr.children.length);
           const detailTr = document.createElement('tr');
           detailTr.className = 'sku-detail-row';
+          const compCount = Number(detail.components?.length || 0);
           let body = '<td colspan="'+cols+'" style="background:#f8f9fa;padding:10px 16px">';
-          body += '<div style="font-size:12px;color:#666;margin-bottom:6px">構成 ('+(detail.components?.length||0)+'件)</div>';
+          body += '<div style="font-size:12px;color:#666;margin-bottom:6px">構成 ('+compCount+'件)</div>';
           body += '<table style="width:auto;font-size:12px;margin-bottom:8px;border:1px solid #ddd">';
           body += '<thead><tr><th style="padding:4px 8px">NE商品コード</th><th style="padding:4px 8px">数量</th><th style="padding:4px 8px">NE側商品名</th><th style="padding:4px 8px">原価</th><th style="padding:4px 8px">状態</th></tr></thead><tbody>';
           for (const c of (detail.components||[])) {
             const statusColor = c.cost_status === 'ok' ? '#27ae60' : (c.cost_status === 'ne_missing' ? '#e74c3c' : '#f39c12');
+            const qty = Number(c.数量) > 0 ? Number(c.数量) : 1;
+            const tanka = c.単価 != null ? Number(c.単価) : null;
             body += '<tr><td style="padding:3px 8px;font-family:monospace">'+he(c.ne_code)+'</td>';
-            body += '<td style="padding:3px 8px;text-align:right">'+(c.数量||1)+'</td>';
+            body += '<td style="padding:3px 8px;text-align:right">'+qty+'</td>';
             body += '<td style="padding:3px 8px;color:#666">'+he((c.ne_title||'').slice(0,40))+'</td>';
-            body += '<td style="padding:3px 8px;text-align:right">'+(c.単価!=null?c.単価+'円':'-')+'</td>';
+            body += '<td style="padding:3px 8px;text-align:right">'+(tanka!=null?tanka+'円':'-')+'</td>';
             body += '<td style="padding:3px 8px;color:'+statusColor+';font-size:11px">'+he(c.cost_status||'')+'</td></tr>';
           }
           body += '</tbody></table>';
           if (relatedError) {
             body += '<div style="font-size:12px;color:#e74c3c;margin-bottom:4px">⚠️ 関連SKUの取得失敗: '+he(relatedError)+'</div>';
           } else if (related.items?.length) {
-            body += '<div style="font-size:12px;color:#666;margin-bottom:4px">同じNEコードを持つ別SKU ('+related.items.length+'件)</div>';
+            const relCount = Number(related.items.length);
+            body += '<div style="font-size:12px;color:#666;margin-bottom:4px">同じNEコードを持つ別SKU ('+relCount+'件)</div>';
             body += '<div style="font-size:11px;line-height:1.6">';
             body += related.items.slice(0, 10).map(r => '<span style="display:inline-block;background:white;border:1px solid #ddd;padding:2px 8px;margin:2px;border-radius:3px"><code>'+he(r.seller_sku)+'</code> '+he((r.商品名||'').slice(0,25))+'</span>').join('');
-            if (related.items.length > 10) body += '<span style="color:#888">...他'+(related.items.length-10)+'件</span>';
+            if (relCount > 10) body += '<span style="color:#888">...他'+(relCount-10)+'件</span>';
             body += '</div>';
           }
           const m = detail.master || {};
-          body += '<div class="meta" style="margin-top:6px">商品名: <b>'+he(m.商品名||'')+'</b> / created='+he((m.created_at||'').slice(0,16))+' / updated='+he((m.updated_at||'').slice(0,16))+' / by='+he(m.updated_by||'-')+'</div>';
+          body += '<div class="meta" style="margin-top:6px;display:flex;align-items:center;gap:12px">';
+          body += '<span>商品名: <b>'+he(m.商品名||'')+'</b> / created='+he((m.created_at||'').slice(0,16))+' / updated='+he((m.updated_at||'').slice(0,16))+' / by='+he(m.updated_by||'-')+'</span>';
+          body += '<button class="btn btn-p" style="font-size:11px;padding:3px 10px" data-act="edit-sku-master" data-sku="'+he(sku)+'">編集</button>';
+          body += '</div>';
           body += '</td>';
           detailTr.innerHTML = body;
           tr.after(detailTr);
           btn.disabled = false; // 「再クリックで閉じる」を有効化
+        } else if (act === 'edit-sku-master') {
+          await openSkuModal('edit', sku);
+          btn.disabled = false;
         } else if (act === 'del') {
           if (!confirm(sku+' を削除しますか？')) { btn.disabled=false; return; }
           const type = btn.dataset.type;
@@ -1787,7 +1829,141 @@ function renderRegisterPage(shippingRates) {
       const rf = document.getElementById('m-rate-filter');
       if (cf) cf.style.display = type === 'sales_class' ? '' : 'none';
       if (rf) rf.style.display = type === 'tax_rate' ? '' : 'none';
+      const newBtn = document.getElementById('m-sku-master-new-btn');
+      if (newBtn) newBtn.style.display = type === 'm-sku-master' ? '' : 'none';
     }
+
+    // ── SKUマスタ 登録/編集モーダル ──
+    let skuModalMode = 'new';
+    let skuModalOriginalSku = '';
+    let skuModalRequestId = 0; // 非同期 race ガード: openSkuModal の度にインクリメント
+    function buildModalRow(neCode, qty) {
+      const safe = he(neCode || '');
+      const q = Number(qty) > 0 ? Number(qty) : 1;
+      return '<div class="modal-comp-row">'
+        + '<div class="suggest-wrap" style="flex:1"><input class="modal-ne" placeholder="NE商品コード" value="'+safe+'" data-suggest="1" autocomplete="off"><div class="suggest-list"></div></div>'
+        + '<input class="modal-qty" type="number" min="1" value="'+q+'" style="width:70px">'
+        + '<button class="btn btn-d" style="font-size:11px;padding:2px 8px" onclick="this.parentElement.remove()">×</button>'
+        + '</div>';
+    }
+    function addModalRow(neCode, qty) {
+      const c = document.getElementById('sku-modal-comps');
+      c.insertAdjacentHTML('beforeend', buildModalRow(neCode, qty));
+    }
+    function clearModal() {
+      document.getElementById('sku-modal-sku').value = '';
+      document.getElementById('sku-modal-name').value = '';
+      document.getElementById('sku-modal-comps').innerHTML = '';
+      document.getElementById('sku-modal-related').innerHTML = '';
+      document.getElementById('sku-modal-error').textContent = '';
+    }
+    async function openSkuModal(mode, sku) {
+      const reqId = ++skuModalRequestId;
+      skuModalMode = mode;
+      skuModalOriginalSku = sku || '';
+      clearModal();
+      document.getElementById('sku-modal-title').textContent =
+        mode === 'edit' ? 'SKUマスタ 編集: ' + (sku||'') : 'SKUマスタ 新規登録';
+      const submitBtn = document.getElementById('sku-modal-submit');
+      submitBtn.textContent = mode === 'edit' ? '更新' : '登録';
+      const skuInput = document.getElementById('sku-modal-sku');
+      skuInput.disabled = mode === 'edit';
+      document.getElementById('sku-modal-bg').classList.add('show');
+      if (mode === 'edit') {
+        skuInput.value = sku || '';
+        // 編集モードは読み込み失敗時の事故防止のため初期 disable、成功時のみ enable
+        submitBtn.disabled = true;
+        try {
+          const [detail, related] = await Promise.all([
+            api('/api/m-sku-master/'+encodeURIComponent(sku)),
+            api('/api/m-sku-master/'+encodeURIComponent(sku)+'/related').catch(()=>({items:[]})),
+          ]);
+          // stale ガード: openSkuModal が再呼び出しされてたら結果を捨てる
+          if (reqId !== skuModalRequestId) return;
+          document.getElementById('sku-modal-name').value = detail.master?.商品名 || '';
+          for (const c of (detail.components || [])) addModalRow(c.ne_code, c.数量);
+          renderModalRelated(related.items || []);
+          submitBtn.disabled = false;
+        } catch (e) {
+          if (reqId !== skuModalRequestId) return;
+          document.getElementById('sku-modal-error').textContent = '読み込み失敗 (更新は無効): ' + e.message;
+          // submit は disable のまま、誤上書き防止
+        }
+      } else {
+        submitBtn.disabled = false;
+        addModalRow('', 1);
+        skuInput.focus();
+      }
+    }
+    function closeSkuModal() {
+      // race ガード: closeした瞬間以降に到着するレスポンスは無効化
+      skuModalRequestId++;
+      document.getElementById('sku-modal-bg').classList.remove('show');
+    }
+    function renderModalRelated(items) {
+      const el = document.getElementById('sku-modal-related');
+      const n = Number(items?.length || 0);
+      if (!n) { el.innerHTML = ''; return; }
+      const head = '<div style="font-size:11px;color:#666;margin-top:8px">同じNEコードを持つ既存SKU ('+n+'件、商品名の参考に):</div>';
+      const pills = items.slice(0, 10).map(r =>
+        '<span class="pill"><code>'+he(r.seller_sku)+'</code> '+he((r.商品名||'').slice(0,25))+'</span>'
+      ).join('');
+      const tail = n > 10 ? '<span style="color:#888">...他'+(n-10)+'件</span>' : '';
+      el.innerHTML = head + '<div>' + pills + tail + '</div>';
+    }
+    async function submitSkuModal() {
+      const errEl = document.getElementById('sku-modal-error');
+      errEl.textContent = '';
+      const sku = (document.getElementById('sku-modal-sku').value || '').trim().toLowerCase();
+      const name = document.getElementById('sku-modal-name').value.trim();
+      const compRows = document.querySelectorAll('#sku-modal-comps .modal-comp-row');
+      const components = [];
+      const seenNe = new Set();
+      for (const row of compRows) {
+        const ne = (row.querySelector('.modal-ne').value || '').trim().toLowerCase();
+        const qty = Number(row.querySelector('.modal-qty').value);
+        if (!ne) continue;
+        if (seenNe.has(ne)) { errEl.textContent = 'NE商品コードが重複: ' + ne; return; }
+        if (!Number.isInteger(qty) || qty <= 0) { errEl.textContent = '数量が不正 (1以上の整数): ' + ne; return; }
+        seenNe.add(ne);
+        components.push({ ne_code: ne, 数量: qty });
+      }
+      if (!sku) { errEl.textContent = 'seller_sku は必須'; return; }
+      if (!name) { errEl.textContent = '商品名 は必須'; return; }
+      if (components.length === 0) { errEl.textContent = '構成は1件以上必要'; return; }
+
+      const submitBtn = document.getElementById('sku-modal-submit');
+      submitBtn.disabled = true;
+      const reqId = skuModalRequestId; // submit 側 stale ガード: 完了時に reqId が変わってたら他モーダルを触らない
+      try {
+        if (skuModalMode === 'edit') {
+          await api('/api/m-sku-master/'+encodeURIComponent(skuModalOriginalSku), {
+            method:'PUT',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({ 商品名: name, components })
+          });
+          if (reqId !== skuModalRequestId) return; // 既に閉じられている / 別モーダル開かれた
+          toast(skuModalOriginalSku + ' を更新');
+        } else {
+          await api('/api/m-sku-master', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({ seller_sku: sku, 商品名: name, components })
+          });
+          if (reqId !== skuModalRequestId) return;
+          toast(sku + ' を登録');
+        }
+        closeSkuModal();
+        if (curManage === 'm-sku-master') searchManage();
+      } catch (e) {
+        if (reqId !== skuModalRequestId) return; // 別モーダルへエラー表示しない
+        errEl.textContent = e.message || '送信失敗';
+      } finally {
+        // 自モーダルが現役のときだけボタン状態を戻す（別モーダルのボタン状態を上書きしない）
+        if (reqId === skuModalRequestId) submitBtn.disabled = false;
+      }
+    }
+
     function classOptions(selected) {
       const labels = { '1': '1: 自社商品', '2': '2: 取扱限定', '3': '3: 仕入れ', '4': '4: 輸出' };
       return Object.keys(labels).map(v => '<option value="'+v+'"'+(String(selected)===v?' selected':'')+'>'+labels[v]+'</option>').join('');
@@ -1852,7 +2028,7 @@ function renderRegisterPage(shippingRates) {
           const upd = (r.updated_at || '').slice(0, 10);
           html += '<tr data-sku-row="'+he(r.seller_sku)+'"><td style="font-family:monospace;font-size:12px">'+he(r.seller_sku)+'</td>';
           html += '<td>'+he((r.商品名||'').slice(0,40))+'</td>';
-          html += '<td style="text-align:center">'+(r.構成数||0)+'</td>';
+          html += '<td style="text-align:center">'+Number(r.構成数||0)+'</td>';
           html += '<td style="font-size:11px;color:#888">'+he(upd)+'</td>';
           html += '<td><button class="btn btn-p" data-act="show-sku-detail" data-sku="'+he(r.seller_sku)+'">詳細</button> <button class="btn btn-d" data-act="del" data-type="m-sku-master" data-sku="'+he(r.seller_sku)+'">削除</button></td></tr>';
         }
