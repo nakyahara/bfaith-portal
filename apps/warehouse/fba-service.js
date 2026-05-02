@@ -15,6 +15,7 @@ import { createJob } from './job-manager.js';
 
 // --- 既存FBAモジュール ---
 import { fetchAllReports, normalizePlanningRow, normalizeRestockRow } from '../fba-replenishment/sp-api-reports.js';
+import { acquireFbaFetchLock, releaseFbaFetchLock } from './fba-fetch-lock.js';
 import {
   createInboundPlan as spCreateInboundPlan,
   listShipments,
@@ -60,15 +61,24 @@ function dbHandler(fn) {
 let fetchReportsJobId = null;
 
 router.post('/fetch-reports', rateLimitMiddleware('sp-api'), async (req, res) => {
-  // 二重実行防止: 実行中のジョブがあればそのjobIdを返す
+  // プロセス内: 同一 WarehouseServer プロセスでのジョブ重複防止
   if (fetchReportsJobId) {
     const { getJob } = await import('./job-manager.js');
     const existing = getJob(fetchReportsJobId);
     if (existing && existing.status === 'running') {
       return okResponse(res, { jobId: fetchReportsJobId, status: 'already_running', message: 'レポート取得が既に実行中です' }, 202);
     }
-    // 完了済みならリセット
     fetchReportsJobId = null;
+  }
+
+  // プロセス跨ぎ: cron (snapshot-fba-stock.js) と排他。lockfile が他プロセスで保持中なら拒否
+  const lock = acquireFbaFetchLock('manual');
+  if (!lock.acquired) {
+    return okResponse(res, {
+      status: 'already_running',
+      message: '別プロセスでレポート取得中です (cron や別セッションの可能性)。完了を待ってください。',
+      holder: lock.holder,
+    }, 202);
   }
 
   const job = createJob('fba-fetch-reports', async (updateProgress) => {
@@ -136,6 +146,8 @@ router.post('/fetch-reports', rateLimitMiddleware('sp-api'), async (req, res) =>
       };
     } finally {
       fetchReportsJobId = null;
+      // lock オブジェクト全体を渡して所有権 (ownerToken) チェックを有効化
+      releaseFbaFetchLock(lock);
     }
   });
 
