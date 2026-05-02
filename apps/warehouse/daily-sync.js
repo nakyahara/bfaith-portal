@@ -56,16 +56,34 @@ function runScript(scriptPath, label, timeoutMs = 600000) {
   }
 }
 
+/** Date を JST (UTC+9) の YYYY-MM-DD に変換 */
+function toJstDate(d) {
+  const jst = new Date(d.getTime() + 9 * 60 * 60 * 1000);
+  return jst.toISOString().slice(0, 10);
+}
+
 async function main() {
   const startTime = new Date();
-  const dateStr = startTime.toISOString().slice(0, 10);
-  console.log(`[DailySync] 開始: ${startTime.toISOString()}`);
+  // JST 固定の業務日付。子プロセスへ env で引き回す (UTC癖回避)
+  const businessDate = toJstDate(startTime);
+  process.env.WAREHOUSE_BUSINESS_DATE = businessDate;
+  const dateStr = businessDate;
+  console.log(`[DailySync] 開始: ${startTime.toISOString()} (business_date=${businessDate})`);
 
   const results = [];
 
   // NE API（商品マスタ + セット商品 + 受注7日分）
   const neResult = runScript('apps/warehouse/ne-api.js sync', 'NE API');
   results.push({ name: 'NE', ...neResult });
+
+  // NE 取得成功直後に raw_ne_products → ne_stock_daily_snapshot へ複製 (履歴化)
+  // ここで失敗しても後続は続ける (snapshot は付加的、欠損日は翌日また取れる)
+  if (neResult.success) {
+    const snapResult = runScript('apps/warehouse/snapshot-ne-stock.js', 'NE在庫スナップショット', 60000);
+    results.push({ name: 'NE在庫snapshot', ...snapResult });
+  } else {
+    console.log('[DailySync] NE API 失敗のため在庫スナップショットをスキップ');
+  }
 
   // SP-API
   const spResult = runScript('apps/warehouse/sp-api-orders.js', 'Amazon SP-API');
