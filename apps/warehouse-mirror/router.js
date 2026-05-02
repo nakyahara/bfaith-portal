@@ -145,6 +145,37 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
       log.push(`sku_resolved: ${resolved.length}件`);
     }
 
+    // inv_daily_summary（全件置換、PR-C 日次在庫スナップショット）
+    if (req.body.inv_daily_summary && Array.isArray(req.body.inv_daily_summary)) {
+      const rows = req.body.inv_daily_summary;
+      const tx = db.transaction(() => {
+        db.exec('DELETE FROM mirror_inv_daily_summary');
+        const stmt = db.prepare(`INSERT INTO mirror_inv_daily_summary (
+          business_date, market, category, total_qty, total_value,
+          resolved_count, unresolved_count, cost_missing_count,
+          source_status, source_row_count, captured_at, synced_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`);
+        for (const r of rows) {
+          stmt.run(
+            r.business_date,
+            r.market || 'jp',
+            r.category,
+            r.total_qty ?? 0,
+            r.total_value ?? null,
+            r.resolved_count ?? 0,
+            r.unresolved_count ?? 0,
+            r.cost_missing_count ?? 0,
+            r.source_status,
+            r.source_row_count ?? null,
+            r.captured_at ?? null,
+            now
+          );
+        }
+      });
+      tx();
+      log.push(`inv_daily_summary: ${rows.length}件`);
+    }
+
     // rakuten_sku_map（全件置換）
     if (req.body.rakuten_sku_map && req.body.rakuten_sku_map.length > 0) {
       const rskmData = req.body.rakuten_sku_map;
@@ -333,6 +364,18 @@ router.get('/api/status', (req, res) => {
       status.sku_resolved_auto_count = r.auto_cnt ?? 0;
     } catch {
       status.sku_resolved_count = 0;
+    }
+
+    // inv_daily_summary (PR-C 日次在庫スナップショット)
+    try {
+      const r = db.prepare(`
+        SELECT COUNT(*) AS cnt, MAX(business_date) AS latest_date
+        FROM mirror_inv_daily_summary
+      `).get();
+      status.inv_daily_summary_count = r.cnt;
+      status.inv_daily_summary_latest_date = r.latest_date;
+    } catch {
+      status.inv_daily_summary_count = 0;
     }
   } catch {}
   res.json(status);
