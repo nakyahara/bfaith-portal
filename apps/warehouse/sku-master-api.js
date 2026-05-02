@@ -217,7 +217,7 @@ export function mountSkuMasterApi(router) {
     const existing = db.prepare('SELECT 1 FROM m_sku_master WHERE seller_sku = ?').get(sku);
     if (!existing) return res.status(404).json({ error: 'not found' });
 
-    db.prepare('DELETE FROM m_sku_master WHERE seller_sku = ?').run(sku);
-    res.status(204).end();
+    const result = db.prepare('DELETE FROM m_sku_master WHERE seller_sku = ?').run(sku);
+    res.json({ ok: true, deleted: result.changes });
   });
 }
