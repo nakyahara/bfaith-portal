@@ -416,8 +416,13 @@ router.post('/aggregate', upload.fields([
     const usFbaRows = usFbaBuf ? parseRestockReport(usFbaBuf) : null;
     const usFbaAmount = usFbaRows ? 0 : (Number(req.body.us_fba_amount) || 0);
 
-    const suppliers = [].concat(req.body['pending_supplier[]'] || []);
-    const amounts = [].concat(req.body['pending_amount[]'] || []);
+    // multer (append-field) は HTML name="pending_supplier[]" を見ると
+    // 末尾の `[]` を「配列appendマーカー」として解釈し、req.body には
+    // 角括弧なしの `pending_supplier` キーで配列として格納する。
+    // 旧実装は `req.body['pending_supplier[]']` を読んでいて常にundefinedとなり、
+    // 発注後未着の入力が無言で 0 円扱いされる事故を起こしていた。
+    const suppliers = [].concat(req.body.pending_supplier || []);
+    const amounts = [].concat(req.body.pending_amount || []);
     const pendingRows = suppliers
       .map((s, i) => ({ supplier_name: (s || '').trim(), amount: Number(amounts[i]) || 0 }))
       .filter(p => p.supplier_name && p.amount > 0);
