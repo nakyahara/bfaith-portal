@@ -1831,6 +1831,8 @@ function renderRegisterPage(shippingRates) {
       if (rf) rf.style.display = type === 'tax_rate' ? '' : 'none';
       const newBtn = document.getElementById('m-sku-master-new-btn');
       if (newBtn) newBtn.style.display = type === 'm-sku-master' ? '' : 'none';
+      // m-sku-master タブを選んだ瞬間に登録済みリストを自動表示
+      if (type === 'm-sku-master') searchManage();
     }
 
     // ── SKUマスタ 登録/編集モーダル ──
