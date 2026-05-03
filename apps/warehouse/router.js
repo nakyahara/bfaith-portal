@@ -2204,7 +2204,7 @@ function renderDashboard(stats) {
         <div class="tab-nav" id="missing-tabs">
           <button class="active" onclick="loadMissing('shipping', this)">送料未登録 (<span id="mc-shipping">...</span>)</button>
           <button onclick="loadMissing('genka', this)">原価未登録 (<span id="mc-genka">...</span>)</button>
-          <button onclick="loadMissing('sku_map', this)">SKU未登録 (<span id="mc-sku">...</span>)</button>
+          <!-- SKU未登録は SKUマスタ画面 (/register) で対応 (SKU管理統合 Step 3) -->
         </div>
         <div id="missing-list"></div>
       </div>
@@ -2217,7 +2217,7 @@ function renderDashboard(stats) {
         <div class="tab-nav">
           <button class="active" onclick="loadManage('shipping', this)">送料マスタ (${stats.product_shipping||0})</button>
           <button onclick="loadManage('genka', this)">特殊原価 (${stats.exception_genka||0})</button>
-          <button onclick="loadManage('skumap', this)">SKUマップ (${stats.sku_map||0})</button>
+          <!-- SKUマップタブは SKU管理統合 Step 3 で削除 (SKUマスタは /register 画面で管理) -->
         </div>
         <div class="form-row">
           <input id="manage-search" placeholder="商品コード or 商品名で検索" style="width:300px">
@@ -2299,7 +2299,11 @@ function renderDashboard(stats) {
 
     async function api(path, opts) {
       const res = await fetch(BASE + path, opts);
-      return res.json();
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.error || ('HTTP ' + res.status));
+      }
+      return data;
     }
 
     // イベント委譲（data属性でパラメータを渡す。onclickの文字列エスケープ問題を根本解決）
@@ -2325,11 +2329,9 @@ function renderDashboard(stats) {
         toast(sku + ' の原価を登録しました');
         loadMissing(currentMissingType);
       } else if (action === 'reg-skumap') {
-        const inp = btn.closest('tr')?.querySelector('input');
-        if (!inp || !inp.value) return;
-        await api('/api/skumap', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ seller_sku: sku, ne_code: inp.value, product_name: name }) });
-        toast(sku + ' のSKUマップを登録しました');
-        loadMissing(currentMissingType);
+        // SKU管理統合 Step 3: SKUマスタ画面 (/register) に誘導
+        toast('SKU登録は「マスタ登録画面」のSKUマスタタブを使ってください');
+        return;
       } else if (action === 'update-shipping') {
         const sel = btn.closest('tr')?.querySelector('select');
         if (!sel) return;
@@ -2344,22 +2346,17 @@ function renderDashboard(stats) {
         toast(sku + ' の原価を更新しました');
         loadManage(currentManageType);
       } else if (action === 'update-skumap') {
-        const inputs = btn.closest('tr')?.querySelectorAll('input');
-        if (!inputs || inputs.length < 2) return;
-        const oldNe = btn.dataset.ne || '';
-        // 古いレコードを削除してから新しいのを挿入（ne_codeが変わる可能性）
-        if (oldNe && oldNe !== inputs[0].value) {
-          await api('/api/skumap/' + encodeURIComponent(sku) + '?ne_code=' + encodeURIComponent(oldNe), { method: 'DELETE' });
-        }
-        await api('/api/skumap', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ seller_sku: sku, ne_code: inputs[0].value, product_name: name, quantity: inputs[1].value }) });
-        toast(sku + ' のSKUマップを更新しました');
-        loadManage(currentManageType);
+        // SKU管理統合 Step 3: SKUマスタ画面 (/register) に誘導
+        toast('SKU編集は「マスタ登録画面」のSKUマスタタブを使ってください');
+        return;
       } else if (action === 'delete') {
         if (!confirm(sku + ' を削除しますか？')) return;
-        const ne = btn.dataset.ne || '';
-        let endpoint = type === 'shipping' ? '/api/shipping/' : type === 'genka' ? '/api/genka/' : '/api/skumap/';
-        let url = endpoint + encodeURIComponent(sku);
-        if (type === 'skumap' && ne) url += '?ne_code=' + encodeURIComponent(ne);
+        if (type === 'skumap') {
+          toast('SKU削除は「マスタ登録画面」のSKUマスタタブを使ってください');
+          return;
+        }
+        const endpoint = type === 'shipping' ? '/api/shipping/' : '/api/genka/';
+        const url = endpoint + encodeURIComponent(sku);
         await api(url, { method: 'DELETE' });
         toast(sku + ' を削除しました');
         loadManage(currentManageType);
