@@ -621,6 +621,7 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_fsl_item ON f_sales_by_listing(モール商品コード)');
 
   // 18. f_sales_by_product（NE商品コード単位・全モール横断の日次集計、縦持ち）
+  // 売上金額: 単品(直接販売)は元の販売金額、セット経由分はセット販売金額を構成数比で按分
   db.exec(`CREATE TABLE IF NOT EXISTS f_sales_by_product (
     日付              TEXT NOT NULL,
     商品コード        TEXT NOT NULL,
@@ -629,9 +630,17 @@ function createTables() {
     数量              INTEGER NOT NULL DEFAULT 0,
     直接販売数        INTEGER DEFAULT 0,
     セット経由数      INTEGER DEFAULT 0,
+    売上金額          REAL,
     updated_at        TEXT NOT NULL,
     PRIMARY KEY (日付, 商品コード, モール)
   )`);
+  // マイグレーション: 既存テーブルに 売上金額 列がなければ追加
+  try {
+    const fspCols = db.prepare('PRAGMA table_info(f_sales_by_product)').all().map(c => c.name);
+    if (!fspCols.includes('売上金額')) {
+      db.exec('ALTER TABLE f_sales_by_product ADD COLUMN 売上金額 REAL');
+    }
+  } catch {}
   db.exec('CREATE INDEX IF NOT EXISTS idx_fsp_month ON f_sales_by_product(SUBSTR(日付, 1, 7))');
   db.exec('CREATE INDEX IF NOT EXISTS idx_fsp_sku ON f_sales_by_product(商品コード)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_fsp_mall ON f_sales_by_product(モール)');
