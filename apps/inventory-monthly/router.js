@@ -501,6 +501,32 @@ const HISTORICAL_MONTHLY_TOTALS = [
   ['2026-03-31', 27665214, 5575553,  175396635, 699100,  5251184],
 ];
 
+// GET: 確認ページ (ボタン付き)。ブラウザで直接開いて実行できる。
+router.get('/admin/import-historical', (req, res) => {
+  if (!ensureDbOrFailHtml(res)) return;
+  const db = getDB();
+  const placeholders = HISTORICAL_MONTHLY_TOTALS.map(() => '?').join(',');
+  const existing = db.prepare(
+    `SELECT snapshot_date FROM inv_snapshot WHERE snapshot_date IN (${placeholders})`
+  ).all(...HISTORICAL_MONTHLY_TOTALS.map(([d]) => d));
+  const existingDates = new Set(existing.map(r => r.snapshot_date));
+  const pendingList = HISTORICAL_MONTHLY_TOTALS.filter(([d]) => !existingDates.has(d));
+  res.send(renderLayout('過去履歴インポート', `
+<h2>過去22ヶ月分の月末在庫データを inv_snapshot に投入</h2>
+<div class="card">
+  <p><b>対象</b>: ${HISTORICAL_MONTHLY_TOTALS.length}ヶ月 (2024-06 〜 2026-03)</p>
+  <p><b>既存</b>: ${existing.length}件 (skip)</p>
+  <p><b>投入予定</b>: ${pendingList.length}件</p>
+</div>
+${pendingList.length === 0 ? '<div class="warn">既に全データ投入済み。実行しても skip されるだけ。</div>' : `
+<form method="POST" action="admin/import-historical">
+  <button type="submit">${pendingList.length}件を投入する</button>
+</form>
+`}
+<p><a href="history">← 履歴ページへ</a></p>
+  `));
+});
+
 router.post('/admin/import-historical', (req, res) => {
   if (!ensureDbOrFail(res)) return;
   const db = getDB();
@@ -528,6 +554,19 @@ router.post('/admin/import-historical', (req, res) => {
     }
   });
   tx();
+
+  // ブラウザ form submit (HTML 期待) なら結果ページを描画。API 呼び出し (JSON Accept) なら JSON。
+  if (req.accepts(['html', 'json']) === 'html') {
+    return res.send(renderLayout('過去履歴インポート - 完了', `
+<div class="card" style="background:#d1e7dd;border-color:#a3cfbb">
+  <h2>✅ 完了</h2>
+  <p><b>新規投入</b>: ${inserted}件</p>
+  <p><b>スキップ</b> (既存): ${skipped.length}件</p>
+  <p><b>合計対象</b>: ${HISTORICAL_MONTHLY_TOTALS.length}件</p>
+</div>
+<p><a href="history">→ 履歴ページで確認</a></p>
+    `));
+  }
   res.json({ ok: true, inserted, skipped, total: HISTORICAL_MONTHLY_TOTALS.length });
 });
 
