@@ -241,6 +241,33 @@ export async function initDb() {
     db.run('ALTER TABLE daily_snapshots ADD COLUMN fba_unfulfillable INTEGER DEFAULT 0');
   }
 
+  // --- US用 daily_snapshots (NA リージョン、JP テーブルとの SKU衝突回避のため別テーブル) ---
+  db.run(`
+    CREATE TABLE IF NOT EXISTS daily_snapshots_us (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      snapshot_date TEXT NOT NULL,
+      amazon_sku TEXT NOT NULL,
+      product_name TEXT,
+      fba_available INTEGER DEFAULT 0,
+      fba_inbound_working INTEGER DEFAULT 0,
+      fba_inbound_shipped INTEGER DEFAULT 0,
+      fba_inbound_received INTEGER DEFAULT 0,
+      fba_fc_transfer INTEGER DEFAULT 0,
+      fba_fc_processing INTEGER DEFAULT 0,
+      fba_customer_order INTEGER DEFAULT 0,
+      fba_unfulfillable INTEGER DEFAULT 0,
+      working_first_seen TEXT,
+      days_of_supply REAL,
+      units_sold_7d INTEGER DEFAULT 0,
+      units_sold_30d INTEGER DEFAULT 0,
+      sales_rank INTEGER,
+      your_price REAL,
+      featured_offer_price REAL,
+      UNIQUE(snapshot_date, amazon_sku)
+    )
+  `);
+  db.run('CREATE INDEX IF NOT EXISTS idx_dailysnap_us_date ON daily_snapshots_us(snapshot_date)');
+
   // --- 8. non_fba_sales_snapshots: 他CH売上の日次スナップショット（60日保持） ---
   db.run(`
     CREATE TABLE IF NOT EXISTS non_fba_sales_snapshots (
@@ -700,6 +727,94 @@ export function savePlanningDataWithHistory(rows, snapshotDate) {
     db.run('COMMIT');
     saveToFile();
     return rows.length;
+  } catch (e) {
+    db.run('ROLLBACK');
+    throw e;
+  }
+}
+
+/**
+ * US 専用 daily_snapshots_us への UPSERT
+ * planning rows と restock rows をマージして1回で書き込み (シンプル統合版)
+ * RESTOCK が source of truth (4列在庫合算)、PLANNING は補助 (sales/price/days_of_supply)
+ *
+ * @param {object} params
+ * @param {Array} params.planningRows - normalizePlanningRow 後の配列
+ * @param {Array} params.restockRows - normalizeRestockRow 後の配列
+ * @param {string} params.snapshotDate - YYYY-MM-DD (JST)
+ */
+export function saveUsDailySnapshots({ planningRows = [], restockRows = [], snapshotDate }) {
+  const today = snapshotDate || new Date().toISOString().slice(0, 10);
+
+  // RESTOCK を主軸 (在庫7列の source of truth)
+  // PLANNING を sales/price 補完用に Map化
+  const planningMap = new Map(planningRows.map(r => [(r.sku || '').toLowerCase(), r]));
+
+  // RESTOCK ベースで全 SKU リスト (RESTOCK にない PLANNING-only SKU は別途処理)
+  const restockMap = new Map(restockRows.map(r => [(r.amazon_sku || '').toLowerCase(), r]));
+  const allSkus = new Set([...restockMap.keys(), ...planningMap.keys()]);
+
+  let inserted = 0, updated = 0;
+  db.run('BEGIN TRANSACTION');
+  try {
+    for (const sku of allSkus) {
+      if (!sku) continue;
+      const r = restockMap.get(sku) || {};
+      const p = planningMap.get(sku) || {};
+      const existing = queryOne('SELECT id FROM daily_snapshots_us WHERE snapshot_date = ? AND amazon_sku = ?', [today, sku]);
+
+      const productName = r.product_name || p.product_name || '';
+      const fbaAvailable = r.fba_available ?? p.fba_available ?? 0;
+      const inboundWorking = r.fba_inbound_working ?? p.fba_inbound_working ?? 0;
+      const inboundShipped = r.fba_inbound_shipped ?? p.fba_inbound_shipped ?? 0;
+      const inboundReceived = r.fba_inbound_received ?? p.fba_inbound_received ?? 0;
+      const fcTransfer = r.fba_fc_transfer ?? 0;
+      const fcProcessing = r.fba_fc_processing ?? 0;
+      const customerOrder = r.fba_customer_order ?? 0;
+      const unfulfillable = r.fba_unfulfillable ?? p.fba_unfulfillable ?? 0;
+      const dos = p.days_of_supply ?? null;
+      const sold7d = p.units_sold_7d ?? 0;
+      const sold30d = p.units_sold_30d ?? r.units_sold_30d ?? 0;
+      const salesRank = p.sales_rank ?? null;
+      const yourPrice = p.your_price ?? null;
+      const featuredPrice = p.featured_offer_price ?? null;
+
+      if (existing) {
+        db.run(`
+          UPDATE daily_snapshots_us SET
+            product_name=?, fba_available=?, fba_inbound_working=?, fba_inbound_shipped=?, fba_inbound_received=?,
+            fba_fc_transfer=?, fba_fc_processing=?, fba_customer_order=?, fba_unfulfillable=?,
+            days_of_supply=?, units_sold_7d=?, units_sold_30d=?,
+            sales_rank=?, your_price=?, featured_offer_price=?
+          WHERE snapshot_date = ? AND amazon_sku = ?
+        `, [
+          productName, fbaAvailable, inboundWorking, inboundShipped, inboundReceived,
+          fcTransfer, fcProcessing, customerOrder, unfulfillable,
+          dos, sold7d, sold30d, salesRank, yourPrice, featuredPrice,
+          today, sku,
+        ]);
+        updated++;
+      } else {
+        db.run(`
+          INSERT INTO daily_snapshots_us
+            (snapshot_date, amazon_sku, product_name,
+             fba_available, fba_inbound_working, fba_inbound_shipped, fba_inbound_received,
+             fba_fc_transfer, fba_fc_processing, fba_customer_order, fba_unfulfillable,
+             days_of_supply, units_sold_7d, units_sold_30d,
+             sales_rank, your_price, featured_offer_price)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, [
+          today, sku, productName,
+          fbaAvailable, inboundWorking, inboundShipped, inboundReceived,
+          fcTransfer, fcProcessing, customerOrder, unfulfillable,
+          dos, sold7d, sold30d, salesRank, yourPrice, featuredPrice,
+        ]);
+        inserted++;
+      }
+    }
+    db.run('COMMIT');
+    saveToFile();
+    return { inserted, updated };
   } catch (e) {
     db.run('ROLLBACK');
     throw e;

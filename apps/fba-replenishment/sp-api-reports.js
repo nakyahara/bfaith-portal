@@ -10,25 +10,51 @@ import SellingPartner from 'amazon-sp-api';
 import iconv from 'iconv-lite';
 import { gunzipSync } from 'zlib';
 
-let spClient = null;
+/**
+ * Marketplace 設定取得 (環境変数から構築)
+ * @param {'jp'|'us'} market - 'jp' (FE region) | 'us' (NA region)
+ * @returns {{region, refresh_token, client_id, client_secret, marketplace_id, market}}
+ */
+export function getMarketplaceContext(market = 'jp') {
+  if (market === 'us') {
+    return {
+      market: 'us',
+      region: 'na',
+      refresh_token: process.env.SP_API_REFRESH_TOKEN_US,
+      client_id: process.env.SP_API_CLIENT_ID_US,
+      client_secret: process.env.SP_API_CLIENT_SECRET_US,
+      marketplace_id: process.env.SP_API_MARKETPLACE_ID_US || 'ATVPDKIKX0DER',
+    };
+  }
+  // default: JP (FE region)
+  return {
+    market: 'jp',
+    region: 'fe',
+    refresh_token: process.env.SP_API_REFRESH_TOKEN,
+    client_id: process.env.SP_API_CLIENT_ID,
+    client_secret: process.env.SP_API_CLIENT_SECRET,
+    marketplace_id: process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528',
+  };
+}
 
-function getClient() {
-  if (!spClient) {
-    spClient = new SellingPartner({
-      region: 'fe',
-      refresh_token: process.env.SP_API_REFRESH_TOKEN,
+// クライアントを market 別にキャッシュ
+const spClients = new Map();
+function getClient(ctx) {
+  const key = ctx.market;
+  if (!spClients.has(key)) {
+    spClients.set(key, new SellingPartner({
+      region: ctx.region,
+      refresh_token: ctx.refresh_token,
       credentials: {
-        SELLING_PARTNER_APP_CLIENT_ID: process.env.SP_API_CLIENT_ID,
-        SELLING_PARTNER_APP_CLIENT_SECRET: process.env.SP_API_CLIENT_SECRET,
+        SELLING_PARTNER_APP_CLIENT_ID: ctx.client_id,
+        SELLING_PARTNER_APP_CLIENT_SECRET: ctx.client_secret,
         AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID,
         AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY,
       },
-    });
+    }));
   }
-  return spClient;
+  return spClients.get(key);
 }
-
-const MARKETPLACE_ID = () => process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -45,10 +71,14 @@ function withTimeout(promise, ms, label = '') {
 
 /**
  * レポートをリクエスト → ポーリング → ダウンロード → TSV解析
+ * @param {string} reportType
+ * @param {object} options - { ctx?: marketplaceContext, ... }
  */
 async function fetchReport(reportType, options = {}) {
-  const sp = getClient();
-  const body = { reportType, marketplaceIds: [MARKETPLACE_ID()], ...options };
+  const ctx = options.ctx || getMarketplaceContext('jp');
+  const sp = getClient(ctx);
+  const { ctx: _, ...restOptions } = options; // ctx を Body から除外
+  const body = { reportType, marketplaceIds: [ctx.marketplace_id], ...restOptions };
 
   // レポート作成（60秒タイムアウト）
   const createResult = await withTimeout(
@@ -125,27 +155,30 @@ function parseTsv(text) {
 // ======================================================
 // レポート1: FBA在庫計画データ（85列、メインデータソース）
 // ======================================================
-export async function fetchPlanningData() {
-  console.log('[SP-API] FBA在庫計画データを取得中...');
-  const rows = await fetchReport('GET_FBA_INVENTORY_PLANNING_DATA');
-  console.log(`[SP-API] FBA在庫計画: ${rows.length}件取得`);
+export async function fetchPlanningData(ctx) {
+  const market = ctx?.market || 'jp';
+  console.log(`[SP-API:${market}] FBA在庫計画データを取得中...`);
+  const rows = await fetchReport('GET_FBA_INVENTORY_PLANNING_DATA', { ctx });
+  console.log(`[SP-API:${market}] FBA在庫計画: ${rows.length}件取得`);
   return rows;
 }
 
 // ======================================================
 // レポート2: 発注推奨レポート（28列）
 // ======================================================
-export async function fetchRestockRecommendations() {
-  console.log('[SP-API] 発注推奨レポートを取得中...');
-  const rows = await fetchReport('GET_RESTOCK_INVENTORY_RECOMMENDATIONS_REPORT');
-  console.log(`[SP-API] 発注推奨: ${rows.length}件取得`);
+export async function fetchRestockRecommendations(ctx) {
+  const market = ctx?.market || 'jp';
+  console.log(`[SP-API:${market}] 発注推奨レポートを取得中...`);
+  const rows = await fetchReport('GET_RESTOCK_INVENTORY_RECOMMENDATIONS_REPORT', { ctx });
+  console.log(`[SP-API:${market}] 発注推奨: ${rows.length}件取得`);
   return rows;
 }
 
 // ======================================================
 // レポート3: FBA在庫内訳（全SKU、22列）
 // ======================================================
-export async function fetchFbaInventory() {
+export async function fetchFbaInventory(ctx) {
+  const market = ctx?.market || 'jp';
   // ALL_INVENTORY_DATAがFATALになることがあるのでフォールバック付き
   const reportTypes = [
     'GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA',
@@ -153,12 +186,12 @@ export async function fetchFbaInventory() {
   ];
   for (const reportType of reportTypes) {
     try {
-      console.log(`[SP-API] FBA在庫内訳を取得中... (${reportType})`);
-      const rows = await fetchReport(reportType);
-      console.log(`[SP-API] FBA在庫内訳: ${rows.length}件取得 (${reportType})`);
+      console.log(`[SP-API:${market}] FBA在庫内訳を取得中... (${reportType})`);
+      const rows = await fetchReport(reportType, { ctx });
+      console.log(`[SP-API:${market}] FBA在庫内訳: ${rows.length}件取得 (${reportType})`);
       return rows;
     } catch (e) {
-      console.error(`[SP-API] ${reportType} 失敗: ${e.message}、次のレポートを試行`);
+      console.error(`[SP-API:${market}] ${reportType} 失敗: ${e.message}、次のレポートを試行`);
     }
   }
   throw new Error('FBA在庫内訳: すべてのレポートタイプが失敗');
@@ -168,15 +201,18 @@ export async function fetchFbaInventory() {
 // 全レポートまとめて取得
 // ======================================================
 // INVENTORY レポートは RESTOCK の部分集合で冗長 + 未使用のため取得停止
-export async function fetchAllReports() {
-  const results = { planning: null, restock: null, inventory: null, errors: [] };
+// ctx 省略時は JP (後方互換)
+export async function fetchAllReports(ctx) {
+  const _ctx = ctx || getMarketplaceContext('jp');
+  const market = _ctx.market;
+  const results = { planning: null, restock: null, inventory: null, errors: [], market };
 
   // 順次実行（SP-APIのcreateReport競合を完全に回避）
-  console.log('[SP-API] RESTOCK + PLANNING を順次取得開始...');
+  console.log(`[SP-API:${market}] RESTOCK + PLANNING を順次取得開始...`);
 
   // 主軸: RESTOCK (必須)
   try {
-    results.restock = await fetchRestockRecommendations();
+    results.restock = await fetchRestockRecommendations(_ctx);
   } catch (e) {
     console.error('[SP-API] RESTOCK 失敗:', e.message);
     results.errors.push({ report: 'restock', error: e.message });
@@ -184,13 +220,13 @@ export async function fetchAllReports() {
 
   // 補助: PLANNING (欠落許容、60/90日販売などの参考情報用)
   try {
-    results.planning = await fetchPlanningData();
+    results.planning = await fetchPlanningData(_ctx);
   } catch (e) {
-    console.error('[SP-API] PLANNING_DATA 失敗:', e.message);
+    console.error(`[SP-API:${market}] PLANNING_DATA 失敗:`, e.message);
     results.errors.push({ report: 'planning', error: e.message });
   }
 
-  console.log('[SP-API] 順次取得完了');
+  console.log(`[SP-API:${market}] 順次取得完了`);
   return results;
 }
 
