@@ -1646,14 +1646,6 @@ function renderRegisterPage(shippingRates) {
           const inp = tr.querySelector('input');
           await api('/api/genka', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sku,genka:inp.value,product_name:name})});
           toast(sku+' の原価を更新');
-        } else if (act === 'update-sku') {
-          const inputs = tr.querySelectorAll('input');
-          const oldNe = btn.dataset.ne || '';
-          if (oldNe && oldNe !== inputs[0].value) {
-            await api('/api/skumap/'+encodeURIComponent(sku)+'?ne_code='+encodeURIComponent(oldNe), {method:'DELETE'});
-          }
-          await api('/api/skumap', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({seller_sku:sku,ne_code:inputs[0].value,product_name:name,quantity:inputs[1]?.value||1})});
-          toast(sku+' のSKUマップを更新');
         } else if (act === 'update-class') {
           const sel = tr.querySelector('select');
           if (!sel?.value) { btn.disabled=false; return; }
@@ -1935,7 +1927,7 @@ function renderRegisterPage(shippingRates) {
     }
     async function searchManage() {
       const search = document.getElementById('m-search').value;
-      const epMap = { shipping: '/api/shipping/list', genka: '/api/genka/list', skumap: '/api/skumap/list', sales_class: '/api/sales_class/list', tax_rate: '/api/tax_rate/list', 'm-sku-master': '/api/m-sku-master' };
+      const epMap = { shipping: '/api/shipping/list', genka: '/api/genka/list', sales_class: '/api/sales_class/list', tax_rate: '/api/tax_rate/list', 'm-sku-master': '/api/m-sku-master' };
       const ep = epMap[curManage] || '/api/shipping/list';
       // m-sku-master は q パラメータ、その他は search パラメータ
       const searchParam = curManage === 'm-sku-master' ? 'q' : 'search';
@@ -2030,7 +2022,6 @@ function renderRegisterPage(shippingRates) {
     const csvFormats = {
       shipping: 'CSV形式: 商品コード, 送料コード',
       genka: 'CSV形式: 商品コード, 原価, 商品名（任意）',
-      skumap: 'CSV形式: seller_sku, ne_code, 数量（任意）, ASIN（任意）',
       'm-sku-master': 'CSV形式: sku, asin, 商品名(社内独自), NE商品コード, 数量, ... (商品コード変換テーブルCSV / 19列、UTF-8)',
       sales_class: 'CSV形式: 商品コード, 売上分類(1:自社/2:取引先限定/3:仕入れ/4:輸出)',
       tax_rate: 'CSV形式: 商品コード, 税率(0.1 or 0.08)'
@@ -2328,10 +2319,6 @@ function renderDashboard(stats) {
         await api('/api/genka', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ sku, genka: inp.value, product_name: name }) });
         toast(sku + ' の原価を登録しました');
         loadMissing(currentMissingType);
-      } else if (action === 'reg-skumap') {
-        // SKU管理統合 Step 3: SKUマスタ画面 (/register) に誘導
-        toast('SKU登録は「マスタ登録画面 (/register)」のSKUマスタタブを使ってください');
-        return;
       } else if (action === 'update-shipping') {
         const sel = btn.closest('tr')?.querySelector('select');
         if (!sel) return;
@@ -2345,16 +2332,8 @@ function renderDashboard(stats) {
         await api('/api/genka', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ sku, genka: inp.value, product_name: name }) });
         toast(sku + ' の原価を更新しました');
         loadManage(currentManageType);
-      } else if (action === 'update-skumap') {
-        // SKU管理統合 Step 3: SKUマスタ画面 (/register) に誘導
-        toast('SKU編集は「マスタ登録画面 (/register)」のSKUマスタタブを使ってください');
-        return;
       } else if (action === 'delete') {
         if (!confirm(sku + ' を削除しますか？')) return;
-        if (type === 'skumap') {
-          toast('SKU削除は「マスタ登録画面 (/register)」のSKUマスタタブを使ってください');
-          return;
-        }
         const endpoint = type === 'shipping' ? '/api/shipping/' : '/api/genka/';
         const url = endpoint + encodeURIComponent(sku);
         await api(url, { method: 'DELETE' });
@@ -2394,9 +2373,6 @@ function renderDashboard(stats) {
         } else if (type === 'genka') {
           html += '<input placeholder="原価" style="width:80px"> ';
           html += '<button class="btn btn-sm btn-primary" data-action="reg-genka" data-sku="' + he(r.商品コード) + '" data-name="' + he(r.商品名) + '">登録</button>';
-        } else if (type === 'sku_map') {
-          html += '<input placeholder="NE商品コード" style="width:120px"> ';
-          html += '<button class="btn btn-sm btn-primary" data-action="reg-skumap" data-sku="' + he(r.商品コード) + '" data-name="' + he(r.商品名) + '">登録</button>';
         }
         html += '</td></tr>';
       }
@@ -2430,14 +2406,6 @@ function renderDashboard(stats) {
           html += '<tr><td>' + he(r.sku) + '</td><td>' + he((r.商品名||'').slice(0,30)) + '</td>';
           html += '<td><input value="' + r.genka + '" style="width:80px"></td>';
           html += '<td><button class="btn btn-sm btn-primary" data-action="update-genka" data-sku="' + he(r.sku) + '" data-name="' + he(r.商品名) + '">更新</button> <button class="btn btn-sm" style="background:#e74c3c;color:white" data-action="delete" data-type="genka" data-sku="' + he(r.sku) + '">削除</button></td></tr>';
-        }
-      } else if (type === 'skumap') {
-        html += '<table class="data"><tr><th>Amazon SKU</th><th>ASIN</th><th>商品名</th><th>NE商品コード</th><th>数量</th><th>操作</th></tr>';
-        for (const r of rows) {
-          html += '<tr><td>' + he(r.seller_sku) + '</td><td>' + he(r.asin||'') + '</td><td>' + he((r.商品名||'').slice(0,25)) + '</td>';
-          html += '<td><input value="' + he(r.ne_code||'') + '" style="width:120px"></td>';
-          html += '<td><input value="' + (r.数量||1) + '" style="width:40px"></td>';
-          html += '<td><button class="btn btn-sm btn-primary" data-action="update-skumap" data-sku="' + he(r.seller_sku) + '" data-ne="' + he(r.ne_code) + '" data-name="' + he(r.商品名) + '">更新</button> <button class="btn btn-sm" style="background:#e74c3c;color:white" data-action="delete" data-type="skumap" data-sku="' + he(r.seller_sku) + '" data-ne="' + he(r.ne_code) + '">削除</button></td></tr>';
         }
       }
       html += '</table>';
