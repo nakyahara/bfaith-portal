@@ -191,6 +191,65 @@ async function main() {
   }
   results.push({ name: 'Render同期', ...syncResult });
 
+  // 月初の自動 月末確定値保存
+  // 条件: 今日が月初 (JST) かつ アップストリームのデータ取得が全部成功してる
+  // (ハンガリ式: FBA snapshot / 在庫集計 / Render同期 が全て成功 = mirror に最新データ揃ってる)
+  // 失敗してれば skip + retry 待ちにすることで 「壊れた前月末値が履歴に残る」事故を防ぐ
+  const todayJstDay = Number(businessDate.slice(8, 10)); // 'YYYY-MM-DD' の dd
+  if (todayJstDay === 1) {
+    const fbaSnapOk = fbaSnapResult.success;
+    const invAggOk = invAggResult.success;
+    const renderOk = syncResult.success;
+    const blockingFails = [];
+    if (!fbaSnapOk) blockingFails.push('FBA在庫snapshot');
+    if (!invAggOk) blockingFails.push('在庫集計');
+    if (!renderOk) blockingFails.push('Render同期');
+
+    if (blockingFails.length === 0) {
+      console.log('\n=== 月末確定値の自動保存 (前月末日) ===');
+      try {
+        const url = (process.env.RENDER_MIRROR_URL || 'https://bfaith-portal.onrender.com/apps/mirror').replace(/\/apps\/mirror\/?$/, '') + '/apps/inventory-monthly/api/save-month-end';
+        const syncKey = process.env.MIRROR_SYNC_KEY;
+        if (!syncKey) {
+          // [Codex R2 #3] MIRROR_SYNC_KEY 未設定は「設定不備の隠蔽」になるので skipped 扱いにしない。
+          // 全体通知を ❌ 化させて運用者に気づかせる (本物のスキップは上流失敗時 / 既存snapshotあり時のみ)
+          results.push({ name: '月末確定値', success: false, summary: '❌ MIRROR_SYNC_KEY 未設定 (.env に追加してください)' });
+        } else {
+          const resp = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-sync-key': syncKey },
+            body: JSON.stringify({}), // 省略時は前月末日を server 側で計算
+            signal: AbortSignal.timeout(60000),
+          });
+          const data = await resp.json().catch(() => ({}));
+          if (resp.ok && data.ok && data.skipped) {
+            // 既存 snapshot あり (手動入力 pending 等を保護するため上書きしない)
+            console.log(`[月末確定値] スキップ: ${data.reason}`);
+            results.push({ name: '月末確定値', success: true, skipped: true, summary: `⏸️ ${data.snapshot_date} 既存あり (id=${data.snapshot_id})` });
+          } else if (resp.ok && data.ok) {
+            const { snapshot_date, totals, partial_categories } = data;
+            const partialNote = (partial_categories && partial_categories.length > 0) ? ` (partial: ${partial_categories.join(',')})` : '';
+            console.log(`[月末確定値] 保存成功: ${snapshot_date} 合計=¥${totals.total.toLocaleString('ja-JP')}${partialNote}`);
+            results.push({ name: '月末確定値', success: true, summary: `${snapshot_date} 合計=¥${totals.total.toLocaleString('ja-JP')}${partialNote}` });
+          } else {
+            const err = data.error || `HTTP ${resp.status}`;
+            console.error(`[月末確定値] 保存失敗:`, err);
+            results.push({ name: '月末確定値', success: false, summary: err.slice(0, 200) });
+          }
+        }
+      } catch (e) {
+        console.error('[月末確定値] 例外:', e.message);
+        results.push({ name: '月末確定値', success: false, summary: e.message.slice(0, 200) });
+      }
+    } else {
+      const msg = `⏸️ skipped (上流失敗: ${blockingFails.join(',')})`;
+      console.log(`[DailySync] 月末確定値スキップ: ${msg}`);
+      // 上流失敗側は別行で既に ❌ になってるので、ここを失敗扱いにすると同じ事故を二重通知する
+      // 意図的スキップ (success=true, skipped=true) として記録
+      results.push({ name: '月末確定値', success: true, skipped: true, summary: msg });
+    }
+  }
+
   const endTime = new Date();
   const duration = Math.round((endTime - startTime) / 1000);
 
@@ -328,7 +387,8 @@ async function main() {
   const icon = allOk ? '✅' : '⚠️';
   let msg = `${icon} *Warehouse日次同期 ${dateStr}* (${duration}秒)\n`;
   for (const r of results) {
-    msg += `${r.success ? '✅' : '❌'} ${r.name}: ${r.summary}\n`;
+    const icon = r.skipped ? '⏸️' : (r.success ? '✅' : '❌');
+    msg += `${icon} ${r.name}: ${r.summary}\n`;
   }
   if (retryableFailed.length > 0) {
     if (retryStateWritten) {

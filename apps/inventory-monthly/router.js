@@ -16,7 +16,7 @@ import multer from 'multer';
 import fs from 'fs';
 import { initInventoryMonthly, getDB } from './db.js';
 import { parseRestockReport, parseOwnWarehouse } from './csv-parser.js';
-import { aggregateInventory, saveSnapshot, listSnapshots, getSnapshot } from './aggregator.js';
+import { aggregateInventory, aggregateFromMirror, saveSnapshot, listSnapshots, getSnapshot } from './aggregator.js';
 import { exportSnapshotToXlsx } from './excel-export.js';
 import { buildSnapshotCsv } from './csv-export.js';
 
@@ -165,6 +165,10 @@ function renderInputPage() {
     <button type="submit" data-save="1" style="background:#198754">集計して履歴に保存</button>
     <small class="hint">保存ボタンは同じCSVをサーバー側で再集計してから保存します（クライアント結果は信頼しません）</small>
   </div>
+  <p style="margin:8px 0 0;font-size:12px;color:#666">
+    💡 月初に miniPC daily-sync の最後で「前月末日」を mirror データから自動保存する仕組みあり (POST /api/save-month-end)。
+    この CSV経路は backfill / 過去月末の手動再計算用に温存。
+  </p>
 </form>
 
 <div id="result"></div>
@@ -222,6 +226,7 @@ document.getElementById('frm').addEventListener('submit', async (e) => {
     result.innerHTML = '<div class="err">' + err.message + '</div>';
   }
 });
+
 
 function yen(n) { return '¥' + Math.round(Number(n)||0).toLocaleString('ja-JP'); }
 // クライアント側 HTML エスケープ。CSV由来の SKU/商品コード文字列は全てここを通す。
@@ -344,6 +349,12 @@ function renderResult(d) {
   };
   warnHtml += showList('Amazon SKU → NE商品コード未マップ', w.unmappedSkus, '未マップSKU CSV', 'dlUnmapped()');
   warnHtml += showList('原価未登録の商品コード', w.missingCost, '原価未登録CSV', 'dlMissingCost()');
+  // mirror 経路: source_status=partial の category がある場合に注意喚起
+  if (w.partialCategories && w.partialCategories.length > 0) {
+    warnHtml += '<div class="warn" style="background:#fff3cd;border-color:#ffeeba;color:#664d03"><b>⚠️ partial カテゴリあり: '
+      + esc(w.partialCategories.join(', ')) + '</b><br>'
+      + '<small>SP-API 取得は成功してるが unresolved/cost_missing を含む。月末確定値として使う前に「未マップSKU CSV / 原価未登録CSV」を確認してください。</small></div>';
+  }
 
   const savedHtml = d.snapshot_id ? '<div class="card" style="background:#d1e7dd;border-color:#a3cfbb"><b>履歴に保存しました</b> → <a href="history/'+encodeURIComponent(d.snapshot_id)+'">詳細を表示</a></div>' : '';
 
@@ -1159,3 +1170,71 @@ router.get('/export/:id.csv', (req, res) => {
 });
 
 export default router;
+
+// ─── 同期APIキー認証で守る /api/* router (server.js 側で先にマウント) ───
+// daily-sync.js (miniPC) からの呼び出し用。セッション認証ではなく x-sync-key で認証。
+// /apps/inventory-monthly/api/save-month-end : 指定日 (or 前月末) の集計を inv_snapshot に保存
+export const apiRouter = Router();
+
+apiRouter.post('/save-month-end', (req, res) => {
+  try {
+    if (!ensureDbOrFail(res)) return;
+
+    // snapshot_date 省略時は「前月末日 (JST)」を自動計算
+    let snapshot_date = (req.body?.snapshot_date || '').slice(0, 10);
+    if (!snapshot_date) {
+      const fmt = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Tokyo', year: 'numeric', month: '2-digit', day: '2-digit',
+      });
+      const parts = Object.fromEntries(fmt.formatToParts(new Date()).map(p => [p.type, p.value]));
+      const y = Number(parts.year), m = Number(parts.month);
+      // 当月の0日 = 前月末
+      const lastDayPrevMonth = new Date(Date.UTC(y, m - 1, 0));
+      const py = lastDayPrevMonth.getUTCFullYear();
+      const pm = String(lastDayPrevMonth.getUTCMonth() + 1).padStart(2, '0');
+      const pd = String(lastDayPrevMonth.getUTCDate()).padStart(2, '0');
+      snapshot_date = `${py}-${pm}-${pd}`;
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(snapshot_date)) {
+      return res.status(400).json({ error: '棚卸し基準日が不正です' });
+    }
+
+    // [Codex R2 #2] 既存スナップショットがあれば上書きしない (cron 再実行で手動入力 pending を消さないため)
+    // 強制上書きは body.force=1 で許可 (将来の管理用)
+    const force = req.body?.force === true || req.body?.force === '1';
+    const existing = getDB().prepare(
+      'SELECT id, total, created_at, note FROM inv_snapshot WHERE snapshot_date = ?'
+    ).get(snapshot_date);
+    if (existing && !force) {
+      return res.json({
+        ok: true,
+        snapshot_date,
+        snapshot_id: existing.id,
+        skipped: true,
+        reason: `既存 snapshot あり (id=${existing.id}, created_at=${existing.created_at})。上書きしないため cron では skip。force=1 で強制上書き可能`,
+        existing_total: existing.total,
+      });
+    }
+
+    // 発注後未着は cron では入らない (mirror に該当データなし)。空配列で進める。
+    const pendingRows = [];
+
+    const result = aggregateFromMirror({ snapshot_date, pendingRows });
+    const snapshot_id = saveSnapshot({ snapshot_date, result, pendingRows, note: 'auto: cron save-month-end' });
+
+    res.json({
+      ok: true,
+      snapshot_date,
+      snapshot_id,
+      totals: result.totals,
+      warnings_count: {
+        unmappedSkus: result.warnings.unmappedSkus.length,
+        missingCost: result.warnings.missingCost.length,
+        partialCategories: (result.warnings.partialCategories || []).length,
+      },
+      partial_categories: result.warnings.partialCategories || [],
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});

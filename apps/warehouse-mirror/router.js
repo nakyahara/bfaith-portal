@@ -146,14 +146,27 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
     }
 
     // inv_daily_detail (D-1c 詳細層、差分sync UPSERT + 古い行クリーン)
-    // ペイロード: { inv_daily_detail: [...rows], meta: { inv_daily_detail_clear_old: true } }
+    // ペイロード: { inv_daily_detail: [...rows], meta: {
+    //   inv_daily_detail_clear_old: true,                      // 365日より古い行 housekeeping
+    //   inv_daily_detail_clear_dates: ['YYYY-MM-DD', ...],    // この sync で再投入する日付を先に DELETE
+    //                                                          // (Codex R3 #2 対応: 同日再集計で消えた SKU の stale 行を残さない)
+    // } }
     if (req.body.inv_daily_detail && Array.isArray(req.body.inv_daily_detail)) {
       const rows = req.body.inv_daily_detail;
       const clearOld = req.body.meta?.inv_daily_detail_clear_old === true;
+      const clearDates = Array.isArray(req.body.meta?.inv_daily_detail_clear_dates) ? req.body.meta.inv_daily_detail_clear_dates : null;
       const tx = db.transaction(() => {
         if (clearOld) {
           // 365日より古い行を削除 (Render disk 圧迫抑制)
           db.prepare(`DELETE FROM mirror_inv_daily_detail WHERE business_date < date('now','-365 days')`).run();
+        }
+        if (clearDates && clearDates.length > 0) {
+          // 同日 stale 防止: 送信元 (miniPC) が「今回 sync で再投入する日付」を明示
+          //   → mirror 側でその日付を先に全削除 → 後続 chunk の UPSERT で新値だけ残る
+          //   → 古い detail 行 (再集計で消えた SKU 等) を残さない
+          // 初回 chunk のみ meta が乗ってる想定なので、後続 chunk でも複数回呼ばれることはない (はず)
+          const placeholders = clearDates.map(() => '?').join(',');
+          db.prepare(`DELETE FROM mirror_inv_daily_detail WHERE business_date IN (${placeholders})`).run(...clearDates);
         }
         const stmt = db.prepare(`
           INSERT INTO mirror_inv_daily_detail (

@@ -267,6 +267,122 @@ export function aggregateInventory({ fbaRows = [], ownRows = [], usFbaRows = nul
   return { totals, details, warnings };
 }
 
+/**
+ * mirror_inv_daily_summary / mirror_inv_daily_detail から指定日の集計を再構成する。
+ * CSV アップロード経路の代替: 毎朝 sync された mirror データを使うことで CSV 取得不要にする。
+ *
+ * 同じ商品×同じ日付なら CSV 経路と数値は一致する想定 (どちらも同じ原価マスタを使う)。
+ *
+ * 入力:
+ *   - snapshot_date: 'YYYY-MM-DD'
+ *   - pendingRows: [{ supplier_name, amount, note }] (発注後未着は手動入力のみ)
+ * 出力: aggregateInventory() と同じ形 { totals, details, warnings }
+ */
+const MIRROR_STATUS_TO_LEGACY = {
+  ok: 'COMPLETE',
+  cost_missing: 'MISSING',
+  ne_missing: 'NOT_IN_MASTER',
+};
+const MIRROR_CATEGORY_TO_LEGACY = {
+  fba_us_warehouse: 'fba_us', // 月末ツール UI は fba_us 単一カテゴリで集計表示
+  fba_us_inbound: 'fba_us',
+};
+
+export function aggregateFromMirror({ snapshot_date, pendingRows = [] }) {
+  const db = getDB();
+
+  // 1) サマリ → totals
+  const summaryRows = db.prepare(
+    `SELECT category, total_value, source_status
+     FROM mirror_inv_daily_summary WHERE business_date = ?`
+  ).all(snapshot_date);
+  if (summaryRows.length === 0) {
+    throw new Error(`${snapshot_date} の在庫スナップショットが mirror に存在しません (sync 待ち or 別日付を指定)`);
+  }
+
+  // [Codex R1 #1] source_status チェック: no_source / failed の日は保存・プレビュー共に拒否
+  // 「正常な 0 円在庫」として履歴保存される事故を防ぐ
+  const fatalRows = summaryRows.filter(r => r.source_status === 'no_source' || r.source_status === 'failed');
+  if (fatalRows.length > 0) {
+    const cats = fatalRows.map(r => `${r.category}=${r.source_status}`).join(', ');
+    throw new Error(`${snapshot_date} の在庫データは不完全です (${cats})。SP-API 取得失敗 or sync 未完了の可能性があるので、cron 完了を待つか別日付を指定してください。`);
+  }
+
+  // [Codex R1 #2 / R2 #1] summary/detail 世代不一致チェック
+  // sync は summary / detail を別 payload で送るため「summary は新、detail は古い」状態が一瞬発生し得る
+  // source_status='no_source' 以外 (= ソースが存在する category) は detail にも行が必要
+  // (total_value=0 でも source_status=partial で unresolved/cost_missing のみのケースを含む)
+  const detailCats = new Set(
+    db.prepare(`SELECT DISTINCT category FROM mirror_inv_daily_detail WHERE business_date = ?`)
+      .all(snapshot_date).map(r => r.category)
+  );
+  const missingDetailCats = summaryRows.filter(r => r.source_status !== 'no_source' && !detailCats.has(r.category));
+  if (missingDetailCats.length > 0) {
+    throw new Error(`${snapshot_date} の明細 (mirror_inv_daily_detail) が summary と一致しません (${missingDetailCats.map(r => r.category).join(',')} の detail 未着)。次回 sync 完了まで待ってください。`);
+  }
+
+  const byCat = Object.fromEntries(summaryRows.map(r => [r.category, r]));
+  const v = (cat) => Number(byCat[cat]?.total_value || 0);
+  const fbaUsSummary = v('fba_us_warehouse') + v('fba_us_inbound');
+
+  // [Codex R2 #3] CSV経路は「生値合計→最後に1回 round」なので mirror経路もそれに合わせる
+  // (カテゴリ毎に round してから足すと小数原価で 1 円ズレる)
+  const pendingTotal = pendingRows.reduce((s, p) => s + (Number(p.amount) || 0), 0);
+  const rawTotal = v('fba_warehouse') + v('fba_inbound') + v('own_warehouse') + fbaUsSummary + pendingTotal;
+  const totals = {
+    fba_warehouse: Math.round(v('fba_warehouse')),
+    fba_inbound: Math.round(v('fba_inbound')),
+    own_warehouse: Math.round(v('own_warehouse')),
+    fba_us: Math.round(fbaUsSummary),
+    pending: Math.round(pendingTotal),
+    total: Math.round(rawTotal),
+  };
+
+  // 2) 明細 → details (mirror_inv_daily_detail はすでにセット展開済 + 原価適用済)
+  const detailRows = db.prepare(`
+    SELECT category, source_item_code, ne_code,
+           COALESCE(product_name, source_product_name, '') AS product_name,
+           qty, unit_cost, total_value, cost_status, resolution_method
+    FROM mirror_inv_daily_detail
+    WHERE business_date = ?
+    ORDER BY category, ne_code
+  `).all(snapshot_date);
+
+  const details = detailRows.map(d => {
+    let 原価状態 = MIRROR_STATUS_TO_LEGACY[d.cost_status] || d.cost_status || 'UNKNOWN';
+    if (d.resolution_method === 'unresolved') 原価状態 = 'UNMAPPED_SKU';
+    return {
+      category: MIRROR_CATEGORY_TO_LEGACY[d.category] || d.category,
+      seller_sku: (d.category === 'own_warehouse') ? null : d.source_item_code,
+      商品コード: d.ne_code,
+      商品名: d.product_name,
+      数量: d.qty,
+      原価: d.unit_cost ?? 0,
+      金額: d.total_value ?? 0,
+      原価状態,
+    };
+  });
+
+  // 3) 警告 (CSV 経路と同じキー名で再構築 → UI ダウンロードボタンが流用できる)
+  const warnings = {
+    unmappedSkus: [...new Set(
+      details.filter(d => d.原価状態 === 'UNMAPPED_SKU' && d.seller_sku).map(d => d.seller_sku)
+    )],
+    unknownProducts: [...new Set(
+      details.filter(d => d.原価状態 === 'NOT_IN_MASTER' && d.商品コード).map(d => d.商品コード)
+    )],
+    missingCost: [...new Set(
+      details
+        .filter(d => INCOMPLETE_COST_STATUSES.has(d.原価状態))
+        .map(d => d.seller_sku ? `${d.seller_sku} → ${d.商品コード}` : d.商品コード)
+    )],
+    // partial: 集計成功だが unresolved/cost_missing を含む。保存は許可するが UI で警告表示
+    partialCategories: summaryRows.filter(r => r.source_status === 'partial').map(r => r.category),
+  };
+
+  return { totals, details, warnings };
+}
+
 /** 集計結果を inv_snapshot* に保存。同一日が既存なら上書きする。 */
 export function saveSnapshot({ snapshot_date, result, pendingRows = [], note = '' }) {
   const db = getDB();
