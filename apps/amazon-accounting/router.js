@@ -490,7 +490,7 @@ router.post('/upload', upload.single('file'), (req, res) => {
   res.json({
     yearMonth,
     totalRows: parsedRows.length,
-    resolvedCount: resolved.filter(r => r.解決方法 !== 'unresolved' && r.解決方法 !== 'skip' && r.解決方法 !== 'no_sku' && !['mixed_tax','mixed_segment','partial_component'].includes(r.解決方法)).length,
+    resolvedCount: resolved.filter(r => r.解決方法 !== 'unresolved' && r.解決方法 !== 'skip' && r.解決方法 !== 'no_sku' && !['mixed_tax','mixed_segment','partial_component','invalid_quantity'].includes(r.解決方法)).length,
     unresolvedSkus: unresolved,
     unresolvedTaxCount,
     unresolvedTax,
@@ -732,7 +732,7 @@ function renderPage() {
       if (data.conflicts && data.conflicts.length > 0) {
         const card = document.getElementById('conflictsCard');
         card.style.display = 'block';
-        const typeLabels = { mixed_tax: '税率混在', mixed_segment: '売上分類混在', partial_component: '構成品欠損' };
+        const typeLabels = { mixed_tax: '税率混在', mixed_segment: '売上分類混在', partial_component: '構成品欠損', invalid_quantity: '数量不正' };
         let html = '<table class="detail-table"><tr><th>SKU</th><th>エラー種別</th><th>詳細</th></tr>';
         for (const c of data.conflicts) {
           const label = typeLabels[c.type] || c.type;
@@ -740,6 +740,7 @@ function renderPage() {
           if (c.type === 'mixed_tax') detail = '税率: ' + (c.taxRates || []).map(r => (r * 100).toFixed(0) + '%').join(', ');
           else if (c.type === 'mixed_segment') detail = '分類: ' + (c.segments || []).join(', ');
           else if (c.type === 'partial_component') detail = '欠損ne_code: ' + (c.missing || []).join(', ');
+          else if (c.type === 'invalid_quantity') detail = '不正数量: ' + (c.invalidQty || []).map(q => q.ne_code + '=' + q.rawQty).join(', ');
           html += '<tr><td style="text-align:left">' + c.sku + '</td><td>' + label + '</td><td style="text-align:left">' + detail + '</td></tr>';
         }
         html += '</table>';
@@ -941,16 +942,8 @@ function renderPage() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             yearMonth: lastData.yearMonth,
-            totalRows: lastData.totalRows,
-            resolvedCount: lastData.resolvedCount,
-            unresolvedCount: lastData.unresolvedSkus?.length || 0,
-            unresolvedTaxCount: (lastData.unresolvedTax || []).length,
-            conflictsCount: (lastData.conflicts || []).length,
-            byTax: lastData.byTax,
-            bySegment: lastData.bySegment,
-            excluded: lastData.excluded,
-            mfRow: lastData.mfRow,
             adCost,
+            csvFilename: document.getElementById('csvFile').files[0]?.name || '',
           }),
         });
         const result = await r.json();

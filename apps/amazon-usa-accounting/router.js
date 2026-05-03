@@ -827,16 +827,8 @@ function renderPage() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             yearMonth: lastData.yearMonth,
-            totalRows: lastData.totalRows,
-            resolvedCount: lastData.resolvedCount,
-            unresolvedCount: lastData.unresolvedSkus?.length || 0,
-            conflictsCount: (lastData.conflicts || []).length,
-            exchangeRate: lastData.rate,
-            usd: lastData.usd,
-            jpy: lastData.jpy,
-            mgmt: lastData.mgmt,
-            costTotalJpy: lastData.costTotalJpy,
             adCost,
+            csvFilename: document.getElementById('csvFile').files[0]?.name || '',
           }),
         });
         const result = await r.json();
