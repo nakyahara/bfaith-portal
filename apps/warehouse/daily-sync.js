@@ -211,7 +211,8 @@ async function main() {
         const url = (process.env.RENDER_MIRROR_URL || 'https://bfaith-portal.onrender.com/apps/mirror').replace(/\/apps\/mirror\/?$/, '') + '/apps/inventory-monthly/api/save-month-end';
         const syncKey = process.env.MIRROR_SYNC_KEY;
         if (!syncKey) {
-          results.push({ name: '月末確定値', success: false, summary: '⏸️ MIRROR_SYNC_KEY 未設定でスキップ' });
+          // 意図的スキップ (success=true, skipped=true) なので全体通知を赤化させない
+          results.push({ name: '月末確定値', success: true, skipped: true, summary: '⏸️ MIRROR_SYNC_KEY 未設定でスキップ' });
         } else {
           const resp = await fetch(url, {
             method: 'POST',
@@ -238,7 +239,9 @@ async function main() {
     } else {
       const msg = `⏸️ skipped (上流失敗: ${blockingFails.join(',')})`;
       console.log(`[DailySync] 月末確定値スキップ: ${msg}`);
-      results.push({ name: '月末確定値', success: false, summary: msg });
+      // 上流失敗側は別行で既に ❌ になってるので、ここを失敗扱いにすると同じ事故を二重通知する
+      // 意図的スキップ (success=true, skipped=true) として記録
+      results.push({ name: '月末確定値', success: true, skipped: true, summary: msg });
     }
   }
 
@@ -379,7 +382,8 @@ async function main() {
   const icon = allOk ? '✅' : '⚠️';
   let msg = `${icon} *Warehouse日次同期 ${dateStr}* (${duration}秒)\n`;
   for (const r of results) {
-    msg += `${r.success ? '✅' : '❌'} ${r.name}: ${r.summary}\n`;
+    const icon = r.skipped ? '⏸️' : (r.success ? '✅' : '❌');
+    msg += `${icon} ${r.name}: ${r.summary}\n`;
   }
   if (retryableFailed.length > 0) {
     if (retryStateWritten) {
