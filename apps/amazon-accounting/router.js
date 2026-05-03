@@ -681,6 +681,9 @@ function renderPage() {
       }
       summaryHtml += '</div>';
       document.getElementById('summary').innerHTML = summaryHtml;
+      // 確定ボタンの disabled 制御 (hard fail)
+      const confirmBtn = document.getElementById('confirmBtn');
+      if (confirmBtn) confirmBtn.disabled = !data.canConfirm;
 
       // 未登録SKU
       if (data.unresolvedSkus.length > 0) {
@@ -894,6 +897,10 @@ function renderPage() {
 
     async function doConfirm() {
       if (!lastData) { alert('先にCSVをアップロードしてください'); return; }
+      if (!lastData.canConfirm) {
+        alert('未登録SKU・税率未登録・セット解決エラーが残っています。確定できません。');
+        return;
+      }
       if (!confirm(lastData.yearMonth + ' の集計を確定しますか？')) return;
       const btn = document.getElementById('confirmBtn');
       btn.disabled = true;
@@ -1253,6 +1260,11 @@ router.post('/confirm', (req, res) => {
     byTax, bySegment, excluded, mfRow, adCost, csvFilename } = req.body;
 
   if (!yearMonth) return res.status(400).json({ error: 'yearMonth は必須です' });
+
+  // サーバ側でも再検証: 未登録SKUがある or 解決行数が0 の場合は確定拒否
+  if ((unresolvedCount || 0) > 0) {
+    return res.status(400).json({ error: '未登録SKUが残っているため確定できません' });
+  }
 
   try {
     const now = new Date().toISOString().replace('T', ' ').slice(0, 19);

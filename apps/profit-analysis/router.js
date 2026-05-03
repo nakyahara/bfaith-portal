@@ -146,13 +146,17 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
       if (neEntries) {
         let totalCost = 0;
         let totalShip = 0;
+        let allFound = true;
+        const taxRates = [];
         for (const entry of neEntries) {
           const prod = productMap.get(entry.ne_code);
           if (prod) {
             if (prod.原価) totalCost += prod.原価 * entry.qty;
-            taxRate = 1 + (prod.消費税率 || 10) / 100;
+            taxRates.push(prod.消費税率 || 10);
             if (prod.送料) totalShip += prod.送料 * entry.qty;
             if (productName === listingCode && prod.商品名) productName = prod.商品名;
+          } else {
+            allFound = false;
           }
         }
         costExTax = totalCost * qty;
@@ -160,7 +164,15 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
         if (channel !== 'FBA') {
           shipping = totalShip * qty;
         }
-        costSource = neEntries.length > 0 ? 'SKU→NE' : '不明';
+        // 税率は構成品で混在しなければそれ、混在なら 10% 既定
+        const uniqueTaxRates = [...new Set(taxRates)];
+        taxRate = uniqueTaxRates.length === 1 ? 1 + uniqueTaxRates[0] / 100 : 1.1;
+        // セット商品の解決状況を costSource に反映 (Codex指摘: silent fallback防止)
+        if (neEntries.length > 0) {
+          if (!allFound) costSource = 'SKU→NE(部分欠損)';
+          else if (uniqueTaxRates.length > 1) costSource = 'SKU→NE(税率混在)';
+          else costSource = 'SKU→NE';
+        }
       }
     } else {
       // 非Amazon: listingCode = NE商品コード（楽天/Yahoo/auPAY等）

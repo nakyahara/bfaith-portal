@@ -398,9 +398,14 @@ router.get('/evidence/:type/:yearMonth', (req, res) => {
 
 router.post('/confirm', (req, res) => {
   const db = getMirrorDB();
-  const { yearMonth, totalRows, resolvedCount, unresolvedCount,
+  const { yearMonth, totalRows, resolvedCount, unresolvedCount, conflictsCount,
     exchangeRate, usd, jpy, mgmt, costTotalJpy, adCost, csvFilename } = req.body;
   if (!yearMonth) return res.status(400).json({ error: 'yearMonth は必須です' });
+
+  // サーバ側再検証: セット解決エラー(partial_component)があれば確定拒否
+  if ((conflictsCount || 0) > 0) {
+    return res.status(400).json({ error: 'セット商品の構成品欠損があるため確定できません' });
+  }
 
   try {
     const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
@@ -652,13 +657,19 @@ function renderPage() {
       document.getElementById('uploadStatus').textContent = '';
 
       const hasUnresolved = data.unresolvedSkus.length > 0;
-      let s = '<div class="' + (hasUnresolved ? 'warn' : 'ok') + '">';
+      const conflictsCount = (data.conflicts || []).length;
+      const blockConfirm = conflictsCount > 0;
+      let s = '<div class="' + (blockConfirm ? 'err' : (hasUnresolved ? 'warn' : 'ok')) + '">';
       s += '<b>対象年月: ' + data.yearMonth + '</b> / 為替: 1 USD = ' + data.rate + ' JPY<br>';
       s += '総行数: ' + data.totalRows + ' (Transfer除外済) / SKU解決済: ' + data.resolvedCount + ' / 未登録SKU: ' + data.unresolvedSkus.length + '件';
-      if (hasUnresolved) s += '<br><b style="color:#d68910">⚠️ 未登録SKUあり(原価0円で集計に含まれます) — 確定可能</b>';
+      if (conflictsCount > 0) s += ' / <span class="negative">セット解決エラー: ' + conflictsCount + '件</span>';
+      if (blockConfirm) s += '<br><b style="color:#e74c3c">❌ セット商品の構成品欠損あり — 確定不可</b>';
+      else if (hasUnresolved) s += '<br><b style="color:#d68910">⚠️ 未登録SKUあり(原価0円で集計に含まれます) — 確定可能</b>';
       else s += '<br><b style="color:#27ae60">✅ 確定可能</b>';
       s += '</div>';
       document.getElementById('summary').innerHTML = s;
+      const confirmBtn = document.getElementById('confirmBtn');
+      if (confirmBtn) confirmBtn.disabled = !data.canConfirm;
 
       // 未登録SKU
       if (data.unresolvedSkus.length > 0) {
@@ -740,6 +751,10 @@ function renderPage() {
 
     async function doConfirm() {
       if (!lastData) { alert('先にCSVをアップロードしてください'); return; }
+      if (!lastData.canConfirm) {
+        alert('セット商品の構成品欠損(partial_component)があるため確定できません。商品マスタを修正してください。');
+        return;
+      }
       let msg = lastData.yearMonth + ' の集計を確定しますか?\\n為替レート: ' + lastData.rate + ' JPY/USD';
       if (lastData.unresolvedSkus.length > 0) {
         msg += '\\n\\n⚠️ 未登録SKU ' + lastData.unresolvedSkus.length + '件あり(原価0円で集計に含まれます)';
@@ -758,6 +773,7 @@ function renderPage() {
             totalRows: lastData.totalRows,
             resolvedCount: lastData.resolvedCount,
             unresolvedCount: lastData.unresolvedSkus?.length || 0,
+            conflictsCount: (lastData.conflicts || []).length,
             exchangeRate: lastData.rate,
             usd: lastData.usd,
             jpy: lastData.jpy,

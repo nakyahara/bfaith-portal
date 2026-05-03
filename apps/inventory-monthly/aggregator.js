@@ -5,7 +5,8 @@
  * Amazon SKU は mirror_sku_resolved (master優先 + sku_map fallback) で NE商品コードに変換し、
  * セット商品は mirror_set_components で構成品に展開する。
  *
- * env INVENTORY_MONTHLY_USE_LEGACY_SKU_MAP=1 で旧 mirror_sku_map 直参照に戻せる escape hatch あり。
+ * env WAREHOUSE_SKU_SOURCE=legacy (推奨) または旧 INVENTORY_MONTHLY_USE_LEGACY_SKU_MAP=1
+ * で旧 mirror_sku_map 直参照に戻せる escape hatch あり (SKU管理統合 Step 2 で env 統合)。
  *
  * 入力:
  *   - fbaRows: [{ seller_sku, fba_warehouse, fba_inbound, product_name, asin }]
