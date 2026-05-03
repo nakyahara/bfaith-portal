@@ -130,6 +130,21 @@ async function main() {
   const spResult = runScript('apps/warehouse/sp-api-orders.js', 'Amazon SP-API');
   results.push({ name: 'Amazon', ...spResult });
 
+  // Amazon SKU手数料取得 (直近30日に売れたSKUのみ)
+  // SP-API getMyFeesEstimateForASIN を1秒1回ペースで叩く (タイムアウト30分)
+  // SP-API 失敗時はスキップ (依存関係)、後続は継続
+  if (spResult.success) {
+    const feeResult = runScript(
+      'apps/warehouse/fetch-amazon-fees.js --recent 30',
+      'Amazon手数料 (--recent 30)',
+      1800000
+    );
+    results.push({ name: 'Amazon手数料', ...feeResult });
+  } else {
+    console.log('[DailySync] SP-API 失敗のため Amazon手数料取得をスキップ');
+    results.push({ name: 'Amazon手数料', success: false, summary: '⏭️ skipped (SP-API失敗のため)' });
+  }
+
   // FBA 在庫スナップショット (RESTOCK + PLANNING) — daily_snapshots に履歴蓄積
   // 手動 /fetch-reports と lockfile で排他、既に走ってればスキップ (失敗扱いにしない)
   // SP-API レポート polling のため最大 15 分余裕
@@ -249,6 +264,10 @@ async function main() {
       results.push({ name: '月末確定値', success: true, skipped: true, summary: msg });
     }
   }
+  // Amazon手数料カバー率の監視 (Phase 0 完了判定指標、データ品質追跡)
+  // 失敗しても daily-sync 全体は成功扱い (補助的監視のため)
+  const monitorFeeResult = runScript('apps/warehouse/monitor-fee-coverage.js', '手数料カバー率監視', 60000);
+  results.push({ name: '手数料カバー率監視', ...monitorFeeResult });
 
   const endTime = new Date();
   const duration = Math.round((endTime - startTime) / 1000);
