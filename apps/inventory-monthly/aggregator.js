@@ -291,19 +291,35 @@ const MIRROR_CATEGORY_TO_LEGACY = {
 export function aggregateFromMirror({ snapshot_date, pendingRows = [] }) {
   const db = getDB();
 
-  // データ存在確認 (同期遅延 / 別日付指定で空のまま保存される事故を防ぐ)
-  const presence = db.prepare(
-    'SELECT COUNT(*) AS n FROM mirror_inv_daily_summary WHERE business_date = ?'
-  ).get(snapshot_date);
-  if (!presence || presence.n === 0) {
-    throw new Error(`${snapshot_date} の在庫スナップショットが mirror に存在しません (sync 待ち or 別日付を指定)`);
-  }
-
   // 1) サマリ → totals
   const summaryRows = db.prepare(
     `SELECT category, total_value, source_status
      FROM mirror_inv_daily_summary WHERE business_date = ?`
   ).all(snapshot_date);
+  if (summaryRows.length === 0) {
+    throw new Error(`${snapshot_date} の在庫スナップショットが mirror に存在しません (sync 待ち or 別日付を指定)`);
+  }
+
+  // [Codex R1 #1] source_status チェック: no_source / failed の日は保存・プレビュー共に拒否
+  // 「正常な 0 円在庫」として履歴保存される事故を防ぐ
+  const fatalRows = summaryRows.filter(r => r.source_status === 'no_source' || r.source_status === 'failed');
+  if (fatalRows.length > 0) {
+    const cats = fatalRows.map(r => `${r.category}=${r.source_status}`).join(', ');
+    throw new Error(`${snapshot_date} の在庫データは不完全です (${cats})。SP-API 取得失敗 or sync 未完了の可能性があるので、cron 完了を待つか別日付を指定してください。`);
+  }
+
+  // [Codex R1 #2] summary/detail 世代不一致チェック
+  // sync は summary / detail を別 payload で送るため「summary は新、detail は古い」状態が一瞬発生し得る
+  // total_value > 0 の category は detail にも行が必要 (なければ saveSnapshot の details が壊れる)
+  const detailCats = new Set(
+    db.prepare(`SELECT DISTINCT category FROM mirror_inv_daily_detail WHERE business_date = ?`)
+      .all(snapshot_date).map(r => r.category)
+  );
+  const missingDetailCats = summaryRows.filter(r => (Number(r.total_value) || 0) > 0 && !detailCats.has(r.category));
+  if (missingDetailCats.length > 0) {
+    throw new Error(`${snapshot_date} の明細 (mirror_inv_daily_detail) が summary と一致しません (${missingDetailCats.map(r => r.category).join(',')} の detail 未着)。次回 sync 完了まで待ってください。`);
+  }
+
   const byCat = Object.fromEntries(summaryRows.map(r => [r.category, r]));
   const v = (cat) => Number(byCat[cat]?.total_value || 0);
   const fbaUsSummary = v('fba_us_warehouse') + v('fba_us_inbound');
@@ -357,6 +373,8 @@ export function aggregateFromMirror({ snapshot_date, pendingRows = [] }) {
         .filter(d => INCOMPLETE_COST_STATUSES.has(d.原価状態))
         .map(d => d.seller_sku ? `${d.seller_sku} → ${d.商品コード}` : d.商品コード)
     )],
+    // partial: 集計成功だが unresolved/cost_missing を含む。保存は許可するが UI で警告表示
+    partialCategories: summaryRows.filter(r => r.source_status === 'partial').map(r => r.category),
   };
 
   return { totals, details, warnings };

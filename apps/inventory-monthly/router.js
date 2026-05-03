@@ -392,6 +392,12 @@ function renderResult(d) {
   };
   warnHtml += showList('Amazon SKU → NE商品コード未マップ', w.unmappedSkus, '未マップSKU CSV', 'dlUnmapped()');
   warnHtml += showList('原価未登録の商品コード', w.missingCost, '原価未登録CSV', 'dlMissingCost()');
+  // mirror 経路: source_status=partial の category がある場合に注意喚起
+  if (w.partialCategories && w.partialCategories.length > 0) {
+    warnHtml += '<div class="warn" style="background:#fff3cd;border-color:#ffeeba;color:#664d03"><b>⚠️ partial カテゴリあり: '
+      + esc(w.partialCategories.join(', ')) + '</b><br>'
+      + '<small>SP-API 取得は成功してるが unresolved/cost_missing を含む。月末確定値として使う前に「未マップSKU CSV / 原価未登録CSV」を確認してください。</small></div>';
+  }
 
   const savedHtml = d.snapshot_id ? '<div class="card" style="background:#d1e7dd;border-color:#a3cfbb"><b>履歴に保存しました</b> → <a href="history/'+encodeURIComponent(d.snapshot_id)+'">詳細を表示</a></div>' : '';
 
