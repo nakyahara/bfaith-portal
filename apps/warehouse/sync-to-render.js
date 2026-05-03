@@ -267,8 +267,12 @@ export async function syncToRender() {
     await sendPart({ products, set_components, sku_map, sku_resolved, amazon_sku_fees, rakuten_sku_map, inv_daily_summary }, 'マスタ');
 
     // Part 1c: inv_daily_detail (D-1c、直近7日、~17MB なので chunk 分割)
-    // 初回チャンクで meta.inv_daily_detail_clear_old=true を渡し、Render側で365日より古い行を削除
+    // 初回チャンクの meta:
+    //   - inv_daily_detail_clear_old=true : Render 側で365日より古い行を削除 (housekeeping)
+    //   - inv_daily_detail_clear_dates=[...] : この sync で送信する全 business_date を Render 側で先に DELETE
+    //     → 同日再集計で SKU が消えた場合の stale detail 行を mirror に残さない (Codex R3 #2 対応)
     const detailChunkSize = 5000;
+    const clearDates = [...new Set(inv_daily_detail.map(r => r.business_date).filter(Boolean))];
     if (inv_daily_detail.length === 0) {
       await sendPart({ inv_daily_detail: [], meta: { inv_daily_detail_clear_old: true } }, 'inv_daily_detail (空 / 古い行クリーンのみ)');
     } else {
@@ -276,7 +280,7 @@ export async function syncToRender() {
         const chunk = inv_daily_detail.slice(i, i + detailChunkSize);
         const isFirst = i === 0;
         await sendPart(
-          { inv_daily_detail: chunk, meta: isFirst ? { inv_daily_detail_clear_old: true } : undefined },
+          { inv_daily_detail: chunk, meta: isFirst ? { inv_daily_detail_clear_old: true, inv_daily_detail_clear_dates: clearDates } : undefined },
           `inv_daily_detail ${i + 1}-${Math.min(i + detailChunkSize, inv_daily_detail.length)}`
         );
       }
