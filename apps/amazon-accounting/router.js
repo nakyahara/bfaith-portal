@@ -2,8 +2,10 @@
  * Amazon売上集計ツール
  *
  * セラセンのペイメントレポートCSVをアップロードし、
- * mirror_products + mirror_sku_map を使って
+ * mirror_products + mirror_sku_resolved (master優先 + sku_map fallback) を使って
  * 税率別・セグメント別の売上集計を自動計算する。
+ *
+ * env WAREHOUSE_SKU_SOURCE=legacy で旧 mirror_sku_map 参照に戻せる(SKU管理統合 Step 2b)
  *
  * Phase 1: CSVアップロード → SKU照合 → 未登録検出 → 集計プレビュー
  */
@@ -49,7 +51,7 @@ function parseCsvBuffer(buf) {
   });
 }
 
-// ─── SKU解決（3段階）───
+// ─── SKU解決（3段階 + セット展開）───
 
 function resolveSkus(rows, db) {
   // mirror_productsの商品コードマップ（小文字統一）
@@ -58,9 +60,14 @@ function resolveSkus(rows, db) {
     productsMap.set((p.商品コード || '').toLowerCase(), p);
   }
 
-  // mirror_sku_mapの変換マップ
+  // 既定: mirror_sku_resolved (master優先 + sku_map fallback)
+  // env WAREHOUSE_SKU_SOURCE=legacy で旧 mirror_sku_map 直参照に戻せる
+  const useLegacy = process.env.WAREHOUSE_SKU_SOURCE === 'legacy';
   const skuMapEntries = new Map();
-  for (const s of db.prepare('SELECT * FROM mirror_sku_map').all()) {
+  const skuRows = useLegacy
+    ? db.prepare('SELECT seller_sku, ne_code, 数量 FROM mirror_sku_map').all()
+    : db.prepare('SELECT seller_sku, ne_code, quantity AS 数量 FROM mirror_sku_resolved').all();
+  for (const s of skuRows) {
     const key = s.seller_sku?.toLowerCase();
     if (!key) continue;
     if (!skuMapEntries.has(key)) skuMapEntries.set(key, []);
@@ -69,6 +76,7 @@ function resolveSkus(rows, db) {
 
   const resolved = [];
   const unresolved = new Map(); // SKU → { sku, name, count, amount }
+  const conflicts = []; // セット商品の解決失敗(混在/欠損)を hard fail で記録
 
   for (const row of rows) {
     const sku = (row.sku || '').toLowerCase();
@@ -89,12 +97,74 @@ function resolveSkus(rows, db) {
     let product = productsMap.get(sku);
     let resolveMethod = 'direct';
 
-    // Stage 2: sku_mapで変換
+    // Stage 2: sku_resolved/sku_map で変換(セット商品は構成品合算)
     if (!product) {
       const mappings = skuMapEntries.get(sku);
       if (mappings && mappings.length > 0) {
-        product = productsMap.get(mappings[0].ne_code);
-        resolveMethod = 'sku_map';
+        if (mappings.length === 1) {
+          // 単品: 1 SKU = 1 ne_code
+          product = productsMap.get((mappings[0].ne_code || '').toLowerCase());
+          resolveMethod = 'sku_map';
+        } else {
+          // セット商品: 1 SKU = N components → 全構成品を解決して合算
+          // 数量検証: NULL→1扱い、0/負数/非整数→invalid_quantity で hard fail
+          const components = mappings.map(m => {
+            const rawQty = m.数量;
+            const validQty = (rawQty == null) ? 1
+              : (Number.isInteger(rawQty) && rawQty > 0) ? rawQty : null;
+            return {
+              ne_code: m.ne_code,
+              qty: validQty,
+              rawQty,
+              product: productsMap.get((m.ne_code || '').toLowerCase()),
+            };
+          });
+
+          // invalid_quantity: 構成品の数量が 0/負数/非数値
+          const invalidQty = components.filter(c => c.qty === null);
+          if (invalidQty.length > 0) {
+            resolved.push({ ...row, 商品コード: null, 原価: 0, 税率: null, 売上分類: null, 解決方法: 'invalid_quantity' });
+            conflicts.push({ sku, type: 'invalid_quantity', invalidQty: invalidQty.map(c => ({ ne_code: c.ne_code, rawQty: c.rawQty })) });
+            continue;
+          }
+
+          // partial_component: 構成品の一部が mirror_products に存在しない
+          const missing = components.filter(c => !c.product).map(c => c.ne_code);
+          if (missing.length > 0) {
+            resolved.push({ ...row, 商品コード: null, 原価: 0, 税率: null, 売上分類: null, 解決方法: 'partial_component' });
+            conflicts.push({ sku, type: 'partial_component', missing });
+            continue;
+          }
+
+          // mixed_tax: 構成品で税率が混在
+          const taxRates = [...new Set(components.map(c => c.product.消費税率))];
+          if (taxRates.length > 1) {
+            resolved.push({ ...row, 商品コード: null, 原価: 0, 税率: null, 売上分類: null, 解決方法: 'mixed_tax' });
+            conflicts.push({ sku, type: 'mixed_tax', taxRates });
+            continue;
+          }
+
+          // mixed_segment: 構成品で売上分類が混在
+          const segments = [...new Set(components.map(c => c.product.売上分類))];
+          if (segments.length > 1) {
+            resolved.push({ ...row, 商品コード: null, 原価: 0, 税率: null, 売上分類: null, 解決方法: 'mixed_segment' });
+            conflicts.push({ sku, type: 'mixed_segment', segments });
+            continue;
+          }
+
+          // セット合算: 原価は構成品(原価×数量)の合計
+          const totalGenka = components.reduce((sum, c) => sum + (c.product.原価 || 0) * (c.qty || 1), 0);
+          resolved.push({
+            ...row,
+            商品コード: components[0].product.商品コード,
+            原価: totalGenka,
+            税率: components[0].product.消費税率 ? Math.round(components[0].product.消費税率 * 100) : null,
+            売上分類: components[0].product.売上分類,
+            解決方法: 'set_components',
+            components: components.map(c => ({ ne_code: c.ne_code, qty: c.qty })),
+          });
+          continue; // セット処理完了
+        }
       }
     }
 
@@ -148,7 +218,13 @@ function resolveSkus(rows, db) {
     }
   }
 
-  return { resolved, unresolved: [...unresolved.values()], zeroGenka: [...zeroGenka.values()], unresolvedTax: [...unresolvedTax.values()] };
+  return {
+    resolved,
+    unresolved: [...unresolved.values()],
+    zeroGenka: [...zeroGenka.values()],
+    unresolvedTax: [...unresolvedTax.values()],
+    conflicts,
+  };
 }
 
 // ─── 集計 ───
@@ -349,7 +425,7 @@ router.post('/upload', upload.single('file'), (req, res) => {
   const yearMonth = firstDate.slice(0, 7).replace('/', '-');
 
   // SKU解決
-  const { resolved, unresolved, zeroGenka, unresolvedTax } = resolveSkus(parsedRows, db);
+  const { resolved, unresolved, zeroGenka, unresolvedTax, conflicts } = resolveSkus(parsedRows, db);
 
   // 集計
   const { byTax, bySegment, excluded, otherDetails, columns, mfRow, mfColumns } = aggregate(resolved);
@@ -395,16 +471,31 @@ router.post('/upload', upload.single('file'), (req, res) => {
     summaryCsv += key + ':' + label + ',' + columns.map(c => row[c] || 0).join(',') + ',' + (row.原価合計 || 0) + '\n';
   }
 
-  evidenceStore.set(yearMonth, { detail: detailCsv, summary: summaryCsv });
+  // /confirm でサーバ側の真値として使うため集計結果も保管 (Codex 3R #1: 改竄防御)
+  const canConfirm = unresolved.length === 0 && unresolvedTax.length === 0 && conflicts.length === 0;
+  evidenceStore.set(yearMonth, {
+    detail: detailCsv,
+    summary: summaryCsv,
+    serverState: {
+      totalRows: parsedRows.length,
+      resolvedCount: resolved.filter(r => r.解決方法 !== 'unresolved' && r.解決方法 !== 'skip' && r.解決方法 !== 'no_sku' && !['mixed_tax','mixed_segment','partial_component','invalid_quantity'].includes(r.解決方法)).length,
+      unresolvedCount: unresolved.length,
+      unresolvedTaxCount: unresolvedTax.length,
+      conflictsCount: conflicts.length,
+      canConfirm,
+      byTax, bySegment, excluded, mfRow,
+    },
+  });
 
   res.json({
     yearMonth,
     totalRows: parsedRows.length,
-    resolvedCount: resolved.filter(r => r.解決方法 !== 'unresolved' && r.解決方法 !== 'skip' && r.解決方法 !== 'no_sku').length,
+    resolvedCount: resolved.filter(r => r.解決方法 !== 'unresolved' && r.解決方法 !== 'skip' && r.解決方法 !== 'no_sku' && !['mixed_tax','mixed_segment','partial_component','invalid_quantity'].includes(r.解決方法)).length,
     unresolvedSkus: unresolved,
     unresolvedTaxCount,
     unresolvedTax,
-    canConfirm: unresolved.length === 0 && unresolvedTax.length === 0,
+    canConfirm: unresolved.length === 0 && unresolvedTax.length === 0 && conflicts.length === 0,
+    conflicts,
     byTax,
     bySegment,
     excluded,
@@ -512,6 +603,12 @@ function renderPage() {
         <div id="unresolvedTaxList"></div>
       </div>
 
+      <div id="conflictsCard" class="card" style="display:none">
+        <h2>⚠️ セット商品の解決エラー</h2>
+        <p class="meta">セット商品(1 SKU = N構成品)で、構成品の税率/売上分類が混在しているか、構成品が商品マスタに見つかりません。確定できません。</p>
+        <div id="conflictsList"></div>
+      </div>
+
       <div class="card">
         <h2>税率別集計</h2>
         <div id="taxTable"></div>
@@ -602,15 +699,20 @@ function renderPage() {
       summaryHtml += '<b>対象年月: ' + data.yearMonth + '</b><br>';
       summaryHtml += '総行数: ' + data.totalRows + ' / SKU解決済: ' + data.resolvedCount + ' / 未登録SKU: ' + data.unresolvedSkus.length + '件';
       if (data.unresolvedTax && data.unresolvedTax.length > 0) summaryHtml += ' / <span class="negative">税率未登録: ' + data.unresolvedTax.length + '商品</span>';
+      if (data.conflicts && data.conflicts.length > 0) summaryHtml += ' / <span class="negative">セット解決エラー: ' + data.conflicts.length + '件</span>';
       if (data.canConfirm) summaryHtml += '<br><b style="color:#27ae60">✅ 全て解決済み — 確定可能</b>';
       else {
         const reasons = [];
         if (data.unresolvedSkus.length > 0) reasons.push('未登録SKU');
         if (data.unresolvedTax && data.unresolvedTax.length > 0) reasons.push('税率未登録');
+        if (data.conflicts && data.conflicts.length > 0) reasons.push('セット解決エラー');
         summaryHtml += '<br><b style="color:#e74c3c">❌ ' + reasons.join('・') + 'あり — 確定不可</b>';
       }
       summaryHtml += '</div>';
       document.getElementById('summary').innerHTML = summaryHtml;
+      // 確定ボタンの disabled 制御 (hard fail)
+      const confirmBtn = document.getElementById('confirmBtn');
+      if (confirmBtn) confirmBtn.disabled = !data.canConfirm;
 
       // 未登録SKU
       if (data.unresolvedSkus.length > 0) {
@@ -624,6 +726,27 @@ function renderPage() {
         document.getElementById('unresolvedList').innerHTML = html;
       } else {
         document.getElementById('unresolvedCard').style.display = 'none';
+      }
+
+      // セット解決エラー (mixed_tax / mixed_segment / partial_component)
+      if (data.conflicts && data.conflicts.length > 0) {
+        const card = document.getElementById('conflictsCard');
+        card.style.display = 'block';
+        const typeLabels = { mixed_tax: '税率混在', mixed_segment: '売上分類混在', partial_component: '構成品欠損', invalid_quantity: '数量不正' };
+        let html = '<table class="detail-table"><tr><th>SKU</th><th>エラー種別</th><th>詳細</th></tr>';
+        for (const c of data.conflicts) {
+          const label = typeLabels[c.type] || c.type;
+          let detail = '';
+          if (c.type === 'mixed_tax') detail = '税率: ' + (c.taxRates || []).map(r => (r * 100).toFixed(0) + '%').join(', ');
+          else if (c.type === 'mixed_segment') detail = '分類: ' + (c.segments || []).join(', ');
+          else if (c.type === 'partial_component') detail = '欠損ne_code: ' + (c.missing || []).join(', ');
+          else if (c.type === 'invalid_quantity') detail = '不正数量: ' + (c.invalidQty || []).map(q => q.ne_code + '=' + q.rawQty).join(', ');
+          html += '<tr><td style="text-align:left">' + c.sku + '</td><td>' + label + '</td><td style="text-align:left">' + detail + '</td></tr>';
+        }
+        html += '</table>';
+        document.getElementById('conflictsList').innerHTML = html;
+      } else {
+        document.getElementById('conflictsCard').style.display = 'none';
       }
 
       // 税率未登録
@@ -804,6 +927,10 @@ function renderPage() {
 
     async function doConfirm() {
       if (!lastData) { alert('先にCSVをアップロードしてください'); return; }
+      if (!lastData.canConfirm) {
+        alert('未登録SKU・税率未登録・セット解決エラーが残っています。確定できません。');
+        return;
+      }
       if (!confirm(lastData.yearMonth + ' の集計を確定しますか？')) return;
       const btn = document.getElementById('confirmBtn');
       btn.disabled = true;
@@ -815,14 +942,8 @@ function renderPage() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             yearMonth: lastData.yearMonth,
-            totalRows: lastData.totalRows,
-            resolvedCount: lastData.resolvedCount,
-            unresolvedCount: lastData.unresolvedSkus?.length || 0,
-            byTax: lastData.byTax,
-            bySegment: lastData.bySegment,
-            excluded: lastData.excluded,
-            mfRow: lastData.mfRow,
             adCost,
+            csvFilename: document.getElementById('csvFile').files[0]?.name || '',
           }),
         });
         const result = await r.json();
@@ -1159,10 +1280,22 @@ router.get('/evidence/:type/:yearMonth', (req, res) => {
 
 router.post('/confirm', (req, res) => {
   const db = getMirrorDB();
-  const { yearMonth, totalRows, resolvedCount, unresolvedCount,
-    byTax, bySegment, excluded, mfRow, adCost, csvFilename } = req.body;
+  const { yearMonth, adCost, csvFilename } = req.body;
 
   if (!yearMonth) return res.status(400).json({ error: 'yearMonth は必須です' });
+
+  // サーバ側保管値を真値として使う (Codex 3R #1: クライアント申告値の改竄防御)
+  const cached = evidenceStore.get(yearMonth);
+  if (!cached || !cached.serverState) {
+    return res.status(400).json({ error: 'アップロード結果が見つかりません。CSVを再アップロードしてください' });
+  }
+  const s = cached.serverState;
+  if (!s.canConfirm) {
+    if (s.unresolvedCount > 0) return res.status(400).json({ error: '未登録SKUが残っているため確定できません' });
+    if (s.unresolvedTaxCount > 0) return res.status(400).json({ error: '税率未登録があるため確定できません' });
+    if (s.conflictsCount > 0) return res.status(400).json({ error: 'セット解決エラー(税率/分類混在・構成品欠損・数量不正)があるため確定できません' });
+    return res.status(400).json({ error: '確定不可状態です' });
+  }
 
   try {
     const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
@@ -1171,15 +1304,15 @@ router.post('/confirm', (req, res) => {
        by_tax, by_segment, excluded, mf_row, ad_cost, confirmed_at, csv_filename)
       VALUES (?,?,?,?,?,?,?,?,?,?,?)
     `).run(
-      yearMonth, totalRows || 0, resolvedCount || 0, unresolvedCount || 0,
-      JSON.stringify(byTax), JSON.stringify(bySegment), JSON.stringify(excluded),
-      JSON.stringify(mfRow), adCost || 0, now, csvFilename || ''
+      yearMonth, s.totalRows, s.resolvedCount, s.unresolvedCount,
+      JSON.stringify(s.byTax), JSON.stringify(s.bySegment), JSON.stringify(s.excluded),
+      JSON.stringify(s.mfRow), adCost || 0, now, csvFilename || ''
     );
 
     db.prepare(`INSERT INTO mart_amazon_upload_log
       (year_month, filename, total_rows, resolved_count, unresolved_count, uploaded_at)
       VALUES (?,?,?,?,?,?)
-    `).run(yearMonth, csvFilename || '', totalRows || 0, resolvedCount || 0, unresolvedCount || 0, now);
+    `).run(yearMonth, csvFilename || '', s.totalRows, s.resolvedCount, s.unresolvedCount, now);
 
     res.json({ ok: true, yearMonth, confirmed_at: now });
   } catch (e) {

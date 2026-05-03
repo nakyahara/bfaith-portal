@@ -271,14 +271,23 @@ router.post('/api/listings', async (req, res) => {
     try {
       const db = getMirrorDB();
 
-      // mirror_sku_map: seller_sku → ne_code
-      const skuMappings = db.prepare('SELECT seller_sku, ne_code, 数量 FROM mirror_sku_map').all();
+      // SKU解決マップ: seller_sku → ne_code
+      // 既定: mirror_sku_resolved (master優先 + sku_map fallback)
+      // env WAREHOUSE_SKU_SOURCE=legacy で旧 mirror_sku_map 直参照に戻せる
+      const useLegacySku = process.env.WAREHOUSE_SKU_SOURCE === 'legacy';
+      const skuMappings = useLegacySku
+        ? db.prepare('SELECT seller_sku, ne_code, 数量 FROM mirror_sku_map').all()
+        : db.prepare('SELECT seller_sku, ne_code, quantity AS 数量 FROM mirror_sku_resolved').all();
       const skuToNe = new Map();
       for (const m of skuMappings) {
         if (!skuToNe.has(m.seller_sku?.toLowerCase())) {
           skuToNe.set(m.seller_sku?.toLowerCase(), []);
         }
-        skuToNe.get(m.seller_sku?.toLowerCase()).push({ ne_code: m.ne_code, qty: m.数量 || 1 });
+        // 数量検証: NULL→1扱い、0/負数/非整数→null (invalid)
+        const rawQty = m.数量;
+        const validQty = (rawQty == null) ? 1
+          : (Number.isInteger(rawQty) && rawQty > 0) ? rawQty : null;
+        skuToNe.get(m.seller_sku?.toLowerCase()).push({ ne_code: m.ne_code, qty: validQty, rawQty });
       }
 
       // mirror_products: 商品コード → 原価, 消費税率
@@ -295,6 +304,12 @@ router.post('/api/listings', async (req, res) => {
 
         const neEntries = skuToNe.get(sku.toLowerCase());
         if (neEntries && neEntries.length > 0) {
+          // 数量invalid な構成品があれば cost計算スキップ
+          const hasInvalidQty = neEntries.some(e => e.qty === null);
+          if (hasInvalidQty) {
+            // costMap には入れない (UI 上で原価未解決として警告)
+            continue;
+          }
           // セット商品: 構成品の原価 × 数量の合計
           let totalCost = 0;
           let taxRate = 10;
@@ -312,7 +327,8 @@ router.post('/api/listings', async (req, res) => {
             }
           }
 
-          if (allFound && totalCost > 0) {
+          // Codex指摘D: totalCost > 0 制約を外す (正当な0円原価SKUを落とさない)
+          if (allFound) {
             costMap.set(sku.toLowerCase(), {
               cost: totalCost,
               taxRate,
