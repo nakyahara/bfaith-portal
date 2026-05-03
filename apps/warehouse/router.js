@@ -577,28 +577,26 @@ router.post('/api/genka', (req, res) => {
   res.json({ ok: true, sku, genka });
 });
 
-// ─── POST /api/skumap ───
-// SKUマップ登録・更新
-
+// ─── POST /api/skumap (廃止予定 — 410 Gone) ───
+// SKU管理統合 Step 3: sku_map writer 停止。
+// SKU 登録は SKUマスタ (POST /api/m-sku-master) を使うこと。
 router.post('/api/skumap', (req, res) => {
-  const seller_sku = (req.body.seller_sku || '').toLowerCase();
-  const ne_code = (req.body.ne_code || '').toLowerCase();
-  const { asin, product_name, quantity } = req.body;
-  if (!seller_sku || !ne_code) return res.status(400).json({ error: 'seller_sku と ne_code は必須です' });
-  const db = getDB();
-  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
-  const old = db.prepare('SELECT * FROM sku_map WHERE seller_sku = ? AND ne_code = ?').get(seller_sku, ne_code);
-  const newData = { seller_sku, asin: asin || '', ne_code, quantity: parseInt(quantity) || 1 };
-  db.prepare('INSERT OR REPLACE INTO sku_map (seller_sku, asin, 商品名, ne_code, 数量, synced_at) VALUES (?, ?, ?, ?, ?, ?)').run(seller_sku, asin || '', product_name || '', ne_code, parseInt(quantity) || 1, now);
-  auditLog(db, 'sku_map', seller_sku + ':' + ne_code, old ? 'UPDATE' : 'INSERT', old || null, newData);
-  // unmapped_salesから該当SKUを削除（リアルタイム反映）
-  try {
-    db.prepare('DELETE FROM unmapped_sales WHERE モール商品コード = ?').run(seller_sku);
-  } catch {}
-  res.json({ ok: true, seller_sku, ne_code });
+  res.status(410).json({
+    error: 'SKUマップへの直接登録は廃止されました。SKUマスタ (POST /api/m-sku-master) を使ってください',
+  });
+});
+router.post('/api/csv/skumap', (req, res) => {
+  res.status(410).json({
+    error: 'SKUマップへのCSV一括登録は廃止されました。SKUマスタ用CSVを使ってください',
+  });
+});
+router.delete('/api/skumap/:sku', (req, res) => {
+  res.status(410).json({
+    error: 'SKUマップ削除は廃止されました。SKUマスタ (DELETE /api/m-sku-master/:sku) を使ってください',
+  });
 });
 
-// ─── CSV アップロード（送料・原価・SKUマップ共通） ───
+// ─── CSV アップロード（送料・原価共通） ───
 
 function parseCsvBuffer(buf) {
   // UTF-8 BOM or Shift-JIS 自動判定
@@ -701,38 +699,7 @@ router.post('/api/csv/genka', upload.single('file'), (req, res) => {
   res.json({ ok: true, imported: count, skipped, total: dataRows.length });
 });
 
-// POST /api/csv/skumap — SKUマップCSV一括登録
-// CSV形式: seller_sku, ne_code, 数量（任意、デフォルト1）, ASIN（任意）
-router.post('/api/csv/skumap', upload.single('file'), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'ファイルが必要です' });
-  const db = getDB();
-  const buf = fs.readFileSync(req.file.path);
-  fs.unlinkSync(req.file.path);
-  const rows = parseCsvBuffer(buf);
-  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
-
-  let dataRows = rows;
-  if (dataRows.length > 0 && /seller_sku|SKU|商品コード/i.test(dataRows[0][0])) dataRows = dataRows.slice(1);
-
-  const stmt = db.prepare('INSERT OR REPLACE INTO sku_map (seller_sku, asin, 商品名, ne_code, 数量, synced_at) VALUES (?, ?, ?, ?, ?, ?)');
-  const delUnmapped = db.prepare('DELETE FROM unmapped_sales WHERE モール商品コード = ?');
-
-  let count = 0, skipped = 0;
-  const tx = db.transaction(() => {
-    for (const row of dataRows) {
-      const sellerSku = (row[0] || '').toLowerCase().trim();
-      const neCode = (row[1] || '').toLowerCase().trim();
-      if (!sellerSku || !neCode) { skipped++; continue; }
-      const qty = parseInt(row[2]) || 1;
-      const asin = (row[3] || '').trim();
-      stmt.run(sellerSku, asin, '', neCode, qty, now);
-      try { delUnmapped.run(sellerSku); } catch {}
-      count++;
-    }
-  });
-  tx();
-  res.json({ ok: true, imported: count, skipped, total: dataRows.length });
-});
+// POST /api/csv/skumap は SKU管理統合 Step 3 で 410 Gone 化済 (上部参照)
 
 // POST /api/csv/m-sku-master — SKUマスタ（商品コード変換テーブル）CSV一括登録
 // CSV形式: sku, asin, 商品名, NE商品コード, 数量, ...（19列、先頭4列を使用）UTF-8固定、最大10MB
@@ -792,24 +759,7 @@ router.delete('/api/genka/:sku', (req, res) => {
   res.json({ ok: true, deleted: result.changes });
 });
 
-// ─── DELETE /api/skumap/:sku ───
-// ne_codeが指定されていればその1行、なければSKU全行を削除
-
-router.delete('/api/skumap/:sku', (req, res) => {
-  const db = getDB();
-  const ne_code = req.query.ne_code;
-  if (ne_code) {
-    const old = db.prepare('SELECT * FROM sku_map WHERE seller_sku = ? AND ne_code = ?').get(req.params.sku, ne_code);
-    const result = db.prepare('DELETE FROM sku_map WHERE seller_sku = ? AND ne_code = ?').run(req.params.sku, ne_code);
-    if (old) auditLog(db, 'sku_map', req.params.sku + ':' + ne_code, 'DELETE', old, null);
-    res.json({ ok: true, deleted: result.changes });
-  } else {
-    const olds = db.prepare('SELECT * FROM sku_map WHERE seller_sku = ?').all(req.params.sku);
-    const result = db.prepare('DELETE FROM sku_map WHERE seller_sku = ?').run(req.params.sku);
-    for (const old of olds) auditLog(db, 'sku_map', req.params.sku + ':' + old.ne_code, 'DELETE', old, null);
-    res.json({ ok: true, deleted: result.changes });
-  }
-});
+// DELETE /api/skumap/:sku は SKU管理統合 Step 3 で 410 Gone 化済 (上部参照)
 
 // ─── GET /api/shipping/list ───
 // 送料マスタ検索（編集用）
@@ -1418,7 +1368,6 @@ function renderRegisterPage(shippingRates) {
       <div class="tabs">
         <button class="active" onclick="switchManage('shipping',this)">送料</button>
         <button onclick="switchManage('genka',this)">原価</button>
-        <button onclick="switchManage('skumap',this)">SKUマップ</button>
         <button onclick="switchManage('m-sku-master',this)">SKUマスタ</button>
         <button onclick="switchManage('sales_class',this)">売上分類</button>
         <button onclick="switchManage('tax_rate',this)">税率</button>
@@ -1452,7 +1401,6 @@ function renderRegisterPage(shippingRates) {
       <div class="tabs">
         <button class="active" id="csv-tab-shipping" onclick="switchCsvType('shipping',this)">送料</button>
         <button id="csv-tab-genka" onclick="switchCsvType('genka',this)">原価</button>
-        <button id="csv-tab-skumap" onclick="switchCsvType('skumap',this)">SKUマップ</button>
         <button id="csv-tab-msku" onclick="switchCsvType('m-sku-master',this)">SKUマスタ</button>
         <button id="csv-tab-salesclass" onclick="switchCsvType('sales_class',this)">売上分類</button>
         <button id="csv-tab-taxrate" onclick="switchCsvType('tax_rate',this)">税率</button>
@@ -1654,27 +1602,38 @@ function renderRegisterPage(shippingRates) {
           const container = tr.querySelector('.sku-mapping-rows');
           if (!container) { btn.disabled=false; return; }
           const rows = container.querySelectorAll('.sku-row');
-          let registered = 0;
+          // SKU管理統合 Step 3: SKUマスタ (m_sku_master + m_sku_components) に登録
+          const components = [];
           for (const row of rows) {
             const neInput = row.querySelector('input[data-suggest]');
             const qtyInput = row.querySelectorAll('input')[1];
             const neCode = neInput?.value?.trim();
             if (!neCode) continue;
             const qty = parseInt(qtyInput?.value) || 1;
-            await api('/api/skumap', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({seller_sku:sku,ne_code:neCode,product_name:name,quantity:qty})});
-            registered++;
+            components.push({ne_code: neCode, 数量: qty, sort_order: components.length});
           }
-          if (registered === 0) { btn.disabled=false; return; }
-          toast(sku+' のSKUマップを'+registered+'件登録');
+          if (components.length === 0) { btn.disabled=false; return; }
+          try {
+            await api('/api/m-sku-master', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({seller_sku:sku, 商品名:name, components})});
+          } catch (e) {
+            toast('登録失敗: ' + (e.message || ''));
+            btn.disabled=false; return;
+          }
+          toast(sku+' をSKUマスタに登録 ('+components.length+'構成品)');
           tr.classList.add('done-row');
           setTimeout(() => tr.remove(), 600);
           updateCount('sku_map', -1);
         } else if (act === 'reg-sku') {
-          // 旧形式の互換性（マスタ管理画面等から）
+          // 旧形式の互換性（マスタ管理画面等から）→ SKUマスタ単品登録
           const inp = tr.querySelector('input[data-suggest]');
           if (!inp || !inp.value) { btn.disabled=false; return; }
-          await api('/api/skumap', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({seller_sku:sku,ne_code:inp.value,product_name:name})});
-          toast(sku+' のSKUマップを登録');
+          try {
+            await api('/api/m-sku-master', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({seller_sku:sku, 商品名:name, components:[{ne_code: inp.value, 数量: 1, sort_order: 0}]})});
+          } catch (e) {
+            toast('登録失敗: ' + (e.message || ''));
+            btn.disabled=false; return;
+          }
+          toast(sku+' をSKUマスタに登録');
           tr.classList.add('done-row');
           setTimeout(() => tr.remove(), 600);
           updateCount('sku_map', -1);
