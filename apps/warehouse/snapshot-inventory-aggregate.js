@@ -223,8 +223,9 @@ export function aggregateInventoryDetail(businessDate) {
     for (const r of db.prepare(`SELECT 商品コード, 商品名, 商品区分, 取扱区分, 売上分類, 原価, 仕入先コード, seasonality_flag, season_months, new_product_flag, new_product_launch_date FROM m_products`).all()) {
       mProducts.set(r.商品コード, r);
     }
+    // 注: ロケーションコードは取得しない (WMS が正、NE側のは古い/不正確)
     const rawNe = new Map(); // ne_code → { ... }
-    for (const r of db.prepare(`SELECT 商品コード, 引当数, 発注残数, ロケーションコード, 最終仕入日, 代表商品コード, 発注ロット単位 FROM raw_ne_products`).all()) {
+    for (const r of db.prepare(`SELECT 商品コード, 引当数, 発注残数, 最終仕入日, 代表商品コード, 発注ロット単位 FROM raw_ne_products`).all()) {
       rawNe.set(r.商品コード, r);
     }
 
@@ -315,7 +316,7 @@ export function aggregateInventoryDetail(businessDate) {
         fba_unfulfillable_qty: opts.fba_unfulfillable_qty ?? null,
         reserved_qty: (category === 'own_warehouse') ? (ne?.引当数 ?? null) : null,
         pending_order_qty: (category === 'own_warehouse') ? (ne?.発注残数 ?? null) : null,
-        location_code: (category === 'own_warehouse') ? (ne?.ロケーションコード ?? null) : null,
+        location_code: null, // WMS が source of truth、NE 側のは不正確なので保存しない
         last_purchase_date: (category === 'own_warehouse') ? (ne?.最終仕入日 ?? null) : null,
         snapshot_run_id: snapshotRunId,
       };

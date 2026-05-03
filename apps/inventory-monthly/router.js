@@ -836,7 +836,7 @@ function loadDailyDetailRows(db, date, opts = {}) {
            last_sold_date, sales_7d_qty, sales_30d_qty, sales_90d_qty,
            sales_7d_value, sales_30d_value, sales_90d_value,
            working_first_seen, fba_unfulfillable_qty,
-           reserved_qty, pending_order_qty, location_code, last_purchase_date,
+           reserved_qty, pending_order_qty, last_purchase_date,
            CASE WHEN sales_30d_qty > 0 THEN ROUND(qty * 30.0 / sales_30d_qty, 1) ELSE NULL END AS days_of_supply,
            CASE WHEN qty > 0 AND sales_30d_qty > 0 THEN ROUND(365.0 * sales_30d_qty / (qty * 30.0), 2) ELSE NULL END AS turnover_yearly,
            CASE WHEN (sales_90d_qty IS NULL OR sales_90d_qty = 0) AND qty > 0 THEN 1 ELSE 0 END AS is_stale
@@ -892,9 +892,23 @@ router.get('/daily/:date', (req, res) => {
     if (r.new_product_flag) return '<span style="background:#27ae60;color:white;padding:1px 6px;border-radius:3px;font-size:11px">新商品</span>';
     return '';
   }
+  const CATEGORY_LABEL = {
+    fba_warehouse: 'FBA倉庫',
+    fba_inbound:   'FBA輸送中',
+    own_warehouse: '自社倉庫',
+    fba_us:        '米国FBA',
+    pending_orders:'発注後未着',
+  };
+  const PRODUCT_TYPE_BADGE = (t) => {
+    if (!t) return '';
+    const colors = { 'セット': '#3498db', '単品': '#95a5a6', '例外': '#e67e22' };
+    const c = colors[t] || '#7f8c8d';
+    return `<span style="background:${c};color:white;padding:1px 6px;border-radius:3px;font-size:11px">${esc(t)}</span>`;
+  };
   const tableRows = rows.map(r => `
     <tr>
-      <td><span style="font-size:10px;color:#888">${esc(r.category)}</span></td>
+      <td><span style="font-size:11px">${esc(CATEGORY_LABEL[r.category] || r.category)}</span></td>
+      <td>${PRODUCT_TYPE_BADGE(r.product_type)}</td>
       <td><code style="font-size:11px">${esc(r.ne_code)}</code></td>
       <td>${esc((r.product_name || r.source_product_name || '').slice(0, 38))}</td>
       <td><small>${esc(r.supplier_code || '')}</small></td>
@@ -905,7 +919,6 @@ router.get('/daily/:date', (req, res) => {
       ${fmtCell(r.sales_30d_value, 'yen')}
       ${fmtCell(r.days_of_supply, 'num')}
       <td><small>${esc(r.last_sold_date || '')}</small></td>
-      <td><small>${esc(r.location_code || '')}</small></td>
       <td>${statusBadge(r)}</td>
     </tr>
   `).join('');
@@ -921,12 +934,21 @@ router.get('/daily/:date', (req, res) => {
   </div>
 </div>
 
+<div class="card" style="font-size:12px;color:#555;background:#eef5ff;border-color:#b3d4fc">
+  <b>用語の意味</b><br>
+  ・<b>FBA倉庫</b> = Amazon FBA フルフィルメントセンター内の在庫 (在庫あり + FC移管中 + FC処理中 + 出荷待ち)<br>
+  ・<b>FBA輸送中</b> = Amazon FBA に向けて輸送中の在庫 (進行中 + 出荷済み + 受領中)<br>
+  ・<b>自社倉庫</b> = NextEngine が管理する自社在庫 (引当数を含む)<br>
+  ・<b>DOS</b> (Days of Supply) = 在庫が何日もつか = 在庫数 ÷ (30日売上 ÷ 30日)。値が大きいほど滞留傾向<br>
+  ・<b>状態バッジ</b>: 滞留(90日売上0) / 原価不明 / 未解決(NE紐付けなし) / 季節 / 新商品
+</div>
+
 <div class="card">
   <h3 style="margin:0 0 6px;font-size:14px">カテゴリ別サマリ</h3>
   <table style="width:auto;font-size:13px">
     <thead><tr><th>カテゴリ</th><th>行数</th><th>合計数量</th><th>合計金額</th></tr></thead>
     <tbody>
-      ${summary.map(s => `<tr><td>${esc(s.category)}</td><td class="num">${s.cnt}</td><td class="num">${(s.sum_qty||0).toLocaleString()}</td><td class="num">¥${Math.round(s.sum_value||0).toLocaleString()}</td></tr>`).join('')}
+      ${summary.map(s => `<tr><td>${esc(CATEGORY_LABEL[s.category] || s.category)}</td><td class="num">${s.cnt}</td><td class="num">${(s.sum_qty||0).toLocaleString()}</td><td class="num">¥${Math.round(s.sum_value||0).toLocaleString()}</td></tr>`).join('')}
     </tbody>
   </table>
 </div>
@@ -963,10 +985,13 @@ router.get('/daily/:date', (req, res) => {
   <table>
     <thead>
       <tr>
-        <th>カテゴリ</th><th>NEコード</th><th>商品名</th><th>仕入先</th>
+        <th>カテゴリ</th>
+        <th title="商品マスタ上の区分 (セット/単品/例外)">商品区分</th>
+        <th>NEコード</th><th>商品名</th><th>仕入先</th>
         <th>数量</th><th>原価</th><th>金額</th>
-        <th>30日売上数</th><th>30日売上金額</th><th>DOS</th>
-        <th>最終売上日</th><th>場所</th><th>状態</th>
+        <th>30日売上数</th><th>30日売上金額</th>
+        <th title="Days of Supply: 在庫数 ÷ (30日売上 ÷ 30) = 在庫が何日もつか">DOS</th>
+        <th>最終売上日</th><th>状態</th>
       </tr>
     </thead>
     <tbody>${tableRows || '<tr><td colspan="13" style="text-align:center">該当なし</td></tr>'}</tbody>
@@ -1041,7 +1066,7 @@ router.get('/daily/:date/export.csv', (req, res) => {
     'last_sold_date','sales_7d_qty','sales_30d_qty','sales_90d_qty',
     'sales_7d_value','sales_30d_value','sales_90d_value',
     'working_first_seen','fba_unfulfillable_qty',
-    'reserved_qty','pending_order_qty','location_code','last_purchase_date',
+    'reserved_qty','pending_order_qty','last_purchase_date',
     'days_of_supply','turnover_yearly','is_stale',
   ];
   const escCsv = v => v == null ? '' : (/[,"\n\r]/.test(String(v)) ? '"' + String(v).replace(/"/g, '""') + '"' : String(v));
