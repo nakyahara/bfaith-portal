@@ -71,7 +71,8 @@ export async function rebuildFSales() {
     // 2. 楽天 → item_number ≒ NE商品コード
     rakutenRows = db.prepare(`
       SELECT SUBSTR(order_date, 1, 10) as date, LOWER(item_number) as item, MAX(item_name) as title,
-             SUM(units) as qty
+             SUM(units) as qty,
+             SUM(price_tax_incl * units) as amount
       FROM raw_rakuten_orders
       WHERE delete_item_flag = 0 AND order_status != 900
       GROUP BY date, item
@@ -80,7 +81,8 @@ export async function rebuildFSales() {
     // 3. NE受注（Yahoo/auPAY等）→ 既にセット展開済み
     neRows = db.prepare(`
       SELECT SUBSTR(o.受注日, 1, 10) as date, LOWER(o.商品コード) as code, s.platform as mall,
-             MAX(o.商品名) as title, SUM(o.受注数) as qty
+             MAX(o.商品名) as title, SUM(o.受注数) as qty,
+             SUM(o.小計金額) as amount
       FROM raw_ne_orders o
       INNER JOIN shops s ON o.店舗コード = s.shop_code
       WHERE o.キャンセル区分 = '有効'
@@ -184,30 +186,37 @@ export async function rebuildFSales() {
   // unmapped行も全部メモリに溜めて、Phase 3 でまとめて書き込む
   const unmappedRows = [];
 
-  function addProductSale(date, neCode, mall, productName, qty, isDirect) {
+  function addProductSale(date, neCode, mall, productName, qty, amount, isDirect) {
     const key = `${date}|${neCode}|${mall}`;
     if (!productSales.has(key)) {
-      productSales.set(key, { date, neCode, mall, productName, qty: 0, direct: 0, setQty: 0 });
+      productSales.set(key, { date, neCode, mall, productName, qty: 0, direct: 0, setQty: 0, amount: 0 });
     }
     const entry = productSales.get(key);
     entry.qty += qty;
+    if (amount != null && Number.isFinite(amount)) entry.amount += amount;
     if (isDirect) entry.direct += qty;
     else entry.setQty += qty;
   }
 
   // セット展開ヘルパー
-  function expandToProducts(date, neCode, mall, productName, saleQty) {
+  // saleAmount はセット販売の合計金額。セット → 構成品展開時は構成数比で按分。
+  function expandToProducts(date, neCode, mall, productName, saleQty, saleAmount) {
     const type = productTypes.get(neCode);
     const comps = setComponents.get(neCode);
 
     if (type === 'セット' && comps && comps.length > 0) {
-      // セット → 構成品に展開
+      // セット → 構成品に展開、金額は構成数 (qty) 比で按分
+      const totalCompQty = comps.reduce((s, c) => s + (c.qty || 1), 0);
       for (const comp of comps) {
-        addProductSale(date, comp.code, mall, '', saleQty * comp.qty, false);
+        const compQty = saleQty * comp.qty;
+        const compAmount = (saleAmount != null && totalCompQty > 0)
+          ? saleAmount * (comp.qty / totalCompQty)
+          : null;
+        addProductSale(date, comp.code, mall, '', compQty, compAmount, false);
       }
     } else {
       // 単品 or 例外 → そのまま
-      addProductSale(date, neCode, mall, productName, saleQty, true);
+      addProductSale(date, neCode, mall, productName, saleQty, saleAmount, true);
     }
   }
 
@@ -224,19 +233,26 @@ export async function rebuildFSales() {
       continue;
     }
     if (resolved.source === 'direct') directMatchCount++;
+    // resolved.mappings 複数件 (1 SKU = N components) のときは元金額を mapping 数量比で按分
+    const totalMapQty = resolved.mappings.reduce((s, m) => s + (m.qty || 1), 0);
     for (const m of resolved.mappings) {
-      expandToProducts(row.date, m.ne_code, 'amazon', row.title, row.qty * m.qty);
+      const expandQty = row.qty * m.qty;
+      const expandAmount = (row.amount != null && totalMapQty > 0)
+        ? row.amount * (m.qty / totalMapQty)
+        : null;
+      expandToProducts(row.date, m.ne_code, 'amazon', row.title, expandQty, expandAmount);
     }
   }
   log.push(`Amazon直接マッチ（sku_map不要）: ${directMatchCount}件`);
 
   for (const row of rakutenRows) {
-    expandToProducts(row.date, row.item, 'rakuten', row.title, row.qty);
+    expandToProducts(row.date, row.item, 'rakuten', row.title, row.qty, row.amount);
   }
 
   for (const row of neRows) {
     if (!row.mall || row.mall === '_ignore') continue;
-    addProductSale(row.date, row.code, row.mall, row.title, row.qty, true);
+    // NE は既にセット展開済みなので直接 addProductSale
+    addProductSale(row.date, row.code, row.mall, row.title, row.qty, row.amount, true);
   }
 
   const t2 = Date.now();
@@ -252,8 +268,8 @@ export async function rebuildFSales() {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertProduct = db.prepare(`
-    INSERT INTO f_sales_by_product (日付, 商品コード, モール, 商品名, 数量, 直接販売数, セット経由数, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO f_sales_by_product (日付, 商品コード, モール, 商品名, 数量, 直接販売数, セット経由数, 売上金額, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertUnmapped = db.prepare(`
     INSERT INTO unmapped_sales (日付, モール, モール商品コード, 商品名, 数量, 売上金額, 失敗理由, created_at)
@@ -280,9 +296,11 @@ export async function rebuildFSales() {
     }
 
     for (const [, entry] of productSales) {
+      // 売上金額: 集計値が >0 なら値、=0 なら NULL (情報無し vs 確定ゼロ を区別)
+      const amountVal = entry.amount > 0 ? Math.round(entry.amount) : null;
       insertProduct.run(
         entry.date, entry.neCode, entry.mall, entry.productName,
-        entry.qty, entry.direct, entry.setQty, ts
+        entry.qty, entry.direct, entry.setQty, amountVal, ts
       );
     }
   });
