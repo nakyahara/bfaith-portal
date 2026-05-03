@@ -769,10 +769,42 @@ function createTables() {
     source_row_count  INTEGER,
     captured_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     PRIMARY KEY (business_date, market, category),
-    CHECK (category IN ('fba_warehouse', 'fba_inbound', 'own_warehouse', 'fba_us')),
+    CHECK (category IN ('fba_warehouse', 'fba_inbound', 'own_warehouse', 'fba_us', 'fba_us_warehouse', 'fba_us_inbound')),
     CHECK (source_status IN ('ok', 'partial', 'failed', 'no_source'))
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_inv_daily_summary_date ON inv_daily_summary(business_date)');
+
+  // --- migration: 既存テーブルの CHECK 制約を新カテゴリ (fba_us_warehouse/fba_us_inbound) 対応に更新 ---
+  {
+    const sqlRow = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='inv_daily_summary'`).get();
+    if (sqlRow && !sqlRow.sql.includes('fba_us_warehouse')) {
+      console.log('[Warehouse] inv_daily_summary CHECK 制約を migration: fba_us_warehouse/fba_us_inbound 追加');
+      db.exec(`
+        BEGIN TRANSACTION;
+        CREATE TABLE inv_daily_summary_new (
+          business_date     TEXT NOT NULL,
+          market            TEXT NOT NULL DEFAULT 'jp',
+          category          TEXT NOT NULL,
+          total_qty         INTEGER NOT NULL,
+          total_value       REAL,
+          resolved_count    INTEGER NOT NULL DEFAULT 0,
+          unresolved_count  INTEGER NOT NULL DEFAULT 0,
+          cost_missing_count INTEGER NOT NULL DEFAULT 0,
+          source_status     TEXT NOT NULL,
+          source_row_count  INTEGER,
+          captured_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+          PRIMARY KEY (business_date, market, category),
+          CHECK (category IN ('fba_warehouse', 'fba_inbound', 'own_warehouse', 'fba_us', 'fba_us_warehouse', 'fba_us_inbound')),
+          CHECK (source_status IN ('ok', 'partial', 'failed', 'no_source'))
+        );
+        INSERT INTO inv_daily_summary_new SELECT * FROM inv_daily_summary;
+        DROP TABLE inv_daily_summary;
+        ALTER TABLE inv_daily_summary_new RENAME TO inv_daily_summary;
+        COMMIT;
+      `);
+      db.exec('CREATE INDEX IF NOT EXISTS idx_inv_daily_summary_date ON inv_daily_summary(business_date)');
+    }
+  }
 
   // 26. 在庫スナップショット詳細層 (drill-down + AI 分析用)
   // 1日 ~5,000-6,000行 × 365日 = 約 220万行/年。SQLite で十分扱える。
@@ -835,7 +867,7 @@ function createTables() {
     snapshot_run_id            TEXT NOT NULL,
     ingested_at                TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     PRIMARY KEY (business_date, market, category, source_system, source_item_code, ne_code),
-    CHECK (category IN ('fba_warehouse', 'fba_inbound', 'own_warehouse', 'fba_us', 'pending_orders')),
+    CHECK (category IN ('fba_warehouse', 'fba_inbound', 'own_warehouse', 'fba_us', 'fba_us_warehouse', 'fba_us_inbound', 'pending_orders')),
     CHECK (source_system IN ('ne', 'fba')),
     CHECK (cost_status IN ('ok', 'cost_missing', 'ne_missing')),
     CHECK (cost_source IS NULL OR cost_source IN ('m_products', 'fallback', 'missing')),
@@ -846,6 +878,75 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_inv_dd_date_cat ON inv_daily_detail(business_date, category)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_inv_dd_date_ne ON inv_daily_detail(business_date, ne_code)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_inv_dd_supplier ON inv_daily_detail(supplier_code)');
+
+  // --- migration: inv_daily_detail CHECK 制約も同様に更新 ---
+  {
+    const sqlRow = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='inv_daily_detail'`).get();
+    if (sqlRow && !sqlRow.sql.includes('fba_us_warehouse')) {
+      console.log('[Warehouse] inv_daily_detail CHECK 制約を migration: fba_us_warehouse/fba_us_inbound 追加');
+      db.exec(`
+        BEGIN TRANSACTION;
+        CREATE TABLE inv_daily_detail_new (
+          business_date              TEXT NOT NULL,
+          market                     TEXT NOT NULL DEFAULT 'jp',
+          category                   TEXT NOT NULL,
+          source_system              TEXT NOT NULL,
+          source_item_code           TEXT NOT NULL,
+          ne_code                    TEXT NOT NULL,
+          qty                        INTEGER NOT NULL,
+          unit_cost                  REAL,
+          total_value                REAL,
+          cost_status                TEXT NOT NULL,
+          cost_source                TEXT,
+          resolution_method          TEXT,
+          is_bundle_expanded         INTEGER NOT NULL DEFAULT 0,
+          component_qty              INTEGER,
+          product_name               TEXT,
+          source_product_name        TEXT,
+          supplier_code              TEXT,
+          product_type               TEXT,
+          handling_class             TEXT,
+          sales_class                INTEGER,
+          representative_product_code TEXT,
+          order_lot_size             INTEGER,
+          seasonality_flag           INTEGER,
+          season_months              TEXT,
+          new_product_flag           INTEGER,
+          new_product_launch_date    TEXT,
+          last_sold_date             TEXT,
+          sales_7d_qty               INTEGER,
+          sales_30d_qty              INTEGER,
+          sales_90d_qty              INTEGER,
+          sales_7d_value             REAL,
+          sales_30d_value            REAL,
+          sales_90d_value            REAL,
+          working_first_seen         TEXT,
+          fba_unfulfillable_qty      INTEGER,
+          reserved_qty               INTEGER,
+          pending_order_qty          INTEGER,
+          location_code              TEXT,
+          last_purchase_date         TEXT,
+          snapshot_run_id            TEXT NOT NULL,
+          ingested_at                TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+          PRIMARY KEY (business_date, market, category, source_system, source_item_code, ne_code),
+          CHECK (category IN ('fba_warehouse', 'fba_inbound', 'own_warehouse', 'fba_us', 'fba_us_warehouse', 'fba_us_inbound', 'pending_orders')),
+          CHECK (source_system IN ('ne', 'fba')),
+          CHECK (cost_status IN ('ok', 'cost_missing', 'ne_missing')),
+          CHECK (cost_source IS NULL OR cost_source IN ('m_products', 'fallback', 'missing')),
+          CHECK (resolution_method IS NULL OR resolution_method IN ('master', 'sku_map', 'direct', 'unresolved')),
+          CHECK (sales_class IS NULL OR sales_class IN (1, 2, 3, 4))
+        );
+        INSERT INTO inv_daily_detail_new SELECT * FROM inv_daily_detail;
+        DROP TABLE inv_daily_detail;
+        ALTER TABLE inv_daily_detail_new RENAME TO inv_daily_detail;
+        COMMIT;
+      `);
+      db.exec('CREATE INDEX IF NOT EXISTS idx_inv_dd_date ON inv_daily_detail(business_date)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_inv_dd_date_cat ON inv_daily_detail(business_date, category)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_inv_dd_date_ne ON inv_daily_detail(business_date, ne_code)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_inv_dd_supplier ON inv_daily_detail(supplier_code)');
+    }
+  }
 
   // 27. 集計実行ログ (Codex 推奨「壊れた run は採用しない」ガード)
   // snapshot_run_id ごとに件数・金額・NULL率を記録、status=failed の run は UI で除外
