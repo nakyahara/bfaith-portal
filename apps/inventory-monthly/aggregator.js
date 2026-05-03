@@ -310,13 +310,14 @@ export function aggregateFromMirror({ snapshot_date, pendingRows = [] }) {
 
   // [Codex R1 #2 / R2 #1] summary/detail 世代不一致チェック
   // sync は summary / detail を別 payload で送るため「summary は新、detail は古い」状態が一瞬発生し得る
-  // source_status='no_source' 以外 (= ソースが存在する category) は detail にも行が必要
-  // (total_value=0 でも source_status=partial で unresolved/cost_missing のみのケースを含む)
+  // 検出条件: total_qty > 0 の category は detail にも行が必要
+  //   - total_qty=0 (例: fba_us_inbound qty=0) なら detail 行は生成されないので check 不要
+  //   - total_qty>0 で source_status='partial'/cost_missing のみでも detail に SKU 行は生成される
   const detailCats = new Set(
     db.prepare(`SELECT DISTINCT category FROM mirror_inv_daily_detail WHERE business_date = ?`)
       .all(snapshot_date).map(r => r.category)
   );
-  const missingDetailCats = summaryRows.filter(r => r.source_status !== 'no_source' && !detailCats.has(r.category));
+  const missingDetailCats = summaryRows.filter(r => Number(r.total_qty || 0) > 0 && !detailCats.has(r.category));
   if (missingDetailCats.length > 0) {
     throw new Error(`${snapshot_date} の明細 (mirror_inv_daily_detail) が summary と一致しません (${missingDetailCats.map(r => r.category).join(',')} の detail 未着)。次回 sync 完了まで待ってください。`);
   }
