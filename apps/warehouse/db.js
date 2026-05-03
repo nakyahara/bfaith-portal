@@ -161,16 +161,51 @@ function createTables() {
   // 5. SKUマッピング（Amazon SKU ↔ NE商品コード、1 SKU = 複数NE商品コード可）
   db.exec(`CREATE TABLE IF NOT EXISTS sku_map (
     seller_sku          TEXT NOT NULL,
+    market              TEXT NOT NULL DEFAULT 'jp',
     asin                TEXT,
     商品名              TEXT,
     ne_code             TEXT NOT NULL,
     数量                INTEGER DEFAULT 1,
     synced_at           TEXT,
-    PRIMARY KEY (seller_sku, ne_code)
+    PRIMARY KEY (seller_sku, market, ne_code),
+    CHECK (market IN ('jp', 'us'))
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_sku_map_asin ON sku_map(asin)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_sku_map_ne ON sku_map(ne_code)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_sku_map_sku ON sku_map(seller_sku)');
+
+  // --- migration: sku_map に market 列を追加 (JP/US で同SKUを別商品として扱えるよう) ---
+  {
+    const sqlRow = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='sku_map'`).get();
+    if (sqlRow && !sqlRow.sql.toLowerCase().includes('market')) {
+      console.log('[Warehouse] sku_map に market 列追加 (既存 row は market=jp)');
+      // sku_map に依存する view を先に drop (後段 createTables で再作成)
+      db.exec(`
+        BEGIN TRANSACTION;
+        DROP VIEW IF EXISTS v_sku_costed;
+        DROP VIEW IF EXISTS v_sku_resolved;
+        CREATE TABLE sku_map_new (
+          seller_sku  TEXT NOT NULL,
+          market      TEXT NOT NULL DEFAULT 'jp',
+          asin        TEXT,
+          商品名      TEXT,
+          ne_code     TEXT NOT NULL,
+          数量        INTEGER DEFAULT 1,
+          synced_at   TEXT,
+          PRIMARY KEY (seller_sku, market, ne_code),
+          CHECK (market IN ('jp', 'us'))
+        );
+        INSERT INTO sku_map_new (seller_sku, market, asin, 商品名, ne_code, 数量, synced_at)
+          SELECT seller_sku, 'jp', asin, 商品名, ne_code, 数量, synced_at FROM sku_map;
+        DROP TABLE sku_map;
+        ALTER TABLE sku_map_new RENAME TO sku_map;
+        COMMIT;
+      `);
+      db.exec('CREATE INDEX IF NOT EXISTS idx_sku_map_asin ON sku_map(asin)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_sku_map_ne ON sku_map(ne_code)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_sku_map_sku ON sku_map(seller_sku)');
+    }
+  }
 
   // 6. 配送区分マスタ
   db.exec(`CREATE TABLE IF NOT EXISTS shipping_rates (
@@ -1009,6 +1044,7 @@ function createTables() {
   db.exec(`CREATE VIEW v_sku_resolved AS
     SELECT
       c.seller_sku,
+      NULL AS market,        -- master は cross-market (Global Selling 想定で全 market 共通)
       c.ne_code,
       c.数量,
       'master' AS source
@@ -1016,6 +1052,7 @@ function createTables() {
     UNION ALL
     SELECT
       s.seller_sku,
+      s.market,              -- sku_map は per row (default 'jp')
       s.ne_code,
       s.数量,
       'auto' AS source

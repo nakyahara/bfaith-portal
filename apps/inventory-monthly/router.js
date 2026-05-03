@@ -716,9 +716,11 @@ router.get('/daily', (req, res) => {
   // チャート用データ (古い順)
   const chartData = [...dates].reverse().map(d => ({
     date: d.date,
-    fba_warehouse: (d.fba_warehouse && d.fba_warehouse.source_status !== 'no_source') ? d.fba_warehouse.total_value || 0 : null,
-    fba_inbound:   (d.fba_inbound   && d.fba_inbound.source_status   !== 'no_source') ? d.fba_inbound.total_value   || 0 : null,
-    own_warehouse: (d.own_warehouse && d.own_warehouse.source_status !== 'no_source') ? d.own_warehouse.total_value || 0 : null,
+    fba_warehouse:    (d.fba_warehouse    && d.fba_warehouse.source_status    !== 'no_source') ? d.fba_warehouse.total_value    || 0 : null,
+    fba_inbound:      (d.fba_inbound      && d.fba_inbound.source_status      !== 'no_source') ? d.fba_inbound.total_value      || 0 : null,
+    own_warehouse:    (d.own_warehouse    && d.own_warehouse.source_status    !== 'no_source') ? d.own_warehouse.total_value    || 0 : null,
+    fba_us_warehouse: (d.fba_us_warehouse && d.fba_us_warehouse.source_status !== 'no_source') ? d.fba_us_warehouse.total_value || 0 : null,
+    fba_us_inbound:   (d.fba_us_inbound   && d.fba_us_inbound.source_status   !== 'no_source') ? d.fba_us_inbound.total_value   || 0 : null,
   }));
   const chartJson = JSON.stringify(chartData);
 
@@ -743,14 +745,18 @@ ${dates.length === 0 ? '<p>まだデータがありません。ミニPC で dail
   const data = ${chartJson};
   const labels = data.map(d => d.date);
   const palette = {
-    fba_warehouse: '#2c5aa0',
-    fba_inbound:   '#5b9bd5',
-    own_warehouse: '#70ad47',
+    fba_warehouse:    '#2c5aa0',
+    fba_inbound:      '#5b9bd5',
+    own_warehouse:    '#70ad47',
+    fba_us_warehouse: '#c0504d',
+    fba_us_inbound:   '#e08a87',
   };
   const labelMap = {
-    fba_warehouse: 'FBA倉庫',
-    fba_inbound:   'FBA輸送中',
-    own_warehouse: '自社倉庫',
+    fba_warehouse:    'FBA倉庫',
+    fba_inbound:      'FBA輸送中',
+    own_warehouse:    '自社倉庫',
+    fba_us_warehouse: '米国FBA倉庫',
+    fba_us_inbound:   '米国FBA輸送中',
   };
   const datasets = Object.keys(palette).map(key => ({
     label: labelMap[key],
