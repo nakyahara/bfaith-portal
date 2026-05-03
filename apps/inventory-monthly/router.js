@@ -704,7 +704,7 @@ router.get('/daily', (req, res) => {
 
   const tableRows = dates.map(d => `
     <tr>
-      <td>${esc(d.date)}</td>
+      <td><a href="daily/${esc(d.date)}">${esc(d.date)}</a></td>
       ${fmtVal(d.fba_warehouse)}
       ${fmtVal(d.fba_inbound)}
       ${fmtVal(d.own_warehouse)}
@@ -809,6 +809,246 @@ ${dates.length === 0 ? '' : `
 <p style="color:#888;font-size:11px;margin-top:8px">合計に「部分」と出る日: いずれかのカテゴリが no_source / cost_missing。月末確定値とは異なる可能性あり (月末ツールで確定値を出してください)。</p>
 `}
 `));
+});
+
+// D-3: 日次詳細ドリルダウン (商品別 Top N、フィルタ可)
+// /daily/:date  → HTML テーブル
+// /daily/:date/export.csv|json → AI 投入用エクスポート (D-4)
+function loadDailyDetailRows(db, date, opts = {}) {
+  const params = [date];
+  let where = `business_date = ?`;
+  if (opts.category) { where += ' AND category = ?'; params.push(opts.category); }
+  if (opts.supplier) { where += ' AND supplier_code = ?'; params.push(opts.supplier); }
+  if (opts.stale === '1') { where += ' AND (sales_90d_qty IS NULL OR sales_90d_qty = 0) AND qty > 0'; }
+  if (opts.q) {
+    where += ' AND (ne_code LIKE ? OR source_item_code LIKE ? OR product_name LIKE ? OR source_product_name LIKE ?)';
+    const q = '%' + opts.q + '%';
+    params.push(q, q, q, q);
+  }
+  const limit = Math.min(parseInt(opts.limit, 10) || 200, 5000);
+  const sql = `
+    SELECT business_date, category, source_system, source_item_code, ne_code,
+           qty, unit_cost, total_value, cost_status, resolution_method,
+           is_bundle_expanded, component_qty,
+           product_name, source_product_name, supplier_code,
+           product_type, handling_class, sales_class,
+           seasonality_flag, new_product_flag,
+           last_sold_date, sales_7d_qty, sales_30d_qty, sales_90d_qty,
+           sales_7d_value, sales_30d_value, sales_90d_value,
+           working_first_seen, fba_unfulfillable_qty,
+           reserved_qty, pending_order_qty, location_code, last_purchase_date,
+           CASE WHEN sales_30d_qty > 0 THEN ROUND(qty * 30.0 / sales_30d_qty, 1) ELSE NULL END AS days_of_supply,
+           CASE WHEN qty > 0 AND sales_30d_qty > 0 THEN ROUND(365.0 * sales_30d_qty / (qty * 30.0), 2) ELSE NULL END AS turnover_yearly,
+           CASE WHEN (sales_90d_qty IS NULL OR sales_90d_qty = 0) AND qty > 0 THEN 1 ELSE 0 END AS is_stale
+    FROM mirror_inv_daily_detail
+    WHERE ${where}
+    ORDER BY total_value DESC NULLS LAST
+    LIMIT ?
+  `;
+  params.push(limit);
+  return db.prepare(sql).all(...params);
+}
+
+router.get('/daily/:date', (req, res) => {
+  if (!ensureDbOrFailHtml(res)) return;
+  const date = (req.params.date || '').slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).send(renderLayout('日次詳細', '<div class="err">日付が不正</div>'));
+  const db = getDB();
+
+  // フィルタクエリ
+  const opts = {
+    category: req.query.category || '',
+    supplier: req.query.supplier || '',
+    stale: req.query.stale || '',
+    q: (req.query.q || '').slice(0, 50),
+    limit: req.query.limit || 200,
+  };
+
+  let rows;
+  try {
+    rows = loadDailyDetailRows(db, date, opts);
+  } catch (e) {
+    return res.status(503).send(renderLayout('日次詳細', `<div class="err">mirror_inv_daily_detail が未作成です: ${esc(e.message)}</div>`));
+  }
+
+  // カテゴリ別集計 (フィルタ前)
+  const summary = db.prepare(`
+    SELECT category, COUNT(*) AS cnt, SUM(total_value) AS sum_value, SUM(qty) AS sum_qty
+    FROM mirror_inv_daily_detail WHERE business_date = ? GROUP BY category
+  `).all(date);
+
+  function fmtCell(v, fmt) {
+    if (v == null) return '<td style="color:#999">-</td>';
+    if (fmt === 'yen') return `<td class="num">¥${Math.round(v).toLocaleString()}</td>`;
+    if (fmt === 'num') return `<td class="num">${Math.round(v).toLocaleString()}</td>`;
+    if (fmt === 'flag') return `<td>${v ? '✓' : ''}</td>`;
+    return `<td>${esc(String(v))}</td>`;
+  }
+  function statusBadge(r) {
+    if (r.is_stale) return '<span style="background:#e74c3c;color:white;padding:1px 6px;border-radius:3px;font-size:11px">滞留</span>';
+    if (r.cost_status === 'cost_missing') return '<span style="background:#f39c12;color:white;padding:1px 6px;border-radius:3px;font-size:11px">原価不明</span>';
+    if (r.cost_status === 'ne_missing') return '<span style="background:#c0392b;color:white;padding:1px 6px;border-radius:3px;font-size:11px">未解決</span>';
+    if (r.seasonality_flag) return '<span style="background:#9b59b6;color:white;padding:1px 6px;border-radius:3px;font-size:11px">季節</span>';
+    if (r.new_product_flag) return '<span style="background:#27ae60;color:white;padding:1px 6px;border-radius:3px;font-size:11px">新商品</span>';
+    return '';
+  }
+  const tableRows = rows.map(r => `
+    <tr>
+      <td><span style="font-size:10px;color:#888">${esc(r.category)}</span></td>
+      <td><code style="font-size:11px">${esc(r.ne_code)}</code></td>
+      <td>${esc((r.product_name || r.source_product_name || '').slice(0, 38))}</td>
+      <td><small>${esc(r.supplier_code || '')}</small></td>
+      ${fmtCell(r.qty, 'num')}
+      ${fmtCell(r.unit_cost, 'yen')}
+      ${fmtCell(r.total_value, 'yen')}
+      ${fmtCell(r.sales_30d_qty, 'num')}
+      ${fmtCell(r.sales_30d_value, 'yen')}
+      ${fmtCell(r.days_of_supply, 'num')}
+      <td><small>${esc(r.last_sold_date || '')}</small></td>
+      <td><small>${esc(r.location_code || '')}</small></td>
+      <td>${statusBadge(r)}</td>
+    </tr>
+  `).join('');
+
+  const supplierList = db.prepare(`SELECT DISTINCT supplier_code FROM mirror_inv_daily_detail WHERE business_date = ? AND supplier_code IS NOT NULL ORDER BY supplier_code LIMIT 100`).all(date);
+
+  res.send(renderLayout(`日次詳細 ${date}`, `
+<div style="display:flex;justify-content:space-between;align-items:flex-end">
+  <h2>日次詳細 ${esc(date)}</h2>
+  <div>
+    <a href="daily/${esc(date)}/export.csv${Object.keys(opts).filter(k => opts[k]).length ? '?' + new URLSearchParams(Object.fromEntries(Object.entries(opts).filter(([_,v]) => v))) : ''}" class="btn">📥 CSV</a>
+    <a href="daily/${esc(date)}/export.json${Object.keys(opts).filter(k => opts[k]).length ? '?' + new URLSearchParams(Object.fromEntries(Object.entries(opts).filter(([_,v]) => v))) : ''}" class="btn">📥 JSON</a>
+  </div>
+</div>
+
+<div class="card">
+  <h3 style="margin:0 0 6px;font-size:14px">カテゴリ別サマリ</h3>
+  <table style="width:auto;font-size:13px">
+    <thead><tr><th>カテゴリ</th><th>行数</th><th>合計数量</th><th>合計金額</th></tr></thead>
+    <tbody>
+      ${summary.map(s => `<tr><td>${esc(s.category)}</td><td class="num">${s.cnt}</td><td class="num">${(s.sum_qty||0).toLocaleString()}</td><td class="num">¥${Math.round(s.sum_value||0).toLocaleString()}</td></tr>`).join('')}
+    </tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h3 style="margin:0 0 6px;font-size:14px">フィルタ</h3>
+  <form method="GET" action="daily/${esc(date)}" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+    <select name="category">
+      <option value="">全カテゴリ</option>
+      <option value="fba_warehouse" ${opts.category === 'fba_warehouse' ? 'selected' : ''}>FBA倉庫</option>
+      <option value="fba_inbound" ${opts.category === 'fba_inbound' ? 'selected' : ''}>FBA輸送中</option>
+      <option value="own_warehouse" ${opts.category === 'own_warehouse' ? 'selected' : ''}>自社倉庫</option>
+    </select>
+    <select name="supplier">
+      <option value="">全仕入先</option>
+      ${supplierList.map(s => `<option value="${esc(s.supplier_code)}" ${opts.supplier === s.supplier_code ? 'selected' : ''}>${esc(s.supplier_code)}</option>`).join('')}
+    </select>
+    <label style="font-weight:normal"><input type="checkbox" name="stale" value="1" ${opts.stale === '1' ? 'checked' : ''}> 滞留のみ</label>
+    <input type="text" name="q" placeholder="商品コード or 商品名" value="${esc(opts.q)}" style="width:200px">
+    <select name="limit">
+      <option value="50" ${opts.limit == 50 ? 'selected' : ''}>50件</option>
+      <option value="200" ${opts.limit == 200 ? 'selected' : ''}>200件</option>
+      <option value="1000" ${opts.limit == 1000 ? 'selected' : ''}>1000件</option>
+      <option value="5000" ${opts.limit == 5000 ? 'selected' : ''}>5000件</option>
+    </select>
+    <button type="submit">適用</button>
+    <a href="daily/${esc(date)}">リセット</a>
+  </form>
+</div>
+
+<div class="card">
+  <h3 style="margin:0 0 6px;font-size:14px">詳細 (金額降順、${rows.length}件)</h3>
+  <div style="overflow-x:auto">
+  <table>
+    <thead>
+      <tr>
+        <th>カテゴリ</th><th>NEコード</th><th>商品名</th><th>仕入先</th>
+        <th>数量</th><th>原価</th><th>金額</th>
+        <th>30日売上数</th><th>30日売上金額</th><th>DOS</th>
+        <th>最終売上日</th><th>場所</th><th>状態</th>
+      </tr>
+    </thead>
+    <tbody>${tableRows || '<tr><td colspan="13" style="text-align:center">該当なし</td></tr>'}</tbody>
+  </table>
+  </div>
+</div>
+
+<p><a href="daily">← 日次推移に戻る</a></p>
+  `));
+});
+
+// D-4: AI/分析用 export
+router.get('/daily/:date/export.json', (req, res) => {
+  if (!ensureDbOrFail(res)) return;
+  const date = (req.params.date || '').slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: '日付不正' });
+  const db = getDB();
+  const opts = {
+    category: req.query.category || '',
+    supplier: req.query.supplier || '',
+    stale: req.query.stale || '',
+    q: (req.query.q || '').slice(0, 50),
+    limit: req.query.limit || 5000,
+  };
+  let rows;
+  try {
+    rows = loadDailyDetailRows(db, date, opts);
+  } catch (e) {
+    return res.status(503).json({ error: e.message });
+  }
+  const summary = db.prepare(`SELECT category, COUNT(*) AS row_count, SUM(total_value) AS total_value, SUM(qty) AS total_qty FROM mirror_inv_daily_detail WHERE business_date = ? GROUP BY category`).all(date);
+  res.json({
+    metadata: {
+      business_date: date,
+      market: 'jp',
+      filters: opts,
+      generated_at: new Date().toISOString(),
+      row_count: rows.length,
+      currency: 'JPY',
+      schema_version: 'd1c-1.0',
+    },
+    summary_by_category: summary,
+    rows,
+  });
+});
+
+router.get('/daily/:date/export.csv', (req, res) => {
+  if (!ensureDbOrFail(res)) return;
+  const date = (req.params.date || '').slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).send('日付不正');
+  const db = getDB();
+  const opts = {
+    category: req.query.category || '',
+    supplier: req.query.supplier || '',
+    stale: req.query.stale || '',
+    q: (req.query.q || '').slice(0, 50),
+    limit: req.query.limit || 5000,
+  };
+  let rows;
+  try {
+    rows = loadDailyDetailRows(db, date, opts);
+  } catch (e) {
+    return res.status(503).send('error: ' + e.message);
+  }
+  const cols = [
+    'business_date','category','source_system','source_item_code','ne_code',
+    'qty','unit_cost','total_value','cost_status','resolution_method',
+    'is_bundle_expanded','component_qty',
+    'product_name','source_product_name','supplier_code',
+    'product_type','handling_class','sales_class',
+    'seasonality_flag','new_product_flag',
+    'last_sold_date','sales_7d_qty','sales_30d_qty','sales_90d_qty',
+    'sales_7d_value','sales_30d_value','sales_90d_value',
+    'working_first_seen','fba_unfulfillable_qty',
+    'reserved_qty','pending_order_qty','location_code','last_purchase_date',
+    'days_of_supply','turnover_yearly','is_stale',
+  ];
+  const escCsv = v => v == null ? '' : (/[,"\n\r]/.test(String(v)) ? '"' + String(v).replace(/"/g, '""') + '"' : String(v));
+  const csv = '﻿' + cols.join(',') + '\n' + rows.map(r => cols.map(c => escCsv(r[c])).join(',')).join('\n');
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="inv_daily_detail_${date}.csv"`);
+  res.send(csv);
 });
 
 router.get('/history/:id', (req, res) => {
