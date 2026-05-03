@@ -159,27 +159,27 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_lz_expiry ON raw_lz_inventory(有効期限)');
 
   // 5. SKUマッピング（Amazon SKU ↔ NE商品コード、1 SKU = 複数NE商品コード可）
+  // 運用規約: JP / US で SKU文字列は必ず重複させない (Global Selling から外して別 SKU で運用)
+  // → market 列は不要、(seller_sku, ne_code) PK のままで衝突しない
   db.exec(`CREATE TABLE IF NOT EXISTS sku_map (
     seller_sku          TEXT NOT NULL,
-    market              TEXT NOT NULL DEFAULT 'jp',
     asin                TEXT,
     商品名              TEXT,
     ne_code             TEXT NOT NULL,
     数量                INTEGER DEFAULT 1,
     synced_at           TEXT,
-    PRIMARY KEY (seller_sku, market, ne_code),
-    CHECK (market IN ('jp', 'us'))
+    PRIMARY KEY (seller_sku, ne_code)
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_sku_map_asin ON sku_map(asin)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_sku_map_ne ON sku_map(ne_code)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_sku_map_sku ON sku_map(seller_sku)');
 
-  // --- migration: sku_map に market 列を追加 (JP/US で同SKUを別商品として扱えるよう) ---
+  // --- rollback migration: 過去 PR で追加された sku_map.market 列を撤去 (運用規約変更) ---
+  // 旧コードを pull したミニPC で適用済の場合、列だけ残しておくと未使用列で混乱するため除去
   {
-    const sqlRow = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='sku_map'`).get();
-    if (sqlRow && !sqlRow.sql.toLowerCase().includes('market')) {
-      console.log('[Warehouse] sku_map に market 列追加 (既存 row は market=jp)');
-      // sku_map に依存する全 view を先に drop (後段 createTables で再作成される)
+    const cols = db.prepare(`PRAGMA table_info(sku_map)`).all().map(c => c.name);
+    if (cols.includes('market')) {
+      console.log('[Warehouse] sku_map.market 列を rollback (JP/US は別SKU運用に変更)');
       db.exec(`
         BEGIN TRANSACTION;
         DROP VIEW IF EXISTS v_sales_by_product;
@@ -188,17 +188,16 @@ function createTables() {
         DROP VIEW IF EXISTS v_sku_resolved;
         CREATE TABLE sku_map_new (
           seller_sku  TEXT NOT NULL,
-          market      TEXT NOT NULL DEFAULT 'jp',
           asin        TEXT,
           商品名      TEXT,
           ne_code     TEXT NOT NULL,
           数量        INTEGER DEFAULT 1,
           synced_at   TEXT,
-          PRIMARY KEY (seller_sku, market, ne_code),
-          CHECK (market IN ('jp', 'us'))
+          PRIMARY KEY (seller_sku, ne_code)
         );
-        INSERT INTO sku_map_new (seller_sku, market, asin, 商品名, ne_code, 数量, synced_at)
-          SELECT seller_sku, 'jp', asin, 商品名, ne_code, 数量, synced_at FROM sku_map;
+        -- US 専用 row があれば 警告のため別保管 (実運用前なので 0 件想定)
+        INSERT OR IGNORE INTO sku_map_new (seller_sku, asin, 商品名, ne_code, 数量, synced_at)
+          SELECT seller_sku, asin, 商品名, ne_code, 数量, synced_at FROM sku_map;
         DROP TABLE sku_map;
         ALTER TABLE sku_map_new RENAME TO sku_map;
         COMMIT;
@@ -1046,7 +1045,6 @@ function createTables() {
   db.exec(`CREATE VIEW v_sku_resolved AS
     SELECT
       c.seller_sku,
-      NULL AS market,        -- master は cross-market (Global Selling 想定で全 market 共通)
       c.ne_code,
       c.数量,
       'master' AS source
@@ -1054,7 +1052,6 @@ function createTables() {
     UNION ALL
     SELECT
       s.seller_sku,
-      s.market,              -- sku_map は per row (default 'jp')
       s.ne_code,
       s.数量,
       'auto' AS source

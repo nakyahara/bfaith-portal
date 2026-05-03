@@ -25,8 +25,15 @@
  * daily-sync.js から PR-0 (snapshot-fba-stock.js) の後に呼ばれる。
  * 単独実行可: node apps/warehouse/snapshot-inventory-aggregate.js [--date=YYYY-MM-DD]
  */
+import 'dotenv/config';
 import crypto from 'crypto';
 import { initDB, getDB } from './db.js';
+
+// US が「セットアップ済 (今後データが来るはず)」かを env から判定
+// daily-sync 経由でも単独実行でも一貫して同じ判定 (過去7日ヒューリスティクスより堅実)
+function isUsExpected() {
+  return !!(process.env.SP_API_REFRESH_TOKEN_US && process.env.SP_API_CLIENT_ID_US && process.env.SP_API_CLIENT_SECRET_US);
+}
 
 function toJstDate(d) {
   const jst = new Date(d.getTime() + 9 * 60 * 60 * 1000);
@@ -90,36 +97,18 @@ export function aggregateInventorySnapshot(businessDate) {
 
   const fbaAttached = attachFbaDb(db);
 
-  // 共通: SKU解決 (market 対応) + 原価
-  // market 別に 3 マップ構築 (us / master / jp) → US は us → master → jp の順で fallback
-  const summaryMaps = { master: new Map(), us: new Map(), jp: new Map() };
-  for (const r of db.prepare(`SELECT seller_sku, market, ne_code, 数量, source FROM v_sku_resolved`).all()) {
-    const target = r.source === 'master' ? summaryMaps.master
-                 : r.market === 'us'     ? summaryMaps.us
-                 : summaryMaps.jp;
-    if (!target.has(r.seller_sku)) target.set(r.seller_sku, []);
-    target.get(r.seller_sku).push({ ne_code: r.ne_code, 数量: r.数量 || 1 });
-  }
-  function summaryResolve(sku, market) {
-    if (market === 'us') {
-      if (summaryMaps.us.has(sku))     return summaryMaps.us.get(sku);
-      if (summaryMaps.master.has(sku)) return summaryMaps.master.get(sku);
-      if (summaryMaps.jp.has(sku))     return summaryMaps.jp.get(sku); // B-Faith 同SKU 前提のフォールバック
-    } else {
-      if (summaryMaps.master.has(sku)) return summaryMaps.master.get(sku);
-      if (summaryMaps.jp.has(sku))     return summaryMaps.jp.get(sku);
-    }
-    return [];
-  }
+  // 共通: SKU解決 + 原価
+  // 運用規約: JP/US で SKU 文字列は重複しない → market 列を使わず単一テーブル参照で衝突なし
+  const resolveStmt = db.prepare(`SELECT ne_code, 数量 FROM v_sku_resolved WHERE seller_sku = ?`);
   const costStmt = db.prepare(`SELECT 原価 FROM m_products WHERE 商品コード = ?`);
 
-  function aggregateFbaCategory(rows, qtyKey, market) {
+  function aggregateFbaCategory(rows, qtyKey) {
     let totalQty = 0, totalValue = 0, resolved = 0, unresolved = 0, costMissing = 0;
     for (const row of rows) {
       const baseQty = row[qtyKey];
       if (baseQty <= 0) continue;
       const sku = (row.amazon_sku || '').toLowerCase();
-      const components = summaryResolve(sku, market);
+      const components = resolveStmt.all(sku);
       if (components.length === 0) {
         totalQty += baseQty;
         unresolved++;
@@ -177,8 +166,8 @@ export function aggregateInventorySnapshot(businessDate) {
 
     if (fbaSrc.length === 0) { writeNoSource(); return sectionResult; }
 
-    const wh = aggregateFbaCategory(fbaSrc, 'qty_warehouse', market);
-    const ib = aggregateFbaCategory(fbaSrc, 'qty_inbound', market);
+    const wh = aggregateFbaCategory(fbaSrc, 'qty_warehouse');
+    const ib = aggregateFbaCategory(fbaSrc, 'qty_inbound');
     upsert.run(businessDate, market, warehouseCategory, wh.totalQty, wh.totalValue, wh.resolved, wh.unresolved, wh.costMissing, statusOf(wh), fbaSrc.length, captured);
     upsert.run(businessDate, market, inboundCategory,   ib.totalQty, ib.totalValue, ib.resolved, ib.unresolved, ib.costMissing, statusOf(ib), fbaSrc.length, captured);
     sectionResult[warehouseCategory] = { qty: wh.totalQty, value: wh.totalValue, resolved: wh.resolved, unresolved: wh.unresolved, costMissing: wh.costMissing, status: statusOf(wh), rowCount: fbaSrc.length };
@@ -258,14 +247,15 @@ export function aggregateInventoryDetail(businessDate) {
   let status = 'ok';
   let errorMessage = null;
   let totalRows = 0, totalValue = 0, costMissing = 0, neMissing = 0;
-  let usFallbackToJpCount = 0;
   // FBA 欠損トラッキング: market 名 → 'no_source' の場合 push
   const fbaMissingMarkets = [];
+  const usExpected = isUsExpected();
 
   const fbaAttached = attachFbaDb(db);
   if (!fbaAttached) {
-    // attach 失敗 = JP は確実に欠損 (US は env 次第なのでスキップ)
+    // attach 失敗 = JP は確実に欠損 (US も env 設定済なら欠損)
     fbaMissingMarkets.push('jp');
+    if (usExpected) fbaMissingMarkets.push('us');
   }
 
   try {
@@ -280,32 +270,16 @@ export function aggregateInventoryDetail(businessDate) {
       rawNe.set(r.商品コード, r);
     }
 
-    // SKU解決マップ (3層、優先順位 us_explicit > master > jp_fallback)
-    //   master:    m_sku_components 由来 (cross-market、Global Selling 想定)
-    //   us:        sku_map.market='us' (US 専用上書き)
-    //   jp:        sku_map.market='jp' (auto-detected JP、US で無い時の fallback)
-    // US lookup: us → master → jp の順、最後の jp は B-Faith 同SKU使用前提のフォールバック
-    const resolveMapMaster = new Map();
-    const resolveMapUs = new Map();
-    const resolveMapJp = new Map();
-    for (const r of db.prepare(`SELECT seller_sku, market, ne_code, 数量, source FROM v_sku_resolved`).all()) {
-      const target = r.source === 'master' ? resolveMapMaster
-                   : r.market === 'us'     ? resolveMapUs
-                   : resolveMapJp;
+    // SKU解決マップ (seller_sku → [{ne_code, qty}])
+    // 運用規約: JP/US で SKU 文字列は重複しない → market 列なしの単一マップで衝突なし
+    const resolveMap = new Map();
+    const resolveSourceMap = new Map(); // seller_sku → 'master' | 'auto' (resolution_method 用)
+    for (const r of db.prepare(`SELECT seller_sku, ne_code, 数量, source FROM v_sku_resolved`).all()) {
       const k = r.seller_sku;
-      if (!target.has(k)) target.set(k, []);
-      target.get(k).push({ ne_code: r.ne_code, qty: r.数量 || 1 });
-    }
-    function resolveSku(sku, market) {
-      if (market === 'us') {
-        if (resolveMapUs.has(sku))     return { components: resolveMapUs.get(sku), method: 'sku_map' };
-        if (resolveMapMaster.has(sku)) return { components: resolveMapMaster.get(sku), method: 'master' };
-        if (resolveMapJp.has(sku))     { usFallbackToJpCount++; return { components: resolveMapJp.get(sku), method: 'sku_map' }; }
-      } else {
-        if (resolveMapMaster.has(sku)) return { components: resolveMapMaster.get(sku), method: 'master' };
-        if (resolveMapJp.has(sku))     return { components: resolveMapJp.get(sku), method: 'sku_map' };
-      }
-      return { components: [], method: 'unresolved' };
+      if (!resolveMap.has(k)) resolveMap.set(k, []);
+      resolveMap.get(k).push({ ne_code: r.ne_code, qty: r.数量 || 1 });
+      // master が先に来た場合は維持 (UNION ALL の順序で master が先)
+      if (!resolveSourceMap.has(k)) resolveSourceMap.set(k, r.source);
     }
 
     // 売上履歴を ne_code 単位で集約 (直近90日、business_date 未満)
@@ -402,16 +376,19 @@ export function aggregateInventoryDetail(businessDate) {
 
     // 2b. FBA helper: 指定 market/table/category 名で1セット展開
     // 戻り値: void。テーブル不在/取得失敗/0件は fbaMissingMarkets に記録 → 後段の status 判定で 'partial' にする
-    // ただし「過去7日もデータ無し」= 未セットアップ market は partial 扱いから除外 (US が任意であるため)
-    function isMarketSetup(table) {
-      try {
-        const r = db.prepare(`SELECT COUNT(*) AS n FROM fba.${table} WHERE snapshot_date >= date('now','-7 days')`).get();
-        return (r?.n ?? 0) > 0;
-      } catch { return false; }
+    // 「market が セットアップ済か」は env ベースで判定 (JP は常に必須、US は SP_API_*_US 設定有無)
+    function isMarketSetup(market) {
+      if (market === 'jp') return true;
+      if (market === 'us') return usExpected;
+      return false;
     }
     function processFbaDetail({ table, market, warehouseCategory, inboundCategory }) {
       const exists = db.prepare(`SELECT name FROM fba.sqlite_master WHERE type='table' AND name=?`).get(table);
-      if (!exists) { /* 未セットアップ環境 → partial にしない */ return; }
+      if (!exists) {
+        // テーブル不在: env 設定済の市場のみ欠損として記録 (env 未設定 US はスキップ)
+        if (isMarketSetup(market)) fbaMissingMarkets.push(market);
+        return;
+      }
       const fbaCols = db.prepare(`PRAGMA fba.table_info(${table})`).all().map(c => c.name);
       const hasUnfulfillable = fbaCols.includes('fba_unfulfillable');
       const hasWorkingFirstSeen = fbaCols.includes('working_first_seen');
@@ -429,20 +406,24 @@ export function aggregateInventoryDetail(businessDate) {
         `).all(businessDate);
       } catch (e) {
         console.warn(`[inv-agg] detail ${table} 取得失敗 (market=${market}):`, e.message);
-        if (isMarketSetup(table)) fbaMissingMarkets.push(market);
+        if (isMarketSetup(market)) fbaMissingMarkets.push(market);
         return;
       }
       if (fbaSrc.length === 0) {
-        // 当日0件: 過去7日も無ければ未セットアップとみなして partial 扱いにしない
-        if (isMarketSetup(table)) fbaMissingMarkets.push(market);
+        // 当日0件: env 設定済 (= データが来るはず) なら欠損として記録
+        // → US env 入れた初日に取得失敗しても status='partial' で検出可能
+        if (isMarketSetup(market)) fbaMissingMarkets.push(market);
         return;
       }
 
       for (const fba of fbaSrc) {
         const sku = (fba.amazon_sku || '').toLowerCase();
-        const { components, method } = resolveSku(sku, market);
+        const components = resolveMap.get(sku) || [];
+        const sourceTag = resolveSourceMap.get(sku);
         const isBundle = components.length > 1;
-        const resolution = components.length === 0 ? 'unresolved' : method;
+        const resolution = components.length === 0 ? 'unresolved'
+                         : sourceTag === 'master' ? 'master'
+                         : 'sku_map';
 
         for (const cat of [
           { name: warehouseCategory, qty: fba.qty_warehouse, working_first_seen: null, unfulfillable: fba.fba_unfulfillable },
@@ -585,7 +566,7 @@ export function aggregateInventoryDetail(businessDate) {
       .run(new Date().toISOString(), status, totalRows, totalValue, costMissing, neMissing, errorMessage, snapshotRunId);
   }
 
-  return { snapshotRunId, status, totalRows, totalValue, costMissing, neMissing, usFallbackToJpCount };
+  return { snapshotRunId, status, totalRows, totalValue, costMissing, neMissing };
 }
 
 // ─── CLI ───
@@ -605,8 +586,5 @@ if (isMain) {
   const detail = aggregateInventoryDetail(businessDate);
   const t2 = Date.now();
   console.log(`[inv-agg] detail 完了 (${t2 - t1}ms): run_id=${detail.snapshotRunId} rows=${detail.totalRows} value=${Math.round(detail.totalValue)} cost_missing=${detail.costMissing} ne_missing=${detail.neMissing} status=${detail.status}`);
-  if (detail.usFallbackToJpCount > 0) {
-    console.warn(`[inv-agg] ⚠️ US SKU 解決で JP fallback: ${detail.usFallbackToJpCount} 行 (US 専用上書きが必要なら sku_map に market='us' で追加)`);
-  }
   process.exit(0);
 }
