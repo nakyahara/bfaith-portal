@@ -48,7 +48,11 @@ function buildLookups(db) {
   for (const s of skuMapRows) {
     const key = (s.seller_sku || '').toLowerCase();
     if (!skuMap.has(key)) skuMap.set(key, []);
-    skuMap.get(key).push({ ne_code: (s.ne_code || '').toLowerCase(), 数量: s.数量 || 1 });
+    // 数量検証: NULL→1扱い、0/負数/非整数→1 fallback (棚卸しは 1 個でも数えたい)
+    const rawQty = s.数量;
+    const validQty = (rawQty == null) ? 1
+      : (Number.isFinite(rawQty) && rawQty > 0) ? rawQty : 1;
+    skuMap.get(key).push({ ne_code: (s.ne_code || '').toLowerCase(), 数量: validQty });
   }
 
   // mirror_set_components: セット商品コード(小文字) → [{ 構成商品コード, 数量, 構成商品原価 }]

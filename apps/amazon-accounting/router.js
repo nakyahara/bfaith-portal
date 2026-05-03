@@ -107,11 +107,26 @@ function resolveSkus(rows, db) {
           resolveMethod = 'sku_map';
         } else {
           // セット商品: 1 SKU = N components → 全構成品を解決して合算
-          const components = mappings.map(m => ({
-            ne_code: m.ne_code,
-            qty: m.数量 || 1,
-            product: productsMap.get((m.ne_code || '').toLowerCase()),
-          }));
+          // 数量検証: NULL→1扱い、0/負数/非整数→invalid_quantity で hard fail
+          const components = mappings.map(m => {
+            const rawQty = m.数量;
+            const validQty = (rawQty == null) ? 1
+              : (Number.isFinite(rawQty) && rawQty > 0) ? rawQty : null;
+            return {
+              ne_code: m.ne_code,
+              qty: validQty,
+              rawQty,
+              product: productsMap.get((m.ne_code || '').toLowerCase()),
+            };
+          });
+
+          // invalid_quantity: 構成品の数量が 0/負数/非数値
+          const invalidQty = components.filter(c => c.qty === null);
+          if (invalidQty.length > 0) {
+            resolved.push({ ...row, 商品コード: null, 原価: 0, 税率: null, 売上分類: null, 解決方法: 'invalid_quantity' });
+            conflicts.push({ sku, type: 'invalid_quantity', invalidQty: invalidQty.map(c => ({ ne_code: c.ne_code, rawQty: c.rawQty })) });
+            continue;
+          }
 
           // partial_component: 構成品の一部が mirror_products に存在しない
           const missing = components.filter(c => !c.product).map(c => c.ne_code);
@@ -915,6 +930,8 @@ function renderPage() {
             totalRows: lastData.totalRows,
             resolvedCount: lastData.resolvedCount,
             unresolvedCount: lastData.unresolvedSkus?.length || 0,
+            unresolvedTaxCount: (lastData.unresolvedTax || []).length,
+            conflictsCount: (lastData.conflicts || []).length,
             byTax: lastData.byTax,
             bySegment: lastData.bySegment,
             excluded: lastData.excluded,
@@ -1257,13 +1274,21 @@ router.get('/evidence/:type/:yearMonth', (req, res) => {
 router.post('/confirm', (req, res) => {
   const db = getMirrorDB();
   const { yearMonth, totalRows, resolvedCount, unresolvedCount,
+    unresolvedTaxCount, conflictsCount,
     byTax, bySegment, excluded, mfRow, adCost, csvFilename } = req.body;
 
   if (!yearMonth) return res.status(400).json({ error: 'yearMonth は必須です' });
 
-  // サーバ側でも再検証: 未登録SKUがある or 解決行数が0 の場合は確定拒否
+  // サーバ側でも再検証: hard fail 条件のいずれかに該当する場合は確定拒否
+  // 注: 集計値 (byTax/bySegment/mfRow) の改竄防御は本PRスコープ外 (CSV再集計が必要)
   if ((unresolvedCount || 0) > 0) {
     return res.status(400).json({ error: '未登録SKUが残っているため確定できません' });
+  }
+  if ((unresolvedTaxCount || 0) > 0) {
+    return res.status(400).json({ error: '税率未登録があるため確定できません' });
+  }
+  if ((conflictsCount || 0) > 0) {
+    return res.status(400).json({ error: 'セット解決エラー(税率/分類混在・構成品欠損・数量不正)があるため確定できません' });
   }
 
   try {

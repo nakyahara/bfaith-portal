@@ -175,11 +175,26 @@ function resolveSkus(rows, db) {
           method = 'sku_map';
         } else {
           // セット商品: 構成品を解決して原価合算
-          const components = maps.map(m => ({
-            ne_code: m.ne_code,
-            qty: m.数量 || 1,
-            product: productsMap.get((m.ne_code || '').toLowerCase()),
-          }));
+          // 数量検証: NULL→1扱い、0/負数/非整数→invalid_quantity で hard fail
+          const components = maps.map(m => {
+            const rawQty = m.数量;
+            const validQty = (rawQty == null) ? 1
+              : (Number.isFinite(rawQty) && rawQty > 0) ? rawQty : null;
+            return {
+              ne_code: m.ne_code,
+              qty: validQty,
+              rawQty,
+              product: productsMap.get((m.ne_code || '').toLowerCase()),
+            };
+          });
+
+          const invalidQty = components.filter(c => c.qty === null);
+          if (invalidQty.length > 0) {
+            resolved.push({ ...row, 商品コード: null, 原価: 0, 解決方法: 'invalid_quantity' });
+            conflicts.push({ sku, type: 'invalid_quantity', invalidQty: invalidQty.map(c => ({ ne_code: c.ne_code, rawQty: c.rawQty })) });
+            continue;
+          }
+
           const missing = components.filter(c => !c.product).map(c => c.ne_code);
           if (missing.length > 0) {
             resolved.push({ ...row, 商品コード: null, 原価: 0, 解決方法: 'partial_component' });

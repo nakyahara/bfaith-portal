@@ -100,7 +100,11 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
   for (const m of skuMap) {
     const key = m.seller_sku?.toLowerCase();
     if (!skuToNeMap.has(key)) skuToNeMap.set(key, []);
-    skuToNeMap.get(key).push({ ne_code: m.ne_code?.toLowerCase(), qty: m.数量 || 1 });
+    // 数量検証: NULL→1扱い、0/負数/非整数→null (invalid、計算除外)
+    const rawQty = m.数量;
+    const validQty = (rawQty == null) ? 1
+      : (Number.isFinite(rawQty) && rawQty > 0) ? rawQty : null;
+    skuToNeMap.get(key).push({ ne_code: m.ne_code?.toLowerCase(), qty: validQty, rawQty });
   }
 
   // 4b. 楽天SKUマップ（rakuten_code → ne_code、AM/AL/W 3段階フォールバック済み）
@@ -144,34 +148,42 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
       // SKUマップでNE商品コードを取得 → 構成品原価合計
       const neEntries = skuToNeMap.get(listingCode);
       if (neEntries) {
-        let totalCost = 0;
-        let totalShip = 0;
-        let allFound = true;
-        const taxRates = [];
-        for (const entry of neEntries) {
-          const prod = productMap.get(entry.ne_code);
-          if (prod) {
-            if (prod.原価) totalCost += prod.原価 * entry.qty;
-            taxRates.push(prod.消費税率 || 10);
-            if (prod.送料) totalShip += prod.送料 * entry.qty;
-            if (productName === listingCode && prod.商品名) productName = prod.商品名;
-          } else {
-            allFound = false;
+        // 数量invalid な構成品があれば hard fail (cost不確定として警告)
+        const hasInvalidQty = neEntries.some(e => e.qty === null);
+        if (hasInvalidQty) {
+          costExTax = 0;
+          costSource = 'SKU→NE(数量不正・原価不確定)';
+        } else {
+          let totalCost = 0;
+          let totalShip = 0;
+          let allFound = true;
+          const taxRates = [];
+          for (const entry of neEntries) {
+            const prod = productMap.get(entry.ne_code);
+            if (prod) {
+              if (prod.原価) totalCost += prod.原価 * entry.qty;
+              taxRates.push(prod.消費税率 || 10);
+              if (prod.送料) totalShip += prod.送料 * entry.qty;
+              if (productName === listingCode && prod.商品名) productName = prod.商品名;
+            } else {
+              allFound = false;
+            }
           }
-        }
-        costExTax = totalCost * qty;
-        // FBMは商品マスタの送料、FBAは後でfba_feeを送料欄に入れる
-        if (channel !== 'FBA') {
-          shipping = totalShip * qty;
-        }
-        // 税率は構成品で混在しなければそれ、混在なら 10% 既定
-        const uniqueTaxRates = [...new Set(taxRates)];
-        taxRate = uniqueTaxRates.length === 1 ? 1 + uniqueTaxRates[0] / 100 : 1.1;
-        // セット商品の解決状況を costSource に反映 (Codex指摘: silent fallback防止)
-        if (neEntries.length > 0) {
-          if (!allFound) costSource = 'SKU→NE(部分欠損)';
-          else if (uniqueTaxRates.length > 1) costSource = 'SKU→NE(税率混在)';
-          else costSource = 'SKU→NE';
+          // 税率混在/部分欠損は hard fail (Codex指摘: 正常値っぽい粗利を出さない)
+          const uniqueTaxRates = [...new Set(taxRates)];
+          if (!allFound || uniqueTaxRates.length > 1) {
+            costExTax = 0;
+            taxRate = 1.1;
+            costSource = !allFound ? 'SKU→NE(部分欠損・原価不確定)' : 'SKU→NE(税率混在・原価不確定)';
+          } else {
+            costExTax = totalCost * qty;
+            // FBMは商品マスタの送料、FBAは後でfba_feeを送料欄に入れる
+            if (channel !== 'FBA') {
+              shipping = totalShip * qty;
+            }
+            taxRate = uniqueTaxRates.length === 1 ? 1 + uniqueTaxRates[0] / 100 : 1.1;
+            costSource = 'SKU→NE';
+          }
         }
       }
     } else {
