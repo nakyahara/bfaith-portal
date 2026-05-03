@@ -2330,7 +2330,7 @@ function renderDashboard(stats) {
         loadMissing(currentMissingType);
       } else if (action === 'reg-skumap') {
         // SKU管理統合 Step 3: SKUマスタ画面 (/register) に誘導
-        toast('SKU登録は「マスタ登録画面」のSKUマスタタブを使ってください');
+        toast('SKU登録は「マスタ登録画面 (/register)」のSKUマスタタブを使ってください');
         return;
       } else if (action === 'update-shipping') {
         const sel = btn.closest('tr')?.querySelector('select');
@@ -2347,12 +2347,12 @@ function renderDashboard(stats) {
         loadManage(currentManageType);
       } else if (action === 'update-skumap') {
         // SKU管理統合 Step 3: SKUマスタ画面 (/register) に誘導
-        toast('SKU編集は「マスタ登録画面」のSKUマスタタブを使ってください');
+        toast('SKU編集は「マスタ登録画面 (/register)」のSKUマスタタブを使ってください');
         return;
       } else if (action === 'delete') {
         if (!confirm(sku + ' を削除しますか？')) return;
         if (type === 'skumap') {
-          toast('SKU削除は「マスタ登録画面」のSKUマスタタブを使ってください');
+          toast('SKU削除は「マスタ登録画面 (/register)」のSKUマスタタブを使ってください');
           return;
         }
         const endpoint = type === 'shipping' ? '/api/shipping/' : '/api/genka/';
