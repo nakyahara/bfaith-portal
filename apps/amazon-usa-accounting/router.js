@@ -132,15 +132,22 @@ function parseUsCsv(buf) {
   return rows;
 }
 
-// ─── SKU解決(3段階 — 日本版と同じ) ───
+// ─── SKU解決(3段階 + セット展開 — 日本版と同じパターン) ───
 
 function resolveSkus(rows, db) {
   const productsMap = new Map();
   for (const p of db.prepare('SELECT * FROM mirror_products').all()) {
     productsMap.set((p.商品コード || '').toLowerCase(), p);
   }
+
+  // 既定: mirror_sku_resolved (master優先 + sku_map fallback)
+  // env WAREHOUSE_SKU_SOURCE=legacy で旧 mirror_sku_map 直参照に戻せる
+  const useLegacy = process.env.WAREHOUSE_SKU_SOURCE === 'legacy';
   const skuMap = new Map();
-  for (const s of db.prepare('SELECT * FROM mirror_sku_map').all()) {
+  const skuRows = useLegacy
+    ? db.prepare('SELECT seller_sku, ne_code, 数量 FROM mirror_sku_map').all()
+    : db.prepare('SELECT seller_sku, ne_code, quantity AS 数量 FROM mirror_sku_resolved').all();
+  for (const s of skuRows) {
     const key = s.seller_sku?.toLowerCase();
     if (!key) continue;
     if (!skuMap.has(key)) skuMap.set(key, []);
@@ -149,6 +156,7 @@ function resolveSkus(rows, db) {
 
   const resolved = [];
   const unresolved = new Map();
+  const conflicts = []; // セット商品の解決失敗
 
   for (const row of rows) {
     const sku = row.sku;
@@ -162,8 +170,32 @@ function resolveSkus(rows, db) {
     if (!product) {
       const maps = skuMap.get(sku);
       if (maps && maps.length > 0) {
-        product = productsMap.get(maps[0].ne_code);
-        method = 'sku_map';
+        if (maps.length === 1) {
+          product = productsMap.get((maps[0].ne_code || '').toLowerCase());
+          method = 'sku_map';
+        } else {
+          // セット商品: 構成品を解決して原価合算
+          const components = maps.map(m => ({
+            ne_code: m.ne_code,
+            qty: m.数量 || 1,
+            product: productsMap.get((m.ne_code || '').toLowerCase()),
+          }));
+          const missing = components.filter(c => !c.product).map(c => c.ne_code);
+          if (missing.length > 0) {
+            resolved.push({ ...row, 商品コード: null, 原価: 0, 解決方法: 'partial_component' });
+            conflicts.push({ sku, type: 'partial_component', missing });
+            continue;
+          }
+          const totalGenka = components.reduce((sum, c) => sum + (c.product.原価 || 0) * (c.qty || 1), 0);
+          resolved.push({
+            ...row,
+            商品コード: components[0].product.商品コード,
+            原価: totalGenka,
+            解決方法: 'set_components',
+            components: components.map(c => ({ ne_code: c.ne_code, qty: c.qty })),
+          });
+          continue;
+        }
       }
     }
 
@@ -207,6 +239,7 @@ function resolveSkus(rows, db) {
     resolved,
     unresolved: [...unresolved.values()],
     zeroGenka: [...zeroGenka.values()],
+    conflicts,
   };
 }
 
@@ -291,7 +324,7 @@ router.post('/upload', upload.single('file'), (req, res) => {
     const firstDate = parsedRows[0].日付 || '';
     const yearMonth = firstDate.slice(0, 7);  // YYYY-MM
 
-    const { resolved, unresolved, zeroGenka } = resolveSkus(parsedRows, db);
+    const { resolved, unresolved, zeroGenka, conflicts } = resolveSkus(parsedRows, db);
     const { usd, jpy, mgmt, costTotalJpy } = aggregate(resolved, rate);
 
     // エビデンスCSV(明細)
@@ -328,10 +361,11 @@ router.post('/upload', upload.single('file'), (req, res) => {
     res.json({
       yearMonth, rate,
       totalRows: parsedRows.length,
-      resolvedCount: resolved.filter(r => r.解決方法 !== 'unresolved' && r.解決方法 !== 'no_sku').length,
+      resolvedCount: resolved.filter(r => r.解決方法 !== 'unresolved' && r.解決方法 !== 'no_sku' && r.解決方法 !== 'partial_component').length,
       unresolvedSkus: unresolved,
-      // 米国Amazon: 未登録SKUは原価0扱いで集計に含める(GAS互換) → 確定可能
-      canConfirm: true,
+      // 米国Amazon: 未登録SKUは原価0扱いで集計に含める(GAS互換)が、セット商品の構成品欠損(partial_component)があれば確定不可
+      canConfirm: conflicts.length === 0,
+      conflicts,
       usd, jpy, mgmt,
       costTotalJpy,
       zeroGenka,

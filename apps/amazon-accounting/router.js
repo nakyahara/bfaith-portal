@@ -2,8 +2,10 @@
  * Amazon売上集計ツール
  *
  * セラセンのペイメントレポートCSVをアップロードし、
- * mirror_products + mirror_sku_map を使って
+ * mirror_products + mirror_sku_resolved (master優先 + sku_map fallback) を使って
  * 税率別・セグメント別の売上集計を自動計算する。
+ *
+ * env WAREHOUSE_SKU_SOURCE=legacy で旧 mirror_sku_map 参照に戻せる(SKU管理統合 Step 2b)
  *
  * Phase 1: CSVアップロード → SKU照合 → 未登録検出 → 集計プレビュー
  */
@@ -49,7 +51,7 @@ function parseCsvBuffer(buf) {
   });
 }
 
-// ─── SKU解決（3段階）───
+// ─── SKU解決（3段階 + セット展開）───
 
 function resolveSkus(rows, db) {
   // mirror_productsの商品コードマップ（小文字統一）
@@ -58,9 +60,14 @@ function resolveSkus(rows, db) {
     productsMap.set((p.商品コード || '').toLowerCase(), p);
   }
 
-  // mirror_sku_mapの変換マップ
+  // 既定: mirror_sku_resolved (master優先 + sku_map fallback)
+  // env WAREHOUSE_SKU_SOURCE=legacy で旧 mirror_sku_map 直参照に戻せる
+  const useLegacy = process.env.WAREHOUSE_SKU_SOURCE === 'legacy';
   const skuMapEntries = new Map();
-  for (const s of db.prepare('SELECT * FROM mirror_sku_map').all()) {
+  const skuRows = useLegacy
+    ? db.prepare('SELECT seller_sku, ne_code, 数量 FROM mirror_sku_map').all()
+    : db.prepare('SELECT seller_sku, ne_code, quantity AS 数量 FROM mirror_sku_resolved').all();
+  for (const s of skuRows) {
     const key = s.seller_sku?.toLowerCase();
     if (!key) continue;
     if (!skuMapEntries.has(key)) skuMapEntries.set(key, []);
@@ -69,6 +76,7 @@ function resolveSkus(rows, db) {
 
   const resolved = [];
   const unresolved = new Map(); // SKU → { sku, name, count, amount }
+  const conflicts = []; // セット商品の解決失敗(混在/欠損)を hard fail で記録
 
   for (const row of rows) {
     const sku = (row.sku || '').toLowerCase();
@@ -89,12 +97,59 @@ function resolveSkus(rows, db) {
     let product = productsMap.get(sku);
     let resolveMethod = 'direct';
 
-    // Stage 2: sku_mapで変換
+    // Stage 2: sku_resolved/sku_map で変換(セット商品は構成品合算)
     if (!product) {
       const mappings = skuMapEntries.get(sku);
       if (mappings && mappings.length > 0) {
-        product = productsMap.get(mappings[0].ne_code);
-        resolveMethod = 'sku_map';
+        if (mappings.length === 1) {
+          // 単品: 1 SKU = 1 ne_code
+          product = productsMap.get((mappings[0].ne_code || '').toLowerCase());
+          resolveMethod = 'sku_map';
+        } else {
+          // セット商品: 1 SKU = N components → 全構成品を解決して合算
+          const components = mappings.map(m => ({
+            ne_code: m.ne_code,
+            qty: m.数量 || 1,
+            product: productsMap.get((m.ne_code || '').toLowerCase()),
+          }));
+
+          // partial_component: 構成品の一部が mirror_products に存在しない
+          const missing = components.filter(c => !c.product).map(c => c.ne_code);
+          if (missing.length > 0) {
+            resolved.push({ ...row, 商品コード: null, 原価: 0, 税率: null, 売上分類: null, 解決方法: 'partial_component' });
+            conflicts.push({ sku, type: 'partial_component', missing });
+            continue;
+          }
+
+          // mixed_tax: 構成品で税率が混在
+          const taxRates = [...new Set(components.map(c => c.product.消費税率))];
+          if (taxRates.length > 1) {
+            resolved.push({ ...row, 商品コード: null, 原価: 0, 税率: null, 売上分類: null, 解決方法: 'mixed_tax' });
+            conflicts.push({ sku, type: 'mixed_tax', taxRates });
+            continue;
+          }
+
+          // mixed_segment: 構成品で売上分類が混在
+          const segments = [...new Set(components.map(c => c.product.売上分類))];
+          if (segments.length > 1) {
+            resolved.push({ ...row, 商品コード: null, 原価: 0, 税率: null, 売上分類: null, 解決方法: 'mixed_segment' });
+            conflicts.push({ sku, type: 'mixed_segment', segments });
+            continue;
+          }
+
+          // セット合算: 原価は構成品(原価×数量)の合計
+          const totalGenka = components.reduce((sum, c) => sum + (c.product.原価 || 0) * (c.qty || 1), 0);
+          resolved.push({
+            ...row,
+            商品コード: components[0].product.商品コード,
+            原価: totalGenka,
+            税率: components[0].product.消費税率 ? Math.round(components[0].product.消費税率 * 100) : null,
+            売上分類: components[0].product.売上分類,
+            解決方法: 'set_components',
+            components: components.map(c => ({ ne_code: c.ne_code, qty: c.qty })),
+          });
+          continue; // セット処理完了
+        }
       }
     }
 
@@ -148,7 +203,13 @@ function resolveSkus(rows, db) {
     }
   }
 
-  return { resolved, unresolved: [...unresolved.values()], zeroGenka: [...zeroGenka.values()], unresolvedTax: [...unresolvedTax.values()] };
+  return {
+    resolved,
+    unresolved: [...unresolved.values()],
+    zeroGenka: [...zeroGenka.values()],
+    unresolvedTax: [...unresolvedTax.values()],
+    conflicts,
+  };
 }
 
 // ─── 集計 ───
@@ -349,7 +410,7 @@ router.post('/upload', upload.single('file'), (req, res) => {
   const yearMonth = firstDate.slice(0, 7).replace('/', '-');
 
   // SKU解決
-  const { resolved, unresolved, zeroGenka, unresolvedTax } = resolveSkus(parsedRows, db);
+  const { resolved, unresolved, zeroGenka, unresolvedTax, conflicts } = resolveSkus(parsedRows, db);
 
   // 集計
   const { byTax, bySegment, excluded, otherDetails, columns, mfRow, mfColumns } = aggregate(resolved);
@@ -400,11 +461,12 @@ router.post('/upload', upload.single('file'), (req, res) => {
   res.json({
     yearMonth,
     totalRows: parsedRows.length,
-    resolvedCount: resolved.filter(r => r.解決方法 !== 'unresolved' && r.解決方法 !== 'skip' && r.解決方法 !== 'no_sku').length,
+    resolvedCount: resolved.filter(r => r.解決方法 !== 'unresolved' && r.解決方法 !== 'skip' && r.解決方法 !== 'no_sku' && !['mixed_tax','mixed_segment','partial_component'].includes(r.解決方法)).length,
     unresolvedSkus: unresolved,
     unresolvedTaxCount,
     unresolvedTax,
-    canConfirm: unresolved.length === 0 && unresolvedTax.length === 0,
+    canConfirm: unresolved.length === 0 && unresolvedTax.length === 0 && conflicts.length === 0,
+    conflicts,
     byTax,
     bySegment,
     excluded,
@@ -512,6 +574,12 @@ function renderPage() {
         <div id="unresolvedTaxList"></div>
       </div>
 
+      <div id="conflictsCard" class="card" style="display:none">
+        <h2>⚠️ セット商品の解決エラー</h2>
+        <p class="meta">セット商品(1 SKU = N構成品)で、構成品の税率/売上分類が混在しているか、構成品が商品マスタに見つかりません。確定できません。</p>
+        <div id="conflictsList"></div>
+      </div>
+
       <div class="card">
         <h2>税率別集計</h2>
         <div id="taxTable"></div>
@@ -602,11 +670,13 @@ function renderPage() {
       summaryHtml += '<b>対象年月: ' + data.yearMonth + '</b><br>';
       summaryHtml += '総行数: ' + data.totalRows + ' / SKU解決済: ' + data.resolvedCount + ' / 未登録SKU: ' + data.unresolvedSkus.length + '件';
       if (data.unresolvedTax && data.unresolvedTax.length > 0) summaryHtml += ' / <span class="negative">税率未登録: ' + data.unresolvedTax.length + '商品</span>';
+      if (data.conflicts && data.conflicts.length > 0) summaryHtml += ' / <span class="negative">セット解決エラー: ' + data.conflicts.length + '件</span>';
       if (data.canConfirm) summaryHtml += '<br><b style="color:#27ae60">✅ 全て解決済み — 確定可能</b>';
       else {
         const reasons = [];
         if (data.unresolvedSkus.length > 0) reasons.push('未登録SKU');
         if (data.unresolvedTax && data.unresolvedTax.length > 0) reasons.push('税率未登録');
+        if (data.conflicts && data.conflicts.length > 0) reasons.push('セット解決エラー');
         summaryHtml += '<br><b style="color:#e74c3c">❌ ' + reasons.join('・') + 'あり — 確定不可</b>';
       }
       summaryHtml += '</div>';
@@ -624,6 +694,26 @@ function renderPage() {
         document.getElementById('unresolvedList').innerHTML = html;
       } else {
         document.getElementById('unresolvedCard').style.display = 'none';
+      }
+
+      // セット解決エラー (mixed_tax / mixed_segment / partial_component)
+      if (data.conflicts && data.conflicts.length > 0) {
+        const card = document.getElementById('conflictsCard');
+        card.style.display = 'block';
+        const typeLabels = { mixed_tax: '税率混在', mixed_segment: '売上分類混在', partial_component: '構成品欠損' };
+        let html = '<table class="detail-table"><tr><th>SKU</th><th>エラー種別</th><th>詳細</th></tr>';
+        for (const c of data.conflicts) {
+          const label = typeLabels[c.type] || c.type;
+          let detail = '';
+          if (c.type === 'mixed_tax') detail = '税率: ' + (c.taxRates || []).map(r => (r * 100).toFixed(0) + '%').join(', ');
+          else if (c.type === 'mixed_segment') detail = '分類: ' + (c.segments || []).join(', ');
+          else if (c.type === 'partial_component') detail = '欠損ne_code: ' + (c.missing || []).join(', ');
+          html += '<tr><td style="text-align:left">' + c.sku + '</td><td>' + label + '</td><td style="text-align:left">' + detail + '</td></tr>';
+        }
+        html += '</table>';
+        document.getElementById('conflictsList').innerHTML = html;
+      } else {
+        document.getElementById('conflictsCard').style.display = 'none';
       }
 
       // 税率未登録

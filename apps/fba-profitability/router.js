@@ -271,8 +271,13 @@ router.post('/api/listings', async (req, res) => {
     try {
       const db = getMirrorDB();
 
-      // mirror_sku_map: seller_sku → ne_code
-      const skuMappings = db.prepare('SELECT seller_sku, ne_code, 数量 FROM mirror_sku_map').all();
+      // SKU解決マップ: seller_sku → ne_code
+      // 既定: mirror_sku_resolved (master優先 + sku_map fallback)
+      // env WAREHOUSE_SKU_SOURCE=legacy で旧 mirror_sku_map 直参照に戻せる
+      const useLegacySku = process.env.WAREHOUSE_SKU_SOURCE === 'legacy';
+      const skuMappings = useLegacySku
+        ? db.prepare('SELECT seller_sku, ne_code, 数量 FROM mirror_sku_map').all()
+        : db.prepare('SELECT seller_sku, ne_code, quantity AS 数量 FROM mirror_sku_resolved').all();
       const skuToNe = new Map();
       for (const m of skuMappings) {
         if (!skuToNe.has(m.seller_sku?.toLowerCase())) {

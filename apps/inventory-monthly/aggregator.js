@@ -35,8 +35,10 @@ function buildLookups(db) {
 
   // SKU解決マップ: seller_sku(小文字) → [{ ne_code, 数量 }]
   // 既定: mirror_sku_resolved (master優先 + sku_map fallback)
-  // env で旧 mirror_sku_map 直参照に戻せる escape hatch あり
-  const useLegacy = process.env.INVENTORY_MONTHLY_USE_LEGACY_SKU_MAP === '1';
+  // env WAREHOUSE_SKU_SOURCE=legacy で旧 mirror_sku_map 直参照に戻せる
+  // (旧 INVENTORY_MONTHLY_USE_LEGACY_SKU_MAP は SKU管理統合 Step 2b で WAREHOUSE_SKU_SOURCE に統合)
+  const useLegacy = process.env.WAREHOUSE_SKU_SOURCE === 'legacy'
+    || process.env.INVENTORY_MONTHLY_USE_LEGACY_SKU_MAP === '1';
   const skuMapRows = useLegacy
     ? db.prepare('SELECT seller_sku, ne_code, 数量 FROM mirror_sku_map').all()
     // mirror_sku_resolved は quantity カラム(英語)。エイリアスで 数量 に揃える
