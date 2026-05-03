@@ -155,35 +155,10 @@ function importSetProducts(filePath) {
 }
 
 function importSkuMap(filePath) {
-  const buf = fs.readFileSync(filePath);
-  const text = buf.toString('utf-8');
-  const allLines = text.split(/\r?\n/);
-  const rows = [];
-  let headerFound = false;
-  for (const line of allLines) {
-    if (!headerFound) { if (line.startsWith('sku,')) { headerFound = true; continue; } continue; }
-    const trimmed = line.trim();
-    if (!trimmed || !trimmed.includes(',')) continue;
-    const parts = parseRow(trimmed);
-    if (parts.length >= 5 && parts[0] && !parts[0].startsWith('直近') && !parts[0].startsWith('売上')) rows.push(parts);
-  }
-  const db = getDB();
-  db.exec('DELETE FROM sku_map');
-  const stmt = db.prepare('INSERT OR REPLACE INTO sku_map (seller_sku, asin, 商品名, ne_code, 数量, synced_at) VALUES (?,?,?,?,?,?)');
-  const tx = db.transaction(() => {
-    let count = 0;
-    for (const row of rows) {
-      const sku = (row[0]?.trim() || '').toLowerCase();
-      if (!sku) continue;
-      const neCode = (row[3] || '').toLowerCase();
-      stmt.run(sku, row[1]||'', row[2]||'', neCode, parseInt(row[4])||1, now());
-      count++;
-    }
-    return count;
-  });
-  const count = tx();
-  updateSyncMeta('sku_map_last_import', now());
-  return count;
+  // SKU管理統合 Step 3b: sku_map writer 廃止。
+  // SKUマスタ (m_sku_master + m_sku_components) を使用してください。
+  console.warn(`[Auto] sku_map 書き込みは廃止されました (Step 3b)。SKUマスタ用CSVを使用してください。skipped: ${filePath}`);
+  return 0;
 }
 
 function importLogizard(filePath) {
