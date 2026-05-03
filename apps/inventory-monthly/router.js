@@ -432,6 +432,71 @@ ${list.length === 0 ? '<p>まだ履歴がありません。</p>' : `
 `));
 });
 
+// 過去月末データの一括投入 (CSV 由来、22ヶ月分、ハードコード)
+// 既に同 snapshot_date 行があれば skip (再実行安全)
+// マッピング:
+//   fba_warehouse = FBA倉庫_10% + 8%
+//   fba_inbound   = FBA輸送中_10 + 8 + FBA輸送準備(NE伝票)_10 + 8
+//   own_warehouse = 自社倉庫_10 + 8
+//   fba_us        = 米国FBA_10 + 8 + 米国輸送中FBA_10 + 8
+//   pending_orders = 注文後未着_10 + 8
+// 1回叩いたら不要 (idempotent なので残しても害なし)
+const HISTORICAL_MONTHLY_TOTALS = [
+  // [snapshot_date, fba_warehouse, fba_inbound, own_warehouse, fba_us, pending_orders]
+  ['2024-06-30', 27941026, 1617028,  107875351, 1230210, 1022768],
+  ['2024-07-31', 29860090, 2698085,  127544915, 590700,  948980],
+  ['2024-08-31', 28798532, 410000,   110980186, 906670,  5577920],
+  ['2024-09-30', 25758563, 1328114,  135212880, 1180450, 2129360],
+  ['2024-10-31', 28278927, 3224697,  138298610, 565450,  1450240],
+  ['2024-11-30', 31504594, 1896085,  141845968, 1887290, 595824],
+  ['2024-12-31', 30107046, 3583283,  151336505, 1887290, 694806],
+  ['2025-01-31', 30631119, 3168067,  155347944, 1388290, 763514],
+  ['2025-02-28', 31161585, 2485995,  148618022, 1087160, 6876942],
+  ['2025-03-31', 35441316, 3821868,  152969657, 571130,  1699590],
+  ['2025-04-30', 33203896, 4136514,  149258238, 1417910, 2455944],
+  ['2025-05-31', 33928211, 4201766,  152211457, 345040,  892906],
+  ['2025-06-30', 31353128, 1970022,  160807890, 241370,  754374],
+  ['2025-07-31', 30856674, 3535892,  169226038, 241370,  2557036],
+  ['2025-08-31', 30990773, 3969203,  165937904, 241370,  999810],
+  ['2025-09-30', 29231979, 2828446,  166014821, 36250,   2401460],
+  ['2025-10-31', 29085016, 1399703,  172743169, 25200,   2400911],
+  ['2025-11-30', 26629950, 3223740,  173146430, 1280800, 251680],
+  ['2025-12-31', 27865104, 1205080,  173279939, 1200200, 211680],
+  ['2026-01-31', 31612880, 15941,    171713024, 1106000, 1998510],
+  ['2026-02-28', 28068812, 367960,   179659945, 918750,  534220],
+  ['2026-03-31', 27665214, 5575553,  175396635, 699100,  5251184],
+];
+
+router.post('/admin/import-historical', (req, res) => {
+  if (!ensureDbOrFail(res)) return;
+  const db = getDB();
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const note = 'historical-import (CSV取込、税抜10%+8%合算、輸送準備含む)';
+
+  const checkStmt = db.prepare('SELECT id FROM inv_snapshot WHERE snapshot_date = ?');
+  const insStmt = db.prepare(`
+    INSERT INTO inv_snapshot
+      (snapshot_date, fba_warehouse, fba_inbound, own_warehouse, fba_us, pending_orders, total, note, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  let inserted = 0;
+  const skipped = [];
+  const tx = db.transaction(() => {
+    for (const [date, fw, fi, ow, fu, po] of HISTORICAL_MONTHLY_TOTALS) {
+      if (checkStmt.get(date)) {
+        skipped.push(date);
+        continue;
+      }
+      const total = fw + fi + ow + fu + po;
+      insStmt.run(date, fw, fi, ow, fu, po, total, note, now);
+      inserted++;
+    }
+  });
+  tx();
+  res.json({ ok: true, inserted, skipped, total: HISTORICAL_MONTHLY_TOTALS.length });
+});
+
 // 日次在庫スナップショット推移 (mirror_inv_daily_summary を読む)
 // PR-A/0/B でミニPC側が毎朝 inv_daily_summary を生成 → sync-to-render で mirror に複製
 router.get('/daily', (req, res) => {
