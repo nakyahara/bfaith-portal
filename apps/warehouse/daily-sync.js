@@ -211,8 +211,9 @@ async function main() {
         const url = (process.env.RENDER_MIRROR_URL || 'https://bfaith-portal.onrender.com/apps/mirror').replace(/\/apps\/mirror\/?$/, '') + '/apps/inventory-monthly/api/save-month-end';
         const syncKey = process.env.MIRROR_SYNC_KEY;
         if (!syncKey) {
-          // 意図的スキップ (success=true, skipped=true) なので全体通知を赤化させない
-          results.push({ name: '月末確定値', success: true, skipped: true, summary: '⏸️ MIRROR_SYNC_KEY 未設定でスキップ' });
+          // [Codex R2 #3] MIRROR_SYNC_KEY 未設定は「設定不備の隠蔽」になるので skipped 扱いにしない。
+          // 全体通知を ❌ 化させて運用者に気づかせる (本物のスキップは上流失敗時 / 既存snapshotあり時のみ)
+          results.push({ name: '月末確定値', success: false, summary: '❌ MIRROR_SYNC_KEY 未設定 (.env に追加してください)' });
         } else {
           const resp = await fetch(url, {
             method: 'POST',
@@ -221,7 +222,11 @@ async function main() {
             signal: AbortSignal.timeout(60000),
           });
           const data = await resp.json().catch(() => ({}));
-          if (resp.ok && data.ok) {
+          if (resp.ok && data.ok && data.skipped) {
+            // 既存 snapshot あり (手動入力 pending 等を保護するため上書きしない)
+            console.log(`[月末確定値] スキップ: ${data.reason}`);
+            results.push({ name: '月末確定値', success: true, skipped: true, summary: `⏸️ ${data.snapshot_date} 既存あり (id=${data.snapshot_id})` });
+          } else if (resp.ok && data.ok) {
             const { snapshot_date, totals, partial_categories } = data;
             const partialNote = (partial_categories && partial_categories.length > 0) ? ` (partial: ${partial_categories.join(',')})` : '';
             console.log(`[月末確定値] 保存成功: ${snapshot_date} 合計=¥${totals.total.toLocaleString('ja-JP')}${partialNote}`);

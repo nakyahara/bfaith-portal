@@ -1199,6 +1199,23 @@ apiRouter.post('/save-month-end', (req, res) => {
       return res.status(400).json({ error: '棚卸し基準日が不正です' });
     }
 
+    // [Codex R2 #2] 既存スナップショットがあれば上書きしない (cron 再実行で手動入力 pending を消さないため)
+    // 強制上書きは body.force=1 で許可 (将来の管理用)
+    const force = req.body?.force === true || req.body?.force === '1';
+    const existing = getDB().prepare(
+      'SELECT id, total, created_at, note FROM inv_snapshot WHERE snapshot_date = ?'
+    ).get(snapshot_date);
+    if (existing && !force) {
+      return res.json({
+        ok: true,
+        snapshot_date,
+        snapshot_id: existing.id,
+        skipped: true,
+        reason: `既存 snapshot あり (id=${existing.id}, created_at=${existing.created_at})。上書きしないため cron では skip。force=1 で強制上書き可能`,
+        existing_total: existing.total,
+      });
+    }
+
     // 発注後未着は cron では入らない (mirror に該当データなし)。空配列で進める。
     const pendingRows = [];
 
