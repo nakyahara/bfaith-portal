@@ -444,7 +444,7 @@ router.post('/aggregate', upload.fields([
 
 router.get('/history', (req, res) => {
   if (!ensureDbOrFailHtml(res)) return;
-  const list = listSnapshots();
+  const list = listSnapshots(); // snapshot_date DESC
   const rows = list.map(s => `
     <tr>
       <td><a href="history/${s.id}">${esc(s.snapshot_date)}</a></td>
@@ -456,13 +456,92 @@ router.get('/history', (req, res) => {
       <td class="num"><b>${yen(s.total)}</b></td>
       <td>${esc(s.created_at)}</td>
     </tr>`).join('');
+
+  // チャート用データ (古い順、Chart.js が期待する order)
+  const chartData = [...list].reverse().map(s => ({
+    date: s.snapshot_date,
+    fba_warehouse: s.fba_warehouse || 0,
+    fba_inbound: s.fba_inbound || 0,
+    own_warehouse: s.own_warehouse || 0,
+    fba_us: s.fba_us || 0,
+    pending_orders: s.pending_orders || 0,
+    total: s.total || 0,
+  }));
+  const chartJson = JSON.stringify(chartData);
+
   res.send(renderLayout('月末棚卸し - 履歴', `
-<h2>履歴一覧</h2>
+<h2>月末在庫推移 (積み上げ面グラフ)</h2>
 ${list.length === 0 ? '<p>まだ履歴がありません。</p>' : `
+<div class="card">
+  <div style="position:relative;height:380px"><canvas id="histChart"></canvas></div>
+</div>
+
+<h2>履歴一覧</h2>
 <table>
   <thead><tr><th>基準日</th><th>FBA倉庫</th><th>FBA輸送中</th><th>自社倉庫</th><th>米国FBA</th><th>発注後未着</th><th>合計</th><th>作成日時</th></tr></thead>
   <tbody>${rows}</tbody>
-</table>`}
+</table>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+  const data = ${chartJson};
+  const labels = data.map(d => d.date);
+  const palette = {
+    fba_warehouse: '#2c5aa0',  // 紺
+    fba_inbound:   '#5b9bd5',  // 水色
+    own_warehouse: '#70ad47',  // 緑 (一番大きいので分かりやすい色)
+    fba_us:        '#ed7d31',  // オレンジ
+    pending_orders:'#a5a5a5',  // グレー
+  };
+  const labelMap = {
+    fba_warehouse: 'FBA倉庫',
+    fba_inbound:   'FBA輸送中',
+    own_warehouse: '自社倉庫',
+    fba_us:        '米国FBA',
+    pending_orders:'発注後未着',
+  };
+  const datasets = Object.keys(palette).map(key => ({
+    label: labelMap[key],
+    data: data.map(d => d[key]),
+    backgroundColor: palette[key],
+    borderColor: palette[key],
+    fill: true,
+    tension: 0.2,
+    pointRadius: 2,
+  }));
+  new Chart(document.getElementById('histChart').getContext('2d'), {
+    type: 'line',
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      scales: {
+        y: {
+          stacked: true,
+          ticks: { callback: v => '¥' + (v/1000000).toFixed(0) + 'M' }
+        },
+        x: { ticks: { maxRotation: 60, minRotation: 0 } }
+      },
+      plugins: {
+        tooltip: {
+          callbacks: {
+            label: ctx => {
+              const v = ctx.parsed.y;
+              return ctx.dataset.label + ': ¥' + Math.round(v).toLocaleString();
+            },
+            footer: items => {
+              const total = items.reduce((s,i) => s + i.parsed.y, 0);
+              return '合計: ¥' + Math.round(total).toLocaleString();
+            }
+          }
+        },
+        legend: { position: 'bottom' }
+      }
+    }
+  });
+</script>
+`}
 `));
 });
 
@@ -633,6 +712,15 @@ router.get('/daily', (req, res) => {
     </tr>
   `).join('');
 
+  // チャート用データ (古い順)
+  const chartData = [...dates].reverse().map(d => ({
+    date: d.date,
+    fba_warehouse: (d.fba_warehouse && d.fba_warehouse.source_status !== 'no_source') ? d.fba_warehouse.total_value || 0 : null,
+    fba_inbound:   (d.fba_inbound   && d.fba_inbound.source_status   !== 'no_source') ? d.fba_inbound.total_value   || 0 : null,
+    own_warehouse: (d.own_warehouse && d.own_warehouse.source_status !== 'no_source') ? d.own_warehouse.total_value || 0 : null,
+  }));
+  const chartJson = JSON.stringify(chartData);
+
   res.send(renderLayout('月末棚卸し - 日次推移', `
 <h2>日次在庫推移 (国内)</h2>
 <p style="color:#666;font-size:13px">
@@ -643,6 +731,69 @@ router.get('/daily', (req, res) => {
   「no data」 = SP-API 未取得 (cron 失敗 or 当日未稼働)。
 </p>
 ${dates.length === 0 ? '<p>まだデータがありません。ミニPC で daily-sync が走るのを待ってください。</p>' : `
+
+<div class="card">
+  <div style="position:relative;height:340px"><canvas id="dailyChart"></canvas></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+  const data = ${chartJson};
+  const labels = data.map(d => d.date);
+  const palette = {
+    fba_warehouse: '#2c5aa0',
+    fba_inbound:   '#5b9bd5',
+    own_warehouse: '#70ad47',
+  };
+  const labelMap = {
+    fba_warehouse: 'FBA倉庫',
+    fba_inbound:   'FBA輸送中',
+    own_warehouse: '自社倉庫',
+  };
+  const datasets = Object.keys(palette).map(key => ({
+    label: labelMap[key],
+    data: data.map(d => d[key]),
+    backgroundColor: palette[key],
+    borderColor: palette[key],
+    fill: true,
+    tension: 0.2,
+    pointRadius: 2,
+    spanGaps: false, // null の日 (no_source) は線をつなげない
+  }));
+  new Chart(document.getElementById('dailyChart').getContext('2d'), {
+    type: 'line',
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      scales: {
+        y: {
+          stacked: true,
+          ticks: { callback: v => '¥' + (v/1000000).toFixed(0) + 'M' }
+        }
+      },
+      plugins: {
+        tooltip: {
+          callbacks: {
+            label: ctx => {
+              const v = ctx.parsed.y;
+              if (v == null) return ctx.dataset.label + ': データなし';
+              return ctx.dataset.label + ': ¥' + Math.round(v).toLocaleString();
+            },
+            footer: items => {
+              const total = items.filter(i => i.parsed.y != null).reduce((s,i) => s + i.parsed.y, 0);
+              return total > 0 ? '合計: ¥' + Math.round(total).toLocaleString() : '';
+            }
+          }
+        },
+        legend: { position: 'bottom' }
+      }
+    }
+  });
+</script>
+`}
+${dates.length === 0 ? '' : `
 <table>
   <thead>
     <tr>
