@@ -779,17 +779,34 @@ export function saveUsDailySnapshots({ planningRows = [], restockRows = [], snap
       const yourPrice = p.your_price ?? null;
       const featuredPrice = p.featured_offer_price ?? null;
 
+      // working_first_seen: JP と同じ自動判定 (前回 working > 0 なら引き継ぎ、新規なら今日)
+      let workingFirstSeen = null;
+      if (inboundWorking > 0) {
+        const prev = queryOne(
+          `SELECT working_first_seen, fba_inbound_working
+           FROM daily_snapshots_us
+           WHERE amazon_sku = ? AND snapshot_date < ?
+           ORDER BY snapshot_date DESC LIMIT 1`,
+          [sku, today]
+        );
+        workingFirstSeen = (prev && prev.fba_inbound_working > 0 && prev.working_first_seen)
+          ? prev.working_first_seen
+          : today;
+      }
+
       if (existing) {
         db.run(`
           UPDATE daily_snapshots_us SET
             product_name=?, fba_available=?, fba_inbound_working=?, fba_inbound_shipped=?, fba_inbound_received=?,
             fba_fc_transfer=?, fba_fc_processing=?, fba_customer_order=?, fba_unfulfillable=?,
+            working_first_seen=?,
             days_of_supply=?, units_sold_7d=?, units_sold_30d=?,
             sales_rank=?, your_price=?, featured_offer_price=?
           WHERE snapshot_date = ? AND amazon_sku = ?
         `, [
           productName, fbaAvailable, inboundWorking, inboundShipped, inboundReceived,
           fcTransfer, fcProcessing, customerOrder, unfulfillable,
+          workingFirstSeen,
           dos, sold7d, sold30d, salesRank, yourPrice, featuredPrice,
           today, sku,
         ]);
@@ -800,13 +817,15 @@ export function saveUsDailySnapshots({ planningRows = [], restockRows = [], snap
             (snapshot_date, amazon_sku, product_name,
              fba_available, fba_inbound_working, fba_inbound_shipped, fba_inbound_received,
              fba_fc_transfer, fba_fc_processing, fba_customer_order, fba_unfulfillable,
+             working_first_seen,
              days_of_supply, units_sold_7d, units_sold_30d,
              sales_rank, your_price, featured_offer_price)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `, [
           today, sku, productName,
           fbaAvailable, inboundWorking, inboundShipped, inboundReceived,
           fcTransfer, fcProcessing, customerOrder, unfulfillable,
+          workingFirstSeen,
           dos, sold7d, sold30d, salesRank, yourPrice, featuredPrice,
         ]);
         inserted++;

@@ -884,10 +884,11 @@ function createTables() {
     const sqlRow = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='inv_daily_detail'`).get();
     if (sqlRow && !sqlRow.sql.includes('fba_us_warehouse')) {
       console.log('[Warehouse] inv_daily_detail CHECK 制約を migration: fba_us_warehouse/fba_us_inbound 追加');
-      // 先に依存 view を drop (後続 createTables で再作成される)
-      db.exec('DROP VIEW IF EXISTS v_inv_daily_metrics');
+      // DROP VIEW + DDL + INSERT を1トランザクションに包む
+      // (途中失敗で view だけ消えてテーブルが残る状態を防止。後続 createTables で view 再作成)
       db.exec(`
         BEGIN TRANSACTION;
+        DROP VIEW IF EXISTS v_inv_daily_metrics;
         CREATE TABLE inv_daily_detail_new (
           business_date              TEXT NOT NULL,
           market                     TEXT NOT NULL DEFAULT 'jp',

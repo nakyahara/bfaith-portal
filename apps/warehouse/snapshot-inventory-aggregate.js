@@ -126,30 +126,37 @@ export function aggregateInventorySnapshot(businessDate) {
   }
 
   // 指定 (table, market, warehouseCategory, inboundCategory) で FBA 集計1セット実行
+  // 取得不能時 (ATTACH 失敗 / テーブル不在 / 行0 / 例外) は no_source 行を明示的に書く
   function processFbaMarket({ table, market, warehouseCategory, inboundCategory }) {
     const sectionResult = {};
-    if (!fbaAttached) {
+    const writeNoSource = () => {
       for (const cat of [warehouseCategory, inboundCategory]) {
         upsert.run(businessDate, market, cat, 0, null, 0, 0, 0, 'no_source', 0, captured);
         sectionResult[cat] = { qty: 0, value: 0, resolved: 0, costMissing: 0, status: 'no_source', rowCount: 0 };
       }
-      return sectionResult;
-    }
-    const fbaSrc = db.prepare(`
-      SELECT amazon_sku,
-             COALESCE(fba_available,0) + COALESCE(fba_fc_transfer,0) + COALESCE(fba_fc_processing,0) + COALESCE(fba_customer_order,0) AS qty_warehouse,
-             COALESCE(fba_inbound_working,0) + COALESCE(fba_inbound_shipped,0) + COALESCE(fba_inbound_received,0) AS qty_inbound
-      FROM fba.${table}
-      WHERE snapshot_date = ?
-    `).all(businessDate);
+    };
+    if (!fbaAttached) { writeNoSource(); return sectionResult; }
 
-    if (fbaSrc.length === 0) {
-      for (const cat of [warehouseCategory, inboundCategory]) {
-        upsert.run(businessDate, market, cat, 0, null, 0, 0, 0, 'no_source', 0, captured);
-        sectionResult[cat] = { qty: 0, value: 0, resolved: 0, costMissing: 0, status: 'no_source', rowCount: 0 };
-      }
+    // テーブル存在チェック (US 旧環境などで daily_snapshots_us が無いケース)
+    const exists = db.prepare(`SELECT name FROM fba.sqlite_master WHERE type='table' AND name=?`).get(table);
+    if (!exists) { writeNoSource(); return sectionResult; }
+
+    let fbaSrc;
+    try {
+      fbaSrc = db.prepare(`
+        SELECT amazon_sku,
+               COALESCE(fba_available,0) + COALESCE(fba_fc_transfer,0) + COALESCE(fba_fc_processing,0) + COALESCE(fba_customer_order,0) AS qty_warehouse,
+               COALESCE(fba_inbound_working,0) + COALESCE(fba_inbound_shipped,0) + COALESCE(fba_inbound_received,0) AS qty_inbound
+        FROM fba.${table}
+        WHERE snapshot_date = ?
+      `).all(businessDate);
+    } catch (e) {
+      console.warn(`[inv-agg] ${table} 取得失敗、no_source として記録:`, e.message);
+      writeNoSource();
       return sectionResult;
     }
+
+    if (fbaSrc.length === 0) { writeNoSource(); return sectionResult; }
 
     const wh = aggregateFbaCategory(fbaSrc, 'qty_warehouse');
     const ib = aggregateFbaCategory(fbaSrc, 'qty_inbound');
@@ -197,17 +204,13 @@ export function aggregateInventorySnapshot(businessDate) {
     }));
 
     // ─── 4/5. FBA US (daily_snapshots_us, market='us') ───
-    // テーブル未作成 (旧バージョン環境) でも落ちないように try
-    try {
-      Object.assign(result, processFbaMarket({
-        table: 'daily_snapshots_us',
-        market: 'us',
-        warehouseCategory: 'fba_us_warehouse',
-        inboundCategory: 'fba_us_inbound',
-      }));
-    } catch (e) {
-      console.warn('[inv-agg] US FBA 集計スキップ:', e.message);
-    }
+    // processFbaMarket がテーブル不在・取得失敗時に no_source を書くので catch 不要
+    Object.assign(result, processFbaMarket({
+      table: 'daily_snapshots_us',
+      market: 'us',
+      warehouseCategory: 'fba_us_warehouse',
+      inboundCategory: 'fba_us_inbound',
+    }));
 
     return result;
   } finally {
