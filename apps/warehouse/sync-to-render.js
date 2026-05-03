@@ -134,6 +134,22 @@ export async function syncToRender() {
     console.log(`[Sync→Render]   inv_daily_summary: 取得失敗（スキップ）: ${e.message}`);
   }
 
+  // 2b-4. inv_daily_detail (D-1c: 詳細層、差分sync)
+  //   毎回 直近7日分のみ送信 → Render側で UPSERT
+  //   Render側は受信時に「365日より古い行 DELETE」も実行 (古い分は捨てる)
+  //   1日 5,000-6,000行 × 7日 = 約 35,000行/送信 → ~5MB ペイロード
+  let inv_daily_detail = [];
+  try {
+    inv_daily_detail = db.prepare(`
+      SELECT * FROM inv_daily_detail
+      WHERE business_date >= date('now','-7 days')
+      ORDER BY business_date, market, category, source_system, source_item_code, ne_code
+    `).all();
+    console.log(`[Sync→Render]   inv_daily_detail (直近7日): ${inv_daily_detail.length}件`);
+  } catch (e) {
+    console.log(`[Sync→Render]   inv_daily_detail: 取得失敗（スキップ）: ${e.message}`);
+  }
+
   // 2b-2. sku_resolved（新、master優先＋fallback解決済みビュー）
   //   v_sku_resolved に商品名と source_updated_at を JOIN/COALESCE して送信
   //   - source='master': m_sku_master.商品名 / m_sku_master.updated_at
@@ -249,6 +265,22 @@ export async function syncToRender() {
   try {
     // Part 1: マスタデータ
     await sendPart({ products, set_components, sku_map, sku_resolved, amazon_sku_fees, rakuten_sku_map, inv_daily_summary }, 'マスタ');
+
+    // Part 1c: inv_daily_detail (D-1c、直近7日、~17MB なので chunk 分割)
+    // 初回チャンクで meta.inv_daily_detail_clear_old=true を渡し、Render側で365日より古い行を削除
+    const detailChunkSize = 5000;
+    if (inv_daily_detail.length === 0) {
+      await sendPart({ inv_daily_detail: [], meta: { inv_daily_detail_clear_old: true } }, 'inv_daily_detail (空 / 古い行クリーンのみ)');
+    } else {
+      for (let i = 0; i < inv_daily_detail.length; i += detailChunkSize) {
+        const chunk = inv_daily_detail.slice(i, i + detailChunkSize);
+        const isFirst = i === 0;
+        await sendPart(
+          { inv_daily_detail: chunk, meta: isFirst ? { inv_daily_detail_clear_old: true } : undefined },
+          `inv_daily_detail ${i + 1}-${Math.min(i + detailChunkSize, inv_daily_detail.length)}`
+        );
+      }
+    }
 
     // Part 1b: 月末在庫スナップショット（PR2a 追加、タブB GMROI用）
     //   件数は最大 商品数 × 25ヶ月（現在月+過去24ヶ月、sales_monthly と同じ境界扱い）。

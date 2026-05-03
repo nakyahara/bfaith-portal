@@ -145,6 +145,68 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
       log.push(`sku_resolved: ${resolved.length}件`);
     }
 
+    // inv_daily_detail (D-1c 詳細層、差分sync UPSERT + 古い行クリーン)
+    // ペイロード: { inv_daily_detail: [...rows], meta: { inv_daily_detail_clear_old: true } }
+    if (req.body.inv_daily_detail && Array.isArray(req.body.inv_daily_detail)) {
+      const rows = req.body.inv_daily_detail;
+      const clearOld = req.body.meta?.inv_daily_detail_clear_old === true;
+      const tx = db.transaction(() => {
+        if (clearOld) {
+          // 365日より古い行を削除 (Render disk 圧迫抑制)
+          db.prepare(`DELETE FROM mirror_inv_daily_detail WHERE business_date < date('now','-365 days')`).run();
+        }
+        const stmt = db.prepare(`
+          INSERT INTO mirror_inv_daily_detail (
+            business_date, market, category, source_system, source_item_code, ne_code,
+            qty, unit_cost, total_value, cost_status, cost_source, resolution_method,
+            is_bundle_expanded, component_qty,
+            product_name, source_product_name, supplier_code, product_type, handling_class,
+            sales_class, representative_product_code, order_lot_size,
+            seasonality_flag, season_months, new_product_flag, new_product_launch_date,
+            last_sold_date, sales_7d_qty, sales_30d_qty, sales_90d_qty,
+            sales_7d_value, sales_30d_value, sales_90d_value,
+            working_first_seen, fba_unfulfillable_qty,
+            reserved_qty, pending_order_qty, location_code, last_purchase_date,
+            snapshot_run_id, synced_at
+          )
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+          ON CONFLICT(business_date, market, category, source_system, source_item_code, ne_code) DO UPDATE SET
+            qty=excluded.qty, unit_cost=excluded.unit_cost, total_value=excluded.total_value,
+            cost_status=excluded.cost_status, cost_source=excluded.cost_source, resolution_method=excluded.resolution_method,
+            is_bundle_expanded=excluded.is_bundle_expanded, component_qty=excluded.component_qty,
+            product_name=excluded.product_name, source_product_name=excluded.source_product_name,
+            supplier_code=excluded.supplier_code, product_type=excluded.product_type, handling_class=excluded.handling_class,
+            sales_class=excluded.sales_class, representative_product_code=excluded.representative_product_code, order_lot_size=excluded.order_lot_size,
+            seasonality_flag=excluded.seasonality_flag, season_months=excluded.season_months,
+            new_product_flag=excluded.new_product_flag, new_product_launch_date=excluded.new_product_launch_date,
+            last_sold_date=excluded.last_sold_date, sales_7d_qty=excluded.sales_7d_qty,
+            sales_30d_qty=excluded.sales_30d_qty, sales_90d_qty=excluded.sales_90d_qty,
+            sales_7d_value=excluded.sales_7d_value, sales_30d_value=excluded.sales_30d_value, sales_90d_value=excluded.sales_90d_value,
+            working_first_seen=excluded.working_first_seen, fba_unfulfillable_qty=excluded.fba_unfulfillable_qty,
+            reserved_qty=excluded.reserved_qty, pending_order_qty=excluded.pending_order_qty,
+            location_code=excluded.location_code, last_purchase_date=excluded.last_purchase_date,
+            snapshot_run_id=excluded.snapshot_run_id, synced_at=excluded.synced_at
+        `);
+        for (const r of rows) {
+          stmt.run(
+            r.business_date, r.market || 'jp', r.category, r.source_system, r.source_item_code, r.ne_code,
+            r.qty ?? 0, r.unit_cost ?? null, r.total_value ?? null, r.cost_status, r.cost_source ?? null, r.resolution_method ?? null,
+            r.is_bundle_expanded ?? 0, r.component_qty ?? null,
+            r.product_name ?? null, r.source_product_name ?? null, r.supplier_code ?? null, r.product_type ?? null, r.handling_class ?? null,
+            r.sales_class ?? null, r.representative_product_code ?? null, r.order_lot_size ?? null,
+            r.seasonality_flag ?? null, r.season_months ?? null, r.new_product_flag ?? null, r.new_product_launch_date ?? null,
+            r.last_sold_date ?? null, r.sales_7d_qty ?? null, r.sales_30d_qty ?? null, r.sales_90d_qty ?? null,
+            r.sales_7d_value ?? null, r.sales_30d_value ?? null, r.sales_90d_value ?? null,
+            r.working_first_seen ?? null, r.fba_unfulfillable_qty ?? null,
+            r.reserved_qty ?? null, r.pending_order_qty ?? null, r.location_code ?? null, r.last_purchase_date ?? null,
+            r.snapshot_run_id ?? null, now
+          );
+        }
+      });
+      tx();
+      log.push(`inv_daily_detail: ${rows.length}件 (${clearOld ? 'cutoff済み' : 'append'})`);
+    }
+
     // inv_daily_summary（全件置換、PR-C 日次在庫スナップショット）
     if (req.body.inv_daily_summary && Array.isArray(req.body.inv_daily_summary)) {
       const rows = req.body.inv_daily_summary;
@@ -376,6 +438,18 @@ router.get('/api/status', (req, res) => {
       status.inv_daily_summary_latest_date = r.latest_date;
     } catch {
       status.inv_daily_summary_count = 0;
+    }
+    // inv_daily_detail (D-1c 詳細層)
+    try {
+      const r = db.prepare(`
+        SELECT COUNT(*) AS cnt, MIN(business_date) AS oldest, MAX(business_date) AS latest
+        FROM mirror_inv_daily_detail
+      `).get();
+      status.inv_daily_detail_count = r.cnt;
+      status.inv_daily_detail_oldest_date = r.oldest;
+      status.inv_daily_detail_latest_date = r.latest;
+    } catch {
+      status.inv_daily_detail_count = 0;
     }
   } catch {}
   res.json(status);

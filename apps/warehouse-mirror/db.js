@@ -152,6 +152,78 @@ function createTables() {
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_mir_inv_daily_date ON mirror_inv_daily_summary(business_date)');
 
+  // mirror_inv_daily_detail — 詳細層 (D-1c、直近365日のみmirror)
+  // 元: ミニPC warehouse.db.inv_daily_detail
+  // 差分sync方式: ミニPCから直近7日分を毎日 UPSERT で送信、365日より古い分を Render 側で DELETE
+  // detail 5,000-6,000行/日 × 365 = 約220万行で、SQLite/Render disk で扱える範囲
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_inv_daily_detail (
+    business_date              TEXT NOT NULL,
+    market                     TEXT NOT NULL DEFAULT 'jp',
+    category                   TEXT NOT NULL,
+    source_system              TEXT NOT NULL,
+    source_item_code           TEXT NOT NULL,
+    ne_code                    TEXT NOT NULL,
+    qty                        INTEGER NOT NULL,
+    unit_cost                  REAL,
+    total_value                REAL,
+    cost_status                TEXT NOT NULL,
+    cost_source                TEXT,
+    resolution_method          TEXT,
+    is_bundle_expanded         INTEGER NOT NULL DEFAULT 0,
+    component_qty              INTEGER,
+    product_name               TEXT,
+    source_product_name        TEXT,
+    supplier_code              TEXT,
+    product_type               TEXT,
+    handling_class             TEXT,
+    sales_class                INTEGER,
+    representative_product_code TEXT,
+    order_lot_size             INTEGER,
+    seasonality_flag           INTEGER,
+    season_months              TEXT,
+    new_product_flag           INTEGER,
+    new_product_launch_date    TEXT,
+    last_sold_date             TEXT,
+    sales_7d_qty               INTEGER,
+    sales_30d_qty              INTEGER,
+    sales_90d_qty              INTEGER,
+    sales_7d_value             REAL,
+    sales_30d_value            REAL,
+    sales_90d_value            REAL,
+    working_first_seen         TEXT,
+    fba_unfulfillable_qty      INTEGER,
+    reserved_qty               INTEGER,
+    pending_order_qty          INTEGER,
+    location_code              TEXT,
+    last_purchase_date         TEXT,
+    snapshot_run_id            TEXT,
+    synced_at                  TEXT NOT NULL,
+    PRIMARY KEY (business_date, market, category, source_system, source_item_code, ne_code)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mir_idd_date ON mirror_inv_daily_detail(business_date)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mir_idd_date_cat ON mirror_inv_daily_detail(business_date, category)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mir_idd_ne ON mirror_inv_daily_detail(ne_code)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mir_idd_supplier ON mirror_inv_daily_detail(supplier_code)');
+
+  // 派生view: DOS / 回転率 / 滞留判定
+  db.exec('DROP VIEW IF EXISTS v_mir_inv_daily_metrics');
+  db.exec(`CREATE VIEW v_mir_inv_daily_metrics AS
+    SELECT
+      business_date, market, category, source_system, source_item_code, ne_code,
+      qty, total_value,
+      sales_7d_qty, sales_30d_qty, sales_90d_qty,
+      sales_7d_value, sales_30d_value, sales_90d_value,
+      last_sold_date,
+      CASE WHEN sales_30d_qty > 0 THEN ROUND(qty * 30.0 / sales_30d_qty, 1) ELSE NULL END AS days_of_supply,
+      CASE WHEN qty > 0 AND sales_30d_qty > 0 THEN ROUND(365.0 * sales_30d_qty / (qty * 30.0), 2) ELSE NULL END AS turnover_yearly,
+      CASE WHEN (sales_90d_qty IS NULL OR sales_90d_qty = 0) AND qty > 0 THEN 1 ELSE 0 END AS is_stale,
+      product_name, supplier_code,
+      product_type, handling_class, sales_class,
+      seasonality_flag, new_product_flag,
+      cost_status, resolution_method
+    FROM mirror_inv_daily_detail
+  `);
+
   // mirror_sales_monthly — 月次集計（24ヶ月分）
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_sales_monthly (
     月                TEXT NOT NULL,
