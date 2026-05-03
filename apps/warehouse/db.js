@@ -179,9 +179,11 @@ function createTables() {
     const sqlRow = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='sku_map'`).get();
     if (sqlRow && !sqlRow.sql.toLowerCase().includes('market')) {
       console.log('[Warehouse] sku_map に market 列追加 (既存 row は market=jp)');
-      // sku_map に依存する view を先に drop (後段 createTables で再作成)
+      // sku_map に依存する全 view を先に drop (後段 createTables で再作成される)
       db.exec(`
         BEGIN TRANSACTION;
+        DROP VIEW IF EXISTS v_sales_by_product;
+        DROP VIEW IF EXISTS v_missing_data;
         DROP VIEW IF EXISTS v_sku_costed;
         DROP VIEW IF EXISTS v_sku_resolved;
         CREATE TABLE sku_map_new (
