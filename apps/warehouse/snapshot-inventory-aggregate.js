@@ -20,6 +20,7 @@
  * daily-sync.js から PR-0 (snapshot-fba-stock.js) の後に呼ばれる。
  * 単独実行可: node apps/warehouse/snapshot-inventory-aggregate.js [--date=YYYY-MM-DD]
  */
+import crypto from 'crypto';
 import { initDB, getDB } from './db.js';
 
 function toJstDate(d) {
@@ -191,6 +192,296 @@ export function aggregateInventorySnapshot(businessDate) {
   }
 }
 
+/**
+ * inv_daily_detail を1日分 UPSERT で書き込む。
+ * - own_warehouse: ne_stock_daily_snapshot を ne_code 単位で展開
+ * - fba_warehouse / fba_inbound: fba.db.daily_snapshots → v_sku_resolved で展開
+ * 戻り値: { snapshotRunId, status, totalRows, totalValue, costMissing, neMissing }
+ */
+export function aggregateInventoryDetail(businessDate) {
+  if (!businessDate || !/^\d{4}-\d{2}-\d{2}$/.test(businessDate)) {
+    throw new Error(`business_date が不正: ${businessDate}`);
+  }
+  const db = getDB();
+  const snapshotRunId = crypto.randomUUID();
+  const startedAt = new Date().toISOString();
+  const market = 'jp';
+
+  // run_log に running を先に記録
+  db.prepare(`INSERT INTO inv_daily_run_log (snapshot_run_id, business_date, started_at, status) VALUES (?, ?, ?, 'running')`)
+    .run(snapshotRunId, businessDate, startedAt);
+
+  let status = 'ok';
+  let errorMessage = null;
+  let totalRows = 0, totalValue = 0, costMissing = 0, neMissing = 0;
+
+  const fbaAttached = attachFbaDb(db);
+
+  try {
+    // ─── 1. マスタ系をメモリに事前ロード ───
+    const mProducts = new Map(); // ne_code → { ... }
+    for (const r of db.prepare(`SELECT 商品コード, 商品名, 商品区分, 取扱区分, 売上分類, 原価, 仕入先コード, seasonality_flag, season_months, new_product_flag, new_product_launch_date FROM m_products`).all()) {
+      mProducts.set(r.商品コード, r);
+    }
+    const rawNe = new Map(); // ne_code → { ... }
+    for (const r of db.prepare(`SELECT 商品コード, 引当数, 発注残数, ロケーションコード, 最終仕入日, 代表商品コード, 発注ロット単位 FROM raw_ne_products`).all()) {
+      rawNe.set(r.商品コード, r);
+    }
+
+    // SKU解決マップ (seller_sku → [{ne_code, qty}])
+    const resolveMap = new Map();
+    for (const r of db.prepare(`SELECT seller_sku, ne_code, 数量 FROM v_sku_resolved`).all()) {
+      const k = r.seller_sku;
+      if (!resolveMap.has(k)) resolveMap.set(k, []);
+      resolveMap.get(k).push({ ne_code: r.ne_code, qty: r.数量 || 1 });
+    }
+
+    // 売上履歴を ne_code 単位で集約 (直近90日、business_date 未満)
+    // last_sold_date / sales_7/30/90d_qty / value
+    const salesAgg = new Map();
+    const salesRows = db.prepare(`
+      SELECT 商品コード AS ne_code,
+             MAX(日付) AS last_sold_date,
+             SUM(CASE WHEN 日付 >= date(?, '-7 days')  THEN 数量    ELSE 0 END) AS s7q,
+             SUM(CASE WHEN 日付 >= date(?, '-30 days') THEN 数量    ELSE 0 END) AS s30q,
+             SUM(CASE WHEN 日付 >= date(?, '-90 days') THEN 数量    ELSE 0 END) AS s90q,
+             SUM(CASE WHEN 日付 >= date(?, '-7 days')  THEN 売上金額 ELSE 0 END) AS s7v,
+             SUM(CASE WHEN 日付 >= date(?, '-30 days') THEN 売上金額 ELSE 0 END) AS s30v,
+             SUM(CASE WHEN 日付 >= date(?, '-90 days') THEN 売上金額 ELSE 0 END) AS s90v
+      FROM f_sales_by_product
+      WHERE 日付 >= date(?, '-90 days') AND 日付 < ?
+      GROUP BY 商品コード
+    `).all(businessDate, businessDate, businessDate, businessDate, businessDate, businessDate, businessDate, businessDate);
+    for (const r of salesRows) salesAgg.set(r.ne_code, r);
+
+    // ─── 2. detail 行を生成 ───
+    const detailRows = [];
+
+    function buildRow(category, sourceSystem, sourceItemCode, neCode, qty, opts = {}) {
+      if (qty == null || qty === 0) return null;
+      const m = mProducts.get(neCode);
+      const ne = rawNe.get(neCode);
+      const s = salesAgg.get(neCode);
+      const unitCost = m?.原価 ?? null;
+      let costStatus = 'ok';
+      let costSource = 'm_products';
+      if (!m) {
+        costStatus = 'ne_missing';
+        costSource = 'missing';
+        neMissing++;
+      } else if (unitCost == null) {
+        costStatus = 'cost_missing';
+        costSource = 'missing';
+        costMissing++;
+      }
+      const totalVal = (unitCost != null) ? qty * unitCost : null;
+      if (totalVal != null) totalValue += totalVal;
+
+      return {
+        business_date: businessDate,
+        market,
+        category,
+        source_system: sourceSystem,
+        source_item_code: sourceItemCode,
+        ne_code: neCode,
+        qty,
+        unit_cost: unitCost,
+        total_value: totalVal,
+        cost_status: costStatus,
+        cost_source: costSource,
+        resolution_method: opts.resolution_method || null,
+        is_bundle_expanded: opts.is_bundle_expanded ? 1 : 0,
+        component_qty: opts.component_qty ?? null,
+        product_name: m?.商品名 ?? null,
+        source_product_name: opts.source_product_name ?? null,
+        supplier_code: m?.仕入先コード ?? null,
+        product_type: m?.商品区分 ?? null,
+        handling_class: m?.取扱区分 ?? null,
+        sales_class: m?.売上分類 ?? null,
+        representative_product_code: ne?.代表商品コード ?? null,
+        order_lot_size: ne?.発注ロット単位 ?? null,
+        seasonality_flag: m?.seasonality_flag ?? null,
+        season_months: m?.season_months ?? null,
+        new_product_flag: m?.new_product_flag ?? null,
+        new_product_launch_date: m?.new_product_launch_date ?? null,
+        last_sold_date: s?.last_sold_date ?? null,
+        sales_7d_qty: s?.s7q ?? null,
+        sales_30d_qty: s?.s30q ?? null,
+        sales_90d_qty: s?.s90q ?? null,
+        sales_7d_value: s?.s7v ?? null,
+        sales_30d_value: s?.s30v ?? null,
+        sales_90d_value: s?.s90v ?? null,
+        working_first_seen: opts.working_first_seen ?? null,
+        fba_unfulfillable_qty: opts.fba_unfulfillable_qty ?? null,
+        reserved_qty: (category === 'own_warehouse') ? (ne?.引当数 ?? null) : null,
+        pending_order_qty: (category === 'own_warehouse') ? (ne?.発注残数 ?? null) : null,
+        location_code: (category === 'own_warehouse') ? (ne?.ロケーションコード ?? null) : null,
+        last_purchase_date: (category === 'own_warehouse') ? (ne?.最終仕入日 ?? null) : null,
+        snapshot_run_id: snapshotRunId,
+      };
+    }
+
+    // 2a. own_warehouse
+    const ownSrc = db.prepare(`SELECT 商品コード, 在庫数 FROM ne_stock_daily_snapshot WHERE business_date = ? AND 在庫数 > 0`).all(businessDate);
+    for (const r of ownSrc) {
+      const row = buildRow('own_warehouse', 'ne', r.商品コード, r.商品コード, r.在庫数, { resolution_method: 'direct' });
+      if (row) detailRows.push(row);
+    }
+
+    // 2b. FBA (warehouse + inbound)
+    if (fbaAttached) {
+      // 既存環境で fba_unfulfillable 列が無い場合に備えて存在チェック
+      const fbaCols = db.prepare(`PRAGMA fba.table_info(daily_snapshots)`).all().map(c => c.name);
+      const hasUnfulfillable = fbaCols.includes('fba_unfulfillable');
+      const unfulfillableExpr = hasUnfulfillable ? 'fba_unfulfillable' : 'NULL AS fba_unfulfillable';
+      const fbaSrc = db.prepare(`
+        SELECT amazon_sku, product_name,
+               COALESCE(fba_available,0) + COALESCE(fba_fc_transfer,0) + COALESCE(fba_fc_processing,0) + COALESCE(fba_customer_order,0) AS qty_warehouse,
+               COALESCE(fba_inbound_working,0) + COALESCE(fba_inbound_shipped,0) + COALESCE(fba_inbound_received,0) AS qty_inbound,
+               working_first_seen, ${unfulfillableExpr}
+        FROM fba.daily_snapshots
+        WHERE snapshot_date = ?
+      `).all(businessDate);
+
+      for (const fba of fbaSrc) {
+        const sku = (fba.amazon_sku || '').toLowerCase();
+        const components = resolveMap.get(sku) || [];
+        const isBundle = components.length > 1;
+        const resolution = components.length === 0 ? 'unresolved' : (isBundle ? 'master' : 'sku_map'); // 簡易: 1件なら sku_map 多い
+
+        for (const cat of [
+          { name: 'fba_warehouse', qty: fba.qty_warehouse, working_first_seen: null, unfulfillable: fba.fba_unfulfillable },
+          { name: 'fba_inbound',   qty: fba.qty_inbound,   working_first_seen: fba.working_first_seen, unfulfillable: null },
+        ]) {
+          if (cat.qty <= 0) continue;
+          if (components.length === 0) {
+            // 未解決: source_item_code = seller_sku, ne_code = seller_sku (PKを満たすため)
+            const row = buildRow(cat.name, 'fba', sku, sku, cat.qty, {
+              resolution_method: 'unresolved',
+              source_product_name: fba.product_name,
+              working_first_seen: cat.working_first_seen,
+              fba_unfulfillable_qty: cat.unfulfillable,
+            });
+            if (row) detailRows.push(row);
+          } else {
+            for (const c of components) {
+              const row = buildRow(cat.name, 'fba', sku, c.ne_code, cat.qty * c.qty, {
+                resolution_method: resolution,
+                is_bundle_expanded: isBundle,
+                component_qty: isBundle ? c.qty : null,
+                source_product_name: fba.product_name,
+                working_first_seen: cat.working_first_seen,
+                fba_unfulfillable_qty: cat.unfulfillable,
+              });
+              if (row) detailRows.push(row);
+            }
+          }
+        }
+      }
+    }
+
+    totalRows = detailRows.length;
+
+    // ─── 3. UPSERT (1 トランザクション) ───
+    const upsertStmt = db.prepare(`
+      INSERT INTO inv_daily_detail (
+        business_date, market, category, source_system, source_item_code, ne_code,
+        qty, unit_cost, total_value, cost_status, cost_source, resolution_method,
+        is_bundle_expanded, component_qty,
+        product_name, source_product_name, supplier_code, product_type, handling_class,
+        sales_class, representative_product_code, order_lot_size,
+        seasonality_flag, season_months, new_product_flag, new_product_launch_date,
+        last_sold_date, sales_7d_qty, sales_30d_qty, sales_90d_qty,
+        sales_7d_value, sales_30d_value, sales_90d_value,
+        working_first_seen, fba_unfulfillable_qty,
+        reserved_qty, pending_order_qty, location_code, last_purchase_date,
+        snapshot_run_id
+      ) VALUES (
+        ?, ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?, ?,
+        ?, ?,
+        ?, ?, ?, ?, ?,
+        ?, ?, ?,
+        ?, ?, ?, ?,
+        ?, ?, ?, ?,
+        ?, ?, ?,
+        ?, ?,
+        ?, ?, ?, ?,
+        ?
+      )
+      ON CONFLICT(business_date, market, category, source_system, source_item_code, ne_code) DO UPDATE SET
+        qty = excluded.qty,
+        unit_cost = excluded.unit_cost,
+        total_value = excluded.total_value,
+        cost_status = excluded.cost_status,
+        cost_source = excluded.cost_source,
+        resolution_method = excluded.resolution_method,
+        is_bundle_expanded = excluded.is_bundle_expanded,
+        component_qty = excluded.component_qty,
+        product_name = excluded.product_name,
+        source_product_name = excluded.source_product_name,
+        supplier_code = excluded.supplier_code,
+        product_type = excluded.product_type,
+        handling_class = excluded.handling_class,
+        sales_class = excluded.sales_class,
+        representative_product_code = excluded.representative_product_code,
+        order_lot_size = excluded.order_lot_size,
+        seasonality_flag = excluded.seasonality_flag,
+        season_months = excluded.season_months,
+        new_product_flag = excluded.new_product_flag,
+        new_product_launch_date = excluded.new_product_launch_date,
+        last_sold_date = excluded.last_sold_date,
+        sales_7d_qty = excluded.sales_7d_qty,
+        sales_30d_qty = excluded.sales_30d_qty,
+        sales_90d_qty = excluded.sales_90d_qty,
+        sales_7d_value = excluded.sales_7d_value,
+        sales_30d_value = excluded.sales_30d_value,
+        sales_90d_value = excluded.sales_90d_value,
+        working_first_seen = excluded.working_first_seen,
+        fba_unfulfillable_qty = excluded.fba_unfulfillable_qty,
+        reserved_qty = excluded.reserved_qty,
+        pending_order_qty = excluded.pending_order_qty,
+        location_code = excluded.location_code,
+        last_purchase_date = excluded.last_purchase_date,
+        snapshot_run_id = excluded.snapshot_run_id,
+        ingested_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    `);
+
+    const tx = db.transaction(() => {
+      for (const r of detailRows) {
+        upsertStmt.run(
+          r.business_date, r.market, r.category, r.source_system, r.source_item_code, r.ne_code,
+          r.qty, r.unit_cost, r.total_value, r.cost_status, r.cost_source, r.resolution_method,
+          r.is_bundle_expanded, r.component_qty,
+          r.product_name, r.source_product_name, r.supplier_code, r.product_type, r.handling_class,
+          r.sales_class, r.representative_product_code, r.order_lot_size,
+          r.seasonality_flag, r.season_months, r.new_product_flag, r.new_product_launch_date,
+          r.last_sold_date, r.sales_7d_qty, r.sales_30d_qty, r.sales_90d_qty,
+          r.sales_7d_value, r.sales_30d_value, r.sales_90d_value,
+          r.working_first_seen, r.fba_unfulfillable_qty,
+          r.reserved_qty, r.pending_order_qty, r.location_code, r.last_purchase_date,
+          r.snapshot_run_id,
+        );
+      }
+    });
+    tx();
+
+    // 完全性判定
+    if (costMissing + neMissing > totalRows * 0.05) status = 'partial'; // 5% 超で partial
+    else if (totalRows === 0) status = 'failed';
+  } catch (e) {
+    status = 'failed';
+    errorMessage = e.message;
+    throw e;
+  } finally {
+    if (fbaAttached) detachFbaDb(db);
+    db.prepare(`UPDATE inv_daily_run_log SET finished_at=?, status=?, detail_total_rows=?, detail_total_value=?, cost_missing_count=?, ne_missing_count=?, error_message=? WHERE snapshot_run_id=?`)
+      .run(new Date().toISOString(), status, totalRows, totalValue, costMissing, neMissing, errorMessage, snapshotRunId);
+  }
+
+  return { snapshotRunId, status, totalRows, totalValue, costMissing, neMissing };
+}
+
 // ─── CLI ───
 const isMain = process.argv[1]?.endsWith('snapshot-inventory-aggregate.js');
 if (isMain) {
@@ -199,10 +490,14 @@ if (isMain) {
   console.log(`[inv-agg] business_date=${businessDate} 開始`);
   const t0 = Date.now();
   const result = aggregateInventorySnapshot(businessDate);
-  const elapsed = Date.now() - t0;
-  console.log(`[inv-agg] ✅ 完了 (${elapsed}ms):`);
+  const t1 = Date.now();
+  console.log(`[inv-agg] summary 完了 (${t1 - t0}ms):`);
   for (const [cat, s] of Object.entries(result)) {
     console.log(`  ${cat}: qty=${s.qty} value=${Math.round(s.value)} status=${s.status} (resolved=${s.resolved}/unresolved=${s.unresolved||0}/cost_missing=${s.costMissing||0}, src=${s.rowCount})`);
   }
+  console.log(`[inv-agg] detail 開始`);
+  const detail = aggregateInventoryDetail(businessDate);
+  const t2 = Date.now();
+  console.log(`[inv-agg] detail 完了 (${t2 - t1}ms): run_id=${detail.snapshotRunId} rows=${detail.totalRows} value=${Math.round(detail.totalValue)} cost_missing=${detail.costMissing} ne_missing=${detail.neMissing} status=${detail.status}`);
   process.exit(0);
 }
