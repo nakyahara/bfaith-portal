@@ -103,7 +103,7 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
     // 数量検証: NULL→1扱い、0/負数/非整数→null (invalid、計算除外)
     const rawQty = m.数量;
     const validQty = (rawQty == null) ? 1
-      : (Number.isFinite(rawQty) && rawQty > 0) ? rawQty : null;
+      : (Number.isInteger(rawQty) && rawQty > 0) ? rawQty : null;
     skuToNeMap.get(key).push({ ne_code: m.ne_code?.toLowerCase(), qty: validQty, rawQty });
   }
 

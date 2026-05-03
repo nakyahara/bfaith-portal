@@ -286,7 +286,7 @@ router.post('/api/listings', async (req, res) => {
         // 数量検証: NULL→1扱い、0/負数/非整数→null (invalid)
         const rawQty = m.数量;
         const validQty = (rawQty == null) ? 1
-          : (Number.isFinite(rawQty) && rawQty > 0) ? rawQty : null;
+          : (Number.isInteger(rawQty) && rawQty > 0) ? rawQty : null;
         skuToNe.get(m.seller_sku?.toLowerCase()).push({ ne_code: m.ne_code, qty: validQty, rawQty });
       }
 

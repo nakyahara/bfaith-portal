@@ -51,7 +51,7 @@ function buildLookups(db) {
     // 数量検証: NULL→1扱い、0/負数/非整数→1 fallback (棚卸しは 1 個でも数えたい)
     const rawQty = s.数量;
     const validQty = (rawQty == null) ? 1
-      : (Number.isFinite(rawQty) && rawQty > 0) ? rawQty : 1;
+      : (Number.isInteger(rawQty) && rawQty > 0) ? rawQty : 1;
     skuMap.get(key).push({ ne_code: (s.ne_code || '').toLowerCase(), 数量: validQty });
   }
 

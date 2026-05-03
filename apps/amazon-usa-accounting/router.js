@@ -179,7 +179,7 @@ function resolveSkus(rows, db) {
           const components = maps.map(m => {
             const rawQty = m.数量;
             const validQty = (rawQty == null) ? 1
-              : (Number.isFinite(rawQty) && rawQty > 0) ? rawQty : null;
+              : (Number.isInteger(rawQty) && rawQty > 0) ? rawQty : null;
             return {
               ne_code: m.ne_code,
               qty: validQty,
@@ -371,12 +371,26 @@ router.post('/upload', upload.single('file'), (req, res) => {
     summaryCsv += 'セグメント,' + MGMT_COLS.join(',') + ',広告費\n';
     summaryCsv += '4:輸出,' + MGMT_COLS.map(c => Math.round(mgmt[c] || 0)).join(',') + ',(確定時に手入力)\n';
 
-    evidenceStore.set(yearMonth, { detail: detailCsv, summary: summaryCsv });
+    // /confirm でサーバ側真値として使うため集計結果も保管 (Codex 3R #1)
+    const canConfirmFlag = conflicts.length === 0;
+    const usResolvedCount = resolved.filter(r => r.解決方法 !== 'unresolved' && r.解決方法 !== 'no_sku' && !['partial_component','invalid_quantity'].includes(r.解決方法)).length;
+    evidenceStore.set(yearMonth, {
+      detail: detailCsv,
+      summary: summaryCsv,
+      serverState: {
+        totalRows: parsedRows.length,
+        resolvedCount: usResolvedCount,
+        unresolvedCount: unresolved.length,
+        conflictsCount: conflicts.length,
+        canConfirm: canConfirmFlag,
+        rate, usd, jpy, mgmt, costTotalJpy,
+      },
+    });
 
     res.json({
       yearMonth, rate,
       totalRows: parsedRows.length,
-      resolvedCount: resolved.filter(r => r.解決方法 !== 'unresolved' && r.解決方法 !== 'no_sku' && r.解決方法 !== 'partial_component').length,
+      resolvedCount: resolved.filter(r => r.解決方法 !== 'unresolved' && r.解決方法 !== 'no_sku' && !['partial_component','invalid_quantity'].includes(r.解決方法)).length,
       unresolvedSkus: unresolved,
       // 米国Amazon: 未登録SKUは原価0扱いで集計に含める(GAS互換)が、セット商品の構成品欠損(partial_component)があれば確定不可
       canConfirm: conflicts.length === 0,
@@ -413,13 +427,17 @@ router.get('/evidence/:type/:yearMonth', (req, res) => {
 
 router.post('/confirm', (req, res) => {
   const db = getMirrorDB();
-  const { yearMonth, totalRows, resolvedCount, unresolvedCount, conflictsCount,
-    exchangeRate, usd, jpy, mgmt, costTotalJpy, adCost, csvFilename } = req.body;
+  const { yearMonth, adCost, csvFilename } = req.body;
   if (!yearMonth) return res.status(400).json({ error: 'yearMonth は必須です' });
 
-  // サーバ側再検証: セット解決エラー(partial_component)があれば確定拒否
-  if ((conflictsCount || 0) > 0) {
-    return res.status(400).json({ error: 'セット商品の構成品欠損があるため確定できません' });
+  // サーバ側保管値を真値として使う (Codex 3R #1)
+  const cached = evidenceStore.get(yearMonth);
+  if (!cached || !cached.serverState) {
+    return res.status(400).json({ error: 'アップロード結果が見つかりません。CSVを再アップロードしてください' });
+  }
+  const s = cached.serverState;
+  if (!s.canConfirm) {
+    return res.status(400).json({ error: 'セット商品の構成品欠損(または数量不正)があるため確定できません' });
   }
 
   try {
@@ -429,16 +447,16 @@ router.post('/confirm', (req, res) => {
        exchange_rate, usd_row, jpy_row, mgmt_row, cost_total, ad_cost, confirmed_at, csv_filename)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
     `).run(
-      yearMonth, totalRows || 0, resolvedCount || 0, unresolvedCount || 0,
-      exchangeRate || 0,
-      JSON.stringify(usd || {}), JSON.stringify(jpy || {}),
-      JSON.stringify(mgmt || {}), costTotalJpy || 0, adCost || 0,
+      yearMonth, s.totalRows, s.resolvedCount, s.unresolvedCount,
+      s.rate || 0,
+      JSON.stringify(s.usd || {}), JSON.stringify(s.jpy || {}),
+      JSON.stringify(s.mgmt || {}), s.costTotalJpy || 0, adCost || 0,
       now, csvFilename || ''
     );
     db.prepare(`INSERT INTO mart_amazon_usa_upload_log
       (year_month, filename, total_rows, resolved_count, unresolved_count, uploaded_at)
       VALUES (?,?,?,?,?,?)
-    `).run(yearMonth, csvFilename || '', totalRows || 0, resolvedCount || 0, unresolvedCount || 0, now);
+    `).run(yearMonth, csvFilename || '', s.totalRows, s.resolvedCount, s.unresolvedCount, now);
     res.json({ ok: true, yearMonth, confirmed_at: now });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -580,6 +598,12 @@ function renderPage() {
         <div id="unresolvedList"></div>
       </div>
 
+      <div id="conflictsCard" class="card" style="display:none">
+        <h2>⚠️ セット商品の解決エラー</h2>
+        <p class="meta">セット商品(1 SKU = N構成品)で構成品が見つからないか、数量が不正です。確定できません。</p>
+        <div id="conflictsList"></div>
+      </div>
+
       <div class="card">
         <h2>USDベース集計</h2>
         <div id="usdTable"></div>
@@ -685,6 +709,24 @@ function renderPage() {
       document.getElementById('summary').innerHTML = s;
       const confirmBtn = document.getElementById('confirmBtn');
       if (confirmBtn) confirmBtn.disabled = !data.canConfirm;
+
+      // セット解決エラー (partial_component / invalid_quantity)
+      if (data.conflicts && data.conflicts.length > 0) {
+        document.getElementById('conflictsCard').style.display = 'block';
+        const typeLabels = { partial_component: '構成品欠損', invalid_quantity: '数量不正' };
+        let html = '<table class="detail-table"><tr><th>SKU</th><th>エラー種別</th><th>詳細</th></tr>';
+        for (const c of data.conflicts) {
+          const label = typeLabels[c.type] || c.type;
+          let detail = '';
+          if (c.type === 'partial_component') detail = '欠損ne_code: ' + (c.missing || []).join(', ');
+          else if (c.type === 'invalid_quantity') detail = '不正数量: ' + (c.invalidQty || []).map(q => q.ne_code + '=' + q.rawQty).join(', ');
+          html += '<tr><td style="text-align:left">' + c.sku + '</td><td>' + label + '</td><td style="text-align:left">' + detail + '</td></tr>';
+        }
+        html += '</table>';
+        document.getElementById('conflictsList').innerHTML = html;
+      } else {
+        document.getElementById('conflictsCard').style.display = 'none';
+      }
 
       // 未登録SKU
       if (data.unresolvedSkus.length > 0) {

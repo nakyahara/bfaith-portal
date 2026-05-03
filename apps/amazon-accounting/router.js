@@ -111,7 +111,7 @@ function resolveSkus(rows, db) {
           const components = mappings.map(m => {
             const rawQty = m.数量;
             const validQty = (rawQty == null) ? 1
-              : (Number.isFinite(rawQty) && rawQty > 0) ? rawQty : null;
+              : (Number.isInteger(rawQty) && rawQty > 0) ? rawQty : null;
             return {
               ne_code: m.ne_code,
               qty: validQty,
@@ -471,7 +471,21 @@ router.post('/upload', upload.single('file'), (req, res) => {
     summaryCsv += key + ':' + label + ',' + columns.map(c => row[c] || 0).join(',') + ',' + (row.原価合計 || 0) + '\n';
   }
 
-  evidenceStore.set(yearMonth, { detail: detailCsv, summary: summaryCsv });
+  // /confirm でサーバ側の真値として使うため集計結果も保管 (Codex 3R #1: 改竄防御)
+  const canConfirm = unresolved.length === 0 && unresolvedTax.length === 0 && conflicts.length === 0;
+  evidenceStore.set(yearMonth, {
+    detail: detailCsv,
+    summary: summaryCsv,
+    serverState: {
+      totalRows: parsedRows.length,
+      resolvedCount: resolved.filter(r => r.解決方法 !== 'unresolved' && r.解決方法 !== 'skip' && r.解決方法 !== 'no_sku' && !['mixed_tax','mixed_segment','partial_component','invalid_quantity'].includes(r.解決方法)).length,
+      unresolvedCount: unresolved.length,
+      unresolvedTaxCount: unresolvedTax.length,
+      conflictsCount: conflicts.length,
+      canConfirm,
+      byTax, bySegment, excluded, mfRow,
+    },
+  });
 
   res.json({
     yearMonth,
@@ -1273,22 +1287,21 @@ router.get('/evidence/:type/:yearMonth', (req, res) => {
 
 router.post('/confirm', (req, res) => {
   const db = getMirrorDB();
-  const { yearMonth, totalRows, resolvedCount, unresolvedCount,
-    unresolvedTaxCount, conflictsCount,
-    byTax, bySegment, excluded, mfRow, adCost, csvFilename } = req.body;
+  const { yearMonth, adCost, csvFilename } = req.body;
 
   if (!yearMonth) return res.status(400).json({ error: 'yearMonth は必須です' });
 
-  // サーバ側でも再検証: hard fail 条件のいずれかに該当する場合は確定拒否
-  // 注: 集計値 (byTax/bySegment/mfRow) の改竄防御は本PRスコープ外 (CSV再集計が必要)
-  if ((unresolvedCount || 0) > 0) {
-    return res.status(400).json({ error: '未登録SKUが残っているため確定できません' });
+  // サーバ側保管値を真値として使う (Codex 3R #1: クライアント申告値の改竄防御)
+  const cached = evidenceStore.get(yearMonth);
+  if (!cached || !cached.serverState) {
+    return res.status(400).json({ error: 'アップロード結果が見つかりません。CSVを再アップロードしてください' });
   }
-  if ((unresolvedTaxCount || 0) > 0) {
-    return res.status(400).json({ error: '税率未登録があるため確定できません' });
-  }
-  if ((conflictsCount || 0) > 0) {
-    return res.status(400).json({ error: 'セット解決エラー(税率/分類混在・構成品欠損・数量不正)があるため確定できません' });
+  const s = cached.serverState;
+  if (!s.canConfirm) {
+    if (s.unresolvedCount > 0) return res.status(400).json({ error: '未登録SKUが残っているため確定できません' });
+    if (s.unresolvedTaxCount > 0) return res.status(400).json({ error: '税率未登録があるため確定できません' });
+    if (s.conflictsCount > 0) return res.status(400).json({ error: 'セット解決エラー(税率/分類混在・構成品欠損・数量不正)があるため確定できません' });
+    return res.status(400).json({ error: '確定不可状態です' });
   }
 
   try {
@@ -1298,15 +1311,15 @@ router.post('/confirm', (req, res) => {
        by_tax, by_segment, excluded, mf_row, ad_cost, confirmed_at, csv_filename)
       VALUES (?,?,?,?,?,?,?,?,?,?,?)
     `).run(
-      yearMonth, totalRows || 0, resolvedCount || 0, unresolvedCount || 0,
-      JSON.stringify(byTax), JSON.stringify(bySegment), JSON.stringify(excluded),
-      JSON.stringify(mfRow), adCost || 0, now, csvFilename || ''
+      yearMonth, s.totalRows, s.resolvedCount, s.unresolvedCount,
+      JSON.stringify(s.byTax), JSON.stringify(s.bySegment), JSON.stringify(s.excluded),
+      JSON.stringify(s.mfRow), adCost || 0, now, csvFilename || ''
     );
 
     db.prepare(`INSERT INTO mart_amazon_upload_log
       (year_month, filename, total_rows, resolved_count, unresolved_count, uploaded_at)
       VALUES (?,?,?,?,?,?)
-    `).run(yearMonth, csvFilename || '', totalRows || 0, resolvedCount || 0, unresolvedCount || 0, now);
+    `).run(yearMonth, csvFilename || '', s.totalRows, s.resolvedCount, s.unresolvedCount, now);
 
     res.json({ ok: true, yearMonth, confirmed_at: now });
   } catch (e) {
