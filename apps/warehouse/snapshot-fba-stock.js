@@ -11,8 +11,8 @@
  * business_date: process.env.WAREHOUSE_BUSINESS_DATE (daily-sync が JST で確定)
  */
 import 'dotenv/config';
-import { initDb, savePlanningData, saveRestockLatest, savePlanningLatest, saveRestockInventoryToDailySnapshot, updateFnskuBatch, syncFnskuBatch } from '../fba-replenishment/db.js';
-import { fetchAllReports, normalizePlanningRow, normalizeRestockRow } from '../fba-replenishment/sp-api-reports.js';
+import { initDb, savePlanningData, saveRestockLatest, savePlanningLatest, saveRestockInventoryToDailySnapshot, updateFnskuBatch, syncFnskuBatch, saveUsDailySnapshots } from '../fba-replenishment/db.js';
+import { fetchAllReports, normalizePlanningRow, normalizeRestockRow, getMarketplaceContext } from '../fba-replenishment/sp-api-reports.js';
 import { acquireFbaFetchLock, releaseFbaFetchLock } from './fba-fetch-lock.js';
 
 function toJstDate(d) {
@@ -86,7 +86,38 @@ async function main() {
       console.warn('[fba-stock-snapshot] errors:', JSON.stringify(results.errors));
     }
 
-    console.log(`[fba-stock-snapshot] ✅ 完了: planning=${savedPlanning} restock_daily=${savedRestockToDaily.updated + savedRestockToDaily.inserted} restock_latest=${savedRestockLatest} planning_latest=${savedPlanningLatest}`);
+    console.log(`[fba-stock-snapshot:jp] ✅ 完了: planning=${savedPlanning} restock_daily=${savedRestockToDaily.updated + savedRestockToDaily.inserted} restock_latest=${savedRestockLatest} planning_latest=${savedPlanningLatest}`);
+
+    // ─── US (NA リージョン) も取得 ───
+    // env が揃ってる時のみ実行 (未設定なら skip = 後方互換)
+    const usCtx = getMarketplaceContext('us');
+    if (usCtx.refresh_token && usCtx.client_id && usCtx.client_secret) {
+      console.log('\n[fba-stock-snapshot:us] US (NA リージョン) SP-API 取得開始...');
+      try {
+        const tUs = Date.now();
+        const usResults = await fetchAllReports(usCtx);
+        console.log(`[fba-stock-snapshot:us] 取得完了 (${((Date.now() - tUs)/1000).toFixed(1)}秒): planning=${usResults.planning?.length || 0} restock=${usResults.restock?.length || 0} errors=${(usResults.errors||[]).length}`);
+
+        const usPlanning = (usResults.planning || []).map(normalizePlanningRow);
+        const usRestock = (usResults.restock || []).map(normalizeRestockRow).filter(r => r.amazon_sku);
+
+        const saveRes = saveUsDailySnapshots({
+          planningRows: usPlanning,
+          restockRows: usRestock,
+          snapshotDate: businessDate,
+        });
+        console.log(`[fba-stock-snapshot:us] daily_snapshots_us: inserted=${saveRes.inserted} updated=${saveRes.updated}`);
+
+        if (usResults.errors?.length) {
+          console.warn('[fba-stock-snapshot:us] errors:', JSON.stringify(usResults.errors));
+        }
+      } catch (e) {
+        console.error('[fba-stock-snapshot:us] 致命的エラー (JP は成功してるので exit 0):', e.message);
+        // US 失敗は全体 fail にしない (JP は成功済み)
+      }
+    } else {
+      console.log('[fba-stock-snapshot:us] env (SP_API_*_US) 未設定のためスキップ');
+    }
   } finally {
     // lock オブジェクト全体を渡して所有権 (ownerToken) チェックを有効化
     releaseFbaFetchLock(lock);

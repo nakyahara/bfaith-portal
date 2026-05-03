@@ -133,7 +133,7 @@ function createTables() {
 
   // mirror_inv_daily_summary — 日次在庫スナップショットの集計結果ミラー
   // 元: ミニPC warehouse.db.inv_daily_summary
-  // category = 'fba_warehouse' | 'fba_inbound' | 'own_warehouse' | (将来) 'fba_us'
+  // category = 'fba_warehouse' | 'fba_inbound' | 'own_warehouse' | 'fba_us_warehouse' | 'fba_us_inbound'
   // source_status = 'ok' | 'partial' | 'failed' | 'no_source'  (no_source は UI で「データなし」表示)
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_inv_daily_summary (
     business_date      TEXT NOT NULL,
