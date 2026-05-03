@@ -30,7 +30,7 @@ import mercariAccountingRouter from './apps/mercari-accounting/router.js';
 import profitAnalysisRouter from './apps/profit-analysis/router.js';
 import mgmtAccountingRouter from './apps/mgmt-accounting/router.js';
 import crossSellFinderRouter from './apps/cross-sell-finder/router.js';
-import inventoryMonthlyRouter from './apps/inventory-monthly/router.js';
+import inventoryMonthlyRouter, { apiRouter as inventoryMonthlyApiRouter } from './apps/inventory-monthly/router.js';
 import serviceRouter from './apps/warehouse/service-router.js';
 import { serviceAuth } from './apps/warehouse/service-auth.js';
 import { isWarehouseDbReady } from './apps/warehouse/router.js';
@@ -641,6 +641,9 @@ app.use('/apps/mercari-accounting', (req, res, next) => {
   if (req.path === '/import-history' && req.method === 'POST') return next();
   requireAuth(req, res, next);
 }, mercariAccountingRouter);
+// daily-sync (miniPC) からの cron 呼び出し用 API。x-sync-key 認証で守る (セッション認証ではない)
+app.use('/apps/inventory-monthly/api', requireSyncKeyStrict, express.json({ limit: '64kb' }), inventoryMonthlyApiRouter);
+// 既存 UI ルート (セッション認証)
 app.use('/apps/inventory-monthly', requireAppAccess('inventory-monthly'), inventoryMonthlyRouter);
 
 // 未実装アプリのプレースホルダー

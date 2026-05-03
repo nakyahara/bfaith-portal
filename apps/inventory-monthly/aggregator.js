@@ -324,16 +324,18 @@ export function aggregateFromMirror({ snapshot_date, pendingRows = [] }) {
   const v = (cat) => Number(byCat[cat]?.total_value || 0);
   const fbaUsSummary = v('fba_us_warehouse') + v('fba_us_inbound');
 
+  // [Codex R2 #3] CSV経路は「生値合計→最後に1回 round」なので mirror経路もそれに合わせる
+  // (カテゴリ毎に round してから足すと小数原価で 1 円ズレる)
   const pendingTotal = pendingRows.reduce((s, p) => s + (Number(p.amount) || 0), 0);
+  const rawTotal = v('fba_warehouse') + v('fba_inbound') + v('own_warehouse') + fbaUsSummary + pendingTotal;
   const totals = {
     fba_warehouse: Math.round(v('fba_warehouse')),
     fba_inbound: Math.round(v('fba_inbound')),
     own_warehouse: Math.round(v('own_warehouse')),
     fba_us: Math.round(fbaUsSummary),
     pending: Math.round(pendingTotal),
-    total: 0,
+    total: Math.round(rawTotal),
   };
-  totals.total = totals.fba_warehouse + totals.fba_inbound + totals.own_warehouse + totals.fba_us + totals.pending;
 
   // 2) 明細 → details (mirror_inv_daily_detail はすでにセット展開済 + 原価適用済)
   const detailRows = db.prepare(`

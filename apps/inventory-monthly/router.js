@@ -160,22 +160,15 @@ function renderInputPage() {
     <button type="button" class="secondary" onclick="addPending()">+ 行を追加</button>
   </div>
 
-  <div style="display:flex;gap:12px;align-items:center;margin-top:10px;flex-wrap:wrap">
-    <button type="submit" data-save="0">プレビュー集計 (CSV)</button>
-    <button type="submit" data-save="1" style="background:#198754">集計+保存 (CSV)</button>
-    <small class="hint">CSVボタン: ①②CSV必須・③は直接入力orCSV。サーバー側で再集計します。</small>
+  <div style="display:flex;gap:12px;align-items:center;margin-top:10px">
+    <button type="submit" data-save="0">プレビュー集計</button>
+    <button type="submit" data-save="1" style="background:#198754">集計して履歴に保存</button>
+    <small class="hint">保存ボタンは同じCSVをサーバー側で再集計してから保存します（クライアント結果は信頼しません）</small>
   </div>
-
-  <div class="card" style="background:#eef5ff;border-color:#b3d4fc;margin-top:12px">
-    <b>📅 mirror から自動集計 (CSV不要)</b>
-    <p style="font-size:12px;color:#555;margin:4px 0 8px">
-      毎朝 ミニPC から sync された <code>mirror_inv_daily_summary</code> / <code>mirror_inv_daily_detail</code> を読んで
-      指定日の集計を返します。CSVアップロード不要、原価マスタは同じものを使うので CSV経路と同じ数値になります。
-      ④ 発注後未着 だけは上記欄から手動で取り込みます。
-    </p>
-    <button type="button" data-mirror="0" formnovalidate onclick="submitFromMirror('0')">プレビュー集計 (mirror)</button>
-    <button type="button" data-mirror="1" formnovalidate onclick="submitFromMirror('1')" style="background:#198754;color:#fff">集計+保存 (mirror)</button>
-  </div>
+  <p style="margin:8px 0 0;font-size:12px;color:#666">
+    💡 月初に miniPC daily-sync の最後で「前月末日」を mirror データから自動保存する仕組みあり (POST /api/save-month-end)。
+    この CSV経路は backfill / 過去月末の手動再計算用に温存。
+  </p>
 </form>
 
 <div id="result"></div>
@@ -234,42 +227,6 @@ document.getElementById('frm').addEventListener('submit', async (e) => {
   }
 });
 
-// mirror から自動集計: CSVアップロードを使わず、サーバー側で mirror_inv_daily_* を読んで集計
-async function submitFromMirror(save) {
-  const result = document.getElementById('result');
-  result.innerHTML = '<div class="card">' + (save === '1' ? 'mirrorから集計+保存中...' : 'mirrorから集計中...') + '</div>';
-  const form = document.getElementById('frm');
-  // ファイル input は multer.none() が拒否するので、必要フィールドだけ手動で詰める
-  const fd = new FormData();
-  fd.set('snapshot_date', form.querySelector('input[name="snapshot_date"]').value);
-  fd.set('save', save);
-  for (const el of form.querySelectorAll('input[name="pending_supplier[]"]')) {
-    fd.append('pending_supplier[]', el.value);
-  }
-  for (const el of form.querySelectorAll('input[name="pending_amount[]"]')) {
-    fd.append('pending_amount[]', el.value);
-  }
-  try {
-    const res = await fetch('aggregate-from-mirror', {
-      method: 'POST',
-      body: fd,
-      headers: { 'Accept': 'application/json' },
-    });
-    if (res.status === 401 || res.status === 403) {
-      result.innerHTML = '<div class="err">認証が切れました。<a href="/login">再ログイン</a>してから再実行してください。</div>';
-      return;
-    }
-    const data = await res.json();
-    if (!res.ok) {
-      result.innerHTML = '<div class="err">' + (data.error || 'エラー') + '</div>';
-      return;
-    }
-    lastResult = data;
-    result.innerHTML = renderResult(data);
-  } catch (err) {
-    result.innerHTML = '<div class="err">' + err.message + '</div>';
-  }
-}
 
 function yen(n) { return '¥' + Math.round(Number(n)||0).toLocaleString('ja-JP'); }
 // クライアント側 HTML エスケープ。CSV由来の SKU/商品コード文字列は全てここを通す。
@@ -492,38 +449,6 @@ router.post('/aggregate', upload.fields([
     res.json({ ...result, snapshot_id });
   } catch (e) {
     cleanup();
-    res.status(500).json({ error: e.message });
-  }
-});
-
-/**
- * /aggregate-from-mirror
- *   CSV アップロードを使わず、mirror_inv_daily_summary / mirror_inv_daily_detail から
- *   指定日の集計を再構成して返す。発注後未着 (pendingRows) のみ手動入力で受ける。
- *   `save=1` が付いていれば inv_snapshot に保存。
- */
-router.post('/aggregate-from-mirror', upload.none(), (req, res) => {
-  try {
-    const wantSave = req.body.save === '1' || req.body.save === 'true';
-    const snapshot_date = (req.body.snapshot_date || '').slice(0, 10);
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(snapshot_date)) {
-      return res.status(400).json({ error: '棚卸し基準日が不正です' });
-    }
-    const suppliers = [].concat(req.body.pending_supplier || []);
-    const amounts = [].concat(req.body.pending_amount || []);
-    const pendingRows = suppliers
-      .map((s, i) => ({ supplier_name: (s || '').trim(), amount: Number(amounts[i]) || 0 }))
-      .filter(p => p.supplier_name && p.amount > 0);
-
-    if (!ensureDbOrFail(res)) return;
-    const result = aggregateFromMirror({ snapshot_date, pendingRows });
-
-    let snapshot_id = null;
-    if (wantSave) {
-      snapshot_id = saveSnapshot({ snapshot_date, result, pendingRows });
-    }
-    res.json({ ...result, snapshot_id, source: 'mirror' });
-  } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
@@ -1245,3 +1170,54 @@ router.get('/export/:id.csv', (req, res) => {
 });
 
 export default router;
+
+// ─── 同期APIキー認証で守る /api/* router (server.js 側で先にマウント) ───
+// daily-sync.js (miniPC) からの呼び出し用。セッション認証ではなく x-sync-key で認証。
+// /apps/inventory-monthly/api/save-month-end : 指定日 (or 前月末) の集計を inv_snapshot に保存
+export const apiRouter = Router();
+
+apiRouter.post('/save-month-end', (req, res) => {
+  try {
+    if (!ensureDbOrFail(res)) return;
+
+    // snapshot_date 省略時は「前月末日 (JST)」を自動計算
+    let snapshot_date = (req.body?.snapshot_date || '').slice(0, 10);
+    if (!snapshot_date) {
+      const fmt = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Tokyo', year: 'numeric', month: '2-digit', day: '2-digit',
+      });
+      const parts = Object.fromEntries(fmt.formatToParts(new Date()).map(p => [p.type, p.value]));
+      const y = Number(parts.year), m = Number(parts.month);
+      // 当月の0日 = 前月末
+      const lastDayPrevMonth = new Date(Date.UTC(y, m - 1, 0));
+      const py = lastDayPrevMonth.getUTCFullYear();
+      const pm = String(lastDayPrevMonth.getUTCMonth() + 1).padStart(2, '0');
+      const pd = String(lastDayPrevMonth.getUTCDate()).padStart(2, '0');
+      snapshot_date = `${py}-${pm}-${pd}`;
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(snapshot_date)) {
+      return res.status(400).json({ error: '棚卸し基準日が不正です' });
+    }
+
+    // 発注後未着は cron では入らない (mirror に該当データなし)。空配列で進める。
+    const pendingRows = [];
+
+    const result = aggregateFromMirror({ snapshot_date, pendingRows });
+    const snapshot_id = saveSnapshot({ snapshot_date, result, pendingRows, note: 'auto: cron save-month-end' });
+
+    res.json({
+      ok: true,
+      snapshot_date,
+      snapshot_id,
+      totals: result.totals,
+      warnings_count: {
+        unmappedSkus: result.warnings.unmappedSkus.length,
+        missingCost: result.warnings.missingCost.length,
+        partialCategories: (result.warnings.partialCategories || []).length,
+      },
+      partial_categories: result.warnings.partialCategories || [],
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
