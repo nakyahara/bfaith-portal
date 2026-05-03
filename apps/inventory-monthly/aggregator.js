@@ -10,7 +10,9 @@
  * 入力:
  *   - fbaRows: [{ seller_sku, fba_warehouse, fba_inbound, product_name, asin }]
  *   - ownRows: [{ 商品コード, 在庫数, 商品名 }]
- *   - usFbaAmount: 数値（米国FBA在庫金額・直接入力）
+ *   - usFbaRows: [{ seller_sku, fba_warehouse, fba_inbound, ... }] | null
+ *       米国版発注推奨レポートCSVをparseRestockReportした結果。指定時はこちらを優先。
+ *   - usFbaAmount: 数値（米国FBA在庫金額・直接入力）。usFbaRowsが無い時のみ使用。
  *   - pendingRows: [{ supplier_name, amount, note }]
  *
  * 出力:
@@ -149,7 +151,7 @@ function valueAmazonRow(seller_sku, qty, lookups, warnings) {
   return { value: total, lines };
 }
 
-export function aggregateInventory({ fbaRows = [], ownRows = [], usFbaAmount = 0, pendingRows = [] }) {
+export function aggregateInventory({ fbaRows = [], ownRows = [], usFbaRows = null, usFbaAmount = 0, pendingRows = [] }) {
   const db = getDB();
   const lookups = buildLookups(db);
 
@@ -216,8 +218,36 @@ export function aggregateInventory({ fbaRows = [], ownRows = [], usFbaAmount = 0
     });
   }
 
-  // 3) 米国FBA / 発注後未着 はシンプルに金額のみ
-  const fbaUsTotal = Number(usFbaAmount) || 0;
+  // 3) 米国FBA: CSVが渡されたらJP同様にSKU解決→原価マスタで円換算する。
+  //    無ければ Phase 1 互換で usFbaAmount を直接金額として採用する。
+  //    原価は JP 用の mirror_products.原価 をそのまま流用する（米国独自の原価マスタは未整備）。
+  let fbaUsTotal = 0;
+  if (Array.isArray(usFbaRows)) {
+    for (const row of usFbaRows) {
+      // 米国も「倉庫内 + 輸送中」の合計数量を fba_us として一本化集計する
+      // （JP は倉庫内/輸送中で分けているが、米国は内訳を持たない既存スキーマに合わせる）
+      const totalQty = (row.fba_warehouse || 0) + (row.fba_inbound || 0);
+      if (totalQty <= 0) continue;
+      const r = valueAmazonRow(row.seller_sku, totalQty, lookups, warnings);
+      fbaUsTotal += r.value;
+      for (const l of r.lines) {
+        details.push({
+          category: 'fba_us',
+          seller_sku: row.seller_sku,
+          商品コード: l.ne_code,
+          商品名: l.name || row.product_name || '',
+          数量: l.qty,
+          原価: l.cost,
+          金額: l.qty * l.cost,
+          原価状態: l.status,
+        });
+      }
+    }
+  } else {
+    fbaUsTotal = Number(usFbaAmount) || 0;
+  }
+
+  // 4) 発注後未着 はシンプルに金額のみ
   const pendingTotal = pendingRows.reduce((s, p) => s + (Number(p.amount) || 0), 0);
 
   const totals = {
