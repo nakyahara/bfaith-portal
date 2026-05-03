@@ -236,6 +236,10 @@ export async function initDb() {
       db.run(`ALTER TABLE daily_snapshots ADD COLUMN ${col} INTEGER DEFAULT 0`);
     }
   }
+  // 販売不可在庫 (D-1b inv_daily_detail で fba_unfulfillable_qty として参照)
+  if (!snapCols.includes('fba_unfulfillable')) {
+    db.run('ALTER TABLE daily_snapshots ADD COLUMN fba_unfulfillable INTEGER DEFAULT 0');
+  }
 
   // --- 8. non_fba_sales_snapshots: 他CH売上の日次スナップショット（60日保持） ---
   db.run(`

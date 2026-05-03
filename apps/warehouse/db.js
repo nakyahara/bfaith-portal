@@ -774,7 +774,129 @@ function createTables() {
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_inv_daily_summary_date ON inv_daily_summary(business_date)');
 
-  // 26. ビュー: SKU紐付け解決（master優先 + sku_map フォールバック）
+  // 26. 在庫スナップショット詳細層 (drill-down + AI 分析用)
+  // 1日 ~5,000-6,000行 × 365日 = 約 220万行/年。SQLite で十分扱える。
+  // PK は (business_date, market, category, source_system, source_item_code, ne_code)
+  // - source_item_code: FBA=seller_sku / 自社=ne_code (両方を統一する意味で)
+  // - is_bundle_expanded=1 のとき、source_item_code は親SKU、ne_code は構成品
+  // 業務定義 (Codex 推奨でコメント明記):
+  //   qty             : 販売可能在庫 (FBA は4列合算 / 自社は raw_ne_products.在庫数)
+  //   reserved_qty    : 自社のみ - 引当数 (販売中で出荷待ち)
+  //   pending_order_qty: 自社のみ - 発注残数 (発注済み未着、SKU別)
+  //   fba_unfulfillable_qty: FBAのみ - 販売不可在庫 (評価対象外、健全性指標)
+  // 属性凍結ルール: m_products / raw_ne_products の snapshot 時点値をコピー保持
+  //   理由: 商品名・仕入先等が将来変わっても過去データの解釈を保持
+  db.exec(`CREATE TABLE IF NOT EXISTS inv_daily_detail (
+    business_date              TEXT NOT NULL,
+    market                     TEXT NOT NULL DEFAULT 'jp',
+    category                   TEXT NOT NULL,
+    source_system              TEXT NOT NULL,
+    source_item_code           TEXT NOT NULL,
+    ne_code                    TEXT NOT NULL,
+    -- 数量・金額
+    qty                        INTEGER NOT NULL,
+    unit_cost                  REAL,
+    total_value                REAL,
+    cost_status                TEXT NOT NULL,
+    cost_source                TEXT,
+    resolution_method          TEXT,
+    is_bundle_expanded         INTEGER NOT NULL DEFAULT 0,
+    component_qty              INTEGER,
+    -- m_products 凍結 (両カテゴリ共通)
+    product_name               TEXT,
+    source_product_name        TEXT,
+    supplier_code              TEXT,
+    product_type               TEXT,
+    handling_class             TEXT,
+    sales_class                INTEGER,
+    representative_product_code TEXT,
+    order_lot_size             INTEGER,
+    seasonality_flag           INTEGER,
+    season_months              TEXT,
+    new_product_flag           INTEGER,
+    new_product_launch_date    TEXT,
+    -- 売上履歴 (snapshot 時点)
+    last_sold_date             TEXT,
+    sales_7d_qty               INTEGER,
+    sales_30d_qty              INTEGER,
+    sales_90d_qty              INTEGER,
+    sales_7d_value             REAL,
+    sales_30d_value            REAL,
+    sales_90d_value            REAL,
+    -- FBA 固有 (own_warehouse は NULL)
+    working_first_seen         TEXT,
+    fba_unfulfillable_qty      INTEGER,
+    -- 自社倉庫 固有 (FBA は NULL)
+    reserved_qty               INTEGER,
+    pending_order_qty          INTEGER,
+    location_code              TEXT,
+    last_purchase_date         TEXT,
+    -- メタ
+    snapshot_run_id            TEXT NOT NULL,
+    ingested_at                TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (business_date, market, category, source_system, source_item_code, ne_code),
+    CHECK (category IN ('fba_warehouse', 'fba_inbound', 'own_warehouse', 'fba_us', 'pending_orders')),
+    CHECK (source_system IN ('ne', 'fba')),
+    CHECK (cost_status IN ('ok', 'cost_missing', 'ne_missing')),
+    CHECK (cost_source IS NULL OR cost_source IN ('m_products', 'fallback', 'missing')),
+    CHECK (resolution_method IS NULL OR resolution_method IN ('master', 'sku_map', 'direct', 'unresolved')),
+    CHECK (sales_class IS NULL OR sales_class IN (1, 2, 3, 4))
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_inv_dd_date ON inv_daily_detail(business_date)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_inv_dd_date_cat ON inv_daily_detail(business_date, category)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_inv_dd_date_ne ON inv_daily_detail(business_date, ne_code)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_inv_dd_supplier ON inv_daily_detail(supplier_code)');
+
+  // 27. 集計実行ログ (Codex 推奨「壊れた run は採用しない」ガード)
+  // snapshot_run_id ごとに件数・金額・NULL率を記録、status=failed の run は UI で除外
+  db.exec(`CREATE TABLE IF NOT EXISTS inv_daily_run_log (
+    snapshot_run_id      TEXT PRIMARY KEY,
+    business_date        TEXT NOT NULL,
+    started_at           TEXT NOT NULL,
+    finished_at          TEXT,
+    status               TEXT NOT NULL,
+    detail_total_rows    INTEGER,
+    detail_total_value   REAL,
+    cost_missing_count   INTEGER,
+    ne_missing_count     INTEGER,
+    error_message        TEXT,
+    notes                TEXT,
+    CHECK (status IN ('running', 'ok', 'partial', 'failed'))
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_inv_dd_runlog_date ON inv_daily_run_log(business_date)');
+
+  // 28. 派生指標ビュー (DOS / ABC / 回転率)
+  // 再計算可能なので保存しない。view で常に最新計算
+  db.exec('DROP VIEW IF EXISTS v_inv_daily_metrics');
+  db.exec(`CREATE VIEW v_inv_daily_metrics AS
+    SELECT
+      business_date, market, category, source_system, source_item_code, ne_code,
+      qty,
+      total_value,
+      sales_7d_qty, sales_30d_qty, sales_90d_qty,
+      sales_7d_value, sales_30d_value, sales_90d_value,
+      last_sold_date,
+      -- DOS (Days Of Supply): 在庫数 ÷ (30日売上 ÷ 30) = 在庫数 × 30 / 30日売上
+      CASE
+        WHEN sales_30d_qty > 0 THEN ROUND(qty * 30.0 / sales_30d_qty, 1)
+        ELSE NULL
+      END AS days_of_supply,
+      -- 回転率(年): 365日 ÷ DOS = 365 × 30日売上 ÷ (在庫数 × 30) = 365 × 売上 / (30 × 在庫)
+      CASE
+        WHEN qty > 0 AND sales_30d_qty > 0 THEN ROUND(365.0 * sales_30d_qty / (qty * 30.0), 2)
+        ELSE NULL
+      END AS turnover_yearly,
+      -- 滞留判定: 90日売上0 かつ 在庫>0
+      CASE WHEN (sales_90d_qty IS NULL OR sales_90d_qty = 0) AND qty > 0 THEN 1 ELSE 0 END AS is_stale,
+      product_name,
+      supplier_code,
+      product_type, handling_class, sales_class,
+      seasonality_flag, new_product_flag,
+      cost_status, resolution_method
+    FROM inv_daily_detail
+  `);
+
+  // 29. ビュー: SKU紐付け解決（master優先 + sku_map フォールバック）
   // 既存 sku_map（自動検出）は m_sku_master 未登録の seller_sku のみフォールバック対象
   // fallback遮断条件は COLLATE NOCASE で大文字小文字差を吸収（万一データ混入時の二重計上防止）
   // 依存順 (v_sku_costed → v_sku_resolved) で DROP してから再作成、定義変更を確実に反映
