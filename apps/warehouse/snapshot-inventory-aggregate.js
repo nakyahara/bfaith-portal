@@ -1,14 +1,19 @@
 /**
  * snapshot-inventory-aggregate.js — 日次在庫スナップショットの集計
  *
- * PR-A (ne_stock_daily_snapshot) + PR-0 (fba.db.daily_snapshots) のデータを
+ * PR-A (ne_stock_daily_snapshot) + PR-0 (fba.db.daily_snapshots / daily_snapshots_us) のデータを
  * SKU解決 (v_sku_resolved) + 原価 (m_products) で金額化し、inv_daily_summary に書く。
  *
- * カテゴリ:
+ * カテゴリ (market='jp'):
  *   fba_warehouse = fba_available + fba_fc_transfer + fba_fc_processing + fba_customer_order
  *                   (月末ツールと同じ4カラム合算定義)
  *   fba_inbound   = fba_inbound_working + fba_inbound_shipped + fba_inbound_received
  *   own_warehouse = ne_stock_daily_snapshot.在庫数 (NE 商品コード単位、セット展開なし)
+ *
+ * カテゴリ (market='us'):
+ *   fba_us_warehouse = JP と同じ4カラム合算 (daily_snapshots_us 由来)
+ *   fba_us_inbound   = JP と同じ3カラム合算 (daily_snapshots_us 由来)
+ *   ※ Phase 1 は JPY 原価ベース管理 (m_products.原価) のため為替変換なし
  *
  * 完全性指標:
  *   source_status: 'ok' | 'partial' | 'failed' | 'no_source'
@@ -64,7 +69,6 @@ export function aggregateInventorySnapshot(businessDate) {
     throw new Error(`business_date が不正: ${businessDate}`);
   }
   const db = getDB();
-  const market = 'jp';
   const captured = new Date().toISOString();
 
   const upsert = db.prepare(`
@@ -86,9 +90,79 @@ export function aggregateInventorySnapshot(businessDate) {
 
   const fbaAttached = attachFbaDb(db);
 
+  // 共通: SKU解決 + 原価
+  const resolveStmt = db.prepare(`SELECT ne_code, 数量 FROM v_sku_resolved WHERE seller_sku = ?`);
+  const costStmt = db.prepare(`SELECT 原価 FROM m_products WHERE 商品コード = ?`);
+
+  function aggregateFbaCategory(rows, qtyKey) {
+    let totalQty = 0, totalValue = 0, resolved = 0, unresolved = 0, costMissing = 0;
+    for (const row of rows) {
+      const baseQty = row[qtyKey];
+      if (baseQty <= 0) continue;
+      const sku = (row.amazon_sku || '').toLowerCase();
+      const components = resolveStmt.all(sku);
+      if (components.length === 0) {
+        totalQty += baseQty;
+        unresolved++;
+        continue;
+      }
+      for (const c of components) {
+        const lineQty = baseQty * (c.数量 || 1);
+        totalQty += lineQty;
+        const cost = costStmt.get(c.ne_code)?.原価;
+        if (cost != null) {
+          totalValue += lineQty * cost;
+          resolved++;
+        } else {
+          costMissing++;
+        }
+      }
+    }
+    return { totalQty, totalValue, resolved, unresolved, costMissing };
+  }
+
+  function statusOf(s) {
+    return (s.unresolved + s.costMissing > 0) ? 'partial' : 'ok';
+  }
+
+  // 指定 (table, market, warehouseCategory, inboundCategory) で FBA 集計1セット実行
+  function processFbaMarket({ table, market, warehouseCategory, inboundCategory }) {
+    const sectionResult = {};
+    if (!fbaAttached) {
+      for (const cat of [warehouseCategory, inboundCategory]) {
+        upsert.run(businessDate, market, cat, 0, null, 0, 0, 0, 'no_source', 0, captured);
+        sectionResult[cat] = { qty: 0, value: 0, resolved: 0, costMissing: 0, status: 'no_source', rowCount: 0 };
+      }
+      return sectionResult;
+    }
+    const fbaSrc = db.prepare(`
+      SELECT amazon_sku,
+             COALESCE(fba_available,0) + COALESCE(fba_fc_transfer,0) + COALESCE(fba_fc_processing,0) + COALESCE(fba_customer_order,0) AS qty_warehouse,
+             COALESCE(fba_inbound_working,0) + COALESCE(fba_inbound_shipped,0) + COALESCE(fba_inbound_received,0) AS qty_inbound
+      FROM fba.${table}
+      WHERE snapshot_date = ?
+    `).all(businessDate);
+
+    if (fbaSrc.length === 0) {
+      for (const cat of [warehouseCategory, inboundCategory]) {
+        upsert.run(businessDate, market, cat, 0, null, 0, 0, 0, 'no_source', 0, captured);
+        sectionResult[cat] = { qty: 0, value: 0, resolved: 0, costMissing: 0, status: 'no_source', rowCount: 0 };
+      }
+      return sectionResult;
+    }
+
+    const wh = aggregateFbaCategory(fbaSrc, 'qty_warehouse');
+    const ib = aggregateFbaCategory(fbaSrc, 'qty_inbound');
+    upsert.run(businessDate, market, warehouseCategory, wh.totalQty, wh.totalValue, wh.resolved, wh.unresolved, wh.costMissing, statusOf(wh), fbaSrc.length, captured);
+    upsert.run(businessDate, market, inboundCategory,   ib.totalQty, ib.totalValue, ib.resolved, ib.unresolved, ib.costMissing, statusOf(ib), fbaSrc.length, captured);
+    sectionResult[warehouseCategory] = { qty: wh.totalQty, value: wh.totalValue, resolved: wh.resolved, unresolved: wh.unresolved, costMissing: wh.costMissing, status: statusOf(wh), rowCount: fbaSrc.length };
+    sectionResult[inboundCategory]   = { qty: ib.totalQty, value: ib.totalValue, resolved: ib.resolved, unresolved: ib.unresolved, costMissing: ib.costMissing, status: statusOf(ib), rowCount: fbaSrc.length };
+    return sectionResult;
+  }
+
   const result = {};
   try {
-    // ─── 1. own_warehouse (自社倉庫: ne_stock_daily_snapshot) ───
+    // ─── 1. own_warehouse (自社倉庫: ne_stock_daily_snapshot, market='jp') ───
     // ne_code 単位で 数量 × 原価 (m_products.原価) を集計。セット展開なし。
     const ownSrc = db.prepare(`
       SELECT
@@ -111,80 +185,29 @@ export function aggregateInventorySnapshot(businessDate) {
       }
     }
     const ownStatus = ownSrc.length === 0 ? 'no_source' : (ownCostMissing > 0 ? 'partial' : 'ok');
-    upsert.run(businessDate, market, 'own_warehouse', ownQty, ownStatus === 'no_source' ? null : ownValue, ownResolved, 0, ownCostMissing, ownStatus, ownSrc.length, captured);
+    upsert.run(businessDate, 'jp', 'own_warehouse', ownQty, ownStatus === 'no_source' ? null : ownValue, ownResolved, 0, ownCostMissing, ownStatus, ownSrc.length, captured);
     result.own_warehouse = { qty: ownQty, value: ownValue, resolved: ownResolved, costMissing: ownCostMissing, status: ownStatus, rowCount: ownSrc.length };
 
-    // ─── 2/3. FBA: fba.db ATTACH 経由で daily_snapshots を読む ───
-    if (!fbaAttached) {
-      // fba.db が読めなければ FBA 系は no_source として記録
-      for (const cat of ['fba_warehouse', 'fba_inbound']) {
-        upsert.run(businessDate, market, cat, 0, null, 0, 0, 0, 'no_source', 0, captured);
-        result[cat] = { qty: 0, value: 0, resolved: 0, costMissing: 0, status: 'no_source', rowCount: 0 };
-      }
-      return result;
+    // ─── 2/3. FBA JP (daily_snapshots) ───
+    Object.assign(result, processFbaMarket({
+      table: 'daily_snapshots',
+      market: 'jp',
+      warehouseCategory: 'fba_warehouse',
+      inboundCategory: 'fba_inbound',
+    }));
+
+    // ─── 4/5. FBA US (daily_snapshots_us, market='us') ───
+    // テーブル未作成 (旧バージョン環境) でも落ちないように try
+    try {
+      Object.assign(result, processFbaMarket({
+        table: 'daily_snapshots_us',
+        market: 'us',
+        warehouseCategory: 'fba_us_warehouse',
+        inboundCategory: 'fba_us_inbound',
+      }));
+    } catch (e) {
+      console.warn('[inv-agg] US FBA 集計スキップ:', e.message);
     }
-
-    // 当日分の daily_snapshots を取得 (Amazon SKU 単位、月末ツールと同じ fba_warehouse 4列合算)
-    const fbaSrc = db.prepare(`
-      SELECT amazon_sku,
-             COALESCE(fba_available,0) + COALESCE(fba_fc_transfer,0) + COALESCE(fba_fc_processing,0) + COALESCE(fba_customer_order,0) AS qty_warehouse,
-             COALESCE(fba_inbound_working,0) + COALESCE(fba_inbound_shipped,0) + COALESCE(fba_inbound_received,0) AS qty_inbound
-      FROM fba.daily_snapshots
-      WHERE snapshot_date = ?
-    `).all(businessDate);
-
-    if (fbaSrc.length === 0) {
-      for (const cat of ['fba_warehouse', 'fba_inbound']) {
-        upsert.run(businessDate, market, cat, 0, null, 0, 0, 0, 'no_source', 0, captured);
-        result[cat] = { qty: 0, value: 0, resolved: 0, costMissing: 0, status: 'no_source', rowCount: 0 };
-      }
-      return result;
-    }
-
-    // Amazon SKU → ne_code 展開 (v_sku_resolved 経由で master 優先 + sku_map fallback)
-    // Map<ne_code, 数量> に展開した上で原価×数量を計算
-    const resolveStmt = db.prepare(`SELECT ne_code, 数量 FROM v_sku_resolved WHERE seller_sku = ?`);
-    const costStmt = db.prepare(`SELECT 原価 FROM m_products WHERE 商品コード = ?`);
-
-    function aggregateFbaCategory(rows, qtyKey) {
-      let totalQty = 0, totalValue = 0, resolved = 0, unresolved = 0, costMissing = 0;
-      for (const row of rows) {
-        const baseQty = row[qtyKey];
-        if (baseQty <= 0) continue;
-        const sku = (row.amazon_sku || '').toLowerCase();
-        const components = resolveStmt.all(sku);
-        if (components.length === 0) {
-          // SKU 解決できず (master/sku_map 両方になし)
-          totalQty += baseQty;
-          unresolved++;
-          continue;
-        }
-        for (const c of components) {
-          const lineQty = baseQty * (c.数量 || 1);
-          totalQty += lineQty;
-          const cost = costStmt.get(c.ne_code)?.原価;
-          if (cost != null) {
-            totalValue += lineQty * cost;
-            resolved++;
-          } else {
-            costMissing++;
-          }
-        }
-      }
-      return { totalQty, totalValue, resolved, unresolved, costMissing };
-    }
-
-    const wh = aggregateFbaCategory(fbaSrc, 'qty_warehouse');
-    const ib = aggregateFbaCategory(fbaSrc, 'qty_inbound');
-
-    function statusOf(s) {
-      return (s.unresolved + s.costMissing > 0) ? 'partial' : 'ok';
-    }
-
-    upsert.run(businessDate, market, 'fba_warehouse', wh.totalQty, wh.totalValue, wh.resolved, wh.unresolved, wh.costMissing, statusOf(wh), fbaSrc.length, captured);
-    upsert.run(businessDate, market, 'fba_inbound',   ib.totalQty, ib.totalValue, ib.resolved, ib.unresolved, ib.costMissing, statusOf(ib), fbaSrc.length, captured);
-    result.fba_warehouse = { qty: wh.totalQty, value: wh.totalValue, resolved: wh.resolved, unresolved: wh.unresolved, costMissing: wh.costMissing, status: statusOf(wh), rowCount: fbaSrc.length };
-    result.fba_inbound   = { qty: ib.totalQty, value: ib.totalValue, resolved: ib.resolved, unresolved: ib.unresolved, costMissing: ib.costMissing, status: statusOf(ib), rowCount: fbaSrc.length };
 
     return result;
   } finally {
@@ -205,7 +228,6 @@ export function aggregateInventoryDetail(businessDate) {
   const db = getDB();
   const snapshotRunId = crypto.randomUUID();
   const startedAt = new Date().toISOString();
-  const market = 'jp';
 
   // run_log に running を先に記録
   db.prepare(`INSERT INTO inv_daily_run_log (snapshot_run_id, business_date, started_at, status) VALUES (?, ?, ?, 'running')`)
@@ -258,7 +280,7 @@ export function aggregateInventoryDetail(businessDate) {
     // ─── 2. detail 行を生成 ───
     const detailRows = [];
 
-    function buildRow(category, sourceSystem, sourceItemCode, neCode, qty, opts = {}) {
+    function buildRow(category, market, sourceSystem, sourceItemCode, neCode, qty, opts = {}) {
       if (qty == null || qty === 0) return null;
       const m = mProducts.get(neCode);
       const ne = rawNe.get(neCode);
@@ -322,25 +344,28 @@ export function aggregateInventoryDetail(businessDate) {
       };
     }
 
-    // 2a. own_warehouse
+    // 2a. own_warehouse (market='jp')
     const ownSrc = db.prepare(`SELECT 商品コード, 在庫数 FROM ne_stock_daily_snapshot WHERE business_date = ? AND 在庫数 > 0`).all(businessDate);
     for (const r of ownSrc) {
-      const row = buildRow('own_warehouse', 'ne', r.商品コード, r.商品コード, r.在庫数, { resolution_method: 'direct' });
+      const row = buildRow('own_warehouse', 'jp', 'ne', r.商品コード, r.商品コード, r.在庫数, { resolution_method: 'direct' });
       if (row) detailRows.push(row);
     }
 
-    // 2b. FBA (warehouse + inbound)
-    if (fbaAttached) {
-      // 既存環境で fba_unfulfillable 列が無い場合に備えて存在チェック
-      const fbaCols = db.prepare(`PRAGMA fba.table_info(daily_snapshots)`).all().map(c => c.name);
+    // 2b. FBA helper: 指定 market/table/category 名で1セット展開
+    function processFbaDetail({ table, market, warehouseCategory, inboundCategory }) {
+      const exists = db.prepare(`SELECT name FROM fba.sqlite_master WHERE type='table' AND name=?`).get(table);
+      if (!exists) return; // 旧環境などでテーブル無し
+      const fbaCols = db.prepare(`PRAGMA fba.table_info(${table})`).all().map(c => c.name);
       const hasUnfulfillable = fbaCols.includes('fba_unfulfillable');
+      const hasWorkingFirstSeen = fbaCols.includes('working_first_seen');
       const unfulfillableExpr = hasUnfulfillable ? 'fba_unfulfillable' : 'NULL AS fba_unfulfillable';
+      const workingExpr = hasWorkingFirstSeen ? 'working_first_seen' : 'NULL AS working_first_seen';
       const fbaSrc = db.prepare(`
         SELECT amazon_sku, product_name,
                COALESCE(fba_available,0) + COALESCE(fba_fc_transfer,0) + COALESCE(fba_fc_processing,0) + COALESCE(fba_customer_order,0) AS qty_warehouse,
                COALESCE(fba_inbound_working,0) + COALESCE(fba_inbound_shipped,0) + COALESCE(fba_inbound_received,0) AS qty_inbound,
-               working_first_seen, ${unfulfillableExpr}
-        FROM fba.daily_snapshots
+               ${workingExpr}, ${unfulfillableExpr}
+        FROM fba.${table}
         WHERE snapshot_date = ?
       `).all(businessDate);
 
@@ -351,13 +376,13 @@ export function aggregateInventoryDetail(businessDate) {
         const resolution = components.length === 0 ? 'unresolved' : (isBundle ? 'master' : 'sku_map'); // 簡易: 1件なら sku_map 多い
 
         for (const cat of [
-          { name: 'fba_warehouse', qty: fba.qty_warehouse, working_first_seen: null, unfulfillable: fba.fba_unfulfillable },
-          { name: 'fba_inbound',   qty: fba.qty_inbound,   working_first_seen: fba.working_first_seen, unfulfillable: null },
+          { name: warehouseCategory, qty: fba.qty_warehouse, working_first_seen: null, unfulfillable: fba.fba_unfulfillable },
+          { name: inboundCategory,   qty: fba.qty_inbound,   working_first_seen: fba.working_first_seen, unfulfillable: null },
         ]) {
           if (cat.qty <= 0) continue;
           if (components.length === 0) {
             // 未解決: source_item_code = seller_sku, ne_code = seller_sku (PKを満たすため)
-            const row = buildRow(cat.name, 'fba', sku, sku, cat.qty, {
+            const row = buildRow(cat.name, market, 'fba', sku, sku, cat.qty, {
               resolution_method: 'unresolved',
               source_product_name: fba.product_name,
               working_first_seen: cat.working_first_seen,
@@ -366,7 +391,7 @@ export function aggregateInventoryDetail(businessDate) {
             if (row) detailRows.push(row);
           } else {
             for (const c of components) {
-              const row = buildRow(cat.name, 'fba', sku, c.ne_code, cat.qty * c.qty, {
+              const row = buildRow(cat.name, market, 'fba', sku, c.ne_code, cat.qty * c.qty, {
                 resolution_method: resolution,
                 is_bundle_expanded: isBundle,
                 component_qty: isBundle ? c.qty : null,
@@ -378,6 +403,15 @@ export function aggregateInventoryDetail(businessDate) {
             }
           }
         }
+      }
+    }
+
+    if (fbaAttached) {
+      processFbaDetail({ table: 'daily_snapshots',    market: 'jp', warehouseCategory: 'fba_warehouse',    inboundCategory: 'fba_inbound' });
+      try {
+        processFbaDetail({ table: 'daily_snapshots_us', market: 'us', warehouseCategory: 'fba_us_warehouse', inboundCategory: 'fba_us_inbound' });
+      } catch (e) {
+        console.warn('[inv-agg] US FBA detail スキップ:', e.message);
       }
     }
 
