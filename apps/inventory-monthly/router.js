@@ -661,8 +661,7 @@ router.get('/daily', (req, res) => {
              resolved_count, unresolved_count, cost_missing_count,
              source_status, source_row_count
       FROM mirror_inv_daily_summary
-      WHERE market = 'jp'
-      ORDER BY business_date DESC, category
+      ORDER BY business_date DESC, market, category
     `).all();
   } catch (e) {
     return res.status(503).send(renderLayout('日次推移', `<p>mirror_inv_daily_summary が未作成です: ${esc(e.message)}</p><p>ミニPC からの初回 sync を待ってください。</p>`));
@@ -709,6 +708,8 @@ router.get('/daily', (req, res) => {
       ${fmtVal(d.fba_inbound)}
       ${fmtVal(d.own_warehouse)}
       ${fmtTotal(d)}
+      ${fmtVal(d.fba_us_warehouse)}
+      ${fmtVal(d.fba_us_inbound)}
     </tr>
   `).join('');
 
@@ -722,11 +723,12 @@ router.get('/daily', (req, res) => {
   const chartJson = JSON.stringify(chartData);
 
   res.send(renderLayout('月末棚卸し - 日次推移', `
-<h2>日次在庫推移 (国内)</h2>
+<h2>日次在庫推移</h2>
 <p style="color:#666;font-size:13px">
   毎朝 自動で記録された在庫金額の推移。
   「FBA倉庫」=月末ツールと同じ4カラム合算 (在庫あり+FC移管中+FC処理中+出荷待ち)。
   「自社倉庫」=NextEngine 在庫数。
+  「米国FBA」= Amazon US (NA) の FBA 在庫 (Phase 1 は JPY 原価ベース、合計には未含)。
   ⚠️ 表示は警告件数 (未解決SKU + 原価未登録)。
   「no data」 = SP-API 未取得 (cron 失敗 or 当日未稼働)。
 </p>
@@ -801,7 +803,9 @@ ${dates.length === 0 ? '' : `
       <th>FBA倉庫</th>
       <th>FBA輸送中</th>
       <th>自社倉庫</th>
-      <th>合計</th>
+      <th>合計 (国内)</th>
+      <th title="米国 Amazon FBA、JPY 原価ベース">米国FBA倉庫</th>
+      <th title="米国 Amazon FBA 輸送中、JPY 原価ベース">米国FBA輸送中</th>
     </tr>
   </thead>
   <tbody>${tableRows}</tbody>
@@ -897,6 +901,8 @@ router.get('/daily/:date', (req, res) => {
     fba_inbound:   'FBA輸送中',
     own_warehouse: '自社倉庫',
     fba_us:        '米国FBA',
+    fba_us_warehouse: '米国FBA倉庫',
+    fba_us_inbound:   '米国FBA輸送中',
     pending_orders:'発注後未着',
   };
   const PRODUCT_TYPE_BADGE = (t) => {
@@ -939,6 +945,7 @@ router.get('/daily/:date', (req, res) => {
   ・<b>FBA倉庫</b> = Amazon FBA フルフィルメントセンター内の在庫 (在庫あり + FC移管中 + FC処理中 + 出荷待ち)<br>
   ・<b>FBA輸送中</b> = Amazon FBA に向けて輸送中の在庫 (進行中 + 出荷済み + 受領中)<br>
   ・<b>自社倉庫</b> = NextEngine が管理する自社在庫 (引当数を含む)<br>
+  ・<b>米国FBA倉庫 / 輸送中</b> = Amazon US (NA リージョン) の FBA 在庫 (Phase 1 は JPY 原価ベース)<br>
   ・<b>DOS</b> (Days of Supply) = 在庫が何日もつか = 在庫数 ÷ (30日売上 ÷ 30日)。値が大きいほど滞留傾向<br>
   ・<b>状態バッジ</b>: 滞留(90日売上0) / 原価不明 / 未解決(NE紐付けなし) / 季節 / 新商品
 </div>
@@ -961,6 +968,8 @@ router.get('/daily/:date', (req, res) => {
       <option value="fba_warehouse" ${opts.category === 'fba_warehouse' ? 'selected' : ''}>FBA倉庫</option>
       <option value="fba_inbound" ${opts.category === 'fba_inbound' ? 'selected' : ''}>FBA輸送中</option>
       <option value="own_warehouse" ${opts.category === 'own_warehouse' ? 'selected' : ''}>自社倉庫</option>
+      <option value="fba_us_warehouse" ${opts.category === 'fba_us_warehouse' ? 'selected' : ''}>米国FBA倉庫</option>
+      <option value="fba_us_inbound" ${opts.category === 'fba_us_inbound' ? 'selected' : ''}>米国FBA輸送中</option>
     </select>
     <select name="supplier">
       <option value="">全仕入先</option>
