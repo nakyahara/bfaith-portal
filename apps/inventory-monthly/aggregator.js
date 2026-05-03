@@ -267,6 +267,101 @@ export function aggregateInventory({ fbaRows = [], ownRows = [], usFbaRows = nul
   return { totals, details, warnings };
 }
 
+/**
+ * mirror_inv_daily_summary / mirror_inv_daily_detail から指定日の集計を再構成する。
+ * CSV アップロード経路の代替: 毎朝 sync された mirror データを使うことで CSV 取得不要にする。
+ *
+ * 同じ商品×同じ日付なら CSV 経路と数値は一致する想定 (どちらも同じ原価マスタを使う)。
+ *
+ * 入力:
+ *   - snapshot_date: 'YYYY-MM-DD'
+ *   - pendingRows: [{ supplier_name, amount, note }] (発注後未着は手動入力のみ)
+ * 出力: aggregateInventory() と同じ形 { totals, details, warnings }
+ */
+const MIRROR_STATUS_TO_LEGACY = {
+  ok: 'COMPLETE',
+  cost_missing: 'MISSING',
+  ne_missing: 'NOT_IN_MASTER',
+};
+const MIRROR_CATEGORY_TO_LEGACY = {
+  fba_us_warehouse: 'fba_us', // 月末ツール UI は fba_us 単一カテゴリで集計表示
+  fba_us_inbound: 'fba_us',
+};
+
+export function aggregateFromMirror({ snapshot_date, pendingRows = [] }) {
+  const db = getDB();
+
+  // データ存在確認 (同期遅延 / 別日付指定で空のまま保存される事故を防ぐ)
+  const presence = db.prepare(
+    'SELECT COUNT(*) AS n FROM mirror_inv_daily_summary WHERE business_date = ?'
+  ).get(snapshot_date);
+  if (!presence || presence.n === 0) {
+    throw new Error(`${snapshot_date} の在庫スナップショットが mirror に存在しません (sync 待ち or 別日付を指定)`);
+  }
+
+  // 1) サマリ → totals
+  const summaryRows = db.prepare(
+    `SELECT category, total_value, source_status
+     FROM mirror_inv_daily_summary WHERE business_date = ?`
+  ).all(snapshot_date);
+  const byCat = Object.fromEntries(summaryRows.map(r => [r.category, r]));
+  const v = (cat) => Number(byCat[cat]?.total_value || 0);
+  const fbaUsSummary = v('fba_us_warehouse') + v('fba_us_inbound');
+
+  const pendingTotal = pendingRows.reduce((s, p) => s + (Number(p.amount) || 0), 0);
+  const totals = {
+    fba_warehouse: Math.round(v('fba_warehouse')),
+    fba_inbound: Math.round(v('fba_inbound')),
+    own_warehouse: Math.round(v('own_warehouse')),
+    fba_us: Math.round(fbaUsSummary),
+    pending: Math.round(pendingTotal),
+    total: 0,
+  };
+  totals.total = totals.fba_warehouse + totals.fba_inbound + totals.own_warehouse + totals.fba_us + totals.pending;
+
+  // 2) 明細 → details (mirror_inv_daily_detail はすでにセット展開済 + 原価適用済)
+  const detailRows = db.prepare(`
+    SELECT category, source_item_code, ne_code,
+           COALESCE(product_name, source_product_name, '') AS product_name,
+           qty, unit_cost, total_value, cost_status, resolution_method
+    FROM mirror_inv_daily_detail
+    WHERE business_date = ?
+    ORDER BY category, ne_code
+  `).all(snapshot_date);
+
+  const details = detailRows.map(d => {
+    let 原価状態 = MIRROR_STATUS_TO_LEGACY[d.cost_status] || d.cost_status || 'UNKNOWN';
+    if (d.resolution_method === 'unresolved') 原価状態 = 'UNMAPPED_SKU';
+    return {
+      category: MIRROR_CATEGORY_TO_LEGACY[d.category] || d.category,
+      seller_sku: (d.category === 'own_warehouse') ? null : d.source_item_code,
+      商品コード: d.ne_code,
+      商品名: d.product_name,
+      数量: d.qty,
+      原価: d.unit_cost ?? 0,
+      金額: d.total_value ?? 0,
+      原価状態,
+    };
+  });
+
+  // 3) 警告 (CSV 経路と同じキー名で再構築 → UI ダウンロードボタンが流用できる)
+  const warnings = {
+    unmappedSkus: [...new Set(
+      details.filter(d => d.原価状態 === 'UNMAPPED_SKU' && d.seller_sku).map(d => d.seller_sku)
+    )],
+    unknownProducts: [...new Set(
+      details.filter(d => d.原価状態 === 'NOT_IN_MASTER' && d.商品コード).map(d => d.商品コード)
+    )],
+    missingCost: [...new Set(
+      details
+        .filter(d => INCOMPLETE_COST_STATUSES.has(d.原価状態))
+        .map(d => d.seller_sku ? `${d.seller_sku} → ${d.商品コード}` : d.商品コード)
+    )],
+  };
+
+  return { totals, details, warnings };
+}
+
 /** 集計結果を inv_snapshot* に保存。同一日が既存なら上書きする。 */
 export function saveSnapshot({ snapshot_date, result, pendingRows = [], note = '' }) {
   const db = getDB();
