@@ -1036,29 +1036,33 @@ function createTables() {
     FROM inv_daily_detail
   `);
 
-  // 29. ビュー: SKU紐付け解決（master優先 + sku_map フォールバック）
-  // 既存 sku_map（自動検出）は m_sku_master 未登録の seller_sku のみフォールバック対象
-  // fallback遮断条件は COLLATE NOCASE で大文字小文字差を吸収（万一データ混入時の二重計上防止）
-  // 依存順 (v_sku_costed → v_sku_resolved) で DROP してから再作成、定義変更を確実に反映
+  // 29. ビュー: SKU紐付け解決
+  // SKU管理統合 Step 4-0 (2026-05-04): auto fallback 撤廃、m_sku_components 直接ラッパーへ
+  //   旧: master優先 + sku_map fallback (UNION ALL)
+  //   新: m_sku_components 直接、master only。sort_order を新規公開
+  //   sku_map writer は Step 3a/3b で停止済み、reader (本ビュー経由) も本変更で master only に
+  // 依存順 (v_sku_costed → v_sku_resolved → v_sku_components_first) で DROP してから再作成
   db.exec('DROP VIEW IF EXISTS v_sku_costed');
   db.exec('DROP VIEW IF EXISTS v_sku_resolved');
+  db.exec('DROP VIEW IF EXISTS v_sku_components_first');
   db.exec(`CREATE VIEW v_sku_resolved AS
     SELECT
-      c.seller_sku,
-      c.ne_code,
-      c.数量,
+      seller_sku,
+      ne_code,
+      数量,
+      sort_order,
       'master' AS source
-    FROM m_sku_components c
-    UNION ALL
-    SELECT
-      s.seller_sku,
-      s.ne_code,
-      s.数量,
-      'auto' AS source
-    FROM sku_map s
-    WHERE NOT EXISTS (
-      SELECT 1 FROM m_sku_master m WHERE m.seller_sku = s.seller_sku COLLATE NOCASE
-    )
+    FROM m_sku_components
+  `);
+
+  // 30. ビュー: セット親代表ne_code (sort_order=0 のみ)
+  // SKU管理統合 Step 4-0 (2026-05-04): 売上分析アプリ v_sales_unified の
+  //   LEFT JOIN sku_map 置換用 (Phase 4-C で適用予定)。
+  //   1 SKU = 1 行になり、JOIN による行増殖を防ぐ。
+  db.exec(`CREATE VIEW v_sku_components_first AS
+    SELECT seller_sku, ne_code, 数量
+    FROM m_sku_components
+    WHERE sort_order = 0
   `);
 
   // 25. ビュー: SKU紐付け＋原価解決
