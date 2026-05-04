@@ -586,4 +586,45 @@ router.get('/summary', (req, res) => {
   }
 });
 
+/**
+ * 通知メッセージのプレビュー (送信なし、安全)
+ * GET /summary/preview?date=YYYY-MM-DD
+ */
+router.get('/summary/preview', async (req, res) => {
+  try {
+    const { formatNotificationMessage } = await import('./notify-job.js');
+    const db = getMirrorDB();
+    const businessDate = req.query.date;
+    const summary = getInventorySummary(db, businessDate ? { businessDate } : {});
+    const text = formatNotificationMessage(summary);
+    res.type('text/plain; charset=utf-8').send(text);
+  } catch (e) {
+    console.error('[inventory-decision] GET /summary/preview error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/**
+ * 手動で通知ジョブを実行する (実際にGChatへ送信、テスト用)
+ * POST /summary/notify-test
+ *   feature flag (INVENTORY_DECISION_ENABLED) でガード済み (router.use)
+ *   GCHAT_WEBHOOK_INSIGHT 未設定なら 412 で拒否
+ */
+router.post('/summary/notify-test', async (req, res) => {
+  if (!process.env.GCHAT_WEBHOOK_INSIGHT) {
+    return res.status(412).json({
+      error: 'GCHAT_WEBHOOK_INSIGHT が未設定',
+      hint: 'Render管理画面で環境変数を設定してください',
+    });
+  }
+  try {
+    const { runNotificationJob } = await import('./notify-job.js');
+    const result = await runNotificationJob();
+    res.json(result);
+  } catch (e) {
+    console.error('[inventory-decision] POST /summary/notify-test error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 export default router;
