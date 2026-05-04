@@ -136,30 +136,29 @@ function resolveSkus(rows, db) {
             continue;
           }
 
-          // mixed_tax: 構成品で税率が混在
-          const taxRates = [...new Set(components.map(c => c.product.消費税率))];
-          if (taxRates.length > 1) {
-            resolved.push({ ...row, 商品コード: null, 原価: 0, 税率: null, 売上分類: null, 解決方法: 'mixed_tax' });
-            conflicts.push({ sku, type: 'mixed_tax', taxRates });
-            continue;
-          }
-
-          // mixed_segment: 構成品で売上分類が混在
-          const segments = [...new Set(components.map(c => c.product.売上分類))];
-          if (segments.length > 1) {
-            resolved.push({ ...row, 商品コード: null, 原価: 0, 税率: null, 売上分類: null, 解決方法: 'mixed_segment' });
-            conflicts.push({ sku, type: 'mixed_segment', segments });
-            continue;
-          }
-
           // セット合算: 原価は構成品(原価×数量)の合計
           const totalGenka = components.reduce((sum, c) => sum + (c.product.原価 || 0) * (c.qty || 1), 0);
+
+          // 税率: 構成品の MIN(税率) を採用 (8%軽減税率優先、業務ルール)
+          //   8% (軽減) と 10% (標準) 混在時は軽減税率優先(食品的扱い)
+          const taxRatesArr = components.map(c => c.product.消費税率).filter(t => t != null);
+          const taxRate = taxRatesArr.length > 0
+            ? Math.round(Math.min(...taxRatesArr) * 100) // 0.08→8, 0.10→10
+            : null;
+
+          // 売上分類: 構成品の MIN(売上分類) を採用 (階層論理、業務ルール)
+          //   1=自社優先 > 2=取引先限定 > 3=仕入れ
+          //   1 を含む→1, 含まず2 含む→2, 3のみ→3
+          //   理由: 自社商品(1)を含むセットは「自社商品セット」と認識される業務慣習
+          const segmentsArr = components.map(c => c.product.売上分類).filter(s => s != null);
+          const segmentValue = segmentsArr.length > 0 ? Math.min(...segmentsArr) : null;
+
           resolved.push({
             ...row,
             商品コード: components[0].product.商品コード,
             原価: totalGenka,
-            税率: components[0].product.消費税率 ? Math.round(components[0].product.消費税率 * 100) : null,
-            売上分類: components[0].product.売上分類,
+            税率: taxRate,
+            売上分類: segmentValue,
             解決方法: 'set_components',
             components: components.map(c => ({ ne_code: c.ne_code, qty: c.qty })),
           });
