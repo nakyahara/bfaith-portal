@@ -24,13 +24,29 @@ import { sendGChatMessage } from './gchat-client.js';
 // JST曜日表示用
 const JST_WEEKDAYS = ['日', '月', '火', '水', '木', '金', '土'];
 
-/** 数値を「¥XXX,XXX」または「¥X.XM」(百万単位) で表示 */
-function fmtYen(n, opts = {}) {
-  const v = Number(n) || 0;
-  if (opts.short && Math.abs(v) >= 1_000_000) {
-    return '¥' + (v / 1_000_000).toFixed(1) + 'M';
+/**
+ * 日本語単位 (億・万) で金額表示。経営層向けの可読性を優先。
+ *   1億以上:    「2億1,712万円」 (端数が0なら「2億円」)
+ *   1万以上:    「1,823万円」
+ *   1万未満:    「7,500円」
+ *   負値も対応: 「-75万円」
+ */
+function fmtYen(n) {
+  const v = Math.round(Number(n) || 0);
+  const sign = v < 0 ? '-' : '';
+  const abs = Math.abs(v);
+
+  if (abs >= 100_000_000) {
+    const oku = Math.floor(abs / 100_000_000);
+    const man = Math.floor((abs % 100_000_000) / 10_000);
+    if (man === 0) return `${sign}${oku}億円`;
+    return `${sign}${oku}億${man.toLocaleString('ja-JP')}万円`;
   }
-  return '¥' + Math.round(v).toLocaleString('ja-JP');
+  if (abs >= 10_000) {
+    const man = Math.floor(abs / 10_000);
+    return `${sign}${man.toLocaleString('ja-JP')}万円`;
+  }
+  return `${sign}${abs.toLocaleString('ja-JP')}円`;
 }
 
 /** % で「+0.3%」「-1.0%」形式 */
@@ -40,12 +56,14 @@ function fmtPct(pct) {
   return `${sign}${pct.toFixed(1)}%`;
 }
 
-/** 比較情報を「+¥XXX (+0.3%)」または「-¥XXX (-1.0%)」 */
+/** 比較情報を「+75万円 (+0.3%) ↑」形式で */
 function fmtDiff(diff) {
   if (diff?.abs == null) return '比較不可';
-  const sign = diff.abs >= 0 ? '+' : '';
   const arrow = diff.abs > 0 ? '↑' : (diff.abs < 0 ? '↓' : '→');
-  return `${sign}${fmtYen(diff.abs, { short: true })} (${fmtPct(diff.pct)}) ${arrow}`;
+  const yen = fmtYen(diff.abs);
+  // fmtYen は負値に '-' を付けるが、正値には符号がない → 正値だけ '+' を頭に補う
+  const yenSigned = (diff.abs > 0) ? `+${yen}` : yen;
+  return `${yenSigned} (${fmtPct(diff.pct)}) ${arrow}`;
 }
 
 /** business_date 'YYYY-MM-DD' から JST曜日表示 */
@@ -94,9 +112,9 @@ export function formatNotificationMessage(summary) {
   }
 
   // ── 1. 総在庫 / 判定対象 / 対象外 (Codex指摘の3行分離) ──
-  lines.push(`総在庫:    ${fmtYen(total.value, { short: true })}  前日 ${fmtPct(total.diff_prev_day.pct)} / 前週 ${fmtPct(total.diff_week_ago.pct)} / 月初 ${fmtPct(total.diff_month_start.pct)}`);
-  lines.push(`判定対象:  ${fmtYen(target.value, { short: true })} (${target.ratio_pct.toFixed(0)}%)  ※${target.note}`);
-  lines.push(`対象外:    ${fmtYen(outOfScope.value, { short: true })} (${outOfScope.ratio_pct.toFixed(0)}%)  ※${outOfScope.note}`);
+  lines.push(`総在庫:    ${fmtYen(total.value)}  前日 ${fmtPct(total.diff_prev_day.pct)} / 前週 ${fmtPct(total.diff_week_ago.pct)} / 月初 ${fmtPct(total.diff_month_start.pct)}`);
+  lines.push(`判定対象:  ${fmtYen(target.value)} (${target.ratio_pct.toFixed(0)}%)  ※${target.note}`);
+  lines.push(`対象外:    ${fmtYen(outOfScope.value)} (${outOfScope.ratio_pct.toFixed(0)}%)  ※${outOfScope.note}`);
   lines.push('');
 
   // ── 2. 判定対象内のアラート ──
@@ -104,11 +122,11 @@ export function formatNotificationMessage(summary) {
   lines.push('*【判定対象内】*');
 
   if (ret.count > 0) {
-    let line = `🔴 撤退検討候補: ${fmtYen(ret.value, { short: true })} (${ret.count} SKU)`;
+    let line = `🔴 撤退検討候補: ${fmtYen(ret.value)} (${ret.count} SKU)`;
     lines.push(line);
     if (ret.supplier_top3 && ret.supplier_top3.length > 0) {
       const topStr = ret.supplier_top3
-        .map(s => `${s.supplier_code} ${fmtYen(s.value, { short: true })} (${s.count}件)`)
+        .map(s => `${s.supplier_code} ${fmtYen(s.value)} (${s.count}件)`)
         .join(' / ');
       lines.push(`   仕入先別: ${topStr}`);
     }
@@ -117,10 +135,10 @@ export function formatNotificationMessage(summary) {
   }
 
   if (warn.count > 0) {
-    let line = `🟡 警戒対象: ${fmtYen(warn.value, { short: true })} (${warn.count} SKU)`;
+    let line = `🟡 警戒対象: ${fmtYen(warn.value)} (${warn.count} SKU)`;
     if (warn.top1_value > 0 && warn.value > 0) {
       const top1Pct = (warn.top1_value / warn.value * 100).toFixed(0);
-      line += ` / 上位1 SKU ${fmtYen(warn.top1_value, { short: true })} (${top1Pct}%)`;
+      line += ` / 上位1 SKU ${fmtYen(warn.top1_value)} (${top1Pct}%)`;
     }
     lines.push(line);
   } else {
@@ -138,7 +156,7 @@ export function formatNotificationMessage(summary) {
   const totalClsValue = cls.good_stock.value + cls.observe.value + cls.price_down.value + cls.bundle_candidate.value + cls.other.value;
   function clsLine(label, item) {
     const pct = totalClsValue > 0 ? (item.value / totalClsValue * 100).toFixed(0) : 0;
-    return `  ${label.padEnd(8, ' ')} ${fmtYen(item.value, { short: true })} (${pct}%, ${item.count} SKU)`;
+    return `  ${label.padEnd(8, ' ')} ${fmtYen(item.value)} (${pct}%, ${item.count} SKU)`;
   }
   lines.push(clsLine('優良', cls.good_stock));
   lines.push(clsLine('観察', cls.observe));
@@ -149,7 +167,7 @@ export function formatNotificationMessage(summary) {
 
   // ── 4. リンク・補足 ──
   lines.push('詳細▶ https://bfaith-portal.onrender.com/apps/profit-analysis');
-  lines.push(`※FBA系在庫は別ロジック/別ツールで管理。上記の撤退・警戒は判定対象${fmtYen(target.value, { short: true })}に対する判定です。`);
+  lines.push(`※FBA系在庫は別ロジック/別ツールで管理。上記の撤退・警戒は判定対象${fmtYen(target.value)}に対する判定です。`);
 
   return lines.join('\n');
 }
