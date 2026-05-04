@@ -104,21 +104,9 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
       log.push(`set_components: ${set_components.length}件`);
     }
 
-    // sku_map（全件置換、旧テーブル、互換維持）
-    if (req.body.sku_map && req.body.sku_map.length > 0) {
-      const skuMapData = req.body.sku_map;
-      const tx = db.transaction(() => {
-        db.exec('DELETE FROM mirror_sku_map');
-        const stmt = db.prepare(`INSERT INTO mirror_sku_map (
-          seller_sku, ne_code, asin, 商品名, 数量, updated_at
-        ) VALUES (?,?,?,?,?,?)`);
-        for (const s of skuMapData) {
-          stmt.run(s.seller_sku, s.ne_code, s.asin || '', s.商品名 || '', s.数量 || 1, now);
-        }
-      });
-      tx();
-      log.push(`sku_map: ${skuMapData.length}件`);
-    }
+    // sku_map: SKU管理統合 Step 5 (2026-05-04) で受信ハンドラ撤去
+    //   ペイロード生成自体を sync-to-render.js で停止済み、本ハンドラへ来ることはない
+    //   既存 mirror_sku_map テーブルは凍結状態 (Step 6 で /api/status / /api/download から除外、Step 7 で DROP TABLE)
 
     // sku_resolved（全件置換、新規ツールはこちらを参照）
     // 0件payloadも受け付ける（meta.clear_sku_resolved=trueで明示クリア可、無くても全件置換動作）
