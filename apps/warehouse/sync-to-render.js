@@ -150,25 +150,27 @@ export async function syncToRender() {
     console.log(`[Sync→Render]   inv_daily_detail: 取得失敗（スキップ）: ${e.message}`);
   }
 
-  // 2b-2. sku_resolved（新、master優先＋fallback解決済みビュー）
-  //   v_sku_resolved に商品名と source_updated_at を JOIN/COALESCE して送信
-  //   - source='master': m_sku_master.商品名 / m_sku_master.updated_at
-  //   - source='auto'  : 商品名NULL / sku_map.synced_at
+  // 2b-2. sku_resolved (master only、m_sku_components 直結)
+  //   SKU管理統合 Phase 4-B (2026-05-04): sku_map / v_sku_resolved 経由を撤廃
+  //   m_sku_components + m_sku_master から直接取得
+  //   - source は常に 'master' (auto fallback は Step 4-0 で撤廃済み)
+  //   - 商品名: m_sku_master.商品名 (社内独自名)
+  //   - source_updated_at: m_sku_master.updated_at
   let sku_resolved = [];
   try {
     sku_resolved = db.prepare(`
       SELECT
-        v.seller_sku,
-        v.ne_code,
-        v.数量 AS quantity,
-        v.source,
-        CASE WHEN v.source = 'master' THEN m.商品名 ELSE NULL END AS 商品名,
-        CASE WHEN v.source = 'master' THEN m.updated_at ELSE s.synced_at END AS source_updated_at
-      FROM v_sku_resolved v
-      LEFT JOIN m_sku_master m ON v.source = 'master' AND v.seller_sku = m.seller_sku
-      LEFT JOIN sku_map s      ON v.source = 'auto'   AND v.seller_sku = s.seller_sku AND v.ne_code = s.ne_code
+        c.seller_sku,
+        c.ne_code,
+        c.数量 AS quantity,
+        'master' AS source,
+        m.商品名,
+        m.updated_at AS source_updated_at
+      FROM m_sku_components c
+      INNER JOIN m_sku_master m ON c.seller_sku = m.seller_sku
+      ORDER BY c.seller_sku, c.sort_order
     `).all();
-    console.log(`[Sync→Render]   sku_resolved: ${sku_resolved.length}件 (master:${sku_resolved.filter(r=>r.source==='master').length} auto:${sku_resolved.filter(r=>r.source==='auto').length})`);
+    console.log(`[Sync→Render]   sku_resolved: ${sku_resolved.length}件 (全 master、m_sku_components 直結)`);
   } catch (e) {
     console.log(`[Sync→Render]   sku_resolved: 取得失敗（スキップ）: ${e.message}`);
   }
