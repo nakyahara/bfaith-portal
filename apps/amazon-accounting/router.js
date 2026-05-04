@@ -88,6 +88,13 @@ function resolveSkus(rows, db) {
       continue;
     }
 
+    // 注文外料金（月額登録料/広告費の返金/納品不備手数料 等）は商品売上ではなく
+    // SKUがあってもAmazon内部管理SKU(X-prefix)なのでマスタ照合せず「その他」へ
+    if (txType === '注文外料金') {
+      resolved.push({ ...row, 原価: 0, 税率: null, 売上分類: null, 商品コード: null, 解決方法: 'no_sku' });
+      continue;
+    }
+
     if (!sku) {
       resolved.push({ ...row, 原価: 0, 税率: null, 売上分類: null, 商品コード: null, 解決方法: 'no_sku' });
       continue;
@@ -370,12 +377,24 @@ router.post('/upload', upload.single('file'), (req, res) => {
   const text = buf[0] === 0xEF ? buf.toString('utf-8') : buf.toString('utf-8');
   const lines = text.split(/\r?\n/);
 
-  // 先頭7行スキップ + ヘッダー1行 = 8行目以降がデータ
+  // 列ヘッダー行（"日付/時間" と "SKU" を含む行）を検出して、その次行から読み始める
+  // ※Amazonがメタ行を増減してもヘッダー検出で吸収できるよう動的に判定
+  let headerIdx = -1;
+  for (let i = 0; i < Math.min(lines.length, 30); i++) {
+    if (lines[i].includes('日付/時間') && lines[i].includes('SKU')) {
+      headerIdx = i;
+      break;
+    }
+  }
+  if (headerIdx < 0) {
+    return res.status(400).json({ error: 'CSVヘッダー行（"日付/時間"と"SKU"を含む行）が見つかりません' });
+  }
+
   const num = v => { const n = parseFloat((v || '').replace(/"/g, '').replace(/,/g, '')); return isNaN(n) ? 0 : n; };
   const clean = v => (v || '').replace(/^"|"$/g, '').trim();
 
   const parsedRows = [];
-  for (let i = 8; i < lines.length; i++) {
+  for (let i = headerIdx + 1; i < lines.length; i++) {
     const line = lines[i];
     if (!line.trim()) continue;
     // CSV行をパース（ダブルクォート対応）
