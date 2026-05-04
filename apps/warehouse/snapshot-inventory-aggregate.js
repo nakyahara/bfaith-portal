@@ -99,8 +99,18 @@ export function aggregateInventorySnapshot(businessDate) {
 
   // 共通: SKU解決 + 原価
   // 運用規約: JP/US で SKU 文字列は重複しない → market 列を使わず単一テーブル参照で衝突なし
-  const resolveStmt = db.prepare(`SELECT ne_code, 数量 FROM v_sku_resolved WHERE seller_sku = ?`);
+  // SKU管理統合 Phase 4-A: v_sku_resolved にない場合、m_products に直接存在する seller_sku
+  //   (Amazon SKU = NE商品コード の自社出荷の命名慣例) を fallback として 1:1 マッピング扱いに
+  const resolveStmt = db.prepare(`SELECT ne_code, 数量 FROM v_sku_resolved WHERE seller_sku = ? COLLATE NOCASE`);
+  const directMatchStmt = db.prepare(`SELECT 商品コード AS ne_code, 1 AS 数量 FROM m_products WHERE 商品コード = ? COLLATE NOCASE LIMIT 1`);
   const costStmt = db.prepare(`SELECT 原価 FROM m_products WHERE 商品コード = ?`);
+
+  function resolveSku(sku) {
+    const components = resolveStmt.all(sku);
+    if (components.length > 0) return components;
+    const direct = directMatchStmt.get(sku);
+    return direct ? [direct] : [];
+  }
 
   function aggregateFbaCategory(rows, qtyKey) {
     let totalQty = 0, totalValue = 0, resolved = 0, unresolved = 0, costMissing = 0;
@@ -108,7 +118,7 @@ export function aggregateInventorySnapshot(businessDate) {
       const baseQty = row[qtyKey];
       if (baseQty <= 0) continue;
       const sku = (row.amazon_sku || '').toLowerCase();
-      const components = resolveStmt.all(sku);
+      const components = resolveSku(sku);
       if (components.length === 0) {
         totalQty += baseQty;
         unresolved++;
@@ -273,13 +283,25 @@ export function aggregateInventoryDetail(businessDate) {
     // SKU解決マップ (seller_sku → [{ne_code, qty}])
     // 運用規約: JP/US で SKU 文字列は重複しない → market 列なしの単一マップで衝突なし
     const resolveMap = new Map();
-    const resolveSourceMap = new Map(); // seller_sku → 'master' | 'auto' (resolution_method 用)
+    const resolveSourceMap = new Map(); // seller_sku → 'master' | 'direct' (resolution_method 用)
     for (const r of db.prepare(`SELECT seller_sku, ne_code, 数量, source FROM v_sku_resolved`).all()) {
       const k = r.seller_sku;
       if (!resolveMap.has(k)) resolveMap.set(k, []);
       resolveMap.get(k).push({ ne_code: r.ne_code, qty: r.数量 || 1 });
-      // master が先に来た場合は維持 (UNION ALL の順序で master が先)
       if (!resolveSourceMap.has(k)) resolveSourceMap.set(k, r.source);
+    }
+    // SKU管理統合 Phase 4-A: m_products に直接存在する seller_sku を fallback として追加
+    //   (Amazon SKU = NE商品コード の自社出荷命名慣例。約361 SKU 救済可能)
+    //   v_sku_resolved に既にあればスキップ (m_sku_components 経由で複数構成品の可能性あり)
+    for (const r of db.prepare(`
+      SELECT 商品コード AS sku FROM m_products
+      WHERE LOWER(商品コード) NOT IN (SELECT LOWER(seller_sku) FROM v_sku_resolved)
+    `).all()) {
+      const k = r.sku.toLowerCase();
+      if (!resolveMap.has(k)) {
+        resolveMap.set(k, [{ ne_code: r.sku, qty: 1 }]);
+        resolveSourceMap.set(k, 'direct');
+      }
     }
 
     // 売上履歴を ne_code 単位で集約 (直近90日、business_date 未満)
@@ -423,7 +445,8 @@ export function aggregateInventoryDetail(businessDate) {
         const isBundle = components.length > 1;
         const resolution = components.length === 0 ? 'unresolved'
                          : sourceTag === 'master' ? 'master'
-                         : 'sku_map';
+                         : sourceTag === 'direct' ? 'direct'
+                         : 'sku_map'; // legacy auto fallback (Step 4-0 で消失予定)
 
         for (const cat of [
           { name: warehouseCategory, qty: fba.qty_warehouse, working_first_seen: null, unfulfillable: fba.fba_unfulfillable },
