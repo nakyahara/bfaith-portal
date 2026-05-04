@@ -15,6 +15,7 @@ import { startMetrics } from './apps/observability/metrics.js';
 import { bootStart, bootEnd, bootNote, bootFail, getBootId } from './apps/observability/boot-log.js';
 import profitRouter from './apps/profit-calculator/router.js';
 import { startPriceWorker, startMaintenanceJobs } from './apps/profit-calculator/price-scheduler.js';
+import { startNotificationJob as startInventoryNotificationJob } from './apps/profit-analysis/notify-job.js';
 import fbaRouter from './apps/fba-replenishment/router.js';
 import warehouseRouter from './apps/warehouse/router.js';
 import mirrorRouter from './apps/warehouse-mirror/router.js';
@@ -782,6 +783,9 @@ app.listen(PORT, () => {
 
   // 価格改定メンテナンスジョブ — 同上理由で無効化 (2026-03-30)
   // startMaintenanceJobs();
+
+  // 経営インサイトGChat通知 (在庫サマリ、INVENTORY_NOTIFY_ENABLED=true で起動)
+  startInventoryNotificationJob();
 });
 
 process.on('SIGTERM', () => {
