@@ -23,7 +23,7 @@ import { initDB, getDB, getStats, saveToFile, updateSyncMeta } from './db.js';
 import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
 import { mountSkuMasterApi } from './sku-master-api.js';
 import { importSkuMasterCSV } from './import-sku-master.js';
-import { resolveTaxRate } from './rebuild-m-products.js';
+import { resolveTaxRate, KNOWN_DECIMAL_RATES } from './rebuild-m-products.js';
 
 const router = Router();
 const upload = multer({ dest: 'data/import/' });
@@ -1062,18 +1062,27 @@ router.post('/api/tax_rate', (req, res) => {
   const { tax_rate, product_name } = req.body;
   if (!sku || tax_rate === undefined) return res.status(400).json({ error: 'sku と tax_rate は必須です' });
   const tr = parseFloat(tax_rate);
-  if (![0.08, 0.1].includes(tr)) return res.status(400).json({ error: 'tax_rate は 0.08 または 0.1 です' });
+  if (!KNOWN_DECIMAL_RATES.includes(tr)) {
+    return res.status(400).json({ error: `tax_rate は ${KNOWN_DECIMAL_RATES.join(' / ')} のいずれかです` });
+  }
   const db = getDB();
   // セット商品の税率は構成品から導出されるため、手動登録は受け付けない (rebuild で消える)
   const kind = db.prepare('SELECT 商品区分 FROM m_products WHERE 商品コード = ? COLLATE NOCASE').get(sku)?.商品区分;
   if (kind === 'セット') return res.status(400).json({ error: 'セット商品の税率は構成品から自動算出されます。単品の税率を登録してください。' });
+  // 適用結果が UNKNOWN になる (= NE 側に想定外値がある) ケースは reject
+  // 成功扱いにするとフロントが行を消し、「登録済み」の体になるが実態は未反映で運用事故になる
+  const neRow = db.prepare('SELECT 消費税率 FROM raw_ne_products WHERE 商品コード = ? COLLATE NOCASE').get(sku);
+  const { taxRate, taxCategory } = resolveTaxRate(neRow?.消費税率, tr);
+  if (taxRate === null) {
+    return res.status(409).json({
+      error: 'NE側の消費税率が想定外値のため m_products に反映できません。NE側を先に修正してください。',
+      ne_value: neRow?.消費税率 ?? null,
+    });
+  }
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
   const old = db.prepare('SELECT * FROM product_tax_rate WHERE sku = ?').get(sku);
   db.prepare('INSERT OR REPLACE INTO product_tax_rate (sku, tax_rate, 商品名, synced_at) VALUES (?, ?, ?, ?)').run(sku, tr, product_name || '', now);
   auditLog(db, 'product_tax_rate', sku, old ? 'UPDATE' : 'INSERT', old || null, { sku, tax_rate: tr });
-  // m_products に即時反映 (rebuild と同じ resolveTaxRate を通す)
-  const neRow = db.prepare('SELECT 消費税率 FROM raw_ne_products WHERE 商品コード = ? COLLATE NOCASE').get(sku);
-  const { taxRate, taxCategory } = resolveTaxRate(neRow?.消費税率, tr);
   try { db.prepare('UPDATE m_products SET 消費税率 = ?, 税区分 = ?, updated_at = ? WHERE 商品コード = ? COLLATE NOCASE').run(taxRate, taxCategory, now, sku); } catch {}
   res.json({ ok: true, sku, tax_rate: tr, applied: { 消費税率: taxRate, 税区分: taxCategory } });
 });
@@ -1098,24 +1107,27 @@ router.post('/api/csv/tax_rate', upload.single('file'), (req, res) => {
   const getNe = db.prepare('SELECT 消費税率 FROM raw_ne_products WHERE 商品コード = ? COLLATE NOCASE');
   const getMp = db.prepare('SELECT 商品名, 商品区分 FROM m_products WHERE 商品コード = ? COLLATE NOCASE');
 
-  let count = 0, skipped = 0, invalid = 0, setSkipped = 0;
+  let count = 0, skipped = 0, invalid = 0, setSkipped = 0, unresolvedSkipped = 0;
   const tx = db.transaction(() => {
     for (const row of dataRows) {
       const sku = (row[0] || '').toLowerCase().trim();
       if (!sku) { skipped++; continue; }
       const tr = parseFloat(row[1]);
-      if (![0.08, 0.1].includes(tr)) { invalid++; skipped++; continue; }
+      if (!KNOWN_DECIMAL_RATES.includes(tr)) { invalid++; skipped++; continue; }
       const mp = getMp.get(sku);
       // セット商品は構成品から自動算出されるためスキップ
       if (mp?.商品区分 === 'セット') { setSkipped++; skipped++; continue; }
-      stmt.run(sku, tr, mp?.商品名 || '', now);
+      // NE側に想定外値があると m_products 反映が UNKNOWN になるので、
+      // product_tax_rate にも保存せず別カウントでスキップする (運用報告の数字を実態に揃える)
       const { taxRate, taxCategory } = resolveTaxRate(getNe.get(sku)?.消費税率, tr);
+      if (taxRate === null) { unresolvedSkipped++; skipped++; continue; }
+      stmt.run(sku, tr, mp?.商品名 || '', now);
       try { updateMp.run(taxRate, taxCategory, now, sku); } catch {}
       count++;
     }
   });
   tx();
-  res.json({ ok: true, imported: count, skipped, invalid, setSkipped, total: dataRows.length });
+  res.json({ ok: true, imported: count, skipped, invalid, setSkipped, unresolvedSkipped, total: dataRows.length });
 });
 
 // ─── GET /api/missing/download ───
