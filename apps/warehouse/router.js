@@ -577,25 +577,6 @@ router.post('/api/genka', (req, res) => {
   res.json({ ok: true, sku, genka });
 });
 
-// ─── POST /api/skumap (廃止予定 — 410 Gone) ───
-// SKU管理統合 Step 3: sku_map writer 停止。
-// SKU 登録は SKUマスタ (POST /api/m-sku-master) を使うこと。
-router.post('/api/skumap', (req, res) => {
-  res.status(410).json({
-    error: 'SKUマップへの直接登録は廃止されました。SKUマスタ (POST /api/m-sku-master) を使ってください',
-  });
-});
-router.post('/api/csv/skumap', (req, res) => {
-  res.status(410).json({
-    error: 'SKUマップへのCSV一括登録は廃止されました。SKUマスタ用CSVを使ってください',
-  });
-});
-router.delete('/api/skumap/:sku', (req, res) => {
-  res.status(410).json({
-    error: 'SKUマップ削除は廃止されました。SKUマスタ (DELETE /api/m-sku-master/:sku) を使ってください',
-  });
-});
-
 // ─── CSV アップロード（送料・原価共通） ───
 
 function parseCsvBuffer(buf) {
@@ -699,8 +680,6 @@ router.post('/api/csv/genka', upload.single('file'), (req, res) => {
   res.json({ ok: true, imported: count, skipped, total: dataRows.length });
 });
 
-// POST /api/csv/skumap は SKU管理統合 Step 3 で 410 Gone 化済 (上部参照)
-
 // POST /api/csv/m-sku-master — SKUマスタ（商品コード変換テーブル）CSV一括登録
 // CSV形式: sku, asin, 商品名, NE商品コード, 数量, ...（19列、先頭4列を使用）UTF-8固定、最大10MB
 // A案: 同一skuの商品名が複数あれば最初の行採用
@@ -759,8 +738,6 @@ router.delete('/api/genka/:sku', (req, res) => {
   res.json({ ok: true, deleted: result.changes });
 });
 
-// DELETE /api/skumap/:sku は SKU管理統合 Step 3 で 410 Gone 化済 (上部参照)
-
 // ─── GET /api/shipping/list ───
 // 送料マスタ検索（編集用）
 
@@ -786,20 +763,6 @@ router.get('/api/genka/list', (req, res) => {
   const countSql = sql.replace('SELECT *', 'SELECT COUNT(*) as cnt');
   const total = execQuery(countSql, params)[0]?.cnt || 0;
   sql += ' ORDER BY sku LIMIT ? OFFSET ?';
-  params.push(parseInt(limit), parseInt(offset));
-  res.json({ rows: execQuery(sql, params), total });
-});
-
-// ─── GET /api/skumap/list ───
-
-router.get('/api/skumap/list', (req, res) => {
-  const { search, limit = '100', offset = '0' } = req.query;
-  let sql = 'SELECT * FROM sku_map WHERE 1=1';
-  const params = [];
-  if (search) { sql += ' AND (seller_sku LIKE ? OR 商品名 LIKE ? OR ne_code LIKE ?)'; const t = `%${search}%`; params.push(t, t, t); }
-  const countSql = sql.replace('SELECT *', 'SELECT COUNT(*) as cnt');
-  const total = execQuery(countSql, params)[0]?.cnt || 0;
-  sql += ' ORDER BY seller_sku LIMIT ? OFFSET ?';
   params.push(parseInt(limit), parseInt(offset));
   res.json({ rows: execQuery(sql, params), total });
 });
@@ -1714,9 +1677,7 @@ function renderRegisterPage(shippingRates) {
         } else if (act === 'del') {
           if (!confirm(sku+' を削除しますか？')) { btn.disabled=false; return; }
           const type = btn.dataset.type;
-          const ne = btn.dataset.ne || '';
-          let url = '/api/'+(type==='skumap'?'skumap':type)+'/'+encodeURIComponent(sku);
-          if (type === 'skumap' && ne) url += '?ne_code='+encodeURIComponent(ne);
+          const url = '/api/'+type+'/'+encodeURIComponent(sku);
           await api(url, {method:'DELETE'});
           toast(sku+' を削除');
           // sku-master の場合は詳細展開行も消す
@@ -1985,14 +1946,6 @@ function renderRegisterPage(shippingRates) {
           html += '<td style="font-size:11px;color:#888">'+he(upd)+'</td>';
           html += '<td><button class="btn btn-p" data-act="show-sku-detail" data-sku="'+he(r.seller_sku)+'">詳細</button> <button class="btn btn-d" data-act="del" data-type="m-sku-master" data-sku="'+he(r.seller_sku)+'">削除</button></td></tr>';
         }
-      } else {
-        head = '<tr><th>Amazon SKU</th><th>ASIN</th><th>商品名</th><th>NE商品コード</th><th>数量</th><th>操作</th></tr>'; cols = 6;
-        for (const r of rows) {
-          html += '<tr><td>'+he(r.seller_sku)+'</td><td>'+he(r.asin||'')+'</td><td>'+he((r.商品名||'').slice(0,25))+'</td>';
-          html += '<td><input value="'+he(r.ne_code||'')+'" style="width:120px"></td>';
-          html += '<td><input value="'+(r.数量||1)+'" style="width:40px" type="number"></td>';
-          html += '<td><button class="btn btn-p" data-act="update-sku" data-sku="'+he(r.seller_sku)+'" data-ne="'+he(r.ne_code)+'" data-name="'+he(r.商品名)+'">更新</button> <button class="btn btn-d" data-act="del" data-type="skumap" data-sku="'+he(r.seller_sku)+'" data-ne="'+he(r.ne_code)+'">削除</button></td></tr>';
-        }
       }
       if (!rows.length) html = '<tr><td colspan="'+cols+'" style="text-align:center;padding:20px;color:#999">該当なし</td></tr>';
       document.getElementById('m-head').innerHTML = head;
@@ -2174,7 +2127,6 @@ function renderDashboard(stats) {
           <div class="stat"><div class="label">Amazon注文</div><div class="value">${(stats.raw_sp_orders||0).toLocaleString()}</div></div>
           <div class="stat"><div class="label">楽天注文</div><div class="value">${(stats.raw_rakuten_orders||0).toLocaleString()}</div></div>
           <div class="stat"><div class="label">ロジザード</div><div class="value">${stats.raw_lz_inventory||0}</div></div>
-          <div class="stat"><div class="label">SKUマップ</div><div class="value">${stats.sku_map||0}</div></div>
         </div>
         <div class="stats" style="margin-top:12px">
           <div class="stat warn"><div class="label">送料未登録</div><div class="value" id="missing-shipping">...</div></div>
@@ -2386,7 +2338,7 @@ function renderDashboard(stats) {
       currentManageType = type;
       if (btn) { document.querySelectorAll('#tab-manage .tab-nav button').forEach(b => b.classList.remove('active')); btn.classList.add('active'); }
       const search = document.getElementById('manage-search')?.value || '';
-      const endpoint = type === 'shipping' ? '/api/shipping/list' : type === 'genka' ? '/api/genka/list' : '/api/skumap/list';
+      const endpoint = type === 'shipping' ? '/api/shipping/list' : '/api/genka/list';
       const data = await api(endpoint + '?search=' + encodeURIComponent(search) + '&limit=100');
       const rows = data.rows || [];
       const he = (s) => (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;');

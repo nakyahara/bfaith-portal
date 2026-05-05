@@ -104,10 +104,6 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
       log.push(`set_components: ${set_components.length}件`);
     }
 
-    // sku_map: SKU管理統合 Step 5 (2026-05-04) で受信ハンドラ撤去
-    //   ペイロード生成自体を sync-to-render.js で停止済み、本ハンドラへ来ることはない
-    //   既存 mirror_sku_map テーブルは凍結状態 (Step 6 で /api/status / /api/download から除外、Step 7 で DROP TABLE)
-
     // sku_resolved（全件置換、新規ツールはこちらを参照）
     // 0件payloadも受け付ける（meta.clear_sku_resolved=trueで明示クリア可、無くても全件置換動作）
     if (req.body.sku_resolved && Array.isArray(req.body.sku_resolved)) {
@@ -411,7 +407,6 @@ router.get('/api/status', (req, res) => {
     status.products_count = db.prepare('SELECT COUNT(*) as cnt FROM mirror_products').get().cnt;
     status.sales_monthly_count = db.prepare('SELECT COUNT(*) as cnt FROM mirror_sales_monthly').get().cnt;
     status.sales_daily_count = db.prepare('SELECT COUNT(*) as cnt FROM mirror_sales_daily').get().cnt;
-    status.sku_map_count = db.prepare('SELECT COUNT(*) as cnt FROM mirror_sku_map').get().cnt;
     try { status.amazon_sku_fees_count = db.prepare('SELECT COUNT(*) as cnt FROM mirror_amazon_sku_fees').get().cnt; } catch { status.amazon_sku_fees_count = 0; }
     try { status.rakuten_sku_map_count = db.prepare('SELECT COUNT(*) as cnt FROM mirror_rakuten_sku_map').get().cnt; } catch { status.rakuten_sku_map_count = 0; }
     // Codex PR2a Round 4 非ブロッカー #3 反映: stock_snapshot 件数も同期検証に乗せる
@@ -462,7 +457,7 @@ router.get('/api/status', (req, res) => {
 router.get('/api/download/:table', (req, res) => {
   const db = getMirrorDB();
   const table = req.params.table;
-  const allowed = ['products', 'set_components', 'sales_monthly', 'sales_daily', 'sku_map'];
+  const allowed = ['products', 'set_components', 'sales_monthly', 'sales_daily'];
   if (!allowed.includes(table)) return res.status(400).json({ error: '無効なテーブル名' });
 
   const tableName = 'mirror_' + table;
