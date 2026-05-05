@@ -12,6 +12,21 @@ function now() {
   return new Date().toISOString().replace('T', ' ').slice(0, 19);
 }
 
+// 税率解決: NE側を優先、NE未登録(null/0)時のみ手動登録 (product_tax_rate) を使う
+// neTaxNum: raw_ne_products.消費税率 (10 / 8 / 0 / null)
+// manualTaxRate: product_tax_rate.tax_rate (0.1 / 0.08 / undefined)
+// NE が 10/8 以外の想定外値の場合は UNKNOWN を返す (upstream 異常を隠さない)
+export function resolveTaxRate(neTaxNum, manualTaxRate) {
+  if (neTaxNum === 10) return { taxRate: 0.1, taxCategory: 'STANDARD_10' };
+  if (neTaxNum === 8) return { taxRate: 0.08, taxCategory: 'REDUCED_8' };
+  // NE 未登録 (null / 0) 時のみ手動値にフォールバック
+  if (neTaxNum == null || neTaxNum === 0) {
+    if (manualTaxRate === 0.1) return { taxRate: 0.1, taxCategory: 'STANDARD_10' };
+    if (manualTaxRate === 0.08) return { taxRate: 0.08, taxCategory: 'REDUCED_8' };
+  }
+  return { taxRate: null, taxCategory: 'UNKNOWN' };
+}
+
 // ─── 本番反映時の列リスト（Codex PR1 Round 3 High 反映: 明示列INSERT） ───
 // 物理的な列順が異なるDBでも値が正しくマップされるよう、
 // DELETE + INSERT INTO target (...) SELECT ... FROM staging で列名を明示する。
@@ -186,7 +201,7 @@ export async function rebuildMProducts() {
   for (const sc of db.prepare('SELECT * FROM product_sales_class').all()) {
     salesClassMap.set(sc.sku?.toLowerCase(), sc.sales_class);
   }
-  // 手動税率マップ（例外商品等、NE税率がない場合用）
+  // 手動税率マップ (NE税率が未登録の単品・例外商品の補完用、resolveTaxRate で参照)
   const taxRateMap = new Map();
   try {
     for (const tr of db.prepare('SELECT * FROM product_tax_rate').all()) {
@@ -233,10 +248,7 @@ export async function rebuildMProducts() {
       genkaStatus = 'OVERRIDDEN';
     }
 
-    const taxRate = p.消費税率 ? p.消費税率 / 100.0 : null;
-    let taxCategory = 'UNKNOWN';
-    if (p.消費税率 === 10) taxCategory = 'STANDARD_10';
-    else if (p.消費税率 === 8) taxCategory = 'REDUCED_8';
+    const { taxRate, taxCategory } = resolveTaxRate(p.消費税率, taxRateMap.get(code));
 
     const co = getCarryover(code);
     const launchDate = resolveLaunchDate(co.new_product_launch_date, p.作成日);
@@ -356,14 +368,8 @@ export async function rebuildMProducts() {
 
     const ps = shippingMap.get(sku);
 
-    // 手動登録税率を参照
-    const manualTaxRate = taxRateMap.get(sku) ?? null;
-    let exTaxRate = null, exTaxCategory = 'UNKNOWN';
-    if (manualTaxRate !== null) {
-      exTaxRate = manualTaxRate;
-      if (manualTaxRate === 0.1) exTaxCategory = 'STANDARD_10';
-      else if (manualTaxRate === 0.08) exTaxCategory = 'REDUCED_8';
-    }
+    // 例外商品は NE に存在しないので neTaxNum=null。手動登録のみが税率ソース
+    const { taxRate: exTaxRate, taxCategory: exTaxCategory } = resolveTaxRate(null, taxRateMap.get(sku));
 
     const coEx = getCarryover(sku);
     // 例外商品も resolveLaunchDate を通すことで、carryover に既存の不正値

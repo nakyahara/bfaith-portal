@@ -23,6 +23,7 @@ import { initDB, getDB, getStats, saveToFile, updateSyncMeta } from './db.js';
 import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
 import { mountSkuMasterApi } from './sku-master-api.js';
 import { importSkuMasterCSV } from './import-sku-master.js';
+import { resolveTaxRate } from './rebuild-m-products.js';
 
 const router = Router();
 const upload = multer({ dest: 'data/import/' });
@@ -1063,14 +1064,18 @@ router.post('/api/tax_rate', (req, res) => {
   const tr = parseFloat(tax_rate);
   if (![0.08, 0.1].includes(tr)) return res.status(400).json({ error: 'tax_rate は 0.08 または 0.1 です' });
   const db = getDB();
+  // セット商品の税率は構成品から導出されるため、手動登録は受け付けない (rebuild で消える)
+  const kind = db.prepare('SELECT 商品区分 FROM m_products WHERE 商品コード = ? COLLATE NOCASE').get(sku)?.商品区分;
+  if (kind === 'セット') return res.status(400).json({ error: 'セット商品の税率は構成品から自動算出されます。単品の税率を登録してください。' });
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
   const old = db.prepare('SELECT * FROM product_tax_rate WHERE sku = ?').get(sku);
   db.prepare('INSERT OR REPLACE INTO product_tax_rate (sku, tax_rate, 商品名, synced_at) VALUES (?, ?, ?, ?)').run(sku, tr, product_name || '', now);
   auditLog(db, 'product_tax_rate', sku, old ? 'UPDATE' : 'INSERT', old || null, { sku, tax_rate: tr });
-  // m_productsにリアルタイム反映
-  const taxCategory = tr === 0.1 ? 'STANDARD_10' : 'REDUCED_8';
-  try { db.prepare('UPDATE m_products SET 消費税率 = ?, 税区分 = ?, updated_at = ? WHERE 商品コード = ? COLLATE NOCASE').run(tr, taxCategory, now, sku); } catch {}
-  res.json({ ok: true, sku, tax_rate: tr });
+  // m_products に即時反映 (rebuild と同じ resolveTaxRate を通す)
+  const neRow = db.prepare('SELECT 消費税率 FROM raw_ne_products WHERE 商品コード = ? COLLATE NOCASE').get(sku);
+  const { taxRate, taxCategory } = resolveTaxRate(neRow?.消費税率, tr);
+  try { db.prepare('UPDATE m_products SET 消費税率 = ?, 税区分 = ?, updated_at = ? WHERE 商品コード = ? COLLATE NOCASE').run(taxRate, taxCategory, now, sku); } catch {}
+  res.json({ ok: true, sku, tax_rate: tr, applied: { 消費税率: taxRate, 税区分: taxCategory } });
 });
 
 // ─── POST /api/csv/tax_rate ───
@@ -1090,23 +1095,27 @@ router.post('/api/csv/tax_rate', upload.single('file'), (req, res) => {
 
   const stmt = db.prepare('INSERT OR REPLACE INTO product_tax_rate (sku, tax_rate, 商品名, synced_at) VALUES (?, ?, ?, ?)');
   const updateMp = db.prepare('UPDATE m_products SET 消費税率 = ?, 税区分 = ?, updated_at = ? WHERE 商品コード = ? COLLATE NOCASE');
+  const getNe = db.prepare('SELECT 消費税率 FROM raw_ne_products WHERE 商品コード = ? COLLATE NOCASE');
+  const getMp = db.prepare('SELECT 商品名, 商品区分 FROM m_products WHERE 商品コード = ? COLLATE NOCASE');
 
-  let count = 0, skipped = 0, invalid = 0;
+  let count = 0, skipped = 0, invalid = 0, setSkipped = 0;
   const tx = db.transaction(() => {
     for (const row of dataRows) {
       const sku = (row[0] || '').toLowerCase().trim();
       if (!sku) { skipped++; continue; }
       const tr = parseFloat(row[1]);
       if (![0.08, 0.1].includes(tr)) { invalid++; skipped++; continue; }
-      const name = db.prepare('SELECT 商品名 FROM m_products WHERE 商品コード = ? COLLATE NOCASE').get(sku)?.商品名 || '';
-      const taxCategory = tr === 0.1 ? 'STANDARD_10' : 'REDUCED_8';
-      stmt.run(sku, tr, name, now);
-      try { updateMp.run(tr, taxCategory, now, sku); } catch {}
+      const mp = getMp.get(sku);
+      // セット商品は構成品から自動算出されるためスキップ
+      if (mp?.商品区分 === 'セット') { setSkipped++; skipped++; continue; }
+      stmt.run(sku, tr, mp?.商品名 || '', now);
+      const { taxRate, taxCategory } = resolveTaxRate(getNe.get(sku)?.消費税率, tr);
+      try { updateMp.run(taxRate, taxCategory, now, sku); } catch {}
       count++;
     }
   });
   tx();
-  res.json({ ok: true, imported: count, skipped, invalid, total: dataRows.length });
+  res.json({ ok: true, imported: count, skipped, invalid, setSkipped, total: dataRows.length });
 });
 
 // ─── GET /api/missing/download ───
