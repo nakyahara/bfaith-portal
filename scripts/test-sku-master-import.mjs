@@ -2,7 +2,7 @@
  * import-sku-master.js を一時DBで動作確認。
  *
  * 1. 一時DBを作成
- * 2. 必要な依存テーブル(raw_ne_products, sku_map)をスタブ作成
+ * 2. 必要な依存テーブル(raw_ne_products)をスタブ作成
  * 3. m_sku_master/components テーブル＋ビューを作成
  * 4. 実CSVを取り込み、結果を出力
  */
@@ -30,10 +30,6 @@ db.pragma('foreign_keys = ON');
 
 // 必要な依存テーブルだけ作る
 db.exec(`CREATE TABLE raw_ne_products (商品コード TEXT PRIMARY KEY, 原価 REAL)`);
-db.exec(`CREATE TABLE sku_map (
-  seller_sku TEXT NOT NULL, ne_code TEXT NOT NULL, 数量 INTEGER DEFAULT 1,
-  PRIMARY KEY (seller_sku, ne_code)
-)`);
 
 // 本体スキーマ（db.js から複製）
 db.exec(`CREATE TABLE m_sku_master (

@@ -8,7 +8,6 @@
  *   node apps/warehouse/csv-import.js products <CSVファイル>
  *   node apps/warehouse/csv-import.js sets <CSVファイル>
  *   node apps/warehouse/csv-import.js orders <CSV1> [<CSV2> ...]
- *   node apps/warehouse/csv-import.js skumap <CSVファイル>
  *   node apps/warehouse/csv-import.js logizard <CSVファイル>
  *   node apps/warehouse/csv-import.js shipping_rates <CSVファイル>
  *   node apps/warehouse/csv-import.js product_shipping <CSVファイル>
@@ -191,15 +190,6 @@ function importSetProducts(filePath) {
   return count;
 }
 
-// ─── SKUマッピング投入 ───
-
-function importSkuMap(filePath) {
-  // SKU管理統合 Step 3b: sku_map writer 廃止。
-  // SKUマスタ (m_sku_master + m_sku_components) を使用してください (importSkuMaster)。
-  console.warn(`[Import] sku_map 書き込みは廃止されました (Step 3b)。SKUマスタ用CSVを使用してください。skipped: ${filePath}`);
-  return 0;
-}
-
 // ─── ロジザード在庫投入 ───
 
 function importLogizard(filePath) {
@@ -359,7 +349,6 @@ async function main() {
     console.log('  node apps/warehouse/csv-import.js products <CSVファイル>');
     console.log('  node apps/warehouse/csv-import.js sets <CSVファイル>');
     console.log('  node apps/warehouse/csv-import.js orders <CSV1> [<CSV2> ...]');
-    console.log('  node apps/warehouse/csv-import.js skumap <CSVファイル>');
     console.log('  node apps/warehouse/csv-import.js logizard <CSVファイル>');
     console.log('  node apps/warehouse/csv-import.js shipping_rates <CSVファイル>');
     console.log('  node apps/warehouse/csv-import.js product_shipping <CSVファイル>');
@@ -372,7 +361,6 @@ async function main() {
   const handlers = {
     products: () => importProducts(files[0]),
     sets: () => importSetProducts(files[0]),
-    skumap: () => importSkuMap(files[0]),
     logizard: () => importLogizard(files[0]),
     shipping_rates: () => importShippingRates(files[0]),
     product_shipping: () => importProductShipping(files[0]),

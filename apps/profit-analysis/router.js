@@ -89,13 +89,8 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
     productMap.set(p.商品コード?.toLowerCase(), p);
   }
 
-  // 4. SKUマップ（seller_skuもne_codeも小文字で統一）
-  // 既定: mirror_sku_resolved (master優先 + sku_map fallback)
-  // env WAREHOUSE_SKU_SOURCE=legacy で旧 mirror_sku_map 直参照に戻せる
-  const useLegacy = process.env.WAREHOUSE_SKU_SOURCE === 'legacy';
-  const skuMap = useLegacy
-    ? db.prepare('SELECT seller_sku, ne_code, 数量 FROM mirror_sku_map').all()
-    : db.prepare('SELECT seller_sku, ne_code, quantity AS 数量 FROM mirror_sku_resolved').all();
+  // 4. SKUマップ（seller_skuもne_codeも小文字で統一、mirror_sku_resolved master only）
+  const skuMap = db.prepare('SELECT seller_sku, ne_code, quantity AS 数量 FROM mirror_sku_resolved').all();
   const skuToNeMap = new Map();
   for (const m of skuMap) {
     const key = m.seller_sku?.toLowerCase();

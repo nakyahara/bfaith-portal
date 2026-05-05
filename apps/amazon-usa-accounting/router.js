@@ -140,13 +140,8 @@ function resolveSkus(rows, db) {
     productsMap.set((p.商品コード || '').toLowerCase(), p);
   }
 
-  // 既定: mirror_sku_resolved (master優先 + sku_map fallback)
-  // env WAREHOUSE_SKU_SOURCE=legacy で旧 mirror_sku_map 直参照に戻せる
-  const useLegacy = process.env.WAREHOUSE_SKU_SOURCE === 'legacy';
   const skuMap = new Map();
-  const skuRows = useLegacy
-    ? db.prepare('SELECT seller_sku, ne_code, 数量 FROM mirror_sku_map').all()
-    : db.prepare('SELECT seller_sku, ne_code, quantity AS 数量 FROM mirror_sku_resolved').all();
+  const skuRows = db.prepare('SELECT seller_sku, ne_code, quantity AS 数量 FROM mirror_sku_resolved').all();
   for (const s of skuRows) {
     const key = s.seller_sku?.toLowerCase();
     if (!key) continue;
