@@ -93,78 +93,94 @@ function resolveSkus(rows, db) {
       continue;
     }
 
-    // Stage 1: mirror_productsで直一致
-    let product = productsMap.get(sku);
-    let resolveMethod = 'direct';
+    let product = null;
+    let resolveMethod = null;
 
-    // Stage 2: sku_resolved/sku_map で変換(セット商品は構成品合算)
-    if (!product) {
-      const mappings = skuMapEntries.get(sku);
-      if (mappings && mappings.length > 0) {
-        if (mappings.length === 1) {
-          // 単品: 1 SKU = 1 ne_code
-          product = productsMap.get((mappings[0].ne_code || '').toLowerCase());
-          resolveMethod = 'sku_map';
-        } else {
-          // セット商品: 1 SKU = N components → 全構成品を解決して合算
-          // 数量検証: NULL→1扱い、0/負数/非整数→invalid_quantity で hard fail
-          const components = mappings.map(m => {
-            const rawQty = m.数量;
-            const validQty = (rawQty == null) ? 1
-              : (Number.isInteger(rawQty) && rawQty > 0) ? rawQty : null;
-            return {
-              ne_code: m.ne_code,
-              qty: validQty,
-              rawQty,
-              product: productsMap.get((m.ne_code || '').toLowerCase()),
-            };
-          });
+    // Stage 1: mirror_sku_resolved を優先 (セット情報が正しい構成数を持つため)
+    // mirror_products に同一SKUの単品レコードが残存していても、ここで先にセット解決する
+    const mappings = skuMapEntries.get(sku);
+    if (mappings && mappings.length > 0) {
+      // 構成品の数量を検証 (NULL→1扱い、0/負数/非整数→invalid_quantity で hard fail)
+      const components = mappings.map(m => {
+        const rawQty = m.数量;
+        const validQty = (rawQty == null) ? 1
+          : (Number.isInteger(rawQty) && rawQty > 0) ? rawQty : null;
+        return {
+          ne_code: m.ne_code,
+          qty: validQty,
+          rawQty,
+          product: productsMap.get((m.ne_code || '').toLowerCase()),
+        };
+      });
 
-          // invalid_quantity: 構成品の数量が 0/負数/非数値
-          const invalidQty = components.filter(c => c.qty === null);
-          if (invalidQty.length > 0) {
-            resolved.push({ ...row, 商品コード: null, 原価: 0, 税率: null, 売上分類: null, 解決方法: 'invalid_quantity' });
-            conflicts.push({ sku, type: 'invalid_quantity', invalidQty: invalidQty.map(c => ({ ne_code: c.ne_code, rawQty: c.rawQty })) });
-            continue;
-          }
-
-          // partial_component: 構成品の一部が mirror_products に存在しない
-          const missing = components.filter(c => !c.product).map(c => c.ne_code);
-          if (missing.length > 0) {
-            resolved.push({ ...row, 商品コード: null, 原価: 0, 税率: null, 売上分類: null, 解決方法: 'partial_component' });
-            conflicts.push({ sku, type: 'partial_component', missing });
-            continue;
-          }
-
-          // セット合算: 原価は構成品(原価×数量)の合計
-          const totalGenka = components.reduce((sum, c) => sum + (c.product.原価 || 0) * (c.qty || 1), 0);
-
-          // 税率: 構成品の MIN(税率) を採用 (8%軽減税率優先、業務ルール)
-          //   8% (軽減) と 10% (標準) 混在時は軽減税率優先(食品的扱い)
-          const taxRatesArr = components.map(c => c.product.消費税率).filter(t => t != null);
-          const taxRate = taxRatesArr.length > 0
-            ? Math.round(Math.min(...taxRatesArr) * 100) // 0.08→8, 0.10→10
-            : null;
-
-          // 売上分類: 構成品の MIN(売上分類) を採用 (階層論理、業務ルール)
-          //   1=自社優先 > 2=取引先限定 > 3=仕入れ
-          //   1 を含む→1, 含まず2 含む→2, 3のみ→3
-          //   理由: 自社商品(1)を含むセットは「自社商品セット」と認識される業務慣習
-          const segmentsArr = components.map(c => c.product.売上分類).filter(s => s != null);
-          const segmentValue = segmentsArr.length > 0 ? Math.min(...segmentsArr) : null;
-
-          resolved.push({
-            ...row,
-            商品コード: components[0].product.商品コード,
-            原価: totalGenka,
-            税率: taxRate,
-            売上分類: segmentValue,
-            解決方法: 'set_components',
-            components: components.map(c => ({ ne_code: c.ne_code, qty: c.qty })),
-          });
-          continue; // セット処理完了
-        }
+      // invalid_quantity: 構成品の数量が 0/負数/非数値 (セット/単品問わず)
+      const invalidQty = components.filter(c => c.qty === null);
+      if (invalidQty.length > 0) {
+        resolved.push({ ...row, 商品コード: null, 原価: 0, 税率: null, 売上分類: null, 解決方法: 'invalid_quantity' });
+        conflicts.push({ sku, type: 'invalid_quantity', invalidQty: invalidQty.map(c => ({ ne_code: c.ne_code, rawQty: c.rawQty })) });
+        continue;
       }
+
+      // セット判定: 構成品 >1個 OR 単一構成品でも qty != 1 (例: 1 SKU = 1 ne_code × 3個 の3個セット)
+      const isSet = components.length > 1 || components.some(c => c.qty !== 1);
+
+      if (isSet) {
+        // partial_component: 構成品の一部が mirror_products に存在しない
+        const missing = components.filter(c => !c.product).map(c => c.ne_code);
+        if (missing.length > 0) {
+          resolved.push({ ...row, 商品コード: null, 原価: 0, 税率: null, 売上分類: null, 解決方法: 'partial_component' });
+          conflicts.push({ sku, type: 'partial_component', missing });
+          continue;
+        }
+
+        // セット合算: 原価は構成品(原価×数量)の合計
+        const totalGenka = components.reduce((sum, c) => sum + (c.product.原価 || 0) * (c.qty || 1), 0);
+
+        // 税率: 構成品の MIN(税率) を採用 (8%軽減税率優先、業務ルール)
+        //   8% (軽減) と 10% (標準) 混在時は軽減税率優先(食品的扱い)
+        const taxRatesArr = components.map(c => c.product.消費税率).filter(t => t != null);
+        const taxRate = taxRatesArr.length > 0
+          ? Math.round(Math.min(...taxRatesArr) * 100) // 0.08→8, 0.10→10
+          : null;
+
+        // 売上分類: 構成品の MIN(売上分類) を採用 (階層論理、業務ルール)
+        //   1=自社優先 > 2=取引先限定 > 3=仕入れ
+        //   1 を含む→1, 含まず2 含む→2, 3のみ→3
+        //   理由: 自社商品(1)を含むセットは「自社商品セット」と認識される業務慣習
+        const segmentsArr = components.map(c => c.product.売上分類).filter(s => s != null);
+        const segmentValue = segmentsArr.length > 0 ? Math.min(...segmentsArr) : null;
+
+        resolved.push({
+          ...row,
+          商品コード: components[0].product.商品コード,
+          原価: totalGenka,
+          税率: taxRate,
+          売上分類: segmentValue,
+          解決方法: 'set_components',
+          components: components.map(c => ({ ne_code: c.ne_code, qty: c.qty })),
+        });
+        continue; // セット処理完了
+      }
+
+      // 単品 (length === 1 && qty === 1): ne_code 経由で解決
+      // ne_code lookup 失敗時は mapped_target_missing で hard fail
+      // (mirror_products direct fallback は意図的に行わない:
+      //  「sku_map あるのに ne_code 壊れている」状態を direct で握りつぶすと
+      //   Round 11 で潰した「mirror_products 残存単品優先」を復活させてしまうため)
+      if (components[0].product) {
+        product = components[0].product;
+        resolveMethod = 'sku_map';
+      } else {
+        resolved.push({ ...row, 商品コード: null, 原価: 0, 税率: null, 売上分類: null, 解決方法: 'mapped_target_missing' });
+        conflicts.push({ sku, type: 'mapped_target_missing', missing: [components[0].ne_code] });
+        continue;
+      }
+    }
+
+    // Stage 2: mirror_products で直一致 (mappings 自体が無い場合のみ)
+    if (!product) {
+      product = productsMap.get(sku);
+      if (product) resolveMethod = 'direct';
     }
 
     if (product) {
@@ -489,7 +505,7 @@ router.post('/upload', upload.single('file'), (req, res) => {
     summary: summaryCsv,
     serverState: {
       totalRows: parsedRows.length,
-      resolvedCount: resolved.filter(r => r.解決方法 !== 'unresolved' && r.解決方法 !== 'skip' && r.解決方法 !== 'no_sku' && !['mixed_tax','mixed_segment','partial_component','invalid_quantity'].includes(r.解決方法)).length,
+      resolvedCount: resolved.filter(r => r.解決方法 !== 'unresolved' && r.解決方法 !== 'skip' && r.解決方法 !== 'no_sku' && !['mixed_tax','mixed_segment','partial_component','invalid_quantity','mapped_target_missing'].includes(r.解決方法)).length,
       unresolvedCount: unresolved.length,
       unresolvedTaxCount: unresolvedTax.length,
       conflictsCount: conflicts.length,
@@ -501,7 +517,7 @@ router.post('/upload', upload.single('file'), (req, res) => {
   res.json({
     yearMonth,
     totalRows: parsedRows.length,
-    resolvedCount: resolved.filter(r => r.解決方法 !== 'unresolved' && r.解決方法 !== 'skip' && r.解決方法 !== 'no_sku' && !['mixed_tax','mixed_segment','partial_component','invalid_quantity'].includes(r.解決方法)).length,
+    resolvedCount: resolved.filter(r => r.解決方法 !== 'unresolved' && r.解決方法 !== 'skip' && r.解決方法 !== 'no_sku' && !['mixed_tax','mixed_segment','partial_component','invalid_quantity','mapped_target_missing'].includes(r.解決方法)).length,
     unresolvedSkus: unresolved,
     unresolvedTaxCount,
     unresolvedTax,
@@ -743,7 +759,7 @@ function renderPage() {
       if (data.conflicts && data.conflicts.length > 0) {
         const card = document.getElementById('conflictsCard');
         card.style.display = 'block';
-        const typeLabels = { mixed_tax: '税率混在', mixed_segment: '売上分類混在', partial_component: '構成品欠損', invalid_quantity: '数量不正' };
+        const typeLabels = { mixed_tax: '税率混在', mixed_segment: '売上分類混在', partial_component: '構成品欠損', invalid_quantity: '数量不正', mapped_target_missing: 'マップ先商品欠損' };
         let html = '<table class="detail-table"><tr><th>SKU</th><th>エラー種別</th><th>詳細</th></tr>';
         for (const c of data.conflicts) {
           const label = typeLabels[c.type] || c.type;
@@ -752,6 +768,7 @@ function renderPage() {
           else if (c.type === 'mixed_segment') detail = '分類: ' + (c.segments || []).join(', ');
           else if (c.type === 'partial_component') detail = '欠損ne_code: ' + (c.missing || []).join(', ');
           else if (c.type === 'invalid_quantity') detail = '不正数量: ' + (c.invalidQty || []).map(q => q.ne_code + '=' + q.rawQty).join(', ');
+          else if (c.type === 'mapped_target_missing') detail = '欠損ne_code: ' + (c.missing || []).join(', ');
           html += '<tr><td style="text-align:left">' + c.sku + '</td><td>' + label + '</td><td style="text-align:left">' + detail + '</td></tr>';
         }
         html += '</table>';
@@ -1304,7 +1321,7 @@ router.post('/confirm', (req, res) => {
   if (!s.canConfirm) {
     if (s.unresolvedCount > 0) return res.status(400).json({ error: '未登録SKUが残っているため確定できません' });
     if (s.unresolvedTaxCount > 0) return res.status(400).json({ error: '税率未登録があるため確定できません' });
-    if (s.conflictsCount > 0) return res.status(400).json({ error: 'セット解決エラー(税率/分類混在・構成品欠損・数量不正)があるため確定できません' });
+    if (s.conflictsCount > 0) return res.status(400).json({ error: 'セット解決エラー(税率/分類混在・構成品欠損・数量不正・マップ先商品欠損)があるため確定できません' });
     return res.status(400).json({ error: '確定不可状態です' });
   }
 
