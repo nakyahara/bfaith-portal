@@ -62,6 +62,7 @@ async function fetchQoo10(days = 7) {
   `);
 
   let total = 0;
+  let lastApiError = null;
 
   // Qoo10 APIは日付範囲90日上限 → 90日チャンクで分割取得
   // またページングが機能しない（Page1で全件返る）ためPage=1のみ取得
@@ -80,7 +81,12 @@ async function fetchQoo10(days = 7) {
       const res = await fetch(url);
       const data = await res.json();
 
-      if (data.ResultCode !== 0 || !data.ResultObject) continue;
+      if (data.ResultCode !== 0) {
+        lastApiError = `[Qoo10] APIエラー stat=${stat}: ResultCode=${data.ResultCode} ${data.ResultMsg || data.ResultMessage || ''}`;
+        console.log(lastApiError);
+        continue;
+      }
+      if (!data.ResultObject) continue;
 
       const items = Array.isArray(data.ResultObject) ? data.ResultObject : [data.ResultObject];
 
@@ -114,6 +120,10 @@ async function fetchQoo10(days = 7) {
     chunkEnd = new Date(chunkStart);
     chunkEnd.setDate(chunkEnd.getDate() - 1);
     await sleep(300);
+  }
+
+  if (total === 0 && lastApiError) {
+    throw new Error(lastApiError);
   }
 
   updateSyncMeta('qoo10_last_sync', now());
@@ -175,8 +185,7 @@ async function fetchAuPay(days = 7) {
 
     if (response.result?.status !== '0') {
       const err = response.result?.error;
-      console.log(`[auPay] APIエラー: ${err?.code} ${err?.message}`);
-      break;
+      throw new Error(`[auPay] APIエラー: ${err?.code} ${err?.message}`);
     }
 
     const resultCount = parseInt(response.resultCount) || 0;
@@ -292,8 +301,7 @@ async function fetchMercari(days = 7) {
 
       const json = await res.json();
       if (json.errors) {
-        console.log('[メルカリ] GraphQLエラー:', json.errors[0]?.message);
-        break;
+        throw new Error(`[メルカリ] GraphQLエラー: ${json.errors[0]?.message || JSON.stringify(json.errors)}`);
       }
 
       const edges = json.data?.orderTransactions?.edges || [];
@@ -326,8 +334,8 @@ async function fetchMercari(days = 7) {
       after = pageInfo.endCursor;
       await sleep(1000);
     } catch (e) {
-      console.log('[メルカリ] エラー:', e.message);
-      break;
+      if (e.message.startsWith('[メルカリ]')) throw e;
+      throw new Error(`[メルカリ] ${e.message}`);
     }
   }
 
@@ -401,8 +409,7 @@ async function fetchLineGift(days = 7) {
       const res = await fetch(url);
 
       if (!res.ok) {
-        console.log('[LINEギフト] HTTP', res.status);
-        break;
+        throw new Error(`[LINEギフト] HTTP ${res.status}`);
       }
 
       const data = await res.json();
@@ -457,8 +464,8 @@ async function fetchLineGift(days = 7) {
       page++;
       await sleep(1000);
     } catch (e) {
-      console.log('[LINEギフト] エラー:', e.message);
-      break;
+      if (e.message.startsWith('[LINEギフト]')) throw e;
+      throw new Error(`[LINEギフト] ${e.message}`);
     }
   }
 
