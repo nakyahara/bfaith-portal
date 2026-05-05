@@ -113,6 +113,10 @@ async function main() {
 
   const results = [];
 
+  // VPS環境変数同期 (au PAYキーがミニPC .env で更新されていればVPSへ反映)
+  const vpsEnvResult = runScript('apps/warehouse/sync-vps-env.js', 'VPS env同期');
+  results.push({ name: 'VPS env同期', ...vpsEnvResult });
+
   // NE API（商品マスタ + セット商品 + 受注7日分）
   const neResult = runScript('apps/warehouse/ne-api.js sync', 'NE API');
   results.push({ name: 'NE', ...neResult });
