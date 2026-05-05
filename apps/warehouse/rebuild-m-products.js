@@ -12,17 +12,29 @@ function now() {
   return new Date().toISOString().replace('T', ' ').slice(0, 19);
 }
 
+// 既知税率マスタ (税制変更時はここに1行追加するだけで全箇所追従する)
+//   neRate: NEが返す整数 (raw_ne_products.消費税率)
+//   decimal: m_products / product_tax_rate に格納する小数表現
+//   category: 税区分 (会計上の意味を持つので機械的に生成しない。明示で持つ)
+export const TAX_RATES = [
+  { neRate: 10, decimal: 0.1,  category: 'STANDARD_10' },
+  { neRate: 8,  decimal: 0.08, category: 'REDUCED_8' },
+  // 将来例: { neRate: 12, decimal: 0.12, category: 'STANDARD_12' },
+];
+export const KNOWN_NE_RATES = TAX_RATES.map(t => t.neRate);
+export const KNOWN_DECIMAL_RATES = TAX_RATES.map(t => t.decimal);
+
 // 税率解決: NE側を優先、NE未登録(null/0)時のみ手動登録 (product_tax_rate) を使う
-// neTaxNum: raw_ne_products.消費税率 (10 / 8 / 0 / null)
-// manualTaxRate: product_tax_rate.tax_rate (0.1 / 0.08 / undefined)
-// NE が 10/8 以外の想定外値の場合は UNKNOWN を返す (upstream 異常を隠さない)
+// neTaxNum: raw_ne_products.消費税率 (整数)
+// manualTaxRate: product_tax_rate.tax_rate (小数)
+// NE が想定外値 (TAX_RATES 未登録) の場合は UNKNOWN を返す (upstream 異常を隠さない)
 export function resolveTaxRate(neTaxNum, manualTaxRate) {
-  if (neTaxNum === 10) return { taxRate: 0.1, taxCategory: 'STANDARD_10' };
-  if (neTaxNum === 8) return { taxRate: 0.08, taxCategory: 'REDUCED_8' };
+  const byNe = TAX_RATES.find(t => t.neRate === neTaxNum);
+  if (byNe) return { taxRate: byNe.decimal, taxCategory: byNe.category };
   // NE 未登録 (null / 0) 時のみ手動値にフォールバック
   if (neTaxNum == null || neTaxNum === 0) {
-    if (manualTaxRate === 0.1) return { taxRate: 0.1, taxCategory: 'STANDARD_10' };
-    if (manualTaxRate === 0.08) return { taxRate: 0.08, taxCategory: 'REDUCED_8' };
+    const byManual = TAX_RATES.find(t => t.decimal === manualTaxRate);
+    if (byManual) return { taxRate: byManual.decimal, taxCategory: byManual.category };
   }
   return { taxRate: null, taxCategory: 'UNKNOWN' };
 }
@@ -298,6 +310,8 @@ export async function rebuildMProducts() {
     let hasAllGenka = true;
     let hasAnyGenka = false;
     const taxRates = new Set();
+    // 構成品税率に null/0 や TAX_RATES 未登録値が含まれるかを記録 (上流異常を握り潰さないため)
+    let hasUnknownTaxRate = false;
 
     for (const comp of components) {
       if (comp.原価 > 0) {
@@ -306,7 +320,13 @@ export async function rebuildMProducts() {
       } else {
         hasAllGenka = false;
       }
-      if (comp.消費税率) taxRates.add(comp.消費税率);
+      if (comp.消費税率 == null || comp.消費税率 === 0) {
+        hasUnknownTaxRate = true;
+      } else if (TAX_RATES.find(t => t.neRate === comp.消費税率)) {
+        taxRates.add(comp.消費税率);
+      } else {
+        hasUnknownTaxRate = true;
+      }
 
       // 構成品staging投入
       insertComponentStaging.run(
@@ -328,15 +348,16 @@ export async function rebuildMProducts() {
       genkaStatus = 'PARTIAL';
     }
 
-    // 税区分
+    // 税区分 (構成品の税率から導出。MIXED は taxRate に最小値を入れる既存仕様を踏襲)
+    // 構成品に null/0 や TAX_RATES 未登録値が1つでもあれば UNKNOWN に倒し、上流異常を握り潰さない
     let taxCategory = 'UNKNOWN', taxRate = null;
-    if (taxRates.size === 1) {
-      const rate = [...taxRates][0];
-      taxRate = rate / 100.0;
-      taxCategory = rate === 10 ? 'STANDARD_10' : rate === 8 ? 'REDUCED_8' : 'UNKNOWN';
-    } else if (taxRates.size > 1) {
+    if (!hasUnknownTaxRate && taxRates.size === 1) {
+      const def = TAX_RATES.find(t => t.neRate === [...taxRates][0]);
+      if (def) { taxRate = def.decimal; taxCategory = def.category; }
+    } else if (!hasUnknownTaxRate && taxRates.size > 1) {
+      const decs = [...taxRates].map(r => TAX_RATES.find(t => t.neRate === r).decimal);
       taxCategory = 'MIXED';
-      taxRate = Math.min(...taxRates) / 100.0;
+      taxRate = Math.min(...decs);
     }
 
     // 取扱区分: NEに存在すればそこから、なければ取扱中
