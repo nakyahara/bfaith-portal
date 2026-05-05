@@ -236,13 +236,13 @@ function aggregate(resolvedRows) {
     }
   }
 
-  // MF連携用：税込み集計
+  // MF連携用：税込み集計（楽天CSVの単価・合計金額は既に税込なのでそのまま使用）
   const t10 = byTax['10'];
   const t8 = byTax['8'];
   const mfColumns = ['商品売上(10%)', '商品売上(8%)', '合計'];
   const mfRow = {
-    '商品売上(10%)': Math.round(t10.クーポン値引後売上 * 1.1),
-    '商品売上(8%)': Math.round(t8.クーポン値引後売上 * 1.08),
+    '商品売上(10%)': Math.round(t10.クーポン値引後売上),
+    '商品売上(8%)': Math.round(t8.クーポン値引後売上),
   };
   mfRow['合計'] = mfRow['商品売上(10%)'] + mfRow['商品売上(8%)'];
 

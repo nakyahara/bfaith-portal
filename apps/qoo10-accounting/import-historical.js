@@ -171,9 +171,9 @@ const insertMany = db.transaction(() => {
     };
 
     const mfRow = {
-      '商品売上(10%)': Math.round(totalSales * 1.1),
+      '商品売上(10%)': Math.round(totalSales),
       '商品売上(8%)': 0,
-      '合計': Math.round(totalSales * 1.1),
+      '合計': Math.round(totalSales),
     };
 
     const excluded = { '4': { 売上合計: 0, 原価合計: 0, 行数: 0 } };

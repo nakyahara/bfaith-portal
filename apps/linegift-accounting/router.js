@@ -244,12 +244,12 @@ function aggregate(resolvedRows) {
     }
   }
 
-  // MF連携用: 税込み集計
+  // MF連携用: 税込み集計（LINEギフトCSVの金額は既に税込なのでそのまま使用）
   const t10 = byTax['10'];
   const t8 = byTax['8'];
   const mfRow = {
-    '商品売上(10%)': Math.round(t10.クーポン値引後売上 * 1.1),
-    '商品売上(8%)': Math.round(t8.クーポン値引後売上 * 1.08),
+    '商品売上(10%)': Math.round(t10.クーポン値引後売上),
+    '商品売上(8%)': Math.round(t8.クーポン値引後売上),
   };
   mfRow['合計'] = mfRow['商品売上(10%)'] + mfRow['商品売上(8%)'];
 
@@ -516,7 +516,7 @@ router.post('/import-history', (req, res) => {
           '10': { 売上合計: totalSales, クーポン値引額: 0, クーポン値引後売上: totalSales, 原価合計: totalCost, 行数: 0 },
           '8': { 売上合計: 0, クーポン値引額: 0, クーポン値引後売上: 0, 原価合計: 0, 行数: 0 },
         };
-        const mfRow = { '商品売上(10%)': Math.round(totalSales * 1.1), '商品売上(8%)': 0, '合計': Math.round(totalSales * 1.1) };
+        const mfRow = { '商品売上(10%)': Math.round(totalSales), '商品売上(8%)': 0, '合計': Math.round(totalSales) };
         const excluded = { '4': { 売上合計: 0, クーポン値引額: 0, クーポン値引後売上: 0, 原価合計: 0, 行数: 0 } };
 
         const r = stmt.run(

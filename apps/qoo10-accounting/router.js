@@ -226,12 +226,12 @@ function aggregate(resolvedRows) {
     }
   }
 
-  // MF連携用: 税込み集計
+  // MF連携用: 税込み集計（Qoo10CSVの金額は既に税込なのでそのまま使用）
   const t10 = byTax['10'];
   const t8 = byTax['8'];
   const mfRow = {
-    '商品売上(10%)': Math.round(t10.売上合計 * 1.1),
-    '商品売上(8%)': Math.round(t8.売上合計 * 1.08),
+    '商品売上(10%)': Math.round(t10.売上合計),
+    '商品売上(8%)': Math.round(t8.売上合計),
   };
   mfRow['合計'] = mfRow['商品売上(10%)'] + mfRow['商品売上(8%)'];
 
