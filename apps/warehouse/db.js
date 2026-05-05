@@ -7,7 +7,7 @@
  *   NE系: raw_ne_products / raw_ne_orders / raw_ne_set_products
  *   SP-API系: raw_sp_orders_log / raw_sp_orders
  *   ロジザード: raw_lz_inventory
- *   マッピング: sku_map / product_shipping / shipping_rates / exception_genka
+ *   マッピング: m_sku_master / m_sku_components / product_shipping / shipping_rates / exception_genka
  *   マスタ: shops / sync_meta
  */
 import Database from 'better-sqlite3';
@@ -157,56 +157,6 @@ function createTables() {
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_lz_product ON raw_lz_inventory(商品ID)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_lz_expiry ON raw_lz_inventory(有効期限)');
-
-  // 5. SKUマッピング（Amazon SKU ↔ NE商品コード、1 SKU = 複数NE商品コード可）
-  // 運用規約: JP / US で SKU文字列は必ず重複させない (Global Selling から外して別 SKU で運用)
-  // → market 列は不要、(seller_sku, ne_code) PK のままで衝突しない
-  db.exec(`CREATE TABLE IF NOT EXISTS sku_map (
-    seller_sku          TEXT NOT NULL,
-    asin                TEXT,
-    商品名              TEXT,
-    ne_code             TEXT NOT NULL,
-    数量                INTEGER DEFAULT 1,
-    synced_at           TEXT,
-    PRIMARY KEY (seller_sku, ne_code)
-  )`);
-  db.exec('CREATE INDEX IF NOT EXISTS idx_sku_map_asin ON sku_map(asin)');
-  db.exec('CREATE INDEX IF NOT EXISTS idx_sku_map_ne ON sku_map(ne_code)');
-  db.exec('CREATE INDEX IF NOT EXISTS idx_sku_map_sku ON sku_map(seller_sku)');
-
-  // --- rollback migration: 過去 PR で追加された sku_map.market 列を撤去 (運用規約変更) ---
-  // 旧コードを pull したミニPC で適用済の場合、列だけ残しておくと未使用列で混乱するため除去
-  {
-    const cols = db.prepare(`PRAGMA table_info(sku_map)`).all().map(c => c.name);
-    if (cols.includes('market')) {
-      console.log('[Warehouse] sku_map.market 列を rollback (JP/US は別SKU運用に変更)');
-      db.exec(`
-        BEGIN TRANSACTION;
-        DROP VIEW IF EXISTS v_sales_by_product;
-        DROP VIEW IF EXISTS v_missing_data;
-        DROP VIEW IF EXISTS v_sku_costed;
-        DROP VIEW IF EXISTS v_sku_resolved;
-        CREATE TABLE sku_map_new (
-          seller_sku  TEXT NOT NULL,
-          asin        TEXT,
-          商品名      TEXT,
-          ne_code     TEXT NOT NULL,
-          数量        INTEGER DEFAULT 1,
-          synced_at   TEXT,
-          PRIMARY KEY (seller_sku, ne_code)
-        );
-        -- US 専用 row があれば 警告のため別保管 (実運用前なので 0 件想定)
-        INSERT OR IGNORE INTO sku_map_new (seller_sku, asin, 商品名, ne_code, 数量, synced_at)
-          SELECT seller_sku, asin, 商品名, ne_code, 数量, synced_at FROM sku_map;
-        DROP TABLE sku_map;
-        ALTER TABLE sku_map_new RENAME TO sku_map;
-        COMMIT;
-      `);
-      db.exec('CREATE INDEX IF NOT EXISTS idx_sku_map_asin ON sku_map(asin)');
-      db.exec('CREATE INDEX IF NOT EXISTS idx_sku_map_ne ON sku_map(ne_code)');
-      db.exec('CREATE INDEX IF NOT EXISTS idx_sku_map_sku ON sku_map(seller_sku)');
-    }
-  }
 
   // 6. 配送区分マスタ
   db.exec(`CREATE TABLE IF NOT EXISTS shipping_rates (
@@ -451,6 +401,8 @@ function createTables() {
   `);
 
   // 商品別販売集計VIEW
+  // SKU管理統合 Step 6 (2026-05-04): Amazon SKU解決を sku_map → v_sku_components_first (master only) に切替
+  //   セット親代表 ne_code (sort_order=0) を採用。未登録 SKU は seller_sku のまま。
   db.exec('DROP VIEW IF EXISTS v_sales_by_product');
   db.exec(`
     CREATE VIEW v_sales_by_product AS
@@ -466,7 +418,7 @@ function createTables() {
       COUNT(DISTINCT o.amazon_order_id) as 注文数,
       'sp_api' as data_source
     FROM raw_sp_orders o
-    LEFT JOIN sku_map sm ON o.seller_sku = sm.seller_sku COLLATE NOCASE
+    LEFT JOIN v_sku_components_first sm ON o.seller_sku = sm.seller_sku COLLATE NOCASE
     WHERE o.order_status NOT IN ('Cancelled')
     GROUP BY COALESCE(sm.ne_code, o.seller_sku), o.title, platform, channel, month, date
     UNION ALL
@@ -494,6 +446,7 @@ function createTables() {
 
   // 未登録データ検出VIEW
   // 注: 商品区分は m_products にのみ存在するので INNER JOIN で引く (raw_ne_products にはない)
+  // SKU管理統合 Step 6 (2026-05-04): missing_type='sku_map' の判定を sku_map 不在 → m_sku_master 不在 に変更
   db.exec('DROP VIEW IF EXISTS v_missing_data');
   db.exec(`
     CREATE VIEW v_missing_data AS
@@ -513,8 +466,8 @@ function createTables() {
     SELECT DISTINCT 'sku_map' as missing_type, o.seller_sku as 商品コード, o.title as 商品名,
       NULL as 売価, NULL as 原価, NULL as 取扱区分, MAX(SUBSTR(o.purchase_date, 1, 10)) as last_sold
     FROM raw_sp_orders o
-    LEFT JOIN sku_map sm ON o.seller_sku = sm.seller_sku COLLATE NOCASE
-    WHERE sm.seller_sku IS NULL AND o.order_status NOT IN ('Cancelled')
+    LEFT JOIN m_sku_master mm ON o.seller_sku = mm.seller_sku COLLATE NOCASE
+    WHERE mm.seller_sku IS NULL AND o.order_status NOT IN ('Cancelled')
     GROUP BY o.seller_sku, o.title
   `);
 
@@ -741,7 +694,7 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_sms_sku ON stock_monthly_snapshot(商品コード)');
 
   // 22. SKUマスタ（人手キュレートの seller_sku 単位の正本）
-  // sku_map（自動検出、毎日DELETE+INSERT）と分離。商品名は社内独自名。
+  // SKU管理統合で sku_map (自動検出) を廃止し、本マスタに一本化 (Step 1〜7)。商品名は社内独自名。
   db.exec(`CREATE TABLE IF NOT EXISTS m_sku_master (
     seller_sku  TEXT NOT NULL PRIMARY KEY,
     商品名      TEXT NOT NULL,
@@ -1056,9 +1009,8 @@ function createTables() {
   `);
 
   // 30. ビュー: セット親代表ne_code (sort_order=0 のみ)
-  // SKU管理統合 Step 4-0 (2026-05-04): 売上分析アプリ v_sales_unified の
-  //   LEFT JOIN sku_map 置換用 (Phase 4-C で適用予定)。
-  //   1 SKU = 1 行になり、JOIN による行増殖を防ぐ。
+  // SKU管理統合 Step 4-0 (2026-05-04): 売上分析アプリ v_sales_unified の旧 sku_map JOIN 置換用。
+  //   1 SKU = 1 行になり、JOIN による行増殖を防ぐ。Phase 4-C / Step 6 で多数のビューに適用済。
   db.exec(`CREATE VIEW v_sku_components_first AS
     SELECT seller_sku, ne_code, 数量
     FROM m_sku_components
@@ -1120,7 +1072,7 @@ function insertDefaultShops() {
 // ─── 統計取得 ───
 
 export function getStats() {
-  const tables = ['raw_ne_products', 'raw_ne_orders', 'raw_ne_set_products', 'raw_sp_orders', 'raw_sp_orders_log', 'raw_rakuten_orders', 'raw_rakuten_orders_log', 'raw_lz_inventory', 'sku_map', 'product_shipping', 'shipping_rates', 'exception_genka', 'product_sales_class', 'shops', 'm_products', 'm_set_components', 'f_sales_by_listing', 'f_sales_by_product', 'unmapped_sales', 'amazon_sku_fees', 'stock_monthly_snapshot', 'm_sku_master', 'm_sku_components'];
+  const tables = ['raw_ne_products', 'raw_ne_orders', 'raw_ne_set_products', 'raw_sp_orders', 'raw_sp_orders_log', 'raw_rakuten_orders', 'raw_rakuten_orders_log', 'raw_lz_inventory', 'product_shipping', 'shipping_rates', 'exception_genka', 'product_sales_class', 'shops', 'm_products', 'm_set_components', 'f_sales_by_listing', 'f_sales_by_product', 'unmapped_sales', 'amazon_sku_fees', 'stock_monthly_snapshot', 'm_sku_master', 'm_sku_components'];
   const stats = {};
 
   for (const table of tables) {

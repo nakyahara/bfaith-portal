@@ -114,11 +114,6 @@ export async function syncToRender() {
   const set_components = db.prepare('SELECT * FROM m_set_components').all();
   console.log(`[Sync→Render]   set_components: ${set_components.length}件`);
 
-  // 2b. sku_map: SKU管理統合 Step 5 (2026-05-04) で同期切離し
-  //   Render mirror_sku_map は全消費アプリが mirror_sku_resolved に移行済み (Step 2)
-  //   ペイロード生成自体を停止、受信ハンドラも warehouse-mirror/router.js で撤去
-  //   Step 6 で db.js の CREATE TABLE / mirror_sku_map 定義削除予定
-
   // 2b-3. inv_daily_summary（PR-B: 日次在庫スナップショット集計）
   //   小規模 (1日3行 × 365日 = 1,095/年)、毎回全件送って Render mirror を完全置換
   let inv_daily_summary = [];
@@ -267,7 +262,6 @@ export async function syncToRender() {
 
   try {
     // Part 1: マスタデータ
-    // Step 5 (2026-05-04): sku_map ペイロード削除、Render 側 mirror_sku_map は受信不可
     await sendPart({ products, set_components, sku_resolved, amazon_sku_fees, rakuten_sku_map, inv_daily_summary }, 'マスタ');
 
     // Part 1c: inv_daily_detail (D-1c、直近7日、~17MB なので chunk 分割)

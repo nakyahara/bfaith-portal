@@ -8,7 +8,6 @@
  *   products_*.csv / nedldata*.csv  → 商品マスタ（UPSERT上書き）
  *   orders_*.csv   / juchu*.csv     → 受注明細（追記蓄積）
  *   sets_*.csv     / set_*.csv      → セット商品（洗い替え）
- *   skumap*.csv    / sku_*.csv      → SKUマッピング（洗い替え）
  *   logi*.csv      / CZ*.csv        → ロジザード在庫（洗い替え）
  *   shipping_rates*.csv             → 配送区分マスタ
  *   product_shipping*.csv / 送料*.csv → 商品別送料
@@ -154,13 +153,6 @@ function importSetProducts(filePath) {
   return count;
 }
 
-function importSkuMap(filePath) {
-  // SKU管理統合 Step 3b: sku_map writer 廃止。
-  // SKUマスタ (m_sku_master + m_sku_components) を使用してください。
-  console.warn(`[Auto] sku_map 書き込みは廃止されました (Step 3b)。SKUマスタ用CSVを使用してください。skipped: ${filePath}`);
-  return 0;
-}
-
 function importLogizard(filePath) {
   const { headers, rows } = readCsvFile(filePath);
   const db = getDB();
@@ -199,7 +191,6 @@ function detectType(filename) {
   if (lower.startsWith('products') || lower.startsWith('nedldata')) return 'products';
   if (lower.startsWith('orders') || lower.startsWith('juchu')) return 'orders';
   if (lower.startsWith('sets') || lower.startsWith('set_')) return 'sets';
-  if (lower.startsWith('skumap') || lower.startsWith('sku_')) return 'skumap';
   if (lower.startsWith('logi') || lower.startsWith('cz')) return 'logizard';
   return null;
 }
@@ -234,7 +225,6 @@ function checkAndImport() {
       if (type === 'products') { result = importProducts(filePath); console.log(`[Auto] 商品マスタ: ${result}件`); }
       else if (type === 'orders') { result = importOrders(filePath); console.log(`[Auto] 受注明細: ${result.inserted}件挿入, ${result.skipped}件スキップ`); }
       else if (type === 'sets') { result = importSetProducts(filePath); console.log(`[Auto] セット商品: ${result}件`); }
-      else if (type === 'skumap') { result = importSkuMap(filePath); console.log(`[Auto] SKUマップ: ${result}件`); }
       else if (type === 'logizard') { result = importLogizard(filePath); console.log(`[Auto] ロジザード: ${result}件`); }
       const dest = moveToDone(filePath);
       console.log(`[Auto] 移動: → ${dest}`);

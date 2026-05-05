@@ -2,11 +2,8 @@
  * aggregator.js — 月末棚卸しの金額集計コア
  *
  * 数量 × 税抜原価 で在庫金額を計算する。原価は mirror_products から引く。
- * Amazon SKU は mirror_sku_resolved (master優先 + sku_map fallback) で NE商品コードに変換し、
+ * Amazon SKU は mirror_sku_resolved (master only) で NE商品コードに変換し、
  * セット商品は mirror_set_components で構成品に展開する。
- *
- * env WAREHOUSE_SKU_SOURCE=legacy (推奨) または旧 INVENTORY_MONTHLY_USE_LEGACY_SKU_MAP=1
- * で旧 mirror_sku_map 直参照に戻せる escape hatch あり (SKU管理統合 Step 2 で env 統合)。
  *
  * 入力:
  *   - fbaRows: [{ seller_sku, fba_warehouse, fba_inbound, product_name, asin }]
@@ -35,15 +32,8 @@ function buildLookups(db) {
   }
 
   // SKU解決マップ: seller_sku(小文字) → [{ ne_code, 数量 }]
-  // 既定: mirror_sku_resolved (master優先 + sku_map fallback)
-  // env WAREHOUSE_SKU_SOURCE=legacy で旧 mirror_sku_map 直参照に戻せる
-  // (旧 INVENTORY_MONTHLY_USE_LEGACY_SKU_MAP は SKU管理統合 Step 2b で WAREHOUSE_SKU_SOURCE に統合)
-  const useLegacy = process.env.WAREHOUSE_SKU_SOURCE === 'legacy'
-    || process.env.INVENTORY_MONTHLY_USE_LEGACY_SKU_MAP === '1';
-  const skuMapRows = useLegacy
-    ? db.prepare('SELECT seller_sku, ne_code, 数量 FROM mirror_sku_map').all()
-    // mirror_sku_resolved は quantity カラム(英語)。エイリアスで 数量 に揃える
-    : db.prepare('SELECT seller_sku, ne_code, quantity AS 数量 FROM mirror_sku_resolved').all();
+  // mirror_sku_resolved は quantity カラム(英語)。エイリアスで 数量 に揃える
+  const skuMapRows = db.prepare('SELECT seller_sku, ne_code, quantity AS 数量 FROM mirror_sku_resolved').all();
   const skuMap = new Map();
   for (const s of skuMapRows) {
     const key = (s.seller_sku || '').toLowerCase();

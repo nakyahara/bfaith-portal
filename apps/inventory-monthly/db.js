@@ -7,7 +7,7 @@
  *   - inv_snapshot_pending 発注後未着商品（手動入力分）
  *
  * 参照する既存テーブル（warehouse-mirror.db, 同期）:
- *   - mirror_products / mirror_sku_map / mirror_set_components
+ *   - mirror_products / mirror_sku_resolved / mirror_set_components
  */
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 

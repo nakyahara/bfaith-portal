@@ -18,7 +18,7 @@
  * 完全性指標:
  *   source_status: 'ok' | 'partial' | 'failed' | 'no_source'
  *     - ok: 当日のソースデータが存在し、ほぼ全行原価解決できた
- *     - partial: ソースはあるが unresolved_count > 0 (master/sku_map にない SKU)
+ *     - partial: ソースはあるが unresolved_count > 0 (m_sku_master にない SKU)
  *     - failed: ソースデータがあったが集計時例外 (このスクリプトでは "no_source" になることはあっても failed は呼出元で設定)
  *     - no_source: 当日の SP-API 取得が走ってない (daily_snapshots に当日行なし)
  *
@@ -443,10 +443,10 @@ export function aggregateInventoryDetail(businessDate) {
         const components = resolveMap.get(sku) || [];
         const sourceTag = resolveSourceMap.get(sku);
         const isBundle = components.length > 1;
+        // Step 4-0 以降 sourceTag は 'master' / 'direct' のみ。components 0件は 'unresolved'。
         const resolution = components.length === 0 ? 'unresolved'
-                         : sourceTag === 'master' ? 'master'
                          : sourceTag === 'direct' ? 'direct'
-                         : 'sku_map'; // legacy auto fallback (Step 4-0 で消失予定)
+                         : 'master';
 
         for (const cat of [
           { name: warehouseCategory, qty: fba.qty_warehouse, working_first_seen: null, unfulfillable: fba.fba_unfulfillable },

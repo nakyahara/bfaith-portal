@@ -2,10 +2,8 @@
  * Amazon売上集計ツール
  *
  * セラセンのペイメントレポートCSVをアップロードし、
- * mirror_products + mirror_sku_resolved (master優先 + sku_map fallback) を使って
+ * mirror_products + mirror_sku_resolved (master only) を使って
  * 税率別・セグメント別の売上集計を自動計算する。
- *
- * env WAREHOUSE_SKU_SOURCE=legacy で旧 mirror_sku_map 参照に戻せる(SKU管理統合 Step 2b)
  *
  * Phase 1: CSVアップロード → SKU照合 → 未登録検出 → 集計プレビュー
  */
@@ -60,13 +58,8 @@ function resolveSkus(rows, db) {
     productsMap.set((p.商品コード || '').toLowerCase(), p);
   }
 
-  // 既定: mirror_sku_resolved (master優先 + sku_map fallback)
-  // env WAREHOUSE_SKU_SOURCE=legacy で旧 mirror_sku_map 直参照に戻せる
-  const useLegacy = process.env.WAREHOUSE_SKU_SOURCE === 'legacy';
   const skuMapEntries = new Map();
-  const skuRows = useLegacy
-    ? db.prepare('SELECT seller_sku, ne_code, 数量 FROM mirror_sku_map').all()
-    : db.prepare('SELECT seller_sku, ne_code, quantity AS 数量 FROM mirror_sku_resolved').all();
+  const skuRows = db.prepare('SELECT seller_sku, ne_code, quantity AS 数量 FROM mirror_sku_resolved').all();
   for (const s of skuRows) {
     const key = s.seller_sku?.toLowerCase();
     if (!key) continue;
@@ -1181,7 +1174,7 @@ function renderPage() {
       <table class="m-tbl">
         <tr><th>段階</th><th>処理</th><th>参照先</th></tr>
         <tr><td>Stage 1</td><td>SKUが商品コードと直接一致するか</td><td>mirror_products</td></tr>
-        <tr><td>Stage 2</td><td>SKUマップで変換してから商品コードを検索</td><td>mirror_sku_map → mirror_products</td></tr>
+        <tr><td>Stage 2</td><td>SKUマスタで変換してから商品コードを検索</td><td>mirror_sku_resolved → mirror_products</td></tr>
         <tr><td>Stage 3</td><td>どちらにも一致しない → <b>未登録SKU</b></td><td>—</td></tr>
       </table>
       <div class="note">SKUと商品コードは全て<b>小文字に統一</b>して照合しています。</div>

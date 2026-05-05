@@ -95,28 +95,13 @@ function createTables() {
     PRIMARY KEY (セット商品コード, 構成商品コード)
   )`);
 
-  // mirror_sku_map — Amazon SKU→NE商品コード対応（旧、互換維持）
-  // ※新規ツールは mirror_sku_resolved を参照すること。本テーブルは段階廃止予定。
-  db.exec(`CREATE TABLE IF NOT EXISTS mirror_sku_map (
-    seller_sku        TEXT NOT NULL,
-    ne_code           TEXT NOT NULL,
-    asin              TEXT,
-    商品名            TEXT,
-    数量              INTEGER DEFAULT 1,
-    updated_at        TEXT NOT NULL,
-    PRIMARY KEY (seller_sku, ne_code)
-  )`);
-  db.exec('CREATE INDEX IF NOT EXISTS idx_mirsku_sku ON mirror_sku_map(seller_sku)');
-  db.exec('CREATE INDEX IF NOT EXISTS idx_mirsku_ne ON mirror_sku_map(ne_code)');
-
   // mirror_sku_resolved — SKU紐付け解決済みビューのミラー（v_sku_resolved の結果）
   // 設計:
   //   - source='master': m_sku_master/m_sku_components 由来（人手キュレート、商品名あり）
-  //   - source='auto'  : sku_map 由来（自動検出、master未登録SKUのみfallback、商品名なし）
-  //   - 商品名はNULL許容（auto時はNULLになる）
-  //   - source_updated_at は元データの更新時刻（master=updated_at, auto=sku_map.synced_at）
+  //     SKU管理統合 Step 4-0 で v_sku_resolved は master only 化済 (sku_map fallback 撤廃)
+  //   - source_updated_at は m_sku_master.updated_at
   //   - synced_at はこのミラーへの取り込み時刻
-  // 新規ツールはこのテーブルだけ見ればよい（master優先＋fallbackロジックはミニPC側で確定済み）
+  //   - source='auto' は SKU管理統合 Step 4-0 で廃止だが、過渡期 row の互換のため列値は許容
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_sku_resolved (
     seller_sku         TEXT NOT NULL,
     ne_code            TEXT NOT NULL,
