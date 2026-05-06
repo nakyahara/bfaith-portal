@@ -209,6 +209,7 @@ async function main() {
   console.log(`[AdsCampaign] 分割: ${ranges.length}個 (各最大${MAX_WINDOW_DAYS}日)`);
 
   let totalSaved = 0;
+  let failedRanges = 0;
   for (const range of ranges) {
     console.log(`\n--- 期間: ${range.startDate} 〜 ${range.endDate} ---`);
     try {
@@ -217,6 +218,7 @@ async function main() {
       const downloadUrl = completed.url;
       if (!downloadUrl) {
         console.error('[AdsCampaign] download URL なし:', JSON.stringify(completed));
+        failedRanges++;
         continue;
       }
       const data = await downloadReport(downloadUrl);
@@ -227,10 +229,11 @@ async function main() {
       console.log(`[AdsCampaign] ✅ ${saved}件 投入`);
     } catch (e) {
       console.error(`[AdsCampaign] 期間 ${range.startDate}〜${range.endDate} 失敗:`, e.message);
+      failedRanges++;
     }
   }
 
-  console.log(`\n[AdsCampaign] 完了: 累計 ${totalSaved}件 投入`);
+  console.log(`\n[AdsCampaign] 完了: 累計 ${totalSaved}件 投入 (失敗 ${failedRanges}/${ranges.length} 期間)`);
 
   // 月次サマリ
   const summary = db.prepare(`
@@ -244,6 +247,12 @@ async function main() {
   `).all(args.from, args.to);
   console.log(`[AdsCampaign] サマリ:`);
   console.table(summary);
+
+  // 部分失敗があれば exit 1 (daily-sync が失敗扱いにできるよう)
+  if (failedRanges > 0) {
+    console.error(`[AdsCampaign] ❌ ${failedRanges}/${ranges.length} 期間が失敗 → 不完全データ`);
+    process.exit(1);
+  }
   process.exit(0);
 }
 

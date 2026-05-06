@@ -89,17 +89,18 @@ async function main() {
   // 2. 通常モード: 差分検出
   // 現在の m_products vs history の各 SKU の最新行 を比較
 
-  // history の最新行を SKU 別に取得 (operation != 'DELETE' の最新)
-  // SQLite の subquery で row_number() 相当
+  // history の最新行を SKU 別に取得
+  // 「最新行が DELETE の SKU」は既に削除済みとして latestMap から除外
+  // (Codex round 1 指摘: 旧実装は WHERE operation != 'DELETE' で latest 抽出してたため、
+  //  DELETE 後も「最新の非 DELETE 行」を prev として拾い → 翌日も DELETE 重複追加 + 復活時に旧版で diff)
   const latestSnapshotSql = `
     WITH latest AS (
       SELECT h.*, ROW_NUMBER() OVER (PARTITION BY 商品コード ORDER BY changed_at DESC, history_id DESC) AS rn
       FROM m_products_history h
-      WHERE operation != 'DELETE'
     )
     SELECT product_id, 商品コード, 商品名, 商品区分, 取扱区分,
            標準売価, 原価, 原価ソース, 原価状態, 消費税率, 税区分, 売上分類
-    FROM latest WHERE rn = 1
+    FROM latest WHERE rn = 1 AND operation != 'DELETE'
   `;
   const latestRows = db.prepare(latestSnapshotSql).all();
   const latestMap = new Map();

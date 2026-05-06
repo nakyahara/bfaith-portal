@@ -144,7 +144,13 @@ function ensureSkuUnitPriceTemp(db) {
     WITH src AS (
       SELECT seller_sku_normalized,
              SUM(CASE WHEN price_type='Principal' THEN price_amount_micro ELSE 0 END) AS principal_micro,
-             SUM(CASE WHEN quantity_purchased > 0 THEN quantity_purchased ELSE 0 END) AS qty
+             -- qty は qty 専用行のみ集計 (price_type/fee_type が NULL = 数量情報行)
+             -- これを限定しないと Order の Principal/Tax/Fee/Promotion 行と二重カウントの恐れ (Codex round 1 指摘)
+             SUM(CASE WHEN quantity_purchased > 0
+                          AND price_type IS NULL
+                          AND item_related_fee_type IS NULL
+                          AND promotion_type IS NULL
+                       THEN quantity_purchased ELSE 0 END) AS qty
       FROM raw_amazon_settlement_lines
       WHERE transaction_type='Order' AND seller_sku_normalized IS NOT NULL
       GROUP BY seller_sku_normalized
@@ -253,7 +259,7 @@ function markProcessed(db, ym, processedAt) {
 }
 
 async function main() {
-  initDB();
+  await initDB();
   const db = getDB();
   db.pragma('busy_timeout = 10000');
 

@@ -127,7 +127,9 @@ async function downloadReport(url) {
 
 function saveAdProduct(db, rows) {
   const ts = nowIso();
-  // fact_ad_spend は SKU と ASIN を別行で保持。spAdvertisedProduct は両方持つので 2 row に展開
+  // fact_ad_spend PK は (日付, モール, キャンペーンID, 広告タイプ, ターゲット, ターゲット粒度)
+  // adGroupId を含まないので、同一 SKU が複数 ad group に載るときは事前合算が必須
+  // (Codex round 1 指摘: 後勝ち UPSERT で広告費が欠損するため)
   const upsert = db.prepare(`
     INSERT INTO fact_ad_spend (
       日付, モール, キャンペーンID, 広告タイプ, ターゲット, ターゲット粒度,
@@ -145,36 +147,51 @@ function saveAdProduct(db, rows) {
       ingested_at = excluded.ingested_at
   `);
 
+  // step 1: ad group 別の行を (date, campaignId, target, granularity) キーで合算
+  const aggregated = new Map();
+  for (const r of rows) {
+    if (!r.date || !r.campaignId) continue;
+    const sku = r.advertisedSku || '';
+    const asin = r.advertisedAsin || '';
+    let target = '', granularity = '';
+    if (sku) {
+      target = String(sku).toLowerCase();
+      granularity = 'sku';
+    } else if (asin) {
+      // SKU 不明だが ASIN だけある場合 (同一行に SKU/ASIN 両方ある場合は SKU 行のみ、重複計上回避)
+      target = String(asin).toLowerCase();
+      granularity = 'asin';
+    } else continue;
+    const key = `${r.date}|${r.campaignId}|${target}|${granularity}`;
+    const cur = aggregated.get(key) || {
+      date: r.date,
+      campaignId: String(r.campaignId),
+      target,
+      granularity,
+      clicks: 0, impressions: 0, cost: 0, sales1d: 0, qty1d: 0,
+    };
+    cur.clicks += r.clicks || 0;
+    cur.impressions += r.impressions || 0;
+    cur.cost += r.cost || 0;
+    cur.sales1d += r.sales1d || 0;
+    cur.qty1d += r.purchases1d || r.unitsSoldClicks1d || 0;
+    aggregated.set(key, cur);
+  }
+
+  // step 2: 合算済を UPSERT
   let n = 0;
-  const tx = db.transaction((arr) => {
-    for (const r of arr) {
-      if (!r.date || !r.campaignId) continue;
-      const sku = r.advertisedSku || '';
-      const asin = r.advertisedAsin || '';
-      if (sku) {
-        upsert.run(
-          r.date, String(r.campaignId), String(sku).toLowerCase(), 'sku',
-          r.clicks || 0, r.impressions || 0, r.cost || 0,
-          r.sales1d || 0,
-          r.purchases1d || r.unitsSoldClicks1d || 0,
-          ts,
-        );
-        n++;
-      }
-      if (asin && !sku) {
-        // SKU 不明だが ASIN だけある場合 (両方ある場合は SKU 行のみ。重複計上回避)
-        upsert.run(
-          r.date, String(r.campaignId), String(asin).toLowerCase(), 'asin',
-          r.clicks || 0, r.impressions || 0, r.cost || 0,
-          r.sales1d || 0,
-          r.purchases1d || r.unitsSoldClicks1d || 0,
-          ts,
-        );
-        n++;
-      }
+  const tx = db.transaction((items) => {
+    for (const a of items) {
+      upsert.run(
+        a.date, a.campaignId, a.target, a.granularity,
+        a.clicks, a.impressions, a.cost,
+        a.sales1d, a.qty1d,
+        ts,
+      );
+      n++;
     }
   });
-  tx(rows);
+  tx(Array.from(aggregated.values()));
   return n;
 }
 
@@ -221,6 +238,7 @@ async function main() {
   console.log(`[AdsProduct] 分割: ${ranges.length}個 (各最大${MAX_WINDOW_DAYS}日)`);
 
   let totalSaved = 0;
+  let failedRanges = 0;
   for (const range of ranges) {
     console.log(`\n--- 期間: ${range.startDate} 〜 ${range.endDate} ---`);
     try {
@@ -229,6 +247,7 @@ async function main() {
       const downloadUrl = completed.url;
       if (!downloadUrl) {
         console.error('[AdsProduct] download URL なし:', JSON.stringify(completed));
+        failedRanges++;
         continue;
       }
       const data = await downloadReport(downloadUrl);
@@ -239,10 +258,11 @@ async function main() {
       console.log(`[AdsProduct] ✅ ${saved}件 投入`);
     } catch (e) {
       console.error(`[AdsProduct] 期間 ${range.startDate}〜${range.endDate} 失敗:`, e.message);
+      failedRanges++;
     }
   }
 
-  console.log(`\n[AdsProduct] 完了: 累計 ${totalSaved}件 投入`);
+  console.log(`\n[AdsProduct] 完了: 累計 ${totalSaved}件 投入 (失敗 ${failedRanges}/${ranges.length} 期間)`);
 
   // 月次サマリ
   const summary = db.prepare(`
@@ -257,6 +277,12 @@ async function main() {
   `).all(args.from, args.to);
   console.log(`[AdsProduct] サマリ:`);
   console.table(summary);
+
+  // 部分失敗があれば exit 1 (daily-sync が失敗扱いにできるよう)
+  if (failedRanges > 0) {
+    console.error(`[AdsProduct] ❌ ${failedRanges}/${ranges.length} 期間が失敗 → 不完全データ`);
+    process.exit(1);
+  }
   process.exit(0);
 }
 
