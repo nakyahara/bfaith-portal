@@ -1418,6 +1418,23 @@ function renderPage() {
     }
 
     // ─── 過去データ ───
+    // /import-history で投入された旧データは {売上, 原価, 件数} の3フィールドしか持たない。
+    // 表示・CSV出力は {売上合計, クーポン値引額, クーポン値引後売上, 原価合計, 行数} を期待するため、
+    // 旧フィールドを正規化（売上=クーポン後売上として扱う／クーポン値引額は不明=0）。
+    function normalizeSegMap(segIn) {
+      const out = {};
+      for (const [k, v] of Object.entries(segIn || {})) {
+        const sale = (v && (v.売上合計 != null)) ? v.売上合計 : (v && v.売上) || 0;
+        const after = (v && (v.クーポン値引後売上 != null)) ? v.クーポン値引後売上 : (v && v.売上) || 0;
+        const cost = (v && (v.原価合計 != null)) ? v.原価合計 : (v && v.原価) || 0;
+        const rowCount = (v && (v.行数 != null)) ? v.行数 : (v && v.件数) || 0;
+        const coupon = (v && v.クーポン値引額) || 0;
+        const grossPct = (v && v.粗利率 != null) ? v.粗利率 : (after > 0 ? ((after - cost) / after * 100).toFixed(1) : '0.0');
+        out[k] = { ...v, 売上合計: sale, クーポン値引額: coupon, クーポン値引後売上: after, 原価合計: cost, 行数: rowCount, 粗利率: grossPct };
+      }
+      return out;
+    }
+
     async function loadHistory() {
       try {
         const r = await fetchWithRetry(location.pathname + '/history', {});
@@ -1429,7 +1446,7 @@ function renderPage() {
         let html = '';
         for (let i = 0; i < rows.length; i++) {
           const row = rows[i];
-          const seg = row.by_segment || {};
+          const seg = normalizeSegMap(row.by_segment || {});
           let hdrSales = 0, hdrAfter = 0;
           for (const sr of Object.values(seg)) { hdrSales += (sr.売上合計 || 0); hdrAfter += (sr.クーポン値引後売上 || 0); }
           const ad = Math.round(row.ad_cost || 0);
@@ -1637,7 +1654,7 @@ function renderPage() {
         }
 
         for (const row of rows) {
-          const seg = row.by_segment || {};
+          const seg = normalizeSegMap(row.by_segment || {});
           const ad = row.ad_cost || 0;
           let tSales = 0;
           const sales = {};
