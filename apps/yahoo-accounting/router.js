@@ -1340,7 +1340,11 @@ function renderPage() {
         taxHtml += '<p class="meta" style="color:#e67e22">注文データに該当がない受取明細 ' + unmatchedOrders + '件 → 10%/自社商品に分類</p>';
       }
       if (emptyIdRowCount > 0) {
-        taxHtml += '<p class="meta" style="color:#e67e22">注文ID空欄の受取行 ' + emptyIdRowCount + '行 → 1件の "注文ID不明" として集約しました（売上・原価への影響なし、件数のみ1）</p>';
+        if (noIdAmount !== 0) {
+          taxHtml += '<p class="meta" style="color:#e67e22">注文ID空欄の受取行 ' + emptyIdRowCount + '行 → 売上 ' + fmt(noIdAmount) + ' を 1件の "注文ID不明" として 10%/自社商品(1) に集約</p>';
+        } else {
+          taxHtml += '<p class="meta" style="color:#e67e22">注文ID空欄の受取行 ' + emptyIdRowCount + '行 → 金額相殺(ネット0)で集計影響なし</p>';
+        }
       }
       document.getElementById('receiptTaxTable').innerHTML = taxHtml;
 
