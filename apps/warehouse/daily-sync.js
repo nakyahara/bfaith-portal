@@ -17,7 +17,8 @@ const PROJECT_DIR = path.resolve(__dirname, '..', '..');
 // retry-failed-jobs.js が読む state ファイル。リトライ対象失敗ジョブをここに記録する
 const RETRY_STATE_FILE = path.join(PROJECT_DIR, 'data', 'daily-sync-retry-state.json');
 // retry-failed-jobs.js でリトライ可能なジョブ (idempotent + 一時的失敗想定)
-const RETRYABLE_JOBS = ['f_sales', '楽天sku_map', 'Render同期'];
+// Amazon Ads / Settlement は SP-API throttle / レポート polling timeout / DL 失敗等の一過性失敗が多いため retry 対象
+const RETRYABLE_JOBS = ['f_sales', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK || 'https://chat.googleapis.com/v1/spaces/AAQAL5zHy-w/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=yER7IJx_9CkKhYnzzre0WcWuqfgXc1oh8ldR35k01zE';
 

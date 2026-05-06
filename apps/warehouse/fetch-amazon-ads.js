@@ -170,11 +170,13 @@ function saveAdProduct(db, rows) {
       granularity,
       clicks: 0, impressions: 0, cost: 0, sales1d: 0, qty1d: 0,
     };
-    cur.clicks += r.clicks || 0;
-    cur.impressions += r.impressions || 0;
-    cur.cost += r.cost || 0;
-    cur.sales1d += r.sales1d || 0;
-    cur.qty1d += r.purchases1d || r.unitsSoldClicks1d || 0;
+    // Number() キャストは Amazon Ads parser が string で返してきた場合の SUM 文字列連結を防ぐ防御
+    cur.clicks += Number(r.clicks) || 0;
+    cur.impressions += Number(r.impressions) || 0;
+    cur.cost += Number(r.cost) || 0;
+    cur.sales1d += Number(r.sales1d) || 0;
+    // qty1d は unitsSoldClicks1d を本命に (purchases1d は trans 件数で意味が違う、Codex round 2 指摘)
+    cur.qty1d += Number(r.unitsSoldClicks1d) || Number(r.purchases1d) || 0;
     aggregated.set(key, cur);
   }
 
