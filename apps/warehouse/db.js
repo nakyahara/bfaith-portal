@@ -1483,6 +1483,15 @@ function createTables() {
       AND v4.year_month_int = v3.year_month_int
   `);
 
+  // ---- m_products trigger 廃止 (差分バッチ record-m-products-history.js に置き換え)
+  // 旧 trigger が残っていると rebuild-m-products.js の DELETE+INSERT 全件で
+  // m_products_history に全件 noise が入るため、initDB で必ず DROP (idempotent)
+  // (Codex round 3 指摘: trigger 削除箇所が record-m-products-history.js 内のみだと
+  //  rebuild-m-products.js → record-m-products-history.js の順では初回 cron で間に合わない)
+  db.exec(`DROP TRIGGER IF EXISTS trg_m_products_after_insert`);
+  db.exec(`DROP TRIGGER IF EXISTS trg_m_products_after_update`);
+  db.exec(`DROP TRIGGER IF EXISTS trg_m_products_after_delete`);
+
   // ---- 監査 view ----
   db.exec(`DROP VIEW IF EXISTS v_settlement_unknown_dims`);
   db.exec(`CREATE VIEW v_settlement_unknown_dims AS
