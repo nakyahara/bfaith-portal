@@ -1247,29 +1247,30 @@ function renderPage() {
       // 受取明細は1注文に複数行（商品売上/送料/ポイント割引/返金 等）出るため、
       // 行ループで原価計上すると 受取行数ぶん 原価が重複計上される。
       // 先に注文ID単位で 金額(税込) を集約し、注文単位で1回だけ原価計算する。
-      // 注文ID空欄行は同一バケットに集約（業務上は同一の "注文ID不明" 入金として扱う、
-      // 件数水増し回避優先。サンプル内で実害ある複数注文混在は実データ上ほぼ発生しない）。
+      // 注文ID空欄行は Map に入れず別変数で扱う（疑似キー衝突回避 + 件数水増し回避）。
       const receiptByOrder = new Map();
+      let noIdAmount = 0;
       let emptyIdRowCount = 0;
       for (const row of receiptData.rows) {
         const amount = row['金額(税込)'] || 0;
         if (amount === 0) continue;
-        const rawOrderId = row.注文ID || '';
-        if (!rawOrderId) emptyIdRowCount++;
-        const orderId = rawOrderId || '__yahoo_no_order_id__';
+        const orderId = row.注文ID || '';
+        if (!orderId) { noIdAmount += amount; emptyIdRowCount++; continue; }
         receiptByOrder.set(orderId, (receiptByOrder.get(orderId) || 0) + amount);
       }
 
       const byTax = { '10': { 売上: 0, 件数: 0 }, '8': { 売上: 0, 件数: 0 } };
       const bySegment = { '1': { 売上: 0, 原価: 0, 件数: 0 }, '2': { 売上: 0, 原価: 0, 件数: 0 }, '3': { 売上: 0, 原価: 0, 件数: 0 }, 'other': { 売上: 0, 原価: 0, 件数: 0 } };
+      // excluded(4=輸出) は「集計から除外」の意図で別管理。segment table 合計 = 国内売上、
+      // 輸出は表の外側に "除外: 4: 輸出（X件）" として明示表示する設計（renderSegmentTableFromReceipt）。
+      // byTax合計件数 = bySegment合計件数 + excluded合計件数 で全体整合は保たれる。
       const excluded = { '4': { 売上: 0, 原価: 0, 件数: 0 } };
       let unmatchedOrders = 0;
 
       // 注文単位でループ（1注文 = 原価1回計上）
       for (const [orderId, amount] of receiptByOrder) {
         if (amount === 0) continue;  // 売上と返金が相殺してネット0になった注文はスキップ
-        // 疑似キーは om に登録されないので必ず unmatched に落ちる (実注文IDとの衝突回避)
-        const orderItems = orderId === '__yahoo_no_order_id__' ? null : om[orderId];
+        const orderItems = om[orderId];
 
         if (orderItems && orderItems.length > 0) {
           // 注文内の最初の商品の税率で判定（1注文=同一税率が基本）
@@ -1311,6 +1312,14 @@ function renderPage() {
           bySegment['1'].件数++;
           unmatchedOrders++;
         }
+      }
+
+      // 注文ID空欄の入金合計を 1件の "注文ID不明" として未突合扱い（売上は合計値、件数+1）
+      if (noIdAmount !== 0) {
+        byTax['10'].売上 += noIdAmount;
+        byTax['10'].件数++;
+        bySegment['1'].売上 += noIdAmount;
+        bySegment['1'].件数++;
       }
 
       // 集計結果を保存（確定時に使う）
