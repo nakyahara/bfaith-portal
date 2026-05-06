@@ -17,7 +17,8 @@ const PROJECT_DIR = path.resolve(__dirname, '..', '..');
 // retry-failed-jobs.js が読む state ファイル。リトライ対象失敗ジョブをここに記録する
 const RETRY_STATE_FILE = path.join(PROJECT_DIR, 'data', 'daily-sync-retry-state.json');
 // retry-failed-jobs.js でリトライ可能なジョブ (idempotent + 一時的失敗想定)
-const RETRYABLE_JOBS = ['f_sales', '楽天sku_map', 'Render同期'];
+// Amazon Ads / Settlement は SP-API throttle / レポート polling timeout / DL 失敗等の一過性失敗が多いため retry 対象
+const RETRYABLE_JOBS = ['f_sales', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK || 'https://chat.googleapis.com/v1/spaces/AAQAL5zHy-w/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=yER7IJx_9CkKhYnzzre0WcWuqfgXc1oh8ldR35k01zE';
 
@@ -134,6 +135,25 @@ async function main() {
   const spResult = runScript('apps/warehouse/sp-api-orders.js', 'Amazon SP-API');
   results.push({ name: 'Amazon', ...spResult });
 
+  // Amazon Settlement Report raw 取得 (Phase 3.1.1)
+  // SP-API getReports で直近 30 日の Settlement を DL → raw_amazon_settlement_lines に append
+  // settlement_refresh_queue へ dirty month 追加 → 後段の mart rebuild が拾う
+  // SP-API throttle + report polling のため最大 30 分余裕
+  const settlementResult = runScript('apps/warehouse/fetch-amazon-settlements.js', 'Amazon Settlement', 1800000);
+  results.push({ name: 'Amazon Settlement', ...settlementResult });
+
+  // Amazon Ads spCampaigns (campaign 全広告費、Phase 3.4)
+  // 直近 30 日。fact_ad_spend_campaign に PK(日付,モール,キャンペーンID,広告タイプ) で UPSERT
+  // Auto-Targeting Campaign の SKU 別漏れ (47%) を補完するための campaign 単位データ
+  const adsCampaignResult = runScript('apps/warehouse/fetch-amazon-ads-campaign.js', 'Amazon Ads (campaign)', 1800000);
+  results.push({ name: 'Amazon Ads (campaign)', ...adsCampaignResult });
+
+  // Amazon Ads spAdvertisedProduct (SKU 別広告費)
+  // 直近 30 日。fact_ad_spend に SKU 別の広告費を UPSERT
+  // v_amazon_sku_profit_actual_v4 view が SKU 別 contribution margin 計算に使う
+  const adsProductResult = runScript('apps/warehouse/fetch-amazon-ads.js', 'Amazon Ads (SKU)', 1800000);
+  results.push({ name: 'Amazon Ads (SKU)', ...adsProductResult });
+
   // FBA 在庫スナップショット (RESTOCK + PLANNING) — daily_snapshots に履歴蓄積
   // 手動 /fetch-reports と lockfile で排他、既に走ってればスキップ (失敗扱いにしない)
   // SP-API レポート polling のため最大 15 分余裕
@@ -169,9 +189,20 @@ async function main() {
   const mProductResult = runScript('apps/warehouse/rebuild-m-products.js', 'm_products 再構築');
   results.push({ name: 'm_products', ...mProductResult });
 
+  // m_products 変更差分を history に記録 (trigger 廃止 → 差分バッチ化)
+  // rebuild-m-products.js の直後に実行 (m_products 確定後の比較)
+  const historyResult = runScript('apps/warehouse/record-m-products-history.js', 'm_products 履歴記録');
+  results.push({ name: 'm_products_history', ...historyResult });
+
   // 販売集計テーブル再構築
   const fSalesResult = runScript('apps/warehouse/rebuild-f-sales.js', 'f_sales 再構築');
   results.push({ name: 'f_sales', ...fSalesResult });
+
+  // Amazon Settlement mart 再構築 (Phase 3.5)
+  // dirty queue から rebuild。Refund qty 推定込みで long+wide 生成。
+  // queue 空なら即終了するので低コスト。
+  const settlementMartResult = runScript('apps/warehouse/rebuild-amazon-settlement-mart.js', 'Settlement mart 再構築', 900000);
+  results.push({ name: 'Settlement mart', ...settlementMartResult });
 
   // 楽天 AM/AL/W → NE商品コード sku_map 再構築 (f_sales と独立)
   const rakutenSkuMapResult = runScript('apps/warehouse/rebuild-rakuten-sku-map.js', '楽天 sku_map 再構築');

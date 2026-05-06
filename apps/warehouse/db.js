@@ -1020,20 +1020,498 @@ function createTables() {
   // 25. ビュー: SKU紐付け＋原価解決
   // raw_ne_products から原価をJOIN。原価NULLは cost_status='cost_missing' で示す
   // exception_genka はレガシー、新規参照しない方針
+  // 25. ビュー: SKU紐付け＋原価解決 (Phase 2.4.6 v2、2026-05-05〜2026-05-06 確立)
+  //   修正点 (旧版から):
+  //     - raw_ne_products → m_products に統一 (原価正本)
+  //     - direct_master fallback 追加: m_products に直接マッチする SKU (Amazon SKU = 商品コード)
+  //     - NOT IN → NOT EXISTS (NULL safe)
+  //   結果: 原価カバー 71.9% → 99.4%
+  db.exec(`DROP VIEW IF EXISTS v_sku_costed`);
   db.exec(`CREATE VIEW v_sku_costed AS
+    WITH resolved AS (
+      SELECT seller_sku, ne_code, 数量, source
+      FROM v_sku_resolved
+    ),
+    cost_master AS (
+      SELECT 商品コード AS product_code, 原価 AS unit_cost
+      FROM m_products
+      WHERE 商品コード IS NOT NULL
+    )
     SELECT
-      v.seller_sku,
-      v.ne_code,
-      v.数量,
-      v.source,
-      p.原価 AS 単価,
+      r.seller_sku,
+      r.ne_code,
+      r.数量,
+      r.source,
+      cm.unit_cost AS 単価,
       CASE
-        WHEN p.商品コード IS NULL THEN 'ne_missing'
-        WHEN p.原価 IS NULL THEN 'cost_missing'
+        WHEN r.ne_code IS NULL THEN 'ne_missing'
+        WHEN cm.product_code IS NULL OR cm.unit_cost IS NULL THEN 'cost_missing'
         ELSE 'ok'
       END AS cost_status
-    FROM v_sku_resolved v
-    LEFT JOIN raw_ne_products p ON v.ne_code = p.商品コード
+    FROM resolved r
+    LEFT JOIN cost_master cm ON cm.product_code = r.ne_code
+
+    UNION ALL
+
+    -- direct_master fallback: 自社内製コード (Amazon SKU = 商品コード)
+    SELECT
+      p.商品コード AS seller_sku,
+      p.商品コード AS ne_code,
+      1 AS 数量,
+      'direct_master' AS source,
+      p.原価 AS 単価,
+      CASE WHEN p.原価 IS NULL THEN 'cost_missing' ELSE 'ok' END AS cost_status
+    FROM m_products p
+    WHERE p.商品コード IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM v_sku_resolved r WHERE r.seller_sku = p.商品コード
+      )
+  `);
+
+  // 31. Phase 3.1.x: Settlement Report 一本化 (2026-05-05〜2026-05-06)
+  // raw / silver / mart 構造、詳細は g:/共有ドライブ/AI_reference/システム設計/売上分析アプリ_Phase3_Settlement_Report移行設計_20260505.md
+  // tables は IF NOT EXISTS、views は DROP + CREATE で常に最新版を強制適用
+
+  // ---- bronze: raw_amazon_settlement_headers / raw_amazon_settlement_lines ----
+  db.exec(`CREATE TABLE IF NOT EXISTS raw_amazon_settlement_headers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    physical_line_hash TEXT NOT NULL UNIQUE,
+    business_line_key  TEXT NOT NULL,
+    source_document_id TEXT NOT NULL,
+    source_file_hash   TEXT,
+    source_path        TEXT,
+    source_line_no     INTEGER,
+    source_layer       TEXT NOT NULL,
+    parser_version     TEXT NOT NULL,
+    source_settlement_id  TEXT NOT NULL,
+    settlement_start_date TEXT,
+    settlement_end_date   TEXT,
+    deposit_date          TEXT,
+    total_amount_micro    INTEGER NOT NULL,
+    currency              TEXT NOT NULL DEFAULT 'JPY',
+    ingest_run_id TEXT, observed_at TEXT, ingested_at TEXT
+  )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_headers_settlement ON raw_amazon_settlement_headers(source_settlement_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_headers_dedup ON raw_amazon_settlement_headers(source_settlement_id, business_line_key, source_layer, ingested_at)`);
+
+  db.exec(`CREATE TABLE IF NOT EXISTS raw_amazon_settlement_lines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    physical_line_hash TEXT NOT NULL UNIQUE,
+    business_line_key  TEXT NOT NULL,
+    source_document_id TEXT NOT NULL,
+    source_file_hash   TEXT,
+    source_path        TEXT,
+    source_line_no     INTEGER,
+    source_layer       TEXT NOT NULL,
+    parser_version     TEXT NOT NULL,
+    source_settlement_id TEXT NOT NULL,
+    posted_date_utc      TEXT NOT NULL,
+    posted_datetime_jst  TEXT NOT NULL,
+    economic_date        TEXT NOT NULL,
+    year_month_int       INTEGER NOT NULL,
+    amazon_order_id        TEXT,
+    merchant_order_id      TEXT,
+    shipment_id            TEXT,
+    order_item_code        TEXT,
+    adjustment_id          TEXT,
+    seller_sku             TEXT,
+    seller_sku_normalized  TEXT,
+    transaction_type   TEXT NOT NULL,
+    marketplace_name   TEXT,
+    fulfillment_id     TEXT,
+    quantity_purchased INTEGER,
+    price_type                       TEXT,
+    price_amount_micro               INTEGER,
+    item_related_fee_type            TEXT,
+    item_related_fee_amount_micro    INTEGER,
+    promotion_id                     TEXT,
+    promotion_type                   TEXT,
+    promotion_amount_micro           INTEGER,
+    shipment_fee_type                TEXT,
+    shipment_fee_amount_micro        INTEGER,
+    order_fee_type                   TEXT,
+    order_fee_amount_micro           INTEGER,
+    misc_fee_amount_micro            INTEGER,
+    other_fee_amount_micro           INTEGER,
+    other_fee_reason_description     TEXT,
+    direct_payment_type              TEXT,
+    direct_payment_amount_micro      INTEGER,
+    other_amount_micro               INTEGER,
+    currency                         TEXT NOT NULL DEFAULT 'JPY',
+    ingest_run_id TEXT, observed_at TEXT, ingested_at TEXT
+  )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_lines_dedup       ON raw_amazon_settlement_lines(source_settlement_id, business_line_key, source_layer, ingested_at)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_lines_month_sku   ON raw_amazon_settlement_lines(year_month_int, seller_sku_normalized)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_lines_economic    ON raw_amazon_settlement_lines(economic_date)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_lines_posted_utc  ON raw_amazon_settlement_lines(posted_date_utc)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_lines_tx_price    ON raw_amazon_settlement_lines(transaction_type, price_type)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_lines_tx_fee      ON raw_amazon_settlement_lines(transaction_type, item_related_fee_type)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_lines_settlement  ON raw_amazon_settlement_lines(source_settlement_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_lines_order       ON raw_amazon_settlement_lines(amazon_order_id)`);
+
+  // ---- dim: 自動 INSERT で蓄積 ----
+  db.exec(`CREATE TABLE IF NOT EXISTS dim_amazon_transaction_type (
+    transaction_type TEXT PRIMARY KEY,
+    group_label TEXT, is_revenue_negative INTEGER, display_order INTEGER, description TEXT,
+    observed_first_at TEXT, observed_last_at TEXT
+  )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS dim_amazon_price_type (
+    price_type TEXT PRIMARY KEY, group_label TEXT,
+    observed_first_at TEXT, observed_last_at TEXT
+  )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS dim_amazon_fee_type (
+    fee_type TEXT PRIMARY KEY, fee_category TEXT, fee_subcategory TEXT,
+    observed_first_at TEXT, observed_last_at TEXT
+  )`);
+
+  // ---- bridge: 販売月リステート用 ----
+  db.exec(`CREATE TABLE IF NOT EXISTS bridge_amazon_order_sale_month (
+    amazon_order_id        TEXT NOT NULL,
+    order_item_code        TEXT NOT NULL,
+    seller_sku_normalized  TEXT NOT NULL,
+    original_year_month    INTEGER NOT NULL,
+    original_economic_date TEXT NOT NULL,
+    original_settlement_id TEXT NOT NULL,
+    ingested_at            TEXT,
+    PRIMARY KEY (amazon_order_id, order_item_code, seller_sku_normalized)
+  ) WITHOUT ROWID`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_bridge_year_month ON bridge_amazon_order_sale_month(original_year_month)`);
+
+  // ---- mart: long fact ----
+  db.exec(`CREATE TABLE IF NOT EXISTS fact_amazon_settlement_monthly_long (
+    year_month_int    INTEGER NOT NULL,
+    seller_sku_normalized TEXT NOT NULL,
+    transaction_type  TEXT NOT NULL,
+    component_family  TEXT NOT NULL,
+    component_type    TEXT NOT NULL,
+    value_micro       INTEGER NOT NULL,
+    row_count         INTEGER NOT NULL,
+    source_layer      TEXT NOT NULL,
+    generated_at      TEXT NOT NULL,
+    PRIMARY KEY (year_month_int, seller_sku_normalized, transaction_type, component_family, component_type, source_layer)
+  ) WITHOUT ROWID`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_long_sku_month ON fact_amazon_settlement_monthly_long(seller_sku_normalized, year_month_int)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_long_tx_family ON fact_amazon_settlement_monthly_long(transaction_type, component_family)`);
+
+  // ---- mart: wide table (主要指標固定、INTEGER micro) ----
+  db.exec(`CREATE TABLE IF NOT EXISTS fact_amazon_settlement_monthly_wide (
+    year_month_int       INTEGER NOT NULL,
+    seller_sku_normalized TEXT NOT NULL,
+    qty_ordered                  INTEGER DEFAULT 0,
+    qty_customer_refunded        INTEGER DEFAULT 0,
+    qty_a_to_z_refund            INTEGER DEFAULT 0,
+    qty_marketplace_guarantee    INTEGER DEFAULT 0,
+    qty_warehouse_damage         INTEGER DEFAULT 0,
+    qty_warehouse_lost           INTEGER DEFAULT 0,
+    qty_reversal_reimbursement   INTEGER DEFAULT 0,
+    qty_removal_completed        INTEGER DEFAULT 0,
+    qty_safe_t                   INTEGER DEFAULT 0,
+    qty_net_sold                 INTEGER DEFAULT 0,
+    sales_principal_micro        INTEGER DEFAULT 0,
+    sales_tax_micro              INTEGER DEFAULT 0,
+    sales_shipping_micro         INTEGER DEFAULT 0,
+    sales_giftwrap_micro         INTEGER DEFAULT 0,
+    refund_principal_micro       INTEGER DEFAULT 0,
+    refund_tax_micro             INTEGER DEFAULT 0,
+    refund_shipping_micro        INTEGER DEFAULT 0,
+    commission_micro             INTEGER DEFAULT 0,
+    fba_fulfillment_micro        INTEGER DEFAULT 0,
+    fba_storage_micro            INTEGER DEFAULT 0,
+    closing_fee_micro            INTEGER DEFAULT 0,
+    shipping_chargeback_micro    INTEGER DEFAULT 0,
+    giftwrap_chargeback_micro    INTEGER DEFAULT 0,
+    promotion_micro              INTEGER DEFAULT 0,
+    warehouse_damage_micro       INTEGER DEFAULT 0,
+    warehouse_lost_micro         INTEGER DEFAULT 0,
+    reversal_reimbursement_micro INTEGER DEFAULT 0,
+    safe_t_micro                 INTEGER DEFAULT 0,
+    fee_adjustment_micro         INTEGER DEFAULT 0,
+    source_layer_summary         TEXT,
+    raw_row_count                INTEGER DEFAULT 0,
+    generated_at                 TEXT NOT NULL,
+    PRIMARY KEY (year_month_int, seller_sku_normalized)
+  ) WITHOUT ROWID`);
+
+  // ---- refresh queue ----
+  db.exec(`CREATE TABLE IF NOT EXISTS settlement_refresh_queue (
+    year_month_int INTEGER PRIMARY KEY,
+    reason         TEXT,
+    enqueued_at    TEXT NOT NULL,
+    processed_at   TEXT
+  )`);
+
+  // ---- Phase 3.4: fact_ad_spend_campaign (spCampaigns 経由、全広告費取得)
+  // 既存 fact_ad_spend (spAdvertisedProduct 経由、SKU 別) は 47% 漏れ (Auto-Targeting unallocated)
+  // 本テーブルで campaign 単位の全広告費を保持、月次集計時に「全 - SKU 別 = unallocated」で導出可
+  db.exec(`CREATE TABLE IF NOT EXISTS fact_ad_spend_campaign (
+    日付          TEXT NOT NULL,
+    モール        TEXT NOT NULL,
+    キャンペーンID TEXT NOT NULL,
+    キャンペーン名 TEXT,
+    広告タイプ    TEXT NOT NULL DEFAULT 'SP',
+    キャンペーンステータス TEXT,
+    クリック数        INTEGER DEFAULT 0,
+    インプレッション  INTEGER DEFAULT 0,
+    広告費            REAL DEFAULT 0,
+    広告経由売上_1d   REAL DEFAULT 0,
+    広告経由売上_7d   REAL DEFAULT 0,
+    広告経由売上_14d  REAL DEFAULT 0,
+    広告経由売上_30d  REAL DEFAULT 0,
+    広告経由数量_1d   INTEGER DEFAULT 0,
+    ingested_at   TEXT NOT NULL,
+    PRIMARY KEY (日付, モール, キャンペーンID, 広告タイプ)
+  )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_fas_campaign_date ON fact_ad_spend_campaign(日付)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_fas_campaign_mall ON fact_ad_spend_campaign(モール, 日付)`);
+
+  // ---- silver view (always recreate) ----
+  db.exec(`DROP VIEW IF EXISTS v_amazon_settlement_unified`);
+  db.exec(`CREATE VIEW v_amazon_settlement_unified AS
+    WITH dedup AS (
+      SELECT
+        l.*,
+        ROW_NUMBER() OVER (
+          PARTITION BY l.source_settlement_id, l.business_line_key
+          ORDER BY CASE l.source_layer
+                     WHEN 'sp_api_v1' THEN 1
+                     WHEN 'manual_csv' THEN 2
+                     ELSE 3
+                   END,
+                   l.ingested_at DESC
+        ) AS rn
+      FROM raw_amazon_settlement_lines l
+    )
+    SELECT
+      d.id, d.physical_line_hash, d.business_line_key,
+      d.source_document_id, d.source_file_hash, d.source_path, d.source_line_no,
+      d.source_layer, d.parser_version, d.source_settlement_id,
+      d.posted_date_utc, d.posted_datetime_jst, d.economic_date, d.year_month_int,
+      d.amazon_order_id, d.merchant_order_id, d.shipment_id, d.order_item_code, d.adjustment_id,
+      d.seller_sku, d.seller_sku_normalized,
+      d.transaction_type, d.marketplace_name, d.fulfillment_id,
+      d.quantity_purchased,
+      d.price_type, d.price_amount_micro,
+      d.item_related_fee_type, d.item_related_fee_amount_micro,
+      d.promotion_id, d.promotion_type, d.promotion_amount_micro,
+      d.shipment_fee_type, d.shipment_fee_amount_micro,
+      d.order_fee_type, d.order_fee_amount_micro,
+      d.misc_fee_amount_micro, d.other_fee_amount_micro, d.other_fee_reason_description,
+      d.direct_payment_type, d.direct_payment_amount_micro, d.other_amount_micro,
+      d.currency, d.ingest_run_id, d.observed_at, d.ingested_at,
+      CASE
+        WHEN d.transaction_type = 'Order' AND d.quantity_purchased IS NOT NULL THEN 'exact'
+        ELSE 'mixed'
+      END AS recognition_basis,
+      'settled' AS settlement_status,
+      d.source_layer AS canonical_source,
+      COALESCE(dt.group_label, 'unknown') AS tx_group_label,
+      COALESCE(dt.is_revenue_negative, 0) AS tx_is_revenue_negative
+    FROM dedup d
+    LEFT JOIN dim_amazon_transaction_type dt ON dt.transaction_type = d.transaction_type
+    WHERE d.rn = 1
+  `);
+
+  // ---- v4 mart view (Phase 3.1.x、符号バグ修正済 + 広告費 + cogs JOIN) ----
+  db.exec(`DROP VIEW IF EXISTS v_amazon_sku_profit_actual_v4`);
+  db.exec(`CREATE VIEW v_amazon_sku_profit_actual_v4 AS
+    WITH cogs_by_sku AS (
+      SELECT
+        seller_sku,
+        SUM(単価 * 数量) AS unit_cogs_excl_tax,
+        MAX(単価) AS one_unit_cost,
+        MAX(数量) AS components_qty
+      FROM v_sku_costed
+      GROUP BY seller_sku
+    )
+    SELECT
+      w.year_month_int,
+      printf('%d-%02d', w.year_month_int / 100, w.year_month_int % 100) AS year_month,
+      w.seller_sku_normalized AS seller_sku,
+      w.qty_ordered, w.qty_customer_refunded, w.qty_marketplace_guarantee, w.qty_a_to_z_refund, w.qty_net_sold,
+      w.sales_principal_micro / 1000000.0 AS sales_principal_jpy,
+      w.sales_tax_micro / 1000000.0 AS sales_tax_jpy,
+      w.commission_micro / 1000000.0 AS commission_jpy,
+      w.fba_fulfillment_micro / 1000000.0 AS fba_fulfillment_jpy,
+      w.fba_storage_micro / 1000000.0 AS fba_storage_jpy,
+      w.closing_fee_micro / 1000000.0 AS closing_fee_jpy,
+      w.shipping_chargeback_micro / 1000000.0 AS shipping_chargeback_jpy,
+      w.giftwrap_chargeback_micro / 1000000.0 AS giftwrap_chargeback_jpy,
+      w.promotion_micro / 1000000.0 AS promotion_jpy,
+      w.warehouse_damage_micro / 1000000.0 AS warehouse_damage_jpy,
+      w.warehouse_lost_micro / 1000000.0 AS warehouse_lost_jpy,
+      w.safe_t_micro / 1000000.0 AS safe_t_jpy,
+      w.refund_principal_micro / 1000000.0 AS refund_principal_jpy,
+      w.reversal_reimbursement_micro / 1000000.0 AS reversal_reimbursement_jpy,
+      COALESCE(ad.ad_cost, 0) AS ad_cost_jpy,
+      COALESCE(ad.ad_attributed_sales, 0) AS ad_attributed_sales_jpy,
+      COALESCE(ad_total.ad_cost_total, 0) AS ad_cost_total_month_jpy,
+      c.one_unit_cost AS unit_cost_excl_tax,
+      c.components_qty AS sku_components_qty,
+      COALESCE(c.unit_cogs_excl_tax * w.qty_ordered, 0) AS cogs_excl_tax,
+      (w.sales_principal_micro / 1000000.0)
+        - COALESCE(c.unit_cogs_excl_tax * w.qty_ordered, 0)
+        + (w.commission_micro / 1000000.0)
+        + (w.fba_fulfillment_micro / 1000000.0)
+        + (w.fba_storage_micro / 1000000.0)
+        + (w.closing_fee_micro / 1000000.0)
+        + (w.shipping_chargeback_micro / 1000000.0)
+        + (w.giftwrap_chargeback_micro / 1000000.0)
+        + (w.promotion_micro / 1000000.0)
+        AS gross_margin_excl_tax,
+      (w.sales_principal_micro / 1000000.0)
+        - COALESCE(c.unit_cogs_excl_tax * w.qty_ordered, 0)
+        + (w.commission_micro / 1000000.0)
+        + (w.fba_fulfillment_micro / 1000000.0)
+        + (w.fba_storage_micro / 1000000.0)
+        + (w.closing_fee_micro / 1000000.0)
+        + (w.shipping_chargeback_micro / 1000000.0)
+        + (w.giftwrap_chargeback_micro / 1000000.0)
+        + (w.promotion_micro / 1000000.0)
+        - COALESCE(ad.ad_cost, 0)
+        AS contribution_margin_excl_tax,
+      (w.sales_principal_micro / 1000000.0)
+        - COALESCE(c.unit_cogs_excl_tax * w.qty_ordered, 0)
+        + (w.commission_micro / 1000000.0)
+        + (w.fba_fulfillment_micro / 1000000.0)
+        + (w.fba_storage_micro / 1000000.0)
+        + (w.closing_fee_micro / 1000000.0)
+        + (w.shipping_chargeback_micro / 1000000.0)
+        + (w.giftwrap_chargeback_micro / 1000000.0)
+        + (w.promotion_micro / 1000000.0)
+        - COALESCE(ad.ad_cost, 0)
+        + (w.warehouse_damage_micro / 1000000.0)
+        + (w.warehouse_lost_micro / 1000000.0)
+        + (w.safe_t_micro / 1000000.0)
+        + (w.refund_principal_micro / 1000000.0)
+        + (w.reversal_reimbursement_micro / 1000000.0)
+        AS settlement_margin_excl_tax,
+      w.source_layer_summary,
+      p.商品名 AS product_name
+    FROM fact_amazon_settlement_monthly_wide w
+    LEFT JOIN cogs_by_sku c ON c.seller_sku = w.seller_sku_normalized
+    LEFT JOIN m_products p ON p.商品コード = w.seller_sku_normalized
+    LEFT JOIN (
+      SELECT
+        CAST(strftime('%Y%m', 日付) AS INTEGER) AS year_month_int,
+        LOWER(ターゲット) AS seller_sku,
+        SUM(広告費) AS ad_cost,
+        SUM(広告経由売上) AS ad_attributed_sales
+      FROM fact_ad_spend
+      WHERE モール = 'amazon' AND ターゲット粒度 IN ('asin', 'sku')
+      GROUP BY year_month_int, LOWER(ターゲット)
+    ) ad ON ad.year_month_int = w.year_month_int AND ad.seller_sku = w.seller_sku_normalized
+    LEFT JOIN (
+      SELECT
+        CAST(strftime('%Y%m', 日付) AS INTEGER) AS year_month_int,
+        SUM(広告費) AS ad_cost_total
+      FROM fact_ad_spend_campaign
+      WHERE モール = 'amazon'
+      GROUP BY year_month_int
+    ) ad_total ON ad_total.year_month_int = w.year_month_int
+  `);
+
+  // ---- Phase 3.4: 月次集計 view ----
+  db.exec(`DROP VIEW IF EXISTS v_amazon_monthly_full_summary`);
+  db.exec(`CREATE VIEW v_amazon_monthly_full_summary AS
+    WITH sku_agg AS (
+      SELECT
+        year_month_int,
+        SUM(qty_ordered) AS total_qty_ordered,
+        SUM(qty_net_sold) AS total_qty_net_sold,
+        SUM(sales_principal_jpy) AS total_sales_jpy,
+        SUM(cogs_excl_tax) AS total_cogs_jpy,
+        SUM(commission_jpy) AS total_commission_jpy,
+        SUM(fba_fulfillment_jpy) AS total_fba_fulfillment_jpy,
+        SUM(promotion_jpy) AS total_promotion_jpy,
+        SUM(gross_margin_excl_tax) AS total_gross_margin_jpy,
+        SUM(ad_cost_jpy) AS total_ad_cost_sku_jpy,
+        SUM(contribution_margin_excl_tax) AS total_contribution_margin_partial_jpy,
+        MAX(ad_cost_total_month_jpy) AS ad_cost_total_campaign_jpy
+      FROM v_amazon_sku_profit_actual_v4
+      GROUP BY year_month_int
+    )
+    SELECT
+      year_month_int,
+      printf('%d-%02d', year_month_int / 100, year_month_int % 100) AS year_month,
+      total_qty_ordered, total_qty_net_sold,
+      total_sales_jpy, total_cogs_jpy,
+      total_commission_jpy, total_fba_fulfillment_jpy, total_promotion_jpy,
+      total_gross_margin_jpy,
+      total_ad_cost_sku_jpy,
+      ad_cost_total_campaign_jpy,
+      (ad_cost_total_campaign_jpy - total_ad_cost_sku_jpy) AS ad_cost_unallocated_jpy,
+      total_contribution_margin_partial_jpy AS contribution_margin_sku_only_jpy,
+      (total_contribution_margin_partial_jpy - (ad_cost_total_campaign_jpy - total_ad_cost_sku_jpy))
+        AS contribution_margin_full_jpy,
+      ROUND(total_gross_margin_jpy * 100.0 / NULLIF(total_sales_jpy, 0), 1) AS gross_margin_pct,
+      ROUND((total_contribution_margin_partial_jpy - (ad_cost_total_campaign_jpy - total_ad_cost_sku_jpy)) * 100.0 / NULLIF(total_sales_jpy, 0), 1) AS contribution_margin_full_pct
+    FROM sku_agg
+  `);
+
+  // ---- 切替判定 view (v3 vs v4) ----
+  db.exec(`DROP VIEW IF EXISTS v_settlement_v3_v4_validation`);
+  db.exec(`CREATE VIEW v_settlement_v3_v4_validation AS
+    WITH v3_monthly AS (
+      SELECT LOWER(TRIM(モール商品コード)) AS seller_sku_normalized,
+             CAST(strftime('%Y%m', 日付) AS INTEGER) AS year_month_int,
+             SUM(数量) AS qty_v3,
+             SUM(原価_税込)/1.1 AS cost_excl_v3,
+             SUM(商品売上)/1.1 AS sales_excl_v3
+      FROM v_amazon_sku_profit_actual
+      GROUP BY LOWER(TRIM(モール商品コード)), year_month_int
+    ),
+    v4_monthly AS (
+      SELECT seller_sku_normalized, year_month_int,
+             qty_net_sold AS qty_v4,
+             (sales_principal_micro / 1000000.0) AS sales_v4
+      FROM fact_amazon_settlement_monthly_wide
+    )
+    SELECT
+      COALESCE(v4.year_month_int, v3.year_month_int) AS year_month_int,
+      COALESCE(v4.seller_sku_normalized, v3.seller_sku_normalized) AS seller_sku_normalized,
+      v3.qty_v3, v4.qty_v4,
+      COALESCE(v4.qty_v4, 0) - COALESCE(v3.qty_v3, 0) AS qty_delta,
+      v3.sales_excl_v3, v4.sales_v4,
+      COALESCE(v4.sales_v4, 0) - COALESCE(v3.sales_excl_v3, 0) AS sales_delta,
+      CASE
+        WHEN ABS(COALESCE(v4.qty_v4, 0) - COALESCE(v3.qty_v3, 0)) <= MAX(1, CAST(ABS(COALESCE(v3.qty_v3, 0)) * 0.001 AS INTEGER))
+        THEN 1 ELSE 0
+      END AS qty_validated_flag
+    FROM v4_monthly v4
+    LEFT JOIN v3_monthly v3
+      ON v4.seller_sku_normalized = v3.seller_sku_normalized
+      AND v4.year_month_int = v3.year_month_int
+  `);
+
+  // ---- m_products trigger 廃止 (差分バッチ record-m-products-history.js に置き換え)
+  // 旧 trigger が残っていると rebuild-m-products.js の DELETE+INSERT 全件で
+  // m_products_history に全件 noise が入るため、initDB で必ず DROP (idempotent)
+  // (Codex round 3 指摘: trigger 削除箇所が record-m-products-history.js 内のみだと
+  //  rebuild-m-products.js → record-m-products-history.js の順では初回 cron で間に合わない)
+  db.exec(`DROP TRIGGER IF EXISTS trg_m_products_after_insert`);
+  db.exec(`DROP TRIGGER IF EXISTS trg_m_products_after_update`);
+  db.exec(`DROP TRIGGER IF EXISTS trg_m_products_after_delete`);
+
+  // ---- 監査 view ----
+  db.exec(`DROP VIEW IF EXISTS v_settlement_unknown_dims`);
+  db.exec(`CREATE VIEW v_settlement_unknown_dims AS
+    SELECT 'transaction_type' AS dim_name, l.transaction_type AS dim_value, COUNT(*) AS row_count
+    FROM raw_amazon_settlement_lines l
+    LEFT JOIN dim_amazon_transaction_type d ON d.transaction_type = l.transaction_type
+    WHERE d.group_label IS NULL OR d.transaction_type IS NULL
+    GROUP BY l.transaction_type
+    UNION ALL
+    SELECT 'price_type', l.price_type, COUNT(*)
+    FROM raw_amazon_settlement_lines l
+    LEFT JOIN dim_amazon_price_type d ON d.price_type = l.price_type
+    WHERE l.price_type IS NOT NULL AND (d.group_label IS NULL OR d.price_type IS NULL)
+    GROUP BY l.price_type
+    UNION ALL
+    SELECT 'fee_type', l.item_related_fee_type, COUNT(*)
+    FROM raw_amazon_settlement_lines l
+    LEFT JOIN dim_amazon_fee_type d ON d.fee_type = l.item_related_fee_type
+    WHERE l.item_related_fee_type IS NOT NULL AND (d.fee_category IS NULL OR d.fee_type IS NULL)
+    GROUP BY l.item_related_fee_type
   `);
 }
 
