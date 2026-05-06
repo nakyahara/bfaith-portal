@@ -1247,11 +1247,13 @@ function renderPage() {
       // 受取明細は1注文に複数行（商品売上/送料/ポイント割引/返金 等）出るため、
       // 行ループで原価計上すると 受取行数ぶん 原価が重複計上される。
       // 先に注文ID単位で 金額(税込) を集約し、注文単位で1回だけ原価計算する。
+      // 注文ID空欄行は個別注文として扱う（誤マージ防止のため一意キーを付与）。
       const receiptByOrder = new Map();
+      let emptyIdSeq = 0;
       for (const row of receiptData.rows) {
         const amount = row['金額(税込)'] || 0;
         if (amount === 0) continue;
-        const orderId = row.注文ID || '';
+        const orderId = row.注文ID || ('__no_id_' + (emptyIdSeq++));
         receiptByOrder.set(orderId, (receiptByOrder.get(orderId) || 0) + amount);
       }
 
@@ -1272,23 +1274,22 @@ function renderPage() {
           byTax[taxKey].売上 += amount;
           byTax[taxKey].件数++;
 
-          // セグメント: 注文内商品の売上按分でセグメント別に振り分け
+          // セグメント:
+          //   売上 = 受取金額(税込)を商品の売上比で按分 (受取は税込・按分後)
+          //   原価 = 各商品の (原価 × 個数) を該当セグメントに直接加算 (按分しない)
+          //   件数 = 注文がそのセグメントに触れた回数 (1注文1セグメントなら 1)
           const totalOrderSales = orderItems.reduce((s, i) => s + (i.売上合計 || 0), 0);
+          const segmentsTouched = new Set();
           for (const oi of orderItems) {
             const ratio = totalOrderSales > 0 ? (oi.売上合計 || 0) / totalOrderSales : 1 / orderItems.length;
             const segKey = oi.売上分類 ? String(oi.売上分類) : 'other';
             const segAmount = amount * ratio;
-            const genka = (oi.原価 || 0) * (oi.個数 || 1) * ratio;
-            if (excluded[segKey]) {
-              excluded[segKey].売上 += segAmount;
-              excluded[segKey].原価 += genka;
-              excluded[segKey].件数++;
-            } else {
-              const target = bySegment[segKey] || bySegment['other'];
-              target.売上 += segAmount;
-              target.原価 += genka;
-              target.件数++;
-            }
+            const genka = (oi.原価 || 0) * (oi.個数 || 1);  // ratio をかけない (按分すると複数商品注文で過小計上)
+            const target = excluded[segKey] || bySegment[segKey] || bySegment['other'];
+            const countKey = excluded[segKey] ? ('exc:' + segKey) : (bySegment[segKey] ? ('seg:' + segKey) : 'seg:other');
+            target.売上 += segAmount;
+            target.原価 += genka;
+            if (!segmentsTouched.has(countKey)) { target.件数++; segmentsTouched.add(countKey); }
           }
         } else {
           // NE_Items_Proに該当注文なし → 10%/自社商品(1)に分類
