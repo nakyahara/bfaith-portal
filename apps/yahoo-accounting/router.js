@@ -1247,13 +1247,16 @@ function renderPage() {
       // 受取明細は1注文に複数行（商品売上/送料/ポイント割引/返金 等）出るため、
       // 行ループで原価計上すると 受取行数ぶん 原価が重複計上される。
       // 先に注文ID単位で 金額(税込) を集約し、注文単位で1回だけ原価計算する。
-      // 注文ID空欄行は個別注文として扱う（誤マージ防止のため一意キーを付与）。
+      // 注文ID空欄行は同一バケットに集約（業務上は同一の "注文ID不明" 入金として扱う、
+      // 件数水増し回避優先。サンプル内で実害ある複数注文混在は実データ上ほぼ発生しない）。
       const receiptByOrder = new Map();
-      let emptyIdSeq = 0;
+      let emptyIdRowCount = 0;
       for (const row of receiptData.rows) {
         const amount = row['金額(税込)'] || 0;
         if (amount === 0) continue;
-        const orderId = row.注文ID || ('__no_id_' + (emptyIdSeq++));
+        const rawOrderId = row.注文ID || '';
+        if (!rawOrderId) emptyIdRowCount++;
+        const orderId = rawOrderId || '__yahoo_no_order_id__';
         receiptByOrder.set(orderId, (receiptByOrder.get(orderId) || 0) + amount);
       }
 
@@ -1265,7 +1268,8 @@ function renderPage() {
       // 注文単位でループ（1注文 = 原価1回計上）
       for (const [orderId, amount] of receiptByOrder) {
         if (amount === 0) continue;  // 売上と返金が相殺してネット0になった注文はスキップ
-        const orderItems = om[orderId];
+        // 疑似キーは om に登録されないので必ず unmatched に落ちる (実注文IDとの衝突回避)
+        const orderItems = orderId === '__yahoo_no_order_id__' ? null : om[orderId];
 
         if (orderItems && orderItems.length > 0) {
           // 注文内の最初の商品の税率で判定（1注文=同一税率が基本）
@@ -1277,19 +1281,27 @@ function renderPage() {
           // セグメント:
           //   売上 = 受取金額(税込)を商品の売上比で按分 (受取は税込・按分後)
           //   原価 = 各商品の (原価 × 個数) を該当セグメントに直接加算 (按分しない)
-          //   件数 = 注文がそのセグメントに触れた回数 (1注文1セグメントなら 1)
+          //   件数 = 1注文1件(byTaxと整合)。注文の主セグメント(売上最大)に1回だけ計上
           const totalOrderSales = orderItems.reduce((s, i) => s + (i.売上合計 || 0), 0);
-          const segmentsTouched = new Set();
+          // 主セグメント決定: 売上合計が最大の商品の売上分類。同点は最初に出てきた方
+          let primarySegKey = null;
+          let primarySegSales = -Infinity;
+          for (const oi of orderItems) {
+            const segKey = oi.売上分類 ? String(oi.売上分類) : 'other';
+            const oiSales = oi.売上合計 || 0;
+            if (oiSales > primarySegSales) { primarySegSales = oiSales; primarySegKey = segKey; }
+          }
+          let primaryCounted = false;
           for (const oi of orderItems) {
             const ratio = totalOrderSales > 0 ? (oi.売上合計 || 0) / totalOrderSales : 1 / orderItems.length;
             const segKey = oi.売上分類 ? String(oi.売上分類) : 'other';
             const segAmount = amount * ratio;
             const genka = (oi.原価 || 0) * (oi.個数 || 1);  // ratio をかけない (按分すると複数商品注文で過小計上)
             const target = excluded[segKey] || bySegment[segKey] || bySegment['other'];
-            const countKey = excluded[segKey] ? ('exc:' + segKey) : (bySegment[segKey] ? ('seg:' + segKey) : 'seg:other');
             target.売上 += segAmount;
             target.原価 += genka;
-            if (!segmentsTouched.has(countKey)) { target.件数++; segmentsTouched.add(countKey); }
+            // 1注文1件: 主セグメントの最初の出現でだけインクリメント
+            if (!primaryCounted && segKey === primarySegKey) { target.件数++; primaryCounted = true; }
           }
         } else {
           // NE_Items_Proに該当注文なし → 10%/自社商品(1)に分類
@@ -1317,6 +1329,9 @@ function renderPage() {
       taxHtml += '</table>';
       if (unmatchedOrders > 0) {
         taxHtml += '<p class="meta" style="color:#e67e22">注文データに該当がない受取明細 ' + unmatchedOrders + '件 → 10%/自社商品に分類</p>';
+      }
+      if (emptyIdRowCount > 0) {
+        taxHtml += '<p class="meta" style="color:#e67e22">注文ID空欄の受取行 ' + emptyIdRowCount + '行 → 1件の "注文ID不明" として集約しました（売上・原価への影響なし、件数のみ1）</p>';
       }
       document.getElementById('receiptTaxTable').innerHTML = taxHtml;
 
