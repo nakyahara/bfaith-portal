@@ -1240,6 +1240,30 @@ function createTables() {
     processed_at   TEXT
   )`);
 
+  // ---- Phase 3.4: fact_ad_spend_campaign (spCampaigns 経由、全広告費取得)
+  // 既存 fact_ad_spend (spAdvertisedProduct 経由、SKU 別) は 47% 漏れ (Auto-Targeting unallocated)
+  // 本テーブルで campaign 単位の全広告費を保持、月次集計時に「全 - SKU 別 = unallocated」で導出可
+  db.exec(`CREATE TABLE IF NOT EXISTS fact_ad_spend_campaign (
+    日付          TEXT NOT NULL,
+    モール        TEXT NOT NULL,
+    キャンペーンID TEXT NOT NULL,
+    キャンペーン名 TEXT,
+    広告タイプ    TEXT NOT NULL DEFAULT 'SP',
+    キャンペーンステータス TEXT,
+    クリック数        INTEGER DEFAULT 0,
+    インプレッション  INTEGER DEFAULT 0,
+    広告費            REAL DEFAULT 0,
+    広告経由売上_1d   REAL DEFAULT 0,
+    広告経由売上_7d   REAL DEFAULT 0,
+    広告経由売上_14d  REAL DEFAULT 0,
+    広告経由売上_30d  REAL DEFAULT 0,
+    広告経由数量_1d   INTEGER DEFAULT 0,
+    ingested_at   TEXT NOT NULL,
+    PRIMARY KEY (日付, モール, キャンペーンID, 広告タイプ)
+  )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_fas_campaign_date ON fact_ad_spend_campaign(日付)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_fas_campaign_mall ON fact_ad_spend_campaign(モール, 日付)`);
+
   // ---- silver view (always recreate) ----
   db.exec(`DROP VIEW IF EXISTS v_amazon_settlement_unified`);
   db.exec(`CREATE VIEW v_amazon_settlement_unified AS
@@ -1324,6 +1348,9 @@ function createTables() {
       w.reversal_reimbursement_micro / 1000000.0 AS reversal_reimbursement_jpy,
       COALESCE(ad.ad_cost, 0) AS ad_cost_jpy,
       COALESCE(ad.ad_attributed_sales, 0) AS ad_attributed_sales_jpy,
+      -- Phase 3.4: campaign 全広告費 (月次合計、全 SKU 共通の参考表示)
+      -- 月次集計時に MAX(ad_cost_total_month_jpy) - SUM(ad_cost_jpy) = unallocated で導出
+      COALESCE(ad_total.ad_cost_total, 0) AS ad_cost_total_month_jpy,
       c.one_unit_cost AS unit_cost_excl_tax,
       c.components_qty AS sku_components_qty,
       COALESCE(c.unit_cogs_excl_tax * w.qty_ordered, 0) AS cogs_excl_tax,
@@ -1383,6 +1410,55 @@ function createTables() {
       WHERE モール = 'amazon' AND ターゲット粒度 IN ('asin', 'sku')
       GROUP BY year_month_int, LOWER(ターゲット)
     ) ad ON ad.year_month_int = w.year_month_int AND ad.seller_sku = w.seller_sku_normalized
+    -- Phase 3.4: campaign 全広告費 月次合計 (全 SKU 共通)
+    LEFT JOIN (
+      SELECT
+        CAST(strftime('%Y%m', 日付) AS INTEGER) AS year_month_int,
+        SUM(広告費) AS ad_cost_total
+      FROM fact_ad_spend_campaign
+      WHERE モール = 'amazon'
+      GROUP BY year_month_int
+    ) ad_total ON ad_total.year_month_int = w.year_month_int
+  `);
+
+  // ---- Phase 3.4: 月次集計 view (campaign 全広告費 + unallocated 反映) ----
+  // SKU 別 ad_cost (spAdvertisedProduct 由来) と campaign 全広告費 (spCampaigns 由来) を月次で統合
+  // unallocated = campaign 全 - SKU 別合計 (Auto-Targeting 等の分配漏れ)
+  db.exec(`DROP VIEW IF EXISTS v_amazon_monthly_full_summary`);
+  db.exec(`CREATE VIEW v_amazon_monthly_full_summary AS
+    WITH sku_agg AS (
+      SELECT
+        year_month_int,
+        SUM(qty_ordered) AS total_qty_ordered,
+        SUM(qty_net_sold) AS total_qty_net_sold,
+        SUM(sales_principal_jpy) AS total_sales_jpy,
+        SUM(cogs_excl_tax) AS total_cogs_jpy,
+        SUM(commission_jpy) AS total_commission_jpy,
+        SUM(fba_fulfillment_jpy) AS total_fba_fulfillment_jpy,
+        SUM(promotion_jpy) AS total_promotion_jpy,
+        SUM(gross_margin_excl_tax) AS total_gross_margin_jpy,
+        SUM(ad_cost_jpy) AS total_ad_cost_sku_jpy,
+        SUM(contribution_margin_excl_tax) AS total_contribution_margin_partial_jpy,
+        MAX(ad_cost_total_month_jpy) AS ad_cost_total_campaign_jpy
+      FROM v_amazon_sku_profit_actual_v4
+      GROUP BY year_month_int
+    )
+    SELECT
+      year_month_int,
+      printf('%d-%02d', year_month_int / 100, year_month_int % 100) AS year_month,
+      total_qty_ordered, total_qty_net_sold,
+      total_sales_jpy, total_cogs_jpy,
+      total_commission_jpy, total_fba_fulfillment_jpy, total_promotion_jpy,
+      total_gross_margin_jpy,
+      total_ad_cost_sku_jpy,
+      ad_cost_total_campaign_jpy,
+      (ad_cost_total_campaign_jpy - total_ad_cost_sku_jpy) AS ad_cost_unallocated_jpy,
+      total_contribution_margin_partial_jpy AS contribution_margin_sku_only_jpy,
+      (total_contribution_margin_partial_jpy - (ad_cost_total_campaign_jpy - total_ad_cost_sku_jpy))
+        AS contribution_margin_full_jpy,
+      ROUND(total_gross_margin_jpy * 100.0 / NULLIF(total_sales_jpy, 0), 1) AS gross_margin_pct,
+      ROUND((total_contribution_margin_partial_jpy - (ad_cost_total_campaign_jpy - total_ad_cost_sku_jpy)) * 100.0 / NULLIF(total_sales_jpy, 0), 1) AS contribution_margin_full_pct
+    FROM sku_agg
   `);
 
   // ---- 切替判定 view (v3 vs v4 4条件 SQL レベル) ----
