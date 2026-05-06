@@ -1244,17 +1244,25 @@ function renderPage() {
       if (!receiptData || !lastData || !lastData.orderMap) return;
       const om = lastData.orderMap;
 
-      // 受取明細の入金行をフィルタし、注文IDでNE_Items_Proと紐付けて集計
+      // 受取明細は1注文に複数行（商品売上/送料/ポイント割引/返金 等）出るため、
+      // 行ループで原価計上すると 受取行数ぶん 原価が重複計上される。
+      // 先に注文ID単位で 金額(税込) を集約し、注文単位で1回だけ原価計算する。
+      const receiptByOrder = new Map();
+      for (const row of receiptData.rows) {
+        const amount = row['金額(税込)'] || 0;
+        if (amount === 0) continue;
+        const orderId = row.注文ID || '';
+        receiptByOrder.set(orderId, (receiptByOrder.get(orderId) || 0) + amount);
+      }
+
       const byTax = { '10': { 売上: 0, 件数: 0 }, '8': { 売上: 0, 件数: 0 } };
       const bySegment = { '1': { 売上: 0, 原価: 0, 件数: 0 }, '2': { 売上: 0, 原価: 0, 件数: 0 }, '3': { 売上: 0, 原価: 0, 件数: 0 }, 'other': { 売上: 0, 原価: 0, 件数: 0 } };
       const excluded = { '4': { 売上: 0, 原価: 0, 件数: 0 } };
       let unmatchedOrders = 0;
 
-      for (const row of receiptData.rows) {
-        const amount = row['金額(税込)'] || 0;
-        if (amount === 0) continue;
-
-        const orderId = row.注文ID || '';
+      // 注文単位でループ（1注文 = 原価1回計上）
+      for (const [orderId, amount] of receiptByOrder) {
+        if (amount === 0) continue;  // 売上と返金が相殺してネット0になった注文はスキップ
         const orderItems = om[orderId];
 
         if (orderItems && orderItems.length > 0) {
