@@ -1329,6 +1329,8 @@ function createTables() {
       w.seller_sku_normalized AS seller_sku,
       w.qty_ordered, w.qty_customer_refunded, w.qty_marketplace_guarantee, w.qty_a_to_z_refund, w.qty_net_sold,
       w.sales_principal_micro / 1000000.0 AS sales_principal_jpy,
+      w.sales_shipping_micro / 1000000.0 AS sales_shipping_jpy,
+      w.sales_giftwrap_micro / 1000000.0 AS sales_giftwrap_jpy,
       w.sales_tax_micro / 1000000.0 AS sales_tax_jpy,
       w.commission_micro / 1000000.0 AS commission_jpy,
       w.fba_fulfillment_micro / 1000000.0 AS fba_fulfillment_jpy,
@@ -1348,7 +1350,11 @@ function createTables() {
       c.one_unit_cost AS unit_cost_excl_tax,
       c.components_qty AS sku_components_qty,
       COALESCE(c.unit_cogs_excl_tax * w.qty_ordered, 0) AS cogs_excl_tax,
+      -- 真の売上 = sales_principal + sales_shipping (買い手送料収入) + sales_giftwrap (ギフト料金収入)
+      -- 中原さん 2026-05-07 指摘: 配送料・ギフト包装手数料は seller の収入なので売上に含める
       (w.sales_principal_micro / 1000000.0)
+        + (w.sales_shipping_micro / 1000000.0)
+        + (w.sales_giftwrap_micro / 1000000.0)
         - COALESCE(c.unit_cogs_excl_tax * w.qty_ordered, 0)
         + (w.commission_micro / 1000000.0)
         + (w.fba_fulfillment_micro / 1000000.0)
@@ -1359,6 +1365,8 @@ function createTables() {
         + (w.promotion_micro / 1000000.0)
         AS gross_margin_excl_tax,
       (w.sales_principal_micro / 1000000.0)
+        + (w.sales_shipping_micro / 1000000.0)
+        + (w.sales_giftwrap_micro / 1000000.0)
         - COALESCE(c.unit_cogs_excl_tax * w.qty_ordered, 0)
         + (w.commission_micro / 1000000.0)
         + (w.fba_fulfillment_micro / 1000000.0)
@@ -1370,6 +1378,8 @@ function createTables() {
         - COALESCE(ad.ad_cost, 0)
         AS contribution_margin_excl_tax,
       (w.sales_principal_micro / 1000000.0)
+        + (w.sales_shipping_micro / 1000000.0)
+        + (w.sales_giftwrap_micro / 1000000.0)
         - COALESCE(c.unit_cogs_excl_tax * w.qty_ordered, 0)
         + (w.commission_micro / 1000000.0)
         + (w.fba_fulfillment_micro / 1000000.0)
@@ -1418,7 +1428,10 @@ function createTables() {
         year_month_int,
         SUM(qty_ordered) AS total_qty_ordered,
         SUM(qty_net_sold) AS total_qty_net_sold,
-        SUM(sales_principal_jpy) AS total_sales_jpy,
+        SUM(sales_principal_jpy + COALESCE(sales_shipping_jpy, 0) + COALESCE(sales_giftwrap_jpy, 0)) AS total_sales_jpy,
+        SUM(sales_principal_jpy) AS total_sales_principal_only_jpy,
+        SUM(COALESCE(sales_shipping_jpy, 0)) AS total_sales_shipping_jpy,
+        SUM(COALESCE(sales_giftwrap_jpy, 0)) AS total_sales_giftwrap_jpy,
         SUM(cogs_excl_tax) AS total_cogs_jpy,
         SUM(commission_jpy) AS total_commission_jpy,
         SUM(fba_fulfillment_jpy) AS total_fba_fulfillment_jpy,
