@@ -6,7 +6,7 @@
  * 結果をGoogle Chatに通知する。
  */
 import 'dotenv/config';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -35,15 +35,23 @@ async function notify(text) {
 }
 
 function runScript(scriptPath, label, timeoutMs = 600000) {
-  const parts = scriptPath.split(' ');
+  const parts = scriptPath.split(' ').filter(Boolean);
   const filePath = path.join(PROJECT_DIR, parts[0]);
-  const args = parts.slice(1).join(' ') || '7';
+  const scriptArgs = parts.slice(1);
+  // 旧仕様互換: 引数なしなら '7' を強制 (一部スクリプトが days 指定として受け取る)
+  if (scriptArgs.length === 0) scriptArgs.push('7');
   console.log(`\n=== ${label} ===`);
   try {
-    const output = execSync(`node "${filePath}" ${args}`, {
+    // execFileSync(node, [...]) で直接 node を起動 (cmd.exe を経由しない)
+    // → timeout 時に確実に node 本体が SIGTERM で殺される
+    // (Codex 朝レビュー指摘: execSync("node ...") は Windows で cmd.exe 経由となり、
+    //  shell だけ殺されて孫の node.exe が残り SQLite WAL lock が残存する事故あり)
+    const output = execFileSync(process.execPath, [filePath, ...scriptArgs], {
       cwd: PROJECT_DIR,
       timeout: timeoutMs,
       encoding: 'utf-8',
+      shell: false,
+      windowsHide: true,
       env: {
         ...process.env,
         PATH: process.env.PATH,
@@ -51,9 +59,10 @@ function runScript(scriptPath, label, timeoutMs = 600000) {
         // db.js の initDB() がこの env を参照する。
         WAREHOUSE_DB_BUSY_TIMEOUT_MS: process.env.WAREHOUSE_DB_BUSY_TIMEOUT_MS || '60000',
       },
+      // 大きな stdout でも握りつぶさず確保 (デフォルト 1MB は settlement で超える)
+      maxBuffer: 64 * 1024 * 1024,
     });
     console.log(output);
-    // 最後の行から結果を抽出
     const lines = output.trim().split('\n');
     const lastLine = lines[lines.length - 1] || '';
     return { success: true, summary: lastLine };
@@ -136,10 +145,11 @@ async function main() {
   results.push({ name: 'Amazon', ...spResult });
 
   // Amazon Settlement Report raw 取得 (Phase 3.1.1)
-  // SP-API getReports で直近 30 日の Settlement を DL → raw_amazon_settlement_lines に append
+  // SP-API getReports で直近 14 日の Settlement を DL → raw_amazon_settlement_lines に append
   // settlement_refresh_queue へ dirty month 追加 → 後段の mart rebuild が拾う
-  // SP-API throttle + report polling のため最大 30 分余裕
-  const settlementResult = runScript('apps/warehouse/fetch-amazon-settlements.js', 'Amazon Settlement', 1800000);
+  // 14日 = 1〜2 settlements、日次の差分捕捉に十分。timeout は 60 分余裕
+  // (2026-05-07 朝の cron で --days 30 default + 30分 timeout で ETIMEDOUT、過去 90 日分は手動 fetch 済)
+  const settlementResult = runScript('apps/warehouse/fetch-amazon-settlements.js --days 14', 'Amazon Settlement', 3600000);
   results.push({ name: 'Amazon Settlement', ...settlementResult });
 
   // Amazon Ads spCampaigns (campaign 全広告費、Phase 3.4)
