@@ -19,7 +19,7 @@ import * as rdb from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const RAKUTEN_API_BASE = 'https://openapi.rakuten.co.jp/ichibams/api/IchibaItem/Search/20220601';
+const RAKUTEN_API_BASE = 'https://openapi.rakuten.co.jp/ichibams/api/IchibaItem/Search/20260401';
 const YAHOO_API_BASE = 'https://shopping.yahooapis.jp/ShoppingWebService/V3/itemSearch';
 const AMAZON_HOST = 'webservices.amazon.co.jp';
 const AMAZON_REGION = 'us-west-2';
