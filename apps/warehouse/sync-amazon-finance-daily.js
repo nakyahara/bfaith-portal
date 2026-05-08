@@ -130,8 +130,11 @@ if (rows.length === 0) {
 const distinctDates = [...new Set(rows.map(r => r.date_jst))].sort();
 console.log(`  Distinct dates: ${distinctDates.length} (${distinctDates[0]} 〜 ${distinctDates[distinctDates.length - 1]})`);
 
-// run_id 生成
-const runId = `${ENTITY_NAME}-v${CONTRACT_VERSION}-${new Date().toISOString().replace(/[:.]/g, '').slice(0, 15)}`;
+// run_id 生成 (ISO timestamp の HH:MM のみだと同分内 sync で PK 衝突するため、
+// 秒 + ms + 乱数 6 hex 桁を付加して完全に一意化)
+const tsCompact = new Date().toISOString().replace(/[:.]/g, '').replace('Z', '');
+const runIdSalt = crypto.randomBytes(3).toString('hex');
+const runId = `${ENTITY_NAME}-v${CONTRACT_VERSION}-${tsCompact}-${runIdSalt}`;
 console.log(`  run_id: ${runId}`);
 
 // payload に source_run_id / source_row_hash / synced_at を付与
