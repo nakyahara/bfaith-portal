@@ -385,12 +385,21 @@ const ENTITY_CONTRACT_VERSION = {
   amazon_finance_sku_daily: 1,
 };
 
-// Insert/ledger statement キャッシュ (一度作って使い回す)
-let _amazonFinanceInsertStmt = null;
-let _ledgerInsertStmt = null;
+// Insert/ledger statement キャッシュ (DB 接続単位、Codex Round 13 #2)
+// モジュール変数だと DB 切替時に古い connection の statement を再利用してしまうため WeakMap
+const _stmtCache = new WeakMap();  // db => { amazonFinanceInsert, ledgerInsert }
+function getStmtBundle(db) {
+  let bundle = _stmtCache.get(db);
+  if (!bundle) {
+    bundle = {};
+    _stmtCache.set(db, bundle);
+  }
+  return bundle;
+}
 function getAmazonFinanceInsert(db) {
-  if (!_amazonFinanceInsertStmt) {
-    _amazonFinanceInsertStmt = db.prepare(`
+  const b = getStmtBundle(db);
+  if (!b.amazonFinanceInsert) {
+    b.amazonFinanceInsert = db.prepare(`
       INSERT OR REPLACE INTO mirror_amazon_finance_sku_daily (
         date_jst, seller_sku, asin_norm, product_name,
         units_ordered, units_refunded_customer, units_marketplace_guarantee,
@@ -420,18 +429,19 @@ function getAmazonFinanceInsert(db) {
       )
     `);
   }
-  return _amazonFinanceInsertStmt;
+  return b.amazonFinanceInsert;
 }
 function getLedgerInsert(db) {
-  if (!_ledgerInsertStmt) {
-    _ledgerInsertStmt = db.prepare(`
+  const b = getStmtBundle(db);
+  if (!b.ledgerInsert) {
+    b.ledgerInsert = db.prepare(`
       INSERT INTO sync_run_chunks
         (run_id, entity, chunk_index, chunk_count, row_count, payload_checksum,
          contract_version, scope_from, scope_to, received_at, applied_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
   }
-  return _ledgerInsertStmt;
+  return b.ledgerInsert;
 }
 
 // HttpError: tx 内から throw して outer catch で http response に変換

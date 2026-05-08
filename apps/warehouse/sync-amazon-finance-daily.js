@@ -236,6 +236,20 @@ import('node:os').then(async (os) => {
       });
       if (!res.ok) {
         const text = await res.text();
+        // 409 incomplete (is_last 受信後の欠番検出) は当該 chunk 自体は DB 反映済みなので
+        // partial 計上に含める (Codex Round 13 #1)
+        if (res.status === 409 && isLast) {
+          try {
+            const j = JSON.parse(text);
+            if (j.status === 'incomplete' && Number.isInteger(j.chunks_received)) {
+              chunksApplied = j.chunks_received;
+              totalRowsSent = Number.isInteger(j.rows_received) ? j.rows_received : totalRowsSent + chunk.length;
+              lastError = `HTTP 409 incomplete: missing_chunks=${JSON.stringify(j.missing_chunks)} chunks_received=${j.chunks_received}/${chunks.length}`;
+              console.error(`  ✗ chunk ${i} accepted but run incomplete: ${lastError}`);
+              break;
+            }
+          } catch { /* fallthrough */ }
+        }
         lastError = `HTTP ${res.status}: ${text.slice(0, 300)}`;
         console.error(`  ✗ chunk ${i} failed: ${lastError}`);
         break;
