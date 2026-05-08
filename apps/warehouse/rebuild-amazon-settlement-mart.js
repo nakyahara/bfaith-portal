@@ -119,7 +119,12 @@ function rebuildLong(db, ym, generatedAt) {
     GROUP BY year_month_int, seller_sku_normalized, transaction_type, promotion_type, source_layer
   `).run(generatedAt);
 
-  // other (price/fee/promotion/qty 全て NULL の行 = WAREHOUSE_DAMAGE 等の direct_payment 系)
+  // other (price/fee/promotion 全て NULL かつ other 系金額を持つ行)
+  // 注: WAREHOUSE_DAMAGE / WAREHOUSE_LOST / REVERSAL_REIMBURSEMENT 等は
+  //     quantity_purchased=1 + other_amount=値 の同居行で来るため、
+  //     qty の有無で除外するとこれらが取りこぼされる (2026-05-08 fix)。
+  //     other 系金額が存在する行だけを拾う条件に変更。
+  //     Order trx は other 系金額 = 0 なので拾わないことを確認済み。
   db.prepare(`
     INSERT INTO fact_amazon_settlement_monthly_long
       (year_month_int, seller_sku_normalized, transaction_type, component_family, component_type, value_micro, row_count, source_layer, generated_at)
@@ -130,7 +135,13 @@ function rebuildLong(db, ym, generatedAt) {
            COUNT(*), source_layer, ?
     FROM _silver_month
     WHERE price_amount_micro IS NULL AND item_related_fee_amount_micro IS NULL
-      AND promotion_amount_micro IS NULL AND quantity_purchased IS NULL
+      AND promotion_amount_micro IS NULL
+      AND (
+        direct_payment_amount_micro IS NOT NULL
+        OR other_amount_micro IS NOT NULL
+        OR misc_fee_amount_micro IS NOT NULL
+        OR other_fee_amount_micro IS NOT NULL
+      )
     GROUP BY year_month_int, seller_sku_normalized, transaction_type, source_layer
   `).run(generatedAt);
 

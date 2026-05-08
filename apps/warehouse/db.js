@@ -1377,6 +1377,25 @@ function createTables() {
         + (w.promotion_micro / 1000000.0)
         - COALESCE(ad.ad_cost, 0)
         AS contribution_margin_excl_tax,
+      -- 中原さん 2026-05-08 指摘: 広告費引く前 + warehouse 補填 = 経営層が頭で見ている利益率
+      -- gross_margin_excl_tax (広告費・補填なし) と settlement_margin_excl_tax (広告費引く + 補填あり) の中間
+      (w.sales_principal_micro / 1000000.0)
+        + (w.sales_shipping_micro / 1000000.0)
+        + (w.sales_giftwrap_micro / 1000000.0)
+        - COALESCE(c.unit_cogs_excl_tax * w.qty_ordered, 0)
+        + (w.commission_micro / 1000000.0)
+        + (w.fba_fulfillment_micro / 1000000.0)
+        + (w.fba_storage_micro / 1000000.0)
+        + (w.closing_fee_micro / 1000000.0)
+        + (w.shipping_chargeback_micro / 1000000.0)
+        + (w.giftwrap_chargeback_micro / 1000000.0)
+        + (w.promotion_micro / 1000000.0)
+        + (w.warehouse_damage_micro / 1000000.0)
+        + (w.warehouse_lost_micro / 1000000.0)
+        + (w.safe_t_micro / 1000000.0)
+        + (w.refund_principal_micro / 1000000.0)
+        + (w.reversal_reimbursement_micro / 1000000.0)
+        AS gross_margin_with_reimbursement_excl_tax,
       (w.sales_principal_micro / 1000000.0)
         + (w.sales_shipping_micro / 1000000.0)
         + (w.sales_giftwrap_micro / 1000000.0)
