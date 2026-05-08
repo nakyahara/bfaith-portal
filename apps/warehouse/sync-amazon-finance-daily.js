@@ -238,17 +238,22 @@ import('node:os').then(async (os) => {
         const text = await res.text();
         // 409 incomplete (is_last 受信後の欠番検出) は当該 chunk 自体は DB 反映済みなので
         // partial 計上に含める (Codex Round 13 #1)
+        // parse 失敗時も保守的に当該 chunk を加算 (Codex Round 14 #1)
         if (res.status === 409 && isLast) {
-          try {
-            const j = JSON.parse(text);
-            if (j.status === 'incomplete' && Number.isInteger(j.chunks_received)) {
-              chunksApplied = j.chunks_received;
-              totalRowsSent = Number.isInteger(j.rows_received) ? j.rows_received : totalRowsSent + chunk.length;
-              lastError = `HTTP 409 incomplete: missing_chunks=${JSON.stringify(j.missing_chunks)} chunks_received=${j.chunks_received}/${chunks.length}`;
-              console.error(`  ✗ chunk ${i} accepted but run incomplete: ${lastError}`);
-              break;
-            }
-          } catch { /* fallthrough */ }
+          let parsed = null;
+          try { parsed = JSON.parse(text); } catch { /* parse 失敗 */ }
+          if (parsed && parsed.status === 'incomplete' && Number.isInteger(parsed.chunks_received)) {
+            chunksApplied = parsed.chunks_received;
+            totalRowsSent = Number.isInteger(parsed.rows_received) ? parsed.rows_received : totalRowsSent + chunk.length;
+            lastError = `HTTP 409 incomplete: missing_chunks=${JSON.stringify(parsed.missing_chunks)} chunks_received=${parsed.chunks_received}/${chunks.length}`;
+          } else {
+            // parse 失敗 / 形式不一致でも 409 + isLast なら当該 chunk は反映済みと推定
+            chunksApplied += 1;
+            totalRowsSent += chunk.length;
+            lastError = `HTTP 409 (body parse failed, conservatively counted as applied): ${text.slice(0, 300)}`;
+          }
+          console.error(`  ✗ chunk ${i} accepted but run incomplete: ${lastError}`);
+          break;
         }
         lastError = `HTTP ${res.status}: ${text.slice(0, 300)}`;
         console.error(`  ✗ chunk ${i} failed: ${lastError}`);
