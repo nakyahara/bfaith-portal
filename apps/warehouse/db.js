@@ -1240,6 +1240,20 @@ function createTables() {
     processed_at   TEXT
   )`);
 
+  // ---- Phase 1 #1-7a: job_locks (concurrency guard)
+  // daily-sync / mart rebuild / sync の重複起動防止
+  // - acquire 時に expires_at < now() なら takeover 可
+  // - heartbeat で expires_at を延長
+  // - release で DELETE
+  // helper: apps/warehouse/job-locks.js
+  db.exec(`CREATE TABLE IF NOT EXISTS job_locks (
+    job_name      TEXT PRIMARY KEY,
+    holder_id     TEXT NOT NULL,
+    acquired_at   TEXT NOT NULL,
+    expires_at    TEXT NOT NULL,
+    heartbeat_at  TEXT NOT NULL
+  )`);
+
   // ---- Phase 3.4: fact_ad_spend_campaign (spCampaigns 経由、全広告費取得)
   // 既存 fact_ad_spend (spAdvertisedProduct 経由、SKU 別) は 47% 漏れ (Auto-Targeting unallocated)
   // 本テーブルで campaign 単位の全広告費を保持、月次集計時に「全 - SKU 別 = unallocated」で導出可
