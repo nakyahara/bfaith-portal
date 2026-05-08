@@ -60,14 +60,14 @@ console.log(`  dry-run: ${isDryRun}`);
 
 if (isDryRun) {
   console.log('\n  (dry-run) would:');
-  console.log(`    1. POST ${renderUrl}/apps/mirror/api/sync/runs/${runId}/backout${isForce ? '?force=1' : ''}`);
+  console.log(`    1. POST ${renderUrl}/api/sync/runs/${runId}/backout${isForce ? '?force=1' : ''}`);
   console.log(`    2. UPDATE sync_runs SET status='backed_out' WHERE run_id='${runId}'`);
   process.exit(0);
 }
 
 // 1. Render 側 backout API 呼び出し
 console.log('\n  Calling Render backout API...');
-const url = `${renderUrl}/apps/mirror/api/sync/runs/${runId}/backout${isForce ? '?force=1' : ''}`;
+const url = `${renderUrl}/api/sync/runs/${runId}/backout${isForce ? '?force=1' : ''}`;
 try {
   const res = await fetch(url, {
     method: 'POST',
