@@ -1254,6 +1254,39 @@ function createTables() {
     heartbeat_at  TEXT NOT NULL
   )`);
 
+  // ---- Phase 1 #1-8a: DQ gate / anomaly alert
+  // monthly validation の差分を 7 bucket に分類して永続化、6 check で品質ゲート
+  // severity='error' の breach で GChat 通知 (Phase 1.x で組み込み)
+  // runner: apps/warehouse/run-amazon-finance-dq.js
+  db.exec(`CREATE TABLE IF NOT EXISTS dq_run_results (
+    run_id          TEXT NOT NULL,
+    check_name      TEXT NOT NULL,
+    severity        TEXT NOT NULL CHECK (severity IN ('info', 'warn', 'error')),
+    actual_value    REAL,
+    threshold_value REAL,
+    details_json    TEXT,
+    checked_at      TEXT NOT NULL,
+    PRIMARY KEY (run_id, check_name)
+  )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_dq_run_results_severity
+    ON dq_run_results (severity, checked_at)`);
+
+  db.exec(`CREATE TABLE IF NOT EXISTS accounting_diff_buckets (
+    run_id        TEXT NOT NULL,
+    month_jst     TEXT NOT NULL,
+    seller_sku    TEXT NOT NULL,
+    asin_norm     TEXT NOT NULL DEFAULT '',
+    bucket_code   TEXT NOT NULL,
+    bucket_amount REAL NOT NULL,
+    row_count     INTEGER NOT NULL,
+    details_json  TEXT,
+    created_at    TEXT NOT NULL
+  )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_acct_diff_buckets_run
+    ON accounting_diff_buckets (run_id, bucket_code)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_acct_diff_buckets_month
+    ON accounting_diff_buckets (month_jst, bucket_code)`);
+
   // ---- Phase 3.4: fact_ad_spend_campaign (spCampaigns 経由、全広告費取得)
   // 既存 fact_ad_spend (spAdvertisedProduct 経由、SKU 別) は 47% 漏れ (Auto-Targeting unallocated)
   // 本テーブルで campaign 単位の全広告費を保持、月次集計時に「全 - SKU 別 = unallocated」で導出可
