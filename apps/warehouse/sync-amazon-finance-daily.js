@@ -226,7 +226,7 @@ import('node:os').then(async (os) => {
 
     console.log(`  [${i + 1}/${chunks.length}] sending ${chunk.length} rows...`);
     try {
-      const res = await fetch(`${renderUrl}/apps/mirror/api/sync/${ENTITY_NAME}/chunk`, {
+      const res = await fetch(`${renderUrl}/api/sync/${ENTITY_NAME}/chunk`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
