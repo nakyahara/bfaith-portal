@@ -1,0 +1,17 @@
+{
+  "entity": "amazon_finance_sku_daily",
+  "contract_version": 1,
+  "source_system": "minipc-warehouse",
+  "source_object": "f_amazon_finance_sku_daily_v1",
+  "target_table": "mirror_amazon_finance_sku_daily",
+  "grain_definition": "one row = one (date_jst, seller_sku, asin_norm)",
+  "key_columns_json": "[\"date_jst\", \"seller_sku\", \"asin_norm\"]",
+  "payload_schema_json": "{\"type\":\"object\",\"required\":[\"date_jst\",\"seller_sku\"],\"properties\":{\"date_jst\":{\"type\":\"string\",\"pattern\":\"^\\\\d{4}-\\\\d{2}-\\\\d{2}$\"},\"seller_sku\":{\"type\":\"string\",\"minLength\":1},\"asin_norm\":{\"type\":\"string\",\"default\":\"\"},\"profit_amount\":{\"type\":\"number\"},\"cost_status\":{\"type\":\"string\",\"enum\":[\"complete\",\"missing_cost\",\"partial_cost\",\"late_bound_after_close\"]}}}",
+  "clear_strategy": "scope_clear_per_run",
+  "clear_strategy_detail": "First chunk of run includes meta.clear_amazon_finance_dates=[<all distinct date_jst in payload>] for Render side to DELETE before insert",
+  "apply_mode": "insert_or_replace",
+  "apply_mode_detail": "INSERT OR REPLACE on (date_jst, seller_sku, asin_norm). source_run_id and source_row_hash track origin",
+  "enabled": 1,
+  "owner": "phase1-amazon-finance",
+  "notes": "Phase 1 #1-4 で導入。snapshot 不変 (miniPC 側 fact) と整合するため、scope clear は date 単位 (SKU 単位の force-rebuild は Phase 1.x 検討)"
+}

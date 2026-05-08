@@ -264,6 +264,58 @@ function createTables() {
     updated_at        TEXT
   )`);
 
+  // mirror_amazon_finance_sku_daily — Phase 1 #1-4 (Render 側 daily fact mirror)
+  // miniPC の f_amazon_finance_sku_daily_v1 の payload を受信。
+  // contract_version は sync_contracts.contract_version と整合。
+  // PK: (date_jst, seller_sku, asin_norm) — asin_norm 物理列で NULL 排除 (Codex Round 8 推奨)
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_amazon_finance_sku_daily (
+    date_jst                    TEXT NOT NULL CHECK(date_jst GLOB '____-__-__'),
+    seller_sku                  TEXT NOT NULL CHECK(trim(seller_sku) <> ''),
+    asin_norm                   TEXT NOT NULL DEFAULT '',
+    product_name                TEXT NOT NULL DEFAULT '',
+    units_ordered               REAL NOT NULL DEFAULT 0,
+    units_refunded_customer     REAL NOT NULL DEFAULT 0,
+    units_marketplace_guarantee REAL NOT NULL DEFAULT 0,
+    units_a_to_z_refund         REAL NOT NULL DEFAULT 0,
+    units_net_sold              REAL NOT NULL DEFAULT 0,
+    sales_principal_jpy         REAL NOT NULL DEFAULT 0,
+    sales_shipping_jpy          REAL NOT NULL DEFAULT 0,
+    sales_giftwrap_jpy          REAL NOT NULL DEFAULT 0,
+    sales_tax_jpy               REAL NOT NULL DEFAULT 0,
+    commission_jpy              REAL NOT NULL DEFAULT 0,
+    fba_fulfillment_jpy         REAL NOT NULL DEFAULT 0,
+    fba_storage_jpy             REAL NOT NULL DEFAULT 0,
+    closing_fee_jpy             REAL NOT NULL DEFAULT 0,
+    shipping_chargeback_jpy     REAL NOT NULL DEFAULT 0,
+    giftwrap_chargeback_jpy     REAL NOT NULL DEFAULT 0,
+    promotion_jpy               REAL NOT NULL DEFAULT 0,
+    warehouse_damage_jpy        REAL NOT NULL DEFAULT 0,
+    warehouse_lost_jpy          REAL NOT NULL DEFAULT 0,
+    safe_t_jpy                  REAL NOT NULL DEFAULT 0,
+    refund_principal_jpy        REAL NOT NULL DEFAULT 0,
+    reversal_reimbursement_jpy  REAL NOT NULL DEFAULT 0,
+    misc_fee_jpy                REAL NOT NULL DEFAULT 0,
+    other_fee_jpy               REAL NOT NULL DEFAULT 0,
+    other_amount_jpy            REAL NOT NULL DEFAULT 0,
+    unit_cost_snapshot          REAL,
+    cost_snapshot_date_jst      TEXT,
+    latest_unit_cost_reference  REAL,
+    cogs_amount                 REAL NOT NULL DEFAULT 0,
+    profit_amount               REAL NOT NULL DEFAULT 0,
+    is_cost_complete            INTEGER NOT NULL DEFAULT 0,
+    cost_status                 TEXT NOT NULL CHECK (
+      cost_status IN ('complete','missing_cost','partial_cost','late_bound_after_close')
+    ),
+    source_run_id               TEXT NOT NULL,
+    source_row_hash             TEXT NOT NULL,
+    synced_at                   TEXT NOT NULL,
+    PRIMARY KEY (date_jst, seller_sku, asin_norm)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mafsd_date ON mirror_amazon_finance_sku_daily(date_jst)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mafsd_sku ON mirror_amazon_finance_sku_daily(seller_sku)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mafsd_month ON mirror_amazon_finance_sku_daily(substr(date_jst, 1, 7))');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mafsd_run ON mirror_amazon_finance_sku_daily(source_run_id)');
+
   // mirror_amazon_sku_fees — Amazon手数料キャッシュ（粗利ダッシュボード用）
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_amazon_sku_fees (
     seller_sku          TEXT PRIMARY KEY,
