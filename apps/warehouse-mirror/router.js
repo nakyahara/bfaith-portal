@@ -348,6 +348,249 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
   }
 });
 
+// ─── Phase 1 #1-4a: POST /api/sync/:entity/chunk (entity-driven contract sync) ───
+//
+// 受信処理:
+//   1. 認証 (x-sync-key)
+//   2. payload validation (sync_run_id / contract_version / chunk_index 等)
+//   3. checksum 検証 (改ざん検知)
+//   4. is_first=true なら scope clear (entity 別 clear strategy)
+//   5. payload を mirror テーブルに INSERT OR REPLACE
+//   6. sync_run_chunks に ledger 記録 (received_at)
+//   7. apply 成功で applied_at を更新
+//   8. is_last=true なら status response
+//
+// Phase 1 #1-4 で sync_contracts に登録済みの entity のみ受信
+// (現状: amazon_finance_sku_daily v1)
+//
+// payload 構造 (POST body):
+// {
+//   sync_run_id: "amazon_finance_sku_daily-v1-2026-05-08T0731",
+//   contract_version: 1,
+//   scope_from: "2026-04-01",
+//   scope_to: "2026-04-30",
+//   chunk_index: 0,
+//   chunk_count: 5,
+//   is_first: true,
+//   is_last: false,
+//   row_count: 5000,
+//   payload_checksum: "sha256...",
+//   meta: { clear_amazon_finance_dates: ["2026-04-01", ...] },  // first chunk のみ
+//   payload: { rows: [...] }
+// }
+router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
+  const entity = req.params.entity;
+  const body = req.body || {};
+  const {
+    sync_run_id, contract_version, scope_from, scope_to,
+    chunk_index, chunk_count, is_first, is_last, row_count,
+    payload_checksum, meta = {}, payload = {}
+  } = body;
+
+  // 1. payload validation
+  if (!sync_run_id || typeof sync_run_id !== 'string') {
+    return res.status(400).json({ error: 'sync_run_id required' });
+  }
+  if (!Number.isInteger(contract_version)) {
+    return res.status(400).json({ error: 'contract_version must be integer' });
+  }
+  if (!Number.isInteger(chunk_index) || chunk_index < 0) {
+    return res.status(400).json({ error: 'chunk_index must be non-negative integer' });
+  }
+  if (!Number.isInteger(chunk_count) || chunk_count <= 0) {
+    return res.status(400).json({ error: 'chunk_count must be positive integer' });
+  }
+  if (typeof payload_checksum !== 'string' || payload_checksum.length === 0) {
+    return res.status(400).json({ error: 'payload_checksum required' });
+  }
+
+  // 2. supported entity 確認 (Phase 1 では amazon_finance_sku_daily のみ)
+  if (entity !== 'amazon_finance_sku_daily') {
+    return res.status(400).json({ error: `unsupported entity: ${entity}` });
+  }
+
+  const db = getMirrorDB();
+  const now = new Date().toISOString();
+  const requestId = `sync-${Date.now().toString(36)}`;
+
+  try {
+    // 3. checksum 検証 (payload を JSON 化して再 hash)
+    const crypto = await import('node:crypto');
+    const payloadStr = JSON.stringify(payload);
+    const computedChecksum = crypto.createHash('sha256').update(payloadStr).digest('hex');
+    if (computedChecksum !== payload_checksum) {
+      console.error(`[Mirror] checksum mismatch req=${requestId} entity=${entity} chunk=${chunk_index}`);
+      return res.status(400).json({
+        error: 'payload_checksum mismatch',
+        expected: payload_checksum,
+        computed: computedChecksum,
+      });
+    }
+
+    // 4. is_first なら scope clear (date 単位)
+    if (is_first && entity === 'amazon_finance_sku_daily') {
+      const clearDates = meta.clear_amazon_finance_dates || [];
+      if (clearDates.length === 0) {
+        return res.status(400).json({ error: 'first chunk requires meta.clear_amazon_finance_dates' });
+      }
+      const placeholders = clearDates.map(() => '?').join(',');
+      const deleted = db.prepare(`
+        DELETE FROM mirror_amazon_finance_sku_daily WHERE date_jst IN (${placeholders})
+      `).run(...clearDates).changes;
+      console.log(`[Mirror] scope clear req=${requestId} entity=${entity} dates=${clearDates.length} deleted=${deleted}`);
+    }
+
+    // 5. payload を mirror テーブルに INSERT OR REPLACE
+    const rows = payload.rows || [];
+    if (entity === 'amazon_finance_sku_daily') {
+      const insertStmt = db.prepare(`
+        INSERT OR REPLACE INTO mirror_amazon_finance_sku_daily (
+          date_jst, seller_sku, asin_norm, product_name,
+          units_ordered, units_refunded_customer, units_marketplace_guarantee,
+          units_a_to_z_refund, units_net_sold,
+          sales_principal_jpy, sales_shipping_jpy, sales_giftwrap_jpy, sales_tax_jpy,
+          commission_jpy, fba_fulfillment_jpy, fba_storage_jpy, closing_fee_jpy,
+          shipping_chargeback_jpy, giftwrap_chargeback_jpy, promotion_jpy,
+          warehouse_damage_jpy, warehouse_lost_jpy, safe_t_jpy,
+          refund_principal_jpy, reversal_reimbursement_jpy,
+          misc_fee_jpy, other_fee_jpy, other_amount_jpy,
+          unit_cost_snapshot, cost_snapshot_date_jst, latest_unit_cost_reference,
+          cogs_amount, profit_amount, is_cost_complete, cost_status,
+          source_run_id, source_row_hash, synced_at
+        ) VALUES (
+          @date_jst, @seller_sku, @asin_norm, @product_name,
+          @units_ordered, @units_refunded_customer, @units_marketplace_guarantee,
+          @units_a_to_z_refund, @units_net_sold,
+          @sales_principal_jpy, @sales_shipping_jpy, @sales_giftwrap_jpy, @sales_tax_jpy,
+          @commission_jpy, @fba_fulfillment_jpy, @fba_storage_jpy, @closing_fee_jpy,
+          @shipping_chargeback_jpy, @giftwrap_chargeback_jpy, @promotion_jpy,
+          @warehouse_damage_jpy, @warehouse_lost_jpy, @safe_t_jpy,
+          @refund_principal_jpy, @reversal_reimbursement_jpy,
+          @misc_fee_jpy, @other_fee_jpy, @other_amount_jpy,
+          @unit_cost_snapshot, @cost_snapshot_date_jst, @latest_unit_cost_reference,
+          @cogs_amount, @profit_amount, @is_cost_complete, @cost_status,
+          @source_run_id, @source_row_hash, @synced_at
+        )
+      `);
+
+      const insertMany = db.transaction((rowList) => {
+        for (const r of rowList) {
+          insertStmt.run({
+            date_jst: r.date_jst, seller_sku: r.seller_sku, asin_norm: r.asin_norm || '',
+            product_name: r.product_name || '',
+            units_ordered: r.units_ordered ?? 0,
+            units_refunded_customer: r.units_refunded_customer ?? 0,
+            units_marketplace_guarantee: r.units_marketplace_guarantee ?? 0,
+            units_a_to_z_refund: r.units_a_to_z_refund ?? 0,
+            units_net_sold: r.units_net_sold ?? 0,
+            sales_principal_jpy: r.sales_principal_jpy ?? 0,
+            sales_shipping_jpy: r.sales_shipping_jpy ?? 0,
+            sales_giftwrap_jpy: r.sales_giftwrap_jpy ?? 0,
+            sales_tax_jpy: r.sales_tax_jpy ?? 0,
+            commission_jpy: r.commission_jpy ?? 0,
+            fba_fulfillment_jpy: r.fba_fulfillment_jpy ?? 0,
+            fba_storage_jpy: r.fba_storage_jpy ?? 0,
+            closing_fee_jpy: r.closing_fee_jpy ?? 0,
+            shipping_chargeback_jpy: r.shipping_chargeback_jpy ?? 0,
+            giftwrap_chargeback_jpy: r.giftwrap_chargeback_jpy ?? 0,
+            promotion_jpy: r.promotion_jpy ?? 0,
+            warehouse_damage_jpy: r.warehouse_damage_jpy ?? 0,
+            warehouse_lost_jpy: r.warehouse_lost_jpy ?? 0,
+            safe_t_jpy: r.safe_t_jpy ?? 0,
+            refund_principal_jpy: r.refund_principal_jpy ?? 0,
+            reversal_reimbursement_jpy: r.reversal_reimbursement_jpy ?? 0,
+            misc_fee_jpy: r.misc_fee_jpy ?? 0,
+            other_fee_jpy: r.other_fee_jpy ?? 0,
+            other_amount_jpy: r.other_amount_jpy ?? 0,
+            unit_cost_snapshot: r.unit_cost_snapshot ?? null,
+            cost_snapshot_date_jst: r.cost_snapshot_date_jst ?? null,
+            latest_unit_cost_reference: r.latest_unit_cost_reference ?? null,
+            cogs_amount: r.cogs_amount ?? 0,
+            profit_amount: r.profit_amount ?? 0,
+            is_cost_complete: r.is_cost_complete ?? 0,
+            cost_status: r.cost_status,
+            source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,
+            synced_at: r.synced_at,
+          });
+        }
+      });
+
+      insertMany(rows);
+    }
+
+    // 6. ledger に chunk 記録 (INSERT OR REPLACE で idempotent)
+    db.prepare(`
+      INSERT OR REPLACE INTO sync_run_chunks
+        (run_id, entity, chunk_index, chunk_count, row_count, payload_checksum, received_at, applied_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(sync_run_id, entity, chunk_index, chunk_count, row_count, payload_checksum, now, now);
+
+    console.log(`[Mirror] sync chunk applied req=${requestId} entity=${entity} run=${sync_run_id} chunk=${chunk_index}/${chunk_count} rows=${rows.length}`);
+
+    // 7. is_last なら全 chunk 受信完了の status を返す
+    if (is_last) {
+      const received = db.prepare(`
+        SELECT COUNT(*) AS c, SUM(row_count) AS r FROM sync_run_chunks
+        WHERE run_id = ? AND entity = ?
+      `).get(sync_run_id, entity);
+      return res.json({
+        ok: true, request_id: requestId,
+        sync_run_id, entity, status: 'completed',
+        chunks_received: received.c, expected: chunk_count,
+        rows_received: received.r,
+      });
+    }
+
+    return res.json({ ok: true, request_id: requestId, sync_run_id, entity, chunk_index });
+  } catch (e) {
+    console.error(`[Mirror] sync chunk error req=${requestId}: ${e.message}`);
+    return res.status(500).json({ error: e.message, request_id: requestId });
+  }
+});
+
+// ─── Phase 1 #1-4a: GET /api/sync/runs/:run_id (status 確認) ───
+router.get('/api/sync/runs/:run_id', requireSyncKey, (req, res) => {
+  const db = getMirrorDB();
+  const chunks = db.prepare(`
+    SELECT entity, chunk_index, chunk_count, row_count, payload_checksum,
+           received_at, applied_at
+    FROM sync_run_chunks WHERE run_id = ? ORDER BY entity, chunk_index
+  `).all(req.params.run_id);
+  if (chunks.length === 0) return res.status(404).json({ error: 'run not found' });
+  const summary = {
+    run_id: req.params.run_id,
+    chunk_count_expected: chunks[0].chunk_count,
+    chunk_count_received: chunks.length,
+    row_count_received: chunks.reduce((s, c) => s + c.row_count, 0),
+    all_applied: chunks.every(c => c.applied_at !== null),
+  };
+  res.json({ summary, chunks });
+});
+
+// ─── Phase 1 #1-4a: POST /api/sync/runs/:run_id/backout (run_id 単位 DELETE) ───
+router.post('/api/sync/runs/:run_id/backout', requireSyncKey, (req, res) => {
+  const runId = req.params.run_id;
+  const db = getMirrorDB();
+  const chunks = db.prepare(`SELECT DISTINCT entity FROM sync_run_chunks WHERE run_id = ?`).all(runId);
+  if (chunks.length === 0) return res.status(404).json({ error: 'run not found' });
+
+  const entities = chunks.map(c => c.entity);
+  const deleted = {};
+  for (const entity of entities) {
+    if (entity === 'amazon_finance_sku_daily') {
+      const info = db.prepare(`
+        DELETE FROM mirror_amazon_finance_sku_daily WHERE source_run_id = ?
+      `).run(runId);
+      deleted[entity] = info.changes;
+    }
+  }
+  // ledger からも削除
+  db.prepare(`DELETE FROM sync_run_chunks WHERE run_id = ?`).run(runId);
+
+  console.log(`[Mirror] backout run=${runId} deleted=${JSON.stringify(deleted)}`);
+  res.json({ ok: true, run_id: runId, deleted });
+});
+
 // ─── GET /api/products ───
 
 router.get('/api/products', (req, res) => {

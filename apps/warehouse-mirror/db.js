@@ -264,6 +264,24 @@ function createTables() {
     updated_at        TEXT
   )`);
 
+  // ---- Phase 1 #1-4a: sync_run_chunks (Render 側 chunk ledger)
+  // chunk 受信のたびに INSERT、apply 成功で applied_at を更新
+  // 同一 (run_id, entity, chunk_index) は idempotent (INSERT OR REPLACE)
+  // payload_checksum で改ざん検知
+  db.exec(`CREATE TABLE IF NOT EXISTS sync_run_chunks (
+    run_id            TEXT NOT NULL,
+    entity            TEXT NOT NULL,
+    chunk_index       INTEGER NOT NULL,
+    chunk_count       INTEGER NOT NULL,
+    row_count         INTEGER NOT NULL,
+    payload_checksum  TEXT NOT NULL,
+    received_at       TEXT NOT NULL,
+    applied_at        TEXT,
+    PRIMARY KEY (run_id, entity, chunk_index)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_src_run_id ON sync_run_chunks(run_id)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_src_entity_received ON sync_run_chunks(entity, received_at)');
+
   // mirror_amazon_finance_sku_daily — Phase 1 #1-4 (Render 側 daily fact mirror)
   // miniPC の f_amazon_finance_sku_daily_v1 の payload を受信。
   // contract_version は sync_contracts.contract_version と整合。
