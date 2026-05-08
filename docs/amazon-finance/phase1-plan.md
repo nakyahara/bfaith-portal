@@ -131,11 +131,15 @@ profit_amount =
 
 ## 関連ドキュメント
 
-- `docs/contracts/raw_amazon_settlement_lines.contract.md` — source contract v1 (Phase 1 の前提)
-- `docs/contracts/transaction_taxonomy_seed.csv` — transaction_type 分類 seed (Ticket #1-0a で生成)
+- `docs/contracts/raw_amazon_settlement_lines.contract.md` — source contract v1.1 (Phase 1 の前提)
+- `docs/contracts/transaction_taxonomy_seed.csv` — transaction_type 分類 seed (Ticket #1-0a で生成、25 種 → 7 bucket)
+- `docs/contracts/source_distinct_values_baseline_20260508.json` — 実 DB baseline 計測 (Ticket #1-0a)
 - `sql/contracts/check_raw_amazon_settlement_lines.sql` — schema / baseline 検査 SQL
 - `scripts/contracts/assert-raw-amazon-source.js` — contract 差分検知 (CI / 手動チェック用)
-- (Ticket #1-0 以降で追加) `docs/amazon-finance/canonical-metric-mapping.md` — line から canonical metric への mapping
+- `scripts/contracts/extract-amazon-source-distinct-values.js` — distinct 値抽出 (Node)
+- `docs/amazon-finance/canonical-metric-mapping.md` — line から canonical metric への mapping (Ticket #1-0 で確定、coverage 100%)
+- `sql/amazon/canonical_metric_mapping_v1.sql` — mapping reference SQL (Ticket #1-0)
+- `scripts/amazon-finance/check-metric-mapping.js` — coverage / fixture 検証 (Ticket #1-0)
 - (Ticket #1-1 以降で追加) `docs/amazon-finance/cogs-snapshot-policy.md` — snapshot 原価の運用規律
 
 ## 実装着手手順 (#1-0a から)
