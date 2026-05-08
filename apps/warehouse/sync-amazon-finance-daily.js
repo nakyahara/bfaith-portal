@@ -40,7 +40,9 @@ import Database from 'better-sqlite3';
 
 const ENTITY_NAME = 'amazon_finance_sku_daily';
 const CONTRACT_VERSION = 1;
-const CHUNK_SIZE = 5000;
+// CHUNK_SIZE は env で override 可能 (Render 側 timeout / payload size 調整用)
+// 5000 だと Render 側で connection terminated になる事象あり、3000 推奨
+const CHUNK_SIZE = parseInt(process.env.CHUNK_SIZE, 10) || 5000;
 
 const args = process.argv.slice(2);
 function getArg(flag) {
