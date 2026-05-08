@@ -1,0 +1,65 @@
+{
+  "_comment": "Phase 1 #1-0a 検証フェーズで実 DB から抽出した distinct 値と baseline metrics。raw_amazon_settlement_lines.contract.md v1 凍結時点の事実ベース。今後の DQ alert 閾値や mapping 更新の根拠として使用。",
+  "_extracted_by": "scripts/contracts/extract-amazon-source-distinct-values.js",
+  "_extracted_at": "2026-05-08T00:08:24Z",
+  "_database": "C:/Users/bfaith/bfaith-portal/data/warehouse.db (miniPC)",
+  "_extracted_from_branch": "feature/phase1-1-0a-source-contract-freeze",
+
+  "baseline": {
+    "total_rows": 4304504,
+    "economic_date_min": "2026-01-26",
+    "economic_date_max": "2026-05-04",
+    "economic_date_distinct_count": 99,
+    "year_month_int_match_rows": 4304504,
+    "year_month_int_mismatch_rows": 0,
+    "physical_line_hash_duplicate_count": 0,
+    "currency_distinct": [{ "currency": "JPY", "c": 4304504 }],
+    "seller_sku_normalized_null_count": 107234,
+    "seller_sku_normalized_empty_count": 0,
+    "seller_sku_normalized_null_or_empty_rate_pct": 2.49,
+    "monthly_row_count": [
+      { "month_jst": "2026-01", "c": 190464 },
+      { "month_jst": "2026-02", "c": 982012 },
+      { "month_jst": "2026-03", "c": 1427304 },
+      { "month_jst": "2026-04", "c": 1532928 },
+      { "month_jst": "2026-05", "c": 171796 }
+    ],
+    "amount_min_max_micro": {
+      "price_amount": { "min": -20000000000, "max": 72591000000 },
+      "item_related_fee_amount": { "min": -12227000000, "max": 3630000000 },
+      "shipment_fee_amount": { "min": null, "max": null, "_note": "全行 NULL — Codex Round 6 の前提と異なる、shipment_fee_type も全行 NULL" },
+      "order_fee_amount": { "min": null, "max": null, "_note": "全行 NULL — 同上" },
+      "promotion_amount": { "min": -455000000, "max": 418000000 },
+      "other_amount": { "min": -444882000000, "max": 471829000000, "_note": "Reserve 系 transaction で大金額。利益計算から除外" }
+    }
+  },
+
+  "_round6_design_corrections_required": [
+    "shipment_fee_type は全行 NULL → SQL から除去、shipping は price_type='Shipping' のみで取得",
+    "order_fee_type は全行 NULL → SQL から除去、shipping_chargeback / giftwrap_chargeback は item_related_fee_type で取得",
+    "other_fee_reason_description は全行 NULL → LIKE 検索ベースの reimbursement 抽出は不可、transaction_type ベースに変更",
+    "Amazon Easy Ship Charges (10.6万件) を fee bucket に追加 (FBM 配送代行)",
+    "MFNPostageFee/MFNPostageFeeTax は item_related_fee_type 経由で FBM 配送料として取得",
+    "Reserve 系 (BuyerRecharge / Previous Reserve / Current Reserve) は exclude bucket で利益計算から除外",
+    "Points 系 (PointsGranted 3278件 / PointsReturned 33件) は別軸で集計検討 (Amazon ポイント原資)"
+  ],
+
+  "_distinct_values": "別出力 (容量大きいので summary)",
+  "transaction_type_count": 25,
+  "transaction_type_top5": [
+    { "value": "Order", "c": 4167119, "ratio_pct": 96.81 },
+    { "value": "Amazon Easy Ship Charges", "c": 106502, "ratio_pct": 2.47 },
+    { "value": "Refund", "c": 20296, "ratio_pct": 0.47 },
+    { "value": "WAREHOUSE_DAMAGE", "c": 7150, "ratio_pct": 0.17 },
+    { "value": "REVERSAL_REIMBURSEMENT", "c": 1744, "ratio_pct": 0.04 }
+  ],
+  "price_type_count": 9,
+  "item_related_fee_type_count": 12,
+  "shipment_fee_type_count": 1,
+  "shipment_fee_type_only_value": "__NULL__",
+  "order_fee_type_count": 1,
+  "order_fee_type_only_value": "__NULL__",
+  "promotion_type_count": 4,
+  "other_fee_reason_description_count": 1,
+  "other_fee_reason_description_only_value": "__NULL__"
+}

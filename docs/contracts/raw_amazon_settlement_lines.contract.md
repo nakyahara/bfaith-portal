@@ -141,16 +141,60 @@ distinct 値は `Order` / `Refund` / `Adjustment` / `SAFE-T` / `A-to-z Guarantee
 
 `scripts/contracts/assert-raw-amazon-source.js` がこの contract と実 DB を突合し、列追加・列欠落・型変更を検知する。CI または手動チェックで mismatch 時に `process.exit(1)` で fail させる。
 
-## 10. baseline metrics (2026-05-07)
+## 10. baseline metrics (2026-05-08 実 DB 計測)
+
+`scripts/contracts/extract-amazon-source-distinct-values.js` で取得 (詳細は `docs/contracts/source_distinct_values_baseline_20260508.json`)。
 
 | 指標 | 値 |
 |---|---|
-| total rows | 3,152,595 |
+| total rows | **4,304,504** |
 | 列数 | 46 |
-| `economic_date` 範囲 | (要計測、`sql/contracts/check_raw_amazon_settlement_lines.sql` で取得) |
-| 月別 row 数 | 同上 |
+| `economic_date` 範囲 | **2026-01-26 〜 2026-05-04** (99 日分) |
+| `year_month_int` 整合性 | 100% 一致 (mismatch 0) |
+| `physical_line_hash` 重複 | 0 |
+| currency | 全行 JPY |
+| `seller_sku_normalized` null/empty 率 | 2.49% (107,234 件、fee 系 transaction に多い想定) |
 
-これらは contract の v1 凍結時点での baseline。Phase 1 実装中に row 数が大幅変動 (例: ±10% 超) したら DQ alert。
+### 月別 row 数
+
+| 月 | 行数 |
+|---|---|
+| 2026-01 (1/26〜) | 190,464 |
+| 2026-02 | 982,012 |
+| 2026-03 | 1,427,304 |
+| 2026-04 | 1,532,928 |
+| 2026-05 (〜5/4) | 171,796 |
+
+### 金額列 min/max (micro 単位)
+
+| 列 | min | max | 備考 |
+|---|---|---|---|
+| `price_amount_micro` | -20,000,000,000 | 72,591,000,000 | 通常範囲 |
+| `item_related_fee_amount_micro` | -12,227,000,000 | 3,630,000,000 | 通常範囲 |
+| `shipment_fee_amount_micro` | NULL | NULL | **全行 NULL** (列は存在するが未使用) |
+| `order_fee_amount_micro` | NULL | NULL | **全行 NULL** (列は存在するが未使用) |
+| `promotion_amount_micro` | -455,000,000 | 418,000,000 | 主に Shipping promotion |
+| `other_amount_micro` | -444,882,000,000 | 471,829,000,000 | Reserve 系で大金額 (利益計算から除外) |
+
+### 検証で判明した Codex Round 6 設計の見直し点
+
+1. **`shipment_fee_type` / `order_fee_type` / `other_fee_reason_description` は全行 NULL** — Round 6 の rebuild SQL がこれら経由で取得していた箇所は要修正。`price_type='Shipping'` と `item_related_fee_type` ベースに集約する
+2. **`Amazon Easy Ship Charges` (10.6万件)** — FBM 配送代行手数料、新規 bucket 追加
+3. **Reserve 系 (BuyerRecharge / Previous Reserve / Current Reserve)** — 利益計算から除外
+4. **Points 系 (PointsGranted/Returned)** — Amazon ポイント原資、別軸検討
+
+詳細は `docs/contracts/transaction_taxonomy_seed.csv` と `docs/contracts/source_distinct_values_baseline_20260508.json` 参照。
+
+### Phase 1 実装中の DQ alert 閾値
+
+- 行数の月内変動 ±10% 超
+- `currency` に JPY 以外混入
+- `physical_line_hash` 重複出現
+- `year_month_int` mismatch
+- `seller_sku_normalized` null/empty 率が 5% 超
+- `transaction_type` に新規値出現 (`__UNKNOWN__` bucket)
+
+これらは contract の v1 凍結時点での baseline。Phase 1 実装中に逸脱したら DQ alert。
 
 ## 11. 関連 ticket / docs
 
@@ -164,3 +208,4 @@ distinct 値は `Order` / `Refund` / `Adjustment` / `SAFE-T` / `A-to-z Guarantee
 | Version | Date | Changes |
 |---|---|---|
 | v1 | 2026-05-07 | 初回凍結。SSH 経由で実 DB を確認し、46 列・economic_date 主軸・micro 単位を確定 |
+| v1.1 | 2026-05-08 | baseline metrics を実 DB 計測値で更新 (4.30M 行)。distinct 値抽出と taxonomy_seed.csv 作成。Codex Round 6 の rebuild SQL に修正必要な点 (shipment_fee_type/order_fee_type/other_fee_reason_description 全行 NULL、Amazon Easy Ship Charges 大量、Reserve 系除外) を発見、文書化 |

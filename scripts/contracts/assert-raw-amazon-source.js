@@ -19,10 +19,11 @@ import Database from 'better-sqlite3';
 import path from 'node:path';
 import fs from 'node:fs';
 
-const DATA_DIR = process.env.DATA_DIR;
+// DATA_DIR は env または第1引数で受ける (SSH 経由時の env 渡し問題回避)
+const DATA_DIR = (process.env.DATA_DIR || process.argv[2] || '').trim();
 if (!DATA_DIR) {
-  console.error('FATAL: DATA_DIR environment variable is required.');
-  console.error('  Example: DATA_DIR=C:/Users/bfaith/bfaith-portal/data node scripts/contracts/assert-raw-amazon-source.js');
+  console.error('FATAL: DATA_DIR environment variable or first argument is required.');
+  console.error('  Example: node scripts/contracts/assert-raw-amazon-source.js C:/Users/bfaith/bfaith-portal/data');
   console.error('  Reason: process.cwd() fallback can silently create a stray DB in worktree.');
   process.exit(2);
 }
@@ -133,7 +134,7 @@ for (const rel of RELATED_OBJECTS) {
 
 // 2. 列定義の突合
 if (!hasFatal) {
-  const actual = db.prepare(`SELECT cid, name, type, "notnull" AS notnull FROM pragma_table_info(?) ORDER BY cid`).all(TABLE_NAME);
+  const actual = db.prepare(`SELECT cid, name, type, "notnull" AS not_null_flag FROM pragma_table_info(?) ORDER BY cid`).all(TABLE_NAME).map(r => ({ cid: r.cid, name: r.name, type: r.type, notnull: r.not_null_flag }));
 
   if (actual.length !== EXPECTED_COLUMNS.length) {
     fatal(`Column count mismatch: expected ${EXPECTED_COLUMNS.length}, got ${actual.length}`);

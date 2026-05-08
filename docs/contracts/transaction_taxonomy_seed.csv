@@ -1,0 +1,27 @@
+transaction_type,row_count,tx_bucket,sign_rule,daily_fact_metric,notes
+Order,4167119,order,positive,principal/shipping/giftwrap/tax/commission/fba_fulfillment等,通常受注。最頻値
+Amazon Easy Ship Charges,106502,fee,negative_as_cost,easy_ship_fee_jpy,FBM配送代行手数料 (memory: feedback_amazon_fbm_easyship)
+Refund,20296,refund,negative_as_refund,refund_principal/refund_tax/refund_shipping等,通常返金
+WAREHOUSE_DAMAGE,7150,reimbursement,positive_as_reimbursement,warehouse_damage_jpy,FBA倉庫破損補填
+REVERSAL_REIMBURSEMENT,1744,reimbursement,positive_as_reimbursement,reversal_reimbursement_jpy,reverse 補填
+WAREHOUSE_LOST,713,reimbursement,positive_as_reimbursement,warehouse_lost_jpy,FBA倉庫紛失補填
+RemovalComplete,395,fee,negative_as_cost,fba_removal_fee_jpy,FBA除去手数料 (Phase1 では misc_fee に集約可)
+Fee Adjustment,140,adjustment,signed,fee_adjustment_jpy,手数料調整。符号は raw データに従う
+WAREHOUSE_DAMAGE_EXCEPTION,76,reimbursement,positive_as_reimbursement,warehouse_damage_jpy,WAREHOUSE_DAMAGE と同一 bucket に集約
+A-to-z Guarantee Refund,76,refund,negative_as_refund,refund_principal_jpy + qty_a_to_z_refund,A-to-z 保証返金
+SAFE-T Reimbursement,48,reimbursement,positive_as_reimbursement,safe_t_jpy,SAFE-T 補填
+Inbound Defect Fee - Barcode cannot be scanned,48,fee,negative_as_cost,misc_fee_jpy,FBA 入荷不良手数料
+BuyerRecharge,28,reserve,exclude,(none),準備金変動。利益計算から除外
+Goodwill Concession,27,reimbursement,positive_as_reimbursement,reversal_reimbursement_jpy,謝罪金。reimbursement と同等扱い
+Previous Reserve Amount Balance,26,reserve,exclude,(none),前期準備金残高。利益計算から除外
+Current Reserve Amount,26,reserve,exclude,(none),今期準備金。利益計算から除外
+Storage Fee - Reversal,15,fee,positive_as_fee_reversal,fba_storage_jpy (符号反転),保管料の取消
+Storage Fee - Correction,15,fee,signed,fba_storage_jpy,保管料修正
+Order_Retrocharge,14,refund,negative_as_refund,refund_principal_jpy,過去受注の追加課金 (実態は refund 系)
+Subscription Fee,11,fee,negative_as_cost,misc_fee_jpy,サブスクリプション手数料
+StorageRenewalBilling,11,fee,negative_as_cost,fba_storage_jpy,保管更新請求
+Storage Fee,11,fee,negative_as_cost,fba_storage_jpy,通常保管料
+Refund_Retrocharge,6,refund,negative_as_refund,refund_principal_jpy,refund の追加課金
+ServiceFee,4,fee,negative_as_cost,misc_fee_jpy,サービス手数料
+Overpaid Fees Adjustment,3,adjustment,signed,fee_adjustment_jpy,過払い手数料の調整
+__UNKNOWN__,0,unknown,detect_and_alert,unknown_micro,新規 transaction_type 検出時のフォールバック (DQ alert)
