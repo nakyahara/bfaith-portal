@@ -1292,6 +1292,35 @@ function createTables() {
     updated_at            TEXT NOT NULL
   )`);
 
+  // ---- Phase 1 #1-4a: sync_runs (run ledger、miniPC 側で sync 開始記録)
+  // status 遷移: started → applied (全 chunk Render から 2xx)
+  //              | → failed (途中失敗、error_message に記録)
+  //              | → backed_out (backout-sync-run.js で逆操作)
+  // replay_of_run_id: 旧 run の replay の場合、起動時に env REPLAY_OF_RUN_ID から INSERT
+  db.exec(`CREATE TABLE IF NOT EXISTS sync_runs (
+    run_id                    TEXT PRIMARY KEY,
+    entity                    TEXT NOT NULL,
+    contract_version          INTEGER NOT NULL,
+    source_host               TEXT NOT NULL,
+    scope_from                TEXT NOT NULL CHECK(scope_from GLOB '????-??-??'),
+    scope_to                  TEXT NOT NULL CHECK(scope_to   GLOB '????-??-??'),
+    chunk_count_expected      INTEGER NOT NULL,
+    chunk_count_received      INTEGER NOT NULL DEFAULT 0,
+    row_count_received        INTEGER NOT NULL DEFAULT 0,
+    payload_checksum_manifest TEXT,
+    status                    TEXT NOT NULL CHECK (
+      status IN ('started','applied','failed','backed_out')
+    ),
+    replay_of_run_id          TEXT,
+    error_message             TEXT,
+    started_at                TEXT NOT NULL,
+    completed_at              TEXT,
+    applied_at                TEXT,
+    FOREIGN KEY (entity) REFERENCES sync_contracts(entity)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_sync_runs_entity_status ON sync_runs(entity, status)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_sync_runs_started_at ON sync_runs(started_at)');
+
   db.exec(`CREATE TABLE IF NOT EXISTS accounting_diff_buckets (
     run_id        TEXT NOT NULL,
     month_jst     TEXT NOT NULL,

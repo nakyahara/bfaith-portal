@@ -348,6 +348,430 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
   }
 });
 
+// ─── Phase 1 #1-4a: POST /api/sync/:entity/chunk (entity-driven contract sync) ───
+//
+// 受信処理:
+//   1. 認証 (x-sync-key)
+//   2. payload validation (sync_run_id / contract_version / chunk_index 等)
+//   3. checksum 検証 (改ざん検知)
+//   4. is_first=true なら scope clear (entity 別 clear strategy)
+//   5. payload を mirror テーブルに INSERT OR REPLACE
+//   6. sync_run_chunks に ledger 記録 (received_at)
+//   7. apply 成功で applied_at を更新
+//   8. is_last=true なら status response
+//
+// Phase 1 #1-4 で sync_contracts に登録済みの entity のみ受信
+// (現状: amazon_finance_sku_daily v1)
+//
+// payload 構造 (POST body):
+// {
+//   sync_run_id: "amazon_finance_sku_daily-v1-2026-05-08T0731",
+//   contract_version: 1,
+//   scope_from: "2026-04-01",
+//   scope_to: "2026-04-30",
+//   chunk_index: 0,
+//   chunk_count: 5,
+//   is_first: true,
+//   is_last: false,
+//   row_count: 5000,
+//   payload_checksum: "sha256...",
+//   meta: { clear_amazon_finance_dates: ["2026-04-01", ...] },  // first chunk のみ
+//   payload: { rows: [...] }
+// }
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const SUPPORTED_ENTITIES = new Set(['amazon_finance_sku_daily']);
+// entity 別の期待 contract_version (Codex Round 12 #5)
+const ENTITY_CONTRACT_VERSION = {
+  amazon_finance_sku_daily: 1,
+};
+
+// Insert/ledger statement キャッシュ (DB 接続単位、Codex Round 13 #2)
+// モジュール変数だと DB 切替時に古い connection の statement を再利用してしまうため WeakMap
+const _stmtCache = new WeakMap();  // db => { amazonFinanceInsert, ledgerInsert }
+function getStmtBundle(db) {
+  let bundle = _stmtCache.get(db);
+  if (!bundle) {
+    bundle = {};
+    _stmtCache.set(db, bundle);
+  }
+  return bundle;
+}
+function getAmazonFinanceInsert(db) {
+  const b = getStmtBundle(db);
+  if (!b.amazonFinanceInsert) {
+    b.amazonFinanceInsert = db.prepare(`
+      INSERT OR REPLACE INTO mirror_amazon_finance_sku_daily (
+        date_jst, seller_sku, asin_norm, product_name,
+        units_ordered, units_refunded_customer, units_marketplace_guarantee,
+        units_a_to_z_refund, units_net_sold,
+        sales_principal_jpy, sales_shipping_jpy, sales_giftwrap_jpy, sales_tax_jpy,
+        commission_jpy, fba_fulfillment_jpy, fba_storage_jpy, closing_fee_jpy,
+        shipping_chargeback_jpy, giftwrap_chargeback_jpy, promotion_jpy,
+        warehouse_damage_jpy, warehouse_lost_jpy, safe_t_jpy,
+        refund_principal_jpy, reversal_reimbursement_jpy,
+        misc_fee_jpy, other_fee_jpy, other_amount_jpy,
+        unit_cost_snapshot, cost_snapshot_date_jst, latest_unit_cost_reference,
+        cogs_amount, profit_amount, is_cost_complete, cost_status,
+        source_run_id, source_row_hash, synced_at
+      ) VALUES (
+        @date_jst, @seller_sku, @asin_norm, @product_name,
+        @units_ordered, @units_refunded_customer, @units_marketplace_guarantee,
+        @units_a_to_z_refund, @units_net_sold,
+        @sales_principal_jpy, @sales_shipping_jpy, @sales_giftwrap_jpy, @sales_tax_jpy,
+        @commission_jpy, @fba_fulfillment_jpy, @fba_storage_jpy, @closing_fee_jpy,
+        @shipping_chargeback_jpy, @giftwrap_chargeback_jpy, @promotion_jpy,
+        @warehouse_damage_jpy, @warehouse_lost_jpy, @safe_t_jpy,
+        @refund_principal_jpy, @reversal_reimbursement_jpy,
+        @misc_fee_jpy, @other_fee_jpy, @other_amount_jpy,
+        @unit_cost_snapshot, @cost_snapshot_date_jst, @latest_unit_cost_reference,
+        @cogs_amount, @profit_amount, @is_cost_complete, @cost_status,
+        @source_run_id, @source_row_hash, @synced_at
+      )
+    `);
+  }
+  return b.amazonFinanceInsert;
+}
+function getLedgerInsert(db) {
+  const b = getStmtBundle(db);
+  if (!b.ledgerInsert) {
+    b.ledgerInsert = db.prepare(`
+      INSERT INTO sync_run_chunks
+        (run_id, entity, chunk_index, chunk_count, row_count, payload_checksum,
+         contract_version, scope_from, scope_to, received_at, applied_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+  }
+  return b.ledgerInsert;
+}
+
+// HttpError: tx 内から throw して outer catch で http response に変換
+class HttpError extends Error {
+  constructor(status, body) { super(body.error || 'http_error'); this.status = status; this.body = body; }
+}
+
+router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
+  const entity = req.params.entity;
+  const body = req.body || {};
+  const {
+    sync_run_id, contract_version, scope_from, scope_to,
+    chunk_index, chunk_count, is_first, is_last, row_count,
+    payload_checksum, meta = {}, payload = {}
+  } = body;
+
+  // ────────── 1. payload validation ──────────
+  if (!sync_run_id || typeof sync_run_id !== 'string') {
+    return res.status(400).json({ error: 'sync_run_id required' });
+  }
+  if (!Number.isInteger(contract_version)) {
+    return res.status(400).json({ error: 'contract_version must be integer' });
+  }
+  if (!Number.isInteger(chunk_index) || chunk_index < 0) {
+    return res.status(400).json({ error: 'chunk_index must be non-negative integer' });
+  }
+  if (!Number.isInteger(chunk_count) || chunk_count <= 0) {
+    return res.status(400).json({ error: 'chunk_count must be positive integer' });
+  }
+  if (chunk_index >= chunk_count) {
+    return res.status(400).json({ error: `chunk_index=${chunk_index} >= chunk_count=${chunk_count}` });
+  }
+  if (typeof payload_checksum !== 'string' || payload_checksum.length === 0) {
+    return res.status(400).json({ error: 'payload_checksum required' });
+  }
+  if (!DATE_RE.test(scope_from) || !DATE_RE.test(scope_to)) {
+    return res.status(400).json({ error: 'scope_from/scope_to must be YYYY-MM-DD' });
+  }
+  if (scope_from > scope_to) {
+    return res.status(400).json({ error: `scope_from=${scope_from} > scope_to=${scope_to}` });
+  }
+  const isFirstExpected = chunk_index === 0;
+  const isLastExpected = chunk_index === chunk_count - 1;
+  if (Boolean(is_first) !== isFirstExpected) {
+    return res.status(400).json({ error: `is_first=${is_first} mismatch chunk_index=${chunk_index} (expected ${isFirstExpected})` });
+  }
+  if (Boolean(is_last) !== isLastExpected) {
+    return res.status(400).json({ error: `is_last=${is_last} mismatch chunk_index=${chunk_index}/${chunk_count} (expected ${isLastExpected})` });
+  }
+  const rows = Array.isArray(payload?.rows) ? payload.rows : null;
+  if (rows === null) {
+    return res.status(400).json({ error: 'payload.rows must be array' });
+  }
+  if (!Number.isInteger(row_count) || row_count !== rows.length) {
+    return res.status(400).json({ error: `row_count=${row_count} != payload.rows.length=${rows.length}` });
+  }
+
+  // ────────── 2. entity / contract_version 値域確認 (Codex Round 12 #5) ──────────
+  if (!SUPPORTED_ENTITIES.has(entity)) {
+    return res.status(400).json({ error: `unsupported entity: ${entity}` });
+  }
+  const expectedVer = ENTITY_CONTRACT_VERSION[entity];
+  if (contract_version !== expectedVer) {
+    return res.status(400).json({
+      error: 'contract_version_mismatch',
+      message: `entity=${entity} requires contract_version=${expectedVer} (got ${contract_version})`,
+    });
+  }
+
+  // ────────── 3. checksum 検証 + first chunk meta 形式 ──────────
+  const crypto = await import('node:crypto');
+  const payloadStr = JSON.stringify(payload);
+  const computedChecksum = crypto.createHash('sha256').update(payloadStr).digest('hex');
+  if (computedChecksum !== payload_checksum) {
+    console.error(`[Mirror] checksum mismatch req entity=${entity} chunk=${chunk_index}`);
+    return res.status(400).json({
+      error: 'payload_checksum mismatch',
+      expected: payload_checksum, computed: computedChecksum,
+    });
+  }
+  let clearDates = null;
+  if (is_first && entity === 'amazon_finance_sku_daily') {
+    clearDates = meta.clear_amazon_finance_dates;
+    if (!Array.isArray(clearDates) || clearDates.length === 0) {
+      return res.status(400).json({ error: 'first chunk requires meta.clear_amazon_finance_dates (non-empty array)' });
+    }
+    for (const d of clearDates) {
+      if (!DATE_RE.test(d)) return res.status(400).json({ error: `invalid date in clear list: ${d}` });
+    }
+  }
+
+  // ────────── 4. tx 実行 (BEGIN IMMEDIATE で write 直列化、Codex Round 12 #1 #3) ──────────
+  const db = getMirrorDB();
+  const now = new Date().toISOString();
+  const requestId = `sync-${Date.now().toString(36)}`;
+  const insertStmt = getAmazonFinanceInsert(db);
+  const insertLedger = getLedgerInsert(db);
+  let result;
+  try {
+    db.transaction(() => {
+      // 4a. run 単位の不変条件: 既存 chunk があれば contract_version / scope / chunk_count 一致 (#2)
+      const runFirst = db.prepare(`
+        SELECT contract_version, scope_from, scope_to, chunk_count
+        FROM sync_run_chunks WHERE run_id = ? AND entity = ? LIMIT 1
+      `).get(sync_run_id, entity);
+      if (runFirst) {
+        if (runFirst.contract_version !== contract_version
+            || runFirst.scope_from !== scope_from
+            || runFirst.scope_to !== scope_to
+            || runFirst.chunk_count !== chunk_count) {
+          throw new HttpError(409, {
+            error: 'run_invariant_mismatch',
+            message: 'run 内の chunk で contract_version / scope / chunk_count が一致しません',
+            run_existing: runFirst,
+            received: { contract_version, scope_from, scope_to, chunk_count },
+          });
+        }
+      }
+
+      // 4b. 同一 chunk_index 既存確認 (idempotent re-send 短絡 / 不一致は 409、Codex Round 12 #3)
+      const existing = db.prepare(`
+        SELECT chunk_count, row_count, payload_checksum, scope_from, scope_to
+        FROM sync_run_chunks WHERE run_id = ? AND entity = ? AND chunk_index = ?
+      `).get(sync_run_id, entity, chunk_index);
+      if (existing) {
+        if (existing.payload_checksum !== payload_checksum
+            || existing.row_count !== row_count
+            || existing.chunk_count !== chunk_count) {
+          throw new HttpError(409, {
+            error: 'chunk_resend_mismatch',
+            existing, received: { payload_checksum, row_count, chunk_count },
+          });
+        }
+        result = { replayed: true };
+        return;
+      }
+
+      // 4c. scope clear (is_first かつ この run でまだ何も apply 無い時のみ、#1 race 解消版)
+      let didClear = false;
+      let clearedRows = 0;
+      if (is_first) {
+        const priorCount = db.prepare(`
+          SELECT COUNT(*) AS c FROM sync_run_chunks WHERE run_id = ? AND entity = ?
+        `).get(sync_run_id, entity).c;
+        if (priorCount === 0) {
+          const placeholders = clearDates.map(() => '?').join(',');
+          clearedRows = db.prepare(`
+            DELETE FROM mirror_amazon_finance_sku_daily WHERE date_jst IN (${placeholders})
+          `).run(...clearDates).changes;
+          didClear = true;
+        }
+      }
+
+      // 4d. row INSERT
+      for (const r of rows) {
+        insertStmt.run(normalizeAmazonFinanceRow(r));
+      }
+
+      // 4e. ledger insert
+      insertLedger.run(sync_run_id, entity, chunk_index, chunk_count, row_count,
+                       payload_checksum, contract_version, scope_from, scope_to, now, now);
+
+      result = { applied: true, didClear, clearedRows };
+    }).immediate();  // BEGIN IMMEDIATE で write 直列化 (cross-process 安全)
+  } catch (e) {
+    if (e instanceof HttpError) {
+      return res.status(e.status).json({ ...e.body, request_id: requestId });
+    }
+    console.error(`[Mirror] sync chunk error req=${requestId}: ${e.message}`);
+    return res.status(500).json({ error: e.message, request_id: requestId });
+  }
+
+  if (result.replayed) {
+    console.log(`[Mirror] sync chunk replayed (idempotent) req=${requestId} entity=${entity} run=${sync_run_id} chunk=${chunk_index}`);
+    return res.json({ ok: true, request_id: requestId, sync_run_id, entity, chunk_index, replayed: true });
+  }
+
+  console.log(`[Mirror] sync chunk applied req=${requestId} entity=${entity} run=${sync_run_id} chunk=${chunk_index}/${chunk_count} rows=${rows.length} cleared=${result.didClear ? result.clearedRows : 'no'}`);
+
+  // ────────── 5. is_last なら欠番チェック ──────────
+  if (is_last) {
+    const present = db.prepare(`
+      SELECT chunk_index, row_count FROM sync_run_chunks
+      WHERE run_id = ? AND entity = ? ORDER BY chunk_index
+    `).all(sync_run_id, entity);
+    const presentSet = new Set(present.map(p => p.chunk_index));
+    const missing = [];
+    for (let i = 0; i < chunk_count; i++) if (!presentSet.has(i)) missing.push(i);
+    const totalRows = present.reduce((s, p) => s + p.row_count, 0);
+    if (missing.length > 0) {
+      console.warn(`[Mirror] sync is_last but missing chunks: ${missing.join(',')} run=${sync_run_id}`);
+      return res.status(409).json({
+        ok: false, request_id: requestId, sync_run_id, entity,
+        status: 'incomplete',
+        chunks_received: present.length, expected: chunk_count,
+        missing_chunks: missing, rows_received: totalRows,
+      });
+    }
+    return res.json({
+      ok: true, request_id: requestId, sync_run_id, entity, status: 'completed',
+      chunks_received: present.length, expected: chunk_count, rows_received: totalRows,
+    });
+  }
+
+  return res.json({ ok: true, request_id: requestId, sync_run_id, entity, chunk_index });
+});
+
+// row 列正規化 (mirror_amazon_finance_sku_daily 用)
+function normalizeAmazonFinanceRow(r) {
+  return {
+    date_jst: r.date_jst, seller_sku: r.seller_sku, asin_norm: r.asin_norm || '',
+    product_name: r.product_name || '',
+    units_ordered: r.units_ordered ?? 0,
+    units_refunded_customer: r.units_refunded_customer ?? 0,
+    units_marketplace_guarantee: r.units_marketplace_guarantee ?? 0,
+    units_a_to_z_refund: r.units_a_to_z_refund ?? 0,
+    units_net_sold: r.units_net_sold ?? 0,
+    sales_principal_jpy: r.sales_principal_jpy ?? 0,
+    sales_shipping_jpy: r.sales_shipping_jpy ?? 0,
+    sales_giftwrap_jpy: r.sales_giftwrap_jpy ?? 0,
+    sales_tax_jpy: r.sales_tax_jpy ?? 0,
+    commission_jpy: r.commission_jpy ?? 0,
+    fba_fulfillment_jpy: r.fba_fulfillment_jpy ?? 0,
+    fba_storage_jpy: r.fba_storage_jpy ?? 0,
+    closing_fee_jpy: r.closing_fee_jpy ?? 0,
+    shipping_chargeback_jpy: r.shipping_chargeback_jpy ?? 0,
+    giftwrap_chargeback_jpy: r.giftwrap_chargeback_jpy ?? 0,
+    promotion_jpy: r.promotion_jpy ?? 0,
+    warehouse_damage_jpy: r.warehouse_damage_jpy ?? 0,
+    warehouse_lost_jpy: r.warehouse_lost_jpy ?? 0,
+    safe_t_jpy: r.safe_t_jpy ?? 0,
+    refund_principal_jpy: r.refund_principal_jpy ?? 0,
+    reversal_reimbursement_jpy: r.reversal_reimbursement_jpy ?? 0,
+    misc_fee_jpy: r.misc_fee_jpy ?? 0,
+    other_fee_jpy: r.other_fee_jpy ?? 0,
+    other_amount_jpy: r.other_amount_jpy ?? 0,
+    unit_cost_snapshot: r.unit_cost_snapshot ?? null,
+    cost_snapshot_date_jst: r.cost_snapshot_date_jst ?? null,
+    latest_unit_cost_reference: r.latest_unit_cost_reference ?? null,
+    cogs_amount: r.cogs_amount ?? 0,
+    profit_amount: r.profit_amount ?? 0,
+    is_cost_complete: r.is_cost_complete ?? 0,
+    cost_status: r.cost_status,
+    source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,
+    synced_at: r.synced_at,
+  };
+}
+
+// ─── Phase 1 #1-4a: GET /api/sync/runs/:run_id (status 確認) ───
+router.get('/api/sync/runs/:run_id', requireSyncKey, (req, res) => {
+  const db = getMirrorDB();
+  const chunks = db.prepare(`
+    SELECT entity, chunk_index, chunk_count, row_count, payload_checksum,
+           received_at, applied_at
+    FROM sync_run_chunks WHERE run_id = ? ORDER BY entity, chunk_index
+  `).all(req.params.run_id);
+  if (chunks.length === 0) return res.status(404).json({ error: 'run not found' });
+  const summary = {
+    run_id: req.params.run_id,
+    chunk_count_expected: chunks[0].chunk_count,
+    chunk_count_received: chunks.length,
+    row_count_received: chunks.reduce((s, c) => s + c.row_count, 0),
+    all_applied: chunks.every(c => c.applied_at !== null),
+  };
+  res.json({ summary, chunks });
+});
+
+// ─── Phase 1 #1-4a: POST /api/sync/runs/:run_id/backout (run_id 単位 DELETE) ───
+//
+// 安全性ガード (Codex Round 11 指摘 #1): INSERT OR REPLACE で旧 run の値が
+// 上書きされている可能性があるため、scope-overlap する後続 run があれば
+// 409 で refuse する。?force=1 で明示 override 可能 (運用判断)。
+router.post('/api/sync/runs/:run_id/backout', requireSyncKey, (req, res) => {
+  const runId = req.params.run_id;
+  const force = req.query.force === '1' || req.body?.force === true;
+  const db = getMirrorDB();
+
+  // 対象 run の chunk 集約 (entity × scope)
+  const targetChunks = db.prepare(`
+    SELECT DISTINCT entity, scope_from, scope_to, MAX(received_at) AS max_received_at
+    FROM sync_run_chunks WHERE run_id = ?
+    GROUP BY entity, scope_from, scope_to
+  `).all(runId);
+  if (targetChunks.length === 0) return res.status(404).json({ error: 'run not found' });
+
+  // 各 entity-scope について、scope-overlap する後続 run を探す
+  const conflicts = [];
+  for (const t of targetChunks) {
+    const overlap = db.prepare(`
+      SELECT DISTINCT run_id, scope_from, scope_to, MAX(received_at) AS max_received_at
+      FROM sync_run_chunks
+      WHERE entity = ?
+        AND run_id <> ?
+        AND scope_from <= ?
+        AND scope_to   >= ?
+        AND received_at > ?
+      GROUP BY run_id, scope_from, scope_to
+      ORDER BY max_received_at
+    `).all(t.entity, runId, t.scope_to, t.scope_from, t.max_received_at);
+    for (const o of overlap) conflicts.push({ entity: t.entity, target_scope: [t.scope_from, t.scope_to], conflicting: o });
+  }
+
+  if (conflicts.length > 0 && !force) {
+    return res.status(409).json({
+      error: 'backout_unsafe_overlap',
+      message: 'scope-overlap する後続 run があるため backout で旧 run の上書き値を消失させる可能性があります。?force=1 で override 可能',
+      run_id: runId,
+      conflicts,
+    });
+  }
+
+  const entities = [...new Set(targetChunks.map(t => t.entity))];
+  const deleted = {};
+  const tx = db.transaction(() => {
+    for (const entity of entities) {
+      if (entity === 'amazon_finance_sku_daily') {
+        const info = db.prepare(`
+          DELETE FROM mirror_amazon_finance_sku_daily WHERE source_run_id = ?
+        `).run(runId);
+        deleted[entity] = info.changes;
+      }
+    }
+    db.prepare(`DELETE FROM sync_run_chunks WHERE run_id = ?`).run(runId);
+  });
+  tx();
+
+  console.log(`[Mirror] backout run=${runId} deleted=${JSON.stringify(deleted)} force=${force} conflicts=${conflicts.length}`);
+  res.json({ ok: true, run_id: runId, deleted, force, conflicts_overridden: conflicts.length });
+});
+
 // ─── GET /api/products ───
 
 router.get('/api/products', (req, res) => {

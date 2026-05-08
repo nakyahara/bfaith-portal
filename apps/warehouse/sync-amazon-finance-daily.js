@@ -154,7 +154,7 @@ const enrichedRows = rows.map(r => {
 });
 
 // ============================================================
-// 3. chunk + send (or dry-run)
+// 3. chunk + ledger 記録 + send (or dry-run)
 // ============================================================
 const chunks = [];
 for (let i = 0; i < enrichedRows.length; i += CHUNK_SIZE) {
@@ -162,19 +162,136 @@ for (let i = 0; i < enrichedRows.length; i += CHUNK_SIZE) {
 }
 console.log(`\n  Chunks: ${chunks.length} (chunk_size=${CHUNK_SIZE})`);
 
-if (isDryRun) {
-  console.log('\n--- DRY RUN ---');
-  console.log(`  Would send ${chunks.length} chunks (${enrichedRows.length} rows total) to ${renderUrl || '<RENDER_MIRROR_URL not set>'}`);
-  console.log(`  First chunk meta: clear_amazon_finance_dates=[${distinctDates.length} dates]`);
-  console.log(`  Sample row keys: ${Object.keys(enrichedRows[0]).join(', ')}`);
-  console.log(`  Sample row[0]: date=${enrichedRows[0].date_jst} sku=${enrichedRows[0].seller_sku} profit=${enrichedRows[0].profit_amount} hash=${enrichedRows[0].source_row_hash}`);
-  db.close();
-  process.exit(0);
-}
+// payload checksum 計算 (chunk 別)
+import('node:os').then(async (os) => {
+  const sourceHost = os.hostname();
+  const startedAt = new Date().toISOString();
 
-// 実 send (Render 受信側は #1-4a で実装、現状は dry-run まで)
-console.log('\n  ⚠ 実 send は #1-4a (sync ledger) で warehouse-mirror/router.js に受信ロジック追加後に実行可能');
-console.log('  本 PR では payload build + dry-run までを scope とする');
+  // 3a. ledger に sync_runs 記録 (started)
+  // replay_of_run_id は REPLAY_OF_RUN_ID env から読み込み (replay-sync-run.js が設定)
+  // child 側で INSERT 時点で記録することで race を回避 (Codex 指摘 #6)
+  const replayOfRunId = (process.env.REPLAY_OF_RUN_ID || '').trim() || null;
+  if (!isDryRun) {
+    db.close();
+    const writeDb = new Database(dbPath);
+    writeDb.prepare(`
+      INSERT INTO sync_runs (
+        run_id, entity, contract_version, source_host,
+        scope_from, scope_to, chunk_count_expected,
+        status, started_at, replay_of_run_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'started', ?, ?)
+    `).run(runId, ENTITY_NAME, CONTRACT_VERSION, sourceHost,
+            dateRange.from, dateRange.to, chunks.length, startedAt, replayOfRunId);
+    writeDb.close();
+    if (replayOfRunId) console.log(`  replay_of_run_id: ${replayOfRunId}`);
+  }
 
-db.close();
-process.exit(0);
+  if (isDryRun) {
+    console.log('\n--- DRY RUN ---');
+    console.log(`  Would send ${chunks.length} chunks (${enrichedRows.length} rows total) to ${renderUrl || '<RENDER_MIRROR_URL not set>'}`);
+    console.log(`  First chunk meta: clear_amazon_finance_dates=[${distinctDates.length} dates]`);
+    console.log(`  Sample row keys: ${Object.keys(enrichedRows[0]).join(', ')}`);
+    console.log(`  Sample row[0]: date=${enrichedRows[0].date_jst} sku=${enrichedRows[0].seller_sku} profit=${enrichedRows[0].profit_amount} hash=${enrichedRows[0].source_row_hash}`);
+    process.exit(0);
+  }
+
+  // 3b. 実 send (chunk loop)
+  const cryptoMod = await import('node:crypto');
+  let totalRowsSent = 0;
+  let chunksApplied = 0;  // partial apply 記録用 (Codex Round 12 #4)
+  let lastError = null;
+
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    const isFirst = i === 0;
+    const isLast = i === chunks.length - 1;
+    const payload = { rows: chunk };
+    const payloadStr = JSON.stringify(payload);
+    const payloadChecksum = cryptoMod.createHash('sha256').update(payloadStr).digest('hex');
+
+    const body = {
+      sync_run_id: runId,
+      contract_version: CONTRACT_VERSION,
+      scope_from: dateRange.from,
+      scope_to: dateRange.to,
+      chunk_index: i,
+      chunk_count: chunks.length,
+      is_first: isFirst,
+      is_last: isLast,
+      row_count: chunk.length,
+      payload_checksum: payloadChecksum,
+      meta: isFirst ? { clear_amazon_finance_dates: distinctDates } : {},
+      payload,
+    };
+
+    console.log(`  [${i + 1}/${chunks.length}] sending ${chunk.length} rows...`);
+    try {
+      const res = await fetch(`${renderUrl}/apps/mirror/api/sync/${ENTITY_NAME}/chunk`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-sync-key': syncKey,
+        },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        // 409 incomplete (is_last 受信後の欠番検出) は当該 chunk 自体は DB 反映済みなので
+        // partial 計上に含める (Codex Round 13 #1)
+        // parse 失敗時も保守的に当該 chunk を加算 (Codex Round 14 #1)
+        if (res.status === 409 && isLast) {
+          let parsed = null;
+          try { parsed = JSON.parse(text); } catch { /* parse 失敗 */ }
+          if (parsed && parsed.status === 'incomplete' && Number.isInteger(parsed.chunks_received)) {
+            chunksApplied = parsed.chunks_received;
+            totalRowsSent = Number.isInteger(parsed.rows_received) ? parsed.rows_received : totalRowsSent + chunk.length;
+            lastError = `HTTP 409 incomplete: missing_chunks=${JSON.stringify(parsed.missing_chunks)} chunks_received=${parsed.chunks_received}/${chunks.length}`;
+          } else {
+            // parse 失敗 / 形式不一致でも 409 + isLast なら当該 chunk は反映済みと推定
+            chunksApplied += 1;
+            totalRowsSent += chunk.length;
+            lastError = `HTTP 409 (body parse failed, conservatively counted as applied): ${text.slice(0, 300)}`;
+          }
+          console.error(`  ✗ chunk ${i} accepted but run incomplete: ${lastError}`);
+          break;
+        }
+        lastError = `HTTP ${res.status}: ${text.slice(0, 300)}`;
+        console.error(`  ✗ chunk ${i} failed: ${lastError}`);
+        break;
+      }
+      const result = await res.json();
+      totalRowsSent += chunk.length;
+      chunksApplied += 1;
+      console.log(`  ✓ chunk ${i} applied (request_id=${result.request_id})`);
+    } catch (e) {
+      lastError = e.message;
+      console.error(`  ✗ chunk ${i} error: ${e.message}`);
+      break;
+    }
+  }
+
+  // 3c. ledger に最終 status 記録 (failed でも partial apply 状況を残す、Codex Round 12 #4)
+  const finishDb = new Database(dbPath);
+  if (lastError) {
+    finishDb.prepare(`
+      UPDATE sync_runs SET status = 'failed', error_message = ?, completed_at = ?,
+        chunk_count_received = ?, row_count_received = ?
+       WHERE run_id = ?
+    `).run(lastError, new Date().toISOString(), chunksApplied, totalRowsSent, runId);
+    console.log(`\n✗ sync FAILED at chunk ${chunksApplied}/${chunks.length} (${totalRowsSent} rows applied): ${lastError}`);
+    finishDb.close();
+    process.exit(1);
+  } else {
+    finishDb.prepare(`
+      UPDATE sync_runs SET status = 'applied', chunk_count_received = ?,
+        row_count_received = ?, completed_at = ?, applied_at = ?
+       WHERE run_id = ?
+    `).run(chunksApplied, totalRowsSent, new Date().toISOString(), new Date().toISOString(), runId);
+    console.log(`\n✓ sync complete (run_id=${runId}, ${totalRowsSent} rows in ${chunksApplied} chunks)`);
+    finishDb.close();
+    process.exit(0);
+  }
+}).catch(e => {
+  console.error(`FATAL: ${e.message}`);
+  process.exit(1);
+});
