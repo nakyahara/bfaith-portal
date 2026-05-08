@@ -198,6 +198,7 @@ import('node:os').then(async (os) => {
   // 3b. 実 send (chunk loop)
   const cryptoMod = await import('node:crypto');
   let totalRowsSent = 0;
+  let chunksApplied = 0;  // partial apply 記録用 (Codex Round 12 #4)
   let lastError = null;
 
   for (let i = 0; i < chunks.length; i++) {
@@ -241,6 +242,7 @@ import('node:os').then(async (os) => {
       }
       const result = await res.json();
       totalRowsSent += chunk.length;
+      chunksApplied += 1;
       console.log(`  ✓ chunk ${i} applied (request_id=${result.request_id})`);
     } catch (e) {
       lastError = e.message;
@@ -249,14 +251,15 @@ import('node:os').then(async (os) => {
     }
   }
 
-  // 3c. ledger に最終 status 記録
+  // 3c. ledger に最終 status 記録 (failed でも partial apply 状況を残す、Codex Round 12 #4)
   const finishDb = new Database(dbPath);
   if (lastError) {
     finishDb.prepare(`
-      UPDATE sync_runs SET status = 'failed', error_message = ?, completed_at = ?
+      UPDATE sync_runs SET status = 'failed', error_message = ?, completed_at = ?,
+        chunk_count_received = ?, row_count_received = ?
        WHERE run_id = ?
-    `).run(lastError, new Date().toISOString(), runId);
-    console.log(`\n✗ sync FAILED at chunk: ${lastError}`);
+    `).run(lastError, new Date().toISOString(), chunksApplied, totalRowsSent, runId);
+    console.log(`\n✗ sync FAILED at chunk ${chunksApplied}/${chunks.length} (${totalRowsSent} rows applied): ${lastError}`);
     finishDb.close();
     process.exit(1);
   } else {
@@ -264,8 +267,8 @@ import('node:os').then(async (os) => {
       UPDATE sync_runs SET status = 'applied', chunk_count_received = ?,
         row_count_received = ?, completed_at = ?, applied_at = ?
        WHERE run_id = ?
-    `).run(chunks.length, totalRowsSent, new Date().toISOString(), new Date().toISOString(), runId);
-    console.log(`\n✓ sync complete (run_id=${runId}, ${totalRowsSent} rows in ${chunks.length} chunks)`);
+    `).run(chunksApplied, totalRowsSent, new Date().toISOString(), new Date().toISOString(), runId);
+    console.log(`\n✓ sync complete (run_id=${runId}, ${totalRowsSent} rows in ${chunksApplied} chunks)`);
     finishDb.close();
     process.exit(0);
   }

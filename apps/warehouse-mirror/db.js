@@ -266,9 +266,9 @@ function createTables() {
 
   // ---- Phase 1 #1-4a: sync_run_chunks (Render 側 chunk ledger)
   // chunk 受信のたびに INSERT、apply 成功で applied_at を更新
-  // 同一 (run_id, entity, chunk_index) は idempotent (INSERT 後 checksum 一致を確認、不一致は 409)
-  // payload_checksum で改ざん検知
-  // scope_from/scope_to は backout 時の scope-overlap 検出用 (denormalized)
+  // 同一 (run_id, entity, chunk_index) は idempotent (tx 内で existing 確認、checksum 一致なら短絡)
+  // contract_version / scope_from / scope_to / chunk_count は run 単位の不変条件として
+  // 同一 run の異なる chunk が来たとき同値かを検証 (Codex Round 12 #2)
   db.exec(`CREATE TABLE IF NOT EXISTS sync_run_chunks (
     run_id            TEXT NOT NULL,
     entity            TEXT NOT NULL,
@@ -276,6 +276,7 @@ function createTables() {
     chunk_count       INTEGER NOT NULL,
     row_count         INTEGER NOT NULL,
     payload_checksum  TEXT NOT NULL,
+    contract_version  INTEGER NOT NULL,
     scope_from        TEXT NOT NULL CHECK(scope_from GLOB '????-??-??'),
     scope_to          TEXT NOT NULL CHECK(scope_to   GLOB '????-??-??'),
     received_at       TEXT NOT NULL,

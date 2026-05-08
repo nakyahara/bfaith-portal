@@ -380,6 +380,64 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
 // }
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const SUPPORTED_ENTITIES = new Set(['amazon_finance_sku_daily']);
+// entity 別の期待 contract_version (Codex Round 12 #5)
+const ENTITY_CONTRACT_VERSION = {
+  amazon_finance_sku_daily: 1,
+};
+
+// Insert/ledger statement キャッシュ (一度作って使い回す)
+let _amazonFinanceInsertStmt = null;
+let _ledgerInsertStmt = null;
+function getAmazonFinanceInsert(db) {
+  if (!_amazonFinanceInsertStmt) {
+    _amazonFinanceInsertStmt = db.prepare(`
+      INSERT OR REPLACE INTO mirror_amazon_finance_sku_daily (
+        date_jst, seller_sku, asin_norm, product_name,
+        units_ordered, units_refunded_customer, units_marketplace_guarantee,
+        units_a_to_z_refund, units_net_sold,
+        sales_principal_jpy, sales_shipping_jpy, sales_giftwrap_jpy, sales_tax_jpy,
+        commission_jpy, fba_fulfillment_jpy, fba_storage_jpy, closing_fee_jpy,
+        shipping_chargeback_jpy, giftwrap_chargeback_jpy, promotion_jpy,
+        warehouse_damage_jpy, warehouse_lost_jpy, safe_t_jpy,
+        refund_principal_jpy, reversal_reimbursement_jpy,
+        misc_fee_jpy, other_fee_jpy, other_amount_jpy,
+        unit_cost_snapshot, cost_snapshot_date_jst, latest_unit_cost_reference,
+        cogs_amount, profit_amount, is_cost_complete, cost_status,
+        source_run_id, source_row_hash, synced_at
+      ) VALUES (
+        @date_jst, @seller_sku, @asin_norm, @product_name,
+        @units_ordered, @units_refunded_customer, @units_marketplace_guarantee,
+        @units_a_to_z_refund, @units_net_sold,
+        @sales_principal_jpy, @sales_shipping_jpy, @sales_giftwrap_jpy, @sales_tax_jpy,
+        @commission_jpy, @fba_fulfillment_jpy, @fba_storage_jpy, @closing_fee_jpy,
+        @shipping_chargeback_jpy, @giftwrap_chargeback_jpy, @promotion_jpy,
+        @warehouse_damage_jpy, @warehouse_lost_jpy, @safe_t_jpy,
+        @refund_principal_jpy, @reversal_reimbursement_jpy,
+        @misc_fee_jpy, @other_fee_jpy, @other_amount_jpy,
+        @unit_cost_snapshot, @cost_snapshot_date_jst, @latest_unit_cost_reference,
+        @cogs_amount, @profit_amount, @is_cost_complete, @cost_status,
+        @source_run_id, @source_row_hash, @synced_at
+      )
+    `);
+  }
+  return _amazonFinanceInsertStmt;
+}
+function getLedgerInsert(db) {
+  if (!_ledgerInsertStmt) {
+    _ledgerInsertStmt = db.prepare(`
+      INSERT INTO sync_run_chunks
+        (run_id, entity, chunk_index, chunk_count, row_count, payload_checksum,
+         contract_version, scope_from, scope_to, received_at, applied_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+  }
+  return _ledgerInsertStmt;
+}
+
+// HttpError: tx 内から throw して outer catch で http response に変換
+class HttpError extends Error {
+  constructor(status, body) { super(body.error || 'http_error'); this.status = status; this.body = body; }
+}
 
 router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
   const entity = req.params.entity;
@@ -390,7 +448,7 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
     payload_checksum, meta = {}, payload = {}
   } = body;
 
-  // 1. payload validation
+  // ────────── 1. payload validation ──────────
   if (!sync_run_id || typeof sync_run_id !== 'string') {
     return res.status(400).json({ error: 'sync_run_id required' });
   }
@@ -415,7 +473,6 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
   if (scope_from > scope_to) {
     return res.status(400).json({ error: `scope_from=${scope_from} > scope_to=${scope_to}` });
   }
-  // is_first/is_last は chunk_index と整合
   const isFirstExpected = chunk_index === 0;
   const isLastExpected = chunk_index === chunk_count - 1;
   if (Boolean(is_first) !== isFirstExpected) {
@@ -424,7 +481,6 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
   if (Boolean(is_last) !== isLastExpected) {
     return res.status(400).json({ error: `is_last=${is_last} mismatch chunk_index=${chunk_index}/${chunk_count} (expected ${isLastExpected})` });
   }
-  // row_count と rows.length 一致
   const rows = Array.isArray(payload?.rows) ? payload.rows : null;
   if (rows === null) {
     return res.status(400).json({ error: 'payload.rows must be array' });
@@ -433,203 +489,154 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
     return res.status(400).json({ error: `row_count=${row_count} != payload.rows.length=${rows.length}` });
   }
 
-  // 2. supported entity 確認 (Phase 1 では amazon_finance_sku_daily のみ)
+  // ────────── 2. entity / contract_version 値域確認 (Codex Round 12 #5) ──────────
   if (!SUPPORTED_ENTITIES.has(entity)) {
     return res.status(400).json({ error: `unsupported entity: ${entity}` });
   }
+  const expectedVer = ENTITY_CONTRACT_VERSION[entity];
+  if (contract_version !== expectedVer) {
+    return res.status(400).json({
+      error: 'contract_version_mismatch',
+      message: `entity=${entity} requires contract_version=${expectedVer} (got ${contract_version})`,
+    });
+  }
 
+  // ────────── 3. checksum 検証 + first chunk meta 形式 ──────────
+  const crypto = await import('node:crypto');
+  const payloadStr = JSON.stringify(payload);
+  const computedChecksum = crypto.createHash('sha256').update(payloadStr).digest('hex');
+  if (computedChecksum !== payload_checksum) {
+    console.error(`[Mirror] checksum mismatch req entity=${entity} chunk=${chunk_index}`);
+    return res.status(400).json({
+      error: 'payload_checksum mismatch',
+      expected: payload_checksum, computed: computedChecksum,
+    });
+  }
+  let clearDates = null;
+  if (is_first && entity === 'amazon_finance_sku_daily') {
+    clearDates = meta.clear_amazon_finance_dates;
+    if (!Array.isArray(clearDates) || clearDates.length === 0) {
+      return res.status(400).json({ error: 'first chunk requires meta.clear_amazon_finance_dates (non-empty array)' });
+    }
+    for (const d of clearDates) {
+      if (!DATE_RE.test(d)) return res.status(400).json({ error: `invalid date in clear list: ${d}` });
+    }
+  }
+
+  // ────────── 4. tx 実行 (BEGIN IMMEDIATE で write 直列化、Codex Round 12 #1 #3) ──────────
   const db = getMirrorDB();
   const now = new Date().toISOString();
   const requestId = `sync-${Date.now().toString(36)}`;
-
+  const insertStmt = getAmazonFinanceInsert(db);
+  const insertLedger = getLedgerInsert(db);
+  let result;
   try {
-    // 3. checksum 検証 (payload を JSON 化して再 hash)
-    const crypto = await import('node:crypto');
-    const payloadStr = JSON.stringify(payload);
-    const computedChecksum = crypto.createHash('sha256').update(payloadStr).digest('hex');
-    if (computedChecksum !== payload_checksum) {
-      console.error(`[Mirror] checksum mismatch req=${requestId} entity=${entity} chunk=${chunk_index}`);
-      return res.status(400).json({
-        error: 'payload_checksum mismatch',
-        expected: payload_checksum,
-        computed: computedChecksum,
-      });
-    }
-
-    // 3.5 既存 chunk 確認 (idempotent re-send は短絡、不一致は 409)
-    const existingChunk = db.prepare(`
-      SELECT chunk_count, row_count, payload_checksum, scope_from, scope_to, applied_at
-      FROM sync_run_chunks WHERE run_id = ? AND entity = ? AND chunk_index = ?
-    `).get(sync_run_id, entity, chunk_index);
-    if (existingChunk) {
-      if (existingChunk.payload_checksum !== payload_checksum
-          || existingChunk.row_count !== row_count
-          || existingChunk.chunk_count !== chunk_count
-          || existingChunk.scope_from !== scope_from
-          || existingChunk.scope_to !== scope_to) {
-        return res.status(409).json({
-          error: 'chunk_resend_mismatch',
-          existing: existingChunk,
-          received: { payload_checksum, row_count, chunk_count, scope_from, scope_to },
-        });
-      }
-      console.log(`[Mirror] sync chunk replayed (idempotent) req=${requestId} entity=${entity} run=${sync_run_id} chunk=${chunk_index}`);
-      return res.json({ ok: true, request_id: requestId, sync_run_id, entity, chunk_index, replayed: true });
-    }
-
-    // 4. scope clear: この run でまだ何も apply されていない時だけ実施
-    //    (is_first chunk の再送で既存 chunk を消さないため)
-    let didClear = false;
-    let clearedDates = 0;
-    if (is_first && entity === 'amazon_finance_sku_daily') {
-      const clearDates = meta.clear_amazon_finance_dates || [];
-      if (!Array.isArray(clearDates) || clearDates.length === 0) {
-        return res.status(400).json({ error: 'first chunk requires meta.clear_amazon_finance_dates (non-empty array)' });
-      }
-      for (const d of clearDates) {
-        if (!DATE_RE.test(d)) return res.status(400).json({ error: `invalid date in clear list: ${d}` });
-      }
-      const priorChunks = db.prepare(`SELECT COUNT(*) AS c FROM sync_run_chunks WHERE run_id = ? AND entity = ?`).get(sync_run_id, entity);
-      if (priorChunks.c > 0) {
-        // chunk 0 の後段再送だが、先に他 chunk が apply 済 → DELETE skip (整合性保護)
-        console.log(`[Mirror] scope clear SKIPPED (run already has ${priorChunks.c} chunks applied) req=${requestId} entity=${entity}`);
-      } else {
-        didClear = true;
+    db.transaction(() => {
+      // 4a. run 単位の不変条件: 既存 chunk があれば contract_version / scope / chunk_count 一致 (#2)
+      const runFirst = db.prepare(`
+        SELECT contract_version, scope_from, scope_to, chunk_count
+        FROM sync_run_chunks WHERE run_id = ? AND entity = ? LIMIT 1
+      `).get(sync_run_id, entity);
+      if (runFirst) {
+        if (runFirst.contract_version !== contract_version
+            || runFirst.scope_from !== scope_from
+            || runFirst.scope_to !== scope_to
+            || runFirst.chunk_count !== chunk_count) {
+          throw new HttpError(409, {
+            error: 'run_invariant_mismatch',
+            message: 'run 内の chunk で contract_version / scope / chunk_count が一致しません',
+            run_existing: runFirst,
+            received: { contract_version, scope_from, scope_to, chunk_count },
+          });
+        }
       }
 
-      // 5+6 を 1 transaction にまとめる (clear → INSERT rows → ledger 記録)
-      const insertStmt = db.prepare(`
-        INSERT OR REPLACE INTO mirror_amazon_finance_sku_daily (
-          date_jst, seller_sku, asin_norm, product_name,
-          units_ordered, units_refunded_customer, units_marketplace_guarantee,
-          units_a_to_z_refund, units_net_sold,
-          sales_principal_jpy, sales_shipping_jpy, sales_giftwrap_jpy, sales_tax_jpy,
-          commission_jpy, fba_fulfillment_jpy, fba_storage_jpy, closing_fee_jpy,
-          shipping_chargeback_jpy, giftwrap_chargeback_jpy, promotion_jpy,
-          warehouse_damage_jpy, warehouse_lost_jpy, safe_t_jpy,
-          refund_principal_jpy, reversal_reimbursement_jpy,
-          misc_fee_jpy, other_fee_jpy, other_amount_jpy,
-          unit_cost_snapshot, cost_snapshot_date_jst, latest_unit_cost_reference,
-          cogs_amount, profit_amount, is_cost_complete, cost_status,
-          source_run_id, source_row_hash, synced_at
-        ) VALUES (
-          @date_jst, @seller_sku, @asin_norm, @product_name,
-          @units_ordered, @units_refunded_customer, @units_marketplace_guarantee,
-          @units_a_to_z_refund, @units_net_sold,
-          @sales_principal_jpy, @sales_shipping_jpy, @sales_giftwrap_jpy, @sales_tax_jpy,
-          @commission_jpy, @fba_fulfillment_jpy, @fba_storage_jpy, @closing_fee_jpy,
-          @shipping_chargeback_jpy, @giftwrap_chargeback_jpy, @promotion_jpy,
-          @warehouse_damage_jpy, @warehouse_lost_jpy, @safe_t_jpy,
-          @refund_principal_jpy, @reversal_reimbursement_jpy,
-          @misc_fee_jpy, @other_fee_jpy, @other_amount_jpy,
-          @unit_cost_snapshot, @cost_snapshot_date_jst, @latest_unit_cost_reference,
-          @cogs_amount, @profit_amount, @is_cost_complete, @cost_status,
-          @source_run_id, @source_row_hash, @synced_at
-        )
-      `);
-      const insertLedger = db.prepare(`
-        INSERT INTO sync_run_chunks
-          (run_id, entity, chunk_index, chunk_count, row_count, payload_checksum,
-           scope_from, scope_to, received_at, applied_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-      const tx = db.transaction(() => {
-        if (didClear) {
+      // 4b. 同一 chunk_index 既存確認 (idempotent re-send 短絡 / 不一致は 409、Codex Round 12 #3)
+      const existing = db.prepare(`
+        SELECT chunk_count, row_count, payload_checksum, scope_from, scope_to
+        FROM sync_run_chunks WHERE run_id = ? AND entity = ? AND chunk_index = ?
+      `).get(sync_run_id, entity, chunk_index);
+      if (existing) {
+        if (existing.payload_checksum !== payload_checksum
+            || existing.row_count !== row_count
+            || existing.chunk_count !== chunk_count) {
+          throw new HttpError(409, {
+            error: 'chunk_resend_mismatch',
+            existing, received: { payload_checksum, row_count, chunk_count },
+          });
+        }
+        result = { replayed: true };
+        return;
+      }
+
+      // 4c. scope clear (is_first かつ この run でまだ何も apply 無い時のみ、#1 race 解消版)
+      let didClear = false;
+      let clearedRows = 0;
+      if (is_first) {
+        const priorCount = db.prepare(`
+          SELECT COUNT(*) AS c FROM sync_run_chunks WHERE run_id = ? AND entity = ?
+        `).get(sync_run_id, entity).c;
+        if (priorCount === 0) {
           const placeholders = clearDates.map(() => '?').join(',');
-          const deleted = db.prepare(`
+          clearedRows = db.prepare(`
             DELETE FROM mirror_amazon_finance_sku_daily WHERE date_jst IN (${placeholders})
           `).run(...clearDates).changes;
-          clearedDates = deleted;
+          didClear = true;
         }
-        for (const r of rows) {
-          insertStmt.run(normalizeAmazonFinanceRow(r));
-        }
-        insertLedger.run(sync_run_id, entity, chunk_index, chunk_count, row_count,
-                          payload_checksum, scope_from, scope_to, now, now);
-      });
-      tx();
-    } else {
-      // 非 first chunk: rows INSERT + ledger を 1 tx
-      const insertStmt = db.prepare(`
-        INSERT OR REPLACE INTO mirror_amazon_finance_sku_daily (
-          date_jst, seller_sku, asin_norm, product_name,
-          units_ordered, units_refunded_customer, units_marketplace_guarantee,
-          units_a_to_z_refund, units_net_sold,
-          sales_principal_jpy, sales_shipping_jpy, sales_giftwrap_jpy, sales_tax_jpy,
-          commission_jpy, fba_fulfillment_jpy, fba_storage_jpy, closing_fee_jpy,
-          shipping_chargeback_jpy, giftwrap_chargeback_jpy, promotion_jpy,
-          warehouse_damage_jpy, warehouse_lost_jpy, safe_t_jpy,
-          refund_principal_jpy, reversal_reimbursement_jpy,
-          misc_fee_jpy, other_fee_jpy, other_amount_jpy,
-          unit_cost_snapshot, cost_snapshot_date_jst, latest_unit_cost_reference,
-          cogs_amount, profit_amount, is_cost_complete, cost_status,
-          source_run_id, source_row_hash, synced_at
-        ) VALUES (
-          @date_jst, @seller_sku, @asin_norm, @product_name,
-          @units_ordered, @units_refunded_customer, @units_marketplace_guarantee,
-          @units_a_to_z_refund, @units_net_sold,
-          @sales_principal_jpy, @sales_shipping_jpy, @sales_giftwrap_jpy, @sales_tax_jpy,
-          @commission_jpy, @fba_fulfillment_jpy, @fba_storage_jpy, @closing_fee_jpy,
-          @shipping_chargeback_jpy, @giftwrap_chargeback_jpy, @promotion_jpy,
-          @warehouse_damage_jpy, @warehouse_lost_jpy, @safe_t_jpy,
-          @refund_principal_jpy, @reversal_reimbursement_jpy,
-          @misc_fee_jpy, @other_fee_jpy, @other_amount_jpy,
-          @unit_cost_snapshot, @cost_snapshot_date_jst, @latest_unit_cost_reference,
-          @cogs_amount, @profit_amount, @is_cost_complete, @cost_status,
-          @source_run_id, @source_row_hash, @synced_at
-        )
-      `);
-      const insertLedger = db.prepare(`
-        INSERT INTO sync_run_chunks
-          (run_id, entity, chunk_index, chunk_count, row_count, payload_checksum,
-           scope_from, scope_to, received_at, applied_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-      const tx = db.transaction(() => {
-        for (const r of rows) {
-          insertStmt.run(normalizeAmazonFinanceRow(r));
-        }
-        insertLedger.run(sync_run_id, entity, chunk_index, chunk_count, row_count,
-                          payload_checksum, scope_from, scope_to, now, now);
-      });
-      tx();
-    }
-
-    console.log(`[Mirror] sync chunk applied req=${requestId} entity=${entity} run=${sync_run_id} chunk=${chunk_index}/${chunk_count} rows=${rows.length} cleared=${didClear ? clearedDates : 'no'}`);
-
-    // 7. is_last なら全 chunk 受信完了 / 欠番有無を確認
-    if (is_last) {
-      const present = db.prepare(`
-        SELECT chunk_index, row_count FROM sync_run_chunks
-        WHERE run_id = ? AND entity = ? ORDER BY chunk_index
-      `).all(sync_run_id, entity);
-      const presentSet = new Set(present.map(p => p.chunk_index));
-      const missing = [];
-      for (let i = 0; i < chunk_count; i++) if (!presentSet.has(i)) missing.push(i);
-      const totalRows = present.reduce((s, p) => s + p.row_count, 0);
-      if (missing.length > 0) {
-        console.warn(`[Mirror] sync is_last but missing chunks: ${missing.join(',')} run=${sync_run_id}`);
-        return res.status(409).json({
-          ok: false, request_id: requestId, sync_run_id, entity,
-          status: 'incomplete',
-          chunks_received: present.length, expected: chunk_count,
-          missing_chunks: missing,
-          rows_received: totalRows,
-        });
       }
-      return res.json({
-        ok: true, request_id: requestId,
-        sync_run_id, entity, status: 'completed',
-        chunks_received: present.length, expected: chunk_count,
-        rows_received: totalRows,
-      });
-    }
 
-    return res.json({ ok: true, request_id: requestId, sync_run_id, entity, chunk_index });
+      // 4d. row INSERT
+      for (const r of rows) {
+        insertStmt.run(normalizeAmazonFinanceRow(r));
+      }
+
+      // 4e. ledger insert
+      insertLedger.run(sync_run_id, entity, chunk_index, chunk_count, row_count,
+                       payload_checksum, contract_version, scope_from, scope_to, now, now);
+
+      result = { applied: true, didClear, clearedRows };
+    }).immediate();  // BEGIN IMMEDIATE で write 直列化 (cross-process 安全)
   } catch (e) {
+    if (e instanceof HttpError) {
+      return res.status(e.status).json({ ...e.body, request_id: requestId });
+    }
     console.error(`[Mirror] sync chunk error req=${requestId}: ${e.message}`);
     return res.status(500).json({ error: e.message, request_id: requestId });
   }
+
+  if (result.replayed) {
+    console.log(`[Mirror] sync chunk replayed (idempotent) req=${requestId} entity=${entity} run=${sync_run_id} chunk=${chunk_index}`);
+    return res.json({ ok: true, request_id: requestId, sync_run_id, entity, chunk_index, replayed: true });
+  }
+
+  console.log(`[Mirror] sync chunk applied req=${requestId} entity=${entity} run=${sync_run_id} chunk=${chunk_index}/${chunk_count} rows=${rows.length} cleared=${result.didClear ? result.clearedRows : 'no'}`);
+
+  // ────────── 5. is_last なら欠番チェック ──────────
+  if (is_last) {
+    const present = db.prepare(`
+      SELECT chunk_index, row_count FROM sync_run_chunks
+      WHERE run_id = ? AND entity = ? ORDER BY chunk_index
+    `).all(sync_run_id, entity);
+    const presentSet = new Set(present.map(p => p.chunk_index));
+    const missing = [];
+    for (let i = 0; i < chunk_count; i++) if (!presentSet.has(i)) missing.push(i);
+    const totalRows = present.reduce((s, p) => s + p.row_count, 0);
+    if (missing.length > 0) {
+      console.warn(`[Mirror] sync is_last but missing chunks: ${missing.join(',')} run=${sync_run_id}`);
+      return res.status(409).json({
+        ok: false, request_id: requestId, sync_run_id, entity,
+        status: 'incomplete',
+        chunks_received: present.length, expected: chunk_count,
+        missing_chunks: missing, rows_received: totalRows,
+      });
+    }
+    return res.json({
+      ok: true, request_id: requestId, sync_run_id, entity, status: 'completed',
+      chunks_received: present.length, expected: chunk_count, rows_received: totalRows,
+    });
+  }
+
+  return res.json({ ok: true, request_id: requestId, sync_run_id, entity, chunk_index });
 });
 
 // row 列正規化 (mirror_amazon_finance_sku_daily 用)
