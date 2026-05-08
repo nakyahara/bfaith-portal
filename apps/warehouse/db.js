@@ -1271,6 +1271,27 @@ function createTables() {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_dq_run_results_severity
     ON dq_run_results (severity, checked_at)`);
 
+  // ---- Phase 1 #1-4: sync_contracts (entity-driven sync registry)
+  // 各 entity (mirror テーブル) ごとに contract version / source / target /
+  // grain / key 列 / payload schema / clear strategy / apply mode を明示。
+  // sync-amazon-finance-daily.js (Phase 1) / 既存 sync-to-render.js (将来 refactor) から参照。
+  db.exec(`CREATE TABLE IF NOT EXISTS sync_contracts (
+    entity                TEXT PRIMARY KEY,
+    contract_version      INTEGER NOT NULL,
+    source_system         TEXT NOT NULL,
+    source_object         TEXT NOT NULL,
+    target_table          TEXT NOT NULL,
+    grain_definition      TEXT NOT NULL,
+    key_columns_json      TEXT NOT NULL,
+    payload_schema_json   TEXT NOT NULL,
+    clear_strategy        TEXT NOT NULL,
+    apply_mode            TEXT NOT NULL,
+    enabled               INTEGER NOT NULL DEFAULT 1,
+    owner                 TEXT NOT NULL,
+    created_at            TEXT NOT NULL,
+    updated_at            TEXT NOT NULL
+  )`);
+
   db.exec(`CREATE TABLE IF NOT EXISTS accounting_diff_buckets (
     run_id        TEXT NOT NULL,
     month_jst     TEXT NOT NULL,
