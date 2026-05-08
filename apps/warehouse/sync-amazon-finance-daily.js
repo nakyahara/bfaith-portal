@@ -168,6 +168,9 @@ import('node:os').then(async (os) => {
   const startedAt = new Date().toISOString();
 
   // 3a. ledger に sync_runs 記録 (started)
+  // replay_of_run_id は REPLAY_OF_RUN_ID env から読み込み (replay-sync-run.js が設定)
+  // child 側で INSERT 時点で記録することで race を回避 (Codex 指摘 #6)
+  const replayOfRunId = (process.env.REPLAY_OF_RUN_ID || '').trim() || null;
   if (!isDryRun) {
     db.close();
     const writeDb = new Database(dbPath);
@@ -175,11 +178,12 @@ import('node:os').then(async (os) => {
       INSERT INTO sync_runs (
         run_id, entity, contract_version, source_host,
         scope_from, scope_to, chunk_count_expected,
-        status, started_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'started', ?)
+        status, started_at, replay_of_run_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'started', ?, ?)
     `).run(runId, ENTITY_NAME, CONTRACT_VERSION, sourceHost,
-            dateRange.from, dateRange.to, chunks.length, startedAt);
+            dateRange.from, dateRange.to, chunks.length, startedAt, replayOfRunId);
     writeDb.close();
+    if (replayOfRunId) console.log(`  replay_of_run_id: ${replayOfRunId}`);
   }
 
   if (isDryRun) {

@@ -28,6 +28,7 @@ function getArg(flag) {
 const DATA_DIR = (process.env.DATA_DIR || '').trim();
 const runId = getArg('--run-id');
 const isDryRun = args.includes('--dry-run');
+const isForce = args.includes('--force');
 const renderUrl = process.env.RENDER_MIRROR_URL;
 const syncKey = process.env.MIRROR_SYNC_KEY;
 
@@ -59,25 +60,34 @@ console.log(`  dry-run: ${isDryRun}`);
 
 if (isDryRun) {
   console.log('\n  (dry-run) would:');
-  console.log(`    1. POST ${renderUrl}/apps/mirror/api/sync/runs/${runId}/backout`);
+  console.log(`    1. POST ${renderUrl}/apps/mirror/api/sync/runs/${runId}/backout${isForce ? '?force=1' : ''}`);
   console.log(`    2. UPDATE sync_runs SET status='backed_out' WHERE run_id='${runId}'`);
   process.exit(0);
 }
 
 // 1. Render 側 backout API 呼び出し
 console.log('\n  Calling Render backout API...');
+const url = `${renderUrl}/apps/mirror/api/sync/runs/${runId}/backout${isForce ? '?force=1' : ''}`;
 try {
-  const res = await fetch(`${renderUrl}/apps/mirror/api/sync/runs/${runId}/backout`, {
+  const res = await fetch(url, {
     method: 'POST',
     headers: { 'x-sync-key': syncKey },
   });
+  if (res.status === 409) {
+    const body = await res.json().catch(() => ({}));
+    console.error(`\n✗ Backout REFUSED by Render (scope-overlap with later runs):`);
+    console.error(JSON.stringify(body, null, 2));
+    console.error(`\n  → 後続 run のデータを上書きで失う恐れがあります。`);
+    console.error(`  → 後続 run を先に backout するか、--force で override してください`);
+    process.exit(1);
+  }
   if (!res.ok) {
     const text = await res.text();
     console.error(`  ✗ HTTP ${res.status}: ${text.slice(0, 300)}`);
     process.exit(1);
   }
   const result = await res.json();
-  console.log(`  ✓ Render backout: ${JSON.stringify(result.deleted)}`);
+  console.log(`  ✓ Render backout: ${JSON.stringify(result.deleted)} (force=${result.force}, conflicts_overridden=${result.conflicts_overridden})`);
 } catch (e) {
   console.error(`  ✗ Render API error: ${e.message}`);
   process.exit(1);

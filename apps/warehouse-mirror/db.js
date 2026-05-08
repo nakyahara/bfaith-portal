@@ -266,8 +266,9 @@ function createTables() {
 
   // ---- Phase 1 #1-4a: sync_run_chunks (Render 側 chunk ledger)
   // chunk 受信のたびに INSERT、apply 成功で applied_at を更新
-  // 同一 (run_id, entity, chunk_index) は idempotent (INSERT OR REPLACE)
+  // 同一 (run_id, entity, chunk_index) は idempotent (INSERT 後 checksum 一致を確認、不一致は 409)
   // payload_checksum で改ざん検知
+  // scope_from/scope_to は backout 時の scope-overlap 検出用 (denormalized)
   db.exec(`CREATE TABLE IF NOT EXISTS sync_run_chunks (
     run_id            TEXT NOT NULL,
     entity            TEXT NOT NULL,
@@ -275,19 +276,22 @@ function createTables() {
     chunk_count       INTEGER NOT NULL,
     row_count         INTEGER NOT NULL,
     payload_checksum  TEXT NOT NULL,
+    scope_from        TEXT NOT NULL CHECK(scope_from GLOB '????-??-??'),
+    scope_to          TEXT NOT NULL CHECK(scope_to   GLOB '????-??-??'),
     received_at       TEXT NOT NULL,
     applied_at        TEXT,
     PRIMARY KEY (run_id, entity, chunk_index)
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_src_run_id ON sync_run_chunks(run_id)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_src_entity_received ON sync_run_chunks(entity, received_at)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_src_entity_scope ON sync_run_chunks(entity, scope_from, scope_to)');
 
   // mirror_amazon_finance_sku_daily — Phase 1 #1-4 (Render 側 daily fact mirror)
   // miniPC の f_amazon_finance_sku_daily_v1 の payload を受信。
   // contract_version は sync_contracts.contract_version と整合。
   // PK: (date_jst, seller_sku, asin_norm) — asin_norm 物理列で NULL 排除 (Codex Round 8 推奨)
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_amazon_finance_sku_daily (
-    date_jst                    TEXT NOT NULL CHECK(date_jst GLOB '____-__-__'),
+    date_jst                    TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
     seller_sku                  TEXT NOT NULL CHECK(trim(seller_sku) <> ''),
     asin_norm                   TEXT NOT NULL DEFAULT '',
     product_name                TEXT NOT NULL DEFAULT '',

@@ -65,26 +65,14 @@ if (isDryRun) childArgs.push('--dry-run');
 
 console.log(`\n  Spawning: node ${childArgs.join(' ')}`);
 
+// child 側で REPLAY_OF_RUN_ID を読んで sync_runs INSERT 時に記録するため、
+// replay 後の SELECT/UPDATE は不要 (Codex 指摘 #6 race 解消)
 const child = spawn('node', childArgs, { stdio: 'inherit', env: { ...process.env, REPLAY_OF_RUN_ID: originalRunId } });
 child.on('close', (code) => {
   if (code !== 0) {
     console.error(`\n✗ Replay child exited with code ${code}`);
     process.exit(code);
   }
-
-  // 新 run_id に replay_of_run_id を記録 (子プロセスが INSERT 済の最新 run を更新)
-  if (!isDryRun) {
-    const writeDb = new Database(dbPath);
-    const newRun = writeDb.prepare(`
-      SELECT run_id FROM sync_runs
-      WHERE entity = ? AND scope_from = ? AND scope_to = ? AND replay_of_run_id IS NULL
-      ORDER BY started_at DESC LIMIT 1
-    `).get(run.entity, run.scope_from, run.scope_to);
-    if (newRun) {
-      writeDb.prepare(`UPDATE sync_runs SET replay_of_run_id = ? WHERE run_id = ?`).run(originalRunId, newRun.run_id);
-      console.log(`\n✓ Replay complete (new run_id=${newRun.run_id}, replay_of=${originalRunId})`);
-    }
-    writeDb.close();
-  }
+  console.log(`\n✓ Replay complete (replay_of=${originalRunId}, child exited 0)`);
   process.exit(0);
 });
