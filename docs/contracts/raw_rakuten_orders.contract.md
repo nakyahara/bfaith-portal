@@ -1,8 +1,12 @@
-# raw_rakuten_orders Source Contract v1
+# raw_rakuten_orders Source Contract v1.1
 
-**作成**: 2026-05-09
-**ticket**: Phase 1a #R-0a (楽天版売上分析、AI_reference: `楽天Phase1a設計書_v0.3_20260509.md`)
+**作成**: 2026-05-09 (v1)、改訂 2026-05-09 (v1.1: §4 D 案採用)
+**ticket**: Phase 1a #R-0a + #R-1 (楽天版売上分析、AI_reference: `楽天Phase1a設計書_v0.4_20260509.md`)
 **目的**: `f_rakuten_finance_sku_daily_v1` build の source として `raw_rakuten_orders` の schema / 値域 / 業務前提を凍結する。
+
+## 改訂履歴
+- v1 (2026-05-09): 初版、§4 で `order_status = 700` のみ売上計上
+- v1.1 (2026-05-09): 楽天 status=700 が 2 ヶ月遅延と判明 → §4 を D 案に改訂 (status IN (500,600,700)、900 は fact_returns 経由で控除)
 
 下流 (build / validation / sync) はこの contract に依存。本表記と実 schema が乖離した場合は、build 失敗ではなく **contract 違反として alert を出す** (`scripts/contracts/assert-rakuten-source.js` 想定)。
 
@@ -90,20 +94,55 @@
 
 ---
 
-## 4. order_status の業務前提 (重要)
+## 4. order_status の業務前提 (重要、v1.1 で D 案に改訂)
 
-`f_rakuten_finance_sku_daily_v1` build では **`order_status = 700` のみを売上計上対象** とする。
+`f_rakuten_finance_sku_daily_v1` build では **`order_status IN (500, 600, 700)` を「受注ベース」で売上計上対象** とする。
+`order_status = 900` (キャンセル) と `200/300` (異常残骸) は **silver から除外**。
+キャンセル数量は別途 `fact_returns` から `units_cancelled` として控除 (= D 案、Codex セカンドオピニオン 2026-05-09 確定)。
 
-### Why
+### Why (v1 の 700 only から改訂した理由)
 
-- **二重計上回避**: 500/600 は出荷前/出荷後だが、status=700 への移行前にキャンセル (status=900 へ遷移) する可能性あり、「売上計上後にキャンセル」の二重控除リスク
-- **会計安全側**: Amazon Phase 1 の `Settlement Report` 確定後ベースと同思想 (受注 vs 確定の分離)
-- **数日遅れ許容**: 500/600 → 700 への移行は通常数日〜1 週間。月締め時点では大部分が 700 化 (memory 確認: 古い月の 200/300 残骸は微少)
+2026-05-09 検証で楽天 `status=700` の月別比率が判明:
+- 2026-05 (当月): 0%
+- 2026-04 (先月): 0%
+- 2026-03: 31%
+- 2026-02: 98%
+- 2025-12 以前: 98%
 
-### Out of scope (将来 Phase で扱う可能性)
+→ **status=700 は約 2 ヶ月遅延**。「月初に先月売上を確定」「直近ダッシュボード可視化」の運用要件を満たせない。
 
-- 速報性が必要な業務指標 (例: リアルタイム売上ダッシュボード) は別 view (`v_rakuten_orders_in_flight` 等) で 500/600 を含める設計を検討可能、ただし Phase 1a では実装しない
-- 200/300 の異常残骸 (1 ヶ月以上経って 700 化していない) は monitoring 対象、本 contract では除外のみ
+700 only の方針は memory `feedback_per_mall_data_design.md` (「楽天は受注時点確定型」) と矛盾。Amazon の Settlement 思想を楽天に持ち込むのは不整合。
+
+### D 案 (採用) の整合性条件 (Codex 確定、検証済 2026-05-09)
+1. ✓ 売上 fact 側で `900` を計上しない (silver で IN (500,600,700) に絞り込み)
+2. ✓ 同一 order line が売上 fact で一度しか立たない (raw は latest-state-only 型、`(order_number, item_detail_id)` 重複ゼロを 376,254 行で確認)
+3. ✓ `fact_returns` がキャンセル/返品を一意キーで重複なく保持 (return_id PK)
+4. ✓ 月次定義 = 「受注純額ベース、後日キャンセルは遡及反映」
+5. ✓ `fact_returns` と silver(IN 500/600/700) の overlap = 0 (二重計上リスクなし、検証済)
+
+### units の定義
+- `units_ordered` = SUM(units) WHERE status IN (500, 600, 700) AND 当月
+- `units_cancelled` = SUM(数量) FROM fact_returns LEFT JOIN ON (date_jst, rakuten_code) — 同 (date, code) ペアのみ
+- `units_net_sold` = MAX(0, units_ordered - units_cancelled) (負値ガード、4 月実測 6 件)
+
+### Phase 1a 既知の限界 (Codex 第 2 回評価 2026-05-09 確定)
+- fact_returns 注文日 と silver date_jst が日付不一致な (date, code) ペアは LEFT JOIN で漏れる
+- 4 月実測: 88 units (cancel 全体 234 units の 36%)、refund_amount で ¥153K
+- 影響: units_cancelled / refund_amount が若干過小、cogs / variable_margin はほぼ影響なし
+- C-lite (UNION で refund-only 行追加) を試したが粗利 KPI 改善せず却下
+- **Phase 1b 推奨**: 同月・同 rakuten_code で units_ordered 比例 cancel 配賦
+  - 詳細: `g:/共有ドライブ/AI_reference/システム設計/楽天Phase1b案_C-lite検討メモ_20260509.md`
+- build script の validation で「日付不一致 SKU 数」を warning 表示済
+
+### 売上 / 原価 / 送料の扱い
+- 売上 (sales_principal / sales_postage) = silver 由来、status=900 は含まれない
+- 原価 (cogs) / 送料 (shipping) = `unit × MAX(0, units_ordered - units_cancelled)` で再計算
+- mall_fee (10%) は `(sales_principal + sales_postage - coupon_all) × 0.10` で units_ordered ベース
+  - キャンセル時の手数料返還を厳密に反映するなら × (units_net_sold/units_ordered) だが、影響 1-2% で省略 (将来 Phase 検討)
+
+### Out of scope
+- 200/300 の異常残骸 (1 ヶ月以上経って完了化していない、各月数百件) は売上定義に入れない、別途 monitoring 対象
+- C 案 (受注 + 完了の 2 列持ち) は経営層が `completed` 指標を実際に使うまで見送り (Phase 1a はシンプルに寄せる)
 
 ---
 
@@ -171,7 +210,8 @@ postage_split[item_i] = postage_price × (price_tax_incl[item_i] × units[item_i
 
 ## 9. 関連
 
-- 設計書: `g:/共有ドライブ/AI_reference/システム設計/楽天Phase1a設計書_v0.3_20260509.md`
+- 設計書: `g:/共有ドライブ/AI_reference/システム設計/楽天Phase1a設計書_v0.4_20260509.md` (v1.1 と同期)
 - Amazon Phase 1 同型 contract: `docs/contracts/raw_amazon_settlement_lines.contract.md`
-- 検査 SQL: `sql/contracts/check_raw_rakuten_orders.sql` (本 PR で新規)
-- assert script: `scripts/contracts/assert-rakuten-source.js` (本 PR で新規)
+- 検査 SQL: `sql/contracts/check_raw_rakuten_orders.sql`
+- assert script: `scripts/contracts/assert-rakuten-source.js`
+- D 案決定の根拠: Codex セカンドオピニオン (2026-05-09、`C:/tmp/codex-prompt-rakuten-status-strategy.txt` + 結果 `C:/tmp/codex-rakuten-status.txt`)
