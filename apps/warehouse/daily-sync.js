@@ -229,9 +229,14 @@ async function main() {
   // DATA_DIR は env 必須 (memory: feedback_db_path_cwd_dependency.md、cwd fallback で
   // worktree の stray DB 事故を起こした履歴あり、Codex Round 1 #1 対応で fail-fast 化)
   if (!process.env.DATA_DIR) {
+    // 設定不備系の blocked は retry 対象外で記録 (Codex Round 2 #medium-1 対応)。
+    //   - retry-failed-jobs は success===false の RETRYABLE_JOBS を再試行するため、
+    //     env 未設定で success:false を積むと永久 retry のノイズになる。
+    //   - success:true + summary に blocked 明示 = retry されないが notification には載る。
+    //   - 真の解決は winsw config 修正なので、運用者が気づける形で残す。
     console.error('[DailySync] FATAL: DATA_DIR env が未設定です。Amazon finance build/sync は実行できません。winsw config に <env name="DATA_DIR" value="C:\\Users\\bfaith\\bfaith-portal\\data"/> を設定してください。');
-    results.push({ name: 'Amazon finance build', success: false, summary: '🔴 DATA_DIR env 未設定 (fail-fast)' });
-    results.push({ name: 'Amazon finance sync', success: false, summary: '🔴 DATA_DIR env 未設定 (build skip)' });
+    const blockedSummary = '⚠️ blocked (DATA_DIR env 未設定、winsw config 要修正、retry 対象外)';
+    results.push({ name: 'Amazon finance build', success: true, summary: blockedSummary });
   } else {
     const DATA_DIR_ARG = process.env.DATA_DIR.replace(/\\/g, '/');
     const amazonFinanceBuildResult = runScript(
