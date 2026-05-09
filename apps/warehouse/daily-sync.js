@@ -261,6 +261,41 @@ async function main() {
       // build を retryable に残し、sync は build 成功時のみ実行 = sync を retry 対象外にする。
       console.log(`[DailySync] Amazon finance sync は build 失敗のため記録せず (build retry 後に翌 cron で sync 実行)`);
     }
+
+    // === 楽天 finance daily fact (Phase 1a #R-3c、#R-1 + #R-2 + #R-3a 統合) ===
+    // 1. f_rakuten_finance_sku_daily_v1 build (status IN (500,600,700) D 案、snapshot UPSERT)
+    // 2. DQ gate (6 check、severity error で exit 1)
+    // 3. mirror_rakuten_finance_sku_daily へ sync (chunk POST + ledger 記録、Render side で受信)
+    // build 失敗で DQ/sync スキップ、DQ gate failure (exit 1) でも sync スキップ
+    const rakutenFinanceBuildResult = runScript(
+      `scripts/rakuten-finance/build-rakuten-daily-fact.js --data-dir "${DATA_DIR_ARG}" --month ${currentMonth}`,
+      '楽天 finance build', 600000
+    );
+    results.push({ name: '楽天 finance build', ...rakutenFinanceBuildResult });
+
+    if (rakutenFinanceBuildResult.success) {
+      const rakutenFinanceDqResult = runScript(
+        `apps/warehouse/run-rakuten-finance-dq.js --data-dir "${DATA_DIR_ARG}" --month ${currentMonth}`,
+        '楽天 finance DQ', 300000
+      );
+      results.push({ name: '楽天 finance DQ', ...rakutenFinanceDqResult });
+
+      if (rakutenFinanceDqResult.success) {
+        // CHUNK_SIZE は Amazon と共有 (上で 3000 set 済)
+        const rakutenFinanceSyncResult = runScript(
+          `apps/warehouse/sync-rakuten-finance-daily.js --data-dir "${DATA_DIR_ARG}" --month ${currentMonth}`,
+          '楽天 finance sync', 600000
+        );
+        results.push({ name: '楽天 finance sync', ...rakutenFinanceSyncResult });
+      } else {
+        // DQ gate failure (severity='error' breach) → sync スキップ
+        // 不正なデータを Render mirror に押し付ける事故防止 (Amazon Phase 1 と同方針)
+        console.log(`[DailySync] 楽天 finance sync は DQ gate failure のため記録せず (品質不正データの mirror 投入防止)`);
+      }
+    } else {
+      // build 失敗 → DQ/sync 記録しない (Amazon と同方針)
+      console.log(`[DailySync] 楽天 finance DQ/sync は build 失敗のため記録せず (build retry 後に翌 cron で実行)`);
+    }
   }
 
   // 楽天 AM/AL/W → NE商品コード sku_map 再構築 (f_sales と独立)
