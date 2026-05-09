@@ -65,9 +65,14 @@ CREATE INDEX _silver_month_v1_idx
   ON _silver_month_v1 (date_jst, seller_sku, transaction_type);
 
 -- ----------------------------
--- INSERT 本体
+-- INSERT 本体 (UPSERT、Codex Round 2 #1 対応)
 -- ----------------------------
-INSERT OR IGNORE INTO f_amazon_finance_sku_daily_v1 (
+-- snapshot 不変条件を SQL レベルで保証:
+--   ON CONFLICT で既存 row があれば snapshot 列 (unit_cost_snapshot, cost_snapshot_date_jst)
+--   と built_at 以外の列を更新する。snapshot 列は既存値を温存。
+--   cogs_amount は「既存 snapshot 原価 × 新 units」で再計算 (refund/adjustment が後追いで来るケース対応)。
+--   profit_amount も同様に「新 sales/fees - 再計算 cogs + 新 reimbursement」。
+INSERT INTO f_amazon_finance_sku_daily_v1 (
   date_jst, seller_sku, asin_norm, product_name,
   units_ordered, units_refunded_customer, units_marketplace_guarantee,
   units_a_to_z_refund, units_net_sold,
@@ -308,6 +313,68 @@ SELECT
 
 FROM refund_enriched r
 LEFT JOIN cost_lookup c ON c.seller_sku = r.seller_sku
-LEFT JOIN m_products mp ON mp.商品コード = r.seller_sku;
+LEFT JOIN m_products mp ON mp.商品コード = r.seller_sku
+ON CONFLICT (date_jst, seller_sku) DO UPDATE SET
+  -- snapshot 列は更新しない (不変条件)
+  -- unit_cost_snapshot     ← 保持
+  -- cost_snapshot_date_jst ← 保持
+  asin_norm                  = excluded.asin_norm,
+  product_name               = excluded.product_name,
+  units_ordered              = excluded.units_ordered,
+  units_refunded_customer    = excluded.units_refunded_customer,
+  units_marketplace_guarantee = excluded.units_marketplace_guarantee,
+  units_a_to_z_refund        = excluded.units_a_to_z_refund,
+  units_net_sold             = excluded.units_net_sold,
+  sales_principal_jpy        = excluded.sales_principal_jpy,
+  sales_shipping_jpy         = excluded.sales_shipping_jpy,
+  sales_giftwrap_jpy         = excluded.sales_giftwrap_jpy,
+  sales_tax_jpy              = excluded.sales_tax_jpy,
+  commission_jpy             = excluded.commission_jpy,
+  fba_fulfillment_jpy        = excluded.fba_fulfillment_jpy,
+  fba_storage_jpy            = excluded.fba_storage_jpy,
+  closing_fee_jpy            = excluded.closing_fee_jpy,
+  shipping_chargeback_jpy    = excluded.shipping_chargeback_jpy,
+  giftwrap_chargeback_jpy    = excluded.giftwrap_chargeback_jpy,
+  promotion_jpy              = excluded.promotion_jpy,
+  warehouse_damage_jpy       = excluded.warehouse_damage_jpy,
+  warehouse_lost_jpy         = excluded.warehouse_lost_jpy,
+  safe_t_jpy                 = excluded.safe_t_jpy,
+  refund_principal_jpy       = excluded.refund_principal_jpy,
+  reversal_reimbursement_jpy = excluded.reversal_reimbursement_jpy,
+  misc_fee_jpy               = excluded.misc_fee_jpy,
+  other_fee_jpy              = excluded.other_fee_jpy,
+  other_amount_jpy           = excluded.other_amount_jpy,
+  -- latest_unit_cost_reference は最新の参考値として更新可
+  latest_unit_cost_reference = excluded.latest_unit_cost_reference,
+  -- cogs_amount は「既存 snapshot 原価 × 新 units_ordered/refund」で再計算
+  cogs_amount = ROUND(
+    COALESCE(f_amazon_finance_sku_daily_v1.unit_cost_snapshot, 0)
+    * (excluded.units_ordered - excluded.units_refunded_customer - excluded.units_a_to_z_refund),
+    2),
+  -- profit_amount = 新 sales/fees/refund/reimbursement − 再計算 cogs
+  profit_amount = ROUND(
+    excluded.sales_principal_jpy
+    + excluded.sales_shipping_jpy
+    + excluded.sales_giftwrap_jpy
+    - excluded.commission_jpy
+    - excluded.fba_fulfillment_jpy
+    - excluded.fba_storage_jpy
+    - excluded.closing_fee_jpy
+    - excluded.shipping_chargeback_jpy
+    - excluded.giftwrap_chargeback_jpy
+    - excluded.promotion_jpy
+    - excluded.refund_principal_jpy
+    + excluded.warehouse_damage_jpy
+    + excluded.warehouse_lost_jpy
+    + excluded.safe_t_jpy
+    + excluded.reversal_reimbursement_jpy
+    - COALESCE(f_amazon_finance_sku_daily_v1.unit_cost_snapshot, 0)
+      * (excluded.units_ordered - excluded.units_refunded_customer - excluded.units_a_to_z_refund),
+    2),
+  is_cost_complete = excluded.is_cost_complete,
+  cost_status      = excluded.cost_status,
+  source_layer_summary = excluded.source_layer_summary,
+  source_row_count = excluded.source_row_count,
+  built_at         = excluded.built_at;
 
 DROP TABLE IF EXISTS _silver_month_v1;

@@ -7,13 +7,14 @@
  * - Build SQL: sql/amazon/build_f_amazon_finance_sku_daily_v1.sql
  * - Mapping: docs/amazon-finance/canonical-metric-mapping.md (v1)
  *
- * 不変条件 (Codex Round 6):
- *   - 既存 (date_jst, seller_sku) は INSERT OR IGNORE で触らない (snapshot 不変)
- *   - rebuild 時は --force-rebuild オプションで対象月の DELETE → 再 INSERT
+ * 不変条件 (Codex Round 6 + Round 2 #1):
+ *   - 既存 (date_jst, seller_sku) は UPSERT で snapshot 列以外を更新 (snapshot 不変)
+ *   - rebuild 時の --force-rebuild は撤廃 (Codex Round 2 #1: snapshot を破壊するため)
+ *     → UPSERT で「refund/adjustment が後追いで来た」「units が変わった」ケースは安全に扱える
+ *     → snapshot 原価を本当にリセットしたい場合は別 ops スクリプトで明示的に行う
  *
  * 使い方:
  *   node scripts/amazon-finance/build-daily-fact.js --data-dir <DATA_DIR> --month 2026-04
- *   node scripts/amazon-finance/build-daily-fact.js --data-dir <DATA_DIR> --month 2026-04 --force-rebuild
  *   node scripts/amazon-finance/build-daily-fact.js --data-dir <DATA_DIR> --month 2026-04 --dry-run
  */
 
@@ -31,8 +32,15 @@ function getArg(flag) {
 }
 const dataDir = (getArg('--data-dir') || process.env.DATA_DIR || '').trim();
 const monthStr = getArg('--month'); // 'YYYY-MM' format
-const forceRebuild = args.includes('--force-rebuild');
 const dryRun = args.includes('--dry-run');
+// 旧 --force-rebuild は snapshot 破壊リスクで撤廃 (Codex Round 2 #1)。
+// 互換のため受け取りはするが警告のみ、実動作は通常 build と同じ。
+const forceRebuildLegacy = args.includes('--force-rebuild');
+if (forceRebuildLegacy) {
+  console.warn('  ⚠ --force-rebuild は撤廃されました (snapshot 不変条件保護のため)。');
+  console.warn('  ⚠ UPSERT で「数量変動 / refund 後追い」は通常 build で安全に扱えます。');
+  console.warn('  ⚠ 本当に snapshot 原価をリセットしたい場合は別 ops スクリプトを使用してください。');
+}
 
 if (!dataDir) {
   console.error('FATAL: --data-dir or DATA_DIR is required.');
@@ -58,7 +66,6 @@ console.log('=== f_amazon_finance_sku_daily_v1 build ===');
 console.log(`DB: ${dbPath}`);
 console.log(`Month: ${monthStr} (year_month_int=${yearMonthInt})`);
 console.log(`Build date: ${buildDate}`);
-console.log(`Force rebuild: ${forceRebuild}`);
 console.log(`Dry run: ${dryRun}`);
 console.log('');
 
@@ -109,33 +116,18 @@ try {
   console.log(`  Existing rows for ${monthStr}: ${beforeCount.toLocaleString()}`);
 
   // ============================================================
-  // 3. force-rebuild なら DELETE
+  // 3. build SQL 実行 (silver dedup temp + UPSERT、Codex Round 2 #2 対応で 1 tx 化)
   // ============================================================
-  if (forceRebuild && !dryRun) {
-    const deleted = db.prepare(`
-      DELETE FROM f_amazon_finance_sku_daily_v1 WHERE substr(date_jst, 1, 7) = ?
-    `).run(monthStr).changes;
-    console.log(`  ⚠ force-rebuild: deleted ${deleted.toLocaleString()} rows`);
-  } else if (forceRebuild && dryRun) {
-    console.log(`  (dry-run) would delete ${beforeCount.toLocaleString()} rows`);
-  }
-
-  // ============================================================
-  // 4. build SQL 実行 (silver dedup temp + INSERT OR IGNORE)
-  // ============================================================
-  console.log('--- 4. build SQL exec (silver dedup + INSERT) ---');
-  // build SQL は複数 statement (DROP TABLE / CREATE TEMP / INSERT / CREATE INDEX / DROP TABLE)
+  console.log('--- 3. build SQL exec (silver dedup + UPSERT、tx) ---');
+  // build SQL は複数 statement (DROP TABLE / CREATE TEMP / INSERT...ON CONFLICT / CREATE INDEX / DROP TABLE)
   // bind パラメータを含むのは CREATE TEMP TABLE と INSERT 文のみ
-  // ; で分割してそれぞれ prepare/exec する
+  // 全 statement を db.transaction(...).immediate() で原子化 (途中失敗時のデータ整合性保護)
 
-  // ; で statement 分割 (DROP TABLE 等の DDL は exec、:param 含むものは prepare/run)
-  // statement 全体がコメント / 空白 のみのものは除外
   const statements = rawBuildSql
     .split(';')
     .map(s => s.trim())
     .filter(s => {
       if (!s) return false;
-      // コメント行と空行を除いて SQL キーワードが残っているか
       const codeOnly = s
         .split('\n')
         .filter(l => !l.trim().startsWith('--') && l.trim() !== '')
@@ -146,26 +138,29 @@ try {
   console.log(`  Parsed ${statements.length} executable statements`);
 
   if (dryRun) {
-    console.log(`  (dry-run) would execute ${statements.length} statements`);
+    console.log(`  (dry-run) would execute ${statements.length} statements in a single tx`);
   } else {
     let totalInserted = 0;
-    for (const sql of statements) {
-      const hasParams = sql.includes(':year_month_int') || sql.includes(':build_date');
-      if (hasParams) {
-        const stmt = db.prepare(sql);
-        const info = stmt.run({ year_month_int: yearMonthInt, build_date: buildDate });
-        if (info.changes > 0) totalInserted += info.changes;
-      } else {
-        db.exec(sql);
+    const runBuildTx = db.transaction(() => {
+      for (const sql of statements) {
+        const hasParams = sql.includes(':year_month_int') || sql.includes(':build_date');
+        if (hasParams) {
+          const stmt = db.prepare(sql);
+          const info = stmt.run({ year_month_int: yearMonthInt, build_date: buildDate });
+          if (info.changes > 0) totalInserted += info.changes;
+        } else {
+          db.exec(sql);
+        }
       }
-    }
+    });
+    runBuildTx.immediate();  // BEGIN IMMEDIATE で write lock 即取得 (cross-process 安全)
     console.log(`  ✓ Total inserted/changed rows: ${totalInserted.toLocaleString()}`);
   }
 
   // ============================================================
-  // 5. 結果サマリー
+  // 4. 結果サマリー
   // ============================================================
-  console.log('--- 5. result summary ---');
+  console.log('--- 4. result summary ---');
   const afterCount = db.prepare(`
     SELECT COUNT(*) AS c FROM f_amazon_finance_sku_daily_v1 WHERE substr(date_jst, 1, 7) = ?
   `).get(monthStr).c;
@@ -202,14 +197,14 @@ try {
     console.log(`    missing_cost: ${summary.missing_count?.toLocaleString()}`);
     console.log(`    partial_cost: ${summary.partial_count?.toLocaleString()}`);
 
-    // v4 比較
+    // v4 比較 (Codex Round 2 #3: gross_margin_with_reimbursement_excl_tax を validation 対象に)
     try {
       const v4 = db.prepare(`
         SELECT
           ROUND(SUM(qty_net_sold), 0) AS v4_qty_net_sold,
           ROUND(SUM(sales_principal_jpy + sales_shipping_jpy + sales_giftwrap_jpy), 0) AS v4_revenue_jpy,
           ROUND(SUM(cogs_excl_tax), 0) AS v4_cogs_jpy,
-          ROUND(SUM(settlement_margin_excl_tax), 0) AS v4_profit_jpy
+          ROUND(SUM(gross_margin_with_reimbursement_excl_tax), 0) AS v4_profit_jpy
         FROM v_amazon_sku_profit_actual_v4
         WHERE year_month_int = ?
       `).get(yearMonthInt);
