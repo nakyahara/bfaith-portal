@@ -379,15 +379,10 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
 //   payload: { rows: [...] }
 // }
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-const SUPPORTED_ENTITIES = new Set(['amazon_finance_sku_daily']);
-// entity 別の期待 contract_version (Codex Round 12 #5)
-const ENTITY_CONTRACT_VERSION = {
-  amazon_finance_sku_daily: 1,
-};
 
 // Insert/ledger statement キャッシュ (DB 接続単位、Codex Round 13 #2)
 // モジュール変数だと DB 切替時に古い connection の statement を再利用してしまうため WeakMap
-const _stmtCache = new WeakMap();  // db => { amazonFinanceInsert, ledgerInsert }
+const _stmtCache = new WeakMap();  // db => { stmts by entity }
 function getStmtBundle(db) {
   let bundle = _stmtCache.get(db);
   if (!bundle) {
@@ -396,6 +391,7 @@ function getStmtBundle(db) {
   }
   return bundle;
 }
+
 function getAmazonFinanceInsert(db) {
   const b = getStmtBundle(db);
   if (!b.amazonFinanceInsert) {
@@ -431,6 +427,47 @@ function getAmazonFinanceInsert(db) {
   }
   return b.amazonFinanceInsert;
 }
+
+function getRakutenFinanceInsert(db) {
+  const b = getStmtBundle(db);
+  if (!b.rakutenFinanceInsert) {
+    b.rakutenFinanceInsert = db.prepare(`
+      INSERT OR REPLACE INTO mirror_rakuten_finance_sku_daily (
+        date_jst, rakuten_code, ne_code, sku_resolution, product_name,
+        units_ordered, units_cancelled, units_net_sold,
+        sales_principal_jpy_incl, sales_postage_jpy_incl,
+        coupon_shop_jpy_incl, coupon_all_jpy_incl, promotion_jpy_incl,
+        refund_amount_jpy_incl,
+        mall_fee_jpy_incl,
+        shipping_cost_jpy_incl, shipping_quality,
+        unit_cost_snapshot_incl, cost_snapshot_date_jst,
+        latest_unit_cost_reference_incl, cogs_amount_jpy_incl,
+        gross_sales_jpy_incl, net_sales_jpy_incl,
+        variable_margin_jpy_incl, refund_adjusted_net_sales_jpy_incl,
+        cost_status, is_cost_complete, data_quality_score, price_variance_warning,
+        source_layer_summary, source_row_count, built_at,
+        source_run_id, source_row_hash, synced_at
+      ) VALUES (
+        @date_jst, @rakuten_code, @ne_code, @sku_resolution, @product_name,
+        @units_ordered, @units_cancelled, @units_net_sold,
+        @sales_principal_jpy_incl, @sales_postage_jpy_incl,
+        @coupon_shop_jpy_incl, @coupon_all_jpy_incl, @promotion_jpy_incl,
+        @refund_amount_jpy_incl,
+        @mall_fee_jpy_incl,
+        @shipping_cost_jpy_incl, @shipping_quality,
+        @unit_cost_snapshot_incl, @cost_snapshot_date_jst,
+        @latest_unit_cost_reference_incl, @cogs_amount_jpy_incl,
+        @gross_sales_jpy_incl, @net_sales_jpy_incl,
+        @variable_margin_jpy_incl, @refund_adjusted_net_sales_jpy_incl,
+        @cost_status, @is_cost_complete, @data_quality_score, @price_variance_warning,
+        @source_layer_summary, @source_row_count, @built_at,
+        @source_run_id, @source_row_hash, @synced_at
+      )
+    `);
+  }
+  return b.rakutenFinanceInsert;
+}
+
 function getLedgerInsert(db) {
   const b = getStmtBundle(db);
   if (!b.ledgerInsert) {
@@ -443,6 +480,26 @@ function getLedgerInsert(db) {
   }
   return b.ledgerInsert;
 }
+
+// ─── Entity Registry (entity-driven dispatch、楽天 #R-3b で導入) ───
+// 新 entity (Yahoo / メルカリ等) 追加時はここに 1 エントリ追加するだけで
+// chunk endpoint / backout endpoint が自動対応する
+const ENTITY_REGISTRY = {
+  amazon_finance_sku_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_amazon_finance_sku_daily',
+    clear_meta_key: 'clear_amazon_finance_dates',
+    getInsertStmt: getAmazonFinanceInsert,
+    normalizeRow: (r) => normalizeAmazonFinanceRow(r),
+  },
+  rakuten_finance_sku_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_rakuten_finance_sku_daily',
+    clear_meta_key: 'clear_rakuten_finance_dates',
+    getInsertStmt: getRakutenFinanceInsert,
+    normalizeRow: (r) => normalizeRakutenFinanceRow(r),
+  },
+};
 
 // HttpError: tx 内から throw して outer catch で http response に変換
 class HttpError extends Error {
@@ -500,14 +557,14 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
   }
 
   // ────────── 2. entity / contract_version 値域確認 (Codex Round 12 #5) ──────────
-  if (!SUPPORTED_ENTITIES.has(entity)) {
+  const entityCfg = ENTITY_REGISTRY[entity];
+  if (!entityCfg) {
     return res.status(400).json({ error: `unsupported entity: ${entity}` });
   }
-  const expectedVer = ENTITY_CONTRACT_VERSION[entity];
-  if (contract_version !== expectedVer) {
+  if (contract_version !== entityCfg.contract_version) {
     return res.status(400).json({
       error: 'contract_version_mismatch',
-      message: `entity=${entity} requires contract_version=${expectedVer} (got ${contract_version})`,
+      message: `entity=${entity} requires contract_version=${entityCfg.contract_version} (got ${contract_version})`,
     });
   }
 
@@ -523,10 +580,10 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
     });
   }
   let clearDates = null;
-  if (is_first && entity === 'amazon_finance_sku_daily') {
-    clearDates = meta.clear_amazon_finance_dates;
+  if (is_first) {
+    clearDates = meta[entityCfg.clear_meta_key];
     if (!Array.isArray(clearDates) || clearDates.length === 0) {
-      return res.status(400).json({ error: 'first chunk requires meta.clear_amazon_finance_dates (non-empty array)' });
+      return res.status(400).json({ error: `first chunk requires meta.${entityCfg.clear_meta_key} (non-empty array)` });
     }
     for (const d of clearDates) {
       if (!DATE_RE.test(d)) return res.status(400).json({ error: `invalid date in clear list: ${d}` });
@@ -537,7 +594,7 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
   const db = getMirrorDB();
   const now = new Date().toISOString();
   const requestId = `sync-${Date.now().toString(36)}`;
-  const insertStmt = getAmazonFinanceInsert(db);
+  const insertStmt = entityCfg.getInsertStmt(db);
   const insertLedger = getLedgerInsert(db);
   let result;
   try {
@@ -589,7 +646,7 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
         if (priorCount === 0) {
           const placeholders = clearDates.map(() => '?').join(',');
           clearedRows = db.prepare(`
-            DELETE FROM mirror_amazon_finance_sku_daily WHERE date_jst IN (${placeholders})
+            DELETE FROM ${entityCfg.mirror_table} WHERE date_jst IN (${placeholders})
           `).run(...clearDates).changes;
           didClear = true;
         }
@@ -597,7 +654,7 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
 
       // 4d. row INSERT
       for (const r of rows) {
-        insertStmt.run(normalizeAmazonFinanceRow(r));
+        insertStmt.run(entityCfg.normalizeRow(r));
       }
 
       // 4e. ledger insert
@@ -648,6 +705,45 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
 
   return res.json({ ok: true, request_id: requestId, sync_run_id, entity, chunk_index });
 });
+
+// row 列正規化 (mirror_rakuten_finance_sku_daily 用、Phase 1a #R-3b)
+function normalizeRakutenFinanceRow(r) {
+  return {
+    date_jst: r.date_jst, rakuten_code: r.rakuten_code,
+    ne_code: r.ne_code ?? null,
+    sku_resolution: r.sku_resolution,
+    product_name: r.product_name || '',
+    units_ordered: r.units_ordered ?? 0,
+    units_cancelled: r.units_cancelled ?? 0,
+    units_net_sold: r.units_net_sold ?? 0,
+    sales_principal_jpy_incl: r.sales_principal_jpy_incl ?? 0,
+    sales_postage_jpy_incl: r.sales_postage_jpy_incl ?? 0,
+    coupon_shop_jpy_incl: r.coupon_shop_jpy_incl ?? 0,
+    coupon_all_jpy_incl: r.coupon_all_jpy_incl ?? 0,
+    promotion_jpy_incl: r.promotion_jpy_incl ?? 0,
+    refund_amount_jpy_incl: r.refund_amount_jpy_incl ?? 0,
+    mall_fee_jpy_incl: r.mall_fee_jpy_incl ?? 0,
+    shipping_cost_jpy_incl: r.shipping_cost_jpy_incl ?? 0,
+    shipping_quality: r.shipping_quality,
+    unit_cost_snapshot_incl: r.unit_cost_snapshot_incl ?? null,
+    cost_snapshot_date_jst: r.cost_snapshot_date_jst ?? null,
+    latest_unit_cost_reference_incl: r.latest_unit_cost_reference_incl ?? null,
+    cogs_amount_jpy_incl: r.cogs_amount_jpy_incl ?? 0,
+    gross_sales_jpy_incl: r.gross_sales_jpy_incl ?? 0,
+    net_sales_jpy_incl: r.net_sales_jpy_incl ?? 0,
+    variable_margin_jpy_incl: r.variable_margin_jpy_incl ?? 0,
+    refund_adjusted_net_sales_jpy_incl: r.refund_adjusted_net_sales_jpy_incl ?? 0,
+    cost_status: r.cost_status,
+    is_cost_complete: r.is_cost_complete ?? 0,
+    data_quality_score: r.data_quality_score ?? 0,
+    price_variance_warning: r.price_variance_warning ?? 0,
+    source_layer_summary: r.source_layer_summary || '',
+    source_row_count: r.source_row_count ?? 0,
+    built_at: r.built_at || new Date().toISOString(),
+    source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,
+    synced_at: r.synced_at,
+  };
+}
 
 // row 列正規化 (mirror_amazon_finance_sku_daily 用)
 function normalizeAmazonFinanceRow(r) {
@@ -757,9 +853,10 @@ router.post('/api/sync/runs/:run_id/backout', requireSyncKey, (req, res) => {
   const deleted = {};
   const tx = db.transaction(() => {
     for (const entity of entities) {
-      if (entity === 'amazon_finance_sku_daily') {
+      const cfg = ENTITY_REGISTRY[entity];
+      if (cfg) {
         const info = db.prepare(`
-          DELETE FROM mirror_amazon_finance_sku_daily WHERE source_run_id = ?
+          DELETE FROM ${cfg.mirror_table} WHERE source_run_id = ?
         `).run(runId);
         deleted[entity] = info.changes;
       }
