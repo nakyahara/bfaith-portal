@@ -1,0 +1,17 @@
+{
+  "entity": "rakuten_finance_sku_daily",
+  "contract_version": 1,
+  "source_system": "minipc-warehouse",
+  "source_object": "f_rakuten_finance_sku_daily_v1",
+  "target_table": "mirror_rakuten_finance_sku_daily",
+  "grain_definition": "one row = one (date_jst, rakuten_code)",
+  "key_columns_json": "[\"date_jst\", \"rakuten_code\"]",
+  "payload_schema_json": "{\"type\":\"object\",\"required\":[\"date_jst\",\"rakuten_code\"],\"properties\":{\"date_jst\":{\"type\":\"string\",\"pattern\":\"^\\\\d{4}-\\\\d{2}-\\\\d{2}$\"},\"rakuten_code\":{\"type\":\"string\",\"minLength\":1},\"variable_margin_jpy_incl\":{\"type\":\"number\"},\"cost_status\":{\"type\":\"string\",\"enum\":[\"complete\",\"missing_cost\",\"partial_cost\",\"late_bound_after_close\"]},\"sku_resolution\":{\"type\":\"string\",\"enum\":[\"resolved\",\"unresolved\",\"direct_master\"]},\"shipping_quality\":{\"type\":\"string\",\"enum\":[\"actual\",\"estimated_rates\",\"estimated_fallback\",\"missing\"]}}}",
+  "clear_strategy": "scope_clear_per_run",
+  "clear_strategy_detail": "First chunk of run includes meta.clear_rakuten_finance_dates=[<all distinct date_jst in payload>] for Render side to DELETE before insert",
+  "apply_mode": "insert_or_replace",
+  "apply_mode_detail": "INSERT OR REPLACE on (date_jst, rakuten_code). source_run_id and source_row_hash track origin",
+  "enabled": 1,
+  "owner": "phase1a-rakuten-finance",
+  "notes": "Phase 1a #R-3 で導入。Amazon Phase 1 #1-4 と同型 (entity-driven、scope clear by date)。snapshot 不変条件と整合"
+}
