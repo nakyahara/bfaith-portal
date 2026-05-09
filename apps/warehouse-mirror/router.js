@@ -772,6 +772,75 @@ router.post('/api/sync/runs/:run_id/backout', requireSyncKey, (req, res) => {
   res.json({ ok: true, run_id: runId, deleted, force, conflicts_overridden: conflicts.length });
 });
 
+// ─── Phase 1 #1-7: POST /api/sync/runs/:run_id/rebuild-marts (downstream mart rebuild trigger) ───
+//
+// 現状 noop: ledger 確認 + ログだけ (Phase 2 で mart_amazon_sku_* を実装する際に中身を実装)。
+// 完了判定は Render 側の sync_run_chunks のみで行う (sync_runs テーブルは miniPC 側のみ
+// で Render mirror には存在しない、Codex Round 1 #medium-1 対応):
+//   - run_id 存在
+//   - chunk 数 = chunk_count (received_count 一致)
+//   - chunk_index が 0..chunk_count-1 連続 (欠番なし、Codex Round 1 #medium-2 対応)
+//   - 全 chunk の applied_at が NOT NULL
+// 将来 Phase 2 で mart 実装時、ここで:
+//   - 該当 entity の mart を rebuild (例: mart_amazon_sku_daily, mart_amazon_sku_monthly)
+//   - rebuild 結果を sync_run に紐付けて記録
+// 失敗しても呼び出し元の sync 結果には影響させない (warn のみ) 設計の明示。
+router.post('/api/sync/runs/:run_id/rebuild-marts', requireSyncKey, (req, res) => {
+  const runId = req.params.run_id;
+  const db = getMirrorDB();
+
+  // ledger 確認 (run_id 存在 + 全 chunk applied + chunk_index 連続)
+  const chunks = db.prepare(`
+    SELECT entity, chunk_index, chunk_count, applied_at
+    FROM sync_run_chunks WHERE run_id = ? ORDER BY entity, chunk_index
+  `).all(runId);
+  if (chunks.length === 0) {
+    return res.status(404).json({ error: 'run not found', run_id: runId });
+  }
+  const entitiesByName = {};
+  for (const c of chunks) {
+    if (!entitiesByName[c.entity]) entitiesByName[c.entity] = { chunks: [], expectedCount: c.chunk_count };
+    entitiesByName[c.entity].chunks.push(c);
+  }
+  const incomplete = [];
+  for (const [entity, info] of Object.entries(entitiesByName)) {
+    const allApplied = info.chunks.every(c => c.applied_at !== null);
+    const presentSet = new Set(info.chunks.map(c => c.chunk_index));
+    const missingIndexes = [];
+    for (let i = 0; i < info.expectedCount; i++) {
+      if (!presentSet.has(i)) missingIndexes.push(i);
+    }
+    if (!allApplied || info.chunks.length !== info.expectedCount || missingIndexes.length > 0) {
+      incomplete.push({
+        entity,
+        received: info.chunks.length,
+        expected: info.expectedCount,
+        missing_chunks: missingIndexes,
+        all_applied: allApplied,
+      });
+    }
+  }
+  if (incomplete.length > 0) {
+    return res.status(409).json({
+      error: 'rebuild_blocked_incomplete_sync',
+      message: 'sync が未完了の entity が含まれているため rebuild を保留',
+      run_id: runId,
+      incomplete,
+    });
+  }
+
+  // 現状 noop (Phase 2 で実装、Phase 1 では trigger 経路の確保のみ)
+  const triggered = Object.keys(entitiesByName);
+  console.log(`[Mirror] rebuild-marts triggered (noop) run=${runId} entities=${triggered.join(',')}`);
+  res.json({
+    ok: true,
+    run_id: runId,
+    triggered_entities: triggered,
+    rebuilt: [],
+    note: 'Phase 1 #1-7: rebuild trigger 経路のみ整備、mart 実装は Phase 2 で追加',
+  });
+});
+
 // ─── GET /api/products ───
 
 router.get('/api/products', (req, res) => {

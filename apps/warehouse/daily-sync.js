@@ -18,7 +18,10 @@ const PROJECT_DIR = path.resolve(__dirname, '..', '..');
 const RETRY_STATE_FILE = path.join(PROJECT_DIR, 'data', 'daily-sync-retry-state.json');
 // retry-failed-jobs.js でリトライ可能なジョブ (idempotent + 一時的失敗想定)
 // Amazon Ads / Settlement は SP-API throttle / レポート polling timeout / DL 失敗等の一過性失敗が多いため retry 対象
-const RETRYABLE_JOBS = ['f_sales', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement'];
+// Codex Round 1 #2: 'Amazon finance sync' は RETRYABLE_JOBS に入れない。
+//   sync 単独 retry すると build やり直さずに古い fact を sync する事故になる。
+//   build を retryable に残し、sync は build 成功時のみ実行 (依存連鎖は cron 単位で完結)。
+const RETRYABLE_JOBS = ['f_sales', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK || 'https://chat.googleapis.com/v1/spaces/AAQAL5zHy-w/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=yER7IJx_9CkKhYnzzre0WcWuqfgXc1oh8ldR35k01zE';
 
@@ -214,6 +217,52 @@ async function main() {
   const settlementMartResult = runScript('apps/warehouse/rebuild-amazon-settlement-mart.js', 'Settlement mart 再構築', 900000);
   results.push({ name: 'Settlement mart', ...settlementMartResult });
 
+  // === Amazon finance daily fact (Phase 1 #1-7、#1-1 + #1-4a 統合) ===
+  // 1. f_amazon_finance_sku_daily_v1 を当月分 build (snapshot UPSERT)
+  //    → raw_amazon_settlement_lines から economic_date × seller_sku_normalized で集約、
+  //       snapshot 原価 + cost_status 4 値、UPSERT で snapshot 不変
+  // 2. mirror_amazon_finance_sku_daily へ sync (chunk POST + ledger 記録)
+  //    → entity-driven contract sync、CHUNK_SIZE=3000 (5000 で connection terminated 対策)
+  //    → sync 成功時に Render rebuild trigger を内部で POST (現状 noop)
+  // 月初は前月確定値も sync 必要だが MVP は当月のみ (前月処理は将来)。
+  const currentMonth = businessDate.slice(0, 7); // 'YYYY-MM'
+  // DATA_DIR は env 必須 (memory: feedback_db_path_cwd_dependency.md、cwd fallback で
+  // worktree の stray DB 事故を起こした履歴あり、Codex Round 1 #1 対応で fail-fast 化)
+  if (!process.env.DATA_DIR) {
+    // 設定不備系の blocked は success:false (失敗扱いで通知に載る) かつ blocked:true で
+    // retry 対象外マーキング (Codex Round 3 #medium 対応)。
+    //   - 旧 success:true は green 集計に隠れるリスク (Codex 指摘)
+    //   - 単純 success:false は RETRYABLE_JOBS の永久 retry ノイズ
+    //   - blocked:true 別軸で「失敗だが retry しない」を明示、下の retry 判定 filter で除外
+    //   - 真の解決は winsw config 修正
+    console.error('[DailySync] FATAL: DATA_DIR env が未設定です。Amazon finance build/sync は実行できません。winsw config に <env name="DATA_DIR" value="C:\\Users\\bfaith\\bfaith-portal\\data"/> を設定してください。');
+    const blockedSummary = '🔴 blocked: DATA_DIR env 未設定 (winsw config 要修正、retry 対象外)';
+    results.push({ name: 'Amazon finance build', success: false, blocked: true, summary: blockedSummary });
+  } else {
+    const DATA_DIR_ARG = process.env.DATA_DIR.replace(/\\/g, '/');
+    const amazonFinanceBuildResult = runScript(
+      `scripts/amazon-finance/build-daily-fact.js --data-dir "${DATA_DIR_ARG}" --month ${currentMonth}`,
+      'Amazon finance build', 600000
+    );
+    results.push({ name: 'Amazon finance build', ...amazonFinanceBuildResult });
+
+    if (amazonFinanceBuildResult.success) {
+      // CHUNK_SIZE は 3000 推奨 (issue #72)、env 経由で override 可
+      if (!process.env.CHUNK_SIZE) process.env.CHUNK_SIZE = '3000';
+      const amazonFinanceSyncResult = runScript(
+        `apps/warehouse/sync-amazon-finance-daily.js --data-dir "${DATA_DIR_ARG}" --month ${currentMonth}`,
+        'Amazon finance sync', 600000
+      );
+      results.push({ name: 'Amazon finance sync', ...amazonFinanceSyncResult });
+    } else {
+      // build 失敗 → sync は記録自体しない (Codex Round 1 #2 対応)。
+      // sync を success:false で push + RETRYABLE_JOBS にあると retry-failed-jobs が
+      // build を再実行せずに sync 単独 retry してしまい、古い fact を sync する事故。
+      // build を retryable に残し、sync は build 成功時のみ実行 = sync を retry 対象外にする。
+      console.log(`[DailySync] Amazon finance sync は build 失敗のため記録せず (build retry 後に翌 cron で sync 実行)`);
+    }
+  }
+
   // 楽天 AM/AL/W → NE商品コード sku_map 再構築 (f_sales と独立)
   const rakutenSkuMapResult = runScript('apps/warehouse/rebuild-rakuten-sku-map.js', '楽天 sku_map 再構築');
   results.push({ name: '楽天sku_map', ...rakutenSkuMapResult });
@@ -376,7 +425,8 @@ async function main() {
   // ─── retry-state 書き込み (リトライ対象の失敗があれば) ───
 
   const retryableFailed = results
-    .filter(r => RETRYABLE_JOBS.includes(r.name) && !r.success)
+    // blocked:true は「失敗だが構成不備等で retry しても無駄」なので除外 (Codex Round 3 #medium)
+    .filter(r => RETRYABLE_JOBS.includes(r.name) && !r.success && !r.blocked)
     .map(r => r.name);
 
   let retryStateWritten = false;

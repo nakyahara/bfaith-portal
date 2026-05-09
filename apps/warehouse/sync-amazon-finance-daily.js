@@ -294,6 +294,26 @@ import('node:os').then(async (os) => {
     `).run(chunksApplied, totalRowsSent, new Date().toISOString(), new Date().toISOString(), runId);
     console.log(`\n✓ sync complete (run_id=${runId}, ${totalRowsSent} rows in ${chunksApplied} chunks)`);
     finishDb.close();
+
+    // 3d. Render mart rebuild trigger (Phase 1 #1-7、現状 noop endpoint だが trigger 経路は確保)
+    // 失敗しても sync の applied 状態は維持 (warn のみ)。
+    try {
+      const rebuildRes = await fetch(`${renderUrl}/api/sync/runs/${runId}/rebuild-marts`, {
+        method: 'POST',
+        headers: { 'x-sync-key': syncKey },
+        signal: AbortSignal.timeout(30000),
+      });
+      if (rebuildRes.ok) {
+        const rb = await rebuildRes.json();
+        console.log(`✓ rebuild-marts trigger: entities=${(rb.triggered_entities || []).join(',')} (${rb.note || 'ok'})`);
+      } else {
+        const text = await rebuildRes.text();
+        console.warn(`⚠ rebuild-marts trigger failed (HTTP ${rebuildRes.status}): ${text.slice(0, 200)}`);
+      }
+    } catch (e) {
+      console.warn(`⚠ rebuild-marts trigger error (sync は applied 維持): ${e.message}`);
+    }
+
     process.exit(0);
   }
 }).catch(e => {
