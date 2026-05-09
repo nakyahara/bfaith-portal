@@ -339,6 +339,60 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_mafsd_month ON mirror_amazon_finance_sku_daily(substr(date_jst, 1, 7))');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mafsd_run ON mirror_amazon_finance_sku_daily(source_run_id)');
 
+  // mirror_rakuten_finance_sku_daily — 楽天 Phase 1a #R-3b (Render 側 daily fact mirror)
+  // miniPC の f_rakuten_finance_sku_daily_v1 の payload を受信。
+  // contract_version は sync_contracts.contract_version と整合。
+  // PK: (date_jst, rakuten_code) — Amazon と異なり asin_norm は楽天にない
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_rakuten_finance_sku_daily (
+    date_jst                          TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+    rakuten_code                      TEXT NOT NULL CHECK(trim(rakuten_code) <> ''),
+    ne_code                           TEXT,
+    sku_resolution                    TEXT NOT NULL CHECK (
+      sku_resolution IN ('resolved', 'unresolved', 'direct_master')
+    ),
+    product_name                      TEXT NOT NULL DEFAULT '',
+    units_ordered                     INTEGER NOT NULL DEFAULT 0,
+    units_cancelled                   INTEGER NOT NULL DEFAULT 0,
+    units_net_sold                    INTEGER NOT NULL DEFAULT 0,
+    sales_principal_jpy_incl          REAL NOT NULL DEFAULT 0,
+    sales_postage_jpy_incl            REAL NOT NULL DEFAULT 0,
+    coupon_shop_jpy_incl              REAL NOT NULL DEFAULT 0,
+    coupon_all_jpy_incl               REAL NOT NULL DEFAULT 0,
+    promotion_jpy_incl                REAL NOT NULL DEFAULT 0,
+    refund_amount_jpy_incl            REAL NOT NULL DEFAULT 0,
+    mall_fee_jpy_incl                 REAL NOT NULL DEFAULT 0,
+    shipping_cost_jpy_incl            REAL NOT NULL DEFAULT 0,
+    shipping_quality                  TEXT NOT NULL CHECK (
+      shipping_quality IN ('actual', 'estimated_rates', 'estimated_fallback', 'missing')
+    ),
+    unit_cost_snapshot_incl           REAL,
+    cost_snapshot_date_jst            TEXT,
+    latest_unit_cost_reference_incl   REAL,
+    cogs_amount_jpy_incl              REAL NOT NULL DEFAULT 0,
+    gross_sales_jpy_incl              REAL NOT NULL DEFAULT 0,
+    net_sales_jpy_incl                REAL NOT NULL DEFAULT 0,
+    variable_margin_jpy_incl          REAL NOT NULL DEFAULT 0,
+    refund_adjusted_net_sales_jpy_incl REAL NOT NULL DEFAULT 0,
+    cost_status                       TEXT NOT NULL CHECK (
+      cost_status IN ('complete', 'missing_cost', 'partial_cost', 'late_bound_after_close')
+    ),
+    is_cost_complete                  INTEGER NOT NULL DEFAULT 0,
+    data_quality_score                INTEGER NOT NULL DEFAULT 0
+                                      CHECK (data_quality_score BETWEEN 0 AND 100),
+    price_variance_warning            INTEGER NOT NULL DEFAULT 0,
+    source_layer_summary              TEXT NOT NULL DEFAULT '',
+    source_row_count                  INTEGER NOT NULL DEFAULT 0,
+    built_at                          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    source_run_id                     TEXT NOT NULL,
+    source_row_hash                   TEXT NOT NULL,
+    synced_at                         TEXT NOT NULL,
+    PRIMARY KEY (date_jst, rakuten_code)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mrfsd_date ON mirror_rakuten_finance_sku_daily(date_jst)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mrfsd_ne ON mirror_rakuten_finance_sku_daily(ne_code)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mrfsd_month ON mirror_rakuten_finance_sku_daily(substr(date_jst, 1, 7))');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mrfsd_run ON mirror_rakuten_finance_sku_daily(source_run_id)');
+
   // mirror_amazon_sku_fees — Amazon手数料キャッシュ（粗利ダッシュボード用）
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_amazon_sku_fees (
     seller_sku          TEXT PRIMARY KEY,
