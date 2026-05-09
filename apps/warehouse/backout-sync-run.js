@@ -36,9 +36,13 @@ if (!DATA_DIR || !runId) {
   console.error('FATAL: DATA_DIR env and --run-id required');
   process.exit(2);
 }
-if (!isDryRun && (!renderUrl || !syncKey)) {
-  console.error('FATAL: RENDER_MIRROR_URL and MIRROR_SYNC_KEY required for non-dry-run');
+if (!isDryRun && !renderUrl) {
+  console.error('FATAL: RENDER_MIRROR_URL required for non-dry-run');
   process.exit(2);
+}
+// MIRROR_SYNC_KEY は optional (Render 側 ALLOW_INSECURE_MIRROR_SYNC=1 と整合)
+if (!isDryRun && !syncKey) {
+  console.warn('⚠️  MIRROR_SYNC_KEY 未設定: Render 側 ALLOW_INSECURE_MIRROR_SYNC=1 に依存');
 }
 
 const dbPath = path.join(DATA_DIR, 'warehouse.db');
@@ -68,10 +72,12 @@ if (isDryRun) {
 // 1. Render 側 backout API 呼び出し
 console.log('\n  Calling Render backout API...');
 const url = `${renderUrl}/api/sync/runs/${runId}/backout${isForce ? '?force=1' : ''}`;
+const backoutHeaders = {};
+if (syncKey) backoutHeaders['x-sync-key'] = syncKey;
 try {
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'x-sync-key': syncKey },
+    headers: backoutHeaders,
   });
   if (res.status === 409) {
     const body = await res.json().catch(() => ({}));
