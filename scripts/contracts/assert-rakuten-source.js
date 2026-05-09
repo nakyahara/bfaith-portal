@@ -9,8 +9,11 @@
  *
  * 終了コード:
  *   0 = contract と実 DB が一致 (or warning のみ)
- *   1 = mismatch あり (必須列の欠落 / 型変更 / 列順入れ替え)
+ *   1 = error あり (必須列の欠落 / 型変更 / NOT NULL 違反 / 依存先欠落)
  *   2 = env 不備
+ *
+ * 注: 列順 (cid) は本 assert では検証しない。列順が変わっても列名で照合するため動作に影響なし。
+ *     列順を業務契約に含めたくなったら EXPECTED_COLUMNS の cid を比較するロジックを追加すること。
  *
  * 使い方:
  *   DATA_DIR=C:/Users/bfaith/bfaith-portal/data node scripts/contracts/assert-rakuten-source.js
@@ -67,6 +70,8 @@ const EXPECTED_COLUMNS = [
 const KNOWN_ORDER_STATUSES = new Set([700, 900, 200, 300, 500, 600]);
 //   - delete_item_flag: 全件 0 (1 が出たら運用変更検出)
 const ALLOWED_DELETE_FLAGS = new Set([0]);
+//   - tax_rate: 0.10 / 0.08 のみ (新税率追加で過去率と並ぶ場合は要再検証)
+const KNOWN_TAX_RATES = new Set([0.10, 0.08]);
 
 const db = new Database(DB_PATH, { readonly: true });
 
@@ -129,6 +134,18 @@ for (const f of flags) {
   console.log(`  flag=${f.delete_item_flag}: ${f.c.toLocaleString()}`);
   if (!ALLOWED_DELETE_FLAGS.has(f.delete_item_flag)) {
     warnings.push(`UNEXPECTED delete_item_flag: ${f.delete_item_flag} (count=${f.c}) — allowed: ${[...ALLOWED_DELETE_FLAGS].join(',')}`);
+  }
+}
+
+// ----------------------------------------------------------------
+// 3.5. tax_rate 値域確認 (Codex PR #75 #3 追加)
+// ----------------------------------------------------------------
+console.log('\n--- 3.5. tax_rate 値域 (0.10 / 0.08 のみ期待) ---');
+const taxRates = db.prepare(`SELECT tax_rate, COUNT(*) AS c FROM ${TABLE_NAME} GROUP BY tax_rate ORDER BY c DESC`).all();
+for (const t of taxRates) {
+  console.log(`  tax_rate=${t.tax_rate}: ${t.c.toLocaleString()}`);
+  if (!KNOWN_TAX_RATES.has(t.tax_rate)) {
+    warnings.push(`UNKNOWN tax_rate: ${t.tax_rate} (count=${t.c}) — known values: ${[...KNOWN_TAX_RATES].join(',')}`);
   }
 }
 

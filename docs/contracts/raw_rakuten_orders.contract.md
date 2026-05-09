@@ -112,17 +112,21 @@
 `postage_price` は注文単位なので、SKU (item) 単位に按分する必要がある。**按分ロジック**:
 
 ```
-postage_split[item_i] = postage_price × (price_tax_incl[item_i] × units[item_i]) / total_price
+items_total[order_n] = SUM(price_tax_incl[item_i] × units[item_i])  -- 同一 order_number 内の商品金額合計
+postage_split[item_i] = postage_price × (price_tax_incl[item_i] × units[item_i]) / items_total[order_n]
 ```
 
 **前提**:
-- `total_price` を分母に使う (商品 + 送料の総額)
-- `total_price = 0` のエッジケースは `postage_split = 0` (zero-division ガード)
+- 分母は **同一 order_number 内の商品金額合計** (= `SUM(price_tax_incl × units)` per order、`goods_price` 相当)
+- これにより SKU 別按分の合計 = `postage_price` 完全保存 (送料漏れなし)
+- `items_total = 0` のエッジケース (例: 全部 free item) は `postage_split = 0` (zero-division ガード)
 - 按分は **注文単位 (per `order_number`) で先に行い**、その後 `date_jst × rakuten_code` に再集約 (Codex Round 3 #1 指摘反映)
 
 ### 別案 (採用しない理由)
+- **`total_price` (商品+送料) を分母にすると送料漏れ発生** ← Codex PR #75 #1 指摘で発覚
+  - 例: 商品 1,000 + 送料 500 → `total_price=1,500` で按分すると合計 333.33、166.67 消失
+  - 過去の v0.3 設計書はこの誤りを含んでいた、本 contract で修正
 - 単純な「items 数で均等割り」 → 高単価 / 低単価が混在する注文で過小過大評価
-- `goods_price` を分母にする → 送料の按分にならない
 
 ---
 

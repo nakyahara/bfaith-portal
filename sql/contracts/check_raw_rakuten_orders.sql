@@ -120,15 +120,23 @@ FROM raw_rakuten_orders;
 -- ==================================================
 -- 10. f_rakuten_sku_map カバー率 (rakuten_code → ne_code 解決率)
 -- ==================================================
+-- Codex PR #75 #2 対応: f_rakuten_sku_map.rakuten_code は一意でない可能性があるため
+-- LEFT JOIN で 1:N 増殖して resolved_pct が 100% 超になり得る。EXISTS で 0/1 化する。
 .print '\n=== 10. f_rakuten_sku_map カバー率 (raw_rakuten_orders.item_number → ne_code 解決) ==='
+WITH src AS (SELECT DISTINCT item_number FROM raw_rakuten_orders WHERE order_status = 700)
 SELECT
-  COUNT(DISTINCT r.item_number) AS distinct_rakuten_codes,
-  SUM(CASE WHEN m.ne_code IS NOT NULL THEN 1 ELSE 0 END) AS resolved,
-  SUM(CASE WHEN m.ne_code IS NULL THEN 1 ELSE 0 END) AS unresolved,
-  ROUND(SUM(CASE WHEN m.ne_code IS NOT NULL THEN 1 ELSE 0 END) * 100.0 /
-        COUNT(DISTINCT r.item_number), 2) AS resolved_pct
-FROM (SELECT DISTINCT item_number FROM raw_rakuten_orders WHERE order_status = 700) r
-LEFT JOIN f_rakuten_sku_map m ON m.rakuten_code = r.item_number;
+  COUNT(*) AS distinct_rakuten_codes,
+  SUM(CASE WHEN EXISTS (SELECT 1 FROM f_rakuten_sku_map m WHERE m.rakuten_code = src.item_number) THEN 1 ELSE 0 END) AS resolved,
+  SUM(CASE WHEN NOT EXISTS (SELECT 1 FROM f_rakuten_sku_map m WHERE m.rakuten_code = src.item_number) THEN 1 ELSE 0 END) AS unresolved,
+  ROUND(SUM(CASE WHEN EXISTS (SELECT 1 FROM f_rakuten_sku_map m WHERE m.rakuten_code = src.item_number) THEN 1 ELSE 0 END) * 100.0 /
+        COUNT(*), 2) AS resolved_pct
+FROM src;
+
+-- 参考: f_rakuten_sku_map の rakuten_code 1:N 件数 (ne_code 重複あれば R-1 で要対処)
+.print '  -- 参考: rakuten_code が複数 ne_code に紐付く件数 --'
+SELECT COUNT(*) AS rakuten_codes_with_multiple_ne FROM (
+  SELECT rakuten_code FROM f_rakuten_sku_map GROUP BY rakuten_code HAVING COUNT(DISTINCT ne_code) > 1
+);
 
 -- ==================================================
 -- 11. fact_promotion_cost (mall=rakuten) 整合性
