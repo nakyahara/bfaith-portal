@@ -8,7 +8,7 @@
 
 このドキュメントは `raw_amazon_settlement_lines` の line を `f_amazon_finance_sku_daily_v1` の **canonical metric** に落とすための mapping rule を凍結したもの。Ticket #1-1 (`f_amazon_finance_sku_daily_v1` の rebuild SQL) はこの mapping を唯一の source-of-truth として参照する。
 
-## 1. 確定済みの利益式 (再掲、Codex Round 6)
+## 1. 確定済みの利益式 (再掲、Codex Round 6 + 2026-05-08 中原さん確定)
 
 ```
 profit_amount =
@@ -22,6 +22,25 @@ profit_amount =
 
 `sales_tax_jpy` は **保持のみ、利益式に入れない** (税抜き利益で v4 と整合)。
 `misc_fee_jpy` / `other_fee_jpy` / `other_amount_jpy` は **保持のみ、利益式に入れない** (Phase 1 では retention のみ、Phase 2 以降で利益式に組み込み判断)。
+
+### profit_amount の意味 (2026-05-08 確定)
+
+- **広告費 (ad_cost) を引かない、warehouse 補填を加算した利益**
+- 経営層が頭で見ている利益率 = `profit_amount / revenue` (revenue = principal + shipping + giftwrap)
+- v4 の対応列: **`v_amazon_sku_profit_actual_v4.gross_margin_with_reimbursement_excl_tax`** (PR #61 で v4 に追加した新列)
+- Codex Round 6 では当初 `settlement_margin_excl_tax` を再現対象としていたが、中原さん確認で「経営層が普段見たい利益率は広告費引く前 + 補填」と確定。validation 対象を新列に変更
+- ad_cost は別軸 (Phase 1.x で `ad_cost_jpy` を別列として追加予定、Phase 2 の広告効果分解で使用)
+
+### 検証結果 (2026-05-08、5 ヶ月合計)
+
+| 指標 | daily fact | v4 (gross+補填) | 差 |
+|---|---|---|---|
+| units_ordered | 217,624 | 217,624 | **0 (完全一致)** |
+| revenue | 220.45M | 220.73M | -0.13% |
+| cogs | 108.17M | 108.92M | -0.68% |
+| **profit** | **27.78M** | **27.73M** | **+0.18%** |
+
+profit 差 0.18% は実用十分。残差は silver dedup の微小挙動差 / v_sku_costed の小さな差 (Phase 2 以降で精度改善余地)。
 
 ## 2. canonical metric 一覧 (DDL 列と完全一致)
 
