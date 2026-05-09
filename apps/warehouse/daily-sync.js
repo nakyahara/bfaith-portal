@@ -18,7 +18,7 @@ const PROJECT_DIR = path.resolve(__dirname, '..', '..');
 const RETRY_STATE_FILE = path.join(PROJECT_DIR, 'data', 'daily-sync-retry-state.json');
 // retry-failed-jobs.js でリトライ可能なジョブ (idempotent + 一時的失敗想定)
 // Amazon Ads / Settlement は SP-API throttle / レポート polling timeout / DL 失敗等の一過性失敗が多いため retry 対象
-const RETRYABLE_JOBS = ['f_sales', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement'];
+const RETRYABLE_JOBS = ['f_sales', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon finance sync'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK || 'https://chat.googleapis.com/v1/spaces/AAQAL5zHy-w/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=yER7IJx_9CkKhYnzzre0WcWuqfgXc1oh8ldR35k01zE';
 
@@ -213,6 +213,36 @@ async function main() {
   // queue 空なら即終了するので低コスト。
   const settlementMartResult = runScript('apps/warehouse/rebuild-amazon-settlement-mart.js', 'Settlement mart 再構築', 900000);
   results.push({ name: 'Settlement mart', ...settlementMartResult });
+
+  // === Amazon finance daily fact (Phase 1 #1-7、#1-1 + #1-4a 統合) ===
+  // 1. f_amazon_finance_sku_daily_v1 を当月分 build (snapshot UPSERT)
+  //    → raw_amazon_settlement_lines から economic_date × seller_sku_normalized で集約、
+  //       snapshot 原価 + cost_status 4 値、UPSERT で snapshot 不変
+  // 2. mirror_amazon_finance_sku_daily へ sync (chunk POST + ledger 記録)
+  //    → entity-driven contract sync、CHUNK_SIZE=3000 (5000 で connection terminated 対策)
+  //    → sync 成功時に Render rebuild trigger を内部で POST (現状 noop)
+  // 月初は前月確定値も sync 必要だが MVP は当月のみ (前月処理は将来)。
+  const currentMonth = businessDate.slice(0, 7); // 'YYYY-MM'
+  const DATA_DIR_ARG = (process.env.DATA_DIR || path.join(process.cwd(), 'data')).replace(/\\/g, '/');
+  const amazonFinanceBuildResult = runScript(
+    `scripts/amazon-finance/build-daily-fact.js --data-dir "${DATA_DIR_ARG}" --month ${currentMonth}`,
+    'Amazon finance build', 600000
+  );
+  results.push({ name: 'Amazon finance build', ...amazonFinanceBuildResult });
+
+  let amazonFinanceSyncResult;
+  if (amazonFinanceBuildResult.success) {
+    // CHUNK_SIZE は 3000 推奨 (issue #72)、env 経由で override 可
+    if (!process.env.CHUNK_SIZE) process.env.CHUNK_SIZE = '3000';
+    amazonFinanceSyncResult = runScript(
+      `apps/warehouse/sync-amazon-finance-daily.js --data-dir "${DATA_DIR_ARG}" --month ${currentMonth}`,
+      'Amazon finance sync', 600000
+    );
+  } else {
+    console.log(`[DailySync] Amazon finance sync スキップ (build 失敗、retry で復旧予定)`);
+    amazonFinanceSyncResult = { success: false, summary: '⏸️ skipped (build 失敗)' };
+  }
+  results.push({ name: 'Amazon finance sync', ...amazonFinanceSyncResult });
 
   // 楽天 AM/AL/W → NE商品コード sku_map 再構築 (f_sales と独立)
   const rakutenSkuMapResult = runScript('apps/warehouse/rebuild-rakuten-sku-map.js', '楽天 sku_map 再構築');

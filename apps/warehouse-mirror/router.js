@@ -772,6 +772,59 @@ router.post('/api/sync/runs/:run_id/backout', requireSyncKey, (req, res) => {
   res.json({ ok: true, run_id: runId, deleted, force, conflicts_overridden: conflicts.length });
 });
 
+// ─── Phase 1 #1-7: POST /api/sync/runs/:run_id/rebuild-marts (downstream mart rebuild trigger) ───
+//
+// 現状 noop: ledger 確認 + ログだけ (Phase 2 で mart_amazon_sku_* を実装する際に中身を実装)。
+// 将来この endpoint で:
+//   - sync_runs.status='applied' を確認 (= mirror に最新データ揃った)
+//   - 該当 entity の mart を rebuild (例: mart_amazon_sku_daily, mart_amazon_sku_monthly)
+//   - rebuild 結果を sync_run に紐付けて記録
+// 失敗しても呼び出し元の sync 結果には影響させない (warn のみ) 設計の明示。
+router.post('/api/sync/runs/:run_id/rebuild-marts', requireSyncKey, (req, res) => {
+  const runId = req.params.run_id;
+  const db = getMirrorDB();
+
+  // ledger 確認 (run_id 存在 + 全 chunk applied かどうか)
+  const chunks = db.prepare(`
+    SELECT entity, chunk_index, chunk_count, applied_at
+    FROM sync_run_chunks WHERE run_id = ? ORDER BY entity, chunk_index
+  `).all(runId);
+  if (chunks.length === 0) {
+    return res.status(404).json({ error: 'run not found', run_id: runId });
+  }
+  const entitiesByName = {};
+  for (const c of chunks) {
+    if (!entitiesByName[c.entity]) entitiesByName[c.entity] = { chunks: [], expectedCount: c.chunk_count };
+    entitiesByName[c.entity].chunks.push(c);
+  }
+  const incomplete = [];
+  for (const [entity, info] of Object.entries(entitiesByName)) {
+    const allApplied = info.chunks.every(c => c.applied_at !== null);
+    if (!allApplied || info.chunks.length !== info.expectedCount) {
+      incomplete.push({ entity, received: info.chunks.length, expected: info.expectedCount });
+    }
+  }
+  if (incomplete.length > 0) {
+    return res.status(409).json({
+      error: 'rebuild_blocked_incomplete_sync',
+      message: 'sync が未完了の entity が含まれているため rebuild を保留',
+      run_id: runId,
+      incomplete,
+    });
+  }
+
+  // 現状 noop (Phase 2 で実装、Phase 1 では trigger 経路の確保のみ)
+  const triggered = Object.keys(entitiesByName);
+  console.log(`[Mirror] rebuild-marts triggered (noop) run=${runId} entities=${triggered.join(',')}`);
+  res.json({
+    ok: true,
+    run_id: runId,
+    triggered_entities: triggered,
+    rebuilt: [],
+    note: 'Phase 1 #1-7: rebuild trigger 経路のみ整備、mart 実装は Phase 2 で追加',
+  });
+});
+
 // ─── GET /api/products ───
 
 router.get('/api/products', (req, res) => {
