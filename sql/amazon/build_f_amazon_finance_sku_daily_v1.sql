@@ -371,8 +371,11 @@ ON CONFLICT (date_jst, seller_sku) DO UPDATE SET
     - COALESCE(f_amazon_finance_sku_daily_v1.unit_cost_snapshot, 0)
       * (excluded.units_ordered - excluded.units_refunded_customer - excluded.units_a_to_z_refund),
     2),
-  is_cost_complete = excluded.is_cost_complete,
-  cost_status      = excluded.cost_status,
+  -- 品質列 (is_cost_complete / cost_status) は snapshot と整合させて既存値保持
+  -- (Codex Round 2 medium #1 対応: unit_cost_snapshot を温存しているのに品質列だけ
+  --  excluded で上書きすると、後日 v_sku_costed 欠損で snapshot 有効 + missing_cost 矛盾になる)
+  -- is_cost_complete ← 保持
+  -- cost_status      ← 保持
   source_layer_summary = excluded.source_layer_summary,
   source_row_count = excluded.source_row_count,
   built_at         = excluded.built_at;
