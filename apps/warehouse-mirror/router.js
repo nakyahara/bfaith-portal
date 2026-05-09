@@ -775,8 +775,13 @@ router.post('/api/sync/runs/:run_id/backout', requireSyncKey, (req, res) => {
 // ─── Phase 1 #1-7: POST /api/sync/runs/:run_id/rebuild-marts (downstream mart rebuild trigger) ───
 //
 // 現状 noop: ledger 確認 + ログだけ (Phase 2 で mart_amazon_sku_* を実装する際に中身を実装)。
-// 将来この endpoint で:
-//   - sync_runs.status='applied' を確認 (= mirror に最新データ揃った)
+// 完了判定は Render 側の sync_run_chunks のみで行う (sync_runs テーブルは miniPC 側のみ
+// で Render mirror には存在しない、Codex Round 1 #medium-1 対応):
+//   - run_id 存在
+//   - chunk 数 = chunk_count (received_count 一致)
+//   - chunk_index が 0..chunk_count-1 連続 (欠番なし、Codex Round 1 #medium-2 対応)
+//   - 全 chunk の applied_at が NOT NULL
+// 将来 Phase 2 で mart 実装時、ここで:
 //   - 該当 entity の mart を rebuild (例: mart_amazon_sku_daily, mart_amazon_sku_monthly)
 //   - rebuild 結果を sync_run に紐付けて記録
 // 失敗しても呼び出し元の sync 結果には影響させない (warn のみ) 設計の明示。
@@ -784,7 +789,7 @@ router.post('/api/sync/runs/:run_id/rebuild-marts', requireSyncKey, (req, res) =
   const runId = req.params.run_id;
   const db = getMirrorDB();
 
-  // ledger 確認 (run_id 存在 + 全 chunk applied かどうか)
+  // ledger 確認 (run_id 存在 + 全 chunk applied + chunk_index 連続)
   const chunks = db.prepare(`
     SELECT entity, chunk_index, chunk_count, applied_at
     FROM sync_run_chunks WHERE run_id = ? ORDER BY entity, chunk_index
@@ -800,8 +805,19 @@ router.post('/api/sync/runs/:run_id/rebuild-marts', requireSyncKey, (req, res) =
   const incomplete = [];
   for (const [entity, info] of Object.entries(entitiesByName)) {
     const allApplied = info.chunks.every(c => c.applied_at !== null);
-    if (!allApplied || info.chunks.length !== info.expectedCount) {
-      incomplete.push({ entity, received: info.chunks.length, expected: info.expectedCount });
+    const presentSet = new Set(info.chunks.map(c => c.chunk_index));
+    const missingIndexes = [];
+    for (let i = 0; i < info.expectedCount; i++) {
+      if (!presentSet.has(i)) missingIndexes.push(i);
+    }
+    if (!allApplied || info.chunks.length !== info.expectedCount || missingIndexes.length > 0) {
+      incomplete.push({
+        entity,
+        received: info.chunks.length,
+        expected: info.expectedCount,
+        missing_chunks: missingIndexes,
+        all_applied: allApplied,
+      });
     }
   }
   if (incomplete.length > 0) {

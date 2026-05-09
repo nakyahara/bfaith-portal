@@ -18,7 +18,10 @@ const PROJECT_DIR = path.resolve(__dirname, '..', '..');
 const RETRY_STATE_FILE = path.join(PROJECT_DIR, 'data', 'daily-sync-retry-state.json');
 // retry-failed-jobs.js でリトライ可能なジョブ (idempotent + 一時的失敗想定)
 // Amazon Ads / Settlement は SP-API throttle / レポート polling timeout / DL 失敗等の一過性失敗が多いため retry 対象
-const RETRYABLE_JOBS = ['f_sales', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon finance sync'];
+// Codex Round 1 #2: 'Amazon finance sync' は RETRYABLE_JOBS に入れない。
+//   sync 単独 retry すると build やり直さずに古い fact を sync する事故になる。
+//   build を retryable に残し、sync は build 成功時のみ実行 (依存連鎖は cron 単位で完結)。
+const RETRYABLE_JOBS = ['f_sales', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK || 'https://chat.googleapis.com/v1/spaces/AAQAL5zHy-w/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=yER7IJx_9CkKhYnzzre0WcWuqfgXc1oh8ldR35k01zE';
 
@@ -223,26 +226,36 @@ async function main() {
   //    → sync 成功時に Render rebuild trigger を内部で POST (現状 noop)
   // 月初は前月確定値も sync 必要だが MVP は当月のみ (前月処理は将来)。
   const currentMonth = businessDate.slice(0, 7); // 'YYYY-MM'
-  const DATA_DIR_ARG = (process.env.DATA_DIR || path.join(process.cwd(), 'data')).replace(/\\/g, '/');
-  const amazonFinanceBuildResult = runScript(
-    `scripts/amazon-finance/build-daily-fact.js --data-dir "${DATA_DIR_ARG}" --month ${currentMonth}`,
-    'Amazon finance build', 600000
-  );
-  results.push({ name: 'Amazon finance build', ...amazonFinanceBuildResult });
-
-  let amazonFinanceSyncResult;
-  if (amazonFinanceBuildResult.success) {
-    // CHUNK_SIZE は 3000 推奨 (issue #72)、env 経由で override 可
-    if (!process.env.CHUNK_SIZE) process.env.CHUNK_SIZE = '3000';
-    amazonFinanceSyncResult = runScript(
-      `apps/warehouse/sync-amazon-finance-daily.js --data-dir "${DATA_DIR_ARG}" --month ${currentMonth}`,
-      'Amazon finance sync', 600000
-    );
+  // DATA_DIR は env 必須 (memory: feedback_db_path_cwd_dependency.md、cwd fallback で
+  // worktree の stray DB 事故を起こした履歴あり、Codex Round 1 #1 対応で fail-fast 化)
+  if (!process.env.DATA_DIR) {
+    console.error('[DailySync] FATAL: DATA_DIR env が未設定です。Amazon finance build/sync は実行できません。winsw config に <env name="DATA_DIR" value="C:\\Users\\bfaith\\bfaith-portal\\data"/> を設定してください。');
+    results.push({ name: 'Amazon finance build', success: false, summary: '🔴 DATA_DIR env 未設定 (fail-fast)' });
+    results.push({ name: 'Amazon finance sync', success: false, summary: '🔴 DATA_DIR env 未設定 (build skip)' });
   } else {
-    console.log(`[DailySync] Amazon finance sync スキップ (build 失敗、retry で復旧予定)`);
-    amazonFinanceSyncResult = { success: false, summary: '⏸️ skipped (build 失敗)' };
+    const DATA_DIR_ARG = process.env.DATA_DIR.replace(/\\/g, '/');
+    const amazonFinanceBuildResult = runScript(
+      `scripts/amazon-finance/build-daily-fact.js --data-dir "${DATA_DIR_ARG}" --month ${currentMonth}`,
+      'Amazon finance build', 600000
+    );
+    results.push({ name: 'Amazon finance build', ...amazonFinanceBuildResult });
+
+    if (amazonFinanceBuildResult.success) {
+      // CHUNK_SIZE は 3000 推奨 (issue #72)、env 経由で override 可
+      if (!process.env.CHUNK_SIZE) process.env.CHUNK_SIZE = '3000';
+      const amazonFinanceSyncResult = runScript(
+        `apps/warehouse/sync-amazon-finance-daily.js --data-dir "${DATA_DIR_ARG}" --month ${currentMonth}`,
+        'Amazon finance sync', 600000
+      );
+      results.push({ name: 'Amazon finance sync', ...amazonFinanceSyncResult });
+    } else {
+      // build 失敗 → sync は記録自体しない (Codex Round 1 #2 対応)。
+      // sync を success:false で push + RETRYABLE_JOBS にあると retry-failed-jobs が
+      // build を再実行せずに sync 単独 retry してしまい、古い fact を sync する事故。
+      // build を retryable に残し、sync は build 成功時のみ実行 = sync を retry 対象外にする。
+      console.log(`[DailySync] Amazon finance sync は build 失敗のため記録せず (build retry 後に翌 cron で sync 実行)`);
+    }
   }
-  results.push({ name: 'Amazon finance sync', ...amazonFinanceSyncResult });
 
   // 楽天 AM/AL/W → NE商品コード sku_map 再構築 (f_sales と独立)
   const rakutenSkuMapResult = runScript('apps/warehouse/rebuild-rakuten-sku-map.js', '楽天 sku_map 再構築');
