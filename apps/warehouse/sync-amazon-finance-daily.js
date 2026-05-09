@@ -83,9 +83,16 @@ if (!fs.existsSync(dbPath)) {
   process.exit(2);
 }
 
-if (!isDryRun && (!renderUrl || !syncKey)) {
-  console.error('FATAL: RENDER_MIRROR_URL and MIRROR_SYNC_KEY required for non-dry-run');
+if (!isDryRun && !renderUrl) {
+  console.error('FATAL: RENDER_MIRROR_URL required for non-dry-run');
   process.exit(2);
+}
+// MIRROR_SYNC_KEY は optional (Render 側 ALLOW_INSECURE_MIRROR_SYNC=1 暫定運用と整合、
+// sync-to-render.js の振る舞いと同じ)。本格 secure 化は Phase 1a.1 で C 案移行 (PROXY_SECRET 同等の
+// 二重受け入れ rotation)。それまでは key 空でも header 無しで送信し insecure mode で通る
+if (!isDryRun && !syncKey) {
+  console.warn('⚠️  MIRROR_SYNC_KEY 未設定: Render 側 ALLOW_INSECURE_MIRROR_SYNC=1 に依存します');
+  console.warn('   (Phase 1a.1 で C 案 = 本物 KEY 設定 + ALLOW_INSECURE 解除 へ移行予定)');
 }
 
 const db = new Database(dbPath, { readonly: true });
@@ -230,13 +237,13 @@ import('node:os').then(async (os) => {
     };
 
     console.log(`  [${i + 1}/${chunks.length}] sending ${chunk.length} rows...`);
+    // syncKey 空なら header 付けず送信 (Render insecure mode で通る)
+    const chunkHeaders = { 'Content-Type': 'application/json' };
+    if (syncKey) chunkHeaders['x-sync-key'] = syncKey;
     try {
       const res = await fetch(`${renderUrl}/api/sync/${ENTITY_NAME}/chunk`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-sync-key': syncKey,
-        },
+        headers: chunkHeaders,
         body: JSON.stringify(body),
       });
       if (!res.ok) {
@@ -298,9 +305,11 @@ import('node:os').then(async (os) => {
     // 3d. Render mart rebuild trigger (Phase 1 #1-7、現状 noop endpoint だが trigger 経路は確保)
     // 失敗しても sync の applied 状態は維持 (warn のみ)。
     try {
+      const rebuildHeaders = {};
+      if (syncKey) rebuildHeaders['x-sync-key'] = syncKey;
       const rebuildRes = await fetch(`${renderUrl}/api/sync/runs/${runId}/rebuild-marts`, {
         method: 'POST',
-        headers: { 'x-sync-key': syncKey },
+        headers: rebuildHeaders,
         signal: AbortSignal.timeout(30000),
       });
       if (rebuildRes.ok) {
