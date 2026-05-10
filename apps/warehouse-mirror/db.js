@@ -354,12 +354,22 @@ function createTables() {
     units_ordered                     INTEGER NOT NULL DEFAULT 0,
     units_cancelled                   INTEGER NOT NULL DEFAULT 0,
     units_net_sold                    INTEGER NOT NULL DEFAULT 0,
+    -- Phase 1b 按分関連
+    allocated_units_cancelled         INTEGER NOT NULL DEFAULT 0,
+    units_cancelled_same_day_matched  INTEGER NOT NULL DEFAULT 0,
+    allocation_method                 TEXT NOT NULL DEFAULT 'no_refund' CHECK (
+      allocation_method IN ('monthly_proportion', 'no_refund')
+    ),
+    cancel_exceeds_ordered_warning    INTEGER NOT NULL DEFAULT 0,
     sales_principal_jpy_incl          REAL NOT NULL DEFAULT 0,
     sales_postage_jpy_incl            REAL NOT NULL DEFAULT 0,
     coupon_shop_jpy_incl              REAL NOT NULL DEFAULT 0,
     coupon_all_jpy_incl               REAL NOT NULL DEFAULT 0,
     promotion_jpy_incl                REAL NOT NULL DEFAULT 0,
     refund_amount_jpy_incl            REAL NOT NULL DEFAULT 0,
+    -- Phase 1b 按分 refund 関連
+    allocated_refund_amount_jpy_incl  REAL NOT NULL DEFAULT 0,
+    refund_amount_same_day_matched_jpy_incl REAL NOT NULL DEFAULT 0,
     mall_fee_jpy_incl                 REAL NOT NULL DEFAULT 0,
     shipping_cost_jpy_incl            REAL NOT NULL DEFAULT 0,
     shipping_quality                  TEXT NOT NULL CHECK (
@@ -392,6 +402,26 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_mrfsd_ne ON mirror_rakuten_finance_sku_daily(ne_code)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mrfsd_month ON mirror_rakuten_finance_sku_daily(substr(date_jst, 1, 7))');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mrfsd_run ON mirror_rakuten_finance_sku_daily(source_run_id)');
+
+  // Phase 1b migration: 既存 mirror_rakuten_finance_sku_daily に新列追加 (idempotent)
+  // CREATE TABLE IF NOT EXISTS は既存 table に新列を追加しないので、ALTER TABLE で動的 migrate
+  const mrfsdCols = new Set(
+    db.prepare("PRAGMA table_info(mirror_rakuten_finance_sku_daily)").all().map(c => c.name)
+  );
+  const phase1bMirrorCols = [
+    { name: 'allocated_units_cancelled',         def: 'INTEGER NOT NULL DEFAULT 0' },
+    { name: 'units_cancelled_same_day_matched',  def: 'INTEGER NOT NULL DEFAULT 0' },
+    { name: 'allocation_method',                 def: "TEXT NOT NULL DEFAULT 'no_refund'" },
+    { name: 'cancel_exceeds_ordered_warning',    def: 'INTEGER NOT NULL DEFAULT 0' },
+    { name: 'allocated_refund_amount_jpy_incl',  def: 'REAL NOT NULL DEFAULT 0' },
+    { name: 'refund_amount_same_day_matched_jpy_incl', def: 'REAL NOT NULL DEFAULT 0' },
+  ];
+  for (const c of phase1bMirrorCols) {
+    if (!mrfsdCols.has(c.name)) {
+      console.log(`[mirror-db] Phase 1b migration: ALTER TABLE mirror_rakuten_finance_sku_daily ADD COLUMN ${c.name}`);
+      db.exec(`ALTER TABLE mirror_rakuten_finance_sku_daily ADD COLUMN ${c.name} ${c.def}`);
+    }
+  }
 
   // mirror_amazon_sku_fees — Amazon手数料キャッシュ（粗利ダッシュボード用）
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_amazon_sku_fees (

@@ -1,17 +1,21 @@
 -- f_rakuten_finance_sku_daily_v1 DDL
--- ticket: Phase 1a #R-1 (楽天売上分析、AI_reference: 楽天Phase1a設計書_v0.4_20260509.md)
--- contract: docs/contracts/raw_rakuten_orders.contract.md (v1.1)
+-- ticket: Phase 1a #R-1 + Phase 1b (楽天売上分析、AI_reference: 楽天Phase1a設計書_v0.4_20260509.md)
+-- contract: docs/contracts/raw_rakuten_orders.contract.md (v1.2 Phase 1b)
 -- build SQL: sql/rakuten/build_f_rakuten_finance_sku_daily_v1.sql
 --
 -- 売上計上方針 (D 案、Codex セカンドオピニオン 2026-05-09 確定):
 --   - units_ordered = status IN (500,600,700) 件数 (受注ベース、発送前/発送後/お届け完了)
---   - units_cancelled = fact_returns 楽天分の数量 (注文日 == silver date_jst の (date,code) ペア)
+--   - units_cancelled = Phase 1b 按分後の採用値 (= allocated_units_cancelled)
 --   - units_net_sold = MAX(0, units_ordered - units_cancelled)
 --   - 楽天 status=700 が 2 ヶ月遅延のため、当月/先月のダッシュボード可視化を優先
 --
--- Phase 1a 既知の限界: refund 注文日 と silver date_jst が日付不一致な (date, code) ペア
--- は LEFT JOIN で漏れる (4 月実測 88 units、cancel 全体の 36%)。Phase 1b で按分案対応予定
--- (詳細: g:/共有ドライブ/AI_reference/システム設計/楽天Phase1b案_C-lite検討メモ_20260509.md)
+-- Phase 1b (2026-05-10、Codex 事前レビュー反映): cogs 補正のため月次按分実装
+--   - refund_monthly = rakuten_code 単位で月集計
+--   - sales_by_code_month = rakuten_code の月内 sales 合計 (按分分母)
+--   - allocated_units_cancelled = Largest Remainder Method (床関数 + 残差を上位に +1 配賦)
+--   - units_cancelled_same_day_matched = Phase 1a 旧 LEFT JOIN 結果 (audit 用)
+--   - 月次フルリビルド前提 (build script で対象月 + 前 2 ヶ月を毎回再計算)
+--   - 月次合計が SUM(allocated_units_cancelled) = SUM(fact_returns 数量) で完全一致保証
 --
 -- 不変条件 (Codex Round 11-13 で Amazon Phase 1 #1-1 から継承):
 --   - PK: (date_jst, rakuten_code)
@@ -32,9 +36,24 @@ CREATE TABLE IF NOT EXISTS f_rakuten_finance_sku_daily_v1 (
   product_name                      TEXT NOT NULL DEFAULT '',
 
   -- 数量 (整数前提)
+  -- units_cancelled は Phase 1b で「按分後の採用値」(= allocated_units_cancelled) に意味変更
+  -- 旧仕様 (Phase 1a 同日マッチのみ) の値は audit 用に units_cancelled_same_day_matched に保存
   units_ordered                     INTEGER NOT NULL DEFAULT 0,
   units_cancelled                   INTEGER NOT NULL DEFAULT 0,
   units_net_sold                    INTEGER NOT NULL DEFAULT 0,
+
+  -- Phase 1b 按分関連 (Codex 事前レビュー 2026-05-10 反映)
+  -- allocated_units_cancelled: refund_monthly × (units_ordered / month_total_ordered) を Largest Remainder Method で配賦
+  --   units_cancelled と同じ値だが、明示的に「按分由来」と分かるように別列で保存
+  -- units_cancelled_same_day_matched: Phase 1a 旧仕様 (同日 LEFT JOIN) の結果、audit 用
+  -- allocation_method: 'monthly_proportion' (按分採用) / 'no_refund' (refund_monthly に該当 SKU なし)
+  -- cancel_exceeds_ordered_warning: month_total_cancelled > month_total_ordered の異常検知 (1=要調査)
+  allocated_units_cancelled         INTEGER NOT NULL DEFAULT 0,
+  units_cancelled_same_day_matched  INTEGER NOT NULL DEFAULT 0,
+  allocation_method                 TEXT NOT NULL DEFAULT 'no_refund' CHECK (
+    allocation_method IN ('monthly_proportion', 'no_refund')
+  ),
+  cancel_exceeds_ordered_warning    INTEGER NOT NULL DEFAULT 0,
 
   -- 売上 (税込)
   sales_principal_jpy_incl          REAL NOT NULL DEFAULT 0,
@@ -45,8 +64,12 @@ CREATE TABLE IF NOT EXISTS f_rakuten_finance_sku_daily_v1 (
   coupon_all_jpy_incl               REAL NOT NULL DEFAULT 0,
   promotion_jpy_incl                REAL NOT NULL DEFAULT 0,
 
-  -- 返金 (税込、注文日基準で fact_returns 楽天分から JOIN)
+  -- 返金 (税込)
+  -- refund_amount_jpy_incl は Phase 1b で「按分後の採用値」(= allocated_refund_amount) に意味変更
+  -- 旧仕様 (同日マッチ) は refund_amount_same_day_matched_jpy_incl に保存
   refund_amount_jpy_incl            REAL NOT NULL DEFAULT 0,
+  allocated_refund_amount_jpy_incl  REAL NOT NULL DEFAULT 0,
+  refund_amount_same_day_matched_jpy_incl REAL NOT NULL DEFAULT 0,
 
   -- モール手数料 (税込、楽天 10%)
   -- 業務前提: 楽天手数料の課金ベース = (sales_principal + sales_postage - coupon_all)

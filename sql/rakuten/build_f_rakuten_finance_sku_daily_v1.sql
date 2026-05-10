@@ -77,9 +77,12 @@ CREATE INDEX _silver_rakuten_orders_v1_order_idx
 INSERT INTO f_rakuten_finance_sku_daily_v1 (
   date_jst, rakuten_code, ne_code, sku_resolution, product_name,
   units_ordered, units_cancelled, units_net_sold,
+  -- Phase 1b 按分関連
+  allocated_units_cancelled, units_cancelled_same_day_matched,
+  allocation_method, cancel_exceeds_ordered_warning,
   sales_principal_jpy_incl, sales_postage_jpy_incl,
   coupon_shop_jpy_incl, coupon_all_jpy_incl, promotion_jpy_incl,
-  refund_amount_jpy_incl,
+  refund_amount_jpy_incl, allocated_refund_amount_jpy_incl, refund_amount_same_day_matched_jpy_incl,
   mall_fee_jpy_incl,
   shipping_cost_jpy_incl, shipping_quality,
   unit_cost_snapshot_incl, cost_snapshot_date_jst,
@@ -155,9 +158,9 @@ coupon_agg AS (
     AND CAST(strftime('%Y%m', 日付) AS INTEGER) = :year_month_int
   GROUP BY 日付, モール商品コード
 ),
--- D-2: 返金 (fact_returns、楽天分は 7,138 件投入済、注文日基準で JOIN)
--- 注意 (Phase 1a 既知の限界): fact_returns 注文日 と silver date_jst が日付不一致な
--- (date, code) ペアは LEFT JOIN で漏れる (4 月実測 88 units)。Phase 1b で按分案対応予定
+-- D-2a: 返金 同日マッチ集計 (Phase 1a 旧仕様、audit 用に残す)
+-- 同 (date_jst, rakuten_code) で fact_returns と silver が一致する分のみ拾う
+-- → units_cancelled_same_day_matched / refund_amount_same_day_matched_jpy_incl 列に流す
 refund_agg AS (
   SELECT
     注文日 AS date_jst,
@@ -169,6 +172,98 @@ refund_agg AS (
     AND 注文日 IS NOT NULL
     AND CAST(strftime('%Y%m', 注文日) AS INTEGER) = :year_month_int
   GROUP BY 注文日, モール商品コード
+),
+-- D-2b: Phase 1b 按分案 (Codex 事前レビュー 2026-05-10 反映)
+-- 月次按分で日付不一致の 88 units (4月実測) を救済し、cogs を正確化
+--
+-- refund_monthly: rakuten_code 単位で月集計 (date_jst を残さない)
+refund_monthly AS (
+  SELECT
+    モール商品コード AS rakuten_code,
+    SUM(数量) AS month_total_cancelled,
+    SUM(返金額) AS month_total_refund
+  FROM fact_returns
+  WHERE モール = 'rakuten'
+    AND 注文日 IS NOT NULL
+    AND CAST(strftime('%Y%m', 注文日) AS INTEGER) = :year_month_int
+  GROUP BY モール商品コード
+),
+-- sales_by_code_month: 同 rakuten_code の月内 sales 合計 (按分分母)
+sales_by_code_month AS (
+  SELECT rakuten_code, SUM(units_ordered) AS month_total_ordered
+  FROM daily_aggregated
+  GROUP BY rakuten_code
+),
+-- allocation_floor: 床関数で初期配賦 + 残差 (= 月内未配賦数量)
+-- silver にない rakuten_code (status=900 完全 cancel) は LEFT JOIN で month_total_ordered=NULL → 配賦 0 で除外
+allocation_floor AS (
+  SELECT
+    da.date_jst,
+    da.rakuten_code,
+    da.units_ordered,
+    rm.month_total_cancelled,
+    rm.month_total_refund,
+    scm.month_total_ordered,
+    -- 配賦比率 (silver にあれば計算、なければ 0)
+    CASE
+      WHEN COALESCE(scm.month_total_ordered, 0) > 0 AND rm.month_total_cancelled IS NOT NULL
+      THEN (da.units_ordered * 1.0 / scm.month_total_ordered) * rm.month_total_cancelled
+      ELSE 0
+    END AS exact_units,
+    -- refund 額は decimal なので最後に ROUND するだけで月合計は完全一致
+    CASE
+      WHEN COALESCE(scm.month_total_ordered, 0) > 0 AND rm.month_total_refund IS NOT NULL
+      THEN (da.units_ordered * 1.0 / scm.month_total_ordered) * rm.month_total_refund
+      ELSE 0
+    END AS exact_refund
+  FROM daily_aggregated da
+  LEFT JOIN sales_by_code_month scm ON scm.rakuten_code = da.rakuten_code
+  LEFT JOIN refund_monthly rm ON rm.rakuten_code = da.rakuten_code
+),
+-- allocation_ranked: 床関数 + 残差ランキング (Largest Remainder Method、Codex 事前/事後レビュー反映)
+-- units と refund 両方に LRM 適用 (refund は円単位、楽天 fact_returns 返金額は整数円前提)
+-- 各 rakuten_code 内で floor 合計 + 残差 +1 = month_total_xxx で完全一致
+allocation_ranked AS (
+  SELECT
+    *,
+    -- units 側
+    CAST(exact_units AS INTEGER) AS units_floor,
+    ROW_NUMBER() OVER (
+      PARTITION BY rakuten_code
+      ORDER BY exact_units - CAST(exact_units AS INTEGER) DESC, date_jst
+    ) AS units_rank_in_code,
+    SUM(CAST(exact_units AS INTEGER)) OVER (PARTITION BY rakuten_code) AS units_sum_floor_in_code,
+    -- refund 側 (Codex post #2 反映: refund も LRM 適用)
+    CAST(exact_refund AS INTEGER) AS refund_floor,
+    ROW_NUMBER() OVER (
+      PARTITION BY rakuten_code
+      ORDER BY exact_refund - CAST(exact_refund AS INTEGER) DESC, date_jst
+    ) AS refund_rank_in_code,
+    SUM(CAST(exact_refund AS INTEGER)) OVER (PARTITION BY rakuten_code) AS refund_sum_floor_in_code,
+    -- month_total_refund を整数円化 (端数があれば切り捨て、誤差は ¥1 以内)
+    CAST(month_total_refund AS INTEGER) AS month_total_refund_int
+  FROM allocation_floor
+),
+-- allocation_final: 上位 (rank <= residual) に +1 配賦 (units / refund 別々に)
+allocation_final AS (
+  SELECT
+    date_jst, rakuten_code, units_ordered,
+    month_total_cancelled, month_total_refund, month_total_ordered,
+    units_floor + (
+      CASE
+        WHEN month_total_cancelled IS NULL THEN 0
+        WHEN units_rank_in_code <= (month_total_cancelled - units_sum_floor_in_code) THEN 1
+        ELSE 0
+      END
+    ) AS allocated_units_cancelled,
+    refund_floor + (
+      CASE
+        WHEN month_total_refund_int IS NULL THEN 0
+        WHEN refund_rank_in_code <= (month_total_refund_int - refund_sum_floor_in_code) THEN 1
+        ELSE 0
+      END
+    ) AS allocated_refund
+  FROM allocation_ranked
 ),
 -- D-3: ne_code 解決 (1 rakuten_code に複数 ne_code がある場合 NULL 化、要 R-1 後段監視)
 sku_resolved AS (
@@ -232,49 +327,58 @@ SELECT
   END AS sku_resolution,
   c.product_name,
   c.units_ordered,
-  COALESCE(rf.units_cancelled, 0) AS units_cancelled,
-  -- units_net_sold: ordered - cancelled、負値ガード MAX(0, ...) (4月実測 6 件)
-  MAX(0, c.units_ordered - COALESCE(rf.units_cancelled, 0)) AS units_net_sold,
+  -- Phase 1b: units_cancelled = 按分後の採用値 (= allocated_units_cancelled)
+  af.allocated_units_cancelled AS units_cancelled,
+  -- units_net_sold: ordered - allocated_cancelled、負値ガード MAX(0, ...)
+  MAX(0, c.units_ordered - af.allocated_units_cancelled) AS units_net_sold,
+  -- Phase 1b 按分関連列
+  af.allocated_units_cancelled,
+  COALESCE(rf.units_cancelled, 0) AS units_cancelled_same_day_matched,
+  CASE WHEN af.month_total_cancelled IS NULL THEN 'no_refund' ELSE 'monthly_proportion' END AS allocation_method,
+  CASE WHEN COALESCE(af.month_total_cancelled, 0) > COALESCE(af.month_total_ordered, 0) THEN 1 ELSE 0 END AS cancel_exceeds_ordered_warning,
   ROUND(c.sales_principal_jpy_incl, 2) AS sales_principal_jpy_incl,
   ROUND(c.sales_postage_jpy_incl, 2) AS sales_postage_jpy_incl,
   ROUND(COALESCE(cp.coupon_shop_jpy_incl, 0), 2) AS coupon_shop_jpy_incl,
   ROUND(COALESCE(cp.coupon_all_jpy_incl, 0), 2) AS coupon_all_jpy_incl,
   ROUND(COALESCE(cp.promotion_jpy_incl, 0), 2) AS promotion_jpy_incl,
-  ROUND(COALESCE(rf.refund_amount_jpy_incl, 0), 2) AS refund_amount_jpy_incl,
+  -- Phase 1b: refund_amount = 按分後の採用値
+  ROUND(af.allocated_refund, 2) AS refund_amount_jpy_incl,
+  ROUND(af.allocated_refund, 2) AS allocated_refund_amount_jpy_incl,
+  ROUND(COALESCE(rf.refund_amount_jpy_incl, 0), 2) AS refund_amount_same_day_matched_jpy_incl,
   -- mall_fee (10%、課金ベース = principal + postage - coupon_all)
   ROUND(
     (c.sales_principal_jpy_incl + c.sales_postage_jpy_incl - COALESCE(cp.coupon_all_jpy_incl, 0)) * 0.10,
     2) AS mall_fee_jpy_incl,
-  -- shipping_cost = 単価 × units_net_sold (cancel 後の数量)
+  -- shipping_cost = 単価 × units_net_sold (Phase 1b 按分後)
   ROUND(
-    COALESCE(sl.unit_shipping_cost, 0) * MAX(0, c.units_ordered - COALESCE(rf.units_cancelled, 0)),
+    COALESCE(sl.unit_shipping_cost, 0) * MAX(0, c.units_ordered - af.allocated_units_cancelled),
     2) AS shipping_cost_jpy_incl,
   COALESCE(sl.shipping_quality, 'missing') AS shipping_quality,
   -- snapshot 原価 (初回 build 時点で固定、UPSERT で更新しない)
   cl.unit_cost_snapshot_incl,
   :build_date AS cost_snapshot_date_jst,
   cl.unit_cost_snapshot_incl AS latest_unit_cost_reference_incl,
-  -- cogs = unit_cost_snapshot × units_net_sold
+  -- cogs = unit_cost_snapshot × units_net_sold (Phase 1b 按分後)
   ROUND(
-    COALESCE(cl.unit_cost_snapshot_incl, 0) * MAX(0, c.units_ordered - COALESCE(rf.units_cancelled, 0)),
+    COALESCE(cl.unit_cost_snapshot_incl, 0) * MAX(0, c.units_ordered - af.allocated_units_cancelled),
     2) AS cogs_amount_jpy_incl,
   -- 利益 5 階層
   ROUND(c.sales_principal_jpy_incl + c.sales_postage_jpy_incl, 2) AS gross_sales_jpy_incl,
   ROUND(
     c.sales_principal_jpy_incl + c.sales_postage_jpy_incl - COALESCE(cp.coupon_shop_jpy_incl, 0),
     2) AS net_sales_jpy_incl,
-  -- variable_margin = net_sales - cogs - shipping - mall_fee
+  -- variable_margin = net_sales - cogs - shipping - mall_fee (Phase 1b 按分後)
   ROUND(
     (c.sales_principal_jpy_incl + c.sales_postage_jpy_incl - COALESCE(cp.coupon_shop_jpy_incl, 0))
-    - COALESCE(cl.unit_cost_snapshot_incl, 0) * MAX(0, c.units_ordered - COALESCE(rf.units_cancelled, 0))
-    - COALESCE(sl.unit_shipping_cost, 0) * MAX(0, c.units_ordered - COALESCE(rf.units_cancelled, 0))
+    - COALESCE(cl.unit_cost_snapshot_incl, 0) * MAX(0, c.units_ordered - af.allocated_units_cancelled)
+    - COALESCE(sl.unit_shipping_cost, 0) * MAX(0, c.units_ordered - af.allocated_units_cancelled)
     - (c.sales_principal_jpy_incl + c.sales_postage_jpy_incl - COALESCE(cp.coupon_all_jpy_incl, 0)) * 0.10,
     2) AS variable_margin_jpy_incl,
-  -- refund_adjusted_net_sales = net_sales - refund_amount
+  -- refund_adjusted_net_sales = net_sales - allocated_refund
   ROUND(
     c.sales_principal_jpy_incl + c.sales_postage_jpy_incl
     - COALESCE(cp.coupon_shop_jpy_incl, 0)
-    - COALESCE(rf.refund_amount_jpy_incl, 0),
+    - af.allocated_refund,
     2) AS refund_adjusted_net_sales_jpy_incl,
   COALESCE(cl.cost_status, 'missing_cost') AS cost_status,
   CASE WHEN cl.cost_status = 'complete' THEN 1 ELSE 0 END AS is_cost_complete,
@@ -290,10 +394,11 @@ SELECT
    + CASE WHEN cp.coupon_shop_jpy_incl IS NOT NULL THEN 25 ELSE 10 END) AS data_quality_score,
   c.price_variance_warning,
   -- メタ
-  'raw_rakuten_orders + fact_promotion_cost + fact_returns + m_products + product_shipping' AS source_layer_summary,
+  'raw_rakuten_orders + fact_promotion_cost + fact_returns + m_products + product_shipping (Phase 1b allocation)' AS source_layer_summary,
   c.source_row_count,
   CURRENT_TIMESTAMP AS built_at
 FROM daily_aggregated c
+JOIN allocation_final af ON af.date_jst = c.date_jst AND af.rakuten_code = c.rakuten_code
 LEFT JOIN sku_resolved sr ON sr.rakuten_code = c.rakuten_code
 LEFT JOIN cost_lookup cl ON cl.rakuten_code = c.rakuten_code
 LEFT JOIN shipping_lookup sl ON sl.rakuten_code = c.rakuten_code
@@ -311,18 +416,25 @@ ON CONFLICT (date_jst, rakuten_code) DO UPDATE SET
   units_ordered                    = excluded.units_ordered,
   units_cancelled                  = excluded.units_cancelled,
   units_net_sold                   = excluded.units_net_sold,
+  -- Phase 1b 按分関連
+  allocated_units_cancelled            = excluded.allocated_units_cancelled,
+  units_cancelled_same_day_matched     = excluded.units_cancelled_same_day_matched,
+  allocation_method                    = excluded.allocation_method,
+  cancel_exceeds_ordered_warning       = excluded.cancel_exceeds_ordered_warning,
   sales_principal_jpy_incl         = excluded.sales_principal_jpy_incl,
   sales_postage_jpy_incl           = excluded.sales_postage_jpy_incl,
   coupon_shop_jpy_incl             = excluded.coupon_shop_jpy_incl,
   coupon_all_jpy_incl              = excluded.coupon_all_jpy_incl,
   promotion_jpy_incl               = excluded.promotion_jpy_incl,
   refund_amount_jpy_incl           = excluded.refund_amount_jpy_incl,
+  allocated_refund_amount_jpy_incl = excluded.allocated_refund_amount_jpy_incl,
+  refund_amount_same_day_matched_jpy_incl = excluded.refund_amount_same_day_matched_jpy_incl,
   mall_fee_jpy_incl                = excluded.mall_fee_jpy_incl,
   shipping_cost_jpy_incl           = excluded.shipping_cost_jpy_incl,
   shipping_quality                 = excluded.shipping_quality,
   -- latest 参考値は最新で更新可
   latest_unit_cost_reference_incl  = excluded.latest_unit_cost_reference_incl,
-  -- cogs / 利益は「既存 snapshot × 新 units」で再計算
+  -- cogs / 利益は「既存 snapshot × 新 units_net_sold (按分後)」で再計算
   cogs_amount_jpy_incl             = ROUND(
     COALESCE(f_rakuten_finance_sku_daily_v1.unit_cost_snapshot_incl, 0)
     * excluded.units_net_sold,

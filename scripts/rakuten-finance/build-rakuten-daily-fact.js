@@ -49,12 +49,28 @@ if (!fs.existsSync(dbPath)) {
   process.exit(2);
 }
 
-const yearMonthInt = parseInt(monthStr.replace('-', ''), 10);
 const buildDate = new Date().toISOString().slice(0, 10);
 
-console.log('=== f_rakuten_finance_sku_daily_v1 build ===');
+// Phase 1b 月次フルリビルド (Codex 事前レビュー 2026-05-10):
+// 月またぎ refund (例: 4/15 注文 → 5/3 cancel) を取り込むため、対象月 + 前 2 ヶ月を毎回再 build。
+// 各月で「rakuten_code 単位の月集計按分」が走るため、過去月の数字も最新 fact_returns で更新される。
+// --skip-back-months 1 で 2 ヶ月、0 で対象月のみ (CLI override)
+function previousMonth(yyyymm, n) {
+  const [y, m] = yyyymm.split('-').map(Number);
+  const date = new Date(y, m - 1 - n, 1);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+}
+const skipBackArg = getArg('--skip-back-months');
+const skipBackMonths = skipBackArg !== null ? parseInt(skipBackArg, 10) : 2; // default: 2 (= 3 ヶ月 build)
+const monthsToBuild = [];
+for (let i = skipBackMonths; i >= 0; i--) {
+  monthsToBuild.push(previousMonth(monthStr, i));
+}
+
+console.log('=== f_rakuten_finance_sku_daily_v1 build (Phase 1b) ===');
 console.log(`DB: ${dbPath}`);
-console.log(`Month: ${monthStr} (year_month_int=${yearMonthInt})`);
+console.log(`Target month: ${monthStr}`);
+console.log(`Build months (Phase 1b 月またぎ refund 取り込み): ${monthsToBuild.join(', ')}`);
 console.log(`Build date: ${buildDate}`);
 console.log(`Dry run: ${dryRun}`);
 console.log('');
@@ -86,24 +102,35 @@ db.pragma('busy_timeout = 30000');
 
 try {
   // ============================================================
-  // 1. DDL 実行
+  // 1. DDL 実行 + Phase 1b migration (既存 table への新列追加)
   // ============================================================
   console.log('--- 1. DDL exec ---');
   db.exec(ddlSql);
   console.log('  ✓ DDL applied (CREATE TABLE IF NOT EXISTS)');
 
-  // ============================================================
-  // 2. 対象月の既存 row 数
-  // ============================================================
-  const beforeCount = db.prepare(`
-    SELECT COUNT(*) AS c FROM f_rakuten_finance_sku_daily_v1 WHERE substr(date_jst, 1, 7) = ?
-  `).get(monthStr).c;
-  console.log(`  Existing rows for ${monthStr}: ${beforeCount.toLocaleString()}`);
+  // CREATE TABLE IF NOT EXISTS は既存 table に新列を追加しない。
+  // Phase 1b で追加した列を既存 table に ALTER TABLE で migrate する (idempotent)
+  const existingCols = new Set(
+    db.prepare("PRAGMA table_info(f_rakuten_finance_sku_daily_v1)").all().map(c => c.name)
+  );
+  const phase1bColumns = [
+    { name: 'allocated_units_cancelled',         def: 'INTEGER NOT NULL DEFAULT 0' },
+    { name: 'units_cancelled_same_day_matched',  def: 'INTEGER NOT NULL DEFAULT 0' },
+    { name: 'allocation_method',                 def: "TEXT NOT NULL DEFAULT 'no_refund'" },
+    { name: 'cancel_exceeds_ordered_warning',    def: 'INTEGER NOT NULL DEFAULT 0' },
+    { name: 'allocated_refund_amount_jpy_incl',  def: 'REAL NOT NULL DEFAULT 0' },
+    { name: 'refund_amount_same_day_matched_jpy_incl', def: 'REAL NOT NULL DEFAULT 0' },
+  ];
+  for (const c of phase1bColumns) {
+    if (!existingCols.has(c.name)) {
+      console.log(`  Migrating: ALTER TABLE ADD COLUMN ${c.name}`);
+      db.exec(`ALTER TABLE f_rakuten_finance_sku_daily_v1 ADD COLUMN ${c.name} ${c.def}`);
+    }
+  }
 
   // ============================================================
-  // 3. build SQL 実行 (CTE A→B→C→D + UPSERT、tx 化)
+  // 2. build SQL parse (1 回、loop 内で再利用)
   // ============================================================
-  console.log('--- 3. build SQL exec (silver + UPSERT、tx) ---');
   const statements = rawBuildSql
     .split(';')
     .map(s => s.trim())
@@ -118,16 +145,29 @@ try {
     });
   console.log(`  Parsed ${statements.length} executable statements`);
 
-  if (dryRun) {
-    console.log(`  (dry-run) would execute ${statements.length} statements in a single tx`);
-  } else {
+  // ============================================================
+  // 3. Phase 1b 月 loop build (各月で UPSERT、snapshot 温存)
+  // ============================================================
+  for (const m of monthsToBuild) {
+    const ymInt = parseInt(m.replace('-', ''), 10);
+    const beforeCount = db.prepare(`
+      SELECT COUNT(*) AS c FROM f_rakuten_finance_sku_daily_v1 WHERE substr(date_jst, 1, 7) = ?
+    `).get(m).c;
+
+    console.log(`\n--- Build ${m} (year_month_int=${ymInt}, existing=${beforeCount.toLocaleString()}) ---`);
+
+    if (dryRun) {
+      console.log(`  (dry-run) would execute ${statements.length} statements`);
+      continue;
+    }
+
     let totalChanges = 0;
     const runBuildTx = db.transaction(() => {
       for (const sql of statements) {
         const hasParams = sql.includes(':year_month_int') || sql.includes(':build_date');
         if (hasParams) {
           const stmt = db.prepare(sql);
-          const info = stmt.run({ year_month_int: yearMonthInt, build_date: buildDate });
+          const info = stmt.run({ year_month_int: ymInt, build_date: buildDate });
           if (info.changes > 0) totalChanges += info.changes;
         } else {
           db.exec(sql);
@@ -135,17 +175,21 @@ try {
       }
     });
     runBuildTx.immediate();
-    console.log(`  ✓ Total inserted/changed rows: ${totalChanges.toLocaleString()}`);
+
+    const afterCount = db.prepare(`
+      SELECT COUNT(*) AS c FROM f_rakuten_finance_sku_daily_v1 WHERE substr(date_jst, 1, 7) = ?
+    `).get(m).c;
+    console.log(`  ✓ Inserted/changed: ${totalChanges.toLocaleString()} rows、After build: ${afterCount.toLocaleString()} rows for ${m}`);
   }
 
   // ============================================================
-  // 4. 結果サマリ
+  // 4. 結果サマリ (target month のみ)
   // ============================================================
-  console.log('--- 4. result summary ---');
+  console.log(`\n--- 4. result summary for target month ${monthStr} ---`);
   const afterCount = db.prepare(`
     SELECT COUNT(*) AS c FROM f_rakuten_finance_sku_daily_v1 WHERE substr(date_jst, 1, 7) = ?
   `).get(monthStr).c;
-  console.log(`  After build: ${afterCount.toLocaleString()} rows for ${monthStr}`);
+  console.log(`  Total rows: ${afterCount.toLocaleString()}`);
 
   if (!dryRun && afterCount > 0) {
     const summary = db.prepare(`
@@ -154,6 +198,9 @@ try {
         SUM(units_ordered) AS sum_units_ordered,
         SUM(units_cancelled) AS sum_units_cancelled,
         SUM(units_net_sold) AS sum_units_net_sold,
+        SUM(allocated_units_cancelled) AS sum_allocated_cancelled,
+        SUM(units_cancelled_same_day_matched) AS sum_same_day_matched,
+        SUM(cancel_exceeds_ordered_warning) AS sum_warning,
         ROUND(SUM(gross_sales_jpy_incl), 0) AS sum_gross_sales,
         ROUND(SUM(coupon_shop_jpy_incl), 0) AS sum_coupon_shop,
         ROUND(SUM(coupon_all_jpy_incl), 0) AS sum_coupon_all,
@@ -186,15 +233,73 @@ try {
       : 'n/a';
     console.log(`    粗利率 (variable_margin / gross_sales): ${margin_pct}%`);
     console.log(`    refund_adjusted_net_sales:             ¥${summary.sum_refund_adjusted?.toLocaleString()}`);
-    console.log(`  units:`);
-    console.log(`    ordered:    ${summary.sum_units_ordered?.toLocaleString()}`);
-    console.log(`    cancelled:  ${summary.sum_units_cancelled?.toLocaleString()}`);
-    console.log(`    net_sold:   ${summary.sum_units_net_sold?.toLocaleString()}`);
+    console.log(`  units (Phase 1b 按分後):`);
+    console.log(`    ordered:                    ${summary.sum_units_ordered?.toLocaleString()}`);
+    console.log(`    cancelled (allocated):      ${summary.sum_units_cancelled?.toLocaleString()}`);
+    console.log(`    net_sold:                   ${summary.sum_units_net_sold?.toLocaleString()}`);
+    console.log(`  Phase 1b allocation audit:`);
+    console.log(`    allocated_cancelled:        ${summary.sum_allocated_cancelled?.toLocaleString()}`);
+    console.log(`    same_day_matched (audit):   ${summary.sum_same_day_matched?.toLocaleString()}`);
+    console.log(`    cancel_exceeds_warning rows: ${summary.sum_warning?.toLocaleString()}`);
     console.log(`  品質:`);
     console.log(`    cost_status complete:           ${summary.complete_count?.toLocaleString()}`);
     console.log(`    cost_status missing_cost:       ${summary.missing_count?.toLocaleString()}`);
     console.log(`    price_variance_warning:         ${summary.price_variance_count?.toLocaleString()}`);
     console.log(`    shipping_quality missing:       ${summary.shipping_missing_count?.toLocaleString()}`);
+
+    // Phase 1b 月合計一致 check (rakuten_code 単位、SUM(allocated) = month_total_cancelled)
+    // Codex 事後レビュー指摘 #1: alloc 起点 LEFT JOIN だと returns-only code を見落とす
+    // → ret_per_code 起点でも検出 (FULL OUTER 相当を UNION で実装)
+    try {
+      const allocCheck = db.prepare(`
+        WITH alloc_per_code AS (
+          SELECT rakuten_code, SUM(allocated_units_cancelled) AS sum_alloc,
+                 SUM(allocated_refund_amount_jpy_incl) AS sum_alloc_refund
+          FROM f_rakuten_finance_sku_daily_v1
+          WHERE substr(date_jst, 1, 7) = ?
+          GROUP BY rakuten_code
+        ),
+        ret_per_code AS (
+          SELECT モール商品コード AS rakuten_code, SUM(数量) AS sum_ret,
+                 SUM(返金額) AS sum_ret_refund
+          FROM fact_returns
+          WHERE モール = 'rakuten' AND 注文日 IS NOT NULL
+            AND substr(注文日, 1, 7) = ?
+          GROUP BY モール商品コード
+        ),
+        all_codes AS (
+          SELECT rakuten_code FROM alloc_per_code
+          UNION
+          SELECT rakuten_code FROM ret_per_code
+        )
+        SELECT
+          COUNT(*) AS total_codes,
+          SUM(CASE WHEN a.sum_alloc IS NULL AND r.sum_ret > 0 THEN 1 ELSE 0 END) AS returns_only_codes,
+          SUM(CASE WHEN a.sum_alloc IS NULL THEN COALESCE(r.sum_ret, 0) ELSE 0 END) AS returns_only_units,
+          SUM(CASE WHEN a.sum_alloc IS NULL THEN COALESCE(r.sum_ret_refund, 0) ELSE 0 END) AS returns_only_refund,
+          SUM(CASE WHEN COALESCE(a.sum_alloc, 0) <> COALESCE(r.sum_ret, 0) THEN 1 ELSE 0 END) AS mismatch_count,
+          ROUND(SUM(COALESCE(a.sum_alloc, 0))) AS total_alloc,
+          ROUND(SUM(COALESCE(r.sum_ret, 0))) AS total_ret,
+          ROUND(SUM(COALESCE(a.sum_alloc_refund, 0)), 2) AS total_alloc_refund,
+          ROUND(SUM(COALESCE(r.sum_ret_refund, 0)), 2) AS total_ret_refund,
+          -- silver-coded のみ (returns-only 除く) で LRM 完全一致を確認
+          ROUND(SUM(CASE WHEN a.sum_alloc IS NOT NULL THEN COALESCE(a.sum_alloc_refund, 0) ELSE 0 END), 2) AS silver_alloc_refund,
+          ROUND(SUM(CASE WHEN a.sum_alloc IS NOT NULL THEN COALESCE(r.sum_ret_refund, 0) ELSE 0 END), 2) AS silver_ret_refund
+        FROM all_codes c
+        LEFT JOIN alloc_per_code a USING (rakuten_code)
+        LEFT JOIN ret_per_code r USING (rakuten_code)
+      `).get(monthStr, monthStr);
+      console.log('');
+      console.log(`  --- Phase 1b 按分一致 check (Codex post 指摘反映、returns-only 検出 + LRM verify) ---`);
+      console.log(`    総 code 数 (silver ∪ fact_returns): ${allocCheck.total_codes}`);
+      console.log(`    silver-coded 一致 (units):         ${allocCheck.total_alloc} = ${allocCheck.total_ret - (allocCheck.returns_only_units || 0)} ${(allocCheck.mismatch_count - (allocCheck.returns_only_codes || 0)) === 0 ? '✓ LRM 完璧' : '⚠️ LRM 残差 bug'}`);
+      const lrmRefundDiff = (allocCheck.silver_alloc_refund || 0) - (allocCheck.silver_ret_refund || 0);
+      console.log(`    silver-coded 一致 (refund):        ¥${allocCheck.silver_alloc_refund?.toLocaleString()} vs ¥${allocCheck.silver_ret_refund?.toLocaleString()} (差分 ¥${lrmRefundDiff.toFixed(2)}) ${Math.abs(lrmRefundDiff) <= 1 ? '✓ LRM ¥1 以内' : '⚠️ ' + Math.abs(lrmRefundDiff).toFixed(0) + '円ズレ'}`);
+      console.log(`    returns-only (silver にない、按分対象外): ${allocCheck.returns_only_codes || 0} code / ${allocCheck.returns_only_units || 0} units / ¥${allocCheck.returns_only_refund?.toLocaleString() || 0}`);
+      console.log(`      → status=900 完全キャンセル等。Phase 1a/1b 設計仕様内 (売上 fact に立てない注文を控除しない)`);
+    } catch (e) {
+      console.log('  (allocation check スキップ:', e.message, ')');
+    }
 
     // f_sales_by_listing 楽天分との突合 (validation Layer 1、簡易)
     try {
@@ -274,11 +379,10 @@ try {
       console.log(`    負値ガード発動 (units_cancelled > units_ordered) 件数: ${negCount}`);
 
       console.log('');
-      console.log('  --- Phase 1b 按分対象モニタリング (refund date != sales date) ---');
+      console.log('  --- 旧 Phase 1a LEFT JOIN 漏れ (Phase 1b 按分で救済済、audit 表示) ---');
       console.log(`    日付不一致 (date, code) ペア数: ${dateMismatchSkus.pair_count}`);
-      console.log(`    回収できなかった cancel units:  ${dateMismatchSkus.lost_units || 0}`);
-      console.log(`    → Phase 1b 「同月・同 rakuten_code 按分」で回収予定`);
-      console.log(`    → 設計メモ: g:/共有ドライブ/AI_reference/システム設計/楽天Phase1b案_C-lite検討メモ_20260509.md`);
+      console.log(`    旧 Phase 1a で漏れた units:     ${dateMismatchSkus.lost_units || 0}`);
+      console.log(`    → Phase 1b 月次按分で救済済 (allocated 列に反映)`);
     } catch (e) {
       console.log('  (fact_returns validation スキップ:', e.message, ')');
     }
