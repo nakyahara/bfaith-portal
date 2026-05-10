@@ -6,16 +6,26 @@
   <title>MF経営トップダッシュボード - B-Faith Portal</title>
   <link rel="icon" type="image/png" href="/favicon.png">
   <link rel="stylesheet" href="/style.css">
+  <!-- Chart.js (CDN) -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <style>
     body { background: #f5f7fa; }
-    .container { max-width: 1280px; margin: 0 auto; padding: 16px 20px; }
-    .header-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+    .container { max-width: 1400px; margin: 0 auto; padding: 16px 20px; }
+    .header-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; flex-wrap: wrap; gap: 12px; }
     .header-row h2 { margin: 0; }
     .back-link { font-size: 13px; color: #2563eb; text-decoration: none; }
     .back-link:hover { text-decoration: underline; }
-    .meta-bar { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px 16px; margin-bottom: 16px; font-size: 12px; color: #555; display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
-    .meta-bar strong { color: #111; }
 
+    .meta-bar { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px 16px; margin-bottom: 16px; font-size: 12px; color: #555; display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; align-items: center; }
+    .meta-bar strong { color: #111; }
+    .badge-success { background: #d1fae5; color: #065f46; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+
+    /* 期間切替 */
+    .period-switcher { display: inline-flex; gap: 4px; background: #fff; border: 1px solid #e5e7eb; border-radius: 6px; padding: 2px; }
+    .period-switcher button { background: transparent; border: none; padding: 6px 12px; font-size: 12px; cursor: pointer; border-radius: 4px; color: #555; }
+    .period-switcher button.active { background: #2563eb; color: white; }
+
+    /* KPI */
     .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 16px; }
     .kpi-card { background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px 20px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
     .kpi-card h3 { margin: 0 0 6px 0; font-size: 13px; color: #6b7280; font-weight: 500; }
@@ -26,18 +36,45 @@
     .yoy-up { color: #059669; }
     .yoy-down { color: #dc2626; }
 
-    .tabs { display: flex; gap: 4px; margin-bottom: -1px; }
+    /* グラフ */
+    .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+    .chart-card { background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
+    .chart-card h3 { margin: 0 0 10px 0; font-size: 13px; color: #374151; font-weight: 600; }
+    .chart-wrap { position: relative; height: 280px; }
+
+    /* タブ */
+    .tabs { display: flex; gap: 4px; margin-bottom: -1px; flex-wrap: wrap; }
     .tab-btn { background: #fff; border: 1px solid #e5e7eb; border-bottom: none; border-radius: 6px 6px 0 0; padding: 10px 16px; cursor: pointer; font-size: 13px; color: #555; }
     .tab-btn.active { background: #2563eb; color: white; border-color: #2563eb; }
-    .tab-content { background: white; border: 1px solid #e5e7eb; border-radius: 0 8px 8px 8px; padding: 16px; min-height: 360px; }
+    .tab-content { background: white; border: 1px solid #e5e7eb; border-radius: 0 8px 8px 8px; padding: 16px; min-height: 400px; }
     .tab-pane { display: none; }
     .tab-pane.active { display: block; }
 
+    /* 試算表 */
+    table.tb { width: 100%; border-collapse: collapse; font-size: 13px; }
+    table.tb thead th { background: #f3f4f6; font-weight: 600; color: #374151; padding: 8px 10px; border: 1px solid #e5e7eb; text-align: right; position: sticky; top: 0; z-index: 1; }
+    table.tb thead th:first-child, table.tb thead th:nth-child(2) { text-align: left; }
+    table.tb tbody td { padding: 5px 10px; border: 1px solid #e5e7eb; font-variant-numeric: tabular-nums; text-align: right; }
+    table.tb tbody td:first-child, table.tb tbody td:nth-child(2) { text-align: left; }
+    table.tb tr.section { background: #eef2ff; font-weight: 700; }
+    table.tb tr.section td { color: #1e3a8a; }
+    table.tb tr.subtotal { background: #fef3c7; font-weight: 700; }
+    table.tb tr.subtotal td { color: #92400e; border-top: 2px solid #fbbf24; }
+    table.tb tr.item { color: #4b5563; }
+    table.tb tr.item:hover { background: #f9fafb; }
+    .toggle-btn { background: transparent; border: none; cursor: pointer; padding: 0 4px; font-size: 14px; color: #6b7280; }
+    .toggle-btn:hover { color: #2563eb; }
+    .neg { color: #dc2626; }
+
+    /* タブ折りたたみ (詳細) */
+    details.detail-section { background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px 12px; margin-bottom: 8px; }
+    details.detail-section summary { font-weight: 600; cursor: pointer; padding: 4px 0; color: #374151; }
+
+    /* table.data: 既存 5 タブ用 */
     table.data { width: 100%; border-collapse: collapse; font-size: 13px; }
     table.data th, table.data td { border: 1px solid #e5e7eb; padding: 6px 10px; }
-    table.data th { background: #f9fafb; font-weight: 600; color: #374151; text-align: left; position: sticky; top: 0; }
+    table.data th { background: #f9fafb; font-weight: 600; color: #374151; text-align: left; }
     table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
-    table.data tbody tr:hover { background: #f9fafb; }
 
     .empty { background: #fef3c7; border: 1px solid #fbbf24; padding: 16px; border-radius: 6px; color: #78350f; }
     .loading { padding: 16px; color: #6b7280; }
@@ -47,6 +84,21 @@
     .badge.high { background: #fed7aa; color: #9a3412; }
     .badge.critical { background: #fecaca; color: #991b1b; }
     .badge.info { background: #dbeafe; color: #1e40af; }
+
+    /* モバイル */
+    @media (max-width: 900px) {
+      .charts-grid { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 768px) {
+      .kpi-grid { grid-template-columns: 1fr 1fr; }
+      .meta-bar { font-size: 11px; }
+      .chart-wrap { height: 220px; }
+      .tab-content { padding: 8px; }
+      table.tb, table.data { font-size: 11px; }
+      table.tb thead th, table.tb tbody td { padding: 4px 6px; }
+      /* テーブル横スクロール */
+      .table-scroll { overflow-x: auto; }
+    }
   </style>
 </head>
 <body>
@@ -62,6 +114,12 @@
   <main class="container">
     <div class="header-row">
       <h2>📊 MFクラウド経営トップ</h2>
+      <div class="period-switcher" id="period-switcher">
+        <button data-period="6m">6ヶ月</button>
+        <button data-period="12m" class="active">12ヶ月</button>
+        <button data-period="24m">24ヶ月</button>
+        <button data-period="all">全期間</button>
+      </div>
       <a href="/" class="back-link">← ポータルへ戻る</a>
     </div>
 
@@ -71,76 +129,86 @@
 
     <div id="kpi-section" class="kpi-grid"></div>
 
+    <div class="charts-grid">
+      <div class="chart-card"><h3>📈 売上 vs 粗利 (粗利率折れ線)</h3><div class="chart-wrap"><canvas id="chart-sales"></canvas></div></div>
+      <div class="chart-card"><h3>💵 現預金推移 (銀行別積み上げ)</h3><div class="chart-wrap"><canvas id="chart-cash"></canvas></div></div>
+      <div class="chart-card"><h3>🛒 モール別売上 (積み上げ)</h3><div class="chart-wrap"><canvas id="chart-channel"></canvas></div></div>
+      <div class="chart-card"><h3>💼 PL 主要 (売上/粗利/営業利益/経常利益)</h3><div class="chart-wrap"><canvas id="chart-pl"></canvas></div></div>
+    </div>
+
     <div class="tabs">
-      <button class="tab-btn active" data-tab="channel">モール別売上</button>
-      <button class="tab-btn" data-tab="balance">月末残高推移</button>
-      <button class="tab-btn" data-tab="cash">現金流入出 (90日)</button>
-      <button class="tab-btn" data-tab="pl">月次PL</button>
-      <button class="tab-btn" data-tab="anomaly">異常検知</button>
+      <button class="tab-btn active" data-tab="pl">📋 PL 試算表</button>
+      <button class="tab-btn" data-tab="bs">🏦 BS (現金及び預金)</button>
+      <button class="tab-btn" data-tab="anomaly">⚠️ 異常検知</button>
+      <button class="tab-btn" data-tab="details">🔎 詳細</button>
     </div>
 
     <div class="tab-content">
-      <div class="tab-pane active" id="tab-channel"><div class="loading">読み込み中...</div></div>
-      <div class="tab-pane" id="tab-balance"><div class="loading">読み込み中...</div></div>
-      <div class="tab-pane" id="tab-cash"><div class="loading">読み込み中...</div></div>
-      <div class="tab-pane" id="tab-pl"><div class="loading">読み込み中...</div></div>
+      <div class="tab-pane active" id="tab-pl"><div class="loading">読み込み中...</div></div>
+      <div class="tab-pane" id="tab-bs"><div class="loading">期間切替後に表示</div></div>
       <div class="tab-pane" id="tab-anomaly"><div class="loading">読み込み中...</div></div>
+      <div class="tab-pane" id="tab-details"><div class="loading">タブを開くと読み込みます</div></div>
     </div>
   </main>
 
 <script>
-// ─── 日本語金額フォーマット (億・万) ───
-function fmtJpy(n) {
-  if (n == null || isNaN(n)) return '—';
-  const v = Math.round(Number(n));
-  if (v === 0) return '¥0';
-  const sign = v < 0 ? '-' : '';
-  const abs = Math.abs(v);
-  const oku = Math.floor(abs / 100000000);
-  const man = Math.floor((abs % 100000000) / 10000);
-  const yen = abs % 10000;
-  let out = sign;
-  if (oku > 0) out += oku + '億';
-  if (man > 0 || (oku > 0 && yen > 0)) out += man.toLocaleString() + '万';
-  if (oku === 0 && man === 0) out += yen.toLocaleString() + '円';
-  else if (yen > 0) out += yen.toString().padStart(4, '0') + '円';
-  else out += '円';
-  return out;
-}
+'use strict';
+
+// ─── 日本語金額フォーマット ───
 function fmtJpyShort(n) {
   if (n == null || isNaN(n)) return '—';
   const v = Math.round(Number(n));
-  if (Math.abs(v) >= 100000000) {
-    return (v / 100000000).toFixed(2).replace(/\.?0+$/, '') + '億円';
-  }
-  if (Math.abs(v) >= 10000) {
-    return Math.round(v / 10000).toLocaleString() + '万円';
-  }
-  return v.toLocaleString() + '円';
+  if (v === 0) return '¥0';
+  if (Math.abs(v) >= 100000000) return (v / 100000000).toFixed(2).replace(/\.?0+$/, '') + '億';
+  if (Math.abs(v) >= 10000) return Math.round(v / 10000).toLocaleString() + '万';
+  return v.toLocaleString();
+}
+function fmtJpyComma(n) {
+  if (n == null || isNaN(n)) return '—';
+  const v = Math.round(Number(n));
+  return v.toLocaleString();
 }
 function fmtPct(n) {
   if (n == null || isNaN(n)) return '—';
   return (n >= 0 ? '+' : '') + Number(n).toFixed(1) + '%';
 }
-function fmtDate(s) {
-  return s ? s.slice(0, 19).replace('T', ' ') : '—';
-}
+function fmtDate(s) { return s ? s.slice(0, 19).replace('T', ' ') : '—'; }
 
-// ─── タブ切り替え ───
+// ─── 状態 ───
+let currentPeriod = '12m';
+const charts = {};
+let detailsLoaded = false;
+
+// ─── 期間切替 ───
+document.querySelectorAll('#period-switcher button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    currentPeriod = btn.dataset.period;
+    document.querySelectorAll('#period-switcher button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    loadAll();
+  });
+});
+
+// ─── タブ切替 ───
 document.querySelectorAll('.tab-btn').forEach(btn => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
     document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
     btn.classList.add('active');
     document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+    if (btn.dataset.tab === 'bs') loadBs();
+    if (btn.dataset.tab === 'details' && !detailsLoaded) loadDetails();
   });
 });
 
-// ─── データ取得 + 描画 ───
-async function loadSnapshot() {
-  const res = await fetch('/apps/exec-dashboard/api/snapshot');
-  const j = await res.json();
+// ─── データ取得 ───
+async function fetchJson(url) {
+  const res = await fetch(url);
+  return res.json();
+}
 
+async function loadSnapshot() {
+  const j = await fetchJson('/apps/exec-dashboard/api/snapshot');
   if (!j.ok) {
     document.getElementById('status-bar').innerHTML = '<span style="color:#dc2626">エラー: ' + (j.error || 'unknown') + '</span>';
     return;
@@ -149,162 +217,217 @@ async function loadSnapshot() {
     document.getElementById('status-bar').innerHTML = '<span class="empty">' + (j.message || 'データなし') + '</span>';
     return;
   }
-
-  renderStatusBar(j.exec, j.runMeta);
+  renderStatus(j.exec, j.runMeta);
   renderKpi(j.exec);
-  renderChannel(j.channelRows);
-  renderBalance(j.balanceRows);
-  renderCash(j.cashRows);
-  renderPl(j.plRows);
   renderAnomaly(j.anomalies);
 }
 
-function renderStatusBar(exec, runMeta) {
-  const el = document.getElementById('status-bar');
-  el.innerHTML =
-    '<span><strong>確定月:</strong> ' + (exec.current_month_ym || '—') + ' (' + (exec.reliability_label || '—') + ')</span>' +
-    '<span><strong>スナップショット:</strong> ' + (exec.snapshot_date || '—') + '</span>' +
-    '<span><strong>build run_id:</strong> ' + runMeta.run_id + ' (' + runMeta.scope + ')</span>' +
-    '<span><strong>finalized:</strong> ' + fmtDate(runMeta.finalized_at) + '</span>';
+async function loadTimeseries() {
+  const j = await fetchJson('/apps/exec-dashboard/api/timeseries?period=' + currentPeriod);
+  if (!j.ok) return;
+  renderCharts(j);
 }
 
+async function loadPl() {
+  document.getElementById('tab-pl').innerHTML = '<div class="loading">読み込み中...</div>';
+  const j = await fetchJson('/apps/exec-dashboard/api/trial-balance/pl?period=' + currentPeriod);
+  if (!j.ok) { document.getElementById('tab-pl').innerHTML = '<div class="empty">エラー: ' + j.error + '</div>'; return; }
+  renderTrialBalance('tab-pl', j, 'pl');
+}
+
+async function loadBs() {
+  document.getElementById('tab-bs').innerHTML = '<div class="loading">読み込み中...</div>';
+  const j = await fetchJson('/apps/exec-dashboard/api/trial-balance/bs?period=' + currentPeriod);
+  if (!j.ok) { document.getElementById('tab-bs').innerHTML = '<div class="empty">エラー: ' + j.error + '</div>'; return; }
+  renderTrialBalance('tab-bs', j, 'bs');
+}
+
+async function loadDetails() {
+  document.getElementById('tab-details').innerHTML = '<div class="loading">読み込み中...</div>';
+  const j = await fetchJson('/apps/exec-dashboard/api/details');
+  if (!j.ok) { document.getElementById('tab-details').innerHTML = '<div class="empty">エラー: ' + j.error + '</div>'; return; }
+  renderDetails(j);
+  detailsLoaded = true;
+}
+
+async function loadAll() {
+  // 期間切替時: timeseries + pl は再取得、bs/details はタブ開いた時のみ
+  await Promise.all([loadTimeseries(), loadPl()]);
+  // 開いてる他タブを refresh
+  if (document.getElementById('tab-bs').classList.contains('active')) await loadBs();
+  detailsLoaded = false;
+  if (document.getElementById('tab-details').classList.contains('active')) await loadDetails();
+}
+
+// ─── render: status bar ───
+function renderStatus(exec, runMeta) {
+  const el = document.getElementById('status-bar');
+  el.innerHTML =
+    '<span><strong>確定月:</strong> ' + (exec.current_month_ym || '—') + '</span>'
+    + '<span><strong>スナップショット:</strong> ' + (exec.snapshot_date || '—') + '</span>'
+    + '<span><strong>build run_id:</strong> ' + runMeta.run_id + ' (' + runMeta.scope + ')</span>'
+    + '<span><strong>finalized:</strong> ' + fmtDate(runMeta.finalized_at) + '</span>'
+    + '<span class="badge-success">✅ MF試算表と完全一致 (Phase 1b)</span>';
+}
+
+// ─── render: KPI ───
 function renderKpi(e) {
   const grossPct = e.sales_mtd_excl_tax ? (e.gross_profit_mtd_excl_tax / e.sales_mtd_excl_tax * 100) : null;
   const yoy = (v) => {
     if (v == null) return '';
-    const cls = v >= 0 ? 'yoy-up' : 'yoy-down';
-    return '<div class="sub"><span class="' + cls + '">前年同月比 ' + fmtPct(v) + '</span></div>';
+    return '<div class="sub"><span class="' + (v >= 0 ? 'yoy-up' : 'yoy-down') + '">前年同月比 ' + fmtPct(v) + '</span></div>';
   };
-  // Phase 1b: cash_balance_json は { banks:[...], by_category:{...} } 形式
-  // 旧形式 (配列のみ) との後方互換も維持
-  let cashSub = 'UPSIDER等のカード除く';
+  let cashSub = 'UPSIDER等カード除く';
   try {
     const parsed = JSON.parse(e.cash_balance_json || '[]');
-    const byCat = parsed && parsed.by_category;
-    if (byCat) {
-      cashSub = '普通 ' + fmtJpyShort(byCat.cash_bank_normal || 0)
-        + ' / 定期 ' + fmtJpyShort(byCat.cash_time_deposit || 0)
-        + ' / PayPal ' + fmtJpyShort(byCat.cash_paypal || 0)
-        + ' / ペイオニア ' + fmtJpyShort(byCat.cash_payoneer || 0);
+    if (parsed.by_category) {
+      const c = parsed.by_category;
+      cashSub = '普通 ' + fmtJpyShort(c.cash_bank_normal) + ' / 定期 ' + fmtJpyShort(c.cash_time_deposit)
+        + ' / PayPal ' + fmtJpyShort(c.cash_paypal) + ' / ペイオニア ' + fmtJpyShort(c.cash_payoneer);
     }
-  } catch (_) { /* 旧形式 fallback */ }
-  const html = [
+  } catch {}
+  document.getElementById('kpi-section').innerHTML = [
     '<div class="kpi-card"><h3>売上</h3><div class="v">' + fmtJpyShort(e.sales_mtd_excl_tax) + '</div>' + yoy(e.yoy_sales_pct) + '</div>',
     '<div class="kpi-card"><h3>粗利' + (grossPct != null ? ' (' + grossPct.toFixed(1) + '%)' : '') + '</h3><div class="v">' + fmtJpyShort(e.gross_profit_mtd_excl_tax) + '</div>' + yoy(e.yoy_gross_profit_pct) + '</div>',
     '<div class="kpi-card"><h3>営業利益</h3><div class="v">' + fmtJpyShort(e.operating_income_mtd_excl_tax) + '</div>' + yoy(e.yoy_operating_income_pct) + '</div>',
     '<div class="kpi-card cash"><h3>現預金合計</h3><div class="v">' + fmtJpyShort(e.cash_balance_total) + '</div><div class="sub" style="font-size:11px">' + cashSub + '</div></div>',
     '<div class="kpi-card danger"><h3>危険信号</h3><div class="v">' + (JSON.parse(e.danger_signals_json || '[]').length || 0) + '件</div><div class="sub">open シグナル</div></div>',
   ].join('');
-  document.getElementById('kpi-section').innerHTML = html;
 }
 
-function renderChannel(rows) {
-  if (!rows.length) { document.getElementById('tab-channel').innerHTML = '<div class="empty">データなし</div>'; return; }
-  // 月×チャネルで pivot
-  const months = [...new Set(rows.map(r => r.month_ym))].sort().reverse();
-  const channels = [...new Set(rows.map(r => r.channel_display_name))];
-  const m = {};
-  rows.forEach(r => { m[r.month_ym + '|' + r.channel_display_name] = r; });
-  let html = '<table class="data"><thead><tr><th>月</th>';
-  channels.forEach(c => html += '<th>' + c + '</th>');
-  html += '<th>合計</th></tr></thead><tbody>';
-  for (const month of months) {
-    let total = 0;
-    html += '<tr><td><strong>' + month + '</strong></td>';
-    for (const ch of channels) {
-      const v = m[month + '|' + ch]?.gross_sales_excl_tax || 0;
-      total += v;
-      html += '<td class="num">' + (v > 0 ? fmtJpyShort(v) : '—') + '</td>';
-    }
-    html += '<td class="num"><strong>' + fmtJpyShort(total) + '</strong></td></tr>';
-  }
-  html += '</tbody></table>';
-  document.getElementById('tab-channel').innerHTML = html;
-}
+// ─── render: charts (Chart.js) ───
+const PALETTE = ['#2563eb', '#dc2626', '#059669', '#d97706', '#7c3aed', '#0891b2', '#db2777', '#65a30d', '#ea580c', '#4f46e5'];
 
-function renderBalance(rows) {
-  if (!rows.length) { document.getElementById('tab-balance').innerHTML = '<div class="empty">データなし</div>'; return; }
-  const months = [...new Set(rows.map(r => r.month_ym))].sort().reverse();
-  const accounts = [...new Set(rows.map(r => r.account_name + (r.sub_account_name ? '/' + r.sub_account_name : '')))];
-  const m = {};
-  rows.forEach(r => {
-    const k = r.account_name + (r.sub_account_name ? '/' + r.sub_account_name : '');
-    m[r.month_ym + '|' + k] = r.closing_balance_excl_tax;
+function destroyChart(key) { if (charts[key]) { charts[key].destroy(); delete charts[key]; } }
+
+function renderCharts(j) {
+  // 1. 売上 vs 粗利
+  destroyChart('sales');
+  const ctx1 = document.getElementById('chart-sales').getContext('2d');
+  charts.sales = new Chart(ctx1, {
+    type: 'bar',
+    data: {
+      labels: j.months,
+      datasets: [
+        { type: 'bar', label: '売上', data: j.sales_vs_gross.map(r => r.sales), backgroundColor: '#2563eb', yAxisID: 'y' },
+        { type: 'bar', label: '粗利', data: j.sales_vs_gross.map(r => r.gross_profit), backgroundColor: '#10b981', yAxisID: 'y' },
+        { type: 'line', label: '粗利率(%)', data: j.sales_vs_gross.map(r => r.gross_profit_pct), borderColor: '#dc2626', backgroundColor: 'transparent', yAxisID: 'y1', tension: 0.2 },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: {
+        y: { ticks: { callback: v => fmtJpyShort(v) }, position: 'left' },
+        y1: { ticks: { callback: v => v + '%' }, position: 'right', grid: { drawOnChartArea: false } },
+      },
+      plugins: { tooltip: { callbacks: { label: (ctx) => ctx.dataset.label + ': ' + (ctx.dataset.yAxisID === 'y1' ? ctx.parsed.y + '%' : '¥' + fmtJpyComma(ctx.parsed.y)) } } },
+    },
   });
-  let html = '<table class="data"><thead><tr><th>月</th>';
-  accounts.forEach(a => html += '<th>' + a + '</th>');
-  html += '<th>合計</th></tr></thead><tbody>';
-  for (const month of months) {
-    let total = 0;
-    html += '<tr><td><strong>' + month + '</strong></td>';
-    for (const a of accounts) {
-      const v = m[month + '|' + a] || 0;
-      total += v;
-      html += '<td class="num">' + (v !== 0 ? fmtJpyShort(v) : '—') + '</td>';
-    }
-    html += '<td class="num"><strong>' + fmtJpyShort(total) + '</strong></td></tr>';
-  }
-  html += '</tbody></table>';
-  document.getElementById('tab-balance').innerHTML = html;
-}
 
-function renderCash(rows) {
-  if (!rows.length) { document.getElementById('tab-cash').innerHTML = '<div class="empty">データなし</div>'; return; }
-  let html = '<table class="data"><thead><tr><th>銀行口座</th><th>入金</th><th>件数</th><th>出金</th><th>件数</th><th>差引</th></tr></thead><tbody>';
-  rows.forEach(r => {
-    const diff = (r.in_total || 0) - (r.out_total || 0);
-    html += '<tr><td><strong>' + r.bank_account_key + '</strong></td>'
-      + '<td class="num">' + fmtJpyShort(r.in_total) + '</td>'
-      + '<td class="num">' + (r.in_cnt || 0) + '</td>'
-      + '<td class="num">' + fmtJpyShort(r.out_total) + '</td>'
-      + '<td class="num">' + (r.out_cnt || 0) + '</td>'
-      + '<td class="num"' + (diff < 0 ? ' style="color:#dc2626"' : '') + '>' + fmtJpyShort(diff) + '</td></tr>';
+  // 2. 現預金推移 (積み上げ)
+  destroyChart('cash');
+  const banks = ['paypay', 'kita_osaka', 'kyoto', 'time_deposit', 'paypal', 'payoneer', 'cash_petty', 'cash_current', 'unknown', 'other'];
+  const bankLabels = { paypay: 'PayPay', kita_osaka: '北おおさか', kyoto: '京都', time_deposit: '定期預金', paypal: 'PayPal', payoneer: 'ペイオニア', cash_petty: '現金', cash_current: '当座', unknown: '不明', other: 'その他' };
+  const cashDatasets = banks.filter(b => j.cash_trend.some(r => r[b] !== 0)).map((b, i) => ({
+    label: bankLabels[b] || b, data: j.cash_trend.map(r => r[b] || 0), backgroundColor: PALETTE[i % PALETTE.length], stack: 's',
+  }));
+  const ctx2 = document.getElementById('chart-cash').getContext('2d');
+  charts.cash = new Chart(ctx2, {
+    type: 'bar',
+    data: { labels: j.months, datasets: cashDatasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: { x: { stacked: true }, y: { stacked: true, ticks: { callback: v => fmtJpyShort(v) } } },
+      plugins: { tooltip: { callbacks: { label: (ctx) => ctx.dataset.label + ': ¥' + fmtJpyComma(ctx.parsed.y) } } },
+    },
   });
-  html += '</tbody></table>';
-  document.getElementById('tab-cash').innerHTML = html;
+
+  // 3. モール別売上 (積み上げ)
+  destroyChart('channel');
+  const channelDatasets = j.channels.map((c, i) => ({
+    label: c, data: j.channel_trend.map(r => r[c] || 0), backgroundColor: PALETTE[i % PALETTE.length], stack: 's',
+  }));
+  const ctx3 = document.getElementById('chart-channel').getContext('2d');
+  charts.channel = new Chart(ctx3, {
+    type: 'bar',
+    data: { labels: j.months, datasets: channelDatasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: { x: { stacked: true }, y: { stacked: true, ticks: { callback: v => fmtJpyShort(v) } } },
+      plugins: { tooltip: { callbacks: { label: (ctx) => ctx.dataset.label + ': ¥' + fmtJpyComma(ctx.parsed.y) } } },
+    },
+  });
+
+  // 4. PL 主要 (折れ線)
+  destroyChart('pl');
+  const ctx4 = document.getElementById('chart-pl').getContext('2d');
+  charts.pl = new Chart(ctx4, {
+    type: 'line',
+    data: {
+      labels: j.months,
+      datasets: [
+        { label: '売上', data: j.sales_vs_gross.map(r => r.sales), borderColor: '#2563eb', backgroundColor: 'transparent', tension: 0.2 },
+        { label: '粗利', data: j.sales_vs_gross.map(r => r.gross_profit), borderColor: '#10b981', backgroundColor: 'transparent', tension: 0.2 },
+        { label: '営業利益', data: j.sales_vs_gross.map(r => r.operating_income), borderColor: '#d97706', backgroundColor: 'transparent', tension: 0.2 },
+        { label: '経常利益', data: j.sales_vs_gross.map(r => r.ordinary_income), borderColor: '#7c3aed', backgroundColor: 'transparent', tension: 0.2 },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: { y: { ticks: { callback: v => fmtJpyShort(v) } } },
+      plugins: { tooltip: { callbacks: { label: (ctx) => ctx.dataset.label + ': ¥' + fmtJpyComma(ctx.parsed.y) } } },
+    },
+  });
 }
 
-function renderPl(rows) {
-  if (!rows.length) { document.getElementById('tab-pl').innerHTML = '<div class="empty">データなし</div>'; return; }
-  const months = [...new Set(rows.map(r => r.month_ym))].sort().reverse();
-  // 集計用 role 群
-  const roleAgg = {
-    '売上': r => ['sales','sales_export','sales_wholesale'].includes(r.role_key),
-    '返品': r => r.role_key === 'sales_return',
-    '原価': r => ['cogs_purchase','cogs_purchase_reduced'].includes(r.role_key),
-    'モール手数料': r => r.role_key === 'mall_fee',
-    '広告費': r => r.role_key === 'ad_cost',
-    '配送費': r => r.role_key === 'shipping_cost',
-    '販管費': r => r.role_key && r.role_key.startsWith('sgae_'),
-  };
-  const m = {};
-  rows.forEach(r => {
-    for (const [label, fn] of Object.entries(roleAgg)) {
-      if (fn(r)) {
-        const k = r.month_ym + '|' + label;
-        m[k] = (m[k] || 0) + (r.amount_excl_tax || 0);
+// ─── render: 試算表 ───
+function renderTrialBalance(targetId, j, kind) {
+  const months = j.months;
+  let html = '<div class="table-scroll"><table class="tb"><thead><tr><th style="width:30px"></th><th>科目</th>';
+  for (const m of months) html += '<th>' + m + '</th>';
+  html += '<th>合計</th></tr></thead><tbody>';
+
+  for (const sec of j.sections) {
+    const sectionId = (kind || 'pl') + '-' + sec.name.replace(/[^\w]/g, '');
+    const total = sec.totals.reduce((s, v) => s + (v || 0), 0);
+    const rowClass = sec.is_subtotal ? 'subtotal' : 'section';
+    const expandable = sec.items && sec.items.length > 0;
+    const toggle = expandable ? '<button class="toggle-btn" data-target="' + sectionId + '">▶</button>' : '';
+    html += '<tr class="' + rowClass + '"><td>' + toggle + '</td><td><strong>' + sec.name + '</strong></td>';
+    for (const t of sec.totals) html += '<td' + (t < 0 ? ' class="neg"' : '') + '>' + fmtJpyComma(t) + '</td>';
+    html += '<td' + (total < 0 ? ' class="neg"' : '') + '><strong>' + fmtJpyComma(total) + '</strong></td></tr>';
+
+    if (expandable) {
+      for (const it of sec.items) {
+        const itTotal = it.totals.reduce((s, v) => s + (v || 0), 0);
+        if (itTotal === 0 && it.totals.every(t => t === 0)) continue;
+        html += '<tr class="item item-detail" data-section="' + sectionId + '" style="display:none"><td></td><td style="padding-left:30px">' + it.name + '</td>';
+        for (const t of it.totals) html += '<td' + (t < 0 ? ' class="neg"' : '') + '>' + fmtJpyComma(t) + '</td>';
+        html += '<td' + (itTotal < 0 ? ' class="neg"' : '') + '>' + fmtJpyComma(itTotal) + '</td></tr>';
       }
     }
-  });
-  let html = '<table class="data"><thead><tr><th>月</th>';
-  Object.keys(roleAgg).forEach(l => html += '<th>' + l + '</th>');
-  html += '<th>粗利</th><th>営業利益</th></tr></thead><tbody>';
-  for (const month of months) {
-    const get = (l) => m[month + '|' + l] || 0;
-    const gross = get('売上') - get('返品') - get('原価');
-    const oi = gross - get('モール手数料') - get('広告費') - get('配送費') - get('販管費');
-    html += '<tr><td><strong>' + month + '</strong></td>';
-    Object.keys(roleAgg).forEach(l => html += '<td class="num">' + fmtJpyShort(get(l)) + '</td>');
-    html += '<td class="num"><strong>' + fmtJpyShort(gross) + '</strong></td>';
-    html += '<td class="num"><strong>' + fmtJpyShort(oi) + '</strong></td>';
-    html += '</tr>';
   }
-  html += '</tbody></table>';
-  document.getElementById('tab-pl').innerHTML = html;
+  html += '</tbody></table></div>';
+  document.getElementById(targetId).innerHTML = html;
+
+  // toggle handler
+  document.querySelectorAll('#' + targetId + ' .toggle-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const sectionId = btn.dataset.target;
+      const items = document.querySelectorAll('#' + targetId + ' .item-detail[data-section="' + sectionId + '"]');
+      const isOpen = items.length > 0 && items[0].style.display !== 'none';
+      items.forEach(it => it.style.display = isOpen ? 'none' : '');
+      btn.textContent = isOpen ? '▶' : '▼';
+    });
+  });
 }
 
+// ─── render: 異常検知 ───
 function renderAnomaly(rows) {
-  if (!rows.length) { document.getElementById('tab-anomaly').innerHTML = '<div class="empty" style="background:#d1fae5;border-color:#10b981;color:#065f46">✅ open な異常検知シグナルはありません</div>'; return; }
+  if (!rows || rows.length === 0) {
+    document.getElementById('tab-anomaly').innerHTML = '<div class="empty" style="background:#d1fae5;border-color:#10b981;color:#065f46">✅ open な異常検知シグナルはありません</div>';
+    return;
+  }
   let html = '<table class="data"><thead><tr><th>重要度</th><th>コード</th><th>タイトル</th><th>状態</th><th>状況</th></tr></thead><tbody>';
   rows.forEach(r => {
     const sev = r.severity || 'info';
@@ -320,7 +443,84 @@ function renderAnomaly(rows) {
   document.getElementById('tab-anomaly').innerHTML = html;
 }
 
+// ─── render: 詳細 (旧 5 タブの内容を折りたたみで) ───
+function renderDetails(j) {
+  let html = '';
+  // モール別売上
+  if (j.channelRows && j.channelRows.length > 0) {
+    const months = [...new Set(j.channelRows.map(r => r.month_ym))].sort().reverse();
+    const channels = [...new Set(j.channelRows.map(r => r.channel_display_name))];
+    const m = {};
+    j.channelRows.forEach(r => { m[r.month_ym + '|' + r.channel_display_name] = r; });
+    let t = '<table class="data"><thead><tr><th>月</th>';
+    channels.forEach(c => t += '<th>' + c + '</th>');
+    t += '<th>合計</th></tr></thead><tbody>';
+    for (const month of months) {
+      let total = 0;
+      t += '<tr><td><strong>' + month + '</strong></td>';
+      for (const ch of channels) {
+        const v = m[month + '|' + ch]?.gross_sales_excl_tax || 0;
+        total += v;
+        t += '<td class="num">' + (v > 0 ? fmtJpyShort(v) : '—') + '</td>';
+      }
+      t += '<td class="num"><strong>' + fmtJpyShort(total) + '</strong></td></tr>';
+    }
+    t += '</tbody></table>';
+    html += '<details class="detail-section"><summary>モール別売上 (補助科目別、生データ)</summary><div class="table-scroll" style="margin-top:10px">' + t + '</div></details>';
+  }
+  // 月末残高
+  if (j.balanceRows && j.balanceRows.length > 0) {
+    const months = [...new Set(j.balanceRows.map(r => r.month_ym))].sort().reverse();
+    const accs = [...new Set(j.balanceRows.map(r => r.account_name + (r.sub_account_name ? '/' + r.sub_account_name : '')))];
+    const m = {};
+    j.balanceRows.forEach(r => {
+      const k = r.account_name + (r.sub_account_name ? '/' + r.sub_account_name : '');
+      m[r.month_ym + '|' + k] = r.closing_balance_excl_tax;
+    });
+    let t = '<table class="data"><thead><tr><th>月</th>';
+    accs.forEach(a => t += '<th>' + a + '</th>');
+    t += '</tr></thead><tbody>';
+    for (const month of months) {
+      t += '<tr><td><strong>' + month + '</strong></td>';
+      for (const a of accs) {
+        const v = m[month + '|' + a] || 0;
+        t += '<td class="num">' + (v !== 0 ? fmtJpyShort(v) : '—') + '</td>';
+      }
+      t += '</tr>';
+    }
+    t += '</tbody></table>';
+    html += '<details class="detail-section"><summary>月末残高 (口座別、生データ)</summary><div class="table-scroll" style="margin-top:10px">' + t + '</div></details>';
+  }
+  // 現金流入出
+  if (j.cashRows && j.cashRows.length > 0) {
+    let t = '<table class="data"><thead><tr><th>銀行</th><th>入金</th><th>件数</th><th>出金</th><th>件数</th><th>差引</th></tr></thead><tbody>';
+    j.cashRows.forEach(r => {
+      const diff = (r.in_total || 0) - (r.out_total || 0);
+      t += '<tr><td><strong>' + r.bank_account_key + '</strong></td>'
+        + '<td class="num">' + fmtJpyShort(r.in_total) + '</td>'
+        + '<td class="num">' + (r.in_cnt || 0) + '</td>'
+        + '<td class="num">' + fmtJpyShort(r.out_total) + '</td>'
+        + '<td class="num">' + (r.out_cnt || 0) + '</td>'
+        + '<td class="num"' + (diff < 0 ? ' style="color:#dc2626"' : '') + '>' + fmtJpyShort(diff) + '</td></tr>';
+    });
+    t += '</tbody></table>';
+    html += '<details class="detail-section"><summary>現金流入出 (過去90日)</summary><div style="margin-top:10px">' + t + '</div></details>';
+  }
+  // role_key 別 PL
+  if (j.plRows && j.plRows.length > 0) {
+    let t = '<table class="data"><thead><tr><th>月</th><th>role_key</th><th>金額</th></tr></thead><tbody>';
+    j.plRows.slice(0, 200).forEach(r => {
+      t += '<tr><td>' + r.month_ym + '</td><td>' + r.role_key + '</td><td class="num">¥' + fmtJpyComma(r.amount_excl_tax) + '</td></tr>';
+    });
+    t += '</tbody></table>';
+    html += '<details class="detail-section"><summary>role_key 別 PL (デバッグ用、200行まで)</summary><div class="table-scroll" style="margin-top:10px">' + t + '</div></details>';
+  }
+  document.getElementById('tab-details').innerHTML = html || '<div class="empty">詳細データなし</div>';
+}
+
+// ─── 起動 ───
 loadSnapshot();
+loadAll();
 </script>
 </body>
 </html>
