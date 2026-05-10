@@ -15,6 +15,14 @@ import { getDB } from './db.js';
 
 const RENDER_URL = process.env.RENDER_MIRROR_URL || 'https://bfaith-portal.onrender.com/apps/mirror';
 const SYNC_KEY = process.env.MIRROR_SYNC_KEY || '';
+
+// Phase 1a.1 (Issue #82) 完了: KEY 必須に揃える (Render 側 ALLOW_INSECURE 解除済)
+// 起動時に MIRROR_SYNC_KEY 未設定なら fail-fast (sync 全部 401 になるので)
+if (!SYNC_KEY) {
+  console.error('FATAL: MIRROR_SYNC_KEY env が未設定です。.env に追加してください。');
+  console.error('       (Phase 1a.1 で Render の ALLOW_INSECURE_MIRROR_SYNC は解除済、KEY なしでは sync 401)');
+  process.exit(2);
+}
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK || 'https://chat.googleapis.com/v1/spaces/AAQAL5zHy-w/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=yER7IJx_9CkKhYnzzre0WcWuqfgXc1oh8ldR35k01zE';
 
 async function notify(text) {

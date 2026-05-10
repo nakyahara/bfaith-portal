@@ -36,13 +36,10 @@ if (!DATA_DIR || !runId) {
   console.error('FATAL: DATA_DIR env and --run-id required');
   process.exit(2);
 }
-if (!isDryRun && !renderUrl) {
-  console.error('FATAL: RENDER_MIRROR_URL required for non-dry-run');
+// Phase 1a.1 (Issue #82) 完了: KEY 必須に再 strict 化
+if (!isDryRun && (!renderUrl || !syncKey)) {
+  console.error('FATAL: RENDER_MIRROR_URL and MIRROR_SYNC_KEY required for non-dry-run');
   process.exit(2);
-}
-// MIRROR_SYNC_KEY は optional (Render 側 ALLOW_INSECURE_MIRROR_SYNC=1 と整合)
-if (!isDryRun && !syncKey) {
-  console.warn('⚠️  MIRROR_SYNC_KEY 未設定: Render 側 ALLOW_INSECURE_MIRROR_SYNC=1 に依存');
 }
 
 const dbPath = path.join(DATA_DIR, 'warehouse.db');

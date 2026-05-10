@@ -79,16 +79,10 @@ if (!fs.existsSync(dbPath)) {
   process.exit(2);
 }
 
-if (!isDryRun && !renderUrl) {
-  console.error('FATAL: RENDER_MIRROR_URL required for non-dry-run');
+// Phase 1a.1 (Issue #82) 完了: KEY 必須に再 strict 化 (Render 側 ALLOW_INSECURE 解除済)
+if (!isDryRun && (!renderUrl || !syncKey)) {
+  console.error('FATAL: RENDER_MIRROR_URL and MIRROR_SYNC_KEY required for non-dry-run');
   process.exit(2);
-}
-// MIRROR_SYNC_KEY は optional (Render 側 ALLOW_INSECURE_MIRROR_SYNC=1 暫定運用と整合、
-// sync-to-render.js の振る舞いと同じ)。本格 secure 化は Phase 1a.1 で C 案移行 (PROXY_SECRET 同等の
-// 二重受け入れ rotation)。それまでは key 空でも header 無しで送信し insecure mode で通る
-if (!isDryRun && !syncKey) {
-  console.warn('⚠️  MIRROR_SYNC_KEY 未設定: Render 側 ALLOW_INSECURE_MIRROR_SYNC=1 に依存します');
-  console.warn('   (Phase 1a.1 で C 案 = 本物 KEY 設定 + ALLOW_INSECURE 解除 へ移行予定)');
 }
 
 const db = new Database(dbPath, { readonly: true });
