@@ -478,8 +478,8 @@ function getLedgerInsert(db) {
     b.ledgerInsert = db.prepare(`
       INSERT INTO sync_run_chunks
         (run_id, entity, chunk_index, chunk_count, row_count, payload_checksum,
-         contract_version, scope_from, scope_to, received_at, applied_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         contract_version, scope_from, scope_to, received_at, applied_at, mf_source_run_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
   }
   return b.ledgerInsert;
@@ -722,20 +722,19 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
     }
   }
 
-  // MF Phase 1a: parent_run_not_found 早期 409 (FK 任せでなく明示エラー)
-  if (entityCfg.requires_parent_run && is_first) {
+  // MF Phase 1a (Codex review #88 反映):
+  //   - 全 MF entity (mf_publish_runs 親 + 6 mart 子) で meta.mf_source_run_id を要求 + ledger 保存
+  //   - 子 entity は parent.status='pending_sync' を tx 内で再 check (race 防止)
+  //   - finalize 時に ledger.mf_source_run_id == finalize_run_id を cross-check
+  const isMfEntity = clearStrategy === 'no_clear';
+  let mfSourceRunIdForLedger = null;
+  if (isMfEntity) {
     const mfSourceRunId = meta.mf_source_run_id;
-    if (!Number.isInteger(mfSourceRunId)) {
-      return res.status(400).json({ error: `MF mart entity '${entity}' first chunk requires meta.mf_source_run_id (integer)` });
+    if (is_first && !Number.isInteger(mfSourceRunId)) {
+      return res.status(400).json({ error: `MF entity '${entity}' first chunk requires meta.mf_source_run_id (integer)` });
     }
-    const _db = getMirrorDB();
-    const parent = _db.prepare(`SELECT run_id, status FROM mirror_mf_publish_runs WHERE run_id = ?`).get(mfSourceRunId);
-    if (!parent) {
-      return res.status(409).json({
-        error: 'parent_run_not_found',
-        message: `mirror_mf_publish_runs.run_id=${mfSourceRunId} が存在しません。先に entity='mf_publish_runs' を送信してください。`,
-        entity, sync_run_id, mf_source_run_id: mfSourceRunId,
-      });
+    if (Number.isInteger(mfSourceRunId)) {
+      mfSourceRunIdForLedger = mfSourceRunId;
     }
   }
 
@@ -802,14 +801,55 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
         }
       }
 
+      // 4c-mf. MF entity の場合、tx 内で parent.status='pending_sync' を再 check (race 防止)
+      // Codex review #88: success/failed flip 後の追加 INSERT/REPLACE を完全拒否
+      if (entityCfg.requires_parent_run) {
+        if (!Number.isInteger(mfSourceRunIdForLedger)) {
+          throw new HttpError(400, {
+            error: 'mf_source_run_id_missing',
+            message: `MF mart entity '${entity}' chunk_index=${chunk_index} requires meta.mf_source_run_id (integer) on every chunk`,
+          });
+        }
+        const parent = db.prepare(`SELECT run_id, status FROM mirror_mf_publish_runs WHERE run_id = ?`).get(mfSourceRunIdForLedger);
+        if (!parent) {
+          throw new HttpError(409, {
+            error: 'parent_run_not_found',
+            message: `mirror_mf_publish_runs.run_id=${mfSourceRunIdForLedger} が存在しません。先に entity='mf_publish_runs' を送信してください。`,
+            entity, sync_run_id, mf_source_run_id: mfSourceRunIdForLedger,
+          });
+        }
+        if (parent.status !== 'pending_sync') {
+          throw new HttpError(409, {
+            error: 'parent_run_not_pending',
+            message: `mirror_mf_publish_runs.run_id=${mfSourceRunIdForLedger} status=${parent.status} (pending_sync のみ受信可、success/failed 確定済 run の追加変更を拒否)`,
+            entity, sync_run_id, mf_source_run_id: mfSourceRunIdForLedger, parent_status: parent.status,
+          });
+        }
+        // sync_run_id 内で mf_source_run_id 一貫性チェック (異 run 混入防止)
+        if (runFirst) {
+          const firstMfRow = db.prepare(`
+            SELECT mf_source_run_id FROM sync_run_chunks
+            WHERE run_id = ? AND entity = ? LIMIT 1
+          `).get(sync_run_id, entity);
+          if (firstMfRow && firstMfRow.mf_source_run_id !== mfSourceRunIdForLedger) {
+            throw new HttpError(409, {
+              error: 'mf_source_run_id_mismatch_within_sync_run',
+              message: `sync_run_id 内で異なる mf_source_run_id が混入 (first=${firstMfRow.mf_source_run_id}, current=${mfSourceRunIdForLedger})`,
+              entity, sync_run_id,
+            });
+          }
+        }
+      }
+
       // 4d. row INSERT
       for (const r of rows) {
         insertStmt.run(entityCfg.normalizeRow(r));
       }
 
-      // 4e. ledger insert
+      // 4e. ledger insert (mf_source_run_id NULL=非MF entity)
       insertLedger.run(sync_run_id, entity, chunk_index, chunk_count, row_count,
-                       payload_checksum, contract_version, scope_from, scope_to, now, now);
+                       payload_checksum, contract_version, scope_from, scope_to, now, now,
+                       mfSourceRunIdForLedger);
 
       result = { applied: true, didClear, clearedRows };
     }).immediate();  // BEGIN IMMEDIATE で write 直列化 (cross-process 安全)
@@ -1223,57 +1263,99 @@ router.post('/api/sync/mf/runs/:run_id/finalize', requireSyncKey, (req, res) => 
     });
   }
 
+  // 検証 + status flip を tx 内で atomic に (Codex review #88: race 防止)
   const incomplete = [];
-  for (const entity of MF_REQUIRED_ENTITIES) {
-    const syncRunId = entityRunIds[entity];
-    if (!syncRunId || typeof syncRunId !== 'string') {
-      incomplete.push({ entity, reason: 'missing_entity_run_id_in_request_body' });
-      continue;
+  let updatedChanges = 0;
+  let alreadyFinalized = false;
+  const now = new Date().toISOString();
+
+  try {
+    db.transaction(() => {
+      // tx 内で再 status check (BEGIN IMMEDIATE で書き込み直列化、他の chunk INSERT が完了済を保証)
+      const parent2 = db.prepare(`SELECT run_id, status FROM mirror_mf_publish_runs WHERE run_id = ?`).get(runId);
+      if (!parent2) {
+        throw new HttpError(404, { error: 'parent_run_not_found', run_id: runId });
+      }
+      if (parent2.status === 'success') {
+        alreadyFinalized = true;
+        return;
+      }
+      if (parent2.status !== 'pending_sync') {
+        throw new HttpError(409, {
+          error: 'invalid_status_for_finalize',
+          message: `run_id=${runId} status=${parent2.status}`,
+        });
+      }
+
+      for (const entity of MF_REQUIRED_ENTITIES) {
+        const syncRunId = entityRunIds[entity];
+        if (!syncRunId || typeof syncRunId !== 'string') {
+          incomplete.push({ entity, reason: 'missing_entity_run_id_in_request_body' });
+          continue;
+        }
+        const chunks = db.prepare(`
+          SELECT chunk_index, chunk_count, applied_at, mf_source_run_id
+          FROM sync_run_chunks WHERE run_id = ? AND entity = ?
+          ORDER BY chunk_index
+        `).all(syncRunId, entity);
+        if (chunks.length === 0) {
+          incomplete.push({ entity, sync_run_id: syncRunId, reason: 'no_chunks_received' });
+          continue;
+        }
+        // Codex Medium fix: chunks の mf_source_run_id が finalize の run_id と一致するか cross-check
+        const mismatched = chunks.find(c => c.mf_source_run_id !== runId);
+        if (mismatched) {
+          incomplete.push({
+            entity, sync_run_id: syncRunId,
+            reason: 'mf_source_run_id_mismatch',
+            expected: runId, got: mismatched.mf_source_run_id,
+          });
+          continue;
+        }
+        const expected = chunks[0].chunk_count;
+        const applied = chunks.every(c => c.applied_at !== null);
+        const indexes = chunks.map(c => c.chunk_index);
+        const missing = [];
+        for (let i = 0; i < expected; i++) if (!indexes.includes(i)) missing.push(i);
+        if (chunks.length !== expected || missing.length > 0 || !applied) {
+          incomplete.push({
+            entity, sync_run_id: syncRunId,
+            received: chunks.length, expected,
+            missing_chunks: missing, all_applied: applied,
+          });
+        }
+      }
+      if (incomplete.length > 0) {
+        throw new HttpError(409, {
+          error: 'finalize_blocked_incomplete',
+          message: '一部 entity の sync が未完了 / cross-check 失敗のため finalize を拒否',
+          run_id: runId, incomplete,
+        });
+      }
+
+      // 全検証 PASS、status を atomic flip
+      updatedChanges = db.prepare(`
+        UPDATE mirror_mf_publish_runs
+           SET status = 'success', finalized_at = ?
+         WHERE run_id = ? AND status = 'pending_sync'
+      `).run(now, runId).changes;
+    }).immediate();
+  } catch (e) {
+    if (e instanceof HttpError) {
+      return res.status(e.status).json({ ...e.body, request_id: requestId });
     }
-    const chunks = db.prepare(`
-      SELECT chunk_index, chunk_count, applied_at
-      FROM sync_run_chunks WHERE run_id = ? AND entity = ?
-      ORDER BY chunk_index
-    `).all(syncRunId, entity);
-    if (chunks.length === 0) {
-      incomplete.push({ entity, sync_run_id: syncRunId, reason: 'no_chunks_received' });
-      continue;
-    }
-    const expected = chunks[0].chunk_count;
-    const applied = chunks.every(c => c.applied_at !== null);
-    const indexes = chunks.map(c => c.chunk_index);
-    const missing = [];
-    for (let i = 0; i < expected; i++) if (!indexes.includes(i)) missing.push(i);
-    if (chunks.length !== expected || missing.length > 0 || !applied) {
-      incomplete.push({
-        entity, sync_run_id: syncRunId,
-        received: chunks.length, expected,
-        missing_chunks: missing, all_applied: applied,
-      });
-    }
-  }
-  if (incomplete.length > 0) {
-    return res.status(409).json({
-      error: 'finalize_blocked_incomplete',
-      message: '一部 entity の sync が未完了のため finalize を拒否',
-      run_id: runId, incomplete, request_id: requestId,
-    });
+    console.error(`[Mirror] mf finalize error req=${requestId}: ${e.message}`);
+    return res.status(500).json({ error: e.message, request_id: requestId });
   }
 
-  const now = new Date().toISOString();
-  const info = db.prepare(`
-    UPDATE mirror_mf_publish_runs
-       SET status = 'success', finalized_at = ?
-     WHERE run_id = ? AND status = 'pending_sync'
-  `).run(now, runId);
-  if (info.changes !== 1) {
-    const after = db.prepare(`SELECT status FROM mirror_mf_publish_runs WHERE run_id = ?`).get(runId);
-    if (after?.status === 'success') {
-      return res.json({ ok: true, run_id: runId, status: 'success', already_finalized: true, request_id: requestId });
-    }
+  if (alreadyFinalized) {
+    console.log(`[Mirror] mf finalize idempotent (already success) req=${requestId} run=${runId}`);
+    return res.json({ ok: true, run_id: runId, status: 'success', already_finalized: true, request_id: requestId });
+  }
+  if (updatedChanges !== 1) {
     return res.status(500).json({
       error: 'finalize_update_failed',
-      run_id: runId, status_after: after?.status, request_id: requestId,
+      run_id: runId, request_id: requestId,
     });
   }
 

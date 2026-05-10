@@ -214,17 +214,16 @@ let totalRowsSent = 0;
 const baseHeaders = { 'Content-Type': 'application/json' };
 if (syncKey) baseHeaders['x-sync-key'] = syncKey;
 
-async function sendChunk(entity, syncRunId, chunkIndex, chunkCount, chunk, isFirst, isLast, includeMfMeta) {
+async function sendChunk(entity, syncRunId, chunkIndex, chunkCount, chunk, isFirst, isLast) {
   const payload = { rows: chunk };
   const payloadStr = JSON.stringify(payload);
   const payloadChecksum = crypto.createHash('sha256').update(payloadStr).digest('hex');
   // scope は run_id 数値を文字列に (chunk endpoint validation: scope_from/to YYYY-MM-DD)
   // 受信側は scope を業務的には使わないので、started_at の日付を流用
   const scopeDate = (runRow.started_at || syncedAt).slice(0, 10);
-  const meta = {};
-  if (isFirst && includeMfMeta) {
-    meta.mf_source_run_id = runId;
-  }
+  // Codex review #88 反映: 全 MF entity (mf_publish_runs 親 + 6 mart 子) で
+  // every chunk に meta.mf_source_run_id を送る (Render 側 ledger 保存 + finalize cross-check)
+  const meta = { mf_source_run_id: runId };
   const body = {
     sync_run_id: syncRunId,
     contract_version: CONTRACT_VERSION,
@@ -256,9 +255,6 @@ console.log('\n[sync] 各 entity を順次送信...');
 for (const e of entities) {
   const syncRunId = makeSyncRunId(e.name);
   entityRunIds[e.name] = syncRunId;
-  // child (mart) entity のみ mf_source_run_id meta を含める
-  // mf_publish_runs entity は親なので不要
-  const includeMfMeta = e.name !== 'mf_publish_runs';
   // chunk 分割 (0 rows でも 1 chunk 送信して finalize の entity_run_ids に登場させる)
   const chunks = [];
   if (e.rows.length === 0) {
@@ -272,7 +268,7 @@ for (const e of entities) {
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
     try {
-      const result = await sendChunk(e.name, syncRunId, i, chunks.length, chunk, i === 0, i === chunks.length - 1, includeMfMeta);
+      const result = await sendChunk(e.name, syncRunId, i, chunks.length, chunk, i === 0, i === chunks.length - 1);
       totalRowsSent += chunk.length;
       console.log(`    ✓ chunk ${i + 1}/${chunks.length} (${chunk.length} rows) request_id=${result.request_id}`);
     } catch (err) {

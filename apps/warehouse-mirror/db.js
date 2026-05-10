@@ -287,6 +287,11 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_src_entity_received ON sync_run_chunks(entity, received_at)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_src_entity_scope ON sync_run_chunks(entity, scope_from, scope_to)');
 
+  // MF Phase 1a (Codex review #88 反映): finalize cross-check 用に
+  // 親 mf_publish_runs.run_id を ledger に記録 (NULL=非MF entity、Amazon/Rakuten 既存 row は NULL のまま)
+  addColumnIfMissing('sync_run_chunks', 'mf_source_run_id', 'INTEGER');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_src_mf_source_run ON sync_run_chunks(mf_source_run_id) WHERE mf_source_run_id IS NOT NULL');
+
   // mirror_amazon_finance_sku_daily — Phase 1 #1-4 (Render 側 daily fact mirror)
   // miniPC の f_amazon_finance_sku_daily_v1 の payload を受信。
   // contract_version は sync_contracts.contract_version と整合。
