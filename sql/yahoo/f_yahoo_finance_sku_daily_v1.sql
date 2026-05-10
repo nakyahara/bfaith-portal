@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS f_yahoo_finance_sku_daily_v1 (
   -- 紐付け (v0.4 Codex Critical 反映)
   ne_code              TEXT,
   variant_key          TEXT NOT NULL DEFAULT '',  -- = sub_code (variant 粒度保持)
+  -- Phase 1.1: ラベル名は v1 互換のため旧名を継続。実態は CI (case-insensitive) join。
   resolution_method    TEXT NOT NULL CHECK (
     resolution_method IN ('sub_match', 'parent_match', 'manual_map', 'unresolved')
   ),

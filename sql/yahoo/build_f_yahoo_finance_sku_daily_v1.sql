@@ -105,27 +105,45 @@ daily_aggregated AS (
   FROM _silver_yahoo_orders_v1
   GROUP BY date_jst, yahoo_sku_key
 ),
--- CTE B: SKU 解決 (3 段階 fallback、Codex Critical 反映)
+-- CTE B: SKU 解決 (3 段階 fallback、case-insensitive + TRIM 正規化)
+-- Phase 1.1 fix (Codex 推奨 + 実データ verify): m_products は小文字 suffix 登録、
+--   Yahoo sub_code は大文字 suffix で来るので LOWER(TRIM()) 化が必須。
+--   この fix だけで unresolved 122 SKU 中 117 SKU (95.9%) を救済。
 sku_resolved AS (
   SELECT
     yahoo_sku_key,
     item_id,
     sub_code,
-    -- 優先順 1: m_products WHERE 商品コード = sub_code (variant 別、56.80%)
-    -- 優先順 2: m_products WHERE 商品コード = item_id (親 SKU、+11.24%)
-    -- 優先順 3: f_yahoo_sku_map (手動 map)
+    -- 優先順 1: m_products WHERE 商品コード ~= sub_code (variant 別、CI)
+    -- 優先順 2: m_products WHERE 商品コード ~= item_id (親 / 単品 SKU、CI)
+    -- 優先順 3: f_yahoo_sku_map (手動 map、CI)
     -- 4: NULL (= unresolved_sku_flag = 1)
     COALESCE(
-      (SELECT 商品コード FROM m_products WHERE 商品コード = sub_code AND sub_code <> ''),
-      (SELECT 商品コード FROM m_products WHERE 商品コード = item_id),
-      (SELECT ne_code FROM f_yahoo_sku_map WHERE yahoo_key = sub_code AND sub_code <> ''),
-      (SELECT ne_code FROM f_yahoo_sku_map WHERE yahoo_key = item_id)
+      (SELECT 商品コード FROM m_products
+        WHERE LOWER(TRIM(商品コード)) = LOWER(TRIM(sub_code))
+          AND TRIM(COALESCE(sub_code, '')) <> ''),
+      (SELECT 商品コード FROM m_products
+        WHERE LOWER(TRIM(商品コード)) = LOWER(TRIM(item_id))),
+      (SELECT ne_code FROM f_yahoo_sku_map
+        WHERE LOWER(TRIM(yahoo_key)) = LOWER(TRIM(sub_code))
+          AND TRIM(COALESCE(sub_code, '')) <> ''),
+      (SELECT ne_code FROM f_yahoo_sku_map
+        WHERE LOWER(TRIM(yahoo_key)) = LOWER(TRIM(item_id)))
     ) AS ne_code,
+    -- 注: ラベル名は v1 互換のため旧名 (sub_match / parent_match / manual_map) を継続。
+    --     実態は CI (case-insensitive) join、parent_match は実は item_id 一致 (単品商品が大半)。
+    --     ラベル整理は別 PR (Phase 1.1.1) で扱う (Render mirror migration 必要なため)。
     CASE
-      WHEN EXISTS (SELECT 1 FROM m_products WHERE 商品コード = sub_code AND sub_code <> '') THEN 'sub_match'
-      WHEN EXISTS (SELECT 1 FROM m_products WHERE 商品コード = item_id) THEN 'parent_match'
-      WHEN EXISTS (SELECT 1 FROM f_yahoo_sku_map WHERE yahoo_key = sub_code AND sub_code <> '')
-        OR EXISTS (SELECT 1 FROM f_yahoo_sku_map WHERE yahoo_key = item_id) THEN 'manual_map'
+      WHEN EXISTS (SELECT 1 FROM m_products
+                    WHERE LOWER(TRIM(商品コード)) = LOWER(TRIM(sub_code))
+                      AND TRIM(COALESCE(sub_code, '')) <> '') THEN 'sub_match'
+      WHEN EXISTS (SELECT 1 FROM m_products
+                    WHERE LOWER(TRIM(商品コード)) = LOWER(TRIM(item_id))) THEN 'parent_match'
+      WHEN EXISTS (SELECT 1 FROM f_yahoo_sku_map
+                    WHERE LOWER(TRIM(yahoo_key)) = LOWER(TRIM(sub_code))
+                      AND TRIM(COALESCE(sub_code, '')) <> '')
+        OR EXISTS (SELECT 1 FROM f_yahoo_sku_map
+                    WHERE LOWER(TRIM(yahoo_key)) = LOWER(TRIM(item_id))) THEN 'manual_map'
       ELSE 'unresolved'
     END AS resolution_method,
     COALESCE(sub_code, '') AS variant_key
