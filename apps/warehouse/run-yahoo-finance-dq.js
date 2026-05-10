@@ -201,7 +201,9 @@ recordResult(
 );
 
 // ============================================================
-// Check 5: unresolved_sku_rate_pct (Codex R2: Yahoo は parent_match 多いため 35%/50% 許容)
+// Check 5: unresolved_sku_rate_pct
+// Phase 1.1 fix 後: case-insensitive 解決で unresolved 6.55% → ほぼ 0% 想定。
+//   閾値はそのまま 35%/50% (将来的な variant 増 / SKU 命名乱れの早期警告用)
 // ============================================================
 const skuStats = db.prepare(`
   SELECT

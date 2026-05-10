@@ -214,9 +214,9 @@ try {
     console.log(`  品質:`);
     console.log(`    cost_status complete:                ${summary.complete_count?.toLocaleString()}`);
     console.log(`    cost_status missing_cost:            ${summary.missing_count?.toLocaleString()}`);
-    console.log(`    SKU 解決 sub_match:                  ${summary.sub_match_count?.toLocaleString()} (variant 別)`);
-    console.log(`    SKU 解決 parent_match:               ${summary.parent_match_count?.toLocaleString()} (親 SKU)`);
-    console.log(`    SKU 解決 manual_map:                 ${summary.manual_map_count?.toLocaleString()}`);
+    console.log(`    SKU 解決 sub_match (CI):             ${summary.sub_match_count?.toLocaleString()} (variant 別、case-insensitive)`);
+    console.log(`    SKU 解決 parent_match (CI):          ${summary.parent_match_count?.toLocaleString()} (item_id / 単品)`);
+    console.log(`    SKU 解決 manual_map (CI):            ${summary.manual_map_count?.toLocaleString()}`);
     console.log(`    unresolved (variant 粒度保持):        ${summary.unresolved_count?.toLocaleString()}`);
     console.log(`    price_variance_warning:              ${summary.price_variance_count?.toLocaleString()}`);
     console.log(`    shipping_quality missing:            ${summary.shipping_missing_count?.toLocaleString()}`);
