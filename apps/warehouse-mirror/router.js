@@ -472,6 +472,50 @@ function getRakutenFinanceInsert(db) {
   return b.rakutenFinanceInsert;
 }
 
+function getYahooFinanceInsert(db) {
+  const b = getStmtBundle(db);
+  if (!b.yahooFinanceInsert) {
+    b.yahooFinanceInsert = db.prepare(`
+      INSERT OR REPLACE INTO mirror_yahoo_finance_sku_daily (
+        date_jst, yahoo_sku_key, ne_code, variant_key, resolution_method,
+        unresolved_sku_flag, product_name,
+        units_ordered, units_cancelled, units_net_sold,
+        sales_principal_jpy_incl, sales_postage_jpy_incl, gross_sales_jpy_incl,
+        net_sales_before_point_jpy_incl, listing_sales_estimated_jpy_incl,
+        coupon_shop_jpy_incl, use_point_jpy_incl,
+        mall_fee_jpy_incl, mall_fee_calc_method, mall_fee_estimate_delta_jpy,
+        shipping_cost_jpy_incl, shipping_quality,
+        unit_cost_snapshot_incl, cost_snapshot_date_jst,
+        latest_unit_cost_reference_incl, cogs_amount_jpy_incl,
+        variable_margin_partial_jpy_incl, variable_margin_full_jpy_incl,
+        refund_adjusted_net_sales_jpy_incl, margin_confidence, margin_full_finalized_at,
+        pay_charge_audit_jpy_incl, ship_charge_audit_jpy_incl, discount_audit_jpy_incl,
+        cost_status, is_cost_complete, data_quality_score, price_variance_warning,
+        source_layer_summary, source_row_count, built_at,
+        source_run_id, source_row_hash, synced_at
+      ) VALUES (
+        @date_jst, @yahoo_sku_key, @ne_code, @variant_key, @resolution_method,
+        @unresolved_sku_flag, @product_name,
+        @units_ordered, @units_cancelled, @units_net_sold,
+        @sales_principal_jpy_incl, @sales_postage_jpy_incl, @gross_sales_jpy_incl,
+        @net_sales_before_point_jpy_incl, @listing_sales_estimated_jpy_incl,
+        @coupon_shop_jpy_incl, @use_point_jpy_incl,
+        @mall_fee_jpy_incl, @mall_fee_calc_method, @mall_fee_estimate_delta_jpy,
+        @shipping_cost_jpy_incl, @shipping_quality,
+        @unit_cost_snapshot_incl, @cost_snapshot_date_jst,
+        @latest_unit_cost_reference_incl, @cogs_amount_jpy_incl,
+        @variable_margin_partial_jpy_incl, @variable_margin_full_jpy_incl,
+        @refund_adjusted_net_sales_jpy_incl, @margin_confidence, @margin_full_finalized_at,
+        @pay_charge_audit_jpy_incl, @ship_charge_audit_jpy_incl, @discount_audit_jpy_incl,
+        @cost_status, @is_cost_complete, @data_quality_score, @price_variance_warning,
+        @source_layer_summary, @source_row_count, @built_at,
+        @source_run_id, @source_row_hash, @synced_at
+      )
+    `);
+  }
+  return b.yahooFinanceInsert;
+}
+
 function getLedgerInsert(db) {
   const b = getStmtBundle(db);
   if (!b.ledgerInsert) {
@@ -566,6 +610,14 @@ const ENTITY_REGISTRY = {
     clear_meta_key: 'clear_rakuten_finance_dates',
     getInsertStmt: getRakutenFinanceInsert,
     normalizeRow: (r) => normalizeRakutenFinanceRow(r),
+  },
+  yahoo_finance_sku_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_yahoo_finance_sku_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_yahoo_finance_dates',
+    getInsertStmt: getYahooFinanceInsert,
+    normalizeRow: (r) => normalizeYahooFinanceRow(r),
   },
 
   // ─── MF Phase 1a (Codex 5ラウンド確定設計) ─────────────────────────
@@ -895,6 +947,54 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
 
   return res.json({ ok: true, request_id: requestId, sync_run_id, entity, chunk_index });
 });
+
+// row 列正規化 (mirror_yahoo_finance_sku_daily 用、Yahoo Phase 1 Y-3b)
+function normalizeYahooFinanceRow(r) {
+  return {
+    date_jst: r.date_jst, yahoo_sku_key: r.yahoo_sku_key,
+    ne_code: r.ne_code ?? null,
+    variant_key: r.variant_key ?? '',
+    resolution_method: r.resolution_method,
+    unresolved_sku_flag: r.unresolved_sku_flag ?? 0,
+    product_name: r.product_name || '',
+    units_ordered: r.units_ordered ?? 0,
+    units_cancelled: r.units_cancelled ?? 0,
+    units_net_sold: r.units_net_sold ?? 0,
+    sales_principal_jpy_incl: r.sales_principal_jpy_incl ?? 0,
+    sales_postage_jpy_incl: r.sales_postage_jpy_incl ?? 0,
+    gross_sales_jpy_incl: r.gross_sales_jpy_incl ?? 0,
+    net_sales_before_point_jpy_incl: r.net_sales_before_point_jpy_incl ?? 0,
+    listing_sales_estimated_jpy_incl: r.listing_sales_estimated_jpy_incl ?? 0,
+    coupon_shop_jpy_incl: r.coupon_shop_jpy_incl ?? 0,
+    use_point_jpy_incl: r.use_point_jpy_incl ?? 0,
+    mall_fee_jpy_incl: r.mall_fee_jpy_incl ?? 0,
+    mall_fee_calc_method: r.mall_fee_calc_method ?? 'estimated_10pct',
+    mall_fee_estimate_delta_jpy: r.mall_fee_estimate_delta_jpy ?? null,
+    shipping_cost_jpy_incl: r.shipping_cost_jpy_incl ?? 0,
+    shipping_quality: r.shipping_quality,
+    unit_cost_snapshot_incl: r.unit_cost_snapshot_incl ?? null,
+    cost_snapshot_date_jst: r.cost_snapshot_date_jst ?? null,
+    latest_unit_cost_reference_incl: r.latest_unit_cost_reference_incl ?? null,
+    cogs_amount_jpy_incl: r.cogs_amount_jpy_incl ?? 0,
+    variable_margin_partial_jpy_incl: r.variable_margin_partial_jpy_incl ?? 0,
+    variable_margin_full_jpy_incl: r.variable_margin_full_jpy_incl ?? null,
+    refund_adjusted_net_sales_jpy_incl: r.refund_adjusted_net_sales_jpy_incl ?? null,
+    margin_confidence: r.margin_confidence ?? 'partial',
+    margin_full_finalized_at: r.margin_full_finalized_at ?? null,
+    pay_charge_audit_jpy_incl: r.pay_charge_audit_jpy_incl ?? 0,
+    ship_charge_audit_jpy_incl: r.ship_charge_audit_jpy_incl ?? 0,
+    discount_audit_jpy_incl: r.discount_audit_jpy_incl ?? 0,
+    cost_status: r.cost_status,
+    is_cost_complete: r.is_cost_complete ?? 0,
+    data_quality_score: r.data_quality_score ?? 0,
+    price_variance_warning: r.price_variance_warning ?? 0,
+    source_layer_summary: r.source_layer_summary || '',
+    source_row_count: r.source_row_count ?? 0,
+    built_at: r.built_at || new Date().toISOString(),
+    source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,
+    synced_at: r.synced_at,
+  };
+}
 
 // row 列正規化 (mirror_rakuten_finance_sku_daily 用、Phase 1a #R-3b)
 function normalizeRakutenFinanceRow(r) {

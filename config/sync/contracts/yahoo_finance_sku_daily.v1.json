@@ -1,0 +1,17 @@
+{
+  "entity": "yahoo_finance_sku_daily",
+  "contract_version": 1,
+  "source_system": "minipc-warehouse",
+  "source_object": "f_yahoo_finance_sku_daily_v1",
+  "target_table": "mirror_yahoo_finance_sku_daily",
+  "grain_definition": "one row = one (date_jst, yahoo_sku_key)",
+  "key_columns_json": "[\"date_jst\", \"yahoo_sku_key\"]",
+  "payload_schema_json": "{\"type\":\"object\",\"required\":[\"date_jst\",\"yahoo_sku_key\"],\"properties\":{\"date_jst\":{\"type\":\"string\",\"pattern\":\"^\\\\d{4}-\\\\d{2}-\\\\d{2}$\"},\"yahoo_sku_key\":{\"type\":\"string\",\"minLength\":1},\"variable_margin_partial_jpy_incl\":{\"type\":\"number\"},\"margin_confidence\":{\"type\":\"string\",\"enum\":[\"partial\",\"full\"]},\"resolution_method\":{\"type\":\"string\",\"enum\":[\"sub_match\",\"parent_match\",\"manual_map\",\"unresolved\"]},\"cost_status\":{\"type\":\"string\",\"enum\":[\"complete\",\"missing_cost\",\"partial_cost\",\"late_bound_after_close\"]},\"shipping_quality\":{\"type\":\"string\",\"enum\":[\"actual\",\"estimated_rates\",\"estimated_fallback\",\"missing\"]},\"mall_fee_calc_method\":{\"type\":\"string\",\"enum\":[\"estimated_10pct\",\"actual_statement\"]}}}",
+  "clear_strategy": "scope_clear_per_run",
+  "clear_strategy_detail": "First chunk of run includes meta.clear_yahoo_finance_dates=[<all distinct date_jst in payload>] for Render side to DELETE before insert",
+  "apply_mode": "insert_or_replace",
+  "apply_mode_detail": "INSERT OR REPLACE on (date_jst, yahoo_sku_key). source_run_id and source_row_hash track origin",
+  "enabled": 1,
+  "owner": "phase1-yahoo-finance",
+  "notes": "Yahoo Phase 1 Y-3a で導入。partial margin (6 要素、Phase 1a 確定) + full margin (Phase 1c-3 で backfill、NULL 初期)。entity registry (router.js ENTITY_REGISTRY) に追加。"
+}

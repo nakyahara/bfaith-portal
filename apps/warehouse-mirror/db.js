@@ -428,6 +428,85 @@ function createTables() {
     }
   }
 
+  // mirror_yahoo_finance_sku_daily — Yahoo Phase 1 Y-3b (Render 側 daily fact mirror)
+  // miniPC の f_yahoo_finance_sku_daily_v1 の payload を受信
+  // PK: (date_jst, yahoo_sku_key) — yahoo_sku_key = item_id-sub_code or item_id (variant 別 or 親 SKU)
+  // 設計書 v0.4: g:/共有ドライブ/AI_reference/システム設計/Yahoo!Phase1a設計書_v0.4_20260510.md
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_yahoo_finance_sku_daily (
+    date_jst                          TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+    yahoo_sku_key                     TEXT NOT NULL CHECK(trim(yahoo_sku_key) <> ''),
+    ne_code                           TEXT,
+    variant_key                       TEXT NOT NULL DEFAULT '',
+    resolution_method                 TEXT NOT NULL CHECK (
+      resolution_method IN ('sub_match', 'parent_match', 'manual_map', 'unresolved')
+    ),
+    unresolved_sku_flag               INTEGER NOT NULL DEFAULT 0,
+    product_name                      TEXT NOT NULL DEFAULT '',
+    units_ordered                     INTEGER NOT NULL DEFAULT 0,
+    units_cancelled                   INTEGER NOT NULL DEFAULT 0,
+    units_net_sold                    INTEGER NOT NULL DEFAULT 0,
+    sales_principal_jpy_incl          REAL NOT NULL DEFAULT 0,
+    sales_postage_jpy_incl            REAL NOT NULL DEFAULT 0,
+    gross_sales_jpy_incl              REAL NOT NULL DEFAULT 0,
+    net_sales_before_point_jpy_incl   REAL NOT NULL DEFAULT 0,
+    listing_sales_estimated_jpy_incl  REAL NOT NULL DEFAULT 0,
+    coupon_shop_jpy_incl              REAL NOT NULL DEFAULT 0,
+    use_point_jpy_incl                REAL NOT NULL DEFAULT 0,
+    mall_fee_jpy_incl                 REAL NOT NULL DEFAULT 0,
+    mall_fee_calc_method              TEXT NOT NULL DEFAULT 'estimated_10pct' CHECK (
+      mall_fee_calc_method IN ('estimated_10pct', 'actual_statement')
+    ),
+    mall_fee_estimate_delta_jpy       REAL,
+    shipping_cost_jpy_incl            REAL NOT NULL DEFAULT 0,
+    shipping_quality                  TEXT NOT NULL CHECK (
+      shipping_quality IN ('actual', 'estimated_rates', 'estimated_fallback', 'missing')
+    ),
+    unit_cost_snapshot_incl           REAL,
+    cost_snapshot_date_jst            TEXT,
+    latest_unit_cost_reference_incl   REAL,
+    cogs_amount_jpy_incl              REAL NOT NULL DEFAULT 0,
+    variable_margin_partial_jpy_incl  REAL NOT NULL DEFAULT 0,
+    variable_margin_full_jpy_incl     REAL,
+    refund_adjusted_net_sales_jpy_incl REAL,
+    margin_confidence                 TEXT NOT NULL DEFAULT 'partial' CHECK (
+      margin_confidence IN ('partial', 'full')
+    ),
+    margin_full_finalized_at          TEXT,
+    pay_charge_audit_jpy_incl         REAL NOT NULL DEFAULT 0,
+    ship_charge_audit_jpy_incl        REAL NOT NULL DEFAULT 0,
+    discount_audit_jpy_incl           REAL NOT NULL DEFAULT 0,
+    cost_status                       TEXT NOT NULL CHECK (
+      cost_status IN ('complete', 'missing_cost', 'partial_cost', 'late_bound_after_close')
+    ),
+    is_cost_complete                  INTEGER NOT NULL DEFAULT 0,
+    data_quality_score                INTEGER NOT NULL DEFAULT 0
+                                      CHECK (data_quality_score BETWEEN 0 AND 100),
+    price_variance_warning            INTEGER NOT NULL DEFAULT 0,
+    source_layer_summary              TEXT NOT NULL DEFAULT '',
+    source_row_count                  INTEGER NOT NULL DEFAULT 0,
+    built_at                          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    source_run_id                     TEXT NOT NULL,
+    source_row_hash                   TEXT NOT NULL,
+    synced_at                         TEXT NOT NULL,
+    PRIMARY KEY (date_jst, yahoo_sku_key)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_myfsd_date  ON mirror_yahoo_finance_sku_daily(date_jst)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_myfsd_ne    ON mirror_yahoo_finance_sku_daily(ne_code)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_myfsd_month ON mirror_yahoo_finance_sku_daily(substr(date_jst, 1, 7))');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_myfsd_run   ON mirror_yahoo_finance_sku_daily(source_run_id)');
+
+  // Phase 1c-3 用 migration framework (Codex R5 #1 反映、PRAGMA table_info 方式)
+  // 現状追加列なし、Phase 1c-3 着手時にここに ALTER TABLE 追加する形
+  const myfsdCols = new Set(
+    db.prepare("PRAGMA table_info(mirror_yahoo_finance_sku_daily)").all().map(c => c.name)
+  );
+  // Phase 1a 時点で全列 DDL に含まれてるので追加なし
+  // Phase 1c-3 着手時:
+  //   { name: 'settlement_fee_jpy_incl', def: 'REAL' }
+  //   { name: 'psr_jpy_incl', def: 'REAL' }
+  //   { name: 'ad_spend_jpy_incl', def: 'REAL' }
+  //   ... (full margin 用列、楽天 + Yahoo 共通スキーマ化検討)
+
   // mirror_amazon_sku_fees — Amazon手数料キャッシュ（粗利ダッシュボード用）
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_amazon_sku_fees (
     seller_sku          TEXT PRIMARY KEY,

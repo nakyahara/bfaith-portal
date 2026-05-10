@@ -325,6 +325,37 @@ async function main() {
       // build 失敗 → DQ/sync 記録しない (Amazon と同方針)
       console.log(`[DailySync] 楽天 finance DQ/sync は build 失敗のため記録せず (build retry 後に翌 cron で実行)`);
     }
+
+    // === Yahoo finance daily fact (Yahoo Phase 1 Y-3c、Y-1 + Y-2 + Y-3a 統合) ===
+    // 1. f_yahoo_finance_sku_daily_v1 build (whitelist order=5/pay=1/ship=3、partial margin)
+    // 2. DQ gate (6 check、severity error で exit 1)
+    // 3. mirror_yahoo_finance_sku_daily へ sync (chunk POST + ledger)
+    // build 失敗で DQ/sync スキップ、DQ gate failure でも sync スキップ (楽天と同方針)
+    const yahooFinanceBuildResult = runScript(
+      `scripts/yahoo-finance/build-yahoo-daily-fact.js --data-dir ${DATA_DIR_ARG} --month ${currentMonth}`,
+      'Yahoo finance build', 600000
+    );
+    results.push({ name: 'Yahoo finance build', ...yahooFinanceBuildResult });
+
+    if (yahooFinanceBuildResult.success) {
+      const yahooFinanceDqResult = runScript(
+        `apps/warehouse/run-yahoo-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${currentMonth}`,
+        'Yahoo finance DQ', 300000
+      );
+      results.push({ name: 'Yahoo finance DQ', ...yahooFinanceDqResult });
+
+      if (yahooFinanceDqResult.success) {
+        const yahooFinanceSyncResult = runScript(
+          `apps/warehouse/sync-yahoo-finance-daily.js --data-dir ${DATA_DIR_ARG} --month ${currentMonth}`,
+          'Yahoo finance sync', 600000
+        );
+        results.push({ name: 'Yahoo finance sync', ...yahooFinanceSyncResult });
+      } else {
+        console.log(`[DailySync] Yahoo finance sync は DQ gate failure のため記録せず (品質不正データの mirror 投入防止)`);
+      }
+    } else {
+      console.log(`[DailySync] Yahoo finance DQ/sync は build 失敗のため記録せず (build retry 後に翌 cron で実行)`);
+    }
   }
 
   // 楽天 AM/AL/W → NE商品コード sku_map 再構築 (f_sales と独立)
