@@ -239,9 +239,15 @@ async function main() {
     const blockedSummary = '🔴 blocked: DATA_DIR env 未設定 (winsw config 要修正、retry 対象外)';
     results.push({ name: 'Amazon finance build', success: false, blocked: true, summary: blockedSummary });
   } else {
+    // runScript は scriptPath.split(' ') で parse するため、DATA_DIR_ARG は空白なし前提
+    // (引用符 `"${DATA_DIR_ARG}"` を script string に含めると literal のまま args に渡り
+    //  `"C:/.../data"` で fs.existsSync false → FATAL: warehouse.db not found 事故あり、5/10 朝発覚)
     const DATA_DIR_ARG = process.env.DATA_DIR.replace(/\\/g, '/');
+    if (DATA_DIR_ARG.includes(' ')) {
+      console.error(`[DailySync] FATAL: DATA_DIR に空白が含まれています (${DATA_DIR_ARG})。runScript の split(' ') 仕様で分解されます`);
+    }
     const amazonFinanceBuildResult = runScript(
-      `scripts/amazon-finance/build-daily-fact.js --data-dir "${DATA_DIR_ARG}" --month ${currentMonth}`,
+      `scripts/amazon-finance/build-daily-fact.js --data-dir ${DATA_DIR_ARG} --month ${currentMonth}`,
       'Amazon finance build', 600000
     );
     results.push({ name: 'Amazon finance build', ...amazonFinanceBuildResult });
@@ -250,7 +256,7 @@ async function main() {
       // CHUNK_SIZE は 3000 推奨 (issue #72)、env 経由で override 可
       if (!process.env.CHUNK_SIZE) process.env.CHUNK_SIZE = '3000';
       const amazonFinanceSyncResult = runScript(
-        `apps/warehouse/sync-amazon-finance-daily.js --data-dir "${DATA_DIR_ARG}" --month ${currentMonth}`,
+        `apps/warehouse/sync-amazon-finance-daily.js --data-dir ${DATA_DIR_ARG} --month ${currentMonth}`,
         'Amazon finance sync', 600000
       );
       results.push({ name: 'Amazon finance sync', ...amazonFinanceSyncResult });
@@ -268,14 +274,14 @@ async function main() {
     // 3. mirror_rakuten_finance_sku_daily へ sync (chunk POST + ledger 記録、Render side で受信)
     // build 失敗で DQ/sync スキップ、DQ gate failure (exit 1) でも sync スキップ
     const rakutenFinanceBuildResult = runScript(
-      `scripts/rakuten-finance/build-rakuten-daily-fact.js --data-dir "${DATA_DIR_ARG}" --month ${currentMonth}`,
+      `scripts/rakuten-finance/build-rakuten-daily-fact.js --data-dir ${DATA_DIR_ARG} --month ${currentMonth}`,
       '楽天 finance build', 600000
     );
     results.push({ name: '楽天 finance build', ...rakutenFinanceBuildResult });
 
     if (rakutenFinanceBuildResult.success) {
       const rakutenFinanceDqResult = runScript(
-        `apps/warehouse/run-rakuten-finance-dq.js --data-dir "${DATA_DIR_ARG}" --month ${currentMonth}`,
+        `apps/warehouse/run-rakuten-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${currentMonth}`,
         '楽天 finance DQ', 300000
       );
       results.push({ name: '楽天 finance DQ', ...rakutenFinanceDqResult });
@@ -283,7 +289,7 @@ async function main() {
       if (rakutenFinanceDqResult.success) {
         // CHUNK_SIZE は Amazon と共有 (上で 3000 set 済)
         const rakutenFinanceSyncResult = runScript(
-          `apps/warehouse/sync-rakuten-finance-daily.js --data-dir "${DATA_DIR_ARG}" --month ${currentMonth}`,
+          `apps/warehouse/sync-rakuten-finance-daily.js --data-dir ${DATA_DIR_ARG} --month ${currentMonth}`,
           '楽天 finance sync', 600000
         );
         results.push({ name: '楽天 finance sync', ...rakutenFinanceSyncResult });
