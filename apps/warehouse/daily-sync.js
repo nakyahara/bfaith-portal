@@ -37,6 +37,29 @@ async function notify(text) {
   }
 }
 
+/**
+ * Issue #85 対応: GChat 通知用 error summary 抽出
+ * 単純 slice(0, 200) だと "Command failed: node ..." だけで FATAL 本体が切れる事故あり (5/10 朝)
+ * → FATAL/Error/ERR 行を優先抽出 + 末尾数行 (stack trace の意味行) を残す形に
+ * @param {string} errMsg - error.message (execFileSync の Command failed message + stdout/stderr)
+ * @param {number} maxLen - GChat への送信最大長 (デフォルト 1024、GChat は 4096 まで OK)
+ */
+function extractErrorSummary(errMsg, maxLen = 1024) {
+  if (!errMsg) return '(empty error message)';
+  const lines = errMsg.split('\n').map(l => l.trim()).filter(Boolean);
+  // 優先: FATAL / Error / ERR で始まる行 (root cause)
+  const fatalLines = lines.filter(l => /^(FATAL|Error|ERR|TypeError|RangeError|SqliteError|SyntaxError)/.test(l));
+  if (fatalLines.length > 0) {
+    // root cause + 最後 3 行 (stack trace 末尾の意味行)
+    const tail = lines.slice(-3).filter(l => !fatalLines.includes(l));
+    const combined = [...fatalLines, ...(tail.length ? ['---', ...tail] : [])].join('\n');
+    return combined.length > maxLen ? combined.slice(0, maxLen - 12) + '... [trunc]' : combined;
+  }
+  // フォールバック: 最後 5 行 (stack trace 末尾)
+  const fallback = lines.slice(-5).join('\n');
+  return fallback.length > maxLen ? fallback.slice(0, maxLen - 12) + '... [trunc]' : fallback;
+}
+
 function runScript(scriptPath, label, timeoutMs = 600000) {
   const parts = scriptPath.split(' ').filter(Boolean);
   const filePath = path.join(PROJECT_DIR, parts[0]);
@@ -71,7 +94,7 @@ function runScript(scriptPath, label, timeoutMs = 600000) {
     return { success: true, summary: lastLine };
   } catch (e) {
     console.error(`[${label}] エラー:`, e.message);
-    return { success: false, summary: e.message.slice(0, 200) };
+    return { success: false, summary: extractErrorSummary(e.message) };
   }
 }
 
@@ -369,12 +392,12 @@ async function main() {
           } else {
             const err = data.error || `HTTP ${resp.status}`;
             console.error(`[月末確定値] 保存失敗:`, err);
-            results.push({ name: '月末確定値', success: false, summary: err.slice(0, 200) });
+            results.push({ name: '月末確定値', success: false, summary: extractErrorSummary(err) });
           }
         }
       } catch (e) {
         console.error('[月末確定値] 例外:', e.message);
-        results.push({ name: '月末確定値', success: false, summary: e.message.slice(0, 200) });
+        results.push({ name: '月末確定値', success: false, summary: extractErrorSummary(e.message) });
       }
     } else {
       const msg = `⏸️ skipped (上流失敗: ${blockingFails.join(',')})`;
