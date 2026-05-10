@@ -29,6 +29,7 @@ import qoo10AccountingRouter from './apps/qoo10-accounting/router.js';
 import fbaProfitabilityRouter from './apps/fba-profitability/router.js';
 import mercariAccountingRouter from './apps/mercari-accounting/router.js';
 import profitAnalysisRouter from './apps/profit-analysis/router.js';
+import execDashboardRouter from './apps/exec-dashboard/router.js';
 import mgmtAccountingRouter from './apps/mgmt-accounting/router.js';
 import crossSellFinderRouter from './apps/cross-sell-finder/router.js';
 import inventoryMonthlyRouter, { apiRouter as inventoryMonthlyApiRouter } from './apps/inventory-monthly/router.js';
@@ -418,6 +419,15 @@ const apps = [
     status: 'active',
     category: 'accounting',
   },
+  {
+    id: 'exec-dashboard',
+    name: 'MF経営トップダッシュボード',
+    description: 'MFクラウド会計データから売上・粗利・現金残高・モール別売上を1画面集約 (Phase 1a)',
+    icon: '📊',
+    path: '/apps/exec-dashboard',
+    status: 'active',
+    category: 'analysis',
+  },
 ];
 
 // 外部リンク
@@ -631,6 +641,7 @@ app.use('/apps/qoo10-accounting', (req, res, next) => {
 }, qoo10AccountingRouter);
 app.use('/apps/fba-profitability', requireAppAccess('fba-profitability'), fbaProfitabilityRouter);
 app.use('/apps/profit-analysis', requireAppAccess('profit-analysis'), profitAnalysisRouter);
+app.use('/apps/exec-dashboard', requireAppAccess('exec-dashboard'), express.json({ limit: '1mb' }), execDashboardRouter);
 app.use('/apps/cross-sell-finder', requireAppAccess('cross-sell-finder'), crossSellFinderRouter);
 app.use('/apps/mgmt-accounting', express.json({ limit: '50mb' }), (req, res, next) => {
   // 管理系APIはセッション認証スキップ（内部で checkAuth により key/session のいずれか必須）
