@@ -175,11 +175,24 @@ function renderKpi(e) {
     const cls = v >= 0 ? 'yoy-up' : 'yoy-down';
     return '<div class="sub"><span class="' + cls + '">前年同月比 ' + fmtPct(v) + '</span></div>';
   };
+  // Phase 1b: cash_balance_json は { banks:[...], by_category:{...} } 形式
+  // 旧形式 (配列のみ) との後方互換も維持
+  let cashSub = 'UPSIDER等のカード除く';
+  try {
+    const parsed = JSON.parse(e.cash_balance_json || '[]');
+    const byCat = parsed && parsed.by_category;
+    if (byCat) {
+      cashSub = '普通 ' + fmtJpyShort(byCat.cash_bank_normal || 0)
+        + ' / 定期 ' + fmtJpyShort(byCat.cash_time_deposit || 0)
+        + ' / PayPal ' + fmtJpyShort(byCat.cash_paypal || 0)
+        + ' / ペイオニア ' + fmtJpyShort(byCat.cash_payoneer || 0);
+    }
+  } catch (_) { /* 旧形式 fallback */ }
   const html = [
     '<div class="kpi-card"><h3>売上</h3><div class="v">' + fmtJpyShort(e.sales_mtd_excl_tax) + '</div>' + yoy(e.yoy_sales_pct) + '</div>',
     '<div class="kpi-card"><h3>粗利' + (grossPct != null ? ' (' + grossPct.toFixed(1) + '%)' : '') + '</h3><div class="v">' + fmtJpyShort(e.gross_profit_mtd_excl_tax) + '</div>' + yoy(e.yoy_gross_profit_pct) + '</div>',
     '<div class="kpi-card"><h3>営業利益</h3><div class="v">' + fmtJpyShort(e.operating_income_mtd_excl_tax) + '</div>' + yoy(e.yoy_operating_income_pct) + '</div>',
-    '<div class="kpi-card cash"><h3>現預金合計</h3><div class="v">' + fmtJpyShort(e.cash_balance_total) + '</div><div class="sub">UPSIDER等のカード除く</div></div>',
+    '<div class="kpi-card cash"><h3>現預金合計</h3><div class="v">' + fmtJpyShort(e.cash_balance_total) + '</div><div class="sub" style="font-size:11px">' + cashSub + '</div></div>',
     '<div class="kpi-card danger"><h3>危険信号</h3><div class="v">' + (JSON.parse(e.danger_signals_json || '[]').length || 0) + '件</div><div class="sub">open シグナル</div></div>',
   ].join('');
   document.getElementById('kpi-section').innerHTML = html;
