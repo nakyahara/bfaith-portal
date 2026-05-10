@@ -485,13 +485,76 @@ function getLedgerInsert(db) {
   return b.ledgerInsert;
 }
 
+// ─── MF Phase 1a: insert factory + 列定義 (ENTITY_REGISTRY より先に必要) ───
+// 全 MF mirror テーブル共通: INSERT OR REPLACE (run_id+業務PK でユニーク、idempotent)
+function makeMfInsertFactory(table, cols) {
+  return (db) => {
+    const b = getStmtBundle(db);
+    const cacheKey = '_mfInsert_' + table;
+    if (!b[cacheKey]) {
+      const colsList = cols.join(', ');
+      const placeholders = cols.map(c => '@' + c).join(', ');
+      b[cacheKey] = db.prepare(`INSERT OR REPLACE INTO ${table} (${colsList}) VALUES (${placeholders})`);
+    }
+    return b[cacheKey];
+  };
+}
+
+const MF_PUBLISH_RUNS_COLS = [
+  'run_id', 'scope', 'status', 'started_at', 'finished_at',
+  'error_message', 'source_run_hash', 'synced_at', 'finalized_at'
+];
+const MF_EXECUTIVE_TOP_COLS = [
+  'run_id', 'snapshot_date', 'current_month_ym',
+  'sales_mtd_excl_tax', 'gross_profit_mtd_excl_tax', 'operating_income_mtd_excl_tax',
+  'sales_month_end_forecast', 'gross_profit_month_end_forecast', 'operating_income_month_end_forecast',
+  'forecast_status',
+  'yoy_sales_pct', 'yoy_gross_profit_pct', 'yoy_operating_income_pct',
+  'cash_balance_total', 'cash_balance_json', 'danger_signals_json',
+  'data_window_from', 'data_window_to', 'reliability_label',
+  'source_row_hash', 'synced_at'
+];
+const MF_PL_MONTHLY_COLS = [
+  'run_id', 'month_ym', 'role_key', 'amount_excl_tax', 'tax_amount',
+  'line_count', 'is_realized_only', 'source_row_hash', 'synced_at'
+];
+const MF_CHANNEL_SALES_COLS = [
+  'run_id', 'month_ym', 'channel_key', 'channel_display_name',
+  'gross_sales_excl_tax', 'pf_fee_excl_tax', 'ad_cost_excl_tax', 'fba_fee_excl_tax',
+  'net_sales_after_pf_excl_tax', 'unmapped_amount_excl_tax', 'mapping_coverage_pct',
+  'source_row_hash', 'synced_at'
+];
+const MF_CASH_EVENTS_DAILY_COLS = [
+  'run_id', 'movement_date', 'bank_account_key', 'direction',
+  'amount_excl_tax', 'event_count', 'source_row_hash', 'synced_at'
+];
+const MF_BALANCE_SNAPSHOT_COLS = [
+  'run_id', 'month_ym', 'account_key', 'account_name', 'sub_account_name',
+  'role_key', 'closing_balance_excl_tax', 'source_row_hash', 'synced_at'
+];
+const MF_ANOMALY_SIGNALS_COLS = [
+  'run_id', 'signal_id', 'detected_at', 'signal_code', 'signal_key',
+  'severity', 'severity_rank', 'title', 'description',
+  'observed_value', 'threshold_value', 'related_entity_key',
+  'recommended_action', 'source_mart',
+  'source_row_hash', 'synced_at'
+];
+
 // ─── Entity Registry (entity-driven dispatch、楽天 #R-3b で導入) ───
 // 新 entity (Yahoo / メルカリ等) 追加時はここに 1 エントリ追加するだけで
 // chunk endpoint / backout endpoint が自動対応する
+//
+// clear_strategy:
+//   'date_range' (default): 第1 chunk で meta[clear_meta_key] の date 配列を DELETE
+//   'no_clear':             clear をスキップ (run_id ベース append-only 用、MF Phase 1a)
+//
+// requires_parent_run (MF Phase 1a):
+//   true:  meta.mf_source_run_id を含み、Render 側で mirror_mf_publish_runs(run_id) 存在チェック
 const ENTITY_REGISTRY = {
   amazon_finance_sku_daily: {
     contract_version: 1,
     mirror_table: 'mirror_amazon_finance_sku_daily',
+    clear_strategy: 'date_range',
     clear_meta_key: 'clear_amazon_finance_dates',
     getInsertStmt: getAmazonFinanceInsert,
     normalizeRow: (r) => normalizeAmazonFinanceRow(r),
@@ -499,9 +562,73 @@ const ENTITY_REGISTRY = {
   rakuten_finance_sku_daily: {
     contract_version: 1,
     mirror_table: 'mirror_rakuten_finance_sku_daily',
+    clear_strategy: 'date_range',
     clear_meta_key: 'clear_rakuten_finance_dates',
     getInsertStmt: getRakutenFinanceInsert,
     normalizeRow: (r) => normalizeRakutenFinanceRow(r),
+  },
+
+  // ─── MF Phase 1a (Codex 5ラウンド確定設計) ─────────────────────────
+  // 受信順序契約 (sync-to-render.js 側で保証):
+  //   1. mf_publish_runs を最初に送信 (status='pending_sync' で親 row 作成)
+  //   2. 6 mart entities (children) 全部送信
+  //   3. POST /api/sync/mf/runs/:run_id/finalize で status='success' に flip
+  // VIEW v_mirror_mf_*_latest は status='success' の最新 run のみ公開
+  mf_publish_runs: {
+    contract_version: 1,
+    mirror_table: 'mirror_mf_publish_runs',
+    clear_strategy: 'no_clear',
+    requires_parent_run: false,
+    getInsertStmt: makeMfInsertFactory('mirror_mf_publish_runs', MF_PUBLISH_RUNS_COLS),
+    normalizeRow: (r) => normalizeMfPublishRunRow(r),
+  },
+  mf_executive_top: {
+    contract_version: 1,
+    mirror_table: 'mirror_mf_executive_top',
+    clear_strategy: 'no_clear',
+    requires_parent_run: true,
+    getInsertStmt: makeMfInsertFactory('mirror_mf_executive_top', MF_EXECUTIVE_TOP_COLS),
+    normalizeRow: (r) => normalizeMfExecutiveTopRow(r),
+  },
+  mf_pl_monthly: {
+    contract_version: 1,
+    mirror_table: 'mirror_mf_pl_monthly',
+    clear_strategy: 'no_clear',
+    requires_parent_run: true,
+    getInsertStmt: makeMfInsertFactory('mirror_mf_pl_monthly', MF_PL_MONTHLY_COLS),
+    normalizeRow: (r) => normalizeMfPlMonthlyRow(r),
+  },
+  mf_channel_sales: {
+    contract_version: 1,
+    mirror_table: 'mirror_mf_channel_sales',
+    clear_strategy: 'no_clear',
+    requires_parent_run: true,
+    getInsertStmt: makeMfInsertFactory('mirror_mf_channel_sales', MF_CHANNEL_SALES_COLS),
+    normalizeRow: (r) => normalizeMfChannelSalesRow(r),
+  },
+  mf_cash_events_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_mf_cash_events_daily',
+    clear_strategy: 'no_clear',
+    requires_parent_run: true,
+    getInsertStmt: makeMfInsertFactory('mirror_mf_cash_events_daily', MF_CASH_EVENTS_DAILY_COLS),
+    normalizeRow: (r) => normalizeMfCashEventsDailyRow(r),
+  },
+  mf_balance_snapshot_monthly: {
+    contract_version: 1,
+    mirror_table: 'mirror_mf_balance_snapshot_monthly',
+    clear_strategy: 'no_clear',
+    requires_parent_run: true,
+    getInsertStmt: makeMfInsertFactory('mirror_mf_balance_snapshot_monthly', MF_BALANCE_SNAPSHOT_COLS),
+    normalizeRow: (r) => normalizeMfBalanceSnapshotRow(r),
+  },
+  mf_anomaly_signals: {
+    contract_version: 1,
+    mirror_table: 'mirror_mf_anomaly_signals',
+    clear_strategy: 'no_clear',
+    requires_parent_run: true,
+    getInsertStmt: makeMfInsertFactory('mirror_mf_anomaly_signals', MF_ANOMALY_SIGNALS_COLS),
+    normalizeRow: (r) => normalizeMfAnomalySignalsRow(r),
   },
 };
 
@@ -584,13 +711,31 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
     });
   }
   let clearDates = null;
-  if (is_first) {
+  const clearStrategy = entityCfg.clear_strategy || 'date_range';  // backward compat
+  if (is_first && clearStrategy === 'date_range') {
     clearDates = meta[entityCfg.clear_meta_key];
     if (!Array.isArray(clearDates) || clearDates.length === 0) {
       return res.status(400).json({ error: `first chunk requires meta.${entityCfg.clear_meta_key} (non-empty array)` });
     }
     for (const d of clearDates) {
       if (!DATE_RE.test(d)) return res.status(400).json({ error: `invalid date in clear list: ${d}` });
+    }
+  }
+
+  // MF Phase 1a: parent_run_not_found 早期 409 (FK 任せでなく明示エラー)
+  if (entityCfg.requires_parent_run && is_first) {
+    const mfSourceRunId = meta.mf_source_run_id;
+    if (!Number.isInteger(mfSourceRunId)) {
+      return res.status(400).json({ error: `MF mart entity '${entity}' first chunk requires meta.mf_source_run_id (integer)` });
+    }
+    const _db = getMirrorDB();
+    const parent = _db.prepare(`SELECT run_id, status FROM mirror_mf_publish_runs WHERE run_id = ?`).get(mfSourceRunId);
+    if (!parent) {
+      return res.status(409).json({
+        error: 'parent_run_not_found',
+        message: `mirror_mf_publish_runs.run_id=${mfSourceRunId} が存在しません。先に entity='mf_publish_runs' を送信してください。`,
+        entity, sync_run_id, mf_source_run_id: mfSourceRunId,
+      });
     }
   }
 
@@ -641,9 +786,10 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
       }
 
       // 4c. scope clear (is_first かつ この run でまだ何も apply 無い時のみ、#1 race 解消版)
+      // MF Phase 1a: clear_strategy='no_clear' は scope clear をスキップ (run_id ベース append-only)
       let didClear = false;
       let clearedRows = 0;
-      if (is_first) {
+      if (is_first && clearStrategy === 'date_range') {
         const priorCount = db.prepare(`
           SELECT COUNT(*) AS c FROM sync_run_chunks WHERE run_id = ? AND entity = ?
         `).get(sync_run_id, entity).c;
@@ -797,6 +943,92 @@ function normalizeAmazonFinanceRow(r) {
   };
 }
 
+// ─── MF Phase 1a: row 列正規化 (7 entity 分) ─────────────────────────
+function normalizeMfPublishRunRow(r) {
+  return {
+    run_id: r.run_id, scope: r.scope, status: r.status,
+    started_at: r.started_at, finished_at: r.finished_at ?? null,
+    error_message: r.error_message ?? null,
+    source_run_hash: r.source_run_hash ?? null, synced_at: r.synced_at,
+    finalized_at: r.finalized_at ?? null,
+  };
+}
+function normalizeMfExecutiveTopRow(r) {
+  return {
+    run_id: r.run_id, snapshot_date: r.snapshot_date, current_month_ym: r.current_month_ym,
+    sales_mtd_excl_tax: r.sales_mtd_excl_tax ?? 0,
+    gross_profit_mtd_excl_tax: r.gross_profit_mtd_excl_tax ?? 0,
+    operating_income_mtd_excl_tax: r.operating_income_mtd_excl_tax ?? 0,
+    sales_month_end_forecast: r.sales_month_end_forecast ?? 0,
+    gross_profit_month_end_forecast: r.gross_profit_month_end_forecast ?? 0,
+    operating_income_month_end_forecast: r.operating_income_month_end_forecast ?? 0,
+    forecast_status: r.forecast_status || '会計確定待ち',
+    yoy_sales_pct: r.yoy_sales_pct ?? null,
+    yoy_gross_profit_pct: r.yoy_gross_profit_pct ?? null,
+    yoy_operating_income_pct: r.yoy_operating_income_pct ?? null,
+    cash_balance_total: r.cash_balance_total ?? 0,
+    cash_balance_json: r.cash_balance_json || '[]',
+    danger_signals_json: r.danger_signals_json || '[]',
+    data_window_from: r.data_window_from ?? null,
+    data_window_to: r.data_window_to ?? null,
+    reliability_label: r.reliability_label || '業務速報',
+    source_row_hash: r.source_row_hash, synced_at: r.synced_at,
+  };
+}
+function normalizeMfPlMonthlyRow(r) {
+  return {
+    run_id: r.run_id, month_ym: r.month_ym, role_key: r.role_key,
+    amount_excl_tax: r.amount_excl_tax ?? 0, tax_amount: r.tax_amount ?? 0,
+    line_count: r.line_count ?? 0, is_realized_only: r.is_realized_only ?? 1,
+    source_row_hash: r.source_row_hash, synced_at: r.synced_at,
+  };
+}
+function normalizeMfChannelSalesRow(r) {
+  return {
+    run_id: r.run_id, month_ym: r.month_ym,
+    channel_key: r.channel_key, channel_display_name: r.channel_display_name,
+    gross_sales_excl_tax: r.gross_sales_excl_tax ?? 0,
+    pf_fee_excl_tax: r.pf_fee_excl_tax ?? 0,
+    ad_cost_excl_tax: r.ad_cost_excl_tax ?? 0,
+    fba_fee_excl_tax: r.fba_fee_excl_tax ?? 0,
+    net_sales_after_pf_excl_tax: r.net_sales_after_pf_excl_tax ?? 0,
+    unmapped_amount_excl_tax: r.unmapped_amount_excl_tax ?? 0,
+    mapping_coverage_pct: r.mapping_coverage_pct ?? 0,
+    source_row_hash: r.source_row_hash, synced_at: r.synced_at,
+  };
+}
+function normalizeMfCashEventsDailyRow(r) {
+  return {
+    run_id: r.run_id, movement_date: r.movement_date,
+    bank_account_key: r.bank_account_key, direction: r.direction,
+    amount_excl_tax: r.amount_excl_tax ?? 0, event_count: r.event_count ?? 0,
+    source_row_hash: r.source_row_hash, synced_at: r.synced_at,
+  };
+}
+function normalizeMfBalanceSnapshotRow(r) {
+  return {
+    run_id: r.run_id, month_ym: r.month_ym,
+    account_key: r.account_key, account_name: r.account_name,
+    sub_account_name: r.sub_account_name ?? null, role_key: r.role_key ?? null,
+    closing_balance_excl_tax: r.closing_balance_excl_tax ?? 0,
+    source_row_hash: r.source_row_hash, synced_at: r.synced_at,
+  };
+}
+function normalizeMfAnomalySignalsRow(r) {
+  return {
+    run_id: r.run_id, signal_id: r.signal_id, detected_at: r.detected_at,
+    signal_code: r.signal_code, signal_key: r.signal_key ?? null,
+    severity: r.severity, severity_rank: r.severity_rank ?? null,
+    title: r.title, description: r.description,
+    observed_value: r.observed_value ?? null,
+    threshold_value: r.threshold_value ?? null,
+    related_entity_key: r.related_entity_key ?? null,
+    recommended_action: r.recommended_action ?? null,
+    source_mart: r.source_mart ?? null,
+    source_row_hash: r.source_row_hash, synced_at: r.synced_at,
+  };
+}
+
 // ─── Phase 1 #1-4a: GET /api/sync/runs/:run_id (status 確認) ───
 router.get('/api/sync/runs/:run_id', requireSyncKey, (req, res) => {
   const db = getMirrorDB();
@@ -866,6 +1098,12 @@ router.post('/api/sync/runs/:run_id/backout', requireSyncKey, (req, res) => {
     for (const entity of entities) {
       const cfg = ENTITY_REGISTRY[entity];
       if (cfg) {
+        // MF entity (clear_strategy='no_clear') は source_run_id 列を持たないので skip
+        // backout は MF 専用 endpoint (Phase 2 で追加予定) で対応
+        if (cfg.clear_strategy === 'no_clear') {
+          deleted[entity] = 0;
+          continue;
+        }
         const info = db.prepare(`
           DELETE FROM ${cfg.mirror_table} WHERE source_run_id = ?
         `).run(runId);
@@ -947,6 +1185,100 @@ router.post('/api/sync/runs/:run_id/rebuild-marts', requireSyncKey, (req, res) =
     rebuilt: [],
     note: 'Phase 1 #1-7: rebuild trigger 経路のみ整備、mart 実装は Phase 2 で追加',
   });
+});
+
+// ─── MF Phase 1a: POST /api/sync/mf/runs/:run_id/finalize ─────────────────
+// 全 7 entity の chunk 受信完了を検証し、mirror_mf_publish_runs.status を
+// 'pending_sync' → 'success' に flip。VIEW v_mirror_mf_*_latest がこの瞬間に活性化。
+//
+// body: { entity_run_ids: { mf_publish_runs: 'sync_run_id...', mf_executive_top: '...', ... } }
+// idempotent: status='success' 既にだったら 200 で no-op
+const MF_REQUIRED_ENTITIES = [
+  'mf_publish_runs', 'mf_executive_top', 'mf_pl_monthly', 'mf_channel_sales',
+  'mf_cash_events_daily', 'mf_balance_snapshot_monthly', 'mf_anomaly_signals',
+];
+router.post('/api/sync/mf/runs/:run_id/finalize', requireSyncKey, (req, res) => {
+  const runId = parseInt(req.params.run_id, 10);
+  if (!Number.isInteger(runId) || runId <= 0) {
+    return res.status(400).json({ error: 'run_id must be positive integer' });
+  }
+  const body = req.body || {};
+  const entityRunIds = body.entity_run_ids || {};
+  const requestId = `mf-finalize-${Date.now().toString(36)}`;
+  const db = getMirrorDB();
+
+  const parent = db.prepare(`SELECT run_id, status, scope FROM mirror_mf_publish_runs WHERE run_id = ?`).get(runId);
+  if (!parent) {
+    return res.status(404).json({ error: 'parent_run_not_found', run_id: runId, request_id: requestId });
+  }
+  if (parent.status === 'success') {
+    console.log(`[Mirror] mf finalize idempotent (already success) req=${requestId} run=${runId}`);
+    return res.json({ ok: true, run_id: runId, status: 'success', already_finalized: true, request_id: requestId });
+  }
+  if (parent.status !== 'pending_sync') {
+    return res.status(409).json({
+      error: 'invalid_status_for_finalize',
+      message: `run_id=${runId} status=${parent.status}, finalize is only valid from 'pending_sync'`,
+      request_id: requestId,
+    });
+  }
+
+  const incomplete = [];
+  for (const entity of MF_REQUIRED_ENTITIES) {
+    const syncRunId = entityRunIds[entity];
+    if (!syncRunId || typeof syncRunId !== 'string') {
+      incomplete.push({ entity, reason: 'missing_entity_run_id_in_request_body' });
+      continue;
+    }
+    const chunks = db.prepare(`
+      SELECT chunk_index, chunk_count, applied_at
+      FROM sync_run_chunks WHERE run_id = ? AND entity = ?
+      ORDER BY chunk_index
+    `).all(syncRunId, entity);
+    if (chunks.length === 0) {
+      incomplete.push({ entity, sync_run_id: syncRunId, reason: 'no_chunks_received' });
+      continue;
+    }
+    const expected = chunks[0].chunk_count;
+    const applied = chunks.every(c => c.applied_at !== null);
+    const indexes = chunks.map(c => c.chunk_index);
+    const missing = [];
+    for (let i = 0; i < expected; i++) if (!indexes.includes(i)) missing.push(i);
+    if (chunks.length !== expected || missing.length > 0 || !applied) {
+      incomplete.push({
+        entity, sync_run_id: syncRunId,
+        received: chunks.length, expected,
+        missing_chunks: missing, all_applied: applied,
+      });
+    }
+  }
+  if (incomplete.length > 0) {
+    return res.status(409).json({
+      error: 'finalize_blocked_incomplete',
+      message: '一部 entity の sync が未完了のため finalize を拒否',
+      run_id: runId, incomplete, request_id: requestId,
+    });
+  }
+
+  const now = new Date().toISOString();
+  const info = db.prepare(`
+    UPDATE mirror_mf_publish_runs
+       SET status = 'success', finalized_at = ?
+     WHERE run_id = ? AND status = 'pending_sync'
+  `).run(now, runId);
+  if (info.changes !== 1) {
+    const after = db.prepare(`SELECT status FROM mirror_mf_publish_runs WHERE run_id = ?`).get(runId);
+    if (after?.status === 'success') {
+      return res.json({ ok: true, run_id: runId, status: 'success', already_finalized: true, request_id: requestId });
+    }
+    return res.status(500).json({
+      error: 'finalize_update_failed',
+      run_id: runId, status_after: after?.status, request_id: requestId,
+    });
+  }
+
+  console.log(`[Mirror] mf finalize success req=${requestId} run=${runId} scope=${parent.scope}`);
+  res.json({ ok: true, run_id: runId, status: 'success', finalized_at: now, request_id: requestId });
 });
 
 // ─── GET /api/products ───

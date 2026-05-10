@@ -814,4 +814,197 @@ function createTables() {
     updated_at   TEXT NOT NULL,
     updated_by   TEXT
   )`);
+
+  // ========================================================================
+  // ▼▼▼ MFクラウド会計ダッシュボード Phase 1a (Codex 4 ラウンド確定) ▼▼▼
+  //
+  // 命名規則:
+  //   mirror_mf_*       miniPC mart_mf_* から sync 受信した read-only データ
+  //   mart_mf_anomaly_* Render local writable (ack/snooze 操作テーブル)
+  //
+  // run_id 設計:
+  //   - miniPC mf_publish_runs.run_id (INTEGER) を Render でそのまま PK 採用
+  //   - mirror_mf_publish_runs.status: 'pending_sync' → 'success' を finalize endpoint で flip
+  //   - 'failed' run は Render に送らない (miniPC 監査のみ)
+  //
+  // 公開 VIEW:
+  //   v_mirror_mf_*_latest  WHERE run_id = MAX success run のみ公開
+  //
+  // GC ポリシー (Phase 2 別途実装):
+  //   Render 側は直近 7 日 + 各月初 run のみ永久保持、それ以外は削除
+  //   mf_publish_runs 自体は永久保持 (監査)
+  // ========================================================================
+
+  // mirror_mf_publish_runs — publish run カタログ (miniPC 由来 run_id を PK に保持)
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_mf_publish_runs (
+    run_id          INTEGER PRIMARY KEY,
+    scope           TEXT NOT NULL,
+    status          TEXT NOT NULL CHECK (status IN ('pending_sync','success','failed')),
+    started_at      TEXT NOT NULL,
+    finished_at     TEXT,
+    error_message   TEXT,
+    source_run_hash TEXT,
+    synced_at       TEXT NOT NULL,
+    finalized_at    TEXT
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mirror_mf_publish_runs_scope_status ON mirror_mf_publish_runs(scope, status, started_at DESC)');
+
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_mf_executive_top (
+    run_id                              INTEGER NOT NULL REFERENCES mirror_mf_publish_runs(run_id) ON DELETE CASCADE,
+    snapshot_date                       TEXT NOT NULL,
+    current_month_ym                    TEXT NOT NULL,
+    sales_mtd_excl_tax                  INTEGER NOT NULL DEFAULT 0,
+    gross_profit_mtd_excl_tax           INTEGER NOT NULL DEFAULT 0,
+    operating_income_mtd_excl_tax       INTEGER NOT NULL DEFAULT 0,
+    sales_month_end_forecast            INTEGER NOT NULL DEFAULT 0,
+    gross_profit_month_end_forecast     INTEGER NOT NULL DEFAULT 0,
+    operating_income_month_end_forecast INTEGER NOT NULL DEFAULT 0,
+    forecast_status                     TEXT NOT NULL DEFAULT '会計確定待ち',
+    yoy_sales_pct                       REAL,
+    yoy_gross_profit_pct                REAL,
+    yoy_operating_income_pct            REAL,
+    cash_balance_total                  INTEGER NOT NULL DEFAULT 0,
+    cash_balance_json                   TEXT NOT NULL DEFAULT '[]',
+    danger_signals_json                 TEXT NOT NULL DEFAULT '[]',
+    data_window_from                    TEXT,
+    data_window_to                      TEXT,
+    reliability_label                   TEXT NOT NULL DEFAULT '業務速報',
+    source_row_hash                     TEXT NOT NULL,
+    synced_at                           TEXT NOT NULL,
+    PRIMARY KEY (run_id)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mirror_mf_executive_top_snapshot ON mirror_mf_executive_top(snapshot_date)');
+
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_mf_pl_monthly (
+    run_id           INTEGER NOT NULL REFERENCES mirror_mf_publish_runs(run_id) ON DELETE CASCADE,
+    month_ym         TEXT NOT NULL,
+    role_key         TEXT NOT NULL,
+    amount_excl_tax  INTEGER NOT NULL DEFAULT 0,
+    tax_amount       INTEGER NOT NULL DEFAULT 0,
+    line_count       INTEGER NOT NULL DEFAULT 0,
+    is_realized_only INTEGER NOT NULL DEFAULT 1,
+    source_row_hash  TEXT NOT NULL,
+    synced_at        TEXT NOT NULL,
+    PRIMARY KEY (run_id, month_ym, role_key)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mirror_mf_pl_monthly_role ON mirror_mf_pl_monthly(role_key, month_ym)');
+
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_mf_channel_sales (
+    run_id                      INTEGER NOT NULL REFERENCES mirror_mf_publish_runs(run_id) ON DELETE CASCADE,
+    month_ym                    TEXT NOT NULL,
+    channel_key                 TEXT NOT NULL,
+    channel_display_name        TEXT NOT NULL,
+    gross_sales_excl_tax        INTEGER NOT NULL DEFAULT 0,
+    pf_fee_excl_tax             INTEGER NOT NULL DEFAULT 0,
+    ad_cost_excl_tax            INTEGER NOT NULL DEFAULT 0,
+    fba_fee_excl_tax            INTEGER NOT NULL DEFAULT 0,
+    net_sales_after_pf_excl_tax INTEGER NOT NULL DEFAULT 0,
+    unmapped_amount_excl_tax    INTEGER NOT NULL DEFAULT 0,
+    mapping_coverage_pct        REAL NOT NULL DEFAULT 0,
+    source_row_hash             TEXT NOT NULL,
+    synced_at                   TEXT NOT NULL,
+    PRIMARY KEY (run_id, month_ym, channel_key)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mirror_mf_channel_sales_month ON mirror_mf_channel_sales(month_ym, channel_key)');
+
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_mf_cash_events_daily (
+    run_id           INTEGER NOT NULL REFERENCES mirror_mf_publish_runs(run_id) ON DELETE CASCADE,
+    movement_date    TEXT NOT NULL,
+    bank_account_key TEXT NOT NULL,
+    direction        TEXT NOT NULL CHECK (direction IN ('in','out')),
+    amount_excl_tax  INTEGER NOT NULL DEFAULT 0,
+    event_count      INTEGER NOT NULL DEFAULT 0,
+    source_row_hash  TEXT NOT NULL,
+    synced_at        TEXT NOT NULL,
+    PRIMARY KEY (run_id, movement_date, bank_account_key, direction)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mirror_mf_cash_events_bank ON mirror_mf_cash_events_daily(bank_account_key, movement_date)');
+
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_mf_balance_snapshot_monthly (
+    run_id                   INTEGER NOT NULL REFERENCES mirror_mf_publish_runs(run_id) ON DELETE CASCADE,
+    month_ym                 TEXT NOT NULL,
+    account_key              TEXT NOT NULL,
+    account_name             TEXT NOT NULL,
+    sub_account_name         TEXT,
+    role_key                 TEXT,
+    closing_balance_excl_tax INTEGER NOT NULL DEFAULT 0,
+    source_row_hash          TEXT NOT NULL,
+    synced_at                TEXT NOT NULL,
+    PRIMARY KEY (run_id, month_ym, account_key)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mirror_mf_balance_role ON mirror_mf_balance_snapshot_monthly(role_key, month_ym)');
+
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_mf_anomaly_signals (
+    run_id             INTEGER NOT NULL REFERENCES mirror_mf_publish_runs(run_id) ON DELETE CASCADE,
+    signal_id          INTEGER NOT NULL,
+    detected_at        TEXT NOT NULL,
+    signal_code        TEXT NOT NULL,
+    signal_key         TEXT,
+    severity           TEXT NOT NULL CHECK (severity IN ('info','warn','high','critical')),
+    severity_rank      INTEGER,
+    title              TEXT NOT NULL,
+    description        TEXT NOT NULL,
+    observed_value     REAL,
+    threshold_value    REAL,
+    related_entity_key TEXT,
+    recommended_action TEXT,
+    source_mart        TEXT,
+    source_row_hash    TEXT NOT NULL,
+    synced_at          TEXT NOT NULL,
+    PRIMARY KEY (run_id, signal_id)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mirror_mf_anomaly_severity ON mirror_mf_anomaly_signals(severity_rank DESC, detected_at DESC)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mirror_mf_anomaly_signal_key ON mirror_mf_anomaly_signals(signal_key)');
+
+  // mart_mf_* (Render local writable) — ack/snooze 等のユーザー操作
+  db.exec(`CREATE TABLE IF NOT EXISTS mart_mf_anomaly_signal_state (
+    signal_key     TEXT PRIMARY KEY,
+    status         TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','ack','snoozed','closed')),
+    suppress_until TEXT,
+    resolved_at    TEXT,
+    acked_by       TEXT,
+    acked_at       TEXT,
+    version_no     INTEGER NOT NULL DEFAULT 1,
+    updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mart_mf_signal_state_status ON mart_mf_anomaly_signal_state(status, suppress_until)');
+
+  db.exec(`CREATE TABLE IF NOT EXISTS mart_mf_anomaly_state_audit (
+    audit_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_key  TEXT NOT NULL,
+    action      TEXT NOT NULL CHECK (action IN ('ack','snooze','unsnooze','close','reopen')),
+    actor       TEXT,
+    detail      TEXT,
+    occurred_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mart_mf_state_audit_signal ON mart_mf_anomaly_state_audit(signal_key, occurred_at DESC)');
+
+  // 公開 VIEW (latest_successful_run のみ参照)
+  db.exec('DROP VIEW IF EXISTS v_mirror_mf_executive_top_latest');
+  db.exec(`CREATE VIEW v_mirror_mf_executive_top_latest AS
+    SELECT m.* FROM mirror_mf_executive_top m
+    WHERE m.run_id = (SELECT MAX(run_id) FROM mirror_mf_publish_runs WHERE status = 'success' AND scope IN ('all','executive_top'))`);
+  db.exec('DROP VIEW IF EXISTS v_mirror_mf_pl_monthly_latest');
+  db.exec(`CREATE VIEW v_mirror_mf_pl_monthly_latest AS
+    SELECT m.* FROM mirror_mf_pl_monthly m
+    WHERE m.run_id = (SELECT MAX(run_id) FROM mirror_mf_publish_runs WHERE status = 'success' AND scope IN ('all','base','pl_monthly'))`);
+  db.exec('DROP VIEW IF EXISTS v_mirror_mf_channel_sales_latest');
+  db.exec(`CREATE VIEW v_mirror_mf_channel_sales_latest AS
+    SELECT m.* FROM mirror_mf_channel_sales m
+    WHERE m.run_id = (SELECT MAX(run_id) FROM mirror_mf_publish_runs WHERE status = 'success' AND scope IN ('all','channel_sales'))`);
+  db.exec('DROP VIEW IF EXISTS v_mirror_mf_cash_events_daily_latest');
+  db.exec(`CREATE VIEW v_mirror_mf_cash_events_daily_latest AS
+    SELECT m.* FROM mirror_mf_cash_events_daily m
+    WHERE m.run_id = (SELECT MAX(run_id) FROM mirror_mf_publish_runs WHERE status = 'success' AND scope IN ('all','base','cash_events_daily'))`);
+  db.exec('DROP VIEW IF EXISTS v_mirror_mf_balance_snapshot_monthly_latest');
+  db.exec(`CREATE VIEW v_mirror_mf_balance_snapshot_monthly_latest AS
+    SELECT m.* FROM mirror_mf_balance_snapshot_monthly m
+    WHERE m.run_id = (SELECT MAX(run_id) FROM mirror_mf_publish_runs WHERE status = 'success' AND scope IN ('all','base','balance_snapshot_monthly'))`);
+  db.exec('DROP VIEW IF EXISTS v_mirror_mf_anomaly_signals_latest');
+  db.exec(`CREATE VIEW v_mirror_mf_anomaly_signals_latest AS
+    SELECT m.*, s.status AS state_status, s.suppress_until, s.acked_by, s.acked_at
+    FROM mirror_mf_anomaly_signals m
+    LEFT JOIN mart_mf_anomaly_signal_state s ON s.signal_key = m.signal_key
+    WHERE m.run_id = (SELECT MAX(run_id) FROM mirror_mf_publish_runs WHERE status = 'success' AND scope IN ('all','anomaly_signals'))`);
+  // ▲▲▲ MFクラウド会計ダッシュボード Phase 1a 終了 ▲▲▲
 }
