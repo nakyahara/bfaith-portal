@@ -65,7 +65,17 @@ const checkedAt = new Date().toISOString();
 // ============================================================
 // Threshold config (Phase 1a #R-2 確定値)
 // ============================================================
-const THRESHOLDS = {
+// listing_diff_pct は当月と前月以前で閾値を分ける (Issue #83 対応 2026-05-10)
+// 当月: build と f_sales_by_listing の sync タイミング差で diff 8% 程度普通に出る (false positive)
+// 前月以前: 月末確定後なので厳密 1%/5% で本物の品質悪化を検出
+function isCurrentMonth(monthStr) {
+  // JST の今日の YYYY-MM (UTC+9)
+  const nowJst = new Date(Date.now() + 9 * 60 * 60 * 1000);
+  const currentMonth = nowJst.toISOString().slice(0, 7);
+  return monthStr === currentMonth;
+}
+
+const THRESHOLDS_PAST_MONTH = {
   row_count_drift:           { warn: 0,    error: 0 },        // 厳密一致 (0 行は error)
   listing_diff_pct:          { warn: 1.0,  error: 5.0 },      // %
   missing_cost_rate_pct:     { warn: 5.0,  error: 10.0 },     // %
@@ -73,6 +83,14 @@ const THRESHOLDS = {
   unresolved_sku_rate_pct:   { warn: 5.0,  error: 10.0 },     // %
   date_mismatch_units:       { warn: null, error: null },     // info only (Phase 1b 按分対象)
 };
+
+const THRESHOLDS_CURRENT_MONTH = {
+  ...THRESHOLDS_PAST_MONTH,
+  // 当月のみ listing_diff を緩和 (build と listing の sync タイミング差で false positive 多発防止)
+  listing_diff_pct:          { warn: 5.0,  error: 15.0 },
+};
+
+const THRESHOLDS = isCurrentMonth(monthStr) ? THRESHOLDS_CURRENT_MONTH : THRESHOLDS_PAST_MONTH;
 
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
@@ -92,7 +110,12 @@ function recordResult(checkName, severity, actualValue, thresholdValue, details 
   }
 }
 
-console.log(`=== Rakuten DQ gate run: ${runId} (month=${monthStr}) ===`);
+const isCurMonth = isCurrentMonth(monthStr);
+console.log(`=== Rakuten DQ gate run: ${runId} (month=${monthStr}, ${isCurMonth ? 'CURRENT month threshold' : 'PAST month threshold'}) ===`);
+if (isCurMonth) {
+  console.log(`  ℹ️  当月モード: listing_diff_pct を warn ${THRESHOLDS.listing_diff_pct.warn}%/error ${THRESHOLDS.listing_diff_pct.error}% に緩和 (Issue #83)`);
+  console.log(`     理由: build と f_sales_by_listing の sync タイミング差で当月は diff 8% 程度普通に出る (false positive 防止)`);
+}
 
 // 既存 run_id の result があれば削除して再実行可
 db.prepare(`DELETE FROM dq_run_results WHERE run_id = ?`).run(runId);
