@@ -156,20 +156,36 @@ function insertOrders(db, orders, batchId, windowStart, windowEnd) {
   `);
 
   let logCount = 0, currentCount = 0;
+  // Phase 1.1.1 fail-closed カウンタ (5/8-10 proxy regression 事故対応、Codex 推奨)
+  let skippedInvalid = 0;
+  let apiError = 0;
 
   const tx = db.transaction(() => {
     for (const { orderId, data } of orders) {
+      // <Error> ルート検知 (proxy or Yahoo API がエラー XML 返した場合、5/8-10 事故の主因)
+      const errorNode = data?.Error || data?.ResultSet?.Error || data?.Result?.Error;
+      if (errorNode) {
+        console.log(`[Yahoo] orderInfo API error for ${orderId}: code=${errorNode?.Code || '?'} msg=${errorNode?.Message || '?'}`);
+        apiError++;
+        continue;
+      }
+
       const resultSet = data?.ResultSet || data?.result || data;
       const result = resultSet?.Result || {};
 
-      // エラーチェック
+      // Status エラーチェック (既存)
       if (result?.Status && result.Status !== '0' && result.Status !== 'OK') {
-        console.log(`[Yahoo] orderInfo error for ${orderId}: ${result?.Message || 'unknown'}`);
+        console.log(`[Yahoo] orderInfo Status error for ${orderId}: ${result?.Message || 'unknown'}`);
+        apiError++;
         continue;
       }
 
       const orderInfo = result?.OrderInfo || resultSet?.OrderInfo || resultSet?.Order || resultSet;
-      if (!orderInfo) continue;
+      if (!orderInfo || typeof orderInfo !== 'object') {
+        console.log(`[Yahoo] skip ${orderId}: OrderInfo missing or invalid`);
+        skippedInvalid++;
+        continue;
+      }
 
       // 注文レベルの情報
       const orderTime = orderInfo.OrderTime || '';
@@ -177,6 +193,14 @@ function insertOrders(db, orders, batchId, windowStart, windowEnd) {
       const orderStatus = orderInfo.OrderStatus || '';
       const payStatus = orderInfo.Pay?.PayStatus || orderInfo.PayStatus || '';
       const shipStatus = orderInfo.Ship?.ShipStatus || orderInfo.ShipStatus || '';
+
+      // 注文ヘッダ必須 field validation (Codex fail-closed 案、SubCode は任意)
+      if (!orderTime || !orderStatus) {
+        console.log(`[Yahoo] skip ${orderId}: order_time or status empty (order_time='${orderTime}' status='${orderStatus}')`);
+        skippedInvalid++;
+        continue;
+      }
+
       const detail = orderInfo.Detail || {};
       const totalPrice = parseFloat(detail.TotalPrice || orderInfo.TotalPrice) || 0;
       const payCharge = parseFloat(detail.PayCharge || orderInfo.PayCharge) || 0;
@@ -188,8 +212,27 @@ function insertOrders(db, orders, batchId, windowStart, windowEnd) {
       let items = orderInfo.Item || orderInfo.Items?.Item || [];
       if (!Array.isArray(items)) items = [items];
       if (!items.length || !items[0]) {
-        // 明細なしの場合は注文レベルで1行
-        items = [{}];
+        // 明細なしは異常 (Codex fail-closed 案: 注文 skip)
+        console.log(`[Yahoo] skip ${orderId}: items empty`);
+        skippedInvalid++;
+        continue;
+      }
+
+      // 明細必須 field validation (item_id / quantity / unit_price のいずれか欠落で注文 skip)
+      let itemValid = true;
+      for (const item of items) {
+        const _itemId = item.ItemId || '';
+        const _qty = parseInt(item.Quantity) || 0;
+        const _price = parseFloat(item.UnitPrice) || 0;
+        if (!_itemId || _qty <= 0 || _price <= 0) {
+          console.log(`[Yahoo] skip ${orderId}: item field empty (item_id='${_itemId}' qty=${_qty} price=${_price})`);
+          itemValid = false;
+          break;
+        }
+      }
+      if (!itemValid) {
+        skippedInvalid++;
+        continue;
       }
 
       // current: 注文ID単位でDELETE→INSERT
@@ -231,7 +274,29 @@ function insertOrders(db, orders, batchId, windowStart, windowEnd) {
   });
   tx();
 
-  return { logCount, currentCount };
+  return { logCount, currentCount, skippedInvalid, apiError };
+}
+
+// fail-closed 判定 (Codex 推奨、5/8-10 事故再発防止)
+//   - fetched > 0 AND inserted = 0 → FATAL (proxy / API 障害の可能性、cron exit 1)
+//   - api_error_rate > 50% → FATAL (Yahoo API 系統的 reject、cron exit 1)
+//   - skipped_invalid > 0 → warning (個別 record の semantic failure)
+function evaluateFetchResult(label, fetched, currentCount, skippedInvalid, apiError) {
+  const skippedRatio = fetched > 0 ? ((skippedInvalid + apiError) / fetched * 100).toFixed(1) : '0.0';
+  console.log(`[Yahoo] ${label}: fetched=${fetched} inserted=${currentCount} skipped_invalid=${skippedInvalid} api_error=${apiError} (skip_ratio=${skippedRatio}%)`);
+  if (fetched > 0 && currentCount === 0) {
+    console.error(`[Yahoo] FATAL: fetched=${fetched} だが inserted=0、proxy or Yahoo API 障害の可能性 (5/8-10 同型事故防止)`);
+    return 'fatal';
+  }
+  if (fetched > 0 && apiError / fetched > 0.5) {
+    console.error(`[Yahoo] FATAL: api_error_rate=${(apiError / fetched * 100).toFixed(1)}% (50% 超)`);
+    return 'fatal';
+  }
+  if (skippedInvalid > 0 || apiError > 0) {
+    console.log(`[Yahoo] ⚠️  semantic warning: skipped_invalid=${skippedInvalid} api_error=${apiError}`);
+    return 'warning';
+  }
+  return 'ok';
 }
 
 // ─── メイン：日次取得 ───
@@ -280,11 +345,16 @@ async function fetchYahoo(days = 7) {
   // Step 2: orderInfo で詳細取得
   const orders = await getOrderDetails(orderIds);
 
-  // Step 3: DB投入
-  const { logCount, currentCount } = insertOrders(db, orders, batchId, startStr, endStr);
+  // Step 3: DB投入 (fail-closed 判定込み)
+  const { logCount, currentCount, skippedInvalid, apiError } = insertOrders(db, orders, batchId, startStr, endStr);
 
   updateSyncMeta('yahoo_last_sync', now());
   console.log(`[Yahoo] 受注取得完了: log=${logCount}件, current=${currentCount}件 (注文${orderIds.length}件)`);
+
+  const verdict = evaluateFetchResult('fetchYahoo', orderIds.length, currentCount, skippedInvalid, apiError);
+  if (verdict === 'fatal') {
+    process.exit(1);  // daily-sync runScript で fail として扱われる
+  }
   return logCount;
 }
 
@@ -301,6 +371,10 @@ async function backfill(startDateStr, endDateStr) {
   const start = new Date(startDateStr.replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3'));
 
   let totalLog = 0;
+  let totalFetched = 0;
+  let totalCurrent = 0;
+  let totalSkipped = 0;
+  let totalApiError = 0;
   let current = new Date(end);
 
   while (current >= start) {
@@ -317,8 +391,12 @@ async function backfill(startDateStr, endDateStr) {
       const { orderIds } = await getOrderIds(dayStartStr, dayEndStr);
       if (orderIds.length) {
         const orders = await getOrderDetails(orderIds);
-        const { logCount } = insertOrders(db, orders, batchId, dayStartStr, dayEndStr);
+        const { logCount, currentCount, skippedInvalid, apiError } = insertOrders(db, orders, batchId, dayStartStr, dayEndStr);
         totalLog += logCount;
+        totalFetched += orderIds.length;
+        totalCurrent += currentCount;
+        totalSkipped += skippedInvalid;
+        totalApiError += apiError;
         console.log(`[Yahoo] バックフィル ${dayStartStr}-${dayEndStr}: ${logCount}件 (累計${totalLog})`);
       } else {
         console.log(`[Yahoo] バックフィル ${dayStartStr}-${dayEndStr}: 0件`);
@@ -337,6 +415,11 @@ async function backfill(startDateStr, endDateStr) {
   }
 
   console.log(`[Yahoo] バックフィル完了: ${totalLog}件`);
+
+  const verdict = evaluateFetchResult('backfill', totalFetched, totalCurrent, totalSkipped, totalApiError);
+  if (verdict === 'fatal') {
+    process.exit(1);
+  }
   return totalLog;
 }
 
