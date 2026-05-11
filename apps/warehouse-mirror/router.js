@@ -583,6 +583,20 @@ const MF_ANOMALY_SIGNALS_COLS = [
   'recommended_action', 'source_mart',
   'source_row_hash', 'synced_at'
 ];
+// Phase 1d-2: 期 (FY) 累計 + 平均残高
+const MF_FY_SUMMARY_COLS = [
+  'run_id', 'fy_number', 'fy_start_ym', 'fy_end_ym',
+  'cumulative_through_ym', 'months_in_cumulative', 'is_fy_completed',
+  'sales_cum', 'cogs_cum', 'gross_profit_cum', 'sgae_cum', 'operating_income_cum',
+  'non_op_revenue_cum', 'non_op_expense_cum', 'ordinary_income_cum',
+  'personnel_cost_cum',
+  'ar_average', 'inventory_average', 'ap_average', 'total_asset_average',
+  'ar_opening', 'ar_closing', 'inventory_opening', 'inventory_closing',
+  'ap_opening', 'ap_closing', 'total_asset_opening', 'total_asset_closing',
+  'cash_closing', 'short_loan_closing', 'long_loan_closing',
+  'current_liab_closing', 'total_equity_closing',
+  'source_row_hash', 'synced_at'
+];
 
 // ─── Entity Registry (entity-driven dispatch、楽天 #R-3b で導入) ───
 // 新 entity (Yahoo / メルカリ等) 追加時はここに 1 エントリ追加するだけで
@@ -681,6 +695,15 @@ const ENTITY_REGISTRY = {
     requires_parent_run: true,
     getInsertStmt: makeMfInsertFactory('mirror_mf_anomaly_signals', MF_ANOMALY_SIGNALS_COLS),
     normalizeRow: (r) => normalizeMfAnomalySignalsRow(r),
+  },
+  // Phase 1d-2: 期 (FY) 累計 + 平均残高
+  mf_fy_summary: {
+    contract_version: 1,
+    mirror_table: 'mirror_mf_fy_summary',
+    clear_strategy: 'no_clear',
+    requires_parent_run: true,
+    getInsertStmt: makeMfInsertFactory('mirror_mf_fy_summary', MF_FY_SUMMARY_COLS),
+    normalizeRow: (r) => normalizeMfFySummaryRow(r),
   },
 };
 
@@ -1168,6 +1191,45 @@ function normalizeMfAnomalySignalsRow(r) {
     source_row_hash: r.source_row_hash, synced_at: r.synced_at,
   };
 }
+// Phase 1d-2: mf_fy_summary
+function normalizeMfFySummaryRow(r) {
+  return {
+    run_id: r.run_id,
+    fy_number: r.fy_number,
+    fy_start_ym: r.fy_start_ym,
+    fy_end_ym: r.fy_end_ym,
+    cumulative_through_ym: r.cumulative_through_ym,
+    months_in_cumulative: r.months_in_cumulative ?? 0,
+    is_fy_completed: r.is_fy_completed ?? 0,
+    sales_cum: r.sales_cum ?? 0,
+    cogs_cum: r.cogs_cum ?? 0,
+    gross_profit_cum: r.gross_profit_cum ?? 0,
+    sgae_cum: r.sgae_cum ?? 0,
+    operating_income_cum: r.operating_income_cum ?? 0,
+    non_op_revenue_cum: r.non_op_revenue_cum ?? 0,
+    non_op_expense_cum: r.non_op_expense_cum ?? 0,
+    ordinary_income_cum: r.ordinary_income_cum ?? 0,
+    personnel_cost_cum: r.personnel_cost_cum ?? 0,
+    ar_average: r.ar_average ?? 0,
+    inventory_average: r.inventory_average ?? 0,
+    ap_average: r.ap_average ?? 0,
+    total_asset_average: r.total_asset_average ?? 0,
+    ar_opening: r.ar_opening ?? 0,
+    ar_closing: r.ar_closing ?? 0,
+    inventory_opening: r.inventory_opening ?? 0,
+    inventory_closing: r.inventory_closing ?? 0,
+    ap_opening: r.ap_opening ?? 0,
+    ap_closing: r.ap_closing ?? 0,
+    total_asset_opening: r.total_asset_opening ?? 0,
+    total_asset_closing: r.total_asset_closing ?? 0,
+    cash_closing: r.cash_closing ?? 0,
+    short_loan_closing: r.short_loan_closing ?? 0,
+    long_loan_closing: r.long_loan_closing ?? 0,
+    current_liab_closing: r.current_liab_closing ?? 0,
+    total_equity_closing: r.total_equity_closing ?? 0,
+    source_row_hash: r.source_row_hash, synced_at: r.synced_at,
+  };
+}
 
 // ─── Phase 1 #1-4a: GET /api/sync/runs/:run_id (status 確認) ───
 router.get('/api/sync/runs/:run_id', requireSyncKey, (req, res) => {
@@ -1328,7 +1390,7 @@ router.post('/api/sync/runs/:run_id/rebuild-marts', requireSyncKey, (req, res) =
 });
 
 // ─── MF Phase 1a: POST /api/sync/mf/runs/:run_id/finalize ─────────────────
-// 全 7 entity の chunk 受信完了を検証し、mirror_mf_publish_runs.status を
+// 全 entity の chunk 受信完了を検証し、mirror_mf_publish_runs.status を
 // 'pending_sync' → 'success' に flip。VIEW v_mirror_mf_*_latest がこの瞬間に活性化。
 //
 // body: { entity_run_ids: { mf_publish_runs: 'sync_run_id...', mf_executive_top: '...', ... } }
@@ -1337,6 +1399,9 @@ const MF_REQUIRED_ENTITIES = [
   'mf_publish_runs', 'mf_executive_top', 'mf_pl_monthly', 'mf_channel_sales',
   'mf_cash_events_daily', 'mf_balance_snapshot_monthly', 'mf_anomaly_signals',
 ];
+// Phase 1d-2: optional entity (旧 sync (deploy 前) との互換のため、欠けても finalize 通過)
+//   将来 (Phase 1d-3 以降で sync 側完全移行後) に MF_REQUIRED_ENTITIES へ昇格予定
+const MF_OPTIONAL_ENTITIES = ['mf_fy_summary'];
 router.post('/api/sync/mf/runs/:run_id/finalize', requireSyncKey, (req, res) => {
   const runId = parseInt(req.params.run_id, 10);
   if (!Number.isInteger(runId) || runId <= 0) {
@@ -1387,9 +1452,18 @@ router.post('/api/sync/mf/runs/:run_id/finalize', requireSyncKey, (req, res) => 
         });
       }
 
-      for (const entity of MF_REQUIRED_ENTITIES) {
+      // Phase 1d-2: required + optional 両方 validate (optional は欠けても通過)
+      const allEntitiesToCheck = [
+        ...MF_REQUIRED_ENTITIES.map(e => ({ entity: e, optional: false })),
+        ...MF_OPTIONAL_ENTITIES.map(e => ({ entity: e, optional: true })),
+      ];
+      for (const { entity, optional } of allEntitiesToCheck) {
         const syncRunId = entityRunIds[entity];
         if (!syncRunId || typeof syncRunId !== 'string') {
+          if (optional) {
+            console.log(`[Mirror] mf finalize req=${requestId} run=${runId}: optional entity '${entity}' not provided, skipping`);
+            continue;
+          }
           incomplete.push({ entity, reason: 'missing_entity_run_id_in_request_body' });
           continue;
         }
@@ -1399,6 +1473,10 @@ router.post('/api/sync/mf/runs/:run_id/finalize', requireSyncKey, (req, res) => 
           ORDER BY chunk_index
         `).all(syncRunId, entity);
         if (chunks.length === 0) {
+          if (optional) {
+            console.log(`[Mirror] mf finalize req=${requestId} run=${runId}: optional entity '${entity}' has no chunks, skipping`);
+            continue;
+          }
           incomplete.push({ entity, sync_run_id: syncRunId, reason: 'no_chunks_received' });
           continue;
         }
