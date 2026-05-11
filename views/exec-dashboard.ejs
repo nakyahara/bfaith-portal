@@ -78,6 +78,28 @@
 
     .empty { background: #fef3c7; border: 1px solid #fbbf24; padding: 16px; border-radius: 6px; color: #78350f; }
     .loading { padding: 16px; color: #6b7280; }
+
+    /* 第N期 累計 セクション (Phase 1d-2) */
+    .fy-summary { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+    .fy-card { background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px 20px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
+    .fy-card.current { border-left: 4px solid #2563eb; }
+    .fy-card.prev { border-left: 4px solid #6b7280; }
+    .fy-card .fy-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 12px; }
+    .fy-card .fy-title { font-size: 15px; font-weight: 700; color: #111; }
+    .fy-card .fy-period { font-size: 12px; color: #6b7280; }
+    .fy-card .fy-status { font-size: 11px; padding: 2px 8px; border-radius: 4px; font-weight: 600; }
+    .fy-card .fy-status.in-progress { background: #dbeafe; color: #1e40af; }
+    .fy-card .fy-status.completed { background: #d1fae5; color: #065f46; }
+    .fy-card .fy-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; margin-top: 6px; }
+    .fy-card .fy-metric { padding: 6px 0; border-bottom: 1px solid #f3f4f6; }
+    .fy-card .fy-metric:last-child { border-bottom: none; }
+    .fy-card .fy-metric .label { font-size: 11px; color: #6b7280; }
+    .fy-card .fy-metric .value { font-size: 18px; font-weight: 700; color: #111; }
+    .fy-card .fy-metric .pct { font-size: 12px; color: #2563eb; margin-left: 4px; font-weight: 500; }
+    @media (max-width: 768px) {
+      .fy-summary { grid-template-columns: 1fr; }
+      .fy-card .fy-row { grid-template-columns: 1fr; }
+    }
     .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; }
     .badge.success { background: #d1fae5; color: #065f46; }
     .badge.warn { background: #fef3c7; color: #92400e; }
@@ -129,6 +151,11 @@
 
     <div id="kpi-section" class="kpi-grid"></div>
 
+    <!-- Phase 1d-2: 期 (FY) 累計 (B-Faith 第N期、7月-6月) -->
+    <div id="fy-summary" class="fy-summary">
+      <div class="loading">第N期 累計データ読み込み中...</div>
+    </div>
+
     <div class="charts-grid">
       <div class="chart-card"><h3>📈 売上 vs 粗利 (粗利率折れ線)</h3><div class="chart-wrap"><canvas id="chart-sales"></canvas></div></div>
       <div class="chart-card"><h3>💵 現預金推移 (銀行別積み上げ)</h3><div class="chart-wrap"><canvas id="chart-cash"></canvas></div></div>
@@ -173,6 +200,16 @@ function fmtPct(n) {
   return (n >= 0 ? '+' : '') + Number(n).toFixed(1) + '%';
 }
 function fmtDate(s) { return s ? s.slice(0, 19).replace('T', ' ') : '—'; }
+// HTML escape helper (Codex review Q5: stored XSS 対策)
+function esc(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 // ─── 状態 ───
 let currentPeriod = '12m';
@@ -220,6 +257,93 @@ async function loadSnapshot() {
   renderStatus(j.exec, j.runMeta);
   renderKpi(j.exec);
   renderAnomaly(j.anomalies);
+}
+
+// Phase 1d-2: 第N期 累計 FY summary (PDF 経営実績報告書の指標)
+async function loadFySummary() {
+  const el = document.getElementById('fy-summary');
+  // Codex R2 review: 前回成功時の meta が unavailable/error に切替えても残る問題を fix
+  //   loadFySummary 突入時に必ず meta を消す (renderFySummary 成功時のみ再注入)
+  const oldMeta = document.getElementById('fy-summary-meta');
+  if (oldMeta) oldMeta.remove();
+  try {
+    const j = await fetchJson('/apps/exec-dashboard/api/fy-summary');
+    if (!j.ok) { el.textContent = ''; el.innerHTML = '<div class="empty">FY summary 取得エラー: ' + esc(j.error || '') + '</div>'; return; }
+    if (!j.available) { el.textContent = ''; el.innerHTML = '<div class="empty">' + esc(j.message || '第N期 累計データなし') + '</div>'; return; }
+    renderFySummary(j.fy_summary, j.headcount, j.meta);
+  } catch (e) {
+    el.textContent = ''; el.innerHTML = '<div class="empty">FY summary 通信エラー: ' + esc(e.message) + '</div>';
+  }
+}
+
+function renderFySummary(rows, headcount, meta) {
+  const el = document.getElementById('fy-summary');
+  if (!rows || rows.length === 0) { el.innerHTML = '<div class="empty">第N期 データなし</div>'; return; }
+  // 当期 = fy_number 大、前期 = 小 (rows は API 側で fy_number DESC ソート済み LIMIT 2)
+  const cur = rows[0];
+  const prev = rows[1];
+
+  const m = (label, val, pct) => {
+    const pctHtml = pct != null && Number.isFinite(pct) ? '<span class="pct">' + esc(pct.toFixed(2)) + '%</span>' : '';
+    return '<div class="fy-metric"><div class="label">' + esc(label) + '</div><div class="value">' + (val == null ? '—' : esc(fmtJpyShort(val))) + pctHtml + '</div></div>';
+  };
+  const pctOnly = (label, pct) => {
+    const v = pct == null || !Number.isFinite(pct) ? '—' : esc(pct.toFixed(2)) + '%';
+    return '<div class="fy-metric"><div class="label">' + esc(label) + '</div><div class="value">' + v + '</div></div>';
+  };
+  const yenOnly = (label, val) => {
+    return '<div class="fy-metric"><div class="label">' + esc(label) + '</div><div class="value">' + (val == null ? '—' : esc(fmtJpyShort(val))) + '</div></div>';
+  };
+
+  const card = (fy, klass) => {
+    if (!fy) return '';   // Codex Q4: prev 無い場合は単独 card (placeholder 削除)
+    const statusClass = fy.is_fy_completed ? 'completed' : 'in-progress';
+    const statusLabel = fy.is_fy_completed ? '完了' : '進行中';
+    const periodText = esc(fy.fy_start_ym) + ' 〜 ' + esc(fy.fy_end_ym)
+      + ' (' + esc(String(fy.months_in_cumulative)) + 'ヶ月時点 ' + esc(fy.cumulative_through_ym) + ')';
+    return ''
+      + '<div class="fy-card ' + klass + '">'
+      + '  <div class="fy-head">'
+      + '    <div>'
+      + '      <div class="fy-title">第' + esc(String(fy.fy_number)) + '期 累計</div>'
+      + '      <div class="fy-period">' + periodText + '</div>'
+      + '    </div>'
+      + '    <span class="fy-status ' + statusClass + '">' + statusLabel + '</span>'
+      + '  </div>'
+      + '  <div class="fy-row">'
+      + m('売上累計', fy.sales_cum)
+      + m('粗利累計 (限界利益)', fy.gross_profit_cum, fy.marginal_profit_pct)
+      + m('営業利益累計', fy.operating_income_cum)
+      + m('経常利益累計', fy.ordinary_income_cum, fy.ordinary_profit_pct)
+      + pctOnly('労働分配率', fy.labor_distribution_pct)
+      + pctOnly('ROA (経常÷平均総資産)', fy.roa_pct)
+      + yenOnly('1人当たり限界利益 (' + esc(String(headcount)) + '名)', fy.marginal_profit_per_employee)
+      + yenOnly('総資産 月平均', fy.total_asset_average)
+      + '  </div>'
+      + '</div>';
+  };
+
+  // Codex Q4: prev が無い (第1期のみ) 場合は当期 card のみ。grid の 1fr 1fr を上書き。
+  if (!prev) {
+    el.style.gridTemplateColumns = '1fr';
+  } else {
+    el.style.gridTemplateColumns = '';
+  }
+  el.innerHTML = card(cur, 'current') + card(prev, 'prev');
+
+  // Codex Q6/Q7: 鮮度メタ情報を status bar の右側に注記 (単独 div で append)
+  if (meta && meta.run_id) {
+    const sb = document.getElementById('status-bar');
+    // 既存の FY summary meta 行を上書き (重複防止)
+    const old = document.getElementById('fy-summary-meta');
+    if (old) old.remove();
+    const span = document.createElement('span');
+    span.id = 'fy-summary-meta';
+    span.textContent = `📅 FY summary: run_id=${meta.run_id} / 〜${meta.cumulative_through_ym} / 1人=${headcount}名 (現在値)`;
+    span.style.fontSize = '11px';
+    span.style.color = '#6b7280';
+    sb.appendChild(span);
+  }
 }
 
 async function loadTimeseries() {
@@ -520,6 +644,7 @@ function renderDetails(j) {
 
 // ─── 起動 ───
 loadSnapshot();
+loadFySummary();
 loadAll();
 </script>
 </body>

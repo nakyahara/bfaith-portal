@@ -193,6 +193,15 @@ entities.push({
   ),
 });
 
+// Phase 1d-2: 期 (FY) 累計 + 平均残高
+entities.push({
+  name: 'mf_fy_summary',
+  rows: enrich(
+    db.prepare(`SELECT * FROM mart_mf_fy_summary WHERE run_id = ?`).all(runId),
+    ['run_id', 'fy_number', 'fy_start_ym', 'sales_cum']
+  ),
+});
+
 console.log('\n  Entities to sync:');
 for (const e of entities) {
   console.log(`    ${e.name.padEnd(35)} ${e.rows.length.toString().padStart(6)} rows`);

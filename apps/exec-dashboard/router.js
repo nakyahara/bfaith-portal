@@ -415,6 +415,82 @@ router.get('/api/trial-balance/bs', (req, res) => {
   }
 });
 
+// ─── API: 第N期 累計 FY summary (Phase 1d-2) ───
+//   v_mirror_mf_fy_summary_latest から 当期 + 前期 (最大 2 行) を返す
+//   経営指標: 売上累計 / 粗利 / 営業利益 / 経常利益 / 当期純利益 / 労働分配率 / ROA / 1人当たり限界利益
+//
+//   注意 (Codex review):
+//     - HEADCOUNT は「現在値」、過去 FY の指標も今の HEADCOUNT で割る (履歴整合性なし)
+//       将来要件次第で fy_summary mart に headcount 列追加すべき
+//     - LIMIT 2 で固定 (3 行以上は silent drop しない)
+const DEFAULT_HEADCOUNT = 13;
+function resolveHeadcount() {
+  const raw = process.env.MF_HEADCOUNT;
+  if (!raw) return DEFAULT_HEADCOUNT;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_HEADCOUNT;
+}
+router.get('/api/fy-summary', (req, res) => {
+  try {
+    const db = getMirrorDB();
+    const rows = db.prepare(`
+      SELECT * FROM v_mirror_mf_fy_summary_latest
+      ORDER BY fy_number DESC
+      LIMIT 2
+    `).all();
+    if (!rows || rows.length === 0) {
+      return res.json({ ok: true, available: false, message: 'FY summary 未 sync (miniPC で Phase 1d-2 build-marts + sync 実行待ち)' });
+    }
+    const HEADCOUNT = resolveHeadcount();
+    // 鮮度情報 (Codex Q6): どの run / どの確定月のデータか UI に出す
+    const freshestRow = rows[0];
+    const meta = {
+      run_id: freshestRow.run_id,
+      cumulative_through_ym: freshestRow.cumulative_through_ym,
+      synced_at: freshestRow.synced_at || null,
+    };
+    // 各 FY に経営指標を追加
+    const enriched = rows.map(r => {
+      const sales = r.sales_cum || 0;
+      const grossProfit = r.gross_profit_cum || 0;
+      const operating = r.operating_income_cum || 0;
+      const ordinary = r.ordinary_income_cum || 0;
+      const personnel = r.personnel_cost_cum || 0;
+      const assetAvg = r.total_asset_average || 0;
+      // 限界利益 = 粗利 (B-Faith 戦略: 原価=変動費)
+      const marginalProfit = grossProfit;
+      return {
+        fy_number: r.fy_number,
+        fy_start_ym: r.fy_start_ym,
+        fy_end_ym: r.fy_end_ym,
+        cumulative_through_ym: r.cumulative_through_ym,
+        months_in_cumulative: r.months_in_cumulative,
+        is_fy_completed: r.is_fy_completed,
+        sales_cum: sales,
+        cogs_cum: r.cogs_cum || 0,
+        gross_profit_cum: grossProfit,
+        sgae_cum: r.sgae_cum || 0,
+        operating_income_cum: operating,
+        ordinary_income_cum: ordinary,
+        personnel_cost_cum: personnel,
+        total_asset_average: assetAvg,
+        // 経営指標 (PDF 経営実績報告書準拠)
+        gross_profit_pct: sales > 0 ? +((grossProfit / sales) * 100).toFixed(2) : null,
+        ordinary_profit_pct: sales > 0 ? +((ordinary / sales) * 100).toFixed(2) : null,
+        marginal_profit_pct: sales > 0 ? +((marginalProfit / sales) * 100).toFixed(2) : null,
+        labor_distribution_pct: marginalProfit > 0 ? +((personnel / marginalProfit) * 100).toFixed(2) : null,
+        roa_pct: assetAvg > 0 ? +((ordinary / assetAvg) * 100).toFixed(2) : null,
+        marginal_profit_per_employee: HEADCOUNT > 0 ? Math.round(marginalProfit / HEADCOUNT) : null,
+        headcount: HEADCOUNT,
+      };
+    });
+    res.json({ ok: true, available: true, fy_summary: enriched, headcount: HEADCOUNT, meta });
+  } catch (e) {
+    console.error('[exec-dashboard] fy-summary error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ─── API: 詳細 (既存 5 タブ用、遅延ロード) ───
 router.get('/api/details', (req, res) => {
   try {

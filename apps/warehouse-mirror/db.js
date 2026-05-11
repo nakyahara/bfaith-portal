@@ -1040,6 +1040,48 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirror_mf_anomaly_severity ON mirror_mf_anomaly_signals(severity_rank DESC, detected_at DESC)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirror_mf_anomaly_signal_key ON mirror_mf_anomaly_signals(signal_key)');
 
+  // Phase 1d-2: 期 (FY) 累計 + 平均残高 mart
+  //   miniPC mart_mf_fy_summary と同形 (1 run につき 第N期 + 第N-1期 の 2 行)
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_mf_fy_summary (
+    run_id                   INTEGER NOT NULL REFERENCES mirror_mf_publish_runs(run_id) ON DELETE CASCADE,
+    fy_number                INTEGER NOT NULL,
+    fy_start_ym              TEXT NOT NULL,
+    fy_end_ym                TEXT NOT NULL,
+    cumulative_through_ym    TEXT NOT NULL,
+    months_in_cumulative     INTEGER NOT NULL,
+    is_fy_completed          INTEGER NOT NULL DEFAULT 0,
+    sales_cum                INTEGER NOT NULL DEFAULT 0,
+    cogs_cum                 INTEGER NOT NULL DEFAULT 0,
+    gross_profit_cum         INTEGER NOT NULL DEFAULT 0,
+    sgae_cum                 INTEGER NOT NULL DEFAULT 0,
+    operating_income_cum     INTEGER NOT NULL DEFAULT 0,
+    non_op_revenue_cum       INTEGER NOT NULL DEFAULT 0,
+    non_op_expense_cum       INTEGER NOT NULL DEFAULT 0,
+    ordinary_income_cum      INTEGER NOT NULL DEFAULT 0,
+    personnel_cost_cum       INTEGER NOT NULL DEFAULT 0,
+    ar_average               INTEGER NOT NULL DEFAULT 0,
+    inventory_average        INTEGER NOT NULL DEFAULT 0,
+    ap_average               INTEGER NOT NULL DEFAULT 0,
+    total_asset_average      INTEGER NOT NULL DEFAULT 0,
+    ar_opening               INTEGER NOT NULL DEFAULT 0,
+    ar_closing               INTEGER NOT NULL DEFAULT 0,
+    inventory_opening        INTEGER NOT NULL DEFAULT 0,
+    inventory_closing        INTEGER NOT NULL DEFAULT 0,
+    ap_opening               INTEGER NOT NULL DEFAULT 0,
+    ap_closing               INTEGER NOT NULL DEFAULT 0,
+    total_asset_opening      INTEGER NOT NULL DEFAULT 0,
+    total_asset_closing      INTEGER NOT NULL DEFAULT 0,
+    cash_closing             INTEGER NOT NULL DEFAULT 0,
+    short_loan_closing       INTEGER NOT NULL DEFAULT 0,
+    long_loan_closing        INTEGER NOT NULL DEFAULT 0,
+    current_liab_closing     INTEGER NOT NULL DEFAULT 0,
+    total_equity_closing     INTEGER NOT NULL DEFAULT 0,
+    source_row_hash          TEXT NOT NULL,
+    synced_at                TEXT NOT NULL,
+    PRIMARY KEY (run_id, fy_number)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mirror_mf_fy_summary_fy ON mirror_mf_fy_summary(fy_number DESC)');
+
   // mart_mf_* (Render local writable) — ack/snooze 等のユーザー操作
   db.exec(`CREATE TABLE IF NOT EXISTS mart_mf_anomaly_signal_state (
     signal_key     TEXT PRIMARY KEY,
@@ -1090,5 +1132,16 @@ function createTables() {
     FROM mirror_mf_anomaly_signals m
     LEFT JOIN mart_mf_anomaly_signal_state s ON s.signal_key = m.signal_key
     WHERE m.run_id = (SELECT MAX(run_id) FROM mirror_mf_publish_runs WHERE status = 'success' AND scope IN ('all','anomaly_signals'))`);
-  // ▲▲▲ MFクラウド会計ダッシュボード Phase 1a 終了 ▲▲▲
+  db.exec('DROP VIEW IF EXISTS v_mirror_mf_fy_summary_latest');
+  // Phase 1d-2 Codex review: empty run で latest が空に切り替わるのを防ぐため、
+  //   mirror_mf_fy_summary に実在する最新 success run を選ぶ (空 run は飛ばす)
+  db.exec(`CREATE VIEW v_mirror_mf_fy_summary_latest AS
+    SELECT m.* FROM mirror_mf_fy_summary m
+    WHERE m.run_id = (
+      SELECT MAX(fs.run_id)
+      FROM mirror_mf_fy_summary fs
+      JOIN mirror_mf_publish_runs r ON r.run_id = fs.run_id
+      WHERE r.status = 'success' AND r.scope IN ('all','fy_summary')
+    )`);
+  // ▲▲▲ MFクラウド会計ダッシュボード Phase 1a/1d-2 終了 ▲▲▲
 }
