@@ -19,9 +19,11 @@
  *   5. unresolved_sku_rate_pct     (warn 35% / error 50%、Codex R2 確定)
  *   6. whitelist_coverage_pct      (warn < 95% / error < 90%、Codex R2 確定)
  *
- * 当月閾値緩和 (Issue #83 楽天と同方針):
+ * 当月閾値緩和 (Issue #83 楽天と同方針 + Phase 1.2 Yahoo 拡張):
  *   - 当月: listing_diff warn 5% / error 15%
- *   - 前月以前: listing_diff warn 1% / error 5%
+ *   - 当月: whitelist_coverage warn 80% / error 70%
+ *     (5/10-11 等の最新日が status 未進行な間 false positive 防止)
+ *   - 前月以前: listing_diff warn 1% / error 5%、whitelist_coverage warn 95% / error 90%
  *
  * 設計参照:
  *   - 設計書 v0.4: g:/共有ドライブ/AI_reference/システム設計/Yahoo!Phase1a設計書_v0.4_20260510.md
@@ -77,6 +79,10 @@ const THRESHOLDS_PAST_MONTH = {
 const THRESHOLDS_CURRENT_MONTH = {
   ...THRESHOLDS_PAST_MONTH,
   listing_diff_pct: { warn: 5.0, error: 15.0 },
+  // 当月は最新 1-2 日の注文が status=5/pay=1/ship=3 (発送完了) に到達してないため
+  // whitelist 比率が自然に低くなる (5/10-11 で 39%/0%、月初は数日分の未発送が累積)
+  // 月締め後は 98%+ に戻る (4月実績 98.77%)
+  whitelist_coverage_pct: { warn: 80.0, error: 70.0 },
 };
 
 const isCurMonth = isCurrentMonth(monthStr);
