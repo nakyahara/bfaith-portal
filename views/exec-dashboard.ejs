@@ -342,6 +342,12 @@ function renderFySummary(rows, headcount, meta) {
     const v = d == null || !Number.isFinite(d) ? '—' : esc(Number(d).toFixed(1)) + '日';
     return '<div class="fy-metric"><div class="label">' + esc(label) + '</div><div class="value">' + v + '</div></div>';
   };
+  const monthsOnly = (label, d, warnThreshold) => {
+    const ok = d != null && Number.isFinite(d);
+    const v = ok ? esc(Number(d).toFixed(1)) + 'ヶ月' : '—';
+    const warn = ok && warnThreshold != null && d < warnThreshold;
+    return '<div class="fy-metric"><div class="label">' + esc(label) + '</div><div class="value"' + (warn ? ' style="color:#dc2626"' : '') + '>' + v + (warn ? ' ⚠' : '') + '</div></div>';
+  };
   const yenOnly = (label, val) => {
     return '<div class="fy-metric"><div class="label">' + esc(label) + '</div><div class="value">' + (val == null ? '—' : esc(fmtJpyShort(val))) + '</div></div>';
   };
@@ -368,7 +374,7 @@ function renderFySummary(rows, headcount, meta) {
       + m('営業利益累計', fy.operating_income_cum)
       + m('経常利益累計', fy.ordinary_income_cum, fy.ordinary_profit_pct)
       + '  </div>'
-      // 経営指標 KPI 9 個
+      // 経営指標 KPI
       + '  <div style="font-size:11px;color:#6b7280;margin:10px 0 4px;font-weight:600;border-top:1px solid #e5e7eb;padding-top:8px">📐 経営指標 KPI</div>'
       + '  <div class="fy-row">'
       + pctOnly('1. 限界利益率', fy.marginal_profit_pct)
@@ -380,7 +386,10 @@ function renderFySummary(rows, headcount, meta) {
       + pctOnly('7. ROA (経常÷平均総資産)', fy.roa_pct)
       + daysOnly('8. DSO 売上債権回転日数', fy.dso_days)
       + daysOnly('9. DPO 仕入債務回転日数', fy.dpo_days)
-      + daysOnly('(参考) 在庫回転日数', fy.inventory_turnover_days)
+      + daysOnly('在庫回転日数', fy.inventory_turnover_days)
+      + daysOnly('CCC (DSO+在庫回転−DPO)', fy.ccc_days)
+      + monthsOnly('💰 資金繰り残月数 (現預金÷月間固定費)', fy.cash_runway_months, 3)
+      + yenOnly('月間固定費 (販管費月平均)', fy.monthly_fixed_cost)
       + yenOnly('総資産 月平均', fy.total_asset_average)
       + '  </div>'
       + '</div>';
