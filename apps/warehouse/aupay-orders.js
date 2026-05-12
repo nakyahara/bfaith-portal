@@ -243,11 +243,12 @@ async function backfill(startYmdStr, endYmdStr) {
   const startD = new Date(`${startStr.slice(0,4)}-${startStr.slice(4,6)}-${startStr.slice(6,8)}`);
   const endD = new Date(`${endStr.slice(0,4)}-${endStr.slice(4,6)}-${endStr.slice(6,8)}`);
   let totalFetched = 0, totalInserted = 0, totalSkipped = 0;
-  let cur = new Date(endD);
-  while (cur >= startD) {
-    const monthEnd = new Date(cur);
-    const monthStart = new Date(cur.getFullYear(), cur.getMonth(), 1);
-    if (monthStart < startD) monthStart.setTime(startD.getTime());
+  // 月単位で endD の月から startD の月まで遡る。各月は「月初〜月末」(端の月は startD/endD でクランプ)
+  let curMonth = new Date(endD.getFullYear(), endD.getMonth(), 1);  // 対象月の 1 日
+  while (curMonth >= new Date(startD.getFullYear(), startD.getMonth(), 1)) {
+    const monthStart = curMonth < startD ? new Date(startD) : new Date(curMonth);
+    const monthLastDay = new Date(curMonth.getFullYear(), curMonth.getMonth() + 1, 0);  // その月の末日
+    const monthEnd = monthLastDay > endD ? new Date(endD) : monthLastDay;
     try {
       const { orders, totalAvailable } = await fetchOrdersInRange(ymd(monthStart), ymd(monthEnd));
       const { inserted, skippedInvalid } = insertOrders(db, orders);
@@ -262,7 +263,7 @@ async function backfill(startYmdStr, endYmdStr) {
       console.error('[auPay] 途中再開可能: sync_meta.aupay_backfill_progress 確認');
       break;
     }
-    cur = new Date(monthStart.getFullYear(), monthStart.getMonth() - 1, monthStart.getDate());
+    curMonth = new Date(curMonth.getFullYear(), curMonth.getMonth() - 1, 1);  // 前月の 1 日
     await sleep(2000);
   }
   console.log(`[auPay] バックフィル完了: ${totalFetched} 注文 / ${totalInserted} 明細`);
