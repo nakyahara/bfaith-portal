@@ -20,14 +20,40 @@ import { getMirrorDB } from '../warehouse-mirror/db.js';
 const router = Router();
 
 // ─── 期間 helper ───
-// period パラメータ: '6m' | '12m' (default) | '24m' | 'all'
+// period パラメータ: '6m' | '12m' (default) | '24m' | 'all' | 'fy:<N>' (第N期、Phase 1d-3c+)
 function periodToMonthsBack(period) {
   const map = { '6m': 6, '12m': 12, '24m': 24, 'all': 60 };
   return map[period] ?? 12;
 }
-// 最終確定月 (executive_top.current_month_ym) を base に monthsBack ヶ月遡る
-//   未確定月 (当月/前月) を除外して、確定済データだけ表示
-function getMonthList(monthsBack, db) {
+// period 文字列から表示対象の月リスト (YYYY-MM 配列、古い順) を返す。
+//   'Nm'/'all': 最終確定月 (executive_top.current_month_ym) を base に N ヶ月遡る
+//   'fy:<N>'  : 第N期 の fy_start_ym 〜 cumulative_through_ym (mart_mf_fy_summary より)
+function getMonthList(period, db) {
+  // fy:<N> モード
+  const fyMatch = /^fy:(\d+)$/.exec(String(period || ''));
+  if (fyMatch && db) {
+    try {
+      const fyNum = parseInt(fyMatch[1], 10);
+      const fy = db.prepare(`SELECT fy_start_ym, cumulative_through_ym FROM v_mirror_mf_fy_summary_latest WHERE fy_number = ?`).get(fyNum);
+      if (fy && fy.fy_start_ym && fy.cumulative_through_ym) {
+        const out = [];
+        let [y, m] = fy.fy_start_ym.split('-').map(Number);
+        const end = fy.cumulative_through_ym;
+        while (true) {
+          const ym = `${y}-${String(m).padStart(2, '0')}`;
+          out.push(ym);
+          if (ym >= end) break;
+          m++; if (m > 12) { m = 1; y++; }
+          if (out.length > 60) break;  // safety
+        }
+        if (out.length > 0) return out;
+      }
+    } catch (e) { /* mirror_mf_fy_summary 無し等 → fallback */ }
+    // fy モードだが取得失敗 → 12m 相当に fallback
+    period = '12m';
+  }
+  // 'Nm' / 'all' モード
+  const monthsBack = periodToMonthsBack(period);
   let baseY, baseM;  // base 月 (1-12)
   if (db) {
     const exec = db.prepare(`SELECT current_month_ym FROM v_mirror_mf_executive_top_latest`).get();
@@ -205,7 +231,7 @@ router.get('/api/timeseries', (req, res) => {
   try {
     const db = getMirrorDB();
     const period = req.query.period || '12m';
-    const months = getMonthList(periodToMonthsBack(period), db);
+    const months = getMonthList(period, db);
 
     // 1. 売上 vs 粗利 月次
     const placeholders = months.map(() => '?').join(',');
@@ -365,7 +391,7 @@ router.get('/api/trial-balance/pl', (req, res) => {
   try {
     const db = getMirrorDB();
     const period = req.query.period || '12m';
-    const months = getMonthList(periodToMonthsBack(period), db);
+    const months = getMonthList(period, db);
     const placeholders = months.map(() => '?').join(',');
 
     // PL 全 role_key × 月別
@@ -461,7 +487,7 @@ router.get('/api/trial-balance/bs', (req, res) => {
   try {
     const db = getMirrorDB();
     const period = req.query.period || '12m';
-    const months = getMonthList(periodToMonthsBack(period), db);
+    const months = getMonthList(period, db);
     const placeholders = months.map(() => '?').join(',');
 
     // mirror_mf_bs_monthly が利用可能か (Phase 1d-3b デプロイ済か) チェック
@@ -560,7 +586,39 @@ router.get('/api/trial-balance/bs', (req, res) => {
       });
     }
 
-    res.json({ ok: true, period, months, sections });
+    // Phase 1d-3c+: 最新確定月 (months の最後) の BS を大きい図解用に整形
+    //   資産の部 = 現預金/売上債権/棚卸資産/その他流動資産/有形固定資産/投資その他
+    //   負債純資産の部 = 仕入債務/(短期借入金等+その他流動負債)/固定負債/資本金/繰越剰余金/当期純利益
+    let latestBalance = null;
+    const latestYm = months.length > 0 ? months[months.length - 1] : null;
+    const latestRow = latestYm ? bsByMonth[latestYm] : null;
+    if (latestRow) {
+      latestBalance = {
+        month: latestYm,
+        assets: [
+          { label: '現預金', value: latestRow.cash_total || 0, color: '#0891b2' },
+          { label: '売上債権', value: latestRow.ar_total || 0, color: '#2563eb' },
+          { label: '棚卸資産', value: latestRow.inventory_total || 0, color: '#7c3aed' },
+          { label: 'その他流動資産', value: latestRow.other_current_asset || 0, color: '#a78bfa' },
+          { label: '有形固定資産', value: latestRow.tangible_fixed_asset || 0, color: '#475569' },
+          { label: '投資その他の資産', value: latestRow.investment_other || 0, color: '#94a3b8' },
+        ].filter(s => s.value !== 0),
+        liab_equity: [
+          { label: '仕入債務', value: latestRow.ap_total || 0, color: '#f59e0b' },
+          { label: '短期借入金等', value: latestRow.short_loan_total || 0, color: '#f97316' },
+          { label: 'その他流動負債', value: latestRow.other_current_liab || 0, color: '#fbbf24' },
+          { label: '固定負債(長期借入金等)', value: latestRow.fixed_liab_total || 0, color: '#dc2626' },
+          { label: '資本金', value: latestRow.capital || 0, color: '#059669' },
+          { label: '繰越利益剰余金', value: latestRow.retained_balance || 0, color: '#10b981' },
+          { label: '当期純利益(期中)', value: latestRow.current_period_profit || 0, color: '#34d399' },
+        ].filter(s => s.value !== 0),
+        total_asset: latestRow.total_asset || 0,
+        total_liab: latestRow.total_liab || 0,
+        net_assets: latestRow.display_total_equity || 0,
+      };
+    }
+
+    res.json({ ok: true, period, months, sections, latest_balance: latestBalance });
   } catch (e) {
     console.error('[exec-dashboard] trial-balance/bs error:', e.message);
     res.status(500).json({ ok: false, error: e.message });

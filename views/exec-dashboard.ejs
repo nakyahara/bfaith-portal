@@ -41,6 +41,12 @@
     .chart-card { background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
     .chart-card h3 { margin: 0 0 10px 0; font-size: 13px; color: #374151; font-weight: 600; }
     .chart-wrap { position: relative; height: 280px; }
+    /* Phase 1d-3c+: BS タブ内の大きい BS 図解 */
+    .big-bs-card { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; }
+    .big-bs-card h3 { margin: 0 0 8px 0; font-size: 14px; color: #1e3a8a; font-weight: 700; }
+    .big-bs-wrap { position: relative; height: 260px; }
+    /* FY 期ボタン (period-switcher 内) */
+    .period-switcher button.fy-period-btn { border-left: 1px solid #e5e7eb; margin-left: 2px; padding-left: 10px; }
 
     /* タブ */
     .tabs { display: flex; gap: 4px; margin-bottom: -1px; flex-wrap: wrap; }
@@ -223,15 +229,31 @@ let currentPeriod = '12m';
 const charts = {};
 let detailsLoaded = false;
 
-// ─── 期間切替 ───
-document.querySelectorAll('#period-switcher button').forEach(btn => {
-  btn.addEventListener('click', () => {
-    currentPeriod = btn.dataset.period;
-    document.querySelectorAll('#period-switcher button').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    loadAll();
-  });
+// ─── 期間切替 (FY ボタンは動的追加なのでイベント委譲) ───
+document.getElementById('period-switcher').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-period]');
+  if (!btn) return;
+  currentPeriod = btn.dataset.period;
+  document.querySelectorAll('#period-switcher button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  loadAll();
 });
+// Phase 1d-3c+: 第N期 ボタンを period-switcher に追加 (loadFySummary から呼ばれる)
+function renderFyPeriodButtons(fyRows) {
+  const sw = document.getElementById('period-switcher');
+  sw.querySelectorAll('.fy-period-btn').forEach(b => b.remove());
+  if (!fyRows || fyRows.length === 0) return;
+  // fy_number 降順 (新しい期が左)
+  const sorted = [...fyRows].sort((a, b) => b.fy_number - a.fy_number);
+  for (const fy of sorted) {
+    const b = document.createElement('button');
+    b.dataset.period = 'fy:' + fy.fy_number;
+    b.className = 'fy-period-btn';
+    b.textContent = '第' + fy.fy_number + '期';
+    if (currentPeriod === 'fy:' + fy.fy_number) b.classList.add('active');
+    sw.appendChild(b);
+  }
+}
 
 // ─── タブ切替 ───
 document.querySelectorAll('.tab-btn').forEach(btn => {
@@ -278,6 +300,7 @@ async function loadFySummary() {
     if (!j.ok) { el.textContent = ''; el.innerHTML = '<div class="empty">FY summary 取得エラー: ' + esc(j.error || '') + '</div>'; return; }
     if (!j.available) { el.textContent = ''; el.innerHTML = '<div class="empty">' + esc(j.message || '第N期 累計データなし') + '</div>'; return; }
     renderFySummary(j.fy_summary, j.headcount, j.meta);
+    renderFyPeriodButtons(j.fy_summary);  // Phase 1d-3c+: 上部に 第N期 ボタン追加
   } catch (e) {
     el.textContent = ''; el.innerHTML = '<div class="empty">FY summary 通信エラー: ' + esc(e.message) + '</div>';
   }
@@ -383,10 +406,53 @@ async function loadPl() {
 }
 
 async function loadBs() {
-  document.getElementById('tab-bs').innerHTML = '<div class="loading">読み込み中...</div>';
-  const j = await fetchJson('/apps/exec-dashboard/api/trial-balance/bs?period=' + currentPeriod);
-  if (!j.ok) { document.getElementById('tab-bs').innerHTML = '<div class="empty">エラー: ' + j.error + '</div>'; return; }
-  renderTrialBalance('tab-bs', j, 'bs');
+  const target = document.getElementById('tab-bs');
+  target.innerHTML = '<div class="loading">読み込み中...</div>';
+  destroyChart('bsBig');
+  let j;
+  try { j = await fetchJson('/apps/exec-dashboard/api/trial-balance/bs?period=' + currentPeriod); }
+  catch (e) { target.innerHTML = '<div class="empty">通信エラー: ' + esc(e.message) + '</div>'; return; }
+  if (!j.ok) { target.innerHTML = '<div class="empty">エラー: ' + esc(j.error || '') + '</div>'; return; }
+  // Phase 1d-3c+: 大きい BS 図解 (最新確定月、資産の部 vs 負債純資産の部 横棒) + 下に試算表
+  const lb = j.latest_balance;
+  target.innerHTML = ''
+    + (lb
+      ? '<div class="big-bs-card"><h3>📊 貸借対照表 ' + esc(lb.month) + ' 時点 (資産の部 ＝ 負債＋純資産の部)</h3>'
+        + '<div class="big-bs-wrap"><canvas id="chart-bs-big"></canvas></div></div>'
+      : '')
+    + '<div id="bs-table-area"></div>';
+  if (lb) renderBigBs(lb);
+  renderTrialBalance('bs-table-area', j, 'bs');
+}
+
+// Phase 1d-3c+: 最新 BS を横棒 2 本 (資産の部 / 負債純資産の部) で大きく描画
+function renderBigBs(lb) {
+  const canvas = document.getElementById('chart-bs-big');
+  if (!canvas) return;
+  destroyChart('bsBig');
+  const datasets = [];
+  (lb.assets || []).forEach(s => datasets.push({ label: s.label, data: [s.value, 0], backgroundColor: s.color, stack: 'x' }));
+  (lb.liab_equity || []).forEach(s => datasets.push({ label: s.label, data: [0, s.value], backgroundColor: s.color, stack: 'x' }));
+  charts.bsBig = new Chart(canvas.getContext('2d'), {
+    type: 'bar',
+    data: {
+      labels: [
+        '資産の部  (' + fmtJpyShort(lb.total_asset) + ')',
+        '負債＋純資産  (負債 ' + fmtJpyShort(lb.total_liab) + ' ＋ 純資産 ' + fmtJpyShort(lb.net_assets) + ')',
+      ],
+      datasets,
+    },
+    options: {
+      indexAxis: 'y',
+      responsive: true, maintainAspectRatio: false,
+      scales: { x: { stacked: true, ticks: { callback: v => fmtJpyShort(v) } }, y: { stacked: true } },
+      plugins: {
+        legend: { labels: { boxWidth: 12, font: { size: 11 } } },
+        tooltip: { callbacks: { label: (ctx) => ctx.dataset.label + ': ¥' + fmtJpyComma(ctx.parsed.x) } },
+        title: { display: true, text: '2 本が同じ長さ ＝ 貸借バランスが取れている (MF 試算表と完全一致)', font: { size: 11 }, color: '#6b7280' },
+      },
+    },
+  });
 }
 
 async function loadDetails() {
