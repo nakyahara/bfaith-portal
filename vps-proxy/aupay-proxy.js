@@ -39,7 +39,9 @@ const YAHOO_SIGNATURE_VERSION = process.env.YAHOO_SIGNATURE_VERSION || '4';
 const YAHOO_TOKEN_URL = 'https://auth.login.yahoo.co.jp/yconnect/v2/token';
 const YAHOO_API_BASE = 'https://circus.shopping.yahooapis.jp/ShoppingWebService/V1';
 const YAHOO_REDIRECT_URI = process.env.YAHOO_REDIRECT_URI || 'https://b-faith.biz';
-const TOKEN_FILE = path.join(__dirname, 'yahoo-tokens.json');
+// git pull deploy 時にトークンを repo ディレクトリ外に置けるよう env で上書き可能にする
+// (.env に YAHOO_TOKEN_FILE=/home/rocky/yahoo-tokens.json を設定推奨)
+const TOKEN_FILE = process.env.YAHOO_TOKEN_FILE || path.join(__dirname, 'yahoo-tokens.json');
 
 if (!PROXY_SECRET) { console.error('PROXY_SECRET is required'); process.exit(1); }
 
