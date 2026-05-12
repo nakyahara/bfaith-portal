@@ -447,7 +447,69 @@ router.get('/api/trial-balance/pl', (req, res) => {
       result.push({ name: sec.name, level: 0, is_subtotal: false, totals: monthTotals, items });
     }
 
-    res.json({ ok: true, period, months, sections: result });
+    // Phase 1d-3c++: PL 箱図 + アコーディオン用 (期間累計)
+    const sumK = (k) => months.reduce((s, m) => s + (byKey[k]?.[m] || 0), 0);
+    const periodSales = sumK('sales') + sumK('sales_export') + sumK('sales_wholesale') - sumK('sales_return');
+    const cogsKeys = ['inventory_opening', 'cogs_purchase', 'cogs_purchase_reduced', 'cogs_mall_fee', 'cogs_shipping', 'cogs_ad', 'cogs_packing', 'cogs_system'];
+    // cogs = (仕入系合計 + 期首棚卸) - 期末棚卸 - 仕入値引返品。mart の符号: inventory_opening は D で +、inventory_closing は C で - (= 既に負値)、cogs_purchase_return は C で - (= 既に負値) なので単純 SUM できるが、PL_SECTIONS の cogs items を流用して累計
+    const cogsSecTot = months.reduce((s, m) => s + (sectionTotals.cogs?.[m] || 0), 0);
+    const sgaeSecTot = months.reduce((s, m) => s + (sectionTotals.sgae?.[m] || 0), 0);
+    const nonOpRev = months.reduce((s, m) => s + (sectionTotals.non_op_revenue?.[m] || 0), 0);
+    const nonOpExp = months.reduce((s, m) => s + (sectionTotals.non_op_expense?.[m] || 0), 0);
+    const taxCorp = sumK('pl_tax_corporate');
+    const grossProfit = periodSales - cogsSecTot;
+    const operatingIncome = grossProfit - sgaeSecTot;
+    const ordinaryIncome = operatingIncome + nonOpRev - nonOpExp;
+    const netIncome = ordinaryIncome - taxCorp;
+    // 期間ラベル
+    const periodLabel = months.length ? months[0] + ' 〜 ' + months[months.length - 1] + ' (' + months.length + 'ヶ月累計)' : '';
+    const plBox = {
+      period_label: periodLabel,
+      sales: periodSales,
+      cogs: cogsSecTot,           // 売上原価 (変動費)
+      sgae: sgaeSecTot,           // 販管費 (固定費)
+      operating_income: operatingIncome,  // 利益 (= 売上 − 原価 − 経費)
+      gross_profit: grossProfit,
+      non_op_revenue: nonOpRev,
+      non_op_expense: nonOpExp,
+      ordinary_income: ordinaryIncome,
+      tax_corporate: taxCorp,
+      net_income: netIncome,
+      // 利益帯の waterfall (営業利益 → 経常 → 当期純利益)
+      profit_waterfall: [
+        { name: '営業利益', value: operatingIncome, sign: 1 },
+        { name: '営業外収益', value: nonOpRev, sign: 1 },
+        { name: '営業外費用', value: nonOpExp, sign: -1 },
+        { name: '経常利益', value: ordinaryIncome, sign: 1, subtotal: true },
+        { name: '法人税等', value: taxCorp, sign: -1 },
+        { name: '当期純利益', value: netIncome, sign: 1, subtotal: true },
+      ],
+    };
+    // アコーディオン用 ツリー (期間累計、各 PL_SECTIONS の items を累計値で)
+    const cumOf = (it) => sumK(it);
+    const plTree = [];
+    for (const sec of PL_SECTIONS) {
+      if (sec.computed) {
+        let v;
+        if (sec.key === 'gross_profit') v = grossProfit;
+        else if (sec.key === 'operating_income') v = operatingIncome;
+        else if (sec.key === 'ordinary_income') v = ordinaryIncome;
+        plTree.push({ name: sec.name, value: v, subtotal: true });
+        continue;
+      }
+      // 売上値引・返品 は byKey が gross (正値) なので表示は負値に。
+      // 仕入値引・返品 / 期末商品棚卸高 は mart 時点で既に C側=負値なのでそのまま (二重否定しない)
+      const items = sec.items
+        .map(it => ({ name: ROLE_DISPLAY[it] || it, value: it === 'sales_return' ? -cumOf(it) : cumOf(it) }))
+        .filter(i => i.value !== 0);
+      const v = months.reduce((s, m) => s + (sectionTotals[sec.key]?.[m] || 0), 0);
+      plTree.push({ name: sec.name, value: v, items });
+    }
+    // 法人税等 / 当期純利益 を末尾に追加
+    plTree.push({ name: '法人税等', value: taxCorp, items: [] });
+    plTree.push({ name: '当期純利益', value: netIncome, subtotal: true });
+
+    res.json({ ok: true, period, months, sections: result, pl_box: plBox, pl_tree: plTree });
   } catch (e) {
     console.error('[exec-dashboard] trial-balance/pl error:', e.message);
     res.status(500).json({ ok: false, error: e.message });
