@@ -301,7 +301,7 @@ ON CONFLICT (date_jst, aupay_sku_key) DO UPDATE SET
 
 -- ─── Step 4: デバイス別 / 決済手段別 fact ───
 -- 対象月の行を一度削除してから再 INSERT (これらは snapshot を持たないので clear-rebuild で OK)
-DELETE FROM f_aupay_sku_device_daily WHERE substr(date_jst, 1, 6) = (
+DELETE FROM f_aupay_sku_device_daily WHERE substr(date_jst, 1, 7) = (
   SELECT printf('%04d-%02d', :year_month_int / 100, :year_month_int % 100)
 );
 INSERT INTO f_aupay_sku_device_daily (date_jst, aupay_sku_key, device, ne_code, product_name, units_net_sold, sales_principal_jpy_incl, order_count, built_at)
@@ -316,7 +316,7 @@ SELECT
 FROM _silver_aupay_orders_v1 s
 GROUP BY s.date_jst, s.aupay_sku_key, s.site_and_device;
 
-DELETE FROM f_aupay_sku_settlement_daily WHERE substr(date_jst, 1, 6) = (
+DELETE FROM f_aupay_sku_settlement_daily WHERE substr(date_jst, 1, 7) = (
   SELECT printf('%04d-%02d', :year_month_int / 100, :year_month_int % 100)
 );
 INSERT INTO f_aupay_sku_settlement_daily (date_jst, aupay_sku_key, settlement_name, ne_code, product_name, units_net_sold, sales_principal_jpy_incl, order_count, built_at)
