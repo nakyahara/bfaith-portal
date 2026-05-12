@@ -586,68 +586,75 @@ router.get('/api/trial-balance/bs', (req, res) => {
       });
     }
 
-    // Phase 1d-3c+: 最新確定月 (months の最後) の BS を「5つの箱」図解用に整形
-    //   左列 (資産の部): 流動資産 box {現預金/売上債権/棚卸資産/その他流動資産} + 固定資産 box {有形固定資産/投資その他}
-    //   右列 (負債純資産の部): 流動負債 box {仕入債務/短期借入金等/その他流動負債} + 固定負債 box {長期借入金等} + 純資産 box {資本金/繰越剰余金/当期純利益(期中)}
+    // Phase 1d-3c++: 最新確定月 (months の最後) の BS を「5つの箱」図解 + アコーディオン用に整形
     let latestBalance = null;
     const latestYm = months.length > 0 ? months[months.length - 1] : null;
     const latestRow = latestYm ? bsByMonth[latestYm] : null;
     if (latestRow) {
-      const sub = (label, value, color) => ({ label, value: value || 0, color });
+      // section ('cash'/'ar'/...) の補助科目 (bs_subaccount の latestYm 行) を {name,value} 配列で
+      const subItemsOf = (...secKeys) => {
+        const out = [];
+        for (const r of subRows) {
+          if (r.month_ym !== latestYm) continue;
+          if (!secKeys.includes(r.section)) continue;
+          let name = r.account_name + (r.sub_account_name ? '／' + r.sub_account_name : '');
+          if (r.is_hub_null_sub) name = r.account_name + ' (未振替ハブ)';
+          out.push({ name, value: r.closing_balance_excl_tax || 0 });
+        }
+        out.sort((a, b) => Math.abs(b.value) - Math.abs(a.value));  // 大きい順
+        return out;
+      };
+      const acct = (name, value, secKeys) => ({ name, value: value || 0, items: secKeys ? subItemsOf(...secKeys) : [] });
+      // 5 色 (流動資産=ピンク / 固定資産=ブルー / 流動負債=オレンジ / 固定負債=イエロー / 純資産=グリーン)
+      const C = { ca: '#fde4ec', fa: '#e1efff', cl: '#fff0df', fl: '#fdf6dd', eq: '#e3f6e6' };
+      const CB = { ca: '#ec407a', fa: '#1e88e5', cl: '#f57c00', fl: '#cab800', eq: '#43a047' };
       latestBalance = {
         month: latestYm,
         total_asset: latestRow.total_asset || 0,
         total_liab: latestRow.total_liab || 0,
         net_assets: latestRow.display_total_equity || 0,
-        // 左列 = 資産の部 (上から: ①流動資産、②固定資産)
-        asset_boxes: [
-          {
-            key: 'current_asset', label: '①流動資産', note: '1年以内に現金化できる資産',
-            total: latestRow.current_asset_total || 0, color: '#fce4ec', border: '#f48fb1',
-            items: [
-              sub('現預金', latestRow.cash_total, '#f8bbd0'),
-              sub('売上債権 (売掛金等)', latestRow.ar_total, '#f48fb1'),
-              sub('棚卸資産 (商品)', latestRow.inventory_total, '#f06292'),
-              sub('その他流動資産', latestRow.other_current_asset, '#ec407a'),
-            ].filter(i => i.value !== 0),
-          },
-          {
-            key: 'fixed_asset', label: '②固定資産', note: '1年以内に現金化されない資産',
-            total: latestRow.fixed_asset_total || 0, color: '#e3f2fd', border: '#90caf9',
-            items: [
-              sub('有形固定資産', latestRow.tangible_fixed_asset, '#bbdefb'),
-              sub('投資その他の資産', latestRow.investment_other, '#90caf9'),
-            ].filter(i => i.value !== 0),
-          },
+        // 「5つの箱」図解 (上部、視覚的概観のみ — 細目は accordion で見る)
+        boxes: [
+          { side: 'asset', key: 'current_asset', label: '流動資産', note: '1年以内に現金化できる資産', total: latestRow.current_asset_total || 0, bg: C.ca, border: CB.ca },
+          { side: 'asset', key: 'fixed_asset',   label: '固定資産', note: '1年超 (設備・投資等)',        total: latestRow.fixed_asset_total || 0,   bg: C.fa, border: CB.fa },
+          { side: 'liab',  key: 'current_liab',  label: '流動負債', note: '1年以内に返済義務がある負債', total: latestRow.current_liab_total || 0,  bg: C.cl, border: CB.cl },
+          { side: 'liab',  key: 'fixed_liab',    label: '固定負債', note: '返済まで1年超の負債',          total: latestRow.fixed_liab_total || 0,    bg: C.fl, border: CB.fl },
+          { side: 'liab',  key: 'net_assets',    label: '純資産',   note: '返済義務がない (自己資本)',    total: latestRow.display_total_equity || 0,bg: C.eq, border: CB.eq },
         ],
-        // 右列 = 負債・純資産の部 (上から: ①流動負債、②固定負債、純資産)
-        liab_equity_boxes: [
-          {
-            key: 'current_liab', label: '①流動負債', note: '1年以内に返済義務がある負債',
-            total: latestRow.current_liab_total || 0, color: '#fff3e0', border: '#ffcc80',
-            items: [
-              sub('仕入債務 (買掛金)', latestRow.ap_total, '#ffe0b2'),
-              sub('短期借入金等', latestRow.short_loan_total, '#ffcc80'),
-              sub('その他流動負債 (未払金/未払消費税等)', latestRow.other_current_liab, '#ffb74d'),
-            ].filter(i => i.value !== 0),
-          },
-          {
-            key: 'fixed_liab', label: '②固定負債', note: '返済までの期間が1年を超える負債',
-            total: latestRow.fixed_liab_total || 0, color: '#fffde7', border: '#fff176',
-            items: [
-              sub('長期借入金等', latestRow.fixed_liab_total, '#fff59d'),
-            ].filter(i => i.value !== 0),
-          },
-          {
-            key: 'net_assets', label: '純資産', note: '返済義務がない資産 (自己資本)',
-            total: latestRow.display_total_equity || 0, color: '#e8f5e9', border: '#a5d6a7',
-            items: [
-              sub('資本金', latestRow.capital, '#c8e6c9'),
-              sub('繰越利益剰余金 (前期末)', latestRow.retained_balance, '#a5d6a7'),
-              sub('当期純利益 (期中累計)', latestRow.current_period_profit, '#81c784'),
-            ].filter(i => i.value !== 0),
-          },
+        // アコーディオン用 階層ツリー (一般的な BS 配列)
+        tree: [
+          { name: '資産の部', value: latestRow.total_asset || 0, kind: 'group', sections: [
+              { name: '流動資産', value: latestRow.current_asset_total || 0, bg: C.ca, border: CB.ca, accounts: [
+                  acct('現預金', latestRow.cash_total, ['cash']),
+                  acct('売上債権 (売掛金 − 貸倒引当金)', latestRow.ar_total, ['ar']),
+                  acct('棚卸資産 (商品)', latestRow.inventory_total, ['inventory']),
+                  acct('その他流動資産 (仮払金/前払費用/未収入金等)', latestRow.other_current_asset, ['other_current_asset']),
+              ].filter(a => a.value !== 0 || a.items.length) },
+              { name: '固定資産', value: latestRow.fixed_asset_total || 0, bg: C.fa, border: CB.fa, accounts: [
+                  acct('有形固定資産 (機械装置/工具器具備品/車両等)', latestRow.tangible_fixed_asset, ['tangible_fixed_asset']),
+                  acct('投資その他の資産 (敷金/差入保証金/長期前払費用/関係会社株式等)', latestRow.investment_other, ['investment_other']),
+              ].filter(a => a.value !== 0 || a.items.length) },
+          ]},
+          { name: '負債の部', value: latestRow.total_liab || 0, kind: 'group', sections: [
+              { name: '流動負債', value: latestRow.current_liab_total || 0, bg: C.cl, border: CB.cl, accounts: [
+                  acct('仕入債務 (買掛金)', latestRow.ap_total, ['ap']),
+                  acct('短期借入金 (1年以内返済長期借入金 等)', latestRow.short_loan_total, ['short_loan']),
+                  acct('その他流動負債 (未払金/未払費用/未払消費税/未払法人税等/預り金/仮受金等)', latestRow.other_current_liab, ['other_current_liab']),
+              ].filter(a => a.value !== 0 || a.items.length) },
+              { name: '固定負債', value: latestRow.fixed_liab_total || 0, bg: C.fl, border: CB.fl, accounts: [
+                  acct('長期借入金 (1年超返済)', latestRow.long_loan_total, ['long_loan']),
+                  acct('その他固定負債 (長期未払金/役員借入金等)', latestRow.other_fixed_liab, ['other_fixed_liab']),
+              ].filter(a => a.value !== 0 || a.items.length) },
+          ]},
+          { name: '純資産の部', value: latestRow.display_total_equity || 0, kind: 'group', sections: [
+              { name: '純資産', value: latestRow.display_total_equity || 0, bg: C.eq, border: CB.eq, accounts: [
+                  acct('資本金', latestRow.capital, null),
+                  acct('繰越利益剰余金 (前期末まで)', latestRow.retained_balance, null),
+                  acct('当期純利益 (期中累計)', latestRow.current_period_profit, null),
+              ].filter(a => a.value !== 0) },
+          ]},
         ],
+        bottom_total: { name: '負債・純資産の部 合計', value: (latestRow.total_liab || 0) + (latestRow.display_total_equity || 0) },
       };
     }
 
