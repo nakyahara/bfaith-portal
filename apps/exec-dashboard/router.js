@@ -371,7 +371,35 @@ router.get('/api/trial-balance/pl', (req, res) => {
   }
 });
 
-// ─── API: BS 試算表形式 (Phase 1c、現預金中心) ───
+// ─── API: BS 試算表形式 (Phase 1d-3b、全 BS section + 細目) ───
+//   mirror_mf_bs_monthly (section合計) + mirror_mf_bs_subaccount_monthly (細目) から組み立て。
+//   bs_monthly が空 (Phase 1d-3b デプロイ前の旧 sync) の場合は現預金のみの Phase 1c 形式に fallback。
+// VIEW/テーブル未デプロイ (mirror_mf_bs_monthly 等が無い) のみ fallback 対象。それ以外の SQL エラーは握り潰さない。
+function isMissingMirrorTable(e) {
+  const m = String(e && e.message || e || "");
+  return /no such table|no such view/i.test(m);
+}
+const BS_TABLE_LAYOUT = [
+  // [表示名, 種別, bs_monthly列 or null, section群 (細目), is_subtotal]
+  { name: '現金及び預金', col: 'cash_total', secs: ['cash'] },
+  { name: '売上債権 (売掛金等、貸倒引当金控除後)', col: 'ar_total', secs: ['ar'] },
+  { name: '棚卸資産 (商品)', col: 'inventory_total', secs: ['inventory'] },
+  { name: 'その他流動資産', col: 'other_current_asset', secs: ['other_current_asset'] },
+  { name: '流動資産合計', col: 'current_asset_total', subtotal: true },
+  { name: '有形固定資産', col: 'tangible_fixed_asset', secs: ['tangible_fixed_asset'] },
+  { name: '投資その他の資産', col: 'investment_other', secs: ['investment_other'] },
+  { name: '固定資産合計', col: 'fixed_asset_total', subtotal: true },
+  { name: '資産の部合計', col: 'total_asset', subtotal: true },
+  { name: '仕入債務 (買掛金)', col: 'ap_total', secs: ['ap'] },
+  { name: 'その他流動負債 (短期借入金/未払金/未払消費税/預り金等)', col: null, customCols: ['short_loan_total', 'other_current_liab'], secs: ['short_loan', 'other_current_liab'] },
+  { name: '流動負債合計', col: 'current_liab_total', subtotal: true },
+  { name: '固定負債 (長期借入金/長期未払金/役員借入金等)', col: 'fixed_liab_total', secs: ['long_loan', 'other_fixed_liab'] },
+  { name: '負債の部合計', col: 'total_liab', subtotal: true },
+  { name: '資本金', col: 'capital' },
+  { name: '繰越利益剰余金 (前期末)', col: 'retained_balance' },
+  { name: '当期純利益 (期中累計)', col: 'current_period_profit' },
+  { name: '純資産の部合計', col: 'display_total_equity', subtotal: true },
+];
 router.get('/api/trial-balance/bs', (req, res) => {
   try {
     const db = getMirrorDB();
@@ -379,36 +407,103 @@ router.get('/api/trial-balance/bs', (req, res) => {
     const months = getMonthList(periodToMonthsBack(period), db);
     const placeholders = months.map(() => '?').join(',');
 
-    // 現金及び預金の口座別月末残高
-    const cashAccounts = ['普通預金', '当座預金', '現金', '小口現金', '普通預金_PayPal', '普通預金_ペイオニア', '定期預金'];
-    const rows = db.prepare(`
-      SELECT month_ym, account_name, sub_account_name, closing_balance_excl_tax
-      FROM v_mirror_mf_balance_snapshot_monthly_latest
-      WHERE month_ym IN (${placeholders}) AND account_name IN (${cashAccounts.map(()=>'?').join(',')})
-    `).all(...months, ...cashAccounts);
-
-    // (account_name+sub_account_name, month) → balance
-    const byAcc = {};
-    const accSet = new Set();
-    for (const r of rows) {
-      const label = r.account_name + (r.sub_account_name ? '/' + r.sub_account_name : '');
-      accSet.add(label);
-      if (!byAcc[label]) byAcc[label] = {};
-      byAcc[label][r.month_ym] = r.closing_balance_excl_tax;
+    // mirror_mf_bs_monthly が利用可能か (Phase 1d-3b デプロイ済か) チェック
+    let bsMonthlyRows = [];
+    try {
+      bsMonthlyRows = db.prepare(`
+        SELECT * FROM v_mirror_mf_bs_monthly_latest WHERE month_ym IN (${placeholders})
+      `).all(...months);
+    } catch (e) {
+      if (!isMissingMirrorTable(e)) throw e;  // 未デプロイ (no such table/view) 以外の SQL エラーは握り潰さない
+      bsMonthlyRows = [];
     }
-    const accs = [...accSet].sort();
-    const items = accs.map(a => ({
-      name: a,
-      totals: months.map(m => byAcc[a]?.[m] || 0),
-    }));
-    const totals = months.map(m => items.reduce((s, it, i) => s + (it.totals[i] || 0), 0));
 
-    res.json({
-      ok: true, period, months,
-      sections: [
-        { name: '現金及び預金合計', level: 0, is_subtotal: false, totals, items },
-      ],
-    });
+    if (bsMonthlyRows.length === 0) {
+      // fallback: Phase 1c 形式 (現預金のみ、balance_snapshot 経由)
+      const cashAccounts = ['普通預金', '当座預金', '現金', '小口現金', '普通預金_PayPal', '普通預金_ペイオニア', '定期預金'];
+      const rows = db.prepare(`
+        SELECT month_ym, account_name, sub_account_name, closing_balance_excl_tax
+        FROM v_mirror_mf_balance_snapshot_monthly_latest
+        WHERE month_ym IN (${placeholders}) AND account_name IN (${cashAccounts.map(()=>'?').join(',')})
+      `).all(...months, ...cashAccounts);
+      const byAcc = {}; const accSet = new Set();
+      for (const r of rows) {
+        const label = r.account_name + (r.sub_account_name ? '/' + r.sub_account_name : '');
+        accSet.add(label);
+        if (!byAcc[label]) byAcc[label] = {};
+        byAcc[label][r.month_ym] = r.closing_balance_excl_tax;
+      }
+      const accs = [...accSet].sort();
+      const items = accs.map(a => ({ name: a, totals: months.map(m => byAcc[a]?.[m] || 0) }));
+      const totals = months.map(m => items.reduce((s, it, i) => s + (it.totals[i] || 0), 0));
+      return res.json({ ok: true, period, months, fallback: true,
+        sections: [{ name: '現金及び預金合計', level: 0, is_subtotal: false, totals, items }] });
+    }
+
+    // bs_monthly を month → row でindex
+    const bsByMonth = {};
+    for (const r of bsMonthlyRows) bsByMonth[r.month_ym] = r;
+
+    // bs_subaccount (細目) を section群 → label → month → value
+    let subRows = [];
+    try {
+      subRows = db.prepare(`
+        SELECT month_ym, account_name, sub_account_name, section, closing_balance_excl_tax, is_hub_null_sub
+        FROM v_mirror_mf_bs_subaccount_monthly_latest WHERE month_ym IN (${placeholders})
+      `).all(...months);
+    } catch (e) {
+      if (!isMissingMirrorTable(e)) throw e;
+      subRows = [];
+    }
+    // section → label → {month: value}
+    const subBySection = {};
+    for (const r of subRows) {
+      const sec = r.section;
+      if (!subBySection[sec]) subBySection[sec] = {};
+      // 補助科目なし振替ハブは「未振替」と注記
+      let label = r.account_name + (r.sub_account_name ? '/' + r.sub_account_name : '');
+      if (r.is_hub_null_sub) label = r.account_name + ' (未振替ハブ)';
+      if (!subBySection[sec][label]) subBySection[sec][label] = {};
+      subBySection[sec][label][r.month_ym] = (subBySection[sec][label][r.month_ym] || 0) + r.closing_balance_excl_tax;
+    }
+
+    const sections = [];
+    for (const layout of BS_TABLE_LAYOUT) {
+      // section 行の monthly totals
+      const totals = months.map(m => {
+        const row = bsByMonth[m];
+        if (!row) return 0;
+        if (layout.customCols) return layout.customCols.reduce((s, c) => s + (row[c] || 0), 0);
+        return row[layout.col] || 0;
+      });
+      // 細目 (section群を横断、label でユニーク化。label に空白を含むので Map-of-Maps で保持)
+      let items = [];
+      if (layout.secs) {
+        const seen = new Set();
+        const pairs = [];
+        for (const sec of layout.secs) {
+          for (const label of Object.keys(subBySection[sec] || {})) {
+            if (seen.has(label)) continue;
+            seen.add(label);
+            pairs.push({ sec, label });
+          }
+        }
+        pairs.sort((a, b) => String(a.label).localeCompare(String(b.label), "ja"));
+        items = pairs.map(p => ({
+          name: p.label,
+          totals: months.map(mm => (subBySection[p.sec][p.label] && subBySection[p.sec][p.label][mm]) || 0),
+        }));
+      }
+      sections.push({
+        name: layout.name,
+        level: 0,
+        is_subtotal: !!layout.subtotal,
+        totals,
+        items: layout.subtotal ? undefined : items,
+      });
+    }
+
+    res.json({ ok: true, period, months, sections });
   } catch (e) {
     console.error('[exec-dashboard] trial-balance/bs error:', e.message);
     res.status(500).json({ ok: false, error: e.message });
