@@ -1,0 +1,6 @@
+{
+  "_comment": "au PAY マーケット 成約手数料率 (store_id ごと、effective_date 降順で該当 rate を採用)。決済手数料コミコミプランなので決済手数料は別途引かない。Phase B で請求明細から実額 verify 予定、現状は暫定 13%。build-aupay-daily-fact.js が読む。",
+  "b-faith01": [
+    { "effective_date": "2020-01-01", "rate": 0.13, "note": "暫定 13% (決済手数料コミコミプラン込み)。Phase B で実額確定" }
+  ]
+}
