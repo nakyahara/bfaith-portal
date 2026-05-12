@@ -1,0 +1,6 @@
+{
+  "name": "vps-proxy",
+  "private": true,
+  "type": "commonjs",
+  "description": "VPS proxy (au PAY + Yahoo Shopping). CommonJS — bfaith-portal root の type:module を上書き"
+}

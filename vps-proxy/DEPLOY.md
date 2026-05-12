@@ -19,10 +19,11 @@
 VPS の `/home/rocky/bfaith-portal/` に bfaith-portal を **sparse-checkout** (`vps-proxy/` のみ取得)。
 systemd は `/home/rocky/bfaith-portal/vps-proxy/aupay-proxy.js` を実行。
 
-- VPS の GitHub 認証: read-only deploy key (`~/.ssh/id_ed25519_github_deploy`、`~/.ssh/config` で `github.com-bfaith` host)
+- VPS の GitHub 認証: read-only deploy key (`~/.ssh/id_ed25519_github_deploy`、`~/.ssh/config` で `github.com-bfaith` host、`IdentitiesOnly yes` + `StrictHostKeyChecking yes`)
 - token / 公開鍵は repo ディレクトリ外に置く (git pull で消えない):
   - `.env` に `YAHOO_TOKEN_FILE=/home/rocky/yahoo-tokens.json` + `YAHOO_PUBLIC_KEY_PATH=/home/rocky/yahoo-public-key.pem`
 - `.env` / `yahoo-tokens.json` は `chmod 600`、`~/.ssh/` は `700`
+- **`vps-proxy/package.json` で `"type": "commonjs"` を宣言** — bfaith-portal repo root の `package.json` は `"type": "module"` (ESM) なので、これがないと `aupay-proxy.js` (CommonJS、`require()` 使用) が ESM 扱いされて `ReferenceError: require is not defined` で起動失敗する
 
 ## 変更フロー (regression 防止、必ずこの順)
 
