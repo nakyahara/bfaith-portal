@@ -41,28 +41,45 @@
     .chart-card { background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
     .chart-card h3 { margin: 0 0 10px 0; font-size: 13px; color: #374151; font-weight: 600; }
     .chart-wrap { position: relative; height: 280px; }
-    /* Phase 1d-3c+: BS タブ内の大きい BS 図解 */
-    /* Phase 1d-3c+: 「5つの箱」貸借対照表 図解 */
-    .big-bs-card { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 14px 16px; margin-bottom: 16px; }
-    .big-bs-card h3 { margin: 0 0 10px 0; font-size: 14px; color: #1e3a8a; font-weight: 700; }
-    .bsbox-grid { display: flex; gap: 8px; align-items: stretch; }
+    /* Phase 1d-3c++: 「5つの箱」BS 概観 + アコーディオン式 BS */
+    .big-bs-card, .bsacc-card { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px 18px; margin-bottom: 16px; }
+    .big-bs-card h3, .bsacc-card h3 { margin: 0 0 12px 0; font-size: 15px; color: #1e3a8a; font-weight: 700; }
+    .bsbox-grid { display: flex; gap: 10px; align-items: stretch; }
     .bsbox-col { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-    .bsbox-colhead { font-size: 12px; text-align: center; padding: 4px 0 6px; color: #374151; }
-    .bsbox-colhead strong { font-size: 14px; color: #111; }
-    .bsbox-stack { display: flex; flex-direction: column; height: 420px; border: 1px solid #d1d5db; border-radius: 4px; overflow: hidden; }
-    .bsbox { flex-grow: 1; flex-basis: 0; min-height: 38px; border-bottom: 2px solid #ccc; padding: 6px 12px; overflow: hidden; display: flex; flex-direction: column; justify-content: center; }
+    .bsbox-colhead { font-size: 13px; text-align: center; padding: 4px 0 8px; color: #374151; }
+    .bsbox-colhead strong { font-size: 16px; color: #111; }
+    .bsbox-colhead .sub { font-weight: 400; color: #6b7280; font-size: 12px; }
+    .bsbox-stack { display: flex; flex-direction: column; height: 380px; border: 1px solid #d1d5db; border-radius: 6px; overflow: hidden; }
+    .bsbox { flex-grow: 1; flex-basis: 0; min-height: 52px; border-bottom: 1px solid rgba(0,0,0,0.12); border-left: 5px solid #ccc; padding: 8px 14px; overflow: hidden; display: flex; flex-direction: column; justify-content: center; }
     .bsbox:last-child { border-bottom: none; }
-    .bsbox-head { display: flex; justify-content: space-between; align-items: baseline; }
-    .bsbox-label { font-size: 13px; font-weight: 700; color: #1f2937; }
-    .bsbox-amt { font-size: 13px; font-weight: 700; color: #111; font-variant-numeric: tabular-nums; }
-    .bsbox-note { font-size: 10px; color: #6b7280; margin-top: 1px; }
-    .bsbox-items { font-size: 10px; color: #4b5563; margin-top: 3px; line-height: 1.4; }
+    .bsbox-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+    .bsbox-label { font-size: 16px; font-weight: 700; color: #1f2937; }
+    .bsbox-amt { font-size: 16px; font-weight: 700; color: #111; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .bsbox-note { font-size: 11px; color: #6b7280; margin-top: 2px; }
+    /* アコーディオン式 BS */
+    .bsacc-group { margin-bottom: 12px; }
+    .bsacc-group-head { display: flex; justify-content: space-between; font-size: 16px; font-weight: 700; color: #111; padding: 8px 10px; background: #eef2ff; border-radius: 4px; }
+    .bsacc-section { border-left: 5px solid #ccc; margin: 6px 0 6px 8px; }
+    .bsacc-section-head { display: flex; justify-content: space-between; font-size: 14px; font-weight: 700; color: #1f2937; padding: 6px 12px; }
+    .bsacc-acct { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: 14px; color: #374151; padding: 6px 12px 6px 30px; border-bottom: 1px solid #f3f4f6; }
+    .bsacc-acct[data-toggle] { cursor: pointer; }
+    .bsacc-acct[data-toggle]:hover { background: #f9fafb; }
+    .bsacc-tri { font-size: 10px; color: #6b7280; width: 14px; flex-shrink: 0; }
+    .bsacc-name { flex: 1; }
+    .bsacc-amt { font-variant-numeric: tabular-nums; white-space: nowrap; font-weight: 600; color: #111; }
+    .bsacc-subpanel { background: #fafafa; }
+    .bsacc-item { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; color: #6b7280; padding: 4px 12px 4px 50px; border-bottom: 1px dashed #eee; }
+    .bsacc-bottom { display: flex; justify-content: space-between; font-size: 16px; font-weight: 700; color: #111; padding: 10px; background: #f0f9ff; border-radius: 4px; border-top: 2px solid #bae6fd; margin-top: 8px; }
+    .bs-trend-details { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px 14px; margin-bottom: 8px; }
+    .bs-trend-details > summary { font-weight: 600; cursor: pointer; padding: 4px 0; color: #374151; }
     /* FY 期ボタン (period-switcher 内) */
     .period-switcher button.fy-period-btn { border-left: 1px solid #e5e7eb; margin-left: 2px; padding-left: 10px; }
     @media (max-width: 768px) {
-      .bsbox-stack { height: 340px; }
-      .bsbox { padding: 4px 8px; min-height: 32px; }
-      .bsbox-items { display: none; }
+      .bsbox-grid { flex-direction: column; }
+      .bsbox-stack { height: auto; }
+      .bsbox { min-height: 48px; }
+      .bsacc-acct { padding-left: 20px; } .bsacc-item { padding-left: 36px; }
+      .bsbox-label, .bsbox-amt, .bsacc-group-head, .bsacc-bottom { font-size: 14px; }
     }
 
     /* タブ */
@@ -438,42 +455,75 @@ async function loadBs() {
   try { j = await fetchJson('/apps/exec-dashboard/api/trial-balance/bs?period=' + currentPeriod); }
   catch (e) { target.innerHTML = '<div class="empty">通信エラー: ' + esc(e.message) + '</div>'; return; }
   if (!j.ok) { target.innerHTML = '<div class="empty">エラー: ' + esc(j.error || '') + '</div>'; return; }
-  // Phase 1d-3c+: 「5つの箱」BS 図解 (最新確定月) を上部に + 下に試算表
   const lb = j.latest_balance;
-  target.innerHTML = (lb ? renderBsBoxDiagramHtml(lb) : '') + '<div id="bs-table-area"></div>';
+  // 上: 「5つの箱」概観 → 中: アコーディオン式 貸借対照表 (科目→補助科目) → 下: 月次推移 (折りたたみ)
+  target.innerHTML = (lb ? (renderBsBoxDiagramHtml(lb) + renderBsAccordionHtml(lb)) : '')
+    + '<details class="bs-trend-details"><summary>📅 月次推移 (試算表形式) を見る</summary><div id="bs-table-area"></div></details>';
   renderTrialBalance('bs-table-area', j, 'bs');
+  // アコーディオン: 科目 (▶/▼) クリックで補助科目を開閉
+  document.querySelectorAll('#tab-bs .bsacc-acct[data-toggle]').forEach(row => {
+    row.addEventListener('click', () => {
+      const id = row.getAttribute('data-toggle');
+      const panel = document.getElementById(id);
+      if (!panel) return;
+      const open = panel.style.display !== 'none';
+      panel.style.display = open ? 'none' : '';
+      const tri = row.querySelector('.bsacc-tri');
+      if (tri) tri.textContent = open ? '▶' : '▼';
+    });
+  });
 }
 
-// Phase 1d-3c+: 「5つの箱」貸借対照表 図解 (純 HTML/CSS、高さ ∝ 金額)
+// 「5つの箱」貸借対照表 図解 (純 HTML/CSS、高さ ∝ 金額) — 概観のみ、細目はアコーディオンで
 function renderBsBoxDiagramHtml(lb) {
   const fmtBox = (v) => '¥' + fmtJpyComma(v);
-  // 各 box: { label, note, total, color, border, items:[{label,value,color}] }
-  // 高さ ∝ total。flex-grow に金額をそのまま入れる (両列とも合計同じなので比率が揃う)
-  const boxHtml = (b) => {
-    const itemsHtml = (b.items && b.items.length)
-      ? '<div class="bsbox-items">' + b.items.map(it => esc(it.label) + ' ' + fmtBox(it.value)).join(' ／ ') + '</div>'
-      : '';
-    return '<div class="bsbox" style="flex-grow:' + Math.max(1, b.total) + ';background:' + b.color + ';border-color:' + b.border + '">'
-      + '<div class="bsbox-head"><span class="bsbox-label">' + esc(b.label) + '</span><span class="bsbox-amt">' + fmtBox(b.total) + '</span></div>'
-      + '<div class="bsbox-note">' + esc(b.note || '') + '</div>'
-      + itemsHtml
-      + '</div>';
-  };
-  const leftCol = (lb.asset_boxes || []).map(boxHtml).join('');
-  const rightCol = (lb.liab_equity_boxes || []).map(boxHtml).join('');
+  const sideBoxes = (side) => (lb.boxes || []).filter(b => b.side === side);
+  const boxHtml = (b) => ''
+    + '<div class="bsbox" style="flex-grow:' + Math.max(1, b.total) + ';background:' + b.bg + ';border-left-color:' + b.border + '">'
+    + '<div class="bsbox-head"><span class="bsbox-label">' + esc(b.label) + '</span><span class="bsbox-amt">' + fmtBox(b.total) + '</span></div>'
+    + '<div class="bsbox-note">' + esc(b.note || '') + '</div>'
+    + '</div>';
+  const leftCol = sideBoxes('asset').map(boxHtml).join('');
+  const rightCol = sideBoxes('liab').map(boxHtml).join('');
   return ''
     + '<div class="big-bs-card">'
-    + '  <h3>📊 貸借対照表 ' + esc(lb.month) + ' 時点 (5つの箱) — 左列 ＝ 右列 で釣り合い</h3>'
+    + '  <h3>📊 貸借対照表 ' + esc(lb.month) + ' 時点 — 左列 ＝ 右列 で釣り合い</h3>'
     + '  <div class="bsbox-grid">'
-    + '    <div class="bsbox-col">'
-    + '      <div class="bsbox-colhead">資産の部 &nbsp;<strong>' + fmtBox(lb.total_asset) + '</strong></div>'
-    + '      <div class="bsbox-stack">' + leftCol + '</div>'
-    + '    </div>'
-    + '    <div class="bsbox-col">'
-    + '      <div class="bsbox-colhead">負債・純資産の部 &nbsp;<strong>' + fmtBox(lb.total_liab + lb.net_assets) + '</strong> <span style="font-weight:400;color:#6b7280">(負債 ' + fmtBox(lb.total_liab) + ' ＋ 純資産 ' + fmtBox(lb.net_assets) + ')</span></div>'
-    + '      <div class="bsbox-stack">' + rightCol + '</div>'
-    + '    </div>'
+    + '    <div class="bsbox-col"><div class="bsbox-colhead">資産の部 &nbsp;<strong>' + fmtBox(lb.total_asset) + '</strong></div><div class="bsbox-stack">' + leftCol + '</div></div>'
+    + '    <div class="bsbox-col"><div class="bsbox-colhead">負債・純資産の部 &nbsp;<strong>' + fmtBox(lb.total_liab + lb.net_assets) + '</strong> <span class="sub">(負債 ' + fmtBox(lb.total_liab) + ' ＋ 純資産 ' + fmtBox(lb.net_assets) + ')</span></div><div class="bsbox-stack">' + rightCol + '</div></div>'
     + '  </div>'
+    + '</div>';
+}
+
+// アコーディオン式 貸借対照表 (部 → 流動/固定 → 科目 ▶ → 補助科目)
+function renderBsAccordionHtml(lb) {
+  const fmtAmt = (v) => '¥' + fmtJpyComma(v);
+  let panelSeq = 0;
+  const acctRow = (a) => {
+    const hasItems = a.items && a.items.length > 0;
+    if (!hasItems) {
+      return '<div class="bsacc-acct"><span class="bsacc-tri" style="visibility:hidden">▶</span><span class="bsacc-name">' + esc(a.name) + '</span><span class="bsacc-amt">' + fmtAmt(a.value) + '</span></div>';
+    }
+    const pid = 'bsacc-p' + (++panelSeq);
+    const sub = a.items.map(it => '<div class="bsacc-item"><span class="bsacc-name">' + esc(it.name) + '</span><span class="bsacc-amt">' + fmtAmt(it.value) + '</span></div>').join('');
+    return '<div class="bsacc-acct" data-toggle="' + pid + '"><span class="bsacc-tri">▶</span><span class="bsacc-name">' + esc(a.name) + '</span><span class="bsacc-amt">' + fmtAmt(a.value) + '</span></div>'
+      + '<div class="bsacc-subpanel" id="' + pid + '" style="display:none">' + sub + '</div>';
+  };
+  const sectionBlock = (s) => ''
+    + '<div class="bsacc-section" style="border-left-color:' + (s.border || '#ccc') + '">'
+    + '  <div class="bsacc-section-head" style="background:' + (s.bg || '#f3f4f6') + '"><span class="bsacc-name">' + esc(s.name) + '</span><span class="bsacc-amt">' + fmtAmt(s.value) + '</span></div>'
+    + '  ' + (s.accounts || []).map(acctRow).join('')
+    + '</div>';
+  const groupBlock = (g) => ''
+    + '<div class="bsacc-group">'
+    + '  <div class="bsacc-group-head"><span class="bsacc-name">' + esc(g.name) + '</span><span class="bsacc-amt">' + fmtAmt(g.value) + '</span></div>'
+    + '  ' + (g.sections || []).map(sectionBlock).join('')
+    + '</div>';
+  return ''
+    + '<div class="bsacc-card">'
+    + '  <h3>📋 貸借対照表 (科目別) — 科目をクリックで補助科目を表示</h3>'
+    + '  ' + (lb.tree || []).map(groupBlock).join('')
+    + '  <div class="bsacc-bottom"><span class="bsacc-name">' + esc((lb.bottom_total && lb.bottom_total.name) || '負債・純資産の部 合計') + '</span><span class="bsacc-amt">' + fmtAmt((lb.bottom_total && lb.bottom_total.value) || 0) + '</span></div>'
     + '</div>';
 }
 
