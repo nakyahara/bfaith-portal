@@ -230,6 +230,7 @@ router.get('/api/timeseries', (req, res) => {
       return {
         month: m,
         sales,
+        cogs: r.cogs || 0,
         gross_profit: gp,
         operating_income: gp - (r.sgae || 0),
         ordinary_income: gp - (r.sgae || 0) + (r.non_op_rev || 0) - (r.non_op_exp || 0),
@@ -305,15 +306,20 @@ router.get('/api/timeseries', (req, res) => {
       `).all(...months);
       const bsByM = {};
       for (const r of bsRows) bsByM[r.month_ym] = r;
+      const cogsByM = Object.fromEntries(months.map(m => [m, (plByMonth[m]?.cogs) || 0]));
       bsTrend = months.map(m => {
         const r = bsByM[m];
         if (!r) return { month: m, empty: true };
+        const inv = r.inventory_total || 0;
+        const monthCogs = cogsByM[m] || 0;
+        // 在庫回転日数 (月次): 棚卸資産 / 1日あたり売上原価 (その月の cogs ÷ 30.4)
+        const invDays = monthCogs > 0 ? +((inv / (monthCogs / 30.4))).toFixed(1) : null;
         return {
           month: m,
           // 資産側 (積み上げ): 現預金 / 売上債権 / 棚卸資産 / その他流動資産 / 固定資産
           a_cash: r.cash_total || 0,
           a_ar: r.ar_total || 0,
-          a_inventory: r.inventory_total || 0,
+          a_inventory: inv,
           a_other_current: r.other_current_asset || 0,
           a_fixed: r.fixed_asset_total || 0,
           // 負債純資産側 (積み上げ): 仕入債務 / 短期借入金等 / その他流動負債 / 固定負債 / 純資産
@@ -326,6 +332,10 @@ router.get('/api/timeseries', (req, res) => {
           total_asset: r.total_asset || 0,
           net_assets: r.display_total_equity || 0,
           total_borrowings: (r.short_loan_total || 0) + (r.long_loan_total || 0),
+          // 在庫回転 (月次)
+          inventory: inv,
+          month_cogs: monthCogs,
+          inventory_turnover_days: invDays,
         };
       });
     } catch (e) {
@@ -591,39 +601,73 @@ router.get('/api/fy-summary', (req, res) => {
       cumulative_through_ym: freshestRow.cumulative_through_ym,
       synced_at: freshestRow.synced_at || null,
     };
-    // 各 FY に経営指標を追加
+    // 各 FY に経営指標を追加 (Phase 1d-3c: KPI 9 個 + 回転日数)
     const enriched = rows.map(r => {
       const sales = r.sales_cum || 0;
+      const cogs = r.cogs_cum || 0;
       const grossProfit = r.gross_profit_cum || 0;
       const operating = r.operating_income_cum || 0;
       const ordinary = r.ordinary_income_cum || 0;
       const personnel = r.personnel_cost_cum || 0;
       const assetAvg = r.total_asset_average || 0;
+      const arAvg = r.ar_average || 0;
+      const apAvg = r.ap_average || 0;
+      const invAvg = r.inventory_average || 0;
+      const cashClosing = r.cash_closing || 0;
+      const arClosing = r.ar_closing || 0;
+      const totalAssetClosing = r.total_asset_closing || 0;
+      const currentLiabClosing = r.current_liab_closing || 0;
+      const equityClosing = r.total_equity_closing || 0;
+      const months = r.months_in_cumulative || 0;
       // 限界利益 = 粗利 (B-Faith 戦略: 原価=変動費)
       const marginalProfit = grossProfit;
+      // 期間日数 (近似: 月数 × 30.4)。回転日数計算の分母用
+      const periodDays = months > 0 ? months * 30.4 : 365;
+      const round2 = (v) => (v == null || !isFinite(v)) ? null : +Number(v).toFixed(2);
       return {
         fy_number: r.fy_number,
         fy_start_ym: r.fy_start_ym,
         fy_end_ym: r.fy_end_ym,
         cumulative_through_ym: r.cumulative_through_ym,
-        months_in_cumulative: r.months_in_cumulative,
+        months_in_cumulative: months,
         is_fy_completed: r.is_fy_completed,
         sales_cum: sales,
-        cogs_cum: r.cogs_cum || 0,
+        cogs_cum: cogs,
         gross_profit_cum: grossProfit,
         sgae_cum: r.sgae_cum || 0,
         operating_income_cum: operating,
         ordinary_income_cum: ordinary,
         personnel_cost_cum: personnel,
         total_asset_average: assetAvg,
-        // 経営指標 (PDF 経営実績報告書準拠)
-        gross_profit_pct: sales > 0 ? +((grossProfit / sales) * 100).toFixed(2) : null,
-        ordinary_profit_pct: sales > 0 ? +((ordinary / sales) * 100).toFixed(2) : null,
-        marginal_profit_pct: sales > 0 ? +((marginalProfit / sales) * 100).toFixed(2) : null,
-        labor_distribution_pct: marginalProfit > 0 ? +((personnel / marginalProfit) * 100).toFixed(2) : null,
-        roa_pct: assetAvg > 0 ? +((ordinary / assetAvg) * 100).toFixed(2) : null,
+        ar_average: arAvg, ap_average: apAvg, inventory_average: invAvg,
+        cash_closing: cashClosing, ar_closing: arClosing,
+        total_asset_closing: totalAssetClosing, current_liab_closing: currentLiabClosing,
+        total_equity_closing: equityClosing,
+        // ─── 経営指標 KPI 9 個 (PDF 経営実績報告書準拠) ───
+        // 1. 限界利益率 (= 粗利率、原価=変動費)
+        marginal_profit_pct: round2(sales > 0 ? marginalProfit / sales * 100 : null),
+        // 2. 労働分配率 (= 人件費 / 限界利益)
+        labor_distribution_pct: round2(marginalProfit > 0 ? personnel / marginalProfit * 100 : null),
+        // 3. 1人当たり限界利益
         marginal_profit_per_employee: HEADCOUNT > 0 ? Math.round(marginalProfit / HEADCOUNT) : null,
+        // 4. 売上高経常利益率
+        ordinary_profit_pct: round2(sales > 0 ? ordinary / sales * 100 : null),
+        // 5. 当座比率 (= 当座資産(現預金+売上債権) / 流動負債) ※受取手形・有価証券は B-Faith 無し
+        quick_ratio_pct: round2(currentLiabClosing > 0 ? (cashClosing + arClosing) / currentLiabClosing * 100 : null),
+        // 6. 自己資本比率 (= 純資産 / 総資産)
+        equity_ratio_pct: round2(totalAssetClosing > 0 ? equityClosing / totalAssetClosing * 100 : null),
+        // 7. ROA (= 経常利益 / 平均総資産)
+        roa_pct: round2(assetAvg > 0 ? ordinary / assetAvg * 100 : null),
+        // 8. DSO 売上債権回転日数 (= 平均売上債権 / 1日あたり売上)
+        dso_days: round2(sales > 0 ? arAvg / (sales / periodDays) : null),
+        // 9. DPO 仕入債務回転日数 (= 平均仕入債務 / 1日あたり売上原価)
+        dpo_days: round2(cogs > 0 ? apAvg / (cogs / periodDays) : null),
+        // (おまけ) 在庫回転日数 (= 平均棚卸資産 / 1日あたり売上原価)
+        inventory_turnover_days: round2(cogs > 0 ? invAvg / (cogs / periodDays) : null),
+        // 粗利率 (参考、限界利益率と同値)
+        gross_profit_pct: round2(sales > 0 ? grossProfit / sales * 100 : null),
         headcount: HEADCOUNT,
+        period_days_used: Math.round(periodDays),
       };
     });
     res.json({ ok: true, available: true, fy_summary: enriched, headcount: HEADCOUNT, meta });

@@ -163,10 +163,11 @@
       <div class="chart-card"><h3>💼 PL 主要 (売上/粗利/営業利益/経常利益)</h3><div class="chart-wrap"><canvas id="chart-pl"></canvas></div></div>
     </div>
 
-    <!-- Phase 1d-3c: BS グラフ (資産=負債+純資産 + 財務体質推移) -->
+    <!-- Phase 1d-3c: BS グラフ (資産=負債+純資産 + 財務体質推移 + 在庫回転) -->
     <div id="bs-charts-card" class="charts-grid">
       <div class="chart-card"><h3>🏦 貸借対照表 構成 (各月: 左=資産 / 右=負債+純資産)</h3><div class="chart-wrap"><canvas id="chart-bs-balance"></canvas></div></div>
       <div class="chart-card"><h3>📊 財務体質推移 (総資産 / 純資産 / 借入金合計)</h3><div class="chart-wrap"><canvas id="chart-bs-trend"></canvas></div></div>
+      <div class="chart-card"><h3>📦 在庫回転 (棚卸資産 + 回転日数)</h3><div class="chart-wrap"><canvas id="chart-inv-turnover"></canvas></div></div>
     </div>
 
     <div class="tabs">
@@ -294,7 +295,11 @@ function renderFySummary(rows, headcount, meta) {
     return '<div class="fy-metric"><div class="label">' + esc(label) + '</div><div class="value">' + (val == null ? '—' : esc(fmtJpyShort(val))) + pctHtml + '</div></div>';
   };
   const pctOnly = (label, pct) => {
-    const v = pct == null || !Number.isFinite(pct) ? '—' : esc(pct.toFixed(2)) + '%';
+    const v = pct == null || !Number.isFinite(pct) ? '—' : esc(Number(pct).toFixed(2)) + '%';
+    return '<div class="fy-metric"><div class="label">' + esc(label) + '</div><div class="value">' + v + '</div></div>';
+  };
+  const daysOnly = (label, d) => {
+    const v = d == null || !Number.isFinite(d) ? '—' : esc(Number(d).toFixed(1)) + '日';
     return '<div class="fy-metric"><div class="label">' + esc(label) + '</div><div class="value">' + v + '</div></div>';
   };
   const yenOnly = (label, val) => {
@@ -316,14 +321,26 @@ function renderFySummary(rows, headcount, meta) {
       + '    </div>'
       + '    <span class="fy-status ' + statusClass + '">' + statusLabel + '</span>'
       + '  </div>'
+      // 累計 PL
       + '  <div class="fy-row">'
       + m('売上累計', fy.sales_cum)
       + m('粗利累計 (限界利益)', fy.gross_profit_cum, fy.marginal_profit_pct)
       + m('営業利益累計', fy.operating_income_cum)
       + m('経常利益累計', fy.ordinary_income_cum, fy.ordinary_profit_pct)
-      + pctOnly('労働分配率', fy.labor_distribution_pct)
-      + pctOnly('ROA (経常÷平均総資産)', fy.roa_pct)
-      + yenOnly('1人当たり限界利益 (' + esc(String(headcount)) + '名)', fy.marginal_profit_per_employee)
+      + '  </div>'
+      // 経営指標 KPI 9 個
+      + '  <div style="font-size:11px;color:#6b7280;margin:10px 0 4px;font-weight:600;border-top:1px solid #e5e7eb;padding-top:8px">📐 経営指標 KPI</div>'
+      + '  <div class="fy-row">'
+      + pctOnly('1. 限界利益率', fy.marginal_profit_pct)
+      + pctOnly('2. 労働分配率', fy.labor_distribution_pct)
+      + yenOnly('3. 1人当たり限界利益 (' + esc(String(headcount)) + '名)', fy.marginal_profit_per_employee)
+      + pctOnly('4. 売上高経常利益率', fy.ordinary_profit_pct)
+      + pctOnly('5. 当座比率 (当座資産÷流動負債)', fy.quick_ratio_pct)
+      + pctOnly('6. 自己資本比率 (純資産÷総資産)', fy.equity_ratio_pct)
+      + pctOnly('7. ROA (経常÷平均総資産)', fy.roa_pct)
+      + daysOnly('8. DSO 売上債権回転日数', fy.dso_days)
+      + daysOnly('9. DPO 仕入債務回転日数', fy.dpo_days)
+      + daysOnly('(参考) 在庫回転日数', fy.inventory_turnover_days)
       + yenOnly('総資産 月平均', fy.total_asset_average)
       + '  </div>'
       + '</div>';
@@ -509,12 +526,12 @@ function renderCharts(j) {
     },
   });
 
-  // 5+6. BS グラフ (Phase 1d-3c) — bs_trend が空 (mirror 未デプロイ等) の場合はカード非表示
+  // 5+6+7. BS グラフ (Phase 1d-3c) — bs_trend が空 (mirror 未デプロイ等) の場合はカード非表示
   const bsCard = document.getElementById('bs-charts-card');
   const bsTrend = (j.bs_trend || []).filter(r => !r.empty);
   if (bsTrend.length === 0) {
     if (bsCard) bsCard.style.display = 'none';
-    destroyChart('bsBalance'); destroyChart('bsTrend');
+    destroyChart('bsBalance'); destroyChart('bsTrend'); destroyChart('invTurnover');
   } else {
     if (bsCard) bsCard.style.display = '';
     const bsLabels = bsTrend.map(r => r.month);
@@ -569,6 +586,27 @@ function renderCharts(j) {
         responsive: true, maintainAspectRatio: false,
         scales: { y: { ticks: { callback: v => fmtJpyShort(v) } } },
         plugins: { tooltip: { callbacks: { label: (ctx) => ctx.dataset.label + ': ¥' + fmtJpyComma(ctx.parsed.y) } } },
+      },
+    });
+
+    // 7. 在庫回転 (棒=棚卸資産月末残高 + 折れ線=在庫回転日数)
+    destroyChart('invTurnover');
+    charts.invTurnover = new Chart(document.getElementById('chart-inv-turnover').getContext('2d'), {
+      type: 'bar',
+      data: {
+        labels: bsLabels,
+        datasets: [
+          { type: 'bar', label: '棚卸資産 (月末)', data: bsTrend.map(r => r.inventory || 0), backgroundColor: '#7c3aed', yAxisID: 'y' },
+          { type: 'line', label: '在庫回転日数', data: bsTrend.map(r => r.inventory_turnover_days), borderColor: '#dc2626', backgroundColor: 'transparent', yAxisID: 'y1', tension: 0.2 },
+        ],
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        scales: {
+          y: { position: 'left', ticks: { callback: v => fmtJpyShort(v) } },
+          y1: { position: 'right', ticks: { callback: v => v + '日' }, grid: { drawOnChartArea: false } },
+        },
+        plugins: { tooltip: { callbacks: { label: (ctx) => ctx.dataset.label + ': ' + (ctx.dataset.yAxisID === 'y1' ? (ctx.parsed.y == null ? '—' : ctx.parsed.y + '日') : '¥' + fmtJpyComma(ctx.parsed.y)) } } },
       },
     });
   }
