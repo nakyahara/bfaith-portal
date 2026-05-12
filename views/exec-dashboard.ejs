@@ -163,6 +163,12 @@
       <div class="chart-card"><h3>💼 PL 主要 (売上/粗利/営業利益/経常利益)</h3><div class="chart-wrap"><canvas id="chart-pl"></canvas></div></div>
     </div>
 
+    <!-- Phase 1d-3c: BS グラフ (資産=負債+純資産 + 財務体質推移) -->
+    <div id="bs-charts-card" class="charts-grid">
+      <div class="chart-card"><h3>🏦 貸借対照表 構成 (各月: 左=資産 / 右=負債+純資産)</h3><div class="chart-wrap"><canvas id="chart-bs-balance"></canvas></div></div>
+      <div class="chart-card"><h3>📊 財務体質推移 (総資産 / 純資産 / 借入金合計)</h3><div class="chart-wrap"><canvas id="chart-bs-trend"></canvas></div></div>
+    </div>
+
     <div class="tabs">
       <button class="tab-btn active" data-tab="pl">📋 PL 試算表</button>
       <button class="tab-btn" data-tab="bs">🏦 BS 試算表 (貸借対照表)</button>
@@ -502,6 +508,70 @@ function renderCharts(j) {
       plugins: { tooltip: { callbacks: { label: (ctx) => ctx.dataset.label + ': ¥' + fmtJpyComma(ctx.parsed.y) } } },
     },
   });
+
+  // 5+6. BS グラフ (Phase 1d-3c) — bs_trend が空 (mirror 未デプロイ等) の場合はカード非表示
+  const bsCard = document.getElementById('bs-charts-card');
+  const bsTrend = (j.bs_trend || []).filter(r => !r.empty);
+  if (bsTrend.length === 0) {
+    if (bsCard) bsCard.style.display = 'none';
+    destroyChart('bsBalance'); destroyChart('bsTrend');
+  } else {
+    if (bsCard) bsCard.style.display = '';
+    const bsLabels = bsTrend.map(r => r.month);
+
+    // 5. 資産 = 負債+純資産 積み上げ棒 (2 stack/月)
+    destroyChart('bsBalance');
+    const assetSegs = [
+      { key: 'a_cash', label: '現預金', color: '#0891b2' },
+      { key: 'a_ar', label: '売上債権', color: '#2563eb' },
+      { key: 'a_inventory', label: '棚卸資産', color: '#7c3aed' },
+      { key: 'a_other_current', label: 'その他流動資産', color: '#a78bfa' },
+      { key: 'a_fixed', label: '固定資産', color: '#64748b' },
+    ];
+    const liabSegs = [
+      { key: 'l_ap', label: '仕入債務', color: '#f59e0b' },
+      { key: 'l_short_loan', label: '短期借入金等', color: '#f97316' },
+      { key: 'l_other_current', label: 'その他流動負債', color: '#fbbf24' },
+      { key: 'l_fixed', label: '固定負債(長期借入金等)', color: '#dc2626' },
+      { key: 'l_equity', label: '純資産', color: '#10b981' },
+    ];
+    const bsBalDatasets = [
+      ...assetSegs.map(s => ({ label: '資産:' + s.label, data: bsTrend.map(r => r[s.key] || 0), backgroundColor: s.color, stack: 'asset' })),
+      ...liabSegs.map(s => ({ label: '負債純資産:' + s.label, data: bsTrend.map(r => r[s.key] || 0), backgroundColor: s.color, stack: 'liab' })),
+    ];
+    charts.bsBalance = new Chart(document.getElementById('chart-bs-balance').getContext('2d'), {
+      type: 'bar',
+      data: { labels: bsLabels, datasets: bsBalDatasets },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        scales: { x: { stacked: true }, y: { stacked: true, ticks: { callback: v => fmtJpyShort(v) } } },
+        plugins: {
+          legend: { labels: { boxWidth: 10, font: { size: 10 } } },
+          tooltip: { callbacks: { label: (ctx) => ctx.dataset.label + ': ¥' + fmtJpyComma(ctx.parsed.y) } },
+          title: { display: true, text: '各月: 左=資産構成 / 右=資金調達構成 (同じ高さ=BSが釣り合い)', font: { size: 10 }, color: '#6b7280' },
+        },
+      },
+    });
+
+    // 6. 財務体質推移 (折れ線): 総資産 / 純資産 / 借入金合計
+    destroyChart('bsTrend');
+    charts.bsTrend = new Chart(document.getElementById('chart-bs-trend').getContext('2d'), {
+      type: 'line',
+      data: {
+        labels: bsLabels,
+        datasets: [
+          { label: '総資産', data: bsTrend.map(r => r.total_asset), borderColor: '#64748b', backgroundColor: 'transparent', tension: 0.2 },
+          { label: '純資産', data: bsTrend.map(r => r.net_assets), borderColor: '#10b981', backgroundColor: 'transparent', tension: 0.2 },
+          { label: '借入金合計', data: bsTrend.map(r => r.total_borrowings), borderColor: '#dc2626', backgroundColor: 'transparent', tension: 0.2 },
+        ],
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        scales: { y: { ticks: { callback: v => fmtJpyShort(v) } } },
+        plugins: { tooltip: { callbacks: { label: (ctx) => ctx.dataset.label + ': ¥' + fmtJpyComma(ctx.parsed.y) } } },
+      },
+    });
+  }
 }
 
 // ─── render: 試算表 ───

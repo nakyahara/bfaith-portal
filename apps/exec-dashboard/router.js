@@ -290,12 +290,59 @@ router.get('/api/timeseries', (req, res) => {
       return obj;
     });
 
+    // 4. BS 推移 (Phase 1d-3c): 資産=負債+純資産 積み上げ棒 + 折れ線用
+    //    mirror_mf_bs_monthly が未デプロイの場合は空配列 (UI 側でグラフ非表示)
+    let bsTrend = [];
+    try {
+      const bsRows = db.prepare(`
+        SELECT month_ym,
+          cash_total, ar_total, inventory_total, other_current_asset,
+          tangible_fixed_asset, investment_other, fixed_asset_total, total_asset,
+          ap_total, short_loan_total, other_current_liab, current_liab_total,
+          long_loan_total, other_fixed_liab, fixed_liab_total, total_liab,
+          capital, retained_balance, current_period_profit, display_total_equity
+        FROM v_mirror_mf_bs_monthly_latest WHERE month_ym IN (${placeholders})
+      `).all(...months);
+      const bsByM = {};
+      for (const r of bsRows) bsByM[r.month_ym] = r;
+      bsTrend = months.map(m => {
+        const r = bsByM[m];
+        if (!r) return { month: m, empty: true };
+        return {
+          month: m,
+          // 資産側 (積み上げ): 現預金 / 売上債権 / 棚卸資産 / その他流動資産 / 固定資産
+          a_cash: r.cash_total || 0,
+          a_ar: r.ar_total || 0,
+          a_inventory: r.inventory_total || 0,
+          a_other_current: r.other_current_asset || 0,
+          a_fixed: r.fixed_asset_total || 0,
+          // 負債純資産側 (積み上げ): 仕入債務 / 短期借入金等 / その他流動負債 / 固定負債 / 純資産
+          l_ap: r.ap_total || 0,
+          l_short_loan: r.short_loan_total || 0,
+          l_other_current: r.other_current_liab || 0,
+          l_fixed: r.fixed_liab_total || 0,
+          l_equity: r.display_total_equity || 0,
+          // 折れ線用 サマリ
+          total_asset: r.total_asset || 0,
+          net_assets: r.display_total_equity || 0,
+          total_borrowings: (r.short_loan_total || 0) + (r.long_loan_total || 0),
+        };
+      });
+    } catch (e) {
+      // mirror_mf_bs_monthly が無い (Phase 1d-3b デプロイ前) → 空のまま
+      if (!/no such table|no such view/i.test(String(e && e.message || e))) {
+        console.warn('[exec-dashboard] timeseries bs_trend error (非致命):', e.message);
+      }
+      bsTrend = [];
+    }
+
     res.json({
       ok: true, period, months,
       sales_vs_gross: salesVsGross,
       cash_trend: cashTrend,
       channel_trend: channelTrend,
       channels,
+      bs_trend: bsTrend,
     });
   } catch (e) {
     console.error('[exec-dashboard] timeseries error:', e.message);
