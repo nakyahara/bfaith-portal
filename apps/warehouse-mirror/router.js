@@ -516,6 +516,60 @@ function getYahooFinanceInsert(db) {
   return b.yahooFinanceInsert;
 }
 
+function getAupayFinanceInsert(db) {
+  const b = getStmtBundle(db);
+  if (!b.aupayFinanceInsert) {
+    b.aupayFinanceInsert = db.prepare(`
+      INSERT OR REPLACE INTO mirror_aupay_finance_sku_daily (
+        date_jst, aupay_sku_key, ne_code, variant_key, resolution_method,
+        unresolved_sku_flag, product_name,
+        units_ordered, units_cancelled, units_net_sold,
+        sales_principal_jpy_incl, postage_allocated_jpy_incl, gross_sales_jpy_incl,
+        net_sales_after_coupon_jpy_incl, request_price_jpy_incl,
+        coupon_shop_jpy_incl,
+        gift_point_jpy_incl, use_ponta_point_jpy_incl, use_au_point_jpy_incl,
+        premium_member_point_jpy_incl, point_cost_pending_jpy_incl,
+        tax_normal_sales_jpy_incl, tax_reduced_sales_jpy_incl, tax_free_sales_jpy_incl,
+        mall_fee_jpy_incl, mall_fee_rate_applied, mall_fee_calc_method, mall_fee_estimate_delta_jpy,
+        shipping_cost_jpy_incl, shipping_quality,
+        unit_cost_snapshot_incl, cost_snapshot_date_jst,
+        latest_unit_cost_reference_incl, cogs_amount_jpy_incl,
+        variable_margin_partial_jpy_incl, variable_margin_full_jpy_incl,
+        refund_adjusted_net_sales_jpy_incl, margin_confidence, margin_full_finalized_at,
+        before_discount_jpy_incl, detail_discount_jpy_incl, charge_allocated_jpy_incl,
+        item_option_jpy_incl, gift_wrapping_jpy_incl,
+        cost_status, is_cost_complete, data_quality_score, price_variance_warning,
+        order_count, line_count,
+        source_layer_summary, source_row_count, built_at,
+        source_run_id, source_row_hash, synced_at
+      ) VALUES (
+        @date_jst, @aupay_sku_key, @ne_code, @variant_key, @resolution_method,
+        @unresolved_sku_flag, @product_name,
+        @units_ordered, @units_cancelled, @units_net_sold,
+        @sales_principal_jpy_incl, @postage_allocated_jpy_incl, @gross_sales_jpy_incl,
+        @net_sales_after_coupon_jpy_incl, @request_price_jpy_incl,
+        @coupon_shop_jpy_incl,
+        @gift_point_jpy_incl, @use_ponta_point_jpy_incl, @use_au_point_jpy_incl,
+        @premium_member_point_jpy_incl, @point_cost_pending_jpy_incl,
+        @tax_normal_sales_jpy_incl, @tax_reduced_sales_jpy_incl, @tax_free_sales_jpy_incl,
+        @mall_fee_jpy_incl, @mall_fee_rate_applied, @mall_fee_calc_method, @mall_fee_estimate_delta_jpy,
+        @shipping_cost_jpy_incl, @shipping_quality,
+        @unit_cost_snapshot_incl, @cost_snapshot_date_jst,
+        @latest_unit_cost_reference_incl, @cogs_amount_jpy_incl,
+        @variable_margin_partial_jpy_incl, @variable_margin_full_jpy_incl,
+        @refund_adjusted_net_sales_jpy_incl, @margin_confidence, @margin_full_finalized_at,
+        @before_discount_jpy_incl, @detail_discount_jpy_incl, @charge_allocated_jpy_incl,
+        @item_option_jpy_incl, @gift_wrapping_jpy_incl,
+        @cost_status, @is_cost_complete, @data_quality_score, @price_variance_warning,
+        @order_count, @line_count,
+        @source_layer_summary, @source_row_count, @built_at,
+        @source_run_id, @source_row_hash, @synced_at
+      )
+    `);
+  }
+  return b.aupayFinanceInsert;
+}
+
 function getLedgerInsert(db) {
   const b = getStmtBundle(db);
   if (!b.ledgerInsert) {
@@ -651,6 +705,14 @@ const ENTITY_REGISTRY = {
     clear_meta_key: 'clear_yahoo_finance_dates',
     getInsertStmt: getYahooFinanceInsert,
     normalizeRow: (r) => normalizeYahooFinanceRow(r),
+  },
+  aupay_finance_sku_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_aupay_finance_sku_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_aupay_finance_dates',
+    getInsertStmt: getAupayFinanceInsert,
+    normalizeRow: (r) => normalizeAupayFinanceRow(r),
   },
 
   // ─── MF Phase 1a (Codex 5ラウンド確定設計) ─────────────────────────
@@ -1048,6 +1110,66 @@ function normalizeYahooFinanceRow(r) {
     is_cost_complete: r.is_cost_complete ?? 0,
     data_quality_score: r.data_quality_score ?? 0,
     price_variance_warning: r.price_variance_warning ?? 0,
+    source_layer_summary: r.source_layer_summary || '',
+    source_row_count: r.source_row_count ?? 0,
+    built_at: r.built_at || new Date().toISOString(),
+    source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,
+    synced_at: r.synced_at,
+  };
+}
+
+// row 列正規化 (mirror_aupay_finance_sku_daily 用、au PAY Phase 1 A-2)
+function normalizeAupayFinanceRow(r) {
+  return {
+    date_jst: r.date_jst, aupay_sku_key: r.aupay_sku_key,
+    ne_code: r.ne_code ?? null,
+    variant_key: r.variant_key ?? '',
+    resolution_method: r.resolution_method,
+    unresolved_sku_flag: r.unresolved_sku_flag ?? 0,
+    product_name: r.product_name || '',
+    units_ordered: r.units_ordered ?? 0,
+    units_cancelled: r.units_cancelled ?? 0,
+    units_net_sold: r.units_net_sold ?? 0,
+    sales_principal_jpy_incl: r.sales_principal_jpy_incl ?? 0,
+    postage_allocated_jpy_incl: r.postage_allocated_jpy_incl ?? 0,
+    gross_sales_jpy_incl: r.gross_sales_jpy_incl ?? 0,
+    net_sales_after_coupon_jpy_incl: r.net_sales_after_coupon_jpy_incl ?? 0,
+    request_price_jpy_incl: r.request_price_jpy_incl ?? 0,
+    coupon_shop_jpy_incl: r.coupon_shop_jpy_incl ?? 0,
+    gift_point_jpy_incl: r.gift_point_jpy_incl ?? 0,
+    use_ponta_point_jpy_incl: r.use_ponta_point_jpy_incl ?? 0,
+    use_au_point_jpy_incl: r.use_au_point_jpy_incl ?? 0,
+    premium_member_point_jpy_incl: r.premium_member_point_jpy_incl ?? 0,
+    point_cost_pending_jpy_incl: r.point_cost_pending_jpy_incl ?? 0,
+    tax_normal_sales_jpy_incl: r.tax_normal_sales_jpy_incl ?? 0,
+    tax_reduced_sales_jpy_incl: r.tax_reduced_sales_jpy_incl ?? 0,
+    tax_free_sales_jpy_incl: r.tax_free_sales_jpy_incl ?? 0,
+    mall_fee_jpy_incl: r.mall_fee_jpy_incl ?? null,
+    mall_fee_rate_applied: r.mall_fee_rate_applied ?? null,
+    mall_fee_calc_method: r.mall_fee_calc_method ?? 'unknown',
+    mall_fee_estimate_delta_jpy: r.mall_fee_estimate_delta_jpy ?? null,
+    shipping_cost_jpy_incl: r.shipping_cost_jpy_incl ?? 0,
+    shipping_quality: r.shipping_quality,
+    unit_cost_snapshot_incl: r.unit_cost_snapshot_incl ?? null,
+    cost_snapshot_date_jst: r.cost_snapshot_date_jst ?? null,
+    latest_unit_cost_reference_incl: r.latest_unit_cost_reference_incl ?? null,
+    cogs_amount_jpy_incl: r.cogs_amount_jpy_incl ?? 0,
+    variable_margin_partial_jpy_incl: r.variable_margin_partial_jpy_incl ?? 0,
+    variable_margin_full_jpy_incl: r.variable_margin_full_jpy_incl ?? null,
+    refund_adjusted_net_sales_jpy_incl: r.refund_adjusted_net_sales_jpy_incl ?? null,
+    margin_confidence: r.margin_confidence ?? 'partial',
+    margin_full_finalized_at: r.margin_full_finalized_at ?? null,
+    before_discount_jpy_incl: r.before_discount_jpy_incl ?? 0,
+    detail_discount_jpy_incl: r.detail_discount_jpy_incl ?? 0,
+    charge_allocated_jpy_incl: r.charge_allocated_jpy_incl ?? 0,
+    item_option_jpy_incl: r.item_option_jpy_incl ?? 0,
+    gift_wrapping_jpy_incl: r.gift_wrapping_jpy_incl ?? 0,
+    cost_status: r.cost_status,
+    is_cost_complete: r.is_cost_complete ?? 0,
+    data_quality_score: r.data_quality_score ?? 0,
+    price_variance_warning: r.price_variance_warning ?? 0,
+    order_count: r.order_count ?? 0,
+    line_count: r.line_count ?? 0,
     source_layer_summary: r.source_layer_summary || '',
     source_row_count: r.source_row_count ?? 0,
     built_at: r.built_at || new Date().toISOString(),
