@@ -14,3 +14,10 @@ data-test/
 check-rakuten*.mjs
 debug-*.mjs
 *.tmp.mjs
+
+# VPS proxy: secret / token / log / backup は git 管理外 (vps-proxy/aupay-proxy.js 本体のみ管理)
+vps-proxy/.env*
+vps-proxy/yahoo-tokens.json
+vps-proxy/*.pem
+vps-proxy/*.log
+vps-proxy/*.bak*

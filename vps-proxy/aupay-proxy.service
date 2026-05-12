@@ -1,0 +1,18 @@
+# /etc/systemd/system/aupay-proxy.service (参考用、VPS 上のコピー)
+# 実体は VPS の /etc/systemd/system/aupay-proxy.service にある。
+# このファイルを変更しただけでは反映されない — VPS 上で sudo systemctl daemon-reload + restart が必要。
+[Unit]
+Description=API Proxy (au PAY + Yahoo)
+After=network.target
+
+[Service]
+Type=simple
+User=rocky
+WorkingDirectory=/home/rocky
+EnvironmentFile=/home/rocky/.env
+ExecStart=/usr/bin/node /home/rocky/aupay-proxy.js
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
