@@ -70,6 +70,8 @@
     .bsacc-subpanel { background: #fafafa; }
     .bsacc-item { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; color: #6b7280; padding: 4px 12px 4px 50px; border-bottom: 1px dashed #eee; }
     .bsacc-bottom { display: flex; justify-content: space-between; font-size: 16px; font-weight: 700; color: #111; padding: 10px; background: #f0f9ff; border-radius: 4px; border-top: 2px solid #bae6fd; margin-top: 8px; }
+    .bsacc-acct.bsacc-subtotal { background: #fffbeb; border-top: 1px solid #fde68a; border-bottom: 1px solid #fde68a; }
+    .pl-flow-note { margin-top: 10px; padding: 8px 12px; background: #f0fdf4; border-left: 4px solid #43a047; border-radius: 4px; font-size: 13px; color: #166534; }
     .bs-trend-details { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px 14px; margin-bottom: 8px; }
     .bs-trend-details > summary { font-weight: 600; cursor: pointer; padding: 4px 0; color: #374151; }
     /* FY 期ボタン (period-switcher 内) */
@@ -442,10 +444,89 @@ async function loadTimeseries() {
 }
 
 async function loadPl() {
-  document.getElementById('tab-pl').innerHTML = '<div class="loading">読み込み中...</div>';
-  const j = await fetchJson('/apps/exec-dashboard/api/trial-balance/pl?period=' + currentPeriod);
-  if (!j.ok) { document.getElementById('tab-pl').innerHTML = '<div class="empty">エラー: ' + j.error + '</div>'; return; }
-  renderTrialBalance('tab-pl', j, 'pl');
+  const target = document.getElementById('tab-pl');
+  target.innerHTML = '<div class="loading">読み込み中...</div>';
+  let j;
+  try { j = await fetchJson('/apps/exec-dashboard/api/trial-balance/pl?period=' + currentPeriod); }
+  catch (e) { target.innerHTML = '<div class="empty">通信エラー: ' + esc(e.message) + '</div>'; return; }
+  if (!j.ok) { target.innerHTML = '<div class="empty">エラー: ' + esc(j.error || '') + '</div>'; return; }
+  // 上: PL 箱図 (売上 ＝ 原価＋経費＋利益) → 中: アコーディオン式 PL → 下: 月次推移 (折りたたみ)
+  target.innerHTML = ((j.pl_box && j.pl_tree) ? (renderPlBoxHtml(j.pl_box) + renderPlAccordionHtml(j.pl_tree)) : '')
+    + '<details class="bs-trend-details"><summary>📅 月次推移 (試算表形式) を見る</summary><div id="pl-table-area"></div></details>';
+  renderTrialBalance('pl-table-area', j, 'pl');
+  // アコーディオン: 科目 (▶/▼) クリックで内訳を開閉
+  document.querySelectorAll('#tab-pl .bsacc-acct[data-toggle]').forEach(row => {
+    row.addEventListener('click', () => {
+      const id = row.getAttribute('data-toggle');
+      const panel = document.getElementById(id);
+      if (!panel) return;
+      const open = panel.style.display !== 'none';
+      panel.style.display = open ? 'none' : '';
+      const tri = row.querySelector('.bsacc-tri');
+      if (tri) tri.textContent = open ? '▶' : '▼';
+    });
+  });
+}
+
+// PL 箱図 (左=売上、右=売上原価(上)/販管費(中)/営業利益(下)、高さ ∝ 金額、左右が釣り合い)
+function renderPlBoxHtml(b) {
+  const fmt = (v) => '¥' + fmtJpyComma(v);
+  const total = b.sales || 0;
+  // 右列: 上から 売上原価(変動費) / 販管費(固定費) / 営業利益(利益)
+  const rightSegs = [
+    { label: '売上原価 (変動費)', note: '商品仕入・モール手数料・運賃・広告等', total: b.cogs || 0, bg: '#fde4ec', border: '#ec407a' },
+    { label: '販管費 (固定費)', note: '役員報酬・給与・家賃・減価償却等', total: b.sgae || 0, bg: '#fff0df', border: '#f57c00' },
+    { label: '営業利益', note: '売上 − 原価 − 経費', total: b.operating_income || 0, bg: '#e3f6e6', border: '#43a047' },
+  ];
+  const segHtml = (s) => ''
+    + '<div class="bsbox" style="flex-grow:' + Math.max(1, Math.abs(s.total)) + ';background:' + s.bg + ';border-left-color:' + s.border + '">'
+    + '<div class="bsbox-head"><span class="bsbox-label">' + esc(s.label) + '</span><span class="bsbox-amt">' + fmt(s.total) + '</span></div>'
+    + '<div class="bsbox-note">' + esc(s.note) + '</div></div>';
+  // 利益の流れ (waterfall) を box の下に注記
+  const wf = (b.profit_waterfall || []);
+  const find = (n) => (wf.find(x => x.name === n) || {}).value || 0;
+  const flowNote = '営業利益 ' + fmt(find('営業利益'))
+    + ' ＋ 営業外収益 ' + fmt(find('営業外収益')) + ' − 営業外費用 ' + fmt(find('営業外費用'))
+    + ' ＝ 経常利益 ' + fmt(find('経常利益'))
+    + ' − 法人税等 ' + fmt(find('法人税等'))
+    + ' ＝ 当期純利益 ' + fmt(b.net_income || 0);
+  return ''
+    + '<div class="big-bs-card">'
+    + '  <h3>📊 損益計算書 ' + esc(b.period_label || '') + ' — 売上 ＝ 原価 ＋ 経費 ＋ 利益</h3>'
+    + '  <div class="bsbox-grid">'
+    + '    <div class="bsbox-col"><div class="bsbox-colhead">売上高 &nbsp;<strong>' + fmt(total) + '</strong></div>'
+    + '      <div class="bsbox-stack"><div class="bsbox" style="flex-grow:1;background:#e8f0fe;border-left-color:#1e88e5"><div class="bsbox-head"><span class="bsbox-label">売上高</span><span class="bsbox-amt">' + fmt(total) + '</span></div><div class="bsbox-note">' + esc(b.period_label || '') + '</div></div></div></div>'
+    + '    <div class="bsbox-col"><div class="bsbox-colhead">原価・経費・利益 &nbsp;<strong>' + fmt(total) + '</strong> <span class="sub">(限界利益(粗利) ' + fmt(b.gross_profit || 0) + ' = 販管費 ＋ 営業利益)</span></div>'
+    + '      <div class="bsbox-stack">' + rightSegs.map(segHtml).join('') + '</div></div>'
+    + '  </div>'
+    + '  <div class="pl-flow-note">' + esc(flowNote) + '</div>'
+    + '</div>';
+}
+
+// アコーディオン式 PL (売上高▶ / 売上原価▶ / 売上総利益 / 販管費▶ / 営業利益 / 営業外▶ / 経常利益 / 法人税等 / 当期純利益)
+function renderPlAccordionHtml(tree) {
+  const fmtAmt = (v) => '¥' + fmtJpyComma(v);
+  let panelSeq = 0;
+  const rowHtml = (node) => {
+    if (node.subtotal) {
+      return '<div class="bsacc-acct bsacc-subtotal"><span class="bsacc-tri" style="visibility:hidden">▶</span><span class="bsacc-name"><strong>' + esc(node.name) + '</strong></span><span class="bsacc-amt"><strong>' + fmtAmt(node.value) + '</strong></span></div>';
+    }
+    const hasItems = node.items && node.items.length > 0;
+    if (!hasItems) {
+      return '<div class="bsacc-acct"><span class="bsacc-tri" style="visibility:hidden">▶</span><span class="bsacc-name">' + esc(node.name) + '</span><span class="bsacc-amt">' + fmtAmt(node.value) + '</span></div>';
+    }
+    const pid = 'placc-p' + (++panelSeq);
+    const sub = node.items.map(it => '<div class="bsacc-item"><span class="bsacc-name">' + esc(it.name) + '</span><span class="bsacc-amt">' + fmtAmt(it.value) + '</span></div>').join('');
+    return '<div class="bsacc-acct" data-toggle="' + pid + '"><span class="bsacc-tri">▶</span><span class="bsacc-name">' + esc(node.name) + '</span><span class="bsacc-amt">' + fmtAmt(node.value) + '</span></div>'
+      + '<div class="bsacc-subpanel" id="' + pid + '" style="display:none">' + sub + '</div>';
+  };
+  return ''
+    + '<div class="bsacc-card">'
+    + '  <h3>📋 損益計算書 (科目別) — 科目をクリックで内訳を表示</h3>'
+    + '  <div class="bsacc-section" style="border-left-color:#cbd5e1">'
+    + '    ' + (tree || []).map(rowHtml).join('')
+    + '  </div>'
+    + '</div>';
 }
 
 async function loadBs() {
