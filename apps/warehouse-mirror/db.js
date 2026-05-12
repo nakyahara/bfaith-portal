@@ -1082,6 +1082,57 @@ function createTables() {
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirror_mf_fy_summary_fy ON mirror_mf_fy_summary(fy_number DESC)');
 
+  // Phase 1d-3b: BS section別月末 mart
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_mf_bs_monthly (
+    run_id                  INTEGER NOT NULL REFERENCES mirror_mf_publish_runs(run_id) ON DELETE CASCADE,
+    month_ym                TEXT NOT NULL,
+    cash_total              INTEGER NOT NULL DEFAULT 0,
+    ar_total                INTEGER NOT NULL DEFAULT 0,
+    inventory_total         INTEGER NOT NULL DEFAULT 0,
+    other_current_asset     INTEGER NOT NULL DEFAULT 0,
+    current_asset_total     INTEGER NOT NULL DEFAULT 0,
+    tangible_fixed_asset    INTEGER NOT NULL DEFAULT 0,
+    investment_other        INTEGER NOT NULL DEFAULT 0,
+    fixed_asset_total       INTEGER NOT NULL DEFAULT 0,
+    total_asset             INTEGER NOT NULL DEFAULT 0,
+    ap_total                INTEGER NOT NULL DEFAULT 0,
+    short_loan_total        INTEGER NOT NULL DEFAULT 0,
+    other_current_liab      INTEGER NOT NULL DEFAULT 0,
+    current_liab_total      INTEGER NOT NULL DEFAULT 0,
+    long_loan_total         INTEGER NOT NULL DEFAULT 0,
+    other_fixed_liab        INTEGER NOT NULL DEFAULT 0,
+    fixed_liab_total        INTEGER NOT NULL DEFAULT 0,
+    total_liab              INTEGER NOT NULL DEFAULT 0,
+    capital                 INTEGER NOT NULL DEFAULT 0,
+    retained                INTEGER NOT NULL DEFAULT 0,
+    total_equity            INTEGER NOT NULL DEFAULT 0,
+    bs_other_total          INTEGER NOT NULL DEFAULT 0,
+    retained_balance        INTEGER NOT NULL DEFAULT 0,
+    current_period_profit   INTEGER NOT NULL DEFAULT 0,
+    display_total_equity    INTEGER NOT NULL DEFAULT 0,
+    source_row_hash         TEXT NOT NULL,
+    synced_at               TEXT NOT NULL,
+    PRIMARY KEY (run_id, month_ym)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mirror_mf_bs_monthly_ym ON mirror_mf_bs_monthly(month_ym)');
+
+  // Phase 1d-3b: BS 細目 mart (account × sub_account 単位、UI breakdown 用)
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_mf_bs_subaccount_monthly (
+    run_id                   INTEGER NOT NULL REFERENCES mirror_mf_publish_runs(run_id) ON DELETE CASCADE,
+    month_ym                 TEXT NOT NULL,
+    account_name             TEXT NOT NULL,
+    sub_account_name         TEXT NOT NULL DEFAULT '',
+    role_key                 TEXT,
+    section                  TEXT NOT NULL,
+    closing_balance_excl_tax INTEGER NOT NULL DEFAULT 0,
+    is_hub_null_sub          INTEGER NOT NULL DEFAULT 0,
+    source_row_hash          TEXT NOT NULL,
+    synced_at                TEXT NOT NULL,
+    PRIMARY KEY (run_id, month_ym, account_name, sub_account_name)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mirror_mf_bs_subaccount_ym ON mirror_mf_bs_subaccount_monthly(month_ym)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mirror_mf_bs_subaccount_sec ON mirror_mf_bs_subaccount_monthly(month_ym, section)');
+
   // mart_mf_* (Render local writable) — ack/snooze 等のユーザー操作
   db.exec(`CREATE TABLE IF NOT EXISTS mart_mf_anomaly_signal_state (
     signal_key     TEXT PRIMARY KEY,
@@ -1143,5 +1194,22 @@ function createTables() {
       JOIN mirror_mf_publish_runs r ON r.run_id = fs.run_id
       WHERE r.status = 'success' AND r.scope IN ('all','fy_summary')
     )`);
-  // ▲▲▲ MFクラウド会計ダッシュボード Phase 1a/1d-2 終了 ▲▲▲
+  // Phase 1d-3b: BS section / 細目 の latest VIEW (同じく実在 run 選択)
+  db.exec('DROP VIEW IF EXISTS v_mirror_mf_bs_monthly_latest');
+  db.exec(`CREATE VIEW v_mirror_mf_bs_monthly_latest AS
+    SELECT m.* FROM mirror_mf_bs_monthly m
+    WHERE m.run_id = (
+      SELECT MAX(b.run_id) FROM mirror_mf_bs_monthly b
+      JOIN mirror_mf_publish_runs r ON r.run_id = b.run_id
+      WHERE r.status = 'success' AND r.scope IN ('all','base','bs_monthly')
+    )`);
+  db.exec('DROP VIEW IF EXISTS v_mirror_mf_bs_subaccount_monthly_latest');
+  db.exec(`CREATE VIEW v_mirror_mf_bs_subaccount_monthly_latest AS
+    SELECT m.* FROM mirror_mf_bs_subaccount_monthly m
+    WHERE m.run_id = (
+      SELECT MAX(b.run_id) FROM mirror_mf_bs_subaccount_monthly b
+      JOIN mirror_mf_publish_runs r ON r.run_id = b.run_id
+      WHERE r.status = 'success' AND r.scope IN ('all','base','bs_subaccount')
+    )`);
+  // ▲▲▲ MFクラウド会計ダッシュボード Phase 1a/1d-2/1d-3b 終了 ▲▲▲
 }

@@ -202,6 +202,22 @@ entities.push({
   ),
 });
 
+// Phase 1d-3b: BS section別月末 + 細目
+entities.push({
+  name: 'mf_bs_monthly',
+  rows: enrich(
+    db.prepare(`SELECT * FROM mart_mf_bs_monthly WHERE run_id = ?`).all(runId),
+    ['run_id', 'month_ym', 'total_asset', 'total_liab']
+  ),
+});
+entities.push({
+  name: 'mf_bs_subaccount_monthly',
+  rows: enrich(
+    db.prepare(`SELECT * FROM mart_mf_bs_subaccount_monthly WHERE run_id = ?`).all(runId),
+    ['run_id', 'month_ym', 'account_name', 'sub_account_name', 'closing_balance_excl_tax']
+  ),
+});
+
 console.log('\n  Entities to sync:');
 for (const e of entities) {
   console.log(`    ${e.name.padEnd(35)} ${e.rows.length.toString().padStart(6)} rows`);

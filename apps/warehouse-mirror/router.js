@@ -597,6 +597,25 @@ const MF_FY_SUMMARY_COLS = [
   'current_liab_closing', 'total_equity_closing',
   'source_row_hash', 'synced_at'
 ];
+// Phase 1d-3b: BS section別月末
+const MF_BS_MONTHLY_COLS = [
+  'run_id', 'month_ym',
+  'cash_total', 'ar_total', 'inventory_total', 'other_current_asset', 'current_asset_total',
+  'tangible_fixed_asset', 'investment_other', 'fixed_asset_total',
+  'total_asset',
+  'ap_total', 'short_loan_total', 'other_current_liab', 'current_liab_total',
+  'long_loan_total', 'other_fixed_liab', 'fixed_liab_total',
+  'total_liab',
+  'capital', 'retained', 'total_equity',
+  'bs_other_total',
+  'retained_balance', 'current_period_profit', 'display_total_equity',
+  'source_row_hash', 'synced_at'
+];
+// Phase 1d-3b: BS 細目
+const MF_BS_SUBACCOUNT_COLS = [
+  'run_id', 'month_ym', 'account_name', 'sub_account_name', 'role_key', 'section',
+  'closing_balance_excl_tax', 'is_hub_null_sub', 'source_row_hash', 'synced_at'
+];
 
 // ─── Entity Registry (entity-driven dispatch、楽天 #R-3b で導入) ───
 // 新 entity (Yahoo / メルカリ等) 追加時はここに 1 エントリ追加するだけで
@@ -704,6 +723,24 @@ const ENTITY_REGISTRY = {
     requires_parent_run: true,
     getInsertStmt: makeMfInsertFactory('mirror_mf_fy_summary', MF_FY_SUMMARY_COLS),
     normalizeRow: (r) => normalizeMfFySummaryRow(r),
+  },
+  // Phase 1d-3b: BS section別月末
+  mf_bs_monthly: {
+    contract_version: 1,
+    mirror_table: 'mirror_mf_bs_monthly',
+    clear_strategy: 'no_clear',
+    requires_parent_run: true,
+    getInsertStmt: makeMfInsertFactory('mirror_mf_bs_monthly', MF_BS_MONTHLY_COLS),
+    normalizeRow: (r) => normalizeMfBsMonthlyRow(r),
+  },
+  // Phase 1d-3b: BS 細目
+  mf_bs_subaccount_monthly: {
+    contract_version: 1,
+    mirror_table: 'mirror_mf_bs_subaccount_monthly',
+    clear_strategy: 'no_clear',
+    requires_parent_run: true,
+    getInsertStmt: makeMfInsertFactory('mirror_mf_bs_subaccount_monthly', MF_BS_SUBACCOUNT_COLS),
+    normalizeRow: (r) => normalizeMfBsSubaccountRow(r),
   },
 };
 
@@ -1230,6 +1267,50 @@ function normalizeMfFySummaryRow(r) {
     source_row_hash: r.source_row_hash, synced_at: r.synced_at,
   };
 }
+// Phase 1d-3b: mf_bs_monthly
+function normalizeMfBsMonthlyRow(r) {
+  return {
+    run_id: r.run_id, month_ym: r.month_ym,
+    cash_total: r.cash_total ?? 0,
+    ar_total: r.ar_total ?? 0,
+    inventory_total: r.inventory_total ?? 0,
+    other_current_asset: r.other_current_asset ?? 0,
+    current_asset_total: r.current_asset_total ?? 0,
+    tangible_fixed_asset: r.tangible_fixed_asset ?? 0,
+    investment_other: r.investment_other ?? 0,
+    fixed_asset_total: r.fixed_asset_total ?? 0,
+    total_asset: r.total_asset ?? 0,
+    ap_total: r.ap_total ?? 0,
+    short_loan_total: r.short_loan_total ?? 0,
+    other_current_liab: r.other_current_liab ?? 0,
+    current_liab_total: r.current_liab_total ?? 0,
+    long_loan_total: r.long_loan_total ?? 0,
+    other_fixed_liab: r.other_fixed_liab ?? 0,
+    fixed_liab_total: r.fixed_liab_total ?? 0,
+    total_liab: r.total_liab ?? 0,
+    capital: r.capital ?? 0,
+    retained: r.retained ?? 0,
+    total_equity: r.total_equity ?? 0,
+    bs_other_total: r.bs_other_total ?? 0,
+    retained_balance: r.retained_balance ?? 0,
+    current_period_profit: r.current_period_profit ?? 0,
+    display_total_equity: r.display_total_equity ?? 0,
+    source_row_hash: r.source_row_hash, synced_at: r.synced_at,
+  };
+}
+// Phase 1d-3b: mf_bs_subaccount_monthly
+function normalizeMfBsSubaccountRow(r) {
+  return {
+    run_id: r.run_id, month_ym: r.month_ym,
+    account_name: r.account_name,
+    sub_account_name: r.sub_account_name ?? '',
+    role_key: r.role_key ?? null,
+    section: r.section,
+    closing_balance_excl_tax: r.closing_balance_excl_tax ?? 0,
+    is_hub_null_sub: r.is_hub_null_sub ?? 0,
+    source_row_hash: r.source_row_hash, synced_at: r.synced_at,
+  };
+}
 
 // ─── Phase 1 #1-4a: GET /api/sync/runs/:run_id (status 確認) ───
 router.get('/api/sync/runs/:run_id', requireSyncKey, (req, res) => {
@@ -1401,7 +1482,7 @@ const MF_REQUIRED_ENTITIES = [
 ];
 // Phase 1d-2: optional entity (旧 sync (deploy 前) との互換のため、欠けても finalize 通過)
 //   将来 (Phase 1d-3 以降で sync 側完全移行後) に MF_REQUIRED_ENTITIES へ昇格予定
-const MF_OPTIONAL_ENTITIES = ['mf_fy_summary'];
+const MF_OPTIONAL_ENTITIES = ['mf_fy_summary', 'mf_bs_monthly', 'mf_bs_subaccount_monthly'];
 router.post('/api/sync/mf/runs/:run_id/finalize', requireSyncKey, (req, res) => {
   const runId = parseInt(req.params.run_id, 10);
   if (!Number.isInteger(runId) || runId <= 0) {
