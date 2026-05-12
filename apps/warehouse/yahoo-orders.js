@@ -280,10 +280,13 @@ function insertOrders(db, orders, batchId, windowStart, windowEnd) {
 // fail-closed 判定 (Codex 推奨、5/8-10 事故再発防止)
 //   - fetched > 0 AND inserted = 0 → FATAL (proxy / API 障害の可能性、cron exit 1)
 //   - api_error_rate > 50% → FATAL (Yahoo API 系統的 reject、cron exit 1)
-//   - skipped_invalid > 0 → warning (個別 record の semantic failure)
+//   - skip_ratio (skipped_invalid + api_error の合計 / fetched) > 5% → FATAL (Phase 1.3: 系統的問題の可能性)
+//   - skipped_invalid > 0 (5% 以下) → warning (個別 record の一時的不完全レスポンス、翌日 cron で補完想定)
+const SKIP_RATIO_FATAL_THRESHOLD = 0.05;
 function evaluateFetchResult(label, fetched, currentCount, skippedInvalid, apiError) {
-  const skippedRatio = fetched > 0 ? ((skippedInvalid + apiError) / fetched * 100).toFixed(1) : '0.0';
-  console.log(`[Yahoo] ${label}: fetched=${fetched} inserted=${currentCount} skipped_invalid=${skippedInvalid} api_error=${apiError} (skip_ratio=${skippedRatio}%)`);
+  const skipRatio = fetched > 0 ? (skippedInvalid + apiError) / fetched : 0;
+  const skipRatioPct = (skipRatio * 100).toFixed(1);
+  console.log(`[Yahoo] ${label}: fetched=${fetched} inserted=${currentCount} skipped_invalid=${skippedInvalid} api_error=${apiError} (skip_ratio=${skipRatioPct}%)`);
   if (fetched > 0 && currentCount === 0) {
     console.error(`[Yahoo] FATAL: fetched=${fetched} だが inserted=0、proxy or Yahoo API 障害の可能性 (5/8-10 同型事故防止)`);
     return 'fatal';
@@ -292,8 +295,12 @@ function evaluateFetchResult(label, fetched, currentCount, skippedInvalid, apiEr
     console.error(`[Yahoo] FATAL: api_error_rate=${(apiError / fetched * 100).toFixed(1)}% (50% 超)`);
     return 'fatal';
   }
+  if (fetched > 0 && skipRatio > SKIP_RATIO_FATAL_THRESHOLD) {
+    console.error(`[Yahoo] FATAL: skip_ratio=${skipRatioPct}% (${(SKIP_RATIO_FATAL_THRESHOLD * 100)}% 超、系統的問題の可能性)`);
+    return 'fatal';
+  }
   if (skippedInvalid > 0 || apiError > 0) {
-    console.log(`[Yahoo] ⚠️  semantic warning: skipped_invalid=${skippedInvalid} api_error=${apiError}`);
+    console.log(`[Yahoo] ⚠️  semantic warning: skipped_invalid=${skippedInvalid} api_error=${apiError} (skip_ratio=${skipRatioPct}%、翌日 cron で補完想定)`);
     return 'warning';
   }
   return 'ok';
