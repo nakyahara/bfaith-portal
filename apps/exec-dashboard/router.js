@@ -712,9 +712,17 @@ router.get('/api/fy-summary', (req, res) => {
       const months = r.months_in_cumulative || 0;
       // 限界利益 = 粗利 (B-Faith 戦略: 原価=変動費)
       const marginalProfit = grossProfit;
+      const sgaeCum = r.sgae_cum || 0;
       // 期間日数 (近似: 月数 × 30.4)。回転日数計算の分母用
       const periodDays = months > 0 ? months * 30.4 : 365;
       const round2 = (v) => (v == null || !isFinite(v)) ? null : +Number(v).toFixed(2);
+      const round1 = (v) => (v == null || !isFinite(v)) ? null : +Number(v).toFixed(1);
+      // 月間固定費 = 販管費 月平均 (B-Faith 戦略: 販管費=固定費)
+      const monthlyFixedCost = months > 0 ? sgaeCum / months : 0;
+      // DSO/在庫回転/DPO の日数 (CCC 計算用、null は 0 扱い)
+      const dsoD = sales > 0 ? arAvg / (sales / periodDays) : null;
+      const invD = cogs > 0 ? invAvg / (cogs / periodDays) : null;
+      const dpoD = cogs > 0 ? apAvg / (cogs / periodDays) : null;
       return {
         fy_number: r.fy_number,
         fy_start_ym: r.fy_start_ym,
@@ -750,11 +758,17 @@ router.get('/api/fy-summary', (req, res) => {
         // 7. ROA (= 経常利益 / 平均総資産)
         roa_pct: round2(assetAvg > 0 ? ordinary / assetAvg * 100 : null),
         // 8. DSO 売上債権回転日数 (= 平均売上債権 / 1日あたり売上)
-        dso_days: round2(sales > 0 ? arAvg / (sales / periodDays) : null),
+        dso_days: round1(dsoD),
         // 9. DPO 仕入債務回転日数 (= 平均仕入債務 / 1日あたり売上原価)
-        dpo_days: round2(cogs > 0 ? apAvg / (cogs / periodDays) : null),
+        dpo_days: round1(dpoD),
         // (おまけ) 在庫回転日数 (= 平均棚卸資産 / 1日あたり売上原価)
-        inventory_turnover_days: round2(cogs > 0 ? invAvg / (cogs / periodDays) : null),
+        inventory_turnover_days: round1(invD),
+        // CCC キャッシュ・コンバージョン・サイクル (= DSO + 在庫回転日数 − DPO)。短いほど資金効率良い
+        ccc_days: (dsoD != null && invD != null && dpoD != null) ? round1(dsoD + invD - dpoD) : null,
+        // 月間固定費 (= 販管費 月平均)
+        monthly_fixed_cost: Math.round(monthlyFixedCost),
+        // 資金繰り残月数 (= 期末現預金 ÷ 月間固定費)。「あと何ヶ月分の固定費が手元にあるか」
+        cash_runway_months: round1(monthlyFixedCost > 0 ? cashClosing / monthlyFixedCost : null),
         // 粗利率 (参考、限界利益率と同値)
         gross_profit_pct: round2(sales > 0 ? grossProfit / sales * 100 : null),
         headcount: HEADCOUNT,
