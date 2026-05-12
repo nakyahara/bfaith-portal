@@ -586,35 +586,68 @@ router.get('/api/trial-balance/bs', (req, res) => {
       });
     }
 
-    // Phase 1d-3c+: 最新確定月 (months の最後) の BS を大きい図解用に整形
-    //   資産の部 = 現預金/売上債権/棚卸資産/その他流動資産/有形固定資産/投資その他
-    //   負債純資産の部 = 仕入債務/(短期借入金等+その他流動負債)/固定負債/資本金/繰越剰余金/当期純利益
+    // Phase 1d-3c+: 最新確定月 (months の最後) の BS を「5つの箱」図解用に整形
+    //   左列 (資産の部): 流動資産 box {現預金/売上債権/棚卸資産/その他流動資産} + 固定資産 box {有形固定資産/投資その他}
+    //   右列 (負債純資産の部): 流動負債 box {仕入債務/短期借入金等/その他流動負債} + 固定負債 box {長期借入金等} + 純資産 box {資本金/繰越剰余金/当期純利益(期中)}
     let latestBalance = null;
     const latestYm = months.length > 0 ? months[months.length - 1] : null;
     const latestRow = latestYm ? bsByMonth[latestYm] : null;
     if (latestRow) {
+      const sub = (label, value, color) => ({ label, value: value || 0, color });
       latestBalance = {
         month: latestYm,
-        assets: [
-          { label: '現預金', value: latestRow.cash_total || 0, color: '#0891b2' },
-          { label: '売上債権', value: latestRow.ar_total || 0, color: '#2563eb' },
-          { label: '棚卸資産', value: latestRow.inventory_total || 0, color: '#7c3aed' },
-          { label: 'その他流動資産', value: latestRow.other_current_asset || 0, color: '#a78bfa' },
-          { label: '有形固定資産', value: latestRow.tangible_fixed_asset || 0, color: '#475569' },
-          { label: '投資その他の資産', value: latestRow.investment_other || 0, color: '#94a3b8' },
-        ].filter(s => s.value !== 0),
-        liab_equity: [
-          { label: '仕入債務', value: latestRow.ap_total || 0, color: '#f59e0b' },
-          { label: '短期借入金等', value: latestRow.short_loan_total || 0, color: '#f97316' },
-          { label: 'その他流動負債', value: latestRow.other_current_liab || 0, color: '#fbbf24' },
-          { label: '固定負債(長期借入金等)', value: latestRow.fixed_liab_total || 0, color: '#dc2626' },
-          { label: '資本金', value: latestRow.capital || 0, color: '#059669' },
-          { label: '繰越利益剰余金', value: latestRow.retained_balance || 0, color: '#10b981' },
-          { label: '当期純利益(期中)', value: latestRow.current_period_profit || 0, color: '#34d399' },
-        ].filter(s => s.value !== 0),
         total_asset: latestRow.total_asset || 0,
         total_liab: latestRow.total_liab || 0,
         net_assets: latestRow.display_total_equity || 0,
+        // 左列 = 資産の部 (上から: ①流動資産、②固定資産)
+        asset_boxes: [
+          {
+            key: 'current_asset', label: '①流動資産', note: '1年以内に現金化できる資産',
+            total: latestRow.current_asset_total || 0, color: '#fce4ec', border: '#f48fb1',
+            items: [
+              sub('現預金', latestRow.cash_total, '#f8bbd0'),
+              sub('売上債権 (売掛金等)', latestRow.ar_total, '#f48fb1'),
+              sub('棚卸資産 (商品)', latestRow.inventory_total, '#f06292'),
+              sub('その他流動資産', latestRow.other_current_asset, '#ec407a'),
+            ].filter(i => i.value !== 0),
+          },
+          {
+            key: 'fixed_asset', label: '②固定資産', note: '1年以内に現金化されない資産',
+            total: latestRow.fixed_asset_total || 0, color: '#e3f2fd', border: '#90caf9',
+            items: [
+              sub('有形固定資産', latestRow.tangible_fixed_asset, '#bbdefb'),
+              sub('投資その他の資産', latestRow.investment_other, '#90caf9'),
+            ].filter(i => i.value !== 0),
+          },
+        ],
+        // 右列 = 負債・純資産の部 (上から: ①流動負債、②固定負債、純資産)
+        liab_equity_boxes: [
+          {
+            key: 'current_liab', label: '①流動負債', note: '1年以内に返済義務がある負債',
+            total: latestRow.current_liab_total || 0, color: '#fff3e0', border: '#ffcc80',
+            items: [
+              sub('仕入債務 (買掛金)', latestRow.ap_total, '#ffe0b2'),
+              sub('短期借入金等', latestRow.short_loan_total, '#ffcc80'),
+              sub('その他流動負債 (未払金/未払消費税等)', latestRow.other_current_liab, '#ffb74d'),
+            ].filter(i => i.value !== 0),
+          },
+          {
+            key: 'fixed_liab', label: '②固定負債', note: '返済までの期間が1年を超える負債',
+            total: latestRow.fixed_liab_total || 0, color: '#fffde7', border: '#fff176',
+            items: [
+              sub('長期借入金等', latestRow.fixed_liab_total, '#fff59d'),
+            ].filter(i => i.value !== 0),
+          },
+          {
+            key: 'net_assets', label: '純資産', note: '返済義務がない資産 (自己資本)',
+            total: latestRow.display_total_equity || 0, color: '#e8f5e9', border: '#a5d6a7',
+            items: [
+              sub('資本金', latestRow.capital, '#c8e6c9'),
+              sub('繰越利益剰余金 (前期末)', latestRow.retained_balance, '#a5d6a7'),
+              sub('当期純利益 (期中累計)', latestRow.current_period_profit, '#81c784'),
+            ].filter(i => i.value !== 0),
+          },
+        ],
       };
     }
 

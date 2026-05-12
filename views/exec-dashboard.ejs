@@ -42,11 +42,28 @@
     .chart-card h3 { margin: 0 0 10px 0; font-size: 13px; color: #374151; font-weight: 600; }
     .chart-wrap { position: relative; height: 280px; }
     /* Phase 1d-3c+: BS タブ内の大きい BS 図解 */
-    .big-bs-card { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; }
-    .big-bs-card h3 { margin: 0 0 8px 0; font-size: 14px; color: #1e3a8a; font-weight: 700; }
-    .big-bs-wrap { position: relative; height: 260px; }
+    /* Phase 1d-3c+: 「5つの箱」貸借対照表 図解 */
+    .big-bs-card { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 14px 16px; margin-bottom: 16px; }
+    .big-bs-card h3 { margin: 0 0 10px 0; font-size: 14px; color: #1e3a8a; font-weight: 700; }
+    .bsbox-grid { display: flex; gap: 8px; align-items: stretch; }
+    .bsbox-col { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+    .bsbox-colhead { font-size: 12px; text-align: center; padding: 4px 0 6px; color: #374151; }
+    .bsbox-colhead strong { font-size: 14px; color: #111; }
+    .bsbox-stack { display: flex; flex-direction: column; height: 420px; border: 1px solid #d1d5db; border-radius: 4px; overflow: hidden; }
+    .bsbox { flex-grow: 1; flex-basis: 0; min-height: 38px; border-bottom: 2px solid #ccc; padding: 6px 12px; overflow: hidden; display: flex; flex-direction: column; justify-content: center; }
+    .bsbox:last-child { border-bottom: none; }
+    .bsbox-head { display: flex; justify-content: space-between; align-items: baseline; }
+    .bsbox-label { font-size: 13px; font-weight: 700; color: #1f2937; }
+    .bsbox-amt { font-size: 13px; font-weight: 700; color: #111; font-variant-numeric: tabular-nums; }
+    .bsbox-note { font-size: 10px; color: #6b7280; margin-top: 1px; }
+    .bsbox-items { font-size: 10px; color: #4b5563; margin-top: 3px; line-height: 1.4; }
     /* FY 期ボタン (period-switcher 内) */
     .period-switcher button.fy-period-btn { border-left: 1px solid #e5e7eb; margin-left: 2px; padding-left: 10px; }
+    @media (max-width: 768px) {
+      .bsbox-stack { height: 340px; }
+      .bsbox { padding: 4px 8px; min-height: 32px; }
+      .bsbox-items { display: none; }
+    }
 
     /* タブ */
     .tabs { display: flex; gap: 4px; margin-bottom: -1px; flex-wrap: wrap; }
@@ -408,51 +425,47 @@ async function loadPl() {
 async function loadBs() {
   const target = document.getElementById('tab-bs');
   target.innerHTML = '<div class="loading">読み込み中...</div>';
-  destroyChart('bsBig');
   let j;
   try { j = await fetchJson('/apps/exec-dashboard/api/trial-balance/bs?period=' + currentPeriod); }
   catch (e) { target.innerHTML = '<div class="empty">通信エラー: ' + esc(e.message) + '</div>'; return; }
   if (!j.ok) { target.innerHTML = '<div class="empty">エラー: ' + esc(j.error || '') + '</div>'; return; }
-  // Phase 1d-3c+: 大きい BS 図解 (最新確定月、資産の部 vs 負債純資産の部 横棒) + 下に試算表
+  // Phase 1d-3c+: 「5つの箱」BS 図解 (最新確定月) を上部に + 下に試算表
   const lb = j.latest_balance;
-  target.innerHTML = ''
-    + (lb
-      ? '<div class="big-bs-card"><h3>📊 貸借対照表 ' + esc(lb.month) + ' 時点 (資産の部 ＝ 負債＋純資産の部)</h3>'
-        + '<div class="big-bs-wrap"><canvas id="chart-bs-big"></canvas></div></div>'
-      : '')
-    + '<div id="bs-table-area"></div>';
-  if (lb) renderBigBs(lb);
+  target.innerHTML = (lb ? renderBsBoxDiagramHtml(lb) : '') + '<div id="bs-table-area"></div>';
   renderTrialBalance('bs-table-area', j, 'bs');
 }
 
-// Phase 1d-3c+: 最新 BS を横棒 2 本 (資産の部 / 負債純資産の部) で大きく描画
-function renderBigBs(lb) {
-  const canvas = document.getElementById('chart-bs-big');
-  if (!canvas) return;
-  destroyChart('bsBig');
-  const datasets = [];
-  (lb.assets || []).forEach(s => datasets.push({ label: s.label, data: [s.value, 0], backgroundColor: s.color, stack: 'x' }));
-  (lb.liab_equity || []).forEach(s => datasets.push({ label: s.label, data: [0, s.value], backgroundColor: s.color, stack: 'x' }));
-  charts.bsBig = new Chart(canvas.getContext('2d'), {
-    type: 'bar',
-    data: {
-      labels: [
-        '資産の部  (' + fmtJpyShort(lb.total_asset) + ')',
-        '負債＋純資産  (負債 ' + fmtJpyShort(lb.total_liab) + ' ＋ 純資産 ' + fmtJpyShort(lb.net_assets) + ')',
-      ],
-      datasets,
-    },
-    options: {
-      indexAxis: 'y',
-      responsive: true, maintainAspectRatio: false,
-      scales: { x: { stacked: true, ticks: { callback: v => fmtJpyShort(v) } }, y: { stacked: true } },
-      plugins: {
-        legend: { labels: { boxWidth: 12, font: { size: 11 } } },
-        tooltip: { callbacks: { label: (ctx) => ctx.dataset.label + ': ¥' + fmtJpyComma(ctx.parsed.x) } },
-        title: { display: true, text: '2 本が同じ長さ ＝ 貸借バランスが取れている (MF 試算表と完全一致)', font: { size: 11 }, color: '#6b7280' },
-      },
-    },
-  });
+// Phase 1d-3c+: 「5つの箱」貸借対照表 図解 (純 HTML/CSS、高さ ∝ 金額)
+function renderBsBoxDiagramHtml(lb) {
+  const fmtBox = (v) => '¥' + fmtJpyComma(v);
+  // 各 box: { label, note, total, color, border, items:[{label,value,color}] }
+  // 高さ ∝ total。flex-grow に金額をそのまま入れる (両列とも合計同じなので比率が揃う)
+  const boxHtml = (b) => {
+    const itemsHtml = (b.items && b.items.length)
+      ? '<div class="bsbox-items">' + b.items.map(it => esc(it.label) + ' ' + fmtBox(it.value)).join(' ／ ') + '</div>'
+      : '';
+    return '<div class="bsbox" style="flex-grow:' + Math.max(1, b.total) + ';background:' + b.color + ';border-color:' + b.border + '">'
+      + '<div class="bsbox-head"><span class="bsbox-label">' + esc(b.label) + '</span><span class="bsbox-amt">' + fmtBox(b.total) + '</span></div>'
+      + '<div class="bsbox-note">' + esc(b.note || '') + '</div>'
+      + itemsHtml
+      + '</div>';
+  };
+  const leftCol = (lb.asset_boxes || []).map(boxHtml).join('');
+  const rightCol = (lb.liab_equity_boxes || []).map(boxHtml).join('');
+  return ''
+    + '<div class="big-bs-card">'
+    + '  <h3>📊 貸借対照表 ' + esc(lb.month) + ' 時点 (5つの箱) — 左列 ＝ 右列 で釣り合い</h3>'
+    + '  <div class="bsbox-grid">'
+    + '    <div class="bsbox-col">'
+    + '      <div class="bsbox-colhead">資産の部 &nbsp;<strong>' + fmtBox(lb.total_asset) + '</strong></div>'
+    + '      <div class="bsbox-stack">' + leftCol + '</div>'
+    + '    </div>'
+    + '    <div class="bsbox-col">'
+    + '      <div class="bsbox-colhead">負債・純資産の部 &nbsp;<strong>' + fmtBox(lb.total_liab + lb.net_assets) + '</strong> <span style="font-weight:400;color:#6b7280">(負債 ' + fmtBox(lb.total_liab) + ' ＋ 純資産 ' + fmtBox(lb.net_assets) + ')</span></div>'
+    + '      <div class="bsbox-stack">' + rightCol + '</div>'
+    + '    </div>'
+    + '  </div>'
+    + '</div>';
 }
 
 async function loadDetails() {
