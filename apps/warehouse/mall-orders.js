@@ -1,12 +1,12 @@
 /**
- * 小規模モール受注データ取得 — Qoo10 / au PAY / メルカリShops / LINEギフト
+ * 小規模モール受注データ取得 — Qoo10 / メルカリShops / LINEギフト
+ * (au PAY は apps/warehouse/aupay-orders.js に分離 — Phase 1 で受注 API 全フィールド + fail-closed 化)
  *
  * 使い方:
  *   node apps/warehouse/mall-orders.js qoo10 [days]
- *   node apps/warehouse/mall-orders.js aupay [days]
  *   node apps/warehouse/mall-orders.js mercari [days]
  *   node apps/warehouse/mall-orders.js linegift [days]
- *   node apps/warehouse/mall-orders.js all [days]       → 全モール一括
+ *   node apps/warehouse/mall-orders.js all [days]       → 上記 3 モール一括
  *
  * デフォルト: 直近7日分
  */
@@ -24,7 +24,7 @@ function ensureTables() {
   const db = getDB();
 
   // 各モール共通の受注テーブル（モール名をテーブル名に含める）
-  for (const mall of ['qoo10', 'aupay', 'mercari', 'linegift']) {
+  for (const mall of ['qoo10', 'mercari', 'linegift']) {
     db.exec(`CREATE TABLE IF NOT EXISTS raw_${mall}_orders (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       order_id TEXT NOT NULL,
@@ -131,111 +131,6 @@ async function fetchQoo10(days = 7) {
   return total;
 }
 
-// ─── au PAY Market（Wow! manager API — wmshopapi） ───
-
-const AUPAY_SHOP_ID = process.env.AUPAY_SHOP_ID || '54318092';
-// VPSプロキシ経由の場合: AUPAY_PROXY_URL=http://133.167.122.198:8080 + AUPAY_PROXY_SECRET
-// 直接アクセスの場合: AUPAY_API_KEY のみ設定
-const AUPAY_PROXY_URL = process.env.AUPAY_PROXY_URL || '';
-const AUPAY_PROXY_SECRET = process.env.AUPAY_PROXY_SECRET || '';
-const AUPAY_BASE = AUPAY_PROXY_URL
-  ? `${AUPAY_PROXY_URL}/wmshopapi`
-  : 'https://api.manager.wowma.jp/wmshopapi';
-
-async function fetchAuPay(days = 7) {
-  const apiKey = process.env.AUPAY_API_KEY;
-  if (!apiKey && !AUPAY_PROXY_URL) { console.log('[auPay] AUPAY_API_KEY または AUPAY_PROXY_URL が未設定'); return; }
-
-  console.log(`[auPay] 受注取得開始（直近${days}日）`);
-  const db = getDB();
-  const ts = now();
-  const end = new Date();
-  const start = new Date(); start.setDate(start.getDate() - days);
-  const startDate = start.toISOString().slice(0, 10).replace(/-/g, '');
-  const endDate = end.toISOString().slice(0, 10).replace(/-/g, '');
-
-  const stmt = db.prepare(`
-    INSERT OR REPLACE INTO raw_aupay_orders (order_id, order_date, order_status, item_code, item_name, quantity, unit_price, total_price, option_info, synced_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?)
-  `);
-
-  let total = 0;
-  let startCount = 1;
-  const pageSize = 100;
-
-  while (true) {
-    const qs = new URLSearchParams({
-      shopId: AUPAY_SHOP_ID,
-      totalCount: String(pageSize),
-      startCount: String(startCount),
-      startDate,
-      endDate,
-      dateType: '0',  // 0=受注日
-    });
-
-    const url = `${AUPAY_BASE}/searchTradeInfoListProc?${qs}`;
-    const headers = AUPAY_PROXY_URL
-      ? { 'X-Proxy-Secret': AUPAY_PROXY_SECRET }
-      : { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/x-www-form-urlencoded' };
-    const res = await fetch(url, { method: 'GET', headers });
-
-    const xml = await res.text();
-    const parsed = await parseStringPromise(xml, { explicitArray: false });
-    const response = parsed.response;
-
-    if (response.result?.status !== '0') {
-      const err = response.result?.error;
-      throw new Error(`[auPay] APIエラー: ${err?.code} ${err?.message}`);
-    }
-
-    const resultCount = parseInt(response.resultCount) || 0;
-    if (resultCount === 0) break;
-
-    // orderInfoが1件の場合はオブジェクト、複数の場合は配列
-    const orders = Array.isArray(response.orderInfo) ? response.orderInfo : [response.orderInfo];
-
-    const tx = db.transaction(() => {
-      for (const order of orders) {
-        if (!order) continue;
-        const orderId = order.orderId || '';
-        const orderDate = order.orderDate || '';
-        const orderStatus = order.orderStatus || '';
-
-        // detailが1件の場合はオブジェクト、複数の場合は配列
-        const details = order.detail
-          ? (Array.isArray(order.detail) ? order.detail : [order.detail])
-          : [];
-
-        for (const detail of details) {
-          stmt.run(
-            orderId,
-            orderDate,
-            orderStatus,
-            (detail.itemCode || '').toLowerCase(),
-            detail.itemName || '',
-            parseInt(detail.unit) || 0,
-            parseFloat(detail.itemPrice) || 0,
-            parseFloat(detail.totalItemPrice) || 0,
-            detail.itemOption || '',
-            ts
-          );
-          total++;
-        }
-      }
-    });
-    tx();
-
-    console.log(`[auPay] ${total}件取得 (startCount: ${startCount}, resultCount: ${resultCount})`);
-
-    if (resultCount < pageSize) break;
-    startCount += pageSize;
-    await sleep(2000);
-  }
-
-  updateSyncMeta('aupay_last_sync', now());
-  console.log(`[auPay] 受注取得完了: ${total}件`);
-  return total;
-}
 
 // ─── メルカリShops ───
 
@@ -484,14 +379,13 @@ async function main() {
   await initDB();
   ensureTables();
 
+  // au PAY は apps/warehouse/aupay-orders.js に分離 (Phase 1 で受注 API 全フィールド + fail-closed 化)
   const handlers = {
     qoo10: () => fetchQoo10(days),
-    aupay: () => fetchAuPay(days),
     mercari: () => fetchMercari(days),
     linegift: () => fetchLineGift(days),
     all: async () => {
       await fetchQoo10(days);
-      await fetchAuPay(days);
       await fetchMercari(days);
       await fetchLineGift(days);
     },
@@ -500,7 +394,7 @@ async function main() {
   if (handlers[command]) {
     await handlers[command]();
   } else {
-    console.log('使い方: node apps/warehouse/mall-orders.js [qoo10|aupay|mercari|linegift|all] [days]');
+    console.log('使い方: node apps/warehouse/mall-orders.js [qoo10|mercari|linegift|all] [days]  (au PAY は aupay-orders.js)');
   }
 }
 

@@ -209,8 +209,9 @@ async function main() {
   const yahooResult = runScript('apps/warehouse/yahoo-orders.js 7', 'Yahoo!ショッピング', 3600000);
   results.push({ name: 'Yahoo', ...yahooResult });
 
-  // au PAY Market
-  const aupayResult = runScript('apps/warehouse/mall-orders.js aupay', 'au PAY');
+  // au PAY マーケット (Wow!manager API、VPS proxy 経由で遅延しやすいため 60 分)
+  // Phase 1: aupay-orders.js (受注 API 全フィールド + fail-closed) に移行
+  const aupayResult = runScript('apps/warehouse/aupay-orders.js 7', 'au PAY マーケット', 3600000);
   results.push({ name: 'au PAY', ...aupayResult });
 
   // Qoo10
