@@ -507,6 +507,90 @@ function createTables() {
   //   { name: 'ad_spend_jpy_incl', def: 'REAL' }
   //   ... (full margin 用列、楽天 + Yahoo 共通スキーマ化検討)
 
+  // mirror_aupay_finance_sku_daily — au PAY マーケット Phase 1 A-2 (Render 側 daily fact mirror)
+  // miniPC の f_aupay_finance_sku_daily_v1 の payload を受信
+  // PK: (date_jst, aupay_sku_key) — aupay_sku_key = item_code (variant 粒度は variant_key=item_option 保持)
+  // 設計書 v0.4: g:/共有ドライブ/AI_reference/システム設計/auPAYマーケットPhase1設計書_v0.4_20260512.md
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_aupay_finance_sku_daily (
+    date_jst                          TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+    aupay_sku_key                     TEXT NOT NULL CHECK(trim(aupay_sku_key) <> ''),
+    ne_code                           TEXT,
+    variant_key                       TEXT NOT NULL DEFAULT '',
+    resolution_method                 TEXT NOT NULL CHECK (
+      resolution_method IN ('master_match', 'manual_map', 'unresolved')
+    ),
+    unresolved_sku_flag               INTEGER NOT NULL DEFAULT 0,
+    product_name                      TEXT NOT NULL DEFAULT '',
+    units_ordered                     INTEGER NOT NULL DEFAULT 0,
+    units_cancelled                   INTEGER NOT NULL DEFAULT 0,
+    units_net_sold                    INTEGER NOT NULL DEFAULT 0,
+    sales_principal_jpy_incl          REAL NOT NULL DEFAULT 0,
+    postage_allocated_jpy_incl        REAL NOT NULL DEFAULT 0,
+    gross_sales_jpy_incl              REAL NOT NULL DEFAULT 0,
+    net_sales_after_coupon_jpy_incl   REAL NOT NULL DEFAULT 0,
+    request_price_jpy_incl            REAL NOT NULL DEFAULT 0,
+    coupon_shop_jpy_incl              REAL NOT NULL DEFAULT 0,
+    gift_point_jpy_incl               REAL NOT NULL DEFAULT 0,
+    use_ponta_point_jpy_incl          REAL NOT NULL DEFAULT 0,
+    use_au_point_jpy_incl             REAL NOT NULL DEFAULT 0,
+    premium_member_point_jpy_incl     REAL NOT NULL DEFAULT 0,
+    point_cost_pending_jpy_incl       REAL NOT NULL DEFAULT 0,
+    tax_normal_sales_jpy_incl         REAL NOT NULL DEFAULT 0,
+    tax_reduced_sales_jpy_incl        REAL NOT NULL DEFAULT 0,
+    tax_free_sales_jpy_incl           REAL NOT NULL DEFAULT 0,
+    mall_fee_jpy_incl                 REAL,
+    mall_fee_rate_applied             REAL,
+    mall_fee_calc_method              TEXT NOT NULL DEFAULT 'unknown' CHECK (
+      mall_fee_calc_method IN ('estimated_rate', 'actual_statement', 'unknown')
+    ),
+    mall_fee_estimate_delta_jpy       REAL,
+    shipping_cost_jpy_incl            REAL NOT NULL DEFAULT 0,
+    shipping_quality                  TEXT NOT NULL CHECK (
+      shipping_quality IN ('actual', 'estimated_rates', 'estimated_fallback', 'missing')
+    ),
+    unit_cost_snapshot_incl           REAL,
+    cost_snapshot_date_jst            TEXT,
+    latest_unit_cost_reference_incl   REAL,
+    cogs_amount_jpy_incl              REAL NOT NULL DEFAULT 0,
+    variable_margin_partial_jpy_incl  REAL NOT NULL DEFAULT 0,
+    variable_margin_full_jpy_incl     REAL,
+    refund_adjusted_net_sales_jpy_incl REAL,
+    margin_confidence                 TEXT NOT NULL DEFAULT 'partial' CHECK (
+      margin_confidence IN ('partial', 'full')
+    ),
+    margin_full_finalized_at          TEXT,
+    before_discount_jpy_incl          REAL NOT NULL DEFAULT 0,
+    detail_discount_jpy_incl          REAL NOT NULL DEFAULT 0,
+    charge_allocated_jpy_incl         REAL NOT NULL DEFAULT 0,
+    item_option_jpy_incl              REAL NOT NULL DEFAULT 0,
+    gift_wrapping_jpy_incl            REAL NOT NULL DEFAULT 0,
+    cost_status                       TEXT NOT NULL CHECK (
+      cost_status IN ('complete', 'missing_cost', 'partial_cost', 'late_bound_after_close')
+    ),
+    is_cost_complete                  INTEGER NOT NULL DEFAULT 0,
+    data_quality_score                INTEGER NOT NULL DEFAULT 0
+                                      CHECK (data_quality_score BETWEEN 0 AND 100),
+    price_variance_warning            INTEGER NOT NULL DEFAULT 0,
+    order_count                       INTEGER NOT NULL DEFAULT 0,
+    line_count                        INTEGER NOT NULL DEFAULT 0,
+    source_layer_summary              TEXT NOT NULL DEFAULT '',
+    source_row_count                  INTEGER NOT NULL DEFAULT 0,
+    built_at                          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    source_run_id                     TEXT NOT NULL,
+    source_row_hash                   TEXT NOT NULL,
+    synced_at                         TEXT NOT NULL,
+    PRIMARY KEY (date_jst, aupay_sku_key)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mafsd_date  ON mirror_aupay_finance_sku_daily(date_jst)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mafsd_ne    ON mirror_aupay_finance_sku_daily(ne_code)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mafsd_month ON mirror_aupay_finance_sku_daily(substr(date_jst, 1, 7))');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mafsd_run   ON mirror_aupay_finance_sku_daily(source_run_id)');
+  // Phase B (full margin backfill) 着手時の migration framework
+  const mafsdCols = new Set(
+    db.prepare("PRAGMA table_info(mirror_aupay_finance_sku_daily)").all().map(c => c.name)
+  );
+  void mafsdCols; // Phase A 時点で全列 DDL に含まれてるので追加なし
+
   // mirror_amazon_sku_fees — Amazon手数料キャッシュ（粗利ダッシュボード用）
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_amazon_sku_fees (
     seller_sku          TEXT PRIMARY KEY,

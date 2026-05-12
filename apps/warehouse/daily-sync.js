@@ -357,6 +357,38 @@ async function main() {
     } else {
       console.log(`[DailySync] Yahoo finance DQ/sync は build 失敗のため記録せず (build retry 後に翌 cron で実行)`);
     }
+
+    // === au PAY マーケット finance daily fact (Phase 1 A-2、A-1 build + DQ + A-2 sync 統合) ===
+    // 1. f_aupay_finance_sku_daily_v1 build (rolling: 当月 + 前2か月、whitelist orderStatus='完了'+itemCancelStatus='N'、partial margin 5要素)
+    //    mall_fee は config/aupay_mall_fee_rates.json 由来の率推計 (現状 13% 暫定)
+    // 2. DQ gate (11 check、severity error で exit 1)
+    // 3. mirror_aupay_finance_sku_daily へ sync (chunk POST + ledger)
+    // build 失敗で DQ/sync スキップ、DQ gate failure でも sync スキップ (楽天/Yahoo と同方針)
+    const aupayFinanceBuildResult = runScript(
+      `scripts/aupay-finance/build-aupay-daily-fact.js --data-dir ${DATA_DIR_ARG} --month ${currentMonth}`,
+      'au PAY finance build', 600000
+    );
+    results.push({ name: 'au PAY finance build', ...aupayFinanceBuildResult });
+
+    if (aupayFinanceBuildResult.success) {
+      const aupayFinanceDqResult = runScript(
+        `apps/warehouse/run-aupay-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${currentMonth}`,
+        'au PAY finance DQ', 300000
+      );
+      results.push({ name: 'au PAY finance DQ', ...aupayFinanceDqResult });
+
+      if (aupayFinanceDqResult.success) {
+        const aupayFinanceSyncResult = runScript(
+          `apps/warehouse/sync-aupay-finance-daily.js --data-dir ${DATA_DIR_ARG} --month ${currentMonth}`,
+          'au PAY finance sync', 600000
+        );
+        results.push({ name: 'au PAY finance sync', ...aupayFinanceSyncResult });
+      } else {
+        console.log(`[DailySync] au PAY finance sync は DQ gate failure のため記録せず (品質不正データの mirror 投入防止)`);
+      }
+    } else {
+      console.log(`[DailySync] au PAY finance DQ/sync は build 失敗のため記録せず (build retry 後に翌 cron で実行)`);
+    }
   }
 
   // 楽天 AM/AL/W → NE商品コード sku_map 再構築 (f_sales と独立)
