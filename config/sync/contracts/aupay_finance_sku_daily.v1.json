@@ -4,7 +4,7 @@
   "source_system": "minipc-warehouse",
   "source_object": "f_aupay_finance_sku_daily_v1",
   "target_table": "mirror_aupay_finance_sku_daily",
-  "grain_definition": "one row = one (date_jst, aupay_sku_key) — aupay_sku_key = item_code (variant 粒度は variant_key=item_option 保持)",
+  "grain_definition": "one row = one (date_jst, aupay_sku_key) — aupay_sku_key = item_code + (item_management_id があれば '-' を挟んで連結) で子SKU相当の grain (variant 区別。表示用 variant 文字列は variant_key=item_option)",
   "key_columns_json": "[\"date_jst\", \"aupay_sku_key\"]",
   "payload_schema_json": "{\"type\":\"object\",\"required\":[\"date_jst\",\"aupay_sku_key\"],\"properties\":{\"date_jst\":{\"type\":\"string\",\"pattern\":\"^\\\\d{4}-\\\\d{2}-\\\\d{2}$\"},\"aupay_sku_key\":{\"type\":\"string\",\"minLength\":1},\"variable_margin_partial_jpy_incl\":{\"type\":\"number\"},\"margin_confidence\":{\"type\":\"string\",\"enum\":[\"partial\",\"full\"]},\"resolution_method\":{\"type\":\"string\",\"enum\":[\"master_match\",\"manual_map\",\"unresolved\"]},\"cost_status\":{\"type\":\"string\",\"enum\":[\"complete\",\"missing_cost\",\"partial_cost\",\"late_bound_after_close\"]},\"shipping_quality\":{\"type\":\"string\",\"enum\":[\"actual\",\"estimated_rates\",\"estimated_fallback\",\"missing\"]},\"mall_fee_calc_method\":{\"type\":\"string\",\"enum\":[\"estimated_rate\",\"actual_statement\",\"unknown\"]}}}",
   "clear_strategy": "scope_clear_per_run",
