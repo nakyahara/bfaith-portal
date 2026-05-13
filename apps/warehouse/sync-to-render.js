@@ -445,14 +445,16 @@ export async function syncToRender() {
       await notify(`⚠️ *Render同期 データ不一致*\n商品: ${verify.products.sent}→${verify.products.received}\n月次: ${verify.monthly.sent}→${verify.monthly.received}\n日次: ${verify.daily.sent}→${verify.daily.received}\n在庫: ${verify.stock_snapshot.sent}→${verify.stock_snapshot.received}${stockSyncPlan.fetched ? '' : ' (skipped)'}\n${skuMasterLine}`);
     }
 
-    // ok の判定方針:
+    // ok の判定方針 (Codex round 4 high 反映):
     //   既存テーブル (products/monthly/daily/stock_snapshot) の count 不一致は notify のみで ok:true を維持
     //     (intermittent な count drift で daily-sync が常時 retry になるのを避ける、従来動作)
-    //   sku_master の状態異常 (empty_skipped / select_failed) は新 PR スコープのため ok:false にする
+    //   sku_master は **状態異常も count mismatch も** すべて ok:false にする (新 PR スコープ)
+    //     SELECT 失敗 / 0 件スキップ / Render 側 partial apply / status 件数不一致 のいずれも
     //     daily-sync 側で retry-failed-jobs に拾わせ、再発リスクを早く気付ける状態にする
-    const sku_master_critical_failure =
-      sku_master_state === 'empty_skipped' || sku_master_state === 'select_failed';
-    return { ok: !sku_master_critical_failure, verify };
+    const sku_master_failure =
+      sku_master_state !== 'ok' ||
+      verify.sku_master.sent !== verify.sku_master.received;
+    return { ok: !sku_master_failure, verify };
   } catch (e) {
     console.error(`[Sync→Render] ❌ 送信失敗:`, e.message);
     await notify(`❌ *Render同期失敗*\n${e.message.slice(0, 200)}`);
