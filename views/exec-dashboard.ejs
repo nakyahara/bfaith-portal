@@ -55,6 +55,7 @@
     .bsbox-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
     .bsbox-label { font-size: 16px; font-weight: 700; color: #1f2937; }
     .bsbox-amt { font-size: 16px; font-weight: 700; color: #111; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .bsbox-pct { font-size: 13px; font-weight: 600; color: #6b7280; margin-left: 2px; }
     .bsbox-note { font-size: 11px; color: #6b7280; margin-top: 2px; }
     /* アコーディオン式 BS */
     .bsacc-group { margin-bottom: 12px; }
@@ -471,8 +472,9 @@ async function loadPl() {
 // PL 箱図 (左=売上、右=売上原価(上)/販管費(中)/営業利益(下)、高さ ∝ 金額、左右が釣り合い)
 function renderPlBoxHtml(b) {
   const fmt = (v) => '¥' + fmtJpyComma(v);
+  const pctOf = (v, whole) => whole ? '<span class="bsbox-pct">(' + (v / whole * 100).toFixed(1) + '%)</span>' : '';
   const total = b.sales || 0;
-  // 右列: 上から 売上原価(変動費) / 販管費(固定費) / 営業利益(利益)
+  // 右列: 上から 売上原価(変動費) / 販管費(固定費) / 営業利益(利益)。% は売上高に対する比率
   const rightSegs = [
     { label: '売上原価 (変動費)', note: '商品仕入・モール手数料・運賃・広告等', total: b.cogs || 0, bg: '#fde4ec', border: '#ec407a' },
     { label: '販管費 (固定費)', note: '役員報酬・給与・家賃・減価償却等', total: b.sgae || 0, bg: '#fff0df', border: '#f57c00' },
@@ -480,7 +482,7 @@ function renderPlBoxHtml(b) {
   ];
   const segHtml = (s) => ''
     + '<div class="bsbox" style="flex-grow:' + Math.max(1, Math.abs(s.total)) + ';background:' + s.bg + ';border-left-color:' + s.border + '">'
-    + '<div class="bsbox-head"><span class="bsbox-label">' + esc(s.label) + '</span><span class="bsbox-amt">' + fmt(s.total) + '</span></div>'
+    + '<div class="bsbox-head"><span class="bsbox-label">' + esc(s.label) + '</span><span class="bsbox-amt">' + fmt(s.total) + ' ' + pctOf(s.total, total) + '</span></div>'
     + '<div class="bsbox-note">' + esc(s.note) + '</div></div>';
   // 利益の流れ (waterfall) を box の下に注記
   const wf = (b.profit_waterfall || []);
@@ -558,10 +560,12 @@ async function loadBs() {
 // 「5つの箱」貸借対照表 図解 (純 HTML/CSS、高さ ∝ 金額) — 概観のみ、細目はアコーディオンで
 function renderBsBoxDiagramHtml(lb) {
   const fmtBox = (v) => '¥' + fmtJpyComma(v);
+  const denom = lb.total_asset || (lb.total_liab + lb.net_assets) || 0;  // 資産の部合計 = 負債純資産合計
+  const pctOf = (v) => denom ? '<span class="bsbox-pct">(' + (v / denom * 100).toFixed(1) + '%)</span>' : '';
   const sideBoxes = (side) => (lb.boxes || []).filter(b => b.side === side);
   const boxHtml = (b) => ''
     + '<div class="bsbox" style="flex-grow:' + Math.max(1, b.total) + ';background:' + b.bg + ';border-left-color:' + b.border + '">'
-    + '<div class="bsbox-head"><span class="bsbox-label">' + esc(b.label) + '</span><span class="bsbox-amt">' + fmtBox(b.total) + '</span></div>'
+    + '<div class="bsbox-head"><span class="bsbox-label">' + esc(b.label) + '</span><span class="bsbox-amt">' + fmtBox(b.total) + ' ' + pctOf(b.total) + '</span></div>'
     + '<div class="bsbox-note">' + esc(b.note || '') + '</div>'
     + '</div>';
   const leftCol = sideBoxes('asset').map(boxHtml).join('');
