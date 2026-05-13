@@ -460,6 +460,10 @@ function renderFySummary(rows, headcount, meta) {
             + yenOnly('減価償却費 累計', fy.loan.depreciation_cum)
             + '  </div>')
           : '')
+      // 💰 簡易キャッシュフロー (間接法、Phase 1d-4)
+      + (fy.cash_flow && fy.cash_flow.available
+          ? renderCashFlowHtml(fy.cash_flow)
+          : '')
       + '</div>';
   };
 
@@ -484,6 +488,61 @@ function renderFySummary(rows, headcount, meta) {
     span.style.color = '#6b7280';
     sb.appendChild(span);
   }
+}
+
+// ─── 💰 簡易キャッシュフロー (間接法、Phase 1d-4) ───
+//   経営者向け「利益 → 現金」ブリッジを fy-card に挿入。
+//   表示する金額の符号は CF 影響ベース (BS 変動の符号と逆になる項目あり、コメント参照)
+function renderCashFlowHtml(cf) {
+  // 符号付き金額: + は緑 (現金 IN)、- は赤 (現金 OUT)、0 はグレー
+  const sign = (v) => {
+    if (v == null || !Number.isFinite(v)) return '—';
+    if (v === 0) return '±¥0';
+    return (v > 0 ? '+' : '▲') + fmtJpyShort(Math.abs(v));
+  };
+  const colorOf = (v) => (v == null || !Number.isFinite(v)) ? '#6b7280' : (v > 0 ? '#16a34a' : (v < 0 ? '#dc2626' : '#6b7280'));
+  const row = (label, value, opts) => {
+    opts = opts || {};
+    const indent = opts.indent ? 'padding-left:14px;color:#6b7280;' : 'color:#111;';
+    const bold = opts.bold ? 'font-weight:700;' : '';
+    const border = opts.borderTop ? 'border-top:1px solid #e5e7eb;padding-top:4px;margin-top:2px;' : '';
+    const fz = opts.bold ? '13px' : '12px';
+    const color = colorOf(value);
+    return '<div style="display:flex;justify-content:space-between;font-size:' + fz + ';padding:2px 0;' + indent + bold + border + '">'
+         + '<span>' + esc(label) + '</span>'
+         + '<span style="color:' + color + ';font-variant-numeric:tabular-nums">' + esc(sign(value)) + '</span>'
+         + '</div>';
+  };
+  // BS 変動 → CF 影響への符号変換:
+  //   資産系 (AR/棚卸/その他流動資産): BS増加 = CF▲ (資金圧迫) → -wc_*_change
+  //   負債系 (AP/その他流動負債/その他固定負債): BS増加 = CF+ (資金調達) → +wc_*_change
+  return '  <div style="font-size:11px;color:#6b7280;margin:10px 0 4px;font-weight:600;border-top:1px solid #e5e7eb;padding-top:8px">'
+    + '💰 簡易キャッシュフロー (間接法)'
+    + '<span style="font-weight:400;color:#9ca3af;margin-left:6px">期首=' + esc(cf.opening_ym) + ' / 確定月=' + esc(cf.closing_ym) + '</span>'
+    + '</div>'
+    + '<div style="background:#fafbfc;border:1px solid #e5e7eb;border-radius:6px;padding:8px 12px;margin-top:4px">'
+    + row('利益 (経常利益累計)', cf.profit_base)
+    + row('+ 減価償却費 (現金支出なき費用)', cf.depreciation)
+    + row('= キャッシュ生成 小計', cf.cash_generation, { bold: true, borderTop: true })
+    + '<div style="font-size:11px;color:#6b7280;margin:6px 0 2px">営業WC変動 (CF影響):</div>'
+    + row('売掛金 (▲=未回収増)', -cf.wc_ar_change, { indent: true })
+    + row('棚卸資産 (▲=過剰在庫増)', -cf.wc_inv_change, { indent: true })
+    + row('買掛金 (+=支払繰延)', cf.wc_ap_change, { indent: true })
+    + row('その他流動資産 (前払/仮払/立替 等)', -cf.wc_other_ca_change, { indent: true })
+    + row('その他流動負債 (未払消費税/未払金/預り 等)', cf.wc_other_cl_change, { indent: true })
+    + row('▶ 営業CF (本業の現金生成力)', cf.operating_cf, { bold: true, borderTop: true })
+    + row('投資CF (固定資産取得相当・売却時は過小)', cf.investing_cf, { bold: true })
+    + row('財務CF (借入金+資本金+役員借入金/長期未払金 等 変動)', cf.financing_cf, { bold: true })
+    + row('= 現金純増減 (理論)', cf.theoretical_cash_change, { bold: true, borderTop: true })
+    + row('現金純増減 (実績、BS差分)', cf.actual_cash_change, { bold: true })
+    // 差額: 税金支払・為替差・資本取引差等。閾値超過 (max(¥10M, 実績×20%)) なら赤太字 ⚠
+    + (cf.unexplained_severity === 'high'
+        ? '<div style="display:flex;justify-content:space-between;font-size:12px;padding:2px 0;border-top:1px solid #e5e7eb;padding-top:4px;margin-top:2px;color:#dc2626;font-weight:600">'
+            + '<span>差額 (未分類: 税金支払・為替差・資本取引差等) ⚠ 閾値超過</span>'
+            + '<span style="font-variant-numeric:tabular-nums">' + esc(sign(cf.unexplained)) + '</span>'
+          + '</div>'
+        : row('差額 (未分類: 税金支払・為替差・資本取引差等)', cf.unexplained, { borderTop: true }))
+    + '</div>';
 }
 
 async function loadTimeseries() {
