@@ -22,7 +22,10 @@ import Database from 'better-sqlite3';
 
 const ENTITY_NAME = 'aupay_finance_sku_daily';
 const CONTRACT_VERSION = 1;
-const CHUNK_SIZE = parseInt(process.env.CHUNK_SIZE, 10) || 5000;
+// au PAY の fact 行は ~55 列 + 日本語 product_name/variant_key で楽天/Yahoo より重い。
+// 1 chunk = 655 行で Render 側が `terminated` で落ちる (300 行 × 3 chunk なら通る) のを確認したので
+// chunk を小さめに固定。daily-sync が CHUNK_SIZE=3000 を global に set しても au PAY は 500 で上限。
+const CHUNK_SIZE = Math.min(parseInt(process.env.CHUNK_SIZE, 10) || 500, 500);
 
 const args = process.argv.slice(2);
 function getArg(flag) {
