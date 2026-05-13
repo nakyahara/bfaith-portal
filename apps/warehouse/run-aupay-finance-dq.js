@@ -42,17 +42,20 @@ function isCurrentMonth(ym) { const nowJst = new Date(Date.now() + 9 * 3600 * 10
 
 const THRESHOLDS_PAST = {
   row_count_drift:                  { warn: 0,    error: 0 },
-  listing_diff_pct:                 { warn: 1.0,  error: 5.0 },
-  missing_cost_rate_pct:            { warn: 5.0,  error: 10.0 },
-  shipping_missing_rate_pct:        { warn: 5.0,  error: 10.0 },
+  // au PAY は f_sales_by_listing (NE 経由) と fact (au PAY API 直) でソース経路が違い、構造的に ~5-6% の乖離が常時ある
+  listing_diff_pct:                 { warn: 3.0,  error: 8.0 },
+  // missing_cost / shipping_missing は unresolved 親 SKU (~9-10%、意図的に粒度を潰さない層) で必ず欠ける = unresolved_sku_rate と同水準が正常。
+  // 「解決済なのに原価ゼロ」は resolved_but_zero_cost_count (error=1) が別途厳格に拾うので、ここは急増検知用に unresolved と同じ閾値にする
+  missing_cost_rate_pct:            { warn: 12.0, error: 20.0 },
+  shipping_missing_rate_pct:        { warn: 12.0, error: 20.0 },
   unresolved_sku_rate_pct:          { warn: 12.0, error: 20.0 },  // au PAY: 親 SKU が意図的に unresolved (~9%)、急増検知用
   whitelist_coverage_pct:           { warn: 95.0, error: 90.0 },
   resolved_but_zero_cost_count:     { warn: 1,    error: 1 },
   normalized_collision_count:       { warn: 1,    error: 999 },
   request_price_reconcile_diff_pct: { warn: 0.5,  error: 1.0 },
-  // Phase A の間は成約手数料率が config 未設定 = 100% unknown が正常 → error は無効化、warn のみ。
-  // Phase B で config/aupay_mall_fee_rates.json 設定後、unknown 比率が下がったら error 閾値を意味あるものに戻す
-  mall_fee_rate_missing_pct:        { warn: 50.0, error: 100.01 },
+  // config/aupay_mall_fee_rates.json で成約手数料率 (現状 13% 暫定) を設定済 → 通常 0% (全 store に率あり)。
+  // unknown 比率が上がる = config 欠損/破損 or 新 store。Phase B で actual_statement に置換しても calc_method='unknown' でない限り問題なし
+  mall_fee_rate_missing_pct:        { warn: 5.0,  error: 50.0 },
   allocation_conservation_diff_pct: { warn: 0.01, error: 0.01 },
 };
 const THRESHOLDS_CURRENT = {
