@@ -70,25 +70,44 @@ function main_() {
   }
   const data = JSON.parse(body);
 
-  // 2. mirror freshness 検証 (Codex review: stale mirror を正常扱いしない)
+  // 2. レスポンス契約検証 (Codex review 2026-05-13 medium #4):
+  //    server 側だけが将来勝手に契約を変えても気付けるよう、固定値を必ず検証する
+  if (data.since_days !== SINCE_DAYS) {
+    throw new Error('Mirror endpoint contract drift: since_days=' + data.since_days + ' (expected ' + SINCE_DAYS + ')');
+  }
+  if (!Array.isArray(data.items)) {
+    throw new Error('Mirror endpoint contract drift: items is not array');
+  }
+
+  // 3. mirror freshness 検証 (Codex review: stale mirror を正常扱いしない)
+  //    mirror_last_synced_at (sync 全体の最終時刻) と mirror_sku_master_synced_at (このテーブルの最新)
+  //    の両方を見る。どちらかが古ければ daily-sync 側の失敗を疑う。
   const masterSync = data.mirror_sku_master_synced_at;
+  const overallSync = data.mirror_last_synced_at;
   if (!masterSync) {
     throw new Error('mirror_sku_master_synced_at が空 — Render mirror に sku_master が未投入の可能性');
   }
-  // 'YYYY-MM-DD HH:MM:SS' (mirror 側 server.js のローカル文字列、UTC) を Date に
-  const syncDate = parseSyncedAt_(masterSync);
-  if (!syncDate) {
-    throw new Error('mirror_sku_master_synced_at がパース不能: ' + masterSync);
+  if (!overallSync) {
+    throw new Error('mirror_last_synced_at が空 — Render mirror の同期メタが未取得、Render 側 DB 異常の可能性');
   }
-  const ageHours = (Date.now() - syncDate.getTime()) / 36e5;
-  if (ageHours > MIRROR_FRESHNESS_MAX_HOURS) {
+  const masterAge = ageHours_(masterSync);
+  const overallAge = ageHours_(overallSync);
+  if (masterAge === null) throw new Error('mirror_sku_master_synced_at がパース不能: ' + masterSync);
+  if (overallAge === null) throw new Error('mirror_last_synced_at がパース不能: ' + overallSync);
+  if (masterAge > MIRROR_FRESHNESS_MAX_HOURS) {
     throw new Error(
-      'Mirror が stale: sku_master 最終同期 ' + masterSync + ' (' + ageHours.toFixed(1) + 'h 前) — ' +
+      'Mirror が stale (sku_master): 最終同期 ' + masterSync + ' (' + masterAge.toFixed(1) + 'h 前) — ' +
+      'miniPC daily-sync の失敗を疑ってください'
+    );
+  }
+  if (overallAge > MIRROR_FRESHNESS_MAX_HOURS) {
+    throw new Error(
+      'Mirror が stale (全体): 最終同期 ' + overallSync + ' (' + overallAge.toFixed(1) + 'h 前) — ' +
       'miniPC daily-sync の失敗を疑ってください'
     );
   }
 
-  const masterItems = Array.isArray(data.items) ? data.items : [];
+  const masterItems = data.items;
 
   // 3. シート側「商品コード変換テーブル」の SKU 集合を作る (正規化済み)
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -141,7 +160,7 @@ function main_() {
   // 注意書きセル
   out.getRange(1, headers.length + 2)
     .setValue('直近 ' + SINCE_DAYS + ' 日に登録/更新された SKU のうち、「' + sourceSheetName +
-              '」(A列='+sourceSkuColumn+'列目) に未記載のもの。毎朝07:30頃、自動上書き。')
+              '」' + sourceSkuColumn + '列目に未記載のもの。毎朝07:30頃、自動上書き。')
     .setFontColor('#666');
   // 列幅
   out.autoResizeColumns(1, headers.length);
@@ -167,6 +186,13 @@ function parseSyncedAt_(s) {
   const m = String(s).match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})/);
   if (!m) return null;
   return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]));
+}
+
+/** synced_at 文字列を現在からの経過時間 (hours) に。パース不能なら null */
+function ageHours_(s) {
+  const d = parseSyncedAt_(s);
+  if (!d) return null;
+  return (Date.now() - d.getTime()) / 36e5;
 }
 
 /** ISO 8601 (UTC Z) or Date を JST 'YYYY-MM-DD HH:MM:SS' に。失敗時は元の文字列 */

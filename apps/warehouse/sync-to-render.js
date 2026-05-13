@@ -183,9 +183,15 @@ export async function syncToRender() {
   //   sku_resolved は seller_sku × ne_code 粒度 (派生) なので、SKU 一覧用途には不自然
   //   m_sku_master.{seller_sku, 商品名, created_at, updated_at} をそのまま 1 SKU 1 行で送る
   //   (Codex review 2026-05-13: A''案 = master の mirror を独立に持つ)
-  let sku_master = [];
+  //
+  // ★ 取得失敗時は payload に sku_master を **含めない** (null のまま)。
+  //   過去事故 (2026-05-08〜10 Yahoo VPS proxy regression: 取得失敗を「空配列の正常同期」として
+  //   流し、mirror を 3 日間全空文字で上書き) の再発防止。stockSnapshot と同じ fail-closed 方針。
+  //   0 件は「m_sku_master が SELECT 成功 & 真に空 = 異常状況」と扱い、明示 meta.clear_sku_master=true を
+  //   付けて受信側に「これは全消し意図」と伝える。flag が無ければ受信側は 0 件反映を拒否する設計。
+  let sku_master = null;
   try {
-    sku_master = db.prepare(`
+    const rows = db.prepare(`
       SELECT
         seller_sku,
         商品名,
@@ -194,9 +200,10 @@ export async function syncToRender() {
       FROM m_sku_master
       ORDER BY seller_sku
     `).all();
-    console.log(`[Sync→Render]   sku_master: ${sku_master.length}件 (1 SKU = 1 行)`);
+    sku_master = rows; // SELECT 成功時のみ payload に乗せる
+    console.log(`[Sync→Render]   sku_master: ${rows.length}件 (1 SKU = 1 行)`);
   } catch (e) {
-    console.log(`[Sync→Render]   sku_master: 取得失敗（スキップ）: ${e.message}`);
+    console.log(`[Sync→Render]   sku_master: 取得失敗（送信スキップ、mirror は前回値を保持）: ${e.message}`);
   }
 
   // 2c. amazon_sku_fees（手数料キャッシュ）
@@ -290,7 +297,19 @@ export async function syncToRender() {
 
   try {
     // Part 1: マスタデータ
-    await sendPart({ products, set_components, sku_resolved, sku_master, amazon_sku_fees, rakuten_sku_map, inv_daily_summary }, 'マスタ');
+    //   sku_master は SELECT 成功時のみ payload に含める (fail-closed)。
+    //   0 件のときは「真に空 = 異常」を意図的に伝えるため meta.clear_sku_master=true を付ける。
+    //   受信側は flag が無い 0 件は反映拒否する (上流異常との区別)。
+    const masterPart = {
+      products, set_components, sku_resolved, amazon_sku_fees, rakuten_sku_map, inv_daily_summary,
+    };
+    if (Array.isArray(sku_master)) {
+      masterPart.sku_master = sku_master;
+      if (sku_master.length === 0) {
+        masterPart.meta = { ...(masterPart.meta || {}), clear_sku_master: true };
+      }
+    }
+    await sendPart(masterPart, 'マスタ');
 
     // Part 1c: inv_daily_detail (D-1c、直近7日、~17MB なので chunk 分割)
     // 初回チャンクの meta:

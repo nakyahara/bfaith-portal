@@ -130,26 +130,41 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
     }
 
     // sku_master (1 SKU = 1 行、Sheets 商品コード変換テーブルとの差分検出用)
-    // 全件置換。空配列も受け取る (mirror 側を clear する意図、ただし sync 側で 0 件取得失敗時は送信しない)
-    if (req.body.sku_master && Array.isArray(req.body.sku_master)) {
+    //
+    // fail-closed 設計 (Codex review 2026-05-13: critical/high #1+#2):
+    //   N>0 件 → 全件置換 (DELETE → INSERT)
+    //   0 件 + meta.clear_sku_master=true → 明示 clear、DELETE のみ実行
+    //   0 件 + flag 無し → 反映拒否 (上流異常 / worktree 別 DB / 送信側 bug の可能性)、前回の mirror 保持
+    //
+    // 過去事故 (2026-05-08〜10 Yahoo VPS proxy regression: 取得失敗を「空配列の正常同期」として
+    // 流し mirror 3 日間全空文字) と (2026-05-06 worktree で別 DB が静かに分裂) の再発防止。
+    if (req.body.sku_master !== undefined && Array.isArray(req.body.sku_master)) {
       const masterRows = req.body.sku_master;
-      const tx = db.transaction(() => {
-        db.exec('DELETE FROM mirror_sku_master');
-        const stmt = db.prepare(`INSERT INTO mirror_sku_master (
-          seller_sku, 商品名, source_created_at, source_updated_at, synced_at
-        ) VALUES (?,?,?,?,?)`);
-        for (const r of masterRows) {
-          stmt.run(
-            r.seller_sku,
-            r.商品名 ?? null,
-            r.source_created_at ?? null,
-            r.source_updated_at ?? null,
-            now
-          );
-        }
-      });
-      tx();
-      log.push(`sku_master: ${masterRows.length}件`);
+      const explicitClear = req.body.meta?.clear_sku_master === true;
+      if (masterRows.length === 0 && !explicitClear) {
+        log.push(`sku_master: 0件 + clear flag 無し → 反映拒否 (前回 mirror を保持)`);
+        console.warn('[Mirror] sku_master 0件 + meta.clear_sku_master 無し: 上流異常の可能性、mirror_sku_master は前回値を保持');
+      } else {
+        const tx = db.transaction(() => {
+          db.exec('DELETE FROM mirror_sku_master');
+          if (masterRows.length > 0) {
+            const stmt = db.prepare(`INSERT INTO mirror_sku_master (
+              seller_sku, 商品名, source_created_at, source_updated_at, synced_at
+            ) VALUES (?,?,?,?,?)`);
+            for (const r of masterRows) {
+              stmt.run(
+                r.seller_sku,
+                r.商品名 ?? null,
+                r.source_created_at ?? null,
+                r.source_updated_at ?? null,
+                now
+              );
+            }
+          }
+        });
+        tx();
+        log.push(`sku_master: ${masterRows.length}件${explicitClear && masterRows.length === 0 ? ' (explicit clear)' : ''}`);
+      }
     }
 
     // inv_daily_detail (D-1c 詳細層、差分sync UPSERT + 古い行クリーン)
@@ -1910,8 +1925,10 @@ function requireReadToken(req, res, next) {
   if (!token) {
     return res.status(503).json({ error: 'mirror_read_token_unset' });
   }
-  const provided = req.headers['x-read-token'] || req.query.read_token;
-  if (provided !== token) {
+  // header only (Codex review 2026-05-13 medium #3): query fallback は URL / アクセスログ /
+  // 監視 / 例外メッセージ / ブラウザ履歴に token を残すため受け付けない。
+  const provided = req.headers['x-read-token'];
+  if (!provided || provided !== token) {
     return res.status(401).json({ error: 'invalid_read_token' });
   }
   next();
