@@ -102,14 +102,26 @@ const rows = db.prepare(`
 `).all(dateRange.from, dateRange.to);
 
 console.log(`\n  Rows to sync: ${rows.length.toLocaleString()}`);
+// 注意: rows.length===0 でも早期 exit しない。空 chunk を 1 個送って Render に scope 全日付を
+// clear させる必要がある (月内全注文がキャンセル等で消えた極稀ケースで mirror に旧 row が残るのを防ぐ
+// = Codex review high #2 round 2 反映)。
 
-if (rows.length === 0) {
-  console.log('  (no rows in range, nothing to sync)');
-  process.exit(0);
+// clear_aupay_finance_dates は scope 全日付を列挙する (rows.map(r=>r.date_jst) だと「その日が source で
+// 0 行になった」ケースを Render から消せず stale day が残る = Codex review high #2 反映)。
+// JS Date 計算で UTC ベース (memory: feedback_jst_to_iso_string_trap.md)、文字列比較で月末を超えたら停止。
+const scopeDates = [];
+{
+  let cur = dateRange.from;
+  while (cur <= dateRange.to) {
+    scopeDates.push(cur);
+    const d = new Date(cur + 'T00:00:00Z');
+    d.setUTCDate(d.getUTCDate() + 1);
+    cur = d.toISOString().slice(0, 10);
+  }
 }
-
-const distinctDates = [...new Set(rows.map(r => r.date_jst))].sort();
-console.log(`  Distinct dates: ${distinctDates.length} (${distinctDates[0]} 〜 ${distinctDates[distinctDates.length - 1]})`);
+const distinctDates = scopeDates;
+const presentDates = [...new Set(rows.map(r => r.date_jst))].sort();
+console.log(`  Distinct dates in scope: ${scopeDates.length} (clear対象、${scopeDates[0]} 〜 ${scopeDates[scopeDates.length - 1]}) / 実 row 日付: ${presentDates.length}`);
 
 const tsCompact = new Date().toISOString().replace(/[:.]/g, '').replace('Z', '');
 const runIdSalt = crypto.randomBytes(3).toString('hex');
@@ -142,7 +154,9 @@ const chunks = [];
 for (let i = 0; i < enrichedRows.length; i += CHUNK_SIZE) {
   chunks.push(enrichedRows.slice(i, i + CHUNK_SIZE));
 }
-console.log(`\n  Chunks: ${chunks.length} (chunk_size=${CHUNK_SIZE})`);
+// 0-row scope でも clear meta を送るため空 chunk を 1 個用意 (Render 側 stale row 防止)
+if (chunks.length === 0) chunks.push([]);
+console.log(`\n  Chunks: ${chunks.length} (chunk_size=${CHUNK_SIZE}${enrichedRows.length === 0 ? ', empty chunk for scope-clear only' : ''})`);
 
 import('node:os').then(async (os) => {
   const sourceHost = os.hostname();
@@ -168,9 +182,13 @@ import('node:os').then(async (os) => {
     console.log('\n--- DRY RUN ---');
     console.log(`  Would send ${chunks.length} chunks (${enrichedRows.length} rows total) to ${renderUrl || '<RENDER_MIRROR_URL not set>'}`);
     console.log(`  First chunk meta: clear_aupay_finance_dates=[${distinctDates.length} dates]`);
-    console.log(`  Sample row keys: ${Object.keys(enrichedRows[0]).join(', ')}`);
-    const r0 = enrichedRows[0];
-    console.log(`  Sample row[0]: date=${r0.date_jst} aupay_sku_key=${r0.aupay_sku_key} ne_code=${r0.ne_code} margin_partial=${r0.variable_margin_partial_jpy_incl} mall_fee=${r0.mall_fee_jpy_incl} hash=${r0.source_row_hash}`);
+    if (enrichedRows.length > 0) {
+      console.log(`  Sample row keys: ${Object.keys(enrichedRows[0]).join(', ')}`);
+      const r0 = enrichedRows[0];
+      console.log(`  Sample row[0]: date=${r0.date_jst} aupay_sku_key=${r0.aupay_sku_key} ne_code=${r0.ne_code} margin_partial=${r0.variable_margin_partial_jpy_incl} mall_fee=${r0.mall_fee_jpy_incl} hash=${r0.source_row_hash}`);
+    } else {
+      console.log('  (no rows — empty chunk will be sent solely to trigger Render-side scope clear)');
+    }
     process.exit(0);
   }
 

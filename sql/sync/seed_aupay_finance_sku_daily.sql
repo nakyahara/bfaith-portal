@@ -17,7 +17,7 @@ INSERT OR REPLACE INTO sync_contracts (
 ) VALUES (
   'aupay_finance_sku_daily', 1, 'minipc-warehouse',
   'f_aupay_finance_sku_daily_v1', 'mirror_aupay_finance_sku_daily',
-  'one row = one (date_jst, aupay_sku_key)',
+  'one row = one (date_jst, aupay_sku_key) — aupay_sku_key = item_code + (item_management_id があれば連結) で子SKU相当の grain',
   '["date_jst","aupay_sku_key"]',
   '{"required":["date_jst","aupay_sku_key"],"date_jst_pattern":"^\d{4}-\d{2}-\d{2}$","cost_status_enum":["complete","missing_cost","partial_cost","late_bound_after_close"],"resolution_method_enum":["master_match","manual_map","unresolved"],"shipping_quality_enum":["actual","estimated_rates","estimated_fallback","missing"],"margin_confidence_enum":["partial","full"],"mall_fee_calc_method_enum":["estimated_rate","actual_statement","unknown"]}',
   'scope_clear_per_run', 'insert_or_replace', 1, 'phase1-aupay-finance',

@@ -19,12 +19,18 @@
 --   gross_sales (= sales_principal + postage_allocated) - cogs - mall_fee - shipping_cost - coupon_shop
 --   ※ mall_fee = (gross_sales - coupon_shop) × :mall_fee_rate (NULL なら mall_fee=NULL, calc_method='unknown')
 --
+-- aupay_sku_key の生成 (silver で計算、変更点 2026-05-13):
+--   item_code + item_management_id を結合して m_products の子SKU命名 (例 fragrancebalm-15g-ki) と揃える。
+--   - itemManagementId = '-wt' のように先頭が '-' なら item_code に連結 → 'fragrancebalm-15g-wt'
+--   - itemManagementId = 'co' (ハイフン無し) なら '-' を挟む → 'goneshus600-3-co'
+--   - itemManagementId 空 (単純商品 or 親未マップ) なら item_code そのまま
 -- SKU 解決 2 段 fallback (CI 最初から):
---   1. m_products WHERE LOWER(TRIM(商品コード)) = LOWER(TRIM(item_code))  (= master_match、90.7%)
---   2. f_aupay_sku_map WHERE LOWER(TRIM(aupay_key)) = LOWER(TRIM(item_code)) AND store_id  (= manual_map)
+--   1. m_products WHERE LOWER(TRIM(商品コード)) = aupay_sku_key  (= master_match、itemManagementId 統合で大幅増)
+--   2. f_aupay_sku_map WHERE LOWER(TRIM(aupay_key)) = aupay_sku_key AND store_id  (= manual_map)
 --   3. NULL → unresolved_sku_flag = 1
--- unresolved 行の原価/送料補完: 子 SKU (商品コードが親コードで始まる) 全部で 原価/送料 が一通りに定まる場合のみ
---   その値を採用 (resolution_method は 'unresolved' のまま、cost_status = 'partial_cost')。バラつけば補完しない。
+-- unresolved 行の原価/送料補完: 子 SKU (商品コードが aupay_sku_key で始まる) 全部で 原価/送料 が
+--   一通りに定まる場合のみその値を採用 (resolution_method='unresolved'、cost_status='partial_cost')。
+--   itemManagementId 統合後はほぼ master_match で解決するので、このフォールバックは保険。
 --
 -- UPSERT 不変条件 (楽天/Yahoo Phase 1 継承):
 --   - snapshot 列 (unit_cost_snapshot_incl, cost_snapshot_date_jst, is_cost_complete, cost_status):
@@ -41,7 +47,16 @@ CREATE TEMP TABLE _silver_aupay_orders_v1 AS
 SELECT
   substr(replace(order_date, '/', '-'), 1, 10) AS date_jst,   -- 'YYYY/MM/DD HH:MM' → 'YYYY-MM-DD'
   order_id, order_detail_id,
-  item_code AS aupay_sku_key,
+  item_code AS source_item_code,                              -- 親コード (audit 用)
+  LOWER(TRIM(COALESCE(item_management_id, ''))) AS source_mgmt_id,  -- variant ID (例 '-wt' / 'co')
+  -- effective SKU key: item_code + item_management_id を結合して m_products 子SKU 命名と揃える。
+  -- 「-」開始 (例 '-wt') ならそのまま連結、「co」のようなハイフン無しなら '-' を挟む。
+  -- itemManagementId が空なら item_code そのまま (= 単純商品 or 親未マップ)。
+  CASE
+    WHEN TRIM(COALESCE(item_management_id, '')) = '' THEN LOWER(TRIM(item_code))
+    WHEN substr(TRIM(item_management_id), 1, 1) = '-' THEN LOWER(TRIM(item_code)) || LOWER(TRIM(item_management_id))
+    ELSE LOWER(TRIM(item_code)) || '-' || LOWER(TRIM(item_management_id))
+  END AS aupay_sku_key,
   COALESCE(item_name, '') AS product_name,
   COALESCE(item_option, '') AS item_option,
   CAST(unit AS INTEGER) AS quantity,
@@ -355,6 +370,21 @@ ON CONFLICT (date_jst, aupay_sku_key) DO UPDATE SET
   source_layer_summary             = excluded.source_layer_summary,
   source_row_count                 = excluded.source_row_count,
   built_at                         = excluded.built_at;
+
+-- ─── Step 3.5: 当月の orphan 行 (新 silver に存在しない (date_jst, aupay_sku_key) 組) を全削除 ───
+-- itemManagementId 導入で aupay_sku_key の grain が「親」→「親+管理ID = 子SKU相当」に細分化された結果、
+-- 旧 build で作られた親コード単位の集計行が UPSERT で更新されず残ってしまう。
+-- (日付込みの差分削除にしないと「同じ SKU が月内のどこかで残っていれば別日の古い行が消えない」=
+--  Codex review high #1 反映)。grain 変更時は「同じ SKU 概念ではなくなる」ので cost_status='complete'
+-- の凍結ポリシーは適用しない (取引時点原価の保持は aupay_sku_key が変わらない通常の rebuild でのみ有効)。
+-- 同時に orderStatus がキャンセルに flip した過去注文の fact 行も自動的に消える (= 正しい挙動)。
+DELETE FROM f_aupay_finance_sku_daily_v1
+WHERE substr(date_jst, 1, 7) = printf('%04d-%02d', :year_month_int / 100, :year_month_int % 100)
+  AND NOT EXISTS (
+    SELECT 1 FROM _silver_aupay_orders_v1 s
+    WHERE s.date_jst = f_aupay_finance_sku_daily_v1.date_jst
+      AND s.aupay_sku_key = f_aupay_finance_sku_daily_v1.aupay_sku_key
+  );
 
 -- ─── Step 4: デバイス別 / 決済手段別 fact ───
 -- 対象月の行を一度削除してから再 INSERT (これらは snapshot を持たないので clear-rebuild で OK)
