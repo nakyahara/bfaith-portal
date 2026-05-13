@@ -23,10 +23,15 @@
 --   1. m_products WHERE LOWER(TRIM(商品コード)) = LOWER(TRIM(item_code))  (= master_match、90.7%)
 --   2. f_aupay_sku_map WHERE LOWER(TRIM(aupay_key)) = LOWER(TRIM(item_code)) AND store_id  (= manual_map)
 --   3. NULL → unresolved_sku_flag = 1
+-- unresolved 行の原価/送料補完: 子 SKU (商品コードが親コードで始まる) 全部で 原価/送料 が一通りに定まる場合のみ
+--   その値を採用 (resolution_method は 'unresolved' のまま、cost_status = 'partial_cost')。バラつけば補完しない。
 --
 -- UPSERT 不変条件 (楽天/Yahoo Phase 1 継承):
---   - snapshot 列 (unit_cost_snapshot_incl, cost_snapshot_date_jst, is_cost_complete, cost_status) 温存
---   - cogs / variable_margin_partial は「既存 snapshot × 新 units_net_sold」で再計算
+--   - snapshot 列 (unit_cost_snapshot_incl, cost_snapshot_date_jst, is_cost_complete, cost_status):
+--     cost_status='complete' (正規 SKU 解決で原価確定) の行のみ凍結 = 取引時点原価を保持。
+--     missing_cost / partial_cost (子から導出した推計) は replaceable:
+--       原価が後から判明したら埋まる / 後で正規解決できたら 'complete' に昇格 / 導出失敗したら missing に戻る。
+--   - cogs / variable_margin_partial は「有効 snapshot (凍結 'complete' 値 or 再評価値) × 新 units_net_sold」で再計算
 --
 -- 構造: Step 1 silver → Step 2 按分 (LRM) → Step 3 UPSERT 本体 → Step 4 device/settlement 別 fact → Step 5 DROP TEMP
 
@@ -157,27 +162,72 @@ sku_resolved AS (
     END AS resolution_method
   FROM (SELECT DISTINCT aupay_sku_key FROM daily_aggregated)
 ),
+-- unresolved 親 SKU の原価/送料を子 SKU (商品コードが親コードで始まる) から導出。
+-- 子全部で 原価 (or 送料) が一通りに定まる場合のみ採用 = どの variant が売れたか不明でもコストは確定できるケース。
+-- au PAY は itemCode に親コード・itemOption に variant を返すが m_products には子 SKU しか無い構造への対策 (Phase A 内の精度向上)。
+-- 子のコストがバラつく場合 (sevendays-art の -db 830 vs -db-2 1660 等) は採用せず missing のまま (f_aupay_sku_map 手動マップ待ち)。
+derived_parent_cost AS (
+  SELECT sr.aupay_sku_key,
+    MIN(mp.原価) * (1 + COALESCE(MIN(mp.消費税率), 0.10)) AS derived_unit_cost_incl
+  FROM sku_resolved sr
+  JOIN m_products mp
+    -- 「商品コードが親コードで始まる」を LIKE のワイルドカード解釈なしで判定 (親コードに _ / % が入っても安全)
+    ON substr(LOWER(mp.商品コード), 1, length(LOWER(TRIM(sr.aupay_sku_key)))) = LOWER(TRIM(sr.aupay_sku_key))
+   AND LOWER(mp.商品コード) <> LOWER(TRIM(sr.aupay_sku_key))
+  WHERE sr.resolution_method = 'unresolved'
+  GROUP BY sr.aupay_sku_key
+  HAVING COUNT(*) >= 1
+     AND COUNT(mp.原価) = COUNT(*)                                            -- 子全部に原価あり (NULL 混入なら不採用)
+     AND MIN(mp.原価) = MAX(mp.原価)                                           -- 原価が一通り
+     AND MIN(mp.原価) > 0
+     AND MIN(COALESCE(mp.消費税率, 0.10)) = MAX(COALESCE(mp.消費税率, 0.10))   -- 税率も一通り
+),
+derived_parent_shipping AS (
+  SELECT sr.aupay_sku_key, MIN(mp.送料) AS derived_unit_shipping
+  FROM sku_resolved sr
+  JOIN m_products mp
+    -- 「商品コードが親コードで始まる」を LIKE のワイルドカード解釈なしで判定 (親コードに _ / % が入っても安全)
+    ON substr(LOWER(mp.商品コード), 1, length(LOWER(TRIM(sr.aupay_sku_key)))) = LOWER(TRIM(sr.aupay_sku_key))
+   AND LOWER(mp.商品コード) <> LOWER(TRIM(sr.aupay_sku_key))
+  WHERE sr.resolution_method = 'unresolved'
+  GROUP BY sr.aupay_sku_key
+  HAVING COUNT(*) >= 1
+     AND COUNT(mp.送料) = COUNT(*)
+     AND MIN(mp.送料) = MAX(mp.送料)
+),
 cost_lookup AS (
   SELECT sr.aupay_sku_key, sr.ne_code,
-    COALESCE(eg.genka, mp.原価) * (1 + COALESCE(mp.消費税率, 0.10)) AS unit_cost_snapshot_incl,
-    CASE WHEN COALESCE(eg.genka, mp.原価) IS NOT NULL THEN 'complete' ELSE 'missing_cost' END AS cost_status
+    CASE
+      WHEN COALESCE(eg.genka, mp.原価) IS NOT NULL THEN COALESCE(eg.genka, mp.原価) * (1 + COALESCE(mp.消費税率, 0.10))
+      WHEN sr.resolution_method = 'unresolved' AND dpc.derived_unit_cost_incl IS NOT NULL THEN dpc.derived_unit_cost_incl
+      ELSE NULL
+    END AS unit_cost_snapshot_incl,
+    CASE
+      WHEN COALESCE(eg.genka, mp.原価) IS NOT NULL THEN 'complete'
+      WHEN sr.resolution_method = 'unresolved' AND dpc.derived_unit_cost_incl IS NOT NULL THEN 'partial_cost'
+      ELSE 'missing_cost'
+    END AS cost_status
   FROM sku_resolved sr
   LEFT JOIN m_products mp ON mp.商品コード = sr.ne_code
   LEFT JOIN exception_genka eg ON eg.sku = sr.ne_code
+  LEFT JOIN derived_parent_cost dpc ON dpc.aupay_sku_key = sr.aupay_sku_key
 ),
 shipping_lookup AS (
   SELECT sr.aupay_sku_key, sr.ne_code,
-    COALESCE(ps.ship_cost, sr2.配送関係費合計, mp.送料) AS unit_shipping_cost,
+    COALESCE(ps.ship_cost, sr2.配送関係費合計, mp.送料,
+             CASE WHEN sr.resolution_method = 'unresolved' THEN dps.derived_unit_shipping END) AS unit_shipping_cost,
     CASE
       WHEN ps.ship_cost IS NOT NULL THEN 'actual'
       WHEN sr2.配送関係費合計 IS NOT NULL THEN 'estimated_rates'
       WHEN mp.送料 IS NOT NULL THEN 'estimated_fallback'
+      WHEN sr.resolution_method = 'unresolved' AND dps.derived_unit_shipping IS NOT NULL THEN 'estimated_fallback'
       ELSE 'missing'
     END AS shipping_quality
   FROM sku_resolved sr
   LEFT JOIN m_products mp ON mp.商品コード = sr.ne_code
   LEFT JOIN product_shipping ps ON ps.sku = sr.ne_code
   LEFT JOIN shipping_rates sr2 ON sr2.shipping_code = mp.送料コード
+  LEFT JOIN derived_parent_shipping dps ON dps.aupay_sku_key = sr.aupay_sku_key
 )
 SELECT
   c.date_jst, c.aupay_sku_key, sr.ne_code, c.item_option AS variant_key, sr.resolution_method,
@@ -278,11 +328,18 @@ ON CONFLICT (date_jst, aupay_sku_key) DO UPDATE SET
   shipping_cost_jpy_incl           = excluded.shipping_cost_jpy_incl,
   shipping_quality                 = excluded.shipping_quality,
   latest_unit_cost_reference_incl  = excluded.latest_unit_cost_reference_incl,
-  -- cogs / margin は「既存 snapshot × 新 units_net_sold」で再計算
-  cogs_amount_jpy_incl             = ROUND(COALESCE(f_aupay_finance_sku_daily_v1.unit_cost_snapshot_incl, 0) * excluded.units_net_sold, 2),
+  -- snapshot 列の凍結は「cost_status = 'complete' (= 正規 SKU 解決で原価確定)」の行のみ。
+  -- それ以外 (missing_cost / partial_cost = 子から導出した推計) は replaceable:
+  --   missing → 原価が後から判明したら埋まる / partial → 後で正規解決できたら 'complete' に昇格 / 導出失敗したら missing に戻る。
+  unit_cost_snapshot_incl          = CASE WHEN f_aupay_finance_sku_daily_v1.cost_status = 'complete' THEN f_aupay_finance_sku_daily_v1.unit_cost_snapshot_incl ELSE excluded.unit_cost_snapshot_incl END,
+  cost_snapshot_date_jst           = CASE WHEN f_aupay_finance_sku_daily_v1.cost_status = 'complete' THEN f_aupay_finance_sku_daily_v1.cost_snapshot_date_jst ELSE excluded.cost_snapshot_date_jst END,
+  cost_status                      = CASE WHEN f_aupay_finance_sku_daily_v1.cost_status = 'complete' THEN 'complete' ELSE excluded.cost_status END,
+  is_cost_complete                 = CASE WHEN f_aupay_finance_sku_daily_v1.cost_status = 'complete' THEN 1 ELSE excluded.is_cost_complete END,
+  -- cogs / margin は「有効 snapshot (凍結 'complete' 値 or 再評価値) × 新 units_net_sold」で再計算
+  cogs_amount_jpy_incl             = ROUND(COALESCE(CASE WHEN f_aupay_finance_sku_daily_v1.cost_status = 'complete' THEN f_aupay_finance_sku_daily_v1.unit_cost_snapshot_incl ELSE excluded.unit_cost_snapshot_incl END, 0) * excluded.units_net_sold, 2),
   variable_margin_partial_jpy_incl = ROUND(
     excluded.gross_sales_jpy_incl
-    - COALESCE(f_aupay_finance_sku_daily_v1.unit_cost_snapshot_incl, 0) * excluded.units_net_sold
+    - COALESCE(CASE WHEN f_aupay_finance_sku_daily_v1.cost_status = 'complete' THEN f_aupay_finance_sku_daily_v1.unit_cost_snapshot_incl ELSE excluded.unit_cost_snapshot_incl END, 0) * excluded.units_net_sold
     - COALESCE(excluded.mall_fee_jpy_incl, 0)
     - excluded.shipping_cost_jpy_incl
     - excluded.coupon_shop_jpy_incl, 2),

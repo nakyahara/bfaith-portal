@@ -24,8 +24,9 @@
 --
 -- 不変条件 (楽天 Phase 1a/1b / Yahoo Phase 1 から継承):
 --   - PK: (date_jst, aupay_sku_key)
---   - UPSERT で snapshot 列 (unit_cost_snapshot_incl, cost_snapshot_date_jst, is_cost_complete, cost_status) 温存
---   - cogs / margin は「既存 snapshot × 新 units_net_sold」で再計算
+--   - UPSERT で snapshot 列 (unit_cost_snapshot_incl, cost_snapshot_date_jst, is_cost_complete, cost_status):
+--     cost_status='complete' の行のみ凍結 (取引時点原価保持)。missing_cost / partial_cost (子から導出した推計) は replaceable
+--   - cogs / margin は「有効 snapshot (凍結 'complete' 値 or 再評価値) × 新 units_net_sold」で再計算
 
 CREATE TABLE IF NOT EXISTS f_aupay_finance_sku_daily_v1 (
   -- PK
