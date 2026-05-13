@@ -104,12 +104,29 @@ const rows = db.prepare(`
 console.log(`\n  Rows to sync: ${rows.length.toLocaleString()}`);
 
 if (rows.length === 0) {
-  console.log('  (no rows in range, nothing to sync)');
+  // 注意: 0 行のときは Render mirror の旧 row も消えない (clear meta は first chunk で送るため、
+  //       0 chunk だと送られない)。月内全注文がキャンセル等で消えた極稀ケースは「Render 側に 0-row
+  //       scope を投入する」別経路が必要 — Phase B 以降で対応。
+  console.log('  (no rows in range, nothing to sync — note: Render side stale rows in this scope are NOT cleared)');
   process.exit(0);
 }
 
-const distinctDates = [...new Set(rows.map(r => r.date_jst))].sort();
-console.log(`  Distinct dates: ${distinctDates.length} (${distinctDates[0]} 〜 ${distinctDates[distinctDates.length - 1]})`);
+// clear_aupay_finance_dates は scope 全日付を列挙する (rows.map(r=>r.date_jst) だと「その日が source で
+// 0 行になった」ケースを Render から消せず stale day が残る = Codex review high #2 反映)。
+// JS Date 計算で UTC ベース (memory: feedback_jst_to_iso_string_trap.md)、文字列比較で月末を超えたら停止。
+const scopeDates = [];
+{
+  let cur = dateRange.from;
+  while (cur <= dateRange.to) {
+    scopeDates.push(cur);
+    const d = new Date(cur + 'T00:00:00Z');
+    d.setUTCDate(d.getUTCDate() + 1);
+    cur = d.toISOString().slice(0, 10);
+  }
+}
+const distinctDates = scopeDates;
+const presentDates = [...new Set(rows.map(r => r.date_jst))].sort();
+console.log(`  Distinct dates in scope: ${scopeDates.length} (clear対象、${scopeDates[0]} 〜 ${scopeDates[scopeDates.length - 1]}) / 実 row 日付: ${presentDates.length}`);
 
 const tsCompact = new Date().toISOString().replace(/[:.]/g, '').replace('Z', '');
 const runIdSalt = crypto.randomBytes(3).toString('hex');

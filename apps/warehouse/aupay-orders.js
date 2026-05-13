@@ -39,60 +39,176 @@ const strVal = v => ((v && typeof v === 'object') ? (v._ ?? '') : (v ?? '')) + '
 const arrify = v => v == null ? [] : (Array.isArray(v) ? v : [v]);
 
 // ─── テーブル確認 / migration ───
-// 旧スキーマ (mall-orders.js の 4 モール共通最小スキーマ) → 新スキーマ (Phase 1 拡張) へ移行。
-// 旧スキーマには order_detail_id 列が無いので、それで判定。
+// API レスポンス detail/order の全フィールドを保存 (中原さん方針「取れる情報は全部とっておく」、2026-05-13)。
+// 旧スキーマ (item_management_id 列なし = Phase 1 A-0 の最小拡張版) を検出したら DROP & 新スキーマで rebuild。
+// item_management_id は variant 解決 (Yahoo の sub_code 相当) に必須なので、これを判定キーにする。
 function ensureTables() {
   const db = getDB();
   const cols = db.prepare("PRAGMA table_info(raw_aupay_orders)").all().map(c => c.name);
-  const isNewSchema = cols.includes('order_detail_id');
-  if (cols.length > 0 && !isNewSchema) {
-    // 旧スキーマ検出 → DROP & 新スキーマで CREATE (既存最小データは捨てる、backfill で埋め直す)
-    console.log('[auPay] 旧スキーマ raw_aupay_orders を検出 → 新スキーマで rebuild (既存データは backfill で埋め直し)');
+  const hasMgmtId = cols.includes('item_management_id');
+  if (cols.length > 0 && !hasMgmtId) {
+    // 旧スキーマ検出 → DROP & 新スキーマで CREATE (既存データは捨てる、backfill で埋め直す)
+    console.log('[auPay] 旧スキーマ raw_aupay_orders 検出 (item_management_id 列なし) → 新スキーマで rebuild (既存データは backfill で埋め直し)');
     db.exec('DROP TABLE IF EXISTS raw_aupay_orders');
   }
   db.exec(`CREATE TABLE IF NOT EXISTS raw_aupay_orders (
     -- PK
     order_id            TEXT NOT NULL,
     order_detail_id     TEXT NOT NULL,
-    -- 注文レベル
-    order_date          TEXT,                -- 'YYYY/MM/DD HH:MM'
-    site_and_device     TEXT,                -- "au PAY マーケット(SP(アプリ))" 等 (デバイス分析軸)
-    settlement_name     TEXT,                -- 決済手段名
-    order_status        TEXT,                -- 完了/発送待ち/キャンセル/発送前入金待ち/新規受付
-    payment_status      TEXT, ship_status TEXT, cancel_status TEXT,
-    authorization_status TEXT, contact_status TEXT, print_status TEXT,
-    total_sale_price             REAL,       -- 商品計
-    total_sale_price_normal_tax  REAL, total_sale_price_reduced_tax REAL, total_sale_price_no_tax REAL,
-    postage_price                REAL, charge_price REAL,
-    total_item_option_price      REAL, total_gift_wrapping_price REAL, total_price REAL,
-    coupon_total_price           REAL,       -- ストアクーポン値引 (detail.discount とは別物)
-    use_point                    REAL,       -- Ponta ポイント利用
-    use_au_point_price           REAL,       -- au ポイント利用
-    premium_issue_price          REAL, premium_mall_price REAL, premium_shop_price REAL,
-    request_price                REAL,       -- 実請求額 = total_price - coupon - usePoint - useAuPointPrice
-    delivery_name                TEXT, delivery_method_id TEXT,
-    point_fixed_date             TEXT, point_fixed_status TEXT,
-    -- 明細レベル
-    item_code           TEXT,
-    item_name           TEXT,
-    item_option         TEXT,                -- = 旧 option_info (variant 情報含む、楽天 selected_choice 相当)
-    before_discount     REAL,                -- 値引前単価
-    discount            REAL,                -- 値引額 (item_price に既反映)
-    item_price          REAL,                -- 値引後単価
-    unit                INTEGER,             -- 数量
-    total_item_price    REAL,                -- = item_price × unit
-    tax_type            TEXT, reduced_tax REAL, tax_rate REAL,
-    gift_point          REAL,                -- 付与ポイント (商品単位、率 ≈ 0.93%)
-    item_cancel_status  TEXT,
-    shipping_day_disp_text TEXT, shipping_timelimit_date TEXT,
+
+    -- ─── 注文レベル: 基本 ───
+    order_date                TEXT,           -- 'YYYY/MM/DD HH:MM'
+    sell_method_segment       TEXT,
+    site_and_device           TEXT,           -- "au PAY マーケット(SP(アプリ))" 等
+    cross_border_ec_trade_kbn TEXT,
+
+    -- ─── 注文レベル: 顧客情報 (PII) ───
+    mail_address          TEXT,
+    orderer_name          TEXT,
+    orderer_kana          TEXT,
+    orderer_zip_code      TEXT,
+    orderer_address       TEXT,
+    orderer_phone_number1 TEXT,
+    orderer_phone_number2 TEXT,
+    nickname              TEXT,
+    sender_name           TEXT,
+    sender_kana           TEXT,
+    sender_zip_code       TEXT,
+    sender_address        TEXT,
+    sender_phone_number1  TEXT,
+    sender_phone_number2  TEXT,
+
+    -- ─── 注文レベル: オプション/コメント ───
+    order_option   TEXT,
+    user_comment   TEXT,
+    trade_remarks  TEXT,
+    memo           TEXT,
+
+    -- ─── 注文レベル: 決済 + ステータス ───
+    settlement_name      TEXT,
+    order_status         TEXT,
+    contact_status       TEXT,
+    authorization_status TEXT,
+    payment_status       TEXT,
+    ship_status          TEXT,
+    print_status         TEXT,
+    cancel_status        TEXT,
+
+    -- ─── 注文レベル: 商品計売上 (税率別) ───
+    total_sale_price              REAL,
+    total_sale_price_normal_tax   REAL,
+    total_sale_price_reduced_tax  REAL,
+    total_sale_price_no_tax       REAL,
+    total_sale_unit               INTEGER,
+
+    -- ─── 注文レベル: 送料 / 代引手数料 ───
+    postage_price          REAL,
+    postage_price_tax_rate REAL,
+    charge_price           REAL,
+    charge_price_tax_rate  REAL,
+
+    -- ─── 注文レベル: オプション料 / ラッピング料 (注文計) ───
+    total_item_option_price            REAL,
+    total_item_option_price_tax_rate   REAL,
+    total_gift_wrapping_price          REAL,
+    total_gift_wrapping_price_tax_rate REAL,
+
+    -- ─── 注文レベル: 合計 (税率別) ───
+    total_price             REAL,
+    total_price_normal_tax  REAL,
+    total_price_reduced_tax REAL,
+    total_price_no_tax      REAL,
+
+    -- ─── 注文レベル: プレミアム / Pontaパス ───
+    premium_member               TEXT,
+    premium_type                 TEXT,
+    premium_issue_price          REAL,
+    premium_mall_price           REAL,
+    premium_shop_price           REAL,
+    pontapass_campaign_apply_flg TEXT,
+
+    -- ─── 注文レベル: クーポン (税率別) ───
+    coupon_total_price             REAL,      -- ストアクーポン値引 (detail.discount とは別物)
+    coupon_total_price_normal_tax  REAL,
+    coupon_total_price_reduced_tax REAL,
+    coupon_total_price_no_tax      REAL,
+
+    -- ─── 注文レベル: Ponta ポイント利用 (税率別) ───
+    use_point             REAL,
+    use_point_normal_tax  REAL,
+    use_point_reduced_tax REAL,
+    use_point_no_tax      REAL,
+
+    -- ─── 注文レベル: au ポイント利用 (税率別 + ポイント数) ───
+    use_au_point_price             REAL,
+    use_au_point_price_normal_tax  REAL,
+    use_au_point_price_reduced_tax REAL,
+    use_au_point_price_no_tax      REAL,
+    use_au_point                   REAL,
+
+    -- ─── 注文レベル: 請求 (税率別 + 税額別) ───
+    request_price                  REAL,      -- 実請求額 = total_price - coupon - usePoint - useAuPointPrice
+    request_price_normal_tax       REAL,
+    request_tax_price_normal_tax   REAL,
+    request_price_reduced_tax      REAL,
+    request_tax_price_reduced_tax  REAL,
+    request_price_no_tax           REAL,
+    request_tax_price_no_tax       REAL,
+
+    -- ─── 注文レベル: ポイント確定 ───
+    point_fixed_date   TEXT,
+    point_fixed_status TEXT,
+
+    -- ─── 注文レベル: 決済処理結果 (PG) ───
+    settle_status                TEXT,
+    pg_result                    TEXT,
+    pg_order_id                  TEXT,
+    pg_request_price             REAL,
+    pg_request_price_normal_tax  REAL,
+    pg_request_price_reduced_tax REAL,
+    pg_request_price_no_tax      REAL,
+
+    -- ─── 注文レベル: 配送 / 電子領収書 ───
+    delivery_name             TEXT,
+    delivery_method_id        TEXT,
+    elec_receipt_issue_status TEXT,
+    elec_receipt_issue_times  INTEGER,
+
+    -- ─── 明細レベル ───
+    item_management_id      TEXT,            -- ★variant 識別 (m_products 子SKU suffix と対応、例 '-wt' / 'co')
+    item_code               TEXT,
+    lotnumber               TEXT,
+    item_name               TEXT,
+    item_option             TEXT,            -- 表示用 variant 文字列 '香り=金木犀'
+    item_option_price       REAL,            -- 商品単位のオプション料
+    gift_wrapping_price     REAL,            -- 商品単位のラッピング料
+    gift_message            TEXT,
+    noshi_presenter_name1   TEXT,
+    noshi_presenter_name2   TEXT,
+    noshi_presenter_name3   TEXT,
+    item_cancel_status      TEXT,
+    before_discount         REAL,            -- 値引前単価
+    discount                REAL,            -- 値引額 (item_price に既反映)
+    item_price              REAL,            -- 値引後単価
+    unit                    INTEGER,         -- 数量
+    total_item_price        REAL,            -- = item_price × unit
+    total_item_charge_price REAL,            -- 商品単位の代引手数料
+    tax_type                TEXT,
+    reduced_tax             REAL,
+    tax_rate                REAL,
+    gift_point              REAL,            -- 付与ポイント (商品単位、率 ≈ 0.93%)
+    shipping_day_disp_text  TEXT,
+    shipping_timelimit_date TEXT,
+
     -- メタ
-    synced_at           TEXT,
+    synced_at TEXT,
     PRIMARY KEY (order_id, order_detail_id)
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_aupay_order_id ON raw_aupay_orders(order_id)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_aupay_date ON raw_aupay_orders(order_date)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_aupay_item ON raw_aupay_orders(item_code)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_aupay_status ON raw_aupay_orders(order_status)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_aupay_mgmt ON raw_aupay_orders(item_management_id)');
 }
 
 // ─── VPS proxy 呼び出し ───
@@ -139,17 +255,59 @@ async function fetchOrdersInRange(startDate, endDate) {
 function insertOrders(db, orders) {
   const ts = now();
   const del = db.prepare('DELETE FROM raw_aupay_orders WHERE order_id = ?');
-  const ins = db.prepare(`INSERT INTO raw_aupay_orders (
-    order_id, order_detail_id, order_date, site_and_device, settlement_name, order_status,
-    payment_status, ship_status, cancel_status, authorization_status, contact_status, print_status,
-    total_sale_price, total_sale_price_normal_tax, total_sale_price_reduced_tax, total_sale_price_no_tax,
-    postage_price, charge_price, total_item_option_price, total_gift_wrapping_price, total_price,
-    coupon_total_price, use_point, use_au_point_price, premium_issue_price, premium_mall_price, premium_shop_price, request_price,
-    delivery_name, delivery_method_id, point_fixed_date, point_fixed_status,
-    item_code, item_name, item_option, before_discount, discount, item_price, unit, total_item_price,
-    tax_type, reduced_tax, tax_rate, gift_point, item_cancel_status, shipping_day_disp_text, shipping_timelimit_date,
-    synced_at
-  ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  // 注文 114 列 (2 PK + 86 注文 + 25 detail + 1 メタ) — CREATE TABLE と同順
+  const COLS = [
+    'order_id', 'order_detail_id',
+    // 注文レベル: 基本
+    'order_date', 'sell_method_segment', 'site_and_device', 'cross_border_ec_trade_kbn',
+    // 注文レベル: 顧客情報 (PII)
+    'mail_address', 'orderer_name', 'orderer_kana', 'orderer_zip_code', 'orderer_address',
+    'orderer_phone_number1', 'orderer_phone_number2', 'nickname',
+    'sender_name', 'sender_kana', 'sender_zip_code', 'sender_address',
+    'sender_phone_number1', 'sender_phone_number2',
+    // 注文レベル: オプション/コメント
+    'order_option', 'user_comment', 'trade_remarks', 'memo',
+    // 注文レベル: 決済 + ステータス
+    'settlement_name', 'order_status', 'contact_status', 'authorization_status',
+    'payment_status', 'ship_status', 'print_status', 'cancel_status',
+    // 商品計売上 (税率別)
+    'total_sale_price', 'total_sale_price_normal_tax', 'total_sale_price_reduced_tax', 'total_sale_price_no_tax', 'total_sale_unit',
+    // 送料 / 代引手数料
+    'postage_price', 'postage_price_tax_rate', 'charge_price', 'charge_price_tax_rate',
+    // オプション料 / ラッピング料 (注文計)
+    'total_item_option_price', 'total_item_option_price_tax_rate', 'total_gift_wrapping_price', 'total_gift_wrapping_price_tax_rate',
+    // 合計 (税率別)
+    'total_price', 'total_price_normal_tax', 'total_price_reduced_tax', 'total_price_no_tax',
+    // プレミアム / Pontaパス
+    'premium_member', 'premium_type', 'premium_issue_price', 'premium_mall_price', 'premium_shop_price', 'pontapass_campaign_apply_flg',
+    // クーポン (税率別)
+    'coupon_total_price', 'coupon_total_price_normal_tax', 'coupon_total_price_reduced_tax', 'coupon_total_price_no_tax',
+    // Ponta ポイント利用 (税率別)
+    'use_point', 'use_point_normal_tax', 'use_point_reduced_tax', 'use_point_no_tax',
+    // au ポイント利用 (税率別 + ポイント数)
+    'use_au_point_price', 'use_au_point_price_normal_tax', 'use_au_point_price_reduced_tax', 'use_au_point_price_no_tax', 'use_au_point',
+    // 請求 (税率別 + 税額別)
+    'request_price', 'request_price_normal_tax', 'request_tax_price_normal_tax',
+    'request_price_reduced_tax', 'request_tax_price_reduced_tax',
+    'request_price_no_tax', 'request_tax_price_no_tax',
+    // ポイント確定
+    'point_fixed_date', 'point_fixed_status',
+    // 決済処理結果 (PG)
+    'settle_status', 'pg_result', 'pg_order_id',
+    'pg_request_price', 'pg_request_price_normal_tax', 'pg_request_price_reduced_tax', 'pg_request_price_no_tax',
+    // 配送 / 電子領収書
+    'delivery_name', 'delivery_method_id', 'elec_receipt_issue_status', 'elec_receipt_issue_times',
+    // ─── 明細レベル ───
+    'item_management_id', 'item_code', 'lotnumber', 'item_name', 'item_option',
+    'item_option_price', 'gift_wrapping_price', 'gift_message',
+    'noshi_presenter_name1', 'noshi_presenter_name2', 'noshi_presenter_name3',
+    'item_cancel_status', 'before_discount', 'discount', 'item_price', 'unit', 'total_item_price', 'total_item_charge_price',
+    'tax_type', 'reduced_tax', 'tax_rate', 'gift_point',
+    'shipping_day_disp_text', 'shipping_timelimit_date',
+    // メタ
+    'synced_at',
+  ];
+  const ins = db.prepare(`INSERT INTO raw_aupay_orders (${COLS.join(', ')}) VALUES (${COLS.map(() => '?').join(',')})`);
 
   let inserted = 0, skippedInvalid = 0;
   const tx = db.transaction(() => {
@@ -172,15 +330,62 @@ function insertOrders(db, orders) {
 
       del.run(orderId);
       for (const d of details) {
+        // COLS と同順 (114 値)
         ins.run(
-          orderId, strVal(d.orderDetailId), orderDate, strVal(o.siteAndDevice), strVal(o.settlementName), orderStatus,
-          strVal(o.paymentStatus), strVal(o.shipStatus), strVal(o.cancelStatus), strVal(o.authorizationStatus), strVal(o.contactStatus), strVal(o.printStatus),
-          numVal(o.totalSalePrice), numVal(o.totalSalePriceNormalTax), numVal(o.totalSalePriceReducedTax), numVal(o.totalSalePriceNoTax),
-          numVal(o.postagePrice), numVal(o.chargePrice), numVal(o.totalItemOptionPrice), numVal(o.totalGiftWrappingPrice), numVal(o.totalPrice),
-          numVal(o.couponTotalPrice), numVal(o.usePoint), numVal(o.useAuPointPrice), numVal(o.premiumIssuePrice), numVal(o.premiumMallPrice), numVal(o.premiumShopPrice), numVal(o.requestPrice),
-          strVal(o.deliveryName), strVal(o.deliveryMethodId), strVal(o.pointFixedDate), strVal(o.pointFixedStatus),
-          (strVal(d.itemCode) || '').toLowerCase(), strVal(d.itemName), strVal(d.itemOption), numVal(d.beforeDiscount), numVal(d.discount), numVal(d.itemPrice), intVal(d.unit), numVal(d.totalItemPrice),
-          strVal(d.taxType), numVal(d.reducedTax), numVal(d.taxRate), numVal(d.giftPoint), strVal(d.itemCancelStatus), strVal(d.shippingDayDispText), strVal(d.shippingTimelimitDate),
+          orderId, strVal(d.orderDetailId),
+          // 注文レベル: 基本
+          orderDate, strVal(o.sellMethodSegment), strVal(o.siteAndDevice), strVal(o.crossBorderEcTradeKbn),
+          // 顧客情報 (PII)
+          strVal(o.mailAddress),
+          strVal(o.ordererName), strVal(o.ordererKana), strVal(o.ordererZipCode), strVal(o.ordererAddress),
+          strVal(o.ordererPhoneNumber1), strVal(o.ordererPhoneNumber2), strVal(o.nickname),
+          strVal(o.senderName), strVal(o.senderKana), strVal(o.senderZipCode), strVal(o.senderAddress),
+          strVal(o.senderPhoneNumber1), strVal(o.senderPhoneNumber2),
+          // オプション/コメント
+          strVal(o.orderOption), strVal(o.userComment), strVal(o.tradeRemarks), strVal(o.memo),
+          // 決済 + ステータス
+          strVal(o.settlementName), orderStatus, strVal(o.contactStatus), strVal(o.authorizationStatus),
+          strVal(o.paymentStatus), strVal(o.shipStatus), strVal(o.printStatus), strVal(o.cancelStatus),
+          // 商品計売上 (税率別 + 数量計)
+          numVal(o.totalSalePrice), numVal(o.totalSalePriceNormalTax), numVal(o.totalSalePriceReducedTax), numVal(o.totalSalePriceNoTax), intVal(o.totalSaleUnit),
+          // 送料 / 代引手数料
+          numVal(o.postagePrice), numVal(o.postagePriceTaxRate), numVal(o.chargePrice), numVal(o.chargePriceTaxRate),
+          // オプション料 / ラッピング料 (注文計)
+          numVal(o.totalItemOptionPrice), numVal(o.totalItemOptionPriceTaxRate), numVal(o.totalGiftWrappingPrice), numVal(o.totalGiftWrappingPriceTaxRate),
+          // 合計 (税率別)
+          numVal(o.totalPrice), numVal(o.totalPriceNormalTax), numVal(o.totalPriceReducedTax), numVal(o.totalPriceNoTax),
+          // プレミアム / Pontaパス
+          strVal(o.premiumMember), strVal(o.premiumType), numVal(o.premiumIssuePrice), numVal(o.premiumMallPrice), numVal(o.premiumShopPrice), strVal(o.pontapassCampaignApplyFlg),
+          // クーポン (税率別)
+          numVal(o.couponTotalPrice), numVal(o.couponTotalPriceNormalTax), numVal(o.couponTotalPriceReducedTax), numVal(o.couponTotalPriceNoTax),
+          // Ponta ポイント利用 (税率別)
+          numVal(o.usePoint), numVal(o.usePointNormalTax), numVal(o.usePointReducedTax), numVal(o.usePointNoTax),
+          // au ポイント利用 (税率別 + ポイント数)
+          numVal(o.useAuPointPrice), numVal(o.useAuPointPriceNormalTax), numVal(o.useAuPointPriceReducedTax), numVal(o.useAuPointPriceNoTax), numVal(o.useAuPoint),
+          // 請求 (税率別 + 税額別)
+          numVal(o.requestPrice), numVal(o.requestPriceNormalTax), numVal(o.requestTaxPriceNormalTax),
+          numVal(o.requestPriceReducedTax), numVal(o.requestTaxPriceReducedTax),
+          numVal(o.requestPriceNoTax), numVal(o.requestTaxPriceNoTax),
+          // ポイント確定
+          strVal(o.pointFixedDate), strVal(o.pointFixedStatus),
+          // 決済処理結果 (PG)
+          strVal(o.settleStatus), strVal(o.pgResult), strVal(o.pgOrderId),
+          numVal(o.pgRequestPrice), numVal(o.pgRequestPriceNormalTax), numVal(o.pgRequestPriceReducedTax), numVal(o.pgRequestPriceNoTax),
+          // 配送 / 電子領収書
+          strVal(o.deliveryName), strVal(o.deliveryMethodId), strVal(o.elecReceiptIssueStatus), intVal(o.elecReceiptIssueTimes),
+          // ─── 明細レベル ───
+          strVal(d.itemManagementId),
+          (strVal(d.itemCode) || '').toLowerCase(),
+          strVal(d.lotnumber),
+          strVal(d.itemName), strVal(d.itemOption),
+          numVal(d.itemOptionPrice), numVal(d.giftWrappingPrice),
+          strVal(d.giftMessage),
+          strVal(d.noshiPresenterName1), strVal(d.noshiPresenterName2), strVal(d.noshiPresenterName3),
+          strVal(d.itemCancelStatus),
+          numVal(d.beforeDiscount), numVal(d.discount), numVal(d.itemPrice), intVal(d.unit), numVal(d.totalItemPrice), numVal(d.totalItemChargePrice),
+          strVal(d.taxType), numVal(d.reducedTax), numVal(d.taxRate), numVal(d.giftPoint),
+          strVal(d.shippingDayDispText), strVal(d.shippingTimelimitDate),
+          // メタ
           ts
         );
         inserted++;
