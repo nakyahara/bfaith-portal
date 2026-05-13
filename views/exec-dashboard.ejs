@@ -371,6 +371,32 @@ function renderFySummary(rows, headcount, meta) {
   const yenOnly = (label, val) => {
     return '<div class="fy-metric"><div class="label">' + esc(label) + '</div><div class="value">' + (val == null ? '—' : esc(fmtJpyShort(val))) + '</div></div>';
   };
+  // ratioFmt: 倍数 (n.n倍) 表示。warnIfBelow=N で N 未満を赤太字 ⚠ (例: インタレストカバレッジ 3倍以下、返済余力 1.0以下)
+  //   missingNote: val が null の時に "—" の代わりに表示する文言 (例: "計算不能 (赤字)")。指定時は ⚠ + 赤太字
+  const ratioFmt = (label, val, suffix, warnIfBelow, missingNote) => {
+    const ok = val != null && Number.isFinite(val);
+    let v, warn = false;
+    if (ok) { v = esc(Number(val).toFixed(1)) + suffix; warn = warnIfBelow != null && val < warnIfBelow; }
+    else if (missingNote) { v = esc(missingNote); warn = true; }
+    else { v = '—'; }
+    return '<div class="fy-metric"><div class="label">' + esc(label) + '</div><div class="value"' + (warn ? ' style="color:#dc2626"' : '') + '>' + v + (warn ? ' ⚠' : '') + '</div></div>';
+  };
+  // ratioFmtAbove: warnIfAbove=N で N 超過を赤太字 ⚠ (例: 債務償還年数 10年超、借入金月商比率 3ヶ月超)
+  const ratioFmtAbove = (label, val, suffix, warnIfAbove, missingNote) => {
+    const ok = val != null && Number.isFinite(val);
+    let v, warn = false;
+    if (ok) { v = esc(Number(val).toFixed(1)) + suffix; warn = warnIfAbove != null && val > warnIfAbove; }
+    else if (missingNote) { v = esc(missingNote); warn = true; }
+    else { v = '—'; }
+    return '<div class="fy-metric"><div class="label">' + esc(label) + '</div><div class="value"' + (warn ? ' style="color:#dc2626"' : '') + '>' + v + (warn ? ' ⚠' : '') + '</div></div>';
+  };
+  // yenSigned: 純増減金額。負(純減=返済進行)を緑▲、正(純増=借入増)を赤+ で色分け
+  const yenSigned = (label, val) => {
+    if (val == null || !Number.isFinite(val)) return '<div class="fy-metric"><div class="label">' + esc(label) + '</div><div class="value">—</div></div>';
+    const color = val < 0 ? '#16a34a' : (val > 0 ? '#dc2626' : '#111');
+    const display = val < 0 ? ('▲' + fmtJpyShort(Math.abs(val))) : (val > 0 ? ('+' + fmtJpyShort(val)) : '±¥0');
+    return '<div class="fy-metric"><div class="label">' + esc(label) + '</div><div class="value" style="color:' + color + '">' + esc(display) + '</div></div>';
+  };
 
   const card = (fy, klass) => {
     if (!fy) return '';   // Codex Q4: prev 無い場合は単独 card (placeholder 削除)
@@ -412,6 +438,28 @@ function renderFySummary(rows, headcount, meta) {
       + yenOnly('月間固定費 (販管費月平均)', fy.monthly_fixed_cost)
       + yenOnly('総資産 月平均', fy.total_asset_average)
       + '  </div>'
+      // 💳 借入金返済余力 (Phase 1d-4)
+      + (fy.loan && fy.loan.available
+          ? ('  <div style="font-size:11px;color:#6b7280;margin:10px 0 4px;font-weight:600;border-top:1px solid #e5e7eb;padding-top:8px">'
+              + '💳 借入金返済余力'
+              + '<span style="font-weight:400;color:#9ca3af;margin-left:6px">期首=' + esc(fy.loan.opening_ym) + ' / 確定月=' + esc(fy.loan.closing_ym) + '</span>'
+              + '</div>'
+            + '  <div class="fy-row">'
+            + yenOnly('借入金合計 (短期+長期)', fy.loan.loan_total_closing)
+            + yenSigned('期首比 純増減 (▲=返済進行)', fy.loan.loan_change_in_period)
+            + ratioFmtAbove('債務償還年数 (借入÷年換算EBITDA、目安≤10年)', fy.loan.debt_to_ebitda_years, '年', 10,
+                fy.loan.ebitda_status === 'non_positive' ? '計算不能 (EBITDA≤0)' : null)
+            + ratioFmt('インタレスト・カバレッジ (営業利益÷支払利息、目安≥3倍)', fy.loan.interest_coverage_ratio, '倍', 3)
+            + ratioFmtAbove('借入金月商比率 (借入÷月平均売上、目安≤3ヶ月)', fy.loan.loan_to_monthly_sales_months, 'ヶ月', 3)
+            + ratioFmt('🛟 返済余力 (年換算EBITDA÷年間返済額、目安≥1.0倍)', fy.loan.repayment_capacity_ratio, '倍', 1.0,
+                fy.loan.repayment_status === 'no_repayment' ? '期中純減なし (借換 or 借入増)'
+                  : (fy.loan.repayment_status === 'no_opening' ? null : null))
+            + yenOnly('年換算EBITDA (簡易: 営業利益+減価償却)', fy.loan.annualized_ebitda)
+            + yenOnly('年間返済額 実績 (期首比純減・年換算、借換影響あり)', fy.loan.annualized_net_repayment)
+            + yenOnly('支払利息 累計', fy.loan.interest_paid_cum)
+            + yenOnly('減価償却費 累計', fy.loan.depreciation_cum)
+            + '  </div>')
+          : '')
       + '</div>';
   };
 
