@@ -792,6 +792,87 @@ router.get('/api/fy-summary', (req, res) => {
       const dsoD = sales > 0 ? arAvg / (sales / periodDays) : null;
       const invD = cogs > 0 ? invAvg / (cogs / periodDays) : null;
       const dpoD = cogs > 0 ? apAvg / (cogs / periodDays) : null;
+      // ─── 💳 借入金返済余力 (Phase 1d-4) ───
+      //   B-Faith 借入金 ¥210M+ に対する返済能力を可視化:
+      //     - 借入金合計 (確定月時点 短期+長期) と 期首比 純増減
+      //     - 債務償還年数 = 借入金 / 年換算EBITDA (10年以下が安全圏)
+      //     - インタレスト・カバレッジ = 営業利益 / 支払利息 (3倍以上が健全、1倍以下は危険)
+      //     - 借入金月商比率 = 借入金 / 月平均売上 (3ヶ月以内が理想)
+      //     - 返済余力 = 年換算EBITDA / 年間返済額 実績 (1.0以上で返済可能)
+      //     - EBITDA = 営業利益 + 減価償却費 (税引前キャッシュ生成力の簡易指標)
+      //   注意:
+      //     - 「年間返済額 実績」は 期首借入−確定月借入 の純減ベース → 期中で追加借入があると過小評価
+      //     - 期首借入 (=fy_start_ym の前月末 closing) が mart に無い (例: 第8期以前) 場合は純増減/返済余力は null
+      //     - mirror_mf_bs_monthly / mirror_mf_pl_monthly が未デプロイなら loan ブロック全体が null
+      let loan = null;
+      try {
+        const [fsy, fsm] = r.fy_start_ym.split('-').map(Number);
+        let openY = fsy, openM = fsm - 1;
+        if (openM < 1) { openM = 12; openY--; }
+        const openingYm = `${openY}-${String(openM).padStart(2, '0')}`;
+        const openingRow = db.prepare(`SELECT short_loan_total, long_loan_total FROM v_mirror_mf_bs_monthly_latest WHERE month_ym = ?`).get(openingYm);
+        const closingRow = db.prepare(`SELECT short_loan_total, long_loan_total FROM v_mirror_mf_bs_monthly_latest WHERE month_ym = ?`).get(r.cumulative_through_ym);
+        if (closingRow) {
+          const plRows = db.prepare(`
+            SELECT role_key, SUM(amount_excl_tax) AS v
+            FROM v_mirror_mf_pl_monthly_latest
+            WHERE month_ym >= ? AND month_ym <= ?
+              AND role_key IN ('non_op_expense_interest', 'sgae_depreciation')
+            GROUP BY role_key
+          `).all(r.fy_start_ym, r.cumulative_through_ym);
+          const plMap = Object.fromEntries(plRows.map(p => [p.role_key, p.v || 0]));
+          const interestPaid = plMap['non_op_expense_interest'] || 0;
+          const depreciation = plMap['sgae_depreciation'] || 0;
+          const loanShort = closingRow.short_loan_total || 0;
+          const loanLong = closingRow.long_loan_total || 0;
+          const loanClosing = loanShort + loanLong;
+          const loanOpening = openingRow ? ((openingRow.short_loan_total || 0) + (openingRow.long_loan_total || 0)) : null;
+          const loanChange = loanOpening != null ? loanClosing - loanOpening : null;  // 負=純減 (良い)
+          const annualizeFactor = months > 0 ? 12 / months : 1;
+          const ebitda = operating + depreciation;                                        // 簡易EBITDA = 営業利益 + 減価償却
+          const annualizedEbitda = ebitda * annualizeFactor;
+          // 純減ベース 年間返済額: 期首比 純減なら正値、純増なら 0 (返済はしてない)、期首不明なら null
+          //   ※ 期中で追加借入があると過小評価される (Codex 指摘: 借換影響あり)
+          const netRepaymentInPeriod = loanChange != null ? Math.max(-loanChange, 0) : null;
+          const annualizedNetRepayment = netRepaymentInPeriod != null ? netRepaymentInPeriod * annualizeFactor : null;
+          // ステータス: UI 側で "—" (欠損) と "計算不能 (要警戒)" を区別するため
+          //   ebitda_status: 'positive' = 計算済、'non_positive' = EBITDA≤0 で算出不能 (営業赤字相当 = 強警戒)
+          //   repayment_status: 'computed' = 計算済、'no_repayment' = 期中純減なし (借換 or 借入増加 = 注意)、'no_opening' = 期首 BS 不明
+          const ebitdaStatus = annualizedEbitda > 0 ? 'positive' : 'non_positive';
+          const repaymentStatus = loanChange == null ? 'no_opening'
+            : (annualizedNetRepayment > 0 ? 'computed' : 'no_repayment');
+          loan = {
+            available: true,
+            opening_ym: openingYm,
+            closing_ym: r.cumulative_through_ym,
+            loan_short: loanShort,
+            loan_long: loanLong,
+            loan_total_closing: loanClosing,
+            loan_total_opening: loanOpening,                                              // null 可
+            loan_change_in_period: loanChange,                                            // 負=純減 (返済進行)
+            interest_paid_cum: Math.round(interestPaid),
+            depreciation_cum: Math.round(depreciation),
+            ebitda_cum: Math.round(ebitda),
+            annualized_ebitda: Math.round(annualizedEbitda),
+            annualized_net_repayment: annualizedNetRepayment != null ? Math.round(annualizedNetRepayment) : null,
+            ebitda_status: ebitdaStatus,                                                  // 'positive' | 'non_positive'
+            repayment_status: repaymentStatus,                                            // 'computed' | 'no_repayment' | 'no_opening'
+            // 債務償還年数 = 借入金 / 年換算EBITDA (PDF 経営報告書の「借入金返済年数」相当、目安≤10年)
+            //   ※ EBITDA≤0 の時は null、UI が ebitda_status='non_positive' を見て「計算不能 (赤字)」表示
+            debt_to_ebitda_years: round1(annualizedEbitda > 0 ? loanClosing / annualizedEbitda : null),
+            // インタレスト・カバレッジ・レシオ = 営業利益 / 支払利息 (3倍以上が健全、1倍以下は強警戒)
+            interest_coverage_ratio: round1(interestPaid > 0 ? operating / interestPaid : null),
+            // 借入金月商比率 = 借入金 / 月平均売上 (3ヶ月以下が理想)
+            loan_to_monthly_sales_months: round1((sales > 0 && months > 0) ? loanClosing / (sales / months) : null),
+            // 返済余力 = 年換算EBITDA / 年間返済額 (1.0 以上で返済可能)
+            //   ※ 期中純減なしの時は null、UI が repayment_status='no_repayment' を見て「期中純減なし」表示
+            repayment_capacity_ratio: round1(annualizedNetRepayment > 0 ? annualizedEbitda / annualizedNetRepayment : null),
+          };
+        }
+      } catch (e) {
+        // mirror_mf_bs_monthly / mirror_mf_pl_monthly が未デプロイなら loan = null のまま、それ以外は warn のみ
+        if (!isMissingMirrorTable(e)) console.warn('[exec-dashboard] loan kpi error (fy=' + r.fy_number + '):', e.message);
+      }
       return {
         fy_number: r.fy_number,
         fy_start_ym: r.fy_start_ym,
@@ -842,6 +923,8 @@ router.get('/api/fy-summary', (req, res) => {
         gross_profit_pct: round2(sales > 0 ? grossProfit / sales * 100 : null),
         headcount: HEADCOUNT,
         period_days_used: Math.round(periodDays),
+        // 💳 借入金返済余力 (Phase 1d-4)。null = mirror 未デプロイ or データ無し
+        loan,
       };
     });
     res.json({ ok: true, available: true, fy_summary: enriched, headcount: HEADCOUNT, meta });
