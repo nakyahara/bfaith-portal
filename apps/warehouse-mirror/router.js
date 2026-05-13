@@ -131,13 +131,17 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
 
     // sku_master (1 SKU = 1 行、Sheets 商品コード変換テーブルとの差分検出用)
     //
-    // fail-closed 設計 (Codex review 2026-05-13: critical/high #1+#2):
+    // fail-closed 設計 (Codex review 2026-05-13 round 1 + round 2 反映):
     //   N>0 件 → 全件置換 (DELETE → INSERT)
     //   0 件 + meta.clear_sku_master=true → 明示 clear、DELETE のみ実行
+    //     ※ daily sync (sync-to-render.js) はこの flag を絶対に自動付与しない設計。
+    //        手動オペ (curl 直送 / 管理スクリプト) 専用の escape hatch。
     //   0 件 + flag 無し → 反映拒否 (上流異常 / worktree 別 DB / 送信側 bug の可能性)、前回の mirror 保持
     //
     // 過去事故 (2026-05-08〜10 Yahoo VPS proxy regression: 取得失敗を「空配列の正常同期」として
     // 流し mirror 3 日間全空文字) と (2026-05-06 worktree で別 DB が静かに分裂) の再発防止。
+    // daily sync 側で 0 件のときに送信スキップする (sync-to-render.js) ので、通常 daily sync で
+    // 当ブランチ (0 件 + flag 無し) に入ること自体が異常検知ポイント。
     if (req.body.sku_master !== undefined && Array.isArray(req.body.sku_master)) {
       const masterRows = req.body.sku_master;
       const explicitClear = req.body.meta?.clear_sku_master === true;
