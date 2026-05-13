@@ -873,6 +873,117 @@ router.get('/api/fy-summary', (req, res) => {
         // mirror_mf_bs_monthly / mirror_mf_pl_monthly が未デプロイなら loan = null のまま、それ以外は warn のみ
         if (!isMissingMirrorTable(e)) console.warn('[exec-dashboard] loan kpi error (fy=' + r.fy_number + '):', e.message);
       }
+      // ─── 💰 簡易キャッシュフロー (間接法、Phase 1d-4) ───
+      //   経営者向け「利益 → 現金」ブリッジ表示。CFAS の正式 CF 計算書ではなく、
+      //   「何で利益と現金がズレたか」が一目で分かることを目的とした簡易版。
+      //   構造:
+      //     ① キャッシュ生成 = 経常利益累計 + 減価償却累計 (現金支出なき費用を戻す)
+      //     ② 営業WC変動 = -ΔAR - Δ棚卸 + ΔAP - ΔOtherCA + ΔOtherCL
+      //        (売上債権・棚卸 増加 = 資金圧迫 = ▲、買掛金・その他流動負債 増加 = 資金調達 = +)
+      //        ※ ΔOtherFL (役員借入金・長期未払金 等) は財務CF側に分類 (Codex R1 high)
+      //     ③ 投資CF (capex_proxy) = -(Δ有形固定 + 減価償却累計) - Δ投資その他
+      //        (有形 簿価増 + 償却分 = 取得相当。固定資産売却時は過小評価 = Codex R1 medium)
+      //     ④ 財務CF = (短期+長期借入) 変動 + 資本金変動 + ΔOtherFL (役員借入金等)
+      //     ⑤ 整合性 = (実績) cash_close - cash_open - (理論) operating_cf+investing_cf+financing_cf
+      //        ※ |差額| > max(¥10M, |actual|×0.2) のとき severity='high' (UI で赤太字 ⚠)
+      //   注意:
+      //     - 期首 BS (fy_start_ym 前月末) が無い (例: 第8期) なら cash_flow = null
+      //     - 「その他WC」には 未払消費税・未払法人税・預り金・前払・仮受金 等の純変動が混入
+      //     - 厳密な CF 計算書は税引前→税引後・為替差損・固定資産売却益等の調整が必要だが
+      //       B-Faith 規模では「unexplained」枠に押し込めて経営判断には十分
+      let cashFlow = null;
+      try {
+        const [fsy, fsm] = r.fy_start_ym.split('-').map(Number);
+        let openY = fsy, openM = fsm - 1;
+        if (openM < 1) { openM = 12; openY--; }
+        const openingYm = `${openY}-${String(openM).padStart(2, '0')}`;
+        const bsOpen = db.prepare(`
+          SELECT cash_total, ar_total, inventory_total, other_current_asset,
+                 tangible_fixed_asset, investment_other,
+                 ap_total, other_current_liab, short_loan_total,
+                 long_loan_total, other_fixed_liab, capital
+          FROM v_mirror_mf_bs_monthly_latest WHERE month_ym = ?
+        `).get(openingYm);
+        const bsClose = db.prepare(`
+          SELECT cash_total, ar_total, inventory_total, other_current_asset,
+                 tangible_fixed_asset, investment_other,
+                 ap_total, other_current_liab, short_loan_total,
+                 long_loan_total, other_fixed_liab, capital
+          FROM v_mirror_mf_bs_monthly_latest WHERE month_ym = ?
+        `).get(r.cumulative_through_ym);
+        if (bsOpen && bsClose) {
+          // 減価償却累計 (loan で取った値を再利用したいが、loan が null の場合もあるため再 query)
+          const depRow = db.prepare(`
+            SELECT COALESCE(SUM(amount_excl_tax), 0) AS v FROM v_mirror_mf_pl_monthly_latest
+            WHERE month_ym >= ? AND month_ym <= ? AND role_key = 'sgae_depreciation'
+          `).get(r.fy_start_ym, r.cumulative_through_ym);
+          const depreciation = depRow?.v || 0;
+          const v = (k) => Number(bsClose[k] || 0) - Number(bsOpen[k] || 0);  // closing - opening = 変動
+          // ① キャッシュ生成
+          const profitBase = ordinary;                                          // 経常利益 (税引前、法人税控除前)
+          const cashGeneration = profitBase + depreciation;
+          // ② 営業WC変動
+          const arChange = v('ar_total');                                       // +=増加=CF▲
+          const invChange = v('inventory_total');
+          const apChange = v('ap_total');                                        // +=増加=CF+
+          const otherCAChange = v('other_current_asset');
+          const otherCLChange = v('other_current_liab');
+          const otherFLChange = v('other_fixed_liab');                           // 役員借入金 + 長期未払金 → 財務CF扱い (Codex review high)
+          const wcCoreNet = -arChange - invChange + apChange;                    // 主要3項目
+          const wcOtherNet = -otherCAChange + otherCLChange;                     // その他流動 (税金/未払/預り/前払/仮受/仮払 等)
+          const operatingCf = cashGeneration + wcCoreNet + wcOtherNet;
+          // ③ 投資CF (固定資産 取得相当、簡易)
+          //   ※ 厳密な投資CFではなく capex_proxy。Δ簿価 + 償却 ≒ 取得 (売却・除却・減損あれば過小評価)
+          //   ※ 投資その他 (保険積立・長期前払 等) も簡易に -Δ で含める
+          const tangibleChange = v('tangible_fixed_asset');
+          const investmentChange = v('investment_other');
+          const capexProxyTangible = -tangibleChange - depreciation;             // 取得相当 (簿価増 + 償却分)
+          const investmentOtherCfImpact = -investmentChange;
+          const investingCf = capexProxyTangible + investmentOtherCfImpact;
+          // ④ 財務CF (借入金 + 資本金 + その他固定負債 = 役員借入金 等)
+          const loanChangeFin = v('short_loan_total') + v('long_loan_total');    // 純増=CF+(調達)、純減=CF▲(返済)
+          const capitalChange = v('capital');
+          const financingCf = loanChangeFin + capitalChange + otherFLChange;
+          // ⑤ 整合性
+          const theoreticalCashChange = operatingCf + investingCf + financingCf;
+          const actualCashChange = v('cash_total');
+          const unexplained = actualCashChange - theoreticalCashChange;
+          // 差額警告閾値: |差額| が max(¥10M, 実績現金変動 × 20%) を超えるなら要確認 (Codex 観点7)
+          const unexplainedThreshold = Math.max(10_000_000, Math.abs(actualCashChange) * 0.2);
+          const unexplainedSeverity = Math.abs(unexplained) > unexplainedThreshold ? 'high' : 'ok';
+          cashFlow = {
+            available: true,
+            opening_ym: openingYm,
+            closing_ym: r.cumulative_through_ym,
+            profit_base: Math.round(profitBase),                                 // 経常利益累計
+            depreciation: Math.round(depreciation),
+            cash_generation: Math.round(cashGeneration),
+            wc_ar_change: Math.round(arChange),
+            wc_inv_change: Math.round(invChange),
+            wc_ap_change: Math.round(apChange),
+            wc_other_ca_change: Math.round(otherCAChange),
+            wc_other_cl_change: Math.round(otherCLChange),
+            wc_core_net: Math.round(wcCoreNet),                                  // -AR -INV +AP
+            wc_other_net: Math.round(wcOtherNet),                                // -OtherCA +OtherCL (※OtherFL は財務CF側)
+            operating_cf: Math.round(operatingCf),
+            // ※ capex_proxy: 厳密な投資CF ではなく「固定資産 取得相当」。設備売却時は過小 (cash IN を取りこぼす)
+            invest_capex_tangible_proxy: Math.round(capexProxyTangible),
+            invest_investment_other: Math.round(investmentOtherCfImpact),
+            investing_cf: Math.round(investingCf),
+            loan_change_financing: Math.round(loanChangeFin),
+            capital_change: Math.round(capitalChange),
+            other_fixed_liab_change_financing: Math.round(otherFLChange),         // 役員借入金 + 長期未払金 (財務CF)
+            financing_cf: Math.round(financingCf),
+            theoretical_cash_change: Math.round(theoreticalCashChange),
+            actual_cash_change: Math.round(actualCashChange),
+            unexplained: Math.round(unexplained),
+            unexplained_threshold: Math.round(unexplainedThreshold),
+            unexplained_severity: unexplainedSeverity,                            // 'ok' | 'high'
+          };
+        }
+      } catch (e) {
+        if (!isMissingMirrorTable(e)) console.warn('[exec-dashboard] cash_flow error (fy=' + r.fy_number + '):', e.message);
+      }
       return {
         fy_number: r.fy_number,
         fy_start_ym: r.fy_start_ym,
@@ -925,6 +1036,8 @@ router.get('/api/fy-summary', (req, res) => {
         period_days_used: Math.round(periodDays),
         // 💳 借入金返済余力 (Phase 1d-4)。null = mirror 未デプロイ or データ無し
         loan,
+        // 💰 簡易キャッシュフロー (間接法、Phase 1d-4)。null = 期首 BS 無 or mirror 未デプロイ
+        cash_flow: cashFlow,
       };
     });
     res.json({ ok: true, available: true, fy_summary: enriched, headcount: HEADCOUNT, meta });
