@@ -129,6 +129,29 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
       log.push(`sku_resolved: ${resolved.length}件`);
     }
 
+    // sku_master (1 SKU = 1 行、Sheets 商品コード変換テーブルとの差分検出用)
+    // 全件置換。空配列も受け取る (mirror 側を clear する意図、ただし sync 側で 0 件取得失敗時は送信しない)
+    if (req.body.sku_master && Array.isArray(req.body.sku_master)) {
+      const masterRows = req.body.sku_master;
+      const tx = db.transaction(() => {
+        db.exec('DELETE FROM mirror_sku_master');
+        const stmt = db.prepare(`INSERT INTO mirror_sku_master (
+          seller_sku, 商品名, source_created_at, source_updated_at, synced_at
+        ) VALUES (?,?,?,?,?)`);
+        for (const r of masterRows) {
+          stmt.run(
+            r.seller_sku,
+            r.商品名 ?? null,
+            r.source_created_at ?? null,
+            r.source_updated_at ?? null,
+            now
+          );
+        }
+      });
+      tx();
+      log.push(`sku_master: ${masterRows.length}件`);
+    }
+
     // inv_daily_detail (D-1c 詳細層、差分sync UPSERT + 古い行クリーン)
     // ペイロード: { inv_daily_detail: [...rows], meta: {
     //   inv_daily_detail_clear_old: true,                      // 365日より古い行 housekeeping
@@ -1843,8 +1866,97 @@ router.get('/api/status', (req, res) => {
     } catch {
       status.inv_daily_detail_count = 0;
     }
+    // mirror_sku_master (商品コード変換テーブル差分検出用)
+    try {
+      const r = db.prepare(`
+        SELECT COUNT(*) AS cnt, MAX(source_updated_at) AS latest, MAX(synced_at) AS synced
+        FROM mirror_sku_master
+      `).get();
+      status.sku_master_count = r.cnt;
+      status.sku_master_latest_updated_at = r.latest;
+      status.sku_master_synced_at = r.synced;
+    } catch {
+      status.sku_master_count = 0;
+    }
   } catch {}
   res.json(status);
+});
+
+// ─── GET /api/sku-master/recent-missing-candidates ───
+// マスタ登録ツール (m_sku_master) に登録済みで、Google Sheets「商品コード変換テーブル」
+// にまだ載っていない SKU を、Sheets 側 GAS から日次でチェックするための専用 endpoint。
+//
+// 認証: x-read-token (MIRROR_READ_TOKEN 環境変数。Render env にのみ置く read-only token)
+//   ・WAREHOUSE_API_KEY (miniPC の master write 権限キー) とは完全分離
+//   ・キー未設定なら 503 (fail-closed)
+//
+// レスポンス:
+//   {
+//     since_days: 7,
+//     server_time_utc: 'YYYY-MM-DDTHH:MM:SS.fffZ',
+//     mirror_last_synced_at: 'YYYY-MM-DD HH:MM:SS' | null,    // mirror_sync_status.last_sync
+//     mirror_sku_master_synced_at: 'YYYY-MM-DD HH:MM:SS' | null, // 当テーブルの最新 synced_at
+//     count: <number>,
+//     items: [ { seller_sku, 商品名, source_updated_at: 'ISO 8601 Z' }, ... ]
+//   }
+//
+// 仕様メモ (Codex review 2026-05-13 反映):
+//   ・since_days は固定 7、パラメータ受け付けない (誤用防止)
+//   ・GAS 側はレスポンスの mirror_last_synced_at が当日かを必ず検証 (古ければ処理停止)
+//   ・Cache-Control: no-store
+//   ・件数 0 でも 200 で返す (差分判定は呼び出し側)
+function requireReadToken(req, res, next) {
+  const token = process.env.MIRROR_READ_TOKEN;
+  if (!token) {
+    return res.status(503).json({ error: 'mirror_read_token_unset' });
+  }
+  const provided = req.headers['x-read-token'] || req.query.read_token;
+  if (provided !== token) {
+    return res.status(401).json({ error: 'invalid_read_token' });
+  }
+  next();
+}
+
+router.get('/api/sku-master/recent-missing-candidates', requireReadToken, (req, res) => {
+  const db = getMirrorDB();
+  const SINCE_DAYS = 7; // 固定 (Codex review #2: パラメータ受け付けない)
+
+  try {
+    // mirror_sku_master.source_updated_at は 'YYYY-MM-DDTHH:MM:SS.fffZ' (UTC ISO 8601、m_sku_master.updated_at 素通し)
+    // 'datetime' 関数は ISO 8601 を解釈できるので直接比較可
+    const items = db.prepare(`
+      SELECT seller_sku, 商品名, source_updated_at
+      FROM mirror_sku_master
+      WHERE source_updated_at IS NOT NULL
+        AND source_updated_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days')
+      ORDER BY source_updated_at DESC, seller_sku
+    `).all();
+
+    // mirror freshness 情報 (GAS 側で stale 判定に使う)
+    let mirrorLastSync = null;
+    let masterSyncedAt = null;
+    try {
+      const r = db.prepare(`SELECT value FROM mirror_sync_status WHERE key='last_sync'`).get();
+      mirrorLastSync = r?.value ?? null;
+    } catch {}
+    try {
+      const r = db.prepare(`SELECT MAX(synced_at) AS s FROM mirror_sku_master`).get();
+      masterSyncedAt = r?.s ?? null;
+    } catch {}
+
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      since_days: SINCE_DAYS,
+      server_time_utc: new Date().toISOString(),
+      mirror_last_synced_at: mirrorLastSync,
+      mirror_sku_master_synced_at: masterSyncedAt,
+      count: items.length,
+      items,
+    });
+  } catch (e) {
+    console.error('[sku-master/recent-missing-candidates] error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ─── GET /api/download/:table ───

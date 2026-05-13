@@ -179,6 +179,26 @@ export async function syncToRender() {
     console.log(`[Sync→Render]   sku_resolved: 取得失敗（スキップ）: ${e.message}`);
   }
 
+  // 2b-2b. sku_master (1 SKU = 1 行、Sheets 商品コード変換テーブルとの差分検出用)
+  //   sku_resolved は seller_sku × ne_code 粒度 (派生) なので、SKU 一覧用途には不自然
+  //   m_sku_master.{seller_sku, 商品名, created_at, updated_at} をそのまま 1 SKU 1 行で送る
+  //   (Codex review 2026-05-13: A''案 = master の mirror を独立に持つ)
+  let sku_master = [];
+  try {
+    sku_master = db.prepare(`
+      SELECT
+        seller_sku,
+        商品名,
+        created_at AS source_created_at,
+        updated_at AS source_updated_at
+      FROM m_sku_master
+      ORDER BY seller_sku
+    `).all();
+    console.log(`[Sync→Render]   sku_master: ${sku_master.length}件 (1 SKU = 1 行)`);
+  } catch (e) {
+    console.log(`[Sync→Render]   sku_master: 取得失敗（スキップ）: ${e.message}`);
+  }
+
   // 2c. amazon_sku_fees（手数料キャッシュ）
   let amazon_sku_fees = [];
   try {
@@ -270,7 +290,7 @@ export async function syncToRender() {
 
   try {
     // Part 1: マスタデータ
-    await sendPart({ products, set_components, sku_resolved, amazon_sku_fees, rakuten_sku_map, inv_daily_summary }, 'マスタ');
+    await sendPart({ products, set_components, sku_resolved, sku_master, amazon_sku_fees, rakuten_sku_map, inv_daily_summary }, 'マスタ');
 
     // Part 1c: inv_daily_detail (D-1c、直近7日、~17MB なので chunk 分割)
     // 初回チャンクの meta:

@@ -116,6 +116,21 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirres_ne ON mirror_sku_resolved(ne_code)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirres_src ON mirror_sku_resolved(source)');
 
+  // mirror_sku_master — m_sku_master の 1 SKU = 1 行 ミラー
+  // 用途: 「マスタ登録ツールで登録済みだが Sheets 側の商品コード変換テーブルに未記載」の差分検出
+  // 経緯: mirror_sku_resolved は seller_sku × ne_code 粒度 (派生 view) で SKU 一覧用途に不自然なため、
+  //       m_sku_master.{seller_sku, 商品名, created_at, updated_at} を 1 SKU 1 行で持つ表を別途立てる
+  //       (Codex review 2026-05-13: A''案 = master の mirror を独立に持つ)
+  // source_created_at / source_updated_at は m_sku_master の ISO 8601 UTC ('YYYY-MM-DDTHH:MM:SS.fffZ') を素通し
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_sku_master (
+    seller_sku         TEXT NOT NULL PRIMARY KEY,
+    商品名             TEXT,
+    source_created_at  TEXT,
+    source_updated_at  TEXT,
+    synced_at          TEXT NOT NULL
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mir_sku_master_updated ON mirror_sku_master(source_updated_at)');
+
   // mirror_inv_daily_summary — 日次在庫スナップショットの集計結果ミラー
   // 元: ミニPC warehouse.db.inv_daily_summary
   // category = 'fba_warehouse' | 'fba_inbound' | 'own_warehouse' | 'fba_us_warehouse' | 'fba_us_inbound'
