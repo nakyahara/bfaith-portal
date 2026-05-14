@@ -1945,13 +1945,43 @@ router.get('/api/sku-master/recent-missing-candidates', requireReadToken, (req, 
   try {
     // mirror_sku_master.source_updated_at は 'YYYY-MM-DDTHH:MM:SS.fffZ' (UTC ISO 8601、m_sku_master.updated_at 素通し)
     // 'datetime' 関数は ISO 8601 を解釈できるので直接比較可
-    const items = db.prepare(`
+    //
+    // GAS 側の「商品コード変換テーブル」直接追記運用 (2026-05-15 仕様変更) のため、
+    // components (NE商品コード + 数量) を JSON 配列で返す。セット商品 (1 SKU が複数 NE) は
+    // GAS 側で components.length 行に展開して書き込む。
+    const masters = db.prepare(`
       SELECT seller_sku, 商品名, source_updated_at
       FROM mirror_sku_master
       WHERE source_updated_at IS NOT NULL
         AND source_updated_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days')
       ORDER BY source_updated_at DESC, seller_sku
     `).all();
+
+    // mirror_sku_resolved には source='master' の component 行が入っている
+    // (sync-to-render.js が m_sku_components × m_sku_master を JOIN して送ってる)
+    // 該当 SKU の component 行を取り出して seller_sku 単位でグループ化
+    let resolvedRows = [];
+    if (masters.length > 0) {
+      const placeholders = masters.map(() => '?').join(',');
+      resolvedRows = db.prepare(`
+        SELECT seller_sku, ne_code, quantity
+        FROM mirror_sku_resolved
+        WHERE seller_sku IN (${placeholders})
+          AND source = 'master'
+        ORDER BY seller_sku, ne_code
+      `).all(...masters.map(m => m.seller_sku));
+    }
+    const componentsBySku = new Map();
+    for (const r of resolvedRows) {
+      if (!componentsBySku.has(r.seller_sku)) componentsBySku.set(r.seller_sku, []);
+      componentsBySku.get(r.seller_sku).push({ ne_code: r.ne_code, quantity: r.quantity });
+    }
+    const items = masters.map(m => ({
+      seller_sku: m.seller_sku,
+      商品名: m['商品名'],
+      source_updated_at: m.source_updated_at,
+      components: componentsBySku.get(m.seller_sku) || [],
+    }));
 
     // mirror freshness 情報 (GAS 側で stale 判定に使う)
     let mirrorLastSync = null;
