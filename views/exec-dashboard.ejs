@@ -438,24 +438,31 @@ function renderFySummary(rows, headcount, meta) {
       + yenOnly('月間固定費 (販管費月平均)', fy.monthly_fixed_cost)
       + yenOnly('総資産 月平均', fy.total_asset_average)
       + '  </div>'
-      // 💳 借入金返済余力 (Phase 1d-4)
+      // 💳 借入金返済余力 (Phase 1d-4 + 1d-5: 期中借入額/返済額 分離)
       + (fy.loan && fy.loan.available
           ? ('  <div style="font-size:11px;color:#6b7280;margin:10px 0 4px;font-weight:600;border-top:1px solid #e5e7eb;padding-top:8px">'
               + '💳 借入金返済余力'
               + '<span style="font-weight:400;color:#9ca3af;margin-left:6px">期首=' + esc(fy.loan.opening_ym) + ' / 確定月=' + esc(fy.loan.closing_ym) + '</span>'
+              + '<span style="font-weight:400;color:#9ca3af;font-size:10px;margin-left:6px">※ Phase 1d-5: 月次純変動から期中借入/返済を gross 集計、返済余力もこれを分母に再計算</span>'
               + '</div>'
             + '  <div class="fy-row">'
             + yenOnly('借入金合計 (短期+長期)', fy.loan.loan_total_closing)
             + yenSigned('期首比 純増減 (▲=返済進行)', fy.loan.loan_change_in_period)
+            // ─ Phase 1d-5: 期中借入額/返済額 を gross で分離表示 (月次純変動から推定) ─
+            + yenOnly('期中借入額 (月次純変動 +方向の合計)', fy.loan.gross_borrowing_in_period)
+            + yenOnly('期中返済額 (月次純変動 -方向の合計)', fy.loan.gross_repayment_in_period)
             + ratioFmtAbove('債務償還年数 (借入÷年換算EBITDA、目安≤10年)', fy.loan.debt_to_ebitda_years, '年', 10,
                 fy.loan.ebitda_status === 'non_positive' ? '計算不能 (EBITDA≤0)' : null)
             + ratioFmt('インタレスト・カバレッジ (営業利益÷支払利息、目安≥3倍)', fy.loan.interest_coverage_ratio, '倍', 3)
             + ratioFmtAbove('借入金月商比率 (借入÷月平均売上、目安≤3ヶ月)', fy.loan.loan_to_monthly_sales_months, 'ヶ月', 3)
-            + ratioFmt('🛟 返済余力 (年換算EBITDA÷年間返済額、目安≥1.0倍)', fy.loan.repayment_capacity_ratio, '倍', 1.0,
-                fy.loan.repayment_status === 'no_repayment' ? '期中純減なし (借換 or 借入増)'
-                  : (fy.loan.repayment_status === 'no_opening' ? null : null))
+            // ─ Phase 1d-5: 返済余力は gross 返済ベースに変更 (純減ベースは旧仕様、追加借入を隠す問題があった) ─
+            + ratioFmt('🛟 返済余力 (年換算EBITDA÷年間返済額 実績、目安≥1.0倍)', fy.loan.repayment_capacity_ratio, '倍', 1.0,
+                fy.loan.repayment_status === 'no_repayment' ? '期中返済なし (要注意)'
+                  : fy.loan.repayment_status === 'gap_in_history' ? '月次BSに欠損 (算出不能)'
+                  : null)
             + yenOnly('年換算EBITDA (簡易: 営業利益+減価償却)', fy.loan.annualized_ebitda)
-            + yenOnly('年間返済額 実績 (期首比純減・年換算、借換影響あり)', fy.loan.annualized_net_repayment)
+            + yenOnly('年間返済額 (期中gross実績・年換算)', fy.loan.annualized_gross_repayment)
+            + yenOnly('年間借入額 (期中gross実績・年換算)', fy.loan.annualized_gross_borrowing)
             + yenOnly('支払利息 累計', fy.loan.interest_paid_cum)
             + yenOnly('減価償却費 累計', fy.loan.depreciation_cum)
             + '  </div>')

@@ -800,8 +800,15 @@ router.get('/api/fy-summary', (req, res) => {
       //     - 借入金月商比率 = 借入金 / 月平均売上 (3ヶ月以内が理想)
       //     - 返済余力 = 年換算EBITDA / 年間返済額 実績 (1.0以上で返済可能)
       //     - EBITDA = 営業利益 + 減価償却費 (税引前キャッシュ生成力の簡易指標)
+      //
+      //   Phase 1d-5 改善 (2026-05-14): 期中借入額/返済額 分離 ─
+      //     旧: 「年間返済額」= 期首比 純減ベース → 期中で追加借入があると過小評価
+      //     新: bs_monthly の月次純変動を方向別 (借入↑/返済↓) に集計し gross で分離
+      //         gross_borrowing_in_period / gross_repayment_in_period
+      //         → 返済余力は実績 gross 返済ベースで再計算 (旧 net base は参考表示)
+      //         月単位の合算で「振替 (長期↔1年以内)」「OPENING仕訳」は打ち消される (同月内の double swing は依然合算されるが稀)
+      //
       //   注意:
-      //     - 「年間返済額 実績」は 期首借入−確定月借入 の純減ベース → 期中で追加借入があると過小評価
       //     - 期首借入 (=fy_start_ym の前月末 closing) が mart に無い (例: 第8期以前) 場合は純増減/返済余力は null
       //     - mirror_mf_bs_monthly / mirror_mf_pl_monthly が未デプロイなら loan ブロック全体が null
       let loan = null;
@@ -810,8 +817,17 @@ router.get('/api/fy-summary', (req, res) => {
         let openY = fsy, openM = fsm - 1;
         if (openM < 1) { openM = 12; openY--; }
         const openingYm = `${openY}-${String(openM).padStart(2, '0')}`;
-        const openingRow = db.prepare(`SELECT short_loan_total, long_loan_total FROM v_mirror_mf_bs_monthly_latest WHERE month_ym = ?`).get(openingYm);
-        const closingRow = db.prepare(`SELECT short_loan_total, long_loan_total FROM v_mirror_mf_bs_monthly_latest WHERE month_ym = ?`).get(r.cumulative_through_ym);
+        // Phase 1d-5: 期首〜確定月の月次借入金推移を一括取得し、方向別 gross 集計
+        const monthlyLoanRows = db.prepare(`
+          SELECT month_ym, COALESCE(short_loan_total, 0) + COALESCE(long_loan_total, 0) AS loan_total,
+                 short_loan_total, long_loan_total
+          FROM v_mirror_mf_bs_monthly_latest
+          WHERE month_ym >= ? AND month_ym <= ?
+          ORDER BY month_ym
+        `).all(openingYm, r.cumulative_through_ym);
+        const openingRow = monthlyLoanRows[0]?.month_ym === openingYm ? monthlyLoanRows[0] : null;
+        const closingRow = monthlyLoanRows.length > 0 && monthlyLoanRows[monthlyLoanRows.length - 1]?.month_ym === r.cumulative_through_ym
+          ? monthlyLoanRows[monthlyLoanRows.length - 1] : null;
         if (closingRow) {
           const plRows = db.prepare(`
             SELECT role_key, SUM(amount_excl_tax) AS v
@@ -826,21 +842,50 @@ router.get('/api/fy-summary', (req, res) => {
           const loanShort = closingRow.short_loan_total || 0;
           const loanLong = closingRow.long_loan_total || 0;
           const loanClosing = loanShort + loanLong;
-          const loanOpening = openingRow ? ((openingRow.short_loan_total || 0) + (openingRow.long_loan_total || 0)) : null;
+          const loanOpening = openingRow ? openingRow.loan_total : null;
           const loanChange = loanOpening != null ? loanClosing - loanOpening : null;  // 負=純減 (良い)
+          // ─── 月次純変動を方向別 gross 集計 (Phase 1d-5) ───
+          //   ※ 中間月欠損 (例: 8月行が無く 7月→9月) があると gross 算出が不正確 (8月借入と9月返済が相殺される)
+          //     → expected vs 実件数 をチェックし不一致なら gross_* を null + status='gap_in_history'
+          //     (Codex R1 medium 指摘)
+          const monthDiff = (a, b) => {
+            const [ay, am] = a.split('-').map(Number);
+            const [by, bm] = b.split('-').map(Number);
+            return (by - ay) * 12 + (bm - am);
+          };
+          const expectedMonthCount = openingRow ? monthDiff(openingYm, r.cumulative_through_ym) + 1 : 0;
+          const monthsContinuous = openingRow != null && monthlyLoanRows.length === expectedMonthCount;
+          let grossBorrowing = 0, grossRepayment = 0;
+          let prevTotal = openingRow ? openingRow.loan_total : null;
+          if (monthsContinuous) {
+            for (const row of monthlyLoanRows.slice(1)) {
+              const d = row.loan_total - prevTotal;
+              if (d > 0) grossBorrowing += d;
+              else if (d < 0) grossRepayment += -d;
+              prevTotal = row.loan_total;
+            }
+          }
+          const grossDataAvailable = monthsContinuous && monthlyLoanRows.length >= 2;
           const annualizeFactor = months > 0 ? 12 / months : 1;
           const ebitda = operating + depreciation;                                        // 簡易EBITDA = 営業利益 + 減価償却
           const annualizedEbitda = ebitda * annualizeFactor;
-          // 純減ベース 年間返済額: 期首比 純減なら正値、純増なら 0 (返済はしてない)、期首不明なら null
-          //   ※ 期中で追加借入があると過小評価される (Codex 指摘: 借換影響あり)
+          // 旧: 純減ベース 年間返済額 (参考用に残す)
           const netRepaymentInPeriod = loanChange != null ? Math.max(-loanChange, 0) : null;
           const annualizedNetRepayment = netRepaymentInPeriod != null ? netRepaymentInPeriod * annualizeFactor : null;
+          // 新: gross 返済 年換算 (Phase 1d-5 主指標)
+          const annualizedGrossRepayment = grossDataAvailable ? grossRepayment * annualizeFactor : null;
+          const annualizedGrossBorrowing = grossDataAvailable ? grossBorrowing * annualizeFactor : null;
           // ステータス: UI 側で "—" (欠損) と "計算不能 (要警戒)" を区別するため
           //   ebitda_status: 'positive' = 計算済、'non_positive' = EBITDA≤0 で算出不能 (営業赤字相当 = 強警戒)
-          //   repayment_status: 'computed' = 計算済、'no_repayment' = 期中純減なし (借換 or 借入増加 = 注意)、'no_opening' = 期首 BS 不明
+          //   repayment_status:
+          //     'computed'           - gross 算出済
+          //     'no_repayment'       - gross 算出済だが期中返済額 0 (借入のみ or 動きなし、要注意)
+          //     'no_opening'         - 期首 BS 不明 (例: 第8期以前で fy_start_ym 前月末が mart に無い)
+          //     'gap_in_history'     - 期首〜確定月の途中月が欠損、gross 算出不可 (Codex R1: 欠損月跨ぎ相殺の罠回避)
           const ebitdaStatus = annualizedEbitda > 0 ? 'positive' : 'non_positive';
-          const repaymentStatus = loanChange == null ? 'no_opening'
-            : (annualizedNetRepayment > 0 ? 'computed' : 'no_repayment');
+          const repaymentStatus = openingRow == null ? 'no_opening'
+            : !monthsContinuous ? 'gap_in_history'
+            : (annualizedGrossRepayment > 0 ? 'computed' : 'no_repayment');
           loan = {
             available: true,
             opening_ym: openingYm,
@@ -850,23 +895,30 @@ router.get('/api/fy-summary', (req, res) => {
             loan_total_closing: loanClosing,
             loan_total_opening: loanOpening,                                              // null 可
             loan_change_in_period: loanChange,                                            // 負=純減 (返済進行)
+            // ─ Phase 1d-5: 方向別 gross 集計 (月次純変動から推定) ─
+            gross_borrowing_in_period: grossDataAvailable ? grossBorrowing : null,        // 期中の追加借入額 (月次変動 +方向の合計)
+            gross_repayment_in_period: grossDataAvailable ? grossRepayment : null,        // 期中の返済額 (月次変動 -方向の合計)
+            annualized_gross_borrowing: annualizedGrossBorrowing != null ? Math.round(annualizedGrossBorrowing) : null,
+            annualized_gross_repayment: annualizedGrossRepayment != null ? Math.round(annualizedGrossRepayment) : null,
+            // ─ 既存指標 (互換) ─
             interest_paid_cum: Math.round(interestPaid),
             depreciation_cum: Math.round(depreciation),
             ebitda_cum: Math.round(ebitda),
             annualized_ebitda: Math.round(annualizedEbitda),
-            annualized_net_repayment: annualizedNetRepayment != null ? Math.round(annualizedNetRepayment) : null,
+            annualized_net_repayment: annualizedNetRepayment != null ? Math.round(annualizedNetRepayment) : null,  // 旧 (参考)
             ebitda_status: ebitdaStatus,                                                  // 'positive' | 'non_positive'
-            repayment_status: repaymentStatus,                                            // 'computed' | 'no_repayment' | 'no_opening'
+            repayment_status: repaymentStatus,                                            // 'computed' | 'no_repayment' | 'no_opening' | 'gap_in_history'
             // 債務償還年数 = 借入金 / 年換算EBITDA (PDF 経営報告書の「借入金返済年数」相当、目安≤10年)
-            //   ※ EBITDA≤0 の時は null、UI が ebitda_status='non_positive' を見て「計算不能 (赤字)」表示
             debt_to_ebitda_years: round1(annualizedEbitda > 0 ? loanClosing / annualizedEbitda : null),
             // インタレスト・カバレッジ・レシオ = 営業利益 / 支払利息 (3倍以上が健全、1倍以下は強警戒)
             interest_coverage_ratio: round1(interestPaid > 0 ? operating / interestPaid : null),
             // 借入金月商比率 = 借入金 / 月平均売上 (3ヶ月以下が理想)
             loan_to_monthly_sales_months: round1((sales > 0 && months > 0) ? loanClosing / (sales / months) : null),
-            // 返済余力 = 年換算EBITDA / 年間返済額 (1.0 以上で返済可能)
-            //   ※ 期中純減なしの時は null、UI が repayment_status='no_repayment' を見て「期中純減なし」表示
-            repayment_capacity_ratio: round1(annualizedNetRepayment > 0 ? annualizedEbitda / annualizedNetRepayment : null),
+            // 返済余力 = 年換算EBITDA / 年間返済額 [gross 実績ベース、Phase 1d-5] (1.0 以上で返済可能)
+            //   旧: annualized_net_repayment ベース → 新: annualized_gross_repayment ベースに変更
+            repayment_capacity_ratio: round1(annualizedGrossRepayment > 0 ? annualizedEbitda / annualizedGrossRepayment : null),
+            // 旧: 純減ベース返済余力 (UI 比較表示用に残す。次フェーズで撤廃可)
+            repayment_capacity_ratio_net_legacy: round1(annualizedNetRepayment > 0 ? annualizedEbitda / annualizedNetRepayment : null),
           };
         }
       } catch (e) {
