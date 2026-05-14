@@ -179,6 +179,53 @@ export async function syncToRender() {
     console.log(`[Sync→Render]   sku_resolved: 取得失敗（スキップ）: ${e.message}`);
   }
 
+  // 2b-2b. sku_master (1 SKU = 1 行、Sheets 商品コード変換テーブルとの差分検出用)
+  //   sku_resolved は seller_sku × ne_code 粒度 (派生) なので、SKU 一覧用途には不自然
+  //   m_sku_master.{seller_sku, 商品名, created_at, updated_at} をそのまま 1 SKU 1 行で送る
+  //   (Codex review 2026-05-13: A''案 = master の mirror を独立に持つ)
+  //
+  // ★ fail-closed 設計 (Codex round 1 + round 2 反映):
+  //   ・SELECT 失敗 → payload に sku_master キーを含めない → mirror 前回値保持
+  //   ・SELECT 成功 0 件 → 通常運用で m_sku_master が 0 件になることはない (新規初期化のみ)
+  //     worktree で空 DB を見ている / DB 壊れ / 初期セットアップ前 等の異常を示唆
+  //     → **送信スキップ** + GChat warn 通知 + mirror 前回値保持
+  //     daily sync では絶対に自動 clear flag を立てない (round 2 high: 自動付与は防御の素通し)
+  //   ・SELECT 成功 N>0 件 → 通常通り全件置換 payload を送る
+  //
+  //   過去事故 (2026-05-08〜10 Yahoo VPS proxy regression: 取得失敗を「空配列の正常同期」として
+  //   流し mirror 3 日間全空文字) + (2026-05-06 worktree で別 DB が静かに分裂) の再発防止。
+  //   mirror_sku_master を明示的に全消ししたい運用 (リセット時等) は別手段で行う想定:
+  //     例) curl で meta.clear_sku_master=true を付けた payload を直送、or 手動 DB 削除。
+  // sku_master_state は後段の verify / allMatch / 通知判定で参照
+  //   'ok'             : SELECT 成功かつ N>0 件、payload 送信
+  //   'empty_skipped'  : SELECT 成功 0 件、送信スキップ (異常検知ポイント)
+  //   'select_failed'  : SELECT 失敗 (schema drift / DB lock 等)、送信スキップ
+  let sku_master = null;
+  let sku_master_state = 'ok';
+  try {
+    const rows = db.prepare(`
+      SELECT
+        seller_sku,
+        商品名,
+        created_at AS source_created_at,
+        updated_at AS source_updated_at
+      FROM m_sku_master
+      ORDER BY seller_sku
+    `).all();
+    if (rows.length === 0) {
+      sku_master_state = 'empty_skipped';
+      console.warn('[Sync→Render]   sku_master: SELECT 成功 0件 → 送信スキップ (worktree/別DB/壊れたDB の可能性、mirror は前回値を保持)');
+      await notify('⚠️ *Sync sku_master 異常*\nm_sku_master が 0 件。送信スキップ。worktree 別 DB / 壊れた DB / 初期セットアップ前の可能性を疑ってください。');
+    } else {
+      sku_master = rows;
+      console.log(`[Sync→Render]   sku_master: ${rows.length}件 (1 SKU = 1 行)`);
+    }
+  } catch (e) {
+    sku_master_state = 'select_failed';
+    console.error(`[Sync→Render]   sku_master: 取得失敗（送信スキップ、mirror は前回値を保持）: ${e.message}`);
+    await notify(`⚠️ *Sync sku_master 取得失敗*\n${e.message.slice(0, 300)}\n送信スキップ、mirror は前回値を保持。schema drift / DB lock を疑ってください。`);
+  }
+
   // 2c. amazon_sku_fees（手数料キャッシュ）
   let amazon_sku_fees = [];
   try {
@@ -270,7 +317,16 @@ export async function syncToRender() {
 
   try {
     // Part 1: マスタデータ
-    await sendPart({ products, set_components, sku_resolved, amazon_sku_fees, rakuten_sku_map, inv_daily_summary }, 'マスタ');
+    //   sku_master は SELECT 成功 & N>0 件のときだけ payload に含める (fail-closed)。
+    //   SELECT 失敗 / 0 件 / その他異常時は payload に乗せない → 受信側は前回 mirror を保持。
+    //   明示的な全消し (clear_sku_master flag) は daily sync では絶対に発行しない (round 2 high)。
+    const masterPart = {
+      products, set_components, sku_resolved, amazon_sku_fees, rakuten_sku_map, inv_daily_summary,
+    };
+    if (Array.isArray(sku_master) && sku_master.length > 0) {
+      masterPart.sku_master = sku_master;
+    }
+    await sendPart(masterPart, 'マスタ');
 
     // Part 1c: inv_daily_detail (D-1c、直近7日、~17MB なので chunk 分割)
     // 初回チャンクの meta:
@@ -343,6 +399,13 @@ export async function syncToRender() {
       monthly: { sent: sales_monthly.length, received: status.sales_monthly_count || 0 },
       daily: { sent: sales_daily.length, received: status.sales_daily_count || 0 },
       stock_snapshot: { sent: stockSyncPlan.count ?? 0, received: status.stock_snapshot_count || 0, fetched: stockSyncPlan.fetched },
+      // Codex round 3 high #1+#2 反映: sku_master の状態を verify に乗せ、
+      // 異常 (skip/失敗) を全体成功扱いから除外する
+      sku_master: {
+        state: sku_master_state,
+        sent: Array.isArray(sku_master) ? sku_master.length : 0,
+        received: status.sku_master_count ?? 0,
+      },
     };
 
     // stock_snapshot: fetched=false（SELECT失敗で同期スキップ）なら検証対象外。
@@ -350,27 +413,48 @@ export async function syncToRender() {
     const stockMatch = !stockSyncPlan.fetched
       || verify.stock_snapshot.sent === verify.stock_snapshot.received;
 
+    // sku_master:
+    //   'ok'             → 送信件数と受信件数の一致を要求
+    //   'empty_skipped'  → 上流異常 (worktree/空DB)、allMatch=false にする
+    //   'select_failed'  → schema drift / DB lock、allMatch=false にする
+    const skuMasterMatch = sku_master_state === 'ok'
+      && verify.sku_master.sent === verify.sku_master.received;
+
     const allMatch = verify.products.sent === verify.products.received
       && verify.monthly.sent === verify.monthly.received
       && verify.daily.sent === verify.daily.received
-      && stockMatch;
+      && stockMatch
+      && skuMasterMatch;
 
     if (allMatch) {
       console.log(`[Sync→Render] ✅ 検証OK — 全データ一致`);
       const stockLine = stockSyncPlan.fetched
         ? `\n月末在庫: ${verify.stock_snapshot.received}件`
         : `\n月末在庫: 取得スキップ`;
-      await notify(`✅ *Render同期完了*\n商品マスタ: ${verify.products.received}件\n月次集計: ${verify.monthly.received}件\n日次集計: ${verify.daily.received}件${stockLine}\n同期時刻: ${ts}`);
+      await notify(`✅ *Render同期完了*\n商品マスタ: ${verify.products.received}件\n月次集計: ${verify.monthly.received}件\n日次集計: ${verify.daily.received}件${stockLine}\nSKUマスタ: ${verify.sku_master.received}件\n同期時刻: ${ts}`);
     } else {
       console.log(`[Sync→Render] ⚠️ 検証NG — データ不一致`);
       console.log(`  products: 送信${verify.products.sent} / 受信${verify.products.received}`);
       console.log(`  monthly: 送信${verify.monthly.sent} / 受信${verify.monthly.received}`);
       console.log(`  daily: 送信${verify.daily.sent} / 受信${verify.daily.received}`);
       console.log(`  stock_snapshot: 送信${verify.stock_snapshot.sent} / 受信${verify.stock_snapshot.received} / fetched=${stockSyncPlan.fetched}`);
-      await notify(`⚠️ *Render同期 データ不一致*\n商品: ${verify.products.sent}→${verify.products.received}\n月次: ${verify.monthly.sent}→${verify.monthly.received}\n日次: ${verify.daily.sent}→${verify.daily.received}\n在庫: ${verify.stock_snapshot.sent}→${verify.stock_snapshot.received}${stockSyncPlan.fetched ? '' : ' (skipped)'}`);
+      console.log(`  sku_master: 状態=${sku_master_state} / 送信${verify.sku_master.sent} / 受信${verify.sku_master.received}`);
+      const skuMasterLine = sku_master_state === 'ok'
+        ? `SKUマスタ: ${verify.sku_master.sent}→${verify.sku_master.received}`
+        : `SKUマスタ: 状態=${sku_master_state} (送信スキップ、mirror=${verify.sku_master.received})`;
+      await notify(`⚠️ *Render同期 データ不一致*\n商品: ${verify.products.sent}→${verify.products.received}\n月次: ${verify.monthly.sent}→${verify.monthly.received}\n日次: ${verify.daily.sent}→${verify.daily.received}\n在庫: ${verify.stock_snapshot.sent}→${verify.stock_snapshot.received}${stockSyncPlan.fetched ? '' : ' (skipped)'}\n${skuMasterLine}`);
     }
 
-    return { ok: true, verify };
+    // ok の判定方針 (Codex round 4 high 反映):
+    //   既存テーブル (products/monthly/daily/stock_snapshot) の count 不一致は notify のみで ok:true を維持
+    //     (intermittent な count drift で daily-sync が常時 retry になるのを避ける、従来動作)
+    //   sku_master は **状態異常も count mismatch も** すべて ok:false にする (新 PR スコープ)
+    //     SELECT 失敗 / 0 件スキップ / Render 側 partial apply / status 件数不一致 のいずれも
+    //     daily-sync 側で retry-failed-jobs に拾わせ、再発リスクを早く気付ける状態にする
+    const sku_master_failure =
+      sku_master_state !== 'ok' ||
+      verify.sku_master.sent !== verify.sku_master.received;
+    return { ok: !sku_master_failure, verify };
   } catch (e) {
     console.error(`[Sync→Render] ❌ 送信失敗:`, e.message);
     await notify(`❌ *Render同期失敗*\n${e.message.slice(0, 200)}`);
