@@ -88,12 +88,42 @@ function main_() {
   }
   const data = JSON.parse(body);
 
-  // 2. レスポンス契約検証 (server 側 drift 検知)
+  // 2. レスポンス契約検証 (server 側 drift 検知 — Codex review medium #4)
+  //    destructive 操作 (シート本体追記) のため厳しめに型まで検証する
   if (data.since_days !== SINCE_DAYS) {
     throw new Error('Mirror endpoint contract drift: since_days=' + data.since_days + ' (expected ' + SINCE_DAYS + ')');
   }
   if (!Array.isArray(data.items)) {
     throw new Error('Mirror endpoint contract drift: items is not array');
+  }
+  if (typeof data.count !== 'number' || data.count !== data.items.length) {
+    throw new Error('Mirror endpoint contract drift: count=' + data.count + ' != items.length=' + data.items.length);
+  }
+  for (let i = 0; i < data.items.length; i++) {
+    const it = data.items[i];
+    if (!it || typeof it !== 'object') throw new Error('items[' + i + '] is not object');
+    if (typeof it.seller_sku !== 'string' || it.seller_sku.length === 0) {
+      throw new Error('items[' + i + '].seller_sku is not non-empty string');
+    }
+    if (it['商品名'] !== null && typeof it['商品名'] !== 'string') {
+      throw new Error('items[' + i + '].商品名 is not string|null');
+    }
+    if (typeof it.source_updated_at !== 'string') {
+      throw new Error('items[' + i + '].source_updated_at is not string');
+    }
+    if (!Array.isArray(it.components)) {
+      throw new Error('items[' + i + '].components is not array');
+    }
+    for (let j = 0; j < it.components.length; j++) {
+      const c = it.components[j];
+      if (!c || typeof c !== 'object') throw new Error('items[' + i + '].components[' + j + '] is not object');
+      if (typeof c.ne_code !== 'string' || c.ne_code.length === 0) {
+        throw new Error('items[' + i + '].components[' + j + '].ne_code is not non-empty string');
+      }
+      if (!Number.isInteger(c.quantity) || c.quantity <= 0) {
+        throw new Error('items[' + i + '].components[' + j + '].quantity is not positive integer');
+      }
+    }
   }
 
   // 3. mirror freshness 検証 (両系列を見る)
@@ -114,45 +144,62 @@ function main_() {
 
   const masterItems = data.items;
 
-  // 4. シート側「商品コード変換テーブル」既存 SKU の集合を作る (正規化済み)
+  // 4. シート側「商品コード変換テーブル」既存 (seller_sku, ne_code) ペアの集合を作る
+  //    Codex review high #2: 重複ガードを SKU 単位 → (sku, ne_code) ペア単位にして
+  //    セット商品の partial write / component 変更時に欠けた行を補完できるようにする
+  //    NE_COLUMN は固定 4 (D列、CSV 仕様より)
+  const NE_COLUMN = 4;
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sourceSheet = ss.getSheetByName(sourceSheetName);
   if (!sourceSheet) throw new Error('参照シートが見つからない: ' + sourceSheetName);
-  const lastRow = sourceSheet.getLastRow();
-  const existingSkuSet = new Set();
-  if (lastRow > sourceHeaderRows) {
-    const range = sourceSheet.getRange(sourceHeaderRows + 1, sourceSkuColumn, lastRow - sourceHeaderRows, 1);
+  const initialLastRow = sourceSheet.getLastRow();
+  const existingPairs = new Set(); // 'sku|ne' 形式
+  if (initialLastRow > sourceHeaderRows) {
+    const colsToRead = Math.max(sourceSkuColumn, NE_COLUMN);
+    const range = sourceSheet.getRange(sourceHeaderRows + 1, 1, initialLastRow - sourceHeaderRows, colsToRead);
     const vals = range.getValues();
     for (const row of vals) {
-      const norm = normalizeSku_(row[0]);
-      if (norm) existingSkuSet.add(norm);
+      const sku = normalizeSku_(row[sourceSkuColumn - 1]);
+      if (!sku) continue;
+      const ne = normalizeSku_(row[NE_COLUMN - 1]);
+      // ne が空でも 'sku|' で記録 → 「SKU 単独行 (NE 未記入)」も重複扱いにする
+      // (中原さんが手動で SKU だけ入れて NE を後で埋める運用も想定)
+      existingPairs.add(sku + '|' + ne);
     }
   }
 
   // 5. 差分計算 + components 展開
-  //    各 missing item の components[] を 1 行ずつに展開
-  //    components が空の場合は 1 行だけ追加 (NE/数量は空)
-  const missingItems = [];
+  //    Codex review critical: components 欠落 (mirror 不整合) は skip + warn、空 D/E 行を書かない
+  //    Codex review high #1: 重複判定は (sku, ne_code) ペア単位
+  const skippedNoComponents = []; // mirror 不整合 SKU
+  const skippedEmptyNe = [];      // ne_code 空の component
+  const newRows = [];             // {sku, name, ne_code, quantity} 形式
   for (const it of masterItems) {
-    const norm = normalizeSku_(it.seller_sku);
-    if (!norm) continue;
-    if (existingSkuSet.has(norm)) continue;
-    missingItems.push(it);
-  }
-
-  // 行展開: [A列, B列(空), C列, D列, E列] の 5 列ぴったり
-  const newRows = [];
-  for (const it of missingItems) {
-    const sku = String(it.seller_sku ?? '');
-    const name = String(it['商品名'] ?? '');
-    const comps = Array.isArray(it.components) ? it.components : [];
-    if (comps.length === 0) {
-      // components が無い (= mirror_sku_resolved に未投入の SKU) → SKU + 商品名のみ追記
-      newRows.push([sku, '', name, '', '']);
-    } else {
-      for (const c of comps) {
-        newRows.push([sku, '', name, String(c.ne_code ?? ''), c.quantity ?? '']);
+    const skuNorm = normalizeSku_(it.seller_sku);
+    if (!skuNorm) continue;
+    if (it.components.length === 0) {
+      // mirror_sku_master に居るが mirror_sku_resolved (source=master) に component 行が無い
+      // = mirror 不整合 (sync 中途半端 / 別 DB 分裂 等)。空 D/E 行を書くと後で SKU 単独で skip され
+      // 自動修復しないので、ここで止めて warn を出す。
+      skippedNoComponents.push(it.seller_sku);
+      continue;
+    }
+    for (const c of it.components) {
+      const neNorm = normalizeSku_(c.ne_code);
+      if (!neNorm) {
+        skippedEmptyNe.push(it.seller_sku + '/' + c.ne_code);
+        continue;
       }
+      const pairKey = skuNorm + '|' + neNorm;
+      if (existingPairs.has(pairKey)) continue;
+      // 中原さんが SKU 単独で入れてた行 ('sku|') がある場合も pair が違うので追加する
+      // (NE を後付けする運用なら、後で重複行が出るが手動で消せる範囲)
+      newRows.push({
+        sku: String(it.seller_sku),
+        name: String(it['商品名'] ?? ''),
+        ne_code: String(c.ne_code),
+        quantity: c.quantity,
+      });
     }
   }
 
@@ -164,12 +211,20 @@ function main_() {
   const summary = {
     write_mode: writeMode,
     fetched_master_skus: masterItems.length,
-    existing_skus_in_sheet: existingSkuSet.size,
-    missing_skus: missingItems.length,
+    existing_pairs_in_sheet: existingPairs.size,
     new_rows_to_write: newRows.length,
+    skipped_no_components: skippedNoComponents.length,
+    skipped_empty_ne: skippedEmptyNe.length,
     mirror_sku_master_synced_at: masterSync,
   };
   console.log(JSON.stringify(summary));
+
+  if (skippedNoComponents.length > 0) {
+    console.warn('[WARN] components 欠落 SKU を skip (mirror_sku_resolved に source=master 行が無い、mirror 不整合の疑い): ' + skippedNoComponents.join(', '));
+  }
+  if (skippedEmptyNe.length > 0) {
+    console.warn('[WARN] ne_code 空の component を skip: ' + skippedEmptyNe.join(', '));
+  }
 
   if (newRows.length === 0) {
     console.log('追記なし、終了');
@@ -179,20 +234,22 @@ function main_() {
   if (writeMode === 'dry_run') {
     console.log('[DRY-RUN] 以下の行を追記する予定 (実際には書き込まない):');
     for (const r of newRows) {
-      console.log('  A=' + r[0] + ' | C=' + r[2] + ' | D=' + r[3] + ' | E=' + r[4]);
+      console.log('  A=' + r.sku + ' | C=' + r.name + ' | D=' + r.ne_code + ' | E=' + r.quantity);
     }
     console.log('[DRY-RUN] 本番に切り替えるには Script Property WRITE_MODE=live にしてください');
     return;
   }
 
   // live 書き込み:
-  //   - 1〜5 列目を一括 setValues で書く (B列は空文字'')
-  //   - 既存の F列以降は触らない
-  //   - 追記する行は元々 lastRow より下なので、B列の空文字上書きで既存値破壊なし
-  const startRow = lastRow + 1;
-  const range = sourceSheet.getRange(startRow, 1, newRows.length, 5);
-  range.setValues(newRows);
-  console.log('[LIVE] ' + newRows.length + ' 行を行 ' + startRow + ' から追記しました');
+  //   Codex review high #2: B 列を触らないため、A/C/D/E 列を個別に setValues する (4 つの range)
+  //   Codex review low #5: lastRow を setValues 直前に再取得 (人手編集との競合で着地ずれ防止)
+  const startRow = sourceSheet.getLastRow() + 1;
+  const numRows = newRows.length;
+  sourceSheet.getRange(startRow, 1, numRows, 1).setValues(newRows.map(r => [r.sku]));
+  sourceSheet.getRange(startRow, 3, numRows, 1).setValues(newRows.map(r => [r.name]));
+  sourceSheet.getRange(startRow, 4, numRows, 1).setValues(newRows.map(r => [r.ne_code]));
+  sourceSheet.getRange(startRow, 5, numRows, 1).setValues(newRows.map(r => [r.quantity]));
+  console.log('[LIVE] ' + numRows + ' 行を行 ' + startRow + ' から追記しました (A/C/D/E のみ、B/F+ 不変)');
 }
 
 function normalizeSku_(v) {
