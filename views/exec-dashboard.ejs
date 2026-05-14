@@ -137,6 +137,11 @@
     .fy-card .fy-metric { padding: 6px 0; border-bottom: 1px solid #f3f4f6; }
     .fy-card .fy-metric:last-child { border-bottom: none; }
     .fy-card .fy-metric .label { font-size: 11px; color: #6b7280; }
+    /* Phase 1d-5: KPI 数値定義ヘルプ ⓘ — hover で title 属性のネイティブ tooltip 表示 */
+    .help-icon { font-size: 10px; color: #9ca3af; cursor: help; margin-left: 2px; user-select: none; vertical-align: super; outline: none; }
+    .help-icon:hover, .help-icon:focus { color: #2563eb; }
+    /* タッチデバイス (hover 不可) では ⓘ をやや強調 (タップで long-press tooltip 表示) */
+    @media (hover: none) { .help-icon { color: #2563eb; font-size: 11px; } }
     .fy-card .fy-metric .value { font-size: 18px; font-weight: 700; color: #111; }
     .fy-card .fy-metric .pct { font-size: 12px; color: #2563eb; margin-left: 4px; font-weight: 500; }
     @media (max-width: 768px) {
@@ -261,6 +266,79 @@ function esc(s) {
     .replace(/'/g, '&#39;');
 }
 
+// ─── 数値定義ヘルプ (Phase 1d-5: KPI 各項目に hover で表示する定義集) ───
+//   各 KPI helper (pctOnly/yenOnly 等) に defKey を渡すと ⓘ icon が出てネイティブ tooltip で定義表示
+//   定義は「計算式」「意味」「目安/しきい値」「B-Faith戦略」を改行区切りで含める
+const KPI_DEFS = {
+  // ─ 上部 KPI 5 ─
+  top_sales: '売上 (確定月)\n計算式: sales_mtd_excl_tax (税抜)\n意味: 最終確定月の売上総額\nB-Faith は EC物販 (年商¥11億) のため月次¥80-100M の幅',
+  top_gross_profit: '粗利 (限界利益)\n計算式: 売上 - 売上原価\n意味: 限界利益 (B-Faith戦略「原価=変動費」)、粗利率は対売上%\n目安: 月次粗利率 12-16% (繁忙期高、閑散期低)',
+  top_op_income: '営業利益\n計算式: 粗利 - 販管費 (sgae_*)\n意味: 本業の利益。販管費を引いた後の儲け\n目安: 月次¥0-5M、累計で営業利益率 3-5%',
+  top_cash: '現預金合計 (確定月末)\n計算式: 現金+預金 (UPSIDER等カード除く)\n5区分: 普通預金/定期預金/PayPal/ペイオニア/小口現金\n注意: UPSIDER等のクレジットカード残高は別カウント',
+  top_danger: '危険信号\n計算式: mart_mf_anomaly_signals の status=open 件数\nルール: R1 資金繰り残月数 / R2 粗利率急落 / R3 在庫急増 / R4 モール売上急減 / R5 営業赤字\n対応: タブ「異常検知」で詳細確認',
+
+  // ─ 第N期 累計 4個 (PL) ─
+  fy_sales: '売上累計 (FY期初〜確定月)\n計算式: Σsales (税抜、FY 期間)\n意味: 当期どこまで稼いだか',
+  fy_gross_profit: '粗利累計 (限界利益累計)\n計算式: Σ(売上 - 売上原価)\n意味: 限界利益 (固定費+利益の原資)',
+  fy_op_income: '営業利益累計\n計算式: Σ(粗利 - 販管費)\n意味: 本業の儲け累計',
+  fy_ord_income: '経常利益累計\n計算式: 営業利益 + 営業外収益 - 営業外費用\n意味: 借入利息や雑収入を含めた通常の儲け\n目安: 売上対比 3-5% で健全',
+
+  // ─ 経営指標 KPI 9個 ─
+  marginal_profit_rate: '限界利益率 (= 粗利率)\n計算式: 粗利 ÷ 売上 × 100\n意味: 売上1円あたり、変動費を引いた残り (固定費+利益の原資)\nB-Faith戦略: 原価=変動費なので 粗利率=限界利益率\n目安: 12-16%',
+  labor_distribution: '労働分配率\n計算式: 人件費 ÷ 限界利益 × 100\n意味: 稼いだ限界利益の何%を人件費に分配しているか\n目安: 50%以下が健全、70%超は人件費過多\n人件費 = 役員報酬+給与+賞与+法定福利+福利厚生',
+  marginal_per_employee: '1人当たり限界利益 (年換算)\n計算式: 限界利益累計 ÷ 従業員数 (現在 ' + 13 + '名)\n意味: 1人がいくら限界利益を稼いでいるか\n注意: 過去 FY も今の HEADCOUNT で割るので履歴非整合 (将来 mart に headcount 列追加予定)',
+  ordinary_profit_rate: '売上高経常利益率\n計算式: 経常利益 ÷ 売上 × 100\n意味: 通常の儲け率 (営業外損益込)\n目安: 5%以上が健全',
+  quick_ratio: '当座比率\n計算式: 当座資産(現預金+売上債権) ÷ 流動負債 × 100\n意味: 1年以内の支払い能力\n目安: 100%以上が健全 (B-Faith 200%+ は資金潤沢)',
+  equity_ratio: '自己資本比率\n計算式: 純資産 ÷ 総資産 × 100\n意味: 借入依存度の逆。30%以上が健全、50%超は財務超健全\nB-Faith は借入¥213M+ で 27-33% 程度',
+  roa: 'ROA (総資産利益率)\n計算式: 経常利益 ÷ 平均総資産 × 100\n意味: 持っている資産がどれだけ稼いでいるか\n目安: 5%以上が健全、業種平均 3-7%',
+  dso: 'DSO 売上債権回転日数\n計算式: 平均売上債権 ÷ 1日あたり売上\n意味: 売上を回収するまでの日数\n目安: 30-45日が標準 (モール入金サイクル次第)',
+  dpo: 'DPO 仕入債務回転日数\n計算式: 平均仕入債務 ÷ 1日あたり売上原価\n意味: 仕入の支払いまでの日数 (短いほど早く支払い、長いほど現金温存)\n目安: 30-60日',
+  inventory_turnover: '在庫回転日数\n計算式: 平均棚卸資産 ÷ 1日あたり売上原価\n意味: 在庫が現金化されるまでの日数\nB-Faith は在庫多めで 200日前後',
+  ccc: 'CCC キャッシュ・コンバージョン・サイクル\n計算式: DSO + 在庫回転日数 - DPO\n意味: 仕入れ支払いから売上回収までの実日数 (短いほど資金効率良)\n目安: 短いほど良い、業種平均 60-100日',
+  cash_runway: '資金繰り残月数\n計算式: 現預金 ÷ 月間固定費\n意味: 売上ゼロでもあと何ヶ月持ちこたえられるか\n目安: 6ヶ月以上が安全、3ヶ月未満は危険\nB-Faith は 11-12ヶ月分で潤沢',
+  monthly_fixed: '月間固定費\n計算式: 販管費累計 ÷ 経過月数\n意味: 売上に依らず毎月出ていく経費 (役員報酬/給与/家賃/通信/減価償却 等)\nB-Faith戦略: 販管費=固定費 として把握',
+  total_asset_avg: '総資産 月平均\n計算式: 各月末総資産の平均\n意味: ROA の分母として使う、期間中の資産規模の代表値',
+
+  // ─ 借入金返済余力 ─
+  loan_total: '借入金合計 (確定月末)\n計算式: 短期借入金 + 長期借入金\n意味: 銀行借入の総額\nB-Faith は 政策公庫 + 北おおさか信金 + 京都銀行 等で ¥210-260M',
+  loan_change: '借入金 期首比 純増減\n計算式: 確定月借入 - 期首借入 (=fy_start_ym 前月末)\n色分け: ▲緑=純減 (返済進行)、+赤=純増 (借入増加)',
+  loan_borrowing: '期中借入額 (Phase 1d-5、月次純変動 +方向の合計)\n計算式: 各月の借入金合計が前月より増えた額の累計\n意味: FY 期間中の追加借入 (新規借入や借換含む)\n注意: 同月内に借入と返済両方あれば相殺される (B-Faith では稀)',
+  loan_repayment: '期中返済額 (Phase 1d-5、月次純変動 -方向の合計)\n計算式: 各月の借入金合計が前月より減った額の累計\n意味: FY 期間中の元金返済額 (継続返済+一括返済)',
+  debt_to_ebitda: '債務償還年数\n計算式: 借入金合計 ÷ 年換算EBITDA\n意味: 今のキャッシュ生成力で借入を全額返すのに何年かかるか\n目安: ≤10年が安全、20年超は危険水域\nPDF 経営報告書「借入金返済年数」相当',
+  icr: 'インタレストカバレッジレシオ\n計算式: 営業利益 ÷ 支払利息\n意味: 利息を払うだけの営業利益が何倍出ているか\n目安: ≥3倍が健全、1倍未満は強警戒 (利息も払えない)',
+  loan_to_sales: '借入金月商比率\n計算式: 借入金 ÷ 月平均売上\n意味: 借入が月商の何ヶ月分か\n目安: ≤3ヶ月が理想、6ヶ月超は借入過多',
+  repayment_capacity: '返済余力\n計算式: 年換算EBITDA ÷ 年間返済額 (期中gross実績)\n意味: 1年で稼ぐキャッシュが、1年で返す元金の何倍か\n目安: ≥1.0倍 (返済できる)、1.5倍以上が健全',
+  ebitda: '年換算EBITDA (簡易)\n計算式: (営業利益 + 減価償却費) × 12 / 経過月数\n意味: 税引前のキャッシュ生成力 (借入返済原資の代表値)\n注意: のれん償却・引当金繰入は含まず簡易版',
+  interest_paid: '支払利息 累計\n計算式: Σ(non_op_expense_interest)\n意味: FY 期間の支払利息',
+  depreciation: '減価償却費 累計\n計算式: Σ(sgae_depreciation)\n意味: 固定資産の費用化分 (現金支出なし)',
+
+  // ─ CF 各項目 ─
+  cf_profit_base: '利益 (経常利益累計)\n計算式: ordinary_income_cum (税引前)\n意味: CF ブリッジの起点となる利益',
+  cf_depreciation: '+ 減価償却費 (現金支出なき費用を戻す)\n意味: P/L で費用計上したが現金は出ていないので CF では足し戻す',
+  cf_cash_generation: 'キャッシュ生成 小計\n計算式: 経常利益 + 減価償却\n意味: WC変動前のキャッシュ生成力',
+  cf_wc_ar: '売掛金 (CF影響)\n計算式: -(ΔAR) — AR増加=未回収増=CF▲、AR減=回収進行=CF+',
+  cf_wc_inv: '棚卸資産 (CF影響)\n計算式: -(Δ棚卸) — 棚卸増=過剰在庫=CF▲、棚卸減=売れて現金化=CF+',
+  cf_wc_ap: '買掛金 (CF影響)\n計算式: +(ΔAP) — AP増=支払繰延=CF+、AP減=支払進行=CF▲',
+  cf_operating: '営業CF (本業の現金生成力)\n計算式: キャッシュ生成 + 営業WC変動\n意味: 本業 (販売活動) で生まれた純現金。プラスが健全',
+  cf_investing: '投資CF (固定資産取得相当・売却時は過小)\n計算式: -(Δ有形固定 + 減価償却) - Δ投資その他\n意味: 設備投資・固定資産取得で出ていった現金 (capex_proxy)\n注意: 売却がある月は過小評価',
+  cf_financing: '財務CF (借入金+資本金+役員借入金/長期未払金 等 変動)\n計算式: Δ短期借入 + Δ長期借入 + Δ資本金 + Δその他固定負債\n意味: 借入返済・新規借入・出資など財務活動の純現金',
+  cf_theoretical: '現金純増減 (理論)\n計算式: 営業CF + 投資CF + 財務CF\n意味: BS の各要素変動から算定した理論値',
+  cf_actual: '現金純増減 (実績、BS差分)\n計算式: 確定月 cash_total - 期首前月末 cash_total\n意味: 実際に通帳で動いた現金変動額',
+  cf_unexplained: '差額 (未分類: 税金支払・為替差・資本取引差等)\n計算式: 実績 - 理論\n意味: 簡易版で拾えない要素 (法人税支払/為替差/その他)\n警告: |差額| > max(¥10M, |実績|×20%) なら赤太字 ⚠',
+};
+// Codex R1 medium: keyboard/AT 対応 → tabindex + aria-label を付ける (title 依存だけより堅い)
+//   typo 検知: defKey 指定されたが KPI_DEFS に無い場合は dev console に warn (silent fail を避ける)
+//   @media (hover: none): モバイルでは long-press でしか title が出ないので CSS 側で常時強調表示
+const helpIcon = (defKey) => {
+  if (!defKey) return '';
+  const def = KPI_DEFS[defKey];
+  if (!def) {
+    if (typeof console !== 'undefined') console.warn('[KPI helpIcon] Unknown defKey:', defKey);
+    return '';
+  }
+  return ' <span class="help-icon" tabindex="0" role="button" aria-label="' + esc(def) + '" title="' + esc(def) + '">ⓘ</span>';
+};
+
 // ─── 状態 ───
 let currentPeriod = '12m';
 const charts = {};
@@ -350,52 +428,53 @@ function renderFySummary(rows, headcount, meta) {
   const cur = rows[0];
   const prev = rows[1];
 
-  const m = (label, val, pct) => {
+  // Phase 1d-5: 各 KPI helper に optional defKey を追加。指定時は label の右に ⓘ + tooltip
+  const m = (label, val, pct, defKey) => {
     const pctHtml = pct != null && Number.isFinite(pct) ? '<span class="pct">' + esc(pct.toFixed(2)) + '%</span>' : '';
-    return '<div class="fy-metric"><div class="label">' + esc(label) + '</div><div class="value">' + (val == null ? '—' : esc(fmtJpyShort(val))) + pctHtml + '</div></div>';
+    return '<div class="fy-metric"><div class="label">' + esc(label) + helpIcon(defKey) + '</div><div class="value">' + (val == null ? '—' : esc(fmtJpyShort(val))) + pctHtml + '</div></div>';
   };
-  const pctOnly = (label, pct) => {
+  const pctOnly = (label, pct, defKey) => {
     const v = pct == null || !Number.isFinite(pct) ? '—' : esc(Number(pct).toFixed(2)) + '%';
-    return '<div class="fy-metric"><div class="label">' + esc(label) + '</div><div class="value">' + v + '</div></div>';
+    return '<div class="fy-metric"><div class="label">' + esc(label) + helpIcon(defKey) + '</div><div class="value">' + v + '</div></div>';
   };
-  const daysOnly = (label, d) => {
+  const daysOnly = (label, d, defKey) => {
     const v = d == null || !Number.isFinite(d) ? '—' : esc(Number(d).toFixed(1)) + '日';
-    return '<div class="fy-metric"><div class="label">' + esc(label) + '</div><div class="value">' + v + '</div></div>';
+    return '<div class="fy-metric"><div class="label">' + esc(label) + helpIcon(defKey) + '</div><div class="value">' + v + '</div></div>';
   };
-  const monthsOnly = (label, d, warnThreshold) => {
+  const monthsOnly = (label, d, warnThreshold, defKey) => {
     const ok = d != null && Number.isFinite(d);
     const v = ok ? esc(Number(d).toFixed(1)) + 'ヶ月' : '—';
     const warn = ok && warnThreshold != null && d < warnThreshold;
-    return '<div class="fy-metric"><div class="label">' + esc(label) + '</div><div class="value"' + (warn ? ' style="color:#dc2626"' : '') + '>' + v + (warn ? ' ⚠' : '') + '</div></div>';
+    return '<div class="fy-metric"><div class="label">' + esc(label) + helpIcon(defKey) + '</div><div class="value"' + (warn ? ' style="color:#dc2626"' : '') + '>' + v + (warn ? ' ⚠' : '') + '</div></div>';
   };
-  const yenOnly = (label, val) => {
-    return '<div class="fy-metric"><div class="label">' + esc(label) + '</div><div class="value">' + (val == null ? '—' : esc(fmtJpyShort(val))) + '</div></div>';
+  const yenOnly = (label, val, defKey) => {
+    return '<div class="fy-metric"><div class="label">' + esc(label) + helpIcon(defKey) + '</div><div class="value">' + (val == null ? '—' : esc(fmtJpyShort(val))) + '</div></div>';
   };
   // ratioFmt: 倍数 (n.n倍) 表示。warnIfBelow=N で N 未満を赤太字 ⚠ (例: インタレストカバレッジ 3倍以下、返済余力 1.0以下)
   //   missingNote: val が null の時に "—" の代わりに表示する文言 (例: "計算不能 (赤字)")。指定時は ⚠ + 赤太字
-  const ratioFmt = (label, val, suffix, warnIfBelow, missingNote) => {
+  const ratioFmt = (label, val, suffix, warnIfBelow, missingNote, defKey) => {
     const ok = val != null && Number.isFinite(val);
     let v, warn = false;
     if (ok) { v = esc(Number(val).toFixed(1)) + suffix; warn = warnIfBelow != null && val < warnIfBelow; }
     else if (missingNote) { v = esc(missingNote); warn = true; }
     else { v = '—'; }
-    return '<div class="fy-metric"><div class="label">' + esc(label) + '</div><div class="value"' + (warn ? ' style="color:#dc2626"' : '') + '>' + v + (warn ? ' ⚠' : '') + '</div></div>';
+    return '<div class="fy-metric"><div class="label">' + esc(label) + helpIcon(defKey) + '</div><div class="value"' + (warn ? ' style="color:#dc2626"' : '') + '>' + v + (warn ? ' ⚠' : '') + '</div></div>';
   };
   // ratioFmtAbove: warnIfAbove=N で N 超過を赤太字 ⚠ (例: 債務償還年数 10年超、借入金月商比率 3ヶ月超)
-  const ratioFmtAbove = (label, val, suffix, warnIfAbove, missingNote) => {
+  const ratioFmtAbove = (label, val, suffix, warnIfAbove, missingNote, defKey) => {
     const ok = val != null && Number.isFinite(val);
     let v, warn = false;
     if (ok) { v = esc(Number(val).toFixed(1)) + suffix; warn = warnIfAbove != null && val > warnIfAbove; }
     else if (missingNote) { v = esc(missingNote); warn = true; }
     else { v = '—'; }
-    return '<div class="fy-metric"><div class="label">' + esc(label) + '</div><div class="value"' + (warn ? ' style="color:#dc2626"' : '') + '>' + v + (warn ? ' ⚠' : '') + '</div></div>';
+    return '<div class="fy-metric"><div class="label">' + esc(label) + helpIcon(defKey) + '</div><div class="value"' + (warn ? ' style="color:#dc2626"' : '') + '>' + v + (warn ? ' ⚠' : '') + '</div></div>';
   };
   // yenSigned: 純増減金額。負(純減=返済進行)を緑▲、正(純増=借入増)を赤+ で色分け
-  const yenSigned = (label, val) => {
-    if (val == null || !Number.isFinite(val)) return '<div class="fy-metric"><div class="label">' + esc(label) + '</div><div class="value">—</div></div>';
+  const yenSigned = (label, val, defKey) => {
+    if (val == null || !Number.isFinite(val)) return '<div class="fy-metric"><div class="label">' + esc(label) + helpIcon(defKey) + '</div><div class="value">—</div></div>';
     const color = val < 0 ? '#16a34a' : (val > 0 ? '#dc2626' : '#111');
     const display = val < 0 ? ('▲' + fmtJpyShort(Math.abs(val))) : (val > 0 ? ('+' + fmtJpyShort(val)) : '±¥0');
-    return '<div class="fy-metric"><div class="label">' + esc(label) + '</div><div class="value" style="color:' + color + '">' + esc(display) + '</div></div>';
+    return '<div class="fy-metric"><div class="label">' + esc(label) + helpIcon(defKey) + '</div><div class="value" style="color:' + color + '">' + esc(display) + '</div></div>';
   };
 
   const card = (fy, klass) => {
@@ -415,28 +494,28 @@ function renderFySummary(rows, headcount, meta) {
       + '  </div>'
       // 累計 PL
       + '  <div class="fy-row">'
-      + m('売上累計', fy.sales_cum)
-      + m('粗利累計 (限界利益)', fy.gross_profit_cum, fy.marginal_profit_pct)
-      + m('営業利益累計', fy.operating_income_cum)
-      + m('経常利益累計', fy.ordinary_income_cum, fy.ordinary_profit_pct)
+      + m('売上累計', fy.sales_cum, null, 'fy_sales')
+      + m('粗利累計 (限界利益)', fy.gross_profit_cum, fy.marginal_profit_pct, 'fy_gross_profit')
+      + m('営業利益累計', fy.operating_income_cum, null, 'fy_op_income')
+      + m('経常利益累計', fy.ordinary_income_cum, fy.ordinary_profit_pct, 'fy_ord_income')
       + '  </div>'
       // 経営指標 KPI
       + '  <div style="font-size:11px;color:#6b7280;margin:10px 0 4px;font-weight:600;border-top:1px solid #e5e7eb;padding-top:8px">📐 経営指標 KPI</div>'
       + '  <div class="fy-row">'
-      + pctOnly('1. 限界利益率', fy.marginal_profit_pct)
-      + pctOnly('2. 労働分配率', fy.labor_distribution_pct)
-      + yenOnly('3. 1人当たり限界利益 (' + esc(String(headcount)) + '名)', fy.marginal_profit_per_employee)
-      + pctOnly('4. 売上高経常利益率', fy.ordinary_profit_pct)
-      + pctOnly('5. 当座比率 (当座資産÷流動負債)', fy.quick_ratio_pct)
-      + pctOnly('6. 自己資本比率 (純資産÷総資産)', fy.equity_ratio_pct)
-      + pctOnly('7. ROA (経常÷平均総資産)', fy.roa_pct)
-      + daysOnly('8. DSO 売上債権回転日数', fy.dso_days)
-      + daysOnly('9. DPO 仕入債務回転日数', fy.dpo_days)
-      + daysOnly('在庫回転日数', fy.inventory_turnover_days)
-      + daysOnly('CCC (DSO+在庫回転−DPO)', fy.ccc_days)
-      + monthsOnly('💰 資金繰り残月数 (現預金÷月間固定費)', fy.cash_runway_months, 3)
-      + yenOnly('月間固定費 (販管費月平均)', fy.monthly_fixed_cost)
-      + yenOnly('総資産 月平均', fy.total_asset_average)
+      + pctOnly('1. 限界利益率', fy.marginal_profit_pct, 'marginal_profit_rate')
+      + pctOnly('2. 労働分配率', fy.labor_distribution_pct, 'labor_distribution')
+      + yenOnly('3. 1人当たり限界利益 (' + esc(String(headcount)) + '名)', fy.marginal_profit_per_employee, 'marginal_per_employee')
+      + pctOnly('4. 売上高経常利益率', fy.ordinary_profit_pct, 'ordinary_profit_rate')
+      + pctOnly('5. 当座比率 (当座資産÷流動負債)', fy.quick_ratio_pct, 'quick_ratio')
+      + pctOnly('6. 自己資本比率 (純資産÷総資産)', fy.equity_ratio_pct, 'equity_ratio')
+      + pctOnly('7. ROA (経常÷平均総資産)', fy.roa_pct, 'roa')
+      + daysOnly('8. DSO 売上債権回転日数', fy.dso_days, 'dso')
+      + daysOnly('9. DPO 仕入債務回転日数', fy.dpo_days, 'dpo')
+      + daysOnly('在庫回転日数', fy.inventory_turnover_days, 'inventory_turnover')
+      + daysOnly('CCC (DSO+在庫回転−DPO)', fy.ccc_days, 'ccc')
+      + monthsOnly('💰 資金繰り残月数 (現預金÷月間固定費)', fy.cash_runway_months, 3, 'cash_runway')
+      + yenOnly('月間固定費 (販管費月平均)', fy.monthly_fixed_cost, 'monthly_fixed')
+      + yenOnly('総資産 月平均', fy.total_asset_average, 'total_asset_avg')
       + '  </div>'
       // 💳 借入金返済余力 (Phase 1d-4 + 1d-5: 期中借入額/返済額 分離)
       + (fy.loan && fy.loan.available
@@ -446,25 +525,25 @@ function renderFySummary(rows, headcount, meta) {
               + '<span style="font-weight:400;color:#9ca3af;font-size:10px;margin-left:6px">※ Phase 1d-5: 月次純変動から期中借入/返済を gross 集計、返済余力もこれを分母に再計算</span>'
               + '</div>'
             + '  <div class="fy-row">'
-            + yenOnly('借入金合計 (短期+長期)', fy.loan.loan_total_closing)
-            + yenSigned('期首比 純増減 (▲=返済進行)', fy.loan.loan_change_in_period)
+            + yenOnly('借入金合計 (短期+長期)', fy.loan.loan_total_closing, 'loan_total')
+            + yenSigned('期首比 純増減 (▲=返済進行)', fy.loan.loan_change_in_period, 'loan_change')
             // ─ Phase 1d-5: 期中借入額/返済額 を gross で分離表示 (月次純変動から推定) ─
-            + yenOnly('期中借入額 (月次純変動 +方向の合計)', fy.loan.gross_borrowing_in_period)
-            + yenOnly('期中返済額 (月次純変動 -方向の合計)', fy.loan.gross_repayment_in_period)
+            + yenOnly('期中借入額 (月次純変動 +方向の合計)', fy.loan.gross_borrowing_in_period, 'loan_borrowing')
+            + yenOnly('期中返済額 (月次純変動 -方向の合計)', fy.loan.gross_repayment_in_period, 'loan_repayment')
             + ratioFmtAbove('債務償還年数 (借入÷年換算EBITDA、目安≤10年)', fy.loan.debt_to_ebitda_years, '年', 10,
-                fy.loan.ebitda_status === 'non_positive' ? '計算不能 (EBITDA≤0)' : null)
-            + ratioFmt('インタレスト・カバレッジ (営業利益÷支払利息、目安≥3倍)', fy.loan.interest_coverage_ratio, '倍', 3)
-            + ratioFmtAbove('借入金月商比率 (借入÷月平均売上、目安≤3ヶ月)', fy.loan.loan_to_monthly_sales_months, 'ヶ月', 3)
+                fy.loan.ebitda_status === 'non_positive' ? '計算不能 (EBITDA≤0)' : null, 'debt_to_ebitda')
+            + ratioFmt('インタレスト・カバレッジ (営業利益÷支払利息、目安≥3倍)', fy.loan.interest_coverage_ratio, '倍', 3, null, 'icr')
+            + ratioFmtAbove('借入金月商比率 (借入÷月平均売上、目安≤3ヶ月)', fy.loan.loan_to_monthly_sales_months, 'ヶ月', 3, null, 'loan_to_sales')
             // ─ Phase 1d-5: 返済余力は gross 返済ベースに変更 (純減ベースは旧仕様、追加借入を隠す問題があった) ─
             + ratioFmt('🛟 返済余力 (年換算EBITDA÷年間返済額 実績、目安≥1.0倍)', fy.loan.repayment_capacity_ratio, '倍', 1.0,
                 fy.loan.repayment_status === 'no_repayment' ? '期中返済なし (要注意)'
                   : fy.loan.repayment_status === 'gap_in_history' ? '月次BSに欠損 (算出不能)'
-                  : null)
-            + yenOnly('年換算EBITDA (簡易: 営業利益+減価償却)', fy.loan.annualized_ebitda)
-            + yenOnly('年間返済額 (期中gross実績・年換算)', fy.loan.annualized_gross_repayment)
-            + yenOnly('年間借入額 (期中gross実績・年換算)', fy.loan.annualized_gross_borrowing)
-            + yenOnly('支払利息 累計', fy.loan.interest_paid_cum)
-            + yenOnly('減価償却費 累計', fy.loan.depreciation_cum)
+                  : null, 'repayment_capacity')
+            + yenOnly('年換算EBITDA (簡易: 営業利益+減価償却)', fy.loan.annualized_ebitda, 'ebitda')
+            + yenOnly('年間返済額 (期中gross実績・年換算)', fy.loan.annualized_gross_repayment, 'loan_repayment')
+            + yenOnly('年間借入額 (期中gross実績・年換算)', fy.loan.annualized_gross_borrowing, 'loan_borrowing')
+            + yenOnly('支払利息 累計', fy.loan.interest_paid_cum, 'interest_paid')
+            + yenOnly('減価償却費 累計', fy.loan.depreciation_cum, 'depreciation')
             + '  </div>')
           : '')
       // 💰 簡易キャッシュフロー (間接法、Phase 1d-4)
@@ -516,7 +595,7 @@ function renderCashFlowHtml(cf) {
     const fz = opts.bold ? '13px' : '12px';
     const color = colorOf(value);
     return '<div style="display:flex;justify-content:space-between;font-size:' + fz + ';padding:2px 0;' + indent + bold + border + '">'
-         + '<span>' + esc(label) + '</span>'
+         + '<span>' + esc(label) + (opts.defKey ? helpIcon(opts.defKey) : '') + '</span>'
          + '<span style="color:' + color + ';font-variant-numeric:tabular-nums">' + esc(sign(value)) + '</span>'
          + '</div>';
   };
@@ -528,27 +607,27 @@ function renderCashFlowHtml(cf) {
     + '<span style="font-weight:400;color:#9ca3af;margin-left:6px">期首=' + esc(cf.opening_ym) + ' / 確定月=' + esc(cf.closing_ym) + '</span>'
     + '</div>'
     + '<div style="background:#fafbfc;border:1px solid #e5e7eb;border-radius:6px;padding:8px 12px;margin-top:4px">'
-    + row('利益 (経常利益累計)', cf.profit_base)
-    + row('+ 減価償却費 (現金支出なき費用)', cf.depreciation)
-    + row('= キャッシュ生成 小計', cf.cash_generation, { bold: true, borderTop: true })
+    + row('利益 (経常利益累計)', cf.profit_base, { defKey: 'cf_profit_base' })
+    + row('+ 減価償却費 (現金支出なき費用)', cf.depreciation, { defKey: 'cf_depreciation' })
+    + row('= キャッシュ生成 小計', cf.cash_generation, { bold: true, borderTop: true, defKey: 'cf_cash_generation' })
     + '<div style="font-size:11px;color:#6b7280;margin:6px 0 2px">営業WC変動 (CF影響):</div>'
-    + row('売掛金 (▲=未回収増)', -cf.wc_ar_change, { indent: true })
-    + row('棚卸資産 (▲=過剰在庫増)', -cf.wc_inv_change, { indent: true })
-    + row('買掛金 (+=支払繰延)', cf.wc_ap_change, { indent: true })
+    + row('売掛金 (▲=未回収増)', -cf.wc_ar_change, { indent: true, defKey: 'cf_wc_ar' })
+    + row('棚卸資産 (▲=過剰在庫増)', -cf.wc_inv_change, { indent: true, defKey: 'cf_wc_inv' })
+    + row('買掛金 (+=支払繰延)', cf.wc_ap_change, { indent: true, defKey: 'cf_wc_ap' })
     + row('その他流動資産 (前払/仮払/立替 等)', -cf.wc_other_ca_change, { indent: true })
     + row('その他流動負債 (未払消費税/未払金/預り 等)', cf.wc_other_cl_change, { indent: true })
-    + row('▶ 営業CF (本業の現金生成力)', cf.operating_cf, { bold: true, borderTop: true })
-    + row('投資CF (固定資産取得相当・売却時は過小)', cf.investing_cf, { bold: true })
-    + row('財務CF (借入金+資本金+役員借入金/長期未払金 等 変動)', cf.financing_cf, { bold: true })
-    + row('= 現金純増減 (理論)', cf.theoretical_cash_change, { bold: true, borderTop: true })
-    + row('現金純増減 (実績、BS差分)', cf.actual_cash_change, { bold: true })
+    + row('▶ 営業CF (本業の現金生成力)', cf.operating_cf, { bold: true, borderTop: true, defKey: 'cf_operating' })
+    + row('投資CF (固定資産取得相当・売却時は過小)', cf.investing_cf, { bold: true, defKey: 'cf_investing' })
+    + row('財務CF (借入金+資本金+役員借入金/長期未払金 等 変動)', cf.financing_cf, { bold: true, defKey: 'cf_financing' })
+    + row('= 現金純増減 (理論)', cf.theoretical_cash_change, { bold: true, borderTop: true, defKey: 'cf_theoretical' })
+    + row('現金純増減 (実績、BS差分)', cf.actual_cash_change, { bold: true, defKey: 'cf_actual' })
     // 差額: 税金支払・為替差・資本取引差等。閾値超過 (max(¥10M, 実績×20%)) なら赤太字 ⚠
     + (cf.unexplained_severity === 'high'
         ? '<div style="display:flex;justify-content:space-between;font-size:12px;padding:2px 0;border-top:1px solid #e5e7eb;padding-top:4px;margin-top:2px;color:#dc2626;font-weight:600">'
-            + '<span>差額 (未分類: 税金支払・為替差・資本取引差等) ⚠ 閾値超過</span>'
+            + '<span>差額 (未分類: 税金支払・為替差・資本取引差等) ⚠ 閾値超過' + helpIcon('cf_unexplained') + '</span>'
             + '<span style="font-variant-numeric:tabular-nums">' + esc(sign(cf.unexplained)) + '</span>'
           + '</div>'
-        : row('差額 (未分類: 税金支払・為替差・資本取引差等)', cf.unexplained, { borderTop: true }))
+        : row('差額 (未分類: 税金支払・為替差・資本取引差等)', cf.unexplained, { borderTop: true, defKey: 'cf_unexplained' }))
     + '</div>';
 }
 
@@ -771,11 +850,11 @@ function renderKpi(e) {
     }
   } catch {}
   document.getElementById('kpi-section').innerHTML = [
-    '<div class="kpi-card"><h3>売上</h3><div class="v">' + fmtJpyShort(e.sales_mtd_excl_tax) + '</div>' + yoy(e.yoy_sales_pct) + '</div>',
-    '<div class="kpi-card"><h3>粗利' + (grossPct != null ? ' (' + grossPct.toFixed(1) + '%)' : '') + '</h3><div class="v">' + fmtJpyShort(e.gross_profit_mtd_excl_tax) + '</div>' + yoy(e.yoy_gross_profit_pct) + '</div>',
-    '<div class="kpi-card"><h3>営業利益</h3><div class="v">' + fmtJpyShort(e.operating_income_mtd_excl_tax) + '</div>' + yoy(e.yoy_operating_income_pct) + '</div>',
-    '<div class="kpi-card cash"><h3>現預金合計</h3><div class="v">' + fmtJpyShort(e.cash_balance_total) + '</div><div class="sub" style="font-size:11px">' + cashSub + '</div></div>',
-    '<div class="kpi-card danger"><h3>危険信号</h3><div class="v">' + (JSON.parse(e.danger_signals_json || '[]').length || 0) + '件</div><div class="sub">open シグナル</div></div>',
+    '<div class="kpi-card"><h3>売上' + helpIcon('top_sales') + '</h3><div class="v">' + fmtJpyShort(e.sales_mtd_excl_tax) + '</div>' + yoy(e.yoy_sales_pct) + '</div>',
+    '<div class="kpi-card"><h3>粗利' + (grossPct != null ? ' (' + grossPct.toFixed(1) + '%)' : '') + helpIcon('top_gross_profit') + '</h3><div class="v">' + fmtJpyShort(e.gross_profit_mtd_excl_tax) + '</div>' + yoy(e.yoy_gross_profit_pct) + '</div>',
+    '<div class="kpi-card"><h3>営業利益' + helpIcon('top_op_income') + '</h3><div class="v">' + fmtJpyShort(e.operating_income_mtd_excl_tax) + '</div>' + yoy(e.yoy_operating_income_pct) + '</div>',
+    '<div class="kpi-card cash"><h3>現預金合計' + helpIcon('top_cash') + '</h3><div class="v">' + fmtJpyShort(e.cash_balance_total) + '</div><div class="sub" style="font-size:11px">' + cashSub + '</div></div>',
+    '<div class="kpi-card danger"><h3>危険信号' + helpIcon('top_danger') + '</h3><div class="v">' + (JSON.parse(e.danger_signals_json || '[]').length || 0) + '件</div><div class="sub">open シグナル</div></div>',
   ].join('');
 }
 
