@@ -984,6 +984,82 @@ router.get('/api/fy-summary', (req, res) => {
           const wcCoreNet = -arChange - invChange + apChange;                    // 主要3項目
           const wcOtherNet = -otherCAChange + otherCLChange;                     // その他流動 (税金/未払/預り/前払/仮受/仮払 等)
           const operatingCf = cashGeneration + wcCoreNet + wcOtherNet;
+          // ─── Phase 1d-5: その他流動 内訳細分化 (mirror_mf_bs_subaccount_monthly から role_key 別 expand) ───
+          //   経営者向けに「税系 (仮払/仮受/未払消費税/法人税)」「未払金/預り (アップサイダー等)」
+          //   「前払/仮払」「その他」の4分類で表示。CF影響符号を直接付与
+          //   role_key カテゴリ:
+          //     tax_consumption  : 仮払/仮受/未払消費税
+          //     tax_corporate    : 未払法人税等 (簡易CF unexplained に押し込まれてた分の見える化)
+          //     accrued_payable  : 未払金 (UPSIDER/給与/送料/クレカ等)、未払費用
+          //     deposit_received : 預り金 (住民税/社会保険/所得税)
+          //     prepay_advance   : 前払金/前払費用
+          //     provisional      : 仮払金/仮受金
+          //     other_residual   : 上記に該当しない other_current
+          let wcBreakdown = null;
+          try {
+            // Codex R1 high: closing 月起点で WHERE すると、期首にあって確定月に消えた行 (e.g. 前払取崩・未払解消) を落とす
+            //   → opening + closing 両月 IN で取得し、(account, sub_account, role_key) で MAX-CASE 集計
+            //
+            // ※ 重要: bs_subaccount は 2025-06 (FY8 末) など FY 切替前月のデータが不完全 (仮受消費税 1 行のみ)
+            //   そのまま openingYm = 2025-06 を起点にすると、未払金/預り金等の期首残高が 0 と仮定され
+            //   FY8→FY9 切替時の解消・再積上が breakdown に上振れ計上される (¥26M ノイズ)
+            //   → breakdown のみ FY期初 (r.fy_start_ym = 2025-07) を起点に切り替える。
+            //   operating_cf 計算は引き続き期首前月末 (openingYm) 起点の wcOtherNet を使う (試算表整合担保)
+            //   UI で「内訳は FY期初起点 (CF全体は期首起点) のため範囲・値が CF 総額と一致しない」と注記
+            const breakdownOpeningYm = r.fy_start_ym;
+            const subRows = db.prepare(`
+              SELECT account_name, COALESCE(sub_account_name, '') AS sub_account_name, role_key,
+                COALESCE(MAX(CASE WHEN month_ym = ? THEN closing_balance_excl_tax END), 0) AS open,
+                COALESCE(MAX(CASE WHEN month_ym = ? THEN closing_balance_excl_tax END), 0) AS close
+              FROM v_mirror_mf_bs_subaccount_monthly_latest
+              WHERE month_ym IN (?, ?)
+                AND section IN ('other_current_asset', 'other_current_liab')
+              GROUP BY account_name, COALESCE(sub_account_name, ''), role_key
+            `).all(breakdownOpeningYm, r.cumulative_through_ym, breakdownOpeningYm, r.cumulative_through_ym);
+            const cat = (rk) => {
+              if (rk === 'bs_asset_current_consumption_tax' || rk === 'bs_liab_current_consumption_tax_received' || rk === 'bs_liab_current_consumption_tax') return 'tax_consumption';
+              if (rk === 'bs_liab_current_corporate_tax') return 'tax_corporate';
+              if (rk === 'bs_liab_current_accrued_pay' || rk === 'bs_liab_current_accrued_expense') return 'accrued_payable';
+              if (rk === 'bs_liab_current_deposit_received') return 'deposit_received';
+              if (rk === 'bs_asset_current_prepay') return 'prepay_advance';
+              if (rk === 'bs_asset_current_provisional' || rk === 'bs_liab_current_provisional_received') return 'provisional';
+              return 'other_residual';
+            };
+            // 資産系は CF影響 = -(close-open)、負債系は +(close-open)
+            //   ※ role_key が null/undefined/空 の行は (missing role_key) として other_residual に落とし、resids list に追加 (Codex R2 medium、null-safe)
+            const isLiab = (rk) => typeof rk === 'string' && rk.startsWith('bs_liab_');
+            const buckets = { tax_consumption: 0, tax_corporate: 0, accrued_payable: 0, deposit_received: 0, prepay_advance: 0, provisional: 0, other_residual: 0 };
+            // Codex R1 medium: 未知 role_key の検知 — other_residual に吸われた role を後から追跡可能に
+            const unknownRoles = new Set();
+            let bdSum = 0;
+            for (const s of subRows) {
+              const delta = (s.close || 0) - (s.open || 0);
+              const cfImpact = isLiab(s.role_key) ? delta : -delta;
+              const bucket = cat(s.role_key);
+              buckets[bucket] += cfImpact;
+              bdSum += cfImpact;
+              if (bucket === 'other_residual') unknownRoles.add(s.role_key || '(missing role_key)');
+            }
+            if (unknownRoles.size > 0) {
+              console.warn('[exec-dashboard] wc breakdown: 未知 role_key が other_residual に分類:', [...unknownRoles].join(', '));
+            }
+            wcBreakdown = {
+              opening_ym: r.fy_start_ym,                                                  // breakdown の起点は FY期初 (CF全体の openingYm とは別)
+              closing_ym: r.cumulative_through_ym,
+              tax_consumption: Math.round(buckets.tax_consumption),
+              tax_corporate: Math.round(buckets.tax_corporate),
+              accrued_payable: Math.round(buckets.accrued_payable),
+              deposit_received: Math.round(buckets.deposit_received),
+              prepay_advance: Math.round(buckets.prepay_advance),
+              provisional: Math.round(buckets.provisional),
+              other_residual: Math.round(buckets.other_residual),
+              other_residual_role_keys: [...unknownRoles],                                // 未知 role の可視化 (UI 注記用 / debugging)
+              breakdown_total: Math.round(bdSum),                                         // FY期初〜確定月 の純変動 (CF全体の wc_other_net とは範囲が違う)
+            };
+          } catch (e) {
+            // mirror_mf_bs_subaccount_monthly_latest が無いなら breakdown=null (CF サブブロックは表示)
+            if (!isMissingMirrorTable(e)) console.warn('[exec-dashboard] wc breakdown error:', e.message);
+          }
           // ③ 投資CF (固定資産 取得相当、簡易)
           //   ※ 厳密な投資CFではなく capex_proxy。Δ簿価 + 償却 ≒ 取得 (売却・除却・減損あれば過小評価)
           //   ※ 投資その他 (保険積立・長期前払 等) も簡易に -Δ で含める
@@ -1017,6 +1093,7 @@ router.get('/api/fy-summary', (req, res) => {
             wc_other_cl_change: Math.round(otherCLChange),
             wc_core_net: Math.round(wcCoreNet),                                  // -AR -INV +AP
             wc_other_net: Math.round(wcOtherNet),                                // -OtherCA +OtherCL (※OtherFL は財務CF側)
+            wc_breakdown: wcBreakdown,                                           // Phase 1d-5: 7分類内訳 (mirror_mf_bs_subaccount_monthly_latest 由来)、null = mirror 未デプロイ
             operating_cf: Math.round(operatingCf),
             // ※ capex_proxy: 厳密な投資CF ではなく「固定資産 取得相当」。設備売却時は過小 (cash IN を取りこぼす)
             invest_capex_tangible_proxy: Math.round(capexProxyTangible),

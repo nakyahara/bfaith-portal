@@ -535,8 +535,23 @@ function renderCashFlowHtml(cf) {
     + row('売掛金 (▲=未回収増)', -cf.wc_ar_change, { indent: true })
     + row('棚卸資産 (▲=過剰在庫増)', -cf.wc_inv_change, { indent: true })
     + row('買掛金 (+=支払繰延)', cf.wc_ap_change, { indent: true })
-    + row('その他流動資産 (前払/仮払/立替 等)', -cf.wc_other_ca_change, { indent: true })
-    + row('その他流動負債 (未払消費税/未払金/預り 等)', cf.wc_other_cl_change, { indent: true })
+    // Phase 1d-5: その他流動 を 7分類に細分化 (mirror_mf_bs_subaccount_monthly_latest 由来)
+    //   breakdown が無い場合 (mirror 未デプロイ) は旧 wc_other_ca_change/cl_change で総額表示
+    + (cf.wc_breakdown
+        ? ('<div style="font-size:11px;color:#6b7280;margin:6px 0 2px;padding-left:8px;border-left:2px solid #e5e7eb">　└ その他流動 内訳 <span style="color:#9ca3af;font-weight:400">(参考値、FY期初 ' + esc(cf.wc_breakdown.opening_ym) + ' 起点)</span></div>'
+            + row('税系 (仮払/仮受/未払消費税)', cf.wc_breakdown.tax_consumption, { indent: true })
+            + (cf.wc_breakdown.tax_corporate !== 0 ? row('未払法人税等 変動', cf.wc_breakdown.tax_corporate, { indent: true }) : '')
+            + (cf.wc_breakdown.accrued_payable !== 0 ? row('未払金 (UPSIDER/給与/送料/クレカ等)', cf.wc_breakdown.accrued_payable, { indent: true }) : '')
+            + (cf.wc_breakdown.deposit_received !== 0 ? row('預り金 (住民税/社会保険/所得税)', cf.wc_breakdown.deposit_received, { indent: true }) : '')
+            + (cf.wc_breakdown.prepay_advance !== 0 ? row('前払金/前払費用', cf.wc_breakdown.prepay_advance, { indent: true }) : '')
+            + (cf.wc_breakdown.provisional !== 0 ? row('仮払金/仮受金', cf.wc_breakdown.provisional, { indent: true }) : '')
+            + (cf.wc_breakdown.other_residual !== 0 ? row('その他 (未分類)', cf.wc_breakdown.other_residual, { indent: true }) : '')
+            // 内訳の起点 (FY期初) と CF全体の起点 (期首前月末) は異なるため、内訳合計と CF その他流動 総額は一致しない
+            + '<div style="font-size:10px;color:#9ca3af;padding-left:14px;margin-top:2px">'
+                + '　※ 内訳は FY期初起点。CF全体は期首前月末起点 (' + esc(cf.opening_ym) + ') のため範囲が異なる'
+              + '</div>')
+        : (row('その他流動資産 (前払/仮払/立替 等)', -cf.wc_other_ca_change, { indent: true })
+            + row('その他流動負債 (未払消費税/未払金/預り 等)', cf.wc_other_cl_change, { indent: true })))
     + row('▶ 営業CF (本業の現金生成力)', cf.operating_cf, { bold: true, borderTop: true })
     + row('投資CF (固定資産取得相当・売却時は過小)', cf.investing_cf, { bold: true })
     + row('財務CF (借入金+資本金+役員借入金/長期未払金 等 変動)', cf.financing_cf, { bold: true })
