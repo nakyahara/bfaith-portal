@@ -22,7 +22,9 @@
 -- aupay_sku_key の生成 (silver で計算、変更点 2026-05-13):
 --   item_code + item_management_id を結合して m_products の子SKU命名 (例 fragrancebalm-15g-ki) と揃える。
 --   - itemManagementId = '-wt' のように先頭が '-' なら item_code に連結 → 'fragrancebalm-15g-wt'
---   - itemManagementId = 'co' (ハイフン無し) なら '-' を挟む → 'goneshus600-3-co'
+--   - itemManagementId = 'co' (ハイフン無し) は通常 '-' を挟む → 'goneshus600-3-co'。
+--     ただし「ハイフン無し連結」のみが m_products に存在する場合 (wae+10-wm → wae10-wm 等) は
+--     前者を採用 (セラー命名規則のばらつき吸収、登録側統一できれば不要)。
 --   - itemManagementId 空 (単純商品 or 親未マップ) なら item_code そのまま
 -- SKU 解決 2 段 fallback (CI 最初から):
 --   1. m_products WHERE LOWER(TRIM(商品コード)) = aupay_sku_key  (= master_match、itemManagementId 統合で大幅増)
@@ -50,11 +52,22 @@ SELECT
   item_code AS source_item_code,                              -- 親コード (audit 用)
   LOWER(TRIM(COALESCE(item_management_id, ''))) AS source_mgmt_id,  -- variant ID (例 '-wt' / 'co')
   -- effective SKU key: item_code + item_management_id を結合して m_products 子SKU 命名と揃える。
-  -- 「-」開始 (例 '-wt') ならそのまま連結、「co」のようなハイフン無しなら '-' を挟む。
-  -- itemManagementId が空なら item_code そのまま (= 単純商品 or 親未マップ)。
+  --   - itemManagementId が空 → item_code そのまま (= 単純商品 or 親未マップ)
+  --   - itemManagementId が '-' で始まる ('-wt' 等) → 'fragrancebalm-15g' || '-wt' = 'fragrancebalm-15g-wt'
+  --   - 'co' のようにハイフン無し → 通常は '-' を挟むが、セラーが「親に直接続けて子を書く運用」をしてる商品もある
+  --     (wae+10-wm が m_products では 'wae10-wm'、0726-001295+M が '0726-001295m' 等)。
+  --     m_products に「ハイフン無し連結」が存在 AND 「'-' 挟み連結」が存在しない場合のみ前者を採用、
+  --     それ以外は canonical な「'-' 挟み連結」を使う (両方存在/両方不在は後者に倒す)。
   CASE
     WHEN TRIM(COALESCE(item_management_id, '')) = '' THEN LOWER(TRIM(item_code))
     WHEN substr(TRIM(item_management_id), 1, 1) = '-' THEN LOWER(TRIM(item_code)) || LOWER(TRIM(item_management_id))
+    WHEN EXISTS (
+      SELECT 1 FROM m_products
+      WHERE LOWER(TRIM(商品コード)) = LOWER(TRIM(item_code)) || LOWER(TRIM(item_management_id))
+    ) AND NOT EXISTS (
+      SELECT 1 FROM m_products
+      WHERE LOWER(TRIM(商品コード)) = LOWER(TRIM(item_code)) || '-' || LOWER(TRIM(item_management_id))
+    ) THEN LOWER(TRIM(item_code)) || LOWER(TRIM(item_management_id))
     ELSE LOWER(TRIM(item_code)) || '-' || LOWER(TRIM(item_management_id))
   END AS aupay_sku_key,
   COALESCE(item_name, '') AS product_name,
