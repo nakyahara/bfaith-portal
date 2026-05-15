@@ -31,11 +31,17 @@ m_sku_master (miniPC)        ─────同期─────>              
 ### 安全装置
 
 - `WRITE_MODE=dry_run` (デフォルト) では実際の書き込みをせず、log のみ
-- 重複ガード: 既に A列にある seller_sku は skip
+- 重複ガード: (seller_sku, ne_code) ペアで既存行を判定、ペアが無いものだけ追記 (セット商品の partial write/component 変更を補完できる)
+- 同一実行内重複ガード: mirror が同じペアを重複返却しても 1 回しか追記しない
 - 1 回の追記行数上限 (`ML_MAX_NEW_ROWS=500`) 超過で throw
-- LockService で多重起動防止
+- LockService で GAS 多重起動防止
 - mirror freshness 26h 超えで throw
-- レスポンス契約 (`since_days=7` 等) 違反で throw
+- レスポンス契約 (`since_days=7` / 各 item 型 / components 各要素型) 違反で throw
+
+### 運用上の前提 (重要)
+
+- **B 列は asin 用** (中原さんが手動入力)。新規追加行は GAS が空文字 `''` を書く設計のため、**B 列に既定値や数式を予約しないこと**。
+- **トリガー起動時 (07:00〜08:00) と人手編集時間は重ねないこと**。Apps Script には sheet-level lock が無く、GAS と人手編集の完全排他は不可能。lastRow を setValues 直前に再取得しているが、競合時は着地行がずれる。
 
 ### スプレッドシート側セットアップ
 

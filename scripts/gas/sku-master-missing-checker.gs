@@ -200,6 +200,9 @@ function main_() {
         ne_code: String(c.ne_code),
         quantity: c.quantity,
       });
+      // Codex round 2 high #1: mirror が同じ (sku, ne) を重複返却したり、
+      // 同一実行内で既に積んだペアを再度積まないように existingPairs に追加
+      existingPairs.add(pairKey);
     }
   }
 
@@ -241,15 +244,22 @@ function main_() {
   }
 
   // live 書き込み:
-  //   Codex review high #2: B 列を触らないため、A/C/D/E 列を個別に setValues する (4 つの range)
-  //   Codex review low #5: lastRow を setValues 直前に再取得 (人手編集との競合で着地ずれ防止)
+  //   Codex review round 1 (B 列非接触) と round 2 high #2 (4 回個別 setValues は非原子的、
+  //   間に人手/別スクリプトが行挿入したら SKU と NE/数量が別商品にずれる) のトレードオフ。
+  //
+  //   採用: A:E 一括 setValues (1 回の操作で原子的)。B 列には空文字 '' が入る。
+  //   - 新規追記行は元々 lastRow より下で空 → 既存値を破壊しない
+  //   - B 列の用途は CSV 仕様の「asin」(中原さんが手動入力)、新規追加時に空でよい運用
+  //   - 「B 列に既定値や数式を予約しない」運用ルールは README に明記
+  //   - lastRow を setValues 直前に再取得 (人手 append との着地ずれ最小化)
+  //   - Apps Script には sheet-level lock が無く、人手編集との完全排他は不可能。
+  //     LockService は GAS 内のみ、運用は trigger 起動 (07:00〜08:00) と人手編集時間が重ならない
+  //     前提を README で明記。
   const startRow = sourceSheet.getLastRow() + 1;
   const numRows = newRows.length;
-  sourceSheet.getRange(startRow, 1, numRows, 1).setValues(newRows.map(r => [r.sku]));
-  sourceSheet.getRange(startRow, 3, numRows, 1).setValues(newRows.map(r => [r.name]));
-  sourceSheet.getRange(startRow, 4, numRows, 1).setValues(newRows.map(r => [r.ne_code]));
-  sourceSheet.getRange(startRow, 5, numRows, 1).setValues(newRows.map(r => [r.quantity]));
-  console.log('[LIVE] ' + numRows + ' 行を行 ' + startRow + ' から追記しました (A/C/D/E のみ、B/F+ 不変)');
+  const matrix = newRows.map(r => [r.sku, '', r.name, r.ne_code, r.quantity]);
+  sourceSheet.getRange(startRow, 1, numRows, 5).setValues(matrix);
+  console.log('[LIVE] ' + numRows + ' 行を行 ' + startRow + ' から追記しました (A/C/D/E に値、B は空文字、F+ 不変)');
 }
 
 function normalizeSku_(v) {
