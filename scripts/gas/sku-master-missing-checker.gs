@@ -154,17 +154,25 @@ function main_() {
   if (!sourceSheet) throw new Error('参照シートが見つからない: ' + sourceSheetName);
   const initialLastRow = sourceSheet.getLastRow();
   const existingPairs = new Set(); // 'sku|ne' 形式
+  // A 列に値がある最終行 (1-indexed)。書き込みはここの直後から始める。
+  // 初期値はヘッダ末尾、A 列がデータ無し (ヘッダのみ) なら header+1 から書く。
+  // getLastRow() ベースで書くと、F 列等が A 列より下まで埋まってる場合に「A 列の途中」へ
+  // 飛んで書かれるので採用しない (中原さん指示 2026-05-15)。
+  let lastARow = sourceHeaderRows;
   if (initialLastRow > sourceHeaderRows) {
     const colsToRead = Math.max(sourceSkuColumn, NE_COLUMN);
     const range = sourceSheet.getRange(sourceHeaderRows + 1, 1, initialLastRow - sourceHeaderRows, colsToRead);
     const vals = range.getValues();
-    for (const row of vals) {
+    for (let i = 0; i < vals.length; i++) {
+      const row = vals[i];
       const sku = normalizeSku_(row[sourceSkuColumn - 1]);
       if (!sku) continue;
       const ne = normalizeSku_(row[NE_COLUMN - 1]);
       // ne が空でも 'sku|' で記録 → 「SKU 単独行 (NE 未記入)」も重複扱いにする
       // (中原さんが手動で SKU だけ入れて NE を後で埋める運用も想定)
       existingPairs.add(sku + '|' + ne);
+      // この行は A 列に値あり。lastARow を更新 (A 列の最終データ行を追跡)
+      lastARow = sourceHeaderRows + 1 + i;
     }
   }
 
@@ -215,6 +223,7 @@ function main_() {
     write_mode: writeMode,
     fetched_master_skus: masterItems.length,
     existing_pairs_in_sheet: existingPairs.size,
+    a_column_last_row: lastARow,
     new_rows_to_write: newRows.length,
     skipped_no_components: skippedNoComponents.length,
     skipped_empty_ne: skippedEmptyNe.length,
@@ -234,7 +243,38 @@ function main_() {
     return;
   }
 
+  // 着地行 + 安全装置: dry_run / live 共通で実行
+  //   Codex round 1 medium #1 反映: dry_run でも着地の健全性を確認したい運用意図のため、
+  //   safety check を writeMode 分岐の前に実行する。
+  //   - 着地行: A 列の最終データ行 + 1 (中原さん指示 2026-05-15)
+  //     getLastRow() ベースだと F 列等が A 列より下まで埋まってる場合に A 列が中抜けで
+  //     書かれてしまう (前回 incident: 5 行が想定外位置に追記された) ため A 列ベースに変更
+  //   - 安全装置: 着地行範囲 (startRow〜startRow+numRows-1, A〜E) が空か再確認。
+  //     人手 append / 別 GAS との競合で既存値があったら throw (誤上書き防止)。
+  //   - 注意: GAS は getRange/getValues と setValues が別 RPC。
+  //     **「確認時点で既存値があれば throw」しか保証できない** (RPC 間の極短時間の競合は検知不可)。
+  //     完全排他は Apps Script API の制約で不可能、運用 (トリガー時刻分離) で補う。
+  const startRow = lastARow + 1;
+  const numRows = newRows.length;
+
+  // 安全装置 (dry_run / live 共通)
+  const safetyVals = sourceSheet.getRange(startRow, 1, numRows, 5).getValues();
+  for (let i = 0; i < numRows; i++) {
+    for (let j = 0; j < 5; j++) {
+      const v = safetyVals[i][j];
+      if (v !== '' && v !== null) {
+        throw new Error(
+          '安全装置発動: 書き込み予定の行 ' + (startRow + i) + ' / 列 ' + (j + 1) +
+          ' に既存値 "' + String(v).slice(0, 80) + '" あり。' +
+          '人手編集 / 別 GAS / 着地行計算ミス の可能性、安全のため中止。dry_run / live 共通で検知。'
+        );
+      }
+    }
+  }
+
   if (writeMode === 'dry_run') {
+    console.log('[DRY-RUN] 着地行 = ' + startRow + ' (A 列の最終データ行 ' + lastARow + ' の次)');
+    console.log('[DRY-RUN] 安全装置 OK (着地行範囲 A〜E は空セル、確認時点)');
     console.log('[DRY-RUN] 以下の行を追記する予定 (実際には書き込まない):');
     for (const r of newRows) {
       console.log('  A=' + r.sku + ' | C=' + r.name + ' | D=' + r.ne_code + ' | E=' + r.quantity);
@@ -244,19 +284,10 @@ function main_() {
   }
 
   // live 書き込み:
-  //   Codex review round 1 (B 列非接触) と round 2 high #2 (4 回個別 setValues は非原子的、
-  //   間に人手/別スクリプトが行挿入したら SKU と NE/数量が別商品にずれる) のトレードオフ。
-  //
-  //   採用: A:E 一括 setValues (1 回の操作で原子的)。B 列には空文字 '' が入る。
-  //   - 新規追記行は元々 lastRow より下で空 → 既存値を破壊しない
-  //   - B 列の用途は CSV 仕様の「asin」(中原さんが手動入力)、新規追加時に空でよい運用
-  //   - 「B 列に既定値や数式を予約しない」運用ルールは README に明記
-  //   - lastRow を setValues 直前に再取得 (人手 append との着地ずれ最小化)
-  //   - Apps Script には sheet-level lock が無く、人手編集との完全排他は不可能。
-  //     LockService は GAS 内のみ、運用は trigger 起動 (07:00〜08:00) と人手編集時間が重ならない
-  //     前提を README で明記。
-  const startRow = sourceSheet.getLastRow() + 1;
-  const numRows = newRows.length;
+  //   A:E 一括 setValues (原子性、Codex round 2 high #2 で確定)
+  //   B 列には空文字 '' が入る。新規追記行は元々空のため既存値破壊なし。
+  //   B 列の用途は CSV 仕様の「asin」(中原さんが手動入力)、新規追加時に空でよい運用。
+  //   「B 列に既定値や数式を予約しない」運用ルールは README に明記。
   const matrix = newRows.map(r => [r.sku, '', r.name, r.ne_code, r.quantity]);
   sourceSheet.getRange(startRow, 1, numRows, 5).setValues(matrix);
   console.log('[LIVE] ' + numRows + ' 行を行 ' + startRow + ' から追記しました (A/C/D/E に値、B は空文字、F+ 不変)');
