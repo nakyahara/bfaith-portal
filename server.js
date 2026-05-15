@@ -428,7 +428,43 @@ const apps = [
     status: 'active',
     category: 'analysis',
   },
+  // ─── miniPC (warehouse variant) でのみ表示するアプリ ───
+  // Render dashboard は社内ツールポータル本体、miniPC は warehouse / マスタ登録専用、
+  // という役割分担に揃えるため、apps 配列は共有しつつ availableOn で表示 variant を切り替える。
+  // 既存 21 アプリは availableOn 未指定 → 'render' 専用 (default)。
+  // 詳細: PORTAL_VARIANT env / appAvailableInVariant() を参照。
+  {
+    id: 'warehouse-register',
+    name: 'マスタ登録',
+    description: 'SKU・送料・原価・売上分類・税率の登録/編集 (warehouse 専用)',
+    icon: '📋',
+    path: '/apps/warehouse/register',
+    status: 'active',
+    category: 'data',
+    availableOn: ['warehouse'],
+  },
 ];
+
+// ─── PORTAL_VARIANT (どの環境で動かしているか) ───
+// 'render'    : 社内ツールポータル本体 (default、bfaith-portal.onrender.com 等)
+// 'warehouse' : miniPC 上の warehouse / マスタ登録専用 (wh.bfaith-wh.uk)
+//               ダッシュボードは「マスタ登録」と admin の「ユーザー管理」だけに絞る
+// fail-fast: 未知の値なら起動時に exit (typo を運用に持ち込ませない)
+const PORTAL_VARIANT = (process.env.PORTAL_VARIANT || 'render').toLowerCase();
+if (!['render', 'warehouse'].includes(PORTAL_VARIANT)) {
+  console.error(`FATAL: PORTAL_VARIANT は 'render' か 'warehouse': "${PORTAL_VARIANT}"`);
+  process.exit(2);
+}
+console.log(`[Portal] PORTAL_VARIANT=${PORTAL_VARIANT}`);
+
+/**
+ * app entry が現在の variant で表示すべきかを判定。
+ * availableOn 未指定の app は 'render' 専用扱い (既存 21 アプリの後方互換)。
+ */
+function appAvailableInVariant(app, variant) {
+  if (!Array.isArray(app.availableOn)) return variant === 'render';
+  return app.availableOn.includes(variant);
+}
 
 // 外部リンク
 const externalLinks = [
@@ -480,8 +516,14 @@ app.get('/', requireAuth, (req, res) => {
   if (!allowed) {
     return req.session.destroy(() => res.redirect('/login'));
   }
-  const visibleApps = allowed === '*' ? apps : apps.filter(a => allowed.includes(a.id));
-  const visibleExtLinks = allowed === '*' ? externalLinks : [];
+  // PORTAL_VARIANT で表示する app をフィルタ:
+  //   'render'    → availableOn 未指定 = render 専用、既存 21 アプリ全部
+  //   'warehouse' → availableOn=['warehouse'] のもの (= マスタ登録) のみ
+  const variantApps = apps.filter(a => appAvailableInVariant(a, PORTAL_VARIANT));
+  // externalLinks は社員ポータル用なので warehouse では空にする
+  const variantExternalLinks = PORTAL_VARIANT === 'warehouse' ? [] : externalLinks;
+  const visibleApps = allowed === '*' ? variantApps : variantApps.filter(a => allowed.includes(a.id));
+  const visibleExtLinks = allowed === '*' ? variantExternalLinks : [];
   res.render('dashboard', {
     apps: visibleApps, categories, externalLinks: visibleExtLinks,
     username: req.session.email, displayName: req.session.displayName,
