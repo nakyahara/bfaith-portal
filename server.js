@@ -430,6 +430,47 @@ const apps = [
   },
 ];
 
+// ─── PORTAL_VARIANT (どの環境で動かしているか) ───
+// 'render'    : 社内ツールポータル本体 (default、bfaith-portal.onrender.com 等)
+// 'warehouse' : miniPC 上の warehouse / マスタ登録専用 (wh.bfaith-wh.uk)
+//               ダッシュボードは「マスタ登録」と admin の「ユーザー管理」だけに絞る
+// fail-fast: 未知の値なら起動時に exit (typo を運用に持ち込ませない)
+const PORTAL_VARIANT = (process.env.PORTAL_VARIANT || 'render').toLowerCase();
+if (!['render', 'warehouse'].includes(PORTAL_VARIANT)) {
+  console.error(`FATAL: PORTAL_VARIANT は 'render' か 'warehouse': "${PORTAL_VARIANT}"`);
+  process.exit(2);
+}
+console.log(`[Portal] PORTAL_VARIANT=${PORTAL_VARIANT}`);
+
+/**
+ * warehouse variant 専用 dashboard 表示エントリ。
+ *
+ * 設計判断 (Codex round 1 critical 反映):
+ *   apps 配列に新規 id を追加すると、認可 (requireAppAccess) の app id とズレが生じる。
+ *   既存ルート保護は /apps/warehouse 配下が requireAppAccess('warehouse') に依存しており、
+ *   dashboard 表示用の id を分けたいだけなのに認可まで再設計する必要が出てしまう。
+ *   そこで dashboard 表示用エントリは別配列で持ち、requiresAccess で「どの allowedApps id を
+ *   持つユーザーに見せるか」を明示する。これで:
+ *     - allowedApps に 'warehouse' を持つユーザー → 「マスタ登録」が見える + クリックして 403 にならない
+ *     - admin 画面 (apps 配列ベース) は無変更、warehouse へのアクセス権付与は従来通り
+ *     - 認可は variant に依存しない (本来 PR の要件外、dashboard 表示の問題のみ解決)
+ *
+ *   「ユーザー管理」リンクは既に dashboard.ejs ヘッダーで admin 限定に表示される実装済みのため、
+ *   ここには含めない。
+ */
+const WAREHOUSE_VARIANT_DASHBOARD_APPS = [
+  {
+    id: 'warehouse-register-display', // dashboard 表示用 (key として使われる程度)
+    requiresAccess: 'warehouse',      // 必要な allowedApps の app id (= 既存の warehouse)
+    name: 'マスタ登録',
+    description: 'SKU・送料・原価・売上分類・税率の登録/編集',
+    icon: '📋',
+    path: '/apps/warehouse/register',
+    status: 'active',
+    category: 'data',
+  },
+];
+
 // 外部リンク
 const externalLinks = [
   {
@@ -480,6 +521,20 @@ app.get('/', requireAuth, (req, res) => {
   if (!allowed) {
     return req.session.destroy(() => res.redirect('/login'));
   }
+  if (PORTAL_VARIANT === 'warehouse') {
+    // warehouse variant: 「マスタ登録」のみ表示。requiresAccess='warehouse' で
+    // ユーザーの allowedApps に warehouse 権限があるかを判定 (認可は既存ルートの
+    // requireAppAccess('warehouse') に揃う、dashboard 表示と認可がズレない)
+    const visibleApps = allowed === '*'
+      ? WAREHOUSE_VARIANT_DASHBOARD_APPS
+      : WAREHOUSE_VARIANT_DASHBOARD_APPS.filter(a => allowed.includes(a.requiresAccess));
+    return res.render('dashboard', {
+      apps: visibleApps, categories, externalLinks: [],
+      username: req.session.email, displayName: req.session.displayName,
+      role: req.session.role,
+    });
+  }
+  // render variant (default): 既存挙動維持
   const visibleApps = allowed === '*' ? apps : apps.filter(a => allowed.includes(a.id));
   const visibleExtLinks = allowed === '*' ? externalLinks : [];
   res.render('dashboard', {
