@@ -1319,7 +1319,7 @@ function renderRegisterPage(shippingRates) {
 <body>
   <div class="header">
     <h1>マスタ登録</h1>
-    <a href="./">← ダッシュボードに戻る</a>
+    <a href="/">← ダッシュボードに戻る</a>
   </div>
   <div class="wrap">
     <!-- 未登録件数サマリ -->
