@@ -190,6 +190,22 @@ async function main() {
   const adsProductResult = runScript('apps/warehouse/fetch-amazon-ads.js', 'Amazon Ads (SKU)', 1800000);
   results.push({ name: 'Amazon Ads (SKU)', ...adsProductResult });
 
+  // Amazon SKU手数料取得 (v2: batch API + TTL/差分更新)
+  // SP-API getMyFeesEstimates (20件/call、0.5 RPS) で fetch、未キャッシュ + TTL>7日 + 価格乖離大 のみ refresh
+  // 旧版の単発APIで37分タイムアウトしてた問題を解消、通常2-3分で完了 (fetch-amazon-fees.js v2 に rewrite 済)
+  // SP-API 失敗時はスキップ (依存関係)、後続は継続
+  if (spResult.success) {
+    const feeResult = runScript(
+      'apps/warehouse/fetch-amazon-fees.js --recent 30',
+      'Amazon手数料 (--recent 30)',
+      600000  // 10分 (通常 2-3分 + マージン、batch API + TTL で 30分も要らない)
+    );
+    results.push({ name: 'Amazon手数料', ...feeResult });
+  } else {
+    console.log('[DailySync] SP-API 失敗のため Amazon手数料取得をスキップ');
+    results.push({ name: 'Amazon手数料', success: false, summary: '⏭️ skipped (SP-API失敗のため)' });
+  }
+
   // FBA 在庫スナップショット (RESTOCK + PLANNING) — daily_snapshots に履歴蓄積
   // 手動 /fetch-reports と lockfile で排他、既に走ってればスキップ (失敗扱いにしない)
   // SP-API レポート polling のため最大 15 分余裕
@@ -420,6 +436,13 @@ async function main() {
     syncResult = { success: false, summary: `⏸️ skipped (${reasons.join(', ')})` };
   }
   results.push({ name: 'Render同期', ...syncResult });
+
+  // Amazon手数料カバー率の監視 (SLO 監視、Codex+Claude 議論結果 2026-05-15)
+  // 売上加重カバー率 (件数じゃなく金額) を主指標、warn 30日<98%、critical <95% or 売上TOP20未カバー
+  // critical で exit 1 → daily-sync 赤、warn/ok は exit 0 (cron 緑)
+  // GChat 通知は warn/critical のみ (env GCHAT_WEBHOOK)
+  const monitorFeeResult = runScript('apps/warehouse/monitor-fee-coverage.js', '手数料カバー率監視', 60000);
+  results.push({ name: '手数料カバー率監視', ...monitorFeeResult });
 
   // 月初の自動 月末確定値保存
   // 条件: 今日が月初 (JST) かつ アップストリームのデータ取得が全部成功してる
