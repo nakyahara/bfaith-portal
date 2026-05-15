@@ -234,8 +234,10 @@ async function main() {
   const qoo10Result = runScript('apps/warehouse/mall-orders.js qoo10', 'Qoo10');
   results.push({ name: 'Qoo10', ...qoo10Result });
 
-  // LINEギフト
-  const linegiftResult = runScript('apps/warehouse/mall-orders.js linegift', 'LINEギフト');
+  // LINEギフト Phase 1 A-1 (2026-05-15、設計書 v0.5)
+  // mall-orders.js fetchLineGift (バグ持ち、item_code 等空文字) を廃止 → linegift-orders.js (新規) に置換
+  // OAuth refresh atomic (file lock + secure staging + atomic .env write) + 90日境界 frozen horizon
+  const linegiftResult = runScript('apps/warehouse/linegift-orders.js', 'LINEギフト');
   results.push({ name: 'LINEギフト', ...linegiftResult });
 
   // 統合商品マスタ再構築
