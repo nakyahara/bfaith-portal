@@ -428,21 +428,6 @@ const apps = [
     status: 'active',
     category: 'analysis',
   },
-  // ─── miniPC (warehouse variant) でのみ表示するアプリ ───
-  // Render dashboard は社内ツールポータル本体、miniPC は warehouse / マスタ登録専用、
-  // という役割分担に揃えるため、apps 配列は共有しつつ availableOn で表示 variant を切り替える。
-  // 既存 21 アプリは availableOn 未指定 → 'render' 専用 (default)。
-  // 詳細: PORTAL_VARIANT env / appAvailableInVariant() を参照。
-  {
-    id: 'warehouse-register',
-    name: 'マスタ登録',
-    description: 'SKU・送料・原価・売上分類・税率の登録/編集 (warehouse 専用)',
-    icon: '📋',
-    path: '/apps/warehouse/register',
-    status: 'active',
-    category: 'data',
-    availableOn: ['warehouse'],
-  },
 ];
 
 // ─── PORTAL_VARIANT (どの環境で動かしているか) ───
@@ -458,13 +443,33 @@ if (!['render', 'warehouse'].includes(PORTAL_VARIANT)) {
 console.log(`[Portal] PORTAL_VARIANT=${PORTAL_VARIANT}`);
 
 /**
- * app entry が現在の variant で表示すべきかを判定。
- * availableOn 未指定の app は 'render' 専用扱い (既存 21 アプリの後方互換)。
+ * warehouse variant 専用 dashboard 表示エントリ。
+ *
+ * 設計判断 (Codex round 1 critical 反映):
+ *   apps 配列に新規 id を追加すると、認可 (requireAppAccess) の app id とズレが生じる。
+ *   既存ルート保護は /apps/warehouse 配下が requireAppAccess('warehouse') に依存しており、
+ *   dashboard 表示用の id を分けたいだけなのに認可まで再設計する必要が出てしまう。
+ *   そこで dashboard 表示用エントリは別配列で持ち、requiresAccess で「どの allowedApps id を
+ *   持つユーザーに見せるか」を明示する。これで:
+ *     - allowedApps に 'warehouse' を持つユーザー → 「マスタ登録」が見える + クリックして 403 にならない
+ *     - admin 画面 (apps 配列ベース) は無変更、warehouse へのアクセス権付与は従来通り
+ *     - 認可は variant に依存しない (本来 PR の要件外、dashboard 表示の問題のみ解決)
+ *
+ *   「ユーザー管理」リンクは既に dashboard.ejs ヘッダーで admin 限定に表示される実装済みのため、
+ *   ここには含めない。
  */
-function appAvailableInVariant(app, variant) {
-  if (!Array.isArray(app.availableOn)) return variant === 'render';
-  return app.availableOn.includes(variant);
-}
+const WAREHOUSE_VARIANT_DASHBOARD_APPS = [
+  {
+    id: 'warehouse-register-display', // dashboard 表示用 (key として使われる程度)
+    requiresAccess: 'warehouse',      // 必要な allowedApps の app id (= 既存の warehouse)
+    name: 'マスタ登録',
+    description: 'SKU・送料・原価・売上分類・税率の登録/編集',
+    icon: '📋',
+    path: '/apps/warehouse/register',
+    status: 'active',
+    category: 'data',
+  },
+];
 
 // 外部リンク
 const externalLinks = [
@@ -516,14 +521,22 @@ app.get('/', requireAuth, (req, res) => {
   if (!allowed) {
     return req.session.destroy(() => res.redirect('/login'));
   }
-  // PORTAL_VARIANT で表示する app をフィルタ:
-  //   'render'    → availableOn 未指定 = render 専用、既存 21 アプリ全部
-  //   'warehouse' → availableOn=['warehouse'] のもの (= マスタ登録) のみ
-  const variantApps = apps.filter(a => appAvailableInVariant(a, PORTAL_VARIANT));
-  // externalLinks は社員ポータル用なので warehouse では空にする
-  const variantExternalLinks = PORTAL_VARIANT === 'warehouse' ? [] : externalLinks;
-  const visibleApps = allowed === '*' ? variantApps : variantApps.filter(a => allowed.includes(a.id));
-  const visibleExtLinks = allowed === '*' ? variantExternalLinks : [];
+  if (PORTAL_VARIANT === 'warehouse') {
+    // warehouse variant: 「マスタ登録」のみ表示。requiresAccess='warehouse' で
+    // ユーザーの allowedApps に warehouse 権限があるかを判定 (認可は既存ルートの
+    // requireAppAccess('warehouse') に揃う、dashboard 表示と認可がズレない)
+    const visibleApps = allowed === '*'
+      ? WAREHOUSE_VARIANT_DASHBOARD_APPS
+      : WAREHOUSE_VARIANT_DASHBOARD_APPS.filter(a => allowed.includes(a.requiresAccess));
+    return res.render('dashboard', {
+      apps: visibleApps, categories, externalLinks: [],
+      username: req.session.email, displayName: req.session.displayName,
+      role: req.session.role,
+    });
+  }
+  // render variant (default): 既存挙動維持
+  const visibleApps = allowed === '*' ? apps : apps.filter(a => allowed.includes(a.id));
+  const visibleExtLinks = allowed === '*' ? externalLinks : [];
   res.render('dashboard', {
     apps: visibleApps, categories, externalLinks: visibleExtLinks,
     username: req.session.email, displayName: req.session.displayName,
