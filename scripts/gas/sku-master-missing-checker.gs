@@ -243,8 +243,38 @@ function main_() {
     return;
   }
 
+  // 着地行 + 安全装置: dry_run / live 共通で実行
+  //   Codex round 1 medium #1 反映: dry_run でも着地の健全性を確認したい運用意図のため、
+  //   safety check を writeMode 分岐の前に実行する。
+  //   - 着地行: A 列の最終データ行 + 1 (中原さん指示 2026-05-15)
+  //     getLastRow() ベースだと F 列等が A 列より下まで埋まってる場合に A 列が中抜けで
+  //     書かれてしまう (前回 incident: 5 行が想定外位置に追記された) ため A 列ベースに変更
+  //   - 安全装置: 着地行範囲 (startRow〜startRow+numRows-1, A〜E) が空か再確認。
+  //     人手 append / 別 GAS との競合で既存値があったら throw (誤上書き防止)。
+  //   - 注意: GAS は getRange/getValues と setValues が別 RPC。
+  //     **「確認時点で既存値があれば throw」しか保証できない** (RPC 間の極短時間の競合は検知不可)。
+  //     完全排他は Apps Script API の制約で不可能、運用 (トリガー時刻分離) で補う。
+  const startRow = lastARow + 1;
+  const numRows = newRows.length;
+
+  // 安全装置 (dry_run / live 共通)
+  const safetyVals = sourceSheet.getRange(startRow, 1, numRows, 5).getValues();
+  for (let i = 0; i < numRows; i++) {
+    for (let j = 0; j < 5; j++) {
+      const v = safetyVals[i][j];
+      if (v !== '' && v !== null) {
+        throw new Error(
+          '安全装置発動: 書き込み予定の行 ' + (startRow + i) + ' / 列 ' + (j + 1) +
+          ' に既存値 "' + String(v).slice(0, 80) + '" あり。' +
+          '人手編集 / 別 GAS / 着地行計算ミス の可能性、安全のため中止。dry_run / live 共通で検知。'
+        );
+      }
+    }
+  }
+
   if (writeMode === 'dry_run') {
-    console.log('[DRY-RUN] 着地行 = ' + (lastARow + 1) + ' (A 列の最終データ行 ' + lastARow + ' の次)');
+    console.log('[DRY-RUN] 着地行 = ' + startRow + ' (A 列の最終データ行 ' + lastARow + ' の次)');
+    console.log('[DRY-RUN] 安全装置 OK (着地行範囲 A〜E は空セル、確認時点)');
     console.log('[DRY-RUN] 以下の行を追記する予定 (実際には書き込まない):');
     for (const r of newRows) {
       console.log('  A=' + r.sku + ' | C=' + r.name + ' | D=' + r.ne_code + ' | E=' + r.quantity);
@@ -254,35 +284,10 @@ function main_() {
   }
 
   // live 書き込み:
-  //   - 着地行: A 列の最終データ行 + 1 (中原さん指示 2026-05-15)
-  //     getLastRow() ベースだと F 列等が A 列より下まで埋まってる場合に A 列が中抜けで
-  //     書かれてしまう (前回 incident: 5 行が想定外位置に追記された) ため A 列ベースに変更
-  //   - A:E 一括 setValues (原子性、Codex round 2 high #2 で確定)
-  //     B 列には空文字 '' が入る。新規追記行は元々空のため既存値破壊なし。
-  //     B 列の用途は CSV 仕様の「asin」(中原さんが手動入力)、新規追加時に空でよい運用。
-  //     「B 列に既定値や数式を予約しない」運用ルールは README に明記。
-  //   - 安全装置: 書き込み直前に着地行範囲 (startRow〜startRow+numRows-1, A〜E) が空かを再確認。
-  //     人手 append / 別 GAS との競合で既存値があったら throw (誤上書き防止)。
-  //   - Apps Script には sheet-level lock が無いため、トリガー時刻はシートを誰も触らない
-  //     時間帯に設定する運用前提 (README 参照)。
-  const startRow = lastARow + 1;
-  const numRows = newRows.length;
-
-  // 安全装置: A〜E が空セルか再確認 (lastARow 取得から setValues までの間に人手 append された場合の検知)
-  const safetyVals = sourceSheet.getRange(startRow, 1, numRows, 5).getValues();
-  for (let i = 0; i < numRows; i++) {
-    for (let j = 0; j < 5; j++) {
-      const v = safetyVals[i][j];
-      if (v !== '' && v !== null) {
-        throw new Error(
-          '安全装置発動: 書き込み予定の行 ' + (startRow + i) + ' / 列 ' + (j + 1) +
-          ' に既存値 "' + String(v).slice(0, 80) + '" あり。' +
-          '人手編集との競合の可能性、安全のため中止。次回 trigger / 手動再実行で再検知される。'
-        );
-      }
-    }
-  }
-
+  //   A:E 一括 setValues (原子性、Codex round 2 high #2 で確定)
+  //   B 列には空文字 '' が入る。新規追記行は元々空のため既存値破壊なし。
+  //   B 列の用途は CSV 仕様の「asin」(中原さんが手動入力)、新規追加時に空でよい運用。
+  //   「B 列に既定値や数式を予約しない」運用ルールは README に明記。
   const matrix = newRows.map(r => [r.sku, '', r.name, r.ne_code, r.quantity]);
   sourceSheet.getRange(startRow, 1, numRows, 5).setValues(matrix);
   console.log('[LIVE] ' + numRows + ' 行を行 ' + startRow + ' から追記しました (A/C/D/E に値、B は空文字、F+ 不変)');

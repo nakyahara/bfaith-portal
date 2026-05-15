@@ -32,7 +32,7 @@ m_sku_master (miniPC)        ─────同期─────>              
 
 - `WRITE_MODE=dry_run` (デフォルト) では実際の書き込みをせず、log のみ
 - 着地行は **A 列の最終データ行 + 1** (シート全体の `getLastRow()` ではない、F 列等が下まで埋まってても A 列が中抜けしない)
-- 書き込み直前安全装置: 着地行範囲 (A〜E) が空セルか再確認、競合で既存値があったら throw (誤上書き防止)
+- 書き込み直前安全装置: 着地行範囲 (A〜E) が空セルか再確認、**確認時点で**既存値があったら throw (誤上書き防止)。dry_run / live 共通で発火。Apps Script は getValues と setValues が別 RPC のため、RPC 間の極短時間競合は検知不可 (運用補完)
 - 重複ガード: (seller_sku, ne_code) ペアで既存行を判定、ペアが無いものだけ追記 (セット商品の partial write/component 変更を補完できる)
 - 同一実行内重複ガード: mirror が同じペアを重複返却しても 1 回しか追記しない
 - 1 回の追記行数上限 (`ML_MAX_NEW_ROWS=500`) 超過で throw
