@@ -1,13 +1,13 @@
 /**
- * 小規模モール受注データ取得 — Qoo10 / メルカリShops
- * (au PAY は apps/warehouse/aupay-orders.js に分離 — Phase 1 で受注 API 全フィールド + fail-closed 化)
- * (LINEギフト は apps/warehouse/linegift-orders.js に分離 — Phase 1 A-1、2026-05-15。
- *  旧 fetchLineGift は item_code 等空文字保存のバグ持ちで廃止)
+ * 小規模モール受注データ取得 — メルカリShops
+ * (au PAY  は apps/warehouse/aupay-orders.js に分離 — Phase 1 で受注 API 全フィールド + fail-closed 化)
+ * (LINEギフト は apps/warehouse/linegift-orders.js に分離 — Phase 1 A-1、2026-05-15)
+ * (Qoo10   は apps/warehouse/qoo10-orders.js に分離 — Phase 1 A-1、2026-05-18。
+ *  旧 fetchQoo10 は packNo を PK 使用していて grain 崩壊バグの原因、新規 ingest に置換)
  *
  * 使い方:
- *   node apps/warehouse/mall-orders.js qoo10 [days]
  *   node apps/warehouse/mall-orders.js mercari [days]
- *   node apps/warehouse/mall-orders.js all [days]       → 上記 2 モール一括
+ *   node apps/warehouse/mall-orders.js all [days]       → メルカリのみ
  *
  * デフォルト: 直近7日分
  */
@@ -24,7 +24,8 @@ function ensureTables() {
   const db = getDB();
 
   // 各モール共通の受注テーブル（モール名をテーブル名に含める）
-  for (const mall of ['qoo10', 'mercari']) {
+  // qoo10 は qoo10-orders.js が新スキーマで管理、ここでは触らない
+  for (const mall of ['mercari']) {
     db.exec(`CREATE TABLE IF NOT EXISTS raw_${mall}_orders (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       order_id TEXT NOT NULL,
@@ -44,92 +45,7 @@ function ensureTables() {
   }
 }
 
-// ─── Qoo10 ───
-
-async function fetchQoo10(days = 7) {
-  const apiKey = process.env.QOO10_CERT_KEY;
-  if (!apiKey) { console.log('[Qoo10] QOO10_CERT_KEY未設定'); return; }
-
-  console.log(`[Qoo10] 受注取得開始（直近${days}日）`);
-  const db = getDB();
-  const ts = now();
-  const end = new Date();
-  const start = new Date(); start.setDate(start.getDate() - days);
-
-  const stmt = db.prepare(`
-    INSERT OR REPLACE INTO raw_qoo10_orders (order_id, order_date, order_status, item_code, item_name, quantity, unit_price, total_price, option_info, synced_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?)
-  `);
-
-  let total = 0;
-  let lastApiError = null;
-
-  // Qoo10 APIは日付範囲90日上限 → 90日チャンクで分割取得
-  // またページングが機能しない（Page1で全件返る）ためPage=1のみ取得
-  let chunkEnd = new Date(end);
-  while (chunkEnd > start) {
-    let chunkStart = new Date(chunkEnd);
-    chunkStart.setDate(chunkStart.getDate() - 89);
-    if (chunkStart < start) chunkStart = new Date(start);
-
-    const startStr = chunkStart.toISOString().slice(0, 10).replace(/-/g, '');
-    const endStr = chunkEnd.toISOString().slice(0, 10).replace(/-/g, '');
-    let chunkTotal = 0;
-
-    for (const stat of ['1', '2', '3', '4', '5']) {
-      const url = `https://api.qoo10.jp/GMKT.INC.Front.QAPIService/ebayjapan.qapi/ShippingBasic.GetShippingInfo_v2?key=${apiKey}&ShippingStat=${stat}&search_Sdate=${startStr}&search_Edate=${endStr}&Page=1&PageSize=200`;
-      const res = await fetch(url);
-      const data = await res.json();
-
-      if (data.ResultCode !== 0) {
-        lastApiError = `[Qoo10] APIエラー stat=${stat}: ResultCode=${data.ResultCode} ${data.ResultMsg || data.ResultMessage || ''}`;
-        console.log(lastApiError);
-        continue;
-      }
-      if (!data.ResultObject) continue;
-
-      const items = Array.isArray(data.ResultObject) ? data.ResultObject : [data.ResultObject];
-
-      const tx = db.transaction(() => {
-        for (const item of items) {
-          const packNo = String(item.packNo || '');
-          if (!packNo) continue;
-          stmt.run(
-            packNo,
-            item.orderDate || '',
-            item.shippingStatus || stat,
-            (item.sellerItemCode || item.itemCode || '').toLowerCase(),
-            item.itemTitle || '',
-            parseInt(item.orderQty) || 0,
-            parseFloat(item.orderPrice) || 0,
-            parseFloat(item.total) || 0,
-            item.option || '',
-            ts
-          );
-          chunkTotal++;
-        }
-      });
-      tx();
-
-      await sleep(300);
-    }
-
-    total += chunkTotal;
-    console.log(`[Qoo10] ${startStr}-${endStr}: ${chunkTotal}件 (累計${total})`);
-
-    chunkEnd = new Date(chunkStart);
-    chunkEnd.setDate(chunkEnd.getDate() - 1);
-    await sleep(300);
-  }
-
-  if (total === 0 && lastApiError) {
-    throw new Error(lastApiError);
-  }
-
-  updateSyncMeta('qoo10_last_sync', now());
-  console.log(`[Qoo10] 受注取得完了: ${total}件`);
-  return total;
-}
+// ─── Qoo10 は apps/warehouse/qoo10-orders.js に分離 (Phase 1 A-1) ───
 
 
 // ─── メルカリShops ───
@@ -251,11 +167,10 @@ async function main() {
 
   // au PAY は apps/warehouse/aupay-orders.js に分離 (Phase 1 で受注 API 全フィールド + fail-closed 化)
   // LINEギフト は apps/warehouse/linegift-orders.js に分離 (Phase 1 A-1)
+  // Qoo10 は apps/warehouse/qoo10-orders.js に分離 (Phase 1 A-1、2026-05-18)
   const handlers = {
-    qoo10: () => fetchQoo10(days),
     mercari: () => fetchMercari(days),
     all: async () => {
-      await fetchQoo10(days);
       await fetchMercari(days);
     },
   };
@@ -263,7 +178,7 @@ async function main() {
   if (handlers[command]) {
     await handlers[command]();
   } else {
-    console.log('使い方: node apps/warehouse/mall-orders.js [qoo10|mercari|all] [days]  (au PAY は aupay-orders.js / LINEギフト は linegift-orders.js)');
+    console.log('使い方: node apps/warehouse/mall-orders.js [mercari|all] [days]  (au PAY は aupay-orders.js / LINEギフト は linegift-orders.js / Qoo10 は qoo10-orders.js)');
   }
 }
 
