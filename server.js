@@ -18,6 +18,7 @@ import { startPriceWorker, startMaintenanceJobs } from './apps/profit-calculator
 import { startNotificationJob as startInventoryNotificationJob } from './apps/profit-analysis/notify-job.js';
 import fbaRouter from './apps/fba-replenishment/router.js';
 import warehouseRouter from './apps/warehouse/router.js';
+import ordersLookupRouter from './apps/warehouse/orders-lookup-router.js';
 import mirrorRouter from './apps/warehouse-mirror/router.js';
 import amazonAccountingRouter from './apps/amazon-accounting/router.js';
 import amazonUsaAccountingRouter from './apps/amazon-usa-accounting/router.js';
@@ -703,6 +704,15 @@ app.use('/apps/mirror/api/sync', mirrorParserErrorHandler);
 // read API (/api/products 等) は従来通り認証なしで素通し。
 // mirrorRouter 内部の `router.post('/api/sync', requireSyncKey, ...)` が二重防御として残る。
 app.use('/apps/mirror', mirrorRouter);
+
+// === Lookup API (Render→ミニPC、read-only 専用) ===
+// 誤出荷管理システム (apps/mis-shipment) からの注文番号 lookup 用。
+// 専用 WAREHOUSE_LOOKUP_TOKEN で認証 (SERVICE_TOKEN/WAREHOUSE_API_KEY とは完全分離)。
+// 設計書: g:/共有ドライブ/AI_reference/システム設計/誤出荷管理システム_設計書_v5.md (中身 v7.3)
+// blast radius 最小化: read-only token、専用 path、専用 router、未設定時 fail-closed (503)。
+// serviceRouter (/service-api) より前にマウントして path 衝突を予防 (Codex round 14 指摘)。
+app.use('/lookup-api', express.json({ limit: '64kb' }), ordersLookupRouter);
+
 // サービスAPI（Render→ミニPC、トークン認証）。
 // rankcheck の履歴込みインポートで 10MB を超える可能性があるため 50MB まで許容。
 // 未認可 DoS 回避のため、serviceAuth を body parser **より前** に置く。
