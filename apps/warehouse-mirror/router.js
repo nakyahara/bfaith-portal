@@ -612,6 +612,52 @@ function getAupayFinanceInsert(db) {
   return b.aupayFinanceInsert;
 }
 
+function getLinegiftFinanceInsert(db) {
+  const b = getStmtBundle(db);
+  if (!b.linegiftFinanceInsert) {
+    b.linegiftFinanceInsert = db.prepare(`
+      INSERT OR REPLACE INTO mirror_linegift_finance_sku_daily (
+        date_jst, sku_code, ne_code, parent_item_code, variant_key, resolution_method,
+        unresolved_sku_flag, product_name,
+        units_ordered, units_cancelled, units_net_sold,
+        sales_principal_jpy_incl, gross_sales_jpy_incl,
+        mall_fee_jpy_incl, mall_fee_calc_method, mall_fee_estimate_delta_jpy,
+        shipping_cost_jpy_incl, shipping_quality,
+        unit_cost_snapshot_incl, cost_snapshot_date_jst,
+        latest_unit_cost_reference_incl, cogs_amount_jpy_incl,
+        variable_margin_jpy_incl, refund_adjusted_net_sales_jpy_incl,
+        margin_confidence, margin_full_finalized_at,
+        recognized_on_jst, bought_date_jst, delivered_lag_days, received_lag_days,
+        is_delivery_by_hand, delivery_agent,
+        first_seen_in_api_at, last_seen_in_api_at, is_frozen_after_horizon,
+        cost_status, is_cost_complete, data_quality_score,
+        order_count, line_count,
+        source_layer_summary, source_row_count, built_at,
+        source_run_id, source_row_hash, synced_at
+      ) VALUES (
+        @date_jst, @sku_code, @ne_code, @parent_item_code, @variant_key, @resolution_method,
+        @unresolved_sku_flag, @product_name,
+        @units_ordered, @units_cancelled, @units_net_sold,
+        @sales_principal_jpy_incl, @gross_sales_jpy_incl,
+        @mall_fee_jpy_incl, @mall_fee_calc_method, @mall_fee_estimate_delta_jpy,
+        @shipping_cost_jpy_incl, @shipping_quality,
+        @unit_cost_snapshot_incl, @cost_snapshot_date_jst,
+        @latest_unit_cost_reference_incl, @cogs_amount_jpy_incl,
+        @variable_margin_jpy_incl, @refund_adjusted_net_sales_jpy_incl,
+        @margin_confidence, @margin_full_finalized_at,
+        @recognized_on_jst, @bought_date_jst, @delivered_lag_days, @received_lag_days,
+        @is_delivery_by_hand, @delivery_agent,
+        @first_seen_in_api_at, @last_seen_in_api_at, @is_frozen_after_horizon,
+        @cost_status, @is_cost_complete, @data_quality_score,
+        @order_count, @line_count,
+        @source_layer_summary, @source_row_count, @built_at,
+        @source_run_id, @source_row_hash, @synced_at
+      )
+    `);
+  }
+  return b.linegiftFinanceInsert;
+}
+
 function getLedgerInsert(db) {
   const b = getStmtBundle(db);
   if (!b.ledgerInsert) {
@@ -755,6 +801,14 @@ const ENTITY_REGISTRY = {
     clear_meta_key: 'clear_aupay_finance_dates',
     getInsertStmt: getAupayFinanceInsert,
     normalizeRow: (r) => normalizeAupayFinanceRow(r),
+  },
+  linegift_finance_sku_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_linegift_finance_sku_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_linegift_finance_dates',
+    getInsertStmt: getLinegiftFinanceInsert,
+    normalizeRow: (r) => normalizeLinegiftFinanceRow(r),
   },
 
   // ─── MF Phase 1a (Codex 5ラウンド確定設計) ─────────────────────────
@@ -1210,6 +1264,58 @@ function normalizeAupayFinanceRow(r) {
     is_cost_complete: r.is_cost_complete ?? 0,
     data_quality_score: r.data_quality_score ?? 0,
     price_variance_warning: r.price_variance_warning ?? 0,
+    order_count: r.order_count ?? 0,
+    line_count: r.line_count ?? 0,
+    source_layer_summary: r.source_layer_summary || '',
+    source_row_count: r.source_row_count ?? 0,
+    built_at: r.built_at || new Date().toISOString(),
+    source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,
+    synced_at: r.synced_at,
+  };
+}
+
+// row 列正規化 (mirror_linegift_finance_sku_daily 用、LINEギフト Phase 1 A-3)
+function normalizeLinegiftFinanceRow(r) {
+  return {
+    date_jst: r.date_jst, sku_code: r.sku_code,
+    ne_code: r.ne_code ?? null,
+    parent_item_code: r.parent_item_code ?? '',
+    variant_key: r.variant_key ?? '',
+    resolution_method: r.resolution_method,
+    unresolved_sku_flag: r.unresolved_sku_flag ?? 0,
+    product_name: r.product_name || '',
+    units_ordered: r.units_ordered ?? 0,
+    units_cancelled: r.units_cancelled ?? 0,
+    units_net_sold: r.units_net_sold ?? 0,
+    sales_principal_jpy_incl: r.sales_principal_jpy_incl ?? 0,
+    gross_sales_jpy_incl: r.gross_sales_jpy_incl ?? 0,
+    mall_fee_jpy_incl: r.mall_fee_jpy_incl ?? 0,
+    mall_fee_calc_method: r.mall_fee_calc_method ?? 'actual_api',
+    mall_fee_estimate_delta_jpy: r.mall_fee_estimate_delta_jpy ?? null,
+    shipping_cost_jpy_incl: r.shipping_cost_jpy_incl ?? 0,
+    shipping_quality: r.shipping_quality,
+    unit_cost_snapshot_incl: r.unit_cost_snapshot_incl ?? null,
+    cost_snapshot_date_jst: r.cost_snapshot_date_jst ?? null,
+    latest_unit_cost_reference_incl: r.latest_unit_cost_reference_incl ?? null,
+    cogs_amount_jpy_incl: r.cogs_amount_jpy_incl ?? 0,
+    variable_margin_jpy_incl: r.variable_margin_jpy_incl ?? 0,
+    refund_adjusted_net_sales_jpy_incl: r.refund_adjusted_net_sales_jpy_incl ?? null,
+    margin_confidence: r.margin_confidence ?? 'provisional_full_candidate',
+    margin_full_finalized_at: r.margin_full_finalized_at ?? null,
+    // LINEギフト 特有 audit
+    recognized_on_jst: r.recognized_on_jst ?? null,
+    bought_date_jst: r.bought_date_jst ?? null,
+    delivered_lag_days: r.delivered_lag_days ?? null,
+    received_lag_days: r.received_lag_days ?? null,
+    is_delivery_by_hand: r.is_delivery_by_hand ?? null,
+    delivery_agent: r.delivery_agent ?? null,
+    // 90日境界 frozen horizon
+    first_seen_in_api_at: r.first_seen_in_api_at ?? null,
+    last_seen_in_api_at: r.last_seen_in_api_at ?? null,
+    is_frozen_after_horizon: r.is_frozen_after_horizon ?? 0,
+    cost_status: r.cost_status,
+    is_cost_complete: r.is_cost_complete ?? 0,
+    data_quality_score: r.data_quality_score ?? 0,
     order_count: r.order_count ?? 0,
     line_count: r.line_count ?? 0,
     source_layer_summary: r.source_layer_summary || '',

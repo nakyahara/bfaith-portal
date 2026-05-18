@@ -415,6 +415,66 @@ async function main() {
     } else {
       console.log(`[DailySync] au PAY finance DQ/sync は build 失敗のため記録せず (build retry 後に翌 cron で実行)`);
     }
+
+    // ─── LINEギフト Phase 1 A-3 (Codex R1 critical 反映: DATA_DIR_ARG スコープ内に配置) ───
+    // 1. f_linegift_finance_sku_daily_v1 build (rolling: 当月 + 前2か月、whitelist status='received'、3 段 confidence
+    //    の Phase A 'provisional_full_candidate'、按分なし、mall_fee は API 実額)
+    // 2. DQ gate (13 check、severity error で exit 1) — build と同じ 3か月 window で回す
+    // 3. mirror_linegift_finance_sku_daily へ sync (chunk POST + ledger) — 月単位、各月独立に DQ→sync
+    // build 失敗で DQ/sync スキップ。各月の DQ gate failure でその月の sync のみスキップ (au PAY と同方針)
+    const linegiftFinanceBuildResult = runScript(
+      `scripts/linegift-finance/build-linegift-daily-fact.js --data-dir ${DATA_DIR_ARG} --month ${currentMonth}`,
+      'LINEギフト finance build', 600000
+    );
+    results.push({ name: 'LINEギフト finance build', ...linegiftFinanceBuildResult });
+
+    if (linegiftFinanceBuildResult.success) {
+      // build-linegift-daily-fact.js の rolling 既定 (当月+前2か月) と同じ window を生成
+      const linegiftRollingMonths = [0, 1, 2].map((n) => {
+        const [y, m] = currentMonth.split('-').map(Number);
+        const d = new Date(Date.UTC(y, m - 1 - n, 1));
+        return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+      });
+      for (const ym of linegiftRollingMonths) {
+        const linegiftFinanceDqResult = runScript(
+          `apps/warehouse/run-linegift-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${ym}`,
+          `LINEギフト finance DQ ${ym}`, 300000
+        );
+        results.push({ name: `LINEギフト finance DQ ${ym}`, ...linegiftFinanceDqResult });
+
+        if (linegiftFinanceDqResult.success) {
+          const linegiftFinanceSyncResult = runScript(
+            `apps/warehouse/sync-linegift-finance-daily.js --data-dir ${DATA_DIR_ARG} --month ${ym}`,
+            `LINEギフト finance sync ${ym}`, 600000
+          );
+          results.push({ name: `LINEギフト finance sync ${ym}`, ...linegiftFinanceSyncResult });
+        } else {
+          // Codex R3 medium + R4 medium + R5 medium 反映: DQ failure 時 skipped 行を results に push
+          //   skipped:true → GChat 表示が ⏸️ (失敗 ❌ ではなく意図的未実行と明示)
+          //   blocked:true → retry filter で除外 (DQ pass までは sync 不可、memory: feedback_blocked_field_for_retry_exclusion.md)
+          results.push({
+            name: `LINEギフト finance sync ${ym}`,
+            success: false,
+            skipped: true,
+            blocked: true,
+            summary: `⏸️ skipped: DQ gate failure ${ym} (品質不正データの mirror 投入防止)`,
+          });
+          console.log(`[DailySync] LINEギフト finance sync ${ym} は DQ gate failure のため skipped 記録`);
+        }
+      }
+    } else {
+      // Codex R3 medium + R4 medium + R5 medium 反映: build failure 時も 3 か月分の DQ/sync の skipped 行を push
+      const linegiftRollingMonths = [0, 1, 2].map((n) => {
+        const [y, m] = currentMonth.split('-').map(Number);
+        const d = new Date(Date.UTC(y, m - 1 - n, 1));
+        return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+      });
+      for (const ym of linegiftRollingMonths) {
+        results.push({ name: `LINEギフト finance DQ ${ym}`, success: false, skipped: true, blocked: true, summary: `⏸️ skipped: build failure (${currentMonth} の build が失敗、翌 cron で retry)` });
+        results.push({ name: `LINEギフト finance sync ${ym}`, success: false, skipped: true, blocked: true, summary: `⏸️ skipped: build failure (${currentMonth} の build が失敗、翌 cron で retry)` });
+      }
+      console.log(`[DailySync] LINEギフト finance DQ/sync 3か月分は build 失敗のため skipped 記録 (build retry 後に翌 cron で実行)`);
+    }
   }
 
   // 楽天 AM/AL/W → NE商品コード sku_map 再構築 (f_sales と独立)
