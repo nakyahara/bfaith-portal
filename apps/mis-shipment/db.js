@@ -273,8 +273,23 @@ function isValidTransition(from, to) {
 export { VALID_TRANSITIONS };
 
 // ─── 楽観ロック付き reporter_note / root_cause_stage / root_cause_note 更新 ───
+/**
+ * 設計書 §6 業務ルール 3: resolved/closed の レコードは root_cause_stage='unknown' に戻せない
+ * (Codex round 18 high 指摘対応: 三層防御で patchEditableFields でも禁止)
+ */
 export function patchEditableFields(id, expectedVersion, fields, updatedBy) {
   const allowed = ['reporter_note', 'root_cause_stage', 'root_cause_note'];
+
+  const db = getMirrorDB();
+
+  // status-aware な禁止: root_cause_stage を 'unknown' に戻す変更は、現在 status が resolved/closed なら拒否
+  if (Object.prototype.hasOwnProperty.call(fields, 'root_cause_stage') && fields.root_cause_stage === 'unknown') {
+    const current = db.prepare('SELECT status FROM f_mis_shipments WHERE id = ? AND deleted_at IS NULL').get(id);
+    if (current && (current.status === 'resolved' || current.status === 'closed')) {
+      return { ok: false, reason: 'root_cause_unknown_forbidden_after_resolve' };
+    }
+  }
+
   const sets = [];
   const vals = [];
   for (const k of allowed) {
@@ -285,7 +300,6 @@ export function patchEditableFields(id, expectedVersion, fields, updatedBy) {
   }
   if (sets.length === 0) return { ok: false, reason: 'no_fields' };
 
-  const db = getMirrorDB();
   const now = utcIsoNow();
   sets.push('updated_at = ?', 'updated_by = ?', 'version = version + 1');
   vals.push(now, updatedBy);

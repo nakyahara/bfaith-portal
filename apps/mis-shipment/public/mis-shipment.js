@@ -382,8 +382,13 @@
       return esc(STAGE_LABEL[cur]) + ' <small>(管理者のみ編集可)</small>';
     }
     const opts = ['receiving', 'supplier', 'master_data', 'picking', 'packing', 'labeling', 'inspection', 'system', 'other', 'unknown'];
+    // 設計書 §6 業務ルール 3: resolved/closed のレコードは unknown に戻せない (Codex round 18 high 指摘対応)
+    const lockUnknown = r.status === 'resolved' || r.status === 'closed';
     return `<select id="root-cause-stage">
-      ${opts.map((o) => `<option value="${o}" ${cur === o ? 'selected' : ''}>${STAGE_LABEL[o]}</option>`).join('')}
+      ${opts.map((o) => {
+        const isUnknownLocked = lockUnknown && o === 'unknown' && cur !== 'unknown';
+        return `<option value="${o}" ${cur === o ? 'selected' : ''} ${isUnknownLocked ? 'disabled' : ''}>${STAGE_LABEL[o]}${isUnknownLocked ? ' (完了済みには不可)' : ''}</option>`;
+      }).join('')}
     </select> <button type="button" id="save-root-cause" class="btn-primary">保存</button>`;
   }
 
@@ -457,7 +462,14 @@
         const result = await apiFetch('/submissions/' + r.id, {
           method: 'PATCH', body: { version: r.version, fields: { root_cause_stage: v } },
         });
-        if (!result.ok) { alert('保存エラー: ' + (result.data?.error || result.status)); return; }
+        if (!result.ok) {
+          if (result.status === 400 && result.data?.error === 'root_cause_unknown_forbidden_after_resolve') {
+            alert('完了/クローズ済みのレコードの根本原因を「不明」に戻すことはできません');
+            return;
+          }
+          alert('保存エラー: ' + (result.data?.error || result.status));
+          return;
+        }
         reloadDetail(r.id);
       });
       const saveNote = document.getElementById('save-root-cause-note');
