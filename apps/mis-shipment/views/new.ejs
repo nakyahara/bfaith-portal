@@ -1,0 +1,108 @@
+<%- include('_header') %>
+
+  <main class="mis-main mis-form-main">
+    <p class="back-link"><a href="/apps/mis-shipment">← 一覧へ戻る</a></p>
+
+    <% if (mixUp) { %>
+      <h2 class="form-title">⚭ テレコ登録 (取り違え誤出荷)</h2>
+      <p class="form-note">テレコ = A注文に B商品、B注文に A商品が入って配送された<br>2 件として記録され、サーバが同じ mix_up_group_id で紐付けます</p>
+    <% } else { %>
+      <h2 class="form-title">⚠️ 誤出荷 新規登録</h2>
+    <% } %>
+
+    <form id="submission-form" class="mis-form" data-mix-up="<%= mixUp ? '1' : '0' %>" novalidate>
+
+      <% if (mixUp) { %>
+        <div class="mixup-pair">
+          <fieldset class="mixup-side">
+            <legend>注文 A</legend>
+            <%- include('_order_section', { sideId: 'a' }) %>
+          </fieldset>
+          <fieldset class="mixup-side">
+            <legend>注文 B</legend>
+            <%- include('_order_section', { sideId: 'b' }) %>
+          </fieldset>
+        </div>
+      <% } else { %>
+        <%- include('_order_section', { sideId: '' }) %>
+      <% } %>
+
+      <fieldset>
+        <legend>誤出荷情報 (共通)</legend>
+
+        <label class="form-row">
+          <span class="label">発生日 <em>*</em></span>
+          <input type="date" name="occurred_on" required>
+        </label>
+
+        <label class="form-row">
+          <span class="label">誤出荷種別 <em>*</em></span>
+          <div class="radio-group large-targets">
+            <% if (mixUp) { %>
+              <p class="form-note">テレコは <code>mix_up</code> 固定 (サーバが自動付与)</p>
+            <% } else { %>
+              <label><input type="radio" name="mis_type" value="wrong_item" required>別商品送付</label>
+              <label><input type="radio" name="mis_type" value="wrong_qty">数量違い</label>
+              <label><input type="radio" name="mis_type" value="damage">破損</label>
+              <label><input type="radio" name="mis_type" value="missing">品物欠品/未着</label>
+              <label><input type="radio" name="mis_type" value="wrong_address">誤宛先</label>
+              <label><input type="radio" name="mis_type" value="other">その他</label>
+            <% } %>
+          </div>
+        </label>
+
+        <label class="form-row">
+          <span class="label">発見工程 <em>*</em></span>
+          <div class="radio-group large-targets">
+            <label><input type="radio" name="process_stage" value="picking" required>ピッキング</label>
+            <label><input type="radio" name="process_stage" value="packing">梱包</label>
+            <label><input type="radio" name="process_stage" value="labeling">ラベル貼付</label>
+            <label><input type="radio" name="process_stage" value="inspection">検品</label>
+            <label><input type="radio" name="process_stage" value="handover">出荷引渡</label>
+            <label><input type="radio" name="process_stage" value="unknown">不明</label>
+          </div>
+        </label>
+
+        <% if (!mixUp) { %>
+          <label class="form-row">
+            <span class="label">影響数量 <em>*</em></span>
+            <input type="number" name="qty_affected" min="1" max="1000" value="1" required>
+            <span class="form-unit">個</span>
+          </label>
+
+          <label class="form-row">
+            <span class="label">損失額 <em>*</em></span>
+            <input type="number" name="loss_amount_jpy" min="0" max="10000000" value="0" required>
+            <span class="form-unit">円</span>
+          </label>
+        <% } %>
+
+        <label class="form-row">
+          <span class="label">詳細メモ (任意)</span>
+          <textarea name="reporter_note" rows="4" maxlength="2000" placeholder="現場で気づいたこと"></textarea>
+        </label>
+
+        <p class="form-note">※「根本原因」は管理者が後で調査時に記録します</p>
+      </fieldset>
+
+      <div class="form-actions">
+        <a href="/apps/mis-shipment" class="btn-secondary">キャンセル</a>
+        <button type="submit" class="btn-primary-large">登録の確認 →</button>
+      </div>
+    </form>
+
+    <!-- 確認ダイアログ (誤操作防止) -->
+    <dialog id="confirm-dialog">
+      <h3>登録内容の確認</h3>
+      <div id="confirm-body"></div>
+      <div class="dialog-actions">
+        <button type="button" class="btn-secondary" id="confirm-cancel">戻る</button>
+        <button type="button" class="btn-primary-large" id="confirm-submit">登録する</button>
+      </div>
+    </dialog>
+  </main>
+
+  <script src="/apps/mis-shipment/public/mis-shipment.js"></script>
+  <script>misShipment.initNewPage(<%= mixUp ? 'true' : 'false' %>);</script>
+</body>
+</html>

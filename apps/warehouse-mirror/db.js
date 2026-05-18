@@ -20,7 +20,13 @@ let db = null;
 export function initMirrorDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   db = new Database(DB_FILE);
+  // PRAGMA は接続単位の設定。SQLite のデフォルトは foreign_keys=OFF / recursive_triggers=OFF なので、
+  // f_mis_shipments の FK 制約 と append-only trigger を機能させるために毎接続で明示する必要がある。
+  // 設計書: 誤出荷管理システム_設計書_v5.md (中身 v7.3) の「実装要件」セクション参照。
+  db.pragma('foreign_keys = ON');
   db.pragma('journal_mode = WAL');
+  db.pragma('busy_timeout = 5000');
+  db.pragma('recursive_triggers = ON');
   createTables();
   console.log('[Mirror] 初期化完了');
   return db;
@@ -605,6 +611,81 @@ function createTables() {
     db.prepare("PRAGMA table_info(mirror_aupay_finance_sku_daily)").all().map(c => c.name)
   );
   void mafsdCols; // Phase A 時点で全列 DDL に含まれてるので追加なし
+
+  // mirror_linegift_finance_sku_daily — LINEギフト Phase 1 A-3 (Render 側 daily fact mirror)
+  // miniPC の f_linegift_finance_sku_daily_v1 の payload を受信
+  // PK: (date_jst, sku_code) — sku_code = variation.code (LOWER(TRIM())、100% master_match 想定)
+  // 設計書 v0.5: g:/共有ドライブ/AI_reference/システム設計/LINEギフトPhase1設計書_v0.5_20260515.md §9
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_linegift_finance_sku_daily (
+    date_jst                          TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+    sku_code                          TEXT NOT NULL CHECK(trim(sku_code) <> ''),
+    ne_code                           TEXT,
+    parent_item_code                  TEXT NOT NULL DEFAULT '',
+    variant_key                       TEXT NOT NULL DEFAULT '',
+    resolution_method                 TEXT NOT NULL CHECK (
+      resolution_method IN ('master_match', 'parent_match', 'unresolved')
+    ),
+    unresolved_sku_flag               INTEGER NOT NULL DEFAULT 0,
+    product_name                      TEXT NOT NULL DEFAULT '',
+    units_ordered                     INTEGER NOT NULL DEFAULT 0,
+    units_cancelled                   INTEGER NOT NULL DEFAULT 0,
+    units_net_sold                    INTEGER NOT NULL DEFAULT 0,
+    sales_principal_jpy_incl          REAL NOT NULL DEFAULT 0,
+    gross_sales_jpy_incl              REAL NOT NULL DEFAULT 0,
+    mall_fee_jpy_incl                 REAL NOT NULL DEFAULT 0,
+    mall_fee_calc_method              TEXT NOT NULL DEFAULT 'actual_api' CHECK (
+      mall_fee_calc_method IN ('actual_api', 'actual_statement', 'estimated_rate', 'unknown')
+    ),
+    mall_fee_estimate_delta_jpy       REAL,
+    shipping_cost_jpy_incl            REAL NOT NULL DEFAULT 0,
+    shipping_quality                  TEXT NOT NULL CHECK (
+      shipping_quality IN ('no_shipping_in_api', 'actual_api', 'estimated_rates', 'estimated_fallback', 'missing')
+    ),
+    unit_cost_snapshot_incl           REAL,
+    cost_snapshot_date_jst            TEXT,
+    latest_unit_cost_reference_incl   REAL,
+    cogs_amount_jpy_incl              REAL NOT NULL DEFAULT 0,
+    variable_margin_jpy_incl          REAL NOT NULL DEFAULT 0,
+    refund_adjusted_net_sales_jpy_incl REAL,
+    margin_confidence                 TEXT NOT NULL DEFAULT 'provisional_full_candidate' CHECK (
+      margin_confidence IN ('provisional_full_candidate', 'full_minus_returns', 'full')
+    ),
+    margin_full_finalized_at          TEXT,
+    -- LINEギフト 特有 audit
+    recognized_on_jst                 TEXT,
+    bought_date_jst                   TEXT,
+    delivered_lag_days                INTEGER,
+    received_lag_days                 INTEGER,
+    is_delivery_by_hand               INTEGER,
+    delivery_agent                    TEXT,
+    -- 90日境界 frozen horizon
+    first_seen_in_api_at              TEXT,
+    last_seen_in_api_at               TEXT,
+    is_frozen_after_horizon           INTEGER NOT NULL DEFAULT 0,
+    -- 品質
+    cost_status                       TEXT NOT NULL CHECK (
+      cost_status IN ('complete', 'missing_cost', 'partial_cost', 'late_bound_after_close')
+    ),
+    is_cost_complete                  INTEGER NOT NULL DEFAULT 0,
+    data_quality_score                INTEGER NOT NULL DEFAULT 0
+                                      CHECK (data_quality_score BETWEEN 0 AND 100),
+    -- メタ
+    order_count                       INTEGER NOT NULL DEFAULT 0,
+    line_count                        INTEGER NOT NULL DEFAULT 0,
+    source_layer_summary              TEXT NOT NULL DEFAULT '',
+    source_row_count                  INTEGER NOT NULL DEFAULT 0,
+    built_at                          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    source_run_id                     TEXT NOT NULL,
+    source_row_hash                   TEXT NOT NULL,
+    synced_at                         TEXT NOT NULL,
+    PRIMARY KEY (date_jst, sku_code)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mlfsd_date   ON mirror_linegift_finance_sku_daily(date_jst)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mlfsd_ne     ON mirror_linegift_finance_sku_daily(ne_code)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mlfsd_month  ON mirror_linegift_finance_sku_daily(substr(date_jst, 1, 7))');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mlfsd_run    ON mirror_linegift_finance_sku_daily(source_run_id)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mlfsd_parent ON mirror_linegift_finance_sku_daily(parent_item_code)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mlfsd_frozen ON mirror_linegift_finance_sku_daily(is_frozen_after_horizon) WHERE is_frozen_after_horizon = 1');
 
   // mirror_amazon_sku_fees — Amazon手数料キャッシュ（粗利ダッシュボード用）
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_amazon_sku_fees (
@@ -1311,4 +1392,142 @@ function createTables() {
       WHERE r.status = 'success' AND r.scope IN ('all','base','bs_subaccount')
     )`);
   // ▲▲▲ MFクラウド会計ダッシュボード Phase 1a/1d-2/1d-3b 終了 ▲▲▲
+
+  // ▼▼▼ 誤出荷管理システム f_mis_shipments / f_mis_shipment_status_history ▼▼▼
+  // 設計書: g:/共有ドライブ/AI_reference/システム設計/誤出荷管理システム_設計書_v5.md (中身 v7.3)
+  // Codex 16 ラウンドレビュー完全 FIX、PR: feature/mis-shipment
+  createMisShipmentTables();
+}
+
+function createMisShipmentTables() {
+  // 正本テーブル (mirror_* と prefix で責任分離、こちらは Render 完結書込)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS f_mis_shipments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      client_submission_id TEXT NOT NULL UNIQUE,
+      payload_hash TEXT NOT NULL
+        CHECK (length(payload_hash) = 64 AND payload_hash NOT GLOB '*[^0-9a-f]*'),
+      version INTEGER NOT NULL DEFAULT 0,
+
+      occurred_on TEXT NOT NULL CHECK (occurred_on GLOB '????-??-??'),
+      reported_at TEXT NOT NULL,
+
+      mall_order_id TEXT
+        CHECK (mall_order_id IS NULL OR length(mall_order_id) <= 100),
+      order_id_unknown INTEGER NOT NULL DEFAULT 0
+        CHECK (order_id_unknown IN (0, 1)),
+      mall TEXT
+        CHECK (mall IS NULL OR mall IN
+          ('amazon','rakuten','yahoo','linegift','mercari','aupay','qoo10','other')),
+      sku_snapshot TEXT
+        CHECK (sku_snapshot IS NULL OR length(sku_snapshot) <= 100),
+      product_name_snapshot TEXT,
+      ordered_qty_snapshot INTEGER,
+      order_date_snapshot TEXT,
+      lookup_source TEXT NOT NULL
+        CHECK (lookup_source IN ('mirror_auto','manual','unknown')),
+
+      mis_type TEXT NOT NULL
+        CHECK (mis_type IN
+          ('wrong_item','wrong_qty','damage','missing','wrong_address','mix_up','other')),
+      qty_affected INTEGER NOT NULL CHECK (qty_affected BETWEEN 1 AND 1000),
+      loss_amount_jpy INTEGER NOT NULL DEFAULT 0
+        CHECK (loss_amount_jpy BETWEEN 0 AND 10000000),
+
+      process_stage TEXT NOT NULL
+        CHECK (process_stage IN
+          ('picking','packing','labeling','inspection','handover','unknown')),
+      root_cause_stage TEXT NOT NULL DEFAULT 'unknown'
+        CHECK (root_cause_stage IN
+          ('receiving','supplier','master_data','picking','packing','labeling',
+           'inspection','system','other','unknown')),
+      root_cause_note TEXT
+        CHECK (root_cause_note IS NULL OR length(root_cause_note) <= 2000),
+
+      mix_up_group_id TEXT,
+
+      status TEXT NOT NULL DEFAULT 'reported'
+        CHECK (status IN ('reported','investigating','resolved','closed')),
+      reporter_note TEXT
+        CHECK (reporter_note IS NULL OR length(reporter_note) <= 2000),
+
+      reported_by TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      updated_by TEXT NOT NULL,
+      deleted_at TEXT,
+      deleted_by TEXT,
+
+      CHECK (
+        (order_id_unknown = 1 AND mall_order_id IS NULL AND lookup_source = 'unknown')
+        OR
+        (order_id_unknown = 0 AND mall_order_id IS NOT NULL)
+      ),
+      CHECK (
+        (lookup_source = 'unknown'
+           AND mall IS NULL
+           AND sku_snapshot IS NULL
+           AND product_name_snapshot IS NULL
+           AND ordered_qty_snapshot IS NULL
+           AND order_date_snapshot IS NULL)
+        OR
+        (lookup_source IN ('mirror_auto','manual') AND mall IS NOT NULL)
+      ),
+      -- mix_up_group_id は mix_up 時のみ存在、それ以外では必ず NULL (Codex round 14 high 指摘: 両方向制約)
+      CHECK (
+        (mis_type = 'mix_up' AND mix_up_group_id IS NOT NULL)
+        OR
+        (mis_type != 'mix_up' AND mix_up_group_id IS NULL)
+      )
+    )
+  `);
+
+  // 状態履歴 (append-only、trigger で UPDATE/DELETE/REPLACE を全部ブロック)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS f_mis_shipment_status_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      mis_shipment_id INTEGER NOT NULL REFERENCES f_mis_shipments(id),
+      from_status TEXT
+        CHECK (from_status IS NULL OR from_status IN
+          ('reported','investigating','resolved','closed')),
+      to_status TEXT NOT NULL
+        CHECK (to_status IN ('reported','investigating','resolved','closed')),
+      changed_by TEXT NOT NULL,
+      changed_at TEXT NOT NULL,
+      change_note TEXT
+    )
+  `);
+
+  // append-only 強制 trigger (Codex round 14/15 指摘)
+  // recursive_triggers = ON で REPLACE INTO 経由の内部 DELETE もブロック
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS trg_mis_status_history_no_update
+      BEFORE UPDATE ON f_mis_shipment_status_history
+      BEGIN
+        SELECT RAISE(ABORT, 'f_mis_shipment_status_history is append-only (UPDATE forbidden)');
+      END
+  `);
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS trg_mis_status_history_no_delete
+      BEFORE DELETE ON f_mis_shipment_status_history
+      BEGIN
+        SELECT RAISE(ABORT, 'f_mis_shipment_status_history is append-only (DELETE forbidden)');
+      END
+  `);
+
+  // インデックス (partial 多用、deleted_at NULL 条件)
+  // 注: client_submission_id は UNIQUE 制約で SQLite 自動 index あり、明示 index は不要
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_mis_occurred
+             ON f_mis_shipments(occurred_on) WHERE deleted_at IS NULL`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_mis_mall_occurred
+             ON f_mis_shipments(mall, occurred_on) WHERE deleted_at IS NULL`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_mis_status
+             ON f_mis_shipments(status) WHERE deleted_at IS NULL`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_mis_order_id
+             ON f_mis_shipments(mall_order_id) WHERE deleted_at IS NULL`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_mis_mix_up_group
+             ON f_mis_shipments(mix_up_group_id) WHERE mix_up_group_id IS NOT NULL`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_status_hist
+             ON f_mis_shipment_status_history(mis_shipment_id, changed_at)`);
+  // ▲▲▲ 誤出荷管理システム ▲▲▲
 }

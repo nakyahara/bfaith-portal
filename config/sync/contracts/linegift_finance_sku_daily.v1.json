@@ -1,0 +1,17 @@
+{
+  "entity": "linegift_finance_sku_daily",
+  "contract_version": 1,
+  "source_system": "minipc-warehouse",
+  "source_object": "f_linegift_finance_sku_daily_v1",
+  "target_table": "mirror_linegift_finance_sku_daily",
+  "grain_definition": "one row = one (date_jst, sku_code) — sku_code = variation.code (LOWER(TRIM())、LINEギフト の variant 主キー、100% master_match 想定)",
+  "key_columns_json": "[\"date_jst\", \"sku_code\"]",
+  "payload_schema_json": "{\"type\":\"object\",\"required\":[\"date_jst\",\"sku_code\"],\"properties\":{\"date_jst\":{\"type\":\"string\",\"pattern\":\"^\\\\d{4}-\\\\d{2}-\\\\d{2}$\"},\"sku_code\":{\"type\":\"string\",\"minLength\":1},\"variable_margin_jpy_incl\":{\"type\":\"number\"},\"margin_confidence\":{\"type\":\"string\",\"enum\":[\"provisional_full_candidate\",\"full_minus_returns\",\"full\"]},\"resolution_method\":{\"type\":\"string\",\"enum\":[\"master_match\",\"parent_match\",\"unresolved\"]},\"cost_status\":{\"type\":\"string\",\"enum\":[\"complete\",\"missing_cost\",\"partial_cost\",\"late_bound_after_close\"]},\"shipping_quality\":{\"type\":\"string\",\"enum\":[\"no_shipping_in_api\",\"actual_api\",\"estimated_rates\",\"estimated_fallback\",\"missing\"]},\"mall_fee_calc_method\":{\"type\":\"string\",\"enum\":[\"actual_api\",\"actual_statement\",\"estimated_rate\",\"unknown\"]}}}",
+  "clear_strategy": "scope_clear_per_run",
+  "clear_strategy_detail": "First chunk of run includes meta.clear_linegift_finance_dates=[<scope_from..scope_to の全日付列挙>] for Render side to DELETE before insert. 0-row scope でも空 chunk を 1 個送って stale day を確実に消す。",
+  "apply_mode": "insert_or_replace",
+  "apply_mode_detail": "INSERT OR REPLACE on (date_jst, sku_code). source_run_id and source_row_hash track origin",
+  "enabled": 1,
+  "owner": "phase1-linegift-finance",
+  "notes": "LINEギフト Phase 1 A-3 で導入。3 段 confidence (provisional_full_candidate / full_minus_returns / full)、mall_fee は API 実額 (calc_method='actual_api')、shipping は raw.shipping_fee (現状 API 提供なしで 'no_shipping_in_api' 常態)、按分なし。90日境界 frozen horizon (is_frozen_after_horizon) を mirror に持つ。entity registry (router.js ENTITY_REGISTRY) に追加済。"
+}

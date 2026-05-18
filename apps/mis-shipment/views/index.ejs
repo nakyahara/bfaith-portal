@@ -1,0 +1,62 @@
+<%- include('_header') %>
+
+  <main class="mis-main">
+    <div class="actions-bar">
+      <a href="/apps/mis-shipment/new" class="btn-primary-large">＋ 新規登録</a>
+      <a href="/apps/mis-shipment/mixup" class="btn-secondary-large">⚭ テレコを登録</a>
+    </div>
+
+    <form id="filter-form" class="filter-form">
+      <label>モール:
+        <select name="mall">
+          <option value="">全て</option>
+          <option value="amazon">Amazon</option>
+          <option value="rakuten">楽天</option>
+          <option value="yahoo">Yahoo</option>
+          <option value="linegift">LINEギフト</option>
+          <option value="mercari">メルカリ</option>
+          <option value="aupay">auPAY</option>
+          <option value="qoo10">Qoo10</option>
+          <option value="other">その他</option>
+        </select>
+      </label>
+      <label>状態:
+        <select name="status">
+          <option value="">全て</option>
+          <option value="reported">報告済</option>
+          <option value="investigating">調査中</option>
+          <option value="resolved">完了</option>
+          <option value="closed">クローズ</option>
+        </select>
+      </label>
+      <label>発生日 (From): <input type="date" name="from"></label>
+      <label>発生日 (To): <input type="date" name="to"></label>
+      <button type="submit" class="btn-primary">絞り込み</button>
+    </form>
+
+    <table class="result-table">
+      <thead>
+        <tr>
+          <th>発生日</th>
+          <th>モール</th>
+          <th>注文番号</th>
+          <th>SKU</th>
+          <th>種別</th>
+          <th>工程</th>
+          <th>原因</th>
+          <th>状態</th>
+          <th class="num">損失額</th>
+        </tr>
+      </thead>
+      <tbody id="results-body">
+        <tr><td colspan="9" class="loading">読み込み中...</td></tr>
+      </tbody>
+    </table>
+
+    <p id="results-summary" class="results-summary"></p>
+  </main>
+
+  <script src="/apps/mis-shipment/public/mis-shipment.js"></script>
+  <script>misShipment.initIndexPage();</script>
+</body>
+</html>
