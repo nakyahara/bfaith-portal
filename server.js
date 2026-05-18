@@ -471,6 +471,49 @@ const WAREHOUSE_VARIANT_DASHBOARD_APPS = [
   },
 ];
 
+/**
+ * variant の scope 内で表示・編集対象にする app id 集合。
+ *   - render variant: null (= 全 apps)
+ *   - warehouse variant: WAREHOUSE_VARIANT_DASHBOARD_APPS で挙げた requiresAccess の集合
+ *
+ * 用途: /admin/users と /admin/permissions の UI で、その variant で実体が動いていない
+ * Render 専用アプリのチェックボックスを出さない (誤操作・誤解防止)。
+ * 権限保存時は variant scope 外の既存権限を保持 (防衛策、users.json が誤って共有された
+ * 場合に Render 側の権限を巻き戻さない)。
+ */
+function variantVisibleAppIds() {
+  if (PORTAL_VARIANT === 'warehouse') {
+    return new Set(WAREHOUSE_VARIANT_DASHBOARD_APPS.map(a => a.requiresAccess));
+  }
+  return null;
+}
+
+function variantVisibleApps() {
+  const ids = variantVisibleAppIds();
+  return ids === null ? apps : apps.filter(a => ids.has(a.id));
+}
+
+/**
+ * 提出された allowedApps をマージ保存用に整形する。
+ *   - variant scope 外の既存 allowedApps エントリは保持
+ *   - submitted は variant scope 内に絞ってから足す (UIに出してない app id を勝手に
+ *     混入されないように、サーバ側でもう一度濾す)
+ */
+function mergeAllowedApps(currentAllowed, submittedAllowed) {
+  const submittedArr = Array.isArray(submittedAllowed)
+    ? submittedAllowed
+    : (submittedAllowed ? [submittedAllowed] : []);
+  const visibleIds = variantVisibleAppIds();
+  if (visibleIds === null) {
+    // render variant: 全 apps が編集可能 → 完全置換
+    return submittedArr;
+  }
+  const currentArr = Array.isArray(currentAllowed) ? currentAllowed : [];
+  const preserved = currentArr.filter(id => !visibleIds.has(id));
+  const accepted = submittedArr.filter(id => visibleIds.has(id));
+  return [...preserved, ...accepted];
+}
+
 // 外部リンク
 const externalLinks = [
   {
@@ -724,7 +767,7 @@ app.get('/apps/:appId', requireAuth, (req, res) => {
 app.get('/admin/permissions', requireAdmin, (req, res) => {
   const nonAdminUsers = users.filter(u => u.role !== 'admin');
   res.render('admin-permissions', {
-    users: nonAdminUsers, apps,
+    users: nonAdminUsers, apps: variantVisibleApps(),
     username: req.session.email, displayName: req.session.displayName,
     success: req.query.success === '1',
   });
@@ -734,8 +777,7 @@ app.post('/admin/permissions', requireAdmin, (req, res) => {
   const perms = req.body.permissions || {};
   users.forEach(user => {
     if (user.role !== 'admin') {
-      const val = perms[user.email];
-      user.allowedApps = Array.isArray(val) ? val : (val ? [val] : []);
+      user.allowedApps = mergeAllowedApps(user.allowedApps, perms[user.email]);
     }
   });
   saveUsers(users);
@@ -745,7 +787,7 @@ app.post('/admin/permissions', requireAdmin, (req, res) => {
 // --- 管理者ルート: ユーザー管理 ---
 app.get('/admin/users', requireAdmin, (req, res) => {
   res.render('admin-users', {
-    users, apps,
+    users, apps: variantVisibleApps(),
     username: req.session.email, displayName: req.session.displayName,
     success: req.query.success, error: req.query.error,
   });
@@ -765,10 +807,9 @@ app.post('/admin/users/add', requireAdmin, (req, res) => {
   }
 
   const parsedRole = role || 'user';
-  const parsedApps = parsedRole === 'admin' ? '*'
-    : Array.isArray(allowedApps) ? allowedApps
-    : allowedApps ? [allowedApps]
-    : [];
+  const parsedApps = parsedRole === 'admin'
+    ? '*'
+    : mergeAllowedApps([], allowedApps);
 
   users.push({
     email: email.toLowerCase(),
@@ -801,7 +842,7 @@ app.post('/admin/users/permissions', requireAdmin, express.json(), (req, res) =>
   const user = users.find(u => u.email === email);
   if (!user) return res.status(404).json({ error: 'ユーザーが見つかりません' });
   if (user.role === 'admin') return res.status(400).json({ error: '管理者の権限は変更できません' });
-  user.allowedApps = Array.isArray(allowedApps) ? allowedApps : [];
+  user.allowedApps = mergeAllowedApps(user.allowedApps, allowedApps);
   saveUsers(users);
   res.json({ ok: true });
 });
