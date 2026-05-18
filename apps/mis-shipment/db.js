@@ -69,33 +69,47 @@ export function findByClientSubmissionId(clientSubmissionId) {
 
 // ─── 単独 INSERT (mix_up でない通常ケース) ───
 /**
- * 単独レコードを挿入。トランザクション内で f_mis_shipments + 初回 status_history を作成。
- * 既存 client_submission_id の場合: payload_hash 一致なら既存返却 (201 → 200 相当), 不一致なら null + conflict 情報を返す
+ * 単独レコードを挿入。INSERT-first + UNIQUE 違反 catch でレース耐性。
  *
- * @param {object} record - INSERT_COLS の値を含むオブジェクト (mix_up_group_id は null、status は 'reported' 固定)
+ * 設計: 既存 client_submission_id の場合:
+ *   - payload_hash 一致 → 既存返却 (idempotent retry、200 相当)
+ *   - 不一致 → conflict (409 相当)
+ *
+ * 実装: SELECT 先行だと同時 2 リクエストで両方「無し」→ INSERT 競合 → 後者 500 になる。
+ * これを避けるため INSERT を先に試み、UNIQUE 違反のときに既存を読み直して判定。
+ * (Codex round 17 medium 指摘対応)
+ *
  * @returns {{ inserted: true, id: number } | { inserted: false, conflict: true, existingId: number } | { inserted: false, idempotent: true, existing: object }}
  */
 export function insertSingleMisShipment(record) {
   const db = getMirrorDB();
-  const existing = findByClientSubmissionId(record.client_submission_id);
-  if (existing) {
-    if (existing.payload_hash === record.payload_hash) {
-      return { inserted: false, idempotent: true, existing };
-    }
-    return { inserted: false, conflict: true, existingId: existing.id };
-  }
-
   const tx = db.transaction(() => {
     const values = INSERT_COLS.map((c) => record[c] ?? null);
     const info = db.prepare(INSERT_SQL).run(...values);
     const id = Number(info.lastInsertRowid);
-    // 初回 status_history (from_status=NULL → to_status='reported')
     db.prepare(HISTORY_INSERT_SQL)
       .run(id, null, record.status ?? 'reported', record.reported_by, record.reported_at, null);
     return id;
   });
-  const id = tx();
-  return { inserted: true, id };
+
+  try {
+    const id = tx();
+    return { inserted: true, id };
+  } catch (e) {
+    if (e && e.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+      // 同時送信レース or 再送。既存を読み直して hash 比較
+      const existing = findByClientSubmissionId(record.client_submission_id);
+      if (!existing) {
+        // UNIQUE 違反だが見つからない (削除済み等) → conflict 扱い
+        return { inserted: false, conflict: true, existingId: null };
+      }
+      if (existing.payload_hash === record.payload_hash) {
+        return { inserted: false, idempotent: true, existing };
+      }
+      return { inserted: false, conflict: true, existingId: existing.id };
+    }
+    throw e;
+  }
 }
 
 // ─── mix_up 同時 INSERT (2件 + 同じ mix_up_group_id) ───
@@ -111,30 +125,6 @@ export function insertSingleMisShipment(record) {
  */
 export function insertMixUpMisShipments(recordA, recordB) {
   const db = getMirrorDB();
-  const existingA = findByClientSubmissionId(recordA.client_submission_id);
-  const existingB = findByClientSubmissionId(recordB.client_submission_id);
-
-  // 両方が既に存在 + hash 一致 + 同じ mix_up_group_id → idempotent return
-  if (existingA && existingB &&
-      existingA.payload_hash === recordA.payload_hash &&
-      existingB.payload_hash === recordB.payload_hash &&
-      existingA.mix_up_group_id && existingA.mix_up_group_id === existingB.mix_up_group_id) {
-    return {
-      inserted: false,
-      idempotent: true,
-      ids: [existingA.id, existingB.id],
-      groupId: existingA.mix_up_group_id,
-    };
-  }
-  // 片方だけ存在、または hash 不一致は conflict
-  if (existingA || existingB) {
-    return {
-      inserted: false,
-      conflict: true,
-      detail: { existingA: existingA?.id ?? null, existingB: existingB?.id ?? null },
-    };
-  }
-
   const groupId = crypto.randomUUID();
   const recA = { ...recordA, mix_up_group_id: groupId };
   const recB = { ...recordB, mix_up_group_id: groupId };
@@ -155,8 +145,36 @@ export function insertMixUpMisShipments(recordA, recordB) {
 
     return [idA, idB];
   });
-  const [idA, idB] = tx();
-  return { inserted: true, ids: [idA, idB], groupId };
+
+  // INSERT-first + UNIQUE 違反 catch でレース耐性 (Codex round 17 medium 指摘対応)
+  try {
+    const [idA, idB] = tx();
+    return { inserted: true, ids: [idA, idB], groupId };
+  } catch (e) {
+    if (e && e.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+      // 片方/両方が既に存在 → 個別に読み直して整合判定
+      const existingA = findByClientSubmissionId(recordA.client_submission_id);
+      const existingB = findByClientSubmissionId(recordB.client_submission_id);
+      // 両方 + hash 一致 + 同じ group → idempotent
+      if (existingA && existingB &&
+          existingA.payload_hash === recordA.payload_hash &&
+          existingB.payload_hash === recordB.payload_hash &&
+          existingA.mix_up_group_id && existingA.mix_up_group_id === existingB.mix_up_group_id) {
+        return {
+          inserted: false,
+          idempotent: true,
+          ids: [existingA.id, existingB.id],
+          groupId: existingA.mix_up_group_id,
+        };
+      }
+      return {
+        inserted: false,
+        conflict: true,
+        detail: { existingA: existingA?.id ?? null, existingB: existingB?.id ?? null },
+      };
+    }
+    throw e;
+  }
 }
 
 // ─── 詳細取得 (status history と mix_up 相方含む) ───
@@ -207,18 +225,24 @@ export function listMisShipments({ mall, status, fromDate, toDate, processStage,
 /**
  * status 遷移を 1 トランザクションで行う。
  * UPDATE は version チェック + version++、history INSERT を併せて実行。
- * @returns {{ ok: true } | { ok: false, reason: 'version_mismatch' | 'not_found' | 'invalid_transition' }}
+ * @returns {{ ok: true } | { ok: false, reason: 'version_mismatch' | 'not_found' | 'invalid_transition' | 'root_cause_required' }}
  */
 export function transitionStatus(id, expectedVersion, newStatus, changedBy, changeNote = null) {
   const db = getMirrorDB();
 
   const tx = db.transaction(() => {
-    const current = db.prepare('SELECT id, version, status FROM f_mis_shipments WHERE id = ? AND deleted_at IS NULL').get(id);
+    const current = db.prepare('SELECT id, version, status, root_cause_stage FROM f_mis_shipments WHERE id = ? AND deleted_at IS NULL').get(id);
     if (!current) return { ok: false, reason: 'not_found' };
     if (current.version !== expectedVersion) return { ok: false, reason: 'version_mismatch', currentVersion: current.version };
 
     if (!isValidTransition(current.status, newStatus)) {
       return { ok: false, reason: 'invalid_transition', from: current.status, to: newStatus };
+    }
+
+    // 設計書 §6 業務ルール 3: resolved/closed への遷移は root_cause_stage 確定が前提
+    // (Codex round 17 high 指摘対応)
+    if ((newStatus === 'resolved' || newStatus === 'closed') && current.root_cause_stage === 'unknown') {
+      return { ok: false, reason: 'root_cause_required', currentRootCause: current.root_cause_stage };
     }
 
     const now = utcIsoNow();

@@ -22,7 +22,27 @@
   <p class="multi-line-warn" hidden>⚠️ この注文は複数明細あり (このフォームでは先頭明細を表示)</p>
 </div>
 <div class="lookup-error" id="lookup-error-<%= sideId || 'single' %>" hidden>
-  <p>⚠️ 注文が見つかりませんでした。番号を確認するか、「注文番号不明」をチェックしてください。</p>
+  <p>⚠️ 注文がマスターに見つかりませんでした。注文番号を確認するか、下記のいずれかを選んでください:</p>
+  <ul class="lookup-options">
+    <li>番号を直して再検索</li>
+    <li>「注文番号不明」をチェック (在庫紛失等)</li>
+    <li>注文番号は正しい (古い受注等でマスターに無い) → モールを手動指定して登録</li>
+  </ul>
+  <label class="form-row manual-mall-row" hidden>
+    <span class="label">モール (手動指定) <em>*</em></span>
+    <select name="manual_mall<%= sideId ? '_' + sideId : '' %>" class="manual-mall-select" data-side="<%= sideId %>">
+      <option value="">選択してください</option>
+      <option value="amazon">Amazon</option>
+      <option value="rakuten">楽天</option>
+      <option value="yahoo">Yahoo</option>
+      <option value="linegift">LINEギフト</option>
+      <option value="mercari">メルカリ</option>
+      <option value="aupay">auPAY</option>
+      <option value="qoo10">Qoo10</option>
+      <option value="other">その他</option>
+    </select>
+  </label>
+  <button type="button" class="btn-secondary toggle-manual-btn" data-side="<%= sideId %>">📝 手動モールを指定して進む</button>
 </div>
 <% if (mixUp) { %>
 <label class="form-row">

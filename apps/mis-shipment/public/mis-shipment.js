@@ -119,6 +119,16 @@
       });
     });
 
+    // 「手動モールを指定」ボタン (lookup ノヒット時)
+    form.querySelectorAll('.toggle-manual-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const errBox = document.getElementById('lookup-error-' + (btn.dataset.side || 'single'));
+        const mallRow = errBox.querySelector('.manual-mall-row');
+        mallRow.hidden = false;
+        btn.hidden = true;
+      });
+    });
+
     // submit → 確認ダイアログ
     form.addEventListener('submit', (e) => {
       e.preventDefault();
@@ -183,11 +193,16 @@
     const processStage = form.querySelector('[name="process_stage"]').value;
     const misType = mixUp ? 'mix_up' : form.querySelector('[name="mis_type"]')?.value;
 
+    // manual_mall: lookup ノヒットで「手動モール指定」を選んだ場合に値が入る (router.js が拾う)
+    const manualMallEl = form.querySelector(`[name="manual_mall${sfx}"]`);
+    const manualMall = manualMallEl && !manualMallEl.closest('[hidden]') ? (manualMallEl.value || null) : null;
+
     return {
       client_submission_id: uuidv4(),
       occurred_on: occurredOn,
       mall_order_id: orderIdUnknown ? null : (get('mall_order_id') || null),
       order_id_unknown: orderIdUnknown,
+      manual_mall: manualMall,
       mis_type: misType,
       qty_affected: parseInt(get('qty_affected') || '1', 10),
       loss_amount_jpy: parseInt(get('loss_amount_jpy') || '0', 10),
@@ -253,6 +268,10 @@
     }
     if (result.status === 503) {
       alert('注文 lookup サービスが利用不能です。後でやり直してください。');
+      return;
+    }
+    if (result.status === 400 && result.data?.error === 'lookup_miss_requires_manual_mall') {
+      alert('注文がマスターに見つかりません。「手動モールを指定して進む」ボタンを押してから、モールを選んで再度登録してください。');
       return;
     }
     alert('登録エラー: ' + (result.data?.error || result.status));
@@ -385,19 +404,28 @@
 
   function renderTransitionButtons(r, isAdmin) {
     const cur = r.status;
+    // 設計書 §6 業務ルール 3: resolved/closed への遷移は root_cause_stage 確定が前提
+    // (Codex round 17 high 指摘対応)
+    const rootCauseConfirmed = r.root_cause_stage && r.root_cause_stage !== 'unknown';
+
     const buttons = [];
-    if (cur === 'reported') buttons.push({ to: 'investigating', label: '調査開始', admin: false });
-    if (cur === 'investigating') buttons.push({ to: 'resolved', label: '完了に変更 (管理者のみ)', admin: true });
+    if (cur === 'reported') buttons.push({ to: 'investigating', label: '調査開始', admin: false, requireRootCause: false });
+    if (cur === 'investigating') buttons.push({ to: 'resolved', label: '完了に変更 (管理者のみ)', admin: true, requireRootCause: true });
     if (cur === 'resolved') {
-      buttons.push({ to: 'investigating', label: '調査に戻す (管理者のみ)', admin: true });
-      buttons.push({ to: 'closed', label: 'クローズ (管理者のみ)', admin: true });
+      buttons.push({ to: 'investigating', label: '調査に戻す (管理者のみ)', admin: true, requireRootCause: false });
+      buttons.push({ to: 'closed', label: 'クローズ (管理者のみ)', admin: true, requireRootCause: true });
     }
     return buttons.map((b) => {
-      const disabled = b.admin && !isAdmin;
+      const adminBlocked = b.admin && !isAdmin;
+      const rootCauseBlocked = b.requireRootCause && !rootCauseConfirmed;
+      const disabled = adminBlocked || rootCauseBlocked;
+      let title = '';
+      if (adminBlocked) title = '管理者権限が必要です';
+      else if (rootCauseBlocked) title = '先に「根本原因」を unknown 以外で確定してください';
       return `<button type="button" data-to="${b.to}" data-version="${r.version}" data-id="${r.id}"
         class="btn-secondary transition-btn ${b.admin ? 'admin-only' : ''}"
-        ${disabled ? 'disabled' : ''} title="${disabled ? '管理者権限が必要です' : ''}">
-        ${esc(b.label)}
+        ${disabled ? 'disabled' : ''} title="${esc(title)}">
+        ${esc(b.label)}${rootCauseBlocked ? ' <small>(根本原因未確定)</small>' : ''}
       </button>`;
     }).join('');
   }
@@ -411,6 +439,10 @@
           body: { version: parseInt(btn.dataset.version, 10), status: btn.dataset.to },
         });
         if (!result.ok) {
+          if (result.status === 400 && result.data?.error === 'root_cause_required') {
+            alert('完了/クローズに進む前に「根本原因」を unknown 以外で確定してください。');
+            return;
+          }
           alert('状態変更エラー: ' + (result.data?.error || result.status));
           return;
         }
