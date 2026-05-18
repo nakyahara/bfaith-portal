@@ -606,6 +606,81 @@ function createTables() {
   );
   void mafsdCols; // Phase A 時点で全列 DDL に含まれてるので追加なし
 
+  // mirror_linegift_finance_sku_daily — LINEギフト Phase 1 A-3 (Render 側 daily fact mirror)
+  // miniPC の f_linegift_finance_sku_daily_v1 の payload を受信
+  // PK: (date_jst, sku_code) — sku_code = variation.code (LOWER(TRIM())、100% master_match 想定)
+  // 設計書 v0.5: g:/共有ドライブ/AI_reference/システム設計/LINEギフトPhase1設計書_v0.5_20260515.md §9
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_linegift_finance_sku_daily (
+    date_jst                          TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+    sku_code                          TEXT NOT NULL CHECK(trim(sku_code) <> ''),
+    ne_code                           TEXT,
+    parent_item_code                  TEXT NOT NULL DEFAULT '',
+    variant_key                       TEXT NOT NULL DEFAULT '',
+    resolution_method                 TEXT NOT NULL CHECK (
+      resolution_method IN ('master_match', 'parent_match', 'unresolved')
+    ),
+    unresolved_sku_flag               INTEGER NOT NULL DEFAULT 0,
+    product_name                      TEXT NOT NULL DEFAULT '',
+    units_ordered                     INTEGER NOT NULL DEFAULT 0,
+    units_cancelled                   INTEGER NOT NULL DEFAULT 0,
+    units_net_sold                    INTEGER NOT NULL DEFAULT 0,
+    sales_principal_jpy_incl          REAL NOT NULL DEFAULT 0,
+    gross_sales_jpy_incl              REAL NOT NULL DEFAULT 0,
+    mall_fee_jpy_incl                 REAL NOT NULL DEFAULT 0,
+    mall_fee_calc_method              TEXT NOT NULL DEFAULT 'actual_api' CHECK (
+      mall_fee_calc_method IN ('actual_api', 'actual_statement', 'estimated_rate', 'unknown')
+    ),
+    mall_fee_estimate_delta_jpy       REAL,
+    shipping_cost_jpy_incl            REAL NOT NULL DEFAULT 0,
+    shipping_quality                  TEXT NOT NULL CHECK (
+      shipping_quality IN ('no_shipping_in_api', 'actual_api', 'estimated_rates', 'estimated_fallback', 'missing')
+    ),
+    unit_cost_snapshot_incl           REAL,
+    cost_snapshot_date_jst            TEXT,
+    latest_unit_cost_reference_incl   REAL,
+    cogs_amount_jpy_incl              REAL NOT NULL DEFAULT 0,
+    variable_margin_jpy_incl          REAL NOT NULL DEFAULT 0,
+    refund_adjusted_net_sales_jpy_incl REAL,
+    margin_confidence                 TEXT NOT NULL DEFAULT 'provisional_full_candidate' CHECK (
+      margin_confidence IN ('provisional_full_candidate', 'full_minus_returns', 'full')
+    ),
+    margin_full_finalized_at          TEXT,
+    -- LINEギフト 特有 audit
+    recognized_on_jst                 TEXT,
+    bought_date_jst                   TEXT,
+    delivered_lag_days                INTEGER,
+    received_lag_days                 INTEGER,
+    is_delivery_by_hand               INTEGER,
+    delivery_agent                    TEXT,
+    -- 90日境界 frozen horizon
+    first_seen_in_api_at              TEXT,
+    last_seen_in_api_at               TEXT,
+    is_frozen_after_horizon           INTEGER NOT NULL DEFAULT 0,
+    -- 品質
+    cost_status                       TEXT NOT NULL CHECK (
+      cost_status IN ('complete', 'missing_cost', 'partial_cost', 'late_bound_after_close')
+    ),
+    is_cost_complete                  INTEGER NOT NULL DEFAULT 0,
+    data_quality_score                INTEGER NOT NULL DEFAULT 0
+                                      CHECK (data_quality_score BETWEEN 0 AND 100),
+    -- メタ
+    order_count                       INTEGER NOT NULL DEFAULT 0,
+    line_count                        INTEGER NOT NULL DEFAULT 0,
+    source_layer_summary              TEXT NOT NULL DEFAULT '',
+    source_row_count                  INTEGER NOT NULL DEFAULT 0,
+    built_at                          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    source_run_id                     TEXT NOT NULL,
+    source_row_hash                   TEXT NOT NULL,
+    synced_at                         TEXT NOT NULL,
+    PRIMARY KEY (date_jst, sku_code)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mlfsd_date   ON mirror_linegift_finance_sku_daily(date_jst)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mlfsd_ne     ON mirror_linegift_finance_sku_daily(ne_code)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mlfsd_month  ON mirror_linegift_finance_sku_daily(substr(date_jst, 1, 7))');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mlfsd_run    ON mirror_linegift_finance_sku_daily(source_run_id)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mlfsd_parent ON mirror_linegift_finance_sku_daily(parent_item_code)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mlfsd_frozen ON mirror_linegift_finance_sku_daily(is_frozen_after_horizon) WHERE is_frozen_after_horizon = 1');
+
   // mirror_amazon_sku_fees — Amazon手数料キャッシュ（粗利ダッシュボード用）
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_amazon_sku_fees (
     seller_sku          TEXT PRIMARY KEY,

@@ -1292,6 +1292,43 @@ function createTables() {
     updated_at            TEXT NOT NULL
   )`);
 
+  // ---- LINEギフト Phase 1 A-3: contract auto-seed (Codex R3 critical + R4 critical 反映)
+  // 将来別環境デプロイ時の手動 seed 漏れを防止。INSERT ... ON CONFLICT DO UPDATE (= UPSERT) で idempotent。
+  // ⚠️ INSERT OR REPLACE は SQLite で実は DELETE+INSERT になり、sync_runs.entity の外部キー違反で
+  //   initDB() が落ちる (sync_runs に履歴がある状態で 2回目以降の起動で発生、R4 critical 反映)。
+  // 既存の手動 seed SQL (sql/sync/seed_linegift_finance_sku_daily.sql) と完全同内容。
+  // TODO (将来別 PR): Amazon / 楽天 / Yahoo / au PAY も同様の auto-seed に統一する
+  db.exec(`
+    INSERT INTO sync_contracts (
+      entity, contract_version, source_system, source_object, target_table,
+      grain_definition, key_columns_json, payload_schema_json,
+      clear_strategy, apply_mode, enabled, owner, created_at, updated_at
+    ) VALUES (
+      'linegift_finance_sku_daily', 1, 'minipc-warehouse',
+      'f_linegift_finance_sku_daily_v1', 'mirror_linegift_finance_sku_daily',
+      'one row = one (date_jst, sku_code) — sku_code = variation.code (LOWER(TRIM())、LINEギフト の variant 主キー、100% master_match 想定)',
+      '["date_jst","sku_code"]',
+      '{"required":["date_jst","sku_code"],"date_jst_pattern":"^\\d{4}-\\d{2}-\\d{2}$","cost_status_enum":["complete","missing_cost","partial_cost","late_bound_after_close"],"resolution_method_enum":["master_match","parent_match","unresolved"],"shipping_quality_enum":["no_shipping_in_api","actual_api","estimated_rates","estimated_fallback","missing"],"margin_confidence_enum":["provisional_full_candidate","full_minus_returns","full"],"mall_fee_calc_method_enum":["actual_api","actual_statement","estimated_rate","unknown"]}',
+      'scope_clear_per_run', 'insert_or_replace', 1, 'phase1-linegift-finance',
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    )
+    ON CONFLICT(entity) DO UPDATE SET
+      contract_version    = excluded.contract_version,
+      source_system       = excluded.source_system,
+      source_object       = excluded.source_object,
+      target_table        = excluded.target_table,
+      grain_definition    = excluded.grain_definition,
+      key_columns_json    = excluded.key_columns_json,
+      payload_schema_json = excluded.payload_schema_json,
+      clear_strategy      = excluded.clear_strategy,
+      apply_mode          = excluded.apply_mode,
+      enabled             = excluded.enabled,
+      owner               = excluded.owner,
+      -- created_at は既存維持 (UPSERT 側で触らない)、updated_at のみ毎回更新
+      updated_at          = excluded.updated_at
+  `);
+
   // ---- Phase 1 #1-4a: sync_runs (run ledger、miniPC 側で sync 開始記録)
   // status 遷移: started → applied (全 chunk Render から 2xx)
   //              | → failed (途中失敗、error_message に記録)
