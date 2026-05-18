@@ -1244,7 +1244,12 @@ router.get('/register', (req, res) => {
   const db = getDB();
   let shippingRates = [];
   try { shippingRates = db.prepare('SELECT shipping_code, 小分類区分名称, 配送関係費合計 FROM shipping_rates ORDER BY shipping_code').all(); } catch {}
-  res.send(renderRegisterPage(shippingRates));
+  const sess = req.session || {};
+  res.send(renderRegisterPage(shippingRates, {
+    email: sess.email || '',
+    displayName: sess.displayName || '',
+    role: sess.role || '',
+  }));
 });
 
 // ─── ダッシュボード（HTML）───
@@ -1254,8 +1259,27 @@ router.get('/', (req, res) => {
   res.send(renderDashboard(stats));
 });
 
-function renderRegisterPage(shippingRates) {
-  const ratesJson = JSON.stringify(shippingRates);
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+const ROLE_LABELS = { admin: '管理者', user: 'ユーザー' };
+
+function jsonForScriptTag(value) {
+  return JSON.stringify(value).replace(/[<>\u2028\u2029]/g, (c) =>
+    '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0')
+  );
+}
+
+function renderRegisterPage(shippingRates, session = {}) {
+  const ratesJson = jsonForScriptTag(shippingRates);
+  const isAdmin = session.role === 'admin';
+  const userLabel = session.displayName || session.email || '';
+  const roleLabel = session.role ? (ROLE_LABELS[session.role] || session.role) : '';
+  const userBadge = userLabel
+    ? `<span class="user-info">${escapeHtml(userLabel)}${roleLabel ? ` (${escapeHtml(roleLabel)})` : ''}</span>`
+    : '';
+  const adminLink = isAdmin ? `<a href="/admin/users">ユーザー管理</a>` : '';
   return `<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -1265,10 +1289,13 @@ function renderRegisterPage(shippingRates) {
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
     body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f5f5;color:#333;font-size:14px}
-    .header{background:#1a5276;color:white;padding:12px 24px;display:flex;align-items:center;gap:16px}
-    .header h1{font-size:18px}
-    .header a{color:#aed6f1;text-decoration:none;font-size:13px}
+    .header{background:#1a5276;color:white;padding:12px 24px;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+    .header h1{font-size:18px;flex-shrink:0}
+    .header a{color:#aed6f1;text-decoration:none;font-size:13px;white-space:nowrap}
     .header a:hover{color:white}
+    .header .spacer{flex:1;min-width:0}
+    .header .user-info{font-size:13px;color:#d6eaf8;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .header .nav-links{display:flex;align-items:center;gap:14px;flex-wrap:wrap;justify-content:flex-end;min-width:0}
     .wrap{max-width:1100px;margin:16px auto;padding:0 16px}
     .card{background:white;border-radius:8px;padding:20px;margin-bottom:12px;box-shadow:0 1px 3px rgba(0,0,0,.1)}
     .card h2{font-size:15px;color:#555;margin-bottom:10px}
@@ -1319,7 +1346,13 @@ function renderRegisterPage(shippingRates) {
 <body>
   <div class="header">
     <h1>マスタ登録</h1>
-    <a href="./">← ダッシュボードに戻る</a>
+    <div class="spacer"></div>
+    <div class="nav-links">
+      ${userBadge}
+      ${adminLink}
+      <a href="/change-password">パスワード変更</a>
+      <a href="/logout">ログアウト</a>
+    </div>
   </div>
   <div class="wrap">
     <!-- 未登録件数サマリ -->
