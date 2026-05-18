@@ -20,7 +20,13 @@ let db = null;
 export function initMirrorDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   db = new Database(DB_FILE);
+  // PRAGMA は接続単位の設定。SQLite のデフォルトは foreign_keys=OFF / recursive_triggers=OFF なので、
+  // f_mis_shipments の FK 制約 と append-only trigger を機能させるために毎接続で明示する必要がある。
+  // 設計書: 誤出荷管理システム_設計書_v5.md (中身 v7.3) の「実装要件」セクション参照。
+  db.pragma('foreign_keys = ON');
   db.pragma('journal_mode = WAL');
+  db.pragma('busy_timeout = 5000');
+  db.pragma('recursive_triggers = ON');
   createTables();
   console.log('[Mirror] 初期化完了');
   return db;
@@ -1386,4 +1392,142 @@ function createTables() {
       WHERE r.status = 'success' AND r.scope IN ('all','base','bs_subaccount')
     )`);
   // ▲▲▲ MFクラウド会計ダッシュボード Phase 1a/1d-2/1d-3b 終了 ▲▲▲
+
+  // ▼▼▼ 誤出荷管理システム f_mis_shipments / f_mis_shipment_status_history ▼▼▼
+  // 設計書: g:/共有ドライブ/AI_reference/システム設計/誤出荷管理システム_設計書_v5.md (中身 v7.3)
+  // Codex 16 ラウンドレビュー完全 FIX、PR: feature/mis-shipment
+  createMisShipmentTables();
+}
+
+function createMisShipmentTables() {
+  // 正本テーブル (mirror_* と prefix で責任分離、こちらは Render 完結書込)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS f_mis_shipments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      client_submission_id TEXT NOT NULL UNIQUE,
+      payload_hash TEXT NOT NULL
+        CHECK (length(payload_hash) = 64 AND payload_hash NOT GLOB '*[^0-9a-f]*'),
+      version INTEGER NOT NULL DEFAULT 0,
+
+      occurred_on TEXT NOT NULL CHECK (occurred_on GLOB '????-??-??'),
+      reported_at TEXT NOT NULL,
+
+      mall_order_id TEXT
+        CHECK (mall_order_id IS NULL OR length(mall_order_id) <= 100),
+      order_id_unknown INTEGER NOT NULL DEFAULT 0
+        CHECK (order_id_unknown IN (0, 1)),
+      mall TEXT
+        CHECK (mall IS NULL OR mall IN
+          ('amazon','rakuten','yahoo','linegift','mercari','aupay','qoo10','other')),
+      sku_snapshot TEXT
+        CHECK (sku_snapshot IS NULL OR length(sku_snapshot) <= 100),
+      product_name_snapshot TEXT,
+      ordered_qty_snapshot INTEGER,
+      order_date_snapshot TEXT,
+      lookup_source TEXT NOT NULL
+        CHECK (lookup_source IN ('mirror_auto','manual','unknown')),
+
+      mis_type TEXT NOT NULL
+        CHECK (mis_type IN
+          ('wrong_item','wrong_qty','damage','missing','wrong_address','mix_up','other')),
+      qty_affected INTEGER NOT NULL CHECK (qty_affected BETWEEN 1 AND 1000),
+      loss_amount_jpy INTEGER NOT NULL DEFAULT 0
+        CHECK (loss_amount_jpy BETWEEN 0 AND 10000000),
+
+      process_stage TEXT NOT NULL
+        CHECK (process_stage IN
+          ('picking','packing','labeling','inspection','handover','unknown')),
+      root_cause_stage TEXT NOT NULL DEFAULT 'unknown'
+        CHECK (root_cause_stage IN
+          ('receiving','supplier','master_data','picking','packing','labeling',
+           'inspection','system','other','unknown')),
+      root_cause_note TEXT
+        CHECK (root_cause_note IS NULL OR length(root_cause_note) <= 2000),
+
+      mix_up_group_id TEXT,
+
+      status TEXT NOT NULL DEFAULT 'reported'
+        CHECK (status IN ('reported','investigating','resolved','closed')),
+      reporter_note TEXT
+        CHECK (reporter_note IS NULL OR length(reporter_note) <= 2000),
+
+      reported_by TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      updated_by TEXT NOT NULL,
+      deleted_at TEXT,
+      deleted_by TEXT,
+
+      CHECK (
+        (order_id_unknown = 1 AND mall_order_id IS NULL AND lookup_source = 'unknown')
+        OR
+        (order_id_unknown = 0 AND mall_order_id IS NOT NULL)
+      ),
+      CHECK (
+        (lookup_source = 'unknown'
+           AND mall IS NULL
+           AND sku_snapshot IS NULL
+           AND product_name_snapshot IS NULL
+           AND ordered_qty_snapshot IS NULL
+           AND order_date_snapshot IS NULL)
+        OR
+        (lookup_source IN ('mirror_auto','manual') AND mall IS NOT NULL)
+      ),
+      -- mix_up_group_id は mix_up 時のみ存在、それ以外では必ず NULL (Codex round 14 high 指摘: 両方向制約)
+      CHECK (
+        (mis_type = 'mix_up' AND mix_up_group_id IS NOT NULL)
+        OR
+        (mis_type != 'mix_up' AND mix_up_group_id IS NULL)
+      )
+    )
+  `);
+
+  // 状態履歴 (append-only、trigger で UPDATE/DELETE/REPLACE を全部ブロック)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS f_mis_shipment_status_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      mis_shipment_id INTEGER NOT NULL REFERENCES f_mis_shipments(id),
+      from_status TEXT
+        CHECK (from_status IS NULL OR from_status IN
+          ('reported','investigating','resolved','closed')),
+      to_status TEXT NOT NULL
+        CHECK (to_status IN ('reported','investigating','resolved','closed')),
+      changed_by TEXT NOT NULL,
+      changed_at TEXT NOT NULL,
+      change_note TEXT
+    )
+  `);
+
+  // append-only 強制 trigger (Codex round 14/15 指摘)
+  // recursive_triggers = ON で REPLACE INTO 経由の内部 DELETE もブロック
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS trg_mis_status_history_no_update
+      BEFORE UPDATE ON f_mis_shipment_status_history
+      BEGIN
+        SELECT RAISE(ABORT, 'f_mis_shipment_status_history is append-only (UPDATE forbidden)');
+      END
+  `);
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS trg_mis_status_history_no_delete
+      BEFORE DELETE ON f_mis_shipment_status_history
+      BEGIN
+        SELECT RAISE(ABORT, 'f_mis_shipment_status_history is append-only (DELETE forbidden)');
+      END
+  `);
+
+  // インデックス (partial 多用、deleted_at NULL 条件)
+  // 注: client_submission_id は UNIQUE 制約で SQLite 自動 index あり、明示 index は不要
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_mis_occurred
+             ON f_mis_shipments(occurred_on) WHERE deleted_at IS NULL`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_mis_mall_occurred
+             ON f_mis_shipments(mall, occurred_on) WHERE deleted_at IS NULL`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_mis_status
+             ON f_mis_shipments(status) WHERE deleted_at IS NULL`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_mis_order_id
+             ON f_mis_shipments(mall_order_id) WHERE deleted_at IS NULL`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_mis_mix_up_group
+             ON f_mis_shipments(mix_up_group_id) WHERE mix_up_group_id IS NOT NULL`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_status_hist
+             ON f_mis_shipment_status_history(mis_shipment_id, changed_at)`);
+  // ▲▲▲ 誤出荷管理システム ▲▲▲
 }
