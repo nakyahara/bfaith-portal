@@ -1,0 +1,106 @@
+/* 誤出荷管理アプリ専用スタイル
+ * 設計書: g:/共有ドライブ/AI_reference/システム設計/誤出荷管理システム_UI_mock_v7.3.md
+ * B型施設アクセシビリティ: 大きいタップ領域、色非依存、確認ダイアログ
+ */
+
+.mis-main { max-width: 1100px; margin: 1rem auto; padding: 0 1rem; }
+.mis-main h2.form-title { margin-top: 0; }
+
+.actions-bar { display: flex; gap: 1rem; margin: 1rem 0 2rem; flex-wrap: wrap; }
+.btn-primary-large, .btn-secondary-large {
+  padding: 0.8rem 1.5rem; font-size: 1.05rem; border-radius: 6px;
+  text-decoration: none; display: inline-block; min-height: 44px; min-width: 44px;
+  border: 2px solid transparent; cursor: pointer;
+}
+.btn-primary-large { background: #2563eb; color: #fff; border-color: #1d4ed8; }
+.btn-primary-large:hover { background: #1d4ed8; }
+.btn-secondary-large { background: #f3f4f6; color: #1f2937; border-color: #d1d5db; }
+.btn-secondary-large:hover { background: #e5e7eb; }
+.btn-primary { padding: 0.5rem 1rem; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; }
+.btn-secondary { padding: 0.5rem 1rem; background: #f3f4f6; color: #1f2937; border: 1px solid #d1d5db; border-radius: 4px; cursor: pointer; text-decoration: none; display: inline-block; }
+
+.filter-form { display: flex; gap: 1rem; flex-wrap: wrap; align-items: flex-end; background: #f9fafb; padding: 1rem; border-radius: 6px; margin-bottom: 1rem; }
+.filter-form label { display: flex; flex-direction: column; font-size: 0.9rem; gap: 0.3rem; }
+.filter-form input, .filter-form select { padding: 0.4rem; border: 1px solid #d1d5db; border-radius: 4px; min-height: 36px; }
+
+.result-table { width: 100%; border-collapse: collapse; }
+.result-table th, .result-table td { padding: 0.6rem 0.5rem; border-bottom: 1px solid #e5e7eb; text-align: left; font-size: 0.95rem; }
+.result-table th { background: #f3f4f6; }
+.result-table td.num { text-align: right; }
+.result-table tr.row-mix-up { background: #fef3c7; }  /* テレコは黄色背景で識別 (色のみ依存しないように mis_type 列にもアイコン表示) */
+.result-table td.status-reported { color: #b45309; font-weight: bold; }
+.result-table td.status-investigating { color: #1d4ed8; font-weight: bold; }
+.result-table td.status-resolved { color: #047857; font-weight: bold; }
+.result-table td.status-closed { color: #6b7280; }
+.loading, .empty { text-align: center; color: #6b7280; padding: 2rem; }
+
+.results-summary { color: #6b7280; font-size: 0.9rem; }
+
+/* ─── new.ejs ─── */
+.mis-form-main { max-width: 900px; }
+.mis-form { display: flex; flex-direction: column; gap: 1.2rem; }
+.mis-form fieldset { border: 1px solid #d1d5db; border-radius: 6px; padding: 1rem; }
+.mis-form legend { font-weight: bold; padding: 0 0.5rem; }
+.form-row { display: flex; flex-direction: column; gap: 0.4rem; margin-bottom: 1rem; }
+.form-row .label { font-weight: 500; }
+.form-row em { color: #dc2626; font-style: normal; }
+.form-row input[type="text"], .form-row input[type="date"], .form-row input[type="number"], .form-row textarea, .form-row select {
+  padding: 0.6rem; border: 1px solid #d1d5db; border-radius: 4px; font-size: 1rem; min-height: 44px;
+}
+.form-row .form-unit { color: #6b7280; margin-left: 0.3rem; }
+
+.radio-group.large-targets { display: flex; flex-wrap: wrap; gap: 0.6rem; }
+.radio-group.large-targets label {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  padding: 0.7rem 1rem; border: 2px solid #d1d5db; border-radius: 6px;
+  min-height: 44px; min-width: 44px; cursor: pointer; background: #fff;
+}
+.radio-group.large-targets label:has(input:checked) { border-color: #2563eb; background: #dbeafe; }
+
+.order-id-row { display: flex; gap: 0.5rem; }
+.order-id-row input { flex: 1; }
+.btn-lookup { padding: 0.6rem 1rem; background: #f3f4f6; border: 1px solid #d1d5db; border-radius: 4px; cursor: pointer; min-height: 44px; }
+.order-unknown { flex-direction: row; align-items: center; gap: 0.5rem; }
+.order-unknown input { width: auto; min-height: auto; }
+
+.lookup-result { background: #ecfdf5; border: 1px solid #6ee7b7; border-radius: 6px; padding: 1rem; margin: 0.5rem 0; }
+.lookup-result h4 { margin: 0 0 0.5rem; color: #047857; }
+.lookup-info { display: grid; grid-template-columns: max-content 1fr; gap: 0.3rem 1rem; margin: 0; }
+.lookup-info dt { color: #6b7280; font-size: 0.9rem; }
+.lookup-info dd { margin: 0; font-weight: 500; }
+.multi-line-warn { color: #b45309; font-size: 0.9rem; margin: 0.5rem 0 0; }
+.lookup-error { background: #fef2f2; border: 1px solid #fca5a5; border-radius: 6px; padding: 1rem; margin: 0.5rem 0; color: #991b1b; }
+
+.mixup-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+@media (max-width: 768px) { .mixup-pair { grid-template-columns: 1fr; } }
+
+.form-actions { display: flex; gap: 1rem; justify-content: flex-end; padding-top: 1rem; border-top: 1px solid #e5e7eb; }
+.form-note { color: #6b7280; font-size: 0.9rem; margin: 0.5rem 0; }
+.back-link { margin: 0 0 1rem; }
+
+/* ─── 確認ダイアログ ─── */
+#confirm-dialog { border: 1px solid #d1d5db; border-radius: 8px; padding: 1.5rem; max-width: 600px; width: 90%; }
+#confirm-dialog::backdrop { background: rgba(0, 0, 0, 0.4); }
+#confirm-dialog h3 { margin-top: 0; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 1rem; margin-top: 1rem; }
+
+/* ─── 詳細画面 ─── */
+.mis-detail-main { max-width: 900px; }
+.detail-section { background: #f9fafb; border-radius: 6px; padding: 1rem; margin: 1rem 0; }
+.detail-section h3 { margin: 0 0 0.5rem; font-size: 1rem; color: #1f2937; }
+.detail-section .info-row { display: grid; grid-template-columns: max-content 1fr; gap: 0.3rem 1rem; }
+.detail-section .info-row dt { color: #6b7280; }
+.detail-section .info-row dd { margin: 0; }
+.status-stepper { display: flex; gap: 0.5rem; align-items: center; margin: 0.5rem 0; flex-wrap: wrap; }
+.status-step { padding: 0.4rem 0.8rem; border-radius: 4px; background: #e5e7eb; }
+.status-step.active { background: #2563eb; color: #fff; font-weight: bold; }
+.status-step.passed { background: #6ee7b7; color: #064e3b; }
+.transition-buttons { display: flex; gap: 0.5rem; margin-top: 0.5rem; flex-wrap: wrap; }
+.transition-buttons button { padding: 0.6rem 1rem; border-radius: 4px; cursor: pointer; min-height: 44px; }
+.transition-buttons button:disabled { background: #f3f4f6; color: #9ca3af; cursor: not-allowed; border: 1px solid #e5e7eb; }
+.transition-buttons button.admin-only { border: 2px dashed #6b7280; }
+.history-table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+.history-table td { padding: 0.4rem; border-bottom: 1px solid #e5e7eb; }
+.history-table .append-only-note { color: #6b7280; font-size: 0.85rem; padding: 0.5rem 0; }
+.related-link { display: inline-block; padding: 0.6rem 1rem; background: #fef3c7; border-radius: 6px; text-decoration: none; color: #78350f; margin: 0.3rem 0; }
+.related-link:hover { background: #fde68a; }

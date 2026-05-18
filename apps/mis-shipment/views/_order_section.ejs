@@ -1,0 +1,38 @@
+<% const sfx = sideId ? '_' + sideId : '' %>
+<label class="form-row">
+  <span class="label">注文番号 <em>*</em></span>
+  <div class="order-id-row">
+    <input type="text" name="mall_order_id<%= sfx %>" maxlength="100" placeholder="例: 503-1234567-1234567" autocomplete="off">
+    <button type="button" class="btn-lookup" data-side="<%= sideId %>">🔍 検索</button>
+  </div>
+</label>
+<label class="form-row order-unknown">
+  <input type="checkbox" name="order_id_unknown<%= sfx %>" class="order-unknown-check" data-side="<%= sideId %>">
+  <span>注文番号不明 (在庫紛失等の場合のみチェック)</span>
+</label>
+<div class="lookup-result" id="lookup-result-<%= sideId || 'single' %>" hidden>
+  <h4>✅ 検索結果 (サーバが POST 時に再取得します)</h4>
+  <dl class="lookup-info">
+    <dt>モール</dt><dd data-field="mall">-</dd>
+    <dt>商品名</dt><dd data-field="product_name">-</dd>
+    <dt>SKU</dt><dd data-field="sku">-</dd>
+    <dt>注文日</dt><dd data-field="order_date">-</dd>
+    <dt>注文数量</dt><dd data-field="ordered_qty">-</dd>
+  </dl>
+  <p class="multi-line-warn" hidden>⚠️ この注文は複数明細あり (このフォームでは先頭明細を表示)</p>
+</div>
+<div class="lookup-error" id="lookup-error-<%= sideId || 'single' %>" hidden>
+  <p>⚠️ 注文が見つかりませんでした。番号を確認するか、「注文番号不明」をチェックしてください。</p>
+</div>
+<% if (mixUp) { %>
+<label class="form-row">
+  <span class="label">影響数量 <em>*</em></span>
+  <input type="number" name="qty_affected<%= sfx %>" min="1" max="1000" value="1" required>
+  <span class="form-unit">個</span>
+</label>
+<label class="form-row">
+  <span class="label">損失額 <em>*</em></span>
+  <input type="number" name="loss_amount_jpy<%= sfx %>" min="0" max="10000000" value="0" required>
+  <span class="form-unit">円</span>
+</label>
+<% } %>
