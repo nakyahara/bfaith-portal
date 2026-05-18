@@ -230,8 +230,11 @@ async function main() {
   const aupayResult = runScript('apps/warehouse/aupay-orders.js 7', 'au PAY マーケット', 3600000);
   results.push({ name: 'au PAY', ...aupayResult });
 
-  // Qoo10
-  const qoo10Result = runScript('apps/warehouse/mall-orders.js qoo10', 'Qoo10');
+  // Qoo10 Phase 1 A-1 (2026-05-18、設計書 v0.11)
+  // mall-orders.js fetchQoo10 (packNo を PK 使用、grain 崩壊バグ持ち、~17,252 行) を廃止
+  // → qoo10-orders.js (新規) に置換、orderNo を PK + 90日 frozen horizon + 30列保持
+  // 旧 raw は migrate_legacy_raw_qoo10_orders.sql で 'legacy:%' prefix + legacy_fields_missing=1 にマイグレ済
+  const qoo10Result = runScript('apps/warehouse/qoo10-orders.js 90', 'Qoo10');
   results.push({ name: 'Qoo10', ...qoo10Result });
 
   // LINEギフト Phase 1 A-1 (2026-05-15、設計書 v0.5)
