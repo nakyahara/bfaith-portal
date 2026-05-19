@@ -59,7 +59,14 @@ WITH base AS (
   SELECT
     substr(order_date, 1, 10) AS date_jst,
     order_id,
-    LOWER(TRIM(seller_item_code)) AS sku_code,
+    -- 2026-05-19 A-2 patch: 3 段 fallback 用の 3 つのキー候補を silver に保持
+    -- Codex R2 patch High #1 反映: GROUP BY 用 internal key と m_products lookup 用 key を分離
+    --   - combined_internal: 区切り文字 char(31) 入りで連結衝突不能 (('ab','c') vs ('a','bc') の事故防止)
+    --   - lookup_combined  : 区切り無し (Qoo10 実 SKU 命名規則 = seller || opt、m_products と一致)
+    LOWER(TRIM(seller_item_code)) AS raw_sku,                                 -- seller_item_code 単独 (tier3、lookup 兼用)
+    LOWER(TRIM(COALESCE(option_code, ''))) AS raw_opt,                        -- option_code 単独 (tier2、空文字なら NULL 扱い)
+    LOWER(TRIM(seller_item_code) || COALESCE(TRIM(option_code), '')) AS lookup_combined, -- m_products 突合用 (tier1 lookup key、命名規則準拠 = 区切り無し)
+    LOWER(TRIM(seller_item_code)) || char(31) || LOWER(TRIM(COALESCE(option_code, ''))) AS combined_internal, -- GROUP BY 用、衝突不能 internal key
     LOWER(TRIM(COALESCE(item_code, ''))) AS parent_item_code,
     COALESCE(option_info, '') AS variant_key,
     COALESCE(item_title, '') AS product_name,
@@ -134,7 +141,8 @@ SELECT
   END AS settle_price_formula_match
 FROM base;
 
-CREATE INDEX _silver_qoo10_v1_idx ON _silver_qoo10_delivered_v1 (date_jst, sku_code);
+-- 2026-05-19 A-2 patch: GROUP BY 用に combined_internal で index (衝突不能 key)
+CREATE INDEX _silver_qoo10_v1_idx ON _silver_qoo10_delivered_v1 (date_jst, combined_internal);
 
 -- ─── Step 2 + 3: UPSERT 本体 (按分なし、daily_aggregated + sku_resolved + cost_lookup を CTE で組み立て) ───
 -- 同時に Step 3 で _silver_qoo10_resolved_keys を作る (Step 3.6 orphan delete 用、Codex R1 #3)
@@ -147,7 +155,7 @@ CREATE TEMP TABLE _silver_qoo10_resolved_keys (
 
 -- daily_aggregated + sku_resolved + cost_lookup は CTE で組み立てて UPSERT に流す
 INSERT INTO f_qoo10_finance_sku_daily_v1 (
-  date_jst, sku_code, ne_code, qoo10_item_id, parent_item_code, variant_key, resolution_method, unresolved_sku_flag, product_name,
+  date_jst, sku_code, ne_code, qoo10_item_id, parent_item_code, variant_key, resolution_method, match_tier, unresolved_sku_flag, product_name,
   units_ordered, units_cancelled, units_net_sold,
   gmv_list_price_jpy_incl, customer_paid_jpy_incl, net_settlement_api_jpy_incl,
   platform_fee_jpy_incl, mall_fee_calc_method, settle_price_formula_scope,
@@ -170,7 +178,13 @@ WITH
 daily_aggregated AS (
   SELECT
     date_jst,
-    sku_code,
+    -- 2026-05-19 A-2 patch: GROUP BY は combined_internal (区切り入り、衝突不能 = Codex R2 patch High #1)
+    -- 旧 (seller_item_code 単独) では variation 商品が 1 行に潰れて variation 別売上が見えなかった。
+    combined_internal,
+    -- 各 tier 候補も保持 (sku_resolved CTE で 3 段 fallback を試すため、GROUP 内代表値 = 一意)
+    MAX(lookup_combined) AS lookup_combined,
+    MAX(raw_sku) AS raw_sku,
+    MAX(raw_opt) AS raw_opt,
     MAX(parent_item_code) AS parent_item_code,
     MAX(variant_key) AS variant_key,
     MAX(product_name) AS product_name,
@@ -219,28 +233,57 @@ daily_aggregated AS (
     COUNT(DISTINCT order_id) AS order_count,
     COUNT(*) AS line_count
   FROM _silver_qoo10_delivered_v1
-  GROUP BY date_jst, sku_code
+  GROUP BY date_jst, combined_internal
+),
+-- 2026-05-19 A-2 patch: 3 段 fallback (combined → option_only → seller_only → unresolved)
+-- Codex 助言: m_products を mp_norm で 1 回正規化、LEFT JOIN 3 本で tier と ne_code を 1 pass 解決
+-- Codex R2 patch Medium #1 反映: 商品コード重複対策で GROUP BY で一意化、MIN で安定値選択
+mp_norm AS (
+  SELECT LOWER(TRIM(商品コード)) AS k, MIN(商品コード) AS ne_code
+  FROM m_products
+  GROUP BY LOWER(TRIM(商品コード))
 ),
 sku_resolved AS (
   SELECT
     da.date_jst,
-    da.sku_code AS raw_sku_code,
-    -- master_match のみ (v0.8 で parent_match 削除)
-    (SELECT 商品コード FROM m_products WHERE LOWER(TRIM(商品コード)) = da.sku_code LIMIT 1) AS ne_code,
+    da.combined_internal,
+    da.lookup_combined,
+    da.raw_sku,
+    da.raw_opt,
+    -- tier 判定: COALESCE で優先順位、JOIN 結果 (mp_*.ne_code) の NULL/NOT NULL で tier 確定
     CASE
-      WHEN EXISTS (SELECT 1 FROM m_products WHERE LOWER(TRIM(商品コード)) = da.sku_code) THEN 'master_match'
+      WHEN mp_c.ne_code IS NOT NULL THEN 'combined'
+      WHEN da.raw_opt <> '' AND mp_o.ne_code IS NOT NULL THEN 'option_only'
+      WHEN mp_s.ne_code IS NOT NULL THEN 'seller_only'
+      ELSE 'unresolved'
+    END AS match_tier,
+    -- ne_code: hit したキーの 商品コード (tier 優先順位で COALESCE、unresolved 時は NULL)
+    COALESCE(mp_c.ne_code,
+             CASE WHEN da.raw_opt <> '' THEN mp_o.ne_code END,
+             mp_s.ne_code) AS ne_code,
+    -- resolution_method は後方互換 2 値 (master_match / unresolved)、内訳は match_tier で
+    CASE
+      WHEN mp_c.ne_code IS NOT NULL
+        OR (da.raw_opt <> '' AND mp_o.ne_code IS NOT NULL)
+        OR mp_s.ne_code IS NOT NULL
+        THEN 'master_match'
       ELSE 'unresolved'
     END AS resolution_method,
-    -- sku_code 確定 (unresolved 時は '__UNRESOLVED__:' prefix で UPSERT key 化、Codex R3 High #3)
+    -- sku_code 確定: tier に応じた m_products 突合 lookup キー、unresolved 時は '__UNRESOLVED__:' || lookup_combined で deterministic
     CASE
-      WHEN EXISTS (SELECT 1 FROM m_products WHERE LOWER(TRIM(商品コード)) = da.sku_code) THEN da.sku_code
-      ELSE '__UNRESOLVED__:' || da.sku_code
+      WHEN mp_c.ne_code IS NOT NULL THEN da.lookup_combined
+      WHEN da.raw_opt <> '' AND mp_o.ne_code IS NOT NULL THEN da.raw_opt
+      WHEN mp_s.ne_code IS NOT NULL THEN da.raw_sku
+      ELSE '__UNRESOLVED__:' || da.lookup_combined
     END AS sku_code_resolved
   FROM daily_aggregated da
+  LEFT JOIN mp_norm mp_c ON mp_c.k = da.lookup_combined
+  LEFT JOIN mp_norm mp_o ON da.raw_opt <> '' AND mp_o.k = da.raw_opt
+  LEFT JOIN mp_norm mp_s ON mp_s.k = da.raw_sku
 ),
 cost_lookup AS (
   SELECT
-    sr.date_jst, sr.raw_sku_code, sr.ne_code, sr.resolution_method, sr.sku_code_resolved,
+    sr.date_jst, sr.combined_internal, sr.match_tier, sr.ne_code, sr.resolution_method, sr.sku_code_resolved,
     CASE
       WHEN COALESCE(eg.genka, mp.原価) IS NOT NULL
         THEN COALESCE(eg.genka, mp.原価) * (1 + COALESCE(mp.消費税率, 0.10))
@@ -264,6 +307,7 @@ SELECT
   c.parent_item_code,
   c.variant_key,
   cl.resolution_method,
+  cl.match_tier,
   CASE WHEN cl.ne_code IS NULL THEN 1 ELSE 0 END AS unresolved_sku_flag,
   c.product_name,
   c.units_ordered, 0 AS units_cancelled, c.units_ordered AS units_net_sold,
@@ -337,13 +381,14 @@ SELECT
   c.line_count AS source_row_count,
   CURRENT_TIMESTAMP AS built_at
 FROM daily_aggregated c
-JOIN cost_lookup cl ON cl.date_jst = c.date_jst AND cl.raw_sku_code = c.sku_code
+JOIN cost_lookup cl ON cl.date_jst = c.date_jst AND cl.combined_internal = c.combined_internal
 ON CONFLICT (date_jst, sku_code) DO UPDATE SET
   ne_code                              = excluded.ne_code,
   qoo10_item_id                        = excluded.qoo10_item_id,
   parent_item_code                     = excluded.parent_item_code,
   variant_key                          = excluded.variant_key,
   resolution_method                    = excluded.resolution_method,
+  match_tier                           = excluded.match_tier,
   unresolved_sku_flag                  = excluded.unresolved_sku_flag,
   product_name                         = excluded.product_name,
   units_ordered                        = excluded.units_ordered,
@@ -400,16 +445,28 @@ ON CONFLICT (date_jst, sku_code) DO UPDATE SET
   built_at                             = excluded.built_at;
 
 -- ─── Step 3 (続): _silver_qoo10_resolved_keys を埋める (orphan delete 用) ───
+-- 2026-05-19 A-2 patch: 3 段 fallback で sku_code 確定 (UPSERT 側と完全同型のロジック)
+-- Codex 助言: mp_norm CTE で m_products を 1 回正規化 (GROUP BY で重複排除)、LEFT JOIN 3 本で 1 pass 解決
+-- lookup_combined (区切り無し、m_products 突合用) を JOIN キーに、combined_internal は不要
+WITH mp_norm AS (
+  SELECT LOWER(TRIM(商品コード)) AS k FROM m_products GROUP BY LOWER(TRIM(商品コード))
+),
+silver_keys AS (
+  SELECT DISTINCT date_jst, lookup_combined, raw_opt, raw_sku FROM _silver_qoo10_delivered_v1
+)
 INSERT OR IGNORE INTO _silver_qoo10_resolved_keys (date_jst, sku_code)
 SELECT
   da.date_jst,
   CASE
-    WHEN EXISTS (SELECT 1 FROM m_products WHERE LOWER(TRIM(商品コード)) = da.sku_code) THEN da.sku_code
-    ELSE '__UNRESOLVED__:' || da.sku_code
+    WHEN mp_c.k IS NOT NULL THEN da.lookup_combined
+    WHEN da.raw_opt <> '' AND mp_o.k IS NOT NULL THEN da.raw_opt
+    WHEN mp_s.k IS NOT NULL THEN da.raw_sku
+    ELSE '__UNRESOLVED__:' || da.lookup_combined
   END AS sku_code_resolved
-FROM (
-  SELECT DISTINCT date_jst, sku_code FROM _silver_qoo10_delivered_v1
-) da;
+FROM silver_keys da
+LEFT JOIN mp_norm mp_c ON mp_c.k = da.lookup_combined
+LEFT JOIN mp_norm mp_o ON da.raw_opt <> '' AND mp_o.k = da.raw_opt
+LEFT JOIN mp_norm mp_s ON mp_s.k = da.raw_sku;
 
 -- ─── Step 3.6: 集合ベース orphan delete (Codex R1 Critical #3 + R2 High #5 反映) ───
 -- raw 直接突合をやめ、Step 3 で生成した _silver_qoo10_resolved_keys を使う

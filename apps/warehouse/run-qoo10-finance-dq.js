@@ -2,13 +2,13 @@
 /**
  * run-qoo10-finance-dq.js — Qoo10 Phase 1 A-2 DQ gate
  *
- * monthly validation: f_qoo10_finance_sku_daily_v1 (A-2 で構築) の品質指標を 15 check で評価し
+ * monthly validation: f_qoo10_finance_sku_daily_v1 (A-2 で構築) の品質指標を 16 check で評価し
  * `dq_run_results` に severity 付きで記録。severity='error' が 1 件以上あれば exit 1 (gate failure)。
  *
  * 使い方:
  *   DATA_DIR=C:/Users/bfaith/bfaith-portal/data node apps/warehouse/run-qoo10-finance-dq.js --month 2026-05
  *
- * 15 check (severity / threshold、設計書 v0.11 §8):
+ * 16 check (severity / threshold、設計書 v0.11 §8 + 2026-05-19 A-2 patch #16):
  *   1. row_count_drift                        (error: rows=0、当月 ratio<0.5 で warn)
  *   2. listing_diff_pct                       (info only、Codex R1 #4 反映で gate 解除) — f_sales_by_listing (qoo10) vs net_settlement_api 突合、構造的 diff 前提で監視のみ
  *   3. missing_cost_rate_pct                  (warn 5% / error 10%)
@@ -24,6 +24,7 @@
  *  13. legacy_fields_missing_active_count     (Qoo10 特有、info) — 旧 raw 由来で fact 対象外の件数監視 (移行完了度の見える化)
  *  14. gross_zero_row_count                   (Qoo10 特有、warn: 1件以上、Codex R3 Medium #4) — silver で gross = order_price × order_qty = 0 の異常行件数
  *  15. frozen_unresolved_observation          (Qoo10 特有、info、Codex R11 Low #1) — frozen 受容済 unresolved 行の可視化、vw_qoo10_finance_horizon_status 経由
+ *  16. match_tier_distribution                (Qoo10 特有、info、2026-05-19 A-2 patch) — 3 段 fallback (combined/option_only/seller_only/unresolved) tier 分布、Qoo10 命名規則変化早期検知
  *
  * 設計書: g:/共有ドライブ/AI_reference/システム設計/Qoo10Phase1設計書_v0.11_20260518.md §8
  */
@@ -61,6 +62,7 @@ const THRESHOLDS_PAST = {
   legacy_fields_missing_active_count:    { warn: 999999, error: 999999 }, // info 固定
   gross_zero_row_count:                  { warn: 1,    error: 999 },   // 1 件以上 warn
   frozen_unresolved_observation:         { warn: 999999, error: 999999 }, // info 固定
+  match_tier_distribution:               { warn: 999999, error: 999999 }, // info 固定 (2026-05-19 A-2 patch)
 };
 const THRESHOLDS_CURRENT = {
   ...THRESHOLDS_PAST,
@@ -283,6 +285,35 @@ recordResult('frozen_unresolved_observation', 'info',
   fuo?.frozen_unresolved_row_count || 0,
   THRESHOLDS.frozen_unresolved_observation.warn,
   { frozen_unresolved_row_count: fuo?.frozen_unresolved_row_count || 0, frozen_unresolved_gmv_jpy: fuo?.frozen_unresolved_gmv_jpy || 0, oldest_frozen_date: fuo?.oldest_frozen_date, frozen_resolved_row_count: fuo?.frozen_resolved_row_count || 0, note: 'frozen 受容済 unresolved 監視、Phase 2 移植判断指標' });
+
+// Check 16: match_tier_distribution (2026-05-19 A-2 patch、3 段 fallback 監視、info)
+// combined / option_only / seller_only / unresolved の月別件数比率を監視、
+// option_only や seller_only が急増したら Qoo10 命名規則の変化を示唆 = API 仕様揺れ早期検知
+// Codex R1 patch Low #1 反映: match_tier 列が未導入の DB (旧 schema) では skip して info 記録 (no such column 防止)
+const factCols = db.prepare("PRAGMA table_info(f_qoo10_finance_sku_daily_v1)").all().map(c => c.name);
+if (factCols.includes('match_tier')) {
+  const mt = db.prepare(`
+    SELECT
+      SUM(CASE WHEN match_tier='combined' THEN 1 ELSE 0 END) AS combined_cnt,
+      SUM(CASE WHEN match_tier='option_only' THEN 1 ELSE 0 END) AS option_only_cnt,
+      SUM(CASE WHEN match_tier='seller_only' THEN 1 ELSE 0 END) AS seller_only_cnt,
+      SUM(CASE WHEN match_tier='unresolved' THEN 1 ELSE 0 END) AS unresolved_cnt,
+      COUNT(*) AS total
+    FROM f_qoo10_finance_sku_daily_v1 WHERE substr(date_jst,1,7) = ?
+  `).get(monthStr);
+  const combinedPct = mt.total > 0 ? mt.combined_cnt / mt.total * 100 : 0;
+  recordResult('match_tier_distribution', 'info', combinedPct, 100, {
+    combined_count: mt.combined_cnt,
+    option_only_count: mt.option_only_cnt,
+    seller_only_count: mt.seller_only_cnt,
+    unresolved_count: mt.unresolved_cnt,
+    total_rows: mt.total,
+    combined_pct: combinedPct.toFixed(2),
+    note: '3 段 fallback の tier 分布、option_only/seller_only 急増で Qoo10 命名規則変化警告 (将来 Qoo10 API 仕様揺れ早期検知)'
+  });
+} else {
+  recordResult('match_tier_distribution', 'info', null, 100, { skipped: true, note: 'match_tier 列未導入 DB (旧 schema)、build 実行で ALTER 適用後に有効化' });
+}
 
 function printSummary() {
   console.log('\n--- DQ check summary ---');

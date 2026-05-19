@@ -17,11 +17,17 @@
 --   - 'full' (Phase B 完了): 精算 CSV 統合 + refund 確定 = margin 確定
 --   - 'partial_legacy_fields_missing': 旧 raw 由来 (実質 0 件、fact 対象外 = この値は理論上発生しない)
 --
--- SKU 解決 1 段 (v0.7 で manual_map 削除、v0.8 で parent_match 削除):
---   1. m_products WHERE LOWER(TRIM(商品コード)) = LOWER(TRIM(seller_item_code))  (= master_match)
---   2. NULL → unresolved_sku_flag = 1
+-- SKU 解決 3 段 fallback (2026-05-19 A-2 後 patch、データ verify 後変更):
+--   ★ Qoo10 variation 商品の実 SKU = seller_item_code + option_code (例 ayuveta + -pi = ayuveta-pi)
+--   旧 v0.11 設計 (seller_item_code 単独) は variation 商品で unresolved 12% を生む不整合判明、
+--   3 段 fallback に改修して unresolved ~0% を達成。match_tier 列で tier 分布を DQ 監視。
+--   1. tier='combined'    : LOWER(TRIM(seller_item_code || option_code)) (variation 含む、第一優先)
+--   2. tier='option_only' : LOWER(TRIM(option_code)) (option_code 側が完全 SKU 形式の例外、ana-001 等)
+--   3. tier='seller_only' : LOWER(TRIM(seller_item_code)) (variation なし商品、旧ロジック互換)
+--   4. tier='unresolved'  : 全 tier miss、'__UNRESOLVED__:' || combined_key で deterministic key 化
 --     - NE 在庫連携前提で原則 ~0% 想定、>0 で NE 在庫連携設定要確認 alert
 --     - frozen 過去 unresolved は受容 (R10 中原さん判断、Phase 1 で修復しない)
+--   resolution_method は 'master_match' (= tier 1-3 いずれか hit) / 'unresolved' の 2 値のまま (後方互換)
 --
 -- Qoo10 特有 (vs LINEギフト):
 --   - メガ割 (年4回×13日、20% off): discount > 0 AND discount/gross ≈ 0.20 を行レベル判別
@@ -50,6 +56,11 @@ CREATE TABLE IF NOT EXISTS f_qoo10_finance_sku_daily_v1 (
   variant_key         TEXT NOT NULL DEFAULT '',         -- = option_info
   resolution_method   TEXT NOT NULL CHECK (
     resolution_method IN ('master_match', 'unresolved')
+  ),
+  -- 2026-05-19 A-2 patch: 3 段 fallback (combined / option_only / seller_only / unresolved)
+  -- resolution_method は後方互換のため 2 値のまま、tier 内訳は match_tier で監視
+  match_tier          TEXT NOT NULL DEFAULT 'unresolved' CHECK (
+    match_tier IN ('combined', 'option_only', 'seller_only', 'unresolved')
   ),
   unresolved_sku_flag INTEGER NOT NULL DEFAULT 0,
   product_name        TEXT NOT NULL DEFAULT '',

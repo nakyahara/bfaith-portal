@@ -93,6 +93,23 @@ try {
   console.log('--- 1. DDL exec ---');
   db.exec(ddlSql);  console.log('  ✓ f_qoo10_finance_sku_daily_v1 + views applied');
 
+  // 2026-05-19 A-2 patch: 既存テーブルに match_tier 列がなければ ALTER TABLE で追加。
+  // CREATE TABLE IF NOT EXISTS では既存テーブルへの列追加ができないため、PRAGMA で判定して migrate。
+  // ⚠️ ALTER 直後の既存行は DEFAULT 'unresolved' で埋まるが、本 script は rolling 3 ヶ月を毎回 rebuild するため
+  //    対象月の match_tier は UPSERT で正しく更新される。rolling 範囲外の月で既存行が残っている場合は
+  //    --month YYYY-MM --single-month で 1 回追加 rebuild すれば良い (Codex R1 patch Medium #2 反映)。
+  const existingCols = db.prepare("PRAGMA table_info(f_qoo10_finance_sku_daily_v1)").all().map(c => c.name);
+  if (!existingCols.includes('match_tier')) {
+    console.log('  → match_tier 列なし → ALTER TABLE ADD COLUMN (既存行は DEFAULT "unresolved"、rolling 月 rebuild で更新)');
+    db.exec(`
+      ALTER TABLE f_qoo10_finance_sku_daily_v1
+      ADD COLUMN match_tier TEXT NOT NULL DEFAULT 'unresolved'
+      CHECK (match_tier IN ('combined', 'option_only', 'seller_only', 'unresolved'))
+    `);
+    const orphanCount = db.prepare(`SELECT COUNT(*) AS c FROM f_qoo10_finance_sku_daily_v1 WHERE substr(date_jst,1,7) NOT IN (${targetMonths.map(m => `'${m}'`).join(',')})`).get().c;
+    console.log(`  ✓ match_tier column added (rolling 範囲外で 'unresolved' のまま残る行: ${orphanCount}、必要なら追加 rebuild)`);
+  }
+
   // build SQL を ; で分割 (コメントのみ statement は除外、LINEギフト 同型)
   const statements = rawBuildSql.split(';').map(s => s.trim()).filter(s => {
     if (!s) return false;
@@ -148,6 +165,10 @@ try {
         SUM(CASE WHEN cost_status='missing_cost' THEN 1 ELSE 0 END) AS missing_cnt,
         SUM(unresolved_sku_flag) AS unresolved_cnt,
         SUM(CASE WHEN resolution_method='master_match' THEN 1 ELSE 0 END) AS master_cnt,
+        SUM(CASE WHEN match_tier='combined' THEN 1 ELSE 0 END) AS tier_combined_cnt,
+        SUM(CASE WHEN match_tier='option_only' THEN 1 ELSE 0 END) AS tier_option_cnt,
+        SUM(CASE WHEN match_tier='seller_only' THEN 1 ELSE 0 END) AS tier_seller_cnt,
+        SUM(CASE WHEN match_tier='unresolved' THEN 1 ELSE 0 END) AS tier_unresolved_cnt,
         SUM(is_frozen_after_horizon) AS frozen_cnt,
         SUM(CASE WHEN settle_price_formula_scope='domestic_non_cod' THEN 1 ELSE 0 END) AS scope_dnoncod,
         SUM(CASE WHEN settle_price_formula_scope='oversea' THEN 1 ELSE 0 END) AS scope_oversea,
@@ -177,6 +198,7 @@ try {
     console.log(`  品質:`);
     console.log(`    cost_status complete / missing: ${s.complete_cnt?.toLocaleString()} / ${s.missing_cnt?.toLocaleString()}`);
     console.log(`    SKU 解決 master_match / unresolved: ${s.master_cnt?.toLocaleString()} / ${s.unresolved_cnt?.toLocaleString()}`);
+    console.log(`    match_tier: combined ${s.tier_combined_cnt} / option_only ${s.tier_option_cnt} / seller_only ${s.tier_seller_cnt} / unresolved ${s.tier_unresolved_cnt}`);
     console.log(`    frozen_after_horizon: ${s.frozen_cnt?.toLocaleString()}`);
     console.log(`    avg delivered lag: ${s.avg_delivered_lag_days?.toFixed(1) || 'n/a'} 日`);
 
