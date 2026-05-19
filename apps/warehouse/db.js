@@ -1329,6 +1329,39 @@ function createTables() {
       updated_at          = excluded.updated_at
   `);
 
+  // ---- Qoo10 Phase 1 A-3: contract auto-seed (LINEギフト同型パターン、2026-05-19)
+  // sku_code は 3 段 fallback (combined / option_only / seller_only) 後の解決値 or '__UNRESOLVED__:%'
+  // resolution_method は 2 値 ('master_match'/'unresolved')、match_tier 列で 4 値内訳監視
+  db.exec(`
+    INSERT INTO sync_contracts (
+      entity, contract_version, source_system, source_object, target_table,
+      grain_definition, key_columns_json, payload_schema_json,
+      clear_strategy, apply_mode, enabled, owner, created_at, updated_at
+    ) VALUES (
+      'qoo10_finance_sku_daily', 1, 'minipc-warehouse',
+      'f_qoo10_finance_sku_daily_v1', 'mirror_qoo10_finance_sku_daily',
+      'one row = one (date_jst, sku_code) — sku_code = 3 段 fallback (combined/option_only/seller_only) 後の解決値、unresolved は __UNRESOLVED__:%',
+      '["date_jst","sku_code"]',
+      '{"required":["date_jst","sku_code"],"date_jst_pattern":"^\\d{4}-\\d{2}-\\d{2}$","cost_status_enum":["complete","missing_cost","partial_cost","late_bound_after_close"],"resolution_method_enum":["master_match","unresolved"],"match_tier_enum":["combined","option_only","seller_only","unresolved"],"shipping_quality_enum":["no_shipping_in_api","actual_api","estimated_rates","estimated_fallback","missing"],"margin_confidence_enum":["partial_pending_settlement_csv","partial_minus_returns","full","partial_legacy_fields_missing"],"mall_fee_calc_method_enum":["actual_api","actual_statement","estimated_rate","unknown"],"settle_price_formula_scope_enum":["domestic_non_cod","oversea","cod","mixed"],"shop_promo_burden_status_enum":["pending_settlement_csv","actual_statement","not_applicable"]}',
+      'scope_clear_per_run', 'insert_or_replace', 1, 'phase1-qoo10-finance',
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    )
+    ON CONFLICT(entity) DO UPDATE SET
+      contract_version    = excluded.contract_version,
+      source_system       = excluded.source_system,
+      source_object       = excluded.source_object,
+      target_table        = excluded.target_table,
+      grain_definition    = excluded.grain_definition,
+      key_columns_json    = excluded.key_columns_json,
+      payload_schema_json = excluded.payload_schema_json,
+      clear_strategy      = excluded.clear_strategy,
+      apply_mode          = excluded.apply_mode,
+      enabled             = excluded.enabled,
+      owner               = excluded.owner,
+      updated_at          = excluded.updated_at
+  `);
+
   // ---- Phase 1 #1-4a: sync_runs (run ledger、miniPC 側で sync 開始記録)
   // status 遷移: started → applied (全 chunk Render から 2xx)
   //              | → failed (途中失敗、error_message に記録)

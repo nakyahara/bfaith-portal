@@ -478,6 +478,63 @@ async function main() {
       }
       console.log(`[DailySync] LINEギフト finance DQ/sync 3か月分は build 失敗のため skipped 記録 (build retry 後に翌 cron で実行)`);
     }
+
+    // ─── Qoo10 Phase 1 A-3 (LINEギフト同型、2026-05-19) ───
+    // 1. f_qoo10_finance_sku_daily_v1 build (rolling: 当月 + 前2か月、whitelist shipping_status='Delivered(5)')
+    // 2. DQ gate (16 check、severity error で exit 1)
+    // 3. mirror_qoo10_finance_sku_daily へ sync (chunk POST + ledger)
+    // build 失敗で DQ/sync スキップ、各月の DQ failure でその月の sync のみスキップ
+    const qoo10FinanceBuildResult = runScript(
+      `scripts/qoo10-finance/build-qoo10-daily-fact.js --data-dir ${DATA_DIR_ARG} --month ${currentMonth}`,
+      'Qoo10 finance build', 600000
+    );
+    results.push({ name: 'Qoo10 finance build', ...qoo10FinanceBuildResult });
+
+    if (qoo10FinanceBuildResult.success) {
+      const qoo10RollingMonths = [0, 1, 2].map((n) => {
+        const [y, m] = currentMonth.split('-').map(Number);
+        const d = new Date(Date.UTC(y, m - 1 - n, 1));
+        return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+      });
+      for (const ym of qoo10RollingMonths) {
+        const qoo10FinanceDqResult = runScript(
+          `apps/warehouse/run-qoo10-finance-dq.js --data-dir ${DATA_DIR_ARG} --month ${ym}`,
+          `Qoo10 finance DQ ${ym}`, 300000
+        );
+        results.push({ name: `Qoo10 finance DQ ${ym}`, ...qoo10FinanceDqResult });
+
+        if (qoo10FinanceDqResult.success) {
+          const qoo10FinanceSyncResult = runScript(
+            `apps/warehouse/sync-qoo10-finance-daily.js --data-dir ${DATA_DIR_ARG} --month ${ym}`,
+            `Qoo10 finance sync ${ym}`, 600000
+          );
+          results.push({ name: `Qoo10 finance sync ${ym}`, ...qoo10FinanceSyncResult });
+        } else {
+          // DQ failure 時: blocked:true (retry 除外) + dq_fail:true (exit 1 トリガー、設計書 v0.11 §9-1)
+          results.push({
+            name: `Qoo10 finance sync ${ym}`,
+            success: false,
+            skipped: true,
+            blocked: true,
+            dq_fail: true,
+            summary: `⏸️ skipped: DQ gate failure ${ym} (品質不正データの mirror 投入防止)`,
+          });
+          console.log(`[DailySync] Qoo10 finance sync ${ym} は DQ gate failure のため skipped 記録 (dq_fail=true、daily-sync は exit 1)`);
+        }
+      }
+    } else {
+      // build failure 時も 3 か月分の DQ/sync を skipped 記録 (LINEギフト同型)
+      const qoo10RollingMonths = [0, 1, 2].map((n) => {
+        const [y, m] = currentMonth.split('-').map(Number);
+        const d = new Date(Date.UTC(y, m - 1 - n, 1));
+        return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+      });
+      for (const ym of qoo10RollingMonths) {
+        results.push({ name: `Qoo10 finance DQ ${ym}`, success: false, skipped: true, blocked: true, summary: `⏸️ skipped: build failure (${currentMonth} の build が失敗、翌 cron で retry)` });
+        results.push({ name: `Qoo10 finance sync ${ym}`, success: false, skipped: true, blocked: true, summary: `⏸️ skipped: build failure (${currentMonth} の build が失敗、翌 cron で retry)` });
+      }
+      console.log(`[DailySync] Qoo10 finance DQ/sync 3か月分は build 失敗のため skipped 記録 (build retry 後に翌 cron で実行)`);
+    }
   }
 
   // 楽天 AM/AL/W → NE商品コード sku_map 再構築 (f_sales と独立)
@@ -729,6 +786,21 @@ async function main() {
   await notify(msg);
 
   console.log(`[DailySync] 完了: ${endTime.toISOString()}`);
+
+  // Codex (Qoo10 A-3) Critical #1 + R2 High #1 + R3 Low #1 反映: DQ gate failure 時のみ exit non-zero。
+  //   設計書 v0.11 §9-1: 「DQ error 時 mirror sync 中止 + exit non-zero」
+  //   ただし既存 blocked:true は retry-failed-jobs.js の除外用途 (memory: feedback_blocked_field_for_retry_exclusion.md)
+  //   = build failure (一時障害、翌 cron で build retry → 連鎖回復) も blocked:true で積んでる用途混在。
+  //   → 新フラグ dq_fail:true を「DQ gate failure (恒久ブロック)」のみに立てて exit 1 はそれに紐付ける。
+  //   blocked セマンティクスは既存 (retry 除外) のまま維持、retry filter 挙動への影響なし。
+  // ⚠️ TODO (Codex R3 Low #1): 現状 dq_fail を立ててるのは Qoo10 のみ。LINEギフト/au PAY/楽天/Yahoo の
+  //   DQ failure 経路にも同フラグ立てを横展開する別 PR を切ること。pushDqFailureResult() ヘルパー化推奨。
+  const hasDqFail = results.some(r => r.dq_fail === true);
+  if (hasDqFail) {
+    const dqFailNames = results.filter(r => r.dq_fail === true).map(r => r.name).join(', ');
+    console.error(`[DailySync] exit 1: DQ gate failure あり (設計書 v0.11 §9-1、mirror sync 中止): ${dqFailNames}`);
+    process.exit(1);
+  }
 }
 
 main().catch(async (e) => {
