@@ -186,8 +186,19 @@ try {
     console.log(`    cogs (snapshot × units):           -¥${s.cogs?.toLocaleString()}`);
     console.log(`    shipping_cost (店負担):            -¥${s.shipping?.toLocaleString()}`);
     console.log(`    variable_margin (net-cogs-ship):    ¥${s.margin?.toLocaleString()}`);
-    const pct = s.net_settle > 0 ? (s.margin / s.net_settle * 100).toFixed(2) : 'n/a';
-    console.log(`    粗利率 (partial_pending_settlement_csv): ${pct}%`);
+    // 粗利率を 4 通り表示 (中原さん 2026-05-19 確定: 「原価と送料を引いた率」両方見たい)
+    //   ★ 商品粗利 = gmv - cogs - shipping (手数料引かず) = 「この商品を送って原価+送料引いたら何%残るか」
+    //   ★ 正味受取粗利 = net_settle - cogs - shipping (= variable_margin) = 手数料も引いた後の実効率
+    const productMargin = (s.gmv_list || 0) - (s.cogs || 0) - (s.shipping || 0);
+    const pmRateGmv = s.gmv_list > 0 ? (productMargin / s.gmv_list * 100).toFixed(2) : 'n/a';
+    const pmRateNet = s.net_settle > 0 ? (productMargin / s.net_settle * 100).toFixed(2) : 'n/a';
+    const vmRateGmv = s.gmv_list > 0 ? ((s.margin || 0) / s.gmv_list * 100).toFixed(2) : 'n/a';
+    const vmRateNet = s.net_settle > 0 ? ((s.margin || 0) / s.net_settle * 100).toFixed(2) : 'n/a';
+    console.log(`    ─────────────────────────────────────`);
+    console.log(`    ★ 商品粗利     (gmv - cogs - shipping): ¥${productMargin.toLocaleString()}`);
+    console.log(`         ÷ 売上(gmv) = ${pmRateGmv}% / ÷ 受取(net) = ${pmRateNet}%`);
+    console.log(`    ★ 正味受取粗利 (net - cogs - shipping): ¥${(s.margin || 0).toLocaleString()}  (= variable_margin、partial_pending_settlement_csv)`);
+    console.log(`         ÷ 売上(gmv) = ${vmRateGmv}% / ÷ 受取(net) = ${vmRateNet}%`);
     console.log(`  promo (行レベル判別):`);
     console.log(`    megawari (~20% off):  ${s.megawari_cnt?.toLocaleString()} 注文 / ¥${s.megawari_amt?.toLocaleString()}`);
     console.log(`    megapo   (~10% off):  ${s.megapo_cnt?.toLocaleString()} 注文 / ¥${s.megapo_amt?.toLocaleString()}`);
