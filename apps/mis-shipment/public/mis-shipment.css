@@ -110,3 +110,23 @@
 .lookup-info dd.matched { background: #fef3c7; padding: 0.1rem 0.4rem; border-radius: 3px; font-weight: bold; }
 .matched-note { color: #78350f; background: #fef3c7; padding: 0.4rem 0.6rem; border-radius: 4px; margin: 0.5rem 0 0; font-size: 0.9rem; }
 .hint { color: #6b7280; font-size: 0.85rem; display: block; margin-top: 0.3rem; }
+
+
+/* ─── ダッシュボード (Phase G) ─── */
+.mis-dashboard { max-width: 1200px; }
+.period-form { display: flex; gap: 1rem; flex-wrap: wrap; align-items: flex-end; background: #f9fafb; padding: 1rem; border-radius: 6px; margin-bottom: 1rem; }
+.period-form label { display: flex; flex-direction: column; gap: 0.3rem; font-size: 0.9rem; }
+.period-form select, .period-form input { padding: 0.4rem; border: 1px solid #d1d5db; border-radius: 4px; min-height: 36px; }
+.period-label-text { color: #6b7280; font-size: 0.9rem; align-self: center; }
+
+.kpi-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; margin: 1rem 0; }
+.kpi-card { background: #f9fafb; border: 1px solid #d1d5db; border-radius: 8px; padding: 1rem; }
+.kpi-card.kpi-warn { background: #fef2f2; border-color: #fca5a5; }
+.kpi-card.kpi-ok { background: #ecfdf5; border-color: #6ee7b7; }
+.kpi-label { font-size: 0.9rem; color: #6b7280; margin-bottom: 0.4rem; }
+.kpi-value { font-size: 2rem; font-weight: bold; color: #1f2937; margin-bottom: 0.4rem; }
+.kpi-detail { font-size: 0.85rem; color: #4b5563; line-height: 1.4; }
+
+.dashboard-section { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+.dashboard-section h3 { margin: 0 0 0.8rem; font-size: 1.05rem; color: #1f2937; }
+.chart-wrap { position: relative; height: 320px; }
