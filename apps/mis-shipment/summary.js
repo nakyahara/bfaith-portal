@@ -158,14 +158,21 @@ export function getKpiForPeriod(db, { from, to }) {
   const totalLoss = aggRow.total_loss;
   const shippedOrders = shipRow.shipped_orders;
 
+  // KPI 設計 (Codex round 2 high 指摘対応、2026-05-19):
+  //   - mirror_sales_daily.注文数 SUM は「SKU × モール × 日」の合計 = 受注ライン数 (line count)。
+  //     注文単位ではない。1 注文に複数 SKU があれば line count はその商品数だけ重複加算される。
+  //   - したがって分母は line count なので、分子も line count で揃える必要がある。
+  //   - 主 KPI は「誤出荷件数率 (Mis-shipment Incident Rate) = incidents / shipped_line_count」。
+  //     業界 ODR (注文単位) ではないが、1 注文 1 ライン主体の小売 EC では近似一致する。
+  //   - distinct_orders は参考値として保持 (mall_order_id の delta 監査用)。order_rate_pct は計算しない (分母にユニーク注文数がない)。
   return {
-    incidents,
-    distinct_orders: distinctOrders,
-    shipped_orders: shippedOrders,
+    incidents,                                  // 件数 (f_mis_shipments 行数)
+    distinct_orders: distinctOrders,            // (参考) ユニーク注文数 (mall_order_id ベース)
+    shipped_line_count: shippedOrders,          // 受注ライン数 (mirror_sales_daily.注文数 SUM)
     total_loss_jpy: totalLoss,
-    error_rate_pct: shippedOrders > 0 ? (distinctOrders * 100 / shippedOrders) : null,
+    // 主 KPI: 件数ベース、業界 0.10% 目標との近似比較
     incident_rate_pct: shippedOrders > 0 ? (incidents * 100 / shippedOrders) : null,
-    loss_per_1000_orders_jpy: shippedOrders > 0 ? Math.round(totalLoss * 1000 / shippedOrders) : null,
+    loss_per_1000_lines_jpy: shippedOrders > 0 ? Math.round(totalLoss * 1000 / shippedOrders) : null,
   };
 }
 
@@ -235,13 +242,14 @@ export function getMonthlyTrend(db, { today }, monthsBack = 6) {
       WHERE 日付 >= ?
         AND 日付 < ?
     `).get(monthStart, monthEnd);
+    // 件数ベースの incident rate (上の getKpiForPeriod と同じ粒度)
     const rate = ship.shipped > 0 ? (mis.incidents * 100 / ship.shipped) : null;
     return {
       month: monthStart.slice(0, 7),  // 'YYYY-MM'
       incidents: mis.incidents,
       loss_jpy: mis.loss_jpy,
-      shipped_orders: ship.shipped,
-      error_rate_pct: rate,
+      shipped_line_count: ship.shipped,
+      incident_rate_pct: rate,
     };
   });
   return trend;
@@ -278,7 +286,7 @@ export function getMisShipmentDashboard(options = {}) {
     diff: {
       incidents: current.incidents - previous.incidents,
       total_loss_jpy: current.total_loss_jpy - previous.total_loss_jpy,
-      error_rate_pct_diff: (current.error_rate_pct ?? 0) - (previous.error_rate_pct ?? 0),
+      incident_rate_pct_diff: (current.incident_rate_pct ?? 0) - (previous.incident_rate_pct ?? 0),
     },
     top_skus: topSkus,
     top_root_causes: topRootCauses,
@@ -303,13 +311,12 @@ export function getMisShipmentNotifySummary(options = {}) {
     period_label: cur.label,
     period_start: cur.from,
     period_end_inclusive: addDays(cur.to, -1),
-    error_rate_pct: kpi.error_rate_pct,
-    incident_rate_pct: kpi.incident_rate_pct,
+    incident_rate_pct: kpi.incident_rate_pct,   // 主 KPI (件数ベース)
     incidents: kpi.incidents,
-    distinct_orders: kpi.distinct_orders,
-    shipped_orders: kpi.shipped_orders,
+    distinct_orders: kpi.distinct_orders,        // (参考)
+    shipped_line_count: kpi.shipped_line_count,
     industry_target_pct: 0.10,
-    over_target: kpi.error_rate_pct != null && kpi.error_rate_pct > 0.10,
+    over_target: kpi.incident_rate_pct != null && kpi.incident_rate_pct > 0.10,
     top_sku: topSkus.length > 0 ? topSkus[0] : null,
     top_root_cause: topRootCauses.length > 0 ? topRootCauses[0] : null,
   };

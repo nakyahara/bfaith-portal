@@ -171,19 +171,20 @@ export function formatNotificationMessage(summary) {
   lines.push(`※FBA系在庫は別ロジック/別ツールで管理。上記の撤退・警戒は判定対象${fmtYen(target.value)}に対する判定です。`);
 
   // ── 5. 誤出荷セクション (Phase G、損失額抜きで率と件数のみ) ──
+  // KPI 定義: 件数ベース (件数 / 出荷ライン数)。業界 ODR 0.10% との近似比較。
   if (summary._misShipment) {
     const m = summary._misShipment;
     lines.push('');
     lines.push('──────────');
     const periodLabel = m.period_label || '今月累計';
     lines.push(`*誤出荷 (${periodLabel}):*`);
-    if (m.error_rate_pct == null) {
-      lines.push('  出荷総数 0 のため算出不可');
+    if (m.incident_rate_pct == null) {
+      lines.push('  出荷ライン数 0 のため算出不可');
     } else {
-      const rateStr = m.error_rate_pct.toFixed(2) + '%';
+      const rateStr = m.incident_rate_pct.toFixed(2) + '%';
       const targetStr = m.industry_target_pct.toFixed(2) + '%';
       const warn = m.over_target ? ' ⚠️ オーバー' : ' ✅';
-      lines.push(`  誤出荷率: ${rateStr} (${m.incidents}件 / ${m.shipped_orders.toLocaleString()}注文)${warn}  目標 ≤ ${targetStr}`);
+      lines.push(`  誤出荷件数率: ${rateStr} (${m.incidents}件 / ${m.shipped_line_count.toLocaleString()}ライン)${warn}  目標 ≤ ${targetStr}`);
     }
     if (m.top_sku) {
       const skuMall = m.top_sku.mall ? ` (${m.top_sku.mall})` : '';

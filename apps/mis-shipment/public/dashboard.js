@@ -113,7 +113,7 @@
     const prev = d.previous;
     const diff = d.diff;
     const target = d.industry_target_pct;
-    const overTarget = cur.error_rate_pct != null && cur.error_rate_pct > target;
+    const overTarget = cur.incident_rate_pct != null && cur.incident_rate_pct > target;
     const lossDiff = diff.total_loss_jpy;
     const lossDiffPct = prev.total_loss_jpy > 0 ? (lossDiff * 100 / prev.total_loss_jpy) : null;
 
@@ -121,11 +121,12 @@
       <!-- KPI カード 4 つ -->
       <section class="kpi-cards">
         <div class="kpi-card ${overTarget ? 'kpi-warn' : 'kpi-ok'}">
-          <div class="kpi-label">📈 誤出荷率</div>
-          <div class="kpi-value">${fmtPct(cur.error_rate_pct)}</div>
+          <div class="kpi-label">📈 誤出荷件数率</div>
+          <div class="kpi-value">${fmtPct(cur.incident_rate_pct)}</div>
           <div class="kpi-detail">
-            ${cur.distinct_orders} 件 / ${cur.shipped_orders.toLocaleString()} 注文<br>
-            業界目標 ≤ ${fmtPct(target)}  ${overTarget ? '⚠️ オーバー' : '✅'}
+            ${cur.incidents} 件 / ${cur.shipped_line_count.toLocaleString()} ライン<br>
+            業界目標 ≤ ${fmtPct(target)}  ${overTarget ? '⚠️ オーバー' : '✅'}<br>
+            <small style="color:#6b7280">※ 件数ベース (1注文1ライン主体で業界 ODR 近似)</small>
           </div>
         </div>
         <div class="kpi-card">
@@ -145,10 +146,10 @@
           </div>
         </div>
         <div class="kpi-card">
-          <div class="kpi-label">💰 千件あたり損失</div>
-          <div class="kpi-value">${fmtYen(cur.loss_per_1000_orders_jpy)}</div>
+          <div class="kpi-label">💰 千ライン当り損失</div>
+          <div class="kpi-value">${fmtYen(cur.loss_per_1000_lines_jpy)}</div>
           <div class="kpi-detail">
-            注文1,000件あたり<br>
+            出荷ライン1,000あたり<br>
             (出荷量補正済み)
           </div>
         </div>
@@ -220,7 +221,7 @@
 
     const labels = trend.map(t => t.month);
     const incidents = trend.map(t => t.incidents);
-    const errorRates = trend.map(t => t.error_rate_pct);
+    const rates = trend.map(t => t.incident_rate_pct);
 
     trendChart = new Chart(ctx, {
       type: 'bar',
@@ -237,8 +238,8 @@
           },
           {
             type: 'line',
-            label: '誤出荷率 (%)',
-            data: errorRates,
+            label: '誤出荷件数率 (%)',
+            data: rates,
             borderColor: 'rgba(37, 99, 235, 1)',
             backgroundColor: 'rgba(37, 99, 235, 0.1)',
             yAxisID: 'y2',
@@ -261,7 +262,7 @@
           y2: {
             type: 'linear',
             position: 'right',
-            title: { display: true, text: '誤出荷率 (%)' },
+            title: { display: true, text: '誤出荷件数率 (%)' },
             beginAtZero: true,
             grid: { drawOnChartArea: false },
           },
