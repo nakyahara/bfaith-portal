@@ -1464,34 +1464,46 @@ function createTables() {
   db.exec(`CREATE VIEW v_mirror_mf_balance_snapshot_monthly_latest AS
     SELECT m.* FROM mirror_mf_balance_snapshot_monthly m
     WHERE m.run_id = (SELECT MAX(run_id) FROM mirror_mf_publish_runs WHERE status = 'success' AND scope IN ('all','base','balance_snapshot_monthly'))`);
-  // ---- biz-ops-overview: 全モール売上日次統合 view (2026-05-19、Codex consultation 反映)
+  // ---- mirror_f_sales_by_listing — biz-ops-overview 業務目線の全モール売上 mirror (2026-05-19 PR #155)
+  // 旧 (PR #153): Phase 1 fact (mirror_*_finance_sku_daily) を view で UNION → 業務売上と 60%+ 乖離
+  // 新: miniPC f_sales_by_listing をそのまま mirror、業務目線の真の売上を Render に同期
+  // PK: (日付, モール, モール商品コード, チャネル) — miniPC f_sales_by_listing と同型
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_f_sales_by_listing (
+    日付              TEXT NOT NULL,
+    月                TEXT NOT NULL,
+    モール            TEXT NOT NULL,
+    モール商品コード  TEXT NOT NULL,
+    チャネル          TEXT NOT NULL DEFAULT '',
+    商品名            TEXT,
+    数量              INTEGER NOT NULL DEFAULT 0,
+    売上金額          REAL,
+    注文数            INTEGER,
+    データソース      TEXT,
+    updated_at        TEXT NOT NULL,
+    source_run_id     TEXT NOT NULL,
+    source_row_hash   TEXT NOT NULL,
+    synced_at         TEXT NOT NULL,
+    PRIMARY KEY (日付, モール, モール商品コード, チャネル)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mfsbl_date   ON mirror_f_sales_by_listing(日付)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mfsbl_mall   ON mirror_f_sales_by_listing(モール, 日付)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mfsbl_month  ON mirror_f_sales_by_listing(月)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mfsbl_run    ON mirror_f_sales_by_listing(source_run_id)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mfsbl_item   ON mirror_f_sales_by_listing(モール商品コード, 日付)'); // Codex R1 M1 反映: source 同型 index
+
+  // ---- biz-ops-overview: 全モール売上日次統合 view (2026-05-19 PR #155、f_sales_by_listing 経由)
   // 用途: biz-ops-overview ダッシュボード + GChat 売上サマリ通知の単一データソース
-  // 売上 = 顧客支払額 (税込、手数料引かず、中原さん 2026-05-19 確定)
-  //   - Amazon (sales_principal_jpy 税抜): × 1.10 で税込換算 (軽減税率 SKU は過大評価の可能性、Phase 2 で SKU 別税率対応検討)
-  //   - 楽天/Yahoo/au PAY/LINEギフト: sales_principal_jpy_incl そのまま (税込)
-  //   - Qoo10: gmv_list_price_jpy_incl そのまま (= orderPrice × qty、税込)
-  //   - メルカリ: mirror 無し、Phase 2 で NE 連携で追加
+  // 売上 = 顧客支払額 (税込、手数料引かず、API 直接集計、業務目線の真の売上)
+  // 7 モール全部 (Amazon/楽天/Yahoo/au PAY/LINEギフト/Qoo10/メルカリ) カバー
   db.exec('DROP VIEW IF EXISTS v_mall_sales_daily_unified');
   db.exec(`CREATE VIEW v_mall_sales_daily_unified AS
-    SELECT 'amazon' AS mall, date_jst,
-      ROUND(sales_principal_jpy * 1.10, 0) AS sales_gross_jpy_incl,
-      units_net_sold, 'mirror_amazon_finance_sku_daily' AS source_fact
-    FROM mirror_amazon_finance_sku_daily
-    UNION ALL
-    SELECT 'rakuten', date_jst, sales_principal_jpy_incl, units_net_sold, 'mirror_rakuten_finance_sku_daily'
-    FROM mirror_rakuten_finance_sku_daily
-    UNION ALL
-    SELECT 'yahoo', date_jst, sales_principal_jpy_incl, units_net_sold, 'mirror_yahoo_finance_sku_daily'
-    FROM mirror_yahoo_finance_sku_daily
-    UNION ALL
-    SELECT 'aupay', date_jst, sales_principal_jpy_incl, units_net_sold, 'mirror_aupay_finance_sku_daily'
-    FROM mirror_aupay_finance_sku_daily
-    UNION ALL
-    SELECT 'linegift', date_jst, sales_principal_jpy_incl, units_net_sold, 'mirror_linegift_finance_sku_daily'
-    FROM mirror_linegift_finance_sku_daily
-    UNION ALL
-    SELECT 'qoo10', date_jst, gmv_list_price_jpy_incl, units_net_sold, 'mirror_qoo10_finance_sku_daily'
-    FROM mirror_qoo10_finance_sku_daily`);
+    SELECT
+      モール AS mall,
+      日付 AS date_jst,
+      売上金額 AS sales_gross_jpy_incl,
+      数量 AS units_net_sold,
+      'mirror_f_sales_by_listing' AS source_fact
+    FROM mirror_f_sales_by_listing`);
 
   db.exec('DROP VIEW IF EXISTS v_mirror_mf_anomaly_signals_latest');
   db.exec(`CREATE VIEW v_mirror_mf_anomaly_signals_latest AS

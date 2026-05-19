@@ -716,6 +716,24 @@ function getQoo10FinanceInsert(db) {
   return b.qoo10FinanceInsert;
 }
 
+function getFSalesByListingInsert(db) {
+  const b = getStmtBundle(db);
+  if (!b.fSalesByListingInsert) {
+    b.fSalesByListingInsert = db.prepare(`
+      INSERT OR REPLACE INTO mirror_f_sales_by_listing (
+        日付, 月, モール, モール商品コード, チャネル,
+        商品名, 数量, 売上金額, 注文数, データソース, updated_at,
+        source_run_id, source_row_hash, synced_at
+      ) VALUES (
+        @date, @month, @mall, @item_code, @channel,
+        @item_name, @qty, @sales_jpy, @order_count, @data_source, @updated_at,
+        @source_run_id, @source_row_hash, @synced_at
+      )
+    `);
+  }
+  return b.fSalesByListingInsert;
+}
+
 function getLedgerInsert(db) {
   const b = getStmtBundle(db);
   if (!b.ledgerInsert) {
@@ -875,6 +893,14 @@ const ENTITY_REGISTRY = {
     clear_meta_key: 'clear_qoo10_finance_dates',
     getInsertStmt: getQoo10FinanceInsert,
     normalizeRow: (r) => normalizeQoo10FinanceRow(r),
+  },
+  f_sales_by_listing: {
+    contract_version: 1,
+    mirror_table: 'mirror_f_sales_by_listing',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_f_sales_by_listing_dates',
+    getInsertStmt: getFSalesByListingInsert,
+    normalizeRow: (r) => normalizeFSalesByListingRow(r),
   },
 
   // ─── MF Phase 1a (Codex 5ラウンド確定設計) ─────────────────────────
@@ -1388,6 +1414,34 @@ function normalizeLinegiftFinanceRow(r) {
     source_row_count: r.source_row_count ?? 0,
     built_at: r.built_at || new Date().toISOString(),
     source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,
+    synced_at: r.synced_at,
+  };
+}
+
+// row 列正規化 (mirror_f_sales_by_listing 用、PR #155 biz-ops-overview)
+// miniPC f_sales_by_listing は日本語列、payload では英語キー (sync runner 側で対応 mapping)
+// Codex R1 M2 反映: ?? に統一 (空文字を未指定扱いしない)、必須列は明示バリデーション
+function normalizeFSalesByListingRow(r) {
+  const date = r.date ?? r['日付'];
+  const month = r.month ?? r['月'];
+  const mall = r.mall ?? r['モール'];
+  const item_code = r.item_code ?? r['モール商品コード'];
+  // 必須列バリデーション (空文字 or 未定義はエラー、Codex R1 M2)
+  if (date == null || date === '') throw new Error('normalizeFSalesByListingRow: date is required');
+  if (month == null || month === '') throw new Error('normalizeFSalesByListingRow: month is required');
+  if (mall == null || mall === '') throw new Error('normalizeFSalesByListingRow: mall is required');
+  if (item_code == null || item_code === '') throw new Error('normalizeFSalesByListingRow: item_code is required');
+  return {
+    date, month, mall, item_code,
+    channel: r.channel ?? r['チャネル'] ?? '',
+    item_name: r.item_name ?? r['商品名'] ?? null,
+    qty: r.qty ?? r['数量'] ?? 0,
+    sales_jpy: r.sales_jpy ?? r['売上金額'] ?? null,
+    order_count: r.order_count ?? r['注文数'] ?? null,
+    data_source: r.data_source ?? r['データソース'] ?? null,
+    updated_at: r.updated_at,
+    source_run_id: r.source_run_id,
+    source_row_hash: r.source_row_hash,
     synced_at: r.synced_at,
   };
 }

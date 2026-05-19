@@ -17,7 +17,8 @@
  *   //   last30days: { period: '2026-04-19〜2026-05-18', total: ..., byMall: ... } }
  */
 
-const MALL_ORDER = ['amazon', 'rakuten', 'yahoo', 'aupay', 'linegift', 'qoo10'];
+// PR #155 patch v2: f_sales_by_listing 経由に変更、メルカリ含む 7 モール対応
+const MALL_ORDER = ['amazon', 'rakuten', 'yahoo', 'aupay', 'linegift', 'qoo10', 'mercari'];
 const MALL_LABEL = {
   amazon: 'Amazon',
   rakuten: '楽天',
@@ -25,6 +26,7 @@ const MALL_LABEL = {
   aupay: 'au PAY',
   linegift: 'LINEギフト',
   qoo10: 'Qoo10',
+  mercari: 'メルカリ',
 };
 
 /**
@@ -133,6 +135,6 @@ export function formatGChatSummary(summary) {
   lines.push(`合計         | ${yenFmt(summary.yesterday.total).padStart(10, ' ')} | ${yenFmt(summary.monthToDate.total).padStart(11, ' ')} | ${yenFmt(summary.last30days.total).padStart(11, ' ')}`);
   lines.push('```');
   lines.push(`期間: 前日=${summary.yesterday.date} / 今月累計=${summary.monthToDate.period} / 過去30日=${summary.last30days.period}`);
-  lines.push('※ 顧客支払額 (税込、手数料引かず)。Amazon は税抜×1.10 換算。メルカリは Phase 2 で統合予定');
+  lines.push('※ 顧客支払額 (税込、手数料引かず)。f_sales_by_listing 経由で各モール API 直接集計の業務目線真の売上');
   return lines.join('\n');
 }

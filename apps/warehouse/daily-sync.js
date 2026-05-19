@@ -535,6 +535,21 @@ async function main() {
       }
       console.log(`[DailySync] Qoo10 finance DQ/sync 3か月分は build 失敗のため skipped 記録 (build retry 後に翌 cron で実行)`);
     }
+
+    // ─── biz-ops-overview f_sales_by_listing → mirror sync (2026-05-19 patch v2、PR #155 系) ───
+    // f_sales_by_listing は f_sales レイヤー (各モール raw API 由来) を rebuild-f-sales.js で集約済。
+    // ここで mirror に sync して Render ダッシュボードと GChat 通知 (in-server cron) が同じデータを参照する。
+    // 直近 90 日 sync (scope_clear_per_run、当月+前2か月の rolling 範囲)
+    // Codex R1 L1 反映: fromDate を分解して明示計算 (= currentMonth から 2 月前の月初)
+    const [_fsblY, _fsblM] = currentMonth.split('-').map(Number);
+    const _fsblD = new Date(Date.UTC(_fsblY, _fsblM - 1 - 2, 1));
+    const fSalesByListingFromDate = `${_fsblD.getUTCFullYear()}-${String(_fsblD.getUTCMonth() + 1).padStart(2, '0')}-01`;
+    const fSalesByListingToDate = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+    const fSalesByListingResult = runScript(
+      `apps/warehouse/sync-f-sales-by-listing.js --data-dir ${DATA_DIR_ARG} --from ${fSalesByListingFromDate} --to ${fSalesByListingToDate}`,
+      'f_sales_by_listing sync', 600000
+    );
+    results.push({ name: 'f_sales_by_listing sync', ...fSalesByListingResult });
   }
 
   // 楽天 AM/AL/W → NE商品コード sku_map 再構築 (f_sales と独立)

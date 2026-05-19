@@ -44,11 +44,10 @@
     <div id="sales-content" class="loading">読み込み中…</div>
 
     <div class="footer-note">
-      <strong>売上の定義</strong>: 顧客支払額 (税込、手数料引かず)。<br>
+      <strong>売上の定義</strong>: 顧客支払額 (税込、手数料引かず、業務目線の真の売上)。<br>
       <strong>期間</strong>: 前日=昨日 / 今月累計=月初〜昨日 / 過去30日=昨日から遡る30日。<br>
-      <strong>データソース</strong>: Amazon (税抜×1.10) / 楽天・Yahoo・au PAY・LINEギフト・Qoo10 (税込 fact 直接)。<br>
-      <strong>メルカリ</strong>: Phase 2 で NE 連携で追加予定 (当面除外)。<br>
-      <strong>N/A 表示</strong>: その期間に fact 行がない場合 (= データ未投入)。
+      <strong>データソース</strong>: <code>f_sales_by_listing</code> (全モール API 直接集計、税込統一、7 モール統合)。<br>
+      <strong>N/A 表示</strong>: その期間にデータがない場合。
     </div>
   </div>
 
