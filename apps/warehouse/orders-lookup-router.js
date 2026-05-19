@@ -69,25 +69,30 @@ router.get('/orders/lookup', (req, res) => {
   try {
     const db = getDB();
     // raw_ne_orders.受注番号 はモール側生 ID と一致 (Amazon: 503-xxx, 楽天: 373343-xxx 等)
-    // 1 注文に複数明細行ある場合は先頭 (明細行番号 ASC) の 1 件を返し、line_count で複数明細を示す
+    // raw_ne_orders.伝票番号 は NE 内部の伝票連番 (例: 1438443)
+    // 現場の出荷指示書にどちらが書いてあるかケースバイケースなので、OR 両方検索。
+    // matched_by で UI 上「NE 伝票番号でヒット」「モール受注番号でヒット」を区別表示。
+    // 1 伝票に複数明細行ある場合は先頭 (明細行番号 ASC) の 1 件を返し、line_count で複数明細を示す。
     const row = db.prepare(`
       SELECT
         s.platform                                       AS mall,
         o.受注番号                                      AS mall_order_id,
+        o.伝票番号                                      AS slip_no,
         o.商品コード                                    AS sku,
         o.商品名                                        AS product_name,
         o.受注数                                        AS ordered_qty,
         o.受注日                                        AS order_date,
+        (CASE WHEN o.受注番号 = ? THEN 'order_no' ELSE 'slip_no' END) AS matched_by,
         (SELECT COUNT(*) FROM raw_ne_orders x
-          WHERE x.受注番号 = o.受注番号
+          WHERE x.伝票番号 = o.伝票番号
             AND x.キャンセル区分 = '有効')              AS line_count
       FROM raw_ne_orders o
       JOIN shops s ON o.店舗コード = s.shop_code
-     WHERE o.受注番号 = ?
+     WHERE (o.受注番号 = ? OR o.伝票番号 = ?)
        AND o.キャンセル区分 = '有効'
      ORDER BY o.明細行番号 ASC
      LIMIT 1
-    `).get(orderId);
+    `).get(orderId, orderId, orderId);
 
     if (!row) {
       return res.status(200).json({ found: false });
@@ -100,6 +105,8 @@ router.get('/orders/lookup', (req, res) => {
       found: true,
       mall: row.mall,
       mall_order_id: row.mall_order_id,
+      slip_no: row.slip_no,
+      matched_by: row.matched_by,  // 'order_no' (モール受注番号) | 'slip_no' (NE 伝票番号)
       sku: row.sku,
       product_name: row.product_name,
       ordered_qty: row.ordered_qty,
