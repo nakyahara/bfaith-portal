@@ -80,12 +80,12 @@ console.log(`  target: ${contract.target_table}`);
 console.log(`  scope: ${dateRange.from} 〜 ${dateRange.to}`);
 console.log(`  dry-run: ${isDryRun}`);
 
-// 日本語列を英語キーに mapping (mirror normalizer は両対応だが、payload は英語が明確)
+// 日本語列を英語キーに mapping (PR #156 hotfix: mirror 側英語列に統一、payload も英語)
 const rows = db.prepare(`
   SELECT
-    日付 AS date, 月 AS month, モール AS mall, モール商品コード AS item_code,
-    チャネル AS channel, 商品名 AS item_name, 数量 AS qty, 売上金額 AS sales_jpy,
-    注文数 AS order_count, データソース AS data_source, updated_at
+    日付 AS date_jst, 月 AS month_ym, モール AS mall, モール商品コード AS item_code,
+    チャネル AS channel, 商品名 AS item_name, 数量 AS units, 売上金額 AS sales_jpy_incl,
+    注文数 AS order_count, データソース AS data_source, updated_at AS source_updated_at
   FROM f_sales_by_listing
   WHERE 日付 >= ? AND 日付 <= ?
   ORDER BY 日付, モール, モール商品コード, チャネル
@@ -105,7 +105,7 @@ const scopeDates = [];
   }
 }
 const distinctDates = scopeDates;
-const presentDates = [...new Set(rows.map(r => r.date))].sort();
+const presentDates = [...new Set(rows.map(r => r.date_jst))].sort();
 console.log(`  Distinct dates in scope: ${scopeDates.length} (clear対象、${scopeDates[0]} 〜 ${scopeDates[scopeDates.length - 1]}) / 実 row 日付: ${presentDates.length}`);
 
 const tsCompact = new Date().toISOString().replace(/[:.]/g, '').replace('Z', '');
@@ -116,8 +116,8 @@ console.log(`  run_id: ${runId}`);
 const syncedAt = new Date().toISOString();
 const enrichedRows = rows.map(r => {
   const hashInput = JSON.stringify({
-    date: r.date, mall: r.mall, item_code: r.item_code, channel: r.channel,
-    qty: r.qty, sales_jpy: r.sales_jpy, order_count: r.order_count,
+    date_jst: r.date_jst, mall: r.mall, item_code: r.item_code, channel: r.channel,
+    units: r.units, sales_jpy_incl: r.sales_jpy_incl, order_count: r.order_count,
   });
   const hash = crypto.createHash('sha256').update(hashInput).digest('hex').slice(0, 16);
   return { ...r, source_run_id: runId, source_row_hash: hash, synced_at: syncedAt };
@@ -155,7 +155,7 @@ import('node:os').then(async (os) => {
     console.log(`  First chunk meta: clear_f_sales_by_listing_dates=[${distinctDates.length} dates]`);
     if (enrichedRows.length > 0) {
       const r0 = enrichedRows[0];
-      console.log(`  Sample row[0]: date=${r0.date} mall=${r0.mall} item=${r0.item_code} qty=${r0.qty} sales=¥${r0.sales_jpy} hash=${r0.source_row_hash}`);
+      console.log(`  Sample row[0]: date=${r0.date_jst} mall=${r0.mall} item=${r0.item_code} units=${r0.units} sales=¥${r0.sales_jpy_incl} hash=${r0.source_row_hash}`);
     }
     process.exit(0);
   }
