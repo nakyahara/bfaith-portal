@@ -171,6 +171,28 @@
     okBox.querySelector('[data-field="sku"]').textContent = result.data.sku || '-';
     okBox.querySelector('[data-field="order_date"]').textContent = result.data.order_date || '-';
     okBox.querySelector('[data-field="ordered_qty"]').textContent = (result.data.ordered_qty != null ? result.data.ordered_qty + ' 個' : '-');
+    // mall_order_id / slip_no を表示 (matched_by でどちらでヒットしたかを示す)
+    const mallOrderEl = okBox.querySelector('[data-field="mall_order_id"]');
+    if (mallOrderEl) {
+      const isOrderMatch = result.data.matched_by === 'order_no';
+      mallOrderEl.textContent = result.data.mall_order_id || '-';
+      mallOrderEl.classList.toggle('matched', isOrderMatch);
+    }
+    const slipEl = okBox.querySelector('[data-field="slip_no"]');
+    if (slipEl) {
+      const isSlipMatch = result.data.matched_by === 'slip_no';
+      slipEl.textContent = result.data.slip_no || '-';
+      slipEl.classList.toggle('matched', isSlipMatch);
+    }
+    const matchedNote = okBox.querySelector('.matched-note');
+    if (matchedNote) {
+      if (result.data.matched_by === 'slip_no') {
+        matchedNote.textContent = '※ NE 伝票番号でヒット (モール受注番号: ' + (result.data.mall_order_id || '-') + ')';
+        matchedNote.hidden = false;
+      } else {
+        matchedNote.hidden = true;
+      }
+    }
     okBox.querySelector('.multi-line-warn').hidden = !(result.data.line_count && result.data.line_count > 1);
   }
 
