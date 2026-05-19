@@ -1329,6 +1329,39 @@ function createTables() {
       updated_at          = excluded.updated_at
   `);
 
+  // ---- biz-ops-overview f_sales_by_listing: contract auto-seed (LINEギフト/Qoo10 同型、2026-05-19 PR #155 patch v2)
+  // 業務目線の真の売上 (API 直接集計、税込、全モール統合) を Render mirror に sync
+  // Phase 1 fact (粗利分析向け) とは別系統、status filter/SKU 解決/按分なし
+  db.exec(`
+    INSERT INTO sync_contracts (
+      entity, contract_version, source_system, source_object, target_table,
+      grain_definition, key_columns_json, payload_schema_json,
+      clear_strategy, apply_mode, enabled, owner, created_at, updated_at
+    ) VALUES (
+      'f_sales_by_listing', 1, 'minipc-warehouse',
+      'f_sales_by_listing', 'mirror_f_sales_by_listing',
+      'one row = one (日付, モール, モール商品コード, チャネル) — 全モール (Amazon/楽天/Yahoo/au PAY/LINEギフト/Qoo10/メルカリ) 統合、API 直接集計の業務目線真の売上',
+      '["date","mall","item_code","channel"]',
+      '{"required":["date","mall","item_code"],"date_pattern":"^\\d{4}-\\d{2}-\\d{2}$"}',
+      'scope_clear_per_run', 'insert_or_replace', 1, 'biz-ops-overview',
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    )
+    ON CONFLICT(entity) DO UPDATE SET
+      contract_version    = excluded.contract_version,
+      source_system       = excluded.source_system,
+      source_object       = excluded.source_object,
+      target_table        = excluded.target_table,
+      grain_definition    = excluded.grain_definition,
+      key_columns_json    = excluded.key_columns_json,
+      payload_schema_json = excluded.payload_schema_json,
+      clear_strategy      = excluded.clear_strategy,
+      apply_mode          = excluded.apply_mode,
+      enabled             = excluded.enabled,
+      owner               = excluded.owner,
+      updated_at          = excluded.updated_at
+  `);
+
   // ---- Qoo10 Phase 1 A-3: contract auto-seed (LINEギフト同型パターン、2026-05-19)
   // sku_code は 3 段 fallback (combined / option_only / seller_only) 後の解決値 or '__UNRESOLVED__:%'
   // resolution_method は 2 値 ('master_match'/'unresolved')、match_tier 列で 4 値内訳監視
@@ -1713,31 +1746,21 @@ function createTables() {
     GROUP BY l.item_related_fee_type
   `);
 
-  // ---- biz-ops-overview: 全モール売上日次統合 view (2026-05-19、中原さん + Codex 確定)
+  // ---- biz-ops-overview: 全モール売上日次統合 view (2026-05-19、PR #155 で f_sales_by_listing 経由に変更)
   // 用途: miniPC GChat 売上サマリ通知 (notify-sales-summary.js)
-  // Render 側 (warehouse-mirror/db.js) にも同型 view あり、ダッシュボードはそちらを参照
-  // 売上 = 顧客支払額 (税込、手数料引かず)、Amazon は税抜×1.10 換算
+  // 旧 (PR #153): Phase 1 fact (f_*_finance_sku_daily_v1) 参照 → status filter + SKU 解決 + 按分で
+  //   業務目線の真の売上と 60%+ 乖離する不適切実装 (5/18 全合計 ¥1.27M vs 真値 ¥3.30M)。
+  // 新: f_sales_by_listing 参照 = 全モール API 直接、税込、業務目線の真の売上、メルカリも含まれる
+  // Render 側 (warehouse-mirror/db.js) は mirror_f_sales_by_listing 経由
   db.exec('DROP VIEW IF EXISTS v_mall_sales_daily_unified');
   db.exec(`CREATE VIEW v_mall_sales_daily_unified AS
-    SELECT 'amazon' AS mall, date_jst,
-      ROUND(sales_principal_jpy * 1.10, 0) AS sales_gross_jpy_incl,
-      units_net_sold, 'f_amazon_finance_sku_daily_v1' AS source_fact
-    FROM f_amazon_finance_sku_daily_v1
-    UNION ALL
-    SELECT 'rakuten', date_jst, sales_principal_jpy_incl, units_net_sold, 'f_rakuten_finance_sku_daily_v1'
-    FROM f_rakuten_finance_sku_daily_v1
-    UNION ALL
-    SELECT 'yahoo', date_jst, sales_principal_jpy_incl, units_net_sold, 'f_yahoo_finance_sku_daily_v1'
-    FROM f_yahoo_finance_sku_daily_v1
-    UNION ALL
-    SELECT 'aupay', date_jst, sales_principal_jpy_incl, units_net_sold, 'f_aupay_finance_sku_daily_v1'
-    FROM f_aupay_finance_sku_daily_v1
-    UNION ALL
-    SELECT 'linegift', date_jst, sales_principal_jpy_incl, units_net_sold, 'f_linegift_finance_sku_daily_v1'
-    FROM f_linegift_finance_sku_daily_v1
-    UNION ALL
-    SELECT 'qoo10', date_jst, gmv_list_price_jpy_incl, units_net_sold, 'f_qoo10_finance_sku_daily_v1'
-    FROM f_qoo10_finance_sku_daily_v1`);
+    SELECT
+      モール AS mall,
+      日付 AS date_jst,
+      売上金額 AS sales_gross_jpy_incl,
+      数量 AS units_net_sold,
+      'f_sales_by_listing' AS source_fact
+    FROM f_sales_by_listing`);
 }
 
 function insertDefaultShops() {
