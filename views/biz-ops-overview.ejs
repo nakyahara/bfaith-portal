@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>業務オペ概要 - B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    .container { max-width: 1200px; margin: 0 auto; padding: 16px 20px; }
+    h1 { font-size: 22px; margin: 0 0 12px; }
+    h2 { font-size: 16px; margin: 24px 0 10px; color: #1f2937; border-left: 3px solid #2563eb; padding-left: 8px; }
+    .meta { font-size: 12px; color: #6b7280; margin-bottom: 12px; }
+    .sales-table { width: 100%; border-collapse: collapse; font-size: 13px; background: white; border-radius: 6px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+    .sales-table th { background: #f3f4f6; padding: 10px 12px; text-align: right; font-weight: 600; border-bottom: 2px solid #e5e7eb; font-size: 12px; }
+    .sales-table th:first-child { text-align: left; }
+    .sales-table td { padding: 8px 12px; text-align: right; border-bottom: 1px solid #f3f4f6; }
+    .sales-table td:first-child { text-align: left; font-weight: 500; }
+    .sales-table tr.total { background: #fef3c7; font-weight: 700; }
+    .sales-table tr.total td { border-top: 2px solid #f59e0b; }
+    .sales-table .na { color: #9ca3af; font-style: italic; }
+    .footer-note { font-size: 11px; color: #6b7280; margin-top: 16px; line-height: 1.6; }
+    .loading { padding: 40px; text-align: center; color: #6b7280; }
+    .error { padding: 20px; background: #fef2f2; border: 1px solid #fca5a5; border-radius: 6px; color: #991b1b; margin-bottom: 12px; }
+    .refresh-btn { background: #2563eb; color: white; padding: 6px 14px; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; }
+    .refresh-btn:hover { background: #1d4ed8; }
+    .updated-at { font-size: 11px; color: #6b7280; margin-left: 8px; }
+  </style>
+</head>
+<body>
+  <%- include('partials/nav', { active: 'biz-ops-overview' }) %>
+  <div class="container">
+    <div style="display:flex; align-items:center; justify-content:space-between;">
+      <h1>業務オペ概要</h1>
+      <div>
+        <button class="refresh-btn" onclick="loadSummary()">🔄 更新</button>
+        <span class="updated-at" id="updated-at"></span>
+      </div>
+    </div>
+    <div class="meta">
+      日次業務オペレーション指標を 1 ページに集約。月次会計トップは <a href="/apps/exec-dashboard">exec-dashboard</a> 参照。
+    </div>
+
+    <h2>📊 モール別売上 (顧客支払額、税込)</h2>
+    <div id="sales-content" class="loading">読み込み中…</div>
+
+    <div class="footer-note">
+      <strong>売上の定義</strong>: 顧客支払額 (税込、手数料引かず)。<br>
+      <strong>期間</strong>: 前日=昨日 / 今月累計=月初〜昨日 / 過去30日=昨日から遡る30日。<br>
+      <strong>データソース</strong>: Amazon (税抜×1.10) / 楽天・Yahoo・au PAY・LINEギフト・Qoo10 (税込 fact 直接)。<br>
+      <strong>メルカリ</strong>: Phase 2 で NE 連携で追加予定 (当面除外)。<br>
+      <strong>N/A 表示</strong>: その期間に fact 行がない場合 (= データ未投入)。
+    </div>
+  </div>
+
+  <script>
+    function yen(n) {
+      if (n === null || n === undefined) return '<span class="na">N/A</span>';
+      return '¥' + Number(n).toLocaleString();
+    }
+    function renderTable(s) {
+      const html = ['<table class="sales-table">'];
+      html.push('<thead><tr><th>モール</th><th>前日</th><th>今月累計</th><th>過去30日</th></tr></thead>');
+      html.push('<tbody>');
+      for (const m of s.mallOrder) {
+        const label = s.mallLabel[m] || m;
+        const y = s.yesterday.byMall[m];
+        const mt = s.monthToDate.byMall[m];
+        const l30 = s.last30days.byMall[m];
+        html.push('<tr><td>' + label + '</td>'
+          + '<td>' + (y.present ? yen(y.sales) : '<span class="na">N/A</span>') + '</td>'
+          + '<td>' + (mt.present ? yen(mt.sales) : '<span class="na">N/A</span>') + '</td>'
+          + '<td>' + (l30.present ? yen(l30.sales) : '<span class="na">N/A</span>') + '</td>'
+          + '</tr>');
+      }
+      html.push('<tr class="total"><td>合計</td>'
+        + '<td>' + yen(s.yesterday.total) + '</td>'
+        + '<td>' + yen(s.monthToDate.total) + '</td>'
+        + '<td>' + yen(s.last30days.total) + '</td>'
+        + '</tr>');
+      html.push('</tbody></table>');
+      html.push('<div class="meta" style="margin-top:8px">前日基準: ' + s.yesterday.date + ' / 今月累計: ' + s.monthToDate.period + ' / 過去30日: ' + s.last30days.period + '</div>');
+      return html.join('');
+    }
+    async function loadSummary() {
+      const el = document.getElementById('sales-content');
+      el.className = 'loading';
+      el.textContent = '読み込み中…';
+      try {
+        const res = await fetch('/apps/biz-ops-overview/api/sales-summary');
+        const json = await res.json();
+        if (!json.ok) throw new Error(json.error || 'unknown error');
+        el.className = '';
+        el.innerHTML = renderTable(json.summary);
+        document.getElementById('updated-at').textContent = '取得: ' + new Date().toLocaleString('ja-JP');
+      } catch (e) {
+        el.className = '';
+        el.innerHTML = '<div class="error">取得エラー: ' + e.message + '</div>';
+      }
+    }
+    loadSummary();
+  </script>
+</body>
+</html>

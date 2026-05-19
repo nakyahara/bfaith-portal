@@ -1464,6 +1464,35 @@ function createTables() {
   db.exec(`CREATE VIEW v_mirror_mf_balance_snapshot_monthly_latest AS
     SELECT m.* FROM mirror_mf_balance_snapshot_monthly m
     WHERE m.run_id = (SELECT MAX(run_id) FROM mirror_mf_publish_runs WHERE status = 'success' AND scope IN ('all','base','balance_snapshot_monthly'))`);
+  // ---- biz-ops-overview: 全モール売上日次統合 view (2026-05-19、Codex consultation 反映)
+  // 用途: biz-ops-overview ダッシュボード + GChat 売上サマリ通知の単一データソース
+  // 売上 = 顧客支払額 (税込、手数料引かず、中原さん 2026-05-19 確定)
+  //   - Amazon (sales_principal_jpy 税抜): × 1.10 で税込換算 (軽減税率 SKU は過大評価の可能性、Phase 2 で SKU 別税率対応検討)
+  //   - 楽天/Yahoo/au PAY/LINEギフト: sales_principal_jpy_incl そのまま (税込)
+  //   - Qoo10: gmv_list_price_jpy_incl そのまま (= orderPrice × qty、税込)
+  //   - メルカリ: mirror 無し、Phase 2 で NE 連携で追加
+  db.exec('DROP VIEW IF EXISTS v_mall_sales_daily_unified');
+  db.exec(`CREATE VIEW v_mall_sales_daily_unified AS
+    SELECT 'amazon' AS mall, date_jst,
+      ROUND(sales_principal_jpy * 1.10, 0) AS sales_gross_jpy_incl,
+      units_net_sold, 'mirror_amazon_finance_sku_daily' AS source_fact
+    FROM mirror_amazon_finance_sku_daily
+    UNION ALL
+    SELECT 'rakuten', date_jst, sales_principal_jpy_incl, units_net_sold, 'mirror_rakuten_finance_sku_daily'
+    FROM mirror_rakuten_finance_sku_daily
+    UNION ALL
+    SELECT 'yahoo', date_jst, sales_principal_jpy_incl, units_net_sold, 'mirror_yahoo_finance_sku_daily'
+    FROM mirror_yahoo_finance_sku_daily
+    UNION ALL
+    SELECT 'aupay', date_jst, sales_principal_jpy_incl, units_net_sold, 'mirror_aupay_finance_sku_daily'
+    FROM mirror_aupay_finance_sku_daily
+    UNION ALL
+    SELECT 'linegift', date_jst, sales_principal_jpy_incl, units_net_sold, 'mirror_linegift_finance_sku_daily'
+    FROM mirror_linegift_finance_sku_daily
+    UNION ALL
+    SELECT 'qoo10', date_jst, gmv_list_price_jpy_incl, units_net_sold, 'mirror_qoo10_finance_sku_daily'
+    FROM mirror_qoo10_finance_sku_daily`);
+
   db.exec('DROP VIEW IF EXISTS v_mirror_mf_anomaly_signals_latest');
   db.exec(`CREATE VIEW v_mirror_mf_anomaly_signals_latest AS
     SELECT m.*, s.status AS state_status, s.suppress_until, s.acked_by, s.acked_at
