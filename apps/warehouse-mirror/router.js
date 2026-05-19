@@ -658,6 +658,64 @@ function getLinegiftFinanceInsert(db) {
   return b.linegiftFinanceInsert;
 }
 
+function getQoo10FinanceInsert(db) {
+  const b = getStmtBundle(db);
+  if (!b.qoo10FinanceInsert) {
+    b.qoo10FinanceInsert = db.prepare(`
+      INSERT OR REPLACE INTO mirror_qoo10_finance_sku_daily (
+        date_jst, sku_code, ne_code, qoo10_item_id, parent_item_code, variant_key,
+        resolution_method, match_tier, unresolved_sku_flag, product_name,
+        units_ordered, units_cancelled, units_net_sold,
+        gmv_list_price_jpy_incl, customer_paid_jpy_incl, net_settlement_api_jpy_incl,
+        platform_fee_jpy_incl, mall_fee_calc_method, settle_price_formula_scope,
+        extra_fee_oversea_jpy_incl, cod_fee_jpy_incl,
+        megawari_order_count, megawari_discount_amount_jpy_incl,
+        megapo_order_count, megapo_discount_amount_jpy_incl,
+        other_promo_order_count, other_promo_discount_jpy_incl,
+        total_platform_promo_jpy_incl, qoo10_cart_discount_jpy_incl, seller_discount_api_jpy_incl,
+        shop_promo_burden_jpy_incl, shop_promo_burden_status,
+        domestic_non_cod_line_count, domestic_non_cod_formula_match_count,
+        shipping_cost_jpy_incl, shipping_quality,
+        unit_cost_snapshot_incl, cost_snapshot_date_jst,
+        latest_unit_cost_reference_incl, cogs_amount_jpy_incl,
+        variable_margin_jpy_incl, variable_margin_full_jpy_incl,
+        margin_confidence, margin_full_finalized_at,
+        delivered_lag_days, shipping_lag_days, oversea_count, payment_methods_json,
+        first_seen_in_api_at, last_seen_in_api_at, is_frozen_after_horizon,
+        cost_status, is_cost_complete, data_quality_score,
+        order_count, line_count,
+        source_layer_summary, source_row_count, built_at,
+        source_run_id, source_row_hash, synced_at
+      ) VALUES (
+        @date_jst, @sku_code, @ne_code, @qoo10_item_id, @parent_item_code, @variant_key,
+        @resolution_method, @match_tier, @unresolved_sku_flag, @product_name,
+        @units_ordered, @units_cancelled, @units_net_sold,
+        @gmv_list_price_jpy_incl, @customer_paid_jpy_incl, @net_settlement_api_jpy_incl,
+        @platform_fee_jpy_incl, @mall_fee_calc_method, @settle_price_formula_scope,
+        @extra_fee_oversea_jpy_incl, @cod_fee_jpy_incl,
+        @megawari_order_count, @megawari_discount_amount_jpy_incl,
+        @megapo_order_count, @megapo_discount_amount_jpy_incl,
+        @other_promo_order_count, @other_promo_discount_jpy_incl,
+        @total_platform_promo_jpy_incl, @qoo10_cart_discount_jpy_incl, @seller_discount_api_jpy_incl,
+        @shop_promo_burden_jpy_incl, @shop_promo_burden_status,
+        @domestic_non_cod_line_count, @domestic_non_cod_formula_match_count,
+        @shipping_cost_jpy_incl, @shipping_quality,
+        @unit_cost_snapshot_incl, @cost_snapshot_date_jst,
+        @latest_unit_cost_reference_incl, @cogs_amount_jpy_incl,
+        @variable_margin_jpy_incl, @variable_margin_full_jpy_incl,
+        @margin_confidence, @margin_full_finalized_at,
+        @delivered_lag_days, @shipping_lag_days, @oversea_count, @payment_methods_json,
+        @first_seen_in_api_at, @last_seen_in_api_at, @is_frozen_after_horizon,
+        @cost_status, @is_cost_complete, @data_quality_score,
+        @order_count, @line_count,
+        @source_layer_summary, @source_row_count, @built_at,
+        @source_run_id, @source_row_hash, @synced_at
+      )
+    `);
+  }
+  return b.qoo10FinanceInsert;
+}
+
 function getLedgerInsert(db) {
   const b = getStmtBundle(db);
   if (!b.ledgerInsert) {
@@ -809,6 +867,14 @@ const ENTITY_REGISTRY = {
     clear_meta_key: 'clear_linegift_finance_dates',
     getInsertStmt: getLinegiftFinanceInsert,
     normalizeRow: (r) => normalizeLinegiftFinanceRow(r),
+  },
+  qoo10_finance_sku_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_qoo10_finance_sku_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_qoo10_finance_dates',
+    getInsertStmt: getQoo10FinanceInsert,
+    normalizeRow: (r) => normalizeQoo10FinanceRow(r),
   },
 
   // ─── MF Phase 1a (Codex 5ラウンド確定設計) ─────────────────────────
@@ -1310,6 +1376,72 @@ function normalizeLinegiftFinanceRow(r) {
     is_delivery_by_hand: r.is_delivery_by_hand ?? null,
     delivery_agent: r.delivery_agent ?? null,
     // 90日境界 frozen horizon
+    first_seen_in_api_at: r.first_seen_in_api_at ?? null,
+    last_seen_in_api_at: r.last_seen_in_api_at ?? null,
+    is_frozen_after_horizon: r.is_frozen_after_horizon ?? 0,
+    cost_status: r.cost_status,
+    is_cost_complete: r.is_cost_complete ?? 0,
+    data_quality_score: r.data_quality_score ?? 0,
+    order_count: r.order_count ?? 0,
+    line_count: r.line_count ?? 0,
+    source_layer_summary: r.source_layer_summary || '',
+    source_row_count: r.source_row_count ?? 0,
+    built_at: r.built_at || new Date().toISOString(),
+    source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,
+    synced_at: r.synced_at,
+  };
+}
+
+// row 列正規化 (mirror_qoo10_finance_sku_daily 用、Qoo10 Phase 1 A-3)
+function normalizeQoo10FinanceRow(r) {
+  return {
+    date_jst: r.date_jst, sku_code: r.sku_code,
+    ne_code: r.ne_code ?? null,
+    qoo10_item_id: r.qoo10_item_id ?? null,
+    parent_item_code: r.parent_item_code ?? '',
+    variant_key: r.variant_key ?? '',
+    resolution_method: r.resolution_method,
+    match_tier: r.match_tier ?? 'unresolved',
+    unresolved_sku_flag: r.unresolved_sku_flag ?? 0,
+    product_name: r.product_name || '',
+    units_ordered: r.units_ordered ?? 0,
+    units_cancelled: r.units_cancelled ?? 0,
+    units_net_sold: r.units_net_sold ?? 0,
+    gmv_list_price_jpy_incl: r.gmv_list_price_jpy_incl ?? 0,
+    customer_paid_jpy_incl: r.customer_paid_jpy_incl ?? 0,
+    net_settlement_api_jpy_incl: r.net_settlement_api_jpy_incl ?? 0,
+    platform_fee_jpy_incl: r.platform_fee_jpy_incl ?? 0,
+    mall_fee_calc_method: r.mall_fee_calc_method ?? 'actual_api',
+    settle_price_formula_scope: r.settle_price_formula_scope ?? 'domestic_non_cod',
+    extra_fee_oversea_jpy_incl: r.extra_fee_oversea_jpy_incl ?? 0,
+    cod_fee_jpy_incl: r.cod_fee_jpy_incl ?? 0,
+    megawari_order_count: r.megawari_order_count ?? 0,
+    megawari_discount_amount_jpy_incl: r.megawari_discount_amount_jpy_incl ?? 0,
+    megapo_order_count: r.megapo_order_count ?? 0,
+    megapo_discount_amount_jpy_incl: r.megapo_discount_amount_jpy_incl ?? 0,
+    other_promo_order_count: r.other_promo_order_count ?? 0,
+    other_promo_discount_jpy_incl: r.other_promo_discount_jpy_incl ?? 0,
+    total_platform_promo_jpy_incl: r.total_platform_promo_jpy_incl ?? 0,
+    qoo10_cart_discount_jpy_incl: r.qoo10_cart_discount_jpy_incl ?? 0,
+    seller_discount_api_jpy_incl: r.seller_discount_api_jpy_incl ?? 0,
+    shop_promo_burden_jpy_incl: r.shop_promo_burden_jpy_incl ?? 0,
+    shop_promo_burden_status: r.shop_promo_burden_status ?? 'pending_settlement_csv',
+    domestic_non_cod_line_count: r.domestic_non_cod_line_count ?? 0,
+    domestic_non_cod_formula_match_count: r.domestic_non_cod_formula_match_count ?? 0,
+    shipping_cost_jpy_incl: r.shipping_cost_jpy_incl ?? 0,
+    shipping_quality: r.shipping_quality,
+    unit_cost_snapshot_incl: r.unit_cost_snapshot_incl ?? null,
+    cost_snapshot_date_jst: r.cost_snapshot_date_jst ?? null,
+    latest_unit_cost_reference_incl: r.latest_unit_cost_reference_incl ?? null,
+    cogs_amount_jpy_incl: r.cogs_amount_jpy_incl ?? 0,
+    variable_margin_jpy_incl: r.variable_margin_jpy_incl ?? 0,
+    variable_margin_full_jpy_incl: r.variable_margin_full_jpy_incl ?? null,
+    margin_confidence: r.margin_confidence ?? 'partial_pending_settlement_csv',
+    margin_full_finalized_at: r.margin_full_finalized_at ?? null,
+    delivered_lag_days: r.delivered_lag_days ?? null,
+    shipping_lag_days: r.shipping_lag_days ?? null,
+    oversea_count: r.oversea_count ?? 0,
+    payment_methods_json: r.payment_methods_json ?? null,
     first_seen_in_api_at: r.first_seen_in_api_at ?? null,
     last_seen_in_api_at: r.last_seen_in_api_at ?? null,
     is_frozen_after_horizon: r.is_frozen_after_horizon ?? 0,

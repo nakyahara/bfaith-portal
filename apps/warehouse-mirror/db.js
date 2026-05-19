@@ -687,6 +687,113 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_mlfsd_parent ON mirror_linegift_finance_sku_daily(parent_item_code)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mlfsd_frozen ON mirror_linegift_finance_sku_daily(is_frozen_after_horizon) WHERE is_frozen_after_horizon = 1');
 
+  // mirror_qoo10_finance_sku_daily — Qoo10 Phase 1 A-3 (Render 側 daily fact mirror)
+  // 設計書 v0.11: g:/共有ドライブ/AI_reference/システム設計/Qoo10Phase1設計書_v0.11_20260518.md §9
+  // miniPC の f_qoo10_finance_sku_daily_v1 の payload を受信
+  // PK: (date_jst, sku_code) — sku_code = master_match 後の解決値 (combined/option_only/seller_only 各 tier) or '__UNRESOLVED__:%'
+  // ★ resolution_method は 2 値、match_tier (combined/option_only/seller_only/unresolved) で内訳監視
+  // ★ shipping は m_products.送料 採用 (Amazon FBM 同型、shipping_quality='estimated_rates' 常態)
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_qoo10_finance_sku_daily (
+    date_jst                          TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+    sku_code                          TEXT NOT NULL CHECK(trim(sku_code) <> ''),
+    ne_code                           TEXT,
+    qoo10_item_id                     INTEGER,
+    parent_item_code                  TEXT NOT NULL DEFAULT '',
+    variant_key                       TEXT NOT NULL DEFAULT '',
+    resolution_method                 TEXT NOT NULL CHECK (
+      resolution_method IN ('master_match', 'unresolved')
+    ),
+    match_tier                        TEXT NOT NULL DEFAULT 'unresolved' CHECK (
+      match_tier IN ('combined', 'option_only', 'seller_only', 'unresolved')
+    ),
+    unresolved_sku_flag               INTEGER NOT NULL DEFAULT 0,
+    product_name                      TEXT NOT NULL DEFAULT '',
+    units_ordered                     INTEGER NOT NULL DEFAULT 0,
+    units_cancelled                   INTEGER NOT NULL DEFAULT 0,
+    units_net_sold                    INTEGER NOT NULL DEFAULT 0,
+    -- 売上 3 列
+    gmv_list_price_jpy_incl           REAL NOT NULL DEFAULT 0,
+    customer_paid_jpy_incl            REAL NOT NULL DEFAULT 0,
+    net_settlement_api_jpy_incl       REAL NOT NULL DEFAULT 0,
+    -- 手数料
+    platform_fee_jpy_incl             REAL NOT NULL DEFAULT 0,
+    mall_fee_calc_method              TEXT NOT NULL DEFAULT 'actual_api' CHECK (
+      mall_fee_calc_method IN ('actual_api', 'actual_statement', 'estimated_rate', 'unknown')
+    ),
+    settle_price_formula_scope        TEXT NOT NULL DEFAULT 'domestic_non_cod' CHECK (
+      settle_price_formula_scope IN ('domestic_non_cod', 'oversea', 'cod', 'mixed')
+    ),
+    -- 海外/COD
+    extra_fee_oversea_jpy_incl        REAL NOT NULL DEFAULT 0,
+    cod_fee_jpy_incl                  REAL NOT NULL DEFAULT 0,
+    -- promo 集計
+    megawari_order_count              INTEGER NOT NULL DEFAULT 0,
+    megawari_discount_amount_jpy_incl REAL NOT NULL DEFAULT 0,
+    megapo_order_count                INTEGER NOT NULL DEFAULT 0,
+    megapo_discount_amount_jpy_incl   REAL NOT NULL DEFAULT 0,
+    other_promo_order_count           INTEGER NOT NULL DEFAULT 0,
+    other_promo_discount_jpy_incl     REAL NOT NULL DEFAULT 0,
+    total_platform_promo_jpy_incl     REAL NOT NULL DEFAULT 0,
+    qoo10_cart_discount_jpy_incl      REAL NOT NULL DEFAULT 0,
+    seller_discount_api_jpy_incl      REAL NOT NULL DEFAULT 0,
+    shop_promo_burden_jpy_incl        REAL NOT NULL DEFAULT 0,
+    shop_promo_burden_status          TEXT NOT NULL DEFAULT 'pending_settlement_csv' CHECK (
+      shop_promo_burden_status IN ('pending_settlement_csv', 'actual_statement', 'not_applicable')
+    ),
+    -- domestic_non_cod 別集計 (DQ check #8 用)
+    domestic_non_cod_line_count           INTEGER NOT NULL DEFAULT 0,
+    domestic_non_cod_formula_match_count  INTEGER NOT NULL DEFAULT 0,
+    -- 送料
+    shipping_cost_jpy_incl            REAL NOT NULL DEFAULT 0,
+    shipping_quality                  TEXT NOT NULL CHECK (
+      shipping_quality IN ('no_shipping_in_api', 'actual_api', 'estimated_rates', 'estimated_fallback', 'missing')
+    ),
+    -- 原価
+    unit_cost_snapshot_incl           REAL,
+    cost_snapshot_date_jst            TEXT,
+    latest_unit_cost_reference_incl   REAL,
+    cogs_amount_jpy_incl              REAL NOT NULL DEFAULT 0,
+    -- 利益
+    variable_margin_jpy_incl          REAL NOT NULL DEFAULT 0,
+    variable_margin_full_jpy_incl     REAL,
+    margin_confidence                 TEXT NOT NULL DEFAULT 'partial_pending_settlement_csv' CHECK (
+      margin_confidence IN ('partial_pending_settlement_csv', 'partial_minus_returns', 'full', 'partial_legacy_fields_missing')
+    ),
+    margin_full_finalized_at          TEXT,
+    -- audit
+    delivered_lag_days                INTEGER,
+    shipping_lag_days                 INTEGER,
+    oversea_count                     INTEGER NOT NULL DEFAULT 0,
+    payment_methods_json              TEXT,
+    -- 90日境界 frozen horizon
+    first_seen_in_api_at              TEXT,
+    last_seen_in_api_at               TEXT,
+    is_frozen_after_horizon           INTEGER NOT NULL DEFAULT 0,
+    -- 品質
+    cost_status                       TEXT NOT NULL CHECK (
+      cost_status IN ('complete', 'missing_cost', 'partial_cost', 'late_bound_after_close')
+    ),
+    is_cost_complete                  INTEGER NOT NULL DEFAULT 0,
+    data_quality_score                INTEGER NOT NULL DEFAULT 0
+                                      CHECK (data_quality_score BETWEEN 0 AND 100),
+    -- メタ
+    order_count                       INTEGER NOT NULL DEFAULT 0,
+    line_count                        INTEGER NOT NULL DEFAULT 0,
+    source_layer_summary              TEXT NOT NULL DEFAULT '',
+    source_row_count                  INTEGER NOT NULL DEFAULT 0,
+    built_at                          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    source_run_id                     TEXT NOT NULL,
+    source_row_hash                   TEXT NOT NULL,
+    synced_at                         TEXT NOT NULL,
+    PRIMARY KEY (date_jst, sku_code)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mqfsd_date   ON mirror_qoo10_finance_sku_daily(date_jst)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mqfsd_ne     ON mirror_qoo10_finance_sku_daily(ne_code)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mqfsd_month  ON mirror_qoo10_finance_sku_daily(substr(date_jst, 1, 7))');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mqfsd_run    ON mirror_qoo10_finance_sku_daily(source_run_id)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mqfsd_tier   ON mirror_qoo10_finance_sku_daily(match_tier)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mqfsd_frozen ON mirror_qoo10_finance_sku_daily(is_frozen_after_horizon) WHERE is_frozen_after_horizon = 1');
+
   // mirror_amazon_sku_fees — Amazon手数料キャッシュ（粗利ダッシュボード用）
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_amazon_sku_fees (
     seller_sku          TEXT PRIMARY KEY,
