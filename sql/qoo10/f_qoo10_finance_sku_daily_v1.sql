@@ -11,6 +11,9 @@
 --
 -- partial → full margin の 4 段階 confidence (Codex R7 設計書反映):
 --   - 'partial_pending_settlement_csv' (Phase A): variable_margin = net_settlement_api - cogs - shipping
+--     ※ cogs   = m_products.原価 × (1 + 消費税率) × units (税込み原価 × 数量)
+--     ※ shipping = m_products.送料 × units (社内想定送料、税込、shipping_quality='estimated_rates')
+--       2026-05-19 patch v2 (中原さん指示): Qoo10 API は実額提供なし → Amazon FBM 同型で m_products 採用
 --     ※ SettlePrice 公式 = round(orderPrice × 0.9) × qty で API 自動的に 10% 手数料引かれ済 → platform_fee は別途引かない
 --     ※ Qoo10 ショップ負担 (メガ割 10% + メガポ 10%) は別途精算 CSV で控除必要、Phase A 未反映
 --   - 'partial_minus_returns' (Phase B 着手後): cancel 注文の refund 確定前
