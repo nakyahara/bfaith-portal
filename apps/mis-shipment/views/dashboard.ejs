@@ -1,0 +1,40 @@
+<%- include('_header') %>
+
+  <main class="mis-main mis-dashboard">
+    <p class="back-link"><a href="/apps/mis-shipment">← 一覧へ戻る</a></p>
+
+    <h2 class="form-title">📊 誤出荷ダッシュボード</h2>
+
+    <!-- 期間切替 -->
+    <form id="period-form" class="period-form">
+      <label>
+        <span class="label">期間タイプ</span>
+        <select name="period">
+          <option value="month" selected>当月</option>
+          <option value="week">今週 (月〜日)</option>
+          <option value="custom">カスタム期間</option>
+        </select>
+      </label>
+      <label class="custom-only" hidden>
+        <span class="label">開始日</span>
+        <input type="date" name="from">
+      </label>
+      <label class="custom-only" hidden>
+        <span class="label">終了日</span>
+        <input type="date" name="to">
+      </label>
+      <button type="submit" class="btn-primary">適用</button>
+      <span id="period-label" class="period-label-text"></span>
+    </form>
+
+    <div id="dashboard-body">
+      <p class="loading">読み込み中...</p>
+    </div>
+  </main>
+
+  <!-- Chart.js (CDN、月次推移グラフ用) -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.js" defer></script>
+  <script src="/apps/mis-shipment/public/dashboard.js" defer></script>
+  <script defer>document.addEventListener('DOMContentLoaded', () => misShipmentDashboard.init());</script>
+</body>
+</html>

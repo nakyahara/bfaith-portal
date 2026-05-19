@@ -20,6 +20,7 @@ import cron from 'node-cron';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { getInventorySummary } from './inventory-decision.js';
 import { sendGChatMessage } from './gchat-client.js';
+import { getMisShipmentNotifySummary } from '../mis-shipment/summary.js';
 
 // JST曜日表示用
 const JST_WEEKDAYS = ['日', '月', '火', '水', '木', '金', '土'];
@@ -169,6 +170,31 @@ export function formatNotificationMessage(summary) {
   lines.push('詳細▶ https://bfaith-portal.onrender.com/apps/profit-analysis');
   lines.push(`※FBA系在庫は別ロジック/別ツールで管理。上記の撤退・警戒は判定対象${fmtYen(target.value)}に対する判定です。`);
 
+  // ── 5. 誤出荷セクション (Phase G、損失額抜きで率と件数のみ) ──
+  if (summary._misShipment) {
+    const m = summary._misShipment;
+    lines.push('');
+    lines.push('──────────');
+    const periodLabel = m.period_label || '今月累計';
+    lines.push(`*誤出荷 (${periodLabel}):*`);
+    if (m.error_rate_pct == null) {
+      lines.push('  出荷総数 0 のため算出不可');
+    } else {
+      const rateStr = m.error_rate_pct.toFixed(2) + '%';
+      const targetStr = m.industry_target_pct.toFixed(2) + '%';
+      const warn = m.over_target ? ' ⚠️ オーバー' : ' ✅';
+      lines.push(`  誤出荷率: ${rateStr} (${m.incidents}件 / ${m.shipped_orders.toLocaleString()}注文)${warn}  目標 ≤ ${targetStr}`);
+    }
+    if (m.top_sku) {
+      const skuMall = m.top_sku.mall ? ` (${m.top_sku.mall})` : '';
+      lines.push(`  🏆 Top SKU: ${m.top_sku.sku || '-'}${skuMall} ${m.top_sku.incidents}件`);
+    }
+    if (m.top_root_cause) {
+      lines.push(`  🔍 Top 根因: ${m.top_root_cause.root_cause_stage} ${m.top_root_cause.incidents}件`);
+    }
+    lines.push('  詳細▶ https://bfaith-portal.onrender.com/apps/mis-shipment/dashboard');
+  }
+
   return lines.join('\n');
 }
 
@@ -186,6 +212,14 @@ export async function runNotificationJob() {
   try {
     const db = getMirrorDB();
     const summary = getInventorySummary(db, {});
+
+    // 誤出荷サマリを合成 (Phase G、失敗しても在庫通知は止めない)
+    try {
+      summary._misShipment = getMisShipmentNotifySummary({});
+    } catch (e) {
+      console.warn('[notify-job] 誤出荷サマリ取得失敗 (在庫通知は継続):', e.message);
+    }
+
     const text = formatNotificationMessage(summary);
 
     console.log(`[notify-job] 送信開始 business_date=${summary.business_date}`);
