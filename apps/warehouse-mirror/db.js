@@ -1464,44 +1464,41 @@ function createTables() {
   db.exec(`CREATE VIEW v_mirror_mf_balance_snapshot_monthly_latest AS
     SELECT m.* FROM mirror_mf_balance_snapshot_monthly m
     WHERE m.run_id = (SELECT MAX(run_id) FROM mirror_mf_publish_runs WHERE status = 'success' AND scope IN ('all','base','balance_snapshot_monthly'))`);
-  // ---- mirror_f_sales_by_listing — biz-ops-overview 業務目線の全モール売上 mirror (2026-05-19 PR #155)
-  // 旧 (PR #153): Phase 1 fact (mirror_*_finance_sku_daily) を view で UNION → 業務売上と 60%+ 乖離
-  // 新: miniPC f_sales_by_listing をそのまま mirror、業務目線の真の売上を Render に同期
-  // PK: (日付, モール, モール商品コード, チャネル) — miniPC f_sales_by_listing と同型
+  // ---- mirror_f_sales_by_listing — biz-ops-overview 業務目線の全モール売上 mirror (2026-05-19 PR #156)
+  // hotfix v3: 列名を英語化 (date_jst 等)。router.js の date_range strategy が `WHERE date_jst IN (...)` を
+  //   ハードコード使用しているため、日本語列だと 500 エラーになる。他 mirror_*_finance_sku_daily も英語列で揃ってる。
+  // PK: (date_jst, mall, item_code, channel) — miniPC f_sales_by_listing (日本語列) からは sync runner 側で mapping
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_f_sales_by_listing (
-    日付              TEXT NOT NULL,
-    月                TEXT NOT NULL,
-    モール            TEXT NOT NULL,
-    モール商品コード  TEXT NOT NULL,
-    チャネル          TEXT NOT NULL DEFAULT '',
-    商品名            TEXT,
-    数量              INTEGER NOT NULL DEFAULT 0,
-    売上金額          REAL,
-    注文数            INTEGER,
-    データソース      TEXT,
-    updated_at        TEXT NOT NULL,
+    date_jst          TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+    month_ym          TEXT NOT NULL,
+    mall              TEXT NOT NULL,
+    item_code         TEXT NOT NULL,
+    channel           TEXT NOT NULL DEFAULT '',
+    item_name         TEXT,
+    units             INTEGER NOT NULL DEFAULT 0,
+    sales_jpy_incl    REAL,
+    order_count       INTEGER,
+    data_source       TEXT,
+    source_updated_at TEXT NOT NULL,
     source_run_id     TEXT NOT NULL,
     source_row_hash   TEXT NOT NULL,
     synced_at         TEXT NOT NULL,
-    PRIMARY KEY (日付, モール, モール商品コード, チャネル)
+    PRIMARY KEY (date_jst, mall, item_code, channel)
   )`);
-  db.exec('CREATE INDEX IF NOT EXISTS idx_mfsbl_date   ON mirror_f_sales_by_listing(日付)');
-  db.exec('CREATE INDEX IF NOT EXISTS idx_mfsbl_mall   ON mirror_f_sales_by_listing(モール, 日付)');
-  db.exec('CREATE INDEX IF NOT EXISTS idx_mfsbl_month  ON mirror_f_sales_by_listing(月)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mfsbl_date   ON mirror_f_sales_by_listing(date_jst)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mfsbl_mall   ON mirror_f_sales_by_listing(mall, date_jst)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mfsbl_month  ON mirror_f_sales_by_listing(month_ym)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mfsbl_run    ON mirror_f_sales_by_listing(source_run_id)');
-  db.exec('CREATE INDEX IF NOT EXISTS idx_mfsbl_item   ON mirror_f_sales_by_listing(モール商品コード, 日付)'); // Codex R1 M1 反映: source 同型 index
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mfsbl_item   ON mirror_f_sales_by_listing(item_code, date_jst)');
 
-  // ---- biz-ops-overview: 全モール売上日次統合 view (2026-05-19 PR #155、f_sales_by_listing 経由)
-  // 用途: biz-ops-overview ダッシュボード + GChat 売上サマリ通知の単一データソース
-  // 売上 = 顧客支払額 (税込、手数料引かず、API 直接集計、業務目線の真の売上)
-  // 7 モール全部 (Amazon/楽天/Yahoo/au PAY/LINEギフト/Qoo10/メルカリ) カバー
+  // ---- biz-ops-overview: 全モール売上日次統合 view (2026-05-19 PR #156)
   db.exec('DROP VIEW IF EXISTS v_mall_sales_daily_unified');
   db.exec(`CREATE VIEW v_mall_sales_daily_unified AS
     SELECT
-      モール AS mall,
-      日付 AS date_jst,
-      売上金額 AS sales_gross_jpy_incl,
-      数量 AS units_net_sold,
+      mall,
+      date_jst,
+      sales_jpy_incl AS sales_gross_jpy_incl,
+      units AS units_net_sold,
       'mirror_f_sales_by_listing' AS source_fact
     FROM mirror_f_sales_by_listing`);
 

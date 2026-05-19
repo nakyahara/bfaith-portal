@@ -719,14 +719,15 @@ function getQoo10FinanceInsert(db) {
 function getFSalesByListingInsert(db) {
   const b = getStmtBundle(db);
   if (!b.fSalesByListingInsert) {
+    // PR #156 hotfix: mirror_f_sales_by_listing は英語列 (date_jst 等) で統一、router の date_range strategy 互換
     b.fSalesByListingInsert = db.prepare(`
       INSERT OR REPLACE INTO mirror_f_sales_by_listing (
-        日付, 月, モール, モール商品コード, チャネル,
-        商品名, 数量, 売上金額, 注文数, データソース, updated_at,
+        date_jst, month_ym, mall, item_code, channel,
+        item_name, units, sales_jpy_incl, order_count, data_source, source_updated_at,
         source_run_id, source_row_hash, synced_at
       ) VALUES (
-        @date, @month, @mall, @item_code, @channel,
-        @item_name, @qty, @sales_jpy, @order_count, @data_source, @updated_at,
+        @date_jst, @month_ym, @mall, @item_code, @channel,
+        @item_name, @units, @sales_jpy_incl, @order_count, @data_source, @source_updated_at,
         @source_run_id, @source_row_hash, @synced_at
       )
     `);
@@ -1418,28 +1419,27 @@ function normalizeLinegiftFinanceRow(r) {
   };
 }
 
-// row 列正規化 (mirror_f_sales_by_listing 用、PR #155 biz-ops-overview)
-// miniPC f_sales_by_listing は日本語列、payload では英語キー (sync runner 側で対応 mapping)
-// Codex R1 M2 反映: ?? に統一 (空文字を未指定扱いしない)、必須列は明示バリデーション
+// row 列正規化 (mirror_f_sales_by_listing 用、PR #156 hotfix で英語列統一)
+// miniPC f_sales_by_listing は日本語列だが、sync runner 側で英語キーに mapping 済み payload を送る
+// Codex R1 M2 反映: ?? + 必須列バリデーション
 function normalizeFSalesByListingRow(r) {
-  const date = r.date ?? r['日付'];
-  const month = r.month ?? r['月'];
+  const date_jst = r.date_jst ?? r.date ?? r['日付'];
+  const month_ym = r.month_ym ?? r.month ?? r['月'];
   const mall = r.mall ?? r['モール'];
   const item_code = r.item_code ?? r['モール商品コード'];
-  // 必須列バリデーション (空文字 or 未定義はエラー、Codex R1 M2)
-  if (date == null || date === '') throw new Error('normalizeFSalesByListingRow: date is required');
-  if (month == null || month === '') throw new Error('normalizeFSalesByListingRow: month is required');
+  if (date_jst == null || date_jst === '') throw new Error('normalizeFSalesByListingRow: date_jst is required');
+  if (month_ym == null || month_ym === '') throw new Error('normalizeFSalesByListingRow: month_ym is required');
   if (mall == null || mall === '') throw new Error('normalizeFSalesByListingRow: mall is required');
   if (item_code == null || item_code === '') throw new Error('normalizeFSalesByListingRow: item_code is required');
   return {
-    date, month, mall, item_code,
+    date_jst, month_ym, mall, item_code,
     channel: r.channel ?? r['チャネル'] ?? '',
     item_name: r.item_name ?? r['商品名'] ?? null,
-    qty: r.qty ?? r['数量'] ?? 0,
-    sales_jpy: r.sales_jpy ?? r['売上金額'] ?? null,
+    units: r.units ?? r.qty ?? r['数量'] ?? 0,
+    sales_jpy_incl: r.sales_jpy_incl ?? r.sales_jpy ?? r['売上金額'] ?? null,
     order_count: r.order_count ?? r['注文数'] ?? null,
     data_source: r.data_source ?? r['データソース'] ?? null,
-    updated_at: r.updated_at,
+    source_updated_at: r.source_updated_at ?? r.updated_at,
     source_run_id: r.source_run_id,
     source_row_hash: r.source_row_hash,
     synced_at: r.synced_at,
