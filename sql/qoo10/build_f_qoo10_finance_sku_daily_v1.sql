@@ -30,8 +30,10 @@
 --
 -- partial margin (Phase A, partial_pending_settlement_csv):
 --   variable_margin = net_settlement_api - cogs - shipping_cost
+--   ※ cogs = m_products.原価 × (1 + 消費税率) × units (= 税込み原価 × 数量)
+--   ※ shipping_cost = m_products.送料 × units (社内想定送料、税込)、estimated_rates
 --   ※ ショップ負担 promo (メガ割 10% + メガポ 10%) は Phase A 未反映、Phase B-2 で精算 CSV 統合
---   ※ Qoo10 公式 SettlePrice = round(orderPrice × 0.9) × qty (= API 自動的に 10% 手数料引かれ済)
+--   ※ Qoo10 公式 SettlePrice = round(orderPrice × 0.9) × qty (= API 自動的に 10% 手数料引かれ済、9% SKU 等の例外あり)
 --
 -- SKU 解決 1 段 (v0.7 で manual_map 削除、v0.8 で parent_match 削除):
 --   1. m_products WHERE LOWER(TRIM(商品コード)) = LOWER(TRIM(seller_item_code))  (= master_match)
@@ -82,12 +84,9 @@ WITH base AS (
     CAST(cart_discount_qoo10 AS REAL) AS cart_discount_qoo10,
     -- gross = order_price × order_qty (0 除算ガード用)
     (CAST(order_price AS REAL) * CAST(order_qty AS INTEGER)) AS gross,
-    -- 送料 (Phase A: shipping_rate、現状 0)
-    COALESCE(CAST(shipping_rate AS REAL), 0) AS shipping_cost_per_line,
-    CASE
-      WHEN shipping_rate IS NULL OR shipping_rate = 0 THEN 'no_shipping_in_api'
-      ELSE 'actual_api'
-    END AS shipping_quality_per_line,
+    -- 送料 (将来切替検知用、現状は raw.shipping_rate=0、daily_aggregated で MAX/SUM 集計後 INSERT 側で CASE 分岐)
+    -- 2026-05-19 patch v2 Codex R1 L1 反映: 旧 shipping_cost_per_line / shipping_quality_per_line を削除、shipping_rate_raw 1 本に
+    COALESCE(CAST(shipping_rate AS REAL), 0) AS shipping_rate_raw,
     -- scope 行レベル判別 ('mixed' 最優先、Codex R2 High #4)
     CASE
       WHEN oversea_consignment = 'Y' AND COALESCE(cod_price, 0) > 0 THEN 'mixed'
@@ -214,13 +213,7 @@ daily_aggregated AS (
     -- domestic_non_cod 別集計 (Codex R3 High #1 反映、scope='mixed' でも domestic 部分を DQ で検証可能化)
     SUM(CASE WHEN scope_per_line = 'domestic_non_cod' THEN 1 ELSE 0 END) AS domestic_non_cod_line_count,
     SUM(CASE WHEN scope_per_line = 'domestic_non_cod' AND settle_price_formula_match = 1 THEN 1 ELSE 0 END) AS domestic_non_cod_formula_match_count,
-    -- 送料
-    SUM(shipping_cost_per_line) AS shipping_cost_jpy_incl,
-    CASE
-      WHEN MIN(shipping_quality_per_line) = 'actual_api' AND MAX(shipping_quality_per_line) = 'actual_api' THEN 'actual_api'
-      WHEN MIN(shipping_quality_per_line) = 'no_shipping_in_api' AND MAX(shipping_quality_per_line) = 'no_shipping_in_api' THEN 'no_shipping_in_api'
-      ELSE 'estimated_fallback'
-    END AS shipping_quality,
+    -- 送料 (2026-05-19 patch v2 Codex R1 L1 反映: 旧 SUM(shipping_cost_per_line) / shipping_quality 集計を削除、INSERT 側で CASE 分岐)
     AVG(delivered_lag_days) AS delivered_lag_days,
     AVG(shipping_lag_days) AS shipping_lag_days,
     SUM(oversea_count) AS oversea_count,
@@ -231,7 +224,14 @@ daily_aggregated AS (
     MAX(last_seen_at) AS last_seen_in_api_at,
     MAX(is_frozen_after_horizon) AS is_frozen_after_horizon,
     COUNT(DISTINCT order_id) AS order_count,
-    COUNT(*) AS line_count
+    COUNT(*) AS line_count,
+    -- 将来 Qoo10 API が shipping_rate を実額返してきた場合の切替検知用 (Codex R1 Medium #3 反映)
+    -- 現状全行 raw.shipping_rate=0、いずれか 1 行でも > 0 になったら 'actual_api' で実額採用、それ以外は m_products.送料 想定送料
+    MAX(shipping_rate_raw) AS raw_shipping_rate_max,
+    -- ⚠️ Codex R2 Medium 反映: Qoo10 API の shipping_rate が「単価」か「行合計」か未確定 (現状全 0 で判定不能)。
+    -- 安全側で SUM(shipping_rate_raw) (行合計 = qty 既込み前提) を採用。仕様確定後、単価仕様だと判明したら * quantity に切替え要。
+    -- 切替時は本箇所 + DQ 突合 + memory feedback を同時更新すること。
+    SUM(shipping_rate_raw) AS raw_shipping_cost_total
   FROM _silver_qoo10_delivered_v1
   GROUP BY date_jst, combined_internal
 ),
@@ -294,10 +294,32 @@ cost_lookup AS (
         CASE WHEN sr.resolution_method = 'master_match' THEN 'complete'
              ELSE 'missing_cost' END
       ELSE 'missing_cost'
-    END AS cost_status
+    END AS cost_status,
+    -- 2026-05-19 patch v2 (中原さん指示): Qoo10 API は shipping_rate=0 のままで実額来ない、
+    -- 社内設定 m_products.送料 (税込想定送料) を採用 (Amazon FBM 同型、memory feedback_amazon_fbm_easyship.md)
+    -- mp.送料 IS NULL (m_products 未登録) は明示的に NULL のまま保持し、INSERT 側で 'missing' フラグ化
+    mp.送料 AS shipping_per_unit_estimated
   FROM sku_resolved sr
   LEFT JOIN m_products mp ON mp.商品コード = sr.ne_code
   LEFT JOIN exception_genka eg ON eg.sku = sr.ne_code
+),
+-- 2026-05-19 patch v2: 送料解決を 1 CTE で確定 (INSERT SELECT 内の重複計算回避、variable_margin/score も再利用)
+shipping_resolved AS (
+  SELECT
+    da.date_jst, da.combined_internal,
+    ROUND(
+      CASE
+        WHEN da.raw_shipping_rate_max > 0 THEN da.raw_shipping_cost_total              -- 1) 将来 Qoo10 API 実額
+        WHEN cl.shipping_per_unit_estimated IS NOT NULL THEN cl.shipping_per_unit_estimated * da.units_ordered  -- 2) m_products.送料
+        ELSE 0                                                                            -- 3) m_products 未登録 (異常)
+      END, 2) AS shipping_cost_jpy_incl,
+    CASE
+      WHEN da.raw_shipping_rate_max > 0 THEN 'actual_api'                                 -- 将来 Qoo10 API 実額提供時
+      WHEN cl.shipping_per_unit_estimated IS NULL THEN 'missing'                          -- m_products.送料 未登録 (異常、DQ で検知)
+      ELSE 'estimated_rates'                                                              -- 社内 m_products 想定送料 (常態)
+    END AS shipping_quality
+  FROM daily_aggregated da
+  JOIN cost_lookup cl ON cl.date_jst = da.date_jst AND cl.combined_internal = da.combined_internal
 )
 SELECT
   c.date_jst,
@@ -338,9 +360,9 @@ SELECT
   -- domestic_non_cod 別集計
   c.domestic_non_cod_line_count,
   c.domestic_non_cod_formula_match_count,
-  -- 送料
-  ROUND(c.shipping_cost_jpy_incl, 2) AS shipping_cost_jpy_incl,
-  c.shipping_quality,
+  -- 送料 (2026-05-19 patch v2、shipping_resolved CTE で確定済の値を渡す)
+  sh.shipping_cost_jpy_incl,
+  sh.shipping_quality,
   -- 原価 snapshot
   cl.unit_cost_snapshot_incl,
   :build_date AS cost_snapshot_date_jst,
@@ -350,7 +372,7 @@ SELECT
   ROUND(
     c.net_settlement_api_jpy_incl
     - COALESCE(cl.unit_cost_snapshot_incl, 0) * c.units_ordered
-    - c.shipping_cost_jpy_incl,
+    - sh.shipping_cost_jpy_incl,
     2) AS variable_margin_jpy_incl,
   'partial_pending_settlement_csv' AS margin_confidence,
   -- audit
@@ -368,9 +390,20 @@ SELECT
   -- data_quality_score: cost (40) + shipping (25) + mall_fee (25) + sku_resolution (10) = 100
   (CASE COALESCE(cl.cost_status, 'missing_cost')
         WHEN 'complete' THEN 40 ELSE 0 END
-   + CASE c.shipping_quality
-        WHEN 'actual_api' THEN 25 WHEN 'no_shipping_in_api' THEN 20
-        WHEN 'estimated_rates' THEN 15 WHEN 'estimated_fallback' THEN 10 ELSE 0 END
+   -- 2026-05-19 patch v2: estimated_rates (m_products.送料 想定送料) を 20 点に上げる (常態であり信頼性高い)
+   --   - actual_api (Qoo10 実額、将来)              = 25 (最高、現状未到達)
+   --   - estimated_rates (m_products.送料、常態)     = 20 (Amazon FBM 同型、社内設定は信頼性高)
+   --   - missing (m_products 未登録、異常)           = 0 (DQ 検知対象)
+   -- ⚠️ 以下 2 値は shipping_resolved CTE では現在生成されない (互換のため残置、Codex R2 Low 反映)
+   --   - estimated_fallback (silver scope 混在)      = 10 (旧 silver 集計時の値、現未到達)
+   --   - no_shipping_in_api (legacy)                 = 5 (旧仕様、現未到達)
+   + CASE sh.shipping_quality
+        WHEN 'actual_api' THEN 25
+        WHEN 'estimated_rates' THEN 20
+        WHEN 'missing' THEN 0
+        WHEN 'estimated_fallback' THEN 10  -- 互換残置、現未到達
+        WHEN 'no_shipping_in_api' THEN 5   -- 互換残置、現未到達
+        ELSE 0 END
    + 25  -- mall_fee は actual_api 固定 (SettlePrice 公式由来) なので満点
    + CASE cl.resolution_method
         WHEN 'master_match' THEN 10 ELSE 0 END
@@ -382,6 +415,7 @@ SELECT
   CURRENT_TIMESTAMP AS built_at
 FROM daily_aggregated c
 JOIN cost_lookup cl ON cl.date_jst = c.date_jst AND cl.combined_internal = c.combined_internal
+JOIN shipping_resolved sh ON sh.date_jst = c.date_jst AND sh.combined_internal = c.combined_internal
 ON CONFLICT (date_jst, sku_code) DO UPDATE SET
   ne_code                              = excluded.ne_code,
   qoo10_item_id                        = excluded.qoo10_item_id,
