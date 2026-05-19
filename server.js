@@ -16,6 +16,7 @@ import { bootStart, bootEnd, bootNote, bootFail, getBootId } from './apps/observ
 import profitRouter from './apps/profit-calculator/router.js';
 import { startPriceWorker, startMaintenanceJobs } from './apps/profit-calculator/price-scheduler.js';
 import { startNotificationJob as startInventoryNotificationJob } from './apps/profit-analysis/notify-job.js';
+import { startSalesNotificationJob } from './apps/biz-ops-overview/notify-job.js';
 import fbaRouter from './apps/fba-replenishment/router.js';
 import warehouseRouter from './apps/warehouse/router.js';
 import ordersLookupRouter from './apps/warehouse/orders-lookup-router.js';
@@ -30,6 +31,7 @@ import qoo10AccountingRouter from './apps/qoo10-accounting/router.js';
 import fbaProfitabilityRouter from './apps/fba-profitability/router.js';
 import mercariAccountingRouter from './apps/mercari-accounting/router.js';
 import profitAnalysisRouter from './apps/profit-analysis/router.js';
+import bizOpsOverviewRouter from './apps/biz-ops-overview/router.js';
 import execDashboardRouter from './apps/exec-dashboard/router.js';
 import mgmtAccountingRouter from './apps/mgmt-accounting/router.js';
 import crossSellFinderRouter from './apps/cross-sell-finder/router.js';
@@ -391,6 +393,15 @@ const apps = [
     description: '商品別粗利分析 + 在庫整理・撤退判断支援',
     icon: '💹',
     path: '/apps/profit-analysis',
+    status: 'active',
+    category: 'analysis',
+  },
+  {
+    id: 'biz-ops-overview',
+    name: '業務オペ概要',
+    description: '全モール売上 (前日/今月/30日) + 出荷率等の日次経営指標集約',
+    icon: '📊',
+    path: '/apps/biz-ops-overview',
     status: 'active',
     category: 'analysis',
   },
@@ -759,6 +770,7 @@ app.use('/apps/qoo10-accounting', (req, res, next) => {
 }, qoo10AccountingRouter);
 app.use('/apps/fba-profitability', requireAppAccess('fba-profitability'), fbaProfitabilityRouter);
 app.use('/apps/profit-analysis', requireAppAccess('profit-analysis'), profitAnalysisRouter);
+app.use('/apps/biz-ops-overview', requireAppAccess('biz-ops-overview'), bizOpsOverviewRouter);
 app.use('/apps/exec-dashboard', requireAppAccess('exec-dashboard'), express.json({ limit: '1mb' }), execDashboardRouter);
 app.use('/apps/cross-sell-finder', requireAppAccess('cross-sell-finder'), crossSellFinderRouter);
 // 誤出荷管理 (apps/mis-shipment): warehouse-mirror.db 同居の f_mis_shipments を CRUD、注文 lookup は miniPC GET 経由
@@ -915,6 +927,8 @@ app.listen(PORT, () => {
 
   // 経営インサイトGChat通知 (在庫サマリ、INVENTORY_NOTIFY_ENABLED=true で起動)
   startInventoryNotificationJob();
+  // biz-ops-overview 売上サマリ GChat 通知 (在庫と独立メッセージ、SALES_NOTIFY_ENABLED=true で起動)
+  startSalesNotificationJob();
 });
 
 process.on('SIGTERM', () => {

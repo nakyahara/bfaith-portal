@@ -1712,6 +1712,32 @@ function createTables() {
     WHERE l.item_related_fee_type IS NOT NULL AND (d.fee_category IS NULL OR d.fee_type IS NULL)
     GROUP BY l.item_related_fee_type
   `);
+
+  // ---- biz-ops-overview: 全モール売上日次統合 view (2026-05-19、中原さん + Codex 確定)
+  // 用途: miniPC GChat 売上サマリ通知 (notify-sales-summary.js)
+  // Render 側 (warehouse-mirror/db.js) にも同型 view あり、ダッシュボードはそちらを参照
+  // 売上 = 顧客支払額 (税込、手数料引かず)、Amazon は税抜×1.10 換算
+  db.exec('DROP VIEW IF EXISTS v_mall_sales_daily_unified');
+  db.exec(`CREATE VIEW v_mall_sales_daily_unified AS
+    SELECT 'amazon' AS mall, date_jst,
+      ROUND(sales_principal_jpy * 1.10, 0) AS sales_gross_jpy_incl,
+      units_net_sold, 'f_amazon_finance_sku_daily_v1' AS source_fact
+    FROM f_amazon_finance_sku_daily_v1
+    UNION ALL
+    SELECT 'rakuten', date_jst, sales_principal_jpy_incl, units_net_sold, 'f_rakuten_finance_sku_daily_v1'
+    FROM f_rakuten_finance_sku_daily_v1
+    UNION ALL
+    SELECT 'yahoo', date_jst, sales_principal_jpy_incl, units_net_sold, 'f_yahoo_finance_sku_daily_v1'
+    FROM f_yahoo_finance_sku_daily_v1
+    UNION ALL
+    SELECT 'aupay', date_jst, sales_principal_jpy_incl, units_net_sold, 'f_aupay_finance_sku_daily_v1'
+    FROM f_aupay_finance_sku_daily_v1
+    UNION ALL
+    SELECT 'linegift', date_jst, sales_principal_jpy_incl, units_net_sold, 'f_linegift_finance_sku_daily_v1'
+    FROM f_linegift_finance_sku_daily_v1
+    UNION ALL
+    SELECT 'qoo10', date_jst, gmv_list_price_jpy_incl, units_net_sold, 'f_qoo10_finance_sku_daily_v1'
+    FROM f_qoo10_finance_sku_daily_v1`);
 }
 
 function insertDefaultShops() {
