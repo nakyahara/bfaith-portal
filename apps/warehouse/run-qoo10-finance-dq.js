@@ -16,7 +16,7 @@
  *   5. unresolved_sku_rate_pct                (warn 0.5% / error 1%、v0.7 で error 化、母集団は non-frozen 限定、v0.11 Codex R11 Medium)
  *   6. whitelist_coverage_pct                 (warn 95% / error 90%) — Delivered(5) 通常 97%
  *   7. resolved_but_zero_cost_count           (error: 1 件以上)
- *   8. settle_price_formula_match_pct         (Qoo10 特有、error: <99%) — silver 行レベル scope='domestic_non_cod' の SettlePrice = round(orderPrice × 0.9) × qty 成立比率
+ *   8. settle_price_formula_match_pct         (Qoo10 特有、info only、2026-05-19 patch) — 公式成立率の監視のみ、9% 手数料 SKU 等の Qoo10 内部設定で乖離するのは正常、gate しない
  *   9. shop_promo_burden_zero_check           (Qoo10 特有、warn: SellerDiscount > 0 or Cart_Discount_Seller > 0 が 1 件以上)
  *  10. promo_type_classification_health       (Qoo10 特有、info) — megawari/megapo/other_promo 月別件数比率
  *  11. horizon_frozen_observed_count          (Qoo10 特有、info、LINEギフト R5 critical 同型)
@@ -54,7 +54,9 @@ const THRESHOLDS_PAST = {
   unresolved_sku_rate_pct:               { warn: 0.5,  error: 1.0 },  // NE 在庫連携前提で原則 ~0%
   whitelist_coverage_pct:                { warn: 95.0, error: 90.0 },
   resolved_but_zero_cost_count:          { warn: 1,    error: 1 },
-  settle_price_formula_match_pct:        { warn: 99.5, error: 99.0 },  // domestic_non_cod 母集団の公式成立比率
+  // 2026-05-19 patch: 9% 手数料 SKU 混在発見で info 化。粗利は API SettlePrice 実額を使うので影響なし、
+  // 設計書 v0.11 の「全 SKU 10% 固定前提」と実態の乖離を監視のみ (gate しない)。
+  settle_price_formula_match_pct:        { warn: 999999, error: 999999 }, // info 固定
   shop_promo_burden_zero_check:          { warn: 1,    error: 999 },   // SellerDiscount > 0 件が 1 件でも warn
   promo_type_classification_health:      { warn: 999999, error: 999999 }, // info 固定
   horizon_frozen_observed_count:         { warn: 999999, error: 999999 }, // info 固定
@@ -187,9 +189,15 @@ const sm = db.prepare(`
   FROM f_qoo10_finance_sku_daily_v1 WHERE substr(date_jst,1,7) = ?
 `).get(monthStr);
 const formulaMatchPct = sm.total_dnoncod_lines > 0 ? sm.match_dnoncod_lines / sm.total_dnoncod_lines * 100 : 100;
-recordResult('settle_price_formula_match_pct',
-  formulaMatchPct <= THRESHOLDS.settle_price_formula_match_pct.error ? 'error' : formulaMatchPct <= THRESHOLDS.settle_price_formula_match_pct.warn ? 'warn' : 'info',
-  formulaMatchPct, THRESHOLDS.settle_price_formula_match_pct.error, { total_domestic_non_cod_lines: sm.total_dnoncod_lines, match_count: sm.match_dnoncod_lines, note: 'SettlePrice = round(orderPrice × 0.9) × qty 成立比率、 99% 未満で API 仕様変化警告' });
+// 2026-05-19 patch: 9% 手数料 SKU 混在発見で info 化 (粗利は SettlePrice 実額を使うので影響なし)
+// 「公式一致率」は設計書 v0.11 (全 SKU 10% 固定前提) と実態の乖離監視として残すが gate しない
+recordResult('settle_price_formula_match_pct', 'info',
+  formulaMatchPct, THRESHOLDS.settle_price_formula_match_pct.error, {
+    total_domestic_non_cod_lines: sm.total_dnoncod_lines,
+    match_count: sm.match_dnoncod_lines,
+    mismatch_count: (sm.total_dnoncod_lines || 0) - (sm.match_dnoncod_lines || 0),
+    note: '公式 round(orderPrice × 0.9) × qty との一致率 (info 監視のみ)、9% 手数料 SKU 等の Qoo10 内部設定で乖離するのは正常、粗利計算は SettlePrice 実額使用で影響なし'
+  });
 
 // Check 9: shop_promo_burden_zero_check (Qoo10 特有、SellerDiscount > 0 or Cart_Discount_Seller > 0 検知)
 const sp = db.prepare(`
