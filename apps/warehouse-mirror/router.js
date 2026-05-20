@@ -1427,10 +1427,11 @@ function normalizeFSalesByListingRow(r) {
   const month_ym = r.month_ym ?? r.month ?? r['月'];
   const mall = r.mall ?? r['モール'];
   const item_code = r.item_code ?? r['モール商品コード'];
-  if (date_jst == null || date_jst === '') throw new Error('normalizeFSalesByListingRow: date_jst is required');
-  if (month_ym == null || month_ym === '') throw new Error('normalizeFSalesByListingRow: month_ym is required');
-  if (mall == null || mall === '') throw new Error('normalizeFSalesByListingRow: mall is required');
-  if (item_code == null || item_code === '') throw new Error('normalizeFSalesByListingRow: item_code is required');
+  // 必須列バリデーション: null/undefined のみ拒否 (空文字は許可、f_sales_by_listing には実例あり)
+  if (date_jst == null) throw new Error('normalizeFSalesByListingRow: date_jst is required');
+  if (month_ym == null) throw new Error('normalizeFSalesByListingRow: month_ym is required');
+  if (mall == null) throw new Error('normalizeFSalesByListingRow: mall is required');
+  if (item_code == null) throw new Error('normalizeFSalesByListingRow: item_code is required');
   return {
     date_jst, month_ym, mall, item_code,
     channel: r.channel ?? r['チャネル'] ?? '',
