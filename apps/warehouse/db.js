@@ -1759,6 +1759,7 @@ function createTables() {
       日付 AS date_jst,
       売上金額 AS sales_gross_jpy_incl,
       数量 AS units_net_sold,
+      updated_at AS data_synced_at,
       'f_sales_by_listing' AS source_fact
     FROM f_sales_by_listing`);
 }

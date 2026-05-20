@@ -1510,6 +1510,7 @@ function createTables() {
       date_jst,
       sales_jpy_incl AS sales_gross_jpy_incl,
       units AS units_net_sold,
+      synced_at AS data_synced_at,
       'mirror_f_sales_by_listing' AS source_fact
     FROM mirror_f_sales_by_listing`);
 
