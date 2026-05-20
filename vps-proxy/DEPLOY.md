@@ -43,9 +43,10 @@ systemd は `/home/rocky/bfaith-portal/vps-proxy/aupay-proxy.js` を実行。
    ```
 4. **smoke test 必須** (miniPC から):
    ```bash
-   node apps/warehouse/smoke-yahoo-proxy.js 14
+   STRICT_YAHOO_ACCESS_TOKEN_SMOKE=1 node apps/warehouse/smoke-yahoo-proxy.js 14
    ```
    → `✅ Yahoo orderInfo proxy 動作確認 OK` を確認。
+   `STRICT_YAHOO_ACCESS_TOKEN_SMOKE=1` は `/yahoo/access-token` の verify (Cache-Control: no-store / 401 fail-closed) を必須化する。本番 deploy では必ず STRICT を付けること (`YAHOO_TOKEN_MINT_SECRET` 同期漏れで `503` のまま残るのを防ぐ)。
 5. **smoke 失敗時の rollback** (手動判断):
    ```bash
    ssh -i ~/.ssh/id_ed25519_vps rocky@133.167.122.198 '
@@ -94,6 +95,36 @@ systemd は `/home/rocky/bfaith-portal/vps-proxy/aupay-proxy.js` を実行。
    ```
    → `sudo systemctl daemon-reload && sudo systemctl restart aupay-proxy.service`
 7. smoke 確認 → OK なら旧 `/home/rocky/aupay-proxy.js` を `.bak_pre_gitdeploy_<日時>` にリネーム (動作確認後削除)
+
+## エンドポイント早見表
+
+| Method | Path | Auth | 用途 |
+|---|---|---|---|
+| GET | `/health` | (なし) | systemd 死活確認 |
+| GET | `/yahoo/health` | secret | token 有無 / expires_at |
+| GET | `/yahoo/auth-url` | secret | 認可 URL 取得 (再認可時) |
+| POST | `/yahoo/token/init` | secret | 認可コードから token 初期化 |
+| GET | `/yahoo/token/refresh` | secret | refresh だけ実行 (token は返さない) |
+| **POST** | **`/yahoo/access-token`** | **secret + mint-secret** | **current access_token を返却。必要なら自動 refresh。Render/ローカルから Yahoo 商品系 API を直接叩く用 (RakutenYahooSync)** |
+| GET | `/yahoo/orderList` | secret | 受注一覧 (固定 IP 必須) |
+| GET/POST | `/yahoo/orderInfo` | secret | 受注詳細 |
+| GET | `/wmshopapi/...` | secret | au PAY 透過 proxy |
+
+- secret 認証は `X-Proxy-Secret` ヘッダ (`PROXY_SECRET` または rotation 中の `PROXY_SECRET_NEXT` のどちらでも可)
+- `/yahoo/access-token` は **加えて `X-Token-Mint-Secret`** ヘッダが必要 (生 OAuth token を払い出す endpoint なので、PROXY_SECRET 漏えい時の blast radius 隔離)。
+  - VPS `.env`: `YAHOO_TOKEN_MINT_SECRET=...` (必須)、rotation 中は `YAHOO_TOKEN_MINT_SECRET_NEXT=...` も併用可
+  - Render `.env`: 同じ値を設定して `X-Token-Mint-Secret` ヘッダで送る
+  - 未設定の VPS は `/yahoo/access-token` を **HTTP 503 で disable** (fail-closed)
+  - 誤った mint secret は **HTTP 401**
+- レスポンス例:
+  ```json
+  { "ok": true, "access_token": "...", "token_type": "Bearer",
+    "expires_at": "2026-05-19T11:30:00.000Z", "refreshed": false }
+  ```
+  - 失敗時: token config エラー (yahoo-tokens.json 破損等) → **HTTP 500** `{ "ok": false, "error": "token config error" }`
+  - upstream エラー (Yahoo OAuth 障害・timeout) → **HTTP 502** `{ "ok": false, "error": "upstream refresh failed" }`
+  - token はサーバログにも書き出さない (refreshed フラグと expires_at のみ出力)
+  - refresh fetch は `YAHOO_TOKEN_REFRESH_TIMEOUT_MS` (default 15000ms) で必ず完了する
 
 ## 鉄則 (memory: feedback_vps_proxy_change_isolation.md)
 
