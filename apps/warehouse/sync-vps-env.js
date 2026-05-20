@@ -23,12 +23,15 @@ const SSH_KEY = process.env.VPS_SSH_KEY || 'C:/Users/bfaith/.ssh/id_ed25519_vps'
 const VPS_ENV_PATH = '/home/rocky/.env';
 const VPS_SERVICE = 'aupay-proxy';
 
-// 同期対象 (ミニPC .env が真の値、VPS .env はミラー)
-// au PAY API キーは月次でローテーション。他のキーは滅多に変わらないがミニPC .env にあれば同期する。
-// YAHOO_TOKEN_MINT_SECRET は /yahoo/access-token 専用 secret (Render から呼ぶ)、未設定だと 503 になる。
+// 必須同期 key (ミニPC .env が真の値、VPS .env はミラー。ミニPC .env に無いとエラー)
+// au PAY API キーは月次でローテーション。YAHOO_TOKEN_MINT_SECRET は /yahoo/access-token 専用 secret。
 const SYNC_KEYS = [
   'AUPAY_API_KEY',
   'YAHOO_TOKEN_MINT_SECRET',
+];
+
+// 任意同期 key (ミニPC .env にあるときだけ同期。rotation 用 _NEXT や timeout override 等、常設しない)
+const OPTIONAL_SYNC_KEYS = [
   'YAHOO_TOKEN_MINT_SECRET_NEXT',
   'YAHOO_TOKEN_REFRESH_TIMEOUT_MS',
 ];
@@ -75,7 +78,7 @@ function parseEnv(content) {
 async function main() {
   console.log(`[${ts()}] [vps-env-sync] 開始${DRY_RUN ? ' (dry-run)' : ''}`);
 
-  // ミニPC .env から取得
+  // ミニPC .env から取得 (必須 key)
   const localValues = {};
   for (const key of SYNC_KEYS) {
     const v = process.env[key];
@@ -83,6 +86,14 @@ async function main() {
       throw new Error(`[vps-env-sync] ミニPC .env に ${key} が未設定`);
     }
     localValues[key] = v;
+  }
+  // 任意 key はミニPC .env にあるときだけ同期対象に含める
+  const syncKeys = [...SYNC_KEYS];
+  for (const key of OPTIONAL_SYNC_KEYS) {
+    if (process.env[key]) {
+      localValues[key] = process.env[key];
+      syncKeys.push(key);
+    }
   }
 
   // VPS .env 取得
@@ -95,10 +106,10 @@ async function main() {
   const vpsValues = parseEnv(vpsContent);
 
   // 差分検知
-  const diffs = SYNC_KEYS.filter(k => localValues[k] !== vpsValues[k]);
+  const diffs = syncKeys.filter(k => localValues[k] !== vpsValues[k]);
 
   if (diffs.length === 0) {
-    console.log(`[${ts()}] [vps-env-sync] 差分なし: ${SYNC_KEYS.join(', ')}`);
+    console.log(`[${ts()}] [vps-env-sync] 差分なし: ${syncKeys.join(', ')}`);
     return;
   }
 
