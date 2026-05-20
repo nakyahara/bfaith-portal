@@ -12,6 +12,7 @@
  *   GET  http://133.167.122.198:8080/yahoo/orderList?startDate=...&endDate=...
  *   POST http://133.167.122.198:8080/yahoo/orderInfo  body: { orderIds: [...] }
  *   POST http://133.167.122.198:8080/yahoo/token/init  body: { code: "認可コード" }
+ *   POST http://133.167.122.198:8080/yahoo/access-token (returns current access_token, refreshes if expired)
  *   GET  http://133.167.122.198:8080/yahoo/auth-url
  *   Header: X-Proxy-Secret
  */
@@ -25,6 +26,16 @@ const PORT = process.env.PROXY_PORT || 8080;
 const PROXY_SECRET = process.env.PROXY_SECRET || '';
 // rotation 用: PROXY_SECRET_NEXT が設定されていれば旧 + 新の両方を受け入れる (二重受け入れ期間)
 const PROXY_SECRET_NEXT = process.env.PROXY_SECRET_NEXT || '';
+
+// /yahoo/access-token 専用 secret (生 OAuth token を払い出すため PROXY_SECRET と分離、漏えい時の blast radius 隔離)
+// 設定されていない場合は /yahoo/access-token は 503 で fail-closed。
+const YAHOO_TOKEN_MINT_SECRET = process.env.YAHOO_TOKEN_MINT_SECRET || '';
+const YAHOO_TOKEN_MINT_SECRET_NEXT = process.env.YAHOO_TOKEN_MINT_SECRET_NEXT || '';
+
+const TOKEN_REFRESH_TIMEOUT_MS = parseInt(process.env.YAHOO_TOKEN_REFRESH_TIMEOUT_MS, 10) || 15000;
+
+class TokenUpstreamError extends Error { constructor(m) { super(m); this.name = 'TokenUpstreamError'; } }
+class TokenLocalError    extends Error { constructor(m) { super(m); this.name = 'TokenLocalError'; } }
 
 // ─── au PAY設定 ───
 const AUPAY_API_KEY = process.env.AUPAY_API_KEY || '';
@@ -49,18 +60,48 @@ function ts() { return new Date().toISOString().slice(0, 19); }
 
 // ─── Yahoo トークン管理 ───
 
+const EMPTY_TOKENS = Object.freeze({ access_token: '', refresh_token: '', expires_at: 0 });
+
+// loadTokens(): 未初期化 (ENOENT) は空 token を返す。それ以外 (parse / read / permission error) は throw。
+// 「壊れた token file」を「未初期化」と取り違えないため。
 function loadTokens() {
-  try { return JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf-8')); }
-  catch { return { access_token: '', refresh_token: '', expires_at: 0 }; }
+  let raw;
+  try {
+    raw = fs.readFileSync(TOKEN_FILE, 'utf-8');
+  } catch (e) {
+    if (e.code === 'ENOENT') return { ...EMPTY_TOKENS };
+    throw new TokenLocalError(`yahoo-tokens.json read error: ${e.code} ${e.message}`);
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    throw new TokenLocalError(`yahoo-tokens.json parse error: ${e.message}`);
+  }
+}
+
+// safeLoadTokens(): /yahoo/health 用。read/parse 失敗を握りつぶして空 token を返す (起動時の startup 列挙にも使う)。
+function safeLoadTokens() {
+  try { return loadTokens(); }
+  catch { return { ...EMPTY_TOKENS }; }
 }
 
 function saveTokens(tokens) {
   fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokens, null, 2));
 }
 
-async function refreshAccessToken() {
-  const tokens = loadTokens();
-  if (!tokens.refresh_token) throw new Error('refresh_token がありません。/yahoo/token/init で初期化してください');
+async function refreshAccessTokenInner() {
+  let tokens;
+  try {
+    tokens = loadTokens();
+  } catch (e) {
+    throw new TokenLocalError(`yahoo-tokens.json 読み込み失敗: ${e.message}`);
+  }
+  if (!tokens.refresh_token) {
+    throw new TokenLocalError('refresh_token がありません。/yahoo/token/init で初期化してください');
+  }
+  if (!YAHOO_CLIENT_ID || !YAHOO_CLIENT_SECRET) {
+    throw new TokenLocalError('YAHOO_CLIENT_ID / YAHOO_CLIENT_SECRET が未設定');
+  }
 
   const body = new URLSearchParams({
     grant_type: 'refresh_token',
@@ -69,13 +110,27 @@ async function refreshAccessToken() {
     client_secret: YAHOO_CLIENT_SECRET,
   });
 
-  const res = await fetch(YAHOO_TOKEN_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: body.toString(),
-  });
-  const data = await res.json();
-  if (data.error) throw new Error(`トークンリフレッシュ失敗: ${data.error} - ${data.error_description || ''}`);
+  // mutex で shared Promise になるため、ハングを絶対に許さない。AbortSignal.timeout で必ず終わる契約にする。
+  let res;
+  try {
+    res = await fetch(YAHOO_TOKEN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+      signal: AbortSignal.timeout(TOKEN_REFRESH_TIMEOUT_MS),
+    });
+  } catch (e) {
+    throw new TokenUpstreamError(`Yahoo token endpoint network/timeout: ${e.message}`);
+  }
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    throw new TokenUpstreamError(`Yahoo token endpoint invalid JSON: ${e.message}`);
+  }
+  if (data.error) {
+    throw new TokenUpstreamError(`トークンリフレッシュ失敗: ${data.error} - ${data.error_description || ''}`);
+  }
 
   const refreshTokenRotated = !!data.refresh_token;
   const updated = {
@@ -90,15 +145,47 @@ async function refreshAccessToken() {
       : (tokens.refresh_token_expires_at || null),
     updated_at: new Date().toISOString(),
   };
-  saveTokens(updated);
+  try {
+    saveTokens(updated);
+  } catch (e) {
+    throw new TokenLocalError(`yahoo-tokens.json 書き込み失敗: ${e.message}`);
+  }
   console.log(`[${ts()}] Yahoo トークンリフレッシュ成功`);
-  return updated.access_token;
+  return updated;
+}
+
+// In-process mutex so that concurrent /yahoo/access-token + /yahoo/orderInfo
+// invocations don't trigger N parallel refreshes against Yahoo's token endpoint.
+let _inFlightRefresh = null;
+async function refreshAccessToken() {
+  if (_inFlightRefresh) return _inFlightRefresh;
+  _inFlightRefresh = (async () => {
+    try {
+      return await refreshAccessTokenInner();
+    } finally {
+      _inFlightRefresh = null;
+    }
+  })();
+  return _inFlightRefresh;
 }
 
 async function getAccessToken() {
   const tokens = loadTokens();
   if (tokens.access_token && tokens.expires_at > Date.now()) return tokens.access_token;
-  return await refreshAccessToken();
+  const updated = await refreshAccessToken();
+  return updated.access_token;
+}
+
+// Returns the current access_token along with metadata. Refreshes only if expired.
+// Used by /yahoo/access-token for downstream apps (Render / local dev) that need
+// to call Yahoo's product APIs directly with the same OAuth token.
+async function getAccessTokenWithMeta() {
+  const tokens = loadTokens();
+  if (tokens.access_token && tokens.expires_at > Date.now()) {
+    return { access_token: tokens.access_token, expires_at: tokens.expires_at, refreshed: false };
+  }
+  const updated = await refreshAccessToken();
+  return { access_token: updated.access_token, expires_at: updated.expires_at, refreshed: true };
 }
 
 async function initTokenFromCode(code) {
@@ -256,7 +343,7 @@ const server = http.createServer(async (req, res) => {
     // ═══════════════════════════════════════
 
     if (pathname === '/yahoo/health') {
-      const tokens = loadTokens();
+      const tokens = safeLoadTokens();
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         status: 'ok',
@@ -286,10 +373,55 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (pathname === '/yahoo/token/refresh') {
+    if (pathname === '/yahoo/token/refresh' && req.method === 'GET') {
       await refreshAccessToken();
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    if (pathname === '/yahoo/access-token' && req.method === 'POST') {
+      // 専用 secret (X-Token-Mint-Secret) 必須。未設定なら 503 fail-closed (PROXY_SECRET 漏えい時の blast radius 隔離)
+      const acceptedMintSecrets = [YAHOO_TOKEN_MINT_SECRET, YAHOO_TOKEN_MINT_SECRET_NEXT].filter(Boolean);
+      if (acceptedMintSecrets.length === 0) {
+        console.error(`[${ts()}] /yahoo/access-token: YAHOO_TOKEN_MINT_SECRET not configured`);
+        res.writeHead(503, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ ok: false, error: 'mint endpoint disabled' }));
+        return;
+      }
+      const mintSecret = req.headers['x-token-mint-secret'] || '';
+      if (!acceptedMintSecrets.includes(mintSecret)) {
+        res.writeHead(401, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ ok: false, error: 'mint secret invalid' }));
+        return;
+      }
+
+      try {
+        const meta = await getAccessTokenWithMeta();
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          'Cache-Control': 'no-store',
+        });
+        res.end(JSON.stringify({
+          ok: true,
+          access_token: meta.access_token,
+          token_type: 'Bearer',
+          expires_at: new Date(meta.expires_at).toISOString(),
+          refreshed: meta.refreshed,
+        }));
+        console.log(`[${ts()}] /yahoo/access-token ok refreshed=${meta.refreshed} expires_at=${new Date(meta.expires_at).toISOString()}`);
+      } catch (e) {
+        // upstream (Yahoo 起因) と local (ファイル/設定起因) を分離。レスポンス本文は秘匿のまま。
+        console.error(`[${ts()}] /yahoo/access-token failed: name=${e.name} msg=${e.message}`);
+        if (e instanceof TokenLocalError) {
+          res.writeHead(500, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify({ ok: false, error: 'token config error' }));
+        } else {
+          // TokenUpstreamError + 未分類 (安全側で upstream 扱い)
+          res.writeHead(502, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify({ ok: false, error: 'upstream refresh failed' }));
+        }
+      }
       return;
     }
 
@@ -348,8 +480,10 @@ server.listen(PORT, '0.0.0.0', () => {
   if (YAHOO_CLIENT_ID && YAHOO_SELLER_ID) {
     console.log(`  Yahoo: Seller ${YAHOO_SELLER_ID}`);
     console.log(`  Yahoo: Public Key ${fs.existsSync(YAHOO_PUBLIC_KEY_PATH) ? 'Found (v' + YAHOO_SIGNATURE_VERSION + ')' : 'Not found'}`);
-    const tokens = loadTokens();
+    // startup 列挙では safeLoadTokens を使う (壊れた token file で crashloop しない)
+    const tokens = safeLoadTokens();
     console.log(`  Yahoo: Tokens ${tokens.access_token ? 'Loaded' : 'Not initialized'}`);
+    console.log(`  Yahoo: /yahoo/access-token mint ${YAHOO_TOKEN_MINT_SECRET ? 'ENABLED' : 'disabled (set YAHOO_TOKEN_MINT_SECRET to enable)'}`);
   } else {
     console.log('  Yahoo: 設定不足（YAHOO_CLIENT_ID / YAHOO_SELLER_ID）');
   }

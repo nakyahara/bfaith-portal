@@ -24,8 +24,14 @@ const VPS_ENV_PATH = '/home/rocky/.env';
 const VPS_SERVICE = 'aupay-proxy';
 
 // 同期対象 (ミニPC .env が真の値、VPS .env はミラー)
-// au PAY API キーは月次でローテーション。他のキーは滅多に変わらないがミニPC .env にあれば同期する
-const SYNC_KEYS = ['AUPAY_API_KEY'];
+// au PAY API キーは月次でローテーション。他のキーは滅多に変わらないがミニPC .env にあれば同期する。
+// YAHOO_TOKEN_MINT_SECRET は /yahoo/access-token 専用 secret (Render から呼ぶ)、未設定だと 503 になる。
+const SYNC_KEYS = [
+  'AUPAY_API_KEY',
+  'YAHOO_TOKEN_MINT_SECRET',
+  'YAHOO_TOKEN_MINT_SECRET_NEXT',
+  'YAHOO_TOKEN_REFRESH_TIMEOUT_MS',
+];
 
 const DRY_RUN = process.argv.includes('--dry');
 

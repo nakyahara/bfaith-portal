@@ -24,6 +24,9 @@ import { parseStringPromise } from 'xml2js';
 
 const YAHOO_PROXY_URL = process.env.YAHOO_PROXY_URL || 'http://133.167.122.198:8080';
 const YAHOO_PROXY_SECRET = process.env.YAHOO_PROXY_SECRET || process.env.AUPAY_PROXY_SECRET || '';
+const YAHOO_TOKEN_MINT_SECRET = process.env.YAHOO_TOKEN_MINT_SECRET || '';
+// STRICT mode: /yahoo/access-token を verify 必須にする。本番 deploy 手順では必ず STRICT=1 を付ける。
+const STRICT_YAHOO_ACCESS_TOKEN_SMOKE = process.env.STRICT_YAHOO_ACCESS_TOKEN_SMOKE === '1';
 
 function fail(msg) {
   console.error(`[smoke-yahoo-proxy] ❌ FAIL: ${msg}`);
@@ -64,6 +67,61 @@ async function main() {
   }
   if (!health.hasTokens) fail('proxy に Yahoo トークン未初期化');
   ok(`health OK (seller=${health.sellerId}, refresh token expires ${health.refreshTokenExpiresAt})`);
+
+  // 1.5. access-token (used by Render/local clients to call Yahoo product APIs directly)
+  //      mint endpoint は YAHOO_TOKEN_MINT_SECRET 専用 secret 必須。
+  //      STRICT_YAHOO_ACCESS_TOKEN_SMOKE=1 のとき未設定で fail (本番 deploy 検証用)。
+  if (!YAHOO_TOKEN_MINT_SECRET) {
+    if (STRICT_YAHOO_ACCESS_TOKEN_SMOKE) {
+      fail('STRICT mode: YAHOO_TOKEN_MINT_SECRET 未設定 (本番 deploy では必須)');
+    }
+    console.log('[smoke-yahoo-proxy] ⚠️  YAHOO_TOKEN_MINT_SECRET 未設定: /yahoo/access-token の verify をスキップ (STRICT=1 で fail に切り替え)');
+  } else {
+    let tokenRes;
+    try {
+      tokenRes = await fetch(`${YAHOO_PROXY_URL}/yahoo/access-token`, {
+        method: 'POST',
+        headers: {
+          'X-Proxy-Secret': YAHOO_PROXY_SECRET,
+          'X-Token-Mint-Secret': YAHOO_TOKEN_MINT_SECRET,
+          'Content-Type': 'application/json',
+        },
+      });
+    } catch (e) {
+      fail(`access-token 取得失敗 (network): ${e.message}`);
+    }
+    if (!tokenRes.ok) {
+      const body = await tokenRes.text().catch(() => '');
+      fail(`access-token HTTP ${tokenRes.status}: ${body.slice(0, 200)}`);
+    }
+    const cc = tokenRes.headers.get('cache-control') || '';
+    if (!/no-store/i.test(cc)) {
+      fail(`access-token: Cache-Control に no-store が無い (got: "${cc}")`);
+    }
+    let tokenData;
+    try { tokenData = await tokenRes.json(); }
+    catch (e) { fail(`access-token: JSON parse 失敗: ${e.message}`); }
+    if (!tokenData?.ok || typeof tokenData.access_token !== 'string' || !tokenData.access_token) {
+      fail(`access-token レスポンス異常 (ok=${tokenData?.ok} access_token=${typeof tokenData?.access_token})`);
+    }
+    if (tokenData.token_type !== 'Bearer') fail(`access-token: token_type が Bearer ではない (${tokenData.token_type})`);
+    if (!tokenData.expires_at) fail('access-token: expires_at が無い');
+    ok(`access-token OK (refreshed=${tokenData.refreshed}, expires_at=${tokenData.expires_at}, cache-control=${cc})`);
+
+    // 認証エラー verify (誤った mint secret は 401 で fail-closed)
+    const wrongRes = await fetch(`${YAHOO_PROXY_URL}/yahoo/access-token`, {
+      method: 'POST',
+      headers: {
+        'X-Proxy-Secret': YAHOO_PROXY_SECRET,
+        'X-Token-Mint-Secret': 'wrong-secret-' + Date.now(),
+        'Content-Type': 'application/json',
+      },
+    });
+    if (wrongRes.status !== 401) {
+      fail(`access-token: 誤った mint secret なのに HTTP ${wrongRes.status} (期待は 401)`);
+    }
+    ok('access-token mint-secret fail-closed OK (401 returned for wrong secret)');
+  }
 
   // 2. orderList
   const endDate = new Date();
