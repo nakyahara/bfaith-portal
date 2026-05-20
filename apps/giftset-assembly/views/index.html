@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ギフトセット組み依頼</title>
+<style>
+  :root { --blue:#2563eb; --green:#16a34a; --orange:#ea580c; --gray:#6b7280; --bg:#f8fafc; --line:#e2e8f0; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", "Hiragino Sans", Meiryo, sans-serif;
+         margin:0; background:var(--bg); color:#1e293b; line-height:1.6; }
+  header { background:#fff; border-bottom:1px solid var(--line); padding:14px 20px; }
+  header h1 { margin:0; font-size:18px; }
+  header .sub { color:var(--gray); font-size:13px; }
+  .tabs { display:flex; gap:4px; padding:12px 20px 0; }
+  .tab { padding:9px 18px; border:1px solid var(--line); border-bottom:none; background:#eef2f7;
+         border-radius:8px 8px 0 0; cursor:pointer; font-weight:600; font-size:14px; }
+  .tab.active { background:#fff; color:var(--blue); }
+  .panel { display:none; background:#fff; border:1px solid var(--line); margin:0 20px 24px;
+           border-radius:0 8px 8px 8px; padding:20px; }
+  .panel.active { display:block; }
+  h2 { font-size:15px; margin:0 0 12px; border-left:4px solid var(--blue); padding-left:8px; }
+  label { display:block; font-size:13px; font-weight:600; margin:10px 0 4px; }
+  input[type=text], input[type=number], input[type=date], select, textarea {
+    width:100%; padding:8px 10px; border:1px solid #cbd5e1; border-radius:6px; font-size:14px; }
+  textarea { min-height:54px; resize:vertical; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; }
+  .row > div { flex:1; min-width:140px; }
+  .hint { font-size:12px; color:var(--gray); margin-top:3px; }
+  button { cursor:pointer; border:none; border-radius:6px; padding:10px 16px; font-size:14px; font-weight:700; color:#fff; }
+  .btn-blue{background:var(--blue);} .btn-green{background:var(--green);} .btn-orange{background:var(--orange);}
+  .btn-gray{background:var(--gray);} button:disabled{opacity:.45; cursor:not-allowed;}
+  .btn-sm{ padding:5px 10px; font-size:12px; }
+  table { width:100%; border-collapse:collapse; margin-top:12px; font-size:13px; }
+  th,td { border:1px solid var(--line); padding:6px 8px; text-align:left; }
+  th { background:#f1f5f9; }
+  .comp-row { display:flex; gap:8px; align-items:center; margin-bottom:6px; }
+  .comp-row .c-code { flex:3; } .comp-row .c-qty { flex:1; min-width:80px; } .comp-row .c-name { flex:2; color:var(--gray); font-size:12px; }
+  .msg { padding:10px 14px; border-radius:6px; margin:12px 0; font-size:14px; display:none; }
+  .msg.ok{ background:#dcfce7; color:#166534; } .msg.err{ background:#fee2e2; color:#991b1b; }
+  .msg.info{ background:#dbeafe; color:#1e40af; }
+  .card-list .item { border:1px solid var(--line); border-radius:8px; padding:10px 12px; margin-bottom:8px;
+                     display:flex; justify-content:space-between; align-items:center; }
+  .card-list .item .name { font-weight:700; }
+  .card-list .item .meta { font-size:12px; color:var(--gray); }
+  .actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:16px; }
+  .step { font-size:13px; color:var(--gray); margin:4px 0 10px; }
+  a.cardlink { color:var(--blue); font-weight:700; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🎁 ギフトセット組み依頼</h1>
+  <div class="sub">構成品のピッキング表（ロジザード貼り付け）と、子会社Notionの作業カードを一度に発行します</div>
+</header>
+
+<div class="tabs">
+  <div class="tab active" data-tab="request">① 依頼を出す</div>
+  <div class="tab" data-tab="register">② ギフトを登録</div>
+</div>
+
+<!-- ============ 依頼タブ ============ -->
+<div class="panel active" id="panel-request">
+  <h2>依頼を出す</h2>
+  <div class="row">
+    <div>
+      <label>ギフトセット</label>
+      <select id="reqSet"><option value="">― 選んでください ―</option></select>
+    </div>
+    <div>
+      <label>個数</label>
+      <input type="number" id="reqQty" min="1" step="1" placeholder="100">
+    </div>
+    <div>
+      <label>人数（任意）</label>
+      <input type="number" id="reqPeople" min="1" step="1" placeholder="3">
+    </div>
+    <div>
+      <label>納期（任意）</label>
+      <input type="date" id="reqDue">
+    </div>
+  </div>
+  <label>メモ（任意）</label>
+  <textarea id="reqNote" placeholder="子会社への伝達事項など"></textarea>
+
+  <div class="actions">
+    <button class="btn-blue" id="btnPreview">ピッキング表を作る</button>
+    <button class="btn-green" id="btnCopy" disabled>📋 ロジザードへコピー</button>
+    <button class="btn-gray" id="btnCsv" disabled>CSVダウンロード</button>
+    <button class="btn-orange" id="btnIssue" disabled>🎴 Notionに作業カードを作る</button>
+  </div>
+  <div class="step" id="notionNote"></div>
+
+  <div class="msg" id="reqMsg"></div>
+
+  <div id="previewWrap" style="display:none;">
+    <h2 style="margin-top:18px;">ピッキング表（ロジザード「出荷予定登録(卸) Excel貼り付け」用）</h2>
+    <div class="step">「📋 ロジザードへコピー」を押す → ロジザード画面で「貼り付け」を押す、で入ります（コピーは見出し行なし）。</div>
+    <table id="previewTable">
+      <thead><tr><th>商品ID</th><th>品質区分</th><th>出荷予定数</th><th>単価</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ============ 登録タブ ============ -->
+<div class="panel" id="panel-register">
+  <h2>登録済みギフト</h2>
+  <div class="card-list" id="giftList"><div class="meta">読み込み中…</div></div>
+
+  <h2 style="margin-top:22px;" id="formTitle">新しいギフトを登録</h2>
+  <input type="hidden" id="giftCode">
+  <div class="row">
+    <div>
+      <label>ギフト名 <span style="color:#dc2626">*</span></label>
+      <input type="text" id="giftName" placeholder="母の日アロマギフトA">
+    </div>
+    <div>
+      <label>単価（任意・子会社への作業代/1セット）</label>
+      <input type="number" id="giftPrice" min="0" step="1" placeholder="80">
+    </div>
+  </div>
+  <div class="row">
+    <div>
+      <label>完成見本 写真URL（任意・Driveのリンク）</label>
+      <input type="text" id="giftPhoto" placeholder="https://drive.google.com/...">
+    </div>
+    <div>
+      <label>作り方 動画URL（任意・Driveのリンク）</label>
+      <input type="text" id="giftVideo" placeholder="https://drive.google.com/...">
+    </div>
+  </div>
+  <div class="hint">※ 写真・動画は「リンクを知っている人は閲覧可」に設定してください（子会社が見られるように）。</div>
+
+  <label style="margin-top:14px;">構成品（中身）<span style="color:#dc2626">*</span></label>
+  <div class="step">商品コードを入れると候補が出ます。数量は「1セットあたり」何個使うか。</div>
+  <div id="compRows"></div>
+  <button class="btn-gray btn-sm" id="btnAddRow" type="button">＋ 構成品を追加</button>
+
+  <label style="margin-top:14px;">メモ（任意）</label>
+  <textarea id="giftMemo" placeholder="リボンは固結びで 等"></textarea>
+
+  <div class="actions">
+    <button class="btn-green" id="btnSave">保存する</button>
+    <button class="btn-gray" id="btnClear" type="button">クリア（新規）</button>
+  </div>
+  <div class="msg" id="regMsg"></div>
+</div>
+
+<datalist id="prodList"></datalist>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g,
+  (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+let lastPicking = null; // { rows:[...] }
+
+// ---- tabs ----
+document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
+  document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(x => x.classList.remove('active'));
+  t.classList.add('active');
+  $('panel-' + t.dataset.tab).classList.add('active');
+  if (t.dataset.tab === 'register') loadGiftList();
+  if (t.dataset.tab === 'request') loadGiftSelect();
+}));
+
+function showMsg(el, type, text) {
+  el.className = 'msg ' + type; el.textContent = text; el.style.display = 'block';
+}
+function hideMsg(el){ el.style.display = 'none'; }
+
+// ================= 依頼タブ =================
+async function loadGiftSelect() {
+  const sel = $('reqSet');
+  const cur = sel.value;
+  try {
+    const r = await fetch('api/list'); const d = await r.json();
+    sel.innerHTML = '<option value="">― 選んでください ―</option>';
+    (d.result || []).forEach(g => {
+      const o = document.createElement('option');
+      o.value = g.giftset_code;
+      o.textContent = `${g.giftset_name}（構成${g.component_count}品）`;
+      sel.appendChild(o);
+    });
+    sel.value = cur;
+  } catch (e) { showMsg($('reqMsg'), 'err', '一覧の取得に失敗しました'); }
+}
+
+async function refreshNotionStatus() {
+  try {
+    const r = await fetch('api/notion-status'); const d = await r.json();
+    if (!d.configured) {
+      $('btnIssue').disabled = true;
+      $('notionNote').textContent = '※ Notion連携が未設定のため作業カード作成は無効です（環境変数の設定が必要）。ピッキング表は使えます。';
+    } else {
+      $('btnIssue').disabled = false;
+      $('notionNote').textContent = '';
+    }
+    return d.configured;
+  } catch {
+    // ステータス確認の一時失敗でボタンが固定無効化されないようにする
+    // (未設定なら押下時に /api/issue が 503 を返して案内する)
+    $('btnIssue').disabled = false;
+    return false;
+  }
+}
+
+function reqInputs() {
+  return {
+    code: $('reqSet').value,
+    qty: parseInt($('reqQty').value, 10),
+    people: $('reqPeople').value ? parseInt($('reqPeople').value, 10) : null,
+    due: $('reqDue').value || null,
+    note: $('reqNote').value || null,
+  };
+}
+
+$('btnPreview').addEventListener('click', async () => {
+  hideMsg($('reqMsg'));
+  const { code, qty } = reqInputs();
+  if (!code) return showMsg($('reqMsg'), 'err', 'ギフトセットを選んでください');
+  if (!qty || qty < 1) return showMsg($('reqMsg'), 'err', '個数を入れてください');
+  try {
+    const r = await fetch(`api/picking?code=${encodeURIComponent(code)}&qty=${qty}`);
+    const d = await r.json();
+    if (!d.ok) return showMsg($('reqMsg'), 'err', d.message || 'ピッキング表の作成に失敗しました');
+    lastPicking = d.result;
+    const tb = $('previewTable').querySelector('tbody');
+    tb.innerHTML = '';
+    d.result.rows.forEach(row => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${esc(row.商品ID)}</td><td>${esc(row.品質区分)}</td><td>${row.出荷予定数}</td><td>${row.単価}</td>`;
+      tb.appendChild(tr);
+    });
+    $('previewWrap').style.display = 'block';
+    $('btnCopy').disabled = false;
+    $('btnCsv').disabled = false;
+    showMsg($('reqMsg'), 'info', `ピッキング表ができました（${d.result.rows.length}品）。コピーしてロジザードに貼り付けてください。`);
+  } catch (e) { showMsg($('reqMsg'), 'err', '通信エラー'); }
+});
+
+$('btnCopy').addEventListener('click', async () => {
+  if (!lastPicking) return;
+  // ロジザード貼り付け用 = 見出しなし・タブ区切り（商品ID / 品質区分 / 出荷予定数 / 単価）
+  const tsv = lastPicking.rows
+    .map(r => [r.商品ID, r.品質区分, r.出荷予定数, r.単価].join('\t')).join('\n');
+  try {
+    await navigator.clipboard.writeText(tsv);
+    showMsg($('reqMsg'), 'ok', 'コピーしました！ロジザードの「貼り付け」を押してください。');
+  } catch (e) {
+    showMsg($('reqMsg'), 'err', 'コピーに失敗しました。CSVダウンロードをお使いください。');
+  }
+});
+
+$('btnCsv').addEventListener('click', () => {
+  const { code, qty } = reqInputs();
+  if (!code || !qty) return;
+  window.location = `api/picking.csv?code=${encodeURIComponent(code)}&qty=${qty}`;
+});
+
+$('btnIssue').addEventListener('click', async () => {
+  hideMsg($('reqMsg'));
+  const body = reqInputs();
+  if (!body.code) return showMsg($('reqMsg'), 'err', 'ギフトセットを選んでください');
+  if (!body.qty || body.qty < 1) return showMsg($('reqMsg'), 'err', '個数を入れてください');
+  $('btnIssue').disabled = true;
+  try {
+    const r = await fetch('api/issue', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (!d.ok) { showMsg($('reqMsg'), 'err', d.message || '作業カードの作成に失敗しました'); }
+    else {
+      $('reqMsg').className = 'msg ok'; $('reqMsg').style.display = 'block';
+      const safeUrl = /^https?:\/\//i.test(d.result.url || '') ? d.result.url : '#';
+      $('reqMsg').innerHTML = `Notionに作業カードを作りました → <a class="cardlink" href="${esc(safeUrl)}" target="_blank" rel="noopener">カードを開く</a>`;
+    }
+  } catch (e) { showMsg($('reqMsg'), 'err', '通信エラー'); }
+  finally { await refreshNotionStatus(); }
+});
+
+// ================= 登録タブ =================
+async function loadGiftList() {
+  const wrap = $('giftList');
+  try {
+    const r = await fetch('api/list'); const d = await r.json();
+    const items = d.result || [];
+    if (!items.length) { wrap.innerHTML = '<div class="meta">まだ登録がありません。下のフォームから追加してください。</div>'; return; }
+    wrap.innerHTML = '';
+    items.forEach(g => {
+      const div = document.createElement('div');
+      div.className = 'item';
+      div.innerHTML = `<div><div class="name">${esc(g.giftset_name)}</div>
+        <div class="meta">構成 ${g.component_count} 品${g.unit_price != null ? ' / 単価 ' + esc(g.unit_price) + '円' : ''}</div></div>`;
+      const btns = document.createElement('div');
+      const edit = document.createElement('button'); edit.className = 'btn-blue btn-sm'; edit.textContent = '編集';
+      edit.onclick = () => editGift(g.giftset_code);
+      const del = document.createElement('button'); del.className = 'btn-gray btn-sm'; del.textContent = '削除';
+      del.style.marginLeft = '6px';
+      del.onclick = () => deleteGift(g.giftset_code, g.giftset_name);
+      btns.appendChild(edit); btns.appendChild(del);
+      div.appendChild(btns);
+      wrap.appendChild(div);
+    });
+  } catch (e) { wrap.innerHTML = '<div class="meta">読み込みに失敗しました</div>'; }
+}
+
+function addCompRow(code = '', qty = '', name = '') {
+  const div = document.createElement('div');
+  div.className = 'comp-row';
+  div.innerHTML = `
+    <input class="c-code" type="text" list="prodList" placeholder="商品コード">
+    <input class="c-qty" type="number" min="1" step="1" placeholder="数">
+    <span class="c-name"></span>
+    <button class="btn-gray btn-sm" type="button">×</button>`;
+  const codeInput = div.querySelector('.c-code');
+  const qtyInput = div.querySelector('.c-qty');
+  const nameSpan = div.querySelector('.c-name');
+  codeInput.value = code;
+  qtyInput.value = qty;
+  nameSpan.textContent = name || '';
+  codeInput.addEventListener('input', () => onProdInput(codeInput, nameSpan));
+  div.querySelector('button').onclick = () => div.remove();
+  $('compRows').appendChild(div);
+}
+
+let suggestTimer = null;
+function onProdInput(input, nameSpan) {
+  const q = input.value.trim();
+  nameSpan.textContent = '';
+  if (suggestTimer) clearTimeout(suggestTimer);
+  if (q.length < 1) return;
+  suggestTimer = setTimeout(async () => {
+    try {
+      const r = await fetch('api/suggest?q=' + encodeURIComponent(q));
+      const d = await r.json();
+      const dl = $('prodList'); dl.innerHTML = '';
+      (d.result || []).forEach(p => {
+        const o = document.createElement('option');
+        o.value = p.商品コード; o.label = `${p.商品コード}　${p.商品名 || ''}`;
+        dl.appendChild(o);
+        if (p.商品コード.toLowerCase() === q.toLowerCase()) nameSpan.textContent = p.商品名 || '';
+      });
+    } catch {}
+  }, 200);
+}
+
+function clearForm() {
+  $('giftCode').value = ''; $('giftName').value = ''; $('giftPrice').value = '';
+  $('giftPhoto').value = ''; $('giftVideo').value = ''; $('giftMemo').value = '';
+  $('compRows').innerHTML = ''; addCompRow(); addCompRow();
+  $('formTitle').textContent = '新しいギフトを登録';
+  hideMsg($('regMsg'));
+}
+
+async function editGift(code) {
+  try {
+    const r = await fetch('api/get?code=' + encodeURIComponent(code)); const d = await r.json();
+    if (!d.ok) return showMsg($('regMsg'), 'err', '取得に失敗しました');
+    const g = d.result;
+    $('giftCode').value = g.giftset_code; $('giftName').value = g.giftset_name;
+    $('giftPrice').value = g.unit_price ?? ''; $('giftPhoto').value = g.photo_url || '';
+    $('giftVideo').value = g.video_url || ''; $('giftMemo').value = g.memo || '';
+    $('compRows').innerHTML = '';
+    (g.components || []).forEach(c => addCompRow(c.商品コード, c.数量, c.商品名));
+    if (!g.components || !g.components.length) addCompRow();
+    $('formTitle').textContent = '編集：' + g.giftset_name;
+    window.scrollTo({ top: $('formTitle').offsetTop - 20, behavior: 'smooth' });
+  } catch (e) { showMsg($('regMsg'), 'err', '通信エラー'); }
+}
+
+async function deleteGift(code, name) {
+  if (!confirm(`「${name}」を一覧から削除しますか？`)) return;
+  try {
+    const r = await fetch('api/delete', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ giftset_code: code }),
+    });
+    const d = await r.json();
+    if (!d.ok) return showMsg($('regMsg'), 'err', '削除に失敗しました');
+    loadGiftList(); loadGiftSelect();
+  } catch (e) { showMsg($('regMsg'), 'err', '通信エラー'); }
+}
+
+$('btnAddRow').addEventListener('click', () => addCompRow());
+$('btnClear').addEventListener('click', clearForm);
+
+$('btnSave').addEventListener('click', async () => {
+  hideMsg($('regMsg'));
+  const components = [];
+  document.querySelectorAll('#compRows .comp-row').forEach(row => {
+    const code = row.querySelector('.c-code').value.trim();
+    const qty = row.querySelector('.c-qty').value;
+    if (code) components.push({ code, qty: parseInt(qty, 10) });
+  });
+  const payload = {
+    giftset_code: $('giftCode').value || undefined,
+    giftset_name: $('giftName').value.trim(),
+    unit_price: $('giftPrice').value || null,
+    photo_url: $('giftPhoto').value.trim() || null,
+    video_url: $('giftVideo').value.trim() || null,
+    memo: $('giftMemo').value.trim() || null,
+    components,
+  };
+  if (!payload.giftset_name) return showMsg($('regMsg'), 'err', 'ギフト名を入れてください');
+  if (!components.length) return showMsg($('regMsg'), 'err', '構成品を1つ以上入れてください');
+  try {
+    const r = await fetch('api/upsert', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+    });
+    const d = await r.json();
+    if (!d.ok) return showMsg($('regMsg'), 'err', d.message || '保存に失敗しました');
+    showMsg($('regMsg'), 'ok', '保存しました！');
+    clearForm(); loadGiftList(); loadGiftSelect();
+  } catch (e) { showMsg($('regMsg'), 'err', '通信エラー'); }
+});
+
+// 初期化
+loadGiftSelect();
+refreshNotionStatus();
+clearForm();
+</script>
+</body>
+</html>

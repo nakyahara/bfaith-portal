@@ -35,6 +35,7 @@ import bizOpsOverviewRouter from './apps/biz-ops-overview/router.js';
 import execDashboardRouter from './apps/exec-dashboard/router.js';
 import mgmtAccountingRouter from './apps/mgmt-accounting/router.js';
 import crossSellFinderRouter from './apps/cross-sell-finder/router.js';
+import giftsetAssemblyRouter from './apps/giftset-assembly/router.js';
 import inventoryMonthlyRouter, { apiRouter as inventoryMonthlyApiRouter } from './apps/inventory-monthly/router.js';
 import misShipmentRouter from './apps/mis-shipment/router.js';
 import serviceRouter from './apps/warehouse/service-router.js';
@@ -415,6 +416,15 @@ const apps = [
     category: 'analysis',
   },
   {
+    id: 'giftset-assembly',
+    name: 'ギフトセット組み依頼',
+    description: '構成品のピッキング表(ロジザード貼り付け)と子会社Notionの作業カードを発行',
+    icon: '🎁',
+    path: '/apps/giftset-assembly',
+    status: 'active',
+    category: 'shipping',
+  },
+  {
     id: 'mgmt-accounting',
     name: '売上分類別粗利集計',
     description: '各モール売上データ+運賃・資材費から売上分類別の変動費・粗利益を管理会計用に集計',
@@ -773,6 +783,7 @@ app.use('/apps/profit-analysis', requireAppAccess('profit-analysis'), profitAnal
 app.use('/apps/biz-ops-overview', requireAppAccess('biz-ops-overview'), bizOpsOverviewRouter);
 app.use('/apps/exec-dashboard', requireAppAccess('exec-dashboard'), express.json({ limit: '1mb' }), execDashboardRouter);
 app.use('/apps/cross-sell-finder', requireAppAccess('cross-sell-finder'), crossSellFinderRouter);
+app.use('/apps/giftset-assembly', requireAppAccess('giftset-assembly'), express.json({ limit: '256kb' }), giftsetAssemblyRouter);
 // 誤出荷管理 (apps/mis-shipment): warehouse-mirror.db 同居の f_mis_shipments を CRUD、注文 lookup は miniPC GET 経由
 app.use('/apps/mis-shipment', requireAppAccess('mis-shipment'), express.json({ limit: '256kb' }), misShipmentRouter);
 app.use('/apps/mgmt-accounting', express.json({ limit: '50mb' }), (req, res, next) => {

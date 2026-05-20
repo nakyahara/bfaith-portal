@@ -1554,6 +1554,51 @@ function createTables() {
   // 設計書: g:/共有ドライブ/AI_reference/システム設計/誤出荷管理システム_設計書_v5.md (中身 v7.3)
   // Codex 16 ラウンドレビュー完全 FIX、PR: feature/mis-shipment
   createMisShipmentTables();
+  createGiftsetTables();
+}
+
+// ▼▼▼ ギフトセット組み依頼（apps/giftset-assembly）正本テーブル ▼▼▼
+// f_mis_shipments と同じ方針: Render 完結書込（mirror_* と prefix 分離、ミニPC 不使用）。
+// 構成品コードは mirror_products.商品コード に存在することを API レベルで検証する。
+// ロジザード「出荷予定登録(卸)Excel貼り付け FS01_05」の商品ID = この構成品コード。
+function createGiftsetTables() {
+  // ギフトセット定義ヘッダー。giftset_code は自動採番(gs_...)。写真/動画は Drive の URL を持つ。
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS f_giftset (
+      giftset_code  TEXT PRIMARY KEY,
+      giftset_name  TEXT NOT NULL,
+      photo_url     TEXT,
+      video_url     TEXT,
+      unit_price    REAL CHECK (unit_price IS NULL OR unit_price >= 0),
+      memo          TEXT,
+      is_active     INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1)),
+      created_at    TEXT NOT NULL,
+      updated_at    TEXT NOT NULL,
+      created_by    TEXT,
+      updated_by    TEXT,
+      CHECK (trim(giftset_code) <> ''),
+      CHECK (trim(giftset_name) <> '')
+    )
+  `);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_f_giftset_active ON f_giftset(is_active)');
+
+  // ギフトセット構成（1ギフト = N構成品、1セットあたり数量）
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS f_giftset_components (
+      giftset_code  TEXT NOT NULL
+        REFERENCES f_giftset(giftset_code) ON DELETE CASCADE,
+      商品コード     TEXT NOT NULL,
+      数量          INTEGER NOT NULL DEFAULT 1 CHECK (数量 BETWEEN 1 AND 100000),
+      sort_order    INTEGER NOT NULL DEFAULT 0,
+      商品名         TEXT,
+      created_at    TEXT NOT NULL,
+      updated_at    TEXT NOT NULL,
+      PRIMARY KEY (giftset_code, 商品コード),
+      CHECK (trim(商品コード) <> '')
+    )
+  `);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_f_giftset_comp_parent ON f_giftset_components(giftset_code)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_f_giftset_comp_child ON f_giftset_components(商品コード)');
 }
 
 function createMisShipmentTables() {
