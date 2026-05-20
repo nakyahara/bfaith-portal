@@ -27,23 +27,15 @@ const MALL_LABEL = {
 };
 
 /**
- * モール別 概算粗利率 (係数方式)。
- * source: f_*_finance_sku_daily_v1 の variable_margin ÷ sales (算出期間 2026-03-21〜2026-05-20、60日)。
- *   amazon は profit_amount ÷ sales_principal_jpy (税抜基準なので税込売上に当てると僅かに過大、速報では許容)。
- * ⚠ 月次で更新すること (確定原価/手数料/広告の実績変動を反映)。
- *   更新方法: 各 fact で SUM(variable_margin) / SUM(sales) を直近60-90日で再計算。
- * mercari は finance fact が無いため MARGIN_RATE_DEFAULT で代替 (暫定)。
+ * 概算粗利率 (あらり率)。中原さんの社内運用値「あらり率(税抜) 13%」を採用。
+ *   - 粗利率は税抜で見るのが標準 (会計の売上高=税抜)。中原さんの「全体13%」も税抜ベース。
+ *   - 速報の売上金額は税込 (現金入金額) のままなので、率を当てる時だけ税抜換算する。
+ *   - 概算粗利(税抜) = 税込売上 ÷ TAX_DIVISOR × GROSS_MARGIN_RATE_TAX_EXCL。
+ * 参考: finance fact の variable_margin から積み上げると税抜 ~16% (ただし広告費控除前)。
+ *   13% は広告費等を引いた後の中原さんの実感/P/L 値。変えたい時はここの 0.13 を変更。
  */
-const MARGIN_RATE = {
-  amazon: 0.134,
-  rakuten: 0.210,
-  yahoo: 0.163,
-  aupay: 0.149,
-  linegift: 0.469,
-  qoo10: 0.211,
-};
-const MARGIN_RATE_DEFAULT = 0.18; // fact 無しモール (mercari 等) の暫定係数
-const MARGIN_RATE_UPDATED = '2026-05'; // ⚠ 係数を更新したらここも更新 (通知に表示される)
+const GROSS_MARGIN_RATE_TAX_EXCL = 0.13;
+const TAX_DIVISOR = 1.10; // 税込→税抜 概算 (大半10%、軽減8%は誤差として許容)
 
 /**
  * UTC タイムスタンプ文字列 ('YYYY-MM-DD HH:MM:SS' or ISO 'Z') を epoch ms に。
@@ -87,6 +79,22 @@ function man(n) {
   const v = Math.round(n || 0);
   if (Math.abs(v) >= 1e8) return (v / 1e8).toFixed(2) + '億';
   return Math.round(v / 1e4).toLocaleString() + '万';
+}
+
+/** 'YYYY-MM-DD' → 'M/D' (スマホ向けに短く) */
+function mmdd(dateStr) {
+  return `${parseInt(dateStr.slice(5, 7), 10)}/${parseInt(dateStr.slice(8, 10), 10)}`;
+}
+
+/**
+ * 半角 ASCII を全角に変換 (スペース→全角スペース)。
+ * 理由: GChat 等幅は日本語(全角)を半角ちょうど2倍で描画しないため、半角ラベルを左に置くと
+ *   右側の数字がズレる。ラベルを全て全角に揃えると 1 文字=一定幅になり、左ラベル+右数字でも桁が揃う。
+ */
+function toFullWidth(s) {
+  return String(s)
+    .replace(/[\x21-\x7E]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 0xFEE0))
+    .replace(/ /g, '　');
 }
 
 /**
@@ -134,15 +142,11 @@ function aggregateRange(db, fromDate, toDate) {
       }
     }
   }
-  // (5) 概算粗利速報: present なモールのみ 売上 × 係数 を加算
-  let grossProfit = 0;
-  for (const m of MALL_ORDER) {
-    if (byMall[m].present) {
-      grossProfit += byMall[m].sales * (MARGIN_RATE[m] ?? MARGIN_RATE_DEFAULT);
-    }
-  }
-  grossProfit = Math.round(grossProfit);
-  const marginRate = total > 0 ? grossProfit / total : null;
+  // (5) 概算粗利速報: あらり率(税抜)13% を税抜売上に当てる。
+  //   税抜売上 = 税込売上 ÷ TAX_DIVISOR。粗利率は税抜表示 (中原さんの「13%」と同じ土俵)。
+  const salesExcl = total / TAX_DIVISOR;
+  const grossProfit = Math.round(salesExcl * GROSS_MARGIN_RATE_TAX_EXCL);
+  const marginRate = total > 0 ? GROSS_MARGIN_RATE_TAX_EXCL : null; // 税抜あらり率 (固定)
   return { byMall, total, totalUnits, grossProfit, marginRate };
 }
 
@@ -227,66 +231,74 @@ export function getSalesSummary(db) {
 }
 
 /**
- * GChat 通知用の compact 表 (mrkdwn)
- *   memory ヘッダー規約: *XXサマリ ...*
+ * GChat 通知用テキスト (スマホ最適化、2026-05-20 改訂)。
+ *   - 等幅コードブロックの横ワイド表はスマホで折り返して崩れるため廃止。
+ *   - 前日 / 今月累計 / 過去30日 を「別セクション」に分割、1モール1行 (ラベル: 金額) の縦並び。
+ *   - 各セクションは金額降順 (大きいモールが上)、欠損は N/A で末尾。
+ *   - 前日は ¥フル (日次は精度重視)、今月累計/過去30日は 億・万 (大きい値の可読性重視)。
+ *   memory ヘッダー規約: *XXサマリ ...* / 経営向け金額は 億・万 ([[feedback-japanese-currency-units]])。
  */
 export function formatGChatSummary(summary) {
-  const yenFmt = (n) => '¥' + (n || 0).toLocaleString();
+  const yen = (n) => '¥' + Math.round(n || 0).toLocaleString();
   const lines = [];
 
-  // ── ヘッダー (前日・暫定ラベル) ──
-  lines.push(`*📊 売上速報 ${summary.asOf}(${weekdayJpFromJstDate(summary.asOf)}) ※暫定値*`);
-
-  // ── (1) 鮮度ガード ──
+  // ── ヘッダー + 鮮度 ──
+  lines.push(`*📊 売上速報 ${mmdd(summary.asOf)}(${weekdayJpFromJstDate(summary.asOf)})* ※暫定値`);
   const f = summary.freshness;
   const incomplete = !!(f && f.available && (f.stale || (f.mallsBehind && f.mallsBehind.length > 0)));
   if (f && f.available) {
     const ageStr = Number.isFinite(f.ageHours) ? `約${Math.round(f.ageHours)}h前` : '時刻不明';
-    lines.push(`🕐 最終取込: ${fmtJst(f.lastSyncMs)} (${ageStr})`);
-    if (f.stale) {
-      lines.push(`⚠️ データが古い可能性。最新の sync が走っていないかも (確認推奨)`);
-    }
+    lines.push(`🕐 最終取込 ${fmtJst(f.lastSyncMs)}(${ageStr})`);
+    if (f.stale) lines.push(`⚠️ データが古い可能性 (sync 未実行かも・確認推奨)`);
     if (f.mallsBehind && f.mallsBehind.length > 0) {
-      const labels = f.mallsBehind.map((m) => summary.mallLabel[m] || m).join('・');
-      lines.push(`⚠️ 前日分が未取込: ${labels}`);
+      lines.push(`⚠️ 前日未取込: ${f.mallsBehind.map((m) => summary.mallLabel[m] || m).join('・')}`);
     }
   } else {
-    lines.push(`🕐 最終取込: 取得不可 (view 未更新)`);
+    lines.push('🕐 最終取込 取得不可 (view 未更新)');
   }
 
-  // ── 売上テーブル ──
-  lines.push('```');
-  lines.push('モール        | 前日       | 今月累計    | 過去30日');
-  lines.push('-------------+------------+-------------+-------------');
-  for (const m of summary.mallOrder) {
-    const label = (summary.mallLabel[m] || m).padEnd(12, ' ');
-    const y = summary.yesterday.byMall[m];
-    const mt = summary.monthToDate.byMall[m];
-    const l30 = summary.last30days.byMall[m];
-    const yStr = y.present ? yenFmt(y.sales).padStart(10, ' ') : '       N/A';
-    const mtStr = mt.present ? yenFmt(mt.sales).padStart(11, ' ') : '        N/A';
-    const l30Str = l30.present ? yenFmt(l30.sales).padStart(11, ' ') : '        N/A';
-    lines.push(`${label} | ${yStr} | ${mtStr} | ${l30Str}`);
-  }
-  lines.push('-------------+------------+-------------+-------------');
-  lines.push(`合計         | ${yenFmt(summary.yesterday.total).padStart(10, ' ')} | ${yenFmt(summary.monthToDate.total).padStart(11, ' ')} | ${yenFmt(summary.last30days.total).padStart(11, ' ')}`);
-  lines.push('```');
+  // ── セクション生成 (金額降順、欠損末尾) ──
+  //   モール名を左 (全角統一で幅を均一化) → 数字を右に右揃え。
+  //   全角ラベルを文字数で揃え + 数字は ASCII 等幅で右揃えなので、両カラムとも桁が揃う。
+  const section = (title, totalText, range, fmt) => {
+    lines.push('');
+    lines.push(`*▼ ${title}｜合計 ${totalText}*`);
+    const ordered = [...summary.mallOrder].sort((a, b) => {
+      const A = range.byMall[a], B = range.byMall[b];
+      if (A.present !== B.present) return A.present ? -1 : 1;
+      return (B.sales || 0) - (A.sales || 0);
+    });
+    const fwLabels = ordered.map((m) => toFullWidth(summary.mallLabel[m] || m));
+    const labelW = Math.max(...fwLabels.map((l) => [...l].length));
+    const valStrs = ordered.map((m) => (range.byMall[m].present ? fmt(range.byMall[m].sales) : 'N/A'));
+    const valW = Math.max(...valStrs.map((s) => s.length));
+    lines.push('```');
+    ordered.forEach((m, i) => {
+      const labelPad = fwLabels[i] + '　'.repeat(labelW - [...fwLabels[i]].length);
+      lines.push(`${labelPad} ${valStrs[i].padStart(valW)}`);
+    });
+    lines.push('```');
+  };
 
-  // ── (5) 概算粗利速報 ──
-  const yGp = summary.yesterday.grossProfit;
-  const yRate = summary.yesterday.marginRate;
+  // 前日 (¥フル)
+  section(`前日 ${mmdd(summary.asOf)}`, yen(summary.yesterday.total), summary.yesterday, yen);
   if (summary.yesterday.total > 0) {
-    lines.push(`概算粗利(速報): 前日 約${man(yGp)} (粗利率 約${yRate != null ? Math.round(yRate * 100) : '-'}%) ※係数推定`);
+    const r = summary.yesterday.marginRate;
+    lines.push(`└ 概算粗利 約${man(summary.yesterday.grossProfit)} (粗利率${r != null ? Math.round(r * 100) : '-'}%・税抜)`);
   }
 
-  // ── (3) 今月着地見込み ── (Codex R1 high 反映: データ欠損時は「参考値」に弱める)
+  // 今月累計 (億・万)
+  section('今月累計', man(summary.monthToDate.total), summary.monthToDate, man);
   const fc = summary.monthToDate.forecast;
   if (fc) {
-    const note = incomplete ? ' ※欠損あり・参考値' : '';
-    lines.push(`今月着地見込: 売上 ${man(fc.sales)} / 粗利 ${man(fc.grossProfit)}  (累計 ${man(summary.monthToDate.total)}・${fc.elapsedDays}/${fc.daysInMonth}日)${note}`);
+    lines.push(`└ 着地見込 ${man(fc.sales)} (粗利 ${man(fc.grossProfit)})${incomplete ? ' ※参考値' : ''}`);
   }
 
-  lines.push(`期間: 前日=${summary.yesterday.date} / 今月=${summary.monthToDate.period} / 過去30日=${summary.last30days.period}`);
-  lines.push(`※暫定値 (確定で増加、特にAmazonは当日夜〜翌に伸びる)。粗利は係数推定 (${MARGIN_RATE_UPDATED}更新・月次見直し)。f_sales_by_listing 経由・税込`);
+  // 過去30日 (億・万)
+  section('過去30日', man(summary.last30days.total), summary.last30days, man);
+
+  // ── フッター ──
+  lines.push('');
+  lines.push('※暫定値 (確定で増加、特にAmazon)。粗利率は税抜13% (社内基準) で概算');
   return lines.join('\n');
 }
