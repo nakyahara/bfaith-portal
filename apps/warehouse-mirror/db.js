@@ -1468,6 +1468,17 @@ function createTables() {
   // hotfix v3: 列名を英語化 (date_jst 等)。router.js の date_range strategy が `WHERE date_jst IN (...)` を
   //   ハードコード使用しているため、日本語列だと 500 エラーになる。他 mirror_*_finance_sku_daily も英語列で揃ってる。
   // PK: (date_jst, mall, item_code, channel) — miniPC f_sales_by_listing (日本語列) からは sync runner 側で mapping
+  // ⚠️ migration: PR #156 で日本語列で作成した既存 mirror_f_sales_by_listing が残ってる場合、
+  //   CREATE TABLE IF NOT EXISTS は no-op なので英語列にならない → 旧列検知して DROP + 再作成
+  try {
+    const existingCols = db.prepare("PRAGMA table_info(mirror_f_sales_by_listing)").all().map(c => c.name);
+    if (existingCols.length > 0 && !existingCols.includes('date_jst')) {
+      console.warn('[mirror] mirror_f_sales_by_listing に date_jst 列なし (PR #156 旧 DDL の名残) → DROP して英語列で再作成');
+      db.exec('DROP TABLE IF EXISTS mirror_f_sales_by_listing');
+    }
+  } catch (e) {
+    // テーブル未存在等は無視 (CREATE で作る)
+  }
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_f_sales_by_listing (
     date_jst          TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
     month_ym          TEXT NOT NULL,
