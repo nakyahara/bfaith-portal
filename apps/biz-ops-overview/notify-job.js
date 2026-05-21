@@ -9,12 +9,14 @@
  *
  * 環境変数:
  *   SALES_NOTIFY_ENABLED  - 'true'/'1' で起動時にスケジュール、未設定/'false'はスキップ
- *   SALES_NOTIFY_CRON     - cron式 (デフォルト '0 22 * * *' = UTC22:00 = JST 07:00、在庫と同時刻)
+ *   SALES_NOTIFY_CRON     - cron式 (デフォルト '0 0 * * *' = UTC00:00 = JST 09:00)
  *   GCHAT_WEBHOOK_INSIGHT - 経営インサイトスペースの Webhook URL (在庫通知と共用)
  *
- * cron 時刻設計 (Codex 助言):
- *   - JST 07:00 時点で前日 (today-1) のデータが各モール ingest 完了済の前提
- *   - 在庫通知と同時刻だが「別メッセージ」として並列送信される (順序は非保証)
+ * cron 時刻設計 (2026-05-21 修正):
+ *   - ⚠️ miniPC daily-sync は JST 07:00 開始で f_sales→mirror sync 完了は ~08:20 (3か月分)。
+ *     当初 07:00 通知にしていたら取り込み前の古い mirror を読んで前日値が出る事故 (5/21朝)。
+ *   - そのため通知は daily-sync 完了後の JST 09:00 に発火 (mirror が当日分で更新済みの想定)。
+ *   - 万一 sync 未完了でも sales-summary の鮮度ガードが「⚠️ データが古い」を出す (二重防御)。
  */
 import cron from 'node-cron';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
@@ -67,7 +69,7 @@ export function startSalesNotificationJob() {
     console.log('[biz-ops-overview/notify-job] SALES_NOTIFY_ENABLED が未設定/falseのためスケジュールしない (Dark Launch)');
     return null;
   }
-  const cronExpr = process.env.SALES_NOTIFY_CRON || '0 22 * * *'; // UTC 22:00 = JST 07:00 (在庫と同時刻)
+  const cronExpr = process.env.SALES_NOTIFY_CRON || '0 0 * * *'; // UTC 00:00 = JST 09:00 (daily-sync 完了 ~08:20 の後)
   if (!cron.validate(cronExpr)) {
     console.error(`[biz-ops-overview/notify-job] SALES_NOTIFY_CRON が不正: ${cronExpr}`);
     return null;
@@ -77,6 +79,6 @@ export function startSalesNotificationJob() {
       console.error('[biz-ops-overview/notify-job] cron 実行中に未捕捉例外:', e);
     });
   }, { timezone: 'UTC' });
-  console.log(`[biz-ops-overview/notify-job] cron schedule 起動: '${cronExpr}' (UTC) — JST 07:00 想定 (在庫通知と同時刻、独立メッセージ)`);
+  console.log(`[biz-ops-overview/notify-job] cron schedule 起動: '${cronExpr}' (UTC) — JST 09:00 想定 (daily-sync 完了後、mirror 更新済みを読む)`);
   return task;
 }
