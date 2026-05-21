@@ -106,6 +106,8 @@ systemd は `/home/rocky/bfaith-portal/vps-proxy/aupay-proxy.js` を実行。
 | POST | `/yahoo/token/init` | secret | 認可コードから token 初期化 |
 | GET | `/yahoo/token/refresh` | secret | refresh だけ実行 (token は返さない) |
 | **POST** | **`/yahoo/access-token`** | **secret + mint-secret** | **current access_token を返却。必要なら自動 refresh。Render/ローカルから Yahoo 商品系 API を直接叩く用 (RakutenYahooSync)** |
+| GET | `/yahoo/item-search` | secret | 一般公開 itemSearch v3 (近傍商品法、カテゴリ AI 補完用)。appid=YAHOO_CLIENT_ID |
+| GET | `/yahoo/category-search` | secret | 一般公開 categorySearch (カテゴリツリー)。appid=YAHOO_CLIENT_ID |
 | GET | `/yahoo/orderList` | secret | 受注一覧 (固定 IP 必須) |
 | GET/POST | `/yahoo/orderInfo` | secret | 受注詳細 |
 | GET | `/wmshopapi/...` | secret | au PAY 透過 proxy |
