@@ -150,8 +150,16 @@ function aggregateRange(db, fromDate, toDate) {
   return { byMall, total, totalUnits, grossProfit, marginRate };
 }
 
+// 「常時稼働」判定: 前日を除く直近7日のうち、これ以上の日数データがあれば毎日売れているモールとみなす。
+//   常時稼働モールが前日データ無し = 未取込(同期失敗の疑い)。
+//   そうでない(たまにしか売れない)モールが前日データ無し = 売上0。
+const REGULAR_DAYS_THRESHOLD = (() => {
+  const n = parseInt(process.env.SALES_REGULAR_DAYS, 10);
+  return Number.isFinite(n) ? Math.min(7, Math.max(1, n)) : 6; // 1..7 に clamp、既定 6
+})();
+
 /**
- * (1) データ鮮度: 最終取込時刻 + stale 判定 + 前日未取込モール。
+ * (1) データ鮮度: 最終取込時刻 + stale 判定 + 前日「未取込」モール (売上0 と区別)。
  * view に data_synced_at 列が無い古いスキーマでは available:false で degrade (本体は継続)。
  */
 function getDataFreshness(db, asOf) {
@@ -163,31 +171,49 @@ function getDataFreshness(db, asOf) {
     `).get();
     lastSync = r?.last_sync || null;
     latestDate = r?.latest_date || null;
+    // 前日(asOf)を除く直近7日 [asOf-7, asOf-1] でモール別の実績日数を数える。
+    const winStart = addDaysJst(asOf, -7);
+    const winEnd = addDaysJst(asOf, -1);
     perMall = db.prepare(`
-      SELECT mall, MAX(date_jst) AS latest_date
+      SELECT mall,
+             MAX(date_jst) AS latest_date,
+             COUNT(DISTINCT CASE WHEN date_jst >= ? AND date_jst <= ? THEN date_jst END) AS recent_days
       FROM v_mall_sales_daily_unified GROUP BY mall
-    `).all();
+    `).all(winStart, winEnd);
   } catch (e) {
     return { available: false };
   }
   const ageMs = lastSync ? parseUtcMs(lastSync) : NaN;
   const ageHours = Number.isFinite(ageMs) ? (Date.now() - ageMs) / 3600000 : null;
-  // 前日 (asOf) が未取込のモール (= 最新日付が asOf に届いていない)。
-  // Codex R1 high 反映: 直近7日以内に実績があったモールのみ監視 (未連携/休止モールのノイズ除外)。
-  const recentCutoff = addDaysJst(asOf, -7);
-  const mallsBehind = (perMall || [])
-    .filter((m) => MALL_ORDER.includes(m.mall) && (m.latest_date || '') < asOf && (m.latest_date || '') >= recentCutoff)
-    .map((m) => m.mall);
   const staleHours = Number(process.env.SALES_FRESH_MAX_HOURS) || 26;
   const stale =
     (!!latestDate && latestDate < asOf) ||
     (ageHours != null && ageHours > staleHours);
+
+  // 常時稼働モール集合 (直近7日で REGULAR_DAYS_THRESHOLD 日以上データあり)
+  const regularMalls = new Set(
+    (perMall || [])
+      .filter((m) => MALL_ORDER.includes(m.mall) && (m.recent_days || 0) >= REGULAR_DAYS_THRESHOLD)
+      .map((m) => m.mall)
+  );
+  const latestByMall = {};
+  for (const m of perMall || []) latestByMall[m.mall] = m.latest_date || '';
+
+  // 「前日未取込」= 常時稼働なのに前日データが無いモール (= 同期失敗の疑い)。
+  //   全体 stale 時は全モール未取込扱い (パイプライン未実行)。
+  const mallsBehind = MALL_ORDER.filter((m) => {
+    const missingYesterday = (latestByMall[m] || '') < asOf;
+    if (!missingYesterday) return false;
+    return stale || regularMalls.has(m);
+  });
+
   return {
     available: true,
     lastSync,
     lastSyncMs: Number.isFinite(ageMs) ? ageMs : null,
     ageHours,
     latestDate,
+    regularMalls: [...regularMalls],
     mallsBehind,
     stale,
   };
@@ -260,7 +286,8 @@ export function formatGChatSummary(summary) {
   // ── セクション生成 (金額降順、欠損末尾) ──
   //   モール名を左 (全角統一で幅を均一化) → 数字を右に右揃え。
   //   全角ラベルを文字数で揃え + 数字は ASCII 等幅で右揃えなので、両カラムとも桁が揃う。
-  const section = (title, totalText, range, fmt) => {
+  //   resolveEmpty(m): データ無しモールの表示を解決 (前日のみ 売上0/未取込 を出し分け、他は N/A)。
+  const section = (title, totalText, range, fmt, resolveEmpty) => {
     lines.push('');
     lines.push(`*▼ ${title}｜合計 ${totalText}*`);
     const ordered = [...summary.mallOrder].sort((a, b) => {
@@ -270,7 +297,9 @@ export function formatGChatSummary(summary) {
     });
     const fwLabels = ordered.map((m) => toFullWidth(summary.mallLabel[m] || m));
     const labelW = Math.max(...fwLabels.map((l) => [...l].length));
-    const valStrs = ordered.map((m) => (range.byMall[m].present ? fmt(range.byMall[m].sales) : 'N/A'));
+    const valStrs = ordered.map((m) =>
+      range.byMall[m].present ? fmt(range.byMall[m].sales) : (resolveEmpty ? resolveEmpty(m) : 'N/A')
+    );
     const valW = Math.max(...valStrs.map((s) => s.length));
     lines.push('```');
     ordered.forEach((m, i) => {
@@ -280,8 +309,13 @@ export function formatGChatSummary(summary) {
     lines.push('```');
   };
 
-  // 前日 (¥フル)
-  section(`前日 ${mmdd(summary.asOf)}`, yen(summary.yesterday.total), summary.yesterday, yen);
+  // 前日 (¥フル)。データ無しは「未取込」(常時稼働モールが欠損 or 全体stale) と「¥0」(売上0) を区別。
+  //   鮮度が取得不能 (古いスキーマ等) のときは判定材料が無いため N/A 維持 (0 と誤表示しない)。
+  const behindSet = new Set((f && f.available && f.mallsBehind) || []);
+  const resolveYesterday = (f && f.available)
+    ? (m) => (behindSet.has(m) ? '未取込' : yen(0))
+    : undefined;
+  section(`前日 ${mmdd(summary.asOf)}`, yen(summary.yesterday.total), summary.yesterday, yen, resolveYesterday);
   if (summary.yesterday.total > 0) {
     const r = summary.yesterday.marginRate;
     lines.push(`└ 概算粗利 約${man(summary.yesterday.grossProfit)} (粗利率${r != null ? Math.round(r * 100) : '-'}%・税抜)`);
