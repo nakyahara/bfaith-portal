@@ -13,6 +13,8 @@
  *   POST http://133.167.122.198:8080/yahoo/orderInfo  body: { orderIds: [...] }
  *   POST http://133.167.122.198:8080/yahoo/token/init  body: { code: "認可コード" }
  *   POST http://133.167.122.198:8080/yahoo/access-token (returns current access_token, refreshes if expired)
+ *   GET  http://133.167.122.198:8080/yahoo/item-search?query=...&results=20 (public API, appid)
+ *   GET  http://133.167.122.198:8080/yahoo/category-search?category_id=... (public API, appid)
  *   GET  http://133.167.122.198:8080/yahoo/auth-url
  *   Header: X-Proxy-Secret
  */
@@ -49,6 +51,9 @@ const YAHOO_PUBLIC_KEY_PATH = process.env.YAHOO_PUBLIC_KEY_PATH || path.join(__d
 const YAHOO_SIGNATURE_VERSION = process.env.YAHOO_SIGNATURE_VERSION || '4';
 const YAHOO_TOKEN_URL = 'https://auth.login.yahoo.co.jp/yconnect/v2/token';
 const YAHOO_API_BASE = 'https://circus.shopping.yahooapis.jp/ShoppingWebService/V1';
+// 一般公開 Yahoo!ショッピング API (appid=Client ID 認証)。出店者 API (circus) と別系統。
+// カテゴリ自動学習の AI 補完で「未進出カテゴリ」を Yahoo 全体から推定するのに使う。
+const YAHOO_PUBLIC_API_BASE = 'https://shopping.yahooapis.jp/ShoppingWebService';
 const YAHOO_REDIRECT_URI = process.env.YAHOO_REDIRECT_URI || 'https://b-faith.biz';
 // git pull deploy 時にトークンを repo ディレクトリ外に置けるよう env で上書き可能にする
 // (.env に YAHOO_TOKEN_FILE=/home/rocky/yahoo-tokens.json を設定推奨)
@@ -214,6 +219,19 @@ async function initTokenFromCode(code) {
   };
   saveTokens(tokens);
   return tokens;
+}
+
+// ─── Yahoo 一般公開 API (appid=Client ID 認証、token 不要) ───
+
+async function yahooPublicGet(apiPath, params = {}) {
+  const u = new URL(`${YAHOO_PUBLIC_API_BASE}${apiPath}`);
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null) u.searchParams.set(k, String(v));
+  }
+  u.searchParams.set('appid', YAHOO_CLIENT_ID);
+  const res = await fetch(u, { signal: AbortSignal.timeout(15000) });
+  const body = await res.text();
+  return { status: res.status, contentType: res.headers.get('content-type') || 'application/json', body };
 }
 
 // ─── Yahoo API呼び出し ───
@@ -422,6 +440,47 @@ const server = http.createServer(async (req, res) => {
           res.end(JSON.stringify({ ok: false, error: 'upstream refresh failed' }));
         }
       }
+      return;
+    }
+
+    // 一般公開 API: 近傍商品検索 (カテゴリ AI 補完用)。GET 限定、appid 未設定なら 503。
+    if (pathname === '/yahoo/item-search') {
+      if (req.method !== 'GET') {
+        res.writeHead(405, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Method Not Allowed' }));
+        return;
+      }
+      if (!YAHOO_CLIENT_ID) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'YAHOO_CLIENT_ID (appid) not configured' }));
+        return;
+      }
+      const query = url.searchParams.get('query') || '';
+      if (!query) throw new Error('query が必要です');
+      const results = Math.min(Math.max(parseInt(url.searchParams.get('results'), 10) || 20, 1), 50);
+      const r = await yahooPublicGet('/V3/itemSearch', { query, results });
+      res.writeHead(r.status, { 'Content-Type': r.contentType });
+      res.end(r.body);
+      return;
+    }
+
+    // 一般公開 API: カテゴリツリー取得 (category_id 指定、子カテゴリ含む)。GET 限定。
+    if (pathname === '/yahoo/category-search') {
+      if (req.method !== 'GET') {
+        res.writeHead(405, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Method Not Allowed' }));
+        return;
+      }
+      if (!YAHOO_CLIENT_ID) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'YAHOO_CLIENT_ID (appid) not configured' }));
+        return;
+      }
+      const categoryId = url.searchParams.get('category_id') || '1';
+      if (!/^\d+$/.test(categoryId)) throw new Error('category_id は数値で指定してください');
+      const r = await yahooPublicGet('/V1/categorySearch', { category_id: categoryId });
+      res.writeHead(r.status, { 'Content-Type': r.contentType });
+      res.end(r.body);
       return;
     }
 
