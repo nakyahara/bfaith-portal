@@ -24,8 +24,10 @@
  */
 import 'dotenv/config';
 import { initDB, getDB } from './db.js';
+import { STALE_TTL_HOURS as TTL_HOURS } from './fee-cache-policy.js';
 
-const TTL_HOURS = 7 * 24;                        // 鮮度しきい値 168h (fetch-amazon-fees と揃える、Codex #4 hour 単位)
+// TTL_HOURS = 鮮度しきい値 = stale/alert 閾値 (= SLO、168h)。fee-cache-policy.js に集約。
+// ⚠️ 更新ジョブ fetch-amazon-fees.js は実効 96〜144h (基準120h) で意図的にこれより手前で refresh する (境界レース防止、揃えてはいけない)
 const WARN_WEIGHTED_COVERAGE_PCT = 98;
 const CRITICAL_WEIGHTED_COVERAGE_PCT = 95;
 const TOP_N_UNCOVERED = 20;
