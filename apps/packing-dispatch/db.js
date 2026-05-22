@@ -136,8 +136,7 @@ export function ensureSchema() {
       UNIQUE (sku_key, mall_group, qty_min),
       CHECK (qty_min >= 1),
       CHECK (qty_max IS NULL OR qty_max >= qty_min),
-      CHECK ( (shipping_method_code='nekopos' AND packing_machine_code IN ('pasline3','pasline2','meltline'))
-           OR (shipping_method_code<>'nekopos' AND packing_machine_code='manual') )
+      CHECK ( packing_machine_code='manual' OR shipping_method_code='nekopos' )
     );
     CREATE INDEX IF NOT EXISTS idx_pd_rule_pc ON pd_shipping_rule(product_code);
     CREATE INDEX IF NOT EXISTS idx_pd_rule_lookup ON pd_shipping_rule(sku_key, mall_group);
@@ -151,8 +150,7 @@ export function ensureSchema() {
       packing_machine_code TEXT NOT NULL REFERENCES pd_packing_machine(code),
       is_active INTEGER NOT NULL DEFAULT 1,
       decided_by TEXT, decided_at TEXT,
-      CHECK ( (shipping_method_code='nekopos' AND packing_machine_code IN ('pasline3','pasline2','meltline'))
-           OR (shipping_method_code<>'nekopos' AND packing_machine_code='manual') )
+      CHECK ( packing_machine_code='manual' OR shipping_method_code='nekopos' )
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_pd_assort_active
       ON pd_assort_decision(combo_key, combo_key_version) WHERE is_active=1;
