@@ -105,9 +105,9 @@
       </div>
     </div>
     <div class="card">
-      <strong>登録済みルール</strong>
+      <strong>登録済みルール</strong> <span class="muted">（行をクリックで上の編集フォームに読み込み）</span>
       <div class="scroll" style="max-height:36vh"><table>
-        <thead><tr><th>SKU</th><th>モール</th><th>数量帯</th><th>配送方法</th><th>梱包機</th></tr></thead>
+        <thead><tr><th>商品コード</th><th>モール</th><th>数量帯</th><th>配送方法</th><th>梱包機</th></tr></thead>
         <tbody id="rulesBody"></tbody>
       </table></div>
     </div>
@@ -266,7 +266,11 @@ async function loadRules(){
   const rows = await api(`api/rules?product=${encodeURIComponent(pc)}`);
   const tb=$('#rulesBody'); tb.innerHTML='';
   for(const r of rows){ const tr=document.createElement('tr');
-    tr.innerHTML=`<td>${esc(r.sku_key)}</td><td>${esc(r.mall_group)}</td><td>${r.qty_min}〜${r.qty_max??'∞'}</td><td>${esc(methodName(r.shipping_method_code))}</td><td>${esc(machineName(r.packing_machine_code))}</td>`;
+    const parts=String(r.sku_key||'').split('::'); const variant=[parts[1],parts[2]].filter(Boolean).join('/');
+    const codeDisp=esc(r.product_code)+(variant?` <span class="muted">(${esc(variant)})</span>`:'');
+    tr.innerHTML=`<td>${codeDisp}</td><td>${esc(r.mall_group)}</td><td>${r.qty_min}〜${r.qty_max??'∞'}</td><td>${esc(methodName(r.shipping_method_code))}</td><td>${esc(machineName(r.packing_machine_code))}</td>`;
+    tr.style.cursor='pointer'; tr.title='クリックで編集フォームへ読み込み';
+    tr.onclick=()=>{ $('#mProduct').value=r.product_code; $('#mMall').value=r.mall_group; loadRules(); };
     tb.appendChild(tr); }
   // 既存(該当モール)を編集欄へ
   const mall=$('#mMall').value;
