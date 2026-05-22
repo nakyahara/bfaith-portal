@@ -7,7 +7,7 @@ import {
   ensureSchema, utcIsoNow, norm, buildSkuKey, normProductCode,
   finalizeLine, classifyOrder, shippingMethodMap, mallGroupOf,
   saveAssortDecision, comboKeyOf, listUnregistered, mirrorFreshness,
-  COL,
+  COL, MALL_GROUPS,
 } from './db.js';
 import { parseNeCsv, buildNeCsv } from './csv.js';
 
@@ -240,7 +240,7 @@ export function upsertRules({ product_code, color_name, size_name, mall_group, t
   const db = ensureSchema();
   const pc = normProductCode(product_code);
   if (!pc) throw vErr('商品コードが必要です');
-  const mg = (mall_group === 'amazon') ? 'amazon' : 'rakuten';
+  const mg = MALL_GROUPS.includes(mall_group) ? mall_group : 'rakuten';
   const sku_key = buildSkuKey(product_code, color_name, size_name);
   if (!Array.isArray(tiers) || tiers.length === 0) throw vErr('数量帯を1つ以上指定してください');
 

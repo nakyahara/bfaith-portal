@@ -66,13 +66,14 @@ const PACKING_MACHINES = [
 const SHOP_MALL_MAP = [
   ['雑貨イズムAmazon店',     'amazon'],
   ['雑貨イズム楽天市場店',   'rakuten'],
-  ['雑貨イズムYahoo!店',     'rakuten'],
+  ['雑貨イズムYahoo!店',     'yahoo'],   // Yahoo は個別保持 (無ければ rakuten にフォールバック)
   ['LINE ギフト',            'rakuten'],
   ['雑貨イズムメルカリshops', 'rakuten'],
   ['雑貨イズムauPay!店',     'rakuten'],
   ['雑貨イズムQoo10店',      'rakuten'],
 ];
-const DEFAULT_MALL_GROUP = 'rakuten'; // 未知ショップのフォールバック
+const MALL_GROUPS = ['amazon', 'rakuten', 'yahoo'];
+const DEFAULT_MALL_GROUP = 'rakuten'; // 未知ショップ・ルール無し時のフォールバック
 
 const COMBO_KEY_VERSION = 1;
 const NEKOPOS_PACKING = ['pasline3', 'pasline2', 'meltline']; // ネコポスで許される梱包機
@@ -437,4 +438,4 @@ export function mirrorFreshness() {
   } catch { return null; }
 }
 
-export { COMBO_KEY_VERSION, shippingMethodMap, mallGroupOf };
+export { COMBO_KEY_VERSION, shippingMethodMap, mallGroupOf, MALL_GROUPS, DEFAULT_MALL_GROUP };
