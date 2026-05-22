@@ -333,6 +333,7 @@ export function formatGChatSummary(summary) {
 
   // ── フッター ──
   lines.push('');
-  lines.push('※暫定値 (確定で増加、特にAmazon)。粗利率は税抜13% (社内基準) で概算');
+  lines.push('※直近72時間(特にAmazon)は実際より低めに出ます: 支払い未承認(Pending)の注文は金額が後から計上されるため。数日かけて確定値に近づきます');
+  lines.push('※粗利率は税抜13%(社内基準)で概算');
   return lines.join('\n');
 }
