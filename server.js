@@ -36,6 +36,7 @@ import execDashboardRouter from './apps/exec-dashboard/router.js';
 import mgmtAccountingRouter from './apps/mgmt-accounting/router.js';
 import crossSellFinderRouter from './apps/cross-sell-finder/router.js';
 import giftsetAssemblyRouter from './apps/giftset-assembly/router.js';
+import packingDispatchRouter from './apps/packing-dispatch/router.js';
 import inventoryMonthlyRouter, { apiRouter as inventoryMonthlyApiRouter } from './apps/inventory-monthly/router.js';
 import misShipmentRouter from './apps/mis-shipment/router.js';
 import serviceRouter from './apps/warehouse/service-router.js';
@@ -425,6 +426,15 @@ const apps = [
     category: 'shipping',
   },
   {
+    id: 'packing-dispatch',
+    name: '梱包機振り分け・配送方法',
+    description: 'NE受注CSVを取り込み、配送方法と梱包機(pasline/meltline)を判定・編集して再出力。Tapes代替',
+    icon: '📦',
+    path: '/apps/packing-dispatch',
+    status: 'active',
+    category: 'shipping',
+  },
+  {
     id: 'mgmt-accounting',
     name: '売上分類別粗利集計',
     description: '各モール売上データ+運賃・資材費から売上分類別の変動費・粗利益を管理会計用に集計',
@@ -784,6 +794,7 @@ app.use('/apps/biz-ops-overview', requireAppAccess('biz-ops-overview'), bizOpsOv
 app.use('/apps/exec-dashboard', requireAppAccess('exec-dashboard'), express.json({ limit: '1mb' }), execDashboardRouter);
 app.use('/apps/cross-sell-finder', requireAppAccess('cross-sell-finder'), crossSellFinderRouter);
 app.use('/apps/giftset-assembly', requireAppAccess('giftset-assembly'), express.json({ limit: '256kb' }), giftsetAssemblyRouter);
+app.use('/apps/packing-dispatch', requireAppAccess('packing-dispatch'), express.json({ limit: '2mb' }), packingDispatchRouter);
 // 誤出荷管理 (apps/mis-shipment): warehouse-mirror.db 同居の f_mis_shipments を CRUD、注文 lookup は miniPC GET 経由
 app.use('/apps/mis-shipment', requireAppAccess('mis-shipment'), express.json({ limit: '256kb' }), misShipmentRouter);
 app.use('/apps/mgmt-accounting', express.json({ limit: '50mb' }), (req, res, next) => {
