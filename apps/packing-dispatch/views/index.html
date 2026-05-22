@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>梱包機振り分け・配送方法判定</title>
+<style>
+  :root { --line:#d4dce6; --head:#eef3fb; --accent:#2b6cb0; --warn:#c0392b; --ok:#2e7d32; }
+  * { box-sizing: border-box; }
+  body { font-family: "Segoe UI", "Hiragino Kaku Gothic ProN", Meiryo, sans-serif; margin:0; color:#222; background:#f7f9fc; font-size:13px; }
+  header { background:#fff; border-bottom:1px solid var(--line); padding:10px 16px; display:flex; align-items:center; gap:14px; }
+  header h1 { font-size:15px; margin:0; }
+  .tabs { display:flex; gap:4px; }
+  .tab { padding:6px 14px; border:1px solid var(--line); border-bottom:none; background:#eef3fb; cursor:pointer; border-radius:6px 6px 0 0; }
+  .tab.active { background:#fff; font-weight:bold; color:var(--accent); }
+  main { padding:14px 16px; }
+  .panel { display:none; } .panel.active { display:block; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:8px; padding:14px; margin-bottom:14px; }
+  table { border-collapse:collapse; width:100%; }
+  th,td { border:1px solid var(--line); padding:4px 8px; text-align:left; white-space:nowrap; }
+  th { background:var(--head); position:sticky; top:0; }
+  .scroll { max-height:62vh; overflow:auto; border:1px solid var(--line); border-radius:6px; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; }
+  .b-warn { background:#fdecea; color:var(--warn); border:1px solid #f5c6cb; }
+  .b-ok { background:#e8f5e9; color:var(--ok); border:1px solid #c8e6c9; }
+  .b-auto { background:#eef3fb; color:var(--accent); border:1px solid #cfe0f5; }
+  button { font-size:13px; padding:6px 12px; border:1px solid var(--accent); background:var(--accent); color:#fff; border-radius:6px; cursor:pointer; }
+  button.sub { background:#fff; color:var(--accent); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  input,select { font-size:13px; padding:5px 7px; border:1px solid var(--line); border-radius:5px; }
+  .summary { display:flex; gap:18px; flex-wrap:wrap; align-items:center; }
+  .summary .num { font-size:18px; font-weight:bold; }
+  .muted { color:#777; font-size:12px; }
+  dialog { border:1px solid var(--line); border-radius:10px; padding:0; width:min(560px,94vw); }
+  dialog .dh { padding:12px 16px; border-bottom:1px solid var(--line); font-weight:bold; }
+  dialog .db { padding:16px; } dialog .df { padding:12px 16px; border-top:1px solid var(--line); text-align:right; }
+  .row { display:flex; gap:10px; align-items:center; margin-bottom:10px; flex-wrap:wrap; }
+  .tier { display:flex; gap:6px; align-items:center; margin-bottom:6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>📦 梱包機振り分け・配送方法判定</h1>
+  <div class="tabs">
+    <div class="tab active" data-tab="dispatch">取込・判定</div>
+    <div class="tab" data-tab="master">商品マスタ</div>
+    <div class="tab" data-tab="unreg">未登録一覧</div>
+  </div>
+</header>
+<main>
+  <!-- ───── 取込・判定 ───── -->
+  <section class="panel active" id="panel-dispatch">
+    <div class="card">
+      <div class="row">
+        <input type="file" id="csvFile" accept=".csv" />
+        <button id="btnUpload">アップロードして判定</button>
+        <span id="upStatus" class="muted"></span>
+      </div>
+      <div id="summary" class="summary" style="display:none"></div>
+    </div>
+    <div class="card" id="ordersCard" style="display:none">
+      <div class="row">
+        <strong>伝票一覧</strong>
+        <select id="filterStatus">
+          <option value="">すべて</option>
+          <option value="要判断">要判断のみ</option>
+          <option value="確定">確定</option>
+          <option value="auto">自動</option>
+        </select>
+        <span style="flex:1"></span>
+        <button id="btnExport" class="sub">CSV出力（要判断ゼロで有効）</button>
+      </div>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>状態</th><th>店舗</th><th>注文番号</th><th>種別</th><th>都道府県</th><th>商品</th><th>配送方法</th><th>梱包機</th><th>理由</th><th></th></tr></thead>
+          <tbody id="ordersBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ───── 商品マスタ ───── -->
+  <section class="panel" id="panel-master">
+    <div class="card" style="background:#fffdf5">
+      <div class="row">
+        <strong>マスタ状態</strong>
+        <span id="masterStat" class="muted">…</span>
+        <span style="flex:1"></span>
+        <button id="btnSeed" class="sub">初期データ投入（Excel移行・未投入時のみ）</button>
+      </div>
+      <div class="muted">初回のみ。投入済みの場合は実行されません（手動編集の上書き防止）。</div>
+    </div>
+    <div class="card">
+      <div class="row">
+        <input id="mProduct" placeholder="商品コード" size="20" />
+        <button id="btnLoadRules" class="sub">読み込み</button>
+        <select id="mMall"><option value="rakuten">rakuten(=既定/楽天・他モール)</option><option value="amazon">amazon</option><option value="yahoo">yahoo</option></select>
+      </div>
+      <div class="muted">数量帯は 1 から連続・最終段の上限は空(=無制限)。配送方法がネコポス以外だと梱包機は自動的に手動になります。</div>
+      <div id="tiers" style="margin-top:10px"></div>
+      <div class="row" style="margin-top:8px">
+        <button id="btnAddTier" class="sub">＋数量帯</button>
+        <button id="btnSaveRules">保存</button>
+        <span id="mStatus" class="muted"></span>
+      </div>
+    </div>
+    <div class="card">
+      <strong>登録済みルール</strong>
+      <div class="scroll" style="max-height:36vh"><table>
+        <thead><tr><th>SKU</th><th>モール</th><th>数量帯</th><th>配送方法</th><th>梱包機</th></tr></thead>
+        <tbody id="rulesBody"></tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <!-- ───── 未登録一覧 ───── -->
+  <section class="panel" id="panel-unreg">
+    <div class="card">
+      <div class="row">
+        <button id="btnLoadUnreg" class="sub">未登録を再取得</button>
+        <span id="freshness" class="muted"></span>
+      </div>
+      <div class="muted">取扱中・非セットで配送方法ルール未登録の商品コード。クリックでマスタ登録へ。</div>
+      <div class="scroll" style="margin-top:8px"><table>
+        <thead><tr><th>商品コード</th><th>商品名</th><th></th></tr></thead>
+        <tbody id="unregBody"></tbody>
+      </table></div>
+    </div>
+  </section>
+</main>
+
+<!-- 判断ダイアログ -->
+<dialog id="dlg">
+  <div class="dh" id="dlgTitle">配送方法・梱包機の確定</div>
+  <div class="db">
+    <div id="dlgInfo" class="muted" style="margin-bottom:10px"></div>
+    <div class="row"><label>配送方法</label><select id="dlgMethod" style="min-width:240px"></select></div>
+    <div class="row"><label>梱包機</label><select id="dlgMachine" style="min-width:240px"></select></div>
+    <label id="dlgLearnWrap" style="display:none"><input type="checkbox" id="dlgLearn" checked /> この組合せを学習（次回から自動）</label>
+  </div>
+  <div class="df">
+    <button class="sub" id="dlgCancel">キャンセル</button>
+    <button id="dlgOk">確定</button>
+  </div>
+</dialog>
+
+<script>
+const $ = (s) => document.querySelector(s);
+let OPTIONS = { methods: [], machines: [] };
+let BATCH = null;
+let DLG_CTX = null;
+
+async function api(url, opt) {
+  const r = await fetch(url, opt);
+  const j = await r.json().catch(() => ({ ok:false, message:'通信エラー' }));
+  if (!j.ok) throw new Error(j.message || j.error || 'エラー');
+  return j.result;
+}
+function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+// タブ
+document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
+  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(x=>x.classList.remove('active'));
+  t.classList.add('active'); $('#panel-'+t.dataset.tab).classList.add('active');
+});
+
+async function loadOptions(){ OPTIONS = await api('api/options'); }
+function methodName(code){ const m=OPTIONS.methods.find(x=>x.code===code); return m?m.name_csv:(code||'—'); }
+function machineName(code){ const m=OPTIONS.machines.find(x=>x.code===code); return m?m.name_csv:(code||'—'); }
+function fillSelect(sel, items, valKey, labelFn, cur){
+  sel.innerHTML='';
+  for(const it of items){ const o=document.createElement('option'); o.value=it[valKey]; o.textContent=labelFn(it); if(it[valKey]===cur)o.selected=true; sel.appendChild(o); }
+}
+
+// ── アップロード ──
+$('#btnUpload').onclick = async () => {
+  const f = $('#csvFile').files[0];
+  if(!f){ alert('CSVを選んでください'); return; }
+  $('#upStatus').textContent='判定中…';
+  try{
+    const fd = new FormData(); fd.append('file', f);
+    const s = await api('api/upload', { method:'POST', body: fd });
+    BATCH = s.batch.batch_id;
+    renderSummary(s); await loadOrders();
+    $('#upStatus').textContent='完了';
+  }catch(e){ $('#upStatus').textContent=''; alert('取込エラー: '+e.message); }
+};
+
+function renderSummary(s){
+  const c = s.counts||{}; const r = s.reasons||{};
+  $('#summary').style.display='flex';
+  $('#summary').innerHTML =
+    `<div><div class="num">${s.batch.row_count}</div><div class="muted">明細行</div></div>`+
+    `<div><div class="num">${s.batch.order_count}</div><div class="muted">伝票</div></div>`+
+    `<div><div class="num" style="color:#c0392b">${c['要判断']||0}</div><div class="muted">要判断</div></div>`+
+    `<div><div class="num" style="color:#2e7d32">${c['確定']||0}</div><div class="muted">確定</div></div>`+
+    `<div><div class="num" style="color:#2b6cb0">${c['auto']||0}</div><div class="muted">自動</div></div>`+
+    `<div class="muted">理由: 未登録 ${r['unregistered']||0} / 数量帯穴 ${r['qty_gap']||0} / 初出アソート ${r['assort_new']||0} / 学習済 ${r['assort_learned']||0} / 地域特例 ${r['region_letterpack']||0} / AES ${r['aes_locked']||0}</div>`;
+  $('#ordersCard').style.display='block';
+  updateExportBtn(c['要判断']||0);
+}
+function updateExportBtn(pending){
+  const b=$('#btnExport'); b.disabled = pending>0; b.textContent = pending>0?`CSV出力（要判断 ${pending} 件を確定して）`:'CSV出力';
+}
+
+async function loadOrders(){
+  const st = $('#filterStatus').value;
+  const rows = await api(`api/orders?batch=${encodeURIComponent(BATCH)}${st?`&status=${encodeURIComponent(st)}`:''}`);
+  const tb=$('#ordersBody'); tb.innerHTML='';
+  for(const o of rows){
+    const tr=document.createElement('tr');
+    const badge = o.row_status==='要判断'?'<span class="badge b-warn">要判断</span>':o.row_status==='確定'?'<span class="badge b-ok">確定</span>':'<span class="badge b-auto">自動</span>';
+    tr.innerHTML = `<td>${badge}</td><td>${esc(o.shop_name)}</td><td>${esc(o.order_no)}</td><td>${esc(o.order_type)}</td><td>${esc(o.pref)}</td>`+
+      `<td>${esc(o.items)}</td><td>${esc(methodName(o.shipping_method_code))}</td><td>${esc(machineName(o.packing_machine_code))}</td>`+
+      `<td class="muted">${esc(o.reason_code||'')}</td>`+
+      `<td>${o.reason_code==='aes_locked'?'<span class="muted">対象外</span>':`<button class="sub" data-act="decide">確定/変更</button>`}</td>`;
+    const btn = tr.querySelector('[data-act=decide]');
+    if(btn) btn.onclick = () => openDecide(o);
+    tb.appendChild(tr);
+  }
+}
+$('#filterStatus').onchange = loadOrders;
+
+// ── 判断ダイアログ ──
+function openDecide(o){
+  DLG_CTX = o;
+  $('#dlgInfo').innerHTML = `${esc(o.shop_name)} / ${esc(o.order_no)}<br>${esc(o.items)}`;
+  fillSelect($('#dlgMethod'), OPTIONS.methods.filter(m=>m.code!=='aes'), 'code', m=>m.name_csv, o.shipping_method_code);
+  fillSelect($('#dlgMachine'), OPTIONS.machines, 'code', m=>m.name_csv, o.packing_machine_code||'manual');
+  $('#dlgLearnWrap').style.display = o.order_type==='assort' ? 'block':'none';
+  $('#dlg').showModal();
+}
+$('#dlgCancel').onclick = () => $('#dlg').close();
+$('#dlgOk').onclick = async () => {
+  try{
+    await api('api/decide', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({
+      batch_id: BATCH, shop_name: DLG_CTX.shop_name, order_no: DLG_CTX.order_no,
+      shipping_method_code: $('#dlgMethod').value, packing_machine_code: $('#dlgMachine').value,
+      learn: DLG_CTX.order_type==='assort' && $('#dlgLearn').checked,
+    })});
+    $('#dlg').close();
+    const s = await api(`api/batch/${encodeURIComponent(BATCH)}`); renderSummary(s); await loadOrders();
+  }catch(e){ alert('確定エラー: '+e.message); }
+};
+
+// ── 出力 ──
+$('#btnExport').onclick = () => { if(BATCH) location.href = `api/export/${encodeURIComponent(BATCH)}`; };
+
+// ── 商品マスタ ──
+function tierRow(t){
+  const div=document.createElement('div'); div.className='tier';
+  const mOpts = OPTIONS.methods.filter(m=>m.code!=='aes').map(m=>`<option value="${m.code}">${esc(m.name_csv)}</option>`).join('');
+  const pOpts = OPTIONS.machines.map(m=>`<option value="${m.code}">${esc(m.name_csv)}</option>`).join('');
+  div.innerHTML = `下限<input type="number" class="qmin" min="1" value="${t?.qty_min??1}" style="width:70px">`+
+    `上限<input type="number" class="qmax" min="1" value="${t?.qty_max??''}" placeholder="空=∞" style="width:80px">`+
+    `<select class="sm">${mOpts}</select><select class="pm">${pOpts}</select>`+
+    `<button class="sub del">削除</button>`;
+  if(t){ div.querySelector('.sm').value=t.shipping_method_code; div.querySelector('.pm').value=t.packing_machine_code; }
+  div.querySelector('.del').onclick=()=>div.remove();
+  return div;
+}
+$('#btnAddTier').onclick=()=>$('#tiers').appendChild(tierRow());
+async function loadRules(){
+  const pc=$('#mProduct').value.trim(); if(!pc)return;
+  const rows = await api(`api/rules?product=${encodeURIComponent(pc)}`);
+  const tb=$('#rulesBody'); tb.innerHTML='';
+  for(const r of rows){ const tr=document.createElement('tr');
+    tr.innerHTML=`<td>${esc(r.sku_key)}</td><td>${esc(r.mall_group)}</td><td>${r.qty_min}〜${r.qty_max??'∞'}</td><td>${esc(methodName(r.shipping_method_code))}</td><td>${esc(machineName(r.packing_machine_code))}</td>`;
+    tb.appendChild(tr); }
+  // 既存(該当モール)を編集欄へ
+  const mall=$('#mMall').value;
+  const mine=rows.filter(r=>r.mall_group===mall).sort((a,b)=>a.qty_min-b.qty_min);
+  $('#tiers').innerHTML='';
+  if(mine.length) mine.forEach(t=>$('#tiers').appendChild(tierRow(t)));
+  else $('#tiers').appendChild(tierRow());
+}
+$('#btnLoadRules').onclick=loadRules; $('#mMall').onchange=loadRules;
+$('#btnSaveRules').onclick = async () => {
+  const tiers=[...$('#tiers').querySelectorAll('.tier')].map(d=>({
+    qty_min: parseInt(d.querySelector('.qmin').value,10),
+    qty_max: d.querySelector('.qmax').value===''?null:parseInt(d.querySelector('.qmax').value,10),
+    shipping_method_code: d.querySelector('.sm').value,
+    packing_machine_code: d.querySelector('.pm').value,
+  }));
+  try{
+    await api('api/rules', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({
+      product_code: $('#mProduct').value.trim(), mall_group: $('#mMall').value, tiers,
+    })});
+    $('#mStatus').textContent='保存しました'; await loadRules();
+  }catch(e){ $('#mStatus').textContent=''; alert('保存エラー: '+e.message); }
+};
+
+// ── 未登録一覧 ──
+async function loadUnreg(){
+  const r = await api('api/unregistered');
+  $('#freshness').textContent = r.freshness ? `ミラー最終同期: ${r.freshness}` : 'ミラー同期時刻不明';
+  const tb=$('#unregBody'); tb.innerHTML='';
+  for(const x of r.rows){ const tr=document.createElement('tr');
+    tr.innerHTML=`<td>${esc(x.product_code)}</td><td>${esc(x.product_name)}</td><td><button class="sub">登録へ</button></td>`;
+    tr.querySelector('button').onclick=()=>{ document.querySelector('.tab[data-tab=master]').click(); $('#mProduct').value=x.product_code; loadRules(); };
+    tb.appendChild(tr); }
+  if(!r.rows.length) tb.innerHTML='<tr><td colspan="3" class="muted">未登録はありません 🎉</td></tr>';
+}
+$('#btnLoadUnreg').onclick=loadUnreg;
+
+// ── マスタ状態 / 初期投入 ──
+async function refreshMasterStat(){
+  try{ const s=await api('api/master-status'); const n=s.rule_rows;
+    $('#masterStat').textContent = `登録済みルール ${n} 行`;
+    $('#btnSeed').disabled = n>0;
+    if(n>0) $('#btnSeed').textContent='初期データ投入（投入済み）';
+  }catch(e){ $('#masterStat').textContent='取得失敗'; }
+}
+$('#btnSeed').onclick = async () => {
+  if(!confirm('Excel移行データを初期投入します。よろしいですか？（未投入時のみ実行）')) return;
+  $('#btnSeed').disabled=true; $('#masterStat').textContent='投入中…';
+  try{ const r=await api('api/admin/load-seed', {method:'POST'});
+    alert(r.skipped?`既に${r.existing}行あるためスキップしました`:`投入完了: ${r.ok}件 (失敗${r.ng})`);
+    await refreshMasterStat();
+  }catch(e){ alert('投入エラー: '+e.message); $('#btnSeed').disabled=false; }
+};
+document.querySelector('.tab[data-tab=master]').addEventListener('click', refreshMasterStat);
+
+(async () => { await loadOptions(); })();
+</script>
+</body>
+</html>
