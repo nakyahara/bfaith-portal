@@ -14,6 +14,7 @@ import {
   importCsv, batchSummary, listOrders, decideOrder, exportCsv,
   listRules, upsertRules, copyRules, listUnregistered, mirrorFreshness,
 } from './service.js';
+import { loadSeed } from './tools/load-shipping-rule-seed.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
@@ -90,5 +91,15 @@ router.get('/api/unregistered', (req, res) => handle(res, () => ({
   freshness: mirrorFreshness(),
   rows: listUnregistered(),
 })));
+
+// ── マスタ状態 (ルール件数) ──
+router.get('/api/master-status', (req, res) => handle(res, () => {
+  const db = ensureSchema();
+  return { rule_rows: db.prepare('SELECT COUNT(*) c FROM pd_shipping_rule').get().c };
+}));
+
+// ── 初期データ投入 (Excel移行シード)。未投入時のみ。force=1 で再投入(全上書き) ──
+router.post('/api/admin/load-seed', (req, res) => handle(res, () =>
+  loadSeed({ force: req.query.force === '1' || (req.body && req.body.force === true) })));
 
 export default router;

@@ -81,6 +81,15 @@
 
   <!-- ───── 商品マスタ ───── -->
   <section class="panel" id="panel-master">
+    <div class="card" style="background:#fffdf5">
+      <div class="row">
+        <strong>マスタ状態</strong>
+        <span id="masterStat" class="muted">…</span>
+        <span style="flex:1"></span>
+        <button id="btnSeed" class="sub">初期データ投入（Excel移行・未投入時のみ）</button>
+      </div>
+      <div class="muted">初回のみ。投入済みの場合は実行されません（手動編集の上書き防止）。</div>
+    </div>
     <div class="card">
       <div class="row">
         <input id="mProduct" placeholder="商品コード" size="20" />
@@ -294,6 +303,24 @@ async function loadUnreg(){
   if(!r.rows.length) tb.innerHTML='<tr><td colspan="3" class="muted">未登録はありません 🎉</td></tr>';
 }
 $('#btnLoadUnreg').onclick=loadUnreg;
+
+// ── マスタ状態 / 初期投入 ──
+async function refreshMasterStat(){
+  try{ const s=await api('api/master-status'); const n=s.rule_rows;
+    $('#masterStat').textContent = `登録済みルール ${n} 行`;
+    $('#btnSeed').disabled = n>0;
+    if(n>0) $('#btnSeed').textContent='初期データ投入（投入済み）';
+  }catch(e){ $('#masterStat').textContent='取得失敗'; }
+}
+$('#btnSeed').onclick = async () => {
+  if(!confirm('Excel移行データを初期投入します。よろしいですか？（未投入時のみ実行）')) return;
+  $('#btnSeed').disabled=true; $('#masterStat').textContent='投入中…';
+  try{ const r=await api('api/admin/load-seed', {method:'POST'});
+    alert(r.skipped?`既に${r.existing}行あるためスキップしました`:`投入完了: ${r.ok}件 (失敗${r.ng})`);
+    await refreshMasterStat();
+  }catch(e){ alert('投入エラー: '+e.message); $('#btnSeed').disabled=false; }
+};
+document.querySelector('.tab[data-tab=master]').addEventListener('click', refreshMasterStat);
 
 (async () => { await loadOptions(); })();
 </script>
