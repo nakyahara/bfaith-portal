@@ -219,7 +219,11 @@ async function loadOrders(){
       `<td class="muted">${esc(o.reason_code||'')}</td>`+
       `<td>${o.reason_code==='aes_locked'?'<span class="muted">対象外</span>':`<button class="sub" data-act="decide">確定/変更</button>`}</td>`;
     const btn = tr.querySelector('[data-act=decide]');
-    if(btn) btn.onclick = () => openDecide(o);
+    if(btn){
+      btn.onclick = (e) => { e.stopPropagation(); openDecide(o); };
+      tr.style.cursor='pointer'; tr.title='クリックで配送方法・梱包機を変更';
+      tr.onclick = () => openDecide(o);
+    }
     tb.appendChild(tr);
   }
 }
