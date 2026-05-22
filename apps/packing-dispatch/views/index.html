@@ -10,6 +10,8 @@
   body { font-family: "Segoe UI", "Hiragino Kaku Gothic ProN", Meiryo, sans-serif; margin:0; color:#222; background:#f7f9fc; font-size:13px; }
   header { background:#fff; border-bottom:1px solid var(--line); padding:10px 16px; display:flex; align-items:center; gap:14px; }
   header h1 { font-size:15px; margin:0; }
+  header .back { color:var(--accent); text-decoration:none; font-size:13px; border:1px solid var(--line); padding:5px 10px; border-radius:6px; background:#f3f7fc; white-space:nowrap; }
+  header .back:hover { background:#e8f0fb; }
   .tabs { display:flex; gap:4px; }
   .tab { padding:6px 14px; border:1px solid var(--line); border-bottom:none; background:#eef3fb; cursor:pointer; border-radius:6px 6px 0 0; }
   .tab.active { background:#fff; font-weight:bold; color:var(--accent); }
@@ -40,6 +42,7 @@
 </head>
 <body>
 <header>
+  <a href="/" class="back">← ポータル</a>
   <h1>📦 梱包機振り分け・配送方法判定</h1>
   <div class="tabs">
     <div class="tab active" data-tab="dispatch">取込・判定</div>
