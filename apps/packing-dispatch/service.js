@@ -7,7 +7,8 @@ import {
   ensureSchema, utcIsoNow, norm, buildSkuKey, normProductCode,
   finalizeLine, classifyOrder, shippingMethodMap, mallGroupOf,
   saveAssortDecision, comboKeyOf, listUnregistered, mirrorFreshness,
-  COL, MALL_GROUPS,
+  recordAssortUsage, comboKeysByOrderRef, getAssortByCombo, purgeOldUsage,
+  COL, MALL_GROUPS, COMBO_KEY_VERSION,
 } from './db.js';
 import { parseNeCsv, buildNeCsv } from './csv.js';
 
@@ -92,10 +93,15 @@ export function importCsv(buffer, filename, user) {
           raw_cols: JSON.stringify(l.raw),
         });
       }
+      // アソートは combo_key と注文番号/受注番号を利用ログに記録(後で注文番号から学習を辿れるように)
+      if (d.order_type === 'assort' && d.combo_key) {
+        recordAssortUsage({ combo_key: d.combo_key, order_no: g[0].order_no, uketsuke_no: g[0].raw[COL.uketsuke], shop_name: g[0].shop_name });
+      }
     }
   });
   tx();
   purgeExpiredBatches();
+  purgeOldUsage();
   return batchSummary(batch_id);
 }
 
@@ -201,11 +207,66 @@ export function decideOrder(batch_id, shop_name, order_no, { shipping_method_cod
       }
       const items = [...bySku.entries()].map(([sku_key, qty]) => ({ sku_key, qty }));
       const detail = items.map((i) => `${i.sku_key} x${i.qty}`);
-      saveAssortDecision({ items, combo_detail: detail, shipping_method_code: fin.shipping_method_code, packing_machine_code: fin.packing_machine_code }, user);
+      const { combo_key } = saveAssortDecision({ items, combo_detail: detail, shipping_method_code: fin.shipping_method_code, packing_machine_code: fin.packing_machine_code }, user);
+      const raw0 = JSON.parse(lines[0].raw_cols || '[]');
+      recordAssortUsage({ combo_key, order_no, uketsuke_no: raw0[COL.uketsuke], shop_name });
     }
   });
   tx();
   return { ok: true };
+}
+
+// ───────────────────────── アソート学習の検索・編集 ─────────────────────────
+
+// sku_key("code::color::size") の先頭=商品コードから商品名を引く(表示用・best-effort)
+function resolveItemName(db, sku_key) {
+  const code = String(sku_key || '').split('::')[0];
+  if (!code) return '';
+  const row = db.prepare(`SELECT 商品名 FROM mirror_products WHERE lower(trim(商品コード))=? LIMIT 1`).get(code);
+  return row ? row.商品名 : '';
+}
+
+/**
+ * 学習を 注文番号/受注番号 または 商品コード で検索。アクティブな学習(③)を明細・利用注文つきで返す。
+ */
+export function searchAssort(q) {
+  const db = ensureSchema();
+  const term = norm(q);
+  if (!term) return [];
+  const combos = new Set(comboKeysByOrderRef(term));
+  // 商品コードでも検索 (sku_key 先頭一致)
+  const pc = normProductCode(term);
+  if (pc) {
+    for (const r of db.prepare(`
+      SELECT DISTINCT d.combo_key FROM pd_assort_decision d
+        JOIN pd_assort_decision_item i ON i.decision_id=d.id
+       WHERE d.is_active=1 AND d.combo_key_version=? AND (i.sku_key=? OR i.sku_key LIKE ?)
+       LIMIT 200`).all(COMBO_KEY_VERSION, pc + '::::', pc + '::%')) combos.add(r.combo_key);
+  }
+  const out = [];
+  for (const ck of combos) {
+    const d = getAssortByCombo(ck);
+    if (!d) continue;
+    out.push({
+      combo_key: ck,
+      shipping_method_code: d.shipping_method_code,
+      packing_machine_code: d.packing_machine_code,
+      decided_by: d.decided_by, decided_at: d.decided_at,
+      items: d.items.map((it) => ({ sku_key: it.sku_key, product_code: String(it.sku_key).split('::')[0], product_name: resolveItemName(db, it.sku_key), qty: it.qty })),
+      usage: d.usage,
+    });
+    if (out.length >= 50) break;
+  }
+  return out;
+}
+
+/** 学習の配送方法・梱包機を更新(明細はそのまま)。SCD2で旧版は is_active=0 に。 */
+export function updateAssort(combo_key, shipping_method_code, packing_machine_code, user) {
+  const d = getAssortByCombo(combo_key);
+  if (!d) throw vErr('対象の学習が見つかりません');
+  const items = d.items.map((i) => ({ sku_key: i.sku_key, qty: i.qty }));
+  const detail = items.map((i) => `${i.sku_key} x${i.qty}`);
+  return saveAssortDecision({ items, combo_detail: detail, shipping_method_code, packing_machine_code }, user);
 }
 
 // ───────────────────────── 出力 (ゲート + CAS) ─────────────────────────

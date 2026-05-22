@@ -22,7 +22,8 @@ export const EXPECTED_COL_COUNT = 93;
 // CSV 列インデックス(0始まり)。NE→ロジザード CSV 実データで確認済み。
 export const COL = {
   shop: 1,            // ショップ名
-  orderNo: 2,         // 注文番号 (伝票グルーピングキー)
+  orderNo: 2,         // 注文番号 (モール注文番号・伝票グルーピングキー)
+  uketsuke: 20,       // 受注番号/伝票番号 (1伝票1値の連番。ヘッダ表記は顧客idだが実態はNE受注番号)
   recipient: 4,       // 配送先名
   pref: 6,            // 配送先都道府県
   carrierId: 17,      // 配送会社id          ← 連動列
@@ -165,6 +166,19 @@ export function ensureSchema() {
       qty INTEGER NOT NULL,
       PRIMARY KEY (decision_id, sku_key)
     );
+
+    -- アソート学習の利用ログ (非PII)。combo_key と NE注文番号 を紐付け、注文番号から学習を辿れるようにする。
+    -- 住所/氏名/電話は持たない。古いものは purge。
+    CREATE TABLE IF NOT EXISTS pd_assort_usage (
+      combo_key TEXT NOT NULL,
+      order_no TEXT NOT NULL,      -- 注文番号 (モール)
+      uketsuke_no TEXT,           -- 受注番号/伝票番号 (NE連番)
+      shop_name TEXT,
+      applied_at TEXT,
+      PRIMARY KEY (combo_key, order_no)
+    );
+    CREATE INDEX IF NOT EXISTS idx_pd_usage_order ON pd_assort_usage(order_no);
+    CREATE INDEX IF NOT EXISTS idx_pd_usage_uke ON pd_assort_usage(uketsuke_no);
 
     CREATE TABLE IF NOT EXISTS pd_import_batch (
       batch_id TEXT PRIMARY KEY,
@@ -391,7 +405,7 @@ export function classifyOrder(lines, smMap = shippingMethodMap()) {
     const combo_key = comboKeyOf(skus);
     const hit = lookupAssort(combo_key);
     if (hit) {
-      result = { order_type: 'assort', shipping_method_code: hit.shipping_method_code, packing_machine_code: hit.packing_machine_code, row_status: 'auto', reason_code: 'assort_learned' };
+      result = { order_type: 'assort', combo_key, shipping_method_code: hit.shipping_method_code, packing_machine_code: hit.packing_machine_code, row_status: 'auto', reason_code: 'assort_learned' };
     } else {
       // 各SKUの単品配送方法→上位を提案。未登録/穴があれば要判断のまま提案だけ。
       const codes = [];
@@ -400,7 +414,7 @@ export function classifyOrder(lines, smMap = shippingMethodMap()) {
         if (r) codes.push(r.shipping_method_code);
       }
       const suggest = upperShipping(codes, smMap);
-      result = { order_type: 'assort', shipping_method_code: null, packing_machine_code: 'manual',
+      result = { order_type: 'assort', combo_key, shipping_method_code: null, packing_machine_code: 'manual',
         suggest_shipping_method_code: suggest || null, row_status: '要判断', reason_code: 'assort_new' };
     }
   }
@@ -412,6 +426,42 @@ export function classifyOrder(lines, smMap = shippingMethodMap()) {
     result = { ...result, suggest_shipping_method_code: 'letterpack' };
   }
   return result;
+}
+
+// ───────────────────────── アソート学習の利用ログ(注文番号⇄combo) ─────────────────────────
+
+// combo_key と 注文番号/受注番号 を紐付け(非PII)。同一(combo,注文番号)は上書き。
+export function recordAssortUsage({ combo_key, order_no, uketsuke_no, shop_name }) {
+  if (!combo_key || !order_no) return;
+  const db = ensureSchema();
+  db.prepare(`INSERT INTO pd_assort_usage (combo_key, order_no, uketsuke_no, shop_name, applied_at)
+    VALUES (?,?,?,?,?)
+    ON CONFLICT(combo_key, order_no) DO UPDATE SET uketsuke_no=excluded.uketsuke_no, shop_name=excluded.shop_name, applied_at=excluded.applied_at`)
+    .run(combo_key, order_no, uketsuke_no || null, shop_name || null, utcIsoNow());
+}
+
+// 注文番号 or 受注番号 で combo_key を引く
+export function comboKeysByOrderRef(q) {
+  const db = ensureSchema();
+  const like = `%${norm(q)}%`;
+  return db.prepare(`SELECT DISTINCT combo_key FROM pd_assort_usage WHERE order_no LIKE ? OR uketsuke_no LIKE ? LIMIT 200`).all(like, like).map(r => r.combo_key);
+}
+
+// アクティブな学習1件 (combo_key) を明細・利用注文つきで取得
+export function getAssortByCombo(combo_key) {
+  const db = ensureSchema();
+  const d = db.prepare(`SELECT * FROM pd_assort_decision WHERE combo_key=? AND combo_key_version=? AND is_active=1`).get(combo_key, COMBO_KEY_VERSION);
+  if (!d) return null;
+  const items = db.prepare(`SELECT sku_key, qty FROM pd_assort_decision_item WHERE decision_id=?`).all(d.id);
+  const usage = db.prepare(`SELECT order_no, uketsuke_no, shop_name, applied_at FROM pd_assort_usage WHERE combo_key=? ORDER BY applied_at DESC LIMIT 50`).all(combo_key);
+  return { ...d, items, usage };
+}
+
+// 30日より古い利用ログを掃除
+export function purgeOldUsage() {
+  const db = ensureSchema();
+  const cutoff = new Date(Date.now() - 30 * 86400 * 1000).toISOString();
+  return db.prepare(`DELETE FROM pd_assort_usage WHERE applied_at < ?`).run(cutoff).changes;
 }
 
 // ───────────────────────── 未登録チェック(取扱中×非セット×②未登録) ─────────────────────────
