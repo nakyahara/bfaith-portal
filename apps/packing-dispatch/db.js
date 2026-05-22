@@ -414,12 +414,18 @@ export function classifyOrder(lines, smMap = shippingMethodMap()) {
 
 export function listUnregistered() {
   const db = ensureSchema();
+  // セット商品は対象外。商品区分='セット' だけでは NE 上 単品扱いのセットを取りこぼすため、
+  // 「セット構成品数>0」と「セット構成品マスタに親として存在」も併せて除外する (3シグナル)。
   // NOT EXISTS で NULL 罠回避。商品コードは比較前に lower(trim()) で正規化整合。
   return db.prepare(`
     SELECT mp.商品コード AS product_code, mp.商品名 AS product_name
       FROM mirror_products mp
      WHERE mp.取扱区分 = '取扱中'
        AND mp.商品区分 <> 'セット'
+       AND COALESCE(mp.セット構成品数, 0) = 0
+       AND NOT EXISTS (
+         SELECT 1 FROM mirror_set_components sc WHERE sc.セット商品コード = mp.商品コード
+       )
        AND NOT EXISTS (
          SELECT 1 FROM pd_shipping_rule r
           WHERE r.product_code = lower(trim(mp.商品コード))
