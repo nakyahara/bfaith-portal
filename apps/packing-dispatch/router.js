@@ -11,7 +11,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { ensureSchema, shippingMethodMap } from './db.js';
 import {
-  importCsv, batchSummary, listOrders, decideOrder, exportCsv,
+  importCsv, batchSummary, listOrders, getOrderDetail, decideOrder, exportCsv,
   listRules, upsertRules, copyRules, listUnregistered, mirrorFreshness,
 } from './service.js';
 import { loadSeed } from './tools/load-shipping-rule-seed.mjs';
@@ -55,6 +55,13 @@ router.get('/api/batch/:id', (req, res) => handle(res, () => {
 
 router.get('/api/orders', (req, res) => handle(res, () =>
   listOrders(req.query.batch, { status: req.query.status || null })));
+
+// 1伝票の詳細 (変更ダイアログのリッチ表示用)
+router.get('/api/order', (req, res) => handle(res, () => {
+  const d = getOrderDetail(req.query.batch, req.query.shop, req.query.order);
+  if (!d) { const e = new Error('伝票が見つかりません'); e.code = 'VALIDATION'; throw e; }
+  return d;
+}));
 
 // 1伝票の確定 (アソートは learn=true で学習登録)
 router.post('/api/decide', (req, res) => handle(res, () => {

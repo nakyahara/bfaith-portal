@@ -142,6 +142,32 @@ export function listOrders(batch_id, filter = {}) {
   return filter.status ? rows.filter((r) => r.row_status === filter.status) : rows;
 }
 
+// 1伝票の詳細 (NE 個別伝票風の表示用)。order-level は先頭行の raw_cols から、商品名は各行から。
+export function getOrderDetail(batch_id, shop_name, order_no) {
+  const db = ensureSchema();
+  const lines = db.prepare(`SELECT * FROM pd_import_line WHERE batch_id=? AND shop_name=? AND order_no=? ORDER BY row_no`)
+    .all(batch_id, shop_name, order_no);
+  if (!lines.length) return null;
+  const raw0 = JSON.parse(lines[0].raw_cols || '[]');
+  const items = lines.map((l) => {
+    const r = JSON.parse(l.raw_cols || '[]');
+    return { product_code: l.product_code, product_name: r[COL.productName] || '', qty: l.qty };
+  });
+  return {
+    order_no, shop_name, mall_group: lines[0].mall_group, order_type: lines[0].order_type,
+    recipient: raw0[COL.recipient] || '',
+    pref: raw0[COL.pref] || '',
+    delivery_date: raw0[COL.deliveryDate] || '',
+    delivery_time: raw0[COL.deliveryTime] || '',
+    current_shipping_csv: raw0[COL.shippingMethod] || '',
+    shipping_method_code: lines[0].shipping_method_code,
+    packing_machine_code: lines[0].packing_machine_code,
+    row_status: lines.some((l) => l.row_status === '要判断') ? '要判断' : (lines.some((l) => l.row_status === '確定') ? '確定' : 'auto'),
+    reason_code: lines[0].reason_code,
+    items,
+  };
+}
+
 // ───────────────────────── 注文の判断確定 / 編集 ─────────────────────────
 
 /**
