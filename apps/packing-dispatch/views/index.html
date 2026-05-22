@@ -33,7 +33,13 @@
   .summary { display:flex; gap:18px; flex-wrap:wrap; align-items:center; }
   .summary .num { font-size:18px; font-weight:bold; }
   .muted { color:#777; font-size:12px; }
-  dialog { border:1px solid var(--line); border-radius:10px; padding:0; width:min(560px,94vw); }
+  dialog { border:1px solid var(--line); border-radius:10px; padding:0; width:min(680px,95vw); }
+  dialog table.kv, dialog table.items { border-collapse:collapse; width:100%; }
+  dialog table.kv th { text-align:left; background:var(--head); color:#555; font-weight:normal; white-space:nowrap; border:1px solid var(--line); padding:4px 8px; width:96px; }
+  dialog table.kv td { border:1px solid var(--line); padding:4px 8px; }
+  dialog table.items { margin-top:10px; }
+  dialog table.items th, dialog table.items td { border:1px solid var(--line); padding:4px 8px; font-size:12px; }
+  dialog table.items th { background:var(--head); }
   dialog .dh { padding:12px 16px; border-bottom:1px solid var(--line); font-weight:bold; }
   dialog .db { padding:16px; } dialog .df { padding:12px 16px; border-top:1px solid var(--line); text-align:right; }
   .row { display:flex; gap:10px; align-items:center; margin-bottom:10px; flex-wrap:wrap; }
@@ -229,14 +235,27 @@ async function loadOrders(){
 }
 $('#filterStatus').onchange = loadOrders;
 
-// ── 判断ダイアログ ──
-function openDecide(o){
+// ── 判断ダイアログ (NE個別伝票風) ──
+async function openDecide(o){
   DLG_CTX = o;
-  $('#dlgInfo').innerHTML = `${esc(o.shop_name)} / ${esc(o.order_no)}<br>${esc(o.items)}`;
-  fillSelect($('#dlgMethod'), OPTIONS.methods.filter(m=>m.code!=='aes'), 'code', m=>m.name_csv, o.shipping_method_code);
-  fillSelect($('#dlgMachine'), OPTIONS.machines, 'code', m=>m.name_csv, o.packing_machine_code||'manual');
-  $('#dlgLearnWrap').style.display = o.order_type==='assort' ? 'block':'none';
+  $('#dlgInfo').innerHTML = '読み込み中…';
   $('#dlg').showModal();
+  try{
+    const d = await api(`api/order?batch=${encodeURIComponent(BATCH)}&shop=${encodeURIComponent(o.shop_name)}&order=${encodeURIComponent(o.order_no)}`);
+    DLG_CTX = { ...o, ...d };
+    const items = d.items.map(it=>`<tr><td>${esc(it.product_code)}</td><td>${esc(it.product_name)}</td><td style="text-align:right">${it.qty}</td></tr>`).join('');
+    $('#dlgInfo').innerHTML =
+      `<table class="kv">
+        <tr><th>店舗</th><td>${esc(d.shop_name)}</td><th>注文番号</th><td>${esc(d.order_no)}</td></tr>
+        <tr><th>配送先</th><td colspan="3"><b>${esc(d.pref)}</b> ${esc(d.recipient)}</td></tr>
+        <tr><th>配送指定日</th><td>${esc(d.delivery_date)||'指定なし'}</td><th>時間帯</th><td>${esc(d.delivery_time)||'指定なし'}</td></tr>
+        <tr><th>現在の配送方法</th><td colspan="3">${esc(d.current_shipping_csv)}（種別: ${esc(d.order_type)}）</td></tr>
+      </table>
+      <table class="items"><thead><tr><th>商品コード</th><th>商品名</th><th>数</th></tr></thead><tbody>${items}</tbody></table>`;
+    fillSelect($('#dlgMethod'), OPTIONS.methods.filter(m=>m.code!=='aes'), 'code', m=>m.name_csv, d.shipping_method_code);
+    fillSelect($('#dlgMachine'), OPTIONS.machines, 'code', m=>m.name_csv, d.packing_machine_code||'manual');
+    $('#dlgLearnWrap').style.display = d.order_type==='assort' ? 'block':'none';
+  }catch(e){ $('#dlgInfo').innerHTML = '読込エラー: '+esc(e.message); }
 }
 $('#dlgCancel').onclick = () => $('#dlg').close();
 $('#dlgOk').onclick = async () => {

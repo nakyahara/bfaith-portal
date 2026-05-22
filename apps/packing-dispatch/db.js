@@ -23,9 +23,13 @@ export const EXPECTED_COL_COUNT = 93;
 export const COL = {
   shop: 1,            // ショップ名
   orderNo: 2,         // 注文番号 (伝票グルーピングキー)
+  recipient: 4,       // 配送先名
   pref: 6,            // 配送先都道府県
   carrierId: 17,      // 配送会社id          ← 連動列
+  deliveryDate: 18,   // 配送指定日 (表示用)
+  deliveryTime: 19,   // 配送時間帯 (表示用)
   shippingMethod: 34, // 配送方法            ← 連動列(出力主)
+  productName: 56,    // 品名 (商品名・表示用)
   productCode: 57,    // 形式/型番 (=NE商品コード。品番(55)は空でこちらに入る)
   colorName: 59,      // 色名
   sizeName: 61,       // サイズ名
