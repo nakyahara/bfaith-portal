@@ -254,9 +254,17 @@ async function openDecide(o){
       <table class="items"><thead><tr><th>商品コード</th><th>商品名</th><th>数</th></tr></thead><tbody>${items}</tbody></table>`;
     fillSelect($('#dlgMethod'), OPTIONS.methods.filter(m=>m.code!=='aes'), 'code', m=>m.name_csv, d.shipping_method_code);
     fillSelect($('#dlgMachine'), OPTIONS.machines, 'code', m=>m.name_csv, d.packing_machine_code||'manual');
+    syncDlgMachine();
     $('#dlgLearnWrap').style.display = d.order_type==='assort' ? 'block':'none';
   }catch(e){ $('#dlgInfo').innerHTML = '読込エラー: '+esc(e.message); }
 }
+// ネコポス以外は梱包機を「手動出荷」に固定(無効化)
+function syncDlgMachine(){
+  const nk = $('#dlgMethod').value === 'nekopos';
+  const mc = $('#dlgMachine');
+  if(!nk){ mc.value='manual'; mc.disabled=true; } else { mc.disabled=false; }
+}
+$('#dlgMethod').addEventListener('change', syncDlgMachine);
 $('#dlgCancel').onclick = () => $('#dlg').close();
 $('#dlgOk').onclick = async () => {
   try{
@@ -283,6 +291,9 @@ function tierRow(t){
     `<select class="sm">${mOpts}</select><select class="pm">${pOpts}</select>`+
     `<button class="sub del">削除</button>`;
   if(t){ div.querySelector('.sm').value=t.shipping_method_code; div.querySelector('.pm').value=t.packing_machine_code; }
+  const sm=div.querySelector('.sm'), pm=div.querySelector('.pm');
+  function lockPm(){ if(sm.value!=='nekopos'){ pm.value='manual'; pm.disabled=true; } else { pm.disabled=false; } }
+  sm.onchange=lockPm; lockPm();
   div.querySelector('.del').onclick=()=>div.remove();
   return div;
 }
