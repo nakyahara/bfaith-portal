@@ -13,6 +13,7 @@ import { ensureSchema, shippingMethodMap } from './db.js';
 import {
   importCsv, batchSummary, listOrders, getOrderDetail, decideOrder, exportCsv,
   listRules, upsertRules, copyRules, listUnregistered, mirrorFreshness,
+  searchAssort, updateAssort,
 } from './service.js';
 import { loadSeed } from './tools/load-shipping-rule-seed.mjs';
 
@@ -87,6 +88,13 @@ router.get('/api/export/:id', (req, res) => {
     res.status(500).json({ ok: false, error: 'server_error', message: e.message });
   }
 });
+
+// ── アソート学習 (注文番号/受注番号/商品コードで検索→編集) ──
+router.get('/api/assort/search', (req, res) => handle(res, () => searchAssort(req.query.q || '')));
+router.post('/api/assort/update', (req, res) => handle(res, () => {
+  const b = req.body || {};
+  return updateAssort(b.combo_key, b.shipping_method_code, b.packing_machine_code, currentUser(req));
+}));
 
 // ── マスタ ──
 router.get('/api/rules', (req, res) => handle(res, () => listRules(req.query.product || '')));

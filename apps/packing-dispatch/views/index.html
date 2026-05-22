@@ -53,6 +53,7 @@
   <div class="tabs">
     <div class="tab active" data-tab="dispatch">取込・判定</div>
     <div class="tab" data-tab="master">商品マスタ</div>
+    <div class="tab" data-tab="assort">アソート学習</div>
     <div class="tab" data-tab="unreg">未登録一覧</div>
   </div>
 </header>
@@ -120,6 +121,19 @@
         <tbody id="rulesBody"></tbody>
       </table></div>
     </div>
+  </section>
+
+  <!-- ───── アソート学習 ───── -->
+  <section class="panel" id="panel-assort">
+    <div class="card">
+      <div class="row">
+        <input id="aQuery" placeholder="注文番号 / 受注番号 / 商品コード で検索" size="32" />
+        <button id="btnAssortSearch">検索</button>
+        <span id="aStatus" class="muted"></span>
+      </div>
+      <div class="muted">アソート(複数商品の組合せ)の学習を検索し、配送方法・梱包機を修正できます（次回以降の自動判定に反映）。注文番号・受注番号は過去にその組合せが出た伝票から辿れます。</div>
+    </div>
+    <div id="assortResults"></div>
   </section>
 
   <!-- ───── 未登録一覧 ───── -->
@@ -344,6 +358,43 @@ async function loadUnreg(){
   if(!r.rows.length) tb.innerHTML='<tr><td colspan="3" class="muted">未登録はありません 🎉</td></tr>';
 }
 $('#btnLoadUnreg').onclick=loadUnreg;
+
+// ── アソート学習 検索・編集 ──
+async function doAssortSearch(){
+  const q=$('#aQuery').value.trim(); if(!q){ $('#assortResults').innerHTML=''; return; }
+  $('#aStatus').textContent='検索中…';
+  try{
+    const rows=await api(`api/assort/search?q=${encodeURIComponent(q)}`);
+    $('#aStatus').textContent=`${rows.length}件`;
+    const box=$('#assortResults'); box.innerHTML='';
+    if(!rows.length){ box.innerHTML='<div class="card muted">該当する学習はありません（その注文番号の組合せはまだ学習されていない可能性）。</div>'; return; }
+    for(const r of rows){
+      const card=document.createElement('div'); card.className='card';
+      const items=r.items.map(i=>`${esc(i.product_code)} ${esc(i.product_name||'')} ×${i.qty}`).join(' ／ ');
+      const orders=r.usage.map(u=>`${esc(u.order_no)}${u.uketsuke_no?`(受:${esc(u.uketsuke_no)})`:''}`).join(', ')||'—';
+      const mOpts=OPTIONS.methods.filter(m=>m.code!=='aes').map(m=>`<option value="${m.code}">${esc(m.name_csv)}</option>`).join('');
+      const pOpts=OPTIONS.machines.map(m=>`<option value="${m.code}">${esc(m.name_csv)}</option>`).join('');
+      card.innerHTML=`<div style="margin-bottom:6px"><b>商品:</b> ${items}</div>`+
+        `<div class="muted" style="margin-bottom:8px"><b>利用注文:</b> ${orders}</div>`+
+        `<div class="row"><label>配送方法</label><select class="asm" style="min-width:220px">${mOpts}</select>`+
+        `<label>梱包機</label><select class="apm" style="min-width:200px">${pOpts}</select>`+
+        `<button class="asave">保存</button><span class="amsg muted"></span></div>`+
+        `<div class="muted">最終更新: ${esc(r.decided_by||'')} ${esc((r.decided_at||'').replace('T',' ').slice(0,16))}</div>`;
+      const sm=card.querySelector('.asm'), pm=card.querySelector('.apm');
+      sm.value=r.shipping_method_code; pm.value=r.packing_machine_code;
+      function lock(){ if(sm.value!=='nekopos'){ pm.value='manual'; pm.disabled=true; } else pm.disabled=false; }
+      sm.onchange=lock; lock();
+      card.querySelector('.asave').onclick=async()=>{
+        try{ await api('api/assort/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({combo_key:r.combo_key,shipping_method_code:sm.value,packing_machine_code:pm.value})});
+          card.querySelector('.amsg').textContent='保存しました'; }
+        catch(e){ alert('保存エラー: '+e.message); }
+      };
+      box.appendChild(card);
+    }
+  }catch(e){ $('#aStatus').textContent=''; alert('検索エラー: '+e.message); }
+}
+$('#btnAssortSearch').onclick=doAssortSearch;
+$('#aQuery').addEventListener('keydown', (e)=>{ if(e.key==='Enter') doAssortSearch(); });
 
 // ── マスタ状態 / 初期投入 ──
 async function refreshMasterStat(){
