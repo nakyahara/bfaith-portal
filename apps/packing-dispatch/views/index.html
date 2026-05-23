@@ -398,11 +398,13 @@ $('#aQuery').addEventListener('keydown', (e)=>{ if(e.key==='Enter') doAssortSear
 
 // ── マスタ状態 / 初期投入 ──
 async function refreshMasterStat(){
-  try{ const s=await api('api/master-status'); const n=s.rule_rows;
+  try{ const s=await api('api/master-status');
+    if(s.error){ $('#masterStat').textContent='取得失敗: '+s.error; $('#btnSeed').disabled=false; return; }
+    const n=s.rule_rows;
     $('#masterStat').textContent = `登録済みルール ${n} 行`;
     $('#btnSeed').disabled = n>0;
     if(n>0) $('#btnSeed').textContent='初期データ投入（投入済み）';
-  }catch(e){ $('#masterStat').textContent='取得失敗'; }
+  }catch(e){ $('#masterStat').textContent='取得失敗(通信): '+e.message; }
 }
 $('#btnSeed').onclick = async () => {
   if(!confirm('Excel移行データを初期投入します。よろしいですか？（未投入時のみ実行）')) return;
