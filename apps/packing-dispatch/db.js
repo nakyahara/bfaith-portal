@@ -105,10 +105,13 @@ export function normProductCode(code) { return normKeyPart(code); }
 // ───────────────────────── スキーマ ─────────────────────────
 
 let schemaReady = false;
+let schemaError = null;
+export function getSchemaError() { return schemaError; }
 export function ensureSchema() {
   const db = getMirrorDB();
   if (schemaReady) return db;
 
+  try {
   db.exec(`
     CREATE TABLE IF NOT EXISTS pd_shipping_method (
       code TEXT PRIMARY KEY,
@@ -218,8 +221,29 @@ export function ensureSchema() {
   const insMap = db.prepare(`INSERT OR IGNORE INTO pd_shop_mall_map (shop_name,mall_group) VALUES (?,?)`);
   for (const r of SHOP_MALL_MAP) insMap.run(...r);
 
-  schemaReady = true;
+    schemaReady = true;
+    schemaError = null;
+  } catch (e) {
+    schemaError = e.message;
+    console.error('[packing] ensureSchema error:', e.message);
+  }
   return db;
+}
+
+// 診断情報 (例外を投げず現状を返す。取得失敗の原因切り分け用)
+export function diagInfo() {
+  const info = { mirror_ok: false, schema_error: schemaError, tables: {}, counts: {} };
+  let db;
+  try { db = getMirrorDB(); info.mirror_ok = true; } catch (e) { info.mirror_error = e.message; return info; }
+  try { ensureSchema(); info.schema_error = schemaError; } catch (e) { info.ensure_error = e.message; }
+  for (const t of ['pd_shipping_method', 'pd_packing_machine', 'pd_shipping_rule', 'pd_assort_decision', 'pd_assort_usage', 'pd_import_batch', 'mirror_products']) {
+    try {
+      const ex = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`).get(t);
+      info.tables[t] = !!ex;
+      if (ex) info.counts[t] = db.prepare(`SELECT COUNT(*) c FROM ${t}`).get().c;
+    } catch (e) { info.tables[t] = 'ERR:' + e.message; }
+  }
+  return info;
 }
 
 function audit(action, target, detail, who) {

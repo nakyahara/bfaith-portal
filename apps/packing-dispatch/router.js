@@ -9,7 +9,7 @@ import { Router } from 'express';
 import multer from 'multer';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { ensureSchema, shippingMethodMap } from './db.js';
+import { ensureSchema, shippingMethodMap, diagInfo } from './db.js';
 import {
   importCsv, batchSummary, listOrders, getOrderDetail, decideOrder, exportCsv,
   listRules, upsertRules, copyRules, listUnregistered, mirrorFreshness,
@@ -107,11 +107,18 @@ router.get('/api/unregistered', (req, res) => handle(res, () => ({
   rows: listUnregistered(),
 })));
 
-// ── マスタ状態 (ルール件数) ──
+// ── マスタ状態 (ルール件数)。失敗しても 500 にせずエラー文を返す(原因可視化) ──
 router.get('/api/master-status', (req, res) => handle(res, () => {
-  const db = ensureSchema();
-  return { rule_rows: db.prepare('SELECT COUNT(*) c FROM pd_shipping_rule').get().c };
+  try {
+    const db = ensureSchema();
+    return { rule_rows: db.prepare('SELECT COUNT(*) c FROM pd_shipping_rule').get().c };
+  } catch (e) {
+    return { rule_rows: null, error: e.message };
+  }
 }));
+
+// ── 診断 (取得失敗の原因切り分け) ──
+router.get('/api/diag', (req, res) => handle(res, () => diagInfo()));
 
 // ── 初期データ投入 (Excel移行シード)。未投入時のみ。force=1 で再投入(全上書き) ──
 router.post('/api/admin/load-seed', (req, res) => handle(res, () =>
