@@ -195,9 +195,34 @@ export function getOrderDetail(batch_id, shop_name, order_no) {
 // ───────────────────────── 注文の判断確定 / 編集 ─────────────────────────
 
 /**
- * 1伝票の配送方法・梱包機を確定。order_type='assort' かつ learn=true なら ③ にも学習登録。
+ * 配送指定日(CSV第18列)の書き戻し。pickerYMD は HTML date input の 'YYYY-MM-DD' か ''(クリア)。
+ * 元の値の区切り形式(スラッシュ/ハイフン/8桁連結)を踏襲。未変更なら元文字列をそのまま保持(形式の揺れを防ぐ)。
  */
-export function decideOrder(batch_id, shop_name, order_no, { shipping_method_code, packing_machine_code, learn }, user) {
+function formatDeliveryDate(origRaw, pickerYMD) {
+  const p = String(pickerYMD ?? '').trim();
+  if (p === '') return ''; // クリア
+  const m = p.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return origRaw == null ? '' : String(origRaw); // 想定外入力は元のまま(安全)
+  const [, y, mo, d] = m;
+  // 暦上ありえない日付(例 2026-02-31)は弾く(API直叩き対策)。不正なら元のまま。
+  const dt = new Date(Date.UTC(+y, +mo - 1, +d));
+  if (dt.getUTCFullYear() !== +y || dt.getUTCMonth() + 1 !== +mo || dt.getUTCDate() !== +d) {
+    return origRaw == null ? '' : String(origRaw);
+  }
+  const o = String(origRaw ?? '');
+  const op = o.match(/(\d{4})\D?(\d{1,2})\D?(\d{1,2})/);
+  if (op && +op[1] === +y && +op[2] === +mo && +op[3] === +d) return o; // 同一日付は元の表記を温存
+  if (/^\d{8}$/.test(o)) return `${y}${mo}${d}`;     // 20260524
+  if (o.includes('-')) return `${y}-${mo}-${d}`;     // 2026-05-24
+  return `${y}/${mo}/${d}`;                            // 2026/05/24 (既定: NE/日本で一般的)
+}
+
+/**
+ * 1伝票の配送方法・梱包機を確定。order_type='assort' かつ learn=true なら ③ にも学習登録。
+ * delivery_date(picker 'YYYY-MM-DD'/'') と delivery_time(フリーテキスト) が渡されたら、
+ * 伝票の全明細の raw_cols(第18/19列) も書き換える(配送会社変更時の日時変換用)。
+ */
+export function decideOrder(batch_id, shop_name, order_no, { shipping_method_code, packing_machine_code, learn, delivery_date, delivery_time }, user) {
   const db = ensureSchema();
   const batch = db.prepare(`SELECT status FROM pd_import_batch WHERE batch_id=?`).get(batch_id);
   if (!batch) throw vErr('バッチが見つかりません');
@@ -217,6 +242,21 @@ export function decideOrder(batch_id, shop_name, order_no, { shipping_method_cod
         SET shipping_method_code=?, packing_machine_code=?, row_status='確定', reason_code='manual_decided'
       WHERE batch_id=? AND shop_name=? AND order_no=?`)
       .run(fin.shipping_method_code, fin.packing_machine_code, batch_id, shop_name, order_no);
+
+    // 配送指定日・時間帯の編集を伝票の全明細の raw_cols に反映 (送られてきた時のみ)
+    if (delivery_date !== undefined || delivery_time !== undefined) {
+      const updRaw = db.prepare(`UPDATE pd_import_line SET raw_cols=? WHERE batch_id=? AND row_no=?`);
+      for (const l of lines) {
+        const raw = JSON.parse(l.raw_cols || '[]');
+        if (delivery_date !== undefined) raw[COL.deliveryDate] = formatDeliveryDate(raw[COL.deliveryDate], delivery_date);
+        if (delivery_time !== undefined) {
+          const cur = raw[COL.deliveryTime] == null ? '' : String(raw[COL.deliveryTime]);
+          const next = String(delivery_time ?? '');
+          if (next !== cur) raw[COL.deliveryTime] = next.trim(); // 変更時のみ書換(無変更は元値温存)
+        }
+        updRaw.run(JSON.stringify(raw), batch_id, l.row_no);
+      }
+    }
 
     if (learn && lines[0].order_type === 'assort') {
       // 同一SKU合算した明細で学習

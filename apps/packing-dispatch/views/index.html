@@ -215,6 +215,8 @@
     <div id="dlgInfo" class="muted" style="margin-bottom:10px"></div>
     <div class="row"><label>配送方法</label><select id="dlgMethod" style="min-width:240px"></select></div>
     <div class="row"><label>梱包機</label><select id="dlgMachine" style="min-width:240px"></select><span id="dlgLgNote" class="muted" style="display:none">※LINEギフトは手動出荷固定</span></div>
+    <div class="row"><label>配送指定日</label><input type="date" id="dlgDate" style="min-width:160px" /><button type="button" id="dlgDateClear" class="sub" title="配送指定日を空にする">クリア</button><label style="margin-left:8px">時間帯</label><input type="text" id="dlgTime" placeholder="指定なし（例: 午前中 / 14時～16時）" style="min-width:200px" /></div>
+    <div class="muted" style="margin-bottom:6px">配送会社を変えたら、時間帯の表記もその会社の形式に直してください。</div>
     <label id="dlgLearnWrap" style="display:none"><input type="checkbox" id="dlgLearn" checked /> この組合せを学習（次回から自動）</label>
   </div>
   <div class="df">
@@ -363,12 +365,13 @@ async function openDecide(o){
       `<table class="kv">
         <tr><th>店舗</th><td>${esc(d.shop_name)}</td><th>注文番号</th><td>${esc(d.order_no)}</td></tr>
         <tr><th>配送先</th><td colspan="3"><b>${esc(d.pref)}</b> ${esc(d.recipient)}</td></tr>
-        <tr><th>配送指定日</th><td>${esc(d.delivery_date)||'指定なし'}</td><th>時間帯</th><td>${esc(d.delivery_time)||'指定なし'}</td></tr>
         <tr><th>現在の配送方法</th><td colspan="3">${esc(d.current_shipping_csv)}（種別: ${esc(d.order_type)}）</td></tr>
       </table>
       <table class="items"><thead><tr><th>商品コード</th><th>商品名</th><th>数</th></tr></thead><tbody>${items}</tbody></table>`;
     fillSelect($('#dlgMethod'), OPTIONS.methods.filter(m=>m.code!=='aes'), 'code', m=>m.name_csv, d.shipping_method_code);
     fillSelect($('#dlgMachine'), OPTIONS.machines, 'code', m=>m.name_csv, d.packing_machine_code||'manual');
+    $('#dlgDate').value = toPickerDate(d.delivery_date);  // CSVの日付 → YYYY-MM-DD
+    $('#dlgTime').value = d.delivery_time || '';
     syncDlgMachine();
     $('#dlgLearnWrap').style.display = d.order_type==='assort' ? 'block':'none';
   }catch(e){ $('#dlgInfo').innerHTML = '読込エラー: '+esc(e.message); }
@@ -382,6 +385,12 @@ function syncDlgMachine(){
   const note=$('#dlgLgNote'); if(note) note.style.display = lg ? 'inline' : 'none';
 }
 $('#dlgMethod').addEventListener('change', syncDlgMachine);
+$('#dlgDateClear').onclick = () => { $('#dlgDate').value=''; };
+// CSVの配送指定日(YYYY/MM/DD・YYYY-MM-DD・YYYYMMDD等) → date input 用 YYYY-MM-DD。解釈不能は空。
+function toPickerDate(s){
+  const m=String(s==null?'':s).match(/(\d{4})\D?(\d{1,2})\D?(\d{1,2})/);
+  return m ? `${m[1]}-${String(m[2]).padStart(2,'0')}-${String(m[3]).padStart(2,'0')}` : '';
+}
 $('#dlgCancel').onclick = () => $('#dlg').close();
 $('#dlgOk').onclick = async () => {
   try{
@@ -389,6 +398,7 @@ $('#dlgOk').onclick = async () => {
       batch_id: BATCH, shop_name: DLG_CTX.shop_name, order_no: DLG_CTX.order_no,
       shipping_method_code: $('#dlgMethod').value, packing_machine_code: $('#dlgMachine').value,
       learn: DLG_CTX.order_type==='assort' && $('#dlgLearn').checked,
+      delivery_date: $('#dlgDate').value, delivery_time: $('#dlgTime').value,
     })});
     $('#dlg').close();
     const s = await api(`api/batch/${encodeURIComponent(BATCH)}`); renderSummary(s); await loadOrders();

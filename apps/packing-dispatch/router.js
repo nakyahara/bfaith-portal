@@ -74,6 +74,8 @@ router.post('/api/decide', (req, res) => handle(res, () => {
     shipping_method_code: b.shipping_method_code,
     packing_machine_code: b.packing_machine_code,
     learn: !!b.learn,
+    delivery_date: b.delivery_date,
+    delivery_time: b.delivery_time,
   }, currentUser(req));
 }));
 
