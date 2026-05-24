@@ -502,7 +502,7 @@ export function listUnregistered() {
        AND mp.商品区分 <> 'セット'
        AND COALESCE(mp.セット構成品数, 0) = 0
        AND NOT EXISTS (
-         SELECT 1 FROM mirror_set_components sc WHERE sc.セット商品コード = mp.商品コード
+         SELECT 1 FROM mirror_set_components sc WHERE lower(trim(sc.セット商品コード)) = lower(trim(mp.商品コード))
        )
        AND NOT EXISTS (
          SELECT 1 FROM pd_shipping_rule r
@@ -511,6 +511,18 @@ export function listUnregistered() {
      ORDER BY mp.商品コード
      LIMIT 2000
   `).all();
+}
+
+// 特定商品コードの判定材料を返す (なぜ未登録一覧に出る/出ないかの切り分け)
+export function productDiag(code) {
+  const db = ensureSchema();
+  const c = normProductCode(code);
+  const mp = db.prepare(`SELECT 商品コード, 商品名, 商品区分, 取扱区分, セット構成品数, 代表商品コード
+                           FROM mirror_products WHERE lower(trim(商品コード))=? LIMIT 1`).get(c) || null;
+  const inSetComp = !!db.prepare(`SELECT 1 FROM mirror_set_components WHERE lower(trim(セット商品コード))=? LIMIT 1`).get(c);
+  const inShippingRule = !!db.prepare(`SELECT 1 FROM pd_shipping_rule WHERE product_code=? LIMIT 1`).get(c);
+  const compCount = db.prepare(`SELECT COUNT(*) n FROM mirror_set_components WHERE lower(trim(セット商品コード))=?`).get(c).n;
+  return { query: code, normalized: c, mirror_products: mp, in_mirror_set_components: inSetComp, set_component_rows: compCount, in_shipping_rule: inShippingRule };
 }
 
 // ミラー鮮度 (最終同期時刻があれば返す。無ければ null)
