@@ -492,14 +492,18 @@ export function purgeOldUsage() {
 
 export function listUnregistered() {
   const db = ensureSchema();
-  // セット商品は対象外。商品区分='セット' だけでは NE 上 単品扱いのセットを取りこぼすため、
+  // NE 単品のみ対象。商品区分 ∈ {'単品','セット','例外'}。
+  //  - 'セット' は梱包機振り分けの対象外 (構成品で出荷)。
+  //  - '例外' は売上由来で NE 商品マスタに存在しないコード (楽天等の独自コード 0726-001377 / 10000064 など)。
+  //    NE 商品コードのみ登録したいので除外する。
+  // さらに 商品区分='単品' でも実体がセットのケース(biwakoalfa-2 等)を取りこぼさないよう、
   // 「セット構成品数>0」と「セット構成品マスタに親として存在」も併せて除外する (3シグナル)。
   // NOT EXISTS で NULL 罠回避。商品コードは比較前に lower(trim()) で正規化整合。
   return db.prepare(`
     SELECT mp.商品コード AS product_code, mp.商品名 AS product_name, mp.取扱区分 AS handling
       FROM mirror_products mp
      WHERE TRIM(mp.取扱区分) = '取扱中'
-       AND mp.商品区分 <> 'セット'
+       AND TRIM(mp.商品区分) = '単品'
        AND COALESCE(mp.セット構成品数, 0) = 0
        AND NOT EXISTS (
          SELECT 1 FROM mirror_set_components sc WHERE lower(trim(sc.セット商品コード)) = lower(trim(mp.商品コード))
