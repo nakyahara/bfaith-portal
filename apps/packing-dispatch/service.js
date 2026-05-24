@@ -107,6 +107,24 @@ export function importCsv(buffer, filename, user) {
 
 // ───────────────────────── バッチ参照 ─────────────────────────
 
+// 取込済みバッチの一覧 (新しい順、TTL内のみ)。画面を閉じても再表示できるようにする。
+// 設計上わざとユーザーで絞っていない: 本アプリは requireAppAccess 配下の倉庫スタッフ専用で、
+// 「アップロードしたデータを複数人で共同編集」が要件 (引き継ぎ書 §共同編集)。
+// 同一ワークスペースを全員で共有する前提なので、batch は uploaded_by に関わらず一覧・再開できる。
+export function listBatches(limit = 20) {
+  const db = ensureSchema();
+  const now = utcIsoNow();
+  const lim = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 100) : 20;
+  return db.prepare(`
+    SELECT b.batch_id, b.filename, b.uploaded_by, b.uploaded_at, b.status, b.row_count, b.order_count,
+           (SELECT COUNT(*) FROM pd_import_line l WHERE l.batch_id=b.batch_id AND l.row_status='要判断') AS pending
+      FROM pd_import_batch b
+     WHERE b.expires_at IS NULL OR b.expires_at >= ?
+     ORDER BY b.uploaded_at DESC
+     LIMIT ?
+  `).all(now, lim);
+}
+
 export function batchSummary(batch_id) {
   const db = ensureSchema();
   const b = db.prepare(`SELECT * FROM pd_import_batch WHERE batch_id=?`).get(batch_id);
