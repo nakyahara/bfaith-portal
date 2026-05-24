@@ -267,6 +267,12 @@ function mallGroupOf(shopName) {
   return row ? row.mall_group : DEFAULT_MALL_GROUP;
 }
 
+// LINEギフトのショップか。このショップは要件により梱包機を必ず手動出荷にする。
+// NFKC正規化+空白除去で「LINE ギフト」「ＬＩＮＥギフト」等の表記揺れを吸収。
+export function isLineGift(shopName) {
+  return norm(shopName).replace(/\s+/g, '').toUpperCase().includes('LINEギフト');
+}
+
 // ───────────────────────── 連動列の一括導出 (純関数の核) ─────────────────────────
 
 /**
@@ -448,6 +454,11 @@ export function classifyOrder(lines, smMap = shippingMethodMap()) {
     result = { ...result, shipping_method_code: 'letterpack', packing_machine_code: 'manual', reason_code: 'region_letterpack' };
   } else if (isRegionSpecial && result.row_status === '要判断') {
     result = { ...result, suggest_shipping_method_code: 'letterpack' };
+  }
+
+  // (5) LINEギフトは必ず手動出荷 (要件)。配送方法はそのまま、梱包機のみ manual に固定 (null/要判断行も含め無条件)。
+  if (isLineGift(lines[0]?.shop_name) && result.packing_machine_code !== 'manual') {
+    result = { ...result, packing_machine_code: 'manual' };
   }
   return result;
 }

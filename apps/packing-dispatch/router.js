@@ -77,11 +77,12 @@ router.post('/api/decide', (req, res) => handle(res, () => {
   }, currentUser(req));
 }));
 
-// 出力 (Shift-JIS)
+// 出力 (Shift-JIS)。premeltline=1 で MeltLine を手動出荷に落として出力 (MeltLine 導入前用)。
 router.get('/api/export/:id', (req, res) => {
   try {
-    const { buffer, rowCount } = exportCsv(req.params.id, currentUser(req));
-    const fname = `logi_dispatch_${rowCount}rows.csv`;
+    const premeltline = req.query.premeltline === '1';
+    const { buffer, rowCount } = exportCsv(req.params.id, currentUser(req), { downgradeMeltline: premeltline });
+    const fname = `logi_dispatch_${premeltline ? 'premelt_' : ''}${rowCount}rows.csv`;
     res.setHeader('Content-Type', 'text/csv; charset=Shift_JIS');
     res.setHeader('Content-Disposition', `attachment; filename="${fname}"`);
     res.send(buffer);
