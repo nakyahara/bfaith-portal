@@ -145,7 +145,7 @@
       </div>
       <div class="muted">取扱中・非セットで配送方法ルール未登録の商品コード。クリックでマスタ登録へ。</div>
       <div class="scroll" style="margin-top:8px"><table>
-        <thead><tr><th>商品コード</th><th>商品名</th><th></th></tr></thead>
+        <thead><tr><th>商品コード</th><th>商品名</th><th>取扱区分</th><th></th></tr></thead>
         <tbody id="unregBody"></tbody>
       </table></div>
     </div>
@@ -353,10 +353,10 @@ async function loadUnreg(){
   $('#freshness').textContent = r.freshness ? `ミラー最終同期: ${r.freshness}` : 'ミラー同期時刻不明';
   const tb=$('#unregBody'); tb.innerHTML='';
   for(const x of r.rows){ const tr=document.createElement('tr');
-    tr.innerHTML=`<td>${esc(x.product_code)}</td><td>${esc(x.product_name)}</td><td><button class="sub">登録へ</button></td>`;
+    tr.innerHTML=`<td>${esc(x.product_code)}</td><td>${esc(x.product_name)}</td><td>${esc(x.handling||'')}</td><td><button class="sub">登録へ</button></td>`;
     tr.querySelector('button').onclick=()=>{ document.querySelector('.tab[data-tab=master]').click(); $('#mProduct').value=x.product_code; loadRules(); };
     tb.appendChild(tr); }
-  if(!r.rows.length) tb.innerHTML='<tr><td colspan="3" class="muted">未登録はありません 🎉</td></tr>';
+  if(!r.rows.length) tb.innerHTML='<tr><td colspan="4" class="muted">未登録はありません 🎉</td></tr>';
 }
 $('#btnLoadUnreg').onclick=loadUnreg;
 

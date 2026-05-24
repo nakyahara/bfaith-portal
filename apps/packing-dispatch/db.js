@@ -496,9 +496,9 @@ export function listUnregistered() {
   // 「セット構成品数>0」と「セット構成品マスタに親として存在」も併せて除外する (3シグナル)。
   // NOT EXISTS で NULL 罠回避。商品コードは比較前に lower(trim()) で正規化整合。
   return db.prepare(`
-    SELECT mp.商品コード AS product_code, mp.商品名 AS product_name
+    SELECT mp.商品コード AS product_code, mp.商品名 AS product_name, mp.取扱区分 AS handling
       FROM mirror_products mp
-     WHERE mp.取扱区分 = '取扱中'
+     WHERE TRIM(mp.取扱区分) = '取扱中'
        AND mp.商品区分 <> 'セット'
        AND COALESCE(mp.セット構成品数, 0) = 0
        AND NOT EXISTS (
