@@ -115,6 +115,16 @@
       </div>
     </div>
     <div class="card">
+      <div class="row">
+        <strong>他の商品からコピー</strong>
+        <input id="copyQuery" placeholder="コピー元の商品コード / 商品名" size="28" />
+        <button id="btnCopySearch" class="sub">検索</button>
+        <span id="copyStatus" class="muted"></span>
+      </div>
+      <div class="muted">登録済みの商品から数量帯・配送方法・梱包機を上の編集フォームへ読み込みます。読み込み後そのまま編集して、上の「商品コード」欄に入れた<b>登録先コード</b>で保存できます。</div>
+      <div class="scroll" id="copyResults" style="max-height:30vh; margin-top:8px; display:none"></div>
+    </div>
+    <div class="card">
       <strong>登録済みルール</strong> <span class="muted">（行をクリックで上の編集フォームに読み込み）</span>
       <div class="scroll" style="max-height:36vh"><table>
         <thead><tr><th>商品コード</th><th>モール</th><th>数量帯</th><th>配送方法</th><th>梱包機</th></tr></thead>
@@ -297,6 +307,7 @@ $('#dlgOk').onclick = async () => {
 $('#btnExport').onclick = () => { if(BATCH) location.href = API_BASE + `api/export/${encodeURIComponent(BATCH)}`; };
 
 // ── 商品マスタ ──
+let justCopied = false; // 直前にコピーで編集欄を埋めたか(保存時の上書き確認用)
 function tierRow(t){
   const div=document.createElement('div'); div.className='tier';
   const mOpts = OPTIONS.methods.filter(m=>m.code!=='aes').map(m=>`<option value="${m.code}">${esc(m.name_csv)}</option>`).join('');
@@ -315,6 +326,7 @@ function tierRow(t){
 $('#btnAddTier').onclick=()=>$('#tiers').appendChild(tierRow());
 async function loadRules(){
   const pc=$('#mProduct').value.trim(); if(!pc)return;
+  justCopied=false; // 既存商品の読込は通常編集(コピー由来ではない)
   const rows = await api(`api/rules?product=${encodeURIComponent(pc)}`);
   const tb=$('#rulesBody'); tb.innerHTML='';
   for(const r of rows){ const tr=document.createElement('tr');
@@ -333,19 +345,67 @@ async function loadRules(){
 }
 $('#btnLoadRules').onclick=loadRules; $('#mMall').onchange=loadRules;
 $('#btnSaveRules').onclick = async () => {
+  const code=$('#mProduct').value.trim();
+  const mall=$('#mMall').value;
+  if(!code){ alert('商品コードを入力してください'); return; }
   const tiers=[...$('#tiers').querySelectorAll('.tier')].map(d=>({
     qty_min: parseInt(d.querySelector('.qmin').value,10),
     qty_max: d.querySelector('.qmax').value===''?null:parseInt(d.querySelector('.qmax').value,10),
     shipping_method_code: d.querySelector('.sm').value,
     packing_machine_code: d.querySelector('.pm').value,
   }));
+  // コピー由来の保存は、登録先に既存ルールがあれば上書き確認(誤上書き防止)
+  if(justCopied){
+    try{
+      const existing=await api(`api/rules?product=${encodeURIComponent(code)}`);
+      if(existing.some(r=>r.mall_group===mall) &&
+         !confirm(`「${code}」(${mall}) には既に登録があります。コピー内容で上書きしますか？`)) return;
+    }catch(_){ /* 確認用の取得失敗は保存をブロックしない */ }
+  }
   try{
     await api('api/rules', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({
-      product_code: $('#mProduct').value.trim(), mall_group: $('#mMall').value, tiers,
+      product_code: code, mall_group: mall, tiers,
     })});
+    justCopied=false;
     $('#mStatus').textContent='保存しました'; await loadRules();
   }catch(e){ $('#mStatus').textContent=''; alert('保存エラー: '+e.message); }
 };
+
+// ── 他の商品からコピー (商品コード/商品名で検索→編集フォームへ流し込み) ──
+async function doCopySearch(){
+  const q=$('#copyQuery').value.trim();
+  const box=$('#copyResults');
+  if(!q){ box.style.display='none'; box.innerHTML=''; $('#copyStatus').textContent=''; return; }
+  $('#copyStatus').textContent='検索中…';
+  try{
+    const rows=await api(`api/rule-search?q=${encodeURIComponent(q)}`);
+    $('#copyStatus').textContent=`${rows.length}件`;
+    box.style.display='block';
+    if(!rows.length){ box.innerHTML='<div class="muted" style="padding:8px">該当する登録済み商品がありません。</div>'; return; }
+    let html='<table><thead><tr><th>商品コード</th><th>商品名</th><th>モール</th><th>登録内容</th><th></th></tr></thead><tbody>';
+    rows.forEach((r,i)=>{
+      const variant=r.variant?` <span class="muted">(${esc(r.variant)})</span>`:'';
+      const summary=r.tiers.map(t=>`${esc(String(t.qty_min))}〜${t.qty_max==null?'∞':esc(String(t.qty_max))}: ${esc(methodName(t.shipping_method_code))} / ${esc(machineName(t.packing_machine_code))}`).join('<br>');
+      html+=`<tr><td>${esc(r.product_code)}${variant}</td><td>${esc(r.product_name)}</td><td>${esc(r.mall_group)}</td>`+
+        `<td style="white-space:normal">${summary}</td><td><button class="sub" data-copy="${i}">この内容をコピー</button></td></tr>`;
+    });
+    html+='</tbody></table>'; box.innerHTML=html;
+    box.querySelectorAll('[data-copy]').forEach(btn=>{ btn.onclick=()=>applyCopy(rows[+btn.dataset.copy]); });
+  }catch(e){ $('#copyStatus').textContent=''; box.style.display='none'; alert('検索エラー: '+e.message); }
+}
+function applyCopy(r){
+  $('#mMall').value=r.mall_group;
+  $('#tiers').innerHTML='';
+  (r.tiers.length?r.tiers:[null]).forEach(t=>$('#tiers').appendChild(tierRow(t)));
+  justCopied=true; // 保存時に既存上書きを確認するためのフラグ
+  const tgt=$('#mProduct').value.trim();
+  $('#mStatus').textContent = tgt
+    ? `「${r.product_code}」の ${r.mall_group} 内容をコピーしました。「${tgt}」で保存できます（編集可）。`
+    : 'コピーしました。上の「商品コード」に登録先コードを入力して保存してください（編集可）。';
+  if(!tgt) $('#mProduct').focus();
+}
+$('#btnCopySearch').onclick=doCopySearch;
+$('#copyQuery').addEventListener('keydown',(e)=>{ if(e.key==='Enter') doCopySearch(); });
 
 // ── 未登録一覧 ──
 async function loadUnreg(){

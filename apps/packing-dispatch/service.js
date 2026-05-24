@@ -374,6 +374,63 @@ export function copyRules({ from_sku_key, from_mall_group, to_product_code, to_c
   return upsertRules({ product_code: to_product_code, color_name: to_color_name, size_name: to_size_name, mall_group: to_mall_group, tiers }, user);
 }
 
+/**
+ * コピー元検索: 商品コード or 商品名で登録済みルールを引き、(sku_key, mall_group) 単位に tiers をまとめて返す。
+ * UI 側で結果を選ぶと編集フォームへ tiers を流し込み、編集→保存できる(登録時コピー)。
+ * 2段クエリ: ①一致する見出し(最大100件)を確定 → ②各見出しの tiers を完全に取得(境界での tiers 欠けを防ぐ)。
+ */
+export function searchRules(q) {
+  const db = ensureSchema();
+  const term = norm(q);
+  if (!term) return [];
+  const pc = normProductCode(term);
+  // LIKE のワイルドカード(% _ \)を literal 化してから部分一致 (ESCAPE 指定)
+  const safe = term.replace(/[\\%_]/g, '\\$&');
+  const codeLike = '%' + normProductCode(safe) + '%';
+  const nameLike = '%' + safe.toLowerCase() + '%';
+  const heads = db.prepare(`
+    SELECT r.sku_key, r.product_code, r.mall_group, MAX(mp.商品名) AS product_name
+      FROM pd_shipping_rule r
+      LEFT JOIN mirror_products mp ON lower(trim(mp.商品コード)) = r.product_code
+     WHERE r.product_code = ?
+        OR r.product_code LIKE ? ESCAPE '\\'
+        OR lower(trim(mp.商品名)) LIKE ? ESCAPE '\\'
+     GROUP BY r.sku_key, r.mall_group, r.product_code
+     ORDER BY r.product_code, r.sku_key, r.mall_group
+     LIMIT 100
+  `).all(pc, codeLike, nameLike);
+  if (!heads.length) return [];
+  // 見出しの tiers を1クエリでまとめて取得 (N+1回避)。複合キーは char(1) 連結で IN 照合
+  // (mall_group は {amazon,rakuten,yahoo}、sku_key は正規化済みのため 0x01 と衝突しない)。
+  const SEP = String.fromCharCode(1); // SQL の char(1) と一致させる区切り
+  const keys = heads.map((h) => h.sku_key + SEP + h.mall_group);
+  const ph = keys.map(() => '?').join(',');
+  const tierRows = db.prepare(`
+    SELECT sku_key, mall_group, qty_min, qty_max, shipping_method_code, packing_machine_code
+      FROM pd_shipping_rule
+     WHERE sku_key || char(1) || mall_group IN (${ph})
+     ORDER BY qty_min
+  `).all(...keys);
+  const tiersByKey = new Map();
+  for (const t of tierRows) {
+    const k = t.sku_key + SEP + t.mall_group;
+    if (!tiersByKey.has(k)) tiersByKey.set(k, []);
+    tiersByKey.get(k).push({
+      qty_min: t.qty_min, qty_max: t.qty_max,
+      shipping_method_code: t.shipping_method_code, packing_machine_code: t.packing_machine_code,
+    });
+  }
+  return heads.map((h) => {
+    const parts = String(h.sku_key || '').split('::');
+    const variant = [parts[1], parts[2]].filter(Boolean).join('/');
+    const tiers = (tiersByKey.get(h.sku_key + SEP + h.mall_group) || []).sort((a, b) => a.qty_min - b.qty_min);
+    return {
+      sku_key: h.sku_key, product_code: h.product_code, product_name: h.product_name || '',
+      mall_group: h.mall_group, variant, tiers,
+    };
+  });
+}
+
 // ───────────────────────── TTL ─────────────────────────
 
 export function purgeExpiredBatches() {
