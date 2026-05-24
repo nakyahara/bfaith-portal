@@ -37,7 +37,7 @@ router.get('/', (req, res) => res.sendFile(path.join(__dirname, 'views', 'index.
 router.get('/api/options', (req, res) => handle(res, () => {
   ensureSchema();
   const db = ensureSchema();
-  const methods = db.prepare(`SELECT code,name_csv,rank,is_locked,is_nekopos FROM pd_shipping_method ORDER BY (rank IS NULL), rank`).all();
+  const methods = db.prepare(`SELECT code,name_csv,rank,is_locked,is_nekopos FROM pd_shipping_method ORDER BY (rank IS NULL), rank, code`).all();
   const machines = db.prepare(`SELECT code,name_csv,sort_order FROM pd_packing_machine ORDER BY sort_order`).all();
   return { methods, machines };
 }));
