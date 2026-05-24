@@ -375,9 +375,28 @@ export function copyRules({ from_sku_key, from_mall_group, to_product_code, to_c
 }
 
 /**
+ * 正規化商品コード集合 → 商品名 の Map。mirror_products を1回だけスキャンして必要分を拾う
+ * (lower(trim(商品コード)) はインデックスが効かないため、関数IN を複数回回すより全件1スキャンが速い)。
+ */
+function fetchProductNames(db, codes) {
+  const want = new Set((codes || []).filter(Boolean));
+  const map = new Map();
+  if (!want.size) return map;
+  // 旧実装 MAX(商品名) と同値: 同一コードに商品名揺れがあれば辞書順最大を採用(通常コードは一意なので実質1件)。
+  for (const r of db.prepare(`SELECT 商品コード AS code, 商品名 AS name FROM mirror_products WHERE 商品コード IS NOT NULL`).iterate()) {
+    const pc = normProductCode(r.code);
+    if (!want.has(pc)) continue;
+    const prev = map.get(pc);
+    if (prev === undefined || (r.name != null && String(r.name) > String(prev))) map.set(pc, r.name);
+  }
+  return map;
+}
+
+/**
  * コピー元検索: 商品コード or 商品名で登録済みルールを引き、(sku_key, mall_group) 単位に tiers をまとめて返す。
  * UI 側で結果を選ぶと編集フォームへ tiers を流し込み、編集→保存できる(登録時コピー)。
- * 2段クエリ: ①一致する見出し(最大100件)を確定 → ②各見出しの tiers を完全に取得(境界での tiers 欠けを防ぐ)。
+ * 高速化: 重い「関数付き JOIN + 商品名 LIKE」を避け、(1)一致 product_code を収集 → (2)idx_pd_rule_pc で見出し
+ *         → (3)商品名は mirror_products を1スキャンで一括取得、の3段に分解。
  */
 export function searchRules(q) {
   const db = ensureSchema();
@@ -387,19 +406,29 @@ export function searchRules(q) {
   // LIKE のワイルドカード(% _ \)を literal 化してから部分一致 (ESCAPE 指定)
   const safe = term.replace(/[\\%_]/g, '\\$&');
   const codeLike = '%' + normProductCode(safe) + '%';
-  const nameLike = '%' + safe.toLowerCase() + '%';
+  const nameLike = '%' + safe.toLowerCase() + '%'; // 商品名一致は lower(trim()) で旧実装と同一(大小文字・前後空白を吸収)
+
+  // 商品名一致は「非相関サブクエリ」で product_code 集合に変換する。これにより mirror_products は
+  // 1回だけ評価され(クエリプラン上 LIST SUBQUERY + BLOOM FILTER)、旧実装の「関数付き JOIN による
+  // 行ごとの mirror 走査」を回避。IN は変数展開ではないので件数上限の心配もなく、打ち切りも無いので
+  // ORDER BY product_code LIMIT 100 が真の top-100 を決定的に返す(旧実装と完全同値)。
   const heads = db.prepare(`
-    SELECT r.sku_key, r.product_code, r.mall_group, MAX(mp.商品名) AS product_name
+    SELECT sku_key, product_code, mall_group
       FROM pd_shipping_rule r
-      LEFT JOIN mirror_products mp ON lower(trim(mp.商品コード)) = r.product_code
      WHERE r.product_code = ?
         OR r.product_code LIKE ? ESCAPE '\\'
-        OR lower(trim(mp.商品名)) LIKE ? ESCAPE '\\'
-     GROUP BY r.sku_key, r.mall_group, r.product_code
-     ORDER BY r.product_code, r.sku_key, r.mall_group
+        OR r.product_code IN (
+             SELECT lower(trim(商品コード)) FROM mirror_products
+              WHERE lower(trim(商品名)) LIKE ? ESCAPE '\\' AND 商品コード IS NOT NULL
+           )
+     GROUP BY sku_key, mall_group, product_code
+     ORDER BY product_code, sku_key, mall_group
      LIMIT 100
   `).all(pc, codeLike, nameLike);
   if (!heads.length) return [];
+  // 商品名を一括取得 (mirror を1スキャン)
+  const nameMap = fetchProductNames(db, heads.map((h) => h.product_code));
+
   // 見出しの tiers を1クエリでまとめて取得 (N+1回避)。複合キーは char(1) 連結で IN 照合
   // (mall_group は {amazon,rakuten,yahoo}、sku_key は正規化済みのため 0x01 と衝突しない)。
   const SEP = String.fromCharCode(1); // SQL の char(1) と一致させる区切り
@@ -425,7 +454,7 @@ export function searchRules(q) {
     const variant = [parts[1], parts[2]].filter(Boolean).join('/');
     const tiers = (tiersByKey.get(h.sku_key + SEP + h.mall_group) || []).sort((a, b) => a.qty_min - b.qty_min);
     return {
-      sku_key: h.sku_key, product_code: h.product_code, product_name: h.product_name || '',
+      sku_key: h.sku_key, product_code: h.product_code, product_name: nameMap.get(h.product_code) || '',
       mall_group: h.mall_group, variant, tiers,
     };
   });
@@ -436,7 +465,7 @@ export function searchRules(q) {
 /**
  * 条件(数量N・配送方法・梱包機・モール、すべて任意)で登録済みルール(帯)を検索。
  * 数量N指定時は「N を含む帯 (qty_min<=N AND (qty_max IS NULL OR qty_max>=N))」に限定。
- * AES(変更対象外)は除外。商品名は相関サブクエリで取得(GROUP BY 不要)。LIMIT 2000(超過は capped)。
+ * AES(変更対象外)は除外。商品名は mirror を1スキャンで一括取得(行ごとの相関サブクエリは遅い)。LIMIT 2000(超過は capped)。
  */
 export function searchRulesByCondition({ qty, shipping_method_code, packing_machine_code, mall_group } = {}) {
   const db = ensureSchema();
@@ -457,15 +486,17 @@ export function searchRulesByCondition({ qty, shipping_method_code, packing_mach
   }
   const rows = db.prepare(`
     SELECT r.sku_key, r.product_code, r.mall_group, r.qty_min, r.qty_max,
-           r.shipping_method_code, r.packing_machine_code,
-           (SELECT mp.商品名 FROM mirror_products mp WHERE lower(trim(mp.商品コード)) = r.product_code LIMIT 1) AS product_name
+           r.shipping_method_code, r.packing_machine_code
       FROM pd_shipping_rule r
      WHERE ${where.join(' AND ')}
      ORDER BY r.product_code, r.sku_key, r.mall_group, r.qty_min
      LIMIT 2001
   `).all(...params);
   const capped = rows.length > 2000;
-  return { rows: capped ? rows.slice(0, 2000) : rows, capped };
+  const out = capped ? rows.slice(0, 2000) : rows;
+  const nameMap = fetchProductNames(db, out.map((r) => r.product_code));
+  for (const r of out) r.product_name = nameMap.get(r.product_code) || '';
+  return { rows: out, capped };
 }
 
 /**
