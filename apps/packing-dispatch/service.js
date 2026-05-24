@@ -252,14 +252,19 @@ export function searchAssort(q) {
   const term = norm(q);
   if (!term) return [];
   const combos = new Set(comboKeysByOrderRef(term));
-  // 商品コードでも検索 (sku_key 先頭一致)
+  // 商品コードでも検索: sku_key は "商品コード::色::サイズ"。入力コードを
+  //   ① "code::%"(完全一致+色サイズ変種) ② "code-%"(ハイフン区切りの派生コード, 例 0726-001794-bk)
+  //   の2パターンで照合する。これで base コードでも派生コードがヒットしつつ、別商品(0726-0017940 等)の
+  //   誤一致は避けられる。LIKE のワイルドカードは literal 化。
   const pc = normProductCode(term);
   if (pc) {
+    const e = pc.replace(/[\\%_]/g, '\\$&');
     for (const r of db.prepare(`
       SELECT DISTINCT d.combo_key FROM pd_assort_decision d
         JOIN pd_assort_decision_item i ON i.decision_id=d.id
-       WHERE d.is_active=1 AND d.combo_key_version=? AND (i.sku_key=? OR i.sku_key LIKE ?)
-       LIMIT 200`).all(COMBO_KEY_VERSION, pc + '::::', pc + '::%')) combos.add(r.combo_key);
+       WHERE d.is_active=1 AND d.combo_key_version=?
+         AND (i.sku_key LIKE ? ESCAPE '\\' OR i.sku_key LIKE ? ESCAPE '\\')
+       LIMIT 200`).all(COMBO_KEY_VERSION, e + '::%', e + '-%')) combos.add(r.combo_key);
   }
   const out = [];
   for (const ck of combos) {
