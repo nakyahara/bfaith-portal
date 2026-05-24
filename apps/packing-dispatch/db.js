@@ -529,6 +529,43 @@ export function productDiag(code) {
   return { query: code, normalized: c, mirror_products: mp, in_mirror_set_components: inSetComp, set_component_rows: compCount, in_shipping_rule: inShippingRule };
 }
 
+// 特定商品コードがアソート学習に登録されているかの診断 (有効/無効・どのコード形式で入っているか・利用注文)。
+// 「商品コードで検索してもヒットしない」ときの切り分け用。
+export function assortDiag(code) {
+  const db = ensureSchema();
+  const c = normProductCode(code);
+  if (!c) return { query: code, error: 'コードが空です' };
+  const e = c.replace(/[\\%_]/g, '\\$&');
+  // この code(派生コード含む)を含む decision を有効・無効ともに列挙
+  const decisions = db.prepare(`
+    SELECT d.id, d.combo_key, d.combo_key_version, d.is_active,
+           d.shipping_method_code, d.packing_machine_code, d.decided_by, d.decided_at
+      FROM pd_assort_decision d
+      JOIN pd_assort_decision_item i ON i.decision_id=d.id
+     WHERE (i.sku_key LIKE ? ESCAPE '\\' OR i.sku_key LIKE ? ESCAPE '\\')
+     GROUP BY d.id
+     ORDER BY d.is_active DESC, d.decided_at DESC
+     LIMIT 50
+  `).all(e + '::%', e + '-%');
+  for (const d of decisions) {
+    d.items = db.prepare(`SELECT sku_key, qty FROM pd_assort_decision_item WHERE decision_id=?`).all(d.id);
+    d.usage = db.prepare(`SELECT order_no, uketsuke_no, shop_name, applied_at FROM pd_assort_usage WHERE combo_key=? ORDER BY applied_at DESC LIMIT 20`).all(d.combo_key);
+  }
+  // この文字列が sku_key 中に出てくる全形式 (想定外のコード形式で入っていないかの確認、部分一致)
+  const skuForms = db.prepare(`
+    SELECT DISTINCT i.sku_key
+      FROM pd_assort_decision_item i JOIN pd_assort_decision d ON d.id=i.decision_id
+     WHERE i.sku_key LIKE ? ESCAPE '\\' LIMIT 50
+  `).all('%' + e + '%').map((r) => r.sku_key);
+  return {
+    query: code, normalized: c,
+    active_count: decisions.filter((d) => d.is_active).length,
+    total_count: decisions.length,
+    decisions,
+    matched_sku_forms: skuForms,
+  };
+}
+
 // ミラー鮮度 (最終同期時刻があれば返す。無ければ null)
 export function mirrorFreshness() {
   const db = ensureSchema();
