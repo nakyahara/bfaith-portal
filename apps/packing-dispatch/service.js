@@ -431,6 +431,90 @@ export function searchRules(q) {
   });
 }
 
+// ───────────────────────── 条件検索 + 一括編集 ─────────────────────────
+
+/**
+ * 条件(数量N・配送方法・梱包機・モール、すべて任意)で登録済みルール(帯)を検索。
+ * 数量N指定時は「N を含む帯 (qty_min<=N AND (qty_max IS NULL OR qty_max>=N))」に限定。
+ * AES(変更対象外)は除外。商品名は相関サブクエリで取得(GROUP BY 不要)。LIMIT 2000(超過は capped)。
+ */
+export function searchRulesByCondition({ qty, shipping_method_code, packing_machine_code, mall_group } = {}) {
+  const db = ensureSchema();
+  const where = [`r.shipping_method_code <> 'aes'`];
+  const params = [];
+  const qtyRaw = String(qty ?? '').trim();
+  if (qtyRaw !== '') {
+    if (!/^\d+$/.test(qtyRaw) || parseInt(qtyRaw, 10) < 1) throw vErr('数量は1以上の整数で指定してください');
+    const qn = parseInt(qtyRaw, 10);
+    where.push(`r.qty_min <= ? AND (r.qty_max IS NULL OR r.qty_max >= ?)`);
+    params.push(qn, qn);
+  }
+  if (shipping_method_code) { where.push(`r.shipping_method_code = ?`); params.push(shipping_method_code); }
+  if (packing_machine_code) { where.push(`r.packing_machine_code = ?`); params.push(packing_machine_code); }
+  if (mall_group) {
+    if (!MALL_GROUPS.includes(mall_group)) throw vErr('不正なモール指定です');
+    where.push(`r.mall_group = ?`); params.push(mall_group);
+  }
+  const rows = db.prepare(`
+    SELECT r.sku_key, r.product_code, r.mall_group, r.qty_min, r.qty_max,
+           r.shipping_method_code, r.packing_machine_code,
+           (SELECT mp.商品名 FROM mirror_products mp WHERE lower(trim(mp.商品コード)) = r.product_code LIMIT 1) AS product_name
+      FROM pd_shipping_rule r
+     WHERE ${where.join(' AND ')}
+     ORDER BY r.product_code, r.sku_key, r.mall_group, r.qty_min
+     LIMIT 2001
+  `).all(...params);
+  const capped = rows.length > 2000;
+  return { rows: capped ? rows.slice(0, 2000) : rows, capped };
+}
+
+/**
+ * 選択した帯(sku_key, mall_group, qty_min)の配送方法/梱包機を一括変更。
+ * shipping/packing は未指定(空)なら「変更しない」。各行で finalizeLine 整合矯正(ネコポス以外→梱包機manual)。
+ * AES 行はスキップ。帯(qty_min/qty_max)自体は変えないので区間連続性は不変。
+ */
+export function bulkUpdateRules({ items, shipping_method_code, packing_machine_code }, user) {
+  const db = ensureSchema();
+  if (!Array.isArray(items) || !items.length) throw vErr('対象が選択されていません');
+  if (items.length > 2000) throw vErr('一括変更は一度に2000件までです');
+  const newSm = shipping_method_code || null;
+  const newPm = packing_machine_code || null;
+  if (!newSm && !newPm) throw vErr('変更する項目(配送方法 または 梱包機)を指定してください');
+  if (newSm === 'aes') throw vErr('AES へは変更できません');
+  // 事前にコード妥当性を検証(配送方法・梱包機どちらの単独更新でも確実に。不正コードによる途中失敗を防ぐ)
+  if (newSm && !shippingMethodMap().has(newSm)) throw vErr('未知の配送方法コード: ' + newSm);
+  if (newPm && !db.prepare(`SELECT 1 FROM pd_packing_machine WHERE code=?`).get(newPm)) throw vErr('未知の梱包機コード: ' + newPm);
+
+  // 帯は (sku_key, mall_group, qty_min) で一意(DB UNIQUE)。qty_max も条件に含め、検索後に帯が
+  // 作り変えられていたら更新しない(notFound として安全側に倒す)。qty_max IS ? は NULL 安全比較。
+  const sel = db.prepare(`SELECT shipping_method_code, packing_machine_code FROM pd_shipping_rule
+                           WHERE sku_key=? AND mall_group=? AND qty_min=? AND qty_max IS ?`);
+  const upd = db.prepare(`UPDATE pd_shipping_rule SET shipping_method_code=?, packing_machine_code=?, updated_at=?, updated_by=?
+                           WHERE sku_key=? AND mall_group=? AND qty_min=? AND qty_max IS ?`);
+  const now = utcIsoNow();
+  let updated = 0, skippedAes = 0, corrected = 0, notFound = 0;
+  // all-or-nothing: 整合不能(コード不正等)で1件でも例外なら全体ロールバック。
+  //   notFound(検索後に消えた/変わった) と skippedAes(変更対象外) は正当なスキップで、成功分はコミット。
+  const tx = db.transaction(() => {
+    for (const it of items) {
+      if (!it || !it.sku_key || !it.mall_group || !Number.isInteger(it.qty_min)) { notFound++; continue; }
+      const qmax = Number.isInteger(it.qty_max) ? it.qty_max : null;
+      const cur = sel.get(it.sku_key, it.mall_group, it.qty_min, qmax);
+      if (!cur) { notFound++; continue; }
+      if (cur.shipping_method_code === 'aes') { skippedAes++; continue; }
+      const wantSm = newSm ?? cur.shipping_method_code;
+      const wantPm = newPm ?? cur.packing_machine_code;
+      const fin = finalizeLine(wantSm, wantPm); // 整合矯正(ネコポス以外→梱包機manual)
+      if (fin.packing_machine_code !== wantPm) corrected++; // 梱包機が manual に矯正された件数
+      upd.run(fin.shipping_method_code, fin.packing_machine_code, now, user || null, it.sku_key, it.mall_group, it.qty_min, qmax);
+      updated++;
+    }
+  });
+  tx();
+  audit('rule_bulk_update', null, { updated, shipping: newSm, packing: newPm }, user);
+  return { updated, corrected, skippedAes, notFound };
+}
+
 // ───────────────────────── TTL ─────────────────────────
 
 export function purgeExpiredBatches() {

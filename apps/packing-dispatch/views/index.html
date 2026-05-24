@@ -53,6 +53,7 @@
   <div class="tabs">
     <div class="tab active" data-tab="dispatch">取込・判定</div>
     <div class="tab" data-tab="master">商品マスタ</div>
+    <div class="tab" data-tab="cond">条件検索・一括編集</div>
     <div class="tab" data-tab="assort">アソート学習</div>
     <div class="tab" data-tab="unreg">未登録一覧</div>
   </div>
@@ -129,6 +130,40 @@
       <div class="scroll" style="max-height:36vh"><table>
         <thead><tr><th>商品コード</th><th>モール</th><th>数量帯</th><th>配送方法</th><th>梱包機</th></tr></thead>
         <tbody id="rulesBody"></tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <!-- ───── 条件検索・一括編集 ───── -->
+  <section class="panel" id="panel-cond">
+    <div class="card">
+      <div class="row">
+        <strong>条件で検索</strong>
+        <label>数量 <input id="cQty" type="number" min="1" style="width:64px" placeholder="任意" /></label>
+        <label>配送方法 <select id="cSm"><option value="">（指定なし）</option></select></label>
+        <label>梱包機 <select id="cPm"><option value="">（指定なし）</option></select></label>
+        <label>モール <select id="cMall"><option value="">（全部）</option><option value="amazon">amazon</option><option value="rakuten">rakuten</option><option value="yahoo">yahoo</option></select></label>
+        <button id="btnCondSearch">検索</button>
+        <span id="cStatus" class="muted"></span>
+      </div>
+      <div class="muted">数量を入れると「その数量を含む数量帯」に限定。配送方法・梱包機・モールはそれぞれ任意で絞り込みます（AES は対象外）。</div>
+    </div>
+    <div class="card" id="bulkBar" style="display:none; background:#fffdf5">
+      <div class="row">
+        <strong>選択を一括変更</strong>
+        <span id="cSelCount" class="muted">0件選択</span>
+        <span style="flex:1"></span>
+        <label>配送方法→ <select id="bSm"><option value="">変更しない</option></select></label>
+        <label>梱包機→ <select id="bPm"><option value="">変更しない</option></select></label>
+        <button id="btnBulkApply">選択に適用</button>
+        <span id="bStatus" class="muted"></span>
+      </div>
+      <div class="muted">梱包機を機械にする場合は配送方法をネコポスにしてください（ネコポス以外は自動的に手動出荷へ矯正されます）。</div>
+    </div>
+    <div class="card">
+      <div class="scroll"><table>
+        <thead><tr><th style="width:28px"><input type="checkbox" id="cHeadChk" /></th><th>商品コード</th><th>商品名</th><th>モール</th><th>数量帯</th><th>配送方法</th><th>梱包機</th><th></th></tr></thead>
+        <tbody id="condBody"></tbody>
       </table></div>
     </div>
   </section>
@@ -407,6 +442,82 @@ function applyCopy(r){
 $('#btnCopySearch').onclick=doCopySearch;
 $('#copyQuery').addEventListener('keydown',(e)=>{ if(e.key==='Enter') doCopySearch(); });
 
+// ── 条件検索・一括編集 ──
+let COND_ROWS=[];
+function appendOpts(sel, items, labelFn){
+  for(const it of items){ const o=document.createElement('option'); o.value=it.code; o.textContent=labelFn(it); sel.appendChild(o); }
+}
+function initCondSelects(){
+  const methods=OPTIONS.methods.filter(m=>m.code!=='aes');
+  appendOpts($('#cSm'),methods,m=>m.name_csv); appendOpts($('#cPm'),OPTIONS.machines,m=>m.name_csv);
+  appendOpts($('#bSm'),methods,m=>m.name_csv); appendOpts($('#bPm'),OPTIONS.machines,m=>m.name_csv);
+}
+async function doCondSearch(){
+  const qs=new URLSearchParams();
+  const qty=$('#cQty').value.trim(); if(qty) qs.set('qty',qty);
+  if($('#cSm').value) qs.set('sm',$('#cSm').value);
+  if($('#cPm').value) qs.set('pm',$('#cPm').value);
+  if($('#cMall').value) qs.set('mall',$('#cMall').value);
+  $('#cStatus').textContent='検索中…';
+  try{
+    const res=await api(`api/rule-condition?${qs.toString()}`);
+    COND_ROWS=res.rows||[];
+    $('#cStatus').textContent=`${COND_ROWS.length}件${res.capped?'（上限2000件・絞り込んでください）':''}`;
+    renderCond();
+  }catch(e){ $('#cStatus').textContent=''; COND_ROWS=[]; renderCond(); alert('検索エラー: '+e.message); }
+}
+function renderCond(){
+  const tb=$('#condBody'); tb.innerHTML=''; $('#cHeadChk').checked=false;
+  if(!COND_ROWS.length){ tb.innerHTML='<tr><td colspan="8" class="muted">該当するルールはありません。</td></tr>'; $('#bulkBar').style.display='none'; updateSelCount(); return; }
+  COND_ROWS.forEach((r,i)=>{
+    const tr=document.createElement('tr');
+    const parts=String(r.sku_key||'').split('::'); const variant=[parts[1],parts[2]].filter(Boolean).join('/');
+    const codeDisp=esc(r.product_code)+(variant?` <span class="muted">(${esc(variant)})</span>`:'');
+    tr.innerHTML=`<td style="text-align:center"><input type="checkbox" class="csel" data-i="${i}"></td>`+
+      `<td>${codeDisp}</td><td>${esc(r.product_name||'')}</td><td>${esc(r.mall_group)}</td>`+
+      `<td>${esc(String(r.qty_min))}〜${r.qty_max==null?'∞':esc(String(r.qty_max))}</td>`+
+      `<td>${esc(methodName(r.shipping_method_code))}</td><td>${esc(machineName(r.packing_machine_code))}</td>`+
+      `<td><button class="sub" data-edit="${i}">編集</button></td>`;
+    tb.appendChild(tr);
+  });
+  tb.querySelectorAll('.csel').forEach(cb=>cb.onchange=updateSelCount);
+  tb.querySelectorAll('[data-edit]').forEach(btn=>btn.onclick=()=>editCondRow(COND_ROWS[+btn.dataset.edit]));
+  $('#bulkBar').style.display='block';
+  updateSelCount();
+}
+function updateSelCount(){
+  const all=$('#condBody').querySelectorAll('.csel');
+  const n=$('#condBody').querySelectorAll('.csel:checked').length;
+  $('#cSelCount').textContent=`${n}件選択`;
+  const h=$('#cHeadChk'); h.checked = all.length>0 && n===all.length; h.indeterminate = n>0 && n<all.length;
+}
+function selectedCondRows(){ return [...$('#condBody').querySelectorAll('.csel:checked')].map(cb=>COND_ROWS[+cb.dataset.i]).filter(Boolean); }
+function editCondRow(r){
+  document.querySelector('.tab[data-tab=master]').click();
+  $('#mProduct').value=r.product_code; $('#mMall').value=r.mall_group; loadRules();
+}
+$('#cHeadChk').onchange=()=>{ const c=$('#cHeadChk').checked; $('#condBody').querySelectorAll('.csel').forEach(cb=>cb.checked=c); updateSelCount(); };
+$('#btnCondSearch').onclick=doCondSearch;
+$('#cQty').addEventListener('keydown',(e)=>{ if(e.key==='Enter') doCondSearch(); });
+$('#btnBulkApply').onclick=async()=>{
+  const items=selectedCondRows().map(r=>({sku_key:r.sku_key, mall_group:r.mall_group, qty_min:r.qty_min, qty_max:r.qty_max}));
+  if(!items.length){ alert('変更する行を選択してください'); return; }
+  const sm=$('#bSm').value||null, pm=$('#bPm').value||null;
+  if(!sm&&!pm){ alert('変更する項目（配送方法 または 梱包機）を選んでください'); return; }
+  const desc=[sm?`配送方法→${methodName(sm)}`:'', pm?`梱包機→${machineName(pm)}`:''].filter(Boolean).join(' / ');
+  if(!confirm(`選択した ${items.length} 件を一括変更します。\n${desc}\nよろしいですか？`)) return;
+  $('#bStatus').textContent='適用中…';
+  try{
+    const r=await api('api/rules/bulk',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items, shipping_method_code:sm, packing_machine_code:pm})});
+    let msg=`${r.updated}件 変更`;
+    if(r.corrected) msg+=` / うち${r.corrected}件は梱包機を手動に矯正`;
+    if(r.skippedAes) msg+=` / AES ${r.skippedAes}件スキップ`;
+    if(r.notFound) msg+=` / ${r.notFound}件は対象が変動しスキップ`;
+    $('#bStatus').textContent=msg;
+    await doCondSearch();
+  }catch(e){ $('#bStatus').textContent=''; alert('一括変更エラー: '+e.message); }
+};
+
 // ── 未登録一覧 ──
 async function loadUnreg(){
   const r = await api('api/unregistered');
@@ -477,7 +588,7 @@ $('#btnSeed').onclick = async () => {
 };
 document.querySelector('.tab[data-tab=master]').addEventListener('click', refreshMasterStat);
 
-(async () => { await loadOptions(); })();
+(async () => { await loadOptions(); initCondSelects(); })();
 </script>
 </body>
 </html>
