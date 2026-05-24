@@ -173,8 +173,9 @@ let OPTIONS = { methods: [], machines: [] };
 let BATCH = null;
 let DLG_CTX = null;
 
+const API_BASE = '/apps/packing-dispatch/';  // 末尾スラッシュ無しURLでも相対解決が崩れないよう絶対パス固定
 async function api(url, opt) {
-  const r = await fetch(url, opt);
+  const r = await fetch(API_BASE + url, opt);
   const j = await r.json().catch(() => ({ ok:false, message:'通信エラー' }));
   if (!j.ok) throw new Error(j.message || j.error || 'エラー');
   return j.result;
@@ -293,7 +294,7 @@ $('#dlgOk').onclick = async () => {
 };
 
 // ── 出力 ──
-$('#btnExport').onclick = () => { if(BATCH) location.href = `api/export/${encodeURIComponent(BATCH)}`; };
+$('#btnExport').onclick = () => { if(BATCH) location.href = API_BASE + `api/export/${encodeURIComponent(BATCH)}`; };
 
 // ── 商品マスタ ──
 function tierRow(t){
