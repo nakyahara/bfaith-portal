@@ -70,6 +70,12 @@
         <button id="btnUpload">アップロードして判定</button>
         <span id="upStatus" class="muted"></span>
       </div>
+      <div class="row" id="resumeRow" style="display:none">
+        <span class="muted">取込済みデータを再表示:</span>
+        <select id="batchPick" style="min-width:380px"></select>
+        <button id="btnResume" class="sub">表示</button>
+        <button id="btnRefreshBatches" class="sub">更新</button>
+      </div>
       <div id="summary" class="summary" style="display:none"></div>
     </div>
     <div class="card" id="ordersCard" style="display:none">
@@ -264,8 +270,38 @@ $('#btnUpload').onclick = async () => {
     BATCH = s.batch.batch_id;
     renderSummary(s); await loadOrders();
     $('#upStatus').textContent='完了';
+    loadBatches();
   }catch(e){ $('#upStatus').textContent=''; alert('取込エラー: '+e.message); }
 };
+
+// ── 取込済みデータの再表示 (画面を閉じても DB に残っているバッチを再取得) ──
+function fmtTs(s){ const d=new Date(s); return isNaN(d)?(s||''):d.toLocaleString('ja-JP',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}); }
+async function loadBatches(){
+  try{
+    const rows = await api('api/batches');
+    const sel = $('#batchPick'); sel.innerHTML='';
+    if(!rows.length){ $('#resumeRow').style.display='none'; return; }
+    for(const b of rows){
+      const o=document.createElement('option'); o.value=b.batch_id;
+      o.textContent = `${b.filename||'(名称なし)'} / ${fmtTs(b.uploaded_at)} / ${b.order_count}伝票`
+        + (b.pending?` / 要判断${b.pending}`:'') + (b.status==='exported'?' / 出力済':'') + (b.uploaded_by?` / ${b.uploaded_by}`:'');
+      if(b.batch_id===BATCH) o.selected=true;
+      sel.appendChild(o);
+    }
+    $('#resumeRow').style.display='flex';
+  }catch(e){ /* 一覧取得失敗は致命的でないので黙って無視 */ }
+}
+async function resumeBatch(id){
+  if(!id) return;
+  $('#upStatus').textContent='読み込み中…';
+  try{
+    const s = await api(`api/batch/${encodeURIComponent(id)}`);
+    BATCH = id; renderSummary(s); await loadOrders();
+    $('#upStatus').textContent='取込済みデータを表示しました';
+  }catch(e){ $('#upStatus').textContent=''; alert('取得エラー: '+e.message); }
+}
+$('#btnResume').onclick=()=>resumeBatch($('#batchPick').value);
+$('#btnRefreshBatches').onclick=loadBatches;
 
 function renderSummary(s){
   const c = s.counts||{}; const r = s.reasons||{};
@@ -601,7 +637,7 @@ $('#btnSeed').onclick = async () => {
 };
 document.querySelector('.tab[data-tab=master]').addEventListener('click', refreshMasterStat);
 
-(async () => { await loadOptions(); initCondSelects(); })();
+(async () => { await loadOptions(); initCondSelects(); loadBatches(); })();
 </script>
 </body>
 </html>

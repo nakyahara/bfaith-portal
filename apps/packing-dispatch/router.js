@@ -11,7 +11,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { ensureSchema, shippingMethodMap, diagInfo, productDiag } from './db.js';
 import {
-  importCsv, batchSummary, listOrders, getOrderDetail, decideOrder, exportCsv,
+  importCsv, listBatches, batchSummary, listOrders, getOrderDetail, decideOrder, exportCsv,
   listRules, upsertRules, copyRules, searchRules, searchRulesByCondition, bulkUpdateRules,
   listUnregistered, mirrorFreshness, searchAssort, updateAssort,
 } from './service.js';
@@ -47,6 +47,9 @@ router.post('/api/upload', upload.single('file'), (req, res) => handle(res, () =
   if (!req.file) { const e = new Error('ファイルがありません'); e.code = 'VALIDATION'; throw e; }
   return importCsv(req.file.buffer, req.file.originalname, currentUser(req));
 }));
+
+// 取込済みバッチ一覧 (再表示用)
+router.get('/api/batches', (req, res) => handle(res, () => listBatches(20)));
 
 router.get('/api/batch/:id', (req, res) => handle(res, () => {
   const s = batchSummary(req.params.id);
