@@ -12,7 +12,7 @@ import { fileURLToPath } from 'url';
 import { ensureSchema, shippingMethodMap, diagInfo, productDiag } from './db.js';
 import {
   importCsv, batchSummary, listOrders, getOrderDetail, decideOrder, exportCsv,
-  listRules, upsertRules, copyRules, listUnregistered, mirrorFreshness,
+  listRules, upsertRules, copyRules, searchRules, listUnregistered, mirrorFreshness,
   searchAssort, updateAssort,
 } from './service.js';
 import { loadSeed } from './tools/load-shipping-rule-seed.mjs';
@@ -100,6 +100,8 @@ router.post('/api/assort/update', (req, res) => handle(res, () => {
 router.get('/api/rules', (req, res) => handle(res, () => listRules(req.query.product || '')));
 router.post('/api/rules', (req, res) => handle(res, () => upsertRules(req.body || {}, currentUser(req))));
 router.post('/api/rules/copy', (req, res) => handle(res, () => copyRules(req.body || {}, currentUser(req))));
+// 登録済みルールを 商品コード/商品名 で検索 (コピー元の選択用)
+router.get('/api/rule-search', (req, res) => handle(res, () => searchRules(req.query.q || '')));
 
 // ── 未登録一覧 (取扱中×非セット×②未登録) ──
 router.get('/api/unregistered', (req, res) => handle(res, () => ({
