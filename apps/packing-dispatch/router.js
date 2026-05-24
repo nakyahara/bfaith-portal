@@ -9,7 +9,7 @@ import { Router } from 'express';
 import multer from 'multer';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { ensureSchema, shippingMethodMap, diagInfo } from './db.js';
+import { ensureSchema, shippingMethodMap, diagInfo, productDiag } from './db.js';
 import {
   importCsv, batchSummary, listOrders, getOrderDetail, decideOrder, exportCsv,
   listRules, upsertRules, copyRules, listUnregistered, mirrorFreshness,
@@ -119,6 +119,8 @@ router.get('/api/master-status', (req, res) => handle(res, () => {
 
 // ── 診断 (取得失敗の原因切り分け) ──
 router.get('/api/diag', (req, res) => handle(res, () => diagInfo()));
+// ── 商品診断 (なぜ未登録一覧に出る/出ないか) ──
+router.get('/api/product-diag', (req, res) => handle(res, () => productDiag(req.query.code || '')));
 
 // ── 初期データ投入 (Excel移行シード)。未投入時のみ。force=1 で再投入(全上書き) ──
 router.post('/api/admin/load-seed', (req, res) => handle(res, () =>
