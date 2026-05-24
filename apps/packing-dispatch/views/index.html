@@ -88,7 +88,9 @@
           <option value="auto">自動</option>
         </select>
         <span style="flex:1"></span>
-        <button id="btnExport" class="sub">CSV出力（要判断ゼロで有効）</button>
+        <span id="exportHint" class="muted"></span>
+        <button id="btnExportPre" class="sub" title="MeltLine になっている明細を手動出荷に切り替えて出力します（6月1日のMeltLine導入前用）">CSV出力（〜5/31 MeltLine→手動）</button>
+        <button id="btnExportPost" class="sub" title="MeltLine はそのまま MeltLine で出力します（6月1日のMeltLine導入後用）">CSV出力（6/1〜 MeltLineそのまま）</button>
       </div>
       <div class="scroll">
         <table>
@@ -212,7 +214,7 @@
   <div class="db">
     <div id="dlgInfo" class="muted" style="margin-bottom:10px"></div>
     <div class="row"><label>配送方法</label><select id="dlgMethod" style="min-width:240px"></select></div>
-    <div class="row"><label>梱包機</label><select id="dlgMachine" style="min-width:240px"></select></div>
+    <div class="row"><label>梱包機</label><select id="dlgMachine" style="min-width:240px"></select><span id="dlgLgNote" class="muted" style="display:none">※LINEギフトは手動出荷固定</span></div>
     <label id="dlgLearnWrap" style="display:none"><input type="checkbox" id="dlgLearn" checked /> この組合せを学習（次回から自動）</label>
   </div>
   <div class="df">
@@ -243,6 +245,8 @@ function shortName(s){
   const after=t.slice(Math.min(...idxs)+1).trim();
   return after || t; // 「|」終端などで空になる場合は原文にフォールバック
 }
+// LINEギフトのショップか (このショップは必ず手動出荷)。サーバ側 isLineGift と同じ判定。
+function isLineGiftShop(shop){ return String(shop||'').normalize('NFKC').replace(/\s+/g,'').toUpperCase().includes('LINEギフト'); }
 
 // タブ
 document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
@@ -317,7 +321,9 @@ function renderSummary(s){
   updateExportBtn(c['要判断']||0);
 }
 function updateExportBtn(pending){
-  const b=$('#btnExport'); b.disabled = pending>0; b.textContent = pending>0?`CSV出力（要判断 ${pending} 件を確定して）`:'CSV出力';
+  const dis = pending>0;
+  $('#btnExportPre').disabled = dis; $('#btnExportPost').disabled = dis;
+  $('#exportHint').textContent = dis ? `要判断 ${pending} 件を確定してから出力` : '';
 }
 
 async function loadOrders(){
@@ -367,11 +373,13 @@ async function openDecide(o){
     $('#dlgLearnWrap').style.display = d.order_type==='assort' ? 'block':'none';
   }catch(e){ $('#dlgInfo').innerHTML = '読込エラー: '+esc(e.message); }
 }
-// ネコポス以外は梱包機を「手動出荷」に固定(無効化)
+// ネコポス以外、または LINEギフトは梱包機を「手動出荷」に固定(無効化)
 function syncDlgMachine(){
   const nk = $('#dlgMethod').value === 'nekopos';
+  const lg = isLineGiftShop(DLG_CTX && DLG_CTX.shop_name);
   const mc = $('#dlgMachine');
-  if(!nk){ mc.value='manual'; mc.disabled=true; } else { mc.disabled=false; }
+  if(!nk || lg){ mc.value='manual'; mc.disabled=true; } else { mc.disabled=false; }
+  const note=$('#dlgLgNote'); if(note) note.style.display = lg ? 'inline' : 'none';
 }
 $('#dlgMethod').addEventListener('change', syncDlgMachine);
 $('#dlgCancel').onclick = () => $('#dlg').close();
@@ -387,8 +395,9 @@ $('#dlgOk').onclick = async () => {
   }catch(e){ alert('確定エラー: '+e.message); }
 };
 
-// ── 出力 ──
-$('#btnExport').onclick = () => { if(BATCH) location.href = API_BASE + `api/export/${encodeURIComponent(BATCH)}`; };
+// ── 出力 (MeltLine 導入前=手動に落とす / 導入後=そのまま の2ボタン) ──
+$('#btnExportPre').onclick = () => { if(BATCH) location.href = API_BASE + `api/export/${encodeURIComponent(BATCH)}?premeltline=1`; };
+$('#btnExportPost').onclick = () => { if(BATCH) location.href = API_BASE + `api/export/${encodeURIComponent(BATCH)}`; };
 
 // ── 商品マスタ ──
 let justCopied = false; // 直前にコピーで編集欄を埋めたか(保存時の上書き確認用)

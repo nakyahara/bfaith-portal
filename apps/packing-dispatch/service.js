@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import {
   ensureSchema, utcIsoNow, norm, buildSkuKey, normProductCode,
-  finalizeLine, classifyOrder, shippingMethodMap, mallGroupOf,
+  finalizeLine, classifyOrder, shippingMethodMap, mallGroupOf, isLineGift,
   saveAssortDecision, comboKeyOf, listUnregistered, mirrorFreshness,
   recordAssortUsage, comboKeysByOrderRef, getAssortByCombo, purgeOldUsage,
   COL, MALL_GROUPS, COMBO_KEY_VERSION,
@@ -208,7 +208,9 @@ export function decideOrder(batch_id, shop_name, order_no, { shipping_method_cod
   if (lines.some((l) => l.shipping_method_code === 'aes' || l.reason_code === 'aes_locked')) {
     throw vErr('AES の伝票は変更対象外です');
   }
-  const fin = finalizeLine(shipping_method_code, packing_machine_code); // 整合矯正(ネコポス以外→manual)
+  // LINEギフトは必ず手動出荷 (要件)。ユーザーが梱包機を選んでも manual に固定。
+  const pmReq = isLineGift(shop_name) ? 'manual' : packing_machine_code;
+  const fin = finalizeLine(shipping_method_code, pmReq); // 整合矯正(ネコポス以外→manual)
   const now = utcIsoNow();
   const tx = db.transaction(() => {
     db.prepare(`UPDATE pd_import_line
@@ -294,7 +296,8 @@ export function updateAssort(combo_key, shipping_method_code, packing_machine_co
 
 // ───────────────────────── 出力 (ゲート + CAS) ─────────────────────────
 
-export function exportCsv(batch_id, user) {
+export function exportCsv(batch_id, user, opts = {}) {
+  const downgradeMeltline = !!opts.downgradeMeltline; // MeltLine 導入前: meltline を手動出荷に落として出力
   const db = ensureSchema();
   const b = db.prepare(`SELECT * FROM pd_import_batch WHERE batch_id=?`).get(batch_id);
   if (!b) throw vErr('バッチが見つかりません');
@@ -311,7 +314,10 @@ export function exportCsv(batch_id, user) {
   const outRows = lineRows.map((l) => {
     const raw = JSON.parse(l.raw_cols);
     if (l.shipping_method_code && l.shipping_method_code !== 'aes') {
-      const fin = finalizeLine(l.shipping_method_code, l.packing_machine_code, smMap);
+      let pm = l.packing_machine_code;
+      if (downgradeMeltline && pm === 'meltline') pm = 'manual'; // MeltLine 導入前は手動出荷で出す
+      if (isLineGift(l.shop_name)) pm = 'manual';                // LINEギフトは必ず手動出荷 (安全網)
+      const fin = finalizeLine(l.shipping_method_code, pm, smMap);
       for (const [idx, val] of Object.entries(fin.cols)) raw[Number(idx)] = val;
     }
     return raw;
