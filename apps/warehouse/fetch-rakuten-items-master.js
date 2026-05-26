@@ -32,6 +32,8 @@
  */
 import 'dotenv/config';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { initDB, getDB } from './db.js';
 
 const SERVICE_SECRET = process.env.RAKUTEN_SERVICE_SECRET;
@@ -44,11 +46,45 @@ const HITS_PER_PAGE = 100;
 const MAX_RETRY = 6;
 const RETRY_BASE_MS = 1000;
 const JITTER_MAX_MS = 250;
+const LOCK_FILE = path.resolve('data', 'fetch-rakuten-items-master.lock');
+
+// JST 時刻は UTC ベースで +9h して壁時計を構築する (feedback_jst_to_iso_string_trap.md)
+// toISOString().replace('Z', '+09:00') は実行環境 TZ 依存で破綻する (Codex Round 1 Critical)
+function jstWallclock() {
+  const utcMs = Date.now();
+  return new Date(utcMs + 9 * 60 * 60 * 1000);
+}
 
 function nowJstIso() {
-  const d = new Date();
-  d.setMinutes(d.getMinutes() + d.getTimezoneOffset() + 9 * 60);
-  return d.toISOString().replace('Z', '+09:00');
+  const j = jstWallclock();
+  const yy = j.getUTCFullYear();
+  const mm = String(j.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(j.getUTCDate()).padStart(2, '0');
+  const hh = String(j.getUTCHours()).padStart(2, '0');
+  const mi = String(j.getUTCMinutes()).padStart(2, '0');
+  const ss = String(j.getUTCSeconds()).padStart(2, '0');
+  return `${yy}-${mm}-${dd}T${hh}:${mi}:${ss}+09:00`;
+}
+
+function acquireLock() {
+  try {
+    const fd = fs.openSync(LOCK_FILE, 'wx');
+    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, started_at: nowJstIso() }), 'utf8');
+    fs.closeSync(fd);
+    return true;
+  } catch (e) {
+    if (e.code === 'EEXIST') {
+      const content = fs.existsSync(LOCK_FILE) ? fs.readFileSync(LOCK_FILE, 'utf8') : '?';
+      console.error(`[fetch-rakuten-items-master] FATAL: lock file exists (${LOCK_FILE}): ${content}`);
+      console.error('  warehouse.db 並列書込みは禁止。前回プロセスが残っていないか確認、必要なら手動で lock 削除。');
+      return false;
+    }
+    throw e;
+  }
+}
+
+function releaseLock() {
+  try { fs.unlinkSync(LOCK_FILE); } catch (_) {}
 }
 
 function sleep(ms) {
@@ -124,10 +160,18 @@ function loadNeProductCodes(db) {
 }
 
 /**
- * raw_rakuten_items_master に UPSERT (SCD2)
+ * raw_rakuten_items_master に UPSERT (SCD2、transaction で atomic)
+ * source_hash は item_number/url も含めて変更検知 (Codex Round 1 Medium 2 反映)
  */
 function upsertRawItem(db, item, syncedAt) {
-  const sourceHashInput = `${item.manageNumber}\t${item.title}\t${item.genreId}\t1`;
+  const sourceHashInput = [
+    item.manageNumber,
+    item.itemNumber,
+    item.itemUrl || '',
+    item.title,
+    item.genreId || '',
+    '1', // is_active
+  ].join('\t');
   const sourceHash = sha256Hex(sourceHashInput);
 
   const existing = db
@@ -138,23 +182,26 @@ function upsertRawItem(db, item, syncedAt) {
 
   if (existing && existing.source_hash === sourceHash) return { action: 'raw_unchanged' };
 
-  if (existing) {
-    db.prepare(`UPDATE raw_rakuten_items_master SET is_active=0, valid_to=?, synced_at=? WHERE id=?`)
-      .run(syncedAt, syncedAt, existing.id);
-  }
-
-  db.prepare(`
-    INSERT INTO raw_rakuten_items_master (
-      rakuten_shop_code, manage_number, item_number, item_url,
-      title, genre_id, is_active, source_payload_json, source_hash,
-      valid_from, valid_to, synced_at
-    ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, NULL, ?)
-  `).run(
-    SHOP_CODE, item.manageNumber, item.itemNumber, item.itemUrl || null,
-    item.title, item.genreId || null,
-    JSON.stringify(item.raw), sourceHash,
-    syncedAt, syncedAt
-  );
+  // SCD2 close + insert を transaction で atomic 化 (Codex Round 1 Critical 3)
+  const txn = db.transaction(() => {
+    if (existing) {
+      db.prepare(`UPDATE raw_rakuten_items_master SET is_active=0, valid_to=?, synced_at=? WHERE id=?`)
+        .run(syncedAt, syncedAt, existing.id);
+    }
+    db.prepare(`
+      INSERT INTO raw_rakuten_items_master (
+        rakuten_shop_code, manage_number, item_number, item_url,
+        title, genre_id, is_active, source_payload_json, source_hash,
+        valid_from, valid_to, synced_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, NULL, ?)
+    `).run(
+      SHOP_CODE, item.manageNumber, item.itemNumber, item.itemUrl || null,
+      item.title, item.genreId || null,
+      JSON.stringify(item.raw), sourceHash,
+      syncedAt, syncedAt
+    );
+  });
+  txn();
   return { action: existing ? 'raw_updated' : 'raw_inserted' };
 }
 
@@ -175,24 +222,27 @@ function upsertMapping(db, item, neProductCode, mappingType, reason, syncedAt) {
 
   if (sameAsExisting) return { action: 'map_unchanged' };
 
-  if (existing) {
-    db.prepare(`UPDATE x_rakuten_item_product_map SET is_active=0, valid_to=?, synced_at=?, updated_by=? WHERE id=?`)
-      .run(syncedAt, syncedAt, 'system:fetch-rakuten-items-master', existing.id);
-  }
-
-  db.prepare(`
-    INSERT INTO x_rakuten_item_product_map (
-      rakuten_shop_code, rakuten_item_code, rakuten_item_url, rakuten_item_name,
-      ne_product_code, ne_sku_code,
-      mapping_type, confidence, reason, is_active,
-      valid_from, valid_to, created_by, updated_by, synced_at
-    ) VALUES (?, ?, ?, ?, ?, NULL, ?, 1.0, ?, 1, ?, NULL, ?, ?, ?)
-  `).run(
-    SHOP_CODE, item.manageNumber, item.itemUrl || null, item.title,
-    neProductCode ?? '',
-    mappingType, reason ?? null,
-    syncedAt, 'system:fetch-rakuten-items-master', 'system:fetch-rakuten-items-master', syncedAt
-  );
+  // SCD2 close + insert を transaction で atomic 化 (Codex Round 1 Critical 3)
+  const txn = db.transaction(() => {
+    if (existing) {
+      db.prepare(`UPDATE x_rakuten_item_product_map SET is_active=0, valid_to=?, synced_at=?, updated_by=? WHERE id=?`)
+        .run(syncedAt, syncedAt, 'system:fetch-rakuten-items-master', existing.id);
+    }
+    db.prepare(`
+      INSERT INTO x_rakuten_item_product_map (
+        rakuten_shop_code, rakuten_item_code, rakuten_item_url, rakuten_item_name,
+        ne_product_code, ne_sku_code,
+        mapping_type, confidence, reason, is_active,
+        valid_from, valid_to, created_by, updated_by, synced_at
+      ) VALUES (?, ?, ?, ?, ?, NULL, ?, 1.0, ?, 1, ?, NULL, ?, ?, ?)
+    `).run(
+      SHOP_CODE, item.manageNumber, item.itemUrl || null, item.title,
+      neProductCode ?? '',
+      mappingType, reason ?? null,
+      syncedAt, 'system:fetch-rakuten-items-master', 'system:fetch-rakuten-items-master', syncedAt
+    );
+  });
+  txn();
   return { action: existing ? 'map_updated' : 'map_inserted' };
 }
 
@@ -207,6 +257,10 @@ async function main() {
     process.exit(1);
   }
 
+  if (!dryRun && !acquireLock()) {
+    process.exit(2);
+  }
+
   console.log(`[fetch-rakuten-items-master] start (dryRun=${dryRun}, maxPages=${maxPages}, shop=${SHOP_CODE})`);
 
   initDB();
@@ -218,8 +272,16 @@ async function main() {
   const syncedAt = nowJstIso();
   const counters = { total: 0, pages: 0, unmapped: 0 };
   let cursorMark = '*';
+  // Codex Round 1 High 2 反映: cursorMark 循環防止 (3点以上のループも検知)
+  const seenCursors = new Set();
 
   while (counters.pages < maxPages) {
+    if (seenCursors.has(cursorMark)) {
+      console.warn(`  [stop] cursorMark already seen: ${cursorMark} — possible cycle, abort loop`);
+      break;
+    }
+    seenCursors.add(cursorMark);
+
     const body = await fetchItemsPage(cursorMark);
     const results = body?.results ?? body?.items ?? [];
     counters.pages += 1;
@@ -275,4 +337,6 @@ async function main() {
 main().catch((e) => {
   console.error('[fetch-rakuten-items-master] FATAL:', e);
   process.exit(1);
+}).finally(() => {
+  releaseLock();
 });

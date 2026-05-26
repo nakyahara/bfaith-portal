@@ -32,6 +32,8 @@
  */
 import 'dotenv/config';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { initDB, getDB } from './db.js';
 
 const APP_ID = process.env.RAKUTEN_APP_ID;
@@ -40,22 +42,55 @@ const RATE_LIMIT_MS = 1100;            // 1 req/sec + 100ms 余裕
 const MAX_RETRY = 6;                    // 指数バックオフ最大 6回 (1+2+4+8+16+32 = 63秒)
 const RETRY_BASE_MS = 1000;
 const JITTER_MAX_MS = 250;
+const LOCK_FILE = path.resolve('data', 'fetch-rakuten-genre-tree.lock');
+
+// JST 時刻は UTC ベースで +9h して壁時計を構築する (feedback_jst_to_iso_string_trap.md)
+// toISOString().replace('Z', '+09:00') は実行環境 TZ 依存で破綻する (Codex Round 1 Critical)
+function jstWallclock() {
+  const utcMs = Date.now();
+  return new Date(utcMs + 9 * 60 * 60 * 1000); // .getUTC* が JST 壁時計値
+}
 
 function nowJstIso() {
-  const d = new Date();
-  d.setMinutes(d.getMinutes() + d.getTimezoneOffset() + 9 * 60);
-  return d.toISOString().replace('Z', '+09:00');
+  const j = jstWallclock();
+  const yy = j.getUTCFullYear();
+  const mm = String(j.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(j.getUTCDate()).padStart(2, '0');
+  const hh = String(j.getUTCHours()).padStart(2, '0');
+  const mi = String(j.getUTCMinutes()).padStart(2, '0');
+  const ss = String(j.getUTCSeconds()).padStart(2, '0');
+  return `${yy}-${mm}-${dd}T${hh}:${mi}:${ss}+09:00`;
 }
 
 function jstYyyymmddHhmm() {
-  const d = new Date();
-  d.setMinutes(d.getMinutes() + d.getTimezoneOffset() + 9 * 60);
-  const yy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-  const hh = String(d.getHours()).padStart(2, '0');
-  const mi = String(d.getMinutes()).padStart(2, '0');
+  const j = jstWallclock();
+  const yy = j.getUTCFullYear();
+  const mm = String(j.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(j.getUTCDate()).padStart(2, '0');
+  const hh = String(j.getUTCHours()).padStart(2, '0');
+  const mi = String(j.getUTCMinutes()).padStart(2, '0');
   return `${yy}${mm}${dd}-${hh}${mi}`;
+}
+
+function acquireLock() {
+  try {
+    const fd = fs.openSync(LOCK_FILE, 'wx');
+    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, started_at: nowJstIso() }), 'utf8');
+    fs.closeSync(fd);
+    return true;
+  } catch (e) {
+    if (e.code === 'EEXIST') {
+      const content = fs.existsSync(LOCK_FILE) ? fs.readFileSync(LOCK_FILE, 'utf8') : '?';
+      console.error(`[fetch-rakuten-genre-tree] FATAL: lock file exists (${LOCK_FILE}): ${content}`);
+      console.error('  warehouse.db 並列書込みは禁止。前回プロセスが残っていないか確認、必要なら手動で lock 削除。');
+      return false;
+    }
+    throw e;
+  }
+}
+
+function releaseLock() {
+  try { fs.unlinkSync(LOCK_FILE); } catch (_) {}
 }
 
 function sleep(ms) {
@@ -71,7 +106,8 @@ function sha256Hex(s) {
 }
 
 /**
- * 1 ジャンル分の API リクエスト (指数バックオフ + ジッタ + fail-open)
+ * 1 ジャンル分の API リクエスト (指数バックオフ + ジッタ、fail-closed: 最終 throw で全体停止)
+ * Codex Round 1 High 3 反映: fail-open ではなく fail-closed が現運用方針 (再実行で復旧)
  */
 async function fetchGenreNode(genreId) {
   const url = `${API_URL}?applicationId=${encodeURIComponent(APP_ID)}&genreId=${genreId}&formatVersion=2`;
@@ -153,16 +189,20 @@ async function fetchGenreTreeBfs(rootGenreId, maxDepth, onNode) {
 
 /**
  * genre_path を構築 (parent から root までを ' > ' で連結)
- * 一旦すべて DB に入れた後、再 pass で path を構築する想定 (BFS 順では parent が先に入る)
+ * 現在 active な行 (is_active=1 AND valid_to IS NULL) のみを辿る。
+ * tree_version で絞らない (Codex Round 1 Critical 1 反映): 不変ノードでも path 更新可能にする。
  */
-function buildGenrePath(db, genreId, treeVersion) {
+function buildGenrePath(db, genreId) {
   const parts = [];
   let cursor = genreId;
   let guard = 0;
-  while (cursor && guard < 30) {
+  const seen = new Set();
+  while (cursor && guard < 30 && !seen.has(cursor)) {
+    seen.add(cursor);
     const row = db
-      .prepare(`SELECT genre_name, parent_genre_id FROM m_rakuten_genres WHERE genre_id=? AND tree_version=? AND is_active=1 AND valid_to IS NULL`)
-      .get(cursor, treeVersion);
+      .prepare(`SELECT genre_name, parent_genre_id FROM m_rakuten_genres
+                WHERE genre_id=? AND is_active=1 AND valid_to IS NULL`)
+      .get(cursor);
     if (!row) break;
     parts.unshift(row.genre_name);
     cursor = row.parent_genre_id;
@@ -172,10 +212,19 @@ function buildGenrePath(db, genreId, treeVersion) {
 }
 
 /**
- * 1 ノードを m_rakuten_genres に UPSERT (SCD2)
+ * 1 ノードを m_rakuten_genres に UPSERT (SCD2、transaction で atomic)
+ * source_hash は構造変化 (parent/leaf/level) も検知するよう拡張 (Codex Round 1 High 1)
  */
 function upsertGenre(db, node, treeVersion, syncedAt) {
-  const sourceHashInput = `${node.genreId}\t${node.genreName}\t1`;
+  // 構造的変化を検知できるよう拡張: parent_genre_id / is_leaf / level_no を含める (Codex Round 1 High 1)
+  const sourceHashInput = [
+    node.genreId,
+    node.genreName,
+    String(node.parentGenreId ?? ''),
+    String(node.isLeaf),
+    String(node.genreLevel ?? ''),
+    '1', // is_active
+  ].join('\t');
   const sourceHash = sha256Hex(sourceHashInput);
 
   // 既存 active 行を取得
@@ -184,29 +233,31 @@ function upsertGenre(db, node, treeVersion, syncedAt) {
     .get(node.genreId);
 
   if (existing && existing.source_hash === sourceHash) {
-    // 変更なし: 何もしない
+    // 変更なし: 何もしない (path 更新は再 pass の更新で行う)
     return { action: 'unchanged', genreId: node.genreId };
   }
 
-  if (existing) {
-    // 変更あり: 旧行を closing
-    db.prepare(`UPDATE m_rakuten_genres SET is_active=0, valid_to=?, synced_at=? WHERE id=?`)
-      .run(syncedAt, syncedAt, existing.id);
-  }
-
-  db.prepare(`
-    INSERT INTO m_rakuten_genres (
-      genre_id, genre_name, genre_path, parent_genre_id, level_no, is_leaf,
-      tree_version, is_active, source_payload_json, source_hash,
-      valid_from, valid_to, synced_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, NULL, ?)
-  `).run(
-    node.genreId, node.genreName, null,
-    node.parentGenreId, node.genreLevel, node.isLeaf,
-    treeVersion,
-    JSON.stringify(node.rawPayload), sourceHash,
-    syncedAt, syncedAt
-  );
+  // SCD2 close + insert を transaction で atomic 化 (Codex Round 1 Critical 3)
+  const txn = db.transaction(() => {
+    if (existing) {
+      db.prepare(`UPDATE m_rakuten_genres SET is_active=0, valid_to=?, synced_at=? WHERE id=?`)
+        .run(syncedAt, syncedAt, existing.id);
+    }
+    db.prepare(`
+      INSERT INTO m_rakuten_genres (
+        genre_id, genre_name, genre_path, parent_genre_id, level_no, is_leaf,
+        tree_version, is_active, source_payload_json, source_hash,
+        valid_from, valid_to, synced_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, NULL, ?)
+    `).run(
+      node.genreId, node.genreName, null,
+      node.parentGenreId, node.genreLevel, node.isLeaf,
+      treeVersion,
+      JSON.stringify(node.rawPayload), sourceHash,
+      syncedAt, syncedAt
+    );
+  });
+  txn();
   return { action: existing ? 'updated' : 'inserted', genreId: node.genreId };
 }
 
@@ -222,6 +273,10 @@ async function main() {
   if (!APP_ID) {
     console.error('[fetch-rakuten-genre-tree] FATAL: RAKUTEN_APP_ID が .env に未設定');
     process.exit(1);
+  }
+
+  if (!dryRun && !acquireLock()) {
+    process.exit(2);
   }
 
   console.log(`[fetch-rakuten-genre-tree] start (root=${rootGenreId}, maxDepth=${maxDepth ?? 'unlimited'}, dryRun=${dryRun})`);
@@ -244,13 +299,13 @@ async function main() {
   });
 
   if (!dryRun) {
-    // path を再 pass で構築
+    // path を再 pass で構築 (現在 active 行を tree_version 不問で更新、Codex Round 1 Critical 1)
     console.log(`[fetch-rakuten-genre-tree] building genre_path for ${counters.total} nodes...`);
     const pathTxn = db.transaction(() => {
       for (const node of collected) {
-        const path = buildGenrePath(db, node.genreId, treeVersion);
-        db.prepare(`UPDATE m_rakuten_genres SET genre_path=? WHERE genre_id=? AND tree_version=? AND is_active=1 AND valid_to IS NULL`)
-          .run(path, node.genreId, treeVersion);
+        const p = buildGenrePath(db, node.genreId);
+        db.prepare(`UPDATE m_rakuten_genres SET genre_path=? WHERE genre_id=? AND is_active=1 AND valid_to IS NULL`)
+          .run(p, node.genreId);
       }
     });
     pathTxn();
@@ -265,4 +320,6 @@ async function main() {
 main().catch((e) => {
   console.error('[fetch-rakuten-genre-tree] FATAL:', e);
   process.exit(1);
+}).finally(() => {
+  releaseLock();
 });
