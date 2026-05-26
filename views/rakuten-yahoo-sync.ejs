@@ -105,22 +105,154 @@
       <div class="progress" id="prog-log">(待機中)</div>
     </section>
 
-    <!-- U2-U5: Coming soon (W3 では skeleton のみ、U2 以降は別 PR で) -->
+    <!-- U2: needs_category 解消 (Yahoo cat 検索 + 影響件数プレビュー + 2段階確認 + manual override) -->
     <section id="tab-U2" class="rys-section" style="display: none;">
-      <h3>needs_category 解消</h3>
-      <div class="coming-soon">この画面は U1 安定稼働後 (W3 Phase 2) で実装します。<br>当面は CLI <code>scripts/export-newgenre-worklist.js</code> + <code>import-newgenre-worklist.js</code> で運用。</div>
+      <h3>needs_category 解消 (手動で Yahoo カテゴリを割り当て)</h3>
+      <div class="rys-stat-row">
+        <div class="rys-stat"><div class="label">除外品 件数</div><div class="value" id="nc-count">—</div></div>
+      </div>
+      <div class="rys-actions">
+        <button class="btn btn-secondary" id="btn-nc-refresh">再読み込み</button>
+      </div>
+      <div class="table-wrap" style="max-height: 320px;">
+        <table class="rys-table" id="nc-table">
+          <thead>
+            <tr>
+              <th>item_code</th>
+              <th>rakuten_manage_number</th>
+              <th>reason</th>
+              <th>detail</th>
+              <th>updated_at</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <div class="rys-section" style="margin-top: 16px;">
+        <h3>Yahoo カテゴリを検索 → manual override 登録</h3>
+        <div class="rys-actions">
+          <label>キーワード</label>
+          <input type="text" id="nc-search" placeholder="例: タオル / バスタオル / アロマオイル" style="padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 4px; min-width: 240px;">
+          <button class="btn btn-secondary" id="btn-nc-search">検索</button>
+        </div>
+        <div class="table-wrap" style="max-height: 240px;">
+          <table class="rys-table" id="nc-search-table">
+            <thead>
+              <tr>
+                <th>product_category</th>
+                <th>name</th>
+                <th>path_name</th>
+                <th>選択</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
+        <div style="margin-top: 12px; padding: 12px; background: #f8fafc; border-radius: 6px;">
+          <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
+            <label>楽天 genre_id</label>
+            <input type="text" id="nc-genre" placeholder="例: 551744" style="padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 4px; min-width: 140px;">
+            <label>Yahoo product_category</label>
+            <input type="text" id="nc-pc" readonly style="padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 4px; min-width: 100px; background: #fff;">
+            <label>note</label>
+            <input type="text" id="nc-note" placeholder="任意" style="padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 4px; min-width: 200px;">
+          </div>
+          <div class="rys-actions" style="margin-top: 10px;">
+            <button class="btn btn-secondary" id="btn-nc-preview">影響件数プレビュー</button>
+            <button class="btn btn-primary" id="btn-nc-confirm" disabled>確定 (manual override 登録)</button>
+            <span id="nc-preview-result" style="font-size: 13px; color: #555;"></span>
+          </div>
+        </div>
+      </div>
     </section>
+
+    <!-- U3: 公開済品一覧 + Yahoo ダッシュリンク -->
     <section id="tab-U3" class="rys-section" style="display: none;">
-      <h3>公開済品一覧</h3>
-      <div class="coming-soon">この画面は W3 Phase 2 で実装。</div>
+      <h3>公開済品一覧 (registered_items)</h3>
+      <div class="rys-stat-row">
+        <div class="rys-stat"><div class="label">合計</div><div class="value" id="reg-total">—</div></div>
+      </div>
+      <div class="rys-actions">
+        <button class="btn btn-secondary" id="btn-reg-refresh">再読み込み</button>
+      </div>
+      <div class="table-wrap">
+        <table class="rys-table" id="reg-table">
+          <thead>
+            <tr>
+              <th>item_code</th>
+              <th>yahoo_item_code</th>
+              <th>source</th>
+              <th>registered_at</th>
+              <th>last_seen_at</th>
+              <th>Yahoo</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
     </section>
+
+    <!-- U4: カテゴリ変換表 (read-only) -->
     <section id="tab-U4" class="rys-section" style="display: none;">
-      <h3>カテゴリ変換表</h3>
-      <div class="coming-soon">この画面は W3 Phase 2 で実装。</div>
+      <h3>カテゴリ変換表 (yahoo_product_category → default_path 観測)</h3>
+      <div class="rys-stat-row">
+        <div class="rys-stat"><div class="label">合計</div><div class="value" id="ct-total">—</div></div>
+      </div>
+      <div class="rys-actions">
+        <button class="btn btn-secondary" id="btn-ct-refresh">再読み込み</button>
+      </div>
+      <div class="table-wrap">
+        <table class="rys-table" id="ct-table">
+          <thead>
+            <tr>
+              <th>yahoo_product_category</th>
+              <th>default_path</th>
+              <th>source</th>
+              <th>sample_count</th>
+              <th>locked</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p style="font-size: 12px; color: #666; margin-top: 8px;">
+        編集は U2 (manual override 登録) から。U4 は現状確認用 read-only。
+      </p>
     </section>
+
+    <!-- U5: 監査ログ viewer -->
     <section id="tab-U5" class="rys-section" style="display: none;">
-      <h3>監査ログ</h3>
-      <div class="coming-soon">この画面は W3 Phase 2 で実装。</div>
+      <h3>監査ログ (audit_log)</h3>
+      <div class="rys-actions">
+        <button class="btn btn-secondary" id="btn-audit-refresh">再読み込み</button>
+        <label>action filter</label>
+        <select id="audit-filter" style="padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 4px;">
+          <option value="">(すべて)</option>
+          <option value="publish_accept">publish_accept</option>
+          <option value="batch_cancel">batch_cancel</option>
+          <option value="manual_override_create">manual_override_create</option>
+          <option value="dry_run">dry_run</option>
+        </select>
+      </div>
+      <div class="table-wrap">
+        <table class="rys-table" id="audit-table">
+          <thead>
+            <tr>
+              <th>audit_id</th>
+              <th>occurred_at</th>
+              <th>actor</th>
+              <th>action</th>
+              <th>target</th>
+              <th>result</th>
+              <th>error_message</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
     </section>
   </main>
 
@@ -134,13 +266,24 @@
       eventCursor: 0,
     };
 
-    // ──────── Tabs ────────
+    // ──────── Tabs (切替時に初回 lazy load) ────────
+    const tabLoaded = new Set();
+    const TAB_LOADERS = {
+      U2: () => loadNeedsCategory(),
+      U3: () => loadRegistered(),
+      U4: () => loadConversionTable(),
+      U5: () => loadAudit(),
+    };
     document.querySelectorAll('.rys-tab').forEach((btn) => {
       btn.addEventListener('click', () => {
         document.querySelectorAll('.rys-tab').forEach((b) => b.classList.toggle('active', b === btn));
         const target = btn.dataset.tab;
         for (const t of ['U1', 'U2', 'U3', 'U4', 'U5']) {
           document.getElementById('tab-' + t).style.display = t === target ? '' : 'none';
+        }
+        if (TAB_LOADERS[target] && !tabLoaded.has(target)) {
+          tabLoaded.add(target);
+          TAB_LOADERS[target]().catch((e) => alert(`${target} 読み込み失敗: ${e.message}`));
         }
       });
     });
@@ -311,13 +454,213 @@
       state.currentBatch = null;
     });
 
+    // ──────── U2: needs_category 解消 ────────
+    const u2State = { lastPreview: null, selectedItem: null };
+
+    async function loadNeedsCategory() {
+      const r = await fetch(`${BASE}/api/needs-category?limit=500`).then((x) => x.json());
+      if (r.error) throw new Error(r.error);
+      const items = r.items || [];
+      document.getElementById('nc-count').textContent = items.length;
+      const tb = document.querySelector('#nc-table tbody');
+      tb.innerHTML = '';
+      for (const it of items) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${escapeHtml(it.item_code)}</td>
+          <td>${escapeHtml(it.rakuten_manage_number ?? '')}</td>
+          <td>${escapeHtml(it.last_error?.reason ?? '')}</td>
+          <td>${escapeHtml(it.last_error?.detail ?? '')}</td>
+          <td>${escapeHtml(it.updated_at ?? '')}</td>
+          <td><button class="btn btn-secondary" data-code="${escapeHtml(it.item_code)}" data-mn="${escapeHtml(it.rakuten_manage_number ?? '')}">この商品で genre 引く</button></td>
+        `;
+        tb.appendChild(tr);
+      }
+      // 行ボタン: 「この商品で genre 引く」→ Rakuten RMS から取得 (簡易: manage_number を入力欄に echo)
+      tb.querySelectorAll('button').forEach((b) => {
+        b.addEventListener('click', () => {
+          const mn = b.dataset.mn;
+          if (!mn) { alert('manage_number 不明'); return; }
+          // 簡易: genre_id は CLI 側で観測済の場合が多いので、ユーザに入力してもらう。
+          // 今後 /rys/items/:item_code/rakuten-genre のような endpoint を miniPC に追加するのが本格対応。
+          alert(`item_code=${b.dataset.code}\nmanage_number=${mn}\n\ngenre_id は楽天RMSの商品編集画面で確認してください (今後ボタン化予定)。下の入力欄に genre_id を入れて、Yahoo cat 検索→確定 で manual override 登録できます。`);
+        });
+      });
+    }
+    document.getElementById('btn-nc-refresh').addEventListener('click', () => {
+      loadNeedsCategory().catch((e) => alert('再読み込み失敗: ' + e.message));
+    });
+
+    async function searchYahooCat(q) {
+      const r = await fetch(`${BASE}/api/yahoo-cat/search?q=${encodeURIComponent(q)}`).then((x) => x.json());
+      if (r.error) throw new Error(r.error);
+      return r.results || [];
+    }
+    document.getElementById('btn-nc-search').addEventListener('click', async () => {
+      const q = document.getElementById('nc-search').value.trim();
+      if (!q) { alert('キーワードを入れてください'); return; }
+      try {
+        const cats = await searchYahooCat(q);
+        const tb = document.querySelector('#nc-search-table tbody');
+        tb.innerHTML = '';
+        for (const c of cats) {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td>${escapeHtml(c.product_category ?? c.id ?? '')}</td>
+            <td>${escapeHtml(c.name ?? '')}</td>
+            <td>${escapeHtml(c.path_name ?? c.path ?? '')}</td>
+            <td><button class="btn btn-secondary" data-pc="${escapeHtml(c.product_category ?? c.id ?? '')}">選択</button></td>
+          `;
+          tb.appendChild(tr);
+        }
+        tb.querySelectorAll('button').forEach((b) => {
+          b.addEventListener('click', () => {
+            document.getElementById('nc-pc').value = b.dataset.pc;
+            u2State.lastPreview = null;
+            document.getElementById('btn-nc-confirm').disabled = true;
+            document.getElementById('nc-preview-result').textContent = '(再度プレビューを実行してください)';
+          });
+        });
+      } catch (e) {
+        alert('Yahoo cat 検索失敗: ' + e.message);
+      }
+    });
+
+    document.getElementById('btn-nc-preview').addEventListener('click', async () => {
+      const genre_id = document.getElementById('nc-genre').value.trim();
+      const product_category = document.getElementById('nc-pc').value.trim();
+      if (!genre_id || !product_category) { alert('genre_id と product_category 両方必要'); return; }
+      try {
+        const r = await fetch(`${BASE}/api/category-manual/preview-impact`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ genre_id, product_category }),
+        }).then((x) => x.json());
+        if (r.error) { alert('preview 失敗: ' + r.error); return; }
+        u2State.lastPreview = { genre_id, product_category, count: r.affected_count };
+        const samples = (r.sample_items || []).map((s) => s.item_code).join(', ');
+        document.getElementById('nc-preview-result').innerHTML =
+          `影響: <strong>${r.affected_count} 件</strong> (genre 観測総計 ${r.observed_total} 件)。例: ${escapeHtml(samples)}`;
+        document.getElementById('btn-nc-confirm').disabled = r.affected_count == null;
+      } catch (e) {
+        alert('preview 失敗: ' + e.message);
+      }
+    });
+
+    document.getElementById('btn-nc-confirm').addEventListener('click', async () => {
+      const genre_id = document.getElementById('nc-genre').value.trim();
+      const product_category = document.getElementById('nc-pc').value.trim();
+      const note = document.getElementById('nc-note').value.trim();
+      const p = u2State.lastPreview;
+      if (!p || p.genre_id !== genre_id || p.product_category !== product_category) {
+        alert('再度プレビューしてください (genre/pc が変わっています)');
+        return;
+      }
+      if (!confirm(`genre=${genre_id} → product_category=${product_category} を確定 (影響 ${p.count} 件)。続行しますか？`)) return;
+      try {
+        const r = await fetch(`${BASE}/api/category-manual`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ genre_id, product_category, note, confirmed_impact_count: p.count }),
+        }).then((x) => x.json());
+        if (r.error) { alert('確定失敗: ' + r.error); return; }
+        alert(`登録しました (genre=${r.genre_id}, pc=${r.product_category})。次回 publish で auto 解決されます。`);
+        // refresh needs_category list
+        await loadNeedsCategory();
+      } catch (e) {
+        alert('確定失敗: ' + e.message);
+      }
+    });
+
+    // ──────── U3: 公開済品 + Yahoo ストアリンク ────────
+    const YAHOO_STORE_BASE = 'https://store.shopping.yahoo.co.jp/b-faith01/'; // <seller_id>/<item_code>.html
+
+    async function loadRegistered() {
+      const r = await fetch(`${BASE}/api/registered-items?limit=500`).then((x) => x.json());
+      if (r.error) throw new Error(r.error);
+      document.getElementById('reg-total').textContent = r.total ?? 0;
+      const tb = document.querySelector('#reg-table tbody');
+      tb.innerHTML = '';
+      for (const row of (r.rows || [])) {
+        const url = `${YAHOO_STORE_BASE}${encodeURIComponent(row.yahoo_item_code || row.item_code)}.html`;
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${escapeHtml(row.item_code)}</td>
+          <td>${escapeHtml(row.yahoo_item_code ?? '')}</td>
+          <td>${escapeHtml(row.source ?? '')}</td>
+          <td>${escapeHtml(row.registered_at ?? '')}</td>
+          <td>${escapeHtml(row.last_seen_at ?? '')}</td>
+          <td><a href="${url}" target="_blank" rel="noopener">店舗確認↗</a></td>
+        `;
+        tb.appendChild(tr);
+      }
+    }
+    document.getElementById('btn-reg-refresh').addEventListener('click', () => {
+      loadRegistered().catch((e) => alert('再読み込み失敗: ' + e.message));
+    });
+
+    // ──────── U4: 変換表 (read-only) ────────
+    async function loadConversionTable() {
+      const r = await fetch(`${BASE}/api/conversion-table?limit=500`).then((x) => x.json());
+      if (r.error) throw new Error(r.error);
+      document.getElementById('ct-total').textContent = r.total ?? 0;
+      const tb = document.querySelector('#ct-table tbody');
+      tb.innerHTML = '';
+      for (const row of (r.rows || [])) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${escapeHtml(row.yahoo_product_category)}</td>
+          <td>${escapeHtml(row.default_path ?? '')}</td>
+          <td>${escapeHtml(row.source ?? '')}</td>
+          <td>${row.sample_count ?? ''}</td>
+          <td>${row.locked ? '🔒' : ''}</td>
+        `;
+        tb.appendChild(tr);
+      }
+    }
+    document.getElementById('btn-ct-refresh').addEventListener('click', () => {
+      loadConversionTable().catch((e) => alert('再読み込み失敗: ' + e.message));
+    });
+
+    // ──────── U5: 監査ログ viewer ────────
+    async function loadAudit() {
+      const filter = document.getElementById('audit-filter').value;
+      const r = await fetch(`${BASE}/api/audit?limit=200`).then((x) => x.json());
+      if (r.error) throw new Error(r.error);
+      const tb = document.querySelector('#audit-table tbody');
+      tb.innerHTML = '';
+      const rows = (r.rows || []).filter((x) => !filter || x.action === filter);
+      for (const row of rows) {
+        const tr = document.createElement('tr');
+        const resultBadge = row.result === 'success'
+          ? `<span class="badge badge-completed">success</span>`
+          : `<span class="badge badge-failed">failed</span>`;
+        tr.innerHTML = `
+          <td>${row.audit_id}</td>
+          <td>${escapeHtml(row.occurred_at)}</td>
+          <td>${escapeHtml(row.actor)}</td>
+          <td>${escapeHtml(row.action)}</td>
+          <td>${escapeHtml((row.target_type ?? '') + (row.target_id ? ':' + row.target_id : ''))}</td>
+          <td>${resultBadge}</td>
+          <td style="max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(row.error_message ?? '')}</td>
+        `;
+        tb.appendChild(tr);
+      }
+    }
+    document.getElementById('btn-audit-refresh').addEventListener('click', () => {
+      loadAudit().catch((e) => alert('再読み込み失敗: ' + e.message));
+    });
+    document.getElementById('audit-filter').addEventListener('change', () => {
+      loadAudit().catch((e) => alert('再読み込み失敗: ' + e.message));
+    });
+
     // ──────── Util ────────
     function escapeHtml(s) {
       if (s == null) return '';
       return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     }
 
-    // 初回ロード
+    // 初回ロード (U1)
     loadMigrationTargets().catch((e) => alert('初回読み込み失敗: ' + e.message));
   </script>
 </body>

@@ -124,6 +124,58 @@ router.get('/api/needs-category', async (req, res) => {
   }
 });
 
+router.get('/api/conversion-table', async (req, res) => {
+  try {
+    const qs = new URLSearchParams(req.query).toString();
+    const r = await callMiniPc(`/rys/conversion-table${qs ? '?' + qs : ''}`, { actor: actorFrom(req) });
+    res.json(r);
+  } catch (e) {
+    res.status(e.statusCode || 500).json({ error: e.message });
+  }
+});
+
+router.get('/api/audit', async (req, res) => {
+  try {
+    const qs = new URLSearchParams(req.query).toString();
+    const r = await callMiniPc(`/rys/audit${qs ? '?' + qs : ''}`, { actor: actorFrom(req) });
+    res.json(r);
+  } catch (e) {
+    res.status(e.statusCode || 500).json({ error: e.message });
+  }
+});
+
+router.get('/api/yahoo-cat/search', async (req, res) => {
+  try {
+    const qs = new URLSearchParams(req.query).toString();
+    const r = await callMiniPc(`/rys/yahoo-cat/search${qs ? '?' + qs : ''}`, { actor: actorFrom(req) });
+    res.json(r);
+  } catch (e) {
+    res.status(e.statusCode || 500).json({ error: e.message });
+  }
+});
+
+router.post('/api/category-manual/preview-impact', express.json({ limit: '32kb' }), async (req, res) => {
+  try {
+    const r = await callMiniPc('/rys/category-manual/preview-impact', {
+      method: 'POST', body: req.body, actor: actorFrom(req),
+    });
+    res.json(r);
+  } catch (e) {
+    res.status(e.statusCode || 500).json({ error: e.message });
+  }
+});
+
+router.post('/api/category-manual', express.json({ limit: '32kb' }), async (req, res) => {
+  try {
+    const r = await callMiniPc('/rys/category-manual', {
+      method: 'POST', body: req.body, actor: actorFrom(req),
+    });
+    res.json(r);
+  } catch (e) {
+    res.status(e.statusCode || 500).json({ error: e.message });
+  }
+});
+
 router.get('/api/batches/:id', async (req, res) => {
   try {
     const r = await callMiniPc(`/rys/batches/${encodeURIComponent(req.params.id)}`, { actor: actorFrom(req) });
