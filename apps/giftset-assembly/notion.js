@@ -7,6 +7,8 @@
  * どちらか未設定なら NOTION_NOT_CONFIGURED を投げる (fail-closed)。
  * ピッキングデータ生成は Notion 未設定でも動くよう、呼び出し側で分離している。
  */
+import { manualSourceLabel } from './db.js';
+
 const API_BASE = 'https://api.notion.com/v1';
 const NOTION_VERSION = '2022-06-28';
 
@@ -147,6 +149,48 @@ export async function createWorkCard({ set, qty, people, dueDate, requestDate, n
         rich_text: [{ text: { content: `1ロット = ${lotSize}個セット。今回 ${qty}個 = ${lots}ロット製造。` } }],
       },
     });
+  }
+
+  // マニュアル / 所要時間 / 難易度 をページ本文の冒頭に追加 (set に値が入っているときのみ)。
+  // Notion DB に新プロパティを追加せずに済むよう、body の callout として表現する
+  // (新プロパティ追加が前提だと、本番 DB の手作業セットアップが必要になり deploy が壊れる)。
+  const manualBlocks = [];
+  if (set.manual_url) {
+    // 表示ラベル: db.js 中心定義 MANUAL_SOURCE_LABELS から取得。
+    // enum 範囲外の値が来たら manualSourceLabel が 'マニュアル' に fallback する。
+    const srcLabel = manualSourceLabel(set.manual_source);
+    manualBlocks.push({
+      object: 'block', type: 'callout',
+      callout: {
+        icon: { type: 'emoji', emoji: '📖' },
+        // Notion API は rich_text を配列で受け取り、各要素ごとにテキスト/リンクを表現できる。
+        // text に href を付けるとそのテキストがクリック可能リンクになる (Notion 仕様)。
+        rich_text: [
+          { text: { content: `製造マニュアル (${srcLabel}): ` } },
+          { text: { content: set.manual_url, link: { url: set.manual_url } } },
+        ],
+      },
+    });
+  }
+  const metaParts = [];
+  if (Number.isInteger(set.estimated_duration_min) && set.estimated_duration_min > 0) {
+    // 1ロット製造の目安時間。lots 倍したのが今回想定時間。
+    const totalMin = set.estimated_duration_min * lots;
+    metaParts.push(`⏱ 所要時間: 1ロット ${set.estimated_duration_min}分 × ${lots}ロット = ${totalMin}分`);
+  }
+  if (Number.isInteger(set.difficulty) && set.difficulty >= 1 && set.difficulty <= 5) {
+    const stars = '★'.repeat(set.difficulty) + '☆'.repeat(5 - set.difficulty);
+    metaParts.push(`🎯 難易度: ${stars} (${set.difficulty}/5)`);
+  }
+  if (metaParts.length > 0) {
+    manualBlocks.push({
+      object: 'block', type: 'paragraph',
+      paragraph: { rich_text: [{ text: { content: metaParts.join('　') } }] },
+    });
+  }
+  // 冒頭 (lot callout の前) に挿入。順序: 📖 manual → ⏱/🎯 meta → 📦 lot info → 構成品...
+  for (let i = manualBlocks.length - 1; i >= 0; i--) {
+    children.unshift(manualBlocks[i]);
   }
 
   const data = await notionCreatePage({

@@ -138,6 +138,36 @@
   </div>
   <div class="hint">※ 写真・動画は「リンクを知っている人は閲覧可」に設定してください（子会社が見られるように）。</div>
 
+  <div class="row" style="margin-top:14px;">
+    <div style="flex:3;">
+      <label>📖 製造マニュアル URL（任意・Notion等）</label>
+      <input type="text" id="giftManualUrl" placeholder="https://www.notion.so/...">
+      <div class="hint">Notion のページ ID 直リンク (?p=&lt;UUID&gt; 形式) を推奨。タイトル変更でも切れない</div>
+    </div>
+    <div style="flex:1; min-width:140px;">
+      <label>マニュアル種別</label>
+      <select id="giftManualSource">
+        <option value="">― 選択 ―</option>
+        <option value="notion">Notion</option>
+        <option value="drive">Google Drive</option>
+        <option value="internal">社内マニュアル</option>
+      </select>
+      <div class="hint">URL を入れたら必須</div>
+    </div>
+  </div>
+  <div class="row">
+    <div>
+      <label>⏱ 所要時間（1ロットあたり、分）</label>
+      <input type="number" id="giftDuration" min="1" max="100000" step="1" placeholder="30">
+      <div class="hint">空欄可。負荷見積に使用</div>
+    </div>
+    <div>
+      <label>🎯 難易度 (1-5)</label>
+      <input type="number" id="giftDifficulty" min="1" max="5" step="1" placeholder="3">
+      <div class="hint">空欄可。1=易しい / 5=難しい</div>
+    </div>
+  </div>
+
   <label style="margin-top:14px;">構成品（中身）<span style="color:#dc2626">*</span></label>
   <div class="step" id="compHint">商品コードを入れると候補が出ます。数量は「1セットあたり」何個使うか。</div>
   <div id="compRows"></div>
@@ -362,8 +392,15 @@ async function loadGiftList() {
       div.className = 'item';
       const lotBadge = (g.production_lot_size && g.production_lot_size > 1)
         ? ` / <strong style="color:#b45309">${esc(g.production_lot_size)}個ロット</strong>` : '';
-      div.innerHTML = `<div><div class="name">${esc(g.giftset_name)}</div>
-        <div class="meta">構成 ${g.component_count} 品${g.unit_price != null ? ' / 単価 ' + esc(g.unit_price) + '円' : ''}${lotBadge}</div></div>`;
+      // マニュアルリンク: URL が http(s) で始まる場合のみ a 要素を出す (XSS 対策、サーバ側でも validation 済みだが念のため)
+      const manualIcon = (g.manual_url && /^https?:\/\//i.test(g.manual_url))
+        ? ` <a href="${esc(g.manual_url)}" target="_blank" rel="noopener" title="マニュアルを開く">📖</a>` : '';
+      const durBadge = (Number.isInteger(g.estimated_duration_min) && g.estimated_duration_min > 0)
+        ? ` / ⏱${esc(g.estimated_duration_min)}分` : '';
+      const diffBadge = (Number.isInteger(g.difficulty) && g.difficulty >= 1 && g.difficulty <= 5)
+        ? ` / 🎯${'★'.repeat(g.difficulty)}` : '';
+      div.innerHTML = `<div><div class="name">${esc(g.giftset_name)}${manualIcon}</div>
+        <div class="meta">構成 ${g.component_count} 品${g.unit_price != null ? ' / 単価 ' + esc(g.unit_price) + '円' : ''}${lotBadge}${durBadge}${diffBadge}</div></div>`;
       const btns = document.createElement('div');
       const edit = document.createElement('button'); edit.className = 'btn-blue btn-sm'; edit.textContent = '編集';
       edit.onclick = () => editGift(g.giftset_code);
@@ -424,6 +461,8 @@ function clearForm() {
   $('giftLotSize').readOnly = false;
   $('giftLotSize').disabled = false;
   $('giftLotSizeLockNote').style.display = 'none';
+  $('giftManualUrl').value = ''; $('giftManualSource').value = '';
+  $('giftDuration').value = ''; $('giftDifficulty').value = '';
   $('compRows').innerHTML = ''; addCompRow(); addCompRow();
   $('formTitle').textContent = '新しいギフトを登録';
   updateCompHint();
@@ -454,6 +493,10 @@ async function editGift(code) {
     $('giftLotSize').readOnly = true;
     $('giftLotSize').disabled = true;
     $('giftLotSizeLockNote').style.display = 'inline';
+    $('giftManualUrl').value = g.manual_url || '';
+    $('giftManualSource').value = g.manual_source || '';
+    $('giftDuration').value = (Number.isInteger(g.estimated_duration_min) && g.estimated_duration_min > 0) ? g.estimated_duration_min : '';
+    $('giftDifficulty').value = (Number.isInteger(g.difficulty) && g.difficulty >= 1 && g.difficulty <= 5) ? g.difficulty : '';
     $('compRows').innerHTML = '';
     (g.components || []).forEach(c => addCompRow(c.商品コード, c.数量, c.商品名));
     if (!g.components || !g.components.length) addCompRow();
@@ -493,6 +536,32 @@ $('btnSave').addEventListener('click', async () => {
   if (!Number.isInteger(lotSize) || lotSize < 1 || lotSize > 10000) {
     return showMsg($('regMsg'), 'err', '1ロットの個数は 1〜10000 の整数で入力してください');
   }
+  // マニュアル系の検証 (UI 側のフレンドリーチェック、サーバでも同等の検証あり)
+  const manualUrl = $('giftManualUrl').value.trim();
+  const manualSource = $('giftManualSource').value;
+  if (manualUrl && !manualSource) {
+    return showMsg($('regMsg'), 'err', 'マニュアル URL を入れたら種別 (Notion/Drive/社内) も選択してください');
+  }
+  if (!manualUrl && manualSource) {
+    return showMsg($('regMsg'), 'err', 'マニュアル種別を選んだら URL も入力してください');
+  }
+  if (manualUrl && !/^https?:\/\//i.test(manualUrl)) {
+    return showMsg($('regMsg'), 'err', 'マニュアル URL は http:// または https:// で始めてください');
+  }
+  const durationRaw = $('giftDuration').value;
+  if (durationRaw !== '') {
+    const n = parseInt(durationRaw, 10);
+    if (!Number.isInteger(n) || n < 1 || n > 100000) {
+      return showMsg($('regMsg'), 'err', '所要時間は 1〜100000 分の整数で入力してください');
+    }
+  }
+  const difficultyRaw = $('giftDifficulty').value;
+  if (difficultyRaw !== '') {
+    const n = parseInt(difficultyRaw, 10);
+    if (!Number.isInteger(n) || n < 1 || n > 5) {
+      return showMsg($('regMsg'), 'err', '難易度は 1〜5 の整数で入力してください');
+    }
+  }
   const payload = {
     giftset_code: $('giftCode').value || undefined,
     giftset_name: $('giftName').value.trim(),
@@ -501,6 +570,10 @@ $('btnSave').addEventListener('click', async () => {
     video_url: $('giftVideo').value.trim() || null,
     memo: $('giftMemo').value.trim() || null,
     production_lot_size: lotSize,
+    manual_url: manualUrl || null,
+    manual_source: manualSource || null,
+    estimated_duration_min: durationRaw === '' ? null : parseInt(durationRaw, 10),
+    difficulty: difficultyRaw === '' ? null : parseInt(difficultyRaw, 10),
     components,
   };
   if (!payload.giftset_name) return showMsg($('regMsg'), 'err', 'ギフト名を入れてください');

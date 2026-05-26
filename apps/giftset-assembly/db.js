@@ -67,6 +67,7 @@ export function listGiftsets() {
   return db.prepare(
     `SELECT g.giftset_code, g.giftset_name, g.unit_price, g.photo_url, g.video_url,
             g.production_lot_size,
+            g.manual_url, g.manual_source, g.estimated_duration_min, g.difficulty,
             COUNT(c.商品コード) AS component_count
        FROM f_giftset g
        LEFT JOIN f_giftset_components c ON c.giftset_code = g.giftset_code
@@ -94,16 +95,62 @@ export function getGiftset(code) {
   return { ...header, components };
 }
 
+// マニュアル URL は http/https のみ受け入れる (XSS / javascript: スキーム回避)。
+//   Notion / Drive とも https URL なので十分。
+//   Codex R1 low #2: URL() コンストラクタで完全なパース検証も追加 (前方一致だけだと不正な URL が混入する可能性)。
+const MANUAL_URL_MAX = 2000; // 一般的な URL 長上限
+function validateManualUrl(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return { ok: true, value: null };
+  if (s.length > MANUAL_URL_MAX) return { ok: false };
+  // スキームを厳格に http/https 限定 (javascript:, data:, file: 等を排除)
+  if (!/^https?:\/\//i.test(s)) return { ok: false };
+  // URL() コンストラクタで完全パース (host が空、不正文字等を弾く)。Node 16+ で WHATWG 仕様。
+  try {
+    const u = new URL(s);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return { ok: false };
+    if (!u.host) return { ok: false };
+  } catch {
+    return { ok: false };
+  }
+  return { ok: true, value: s };
+}
+
+// manual_source 列挙値の中心定義 (Codex R1 nit #3)。
+//   ここを更新する場合は以下も同期する (検索キー: MANUAL_SOURCE):
+//     - apps/warehouse-mirror/db.js の CHECK 句および起動時整合性チェック
+//     - apps/giftset-assembly/views/index.html の <select id="giftManualSource"> オプション
+//     - apps/giftset-assembly/notion.js の srcLabel 分岐
+export const MANUAL_SOURCES = ['notion', 'drive', 'internal'];
+export const MANUAL_SOURCE_LABELS = {
+  notion: 'Notion',
+  drive: 'Google Drive',
+  internal: '社内マニュアル',
+};
+export function manualSourceLabel(src) {
+  return MANUAL_SOURCE_LABELS[src] || 'マニュアル';
+}
+const MANUAL_SOURCE_VALUES = new Set(MANUAL_SOURCES);
+
 /**
  * ギフトセットの登録/更新。
  * payload: { giftset_code?, giftset_name, photo_url?, video_url?, unit_price?, memo?,
- *            production_lot_size?, components: [{ code, qty }] }
+ *            production_lot_size?, manual_url?, manual_source?,
+ *            estimated_duration_min?, difficulty?,
+ *            components: [{ code, qty }] }
  * 構成品コードは mirror_products に存在することを必須検証。
  *
  * production_lot_size (任意、デフォルト 1):
  *   1ロットあたりの完成個数。半端な箱開封ができない構成品 (例: agneyemask5 を
  *   ばらして使う relaxgiftset は 5個ロット必須) のための制約。構成品の数量は
  *   「1ロット分」で登録する。依頼時の qty は production_lot_size の倍数を強制。
+ *
+ * manual_url / manual_source (任意、両方セットか両方未設定):
+ *   製造マニュアルの保管先 URL (http/https のみ) と種別 ('notion'|'drive'|'internal')。
+ *   委託先 (いろは施設) が見るマニュアル。Notion 卒業時は manual_source で切替可能。
+ *
+ * estimated_duration_min (任意): 1ロット製造の目安時間 (分、1-100000 整数)。
+ * difficulty (任意): 1-5 の難易度。
  *
  * @returns { giftset_code }
  * @throws Error (err.code = 'VALIDATION', err.detail に詳細)
@@ -128,6 +175,46 @@ export function upsertGiftset(payload, user) {
     const n = Number(rawLot);
     if (!Number.isInteger(n) || n < 1 || n > 10000) errs.push('production_lot_size');
     else lotSize = n;
+  }
+
+  // manual_url / manual_source: ペア検証 (片方だけはエラー)。URL は http/https のみ。
+  const manualUrlRaw = payload?.manual_url;
+  const manualSourceRaw = payload?.manual_source;
+  let manualUrl = null;
+  let manualSource = null;
+  const hasUrlInput = manualUrlRaw !== undefined && manualUrlRaw !== null && String(manualUrlRaw).trim() !== '';
+  const hasSourceInput = manualSourceRaw !== undefined && manualSourceRaw !== null && String(manualSourceRaw).trim() !== '';
+  if (hasUrlInput) {
+    const r = validateManualUrl(manualUrlRaw);
+    if (!r.ok) errs.push('manual_url');
+    else manualUrl = r.value;
+  }
+  if (hasSourceInput) {
+    const s = String(manualSourceRaw).trim().toLowerCase();
+    if (!MANUAL_SOURCE_VALUES.has(s)) errs.push('manual_source');
+    else manualSource = s;
+  }
+  // ペア整合: 'どちらもある' or 'どちらもない' のみ許可。
+  if ((manualUrl && !manualSource) || (!manualUrl && manualSource)) {
+    errs.push('manual_url_source_pair');
+  }
+
+  // estimated_duration_min: 任意、整数 1-100000。
+  let durationMin = null;
+  const rawDur = payload?.estimated_duration_min;
+  if (rawDur !== undefined && rawDur !== null && rawDur !== '') {
+    const n = Number(rawDur);
+    if (!Number.isInteger(n) || n < 1 || n > 100000) errs.push('estimated_duration_min');
+    else durationMin = n;
+  }
+
+  // difficulty: 任意、整数 1-5。
+  let difficulty = null;
+  const rawDiff = payload?.difficulty;
+  if (rawDiff !== undefined && rawDiff !== null && rawDiff !== '') {
+    const n = Number(rawDiff);
+    if (!Number.isInteger(n) || n < 1 || n > 5) errs.push('difficulty');
+    else difficulty = n;
   }
 
   // 構成品の検証 + 正本解決 + 同一コードのマージ(数量合算)
@@ -192,18 +279,24 @@ export function upsertGiftset(payload, user) {
     db.prepare(
       `INSERT INTO f_giftset
          (giftset_code, giftset_name, photo_url, video_url, unit_price, memo,
-          production_lot_size, is_active, created_at, updated_at, created_by, updated_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+          production_lot_size, manual_url, manual_source,
+          estimated_duration_min, difficulty,
+          is_active, created_at, updated_at, created_by, updated_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
        ON CONFLICT(giftset_code) DO UPDATE SET
-         giftset_name        = excluded.giftset_name,
-         photo_url           = excluded.photo_url,
-         video_url           = excluded.video_url,
-         unit_price          = excluded.unit_price,
-         memo                = excluded.memo,
-         production_lot_size = excluded.production_lot_size,
-         is_active           = 1,
-         updated_at          = excluded.updated_at,
-         updated_by          = excluded.updated_by`
+         giftset_name           = excluded.giftset_name,
+         photo_url              = excluded.photo_url,
+         video_url              = excluded.video_url,
+         unit_price             = excluded.unit_price,
+         memo                   = excluded.memo,
+         production_lot_size    = excluded.production_lot_size,
+         manual_url             = excluded.manual_url,
+         manual_source          = excluded.manual_source,
+         estimated_duration_min = excluded.estimated_duration_min,
+         difficulty             = excluded.difficulty,
+         is_active              = 1,
+         updated_at             = excluded.updated_at,
+         updated_by             = excluded.updated_by`
     ).run(
       code, name,
       payload?.photo_url ? String(payload.photo_url).trim() : null,
@@ -211,6 +304,8 @@ export function upsertGiftset(payload, user) {
       unitPrice,
       payload?.memo ? String(payload.memo).trim() : null,
       lotSize,
+      manualUrl, manualSource,
+      durationMin, difficulty,
       now, now, by, by
     );
 
