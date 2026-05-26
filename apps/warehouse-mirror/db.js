@@ -1563,26 +1563,61 @@ function createTables() {
 // ロジザード「出荷予定登録(卸)Excel貼り付け FS01_05」の商品ID = この構成品コード。
 function createGiftsetTables() {
   // ギフトセット定義ヘッダー。giftset_code は自動採番(gs_...)。写真/動画は Drive の URL を持つ。
+  // production_lot_size: 1ロットあたりの完成個数 (デフォルト 1)。
+  //   例) agneyemask5 (5個入り箱) をばらして使う relaxgiftset は 1ロット=5個でしか
+  //   作れない (= 半端な箱開封不可) ため production_lot_size=5、構成品の数量は
+  //   「1ロット分」の数量で登録する。
   db.exec(`
     CREATE TABLE IF NOT EXISTS f_giftset (
-      giftset_code  TEXT PRIMARY KEY,
-      giftset_name  TEXT NOT NULL,
-      photo_url     TEXT,
-      video_url     TEXT,
-      unit_price    REAL CHECK (unit_price IS NULL OR unit_price >= 0),
-      memo          TEXT,
-      is_active     INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1)),
-      created_at    TEXT NOT NULL,
-      updated_at    TEXT NOT NULL,
-      created_by    TEXT,
-      updated_by    TEXT,
+      giftset_code         TEXT PRIMARY KEY,
+      giftset_name         TEXT NOT NULL,
+      photo_url            TEXT,
+      video_url            TEXT,
+      unit_price           REAL CHECK (unit_price IS NULL OR unit_price >= 0),
+      memo                 TEXT,
+      production_lot_size  INTEGER NOT NULL DEFAULT 1
+        CHECK (production_lot_size BETWEEN 1 AND 10000),
+      is_active            INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1)),
+      created_at           TEXT NOT NULL,
+      updated_at           TEXT NOT NULL,
+      created_by           TEXT,
+      updated_by           TEXT,
       CHECK (trim(giftset_code) <> ''),
       CHECK (trim(giftset_name) <> '')
     )
   `);
   db.exec('CREATE INDEX IF NOT EXISTS idx_f_giftset_active ON f_giftset(is_active)');
+  // 既存 f_giftset への production_lot_size 追加 (本番 DB 用 migration、idempotent)。
+  // ALTER ADD COLUMN は CHECK 句を新カラムに付けられないため、ここではデフォルト 1 で追加し、
+  // アプリ層 (giftset-assembly/db.js upsertGiftset) で範囲検証を行う。
+  addColumnIfMissing('f_giftset', 'production_lot_size', 'INTEGER NOT NULL DEFAULT 1');
+  // 起動時整合性チェック (Codex review R1 medium #2)。
+  //   ALTER ADD COLUMN は新カラムに CHECK を付けられないので、もし他経路 (手 SQL 等) で
+  //   不正値 (NULL / 0 / 負 / 過大) が入っていれば検知し、安全側 (=1) に正規化して警告ログ。
+  //   黙って動作させると出荷予定数が誤計算される (lots 計算が破綻) ため、必ず警告を出す。
+  const anomalies = db.prepare(
+    `SELECT giftset_code, production_lot_size FROM f_giftset
+       WHERE production_lot_size IS NULL
+          OR production_lot_size < 1
+          OR production_lot_size > 10000`
+  ).all();
+  if (anomalies.length > 0) {
+    console.warn(
+      `[mirror-db] f_giftset.production_lot_size に不正値 ${anomalies.length} 行を検出、` +
+      `安全側 1 に正規化します: ` + anomalies.map(a => `${a.giftset_code}=${a.production_lot_size}`).join(', ')
+    );
+    db.prepare(
+      `UPDATE f_giftset SET production_lot_size = 1
+        WHERE production_lot_size IS NULL
+           OR production_lot_size < 1
+           OR production_lot_size > 10000`
+    ).run();
+  }
 
-  // ギフトセット構成（1ギフト = N構成品、1セットあたり数量）
+  // ギフトセット構成（1ギフト = N構成品）。
+  // 数量の単位: 1ロット分 (production_lot_size 個セット分) の数量。
+  //   production_lot_size = 1 (デフォルト) なら「1セットあたり」と同義。
+  //   production_lot_size > 1 (例: relaxgiftset_lot5) なら「N個ロット 1 回分」の数量を登録する。
   db.exec(`
     CREATE TABLE IF NOT EXISTS f_giftset_components (
       giftset_code  TEXT NOT NULL

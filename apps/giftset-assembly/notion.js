@@ -86,8 +86,17 @@ async function notionCreatePage(body, token) {
 export async function createWorkCard({ set, qty, people, dueDate, requestDate, note }) {
   const { token, dbId } = getConfig();
 
+  // 名前: lot_size > 1 のときはロット数も併記して誤読を防ぐ。
+  //   例) 'リラックスギフトセット（10個 = 2ロット）'
+  //   この時点では本文側で qty % lotSize の整合チェックを後段で行うが、ここでも防御的に
+  //   Math.floor を使わず整数除算 (qty が倍数前提) を信頼する形にする。
+  const lotSizeForTitle = Number.isInteger(set.production_lot_size) && set.production_lot_size >= 1
+    ? set.production_lot_size : 1;
+  const titleText = (lotSizeForTitle > 1 && qty % lotSizeForTitle === 0)
+    ? `${set.giftset_name}（${qty}個 = ${qty / lotSizeForTitle}ロット）`
+    : `${set.giftset_name}（${qty}個）`;
   const props = {
-    '名前': { title: [{ text: { content: `${set.giftset_name}（${qty}個）` } }] },
+    '名前': { title: [{ text: { content: titleText } }] },
     'ステータス': { select: { name: '未着手' } },
     '個数': { number: qty },
     '依頼日': { date: { start: requestDate } },
@@ -102,18 +111,43 @@ export async function createWorkCard({ set, qty, people, dueDate, requestDate, n
   }
   if (note) props['メモ'] = { rich_text: [{ text: { content: String(note).slice(0, 1900) } }] };
 
-  // ページ本文: 構成品リスト (1セットあたり / 合計)
+  // ページ本文: 構成品リスト (1ロットあたり / 今回合計)。
+  // production_lot_size > 1 のときは、構成品.数量 は「1ロット分」で登録されているため
+  // 合計は 数量 × lots ( = qty / lot_size)。lot_size=1 (デフォルト) なら従来通り 数量 × qty。
+  const lotSize = Number.isInteger(set.production_lot_size) && set.production_lot_size >= 1
+    ? set.production_lot_size : 1;
+  // 防御的チェック (Codex review R1 medium #3): 通常は router /api/issue で qty%lotSize=0 を保証。
+  // 将来 createWorkCard を別経路から呼んだ場合の安全網。Math.floor で潜在化させない。
+  if (qty % lotSize !== 0) {
+    const e = new Error(
+      `[notion.createWorkCard] qty=${qty} が production_lot_size=${lotSize} の倍数ではありません`
+    );
+    e.code = 'VALIDATION';
+    throw e;
+  }
+  const lots = qty / lotSize;
+  const unitLabel = lotSize > 1 ? `1ロット(${lotSize}個)あたり` : '1セットあたり';
+  const heading = `構成品（${unitLabel} / 今回合計）`;
   const children = [
-    { object: 'block', type: 'heading_3', heading_3: { rich_text: [{ text: { content: '構成品（1セットあたり / 今回合計）' } }] } },
+    { object: 'block', type: 'heading_3', heading_3: { rich_text: [{ text: { content: heading } }] } },
     ...set.components.map((c) => ({
       object: 'block', type: 'bulleted_list_item',
       bulleted_list_item: {
         rich_text: [{
-          text: { content: `${c.商品名 || c.商品コード}（${c.商品コード}）× ${c.数量}　→ 合計 ${c.数量 * qty}` },
+          text: { content: `${c.商品名 || c.商品コード}（${c.商品コード}）× ${c.数量}　→ 合計 ${c.数量 * lots}` },
         }],
       },
     })),
   ];
+  if (lotSize > 1) {
+    children.unshift({
+      object: 'block', type: 'callout',
+      callout: {
+        icon: { type: 'emoji', emoji: '📦' },
+        rich_text: [{ text: { content: `1ロット = ${lotSize}個セット。今回 ${qty}個 = ${lots}ロット製造。` } }],
+      },
+    });
+  }
 
   const data = await notionCreatePage({
     parent: { database_id: dbId },
