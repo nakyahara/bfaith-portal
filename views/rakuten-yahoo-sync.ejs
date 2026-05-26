@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>楽天→Yahoo 自動移行 - B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png"><link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    .rys-container { max-width: 100%; margin: 0 auto; padding: 12px 20px; }
+    .rys-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+    .rys-rule-banner { background: #fef3c7; color: #92400e; padding: 10px 14px; border-radius: 6px; margin-bottom: 16px; font-weight: 500; }
+    .rys-tabs { display: flex; gap: 4px; border-bottom: 2px solid #e5e7eb; margin-bottom: 16px; }
+    .rys-tab { padding: 8px 16px; cursor: pointer; border: none; background: transparent; font-size: 14px; color: #6b7280; }
+    .rys-tab.active { color: #2563eb; border-bottom: 2px solid #2563eb; margin-bottom: -2px; font-weight: 600; }
+    .rys-section { background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+    .rys-section h3 { margin: 0 0 12px; font-size: 16px; border-bottom: 2px solid #2563eb; padding-bottom: 6px; }
+    .rys-stat-row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+    .rys-stat { background: #f8f9fa; border-radius: 6px; padding: 12px 16px; min-width: 120px; }
+    .rys-stat .label { font-size: 12px; color: #666; }
+    .rys-stat .value { font-size: 22px; font-weight: bold; color: #111; margin-top: 4px; }
+    .rys-actions { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+    .btn { display: inline-block; padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500; }
+    .btn-primary { background: #2563eb; color: white; }
+    .btn-primary:hover { background: #1d4ed8; }
+    .btn-primary:disabled { background: #93c5fd; cursor: not-allowed; }
+    .btn-secondary { background: #e5e7eb; color: #374151; }
+    .btn-danger { background: #dc2626; color: white; }
+    .rys-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .rys-table th, .rys-table td { border: 1px solid #e5e7eb; padding: 6px 10px; text-align: left; }
+    .rys-table th { background: #f3f4f6; }
+    .rys-table tr.selected { background: #dbeafe; }
+    .table-wrap { max-height: 480px; overflow: auto; border: 1px solid #e5e7eb; border-radius: 6px; }
+    .progress { background: #f3f4f6; border-radius: 6px; padding: 12px; font-family: monospace; font-size: 12px; max-height: 240px; overflow-y: auto; white-space: pre-wrap; }
+    .badge { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 4px; }
+    .badge-pending { background: #e0f2fe; color: #0369a1; }
+    .badge-running { background: #fef3c7; color: #92400e; }
+    .badge-completed { background: #dcfce7; color: #166534; }
+    .badge-failed { background: #fee2e2; color: #991b1b; }
+    .coming-soon { padding: 32px; text-align: center; color: #9ca3af; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <a href="/" style="color: white; text-decoration: none;">← B-Faith Portal</a>
+      <h1>楽天→Yahoo 自動移行</h1>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= displayName || username %></span>
+      <a href="/logout" class="btn-logout">ログアウト</a>
+    </div>
+  </header>
+
+  <main class="rys-container">
+    <div class="rys-rule-banner">
+      ⚠️ 公開は必ず <strong>display=0 (非公開)</strong> + <strong>quantity=0 (在庫0)</strong> で行います。公開後の在庫補充/display=1 化は Yahoo 管理画面から手動で。
+    </div>
+
+    <div class="rys-tabs">
+      <button class="rys-tab active" data-tab="U1">未公開品 (公開操作)</button>
+      <button class="rys-tab" data-tab="U2">needs_category 解消</button>
+      <button class="rys-tab" data-tab="U3">公開済品</button>
+      <button class="rys-tab" data-tab="U4">変換表</button>
+      <button class="rys-tab" data-tab="U5">監査ログ</button>
+    </div>
+
+    <!-- U1: 未公開品一覧 + ワンクリック公開 -->
+    <section id="tab-U1" class="rys-section">
+      <h3>未公開品一覧 (移行待ち)</h3>
+      <div class="rys-stat-row">
+        <div class="rys-stat"><div class="label">合計</div><div class="value" id="mt-total">—</div></div>
+        <div class="rys-stat"><div class="label">表示中</div><div class="value" id="mt-shown">—</div></div>
+        <div class="rys-stat"><div class="label">選択中</div><div class="value" id="mt-selected">0</div></div>
+      </div>
+      <div class="rys-actions">
+        <button class="btn btn-secondary" id="btn-refresh">再読み込み</button>
+        <button class="btn btn-secondary" id="btn-select-all">全選択</button>
+        <button class="btn btn-secondary" id="btn-select-none">選択解除</button>
+        <button class="btn btn-secondary" id="btn-dry-run">Dry-Run (公開しない)</button>
+        <button class="btn btn-primary" id="btn-publish" disabled>選択を公開 (display=0/qty=0)</button>
+      </div>
+      <div class="table-wrap">
+        <table class="rys-table" id="mt-table">
+          <thead>
+            <tr>
+              <th style="width: 40px;"><input type="checkbox" id="chk-master"></th>
+              <th>item_code</th>
+              <th>rakuten_manage_number</th>
+              <th>queued_at</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- U1 進捗 -->
+    <section id="tab-U1-progress" class="rys-section" style="display: none;">
+      <h3>公開進捗 — batch <span id="prog-batch">—</span> <span class="badge" id="prog-status">—</span></h3>
+      <div class="rys-actions">
+        <button class="btn btn-danger" id="btn-cancel" disabled>キャンセル</button>
+        <button class="btn btn-secondary" id="btn-prog-close">閉じる</button>
+      </div>
+      <div class="progress" id="prog-log">(待機中)</div>
+    </section>
+
+    <!-- U2-U5: Coming soon (W3 では skeleton のみ、U2 以降は別 PR で) -->
+    <section id="tab-U2" class="rys-section" style="display: none;">
+      <h3>needs_category 解消</h3>
+      <div class="coming-soon">この画面は U1 安定稼働後 (W3 Phase 2) で実装します。<br>当面は CLI <code>scripts/export-newgenre-worklist.js</code> + <code>import-newgenre-worklist.js</code> で運用。</div>
+    </section>
+    <section id="tab-U3" class="rys-section" style="display: none;">
+      <h3>公開済品一覧</h3>
+      <div class="coming-soon">この画面は W3 Phase 2 で実装。</div>
+    </section>
+    <section id="tab-U4" class="rys-section" style="display: none;">
+      <h3>カテゴリ変換表</h3>
+      <div class="coming-soon">この画面は W3 Phase 2 で実装。</div>
+    </section>
+    <section id="tab-U5" class="rys-section" style="display: none;">
+      <h3>監査ログ</h3>
+      <div class="coming-soon">この画面は W3 Phase 2 で実装。</div>
+    </section>
+  </main>
+
+  <script>
+    const BASE = '/apps/rakuten-yahoo-sync';
+    const state = {
+      items: [],
+      selected: new Set(),
+      currentBatch: null,
+      pollTimer: null,
+      eventCursor: 0,
+    };
+
+    // ──────── Tabs ────────
+    document.querySelectorAll('.rys-tab').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.rys-tab').forEach((b) => b.classList.toggle('active', b === btn));
+        const target = btn.dataset.tab;
+        for (const t of ['U1', 'U2', 'U3', 'U4', 'U5']) {
+          document.getElementById('tab-' + t).style.display = t === target ? '' : 'none';
+        }
+      });
+    });
+
+    // ──────── U1: 未公開品一覧 ────────
+    async function loadMigrationTargets() {
+      const r = await fetch(`${BASE}/api/migration-targets?limit=500`).then((x) => x.json());
+      if (r.error) { alert('読み込み失敗: ' + r.error); return; }
+      state.items = r.items || [];
+      document.getElementById('mt-total').textContent = r.total ?? state.items.length;
+      document.getElementById('mt-shown').textContent = state.items.length;
+      renderTable();
+    }
+
+    function renderTable() {
+      const tb = document.querySelector('#mt-table tbody');
+      tb.innerHTML = '';
+      for (const it of state.items) {
+        const tr = document.createElement('tr');
+        tr.dataset.code = it.item_code;
+        if (state.selected.has(it.item_code)) tr.classList.add('selected');
+        tr.innerHTML = `
+          <td><input type="checkbox" class="row-chk" ${state.selected.has(it.item_code) ? 'checked' : ''}></td>
+          <td>${escapeHtml(it.item_code)}</td>
+          <td>${escapeHtml(it.rakuten_manage_number ?? '')}</td>
+          <td>${escapeHtml(it.created_at ?? '')}</td>
+        `;
+        tb.appendChild(tr);
+      }
+      bindRowChecks();
+      updateSelectedCount();
+    }
+
+    function bindRowChecks() {
+      document.querySelectorAll('#mt-table .row-chk').forEach((chk, i) => {
+        chk.addEventListener('change', () => {
+          const code = state.items[i].item_code;
+          if (chk.checked) state.selected.add(code); else state.selected.delete(code);
+          renderTable();
+        });
+      });
+    }
+
+    function updateSelectedCount() {
+      document.getElementById('mt-selected').textContent = state.selected.size;
+      document.getElementById('btn-publish').disabled = state.selected.size === 0;
+    }
+
+    document.getElementById('btn-refresh').addEventListener('click', loadMigrationTargets);
+    document.getElementById('btn-select-all').addEventListener('click', () => {
+      for (const it of state.items) state.selected.add(it.item_code);
+      renderTable();
+    });
+    document.getElementById('btn-select-none').addEventListener('click', () => {
+      state.selected.clear();
+      renderTable();
+    });
+    document.getElementById('chk-master').addEventListener('change', (e) => {
+      if (e.target.checked) for (const it of state.items) state.selected.add(it.item_code);
+      else state.selected.clear();
+      renderTable();
+    });
+
+    // ──────── Dry-run ────────
+    document.getElementById('btn-dry-run').addEventListener('click', async () => {
+      const codes = [...state.selected];
+      if (codes.length === 0) { alert('対象を選択してください'); return; }
+      if (codes.length > 50) {
+        if (!confirm(`Dry-Run 対象 ${codes.length} 件、時間がかかります (Rakuten 1qps 〜 ${Math.ceil(codes.length * 1.1)} 秒)。続行しますか？`)) return;
+      }
+      const r = await fetch(`${BASE}/api/dry-run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ item_codes: codes }),
+      }).then((x) => x.json());
+      if (r.error) { alert('Dry-Run 失敗: ' + r.error); return; }
+      const ok = r.results.filter((x) => x.status === 'ok').length;
+      const ng = r.results.length - ok;
+      alert(`Dry-Run 完了: ok=${ok} / ng=${ng}\n\n(詳細は次バージョンで表示。今回は OK/NG 件数のみ)`);
+    });
+
+    // ──────── Publish ────────
+    document.getElementById('btn-publish').addEventListener('click', async () => {
+      const codes = [...state.selected];
+      if (codes.length === 0) return;
+      const idem = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      if (!confirm(`${codes.length} 件を公開します (display=0 / qty=0)。idempotency_key=${idem}\n続行しますか？`)) return;
+      const r = await fetch(`${BASE}/api/publish`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idempotency_key: idem, item_codes: codes }),
+      }).then((x) => x.json());
+      if (r.error) { alert('公開受理失敗: ' + r.error); return; }
+      state.currentBatch = r.batch_id;
+      state.eventCursor = 0;
+      showProgress(r);
+      startPolling();
+    });
+
+    function showProgress(initial) {
+      document.getElementById('tab-U1-progress').style.display = '';
+      document.getElementById('prog-batch').textContent = initial.batch_id;
+      document.getElementById('prog-status').textContent = initial.deduped ? 'deduped' : 'accepted';
+      document.getElementById('prog-status').className = 'badge badge-running';
+      document.getElementById('btn-cancel').disabled = false;
+      const log = document.getElementById('prog-log');
+      log.textContent = `[${new Date().toISOString()}] batch ${initial.batch_id} accepted: attached=${initial.attached}, missing=${(initial.missing || []).length}\n`;
+    }
+
+    function startPolling() {
+      stopPolling();
+      state.pollTimer = setInterval(pollBatch, 2000);
+      pollBatch();
+    }
+    function stopPolling() {
+      if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+    }
+
+    async function pollBatch() {
+      if (!state.currentBatch) return;
+      try {
+        const [b, ev] = await Promise.all([
+          fetch(`${BASE}/api/batches/${state.currentBatch}`).then((x) => x.json()),
+          fetch(`${BASE}/api/batches/${state.currentBatch}/events?since=${state.eventCursor}&limit=50`).then((x) => x.json()),
+        ]);
+        if (ev.events && ev.events.length) {
+          const log = document.getElementById('prog-log');
+          for (const e of ev.events) {
+            log.textContent += `[${e.occurred_at}] ${e.event_type}${e.item_code ? ' ' + e.item_code : ''}${e.to_state ? ' → ' + e.to_state : ''}\n`;
+          }
+          log.scrollTop = log.scrollHeight;
+          state.eventCursor = ev.next_since;
+        }
+        if (b.batch) {
+          document.getElementById('prog-status').textContent = b.batch.state;
+          const cls = ['completed', 'completed_with_exclusions'].includes(b.batch.state) ? 'badge-completed'
+                    : ['failed', 'aborted', 'correlation_failed', 'correlation_anomaly', 'partial_failed'].includes(b.batch.state) ? 'badge-failed'
+                    : 'badge-running';
+          document.getElementById('prog-status').className = 'badge ' + cls;
+          if (b.batch.finished_at) {
+            stopPolling();
+            document.getElementById('btn-cancel').disabled = true;
+            // ダッシュ更新 (公開済みは migration-targets から消える)
+            setTimeout(loadMigrationTargets, 500);
+          }
+        }
+      } catch (e) {
+        document.getElementById('prog-log').textContent += `[poll error] ${e.message}\n`;
+      }
+    }
+
+    // ──────── Cancel ────────
+    document.getElementById('btn-cancel').addEventListener('click', async () => {
+      if (!state.currentBatch) return;
+      if (!confirm(`batch ${state.currentBatch} をキャンセルします。続行しますか？\n(reserve_done 以降は不可、Yahoo 反映済の場合は手動 reconcile が必要)`)) return;
+      const r = await fetch(`${BASE}/api/batches/${state.currentBatch}/cancel`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason: 'web_user_cancel' }),
+      }).then((x) => x.json());
+      if (r.error) { alert('キャンセル失敗: ' + r.error); return; }
+      alert('キャンセル受理しました。');
+    });
+
+    document.getElementById('btn-prog-close').addEventListener('click', () => {
+      stopPolling();
+      document.getElementById('tab-U1-progress').style.display = 'none';
+      state.currentBatch = null;
+    });
+
+    // ──────── Util ────────
+    function escapeHtml(s) {
+      if (s == null) return '';
+      return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+
+    // 初回ロード
+    loadMigrationTargets().catch((e) => alert('初回読み込み失敗: ' + e.message));
+  </script>
+</body>
+</html>

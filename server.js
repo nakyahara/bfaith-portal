@@ -37,6 +37,7 @@ import mgmtAccountingRouter from './apps/mgmt-accounting/router.js';
 import crossSellFinderRouter from './apps/cross-sell-finder/router.js';
 import giftsetAssemblyRouter from './apps/giftset-assembly/router.js';
 import packingDispatchRouter from './apps/packing-dispatch/router.js';
+import rakutenYahooSyncRouter from './apps/rakuten-yahoo-sync/router.js';
 import inventoryMonthlyRouter, { apiRouter as inventoryMonthlyApiRouter } from './apps/inventory-monthly/router.js';
 import misShipmentRouter from './apps/mis-shipment/router.js';
 import serviceRouter from './apps/warehouse/service-router.js';
@@ -404,6 +405,15 @@ const apps = [
     description: '全モール売上 (前日/今月/30日) + 出荷率等の日次経営指標集約',
     icon: '📊',
     path: '/apps/biz-ops-overview',
+    status: 'active',
+    category: 'analysis',
+  },
+  {
+    id: 'rakuten-yahoo-sync',
+    name: '楽天→Yahoo 自動移行',
+    description: '楽天商品をYahooへ display=0/qty=0 で自動公開 (フェンス付きlease + 監査ログ)',
+    icon: '🔁',
+    path: '/apps/rakuten-yahoo-sync',
     status: 'active',
     category: 'analysis',
   },
@@ -791,6 +801,7 @@ app.use('/apps/qoo10-accounting', (req, res, next) => {
 app.use('/apps/fba-profitability', requireAppAccess('fba-profitability'), fbaProfitabilityRouter);
 app.use('/apps/profit-analysis', requireAppAccess('profit-analysis'), profitAnalysisRouter);
 app.use('/apps/biz-ops-overview', requireAppAccess('biz-ops-overview'), bizOpsOverviewRouter);
+app.use('/apps/rakuten-yahoo-sync', requireAppAccess('rakuten-yahoo-sync'), rakutenYahooSyncRouter);
 app.use('/apps/exec-dashboard', requireAppAccess('exec-dashboard'), express.json({ limit: '1mb' }), execDashboardRouter);
 app.use('/apps/cross-sell-finder', requireAppAccess('cross-sell-finder'), crossSellFinderRouter);
 app.use('/apps/giftset-assembly', requireAppAccess('giftset-assembly'), express.json({ limit: '256kb' }), giftsetAssemblyRouter);
