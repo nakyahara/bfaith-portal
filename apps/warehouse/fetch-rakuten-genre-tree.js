@@ -72,11 +72,17 @@ function jstYyyymmddHhmm() {
   return `${yy}${mm}${dd}-${hh}${mi}`;
 }
 
+// lockOwned: 「このプロセスが lock を取得済か」のフラグ
+// Codex Round 2 Critical 反映: acquireLock 失敗時に finally の releaseLock で
+// 他プロセスの lock を消す事故を防止する
+let lockOwned = false;
+
 function acquireLock() {
   try {
     const fd = fs.openSync(LOCK_FILE, 'wx');
     fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, started_at: nowJstIso() }), 'utf8');
     fs.closeSync(fd);
+    lockOwned = true;
     return true;
   } catch (e) {
     if (e.code === 'EEXIST') {
@@ -90,7 +96,9 @@ function acquireLock() {
 }
 
 function releaseLock() {
+  if (!lockOwned) return;
   try { fs.unlinkSync(LOCK_FILE); } catch (_) {}
+  lockOwned = false;
 }
 
 function sleep(ms) {
