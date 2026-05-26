@@ -53,6 +53,9 @@ let lockOwned = false;
 
 function acquireLock() {
   try {
+    // Codex Round 1 A-5a-2 High 1 反映: data/ 未作成時の ENOENT を防ぐため事前 mkdir
+    // (initDB() でも data/ 作成しているが本関数は initDB より先に呼ばれる)
+    fs.mkdirSync(path.dirname(LOCK_FILE), { recursive: true });
     const fd = fs.openSync(LOCK_FILE, 'wx');
     fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, started_at: nowJstIso() }), 'utf8');
     fs.closeSync(fd);
@@ -202,29 +205,44 @@ async function main() {
 
   // 入力 (raw_rakuten_items_master と x_rakuten_item_product_map の JOIN、CONFIRMED のみ)
   // m_rakuten_genres から genre_name を lookup、m_products から 標準売価 を取得して band 派生
+  //
+  // Codex Round 1 A-5a-2 High 2 反映: 同一 ne_product_code に複数の楽天商品が紐づく場合 (バリエーション枝番 / 別ページ等)、
+  // valid_from=syncedAt が同値で UNIQUE INDEX 違反になるため、1 ne_product_code = 1 行に集約。
+  // 代表行は raw_rakuten_items_master.synced_at 降順、同値なら id 降順 (最新登録) を採用。
   const rows = db.prepare(`
-    SELECT
-      x.ne_product_code   AS ne_product_code,
-      r.genre_id          AS main_genre_id,
-      g.genre_name        AS main_genre_name,
-      mp.標準売価         AS standard_price,
-      r.manage_number     AS source_ref
-    FROM x_rakuten_item_product_map x
-    JOIN raw_rakuten_items_master r
-      ON r.rakuten_shop_code = x.rakuten_shop_code
-     AND r.manage_number = x.rakuten_item_code
-     AND r.is_active = 1
-     AND r.valid_to IS NULL
-    LEFT JOIN m_rakuten_genres g
-      ON g.genre_id = r.genre_id
-     AND g.is_active = 1
-     AND g.valid_to IS NULL
-    LEFT JOIN m_products mp
-      ON mp.商品コード = x.ne_product_code
-    WHERE x.is_active = 1
-      AND x.valid_to IS NULL
-      AND x.mapping_type = 'CONFIRMED'
-      AND x.ne_product_code <> ''
+    WITH joined AS (
+      SELECT
+        x.ne_product_code   AS ne_product_code,
+        r.genre_id          AS main_genre_id,
+        g.genre_name        AS main_genre_name,
+        mp.標準売価         AS standard_price,
+        r.manage_number     AS source_ref,
+        r.synced_at         AS raw_synced_at,
+        r.id                AS raw_id,
+        ROW_NUMBER() OVER (
+          PARTITION BY x.ne_product_code
+          ORDER BY r.synced_at DESC, r.id DESC
+        ) AS rn
+      FROM x_rakuten_item_product_map x
+      JOIN raw_rakuten_items_master r
+        ON r.rakuten_shop_code = x.rakuten_shop_code
+       AND r.manage_number = x.rakuten_item_code
+       AND r.is_active = 1
+       AND r.valid_to IS NULL
+      LEFT JOIN m_rakuten_genres g
+        ON g.genre_id = r.genre_id
+       AND g.is_active = 1
+       AND g.valid_to IS NULL
+      LEFT JOIN m_products mp
+        ON mp.商品コード = x.ne_product_code
+      WHERE x.is_active = 1
+        AND x.valid_to IS NULL
+        AND x.mapping_type = 'CONFIRMED'
+        AND x.ne_product_code <> ''
+    )
+    SELECT ne_product_code, main_genre_id, main_genre_name, standard_price, source_ref
+    FROM joined
+    WHERE rn = 1
   `).all();
 
   console.log(`  candidates: ${rows.length} 件 (CONFIRMED 紐付け済)`);
