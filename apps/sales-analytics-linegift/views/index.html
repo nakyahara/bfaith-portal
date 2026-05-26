@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <title>LINEギフト 売上分析 — 商品分類管理</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body { font-family: -apple-system, "Segoe UI", "Hiragino Sans", "Yu Gothic", sans-serif;
+           background: #f6f8fa; color: #24292e; margin: 0; padding: 16px; }
+    h1 { font-size: 1.4em; margin: 0 0 8px; }
+    .header { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
+    .counter { background: #fff; padding: 8px 12px; border-radius: 6px; box-shadow: 0 1px 2px rgba(0,0,0,.06); font-size: .9em; }
+    .counter .label { color: #586069; font-size: .85em; }
+    .counter .value { font-size: 1.2em; font-weight: 600; }
+    .counter.warn .value { color: #d29922; }
+    .counter.danger .value { color: #cf222e; }
+    table { width: 100%; border-collapse: collapse; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.06); }
+    th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #eaecef; font-size: .92em; vertical-align: top; }
+    th { background: #f6f8fa; font-weight: 600; }
+    td.num { text-align: right; }
+    .ne-input { width: 180px; padding: 4px 6px; }
+    .reason-input { width: 240px; padding: 4px 6px; }
+    button { background: #06C755; color: #fff; border: 0; padding: 6px 12px; border-radius: 4px; cursor: pointer; }
+    button:hover { background: #058845; }
+    button:disabled { background: #ccc; cursor: not-allowed; }
+    .empty { color: #586069; padding: 24px; text-align: center; }
+    .row-msg { font-size: .8em; margin-top: 4px; }
+    .row-msg.ok { color: #1a7f37; }
+    .row-msg.err { color: #cf222e; }
+    .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+    .reload-btn { background: #6b7280; }
+    .reload-btn:hover { background: #4b5563; }
+    a.ext { color: #0969da; }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <h1>LINEギフト 商品分類 — 未分類キュー</h1>
+    <button class="reload-btn" id="reload-btn">🔄 再読込</button>
+  </div>
+
+  <div class="header" id="counters">読み込み中…</div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>楽天商品コード</th>
+        <th>商品名 (楽天)</th>
+        <th>ジャンル</th>
+        <th class="num">直近7日 売上</th>
+        <th class="num">件数</th>
+        <th>NE商品コード</th>
+        <th>理由 (必須、3字以上)</th>
+        <th>操作</th>
+      </tr>
+    </thead>
+    <tbody id="rows">
+      <tr><td colspan="8" class="empty">読み込み中…</td></tr>
+    </tbody>
+  </table>
+
+<script>
+const fmtJpy = (n) => '¥' + Number(n || 0).toLocaleString();
+
+async function fetchJson(url, opts) {
+  const res = await fetch(url, opts);
+  const body = await res.json().catch(() => ({ ok: false, error: 'invalid json' }));
+  if (!body.ok) throw new Error(body.error || `HTTP ${res.status}`);
+  return body.result;
+}
+
+async function loadCounters() {
+  try {
+    const c = await fetchJson('/apps/sales-analytics-linegift/api/counters');
+    const m = c.mapping || {};
+    const cl = c.classification || {};
+    const total = (m.CONFIRMED || 0) + (m.PROVISIONAL || 0) + (m.UNMAPPED || 0);
+    const unmapped = m.UNMAPPED || 0;
+    const pct = total > 0 ? Math.round(unmapped * 1000 / total) / 10 : 0;
+    const unmappedClass = pct >= 10 ? 'danger' : (pct >= 5 ? 'warn' : '');
+    document.getElementById('counters').innerHTML = `
+      <div class="counter"><div class="label">楽天商品 紐付け済</div><div class="value">${m.CONFIRMED || 0}</div></div>
+      <div class="counter ${unmappedClass}"><div class="label">未分類 UNMAPPED</div><div class="value">${unmapped} (${pct}%)</div></div>
+      <div class="counter"><div class="label">分類済 RAKUTEN_AUTO</div><div class="value">${cl.RAKUTEN_AUTO || 0}</div></div>
+      <div class="counter"><div class="label">手動分類 MANUAL</div><div class="value">${cl.MANUAL || 0}</div></div>
+    `;
+  } catch (e) {
+    document.getElementById('counters').innerHTML = `<div class="counter danger"><div class="label">カウンタ取得失敗</div><div class="value">${e.message}</div></div>`;
+  }
+}
+
+async function loadRows() {
+  const tbody = document.getElementById('rows');
+  tbody.innerHTML = '<tr><td colspan="8" class="empty">読み込み中…</td></tr>';
+  try {
+    const rows = await fetchJson('/apps/sales-analytics-linegift/api/unmapped?limit=200');
+    if (rows.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="8" class="empty">🎉 UNMAPPED は 0 件です</td></tr>';
+      return;
+    }
+    tbody.innerHTML = '';
+    for (const r of rows) {
+      const tr = document.createElement('tr');
+      tr.dataset.shopCode = r.rakuten_shop_code;
+      tr.dataset.itemCode = r.rakuten_item_code;
+      tr.innerHTML = `
+        <td>${r.rakuten_item_code}</td>
+        <td>${r.rakuten_item_name ? `<a class="ext" target="_blank" href="${r.rakuten_item_url || '#'}">${escapeHtml(r.rakuten_item_name)}</a>` : '(no name)'}</td>
+        <td>${r.genre_name ? escapeHtml(r.genre_name) : (r.genre_id || '-')}</td>
+        <td class="num">${fmtJpy(r.sales_7d)}</td>
+        <td class="num">${r.units_7d || 0}</td>
+        <td><input class="ne-input" placeholder="NE商品コード" /></td>
+        <td><input class="reason-input" placeholder="例: 楽天 manageNumber 仕様変更" /></td>
+        <td>
+          <button class="confirm-btn">紐付け</button>
+          <div class="row-msg"></div>
+        </td>
+      `;
+      tbody.appendChild(tr);
+    }
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="8" class="empty">読込失敗: ${escapeHtml(e.message)}</td></tr>`;
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+}
+
+document.addEventListener('click', async (ev) => {
+  const btn = ev.target.closest('.confirm-btn');
+  if (!btn) return;
+  const tr = btn.closest('tr');
+  const shopCode = tr.dataset.shopCode;
+  const itemCode = tr.dataset.itemCode;
+  const neInput = tr.querySelector('.ne-input');
+  const reasonInput = tr.querySelector('.reason-input');
+  const msg = tr.querySelector('.row-msg');
+  const ne = (neInput.value || '').trim();
+  const reason = (reasonInput.value || '').trim();
+  if (!ne) { msg.className = 'row-msg err'; msg.textContent = 'NE商品コードを入力してください'; return; }
+  if (reason.length < 3) { msg.className = 'row-msg err'; msg.textContent = '理由は3字以上'; return; }
+  btn.disabled = true;
+  msg.className = 'row-msg'; msg.textContent = '送信中…';
+  try {
+    await fetchJson('/apps/sales-analytics-linegift/api/mapping', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        rakuten_shop_code: shopCode, rakuten_item_code: itemCode,
+        ne_product_code: ne, reason,
+      }),
+    });
+    msg.className = 'row-msg ok'; msg.textContent = '✓ 紐付け完了';
+    setTimeout(() => { tr.remove(); }, 500);
+    loadCounters();
+  } catch (e) {
+    msg.className = 'row-msg err'; msg.textContent = '失敗: ' + e.message;
+    btn.disabled = false;
+  }
+});
+
+document.getElementById('reload-btn').addEventListener('click', () => {
+  loadCounters();
+  loadRows();
+});
+
+loadCounters();
+loadRows();
+</script>
+</body>
+</html>
