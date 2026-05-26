@@ -103,12 +103,21 @@ async function loadRows() {
       const tr = document.createElement('tr');
       tr.dataset.shopCode = r.rakuten_shop_code;
       tr.dataset.itemCode = r.rakuten_item_code;
+      const safeUrl = sanitizeUrl(r.rakuten_item_url);
+      const nameHtml = r.rakuten_item_name
+        ? (safeUrl
+            ? `<a class="ext" target="_blank" rel="noopener noreferrer" href="${escapeAttr(safeUrl)}">${escapeHtml(r.rakuten_item_name)}</a>`
+            : escapeHtml(r.rakuten_item_name))
+        : '(no name)';
+      const genreHtml = r.genre_name
+        ? escapeHtml(r.genre_name)
+        : (r.genre_id ? escapeHtml(r.genre_id) : '-');
       tr.innerHTML = `
-        <td>${r.rakuten_item_code}</td>
-        <td>${r.rakuten_item_name ? `<a class="ext" target="_blank" href="${r.rakuten_item_url || '#'}">${escapeHtml(r.rakuten_item_name)}</a>` : '(no name)'}</td>
-        <td>${r.genre_name ? escapeHtml(r.genre_name) : (r.genre_id || '-')}</td>
+        <td>${escapeHtml(r.rakuten_item_code)}</td>
+        <td>${nameHtml}</td>
+        <td>${genreHtml}</td>
         <td class="num">${fmtJpy(r.sales_7d)}</td>
-        <td class="num">${r.units_7d || 0}</td>
+        <td class="num">${escapeHtml(r.units_7d || 0)}</td>
         <td><input class="ne-input" placeholder="NE商品コード" /></td>
         <td><input class="reason-input" placeholder="例: 楽天 manageNumber 仕様変更" /></td>
         <td>
@@ -123,8 +132,17 @@ async function loadRows() {
   }
 }
 
+// XSS 対策 (Codex Round 1 A-5b high 1 反映)
 function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+}
+function escapeAttr(s) { return escapeHtml(s); }
+// URL は http/https のみ許可 (javascript: / data: 等を弾く)
+function sanitizeUrl(u) {
+  if (!u) return null;
+  const s = String(u).trim();
+  if (!/^https?:\/\//i.test(s)) return null;
+  return s;
 }
 
 document.addEventListener('click', async (ev) => {

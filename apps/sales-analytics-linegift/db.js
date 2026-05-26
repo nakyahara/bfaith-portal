@@ -120,16 +120,18 @@ export function setManualMapping(params) {
   const syncedAt = nowJstIso();
   const userTag = user || 'system:manual';
 
-  const existing = db.prepare(`
-    SELECT id, ne_product_code, mapping_type
-    FROM x_rakuten_item_product_map
-    WHERE rakuten_shop_code = ?
-      AND rakuten_item_code = ?
-      AND is_active = 1
-      AND valid_to IS NULL
-  `).get(rakuten_shop_code, rakuten_item_code);
-
+  // SCD2: existing 取得 + UPDATE + INSERT を全部 transaction 内に
+  // (Codex Round 1 A-5b high 2 反映: 同時更新で active 重複を作る事故防止)
   const txn = db.transaction(() => {
+    const existing = db.prepare(`
+      SELECT id, ne_product_code, mapping_type
+      FROM x_rakuten_item_product_map
+      WHERE rakuten_shop_code = ?
+        AND rakuten_item_code = ?
+        AND is_active = 1
+        AND valid_to IS NULL
+    `).get(rakuten_shop_code, rakuten_item_code);
+
     if (existing) {
       db.prepare(`UPDATE x_rakuten_item_product_map
                   SET is_active=0, valid_to=?, updated_by=?, synced_at=?
@@ -152,9 +154,10 @@ export function setManualMapping(params) {
       reason,
       syncedAt, userTag, userTag, syncedAt
     );
+    return { action: existing ? 'updated' : 'inserted' };
   });
-  txn();
-  return { action: existing ? 'updated' : 'inserted', ne_product_code: np['商品コード'] };
+  const result = txn();
+  return { ...result, ne_product_code: np['商品コード'] };
 }
 
 /**
@@ -191,17 +194,19 @@ export function setManualClassification(params) {
   const syncedAt = nowJstIso();
   const userTag = user || 'system:manual';
 
-  const existing = db.prepare(`
-    SELECT id
-    FROM m_product_classifications
-    WHERE ne_product_code = ?
-      AND ne_sku_code IS NULL
-      AND classification_level = 'PRODUCT'
-      AND is_active = 1
-      AND valid_to IS NULL
-  `).get(ne_product_code);
-
+  // SCD2: existing 取得 + UPDATE + INSERT を全部 transaction 内に
+  // (Codex Round 1 A-5b high 2 反映)
   const txn = db.transaction(() => {
+    const existing = db.prepare(`
+      SELECT id
+      FROM m_product_classifications
+      WHERE ne_product_code = ?
+        AND ne_sku_code IS NULL
+        AND classification_level = 'PRODUCT'
+        AND is_active = 1
+        AND valid_to IS NULL
+    `).get(ne_product_code);
+
     if (existing) {
       db.prepare(`UPDATE m_product_classifications
                   SET is_active=0, valid_to=?, updated_by=?, synced_at=?
@@ -226,9 +231,10 @@ export function setManualClassification(params) {
       price_band_code_master || null,
       syncedAt, userTag, userTag, reason, syncedAt
     );
+    return { action: existing ? 'updated' : 'inserted' };
   });
-  txn();
-  return { action: existing ? 'updated' : 'inserted', ne_product_code };
+  const result = txn();
+  return { ...result, ne_product_code };
 }
 
 /**
