@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <title>LINEギフト 売上分析ダッシュボード v1.0</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body { font-family: -apple-system, "Segoe UI", "Hiragino Sans", "Yu Gothic", sans-serif;
+           background: #f6f8fa; color: #24292e; margin: 0; padding: 16px; }
+    h1 { font-size: 1.4em; margin: 0; display: flex; gap: 8px; align-items: center; }
+    .topbar { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+    .topbar .build-info { margin-left: auto; font-size: .8em; color: #586069; }
+    .build-btn { background: #06C755; color: #fff; border: 0; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-size: .9em; }
+    .build-btn:hover { background: #058845; }
+    .build-btn:disabled { background: #ccc; cursor: not-allowed; }
+
+    .filters { background: #fff; padding: 12px; border-radius: 8px; display: flex; gap: 16px;
+               flex-wrap: wrap; align-items: center; margin-bottom: 16px; box-shadow: 0 1px 2px rgba(0,0,0,.06); }
+    .filters label { font-size: .85em; color: #586069; }
+    .filters select { padding: 4px 8px; font-size: .92em; border: 1px solid #d0d7de; border-radius: 4px; min-width: 120px; }
+    .filters .reset { background: #6b7280; color: #fff; border: 0; padding: 5px 10px; border-radius: 4px; cursor: pointer; font-size: .85em; }
+
+    .kpi-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 16px; }
+    .kpi-card { background: #fff; padding: 14px 16px; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,.06); }
+    .kpi-card .label { color: #586069; font-size: .78em; margin-bottom: 4px; }
+    .kpi-card .value { font-size: 1.4em; font-weight: 600; color: #24292e; }
+    .kpi-card .sub { color: #586069; font-size: .72em; margin-top: 2px; }
+
+    .row-2 { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; margin-bottom: 16px; }
+    .panel { background: #fff; padding: 14px; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,.06); }
+    .panel h2 { font-size: .95em; margin: 0 0 10px; color: #24292e; }
+
+    .chart-wrap { width: 100%; overflow-x: auto; }
+    svg.chart { width: 100%; max-width: 100%; height: 220px; display: block; }
+    svg.chart .bar { fill: #06C755; }
+    svg.chart .line { stroke: #0969da; stroke-width: 2; fill: none; }
+    svg.chart .dot { fill: #0969da; }
+    svg.chart .axis { stroke: #d0d7de; }
+    svg.chart text { font-size: 10px; fill: #586069; }
+
+    .top5 { display: flex; flex-direction: column; gap: 6px; }
+    .top5-row { display: flex; align-items: center; gap: 8px; font-size: .85em; }
+    .top5-row .name { width: 50%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .top5-row .bar { flex: 1; height: 14px; background: #f59e0b; border-radius: 2px; }
+    .top5-row .val { color: #586069; font-size: .78em; min-width: 60px; text-align: right; }
+
+    table { width: 100%; border-collapse: collapse; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.06); font-size: .85em; }
+    th, td { padding: 6px 10px; text-align: left; border-bottom: 1px solid #eaecef; }
+    th { background: #f6f8fa; font-weight: 600; cursor: pointer; user-select: none; }
+    th.sortable:hover { background: #eef2f6; }
+    th.sorted-desc::after { content: ' ▼'; color: #06C755; }
+    th.sorted-asc::after  { content: ' ▲'; color: #06C755; }
+    td.num { text-align: right; }
+    .bar-cell { display: inline-block; height: 10px; background: #06C755; border-radius: 2px; vertical-align: middle; margin-left: 4px; }
+    .bar-cell.profit { background: #f59e0b; }
+    .bar-cell.units  { background: #0969da; }
+    .panel.scroll { max-height: 600px; overflow-y: auto; }
+    .empty { color: #586069; padding: 24px; text-align: center; }
+    .loading { color: #586069; font-style: italic; }
+    .status-ok { color: #1a7f37; }
+    .status-fail { color: #cf222e; }
+    .status-running { color: #d29922; }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <h1>💚 LINEギフト 売上分析 v1.0</h1>
+    <div class="build-info" id="build-info"></div>
+    <button class="build-btn" id="build-btn">🔄 データ再集計</button>
+  </div>
+
+  <div class="filters">
+    <label>期間:
+      <select id="filter-window">
+        <option value="7">過去 7 日</option>
+        <option value="28">過去 28 日</option>
+        <option value="90" selected>過去 90 日</option>
+      </select>
+    </label>
+    <label>シーン:
+      <select id="filter-season"><option value="">指定なし</option></select>
+    </label>
+    <button class="reset" id="reset-btn">フィルタ解除</button>
+    <div id="as-of-info" style="margin-left:auto; font-size:.75em; color:#586069;"></div>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi-card"><div class="label">売上 (税込)</div><div class="value" id="kpi-sales">-</div><div class="sub">期間集計</div></div>
+    <div class="kpi-card"><div class="label">注文数</div><div class="value" id="kpi-orders">-</div></div>
+    <div class="kpi-card"><div class="label">平均注文単価</div><div class="value" id="kpi-aov">-</div></div>
+    <div class="kpi-card"><div class="label">粗利</div><div class="value" id="kpi-profit">-</div></div>
+    <div class="kpi-card"><div class="label">粗利率</div><div class="value" id="kpi-rate">-</div></div>
+  </div>
+
+  <div class="row-2">
+    <div class="panel">
+      <h2>月別 売上 + 粗利 (過去 12 ヶ月)</h2>
+      <div class="chart-wrap" id="monthly-chart"><div class="loading">読み込み中…</div></div>
+    </div>
+    <div class="panel">
+      <h2>利益額 TOP 5 (現フィルタ)</h2>
+      <div class="top5" id="top5-list"><div class="loading">読み込み中…</div></div>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-bottom: 16px;">
+    <h2>価格帯別販売動向 (実売単価ベース、8 段階)</h2>
+    <div id="price-band-table"><div class="loading">読み込み中…</div></div>
+  </div>
+
+  <div class="panel scroll">
+    <h2>商品ランキング (Top 500)</h2>
+    <div id="ranking-table"><div class="loading">読み込み中…</div></div>
+  </div>
+
+<script>
+const QS = () => new URLSearchParams(location.search);
+function setQS(k, v) {
+  const p = QS();
+  if (v == null || v === '') p.delete(k); else p.set(k, v);
+  history.replaceState(null, '', location.pathname + (p.toString() ? '?' + p.toString() : ''));
+}
+
+function fmtJpy(n) {
+  if (n == null) return '-';
+  const v = Number(n);
+  if (v >= 100_000_000) return '¥' + (v / 100_000_000).toFixed(2) + '億';
+  if (v >= 10_000)      return '¥' + Math.round(v / 10_000).toLocaleString('ja-JP') + '万';
+  return '¥' + Math.round(v).toLocaleString('ja-JP');
+}
+function fmtPct(n) { return (Number(n) * 100).toFixed(1) + '%'; }
+function fmtInt(n) { return n == null ? '-' : Number(n).toLocaleString('ja-JP'); }
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+}
+
+async function fetchJson(url, opts) {
+  const res = await fetch(url, opts);
+  const body = await res.json().catch(() => ({ ok: false, error: 'invalid json' }));
+  if (!body.ok) throw new Error(body.error || `HTTP ${res.status}`);
+  return body.result;
+}
+
+const state = {
+  window: Number(QS().get('window')) || 90,
+  season: QS().get('season') || '',
+  sort: QS().get('sort') || 'sales',
+};
+
+function syncFiltersFromState() {
+  document.getElementById('filter-window').value = String(state.window);
+  document.getElementById('filter-season').value = state.season;
+}
+
+async function loadKpi() {
+  const ids = { sales: 'kpi-sales', orders: 'kpi-orders', aov: 'kpi-aov', profit: 'kpi-profit', rate: 'kpi-rate' };
+  try {
+    const r = await fetchJson(`/apps/sales-analytics-linegift/api/dashboard/kpi-summary?window=${state.window}`);
+    if (!r) {
+      Object.values(ids).forEach((id) => document.getElementById(id).textContent = '(データなし)');
+      document.getElementById('as-of-info').textContent = '';
+      return;
+    }
+    document.getElementById('kpi-sales').textContent = fmtJpy(r.total_sales_jpy_incl);
+    document.getElementById('kpi-orders').textContent = fmtInt(r.total_orders);
+    document.getElementById('kpi-aov').textContent = fmtJpy(r.avg_order_value_jpy_incl);
+    document.getElementById('kpi-profit').textContent = fmtJpy(r.total_gross_profit_jpy_incl);
+    document.getElementById('kpi-rate').textContent = fmtPct(r.gross_margin_rate);
+    document.getElementById('as-of-info').textContent = `as_of: ${escapeHtml(r.as_of_date_jst)} / 集計: ${escapeHtml(r.synced_at)}`;
+  } catch (e) {
+    Object.values(ids).forEach((id) => document.getElementById(id).textContent = 'エラー');
+    console.error(e);
+  }
+}
+
+async function loadMonthly() {
+  const wrap = document.getElementById('monthly-chart');
+  try {
+    const rows = await fetchJson('/apps/sales-analytics-linegift/api/dashboard/monthly-trend');
+    if (!rows || rows.length === 0) { wrap.innerHTML = '<div class="empty">月次データなし</div>'; return; }
+    const maxSales = Math.max(...rows.map((r) => Number(r.sales_jpy_incl) || 0), 1);
+    const maxProfit = Math.max(...rows.map((r) => Number(r.gross_profit_jpy_incl) || 0), 1);
+    const W = Math.max(rows.length * 60, 400);
+    const H = 200;
+    const padL = 40, padR = 40, padB = 28, padT = 10;
+    const innerW = W - padL - padR;
+    const innerH = H - padT - padB;
+    const bw = innerW / rows.length * 0.6;
+    const gap = innerW / rows.length * 0.4;
+    let svg = `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg">`;
+    svg += `<line class="axis" x1="${padL}" y1="${H - padB}" x2="${W - padR}" y2="${H - padB}" />`;
+    rows.forEach((r, i) => {
+      const x = padL + i * (bw + gap) + gap / 2;
+      const h = innerH * ((Number(r.sales_jpy_incl) || 0) / maxSales);
+      const y = H - padB - h;
+      svg += `<rect class="bar" x="${x}" y="${y}" width="${bw}" height="${h}"><title>${escapeHtml(r.year_month)}\n売上 ${fmtJpy(r.sales_jpy_incl)}</title></rect>`;
+      svg += `<text x="${x + bw/2}" y="${H - padB + 14}" text-anchor="middle">${escapeHtml(r.year_month.slice(2))}</text>`;
+    });
+    let pathD = '';
+    rows.forEach((r, i) => {
+      const x = padL + i * (bw + gap) + gap / 2 + bw / 2;
+      const y = H - padB - innerH * ((Number(r.gross_profit_jpy_incl) || 0) / maxProfit);
+      pathD += (i === 0 ? 'M' : 'L') + x + ' ' + y + ' ';
+      svg += `<circle class="dot" cx="${x}" cy="${y}" r="3"><title>粗利 ${fmtJpy(r.gross_profit_jpy_incl)}</title></circle>`;
+    });
+    svg += `<path class="line" d="${pathD.trim()}" />`;
+    svg += `<text x="${padL}" y="${padT + 10}" fill="#06C755">売上(棒)</text>`;
+    svg += `<text x="${padL + 80}" y="${padT + 10}" fill="#0969da">粗利(折線)</text>`;
+    svg += '</svg>';
+    wrap.innerHTML = svg;
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty">読込失敗: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+async function loadTop5() {
+  const wrap = document.getElementById('top5-list');
+  try {
+    const qs = new URLSearchParams({ window: state.window, sort: 'profit', limit: 5 });
+    if (state.season) qs.set('season_code', state.season);
+    const rows = await fetchJson('/apps/sales-analytics-linegift/api/dashboard/sku-ranking?' + qs.toString());
+    if (!rows || rows.length === 0) { wrap.innerHTML = '<div class="empty">データなし</div>'; return; }
+    const max = Math.max(...rows.map((r) => Number(r.gross_profit_jpy_incl) || 0), 1);
+    wrap.innerHTML = rows.map((r) => {
+      const pct = (Number(r.gross_profit_jpy_incl) || 0) / max * 100;
+      const label = r.product_name || r.sku_code;
+      return `<div class="top5-row">
+        <div class="name" title="${escapeHtml(label)}">${escapeHtml(label)}</div>
+        <div class="bar" style="width:${pct.toFixed(1)}%"></div>
+        <div class="val">${fmtJpy(r.gross_profit_jpy_incl)}</div>
+      </div>`;
+    }).join('');
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty">読込失敗: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+async function loadPriceBand() {
+  const wrap = document.getElementById('price-band-table');
+  try {
+    const rows = await fetchJson(`/apps/sales-analytics-linegift/api/dashboard/price-band-summary?window=${state.window}`);
+    if (!rows || rows.length === 0) { wrap.innerHTML = '<div class="empty">データなし</div>'; return; }
+    const maxSales = Math.max(...rows.map((r) => Number(r.sales_jpy_incl) || 0), 1);
+    wrap.innerHTML = `<table>
+      <thead><tr><th>価格帯</th><th class="num">SKU 数</th><th class="num">件数</th><th class="num">売上</th><th class="num">粗利</th><th class="num">粗利率</th><th></th></tr></thead>
+      <tbody>${rows.map((r) => {
+        const pct = (Number(r.sales_jpy_incl) || 0) / maxSales * 100;
+        return `<tr>
+          <td>${escapeHtml(r.band_label)}</td>
+          <td class="num">${fmtInt(r.sku_count)}</td>
+          <td class="num">${fmtInt(r.orders_count)}</td>
+          <td class="num">${fmtJpy(r.sales_jpy_incl)}</td>
+          <td class="num">${fmtJpy(r.gross_profit_jpy_incl)}</td>
+          <td class="num">${fmtPct(r.gross_margin_rate)}</td>
+          <td><span class="bar-cell" style="width:${pct.toFixed(1)}%"></span></td>
+        </tr>`;
+      }).join('')}</tbody>
+    </table>`;
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty">読込失敗: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+async function loadRanking() {
+  const wrap = document.getElementById('ranking-table');
+  try {
+    const qs = new URLSearchParams({ window: state.window, sort: state.sort, limit: 500 });
+    if (state.season) qs.set('season_code', state.season);
+    const rows = await fetchJson('/apps/sales-analytics-linegift/api/dashboard/sku-ranking?' + qs.toString());
+    if (!rows || rows.length === 0) { wrap.innerHTML = '<div class="empty">データなし</div>'; return; }
+    const maxSales  = Math.max(...rows.map((r) => Number(r.sales_amount_jpy_incl) || 0), 1);
+    const maxUnits  = Math.max(...rows.map((r) => Number(r.units) || 0), 1);
+    const maxProfit = Math.max(...rows.map((r) => Number(r.gross_profit_jpy_incl) || 0), 1);
+    const headers = [
+      { id: 'rank',  label: '#', sortable: false, num: true },
+      { id: 'name',  label: '商品', sortable: false },
+      { id: 'price', label: '単価', sortable: false, num: true },
+      { id: 'sales', label: '売上', sortable: true,  num: true },
+      { id: 'units', label: '件数', sortable: true,  num: true },
+      { id: 'profit',label: '粗利', sortable: true,  num: true },
+      { id: 'gm',    label: '粗利率', sortable: false, num: true },
+    ];
+    wrap.innerHTML = `<table>
+      <thead><tr>${headers.map((h) => {
+        let cls = '';
+        if (h.sortable) {
+          cls = 'sortable';
+          if (state.sort === h.id) cls += ' sorted-desc';
+        }
+        return `<th class="${cls}${h.num ? ' num' : ''}" data-sort="${h.id}">${escapeHtml(h.label)}</th>`;
+      }).join('')}</tr></thead>
+      <tbody>${rows.map((r, i) => {
+        const sBar = (Number(r.sales_amount_jpy_incl) || 0) / maxSales * 60;
+        const uBar = (Number(r.units) || 0) / maxUnits * 60;
+        const pBar = (Number(r.gross_profit_jpy_incl) || 0) / maxProfit * 60;
+        const name = r.product_name || r.sku_code;
+        return `<tr>
+          <td class="num">${i + 1}</td>
+          <td title="${escapeHtml(r.sku_code)}">${escapeHtml(name)}</td>
+          <td class="num">${fmtJpy(r.unit_price_jpy_incl_display)}</td>
+          <td class="num">${fmtJpy(r.sales_amount_jpy_incl)} <span class="bar-cell" style="width:${sBar.toFixed(0)}px"></span></td>
+          <td class="num">${fmtInt(r.units)} <span class="bar-cell units" style="width:${uBar.toFixed(0)}px"></span></td>
+          <td class="num">${fmtJpy(r.gross_profit_jpy_incl)} <span class="bar-cell profit" style="width:${pBar.toFixed(0)}px"></span></td>
+          <td class="num">${fmtPct(r.gross_margin_rate)}</td>
+        </tr>`;
+      }).join('')}</tbody>
+    </table>`;
+    wrap.querySelectorAll('th.sortable').forEach((th) => {
+      th.addEventListener('click', () => {
+        state.sort = th.dataset.sort;
+        setQS('sort', state.sort);
+        loadRanking();
+        loadTop5();
+      });
+    });
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty">読込失敗: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+async function loadSeasons() {
+  try {
+    const seasons = await fetchJson('/apps/sales-analytics-linegift/api/dashboard/seasons');
+    const ss = document.getElementById('filter-season');
+    ss.innerHTML = '<option value="">指定なし</option>' + seasons.map((s) =>
+      `<option value="${escapeHtml(s.season_code)}">${escapeHtml(s.season_name)} (${escapeHtml(s.latest_start || '-')} 〜 ${escapeHtml(s.latest_end || '-')})</option>`
+    ).join('');
+    syncFiltersFromState();
+  } catch (e) {
+    console.error('seasons load failed:', e);
+  }
+}
+
+async function loadBuildStatus() {
+  try {
+    const r = await fetchJson('/apps/sales-analytics-linegift/api/build-status');
+    const cur = r?.current;
+    const info = document.getElementById('build-info');
+    if (!cur) { info.textContent = 'build 未実行'; return; }
+    const cls = cur.status === 'COMPLETED' ? 'status-ok' : (cur.status === 'FAILED' ? 'status-fail' : 'status-running');
+    info.innerHTML = `<span class="${cls}">最終 build: ${escapeHtml(cur.status)}</span> @ ${escapeHtml(cur.heartbeat_at)}`;
+  } catch (e) { /* swallow */ }
+}
+
+function refreshAll() {
+  loadKpi();
+  loadMonthly();
+  loadTop5();
+  loadPriceBand();
+  loadRanking();
+  loadBuildStatus();
+}
+
+document.getElementById('filter-window').addEventListener('change', (ev) => {
+  state.window = Number(ev.target.value); setQS('window', state.window); refreshAll();
+});
+document.getElementById('filter-season').addEventListener('change', (ev) => {
+  state.season = ev.target.value; setQS('season', state.season); refreshAll();
+});
+document.getElementById('reset-btn').addEventListener('click', () => {
+  state.window = 90; state.season = ''; state.sort = 'sales';
+  history.replaceState(null, '', location.pathname);
+  syncFiltersFromState();
+  refreshAll();
+});
+document.getElementById('build-btn').addEventListener('click', async (ev) => {
+  const btn = ev.target;
+  btn.disabled = true; btn.textContent = '⏳ 起動中…';
+  try {
+    await fetchJson('/apps/sales-analytics-linegift/api/build-trigger', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+    btn.textContent = '✓ 起動完了';
+    setTimeout(() => { btn.textContent = '🔄 データ再集計'; btn.disabled = false; }, 3000);
+    setTimeout(() => loadBuildStatus(), 1500);
+  } catch (e) {
+    btn.textContent = `失敗: ${e.message}`;
+    setTimeout(() => { btn.textContent = '🔄 データ再集計'; btn.disabled = false; }, 5000);
+  }
+});
+
+loadSeasons().then(refreshAll);
+</script>
+</body>
+</html>

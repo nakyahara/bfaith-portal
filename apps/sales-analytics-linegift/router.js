@@ -1,0 +1,110 @@
+/**
+ * apps/sales-analytics-linegift/router.js — v1.0 Render 完結 UI + API
+ *
+ * 設計書: g:/共有ドライブ/AI_reference/システム設計/LINEギフトPhase1設計書_v1.0_20260527.md §6 / §7
+ *
+ * URL:
+ *   GET  /apps/sales-analytics-linegift/                          UI (ダッシュボード)
+ *   GET  /apps/sales-analytics-linegift/api/dashboard/kpi-summary
+ *   GET  /apps/sales-analytics-linegift/api/dashboard/monthly-trend
+ *   GET  /apps/sales-analytics-linegift/api/dashboard/sku-ranking
+ *   GET  /apps/sales-analytics-linegift/api/dashboard/price-band-summary
+ *   GET  /apps/sales-analytics-linegift/api/dashboard/seasons
+ *   GET  /apps/sales-analytics-linegift/api/build-status         build lock 状態
+ *   POST /apps/sales-analytics-linegift/api/build-trigger        build スクリプト起動 (409 対応)
+ *
+ * 認証: server.js で requireAppAccess('sales-analytics-linegift') を mount 時に適用。
+ */
+import { Router } from 'express';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { spawn } from 'node:child_process';
+import {
+  getKpiSummary, getMonthlyTrend, getSkuRanking,
+  getPriceBandSummary, listSeasons, getBuildStatus,
+} from './db.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const router = Router();
+
+// ─── UI ───
+router.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'views', 'dashboard.html'));
+});
+
+// ─── API ───
+router.get('/api/dashboard/kpi-summary', (req, res) => {
+  try {
+    const w = Number(req.query.window) || 90;
+    res.json({ ok: true, result: getKpiSummary(w) });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+router.get('/api/dashboard/monthly-trend', (req, res) => {
+  try {
+    res.json({ ok: true, result: getMonthlyTrend() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+router.get('/api/dashboard/sku-ranking', (req, res) => {
+  try {
+    const filters = {
+      window: req.query.window ? Number(req.query.window) : 90,
+      season_code: req.query.season_code || null,
+      season_year: req.query.season_year ? Number(req.query.season_year) : null,
+      sort: req.query.sort || 'sales',
+      limit: req.query.limit ? Number(req.query.limit) : 500,
+    };
+    res.json({ ok: true, result: getSkuRanking(filters) });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+router.get('/api/dashboard/price-band-summary', (req, res) => {
+  try {
+    const w = Number(req.query.window) || 90;
+    res.json({ ok: true, result: getPriceBandSummary(w) });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+router.get('/api/dashboard/seasons', (req, res) => {
+  try {
+    res.json({ ok: true, result: listSeasons() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+router.get('/api/build-status', (req, res) => {
+  try {
+    res.json({ ok: true, result: getBuildStatus() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// build トリガー (UI ボタン or miniPC daily-sync から HTTP 起動)
+// 同時呼出は build スクリプト内の acquireLock で 409 ガード
+router.post('/api/build-trigger', (req, res) => {
+  try {
+    const scriptPath = path.resolve(__dirname, '..', 'warehouse-mirror', 'build-linegift-analytics-mart.js');
+    const child = spawn(process.execPath, [scriptPath], {
+      detached: true,
+      stdio: 'ignore',
+      cwd: process.cwd(),
+    });
+    child.unref();
+    res.json({ ok: true, result: { triggered: true, pid: child.pid, note: 'build スクリプトを起動しました。状態は GET /api/build-status で確認してください' } });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+export default router;
