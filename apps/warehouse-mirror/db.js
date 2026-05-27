@@ -1563,26 +1563,149 @@ function createTables() {
 // ロジザード「出荷予定登録(卸)Excel貼り付け FS01_05」の商品ID = この構成品コード。
 function createGiftsetTables() {
   // ギフトセット定義ヘッダー。giftset_code は自動採番(gs_...)。写真/動画は Drive の URL を持つ。
+  // production_lot_size: 1ロットあたりの完成個数 (デフォルト 1)。
+  //   例) agneyemask5 (5個入り箱) をばらして使う relaxgiftset は 1ロット=5個でしか
+  //   作れない (= 半端な箱開封不可) ため production_lot_size=5、構成品の数量は
+  //   「1ロット分」の数量で登録する。
+  // マニュアル系カラム (Codex review 推奨、Notion 継続 + URL 連携方針):
+  //   manual_url / manual_source: 製造マニュアルの保管場所 URL とその種別 (notion/drive/internal)。
+  //     manual_source を持つ理由は、将来 Notion を卒業して Drive や内製 CMS に移行した
+  //     場合の切替容易性 (URL だけ持ってると種別判別不能で、UI/作業カード側の挙動を
+  //     正しく分岐できないため)。
+  //   estimated_duration_min: 1ロット製造の目安時間 (分)。負荷見積/進捗遅延検知に使う。
+  //   difficulty: 1-5 の難易度。委託先での人員配置判断材料。
   db.exec(`
     CREATE TABLE IF NOT EXISTS f_giftset (
-      giftset_code  TEXT PRIMARY KEY,
-      giftset_name  TEXT NOT NULL,
-      photo_url     TEXT,
-      video_url     TEXT,
-      unit_price    REAL CHECK (unit_price IS NULL OR unit_price >= 0),
-      memo          TEXT,
-      is_active     INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1)),
-      created_at    TEXT NOT NULL,
-      updated_at    TEXT NOT NULL,
-      created_by    TEXT,
-      updated_by    TEXT,
+      giftset_code             TEXT PRIMARY KEY,
+      giftset_name             TEXT NOT NULL,
+      photo_url                TEXT,
+      video_url                TEXT,
+      unit_price               REAL CHECK (unit_price IS NULL OR unit_price >= 0),
+      memo                     TEXT,
+      production_lot_size      INTEGER NOT NULL DEFAULT 1
+        CHECK (production_lot_size BETWEEN 1 AND 10000),
+      manual_url               TEXT,
+      manual_source            TEXT
+        CHECK (manual_source IS NULL OR manual_source IN ('notion', 'drive', 'internal')),
+      estimated_duration_min   INTEGER
+        CHECK (estimated_duration_min IS NULL OR (estimated_duration_min >= 1 AND estimated_duration_min <= 100000)),
+      difficulty               INTEGER
+        CHECK (difficulty IS NULL OR difficulty BETWEEN 1 AND 5),
+      is_active                INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1)),
+      created_at               TEXT NOT NULL,
+      updated_at               TEXT NOT NULL,
+      created_by               TEXT,
+      updated_by               TEXT,
       CHECK (trim(giftset_code) <> ''),
-      CHECK (trim(giftset_name) <> '')
+      CHECK (trim(giftset_name) <> ''),
+      -- manual_url と manual_source は 'どちらも空' or 'どちらも値あり' のみ許可 (片方だけ
+      -- 入る状態は不整合)。URL を入れるなら必ず source を選ばせる UX を強制。
+      CHECK (
+        (manual_url IS NULL AND manual_source IS NULL)
+        OR (manual_url IS NOT NULL AND length(trim(manual_url)) > 0 AND manual_source IS NOT NULL)
+      )
     )
   `);
   db.exec('CREATE INDEX IF NOT EXISTS idx_f_giftset_active ON f_giftset(is_active)');
+  // 既存 f_giftset への production_lot_size 追加 (本番 DB 用 migration、idempotent)。
+  // ALTER ADD COLUMN は CHECK 句を新カラムに付けられないため、ここではデフォルト 1 で追加し、
+  // アプリ層 (giftset-assembly/db.js upsertGiftset) で範囲検証を行う。
+  addColumnIfMissing('f_giftset', 'production_lot_size', 'INTEGER NOT NULL DEFAULT 1');
+  // マニュアル系カラム migration (本番 DB 用、idempotent)。NULL 許容 (=既存セットは未設定)。
+  // CHECK 句は ALTER ADD COLUMN では付けられないので、アプリ層で範囲検証する。
+  addColumnIfMissing('f_giftset', 'manual_url', 'TEXT');
+  addColumnIfMissing('f_giftset', 'manual_source', 'TEXT');
+  addColumnIfMissing('f_giftset', 'estimated_duration_min', 'INTEGER');
+  addColumnIfMissing('f_giftset', 'difficulty', 'INTEGER');
+  // 起動時整合性チェック (Codex review R1 medium #2)。
+  //   ALTER ADD COLUMN は新カラムに CHECK を付けられないので、もし他経路 (手 SQL 等) で
+  //   不正値 (NULL / 0 / 負 / 過大) が入っていれば検知し、安全側 (=1) に正規化して警告ログ。
+  //   黙って動作させると出荷予定数が誤計算される (lots 計算が破綻) ため、必ず警告を出す。
+  const anomalies = db.prepare(
+    `SELECT giftset_code, production_lot_size FROM f_giftset
+       WHERE production_lot_size IS NULL
+          OR production_lot_size < 1
+          OR production_lot_size > 10000`
+  ).all();
+  if (anomalies.length > 0) {
+    console.warn(
+      `[mirror-db] f_giftset.production_lot_size に不正値 ${anomalies.length} 行を検出、` +
+      `安全側 1 に正規化します: ` + anomalies.map(a => `${a.giftset_code}=${a.production_lot_size}`).join(', ')
+    );
+    db.prepare(
+      `UPDATE f_giftset SET production_lot_size = 1
+        WHERE production_lot_size IS NULL
+           OR production_lot_size < 1
+           OR production_lot_size > 10000`
+    ).run();
+  }
 
-  // ギフトセット構成（1ギフト = N構成品、1セットあたり数量）
+  // マニュアル系カラム整合性チェック (起動時、ALTER ADD COLUMN 経路では CHECK が効かないため)。
+  //   検知対象 (いずれも NULL に揃える):
+  //     - manual_url / manual_source の片方だけ埋まっている (ペア整合違反)
+  //     - manual_url が空文字 (trim 後 length 0)
+  //     - manual_source が enum (notion|drive|internal) 範囲外
+  //     - manual_url のスキームが http/https でない (Codex R1 medium #1、javascript:/file:/ftp: 等を排除)
+  //     - manual_url の長さが 2000 字超 (DoS / Notion API リジェクト対策)
+  //   UI/API 経路では validation 済みだが、手 SQL や旧アプリで入った異常値の早期発見。
+  const manualAnomalies = db.prepare(
+    `SELECT giftset_code, manual_url, manual_source FROM f_giftset
+       WHERE (manual_url IS NULL AND manual_source IS NOT NULL)
+          OR (manual_url IS NOT NULL AND length(trim(manual_url)) > 0 AND manual_source IS NULL)
+          OR (manual_url IS NOT NULL AND length(trim(manual_url)) = 0)
+          OR (manual_source IS NOT NULL AND manual_source NOT IN ('notion','drive','internal'))
+          OR (manual_url IS NOT NULL
+              AND length(trim(manual_url)) > 0
+              AND lower(trim(manual_url)) NOT LIKE 'http://%'
+              AND lower(trim(manual_url)) NOT LIKE 'https://%')
+          OR (manual_url IS NOT NULL AND length(manual_url) > 2000)`
+  ).all();
+  if (manualAnomalies.length > 0) {
+    console.warn(
+      `[mirror-db] f_giftset.manual_url / manual_source の不整合 ${manualAnomalies.length} 行を検出、` +
+      `NULL に揃えます: ` + manualAnomalies.map(a => `${a.giftset_code}(url=${a.manual_url ? 'set' : 'null'}, src=${a.manual_source})`).join(', ')
+    );
+    db.prepare(
+      `UPDATE f_giftset SET manual_url = NULL, manual_source = NULL
+        WHERE (manual_url IS NULL AND manual_source IS NOT NULL)
+           OR (manual_url IS NOT NULL AND length(trim(manual_url)) > 0 AND manual_source IS NULL)
+           OR (manual_url IS NOT NULL AND length(trim(manual_url)) = 0)
+           OR (manual_source IS NOT NULL AND manual_source NOT IN ('notion','drive','internal'))
+           OR (manual_url IS NOT NULL
+               AND length(trim(manual_url)) > 0
+               AND lower(trim(manual_url)) NOT LIKE 'http://%'
+               AND lower(trim(manual_url)) NOT LIKE 'https://%')
+           OR (manual_url IS NOT NULL AND length(manual_url) > 2000)`
+    ).run();
+  }
+  // 数値カラムの異常値検知 (NULL は許可、それ以外は範囲外なら NULL に戻す + 警告)。
+  const numAnomalies = db.prepare(
+    `SELECT giftset_code, estimated_duration_min, difficulty FROM f_giftset
+       WHERE (estimated_duration_min IS NOT NULL
+              AND (estimated_duration_min < 1 OR estimated_duration_min > 100000))
+          OR (difficulty IS NOT NULL AND (difficulty < 1 OR difficulty > 5))`
+  ).all();
+  if (numAnomalies.length > 0) {
+    console.warn(
+      `[mirror-db] f_giftset.estimated_duration_min / difficulty の異常値 ${numAnomalies.length} 行を検出、` +
+      `NULL に揃えます: ` + numAnomalies.map(a =>
+        `${a.giftset_code}(dur=${a.estimated_duration_min}, diff=${a.difficulty})`).join(', ')
+    );
+    db.prepare(
+      `UPDATE f_giftset SET estimated_duration_min = NULL
+        WHERE estimated_duration_min IS NOT NULL
+          AND (estimated_duration_min < 1 OR estimated_duration_min > 100000)`
+    ).run();
+    db.prepare(
+      `UPDATE f_giftset SET difficulty = NULL
+        WHERE difficulty IS NOT NULL AND (difficulty < 1 OR difficulty > 5)`
+    ).run();
+  }
+
+  // ギフトセット構成（1ギフト = N構成品）。
+  // 数量の単位: 1ロット分 (production_lot_size 個セット分) の数量。
+  //   production_lot_size = 1 (デフォルト) なら「1セットあたり」と同義。
+  //   production_lot_size > 1 (例: relaxgiftset_lot5) なら「N個ロット 1 回分」の数量を登録する。
   db.exec(`
     CREATE TABLE IF NOT EXISTS f_giftset_components (
       giftset_code  TEXT NOT NULL

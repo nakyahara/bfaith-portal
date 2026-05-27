@@ -153,6 +153,15 @@ router.post('/api/issue', async (req, res) => {
     if (!Number.isInteger(qty) || qty < 1 || qty > 1000000) {
       return res.status(400).json({ ok: false, error: 'validation', message: '個数が不正です' });
     }
+    // production_lot_size の倍数チェック (依頼時にもサーバ側で強制、UI 改竄や直接 API 叩き対策)
+    const lotSize = Number.isInteger(set.production_lot_size) && set.production_lot_size >= 1
+      ? set.production_lot_size : 1;
+    if (qty % lotSize !== 0) {
+      return res.status(400).json({
+        ok: false, error: 'validation',
+        message: `個数は ${lotSize} の倍数で入力してください (1ロット = ${lotSize}個)`,
+      });
+    }
     let people = null;
     if (body.people !== undefined && body.people !== null && body.people !== '') {
       const p = Number(body.people);
