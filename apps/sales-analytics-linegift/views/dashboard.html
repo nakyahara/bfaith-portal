@@ -9,6 +9,8 @@
            background: #f6f8fa; color: #24292e; margin: 0; padding: 16px; }
     h1 { font-size: 1.4em; margin: 0; display: flex; gap: 8px; align-items: center; }
     .topbar { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+    .topbar .back-link { color: #0969da; text-decoration: none; font-size: .9em; padding: 4px 8px; border-radius: 4px; }
+    .topbar .back-link:hover { background: #ddf4ff; text-decoration: underline; }
     .topbar .build-info { margin-left: auto; font-size: .8em; color: #586069; }
     .build-btn { background: #06C755; color: #fff; border: 0; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-size: .9em; }
     .build-btn:hover { background: #058845; }
@@ -30,7 +32,7 @@
     .panel { background: #fff; padding: 14px; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,.06); }
     .panel h2 { font-size: .95em; margin: 0 0 10px; color: #24292e; }
 
-    .chart-wrap { width: 100%; overflow-x: auto; }
+    .chart-wrap { width: 100%; overflow-x: auto; position: relative; }
     svg.chart { width: 100%; max-width: 100%; height: 360px; display: block; }
     svg.chart .bar-sales  { fill: #06C755; }
     svg.chart .bar-profit { fill: #f59e0b; }
@@ -38,6 +40,25 @@
     svg.chart .dot { fill: #0969da; }
     svg.chart .axis { stroke: #d0d7de; }
     svg.chart text { font-size: 11px; fill: #586069; }
+    svg.chart .hover-zone { fill: transparent; cursor: pointer; }
+    svg.chart .hover-zone:hover { fill: rgba(9, 105, 218, .05); }
+    svg.chart .hover-guide { stroke: #0969da; stroke-width: 1; stroke-dasharray: 3 3; pointer-events: none; opacity: 0; }
+    svg.chart.hover-active .hover-guide.active { opacity: .5; }
+
+    .chart-tooltip {
+      position: absolute; pointer-events: none; opacity: 0;
+      background: rgba(36, 41, 46, .95); color: #fff;
+      padding: 8px 10px; border-radius: 6px; font-size: .8em; line-height: 1.5;
+      box-shadow: 0 2px 8px rgba(0,0,0,.18);
+      white-space: nowrap; z-index: 10;
+      transition: opacity .12s ease-out;
+    }
+    .chart-tooltip.visible { opacity: 1; }
+    .chart-tooltip .tt-month { font-weight: 600; margin-bottom: 4px; font-size: .9em; }
+    .chart-tooltip .tt-row { display: flex; justify-content: space-between; gap: 16px; }
+    .chart-tooltip .tt-row .lbl { color: #c0c8d0; }
+    .chart-tooltip .tt-row .val { font-weight: 600; }
+    .chart-tooltip .tt-row .sw { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }
 
     .top5 { display: flex; flex-direction: column; gap: 6px; }
     /* TOP5 横棒: bar-track が flex:1 で残り幅を取り、内側 bar が width:% で実際の比率 (2026-05-27 fix) */
@@ -67,6 +88,7 @@
 </head>
 <body>
   <div class="topbar">
+    <a class="back-link" href="/">← ポータルに戻る</a>
     <h1>💚 LINEギフト 売上分析 v1.0</h1>
     <div class="build-info" id="build-info"></div>
     <button class="build-btn" id="build-btn">🔄 データ再集計</button>
@@ -112,7 +134,10 @@
   <div class="row-2">
     <div class="panel">
       <h2>月別 売上 + 粗利 (過去 12 ヶ月)</h2>
-      <div class="chart-wrap" id="monthly-chart"><div class="loading">読み込み中…</div></div>
+      <div class="chart-wrap">
+        <div id="monthly-chart"><div class="loading">読み込み中…</div></div>
+        <div class="chart-tooltip" id="monthly-tooltip" role="tooltip"></div>
+      </div>
     </div>
     <div class="panel">
       <h2>利益額 TOP 5 (現フィルタ)</h2>
@@ -292,13 +317,8 @@ async function loadMonthly() {
       const hProfit = innerH * ((Number(r.gross_profit_jpy_incl) || 0) / maxAmount);
       const ySales  = H - padB - hSales;
       const yProfit = H - padB - hProfit;
-      const title = `${escapeHtml(r.year_month)}
-売上: ${fmtJpy(r.sales_jpy_incl)}
-粗利: ${fmtJpy(r.gross_profit_jpy_incl)}
-注文: ${fmtInt(r.orders)}
-粗利率: ${fmtPct(r.gross_margin_rate)}`;
-      svg += `<rect class="bar-sales"  x="${xSales}"  y="${ySales}"  width="${bw}" height="${hSales}"><title>${title}</title></rect>`;
-      svg += `<rect class="bar-profit" x="${xProfit}" y="${yProfit}" width="${bw}" height="${hProfit}"><title>${title}</title></rect>`;
+      svg += `<rect class="bar-sales"  x="${xSales}"  y="${ySales}"  width="${bw}" height="${hSales}" />`;
+      svg += `<rect class="bar-profit" x="${xProfit}" y="${yProfit}" width="${bw}" height="${hProfit}" />`;
       // X軸 月ラベル
       svg += `<text x="${center}" y="${H - padB + 18}" text-anchor="middle">${escapeHtml(r.year_month)}</text>`;
     });
@@ -313,9 +333,17 @@ async function loadMonthly() {
       const ratio = Math.min(1, Math.max(0, ratePct / maxRatePct));
       const y = H - padB - innerH * ratio;
       pathD += (i === 0 ? 'M' : 'L') + x + ' ' + y + ' ';
-      svg += `<circle class="dot" cx="${x}" cy="${y}" r="4"><title>${escapeHtml(r.year_month)} 粗利率: ${fmtPct(r.gross_margin_rate)}</title></circle>`;
+      svg += `<circle class="dot" cx="${x}" cy="${y}" r="4" />`;
     });
     svg += `<path class="line" d="${pathD.trim()}" />`;
+
+    // 月別ホバーゾーン + 縦ガイド線 (透明矩形にカーソルを置くとカスタムツールチップを表示、2026-05-27)
+    rows.forEach((r, i) => {
+      const slotX = padL + i * slotW;
+      const center = slotX + slotW / 2;
+      svg += `<line class="hover-guide" data-idx="${i}" x1="${center}" y1="${padT}" x2="${center}" y2="${H - padB}" />`;
+      svg += `<rect class="hover-zone" data-idx="${i}" x="${slotX}" y="${padT}" width="${slotW}" height="${innerH}" />`;
+    });
 
     // 凡例 (上部)
     svg += `<rect x="${padL}"        y="${padT - 22}" width="12" height="12" fill="#06C755" />`;
@@ -328,9 +356,59 @@ async function loadMonthly() {
 
     svg += '</svg>';
     wrap.innerHTML = svg;
+    bindMonthlyTooltip(wrap.querySelector('svg.chart'), rows);
   } catch (e) {
     wrap.innerHTML = `<div class="empty">読込失敗: ${escapeHtml(e.message)}</div>`;
   }
+}
+
+// 月別グラフのホバー → カスタムツールチップ。SVG ネイティブの <title> は表示遅延が大きいため自作
+function bindMonthlyTooltip(svgEl, rows) {
+  if (!svgEl) return;
+  const tooltip = document.getElementById('monthly-tooltip');
+  // ツールチップの absolute 配置基準と座標計算基準を一致させる (Codex Round 1 high)
+  // tooltip は .chart-wrap (position: relative) 直下、SVG は #monthly-chart の子なので親の親
+  const wrap = tooltip ? tooltip.parentElement : null;
+  if (!tooltip || !wrap) return;
+  const zones = svgEl.querySelectorAll('.hover-zone');
+  const guides = svgEl.querySelectorAll('.hover-guide');
+
+  function showFor(idx, clientX, clientY) {
+    const r = rows[idx];
+    if (!r) return;
+    tooltip.innerHTML = `
+      <div class="tt-month">${escapeHtml(r.year_month)}</div>
+      <div class="tt-row"><span class="lbl"><span class="sw" style="background:#06C755"></span>売上</span><span class="val">${fmtJpy(r.sales_jpy_incl)}</span></div>
+      <div class="tt-row"><span class="lbl"><span class="sw" style="background:#f59e0b"></span>粗利</span><span class="val">${fmtJpy(r.gross_profit_jpy_incl)}</span></div>
+      <div class="tt-row"><span class="lbl"><span class="sw" style="background:#0969da"></span>粗利率</span><span class="val">${fmtPct(r.gross_margin_rate)}</span></div>
+      <div class="tt-row"><span class="lbl">注文数</span><span class="val">${fmtInt(r.orders)}</span></div>`;
+    // 表示位置: chart-wrap 基準でマウス座標から少しオフセット
+    const rect = wrap.getBoundingClientRect();
+    const offsetX = clientX - rect.left + wrap.scrollLeft;
+    const offsetY = clientY - rect.top + wrap.scrollTop;
+    tooltip.classList.add('visible');
+    // 一旦左に置いてサイズ確定 → 右端はみ出し時のみ左反転
+    tooltip.style.left = (offsetX + 12) + 'px';
+    tooltip.style.top  = (offsetY - 12) + 'px';
+    const tw = tooltip.offsetWidth, th = tooltip.offsetHeight;
+    if (offsetX + 12 + tw > rect.width)  tooltip.style.left = Math.max(0, offsetX - tw - 12) + 'px';
+    if (offsetY - 12 - th < 0)           tooltip.style.top  = (offsetY + 18) + 'px';
+    // ガイド線 active 切替
+    svgEl.classList.add('hover-active');
+    guides.forEach((g) => g.classList.toggle('active', Number(g.dataset.idx) === idx));
+  }
+  function hide() {
+    tooltip.classList.remove('visible');
+    svgEl.classList.remove('hover-active');
+    guides.forEach((g) => g.classList.remove('active'));
+  }
+
+  zones.forEach((z) => {
+    const idx = Number(z.dataset.idx);
+    z.addEventListener('mouseenter', (ev) => showFor(idx, ev.clientX, ev.clientY));
+    z.addEventListener('mousemove',  (ev) => showFor(idx, ev.clientX, ev.clientY));
+    z.addEventListener('mouseleave', hide);
+  });
 }
 
 async function loadTop5() {
