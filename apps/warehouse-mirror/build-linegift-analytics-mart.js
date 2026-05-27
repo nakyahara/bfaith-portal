@@ -75,6 +75,15 @@ function buildPriceBandResolver(db) {
  */
 function buildSkuPerf(db, asOf, windowDays, syncedAt) {
   const startOffset = windowDays - 1;
+  // 2026-05-27 中原さん指摘で送料引き算を追加:
+  //   LINEギフトは表示送料無料 (送料込み価格) だが、実態は自社が送料を負担している。
+  //   miniPC の variable_margin_jpy_incl は送料 0 で計算済 (設計書 v0.5 §4-2 の旧前提)。
+  //   Render 側で mirror_products.送料 × units を引いて powr"想定送料控除後"の粗利に直す。
+  //   Amazon FBM (feedback_amazon_fbm_easyship.md) と同じパターン。
+  //
+  // shipping_cost_jpy_incl = SUM(units_net_sold) × mirror_products.送料
+  //   (mirror_products.送料 は product_shipping から反映、税扱いは原価と同じ慣習で × (1 + 消費税率) で税込換算)
+  // gross_profit_jpy_incl = variable_margin_jpy_incl - shipping_cost_jpy_incl
   const sql = `
     INSERT OR REPLACE INTO mart_linegift_sku_perf_daily (
       as_of_date_jst, window_days, ne_code, sku_code, product_name,
@@ -86,8 +95,11 @@ function buildSkuPerf(db, asOf, windowDays, syncedAt) {
     WITH base AS (
       SELECT f.date_jst, f.sku_code, f.ne_code, f.product_name,
              f.units_net_sold, f.gross_sales_jpy_incl,
-             f.variable_margin_jpy_incl, f.order_count
+             f.variable_margin_jpy_incl, f.order_count,
+             -- mirror_products.送料 (税抜) を税込換算 (LINEギフト売価が税込のため整合)。消費税率不明なら 0.1 を既定
+             COALESCE(p.送料, 0) * (1 + COALESCE(p.消費税率, 0.1)) AS unit_shipping_cost_jpy_incl
       FROM mirror_linegift_finance_sku_daily f
+      LEFT JOIN mirror_products p ON p.商品コード = f.ne_code
       WHERE f.date_jst >= date(?, '-' || ? || ' days')
         AND f.date_jst <= ?
     )
@@ -98,7 +110,8 @@ function buildSkuPerf(db, asOf, windowDays, syncedAt) {
       MAX(b.product_name) AS product_name,
       COALESCE(SUM(b.units_net_sold), 0) AS units,
       ROUND(COALESCE(SUM(b.gross_sales_jpy_incl), 0)) AS sales_amount_jpy_incl,
-      ROUND(COALESCE(SUM(b.variable_margin_jpy_incl), 0)) AS gross_profit_jpy_incl,
+      -- 粗利 = miniPC variable_margin - 想定送料 (units × unit_shipping_cost)
+      ROUND(COALESCE(SUM(b.variable_margin_jpy_incl), 0) - COALESCE(SUM(b.units_net_sold * b.unit_shipping_cost_jpy_incl), 0)) AS gross_profit_jpy_incl,
       COALESCE(SUM(b.order_count), 0) AS orders,
       COUNT(DISTINCT b.date_jst) AS active_days,
       CASE WHEN COUNT(DISTINCT b.date_jst) = 0 THEN 0.0
@@ -108,13 +121,13 @@ function buildSkuPerf(db, asOf, windowDays, syncedAt) {
            ELSE 1.0 * COALESCE(SUM(b.gross_sales_jpy_incl), 0) / COALESCE(SUM(b.units_net_sold), 0) END AS unit_price_jpy_incl_raw,
       CASE WHEN COALESCE(SUM(b.units_net_sold), 0) = 0 THEN 0
            ELSE ROUND(COALESCE(SUM(b.gross_sales_jpy_incl), 0) * 1.0 / COALESCE(SUM(b.units_net_sold), 0)) END AS unit_price_jpy_incl_display,
+      -- 粗利率 = 送料引き後粗利 / 売上
       CASE WHEN COALESCE(SUM(b.gross_sales_jpy_incl), 0) = 0 THEN 0
-           ELSE ROUND(COALESCE(SUM(b.variable_margin_jpy_incl), 0) * 1.0 / COALESCE(SUM(b.gross_sales_jpy_incl), 0), 4) END AS gross_margin_rate,
+           ELSE ROUND((COALESCE(SUM(b.variable_margin_jpy_incl), 0) - COALESCE(SUM(b.units_net_sold * b.unit_shipping_cost_jpy_incl), 0)) * 1.0 / COALESCE(SUM(b.gross_sales_jpy_incl), 0), 4) END AS gross_margin_rate,
       ? AS synced_at
     FROM base b
     GROUP BY b.ne_code, b.sku_code
   `;
-  // bind: [as_of(WHERE start), startOffset, as_of(WHERE end), as_of(SELECT), windowDays(SELECT), windowDays(velocity分母), syncedAt]
   const info = db.prepare(sql).run(asOf, startOffset, asOf, asOf, windowDays, windowDays, syncedAt);
   return info.changes;
 }
@@ -124,29 +137,36 @@ function buildSkuPerf(db, asOf, windowDays, syncedAt) {
  */
 function buildKpiSummary(db, asOf, windowDays, syncedAt) {
   const startOffset = windowDays - 1;
+  // 送料引き算 (sku_perf と同じパターン、mirror_products.送料 × units を粗利から引く)
   const sql = `
     INSERT OR REPLACE INTO mart_linegift_kpi_summary_daily (
       as_of_date_jst, window_days,
       total_sales_jpy_incl, total_orders, avg_order_value_jpy_incl,
       total_gross_profit_jpy_incl, gross_margin_rate, synced_at
     )
+    WITH base AS (
+      SELECT f.gross_sales_jpy_incl, f.variable_margin_jpy_incl, f.order_count, f.units_net_sold,
+             COALESCE(p.送料, 0) * (1 + COALESCE(p.消費税率, 0.1)) AS unit_shipping_cost_jpy_incl
+      FROM mirror_linegift_finance_sku_daily f
+      LEFT JOIN mirror_products p ON p.商品コード = f.ne_code
+      WHERE f.date_jst >= date(?, '-' || ? || ' days')
+        AND f.date_jst <= ?
+    )
     SELECT
       ? AS as_of_date_jst,
       ? AS window_days,
-      ROUND(COALESCE(SUM(f.gross_sales_jpy_incl), 0)) AS total_sales_jpy_incl,
-      COALESCE(SUM(f.order_count), 0) AS total_orders,
-      CASE WHEN COALESCE(SUM(f.order_count), 0) = 0 THEN 0
-           ELSE ROUND(COALESCE(SUM(f.gross_sales_jpy_incl), 0) / COALESCE(SUM(f.order_count), 0)) END AS avg_order_value_jpy_incl,
-      ROUND(COALESCE(SUM(f.variable_margin_jpy_incl), 0)) AS total_gross_profit_jpy_incl,
-      CASE WHEN COALESCE(SUM(f.gross_sales_jpy_incl), 0) = 0 THEN 0
-           ELSE ROUND(COALESCE(SUM(f.variable_margin_jpy_incl), 0) * 1.0 / COALESCE(SUM(f.gross_sales_jpy_incl), 0), 4) END AS gross_margin_rate,
+      ROUND(COALESCE(SUM(gross_sales_jpy_incl), 0)) AS total_sales_jpy_incl,
+      COALESCE(SUM(order_count), 0) AS total_orders,
+      CASE WHEN COALESCE(SUM(order_count), 0) = 0 THEN 0
+           ELSE ROUND(COALESCE(SUM(gross_sales_jpy_incl), 0) / COALESCE(SUM(order_count), 0)) END AS avg_order_value_jpy_incl,
+      ROUND(COALESCE(SUM(variable_margin_jpy_incl), 0) - COALESCE(SUM(units_net_sold * unit_shipping_cost_jpy_incl), 0)) AS total_gross_profit_jpy_incl,
+      CASE WHEN COALESCE(SUM(gross_sales_jpy_incl), 0) = 0 THEN 0
+           ELSE ROUND((COALESCE(SUM(variable_margin_jpy_incl), 0) - COALESCE(SUM(units_net_sold * unit_shipping_cost_jpy_incl), 0)) * 1.0 / COALESCE(SUM(gross_sales_jpy_incl), 0), 4) END AS gross_margin_rate,
       ? AS synced_at
-    FROM mirror_linegift_finance_sku_daily f
-    WHERE f.date_jst >= date(?, '-' || ? || ' days')
-      AND f.date_jst <= ?
+    FROM base
   `;
-  // bind: [as_of(SELECT), windowDays(SELECT), syncedAt, as_of(WHERE start), startOffset, as_of(WHERE end)]
-  const info = db.prepare(sql).run(asOf, windowDays, syncedAt, asOf, startOffset, asOf);
+  // bind: [as_of(WHERE start), startOffset, as_of(WHERE end), as_of(SELECT), windowDays(SELECT), syncedAt]
+  const info = db.prepare(sql).run(asOf, startOffset, asOf, asOf, windowDays, syncedAt);
   return info.changes;
 }
 
