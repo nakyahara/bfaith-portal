@@ -113,6 +113,9 @@ function buildPriceBandResolver(db) {
  * INSERT OR REPLACE、window_days パラメタ完全注入 (Codex Round 5)
  */
 function buildSkuPerf(db, asOf, windowDays, syncedAt, dryRun) {
+  // Codex Round 1 A-5c High 反映: window_days=7 で as_of-7 〜 as_of は 8 日になる off-by-one を修正
+  // 厳密に N 日窓にするため start = as_of - (N - 1)
+  const startOffset = windowDays - 1;
   const sql = `
     INSERT OR REPLACE INTO f_linegift_sku_perf_daily (
       as_of_date_jst, window_days, ne_code, sku_code,
@@ -155,11 +158,12 @@ function buildSkuPerf(db, asOf, windowDays, syncedAt, dryRun) {
       SELECT COUNT(DISTINCT ne_code || '|' || sku_code) AS n
       FROM f_linegift_finance_sku_daily_v1
       WHERE date_jst >= date(?, '-' || ? || ' days') AND date_jst <= ?
-    `).get(asOf, windowDays, asOf).n;
-    console.log(`  [dry] sku_perf window=${windowDays}: ${count} SKU candidates`);
+    `).get(asOf, startOffset, asOf).n;
+    console.log(`  [dry] sku_perf window=${windowDays} (range: as_of - ${startOffset} 〜 as_of, 計 ${windowDays} 日): ${count} SKU candidates`);
     return count;
   }
-  const info = db.prepare(sql).run(asOf, windowDays, asOf, asOf, windowDays, windowDays, syncedAt);
+  // bind: [as_of, startOffset(WHERE start), as_of(WHERE end), as_of(SELECT), windowDays(SELECT), windowDays(velocity分母), syncedAt]
+  const info = db.prepare(sql).run(asOf, startOffset, asOf, asOf, windowDays, windowDays, syncedAt);
   return info.changes;
 }
 
@@ -167,6 +171,8 @@ function buildSkuPerf(db, asOf, windowDays, syncedAt, dryRun) {
  * 2) f_linegift_kpi_summary_daily を build
  */
 function buildKpiSummary(db, asOf, windowDays, syncedAt, dryRun) {
+  // Codex Round 1 A-5c High 反映: 厳密に N 日窓 (start = as_of - (N - 1))
+  const startOffset = windowDays - 1;
   const sql = `
     INSERT OR REPLACE INTO f_linegift_kpi_summary_daily (
       as_of_date_jst, window_days,
@@ -189,10 +195,11 @@ function buildKpiSummary(db, asOf, windowDays, syncedAt, dryRun) {
       AND f.date_jst <= ?
   `;
   if (dryRun) {
-    console.log(`  [dry] kpi_summary window=${windowDays}: skipped (1 row aggregate)`);
+    console.log(`  [dry] kpi_summary window=${windowDays} (range: as_of - ${startOffset} 〜 as_of, 計 ${windowDays} 日): skipped (1 row aggregate)`);
     return 0;
   }
-  const info = db.prepare(sql).run(asOf, windowDays, syncedAt, asOf, windowDays, asOf);
+  // bind: [as_of(SELECT), windowDays(SELECT), syncedAt, as_of(WHERE start), startOffset, as_of(WHERE end)]
+  const info = db.prepare(sql).run(asOf, windowDays, syncedAt, asOf, startOffset, asOf);
   return info.changes;
 }
 
