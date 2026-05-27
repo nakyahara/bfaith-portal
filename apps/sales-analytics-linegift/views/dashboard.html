@@ -222,28 +222,27 @@ async function loadMonthly() {
     // X軸線
     svg += `<line class="axis" x1="${padL}" y1="${H - padB}" x2="${W - padR}" y2="${H - padB}" stroke-width="1.5" />`;
 
-    // 棒 (売上) + 各バー上に数値ラベル
+    // 棒 (売上) + 月ラベルのみ (数値は左軸目盛り / ホバー title で読む、2026-05-27 中原さん指摘で衝突回避)
     rows.forEach((r, i) => {
       const x = padL + i * (bw + gap) + gap / 2;
       const h = innerH * ((Number(r.sales_jpy_incl) || 0) / maxSales);
       const y = H - padB - h;
-      svg += `<rect class="bar" x="${x}" y="${y}" width="${bw}" height="${h}"><title>${escapeHtml(r.year_month)}\n売上: ${fmtJpy(r.sales_jpy_incl)}\n粗利: ${fmtJpy(r.gross_profit_jpy_incl)}\n注文: ${fmtInt(r.orders)}\n粗利率: ${fmtPct(r.gross_margin_rate)}</title></rect>`;
-      // 棒の上に売上数値
-      if (h > 12) {
-        svg += `<text x="${x + bw/2}" y="${y - 4}" text-anchor="middle" fill="#06C755" font-weight="600">${fmtJpy(r.sales_jpy_incl)}</text>`;
-      }
+      svg += `<rect class="bar" x="${x}" y="${y}" width="${bw}" height="${h}"><title>${escapeHtml(r.year_month)}
+売上: ${fmtJpy(r.sales_jpy_incl)}
+粗利: ${fmtJpy(r.gross_profit_jpy_incl)}
+注文: ${fmtInt(r.orders)}
+粗利率: ${fmtPct(r.gross_margin_rate)}</title></rect>`;
+      // X 軸 月ラベル
       svg += `<text x="${x + bw/2}" y="${H - padB + 16}" text-anchor="middle">${escapeHtml(r.year_month)}</text>`;
     });
 
-    // 折線 (粗利) + 各点に数値ラベル
+    // 折線 (粗利) + 点のみ (数値ラベルは廃止、衝突回避)
     let pathD = '';
     rows.forEach((r, i) => {
       const x = padL + i * (bw + gap) + gap / 2 + bw / 2;
       const y = H - padB - innerH * ((Number(r.gross_profit_jpy_incl) || 0) / maxProfit);
       pathD += (i === 0 ? 'M' : 'L') + x + ' ' + y + ' ';
       svg += `<circle class="dot" cx="${x}" cy="${y}" r="4"><title>粗利: ${fmtJpy(r.gross_profit_jpy_incl)}</title></circle>`;
-      // 各点に粗利数値
-      svg += `<text x="${x}" y="${y - 8}" text-anchor="middle" fill="#0969da" font-weight="600">${fmtJpy(r.gross_profit_jpy_incl)}</text>`;
     });
     svg += `<path class="line" d="${pathD.trim()}" />`;
 
