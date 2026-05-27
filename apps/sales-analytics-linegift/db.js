@@ -79,7 +79,7 @@ export function getSkuRanking(filters = {}) {
         ON f.date_jst BETWEEN s.start_date_jst AND s.end_date_jst
       WHERE s.is_active = 1
         AND s.season_code = ?
-        AND s.season_year = COALESCE(?, (SELECT MAX(season_year) FROM mart_gift_season_occurrences WHERE season_code = ?))
+        AND s.season_year = COALESCE(?, (SELECT MAX(season_year) FROM mart_gift_season_occurrences WHERE season_code = ? AND is_active = 1))
       GROUP BY f.ne_code, f.sku_code, s.season_code, s.season_year, s.start_date_jst, s.end_date_jst
       ORDER BY ${orderCol} DESC, f.sku_code ASC
       LIMIT ?
