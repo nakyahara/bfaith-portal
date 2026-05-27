@@ -31,18 +31,21 @@
     .panel h2 { font-size: .95em; margin: 0 0 10px; color: #24292e; }
 
     .chart-wrap { width: 100%; overflow-x: auto; }
-    svg.chart { width: 100%; max-width: 100%; height: 220px; display: block; }
-    svg.chart .bar { fill: #06C755; }
+    svg.chart { width: 100%; max-width: 100%; height: 360px; display: block; }
+    svg.chart .bar-sales  { fill: #06C755; }
+    svg.chart .bar-profit { fill: #f59e0b; }
     svg.chart .line { stroke: #0969da; stroke-width: 2; fill: none; }
     svg.chart .dot { fill: #0969da; }
     svg.chart .axis { stroke: #d0d7de; }
-    svg.chart text { font-size: 10px; fill: #586069; }
+    svg.chart text { font-size: 11px; fill: #586069; }
 
     .top5 { display: flex; flex-direction: column; gap: 6px; }
+    /* TOP5 横棒: bar-track が flex:1 で残り幅を取り、内側 bar が width:% で実際の比率 (2026-05-27 fix) */
     .top5-row { display: flex; align-items: center; gap: 8px; font-size: .85em; }
-    .top5-row .name { width: 50%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .top5-row .bar { flex: 1; height: 14px; background: #f59e0b; border-radius: 2px; }
-    .top5-row .val { color: #586069; font-size: .78em; min-width: 60px; text-align: right; }
+    .top5-row .name { width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .top5-row .bar-track { flex: 1; height: 14px; background: #f6f8fa; border-radius: 2px; overflow: hidden; }
+    .top5-row .bar-track .bar { height: 100%; background: #f59e0b; border-radius: 2px; transition: width .2s; }
+    .top5-row .val { color: #24292e; font-size: .85em; min-width: 70px; text-align: right; font-weight: 600; }
 
     table { width: 100%; border-collapse: collapse; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.06); font-size: .85em; }
     th, td { padding: 6px 10px; text-align: left; border-bottom: 1px solid #eaecef; }
@@ -193,17 +196,24 @@ async function loadMonthly() {
   try {
     const rows = await fetchJson('/apps/sales-analytics-linegift/api/dashboard/monthly-trend');
     if (!rows || rows.length === 0) { wrap.innerHTML = '<div class="empty">月次データなし</div>'; return; }
-    const rawMaxSales = Math.max(...rows.map((r) => Number(r.sales_jpy_incl) || 0), 1);
-    const rawMaxProfit = Math.max(...rows.map((r) => Number(r.gross_profit_jpy_incl) || 0), 1);
-    const maxSales = niceTickMax(rawMaxSales);
-    const maxProfit = niceTickMax(rawMaxProfit);
-    const W = Math.max(rows.length * 80, 480);
-    const H = 280;
-    const padL = 70, padR = 70, padB = 36, padT = 24;
+    // 2026-05-27 中原さん指摘: 売上/粗利は同一スケール (同じ左軸)、粗利率を右軸 % で表示する
+    const rawMaxAmount = Math.max(
+      ...rows.map((r) => Number(r.sales_jpy_incl) || 0),
+      ...rows.map((r) => Number(r.gross_profit_jpy_incl) || 0),
+      1,
+    );
+    const rawMaxRate = Math.max(...rows.map((r) => Number(r.gross_margin_rate) || 0), 0.01);
+    const maxAmount = niceTickMax(rawMaxAmount);
+    // 粗利率は % スケール、最大値の 1.2 倍を上限に切り上げ (上に余白を確保)
+    const maxRatePct = Math.max(5, Math.ceil(rawMaxRate * 100 * 1.2 / 5) * 5);
+    const W = Math.max(rows.length * 90, 540);
+    const H = 360;
+    const padL = 78, padR = 78, padB = 40, padT = 36;
     const innerW = W - padL - padR;
     const innerH = H - padT - padB;
-    const bw = innerW / rows.length * 0.55;
-    const gap = innerW / rows.length * 0.45;
+    // 月幅を半分に分けて棒を 2 本横並びにする
+    const slotW = innerW / rows.length;
+    const bw = slotW * 0.34;
     let svg = `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg">`;
 
     // Y軸グリッド + 目盛り (5分割)
@@ -211,46 +221,60 @@ async function loadMonthly() {
     for (let i = 0; i <= yTicks; i++) {
       const y = padT + innerH * (1 - i / yTicks);
       svg += `<line x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}" stroke="#eaecef" stroke-width="1" />`;
-      // 左軸ラベル (売上、緑系)
-      const salesVal = maxSales * i / yTicks;
-      svg += `<text x="${padL - 6}" y="${y + 3}" text-anchor="end" fill="#06C755">${fmtJpy(salesVal)}</text>`;
-      // 右軸ラベル (粗利、青系)
-      const profitVal = maxProfit * i / yTicks;
-      svg += `<text x="${W - padR + 6}" y="${y + 3}" text-anchor="start" fill="#0969da">${fmtJpy(profitVal)}</text>`;
+      // 左軸ラベル (金額: 売上+粗利 共通スケール)
+      const amountVal = maxAmount * i / yTicks;
+      svg += `<text x="${padL - 6}" y="${y + 4}" text-anchor="end" fill="#586069">${fmtJpy(amountVal)}</text>`;
+      // 右軸ラベル (粗利率 %)
+      const ratePct = maxRatePct * i / yTicks;
+      svg += `<text x="${W - padR + 6}" y="${y + 4}" text-anchor="start" fill="#0969da">${ratePct.toFixed(0)}%</text>`;
     }
 
     // X軸線
     svg += `<line class="axis" x1="${padL}" y1="${H - padB}" x2="${W - padR}" y2="${H - padB}" stroke-width="1.5" />`;
 
-    // 棒 (売上) + 月ラベルのみ (数値は左軸目盛り / ホバー title で読む、2026-05-27 中原さん指摘で衝突回避)
+    // 棒 (売上=緑 / 粗利=橙) を月ごとに横並びで描画
     rows.forEach((r, i) => {
-      const x = padL + i * (bw + gap) + gap / 2;
-      const h = innerH * ((Number(r.sales_jpy_incl) || 0) / maxSales);
-      const y = H - padB - h;
-      svg += `<rect class="bar" x="${x}" y="${y}" width="${bw}" height="${h}"><title>${escapeHtml(r.year_month)}
+      const slotX = padL + i * slotW;
+      const center = slotX + slotW / 2;
+      const xSales  = center - bw - 1;
+      const xProfit = center + 1;
+      const hSales  = innerH * ((Number(r.sales_jpy_incl) || 0) / maxAmount);
+      const hProfit = innerH * ((Number(r.gross_profit_jpy_incl) || 0) / maxAmount);
+      const ySales  = H - padB - hSales;
+      const yProfit = H - padB - hProfit;
+      const title = `${escapeHtml(r.year_month)}
 売上: ${fmtJpy(r.sales_jpy_incl)}
 粗利: ${fmtJpy(r.gross_profit_jpy_incl)}
 注文: ${fmtInt(r.orders)}
-粗利率: ${fmtPct(r.gross_margin_rate)}</title></rect>`;
-      // X 軸 月ラベル
-      svg += `<text x="${x + bw/2}" y="${H - padB + 16}" text-anchor="middle">${escapeHtml(r.year_month)}</text>`;
+粗利率: ${fmtPct(r.gross_margin_rate)}`;
+      svg += `<rect class="bar-sales"  x="${xSales}"  y="${ySales}"  width="${bw}" height="${hSales}"><title>${title}</title></rect>`;
+      svg += `<rect class="bar-profit" x="${xProfit}" y="${yProfit}" width="${bw}" height="${hProfit}"><title>${title}</title></rect>`;
+      // X軸 月ラベル
+      svg += `<text x="${center}" y="${H - padB + 18}" text-anchor="middle">${escapeHtml(r.year_month)}</text>`;
     });
 
-    // 折線 (粗利) + 点のみ (数値ラベルは廃止、衝突回避)
+    // 折線 (粗利率) + 点 (右軸 % スケール)
+    // ratio はプロット領域内にクランプ (赤字月 / 想定外の高粗利率で SVG 外にはみ出すのを防ぐ、Codex Round 1 medium)
     let pathD = '';
     rows.forEach((r, i) => {
-      const x = padL + i * (bw + gap) + gap / 2 + bw / 2;
-      const y = H - padB - innerH * ((Number(r.gross_profit_jpy_incl) || 0) / maxProfit);
+      const slotX = padL + i * slotW;
+      const x = slotX + slotW / 2;
+      const ratePct = (Number(r.gross_margin_rate) || 0) * 100;
+      const ratio = Math.min(1, Math.max(0, ratePct / maxRatePct));
+      const y = H - padB - innerH * ratio;
       pathD += (i === 0 ? 'M' : 'L') + x + ' ' + y + ' ';
-      svg += `<circle class="dot" cx="${x}" cy="${y}" r="4"><title>粗利: ${fmtJpy(r.gross_profit_jpy_incl)}</title></circle>`;
+      svg += `<circle class="dot" cx="${x}" cy="${y}" r="4"><title>${escapeHtml(r.year_month)} 粗利率: ${fmtPct(r.gross_margin_rate)}</title></circle>`;
     });
     svg += `<path class="line" d="${pathD.trim()}" />`;
 
-    // 凡例
-    svg += `<rect x="${padL}" y="${padT - 14}" width="10" height="10" fill="#06C755" />`;
-    svg += `<text x="${padL + 14}" y="${padT - 5}" fill="#06C755">売上 (左軸)</text>`;
-    svg += `<circle cx="${padL + 110}" cy="${padT - 9}" r="4" fill="#0969da" />`;
-    svg += `<text x="${padL + 120}" y="${padT - 5}" fill="#0969da">粗利 (右軸)</text>`;
+    // 凡例 (上部)
+    svg += `<rect x="${padL}"        y="${padT - 22}" width="12" height="12" fill="#06C755" />`;
+    svg += `<text x="${padL + 16}"   y="${padT - 12}" fill="#06C755">売上 (左軸)</text>`;
+    svg += `<rect x="${padL + 110}"  y="${padT - 22}" width="12" height="12" fill="#f59e0b" />`;
+    svg += `<text x="${padL + 126}"  y="${padT - 12}" fill="#f59e0b">粗利 (左軸)</text>`;
+    svg += `<line x1="${padL + 220}" y1="${padT - 16}" x2="${padL + 242}" y2="${padT - 16}" stroke="#0969da" stroke-width="2" />`;
+    svg += `<circle cx="${padL + 231}" cy="${padT - 16}" r="4" fill="#0969da" />`;
+    svg += `<text x="${padL + 248}"  y="${padT - 12}" fill="#0969da">粗利率 (右軸 %)</text>`;
 
     svg += '</svg>';
     wrap.innerHTML = svg;
@@ -275,7 +299,7 @@ async function loadTop5() {
       const titleAttr = `${label}\n粗利: ${fmtJpy(r.gross_profit_jpy_incl)}\n売上: ${fmtJpy(r.sales_amount_jpy_incl)}\n件数: ${fmtInt(r.units)}\n粗利率: ${fmtPct(r.gross_margin_rate)}`;
       return `<div class="top5-row" title="${escapeHtml(titleAttr)}">
         <div class="name" title="${escapeHtml(label)}">${escapeHtml(label)}</div>
-        <div class="bar" style="width:${pct.toFixed(1)}%"></div>
+        <div class="bar-track"><div class="bar" style="width:${pct.toFixed(1)}%"></div></div>
         <div class="val">💰 ${fmtJpy(r.gross_profit_jpy_incl)}</div>
       </div>`;
     }).join('');
@@ -298,10 +322,10 @@ async function loadPriceBand() {
       <thead><tr>
         <th>価格帯</th>
         <th class="num">SKU 数</th>
-        <th class="num"><span style="color:#0969da">■</span> 件数</th>
-        <th class="num"><span style="color:#06C755">■</span> 売上</th>
-        <th class="num"><span style="color:#f59e0b">■</span> 粗利</th>
-        <th class="num">粗利率</th>
+        <th class="num"><span style="color:#0969da">■</span> 件数 (件)</th>
+        <th class="num"><span style="color:#06C755">■</span> 売上 (円)</th>
+        <th class="num"><span style="color:#f59e0b">■</span> 粗利 (円)</th>
+        <th class="num">粗利率 (%)</th>
       </tr></thead>
       <tbody>${rows.map((r) => {
         const oBar = (Number(r.orders_count) || 0) / maxOrders * 60;
@@ -335,11 +359,11 @@ async function loadRanking() {
     const headers = [
       { id: 'rank',  label: '#', sortable: false, num: true },
       { id: 'name',  label: '商品', sortable: false },
-      { id: 'price', label: '単価', sortable: false, num: true },
-      { id: 'sales', label: '売上', sortable: true,  num: true },
-      { id: 'units', label: '件数', sortable: true,  num: true },
-      { id: 'profit',label: '粗利', sortable: true,  num: true },
-      { id: 'gm',    label: '粗利率', sortable: false, num: true },
+      { id: 'price', label: '単価 (円)', sortable: false, num: true },
+      { id: 'sales', label: '売上 (円)', sortable: true,  num: true },
+      { id: 'units', label: '件数 (件)', sortable: true,  num: true },
+      { id: 'profit',label: '粗利 (円)', sortable: true,  num: true },
+      { id: 'gm',    label: '粗利率 (%)', sortable: false, num: true },
     ];
     wrap.innerHTML = `<table>
       <thead><tr>${headers.map((h) => {
