@@ -273,3 +273,170 @@ export function listPriceBands() {
     ORDER BY sort_order
   `).all();
 }
+
+// ─────────────────────────────────────────────────────────────────
+// A-6 ダッシュボード API 用関数
+// ─────────────────────────────────────────────────────────────────
+
+const VALID_WINDOWS = new Set([7, 28, 90]);
+
+function validateWindow(w) {
+  const n = Number(w);
+  if (!VALID_WINDOWS.has(n)) throw new Error(`invalid window: ${w} (must be 7/28/90)`);
+  return n;
+}
+
+/**
+ * ① KPI summary (期間別、materialized から)
+ * 同一 as_of_date_jst 契約 (Codex Round 5 High-1) に従い、各 window で最新 as_of の行を返す
+ */
+export function getKpiSummary(windowDays) {
+  const w = validateWindow(windowDays);
+  const db = getDB();
+  return db.prepare(`
+    SELECT total_sales_jpy_incl, total_orders, avg_order_value_jpy_incl,
+           total_gross_profit_jpy_incl, gross_margin_rate, as_of_date_jst, synced_at
+    FROM f_linegift_kpi_summary_daily
+    WHERE window_days = ?
+      AND as_of_date_jst = (SELECT MAX(as_of_date_jst) FROM f_linegift_kpi_summary_daily WHERE window_days = ?)
+  `).get(w, w) || null;
+}
+
+/**
+ * ② 月別トレンド (過去12ヶ月、view 直 SELECT)
+ */
+export function getMonthlyTrend() {
+  const db = getDB();
+  return db.prepare(`SELECT * FROM v_linegift_monthly_trend`).all();
+}
+
+/**
+ * ③④ 商品ランキング (filters: window/genre/price_band_master/season_code/sort/limit)
+ * 集計データは f_linegift_sku_perf_daily (期間別 materialized) から取得、
+ * m_product_classifications JOIN で genre/price_band master を取得。
+ * season_code 指定時は d_gift_season_occurrences と f_linegift_finance_sku_daily_v1 から
+ * 期間内売上を集計し直す (window_days 無視、シーン期間が優先)。
+ */
+export function getSkuRanking(filters = {}) {
+  const db = getDB();
+  const limit = Math.max(1, Math.min(500, Number(filters.limit) || 100));
+  const sort = ['sales', 'units', 'profit'].includes(filters.sort) ? filters.sort : 'sales';
+  const orderCol = { sales: 'sales_amount_jpy_incl', units: 'units', profit: 'gross_profit_jpy_incl' }[sort];
+
+  if (filters.season_code) {
+    // シーン期間集計 (最新の season_year を採用、または明示指定可)
+    const seasonRows = db.prepare(`
+      SELECT
+        f.ne_code, f.sku_code,
+        SUM(f.units_net_sold) AS units,
+        ROUND(SUM(f.gross_sales_jpy_incl)) AS sales_amount_jpy_incl,
+        ROUND(SUM(f.variable_margin_jpy_incl)) AS gross_profit_jpy_incl,
+        SUM(f.order_count) AS orders,
+        c.main_genre_id, c.main_genre_name, c.price_band_code_master,
+        s.season_code, s.season_year, s.start_date_jst, s.end_date_jst
+      FROM d_gift_season_occurrences s
+      JOIN f_linegift_finance_sku_daily_v1 f
+        ON f.date_jst BETWEEN s.start_date_jst AND s.end_date_jst
+      LEFT JOIN m_product_classifications c
+        ON c.ne_product_code = f.ne_code
+       AND COALESCE(c.ne_sku_code, '') = COALESCE(f.sku_code, '')
+       AND c.is_active = 1 AND c.valid_to IS NULL
+      WHERE s.is_active = 1
+        AND s.season_code = ?
+        AND s.season_year = COALESCE(?, (SELECT MAX(season_year) FROM d_gift_season_occurrences WHERE season_code = ?))
+        AND (? IS NULL OR c.main_genre_id = ?)
+        AND (? IS NULL OR c.price_band_code_master = ?)
+      GROUP BY f.ne_code, f.sku_code, c.main_genre_id, c.main_genre_name, c.price_band_code_master,
+               s.season_code, s.season_year, s.start_date_jst, s.end_date_jst
+      ORDER BY ${orderCol} DESC, f.sku_code ASC
+      LIMIT ?
+    `).all(
+      filters.season_code,
+      filters.season_year || null, filters.season_code,
+      filters.genre || null, filters.genre || null,
+      filters.price_band || null, filters.price_band || null,
+      limit
+    );
+    return seasonRows;
+  }
+
+  // 通常の window_days ベース
+  const w = validateWindow(filters.window);
+  return db.prepare(`
+    SELECT
+      p.ne_code, p.sku_code,
+      p.units, p.sales_amount_jpy_incl, p.gross_profit_jpy_incl, p.orders, p.active_days,
+      p.velocity_per_active_day, p.velocity_per_calendar_day,
+      p.unit_price_jpy_incl_raw, p.unit_price_jpy_incl_display,
+      p.gross_margin_rate,
+      c.main_genre_id, c.main_genre_name, c.price_band_code_master,
+      r.velocity_index_vs_median, r.velocity_percent_rank
+    FROM f_linegift_sku_perf_daily p
+    LEFT JOIN m_product_classifications c
+      ON c.ne_product_code = p.ne_code
+     AND COALESCE(c.ne_sku_code, '') = COALESCE(p.sku_code, '')
+     AND c.is_active = 1 AND c.valid_to IS NULL
+    LEFT JOIN v_linegift_sku_relative_score_90d r
+      ON r.ne_code = p.ne_code AND COALESCE(r.sku_code, '') = COALESCE(p.sku_code, '')
+    WHERE p.window_days = ?
+      AND p.as_of_date_jst = (SELECT MAX(as_of_date_jst) FROM f_linegift_sku_perf_daily WHERE window_days = ?)
+      AND (? IS NULL OR c.main_genre_id = ?)
+      AND (? IS NULL OR c.price_band_code_master = ?)
+    ORDER BY ${orderCol} DESC, p.sku_code ASC
+    LIMIT ?
+  `).all(
+    w, w,
+    filters.genre || null, filters.genre || null,
+    filters.price_band || null, filters.price_band || null,
+    limit
+  );
+}
+
+/**
+ * 価格帯テーブル (sales 系、materialized から)
+ */
+export function getPriceBandSummaryByWindow(windowDays) {
+  const w = validateWindow(windowDays);
+  const db = getDB();
+  return db.prepare(`
+    SELECT *
+    FROM f_linegift_price_band_summary_daily
+    WHERE window_days = ?
+      AND as_of_date_jst = (SELECT MAX(as_of_date_jst) FROM f_linegift_price_band_summary_daily WHERE window_days = ?)
+    ORDER BY sort_order
+  `).all(w, w);
+}
+
+/**
+ * ジャンル一覧 (フィルタ用、最新 active 分類で使われている genre のみ)
+ */
+export function listAvailableGenres() {
+  const db = getDB();
+  return db.prepare(`
+    SELECT c.main_genre_id, c.main_genre_name, COUNT(*) AS sku_count
+    FROM m_product_classifications c
+    WHERE c.is_active = 1 AND c.valid_to IS NULL
+      AND c.main_genre_id IS NOT NULL
+    GROUP BY c.main_genre_id, c.main_genre_name
+    ORDER BY sku_count DESC, c.main_genre_name
+  `).all();
+}
+
+/**
+ * シーン一覧 (フィルタ用、active な m_gift_seasons の最新 season_year occurrence 付き)
+ */
+export function listAvailableSeasons() {
+  const db = getDB();
+  return db.prepare(`
+    SELECT
+      s.season_code, s.season_name,
+      MAX(o.season_year) AS latest_year,
+      (SELECT start_date_jst FROM d_gift_season_occurrences WHERE season_code = s.season_code ORDER BY season_year DESC LIMIT 1) AS latest_start,
+      (SELECT end_date_jst   FROM d_gift_season_occurrences WHERE season_code = s.season_code ORDER BY season_year DESC LIMIT 1) AS latest_end
+    FROM m_gift_seasons s
+    LEFT JOIN d_gift_season_occurrences o ON o.season_code = s.season_code
+    WHERE s.is_active = 1 AND s.valid_to IS NULL
+    GROUP BY s.season_code, s.season_name
+    ORDER BY s.priority DESC, s.season_name
+  `).all();
+}

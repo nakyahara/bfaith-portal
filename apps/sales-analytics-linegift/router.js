@@ -20,6 +20,8 @@ import { fileURLToPath } from 'url';
 import {
   listUnmapped, setManualMapping, setManualClassification,
   getCounters, listPriceBands, lookupNeProduct,
+  getKpiSummary, getMonthlyTrend, getSkuRanking,
+  getPriceBandSummaryByWindow, listAvailableGenres, listAvailableSeasons,
 } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -30,7 +32,11 @@ function currentUser(req) {
 }
 
 // ─── UI ───
+// デフォルトはダッシュボード画面 (A-6)、手動分類画面は /classify で別ルート
 router.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'views', 'dashboard.html'));
+});
+router.get('/classify', (req, res) => {
   res.sendFile(path.join(__dirname, 'views', 'index.html'));
 });
 
@@ -106,6 +112,67 @@ router.post('/api/classification', (req, res) => {
     res.json({ ok: true, result: r });
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// ─── A-6 ダッシュボード API ───
+
+router.get('/api/dashboard/kpi-summary', (req, res) => {
+  try {
+    const w = Number(req.query.window) || 90;
+    res.json({ ok: true, result: getKpiSummary(w) });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+router.get('/api/dashboard/monthly-trend', (req, res) => {
+  try {
+    res.json({ ok: true, result: getMonthlyTrend() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+router.get('/api/dashboard/sku-ranking', (req, res) => {
+  try {
+    const filters = {
+      window: req.query.window ? Number(req.query.window) : 90,
+      genre: req.query.genre || null,
+      price_band: req.query.price_band || null,
+      season_code: req.query.season_code || null,
+      season_year: req.query.season_year ? Number(req.query.season_year) : null,
+      sort: req.query.sort || 'sales',
+      limit: req.query.limit ? Number(req.query.limit) : 100,
+    };
+    res.json({ ok: true, result: getSkuRanking(filters) });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+router.get('/api/dashboard/price-band-summary', (req, res) => {
+  try {
+    const w = Number(req.query.window) || 90;
+    res.json({ ok: true, result: getPriceBandSummaryByWindow(w) });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+router.get('/api/dashboard/genres', (req, res) => {
+  try {
+    res.json({ ok: true, result: listAvailableGenres() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+router.get('/api/dashboard/seasons', (req, res) => {
+  try {
+    res.json({ ok: true, result: listAvailableSeasons() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
