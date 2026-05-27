@@ -61,22 +61,24 @@ export function getSkuRanking(filters = {}) {
   const orderCol = { sales: 'sales_amount_jpy_incl', units: 'units', profit: 'gross_profit_jpy_incl' }[sort];
 
   if (filters.season_code) {
-    // シーン期間集計 (最新 season_year を採用、または明示指定可)
+    // シーン期間集計: window モード同様に mirror_products.送料 を引いた粗利を採用 (2026-05-27 中原さん指摘)
     return db.prepare(`
       SELECT
         f.ne_code, f.sku_code, MAX(f.product_name) AS product_name,
         SUM(f.units_net_sold) AS units,
         ROUND(SUM(f.gross_sales_jpy_incl)) AS sales_amount_jpy_incl,
-        ROUND(SUM(f.variable_margin_jpy_incl)) AS gross_profit_jpy_incl,
+        -- 送料引き後粗利 (Amazon FBM と同パターン、mirror_products.送料 × units を税込換算で引く)
+        ROUND(SUM(f.variable_margin_jpy_incl) - SUM(f.units_net_sold * COALESCE(p.送料, 0) * (1 + COALESCE(p.消費税率, 0.1)))) AS gross_profit_jpy_incl,
         SUM(f.order_count) AS orders,
         CASE WHEN COALESCE(SUM(f.units_net_sold), 0) = 0 THEN 0
              ELSE ROUND(SUM(f.gross_sales_jpy_incl) * 1.0 / SUM(f.units_net_sold)) END AS unit_price_jpy_incl_display,
         CASE WHEN COALESCE(SUM(f.gross_sales_jpy_incl), 0) = 0 THEN 0
-             ELSE ROUND(SUM(f.variable_margin_jpy_incl) * 1.0 / SUM(f.gross_sales_jpy_incl), 4) END AS gross_margin_rate,
+             ELSE ROUND((SUM(f.variable_margin_jpy_incl) - SUM(f.units_net_sold * COALESCE(p.送料, 0) * (1 + COALESCE(p.消費税率, 0.1)))) * 1.0 / SUM(f.gross_sales_jpy_incl), 4) END AS gross_margin_rate,
         s.season_code, s.season_year, s.start_date_jst, s.end_date_jst
       FROM mart_gift_season_occurrences s
       JOIN mirror_linegift_finance_sku_daily f
         ON f.date_jst BETWEEN s.start_date_jst AND s.end_date_jst
+      LEFT JOIN mirror_products p ON p.商品コード = f.ne_code
       WHERE s.is_active = 1
         AND s.season_code = ?
         AND s.season_year = COALESCE(?, (SELECT MAX(season_year) FROM mart_gift_season_occurrences WHERE season_code = ? AND is_active = 1))

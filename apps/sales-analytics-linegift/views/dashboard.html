@@ -174,39 +174,85 @@ async function loadKpi() {
   }
 }
 
+// 「キリの良い」値を返す (Y軸目盛り用、5分割になる単位を選ぶ)
+function niceTickMax(value) {
+  if (value <= 0) return 1;
+  const exp = Math.floor(Math.log10(value));
+  const f = value / Math.pow(10, exp);
+  let nice;
+  if (f <= 1)        nice = 1;
+  else if (f <= 2)   nice = 2;
+  else if (f <= 2.5) nice = 2.5;
+  else if (f <= 5)   nice = 5;
+  else               nice = 10;
+  return nice * Math.pow(10, exp);
+}
+
 async function loadMonthly() {
   const wrap = document.getElementById('monthly-chart');
   try {
     const rows = await fetchJson('/apps/sales-analytics-linegift/api/dashboard/monthly-trend');
     if (!rows || rows.length === 0) { wrap.innerHTML = '<div class="empty">月次データなし</div>'; return; }
-    const maxSales = Math.max(...rows.map((r) => Number(r.sales_jpy_incl) || 0), 1);
-    const maxProfit = Math.max(...rows.map((r) => Number(r.gross_profit_jpy_incl) || 0), 1);
-    const W = Math.max(rows.length * 60, 400);
-    const H = 200;
-    const padL = 40, padR = 40, padB = 28, padT = 10;
+    const rawMaxSales = Math.max(...rows.map((r) => Number(r.sales_jpy_incl) || 0), 1);
+    const rawMaxProfit = Math.max(...rows.map((r) => Number(r.gross_profit_jpy_incl) || 0), 1);
+    const maxSales = niceTickMax(rawMaxSales);
+    const maxProfit = niceTickMax(rawMaxProfit);
+    const W = Math.max(rows.length * 80, 480);
+    const H = 280;
+    const padL = 70, padR = 70, padB = 36, padT = 24;
     const innerW = W - padL - padR;
     const innerH = H - padT - padB;
-    const bw = innerW / rows.length * 0.6;
-    const gap = innerW / rows.length * 0.4;
+    const bw = innerW / rows.length * 0.55;
+    const gap = innerW / rows.length * 0.45;
     let svg = `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg">`;
-    svg += `<line class="axis" x1="${padL}" y1="${H - padB}" x2="${W - padR}" y2="${H - padB}" />`;
+
+    // Y軸グリッド + 目盛り (5分割)
+    const yTicks = 5;
+    for (let i = 0; i <= yTicks; i++) {
+      const y = padT + innerH * (1 - i / yTicks);
+      svg += `<line x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}" stroke="#eaecef" stroke-width="1" />`;
+      // 左軸ラベル (売上、緑系)
+      const salesVal = maxSales * i / yTicks;
+      svg += `<text x="${padL - 6}" y="${y + 3}" text-anchor="end" fill="#06C755">${fmtJpy(salesVal)}</text>`;
+      // 右軸ラベル (粗利、青系)
+      const profitVal = maxProfit * i / yTicks;
+      svg += `<text x="${W - padR + 6}" y="${y + 3}" text-anchor="start" fill="#0969da">${fmtJpy(profitVal)}</text>`;
+    }
+
+    // X軸線
+    svg += `<line class="axis" x1="${padL}" y1="${H - padB}" x2="${W - padR}" y2="${H - padB}" stroke-width="1.5" />`;
+
+    // 棒 (売上) + 各バー上に数値ラベル
     rows.forEach((r, i) => {
       const x = padL + i * (bw + gap) + gap / 2;
       const h = innerH * ((Number(r.sales_jpy_incl) || 0) / maxSales);
       const y = H - padB - h;
-      svg += `<rect class="bar" x="${x}" y="${y}" width="${bw}" height="${h}"><title>${escapeHtml(r.year_month)}\n売上 ${fmtJpy(r.sales_jpy_incl)}</title></rect>`;
-      svg += `<text x="${x + bw/2}" y="${H - padB + 14}" text-anchor="middle">${escapeHtml(r.year_month.slice(2))}</text>`;
+      svg += `<rect class="bar" x="${x}" y="${y}" width="${bw}" height="${h}"><title>${escapeHtml(r.year_month)}\n売上: ${fmtJpy(r.sales_jpy_incl)}\n粗利: ${fmtJpy(r.gross_profit_jpy_incl)}\n注文: ${fmtInt(r.orders)}\n粗利率: ${fmtPct(r.gross_margin_rate)}</title></rect>`;
+      // 棒の上に売上数値
+      if (h > 12) {
+        svg += `<text x="${x + bw/2}" y="${y - 4}" text-anchor="middle" fill="#06C755" font-weight="600">${fmtJpy(r.sales_jpy_incl)}</text>`;
+      }
+      svg += `<text x="${x + bw/2}" y="${H - padB + 16}" text-anchor="middle">${escapeHtml(r.year_month)}</text>`;
     });
+
+    // 折線 (粗利) + 各点に数値ラベル
     let pathD = '';
     rows.forEach((r, i) => {
       const x = padL + i * (bw + gap) + gap / 2 + bw / 2;
       const y = H - padB - innerH * ((Number(r.gross_profit_jpy_incl) || 0) / maxProfit);
       pathD += (i === 0 ? 'M' : 'L') + x + ' ' + y + ' ';
-      svg += `<circle class="dot" cx="${x}" cy="${y}" r="3"><title>粗利 ${fmtJpy(r.gross_profit_jpy_incl)}</title></circle>`;
+      svg += `<circle class="dot" cx="${x}" cy="${y}" r="4"><title>粗利: ${fmtJpy(r.gross_profit_jpy_incl)}</title></circle>`;
+      // 各点に粗利数値
+      svg += `<text x="${x}" y="${y - 8}" text-anchor="middle" fill="#0969da" font-weight="600">${fmtJpy(r.gross_profit_jpy_incl)}</text>`;
     });
     svg += `<path class="line" d="${pathD.trim()}" />`;
-    svg += `<text x="${padL}" y="${padT + 10}" fill="#06C755">売上(棒)</text>`;
-    svg += `<text x="${padL + 80}" y="${padT + 10}" fill="#0969da">粗利(折線)</text>`;
+
+    // 凡例
+    svg += `<rect x="${padL}" y="${padT - 14}" width="10" height="10" fill="#06C755" />`;
+    svg += `<text x="${padL + 14}" y="${padT - 5}" fill="#06C755">売上 (左軸)</text>`;
+    svg += `<circle cx="${padL + 110}" cy="${padT - 9}" r="4" fill="#0969da" />`;
+    svg += `<text x="${padL + 120}" y="${padT - 5}" fill="#0969da">粗利 (右軸)</text>`;
+
     svg += '</svg>';
     wrap.innerHTML = svg;
   } catch (e) {
