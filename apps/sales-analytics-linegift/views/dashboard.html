@@ -268,15 +268,19 @@ async function loadTop5() {
     const rows = await fetchJson('/apps/sales-analytics-linegift/api/dashboard/sku-ranking?' + qs.toString());
     if (!rows || rows.length === 0) { wrap.innerHTML = '<div class="empty">データなし</div>'; return; }
     const max = Math.max(...rows.map((r) => Number(r.gross_profit_jpy_incl) || 0), 1);
-    wrap.innerHTML = rows.map((r) => {
+    // 「粗利」ランキングであることを凡例で明示 (TOP5 が何の指標か分かりにくい問題への対応、2026-05-27 中原さん指摘)
+    let html = '<div style="font-size:.78em; color:#586069; margin-bottom:6px;">並び順: 💰 粗利額 (現フィルタの上位 5 件)</div>';
+    html += rows.map((r) => {
       const pct = (Number(r.gross_profit_jpy_incl) || 0) / max * 100;
       const label = r.product_name || r.sku_code;
-      return `<div class="top5-row">
+      const titleAttr = `${label}\n粗利: ${fmtJpy(r.gross_profit_jpy_incl)}\n売上: ${fmtJpy(r.sales_amount_jpy_incl)}\n件数: ${fmtInt(r.units)}\n粗利率: ${fmtPct(r.gross_margin_rate)}`;
+      return `<div class="top5-row" title="${escapeHtml(titleAttr)}">
         <div class="name" title="${escapeHtml(label)}">${escapeHtml(label)}</div>
         <div class="bar" style="width:${pct.toFixed(1)}%"></div>
-        <div class="val">${fmtJpy(r.gross_profit_jpy_incl)}</div>
+        <div class="val">💰 ${fmtJpy(r.gross_profit_jpy_incl)}</div>
       </div>`;
     }).join('');
+    wrap.innerHTML = html;
   } catch (e) {
     wrap.innerHTML = `<div class="empty">読込失敗: ${escapeHtml(e.message)}</div>`;
   }
@@ -287,19 +291,30 @@ async function loadPriceBand() {
   try {
     const rows = await fetchJson(`/apps/sales-analytics-linegift/api/dashboard/price-band-summary?window=${state.window}`);
     if (!rows || rows.length === 0) { wrap.innerHTML = '<div class="empty">データなし</div>'; return; }
-    const maxSales = Math.max(...rows.map((r) => Number(r.sales_jpy_incl) || 0), 1);
+    // 2026-05-27 中原さん指摘: 右端の単一バーが何を示すか不明だった → 件数/売上/粗利 列内に色分けバーを inline 表示
+    const maxOrders = Math.max(...rows.map((r) => Number(r.orders_count) || 0), 1);
+    const maxSales  = Math.max(...rows.map((r) => Number(r.sales_jpy_incl) || 0), 1);
+    const maxProfit = Math.max(...rows.map((r) => Number(r.gross_profit_jpy_incl) || 0), 1);
     wrap.innerHTML = `<table>
-      <thead><tr><th>価格帯</th><th class="num">SKU 数</th><th class="num">件数</th><th class="num">売上</th><th class="num">粗利</th><th class="num">粗利率</th><th></th></tr></thead>
+      <thead><tr>
+        <th>価格帯</th>
+        <th class="num">SKU 数</th>
+        <th class="num"><span style="color:#0969da">■</span> 件数</th>
+        <th class="num"><span style="color:#06C755">■</span> 売上</th>
+        <th class="num"><span style="color:#f59e0b">■</span> 粗利</th>
+        <th class="num">粗利率</th>
+      </tr></thead>
       <tbody>${rows.map((r) => {
-        const pct = (Number(r.sales_jpy_incl) || 0) / maxSales * 100;
+        const oBar = (Number(r.orders_count) || 0) / maxOrders * 60;
+        const sBar = (Number(r.sales_jpy_incl) || 0) / maxSales * 60;
+        const pBar = (Number(r.gross_profit_jpy_incl) || 0) / maxProfit * 60;
         return `<tr>
           <td>${escapeHtml(r.band_label)}</td>
           <td class="num">${fmtInt(r.sku_count)}</td>
-          <td class="num">${fmtInt(r.orders_count)}</td>
-          <td class="num">${fmtJpy(r.sales_jpy_incl)}</td>
-          <td class="num">${fmtJpy(r.gross_profit_jpy_incl)}</td>
+          <td class="num">${fmtInt(r.orders_count)} <span class="bar-cell units" style="width:${oBar.toFixed(0)}px"></span></td>
+          <td class="num">${fmtJpy(r.sales_jpy_incl)} <span class="bar-cell" style="width:${sBar.toFixed(0)}px"></span></td>
+          <td class="num">${fmtJpy(r.gross_profit_jpy_incl)} <span class="bar-cell profit" style="width:${pBar.toFixed(0)}px"></span></td>
           <td class="num">${fmtPct(r.gross_margin_rate)}</td>
-          <td><span class="bar-cell" style="width:${pct.toFixed(1)}%"></span></td>
         </tr>`;
       }).join('')}</tbody>
     </table>`;
