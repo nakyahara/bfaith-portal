@@ -325,6 +325,8 @@ export function getSkuRanking(filters = {}) {
 
   if (filters.season_code) {
     // シーン期間集計 (最新の season_year を採用、または明示指定可)
+    // Codex Round 1 A-6 High 反映: UI が描画する unit_price_jpy_incl_display と gross_margin_rate を
+    // シーン分岐でも返す。NULLIF で 0 除算保護、UI と列契約を揃える。
     const seasonRows = db.prepare(`
       SELECT
         f.ne_code, f.sku_code,
@@ -332,6 +334,12 @@ export function getSkuRanking(filters = {}) {
         ROUND(SUM(f.gross_sales_jpy_incl)) AS sales_amount_jpy_incl,
         ROUND(SUM(f.variable_margin_jpy_incl)) AS gross_profit_jpy_incl,
         SUM(f.order_count) AS orders,
+        -- 単価 (実売平均): SUM(sales) / SUM(units)、0 除算は NULLIF で NULL → UI 側で '-' 表示
+        CASE WHEN COALESCE(SUM(f.units_net_sold), 0) = 0 THEN 0
+             ELSE ROUND(SUM(f.gross_sales_jpy_incl) * 1.0 / SUM(f.units_net_sold)) END AS unit_price_jpy_incl_display,
+        -- 粗利率: variable_margin / gross_sales、0 除算は 0 に丸める
+        CASE WHEN COALESCE(SUM(f.gross_sales_jpy_incl), 0) = 0 THEN 0
+             ELSE ROUND(SUM(f.variable_margin_jpy_incl) * 1.0 / SUM(f.gross_sales_jpy_incl), 4) END AS gross_margin_rate,
         c.main_genre_id, c.main_genre_name, c.price_band_code_master,
         s.season_code, s.season_year, s.start_date_jst, s.end_date_jst
       FROM d_gift_season_occurrences s
