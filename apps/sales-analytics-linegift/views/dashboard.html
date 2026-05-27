@@ -73,13 +73,27 @@
   </div>
 
   <div class="filters">
-    <label>期間:
+    <label>期間モード:
+      <select id="filter-mode">
+        <option value="window" selected>ウィンドウ (直近 N 日)</option>
+        <option value="month">月別</option>
+        <option value="custom">カスタム期間</option>
+      </select>
+    </label>
+    <label id="mode-window-wrap">期間:
       <select id="filter-window">
         <option value="7">過去 7 日</option>
         <option value="28">過去 28 日</option>
         <option value="90" selected>過去 90 日</option>
       </select>
     </label>
+    <label id="mode-month-wrap" style="display:none;">月:
+      <select id="filter-month"><option value="">読み込み中…</option></select>
+    </label>
+    <span id="mode-custom-wrap" style="display:none;">
+      <label>開始: <input id="filter-from" type="date" /></label>
+      <label>終了: <input id="filter-to" type="date" /></label>
+    </span>
     <label>シーン:
       <select id="filter-season"><option value="">指定なし</option></select>
     </label>
@@ -146,20 +160,56 @@ async function fetchJson(url, opts) {
 }
 
 const state = {
+  mode: QS().get('mode') || 'window', // 'window' | 'month' | 'custom'
   window: Number(QS().get('window')) || 90,
+  month: QS().get('month') || '',
+  from: QS().get('from') || '',
+  to: QS().get('to') || '',
   season: QS().get('season') || '',
   sort: QS().get('sort') || 'sales',
 };
 
 function syncFiltersFromState() {
+  document.getElementById('filter-mode').value = state.mode;
   document.getElementById('filter-window').value = String(state.window);
+  document.getElementById('filter-month').value = state.month;
+  document.getElementById('filter-from').value = state.from;
+  document.getElementById('filter-to').value = state.to;
   document.getElementById('filter-season').value = state.season;
+  document.getElementById('mode-window-wrap').style.display = state.mode === 'window' ? '' : 'none';
+  document.getElementById('mode-month-wrap').style.display  = state.mode === 'month'  ? '' : 'none';
+  document.getElementById('mode-custom-wrap').style.display = state.mode === 'custom' ? '' : 'none';
+  // シーン絞り込みは window モードでのみ意味を持つ (シーン期間集計が経路として別、
+  // 月別/カスタム期間と組み合わせるとサイレント無視されるため UI で disable: Codex Round 1 medium)
+  const seasonSel = document.getElementById('filter-season');
+  seasonSel.disabled = state.mode !== 'window';
+  seasonSel.title = state.mode === 'window' ? '' : 'シーン絞り込みは「ウィンドウ」モードでのみ利用可能です';
+}
+
+// 現フィルタ状態から API 共通 query を生成 (sku-ranking/kpi/price-band 共用)
+function buildPeriodQS() {
+  const qs = new URLSearchParams();
+  if (state.mode === 'month' && state.month) {
+    qs.set('mode', 'month'); qs.set('month', state.month);
+  } else if (state.mode === 'custom' && state.from && state.to) {
+    qs.set('mode', 'custom'); qs.set('from', state.from); qs.set('to', state.to);
+  } else {
+    qs.set('window', String(state.window));
+  }
+  return qs;
+}
+
+// 現フィルタが API 呼び出し可能か (custom で日付未入力など)
+function periodReady() {
+  if (state.mode === 'month')  return Boolean(state.month);
+  if (state.mode === 'custom') return Boolean(state.from && state.to && state.from <= state.to);
+  return true;
 }
 
 async function loadKpi() {
   const ids = { sales: 'kpi-sales', orders: 'kpi-orders', aov: 'kpi-aov', profit: 'kpi-profit', rate: 'kpi-rate' };
   try {
-    const r = await fetchJson(`/apps/sales-analytics-linegift/api/dashboard/kpi-summary?window=${state.window}`);
+    const r = await fetchJson(`/apps/sales-analytics-linegift/api/dashboard/kpi-summary?${buildPeriodQS().toString()}`);
     if (!r) {
       Object.values(ids).forEach((id) => document.getElementById(id).textContent = '(データなし)');
       document.getElementById('as-of-info').textContent = '';
@@ -286,7 +336,8 @@ async function loadMonthly() {
 async function loadTop5() {
   const wrap = document.getElementById('top5-list');
   try {
-    const qs = new URLSearchParams({ window: state.window, sort: 'profit', limit: 5 });
+    const qs = buildPeriodQS();
+    qs.set('sort', 'profit'); qs.set('limit', '5');
     if (state.season) qs.set('season_code', state.season);
     const rows = await fetchJson('/apps/sales-analytics-linegift/api/dashboard/sku-ranking?' + qs.toString());
     if (!rows || rows.length === 0) { wrap.innerHTML = '<div class="empty">データなし</div>'; return; }
@@ -312,7 +363,7 @@ async function loadTop5() {
 async function loadPriceBand() {
   const wrap = document.getElementById('price-band-table');
   try {
-    const rows = await fetchJson(`/apps/sales-analytics-linegift/api/dashboard/price-band-summary?window=${state.window}`);
+    const rows = await fetchJson(`/apps/sales-analytics-linegift/api/dashboard/price-band-summary?${buildPeriodQS().toString()}`);
     if (!rows || rows.length === 0) { wrap.innerHTML = '<div class="empty">データなし</div>'; return; }
     // 2026-05-27 中原さん指摘: 右端の単一バーが何を示すか不明だった → 件数/売上/粗利 列内に色分けバーを inline 表示
     const maxOrders = Math.max(...rows.map((r) => Number(r.orders_count) || 0), 1);
@@ -349,7 +400,8 @@ async function loadPriceBand() {
 async function loadRanking() {
   const wrap = document.getElementById('ranking-table');
   try {
-    const qs = new URLSearchParams({ window: state.window, sort: state.sort, limit: 500 });
+    const qs = buildPeriodQS();
+    qs.set('sort', state.sort); qs.set('limit', '500');
     if (state.season) qs.set('season_code', state.season);
     const rows = await fetchJson('/apps/sales-analytics-linegift/api/dashboard/sku-ranking?' + qs.toString());
     if (!rows || rows.length === 0) { wrap.innerHTML = '<div class="empty">データなし</div>'; return; }
@@ -403,6 +455,24 @@ async function loadRanking() {
   }
 }
 
+async function loadMonths() {
+  try {
+    const months = await fetchJson('/apps/sales-analytics-linegift/api/dashboard/available-months');
+    const sel = document.getElementById('filter-month');
+    const cur = state.month;
+    if (!months || months.length === 0) {
+      sel.innerHTML = '<option value="">(データなし)</option>';
+      return;
+    }
+    // 既定: state.month 指定が無ければ最新月をセット
+    if (!cur) state.month = months[0];
+    sel.innerHTML = months.map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join('');
+    sel.value = state.month;
+  } catch (e) {
+    document.getElementById('filter-month').innerHTML = `<option value="">読込失敗</option>`;
+  }
+}
+
 async function loadSeasons() {
   try {
     const seasons = await fetchJson('/apps/sales-analytics-linegift/api/dashboard/seasons');
@@ -427,7 +497,26 @@ async function loadBuildStatus() {
   } catch (e) { /* swallow */ }
 }
 
+function clearPanelsForPendingPeriod() {
+  // custom 期間が未確定のうちは既存値が残ると条件不整合に見えるため、
+  // KPI/グラフ/表すべてプレースホルダ表示にクリア (Codex Round 1 medium)
+  const placeholder = '<div class="empty">期間を確定してください</div>';
+  ['kpi-sales','kpi-orders','kpi-aov','kpi-profit','kpi-rate'].forEach((id) => {
+    document.getElementById(id).textContent = '-';
+  });
+  document.getElementById('top5-list').innerHTML       = placeholder;
+  document.getElementById('price-band-table').innerHTML = placeholder;
+  document.getElementById('ranking-table').innerHTML    = placeholder;
+}
+
 function refreshAll() {
+  if (!periodReady()) {
+    document.getElementById('as-of-info').textContent = '期間を入力してください (開始 ≤ 終了)';
+    clearPanelsForPendingPeriod();
+    // 月別トレンドは期間モードに依存しないので継続表示
+    loadMonthly();
+    return;
+  }
   loadKpi();
   loadMonthly();
   loadTop5();
@@ -436,14 +525,31 @@ function refreshAll() {
   loadBuildStatus();
 }
 
+document.getElementById('filter-mode').addEventListener('change', (ev) => {
+  state.mode = ev.target.value; setQS('mode', state.mode === 'window' ? '' : state.mode);
+  // window 以外に切替時はシーン絞り込みを解除 (黙って無視されるのを防ぐ、Codex Round 1)
+  if (state.mode !== 'window' && state.season) { state.season = ''; setQS('season', ''); }
+  syncFiltersFromState(); refreshAll();
+});
 document.getElementById('filter-window').addEventListener('change', (ev) => {
   state.window = Number(ev.target.value); setQS('window', state.window); refreshAll();
+});
+document.getElementById('filter-month').addEventListener('change', (ev) => {
+  state.month = ev.target.value; setQS('month', state.month); refreshAll();
+});
+document.getElementById('filter-from').addEventListener('change', (ev) => {
+  state.from = ev.target.value; setQS('from', state.from); refreshAll();
+});
+document.getElementById('filter-to').addEventListener('change', (ev) => {
+  state.to = ev.target.value; setQS('to', state.to); refreshAll();
 });
 document.getElementById('filter-season').addEventListener('change', (ev) => {
   state.season = ev.target.value; setQS('season', state.season); refreshAll();
 });
 document.getElementById('reset-btn').addEventListener('click', () => {
-  state.window = 90; state.season = ''; state.sort = 'sales';
+  state.mode = 'window'; state.window = 90;
+  state.month = ''; state.from = ''; state.to = '';
+  state.season = ''; state.sort = 'sales';
   history.replaceState(null, '', location.pathname);
   syncFiltersFromState();
   refreshAll();
@@ -462,7 +568,11 @@ document.getElementById('build-btn').addEventListener('click', async (ev) => {
   }
 });
 
-loadSeasons().then(refreshAll);
+// 起動時: 月一覧 + シーン一覧を並行ロード → state を整えてから一括 refresh
+Promise.all([loadMonths(), loadSeasons()]).then(() => {
+  syncFiltersFromState();
+  refreshAll();
+});
 </script>
 </body>
 </html>

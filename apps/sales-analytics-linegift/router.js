@@ -20,8 +20,9 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { spawn } from 'node:child_process';
 import {
-  getKpiSummary, getMonthlyTrend, getSkuRanking,
-  getPriceBandSummary, listSeasons, getBuildStatus,
+  getKpiSummary, getKpiSummaryByPeriod, getMonthlyTrend, getSkuRanking,
+  getPriceBandSummary, getPriceBandSummaryByPeriod, listSeasons, listAvailableMonths,
+  getBuildStatus, resolvePeriod,
 } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -35,6 +36,11 @@ router.get('/', (req, res) => {
 // ─── API ───
 router.get('/api/dashboard/kpi-summary', (req, res) => {
   try {
+    const period = resolvePeriod(req.query);
+    if (period) {
+      res.json({ ok: true, result: getKpiSummaryByPeriod(period.from, period.to) });
+      return;
+    }
     const w = Number(req.query.window) || 90;
     res.json({ ok: true, result: getKpiSummary(w) });
   } catch (e) {
@@ -52,12 +58,21 @@ router.get('/api/dashboard/monthly-trend', (req, res) => {
 
 router.get('/api/dashboard/sku-ranking', (req, res) => {
   try {
+    const period = resolvePeriod(req.query);
+    // period (month/custom) と season_code の同時指定は経路が異なり共存できないため 400 で reject
+    // (UI 側でも season は disable しているが API 直叩き対策、Codex Round 1 medium)
+    if (period && req.query.season_code) {
+      res.status(400).json({ ok: false, error: 'season_code と period (month/custom) は同時指定できません。シーン絞り込みは window モード専用です' });
+      return;
+    }
     const filters = {
       window: req.query.window ? Number(req.query.window) : 90,
       season_code: req.query.season_code || null,
       season_year: req.query.season_year ? Number(req.query.season_year) : null,
       sort: req.query.sort || 'sales',
       limit: req.query.limit ? Number(req.query.limit) : 500,
+      from: period?.from || null,
+      to: period?.to || null,
     };
     res.json({ ok: true, result: getSkuRanking(filters) });
   } catch (e) {
@@ -67,10 +82,23 @@ router.get('/api/dashboard/sku-ranking', (req, res) => {
 
 router.get('/api/dashboard/price-band-summary', (req, res) => {
   try {
+    const period = resolvePeriod(req.query);
+    if (period) {
+      res.json({ ok: true, result: getPriceBandSummaryByPeriod(period.from, period.to) });
+      return;
+    }
     const w = Number(req.query.window) || 90;
     res.json({ ok: true, result: getPriceBandSummary(w) });
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+router.get('/api/dashboard/available-months', (req, res) => {
+  try {
+    res.json({ ok: true, result: listAvailableMonths() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
