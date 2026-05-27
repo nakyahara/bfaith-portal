@@ -82,13 +82,28 @@ function yyyymmdd(d) {
 /**
  * 指定年・月の第 N 曜日 (weekday: 0=Sun ... 6=Sat) を Date オブジェクトで返す
  * 全て UTC ベースで計算 (JST 壁時計と同じ扱い)
+ * Codex Round 1 Medium 反映: month/nth/weekday の範囲検証 + 結果が同月内に収まるかチェック
  */
 function nthWeekdayOfMonth(year, month1to12, weekday0Sun, nth) {
+  if (!Number.isInteger(month1to12) || month1to12 < 1 || month1to12 > 12) {
+    throw new Error(`invalid month: ${month1to12} (must be 1-12)`);
+  }
+  if (!Number.isInteger(weekday0Sun) || weekday0Sun < 0 || weekday0Sun > 6) {
+    throw new Error(`invalid weekday: ${weekday0Sun} (must be 0-6, 0=Sun)`);
+  }
+  if (!Number.isInteger(nth) || nth < 1 || nth > 5) {
+    throw new Error(`invalid nth: ${nth} (must be 1-5)`);
+  }
   const first = new Date(Date.UTC(year, month1to12 - 1, 1));
   const firstDow = first.getUTCDay();
   const delta = (weekday0Sun - firstDow + 7) % 7;
   const day = 1 + delta + (nth - 1) * 7;
-  return new Date(Date.UTC(year, month1to12 - 1, day));
+  const result = new Date(Date.UTC(year, month1to12 - 1, day));
+  // 「5月の第5月曜」のように月内に存在しないケースを検知 (月跨ぎ防止)
+  if (result.getUTCMonth() !== month1to12 - 1) {
+    throw new Error(`nth=${nth} weekday=${weekday0Sun} does not exist in year=${year} month=${month1to12}`);
+  }
+  return result;
 }
 
 function addDays(date, days) {
@@ -96,8 +111,13 @@ function addDays(date, days) {
 }
 
 function parseMmDd(mmdd) {
-  const [m, d] = mmdd.split('-').map(Number);
-  if (!m || !d) throw new Error(`invalid mmdd: ${mmdd}`);
+  const parts = String(mmdd || '').split('-');
+  if (parts.length !== 2) throw new Error(`invalid mmdd: '${mmdd}' (expected 'MM-DD')`);
+  const m = Number(parts[0]);
+  const d = Number(parts[1]);
+  // Codex Round 1 Medium 反映: 範囲検証 (1-12 / 1-31)
+  if (!Number.isInteger(m) || m < 1 || m > 12) throw new Error(`invalid mmdd month: '${mmdd}' (m=${m})`);
+  if (!Number.isInteger(d) || d < 1 || d > 31) throw new Error(`invalid mmdd day: '${mmdd}' (d=${d})`);
   return { m, d };
 }
 

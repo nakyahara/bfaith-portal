@@ -5,8 +5,10 @@
 -- m_gift_seasons の rule_json を年単位で展開してここに INSERT。
 -- 集計時は f_linegift_finance_sku_daily_v1.date_jst BETWEEN start_date_jst AND end_date_jst で絞り込む。
 --
--- year 跨ぎ (NEW_YEAR_CARD: 12-26 〜 翌 01-03) は anchor_date_jst の年で season_year を固定する
--- (Codex Round 3 Medium 反映)。
+-- year 跨ぎ (NEW_YEAR_CARD: 12-26 〜 翌 01-03) は m_gift_seasons.rule_json.year_anchor
+-- ('start' or 'end') で season_year を固定する (Codex Round 3 Medium 反映)。
+-- 例: NEW_YEAR_CARD は year_anchor='end' → 2025-12-26〜2026-01-03 を season_year=2026 として登録。
+-- anchor_date_jst は NTH_WEEKDAY 系のみ設定、CUSTOM/FIXED_RANGE は NULL。
 
 CREATE TABLE IF NOT EXISTS d_gift_season_occurrences (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
