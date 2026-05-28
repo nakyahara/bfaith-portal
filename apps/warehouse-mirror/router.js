@@ -658,6 +658,27 @@ function getLinegiftFinanceInsert(db) {
   return b.linegiftFinanceInsert;
 }
 
+// LINEギフト v1.2 (PR-H): orders sync (集計用 subset)
+function getLinegiftOrdersInsert(db) {
+  const b = getStmtBundle(db);
+  if (!b.linegiftOrdersInsert) {
+    b.linegiftOrdersInsert = db.prepare(`
+      INSERT OR REPLACE INTO mirror_linegift_orders (
+        order_id, status, sku_code, parent_item_code,
+        selling_price, fee,
+        bought_at_jst, bought_date_jst, received_date_jst,
+        is_frozen_after_horizon, source_run_id, synced_at
+      ) VALUES (
+        @order_id, @status, @sku_code, @parent_item_code,
+        @selling_price, @fee,
+        @bought_at_jst, @bought_date_jst, @received_date_jst,
+        @is_frozen_after_horizon, @source_run_id, @synced_at
+      )
+    `);
+  }
+  return b.linegiftOrdersInsert;
+}
+
 function getQoo10FinanceInsert(db) {
   const b = getStmtBundle(db);
   if (!b.qoo10FinanceInsert) {
@@ -886,6 +907,15 @@ const ENTITY_REGISTRY = {
     clear_meta_key: 'clear_linegift_finance_dates',
     getInsertStmt: getLinegiftFinanceInsert,
     normalizeRow: (r) => normalizeLinegiftFinanceRow(r),
+  },
+  // LINEギフト v1.2 (PR-H): orders 集計用 subset (PII 除外)
+  // 90日 frozen horizon 越えの行は miniPC 側でも UPDATE 禁止なので no_clear で OK
+  linegift_orders: {
+    contract_version: 1,
+    mirror_table: 'mirror_linegift_orders',
+    clear_strategy: 'no_clear',
+    getInsertStmt: getLinegiftOrdersInsert,
+    normalizeRow: (r) => normalizeLinegiftOrdersRow(r),
   },
   qoo10_finance_sku_daily: {
     contract_version: 1,
@@ -1416,6 +1446,28 @@ function normalizeLinegiftFinanceRow(r) {
     built_at: r.built_at || new Date().toISOString(),
     source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,
     synced_at: r.synced_at,
+  };
+}
+
+// LINEギフト v1.2 (PR-H): orders 集計用 subset normalize
+// ★ PII 列 (user_name, address_*, delivery_*, sku_name, parent_item_name) は受け取らない
+function normalizeLinegiftOrdersRow(r) {
+  if (!r.order_id) throw new Error('linegift_orders: order_id is required');
+  if (!r.bought_at_jst) throw new Error(`linegift_orders: bought_at_jst is required (order_id=${r.order_id})`);
+  if (!r.bought_date_jst) throw new Error(`linegift_orders: bought_date_jst is required (order_id=${r.order_id})`);
+  return {
+    order_id: String(r.order_id),
+    status: r.status ?? null,
+    sku_code: r.sku_code ?? null,
+    parent_item_code: r.parent_item_code ?? null,
+    selling_price: r.selling_price ?? null,
+    fee: r.fee ?? null,
+    bought_at_jst: r.bought_at_jst,
+    bought_date_jst: r.bought_date_jst,
+    received_date_jst: r.received_date_jst ?? null,
+    is_frozen_after_horizon: r.is_frozen_after_horizon ?? 0,
+    source_run_id: r.source_run_id ?? null,
+    synced_at: r.synced_at || new Date().toISOString(),
   };
 }
 
