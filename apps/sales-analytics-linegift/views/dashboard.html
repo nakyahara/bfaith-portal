@@ -123,8 +123,12 @@
     /* 商品トレンド (PR-J) */
     .sku-trend-header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
     .sku-trend-header label { font-size: .85em; color: #586069; }
-    .sku-trend-header select { padding: 4px 8px; font-size: .92em; border: 1px solid #d0d7de; border-radius: 4px; min-width: 320px; max-width: 100%; }
+    .sku-trend-header input[list], .sku-trend-header select { padding: 4px 8px; font-size: .92em; border: 1px solid #d0d7de; border-radius: 4px; min-width: 360px; max-width: 100%; }
+    .sku-trend-meta { font-size: .85em; color: #24292e; margin-bottom: 6px; font-weight: 500; }
     .sku-trend-empty { color: #586069; padding: 24px; text-align: center; font-size: .9em; }
+    .sku-trend-table-wrap { max-height: 320px; overflow-y: auto; margin-top: 12px; }
+    .sku-trend-table-wrap table { font-size: .85em; }
+    .sku-trend-table-wrap thead th { position: sticky; top: 0; background: #f6f8fa; z-index: 1; }
 
     /* トレンド粒度トグル (2026-05-28、中原さん追加リクエスト) */
     .trend-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
@@ -284,14 +288,23 @@
     <div class="panel" style="margin-bottom: 16px;">
       <h2>📈 商品別トレンド (個別 SKU、現フィルタ期間)</h2>
       <div class="sku-trend-header">
-        <label for="sku-trend-select">商品:</label>
-        <select id="sku-trend-select"><option value="">読み込み中…</option></select>
-        <div style="font-size:.78em; color:#586069;">並び順は商品ランキング (現モード) と一致 — Top 50 が選択候補</div>
+        <label for="sku-trend-input">商品:</label>
+        <input id="sku-trend-input" list="sku-trend-options" placeholder="商品名 / SKU を入力 (検索可)" autocomplete="off" />
+        <datalist id="sku-trend-options"></datalist>
+        <span style="font-size:.78em; color:#586069;">候補はランキング Top 500 (現フィルタ)</span>
+        <div class="trend-granularity" id="sku-trend-granularity" role="tablist" aria-label="商品別グラフ粒度" style="margin-left:auto">
+          <button type="button" data-gran="inherit" class="active" role="tab">全体に従う</button>
+          <button type="button" data-gran="day"     role="tab">日</button>
+          <button type="button" data-gran="week"    role="tab">週</button>
+          <button type="button" data-gran="month"   role="tab">月</button>
+        </div>
       </div>
+      <div class="sku-trend-meta" id="sku-trend-meta"></div>
       <div class="chart-wrap" id="sku-trend-chart-wrap">
         <div id="sku-trend-chart"><div class="sku-trend-empty">商品を選択してください</div></div>
         <div class="chart-tooltip" id="sku-trend-tooltip" role="tooltip"></div>
       </div>
+      <div class="sku-trend-table-wrap" id="sku-trend-table-wrap"></div>
     </div>
 
     <div class="panel" style="margin-bottom: 16px;">
@@ -391,7 +404,13 @@ const state = {
   tab: (['overview', 'products', 'season-price', 'time'].includes(QS().get('tab')) ? QS().get('tab') : 'overview'),
   // 商品別トレンド (PR-J): 選択中の SKU
   skuTrend: QS().get('sku_trend') || '',
+  // 商品別トレンド専用粒度: 'inherit' (全体トレンドに従う、デフォルト) / 'day' / 'week' / 'month'
+  skuTrendGranularity: (['inherit', 'day', 'week', 'month'].includes(QS().get('sku_trend_gran')) ? QS().get('sku_trend_gran') : 'inherit'),
 };
+
+// SKU 候補リスト (ランキング Top 500 から populate)
+let skuCandidateMap = new Map(); // key: display label, value: { sku_code, product_name }
+let skuCodeToLabel = new Map();  // key: sku_code, value: display label (input 側に出すラベル)
 
 // 前期比デルタを各 KPI カードに反映 (kpi-comparison レスポンスから)
 // 売上/件数/粗利系: deltaPct (-1.0 〜 +N) を「▲X.X% (前期比)」表示。プラス=緑、マイナス=赤
@@ -904,40 +923,64 @@ function refreshAll() {
   loadBuildStatus();
 }
 
-// 商品ランキング結果から SKU セレクタを populate (PR-J)
+// 商品ランキング結果から SKU 候補 datalist を populate (PR-J + 2026-05-28 検索可能化)
 function populateSkuTrendSelect() {
-  const sel = document.getElementById('sku-trend-select');
-  if (!sel) return;
-  // 現状の ranking テーブルから上位 50 個を抽出
-  const rows = Array.from(document.querySelectorAll('#ranking-table tbody tr')).slice(0, 50);
-  if (rows.length === 0) {
-    sel.innerHTML = '<option value="">対象 SKU なし</option>';
-    return;
-  }
-  const options = rows.map((tr, i) => {
+  const input = document.getElementById('sku-trend-input');
+  const dl = document.getElementById('sku-trend-options');
+  if (!input || !dl) return;
+  // 現状の ranking テーブルから Top 500 を抽出 (backend limit=500、防御的に slice で再保証)
+  const rows = Array.from(document.querySelectorAll('#ranking-table tbody tr')).slice(0, 500);
+  skuCandidateMap = new Map();
+  skuCodeToLabel = new Map();
+  rows.forEach((tr, i) => {
     const cells = tr.cells;
-    if (!cells || cells.length < 2) return null;
-    // 2 列目が商品名、title 属性に sku_code が入る (loadRanking で<td title="${escapeHtml(r.sku_code)}">)
+    if (!cells || cells.length < 2) return;
     const nameCell = cells[1];
     const skuCode = nameCell.getAttribute('title') || '';
     const name = nameCell.textContent || skuCode;
-    if (!skuCode) return null;
-    return { skuCode, name, rank: i + 1 };
-  }).filter(Boolean);
+    if (!skuCode) return;
+    // datalist option には商品名 (検索しやすい) を表示、追跡用に SKU を併記
+    const label = `${name} [${skuCode}] (#${i + 1})`;
+    skuCandidateMap.set(label, { skuCode, name });
+    if (!skuCodeToLabel.has(skuCode)) skuCodeToLabel.set(skuCode, label);
+  });
+  if (skuCandidateMap.size === 0) {
+    dl.innerHTML = '';
+    input.placeholder = '対象 SKU なし';
+    return;
+  }
+  // datalist 反映 (option の value がそのまま input.value に流れ込む — 商品名で検索可能)
+  dl.innerHTML = Array.from(skuCandidateMap.keys()).map((label) => `<option value="${escapeHtml(label)}"></option>`).join('');
+  input.placeholder = '商品名 / SKU を入力 (検索可)';
 
-  sel.innerHTML = '<option value="">商品を選択…</option>' + options.map((o) =>
-    `<option value="${escapeHtml(o.skuCode)}">${escapeHtml(`#${o.rank} ${o.name}`)}</option>`,
-  ).join('');
-
-  if (state.skuTrend && options.some((o) => o.skuCode === state.skuTrend)) {
-    sel.value = state.skuTrend;
-    loadSkuTrend(state.skuTrend);
-  } else if (state.skuTrend) {
-    // 選択中 SKU が現フィルタ Top 50 に無い場合は強制的に option 追加して維持
-    sel.insertAdjacentHTML('beforeend',
-      `<option value="${escapeHtml(state.skuTrend)}" selected>${escapeHtml(`(現フィルタ外) ${state.skuTrend}`)}</option>`);
+  // state の skuTrend が現候補にあれば input 値に反映
+  if (state.skuTrend) {
+    const label = skuCodeToLabel.get(state.skuTrend);
+    if (label) {
+      input.value = label;
+    } else {
+      // Top 500 外の SKU — 強制的に datalist に追加して維持 (ラベルは SKU コードのみ)
+      const fallbackLabel = `(現フィルタ外) ${state.skuTrend}`;
+      skuCandidateMap.set(fallbackLabel, { skuCode: state.skuTrend, name: state.skuTrend });
+      skuCodeToLabel.set(state.skuTrend, fallbackLabel);
+      dl.insertAdjacentHTML('afterbegin', `<option value="${escapeHtml(fallbackLabel)}"></option>`);
+      input.value = fallbackLabel;
+    }
     loadSkuTrend(state.skuTrend);
   }
+}
+
+// input → 選択 SKU 解決 (datalist の選択 or 直接入力)
+function resolveSkuFromInput(rawValue) {
+  if (!rawValue) return '';
+  const v = String(rawValue).trim();
+  // 1. datalist option ラベル完全一致
+  if (skuCandidateMap.has(v)) return skuCandidateMap.get(v).skuCode;
+  // 2. [SKU_CODE] パターン抽出
+  const m = v.match(/\[([^\]]+)\]/);
+  if (m) return m[1].trim();
+  // 3. 入力そのものを SKU として扱う (深リンク時の SKU 直指定対応)
+  return v;
 }
 
 // 商品別トレンドグラフ (PR-J、SKU 個別時系列)
@@ -954,15 +997,24 @@ async function loadSkuTrend(skuCode) {
   try {
     const qs = buildPeriodQS();
     if (state.season && state.mode === 'window') qs.set('season_code', state.season);
-    if (state.granularity && state.granularity !== 'auto') qs.set('granularity', state.granularity);
+    // 粒度: SKU 専用トグルが 'inherit' なら全体トレンドの granularity に従う
+    // それ以外は SKU 専用の指定を優先 (2026-05-28 中原さん「日週月で切替えれるように」)
+    const skuGran = state.skuTrendGranularity === 'inherit' ? state.granularity : state.skuTrendGranularity;
+    if (skuGran && skuGran !== 'auto') qs.set('granularity', skuGran);
     qs.set('sku_code', skuCode);
     const r = await fetchJson('/apps/sales-analytics-linegift/api/dashboard/sku-trend?' + qs.toString());
     if (!r || !r.rows || r.rows.length === 0) {
       wrap.innerHTML = '<div class="sku-trend-empty">期間内データなし</div>';
+      document.getElementById('sku-trend-meta').textContent = '';
+      document.getElementById('sku-trend-table-wrap').innerHTML = '';
       return;
     }
-    const rows = r.rows.map((x) => ({ ...x, year_month: x.bucket }));
-    // 既存 loadMonthly と同じ描画ロジックを使う (タイトルだけ商品名に変更)
+    // 商品名・期間・粒度を SVG の外 (HTML div) に出す (2026-05-28 凡例と被ってた問題の修正)
+    const gLabel = { day: '日次', week: '週次', month: '月次' }[r.granularity] || r.granularity;
+    document.getElementById('sku-trend-meta').textContent =
+      `📦 ${r.product_name} — ${gLabel} (${r.from} 〜 ${r.to}、${r.rows.length} 期間)`;
+
+    const rows = r.rows;
     const rawMaxAmount = Math.max(
       ...rows.map((x) => Number(x.sales_jpy_incl) || 0),
       ...rows.map((x) => Number(x.gross_profit_jpy_incl) || 0),
@@ -973,7 +1025,7 @@ async function loadSkuTrend(skuCode) {
     const maxRatePct = Math.max(5, Math.ceil(rawMaxRate * 100 * 1.2 / 5) * 5);
     const W = Math.max(rows.length * 60, 540);
     const H = 320;
-    const padL = 78, padR = 78, padB = 40, padT = 36;
+    const padL = 78, padR = 78, padB = 40, padT = 28;
     const innerW = W - padL - padR;
     const innerH = H - padT - padB;
     const slotW = innerW / rows.length;
@@ -1008,17 +1060,55 @@ async function loadSkuTrend(skuCode) {
       svg += `<circle class="dot" cx="${cx}" cy="${cy}" r="3" />`;
     });
     svg += `<path class="line" d="${pathD.trim()}" />`;
-    // 凡例
-    svg += `<rect x="${padL}" y="${padT - 22}" width="10" height="10" fill="#06C755" />`;
-    svg += `<text x="${padL + 14}" y="${padT - 13}" fill="#06C755">売上 (左軸)</text>`;
-    svg += `<rect x="${padL + 100}" y="${padT - 22}" width="10" height="10" fill="#f59e0b" />`;
-    svg += `<text x="${padL + 114}" y="${padT - 13}" fill="#f59e0b">粗利 (左軸)</text>`;
-    svg += `<circle cx="${padL + 210}" cy="${padT - 17}" r="3" fill="#0969da" />`;
-    svg += `<text x="${padL + 218}" y="${padT - 13}" fill="#0969da">粗利率 (右軸 %)</text>`;
-    // 商品名
-    svg += `<text x="${W - padR}" y="${padT - 13}" text-anchor="end" fill="#24292e" font-weight="600">${escapeHtml(r.product_name)} (${escapeHtml(r.granularity)})</text>`;
+    // 凡例のみ SVG 内 (商品名は外に出したので被らない)
+    svg += `<rect x="${padL}" y="${padT - 18}" width="10" height="10" fill="#06C755" />`;
+    svg += `<text x="${padL + 14}" y="${padT - 9}" fill="#06C755">売上 (左軸)</text>`;
+    svg += `<rect x="${padL + 100}" y="${padT - 18}" width="10" height="10" fill="#f59e0b" />`;
+    svg += `<text x="${padL + 114}" y="${padT - 9}" fill="#f59e0b">粗利 (左軸)</text>`;
+    svg += `<circle cx="${padL + 210}" cy="${padT - 13}" r="3" fill="#0969da" />`;
+    svg += `<text x="${padL + 218}" y="${padT - 9}" fill="#0969da">粗利率 (右軸 %)</text>`;
     svg += '</svg>';
     wrap.innerHTML = svg;
+
+    // 数値表 (2026-05-28 中原さん「表にもしてほしい」)
+    // 新しい bucket が下に来るよう降順 + 合計行
+    const sorted = rows.slice().sort((a, b) => (b.bucket || '').localeCompare(a.bucket || ''));
+    const totals = rows.reduce((acc, x) => ({
+      sales:  acc.sales  + (Number(x.sales_jpy_incl) || 0),
+      profit: acc.profit + (Number(x.gross_profit_jpy_incl) || 0),
+      orders: acc.orders + (Number(x.orders) || 0),
+      units:  acc.units  + (Number(x.units) || 0),
+    }), { sales: 0, profit: 0, orders: 0, units: 0 });
+    const totalRate = totals.sales === 0 ? 0 : totals.profit / totals.sales;
+    document.getElementById('sku-trend-table-wrap').innerHTML = `<table>
+      <thead><tr>
+        <th>期間 (${escapeHtml(gLabel)})</th>
+        <th class="num">売上 (円)</th>
+        <th class="num">粗利 (円)</th>
+        <th class="num">粗利率</th>
+        <th class="num">注文 (件)</th>
+        <th class="num">販売数 (個)</th>
+      </tr></thead>
+      <tbody>
+        <tr style="background:#eef2f6; font-weight:600;">
+          <td>合計</td>
+          <td class="num">${fmtJpy(totals.sales)}</td>
+          <td class="num" style="color:${totals.profit < 0 ? '#cf222e' : '#24292e'}">${fmtJpy(totals.profit)}</td>
+          <td class="num">${fmtPct(totalRate)}</td>
+          <td class="num">${fmtInt(totals.orders)}</td>
+          <td class="num">${fmtInt(totals.units)}</td>
+        </tr>
+        ${sorted.map((x) => `
+          <tr>
+            <td>${escapeHtml(x.bucket)}</td>
+            <td class="num">${fmtJpy(x.sales_jpy_incl)}</td>
+            <td class="num" style="color:${x.gross_profit_jpy_incl < 0 ? '#cf222e' : '#24292e'}">${fmtJpy(x.gross_profit_jpy_incl)}</td>
+            <td class="num">${fmtPct(x.gross_margin_rate)}</td>
+            <td class="num">${fmtInt(x.orders)}</td>
+            <td class="num">${fmtInt(x.units)}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table>`;
   } catch (e) {
     wrap.innerHTML = `<div class="sku-trend-empty">読込失敗: ${escapeHtml(e.message)}</div>`;
   }
@@ -1365,11 +1455,14 @@ document.getElementById('reset-btn').addEventListener('click', () => {
   state.top5Mode = 'profit';
   state.granularity = 'auto';
   state.skuTrend = '';
+  state.skuTrendGranularity = 'inherit';
   // tab は維持 (現在見ているタブを変えると驚き)
   history.replaceState(null, '', location.pathname + (state.tab === 'overview' ? '' : '?tab=' + state.tab));
+  document.getElementById('sku-trend-input').value = '';
   syncFiltersFromState();
   syncTop5ModeFromState();
   syncGranularityFromState();
+  syncSkuTrendGranularityFromState();
   refreshAll();
 });
 
@@ -1434,13 +1527,39 @@ document.querySelector('.tabs').addEventListener('click', (ev) => {
 });
 syncTabFromState();
 
-// 商品トレンド SKU セレクタ (PR-J)
-document.getElementById('sku-trend-select').addEventListener('change', (ev) => {
-  const v = ev.target.value || '';
-  state.skuTrend = v;
-  setQS('sku_trend', v);
-  loadSkuTrend(v);
+// 商品トレンド SKU 検索 input (PR-J + 2026-05-28 検索可能化)
+//   datalist 選択 / 直接入力どちらも対応、Enter / change で確定
+function applySkuTrendInput(rawValue) {
+  const skuCode = resolveSkuFromInput(rawValue);
+  if (skuCode === state.skuTrend) return;
+  state.skuTrend = skuCode;
+  setQS('sku_trend', skuCode);
+  loadSkuTrend(skuCode);
+}
+const skuInput = document.getElementById('sku-trend-input');
+skuInput.addEventListener('change', (ev) => applySkuTrendInput(ev.target.value));
+skuInput.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Enter') { ev.preventDefault(); applySkuTrendInput(ev.target.value); }
 });
+
+// 商品別トレンド専用粒度トグル (2026-05-28、中原さん「日週月で切替えれるように」)
+function syncSkuTrendGranularityFromState() {
+  document.querySelectorAll('#sku-trend-granularity button').forEach((b) => {
+    b.classList.toggle('active', b.dataset.gran === state.skuTrendGranularity);
+  });
+}
+document.getElementById('sku-trend-granularity').addEventListener('click', (ev) => {
+  const btn = ev.target.closest('button');
+  if (!btn) return;
+  const g = btn.dataset.gran;
+  if (!['inherit', 'day', 'week', 'month'].includes(g)) return;
+  if (g === state.skuTrendGranularity) return;
+  state.skuTrendGranularity = g;
+  setQS('sku_trend_gran', g === 'inherit' ? '' : g);
+  syncSkuTrendGranularityFromState();
+  if (state.skuTrend) loadSkuTrend(state.skuTrend);
+});
+syncSkuTrendGranularityFromState();
 document.getElementById('build-btn').addEventListener('click', async (ev) => {
   const btn = ev.target;
   btn.disabled = true; btn.textContent = '⏳ 起動中…';
