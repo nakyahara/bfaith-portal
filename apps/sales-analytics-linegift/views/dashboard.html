@@ -33,6 +33,19 @@
     .kpi-card .delta.flat { color: #586069; font-weight: 500; }
     .kpi-card .delta .prev { color: #8b95a1; font-weight: 400; font-size: .92em; margin-left: 4px; }
 
+    /* 曜日別サマリ (PR-G ⑧) */
+    .weekday-summary .legend { color: #586069; font-size: .78em; margin-bottom: 4px; }
+    .weekday-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; }
+    .weekday-cell { background: #fff; border: 1px solid #e1e4e8; border-radius: 6px; padding: 8px 6px; text-align: center; position: relative; overflow: hidden; }
+    .weekday-cell .heat { position: absolute; left: 0; top: 0; right: 0; bottom: 0; z-index: 0; }
+    .weekday-cell .content { position: relative; z-index: 1; }
+    .weekday-cell .dow { font-weight: 600; font-size: .9em; color: #24292e; }
+    .weekday-cell .sales { font-size: .78em; color: #586069; margin-top: 2px; }
+    .weekday-cell .rate { font-size: .72em; color: #586069; }
+    .weekday-cell.sun .dow { color: #cf222e; }
+    .weekday-cell.sat .dow { color: #0969da; }
+    .weekday-note { font-size: .75em; color: #8b95a1; margin-top: 6px; }
+
     /* シーン × 前年比較 (PR-F) */
     .season-compare .summary { display: flex; gap: 24px; margin-bottom: 10px; font-size: .9em; }
     .season-compare .summary .col { padding: 6px 12px; border-radius: 6px; background: #f6f8fa; }
@@ -189,7 +202,7 @@
 
   <div class="row-2">
     <div class="panel">
-      <h2>月別 売上 + 粗利 (過去 12 ヶ月)</h2>
+      <h2 id="monthly-chart-title">トレンド 売上 + 粗利</h2>
       <div class="chart-wrap">
         <div id="monthly-chart"><div class="loading">読み込み中…</div></div>
         <div class="chart-tooltip" id="monthly-tooltip" role="tooltip"></div>
@@ -203,6 +216,13 @@
       </div>
       <div class="top5" id="top5-list"><div class="loading">読み込み中…</div></div>
     </div>
+  </div>
+
+  <div class="panel weekday-summary" style="margin-bottom: 16px;">
+    <h2>📅 曜日別 売上 (現フィルタ期間)</h2>
+    <div class="legend">背景の青濃度 = 売上の高さ (期間内で正規化)</div>
+    <div id="weekday-grid"><div class="loading">読み込み中…</div></div>
+    <div class="weekday-note">※ 時間帯軸 (00-23 時) は raw_linegift_orders を Render mirror に追加同期した v1.2 で対応予定</div>
   </div>
 
   <div class="panel" style="margin-bottom: 16px;">
@@ -408,9 +428,25 @@ function niceTickMax(value) {
 
 async function loadMonthly() {
   const wrap = document.getElementById('monthly-chart');
+  const title = document.getElementById('monthly-chart-title');
   try {
-    const rows = await fetchJson('/apps/sales-analytics-linegift/api/dashboard/monthly-trend');
-    if (!rows || rows.length === 0) { wrap.innerHTML = '<div class="empty">月次データなし</div>'; return; }
+    // PR-G ⑥: 期間モードに連動した粒度自動切替 (day/week/month)
+    // 期間未確定時は monthly-trend 既存 view (過去 12ヶ月) にフォールバック
+    let trend, rows;
+    if (periodReady()) {
+      const qs = buildPeriodQS();
+      if (state.season && state.mode === 'window') qs.set('season_code', state.season);
+      trend = await fetchJson('/apps/sales-analytics-linegift/api/dashboard/trend?' + qs.toString());
+      rows = trend?.rows || [];
+      const gLabel = { day: '日次', week: '週次', month: '月次' }[trend?.granularity] || '';
+      if (title) title.textContent = `トレンド 売上 + 粗利 (${gLabel}、${trend?.from || ''} 〜 ${trend?.to || ''})`;
+      // バケットを year_month 互換キー (year_month) にして既存描画ロジック維持
+      rows = rows.map((r) => ({ ...r, year_month: r.bucket }));
+    } else {
+      rows = await fetchJson('/apps/sales-analytics-linegift/api/dashboard/monthly-trend');
+      if (title) title.textContent = 'トレンド 売上 + 粗利 (過去 12 ヶ月)';
+    }
+    if (!rows || rows.length === 0) { wrap.innerHTML = '<div class="empty">期間内データなし</div>'; return; }
     // 2026-05-27 中原さん指摘: 売上/粗利は同一スケール (同じ左軸)、粗利率を右軸 % で表示する
     const rawMaxAmount = Math.max(
       ...rows.map((r) => Number(r.sales_jpy_incl) || 0),
@@ -750,6 +786,7 @@ function clearPanelsForPendingPeriod() {
   document.getElementById('top5-list').innerHTML        = placeholder;
   document.getElementById('price-band-table').innerHTML = placeholder;
   document.getElementById('dead-stock-table').innerHTML = placeholder;
+  document.getElementById('weekday-grid').innerHTML     = placeholder;
   document.getElementById('ranking-table').innerHTML    = placeholder;
   // 新商品 ramp は期間に依存しない (発売日基準) ため残置
 }
@@ -769,8 +806,40 @@ function refreshAll() {
   loadDeadStock();
   loadNewItemRamp();
   loadSeasonComparison();
+  loadWeekdaySummary();
   loadRanking();
   loadBuildStatus();
+}
+
+// 曜日別売上サマリ (PR-G ⑧、現状は曜日のみ、時間帯軸は v1.2)
+async function loadWeekdaySummary() {
+  const wrap = document.getElementById('weekday-grid');
+  try {
+    const qs = buildPeriodQS();
+    if (state.season && state.mode === 'window') qs.set('season_code', state.season);
+    const r = await fetchJson('/apps/sales-analytics-linegift/api/dashboard/weekday-summary?' + qs.toString());
+    if (!r || !r.rows || r.rows.length === 0) {
+      wrap.innerHTML = '<div class="empty">期間内データなし</div>';
+      return;
+    }
+    const maxSales = Math.max(...r.rows.map((x) => x.sales_jpy_incl || 0), 1);
+    const cells = r.rows.map((x) => {
+      const ratio = (x.sales_jpy_incl || 0) / maxSales;
+      const opacity = 0.08 + ratio * 0.42; // 0.08〜0.50
+      const dowCls = x.dow === 0 ? 'sun' : (x.dow === 6 ? 'sat' : '');
+      return `<div class="weekday-cell ${dowCls}" title="${escapeHtml(x.label)}曜日\n売上: ${fmtJpy(x.sales_jpy_incl)}\n粗利: ${fmtJpy(x.gross_profit_jpy_incl)}\n注文: ${fmtInt(x.orders)}\n粗利率: ${fmtPct(x.gross_margin_rate)}">
+        <div class="heat" style="background:rgba(9,105,218,${opacity.toFixed(2)})"></div>
+        <div class="content">
+          <div class="dow">${escapeHtml(x.label)}</div>
+          <div class="sales">${fmtJpy(x.sales_jpy_incl)}</div>
+          <div class="rate">${fmtPct(x.gross_margin_rate)}</div>
+        </div>
+      </div>`;
+    }).join('');
+    wrap.innerHTML = `<div class="weekday-grid">${cells}</div>`;
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty">読込失敗: ${escapeHtml(e.message)}</div>`;
+  }
 }
 
 // シーン × 前年比較 (PR-F): シーン選択時のみ表示
