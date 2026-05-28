@@ -95,6 +95,135 @@ export function getKpiSummaryByPeriod(from, to) {
   };
 }
 
+// 前期比 共通: 期間内の KPI を on-the-fly 集計 (送料引き後粗利、税込換算)
+function computeKpiInRange(db, from, to) {
+  const row = db.prepare(`
+    WITH base AS (
+      SELECT f.gross_sales_jpy_incl, f.variable_margin_jpy_incl, f.order_count, f.units_net_sold,
+             COALESCE(p.送料, 0) * (1 + COALESCE(p.消費税率, 0.1)) AS unit_shipping_cost_jpy_incl
+      FROM mirror_linegift_finance_sku_daily f
+      LEFT JOIN mirror_products p ON p.商品コード = f.ne_code
+      WHERE f.date_jst BETWEEN ? AND ?
+    )
+    SELECT
+      ROUND(COALESCE(SUM(gross_sales_jpy_incl), 0)) AS total_sales_jpy_incl,
+      COALESCE(SUM(order_count), 0) AS total_orders,
+      CASE WHEN COALESCE(SUM(order_count), 0) = 0 THEN 0
+           ELSE ROUND(COALESCE(SUM(gross_sales_jpy_incl), 0) / COALESCE(SUM(order_count), 0)) END AS avg_order_value_jpy_incl,
+      ROUND(COALESCE(SUM(variable_margin_jpy_incl), 0) - COALESCE(SUM(units_net_sold * unit_shipping_cost_jpy_incl), 0)) AS total_gross_profit_jpy_incl,
+      CASE WHEN COALESCE(SUM(gross_sales_jpy_incl), 0) = 0 THEN 0
+           ELSE ROUND((COALESCE(SUM(variable_margin_jpy_incl), 0) - COALESCE(SUM(units_net_sold * unit_shipping_cost_jpy_incl), 0)) * 1.0 / COALESCE(SUM(gross_sales_jpy_incl), 0), 4) END AS gross_margin_rate
+    FROM base
+  `).get(from, to);
+  return row || {
+    total_sales_jpy_incl: 0, total_orders: 0, avg_order_value_jpy_incl: 0,
+    total_gross_profit_jpy_incl: 0, gross_margin_rate: 0,
+  };
+}
+
+function shiftIsoDate(iso, days) {
+  const t = Date.parse(iso + 'T00:00:00Z');
+  return new Date(t + days * 86400000).toISOString().slice(0, 10);
+}
+
+// 現在期と前期の (from, to) を解決
+// season: シーン期間 vs 前年同シーン期間 (PR-D Codex Round 2 High 修正: 季節絞り込み中の整合性)
+// window: as_of (mirror の最新日) から N 日窓、前期は同じ N 日でその直前
+// month:  当月 / 前月 (カレンダー基準)
+// custom: 同期間ずらし (例: 5/1-5/15 → 4/16-4/30、15日 vs 15日)
+function resolveComparisonRanges(periodSpec) {
+  if (periodSpec.season_code) {
+    const db = getMirrorDB();
+    // 最新の season_year occurrence を current にする (year 指定時はその year、未指定なら最新)
+    const occ = periodSpec.season_year
+      ? db.prepare(`SELECT season_year, start_date_jst, end_date_jst FROM mart_gift_season_occurrences
+                    WHERE season_code = ? AND season_year = ? AND is_active = 1`).get(periodSpec.season_code, periodSpec.season_year)
+      : db.prepare(`SELECT season_year, start_date_jst, end_date_jst FROM mart_gift_season_occurrences
+                    WHERE season_code = ? AND is_active = 1
+                    ORDER BY season_year DESC LIMIT 1`).get(periodSpec.season_code);
+    if (!occ) return null;
+    // 前年同シーン
+    const prevOcc = db.prepare(`SELECT start_date_jst, end_date_jst FROM mart_gift_season_occurrences
+                                WHERE season_code = ? AND season_year = ? AND is_active = 1`)
+      .get(periodSpec.season_code, occ.season_year - 1);
+    return {
+      curr: { from: occ.start_date_jst, to: occ.end_date_jst },
+      // 前年 occurrence が無い場合は当年と同じ期間を渡しても集計は 0 件にはならないので、null sentinel として未来の 1 日範囲を使い前期 0 を保証
+      prev: prevOcc
+        ? { from: prevOcc.start_date_jst, to: prevOcc.end_date_jst }
+        : { from: '9999-12-31', to: '9999-12-31' },
+      mode: 'season',
+      span_days: null,
+    };
+  }
+  if (periodSpec.from && periodSpec.to) {
+    validatePeriod(periodSpec.from, periodSpec.to);
+    const days = (Date.parse(periodSpec.to + 'T00:00:00Z') - Date.parse(periodSpec.from + 'T00:00:00Z')) / 86400000 + 1;
+    return {
+      curr: { from: periodSpec.from, to: periodSpec.to },
+      prev: { from: shiftIsoDate(periodSpec.from, -days), to: shiftIsoDate(periodSpec.from, -1) },
+      mode: 'custom',
+      span_days: days,
+    };
+  }
+  if (periodSpec.month) {
+    if (!/^\d{4}-\d{2}$/.test(periodSpec.month)) throw new Error(`invalid month: ${periodSpec.month}`);
+    const [yy, mm] = periodSpec.month.split('-').map(Number);
+    const currLast = new Date(Date.UTC(yy, mm, 0)).getUTCDate();
+    const currFrom = `${yy}-${String(mm).padStart(2,'0')}-01`;
+    const currTo   = `${yy}-${String(mm).padStart(2,'0')}-${String(currLast).padStart(2,'0')}`;
+    const pYy = mm === 1 ? yy - 1 : yy;
+    const pMm = mm === 1 ? 12 : mm - 1;
+    const prevLast = new Date(Date.UTC(pYy, pMm, 0)).getUTCDate();
+    const prevFrom = `${pYy}-${String(pMm).padStart(2,'0')}-01`;
+    const prevTo   = `${pYy}-${String(pMm).padStart(2,'0')}-${String(prevLast).padStart(2,'0')}`;
+    return { curr: { from: currFrom, to: currTo }, prev: { from: prevFrom, to: prevTo }, mode: 'month', span_days: currLast };
+  }
+  // window
+  const w = validateWindow(periodSpec.window);
+  const db = getMirrorDB();
+  const row = db.prepare(`SELECT MAX(date_jst) AS d FROM mirror_linegift_finance_sku_daily`).get();
+  if (!row?.d) return null;
+  const asOf = row.d;
+  return {
+    curr: { from: shiftIsoDate(asOf, -(w - 1)), to: asOf },
+    prev: { from: shiftIsoDate(asOf, -(2 * w - 1)), to: shiftIsoDate(asOf, -w) },
+    mode: 'window',
+    span_days: w,
+  };
+}
+
+/**
+ * KPI + 前期比 (中原さん指摘 2026-05-28)
+ * 戻り値: { current, previous, delta_pct, ranges, mode }
+ *   - delta_pct.* は変化率 (-1.0 〜 +N.NN、null = 前期 0 で計算不能)
+ *   - gross_margin_rate_pt は pt 差 (比率の差、四桁丸め)
+ */
+export function getKpiWithPrevious(periodSpec) {
+  const ranges = resolveComparisonRanges(periodSpec || {});
+  if (!ranges) return null;
+  const db = getMirrorDB();
+  const current  = computeKpiInRange(db, ranges.curr.from, ranges.curr.to);
+  const previous = computeKpiInRange(db, ranges.prev.from, ranges.prev.to);
+  // current 全 0 = 期間内データなし
+  if ((current.total_sales_jpy_incl || 0) === 0 && (current.total_orders || 0) === 0) return null;
+  const deltaPct = (c, p) => (p === 0 ? null : Math.round(((c - p) / p) * 10000) / 10000);
+  return {
+    current:  { ...current,  from: ranges.curr.from, to: ranges.curr.to },
+    previous: { ...previous, from: ranges.prev.from, to: ranges.prev.to },
+    delta_pct: {
+      total_sales_jpy_incl:        deltaPct(current.total_sales_jpy_incl,        previous.total_sales_jpy_incl),
+      total_orders:                deltaPct(current.total_orders,                previous.total_orders),
+      avg_order_value_jpy_incl:    deltaPct(current.avg_order_value_jpy_incl,    previous.avg_order_value_jpy_incl),
+      total_gross_profit_jpy_incl: deltaPct(current.total_gross_profit_jpy_incl, previous.total_gross_profit_jpy_incl),
+      // 粗利率は pt 差 (current.rate - previous.rate)
+      gross_margin_rate_pt: Math.round((current.gross_margin_rate - previous.gross_margin_rate) * 10000) / 10000,
+    },
+    mode: ranges.mode,
+    span_days: ranges.span_days,
+  };
+}
+
 /**
  * 月別トレンド (12ヶ月、view 直)
  */
