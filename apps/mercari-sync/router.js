@@ -23,6 +23,11 @@ function getServiceHeaders() {
     'Content-Type': 'application/json',
   };
 }
+// details-bulk は楽天 RMS が 1req/sec のレート制限のため
+// 100件 chunk × 1.1秒 = 110秒/chunk、HTTP timeout 240秒で安全圏
+const DETAILS_BULK_CHUNK_SIZE = 100;
+const DETAILS_BULK_CHUNK_TIMEOUT_MS = 240_000;
+
 const rakuten = {
   async getAllItemCodes() {
     const res = await fetch(`${WAREHOUSE_URL}/service-api/rakuten-rms/items/all-codes`, { headers: getServiceHeaders(), signal: AbortSignal.timeout(120000) });
@@ -31,10 +36,20 @@ const rakuten = {
     return data.mapping;
   },
   async getItemDetailsBulk(serviceSecret, licenseKey, itemCodes) {
-    const res = await fetch(`${WAREHOUSE_URL}/service-api/rakuten-rms/items/details-bulk`, { method: 'POST', headers: getServiceHeaders(), body: JSON.stringify({ itemCodes }), signal: AbortSignal.timeout(120000) });
-    const data = await res.json();
-    if (!data.ok) throw new Error(data.message || 'RMS API error');
-    return data.items;
+    const allItems = [];
+    for (let i = 0; i < itemCodes.length; i += DETAILS_BULK_CHUNK_SIZE) {
+      const chunk = itemCodes.slice(i, i + DETAILS_BULK_CHUNK_SIZE);
+      const res = await fetch(`${WAREHOUSE_URL}/service-api/rakuten-rms/items/details-bulk`, {
+        method: 'POST',
+        headers: getServiceHeaders(),
+        body: JSON.stringify({ itemCodes: chunk }),
+        signal: AbortSignal.timeout(DETAILS_BULK_CHUNK_TIMEOUT_MS),
+      });
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.message || 'RMS API error');
+      if (Array.isArray(data.items)) allItems.push(...data.items);
+    }
+    return allItems;
   },
 };
 
