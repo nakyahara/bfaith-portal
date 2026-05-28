@@ -130,6 +130,14 @@
     .sku-trend-table-wrap table { font-size: .85em; }
     .sku-trend-table-wrap thead th { position: sticky; top: 0; background: #f6f8fa; z-index: 1; }
 
+    /* チャート凡例 (2026-05-29、preserveAspectRatio=none で SVG 内 text が横圧縮されるため HTML 化) */
+    .chart-legend { display: flex; gap: 16px; font-size: .8em; color: #586069; margin-bottom: 6px; flex-wrap: wrap; }
+    .chart-legend .sw       { display: inline-block; width: 10px; height: 10px; vertical-align: middle; margin-right: 4px; border-radius: 2px; }
+    .chart-legend .dot-sw   { display: inline-block; width: 8px; height: 8px; border-radius: 50%; vertical-align: middle; margin-right: 4px; }
+    .chart-legend .sales-sw  { background: #06C755; }
+    .chart-legend .profit-sw { background: #f59e0b; }
+    .chart-legend .rate-sw   { background: #0969da; }
+
     /* トレンド粒度トグル (2026-05-28、中原さん追加リクエスト) */
     .trend-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
     .trend-granularity { display: inline-flex; gap: 0; border: 1px solid #d0d7de; border-radius: 6px; overflow: hidden; font-size: .78em; }
@@ -142,14 +150,12 @@
     .panel { background: #fff; padding: 14px; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,.06); }
     .panel h2 { font-size: .95em; margin: 0 0 10px; color: #24292e; }
 
-    .chart-wrap { width: 100%; overflow-x: auto; position: relative; }
-    /* CSS の width / max-width を削除 (2026-05-29、中原さん「日次グラフが細すぎ」修正)
-       理由: viewBox W=rows*90 で 90 本 = 8100、画面幅 800px に
-       preserveAspectRatio=meet で fit させると Y 軸も 800/8100=10% 縮小、
-       結果 高さ 360→36px で棒が見えなくなる。CSS 制約を外して SVG タグの
-       width/height 属性 (=viewBox W/H ピクセル) に任せ、chart-wrap.overflow-x: auto
-       で横スクロール許可。棒少ない時 (月次 12 本=1080px 等) は画面より小さく左寄せ表示 */
-    svg.chart { display: block; }
+    .chart-wrap { width: 100%; position: relative; }
+    /* 2026-05-29 (中原さん再指摘): 横スクロール戻しは不便 → 画面 fit + 縦は固定 H
+       preserveAspectRatio="none" で viewBox を画面サイズに stretch、棒の縦は H=360 維持、
+       横は画面幅に応じて圧縮。棒が多い時 (日次 90 本) でも一目で全体傾向が見える。
+       X 軸ラベルは loadMonthly 内で間引いて重なり回避 */
+    svg.chart { width: 100%; height: 360px; display: block; }
     svg.chart .bar-sales  { fill: #06C755; }
     svg.chart .bar-profit { fill: #f59e0b; }
     svg.chart .line { stroke: #0969da; stroke-width: 2; fill: none; }
@@ -267,6 +273,11 @@
             <button type="button" data-gran="month" role="tab">月</button>
           </div>
         </div>
+        <div class="chart-legend">
+          <span><span class="sw sales-sw"></span>売上 (左軸)</span>
+          <span><span class="sw profit-sw"></span>粗利 (左軸)</span>
+          <span><span class="dot-sw rate-sw"></span>粗利率 (右軸 %)</span>
+        </div>
         <div class="chart-wrap">
           <div id="monthly-chart"><div class="loading">読み込み中…</div></div>
           <div class="chart-tooltip" id="monthly-tooltip" role="tooltip"></div>
@@ -306,6 +317,11 @@
         </div>
       </div>
       <div class="sku-trend-meta" id="sku-trend-meta"></div>
+      <div class="chart-legend">
+        <span><span class="sw sales-sw"></span>売上 (左軸)</span>
+        <span><span class="sw profit-sw"></span>粗利 (左軸)</span>
+        <span><span class="dot-sw rate-sw"></span>粗利率 (右軸 %)</span>
+      </div>
       <div class="chart-wrap" id="sku-trend-chart-wrap">
         <div id="sku-trend-chart"><div class="sku-trend-empty">商品を選択してください</div></div>
         <div class="chart-tooltip" id="sku-trend-tooltip" role="tooltip"></div>
@@ -580,8 +596,9 @@ async function loadMonthly() {
     // 月幅を半分に分けて棒を 2 本横並びにする
     const slotW = innerW / rows.length;
     const bw = slotW * 0.34;
-    // 2026-05-29 中原さん指摘で width/height 属性を viewBox と同寸に明示 (CSS の width 制約撤廃と組合せ、縮小表示問題を解消)
-    let svg = `<svg class="chart" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg">`;
+    // 2026-05-29 中原さん再指摘: 横スクロールは不便 → preserveAspectRatio="none" で画面 fit、
+    // viewBox 座標は線形マップ、棒の縦は H 維持で見える、横は画面幅に圧縮
+    let svg = `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">`;
 
     // Y軸グリッド + 目盛り (5分割)
     const yTicks = 5;
@@ -600,6 +617,8 @@ async function loadMonthly() {
     svg += `<line class="axis" x1="${padL}" y1="${H - padB}" x2="${W - padR}" y2="${H - padB}" stroke-width="1.5" />`;
 
     // 棒 (売上=緑 / 粗利=橙) を月ごとに横並びで描画
+    // 2026-05-29: X 軸ラベルは ~12 個に間引き (preserveAspectRatio=none で画面 fit する際、密集して読めなくなるのを回避)
+    const labelStep = Math.max(1, Math.ceil(rows.length / 12));
     rows.forEach((r, i) => {
       const slotX = padL + i * slotW;
       const center = slotX + slotW / 2;
@@ -611,8 +630,10 @@ async function loadMonthly() {
       const yProfit = H - padB - hProfit;
       svg += `<rect class="bar-sales"  x="${xSales}"  y="${ySales}"  width="${bw}" height="${hSales}" />`;
       svg += `<rect class="bar-profit" x="${xProfit}" y="${yProfit}" width="${bw}" height="${hProfit}" />`;
-      // X軸 月ラベル
-      svg += `<text x="${center}" y="${H - padB + 18}" text-anchor="middle">${escapeHtml(r.year_month)}</text>`;
+      // X軸ラベル (間引き表示、先頭/末尾は必ず表示)
+      if (i % labelStep === 0 || i === rows.length - 1) {
+        svg += `<text x="${center}" y="${H - padB + 18}" text-anchor="middle">${escapeHtml(r.year_month)}</text>`;
+      }
     });
 
     // 折線 (粗利率) + 点 (右軸 % スケール)
@@ -637,14 +658,7 @@ async function loadMonthly() {
       svg += `<rect class="hover-zone" data-idx="${i}" x="${slotX}" y="${padT}" width="${slotW}" height="${innerH}" />`;
     });
 
-    // 凡例 (上部)
-    svg += `<rect x="${padL}"        y="${padT - 22}" width="12" height="12" fill="#06C755" />`;
-    svg += `<text x="${padL + 16}"   y="${padT - 12}" fill="#06C755">売上 (左軸)</text>`;
-    svg += `<rect x="${padL + 110}"  y="${padT - 22}" width="12" height="12" fill="#f59e0b" />`;
-    svg += `<text x="${padL + 126}"  y="${padT - 12}" fill="#f59e0b">粗利 (左軸)</text>`;
-    svg += `<line x1="${padL + 220}" y1="${padT - 16}" x2="${padL + 242}" y2="${padT - 16}" stroke="#0969da" stroke-width="2" />`;
-    svg += `<circle cx="${padL + 231}" cy="${padT - 16}" r="4" fill="#0969da" />`;
-    svg += `<text x="${padL + 248}"  y="${padT - 12}" fill="#0969da">粗利率 (右軸 %)</text>`;
+    // 凡例は HTML 側 (.chart-legend) に移動 (2026-05-29、preserveAspectRatio=none で横圧縮されるため)
 
     svg += '</svg>';
     wrap.innerHTML = svg;
@@ -1037,8 +1051,9 @@ async function loadSkuTrend(skuCode) {
     const innerH = H - padT - padB;
     const slotW = innerW / rows.length;
     const bw = slotW * 0.34;
-    // 2026-05-29 中原さん指摘で width/height 属性を viewBox と同寸に明示 (CSS の width 制約撤廃と組合せ、縮小表示問題を解消)
-    let svg = `<svg class="chart" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg">`;
+    // 2026-05-29 中原さん再指摘: 横スクロールは不便 → preserveAspectRatio="none" で画面 fit、
+    // viewBox 座標は線形マップ、棒の縦は H 維持で見える、横は画面幅に圧縮
+    let svg = `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">`;
     for (let i = 0; i <= 5; i++) {
       const y = padT + innerH * (1 - i / 5);
       svg += `<line x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}" stroke="#eaecef" stroke-width="1" />`;
@@ -1046,6 +1061,8 @@ async function loadSkuTrend(skuCode) {
       svg += `<text x="${W - padR + 6}" y="${y + 4}" text-anchor="start" fill="#0969da">${(maxRatePct * i / 5).toFixed(0)}%</text>`;
     }
     svg += `<line class="axis" x1="${padL}" y1="${H - padB}" x2="${W - padR}" y2="${H - padB}" stroke-width="1.5" />`;
+    // X軸ラベル間引き (2026-05-29、preserveAspectRatio=none で画面 fit する際の密集回避)
+    const labelStepSku = Math.max(1, Math.ceil(rows.length / 12));
     rows.forEach((x, i) => {
       const slotX = padL + i * slotW;
       const center = slotX + slotW / 2;
@@ -1055,7 +1072,9 @@ async function loadSkuTrend(skuCode) {
       const hProfit = innerH * ((Number(x.gross_profit_jpy_incl) || 0) / maxAmount);
       svg += `<rect class="bar-sales"  x="${xSales}"  y="${H - padB - hSales}"  width="${bw}" height="${hSales}" />`;
       svg += `<rect class="bar-profit" x="${xProfit}" y="${H - padB - hProfit}" width="${bw}" height="${hProfit}" />`;
-      svg += `<text x="${center}" y="${H - padB + 18}" text-anchor="middle" font-size="9">${escapeHtml(x.bucket)}</text>`;
+      if (i % labelStepSku === 0 || i === rows.length - 1) {
+        svg += `<text x="${center}" y="${H - padB + 18}" text-anchor="middle" font-size="9">${escapeHtml(x.bucket)}</text>`;
+      }
     });
     let pathD = '';
     rows.forEach((x, i) => {
@@ -1068,13 +1087,7 @@ async function loadSkuTrend(skuCode) {
       svg += `<circle class="dot" cx="${cx}" cy="${cy}" r="3" />`;
     });
     svg += `<path class="line" d="${pathD.trim()}" />`;
-    // 凡例のみ SVG 内 (商品名は外に出したので被らない)
-    svg += `<rect x="${padL}" y="${padT - 18}" width="10" height="10" fill="#06C755" />`;
-    svg += `<text x="${padL + 14}" y="${padT - 9}" fill="#06C755">売上 (左軸)</text>`;
-    svg += `<rect x="${padL + 100}" y="${padT - 18}" width="10" height="10" fill="#f59e0b" />`;
-    svg += `<text x="${padL + 114}" y="${padT - 9}" fill="#f59e0b">粗利 (左軸)</text>`;
-    svg += `<circle cx="${padL + 210}" cy="${padT - 13}" r="3" fill="#0969da" />`;
-    svg += `<text x="${padL + 218}" y="${padT - 9}" fill="#0969da">粗利率 (右軸 %)</text>`;
+    // 凡例は HTML 側 (.chart-legend) に移動 (2026-05-29)
     svg += '</svg>';
     wrap.innerHTML = svg;
 
