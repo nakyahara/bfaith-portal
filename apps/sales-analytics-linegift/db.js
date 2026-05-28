@@ -301,6 +301,78 @@ export function getTrend(periodSpec) {
 }
 
 /**
+ * 商品別トレンド (中原さん指示 2026-05-28、PR-J)
+ *
+ * 指定 sku_code (and ne_code) について getTrend と同じ粒度で時系列を返す。
+ * granularity 自動判定は getTrend と完全に同じロジック。
+ */
+export function getSkuTrend(skuCode, periodSpec) {
+  if (!skuCode) throw new Error('sku_code is required');
+  const ranges = resolveComparisonRanges(periodSpec || {});
+  if (!ranges) return null;
+  const { from, to } = ranges.curr;
+  const days = (Date.parse(to + 'T00:00:00Z') - Date.parse(from + 'T00:00:00Z')) / 86400000 + 1;
+
+  let granularity = periodSpec?.granularity;
+  if (!['day', 'week', 'month'].includes(granularity)) {
+    if (days <= 31)      granularity = 'day';
+    else if (days <= 180) granularity = 'week';
+    else                  granularity = 'month';
+  }
+
+  const db = getMirrorDB();
+  let bucketExpr;
+  if (granularity === 'day') {
+    bucketExpr = 'f.date_jst';
+  } else if (granularity === 'week') {
+    bucketExpr = `date(f.date_jst, '-' || ((CAST(strftime('%w', f.date_jst) AS INTEGER) + 6) % 7) || ' days')`;
+  } else {
+    bucketExpr = `substr(f.date_jst, 1, 7)`;
+  }
+
+  const rows = db.prepare(`
+    WITH base AS (
+      SELECT
+        ${bucketExpr} AS bucket,
+        f.gross_sales_jpy_incl, f.variable_margin_jpy_incl, f.order_count, f.units_net_sold,
+        COALESCE(p.送料, 0) * (1 + COALESCE(p.消費税率, 0.1)) AS unit_shipping_cost_jpy_incl
+      FROM mirror_linegift_finance_sku_daily f
+      LEFT JOIN mirror_products p ON p.商品コード = f.ne_code
+      WHERE f.date_jst BETWEEN ? AND ?
+        AND f.sku_code = ?
+    )
+    SELECT
+      bucket,
+      ROUND(COALESCE(SUM(gross_sales_jpy_incl), 0)) AS sales_jpy_incl,
+      ROUND(COALESCE(SUM(variable_margin_jpy_incl), 0) - COALESCE(SUM(units_net_sold * unit_shipping_cost_jpy_incl), 0)) AS gross_profit_jpy_incl,
+      COALESCE(SUM(order_count), 0) AS orders,
+      COALESCE(SUM(units_net_sold), 0) AS units,
+      CASE WHEN COALESCE(SUM(gross_sales_jpy_incl), 0) = 0 THEN 0
+           ELSE ROUND((COALESCE(SUM(variable_margin_jpy_incl), 0) - COALESCE(SUM(units_net_sold * unit_shipping_cost_jpy_incl), 0)) * 1.0 / COALESCE(SUM(gross_sales_jpy_incl), 0), 4) END AS gross_margin_rate
+    FROM base
+    GROUP BY bucket
+    ORDER BY bucket
+  `).all(from, to, skuCode);
+
+  // SKU 名 (mirror_linegift_finance_sku_daily の最新 product_name)
+  const meta = db.prepare(`
+    SELECT MAX(product_name) AS product_name, MAX(ne_code) AS ne_code
+    FROM mirror_linegift_finance_sku_daily
+    WHERE sku_code = ?
+  `).get(skuCode);
+
+  return {
+    sku_code: skuCode,
+    product_name: meta?.product_name || skuCode,
+    ne_code: meta?.ne_code || null,
+    granularity,
+    from, to,
+    span_days: days,
+    rows,
+  };
+}
+
+/**
  * 曜日 × 時間帯ヒートマップ (PR-H、v1.2)
  *
  * mirror_linegift_orders.bought_at_jst (注文時刻 JST) から dow × hour 168 セルで集計。

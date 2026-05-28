@@ -25,7 +25,7 @@ import {
   getPriceBandSummary, getPriceBandSummaryByPeriod, listSeasons, listAvailableMonths,
   getBuildStatus, resolvePeriod,
   getDeadStockSkus, getNewItemRamps, getSeasonComparison,
-  getTrend, getWeekdaySummary, getDowHourHeatmap,
+  getTrend, getWeekdaySummary, getDowHourHeatmap, getSkuTrend,
 } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -208,6 +208,28 @@ router.get('/api/dashboard/weekday-summary', (req, res) => {
       season_year: req.query.season_year ? Number(req.query.season_year) : null,
     };
     res.json({ ok: true, result: getWeekdaySummary(spec) });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// 商品別トレンド (PR-J、SKU 個別時系列)
+router.get('/api/dashboard/sku-trend', (req, res) => {
+  try {
+    if (!req.query.sku_code) {
+      res.status(400).json({ ok: false, error: 'sku_code is required' });
+      return;
+    }
+    const spec = {
+      window: req.query.window ? Number(req.query.window) : 90,
+      month: req.query.month || null,
+      from: req.query.from || null,
+      to: req.query.to || null,
+      season_code: req.query.season_code || null,
+      season_year: req.query.season_year ? Number(req.query.season_year) : null,
+      granularity: req.query.granularity || null,
+    };
+    res.json({ ok: true, result: getSkuTrend(String(req.query.sku_code), spec) });
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
   }

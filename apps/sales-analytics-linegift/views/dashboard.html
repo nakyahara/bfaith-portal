@@ -112,6 +112,20 @@
     .top5-modes button.active { background: #06C755; color: #fff; font-weight: 600; }
     .top5-modes button:hover:not(.active) { background: #f6f8fa; }
 
+    /* タブ (2026-05-28、中原さん「スクロールしすぎる」対応) */
+    .tabs { display: flex; gap: 2px; border-bottom: 2px solid #d0d7de; margin-bottom: 16px; flex-wrap: wrap; }
+    .tabs button { background: transparent; border: 0; padding: 10px 16px; cursor: pointer; color: #586069; font-size: .92em; font-weight: 500; border-bottom: 3px solid transparent; margin-bottom: -2px; }
+    .tabs button:hover:not(.active) { background: #f6f8fa; color: #24292e; }
+    .tabs button.active { color: #0969da; border-bottom-color: #0969da; font-weight: 600; }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+
+    /* 商品トレンド (PR-J) */
+    .sku-trend-header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+    .sku-trend-header label { font-size: .85em; color: #586069; }
+    .sku-trend-header select { padding: 4px 8px; font-size: .92em; border: 1px solid #d0d7de; border-radius: 4px; min-width: 320px; max-width: 100%; }
+    .sku-trend-empty { color: #586069; padding: 24px; text-align: center; font-size: .9em; }
+
     /* トレンド粒度トグル (2026-05-28、中原さん追加リクエスト) */
     .trend-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
     .trend-granularity { display: inline-flex; gap: 0; border: 1px solid #d0d7de; border-radius: 6px; overflow: hidden; font-size: .78em; }
@@ -223,81 +237,113 @@
     <div class="kpi-card"><div class="label">粗利率</div><div class="value" id="kpi-rate">-</div><div class="delta" id="kpi-rate-delta"></div></div>
   </div>
 
-  <div class="row-2">
-    <div class="panel">
-      <div class="trend-header">
-        <h2 id="monthly-chart-title" style="margin:0">トレンド 売上 + 粗利</h2>
-        <div class="trend-granularity" id="trend-granularity" role="tablist" aria-label="トレンド粒度">
-          <button type="button" data-gran="auto"  class="active" role="tab">自動</button>
-          <button type="button" data-gran="day"   role="tab">日</button>
-          <button type="button" data-gran="week"  role="tab">週</button>
-          <button type="button" data-gran="month" role="tab">月</button>
+  <div class="tabs" role="tablist" aria-label="ダッシュボード タブ">
+    <button type="button" class="tab active" data-tab="overview"    role="tab">📊 概要</button>
+    <button type="button" class="tab"        data-tab="products"    role="tab">📦 商品</button>
+    <button type="button" class="tab"        data-tab="season-price" role="tab">🎁 シーン・価格</button>
+    <button type="button" class="tab"        data-tab="time"        role="tab">🕐 時間帯</button>
+  </div>
+
+  <!-- ───── タブ: 概要 (KPI 上 + トレンド + TOP5 + 曜日サマリ) ───── -->
+  <div class="tab-content active" id="tab-overview" role="tabpanel">
+    <div class="row-2">
+      <div class="panel">
+        <div class="trend-header">
+          <h2 id="monthly-chart-title" style="margin:0">トレンド 売上 + 粗利</h2>
+          <div class="trend-granularity" id="trend-granularity" role="tablist" aria-label="トレンド粒度">
+            <button type="button" data-gran="auto"  class="active" role="tab">自動</button>
+            <button type="button" data-gran="day"   role="tab">日</button>
+            <button type="button" data-gran="week"  role="tab">週</button>
+            <button type="button" data-gran="month" role="tab">月</button>
+          </div>
+        </div>
+        <div class="chart-wrap">
+          <div id="monthly-chart"><div class="loading">読み込み中…</div></div>
+          <div class="chart-tooltip" id="monthly-tooltip" role="tooltip"></div>
         </div>
       </div>
-      <div class="chart-wrap">
-        <div id="monthly-chart"><div class="loading">読み込み中…</div></div>
-        <div class="chart-tooltip" id="monthly-tooltip" role="tooltip"></div>
+      <div class="panel">
+        <h2>商品 TOP 5 (現フィルタ)</h2>
+        <div class="top5-modes" id="top5-modes" role="tablist" aria-label="TOP5 モード">
+          <button type="button" data-mode="profit" class="active" role="tab">💰 粗利モード</button>
+          <button type="button" data-mode="sales"  role="tab">📈 売上モード</button>
+        </div>
+        <div class="top5" id="top5-list"><div class="loading">読み込み中…</div></div>
       </div>
     </div>
+
+    <div class="panel weekday-summary">
+      <h2>📅 曜日別 売上 (現フィルタ期間)</h2>
+      <div class="legend">背景の青濃度 = 売上の高さ (期間内で正規化)</div>
+      <div id="weekday-grid"><div class="loading">読み込み中…</div></div>
+    </div>
+  </div>
+
+  <!-- ───── タブ: 商品 (商品別グラフ + ランキング + 死筋 + 新商品) ───── -->
+  <div class="tab-content" id="tab-products" role="tabpanel">
+    <div class="panel" style="margin-bottom: 16px;">
+      <h2>📈 商品別トレンド (個別 SKU、現フィルタ期間)</h2>
+      <div class="sku-trend-header">
+        <label for="sku-trend-select">商品:</label>
+        <select id="sku-trend-select"><option value="">読み込み中…</option></select>
+        <div style="font-size:.78em; color:#586069;">並び順は商品ランキング (現モード) と一致 — Top 50 が選択候補</div>
+      </div>
+      <div class="chart-wrap" id="sku-trend-chart-wrap">
+        <div id="sku-trend-chart"><div class="sku-trend-empty">商品を選択してください</div></div>
+        <div class="chart-tooltip" id="sku-trend-tooltip" role="tooltip"></div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-bottom: 16px;">
+      <h2>💀 死筋 SKU (撤退判断支援、現フィルタ期間)</h2>
+      <div class="dead-stock">
+        <div class="legend">
+          <span class="risk-badge red">💀 赤字</span> 粗利率 &lt; 0% (売れば売るほど赤字) /
+          <span class="risk-badge yellow">⚠️ 低粗利率×低回転</span> 粗利率 &lt; 10% かつ 注文件数 &lt; 5 件
+        </div>
+        <div id="dead-stock-table"><div class="loading">読み込み中…</div></div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-bottom: 16px;">
+      <h2>🌱 新商品 立ち上がりカーブ (発売 ≤ 90 日)</h2>
+      <div class="new-item-grid">
+        <div>
+          <div class="sub">SKU 別 累計売上 (day 0-60)、グレー破線は全体中央値</div>
+          <div class="ramp-chart-wrap" id="new-item-chart"><div class="loading">読み込み中…</div></div>
+        </div>
+        <div>
+          <div class="sub">SKU 一覧 (発売日 / 30 日累計 売上・粗利 / vs 中央値)</div>
+          <div class="new-item-table" id="new-item-table"><div class="loading">読み込み中…</div></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel scroll">
+      <h2>商品ランキング (Top 500)</h2>
+      <div id="ranking-table"><div class="loading">読み込み中…</div></div>
+    </div>
+  </div>
+
+  <!-- ───── タブ: シーン・価格 ───── -->
+  <div class="tab-content" id="tab-season-price" role="tabpanel">
+    <div class="panel season-compare" id="season-compare-panel" style="margin-bottom: 16px;">
+      <h2>🎁 シーン × 前年同シーン比較 (SKU 単位)</h2>
+      <div id="season-compare-body"><div class="empty">フィルタの「シーン」で対象シーンを選択してください</div></div>
+    </div>
+
     <div class="panel">
-      <h2>商品 TOP 5 (現フィルタ)</h2>
-      <div class="top5-modes" id="top5-modes" role="tablist" aria-label="TOP5 モード">
-        <button type="button" data-mode="profit" class="active" role="tab">💰 粗利モード</button>
-        <button type="button" data-mode="sales"  role="tab">📈 売上モード</button>
-      </div>
-      <div class="top5" id="top5-list"><div class="loading">読み込み中…</div></div>
+      <h2>価格帯別販売動向 (実売単価ベース、8 段階)</h2>
+      <div id="price-band-table"><div class="loading">読み込み中…</div></div>
     </div>
   </div>
 
-  <div class="panel weekday-summary" style="margin-bottom: 16px;">
-    <h2>📅 曜日別 売上 (現フィルタ期間)</h2>
-    <div class="legend">背景の青濃度 = 売上の高さ (期間内で正規化)</div>
-    <div id="weekday-grid"><div class="loading">読み込み中…</div></div>
-  </div>
-
-  <div class="panel dow-hour-heatmap" style="margin-bottom: 16px;">
-    <h2>🕐 曜日 × 時間帯 ヒートマップ (注文時刻 JST、cancelled 除外)</h2>
-    <div id="dow-hour-table"><div class="loading">読み込み中…</div></div>
-  </div>
-
-  <div class="panel" style="margin-bottom: 16px;">
-    <h2>価格帯別販売動向 (実売単価ベース、8 段階)</h2>
-    <div id="price-band-table"><div class="loading">読み込み中…</div></div>
-  </div>
-
-  <div class="panel season-compare" id="season-compare-panel" style="margin-bottom: 16px; display:none;">
-    <h2>🎁 シーン × 前年同シーン比較 (SKU 単位)</h2>
-    <div id="season-compare-body"><div class="loading">読み込み中…</div></div>
-  </div>
-
-  <div class="panel" style="margin-bottom: 16px;">
-    <h2>💀 死筋 SKU (撤退判断支援、現フィルタ期間)</h2>
-    <div class="dead-stock">
-      <div class="legend">
-        <span class="risk-badge red">💀 赤字</span> 粗利率 &lt; 0% (売れば売るほど赤字) /
-        <span class="risk-badge yellow">⚠️ 低粗利率×低回転</span> 粗利率 &lt; 10% かつ 注文件数 &lt; 5 件
-      </div>
-      <div id="dead-stock-table"><div class="loading">読み込み中…</div></div>
+  <!-- ───── タブ: 時間帯 (曜日 × 時間帯ヒートマップ) ───── -->
+  <div class="tab-content" id="tab-time" role="tabpanel">
+    <div class="panel dow-hour-heatmap">
+      <h2>🕐 曜日 × 時間帯 ヒートマップ (注文時刻 JST、cancelled 除外)</h2>
+      <div id="dow-hour-table"><div class="loading">読み込み中…</div></div>
     </div>
-  </div>
-
-  <div class="panel" style="margin-bottom: 16px;">
-    <h2>🌱 新商品 立ち上がりカーブ (発売 ≤ 90 日)</h2>
-    <div class="new-item-grid">
-      <div>
-        <div class="sub">SKU 別 累計売上 (day 0-60)、グレー破線は全体中央値</div>
-        <div class="ramp-chart-wrap" id="new-item-chart"><div class="loading">読み込み中…</div></div>
-      </div>
-      <div>
-        <div class="sub">SKU 一覧 (発売日 / 30 日累計 売上・粗利 / vs 中央値)</div>
-        <div class="new-item-table" id="new-item-table"><div class="loading">読み込み中…</div></div>
-      </div>
-    </div>
-  </div>
-
-  <div class="panel scroll">
-    <h2>商品ランキング (Top 500)</h2>
-    <div id="ranking-table"><div class="loading">読み込み中…</div></div>
   </div>
 
 <script>
@@ -341,6 +387,10 @@ const state = {
   top5Mode: (['profit', 'sales'].includes(QS().get('top5_mode')) ? QS().get('top5_mode') : 'profit'),
   // トレンド粒度: 'auto' (期間 span から自動判定、デフォルト) / 'day' / 'week' / 'month'
   granularity: (['auto', 'day', 'week', 'month'].includes(QS().get('granularity')) ? QS().get('granularity') : 'auto'),
+  // タブ: 'overview' (デフォルト) / 'products' / 'season-price' / 'time'
+  tab: (['overview', 'products', 'season-price', 'time'].includes(QS().get('tab')) ? QS().get('tab') : 'overview'),
+  // 商品別トレンド (PR-J): 選択中の SKU
+  skuTrend: QS().get('sku_trend') || '',
 };
 
 // 前期比デルタを各 KPI カードに反映 (kpi-comparison レスポンスから)
@@ -828,6 +878,7 @@ function clearPanelsForPendingPeriod() {
   document.getElementById('dead-stock-table').innerHTML = placeholder;
   document.getElementById('weekday-grid').innerHTML     = placeholder;
   document.getElementById('dow-hour-table').innerHTML   = placeholder;
+  document.getElementById('sku-trend-chart').innerHTML  = placeholder;
   document.getElementById('ranking-table').innerHTML    = placeholder;
   // 新商品 ramp は期間に依存しない (発売日基準) ため残置
 }
@@ -849,8 +900,128 @@ function refreshAll() {
   loadSeasonComparison();
   loadWeekdaySummary();
   loadDowHourHeatmap();
-  loadRanking();
+  loadRanking().then(() => populateSkuTrendSelect()); // ranking 完了後に SKU セレクタを作る
   loadBuildStatus();
+}
+
+// 商品ランキング結果から SKU セレクタを populate (PR-J)
+function populateSkuTrendSelect() {
+  const sel = document.getElementById('sku-trend-select');
+  if (!sel) return;
+  // 現状の ranking テーブルから上位 50 個を抽出
+  const rows = Array.from(document.querySelectorAll('#ranking-table tbody tr')).slice(0, 50);
+  if (rows.length === 0) {
+    sel.innerHTML = '<option value="">対象 SKU なし</option>';
+    return;
+  }
+  const options = rows.map((tr, i) => {
+    const cells = tr.cells;
+    if (!cells || cells.length < 2) return null;
+    // 2 列目が商品名、title 属性に sku_code が入る (loadRanking で<td title="${escapeHtml(r.sku_code)}">)
+    const nameCell = cells[1];
+    const skuCode = nameCell.getAttribute('title') || '';
+    const name = nameCell.textContent || skuCode;
+    if (!skuCode) return null;
+    return { skuCode, name, rank: i + 1 };
+  }).filter(Boolean);
+
+  sel.innerHTML = '<option value="">商品を選択…</option>' + options.map((o) =>
+    `<option value="${escapeHtml(o.skuCode)}">${escapeHtml(`#${o.rank} ${o.name}`)}</option>`,
+  ).join('');
+
+  if (state.skuTrend && options.some((o) => o.skuCode === state.skuTrend)) {
+    sel.value = state.skuTrend;
+    loadSkuTrend(state.skuTrend);
+  } else if (state.skuTrend) {
+    // 選択中 SKU が現フィルタ Top 50 に無い場合は強制的に option 追加して維持
+    sel.insertAdjacentHTML('beforeend',
+      `<option value="${escapeHtml(state.skuTrend)}" selected>${escapeHtml(`(現フィルタ外) ${state.skuTrend}`)}</option>`);
+    loadSkuTrend(state.skuTrend);
+  }
+}
+
+// 商品別トレンドグラフ (PR-J、SKU 個別時系列)
+async function loadSkuTrend(skuCode) {
+  const wrap = document.getElementById('sku-trend-chart');
+  if (!skuCode) {
+    wrap.innerHTML = '<div class="sku-trend-empty">商品を選択してください</div>';
+    return;
+  }
+  if (!periodReady()) {
+    wrap.innerHTML = '<div class="sku-trend-empty">期間を確定してください</div>';
+    return;
+  }
+  try {
+    const qs = buildPeriodQS();
+    if (state.season && state.mode === 'window') qs.set('season_code', state.season);
+    if (state.granularity && state.granularity !== 'auto') qs.set('granularity', state.granularity);
+    qs.set('sku_code', skuCode);
+    const r = await fetchJson('/apps/sales-analytics-linegift/api/dashboard/sku-trend?' + qs.toString());
+    if (!r || !r.rows || r.rows.length === 0) {
+      wrap.innerHTML = '<div class="sku-trend-empty">期間内データなし</div>';
+      return;
+    }
+    const rows = r.rows.map((x) => ({ ...x, year_month: x.bucket }));
+    // 既存 loadMonthly と同じ描画ロジックを使う (タイトルだけ商品名に変更)
+    const rawMaxAmount = Math.max(
+      ...rows.map((x) => Number(x.sales_jpy_incl) || 0),
+      ...rows.map((x) => Number(x.gross_profit_jpy_incl) || 0),
+      1,
+    );
+    const rawMaxRate = Math.max(...rows.map((x) => Number(x.gross_margin_rate) || 0), 0.01);
+    const maxAmount = niceTickMax(rawMaxAmount);
+    const maxRatePct = Math.max(5, Math.ceil(rawMaxRate * 100 * 1.2 / 5) * 5);
+    const W = Math.max(rows.length * 60, 540);
+    const H = 320;
+    const padL = 78, padR = 78, padB = 40, padT = 36;
+    const innerW = W - padL - padR;
+    const innerH = H - padT - padB;
+    const slotW = innerW / rows.length;
+    const bw = slotW * 0.34;
+    let svg = `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg">`;
+    for (let i = 0; i <= 5; i++) {
+      const y = padT + innerH * (1 - i / 5);
+      svg += `<line x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}" stroke="#eaecef" stroke-width="1" />`;
+      svg += `<text x="${padL - 6}" y="${y + 4}" text-anchor="end" fill="#586069">${fmtJpy(maxAmount * i / 5)}</text>`;
+      svg += `<text x="${W - padR + 6}" y="${y + 4}" text-anchor="start" fill="#0969da">${(maxRatePct * i / 5).toFixed(0)}%</text>`;
+    }
+    svg += `<line class="axis" x1="${padL}" y1="${H - padB}" x2="${W - padR}" y2="${H - padB}" stroke-width="1.5" />`;
+    rows.forEach((x, i) => {
+      const slotX = padL + i * slotW;
+      const center = slotX + slotW / 2;
+      const xSales  = center - bw - 1;
+      const xProfit = center + 1;
+      const hSales  = innerH * ((Number(x.sales_jpy_incl) || 0) / maxAmount);
+      const hProfit = innerH * ((Number(x.gross_profit_jpy_incl) || 0) / maxAmount);
+      svg += `<rect class="bar-sales"  x="${xSales}"  y="${H - padB - hSales}"  width="${bw}" height="${hSales}" />`;
+      svg += `<rect class="bar-profit" x="${xProfit}" y="${H - padB - hProfit}" width="${bw}" height="${hProfit}" />`;
+      svg += `<text x="${center}" y="${H - padB + 18}" text-anchor="middle" font-size="9">${escapeHtml(x.bucket)}</text>`;
+    });
+    let pathD = '';
+    rows.forEach((x, i) => {
+      const slotX = padL + i * slotW;
+      const cx = slotX + slotW / 2;
+      const ratePct = (Number(x.gross_margin_rate) || 0) * 100;
+      const ratio = Math.min(1, Math.max(0, ratePct / maxRatePct));
+      const cy = H - padB - innerH * ratio;
+      pathD += (i === 0 ? 'M' : 'L') + cx + ' ' + cy + ' ';
+      svg += `<circle class="dot" cx="${cx}" cy="${cy}" r="3" />`;
+    });
+    svg += `<path class="line" d="${pathD.trim()}" />`;
+    // 凡例
+    svg += `<rect x="${padL}" y="${padT - 22}" width="10" height="10" fill="#06C755" />`;
+    svg += `<text x="${padL + 14}" y="${padT - 13}" fill="#06C755">売上 (左軸)</text>`;
+    svg += `<rect x="${padL + 100}" y="${padT - 22}" width="10" height="10" fill="#f59e0b" />`;
+    svg += `<text x="${padL + 114}" y="${padT - 13}" fill="#f59e0b">粗利 (左軸)</text>`;
+    svg += `<circle cx="${padL + 210}" cy="${padT - 17}" r="3" fill="#0969da" />`;
+    svg += `<text x="${padL + 218}" y="${padT - 13}" fill="#0969da">粗利率 (右軸 %)</text>`;
+    // 商品名
+    svg += `<text x="${W - padR}" y="${padT - 13}" text-anchor="end" fill="#24292e" font-weight="600">${escapeHtml(r.product_name)} (${escapeHtml(r.granularity)})</text>`;
+    svg += '</svg>';
+    wrap.innerHTML = svg;
+  } catch (e) {
+    wrap.innerHTML = `<div class="sku-trend-empty">読込失敗: ${escapeHtml(e.message)}</div>`;
+  }
 }
 
 // 曜日 × 時間帯ヒートマップ (PR-H、v1.2)
@@ -930,16 +1101,14 @@ async function loadWeekdaySummary() {
   }
 }
 
-// シーン × 前年比較 (PR-F): シーン選択時のみ表示
+// シーン × 前年比較 (PR-F): シーン選択時に詳細表示、未選択時はガイドメッセージ
 async function loadSeasonComparison() {
-  const panel = document.getElementById('season-compare-panel');
   const body  = document.getElementById('season-compare-body');
-  // シーン未選択時はパネル非表示
+  // シーン未選択時はガイドメッセージ (PR-J: タブ内に常時表示するため hide ではなく empty message)
   if (!state.season) {
-    panel.style.display = 'none';
+    body.innerHTML = '<div class="empty">フィルタの「シーン」で対象シーンを選択してください</div>';
     return;
   }
-  panel.style.display = '';
   body.innerHTML = '<div class="loading">読み込み中…</div>';
   try {
     const qs = new URLSearchParams({ season_code: state.season });
@@ -1195,7 +1364,9 @@ document.getElementById('reset-btn').addEventListener('click', () => {
   state.season = ''; state.sort = 'sales';
   state.top5Mode = 'profit';
   state.granularity = 'auto';
-  history.replaceState(null, '', location.pathname);
+  state.skuTrend = '';
+  // tab は維持 (現在見ているタブを変えると驚き)
+  history.replaceState(null, '', location.pathname + (state.tab === 'overview' ? '' : '?tab=' + state.tab));
   syncFiltersFromState();
   syncTop5ModeFromState();
   syncGranularityFromState();
@@ -1237,8 +1408,39 @@ document.getElementById('trend-granularity').addEventListener('click', (ev) => {
   setQS('granularity', g === 'auto' ? '' : g); // auto はデフォルトのため URL から省く
   syncGranularityFromState();
   loadMonthly();
+  // 商品別トレンドも粒度連動 (PR-J)
+  if (state.skuTrend) loadSkuTrend(state.skuTrend);
 });
 syncGranularityFromState();
+
+// タブ切替 (PR-J、2026-05-28 「スクロールしすぎる」対応)
+function syncTabFromState() {
+  document.querySelectorAll('.tabs button').forEach((b) => {
+    b.classList.toggle('active', b.dataset.tab === state.tab);
+  });
+  document.querySelectorAll('.tab-content').forEach((c) => {
+    c.classList.toggle('active', c.id === `tab-${state.tab}`);
+  });
+}
+document.querySelector('.tabs').addEventListener('click', (ev) => {
+  const btn = ev.target.closest('button');
+  if (!btn) return;
+  const t = btn.dataset.tab;
+  if (!['overview', 'products', 'season-price', 'time'].includes(t)) return;
+  if (t === state.tab) return;
+  state.tab = t;
+  setQS('tab', t === 'overview' ? '' : t);
+  syncTabFromState();
+});
+syncTabFromState();
+
+// 商品トレンド SKU セレクタ (PR-J)
+document.getElementById('sku-trend-select').addEventListener('change', (ev) => {
+  const v = ev.target.value || '';
+  state.skuTrend = v;
+  setQS('sku_trend', v);
+  loadSkuTrend(v);
+});
 document.getElementById('build-btn').addEventListener('click', async (ev) => {
   const btn = ev.target;
   btn.disabled = true; btn.textContent = '⏳ 起動中…';
