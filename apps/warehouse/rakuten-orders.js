@@ -17,14 +17,7 @@
  */
 import 'dotenv/config';
 import { initDB, getDB, updateSyncMeta } from './db.js';
-
-const SERVICE_SECRET = process.env.RAKUTEN_SERVICE_SECRET;
-const LICENSE_KEY = process.env.RAKUTEN_LICENSE_KEY;
-const AUTH = SERVICE_SECRET && LICENSE_KEY
-  ? Buffer.from(`${SERVICE_SECRET}:${LICENSE_KEY}`).toString('base64')
-  : null;
-
-const BASE_URL = 'https://api.rms.rakuten.co.jp/es/2.0/order';
+import { rakutenRequest } from './rakuten-client.js';
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -35,27 +28,23 @@ function now() {
 }
 
 // ─── API呼び出し ───
+// レート制御 (1req/sec) と 429/5xx retry は rakuten-client.js に一元化済み
 
 async function callRMS(endpoint, body) {
-  const url = `${BASE_URL}/${endpoint}/`;
-  const response = await fetch(url, {
+  const result = await rakutenRequest({
+    path: `/es/2.0/order/${endpoint}/`,
     method: 'POST',
-    headers: {
-      'Authorization': `ESA ${AUTH}`,
-      'Content-Type': 'application/json; charset=utf-8',
-    },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(60000),
+    body,
   });
 
-  if (!response.ok) {
-    throw new Error(`RMS API ${endpoint} HTTP ${response.status}`);
+  if (result.status < 200 || result.status >= 300) {
+    throw new Error(`RMS API ${endpoint} HTTP ${result.status}`);
   }
 
-  const data = await response.json();
+  const data = result.data;
 
   // エラーチェック（レスポンス本文はログに出さない＝個人情報対策）
-  if (data.MessageModelList) {
+  if (data && data.MessageModelList) {
     const errors = data.MessageModelList.filter(m => m.messageType === 'ERROR');
     if (errors.length > 0) {
       throw new Error(`RMS API ${endpoint}: ${errors.map(e => e.messageCode + ' ' + e.message).join(', ')}`);
@@ -229,7 +218,7 @@ async function fetchAndImport(startDate, endDate, batchId) {
     allOrderNumbers = allOrderNumbers.concat(result.orderNumbers);
     totalPages = result.totalPages;
     page++;
-    if (page <= totalPages) await sleep(1000);
+    // ペース調整は rakuten-client.js (1.1秒間隔) に一任
   }
 
   if (allOrderNumbers.length === 0) {
@@ -246,7 +235,7 @@ async function fetchAndImport(startDate, endDate, batchId) {
     console.log(`[楽天] getOrder: ${i + 1}〜${Math.min(i + 100, allOrderNumbers.length)} / ${allOrderNumbers.length}`);
     const items = await getOrderDetails(batch);
     allItems = allItems.concat(items);
-    if (i + 100 < allOrderNumbers.length) await sleep(1000);
+    // ペース調整は rakuten-client.js (1.1秒間隔) に一任
   }
 
   console.log(`[楽天] 商品明細取得: ${allItems.length}件`);
@@ -263,8 +252,8 @@ async function fetchAndImport(startDate, endDate, batchId) {
 async function main() {
   const args = process.argv.slice(2);
 
-  // 認証チェック
-  if (!SERVICE_SECRET || !LICENSE_KEY) {
+  // 認証チェック (helper でも throw されるが、起動時の早期エラーとして残す)
+  if (!process.env.RAKUTEN_SERVICE_SECRET || !process.env.RAKUTEN_LICENSE_KEY) {
     console.error('[楽天] 環境変数が不足: RAKUTEN_SERVICE_SECRET, RAKUTEN_LICENSE_KEY');
     process.exit(1);
   }
