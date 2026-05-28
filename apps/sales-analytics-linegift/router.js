@@ -25,6 +25,7 @@ import {
   getPriceBandSummary, getPriceBandSummaryByPeriod, listSeasons, listAvailableMonths,
   getBuildStatus, resolvePeriod,
   getDeadStockSkus, getNewItemRamps, getSeasonComparison,
+  getTrend, getWeekdaySummary,
 } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -172,6 +173,41 @@ router.get('/api/dashboard/season-comparison', (req, res) => {
         req.query.season_year ? Number(req.query.season_year) : null,
       ),
     });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// 期間モード連動トレンド (PR-G ⑥): granularity=day/week/month (auto)
+router.get('/api/dashboard/trend', (req, res) => {
+  try {
+    const spec = {
+      window: req.query.window ? Number(req.query.window) : 90,
+      month: req.query.month || null,
+      from: req.query.from || null,
+      to: req.query.to || null,
+      season_code: req.query.season_code || null,
+      season_year: req.query.season_year ? Number(req.query.season_year) : null,
+      granularity: req.query.granularity || null,
+    };
+    res.json({ ok: true, result: getTrend(spec) });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// 曜日別売上サマリ (PR-G ⑧、時間帯は v1.2 課題)
+router.get('/api/dashboard/weekday-summary', (req, res) => {
+  try {
+    const spec = {
+      window: req.query.window ? Number(req.query.window) : 90,
+      month: req.query.month || null,
+      from: req.query.from || null,
+      to: req.query.to || null,
+      season_code: req.query.season_code || null,
+      season_year: req.query.season_year ? Number(req.query.season_year) : null,
+    };
+    res.json({ ok: true, result: getWeekdaySummary(spec) });
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
   }

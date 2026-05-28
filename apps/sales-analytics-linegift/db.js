@@ -233,6 +233,122 @@ export function getMonthlyTrend() {
 }
 
 /**
+ * 期間モード連動トレンド (中原さん指示 2026-05-28、PR-G ⑥)
+ *
+ * granularity を自動 or 明示で選択し、その粒度で売上/粗利/粗利率/件数を返す:
+ *   - day:   span <= 31 日のとき自動採用
+ *   - week:  32-180 日のとき
+ *   - month: 181 日+ または期間モード未指定 (デフォルト 12ヶ月)
+ *
+ * 期間指定: periodSpec (window/month/custom/season) から resolveComparisonRanges で curr 範囲取得。
+ * granularity=month は v_linegift_monthly_trend と同等 (送料引き後粗利) を当該期間で実行。
+ */
+export function getTrend(periodSpec) {
+  const ranges = resolveComparisonRanges(periodSpec || {});
+  if (!ranges) return null;
+  const { from, to } = ranges.curr;
+  const days = (Date.parse(to + 'T00:00:00Z') - Date.parse(from + 'T00:00:00Z')) / 86400000 + 1;
+
+  // granularity 自動判定 (明示指定があれば優先)
+  let granularity = periodSpec?.granularity;
+  if (!['day', 'week', 'month'].includes(granularity)) {
+    if (days <= 31)      granularity = 'day';
+    else if (days <= 180) granularity = 'week';
+    else                  granularity = 'month';
+  }
+
+  const db = getMirrorDB();
+  let bucketExpr;
+  if (granularity === 'day') {
+    bucketExpr = 'f.date_jst';
+  } else if (granularity === 'week') {
+    // 週開始月曜日 (YYYY-MM-DD) をバケットキーに採用 (PR-G Codex Round 1 High 修正)
+    // SQLite の %W は ISO 週ではなく、年跨ぎで誤集計するため不採用。
+    // オフセット計算: dow=0(日)→-6, dow=1(月)→0, dow=2(火)→-1, ..., dow=6(土)→-5
+    bucketExpr = `date(f.date_jst, '-' || ((CAST(strftime('%w', f.date_jst) AS INTEGER) + 6) % 7) || ' days')`;
+  } else {
+    bucketExpr = `substr(f.date_jst, 1, 7)`;
+  }
+
+  const rows = db.prepare(`
+    WITH base AS (
+      SELECT
+        ${bucketExpr} AS bucket,
+        f.gross_sales_jpy_incl, f.variable_margin_jpy_incl, f.order_count, f.units_net_sold,
+        COALESCE(p.送料, 0) * (1 + COALESCE(p.消費税率, 0.1)) AS unit_shipping_cost_jpy_incl
+      FROM mirror_linegift_finance_sku_daily f
+      LEFT JOIN mirror_products p ON p.商品コード = f.ne_code
+      WHERE f.date_jst BETWEEN ? AND ?
+    )
+    SELECT
+      bucket,
+      ROUND(COALESCE(SUM(gross_sales_jpy_incl), 0)) AS sales_jpy_incl,
+      ROUND(COALESCE(SUM(variable_margin_jpy_incl), 0) - COALESCE(SUM(units_net_sold * unit_shipping_cost_jpy_incl), 0)) AS gross_profit_jpy_incl,
+      COALESCE(SUM(order_count), 0) AS orders,
+      CASE WHEN COALESCE(SUM(gross_sales_jpy_incl), 0) = 0 THEN 0
+           ELSE ROUND((COALESCE(SUM(variable_margin_jpy_incl), 0) - COALESCE(SUM(units_net_sold * unit_shipping_cost_jpy_incl), 0)) * 1.0 / COALESCE(SUM(gross_sales_jpy_incl), 0), 4) END AS gross_margin_rate
+    FROM base
+    GROUP BY bucket
+    ORDER BY bucket
+  `).all(from, to);
+
+  return {
+    granularity,
+    from, to,
+    span_days: days,
+    rows,
+  };
+}
+
+/**
+ * 曜日別売上サマリ (中原さん指示 2026-05-28、PR-G ⑧)
+ *
+ * raw_linegift_orders は Render mirror に同期されていないため、現状は
+ * mirror_linegift_finance_sku_daily の date_jst から曜日のみ集計。
+ * 時間帯軸 (00-23 時) は raw_linegift_orders を Render mirror に追加 sync した v1.2 で対応。
+ */
+export function getWeekdaySummary(periodSpec) {
+  const ranges = resolveComparisonRanges(periodSpec || {});
+  if (!ranges) return null;
+  const { from, to } = ranges.curr;
+  const db = getMirrorDB();
+  const rows = db.prepare(`
+    WITH base AS (
+      SELECT
+        CAST(strftime('%w', f.date_jst) AS INTEGER) AS dow,  -- 0=日, 1=月, ..., 6=土
+        f.gross_sales_jpy_incl, f.variable_margin_jpy_incl, f.order_count, f.units_net_sold,
+        COALESCE(p.送料, 0) * (1 + COALESCE(p.消費税率, 0.1)) AS unit_shipping_cost_jpy_incl
+      FROM mirror_linegift_finance_sku_daily f
+      LEFT JOIN mirror_products p ON p.商品コード = f.ne_code
+      WHERE f.date_jst BETWEEN ? AND ?
+    )
+    SELECT
+      dow,
+      ROUND(COALESCE(SUM(gross_sales_jpy_incl), 0)) AS sales_jpy_incl,
+      ROUND(COALESCE(SUM(variable_margin_jpy_incl), 0) - COALESCE(SUM(units_net_sold * unit_shipping_cost_jpy_incl), 0)) AS gross_profit_jpy_incl,
+      COALESCE(SUM(order_count), 0) AS orders,
+      CASE WHEN COALESCE(SUM(gross_sales_jpy_incl), 0) = 0 THEN 0
+           ELSE ROUND((COALESCE(SUM(variable_margin_jpy_incl), 0) - COALESCE(SUM(units_net_sold * unit_shipping_cost_jpy_incl), 0)) * 1.0 / COALESCE(SUM(gross_sales_jpy_incl), 0), 4) END AS gross_margin_rate
+    FROM base
+    GROUP BY dow
+    ORDER BY dow
+  `).all(from, to);
+  // dow 0-6 を全部埋めて返す (データなし曜日は 0)
+  const map = new Map(rows.map((r) => [r.dow, r]));
+  const labels = ['日', '月', '火', '水', '木', '金', '土'];
+  return {
+    from, to,
+    rows: labels.map((label, dow) => ({
+      dow, label,
+      sales_jpy_incl: (map.get(dow) || {}).sales_jpy_incl || 0,
+      gross_profit_jpy_incl: (map.get(dow) || {}).gross_profit_jpy_incl || 0,
+      orders: (map.get(dow) || {}).orders || 0,
+      gross_margin_rate: (map.get(dow) || {}).gross_margin_rate || 0,
+    })),
+  };
+}
+
+/**
  * 商品ランキング (filters: window/season_code/season_year/sort/limit)
  * シーン指定時は mart_gift_season_occurrences + mirror_linegift_finance_sku_daily で動的集計、
  * 通常は mart_linegift_sku_perf_daily を参照。
