@@ -33,6 +33,32 @@
     .kpi-card .delta.flat { color: #586069; font-weight: 500; }
     .kpi-card .delta .prev { color: #8b95a1; font-weight: 400; font-size: .92em; margin-left: 4px; }
 
+    /* 死筋 SKU パネル (PR-E、撤退判断支援) */
+    .dead-stock { font-size: .85em; }
+    .dead-stock .legend { color: #586069; font-size: .85em; margin-bottom: 6px; }
+    .dead-stock .legend code { background: #f6f8fa; padding: 1px 6px; border-radius: 3px; font-family: ui-monospace, monospace; font-size: .9em; }
+    .dead-stock table { background: #fff; }
+    .dead-stock tr.risk-red    { background: #ffebee; }
+    .dead-stock tr.risk-red:hover    { background: #ffd7d7; }
+    .dead-stock tr.risk-yellow { background: #fffbeb; }
+    .dead-stock tr.risk-yellow:hover { background: #fef3c7; }
+    .dead-stock .risk-badge { font-size: .82em; padding: 1px 6px; border-radius: 10px; font-weight: 600; }
+    .dead-stock .risk-badge.red    { background: #cf222e; color: #fff; }
+    .dead-stock .risk-badge.yellow { background: #d29922; color: #fff; }
+
+    /* 新商品立ち上がり (PR-E) */
+    .new-item-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .new-item-grid .sub { color: #586069; font-size: .78em; margin-bottom: 6px; }
+    .new-item-table { font-size: .85em; }
+    .new-item-sparkline { display: inline-block; vertical-align: middle; }
+    .ramp-chart-wrap { width: 100%; height: 260px; position: relative; }
+    .ramp-chart-wrap svg { width: 100%; height: 100%; }
+    .ramp-chart-wrap .median { stroke: #6e7681; stroke-width: 2.5; stroke-dasharray: 6 4; fill: none; }
+    .ramp-chart-wrap .sku-line { stroke: #06C755; stroke-width: 1; fill: none; opacity: .35; }
+    .ramp-chart-wrap .sku-line:hover { stroke-width: 2; opacity: 1; stroke: #058845; }
+    .ramp-chart-wrap .axis { stroke: #d0d7de; }
+    .ramp-chart-wrap text { font-size: 10px; fill: #586069; }
+
     /* TOP5 モード切替 (2026-05-28: 売上 / 粗利 の 2 モード固定、Codex 推奨) */
     .top5-modes { display: inline-flex; gap: 0; border: 1px solid #d0d7de; border-radius: 6px; overflow: hidden; font-size: .8em; margin-bottom: 8px; }
     .top5-modes button { background: #fff; border: 0; padding: 4px 10px; cursor: pointer; color: #586069; border-right: 1px solid #d0d7de; }
@@ -164,6 +190,31 @@
   <div class="panel" style="margin-bottom: 16px;">
     <h2>価格帯別販売動向 (実売単価ベース、8 段階)</h2>
     <div id="price-band-table"><div class="loading">読み込み中…</div></div>
+  </div>
+
+  <div class="panel" style="margin-bottom: 16px;">
+    <h2>💀 死筋 SKU (撤退判断支援、現フィルタ期間)</h2>
+    <div class="dead-stock">
+      <div class="legend">
+        <span class="risk-badge red">💀 赤字</span> 粗利率 &lt; 0% (売れば売るほど赤字) /
+        <span class="risk-badge yellow">⚠️ 低粗利率×低回転</span> 粗利率 &lt; 10% かつ 注文件数 &lt; 5 件
+      </div>
+      <div id="dead-stock-table"><div class="loading">読み込み中…</div></div>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-bottom: 16px;">
+    <h2>🌱 新商品 立ち上がりカーブ (発売 ≤ 90 日)</h2>
+    <div class="new-item-grid">
+      <div>
+        <div class="sub">SKU 別 累計売上 (day 0-60)、グレー破線は全体中央値</div>
+        <div class="ramp-chart-wrap" id="new-item-chart"><div class="loading">読み込み中…</div></div>
+      </div>
+      <div>
+        <div class="sub">SKU 一覧 (発売日 / 30 日累計 売上・粗利 / vs 中央値)</div>
+        <div class="new-item-table" id="new-item-table"><div class="loading">読み込み中…</div></div>
+      </div>
+    </div>
   </div>
 
   <div class="panel scroll">
@@ -653,9 +704,11 @@ function clearPanelsForPendingPeriod() {
   ['kpi-sales','kpi-orders','kpi-aov','kpi-profit','kpi-rate'].forEach((id) => {
     document.getElementById(id).textContent = '-';
   });
-  document.getElementById('top5-list').innerHTML       = placeholder;
+  document.getElementById('top5-list').innerHTML        = placeholder;
   document.getElementById('price-band-table').innerHTML = placeholder;
+  document.getElementById('dead-stock-table').innerHTML = placeholder;
   document.getElementById('ranking-table').innerHTML    = placeholder;
+  // 新商品 ramp は期間に依存しない (発売日基準) ため残置
 }
 
 function refreshAll() {
@@ -670,8 +723,152 @@ function refreshAll() {
   loadMonthly();
   loadTop5();
   loadPriceBand();
+  loadDeadStock();
+  loadNewItemRamp();
   loadRanking();
   loadBuildStatus();
+}
+
+// 死筋 SKU (PR-E、撤退判断支援)
+async function loadDeadStock() {
+  const wrap = document.getElementById('dead-stock-table');
+  try {
+    const qs = buildPeriodQS();
+    if (state.season && state.mode === 'window') qs.set('season_code', state.season);
+    const rows = await fetchJson('/apps/sales-analytics-linegift/api/dashboard/dead-stock?' + qs.toString());
+    if (!rows || rows.length === 0) {
+      wrap.innerHTML = '<div class="empty">該当 SKU なし (現フィルタ期間は健全)</div>';
+      return;
+    }
+    const redCount    = rows.filter((r) => r.risk_level === 'red').length;
+    const yellowCount = rows.filter((r) => r.risk_level === 'yellow').length;
+    wrap.innerHTML = `
+      <div style="color:#586069; font-size:.85em; margin-bottom:6px;">
+        💀 赤字 <strong style="color:#cf222e">${redCount}</strong> 件 / ⚠️ 要注意 <strong style="color:#d29922">${yellowCount}</strong> 件
+      </div>
+      <table>
+        <thead><tr>
+          <th>リスク</th>
+          <th>商品</th>
+          <th class="num">売上 (円)</th>
+          <th class="num">粗利 (円)</th>
+          <th class="num">粗利率 (%)</th>
+          <th class="num">注文件数 (件)</th>
+          <th class="num">販売数 (個)</th>
+        </tr></thead>
+        <tbody>${rows.map((r) => `
+          <tr class="risk-${r.risk_level}">
+            <td><span class="risk-badge ${r.risk_level}">${escapeHtml(r.risk_label)}</span></td>
+            <td title="${escapeHtml(r.sku_code)}">${escapeHtml(r.product_name || r.sku_code)}</td>
+            <td class="num">${fmtJpy(r.sales_jpy_incl)}</td>
+            <td class="num" style="color:${r.gross_profit_jpy_incl < 0 ? '#cf222e' : '#24292e'}">${fmtJpy(r.gross_profit_jpy_incl)}</td>
+            <td class="num">${fmtPct(r.gross_margin_rate)}</td>
+            <td class="num">${fmtInt(r.orders)}</td>
+            <td class="num">${fmtInt(r.units)}</td>
+          </tr>`).join('')}</tbody>
+      </table>`;
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty">読込失敗: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+// 新商品立ち上がりカーブ (PR-E、v_linegift_new_item_ramp 由来)
+async function loadNewItemRamp() {
+  const chartWrap = document.getElementById('new-item-chart');
+  const tableWrap = document.getElementById('new-item-table');
+  try {
+    const r = await fetchJson('/apps/sales-analytics-linegift/api/dashboard/new-item-ramp?launch_lookback_days=90');
+    if (!r || !r.skus || r.skus.length === 0) {
+      chartWrap.innerHTML = '<div class="empty">直近 90 日に発売した新商品はありません</div>';
+      tableWrap.innerHTML = '';
+      return;
+    }
+    // ── 折れ線グラフ ──
+    const W = 580, H = 260, padL = 60, padR = 16, padT = 16, padB = 28;
+    const innerW = W - padL - padR, innerH = H - padT - padB;
+    const maxDay = 60;
+    let maxCum = Math.max(
+      ...r.median.map((m) => m.median_cum_sales || 0),
+      ...r.skus.flatMap((s) => s.curve.map((c) => c.cum_sales || 0)),
+      1,
+    );
+    maxCum = niceTickMax(maxCum);
+    const xOf = (day) => padL + (day / maxDay) * innerW;
+    const yOf = (val) => H - padB - (val / maxCum) * innerH;
+    let svg = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg">`;
+    // Y 軸
+    for (let i = 0; i <= 5; i++) {
+      const y = padT + innerH * (1 - i / 5);
+      svg += `<line x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}" stroke="#eaecef" />`;
+      svg += `<text x="${padL - 6}" y="${y + 3}" text-anchor="end">${fmtJpy(maxCum * i / 5)}</text>`;
+    }
+    // X 軸 day ラベル
+    [0, 7, 14, 30, 45, 60].forEach((d) => {
+      svg += `<text x="${xOf(d)}" y="${H - padB + 16}" text-anchor="middle">day ${d}</text>`;
+    });
+    // 各 SKU のカーブ (薄緑)
+    for (const sku of r.skus) {
+      if (sku.curve.length < 2) continue;
+      const d = sku.curve.map((c, i) => `${i === 0 ? 'M' : 'L'} ${xOf(c.day)} ${yOf(c.cum_sales)}`).join(' ');
+      svg += `<path class="sku-line" d="${d}"><title>${escapeHtml(sku.product_name || sku.sku_code)} (発売: ${escapeHtml(sku.first_sale_date_jst)})</title></path>`;
+    }
+    // 中央値カーブ (太グレー破線)
+    if (r.median.length >= 2) {
+      const d = r.median.map((m, i) => `${i === 0 ? 'M' : 'L'} ${xOf(m.day)} ${yOf(m.median_cum_sales)}`).join(' ');
+      svg += `<path class="median" d="${d}"><title>全体中央値</title></path>`;
+    }
+    svg += '</svg>';
+    chartWrap.innerHTML = svg;
+
+    // ── テーブル: SKU 一覧 ──
+    const dayAt = (curve, day) => {
+      // day_from_launch=day 付近の cum_sales (なければ最も近い手前)
+      let last = null;
+      for (const c of curve) { if (c.day <= day) last = c; else break; }
+      return last;
+    };
+    const medianAt = (day) => {
+      const m = r.median.find((x) => x.day === day);
+      return m ? m.median_cum_sales : null;
+    };
+    const skusSorted = r.skus.slice().sort((a, b) => {
+      const av = (dayAt(a.curve, 30) || {}).cum_sales || 0;
+      const bv = (dayAt(b.curve, 30) || {}).cum_sales || 0;
+      return bv - av;
+    });
+    const med30 = medianAt(30);
+    tableWrap.innerHTML = `<table>
+      <thead><tr>
+        <th>商品</th>
+        <th class="num">発売日</th>
+        <th class="num">30日売上 (円)</th>
+        <th class="num">30日粗利 (円)</th>
+        <th class="num">vs 中央値</th>
+      </tr></thead>
+      <tbody>${skusSorted.map((s) => {
+        const d30 = dayAt(s.curve, 30);
+        const cum30 = (d30 || {}).cum_sales || 0;
+        const profit30 = (d30 || {}).cum_profit || 0;
+        let vsLabel = '—', vsColor = '#586069';
+        if (med30 && med30 > 0) {
+          const ratio = cum30 / med30;
+          vsLabel = `${(ratio * 100).toFixed(0)}%`;
+          if (ratio >= 1.2)      vsColor = '#1a7f37';
+          else if (ratio < 0.6)  vsColor = '#cf222e';
+        }
+        return `<tr>
+          <td title="${escapeHtml(s.sku_code)}">${escapeHtml(s.product_name || s.sku_code)}</td>
+          <td class="num">${escapeHtml(s.first_sale_date_jst)}</td>
+          <td class="num">${fmtJpy(cum30)}</td>
+          <td class="num" style="color:${profit30 < 0 ? '#cf222e' : '#24292e'}">${fmtJpy(profit30)}</td>
+          <td class="num" style="color:${vsColor}; font-weight:600">${vsLabel}</td>
+        </tr>`;
+      }).join('')}</tbody>
+    </table>`;
+  } catch (e) {
+    chartWrap.innerHTML = `<div class="empty">読込失敗: ${escapeHtml(e.message)}</div>`;
+    tableWrap.innerHTML = '';
+  }
 }
 
 document.getElementById('filter-mode').addEventListener('change', (ev) => {

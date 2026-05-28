@@ -431,6 +431,150 @@ export function resolvePeriod(query) {
 }
 
 /**
+ * 死筋 SKU 抽出 (中原さん指示 2026-05-28、撤退判断支援)
+ *
+ * 判定 (Codex 推奨「基準を明文化」、PR-E Codex Round 1 High 修正で 件数=注文件数 に統一):
+ *   - 赤 (撤退候補):   粗利率 < 0 (期間内売上 > 0)            ← 売れば売るほど赤字
+ *   - 黄 (要注意):     0 <= 粗利率 < 0.10 (期間内売上 > 0 かつ 注文件数 < 5)  ← 低粗利率 × 低回転
+ *   - その他は除外 (健全 SKU はランキングで見る)
+ *
+ * 期間モードは既存と同一 (window/month/custom/season)。
+ * ソート: 粗利額の少ない順 (赤字が大きい SKU が先頭)。
+ */
+export function getDeadStockSkus(periodSpec) {
+  const ranges = resolveComparisonRanges(periodSpec || {});
+  if (!ranges) return null;
+  const db = getMirrorDB();
+  const rows = db.prepare(`
+    SELECT
+      f.ne_code, f.sku_code, MAX(f.product_name) AS product_name,
+      ROUND(COALESCE(SUM(f.gross_sales_jpy_incl), 0)) AS sales_jpy_incl,
+      ROUND(COALESCE(SUM(f.variable_margin_jpy_incl), 0) - COALESCE(SUM(f.units_net_sold * COALESCE(p.送料, 0) * (1 + COALESCE(p.消費税率, 0.1))), 0)) AS gross_profit_jpy_incl,
+      COALESCE(SUM(f.units_net_sold), 0) AS units,
+      COALESCE(SUM(f.order_count), 0) AS orders,
+      CASE WHEN COALESCE(SUM(f.gross_sales_jpy_incl), 0) = 0 THEN 0
+           ELSE ROUND((COALESCE(SUM(f.variable_margin_jpy_incl), 0) - COALESCE(SUM(f.units_net_sold * COALESCE(p.送料, 0) * (1 + COALESCE(p.消費税率, 0.1))), 0)) * 1.0 / COALESCE(SUM(f.gross_sales_jpy_incl), 0), 4) END AS gross_margin_rate
+    FROM mirror_linegift_finance_sku_daily f
+    LEFT JOIN mirror_products p ON p.商品コード = f.ne_code
+    WHERE f.date_jst BETWEEN ? AND ?
+    GROUP BY f.ne_code, f.sku_code
+    HAVING sales_jpy_incl > 0
+       AND (
+         gross_margin_rate < 0
+         OR (gross_margin_rate < 0.10 AND orders < 5)
+       )
+    ORDER BY gross_profit_jpy_incl ASC, sales_jpy_incl DESC
+    LIMIT 200
+  `).all(ranges.curr.from, ranges.curr.to);
+  // フラグ付与
+  return rows.map((r) => ({
+    ...r,
+    risk_level: r.gross_margin_rate < 0 ? 'red' : 'yellow',
+    risk_label: r.gross_margin_rate < 0 ? '💀 赤字' : '⚠️ 低粗利率×低回転',
+  }));
+}
+
+/**
+ * 新商品立ち上がり ramp (中原さん指示 2026-05-28、新商品の初速・採用判断)
+ *
+ * v_linegift_new_item_ramp が day_from_launch 0-60 で units/sales/profit を持つ。
+ * - 過去 launch_lookback_days 以内に first_sale_date_jst のある SKU を対象
+ * - SKU 別に cumulative_sales (day0..day60) を返す + 全体中央値カーブ
+ * - 中原さんが「初週ベンチ比 / 30日達成」で見られる
+ */
+export function getNewItemRamps(opts = {}) {
+  const db = getMirrorDB();
+  const lookback = Math.max(7, Math.min(365, Number(opts.launch_lookback_days) || 90));
+  // 対象 SKU を絞る (first_sale_date_jst が直近 lookback 日以内)
+  // PR-E Codex Round 3/4 High:
+  //   - view v_linegift_new_item_ramp は内部で JOIN するため SKU 抽出には重い
+  //   - 集約後 HAVING でなく、CTE materialize → WHERE 句で絞り込む形に変更 (集約後評価回避)
+  //   - cutoff_date は JS で先に確定し、string 比較で渡す
+  const jstNowMs = Date.now() + 9 * 3600 * 1000;
+  const cutoffDate = new Date(jstNowMs - lookback * 86400000).toISOString().slice(0, 10);
+  const skus = db.prepare(`
+    WITH first_sale AS (
+      SELECT sku_code, ne_code,
+             MAX(product_name) AS product_name,
+             MIN(date_jst) AS first_sale_date_jst
+      FROM mirror_linegift_finance_sku_daily
+      GROUP BY sku_code, ne_code
+    )
+    SELECT sku_code, ne_code, product_name, first_sale_date_jst
+    FROM first_sale
+    WHERE first_sale_date_jst >= ?
+    ORDER BY first_sale_date_jst DESC
+    LIMIT 50
+  `).all(cutoffDate);
+  if (skus.length === 0) return { skus: [], median: [] };
+
+  // 各 SKU の day_from_launch × cumulative_sales (送料引き後粗利も)
+  const rampRows = db.prepare(`
+    SELECT
+      r.sku_code, r.ne_code, r.day_from_launch,
+      r.units, r.sales,
+      -- 粗利は送料引き後 (LINEギフトの送料無料分を弊社負担)
+      r.profit - COALESCE(r.units * COALESCE(p.送料, 0) * (1 + COALESCE(p.消費税率, 0.1)), 0) AS profit_adj
+    FROM v_linegift_new_item_ramp r
+    LEFT JOIN mirror_products p ON p.商品コード = r.ne_code
+    WHERE r.sku_code IN (${skus.map(() => '?').join(',')})
+    -- 同 sku_code に複数 ne_code がある場合、ne_code を含めないと day 単位で混ざり累積が壊れる (PR-E Codex Round 1 High)
+    ORDER BY r.sku_code, r.ne_code, r.day_from_launch
+  `).all(...skus.map((s) => s.sku_code));
+
+  // SKU 単位で cumulative 配列を構築
+  const byKey = new Map();
+  for (const s of skus) {
+    byKey.set(`${s.sku_code}|${s.ne_code}`, {
+      sku_code: s.sku_code, ne_code: s.ne_code,
+      product_name: s.product_name, first_sale_date_jst: s.first_sale_date_jst,
+      curve: [], // [{ day, cum_sales, cum_profit, cum_units }]
+    });
+  }
+  let lastKey = null, cumSales = 0, cumProfit = 0, cumUnits = 0, lastDay = -1;
+  for (const r of rampRows) {
+    const key = `${r.sku_code}|${r.ne_code}`;
+    if (key !== lastKey) {
+      cumSales = 0; cumProfit = 0; cumUnits = 0; lastDay = -1;
+      lastKey = key;
+    }
+    // day_from_launch の抜けは前値で線形補間せず、抜けたまま (sparkline は line で描く)
+    cumSales  += Number(r.sales) || 0;
+    cumProfit += Number(r.profit_adj) || 0;
+    cumUnits  += Number(r.units) || 0;
+    const target = byKey.get(key);
+    if (target) target.curve.push({
+      day: Number(r.day_from_launch),
+      cum_sales: Math.round(cumSales),
+      cum_profit: Math.round(cumProfit),
+      cum_units: cumUnits,
+    });
+    lastDay = r.day_from_launch;
+  }
+
+  // 中央値カーブ (day 0-60、各 day で各 SKU の cum_sales の median)
+  const median = [];
+  for (let day = 0; day <= 60; day++) {
+    const vals = [];
+    for (const s of byKey.values()) {
+      const point = s.curve.find((c) => c.day === day);
+      if (point) vals.push(point.cum_sales);
+    }
+    if (vals.length === 0) continue;
+    vals.sort((a, b) => a - b);
+    const mid = Math.floor(vals.length / 2);
+    const med = vals.length % 2 === 0 ? Math.round((vals[mid - 1] + vals[mid]) / 2) : vals[mid];
+    median.push({ day, median_cum_sales: med, sample_count: vals.length });
+  }
+
+  return {
+    skus: Array.from(byKey.values()),
+    median,
+    lookback_days: lookback,
+  };
+}
+
+/**
  * シーン一覧 (フィルタ用)
  */
 export function listSeasons() {

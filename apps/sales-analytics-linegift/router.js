@@ -24,6 +24,7 @@ import {
   getMonthlyTrend, getSkuRanking,
   getPriceBandSummary, getPriceBandSummaryByPeriod, listSeasons, listAvailableMonths,
   getBuildStatus, resolvePeriod,
+  getDeadStockSkus, getNewItemRamps,
 } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -127,6 +128,33 @@ router.get('/api/dashboard/seasons', (req, res) => {
     res.json({ ok: true, result: listSeasons() });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// 死筋 SKU (撤退判断支援、PR-E)
+router.get('/api/dashboard/dead-stock', (req, res) => {
+  try {
+    const spec = {
+      window: req.query.window ? Number(req.query.window) : 90,
+      month: req.query.month || null,
+      from: req.query.from || null,
+      to: req.query.to || null,
+      season_code: req.query.season_code || null,
+      season_year: req.query.season_year ? Number(req.query.season_year) : null,
+    };
+    res.json({ ok: true, result: getDeadStockSkus(spec) });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// 新商品立ち上がり ramp (PR-E)
+router.get('/api/dashboard/new-item-ramp', (req, res) => {
+  try {
+    const lookback = req.query.launch_lookback_days ? Number(req.query.launch_lookback_days) : 90;
+    res.json({ ok: true, result: getNewItemRamps({ launch_lookback_days: lookback }) });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
   }
 });
 
