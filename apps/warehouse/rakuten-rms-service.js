@@ -4,44 +4,42 @@
  *
  * 楽天RMS APIのプロキシ。APIキー（serviceSecret/licenseKey）はミニPC側で管理。
  * LINEギフト同期・メルカリ同期の両方から利用される。
+ *
+ * レート制御は rakuten-client.js の rakutenRequest() に一元化されている
+ * (プロセス内グローバル直列キュー + 429/Retry-After 尊重 + 5xx 自動リトライ)。
+ *
+ * rateLimitMiddleware('rakuten') は HTTP route レベルでの過負荷保護
+ * (同時実行数 1 + queue 5 超で早期 429) として残してある。
  */
 import { Router } from 'express';
-import https from 'https';
 import { rateLimitMiddleware } from './rate-limiter.js';
 import { okResponse, errorResponse } from './error-handler.js';
+import { rakutenRequest } from './rakuten-client.js';
 
 const router = Router();
 
-const SERVICE_SECRET = () => process.env.RAKUTEN_SERVICE_SECRET || '';
-const LICENSE_KEY = () => process.env.RAKUTEN_LICENSE_KEY || '';
+const DETAILS_BULK_MAX = 200;
 
-function makeAuthHeader() {
-  const token = Buffer.from(`${SERVICE_SECRET()}:${LICENSE_KEY()}`).toString('base64');
-  return `ESA ${token}`;
-}
-
-/**
- * 楽天RMS APIにリクエストを送信するヘルパー
- */
-function rmsRequest(apiPath) {
-  return new Promise((resolve, reject) => {
-    const opts = {
-      hostname: 'api.rms.rakuten.co.jp',
-      path: apiPath,
-      headers: { 'Authorization': makeAuthHeader() },
+// 楽天 RMS のレスポンス本文からエラーコード / メッセージを安全に抽出 (型固定)
+function extractRmsError(data) {
+  if (data == null) return { errorCode: null, message: null };
+  if (typeof data === 'string') return { errorCode: null, message: data.slice(0, 500) };
+  if (typeof data === 'object') {
+    // MessageModelList[].messageCode / message を最優先で拾う
+    const list = Array.isArray(data.MessageModelList) ? data.MessageModelList : null;
+    if (list && list.length > 0) {
+      const err = list.find(m => m && m.messageType === 'ERROR') || list[0];
+      return {
+        errorCode: err && typeof err.messageCode === 'string' ? err.messageCode : null,
+        message: err && typeof err.message === 'string' ? err.message : null,
+      };
+    }
+    return {
+      errorCode: typeof data.code === 'string' ? data.code : null,
+      message: typeof data.message === 'string' ? data.message : null,
     };
-    https.get(opts, (res) => {
-      let body = '';
-      res.on('data', d => body += d);
-      res.on('end', () => {
-        try {
-          resolve({ status: res.statusCode, data: JSON.parse(body) });
-        } catch (e) {
-          resolve({ status: res.statusCode, data: body });
-        }
-      });
-    }).on('error', reject);
-  });
+  }
+  return { errorCode: null, message: null };
 }
 
 // ==========================================
@@ -53,7 +51,7 @@ router.get('/items/search', rateLimitMiddleware('rakuten'), async (req, res) => 
     const cursorMark = req.query.cursorMark || '*';
     const hits = req.query.hits || '100';
     const apiPath = `/es/2.0/items/search?cursorMark=${encodeURIComponent(cursorMark)}&hits=${hits}`;
-    const result = await rmsRequest(apiPath);
+    const result = await rakutenRequest({ path: apiPath });
     res.status(result.status).json(result.data);
   } catch (e) {
     errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
@@ -71,7 +69,7 @@ router.get('/items/all-codes', rateLimitMiddleware('rakuten'), async (req, res) 
 
     for (let page = 0; page < 100; page++) {
       const apiPath = `/es/2.0/items/search?cursorMark=${encodeURIComponent(cursorMark)}&hits=100`;
-      const result = await rmsRequest(apiPath);
+      const result = await rakutenRequest({ path: apiPath });
 
       if (result.status !== 200) {
         return errorResponse(res, { status: result.status, error: 'RMS_API_ERROR', message: `HTTP ${result.status}`, requestId: req.requestId });
@@ -111,7 +109,7 @@ router.get('/items/all-skus', rateLimitMiddleware('rakuten'), async (req, res) =
 
     for (let page = 0; page < 100; page++) {
       const apiPath = `/es/2.0/items/search?cursorMark=${encodeURIComponent(cursorMark)}&hits=100`;
-      const result = await rmsRequest(apiPath);
+      const result = await rakutenRequest({ path: apiPath });
 
       if (result.status !== 200) {
         return errorResponse(res, { status: result.status, error: 'RMS_API_ERROR', message: `HTTP ${result.status}`, requestId: req.requestId });
@@ -126,7 +124,6 @@ router.get('/items/all-skus', rateLimitMiddleware('rakuten'), async (req, res) =
         const variantKeys = Object.keys(variants);
 
         if (variantKeys.length === 0) {
-          // variantが無い商品（単一SKU）はitem情報だけ残す
           skus.push({
             itemNumber,
             manageNumber,
@@ -149,9 +146,6 @@ router.get('/items/all-skus', rateLimitMiddleware('rakuten'), async (req, res) =
       pageCount++;
       if (!result.data.nextCursorMark || items.length === 0) break;
       cursorMark = result.data.nextCursorMark;
-
-      // Rakuten RMS レート制限対策（1req/sec 想定で500ms sleep）
-      await new Promise(r => setTimeout(r, 500));
     }
 
     okResponse(res, { skus, count: skus.length, pages: pageCount });
@@ -167,7 +161,7 @@ router.get('/items/all-skus', rateLimitMiddleware('rakuten'), async (req, res) =
 router.get('/items/detail/:manageNumber', rateLimitMiddleware('rakuten'), async (req, res) => {
   try {
     const apiPath = `/es/2.0/items/manage-numbers/${encodeURIComponent(req.params.manageNumber)}`;
-    const result = await rmsRequest(apiPath);
+    const result = await rakutenRequest({ path: apiPath });
     res.status(result.status).json(result.data);
   } catch (e) {
     errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
@@ -175,27 +169,58 @@ router.get('/items/detail/:manageNumber', rateLimitMiddleware('rakuten'), async 
 });
 
 // 複数商品詳細（バルク）
+// 個別失敗を握り潰さず failedCodes で明示返却。status: 'ok' | 'partial'
 router.post('/items/details-bulk', rateLimitMiddleware('rakuten'), async (req, res) => {
   try {
     const { itemCodes } = req.body;
     if (!itemCodes || !Array.isArray(itemCodes)) {
       return errorResponse(res, { status: 400, error: 'VALIDATION', message: 'itemCodes required', requestId: req.requestId });
     }
+    if (itemCodes.length > DETAILS_BULK_MAX) {
+      return errorResponse(res, {
+        status: 400,
+        error: 'VALIDATION',
+        message: `itemCodes too many (${itemCodes.length} > ${DETAILS_BULK_MAX})`,
+        requestId: req.requestId,
+      });
+    }
 
     const results = [];
+    const failedCodes = [];
+
+    // 固定スキーマ: { code: string, status: number|null, errorCode: string|null, message: string|null }
     for (const code of itemCodes) {
       try {
         const apiPath = `/es/2.0/items/manage-numbers/${encodeURIComponent(code)}`;
-        const result = await rmsRequest(apiPath);
-        if (result.status === 200) {
+        const result = await rakutenRequest({ path: apiPath });
+        if (result.status === 200 && result.data) {
           results.push(result.data);
+        } else {
+          const errInfo = extractRmsError(result.data);
+          failedCodes.push({
+            code,
+            status: result.status,
+            errorCode: errInfo.errorCode,
+            message: errInfo.message,
+          });
         }
       } catch (e) {
-        // 個別エラーはスキップ
+        failedCodes.push({
+          code,
+          status: null,
+          errorCode: null,
+          message: String(e && e.message ? e.message : e),
+        });
       }
     }
 
-    okResponse(res, { items: results, count: results.length });
+    okResponse(res, {
+      items: results,
+      count: results.length,
+      failedCodes,
+      failedCount: failedCodes.length,
+      status: failedCodes.length === 0 ? 'ok' : 'partial',
+    });
   } catch (e) {
     errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
   }
@@ -207,7 +232,7 @@ router.post('/items/details-bulk', rateLimitMiddleware('rakuten'), async (req, r
 
 router.get('/status', (req, res) => {
   okResponse(res, {
-    hasCredentials: !!(SERVICE_SECRET() && LICENSE_KEY()),
+    hasCredentials: !!(process.env.RAKUTEN_SERVICE_SECRET && process.env.RAKUTEN_LICENSE_KEY),
   });
 });
 
