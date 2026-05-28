@@ -112,6 +112,14 @@
     .top5-modes button.active { background: #06C755; color: #fff; font-weight: 600; }
     .top5-modes button:hover:not(.active) { background: #f6f8fa; }
 
+    /* トレンド粒度トグル (2026-05-28、中原さん追加リクエスト) */
+    .trend-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+    .trend-granularity { display: inline-flex; gap: 0; border: 1px solid #d0d7de; border-radius: 6px; overflow: hidden; font-size: .78em; }
+    .trend-granularity button { background: #fff; border: 0; padding: 3px 10px; cursor: pointer; color: #586069; border-right: 1px solid #d0d7de; }
+    .trend-granularity button:last-child { border-right: 0; }
+    .trend-granularity button.active { background: #0969da; color: #fff; font-weight: 600; }
+    .trend-granularity button:hover:not(.active) { background: #f6f8fa; }
+
     .row-2 { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; margin-bottom: 16px; }
     .panel { background: #fff; padding: 14px; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,.06); }
     .panel h2 { font-size: .95em; margin: 0 0 10px; color: #24292e; }
@@ -217,7 +225,15 @@
 
   <div class="row-2">
     <div class="panel">
-      <h2 id="monthly-chart-title">トレンド 売上 + 粗利</h2>
+      <div class="trend-header">
+        <h2 id="monthly-chart-title" style="margin:0">トレンド 売上 + 粗利</h2>
+        <div class="trend-granularity" id="trend-granularity" role="tablist" aria-label="トレンド粒度">
+          <button type="button" data-gran="auto"  class="active" role="tab">自動</button>
+          <button type="button" data-gran="day"   role="tab">日</button>
+          <button type="button" data-gran="week"  role="tab">週</button>
+          <button type="button" data-gran="month" role="tab">月</button>
+        </div>
+      </div>
       <div class="chart-wrap">
         <div id="monthly-chart"><div class="loading">読み込み中…</div></div>
         <div class="chart-tooltip" id="monthly-tooltip" role="tooltip"></div>
@@ -323,6 +339,8 @@ const state = {
   sort: QS().get('sort') || 'sales',
   // TOP5 モード: 'profit' (経営=粗利重視、デフォルト) / 'sales' (売上重視)
   top5Mode: (['profit', 'sales'].includes(QS().get('top5_mode')) ? QS().get('top5_mode') : 'profit'),
+  // トレンド粒度: 'auto' (期間 span から自動判定、デフォルト) / 'day' / 'week' / 'month'
+  granularity: (['auto', 'day', 'week', 'month'].includes(QS().get('granularity')) ? QS().get('granularity') : 'auto'),
 };
 
 // 前期比デルタを各 KPI カードに反映 (kpi-comparison レスポンスから)
@@ -455,10 +473,13 @@ async function loadMonthly() {
     if (periodReady()) {
       const qs = buildPeriodQS();
       if (state.season && state.mode === 'window') qs.set('season_code', state.season);
+      // 中原さん指示 2026-05-28: 粒度の手動切替 (auto/day/week/month)
+      if (state.granularity && state.granularity !== 'auto') qs.set('granularity', state.granularity);
       trend = await fetchJson('/apps/sales-analytics-linegift/api/dashboard/trend?' + qs.toString());
       rows = trend?.rows || [];
       const gLabel = { day: '日次', week: '週次', month: '月次' }[trend?.granularity] || '';
-      if (title) title.textContent = `トレンド 売上 + 粗利 (${gLabel}、${trend?.from || ''} 〜 ${trend?.to || ''})`;
+      const autoTag = state.granularity === 'auto' ? '自動' : '手動';
+      if (title) title.textContent = `トレンド 売上 + 粗利 (${gLabel} / ${autoTag}、${trend?.from || ''} 〜 ${trend?.to || ''})`;
       // バケットを year_month 互換キー (year_month) にして既存描画ロジック維持
       rows = rows.map((r) => ({ ...r, year_month: r.bucket }));
     } else {
@@ -1173,9 +1194,11 @@ document.getElementById('reset-btn').addEventListener('click', () => {
   state.month = ''; state.from = ''; state.to = '';
   state.season = ''; state.sort = 'sales';
   state.top5Mode = 'profit';
+  state.granularity = 'auto';
   history.replaceState(null, '', location.pathname);
   syncFiltersFromState();
   syncTop5ModeFromState();
+  syncGranularityFromState();
   refreshAll();
 });
 
@@ -1197,6 +1220,25 @@ document.getElementById('top5-modes').addEventListener('click', (ev) => {
   loadTop5();
 });
 syncTop5ModeFromState();
+
+// トレンド粒度トグル (2026-05-28、中原さん追加リクエスト)
+function syncGranularityFromState() {
+  document.querySelectorAll('#trend-granularity button').forEach((b) => {
+    b.classList.toggle('active', b.dataset.gran === state.granularity);
+  });
+}
+document.getElementById('trend-granularity').addEventListener('click', (ev) => {
+  const btn = ev.target.closest('button');
+  if (!btn) return;
+  const g = btn.dataset.gran;
+  if (!['auto', 'day', 'week', 'month'].includes(g)) return;
+  if (g === state.granularity) return;
+  state.granularity = g;
+  setQS('granularity', g === 'auto' ? '' : g); // auto はデフォルトのため URL から省く
+  syncGranularityFromState();
+  loadMonthly();
+});
+syncGranularityFromState();
 document.getElementById('build-btn').addEventListener('click', async (ev) => {
   const btn = ev.target;
   btn.disabled = true; btn.textContent = '⏳ 起動中…';
