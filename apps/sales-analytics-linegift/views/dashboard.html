@@ -143,7 +143,13 @@
     .panel h2 { font-size: .95em; margin: 0 0 10px; color: #24292e; }
 
     .chart-wrap { width: 100%; overflow-x: auto; position: relative; }
-    svg.chart { width: 100%; max-width: 100%; height: 360px; display: block; }
+    /* CSS の width / max-width を削除 (2026-05-29、中原さん「日次グラフが細すぎ」修正)
+       理由: viewBox W=rows*90 で 90 本 = 8100、画面幅 800px に
+       preserveAspectRatio=meet で fit させると Y 軸も 800/8100=10% 縮小、
+       結果 高さ 360→36px で棒が見えなくなる。CSS 制約を外して SVG タグの
+       width/height 属性 (=viewBox W/H ピクセル) に任せ、chart-wrap.overflow-x: auto
+       で横スクロール許可。棒少ない時 (月次 12 本=1080px 等) は画面より小さく左寄せ表示 */
+    svg.chart { display: block; }
     svg.chart .bar-sales  { fill: #06C755; }
     svg.chart .bar-profit { fill: #f59e0b; }
     svg.chart .line { stroke: #0969da; stroke-width: 2; fill: none; }
@@ -574,7 +580,8 @@ async function loadMonthly() {
     // 月幅を半分に分けて棒を 2 本横並びにする
     const slotW = innerW / rows.length;
     const bw = slotW * 0.34;
-    let svg = `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg">`;
+    // 2026-05-29 中原さん指摘で width/height 属性を viewBox と同寸に明示 (CSS の width 制約撤廃と組合せ、縮小表示問題を解消)
+    let svg = `<svg class="chart" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg">`;
 
     // Y軸グリッド + 目盛り (5分割)
     const yTicks = 5;
@@ -1030,7 +1037,8 @@ async function loadSkuTrend(skuCode) {
     const innerH = H - padT - padB;
     const slotW = innerW / rows.length;
     const bw = slotW * 0.34;
-    let svg = `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg">`;
+    // 2026-05-29 中原さん指摘で width/height 属性を viewBox と同寸に明示 (CSS の width 制約撤廃と組合せ、縮小表示問題を解消)
+    let svg = `<svg class="chart" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg">`;
     for (let i = 0; i <= 5; i++) {
       const y = padT + innerH * (1 - i / 5);
       svg += `<line x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}" stroke="#eaecef" stroke-width="1" />`;
