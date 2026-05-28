@@ -33,6 +33,24 @@
     .kpi-card .delta.flat { color: #586069; font-weight: 500; }
     .kpi-card .delta .prev { color: #8b95a1; font-weight: 400; font-size: .92em; margin-left: 4px; }
 
+    /* シーン × 前年比較 (PR-F) */
+    .season-compare .summary { display: flex; gap: 24px; margin-bottom: 10px; font-size: .9em; }
+    .season-compare .summary .col { padding: 6px 12px; border-radius: 6px; background: #f6f8fa; }
+    .season-compare .summary .col strong { font-size: 1.1em; }
+    .season-compare .summary .col.curr { background: #ddf4ff; }
+    .season-compare .summary .col.prev { background: #f6f8fa; color: #586069; }
+    .season-compare table { background: #fff; font-size: .85em; }
+    .season-compare .delta-up   { color: #1a7f37; font-weight: 600; }
+    .season-compare .delta-down { color: #cf222e; font-weight: 600; }
+    .season-compare .delta-flat { color: #586069; }
+    .season-compare .empty-curr { background: #fef3c7; }
+    .season-compare .empty-prev { background: #ddf4ff; }
+
+    /* 価格帯ギャップ列 (PR-F): 全体平均 vs バンド粗利率の差 */
+    .priceband-gap.gap-up   { color: #1a7f37; font-weight: 600; }
+    .priceband-gap.gap-down { color: #cf222e; font-weight: 600; }
+    .priceband-gap.gap-flat { color: #586069; }
+
     /* 死筋 SKU パネル (PR-E、撤退判断支援) */
     .dead-stock { font-size: .85em; }
     .dead-stock .legend { color: #586069; font-size: .85em; margin-bottom: 6px; }
@@ -190,6 +208,11 @@
   <div class="panel" style="margin-bottom: 16px;">
     <h2>価格帯別販売動向 (実売単価ベース、8 段階)</h2>
     <div id="price-band-table"><div class="loading">読み込み中…</div></div>
+  </div>
+
+  <div class="panel season-compare" id="season-compare-panel" style="margin-bottom: 16px; display:none;">
+    <h2>🎁 シーン × 前年同シーン比較 (SKU 単位)</h2>
+    <div id="season-compare-body"><div class="loading">読み込み中…</div></div>
   </div>
 
   <div class="panel" style="margin-bottom: 16px;">
@@ -569,7 +592,15 @@ async function loadPriceBand() {
     const maxOrders = Math.max(...rows.map((r) => Number(r.orders_count) || 0), 1);
     const maxSales  = Math.max(...rows.map((r) => Number(r.sales_jpy_incl) || 0), 1);
     const maxProfit = Math.max(...rows.map((r) => Number(r.gross_profit_jpy_incl) || 0), 1);
-    wrap.innerHTML = `<table>
+    // PR-F ④: 全体平均粗利率 (売上加重) と各バンドのギャップ (pt 差) を併記
+    const totalSales  = rows.reduce((a, r) => a + (Number(r.sales_jpy_incl) || 0), 0);
+    const totalProfit = rows.reduce((a, r) => a + (Number(r.gross_profit_jpy_incl) || 0), 0);
+    const overallRate = totalSales === 0 ? 0 : totalProfit / totalSales;
+    const overallPct = (overallRate * 100).toFixed(1);
+    wrap.innerHTML = `<div style="font-size:.78em; color:#586069; margin-bottom:6px;">
+      全体粗利率 (売上加重): <strong>${overallPct}%</strong> — 各バンドのギャップ (vs 全体) は最終列に表示
+    </div>
+    <table>
       <thead><tr>
         <th>価格帯</th>
         <th class="num">SKU 数</th>
@@ -577,11 +608,19 @@ async function loadPriceBand() {
         <th class="num"><span style="color:#06C755">■</span> 売上 (円)</th>
         <th class="num"><span style="color:#f59e0b">■</span> 粗利 (円)</th>
         <th class="num">粗利率 (%)</th>
+        <th class="num">ギャップ vs 全体</th>
       </tr></thead>
       <tbody>${rows.map((r) => {
         const oBar = (Number(r.orders_count) || 0) / maxOrders * 60;
         const sBar = (Number(r.sales_jpy_incl) || 0) / maxSales * 60;
         const pBar = (Number(r.gross_profit_jpy_incl) || 0) / maxProfit * 60;
+        const gapPt = ((Number(r.gross_margin_rate) || 0) - overallRate) * 100;
+        let gapCls = 'gap-flat', gapArrow = '＝';
+        if (gapPt >=  5) { gapCls = 'gap-up';   gapArrow = '▲'; }   // 強化余地 (高粗利率帯)
+        if (gapPt <= -5) { gapCls = 'gap-down'; gapArrow = '▼'; }   // 見直し余地 (低粗利率帯)
+        const gapLabel = (Number(r.sales_jpy_incl) || 0) === 0
+          ? '<span class="priceband-gap gap-flat">—</span>'
+          : `<span class="priceband-gap ${gapCls}">${gapArrow} ${gapPt >= 0 ? '+' : ''}${gapPt.toFixed(1)}pt</span>`;
         return `<tr>
           <td>${escapeHtml(r.band_label)}</td>
           <td class="num">${fmtInt(r.sku_count)}</td>
@@ -589,9 +628,13 @@ async function loadPriceBand() {
           <td class="num">${fmtJpy(r.sales_jpy_incl)} <span class="bar-cell" style="width:${sBar.toFixed(0)}px"></span></td>
           <td class="num">${fmtJpy(r.gross_profit_jpy_incl)} <span class="bar-cell profit" style="width:${pBar.toFixed(0)}px"></span></td>
           <td class="num">${fmtPct(r.gross_margin_rate)}</td>
+          <td class="num">${gapLabel}</td>
         </tr>`;
       }).join('')}</tbody>
-    </table>`;
+    </table>
+    <div style="font-size:.75em; color:#586069; margin-top:4px;">
+      ▲ +5pt 以上: 高粗利率帯 (強化余地) / ▼ -5pt 以下: 低粗利率帯 (値上げ・販促配分の見直し余地)
+    </div>`;
   } catch (e) {
     wrap.innerHTML = `<div class="empty">読込失敗: ${escapeHtml(e.message)}</div>`;
   }
@@ -725,8 +768,105 @@ function refreshAll() {
   loadPriceBand();
   loadDeadStock();
   loadNewItemRamp();
+  loadSeasonComparison();
   loadRanking();
   loadBuildStatus();
+}
+
+// シーン × 前年比較 (PR-F): シーン選択時のみ表示
+async function loadSeasonComparison() {
+  const panel = document.getElementById('season-compare-panel');
+  const body  = document.getElementById('season-compare-body');
+  // シーン未選択時はパネル非表示
+  if (!state.season) {
+    panel.style.display = 'none';
+    return;
+  }
+  panel.style.display = '';
+  body.innerHTML = '<div class="loading">読み込み中…</div>';
+  try {
+    const qs = new URLSearchParams({ season_code: state.season });
+    const r = await fetchJson('/apps/sales-analytics-linegift/api/dashboard/season-comparison?' + qs.toString());
+    if (!r) {
+      body.innerHTML = '<div class="empty">該当シーンが見つかりません</div>';
+      return;
+    }
+    // サマリ集計 (curr/prev の合計)
+    const sumCurr = r.rows.reduce((acc, x) => ({
+      sales: acc.sales + (x.curr_sales || 0), profit: acc.profit + (x.curr_profit || 0),
+      units: acc.units + (x.curr_units || 0), orders: acc.orders + (x.curr_orders || 0),
+    }), { sales: 0, profit: 0, units: 0, orders: 0 });
+    const sumPrev = r.rows.reduce((acc, x) => ({
+      sales: acc.sales + (x.prev_sales || 0), profit: acc.profit + (x.prev_profit || 0),
+      units: acc.units + (x.prev_units || 0), orders: acc.orders + (x.prev_orders || 0),
+    }), { sales: 0, profit: 0, units: 0, orders: 0 });
+    const ratioPct = (c, p) => (p === 0 ? null : ((c - p) / p * 100));
+    // n は % 値 (例: +52% なら 52、+1.2pt なら 1.2)。閾値は 5% / 1pt 程度を「意味ある変化」とする
+    // (PR-F Codex Round 1 High: 元 0.05 のままだと 100 倍敏感に、誤判定)
+    const fmtDelta = (n, suffix = '%') => {
+      if (n == null) return '<span class="delta-flat">—</span>';
+      const threshold = suffix === 'pt' ? 1 : 5;
+      const cls = n >  threshold ? 'delta-up'   :
+                  n < -threshold ? 'delta-down' : 'delta-flat';
+      const arrow = n >  threshold ? '▲' :
+                    n < -threshold ? '▼' : '＝';
+      return `<span class="${cls}">${arrow} ${n >= 0 ? '+' : ''}${n.toFixed(1)}${suffix}</span>`;
+    };
+
+    const currLabel = r.curr ? `${r.curr.season_year} (${r.curr.from} 〜 ${r.curr.to})` : '-';
+    const prevLabel = r.prev ? `${r.prev.season_year} (${r.prev.from} 〜 ${r.prev.to})` : '前年データなし';
+    const dSales  = ratioPct(sumCurr.sales,  sumPrev.sales);
+    const dProfit = ratioPct(sumCurr.profit, sumPrev.profit);
+    const dUnits  = ratioPct(sumCurr.units,  sumPrev.units);
+    const currRate = sumCurr.sales === 0 ? 0 : sumCurr.profit / sumCurr.sales;
+    const prevRate = sumPrev.sales === 0 ? 0 : sumPrev.profit / sumPrev.sales;
+    const dRatePt  = (currRate - prevRate) * 100;
+
+    let html = `
+      <div class="summary">
+        <div class="col curr">当年: <strong>${escapeHtml(currLabel)}</strong></div>
+        <div class="col prev">前年: <strong>${escapeHtml(prevLabel)}</strong></div>
+      </div>
+      <div class="summary">
+        <div class="col">売上: <strong>${fmtJpy(sumCurr.sales)}</strong> ${fmtDelta(dSales)}</div>
+        <div class="col">粗利: <strong>${fmtJpy(sumCurr.profit)}</strong> ${fmtDelta(dProfit)}</div>
+        <div class="col">粗利率: <strong>${(currRate * 100).toFixed(1)}%</strong> ${fmtDelta(dRatePt, 'pt')}</div>
+        <div class="col">販売数: <strong>${fmtInt(sumCurr.units)}</strong> ${fmtDelta(dUnits)}</div>
+      </div>
+      <table>
+        <thead><tr>
+          <th>商品</th>
+          <th class="num">売上 (当)</th>
+          <th class="num">売上 (前)</th>
+          <th class="num">Δ売上</th>
+          <th class="num">粗利 (当)</th>
+          <th class="num">粗利 (前)</th>
+          <th class="num">粗利率 (当)</th>
+          <th class="num">Δ粗利率</th>
+          <th class="num">販売数 (当/前)</th>
+        </tr></thead>
+        <tbody>${r.rows.map((x) => {
+          const rowCls = x.curr_sales === 0 ? 'empty-curr' : (x.prev_sales === 0 ? 'empty-prev' : '');
+          return `<tr class="${rowCls}">
+            <td title="${escapeHtml(x.sku_code)}">${escapeHtml(x.product_name || x.sku_code)}</td>
+            <td class="num">${fmtJpy(x.curr_sales)}</td>
+            <td class="num">${fmtJpy(x.prev_sales)}</td>
+            <td class="num">${fmtDelta(x.delta_sales_pct == null ? null : x.delta_sales_pct * 100)}</td>
+            <td class="num" style="color:${x.curr_profit < 0 ? '#cf222e' : '#24292e'}">${fmtJpy(x.curr_profit)}</td>
+            <td class="num">${fmtJpy(x.prev_profit)}</td>
+            <td class="num">${fmtPct(x.curr_gross_margin_rate)}</td>
+            <td class="num">${fmtDelta(x.delta_rate_pt * 100, 'pt')}</td>
+            <td class="num">${fmtInt(x.curr_units)} / ${fmtInt(x.prev_units)}</td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table>
+      <div style="font-size:.78em; color:#586069; margin-top:6px;">
+        🟡 黄色行 = 当年売上なし / 🟦 青行 = 前年売上なし (新規 SKU)
+      </div>`;
+    body.innerHTML = html;
+  } catch (e) {
+    body.innerHTML = `<div class="empty">読込失敗: ${escapeHtml(e.message)}</div>`;
+  }
 }
 
 // 死筋 SKU (PR-E、撤退判断支援)
