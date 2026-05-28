@@ -20,7 +20,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { spawn } from 'node:child_process';
 import {
-  getKpiSummary, getKpiSummaryByPeriod, getMonthlyTrend, getSkuRanking,
+  getKpiSummary, getKpiSummaryByPeriod, getKpiWithPrevious,
+  getMonthlyTrend, getSkuRanking,
   getPriceBandSummary, getPriceBandSummaryByPeriod, listSeasons, listAvailableMonths,
   getBuildStatus, resolvePeriod,
 } from './db.js';
@@ -43,6 +44,25 @@ router.get('/api/dashboard/kpi-summary', (req, res) => {
     }
     const w = Number(req.query.window) || 90;
     res.json({ ok: true, result: getKpiSummary(w) });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// 前期比つき KPI (中原さん指摘 2026-05-28)
+// クエリ: window=7/28/90 / month=YYYY-MM / from=&to= / season_code+season_year のいずれか
+// season_code 指定時は「シーン期間 vs 前年同シーン期間」(PR-D Codex Round 2 High 修正)
+router.get('/api/dashboard/kpi-comparison', (req, res) => {
+  try {
+    const spec = {
+      window: req.query.window ? Number(req.query.window) : 90,
+      month: req.query.month || null,
+      from: req.query.from || null,
+      to: req.query.to || null,
+      season_code: req.query.season_code || null,
+      season_year: req.query.season_year ? Number(req.query.season_year) : null,
+    };
+    res.json({ ok: true, result: getKpiWithPrevious(spec) });
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
   }

@@ -27,6 +27,18 @@
     .kpi-card .label { color: #586069; font-size: .78em; margin-bottom: 4px; }
     .kpi-card .value { font-size: 1.4em; font-weight: 600; color: #24292e; }
     .kpi-card .sub { color: #586069; font-size: .72em; margin-top: 2px; }
+    .kpi-card .delta { font-size: .78em; margin-top: 4px; font-weight: 600; }
+    .kpi-card .delta.up   { color: #1a7f37; }
+    .kpi-card .delta.down { color: #cf222e; }
+    .kpi-card .delta.flat { color: #586069; font-weight: 500; }
+    .kpi-card .delta .prev { color: #8b95a1; font-weight: 400; font-size: .92em; margin-left: 4px; }
+
+    /* TOP5 モード切替 (2026-05-28: 売上 / 粗利 の 2 モード固定、Codex 推奨) */
+    .top5-modes { display: inline-flex; gap: 0; border: 1px solid #d0d7de; border-radius: 6px; overflow: hidden; font-size: .8em; margin-bottom: 8px; }
+    .top5-modes button { background: #fff; border: 0; padding: 4px 10px; cursor: pointer; color: #586069; border-right: 1px solid #d0d7de; }
+    .top5-modes button:last-child { border-right: 0; }
+    .top5-modes button.active { background: #06C755; color: #fff; font-weight: 600; }
+    .top5-modes button:hover:not(.active) { background: #f6f8fa; }
 
     .row-2 { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; margin-bottom: 16px; }
     .panel { background: #fff; padding: 14px; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,.06); }
@@ -124,11 +136,11 @@
   </div>
 
   <div class="kpi-grid">
-    <div class="kpi-card"><div class="label">売上 (税込)</div><div class="value" id="kpi-sales">-</div><div class="sub">期間集計</div></div>
-    <div class="kpi-card"><div class="label">注文数</div><div class="value" id="kpi-orders">-</div></div>
-    <div class="kpi-card"><div class="label">平均注文単価</div><div class="value" id="kpi-aov">-</div></div>
-    <div class="kpi-card"><div class="label">粗利</div><div class="value" id="kpi-profit">-</div></div>
-    <div class="kpi-card"><div class="label">粗利率</div><div class="value" id="kpi-rate">-</div></div>
+    <div class="kpi-card"><div class="label">売上 (税込)</div><div class="value" id="kpi-sales">-</div><div class="delta" id="kpi-sales-delta"></div></div>
+    <div class="kpi-card"><div class="label">注文数</div><div class="value" id="kpi-orders">-</div><div class="delta" id="kpi-orders-delta"></div></div>
+    <div class="kpi-card"><div class="label">平均注文単価</div><div class="value" id="kpi-aov">-</div><div class="delta" id="kpi-aov-delta"></div></div>
+    <div class="kpi-card"><div class="label">粗利</div><div class="value" id="kpi-profit">-</div><div class="delta" id="kpi-profit-delta"></div></div>
+    <div class="kpi-card"><div class="label">粗利率</div><div class="value" id="kpi-rate">-</div><div class="delta" id="kpi-rate-delta"></div></div>
   </div>
 
   <div class="row-2">
@@ -140,7 +152,11 @@
       </div>
     </div>
     <div class="panel">
-      <h2>利益額 TOP 5 (現フィルタ)</h2>
+      <h2>商品 TOP 5 (現フィルタ)</h2>
+      <div class="top5-modes" id="top5-modes" role="tablist" aria-label="TOP5 モード">
+        <button type="button" data-mode="profit" class="active" role="tab">💰 粗利モード</button>
+        <button type="button" data-mode="sales"  role="tab">📈 売上モード</button>
+      </div>
       <div class="top5" id="top5-list"><div class="loading">読み込み中…</div></div>
     </div>
   </div>
@@ -192,7 +208,44 @@ const state = {
   to: QS().get('to') || '',
   season: QS().get('season') || '',
   sort: QS().get('sort') || 'sales',
+  // TOP5 モード: 'profit' (経営=粗利重視、デフォルト) / 'sales' (売上重視)
+  top5Mode: (['profit', 'sales'].includes(QS().get('top5_mode')) ? QS().get('top5_mode') : 'profit'),
 };
+
+// 前期比デルタを各 KPI カードに反映 (kpi-comparison レスポンスから)
+// 売上/件数/粗利系: deltaPct (-1.0 〜 +N) を「▲X.X% (前期比)」表示。プラス=緑、マイナス=赤
+function renderDeltaPct(elId, deltaPct) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  if (deltaPct == null || Number.isNaN(deltaPct)) {
+    el.className = 'delta flat';
+    el.innerHTML = '<span class="prev">前期比 —</span>';
+    return;
+  }
+  const pct = deltaPct * 100;
+  let cls = 'flat', arrow = '＝';
+  if (pct >= 0.05)  { cls = 'up';   arrow = '▲'; }
+  if (pct <= -0.05) { cls = 'down'; arrow = '▼'; }
+  el.className = 'delta ' + cls;
+  el.innerHTML = `${arrow} ${(pct >= 0 ? '+' : '')}${pct.toFixed(1)}%<span class="prev">前期比</span>`;
+}
+
+// 粗利率は pt 差 (current.rate - previous.rate)、表示は ▲1.2pt / ▼0.8pt
+function renderDeltaPt(elId, deltaRateRaw) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  if (deltaRateRaw == null || Number.isNaN(deltaRateRaw)) {
+    el.className = 'delta flat';
+    el.innerHTML = '<span class="prev">前期比 —</span>';
+    return;
+  }
+  const pt = deltaRateRaw * 100; // 0.012 → 1.2pt
+  let cls = 'flat', arrow = '＝';
+  if (pt >= 0.05)  { cls = 'up';   arrow = '▲'; }
+  if (pt <= -0.05) { cls = 'down'; arrow = '▼'; }
+  el.className = 'delta ' + cls;
+  el.innerHTML = `${arrow} ${(pt >= 0 ? '+' : '')}${pt.toFixed(1)}pt<span class="prev">前期比</span>`;
+}
 
 function syncFiltersFromState() {
   document.getElementById('filter-mode').value = state.mode;
@@ -233,19 +286,32 @@ function periodReady() {
 
 async function loadKpi() {
   const ids = { sales: 'kpi-sales', orders: 'kpi-orders', aov: 'kpi-aov', profit: 'kpi-profit', rate: 'kpi-rate' };
+  const deltaIds = ['kpi-sales-delta', 'kpi-orders-delta', 'kpi-aov-delta', 'kpi-profit-delta', 'kpi-rate-delta'];
   try {
-    const r = await fetchJson(`/apps/sales-analytics-linegift/api/dashboard/kpi-summary?${buildPeriodQS().toString()}`);
-    if (!r) {
+    // KPI も他パネルと同じ母集団を見るため season_code を載せる (PR-D Codex Round 2 High 修正)
+    // シーン絞り込みは window モードでのみ有効 (custom/month と組み合わせ不能)
+    const qs = buildPeriodQS();
+    if (state.season && state.mode === 'window') qs.set('season_code', state.season);
+    const r = await fetchJson(`/apps/sales-analytics-linegift/api/dashboard/kpi-comparison?${qs.toString()}`);
+    if (!r || !r.current) {
       Object.values(ids).forEach((id) => document.getElementById(id).textContent = '(データなし)');
+      deltaIds.forEach((id) => { const el = document.getElementById(id); if (el) el.innerHTML = ''; });
       document.getElementById('as-of-info').textContent = '';
       return;
     }
-    document.getElementById('kpi-sales').textContent = fmtJpy(r.total_sales_jpy_incl);
-    document.getElementById('kpi-orders').textContent = fmtInt(r.total_orders);
-    document.getElementById('kpi-aov').textContent = fmtJpy(r.avg_order_value_jpy_incl);
-    document.getElementById('kpi-profit').textContent = fmtJpy(r.total_gross_profit_jpy_incl);
-    document.getElementById('kpi-rate').textContent = fmtPct(r.gross_margin_rate);
-    document.getElementById('as-of-info').textContent = `as_of: ${escapeHtml(r.as_of_date_jst)} / 集計: ${escapeHtml(r.synced_at)}`;
+    const c = r.current, p = r.previous || {}, d = r.delta_pct || {};
+    document.getElementById('kpi-sales').textContent  = fmtJpy(c.total_sales_jpy_incl);
+    document.getElementById('kpi-orders').textContent = fmtInt(c.total_orders);
+    document.getElementById('kpi-aov').textContent    = fmtJpy(c.avg_order_value_jpy_incl);
+    document.getElementById('kpi-profit').textContent = fmtJpy(c.total_gross_profit_jpy_incl);
+    document.getElementById('kpi-rate').textContent   = fmtPct(c.gross_margin_rate);
+    renderDeltaPct('kpi-sales-delta',  d.total_sales_jpy_incl);
+    renderDeltaPct('kpi-orders-delta', d.total_orders);
+    renderDeltaPct('kpi-aov-delta',    d.avg_order_value_jpy_incl);
+    renderDeltaPct('kpi-profit-delta', d.total_gross_profit_jpy_incl);
+    renderDeltaPt ('kpi-rate-delta',   d.gross_margin_rate_pt);
+    document.getElementById('as-of-info').textContent =
+      `期間: ${escapeHtml(c.from)} 〜 ${escapeHtml(c.to)} / 前期: ${escapeHtml(p.from || '-')} 〜 ${escapeHtml(p.to || '-')}`;
   } catch (e) {
     Object.values(ids).forEach((id) => document.getElementById(id).textContent = 'エラー');
     console.error(e);
@@ -413,23 +479,28 @@ function bindMonthlyTooltip(svgEl, rows) {
 
 async function loadTop5() {
   const wrap = document.getElementById('top5-list');
+  // モード設定 (2026-05-28 Codex 推奨: 自由切替ではなく経営/売上の 2 モード固定)
+  const isProfit = state.top5Mode === 'profit';
+  const sortKey  = isProfit ? 'profit' : 'sales';
+  const metricKey = isProfit ? 'gross_profit_jpy_incl' : 'sales_amount_jpy_incl';
+  const metricLabel = isProfit ? '💰 粗利額' : '📈 売上額';
+  const barColor = isProfit ? '#f59e0b' : '#06C755';
   try {
     const qs = buildPeriodQS();
-    qs.set('sort', 'profit'); qs.set('limit', '5');
+    qs.set('sort', sortKey); qs.set('limit', '5');
     if (state.season) qs.set('season_code', state.season);
     const rows = await fetchJson('/apps/sales-analytics-linegift/api/dashboard/sku-ranking?' + qs.toString());
     if (!rows || rows.length === 0) { wrap.innerHTML = '<div class="empty">データなし</div>'; return; }
-    const max = Math.max(...rows.map((r) => Number(r.gross_profit_jpy_incl) || 0), 1);
-    // 「粗利」ランキングであることを凡例で明示 (TOP5 が何の指標か分かりにくい問題への対応、2026-05-27 中原さん指摘)
-    let html = '<div style="font-size:.78em; color:#586069; margin-bottom:6px;">並び順: 💰 粗利額 (現フィルタの上位 5 件)</div>';
+    const max = Math.max(...rows.map((r) => Number(r[metricKey]) || 0), 1);
+    let html = `<div style="font-size:.78em; color:#586069; margin-bottom:6px;">並び順: ${metricLabel} (現フィルタの上位 5 件)</div>`;
     html += rows.map((r) => {
-      const pct = (Number(r.gross_profit_jpy_incl) || 0) / max * 100;
+      const pct = (Number(r[metricKey]) || 0) / max * 100;
       const label = r.product_name || r.sku_code;
       const titleAttr = `${label}\n粗利: ${fmtJpy(r.gross_profit_jpy_incl)}\n売上: ${fmtJpy(r.sales_amount_jpy_incl)}\n件数: ${fmtInt(r.units)}\n粗利率: ${fmtPct(r.gross_margin_rate)}`;
       return `<div class="top5-row" title="${escapeHtml(titleAttr)}">
         <div class="name" title="${escapeHtml(label)}">${escapeHtml(label)}</div>
-        <div class="bar-track"><div class="bar" style="width:${pct.toFixed(1)}%"></div></div>
-        <div class="val">💰 ${fmtJpy(r.gross_profit_jpy_incl)}</div>
+        <div class="bar-track"><div class="bar" style="width:${pct.toFixed(1)}%; background:${barColor}"></div></div>
+        <div class="val">${metricLabel.charAt(0)} ${fmtJpy(r[metricKey])}</div>
       </div>`;
     }).join('');
     wrap.innerHTML = html;
@@ -628,10 +699,31 @@ document.getElementById('reset-btn').addEventListener('click', () => {
   state.mode = 'window'; state.window = 90;
   state.month = ''; state.from = ''; state.to = '';
   state.season = ''; state.sort = 'sales';
+  state.top5Mode = 'profit';
   history.replaceState(null, '', location.pathname);
   syncFiltersFromState();
+  syncTop5ModeFromState();
   refreshAll();
 });
+
+// TOP5 モード切替トグル (2026-05-28、Codex 推奨の 2 モード固定)
+function syncTop5ModeFromState() {
+  document.querySelectorAll('#top5-modes button').forEach((b) => {
+    b.classList.toggle('active', b.dataset.mode === state.top5Mode);
+  });
+}
+document.getElementById('top5-modes').addEventListener('click', (ev) => {
+  const btn = ev.target.closest('button');
+  if (!btn) return;
+  const m = btn.dataset.mode;
+  if (m !== 'profit' && m !== 'sales') return;
+  if (m === state.top5Mode) return;
+  state.top5Mode = m;
+  setQS('top5_mode', m === 'profit' ? '' : m); // profit はデフォルトのため URL から省く
+  syncTop5ModeFromState();
+  loadTop5();
+});
+syncTop5ModeFromState();
 document.getElementById('build-btn').addEventListener('click', async (ev) => {
   const btn = ev.target;
   btn.disabled = true; btn.textContent = '⏳ 起動中…';
