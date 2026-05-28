@@ -301,11 +301,74 @@ export function getTrend(periodSpec) {
 }
 
 /**
+ * 曜日 × 時間帯ヒートマップ (PR-H、v1.2)
+ *
+ * mirror_linegift_orders.bought_at_jst (注文時刻 JST) から dow × hour 168 セルで集計。
+ * - dow: 0=日, 1=月, ..., 6=土
+ * - hour: 0-23
+ * - 値: 注文件数 (orders) と 売上 (selling_price 合計)
+ *
+ * 期間絞り込みは bought_date_jst を使う (orders は date_jst でなく bought_date_jst が正規)。
+ * status は LINEギフト の whitelist (received など、cancelled 除外) でなく、現状は全件
+ * 集計 (sender 側で raw 全件を送るため、最初は status='received' filter を入れない)。
+ */
+export function getDowHourHeatmap(periodSpec) {
+  const ranges = resolveComparisonRanges(periodSpec || {});
+  if (!ranges) return null;
+  const { from, to } = ranges.curr;
+  const db = getMirrorDB();
+  // mirror_linegift_orders が存在しないと throw する。catch で null 返却して UI 側でフォールバック
+  let rows;
+  try {
+    // bought_at_jst は '+09:00' 付き ISO 文字列 (例: 2026-05-15T14:30:00+09:00)。
+    // SQLite の strftime は timezone を UTC として内部解釈するため、+9 hours 補正で
+    // JST 壁時計に戻して dow/hour を抽出 (PR-H Codex Round 1 High 修正)。
+    rows = db.prepare(`
+      SELECT
+        CAST(strftime('%w', bought_at_jst, '+9 hours') AS INTEGER) AS dow,
+        CAST(strftime('%H', bought_at_jst, '+9 hours') AS INTEGER) AS hour,
+        COUNT(*) AS orders,
+        ROUND(COALESCE(SUM(selling_price), 0)) AS sales_jpy_incl
+      FROM mirror_linegift_orders
+      WHERE bought_date_jst BETWEEN ? AND ?
+        AND (status IS NULL OR status NOT IN ('cancelled', 'canceled'))
+      GROUP BY dow, hour
+      ORDER BY dow, hour
+    `).all(from, to);
+  } catch (e) {
+    if (String(e.message).includes('no such table')) {
+      return { from, to, available: false, message: 'mirror_linegift_orders がまだ同期されていません (miniPC daily-sync 側で sync-linegift-orders を有効化してください)' };
+    }
+    throw e;
+  }
+  // 168 セル (7 × 24) を埋めて返す (存在しない dow×hour は 0)
+  const labels = ['日', '月', '火', '水', '木', '金', '土'];
+  const grid = [];
+  const map = new Map(rows.map((r) => [`${r.dow}|${r.hour}`, r]));
+  for (let dow = 0; dow < 7; dow++) {
+    for (let hour = 0; hour < 24; hour++) {
+      const k = `${dow}|${hour}`;
+      const r = map.get(k);
+      grid.push({
+        dow, hour, dow_label: labels[dow],
+        orders: r ? r.orders : 0,
+        sales_jpy_incl: r ? r.sales_jpy_incl : 0,
+      });
+    }
+  }
+  return {
+    from, to,
+    available: true,
+    grid,
+  };
+}
+
+/**
  * 曜日別売上サマリ (中原さん指示 2026-05-28、PR-G ⑧)
  *
  * raw_linegift_orders は Render mirror に同期されていないため、現状は
  * mirror_linegift_finance_sku_daily の date_jst から曜日のみ集計。
- * 時間帯軸 (00-23 時) は raw_linegift_orders を Render mirror に追加 sync した v1.2 で対応。
+ * v1.2 (PR-H) で時間帯軸を別エンドポイント getDowHourHeatmap で提供。
  */
 export function getWeekdaySummary(periodSpec) {
   const ranges = resolveComparisonRanges(periodSpec || {});

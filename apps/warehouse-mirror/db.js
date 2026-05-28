@@ -687,6 +687,34 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_mlfsd_parent ON mirror_linegift_finance_sku_daily(parent_item_code)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mlfsd_frozen ON mirror_linegift_finance_sku_daily(is_frozen_after_horizon) WHERE is_frozen_after_horizon = 1');
 
+  // mirror_linegift_orders — LINEギフト v1.2 (2026-05-28、PR-H)
+  //   miniPC raw_linegift_orders から「集計用 subset」だけを Render に sync。
+  //   時間帯ヒートマップ (曜日 × 00-23 時) と将来のリピート/同梱分析の基盤。
+  //   ★ PII 列 (user_name=LINE ID / address_* / delivery_* / sku_name / parent_item_name)
+  //     は Render に送らない (sender 側で SELECT 列を制限、本テーブルにも列を持たない)。
+  //   PK: order_id (1注文1商品 = order_id 単一 PK、miniPC raw と同じ grain)
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_linegift_orders (
+    order_id                  TEXT NOT NULL PRIMARY KEY,
+    status                    TEXT,                    -- 'received' / 'cancelled' 等
+    sku_code                  TEXT,                    -- variation.code (LOWER(TRIM())、mirror_products 解決用)
+    parent_item_code          TEXT,                    -- item.code (親軸集計用)
+    selling_price             REAL,                    -- 売価 (税込・送料込み)
+    fee                       REAL,                    -- モール手数料 (税込)
+    -- タイムスタンプ (JST、時間帯ヒートマップで使用)
+    bought_at_jst             TEXT NOT NULL CHECK(bought_at_jst GLOB '????-??-??T??:??:*'),
+    bought_date_jst           TEXT NOT NULL CHECK(bought_date_jst GLOB '????-??-??'),
+    received_date_jst         TEXT,                    -- recognized_on (whitelist=received で集計の基準日)
+    -- 90日境界凍結
+    is_frozen_after_horizon   INTEGER NOT NULL DEFAULT 0 CHECK (is_frozen_after_horizon IN (0, 1)),
+    -- メタ
+    source_run_id             TEXT,
+    synced_at                 TEXT NOT NULL
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mlo_bought_at ON mirror_linegift_orders(bought_at_jst)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mlo_received  ON mirror_linegift_orders(received_date_jst)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mlo_status    ON mirror_linegift_orders(status)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mlo_sku       ON mirror_linegift_orders(sku_code)');
+
   // mirror_qoo10_finance_sku_daily — Qoo10 Phase 1 A-3 (Render 側 daily fact mirror)
   // 設計書 v0.11: g:/共有ドライブ/AI_reference/システム設計/Qoo10Phase1設計書_v0.11_20260518.md §9
   // miniPC の f_qoo10_finance_sku_daily_v1 の payload を受信

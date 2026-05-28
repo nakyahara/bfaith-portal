@@ -1,0 +1,17 @@
+{
+  "entity": "linegift_orders",
+  "contract_version": 1,
+  "source_system": "minipc-warehouse",
+  "source_object": "raw_linegift_orders",
+  "target_table": "mirror_linegift_orders",
+  "grain_definition": "one row = one order (1注文1商品 = order_id 単一 PK、miniPC raw と同じ grain)",
+  "key_columns_json": "[\"order_id\"]",
+  "payload_schema_json": "{\"type\":\"object\",\"required\":[\"order_id\",\"bought_at_jst\",\"bought_date_jst\"],\"properties\":{\"order_id\":{\"type\":\"string\",\"minLength\":1},\"status\":{\"type\":[\"string\",\"null\"]},\"sku_code\":{\"type\":[\"string\",\"null\"]},\"parent_item_code\":{\"type\":[\"string\",\"null\"]},\"selling_price\":{\"type\":[\"number\",\"null\"]},\"fee\":{\"type\":[\"number\",\"null\"]},\"bought_at_jst\":{\"type\":\"string\",\"pattern\":\"^\\\\d{4}-\\\\d{2}-\\\\d{2}T\\\\d{2}:\\\\d{2}:\\\\d{2}\"},\"bought_date_jst\":{\"type\":\"string\",\"pattern\":\"^\\\\d{4}-\\\\d{2}-\\\\d{2}$\"},\"received_date_jst\":{\"type\":[\"string\",\"null\"]},\"is_frozen_after_horizon\":{\"type\":\"integer\",\"enum\":[0,1]}}}",
+  "clear_strategy": "no_clear",
+  "clear_strategy_detail": "order_id PK で INSERT OR REPLACE、明示的な clear なし。90日 frozen horizon 越えの行は miniPC 側でも UPDATE 禁止のため整合性維持。",
+  "apply_mode": "insert_or_replace",
+  "apply_mode_detail": "INSERT OR REPLACE on order_id。status の更新 (e.g. 'received' → 'cancelled') にも追従。",
+  "enabled": 1,
+  "owner": "phase1-linegift-orders",
+  "notes": "LINEギフト v1.2 (2026-05-28、PR-H) で導入。集計用 subset のみ Render に同期 — 時間帯ヒートマップ (曜日 × 00-23 時) と将来のリピート/同梱分析の基盤。★ PII 列 (user_name=LINE ID, address_*, delivery_*, sku_name, parent_item_name) は sender 側で SELECT 列を制限し Render には送らない。entity registry (router.js ENTITY_REGISTRY) に追加済。"
+}

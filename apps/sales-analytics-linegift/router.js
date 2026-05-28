@@ -25,7 +25,7 @@ import {
   getPriceBandSummary, getPriceBandSummaryByPeriod, listSeasons, listAvailableMonths,
   getBuildStatus, resolvePeriod,
   getDeadStockSkus, getNewItemRamps, getSeasonComparison,
-  getTrend, getWeekdaySummary,
+  getTrend, getWeekdaySummary, getDowHourHeatmap,
 } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -208,6 +208,23 @@ router.get('/api/dashboard/weekday-summary', (req, res) => {
       season_year: req.query.season_year ? Number(req.query.season_year) : null,
     };
     res.json({ ok: true, result: getWeekdaySummary(spec) });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// 曜日 × 時間帯ヒートマップ (PR-H、v1.2)
+router.get('/api/dashboard/dow-hour-heatmap', (req, res) => {
+  try {
+    const spec = {
+      window: req.query.window ? Number(req.query.window) : 90,
+      month: req.query.month || null,
+      from: req.query.from || null,
+      to: req.query.to || null,
+      season_code: req.query.season_code || null,
+      season_year: req.query.season_year ? Number(req.query.season_year) : null,
+    };
+    res.json({ ok: true, result: getDowHourHeatmap(spec) });
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
   }

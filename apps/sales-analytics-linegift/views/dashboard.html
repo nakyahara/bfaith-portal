@@ -33,6 +33,21 @@
     .kpi-card .delta.flat { color: #586069; font-weight: 500; }
     .kpi-card .delta .prev { color: #8b95a1; font-weight: 400; font-size: .92em; margin-left: 4px; }
 
+    /* 曜日 × 時間帯ヒートマップ (PR-H、v1.2) */
+    .dow-hour-heatmap { width: 100%; overflow-x: auto; }
+    .dow-hour-heatmap table { border-collapse: collapse; font-size: .75em; }
+    .dow-hour-heatmap th, .dow-hour-heatmap td { border: 1px solid #f0f3f6; padding: 0; text-align: center; }
+    .dow-hour-heatmap th { background: #f6f8fa; padding: 4px 6px; font-weight: 500; color: #586069; }
+    .dow-hour-heatmap th.hour-h { min-width: 26px; }
+    .dow-hour-heatmap td.cell { width: 26px; height: 22px; position: relative; cursor: default; }
+    .dow-hour-heatmap td.cell:hover { outline: 2px solid #0969da; outline-offset: -2px; z-index: 1; }
+    .dow-hour-heatmap td.dow-label { font-weight: 600; color: #24292e; padding: 4px 8px; background: #f6f8fa; }
+    .dow-hour-heatmap td.dow-label.sun { color: #cf222e; }
+    .dow-hour-heatmap td.dow-label.sat { color: #0969da; }
+    .dow-hour-heatmap .scale-legend { display: inline-flex; align-items: center; gap: 4px; font-size: .78em; color: #586069; margin-bottom: 6px; }
+    .dow-hour-heatmap .scale-legend .swatch { display: inline-flex; height: 12px; }
+    .dow-hour-heatmap .scale-legend .swatch div { width: 14px; height: 12px; }
+
     /* 曜日別サマリ (PR-G ⑧) */
     .weekday-summary .legend { color: #586069; font-size: .78em; margin-bottom: 4px; }
     .weekday-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; }
@@ -222,7 +237,11 @@
     <h2>📅 曜日別 売上 (現フィルタ期間)</h2>
     <div class="legend">背景の青濃度 = 売上の高さ (期間内で正規化)</div>
     <div id="weekday-grid"><div class="loading">読み込み中…</div></div>
-    <div class="weekday-note">※ 時間帯軸 (00-23 時) は raw_linegift_orders を Render mirror に追加同期した v1.2 で対応予定</div>
+  </div>
+
+  <div class="panel dow-hour-heatmap" style="margin-bottom: 16px;">
+    <h2>🕐 曜日 × 時間帯 ヒートマップ (注文時刻 JST、cancelled 除外)</h2>
+    <div id="dow-hour-table"><div class="loading">読み込み中…</div></div>
   </div>
 
   <div class="panel" style="margin-bottom: 16px;">
@@ -787,6 +806,7 @@ function clearPanelsForPendingPeriod() {
   document.getElementById('price-band-table').innerHTML = placeholder;
   document.getElementById('dead-stock-table').innerHTML = placeholder;
   document.getElementById('weekday-grid').innerHTML     = placeholder;
+  document.getElementById('dow-hour-table').innerHTML   = placeholder;
   document.getElementById('ranking-table').innerHTML    = placeholder;
   // 新商品 ramp は期間に依存しない (発売日基準) ため残置
 }
@@ -807,8 +827,55 @@ function refreshAll() {
   loadNewItemRamp();
   loadSeasonComparison();
   loadWeekdaySummary();
+  loadDowHourHeatmap();
   loadRanking();
   loadBuildStatus();
+}
+
+// 曜日 × 時間帯ヒートマップ (PR-H、v1.2)
+async function loadDowHourHeatmap() {
+  const wrap = document.getElementById('dow-hour-table');
+  try {
+    const qs = buildPeriodQS();
+    if (state.season && state.mode === 'window') qs.set('season_code', state.season);
+    const r = await fetchJson('/apps/sales-analytics-linegift/api/dashboard/dow-hour-heatmap?' + qs.toString());
+    if (!r) { wrap.innerHTML = '<div class="empty">データなし</div>'; return; }
+    if (r.available === false) {
+      wrap.innerHTML = `<div class="empty">${escapeHtml(r.message || 'mirror_linegift_orders がまだ同期されていません')}</div>`;
+      return;
+    }
+    const cells = r.grid || [];
+    if (cells.length === 0) { wrap.innerHTML = '<div class="empty">期間内データなし</div>'; return; }
+    const maxOrders = Math.max(...cells.map((c) => c.orders), 1);
+    // 24 時間ヘッダー
+    let html = '<div class="scale-legend">注文件数の高さ (青濃度): <span class="swatch">';
+    [0.05, 0.12, 0.22, 0.35, 0.5, 0.65, 0.8].forEach((op) => {
+      html += `<div style="background:rgba(9,105,218,${op})"></div>`;
+    });
+    html += `</span> 低 → 高</div>`;
+    html += '<table><thead><tr><th></th>';
+    for (let h = 0; h < 24; h++) {
+      html += `<th class="hour-h">${String(h).padStart(2, '0')}</th>`;
+    }
+    html += '</tr></thead><tbody>';
+    for (let dow = 0; dow < 7; dow++) {
+      const dowCls = dow === 0 ? 'sun' : (dow === 6 ? 'sat' : '');
+      const label = ['日', '月', '火', '水', '木', '金', '土'][dow];
+      html += `<tr><td class="dow-label ${dowCls}">${label}</td>`;
+      for (let h = 0; h < 24; h++) {
+        const c = cells.find((x) => x.dow === dow && x.hour === h) || { orders: 0, sales_jpy_incl: 0 };
+        const ratio = c.orders / maxOrders;
+        const opacity = ratio === 0 ? 0 : (0.05 + ratio * 0.75);
+        const title = `${label} ${String(h).padStart(2, '0')}:00-${String(h).padStart(2, '0')}:59\n注文: ${fmtInt(c.orders)} 件\n売上: ${fmtJpy(c.sales_jpy_incl)}`;
+        html += `<td class="cell" title="${escapeHtml(title)}" style="background:rgba(9,105,218,${opacity.toFixed(2)})"></td>`;
+      }
+      html += '</tr>';
+    }
+    html += '</tbody></table>';
+    wrap.innerHTML = html;
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty">読込失敗: ${escapeHtml(e.message)}</div>`;
+  }
 }
 
 // 曜日別売上サマリ (PR-G ⑧、現状は曜日のみ、時間帯軸は v1.2)
