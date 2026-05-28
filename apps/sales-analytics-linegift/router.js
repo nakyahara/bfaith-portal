@@ -24,7 +24,7 @@ import {
   getMonthlyTrend, getSkuRanking,
   getPriceBandSummary, getPriceBandSummaryByPeriod, listSeasons, listAvailableMonths,
   getBuildStatus, resolvePeriod,
-  getDeadStockSkus, getNewItemRamps,
+  getDeadStockSkus, getNewItemRamps, getSeasonComparison,
 } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -153,6 +153,25 @@ router.get('/api/dashboard/new-item-ramp', (req, res) => {
   try {
     const lookback = req.query.launch_lookback_days ? Number(req.query.launch_lookback_days) : 90;
     res.json({ ok: true, result: getNewItemRamps({ launch_lookback_days: lookback }) });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// シーン × 前年同シーン SKU 比較 (PR-F)
+router.get('/api/dashboard/season-comparison', (req, res) => {
+  try {
+    if (!req.query.season_code) {
+      res.status(400).json({ ok: false, error: 'season_code is required' });
+      return;
+    }
+    res.json({
+      ok: true,
+      result: getSeasonComparison(
+        req.query.season_code,
+        req.query.season_year ? Number(req.query.season_year) : null,
+      ),
+    });
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
   }

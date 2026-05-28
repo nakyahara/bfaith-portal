@@ -575,6 +575,133 @@ export function getNewItemRamps(opts = {}) {
 }
 
 /**
+ * シーン × 前年同シーン SKU 比較 (中原さん指示 2026-05-28、PR-F)
+ *
+ * 当年シーン期間 (最新 season_year) と前年同シーン期間で SKU 単位の売上/粗利/件数を比較。
+ * - 当年 OR 前年に売上のあった全 SKU を OUTER 風に union
+ * - 並び: 当年売上の降順 (Top 50)
+ * - 送料引き後粗利 (mirror_products.送料 を税込換算で控除、LINEギフト FBM パターン)
+ */
+export function getSeasonComparison(seasonCode, seasonYear) {
+  if (!seasonCode) throw new Error('season_code is required');
+  const db = getMirrorDB();
+  // current occurrence (year 指定なければ最新)
+  const occ = seasonYear
+    ? db.prepare(`SELECT season_year, start_date_jst, end_date_jst FROM mart_gift_season_occurrences
+                  WHERE season_code = ? AND season_year = ? AND is_active = 1`).get(seasonCode, seasonYear)
+    : db.prepare(`SELECT season_year, start_date_jst, end_date_jst FROM mart_gift_season_occurrences
+                  WHERE season_code = ? AND is_active = 1 ORDER BY season_year DESC LIMIT 1`).get(seasonCode);
+  if (!occ) return null;
+  const prev = db.prepare(`SELECT season_year, start_date_jst, end_date_jst FROM mart_gift_season_occurrences
+                           WHERE season_code = ? AND season_year = ? AND is_active = 1`)
+    .get(seasonCode, occ.season_year - 1);
+
+  // 期間集計用 inner SQL を CTE で展開
+  const buildSql = `
+    WITH curr AS (
+      SELECT f.sku_code, f.ne_code, MAX(f.product_name) AS product_name,
+        COALESCE(SUM(f.units_net_sold), 0) AS units,
+        ROUND(COALESCE(SUM(f.gross_sales_jpy_incl), 0)) AS sales,
+        ROUND(COALESCE(SUM(f.variable_margin_jpy_incl), 0) - COALESCE(SUM(f.units_net_sold * COALESCE(p.送料, 0) * (1 + COALESCE(p.消費税率, 0.1))), 0)) AS profit,
+        COALESCE(SUM(f.order_count), 0) AS orders
+      FROM mirror_linegift_finance_sku_daily f
+      LEFT JOIN mirror_products p ON p.商品コード = f.ne_code
+      WHERE f.date_jst BETWEEN ? AND ?
+      GROUP BY f.sku_code, f.ne_code
+    ), prev AS (
+      SELECT f.sku_code, f.ne_code, MAX(f.product_name) AS product_name,
+        COALESCE(SUM(f.units_net_sold), 0) AS units,
+        ROUND(COALESCE(SUM(f.gross_sales_jpy_incl), 0)) AS sales,
+        ROUND(COALESCE(SUM(f.variable_margin_jpy_incl), 0) - COALESCE(SUM(f.units_net_sold * COALESCE(p.送料, 0) * (1 + COALESCE(p.消費税率, 0.1))), 0)) AS profit,
+        COALESCE(SUM(f.order_count), 0) AS orders
+      FROM mirror_linegift_finance_sku_daily f
+      LEFT JOIN mirror_products p ON p.商品コード = f.ne_code
+      WHERE f.date_jst BETWEEN ? AND ?
+      GROUP BY f.sku_code, f.ne_code
+    )
+    SELECT
+      COALESCE(c.sku_code, p.sku_code) AS sku_code,
+      COALESCE(c.ne_code, p.ne_code) AS ne_code,
+      COALESCE(c.product_name, p.product_name) AS product_name,
+      COALESCE(c.units, 0)  AS curr_units,  COALESCE(p.units, 0)  AS prev_units,
+      COALESCE(c.sales, 0)  AS curr_sales,  COALESCE(p.sales, 0)  AS prev_sales,
+      COALESCE(c.profit, 0) AS curr_profit, COALESCE(p.profit, 0) AS prev_profit,
+      COALESCE(c.orders, 0) AS curr_orders, COALESCE(p.orders, 0) AS prev_orders
+    FROM curr c
+    FULL OUTER JOIN prev p ON p.sku_code = c.sku_code AND p.ne_code = c.ne_code
+    ORDER BY curr_sales DESC, prev_sales DESC
+    LIMIT 50
+  `;
+  // SQLite は FULL OUTER JOIN を 3.39+ でサポート、念のため LEFT JOIN + UNION ALL 風に書き換える方が互換性高い
+  const safeSql = `
+    WITH curr AS (
+      SELECT f.sku_code, f.ne_code, MAX(f.product_name) AS product_name,
+        COALESCE(SUM(f.units_net_sold), 0) AS units,
+        ROUND(COALESCE(SUM(f.gross_sales_jpy_incl), 0)) AS sales,
+        ROUND(COALESCE(SUM(f.variable_margin_jpy_incl), 0) - COALESCE(SUM(f.units_net_sold * COALESCE(p.送料, 0) * (1 + COALESCE(p.消費税率, 0.1))), 0)) AS profit,
+        COALESCE(SUM(f.order_count), 0) AS orders
+      FROM mirror_linegift_finance_sku_daily f
+      LEFT JOIN mirror_products p ON p.商品コード = f.ne_code
+      WHERE f.date_jst BETWEEN ? AND ?
+      GROUP BY f.sku_code, f.ne_code
+    ), prev AS (
+      SELECT f.sku_code, f.ne_code, MAX(f.product_name) AS product_name,
+        COALESCE(SUM(f.units_net_sold), 0) AS units,
+        ROUND(COALESCE(SUM(f.gross_sales_jpy_incl), 0)) AS sales,
+        ROUND(COALESCE(SUM(f.variable_margin_jpy_incl), 0) - COALESCE(SUM(f.units_net_sold * COALESCE(p.送料, 0) * (1 + COALESCE(p.消費税率, 0.1))), 0)) AS profit,
+        COALESCE(SUM(f.order_count), 0) AS orders
+      FROM mirror_linegift_finance_sku_daily f
+      LEFT JOIN mirror_products p ON p.商品コード = f.ne_code
+      WHERE f.date_jst BETWEEN ? AND ?
+      GROUP BY f.sku_code, f.ne_code
+    ), keys AS (
+      SELECT sku_code, ne_code FROM curr
+      UNION
+      SELECT sku_code, ne_code FROM prev
+    )
+    SELECT
+      k.sku_code, k.ne_code,
+      COALESCE(c.product_name, p.product_name) AS product_name,
+      COALESCE(c.units, 0)  AS curr_units,  COALESCE(p.units, 0)  AS prev_units,
+      COALESCE(c.sales, 0)  AS curr_sales,  COALESCE(p.sales, 0)  AS prev_sales,
+      COALESCE(c.profit, 0) AS curr_profit, COALESCE(p.profit, 0) AS prev_profit,
+      COALESCE(c.orders, 0) AS curr_orders, COALESCE(p.orders, 0) AS prev_orders
+    FROM keys k
+    LEFT JOIN curr c ON c.sku_code = k.sku_code AND c.ne_code = k.ne_code
+    LEFT JOIN prev p ON p.sku_code = k.sku_code AND p.ne_code = k.ne_code
+    ORDER BY curr_sales DESC, prev_sales DESC
+    LIMIT 50
+  `;
+  const params = prev
+    ? [occ.start_date_jst, occ.end_date_jst, prev.start_date_jst, prev.end_date_jst]
+    : [occ.start_date_jst, occ.end_date_jst, '9999-12-31', '9999-12-31'];
+  const rows = db.prepare(safeSql).all(...params);
+  // delta 計算と粗利率付与
+  const enriched = rows.map((r) => {
+    const dSales  = r.prev_sales  === 0 ? null : (r.curr_sales  - r.prev_sales)  / r.prev_sales;
+    const dProfit = r.prev_profit === 0 ? null : (r.curr_profit - r.prev_profit) / r.prev_profit;
+    const dUnits  = r.prev_units  === 0 ? null : (r.curr_units  - r.prev_units)  / r.prev_units;
+    const currRate = r.curr_sales === 0 ? 0 : r.curr_profit / r.curr_sales;
+    const prevRate = r.prev_sales === 0 ? 0 : r.prev_profit / r.prev_sales;
+    return {
+      ...r,
+      curr_gross_margin_rate: Math.round(currRate * 10000) / 10000,
+      prev_gross_margin_rate: Math.round(prevRate * 10000) / 10000,
+      delta_sales_pct:  dSales  == null ? null : Math.round(dSales  * 10000) / 10000,
+      delta_profit_pct: dProfit == null ? null : Math.round(dProfit * 10000) / 10000,
+      delta_units_pct:  dUnits  == null ? null : Math.round(dUnits  * 10000) / 10000,
+      delta_rate_pt:    Math.round((currRate - prevRate) * 10000) / 10000,
+    };
+  });
+  return {
+    season_code: seasonCode,
+    curr: { season_year: occ.season_year, from: occ.start_date_jst, to: occ.end_date_jst },
+    prev: prev ? { season_year: prev.season_year, from: prev.start_date_jst, to: prev.end_date_jst } : null,
+    rows: enriched,
+  };
+}
+
+/**
  * シーン一覧 (フィルタ用)
  */
 export function listSeasons() {
