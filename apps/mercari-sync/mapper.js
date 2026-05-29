@@ -118,6 +118,21 @@ function truncate(text, maxLen) {
   return text;
 }
 
+// 楽天 RMS の商品説明取得
+// - productDescription はオブジェクト形式 { pc: "...", sp: "..." }
+//   PC 用が一般的に詳しいので pc を優先、不在なら sp
+// - 文字列形式 / salesDescription / description (旧API) も fallback
+function extractItemDescription(item) {
+  const pd = item.productDescription;
+  if (pd && typeof pd === 'object') {
+    return pd.pc || pd.sp || '';
+  }
+  if (typeof pd === 'string') return pd;
+  if (typeof item.salesDescription === 'string') return item.salesDescription;
+  if (typeof item.description === 'string') return item.description;
+  return '';
+}
+
 export function rakutenItemToCsvRows(item, settings, categoryMapping) {
   const warnings = [];
   const shopUrl = settings.shop_url || '';
@@ -125,7 +140,7 @@ export function rakutenItemToCsvRows(item, settings, categoryMapping) {
   const mercariCategory = categoryMapping[genreId] || settings.default_mercari_category || '';
 
   const baseName = item.title || '';
-  const description = truncate(stripHtml(item.description || ''), MAX_DESC_LEN);
+  const description = truncate(stripHtml(extractItemDescription(item)), MAX_DESC_LEN);
 
   const excludedPositions = settings.excluded_image_positions || new Set();
   const excludedPatterns = settings.excluded_image_patterns || [];
