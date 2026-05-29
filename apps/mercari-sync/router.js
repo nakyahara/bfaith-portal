@@ -24,10 +24,12 @@ function getServiceHeaders() {
   };
 }
 // details-bulk は楽天 RMS が 1req/sec のレート制限のため
-// 100件 chunk × 1.1秒 = 110秒/chunk、HTTP timeout 240秒で安全圏
-const DETAILS_BULK_CHUNK_SIZE = 100;
-const DETAILS_BULK_CHUNK_TIMEOUT_MS = 240_000;
-// all-codes は 100ページ × 1.1秒 = 最大 110 秒。cold cache 時は 5 分まで許容。
+// 50件 chunk × 1.1秒 = 55秒/chunk、Cloudflare Access の 100秒 idle timeout 内に収める
+// (100件にすると120秒かかって Cloudflare が無音で connection を切る)
+const DETAILS_BULK_CHUNK_SIZE = 50;
+const DETAILS_BULK_CHUNK_TIMEOUT_MS = 90_000;
+// all-codes は 100ページ × 1.1秒 = 最大 110 秒 だが cold cache を許容するため 300秒
+// (Render → miniPC では Cloudflare Tunnel が長時間 OK のはず、cache 命中なら即返答)
 const ALL_CODES_TIMEOUT_MS = 300_000;
 
 const rakuten = {
