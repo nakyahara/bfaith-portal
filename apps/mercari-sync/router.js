@@ -27,10 +27,12 @@ function getServiceHeaders() {
 // 100件 chunk × 1.1秒 = 110秒/chunk、HTTP timeout 240秒で安全圏
 const DETAILS_BULK_CHUNK_SIZE = 100;
 const DETAILS_BULK_CHUNK_TIMEOUT_MS = 240_000;
+// all-codes は 100ページ × 1.1秒 = 最大 110 秒。cold cache 時は 5 分まで許容。
+const ALL_CODES_TIMEOUT_MS = 300_000;
 
 const rakuten = {
   async getAllItemCodes() {
-    const res = await fetch(`${WAREHOUSE_URL}/service-api/rakuten-rms/items/all-codes`, { headers: getServiceHeaders(), signal: AbortSignal.timeout(120000) });
+    const res = await fetch(`${WAREHOUSE_URL}/service-api/rakuten-rms/items/all-codes`, { headers: getServiceHeaders(), signal: AbortSignal.timeout(ALL_CODES_TIMEOUT_MS) });
     const data = await res.json();
     if (!data.ok) throw new Error(data.message || 'RMS API error');
     return data.mapping;
