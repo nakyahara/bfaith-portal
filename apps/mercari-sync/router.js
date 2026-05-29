@@ -89,6 +89,21 @@ function genJobId() {
   return crypto.randomBytes(16).toString('hex');
 }
 
+// Rakuten RMS の variants はオブジェクト形式 {sku1: {price, hidden, ...}, sku2: {...}}
+// hidden=true を除いた配列に正規化し、value 内 skuManageNumber 不在ならキーで補完する。
+// (mapper.js / mercari-sync の集計で配列の前提のロジックが多いため一元化)
+function normalizeVariants(variants) {
+  if (Array.isArray(variants)) {
+    return variants.filter(v => v && !v.hidden);
+  }
+  if (variants && typeof variants === 'object') {
+    return Object.entries(variants)
+      .filter(([, v]) => v && !v.hidden)
+      .map(([k, v]) => ({ ...v, skuManageNumber: v.skuManageNumber || k }));
+  }
+  return [];
+}
+
 function countRunningJobs() {
   let n = 0;
   for (const j of checkCsvJobs.values()) {
@@ -320,7 +335,9 @@ async function runCheckCsvJob(jobId) {
       continue;
     }
 
-    const activeVariants = (detail.variants || []).filter(v => !v.hidden);
+    // Rakuten RMS の variants は通常オブジェクト形式 {skuManageNumber: {price, hidden, ...}}
+    // 念のため配列形式にもフォールバック
+    const activeVariants = normalizeVariants(detail.variants);
 
     if (registeredCodes.size > 0 && activeVariants.length > 0) {
       const skuCodes = new Set(activeVariants.map(v => (v.skuManageNumber || '').trim()).filter(Boolean));
@@ -476,7 +493,7 @@ router.post('/api/export-csv', async (req, res) => {
       // エクスポートした商品コード+SKUコードを記録
       exportedCodes.add(code);
       exportedCodes.add(mn);
-      for (const v of (detail.variants || [])) {
+      for (const v of normalizeVariants(detail.variants)) {
         if (v.skuManageNumber) exportedCodes.add(v.skuManageNumber);
       }
     } catch (e) {
