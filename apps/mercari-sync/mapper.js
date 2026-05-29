@@ -67,7 +67,8 @@ function normalizeShopUrl(shopUrl) {
 
 function buildSingleImageUrl(img, shopUrl) {
   const imgType = (img.type || '').toUpperCase();
-  let imgPath = img.path || '';
+  // 楽天 RMS は location が画像パス。旧コード互換で path も fallback
+  let imgPath = img.location || img.path || '';
   if (!imgPath) return '';
   if (imgPath.startsWith('http')) return imgPath;
 
@@ -128,7 +129,8 @@ export function rakutenItemToCsvRows(item, settings, categoryMapping) {
 
   const excludedPositions = settings.excluded_image_positions || new Set();
   const excludedPatterns = settings.excluded_image_patterns || [];
-  const imageUrls = buildFullImageUrls(item.imagePaths || [], shopUrl, excludedPositions, excludedPatterns);
+  // 楽天 RMS は item.images (旧名 imagePaths は fallback)
+  const imageUrls = buildFullImageUrls(item.images || item.imagePaths || [], shopUrl, excludedPositions, excludedPatterns);
 
   // Rakuten RMS の variants はオブジェクト形式 {sku1: {price, hidden, ...}}
   // hidden=true を除いた配列に正規化し、value 内 skuManageNumber 不在ならキーで補完

@@ -345,7 +345,9 @@ async function runCheckCsvJob(jobId) {
       if (matched.length > 0) { skuMatchedCount++; continue; }
     }
 
-    const imageUrls = mapper.buildFullImageUrls(detail.imagePaths || [], shopUrl);
+    // 楽天 RMS の商品画像は detail.images (各要素は {type, location, alt})
+    // 旧フィールド名 imagePaths も fallback で受け入れる
+    const imageUrls = mapper.buildFullImageUrls(detail.images || detail.imagePaths || [], shopUrl);
     // 楽天 RMS の variant 価格フィールドは standardPrice。price は念のため fallback として残す
     const variantPrices = activeVariants.map(v => parseInt(v.standardPrice ?? v.price ?? 0)).filter(p => p > 0);
     const price = variantPrices.length ? Math.min(...variantPrices) : 0;
