@@ -143,8 +143,9 @@ export function rakutenItemToCsvRows(item, settings, categoryMapping) {
     activeVariants = [];
   }
 
+  // 楽天 RMS の variant 価格フィールドは standardPrice。price は念のため fallback として残す
   const variantPrices = activeVariants
-    .map(v => parseInt(v.price || 0))
+    .map(v => parseInt(v.standardPrice ?? v.price ?? 0))
     .filter(p => p > 0);
 
   let price = 0;
