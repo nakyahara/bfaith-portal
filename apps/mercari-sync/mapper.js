@@ -130,8 +130,18 @@ export function rakutenItemToCsvRows(item, settings, categoryMapping) {
   const excludedPatterns = settings.excluded_image_patterns || [];
   const imageUrls = buildFullImageUrls(item.imagePaths || [], shopUrl, excludedPositions, excludedPatterns);
 
-  const variants = item.variants || [];
-  const activeVariants = variants.filter(v => !v.hidden);
+  // Rakuten RMS の variants はオブジェクト形式 {sku1: {price, hidden, ...}}
+  // hidden=true を除いた配列に正規化し、value 内 skuManageNumber 不在ならキーで補完
+  let activeVariants;
+  if (Array.isArray(item.variants)) {
+    activeVariants = item.variants.filter(v => v && !v.hidden);
+  } else if (item.variants && typeof item.variants === 'object') {
+    activeVariants = Object.entries(item.variants)
+      .filter(([, v]) => v && !v.hidden)
+      .map(([k, v]) => ({ ...v, skuManageNumber: v.skuManageNumber || k }));
+  } else {
+    activeVariants = [];
+  }
 
   const variantPrices = activeVariants
     .map(v => parseInt(v.price || 0))
