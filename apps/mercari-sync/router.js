@@ -28,7 +28,11 @@ function getServiceHeaders() {
 // 50件 chunk × 1.1秒 = 55秒/chunk、Cloudflare Access の 100秒 idle timeout 内に収める
 // (100件にすると120秒かかって Cloudflare が無音で connection を切る)
 const DETAILS_BULK_CHUNK_SIZE = 50;
-const DETAILS_BULK_CHUNK_TIMEOUT_MS = 90_000;
+// 50件 chunk × 1.1秒 = 55秒/chunk が理論値、実測 60-65 秒。
+// Cloudflare Tunnel の 100秒 idle response timeout を超えないギリギリ範囲。
+// 90秒だとマージンが薄すぎて Rakuten 応答が遅い時に AbortSignal が誤発火するので 110秒に。
+const DETAILS_BULK_CHUNK_TIMEOUT_MS = 110_000;
+const DETAILS_BULK_CHUNK_MAX_ATTEMPTS = 2; // 失敗時は 1 回 retry
 // all-codes は 100ページ × 1.1秒 = 最大 110 秒 だが cold cache を許容するため 300秒
 // (Render → miniPC では Cloudflare Tunnel が長時間 OK のはず、cache 命中なら即返答)
 const ALL_CODES_TIMEOUT_MS = 300_000;
@@ -289,25 +293,40 @@ async function runCheckCsvJob(jobId) {
   updateJobProgress(job, { phase: 'details', done: 0, total: apiCodes.length, chunkIndex: 0, chunkTotal });
 
   // chunk loop + chunk-by-chunk progress 更新 (Codex medium #6)
+  // chunk-level retry: 1 chunk が transient に失敗 (Rakuten 一時的遅延等) しても
+  // 自動で 1 回 retry して救済する (rakuten-client.js helper の retry とは別レイヤー)
   const details = [];
   for (let i = 0; i < apiCodes.length; i += DETAILS_BULK_CHUNK_SIZE) {
     const chunk = apiCodes.slice(i, i + DETAILS_BULK_CHUNK_SIZE);
     updateJobProgress(job, { chunkIndex: Math.floor(i / DETAILS_BULK_CHUNK_SIZE) + 1 });
-    try {
-      const r = await fetch(`${WAREHOUSE_URL}/service-api/rakuten-rms/items/details-bulk`, {
-        method: 'POST',
-        headers: getServiceHeaders(),
-        body: JSON.stringify({ itemCodes: chunk }),
-        signal: AbortSignal.timeout(DETAILS_BULK_CHUNK_TIMEOUT_MS),
-      });
-      const data = await r.json();
-      if (!data.ok) throw new Error(data.message || 'RMS API error');
-      if (Array.isArray(data.items)) details.push(...data.items);
-      updateJobProgress(job, { done: Math.min(i + DETAILS_BULK_CHUNK_SIZE, apiCodes.length) });
-    } catch (e) {
-      console.error(`[mercari-sync] check-csv job ${jobId} details-bulk chunk error:`, e);
+
+    let lastError = null;
+    let success = false;
+    for (let attempt = 1; attempt <= DETAILS_BULK_CHUNK_MAX_ATTEMPTS; attempt++) {
+      try {
+        const r = await fetch(`${WAREHOUSE_URL}/service-api/rakuten-rms/items/details-bulk`, {
+          method: 'POST',
+          headers: getServiceHeaders(),
+          body: JSON.stringify({ itemCodes: chunk }),
+          signal: AbortSignal.timeout(DETAILS_BULK_CHUNK_TIMEOUT_MS),
+        });
+        const data = await r.json();
+        if (!data.ok) throw new Error(data.message || 'RMS API error');
+        if (Array.isArray(data.items)) details.push(...data.items);
+        updateJobProgress(job, { done: Math.min(i + DETAILS_BULK_CHUNK_SIZE, apiCodes.length) });
+        success = true;
+        break;
+      } catch (e) {
+        lastError = e;
+        console.error(`[mercari-sync] check-csv job ${jobId} details-bulk chunk ${Math.floor(i / DETAILS_BULK_CHUNK_SIZE) + 1} attempt ${attempt} error:`, e.message);
+        if (attempt < DETAILS_BULK_CHUNK_MAX_ATTEMPTS) {
+          await new Promise(r => setTimeout(r, 3000)); // 3秒 backoff
+        }
+      }
+    }
+    if (!success) {
       job.status = 'error';
-      job.error = `楽天RMS API エラー（詳細取得）: ${e.message}`;
+      job.error = `楽天RMS API エラー（詳細取得）: ${lastError?.message || 'unknown'} (${DETAILS_BULK_CHUNK_MAX_ATTEMPTS}回試行後失敗)`;
       job.updatedAt = Date.now();
       return;
     }
