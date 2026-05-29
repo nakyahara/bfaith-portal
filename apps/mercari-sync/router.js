@@ -7,6 +7,7 @@ import multer from 'multer';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import archiver from 'archiver';
+import crypto from 'crypto';
 
 import * as settingsDb from './settings-db.js';
 import * as rakutenLocal from './rakuten.js';
@@ -56,6 +57,50 @@ const rakuten = {
     return allItems;
   },
 };
+
+// =========================================================================
+// 差分チェックを非同期ジョブ + polling 化する仕組み
+//
+// 同期 HTTP で 6 分待つと Cloudflare の Proxy Read Timeout (120秒) に引っかかって
+// ブラウザに応答が届かない。POST で job を kick して即 jobId を返し、
+// フロントは GET /api/check-csv-status/:jobId で 3 秒間隔 polling する設計。
+// =========================================================================
+const checkCsvJobs = new Map(); // jobId -> { status, progress, result, error, createdAt, updatedAt, lastAccessedAt }
+const JOB_TTL_DONE_MS = 30 * 60 * 1000; // done/error は 30 分保持
+const JOB_TTL_RUNNING_MS = 30 * 60 * 1000; // running も 30 分上限 (本来 6 分で終わるべき)
+const JOB_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
+const JOB_MAX_TOTAL = 50;
+const JOB_MAX_CONCURRENT_RUNNING = 3;
+
+let _checkCsvCleanupInterval = null;
+if (!_checkCsvCleanupInterval) {
+  _checkCsvCleanupInterval = setInterval(() => {
+    const now = Date.now();
+    for (const [id, job] of checkCsvJobs) {
+      const ttl = (job.status === 'running' || job.status === 'queued') ? JOB_TTL_RUNNING_MS : JOB_TTL_DONE_MS;
+      const baseline = (job.status === 'running' || job.status === 'queued') ? job.updatedAt : job.lastAccessedAt;
+      if (now - baseline > ttl) checkCsvJobs.delete(id);
+    }
+  }, JOB_CLEANUP_INTERVAL_MS);
+  if (typeof _checkCsvCleanupInterval.unref === 'function') _checkCsvCleanupInterval.unref();
+}
+
+function genJobId() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+function countRunningJobs() {
+  let n = 0;
+  for (const j of checkCsvJobs.values()) {
+    if (j.status === 'running' || j.status === 'queued') n++;
+  }
+  return n;
+}
+
+function updateJobProgress(job, patch) {
+  Object.assign(job.progress, patch);
+  job.updatedAt = Date.now();
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -181,24 +226,36 @@ router.post('/api/registered-items/clear', async (req, res) => {
   res.json({ message: '登録済みデータをクリアしました', count: 0 });
 });
 
-router.post('/api/check-csv', async (req, res) => {
+// 差分チェック実体 (非同期ジョブで実行)
+async function runCheckCsvJob(jobId) {
+  const job = checkCsvJobs.get(jobId);
+  if (!job) return;
+
+  job.status = 'running';
+  job.updatedAt = Date.now();
+  updateJobProgress(job, { phase: 'all-codes', done: 0, total: 1, chunkIndex: 0, chunkTotal: 0 });
+
   await ensureDb();
   const cfg = settingsDb.getAllConfig();
+
   let rakutenMapping;
   try {
     rakutenMapping = await rakuten.getAllItemCodes();
+    updateJobProgress(job, { done: 1 });
   } catch (e) {
-    return res.json({ error: `楽天RMS API エラー: ${e.message}` });
+    console.error(`[mercari-sync] check-csv job ${jobId} all-codes error:`, e);
+    job.status = 'error';
+    job.error = `楽天RMS API エラー: ${e.message}`;
+    job.updatedAt = Date.now();
+    return;
   }
 
   let rakutenItemNumbers = new Set(Object.keys(rakutenMapping));
   const registeredCodes = settingsDb.getRegisteredItems();
   const excludedItems = settingsDb.getExcludedItems();
 
-  // 除外適用
   for (const ex of excludedItems) rakutenItemNumbers.delete(ex);
 
-  // 差分判定
   let diffItemNumbers;
   if (registeredCodes.size > 0) {
     diffItemNumbers = new Set();
@@ -210,15 +267,35 @@ router.post('/api/check-csv', async (req, res) => {
     diffItemNumbers = new Set(rakutenItemNumbers);
   }
 
-  // 詳細取得
   const sortedDiff = [...diffItemNumbers].sort();
   const apiCodes = sortedDiff.map(n => rakutenMapping[n] || n);
+  const chunkTotal = Math.ceil(apiCodes.length / DETAILS_BULK_CHUNK_SIZE);
 
-  let details;
-  try {
-    details = await rakuten.getItemDetailsBulk(null, null, apiCodes);
-  } catch (e) {
-    return res.json({ error: `楽天RMS API エラー（詳細取得）: ${e.message}` });
+  updateJobProgress(job, { phase: 'details', done: 0, total: apiCodes.length, chunkIndex: 0, chunkTotal });
+
+  // chunk loop + chunk-by-chunk progress 更新 (Codex medium #6)
+  const details = [];
+  for (let i = 0; i < apiCodes.length; i += DETAILS_BULK_CHUNK_SIZE) {
+    const chunk = apiCodes.slice(i, i + DETAILS_BULK_CHUNK_SIZE);
+    updateJobProgress(job, { chunkIndex: Math.floor(i / DETAILS_BULK_CHUNK_SIZE) + 1 });
+    try {
+      const r = await fetch(`${WAREHOUSE_URL}/service-api/rakuten-rms/items/details-bulk`, {
+        method: 'POST',
+        headers: getServiceHeaders(),
+        body: JSON.stringify({ itemCodes: chunk }),
+        signal: AbortSignal.timeout(DETAILS_BULK_CHUNK_TIMEOUT_MS),
+      });
+      const data = await r.json();
+      if (!data.ok) throw new Error(data.message || 'RMS API error');
+      if (Array.isArray(data.items)) details.push(...data.items);
+      updateJobProgress(job, { done: Math.min(i + DETAILS_BULK_CHUNK_SIZE, apiCodes.length) });
+    } catch (e) {
+      console.error(`[mercari-sync] check-csv job ${jobId} details-bulk chunk error:`, e);
+      job.status = 'error';
+      job.error = `楽天RMS API エラー（詳細取得）: ${e.message}`;
+      job.updatedAt = Date.now();
+      return;
+    }
   }
 
   const detailMap = {};
@@ -245,7 +322,6 @@ router.post('/api/check-csv', async (req, res) => {
 
     const activeVariants = (detail.variants || []).filter(v => !v.hidden);
 
-    // SKUレベル照合
     if (registeredCodes.size > 0 && activeVariants.length > 0) {
       const skuCodes = new Set(activeVariants.map(v => (v.skuManageNumber || '').trim()).filter(Boolean));
       const matched = [...skuCodes].filter(c => registeredCodes.has(c));
@@ -271,7 +347,7 @@ router.post('/api/check-csv', async (req, res) => {
     });
   }
 
-  res.json({
+  job.result = {
     diff_items: diffItems,
     rakuten_total: rakutenItemNumbers.size,
     registered_total: registeredCodes.size,
@@ -279,6 +355,64 @@ router.post('/api/check-csv', async (req, res) => {
     excluded_count: excludedItems.size,
     sku_matched_count: skuMatchedCount,
     error: null,
+  };
+  job.status = 'done';
+  job.updatedAt = Date.now();
+  updateJobProgress(job, { phase: 'done', done: apiCodes.length, total: apiCodes.length });
+}
+
+// POST /api/check-csv → job kick + jobId 即返却
+router.post('/api/check-csv', async (req, res) => {
+  await ensureDb();
+
+  if (checkCsvJobs.size >= JOB_MAX_TOTAL) {
+    return res.status(503).json({ error: 'ジョブ table が満杯です。しばらく待ってから再試行してください。' });
+  }
+  if (countRunningJobs() >= JOB_MAX_CONCURRENT_RUNNING) {
+    return res.status(429).json({ error: '同時実行ジョブ数の上限に達しています。実行中のジョブが終わってから再試行してください。' });
+  }
+
+  const jobId = genJobId();
+  const now = Date.now();
+  const job = {
+    status: 'queued',
+    progress: { phase: 'pending', done: 0, total: 0, chunkIndex: 0, chunkTotal: 0 },
+    result: null,
+    error: null,
+    createdAt: now,
+    updatedAt: now,
+    lastAccessedAt: now,
+  };
+  checkCsvJobs.set(jobId, job);
+
+  // 即返却して背景で実処理
+  setImmediate(() => {
+    runCheckCsvJob(jobId).catch(e => {
+      console.error(`[mercari-sync] check-csv job ${jobId} unexpected error:`, e);
+      const j = checkCsvJobs.get(jobId);
+      if (j) {
+        j.status = 'error';
+        j.error = `内部エラー: ${e.message}`;
+        j.updatedAt = Date.now();
+      }
+    });
+  });
+
+  res.json({ jobId });
+});
+
+// GET /api/check-csv-status/:jobId → ジョブ状態取得
+router.get('/api/check-csv-status/:jobId', (req, res) => {
+  const job = checkCsvJobs.get(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({ error: 'ジョブが見つからないか期限切れです (Render 再起動でジョブが消失した可能性あり)' });
+  }
+  job.lastAccessedAt = Date.now();
+  res.json({
+    status: job.status,
+    progress: job.progress,
+    result: job.status === 'done' ? job.result : null,
+    error: job.error,
   });
 });
 

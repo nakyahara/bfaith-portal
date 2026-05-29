@@ -253,35 +253,129 @@ document.getElementById('btnClearRegistered')?.addEventListener('click', async (
 });
 <% } %>
 
+// 差分チェック (非同期ジョブ + polling パターン)
+// 同期 HTTP だと Cloudflare の 120秒 idle timeout で切られるため、
+// POST で jobId を取得 → GET /api/check-csv-status/:jobId で 3秒間隔 polling
 document.getElementById('btnCheck').addEventListener('click', async () => {
   const statusEl = document.getElementById('checkStatus');
-  statusEl.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>チェック中（楽天の全商品を取得しています。数分かかる場合があります）';
+  statusEl.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>ジョブ開始中...';
   document.getElementById('btnCheck').disabled = true;
   document.getElementById('resultSection').classList.add('d-none');
   document.getElementById('summaryBadges').classList.add('d-none');
+
+  // mercari モードは依然 /api/check (短時間で完了するので同期のまま)
+  if (currentMode !== 'csv') {
+    try {
+      const res = await fetch(BASE + '/api/check', { method: 'POST', signal: AbortSignal.timeout(120000) });
+      const data = await res.json();
+      if (data.error) { statusEl.innerHTML = `<span class="text-danger">エラー: ${escapeHtml(data.error)}</span>`; return; }
+      diffItems = data.diff_items || [];
+      statusEl.innerHTML = `<span class="text-success">チェック完了</span>`;
+      document.getElementById('badgeRakuten').textContent = `楽天: ${data.rakuten_total}件`;
+      document.getElementById('badgeMercari').textContent = `メルカリ: ${data.mercari_total}件`;
+      document.getElementById('badgeDiff').textContent = `未登録: ${data.diff_count}件`;
+      const excludedBadge = document.getElementById('badgeExcluded');
+      if (data.excluded_count > 0) { excludedBadge.textContent = `除外: ${data.excluded_count}件`; excludedBadge.classList.remove('d-none'); } else { excludedBadge.classList.add('d-none'); }
+      const skuMatchedBadge = document.getElementById('badgeSkuMatched');
+      if (data.sku_matched_count > 0) { skuMatchedBadge.textContent = `SKU照合済: ${data.sku_matched_count}件`; skuMatchedBadge.classList.remove('d-none'); } else { skuMatchedBadge.classList.add('d-none'); }
+      document.getElementById('summaryBadges').classList.remove('d-none');
+      renderTable(diffItems);
+      document.getElementById('resultSection').classList.remove('d-none');
+    } catch(e) { statusEl.innerHTML = `<span class="text-danger">エラー: ${e.message}</span>`; }
+    finally { document.getElementById('btnCheck').disabled = false; }
+    return;
+  }
+
+  // CSV モード: 非同期ジョブ + polling
+  let jobId;
   try {
-    let res;
-    if (currentMode === 'csv') {
-      res = await fetch(BASE + '/api/check-csv', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
-    } else {
-      res = await fetch(BASE + '/api/check', {method:'POST'});
-    }
+    const res = await fetch(BASE + '/api/check-csv', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+      signal: AbortSignal.timeout(30000),
+    });
     const data = await res.json();
-    if (data.error) { statusEl.innerHTML = `<span class="text-danger">エラー: ${escapeHtml(data.error)}</span>`; return; }
-    diffItems = data.diff_items || [];
-    statusEl.innerHTML = `<span class="text-success">チェック完了</span>`;
-    document.getElementById('badgeRakuten').textContent = `楽天: ${data.rakuten_total}件`;
-    document.getElementById('badgeMercari').textContent = currentMode === 'csv' ? `登録済み: ${data.registered_total}件` : `メルカリ: ${data.mercari_total}件`;
-    document.getElementById('badgeDiff').textContent = `未登録: ${data.diff_count}件`;
-    const excludedBadge = document.getElementById('badgeExcluded');
-    if (data.excluded_count > 0) { excludedBadge.textContent = `除外: ${data.excluded_count}件`; excludedBadge.classList.remove('d-none'); } else { excludedBadge.classList.add('d-none'); }
-    const skuMatchedBadge = document.getElementById('badgeSkuMatched');
-    if (data.sku_matched_count > 0) { skuMatchedBadge.textContent = `SKU照合済: ${data.sku_matched_count}件`; skuMatchedBadge.classList.remove('d-none'); } else { skuMatchedBadge.classList.add('d-none'); }
-    document.getElementById('summaryBadges').classList.remove('d-none');
-    renderTable(diffItems);
-    document.getElementById('resultSection').classList.remove('d-none');
-  } catch(e) { statusEl.innerHTML = `<span class="text-danger">エラー: ${e.message}</span>`; }
-  finally { document.getElementById('btnCheck').disabled = false; }
+    if (!res.ok || data.error) {
+      statusEl.innerHTML = `<span class="text-danger">エラー: ${escapeHtml(data.error || ('HTTP ' + res.status))}</span>`;
+      document.getElementById('btnCheck').disabled = false;
+      return;
+    }
+    jobId = data.jobId;
+  } catch (e) {
+    statusEl.innerHTML = `<span class="text-danger">ジョブ開始エラー: ${escapeHtml(e.message)}</span>`;
+    document.getElementById('btnCheck').disabled = false;
+    return;
+  }
+
+  let consecutivePollErrors = 0;
+  const MAX_POLL_ERRORS = 5;
+  const POLL_INTERVAL_MS = 3000;
+  const POLL_RETRY_INTERVAL_MS = 5000;
+
+  const poll = async () => {
+    try {
+      const r = await fetch(BASE + '/api/check-csv-status/' + encodeURIComponent(jobId), { signal: AbortSignal.timeout(15000) });
+      if (r.status === 404) {
+        const errData = await r.json().catch(() => ({}));
+        statusEl.innerHTML = `<span class="text-danger">エラー: ${escapeHtml(errData.error || 'ジョブが見つかりません')}</span>`;
+        document.getElementById('btnCheck').disabled = false;
+        return;
+      }
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+
+      const data = await r.json();
+      consecutivePollErrors = 0;
+
+      if (data.status === 'error') {
+        statusEl.innerHTML = `<span class="text-danger">エラー: ${escapeHtml(data.error || '不明なエラー')}</span>`;
+        document.getElementById('btnCheck').disabled = false;
+        return;
+      }
+
+      if (data.status === 'done') {
+        const r2 = data.result || {};
+        diffItems = r2.diff_items || [];
+        statusEl.innerHTML = `<span class="text-success">チェック完了</span>`;
+        document.getElementById('badgeRakuten').textContent = `楽天: ${r2.rakuten_total}件`;
+        document.getElementById('badgeMercari').textContent = `登録済み: ${r2.registered_total}件`;
+        document.getElementById('badgeDiff').textContent = `未登録: ${r2.diff_count}件`;
+        const excludedBadge = document.getElementById('badgeExcluded');
+        if (r2.excluded_count > 0) { excludedBadge.textContent = `除外: ${r2.excluded_count}件`; excludedBadge.classList.remove('d-none'); } else { excludedBadge.classList.add('d-none'); }
+        const skuMatchedBadge = document.getElementById('badgeSkuMatched');
+        if (r2.sku_matched_count > 0) { skuMatchedBadge.textContent = `SKU照合済: ${r2.sku_matched_count}件`; skuMatchedBadge.classList.remove('d-none'); } else { skuMatchedBadge.classList.add('d-none'); }
+        document.getElementById('summaryBadges').classList.remove('d-none');
+        renderTable(diffItems);
+        document.getElementById('resultSection').classList.remove('d-none');
+        document.getElementById('btnCheck').disabled = false;
+        return;
+      }
+
+      // queued / running → 進捗表示更新
+      const p = data.progress || {};
+      let msg = 'チェック中...';
+      if (p.phase === 'all-codes') {
+        msg = '楽天の全商品コードを取得中...';
+      } else if (p.phase === 'details' && p.total > 0) {
+        const chunkInfo = (p.chunkTotal > 0) ? ` [chunk ${p.chunkIndex}/${p.chunkTotal}]` : '';
+        msg = `商品詳細を取得中: ${p.done}/${p.total}件${chunkInfo}`;
+      } else if (p.phase === 'pending') {
+        msg = 'ジョブを開始しています...';
+      }
+      statusEl.innerHTML = `<span class="spinner-border spinner-border-sm me-1"></span>${escapeHtml(msg)}`;
+
+      setTimeout(poll, POLL_INTERVAL_MS);
+    } catch (e) {
+      consecutivePollErrors++;
+      if (consecutivePollErrors >= MAX_POLL_ERRORS) {
+        statusEl.innerHTML = `<span class="text-danger">通信エラー (${MAX_POLL_ERRORS}回連続失敗): ${escapeHtml(e.message)}。再度お試しください。</span>`;
+        document.getElementById('btnCheck').disabled = false;
+        return;
+      }
+      setTimeout(poll, POLL_RETRY_INTERVAL_MS);
+    }
+  };
+  poll();
 });
 
 function renderTable(items) {
