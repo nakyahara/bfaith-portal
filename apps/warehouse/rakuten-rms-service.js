@@ -20,6 +20,41 @@ const router = Router();
 
 const DETAILS_BULK_MAX = 200;
 
+// /items/all-codes は 100ページ × 1.1秒 = ~110秒かかるので 5分キャッシュ。
+// 進行中の取得は in-flight promise を共有して同時実行重複を防ぐ。
+// 強制再取得は ?refresh=1 で可能。
+const ALL_CODES_CACHE_TTL_MS = 5 * 60 * 1000;
+let allCodesCache = null; // { mapping, fetchedAt }
+let allCodesInflight = null; // Promise<{mapping}>
+
+async function fetchAllRakutenItemCodes() {
+  const mapping = {};
+  let cursorMark = '*';
+
+  for (let page = 0; page < 100; page++) {
+    const apiPath = `/es/2.0/items/search?cursorMark=${encodeURIComponent(cursorMark)}&hits=100`;
+    const result = await rakutenRequest({ path: apiPath });
+
+    if (result.status !== 200) {
+      const err = extractRmsError(result.data);
+      throw Object.assign(new Error(`HTTP ${result.status}${err.message ? `: ${err.message}` : ''}`), { rmsStatus: result.status });
+    }
+
+    const items = result.data.results || result.data.items || [];
+    for (const r of items) {
+      const item = r.item || r;
+      if (item.manageNumber) {
+        mapping[item.itemNumber || item.manageNumber] = item.manageNumber;
+      }
+    }
+
+    if (!result.data.nextCursorMark || items.length === 0) break;
+    cursorMark = result.data.nextCursorMark;
+  }
+
+  return mapping;
+}
+
 // 楽天 RMS のレスポンス本文からエラーコード / メッセージを安全に抽出 (型固定)
 function extractRmsError(data) {
   if (data == null) return { errorCode: null, message: null };
@@ -64,32 +99,35 @@ router.get('/items/search', rateLimitMiddleware('rakuten'), async (req, res) => 
 
 router.get('/items/all-codes', rateLimitMiddleware('rakuten'), async (req, res) => {
   try {
-    const mapping = {};
-    let cursorMark = '*';
+    const forceRefresh = req.query.refresh === '1';
+    const now = Date.now();
 
-    for (let page = 0; page < 100; page++) {
-      const apiPath = `/es/2.0/items/search?cursorMark=${encodeURIComponent(cursorMark)}&hits=100`;
-      const result = await rakutenRequest({ path: apiPath });
-
-      if (result.status !== 200) {
-        return errorResponse(res, { status: result.status, error: 'RMS_API_ERROR', message: `HTTP ${result.status}`, requestId: req.requestId });
-      }
-
-      const items = result.data.results || result.data.items || [];
-      for (const r of items) {
-        const item = r.item || r;
-        if (item.manageNumber) {
-          mapping[item.itemNumber || item.manageNumber] = item.manageNumber;
-        }
-      }
-
-      if (!result.data.nextCursorMark || items.length === 0) break;
-      cursorMark = result.data.nextCursorMark;
+    // キャッシュ有効ならそのまま返す
+    if (!forceRefresh && allCodesCache && (now - allCodesCache.fetchedAt) < ALL_CODES_CACHE_TTL_MS) {
+      const ageSec = Math.round((now - allCodesCache.fetchedAt) / 1000);
+      return okResponse(res, {
+        mapping: allCodesCache.mapping,
+        count: Object.keys(allCodesCache.mapping).length,
+        cached: true,
+        ageSec,
+      });
     }
 
-    okResponse(res, { mapping, count: Object.keys(mapping).length });
+    // 既に取得中なら同じ promise を待つ (同時実行による重複叩き防止)
+    if (!allCodesInflight) {
+      allCodesInflight = fetchAllRakutenItemCodes()
+        .then((mapping) => {
+          allCodesCache = { mapping, fetchedAt: Date.now() };
+          return mapping;
+        })
+        .finally(() => { allCodesInflight = null; });
+    }
+
+    const mapping = await allCodesInflight;
+    okResponse(res, { mapping, count: Object.keys(mapping).length, cached: false });
   } catch (e) {
-    errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
+    const status = e && e.rmsStatus ? e.rmsStatus : 502;
+    errorResponse(res, { status, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
   }
 });
 
