@@ -346,7 +346,8 @@ async function runCheckCsvJob(jobId) {
     }
 
     const imageUrls = mapper.buildFullImageUrls(detail.imagePaths || [], shopUrl);
-    const variantPrices = activeVariants.map(v => parseInt(v.price || 0)).filter(p => p > 0);
+    // 楽天 RMS の variant 価格フィールドは standardPrice。price は念のため fallback として残す
+    const variantPrices = activeVariants.map(v => parseInt(v.standardPrice ?? v.price ?? 0)).filter(p => p > 0);
     const price = variantPrices.length ? Math.min(...variantPrices) : 0;
     const hasPriceDiff = variantPrices.length > 0 && new Set(variantPrices).size > 1;
 
