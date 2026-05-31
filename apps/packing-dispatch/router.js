@@ -96,7 +96,15 @@ router.get('/api/export/:id', (req, res) => {
 });
 
 // ── アソート学習 (注文番号/受注番号/商品コードで検索→編集) ──
-router.get('/api/assort/search', (req, res) => handle(res, () => searchAssort(req.query.q || '')));
+router.get('/api/assort/search', (req, res) => handle(res, () => searchAssort({
+  q: req.query.q || '',
+  shipping_method_code: req.query.sm || '',
+  packing_machine_code: req.query.pm || '',
+  qtyMin: req.query.qtyMin,
+  qtyMax: req.query.qtyMax,
+  dateFrom: req.query.dateFrom || '',
+  dateTo: req.query.dateTo || '',
+})));
 router.post('/api/assort/update', (req, res) => handle(res, () => {
   const b = req.body || {};
   return updateAssort(b.combo_key, b.shipping_method_code, b.packing_machine_code, currentUser(req));
