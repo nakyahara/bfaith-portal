@@ -47,6 +47,25 @@
   dialog .db { padding:16px; } dialog .df { padding:12px 16px; border-top:1px solid var(--line); text-align:right; }
   .row { display:flex; gap:10px; align-items:center; margin-bottom:10px; flex-wrap:wrap; }
   .tier { display:flex; gap:6px; align-items:center; margin-bottom:6px; }
+  /* マニュアル用 */
+  .help-bar { background:#fff8e1; border:1px solid #ffe082; border-radius:6px; padding:8px 12px; margin-bottom:10px; font-size:13px; }
+  .help-bar a { color:var(--accent); text-decoration:none; margin-left:8px; }
+  .help-bar a:hover { text-decoration:underline; }
+  #panel-manual { max-width:900px; }
+  #panel-manual h2 { font-size:18px; border-bottom:2px solid var(--accent); padding-bottom:6px; margin-top:24px; color:var(--accent); }
+  #panel-manual h2:first-of-type { margin-top:0; }
+  #panel-manual h3 { font-size:15px; margin-top:18px; margin-bottom:6px; }
+  #panel-manual p, #panel-manual li { font-size:14px; line-height:1.7; }
+  #panel-manual ul, #panel-manual ol { padding-left:24px; }
+  #panel-manual table { font-size:13px; margin:10px 0; background:#fff; }
+  #panel-manual table th { background:var(--head); white-space:nowrap; }
+  #panel-manual table td { white-space:normal; }
+  #panel-manual .toc { background:#eef3fb; border:1px solid var(--line); border-radius:6px; padding:12px 18px; margin-bottom:18px; }
+  #panel-manual .toc a { display:block; color:var(--accent); text-decoration:none; padding:2px 0; }
+  #panel-manual .toc a:hover { text-decoration:underline; }
+  #panel-manual .note { background:#fff8e1; border-left:4px solid #ffb300; padding:8px 12px; margin:10px 0; }
+  #panel-manual .warn { background:#fdecea; border-left:4px solid var(--warn); padding:8px 12px; margin:10px 0; }
+  #panel-manual code { background:#eef3fb; padding:2px 6px; border-radius:3px; font-size:13px; }
 </style>
 </head>
 <body>
@@ -59,11 +78,16 @@
     <div class="tab" data-tab="cond">条件検索・一括編集</div>
     <div class="tab" data-tab="assort">アソート学習</div>
     <div class="tab" data-tab="unreg">未登録一覧</div>
+    <div class="tab" data-tab="manual">📖 マニュアル</div>
   </div>
 </header>
 <main>
   <!-- ───── 取込・判定 ───── -->
   <section class="panel active" id="panel-dispatch">
+    <div class="help-bar">
+      💡 この画面の使い方: NEの受注CSVをアップロード → 自動判定 → <b>要判断</b>を伝票クリックで確定 → CSV出力。
+      <a href="#" data-jump="ch2">📖 詳しい手順を見る</a>
+    </div>
     <div class="card">
       <div class="row">
         <input type="file" id="csvFile" accept=".csv" />
@@ -103,6 +127,10 @@
 
   <!-- ───── 商品マスタ ───── -->
   <section class="panel" id="panel-master">
+    <div class="help-bar">
+      💡 この画面の使い方: 商品コードごとに (モール×数量帯) の配送方法・梱包機を登録。最初は「初期データ投入」で Excel 移行データを一括登録。
+      <a href="#" data-jump="ch7-master">📖 マスタ登録のコツを見る</a>
+    </div>
     <div class="card" style="background:#fffdf5">
       <div class="row">
         <strong>マスタ状態</strong>
@@ -147,6 +175,10 @@
 
   <!-- ───── 条件検索・一括編集 ───── -->
   <section class="panel" id="panel-cond">
+    <div class="help-bar">
+      💡 この画面の使い方: 「配送方法◯◯のルールを全部××に変えたい」等のときに使用。条件で絞り込み→チェック→一括変更。
+      <a href="#" data-jump="ch7-cond">📖 一括編集の使い所を見る</a>
+    </div>
     <div class="card">
       <div class="row">
         <strong>条件で検索</strong>
@@ -181,6 +213,10 @@
 
   <!-- ───── アソート学習 ───── -->
   <section class="panel" id="panel-assort">
+    <div class="help-bar">
+      💡 この画面の使い方: アソート(複数商品の組み合わせ注文)の判定を検索・修正。一度確定した組み合わせは次回から自動判定される。
+      <a href="#" data-jump="ch7-assort">📖 アソート学習の仕組みを見る</a>
+    </div>
     <div class="card">
       <div class="row">
         <input id="aQuery" placeholder="注文番号 / 受注番号 / 商品コード で検索" size="32" />
@@ -194,6 +230,10 @@
 
   <!-- ───── 未登録一覧 ───── -->
   <section class="panel" id="panel-unreg">
+    <div class="help-bar">
+      💡 この画面の使い方: 配送方法ルール未登録の商品コード一覧。「要判断: 未登録」が出る原因の解消に。
+      <a href="#" data-jump="ch7-unreg">📖 未登録への対処を見る</a>
+    </div>
     <div class="card">
       <div class="row">
         <button id="btnLoadUnreg" class="sub">未登録を再取得</button>
@@ -204,6 +244,207 @@
         <thead><tr><th>商品コード</th><th>商品名</th><th>取扱区分</th><th></th></tr></thead>
         <tbody id="unregBody"></tbody>
       </table></div>
+    </div>
+  </section>
+
+  <!-- ───── マニュアル ───── -->
+  <section class="panel" id="panel-manual">
+    <div class="card">
+      <p class="muted" style="margin:0">最終更新: 2026-05-31 / 本番URL: <code>/apps/packing-dispatch/</code></p>
+      <div class="toc">
+        <b>目次</b>
+        <a href="#" data-jump="ch1">1. 3分でわかるこのアプリ</a>
+        <a href="#" data-jump="ch2">2. 毎日の作業手順</a>
+        <a href="#" data-jump="ch3">3. 「要判断」が出たときの見方</a>
+        <a href="#" data-jump="ch4">4. 特例ルール (沖縄/北海道/LINEギフト/AES)</a>
+        <a href="#" data-jump="ch5">5. よくある質問 (FAQ)</a>
+        <a href="#" data-jump="ch6">6. トラブルシューティング</a>
+        <a href="#" data-jump="ch7">7. 管理者向け付録</a>
+      </div>
+
+      <h2 id="ch1">1. 3分でわかるこのアプリ</h2>
+      <p>このアプリは、NextEngine(NE) から吐き出された受注CSVを受け取って、<b>配送方法と梱包機を自動で判定</b>し、ロジザード(WMS)に渡せる形でCSV出力するためのツールです。</p>
+      <p>梱包機の振り分けにはこれまで NE の有料アプリ「Tapes」(月額約3.7万円)を使っていましたが、それを自社内製に置き換えたのが本アプリです。</p>
+      <h3>このアプリで「やること」</h3>
+      <ul>
+        <li>NEからの受注CSVをアップロードする</li>
+        <li>自動判定の結果を確認し、<b>「要判断」と出た伝票だけ人が確定する</b></li>
+        <li>確定が全部終わったらCSV出力 → ロジザードに渡す</li>
+      </ul>
+      <h3>このアプリで「やらないこと」</h3>
+      <ul>
+        <li>住所確認・在庫引き当て (NE と ロジザードで実施)</li>
+        <li>送り状の発行 (ロジザード/ヤマトの端末で実施)</li>
+      </ul>
+
+      <h2 id="ch2">2. 毎日の作業手順</h2>
+      <ol>
+        <li><b>NEで受注CSVを吐き出す</b> (従来通り)</li>
+        <li>本アプリの「<b>取込・判定</b>」タブを開く</li>
+        <li>「ファイル選択」でCSVを選び、「<b>アップロードして判定</b>」を押す</li>
+        <li>サマリが出る → 「要判断 ◯件」を確認</li>
+        <li>伝票一覧から <span class="badge b-warn">要判断</span> の行をクリックして、ダイアログで配送方法・梱包機を選んで「確定」</li>
+        <li><b>要判断が0件になったら</b>、CSV出力ボタンが押せるようになる</li>
+        <li>下記のいずれかを押してCSVをダウンロード:
+          <ul>
+            <li><b>CSV出力(〜5/31 MeltLine→手動)</b>: 6月1日のMeltLine本稼働前。MeltLine判定された行は出力時に「手動出荷」に矯正される</li>
+            <li><b>CSV出力(6/1〜 MeltLineそのまま)</b>: 6月1日以降。MeltLineはそのままMeltLineで出力</li>
+          </ul>
+        </li>
+        <li>ダウンロードしたCSVをロジザードに取り込む</li>
+      </ol>
+      <div class="note"><b>ヒント</b>: 「取込済みデータを再表示」のドロップダウンで、過去48時間以内の取込バッチを再表示できます。途中で画面を閉じても作業を続行可能。</div>
+
+      <h2 id="ch3">3. 「要判断」が出たときの見方</h2>
+      <p>状態は3種類:</p>
+      <table>
+        <thead><tr><th>状態</th><th>意味</th><th>対応</th></tr></thead>
+        <tbody>
+          <tr><td><span class="badge b-auto">自動</span></td><td>ルールで自動判定済み</td><td>そのままでOK</td></tr>
+          <tr><td><span class="badge b-warn">要判断</span></td><td>人が確認・確定する必要あり</td><td>クリックして確定</td></tr>
+          <tr><td><span class="badge b-ok">確定</span></td><td>人が確定済み</td><td>そのままでOK</td></tr>
+        </tbody>
+      </table>
+      <h3>「理由」欄に出るメッセージと対処</h3>
+      <table>
+        <thead><tr><th>理由</th><th>意味</th><th>対処</th></tr></thead>
+        <tbody>
+          <tr><td>未登録</td><td>商品マスタにルール未登録</td><td>「未登録一覧」タブから商品マスタへ登録 → 再取込</td></tr>
+          <tr><td>数量帯穴</td><td>その数量に対応するルール無し</td><td>商品マスタで数量帯を追加 or その場で配送方法を選択して確定</td></tr>
+          <tr><td>初出アソート</td><td>その組合せは初めて</td><td>配送方法を選んで「この組合せを学習」にチェックして確定 → 次回から自動</td></tr>
+          <tr><td>学習済</td><td>過去のアソート学習を流用</td><td>そのままでOK (内容に違和感があれば修正可能)</td></tr>
+          <tr><td>沖縄/北海道→要目視確認</td><td>地域別運賃の配送方法をレターパックに振替候補</td><td>後述「特例ルール」参照</td></tr>
+          <tr><td>AES対象外</td><td>AES配送は変更しない</td><td>そのまま (変更不可)</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="ch4">4. 特例ルール</h2>
+
+      <h3>4-1. 沖縄/北海道のレターパック振替 (2026-05-31〜)</h3>
+      <p>自動判定の結果が以下の <b>3つの配送方法のときだけ</b>、レターパック500の振替候補にして「要判断」で残します。</p>
+      <ul>
+        <li>ヤマト宅急便【50サイズ専用】 (takkyu50)</li>
+        <li>ヤマト(発払い)B2v6 (hatsubarai)</li>
+        <li>ゆうパック (yupack)</li>
+      </ul>
+      <p>これらは地域別運賃で、沖縄・北海道宛が高いため、全国一律のレターパック500(350円相当)に振替えて送料圧縮します。</p>
+      <div class="warn"><b>必ず人が判断</b>: レターパック500 は A4 サイズ・4kg 制限があります。「箱に入るか」「重量超えてないか」を<b>目視で確認</b>してから確定してください。入らないものはゆうパック等に戻す。</div>
+      <p>その他の配送方法 (ネコポス / ゆうパケットパフ / 定形外 / クリックポスト 等) は全国一律料金なので振替しません。</p>
+
+      <h3>4-2. 沖縄県×ネコポスの手動出荷化 (2026-05-31〜)</h3>
+      <p>沖縄県宛のネコポス伝票は、CSV出力時に<b>梱包機マーカーだけ「手動出荷」に書き換えて</b>出力します(配送方法はネコポスのまま)。</p>
+      <div class="warn"><b>理由</b>: 沖縄の航空便は液体類が別管理対象です。ヤマトの端末で送り状QRを読んだときに「沖縄エラー」が表示される運用ですが、梱包機(pasline/meltline)で出すと送り状にQRが付かないため端末でエラーが出ません。手動出荷扱いにすることで、送り状経由で必ずエラー検知できるようにしています。</div>
+      <p>この処理は画面では「ネコポス + 梱包機〇〇」の表示のままですが、出力時に自動で書き換わります(2つのCSV出力ボタンの両方で適用)。</p>
+
+      <h3>4-3. LINEギフトは必ず手動出荷</h3>
+      <p>ショップ名「LINE ギフト」の伝票は、配送方法を何にしても梱包機は「手動出荷」固定です。</p>
+
+      <h3>4-4. AES の伝票は変更対象外</h3>
+      <p>元の配送方法が AES の伝票は、自動判定で一切触りません。状態は「自動」、理由は「AES対象外」で確定ボタンも出ません。</p>
+
+      <h2 id="ch5">5. よくある質問 (FAQ)</h2>
+      <h3>Q. 配送方法を間違えて確定した。やり直せる?</h3>
+      <p>A. 同じ伝票をもう一度クリックして配送方法・梱包機を選び直せば上書きできます。CSV出力前であれば何度でも変更可能。</p>
+      <h3>Q. CSV出力したらバッチが「出力済み」になった。再出力できる?</h3>
+      <p>A. 二重出力防止のため、出力済みバッチは再出力できません。同じCSVをもう一度アップロードしてください(同じ判定結果が再現されます。学習済みの組合せはそのまま流用)。</p>
+      <h3>Q. 「学習する」にチェックを入れて確定したら、間違って学習してしまった</h3>
+      <p>A. 「アソート学習」タブで注文番号・受注番号・商品コードのいずれかで検索→修正できます。</p>
+      <h3>Q. 配送方法に「レターパック」が選べないことがある</h3>
+      <p>A. アソート学習編集タブでは、レターパックは選択肢から除外しています(A4・4kg制限のため毎回目視判断が必要で、学習対象外)。</p>
+      <h3>Q. 取込済みのCSVが古いまま残っている</h3>
+      <p>A. 取込から48時間で自動削除されます。それまでは「取込済みデータを再表示」で再開可能。</p>
+
+      <h2 id="ch6">6. トラブルシューティング</h2>
+      <h3>「列数が想定外です」エラー</h3>
+      <p>NE のCSV書式が変わった可能性。引き継ぎ書記載の列マッピング (93列・Shift-JIS) と照合してください。</p>
+      <h3>CSV出力ボタンが押せない</h3>
+      <p>要判断が残っています。「要判断のみ」フィルタで残っている伝票を全部確定してください。</p>
+      <h3>「未登録」が大量に出る</h3>
+      <p>商品マスタが空 or 大幅に欠けています。「商品マスタ」タブで「初期データ投入」ボタン (未投入時のみ動作) で Excel 移行データを一括登録。</p>
+      <h3>確定ダイアログで梱包機が「手動出荷」固定になっている</h3>
+      <p>正常です。梱包機 (pasline/meltline) はネコポスでのみ使用できます。LINEギフトも常に手動出荷固定。</p>
+
+      <h2 id="ch7">7. 管理者向け付録</h2>
+
+      <h3 id="ch7-master">7-1. 商品マスタ (区間ルール)</h3>
+      <ul>
+        <li>(商品コード × モール × 数量帯) で配送方法・梱包機を登録</li>
+        <li>数量帯は <b>1 から連続必須</b>。最終段の上限は空 (= 無制限)</li>
+        <li>モール別: Amazon / 楽天 (既定/その他モールのフォールバック) / Yahoo (個別保持・728商品が楽天と異なる)</li>
+        <li>「他の商品からコピー」で類似商品の数量帯設定をコピーして編集可能</li>
+      </ul>
+
+      <h3 id="ch7-cond">7-2. 条件検索・一括編集</h3>
+      <ul>
+        <li>「配送方法 X のルールを全部 Y に変えたい」等の大量更新で使用</li>
+        <li>条件(数量・配送方法・梱包機・モール)で絞り込み→チェック→一括変更</li>
+        <li>ネコポス以外を選ぶと梱包機は自動的に手動出荷に矯正される</li>
+      </ul>
+
+      <h3 id="ch7-assort">7-3. アソート学習</h3>
+      <ul>
+        <li>異商品の組合せ注文(アソート)は商品マスタのルールでは引けないため、組合せ(combo_key)単位で別途学習</li>
+        <li>注文番号 / 受注番号 / 商品コードで過去の学習を検索 → 修正可能</li>
+        <li>修正は次回以降の自動判定に反映 (SCD2 履歴保持)</li>
+        <li>レターパックは学習対象外 (4kg/A4制限のため毎回目視判断)</li>
+      </ul>
+
+      <h3 id="ch7-unreg">7-4. 未登録一覧</h3>
+      <ul>
+        <li>取扱中・非セットでルール未登録の商品コード一覧</li>
+        <li>クリックで商品マスタの登録画面へ</li>
+        <li>セット商品は3シグナル判定(商品区分 / 構成品数 / 親存在)で除外済</li>
+      </ul>
+
+      <h3>7-5. 配送方法一覧</h3>
+      <table>
+        <thead><tr><th>コード</th><th>名称</th><th>用途</th><th>地域別運賃</th><th>梱包機</th></tr></thead>
+        <tbody>
+          <tr><td>nekopos</td><td>ヤマト(ネコポス)</td><td>小型・薄物</td><td>一律</td><td>使用可</td></tr>
+          <tr><td>yupacketpuff</td><td>ゆうパケットパフ</td><td>小型</td><td>一律</td><td>手動</td></tr>
+          <tr><td>takkyu50</td><td>ヤマト宅急便【50サイズ】</td><td>50サイズまでの宅配</td><td>地域別 (沖縄/北海道高)</td><td>手動</td></tr>
+          <tr><td>hatsubarai</td><td>ヤマト(発払い)B2v6</td><td>大型宅配</td><td>地域別 (沖縄/北海道高)</td><td>手動</td></tr>
+          <tr><td>teikeigai</td><td>定形外郵便</td><td>軽量・小型</td><td>一律</td><td>手動</td></tr>
+          <tr><td>letterpack</td><td>レターパック500</td><td>A4・4kg以内 (沖縄/北海道振替先)</td><td>一律</td><td>手動</td></tr>
+          <tr><td>yupack</td><td>ゆうパック</td><td>大型宅配 (通常運用は手動選択)</td><td>地域別</td><td>手動</td></tr>
+          <tr><td>clickpost</td><td>クリックポスト</td><td>小型 (通常運用は手動選択)</td><td>一律</td><td>手動</td></tr>
+          <tr><td>fukuyama</td><td>福山通運istar2</td><td>大型 (通常運用は手動選択)</td><td>地域別</td><td>手動</td></tr>
+          <tr><td>seino</td><td>西濃運輸カンガル2</td><td>大型 (通常運用は手動選択)</td><td>地域別</td><td>手動</td></tr>
+          <tr><td>aes</td><td>AES</td><td>専用配送 (変更対象外)</td><td>—</td><td>手動</td></tr>
+        </tbody>
+      </table>
+
+      <h3>7-6. 梱包機一覧</h3>
+      <table>
+        <thead><tr><th>コード</th><th>名称</th><th>コスト</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><td>pasline3</td><td>pasline3つ折り</td><td>約18円/個</td><td>プチプチ用、3つ折りで収まるもの</td></tr>
+          <tr><td>pasline2</td><td>pasline2つ折り</td><td>約24-25円/個</td><td>プチプチ用、2つ折りで収まるもの</td></tr>
+          <tr><td>meltline</td><td>meltline</td><td>約40円/個</td><td>ネコポス段ボール専用、3つ折り・2つ折りで収まらないもの</td></tr>
+          <tr><td>manual</td><td>手動出荷</td><td>—</td><td>梱包機NG・LINEギフト・沖縄ネコポス出力時 等</td></tr>
+        </tbody>
+      </table>
+
+      <h3>7-7. 自動判定の優先順位</h3>
+      <ol>
+        <li>AES → 即座に対象外 (触らない)</li>
+        <li>単品/同一商品複数 → 商品マスタ区間ルール (sku × mall × 数量帯) で引く</li>
+        <li>アソート(異商品の組合せ) → アソート学習(combo_key)で照会、ヒットで自動 / 初出は上位ルールでサジェストして要判断</li>
+        <li>沖縄/北海道で結果が takkyu50/hatsubarai/yupack なら letterpack 振替候補 + 要判断に格下げ</li>
+        <li>LINEギフトは梱包機を強制 manual</li>
+        <li>CSV出力時に沖縄県×ネコポスは梱包機マーカーだけ manual に書き換え</li>
+      </ol>
+
+      <h3>7-8. データの保持期間</h3>
+      <ul>
+        <li>取込バッチ (顧客PII含む): <b>48時間</b>で自動削除</li>
+        <li>商品マスタ (区間ルール): 永続</li>
+        <li>アソート学習: 永続 (SCD2 履歴保持)</li>
+        <li>アソート学習の利用ログ (注文番号⇄combo紐付け): <b>30日</b>で自動削除</li>
+      </ul>
+
+      <h3>7-9. 引き継ぎ書</h3>
+      <p>技術仕様の詳細(DBスキーマ・連動列・コード構成等)は引き継ぎ書を参照: <code>g:/共有ドライブ/AI_reference/システム設計/梱包機振り分け配送方法判定アプリ_引き継ぎ.md</code></p>
     </div>
   </section>
 </main>
@@ -251,10 +492,26 @@ function shortName(s){
 function isLineGiftShop(shop){ return String(shop||'').normalize('NFKC').replace(/\s+/g,'').toUpperCase().includes('LINEギフト'); }
 
 // タブ
-document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
+function activateTab(tabName){
   document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
   document.querySelectorAll('.panel').forEach(x=>x.classList.remove('active'));
-  t.classList.add('active'); $('#panel-'+t.dataset.tab).classList.add('active');
+  const tab = document.querySelector(`.tab[data-tab="${tabName}"]`);
+  const panel = $('#panel-'+tabName);
+  if(tab) tab.classList.add('active');
+  if(panel) panel.classList.add('active');
+}
+document.querySelectorAll('.tab').forEach(t => t.onclick = () => activateTab(t.dataset.tab));
+// マニュアル該当章へのジャンプ (各タブの help-bar / マニュアル目次から呼ばれる)
+document.addEventListener('click', (e) => {
+  const a = e.target.closest('a[data-jump]');
+  if(!a) return;
+  e.preventDefault();
+  activateTab('manual');
+  const target = document.getElementById(a.dataset.jump);
+  if(!target) return;
+  // 古いブラウザは scrollIntoView の options を解釈できないため、try/catch で素のスクロールにフォールバック
+  try { target.scrollIntoView({behavior:'smooth', block:'start'}); }
+  catch(_) { target.scrollIntoView(true); }
 });
 
 async function loadOptions(){ OPTIONS = await api('api/options'); }
