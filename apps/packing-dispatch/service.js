@@ -288,42 +288,127 @@ function resolveItemName(db, sku_key) {
 }
 
 /**
- * 学習を 注文番号/受注番号 または 商品コード で検索。アクティブな学習(③)を明細・利用注文つきで返す。
+ * アソート学習を検索。アクティブな学習(③)を明細・利用注文つきで返す。
+ * フィルタ:
+ *   - q: 注文番号 / 受注番号 / 商品コード のテキスト検索
+ *   - shipping_method_code / packing_machine_code: 完全一致
+ *   - qtyMin / qtyMax: アソート合計数量 (items の SUM qty)
+ *   - dateFrom / dateTo: 登録日 (decided_at) の範囲 (YYYY-MM-DD、JST扱いで境界包含)
+ * 何も指定なし → 空配列を返す (現状互換、暴発防止)。
+ * いずれか1つ以上指定で AND 合成、結果は 50 件 LIMIT。
  */
-export function searchAssort(q) {
+// 'YYYY-MM-DD' を JST 0:00 として UTC ISO 文字列へ。実在しない日付は null。
+function jstMidnightIso(ymd) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(ymd || ''));
+  if (!m) return null;
+  const y = +m[1], mo = +m[2], d = +m[3];
+  const dt = new Date(`${m[0]}T00:00:00+09:00`);
+  if (isNaN(dt.getTime())) return null;
+  // 逆引きで実在チェック (例: 2026-02-31 のような不正値は弾く)
+  const jstDt = new Date(dt.getTime() + 9 * 3600 * 1000);
+  if (jstDt.getUTCFullYear() !== y || jstDt.getUTCMonth() + 1 !== mo || jstDt.getUTCDate() !== d) return null;
+  return dt.toISOString();
+}
+
+export function searchAssort(filters = {}) {
   const db = ensureSchema();
-  const term = norm(q);
-  if (!term) return [];
-  const combos = new Set(comboKeysByOrderRef(term));
-  // 商品コードでも検索: sku_key は "商品コード::色::サイズ"。入力コードを
-  //   ① "code::%"(完全一致+色サイズ変種) ② "code-%"(ハイフン区切りの派生コード, 例 0726-001794-bk)
-  //   の2パターンで照合する。これで base コードでも派生コードがヒットしつつ、別商品(0726-0017940 等)の
-  //   誤一致は避けられる。LIKE のワイルドカードは literal 化。
-  const pc = normProductCode(term);
-  if (pc) {
-    const e = pc.replace(/[\\%_]/g, '\\$&');
-    for (const r of db.prepare(`
-      SELECT DISTINCT d.combo_key FROM pd_assort_decision d
-        JOIN pd_assort_decision_item i ON i.decision_id=d.id
-       WHERE d.is_active=1 AND d.combo_key_version=?
-         AND (i.sku_key LIKE ? ESCAPE '\\' OR i.sku_key LIKE ? ESCAPE '\\')
-       LIMIT 200`).all(COMBO_KEY_VERSION, e + '::%', e + '-%')) combos.add(r.combo_key);
+  // 旧シグネチャ (q を文字列で直接渡す) との後方互換
+  if (typeof filters === 'string') filters = { q: filters };
+  const term = norm(filters.q);
+  const sm = norm(filters.shipping_method_code);
+  const pm = norm(filters.packing_machine_code);
+  // 合計数量は 1以上の整数。入力ありで不正なら VALIDATION エラー (silent 無視はしない、日付と方針統一)。
+  const parseQty = (v, label) => {
+    if (v == null || v === '') return null;
+    const n = Number(v);
+    if (!Number.isInteger(n) || n <= 0) throw vErr(`${label} は 1 以上の整数で指定してください: ${v}`);
+    return n;
+  };
+  const qtyMin = parseQty(filters.qtyMin, '合計数量の最小');
+  const qtyMax = parseQty(filters.qtyMax, '合計数量の最大');
+  if (qtyMin !== null && qtyMax !== null && qtyMin > qtyMax) {
+    throw vErr('合計数量の最小が最大より大きい指定です');
   }
-  const out = [];
+  // 登録日は JST 基準。入力ありで実在しない日付は VALIDATION エラー (silent 無視はしない)。
+  // dateFrom 00:00 JST 以降、dateTo の翌日 00:00 JST 未満 (両端包含)。
+  const dateFromIso = filters.dateFrom ? jstMidnightIso(filters.dateFrom) : null;
+  if (filters.dateFrom && !dateFromIso) throw vErr(`登録日(from)の日付が不正です: ${filters.dateFrom}`);
+  let dateToIsoExclusive = null;
+  let dateToIsoInclusiveBase = null;
+  if (filters.dateTo) {
+    const toBase = jstMidnightIso(filters.dateTo);
+    if (!toBase) throw vErr(`登録日(to)の日付が不正です: ${filters.dateTo}`);
+    dateToIsoInclusiveBase = toBase;
+    const next = new Date(toBase);
+    next.setUTCDate(next.getUTCDate() + 1);
+    dateToIsoExclusive = next.toISOString();
+  }
+  if (dateFromIso && dateToIsoInclusiveBase && dateFromIso > dateToIsoInclusiveBase) {
+    throw vErr('登録日 from が to より後ろの指定です');
+  }
+  const hasAnyFilter = term || sm || pm || qtyMin !== null || qtyMax !== null || dateFromIso || dateToIsoExclusive;
+  if (!hasAnyFilter) return [];
+
+  // 1) text 検索: term 指定時は combos を注文番号/商品コードから絞る (= 集合の上限)。
+  //    無指定なら null (= 上限なし、後段の DB filter のみで決定)。
+  let combos = null;
+  if (term) {
+    combos = new Set(comboKeysByOrderRef(term));
+    // 商品コードでも検索: sku_key は "商品コード::色::サイズ"。
+    //   ① "code::%"(完全一致+色サイズ変種) ② "code-%"(ハイフン区切りの派生コード, 例 0726-001794-bk)
+    //   の2パターンで照合。LIKE のワイルドカードは literal 化。
+    const pc = normProductCode(term);
+    if (pc) {
+      const e = pc.replace(/[\\%_]/g, '\\$&');
+      for (const r of db.prepare(`
+        SELECT DISTINCT d.combo_key FROM pd_assort_decision d
+          JOIN pd_assort_decision_item i ON i.decision_id=d.id
+         WHERE d.is_active=1 AND d.combo_key_version=?
+           AND (i.sku_key LIKE ? ESCAPE '\\' OR i.sku_key LIKE ? ESCAPE '\\')
+         ORDER BY d.decided_at DESC
+         LIMIT 500`).all(COMBO_KEY_VERSION, e + '::%', e + '-%')) combos.add(r.combo_key);
+    }
+  }
+
+  // 2) DB 側で絞れるフィルタ (sm/pm/date) を適用。
+  //    - text 指定済 (combos != null): combos ∩ allowed
+  //    - text 無指定 (combos == null): allowed をそのまま combos に
+  //    ORDER BY decided_at DESC + LIMIT 2000 で「古い分が先に落ちる」事故を防ぐ。
+  const needDbFilter = sm || pm || dateFromIso || dateToIsoExclusive || combos === null;
+  if (needDbFilter) {
+    const where = ['is_active=1', 'combo_key_version=?'];
+    const params = [COMBO_KEY_VERSION];
+    if (sm) { where.push('shipping_method_code=?'); params.push(sm); }
+    if (pm) { where.push('packing_machine_code=?'); params.push(pm); }
+    if (dateFromIso) { where.push('decided_at >= ?'); params.push(dateFromIso); }
+    if (dateToIsoExclusive) { where.push('decided_at < ?'); params.push(dateToIsoExclusive); }
+    const allowed = new Set(db.prepare(`SELECT combo_key FROM pd_assort_decision WHERE ${where.join(' AND ')} ORDER BY decided_at DESC LIMIT 2000`)
+      .all(...params).map((r) => r.combo_key));
+    if (combos === null) combos = allowed;
+    else for (const ck of [...combos]) if (!allowed.has(ck)) combos.delete(ck);
+  }
+
+  // 3) 全候補を hydrate → 合計数量で post-filter → 登録日降順で sort → 50件 slice
+  //    (Set 走査中に 50件 break + 後 sort だと「先に拾われた 50件」になるため、全候補を sort 対象に)
+  const hydrated = [];
   for (const ck of combos) {
     const d = getAssortByCombo(ck);
     if (!d) continue;
-    out.push({
+    const totalQty = d.items.reduce((s, it) => s + Number(it.qty || 0), 0);
+    if (qtyMin !== null && totalQty < qtyMin) continue;
+    if (qtyMax !== null && totalQty > qtyMax) continue;
+    hydrated.push({
       combo_key: ck,
       shipping_method_code: d.shipping_method_code,
       packing_machine_code: d.packing_machine_code,
       decided_by: d.decided_by, decided_at: d.decided_at,
+      total_qty: totalQty,
       items: d.items.map((it) => ({ sku_key: it.sku_key, product_code: String(it.sku_key).split('::')[0], product_name: resolveItemName(db, it.sku_key), qty: it.qty })),
       usage: d.usage,
     });
-    if (out.length >= 50) break;
   }
-  return out;
+  hydrated.sort((a, b) => (a.decided_at < b.decided_at ? 1 : a.decided_at > b.decided_at ? -1 : 0));
+  return hydrated.slice(0, 50);
 }
 
 /** 学習の配送方法・梱包機を更新(明細はそのまま)。SCD2で旧版は is_active=0 に。 */

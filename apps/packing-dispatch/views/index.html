@@ -219,11 +219,18 @@
     </div>
     <div class="card">
       <div class="row">
-        <input id="aQuery" placeholder="注文番号 / 受注番号 / 商品コード で検索" size="32" />
+        <input id="aQuery" placeholder="注文番号 / 受注番号 / 商品コード" size="32" />
+        <label>配送方法 <select id="aSm"><option value="">（指定なし）</option></select></label>
+        <label>梱包機 <select id="aPm"><option value="">（指定なし）</option></select></label>
+      </div>
+      <div class="row">
+        <label>合計数量 <input id="aQtyMin" type="number" min="1" style="width:64px" placeholder="最小" /> 〜 <input id="aQtyMax" type="number" min="1" style="width:64px" placeholder="最大" /></label>
+        <label>登録日 <input id="aDateFrom" type="date" style="min-width:140px" /> 〜 <input id="aDateTo" type="date" style="min-width:140px" /></label>
         <button id="btnAssortSearch">検索</button>
+        <button id="btnAssortClear" class="sub" title="検索条件をクリア">クリア</button>
         <span id="aStatus" class="muted"></span>
       </div>
-      <div class="muted">アソート(複数商品の組合せ)の学習を検索し、配送方法・梱包機を修正できます（次回以降の自動判定に反映）。注文番号・受注番号は過去にその組合せが出た伝票から辿れます。</div>
+      <div class="muted">複数条件は AND で絞り込み。<b>条件を1つも指定しない検索は実行されません</b>。合計数量はアソート内の全SKUの数量合計、登録日はその学習を確定した日。</div>
     </div>
     <div id="assortResults"></div>
   </section>
@@ -384,7 +391,15 @@
       <h3 id="ch7-assort">7-3. アソート学習</h3>
       <ul>
         <li>異商品の組合せ注文(アソート)は商品マスタのルールでは引けないため、組合せ(combo_key)単位で別途学習</li>
-        <li>注文番号 / 受注番号 / 商品コードで過去の学習を検索 → 修正可能</li>
+        <li>検索条件 (複数指定可・AND):
+          <ul>
+            <li>テキスト: 注文番号 / 受注番号 / 商品コード</li>
+            <li>配送方法 (ネコポス/ヤマト50/発払い等)</li>
+            <li>梱包機 (pasline3つ折り/pasline2つ折り/meltline/手動)</li>
+            <li>合計数量 (最小〜最大、アソート内全SKUの合計)</li>
+            <li>登録日 (from 〜 to の範囲)</li>
+          </ul>
+        </li>
         <li>修正は次回以降の自動判定に反映 (SCD2 履歴保持)</li>
         <li>レターパックは学習対象外 (4kg/A4制限のため毎回目視判断)</li>
       </ul>
@@ -875,22 +890,41 @@ async function loadUnreg(){
 $('#btnLoadUnreg').onclick=loadUnreg;
 
 // ── アソート学習 検索・編集 ──
+// 検索条件select の初期化 (一度だけ。OPTIONS は読込み済み前提)
+function initAssortFilters(){
+  // aes は学習対象外なので除外 / letterpack も同様
+  fillSelect($('#aSm'), [{code:'',name_csv:'（指定なし）'}, ...OPTIONS.methods.filter(m=>m.code!=='aes' && m.code!=='letterpack')], 'code', m=>m.name_csv, '');
+  fillSelect($('#aPm'), [{code:'',name_csv:'（指定なし）'}, ...OPTIONS.machines], 'code', m=>m.name_csv, '');
+}
 async function doAssortSearch(){
-  const q=$('#aQuery').value.trim(); if(!q){ $('#assortResults').innerHTML=''; return; }
+  const params = new URLSearchParams();
+  const q=$('#aQuery').value.trim(); if(q) params.set('q', q);
+  const sm=$('#aSm').value; if(sm) params.set('sm', sm);
+  const pm=$('#aPm').value; if(pm) params.set('pm', pm);
+  const qMin=$('#aQtyMin').value.trim(); if(qMin) params.set('qtyMin', qMin);
+  const qMax=$('#aQtyMax').value.trim(); if(qMax) params.set('qtyMax', qMax);
+  const dFrom=$('#aDateFrom').value; if(dFrom) params.set('dateFrom', dFrom);
+  const dTo=$('#aDateTo').value; if(dTo) params.set('dateTo', dTo);
+  if([...params.keys()].length===0){
+    $('#assortResults').innerHTML='<div class="card muted">検索条件を1つ以上入れてください。</div>';
+    $('#aStatus').textContent='';
+    return;
+  }
   $('#aStatus').textContent='検索中…';
   try{
-    const rows=await api(`api/assort/search?q=${encodeURIComponent(q)}`);
+    const rows=await api(`api/assort/search?${params.toString()}`);
     $('#aStatus').textContent=`${rows.length}件`;
     const box=$('#assortResults'); box.innerHTML='';
-    if(!rows.length){ box.innerHTML='<div class="card muted">該当する学習はありません（その注文番号の組合せはまだ学習されていない可能性）。</div>'; return; }
+    if(!rows.length){ box.innerHTML='<div class="card muted">該当する学習はありません。</div>'; return; }
     for(const r of rows){
       const card=document.createElement('div'); card.className='card';
       const items=r.items.map(i=>`${esc(i.product_code)} ${esc(i.product_name||'')} ×${i.qty}`).join(' ／ ');
       const orders=r.usage.map(u=>`${esc(u.order_no)}${u.uketsuke_no?`(受:${esc(u.uketsuke_no)})`:''}`).join(', ')||'—';
+      const totalQtyHtml = (typeof r.total_qty==='number') ? `<span class="muted"> (合計${r.total_qty}個)</span>` : '';
       // letterpack は学習対象外 (A4/4kg制限、目視判断必須)。選択肢から除外。
       const mOpts=OPTIONS.methods.filter(m=>m.code!=='aes' && m.code!=='letterpack').map(m=>`<option value="${m.code}">${esc(m.name_csv)}</option>`).join('');
       const pOpts=OPTIONS.machines.map(m=>`<option value="${m.code}">${esc(m.name_csv)}</option>`).join('');
-      card.innerHTML=`<div style="margin-bottom:6px"><b>商品:</b> ${items}</div>`+
+      card.innerHTML=`<div style="margin-bottom:6px"><b>商品:</b> ${items}${totalQtyHtml}</div>`+
         `<div class="muted" style="margin-bottom:8px"><b>利用注文:</b> ${orders}</div>`+
         `<div class="row"><label>配送方法</label><select class="asm" style="min-width:220px">${mOpts}</select>`+
         `<label>梱包機</label><select class="apm" style="min-width:200px">${pOpts}</select>`+
@@ -911,6 +945,11 @@ async function doAssortSearch(){
   }catch(e){ $('#aStatus').textContent=''; alert('検索エラー: '+e.message); }
 }
 $('#btnAssortSearch').onclick=doAssortSearch;
+$('#btnAssortClear').onclick=() => {
+  $('#aQuery').value=''; $('#aSm').value=''; $('#aPm').value='';
+  $('#aQtyMin').value=''; $('#aQtyMax').value=''; $('#aDateFrom').value=''; $('#aDateTo').value='';
+  $('#assortResults').innerHTML=''; $('#aStatus').textContent='';
+};
 $('#aQuery').addEventListener('keydown', (e)=>{ if(e.key==='Enter') doAssortSearch(); });
 
 // ── マスタ状態 / 初期投入 ──
@@ -933,7 +972,7 @@ $('#btnSeed').onclick = async () => {
 };
 document.querySelector('.tab[data-tab=master]').addEventListener('click', refreshMasterStat);
 
-(async () => { await loadOptions(); initCondSelects(); loadBatches(); })();
+(async () => { await loadOptions(); initCondSelects(); initAssortFilters(); loadBatches(); })();
 </script>
 </body>
 </html>
