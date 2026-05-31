@@ -88,7 +88,12 @@ const DEFAULT_MALL_GROUP = 'rakuten'; // 未知ショップ・ルール無し時
 
 const COMBO_KEY_VERSION = 1;
 const NEKOPOS_PACKING = ['pasline3', 'pasline2', 'meltline']; // ネコポスで許される梱包機
-const HOKKAIDO_OKINAWA = ['北海道', '沖縄県', '沖縄']; // 地域特例
+// 地域特例: 沖縄/北海道宛は前方一致で判定 (CSV第6列は基本「都道府県名」のみだが、表記揺れ・住所混入の防御)。
+// '沖縄' で startsWith → '沖縄県' も '沖縄' 単体も拾える。
+const HOKKAIDO_OKINAWA_PREFIXES = ['北海道', '沖縄'];
+// 地域別運賃が発生する配送方法のみ letterpack(全国一律)に振替候補化する。
+// その他 (ネコポス/ゆうパケットパフ/定形外/クリックポスト/福山/西濃) は全国一律料金なので据え置き。
+const REGION_REPLACE_TARGETS = ['takkyu50', 'hatsubarai', 'yupack'];
 
 // ───────────────────────── 共通ユーティリティ ─────────────────────────
 
@@ -365,6 +370,12 @@ function lookupAssort(combo_key) {
 export function saveAssortDecision({ items, combo_detail, shipping_method_code, packing_machine_code }, user) {
   const db = ensureSchema();
   const combo_key = comboKeyOf(items);
+  // letterpack は学習対象外 (A4/4kg制限のため毎回目視判断が必要)。defense-in-depth で DB 層でも遮断。
+  // 呼び出し側で skipped を検知できるよう値を返す (audit にも記録)。
+  if (shipping_method_code === 'letterpack') {
+    audit('assort_decide_skipped', combo_key, { reason: 'letterpack_no_learn' }, user);
+    return { combo_key, skipped: 'letterpack_no_learn' };
+  }
   const fin = finalizeLine(shipping_method_code, packing_machine_code); // 整合矯正
   const now = utcIsoNow();
   const tx = db.transaction(() => {
@@ -410,7 +421,7 @@ export function classifyOrder(lines, smMap = shippingMethodMap()) {
   const skus = [...bySku.values()];
   const mall_group = lines[0]?.mall_group || DEFAULT_MALL_GROUP;
   const pref = norm(lines[0]?.pref);
-  const isRegionSpecial = HOKKAIDO_OKINAWA.includes(pref);
+  const isRegionSpecial = HOKKAIDO_OKINAWA_PREFIXES.some((p) => pref.startsWith(p));
 
   // (1) AES lock: いずれかの行が AES(現行配送方法) なら触らない
   const curMethodCodes = lines.map((l) => l.cur_method_code).filter(Boolean);
@@ -455,11 +466,26 @@ export function classifyOrder(lines, smMap = shippingMethodMap()) {
     }
   }
 
-  // (4) 地域特例: 沖縄・北海道 → letterpack 上書き(梱包機は manual に落ちる)
-  if (isRegionSpecial && result.row_status === 'auto' && result.shipping_method_code && result.shipping_method_code !== 'aes') {
-    result = { ...result, shipping_method_code: 'letterpack', packing_machine_code: 'manual', reason_code: 'region_letterpack' };
-  } else if (isRegionSpecial && result.row_status === '要判断') {
-    result = { ...result, suggest_shipping_method_code: 'letterpack' };
+  // (4) 地域特例: 沖縄・北海道 × 地域別運賃の3配送方法(takkyu50/hatsubarai/yupack)のみ letterpack 候補化。
+  //   - 全国一律料金の配送方法 (nekopos/yupacketpuff/teikeigai/clickpost等) は据え置き。
+  //   - レターパック500 は A4/4kg 制限のため箱に入るか目視判断が必須 → 必ず row_status='要判断' に格下げ。
+  //   - 新規アソート(要判断)で上位サジェストが該当3つなら、サジェストのみ letterpack に差し替え。
+  if (isRegionSpecial && result.shipping_method_code && REGION_REPLACE_TARGETS.includes(result.shipping_method_code)) {
+    result = {
+      ...result,
+      shipping_method_code: 'letterpack',
+      packing_machine_code: 'manual',
+      row_status: '要判断',
+      reason_code: 'region_letterpack_check',
+    };
+  } else if (
+    isRegionSpecial &&
+    result.row_status === '要判断' &&
+    result.suggest_shipping_method_code &&
+    REGION_REPLACE_TARGETS.includes(result.suggest_shipping_method_code)
+  ) {
+    // サジェストも letterpack に差し替え + 集計用に reason_code も統一 (運用可視性)。
+    result = { ...result, suggest_shipping_method_code: 'letterpack', reason_code: 'region_letterpack_check' };
   }
 
   // (5) LINEギフトは必ず手動出荷 (要件)。配送方法はそのまま、梱包機のみ manual に固定 (null/要判断行も含め無条件)。

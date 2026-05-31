@@ -258,7 +258,8 @@ export function decideOrder(batch_id, shop_name, order_no, { shipping_method_cod
       }
     }
 
-    if (learn && lines[0].order_type === 'assort') {
+    // letterpack は学習対象外 (A4/4kg制限のため毎回目視判断が必要)。learn=true でもスキップ。
+    if (learn && lines[0].order_type === 'assort' && fin.shipping_method_code !== 'letterpack') {
       // 同一SKU合算した明細で学習
       const bySku = new Map();
       for (const l of lines) {
