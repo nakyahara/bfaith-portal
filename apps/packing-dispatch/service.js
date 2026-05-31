@@ -358,6 +358,12 @@ export function exportCsv(batch_id, user, opts = {}) {
       let pm = l.packing_machine_code;
       if (downgradeMeltline && pm === 'meltline') pm = 'manual'; // MeltLine 導入前は手動出荷で出す
       if (isLineGift(l.shop_name)) pm = 'manual';                // LINEギフトは必ず手動出荷 (安全網)
+      // 沖縄県宛 × ネコポス は梱包機マーカーを「手動出荷」に矯正。
+      // 航空便の液体規制は、ヤマト端末で送り状QRを読んだときに「沖縄エラー」で別管理導線へ
+      // 入る運用。梱包機出荷(pasline/meltline)だと送り状にQRが付かずヤマト端末でエラーが
+      // 出ないため、手動出荷扱いで吐き出して送り状経由で必ずエラーを検知させる。
+      // (配送方法はネコポスのまま=送料/契約区分は変えない、91列目の梱包機マーカーだけ落とす)
+      if (l.shipping_method_code === 'nekopos' && norm(l.pref).startsWith('沖縄')) pm = 'manual';
       const fin = finalizeLine(l.shipping_method_code, pm, smMap);
       for (const [idx, val] of Object.entries(fin.cols)) raw[Number(idx)] = val;
     }
