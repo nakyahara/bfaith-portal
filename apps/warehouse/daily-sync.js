@@ -104,6 +104,90 @@ function toJstDate(d) {
   return jst.toISOString().slice(0, 10);
 }
 
+// ─── ディスク保守 (再発防止: 2026-06-01 障害) ───
+// 障害: warehouse.db.bak_pre_* (migration 直前の手動バックアップ) が 10 個・約 150GB 蓄積し
+//   C: ドライブが残り 1.5GB に → Amazon Settlement / FBA snapshot が
+//   "database or disk is full" で失敗、月末確定値まで連鎖 skip。
+// 根本原因: これらの .bak は各 migration スクリプトが「実行前に手動 backup 必須」と
+//   注記しているだけで、作成側に cleanup 機構が無く溜まり続ける。
+// 対策: 毎朝この冒頭 (重い処理の前) で
+//   (1) 古い .bak を自動掃除 — 最新 1 個は常に温存し、retention 日数より古いものだけ削除。
+//   (2) 空き容量を取得し warn/crit 閾値で通知 → 溢れる前に気づける。
+const DB_BAK_RETENTION_DAYS = Number(process.env.DB_BAK_RETENTION_DAYS || 7);
+const DISK_FREE_WARN_GB = Number(process.env.DISK_FREE_WARN_GB || 20);
+const DISK_FREE_CRIT_GB = Number(process.env.DISK_FREE_CRIT_GB || 10);
+
+function diskMaintenance() {
+  const dataDir = process.env.DATA_DIR || path.join(PROJECT_DIR, 'data');
+  const warnings = [];
+  const deleted = [];
+  let freedBytes = 0;
+  let keptCount = 0;
+
+  // (1) 古い warehouse.db.bak* (= migration 直前バックアップ) の掃除
+  try {
+    const baks = fs.readdirSync(dataDir)
+      .filter((n) => n.startsWith('warehouse.db.bak'))
+      .map((n) => {
+        const fp = path.join(dataDir, n);
+        try {
+          const st = fs.statSync(fp);
+          return { name: n, fp, mtime: st.mtimeMs, size: st.size };
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.mtime - a.mtime); // 新しい順
+
+    keptCount = baks.length; // 後で削除数を引く
+    const cutoff = Date.now() - DB_BAK_RETENTION_DAYS * 86400000;
+    // index 0 (最新) は age に関わらず常に温存 (直前 migration の唯一の復元点を守る)。
+    // 残りのうち retention 日数より古いものだけ削除 (新しい .bak は手元に残す)。
+    for (let i = 1; i < baks.length; i++) {
+      const b = baks[i];
+      if (b.mtime < cutoff) {
+        try {
+          fs.unlinkSync(b.fp);
+          deleted.push(b.name);
+          freedBytes += b.size;
+        } catch (e) {
+          warnings.push(`🟡 .bak 削除失敗 ${b.name} (${e.message})`);
+        }
+      }
+    }
+    keptCount -= deleted.length;
+  } catch (e) {
+    warnings.push(`🟡 .bak 掃除スキップ (${e.message})`);
+  }
+
+  // (2) 空き容量チェック (fs.statfsSync は Node v18.15+、miniPC は v24)
+  let freeGB = null;
+  try {
+    const s = fs.statfsSync(dataDir);
+    freeGB = Math.round((s.bavail * s.bsize) / 1e9 * 10) / 10;
+  } catch (e) {
+    warnings.push(`🟡 空き容量取得失敗 (${e.message})`);
+  }
+
+  if (freeGB !== null) {
+    if (freeGB < DISK_FREE_CRIT_GB) {
+      warnings.unshift(`🔴 ディスク残り ${freeGB}GB → 逼迫 (warehouse.db ~35GB の書き込みが失敗する恐れ、不要 .bak / クラッシュダンプ削除を)`);
+    } else if (freeGB < DISK_FREE_WARN_GB) {
+      warnings.unshift(`🟡 ディスク残り ${freeGB}GB`);
+    }
+  }
+
+  const freedGB = Math.round((freedBytes / 1e9) * 10) / 10;
+  const summary =
+    `${freeGB !== null ? `残り ${freeGB}GB` : '残り不明'}` +
+    ` / .bak ${deleted.length}個削除` +
+    `${deleted.length ? `(${freedGB}GB解放)` : ''}, 保持${keptCount}個`;
+  // critical 未満のみ success:false (= 全体通知を ⚠️ 化)。warn / 取得失敗では落とさない。
+  const ok = !(freeGB !== null && freeGB < DISK_FREE_CRIT_GB);
+  return { ok, summary, warnings, freeGB };
+}
+
 async function main() {
   const startTime = new Date();
   // JST 固定の業務日付。子プロセスへ env で引き回す (UTC癖回避)
@@ -148,6 +232,12 @@ async function main() {
   }
 
   const results = [];
+
+  // ディスク保守を最初に実行: 古い .bak 掃除で当日の空きを確保し、空き容量を監視。
+  // 後続の重い処理 (Amazon Settlement / FBA snapshot 等、warehouse.db 書き込み) の前に走らせる。
+  const diskInfo = diskMaintenance();
+  console.log(`[DailySync] ディスク保守: ${diskInfo.summary}`);
+  results.push({ name: '💾 ディスク保守', success: diskInfo.ok, summary: diskInfo.summary });
 
   // VPS環境変数同期 (au PAYキーがミニPC .env で更新されていればVPSへ反映)
   const vpsEnvResult = runScript('apps/warehouse/sync-vps-env.js', 'VPS env同期');
@@ -774,7 +864,8 @@ async function main() {
   // 通知メッセージ作成
   // 期限切れ系（🔴🟡）のみ通知に含め、設定チェック系は同期失敗時のみ表示
   const urgentWarnings = tokenWarnings.filter(w => w.startsWith('🔴') || w.startsWith('🟡'));
-  const allOk = results.every(r => r.success) && urgentWarnings.length === 0;
+  const diskWarnings = (diskInfo && diskInfo.warnings) ? diskInfo.warnings : [];
+  const allOk = results.every(r => r.success) && urgentWarnings.length === 0 && diskWarnings.length === 0;
   const icon = allOk ? '✅' : '⚠️';
   let msg = `${icon} *Warehouse日次同期 ${dateStr}* (${duration}秒)\n`;
   for (const r of results) {
@@ -795,6 +886,10 @@ async function main() {
   if (urgentWarnings.length > 0) {
     msg += `\n*⏰ 認証情報アラート:*\n`;
     for (const w of urgentWarnings) msg += `${w}\n`;
+  }
+  if (diskWarnings.length > 0) {
+    msg += `\n*💾 ディスク容量アラート:*\n`;
+    for (const w of diskWarnings) msg += `${w}\n`;
   }
 
   console.log('\n' + msg);
