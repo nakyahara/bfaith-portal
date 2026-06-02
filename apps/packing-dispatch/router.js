@@ -14,6 +14,8 @@ import {
   importCsv, listBatches, batchSummary, listOrders, getOrderDetail, decideOrder, exportCsv,
   listRules, upsertRules, copyRules, searchRules, searchRulesByCondition, bulkUpdateRules,
   listUnregistered, mirrorFreshness, searchAssort, updateAssort,
+  getMeltlineMigrationPreview, executeMeltlineMigration, rollbackMeltlineMigration,
+  listMeltlineBackups, readMeltlineBackup,
 } from './service.js';
 import { loadSeed } from './tools/load-shipping-rule-seed.mjs';
 
@@ -22,6 +24,13 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 
 const router = Router();
 
 function currentUser(req) { return req.session?.email || req.session?.displayName || null; }
+function requireAdmin(req, res) {
+  if (req.session?.role !== 'admin') {
+    res.status(403).json({ ok: false, error: 'forbidden', message: '管理者専用機能です' });
+    return false;
+  }
+  return true;
+}
 function handle(res, fn) {
   try { res.json({ ok: true, result: fn() }); }
   catch (e) {
@@ -147,8 +156,52 @@ router.get('/api/product-diag', (req, res) => handle(res, () => productDiag(req.
 // ── アソート学習診断 (商品コードが学習に登録されているか・形式・有効無効) ──
 router.get('/api/assort-diag', (req, res) => handle(res, () => assortDiag(req.query.code || '')));
 
-// ── 初期データ投入 (Excel移行シード)。未投入時のみ。force=1 で再投入(全上書き) ──
-router.post('/api/admin/load-seed', (req, res) => handle(res, () =>
-  loadSeed({ force: req.query.force === '1' || (req.body && req.body.force === true) })));
+// ── 現在ユーザー情報 (UI で admin 専用機能の出し分け用) ──
+router.get('/api/me', (req, res) => handle(res, () => ({
+  email: req.session?.email || null,
+  displayName: req.session?.displayName || null,
+  role: req.session?.role || null,
+})));
+
+// ── 初期データ投入 (Excel移行シード)。未投入時のみ。force=1 で再投入(全上書き)。admin 限定 ──
+router.post('/api/admin/load-seed', (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  handle(res, () => loadSeed({ force: req.query.force === '1' || (req.body && req.body.force === true) }));
+});
+
+// ── マスタ移行: ネコポス×手動出荷 → ネコポス×meltline (admin専用、1回限り想定) ──
+// dry-run: 件数・サンプル・5分有効な dryRunToken を返す
+router.post('/api/admin/meltline-migration/preview', (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  handle(res, () => getMeltlineMigrationPreview());
+});
+// 本実行: { dryRunToken, confirm: "メルトライン移行を実行" } を body で受ける
+router.post('/api/admin/meltline-migration/execute', (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  handle(res, () => executeMeltlineMigration(req.body || {}, currentUser(req)));
+});
+// バックアップ一覧
+router.get('/api/admin/meltline-migration/backups', (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  handle(res, () => listMeltlineBackups());
+});
+// バックアップ JSON ダウンロード (path traversal 防御は service 内)
+router.get('/api/admin/meltline-migration/backup/:filename', (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const json = readMeltlineBackup(req.params.filename);
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(req.params.filename)}"`);
+    res.send(json);
+  } catch (e) {
+    if (e.code === 'VALIDATION') return res.status(400).json({ ok: false, error: 'validation', message: e.message });
+    res.status(500).json({ ok: false, error: 'server_error', message: e.message });
+  }
+});
+// ロールバック: { backup_file, confirm: "メルトライン移行をロールバック" }
+router.post('/api/admin/meltline-migration/rollback', (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  handle(res, () => rollbackMeltlineMigration(req.body || {}, currentUser(req)));
+});
 
 export default router;

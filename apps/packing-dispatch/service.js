@@ -2,6 +2,8 @@
  * 梱包機振り分け・配送方法判定 — サービス層 (取込/判定/編集/出力/マスタ)
  */
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import {
   ensureSchema, utcIsoNow, norm, buildSkuKey, normProductCode,
@@ -725,3 +727,363 @@ export function purgeExpiredBatches() {
 }
 
 export { listUnregistered, mirrorFreshness };
+
+// ───────────────────────── マスタ移行 (manual → meltline 一括書き換え) ─────────────────────────
+//
+// 目的: 2026-06-03 の meltline 本稼働に合わせ、既存「ネコポス × 手動出荷」設定を「ネコポス × meltline」
+//   に一括書き換え。pd_shipping_rule と pd_assort_decision (is_active=1) の両方を直接 UPDATE。
+//   レコード数不変。バックアップ JSON + audit log + ロールバック endpoint を併設。
+// 設計レビュー: Codex gpt-5.5 (Critical なし、High 3件対応済)。
+
+// dryRun トークンの揮発キャッシュ (5分有効)。同一プロセス内のみ有効、再起動で消えて OK (再 dryRun で再発行)。
+const MIGRATION_TOKEN_TTL_MS = 5 * 60 * 1000;
+const _migrationTokens = new Map(); // token -> { issued_at, target_ids: { rule:[], assort:[] } }
+
+function _purgeOldMigrationTokens() {
+  const cutoff = Date.now() - MIGRATION_TOKEN_TTL_MS;
+  for (const [k, v] of _migrationTokens) if (v.issued_at < cutoff) _migrationTokens.delete(k);
+}
+
+// バックアップ保存先 (Render の永続ディスクが無いので process.cwd() の data/backup 配下、後で Web Shell でも取れる)。
+function _backupDir() {
+  const base = process.env.DATA_DIR || path.join(process.cwd(), 'data');
+  const dir = path.join(base, 'backup', 'packing-dispatch');
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+const MIGRATION_MANUAL_TO_MELTLINE = 'manual_to_meltline_v1';
+// 許可するバックアップファイル名 (whitelist 強化、path traversal 防御)
+const BACKUP_FILENAME_RE = /^meltline_migration_[\w.\-]+\.json$/;
+// commit 済み marker (filesystem 上の .committed ファイル)
+function _committedMarker(backupPath) { return backupPath + '.committed'; }
+
+// backup file が commit 済みかを判定 (marker or audit log のいずれかで OK)。
+// marker 書込みが I/O 失敗した場合のフォールバック。audit は json_extract で完全一致。
+function _isBackupCommitted(db, fullPath, backupFilename) {
+  if (fs.existsSync(_committedMarker(fullPath))) return true;
+  const row = db.prepare(`SELECT 1 FROM pd_audit_log
+    WHERE action='meltline_migration'
+      AND json_extract(detail, '$.backup_file') = ? LIMIT 1`).get(backupFilename);
+  return !!row;
+}
+
+// 対象集合の fingerprint (id + content の sha256)。dry-run 後に内容が変わったケースまで検出する。
+function _targetsFingerprint({ rules, assorts }) {
+  const r = rules.map(x => [x.id, x.packing_machine_code, x.shipping_method_code, x.updated_at]);
+  const a = assorts.map(x => [x.id, x.packing_machine_code, x.shipping_method_code, x.decided_at]);
+  return crypto.createHash('sha256').update(JSON.stringify({ r, a })).digest('hex');
+}
+
+// 進行中バッチチェック (busy/import/export 中なら拒否)。txFn 内で再チェックも行う。
+// expired (TTL 切れ) は除外して「実際に進行中」のみ拾う。
+function _assertNoBusyBatch(db) {
+  const now = utcIsoNow();
+  const busy = db.prepare(`SELECT batch_id, status FROM pd_import_batch
+    WHERE status IN ('classifying','locked_for_export')
+      AND (expires_at IS NULL OR expires_at >= ?)
+    LIMIT 5`).all(now);
+  if (busy.length > 0) throw vErr('進行中の取込バッチがあるため移行できません。先に確定・出力を済ませてください。', { busy });
+}
+
+// audit log を throw 版で記録 (移行系は audit 失敗を見逃せない)。
+function _auditOrThrow(action, target, detail, who) {
+  const db = ensureSchema();
+  const info = db.prepare(`INSERT INTO pd_audit_log (ts,who,action,target,detail) VALUES (?,?,?,?,?)`)
+    .run(utcIsoNow(), who || null, action, target || null, detail ? JSON.stringify(detail) : null);
+  if (!info.changes) throw new Error(`audit log 書込み失敗 (${action})`);
+}
+
+// 対象集合を確定する内部関数 (BEGIN IMMEDIATE 下でも、dryRun でも共通)。
+// assort はあとで item も付ける (完全 backup のため)。
+function _selectMeltlineTargets(db) {
+  const rules = db.prepare(`
+    SELECT id, sku_key, product_code, mall_group, qty_min, qty_max,
+           shipping_method_code, packing_machine_code, updated_at, updated_by
+      FROM pd_shipping_rule
+     WHERE shipping_method_code='nekopos' AND packing_machine_code='manual'
+     ORDER BY id
+  `).all();
+  const assorts = db.prepare(`
+    SELECT id, combo_key, combo_key_version, combo_detail,
+           shipping_method_code, packing_machine_code, is_active, decided_by, decided_at
+      FROM pd_assort_decision
+     WHERE shipping_method_code='nekopos' AND packing_machine_code='manual' AND is_active=1
+     ORDER BY id
+  `).all();
+  return { rules, assorts };
+}
+
+// assort の item を id 群で取得 (backup 完全性のため)。
+function _selectAssortItems(db, decisionIds) {
+  if (!decisionIds.length) return [];
+  const placeholders = decisionIds.map(() => '?').join(',');
+  return db.prepare(`SELECT decision_id, sku_key, qty FROM pd_assort_decision_item
+    WHERE decision_id IN (${placeholders}) ORDER BY decision_id, sku_key`).all(...decisionIds);
+}
+
+/**
+ * dry-run: 対象件数・モール別内訳・サンプル + 5分有効な dryRunToken を返す。
+ * 実行時はこの token と確認文言 "メルトライン移行を実行" を要求する。
+ */
+export function getMeltlineMigrationPreview() {
+  const db = ensureSchema();
+  _assertNoBusyBatch(db);
+  // ターゲットチェック: meltline コードと nekopos コードが存在することを確認
+  const pmExists = db.prepare(`SELECT code FROM pd_packing_machine WHERE code='meltline'`).get();
+  const smExists = db.prepare(`SELECT code FROM pd_shipping_method WHERE code='nekopos'`).get();
+  if (!pmExists) throw vErr('pd_packing_machine に meltline が未登録です');
+  if (!smExists) throw vErr('pd_shipping_method に nekopos が未登録です');
+
+  const { rules, assorts } = _selectMeltlineTargets(db);
+  const byMall = {};
+  for (const r of rules) byMall[r.mall_group] = (byMall[r.mall_group] || 0) + 1;
+
+  if (rules.length === 0 && assorts.length === 0) {
+    return {
+      already_migrated: true,
+      rule: { total: 0, by_mall_group: {}, samples: [] },
+      assort: { total: 0, samples: [] },
+      dryRunToken: null,
+    };
+  }
+
+  _purgeOldMigrationTokens();
+  const dryRunToken = crypto.randomBytes(24).toString('hex');
+  _migrationTokens.set(dryRunToken, {
+    issued_at: Date.now(),
+    target_ids: { rule: rules.map(r => r.id), assort: assorts.map(a => a.id) },
+    fingerprint: _targetsFingerprint({ rules, assorts }),
+  });
+
+  return {
+    already_migrated: false,
+    rule: {
+      total: rules.length,
+      by_mall_group: byMall,
+      samples: rules.slice(0, 10).map(r => ({
+        sku_key: r.sku_key, mall_group: r.mall_group, qty_min: r.qty_min, qty_max: r.qty_max,
+      })),
+    },
+    assort: {
+      total: assorts.length,
+      samples: assorts.slice(0, 10).map(a => ({
+        combo_key: a.combo_key, combo_detail: a.combo_detail,
+      })),
+    },
+    dryRunToken,
+    dryRunTokenTtlSec: Math.floor(MIGRATION_TOKEN_TTL_MS / 1000),
+  };
+}
+
+/**
+ * 本実行: BEGIN IMMEDIATE で書込ロック → 対象 id 確定 → backup JSON → UPDATE → post-check → COMMIT。
+ * dryRunToken と confirm 文言 ('メルトライン移行を実行') が必須。
+ */
+export function executeMeltlineMigration({ dryRunToken, confirm }, user) {
+  if (confirm !== 'メルトライン移行を実行') throw vErr('確認文言が一致しません');
+  _purgeOldMigrationTokens();
+  const tok = _migrationTokens.get(dryRunToken);
+  if (!tok) throw vErr('dryRunToken が無効または期限切れです (5分以内に取り直してください)');
+
+  const db = ensureSchema();
+
+  const migration_id = crypto.randomUUID();
+  const now = utcIsoNow();
+  const ts = now.replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
+  const backupFilename = `meltline_migration_${ts}_${migration_id.slice(0, 8)}.json`;
+  if (!BACKUP_FILENAME_RE.test(backupFilename)) throw new Error('生成した backup filename が whitelist に合いません');
+  const backupPath = path.join(_backupDir(), backupFilename);
+
+  // BEGIN IMMEDIATE 相当: better-sqlite3 の transaction('immediate') で書込ロック取得
+  // (better-sqlite3 v8 以降は db.transaction(fn).immediate() で呼ぶ)
+  const txFn = db.transaction(() => {
+    // 0. lock 取得後に busy check を再実施 (lock 外でのチェックは race を残す)
+    _assertNoBusyBatch(db);
+    // 1. 対象 id を再確定 (dryRun 時から状態が変わっていれば差分を検出)
+    const { rules, assorts } = _selectMeltlineTargets(db);
+    const assortItems = _selectAssortItems(db, assorts.map(a => a.id));
+    const ruleIdsNow = new Set(rules.map(r => r.id));
+    const assortIdsNow = new Set(assorts.map(a => a.id));
+    const ruleIdsToken = new Set(tok.target_ids.rule);
+    const assortIdsToken = new Set(tok.target_ids.assort);
+    const ruleDiffAdded = [...ruleIdsNow].filter(x => !ruleIdsToken.has(x));
+    const ruleDiffRemoved = [...ruleIdsToken].filter(x => !ruleIdsNow.has(x));
+    const assortDiffAdded = [...assortIdsNow].filter(x => !assortIdsToken.has(x));
+    const assortDiffRemoved = [...assortIdsToken].filter(x => !assortIdsNow.has(x));
+    if (ruleDiffAdded.length || ruleDiffRemoved.length || assortDiffAdded.length || assortDiffRemoved.length) {
+      throw vErr('dry-run 時から対象が変わっています。再度 dry-run を取り直してください', {
+        diff: { ruleAdded: ruleDiffAdded.length, ruleRemoved: ruleDiffRemoved.length,
+          assortAdded: assortDiffAdded.length, assortRemoved: assortDiffRemoved.length },
+      });
+    }
+    // 内容 fingerprint も一致確認 (集合は同じだが内容が編集されたケース検出)
+    const fpNow = _targetsFingerprint({ rules, assorts });
+    if (fpNow !== tok.fingerprint) {
+      throw vErr('dry-run 時から対象行の内容が変わっています。再度 dry-run を取り直してください');
+    }
+
+    // 2. backup JSON を書き込み (write + fsync + dir fsync + 存在確認)
+    //    assort_items も含める (完全 backup)。executed_at は UPDATE の updated_at と同値にして
+    //    rollback 時の「移行後に触られた行かどうか」判定に使う。
+    const backup = {
+      migration_id, migration_type: MIGRATION_MANUAL_TO_MELTLINE,
+      executed_at: now, executed_by: user || null,
+      predicate: { shipping_method_code: 'nekopos', packing_machine_code: 'manual' },
+      counts: { rule: rules.length, assort: assorts.length, assort_items: assortItems.length },
+      rules, assorts, assort_items: assortItems,
+    };
+    const tmpPath = backupPath + '.tmp';
+    const fd = fs.openSync(tmpPath, 'w');
+    try {
+      fs.writeFileSync(fd, JSON.stringify(backup, null, 2), 'utf8');
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(tmpPath, backupPath);
+    if (!fs.existsSync(backupPath)) throw new Error('backup JSON の保存に失敗しました');
+    // ディレクトリの metadata flush (POSIX) - Windows では noop だが安全側で
+    try {
+      const dirFd = fs.openSync(_backupDir(), 'r');
+      try { fs.fsyncSync(dirFd); } catch {} finally { fs.closeSync(dirFd); }
+    } catch {}
+
+    // 3. UPDATE rule
+    const ruleUpd = db.prepare(`
+      UPDATE pd_shipping_rule SET packing_machine_code='meltline', updated_at=?, updated_by=?
+       WHERE shipping_method_code='nekopos' AND packing_machine_code='manual'
+    `).run(now, user || null);
+
+    // 4. UPDATE assort
+    const assortUpd = db.prepare(`
+      UPDATE pd_assort_decision SET packing_machine_code='meltline', decided_at=?, decided_by=?
+       WHERE shipping_method_code='nekopos' AND packing_machine_code='manual' AND is_active=1
+    `).run(now, user || null);
+
+    // 5. post-check: nekopos + manual の残数が 0 件であること
+    const ruleRemain = db.prepare(`SELECT COUNT(*) c FROM pd_shipping_rule
+      WHERE shipping_method_code='nekopos' AND packing_machine_code='manual'`).get().c;
+    const assortRemain = db.prepare(`SELECT COUNT(*) c FROM pd_assort_decision
+      WHERE shipping_method_code='nekopos' AND packing_machine_code='manual' AND is_active=1`).get().c;
+    if (ruleRemain !== 0 || assortRemain !== 0) {
+      throw new Error(`post-check 失敗: 残 rule=${ruleRemain}, assort=${assortRemain} (ロールバック)`);
+    }
+    // 6. 件数突合 (UPDATE 件数 = dryRun token 時の対象数)
+    if (ruleUpd.changes !== rules.length || assortUpd.changes !== assorts.length) {
+      throw new Error(`件数不一致: rule updated=${ruleUpd.changes} expected=${rules.length} / assort updated=${assortUpd.changes} expected=${assorts.length}`);
+    }
+
+    // 7. audit log (まとめて 1 件)。失敗したら tx ロールバック (例外を握りつぶさない)
+    _auditOrThrow('meltline_migration', migration_id, {
+      rule_count: ruleUpd.changes, assort_count: assortUpd.changes,
+      backup_path: backupPath, backup_file: backupFilename,
+    }, user);
+
+    return { migration_id, rule_count: ruleUpd.changes, assort_count: assortUpd.changes,
+      backup_file: backupFilename, backup_path: backupPath };
+  });
+  // better-sqlite3 の immediate mode: 書込ロック取得
+  let result;
+  try {
+    result = txFn.immediate();
+  } catch (e) {
+    // tx 内で throw → backup JSON は filesystem 上に残る可能性がある。orphan を削除。
+    try { if (fs.existsSync(backupPath)) fs.unlinkSync(backupPath); } catch {}
+    try { if (fs.existsSync(backupPath + '.tmp')) fs.unlinkSync(backupPath + '.tmp'); } catch {}
+    throw e;
+  }
+  // 8. tx COMMIT 成功後に .committed marker を作成 (filesystem 側の orphan 検知に利用)。
+  try { fs.writeFileSync(_committedMarker(backupPath), JSON.stringify({ committed_at: utcIsoNow() }), 'utf8'); } catch {}
+
+  // token は使い切り
+  _migrationTokens.delete(dryRunToken);
+  return result;
+}
+
+/**
+ * ロールバック: backup JSON を読んで、UPDATE 対象が現在 meltline であることを検証してから
+ *   元の packing_machine_code に戻す。同じく BEGIN IMMEDIATE。
+ */
+export function rollbackMeltlineMigration({ backup_file, confirm }, user) {
+  if (confirm !== 'メルトライン移行をロールバック') throw vErr('確認文言が一致しません');
+  if (!backup_file || !BACKUP_FILENAME_RE.test(backup_file)) {
+    throw vErr('backup_file が不正です');
+  }
+  const fullPath = path.join(_backupDir(), backup_file);
+  if (!fs.existsSync(fullPath)) throw vErr('backup ファイルが見つかりません');
+  // commit 判定 (marker or audit log。marker 書込み失敗の fail-safe で audit log も見る)
+  if (!_isBackupCommitted(ensureSchema(), fullPath, backup_file)) {
+    throw vErr('この backup は commit 確定マーカーが見つかりません (実行中断・失敗した可能性)');
+  }
+  const backup = JSON.parse(fs.readFileSync(fullPath, 'utf8'));
+  if (backup.migration_type !== MIGRATION_MANUAL_TO_MELTLINE) throw vErr('backup の種別が違います');
+  if (!backup.executed_at) throw vErr('backup に executed_at がありません');
+
+  const db = ensureSchema();
+  const now = utcIsoNow();
+
+  const txFn = db.transaction(() => {
+    _assertNoBusyBatch(db);
+    let ruleRollback = 0, assortRollback = 0, ruleSkippedTouched = 0, assortSkippedTouched = 0;
+    // rule: 現在値が meltline かつ updated_at = backup.executed_at (= 移行後に再 UPDATE されていない) のみ戻す。
+    // 移行後に手動で再編集された行は対象外 (ユーザーの上書きを潰さない)。
+    const updRule = db.prepare(`
+      UPDATE pd_shipping_rule SET packing_machine_code=?, updated_at=?, updated_by=?
+       WHERE id=? AND shipping_method_code='nekopos' AND packing_machine_code='meltline'
+         AND updated_at = ?
+    `);
+    for (const r of backup.rules || []) {
+      const info = updRule.run(r.packing_machine_code || 'manual', now, user || null, r.id, backup.executed_at);
+      if (info.changes) ruleRollback += info.changes;
+      else ruleSkippedTouched++;
+    }
+    // assort: 同様に decided_at = backup.executed_at で守る
+    const updAssort = db.prepare(`
+      UPDATE pd_assort_decision SET packing_machine_code=?, decided_at=?, decided_by=?
+       WHERE id=? AND shipping_method_code='nekopos' AND packing_machine_code='meltline' AND is_active=1
+         AND decided_at = ?
+    `);
+    for (const a of backup.assorts || []) {
+      const info = updAssort.run(a.packing_machine_code || 'manual', now, user || null, a.id, backup.executed_at);
+      if (info.changes) assortRollback += info.changes;
+      else assortSkippedTouched++;
+    }
+    _auditOrThrow('meltline_migration_rollback', backup.migration_id, {
+      backup_file, rule_rolled_back: ruleRollback, assort_rolled_back: assortRollback,
+      rule_skipped_touched: ruleSkippedTouched, assort_skipped_touched: assortSkippedTouched,
+      rule_in_backup: (backup.rules || []).length, assort_in_backup: (backup.assorts || []).length,
+    }, user);
+    return { migration_id: backup.migration_id, rule_rolled_back: ruleRollback,
+      assort_rolled_back: assortRollback,
+      rule_skipped_touched: ruleSkippedTouched, assort_skipped_touched: assortSkippedTouched,
+      rule_in_backup: (backup.rules || []).length, assort_in_backup: (backup.assorts || []).length };
+  });
+  return txFn.immediate();
+}
+
+/** バックアップ一覧 (admin endpoint から呼ぶ)。.committed marker or audit log 確定で committed=true */
+export function listMeltlineBackups() {
+  const dir = _backupDir();
+  if (!fs.existsSync(dir)) return [];
+  const db = ensureSchema();
+  return fs.readdirSync(dir)
+    .filter(f => BACKUP_FILENAME_RE.test(f))
+    .map(f => {
+      const full = path.join(dir, f);
+      const stat = fs.statSync(full);
+      const committed = _isBackupCommitted(db, full, f);
+      return { file: f, size: stat.size, mtime: stat.mtime.toISOString(), committed };
+    })
+    .sort((a, b) => (a.mtime < b.mtime ? 1 : -1));
+}
+
+/** バックアップ JSON を返す (admin endpoint から呼ぶ。filename whitelist で path traversal 防御) */
+export function readMeltlineBackup(filename) {
+  if (!filename || !BACKUP_FILENAME_RE.test(filename)) {
+    throw vErr('filename が不正です');
+  }
+  const fullPath = path.join(_backupDir(), filename);
+  if (!fs.existsSync(fullPath)) throw vErr('backup ファイルが見つかりません');
+  return fs.readFileSync(fullPath, 'utf8');
+}

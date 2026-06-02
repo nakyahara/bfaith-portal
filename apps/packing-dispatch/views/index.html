@@ -171,6 +171,19 @@
         <tbody id="rulesBody"></tbody>
       </table></div>
     </div>
+    <!-- 管理者専用: メルトライン移行 (ネコポス×手動出荷 → ネコポス×meltline 一括書き換え) -->
+    <div class="card" id="adminMeltlineCard" style="display:none; background:#fff5f5; border-color:#f5c6cb">
+      <div class="row">
+        <strong style="color:#c0392b">⚠️ 管理者専用: メルトライン移行 (1回限り)</strong>
+      </div>
+      <div class="muted">ネコポス × 手動出荷 のルール／アソート学習をすべて ネコポス × meltline に一括書き換えます。実行前にバックアップ JSON が自動で作られ、ロールバック可能です。</div>
+      <div class="row" style="margin-top:8px">
+        <button id="btnMeltlineMigrate" style="background:#c0392b; border-color:#c0392b">メルトライン移行を開く</button>
+        <button id="btnMeltlineBackups" class="sub">バックアップ一覧</button>
+        <span id="meltlineStatus" class="muted"></span>
+      </div>
+      <div id="meltlineBackupList" style="margin-top:8px; display:none"></div>
+    </div>
   </section>
 
   <!-- ───── 条件検索・一括編集 ───── -->
@@ -478,6 +491,58 @@
   <div class="df">
     <button class="sub" id="dlgCancel">キャンセル</button>
     <button id="dlgOk">確定</button>
+  </div>
+</dialog>
+
+<!-- メルトライン移行ダイアログ -->
+<dialog id="meltDlg">
+  <div class="dh">⚠️ メルトライン移行 (ネコポス × 手動出荷 → ネコポス × meltline)</div>
+  <div class="db">
+    <div id="meltStep1">
+      <p>ステップ 1/3: 対象を確認します。「対象を取得」ボタンを押してください。</p>
+      <div class="row">
+        <button id="btnMeltPreview">対象を取得</button>
+        <span id="meltPreviewStatus" class="muted"></span>
+      </div>
+    </div>
+    <div id="meltStep2" style="display:none">
+      <p><b>ステップ 2/3: 対象件数を確認してください。</b></p>
+      <div id="meltPreviewResult" class="card" style="background:#f9f9f9; padding:12px"></div>
+      <p style="margin-top:12px">ステップ 3/3: 実行するには下のテキスト欄に <b style="color:#c0392b">メルトライン移行を実行</b> と入力して、「実行」ボタンを押してください。</p>
+      <div class="row">
+        <input id="meltConfirm" placeholder="ここに「メルトライン移行を実行」と入力" size="40" />
+        <button id="btnMeltExecute" disabled>実行</button>
+        <span id="meltExecStatus" class="muted"></span>
+      </div>
+      <div class="muted">トークン有効期限: <span id="meltTokenTtl">—</span></div>
+    </div>
+    <div id="meltStep3" style="display:none">
+      <p style="color:#2e7d32; font-weight:bold">✅ 移行完了</p>
+      <div id="meltExecResult" class="card" style="background:#e8f5e9; padding:12px"></div>
+      <p class="muted" style="margin-top:8px">バックアップは自動保存されました。ロールバックが必要な場合は「バックアップ一覧」から戻せます。</p>
+    </div>
+  </div>
+  <div class="df">
+    <button class="sub" id="btnMeltClose">閉じる</button>
+  </div>
+</dialog>
+
+<!-- ロールバック確認ダイアログ -->
+<dialog id="rollbackDlg">
+  <div class="dh">⚠️ メルトライン移行のロールバック</div>
+  <div class="db">
+    <p>バックアップファイル: <code id="rollbackFile"></code></p>
+    <p>このバックアップを使って、対象レコードを meltline → 手動出荷 に戻します。</p>
+    <p>実行するには下のテキスト欄に <b style="color:#c0392b">メルトライン移行をロールバック</b> と入力してください。</p>
+    <div class="row">
+      <input id="rollbackConfirm" placeholder="ここに「メルトライン移行をロールバック」と入力" size="40" />
+      <button id="btnRollbackExec" disabled>ロールバック実行</button>
+      <span id="rollbackStatus" class="muted"></span>
+    </div>
+    <div id="rollbackResult" style="margin-top:8px"></div>
+  </div>
+  <div class="df">
+    <button class="sub" id="btnRollbackClose">閉じる</button>
   </div>
 </dialog>
 
@@ -972,7 +1037,150 @@ $('#btnSeed').onclick = async () => {
 };
 document.querySelector('.tab[data-tab=master]').addEventListener('click', refreshMasterStat);
 
-(async () => { await loadOptions(); initCondSelects(); initAssortFilters(); loadBatches(); })();
+// ── 管理者専用: メルトライン移行 ──
+async function loadMe(){
+  try{ const me = await api('api/me');
+    if(me && me.role === 'admin'){
+      $('#adminMeltlineCard').style.display='block';
+    } else {
+      // 非 admin は seed ボタンも 403 になるので非表示にして UX を揃える
+      const sb = $('#btnSeed'); if(sb) sb.style.display='none';
+    }
+  }catch{}
+}
+let MELT_TOKEN = null;
+let MELT_TOKEN_TIMER = null;
+function meltResetSteps(){
+  $('#meltStep1').style.display='block'; $('#meltStep2').style.display='none'; $('#meltStep3').style.display='none';
+  $('#meltPreviewStatus').textContent=''; $('#meltExecStatus').textContent='';
+  $('#meltConfirm').value=''; $('#meltConfirm').disabled=false;
+  $('#meltConfirm').placeholder='ここに「メルトライン移行を実行」と入力';
+  $('#btnMeltExecute').disabled=true;
+  MELT_TOKEN = null;
+  if(MELT_TOKEN_TIMER){ clearInterval(MELT_TOKEN_TIMER); MELT_TOKEN_TIMER=null; }
+}
+$('#btnMeltlineMigrate').onclick = () => { meltResetSteps(); $('#meltDlg').showModal(); };
+$('#btnMeltClose').onclick = () => $('#meltDlg').close();
+$('#btnMeltPreview').onclick = async () => {
+  $('#meltPreviewStatus').textContent='取得中…';
+  try{
+    const r = await api('api/admin/meltline-migration/preview', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+    if(r.already_migrated){
+      $('#meltPreviewResult').innerHTML = '<b style="color:#2e7d32">✅ 既に移行済み: 対象 0 件</b>';
+      $('#meltStep1').style.display='none'; $('#meltStep2').style.display='block';
+      $('#btnMeltExecute').disabled = true;
+      $('#meltConfirm').disabled = true;
+      $('#meltConfirm').placeholder = '対象がないため実行できません';
+      $('#meltPreviewStatus').textContent = '';
+      return;
+    }
+    MELT_TOKEN = r.dryRunToken;
+    const byMall = r.rule.by_mall_group || {};
+    const mallRows = Object.entries(byMall).map(([m,c])=>`<tr><td>${esc(m)}</td><td style="text-align:right">${c}</td></tr>`).join('');
+    const ruleSamples = r.rule.samples.map(s=>`<tr><td>${esc(s.sku_key)}</td><td>${esc(s.mall_group)}</td><td>${s.qty_min}〜${s.qty_max==null?'∞':s.qty_max}</td></tr>`).join('');
+    const assortSamples = r.assort.samples.map(s=>`<tr><td>${esc((s.combo_key||'').slice(0,16))}…</td><td>${esc(s.combo_detail||'').slice(0,80)}</td></tr>`).join('');
+    $('#meltPreviewResult').innerHTML = `
+      <div><b>商品マスタルール: ${r.rule.total} 件</b></div>
+      <table style="margin-top:6px"><thead><tr><th>モール</th><th>件数</th></tr></thead><tbody>${mallRows}</tbody></table>
+      <div style="margin-top:8px"><b>サンプル (上位${r.rule.samples.length}件):</b></div>
+      <table style="margin-top:4px"><thead><tr><th>SKU</th><th>モール</th><th>数量帯</th></tr></thead><tbody>${ruleSamples}</tbody></table>
+      <div style="margin-top:12px"><b>アソート学習: ${r.assort.total} 件</b></div>
+      ${r.assort.samples.length?`<table style="margin-top:4px"><thead><tr><th>combo_key</th><th>明細</th></tr></thead><tbody>${assortSamples}</tbody></table>`:'<div class="muted">(なし)</div>'}
+    `;
+    $('#meltStep1').style.display='none'; $('#meltStep2').style.display='block';
+    // 5分カウントダウン
+    let remain = r.dryRunTokenTtlSec;
+    const updTtl = () => {
+      const m = Math.floor(remain/60), s = remain%60;
+      $('#meltTokenTtl').textContent = `${m}分${String(s).padStart(2,'0')}秒`;
+      if(remain<=0){ $('#meltTokenTtl').textContent='期限切れ — 再取得が必要です';
+        $('#btnMeltExecute').disabled=true; clearInterval(MELT_TOKEN_TIMER); MELT_TOKEN_TIMER=null; MELT_TOKEN=null; }
+      remain--;
+    };
+    updTtl();
+    MELT_TOKEN_TIMER = setInterval(updTtl, 1000);
+    $('#meltPreviewStatus').textContent='';
+  }catch(e){ $('#meltPreviewStatus').textContent='エラー: '+e.message; }
+};
+$('#meltConfirm').addEventListener('input', (e) => {
+  $('#btnMeltExecute').disabled = !(e.target.value === 'メルトライン移行を実行' && MELT_TOKEN);
+});
+$('#btnMeltExecute').onclick = async () => {
+  if(!MELT_TOKEN){ alert('トークンが期限切れです。最初からやり直してください。'); return; }
+  if($('#meltConfirm').value !== 'メルトライン移行を実行'){ return; }
+  if(!confirm('本当に実行しますか? バックアップは自動保存されますが、慎重に確認してください。')) return;
+  $('#meltExecStatus').textContent='実行中…';
+  $('#btnMeltExecute').disabled = true;
+  try{
+    const r = await api('api/admin/meltline-migration/execute', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ dryRunToken: MELT_TOKEN, confirm: 'メルトライン移行を実行' })
+    });
+    $('#meltExecResult').innerHTML = `
+      <div>migration_id: <code>${esc(r.migration_id)}</code></div>
+      <div>商品マスタルール更新: <b>${r.rule_count} 件</b></div>
+      <div>アソート学習更新: <b>${r.assort_count} 件</b></div>
+      <div>バックアップファイル: <code>${esc(r.backup_file)}</code></div>
+      <div style="margin-top:8px"><a href="api/admin/meltline-migration/backup/${encodeURIComponent(r.backup_file)}" download>📥 バックアップ JSON をダウンロード</a></div>
+    `;
+    $('#meltStep2').style.display='none'; $('#meltStep3').style.display='block';
+    if(MELT_TOKEN_TIMER){ clearInterval(MELT_TOKEN_TIMER); MELT_TOKEN_TIMER=null; }
+    MELT_TOKEN = null;
+  }catch(e){ $('#meltExecStatus').textContent='エラー: '+e.message; $('#btnMeltExecute').disabled = false; }
+};
+$('#btnMeltlineBackups').onclick = async () => {
+  $('#meltlineStatus').textContent='取得中…';
+  try{
+    const list = await api('api/admin/meltline-migration/backups');
+    const box = $('#meltlineBackupList');
+    if(!list || !list.length){ box.style.display='block'; box.innerHTML='<div class="muted">バックアップはありません。</div>'; $('#meltlineStatus').textContent=''; return; }
+    box.style.display='block';
+    box.innerHTML = '<table><thead><tr><th>ファイル名</th><th>状態</th><th>作成日時</th><th>サイズ</th><th>操作</th></tr></thead><tbody>'+
+      list.map(b=>{
+        const stateBadge = b.committed ? '<span class="badge b-ok">確定</span>' : '<span class="badge b-warn">未確定(orphan)</span>';
+        const rollbackBtn = b.committed ? `<button class="sub" data-rollback="${esc(b.file)}">↩️ ロールバック</button>` : '<span class="muted">(ロールバック不可)</span>';
+        return `<tr><td><code>${esc(b.file)}</code></td><td>${stateBadge}</td><td>${esc(b.mtime.replace('T',' ').slice(0,19))}</td><td>${b.size}B</td><td><a href="api/admin/meltline-migration/backup/${encodeURIComponent(b.file)}" download>📥</a> ${rollbackBtn}</td></tr>`;
+      }).join('')+
+      '</tbody></table>';
+    box.querySelectorAll('button[data-rollback]').forEach(btn => {
+      btn.onclick = () => {
+        $('#rollbackFile').textContent = btn.dataset.rollback;
+        $('#rollbackConfirm').value=''; $('#btnRollbackExec').disabled=true;
+        $('#rollbackResult').innerHTML=''; $('#rollbackStatus').textContent='';
+        $('#rollbackDlg').showModal();
+      };
+    });
+    $('#meltlineStatus').textContent='';
+  }catch(e){ $('#meltlineStatus').textContent='エラー: '+e.message; }
+};
+$('#rollbackConfirm').addEventListener('input', (e) => {
+  $('#btnRollbackExec').disabled = !(e.target.value === 'メルトライン移行をロールバック');
+});
+$('#btnRollbackClose').onclick = () => $('#rollbackDlg').close();
+$('#btnRollbackExec').onclick = async () => {
+  if($('#rollbackConfirm').value !== 'メルトライン移行をロールバック') return;
+  if(!confirm('ロールバックを実行しますか?')) return;
+  $('#rollbackStatus').textContent='実行中…';
+  $('#btnRollbackExec').disabled = true;
+  try{
+    const r = await api('api/admin/meltline-migration/rollback', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ backup_file: $('#rollbackFile').textContent, confirm: 'メルトライン移行をロールバック' })
+    });
+    const skipNote = (r.rule_skipped_touched > 0 || r.assort_skipped_touched > 0) ?
+      `<div class="muted" style="color:#c0392b">⚠️ ロールバック対象外があります (移行後に手動で再編集された行、または現在値が meltline 以外):<br/>商品マスタ ${r.rule_skipped_touched} 件 / アソート学習 ${r.assort_skipped_touched} 件 — ユーザーの上書きを保護するためそのまま残しました。</div>` : '';
+    $('#rollbackResult').innerHTML = `
+      <div style="color:#2e7d32; font-weight:bold">✅ ロールバック完了</div>
+      <div>migration_id: <code>${esc(r.migration_id)}</code></div>
+      <div>商品マスタ戻し: <b>${r.rule_rolled_back} / ${r.rule_in_backup} 件</b></div>
+      <div>アソート学習戻し: <b>${r.assort_rolled_back} / ${r.assort_in_backup} 件</b></div>
+      ${skipNote}
+    `;
+    $('#rollbackStatus').textContent='';
+  }catch(e){ $('#rollbackStatus').textContent='エラー: '+e.message; $('#btnRollbackExec').disabled = false; }
+};
+
+(async () => { await loadOptions(); initCondSelects(); initAssortFilters(); loadBatches(); loadMe(); })();
 </script>
 </body>
 </html>
