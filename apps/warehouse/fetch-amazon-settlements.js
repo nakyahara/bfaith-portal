@@ -374,7 +374,10 @@ const UPSERT_DIM_FEE_SQL = `
 const UPSERT_REFRESH_QUEUE_SQL = `
   INSERT INTO settlement_refresh_queue (year_month_int, reason, enqueued_at)
   VALUES (?, ?, ?)
-  ON CONFLICT(year_month_int) DO UPDATE SET reason = excluded.reason, enqueued_at = excluded.enqueued_at
+  ON CONFLICT(year_month_int) DO UPDATE SET
+    reason = excluded.reason,
+    enqueued_at = excluded.enqueued_at,
+    processed_at = NULL
 `;
 
 function ingestSettlement(db, headerRow, lineRows, ctx) {
