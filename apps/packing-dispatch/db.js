@@ -73,12 +73,14 @@ const PACKING_MACHINES = [
   ['manual',   '手動出荷',       9],
 ];
 
-// ショップ名→mall_group。Amazon 系のみ amazon、それ以外(楽天/Yahoo/LINE/メルカリ/auPay/Qoo10…)は rakuten を参照。
+// ショップ名→mall_group。Amazon 系のみ amazon、Yahoo / LINEギフト は yahoo (LINEギフトは
+// 楽天より Yahoo マスタの方が近い特性のため、2026-06-03 中原さん指示で移行)、それ以外は rakuten。
+// Yahoo ルール未登録のときは lookupRule で rakuten にフォールバックする (LINEギフトも同様)。
 const SHOP_MALL_MAP = [
   ['雑貨イズムAmazon店',     'amazon'],
   ['雑貨イズム楽天市場店',   'rakuten'],
-  ['雑貨イズムYahoo!店',     'yahoo'],   // Yahoo は個別保持 (無ければ rakuten にフォールバック)
-  ['LINE ギフト',            'rakuten'],
+  ['雑貨イズムYahoo!店',     'yahoo'],
+  ['LINE ギフト',            'yahoo'],    // ← 2026-06-03 rakuten から移行 (Yahoo マスタ参照)
   ['雑貨イズムメルカリshops', 'rakuten'],
   ['雑貨イズムauPay!店',     'rakuten'],
   ['雑貨イズムQoo10店',      'rakuten'],
@@ -232,6 +234,12 @@ export function ensureSchema() {
   const insMap = db.prepare(`INSERT OR IGNORE INTO pd_shop_mall_map (shop_name,mall_group) VALUES (?,?)`);
   for (const r of SHOP_MALL_MAP) insMap.run(...r);
 
+  // 2026-06-03 LINEギフト の mall_group を rakuten から yahoo へ移行 (中原さん指示)。
+  // INSERT OR IGNORE では既存行を更新できないため、idempotent UPDATE で本番 DB も移行する。
+  // 対象が無い (=移行済み / 行なし) なら no-op。
+  db.prepare(`UPDATE pd_shop_mall_map SET mall_group='yahoo'
+    WHERE shop_name='LINE ギフト' AND mall_group='rakuten'`).run();
+
     schemaReady = true;
     schemaError = null;
   } catch (e) {
@@ -273,6 +281,10 @@ function shippingMethodMap() {
   return m;
 }
 function mallGroupOf(shopName) {
+  // LINEギフトは表記揺れ (「LINE ギフト」「LINEギフト」「ＬＩＮＥギフト」等) を isLineGift() の
+  // 正規化で吸収して常に yahoo を返す。pd_shop_mall_map は完全一致しか引けないため、特例を
+  // 先頭で処理する (2026-06-03 mall_group 移行に伴う堅牢化)。
+  if (isLineGift(shopName)) return 'yahoo';
   const db = ensureSchema();
   const row = db.prepare(`SELECT mall_group FROM pd_shop_mall_map WHERE shop_name=?`).get(norm(shopName));
   return row ? row.mall_group : DEFAULT_MALL_GROUP;
