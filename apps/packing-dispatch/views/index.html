@@ -105,12 +105,15 @@
     <div class="card" id="ordersCard" style="display:none">
       <div class="row">
         <strong>伝票一覧</strong>
-        <select id="filterStatus">
+        <label class="muted">状態 <select id="filterStatus">
           <option value="">すべて</option>
           <option value="要判断">要判断のみ</option>
           <option value="確定">確定</option>
           <option value="auto">自動</option>
-        </select>
+        </select></label>
+        <label class="muted">店舗 <select id="filterShop"><option value="">すべて</option></select></label>
+        <label class="muted">配送方法 <select id="filterMethod"><option value="">すべて</option></select></label>
+        <span id="filterCount" class="muted"></span>
         <span style="flex:1"></span>
         <span id="exportHint" class="muted"></span>
         <button id="btnExportPre" class="sub" title="MeltLine になっている明細を手動出荷に切り替えて出力します（6月1日のMeltLine導入前用）">CSV出力（〜5/31 MeltLine→手動）</button>
@@ -677,11 +680,41 @@ function updateExportBtn(pending){
   $('#exportHint').textContent = dis ? `要判断 ${pending} 件を確定してから出力` : '';
 }
 
+// 取込済みの全伝票をメモリ保持し、状態/店舗/配送方法フィルタを frontend で同時適用する。
+// 状態フィルタ単独だった頃の API パターンを継承 (LIMIT 5000 で実用上問題なし)。
+let ORDER_ROWS = [];
 async function loadOrders(){
+  ORDER_ROWS = await api(`api/orders?batch=${encodeURIComponent(BATCH)}`);
+  rebuildOrderFilterOptions(ORDER_ROWS);
+  renderOrders();
+}
+// 取得結果に存在する shop/shipping_method の集合だけを select に積む (空の選択肢を出さない)。
+function rebuildOrderFilterOptions(rows){
+  const shops = [...new Set(rows.map(r => r.shop_name).filter(Boolean))].sort();
+  const methods = [...new Set(rows.map(r => r.shipping_method_code).filter(Boolean))].sort();
+  const curShop = $('#filterShop').value;
+  const curMethod = $('#filterMethod').value;
+  $('#filterShop').innerHTML = '<option value="">すべて</option>' +
+    shops.map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
+  $('#filterMethod').innerHTML = '<option value="">すべて</option>' +
+    methods.map(m => `<option value="${esc(m)}">${esc(methodName(m))}</option>`).join('');
+  // 取り直し前の選択を、まだ取込内に存在するなら保持
+  if(shops.includes(curShop)) $('#filterShop').value = curShop;
+  if(methods.includes(curMethod)) $('#filterMethod').value = curMethod;
+}
+function renderOrders(){
   const st = $('#filterStatus').value;
-  const rows = await api(`api/orders?batch=${encodeURIComponent(BATCH)}${st?`&status=${encodeURIComponent(st)}`:''}`);
+  const shop = $('#filterShop').value;
+  const sm = $('#filterMethod').value;
+  const filtered = ORDER_ROWS.filter(r =>
+    (!st || r.row_status === st) &&
+    (!shop || r.shop_name === shop) &&
+    (!sm || r.shipping_method_code === sm)
+  );
+  $('#filterCount').textContent = (st || shop || sm)
+    ? `${filtered.length} / ${ORDER_ROWS.length} 件` : `${ORDER_ROWS.length} 件`;
   const tb=$('#ordersBody'); tb.innerHTML='';
-  for(const o of rows){
+  for(const o of filtered){
     const tr=document.createElement('tr');
     const badge = o.row_status==='要判断'?'<span class="badge b-warn">要判断</span>':o.row_status==='確定'?'<span class="badge b-ok">確定</span>':'<span class="badge b-auto">自動</span>';
     tr.innerHTML = `<td>${badge}</td>`+
@@ -699,7 +732,9 @@ async function loadOrders(){
     tb.appendChild(tr);
   }
 }
-$('#filterStatus').onchange = loadOrders;
+$('#filterStatus').onchange = renderOrders;
+$('#filterShop').onchange = renderOrders;
+$('#filterMethod').onchange = renderOrders;
 
 // ── 判断ダイアログ (NE個別伝票風) ──
 async function openDecide(o){
