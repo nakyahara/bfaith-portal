@@ -177,9 +177,21 @@ function makeBusinessKey(row) {
   return sha256(canonicalize(obj));
 }
 
+// physical_line_hash から除外する volatile な ingest metadata。
+// row には実行毎に変わる ingest_run_id(=`settlement-${Date.now()}`) / observed_at(=nowIso) /
+// ingested_at(=nowSql) が含まれる。これらをハッシュに含めると同一物理行でも毎回
+// ハッシュが変わり、INSERT OR IGNORE (physical_line_hash UNIQUE) の重複排除が無効化される。
+// 2026-06-03 発覚: 同一 Settlement レポートを日次で再 fetch するたびに全行を再 INSERT し、
+// raw_amazon_settlement_lines が 31.8M 行 (実数の 10-30 倍) に膨張、mart 再構築が timeout。
+const PHYSICAL_HASH_EXCLUDE = new Set(['ingest_run_id', 'observed_at', 'ingested_at']);
+
 function makePhysicalHash(row, sourceDocumentId, sourceLineNo) {
-  // 全列 + source_document_id + source_line_no
-  const obj = { ...row, _source_document_id: sourceDocumentId, _source_line_no: sourceLineNo };
+  // 物理行の安定 identity (= 同一レポートの同一行は再 fetch しても同一ハッシュ)。
+  // volatile な ingest metadata を除いた全列 + source_document_id + source_line_no。
+  const obj = { _source_document_id: sourceDocumentId, _source_line_no: sourceLineNo };
+  for (const k of Object.keys(row)) {
+    if (!PHYSICAL_HASH_EXCLUDE.has(k)) obj[k] = row[k];
+  }
   return sha256(canonicalize(obj));
 }
 
