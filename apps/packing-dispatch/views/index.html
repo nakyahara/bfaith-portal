@@ -188,6 +188,33 @@
       </div>
       <div id="meltlineBackupList" style="margin-top:8px; display:none"></div>
     </div>
+    <!-- 管理者専用: 過去 exported バッチを pd_shipment_tracking に backfill (2026-06-04 hotfix) -->
+    <div class="card" id="adminBackfillTrackingCard" style="display:none; background:#fff5f5; border-color:#f5c6cb">
+      <div class="row">
+        <strong style="color:#c0392b">⚠️ 管理者専用: 追跡番号 backfill + 取込履歴削除 (2026-06-04 hotfix)</strong>
+      </div>
+      <div class="muted">
+        <b>Step 1</b>: PR #231 より前にアプリで出力したバッチを pd_shipment_tracking に補填 (INSERT-only、既存行は完全保護)。<br/>
+        <b>Step 2</b>: 既に取込済の B2 / ゆうパケットポストファン CSV を再投入できるよう、直近 24h の取込履歴を削除 (file_hash 解放)。<br/>
+        <b>Step 3</b>: 通常の追跡番号取込タブから B2 CSV を再アップロード → backfill で追加された 285 件に追跡番号紐付け。
+      </div>
+      <div class="row" style="margin-top:8px">
+        <strong>Step 1:</strong>
+        <button id="btnBackfillTrackingDry" class="sub">🔍 ドライラン</button>
+        <button id="btnBackfillTrackingRun" style="background:#c0392b; border-color:#c0392b">⚠️ backfill 実行</button>
+        <span id="backfillTrackingStatus" class="muted"></span>
+      </div>
+      <div id="backfillTrackingResult" style="margin-top:8px; display:none"></div>
+      <hr style="margin:12px 0; border:none; border-top:1px dashed #c0392b" />
+      <div class="row">
+        <strong>Step 2:</strong>
+        <label>直近 <input id="delImportsHours" type="number" min="1" max="72" value="24" style="width:64px" /> h</label>
+        <button id="btnDelImportsDry" class="sub">🔍 ドライラン</button>
+        <button id="btnDelImportsRun" style="background:#c0392b; border-color:#c0392b">⚠️ 取込履歴を削除</button>
+        <span id="delImportsStatus" class="muted"></span>
+      </div>
+      <div id="delImportsResult" style="margin-top:8px; display:none"></div>
+    </div>
   </section>
 
   <!-- ───── 条件検索・一括編集 ───── -->
@@ -1301,6 +1328,7 @@ async function loadMe(){
   try{ const me = await api('api/me');
     if(me && me.role === 'admin'){
       $('#adminMeltlineCard').style.display='block';
+      $('#adminBackfillTrackingCard').style.display='block';
     } else {
       // 非 admin は seed ボタンも 403 になるので非表示にして UX を揃える
       const sb = $('#btnSeed'); if(sb) sb.style.display='none';
@@ -1438,6 +1466,88 @@ $('#btnRollbackExec').onclick = async () => {
     $('#rollbackStatus').textContent='';
   }catch(e){ $('#rollbackStatus').textContent='エラー: '+e.message; $('#btnRollbackExec').disabled = false; }
 };
+
+// ── 管理者専用: 追跡番号 backfill (2026-06-04 hotfix) ──
+async function runBackfillTracking(dryRun){
+  const btn = dryRun ? $('#btnBackfillTrackingDry') : $('#btnBackfillTrackingRun');
+  if(!dryRun){
+    if(!confirm('過去 48h の exported バッチを走査し、未登録の伝票を pd_shipment_tracking に追加します (INSERT-only)。実行しますか?')) return;
+    if(!confirm('もう一度確認: 既存行 (紐付け済 / ready / synced / error 等すべて) は ON CONFLICT DO NOTHING で完全保護され、変更されません。実行しますか?')) return;
+  }
+  btn.disabled = true;
+  $('#backfillTrackingStatus').textContent = dryRun ? 'ドライラン実行中…' : 'backfill 実行中…';
+  try{
+    const r = await api('api/admin/tracking/backfill-from-exported' + (dryRun ? '?dryRun=1' : ''), {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'
+    });
+    const box = $('#backfillTrackingResult');
+    box.style.display = 'block';
+    const header = dryRun
+      ? `<div style="color:#2b6cb0; font-weight:bold">🔍 ドライラン結果</div>`
+      : `<div style="color:#2e7d32; font-weight:bold">✅ backfill 完了</div>`;
+    const perBatch = (r.per_batch || []).map(b => {
+      const note = b.note || (typeof b.already_exists === 'number' && b.already_exists > 0 ? `既存 ${b.already_exists} 件 skip` : '');
+      return `<tr><td><code>${esc(b.batch_id || '')}</code></td><td>${esc((b.uploaded_at || '').replace('T',' ').slice(0,19))}</td><td>${b.candidates || 0}</td><td>${b.inserted || 0}</td><td>${esc(note)}</td></tr>`;
+    }).join('');
+    const summary = `対象バッチ: <b>${r.batch_count}</b> 件 / 候補: <b>${r.total_candidates}</b> 件 / 新規追加: <b>${r.total_inserted}</b> 件 / 既存スキップ: <b>${r.total_already_exists}</b> 件`;
+    box.innerHTML = `
+      ${header}
+      <div>${summary}</div>
+      ${perBatch ? `<table style="margin-top:8px"><thead><tr><th>batch_id</th><th>uploaded_at</th><th>候補</th><th>新規追加</th><th>備考</th></tr></thead><tbody>${perBatch}</tbody></table>` : ''}
+      ${dryRun ? '<div class="muted" style="margin-top:8px">問題なければ「backfill 実行」を押してください。</div>' : ''}
+    `;
+    $('#backfillTrackingStatus').textContent = '';
+    if(!dryRun){ loadTrackingAll && loadTrackingAll(); }
+  }catch(e){
+    $('#backfillTrackingStatus').textContent = 'エラー: ' + e.message;
+  }finally{
+    btn.disabled = false;
+  }
+}
+const _bDry = $('#btnBackfillTrackingDry'); if(_bDry) _bDry.onclick = () => runBackfillTracking(true);
+const _bRun = $('#btnBackfillTrackingRun'); if(_bRun) _bRun.onclick = () => runBackfillTracking(false);
+
+// ── 管理者専用: 直近 24h の追跡番号取込履歴を削除 (再投入用、Codex R1 Critical 対応) ──
+async function runDeleteRecentImports(dryRun){
+  const btn = dryRun ? $('#btnDelImportsDry') : $('#btnDelImportsRun');
+  const hours = parseInt($('#delImportsHours').value, 10) || 24;
+  if(!dryRun){
+    if(!confirm(`直近 ${hours} 時間の追跡番号取込履歴 (B2 / ゆうパケットポストファン) を削除し、同じ CSV を再投入可能にします。実行しますか?`)) return;
+    if(!confirm('もう一度確認: 取込履歴 + 該当する配送方法変更ログ (90日 TTL 分のみ) も削除されます。永続集計件数 (pd_tracking_import の カウント) は失われます。実行しますか?')) return;
+  }
+  btn.disabled = true;
+  $('#delImportsStatus').textContent = dryRun ? 'ドライラン実行中…' : '削除実行中…';
+  try{
+    const r = await api('api/admin/tracking/imports/delete-recent' + (dryRun ? '?dryRun=1' : ''), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ hoursBack: hours })
+    });
+    const box = $('#delImportsResult');
+    box.style.display = 'block';
+    const header = dryRun
+      ? `<div style="color:#2b6cb0; font-weight:bold">🔍 ドライラン結果</div>`
+      : `<div style="color:#2e7d32; font-weight:bold">✅ 削除完了</div>`;
+    const targetRows = (r.targets || []).map(t =>
+      `<tr><td><code>${esc(t.import_id || '')}</code></td><td>${esc(t.source || '')}</td><td>${esc(t.filename || '')}</td><td>${t.row_count || 0}</td><td>${esc((t.imported_at || '').replace('T',' ').slice(0,19))}</td></tr>`
+    ).join('');
+    const summary = dryRun
+      ? `対象: <b>${(r.targets || []).length}</b> 件`
+      : `削除済: 取込履歴 <b>${r.imports_deleted}</b> 件 / 変更ログ <b>${r.logs_deleted}</b> 件`;
+    box.innerHTML = `
+      ${header}
+      <div>${summary} (直近 ${r.hours_back}h / source: ${esc((r.sources || []).join(', '))})</div>
+      ${targetRows ? `<table style="margin-top:8px"><thead><tr><th>import_id</th><th>source</th><th>filename</th><th>件数</th><th>imported_at</th></tr></thead><tbody>${targetRows}</tbody></table>` : '<div class="muted" style="margin-top:8px">対象なし</div>'}
+      ${dryRun ? '<div class="muted" style="margin-top:8px">問題なければ「取込履歴を削除」を押してください。</div>' : '<div class="muted" style="margin-top:8px">通常の追跡番号取込タブから CSV を再アップロードできます。</div>'}
+    `;
+    $('#delImportsStatus').textContent = '';
+  }catch(e){
+    $('#delImportsStatus').textContent = 'エラー: ' + e.message;
+  }finally{
+    btn.disabled = false;
+  }
+}
+const _dDry = $('#btnDelImportsDry'); if(_dDry) _dDry.onclick = () => runDeleteRecentImports(true);
+const _dRun = $('#btnDelImportsRun'); if(_dRun) _dRun.onclick = () => runDeleteRecentImports(false);
 
 // ── 追跡番号 / NE反映 タブ (PR 1: CSV取込 + 一覧 + 手動入力 + ready/skip) ──
 const TRK_STATUS_LABELS = {

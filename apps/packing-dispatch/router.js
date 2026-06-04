@@ -21,6 +21,7 @@ import {
   listTrackingByMethod, listMissingTracking, setTrackingOne,
   listTodayImportLinesByMethod,
   getMethodChangeSummary, listMethodChangeLog, purgeOldMethodChangeLog,
+  backfillShipmentTrackingFromExportedBatches, deleteRecentTrackingImports,
 } from './service.js';
 import { loadSeed } from './tools/load-shipping-rule-seed.mjs';
 
@@ -214,6 +215,25 @@ router.get('/api/tracking/method-change/log', (req, res) => handle(res, () => li
 router.post('/api/admin/tracking/method-change/purge', (req, res) => {
   if (!requireAdmin(req, res)) return;
   handle(res, () => purgeOldMethodChangeLog());
+});
+
+// 過去 exported バッチを走査して pd_shipment_tracking に backfill (2026-06-04 hotfix、admin専用)
+router.post('/api/admin/tracking/backfill-from-exported', (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  handle(res, () => backfillShipmentTrackingFromExportedBatches({
+    dryRun: req.query.dryRun === '1' || (req.body && req.body.dryRun === true),
+  }, currentUser(req)));
+});
+
+// duplicate file_hash で再投入できない取込履歴を削除 (2026-06-04 hotfix、admin専用)
+// body: { hoursBack?: number, sources?: string[], dryRun?: boolean }
+router.post('/api/admin/tracking/imports/delete-recent', (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  handle(res, () => deleteRecentTrackingImports({
+    hoursBack: Math.max(1, Math.min(72, parseInt((req.body || {}).hoursBack, 10) || 24)),
+    sources: Array.isArray((req.body || {}).sources) ? req.body.sources : null,
+    dryRun: req.query.dryRun === '1' || (req.body && req.body.dryRun === true),
+  }, currentUser(req)));
 });
 
 // 取込履歴
