@@ -222,6 +222,64 @@ export function ensureSchema() {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       ts TEXT, who TEXT, action TEXT, target TEXT, detail TEXT
     );
+
+    -- ─────────────────────── 追跡番号 / NE反映 (PR 1) ───────────────────────
+    -- pd_shipment_tracking: 1 受注 1 行 (NE 伝票番号 = ne_uketsuke_no が PK)。
+    --   packing-dispatch 確定時に自動 UPSERT、キャリア CSV 取込 or 手動入力で追跡番号を紐付け、
+    --   「これで反映する」ボタンで pending → ready 遷移 → ミニPC が cron で NE 反映 (PR 2/3)。
+    --   sync_status の遷移:
+    --     pending  : 配送方法のみ確定済 (追跡番号未割当 or レターパック未入力)
+    --     ready    : 反映可 (中原さんが「反映する」ボタンを押した状態)
+    --     syncing  : ミニPCが claim 中 (lease 切れたら ready に戻す)
+    --     synced   : NE 反映完了
+    --     error    : NE 反映失敗 (retryable、attempt_count++)
+    --     conflict : NE 側に異なる値が既存 (人間判断)
+    --     skipped  : 欠品等で反映対象外 (手動マーク)
+    --     manual_review : 5回失敗 or 不正データ等で人間判断待ち
+    CREATE TABLE IF NOT EXISTS pd_shipment_tracking (
+      ne_uketsuke_no TEXT PRIMARY KEY,
+      shipping_method_code TEXT NOT NULL REFERENCES pd_shipping_method(code),
+      shop_name TEXT,
+      order_no TEXT,                            -- モール注文番号 (表示用)
+      tracking_no TEXT,                         -- nullable (定形外/欠品はなし)
+      tracking_source TEXT,                     -- 'yamato_b2' | 'yamato_b2_50' | 'yupacketpuff' | 'manual_letterpack' | 'no_tracking'
+      sync_status TEXT NOT NULL DEFAULT 'pending',
+      sync_requested_at TEXT,                   -- ready ボタン押下時刻
+      claim_id TEXT,                            -- ミニPCの claim UUID
+      claim_token_hash TEXT,                    -- どの token で claim したか (rotation 時の追跡)
+      syncing_started_at TEXT,                  -- claim 取得時刻
+      claim_expires_at TEXT,                    -- lease 期限 (heartbeat で延長可)
+      claim_attempt_count INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,                          -- 直近の NE エラーメッセージ
+      last_error_code TEXT,                     -- 020006/003002 等の NE エラー区分
+      ne_last_modified_date TEXT,               -- NE search で取った楽観ロック値
+      ne_synced_at TEXT,                        -- NE 反映完了時刻
+      skip_reason TEXT,                         -- skipped 時の理由 (欠品等)
+      added_at TEXT NOT NULL,
+      added_by TEXT,
+      updated_at TEXT,
+      updated_by TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_pd_tracking_status ON pd_shipment_tracking(sync_status);
+    CREATE INDEX IF NOT EXISTS idx_pd_tracking_claim ON pd_shipment_tracking(claim_id) WHERE claim_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_pd_tracking_ready ON pd_shipment_tracking(sync_status, sync_requested_at) WHERE sync_status='ready';
+
+    -- pd_tracking_import: CSV 取込履歴 (idempotency)。同じファイルの再取込を検出。
+    -- (source, file_hash) で UNIQUE 制約。重複取込はアプリ側で先に検出するが、DB制約でも防御。
+    CREATE TABLE IF NOT EXISTS pd_tracking_import (
+      import_id TEXT PRIMARY KEY,
+      source TEXT NOT NULL,                     -- 'yamato_b2' | 'yamato_b2_50' | 'yupacketpuff' | 'manual_letterpack'
+      filename TEXT,
+      file_hash TEXT NOT NULL,                  -- SHA-256 (重複検出)
+      row_count INTEGER,
+      matched_count INTEGER,                    -- pd_shipment_tracking と紐付いた件数
+      unmatched_count INTEGER,                  -- 紐付かなかった件数 (CSV にあるが DB にない)
+      conflict_count INTEGER,                   -- 既存の tracking_no と異なる
+      imported_by TEXT,
+      imported_at TEXT,
+      detail_json TEXT,                         -- 紐付け失敗の詳細 (デバッグ用)
+      UNIQUE (source, file_hash)
+    );
   `);
 
   // コードテーブルの seed (INSERT OR IGNORE: 既存は壊さない)
