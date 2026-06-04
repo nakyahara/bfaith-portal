@@ -478,32 +478,68 @@ export function exportCsv(batch_id, user, opts = {}) {
 }
 
 // CSV 出力時に各伝票を pd_shipment_tracking に UPSERT。NE 受注番号 (col 20) で 1 行に集約。
+// 配送方法変更ログ機能 (中原さん 2026-06-04 指示) のため、以下も保存:
+//   method_at_export: CSV 出力時の shipping_method_code (変更検出基準値)
+//                     ※既に tracking_no が紐付け済の行は上書きしない (Codex R1 High 3)
+//   product_summary:  商品名要約 (例: "商品A 名称 ×1 ／ 商品B ×2 ／ ...他3件") - 500文字制限
+//   product_items_json: 商品配列 JSON (後で分析用)
+//   exported_at:      CSV 出力時刻
 function registerShipmentTrackingFromBatch(db, lineRows, user) {
   const now = utcIsoNow();
-  // 伝票単位に集約 (同一 shop+order_no の最初の line から代表値を取る)
+  // 伝票単位に集約。商品リストは line 単位で積み上げ。
   const byUketsuke = new Map();
   for (const l of lineRows) {
     if (!l.shipping_method_code || l.shipping_method_code === 'aes') continue;
     const raw = JSON.parse(l.raw_cols || '[]');
     const uke = norm(raw[COL.uketsuke]);
     if (!uke) continue;
-    if (byUketsuke.has(uke)) continue; // 最初の line だけ採用 (伝票内で代表値は同じ)
-    byUketsuke.set(uke, {
-      ne_uketsuke_no: uke,
-      shipping_method_code: l.shipping_method_code,
-      shop_name: l.shop_name,
-      order_no: l.order_no,
+    if (!byUketsuke.has(uke)) {
+      byUketsuke.set(uke, {
+        ne_uketsuke_no: uke,
+        shipping_method_code: l.shipping_method_code,
+        shop_name: l.shop_name,
+        order_no: l.order_no,
+        items: [],
+      });
+    }
+    byUketsuke.get(uke).items.push({
+      product_code: l.product_code || '',
+      product_name: norm(raw[COL.productName] || ''),
+      qty: l.qty || 0,
     });
   }
+  // 商品要約整形 (先頭 N 件 + "他K件" 形式、500 文字以内)。
+  // suffix 分を先に予約しておき、slice(0,500) で件数表示が消えるのを防ぐ (Codex R1 Low 1)。
+  const buildSummary = (items) => {
+    if (!items.length) return null;
+    const parts = items.map(i => `${i.product_code} ${i.product_name} ×${i.qty}`.trim());
+    const maxLen = 480; // 500 - "...他99件" (約20文字) のマージン
+    let summary = parts[0].slice(0, maxLen);
+    let i = 1;
+    while (i < parts.length) {
+      const candidate = summary + ' ／ ' + parts[i];
+      if (candidate.length > maxLen) break;
+      summary = candidate;
+      i++;
+    }
+    if (i < parts.length) summary += ` ／ ...他${parts.length - i}件`;
+    return summary;
+  };
   if (!byUketsuke.size) return 0;
   // synced 済みは触らない。それ以外 (pending/ready/error/conflict/skipped/syncing/manual_review)
   // は最新値で上書き + sync_status を pending にリセット + 追跡番号/エラー/claim 系を全クリア。
   // 出力をやり直したらキャリア CSV から再紐付け必要。古いデータが残って NE 反映に混入するのを防ぐ。
+  //
+  // method_at_export は「tracking_no がまだ NULL のときだけ更新」(Codex R1 High 3)。
+  // 既にキャリア CSV と紐付け済 (変更ログ作成済の可能性) の行は基準値を変えない。
+  // 新規追加 (INSERT) 時は無条件で method_at_export = shipping_method_code とする。
+  // product_summary / product_items_json / exported_at は最新出力時のスナップショットで更新。
   const upsert = db.prepare(`
     INSERT INTO pd_shipment_tracking
       (ne_uketsuke_no, shipping_method_code, shop_name, order_no,
-       sync_status, added_at, added_by, updated_at, updated_by)
-    VALUES (?,?,?,?, 'pending', ?, ?, ?, ?)
+       sync_status, method_at_export, product_summary, product_items_json, exported_at,
+       added_at, added_by, updated_at, updated_by)
+    VALUES (?,?,?,?, 'pending', ?,?,?,?, ?, ?, ?, ?)
     ON CONFLICT(ne_uketsuke_no) DO UPDATE SET
       shipping_method_code = excluded.shipping_method_code,
       shop_name = excluded.shop_name,
@@ -522,13 +558,23 @@ function registerShipmentTrackingFromBatch(db, lineRows, user) {
       ne_last_modified_date = NULL,
       ne_synced_at = NULL,
       skip_reason = NULL,
+      method_at_export = CASE
+        WHEN pd_shipment_tracking.tracking_no IS NULL THEN excluded.method_at_export
+        ELSE pd_shipment_tracking.method_at_export
+      END,
+      product_summary = excluded.product_summary,
+      product_items_json = excluded.product_items_json,
+      exported_at = excluded.exported_at,
       updated_at = excluded.updated_at,
       updated_by = excluded.updated_by
     WHERE pd_shipment_tracking.sync_status != 'synced'
   `);
   let n = 0;
   for (const t of byUketsuke.values()) {
+    const summary = buildSummary(t.items);
+    const itemsJson = JSON.stringify(t.items);
     upsert.run(t.ne_uketsuke_no, t.shipping_method_code, t.shop_name, t.order_no,
+      t.shipping_method_code, summary, itemsJson, now,
       now, user || null, now, user || null);
     n++;
   }
@@ -841,16 +887,17 @@ function parseCsvText(text) {
   return rows;
 }
 
-// ヤマト B2 出力 CSV: col 31 = 荷扱い1 (NE伝票番号 = ne_uketsuke_no), col 3 = 伝票番号 (追跡番号)
+// ヤマト B2 出力 CSV: col 1 = 送り状種類 ("0"=発払い / "A"=ネコポス、配送方法変更ログ用)
+//                     col 3 = 伝票番号 (追跡番号)
+//                     col 31 = 荷扱い1 (NE伝票番号 = ne_uketsuke_no)
 function parseYamatoB2Csv(buffer) {
   const text = detectAndDecodeCsv(buffer);
   const rows = parseCsvText(text);
   if (!rows.length) return { rows: [], errors: ['CSV が空です'] };
-  // ヤマト B2 はヘッダ行あり。1 行目をスキップしてデータ行のみ。
   const header = rows[0];
-  // 最低限のヘッダ検証 (列数 + col 0 が「お客様管理番号」)
   const errors = [];
   if (header.length < 32) errors.push(`列数が想定外 (期待 ≥32、実際 ${header.length})。ヤマト B2 のフォーマットが変わった可能性があります。`);
+  if (header[1] !== '送り状種類') errors.push(`col 1 が「送り状種類」ではありません (実際: ${header[1]})`);
   if (header[3] !== '伝票番号') errors.push(`col 3 が「伝票番号」ではありません (実際: ${header[3]})`);
   if (header[31] !== '荷扱い１' && header[31] !== '荷扱い1') errors.push(`col 31 が「荷扱い1」ではありません (実際: ${header[31]})`);
   const dataRows = rows.slice(1).filter(r => r.length > 3 && (r[3] || r[31]));
@@ -858,6 +905,7 @@ function parseYamatoB2Csv(buffer) {
     row_no: i + 2,
     ne_uketsuke_no: norm(r[31]),    // 荷扱い1
     tracking_no: norm(r[3]),         // 伝票番号
+    invoice_type_raw: norm(r[1]),    // 送り状種類 (配送方法変更判定用)
     raw: r,
   })).filter(x => x.ne_uketsuke_no && x.tracking_no);
   return { rows: items, errors, header };
@@ -899,8 +947,41 @@ const TRACKING_PARSERS = {
 // 動作: CSV パース → file_hash 重複チェック → ne_uketsuke_no で pd_shipment_tracking 検索 →
 //       マッチしたら tracking_no 紐付け (sync_status=pending のまま、ready 化は別アクション)。
 //       既存 tracking_no と異なれば conflict。マッチしなければ unmatched としてカウント。
+// source 別の actual_method 判定 (中原さん 2026-06-04 指示の配送方法変更ログ機能用)。
+// 戻り値: { method, raw } または { method: null, raw } (unknown)
+function judgeActualMethod(source, row) {
+  if (source === 'yamato_b2_50') return { method: 'takkyu50', raw: null };
+  if (source === 'yupacketpuff') return { method: 'yupacketpuff', raw: null };
+  if (source === 'yamato_b2') {
+    const raw = row.invoice_type_raw || '';
+    if (raw === '0') return { method: 'hatsubarai', raw };
+    if (raw === 'A') return { method: 'nekopos', raw };
+    return { method: null, raw }; // unknown
+  }
+  return { method: null, raw: null };
+}
+
 export function importTrackingCsv({ source, buffer, filename }, user) {
   if (!TRACKING_PARSERS[source]) throw vErr(`未知の source: ${source}`);
+  const db = ensureSchema();
+  // file_hash チェックは parser 前に実施 (Codex R1 Medium 1: 種別ミス検出を parse エラーより前に)
+  const file_hash = crypto.createHash('sha256').update(buffer).digest('hex');
+  const existing = db.prepare(`SELECT import_id FROM pd_tracking_import WHERE source=? AND file_hash=? LIMIT 1`)
+    .get(source, file_hash);
+  if (existing) {
+    return { import_id: existing.import_id, source, row_count: 0,
+      matched_count: 0, unmatched_count: 0, conflict_count: 0,
+      method_match_count: 0, method_change_count: 0, method_unknown_count: 0, method_skipped_count: 0,
+      duplicate: true, message: 'このファイルは既に取込済みです' };
+  }
+  // 同じファイルを別 source で取込済みなら警告 (中原さん指示: 種別ミス防止)
+  const crossSource = db.prepare(`SELECT source, imported_at FROM pd_tracking_import WHERE file_hash=? LIMIT 1`)
+    .get(file_hash);
+  if (crossSource) {
+    throw vErr(`このファイルは既に別の取込元 (${crossSource.source}) で取込済みです。種別を間違えていませんか?`,
+      { other_source: crossSource.source, other_imported_at: crossSource.imported_at });
+  }
+  // hash check 後に parse
   const parser = TRACKING_PARSERS[source];
   const parsed = parser(buffer);
   if (parsed.errors && parsed.errors.length) {
@@ -908,37 +989,43 @@ export function importTrackingCsv({ source, buffer, filename }, user) {
   }
   if (!parsed.rows.length) {
     return { import_id: null, source, row_count: 0, matched_count: 0, unmatched_count: 0, conflict_count: 0,
+      method_match_count: 0, method_change_count: 0, method_unknown_count: 0, method_skipped_count: 0,
       duplicate: false, message: 'データ行がありません' };
-  }
-  const db = ensureSchema();
-  // file_hash で重複チェック
-  const file_hash = crypto.createHash('sha256').update(buffer).digest('hex');
-  const existing = db.prepare(`SELECT import_id FROM pd_tracking_import WHERE source=? AND file_hash=? LIMIT 1`)
-    .get(source, file_hash);
-  if (existing) {
-    return { import_id: existing.import_id, source, row_count: parsed.rows.length,
-      matched_count: 0, unmatched_count: 0, conflict_count: 0,
-      duplicate: true, message: 'このファイルは既に取込済みです' };
   }
 
   const import_id = crypto.randomUUID();
   const now = utcIsoNow();
   let matched = 0, unmatched = 0, conflict = 0;
+  let methodMatch = 0, methodChange = 0, methodUnknown = 0, methodSkipped = 0;
   const unmatchedList = [];
   const conflictList = [];
 
-  const sel = db.prepare(`SELECT ne_uketsuke_no, tracking_no, tracking_source, sync_status
+  // pd_shipment_tracking の現状取得 (配送方法変更判定用に method_at_export も含める)
+  const sel = db.prepare(`SELECT ne_uketsuke_no, tracking_no, tracking_source, sync_status,
+    method_at_export, product_summary, shop_name, order_no
     FROM pd_shipment_tracking WHERE ne_uketsuke_no=?`);
   const upd = db.prepare(`UPDATE pd_shipment_tracking
     SET tracking_no=?, tracking_source=?, updated_at=?, updated_by=?
     WHERE ne_uketsuke_no=? AND sync_status != 'synced'`);
-  // conflict 時は sync_status='conflict' に遷移 (人間判断待ち、ready 化対象から外す)。
-  // last_error にも経緯を残す。
   const updConflict = db.prepare(`UPDATE pd_shipment_tracking
     SET sync_status='conflict', last_error=?, updated_at=?, updated_by=?
     WHERE ne_uketsuke_no=? AND sync_status != 'synced'`);
+  const insChangeLog = db.prepare(`INSERT INTO pd_method_change_log
+    (detected_at, source, import_id, shipment_tracking_ne, ne_uketsuke_no, tracking_no,
+     shop_name, order_no, product_summary, original_method, actual_method, actual_method_raw)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`);
 
   const tx = db.transaction(() => {
+    // 親レコード (pd_tracking_import) を先に INSERT。pd_method_change_log の FK 参照を満たすため。
+    // counts は後で UPDATE する (Codex R1 Critical 対応)。
+    db.prepare(`INSERT INTO pd_tracking_import
+      (import_id, source, filename, file_hash, row_count, matched_count, unmatched_count, conflict_count,
+       method_match_count, method_change_count, method_unknown_count, method_skipped_count,
+       imported_by, imported_at, detail_json)
+      VALUES (?,?,?,?,?, 0,0,0, 0,0,0,0, ?,?,?)`).run(
+      import_id, source, filename || null, file_hash, parsed.rows.length,
+      user || null, now, null);
+
     for (const r of parsed.rows) {
       const cur = sel.get(r.ne_uketsuke_no);
       if (!cur) {
@@ -946,38 +1033,66 @@ export function importTrackingCsv({ source, buffer, filename }, user) {
         if (unmatchedList.length < 50) unmatchedList.push({ ne_uketsuke_no: r.ne_uketsuke_no, tracking_no: r.tracking_no, row_no: r.row_no });
         continue;
       }
-      // synced 済みは無条件にスキップ (既に NE 反映完了済、再上書きしない)
-      if (cur.sync_status === 'synced') {
+      // 紐付け更新の可否 (synced は対象外、conflict は別状態に遷移、それ以外は upd)。
+      // 配送方法変更判定は紐付けと独立 (Codex R1 High 2 対応): synced であっても KPI 判定する。
+      const isSynced = cur.sync_status === 'synced';
+      const isConflict = !!cur.tracking_no && cur.tracking_no !== r.tracking_no;
+      if (isSynced) {
         unmatched++;
         if (unmatchedList.length < 50) unmatchedList.push({ ne_uketsuke_no: r.ne_uketsuke_no, tracking_no: r.tracking_no, row_no: r.row_no, note: 'synced' });
-        continue;
-      }
-      // 既存 tracking_no と新しい tracking_no を比較 (正規化済)
-      if (cur.tracking_no && cur.tracking_no !== r.tracking_no) {
+      } else if (isConflict) {
         conflict++;
         if (conflictList.length < 50) conflictList.push({
           ne_uketsuke_no: r.ne_uketsuke_no, current: cur.tracking_no, incoming: r.tracking_no });
-        // 状態を conflict に遷移して ready 化対象から外す
         updConflict.run(`既存=${cur.tracking_no} / 新=${r.tracking_no} (source=${source})`,
           now, user || null, r.ne_uketsuke_no);
+      } else {
+        upd.run(r.tracking_no, source, now, user || null, r.ne_uketsuke_no);
+        matched++;
+      }
+
+      // ── 配送方法変更判定 (matched/synced 関係なく、conflict 以外で method_at_export あり) ──
+      // conflict は別の運用問題、変更ログ KPI 対象外
+      if (isConflict) continue;
+      if (!cur.method_at_export) {
+        methodSkipped++;
         continue;
       }
-      upd.run(r.tracking_no, source, now, user || null, r.ne_uketsuke_no);
-      matched++;
+      const judged = judgeActualMethod(source, r);
+      if (!judged.method) {
+        methodUnknown++;
+        continue;
+      }
+      if (judged.method === cur.method_at_export) {
+        methodMatch++;
+      } else {
+        methodChange++;
+        insChangeLog.run(now, source, import_id, cur.ne_uketsuke_no, cur.ne_uketsuke_no,
+          r.tracking_no, cur.shop_name, cur.order_no, cur.product_summary,
+          cur.method_at_export, judged.method, judged.raw);
+      }
     }
-    db.prepare(`INSERT INTO pd_tracking_import
-      (import_id, source, filename, file_hash, row_count, matched_count, unmatched_count, conflict_count,
-       imported_by, imported_at, detail_json)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(
-      import_id, source, filename || null, file_hash, parsed.rows.length,
-      matched, unmatched, conflict, user || null, now,
-      JSON.stringify({ unmatched: unmatchedList, conflict: conflictList }));
+    // counts を更新
+    db.prepare(`UPDATE pd_tracking_import
+      SET matched_count=?, unmatched_count=?, conflict_count=?,
+          method_match_count=?, method_change_count=?, method_unknown_count=?, method_skipped_count=?,
+          detail_json=?
+      WHERE import_id=?`).run(
+      matched, unmatched, conflict,
+      methodMatch, methodChange, methodUnknown, methodSkipped,
+      JSON.stringify({ unmatched: unmatchedList, conflict: conflictList }),
+      import_id);
   });
   tx();
+  // 軽い maintenance: 90日超ログ purge (1日1回まで、Codex R2 Medium 1)
+  purgeOldMethodChangeLogOncePerDay();
   audit('tracking_import', import_id, { source, filename, file_hash, row_count: parsed.rows.length,
-    matched, unmatched, conflict }, user);
+    matched, unmatched, conflict,
+    method_match: methodMatch, method_change: methodChange, method_unknown: methodUnknown, method_skipped: methodSkipped }, user);
   return { import_id, source, row_count: parsed.rows.length,
     matched_count: matched, unmatched_count: unmatched, conflict_count: conflict,
+    method_match_count: methodMatch, method_change_count: methodChange,
+    method_unknown_count: methodUnknown, method_skipped_count: methodSkipped,
     duplicate: false, unmatched_samples: unmatchedList.slice(0, 10), conflict_samples: conflictList.slice(0, 10) };
 }
 
@@ -1119,6 +1234,89 @@ export function getTrackingImportDetail(import_id) {
   const row = db.prepare(`SELECT * FROM pd_tracking_import WHERE import_id=?`).get(import_id);
   if (!row) return null;
   return { ...row, detail: row.detail_json ? JSON.parse(row.detail_json) : null };
+}
+
+// ─── 配送方法変更ログ集計 (中原さん 2026-06-04 指示) ───
+
+// 数値パラメータの正規化ヘルパ (Codex R2 Medium 2: NaN/undefined 防御)
+function clampInt(v, min, max, def) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return def;
+  return Math.max(min, Math.min(Math.floor(n), max));
+}
+
+// 日付別 / source 別の集計を返す。期間 days (デフォルト 30)。
+// 詳細ログ (pd_method_change_log) は 90日 TTL だが、件数集計 (pd_tracking_import) は永続。
+export function getMethodChangeSummary({ days = 30 } = {}) {
+  const db = ensureSchema();
+  const limit = clampInt(days, 1, 365, 30);
+  // 日別集計は JST (+9h) で。UTC 18:00-23:59 (JST 翌日 03:00-08:59) の取込が前日扱いになる事故防止 (Codex R1 Medium 3)
+  const rows = db.prepare(`SELECT
+      date(imported_at, '+9 hours') AS day, source,
+      COUNT(*) AS import_count,
+      SUM(method_match_count) AS method_match,
+      SUM(method_change_count) AS method_change,
+      SUM(method_unknown_count) AS method_unknown,
+      SUM(method_skipped_count) AS method_skipped
+    FROM pd_tracking_import
+    WHERE imported_at >= datetime('now', '-' || ? || ' days')
+      AND source IN ('yamato_b2', 'yamato_b2_50', 'yupacketpuff')
+    GROUP BY date(imported_at, '+9 hours'), source
+    ORDER BY day DESC, source`).all(limit);
+  // 全期間集計
+  const total = db.prepare(`SELECT
+      SUM(method_match_count) AS method_match,
+      SUM(method_change_count) AS method_change,
+      SUM(method_unknown_count) AS method_unknown,
+      SUM(method_skipped_count) AS method_skipped
+    FROM pd_tracking_import
+    WHERE imported_at >= datetime('now', '-' || ? || ' days')
+      AND source IN ('yamato_b2', 'yamato_b2_50', 'yupacketpuff')`).get(limit);
+  const denom = (total.method_match || 0) + (total.method_change || 0);
+  const change_rate = denom > 0 ? Math.round((total.method_change || 0) / denom * 1000) / 10 : 0;
+  return { days: limit, rows, total: { ...total, change_rate } };
+}
+
+// 配送方法変更の詳細ログ (90日以内、フィルタ可)。
+export function listMethodChangeLog({ days = 30, source = '', limit = 500 } = {}) {
+  const db = ensureSchema();
+  const d = clampInt(days, 1, 90, 30);
+  const lim = clampInt(limit, 1, 2000, 500);
+  const params = [d];
+  let where = `detected_at >= datetime('now', '-' || ? || ' days')`;
+  if (source) { where += ` AND source = ?`; params.push(source); }
+  const sql = `SELECT * FROM pd_method_change_log
+    WHERE ${where}
+    ORDER BY detected_at DESC
+    LIMIT ?`;
+  params.push(lim);
+  return db.prepare(sql).all(...params);
+}
+
+// 90日超えた詳細ログを purge (件数集計は pd_tracking_import で永続)。
+// daily-sync 等で呼び出すことを想定。
+export function purgeOldMethodChangeLog() {
+  const db = ensureSchema();
+  const n = db.prepare(`DELETE FROM pd_method_change_log
+    WHERE detected_at < datetime('now', '-90 days')`).run().changes;
+  if (n > 0) audit('purge_method_change_log', null, { deleted: n }, 'system');
+  return { deleted: n };
+}
+
+// 1日1回までに制限した purge (Codex R2 Medium 1: 確率制ではなく決定的に)。
+// 最後の purge audit log を見て 24h 以内なら no-op。
+function purgeOldMethodChangeLogOncePerDay() {
+  try {
+    const db = ensureSchema();
+    const last = db.prepare(`SELECT ts FROM pd_audit_log
+      WHERE action='purge_method_change_log'
+      ORDER BY id DESC LIMIT 1`).get();
+    if (last && last.ts) {
+      const lastTime = new Date(last.ts).getTime();
+      if (Date.now() - lastTime < 24 * 3600 * 1000) return; // 24h 以内なら skip
+    }
+    purgeOldMethodChangeLog();
+  } catch {}
 }
 
 // 「本日 (JST) アップロードされた取込バッチ」の伝票を配送方法別に抽出 (定形外/レターパック表示用)。
