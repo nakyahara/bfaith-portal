@@ -794,9 +794,10 @@
     <div class="muted" style="margin-top:8px">未マッチ = pd_shipment_tracking に該当 NE 受注番号がない / 競合 = 既存追跡番号と異なる値。注文内容は pd_shipment_tracking → 過去 48h の pd_import_line の順で検索。</div>
     <div id="trkImpDetailUnmatchedWrap" style="margin-top:12px">
       <strong style="color:#c0392b">❌ 未マッチ</strong>
+      <div class="muted" style="margin-top:2px">NextEngine で受注番号を確認のうえ、反映して問題なければ「✅ 反映に含める」を押してください。NE に該当受注が無ければ後の cron で error 状態になります。</div>
       <div class="scroll" style="max-height:35vh; margin-top:4px">
         <table>
-          <thead><tr><th>NE受注番号</th><th>追跡番号</th><th>店舗</th><th>注文番号</th><th>商品 (コード+名称+数量)</th><th>備考</th></tr></thead>
+          <thead><tr><th>NE受注番号</th><th>追跡番号</th><th>店舗</th><th>注文番号</th><th>商品 (コード+名称+数量)</th><th>備考</th><th>操作</th></tr></thead>
           <tbody id="trkImpDetailUnmatchedBody"></tbody>
         </table>
       </div>
@@ -1886,20 +1887,55 @@ function openTrkImportDetailDialog(d){
   // 件数ラベル
   document.querySelector('#trkImpDetailUnmatchedWrap strong').innerHTML = `❌ 未マッチ (${umTotal} 件)${truncNote(umTotal)}`;
   document.querySelector('#trkImpDetailConflictWrap strong').innerHTML = `⚠️ 競合 (${cfTotal} 件)${truncNote(cfTotal)}`;
-  // 未マッチ行
+  // 未マッチ行 (note='synced' のタイプ② は反映ボタン非表示)
   $('#trkImpDetailUnmatchedBody').innerHTML = um.length
-    ? um.map(x => {
+    ? um.map((x, idx) => {
         const e = x.enrich || {};
-        return `<tr>
+        const isSynced = x.note === 'synced';
+        const btn = isSynced
+          ? '<span class="muted">既反映 (synced)</span>'
+          : `<button class="sub" data-trk-include="${idx}" data-uke="${esc(x.ne_uketsuke_no || '')}" data-trk="${esc(x.tracking_no || '')}" data-src="${esc(d.source || '')}">✅ 反映に含める</button>`;
+        return `<tr id="trkUnmatchRow_${idx}">
           <td><code>${esc(x.ne_uketsuke_no || '')}</code></td>
           <td>${esc(x.tracking_no || '')}</td>
           <td>${esc(e.shop_name || '')}</td>
           <td>${esc(e.order_no || '')}</td>
           <td>${esc(e.product_summary || '')}</td>
-          <td>${esc(x.note || (e ? '' : 'enrich なし (TTL 切れ?)'))}</td>
+          <td>${esc(x.note || (e && Object.keys(e).length ? '' : 'enrich なし (TTL 切れ or 別ルート)'))}</td>
+          <td>${btn}</td>
         </tr>`;
       }).join('')
-    : '<tr><td colspan="6" class="muted">未マッチなし</td></tr>';
+    : '<tr><td colspan="7" class="muted">未マッチなし</td></tr>';
+  // 反映ボタンのハンドラ
+  $('#trkImpDetailUnmatchedBody').querySelectorAll('button[data-trk-include]').forEach(btn => {
+    btn.onclick = async () => {
+      const idx = btn.dataset.trkInclude;
+      const uke = btn.dataset.uke;
+      const trk = btn.dataset.trk;
+      const src = btn.dataset.src;
+      const x = um[idx] || {};
+      const enrich = x.enrich || null;
+      btn.disabled = true;
+      btn.textContent = '反映中…';
+      try{
+        const r = await api('api/tracking/unmatched/include', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ ne_uketsuke_no: uke, tracking_no: trk, source: src, enrich })
+        });
+        const row = document.getElementById(`trkUnmatchRow_${idx}`);
+        if(row){
+          const ok = r.action === 'inserted' || r.action === 'updated';
+          row.style.background = ok ? '#e8f5e9' : '#fff8e1';
+          row.querySelector('td:last-child').innerHTML = `<span style="color:${ok?'#2e7d32':'#e67e22'}">${esc(r.note || '完了')}</span>`;
+        }
+        await loadTrackingAll();
+      }catch(e){
+        btn.disabled = false;
+        btn.textContent = '✅ 反映に含める';
+        alert('エラー: '+e.message);
+      }
+    };
+  });
   $('#trkImpDetailUnmatchedWrap').style.display = um.length ? 'block' : 'none';
   // 競合行
   $('#trkImpDetailConflictBody').innerHTML = cf.length

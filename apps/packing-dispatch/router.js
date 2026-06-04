@@ -22,6 +22,7 @@ import {
   listTodayImportLinesByMethod,
   getMethodChangeSummary, listMethodChangeLog, purgeOldMethodChangeLog,
   backfillShipmentTrackingFromExportedBatches, deleteRecentTrackingImports,
+  includeUnmatchedToTracking,
 } from './service.js';
 import { loadSeed } from './tools/load-shipping-rule-seed.mjs';
 
@@ -238,6 +239,12 @@ router.post('/api/admin/tracking/imports/delete-recent', (req, res) => {
     dryRun: req.query.dryRun === '1' || (req.body && req.body.dryRun === true),
   }, currentUser(req)));
 });
+
+// 未マッチ行を「反映に含める」(スタッフが NextEngine で実在確認した上で押下、2026-06-04)
+// body: { ne_uketsuke_no, tracking_no, source, enrich? }
+// admin 限定にはしない (スタッフ運用、ただし audit log は残す)
+router.post('/api/tracking/unmatched/include', (req, res) =>
+  handle(res, () => includeUnmatchedToTracking(req.body || {}, currentUser(req))));
 
 // 取込履歴
 router.get('/api/tracking/imports', (req, res) => handle(res, () => listTrackingImports()));
