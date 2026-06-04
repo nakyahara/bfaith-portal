@@ -1492,6 +1492,67 @@ export function setTrackingManual({ entries, source }, user) {
     not_found_samples: notFoundList.slice(0, 10), conflict_samples: conflictList.slice(0, 10) };
 }
 
+// ─── NE 手動反映用エクスポート (2026-06-04 中原さん指示) ───
+//
+// 運用: NE 反映 cron が未実装のため、当面は手動運用:
+//   Step 1: 配送方法ごとに ready 状態の NE 受注番号をコピー → NE で一括検索 → 配送方法を変更
+//   Step 2: NE 受注番号 + 追跡番号の 2 列 CSV をダウンロード → NE の追跡番号 CSV インポートに流す
+// 対象は sync_status='ready' (= 「これで NE 反映する」ボタンを押し終わった伝票)
+
+// 配送方法ごとの ready 件数 (UI のセレクトボックス表示用)。
+export function getReadyExportSummary() {
+  const db = ensureSchema();
+  const rows = db.prepare(`SELECT shipping_method_code,
+      COUNT(*) AS total,
+      SUM(CASE WHEN tracking_no IS NOT NULL THEN 1 ELSE 0 END) AS with_tracking,
+      SUM(CASE WHEN tracking_no IS NULL THEN 1 ELSE 0 END) AS without_tracking
+    FROM pd_shipment_tracking
+    WHERE sync_status='ready'
+    GROUP BY shipping_method_code
+    ORDER BY shipping_method_code`).all();
+  const total = rows.reduce((s, r) => s + r.total, 0);
+  const totalWithTracking = rows.reduce((s, r) => s + r.with_tracking, 0);
+  return { rows, total, total_with_tracking: totalWithTracking };
+}
+
+// 配送方法を指定して ready の NE 受注番号一覧を返す (コピー用)。
+// method='all' or 空 で全配送方法。
+export function getReadyNeUketsukeNos({ method } = {}) {
+  const db = ensureSchema();
+  const where = (method && method !== 'all')
+    ? ` AND shipping_method_code=?` : '';
+  const params = (method && method !== 'all') ? [method] : [];
+  const rows = db.prepare(`SELECT DISTINCT ne_uketsuke_no
+    FROM pd_shipment_tracking
+    WHERE sync_status='ready'${where}
+    ORDER BY ne_uketsuke_no`).all(...params);
+  return rows.map(r => r.ne_uketsuke_no);
+}
+
+// NE 受注番号 + 追跡番号の 2 列 CSV を生成 (UTF-8 BOM 付き、Shift-JIS のため Excel/NE 互換)。
+// tracking_no が NULL のもの (定形外/未紐付け) は除外。
+// 配送方法フィルタは getReadyNeUketsukeNos と同じ仕様。
+export function getReadyTrackingCsv({ method } = {}) {
+  const db = ensureSchema();
+  const where = (method && method !== 'all')
+    ? ` AND shipping_method_code=?` : '';
+  const params = (method && method !== 'all') ? [method] : [];
+  const rows = db.prepare(`SELECT ne_uketsuke_no, tracking_no, shipping_method_code
+    FROM pd_shipment_tracking
+    WHERE sync_status='ready' AND tracking_no IS NOT NULL${where}
+    ORDER BY shipping_method_code, ne_uketsuke_no`).all(...params);
+  // CSV escape: ダブルクォート囲み + 内部の " は ""
+  const esc = (v) => {
+    const s = String(v == null ? '' : v);
+    return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const header = '受注番号,追跡番号';
+  const lines = rows.map(r => `${esc(r.ne_uketsuke_no)},${esc(r.tracking_no)}`);
+  // UTF-8 BOM + CRLF (Excel/Windows 互換)
+  const bom = '﻿';
+  return { csv: bom + [header, ...lines].join('\r\n') + '\r\n', count: rows.length };
+}
+
 // ─── 状態遷移 ───
 
 // pending → ready 遷移 (「これで反映する」ボタン)。
