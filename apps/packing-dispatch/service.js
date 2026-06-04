@@ -462,6 +462,7 @@ export function exportCsv(batch_id, user, opts = {}) {
 
   // CAS で exported へ (二重出力防止) + tracking UPSERT を 1 transaction に。
   // どちらか失敗したら状態は変えず、ユーザーが再試行できる状態にする。
+  let trackingStats = { registered: 0, syncedSkipped: 0, candidates: 0 };
   const tx = db.transaction(() => {
     const cas = db.prepare(`UPDATE pd_import_batch SET status='exported' WHERE batch_id=? AND status IN ('classifying','locked_for_export')`)
       .run(batch_id);
@@ -469,12 +470,157 @@ export function exportCsv(batch_id, user, opts = {}) {
     // pd_shipment_tracking に登録 (CSV 出力した伝票だけが NE 反映対象)。
     // 同一 ne_uketsuke_no (col 20) を伝票単位で 1 行に集約。AES は対象外 (NE 側で別管理)。
     // synced 済み (=既に NE 反映完了) は触らない、それ以外は pending リセット + 追跡番号クリア。
-    registerShipmentTrackingFromBatch(db, lineRows, user);
+    trackingStats = registerShipmentTrackingFromBatch(db, lineRows, user);
   });
   tx();
 
-  audit('export', batch_id, { rows: outRows.length }, user);
-  return { buffer: buf, rowCount: outRows.length };
+  // 登録件数を audit log に残す (Codex R0 High 2: 登録件数が低くても検知できるように)
+  audit('export', batch_id, { rows: outRows.length, tracking: trackingStats }, user);
+  return { buffer: buf, rowCount: outRows.length, tracking: trackingStats };
+}
+
+// 過去の exported バッチを走査して pd_shipment_tracking に backfill する admin 機能。
+// 2026-06-04 hotfix: PR #231 (tracking テーブル新設) より前に exportCsv された伝票は
+// pd_shipment_tracking に登録されていないため、48h 以内に残っている pd_import_line から
+// 補填する。
+//
+// ⚠️ backfill は「未登録を補う」だけ (Codex R1 High)。既存行 (今日紐付け済 / ready / skipped / error 等)
+// は INSERT OR IGNORE で完全保護する。再出力時の破壊的 UPSERT は exportCsv 専用 (別経路)。
+export function backfillShipmentTrackingFromExportedBatches({ dryRun = false } = {}, user) {
+  const db = ensureSchema();
+  // exported / locked_for_export 状態のバッチを全部対象 (まだ TTL 内のもの)
+  const batches = db.prepare(`SELECT batch_id, status, uploaded_at, row_count
+    FROM pd_import_batch
+    WHERE status IN ('exported', 'locked_for_export')
+      AND (expires_at IS NULL OR expires_at >= ?)
+    ORDER BY uploaded_at`).all(utcIsoNow());
+  // INSERT-only (既存行は ne_uketsuke_no UNIQUE で弾く、ON CONFLICT DO NOTHING)。
+  // product_summary も exportCsv と同じロジックで作る (中身の仕様統一)。
+  const buildSummaryLocal = (items) => {
+    if (!items.length) return null;
+    const parts = items.map(i => `${i.product_code} ${i.product_name} ×${i.qty}`.trim());
+    const maxLen = 480;
+    let summary = parts[0].slice(0, maxLen);
+    let i = 1;
+    while (i < parts.length) {
+      const candidate = summary + ' ／ ' + parts[i];
+      if (candidate.length > maxLen) break;
+      summary = candidate; i++;
+    }
+    if (i < parts.length) summary += ` ／ ...他${parts.length - i}件`;
+    return summary;
+  };
+  const insertOnly = db.prepare(`
+    INSERT INTO pd_shipment_tracking
+      (ne_uketsuke_no, shipping_method_code, shop_name, order_no,
+       sync_status, method_at_export, product_summary, product_items_json, exported_at,
+       added_at, added_by, updated_at, updated_by)
+    VALUES (?,?,?,?, 'pending', ?,?,?,?, ?, ?, ?, ?)
+    ON CONFLICT(ne_uketsuke_no) DO NOTHING
+  `);
+  const now = utcIsoNow();
+  let totalInserted = 0;
+  let totalAlreadyExists = 0;
+  let totalCandidates = 0;
+  const perBatch = [];
+  for (const b of batches) {
+    const lineRows = db.prepare(`SELECT * FROM pd_import_line WHERE batch_id=? ORDER BY row_no`).all(b.batch_id);
+    if (!lineRows.length) {
+      perBatch.push({ batch_id: b.batch_id, uploaded_at: b.uploaded_at, candidates: 0, inserted: 0, already_exists: 0, note: 'no lines (TTL?)' });
+      continue;
+    }
+    // 伝票単位に集約
+    const byUke = new Map();
+    for (const l of lineRows) {
+      if (!l.shipping_method_code || l.shipping_method_code === 'aes') continue;
+      const raw = JSON.parse(l.raw_cols || '[]');
+      const uke = norm(raw[COL.uketsuke]);
+      if (!uke) continue;
+      if (!byUke.has(uke)) byUke.set(uke, {
+        ne_uketsuke_no: uke, shipping_method_code: l.shipping_method_code,
+        shop_name: l.shop_name, order_no: l.order_no, items: [],
+      });
+      byUke.get(uke).items.push({
+        product_code: l.product_code || '',
+        product_name: norm(raw[COL.productName] || ''),
+        qty: l.qty || 0,
+      });
+    }
+    const candidateCount = byUke.size;
+    totalCandidates += candidateCount;
+    if (dryRun) {
+      // dry-run は事前 SELECT で「未登録だけ」をカウント (確度の高い予測)
+      let willInsert = 0;
+      const exists = db.prepare(`SELECT 1 FROM pd_shipment_tracking WHERE ne_uketsuke_no=? LIMIT 1`);
+      for (const uke of byUke.keys()) { if (!exists.get(uke)) willInsert++; }
+      perBatch.push({ batch_id: b.batch_id, uploaded_at: b.uploaded_at,
+        candidates: candidateCount, inserted: willInsert, already_exists: candidateCount - willInsert, dry_run: true });
+      totalInserted += willInsert;
+      totalAlreadyExists += (candidateCount - willInsert);
+      continue;
+    }
+    // 実 INSERT-only を transaction で
+    const tx = db.transaction(() => {
+      let ins = 0, dup = 0;
+      for (const t of byUke.values()) {
+        const summary = buildSummaryLocal(t.items);
+        const itemsJson = JSON.stringify(t.items);
+        const info = insertOnly.run(t.ne_uketsuke_no, t.shipping_method_code, t.shop_name, t.order_no,
+          t.shipping_method_code, summary, itemsJson, now,
+          now, user || 'backfill', now, user || 'backfill');
+        if (info.changes > 0) ins++; else dup++;
+      }
+      return { ins, dup };
+    });
+    const { ins, dup } = tx();
+    perBatch.push({ batch_id: b.batch_id, uploaded_at: b.uploaded_at,
+      candidates: candidateCount, inserted: ins, already_exists: dup });
+    totalInserted += ins;
+    totalAlreadyExists += dup;
+  }
+  audit(dryRun ? 'tracking_backfill_dry_run' : 'tracking_backfill', null,
+    { batch_count: batches.length, total_candidates: totalCandidates,
+      total_inserted: totalInserted, total_already_exists: totalAlreadyExists }, user);
+  return { dry_run: dryRun, batch_count: batches.length,
+    total_candidates: totalCandidates, total_inserted: totalInserted, total_already_exists: totalAlreadyExists,
+    per_batch: perBatch };
+}
+
+// duplicate file_hash で再投入できない取込履歴を削除する admin 機能 (Codex R1 Critical)。
+// 2026-06-04 backfill 後に同じ B2 CSV を再アップロードして紐付けし直すための窓開け。
+// 期間 / source を絞って削除。関連 pd_method_change_log は FK で先に消す。
+export function deleteRecentTrackingImports({ hoursBack = 24, sources = null, dryRun = false } = {}, user) {
+  const db = ensureSchema();
+  const allowedSources = ['yamato_b2', 'yamato_b2_50', 'yupacketpuff'];
+  const targetSources = Array.isArray(sources) && sources.length
+    ? sources.filter(s => allowedSources.includes(s))
+    : allowedSources;
+  if (!targetSources.length) throw vErr('source が未指定です');
+  const cutoff = new Date(Date.now() - hoursBack * 3600 * 1000).toISOString();
+  const placeholders = targetSources.map(() => '?').join(',');
+  const params = [cutoff, ...targetSources];
+  const targets = db.prepare(`SELECT import_id, source, filename, imported_at, row_count
+    FROM pd_tracking_import
+    WHERE imported_at >= ? AND source IN (${placeholders})
+    ORDER BY imported_at DESC`).all(...params);
+  if (dryRun) {
+    audit('tracking_import_delete_dry_run', null, { hours_back: hoursBack, sources: targetSources, count: targets.length }, user);
+    return { dry_run: true, hours_back: hoursBack, sources: targetSources, targets };
+  }
+  const tx = db.transaction(() => {
+    let logsDeleted = 0;
+    for (const t of targets) {
+      const r1 = db.prepare(`DELETE FROM pd_method_change_log WHERE import_id=?`).run(t.import_id);
+      logsDeleted += r1.changes;
+      db.prepare(`DELETE FROM pd_tracking_import WHERE import_id=?`).run(t.import_id);
+    }
+    return logsDeleted;
+  });
+  const logsDeleted = tx();
+  audit('tracking_import_delete', null,
+    { hours_back: hoursBack, sources: targetSources, imports_deleted: targets.length, logs_deleted: logsDeleted }, user);
+  return { dry_run: false, hours_back: hoursBack, sources: targetSources,
+    imports_deleted: targets.length, logs_deleted: logsDeleted, targets };
 }
 
 // CSV 出力時に各伝票を pd_shipment_tracking に UPSERT。NE 受注番号 (col 20) で 1 行に集約。
@@ -569,16 +715,19 @@ function registerShipmentTrackingFromBatch(db, lineRows, user) {
       updated_by = excluded.updated_by
     WHERE pd_shipment_tracking.sync_status != 'synced'
   `);
-  let n = 0;
+  // changes は INSERT 成功 or UPDATE 成功で 1、synced no-op で 0 を返す。
+  // 「CSV は出たが登録 0/少数」を audit から検知できるよう実 UPSERT 件数を返す (Codex R0 High 2)。
+  let registered = 0;
+  let syncedSkipped = 0;
   for (const t of byUketsuke.values()) {
     const summary = buildSummary(t.items);
     const itemsJson = JSON.stringify(t.items);
-    upsert.run(t.ne_uketsuke_no, t.shipping_method_code, t.shop_name, t.order_no,
+    const info = upsert.run(t.ne_uketsuke_no, t.shipping_method_code, t.shop_name, t.order_no,
       t.shipping_method_code, summary, itemsJson, now,
       now, user || null, now, user || null);
-    n++;
+    if (info.changes > 0) registered++; else syncedSkipped++;
   }
-  return n;
+  return { registered, syncedSkipped, candidates: byUketsuke.size };
 }
 
 function audit(action, target, detail, who) {
