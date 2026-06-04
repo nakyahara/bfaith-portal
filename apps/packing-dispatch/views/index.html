@@ -422,6 +422,30 @@
       </div>
     </div>
 
+    <!-- 📊 配送方法変更ログ (中原さん 2026-06-04 指示) -->
+    <div class="card">
+      <div class="row">
+        <strong>📊 配送方法変更ログ</strong>
+        <label class="muted">期間 <select id="trkMcDays">
+          <option value="7">過去 7 日</option>
+          <option value="30" selected>過去 30 日</option>
+          <option value="90">過去 90 日</option>
+        </select></label>
+        <span id="trkMcStatus" class="muted"></span>
+        <span style="flex:1"></span>
+        <button class="sub" id="btnTrkMcReload">再読込</button>
+        <button class="sub" id="btnTrkMcDetail">詳細を見る</button>
+      </div>
+      <div class="muted">アプリで決めた配送方法と、キャリアCSVから判定した実際の配送方法を比較。変更件数を KPI として可視化 (理想は 0)。詳細ログは 90 日 TTL、件数集計は永続。</div>
+      <div id="trkMcTotal" class="summary" style="margin-top:8px"></div>
+      <div class="scroll" style="max-height:30vh; margin-top:8px">
+        <table>
+          <thead><tr><th>日付</th><th>取込元</th><th>一致</th><th>変更</th><th>判定不能</th><th>判定不可</th><th>変更率</th></tr></thead>
+          <tbody id="trkMcBody"></tbody>
+        </table>
+      </div>
+    </div>
+
     <!-- 取込履歴 -->
     <div class="card">
       <div class="row">
@@ -694,6 +718,39 @@
   </div>
   <div class="df">
     <button class="sub" id="btnMeltClose">閉じる</button>
+  </div>
+</dialog>
+
+<!-- 📊 配送方法変更ログ 詳細ダイアログ -->
+<dialog id="trkMcDetailDlg" style="width:min(900px,95vw)">
+  <div class="dh">📊 配送方法変更ログ 詳細</div>
+  <div class="db">
+    <div class="row">
+      <label class="muted">取込元 <select id="trkMcDetailSource">
+        <option value="">すべて</option>
+        <option value="yamato_b2">ヤマトB2(通常)</option>
+        <option value="yamato_b2_50">ヤマトB2(50サイズ)</option>
+        <option value="yupacketpuff">ゆうパケットパフ</option>
+      </select></label>
+      <label class="muted">期間
+        <select id="trkMcDetailDays">
+          <option value="7">過去 7 日</option>
+          <option value="30" selected>過去 30 日</option>
+          <option value="90">過去 90 日</option>
+        </select></label>
+      <button class="sub" id="btnTrkMcDetailReload">再読込</button>
+      <span id="trkMcDetailStatus" class="muted"></span>
+    </div>
+    <div class="muted">アプリで決めた配送方法 → 現場で実際に使った配送方法。同じ受注で複数個口の場合は別行で記録。</div>
+    <div class="scroll" style="max-height:60vh; margin-top:8px">
+      <table>
+        <thead><tr><th>日時</th><th>取込元</th><th>NE受注番号</th><th>店舗</th><th>注文番号</th><th>商品</th><th>元の配送方法</th><th>実際の配送方法</th></tr></thead>
+        <tbody id="trkMcDetailBody"></tbody>
+      </table>
+    </div>
+  </div>
+  <div class="df">
+    <button class="sub" id="btnTrkMcDetailClose">閉じる</button>
   </div>
 </dialog>
 
@@ -1417,9 +1474,86 @@ async function loadTrackingAll(){
       loadTrkLetterpack(),
       loadTrkTeikeigai(),
       loadTrkMissing(),
+      loadTrkMethodChange(),
     ]);
   }catch(e){ console.error('[tracking]', e.message); }
 }
+
+// ─── 配送方法変更ログ (中原さん 2026-06-04 指示) ───
+const TRK_MC_SOURCE_LABEL = {
+  yamato_b2: 'ヤマトB2(通常)',
+  yamato_b2_50: 'ヤマトB2(50サイズ)',
+  yupacketpuff: 'ゆうパケパフ',
+};
+async function loadTrkMethodChange(){
+  const days = $('#trkMcDays').value || 30;
+  $('#trkMcStatus').textContent = '読込中…';
+  try{
+    const r = await api(`api/tracking/method-change/summary?days=${encodeURIComponent(days)}`);
+    // 全期間集計
+    const t = r.total || {};
+    const denom = (t.method_match||0) + (t.method_change||0);
+    $('#trkMcTotal').innerHTML =
+      `<div><div class="num">${t.method_match||0}</div><div class="muted">一致</div></div>`+
+      `<div><div class="num" style="color:#c0392b">${t.method_change||0}</div><div class="muted">変更</div></div>`+
+      `<div><div class="num" style="color:#e67e22">${t.method_unknown||0}</div><div class="muted">判定不能</div></div>`+
+      `<div><div class="num" style="color:#777">${t.method_skipped||0}</div><div class="muted">判定不可</div></div>`+
+      `<div><div class="num" style="color:#c0392b">${t.change_rate||0}%</div><div class="muted">変更率 (変更 / 一致+変更)</div></div>`;
+    // 日別 / source 別
+    const tb = $('#trkMcBody'); tb.innerHTML = '';
+    for(const x of r.rows){
+      const denom2 = (x.method_match||0) + (x.method_change||0);
+      const rate = denom2 > 0 ? Math.round((x.method_change||0) / denom2 * 1000) / 10 : 0;
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${esc(x.day)}</td>`+
+        `<td>${esc(TRK_MC_SOURCE_LABEL[x.source]||x.source)}</td>`+
+        `<td style="text-align:right">${x.method_match||0}</td>`+
+        `<td style="text-align:right; color:${x.method_change>0?'#c0392b':'#777'}">${x.method_change||0}</td>`+
+        `<td style="text-align:right; color:${x.method_unknown>0?'#e67e22':'#777'}">${x.method_unknown||0}</td>`+
+        `<td style="text-align:right; color:#777">${x.method_skipped||0}</td>`+
+        `<td style="text-align:right; color:${rate>10?'#c0392b':'#777'}">${rate}%</td>`;
+      tb.appendChild(tr);
+    }
+    if(!r.rows.length) tb.innerHTML = '<tr><td colspan="7" class="muted">期間内のデータなし</td></tr>';
+    $('#trkMcStatus').textContent = '';
+  }catch(e){ $('#trkMcStatus').textContent = 'エラー: '+e.message; }
+}
+$('#btnTrkMcReload').onclick = loadTrkMethodChange;
+$('#trkMcDays').onchange = loadTrkMethodChange;
+$('#btnTrkMcDetail').onclick = async () => {
+  $('#trkMcDetailDlg').showModal();
+  await loadTrkMcDetail();
+};
+async function loadTrkMcDetail(){
+  const days = $('#trkMcDetailDays').value || 30;
+  const source = $('#trkMcDetailSource').value;
+  $('#trkMcDetailStatus').textContent = '読込中…';
+  try{
+    const params = new URLSearchParams({ days });
+    if(source) params.set('source', source);
+    const rows = await api(`api/tracking/method-change/log?${params.toString()}`);
+    const tb = $('#trkMcDetailBody'); tb.innerHTML = '';
+    for(const r of rows){
+      const tr = document.createElement('tr');
+      const dt = (r.detected_at||'').replace('T',' ').slice(0,16);
+      tr.innerHTML = `<td class="muted">${esc(dt)}</td>`+
+        `<td>${esc(TRK_MC_SOURCE_LABEL[r.source]||r.source)}</td>`+
+        `<td><code>${esc(r.ne_uketsuke_no||'')}</code></td>`+
+        `<td>${esc(r.shop_name||'')}</td>`+
+        `<td>${esc(r.order_no||'')}</td>`+
+        `<td><span class="items-cell" title="${esc(r.product_summary||'')}">${esc(r.product_summary||'')}</span></td>`+
+        `<td>${esc(methodName(r.original_method))}</td>`+
+        `<td><b style="color:#c0392b">${esc(methodName(r.actual_method))}</b></td>`;
+      tb.appendChild(tr);
+    }
+    if(!rows.length) tb.innerHTML = '<tr><td colspan="8" class="muted">期間内のデータなし</td></tr>';
+    $('#trkMcDetailStatus').textContent = `${rows.length} 件`;
+  }catch(e){ $('#trkMcDetailStatus').textContent = 'エラー: '+e.message; }
+}
+$('#btnTrkMcDetailReload').onclick = loadTrkMcDetail;
+$('#trkMcDetailDays').onchange = loadTrkMcDetail;
+$('#trkMcDetailSource').onchange = loadTrkMcDetail;
+$('#btnTrkMcDetailClose').onclick = () => $('#trkMcDetailDlg').close();
 
 // ─── 配送方法別一覧 (レターパック / 定形外) + アラート ───
 
@@ -1617,6 +1751,21 @@ function renderTrkImportResult(res){
   html += `<tr><td style="color:#2e7d32">紐付け成功</td><td style="text-align:right; color:#2e7d32">${res.matched_count}</td></tr>`;
   html += `<tr><td style="color:#c0392b">未マッチ (pd_shipment_tracking に該当なし)</td><td style="text-align:right; color:#c0392b">${res.unmatched_count}</td></tr>`;
   html += `<tr><td style="color:#e67e22">競合 (既存追跡番号と異なる)</td><td style="text-align:right; color:#e67e22">${res.conflict_count}</td></tr>`;
+  // 配送方法変更ログ (中原さん 2026-06-04 指示)
+  const m = res.method_match_count || 0;
+  const c = res.method_change_count || 0;
+  const u = res.method_unknown_count || 0;
+  const s = res.method_skipped_count || 0;
+  if(m + c + u + s > 0){
+    const denom = m + c;
+    const rate = denom > 0 ? Math.round(c / denom * 1000) / 10 : 0;
+    html += `<tr><td colspan="2" style="background:#f3f7fc; padding:4px"><b>📊 配送方法変更</b></td></tr>`;
+    html += `<tr><td style="color:#2e7d32">　配送方法 一致</td><td style="text-align:right; color:#2e7d32">${m}</td></tr>`;
+    html += `<tr><td style="color:#c0392b">　配送方法 変更 (現場で変更)</td><td style="text-align:right; color:#c0392b">${c}</td></tr>`;
+    html += `<tr><td style="color:#e67e22">　判定不能 (送り状種類 "0"/"A" 以外)</td><td style="text-align:right; color:#e67e22">${u}</td></tr>`;
+    html += `<tr><td style="color:#999">　判定不可 (CSV出力前 等)</td><td style="text-align:right; color:#999">${s}</td></tr>`;
+    html += `<tr><td><b>変更率</b> (変更 / 一致+変更)</td><td style="text-align:right"><b style="color:${rate>10?'#c0392b':'#2e7d32'}">${rate}%</b></td></tr>`;
+  }
   html += `</tbody></table>`;
   if((res.unmatched_samples||[]).length){
     html += `<div class="muted" style="margin-top:6px">未マッチサンプル (最大10):</div><ul>` +

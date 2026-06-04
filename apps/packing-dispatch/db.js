@@ -255,6 +255,10 @@ export function ensureSchema() {
       ne_last_modified_date TEXT,               -- NE search で取った楽観ロック値
       ne_synced_at TEXT,                        -- NE 反映完了時刻
       skip_reason TEXT,                         -- skipped 時の理由 (欠品等)
+      method_at_export TEXT,                    -- CSV出力時の shipping_method_code (変更検出基準、tracking_no NULL のときのみ更新)
+      product_summary TEXT,                     -- CSV出力時の商品名要約 (例: 商品A x1 ／ 商品B x2 ／ ...他N件)
+      product_items_json TEXT,                  -- 商品配列 JSON (後で分析用)
+      exported_at TEXT,                         -- CSV 出力時刻
       added_at TEXT NOT NULL,
       added_by TEXT,
       updated_at TEXT,
@@ -266,6 +270,7 @@ export function ensureSchema() {
 
     -- pd_tracking_import: CSV 取込履歴 (idempotency)。同じファイルの再取込を検出。
     -- (source, file_hash) で UNIQUE 制約。重複取込はアプリ側で先に検出するが、DB制約でも防御。
+    -- method_* 集計は配送方法変更ログ機能 (永続)。詳細は pd_method_change_log (90日TTL)。
     CREATE TABLE IF NOT EXISTS pd_tracking_import (
       import_id TEXT PRIMARY KEY,
       source TEXT NOT NULL,                     -- 'yamato_b2' | 'yamato_b2_50' | 'yupacketpuff' | 'manual_letterpack'
@@ -275,12 +280,52 @@ export function ensureSchema() {
       matched_count INTEGER,                    -- pd_shipment_tracking と紐付いた件数
       unmatched_count INTEGER,                  -- 紐付かなかった件数 (CSV にあるが DB にない)
       conflict_count INTEGER,                   -- 既存の tracking_no と異なる
+      method_match_count INTEGER DEFAULT 0,     -- 配送方法 一致 (Codex R1 採用、永続集計)
+      method_change_count INTEGER DEFAULT 0,    -- 配送方法 変更 (現場で別配送方法に変えた)
+      method_unknown_count INTEGER DEFAULT 0,   -- yamato_b2 で送り状種類が "0"/"A" 以外
+      method_skipped_count INTEGER DEFAULT 0,   -- method_at_export NULL 等で判定不能
       imported_by TEXT,
       imported_at TEXT,
       detail_json TEXT,                         -- 紐付け失敗の詳細 (デバッグ用)
       UNIQUE (source, file_hash)
     );
+
+    -- pd_method_change_log: 配送方法変更の詳細ログ (90日 TTL、件数集計は pd_tracking_import で永続)。
+    -- 中原さん要件: どの受注で どの商品で 何から何に変わったかを 90 日分は追える。
+    -- shipment_tracking_id を持つことで、同一受注の複数個口・分納も区別可 (Codex R1 High 1 対応)。
+    CREATE TABLE IF NOT EXISTS pd_method_change_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      detected_at TEXT NOT NULL,
+      source TEXT NOT NULL,                     -- yamato_b2 / yamato_b2_50 / yupacketpuff
+      import_id TEXT NOT NULL REFERENCES pd_tracking_import(import_id),
+      shipment_tracking_ne TEXT NOT NULL,       -- pd_shipment_tracking.ne_uketsuke_no (PK 参照)
+      ne_uketsuke_no TEXT NOT NULL,
+      tracking_no TEXT,
+      shop_name TEXT,
+      order_no TEXT,
+      product_summary TEXT,
+      original_method TEXT NOT NULL,            -- アプリで決めた配送方法 (method_at_export)
+      actual_method TEXT NOT NULL,              -- 判定した実際の配送方法
+      actual_method_raw TEXT                    -- 送り状種類の生値 (例: "0", "A") - 将来の判別追加用
+    );
+    CREATE INDEX IF NOT EXISTS idx_pd_method_change_detected ON pd_method_change_log(detected_at);
+    CREATE INDEX IF NOT EXISTS idx_pd_method_change_source_detected ON pd_method_change_log(source, detected_at);
+    CREATE INDEX IF NOT EXISTS idx_pd_method_change_import ON pd_method_change_log(import_id);
+    CREATE INDEX IF NOT EXISTS idx_pd_method_change_ne ON pd_method_change_log(shipment_tracking_ne);
   `);
+
+  // ALTER TABLE migration (既存 DB に新列を追加。SQLite は ADD COLUMN のみ、try/catch で重複 ADD を許容)
+  const safeAlter = (sql) => { try { db.prepare(sql).run(); } catch (e) { if (!/duplicate column name/i.test(e.message)) throw e; } };
+  // pd_shipment_tracking 新規列 (Codex R1 設計レビューより)
+  safeAlter(`ALTER TABLE pd_shipment_tracking ADD COLUMN method_at_export TEXT`);
+  safeAlter(`ALTER TABLE pd_shipment_tracking ADD COLUMN product_summary TEXT`);
+  safeAlter(`ALTER TABLE pd_shipment_tracking ADD COLUMN product_items_json TEXT`);
+  safeAlter(`ALTER TABLE pd_shipment_tracking ADD COLUMN exported_at TEXT`);
+  // pd_tracking_import 新規列 (永続集計)
+  safeAlter(`ALTER TABLE pd_tracking_import ADD COLUMN method_match_count INTEGER DEFAULT 0`);
+  safeAlter(`ALTER TABLE pd_tracking_import ADD COLUMN method_change_count INTEGER DEFAULT 0`);
+  safeAlter(`ALTER TABLE pd_tracking_import ADD COLUMN method_unknown_count INTEGER DEFAULT 0`);
+  safeAlter(`ALTER TABLE pd_tracking_import ADD COLUMN method_skipped_count INTEGER DEFAULT 0`);
 
   // コードテーブルの seed (INSERT OR IGNORE: 既存は壊さない)
   const insSM = db.prepare(`INSERT OR IGNORE INTO pd_shipping_method

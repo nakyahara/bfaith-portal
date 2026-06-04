@@ -20,6 +20,7 @@ import {
   trackingSummary, listTracking, listTrackingImports, getTrackingImportDetail,
   listTrackingByMethod, listMissingTracking, setTrackingOne,
   listTodayImportLinesByMethod,
+  getMethodChangeSummary, listMethodChangeLog, purgeOldMethodChangeLog,
 } from './service.js';
 import { loadSeed } from './tools/load-shipping-rule-seed.mjs';
 
@@ -201,6 +202,19 @@ router.get('/api/tracking/missing', (req, res) => handle(res, () => listMissingT
 
 // レターパック 1 件保存 (body: { ne_uketsuke_no, tracking_no, source })
 router.post('/api/tracking/set-one', (req, res) => handle(res, () => setTrackingOne(req.body || {}, currentUser(req))));
+
+// 配送方法変更ログ (集計 + 詳細 + purge、永続集計は pd_tracking_import、詳細は 90 日 TTL)
+router.get('/api/tracking/method-change/summary', (req, res) => handle(res, () =>
+  getMethodChangeSummary({ days: parseInt(req.query.days, 10) || 30 })));
+router.get('/api/tracking/method-change/log', (req, res) => handle(res, () => listMethodChangeLog({
+  days: parseInt(req.query.days, 10) || 30,
+  source: req.query.source || '',
+  limit: parseInt(req.query.limit, 10) || 500,
+})));
+router.post('/api/admin/tracking/method-change/purge', (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  handle(res, () => purgeOldMethodChangeLog());
+});
 
 // 取込履歴
 router.get('/api/tracking/imports', (req, res) => handle(res, () => listTrackingImports()));
