@@ -629,6 +629,96 @@ export function deleteRecentTrackingImports({ hoursBack = 24, sources = null, dr
     imports_deleted: targets.length, logs_deleted: logsDeleted, targets };
 }
 
+// 未マッチ行を pd_shipment_tracking に「反映に含める」(2026-06-04 中原さん指示)。
+//
+// 運用: スタッフが取込履歴詳細モーダルで未マッチ行を見て、NextEngine 側で実在確認した上で
+// 「✅ 反映に含める」ボタンを押す。pd_shipment_tracking に sync_status='ready' で INSERT し、
+// 次回 cron が NE 反映を試みる。NE 側に該当受注がなければ API エラー → status=error
+// で manual_review (既存挙動)。typo の予防は運用 (目視確認) でカバー。
+//
+// Codex R1 対応:
+// - Critical: shipping_method_code NOT NULL → enrich → source fallback の順で必ず確定
+// - High 1: ready で直接 INSERT (sync_requested_at=now)、ボタン 1 押下で完結
+// - High 2: changes=0 後に既存行を再 SELECT、tracking_no が異なれば vErr (conflict)
+// - synced は拒否 (UI でも非表示だが二重チェック)
+//
+// source 別 fallback (enrich/import_line から取れなかった場合の最終手段):
+//   yamato_b2_50  → takkyu50 (50サイズは固定)
+//   yupacketpuff  → yupacketpuff (固定)
+//   yamato_b2     → hatsubarai (デフォルト発払い、現場で多い側)
+const SOURCE_FALLBACK_METHOD = {
+  yamato_b2: 'hatsubarai',
+  yamato_b2_50: 'takkyu50',
+  yupacketpuff: 'yupacketpuff',
+};
+export function includeUnmatchedToTracking({ ne_uketsuke_no, tracking_no, source, enrich = null }, user) {
+  if (!ne_uketsuke_no) throw vErr('ne_uketsuke_no が空です');
+  if (!tracking_no) throw vErr('tracking_no が空です');
+  const validSources = Object.keys(SOURCE_FALLBACK_METHOD);
+  if (!validSources.includes(source)) throw vErr(`source は ${validSources.join(' / ')} のいずれか`);
+  const e = enrich || {};
+  // shipping_method_code: enrich (= pd_import_line の判定結果) を優先、なければ source fallback
+  const shippingMethodCode = e.shipping_method_code || SOURCE_FALLBACK_METHOD[source];
+  if (!shippingMethodCode) throw vErr(`shipping_method_code を決定できません (source=${source})`);
+  const db = ensureSchema();
+  const now = utcIsoNow();
+  // 既存行を先に取得して状況別に処理 (Codex R2 High: 既存 pending+tracking_no=NULL を no-op で
+  // 取りこぼさない、別 tracking_no は conflict、synced は拒否、既存ありで同値は idempotent)。
+  const sel = db.prepare(`SELECT sync_status, tracking_no FROM pd_shipment_tracking WHERE ne_uketsuke_no=?`);
+  const cur = sel.get(ne_uketsuke_no);
+  if (cur && cur.sync_status === 'synced') {
+    throw vErr('既に NE 反映済 (synced) のため反映に含められません。訂正は別経路で行ってください。');
+  }
+  if (cur && cur.tracking_no && cur.tracking_no !== tracking_no) {
+    audit('tracking_unmatched_include_conflict', ne_uketsuke_no,
+      { incoming_tracking_no: tracking_no, current_tracking_no: cur.tracking_no, source }, user);
+    throw vErr(`既に異なる追跡番号で登録されています (既存=${cur.tracking_no} / 新=${tracking_no})。先にレターパック/手動で確認してください。`);
+  }
+  // 既存なし → INSERT、既存あり (synced 以外、tracking_no NULL or 同値) → UPDATE で ready 化
+  const tx = db.transaction(() => {
+    if (!cur) {
+      db.prepare(`INSERT INTO pd_shipment_tracking
+        (ne_uketsuke_no, shipping_method_code, shop_name, order_no,
+         sync_status, sync_requested_at, tracking_no, tracking_source,
+         method_at_export, product_summary,
+         added_at, added_by, updated_at, updated_by)
+        VALUES (?, ?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        ne_uketsuke_no, shippingMethodCode,
+        e.shop_name || null, e.order_no || null,
+        now, tracking_no, source, shippingMethodCode, e.product_summary || null,
+        now, user || null, now, user || null);
+      return 'inserted';
+    }
+    // 既存あり: 同値 tracking_no + ready なら idempotent (touch しない)
+    if (cur.tracking_no === tracking_no && cur.sync_status === 'ready') return 'idempotent_ready';
+    // それ以外: tracking_no を確定 + ready 化 (他カラムは既存値を尊重、ただし enrich があれば補完)
+    db.prepare(`UPDATE pd_shipment_tracking SET
+        tracking_no = ?, tracking_source = ?,
+        sync_status = 'ready', sync_requested_at = ?,
+        last_error = NULL, last_error_code = NULL,
+        shop_name = COALESCE(shop_name, ?),
+        order_no = COALESCE(order_no, ?),
+        product_summary = COALESCE(product_summary, ?),
+        updated_at = ?, updated_by = ?
+      WHERE ne_uketsuke_no=? AND sync_status != 'synced'`).run(
+      tracking_no, source, now,
+      e.shop_name || null, e.order_no || null, e.product_summary || null,
+      now, user || null, ne_uketsuke_no);
+    return 'updated';
+  });
+  const action = tx();
+  audit('tracking_unmatched_include', ne_uketsuke_no,
+    { tracking_no, source, shipping_method_code: shippingMethodCode, action,
+      existing_status: cur ? cur.sync_status : null }, user);
+  const noteByAction = {
+    inserted: '✅ NE 反映待ち (ready) に追加しました',
+    updated: `✅ 既存 ${cur ? cur.sync_status : '?'} 行を ready に更新しました`,
+    idempotent_ready: '既に ready で登録済 (変更なし)',
+  };
+  return { ne_uketsuke_no, tracking_no, source, action,
+    shipping_method_code: shippingMethodCode, note: noteByAction[action] };
+}
+
 // CSV 出力時に各伝票を pd_shipment_tracking に UPSERT。NE 受注番号 (col 20) で 1 行に集約。
 // 配送方法変更ログ機能 (中原さん 2026-06-04 指示) のため、以下も保存:
 //   method_at_export: CSV 出力時の shipping_method_code (変更検出基準値)
@@ -1423,7 +1513,7 @@ export function getTrackingImportDetail(import_id) {
     const recentBatches = db.prepare(`SELECT batch_id FROM pd_import_batch
       WHERE uploaded_at >= datetime('now', '-48 hours')
       ORDER BY uploaded_at DESC`).all();
-    const linesByBatch = db.prepare(`SELECT shop_name, order_no, product_code, qty, raw_cols
+    const linesByBatch = db.prepare(`SELECT shop_name, order_no, product_code, qty, raw_cols, shipping_method_code
       FROM pd_import_line WHERE batch_id=? AND shipping_method_code IS NOT NULL`);
     for (const b of recentBatches) {
       if (!targetUkes.size) break; // 全 uke 解決済み → 以降のバッチは触らない
@@ -1440,6 +1530,7 @@ export function getTrackingImportDetail(import_id) {
             product_code: l.product_code || '',
             product_name: (raw[COL.productName] || '').trim(),
             qty: l.qty || 0,
+            shipping_method_code: l.shipping_method_code || null,
           });
         } catch { /* skip malformed JSON */ }
       }
@@ -1454,7 +1545,7 @@ export function getTrackingImportDetail(import_id) {
     return {
       shop_name: lines[0].shop_name, order_no: lines[0].order_no,
       product_summary: items.length > 500 ? items.slice(0, 500) + '…' : items,
-      shipping_method_code: null,
+      shipping_method_code: lines[0].shipping_method_code || null,
     };
   };
   const enrichOne = (uke) => enrichFromTracking(uke) || enrichFromLines(uke) || null;
