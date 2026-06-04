@@ -486,13 +486,18 @@ export function exportCsv(batch_id, user, opts = {}) {
 //
 // ⚠️ backfill は「未登録を補う」だけ (Codex R1 High)。既存行 (今日紐付け済 / ready / skipped / error 等)
 // は INSERT OR IGNORE で完全保護する。再出力時の破壊的 UPSERT は exportCsv 専用 (別経路)。
-export function backfillShipmentTrackingFromExportedBatches({ dryRun = false } = {}, user) {
+export function backfillShipmentTrackingFromExportedBatches({ dryRun = false, todayJstOnly = true } = {}, user) {
   const db = ensureSchema();
-  // exported / locked_for_export 状態のバッチを全部対象 (まだ TTL 内のもの)
+  // exported / locked_for_export 状態のバッチを対象 (まだ TTL 内のもの)。
+  // 2026-06-04 中原さん指摘: todayJstOnly (デフォ ON) で「今日 JST にアップしたバッチだけ」に絞れる。
+  // 前日以前のバッチを backfill すると、B2 CSV 再投入対象外なのに pending として残って混乱するため。
+  const todayFilter = todayJstOnly
+    ? `AND date(uploaded_at, '+9 hours') = date('now', '+9 hours')` : '';
   const batches = db.prepare(`SELECT batch_id, status, uploaded_at, row_count
     FROM pd_import_batch
     WHERE status IN ('exported', 'locked_for_export')
       AND (expires_at IS NULL OR expires_at >= ?)
+      ${todayFilter}
     ORDER BY uploaded_at`).all(utcIsoNow());
   // INSERT-only (既存行は ne_uketsuke_no UNIQUE で弾く、ON CONFLICT DO NOTHING)。
   // product_summary も exportCsv と同じロジックで作る (中身の仕様統一)。
@@ -579,9 +584,10 @@ export function backfillShipmentTrackingFromExportedBatches({ dryRun = false } =
     totalAlreadyExists += dup;
   }
   audit(dryRun ? 'tracking_backfill_dry_run' : 'tracking_backfill', null,
-    { batch_count: batches.length, total_candidates: totalCandidates,
+    { batch_count: batches.length, today_jst_only: todayJstOnly,
+      total_candidates: totalCandidates,
       total_inserted: totalInserted, total_already_exists: totalAlreadyExists }, user);
-  return { dry_run: dryRun, batch_count: batches.length,
+  return { dry_run: dryRun, today_jst_only: todayJstOnly, batch_count: batches.length,
     total_candidates: totalCandidates, total_inserted: totalInserted, total_already_exists: totalAlreadyExists,
     per_batch: perBatch };
 }

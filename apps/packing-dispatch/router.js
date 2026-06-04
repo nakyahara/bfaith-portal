@@ -218,10 +218,13 @@ router.post('/api/admin/tracking/method-change/purge', (req, res) => {
 });
 
 // 過去 exported バッチを走査して pd_shipment_tracking に backfill (2026-06-04 hotfix、admin専用)
+// todayJstOnly (デフォ true) で「今日 JST にアップしたバッチだけ」に絞る
 router.post('/api/admin/tracking/backfill-from-exported', (req, res) => {
   if (!requireAdmin(req, res)) return;
+  const body = req.body || {};
   handle(res, () => backfillShipmentTrackingFromExportedBatches({
-    dryRun: req.query.dryRun === '1' || (req.body && req.body.dryRun === true),
+    dryRun: req.query.dryRun === '1' || body.dryRun === true,
+    todayJstOnly: body.todayJstOnly !== false, // 明示的に false 以外はすべて true
   }, currentUser(req)));
 });
 
