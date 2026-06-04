@@ -200,6 +200,7 @@
       </div>
       <div class="row" style="margin-top:8px">
         <strong>Step 1:</strong>
+        <label><input id="bkTodayOnly" type="checkbox" checked /> 今日 (JST) アップロード分のみ</label>
         <button id="btnBackfillTrackingDry" class="sub">🔍 ドライラン</button>
         <button id="btnBackfillTrackingRun" style="background:#c0392b; border-color:#c0392b">⚠️ backfill 実行</button>
         <span id="backfillTrackingStatus" class="muted"></span>
@@ -1468,17 +1469,28 @@ $('#btnRollbackExec').onclick = async () => {
 };
 
 // ── 管理者専用: 追跡番号 backfill (2026-06-04 hotfix) ──
+// UTC ISO → JST 表示 ("2026-06-04 12:48:15 JST")。null 時は空。
+function utcIsoToJst(iso){
+  if(!iso) return '';
+  const d = new Date(iso);
+  if(isNaN(d.getTime())) return iso;
+  // toLocaleString は環境依存なので明示的に +9h して slice
+  const jst = new Date(d.getTime() + 9 * 3600 * 1000);
+  return jst.toISOString().replace('T',' ').slice(0,19) + ' JST';
+}
 async function runBackfillTracking(dryRun){
   const btn = dryRun ? $('#btnBackfillTrackingDry') : $('#btnBackfillTrackingRun');
+  const todayOnly = $('#bkTodayOnly').checked;
   if(!dryRun){
-    if(!confirm('過去 48h の exported バッチを走査し、未登録の伝票を pd_shipment_tracking に追加します (INSERT-only)。実行しますか?')) return;
+    if(!confirm(`過去 48h の exported バッチ${todayOnly ? ' (今日 JST のみ)' : ' (全期間)'}を走査し、未登録の伝票を pd_shipment_tracking に追加します (INSERT-only)。実行しますか?`)) return;
     if(!confirm('もう一度確認: 既存行 (紐付け済 / ready / synced / error 等すべて) は ON CONFLICT DO NOTHING で完全保護され、変更されません。実行しますか?')) return;
   }
   btn.disabled = true;
   $('#backfillTrackingStatus').textContent = dryRun ? 'ドライラン実行中…' : 'backfill 実行中…';
   try{
     const r = await api('api/admin/tracking/backfill-from-exported' + (dryRun ? '?dryRun=1' : ''), {
-      method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ todayJstOnly: todayOnly })
     });
     const box = $('#backfillTrackingResult');
     box.style.display = 'block';
@@ -1487,13 +1499,16 @@ async function runBackfillTracking(dryRun){
       : `<div style="color:#2e7d32; font-weight:bold">✅ backfill 完了</div>`;
     const perBatch = (r.per_batch || []).map(b => {
       const note = b.note || (typeof b.already_exists === 'number' && b.already_exists > 0 ? `既存 ${b.already_exists} 件 skip` : '');
-      return `<tr><td><code>${esc(b.batch_id || '')}</code></td><td>${esc((b.uploaded_at || '').replace('T',' ').slice(0,19))}</td><td>${b.candidates || 0}</td><td>${b.inserted || 0}</td><td>${esc(note)}</td></tr>`;
+      return `<tr><td><code>${esc(b.batch_id || '')}</code></td><td>${esc(utcIsoToJst(b.uploaded_at))}</td><td>${b.candidates || 0}</td><td>${b.inserted || 0}</td><td>${esc(note)}</td></tr>`;
     }).join('');
-    const summary = `対象バッチ: <b>${r.batch_count}</b> 件 / 候補: <b>${r.total_candidates}</b> 件 / 新規追加: <b>${r.total_inserted}</b> 件 / 既存スキップ: <b>${r.total_already_exists}</b> 件`;
+    const scopeBadge = r.today_jst_only
+      ? '<span class="badge b-ok">今日 (JST) のみ</span>'
+      : '<span class="badge b-warn">全期間 (48h 以内)</span>';
+    const summary = `${scopeBadge} 対象バッチ: <b>${r.batch_count}</b> 件 / 候補: <b>${r.total_candidates}</b> 件 / 新規追加: <b>${r.total_inserted}</b> 件 / 既存スキップ: <b>${r.total_already_exists}</b> 件`;
     box.innerHTML = `
       ${header}
       <div>${summary}</div>
-      ${perBatch ? `<table style="margin-top:8px"><thead><tr><th>batch_id</th><th>uploaded_at</th><th>候補</th><th>新規追加</th><th>備考</th></tr></thead><tbody>${perBatch}</tbody></table>` : ''}
+      ${perBatch ? `<table style="margin-top:8px"><thead><tr><th>batch_id</th><th>uploaded_at (JST)</th><th>候補</th><th>新規追加</th><th>備考</th></tr></thead><tbody>${perBatch}</tbody></table>` : ''}
       ${dryRun ? '<div class="muted" style="margin-top:8px">問題なければ「backfill 実行」を押してください。</div>' : ''}
     `;
     $('#backfillTrackingStatus').textContent = '';
@@ -1528,7 +1543,7 @@ async function runDeleteRecentImports(dryRun){
       ? `<div style="color:#2b6cb0; font-weight:bold">🔍 ドライラン結果</div>`
       : `<div style="color:#2e7d32; font-weight:bold">✅ 削除完了</div>`;
     const targetRows = (r.targets || []).map(t =>
-      `<tr><td><code>${esc(t.import_id || '')}</code></td><td>${esc(t.source || '')}</td><td>${esc(t.filename || '')}</td><td>${t.row_count || 0}</td><td>${esc((t.imported_at || '').replace('T',' ').slice(0,19))}</td></tr>`
+      `<tr><td><code>${esc(t.import_id || '')}</code></td><td>${esc(t.source || '')}</td><td>${esc(t.filename || '')}</td><td>${t.row_count || 0}</td><td>${esc(utcIsoToJst(t.imported_at))}</td></tr>`
     ).join('');
     const summary = dryRun
       ? `対象: <b>${(r.targets || []).length}</b> 件`
