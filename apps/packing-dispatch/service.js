@@ -62,7 +62,7 @@ export function importCsv(buffer, filename, user) {
   // 伝票(shop+注文番号)でグループ化
   const groups = new Map();
   for (const l of lines) {
-    const key = l.shop_name + '' + l.order_no;
+    const key = l.shop_name + "_" + l.order_no;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(l);
   }
@@ -1121,10 +1121,81 @@ export function getTrackingImportDetail(import_id) {
   return { ...row, detail: row.detail_json ? JSON.parse(row.detail_json) : null };
 }
 
-// 配送方法別の一覧 (定形外/レターパック など、特定方法だけ抽出)。
-// 「未完了」= synced (NE反映済) / skipped (欠品) を除外したもの。
-// 当日の伝票だけ見たい場合も、運用上は exportCsv で前日以前の synced は速やかに処理されるので、
-// 「未完了」=「実質その日の作業対象」と一致する。
+// 「本日 (JST) アップロードされた取込バッチ」の伝票を配送方法別に抽出 (定形外/レターパック表示用)。
+// データソース: pd_import_batch (uploaded_at) + pd_import_line (確定済 / auto / 要判断 すべて含む)。
+// 伝票単位 (batch_id + shop_name + order_no) で集約し、商品名/数量を結合表示用に整形。
+// 業務理由 (中原さん 2026-06-04): 定形外/レターパックはキャリア CSV から紐付けされないため、
+// 手動確認用の一覧が必要。「CSV ボタンを押す直前のやつ」 = pd_import_line で本日 uploaded。
+export function listTodayImportLinesByMethod(method) {
+  if (!method) throw vErr('method を指定してください');
+  const db = ensureSchema();
+  const now = new Date();
+  // JST 今日 0:00 と 翌日 0:00 を UTC ISO で求める
+  const jstNow = new Date(now.getTime() + 9 * 3600 * 1000);
+  const ymd = `${jstNow.getUTCFullYear()}-${String(jstNow.getUTCMonth() + 1).padStart(2, '0')}-${String(jstNow.getUTCDate()).padStart(2, '0')}`;
+  const fromIso = jstMidnightIso(ymd);
+  const toIso = new Date(new Date(fromIso).getTime() + 24 * 3600 * 1000).toISOString();
+
+  // 本日アップロードされた batch のうち、status='exported' 以外は「CSV出力前」、それも含めて表示。
+  // (中原さん「CSV ボタンを押す直前のやつ」 = 出力済みも未済も両方表示するという解釈)
+  // expires_at で TTL 切れは除外。
+  const lines = db.prepare(`
+    SELECT l.batch_id, l.row_no, l.order_no, l.shop_name, l.mall_group,
+           l.product_code, l.qty, l.shipping_method_code, l.packing_machine_code,
+           l.row_status, l.reason_code, l.raw_cols,
+           b.uploaded_at, b.status AS batch_status, b.filename
+      FROM pd_import_line l
+      JOIN pd_import_batch b ON l.batch_id = b.batch_id
+     WHERE b.uploaded_at >= ? AND b.uploaded_at < ?
+       AND (b.expires_at IS NULL OR b.expires_at >= ?)
+       AND l.shipping_method_code = ?
+     ORDER BY b.uploaded_at, l.shop_name, l.order_no, l.row_no
+  `).all(fromIso, toIso, utcIsoNow(), method);
+
+  // 伝票単位に集約 (batch_id + shop_name + order_no)。
+  // batch_id もキーに含めることで、同日中の再アップロード分は別件として扱う (Codex R1 Medium 指摘)。
+  // row_status は「要判断 > 確定 > auto」の優先で集約 (listOrders と同方針)。
+  const ROW_STATUS_RANK = { '要判断': 0, '確定': 1, 'auto': 2 };
+  const byOrder = new Map();
+  for (const l of lines) {
+    const key = l.batch_id + "_" + l.shop_name + "_" + l.order_no;
+    if (!byOrder.has(key)) {
+      const raw = JSON.parse(l.raw_cols || '[]');
+      byOrder.set(key, {
+        batch_id: l.batch_id,
+        batch_status: l.batch_status,
+        uploaded_at: l.uploaded_at,
+        filename: l.filename,
+        shop_name: l.shop_name,
+        order_no: l.order_no,
+        ne_uketsuke_no: norm(raw[COL.uketsuke] || ''),
+        pref: norm(raw[COL.pref] || ''),
+        recipient: norm(raw[COL.recipient] || ''),
+        shipping_method_code: l.shipping_method_code,
+        packing_machine_code: l.packing_machine_code,
+        row_status: l.row_status,
+        items: [],
+        total_qty: 0,
+      });
+    }
+    const entry = byOrder.get(key);
+    const raw = JSON.parse(l.raw_cols || '[]');
+    entry.items.push({
+      product_code: l.product_code,
+      product_name: norm(raw[COL.productName] || ''),
+      qty: l.qty || 0,
+    });
+    entry.total_qty += (l.qty || 0);
+    // row_status は優先度の高い方 (要判断 > 確定 > auto) を採用 (listOrders と同方針)
+    const curRank = ROW_STATUS_RANK[entry.row_status] ?? 99;
+    const newRank = ROW_STATUS_RANK[l.row_status] ?? 99;
+    if (newRank < curRank) entry.row_status = l.row_status;
+  }
+  return [...byOrder.values()];
+}
+
+// (旧) pd_shipment_tracking ベースの配送方法別一覧 (synced/skipped 除外)。
+// PR で「pd_import_line ベースに変更」したため未使用。互換のため残す (後で削除予定)。
 export function listTrackingByMethod(method) {
   if (!method) throw vErr('method を指定してください');
   const db = ensureSchema();
