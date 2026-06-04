@@ -419,6 +419,23 @@
       </div>
     </div>
 
+    <!-- NE 手動反映用エクスポート (cron 未実装の暫定運用、2026-06-04) -->
+    <div class="card" id="trkReadyExportCard" style="background:#f0f7ff; border-color:#b3d4ff">
+      <div class="row">
+        <strong>📤 NE 手動反映用エクスポート (ready 状態のみ)</strong>
+        <span id="trkReadyExportSummary" class="muted"></span>
+        <span style="flex:1"></span>
+        <button class="sub" id="btnTrkReadyExportReload">再読込</button>
+      </div>
+      <div class="muted">NE 反映 cron 未実装のため当面は手動運用。<b>Step 1</b>: 配送方法を選んで NE 受注番号をコピー → NextEngine で一括検索 → 配送方法を変更。<b>Step 2</b>: 受注番号+追跡番号の CSV をダウンロード → NextEngine の追跡番号 CSV インポートに流す。</div>
+      <div class="row" style="margin-top:8px">
+        <label>配送方法 <select id="trkReadyExportMethod"></select></label>
+        <button id="btnTrkReadyCopyUkes" style="background:#2b6cb0; border-color:#2b6cb0">📋 NE 受注番号をコピー</button>
+        <button id="btnTrkReadyDownloadCsv" style="background:#2e7d32; border-color:#2e7d32">📥 受注番号 + 追跡番号 CSV ダウンロード</button>
+        <span id="trkReadyExportStatus" class="muted"></span>
+      </div>
+    </div>
+
     <!-- 一覧 + フィルタ + 一括操作 -->
     <div class="card">
       <div class="row">
@@ -1642,6 +1659,7 @@ async function loadTrackingAll(){
       loadTrkTeikeigai(),
       loadTrkMissing(),
       loadTrkMethodChange(),
+      loadTrkReadyExport(),
     ]);
   }catch(e){ console.error('[tracking]', e.message); }
 }
@@ -1804,6 +1822,73 @@ async function loadTrkMissing(){
 $('#btnTrkLetterpackReload').onclick = loadTrkLetterpack;
 $('#btnTrkTeikeigaiReload').onclick = loadTrkTeikeigai;
 $('#btnTrkMissingReload').onclick = loadTrkMissing;
+
+// ── NE 手動反映用エクスポート (2026-06-04、cron 未実装の暫定運用) ──
+async function loadTrkReadyExport(){
+  try{
+    const sum = await api('api/tracking/ready/summary');
+    const sel = $('#trkReadyExportMethod');
+    const card = $('#trkReadyExportCard');
+    $('#trkReadyExportSummary').textContent = sum.total > 0
+      ? `合計 ${sum.total} 件 (内 追跡番号あり ${sum.total_with_tracking} 件)`
+      : '';
+    if(sum.total === 0){
+      card.style.display = 'none';
+      return;
+    }
+    card.style.display = 'block';
+    // セレクトボックスに「すべて + 配送方法ごと」を構築 (件数表示付き)
+    const allOption = `<option value="all">すべて (${sum.total} 件)</option>`;
+    const methodOptions = sum.rows.map(r => {
+      const label = `${methodName(r.shipping_method_code)} — ${r.total} 件` +
+        (r.without_tracking > 0 ? ` (追跡なし ${r.without_tracking} 件含む)` : '');
+      return `<option value="${esc(r.shipping_method_code)}">${esc(label)}</option>`;
+    }).join('');
+    sel.innerHTML = allOption + methodOptions;
+  }catch(e){ console.error('[trk-ready-export]', e.message); }
+}
+$('#btnTrkReadyExportReload').onclick = loadTrkReadyExport;
+
+// 📋 NE 受注番号をコピー
+$('#btnTrkReadyCopyUkes').onclick = async () => {
+  const method = $('#trkReadyExportMethod').value;
+  $('#trkReadyExportStatus').textContent = '取得中…';
+  // API call は 1 回だけ。クリップボード API が使えなくても fallback で同じ text を使う。
+  let ukes;
+  try{
+    ukes = await api('api/tracking/ready/uketsuke?method=' + encodeURIComponent(method));
+  }catch(e){
+    $('#trkReadyExportStatus').textContent = 'API エラー: ' + e.message;
+    return;
+  }
+  if(!ukes || !ukes.length){
+    $('#trkReadyExportStatus').textContent = '対象 0 件';
+    return;
+  }
+  const text = ukes.join('\n');
+  // 1: navigator.clipboard 経由 (HTTPS + 対応ブラウザ)
+  try{
+    await navigator.clipboard.writeText(text);
+    $('#trkReadyExportStatus').textContent = `✅ ${ukes.length} 件をクリップボードにコピー (改行区切り)`;
+    return;
+  }catch(_){ /* fallback へ */ }
+  // 2: textarea + execCommand 経由 (古いブラウザ / 一部環境)
+  try{
+    const ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta);
+    ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+    $('#trkReadyExportStatus').textContent = `✅ ${ukes.length} 件をクリップボードにコピー (fallback)`;
+  }catch(e){
+    $('#trkReadyExportStatus').textContent = 'クリップボード失敗: ' + e.message;
+  }
+};
+
+// 📥 CSV ダウンロード
+$('#btnTrkReadyDownloadCsv').onclick = () => {
+  const method = $('#trkReadyExportMethod').value;
+  // 単純なリンク遷移で download attribute はサーバ側 Content-Disposition で渡している
+  location.href = API_BASE + 'api/tracking/ready/csv?method=' + encodeURIComponent(method);
+};
 
 // 定形外: 全選択 / 全解除
 $('#trkTeikeigaiSelectAll').onchange = (e) => {
