@@ -1400,7 +1400,76 @@ export function getTrackingImportDetail(import_id) {
   const db = ensureSchema();
   const row = db.prepare(`SELECT * FROM pd_tracking_import WHERE import_id=?`).get(import_id);
   if (!row) return null;
-  return { ...row, detail: row.detail_json ? JSON.parse(row.detail_json) : null };
+  const detail = row.detail_json ? JSON.parse(row.detail_json) : null;
+  if (!detail) return { ...row, detail: null };
+  // 2026-06-04 中原さん要望: 未マッチ/競合の NE 受注番号と注文内容 (ショップ/注文番号/商品名) を見たい。
+  // - 競合 (pd_shipment_tracking に既存): pd_shipment_tracking から enrich
+  // - 未マッチ (pd_shipment_tracking に該当なし): 過去 48h の pd_import_line から JSON raw_cols 経由で enrich
+  //   (TTL 切れ等で見つからなければ null のまま返す)
+  const trkSel = db.prepare(`SELECT shop_name, order_no, product_summary, shipping_method_code
+    FROM pd_shipment_tracking WHERE ne_uketsuke_no=?`);
+  const enrichFromTracking = (uke) => trkSel.get(uke) || null;
+  // 未マッチ enrich = 過去 48h の pd_import_line から ne_uketsuke_no (col 20) を引く。
+  // Codex R1 High 1: pd_import_line は (batch_id, order_no) しか index がなく、NE受注番号で
+  // 直接 WHERE できない (raw_cols は JSON 文字列)。詳細表示のたびに全件 JSON.parse は OOM/timeout 危険。
+  // → ① detail の unmatched サンプルから「これから引きたい uke 集合」を先に作る
+  //   ② 過去 48h の batch_id ごとに ORDER BY b.uploaded_at DESC で 1 バッチ分ずつ走査
+  //   ③ 目的 uke の最初のバッチがヒットしたら以降の古いバッチは触らない
+  // Codex R1 High 2: 最新バッチで決定打を取るため、最も新しい batch から見つけた行を採用
+  const targetUkes = new Set((detail.unmatched || []).map(x => (x.ne_uketsuke_no || '').trim()).filter(Boolean));
+  const enrichFromLinesMap = new Map();
+  if (targetUkes.size) {
+    // 過去 48h の batch を新しい順に走査
+    const recentBatches = db.prepare(`SELECT batch_id FROM pd_import_batch
+      WHERE uploaded_at >= datetime('now', '-48 hours')
+      ORDER BY uploaded_at DESC`).all();
+    const linesByBatch = db.prepare(`SELECT shop_name, order_no, product_code, qty, raw_cols
+      FROM pd_import_line WHERE batch_id=? AND shipping_method_code IS NOT NULL`);
+    for (const b of recentBatches) {
+      if (!targetUkes.size) break; // 全 uke 解決済み → 以降のバッチは触らない
+      const rows = linesByBatch.all(b.batch_id);
+      for (const l of rows) {
+        try {
+          const raw = JSON.parse(l.raw_cols || '[]');
+          const uke = (raw[COL.uketsuke] || '').trim();
+          if (!uke || !targetUkes.has(uke)) continue;
+          // 同バッチ内で同 uke 複数行 → 配列に集約
+          if (!enrichFromLinesMap.has(uke)) enrichFromLinesMap.set(uke, []);
+          enrichFromLinesMap.get(uke).push({
+            shop_name: l.shop_name, order_no: l.order_no,
+            product_code: l.product_code || '',
+            product_name: (raw[COL.productName] || '').trim(),
+            qty: l.qty || 0,
+          });
+        } catch { /* skip malformed JSON */ }
+      }
+      // このバッチで見つけた uke は targetUkes から除外 (古いバッチに混ぜないため)
+      for (const uke of enrichFromLinesMap.keys()) targetUkes.delete(uke);
+    }
+  }
+  const enrichFromLines = (uke) => {
+    const lines = enrichFromLinesMap.get(uke);
+    if (!lines || !lines.length) return null;
+    const items = lines.map(l => `${l.product_code} ${l.product_name} ×${l.qty}`.trim()).join(' ／ ');
+    return {
+      shop_name: lines[0].shop_name, order_no: lines[0].order_no,
+      product_summary: items.length > 500 ? items.slice(0, 500) + '…' : items,
+      shipping_method_code: null,
+    };
+  };
+  const enrichOne = (uke) => enrichFromTracking(uke) || enrichFromLines(uke) || null;
+  const enrichedUnmatched = (detail.unmatched || []).map(x => ({ ...x, enrich: enrichOne(x.ne_uketsuke_no) }));
+  const enrichedConflict = (detail.conflict || []).map(x => ({ ...x, enrich: enrichOne(x.ne_uketsuke_no) }));
+  // Codex R1 High 3: detail サンプルは最大 50 件で truncate されている (importTrackingCsv 内 50 上限)。
+  // unmatched_count / conflict_count (永続化された総数) と sample_limit を一緒に返して UI で明示。
+  return { ...row, detail: {
+    ...detail,
+    unmatched: enrichedUnmatched,
+    conflict: enrichedConflict,
+    sample_limit: 50,
+    unmatched_total: row.unmatched_count,
+    conflict_total: row.conflict_count,
+  }};
 }
 
 // ─── 配送方法変更ログ集計 (中原さん 2026-06-04 指示) ───
