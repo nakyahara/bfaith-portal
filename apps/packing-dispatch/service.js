@@ -629,6 +629,100 @@ export function deleteRecentTrackingImports({ hoursBack = 24, sources = null, dr
     imports_deleted: targets.length, logs_deleted: logsDeleted, targets };
 }
 
+// 定形外伝票を一括で「定形外として反映する」(2026-06-04 中原さん指示)。
+// 「📫 定形外 (本日アップロード分)」一覧で選択した NE 受注番号を 1 transaction で
+// tracking_source='no_tracking' + sync_status='ready' に遷移させる。
+//
+// Codex R1 Critical 対応: setTrackingManual と異なり、既存 tracking_no がある行は
+// 上書きしない (skip としてカウント、conflict 検出も同等)。サーバ側で以下を厳格に検証:
+// - shipping_method_code='teikeigai' のみ (画面以外からの誤呼び出し防御)
+// - sync_status が editable (pending/ready/error/conflict/manual_review) のみ
+// - tracking_no が既にあれば skip (上書きしない)
+//
+// Codex R1 High 対応: IN 句の 999 件上限を避けるため、1 行ずつ UPDATE で処理。
+// チャンク化は不要、transaction で atomic に。
+export function bulkApplyTeikeigai({ ne_uketsuke_nos } = {}, user) {
+  if (!Array.isArray(ne_uketsuke_nos) || !ne_uketsuke_nos.length) {
+    throw vErr('ne_uketsuke_nos が空です');
+  }
+  const uniqueUkes = [...new Set(ne_uketsuke_nos.map(u => norm(u)).filter(Boolean))];
+  if (!uniqueUkes.length) throw vErr('有効な NE 受注番号がありません');
+  const db = ensureSchema();
+  const now = utcIsoNow();
+  const editableStatuses = new Set(['pending', 'ready', 'error', 'conflict', 'manual_review']);
+  const sel = db.prepare(`SELECT ne_uketsuke_no, shipping_method_code, sync_status, tracking_no, tracking_source
+    FROM pd_shipment_tracking WHERE ne_uketsuke_no=?`);
+  const upd = db.prepare(`UPDATE pd_shipment_tracking
+    SET tracking_source='no_tracking', sync_status='ready', sync_requested_at=?,
+        last_error=NULL, last_error_code=NULL,
+        updated_at=?, updated_by=?
+    WHERE ne_uketsuke_no=?
+      AND shipping_method_code='teikeigai'
+      AND sync_status IN ('pending','ready','error','conflict','manual_review')
+      AND tracking_no IS NULL`);
+  let updated = 0, alreadyReady = 0, notFound = 0;
+  const skippedHasTracking = [];
+  const skippedNotTeikeigai = [];
+  const skippedSynced = [];
+  const skippedOther = [];
+  const tx = db.transaction(() => {
+    for (const uke of uniqueUkes) {
+      const cur = sel.get(uke);
+      if (!cur) { notFound++; continue; }
+      if (cur.shipping_method_code !== 'teikeigai') {
+        skippedNotTeikeigai.push({ ne_uketsuke_no: uke, method: cur.shipping_method_code });
+        continue;
+      }
+      if (cur.sync_status === 'synced') {
+        skippedSynced.push(uke);
+        continue;
+      }
+      if (cur.sync_status === 'syncing' || cur.sync_status === 'skipped') {
+        skippedOther.push({ ne_uketsuke_no: uke, status: cur.sync_status });
+        continue;
+      }
+      if (!editableStatuses.has(cur.sync_status)) {
+        skippedOther.push({ ne_uketsuke_no: uke, status: cur.sync_status });
+        continue;
+      }
+      if (cur.tracking_no) {
+        // 既に追跡番号あり → 上書きしない (Codex R1 Critical: setTrackingManual と違って defensive)
+        skippedHasTracking.push({ ne_uketsuke_no: uke, current_tracking_no: cur.tracking_no });
+        continue;
+      }
+      // 既に ready + tracking_source='no_tracking' で同状態なら idempotent (count として alreadyReady に)
+      const isAlreadyReady = cur.sync_status === 'ready' && cur.tracking_source === 'no_tracking';
+      const info = upd.run(now, now, user || null, uke);
+      if (info.changes > 0) {
+        if (isAlreadyReady) alreadyReady++; else updated++;
+      } else {
+        // WHERE で弾かれた (typically: race で他プロセスが先に更新)
+        skippedOther.push({ ne_uketsuke_no: uke, status: cur.sync_status, reason: 'race_or_constraint' });
+      }
+    }
+  });
+  tx();
+  audit('tracking_bulk_teikeigai', null,
+    { input_count: uniqueUkes.length, updated, already_ready: alreadyReady, not_found: notFound,
+      skipped_has_tracking: skippedHasTracking.length,
+      skipped_not_teikeigai: skippedNotTeikeigai.length,
+      skipped_synced: skippedSynced.length,
+      skipped_other: skippedOther.length }, user);
+  return {
+    input_count: uniqueUkes.length,
+    updated, already_ready: alreadyReady, not_found: notFound,
+    skipped_has_tracking: skippedHasTracking.length,
+    skipped_not_teikeigai: skippedNotTeikeigai.length,
+    skipped_synced: skippedSynced.length,
+    skipped_other: skippedOther.length,
+    samples: {
+      has_tracking: skippedHasTracking.slice(0, 10),
+      not_teikeigai: skippedNotTeikeigai.slice(0, 10),
+      synced: skippedSynced.slice(0, 10),
+    },
+  };
+}
+
 // 未マッチ行を pd_shipment_tracking に「反映に含める」(2026-06-04 中原さん指示)。
 //
 // 運用: スタッフが取込履歴詳細モーダルで未マッチ行を見て、NextEngine 側で実在確認した上で

@@ -342,7 +342,31 @@
       <div id="trkImportResult"></div>
     </div>
 
-    <!-- 手動入力 -->
+    <!-- 定形外一覧 (本日アップロード分): チェックボックス + 一括「定形外を反映する」ボタン -->
+    <div class="card" id="trkTeikeigaiCard" style="display:none">
+      <div class="row">
+        <strong>📫 定形外 (本日アップロード分)</strong>
+        <span id="trkTeikeigaiSummary" class="muted"></span>
+        <span style="flex:1"></span>
+        <button class="sub" id="btnTrkTeikeigaiReload">再読込</button>
+      </div>
+      <div class="muted">本日 (JST) アップロードされた取込バッチから、配送方法=定形外の伝票一覧。定形外は追跡番号が無いためキャリアCSVには出ません。チェックを入れて「✅ 定形外として反映する」を押すと、追跡番号なしで NE 反映待ち (ready) に遷移します。</div>
+      <div class="row" style="margin-top:8px">
+        <label><input type="checkbox" id="trkTeikeigaiSelectAll" /> 全選択 / 解除</label>
+        <span style="flex:1"></span>
+        <span id="trkTeikeigaiSelectedCount" class="muted"></span>
+        <button id="btnTrkTeikeigaiApply" style="background:#2e7d32; border-color:#2e7d32">✅ 定形外として反映する</button>
+        <span id="trkTeikeigaiApplyStatus" class="muted"></span>
+      </div>
+      <div class="scroll" style="max-height:40vh; margin-top:8px">
+        <table>
+          <thead><tr><th style="width:32px"></th><th>店舗</th><th>注文番号</th><th>NE受注番号</th><th>宛先</th><th>商品 (数量)</th><th>判定状態</th></tr></thead>
+          <tbody id="trkTeikeigaiBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- 手動入力 (レターパック追跡あり、定形外は上記カードを使用) -->
     <div class="card">
       <div class="row">
         <strong>手動入力 (レターパック / 定形外)</strong>
@@ -353,7 +377,7 @@
         <button class="sub" id="btnTrkManualPaste">一括ペースト</button>
         <span id="trkManualStatus" class="muted"></span>
       </div>
-      <div class="muted">「NE受注番号 タブ または カンマ または スペース 追跡番号」を行ごとに貼り付け。定形外は追跡番号列なしで OK。</div>
+      <div class="muted">「NE受注番号 タブ または カンマ または スペース 追跡番号」を行ごとに貼り付け。定形外は追跡番号列なしで OK。<b>定形外は上の「📫 定形外」カードでチェックして反映する方が早いです。</b></div>
       <textarea id="trkManualText" rows="6" style="width:100%; font-family:monospace; font-size:12px; padding:6px; border:1px solid var(--line); border-radius:5px"
         placeholder="例:&#10;1452297&#9;490356296640&#10;1452370&#9;680467536512"></textarea>
       <div class="row" style="margin-top:6px">
@@ -391,23 +415,6 @@
         <table>
           <thead><tr><th>店舗</th><th>注文番号</th><th>NE受注番号</th><th>宛先</th><th>商品 (数量)</th><th>判定状態</th></tr></thead>
           <tbody id="trkLetterpackBody"></tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- 定形外一覧 (本日アップロード分、確認用) -->
-    <div class="card" id="trkTeikeigaiCard" style="display:none">
-      <div class="row">
-        <strong>📫 定形外 (本日アップロード分)</strong>
-        <span id="trkTeikeigaiSummary" class="muted"></span>
-        <span style="flex:1"></span>
-        <button class="sub" id="btnTrkTeikeigaiReload">再読込</button>
-      </div>
-      <div class="muted">本日 (JST) アップロードされた取込バッチから、配送方法=定形外の伝票一覧。定形外は追跡番号が無いためキャリアCSVには出ません。手動確認用。</div>
-      <div class="scroll" style="max-height:30vh; margin-top:8px">
-        <table>
-          <thead><tr><th>店舗</th><th>注文番号</th><th>NE受注番号</th><th>宛先</th><th>商品 (数量)</th><th>判定状態</th></tr></thead>
-          <tbody id="trkTeikeigaiBody"></tbody>
         </table>
       </div>
     </div>
@@ -1720,8 +1727,9 @@ $('#btnTrkMcDetailClose').onclick = () => $('#trkMcDetailDlg').close();
 // pd_import_line (本日 JST アップロード) ベースで配送方法別の一覧を描画。
 // 中原さん指示 (2026-06-04): 「取込・判定で取り込んで編集した、本日アップロード全バッチの伝票」を見たい。
 // 入力欄や操作ボタンは付けない (一覧表示のみ)。商品名と数量も表示。
-function renderTodayByMethodTable(tbId, rows){
+function renderTodayByMethodTable(tbId, rows, opts = {}){
   const tb = $('#'+tbId); tb.innerHTML = '';
+  const withCheckbox = !!opts.withCheckbox;
   for(const o of rows){
     // items は生文字列で組み (商品名は raw)、出力時に 1 回だけ esc()。数量は常時 ×N で表示。
     const itemsRaw = (o.items || []).map(it =>
@@ -1729,7 +1737,10 @@ function renderTodayByMethodTable(tbId, rows){
     const statusBadge = o.row_status==='要判断'?'<span class="badge b-warn">要判断</span>':
                         o.row_status==='確定'?'<span class="badge b-ok">確定</span>':'<span class="badge b-auto">自動</span>';
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${esc(o.shop_name||'')}</td>`+
+    const cb = withCheckbox
+      ? `<td><input type="checkbox" class="trk-row-check" data-uke="${esc(o.ne_uketsuke_no||'')}" /></td>` : '';
+    tr.innerHTML = cb +
+      `<td>${esc(o.shop_name||'')}</td>`+
       `<td>${esc(o.order_no||'')}</td>`+
       `<td><code>${esc(o.ne_uketsuke_no||'')}</code></td>`+
       `<td>${esc(o.pref||'')} ${esc(o.recipient||'')}</td>`+
@@ -1754,7 +1765,18 @@ async function loadTrkTeikeigai(){
   $('#trkTeikeigaiSummary').textContent = `${rows.length} 件`;
   if(!rows.length){ card.style.display='none'; return; }
   card.style.display='block';
-  renderTodayByMethodTable('trkTeikeigaiBody', rows);
+  renderTodayByMethodTable('trkTeikeigaiBody', rows, { withCheckbox: true });
+  // チェック数のライブ更新 (event delegation で 1 個リスナー)
+  const tb = $('#trkTeikeigaiBody');
+  tb.onchange = updateTeikeigaiSelectedCount;
+  updateTeikeigaiSelectedCount();
+  $('#trkTeikeigaiSelectAll').checked = false;
+}
+function updateTeikeigaiSelectedCount(){
+  const checks = document.querySelectorAll('#trkTeikeigaiBody input.trk-row-check');
+  const checked = Array.from(checks).filter(c => c.checked).length;
+  $('#trkTeikeigaiSelectedCount').textContent = checked > 0 ? `選択中: ${checked} 件` : '';
+  $('#btnTrkTeikeigaiApply').disabled = checked === 0;
 }
 
 async function loadTrkMissing(){
@@ -1782,6 +1804,59 @@ async function loadTrkMissing(){
 $('#btnTrkLetterpackReload').onclick = loadTrkLetterpack;
 $('#btnTrkTeikeigaiReload').onclick = loadTrkTeikeigai;
 $('#btnTrkMissingReload').onclick = loadTrkMissing;
+
+// 定形外: 全選択 / 全解除
+$('#trkTeikeigaiSelectAll').onchange = (e) => {
+  document.querySelectorAll('#trkTeikeigaiBody input.trk-row-check').forEach(c => { c.checked = e.target.checked; });
+  updateTeikeigaiSelectedCount();
+};
+
+// 定形外: チェック行を「定形外として反映する」(専用 bulk endpoint で 1 transaction 内処理)
+// Codex R1 Critical: 既存 tracking_no の上書きを防ぐため setTrackingManual ではなく bulk-apply-teikeigai を使う
+// Codex R1 High: IN 句 999 件上限を避けるため 1 行ずつ UPDATE (サーバ側で実装)
+$('#btnTrkTeikeigaiApply').onclick = async () => {
+  const checks = Array.from(document.querySelectorAll('#trkTeikeigaiBody input.trk-row-check'));
+  const ukes = checks.filter(c => c.checked).map(c => c.dataset.uke).filter(Boolean);
+  const uniqueUkes = [...new Set(ukes)];
+  if(!uniqueUkes.length){ alert('1 行も選択されていません'); return; }
+  if(!confirm(`${uniqueUkes.length} 件を「定形外 (追跡番号なし)」として NE 反映待ち (ready) に追加します。よろしいですか?`)) return;
+  $('#btnTrkTeikeigaiApply').disabled = true;
+  $('#trkTeikeigaiApplyStatus').textContent = '反映中…';
+  try{
+    const r = await api('api/tracking/bulk-apply-teikeigai', { method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ ne_uketsuke_nos: uniqueUkes }) });
+    let msg = `✅ ${r.updated} 件を ready に遷移`;
+    if(r.already_ready > 0) msg += ` / 既 ready ${r.already_ready} 件`;
+    if(r.not_found > 0) msg += ` / 未登録 ${r.not_found} 件`;
+    if(r.skipped_has_tracking > 0) msg += ` / 追跡番号あり skip ${r.skipped_has_tracking} 件`;
+    if(r.skipped_not_teikeigai > 0) msg += ` / 定形外以外 skip ${r.skipped_not_teikeigai} 件`;
+    if(r.skipped_synced > 0) msg += ` / 既反映 skip ${r.skipped_synced} 件`;
+    if(r.skipped_other > 0) msg += ` / その他 skip ${r.skipped_other} 件`;
+    $('#trkTeikeigaiApplyStatus').textContent = msg;
+    // skip 詳細を alert で見せる
+    const samples = r.samples || {};
+    let detail = '';
+    if(samples.has_tracking && samples.has_tracking.length){
+      detail += '追跡番号ありで skip (上書きされません):\n' +
+        samples.has_tracking.map(x => `  - ${x.ne_uketsuke_no}: 既存 ${x.current_tracking_no}`).join('\n') + '\n\n';
+    }
+    if(samples.not_teikeigai && samples.not_teikeigai.length){
+      detail += '配送方法が定形外でないため skip:\n' +
+        samples.not_teikeigai.map(x => `  - ${x.ne_uketsuke_no}: method=${x.method}`).join('\n') + '\n\n';
+    }
+    if(samples.synced && samples.synced.length){
+      detail += '既に NE 反映済 (synced) で skip:\n' +
+        samples.synced.map(x => `  - ${x}`).join('\n');
+    }
+    if(detail) alert(detail.trim());
+    await loadTrackingAll();
+  }catch(e){
+    $('#trkTeikeigaiApplyStatus').textContent = 'エラー: ' + e.message;
+  }finally{
+    $('#btnTrkTeikeigaiApply').disabled = false;
+  }
+};
 
 function trkStatusBadge(status){
   const cfg = TRK_STATUS_LABELS[status] || { label: status, color: '#777' };

@@ -22,7 +22,7 @@ import {
   listTodayImportLinesByMethod,
   getMethodChangeSummary, listMethodChangeLog, purgeOldMethodChangeLog,
   backfillShipmentTrackingFromExportedBatches, deleteRecentTrackingImports,
-  includeUnmatchedToTracking,
+  includeUnmatchedToTracking, bulkApplyTeikeigai,
 } from './service.js';
 import { loadSeed } from './tools/load-shipping-rule-seed.mjs';
 
@@ -245,6 +245,11 @@ router.post('/api/admin/tracking/imports/delete-recent', (req, res) => {
 // admin 限定にはしない (スタッフ運用、ただし audit log は残す)
 router.post('/api/tracking/unmatched/include', (req, res) =>
   handle(res, () => includeUnmatchedToTracking(req.body || {}, currentUser(req))));
+
+// 定形外一括反映 (本日アップロード分の定形外 NE 受注番号を ready 化、Codex R1 Critical+High 対応)
+// body: { ne_uketsuke_nos: [...] }
+router.post('/api/tracking/bulk-apply-teikeigai', (req, res) =>
+  handle(res, () => bulkApplyTeikeigai(req.body || {}, currentUser(req))));
 
 // 取込履歴
 router.get('/api/tracking/imports', (req, res) => handle(res, () => listTrackingImports()));
