@@ -782,6 +782,40 @@
   </div>
 </dialog>
 
+<!-- 取込結果 詳細ダイアログ (未マッチ/競合の NE受注番号 + 注文内容) -->
+<dialog id="trkImpDetailDlg" style="width:min(1100px,95vw)">
+  <div class="dh">📋 CSV 取込結果 詳細</div>
+  <div class="db">
+    <div class="row">
+      <span class="muted">取込元: <b id="trkImpDetailSource"></b></span>
+      <span class="muted">ファイル: <b id="trkImpDetailFile"></b></span>
+      <span class="muted">取込日時: <b id="trkImpDetailDt"></b></span>
+    </div>
+    <div class="muted" style="margin-top:8px">未マッチ = pd_shipment_tracking に該当 NE 受注番号がない / 競合 = 既存追跡番号と異なる値。注文内容は pd_shipment_tracking → 過去 48h の pd_import_line の順で検索。</div>
+    <div id="trkImpDetailUnmatchedWrap" style="margin-top:12px">
+      <strong style="color:#c0392b">❌ 未マッチ</strong>
+      <div class="scroll" style="max-height:35vh; margin-top:4px">
+        <table>
+          <thead><tr><th>NE受注番号</th><th>追跡番号</th><th>店舗</th><th>注文番号</th><th>商品 (コード+名称+数量)</th><th>備考</th></tr></thead>
+          <tbody id="trkImpDetailUnmatchedBody"></tbody>
+        </table>
+      </div>
+    </div>
+    <div id="trkImpDetailConflictWrap" style="margin-top:12px">
+      <strong style="color:#e67e22">⚠️ 競合</strong>
+      <div class="scroll" style="max-height:35vh; margin-top:4px">
+        <table>
+          <thead><tr><th>NE受注番号</th><th>既存追跡番号</th><th>新追跡番号</th><th>店舗</th><th>注文番号</th><th>商品 (コード+名称+数量)</th></tr></thead>
+          <tbody id="trkImpDetailConflictBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <div class="df">
+    <button class="sub" id="btnTrkImpDetailClose">閉じる</button>
+  </div>
+</dialog>
+
 <!-- ロールバック確認ダイアログ -->
 <dialog id="rollbackDlg">
   <div class="dh">⚠️ メルトライン移行のロールバック</div>
@@ -1829,13 +1863,63 @@ async function loadTrkImports(){
       try{
         const d = await api(`api/tracking/imports/${encodeURIComponent(btn.dataset.trkImpDetail)}`);
         if(!d || !d.detail) return alert('詳細データなし');
-        const um = (d.detail.unmatched||[]).map(x => `  - ${x.ne_uketsuke_no} (${x.tracking_no})`).join('\n');
-        const cf = (d.detail.conflict||[]).map(x => `  - ${x.ne_uketsuke_no}: 既存=${x.current} / 新=${x.incoming}`).join('\n');
-        alert(`未マッチ (${d.unmatched_count}件):\n${um||'  なし'}\n\n競合 (${d.conflict_count}件):\n${cf||'  なし'}`);
+        openTrkImportDetailDialog(d);
       }catch(e){ alert('エラー: '+e.message); }
     };
   });
 }
+
+// 取込履歴 詳細ダイアログを開く (中原さん 2026-06-04 要望: 未マッチ/競合の注文内容可視化)
+function openTrkImportDetailDialog(d){
+  $('#trkImpDetailSource').textContent = d.source || '';
+  $('#trkImpDetailFile').textContent = d.filename || '';
+  $('#trkImpDetailDt').textContent = utcIsoToJst(d.imported_at);
+  const detail = d.detail || {};
+  const um = detail.unmatched || [];
+  const cf = detail.conflict || [];
+  const umTotal = detail.unmatched_total != null ? detail.unmatched_total : (d.unmatched_count || 0);
+  const cfTotal = detail.conflict_total != null ? detail.conflict_total : (d.conflict_count || 0);
+  const sampleLimit = detail.sample_limit || 50;
+  const truncNote = (total) => total > sampleLimit
+    ? ` <span style="color:#c0392b">(全 ${total} 件中、サンプル最大 ${sampleLimit} 件表示)</span>`
+    : '';
+  // 件数ラベル
+  document.querySelector('#trkImpDetailUnmatchedWrap strong').innerHTML = `❌ 未マッチ (${umTotal} 件)${truncNote(umTotal)}`;
+  document.querySelector('#trkImpDetailConflictWrap strong').innerHTML = `⚠️ 競合 (${cfTotal} 件)${truncNote(cfTotal)}`;
+  // 未マッチ行
+  $('#trkImpDetailUnmatchedBody').innerHTML = um.length
+    ? um.map(x => {
+        const e = x.enrich || {};
+        return `<tr>
+          <td><code>${esc(x.ne_uketsuke_no || '')}</code></td>
+          <td>${esc(x.tracking_no || '')}</td>
+          <td>${esc(e.shop_name || '')}</td>
+          <td>${esc(e.order_no || '')}</td>
+          <td>${esc(e.product_summary || '')}</td>
+          <td>${esc(x.note || (e ? '' : 'enrich なし (TTL 切れ?)'))}</td>
+        </tr>`;
+      }).join('')
+    : '<tr><td colspan="6" class="muted">未マッチなし</td></tr>';
+  $('#trkImpDetailUnmatchedWrap').style.display = um.length ? 'block' : 'none';
+  // 競合行
+  $('#trkImpDetailConflictBody').innerHTML = cf.length
+    ? cf.map(x => {
+        const e = x.enrich || {};
+        return `<tr>
+          <td><code>${esc(x.ne_uketsuke_no || '')}</code></td>
+          <td>${esc(x.current || '')}</td>
+          <td>${esc(x.incoming || '')}</td>
+          <td>${esc(e.shop_name || '')}</td>
+          <td>${esc(e.order_no || '')}</td>
+          <td>${esc(e.product_summary || '')}</td>
+        </tr>`;
+      }).join('')
+    : '<tr><td colspan="6" class="muted">競合なし</td></tr>';
+  $('#trkImpDetailConflictWrap').style.display = cf.length ? 'block' : 'none';
+  $('#trkImpDetailDlg').showModal();
+}
+const _trkImpDetailClose = $('#btnTrkImpDetailClose');
+if(_trkImpDetailClose) _trkImpDetailClose.onclick = () => $('#trkImpDetailDlg').close();
 
 // CSV 取込ボタン
 document.querySelectorAll('[data-trk-import]').forEach(btn => {
@@ -1905,7 +1989,18 @@ function renderTrkImportResult(res){
     html += `<div class="muted" style="margin-top:6px">競合サンプル (最大10):</div><ul>` +
       res.conflict_samples.map(x => `<li>${esc(x.ne_uketsuke_no)}: 既存=${esc(x.current)} / 新=${esc(x.incoming)}</li>`).join('') + `</ul>`;
   }
+  if((res.unmatched_count > 0 || res.conflict_count > 0) && res.import_id){
+    html += `<div style="margin-top:8px"><button class="sub" id="btnTrkImportResultDetail" data-imp-id="${esc(res.import_id)}">📋 注文内容まで詳細を見る</button></div>`;
+  }
   box.innerHTML = html;
+  const dbtn = $('#btnTrkImportResultDetail');
+  if(dbtn) dbtn.onclick = async () => {
+    try{
+      const d = await api(`api/tracking/imports/${encodeURIComponent(dbtn.dataset.impId)}`);
+      if(!d || !d.detail) return alert('詳細データなし');
+      openTrkImportDetailDialog(d);
+    }catch(e){ alert('エラー: '+e.message); }
+  };
 }
 
 // 手動入力
