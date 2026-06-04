@@ -333,6 +333,58 @@
       </div>
     </div>
 
+    <!-- ⚠️ 追跡番号未割当アラート (定形外/レターパック以外で tracking_no がない pending/error) -->
+    <div class="card" id="trkMissingCard" style="background:#fff5f5; border-color:#f5c6cb; display:none">
+      <div class="row">
+        <strong style="color:#c0392b">⚠️ 追跡番号未割当アラート</strong>
+        <span id="trkMissingSummary" class="muted"></span>
+        <span style="flex:1"></span>
+        <button class="sub" id="btnTrkMissingReload">再読込</button>
+      </div>
+      <div class="muted">定形外・レターパック以外で、CSV からも紐付けされていない伝票です。キャリア CSV を再取込するか、個別に確認してください。</div>
+      <div class="scroll" style="max-height:30vh; margin-top:8px">
+        <table>
+          <thead><tr><th>配送方法</th><th>NE受注番号</th><th>店舗</th><th>注文番号</th><th>状態</th><th>更新</th></tr></thead>
+          <tbody id="trkMissingBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- レターパック一覧 (追跡番号入力) -->
+    <div class="card" id="trkLetterpackCard" style="display:none">
+      <div class="row">
+        <strong>📮 レターパック (追跡番号を入力)</strong>
+        <span id="trkLetterpackSummary" class="muted"></span>
+        <span style="flex:1"></span>
+        <button class="sub" id="btnTrkLetterpackReload">再読込</button>
+      </div>
+      <div class="muted">レターパックは CSV 取込ができないため、ここで 1 件ずつ追跡番号を入力してください。保存ボタンで確定。</div>
+      <div class="scroll" style="max-height:40vh; margin-top:8px">
+        <table>
+          <thead><tr><th>状態</th><th>NE受注番号</th><th>店舗</th><th>注文番号</th><th>追跡番号</th><th>操作</th></tr></thead>
+          <tbody id="trkLetterpackBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- 定形外一覧 (追跡番号なし、配送方法だけ NE 反映) -->
+    <div class="card" id="trkTeikeigaiCard" style="display:none">
+      <div class="row">
+        <strong>📫 定形外 (追跡番号なし、配送方法だけ NE 反映)</strong>
+        <span id="trkTeikeigaiSummary" class="muted"></span>
+        <span style="flex:1"></span>
+        <button class="sub" id="btnTrkTeikeigaiReload">再読込</button>
+        <button id="btnTrkTeikeigaiMarkAll">📤 pending 全件を「追跡なし」マーク</button>
+      </div>
+      <div class="muted">定形外は追跡番号が無い前提で、配送方法だけ NE 反映します。「pending 全件マーク」を押すと、まだ未紐付け (pending) の定形外を一括で no_tracking として ready 化準備します。既にマーク済み (tracking_source=no_tracking) は対象外。</div>
+      <div class="scroll" style="max-height:30vh; margin-top:8px">
+        <table>
+          <thead><tr><th>状態</th><th>NE受注番号</th><th>店舗</th><th>注文番号</th><th>取込元</th><th>更新</th></tr></thead>
+          <tbody id="trkTeikeigaiBody"></tbody>
+        </table>
+      </div>
+    </div>
+
     <!-- 一覧 + フィルタ + 一括操作 -->
     <div class="card">
       <div class="row">
@@ -1360,10 +1412,137 @@ async function loadTrackingAll(){
   try{
     const sum = await api('api/tracking/summary');
     trkRenderSummary(sum);
-    await loadTrackingList();
-    await loadTrkImports();
+    await Promise.all([
+      loadTrackingList(),
+      loadTrkImports(),
+      loadTrkLetterpack(),
+      loadTrkTeikeigai(),
+      loadTrkMissing(),
+    ]);
   }catch(e){ console.error('[tracking]', e.message); }
 }
+
+// ─── 配送方法別一覧 (レターパック / 定形外) + アラート ───
+
+async function loadTrkLetterpack(){
+  const rows = await api('api/tracking/by-method?method=letterpack');
+  const card = $('#trkLetterpackCard');
+  $('#trkLetterpackSummary').textContent = `${rows.length} 件`;
+  if(!rows.length){ card.style.display='none'; return; }
+  card.style.display='block';
+  const tb = $('#trkLetterpackBody'); tb.innerHTML = '';
+  for(const r of rows){
+    const tr = document.createElement('tr');
+    const trkVal = esc(r.tracking_no || '');
+    tr.innerHTML = `<td>${trkStatusBadge(r.sync_status)}</td>`+
+      `<td><code>${esc(r.ne_uketsuke_no)}</code></td>`+
+      `<td>${esc(r.shop_name||'')}</td>`+
+      `<td>${esc(r.order_no||'')}</td>`+
+      `<td><input type="text" data-trk-lp-input="${esc(r.ne_uketsuke_no)}" value="${trkVal}" placeholder="追跡番号" style="width:200px" /></td>`+
+      `<td><button class="sub" data-trk-lp-save="${esc(r.ne_uketsuke_no)}">保存</button>`+
+      ` <button class="sub" data-trk-skip="${esc(r.ne_uketsuke_no)}">欠品</button>`+
+      `<span class="muted" data-trk-lp-msg="${esc(r.ne_uketsuke_no)}" style="margin-left:6px"></span></td>`;
+    tb.appendChild(tr);
+  }
+  tb.querySelectorAll('button[data-trk-lp-save]').forEach(btn => {
+    btn.onclick = async () => {
+      const uke = btn.dataset.trkLpSave;
+      const e_uke = CSS.escape(uke);
+      const input = $(`input[data-trk-lp-input="${e_uke}"]`);
+      const msg = $(`[data-trk-lp-msg="${e_uke}"]`);
+      const trk = (input.value||'').trim();
+      if(!trk){ msg.textContent = '追跡番号が空'; msg.style.color='#c0392b'; return; }
+      msg.textContent = '保存中…'; msg.style.color='#777';
+      try{
+        const r = await api('api/tracking/set-one', { method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ ne_uketsuke_no: uke, tracking_no: trk, source: 'manual_letterpack' })});
+        if(r.status === 'conflict'){
+          msg.textContent = `競合: 既存=${r.existing}`; msg.style.color='#e67e22';
+        } else {
+          msg.textContent = '保存OK'; msg.style.color='#2e7d32';
+        }
+        // サマリだけ更新 (この行の reload はしない、保存メッセージを残す)
+        try { trkRenderSummary(await api('api/tracking/summary')); } catch{}
+        try { await loadTrkMissing(); } catch{}
+      }catch(e){ msg.textContent = 'エラー: '+e.message; msg.style.color='#c0392b'; }
+    };
+  });
+  tb.querySelectorAll('button[data-trk-skip]').forEach(btn => {
+    btn.onclick = async () => {
+      const reason = prompt('対象外にする理由を入力 (例: 欠品)', '欠品');
+      if(!reason) return;
+      try{
+        await api('api/tracking/mark-skipped', { method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ ids:[btn.dataset.trkSkip], reason })});
+        await loadTrackingAll();
+      }catch(e){ alert('エラー: '+e.message); }
+    };
+  });
+}
+
+async function loadTrkTeikeigai(){
+  const rows = await api('api/tracking/by-method?method=teikeigai');
+  const card = $('#trkTeikeigaiCard');
+  $('#trkTeikeigaiSummary').textContent = `${rows.length} 件`;
+  if(!rows.length){ card.style.display='none'; return; }
+  card.style.display='block';
+  const tb = $('#trkTeikeigaiBody'); tb.innerHTML = '';
+  for(const r of rows){
+    const tr = document.createElement('tr');
+    const upd = (r.updated_at || r.added_at || '').replace('T',' ').slice(0,16);
+    tr.innerHTML = `<td>${trkStatusBadge(r.sync_status)}</td>`+
+      `<td><code>${esc(r.ne_uketsuke_no)}</code></td>`+
+      `<td>${esc(r.shop_name||'')}</td>`+
+      `<td>${esc(r.order_no||'')}</td>`+
+      `<td class="muted">${esc(r.tracking_source||'')}</td>`+
+      `<td class="muted">${esc(upd)}</td>`;
+    tb.appendChild(tr);
+  }
+}
+
+$('#btnTrkTeikeigaiMarkAll').onclick = async () => {
+  if(!confirm('定形外の pending を全て「追跡番号なし (no_tracking)」としてマークし、「これで NE 反映する」で ready 化可能にします。よろしいですか?')) return;
+  try{
+    // 一覧から pending な ne_uketsuke_no を集めて、setTrackingManual で一括 no_tracking 化
+    const rows = await api('api/tracking/by-method?method=teikeigai');
+    const targets = rows.filter(r => r.sync_status === 'pending' && !r.tracking_source);
+    if(!targets.length){ alert('対象がありません (既にマーク済みの可能性)'); return; }
+    const entries = targets.map(r => ({ ne_uketsuke_no: r.ne_uketsuke_no, tracking_no: '' }));
+    const r = await api('api/tracking/manual', { method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ source: 'no_tracking', entries })});
+    alert(`定形外マーク完了: ${r.updated} 件`);
+    await loadTrackingAll();
+  }catch(e){ alert('エラー: '+e.message); }
+};
+
+async function loadTrkMissing(){
+  const result = await api('api/tracking/missing');
+  const card = $('#trkMissingCard');
+  if(!result.total){ card.style.display='none'; return; }
+  card.style.display='block';
+  const byMethod = Object.entries(result.by_method)
+    .map(([m,c]) => `${esc(methodName(m))}: ${c}件`).join(' / ');
+  $('#trkMissingSummary').innerHTML = `<b style="color:#c0392b">${result.total} 件</b> ${byMethod ? '('+byMethod+')' : ''}`;
+  const tb = $('#trkMissingBody'); tb.innerHTML = '';
+  for(const r of result.rows){
+    const tr = document.createElement('tr');
+    const upd = (r.updated_at || r.added_at || '').replace('T',' ').slice(0,16);
+    tr.innerHTML = `<td>${esc(methodName(r.shipping_method_code))}</td>`+
+      `<td><code>${esc(r.ne_uketsuke_no)}</code></td>`+
+      `<td>${esc(r.shop_name||'')}</td>`+
+      `<td>${esc(r.order_no||'')}</td>`+
+      `<td>${trkStatusBadge(r.sync_status)}</td>`+
+      `<td class="muted">${esc(upd)}</td>`;
+    tb.appendChild(tr);
+  }
+}
+
+$('#btnTrkLetterpackReload').onclick = loadTrkLetterpack;
+$('#btnTrkTeikeigaiReload').onclick = loadTrkTeikeigai;
+$('#btnTrkMissingReload').onclick = loadTrkMissing;
 
 function trkStatusBadge(status){
   const cfg = TRK_STATUS_LABELS[status] || { label: status, color: '#777' };

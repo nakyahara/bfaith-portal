@@ -1121,6 +1121,86 @@ export function getTrackingImportDetail(import_id) {
   return { ...row, detail: row.detail_json ? JSON.parse(row.detail_json) : null };
 }
 
+// 配送方法別の一覧 (定形外/レターパック など、特定方法だけ抽出)。
+// 「未完了」= synced (NE反映済) / skipped (欠品) を除外したもの。
+// 当日の伝票だけ見たい場合も、運用上は exportCsv で前日以前の synced は速やかに処理されるので、
+// 「未完了」=「実質その日の作業対象」と一致する。
+export function listTrackingByMethod(method) {
+  if (!method) throw vErr('method を指定してください');
+  const db = ensureSchema();
+  return db.prepare(`SELECT * FROM pd_shipment_tracking
+    WHERE shipping_method_code = ?
+      AND sync_status NOT IN ('synced','skipped')
+    ORDER BY added_at DESC, ne_uketsuke_no
+    LIMIT 5000`).all(method);
+}
+
+// 追跡番号未割当アラート: 配送方法が「定形外」「レターパック」以外で tracking_no が NULL の
+// pending/error 伝票。CSV から自動紐付けされるはずだが、CSV にない or 紐付け失敗のケース。
+// (ready 状態は tracking_no セット済 or no_tracking なので含めない)
+export function listMissingTracking() {
+  const db = ensureSchema();
+  const rows = db.prepare(`SELECT * FROM pd_shipment_tracking
+    WHERE shipping_method_code NOT IN ('teikeigai','letterpack','aes')
+      AND tracking_no IS NULL
+      AND sync_status IN ('pending','error')
+    ORDER BY shipping_method_code, added_at DESC, ne_uketsuke_no
+    LIMIT 5000`).all();
+  // 配送方法別の件数も併せて返す (アラート表示用)
+  const byMethod = {};
+  for (const r of rows) byMethod[r.shipping_method_code] = (byMethod[r.shipping_method_code] || 0) + 1;
+  return { rows, total: rows.length, by_method: byMethod };
+}
+
+// レターパック (or 定形外) の追跡番号を 1 件設定。
+// レターパック → tracking_no 必須、source='manual_letterpack'、shipping_method=letterpack のみ
+// 定形外 → tracking_no 不要 (no_tracking、配送方法だけ NE 反映)、shipping_method=teikeigai のみ
+// 既存 tracking_no と異なる場合は conflict 扱い (sync_status='conflict')。
+// pending/ready/error/conflict/manual_review は更新可、syncing/synced/skipped は不可。
+// 更新成功時は sync_status='pending' にリセット (error/conflict 修正パスを兼ねる)、last_error クリア。
+export function setTrackingOne({ ne_uketsuke_no, tracking_no, source }, user) {
+  const uke = norm(ne_uketsuke_no);
+  if (!uke) throw vErr('ne_uketsuke_no が空です');
+  const SOURCE_TO_METHOD = { manual_letterpack: 'letterpack', no_tracking: 'teikeigai' };
+  const requiredMethod = SOURCE_TO_METHOD[source];
+  if (!requiredMethod) throw vErr(`source は ${Object.keys(SOURCE_TO_METHOD).join(' / ')} のいずれか`);
+  const trk = source === 'no_tracking' ? null : norm(tracking_no);
+  if (source === 'manual_letterpack' && !trk) throw vErr('レターパックは追跡番号が必要です');
+  const db = ensureSchema();
+  const now = utcIsoNow();
+  const cur = db.prepare(`SELECT shipping_method_code, tracking_no, sync_status
+    FROM pd_shipment_tracking WHERE ne_uketsuke_no=?`).get(uke);
+  if (!cur) throw vErr('該当の伝票が見つかりません');
+  // 配送方法ガード (CSV取込→紐付けと整合する source のみ受け付ける)
+  if (cur.shipping_method_code !== requiredMethod) {
+    throw vErr(`source=${source} は ${requiredMethod} の伝票にのみ使えます (この伝票=${cur.shipping_method_code})`);
+  }
+  // 更新可能な状態のみ受け付ける
+  const editableStatuses = ['pending', 'ready', 'error', 'conflict', 'manual_review'];
+  if (!editableStatuses.includes(cur.sync_status)) {
+    throw vErr(`状態が ${cur.sync_status} のため変更できません (編集可: ${editableStatuses.join(',')})`);
+  }
+  if (cur.tracking_no && trk && cur.tracking_no !== trk) {
+    db.prepare(`UPDATE pd_shipment_tracking
+      SET sync_status='conflict', last_error=?, updated_at=?, updated_by=?
+      WHERE ne_uketsuke_no=? AND sync_status NOT IN ('synced','syncing','skipped')`).run(
+      `既存=${cur.tracking_no} / 新=${trk} (source=${source})`, now, user || null, uke);
+    audit('tracking_set_one_conflict', uke, { source, existing: cur.tracking_no, incoming: trk }, user);
+    return { status: 'conflict', message: '既存の追跡番号と異なるため conflict として記録しました', existing: cur.tracking_no };
+  }
+  // 通常更新: sync_status を pending に戻す + last_error / claim 系をクリア (error/conflict 修正経路)
+  db.prepare(`UPDATE pd_shipment_tracking
+    SET tracking_no=?, tracking_source=?,
+        sync_status='pending', sync_requested_at=NULL,
+        last_error=NULL, last_error_code=NULL,
+        claim_id=NULL, syncing_started_at=NULL, claim_expires_at=NULL, claim_attempt_count=0,
+        updated_at=?, updated_by=?
+    WHERE ne_uketsuke_no=? AND sync_status NOT IN ('synced','syncing','skipped')`)
+    .run(trk, source, now, user || null, uke);
+  audit('tracking_set_one', uke, { source, has_tracking: !!trk }, user);
+  return { status: 'ok' };
+}
+
 // ───────────────────────── マスタ移行 (manual → meltline 一括書き換え) ─────────────────────────
 //
 // 目的: 2026-06-03 の meltline 本稼働に合わせ、既存「ネコポス × 手動出荷」設定を「ネコポス × meltline」

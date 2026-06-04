@@ -18,6 +18,7 @@ import {
   listMeltlineBackups, readMeltlineBackup,
   importTrackingCsv, setTrackingManual, markReady, markSkipped,
   trackingSummary, listTracking, listTrackingImports, getTrackingImportDetail,
+  listTrackingByMethod, listMissingTracking, setTrackingOne,
 } from './service.js';
 import { loadSeed } from './tools/load-shipping-rule-seed.mjs';
 
@@ -187,6 +188,15 @@ router.get('/api/tracking/summary', (req, res) => handle(res, () => trackingSumm
 router.get('/api/tracking', (req, res) => handle(res, () => listTracking({
   status: req.query.status, source: req.query.source, shop: req.query.shop, q: req.query.q,
 })));
+
+// 配送方法別一覧 (定形外/レターパック 等の特定方法だけ抽出、synced/skipped 除外)
+router.get('/api/tracking/by-method', (req, res) => handle(res, () => listTrackingByMethod(req.query.method)));
+
+// 追跡番号未割当アラート (定形外/レターパック/AES 以外で tracking_no が NULL の pending/error)
+router.get('/api/tracking/missing', (req, res) => handle(res, () => listMissingTracking()));
+
+// レターパック 1 件保存 (body: { ne_uketsuke_no, tracking_no, source })
+router.post('/api/tracking/set-one', (req, res) => handle(res, () => setTrackingOne(req.body || {}, currentUser(req))));
 
 // 取込履歴
 router.get('/api/tracking/imports', (req, res) => handle(res, () => listTrackingImports()));
