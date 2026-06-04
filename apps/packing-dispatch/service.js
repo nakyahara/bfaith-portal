@@ -12,7 +12,7 @@ import {
   recordAssortUsage, comboKeysByOrderRef, getAssortByCombo, purgeOldUsage,
   COL, MALL_GROUPS, COMBO_KEY_VERSION,
 } from './db.js';
-import { parseNeCsv, buildNeCsv } from './csv.js';
+import { parseNeCsv, buildNeCsv, decodeCp932 } from './csv.js';
 
 const BATCH_TTL_HOURS = 48; // 揮発: 取込から48h で自動削除対象
 
@@ -457,14 +457,82 @@ export function exportCsv(batch_id, user, opts = {}) {
     return raw;
   });
 
-  // CAS で exported へ (二重出力防止)
-  const cas = db.prepare(`UPDATE pd_import_batch SET status='exported' WHERE batch_id=? AND status IN ('classifying','locked_for_export')`)
-    .run(batch_id);
-  if (cas.changes === 0) throw vErr('このバッチは既に出力済みか、状態が変わっています');
-
+  // buffer 生成は副作用なしなので CAS の前に済ませる (失敗してもユーザー操作は復活可能)。
   const buf = buildNeCsv(headerRow, outRows);
+
+  // CAS で exported へ (二重出力防止) + tracking UPSERT を 1 transaction に。
+  // どちらか失敗したら状態は変えず、ユーザーが再試行できる状態にする。
+  const tx = db.transaction(() => {
+    const cas = db.prepare(`UPDATE pd_import_batch SET status='exported' WHERE batch_id=? AND status IN ('classifying','locked_for_export')`)
+      .run(batch_id);
+    if (cas.changes === 0) throw vErr('このバッチは既に出力済みか、状態が変わっています');
+    // pd_shipment_tracking に登録 (CSV 出力した伝票だけが NE 反映対象)。
+    // 同一 ne_uketsuke_no (col 20) を伝票単位で 1 行に集約。AES は対象外 (NE 側で別管理)。
+    // synced 済み (=既に NE 反映完了) は触らない、それ以外は pending リセット + 追跡番号クリア。
+    registerShipmentTrackingFromBatch(db, lineRows, user);
+  });
+  tx();
+
   audit('export', batch_id, { rows: outRows.length }, user);
   return { buffer: buf, rowCount: outRows.length };
+}
+
+// CSV 出力時に各伝票を pd_shipment_tracking に UPSERT。NE 受注番号 (col 20) で 1 行に集約。
+function registerShipmentTrackingFromBatch(db, lineRows, user) {
+  const now = utcIsoNow();
+  // 伝票単位に集約 (同一 shop+order_no の最初の line から代表値を取る)
+  const byUketsuke = new Map();
+  for (const l of lineRows) {
+    if (!l.shipping_method_code || l.shipping_method_code === 'aes') continue;
+    const raw = JSON.parse(l.raw_cols || '[]');
+    const uke = norm(raw[COL.uketsuke]);
+    if (!uke) continue;
+    if (byUketsuke.has(uke)) continue; // 最初の line だけ採用 (伝票内で代表値は同じ)
+    byUketsuke.set(uke, {
+      ne_uketsuke_no: uke,
+      shipping_method_code: l.shipping_method_code,
+      shop_name: l.shop_name,
+      order_no: l.order_no,
+    });
+  }
+  if (!byUketsuke.size) return 0;
+  // synced 済みは触らない。それ以外 (pending/ready/error/conflict/skipped/syncing/manual_review)
+  // は最新値で上書き + sync_status を pending にリセット + 追跡番号/エラー/claim 系を全クリア。
+  // 出力をやり直したらキャリア CSV から再紐付け必要。古いデータが残って NE 反映に混入するのを防ぐ。
+  const upsert = db.prepare(`
+    INSERT INTO pd_shipment_tracking
+      (ne_uketsuke_no, shipping_method_code, shop_name, order_no,
+       sync_status, added_at, added_by, updated_at, updated_by)
+    VALUES (?,?,?,?, 'pending', ?, ?, ?, ?)
+    ON CONFLICT(ne_uketsuke_no) DO UPDATE SET
+      shipping_method_code = excluded.shipping_method_code,
+      shop_name = excluded.shop_name,
+      order_no = excluded.order_no,
+      sync_status = 'pending',
+      tracking_no = NULL,
+      tracking_source = NULL,
+      sync_requested_at = NULL,
+      claim_id = NULL,
+      claim_token_hash = NULL,
+      syncing_started_at = NULL,
+      claim_expires_at = NULL,
+      claim_attempt_count = 0,
+      last_error = NULL,
+      last_error_code = NULL,
+      ne_last_modified_date = NULL,
+      ne_synced_at = NULL,
+      skip_reason = NULL,
+      updated_at = excluded.updated_at,
+      updated_by = excluded.updated_by
+    WHERE pd_shipment_tracking.sync_status != 'synced'
+  `);
+  let n = 0;
+  for (const t of byUketsuke.values()) {
+    upsert.run(t.ne_uketsuke_no, t.shipping_method_code, t.shop_name, t.order_no,
+      now, user || null, now, user || null);
+    n++;
+  }
+  return n;
 }
 
 function audit(action, target, detail, who) {
@@ -727,6 +795,331 @@ export function purgeExpiredBatches() {
 }
 
 export { listUnregistered, mirrorFreshness };
+
+// ═══════════════════════════════════════════════════════════════════
+//  追跡番号 / NE反映 (PR 1: CSV取込 + 一覧 + 手動入力 + ready 遷移)
+//  PR 2/3 で sync-queue/result API + ミニPC CLI が後続。
+// ═══════════════════════════════════════════════════════════════════
+
+// ─── CSV パーサ ───
+
+// キャリア CSV のエンコーディング検出 (ヤマト B2 = Shift-JIS / ゆうパケパフ = UTF-8 が多い)。
+// 戦略: ① BOM ありなら UTF-8 ② TextDecoder('utf-8', {fatal:true}) で全バイトが妥当なら UTF-8
+// ③ ダメなら CP932 (Shift-JIS)。byte 頻度判定は誤判定が多いので使わない (Codex指摘の Round1)。
+function detectAndDecodeCsv(buffer) {
+  if (buffer.length >= 3 && buffer[0] === 0xEF && buffer[1] === 0xBB && buffer[2] === 0xBF) {
+    return buffer.slice(3).toString('utf8');
+  }
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(buffer);
+  } catch {
+    return decodeCp932(buffer); // csv.js の iconv-lite 経由
+  }
+}
+
+// RFC4180 風パーサ (csv.js の parseCsv とロジック同等、こちらは独立コピーで decode 分離)
+function parseCsvText(text) {
+  const rows = [];
+  let row = [], field = '', inQuotes = false, i = 0;
+  const n = text.length;
+  while (i < n) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i += 2; continue; }
+        inQuotes = false; i++; continue;
+      }
+      field += c; i++; continue;
+    }
+    if (c === '"') { inQuotes = true; i++; continue; }
+    if (c === ',') { row.push(field); field = ''; i++; continue; }
+    if (c === '\r') { i++; continue; }
+    if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; i++; continue; }
+    field += c; i++;
+  }
+  if (field.length > 0 || row.length > 0) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+// ヤマト B2 出力 CSV: col 31 = 荷扱い1 (NE伝票番号 = ne_uketsuke_no), col 3 = 伝票番号 (追跡番号)
+function parseYamatoB2Csv(buffer) {
+  const text = detectAndDecodeCsv(buffer);
+  const rows = parseCsvText(text);
+  if (!rows.length) return { rows: [], errors: ['CSV が空です'] };
+  // ヤマト B2 はヘッダ行あり。1 行目をスキップしてデータ行のみ。
+  const header = rows[0];
+  // 最低限のヘッダ検証 (列数 + col 0 が「お客様管理番号」)
+  const errors = [];
+  if (header.length < 32) errors.push(`列数が想定外 (期待 ≥32、実際 ${header.length})。ヤマト B2 のフォーマットが変わった可能性があります。`);
+  if (header[3] !== '伝票番号') errors.push(`col 3 が「伝票番号」ではありません (実際: ${header[3]})`);
+  if (header[31] !== '荷扱い１' && header[31] !== '荷扱い1') errors.push(`col 31 が「荷扱い1」ではありません (実際: ${header[31]})`);
+  const dataRows = rows.slice(1).filter(r => r.length > 3 && (r[3] || r[31]));
+  const items = dataRows.map((r, i) => ({
+    row_no: i + 2,
+    ne_uketsuke_no: norm(r[31]),    // 荷扱い1
+    tracking_no: norm(r[3]),         // 伝票番号
+    raw: r,
+  })).filter(x => x.ne_uketsuke_no && x.tracking_no);
+  return { rows: items, errors, header };
+}
+
+// ゆうパケットパフ CSV (ゆうプリR 出力): お客様側管理番号 / お問い合わせ番号
+function parseYupacketpuffCsv(buffer) {
+  const text = detectAndDecodeCsv(buffer);
+  const rows = parseCsvText(text);
+  if (!rows.length) return { rows: [], errors: ['CSV が空です'] };
+  const header = rows[0];
+  const errors = [];
+  // ヘッダから列番号を引く
+  const findIdx = (name) => header.findIndex(h => norm(h).replace(/\s+/g, '') === norm(name).replace(/\s+/g, ''));
+  const idxUke = findIdx('お客様側管理番号');
+  const idxTrack = findIdx('お問い合わせ番号');
+  if (idxUke < 0) errors.push('「お客様側管理番号」列が見つかりません');
+  if (idxTrack < 0) errors.push('「お問い合わせ番号」列が見つかりません');
+  if (idxUke < 0 || idxTrack < 0) return { rows: [], errors, header };
+  const dataRows = rows.slice(1).filter(r => r.length > Math.max(idxUke, idxTrack) && (r[idxUke] || r[idxTrack]));
+  const items = dataRows.map((r, i) => ({
+    row_no: i + 2,
+    ne_uketsuke_no: norm(r[idxUke]),
+    tracking_no: norm(r[idxTrack]),
+    raw: r,
+  })).filter(x => x.ne_uketsuke_no && x.tracking_no);
+  return { rows: items, errors, header };
+}
+
+const TRACKING_PARSERS = {
+  yamato_b2: parseYamatoB2Csv,
+  yamato_b2_50: parseYamatoB2Csv,    // 50 サイズ専用も同フォーマット
+  yupacketpuff: parseYupacketpuffCsv,
+};
+
+// ─── CSV 取込 (キャリア CSV → pd_shipment_tracking 紐付け) ───
+
+// source: 'yamato_b2' | 'yamato_b2_50' | 'yupacketpuff'
+// 動作: CSV パース → file_hash 重複チェック → ne_uketsuke_no で pd_shipment_tracking 検索 →
+//       マッチしたら tracking_no 紐付け (sync_status=pending のまま、ready 化は別アクション)。
+//       既存 tracking_no と異なれば conflict。マッチしなければ unmatched としてカウント。
+export function importTrackingCsv({ source, buffer, filename }, user) {
+  if (!TRACKING_PARSERS[source]) throw vErr(`未知の source: ${source}`);
+  const parser = TRACKING_PARSERS[source];
+  const parsed = parser(buffer);
+  if (parsed.errors && parsed.errors.length) {
+    throw vErr('CSV の解析に失敗しました', { errors: parsed.errors });
+  }
+  if (!parsed.rows.length) {
+    return { import_id: null, source, row_count: 0, matched_count: 0, unmatched_count: 0, conflict_count: 0,
+      duplicate: false, message: 'データ行がありません' };
+  }
+  const db = ensureSchema();
+  // file_hash で重複チェック
+  const file_hash = crypto.createHash('sha256').update(buffer).digest('hex');
+  const existing = db.prepare(`SELECT import_id FROM pd_tracking_import WHERE source=? AND file_hash=? LIMIT 1`)
+    .get(source, file_hash);
+  if (existing) {
+    return { import_id: existing.import_id, source, row_count: parsed.rows.length,
+      matched_count: 0, unmatched_count: 0, conflict_count: 0,
+      duplicate: true, message: 'このファイルは既に取込済みです' };
+  }
+
+  const import_id = crypto.randomUUID();
+  const now = utcIsoNow();
+  let matched = 0, unmatched = 0, conflict = 0;
+  const unmatchedList = [];
+  const conflictList = [];
+
+  const sel = db.prepare(`SELECT ne_uketsuke_no, tracking_no, tracking_source, sync_status
+    FROM pd_shipment_tracking WHERE ne_uketsuke_no=?`);
+  const upd = db.prepare(`UPDATE pd_shipment_tracking
+    SET tracking_no=?, tracking_source=?, updated_at=?, updated_by=?
+    WHERE ne_uketsuke_no=? AND sync_status != 'synced'`);
+  // conflict 時は sync_status='conflict' に遷移 (人間判断待ち、ready 化対象から外す)。
+  // last_error にも経緯を残す。
+  const updConflict = db.prepare(`UPDATE pd_shipment_tracking
+    SET sync_status='conflict', last_error=?, updated_at=?, updated_by=?
+    WHERE ne_uketsuke_no=? AND sync_status != 'synced'`);
+
+  const tx = db.transaction(() => {
+    for (const r of parsed.rows) {
+      const cur = sel.get(r.ne_uketsuke_no);
+      if (!cur) {
+        unmatched++;
+        if (unmatchedList.length < 50) unmatchedList.push({ ne_uketsuke_no: r.ne_uketsuke_no, tracking_no: r.tracking_no, row_no: r.row_no });
+        continue;
+      }
+      // synced 済みは無条件にスキップ (既に NE 反映完了済、再上書きしない)
+      if (cur.sync_status === 'synced') {
+        unmatched++;
+        if (unmatchedList.length < 50) unmatchedList.push({ ne_uketsuke_no: r.ne_uketsuke_no, tracking_no: r.tracking_no, row_no: r.row_no, note: 'synced' });
+        continue;
+      }
+      // 既存 tracking_no と新しい tracking_no を比較 (正規化済)
+      if (cur.tracking_no && cur.tracking_no !== r.tracking_no) {
+        conflict++;
+        if (conflictList.length < 50) conflictList.push({
+          ne_uketsuke_no: r.ne_uketsuke_no, current: cur.tracking_no, incoming: r.tracking_no });
+        // 状態を conflict に遷移して ready 化対象から外す
+        updConflict.run(`既存=${cur.tracking_no} / 新=${r.tracking_no} (source=${source})`,
+          now, user || null, r.ne_uketsuke_no);
+        continue;
+      }
+      upd.run(r.tracking_no, source, now, user || null, r.ne_uketsuke_no);
+      matched++;
+    }
+    db.prepare(`INSERT INTO pd_tracking_import
+      (import_id, source, filename, file_hash, row_count, matched_count, unmatched_count, conflict_count,
+       imported_by, imported_at, detail_json)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(
+      import_id, source, filename || null, file_hash, parsed.rows.length,
+      matched, unmatched, conflict, user || null, now,
+      JSON.stringify({ unmatched: unmatchedList, conflict: conflictList }));
+  });
+  tx();
+  audit('tracking_import', import_id, { source, filename, file_hash, row_count: parsed.rows.length,
+    matched, unmatched, conflict }, user);
+  return { import_id, source, row_count: parsed.rows.length,
+    matched_count: matched, unmatched_count: unmatched, conflict_count: conflict,
+    duplicate: false, unmatched_samples: unmatchedList.slice(0, 10), conflict_samples: conflictList.slice(0, 10) };
+}
+
+// ─── 手動入力 (レターパック / 定形外 等) ───
+
+// レターパック等は CSV がないので手動で 1 件ずつ or 一括ペースト入力。
+// entries: [{ne_uketsuke_no, tracking_no}]、tracking_no が空なら no_tracking 扱い (定形外想定)
+export function setTrackingManual({ entries, source }, user) {
+  if (!Array.isArray(entries) || !entries.length) throw vErr('entries が空です');
+  const valid_sources = ['manual_letterpack', 'no_tracking'];
+  if (!valid_sources.includes(source)) throw vErr(`source は ${valid_sources.join(' / ')} のいずれか`);
+  const db = ensureSchema();
+  const now = utcIsoNow();
+  let updated = 0, notFound = 0, conflict = 0, synced = 0;
+  const notFoundList = [];
+  const conflictList = [];
+
+  const sel = db.prepare(`SELECT ne_uketsuke_no, tracking_no, sync_status FROM pd_shipment_tracking WHERE ne_uketsuke_no=?`);
+  const upd = db.prepare(`UPDATE pd_shipment_tracking
+    SET tracking_no=?, tracking_source=?, updated_at=?, updated_by=?
+    WHERE ne_uketsuke_no=? AND sync_status != 'synced'`);
+  const updConflict = db.prepare(`UPDATE pd_shipment_tracking
+    SET sync_status='conflict', last_error=?, updated_at=?, updated_by=?
+    WHERE ne_uketsuke_no=? AND sync_status != 'synced'`);
+
+  const tx = db.transaction(() => {
+    for (const e of entries) {
+      const uke = norm(e.ne_uketsuke_no);
+      const trk = norm(e.tracking_no);
+      if (!uke) { notFound++; continue; }
+      const cur = sel.get(uke);
+      if (!cur) { notFound++; if (notFoundList.length < 50) notFoundList.push(uke); continue; }
+      if (cur.sync_status === 'synced') { synced++; continue; }
+      if (cur.tracking_no && trk && cur.tracking_no !== trk) {
+        conflict++; if (conflictList.length < 50) conflictList.push({ ne_uketsuke_no: uke, current: cur.tracking_no, incoming: trk });
+        updConflict.run(`既存=${cur.tracking_no} / 新=${trk} (source=${source})`, now, user || null, uke);
+        continue;
+      }
+      upd.run(trk || null, source, now, user || null, uke);
+      updated++;
+    }
+  });
+  tx();
+  audit('tracking_manual', null, { source, updated, notFound, conflict, synced }, user);
+  return { updated, not_found: notFound, conflict, synced_skipped: synced,
+    not_found_samples: notFoundList.slice(0, 10), conflict_samples: conflictList.slice(0, 10) };
+}
+
+// ─── 状態遷移 ───
+
+// pending → ready 遷移 (「これで反映する」ボタン)。
+// 対象: tracking_no がセットされている (定形外/no_tracking 含む) and sync_status='pending'
+// 引数: { allPending: true } で全件、または { ids: [...] } で個別
+export function markReady({ allPending, ids }, user) {
+  const db = ensureSchema();
+  const now = utcIsoNow();
+  let n;
+  if (allPending) {
+    // tracking_no がセット済 or tracking_source='no_tracking' (定形外) なら ready 化可能
+    n = db.prepare(`UPDATE pd_shipment_tracking
+      SET sync_status='ready', sync_requested_at=?, updated_at=?, updated_by=?
+      WHERE sync_status='pending'
+        AND (tracking_no IS NOT NULL OR tracking_source='no_tracking')`)
+      .run(now, now, user || null).changes;
+  } else if (Array.isArray(ids) && ids.length) {
+    const placeholders = ids.map(() => '?').join(',');
+    n = db.prepare(`UPDATE pd_shipment_tracking
+      SET sync_status='ready', sync_requested_at=?, updated_at=?, updated_by=?
+      WHERE ne_uketsuke_no IN (${placeholders}) AND sync_status='pending'
+        AND (tracking_no IS NOT NULL OR tracking_source='no_tracking')`)
+      .run(now, now, user || null, ...ids).changes;
+  } else {
+    throw vErr('allPending または ids を指定してください');
+  }
+  audit('tracking_mark_ready', null, { count: n, mode: allPending ? 'all' : 'ids' }, user);
+  return { updated: n };
+}
+
+// 欠品マーク (skipped 状態へ)
+export function markSkipped({ ids, reason }, user) {
+  if (!Array.isArray(ids) || !ids.length) throw vErr('ids が空です');
+  if (!reason) throw vErr('skip_reason を指定してください');
+  const db = ensureSchema();
+  const now = utcIsoNow();
+  const placeholders = ids.map(() => '?').join(',');
+  // synced は除外 (既に反映済みは触らない)
+  const n = db.prepare(`UPDATE pd_shipment_tracking
+    SET sync_status='skipped', skip_reason=?, updated_at=?, updated_by=?
+    WHERE ne_uketsuke_no IN (${placeholders}) AND sync_status != 'synced'`)
+    .run(reason, now, user || null, ...ids).changes;
+  audit('tracking_mark_skipped', null, { count: n, reason }, user);
+  return { updated: n };
+}
+
+// ─── 一覧 / サマリ ───
+
+export function trackingSummary() {
+  const db = ensureSchema();
+  const rows = db.prepare(`SELECT sync_status, COUNT(*) c FROM pd_shipment_tracking GROUP BY sync_status`).all();
+  const summary = { pending: 0, ready: 0, syncing: 0, synced: 0, error: 0, conflict: 0, skipped: 0, manual_review: 0, total: 0 };
+  for (const r of rows) { summary[r.sync_status] = r.c; summary.total += r.c; }
+  // tracking_no 未割当の pending を別カウント
+  summary.pending_no_tracking = db.prepare(`SELECT COUNT(*) c FROM pd_shipment_tracking
+    WHERE sync_status='pending' AND tracking_no IS NULL AND (tracking_source IS NULL OR tracking_source != 'no_tracking')`).get().c;
+  return summary;
+}
+
+export function listTracking({ status, source, shop, q, limit = 1000 } = {}) {
+  const db = ensureSchema();
+  const where = [];
+  const params = [];
+  if (status) { where.push('sync_status = ?'); params.push(status); }
+  if (source) { where.push('tracking_source = ?'); params.push(source); }
+  if (shop) { where.push('shop_name = ?'); params.push(shop); }
+  if (q) {
+    where.push('(ne_uketsuke_no LIKE ? OR tracking_no LIKE ? OR order_no LIKE ?)');
+    const like = `%${norm(q)}%`;
+    params.push(like, like, like);
+  }
+  const sql = `SELECT * FROM pd_shipment_tracking
+    ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+    ORDER BY (CASE sync_status WHEN 'error' THEN 0 WHEN 'conflict' THEN 1 WHEN 'manual_review' THEN 2
+                                WHEN 'ready' THEN 3 WHEN 'pending' THEN 4 WHEN 'syncing' THEN 5
+                                WHEN 'skipped' THEN 6 WHEN 'synced' THEN 7 ELSE 8 END),
+             updated_at DESC
+    LIMIT ?`;
+  return db.prepare(sql).all(...params, Math.min(limit, 5000));
+}
+
+export function listTrackingImports(limit = 50) {
+  const db = ensureSchema();
+  return db.prepare(`SELECT import_id, source, filename, row_count, matched_count, unmatched_count,
+    conflict_count, imported_by, imported_at
+    FROM pd_tracking_import ORDER BY imported_at DESC LIMIT ?`).all(Math.min(limit, 200));
+}
+
+export function getTrackingImportDetail(import_id) {
+  const db = ensureSchema();
+  const row = db.prepare(`SELECT * FROM pd_tracking_import WHERE import_id=?`).get(import_id);
+  if (!row) return null;
+  return { ...row, detail: row.detail_json ? JSON.parse(row.detail_json) : null };
+}
 
 // ───────────────────────── マスタ移行 (manual → meltline 一括書き換え) ─────────────────────────
 //

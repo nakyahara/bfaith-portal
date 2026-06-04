@@ -78,6 +78,7 @@
     <div class="tab" data-tab="cond">条件検索・一括編集</div>
     <div class="tab" data-tab="assort">アソート学習</div>
     <div class="tab" data-tab="unreg">未登録一覧</div>
+    <div class="tab" data-tab="tracking">📦 追跡番号 / NE反映</div>
     <div class="tab" data-tab="manual">📖 マニュアル</div>
   </div>
 </header>
@@ -267,6 +268,121 @@
         <thead><tr><th>商品コード</th><th>商品名</th><th>取扱区分</th><th></th></tr></thead>
         <tbody id="unregBody"></tbody>
       </table></div>
+    </div>
+  </section>
+
+  <!-- ───── 追跡番号 / NE反映 (PR 1: CSV取込 + 一覧 + 手動入力 + ready/skip) ───── -->
+  <section class="panel" id="panel-tracking">
+    <div class="help-bar">
+      💡 この画面の使い方: CSV出力した伝票を、キャリアCSV (ヤマト/ゆうパケパフ) や手動入力 (レターパック/定形外) で追跡番号と紐付け → 「これで反映する」で NE 反映待ち (ready) に。NE への実反映は <span class="muted">PR 2/3 で実装予定</span>。
+    </div>
+
+    <!-- サマリ -->
+    <div class="card">
+      <div class="row">
+        <strong>状態サマリ</strong>
+        <span style="flex:1"></span>
+        <button id="btnTrackingReload" class="sub">再読込</button>
+      </div>
+      <div id="trackingSummary" class="summary"></div>
+    </div>
+
+    <!-- CSV 取込 -->
+    <div class="card">
+      <div class="row">
+        <strong>キャリア CSV 取込</strong>
+        <span class="muted">同じファイルは重複取込を自動検出</span>
+      </div>
+      <div class="row">
+        <label class="muted" style="min-width:240px">ヤマト B2 (ネコポス・発払い)
+          <input type="file" id="trkFileYamato" accept=".csv" /></label>
+        <button class="sub" data-trk-import="yamato_b2">取込</button>
+        <span id="trkStatusYamato" class="muted"></span>
+      </div>
+      <div class="row">
+        <label class="muted" style="min-width:240px">ヤマト B2 (50サイズ専用)
+          <input type="file" id="trkFileYamato50" accept=".csv" /></label>
+        <button class="sub" data-trk-import="yamato_b2_50">取込</button>
+        <span id="trkStatusYamato50" class="muted"></span>
+      </div>
+      <div class="row">
+        <label class="muted" style="min-width:240px">ゆうパケットパフ
+          <input type="file" id="trkFileYupacketpuff" accept=".csv" /></label>
+        <button class="sub" data-trk-import="yupacketpuff">取込</button>
+        <span id="trkStatusYupacketpuff" class="muted"></span>
+      </div>
+      <div id="trkImportResult"></div>
+    </div>
+
+    <!-- 手動入力 -->
+    <div class="card">
+      <div class="row">
+        <strong>手動入力 (レターパック / 定形外)</strong>
+        <select id="trkManualSource">
+          <option value="manual_letterpack">レターパック (追跡番号あり)</option>
+          <option value="no_tracking">定形外 (追跡番号なし)</option>
+        </select>
+        <button class="sub" id="btnTrkManualPaste">一括ペースト</button>
+        <span id="trkManualStatus" class="muted"></span>
+      </div>
+      <div class="muted">「NE受注番号 タブ または カンマ または スペース 追跡番号」を行ごとに貼り付け。定形外は追跡番号列なしで OK。</div>
+      <textarea id="trkManualText" rows="6" style="width:100%; font-family:monospace; font-size:12px; padding:6px; border:1px solid var(--line); border-radius:5px"
+        placeholder="例:&#10;1452297&#9;490356296640&#10;1452370&#9;680467536512"></textarea>
+      <div class="row" style="margin-top:6px">
+        <button id="btnTrkManualApply">入力を適用</button>
+      </div>
+    </div>
+
+    <!-- 一覧 + フィルタ + 一括操作 -->
+    <div class="card">
+      <div class="row">
+        <strong>追跡番号一覧</strong>
+        <label class="muted">状態 <select id="trkFilterStatus">
+          <option value="">すべて</option>
+          <option value="pending">反映待ち (未紐付け含む)</option>
+          <option value="ready">反映可</option>
+          <option value="syncing">反映中</option>
+          <option value="synced">反映済</option>
+          <option value="error">失敗</option>
+          <option value="conflict">競合</option>
+          <option value="skipped">対象外</option>
+          <option value="manual_review">要手動確認</option>
+        </select></label>
+        <label class="muted">取込元 <select id="trkFilterSource">
+          <option value="">すべて</option>
+          <option value="yamato_b2">ヤマト</option>
+          <option value="yamato_b2_50">ヤマト50</option>
+          <option value="yupacketpuff">ゆうパケパフ</option>
+          <option value="manual_letterpack">レターパック手入力</option>
+          <option value="no_tracking">追跡なし(定形外)</option>
+        </select></label>
+        <label class="muted">店舗 <select id="trkFilterShop"><option value="">すべて</option></select></label>
+        <input id="trkQuery" placeholder="受注番号 / 追跡番号 / 注文番号" size="28" />
+        <button class="sub" id="btnTrkSearch">検索</button>
+        <span style="flex:1"></span>
+        <button id="btnTrkMarkReady">📤 これで NE 反映する (pending → ready)</button>
+      </div>
+      <div class="muted">「これで NE 反映する」を押すと、追跡番号セット済み + 定形外マークの全 pending を ready に遷移。NE への実反映は別途 cron で実行。</div>
+      <div class="scroll" style="max-height:50vh; margin-top:8px">
+        <table>
+          <thead><tr><th>状態</th><th>NE受注番号</th><th>店舗</th><th>注文番号</th><th>配送方法</th><th>追跡番号</th><th>取込元</th><th>更新</th><th>操作</th></tr></thead>
+          <tbody id="trackingBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- 取込履歴 -->
+    <div class="card">
+      <div class="row">
+        <strong>CSV 取込履歴</strong>
+        <button class="sub" id="btnTrkImportsReload">再読込</button>
+      </div>
+      <div class="scroll" style="max-height:30vh">
+        <table>
+          <thead><tr><th>日時</th><th>取込者</th><th>取込元</th><th>ファイル名</th><th>行数</th><th>紐付け</th><th>未マッチ</th><th>競合</th><th></th></tr></thead>
+          <tbody id="trkImportsBody"></tbody>
+        </table>
+      </div>
     </div>
   </section>
 
@@ -1214,6 +1330,239 @@ $('#btnRollbackExec').onclick = async () => {
     $('#rollbackStatus').textContent='';
   }catch(e){ $('#rollbackStatus').textContent='エラー: '+e.message; $('#btnRollbackExec').disabled = false; }
 };
+
+// ── 追跡番号 / NE反映 タブ (PR 1: CSV取込 + 一覧 + 手動入力 + ready/skip) ──
+const TRK_STATUS_LABELS = {
+  pending:       { label: '反映待ち', color: '#777',    sub: '追跡番号未紐付け or 未 ready 化' },
+  ready:         { label: '反映可',    color: '#2b6cb0', sub: 'NE 反映待ち (cron で処理)' },
+  syncing:       { label: '反映中',    color: '#f39c12', sub: 'ミニPCが処理中' },
+  synced:        { label: '反映済',    color: '#2e7d32', sub: 'NE 反映完了' },
+  error:         { label: '失敗',       color: '#c0392b', sub: 'NE 反映失敗、リトライ可' },
+  conflict:      { label: '競合',       color: '#e67e22', sub: 'NE側に既存値あり、人間判断' },
+  skipped:       { label: '対象外',    color: '#999',    sub: '欠品等で NE 反映しない' },
+  manual_review: { label: '要手動確認', color: '#8e44ad', sub: '5回失敗 or 不正データ' },
+};
+
+function trkRenderSummary(s){
+  if(!s) return;
+  const box = $('#trackingSummary');
+  const order = ['pending', 'ready', 'syncing', 'synced', 'error', 'conflict', 'skipped', 'manual_review'];
+  box.innerHTML = order.map(k => {
+    const cfg = TRK_STATUS_LABELS[k];
+    const c = s[k] || 0;
+    return `<div><div class="num" style="color:${cfg.color}">${c}</div><div class="muted" title="${esc(cfg.sub)}">${cfg.label}</div></div>`;
+  }).join('') + `<div><div class="num">${s.total||0}</div><div class="muted">合計</div></div>`
+    + (s.pending_no_tracking > 0
+      ? `<div><div class="num" style="color:#c0392b">${s.pending_no_tracking}</div><div class="muted" title="紐付け待ち">うち未紐付け</div></div>` : '');
+}
+
+async function loadTrackingAll(){
+  try{
+    const sum = await api('api/tracking/summary');
+    trkRenderSummary(sum);
+    await loadTrackingList();
+    await loadTrkImports();
+  }catch(e){ console.error('[tracking]', e.message); }
+}
+
+function trkStatusBadge(status){
+  const cfg = TRK_STATUS_LABELS[status] || { label: status, color: '#777' };
+  return `<span class="badge" style="background:${cfg.color}22; color:${cfg.color}; border:1px solid ${cfg.color}66">${cfg.label}</span>`;
+}
+
+function trkMaskTracking(t){
+  if(!t) return '<span class="muted">—</span>';
+  // 表示は末尾4桁マスクではなくフル表示 (UI 上は中原さん本人が見るため)。ログのみ末尾4桁化はサーバ側で実施予定。
+  return esc(t);
+}
+
+async function loadTrackingList(){
+  const status = $('#trkFilterStatus').value;
+  const source = $('#trkFilterSource').value;
+  const shop = $('#trkFilterShop').value;
+  const q = $('#trkQuery').value.trim();
+  const params = new URLSearchParams();
+  if(status) params.set('status', status);
+  if(source) params.set('source', source);
+  if(shop) params.set('shop', shop);
+  if(q) params.set('q', q);
+  const rows = await api(`api/tracking?${params.toString()}`);
+  // 店舗フィルタの選択肢を取得結果から構築 (DISTINCT)
+  const shops = [...new Set(rows.map(r => r.shop_name).filter(Boolean))].sort();
+  const curShop = $('#trkFilterShop').value;
+  $('#trkFilterShop').innerHTML = '<option value="">すべて</option>' +
+    shops.map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
+  if(shops.includes(curShop)) $('#trkFilterShop').value = curShop;
+  // テーブル描画
+  const tb = $('#trackingBody'); tb.innerHTML = '';
+  for(const r of rows){
+    const tr = document.createElement('tr');
+    const upd = (r.updated_at || r.added_at || '').replace('T',' ').slice(0,16);
+    tr.innerHTML = `<td>${trkStatusBadge(r.sync_status)}</td>`+
+      `<td><code>${esc(r.ne_uketsuke_no)}</code></td>`+
+      `<td>${esc(r.shop_name||'')}</td>`+
+      `<td>${esc(r.order_no||'')}</td>`+
+      `<td>${esc(methodName(r.shipping_method_code))}</td>`+
+      `<td>${trkMaskTracking(r.tracking_no)}</td>`+
+      `<td class="muted">${esc(r.tracking_source||'')}</td>`+
+      `<td class="muted">${esc(upd)}</td>`+
+      `<td>${r.sync_status==='pending' || r.sync_status==='ready' || r.sync_status==='error'
+        ? `<button class="sub" data-trk-skip="${esc(r.ne_uketsuke_no)}">欠品</button>` : ''}</td>`;
+    tb.appendChild(tr);
+  }
+  $('#trackingBody').querySelectorAll('button[data-trk-skip]').forEach(btn => {
+    btn.onclick = async () => {
+      const reason = prompt('対象外にする理由を入力 (例: 欠品)', '欠品');
+      if(!reason) return;
+      try{
+        await api('api/tracking/mark-skipped', { method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ ids:[btn.dataset.trkSkip], reason })});
+        await loadTrackingAll();
+      }catch(e){ alert('エラー: '+e.message); }
+    };
+  });
+}
+
+async function loadTrkImports(){
+  const rows = await api('api/tracking/imports');
+  const tb = $('#trkImportsBody'); tb.innerHTML = '';
+  for(const r of rows){
+    const tr = document.createElement('tr');
+    const dt = (r.imported_at||'').replace('T',' ').slice(0,16);
+    tr.innerHTML = `<td>${esc(dt)}</td>`+
+      `<td>${esc(r.imported_by||'')}</td>`+
+      `<td>${esc(r.source)}</td>`+
+      `<td>${esc(r.filename||'')}</td>`+
+      `<td style="text-align:right">${r.row_count}</td>`+
+      `<td style="text-align:right; color:#2e7d32">${r.matched_count}</td>`+
+      `<td style="text-align:right; color:${r.unmatched_count>0?'#c0392b':'#777'}">${r.unmatched_count}</td>`+
+      `<td style="text-align:right; color:${r.conflict_count>0?'#e67e22':'#777'}">${r.conflict_count}</td>`+
+      `<td>${r.unmatched_count>0||r.conflict_count>0 ? `<button class="sub" data-trk-imp-detail="${esc(r.import_id)}">詳細</button>` : ''}</td>`;
+    tb.appendChild(tr);
+  }
+  tb.querySelectorAll('button[data-trk-imp-detail]').forEach(btn => {
+    btn.onclick = async () => {
+      try{
+        const d = await api(`api/tracking/imports/${encodeURIComponent(btn.dataset.trkImpDetail)}`);
+        if(!d || !d.detail) return alert('詳細データなし');
+        const um = (d.detail.unmatched||[]).map(x => `  - ${x.ne_uketsuke_no} (${x.tracking_no})`).join('\n');
+        const cf = (d.detail.conflict||[]).map(x => `  - ${x.ne_uketsuke_no}: 既存=${x.current} / 新=${x.incoming}`).join('\n');
+        alert(`未マッチ (${d.unmatched_count}件):\n${um||'  なし'}\n\n競合 (${d.conflict_count}件):\n${cf||'  なし'}`);
+      }catch(e){ alert('エラー: '+e.message); }
+    };
+  });
+}
+
+// CSV 取込ボタン
+document.querySelectorAll('[data-trk-import]').forEach(btn => {
+  btn.onclick = async () => {
+    const source = btn.dataset.trkImport;
+    const fileInputId = source==='yamato_b2' ? 'trkFileYamato' :
+                        source==='yamato_b2_50' ? 'trkFileYamato50' : 'trkFileYupacketpuff';
+    const statusId = source==='yamato_b2' ? 'trkStatusYamato' :
+                     source==='yamato_b2_50' ? 'trkStatusYamato50' : 'trkStatusYupacketpuff';
+    const f = $('#'+fileInputId).files[0];
+    if(!f){ $('#'+statusId).textContent = 'ファイルを選択してください'; return; }
+    $('#'+statusId).textContent = '取込中…';
+    const fd = new FormData();
+    fd.append('file', f);
+    fd.append('source', source);
+    try{
+      const r = await fetch(API_BASE + 'api/tracking/import', { method:'POST', body: fd, credentials:'include' });
+      const j = await r.json();
+      if(!j.ok) throw new Error(j.message || '取込エラー');
+      const res = j.result;
+      if(res.duplicate){
+        $('#'+statusId).textContent = `重複: 既に取込済み (${res.row_count}行)`;
+      } else {
+        $('#'+statusId).textContent = `取込完了: 全${res.row_count} / 紐付け${res.matched_count} / 未マッチ${res.unmatched_count} / 競合${res.conflict_count}`;
+        renderTrkImportResult(res);
+      }
+      await loadTrackingAll();
+    }catch(e){ $('#'+statusId).textContent = 'エラー: '+e.message; }
+  };
+});
+
+function renderTrkImportResult(res){
+  const box = $('#trkImportResult');
+  if(!res) { box.innerHTML=''; return; }
+  let html = `<div class="muted" style="margin-top:8px">最終取込結果:</div>`;
+  html += `<table style="margin-top:4px"><thead><tr><th>項目</th><th>件数</th></tr></thead><tbody>`;
+  html += `<tr><td>全行</td><td style="text-align:right">${res.row_count}</td></tr>`;
+  html += `<tr><td style="color:#2e7d32">紐付け成功</td><td style="text-align:right; color:#2e7d32">${res.matched_count}</td></tr>`;
+  html += `<tr><td style="color:#c0392b">未マッチ (pd_shipment_tracking に該当なし)</td><td style="text-align:right; color:#c0392b">${res.unmatched_count}</td></tr>`;
+  html += `<tr><td style="color:#e67e22">競合 (既存追跡番号と異なる)</td><td style="text-align:right; color:#e67e22">${res.conflict_count}</td></tr>`;
+  html += `</tbody></table>`;
+  if((res.unmatched_samples||[]).length){
+    html += `<div class="muted" style="margin-top:6px">未マッチサンプル (最大10):</div><ul>` +
+      res.unmatched_samples.map(x => `<li>${esc(x.ne_uketsuke_no)} (追跡: ${esc(x.tracking_no)})</li>`).join('') + `</ul>`;
+  }
+  if((res.conflict_samples||[]).length){
+    html += `<div class="muted" style="margin-top:6px">競合サンプル (最大10):</div><ul>` +
+      res.conflict_samples.map(x => `<li>${esc(x.ne_uketsuke_no)}: 既存=${esc(x.current)} / 新=${esc(x.incoming)}</li>`).join('') + `</ul>`;
+  }
+  box.innerHTML = html;
+}
+
+// 手動入力
+$('#btnTrkManualApply').onclick = async () => {
+  const source = $('#trkManualSource').value;
+  const text = $('#trkManualText').value.trim();
+  if(!text){ $('#trkManualStatus').textContent = 'テキストが空です'; return; }
+  const entries = [];
+  for(const ln of text.split(/\r?\n/)){
+    const parts = ln.split(/[\t,\s]+/).filter(Boolean);
+    if(!parts.length) continue;
+    entries.push({ ne_uketsuke_no: parts[0], tracking_no: parts[1] || '' });
+  }
+  if(!entries.length){ $('#trkManualStatus').textContent = '有効な行がありません'; return; }
+  $('#trkManualStatus').textContent = '適用中…';
+  try{
+    const r = await api('api/tracking/manual', { method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ source, entries })});
+    $('#trkManualStatus').textContent = `更新${r.updated} / 未マッチ${r.not_found} / 競合${r.conflict} / 既反映スキップ${r.synced_skipped}`;
+    if(r.not_found > 0 || r.conflict > 0){
+      let msg = '';
+      if((r.not_found_samples||[]).length) msg += `未マッチ:\n${r.not_found_samples.map(x=>'  - '+x).join('\n')}\n\n`;
+      if((r.conflict_samples||[]).length) msg += `競合:\n${r.conflict_samples.map(x=>'  - '+x.ne_uketsuke_no+': 既存='+x.current+' / 新='+x.incoming).join('\n')}`;
+      if(msg) alert(msg);
+    }
+    await loadTrackingAll();
+  }catch(e){ $('#trkManualStatus').textContent = 'エラー: '+e.message; }
+};
+
+// 一括ペースト ヘルプ
+$('#btnTrkManualPaste').onclick = () => {
+  alert('Excel から「NE受注番号」「追跡番号」の 2 列を選択して Ctrl+C → このページの入力欄に Ctrl+V してください。タブ/カンマ/スペース区切り対応。');
+};
+
+// 「これで NE 反映する」ボタン
+$('#btnTrkMarkReady').onclick = async () => {
+  if(!confirm('追跡番号が割り当て済みの全 pending を NE 反映待ち (ready) に遷移します。よろしいですか?')) return;
+  try{
+    const r = await api('api/tracking/mark-ready', { method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ allPending: true })});
+    alert(`${r.updated} 件を ready にしました。\n(NE への実反映は別途 cron で実行されます — PR 2/3 で実装予定)`);
+    await loadTrackingAll();
+  }catch(e){ alert('エラー: '+e.message); }
+};
+
+// 検索 / フィルタ
+$('#btnTrkSearch').onclick = loadTrackingList;
+$('#trkFilterStatus').onchange = loadTrackingList;
+$('#trkFilterSource').onchange = loadTrackingList;
+$('#trkFilterShop').onchange = loadTrackingList;
+$('#trkQuery').addEventListener('keydown', (e) => { if(e.key==='Enter') loadTrackingList(); });
+$('#btnTrackingReload').onclick = loadTrackingAll;
+$('#btnTrkImportsReload').onclick = loadTrkImports;
+
+// タブ切替時に初回ロード
+document.querySelector('.tab[data-tab=tracking]').addEventListener('click', () => {
+  if(!$('#trackingSummary').children.length) loadTrackingAll();
+});
 
 (async () => { await loadOptions(); initCondSelects(); initAssortFilters(); loadBatches(); loadMe(); })();
 </script>

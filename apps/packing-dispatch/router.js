@@ -16,6 +16,8 @@ import {
   listUnregistered, mirrorFreshness, searchAssort, updateAssort,
   getMeltlineMigrationPreview, executeMeltlineMigration, rollbackMeltlineMigration,
   listMeltlineBackups, readMeltlineBackup,
+  importTrackingCsv, setTrackingManual, markReady, markSkipped,
+  trackingSummary, listTracking, listTrackingImports, getTrackingImportDetail,
 } from './service.js';
 import { loadSeed } from './tools/load-shipping-rule-seed.mjs';
 
@@ -155,6 +157,40 @@ router.get('/api/diag', (req, res) => handle(res, () => diagInfo()));
 router.get('/api/product-diag', (req, res) => handle(res, () => productDiag(req.query.code || '')));
 // ── アソート学習診断 (商品コードが学習に登録されているか・形式・有効無効) ──
 router.get('/api/assort-diag', (req, res) => handle(res, () => assortDiag(req.query.code || '')));
+
+// ═══ 追跡番号 / NE反映 (PR 1: CSV取込 + 一覧 + 手動入力 + ready/skip 遷移) ═══
+
+// CSV 取込 (source: yamato_b2 | yamato_b2_50 | yupacketpuff)
+router.post('/api/tracking/import', upload.single('file'), (req, res) => handle(res, () => {
+  if (!req.file) { const e = new Error('ファイルがありません'); e.code = 'VALIDATION'; throw e; }
+  const source = (req.body && req.body.source) || req.query.source;
+  if (!source) { const e = new Error('source パラメータが必要です'); e.code = 'VALIDATION'; throw e; }
+  return importTrackingCsv({ source, buffer: req.file.buffer, filename: req.file.originalname }, currentUser(req));
+}));
+
+// 手動入力 (レターパック / 定形外)
+//   body: { source: 'manual_letterpack' | 'no_tracking', entries: [{ne_uketsuke_no, tracking_no}] }
+router.post('/api/tracking/manual', (req, res) => handle(res, () => setTrackingManual(req.body || {}, currentUser(req))));
+
+// pending → ready 遷移
+//   body: { allPending: true } または { ids: [ne_uketsuke_no, ...] }
+router.post('/api/tracking/mark-ready', (req, res) => handle(res, () => markReady(req.body || {}, currentUser(req))));
+
+// 欠品マーク (skipped 状態へ)
+//   body: { ids: [...], reason: '欠品' 等 }
+router.post('/api/tracking/mark-skipped', (req, res) => handle(res, () => markSkipped(req.body || {}, currentUser(req))));
+
+// サマリ (ステータス別カウント)
+router.get('/api/tracking/summary', (req, res) => handle(res, () => trackingSummary()));
+
+// 一覧 (filter: status / source / shop / q)
+router.get('/api/tracking', (req, res) => handle(res, () => listTracking({
+  status: req.query.status, source: req.query.source, shop: req.query.shop, q: req.query.q,
+})));
+
+// 取込履歴
+router.get('/api/tracking/imports', (req, res) => handle(res, () => listTrackingImports()));
+router.get('/api/tracking/imports/:id', (req, res) => handle(res, () => getTrackingImportDetail(req.params.id)));
 
 // ── 現在ユーザー情報 (UI で admin 専用機能の出し分け用) ──
 router.get('/api/me', (req, res) => handle(res, () => ({
