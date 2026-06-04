@@ -1729,7 +1729,12 @@ document.querySelectorAll('[data-trk-import]').forEach(btn => {
     try{
       const r = await fetch(API_BASE + 'api/tracking/import', { method:'POST', body: fd, credentials:'include' });
       const j = await r.json();
-      if(!j.ok) throw new Error(j.message || '取込エラー');
+      if(!j.ok) {
+        // detail.errors があれば全部表示してデバッグしやすくする
+        const detail = j.detail && j.detail.errors ? '\n' + j.detail.errors.join('\n') : '';
+        const otherSource = j.detail && j.detail.other_source ? `\n(別取込元: ${j.detail.other_source})` : '';
+        throw new Error((j.message || '取込エラー') + detail + otherSource);
+      }
       const res = j.result;
       if(res.duplicate){
         $('#'+statusId).textContent = `重複: 既に取込済み (${res.row_count}行)`;

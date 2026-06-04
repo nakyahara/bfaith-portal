@@ -887,25 +887,37 @@ function parseCsvText(text) {
   return rows;
 }
 
-// ヤマト B2 出力 CSV: col 1 = 送り状種類 ("0"=発払い / "A"=ネコポス、配送方法変更ログ用)
-//                     col 3 = 伝票番号 (追跡番号)
-//                     col 31 = 荷扱い1 (NE伝票番号 = ne_uketsuke_no)
+// ヤマト B2 出力 CSV パーサ。
+// 列番号はヘッダ名から検索する (2026-06-04 hotfix: 固定 col 番号は B2 アカウント設定で
+// 並び順が変わるとずれる事故が起きた。ヤマト側で項目追加/削除が起きても堅牢にするため、
+// 「送り状種類」「伝票番号」「荷扱い１」のヘッダ名で列を引く)。
+// 想定: 送り状種類 = "0" (発払い) / "A" (ネコポス、配送方法変更ログ用)、伝票番号 = 追跡番号、
+// 荷扱い１ = NE 伝票番号 (ne_uketsuke_no)
 function parseYamatoB2Csv(buffer) {
   const text = detectAndDecodeCsv(buffer);
   const rows = parseCsvText(text);
   if (!rows.length) return { rows: [], errors: ['CSV が空です'] };
   const header = rows[0];
   const errors = [];
-  if (header.length < 32) errors.push(`列数が想定外 (期待 ≥32、実際 ${header.length})。ヤマト B2 のフォーマットが変わった可能性があります。`);
-  if (header[1] !== '送り状種類') errors.push(`col 1 が「送り状種類」ではありません (実際: ${header[1]})`);
-  if (header[3] !== '伝票番号') errors.push(`col 3 が「伝票番号」ではありません (実際: ${header[3]})`);
-  if (header[31] !== '荷扱い１' && header[31] !== '荷扱い1') errors.push(`col 31 が「荷扱い1」ではありません (実際: ${header[31]})`);
-  const dataRows = rows.slice(1).filter(r => r.length > 3 && (r[3] || r[31]));
+  // ヘッダ名で列を検索 (空白除去・全角半角統一)
+  const normKey = (s) => norm(s).replace(/\s+/g, '');
+  const findIdx = (...names) => {
+    const set = new Set(names.map(normKey));
+    return header.findIndex(h => set.has(normKey(h)));
+  };
+  const idxInvoice = findIdx('送り状種類');
+  const idxTrack = findIdx('伝票番号');
+  const idxNi = findIdx('荷扱い１', '荷扱い1');
+  if (idxInvoice < 0) errors.push('「送り状種類」列が見つかりません');
+  if (idxTrack < 0) errors.push('「伝票番号」列が見つかりません');
+  if (idxNi < 0) errors.push('「荷扱い１」(または「荷扱い1」)列が見つかりません');
+  if (errors.length) return { rows: [], errors, header };
+  const dataRows = rows.slice(1).filter(r => r.length > Math.max(idxTrack, idxNi) && (r[idxTrack] || r[idxNi]));
   const items = dataRows.map((r, i) => ({
     row_no: i + 2,
-    ne_uketsuke_no: norm(r[31]),    // 荷扱い1
-    tracking_no: norm(r[3]),         // 伝票番号
-    invoice_type_raw: norm(r[1]),    // 送り状種類 (配送方法変更判定用)
+    ne_uketsuke_no: norm(r[idxNi]),         // 荷扱い１
+    tracking_no: norm(r[idxTrack]),          // 伝票番号
+    invoice_type_raw: norm(r[idxInvoice]),   // 送り状種類 (配送方法変更判定用)
     raw: r,
   })).filter(x => x.ne_uketsuke_no && x.tracking_no);
   return { rows: items, errors, header };
