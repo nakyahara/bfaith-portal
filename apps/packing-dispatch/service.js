@@ -2343,3 +2343,250 @@ export function readMeltlineBackup(filename) {
   if (!fs.existsSync(fullPath)) throw vErr('backup ファイルが見つかりません');
   return fs.readFileSync(fullPath, 'utf8');
 }
+
+// ═══════════════════════════════════════════════════════════════════
+//  NE 反映ジョブ (Phase 2, PR-A 2026-06-05、構成 B: CF Access 既存 + Bearer 専用)
+//  ミニPC がこれらの内部 API を叩いて NE 反映を実行する。Render は queue + state のみ管理。
+// ═══════════════════════════════════════════════════════════════════
+
+const NE_SYNC_RUN_EXPIRY_MIN = 30; // running な run が 30 分以上更新なし → 次回 start で expired 扱い
+const NE_SYNC_CLAIM_TTL_MIN = 15;  // claim 取得から 15 分経過 → 期限切れ、次回 queue で再 claim 可能
+const NE_SYNC_MAX_ATTEMPT = 5;     // 連続失敗 5 回で manual_review
+
+// 平文 claim_token を sha256 hash 化 (DB 保存は hash のみ、平文は worker メモリ + journal で保持)
+function hashToken(token) { return crypto.createHash('sha256').update(String(token)).digest('hex'); }
+
+/**
+ * NE 反映 run を開始 (UI ボタンから 1 回ずつ)。単一起動ロック: running が既にあれば 409。
+ * 古い running (30 分以上更新なし) は expired として finalize してから新規開始。
+ */
+export function startNeSyncRun({ started_by } = {}) {
+  const db = ensureSchema();
+  const now = utcIsoNow();
+  const tx = db.transaction(() => {
+    // 古い running を expired に finalize (TTL 切れ自動掃除)。
+    // Codex R1 High 2: heartbeat_at を考慮、worker が進行中なら expired 扱いしない。
+    const cutoff = new Date(Date.now() - NE_SYNC_RUN_EXPIRY_MIN * 60 * 1000).toISOString();
+    db.prepare(`UPDATE pd_ne_sync_run SET status='expired', ended_at=?,
+        last_error='run expired (no heartbeat within ' || ? || ' min)'
+        WHERE status='running' AND COALESCE(heartbeat_at, started_at) < ?`).run(now, NE_SYNC_RUN_EXPIRY_MIN, cutoff);
+    // 単一起動ロック: 他の running があれば 409 相当 (vErr)
+    const existing = db.prepare(`SELECT run_id, started_at, started_by FROM pd_ne_sync_run WHERE status='running' LIMIT 1`).get();
+    if (existing) {
+      const err = vErr(`既に実行中の run があります (run_id=${existing.run_id}, by=${existing.started_by || '?'}, started=${existing.started_at})`);
+      err.code = 'CONFLICT';
+      throw err;
+    }
+    // 期限切れ claim を ready に戻す (TTL 自動回収)
+    const claimCutoff = new Date(Date.now() - NE_SYNC_CLAIM_TTL_MIN * 60 * 1000).toISOString();
+    db.prepare(`UPDATE pd_shipment_tracking SET sync_status='ready', claim_id=NULL, claim_token_hash=NULL,
+        claim_expires_at=NULL, syncing_started_at=NULL
+        WHERE sync_status='syncing' AND (claim_expires_at IS NULL OR claim_expires_at < ?)`).run(claimCutoff);
+    const run_id = crypto.randomUUID();
+    db.prepare(`INSERT INTO pd_ne_sync_run (run_id, status, started_at, started_by) VALUES (?, 'running', ?, ?)`)
+      .run(run_id, now, started_by || null);
+    return run_id;
+  });
+  const run_id = tx();
+  audit('ne_sync_run_start', run_id, { started_by }, started_by);
+  return { run_id, started_at: now };
+}
+
+/**
+ * Run の進行状況を取得 (UI のステータス表示用)。
+ */
+export function getNeSyncRun(run_id) {
+  const db = ensureSchema();
+  if (!run_id) throw vErr('run_id is required');
+  const row = db.prepare(`SELECT * FROM pd_ne_sync_run WHERE run_id=?`).get(run_id);
+  return row || null;
+}
+
+/**
+ * 直近の run 一覧 (UI 履歴表示用、最大 50 件)。
+ */
+export function listRecentNeSyncRuns(limit = 50) {
+  const db = ensureSchema();
+  const lim = Math.max(1, Math.min(200, parseInt(limit, 10) || 50));
+  return db.prepare(`SELECT * FROM pd_ne_sync_run ORDER BY started_at DESC LIMIT ?`).all(lim);
+}
+
+/**
+ * ミニPC worker が呼ぶ: ready 行を limit 件 atomic claim → syncing に遷移。
+ * claim_id = run_id を使う (1 run = 1 claim_id でシンプル)。claim_token は行ごとにランダム発行、
+ * DB には sha256 hash のみ保存、平文は worker レスポンスでだけ返す (結果 POST で照合)。
+ */
+export function claimReadyForNeSync({ run_id, limit = 50 } = {}) {
+  if (!run_id) throw vErr('run_id is required');
+  const db = ensureSchema();
+  const run = db.prepare(`SELECT status FROM pd_ne_sync_run WHERE run_id=?`).get(run_id);
+  if (!run) throw vErr(`run not found: ${run_id}`);
+  if (run.status !== 'running') throw vErr(`run is not running (status=${run.status})`);
+  const lim = Math.max(1, Math.min(100, parseInt(limit, 10) || 50));
+  const now = utcIsoNow();
+  const expiresAt = new Date(Date.now() + NE_SYNC_CLAIM_TTL_MIN * 60 * 1000).toISOString();
+  // ne_carrier_id / is_locked を JOIN で同梱 (worker が NE API 用 carrier_id を持つ)
+  const tx = db.transaction(() => {
+    // 候補: ready 行 と attempt < 5 の error 行 (Codex R1 High 3: 自動 retry 経路)。
+    // sync_requested_at 古い順、aes は除外 (is_locked=1)。
+    const candidates = db.prepare(`
+      SELECT t.ne_uketsuke_no, t.tracking_no, t.tracking_source, t.shipping_method_code,
+             t.method_at_export, t.shop_name, t.order_no, t.product_summary, t.sync_status,
+             sm.ne_carrier_id, sm.is_locked
+        FROM pd_shipment_tracking t
+        JOIN pd_shipping_method sm ON sm.code = t.shipping_method_code
+       WHERE (t.sync_status = 'ready'
+              OR (t.sync_status = 'error' AND COALESCE(t.claim_attempt_count, 0) < ?))
+         AND COALESCE(sm.is_locked, 0) = 0
+       ORDER BY t.sync_requested_at ASC, t.ne_uketsuke_no ASC
+       LIMIT ?
+    `).all(NE_SYNC_MAX_ATTEMPT, lim);
+    if (!candidates.length) return [];
+    // 各行に claim_token を発行 + UPDATE
+    // 元 status (ready or error) を WHERE に挟んで他 worker との race を防ぐ
+    const upd = db.prepare(`UPDATE pd_shipment_tracking
+      SET sync_status='syncing', claim_id=?, claim_token_hash=?, claim_expires_at=?,
+          syncing_started_at=?, claim_attempt_count=claim_attempt_count+1,
+          updated_at=?, updated_by='ne_sync_worker'
+      WHERE ne_uketsuke_no=? AND sync_status=?`);
+    const claimed = [];
+    for (const r of candidates) {
+      const token = crypto.randomBytes(24).toString('hex');
+      const hash = hashToken(token);
+      const info = upd.run(run_id, hash, expiresAt, now, now, r.ne_uketsuke_no, r.sync_status);
+      if (info.changes > 0) {
+        // 平文 token は worker にのみ返す (DB には hash のみ)
+        claimed.push({
+          ne_uketsuke_no: r.ne_uketsuke_no,
+          claim_token: token, // worker が結果 POST で送り返す、Render は hash 比較で照合
+          tracking_no: r.tracking_no,
+          tracking_source: r.tracking_source,
+          shipping_method_code: r.shipping_method_code,
+          method_at_export: r.method_at_export,
+          shop_name: r.shop_name,
+          order_no: r.order_no,
+          product_summary: r.product_summary,
+          ne_carrier_id: r.ne_carrier_id,
+        });
+      }
+    }
+    // run の target_count を加算
+    db.prepare(`UPDATE pd_ne_sync_run SET target_count = target_count + ?, heartbeat_at=? WHERE run_id=?`)
+      .run(claimed.length, now, run_id);
+    return claimed;
+  });
+  const claimed = tx();
+  audit('ne_sync_claim', run_id, { count: claimed.length }, 'ne_sync_worker');
+  return { run_id, claimed_count: claimed.length, items: claimed };
+}
+
+/**
+ * ミニPC worker が呼ぶ: バッチ結果を反映。各 result の claim_token と DB の claim_token_hash を
+ * 照合してから状態遷移。claim 切れ・トークン不一致は silently skip (idempotent)。
+ *
+ * results: [{ ne_uketsuke_no, claim_token, status: 'synced'|'error'|'manual_review',
+ *             error_code?, error_message?, ne_synced_at? }]
+ */
+export function applyNeSyncResults({ run_id, results } = {}) {
+  if (!run_id) throw vErr('run_id is required');
+  if (!Array.isArray(results)) throw vErr('results must be an array');
+  const db = ensureSchema();
+  const run = db.prepare(`SELECT status FROM pd_ne_sync_run WHERE run_id=?`).get(run_id);
+  if (!run) throw vErr(`run not found: ${run_id}`);
+  if (run.status !== 'running') throw vErr(`run is not running (status=${run.status})`);
+  const now = utcIsoNow();
+  let synced = 0, errored = 0, manualReview = 0, mismatched = 0;
+  const tx = db.transaction(() => {
+    for (const r of results) {
+      if (!r || !r.ne_uketsuke_no || !r.claim_token) { mismatched++; continue; }
+      const incomingHash = hashToken(r.claim_token);
+      // 現在の claim 確認: 該当行が syncing + claim_id 一致 + token hash 一致
+      const cur = db.prepare(`SELECT sync_status, claim_id, claim_token_hash, claim_attempt_count
+        FROM pd_shipment_tracking WHERE ne_uketsuke_no=?`).get(r.ne_uketsuke_no);
+      if (!cur || cur.sync_status !== 'syncing' || cur.claim_id !== run_id
+          || !cur.claim_token_hash
+          || !timingSafeEqualHex(cur.claim_token_hash, incomingHash)) {
+        // 期限切れ後に他 run が再 claim した、token 不一致、claim_id 違い等 → silently skip
+        mismatched++;
+        continue;
+      }
+      // 結果適用
+      if (r.status === 'synced') {
+        db.prepare(`UPDATE pd_shipment_tracking
+          SET sync_status='synced', ne_synced_at=?, claim_id=NULL, claim_token_hash=NULL,
+              claim_expires_at=NULL, last_error=NULL, last_error_code=NULL,
+              updated_at=?, updated_by='ne_sync_worker'
+          WHERE ne_uketsuke_no=? AND claim_id=?`)
+          .run(r.ne_synced_at || now, now, r.ne_uketsuke_no, run_id);
+        synced++;
+      } else if (r.status === 'manual_review') {
+        db.prepare(`UPDATE pd_shipment_tracking
+          SET sync_status='manual_review', last_error=?, last_error_code=?,
+              claim_id=NULL, claim_token_hash=NULL, claim_expires_at=NULL,
+              updated_at=?, updated_by='ne_sync_worker'
+          WHERE ne_uketsuke_no=? AND claim_id=?`)
+          .run(r.error_message || null, r.error_code || null, now, r.ne_uketsuke_no, run_id);
+        manualReview++;
+      } else {
+        // error: 5 回連続失敗で manual_review に格上げ
+        const newAttempt = (cur.claim_attempt_count || 0); // claim 時に既に +1 されている
+        const escalate = newAttempt >= NE_SYNC_MAX_ATTEMPT;
+        db.prepare(`UPDATE pd_shipment_tracking
+          SET sync_status=?, last_error=?, last_error_code=?,
+              claim_id=NULL, claim_token_hash=NULL, claim_expires_at=NULL,
+              updated_at=?, updated_by='ne_sync_worker'
+          WHERE ne_uketsuke_no=? AND claim_id=?`)
+          .run(escalate ? 'manual_review' : 'error',
+            r.error_message || null, r.error_code || null,
+            now, r.ne_uketsuke_no, run_id);
+        if (escalate) manualReview++; else errored++;
+      }
+    }
+    db.prepare(`UPDATE pd_ne_sync_run SET
+        synced_count = synced_count + ?,
+        error_count = error_count + ?,
+        manual_review_count = manual_review_count + ?,
+        heartbeat_at = ?
+        WHERE run_id=?`)
+      .run(synced, errored, manualReview, now, run_id);
+  });
+  tx();
+  audit('ne_sync_results', run_id, { synced, errored, manualReview, mismatched }, 'ne_sync_worker');
+  return { run_id, synced, errored, manual_review: manualReview, mismatched };
+}
+
+// hex string timing-safe compare
+function timingSafeEqualHex(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
+  const ba = Buffer.from(a, 'utf8');
+  const bb = Buffer.from(b, 'utf8');
+  if (ba.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ba, bb);
+}
+
+/**
+ * Run を完了 (UI または worker から)。残った syncing 行を ready に戻す (= 次回 run で再試行可)。
+ * status: 'done' (全件処理) | 'failed' (job 全体エラー) | 'aborted' (UI からキャンセル)
+ */
+export function completeNeSyncRun({ run_id, status, last_error } = {}) {
+  if (!run_id) throw vErr('run_id is required');
+  const ok = ['done', 'failed', 'aborted'];
+  if (!ok.includes(status)) throw vErr(`invalid status: ${status}`);
+  const db = ensureSchema();
+  const now = utcIsoNow();
+  const tx = db.transaction(() => {
+    const cur = db.prepare(`SELECT status FROM pd_ne_sync_run WHERE run_id=?`).get(run_id);
+    if (!cur) throw vErr(`run not found: ${run_id}`);
+    if (cur.status !== 'running') return; // idempotent: 既に finalize 済み
+    // 残った syncing (= worker が結果を返さなかった行) を ready に戻す
+    db.prepare(`UPDATE pd_shipment_tracking SET sync_status='ready',
+        claim_id=NULL, claim_token_hash=NULL, claim_expires_at=NULL,
+        updated_at=?, updated_by='ne_sync_worker'
+        WHERE sync_status='syncing' AND claim_id=?`).run(now, run_id);
+    db.prepare(`UPDATE pd_ne_sync_run SET status=?, ended_at=?, last_error=? WHERE run_id=?`)
+      .run(status, now, last_error || null, run_id);
+  });
+  tx();
+  audit('ne_sync_run_complete', run_id, { status, last_error }, 'ne_sync_worker');
+  return getNeSyncRun(run_id);
+}

@@ -312,6 +312,27 @@ export function ensureSchema() {
     CREATE INDEX IF NOT EXISTS idx_pd_method_change_source_detected ON pd_method_change_log(source, detected_at);
     CREATE INDEX IF NOT EXISTS idx_pd_method_change_import ON pd_method_change_log(import_id);
     CREATE INDEX IF NOT EXISTS idx_pd_method_change_ne ON pd_method_change_log(shipment_tracking_ne);
+
+    -- ──────────────── NE 反映ジョブ履歴 (Phase 2: PR-A 2026-06-05) ────────────────
+    -- 中原さんが UI で「📤 NE 反映」を押すと 1 run が走る (ミニPC が NE API 呼び出し)。
+    -- 単一起動ロック: status='running' な run があれば新規開始は 409。
+    -- start-run で INSERT、queue で row claim、results で row 個別更新、complete-run で finalize。
+    -- TTL: 中原さん運用は基本 1 日 1-2 回。30 分以上 running のままなら次回 start で expired 扱い。
+    CREATE TABLE IF NOT EXISTS pd_ne_sync_run (
+      run_id TEXT PRIMARY KEY,                  -- UUID v4
+      status TEXT NOT NULL DEFAULT 'running',   -- running / done / failed / aborted / expired
+      started_at TEXT NOT NULL,
+      ended_at TEXT,
+      started_by TEXT,                          -- user email or 'staff' 等 (押した人)
+      target_count INTEGER NOT NULL DEFAULT 0,  -- claim した行数 (累計)
+      synced_count INTEGER NOT NULL DEFAULT 0,
+      error_count INTEGER NOT NULL DEFAULT 0,
+      manual_review_count INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,                          -- job 全体エラー (worker 接続失敗等)
+      heartbeat_at TEXT                         -- 任意ハートビート (今は使わない、将来用)
+    );
+    CREATE INDEX IF NOT EXISTS idx_pd_ne_sync_run_status ON pd_ne_sync_run(status);
+    CREATE INDEX IF NOT EXISTS idx_pd_ne_sync_run_started ON pd_ne_sync_run(started_at);
   `);
 
   // ALTER TABLE migration (既存 DB に新列を追加。SQLite は ADD COLUMN のみ、try/catch で重複 ADD を許容)

@@ -24,7 +24,10 @@ import {
   backfillShipmentTrackingFromExportedBatches, deleteRecentTrackingImports,
   includeUnmatchedToTracking, bulkApplyTeikeigai,
   getReadyExportSummary, getReadyNeUketsukeNos, getReadyTrackingCsv,
+  startNeSyncRun, getNeSyncRun, listRecentNeSyncRuns,
+  claimReadyForNeSync, applyNeSyncResults, completeNeSyncRun,
 } from './service.js';
+import crypto from 'node:crypto';
 import { loadSeed } from './tools/load-shipping-rule-seed.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -43,9 +46,37 @@ function handle(res, fn) {
   try { res.json({ ok: true, result: fn() }); }
   catch (e) {
     if (e.code === 'VALIDATION') return res.status(400).json({ ok: false, error: 'validation', message: e.message, detail: e.detail });
+    if (e.code === 'CONFLICT') return res.status(409).json({ ok: false, error: 'conflict', message: e.message });
     console.error('[packing]', e.message);
     res.status(500).json({ ok: false, error: 'server_error', message: e.message });
   }
+}
+
+// ── ミニPC worker 用 Bearer middleware (fail-closed、構成 B 2026-06-05) ──
+//
+// 構成 B: CF Access は外周防御 (既存運用流用)、Bearer は NE sync 専用 (新規発行)。
+// 未設定 (env 未設定) なら全 endpoint を 503 で fail-closed (Codex 助言、絶対 fail-open しない)。
+// timing-safe compare で token を比較。
+function requireWorkerKey(req, res, next) {
+  const expected = process.env.RENDER_NE_SYNC_WORKER_KEY || '';
+  if (!expected) {
+    // env 未設定 → fail-closed (本番運用前にも誤って認証バイパスしないため)
+    return res.status(503).json({ ok: false, error: 'not_configured',
+      message: 'RENDER_NE_SYNC_WORKER_KEY が未設定です。サーバ管理者に連絡してください。' });
+  }
+  const header = String(req.headers.authorization || '');
+  const m = /^Bearer\s+(\S+)$/.exec(header);
+  if (!m) return res.status(401).json({ ok: false, error: 'unauthorized', message: 'Bearer token がありません' });
+  const got = m[1];
+  // timing-safe compare (length 不一致でも短絡しない)
+  const a = Buffer.from(got, 'utf8');
+  const b = Buffer.from(expected, 'utf8');
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    // 監査ログ: failure のみ記録 (token は記録しない)
+    console.warn('[ne-sync] worker auth failed', { ip: req.ip, ua: req.headers['user-agent'] });
+    return res.status(403).json({ ok: false, error: 'forbidden', message: 'Bearer token が一致しません' });
+  }
+  next();
 }
 
 router.get('/', (req, res) => res.sendFile(path.join(__dirname, 'views', 'index.html')));
@@ -275,6 +306,23 @@ router.get('/api/tracking/ready/csv', (req, res) => {
   }
 });
 
+// ── NE 反映ジョブ (Phase 2 PR-A 2026-06-05、構成 B) ──
+//
+// UI endpoint (session 認証は server.js mount で効く):
+//  POST /api/ne-sync/runs              start (新規 run 作成、単一起動ロック)
+//  GET  /api/ne-sync/runs/:id          状態確認
+//  GET  /api/ne-sync/runs              履歴一覧
+
+// UI: start (新規 run 作成、単一起動ロック)
+router.post('/api/ne-sync/runs', (req, res) => handle(res, () =>
+  startNeSyncRun({ started_by: currentUser(req) })));
+
+// UI: run の状態確認
+router.get('/api/ne-sync/runs/:id', (req, res) => handle(res, () => getNeSyncRun(req.params.id)));
+
+// UI: 履歴一覧
+router.get('/api/ne-sync/runs', (req, res) => handle(res, () => listRecentNeSyncRuns(req.query.limit)));
+
 // 取込履歴
 router.get('/api/tracking/imports', (req, res) => handle(res, () => listTrackingImports()));
 router.get('/api/tracking/imports/:id', (req, res) => handle(res, () => getTrackingImportDetail(req.params.id)));
@@ -328,3 +376,27 @@ router.post('/api/admin/meltline-migration/rollback', (req, res) => {
 });
 
 export default router;
+
+// ── NE 反映 worker 専用 router (Codex R1 High 1 対応、2026-06-05) ──
+//
+// server.js で `/apps/packing-dispatch/api/ne-sync-worker` に session 認証 bypass で mount される。
+// requireAppAccess('packing-dispatch') が手前で効くと、Express session を持たない miniPC が
+// 401/403 で弾かれて到達できなくなるため、UI 用の本体 router とは別 mount する。
+//
+// 認証は requireWorkerKey (Bearer、fail-closed) のみで完結。
+//
+// path:
+//   POST /:run_id/queue    - ready 行を claim (worker pull)
+//   POST /:run_id/results  - バッチ結果反映 (worker push)
+//   POST /:run_id/complete - run finalize
+export const neSyncWorkerRouter = Router();
+neSyncWorkerRouter.use(requireWorkerKey);
+
+neSyncWorkerRouter.post('/:run_id/queue', (req, res) => handle(res, () =>
+  claimReadyForNeSync({ run_id: req.params.run_id, limit: (req.body || {}).limit })));
+
+neSyncWorkerRouter.post('/:run_id/results', (req, res) => handle(res, () =>
+  applyNeSyncResults({ run_id: req.params.run_id, results: (req.body || {}).results })));
+
+neSyncWorkerRouter.post('/:run_id/complete', (req, res) => handle(res, () =>
+  completeNeSyncRun({ run_id: req.params.run_id, status: (req.body || {}).status, last_error: (req.body || {}).last_error })));
