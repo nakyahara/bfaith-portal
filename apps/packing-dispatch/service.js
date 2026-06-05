@@ -1516,12 +1516,15 @@ export function getReadyExportSummary() {
 }
 
 // 配送方法を指定して ready の NE 受注番号一覧を返す (コピー用)。
-// method='all' or 空 で全配送方法。
+// 必ず特定の配送方法を指定すること。'' / 'all' は拒否 (Codex R1 High: NextEngine で
+// 一括検索 → 別配送方法を誤更新する事故防止のため、必ず配送方法を絞らせる)。
 export function getReadyNeUketsukeNos({ method } = {}) {
+  if (!method || method === 'all') {
+    throw vErr('配送方法を指定してください (コピーは配送方法ごとに行います)');
+  }
   const db = ensureSchema();
-  const where = (method && method !== 'all')
-    ? ` AND shipping_method_code=?` : '';
-  const params = (method && method !== 'all') ? [method] : [];
+  const where = ` AND shipping_method_code=?`;
+  const params = [method];
   const rows = db.prepare(`SELECT DISTINCT ne_uketsuke_no
     FROM pd_shipment_tracking
     WHERE sync_status='ready'${where}
