@@ -149,7 +149,12 @@
         <input id="mProduct" placeholder="商品コード" size="20" />
         <button id="btnLoadRules" class="sub">読み込み</button>
         <select id="mMall"><option value="rakuten">rakuten(=既定/楽天・他モール)</option><option value="amazon">amazon</option><option value="yahoo">yahoo</option></select>
+        <span class="muted" style="margin-left:8px">または</span>
+        <input id="mNameQuery" placeholder="商品名で検索 (部分一致、2文字以上)" size="32" />
+        <button id="btnNameSearch" class="sub">検索</button>
+        <span id="mNameSearchStatus" class="muted"></span>
       </div>
+      <div id="mNameSearchResults" class="scroll" style="max-height:30vh; margin-top:6px; display:none"></div>
       <div class="muted">数量帯は 1 から連続・最終段の上限は空(=無制限)。配送方法がネコポス以外だと梱包機は自動的に手動になります。</div>
       <div id="tiers" style="margin-top:10px"></div>
       <div class="row" style="margin-top:8px">
@@ -1148,6 +1153,57 @@ async function loadRules(){
   else $('#tiers').appendChild(tierRow());
 }
 $('#btnLoadRules').onclick=loadRules; $('#mMall').onchange=loadRules;
+
+// 商品名検索 (2026-06-05 中原さん指示): mirror_products から商品コード/商品名 部分一致、
+// 候補をクリックで #mProduct に商品コードを入れて loadRules() を実行
+async function doProductSearch(){
+  const q = $('#mNameQuery').value.trim();
+  const box = $('#mNameSearchResults');
+  if(q.length < 2){
+    $('#mNameSearchStatus').textContent = '2 文字以上で検索';
+    box.style.display = 'none'; box.innerHTML = '';
+    return;
+  }
+  $('#mNameSearchStatus').textContent = '検索中…';
+  try{
+    const rows = await api('api/product-search?q=' + encodeURIComponent(q));
+    $('#mNameSearchStatus').textContent = `${rows.length} 件` + (rows.length === 30 ? ' (上限)' : '');
+    box.style.display = 'block';
+    if(!rows.length){
+      box.innerHTML = '<div class="muted" style="padding:8px">該当する商品がありません</div>';
+      return;
+    }
+    let html = '<table><thead><tr><th>商品コード</th><th>商品名</th><th>取扱区分</th><th>ルール</th><th></th></tr></thead><tbody>';
+    rows.forEach((r, i) => {
+      const ruleBadge = r.has_rule
+        ? '<span class="badge b-ok">登録済</span>'
+        : '<span class="badge b-warn">未登録</span>';
+      html += `<tr><td><code>${esc(r.product_code)}</code></td>`+
+        `<td>${esc(r.product_name || '')}</td>`+
+        `<td>${esc(r.handling || '')}</td>`+
+        `<td>${ruleBadge}</td>`+
+        `<td><button class="sub" data-pick="${i}">この商品を編集</button></td></tr>`;
+    });
+    html += '</tbody></table>';
+    box.innerHTML = html;
+    box.querySelectorAll('[data-pick]').forEach(btn => {
+      btn.onclick = () => {
+        const r = rows[+btn.dataset.pick];
+        $('#mProduct').value = r.product_code;
+        // 検索結果は閉じてフォームに集中
+        box.style.display = 'none'; box.innerHTML = '';
+        $('#mNameQuery').value = ''; $('#mNameSearchStatus').textContent = '';
+        loadRules();
+      };
+    });
+  }catch(e){
+    $('#mNameSearchStatus').textContent = '';
+    box.style.display = 'none';
+    alert('検索エラー: ' + e.message);
+  }
+}
+$('#btnNameSearch').onclick = doProductSearch;
+$('#mNameQuery').addEventListener('keydown', (e) => { if(e.key === 'Enter') doProductSearch(); });
 $('#btnSaveRules').onclick = async () => {
   const code=$('#mProduct').value.trim();
   const mall=$('#mMall').value;

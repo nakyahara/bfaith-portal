@@ -13,7 +13,7 @@ import { ensureSchema, shippingMethodMap, diagInfo, productDiag, assortDiag } fr
 import {
   importCsv, listBatches, batchSummary, listOrders, getOrderDetail, decideOrder, exportCsv,
   listRules, upsertRules, copyRules, searchRules, searchRulesByCondition, bulkUpdateRules,
-  listUnregistered, mirrorFreshness, searchAssort, updateAssort,
+  listUnregistered, mirrorFreshness, searchAssort, updateAssort, searchProducts,
   getMeltlineMigrationPreview, executeMeltlineMigration, rollbackMeltlineMigration,
   listMeltlineBackups, readMeltlineBackup,
   importTrackingCsv, setTrackingManual, markReady, markSkipped,
@@ -133,6 +133,8 @@ router.post('/api/rules', (req, res) => handle(res, () => upsertRules(req.body |
 router.post('/api/rules/copy', (req, res) => handle(res, () => copyRules(req.body || {}, currentUser(req))));
 // 登録済みルールを 商品コード/商品名 で検索 (コピー元の選択用)
 router.get('/api/rule-search', (req, res) => handle(res, () => searchRules(req.query.q || '')));
+// 商品マスタ検索 (商品コード/商品名で部分一致、2026-06-05 中原さん指示)
+router.get('/api/product-search', (req, res) => handle(res, () => searchProducts(req.query.q || '', req.query.limit)));
 // 条件(数量N・配送方法・梱包機・モール、すべて任意)で登録済みルールを検索
 router.get('/api/rule-condition', (req, res) => handle(res, () => searchRulesByCondition({
   qty: req.query.qty, shipping_method_code: req.query.sm || null,

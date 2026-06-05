@@ -1181,6 +1181,35 @@ export function purgeExpiredBatches() {
 
 export { listUnregistered, mirrorFreshness };
 
+// 商品マスタ検索 (商品コード / 商品名 部分一致、上限 30 件、2026-06-05 中原さん指示)
+// 商品マスタ編集フォームで「商品名から検索」用。mirror_products (NE 商品マスタ) から検索。
+// 各候補に has_rule (pd_shipping_rule にルール登録済みかどうか) を付与。
+export function searchProducts(q, limit = 30) {
+  const db = ensureSchema();
+  const term = norm(q);
+  if (!term || term.length < 2) return []; // 1 文字で全件マッチ防止
+  // LIKE のワイルドカード(% _ \)を literal 化
+  const safe = term.replace(/[\\%_]/g, '\\$&');
+  const codeLike = '%' + normProductCode(safe) + '%';
+  const nameLike = '%' + safe.toLowerCase() + '%';
+  // mirror_products から検索、pd_shipping_rule の有無を LEFT JOIN で確認
+  const rows = db.prepare(`
+    SELECT lower(trim(p.商品コード)) AS product_code,
+           p.商品名 AS product_name,
+           p.取扱区分 AS handling,
+           CASE WHEN EXISTS(SELECT 1 FROM pd_shipping_rule r
+                              WHERE r.product_code = lower(trim(p.商品コード)))
+                THEN 1 ELSE 0 END AS has_rule
+      FROM mirror_products p
+     WHERE p.商品コード IS NOT NULL
+       AND (lower(trim(p.商品コード)) LIKE ? ESCAPE '\\'
+            OR lower(trim(p.商品名)) LIKE ? ESCAPE '\\')
+     ORDER BY p.商品コード
+     LIMIT ?
+  `).all(codeLike, nameLike, Math.min(Math.max(1, parseInt(limit, 10) || 30), 100));
+  return rows;
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  追跡番号 / NE反映 (PR 1: CSV取込 + 一覧 + 手動入力 + ready 遷移)
 //  PR 2/3 で sync-queue/result API + ミニPC CLI が後続。
