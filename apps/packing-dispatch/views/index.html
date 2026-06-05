@@ -237,9 +237,10 @@
         <label>梱包機 <select id="cPm"><option value="">（指定なし）</option></select></label>
         <label>モール <select id="cMall"><option value="">（全部）</option><option value="amazon">amazon</option><option value="rakuten">rakuten</option><option value="yahoo">yahoo</option></select></label>
         <button id="btnCondSearch">検索</button>
+        <button id="btnCondCsv" class="sub" disabled>📥 検索結果を CSV 出力</button>
         <span id="cStatus" class="muted"></span>
       </div>
-      <div class="muted">数量を入れると「その数量を含む数量帯」に限定。配送方法・梱包機・モールはそれぞれ任意で絞り込みます（AES は対象外）。</div>
+      <div class="muted">数量を入れると「その数量を含む数量帯」に限定。配送方法・梱包機・モールはそれぞれ任意で絞り込みます（AES は対象外）。検索後に「📥 CSV 出力」で画面に表示中のルール一覧を CSV ダウンロードできます。</div>
     </div>
     <div class="card" id="bulkBar" style="display:none; background:#fffdf5">
       <div class="row">
@@ -1293,6 +1294,8 @@ async function doCondSearch(){
 }
 function renderCond(){
   const tb=$('#condBody'); tb.innerHTML=''; $('#cHeadChk').checked=false;
+  // 検索結果に応じて CSV ボタンの有効化
+  $('#btnCondCsv').disabled = !COND_ROWS.length;
   if(!COND_ROWS.length){ tb.innerHTML='<tr><td colspan="8" class="muted">該当するルールはありません。</td></tr>'; $('#bulkBar').style.display='none'; updateSelCount(); return; }
   COND_ROWS.forEach((r,i)=>{
     const tr=document.createElement('tr');
@@ -1324,6 +1327,56 @@ function editCondRow(r){
 $('#cHeadChk').onchange=()=>{ const c=$('#cHeadChk').checked; $('#condBody').querySelectorAll('.csel').forEach(cb=>cb.checked=c); updateSelCount(); };
 $('#btnCondSearch').onclick=doCondSearch;
 $('#cQty').addEventListener('keydown',(e)=>{ if(e.key==='Enter') doCondSearch(); });
+
+// 検索結果を CSV ダウンロード (2026-06-05 中原さん指示)
+// 現在の COND_ROWS (memory) をそのまま CSV 化、画面表示と完全一致。
+// UTF-8 BOM + CRLF (Excel 互換、既存 NE エクスポートと同方式)。
+$('#btnCondCsv').onclick = () => {
+  if(!COND_ROWS || !COND_ROWS.length){ alert('検索結果がありません'); return; }
+  // CSV escape (Codex R1 High 対応):
+  // - 構造的 escape: ,/"/改行は二重クォート
+  // - Excel formula injection 対策: 先頭が =/+/-/@/タブ/CR の場合は先頭に ' を付ける
+  //   (商品名に =SUM(...) などが入った悪意 CSV を開くと式評価される脆弱性の防御)
+  const csvEsc = (v) => {
+    let s = String(v == null ? '' : v);
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+    return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const header = ['商品コード','バリアント','商品名','モール','数量帯下限','数量帯上限','配送方法コード','配送方法名','梱包機コード','梱包機名'];
+  const lines = COND_ROWS.map(r => {
+    const parts = String(r.sku_key || '').split('::');
+    const variant = [parts[1], parts[2]].filter(Boolean).join('/');
+    return [
+      r.product_code || '',
+      variant,
+      r.product_name || '',
+      r.mall_group || '',
+      String(r.qty_min ?? ''),
+      r.qty_max == null ? '∞' : String(r.qty_max),
+      r.shipping_method_code || '',
+      methodName(r.shipping_method_code),
+      r.packing_machine_code || '',
+      machineName(r.packing_machine_code),
+    ].map(csvEsc).join(',');
+  });
+  const bom = '﻿';
+  const csv = bom + [header.join(','), ...lines].join('\r\n') + '\r\n';
+  const today = new Date().toISOString().slice(0,10).replace(/-/g, '');
+  // ファイル名に検索条件を含める (どの条件で出した CSV か後から見て分かるよう)
+  const condParts = [];
+  if($('#cQty').value.trim()) condParts.push(`qty${$('#cQty').value.trim()}`);
+  if($('#cSm').value) condParts.push($('#cSm').value);
+  if($('#cPm').value) condParts.push($('#cPm').value);
+  if($('#cMall').value) condParts.push($('#cMall').value);
+  const condSlug = condParts.length ? '-' + condParts.join('-') : '';
+  const filename = `pd-rules-${today}${condSlug}-${COND_ROWS.length}rows.csv`;
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+};
 $('#btnBulkApply').onclick=async()=>{
   const items=selectedCondRows().map(r=>({sku_key:r.sku_key, mall_group:r.mall_group, qty_min:r.qty_min, qty_max:r.qty_max}));
   if(!items.length){ alert('変更する行を選択してください'); return; }
