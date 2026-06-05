@@ -427,7 +427,7 @@
         <span style="flex:1"></span>
         <button class="sub" id="btnTrkReadyExportReload">再読込</button>
       </div>
-      <div class="muted">NE 反映 cron 未実装のため当面は手動運用。<b>Step 1</b>: 配送方法を選んで NE 受注番号をコピー → NextEngine で一括検索 → 配送方法を変更。<b>Step 2</b>: 受注番号+追跡番号の CSV をダウンロード → NextEngine の追跡番号 CSV インポートに流す。</div>
+      <div class="muted">NE 反映 cron 未実装のため当面は手動運用。<b>Step 1</b>: 配送方法を <b>1 つ選んで</b> NE 受注番号をコピー → NextEngine で一括検索 → 配送方法を変更。<b>Step 2</b>: 受注番号+追跡番号の CSV をダウンロード → NextEngine の追跡番号 CSV インポートに流す。<br/><span style="color:#c0392b">⚠️ コピーは配送方法ごとに行ってください (まとめて変更すると別配送方法を巻き込みます)。CSV ダウンロードは混在 OK。</span></div>
       <div class="row" style="margin-top:8px">
         <label>配送方法 <select id="trkReadyExportMethod"></select></label>
         <button id="btnTrkReadyCopyUkes" style="background:#2b6cb0; border-color:#2b6cb0">📋 NE 受注番号をコピー</button>
@@ -1837,21 +1837,29 @@ async function loadTrkReadyExport(){
       return;
     }
     card.style.display = 'block';
-    // セレクトボックスに「すべて + 配送方法ごと」を構築 (件数表示付き)
-    const allOption = `<option value="all">すべて (${sum.total} 件)</option>`;
+    // セレクトボックスはデフォルト = 未選択。「すべて」は CSV ダウンロードのみ用途で末尾に置く。
+    // Codex R1 High: デフォルト「すべて」で受注番号コピー → NextEngine で別配送方法を一括変更する
+    // 事故防止のため、コピー操作では明示的に配送方法を選ばせる。
+    const placeholderOption = `<option value="">（配送方法を選択してください）</option>`;
     const methodOptions = sum.rows.map(r => {
       const label = `${methodName(r.shipping_method_code)} — ${r.total} 件` +
         (r.without_tracking > 0 ? ` (追跡なし ${r.without_tracking} 件含む)` : '');
       return `<option value="${esc(r.shipping_method_code)}">${esc(label)}</option>`;
     }).join('');
-    sel.innerHTML = allOption + methodOptions;
+    const allOption = `<option value="all">— すべて (${sum.total} 件) ※ CSV ダウンロードのみ</option>`;
+    sel.innerHTML = placeholderOption + methodOptions + allOption;
   }catch(e){ console.error('[trk-ready-export]', e.message); }
 }
 $('#btnTrkReadyExportReload').onclick = loadTrkReadyExport;
 
-// 📋 NE 受注番号をコピー
+// 📋 NE 受注番号をコピー (Codex R1 High: 配送方法を明示選択させる)
 $('#btnTrkReadyCopyUkes').onclick = async () => {
   const method = $('#trkReadyExportMethod').value;
+  // 「すべて」or 未選択でコピーは禁止 (NextEngine で一括検索 → 別配送方法に変更する事故防止)
+  if(!method || method === 'all'){
+    $('#trkReadyExportStatus').textContent = '⚠️ 配送方法を選んでください (コピーは配送方法ごとに行ってください)';
+    return;
+  }
   $('#trkReadyExportStatus').textContent = '取得中…';
   // API call は 1 回だけ。クリップボード API が使えなくても fallback で同じ text を使う。
   let ukes;
@@ -1883,10 +1891,11 @@ $('#btnTrkReadyCopyUkes').onclick = async () => {
   }
 };
 
-// 📥 CSV ダウンロード
+// 📥 CSV ダウンロード (all/特定配送方法 OK、追跡番号 CSV は混在しても NextEngine が受注番号で判別)
 $('#btnTrkReadyDownloadCsv').onclick = () => {
-  const method = $('#trkReadyExportMethod').value;
-  // 単純なリンク遷移で download attribute はサーバ側 Content-Disposition で渡している
+  let method = $('#trkReadyExportMethod').value;
+  // placeholder (未選択) は all 扱いにする (CSV ダウンロードは混在 OK)
+  if(!method) method = 'all';
   location.href = API_BASE + 'api/tracking/ready/csv?method=' + encodeURIComponent(method);
 };
 
