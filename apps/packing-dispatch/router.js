@@ -321,7 +321,18 @@ router.post('/api/ne-sync/runs', (req, res) => handle(res, () =>
 // CF Access + 専用 Bearer (MINIPC_NE_SYNC_RUN_KEY) で ミニPC を叩く。
 // secret は Render env のみ、UI には渡さない。
 const MINIPC_BASE_URL = 'https://wh.bfaith-wh.uk'; // hardcode (SSRF 防御)
+
+// ⏸️ 一時停止 (2026-06-06、有料 API 課金リスク調整中):
+// shipped API が 1 件 1 call 必要で月 9,000-15,000 件運用だと NE 無料枠超で 30,000 円〜課金。
+// bulkupdate + shipped_update_flag への切り替え検討中。UI ボタンも disable 済だが、
+// API 直叩き / UI 改ざんを防ぐためサーバ側でも 503 で fail-closed。
+const NE_SYNC_PAUSED = true;
+
 router.post('/api/ne-sync/start-and-run', async (req, res) => {
+  if (NE_SYNC_PAUSED) {
+    return res.status(503).json({ ok: false, error: 'paused',
+      message: 'NE 反映機能は一時停止中 (有料 API 課金リスク調整中)。当面は CSV エクスポートで運用してください。' });
+  }
   // Phase 1: start-run (Render 側で run_id 発行)
   let run;
   try {
