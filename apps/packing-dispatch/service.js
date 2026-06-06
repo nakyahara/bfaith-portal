@@ -794,7 +794,7 @@ export function includeUnmatchedToTracking({ ne_uketsuke_no, tracking_no, source
         order_no = COALESCE(order_no, ?),
         product_summary = COALESCE(product_summary, ?),
         updated_at = ?, updated_by = ?
-      WHERE ne_uketsuke_no=? AND sync_status != 'synced'`).run(
+      WHERE ne_uketsuke_no=? AND sync_status IN ('pending','ready','error','conflict','manual_review')`).run(
       tracking_no, source, now,
       e.shop_name || null, e.order_no || null, e.product_summary || null,
       now, user || null, ne_uketsuke_no);
@@ -903,8 +903,10 @@ function registerShipmentTrackingFromBatch(db, lineRows, user) {
       exported_at = excluded.exported_at,
       updated_at = excluded.updated_at,
       updated_by = excluded.updated_by
-    WHERE pd_shipment_tracking.sync_status != 'synced'
+    WHERE pd_shipment_tracking.sync_status IN ('pending','ready','error','conflict','manual_review')
   `);
+  // ↑ 構成 4 + Codex R5 助言: positive whitelist (synced / syncing / skipped / ne_unknown は触らない)。
+  // CSV 出力で worker 管理中 (syncing) や成功確定 (synced) や曖昧 (ne_unknown) を巻き戻さない。
   // changes は INSERT 成功 or UPDATE 成功で 1、synced no-op で 0 を返す。
   // 「CSV は出たが登録 0/少数」を audit から検知できるよう実 UPSERT 件数を返す (Codex R0 High 2)。
   let registered = 0;
@@ -1386,10 +1388,10 @@ export function importTrackingCsv({ source, buffer, filename }, user) {
     FROM pd_shipment_tracking WHERE ne_uketsuke_no=?`);
   const upd = db.prepare(`UPDATE pd_shipment_tracking
     SET tracking_no=?, tracking_source=?, updated_at=?, updated_by=?
-    WHERE ne_uketsuke_no=? AND sync_status != 'synced'`);
+    WHERE ne_uketsuke_no=? AND sync_status IN ('pending','ready','error','conflict','manual_review')`);
   const updConflict = db.prepare(`UPDATE pd_shipment_tracking
     SET sync_status='conflict', last_error=?, updated_at=?, updated_by=?
-    WHERE ne_uketsuke_no=? AND sync_status != 'synced'`);
+    WHERE ne_uketsuke_no=? AND sync_status IN ('pending','ready','error','conflict','manual_review')`);
   const insChangeLog = db.prepare(`INSERT INTO pd_method_change_log
     (detected_at, source, import_id, shipment_tracking_ne, ne_uketsuke_no, tracking_no,
      shop_name, order_no, product_summary, original_method, actual_method, actual_method_raw)
@@ -1493,10 +1495,10 @@ export function setTrackingManual({ entries, source }, user) {
   const sel = db.prepare(`SELECT ne_uketsuke_no, tracking_no, sync_status FROM pd_shipment_tracking WHERE ne_uketsuke_no=?`);
   const upd = db.prepare(`UPDATE pd_shipment_tracking
     SET tracking_no=?, tracking_source=?, updated_at=?, updated_by=?
-    WHERE ne_uketsuke_no=? AND sync_status != 'synced'`);
+    WHERE ne_uketsuke_no=? AND sync_status IN ('pending','ready','error','conflict','manual_review')`);
   const updConflict = db.prepare(`UPDATE pd_shipment_tracking
     SET sync_status='conflict', last_error=?, updated_at=?, updated_by=?
-    WHERE ne_uketsuke_no=? AND sync_status != 'synced'`);
+    WHERE ne_uketsuke_no=? AND sync_status IN ('pending','ready','error','conflict','manual_review')`);
 
   const tx = db.transaction(() => {
     for (const e of entries) {
@@ -1625,7 +1627,7 @@ export function markSkipped({ ids, reason }, user) {
   // synced は除外 (既に反映済みは触らない)
   const n = db.prepare(`UPDATE pd_shipment_tracking
     SET sync_status='skipped', skip_reason=?, updated_at=?, updated_by=?
-    WHERE ne_uketsuke_no IN (${placeholders}) AND sync_status != 'synced'`)
+    WHERE ne_uketsuke_no IN (${placeholders}) AND sync_status IN ('pending','ready','error','conflict','manual_review')`)
     .run(reason, now, user || null, ...ids).changes;
   audit('tracking_mark_skipped', null, { count: n, reason }, user);
   return { updated: n };
@@ -1636,7 +1638,7 @@ export function markSkipped({ ids, reason }, user) {
 export function trackingSummary() {
   const db = ensureSchema();
   const rows = db.prepare(`SELECT sync_status, COUNT(*) c FROM pd_shipment_tracking GROUP BY sync_status`).all();
-  const summary = { pending: 0, ready: 0, syncing: 0, synced: 0, error: 0, conflict: 0, skipped: 0, manual_review: 0, total: 0 };
+  const summary = { pending: 0, ready: 0, syncing: 0, synced: 0, error: 0, conflict: 0, skipped: 0, manual_review: 0, ne_unknown: 0, total: 0 };
   for (const r of rows) { summary[r.sync_status] = r.c; summary.total += r.c; }
   // tracking_no 未割当の pending を別カウント
   summary.pending_no_tracking = db.prepare(`SELECT COUNT(*) c FROM pd_shipment_tracking
@@ -1964,9 +1966,12 @@ export function setTrackingOne({ ne_uketsuke_no, tracking_no, source }, user) {
     throw vErr(`状態が ${cur.sync_status} のため変更できません (編集可: ${editableStatuses.join(',')})`);
   }
   if (cur.tracking_no && trk && cur.tracking_no !== trk) {
+    // 構成 4: positive whitelist (pending/ready/error/conflict/manual_review のみ)。
+    // syncing/synced/skipped/ne_unknown は触らない。
     db.prepare(`UPDATE pd_shipment_tracking
-      SET sync_status='conflict', last_error=?, updated_at=?, updated_by=?
-      WHERE ne_uketsuke_no=? AND sync_status NOT IN ('synced','syncing','skipped')`).run(
+      SET sync_status='conflict', last_error=?, claim_id=NULL,
+          updated_at=?, updated_by=?
+      WHERE ne_uketsuke_no=? AND sync_status IN ('pending','ready','error','conflict','manual_review')`).run(
       `既存=${cur.tracking_no} / 新=${trk} (source=${source})`, now, user || null, uke);
     audit('tracking_set_one_conflict', uke, { source, existing: cur.tracking_no, incoming: trk }, user);
     return { status: 'conflict', message: '既存の追跡番号と異なるため conflict として記録しました', existing: cur.tracking_no };
@@ -1976,9 +1981,9 @@ export function setTrackingOne({ ne_uketsuke_no, tracking_no, source }, user) {
     SET tracking_no=?, tracking_source=?,
         sync_status='pending', sync_requested_at=NULL,
         last_error=NULL, last_error_code=NULL,
-        claim_id=NULL, syncing_started_at=NULL, claim_expires_at=NULL, claim_attempt_count=0,
+        claim_id=NULL, syncing_started_at=NULL,
         updated_at=?, updated_by=?
-    WHERE ne_uketsuke_no=? AND sync_status NOT IN ('synced','syncing','skipped')`)
+    WHERE ne_uketsuke_no=? AND sync_status IN ('pending','ready','error','conflict','manual_review')`)
     .run(trk, source, now, user || null, uke);
   audit('tracking_set_one', uke, { source, has_tracking: !!trk }, user);
   return { status: 'ok' };
@@ -2345,43 +2350,73 @@ export function readMeltlineBackup(filename) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  NE 反映ジョブ (Phase 2, PR-A 2026-06-05、構成 B: CF Access 既存 + Bearer 専用)
-//  ミニPC がこれらの内部 API を叩いて NE 反映を実行する。Render は queue + state のみ管理。
+//  NE 反映ジョブ (Phase 2, 2026-06-06、構成 4: simple-hybrid + ne_unknown)
+//
+//  運用: 中原さんが 1 日 1 回 (夕方) UI ボタンで起動 → ミニPC worker が一括反映。
+//
+//  状態遷移:
+//    pending → ready → syncing → synced              ← 正常完了
+//                              → manual_review       ← NE 業務エラー (受注なし、キャンセル等)
+//                              → ne_unknown          ← NE 反映成功後の DB / ack / クラッシュ
+//
+//  ルール:
+//    - ne_unknown は自動 retry しない (= 滞留問題なし、中原さんが翌日確認)
+//    - syncing 中の payload を巻き戻す経路を作らない (positive whitelist で防ぐ)
+//    - claim_token / late-results / TTL release / journal は廃止 (構成 B から簡素化)
+//    - Bearer 認証 (CF Access + RENDER_NE_SYNC_WORKER_KEY) で worker を保護
+//    - 1 run = 1 attempt_id (= run_id を流用)、行ごとには発行しない
 // ═══════════════════════════════════════════════════════════════════
 
-const NE_SYNC_RUN_EXPIRY_MIN = 30; // running な run が 30 分以上更新なし → 次回 start で expired 扱い
-const NE_SYNC_CLAIM_TTL_MIN = 15;  // claim 取得から 15 分経過 → 期限切れ、次回 queue で再 claim 可能
-const NE_SYNC_MAX_ATTEMPT = 5;     // 連続失敗 5 回で manual_review
+const NE_SYNC_RUN_EXPIRY_MIN = 60; // running が 60 分以上更新なし → 次回 start で expired、syncing は ne_unknown
 
-// 平文 claim_token を sha256 hash 化 (DB 保存は hash のみ、平文は worker メモリ + journal で保持)
-function hashToken(token) { return crypto.createHash('sha256').update(String(token)).digest('hex'); }
+// 「Render が触ってよい状態」の positive whitelist (Codex R5 助言)
+// payload を変える経路 (CSV 出力、setTrackingManual 等) は必ずこのいずれかでガードする
+const PD_EDITABLE_STATUSES = ['pending', 'ready', 'error', 'conflict', 'manual_review'];
+const PD_EDITABLE_PLACEHOLDERS = PD_EDITABLE_STATUSES.map(() => '?').join(',');
 
 /**
  * NE 反映 run を開始 (UI ボタンから 1 回ずつ)。単一起動ロック: running が既にあれば 409。
  * 古い running (30 分以上更新なし) は expired として finalize してから新規開始。
  */
+/**
+ * NE 反映 run を開始 (UI ボタンから 1 回ずつ)。
+ * - 単一起動ロック: running が既にあれば 409
+ * - 古い running (60 分以上 heartbeat なし) は expired に
+ * - 構成 4: 前回 run が中断して残った syncing 行は **ne_unknown** に落とす
+ *   (= 自動 retry せず、中原さんが翌日確認)
+ */
 export function startNeSyncRun({ started_by } = {}) {
   const db = ensureSchema();
   const now = utcIsoNow();
   const tx = db.transaction(() => {
-    // 古い running を expired に finalize (TTL 切れ自動掃除)。
-    // Codex R1 High 2: heartbeat_at を考慮、worker が進行中なら expired 扱いしない。
+    // 古い running を expired に finalize (heartbeat_at 考慮)
     const cutoff = new Date(Date.now() - NE_SYNC_RUN_EXPIRY_MIN * 60 * 1000).toISOString();
     db.prepare(`UPDATE pd_ne_sync_run SET status='expired', ended_at=?,
         last_error='run expired (no heartbeat within ' || ? || ' min)'
         WHERE status='running' AND COALESCE(heartbeat_at, started_at) < ?`).run(now, NE_SYNC_RUN_EXPIRY_MIN, cutoff);
-    // 単一起動ロック: 他の running があれば 409 相当 (vErr)
+    // expired 化された run に紐づく syncing 行は ne_unknown に (= 自動 retry しない)
+    db.prepare(`UPDATE pd_shipment_tracking
+        SET sync_status='ne_unknown',
+            last_error=COALESCE(last_error, 'syncing left after run expired'),
+            last_error_code=COALESCE(last_error_code, 'NE_UNKNOWN_RUN_EXPIRED'),
+            claim_id=NULL, syncing_started_at=NULL,
+            updated_at=?, updated_by='ne_sync_system'
+        WHERE sync_status='syncing'
+          AND claim_id IN (SELECT run_id FROM pd_ne_sync_run WHERE status='expired')`).run(now);
+    // 単一起動ロック
     const existing = db.prepare(`SELECT run_id, started_at, started_by FROM pd_ne_sync_run WHERE status='running' LIMIT 1`).get();
     if (existing) {
       const err = vErr(`既に実行中の run があります (run_id=${existing.run_id}, by=${existing.started_by || '?'}, started=${existing.started_at})`);
       err.code = 'CONFLICT';
       throw err;
     }
-    // 期限切れ claim を ready に戻す (TTL 自動回収)
-    const claimCutoff = new Date(Date.now() - NE_SYNC_CLAIM_TTL_MIN * 60 * 1000).toISOString();
-    db.prepare(`UPDATE pd_shipment_tracking SET sync_status='ready', claim_id=NULL, claim_token_hash=NULL,
-        claim_expires_at=NULL, syncing_started_at=NULL
-        WHERE sync_status='syncing' AND (claim_expires_at IS NULL OR claim_expires_at < ?)`).run(claimCutoff);
+    // 念のため: claim_id が NULL の syncing (= 過去の異常状態) も ne_unknown に
+    db.prepare(`UPDATE pd_shipment_tracking
+        SET sync_status='ne_unknown',
+            last_error=COALESCE(last_error, 'orphan syncing without claim_id'),
+            last_error_code=COALESCE(last_error_code, 'NE_UNKNOWN_ORPHAN'),
+            updated_at=?, updated_by='ne_sync_system'
+        WHERE sync_status='syncing' AND claim_id IS NULL`).run(now);
     const run_id = crypto.randomUUID();
     db.prepare(`INSERT INTO pd_ne_sync_run (run_id, status, started_at, started_by) VALUES (?, 'running', ?, ?)`)
       .run(run_id, now, started_by || null);
@@ -2412,53 +2447,57 @@ export function listRecentNeSyncRuns(limit = 50) {
 }
 
 /**
- * ミニPC worker が呼ぶ: ready 行を limit 件 atomic claim → syncing に遷移。
- * claim_id = run_id を使う (1 run = 1 claim_id でシンプル)。claim_token は行ごとにランダム発行、
- * DB には sha256 hash のみ保存、平文は worker レスポンスでだけ返す (結果 POST で照合)。
+ * ミニPC worker が呼ぶ: ready 行を atomic claim → syncing に遷移。
+ * 構成 4: claim_id = run_id のみで管理。claim_token は廃止 (Bearer 認証で worker を保護)。
+ * error 行も attempt 制限なしで再 claim 対象 (構成 4: manual_review/ne_unknown へ早く落とす)。
  */
-export function claimReadyForNeSync({ run_id, limit = 50 } = {}) {
+export function claimReadyForNeSync({ run_id } = {}) {
   if (!run_id) throw vErr('run_id is required');
   const db = ensureSchema();
   const run = db.prepare(`SELECT status FROM pd_ne_sync_run WHERE run_id=?`).get(run_id);
   if (!run) throw vErr(`run not found: ${run_id}`);
   if (run.status !== 'running') throw vErr(`run is not running (status=${run.status})`);
-  const lim = Math.max(1, Math.min(100, parseInt(limit, 10) || 50));
+  // 構成 4 不変条件 (Codex R3 High): claim は **常に 1 件**。
+  // batch claim を許すと「途中失敗時に未処理行も ne_unknown になる」問題が再発する。
+  // worker 側 CLI でも 1 固定だが、サーバ側でも強制してリクエスト偽造を防ぐ。
+  const lim = 1;
   const now = utcIsoNow();
-  const expiresAt = new Date(Date.now() + NE_SYNC_CLAIM_TTL_MIN * 60 * 1000).toISOString();
-  // ne_carrier_id / is_locked を JOIN で同梱 (worker が NE API 用 carrier_id を持つ)
   const tx = db.transaction(() => {
-    // 候補: ready 行 と attempt < 5 の error 行 (Codex R1 High 3: 自動 retry 経路)。
-    // sync_requested_at 古い順、aes は除外 (is_locked=1)。
+    // Codex R4 High 対応: 同一 run_id で既に outstanding な syncing 行があれば新規 claim しない。
+    // これがないと worker が results 前に /queue を連発して claim を貯められ、worker 落ち→
+    // complete で複数行が ne_unknown になる (R3 High が経路を変えて再発)。
+    // worker は 1 件 claim → 1 件 NE 反映 → 1 件 results POST → 次の 1 件 claim、の順を強制される。
+    const outstanding = db.prepare(`SELECT COUNT(*) AS c FROM pd_shipment_tracking
+      WHERE sync_status='syncing' AND claim_id=?`).get(run_id);
+    if (outstanding.c > 0) {
+      throw vErr(`outstanding syncing がある間は新規 claim できません (count=${outstanding.c}, run_id=${run_id}). 直前の results を POST してから再 claim してください。`);
+    }
+    // 候補: ready 行 と error 行 (構成 4: error の自動 retry は持つが、回数制限なし。
+    // NE 業務エラーは worker 側で manual_review に落とす)
+    // aes (is_locked=1) は除外。
     const candidates = db.prepare(`
       SELECT t.ne_uketsuke_no, t.tracking_no, t.tracking_source, t.shipping_method_code,
              t.method_at_export, t.shop_name, t.order_no, t.product_summary, t.sync_status,
              sm.ne_carrier_id, sm.is_locked
         FROM pd_shipment_tracking t
         JOIN pd_shipping_method sm ON sm.code = t.shipping_method_code
-       WHERE (t.sync_status = 'ready'
-              OR (t.sync_status = 'error' AND COALESCE(t.claim_attempt_count, 0) < ?))
+       WHERE t.sync_status IN ('ready', 'error')
          AND COALESCE(sm.is_locked, 0) = 0
        ORDER BY t.sync_requested_at ASC, t.ne_uketsuke_no ASC
        LIMIT ?
-    `).all(NE_SYNC_MAX_ATTEMPT, lim);
+    `).all(lim);
     if (!candidates.length) return [];
-    // 各行に claim_token を発行 + UPDATE
-    // 元 status (ready or error) を WHERE に挟んで他 worker との race を防ぐ
+    // syncing に遷移。WHERE で元 status を照合して race を防ぐ。
     const upd = db.prepare(`UPDATE pd_shipment_tracking
-      SET sync_status='syncing', claim_id=?, claim_token_hash=?, claim_expires_at=?,
-          syncing_started_at=?, claim_attempt_count=claim_attempt_count+1,
+      SET sync_status='syncing', claim_id=?, syncing_started_at=?,
           updated_at=?, updated_by='ne_sync_worker'
       WHERE ne_uketsuke_no=? AND sync_status=?`);
     const claimed = [];
     for (const r of candidates) {
-      const token = crypto.randomBytes(24).toString('hex');
-      const hash = hashToken(token);
-      const info = upd.run(run_id, hash, expiresAt, now, now, r.ne_uketsuke_no, r.sync_status);
+      const info = upd.run(run_id, now, now, r.ne_uketsuke_no, r.sync_status);
       if (info.changes > 0) {
-        // 平文 token は worker にのみ返す (DB には hash のみ)
         claimed.push({
           ne_uketsuke_no: r.ne_uketsuke_no,
-          claim_token: token, // worker が結果 POST で送り返す、Render は hash 比較で照合
           tracking_no: r.tracking_no,
           tracking_source: r.tracking_source,
           shipping_method_code: r.shipping_method_code,
@@ -2470,7 +2509,6 @@ export function claimReadyForNeSync({ run_id, limit = 50 } = {}) {
         });
       }
     }
-    // run の target_count を加算
     db.prepare(`UPDATE pd_ne_sync_run SET target_count = target_count + ?, heartbeat_at=? WHERE run_id=?`)
       .run(claimed.length, now, run_id);
     return claimed;
@@ -2481,11 +2519,13 @@ export function claimReadyForNeSync({ run_id, limit = 50 } = {}) {
 }
 
 /**
- * ミニPC worker が呼ぶ: バッチ結果を反映。各 result の claim_token と DB の claim_token_hash を
- * 照合してから状態遷移。claim 切れ・トークン不一致は silently skip (idempotent)。
+ * ミニPC worker が呼ぶ: バッチ結果を反映。
+ * 構成 4: claim_id (= run_id) のみで照合、token なし。
+ * 受理する status: 'synced' | 'manual_review' | 'ne_unknown'
+ * (構成 4 では 'error' を worker 側で出さない: 業務エラーは manual_review、
+ *  通信/クラッシュは Render 側で ne_unknown 化される)
  *
- * results: [{ ne_uketsuke_no, claim_token, status: 'synced'|'error'|'manual_review',
- *             error_code?, error_message?, ne_synced_at? }]
+ * results: [{ ne_uketsuke_no, status, error_code?, error_message?, ne_synced_at? }]
  */
 export function applyNeSyncResults({ run_id, results } = {}) {
   if (!run_id) throw vErr('run_id is required');
@@ -2495,26 +2535,21 @@ export function applyNeSyncResults({ run_id, results } = {}) {
   if (!run) throw vErr(`run not found: ${run_id}`);
   if (run.status !== 'running') throw vErr(`run is not running (status=${run.status})`);
   const now = utcIsoNow();
-  let synced = 0, errored = 0, manualReview = 0, mismatched = 0;
+  let synced = 0, manualReview = 0, neUnknown = 0, mismatched = 0;
+  const ACCEPTED_STATUSES = new Set(['synced', 'manual_review', 'ne_unknown']);
   const tx = db.transaction(() => {
     for (const r of results) {
-      if (!r || !r.ne_uketsuke_no || !r.claim_token) { mismatched++; continue; }
-      const incomingHash = hashToken(r.claim_token);
-      // 現在の claim 確認: 該当行が syncing + claim_id 一致 + token hash 一致
-      const cur = db.prepare(`SELECT sync_status, claim_id, claim_token_hash, claim_attempt_count
-        FROM pd_shipment_tracking WHERE ne_uketsuke_no=?`).get(r.ne_uketsuke_no);
-      if (!cur || cur.sync_status !== 'syncing' || cur.claim_id !== run_id
-          || !cur.claim_token_hash
-          || !timingSafeEqualHex(cur.claim_token_hash, incomingHash)) {
-        // 期限切れ後に他 run が再 claim した、token 不一致、claim_id 違い等 → silently skip
+      if (!r || !r.ne_uketsuke_no || !ACCEPTED_STATUSES.has(r.status)) { mismatched++; continue; }
+      const cur = db.prepare(`SELECT sync_status, claim_id FROM pd_shipment_tracking WHERE ne_uketsuke_no=?`).get(r.ne_uketsuke_no);
+      // 構成 4: syncing + claim_id 一致だけで照合 (Bearer で worker を保護)
+      if (!cur || cur.sync_status !== 'syncing' || cur.claim_id !== run_id) {
         mismatched++;
         continue;
       }
-      // 結果適用
       if (r.status === 'synced') {
         db.prepare(`UPDATE pd_shipment_tracking
-          SET sync_status='synced', ne_synced_at=?, claim_id=NULL, claim_token_hash=NULL,
-              claim_expires_at=NULL, last_error=NULL, last_error_code=NULL,
+          SET sync_status='synced', ne_synced_at=?, claim_id=NULL, syncing_started_at=NULL,
+              last_error=NULL, last_error_code=NULL,
               updated_at=?, updated_by='ne_sync_worker'
           WHERE ne_uketsuke_no=? AND claim_id=?`)
           .run(r.ne_synced_at || now, now, r.ne_uketsuke_no, run_id);
@@ -2522,51 +2557,40 @@ export function applyNeSyncResults({ run_id, results } = {}) {
       } else if (r.status === 'manual_review') {
         db.prepare(`UPDATE pd_shipment_tracking
           SET sync_status='manual_review', last_error=?, last_error_code=?,
-              claim_id=NULL, claim_token_hash=NULL, claim_expires_at=NULL,
+              claim_id=NULL, syncing_started_at=NULL,
               updated_at=?, updated_by='ne_sync_worker'
           WHERE ne_uketsuke_no=? AND claim_id=?`)
           .run(r.error_message || null, r.error_code || null, now, r.ne_uketsuke_no, run_id);
         manualReview++;
       } else {
-        // error: 5 回連続失敗で manual_review に格上げ
-        const newAttempt = (cur.claim_attempt_count || 0); // claim 時に既に +1 されている
-        const escalate = newAttempt >= NE_SYNC_MAX_ATTEMPT;
+        // ne_unknown: NE 反映に成功したが結果不明 (DB / 通信 / クラッシュ)
+        // 自動 retry しない、中原さんが翌日確認
         db.prepare(`UPDATE pd_shipment_tracking
-          SET sync_status=?, last_error=?, last_error_code=?,
-              claim_id=NULL, claim_token_hash=NULL, claim_expires_at=NULL,
+          SET sync_status='ne_unknown', last_error=?, last_error_code=?,
+              claim_id=NULL, syncing_started_at=NULL,
               updated_at=?, updated_by='ne_sync_worker'
           WHERE ne_uketsuke_no=? AND claim_id=?`)
-          .run(escalate ? 'manual_review' : 'error',
-            r.error_message || null, r.error_code || null,
-            now, r.ne_uketsuke_no, run_id);
-        if (escalate) manualReview++; else errored++;
+          .run(r.error_message || null, r.error_code || 'NE_UNKNOWN', now, r.ne_uketsuke_no, run_id);
+        neUnknown++;
       }
     }
     db.prepare(`UPDATE pd_ne_sync_run SET
         synced_count = synced_count + ?,
-        error_count = error_count + ?,
         manual_review_count = manual_review_count + ?,
+        error_count = error_count + ?,
         heartbeat_at = ?
         WHERE run_id=?`)
-      .run(synced, errored, manualReview, now, run_id);
+      .run(synced, manualReview, neUnknown, now, run_id);
   });
   tx();
-  audit('ne_sync_results', run_id, { synced, errored, manualReview, mismatched }, 'ne_sync_worker');
-  return { run_id, synced, errored, manual_review: manualReview, mismatched };
-}
-
-// hex string timing-safe compare
-function timingSafeEqualHex(a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
-  const ba = Buffer.from(a, 'utf8');
-  const bb = Buffer.from(b, 'utf8');
-  if (ba.length !== bb.length) return false;
-  return crypto.timingSafeEqual(ba, bb);
+  audit('ne_sync_results', run_id, { synced, manualReview, neUnknown, mismatched }, 'ne_sync_worker');
+  return { run_id, synced, manual_review: manualReview, ne_unknown: neUnknown, mismatched };
 }
 
 /**
- * Run を完了 (UI または worker から)。残った syncing 行を ready に戻す (= 次回 run で再試行可)。
- * status: 'done' (全件処理) | 'failed' (job 全体エラー) | 'aborted' (UI からキャンセル)
+ * Run を完了。残った syncing 行 (worker が結果を返さなかった行) は **ne_unknown** に。
+ * 構成 4: ready に戻さない、自動 retry しない、中原さんが翌日確認する運用。
+ * status: 'done' | 'failed' | 'aborted'
  */
 export function completeNeSyncRun({ run_id, status, last_error } = {}) {
   if (!run_id) throw vErr('run_id is required');
@@ -2578,9 +2602,12 @@ export function completeNeSyncRun({ run_id, status, last_error } = {}) {
     const cur = db.prepare(`SELECT status FROM pd_ne_sync_run WHERE run_id=?`).get(run_id);
     if (!cur) throw vErr(`run not found: ${run_id}`);
     if (cur.status !== 'running') return; // idempotent: 既に finalize 済み
-    // 残った syncing (= worker が結果を返さなかった行) を ready に戻す
-    db.prepare(`UPDATE pd_shipment_tracking SET sync_status='ready',
-        claim_id=NULL, claim_token_hash=NULL, claim_expires_at=NULL,
+    // 構成 4: 残った syncing は ne_unknown に (= 自動 retry しない、中原さんが翌日確認)
+    // NE 反映済みの可能性があるため ready に戻さない (二重反映防止)
+    db.prepare(`UPDATE pd_shipment_tracking SET sync_status='ne_unknown',
+        last_error=COALESCE(last_error, 'worker did not return result before run complete'),
+        last_error_code=COALESCE(last_error_code, 'NE_UNKNOWN_NO_RESULT'),
+        claim_id=NULL, syncing_started_at=NULL,
         updated_at=?, updated_by='ne_sync_worker'
         WHERE sync_status='syncing' AND claim_id=?`).run(now, run_id);
     db.prepare(`UPDATE pd_ne_sync_run SET status=?, ended_at=?, last_error=? WHERE run_id=?`)

@@ -393,7 +393,7 @@ export const neSyncWorkerRouter = Router();
 neSyncWorkerRouter.use(requireWorkerKey);
 
 neSyncWorkerRouter.post('/:run_id/queue', (req, res) => handle(res, () =>
-  claimReadyForNeSync({ run_id: req.params.run_id, limit: (req.body || {}).limit })));
+  claimReadyForNeSync({ run_id: req.params.run_id })));
 
 neSyncWorkerRouter.post('/:run_id/results', (req, res) => handle(res, () =>
   applyNeSyncResults({ run_id: req.params.run_id, results: (req.body || {}).results })));

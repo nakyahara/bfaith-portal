@@ -96,6 +96,8 @@ async function authenticate(callbackUrl) {
 
 // ─── API呼び出し ───
 
+// 他モジュール (ne-sync-runner 等) から再利用するため export 化 (2026-06-06 構成 4 PR)
+export { callNE, loadTokens, saveTokens };
 async function callNE(endpoint, params = {}) {
   const tokens = loadTokens();
   if (!tokens) throw new Error('トークンがありません。先に認証してください: node ne-api.js auth <callback_url>');
@@ -437,7 +439,11 @@ async function main() {
   }
 }
 
-main().catch(e => {
-  console.error('[NE] エラー:', e.message);
-  process.exit(1);
-});
+// CLI として直接実行された時のみ main() を起動 (import 時は起動しない、2026-06-06 構成 4 PR)
+const isDirectRun = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+if (isDirectRun) {
+  main().catch(e => {
+    console.error('[NE] エラー:', e.message);
+    process.exit(1);
+  });
+}

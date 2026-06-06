@@ -456,6 +456,7 @@
           <option value="conflict">競合</option>
           <option value="skipped">対象外</option>
           <option value="manual_review">要手動確認</option>
+          <option value="ne_unknown">⚠️ 要確認 (ne_unknown)</option>
         </select></label>
         <label class="muted">取込元 <select id="trkFilterSource">
           <option value="">すべて</option>
@@ -1735,19 +1736,22 @@ const _dRun = $('#btnDelImportsRun'); if(_dRun) _dRun.onclick = () => runDeleteR
 // ── 追跡番号 / NE反映 タブ (PR 1: CSV取込 + 一覧 + 手動入力 + ready/skip) ──
 const TRK_STATUS_LABELS = {
   pending:       { label: '反映待ち', color: '#777',    sub: '追跡番号未紐付け or 未 ready 化' },
-  ready:         { label: '反映可',    color: '#2b6cb0', sub: 'NE 反映待ち (cron で処理)' },
+  ready:         { label: '反映可',    color: '#2b6cb0', sub: 'NE 反映待ち' },
   syncing:       { label: '反映中',    color: '#f39c12', sub: 'ミニPCが処理中' },
   synced:        { label: '反映済',    color: '#2e7d32', sub: 'NE 反映完了' },
   error:         { label: '失敗',       color: '#c0392b', sub: 'NE 反映失敗、リトライ可' },
   conflict:      { label: '競合',       color: '#e67e22', sub: 'NE側に既存値あり、人間判断' },
   skipped:       { label: '対象外',    color: '#999',    sub: '欠品等で NE 反映しない' },
-  manual_review: { label: '要手動確認', color: '#8e44ad', sub: '5回失敗 or 不正データ' },
+  manual_review: { label: '要手動確認', color: '#8e44ad', sub: 'NE 業務エラー / 不正データ' },
+  // 構成 4 で追加: NE 反映後の通信/クラッシュで成否不明、自動 retry しない、翌日確認
+  ne_unknown:    { label: '⚠️ 要確認', color: '#d35400', sub: 'NE 反映後の通信/クラッシュで成否不明。NextEngine で実態確認のうえ手動解決' },
 };
 
 function trkRenderSummary(s){
   if(!s) return;
   const box = $('#trackingSummary');
-  const order = ['pending', 'ready', 'syncing', 'synced', 'error', 'conflict', 'skipped', 'manual_review'];
+  // 表示順序: 構成 4 では ne_unknown を「要手動確認」の隣に置き、運用上の確認対象として目立たせる
+  const order = ['pending', 'ready', 'syncing', 'synced', 'error', 'conflict', 'skipped', 'manual_review', 'ne_unknown'];
   box.innerHTML = order.map(k => {
     const cfg = TRK_STATUS_LABELS[k];
     const c = s[k] || 0;
