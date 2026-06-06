@@ -15,10 +15,11 @@
  *   node apps/ne-sync-runner/runner.js --run-id=<uuid> [--limit=50] [--dry-run]
  *
  * 環境変数 (fail-closed、未設定で起動拒否):
- *   RENDER_BASE_URL                   = https://bfaith-portal.onrender.com (allowlist 照合)
  *   RENDER_NE_SYNC_WORKER_KEY         = Render 側で発行した Bearer
  *   NE_CLIENT_ID / NE_CLIENT_SECRET   = NE OAuth (既存)
  *   DATA_DIR (任意)                   = ne-tokens.json + PID 保存先 (デフォルト data/)
+ *
+ * Render URL は hardcode (中原さん指示 2026-06-06、SSRF 防御として env 受け取り廃止)
  */
 import 'dotenv/config';
 import fs from 'node:fs';
@@ -29,13 +30,13 @@ import { callNE, loadTokens } from '../warehouse/ne-api.js';
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 const PID_FILE = path.join(DATA_DIR, 'ne-sync-runner.pid');
 
-// ─── env validation + allowlist (fail-closed) ───
-const ALLOWED_ORIGINS = new Set([
-  'https://bfaith-portal.onrender.com', // 本番のみ
-]);
+// Render の URL は ハードコード (中原さん指示 2026-06-06)。
+// env で受け取らない = SSRF 防御として完全 (env 操作で URL 変更不可)。
+const RENDER_BASE_URL = 'https://bfaith-portal.onrender.com';
+
+// ─── env validation (fail-closed) ───
 function loadEnv() {
   const required = {
-    RENDER_BASE_URL: process.env.RENDER_BASE_URL,
     RENDER_NE_SYNC_WORKER_KEY: process.env.RENDER_NE_SYNC_WORKER_KEY,
     NE_CLIENT_ID: process.env.NE_CLIENT_ID,
     NE_CLIENT_SECRET: process.env.NE_CLIENT_SECRET,
@@ -45,22 +46,7 @@ function loadEnv() {
     console.error('[ne-sync-runner] 環境変数が未設定: ' + missing.join(', '));
     process.exit(2);
   }
-  let originBase;
-  try {
-    const u = new URL(required.RENDER_BASE_URL);
-    if (u.protocol !== 'https:') throw new Error('must be https');
-    if (u.pathname !== '/' && u.pathname !== '') throw new Error('must not contain path');
-    if (u.search || u.hash) throw new Error('must not contain query or fragment');
-    originBase = u.origin;
-  } catch (e) {
-    console.error('[ne-sync-runner] RENDER_BASE_URL 不正: ' + e.message);
-    process.exit(2);
-  }
-  if (!ALLOWED_ORIGINS.has(originBase)) {
-    console.error(`[ne-sync-runner] RENDER_BASE_URL=${originBase} は allowlist 外`);
-    process.exit(2);
-  }
-  return { ...required, RENDER_BASE_URL: originBase };
+  return { ...required, RENDER_BASE_URL };
 }
 
 function redact(s) {
