@@ -42,6 +42,7 @@ import inventoryMonthlyRouter, { apiRouter as inventoryMonthlyApiRouter } from '
 import misShipmentRouter from './apps/mis-shipment/router.js';
 import serviceRouter from './apps/warehouse/service-router.js';
 import { serviceAuth } from './apps/warehouse/service-auth.js';
+import { neSyncControlRouter } from './apps/warehouse/ne-sync-control-router.js';
 import { isWarehouseDbReady } from './apps/warehouse/router.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -776,6 +777,17 @@ app.use('/service-api', serviceAuth, (req, res, next) => {
   if (req.method === 'POST' && SERVICE_RAW_PATHS.includes(req.path)) return next();
   return express.json({ limit: '50mb' })(req, res, next);
 }, serviceRouter);
+
+// NE 反映 worker 起動 control endpoint (2026-06-06 PR-C 構成 4)
+// 既存 serviceAuth と独立した別 mount で、専用 Bearer (MINIPC_NE_SYNC_RUN_KEY) で保護。
+// CF Access は edge で前段、ここは Bearer fail-closed + spawn 即返却。
+//
+// Codex R1 High 1 対応: ENABLE_MINIPC_NE_SYNC_CONTROL=1 のミニPC 専用 env で mount 自体を gate。
+// Render では mount しない (= worker spawn endpoint が Render に立たない、攻撃面削減)。
+if (process.env.ENABLE_MINIPC_NE_SYNC_CONTROL === '1') {
+  app.use('/ne-sync-control', express.json({ limit: '64kb' }), neSyncControlRouter);
+  console.log('[server] ne-sync-control mounted (miniPC mode)');
+}
 app.use('/apps/amazon-accounting', (req, res, next) => {
   if (req.path === '/import-history' && req.method === 'POST') return next();  // APIキー認証に委譲
   requireAuth(req, res, next);

@@ -317,6 +317,62 @@ router.get('/api/tracking/ready/csv', (req, res) => {
 router.post('/api/ne-sync/runs', (req, res) => handle(res, () =>
   startNeSyncRun({ started_by: currentUser(req) })));
 
+// UI: start-and-run (start-run + ミニPC worker 起動を 1 リクエストで実行、PR-C 構成 4)
+// CF Access + 専用 Bearer (MINIPC_NE_SYNC_RUN_KEY) で ミニPC を叩く。
+// secret は Render env のみ、UI には渡さない。
+const MINIPC_BASE_URL = 'https://wh.bfaith-wh.uk'; // hardcode (SSRF 防御)
+router.post('/api/ne-sync/start-and-run', async (req, res) => {
+  // Phase 1: start-run (Render 側で run_id 発行)
+  let run;
+  try {
+    run = startNeSyncRun({ started_by: currentUser(req) });
+  } catch (e) {
+    if (e.code === 'VALIDATION') return res.status(400).json({ ok: false, error: 'validation', message: e.message });
+    if (e.code === 'CONFLICT') return res.status(409).json({ ok: false, error: 'conflict', message: e.message });
+    console.error('[ne-sync start]', e.message);
+    return res.status(500).json({ ok: false, error: 'server_error', message: e.message });
+  }
+  // Phase 2: ミニPC worker 起動 (HTTP POST、即返却を期待)
+  const runKey = process.env.MINIPC_NE_SYNC_RUN_KEY || '';
+  const cfId = process.env.CF_ACCESS_CLIENT_ID || '';
+  const cfSecret = process.env.CF_ACCESS_CLIENT_SECRET || '';
+  if (!runKey || !cfId || !cfSecret) {
+    // fail-closed: run は既に作られているので complete(failed) してクリーンアップ
+    try { completeNeSyncRun({ run_id: run.run_id, status: 'failed', last_error: 'env missing on Render' }); } catch {}
+    return res.status(503).json({ ok: false, error: 'not_configured',
+      message: 'MINIPC_NE_SYNC_RUN_KEY / CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET が未設定です' });
+  }
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 15000); // 15秒で abort
+    const r = await fetch(MINIPC_BASE_URL + '/ne-sync-control/start', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${runKey}`,
+        'CF-Access-Client-Id': cfId,
+        'CF-Access-Client-Secret': cfSecret,
+      },
+      body: JSON.stringify({ run_id: run.run_id }),
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    const text = await r.text();
+    let data; try { data = JSON.parse(text); } catch { data = { ok: false, message: text.slice(0, 300) }; }
+    if (!r.ok || !data.ok) {
+      try { completeNeSyncRun({ run_id: run.run_id, status: 'failed', last_error: `worker spawn failed: HTTP ${r.status}` }); } catch {}
+      return res.status(502).json({ ok: false, error: 'worker_start_failed',
+        message: `ミニPC worker 起動失敗: HTTP ${r.status}: ${data && data.message || ''}`,
+        run_id: run.run_id });
+    }
+    return res.json({ ok: true, result: { run_id: run.run_id, pid: data.pid || null, started_at: run.started_at } });
+  } catch (e) {
+    try { completeNeSyncRun({ run_id: run.run_id, status: 'failed', last_error: `worker comm error: ${e.message}` }); } catch {}
+    return res.status(502).json({ ok: false, error: 'worker_unreachable',
+      message: `ミニPC に到達できません: ${e.message}`, run_id: run.run_id });
+  }
+});
+
 // UI: run の状態確認
 router.get('/api/ne-sync/runs/:id', (req, res) => handle(res, () => getNeSyncRun(req.params.id)));
 

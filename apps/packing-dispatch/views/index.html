@@ -425,6 +425,31 @@
       </div>
     </div>
 
+    <!-- 📤 NE 反映実行 (構成 4、2026-06-06 PR-C) -->
+    <div class="card" id="trkNeSyncCard" style="background:#e8f5e9; border-color:#7fbf7f">
+      <div class="row">
+        <strong>📤 NextEngine に反映実行</strong>
+        <span id="trkNeSyncStatus" class="muted"></span>
+        <span style="flex:1"></span>
+        <button id="btnTrkNeSyncStart" style="background:#2e7d32; border-color:#2e7d32">📤 NE 反映を開始</button>
+      </div>
+      <div class="muted">
+        ready 状態の伝票を 1 件ずつ NextEngine API で反映します (検索 → 配送方法+追跡番号更新 → 出荷確定)。
+        押した後はミニPC で worker が背景実行され、画面下に進捗が出ます。
+        <b>失敗時に <span style="color:#d35400">⚠️ 要確認 (ne_unknown)</span> 状態になった伝票は翌日 NextEngine で実態確認してください</b> (自動再試行しません)。
+      </div>
+      <div id="trkNeSyncProgress" style="margin-top:8px; display:none">
+        <div class="row">
+          <span class="muted">run_id:</span> <code id="trkNeSyncRunId"></code>
+          <span class="muted">開始:</span> <span id="trkNeSyncStartedAt"></span>
+          <span style="flex:1"></span>
+          <span id="trkNeSyncRunStatus"></span>
+        </div>
+        <div id="trkNeSyncCounts" class="row" style="margin-top:4px"></div>
+        <div class="muted" id="trkNeSyncNote" style="margin-top:4px"></div>
+      </div>
+    </div>
+
     <!-- NE 手動反映用エクスポート (cron 未実装の暫定運用、2026-06-04) -->
     <div class="card" id="trkReadyExportCard" style="background:#f0f7ff; border-color:#b3d4ff">
       <div class="row">
@@ -2361,10 +2386,86 @@ $('#btnTrkMarkReady').onclick = async () => {
     const r = await api('api/tracking/mark-ready', { method:'POST',
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ allPending: true })});
-    alert(`${r.updated} 件を ready にしました。\n(NE への実反映は別途 cron で実行されます — PR 2/3 で実装予定)`);
+    alert(`${r.updated} 件を ready にしました。\n上の「📤 NE 反映を開始」を押すと NextEngine に反映が走ります。`);
     await loadTrackingAll();
   }catch(e){ alert('エラー: '+e.message); }
 };
+
+// ── 📤 NE 反映実行 (構成 4 PR-C、2026-06-06) ──
+let NE_SYNC_POLL_TIMER = null;
+function fmtJst(iso){
+  if(!iso) return '';
+  const d = new Date(iso);
+  if(isNaN(d.getTime())) return iso;
+  const jst = new Date(d.getTime() + 9*3600*1000);
+  return jst.toISOString().replace('T',' ').slice(0,19) + ' JST';
+}
+$('#btnTrkNeSyncStart').onclick = async () => {
+  if(!confirm('ready 状態の伝票を NextEngine に反映します (1 件ずつ、500 件で約 30-60 分)。よろしいですか?')) return;
+  $('#btnTrkNeSyncStart').disabled = true;
+  $('#trkNeSyncStatus').textContent = '起動中…';
+  try{
+    const r = await api('api/ne-sync/start-and-run', { method:'POST',
+      headers:{'Content-Type':'application/json'}, body:'{}' });
+    $('#trkNeSyncStatus').textContent = '✅ Worker 起動成功';
+    $('#trkNeSyncProgress').style.display = 'block';
+    $('#trkNeSyncRunId').textContent = r.run_id;
+    $('#trkNeSyncStartedAt').textContent = fmtJst(r.started_at);
+    pollNeSyncRun(r.run_id);
+  }catch(e){
+    $('#trkNeSyncStatus').textContent = '❌ エラー: ' + e.message;
+    $('#btnTrkNeSyncStart').disabled = false;
+  }
+};
+async function pollNeSyncRun(run_id){
+  if(NE_SYNC_POLL_TIMER){ clearInterval(NE_SYNC_POLL_TIMER); NE_SYNC_POLL_TIMER = null; }
+  const renderProgress = async () => {
+    try{
+      const run = await api('api/ne-sync/runs/' + encodeURIComponent(run_id));
+      if(!run){
+        $('#trkNeSyncRunStatus').textContent = '? (run 不在)'; return;
+      }
+      const statusBadge = ({
+        running: '<span class="badge b-auto">実行中</span>',
+        done: '<span class="badge b-ok">完了</span>',
+        failed: '<span class="badge b-warn">失敗</span>',
+        aborted: '<span class="badge b-warn">中断</span>',
+        expired: '<span class="badge b-warn">期限切れ</span>',
+      })[run.status] || run.status;
+      $('#trkNeSyncRunStatus').innerHTML = statusBadge;
+      const target = run.target_count || 0;
+      const synced = run.synced_count || 0;
+      const manual = run.manual_review_count || 0;
+      const unk = run.error_count || 0;
+      const remaining = Math.max(0, target - synced - manual - unk);
+      const unkBadge = unk > 0
+        ? `<span style="color:#d35400; font-weight:bold">⚠️ 要確認 ${unk} 件</span>` : '';
+      $('#trkNeSyncCounts').innerHTML =
+        `<span>処理済 <b>${synced + manual + unk}</b> / 取得 <b>${target}</b></span>`+
+        `<span style="margin-left:16px; color:#2e7d32">✅ 反映済 ${synced}</span>`+
+        `<span style="margin-left:16px; color:#8e44ad">手動確認 ${manual}</span>`+
+        (unkBadge ? `<span style="margin-left:16px">${unkBadge}</span>` : '');
+      let note = '';
+      if(run.status === 'running'){
+        note = '実行中… 1 件約 5-10 秒。500 件で 30-60 分。';
+      } else if(run.status === 'done'){
+        note = `✅ 完了。${unk > 0 ? `⚠️ ne_unknown ${unk} 件は NextEngine で実態確認のうえ手動解決してください。` : ''}`;
+      } else if(run.status === 'failed' || run.status === 'aborted' || run.status === 'expired'){
+        note = `${run.status}: ${run.last_error || '(理由不明)'} - ${run.status === 'expired' ? 'Worker 応答なし、未完了行は ne_unknown に。' : ''}`;
+      }
+      $('#trkNeSyncNote').textContent = note;
+      // 終了状態なら polling 停止
+      if(run.status !== 'running'){
+        if(NE_SYNC_POLL_TIMER){ clearInterval(NE_SYNC_POLL_TIMER); NE_SYNC_POLL_TIMER = null; }
+        $('#btnTrkNeSyncStart').disabled = false;
+        loadTrackingAll();
+      }
+    }catch(e){ console.warn('[ne-sync poll]', e.message); }
+  };
+  await renderProgress();
+  // Codex+Claude 議論: 常時 5 秒 polling (シンプルさ優先)
+  NE_SYNC_POLL_TIMER = setInterval(renderProgress, 5000);
+}
 
 // 検索 / フィルタ
 $('#btnTrkSearch').onclick = loadTrackingList;
