@@ -425,18 +425,17 @@
       </div>
     </div>
 
-    <!-- 📤 NE 反映実行 (構成 4、2026-06-06 PR-C) -->
-    <div class="card" id="trkNeSyncCard" style="background:#e8f5e9; border-color:#7fbf7f">
+    <!-- 📤 NE 反映実行 (構成 4、2026-06-06 PR-C) - 一時停止中 (有料 API 課金リスクのため bulkupdate 化検討中) -->
+    <div class="card" id="trkNeSyncCard" style="background:#fdf2e9; border-color:#f5b041">
       <div class="row">
-        <strong>📤 NextEngine に反映実行</strong>
+        <strong style="color:#a04000">⏸️ NextEngine 反映機能 (一時停止中)</strong>
         <span id="trkNeSyncStatus" class="muted"></span>
         <span style="flex:1"></span>
-        <button id="btnTrkNeSyncStart" style="background:#2e7d32; border-color:#2e7d32">📤 NE 反映を開始</button>
+        <button id="btnTrkNeSyncStart" disabled style="background:#ccc; border-color:#999; cursor:not-allowed">📤 NE 反映を開始 (停止中)</button>
       </div>
-      <div class="muted">
-        ready 状態の伝票を 1 件ずつ NextEngine API で反映します (検索 → 配送方法+追跡番号更新 → 出荷確定)。
-        押した後はミニPC で worker が背景実行され、画面下に進捗が出ます。
-        <b>失敗時に <span style="color:#d35400">⚠️ 要確認 (ne_unknown)</span> 状態になった伝票は翌日 NextEngine で実態確認してください</b> (自動再試行しません)。
+      <div class="muted" style="color:#a04000">
+        ⚠️ <b>一時停止中</b>: shipped API が 1 件 1 call 必要で、月 9,000-15,000 件運用だと NE 無料枠 (1,000 call/月) を超えて課金 (30,000 円〜) が発生するため、
+        bulkupdate + shipped_update_flag への切り替え検討中 (2026-06-06)。当面は「📤 NE 手動反映用エクスポート」の CSV ダウンロードで運用してください。
       </div>
       <div id="trkNeSyncProgress" style="margin-top:8px; display:none">
         <div class="row">
