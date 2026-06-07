@@ -1531,49 +1531,56 @@ export function setTrackingManual({ entries, source }, user) {
 // 対象は sync_status='ready' (= 「これで NE 反映する」ボタンを押し終わった伝票)
 
 // 配送方法ごとの ready 件数 (UI のセレクトボックス表示用)。
-export function getReadyExportSummary() {
+export function getReadyExportSummary({ scope = 'today' } = {}) {
   const db = ensureSchema();
+  // Phase 1 UI 再設計 (2026-06-07): scope='today' で本日のみに絞る
+  const todayWhere = scope === 'today'
+    ? `AND date(COALESCE(exported_at, added_at), '+9 hours') = date('now', '+9 hours')` : '';
   const rows = db.prepare(`SELECT shipping_method_code,
       COUNT(*) AS total,
       SUM(CASE WHEN tracking_no IS NOT NULL THEN 1 ELSE 0 END) AS with_tracking,
       SUM(CASE WHEN tracking_no IS NULL THEN 1 ELSE 0 END) AS without_tracking
     FROM pd_shipment_tracking
-    WHERE sync_status='ready'
+    WHERE sync_status='ready' ${todayWhere}
     GROUP BY shipping_method_code
     ORDER BY shipping_method_code`).all();
   const total = rows.reduce((s, r) => s + r.total, 0);
   const totalWithTracking = rows.reduce((s, r) => s + r.with_tracking, 0);
-  return { rows, total, total_with_tracking: totalWithTracking };
+  return { rows, total, total_with_tracking: totalWithTracking, scope };
 }
 
 // 配送方法を指定して ready の NE 受注番号一覧を返す (コピー用)。
 // 必ず特定の配送方法を指定すること。'' / 'all' は拒否 (Codex R1 High: NextEngine で
 // 一括検索 → 別配送方法を誤更新する事故防止のため、必ず配送方法を絞らせる)。
-export function getReadyNeUketsukeNos({ method } = {}) {
+export function getReadyNeUketsukeNos({ method, scope = 'today' } = {}) {
   if (!method || method === 'all') {
     throw vErr('配送方法を指定してください (コピーは配送方法ごとに行います)');
   }
   const db = ensureSchema();
-  const where = ` AND shipping_method_code=?`;
-  const params = [method];
+  // Codex R1 High 3: ready/summary と range が合うよう scope 対応
+  const todayWhere = scope === 'today'
+    ? ` AND date(COALESCE(exported_at, added_at), '+9 hours') = date('now', '+9 hours')` : '';
   const rows = db.prepare(`SELECT DISTINCT ne_uketsuke_no
     FROM pd_shipment_tracking
-    WHERE sync_status='ready'${where}
-    ORDER BY ne_uketsuke_no`).all(...params);
+    WHERE sync_status='ready' AND shipping_method_code=?${todayWhere}
+    ORDER BY ne_uketsuke_no`).all(method);
   return rows.map(r => r.ne_uketsuke_no);
 }
 
 // NE 受注番号 + 追跡番号の 2 列 CSV を生成 (UTF-8 BOM 付き、Shift-JIS のため Excel/NE 互換)。
 // tracking_no が NULL のもの (定形外/未紐付け) は除外。
 // 配送方法フィルタは getReadyNeUketsukeNos と同じ仕様。
-export function getReadyTrackingCsv({ method } = {}) {
+export function getReadyTrackingCsv({ method, scope = 'today' } = {}) {
   const db = ensureSchema();
+  // Codex R1 High 3: scope 対応
+  const todayWhere = scope === 'today'
+    ? ` AND date(COALESCE(exported_at, added_at), '+9 hours') = date('now', '+9 hours')` : '';
   const where = (method && method !== 'all')
     ? ` AND shipping_method_code=?` : '';
   const params = (method && method !== 'all') ? [method] : [];
   const rows = db.prepare(`SELECT ne_uketsuke_no, tracking_no, shipping_method_code
     FROM pd_shipment_tracking
-    WHERE sync_status='ready' AND tracking_no IS NOT NULL${where}
+    WHERE sync_status='ready' AND tracking_no IS NOT NULL${where}${todayWhere}
     ORDER BY shipping_method_code, ne_uketsuke_no`).all(...params);
   // CSV escape: ダブルクォート囲み + 内部の " は ""
   const esc = (v) => {
@@ -1635,15 +1642,52 @@ export function markSkipped({ ids, reason }, user) {
 
 // ─── 一覧 / サマリ ───
 
-export function trackingSummary() {
+export function trackingSummary({ scope = 'today' } = {}) {
   const db = ensureSchema();
-  const rows = db.prepare(`SELECT sync_status, COUNT(*) c FROM pd_shipment_tracking GROUP BY sync_status`).all();
-  const summary = { pending: 0, ready: 0, syncing: 0, synced: 0, error: 0, conflict: 0, skipped: 0, manual_review: 0, ne_unknown: 0, total: 0 };
-  for (const r of rows) { summary[r.sync_status] = r.c; summary.total += r.c; }
-  // tracking_no 未割当の pending を別カウント
-  summary.pending_no_tracking = db.prepare(`SELECT COUNT(*) c FROM pd_shipment_tracking
-    WHERE sync_status='pending' AND tracking_no IS NULL AND (tracking_source IS NULL OR tracking_source != 'no_tracking')`).get().c;
-  return summary;
+  // 2026-06-07 Phase 1 UI 再設計 (中原さん + Codex 助言、状態駆動・本日デフォルト)
+  // - scope='today': 本日 (JST) アップロード分のみ (= exported_at JST = today、未exported は added_at JST = today で補完)
+  // - scope='all': 全件 (過去履歴ボタンで使う)
+  const todayWhere = scope === 'today'
+    ? `WHERE date(COALESCE(exported_at, added_at), '+9 hours') = date('now', '+9 hours')` : '';
+  const rows = db.prepare(`SELECT sync_status, COUNT(*) c FROM pd_shipment_tracking ${todayWhere} GROUP BY sync_status`).all();
+  const raw = { pending: 0, ready: 0, syncing: 0, synced: 0, error: 0, conflict: 0, skipped: 0, manual_review: 0, ne_unknown: 0, total: 0 };
+  for (const r of rows) { raw[r.sync_status] = r.c; raw.total += r.c; }
+  // Codex R1 High 2 対応: pending を「未紐付け (waiting)」と「紐付け済 (linked)」に分離。
+  // linked = pending + (tracking_no がある OR 定形外マーク tracking_source='no_tracking')
+  //        = markReady で一発 ready 化できる、CSV 出力直前段階
+  const pendingScopeAnd = scope === 'today'
+    ? `AND date(COALESCE(exported_at, added_at), '+9 hours') = date('now', '+9 hours')` : '';
+  const pendingNoTracking = db.prepare(`SELECT COUNT(*) c FROM pd_shipment_tracking
+    WHERE sync_status='pending' AND tracking_no IS NULL AND (tracking_source IS NULL OR tracking_source != 'no_tracking')
+    ${pendingScopeAnd}`).get().c;
+  const pendingLinked = db.prepare(`SELECT COUNT(*) c FROM pd_shipment_tracking
+    WHERE sync_status='pending' AND (tracking_no IS NOT NULL OR tracking_source='no_tracking')
+    ${pendingScopeAnd}`).get().c;
+  // 5 状態に正規化 (UI 用、DB は触らない)。Codex 助言:
+  //   - 紐付け待ち (waiting): pending + tracking_no NULL + 定形外マーク未
+  //   - 紐付け済 (linked):    pending + tracking_no あり or 定形外マーク済 (= markReady で ready 化可能)
+  //   - CSV作成対象 (csv_ready): ready
+  //   - 要確認 (needs_check): conflict / error / manual_review / ne_unknown / syncing
+  //   - 対象外 (excluded): skipped
+  // synced (= 過去 API 反映済) は手動 CSV 運用では表示しない
+  const buckets = {
+    waiting: pendingNoTracking,
+    linked: pendingLinked,
+    csv_ready: raw.ready,
+    needs_check: raw.conflict + raw.error + raw.manual_review + raw.ne_unknown + raw.syncing,
+    excluded: raw.skipped,
+  };
+  buckets.total = buckets.waiting + buckets.linked + buckets.csv_ready + buckets.needs_check + buckets.excluded;
+  // 業務状態: 完了 = waiting/linked/needs_check が全て 0 かつ csv_ready > 0 (= 残作業なし、CSV ダウンロード可)
+  const allDone = buckets.csv_ready > 0
+    && buckets.waiting === 0 && buckets.linked === 0 && buckets.needs_check === 0;
+  return {
+    scope,
+    buckets,                  // 4 状態の件数
+    raw,                       // 既存 9 状態 (デバッグ / 詳細表示用)
+    pending_no_tracking: pendingNoTracking,  // 後方互換
+    all_done: allDone,
+  };
 }
 
 export function listTracking({ status, source, shop, q, limit = 1000 } = {}) {

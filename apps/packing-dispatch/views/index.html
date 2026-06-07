@@ -305,20 +305,30 @@
     </div>
   </section>
 
-  <!-- ───── 追跡番号 / NE反映 (PR 1: CSV取込 + 一覧 + 手動入力 + ready/skip) ───── -->
+  <!-- ───── 追跡番号 / NE反映 (Phase 1 UI 再設計、2026-06-07、状態駆動 + 本日デフォルト) ───── -->
   <section class="panel" id="panel-tracking">
-    <div class="help-bar">
-      💡 この画面の使い方: CSV出力した伝票を、キャリアCSV (ヤマト/ゆうパケパフ) や手動入力 (レターパック/定形外) で追跡番号と紐付け → 「これで反映する」で NE 反映待ち (ready) に。NE への実反映は <span class="muted">PR 2/3 で実装予定</span>。
+
+    <!-- スコープ切替 (本日 / 過去履歴) -->
+    <div class="row" style="margin-bottom:8px">
+      <strong style="font-size:16px">今日の出荷CSV作成</strong>
+      <span id="trkScopeLabel" class="muted">本日 (--)</span>
+      <span style="flex:1"></span>
+      <button id="btnTrkScopeToday" class="sub" style="background:#2b6cb0; border-color:#2b6cb0; color:white">本日</button>
+      <button id="btnTrkScopePast" class="sub">過去履歴を見る</button>
+      <button id="btnTrackingReload" class="sub">再読込</button>
     </div>
 
-    <!-- サマリ -->
-    <div class="card">
-      <div class="row">
-        <strong>状態サマリ</strong>
-        <span style="flex:1"></span>
-        <button id="btnTrackingReload" class="sub">再読込</button>
+    <!-- 状態駆動メインカード (未完了 = 確認画面 / 完了 = CSV画面、Codex 案、絵文字最小) -->
+    <div class="card" id="trkMainCard" style="background:#fafcff; border:2px solid #2b6cb0">
+      <div id="trkMainContent">
+        <div class="muted">読込中…</div>
       </div>
-      <div id="trackingSummary" class="summary"></div>
+    </div>
+
+    <!-- 未対応の内訳 (主ボタンの下、業務フロー順: 定形外 → レターパック → 紐付け待ち) -->
+    <div class="card" id="trkBreakdownCard" style="display:none">
+      <strong>未対応の内訳</strong>
+      <div id="trkBreakdownList" style="margin-top:8px"></div>
     </div>
 
     <!-- CSV 取込 -->
@@ -425,31 +435,7 @@
       </div>
     </div>
 
-    <!-- 📤 NE 反映実行 (構成 4、2026-06-06 PR-C) - 一時停止中 (有料 API 課金リスクのため bulkupdate 化検討中) -->
-    <div class="card" id="trkNeSyncCard" style="background:#fdf2e9; border-color:#f5b041">
-      <div class="row">
-        <strong style="color:#a04000">⏸️ NextEngine 反映機能 (一時停止中)</strong>
-        <span id="trkNeSyncStatus" class="muted"></span>
-        <span style="flex:1"></span>
-        <button id="btnTrkNeSyncStart" disabled style="background:#ccc; border-color:#999; cursor:not-allowed">📤 NE 反映を開始 (停止中)</button>
-      </div>
-      <div class="muted" style="color:#a04000">
-        ⚠️ <b>一時停止中</b>: shipped API が 1 件 1 call 必要で、月 9,000-15,000 件運用だと NE 無料枠 (1,000 call/月) を超えて課金 (30,000 円〜) が発生するため、
-        bulkupdate + shipped_update_flag への切り替え検討中 (2026-06-06)。当面は「📤 NE 手動反映用エクスポート」の CSV ダウンロードで運用してください。
-      </div>
-      <div id="trkNeSyncProgress" style="margin-top:8px; display:none">
-        <div class="row">
-          <span class="muted">run_id:</span> <code id="trkNeSyncRunId"></code>
-          <span class="muted">開始:</span> <span id="trkNeSyncStartedAt"></span>
-          <span style="flex:1"></span>
-          <span id="trkNeSyncRunStatus"></span>
-        </div>
-        <div id="trkNeSyncCounts" class="row" style="margin-top:4px"></div>
-        <div class="muted" id="trkNeSyncNote" style="margin-top:4px"></div>
-      </div>
-    </div>
-
-    <!-- NE 手動反映用エクスポート (cron 未実装の暫定運用、2026-06-04) -->
+    <!-- NE 手動反映用エクスポート (主ボタンは状態駆動メインカードに移動、ここは詳細操作用) -->
     <div class="card" id="trkReadyExportCard" style="background:#f0f7ff; border-color:#b3d4ff">
       <div class="row">
         <strong>📤 NE 手動反映用エクスポート (ready 状態のみ)</strong>
@@ -1771,24 +1757,133 @@ const TRK_STATUS_LABELS = {
   ne_unknown:    { label: '⚠️ 要確認', color: '#d35400', sub: 'NE 反映後の通信/クラッシュで成否不明。NextEngine で実態確認のうえ手動解決' },
 };
 
-function trkRenderSummary(s){
+// 状態駆動メインカード (Codex 案、2026-06-07 Phase 1)
+// - 未完了時: 「次にやること: 残り N 件を確認してください」+ 主ボタン「今すぐ確認する」
+// - 完了時: 「✅ N 件完了」+ 主ボタン「CSV ダウンロード」
+// - 主ボタンは常に 1 つだけ目立たせる (Codex 助言)
+let TRK_SCOPE = 'today'; // 'today' or 'all' (過去履歴ボタンで切替)
+let TRK_LOADED_ONCE = false; // タブ切替時の初回ロード判定
+function trkRenderMain(s){
   if(!s) return;
-  const box = $('#trackingSummary');
-  // 表示順序: 構成 4 では ne_unknown を「要手動確認」の隣に置き、運用上の確認対象として目立たせる
-  const order = ['pending', 'ready', 'syncing', 'synced', 'error', 'conflict', 'skipped', 'manual_review', 'ne_unknown'];
-  box.innerHTML = order.map(k => {
-    const cfg = TRK_STATUS_LABELS[k];
-    const c = s[k] || 0;
-    return `<div><div class="num" style="color:${cfg.color}">${c}</div><div class="muted" title="${esc(cfg.sub)}">${cfg.label}</div></div>`;
-  }).join('') + `<div><div class="num">${s.total||0}</div><div class="muted">合計</div></div>`
-    + (s.pending_no_tracking > 0
-      ? `<div><div class="num" style="color:#c0392b">${s.pending_no_tracking}</div><div class="muted" title="紐付け待ち">うち未紐付け</div></div>` : '');
+  const main = $('#trkMainContent');
+  const breakdownCard = $('#trkBreakdownCard');
+  const breakdownList = $('#trkBreakdownList');
+  const scopeLabel = $('#trkScopeLabel');
+  const b = s.buckets || {};
+  const total = b.total || 0;
+  const csvReady = b.csv_ready || 0;
+  const waiting = b.waiting || 0;
+  const linked = b.linked || 0; // Codex R1 High 2: pending + tracking_no あり (= ready 化待ち)
+  const needsCheck = b.needs_check || 0;
+  const excluded = b.excluded || 0;
+  const remaining = waiting + linked + needsCheck;
+  const allDone = s.all_done && total > 0;
+  // 本日 / 過去スコープ表示
+  const today = new Date(Date.now() + 9*3600*1000).toISOString().slice(0,10);
+  scopeLabel.textContent = TRK_SCOPE === 'today' ? `本日 (${today} JST)` : '過去履歴 (全期間)';
+  // 進捗バー %
+  const processed = csvReady + excluded; // 確定済 (= CSV対象 + 対象外)
+  const pct = total > 0 ? Math.round(processed / total * 100) : 0;
+  // 状態駆動描画
+  if(total === 0){
+    main.innerHTML = `
+      <div style="text-align:center; padding:20px">
+        <div style="font-size:18px; color:#777; margin-bottom:8px">${TRK_SCOPE === 'today' ? '本日アップロードされた伝票はまだありません' : '対象データがありません'}</div>
+        <div class="muted">${TRK_SCOPE === 'today' ? '取込・判定 タブで NE 受注 CSV をアップロードしてください' : ''}</div>
+      </div>`;
+    breakdownCard.style.display = 'none';
+  } else if(allDone){
+    // 完了時: 主ボタン = CSV ダウンロード
+    main.innerHTML = `
+      <div style="text-align:center; padding:12px 8px">
+        <div style="font-size:28px; color:#2e7d32; margin-bottom:4px">✅ ${total} 件 完了</div>
+        <div class="muted" style="margin-bottom:16px">次にやること: NextEngine に取り込む CSV をダウンロードしてください</div>
+        <button id="btnTrkMainCsvDownload" style="background:#2e7d32; border-color:#2e7d32; font-size:16px; padding:12px 24px">📥 CSV ダウンロード (${csvReady} 件)</button>
+      </div>
+      <div class="muted" style="margin-top:12px; text-align:center">
+        対象外 (欠品等): ${excluded} 件
+      </div>`;
+    breakdownCard.style.display = 'none';
+    const btn = $('#btnTrkMainCsvDownload');
+    if(btn) btn.onclick = () => {
+      // CSV ダウンロードカード (#trkReadyExportCard) の「すべて」を選択して CSV ダウンロード
+      const sel = $('#trkReadyExportMethod');
+      if(sel){ sel.value = 'all'; }
+      const dlBtn = $('#btnTrkReadyDownloadCsv');
+      if(dlBtn) dlBtn.click();
+      else alert('CSV ダウンロード機能の初期化中です。再読込してください。');
+    };
+  } else {
+    // 未完了時: 主ボタン = 今すぐ確認する (= 残作業内訳カードを表示してスクロール)
+    main.innerHTML = `
+      <div style="padding:8px">
+        <div class="row" style="margin-bottom:8px">
+          <span style="font-size:18px">⚠️ 残り <b style="color:#c0392b">${remaining}</b> 件を確認してください</span>
+          <span style="flex:1"></span>
+          <span class="muted">処理済 ${processed} / ${total} 件</span>
+        </div>
+        <div style="background:#e0e0e0; height:18px; border-radius:9px; overflow:hidden; margin-bottom:12px">
+          <div style="background:#2e7d32; height:100%; width:${pct}%; transition:width .3s"></div>
+        </div>
+        <div style="text-align:center; margin-bottom:8px">
+          <button id="btnTrkMainCheck" style="background:#2b6cb0; border-color:#2b6cb0; font-size:16px; padding:12px 24px">👇 今すぐ確認する</button>
+        </div>
+        <div class="muted" style="text-align:center">CSV ダウンロードは残り ${remaining} 件の確認後に有効化されます</div>
+      </div>`;
+    const checkBtn = $('#btnTrkMainCheck');
+    if(checkBtn) checkBtn.onclick = () => {
+      breakdownCard.scrollIntoView({ behavior:'smooth', block:'start' });
+    };
+    // Codex R1 High 4: 過去履歴モードでは内訳カードを表示しない (アンカー先 (定形外/レターパック)
+    // は常に本日分のため、過去モードで「残り N 件」と出してもアンカー先が空で混乱を招く)
+    if(TRK_SCOPE === 'all'){
+      breakdownList.innerHTML = '<div class="muted">過去履歴モードでは詳細データ (下記の追跡番号一覧/取込履歴) で確認してください</div>';
+      breakdownCard.style.display = 'block';
+      return;
+    }
+    // 残作業内訳 (業務フロー順: 定形外/レターパック → 紐付け済 → 要確認)
+    const items = [];
+    if(waiting > 0){
+      items.push(`<div class="row" style="padding:6px 0; border-bottom:1px solid #eee">
+        <span>📫 定形外・📮 レターパック・未紐付け</span>
+        <span style="flex:1"></span>
+        <b style="color:#c0392b">${waiting} 件</b>
+        <a href="#trkTeikeigaiCard" style="margin-left:12px">定形外カードへ ↓</a>
+      </div>`);
+    }
+    if(linked > 0){
+      items.push(`<div class="row" style="padding:6px 0; border-bottom:1px solid #eee">
+        <span>🔗 紐付け済 (CSV作成対象へ移動が必要)</span>
+        <span style="flex:1"></span>
+        <b style="color:#e67e22">${linked} 件</b>
+        <a href="#" id="btnTrkMarkReadyFromBreakdown" style="margin-left:12px">これで反映するボタンへ ↓</a>
+      </div>`);
+    }
+    if(needsCheck > 0){
+      items.push(`<div class="row" style="padding:6px 0; border-bottom:1px solid #eee">
+        <span>⚠️ 要確認 (競合・エラー等)</span>
+        <span style="flex:1"></span>
+        <b style="color:#d35400">${needsCheck} 件</b>
+        <a href="#trkMissingCard" style="margin-left:12px">未割当アラートへ ↓</a>
+      </div>`);
+    }
+    breakdownList.innerHTML = items.join('') || '<div class="muted">対応すべき項目はありません</div>';
+    breakdownCard.style.display = 'block';
+    // 紐付け済 アンカー (「これで反映する」ボタンへスクロール)
+    const linkedAnchor = $('#btnTrkMarkReadyFromBreakdown');
+    if(linkedAnchor) linkedAnchor.onclick = (e) => {
+      e.preventDefault();
+      const target = $('#btnTrkMarkReady');
+      if(target) target.scrollIntoView({ behavior:'smooth', block:'center' });
+    };
+  }
 }
 
 async function loadTrackingAll(){
   try{
-    const sum = await api('api/tracking/summary');
-    trkRenderSummary(sum);
+    // Phase 1: scope クエリで本日/全期間切替
+    const sum = await api('api/tracking/summary?scope=' + TRK_SCOPE);
+    trkRenderMain(sum);
     await Promise.all([
       loadTrackingList(),
       loadTrkImports(),
@@ -1963,7 +2058,7 @@ $('#btnTrkMissingReload').onclick = loadTrkMissing;
 // ── NE 手動反映用エクスポート (2026-06-04、cron 未実装の暫定運用) ──
 async function loadTrkReadyExport(){
   try{
-    const sum = await api('api/tracking/ready/summary');
+    const sum = await api('api/tracking/ready/summary?scope=' + TRK_SCOPE);
     const sel = $('#trkReadyExportMethod');
     const card = $('#trkReadyExportCard');
     $('#trkReadyExportSummary').textContent = sum.total > 0
@@ -2001,7 +2096,7 @@ $('#btnTrkReadyCopyUkes').onclick = async () => {
   // API call は 1 回だけ。クリップボード API が使えなくても fallback で同じ text を使う。
   let ukes;
   try{
-    ukes = await api('api/tracking/ready/uketsuke?method=' + encodeURIComponent(method));
+    ukes = await api('api/tracking/ready/uketsuke?method=' + encodeURIComponent(method) + '&scope=' + TRK_SCOPE);
   }catch(e){
     $('#trkReadyExportStatus').textContent = 'API エラー: ' + e.message;
     return;
@@ -2033,7 +2128,7 @@ $('#btnTrkReadyDownloadCsv').onclick = () => {
   let method = $('#trkReadyExportMethod').value;
   // placeholder (未選択) は all 扱いにする (CSV ダウンロードは混在 OK)
   if(!method) method = 'all';
-  location.href = API_BASE + 'api/tracking/ready/csv?method=' + encodeURIComponent(method);
+  location.href = API_BASE + 'api/tracking/ready/csv?method=' + encodeURIComponent(method) + '&scope=' + TRK_SCOPE;
 };
 
 // 定形外: 全選択 / 全解除
@@ -2390,81 +2485,8 @@ $('#btnTrkMarkReady').onclick = async () => {
   }catch(e){ alert('エラー: '+e.message); }
 };
 
-// ── 📤 NE 反映実行 (構成 4 PR-C、2026-06-06) ──
-let NE_SYNC_POLL_TIMER = null;
-function fmtJst(iso){
-  if(!iso) return '';
-  const d = new Date(iso);
-  if(isNaN(d.getTime())) return iso;
-  const jst = new Date(d.getTime() + 9*3600*1000);
-  return jst.toISOString().replace('T',' ').slice(0,19) + ' JST';
-}
-$('#btnTrkNeSyncStart').onclick = async () => {
-  if(!confirm('ready 状態の伝票を NextEngine に反映します (1 件ずつ、500 件で約 30-60 分)。よろしいですか?')) return;
-  $('#btnTrkNeSyncStart').disabled = true;
-  $('#trkNeSyncStatus').textContent = '起動中…';
-  try{
-    const r = await api('api/ne-sync/start-and-run', { method:'POST',
-      headers:{'Content-Type':'application/json'}, body:'{}' });
-    $('#trkNeSyncStatus').textContent = '✅ Worker 起動成功';
-    $('#trkNeSyncProgress').style.display = 'block';
-    $('#trkNeSyncRunId').textContent = r.run_id;
-    $('#trkNeSyncStartedAt').textContent = fmtJst(r.started_at);
-    pollNeSyncRun(r.run_id);
-  }catch(e){
-    $('#trkNeSyncStatus').textContent = '❌ エラー: ' + e.message;
-    $('#btnTrkNeSyncStart').disabled = false;
-  }
-};
-async function pollNeSyncRun(run_id){
-  if(NE_SYNC_POLL_TIMER){ clearInterval(NE_SYNC_POLL_TIMER); NE_SYNC_POLL_TIMER = null; }
-  const renderProgress = async () => {
-    try{
-      const run = await api('api/ne-sync/runs/' + encodeURIComponent(run_id));
-      if(!run){
-        $('#trkNeSyncRunStatus').textContent = '? (run 不在)'; return;
-      }
-      const statusBadge = ({
-        running: '<span class="badge b-auto">実行中</span>',
-        done: '<span class="badge b-ok">完了</span>',
-        failed: '<span class="badge b-warn">失敗</span>',
-        aborted: '<span class="badge b-warn">中断</span>',
-        expired: '<span class="badge b-warn">期限切れ</span>',
-      })[run.status] || run.status;
-      $('#trkNeSyncRunStatus').innerHTML = statusBadge;
-      const target = run.target_count || 0;
-      const synced = run.synced_count || 0;
-      const manual = run.manual_review_count || 0;
-      const unk = run.error_count || 0;
-      const remaining = Math.max(0, target - synced - manual - unk);
-      const unkBadge = unk > 0
-        ? `<span style="color:#d35400; font-weight:bold">⚠️ 要確認 ${unk} 件</span>` : '';
-      $('#trkNeSyncCounts').innerHTML =
-        `<span>処理済 <b>${synced + manual + unk}</b> / 取得 <b>${target}</b></span>`+
-        `<span style="margin-left:16px; color:#2e7d32">✅ 反映済 ${synced}</span>`+
-        `<span style="margin-left:16px; color:#8e44ad">手動確認 ${manual}</span>`+
-        (unkBadge ? `<span style="margin-left:16px">${unkBadge}</span>` : '');
-      let note = '';
-      if(run.status === 'running'){
-        note = '実行中… 1 件約 5-10 秒。500 件で 30-60 分。';
-      } else if(run.status === 'done'){
-        note = `✅ 完了。${unk > 0 ? `⚠️ ne_unknown ${unk} 件は NextEngine で実態確認のうえ手動解決してください。` : ''}`;
-      } else if(run.status === 'failed' || run.status === 'aborted' || run.status === 'expired'){
-        note = `${run.status}: ${run.last_error || '(理由不明)'} - ${run.status === 'expired' ? 'Worker 応答なし、未完了行は ne_unknown に。' : ''}`;
-      }
-      $('#trkNeSyncNote').textContent = note;
-      // 終了状態なら polling 停止
-      if(run.status !== 'running'){
-        if(NE_SYNC_POLL_TIMER){ clearInterval(NE_SYNC_POLL_TIMER); NE_SYNC_POLL_TIMER = null; }
-        $('#btnTrkNeSyncStart').disabled = false;
-        loadTrackingAll();
-      }
-    }catch(e){ console.warn('[ne-sync poll]', e.message); }
-  };
-  await renderProgress();
-  // Codex+Claude 議論: 常時 5 秒 polling (シンプルさ優先)
-  NE_SYNC_POLL_TIMER = setInterval(renderProgress, 5000);
-}
+// (NE 反映 UI は廃止、Phase 1 で状態駆動メインカードに統合)
+// NE 反映ボタンの JS は削除済 (Phase 1: 状態駆動メインカードに統合、停止中機能の UI 廃止)
 
 // 検索 / フィルタ
 $('#btnTrkSearch').onclick = loadTrackingList;
@@ -2473,11 +2495,30 @@ $('#trkFilterSource').onchange = loadTrackingList;
 $('#trkFilterShop').onchange = loadTrackingList;
 $('#trkQuery').addEventListener('keydown', (e) => { if(e.key==='Enter') loadTrackingList(); });
 $('#btnTrackingReload').onclick = loadTrackingAll;
+
+// スコープ切替 (本日 / 過去履歴、Phase 1 UI 再設計)
+function trkSetScope(scope){
+  TRK_SCOPE = scope === 'all' ? 'all' : 'today';
+  const todayBtn = $('#btnTrkScopeToday');
+  const pastBtn = $('#btnTrkScopePast');
+  if(TRK_SCOPE === 'today'){
+    todayBtn.style.background = '#2b6cb0'; todayBtn.style.borderColor = '#2b6cb0'; todayBtn.style.color = 'white';
+    pastBtn.style.background = ''; pastBtn.style.borderColor = ''; pastBtn.style.color = '';
+  } else {
+    pastBtn.style.background = '#2b6cb0'; pastBtn.style.borderColor = '#2b6cb0'; pastBtn.style.color = 'white';
+    todayBtn.style.background = ''; todayBtn.style.borderColor = ''; todayBtn.style.color = '';
+  }
+  loadTrackingAll();
+}
+$('#btnTrkScopeToday').onclick = () => trkSetScope('today');
+$('#btnTrkScopePast').onclick = () => trkSetScope('all');
 $('#btnTrkImportsReload').onclick = loadTrkImports;
 
 // タブ切替時に初回ロード
 document.querySelector('.tab[data-tab=tracking]').addEventListener('click', () => {
-  if(!$('#trackingSummary').children.length) loadTrackingAll();
+  // Codex R1 Critical: #trackingSummary は削除済 → #trkMainContent 基準に変更。
+  // 初期は loadTrackingAll() で読み込まれるが、毎回タブクリック時にリロードしたい場合は無条件呼び出しでも OK
+  if(!TRK_LOADED_ONCE) { TRK_LOADED_ONCE = true; loadTrackingAll(); }
 });
 
 (async () => { await loadOptions(); initCondSelects(); initAssortFilters(); loadBatches(); loadMe(); })();
