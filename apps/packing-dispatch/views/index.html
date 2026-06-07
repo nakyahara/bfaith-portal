@@ -426,10 +426,10 @@
         <span style="flex:1"></span>
         <button class="sub" id="btnTrkLetterpackReload">再読込</button>
       </div>
-      <div class="muted">本日 (JST) アップロードされた取込バッチから、配送方法=レターパックの伝票一覧。CSV取込で紐付けできない (キャリアCSVに出ない) ため、手動確認用。</div>
-      <div class="scroll" style="max-height:40vh; margin-top:8px">
+      <div class="muted">本日 (JST) アップロードされた取込バッチから、配送方法=レターパックの伝票一覧。<b>各行の入力欄に追跡番号を直接入力 → 保存。</b> サイズ超過等で別配送方法に変えたい場合は「配送方法変更」ボタンから (2026-06-07 中原さん指示)。</div>
+      <div class="scroll" style="max-height:50vh; margin-top:8px">
         <table>
-          <thead><tr><th>店舗</th><th>注文番号</th><th>NE受注番号</th><th>宛先</th><th>商品 (数量)</th><th>判定状態</th></tr></thead>
+          <thead><tr><th>店舗</th><th>注文番号</th><th>NE受注番号</th><th>宛先</th><th>商品 (数量)</th><th>追跡番号入力</th><th>操作</th></tr></thead>
           <tbody id="trkLetterpackBody"></tbody>
         </table>
       </div>
@@ -458,15 +458,11 @@
         <strong>追跡番号一覧</strong>
         <label class="muted">状態 <select id="trkFilterStatus">
           <option value="">すべて</option>
-          <option value="pending">反映待ち (未紐付け含む)</option>
-          <option value="ready">反映可</option>
-          <option value="syncing">反映中</option>
-          <option value="synced">反映済</option>
-          <option value="error">失敗</option>
-          <option value="conflict">競合</option>
-          <option value="skipped">対象外</option>
-          <option value="manual_review">要手動確認</option>
-          <option value="ne_unknown">⚠️ 要確認 (ne_unknown)</option>
+          <option value="group:waiting">📫 紐付け待ち</option>
+          <option value="group:linked">🔗 紐付け済</option>
+          <option value="group:csv_ready">📥 CSV 作成対象</option>
+          <option value="group:needs_check">⚠️ 要確認</option>
+          <option value="group:excluded">対象外</option>
         </select></label>
         <label class="muted">取込元 <select id="trkFilterSource">
           <option value="">すべて</option>
@@ -824,6 +820,23 @@
 </dialog>
 
 <!-- 取込結果 詳細ダイアログ (未マッチ/競合の NE受注番号 + 注文内容) -->
+<!-- レターパック → 別配送方法変更ダイアログ (2026-06-07 中原さん指示) -->
+<dialog id="trkLpMethodDlg" style="width:min(500px,95vw)">
+  <div class="dh">レターパックの配送方法を変更</div>
+  <div class="db">
+    <div class="muted">NE 受注番号: <code id="trkLpMethodUke"></code></div>
+    <div class="muted" style="margin-top:6px">サイズ超過などで <b>レターパック以外</b> に変更したい場合に使ってください。変更後は通常のキャリア CSV / 手動入力で追跡番号を紐付けます。</div>
+    <div class="row" style="margin-top:12px">
+      <label>新しい配送方法 <select id="trkLpMethodSelect"></select></label>
+    </div>
+    <div id="trkLpMethodStatus" class="muted" style="margin-top:8px"></div>
+  </div>
+  <div class="df">
+    <button id="btnTrkLpMethodApply">変更する</button>
+    <button id="btnTrkLpMethodClose" class="sub">閉じる</button>
+  </div>
+</dialog>
+
 <dialog id="trkImpDetailDlg" style="width:min(1100px,95vw)">
   <div class="dh">📋 CSV 取込結果 詳細</div>
   <div class="db">
@@ -2001,12 +2014,85 @@ function renderTodayByMethodTable(tbId, rows, opts = {}){
 }
 
 async function loadTrkLetterpack(){
-  const rows = await api('api/tracking/today-by-method?method=letterpack');
+  // 2026-06-07 中原さん指示: 行ごとの追跡番号入力欄 + 配送方法変更ボタン
+  // Codex R1 High 4: pd_import_line ベースのため、保存済 LP 行は別経路 (pd_shipment_tracking)
+  // で tracking_no を取得して JOIN 表示する。サーバ側の statuses を取得して、既に追跡番号
+  // セット済の行は「保存済」表示にする (空欄入力で復活しない)。
+  const [rows, statusList] = await Promise.all([
+    api('api/tracking/today-by-method?method=letterpack'),
+    // Codex R2 High: status 非依存で manual_letterpack source 全行取得 (ready 化された行も拾う)
+    api('api/tracking?source=manual_letterpack&limit=2000').catch(() => []),
+  ]);
   const card = $('#trkLetterpackCard');
   $('#trkLetterpackSummary').textContent = `${rows.length} 件`;
   if(!rows.length){ card.style.display='none'; return; }
   card.style.display='block';
-  renderTodayByMethodTable('trkLetterpackBody', rows);
+  // ne_uketsuke_no → tracking_no の map (保存済表示用)
+  const savedMap = new Map();
+  for(const r of (statusList || [])){
+    if(r.tracking_no) savedMap.set(r.ne_uketsuke_no, r.tracking_no);
+  }
+  renderLetterpackTable('trkLetterpackBody', rows, savedMap);
+}
+
+// レターパック用のインライン入力テーブル
+// savedMap: 既に追跡番号保存済の ne_uketsuke_no → tracking_no
+function renderLetterpackTable(tbId, rows, savedMap){
+  const tb = $('#'+tbId); tb.innerHTML = '';
+  for(const o of rows){
+    const itemsRaw = (o.items || []).map(it =>
+      `${it.product_code||''} ${it.product_name||''} ×${it.qty||0}`).join(' ／ ');
+    const statusBadge = o.row_status==='要判断'?'<span class="badge b-warn">要判断</span>':
+                        o.row_status==='確定'?'<span class="badge b-ok">確定</span>':'<span class="badge b-auto">自動</span>';
+    const tr = document.createElement('tr');
+    const uke = esc(o.ne_uketsuke_no || '');
+    const savedTrk = savedMap && savedMap.get(o.ne_uketsuke_no);
+    // 保存済行は「✅ 追跡番号 (read-only)」表示。空入力で復活しない (Codex R1 High 4)。
+    const inputCell = savedTrk
+      ? `<code>${esc(savedTrk)}</code> <span style="color:#2e7d32">✅ 保存済</span>`
+      : `<input type="text" class="trk-lp-input" data-uke="${uke}" placeholder="追跡番号" size="14" />
+         <button class="sub" data-trk-lp-save="${uke}">保存</button>
+         <span class="trk-lp-status muted" data-uke-status="${uke}"></span>`;
+    tr.innerHTML =
+      `<td>${esc(o.shop_name||'')}</td>`+
+      `<td>${esc(o.order_no||'')}</td>`+
+      `<td><code>${uke}</code></td>`+
+      `<td>${esc(o.pref||'')} ${esc(o.recipient||'')}</td>`+
+      `<td><span class="items-cell" title="${esc(itemsRaw)}">${esc(itemsRaw)}</span></td>`+
+      `<td>${inputCell}</td>`+
+      `<td><button class="sub" data-trk-lp-method="${uke}" title="サイズ超過等の理由で別配送方法に変更">配送方法変更</button> ${statusBadge}</td>`;
+    tb.appendChild(tr);
+  }
+  // 各行の「保存」ボタン: setTrackingOne で 1 件登録
+  tb.querySelectorAll('[data-trk-lp-save]').forEach(btn => {
+    btn.onclick = async () => {
+      const uke = btn.dataset.trkLpSave;
+      const input = tb.querySelector(`input.trk-lp-input[data-uke="${uke}"]`);
+      const statusEl = tb.querySelector(`[data-uke-status="${uke}"]`);
+      const trk = (input.value || '').trim();
+      if(!trk){ statusEl.textContent = '⚠️ 追跡番号を入力してください'; statusEl.style.color = '#c0392b'; return; }
+      btn.disabled = true; statusEl.style.color = '#777'; statusEl.textContent = '保存中…';
+      try{
+        await api('api/tracking/set-one', { method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ ne_uketsuke_no: uke, tracking_no: trk, source: 'manual_letterpack' }) });
+        statusEl.style.color = '#2e7d32'; statusEl.textContent = '✅ 保存';
+        input.disabled = true;
+        // サマリ更新
+        loadTrackingAll && loadTrackingAll();
+      }catch(e){
+        statusEl.style.color = '#c0392b'; statusEl.textContent = '❌ ' + e.message;
+        btn.disabled = false;
+      }
+    };
+  });
+  // 各行の「配送方法変更」ボタン
+  tb.querySelectorAll('[data-trk-lp-method]').forEach(btn => {
+    btn.onclick = () => {
+      const uke = btn.dataset.trkLpMethod;
+      openLetterpackMethodChangeDialog(uke);
+    };
+  });
 }
 
 async function loadTrkTeikeigai(){
@@ -2052,6 +2138,44 @@ async function loadTrkMissing(){
 }
 
 $('#btnTrkLetterpackReload').onclick = loadTrkLetterpack;
+
+// レターパック → 別配送方法変更ダイアログ (2026-06-07)
+function openLetterpackMethodChangeDialog(uke){
+  $('#trkLpMethodUke').textContent = uke;
+  // 配送方法選択肢 (aes / letterpack / teikeigai は除外)
+  // Codex R1 High 3: teikeigai (定形外) は no_tracking 自動遷移が未実装のため今回は除外
+  const sel = $('#trkLpMethodSelect');
+  sel.innerHTML = (OPTIONS.methods || [])
+    .filter(m => m.code !== 'aes' && m.code !== 'letterpack' && m.code !== 'teikeigai')
+    .map(m => `<option value="${esc(m.code)}">${esc(m.name_csv)}</option>`)
+    .join('');
+  $('#trkLpMethodStatus').textContent = '';
+  $('#btnTrkLpMethodApply').disabled = false;
+  $('#trkLpMethodDlg').showModal();
+}
+$('#btnTrkLpMethodClose').onclick = () => $('#trkLpMethodDlg').close();
+$('#btnTrkLpMethodApply').onclick = async () => {
+  const uke = $('#trkLpMethodUke').textContent;
+  const newMethod = $('#trkLpMethodSelect').value;
+  if(!confirm(`受注 ${uke} の配送方法を「${methodName(newMethod)}」に変更します。よろしいですか?`)) return;
+  $('#btnTrkLpMethodApply').disabled = true;
+  $('#trkLpMethodStatus').textContent = '変更中…';
+  try{
+    await api('api/tracking/change-method', { method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ ne_uketsuke_no: uke, shipping_method_code: newMethod }) });
+    $('#trkLpMethodStatus').style.color = '#2e7d32';
+    $('#trkLpMethodStatus').textContent = '✅ 変更完了';
+    setTimeout(() => {
+      $('#trkLpMethodDlg').close();
+      loadTrackingAll && loadTrackingAll();
+    }, 800);
+  }catch(e){
+    $('#trkLpMethodStatus').style.color = '#c0392b';
+    $('#trkLpMethodStatus').textContent = '❌ ' + e.message;
+    $('#btnTrkLpMethodApply').disabled = false;
+  }
+};
 $('#btnTrkTeikeigaiReload').onclick = loadTrkTeikeigai;
 $('#btnTrkMissingReload').onclick = loadTrkMissing;
 

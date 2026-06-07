@@ -18,7 +18,7 @@ import {
   listMeltlineBackups, readMeltlineBackup,
   importTrackingCsv, setTrackingManual, markReady, markSkipped,
   trackingSummary, listTracking, listTrackingImports, getTrackingImportDetail,
-  listTrackingByMethod, listMissingTracking, setTrackingOne,
+  listTrackingByMethod, listMissingTracking, setTrackingOne, changeShippingMethod,
   listTodayImportLinesByMethod,
   getMethodChangeSummary, listMethodChangeLog, purgeOldMethodChangeLog,
   backfillShipmentTrackingFromExportedBatches, deleteRecentTrackingImports,
@@ -226,6 +226,7 @@ router.get('/api/tracking/summary', (req, res) => handle(res, () =>
 // 一覧 (filter: status / source / shop / q)
 router.get('/api/tracking', (req, res) => handle(res, () => listTracking({
   status: req.query.status, source: req.query.source, shop: req.query.shop, q: req.query.q,
+  limit: parseInt(req.query.limit, 10) || undefined, // Codex R3 High: limit pass-through
 })));
 
 // 配送方法別一覧 (定形外/レターパック 等の特定方法だけ抽出、synced/skipped 除外) - pd_shipment_tracking 起点 (旧版、互換用)
@@ -239,6 +240,10 @@ router.get('/api/tracking/missing', (req, res) => handle(res, () => listMissingT
 
 // レターパック 1 件保存 (body: { ne_uketsuke_no, tracking_no, source })
 router.post('/api/tracking/set-one', (req, res) => handle(res, () => setTrackingOne(req.body || {}, currentUser(req))));
+
+// 配送方法変更 (2026-06-07 中原さん指示、レターパック→別配送方法等)
+router.post('/api/tracking/change-method', (req, res) =>
+  handle(res, () => changeShippingMethod(req.body || {}, currentUser(req))));
 
 // 配送方法変更ログ (集計 + 詳細 + purge、永続集計は pd_tracking_import、詳細は 90 日 TTL)
 router.get('/api/tracking/method-change/summary', (req, res) => handle(res, () =>
