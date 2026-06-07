@@ -192,6 +192,19 @@ function resolveSkus(rows, db) {
         売上分類: product.売上分類,
         解決方法: resolveMethod,
       });
+    } else if (txType === '調整') {
+      // 調整（FBA在庫の補償=紛失/破損の弁償金 等）は商品売上ではない。
+      // 弁償行にはAmazonが独自採番したSKU(例: 820283975_b00fglltgw)が付くが、
+      // これは商品コードではなくマスタ照合できないため「その他」へ流す（確定はブロックしない）。
+      // ※商品連動の調整で実SKUを持つものは Stage 1/2 で解決済みのためここには来ない。
+      resolved.push({
+        ...row,
+        商品コード: null,
+        原価: 0,
+        税率: null,
+        売上分類: null,
+        解決方法: 'adjustment_no_master',
+      });
     } else {
       // Stage 3: 未登録
       resolved.push({
@@ -214,7 +227,7 @@ function resolveSkus(rows, db) {
   // 税率未登録の商品を検出
   const unresolvedTax = new Map();
   for (const row of resolved) {
-    if (row.解決方法 === 'skip' || row.解決方法 === 'no_sku') continue;
+    if (row.解決方法 === 'skip' || row.解決方法 === 'no_sku' || row.解決方法 === 'adjustment_no_master') continue;
     if (row.商品コード && (row.原価 === 0 || row.原価 === null)) {
       const key = row.商品コード;
       const existing = zeroGenka.get(key) || { 商品コード: key, sku: row.sku || '', 商品名: row.説明 || '', 数量合計: 0, 売上合計: 0, count: 0 };
@@ -282,8 +295,8 @@ function aggregate(resolvedRows) {
     // 税率別（税率未登録は集計しない）
     if (row.税率 === 10 || row.税率 === 8) {
       addRow(byTax[String(row.税率)], row);
-    } else if (row.解決方法 === 'no_sku' || row.解決方法 === 'unresolved') {
-      // SKUなし・未解決は10%扱い（手数料等は税率情報がない）
+    } else if (row.解決方法 === 'no_sku' || row.解決方法 === 'unresolved' || row.解決方法 === 'adjustment_no_master') {
+      // SKUなし・未解決・調整(照合対象外)は10%扱い（手数料/弁償金等は税率情報がない）
       addRow(byTax['10'], row);
     }
     // 税率未登録（商品は解決済みだが税率がない）→ 税率別集計に含めない
@@ -458,7 +471,7 @@ router.post('/upload', upload.single('file'), (req, res) => {
   const { byTax, bySegment, excluded, otherDetails, columns, mfRow, mfColumns } = aggregate(resolved);
 
   // 未登録税率の件数
-  const unresolvedTaxCount = resolved.filter(r => r.解決方法 !== 'skip' && r.解決方法 !== 'no_sku' && r.税率 === null).length;
+  const unresolvedTaxCount = resolved.filter(r => r.解決方法 !== 'skip' && r.解決方法 !== 'no_sku' && r.解決方法 !== 'adjustment_no_master' && r.税率 === null).length;
 
   // ─── エビデンスCSV生成 ───
   // 1. 明細CSV（元CSVの各行 + 判定結果）
@@ -505,7 +518,7 @@ router.post('/upload', upload.single('file'), (req, res) => {
     summary: summaryCsv,
     serverState: {
       totalRows: parsedRows.length,
-      resolvedCount: resolved.filter(r => r.解決方法 !== 'unresolved' && r.解決方法 !== 'skip' && r.解決方法 !== 'no_sku' && !['mixed_tax','mixed_segment','partial_component','invalid_quantity','mapped_target_missing'].includes(r.解決方法)).length,
+      resolvedCount: resolved.filter(r => r.解決方法 !== 'unresolved' && r.解決方法 !== 'skip' && r.解決方法 !== 'no_sku' && r.解決方法 !== 'adjustment_no_master' && !['mixed_tax','mixed_segment','partial_component','invalid_quantity','mapped_target_missing'].includes(r.解決方法)).length,
       unresolvedCount: unresolved.length,
       unresolvedTaxCount: unresolvedTax.length,
       conflictsCount: conflicts.length,
@@ -517,7 +530,7 @@ router.post('/upload', upload.single('file'), (req, res) => {
   res.json({
     yearMonth,
     totalRows: parsedRows.length,
-    resolvedCount: resolved.filter(r => r.解決方法 !== 'unresolved' && r.解決方法 !== 'skip' && r.解決方法 !== 'no_sku' && !['mixed_tax','mixed_segment','partial_component','invalid_quantity','mapped_target_missing'].includes(r.解決方法)).length,
+    resolvedCount: resolved.filter(r => r.解決方法 !== 'unresolved' && r.解決方法 !== 'skip' && r.解決方法 !== 'no_sku' && r.解決方法 !== 'adjustment_no_master' && !['mixed_tax','mixed_segment','partial_component','invalid_quantity','mapped_target_missing'].includes(r.解決方法)).length,
     unresolvedSkus: unresolved,
     unresolvedTaxCount,
     unresolvedTax,
@@ -900,7 +913,7 @@ function renderPage() {
         card.style.display = 'block';
         let html = '<table class="detail-table"><tr><th>SKU</th><th>商品コード</th><th>商品名</th><th>種類</th><th>解決方法</th><th>行数</th><th>数量</th><th>商品売上</th><th>合計</th></tr>';
         for (const d of data.otherDetails) {
-          const method = { direct: '商品コード一致', sku_map: 'SKUマップ経由', unresolved: '未解決', no_sku: 'SKUなし' }[d.解決方法] || d.解決方法;
+          const method = { direct: '商品コード一致', sku_map: 'SKUマップ経由', unresolved: '未解決', no_sku: 'SKUなし', adjustment_no_master: '調整(照合対象外)' }[d.解決方法] || d.解決方法;
           html += '<tr>';
           html += '<td style="text-align:left">' + (d.sku || '-') + '</td>';
           html += '<td style="text-align:left">' + (d.商品コード || '-') + '</td>';
@@ -1203,7 +1216,7 @@ function renderPage() {
         <tr><td>税率</td><td>10 or 8（商品マスタの消費税率から判定）</td></tr>
         <tr><td>売上分類</td><td>1:自社 / 2:取引先限定 / 3:仕入れ / 4:輸出 / 空:未分類</td></tr>
         <tr><td>原価</td><td>商品マスタの原価（未解決 or 原価未登録の場合は0）</td></tr>
-        <tr><td>解決方法</td><td>direct / sku_map / unresolved / no_sku / skip</td></tr>
+        <tr><td>解決方法</td><td>direct / sku_map / unresolved / no_sku / adjustment_no_master / skip</td></tr>
       </table>
 
       <h2>5. 税率別集計</h2>
@@ -1212,7 +1225,7 @@ function renderPage() {
         <tr><td><b>10%</b></td><td>消費税率=0.10 の商品、または税率未登録の商品（10%仮扱い）</td></tr>
         <tr><td><b>8%</b></td><td>消費税率=0.08 の商品</td></tr>
       </table>
-      <div class="note">トランザクション種類が「振込み」の行は集計から除外されます。</div>
+      <div class="note">トランザクション種類が「振込み」の行は集計から除外されます。「注文外料金」はマスタ照合せず「その他」へ。「調整」（FBA在庫補償など）はマスタ照合を試み、Amazon独自採番SKUで照合できないものだけ「その他」に集計されます（確定はブロックしません）。</div>
 
       <h2>6. MF連携用 税込み集計</h2>
       <p>マネーフォワードへの入力用に、税込み金額に変換して集計します。</p>
@@ -1235,7 +1248,7 @@ function renderPage() {
         <tr><td><b>1: 自社商品</b></td><td>1</td><td>自社ブランド・独占商品</td><td>売上按分あり</td></tr>
         <tr><td><b>2: 取引先限定</b></td><td>2</td><td>取引先限定品</td><td>売上按分あり</td></tr>
         <tr><td><b>3: 仕入れ商品</b></td><td>3</td><td>一般仕入れ商品</td><td>なし</td></tr>
-        <tr><td><b>other: その他</b></td><td>空/未登録</td><td>SKUなし行（FBA保管手数料等）+ 分類未登録商品</td><td>なし</td></tr>
+        <tr><td><b>other: その他</b></td><td>空/未登録</td><td>SKUなし行（FBA保管手数料・FBA在庫補償等）+ 分類未登録商品</td><td>なし</td></tr>
       </table>
       <div class="note"><b>セグメント4（輸出）</b>は集計テーブルから除外、別枠で表示されます。</div>
 
