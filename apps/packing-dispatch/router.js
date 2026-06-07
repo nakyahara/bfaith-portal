@@ -220,7 +220,8 @@ router.post('/api/tracking/mark-ready', (req, res) => handle(res, () => markRead
 router.post('/api/tracking/mark-skipped', (req, res) => handle(res, () => markSkipped(req.body || {}, currentUser(req))));
 
 // サマリ (ステータス別カウント)
-router.get('/api/tracking/summary', (req, res) => handle(res, () => trackingSummary()));
+router.get('/api/tracking/summary', (req, res) => handle(res, () =>
+  trackingSummary({ scope: req.query.scope === 'all' ? 'all' : 'today' })));
 
 // 一覧 (filter: status / source / shop / q)
 router.get('/api/tracking', (req, res) => handle(res, () => listTracking({
@@ -288,14 +289,20 @@ router.post('/api/tracking/bulk-apply-teikeigai', (req, res) =>
 // ── NE 手動反映用エクスポート (2026-06-04、cron 未実装の暫定運用) ──
 // ready 状態の配送方法別 summary
 router.get('/api/tracking/ready/summary', (req, res) =>
-  handle(res, () => getReadyExportSummary()));
+  handle(res, () => getReadyExportSummary({ scope: req.query.scope === 'all' ? 'all' : 'today' })));
 // 配送方法を指定して NE 受注番号一覧 (JSON配列、コピー用)
 router.get('/api/tracking/ready/uketsuke', (req, res) =>
-  handle(res, () => getReadyNeUketsukeNos({ method: String(req.query.method || '').trim() })));
+  handle(res, () => getReadyNeUketsukeNos({
+    method: String(req.query.method || '').trim(),
+    scope: req.query.scope === 'all' ? 'all' : 'today',
+  })));
 // CSV ダウンロード (受注番号 + 追跡番号、Shift-JIS not、UTF-8 BOM)
 router.get('/api/tracking/ready/csv', (req, res) => {
   try {
-    const { csv, count } = getReadyTrackingCsv({ method: String(req.query.method || '').trim() });
+    const { csv, count } = getReadyTrackingCsv({
+      method: String(req.query.method || '').trim(),
+      scope: req.query.scope === 'all' ? 'all' : 'today',
+    });
     const today = new Date().toISOString().slice(0,10).replace(/-/g, '');
     const filename = `ne-tracking-${today}-${count}rows.csv`;
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
