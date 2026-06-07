@@ -366,12 +366,13 @@
         <span style="flex:1"></span>
         <button class="sub" id="btnTrkTeikeigaiReload">再読込</button>
       </div>
-      <div class="muted">本日 (JST) アップロードされた取込バッチから、配送方法=定形外の伝票一覧。定形外は追跡番号が無いためキャリアCSVには出ません。チェックを入れて「✅ 定形外として反映する」を押すと、追跡番号なしで NE 反映待ち (ready) に遷移します。</div>
+      <div class="muted">本日 (JST) アップロードされた取込バッチから、配送方法=定形外の伝票一覧。定形外は追跡番号が無いためキャリアCSVには出ません。<b>通常は「✅ すべて反映する」で全件まとめて反映してください。</b>個別に選びたいときはチェックボックスを使ってください。</div>
       <div class="row" style="margin-top:8px">
         <label><input type="checkbox" id="trkTeikeigaiSelectAll" /> 全選択 / 解除</label>
         <span style="flex:1"></span>
         <span id="trkTeikeigaiSelectedCount" class="muted"></span>
-        <button id="btnTrkTeikeigaiApply" style="background:#2e7d32; border-color:#2e7d32">✅ 定形外として反映する</button>
+        <button id="btnTrkTeikeigaiApply" class="sub">チェックのみ反映</button>
+        <button id="btnTrkTeikeigaiApplyAll" style="background:#2e7d32; border-color:#2e7d32">✅ すべて反映する</button>
         <span id="trkTeikeigaiApplyStatus" class="muted"></span>
       </div>
       <div class="scroll" style="max-height:40vh; margin-top:8px">
@@ -382,22 +383,22 @@
       </div>
     </div>
 
-    <!-- 手動入力 (レターパック追跡あり、定形外は上記カードを使用) -->
-    <div class="card">
+    <!-- 手動入力カードは削除 (2026-06-07 中原さん指示)。レターパック/定形外 とも行ごとのインライン UI で完結 -->
+
+    <!-- レターパック一覧 (本日アップロード分、業務フロー順序: 定形外の次、未割当アラートの上、2026-06-07 中原さん指示) -->
+    <div class="card" id="trkLetterpackCard" style="display:none">
       <div class="row">
-        <strong>手動入力 (レターパック / 定形外)</strong>
-        <select id="trkManualSource">
-          <option value="manual_letterpack">レターパック (追跡番号あり)</option>
-          <option value="no_tracking">定形外 (追跡番号なし)</option>
-        </select>
-        <button class="sub" id="btnTrkManualPaste">一括ペースト</button>
-        <span id="trkManualStatus" class="muted"></span>
+        <strong>📮 レターパック (本日アップロード分)</strong>
+        <span id="trkLetterpackSummary" class="muted"></span>
+        <span style="flex:1"></span>
+        <button class="sub" id="btnTrkLetterpackReload">再読込</button>
       </div>
-      <div class="muted">「NE受注番号 タブ または カンマ または スペース 追跡番号」を行ごとに貼り付け。定形外は追跡番号列なしで OK。<b>定形外は上の「📫 定形外」カードでチェックして反映する方が早いです。</b></div>
-      <textarea id="trkManualText" rows="6" style="width:100%; font-family:monospace; font-size:12px; padding:6px; border:1px solid var(--line); border-radius:5px"
-        placeholder="例:&#10;1452297&#9;490356296640&#10;1452370&#9;680467536512"></textarea>
-      <div class="row" style="margin-top:6px">
-        <button id="btnTrkManualApply">入力を適用</button>
+      <div class="muted">本日 (JST) アップロードされた取込バッチから、配送方法=レターパックの伝票一覧。<b>各行の入力欄に追跡番号を直接入力 → 保存。</b> サイズ超過等で別配送方法に変えたい場合は「配送方法変更」ボタンから。</div>
+      <div class="scroll" style="max-height:50vh; margin-top:8px">
+        <table>
+          <thead><tr><th>店舗</th><th>注文番号</th><th>NE受注番号</th><th>宛先</th><th>商品 (数量)</th><th>追跡番号入力</th><th>操作</th></tr></thead>
+          <tbody id="trkLetterpackBody"></tbody>
+        </table>
       </div>
     </div>
 
@@ -414,23 +415,6 @@
         <table>
           <thead><tr><th>配送方法</th><th>NE受注番号</th><th>店舗</th><th>注文番号</th><th>状態</th><th>更新</th></tr></thead>
           <tbody id="trkMissingBody"></tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- レターパック一覧 (本日アップロード分、確認用) -->
-    <div class="card" id="trkLetterpackCard" style="display:none">
-      <div class="row">
-        <strong>📮 レターパック (本日アップロード分)</strong>
-        <span id="trkLetterpackSummary" class="muted"></span>
-        <span style="flex:1"></span>
-        <button class="sub" id="btnTrkLetterpackReload">再読込</button>
-      </div>
-      <div class="muted">本日 (JST) アップロードされた取込バッチから、配送方法=レターパックの伝票一覧。<b>各行の入力欄に追跡番号を直接入力 → 保存。</b> サイズ超過等で別配送方法に変えたい場合は「配送方法変更」ボタンから (2026-06-07 中原さん指示)。</div>
-      <div class="scroll" style="max-height:50vh; margin-top:8px">
-        <table>
-          <thead><tr><th>店舗</th><th>注文番号</th><th>NE受注番号</th><th>宛先</th><th>商品 (数量)</th><th>追跡番号入力</th><th>操作</th></tr></thead>
-          <tbody id="trkLetterpackBody"></tbody>
         </table>
       </div>
     </div>
@@ -2131,7 +2115,7 @@ async function loadTrkMissing(){
       `<td><code>${esc(r.ne_uketsuke_no)}</code></td>`+
       `<td>${esc(r.shop_name||'')}</td>`+
       `<td>${esc(r.order_no||'')}</td>`+
-      `<td>${trkStatusBadge(r.sync_status)}</td>`+
+      `<td>${trkStatusBadge(r)}</td>`+
       `<td class="muted">${esc(upd)}</td>`;
     tb.appendChild(tr);
   }
@@ -2261,30 +2245,28 @@ $('#trkTeikeigaiSelectAll').onchange = (e) => {
   updateTeikeigaiSelectedCount();
 };
 
-// 定形外: チェック行を「定形外として反映する」(専用 bulk endpoint で 1 transaction 内処理)
-// Codex R1 Critical: 既存 tracking_no の上書きを防ぐため setTrackingManual ではなく bulk-apply-teikeigai を使う
-// Codex R1 High: IN 句 999 件上限を避けるため 1 行ずつ UPDATE (サーバ側で実装)
-$('#btnTrkTeikeigaiApply').onclick = async () => {
-  const checks = Array.from(document.querySelectorAll('#trkTeikeigaiBody input.trk-row-check'));
-  const ukes = checks.filter(c => c.checked).map(c => c.dataset.uke).filter(Boolean);
-  const uniqueUkes = [...new Set(ukes)];
-  if(!uniqueUkes.length){ alert('1 行も選択されていません'); return; }
-  if(!confirm(`${uniqueUkes.length} 件を「定形外 (追跡番号なし)」として NE 反映待ち (ready) に追加します。よろしいですか?`)) return;
-  $('#btnTrkTeikeigaiApply').disabled = true;
+// 定形外: 反映処理を共通化 (チェックのみ / すべて の 2 ボタン共用、2026-06-07)
+async function applyTeikeigaiUkes(uniqueUkes, modeLabel){
+  if(!uniqueUkes.length){ alert(modeLabel === 'all' ? '対象がありません' : '1 行も選択されていません'); return; }
+  const confirmMsg = modeLabel === 'all'
+    ? `本日アップロードされた定形外 ${uniqueUkes.length} 件をすべて「定形外 (追跡番号なし)」として NE 反映待ちに追加します。よろしいですか?`
+    : `${uniqueUkes.length} 件を「定形外 (追跡番号なし)」として NE 反映待ちに追加します。よろしいですか?`;
+  if(!confirm(confirmMsg)) return;
+  const btnIds = ['#btnTrkTeikeigaiApply', '#btnTrkTeikeigaiApplyAll'];
+  btnIds.forEach(id => { const b = $(id); if(b) b.disabled = true; });
   $('#trkTeikeigaiApplyStatus').textContent = '反映中…';
   try{
     const r = await api('api/tracking/bulk-apply-teikeigai', { method:'POST',
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ ne_uketsuke_nos: uniqueUkes }) });
-    let msg = `✅ ${r.updated} 件を ready に遷移`;
-    if(r.already_ready > 0) msg += ` / 既 ready ${r.already_ready} 件`;
-    if(r.not_found > 0) msg += ` / 未登録 ${r.not_found} 件`;
-    if(r.skipped_has_tracking > 0) msg += ` / 追跡番号あり skip ${r.skipped_has_tracking} 件`;
-    if(r.skipped_not_teikeigai > 0) msg += ` / 定形外以外 skip ${r.skipped_not_teikeigai} 件`;
-    if(r.skipped_synced > 0) msg += ` / 既反映 skip ${r.skipped_synced} 件`;
-    if(r.skipped_other > 0) msg += ` / その他 skip ${r.skipped_other} 件`;
+    let msg = `✅ ${r.updated} 件を反映`;
+    if(r.already_ready > 0) msg += ` / 既反映 ${r.already_ready}`;
+    if(r.not_found > 0) msg += ` / 未登録 ${r.not_found}`;
+    if(r.skipped_has_tracking > 0) msg += ` / 追跡番号あり skip ${r.skipped_has_tracking}`;
+    if(r.skipped_not_teikeigai > 0) msg += ` / 定形外以外 skip ${r.skipped_not_teikeigai}`;
+    if(r.skipped_synced > 0) msg += ` / 既 NE反映 skip ${r.skipped_synced}`;
+    if(r.skipped_other > 0) msg += ` / その他 skip ${r.skipped_other}`;
     $('#trkTeikeigaiApplyStatus').textContent = msg;
-    // skip 詳細を alert で見せる
     const samples = r.samples || {};
     let detail = '';
     if(samples.has_tracking && samples.has_tracking.length){
@@ -2304,12 +2286,48 @@ $('#btnTrkTeikeigaiApply').onclick = async () => {
   }catch(e){
     $('#trkTeikeigaiApplyStatus').textContent = 'エラー: ' + e.message;
   }finally{
-    $('#btnTrkTeikeigaiApply').disabled = false;
+    btnIds.forEach(id => { const b = $(id); if(b) b.disabled = false; });
   }
+}
+
+// 定形外: チェック行のみ反映
+$('#btnTrkTeikeigaiApply').onclick = async () => {
+  const checks = Array.from(document.querySelectorAll('#trkTeikeigaiBody input.trk-row-check'));
+  const ukes = checks.filter(c => c.checked).map(c => c.dataset.uke).filter(Boolean);
+  const uniqueUkes = [...new Set(ukes)];
+  await applyTeikeigaiUkes(uniqueUkes, 'checked');
+};
+// 定形外: 表示中の全件を反映 (2026-06-07 中原さん指示、主動線)
+$('#btnTrkTeikeigaiApplyAll').onclick = async () => {
+  const checks = Array.from(document.querySelectorAll('#trkTeikeigaiBody input.trk-row-check'));
+  const ukes = checks.map(c => c.dataset.uke).filter(Boolean);
+  const uniqueUkes = [...new Set(ukes)];
+  await applyTeikeigaiUkes(uniqueUkes, 'all');
 };
 
-function trkStatusBadge(status){
-  const cfg = TRK_STATUS_LABELS[status] || { label: status, color: '#777' };
+// 行ごとの状態バッジ。2026-06-07 中原さん指示で API 用語 (反映可/反映中/反映済/失敗) を撤去し、
+// 業務 5 状態 (📫 紐付け待ち / 🔗 紐付け済 / 📥 CSV作成対象 / ⚠️ 要確認 / 対象外) に正規化。
+// 行から判定するため tracking_no / tracking_source も見る (= summary の bucket と同じロジック)。
+function trkRowToGroup(row){
+  const st = row.sync_status;
+  const hasTracking = !!row.tracking_no;
+  const isNoTracking = row.tracking_source === 'no_tracking';
+  if(st === 'skipped') return { key: 'excluded', label: '対象外', color: '#999' };
+  if(['conflict','error','manual_review','ne_unknown','syncing'].includes(st)) return { key: 'needs_check', label: '⚠️ 要確認', color: '#d35400' };
+  if(st === 'ready') return { key: 'csv_ready', label: '📥 CSV作成対象', color: '#2e7d32' };
+  if(st === 'pending'){
+    if(hasTracking || isNoTracking) return { key: 'linked', label: '🔗 紐付け済', color: '#2b6cb0' };
+    return { key: 'waiting', label: '📫 紐付け待ち', color: '#c0392b' };
+  }
+  // synced (= 過去 API 反映) はそのまま、運用上ほぼ出ない
+  if(st === 'synced') return { key: 'synced', label: '反映済', color: '#777' };
+  return { key: st, label: st, color: '#777' };
+}
+function trkStatusBadge(row_or_status){
+  // 後方互換: status 文字列だけ渡された場合は最小推定
+  const cfg = typeof row_or_status === 'string'
+    ? { label: row_or_status, color: '#777' }
+    : trkRowToGroup(row_or_status);
   return `<span class="badge" style="background:${cfg.color}22; color:${cfg.color}; border:1px solid ${cfg.color}66">${cfg.label}</span>`;
 }
 
@@ -2341,7 +2359,7 @@ async function loadTrackingList(){
   for(const r of rows){
     const tr = document.createElement('tr');
     const upd = (r.updated_at || r.added_at || '').replace('T',' ').slice(0,16);
-    tr.innerHTML = `<td>${trkStatusBadge(r.sync_status)}</td>`+
+    tr.innerHTML = `<td>${trkStatusBadge(r)}</td>`+
       `<td><code>${esc(r.ne_uketsuke_no)}</code></td>`+
       `<td>${esc(r.shop_name||'')}</td>`+
       `<td>${esc(r.order_no||'')}</td>`+
@@ -2564,38 +2582,7 @@ function renderTrkImportResult(res){
   };
 }
 
-// 手動入力
-$('#btnTrkManualApply').onclick = async () => {
-  const source = $('#trkManualSource').value;
-  const text = $('#trkManualText').value.trim();
-  if(!text){ $('#trkManualStatus').textContent = 'テキストが空です'; return; }
-  const entries = [];
-  for(const ln of text.split(/\r?\n/)){
-    const parts = ln.split(/[\t,\s]+/).filter(Boolean);
-    if(!parts.length) continue;
-    entries.push({ ne_uketsuke_no: parts[0], tracking_no: parts[1] || '' });
-  }
-  if(!entries.length){ $('#trkManualStatus').textContent = '有効な行がありません'; return; }
-  $('#trkManualStatus').textContent = '適用中…';
-  try{
-    const r = await api('api/tracking/manual', { method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ source, entries })});
-    $('#trkManualStatus').textContent = `更新${r.updated} / 未マッチ${r.not_found} / 競合${r.conflict} / 既反映スキップ${r.synced_skipped}`;
-    if(r.not_found > 0 || r.conflict > 0){
-      let msg = '';
-      if((r.not_found_samples||[]).length) msg += `未マッチ:\n${r.not_found_samples.map(x=>'  - '+x).join('\n')}\n\n`;
-      if((r.conflict_samples||[]).length) msg += `競合:\n${r.conflict_samples.map(x=>'  - '+x.ne_uketsuke_no+': 既存='+x.current+' / 新='+x.incoming).join('\n')}`;
-      if(msg) alert(msg);
-    }
-    await loadTrackingAll();
-  }catch(e){ $('#trkManualStatus').textContent = 'エラー: '+e.message; }
-};
-
-// 一括ペースト ヘルプ
-$('#btnTrkManualPaste').onclick = () => {
-  alert('Excel から「NE受注番号」「追跡番号」の 2 列を選択して Ctrl+C → このページの入力欄に Ctrl+V してください。タブ/カンマ/スペース区切り対応。');
-};
+// 手動入力 UI は廃止 (2026-06-07 中原さん指示)。レターパック/定形外は行ごとの専用 UI に置換済。
 
 // 「これで NE 反映する」ボタン
 $('#btnTrkMarkReady').onclick = async () => {
