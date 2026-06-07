@@ -1599,28 +1599,35 @@ export function getReadyTrackingCsv({ method, scope = 'today' } = {}) {
 // pending → ready 遷移 (「これで反映する」ボタン)。
 // 対象: tracking_no がセットされている (定形外/no_tracking 含む) and sync_status='pending'
 // 引数: { allPending: true } で全件、または { ids: [...] } で個別
-export function markReady({ allPending, ids }, user) {
+export function markReady({ allPending, ids, scope = 'today' }, user) {
   const db = ensureSchema();
   const now = utcIsoNow();
   let n;
-  if (allPending) {
-    // tracking_no がセット済 or tracking_source='no_tracking' (定形外) なら ready 化可能
+  // Codex R3 High (2026-06-07): scope='today' で本日 JST 分のみ ready 化、過去 hidden row 巻き込み防止。
+  // Codex R4 High: fail-closed 化。'all' 明示時のみ全期間、それ以外 (null/typo/欠落) は本日扱い。
+  const effectiveScope = scope === 'all' ? 'all' : 'today';
+  const todayAnd = effectiveScope === 'today'
+    ? ` AND date(COALESCE(exported_at, added_at), '+9 hours') = date('now', '+9 hours')` : '';
+  // Codex R5 High: bulk mutation gate も fail-closed。{ allPending: "false" } 等の truthy malformed で
+  // ids 指定のつもりが一括 ready 化する事故を防ぐため strict 比較。
+  const isAllPending = allPending === true;
+  if (isAllPending) {
     n = db.prepare(`UPDATE pd_shipment_tracking
       SET sync_status='ready', sync_requested_at=?, updated_at=?, updated_by=?
       WHERE sync_status='pending'
-        AND (tracking_no IS NOT NULL OR tracking_source='no_tracking')`)
+        AND (tracking_no IS NOT NULL OR tracking_source='no_tracking')${todayAnd}`)
       .run(now, now, user || null).changes;
   } else if (Array.isArray(ids) && ids.length) {
     const placeholders = ids.map(() => '?').join(',');
     n = db.prepare(`UPDATE pd_shipment_tracking
       SET sync_status='ready', sync_requested_at=?, updated_at=?, updated_by=?
       WHERE ne_uketsuke_no IN (${placeholders}) AND sync_status='pending'
-        AND (tracking_no IS NOT NULL OR tracking_source='no_tracking')`)
+        AND (tracking_no IS NOT NULL OR tracking_source='no_tracking')${todayAnd}`)
       .run(now, now, user || null, ...ids).changes;
   } else {
     throw vErr('allPending または ids を指定してください');
   }
-  audit('tracking_mark_ready', null, { count: n, mode: allPending ? 'all' : 'ids' }, user);
+  audit('tracking_mark_ready', null, { count: n, mode: isAllPending ? 'all' : 'ids', scope: effectiveScope }, user);
   return { updated: n };
 }
 
@@ -1699,10 +1706,14 @@ export function trackingSummary({ scope = 'today' } = {}) {
 //   group:excluded   - 対象外 (skipped)
 //   <未指定>          - すべて
 // 後方互換: 既存の単一 status 値 (pending/ready/synced 等) も受理 (詳細データ系で使う場合あり)
-export function listTracking({ status, source, shop, q, limit = 1000 } = {}) {
+export function listTracking({ status, source, shop, q, scope = 'all', limit = 1000 } = {}) {
   const db = ensureSchema();
   const where = [];
   const params = [];
+  // Codex R2 High 3 (2026-06-07): summary との件数ズレ対策。scope='today' で本日 JST のみ。
+  if (scope === 'today') {
+    where.push(`date(COALESCE(exported_at, added_at), '+9 hours') = date('now', '+9 hours')`);
+  }
   if (status) {
     if (status === 'group:waiting') {
       where.push(`sync_status='pending' AND tracking_no IS NULL AND (tracking_source IS NULL OR tracking_source != 'no_tracking')`);
@@ -1726,12 +1737,19 @@ export function listTracking({ status, source, shop, q, limit = 1000 } = {}) {
     const like = `%${norm(q)}%`;
     params.push(like, like, like);
   }
+  // 2026-06-07 中原さん指示: 表示順は業務 5 状態優先 (未割当 → 要確認 → 紐付け済 → CSV作成対象 → 対象外 → 反映済)。
+  // 「未割当が常に一番上に来て、減ったら下がる」運用導線。
   const sql = `SELECT * FROM pd_shipment_tracking
     ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
-    ORDER BY (CASE sync_status WHEN 'error' THEN 0 WHEN 'conflict' THEN 1 WHEN 'manual_review' THEN 2
-                                WHEN 'ready' THEN 3 WHEN 'pending' THEN 4 WHEN 'syncing' THEN 5
-                                WHEN 'skipped' THEN 6 WHEN 'synced' THEN 7 ELSE 8 END),
-             updated_at DESC
+    ORDER BY (CASE
+        WHEN sync_status='pending' AND tracking_no IS NULL AND (tracking_source IS NULL OR tracking_source != 'no_tracking') THEN 0
+        WHEN sync_status IN ('error','conflict','manual_review','ne_unknown','syncing') THEN 1
+        WHEN sync_status='pending' THEN 2
+        WHEN sync_status='ready' THEN 3
+        WHEN sync_status='skipped' THEN 4
+        WHEN sync_status='synced' THEN 5
+        ELSE 6 END),
+      updated_at DESC
     LIMIT ?`;
   // Codex R4 High: 負数 / NaN / 0 の defense
   const n = Number.parseInt(limit, 10);

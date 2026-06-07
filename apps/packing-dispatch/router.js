@@ -226,6 +226,9 @@ router.get('/api/tracking/summary', (req, res) => handle(res, () =>
 // 一覧 (filter: status / source / shop / q)
 router.get('/api/tracking', (req, res) => handle(res, () => listTracking({
   status: req.query.status, source: req.query.source, shop: req.query.shop, q: req.query.q,
+  // Codex R6 High (2026-06-07): fail-closed。'all' 明示時のみ全期間、欠落/typo は本日扱い。
+  // 全期間が欲しい caller は scope=all を明示すること。
+  scope: req.query.scope === 'all' ? 'all' : 'today',
   limit: parseInt(req.query.limit, 10) || undefined, // Codex R3 High: limit pass-through
 })));
 
