@@ -402,22 +402,8 @@
       </div>
     </div>
 
-    <!-- ⚠️ 追跡番号未割当アラート (定形外/レターパック以外で tracking_no がない pending/error) -->
-    <div class="card" id="trkMissingCard" style="background:#fff5f5; border-color:#f5c6cb; display:none">
-      <div class="row">
-        <strong style="color:#c0392b">⚠️ 追跡番号未割当アラート</strong>
-        <span id="trkMissingSummary" class="muted"></span>
-        <span style="flex:1"></span>
-        <button class="sub" id="btnTrkMissingReload">再読込</button>
-      </div>
-      <div class="muted">定形外・レターパック以外で、CSV からも紐付けされていない伝票です。キャリア CSV を再取込するか、個別に確認してください。</div>
-      <div class="scroll" style="max-height:30vh; margin-top:8px">
-        <table>
-          <thead><tr><th>配送方法</th><th>NE受注番号</th><th>店舗</th><th>注文番号</th><th>状態</th><th>更新</th></tr></thead>
-          <tbody id="trkMissingBody"></tbody>
-        </table>
-      </div>
-    </div>
+    <!-- 追跡番号未割当アラートは追跡番号一覧に統合 (2026-06-07 中原さん指示)。
+         下の「追跡番号一覧」で状態フィルタ '📫 紐付け待ち' を選ぶと同等のリストが見える。 -->
 
     <!-- NE 手動反映用エクスポート (主ボタンは状態駆動メインカードに移動、ここは詳細操作用) -->
     <div class="card" id="trkReadyExportCard" style="background:#f0f7ff; border-color:#b3d4ff">
@@ -437,9 +423,10 @@
     </div>
 
     <!-- 一覧 + フィルタ + 一括操作 -->
-    <div class="card">
+    <div class="card" id="trkListCard">
       <div class="row">
         <strong>追跡番号一覧</strong>
+        <span id="trkWaitingBadge" class="muted"></span>
         <label class="muted">状態 <select id="trkFilterStatus">
           <option value="">すべて</option>
           <option value="group:waiting">📫 紐付け待ち</option>
@@ -1846,6 +1833,7 @@ function trkRenderMain(s){
         <span style="flex:1"></span>
         <b style="color:#c0392b">${waiting} 件</b>
         <a href="#trkTeikeigaiCard" style="margin-left:12px">定形外カードへ ↓</a>
+        <a href="#" id="btnTrkOpenWaiting" style="margin-left:8px">追跡番号一覧で見る ↓</a>
       </div>`);
     }
     if(linked > 0){
@@ -1861,7 +1849,7 @@ function trkRenderMain(s){
         <span>⚠️ 要確認 (競合・エラー等)</span>
         <span style="flex:1"></span>
         <b style="color:#d35400">${needsCheck} 件</b>
-        <a href="#trkMissingCard" style="margin-left:12px">未割当アラートへ ↓</a>
+        <a href="#" id="btnTrkOpenNeedsCheck" style="margin-left:12px">追跡番号一覧で確認 ↓</a>
       </div>`);
     }
     breakdownList.innerHTML = items.join('') || '<div class="muted">対応すべき項目はありません</div>';
@@ -1873,6 +1861,32 @@ function trkRenderMain(s){
       const target = $('#btnTrkMarkReady');
       if(target) target.scrollIntoView({ behavior:'smooth', block:'center' });
     };
+    // 要確認 アンカー: 追跡番号一覧を 'group:needs_check' フィルタで開く (他フィルタ clear)
+    const needsAnchor = $('#btnTrkOpenNeedsCheck');
+    if(needsAnchor) needsAnchor.onclick = (e) => {
+      e.preventDefault();
+      const sel = $('#trkFilterStatus');
+      if(sel){ sel.value = 'group:needs_check'; }
+      const src = $('#trkFilterSource'); if(src) src.value = '';
+      const shop = $('#trkFilterShop'); if(shop) shop.value = '';
+      const q = $('#trkQuery'); if(q) q.value = '';
+      loadTrackingList();
+      const target = $('#trkListCard');
+      if(target) target.scrollIntoView({ behavior:'smooth', block:'start' });
+    };
+    // 紐付け待ち アンカー: 一覧を group:waiting で開く (Codex R2 High 4 対応)
+    const waitingAnchor = $('#btnTrkOpenWaiting');
+    if(waitingAnchor) waitingAnchor.onclick = (e) => {
+      e.preventDefault();
+      const sel = $('#trkFilterStatus');
+      if(sel){ sel.value = 'group:waiting'; }
+      const src = $('#trkFilterSource'); if(src) src.value = '';
+      const shop = $('#trkFilterShop'); if(shop) shop.value = '';
+      const q = $('#trkQuery'); if(q) q.value = '';
+      loadTrackingList();
+      const target = $('#trkListCard');
+      if(target) target.scrollIntoView({ behavior:'smooth', block:'start' });
+    };
   }
 }
 
@@ -1881,12 +1895,22 @@ async function loadTrackingAll(){
     // Phase 1: scope クエリで本日/全期間切替
     const sum = await api('api/tracking/summary?scope=' + TRK_SCOPE);
     trkRenderMain(sum);
+    // 追跡番号一覧の「📫 未割当 残り」バッジ更新 (2026-06-07 中原さん指示)
+    // Codex R2 High: sum.waiting は undefined。trackingSummary は buckets.waiting で返す。
+    const badge = $('#trkWaitingBadge');
+    if(badge){
+      const w = (sum.buckets && sum.buckets.waiting) || 0;
+      if(w > 0){
+        badge.innerHTML = `<b style="color:#c0392b">📫 未割当 残り ${w} 件</b>`;
+      }else{
+        badge.innerHTML = `<span style="color:#2e7d32">✅ 未割当 0 件</span>`;
+      }
+    }
     await Promise.all([
       loadTrackingList(),
       loadTrkImports(),
       loadTrkLetterpack(),
       loadTrkTeikeigai(),
-      loadTrkMissing(),
       loadTrkMethodChange(),
       loadTrkReadyExport(),
     ]);
@@ -2005,7 +2029,8 @@ async function loadTrkLetterpack(){
   const [rows, statusList] = await Promise.all([
     api('api/tracking/today-by-method?method=letterpack'),
     // Codex R2 High: status 非依存で manual_letterpack source 全行取得 (ready 化された行も拾う)
-    api('api/tracking?source=manual_letterpack&limit=2000').catch(() => []),
+    // Codex R6 High: /api/tracking のデフォルトが today に変わったので、過去 LP 入力履歴も拾うため scope=all 明示
+    api('api/tracking?source=manual_letterpack&scope=all&limit=2000').catch(() => []),
   ]);
   const card = $('#trkLetterpackCard');
   $('#trkLetterpackSummary').textContent = `${rows.length} 件`;
@@ -2099,27 +2124,8 @@ function updateTeikeigaiSelectedCount(){
   $('#btnTrkTeikeigaiApply').disabled = checked === 0;
 }
 
-async function loadTrkMissing(){
-  const result = await api('api/tracking/missing');
-  const card = $('#trkMissingCard');
-  if(!result.total){ card.style.display='none'; return; }
-  card.style.display='block';
-  const byMethod = Object.entries(result.by_method)
-    .map(([m,c]) => `${esc(methodName(m))}: ${c}件`).join(' / ');
-  $('#trkMissingSummary').innerHTML = `<b style="color:#c0392b">${result.total} 件</b> ${byMethod ? '('+byMethod+')' : ''}`;
-  const tb = $('#trkMissingBody'); tb.innerHTML = '';
-  for(const r of result.rows){
-    const tr = document.createElement('tr');
-    const upd = (r.updated_at || r.added_at || '').replace('T',' ').slice(0,16);
-    tr.innerHTML = `<td>${esc(methodName(r.shipping_method_code))}</td>`+
-      `<td><code>${esc(r.ne_uketsuke_no)}</code></td>`+
-      `<td>${esc(r.shop_name||'')}</td>`+
-      `<td>${esc(r.order_no||'')}</td>`+
-      `<td>${trkStatusBadge(r)}</td>`+
-      `<td class="muted">${esc(upd)}</td>`;
-    tb.appendChild(tr);
-  }
-}
+// loadTrkMissing は廃止 (2026-06-07): 追跡番号一覧で未割当 (waiting) が常に最上段に来るソートに変更。
+// 一覧カードのタイトル横「📫 未割当 残り N 件」バッジで件数表示 (#trkWaitingBadge)。
 
 $('#btnTrkLetterpackReload').onclick = loadTrkLetterpack;
 
@@ -2161,7 +2167,6 @@ $('#btnTrkLpMethodApply').onclick = async () => {
   }
 };
 $('#btnTrkTeikeigaiReload').onclick = loadTrkTeikeigai;
-$('#btnTrkMissingReload').onclick = loadTrkMissing;
 
 // ── NE 手動反映用エクスポート (2026-06-04、cron 未実装の暫定運用) ──
 async function loadTrkReadyExport(){
@@ -2347,6 +2352,8 @@ async function loadTrackingList(){
   if(source) params.set('source', source);
   if(shop) params.set('shop', shop);
   if(q) params.set('q', q);
+  // Codex R2 High 3 (2026-06-07): メインカード summary と件数同期
+  params.set('scope', TRK_SCOPE);
   const rows = await api(`api/tracking?${params.toString()}`);
   // 店舗フィルタの選択肢を取得結果から構築 (DISTINCT)
   const shops = [...new Set(rows.map(r => r.shop_name).filter(Boolean))].sort();
@@ -2586,11 +2593,13 @@ function renderTrkImportResult(res){
 
 // 「これで NE 反映する」ボタン
 $('#btnTrkMarkReady').onclick = async () => {
-  if(!confirm('追跡番号が割り当て済みの全 pending を NE 反映待ち (ready) に遷移します。よろしいですか?')) return;
+  const scopeLabel = TRK_SCOPE === 'today' ? '本日分の' : '全期間の';
+  if(!confirm(`追跡番号が割り当て済みの${scopeLabel} pending を NE 反映待ち (ready) に遷移します。よろしいですか?`)) return;
   try{
+    // Codex R3 High (2026-06-07): 画面表示の scope を server に渡して、見えてない過去 pending の巻き込み防止
     const r = await api('api/tracking/mark-ready', { method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ allPending: true })});
+      body: JSON.stringify({ allPending: true, scope: TRK_SCOPE })});
     alert(`${r.updated} 件を ready にしました。\n上の「📤 NE 反映を開始」を押すと NextEngine に反映が走ります。`);
     await loadTrackingAll();
   }catch(e){ alert('エラー: '+e.message); }
