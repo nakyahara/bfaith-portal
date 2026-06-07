@@ -791,15 +791,22 @@
 </dialog>
 
 <!-- 取込結果 詳細ダイアログ (未マッチ/競合の NE受注番号 + 注文内容) -->
-<!-- レターパック → 別配送方法変更ダイアログ (2026-06-07 中原さん指示) -->
+<!-- 未割当伝票の配送方法変更ダイアログ (2026-06-07 中原さん指示で汎用化、追跡番号同時入力対応) -->
 <dialog id="trkLpMethodDlg" style="width:min(500px,95vw)">
-  <div class="dh">レターパックの配送方法を変更</div>
+  <div class="dh">配送方法を変更</div>
   <div class="db">
     <div class="muted">NE 受注番号: <code id="trkLpMethodUke"></code></div>
-    <div class="muted" style="margin-top:6px">サイズ超過などで <b>レターパック以外</b> に変更したい場合に使ってください。変更後は通常のキャリア CSV / 手動入力で追跡番号を紐付けます。</div>
+    <div class="muted" style="margin-top:6px">現在の配送方法: <span id="trkLpMethodCurrent" style="font-weight:bold"></span></div>
+    <div class="muted" style="margin-top:6px">例: サイズ超過で <b>ゆうパケパフ → レターパック</b>、規格外で <b>ヤマト → 定形外</b> 等。</div>
     <div class="row" style="margin-top:12px">
       <label>新しい配送方法 <select id="trkLpMethodSelect"></select></label>
     </div>
+    <div class="row" style="margin-top:12px">
+      <label style="flex:1">追跡番号 (任意)
+        <input id="trkLpMethodTracking" type="text" placeholder="" style="width:100%; padding:6px" />
+      </label>
+    </div>
+    <div id="trkLpMethodTrackingHint" class="muted" style="margin-top:4px; font-size:12px"></div>
     <div id="trkLpMethodStatus" class="muted" style="margin-top:8px"></div>
   </div>
   <div class="df">
@@ -2129,31 +2136,80 @@ function updateTeikeigaiSelectedCount(){
 
 $('#btnTrkLetterpackReload').onclick = loadTrkLetterpack;
 
-// レターパック → 別配送方法変更ダイアログ (2026-06-07)
-function openLetterpackMethodChangeDialog(uke){
+// 配送方法変更ダイアログ (2026-06-07 中原さん指示で汎用化: 未割当行からどの配送方法でも変更可、追跡番号同時入力可)
+// uke: 受注番号、currentMethod: 現在の配送方法コード (= 元配送方法表示用)
+function openMethodChangeDialog(uke, currentMethod){
   $('#trkLpMethodUke').textContent = uke;
-  // 配送方法選択肢 (aes / letterpack / teikeigai は除外)
-  // Codex R1 High 3: teikeigai (定形外) は no_tracking 自動遷移が未実装のため今回は除外
+  $('#trkLpMethodCurrent').textContent = methodName(currentMethod) + ' (' + currentMethod + ')';
+  // 変更先 whitelist: letterpack / teikeigai のみ (2026-06-07 中原さん指示)
+  // 「キャリアに変えても CSV 取込で上書きされるので意味ない」と確定
+  const ALLOWED_CHANGE_TARGETS = new Set(['letterpack', 'teikeigai']);
+  const allowed = (OPTIONS.methods || []).filter(m => ALLOWED_CHANGE_TARGETS.has(m.code) && !m.is_locked);
   const sel = $('#trkLpMethodSelect');
-  sel.innerHTML = (OPTIONS.methods || [])
-    .filter(m => m.code !== 'aes' && m.code !== 'letterpack' && m.code !== 'teikeigai')
-    .map(m => `<option value="${esc(m.code)}">${esc(m.name_csv)}</option>`)
+  sel.innerHTML = allowed
+    .map(m => {
+      const sameMark = m.code === currentMethod ? ' (現在)' : '';
+      return `<option value="${esc(m.code)}">${esc(m.name_csv)}${sameMark}</option>`;
+    })
     .join('');
+  // デフォルトは現状以外の最初のもの
+  const firstOther = allowed.find(m => m.code !== currentMethod);
+  if(firstOther) sel.value = firstOther.code;
+  $('#trkLpMethodTracking').value = '';
+  updateMethodChangeTrackingHint();
   $('#trkLpMethodStatus').textContent = '';
   $('#btnTrkLpMethodApply').disabled = false;
   $('#trkLpMethodDlg').showModal();
 }
+// 後方互換 alias (古い呼び出しが残っていた場合用)
+function openLetterpackMethodChangeDialog(uke){ openMethodChangeDialog(uke, 'letterpack'); }
+
+// 新配送方法に応じて追跡番号入力欄のヒント / disable を切り替え
+function updateMethodChangeTrackingHint(){
+  const newMethod = $('#trkLpMethodSelect').value;
+  const trkInput = $('#trkLpMethodTracking');
+  const hint = $('#trkLpMethodTrackingHint');
+  if(newMethod === 'teikeigai'){
+    trkInput.disabled = true;
+    trkInput.value = '';
+    trkInput.style.background = '#f0f0f0';
+    hint.style.color = '#2e7d32';
+    hint.textContent = '定形外は追跡番号不要 (no_tracking として linked 状態にします)';
+  } else {
+    // letterpack (whitelist で他は到達しない)
+    trkInput.disabled = false;
+    trkInput.style.background = '';
+    hint.style.color = '#c0392b';
+    hint.textContent = '⚠️ レターパックへ変更する場合は追跡番号が必須です';
+  }
+}
+
+$('#trkLpMethodSelect').onchange = updateMethodChangeTrackingHint;
 $('#btnTrkLpMethodClose').onclick = () => $('#trkLpMethodDlg').close();
 $('#btnTrkLpMethodApply').onclick = async () => {
   const uke = $('#trkLpMethodUke').textContent;
   const newMethod = $('#trkLpMethodSelect').value;
-  if(!confirm(`受注 ${uke} の配送方法を「${methodName(newMethod)}」に変更します。よろしいですか?`)) return;
+  const trkRaw = $('#trkLpMethodTracking').value.trim();
+  // letterpack のみ tracking_no を採用、他 method は送らない
+  let trk = '';
+  if(newMethod === 'letterpack'){
+    if(!trkRaw){
+      $('#trkLpMethodStatus').style.color = '#c0392b';
+      $('#trkLpMethodStatus').textContent = '⚠️ レターパックへの変更は追跡番号が必須です';
+      return;
+    }
+    trk = trkRaw;
+  }
+  const trkLabel = newMethod === 'letterpack' ? ` + 追跡番号「${trk}」` : ' (追跡番号不要)';
+  if(!confirm(`受注 ${uke} の配送方法を「${methodName(newMethod)}」に変更します${trkLabel}。よろしいですか?`)) return;
   $('#btnTrkLpMethodApply').disabled = true;
   $('#trkLpMethodStatus').textContent = '変更中…';
   try{
+    const body = { ne_uketsuke_no: uke, shipping_method_code: newMethod };
+    if(trk) body.tracking_no = trk;
     await api('api/tracking/change-method', { method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ ne_uketsuke_no: uke, shipping_method_code: newMethod }) });
+      body: JSON.stringify(body) });
     $('#trkLpMethodStatus').style.color = '#2e7d32';
     $('#trkLpMethodStatus').textContent = '✅ 変更完了';
     setTimeout(() => {
@@ -2366,6 +2422,15 @@ async function loadTrackingList(){
   for(const r of rows){
     const tr = document.createElement('tr');
     const upd = (r.updated_at || r.added_at || '').replace('T',' ').slice(0,16);
+    // 未割当 (waiting) 行: 配送方法変更ボタン (2026-06-07 中原さん指示)
+    // Codex R1 High 1: 元 method=aes は UI でも除外 (サーバ側でも拒否)
+    const isWaiting = r.sync_status === 'pending'
+      && !r.tracking_no && r.tracking_source !== 'no_tracking'
+      && r.shipping_method_code !== 'aes';
+    const changeBtn = isWaiting
+      ? `<button class="sub" data-trk-change-method="${esc(r.ne_uketsuke_no)}" data-trk-cur-method="${esc(r.shipping_method_code)}" title="配送方法を変更 + 追跡番号を入力">✏️ 変更</button> ` : '';
+    const skipBtn = (r.sync_status==='pending' || r.sync_status==='ready' || r.sync_status==='error')
+      ? `<button class="sub" data-trk-skip="${esc(r.ne_uketsuke_no)}">欠品</button>` : '';
     tr.innerHTML = `<td>${trkStatusBadge(r)}</td>`+
       `<td><code>${esc(r.ne_uketsuke_no)}</code></td>`+
       `<td>${esc(r.shop_name||'')}</td>`+
@@ -2374,10 +2439,15 @@ async function loadTrackingList(){
       `<td>${trkMaskTracking(r.tracking_no)}</td>`+
       `<td class="muted">${esc(r.tracking_source||'')}</td>`+
       `<td class="muted">${esc(upd)}</td>`+
-      `<td>${r.sync_status==='pending' || r.sync_status==='ready' || r.sync_status==='error'
-        ? `<button class="sub" data-trk-skip="${esc(r.ne_uketsuke_no)}">欠品</button>` : ''}</td>`;
+      `<td>${changeBtn}${skipBtn}</td>`;
     tb.appendChild(tr);
   }
+  // 配送方法変更ボタン: 共通ダイアログ起動
+  $('#trackingBody').querySelectorAll('button[data-trk-change-method]').forEach(btn => {
+    btn.onclick = () => {
+      openMethodChangeDialog(btn.dataset.trkChangeMethod, btn.dataset.trkCurMethod);
+    };
+  });
   $('#trackingBody').querySelectorAll('button[data-trk-skip]').forEach(btn => {
     btn.onclick = async () => {
       const reason = prompt('対象外にする理由を入力 (例: 欠品)', '欠品');

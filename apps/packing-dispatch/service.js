@@ -2042,57 +2042,95 @@ export function listMissingTracking() {
 //       将来定形外対応を追加するなら、tracking_source='no_tracking' を自動セットして
 //       定形外カードに出すフロー設計が必要)
 //   #1: UPDATE 後 changes 確認、0 件なら conflict エラー (SELECT/UPDATE 間の race 検出)
-export function changeShippingMethod({ ne_uketsuke_no, shipping_method_code }, user) {
+// changeShippingMethod (2026-06-07 中原さん指示で waiting 行全対応に拡張):
+//   未割当 (waiting = pending + tracking_no NULL + tracking_source != 'no_tracking') の伝票なら
+//   レターパック または 定形外 に手動で変更可。
+//   想定: 「ゆうパケットパフにしてたが、サイズオーバーでレターパックに変更」等。
+//
+//   変更先は letterpack / teikeigai の 2 つに限定 (2026-06-07 中原さん指示):
+//   - キャリア (ヤマト/ゆうパケパフ等) への変更はサポートしない (CSV 取込で shipping_method が
+//     上書きされるため、手動変更しても意味がない)
+//
+//   引数:
+//     shipping_method_code (new): letterpack / teikeigai のみ
+//     tracking_no:
+//       - new='teikeigai' → 引数無視、tracking_source='no_tracking' 自動セット
+//       - new='letterpack' → 必須。空ならエラー。tracking_source='manual_letterpack'
+const ALLOWED_CHANGE_TARGETS = new Set(['letterpack', 'teikeigai']);
+export function changeShippingMethod({ ne_uketsuke_no, shipping_method_code, tracking_no }, user) {
   const uke = norm(ne_uketsuke_no);
   if (!uke) throw vErr('ne_uketsuke_no が空です');
   if (!shipping_method_code) throw vErr('shipping_method_code が空です');
-  // Codex R1 High 3: 変更先 teikeigai 禁止 (LP→定形外フローは未対応)
-  if (shipping_method_code === 'teikeigai') {
-    throw vErr('レターパックから定形外への変更は現状未対応です (定形外マーク → no_tracking の遷移が必要)');
-  }
-  // Codex R1 High 2: 変更先 letterpack 禁止 (= 同じになる、意味なし)
-  if (shipping_method_code === 'letterpack') {
-    throw vErr('変更先にレターパックは選べません');
+  // 変更先 whitelist (Codex R2 High: パーサーなし method 廃止 + 中原さん指示で LP/teikeigai に限定)
+  if (!ALLOWED_CHANGE_TARGETS.has(shipping_method_code)) {
+    throw vErr(`変更先は letterpack / teikeigai のみ対応 (指定=${shipping_method_code})`);
   }
   const db = ensureSchema();
   const sm = db.prepare(`SELECT code, is_locked FROM pd_shipping_method WHERE code=?`).get(shipping_method_code);
   if (!sm) throw vErr(`未知の配送方法コード: ${shipping_method_code}`);
   if (sm.is_locked) throw vErr(`配送方法 ${shipping_method_code} は変更対象外 (lock)`);
-  const cur = db.prepare(`SELECT sync_status, shipping_method_code FROM pd_shipment_tracking WHERE ne_uketsuke_no=?`).get(uke);
+  const cur = db.prepare(`SELECT sync_status, shipping_method_code, tracking_no, tracking_source
+    FROM pd_shipment_tracking WHERE ne_uketsuke_no=?`).get(uke);
   if (!cur) throw vErr(`受注 ${uke} は pd_shipment_tracking にありません`);
-  // Codex R1 High 2: 現在 letterpack 行のみ変更可 (他の行を直接 POST で letterpack に戻すのを防ぐ)
-  if (cur.shipping_method_code !== 'letterpack') {
-    throw vErr(`現在の配送方法 ${cur.shipping_method_code} はこの機能では変更できません (レターパック行専用)`);
+  // Codex R1 High 1: 元 method も lock / aes 拒否 (AES 行を抜け道で逃さない)
+  if (cur.shipping_method_code === 'aes') {
+    throw vErr('AES 行はこの機能で変更できません');
   }
-  const editable = ['pending', 'ready', 'error', 'conflict', 'manual_review'];
-  if (!editable.includes(cur.sync_status)) {
-    throw vErr(`状態が ${cur.sync_status} のため配送方法を変更できません`);
+  const curSm = db.prepare(`SELECT is_locked FROM pd_shipping_method WHERE code=?`).get(cur.shipping_method_code);
+  if (curSm && curSm.is_locked) {
+    throw vErr(`現在の配送方法 ${cur.shipping_method_code} は lock のため変更できません`);
   }
-  if (cur.shipping_method_code === shipping_method_code) {
-    return { status: 'no_change', message: '既に同じ配送方法です' };
+  // waiting (未割当) 状態のみ変更可: pending + tracking_no NULL + tracking_source != 'no_tracking'
+  const isWaiting = cur.sync_status === 'pending'
+    && cur.tracking_no == null
+    && cur.tracking_source !== 'no_tracking';
+  if (!isWaiting) {
+    throw vErr(`未割当 (waiting) 状態の伝票のみ変更できます (現在=${cur.sync_status}, tracking_no=${cur.tracking_no ? 'あり' : 'なし'}, source=${cur.tracking_source || 'なし'})`);
+  }
+  // 新配送方法別の tracking 設定
+  let newTrk = null;
+  let newSource = null;
+  const trkInput = norm(tracking_no);
+  if (shipping_method_code === 'teikeigai') {
+    newTrk = null;
+    newSource = 'no_tracking';
+  } else {
+    // letterpack (whitelist で他は到達しない)
+    // Codex R1 High 4: LP 変更は追跡番号必須。空だと LP カード (pd_import_line 起点) に出ず宙ぶらりんになる。
+    if (!trkInput) throw vErr('レターパックへ変更する場合は追跡番号が必須です');
+    newTrk = trkInput;
+    newSource = 'manual_letterpack';
+  }
+  if (cur.shipping_method_code === shipping_method_code && cur.tracking_no === newTrk
+      && (cur.tracking_source || null) === newSource) {
+    return { status: 'no_change', message: '既に同じ配送方法・状態です' };
   }
   const now = utcIsoNow();
-  // Codex R1 High 1: changes 確認で race 検出
+  // Codex R1 High 2: WHERE に現 method を含めて CAS race 検出。
+  // waiting 条件再確認 + 元 method 一致確認で stale 上書きを防ぐ。
   const info = db.prepare(`UPDATE pd_shipment_tracking
     SET shipping_method_code = ?,
-        tracking_no = NULL,
-        tracking_source = NULL,
+        tracking_no = ?,
+        tracking_source = ?,
         sync_status = 'pending',
         sync_requested_at = NULL,
         last_error = NULL, last_error_code = NULL,
         claim_id = NULL, claim_token_hash = NULL, claim_expires_at = NULL,
         updated_at = ?, updated_by = ?
     WHERE ne_uketsuke_no=?
-      AND shipping_method_code='letterpack'
-      AND sync_status IN ('pending','ready','error','conflict','manual_review')`)
-    .run(shipping_method_code, now, user || null, uke);
+      AND shipping_method_code=?
+      AND sync_status='pending'
+      AND tracking_no IS NULL
+      AND (tracking_source IS NULL OR tracking_source != 'no_tracking')`)
+    .run(shipping_method_code, newTrk, newSource, now, user || null, uke, cur.shipping_method_code);
   if (info.changes === 0) {
-    // SELECT/UPDATE 間で他経路が状態を変えた
     throw vErr(`変更が反映されませんでした (他の操作で状態が変わった可能性、再読込してください)`);
   }
   audit('change_shipping_method', uke,
-    { old_method: cur.shipping_method_code, new_method: shipping_method_code }, user);
-  return { status: 'ok', old_method: cur.shipping_method_code, new_method: shipping_method_code };
+    { old_method: cur.shipping_method_code, new_method: shipping_method_code,
+      tracking_no: newTrk, tracking_source: newSource }, user);
+  return { status: 'ok', old_method: cur.shipping_method_code, new_method: shipping_method_code,
+    tracking_no: newTrk, tracking_source: newSource };
 }
 
 export function setTrackingOne({ ne_uketsuke_no, tracking_no, source }, user) {
