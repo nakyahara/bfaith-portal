@@ -318,18 +318,8 @@
       <button id="btnTrackingReload" class="sub">再読込</button>
     </div>
 
-    <!-- 状態駆動メインカード (未完了 = 確認画面 / 完了 = CSV画面、Codex 案、絵文字最小) -->
-    <div class="card" id="trkMainCard" style="background:#fafcff; border:2px solid #2b6cb0">
-      <div id="trkMainContent">
-        <div class="muted">読込中…</div>
-      </div>
-    </div>
-
-    <!-- 未対応の内訳 (主ボタンの下、業務フロー順: 定形外 → レターパック → 紐付け待ち) -->
-    <div class="card" id="trkBreakdownCard" style="display:none">
-      <strong>未対応の内訳</strong>
-      <div id="trkBreakdownList" style="margin-top:8px"></div>
-    </div>
+    <!-- 状態駆動メインカード + 内訳カードはレターパックの下に移動 (2026-06-07 中原さん指示)。
+         「いちいち上にスクロールして戻らないと見えないから意味ない」→ 業務作業エリアの近くに配置。 -->
 
     <!-- CSV 取込 -->
     <div class="card">
@@ -405,21 +395,17 @@
     <!-- 追跡番号未割当アラートは追跡番号一覧に統合 (2026-06-07 中原さん指示)。
          下の「追跡番号一覧」で状態フィルタ '📫 紐付け待ち' を選ぶと同等のリストが見える。 -->
 
-    <!-- NE 手動反映用エクスポート (主ボタンは状態駆動メインカードに移動、ここは詳細操作用) -->
-    <div class="card" id="trkReadyExportCard" style="background:#f0f7ff; border-color:#b3d4ff">
-      <div class="row">
-        <strong>📤 NE 手動反映用エクスポート (ready 状態のみ)</strong>
-        <span id="trkReadyExportSummary" class="muted"></span>
-        <span style="flex:1"></span>
-        <button class="sub" id="btnTrkReadyExportReload">再読込</button>
+    <!-- 状態駆動メインカード (2026-06-07 中原さん指示でレターパックの下に移動) -->
+    <div class="card" id="trkMainCard" style="background:#fafcff; border:2px solid #2b6cb0">
+      <div id="trkMainContent">
+        <div class="muted">読込中…</div>
       </div>
-      <div class="muted">NE 反映 cron 未実装のため当面は手動運用。<b>Step 1</b>: 配送方法を <b>1 つ選んで</b> NE 受注番号をコピー → NextEngine で一括検索 → 配送方法を変更。<b>Step 2</b>: 受注番号+追跡番号の CSV をダウンロード → NextEngine の追跡番号 CSV インポートに流す。<br/><span style="color:#c0392b">⚠️ コピーは配送方法ごとに行ってください (まとめて変更すると別配送方法を巻き込みます)。CSV ダウンロードは混在 OK。</span></div>
-      <div class="row" style="margin-top:8px">
-        <label>配送方法 <select id="trkReadyExportMethod"></select></label>
-        <button id="btnTrkReadyCopyUkes" style="background:#2b6cb0; border-color:#2b6cb0">📋 NE 受注番号をコピー</button>
-        <button id="btnTrkReadyDownloadCsv" style="background:#2e7d32; border-color:#2e7d32">📥 受注番号 + 追跡番号 CSV ダウンロード</button>
-        <span id="trkReadyExportStatus" class="muted"></span>
-      </div>
+    </div>
+
+    <!-- 未対応の内訳 -->
+    <div class="card" id="trkBreakdownCard" style="display:none">
+      <strong>未対応の内訳</strong>
+      <div id="trkBreakdownList" style="margin-top:8px"></div>
     </div>
 
     <!-- 一覧 + フィルタ + 一括操作 -->
@@ -430,8 +416,7 @@
         <label class="muted">状態 <select id="trkFilterStatus">
           <option value="">すべて</option>
           <option value="group:waiting">📫 紐付け待ち</option>
-          <option value="group:linked">🔗 紐付け済</option>
-          <option value="group:csv_ready">📥 CSV 作成対象</option>
+          <option value="group:csv_ready">📥 CSV 作成対象 (旧 紐付け済 + ready 統合)</option>
           <option value="group:needs_check">⚠️ 要確認</option>
           <option value="group:excluded">対象外</option>
         </select></label>
@@ -446,15 +431,30 @@
         <label class="muted">店舗 <select id="trkFilterShop"><option value="">すべて</option></select></label>
         <input id="trkQuery" placeholder="受注番号 / 追跡番号 / 注文番号" size="28" />
         <button class="sub" id="btnTrkSearch">検索</button>
-        <span style="flex:1"></span>
-        <button id="btnTrkMarkReady">📤 これで NE 反映する (pending → ready)</button>
       </div>
-      <div class="muted">「これで NE 反映する」を押すと、追跡番号セット済み + 定形外マークの全 pending を ready に遷移。NE への実反映は別途 cron で実行。</div>
+      <div class="muted">紐付け済 (linked) の伝票は下の「NE 手動反映用エクスポート」で配送方法ごとに NE 受注番号コピー / 追跡番号 CSV ダウンロードが可能です。</div>
       <div class="scroll" style="max-height:50vh; margin-top:8px">
         <table>
           <thead><tr><th>状態</th><th>NE受注番号</th><th>店舗</th><th>注文番号</th><th>配送方法</th><th>追跡番号</th><th>取込元</th><th>更新</th><th>操作</th></tr></thead>
           <tbody id="trackingBody"></tbody>
         </table>
+      </div>
+    </div>
+
+    <!-- NE 手動反映用エクスポート (2026-06-07 中原さん指示で追跡番号一覧の下に移動 + 対象を linked + ready 両方に拡張) -->
+    <div class="card" id="trkReadyExportCard" style="background:#f0f7ff; border-color:#b3d4ff">
+      <div class="row">
+        <strong>📤 NE 手動反映用エクスポート (紐付け済)</strong>
+        <span id="trkReadyExportSummary" class="muted"></span>
+        <span style="flex:1"></span>
+        <button class="sub" id="btnTrkReadyExportReload">再読込</button>
+      </div>
+      <div class="muted">NE 反映 cron 未実装のため当面は手動運用。<b>Step 1</b>: 配送方法を <b>1 つ選んで</b> NE 受注番号をコピー → NextEngine で一括検索 → 配送方法を変更。<b>Step 2</b>: 受注番号+追跡番号の CSV をダウンロード → NextEngine の追跡番号 CSV インポートに流す。<br/><span style="color:#c0392b">⚠️ コピーは配送方法ごとに行ってください (まとめて変更すると別配送方法を巻き込みます)。CSV ダウンロードは混在 OK。</span></div>
+      <div class="row" style="margin-top:8px">
+        <label>配送方法 <select id="trkReadyExportMethod"></select></label>
+        <button id="btnTrkReadyCopyUkes" style="background:#2b6cb0; border-color:#2b6cb0">📋 NE 受注番号をコピー</button>
+        <button id="btnTrkReadyDownloadCsv" style="background:#2e7d32; border-color:#2e7d32">📥 受注番号 + 追跡番号 CSV ダウンロード</button>
+        <span id="trkReadyExportStatus" class="muted"></span>
       </div>
     </div>
 
@@ -1764,10 +1764,11 @@ function trkRenderMain(s){
   const total = b.total || 0;
   const csvReady = b.csv_ready || 0;
   const waiting = b.waiting || 0;
-  const linked = b.linked || 0; // Codex R1 High 2: pending + tracking_no あり (= ready 化待ち)
+  // 2026-06-07: linked は csv_ready に統合 (ready 化ボタン廃止)
+  const linked = 0;
   const needsCheck = b.needs_check || 0;
   const excluded = b.excluded || 0;
-  const remaining = waiting + linked + needsCheck;
+  const remaining = waiting + needsCheck;
   const allDone = s.all_done && total > 0;
   // 本日 / 過去スコープ表示
   const today = new Date(Date.now() + 9*3600*1000).toISOString().slice(0,10);
@@ -1784,25 +1785,23 @@ function trkRenderMain(s){
       </div>`;
     breakdownCard.style.display = 'none';
   } else if(allDone){
-    // 完了時: 主ボタン = CSV ダウンロード
+    // 完了時: 主ボタン = NE 反映エクスポートへスクロール
+    // 2026-06-07 中原さん指示: 直接 CSV ダウンロードは定形外混在時に Step 1 (NE 受注番号コピー) を飛ばす
+    // 導線になるため、エクスポートカードへ移動して配送方法ごとに Step 1/Step 2 を選んでもらう
     main.innerHTML = `
       <div style="text-align:center; padding:12px 8px">
         <div style="font-size:28px; color:#2e7d32; margin-bottom:4px">✅ ${total} 件 完了</div>
-        <div class="muted" style="margin-bottom:16px">次にやること: NextEngine に取り込む CSV をダウンロードしてください</div>
-        <button id="btnTrkMainCsvDownload" style="background:#2e7d32; border-color:#2e7d32; font-size:16px; padding:12px 24px">📥 CSV ダウンロード (${csvReady} 件)</button>
+        <div class="muted" style="margin-bottom:16px">次にやること: 下の「NE 手動反映用エクスポート」で配送方法ごとに Step 1 (NE 受注番号コピー) と Step 2 (追跡番号 CSV ダウンロード) を実行</div>
+        <button id="btnTrkMainGoExport" style="background:#2e7d32; border-color:#2e7d32; font-size:16px; padding:12px 24px">📤 NE 反映エクスポートへ ↓ (${csvReady} 件)</button>
       </div>
       <div class="muted" style="margin-top:12px; text-align:center">
         対象外 (欠品等): ${excluded} 件
       </div>`;
     breakdownCard.style.display = 'none';
-    const btn = $('#btnTrkMainCsvDownload');
+    const btn = $('#btnTrkMainGoExport');
     if(btn) btn.onclick = () => {
-      // CSV ダウンロードカード (#trkReadyExportCard) の「すべて」を選択して CSV ダウンロード
-      const sel = $('#trkReadyExportMethod');
-      if(sel){ sel.value = 'all'; }
-      const dlBtn = $('#btnTrkReadyDownloadCsv');
-      if(dlBtn) dlBtn.click();
-      else alert('CSV ダウンロード機能の初期化中です。再読込してください。');
+      const target = $('#trkReadyExportCard');
+      if(target) target.scrollIntoView({ behavior:'smooth', block:'start' });
     };
   } else {
     // 未完了時: 主ボタン = 今すぐ確認する (= 残作業内訳カードを表示してスクロール)
@@ -1843,14 +1842,8 @@ function trkRenderMain(s){
         <a href="#" id="btnTrkOpenWaiting" style="margin-left:8px">追跡番号一覧で見る ↓</a>
       </div>`);
     }
-    if(linked > 0){
-      items.push(`<div class="row" style="padding:6px 0; border-bottom:1px solid #eee">
-        <span>🔗 紐付け済 (CSV作成対象へ移動が必要)</span>
-        <span style="flex:1"></span>
-        <b style="color:#e67e22">${linked} 件</b>
-        <a href="#" id="btnTrkMarkReadyFromBreakdown" style="margin-left:12px">これで反映するボタンへ ↓</a>
-      </div>`);
-    }
+    // 2026-06-07 中原さん指示: ready 化ボタン廃止、linked = エクスポート可能扱い。
+    // linked > 0 の特別表示は不要 (csv_ready に統合済み)。
     if(needsCheck > 0){
       items.push(`<div class="row" style="padding:6px 0; border-bottom:1px solid #eee">
         <span>⚠️ 要確認 (競合・エラー等)</span>
@@ -1861,13 +1854,6 @@ function trkRenderMain(s){
     }
     breakdownList.innerHTML = items.join('') || '<div class="muted">対応すべき項目はありません</div>';
     breakdownCard.style.display = 'block';
-    // 紐付け済 アンカー (「これで反映する」ボタンへスクロール)
-    const linkedAnchor = $('#btnTrkMarkReadyFromBreakdown');
-    if(linkedAnchor) linkedAnchor.onclick = (e) => {
-      e.preventDefault();
-      const target = $('#btnTrkMarkReady');
-      if(target) target.scrollIntoView({ behavior:'smooth', block:'center' });
-    };
     // 要確認 アンカー: 追跡番号一覧を 'group:needs_check' フィルタで開く (他フィルタ clear)
     const needsAnchor = $('#btnTrkOpenNeedsCheck');
     if(needsAnchor) needsAnchor.onclick = (e) => {
@@ -2292,11 +2278,17 @@ $('#btnTrkReadyCopyUkes').onclick = async () => {
   }
 };
 
-// 📥 CSV ダウンロード (all/特定配送方法 OK、追跡番号 CSV は混在しても NextEngine が受注番号で判別)
+// 📥 CSV ダウンロード (配送方法を選択してから、Step 1 のコピー操作と対になる運用)
+// Codex R2 High (2026-06-07): placeholder 未選択時に all で落ちると Step 1 を飛ばす導線になるため、
+// 未選択時は警告して止める。
 $('#btnTrkReadyDownloadCsv').onclick = () => {
-  let method = $('#trkReadyExportMethod').value;
-  // placeholder (未選択) は all 扱いにする (CSV ダウンロードは混在 OK)
-  if(!method) method = 'all';
+  const method = $('#trkReadyExportMethod').value;
+  if(!method){
+    $('#trkReadyExportStatus').style.color = '#c0392b';
+    $('#trkReadyExportStatus').textContent = '⚠️ 配送方法を選択してください (Step 1 のコピーと同じ配送方法で)';
+    return;
+  }
+  $('#trkReadyExportStatus').textContent = '';
   location.href = API_BASE + 'api/tracking/ready/csv?method=' + encodeURIComponent(method) + '&scope=' + TRK_SCOPE;
 };
 
@@ -2375,9 +2367,10 @@ function trkRowToGroup(row){
   const isNoTracking = row.tracking_source === 'no_tracking';
   if(st === 'skipped') return { key: 'excluded', label: '対象外', color: '#999' };
   if(['conflict','error','manual_review','ne_unknown','syncing'].includes(st)) return { key: 'needs_check', label: '⚠️ 要確認', color: '#d35400' };
+  // 2026-06-07 中原さん指示: linked と csv_ready 統合 (ready 化ボタン廃止、両方とも CSV 作成対象)
   if(st === 'ready') return { key: 'csv_ready', label: '📥 CSV作成対象', color: '#2e7d32' };
   if(st === 'pending'){
-    if(hasTracking || isNoTracking) return { key: 'linked', label: '🔗 紐付け済', color: '#2b6cb0' };
+    if(hasTracking || isNoTracking) return { key: 'csv_ready', label: '📥 CSV作成対象', color: '#2e7d32' };
     return { key: 'waiting', label: '📫 紐付け待ち', color: '#c0392b' };
   }
   // synced (= 過去 API 反映) はそのまま、運用上ほぼ出ない
@@ -2661,22 +2654,10 @@ function renderTrkImportResult(res){
 
 // 手動入力 UI は廃止 (2026-06-07 中原さん指示)。レターパック/定形外は行ごとの専用 UI に置換済。
 
-// 「これで NE 反映する」ボタン
-$('#btnTrkMarkReady').onclick = async () => {
-  const scopeLabel = TRK_SCOPE === 'today' ? '本日分の' : '全期間の';
-  if(!confirm(`追跡番号が割り当て済みの${scopeLabel} pending を NE 反映待ち (ready) に遷移します。よろしいですか?`)) return;
-  try{
-    // Codex R3 High (2026-06-07): 画面表示の scope を server に渡して、見えてない過去 pending の巻き込み防止
-    const r = await api('api/tracking/mark-ready', { method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ allPending: true, scope: TRK_SCOPE })});
-    alert(`${r.updated} 件を ready にしました。\n上の「📤 NE 反映を開始」を押すと NextEngine に反映が走ります。`);
-    await loadTrackingAll();
-  }catch(e){ alert('エラー: '+e.message); }
-};
-
-// (NE 反映 UI は廃止、Phase 1 で状態駆動メインカードに統合)
-// NE 反映ボタンの JS は削除済 (Phase 1: 状態駆動メインカードに統合、停止中機能の UI 廃止)
+// 「これで NE 反映する」ボタンは廃止 (2026-06-07 中原さん指示)。
+//   理由: NE 自動反映 cron が PR #251 で停止中、ready 化しても何も追加処理されない無駄ステップ。
+//   linked 状態 (= 追跡番号紐付け済) を直接「NE 手動反映用エクスポート」で扱う方針に変更。
+//   API endpoint /api/tracking/mark-ready と service.markReady は後方互換のため残置。
 
 // 検索 / フィルタ
 $('#btnTrkSearch').onclick = loadTrackingList;
