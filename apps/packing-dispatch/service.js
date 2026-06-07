@@ -1690,11 +1690,35 @@ export function trackingSummary({ scope = 'today' } = {}) {
   };
 }
 
+// listTracking: 2026-06-07 中原さん指示で status フィルタを業務 5 状態に再構成。
+// status 値の規約:
+//   group:waiting    - 紐付け待ち (pending + tracking_no NULL + tracking_source != 'no_tracking')
+//   group:linked     - 紐付け済 (pending + 追跡番号 or 定形外マーク)
+//   group:csv_ready  - CSV作成対象 (ready)
+//   group:needs_check - 要確認 (conflict / error / manual_review / ne_unknown / syncing)
+//   group:excluded   - 対象外 (skipped)
+//   <未指定>          - すべて
+// 後方互換: 既存の単一 status 値 (pending/ready/synced 等) も受理 (詳細データ系で使う場合あり)
 export function listTracking({ status, source, shop, q, limit = 1000 } = {}) {
   const db = ensureSchema();
   const where = [];
   const params = [];
-  if (status) { where.push('sync_status = ?'); params.push(status); }
+  if (status) {
+    if (status === 'group:waiting') {
+      where.push(`sync_status='pending' AND tracking_no IS NULL AND (tracking_source IS NULL OR tracking_source != 'no_tracking')`);
+    } else if (status === 'group:linked') {
+      where.push(`sync_status='pending' AND (tracking_no IS NOT NULL OR tracking_source='no_tracking')`);
+    } else if (status === 'group:csv_ready') {
+      where.push(`sync_status='ready'`);
+    } else if (status === 'group:needs_check') {
+      where.push(`sync_status IN ('conflict','error','manual_review','ne_unknown','syncing')`);
+    } else if (status === 'group:excluded') {
+      where.push(`sync_status='skipped'`);
+    } else {
+      // 後方互換 (単一 status)
+      where.push('sync_status = ?'); params.push(status);
+    }
+  }
   if (source) { where.push('tracking_source = ?'); params.push(source); }
   if (shop) { where.push('shop_name = ?'); params.push(shop); }
   if (q) {
@@ -1709,7 +1733,10 @@ export function listTracking({ status, source, shop, q, limit = 1000 } = {}) {
                                 WHEN 'skipped' THEN 6 WHEN 'synced' THEN 7 ELSE 8 END),
              updated_at DESC
     LIMIT ?`;
-  return db.prepare(sql).all(...params, Math.min(limit, 5000));
+  // Codex R4 High: 負数 / NaN / 0 の defense
+  const n = Number.parseInt(limit, 10);
+  const safeLimit = Number.isFinite(n) && n > 0 ? Math.min(n, 5000) : 1000;
+  return db.prepare(sql).all(...params, safeLimit);
 }
 
 export function listTrackingImports(limit = 50) {
@@ -1987,6 +2014,69 @@ export function listMissingTracking() {
 // 既存 tracking_no と異なる場合は conflict 扱い (sync_status='conflict')。
 // pending/ready/error/conflict/manual_review は更新可、syncing/synced/skipped は不可。
 // 更新成功時は sync_status='pending' にリセット (error/conflict 修正パスを兼ねる)、last_error クリア。
+// 1 件の配送方法変更 (2026-06-07 中原さん指示、レターパック→別配送方法等)。
+// サイズ超過等で出荷現場が別配送方法を選んだケース。tracking_no/tracking_source は
+// クリアして次の手動入力 or キャリア CSV 取込で紐付け直す形にする。
+//
+// Codex R1 High 対応:
+//   #2: 現在の配送方法が letterpack の行のみ変更可、変更先 letterpack は禁止
+//   #3: 変更先 teikeigai (定形外) は今回禁止 (LP→定形外の運用導線が無いため。
+//       将来定形外対応を追加するなら、tracking_source='no_tracking' を自動セットして
+//       定形外カードに出すフロー設計が必要)
+//   #1: UPDATE 後 changes 確認、0 件なら conflict エラー (SELECT/UPDATE 間の race 検出)
+export function changeShippingMethod({ ne_uketsuke_no, shipping_method_code }, user) {
+  const uke = norm(ne_uketsuke_no);
+  if (!uke) throw vErr('ne_uketsuke_no が空です');
+  if (!shipping_method_code) throw vErr('shipping_method_code が空です');
+  // Codex R1 High 3: 変更先 teikeigai 禁止 (LP→定形外フローは未対応)
+  if (shipping_method_code === 'teikeigai') {
+    throw vErr('レターパックから定形外への変更は現状未対応です (定形外マーク → no_tracking の遷移が必要)');
+  }
+  // Codex R1 High 2: 変更先 letterpack 禁止 (= 同じになる、意味なし)
+  if (shipping_method_code === 'letterpack') {
+    throw vErr('変更先にレターパックは選べません');
+  }
+  const db = ensureSchema();
+  const sm = db.prepare(`SELECT code, is_locked FROM pd_shipping_method WHERE code=?`).get(shipping_method_code);
+  if (!sm) throw vErr(`未知の配送方法コード: ${shipping_method_code}`);
+  if (sm.is_locked) throw vErr(`配送方法 ${shipping_method_code} は変更対象外 (lock)`);
+  const cur = db.prepare(`SELECT sync_status, shipping_method_code FROM pd_shipment_tracking WHERE ne_uketsuke_no=?`).get(uke);
+  if (!cur) throw vErr(`受注 ${uke} は pd_shipment_tracking にありません`);
+  // Codex R1 High 2: 現在 letterpack 行のみ変更可 (他の行を直接 POST で letterpack に戻すのを防ぐ)
+  if (cur.shipping_method_code !== 'letterpack') {
+    throw vErr(`現在の配送方法 ${cur.shipping_method_code} はこの機能では変更できません (レターパック行専用)`);
+  }
+  const editable = ['pending', 'ready', 'error', 'conflict', 'manual_review'];
+  if (!editable.includes(cur.sync_status)) {
+    throw vErr(`状態が ${cur.sync_status} のため配送方法を変更できません`);
+  }
+  if (cur.shipping_method_code === shipping_method_code) {
+    return { status: 'no_change', message: '既に同じ配送方法です' };
+  }
+  const now = utcIsoNow();
+  // Codex R1 High 1: changes 確認で race 検出
+  const info = db.prepare(`UPDATE pd_shipment_tracking
+    SET shipping_method_code = ?,
+        tracking_no = NULL,
+        tracking_source = NULL,
+        sync_status = 'pending',
+        sync_requested_at = NULL,
+        last_error = NULL, last_error_code = NULL,
+        claim_id = NULL, claim_token_hash = NULL, claim_expires_at = NULL,
+        updated_at = ?, updated_by = ?
+    WHERE ne_uketsuke_no=?
+      AND shipping_method_code='letterpack'
+      AND sync_status IN ('pending','ready','error','conflict','manual_review')`)
+    .run(shipping_method_code, now, user || null, uke);
+  if (info.changes === 0) {
+    // SELECT/UPDATE 間で他経路が状態を変えた
+    throw vErr(`変更が反映されませんでした (他の操作で状態が変わった可能性、再読込してください)`);
+  }
+  audit('change_shipping_method', uke,
+    { old_method: cur.shipping_method_code, new_method: shipping_method_code }, user);
+  return { status: 'ok', old_method: cur.shipping_method_code, new_method: shipping_method_code };
+}
+
 export function setTrackingOne({ ne_uketsuke_no, tracking_no, source }, user) {
   const uke = norm(ne_uketsuke_no);
   if (!uke) throw vErr('ne_uketsuke_no が空です');
