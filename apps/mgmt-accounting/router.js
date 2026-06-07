@@ -206,6 +206,8 @@ router.post('/api/freight', (req, res) => {
     for (const item of items) {
       stmt.run(year_month, item.carrier, Math.round(item.amount || 0), item.cost_scope || 'shared', item.target_segment || null, item.target_mall_id || null, item.note || null, user, now, now);
     }
+    // 確定済み月の運賃を書き換えたら確定PLが古くなるので要再確定に降格（同一tx）
+    db.prepare("UPDATE mgmt_monthly_closing SET status='needs_review' WHERE year_month = ? AND status = 'confirmed'").run(year_month);
   });
   tx();
   res.json({ ok: true });
@@ -224,6 +226,8 @@ router.post('/api/material', (req, res) => {
     for (const item of items) {
       stmt.run(year_month, item.supplier, Math.round(item.amount || 0), item.note || null, user, now, now);
     }
+    // 確定済み月の資材費を書き換えたら確定PLが古くなるので要再確定に降格（同一tx）
+    db.prepare("UPDATE mgmt_monthly_closing SET status='needs_review' WHERE year_month = ? AND status = 'confirmed'").run(year_month);
   });
   tx();
   res.json({ ok: true });
@@ -368,47 +372,50 @@ router.post('/auto-sync-sales', (req, res) => {
   const db = getMirrorDB();
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
 
+  // 対象月: 各モール summary + 既存 segment_sales + 確定済み closing の和集合。
+  // summary が全消えした月も candidate に含めることで segment_sales を空にして整合させる。
   const monthsSet = new Set();
   for (const mt of MALL_TABLES) {
     try {
       for (const r of db.prepare(`SELECT DISTINCT year_month FROM ${mt.table}`).all()) monthsSet.add(r.year_month);
     } catch {}
   }
+  for (const r of db.prepare('SELECT DISTINCT year_month FROM mart_monthly_segment_sales').all()) monthsSet.add(r.year_month);
+  for (const r of db.prepare("SELECT year_month FROM mgmt_monthly_closing WHERE status = 'confirmed'").all()) monthsSet.add(r.year_month);
   const months = [...monthsSet].sort();
 
-  // 確定済みPLの入力値合計。売上だけでなく原価/手数料/広告費/運賃の変動も検知する。
-  const sumSeg = ym => db.prepare(
-    'SELECT COALESCE(SUM(sales),0) sales, COALESCE(SUM(cost),0) cost, COALESCE(SUM(pf_fee),0) pf, COALESCE(SUM(ad_cost),0) ad FROM mart_monthly_segment_sales WHERE year_month = ?'
-  ).get(ym);
-  const sumPl = ym => db.prepare(
-    'SELECT COALESCE(SUM(sales),0) sales, COALESCE(SUM(cost),0) cost, COALESCE(SUM(pf_fee),0) pf, COALESCE(SUM(ad_cost),0) ad FROM mgmt_monthly_pl WHERE year_month = ?'
-  ).get(ym);
   const sumFreight = ym => db.prepare('SELECT COALESCE(SUM(amount),0) s FROM mgmt_freight_costs WHERE year_month = ?').get(ym).s;
+  // 行単位の差分検知（合計一致でもモール/セグメント間の入替を検知）。
+  // confirmed 時に segment_sales を写した mgmt_monthly_pl と、再同期後の segment_sales を突合。
+  const inputsChanged = ym => {
+    const segCount = db.prepare('SELECT COUNT(*) c FROM mart_monthly_segment_sales WHERE year_month = ?').get(ym).c;
+    const plCount = db.prepare('SELECT COUNT(*) c FROM mgmt_monthly_pl WHERE year_month = ?').get(ym).c;
+    if (segCount !== plCount) return true;
+    const diff = db.prepare(`SELECT COUNT(*) c FROM (
+      SELECT mall_id, segment, sales, cost, pf_fee, ad_cost FROM mart_monthly_segment_sales WHERE year_month = ?
+      EXCEPT
+      SELECT mall_id, segment, sales, cost, pf_fee, ad_cost FROM mgmt_monthly_pl WHERE year_month = ?
+    )`).get(ym, ym).c;
+    return diff > 0;
+  };
 
   const flagged = [];
   let syncedCount = 0;
-  for (const ym of months) {
+  // 月単位で「完全置換 → 差分判定 → closing降格」を同一トランザクションに入れて原子性を担保。
+  const runMonth = db.transaction(ym => {
     const closing = db.prepare('SELECT status, freight_total FROM mgmt_monthly_closing WHERE year_month = ?').get(ym);
-    const prev = sumPl(ym); // 同期前の確定PL入力値
-
-    syncSegmentSalesForMonth(db, ym, now);
+    syncSegmentSalesForMonth(db, ym, now); // 内部 tx は savepoint としてネスト
     syncedCount++;
-
-    // 確定済みなのに確定時の入力値から変わった → 運賃込みPLが古いので要再確定に落とす
     if (closing && closing.status === 'confirmed') {
-      const cur = sumSeg(ym);
-      const curFreight = sumFreight(ym);
-      const changed = Math.abs(cur.sales - prev.sales) > 1
-                   || Math.abs(cur.cost - prev.cost) > 1
-                   || Math.abs(cur.pf - prev.pf) > 1
-                   || Math.abs(cur.ad - prev.ad) > 1
-                   || Math.abs(curFreight - (closing.freight_total || 0)) > 1;
+      const changed = inputsChanged(ym) || Math.abs(sumFreight(ym) - (closing.freight_total || 0)) > 1;
       if (changed) {
         db.prepare("UPDATE mgmt_monthly_closing SET status='needs_review' WHERE year_month = ?").run(ym);
-        flagged.push({ year_month: ym, old_sales: prev.sales, new_sales: cur.sales });
+        flagged.push({ year_month: ym });
       }
     }
-  }
+  });
+  for (const ym of months) runMonth(ym);
+
   res.json({ ok: true, months: months.length, synced: syncedCount, flagged });
 });
 
@@ -538,7 +545,11 @@ router.get('/api/monthly-pl/:yearMonth', (req, res) => {
 router.get('/api/annual-pl/:fiscalYear', (req, res) => {
   const db = getMirrorDB();
   const fy = parseInt(req.params.fiscalYear);
-  const months = getFiscalYearMonths(fy);
+  // 表示は確定済みの月のみ（未確定月がゼロ列で出ないようにする）
+  const confirmedSet = new Set(
+    db.prepare("SELECT year_month FROM mgmt_monthly_closing WHERE fiscal_year = ? AND status = 'confirmed'").all(fy).map(r => r.year_month)
+  );
+  const months = getFiscalYearMonths(fy).filter(m => confirmedSet.has(m));
 
   // セグメント別×月で集約
   const rows = db.prepare(`
