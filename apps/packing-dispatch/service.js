@@ -1531,6 +1531,14 @@ export function setTrackingManual({ entries, source }, user) {
 // 対象は sync_status='ready' (= 「これで NE 反映する」ボタンを押し終わった伝票)
 
 // 配送方法ごとの ready 件数 (UI のセレクトボックス表示用)。
+// 2026-06-07 中原さん指示: ready 化ボタン廃止、対象を「紐付け済 (linked + ready)」に拡張。
+//   linked = pending + (tracking_no あり OR tracking_source='no_tracking')
+//   ready = 旧 markReady 経路 (NE 自動反映 cron が止まっているので将来使われない、後方互換のため残置)
+const EXPORT_SQL_FILTER = `(
+  (sync_status='pending' AND (tracking_no IS NOT NULL OR tracking_source='no_tracking'))
+  OR sync_status='ready'
+)`;
+
 export function getReadyExportSummary({ scope = 'today' } = {}) {
   const db = ensureSchema();
   // Phase 1 UI 再設計 (2026-06-07): scope='today' で本日のみに絞る
@@ -1541,7 +1549,7 @@ export function getReadyExportSummary({ scope = 'today' } = {}) {
       SUM(CASE WHEN tracking_no IS NOT NULL THEN 1 ELSE 0 END) AS with_tracking,
       SUM(CASE WHEN tracking_no IS NULL THEN 1 ELSE 0 END) AS without_tracking
     FROM pd_shipment_tracking
-    WHERE sync_status='ready' ${todayWhere}
+    WHERE ${EXPORT_SQL_FILTER} ${todayWhere}
     GROUP BY shipping_method_code
     ORDER BY shipping_method_code`).all();
   const total = rows.reduce((s, r) => s + r.total, 0);
@@ -1549,7 +1557,7 @@ export function getReadyExportSummary({ scope = 'today' } = {}) {
   return { rows, total, total_with_tracking: totalWithTracking, scope };
 }
 
-// 配送方法を指定して ready の NE 受注番号一覧を返す (コピー用)。
+// 配送方法を指定して紐付け済の NE 受注番号一覧を返す (コピー用)。
 // 必ず特定の配送方法を指定すること。'' / 'all' は拒否 (Codex R1 High: NextEngine で
 // 一括検索 → 別配送方法を誤更新する事故防止のため、必ず配送方法を絞らせる)。
 export function getReadyNeUketsukeNos({ method, scope = 'today' } = {}) {
@@ -1562,7 +1570,7 @@ export function getReadyNeUketsukeNos({ method, scope = 'today' } = {}) {
     ? ` AND date(COALESCE(exported_at, added_at), '+9 hours') = date('now', '+9 hours')` : '';
   const rows = db.prepare(`SELECT DISTINCT ne_uketsuke_no
     FROM pd_shipment_tracking
-    WHERE sync_status='ready' AND shipping_method_code=?${todayWhere}
+    WHERE ${EXPORT_SQL_FILTER} AND shipping_method_code=?${todayWhere}
     ORDER BY ne_uketsuke_no`).all(method);
   return rows.map(r => r.ne_uketsuke_no);
 }
@@ -1580,7 +1588,7 @@ export function getReadyTrackingCsv({ method, scope = 'today' } = {}) {
   const params = (method && method !== 'all') ? [method] : [];
   const rows = db.prepare(`SELECT ne_uketsuke_no, tracking_no, shipping_method_code
     FROM pd_shipment_tracking
-    WHERE sync_status='ready' AND tracking_no IS NOT NULL${where}${todayWhere}
+    WHERE ${EXPORT_SQL_FILTER} AND tracking_no IS NOT NULL${where}${todayWhere}
     ORDER BY shipping_method_code, ne_uketsuke_no`).all(...params);
   // CSV escape: ダブルクォート囲み + 内部の " は ""
   const esc = (v) => {
@@ -1670,24 +1678,24 @@ export function trackingSummary({ scope = 'today' } = {}) {
   const pendingLinked = db.prepare(`SELECT COUNT(*) c FROM pd_shipment_tracking
     WHERE sync_status='pending' AND (tracking_no IS NOT NULL OR tracking_source='no_tracking')
     ${pendingScopeAnd}`).get().c;
-  // 5 状態に正規化 (UI 用、DB は触らない)。Codex 助言:
+  // 4 状態に正規化 (2026-06-07 中原さん指示で linked と csv_ready 統合):
   //   - 紐付け待ち (waiting): pending + tracking_no NULL + 定形外マーク未
-  //   - 紐付け済 (linked):    pending + tracking_no あり or 定形外マーク済 (= markReady で ready 化可能)
-  //   - CSV作成対象 (csv_ready): ready
+  //   - CSV作成対象 (csv_ready): pending + 紐付け済 (= 旧 linked) OR ready (= markReady ステップ廃止で統合)
   //   - 要確認 (needs_check): conflict / error / manual_review / ne_unknown / syncing
   //   - 対象外 (excluded): skipped
+  // NE 自動反映 cron が止まっている (PR #251) ので「ready 化」ボタンは廃止。linked = エクスポート可能。
   // synced (= 過去 API 反映済) は手動 CSV 運用では表示しない
   const buckets = {
     waiting: pendingNoTracking,
-    linked: pendingLinked,
-    csv_ready: raw.ready,
+    linked: 0,  // 後方互換のため残置、UI では使わない
+    csv_ready: pendingLinked + raw.ready,
     needs_check: raw.conflict + raw.error + raw.manual_review + raw.ne_unknown + raw.syncing,
     excluded: raw.skipped,
   };
-  buckets.total = buckets.waiting + buckets.linked + buckets.csv_ready + buckets.needs_check + buckets.excluded;
-  // 業務状態: 完了 = waiting/linked/needs_check が全て 0 かつ csv_ready > 0 (= 残作業なし、CSV ダウンロード可)
+  buckets.total = buckets.waiting + buckets.csv_ready + buckets.needs_check + buckets.excluded;
+  // 業務状態: 完了 = waiting/needs_check が全て 0 かつ csv_ready > 0 (= 残作業なし、CSV ダウンロード可)
   const allDone = buckets.csv_ready > 0
-    && buckets.waiting === 0 && buckets.linked === 0 && buckets.needs_check === 0;
+    && buckets.waiting === 0 && buckets.needs_check === 0;
   return {
     scope,
     buckets,                  // 4 状態の件数
@@ -1697,11 +1705,11 @@ export function trackingSummary({ scope = 'today' } = {}) {
   };
 }
 
-// listTracking: 2026-06-07 中原さん指示で status フィルタを業務 5 状態に再構成。
-// status 値の規約:
+// listTracking: 2026-06-07 中原さん指示で status フィルタを業務 4 状態に再構成。
+// status 値の規約 (linked と csv_ready 統合):
 //   group:waiting    - 紐付け待ち (pending + tracking_no NULL + tracking_source != 'no_tracking')
-//   group:linked     - 紐付け済 (pending + 追跡番号 or 定形外マーク)
-//   group:csv_ready  - CSV作成対象 (ready)
+//   group:csv_ready  - CSV作成対象 (旧 linked = pending + 追跡番号 or 定形外マーク) + 旧 ready
+//   group:linked     - 後方互換 alias → csv_ready と同じ意味
 //   group:needs_check - 要確認 (conflict / error / manual_review / ne_unknown / syncing)
 //   group:excluded   - 対象外 (skipped)
 //   <未指定>          - すべて
@@ -1717,10 +1725,12 @@ export function listTracking({ status, source, shop, q, scope = 'all', limit = 1
   if (status) {
     if (status === 'group:waiting') {
       where.push(`sync_status='pending' AND tracking_no IS NULL AND (tracking_source IS NULL OR tracking_source != 'no_tracking')`);
-    } else if (status === 'group:linked') {
-      where.push(`sync_status='pending' AND (tracking_no IS NOT NULL OR tracking_source='no_tracking')`);
-    } else if (status === 'group:csv_ready') {
-      where.push(`sync_status='ready'`);
+    } else if (status === 'group:linked' || status === 'group:csv_ready') {
+      // 2026-06-07 中原さん指示: linked + ready 統合 (ready 化ボタン廃止)
+      where.push(`(
+        (sync_status='pending' AND (tracking_no IS NOT NULL OR tracking_source='no_tracking'))
+        OR sync_status='ready'
+      )`);
     } else if (status === 'group:needs_check') {
       where.push(`sync_status IN ('conflict','error','manual_review','ne_unknown','syncing')`);
     } else if (status === 'group:excluded') {
