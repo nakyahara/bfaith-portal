@@ -269,6 +269,12 @@ function syncSegmentSalesForMonth(db, year_month, now) {
     ON CONFLICT(year_month, carrier) DO UPDATE SET amount=excluded.amount, cost_scope=excluded.cost_scope, note=excluded.note, updated_at=excluded.updated_at`);
 
   const tx = db.transaction(() => {
+    // source-owned（各 summary 由来）の当月行を先に全消去。summary が削除/空化された
+    // モールの stale 行も確実に除去する（source_file = テーブル名で識別）。
+    // historical-excel 由来や米国Amazon(mgmt_row, historical由来)の行は対象外で保護される。
+    for (const mt of MALL_TABLES) {
+      db.prepare('DELETE FROM mart_monthly_segment_sales WHERE year_month = ? AND source_file = ?').run(year_month, mt.table);
+    }
     for (const mt of MALL_TABLES) {
       let row;
       try {
@@ -346,13 +352,11 @@ function syncSegmentSalesForMonth(db, year_month, now) {
         segRows.push({ seg, sales: Math.round(sales), cost: Math.round(cost), pfFee: Math.round(pfFee), adCost });
       }
 
-      // by_segment 形式で 1 行も作れないモール(米国Amazon等)は既存行を保護してスキップ
+      // by_segment 形式で 1 行も作れないモール(米国Amazon等)は何も挿入しない
+      // （source-owned 行は上で消去済みなので、historical 由来の既存行だけが残る）
       if (segRows.length === 0) continue;
 
-      // モール単位の完全置換: そのモールの当月行だけ入替（他モール/historical/米国Amazon は保持）。
-      // 同一モール内で消えたセグメントの残骸はこの delete で除去される。
       mallsPresent.add(mt.mall_id);
-      db.prepare('DELETE FROM mart_monthly_segment_sales WHERE year_month = ? AND mall_id = ?').run(year_month, mt.mall_id);
       for (const r of segRows) {
         insertStmt.run(year_month, mt.mall_id, r.seg, r.sales, r.cost, r.pfFee, r.adCost, now, mt.table, 'v1');
         totalInserted++;
