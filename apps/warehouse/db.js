@@ -495,6 +495,18 @@ function createTables() {
   )`);
   // CHECK制約はSQLiteでは制限があるため、取り込み時にバリデーション
 
+  // 12c. 発注設定マスタ（手動入力）— 推奨保有月数（「何ヶ月分の在庫を持つか」の係数）
+  //   商品管理リストの「推奨保有在庫」列に相当。販売データから自動算出できない手動パラメータ。
+  //   新商品は GET /api/reorder/unregistered（未登録リスト）に上がってきて、register UI で登録する。
+  db.exec(`CREATE TABLE IF NOT EXISTS m_reorder_setting (
+    sku               TEXT PRIMARY KEY,
+    推奨保有月数      REAL NOT NULL CHECK (推奨保有月数 >= 0 AND 推奨保有月数 <= 60),
+    商品名            TEXT,
+    updated_by        TEXT,
+    synced_at         TEXT
+  )`);
+  // 値域は DB CHECK + API/取り込み側バリデーションの二重防御
+
   // ─── 統合商品マスタ系 ───
 
   // 13. m_products（統合商品マスタ）
@@ -1799,7 +1811,7 @@ function insertDefaultShops() {
 // ─── 統計取得 ───
 
 export function getStats() {
-  const tables = ['raw_ne_products', 'raw_ne_orders', 'raw_ne_set_products', 'raw_sp_orders', 'raw_sp_orders_log', 'raw_rakuten_orders', 'raw_rakuten_orders_log', 'raw_lz_inventory', 'product_shipping', 'shipping_rates', 'exception_genka', 'product_sales_class', 'shops', 'm_products', 'm_set_components', 'f_sales_by_listing', 'f_sales_by_product', 'unmapped_sales', 'amazon_sku_fees', 'stock_monthly_snapshot', 'm_sku_master', 'm_sku_components'];
+  const tables = ['raw_ne_products', 'raw_ne_orders', 'raw_ne_set_products', 'raw_sp_orders', 'raw_sp_orders_log', 'raw_rakuten_orders', 'raw_rakuten_orders_log', 'raw_lz_inventory', 'product_shipping', 'shipping_rates', 'exception_genka', 'product_sales_class', 'm_reorder_setting', 'shops', 'm_products', 'm_set_components', 'f_sales_by_listing', 'f_sales_by_product', 'unmapped_sales', 'amazon_sku_fees', 'stock_monthly_snapshot', 'm_sku_master', 'm_sku_components'];
   const stats = {};
 
   for (const table of tables) {

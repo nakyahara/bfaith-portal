@@ -950,6 +950,29 @@ router.get('/api/missing/prioritized', (req, res) => {
         LIMIT 200
       `).all(cutoff7Str, cutoff30Str));
     }
+
+    if (!type || type === 'reorder') {
+      rows = rows.concat(db.prepare(`
+        SELECT 'reorder' as missing_type, m.商品コード, m.商品名, m.標準売価 as 売価, m.原価,
+          m.取扱区分, m.商品区分,
+          COALESCE(s7.qty, 0) as sales_7d,
+          COALESCE(s30.qty, 0) as sales_30d,
+          s30.last_sold,
+          CASE WHEN COALESCE(s7.qty, 0) > 0 THEN 'A_7日以内' WHEN COALESCE(s30.qty, 0) > 0 THEN 'B_30日以内' ELSE 'C_実績なし' END as priority
+        FROM m_products m
+        LEFT JOIN m_reorder_setting r ON m.商品コード = r.sku COLLATE NOCASE
+        LEFT JOIN (
+          SELECT 商品コード, SUM(数量) as qty FROM f_sales_by_product WHERE 日付 >= ? GROUP BY 商品コード
+        ) s7 ON m.商品コード = s7.商品コード
+        LEFT JOIN (
+          SELECT 商品コード, SUM(数量) as qty, MAX(日付) as last_sold FROM f_sales_by_product WHERE 日付 >= ? GROUP BY 商品コード
+        ) s30 ON m.商品コード = s30.商品コード
+        WHERE m.商品区分 IN ('単品', '例外') AND r.sku IS NULL
+          AND m.取扱区分 = '取扱中'
+        ORDER BY priority, sales_7d DESC, sales_30d DESC
+        LIMIT 200
+      `).all(cutoff7Str, cutoff30Str));
+    }
   } catch (e) {
     console.error('[missing/prioritized] m_products未構築?', e.message);
   }
@@ -1047,6 +1070,125 @@ router.post('/api/csv/sales_class', upload.single('file'), (req, res) => {
       const name = db.prepare('SELECT 商品名 FROM m_products WHERE 商品コード = ? COLLATE NOCASE').get(sku)?.商品名 || '';
       stmt.run(sku, sc, name, now);
       try { updateMp.run(sc, now, sku); } catch {}
+      count++;
+    }
+  });
+  tx();
+  res.json({ ok: true, imported: count, skipped, invalid, total: dataRows.length });
+});
+
+// ─── 発注設定マスタ（推奨保有月数）───
+//   商品管理リストの「推奨保有在庫」(=何ヶ月分持つかの係数) を商品コード単位で管理する。
+//   値域: 0 <= 推奨保有月数 <= 60。小数1桁まで。
+
+const REORDER_MONTHS_MAX = 60;
+function parseReorderMonths(v) {
+  if (v === undefined || v === null || v === '') return null;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0 || n > REORDER_MONTHS_MAX) return null;
+  return Math.round(n * 10) / 10; // 小数1桁に丸め
+}
+
+// POST /api/reorder_setting — 推奨保有月数の登録・更新
+router.post('/api/reorder_setting', (req, res) => {
+  const sku = (req.body.sku || '').toLowerCase().trim();
+  const months = parseReorderMonths(req.body.推奨保有月数 ?? req.body.months);
+  if (!sku) return res.status(400).json({ error: 'sku は必須です' });
+  if (months === null) return res.status(400).json({ error: `推奨保有月数 は 0〜${REORDER_MONTHS_MAX} の数値です` });
+  const db = getDB();
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const updatedBy = req.session?.email || req.headers['x-actor'] || 'system';
+  const old = db.prepare('SELECT * FROM m_reorder_setting WHERE sku = ?').get(sku);
+  const name = req.body.product_name
+    || old?.商品名
+    || db.prepare('SELECT 商品名 FROM m_products WHERE 商品コード = ? COLLATE NOCASE').get(sku)?.商品名
+    || '';
+  db.prepare('INSERT OR REPLACE INTO m_reorder_setting (sku, 推奨保有月数, 商品名, updated_by, synced_at) VALUES (?, ?, ?, ?, ?)')
+    .run(sku, months, name, updatedBy, now);
+  auditLog(db, 'm_reorder_setting', sku, old ? 'UPDATE' : 'INSERT', old || null, { sku, 推奨保有月数: months, updated_by: updatedBy });
+  res.json({ ok: true, sku, 推奨保有月数: months });
+});
+
+// GET /api/reorder_setting/list — 登録済み検索（編集用）
+router.get('/api/reorder_setting/list', (req, res) => {
+  const { search, limit = '100', offset = '0' } = req.query;
+  let sql = 'SELECT * FROM m_reorder_setting WHERE 1=1';
+  const params = [];
+  if (search) { sql += ' AND (sku LIKE ? OR 商品名 LIKE ?)'; const t = `%${search}%`; params.push(t, t); }
+  const countSql = sql.replace('SELECT *', 'SELECT COUNT(*) as cnt');
+  const total = execQuery(countSql, params)[0]?.cnt || 0;
+  sql += ' ORDER BY sku LIMIT ? OFFSET ?';
+  params.push(parseInt(limit), parseInt(offset));
+  res.json({ rows: execQuery(sql, params), total });
+});
+
+// DELETE /api/reorder_setting/:sku — 削除（未登録一覧に戻る）
+router.delete('/api/reorder_setting/:sku', (req, res) => {
+  const db = getDB();
+  const sku = (req.params.sku || '').toLowerCase();
+  const old = db.prepare('SELECT * FROM m_reorder_setting WHERE sku = ?').get(sku);
+  const result = db.prepare('DELETE FROM m_reorder_setting WHERE sku = ?').run(sku);
+  if (old) auditLog(db, 'm_reorder_setting', sku, 'DELETE', old, null);
+  res.json({ ok: true, deleted: result.changes });
+});
+
+// GET /api/reorder/unregistered — 推奨保有月数が未登録の取扱中商品（新商品リスト）
+//   m_products(取扱中) 起点で m_reorder_setting 未登録を抽出。直近売上順で優先表示。
+router.get('/api/reorder/unregistered', (req, res) => {
+  const { limit = '500' } = req.query;
+  const cutoff30 = new Date(); cutoff30.setDate(cutoff30.getDate() - 30);
+  const cutoff30Str = cutoff30.toISOString().slice(0, 10);
+  const rows = execQuery(`
+    SELECT
+      p.商品コード,
+      p.商品名,
+      p.取扱区分,
+      p.new_product_launch_date AS 登録日,
+      COALESCE(s30.qty, 0) AS 直近30日販売数
+    FROM m_products p
+    LEFT JOIN m_reorder_setting r ON p.商品コード = r.sku COLLATE NOCASE
+    LEFT JOIN (
+      SELECT 商品コード, SUM(数量) as qty FROM f_sales_by_product WHERE 日付 >= ? GROUP BY 商品コード
+    ) s30 ON p.商品コード = s30.商品コード COLLATE NOCASE
+    WHERE r.sku IS NULL
+      AND p.商品区分 IN ('単品', '例外')
+      AND p.取扱区分 = '取扱中'
+    ORDER BY 直近30日販売数 DESC, p.new_product_launch_date DESC, p.商品コード
+    LIMIT ?
+  `, [cutoff30Str, parseInt(limit)]);
+  res.json({ rows, total: rows.length });
+});
+
+// POST /api/csv/reorder_setting — 推奨保有月数CSV一括登録
+//   CSV形式: 商品コード, 推奨保有月数(0〜60) ／ ヘッダー行は自動スキップ
+router.post('/api/csv/reorder_setting', upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'ファイルが必要です' });
+  const db = getDB();
+  const buf = fs.readFileSync(req.file.path);
+  fs.unlinkSync(req.file.path);
+  const rows = parseCsvBuffer(buf);
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const updatedBy = req.session?.email || 'csv-import';
+
+  let dataRows = rows;
+  let colSku = 0, colMonths = 1;
+  if (dataRows.length > 0 && /商品コード|sku|SKU/i.test(dataRows[0][0])) {
+    const hdr = rows[0].map(h => (h || '').toLowerCase().trim());
+    const ci = hdr.findIndex(h => h.includes('推奨保有') || h.includes('月数') || h.includes('months'));
+    if (ci >= 0) colMonths = ci;
+    dataRows = dataRows.slice(1);
+  }
+
+  const stmt = db.prepare('INSERT OR REPLACE INTO m_reorder_setting (sku, 推奨保有月数, 商品名, updated_by, synced_at) VALUES (?, ?, ?, ?, ?)');
+  let count = 0, skipped = 0, invalid = 0;
+  const tx = db.transaction(() => {
+    for (const row of dataRows) {
+      const sku = (row[colSku] || '').toLowerCase().trim();
+      if (!sku) { skipped++; continue; }
+      const months = parseReorderMonths(row[colMonths]);
+      if (months === null) { invalid++; skipped++; continue; }
+      const name = db.prepare('SELECT 商品名 FROM m_products WHERE 商品コード = ? COLLATE NOCASE').get(sku)?.商品名 || '';
+      stmt.run(sku, months, name, updatedBy, now);
       count++;
     }
   });
@@ -1183,8 +1325,19 @@ router.get('/api/missing/download', (req, res) => {
       `).all();
       header = '商品コード,商品名,商品区分,取扱区分,標準売価,原価,原価状態,税率(0.08or0.1)';
       filename = 'tax_rate_missing.csv';
+    } else if (type === 'reorder') {
+      rows = db.prepare(`
+        SELECT m.商品コード, m.商品名, m.商品区分, m.取扱区分, m.標準売価, m.原価, m.原価状態, '' as 推奨保有月数
+        FROM m_products m
+        LEFT JOIN m_reorder_setting r ON m.商品コード = r.sku COLLATE NOCASE
+        WHERE m.商品区分 IN ('単品', '例外') AND r.sku IS NULL
+          AND m.取扱区分 = '取扱中'
+        ORDER BY m.取扱区分, m.商品コード
+      `).all();
+      header = '商品コード,商品名,商品区分,取扱区分,標準売価,原価,原価状態,推奨保有月数(0-60)';
+      filename = 'reorder_missing.csv';
     } else {
-      return res.status(400).json({ error: 'type パラメータが必要です（shipping / genka / sku_map / sales_class / tax_rate）' });
+      return res.status(400).json({ error: 'type パラメータが必要です（shipping / genka / sku_map / sales_class / tax_rate / reorder）' });
     }
   } catch (e) {
     return res.status(500).json({ error: e.message });
@@ -1218,9 +1371,13 @@ router.get('/api/missing/counts', (req, res) => {
     const sku_map = db.prepare("SELECT COUNT(*) as cnt FROM unmapped_sales").get().cnt;
     const sales_class = db.prepare("SELECT COUNT(*) as cnt FROM m_products WHERE 商品区分 IN ('単品', '例外') AND 売上分類 IS NULL").get().cnt;
     const tax_rate = db.prepare("SELECT COUNT(*) as cnt FROM m_products WHERE 商品区分 IN ('単品', '例外') AND 消費税率 IS NULL").get().cnt;
-    res.json({ shipping, genka, sku_map, sales_class, tax_rate });
+    const reorder = db.prepare(`SELECT COUNT(*) as cnt FROM m_products m
+      LEFT JOIN m_reorder_setting r ON m.商品コード = r.sku COLLATE NOCASE
+      WHERE m.商品区分 IN ('単品', '例外') AND r.sku IS NULL
+        AND m.取扱区分 = '取扱中'`).get().cnt;
+    res.json({ shipping, genka, sku_map, sales_class, tax_rate, reorder });
   } catch {
-    res.json({ shipping: 0, genka: 0, sku_map: 0, sales_class: 0, tax_rate: 0 });
+    res.json({ shipping: 0, genka: 0, sku_map: 0, sales_class: 0, tax_rate: 0, reorder: 0 });
   }
 });
 
@@ -1363,6 +1520,7 @@ function renderRegisterPage(shippingRates, session = {}) {
         <div class="cnt cnt-sku" onclick="switchType('sku_map',this)">SKU未登録: <b id="c-sku">...</b></div>
         <div class="cnt" style="background:#e8daef;color:#8e44ad" onclick="switchType('sales_class',this)">分類未登録: <b id="c-class">...</b></div>
         <div class="cnt" style="background:#d4efdf;color:#1e8449" onclick="switchType('tax_rate',this)">税率未登録: <b id="c-tax">...</b></div>
+        <div class="cnt" style="background:#fdebd0;color:#b9770e" onclick="switchType('reorder',this)">発注設定未登録: <b id="c-reorder">...</b></div>
       </div>
     </div>
 
@@ -1388,6 +1546,7 @@ function renderRegisterPage(shippingRates, session = {}) {
         <button onclick="switchManage('m-sku-master',this)">SKUマスタ</button>
         <button onclick="switchManage('sales_class',this)">売上分類</button>
         <button onclick="switchManage('tax_rate',this)">税率</button>
+        <button onclick="switchManage('reorder',this)">発注設定</button>
       </div>
       <div class="row">
         <input id="m-search" placeholder="商品コード or 商品名" style="width:280px" onkeydown="if(event.key==='Enter')searchManage()">
@@ -1421,6 +1580,7 @@ function renderRegisterPage(shippingRates, session = {}) {
         <button id="csv-tab-msku" onclick="switchCsvType('m-sku-master',this)">SKUマスタ</button>
         <button id="csv-tab-salesclass" onclick="switchCsvType('sales_class',this)">売上分類</button>
         <button id="csv-tab-taxrate" onclick="switchCsvType('tax_rate',this)">税率</button>
+        <button id="csv-tab-reorder" onclick="switchCsvType('reorder_setting',this)">発注設定</button>
       </div>
       <div id="csv-format" style="font-size:12px;color:#666;margin-bottom:8px"></div>
       <div class="row">
@@ -1492,7 +1652,7 @@ function renderRegisterPage(shippingRates, session = {}) {
 
     // ── 未登録データ読み込み ──
     async function loadMissing() {
-      const titles = { shipping: '送料未登録', genka: '原価未登録', sku_map: 'SKU未登録', sales_class: '分類未登録', tax_rate: '税率未登録' };
+      const titles = { shipping: '送料未登録', genka: '原価未登録', sku_map: 'SKU未登録', sales_class: '分類未登録', tax_rate: '税率未登録', reorder: '発注設定未登録' };
       document.getElementById('list-title').textContent = titles[curType] || '';
       document.getElementById('table-body').innerHTML = '<tr><td colspan="8" style="text-align:center;padding:20px;color:#999">読み込み中...</td></tr>';
 
@@ -1537,6 +1697,9 @@ function renderRegisterPage(shippingRates, session = {}) {
         } else if (curType === 'tax_rate') {
           html += '<select style="width:120px"><option value="">--</option><option value="0.1">10%（標準）</option><option value="0.08">8%（軽減）</option></select> ';
           html += '<button class="btn btn-p" data-act="reg-tax" data-sku="'+he(r.商品コード)+'" data-name="'+he(r.商品名)+'">登録</button>';
+        } else if (curType === 'reorder') {
+          html += '<input placeholder="月数" style="width:70px" type="number" step="0.1" min="0" max="60"> ヶ月 ';
+          html += '<button class="btn btn-p" data-act="reg-reorder" data-sku="'+he(r.商品コード)+'" data-name="'+he(r.商品名)+'">登録</button>';
         } else {
           html += '<div class="sku-mapping-rows" data-seller-sku="'+he(r.商品コード)+'" data-name="'+he(r.商品名)+'">';
           html += '<div class="sku-row" style="display:flex;gap:4px;align-items:center;margin-bottom:3px">';
@@ -1599,6 +1762,14 @@ function renderRegisterPage(shippingRates, session = {}) {
           tr.classList.add('done-row');
           setTimeout(() => tr.remove(), 600);
           updateCount('tax_rate', -1);
+        } else if (act === 'reg-reorder') {
+          const inp = tr.querySelector('input');
+          if (inp.value === '') { btn.disabled=false; return; }
+          await api('/api/reorder_setting', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sku,推奨保有月数:inp.value,product_name:name})});
+          toast(sku+' の推奨保有月数を登録');
+          tr.classList.add('done-row');
+          setTimeout(() => tr.remove(), 600);
+          updateCount('reorder', -1);
         } else if (act === 'remove-sku-row') {
           btn.closest('.sku-row')?.remove();
           btn.disabled = false;
@@ -1673,6 +1844,11 @@ function renderRegisterPage(shippingRates, session = {}) {
           if (!sel?.value) { btn.disabled=false; return; }
           await api('/api/tax_rate', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sku,tax_rate:sel.value,product_name:name})});
           toast(sku+' の税率を更新');
+        } else if (act === 'update-reorder') {
+          const inp = tr.querySelector('input');
+          if (inp.value === '') { btn.disabled=false; return; }
+          await api('/api/reorder_setting', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sku,推奨保有月数:inp.value,product_name:name})});
+          toast(sku+' の推奨保有月数を更新');
         } else if (act === 'show-sku-detail') {
           // 既に展開されてれば閉じる
           const next = tr.nextElementSibling;
@@ -1743,7 +1919,7 @@ function renderRegisterPage(shippingRates, session = {}) {
     });
 
     function updateCount(type, delta) {
-      const map = {shipping:'c-ship',genka:'c-genka',sku_map:'c-sku',sales_class:'c-class',tax_rate:'c-tax'};
+      const map = {shipping:'c-ship',genka:'c-genka',sku_map:'c-sku',sales_class:'c-class',tax_rate:'c-tax',reorder:'c-reorder'};
       const el = document.getElementById(map[type]);
       if (el) el.textContent = Math.max(0, parseInt(el.textContent||'0') + delta);
     }
@@ -1942,7 +2118,7 @@ function renderRegisterPage(shippingRates, session = {}) {
     }
     async function searchManage() {
       const search = document.getElementById('m-search').value;
-      const epMap = { shipping: '/api/shipping/list', genka: '/api/genka/list', sales_class: '/api/sales_class/list', tax_rate: '/api/tax_rate/list', 'm-sku-master': '/api/m-sku-master' };
+      const epMap = { shipping: '/api/shipping/list', genka: '/api/genka/list', sales_class: '/api/sales_class/list', tax_rate: '/api/tax_rate/list', reorder: '/api/reorder_setting/list', 'm-sku-master': '/api/m-sku-master' };
       const ep = epMap[curManage] || '/api/shipping/list';
       // m-sku-master は q パラメータ、その他は search パラメータ
       const searchParam = curManage === 'm-sku-master' ? 'q' : 'search';
@@ -1990,6 +2166,15 @@ function renderRegisterPage(shippingRates, session = {}) {
           html += '<td style="font-size:11px;color:#888">'+he(r.synced_at||'')+'</td>';
           html += '<td><button class="btn btn-p" data-act="update-tax" data-sku="'+he(r.sku)+'" data-name="'+he(r.商品名||'')+'">更新</button> <button class="btn btn-d" data-act="del" data-type="tax_rate" data-sku="'+he(r.sku)+'">削除</button></td></tr>';
         }
+      } else if (curManage === 'reorder') {
+        head = '<tr><th>商品コード</th><th>商品名</th><th>推奨保有月数</th><th>更新者</th><th>更新日時</th><th>操作</th></tr>'; cols = 6;
+        for (const r of rows) {
+          html += '<tr><td>'+he(r.sku)+'</td><td>'+he((r.商品名||'').slice(0,30))+'</td>';
+          html += '<td><input value="'+he(String(r.推奨保有月数))+'" style="width:70px" type="number" step="0.1" min="0" max="60"> ヶ月</td>';
+          html += '<td style="font-size:11px;color:#888">'+he(r.updated_by||'')+'</td>';
+          html += '<td style="font-size:11px;color:#888">'+he(r.synced_at||'')+'</td>';
+          html += '<td><button class="btn btn-p" data-act="update-reorder" data-sku="'+he(r.sku)+'" data-name="'+he(r.商品名||'')+'">更新</button> <button class="btn btn-d" data-act="del" data-type="reorder_setting" data-sku="'+he(r.sku)+'">削除</button></td></tr>';
+        }
       } else if (curManage === 'm-sku-master') {
         head = '<tr><th>seller_sku</th><th>商品名</th><th>構成数</th><th>更新日</th><th>操作</th></tr>'; cols = 5;
         for (const r of rows) {
@@ -2021,7 +2206,8 @@ function renderRegisterPage(shippingRates, session = {}) {
         document.getElementById('c-sku').textContent = c.sku_map || 0;
         document.getElementById('c-class').textContent = c.sales_class || 0;
         document.getElementById('c-tax').textContent = c.tax_rate || 0;
-      }).catch(() => { document.getElementById('c-sku').textContent = '-'; document.getElementById('c-class').textContent = '-'; document.getElementById('c-tax').textContent = '-'; });
+        document.getElementById('c-reorder').textContent = c.reorder || 0;
+      }).catch(() => { document.getElementById('c-sku').textContent = '-'; document.getElementById('c-class').textContent = '-'; document.getElementById('c-tax').textContent = '-'; document.getElementById('c-reorder').textContent = '-'; });
     })();
 
     // ── CSV一括アップロード ──
@@ -2031,7 +2217,8 @@ function renderRegisterPage(shippingRates, session = {}) {
       genka: 'CSV形式: 商品コード, 原価, 商品名（任意）',
       'm-sku-master': 'CSV形式: sku, asin, 商品名(社内独自), NE商品コード, 数量, ... (商品コード変換テーブルCSV / 19列、UTF-8)',
       sales_class: 'CSV形式: 商品コード, 売上分類(1:自社/2:取引先限定/3:仕入れ/4:輸出)',
-      tax_rate: 'CSV形式: 商品コード, 税率(0.1 or 0.08)'
+      tax_rate: 'CSV形式: 商品コード, 税率(0.1 or 0.08)',
+      reorder_setting: 'CSV形式: 商品コード, 推奨保有月数(0〜60, 何ヶ月分の在庫を持つかの係数)'
     };
     function switchCsvType(type, el) {
       curCsvType = type;
@@ -2087,6 +2274,7 @@ function renderRegisterPage(shippingRates, session = {}) {
             document.getElementById('c-sku').textContent = c.sku_map || 0;
             document.getElementById('c-class').textContent = c.sales_class || 0;
             document.getElementById('c-tax').textContent = c.tax_rate || 0;
+            document.getElementById('c-reorder').textContent = c.reorder || 0;
           } catch {}
         } else {
           document.getElementById('csv-result').textContent = '❌ エラー: ' + (data.error || '不明');
