@@ -30,6 +30,12 @@ function getFiscalYearMonths(fiscalYear) {
   for (let m = 1; m <= 6; m++) months.push(`${startCalYear + 1}-${String(m).padStart(2, '0')}`);
   return months;
 }
+// 'YYYY-MM' に delta ヶ月を加算（delta は負も可）
+function addMonths(yearMonth, delta) {
+  const [y, m] = yearMonth.split('-').map(Number);
+  const idx = y * 12 + (m - 1) + delta;
+  return `${Math.floor(idx / 12)}-${String((idx % 12) + 1).padStart(2, '0')}`;
+}
 
 // 運送会社・仕入先のプリセット（Excel「運賃集計」「輸出運賃」「梱包資材費」シートのヘッダーに合わせる）
 const CARRIERS = ['FBA運賃', 'RSL費用', 'ヤマト', 'ヤマト2', '佐川', '西濃', '福山通運', '郵便局（UPSIDER1）', '郵便局（UPSIDER2）', 'クリックポスト'];
@@ -133,6 +139,8 @@ router.post('/bulk-calculate', (req, res) => {
     const fiscalYear = getFiscalYear(ym);
 
     const tx = db.transaction(() => {
+      // 完全置換: 消えたモール/セグメントの旧PL行を残さない
+      db.prepare('DELETE FROM mgmt_monthly_pl WHERE year_month = ?').run(ym);
       const plStmt = db.prepare(`INSERT OR REPLACE INTO mgmt_monthly_pl
         (year_month, mall_id, segment, sales, sales_ratio, cost, pf_fee, ad_cost, freight, material, variable_cost, gross_profit, gross_margin, fiscal_year)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
@@ -198,6 +206,8 @@ router.post('/api/freight', (req, res) => {
     for (const item of items) {
       stmt.run(year_month, item.carrier, Math.round(item.amount || 0), item.cost_scope || 'shared', item.target_segment || null, item.target_mall_id || null, item.note || null, user, now, now);
     }
+    // 確定済み月の運賃を書き換えたら確定PLが古くなるので要再確定に降格（同一tx）
+    db.prepare("UPDATE mgmt_monthly_closing SET status='needs_review' WHERE year_month = ? AND status = 'confirmed'").run(year_month);
   });
   tx();
   res.json({ ok: true });
@@ -216,6 +226,8 @@ router.post('/api/material', (req, res) => {
     for (const item of items) {
       stmt.run(year_month, item.supplier, Math.round(item.amount || 0), item.note || null, user, now, now);
     }
+    // 確定済み月の資材費を書き換えたら確定PLが古くなるので要再確定に降格（同一tx）
+    db.prepare("UPDATE mgmt_monthly_closing SET status='needs_review' WHERE year_month = ? AND status = 'confirmed'").run(year_month);
   });
   tx();
   res.json({ ok: true });
@@ -240,12 +252,12 @@ const MALL_TABLES = [
   { table: 'mart_amazon_usa_monthly_summary', mall_id: 'amazon_usa', adField: 'ad_cost', feeField: null },
 ];
 
-router.post('/api/sync-segment-sales', (req, res) => {
-  const db = getMirrorDB();
-  const { year_month } = req.body;
-  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+// 各モール集計テーブル(mart_*_monthly_summary)から指定月の mart_monthly_segment_sales を生成。
+// 各モールアプリは「確定」時のみ summary 行を作るため、行の存在 = そのモールの当月確定済み。
+function syncSegmentSalesForMonth(db, year_month, now) {
   let totalInserted = 0;
   let fbaFreightInserted = null;
+  const mallsPresent = new Set();
 
   const insertStmt = db.prepare(`INSERT OR REPLACE INTO mart_monthly_segment_sales
     (year_month, mall_id, segment, sales, cost, pf_fee, ad_cost, confirmed_at, source_file, logic_version)
@@ -257,6 +269,15 @@ router.post('/api/sync-segment-sales', (req, res) => {
     ON CONFLICT(year_month, carrier) DO UPDATE SET amount=excluded.amount, cost_scope=excluded.cost_scope, note=excluded.note, updated_at=excluded.updated_at`);
 
   const tx = db.transaction(() => {
+    // source-owned（各 summary 由来）の当月行を先に全消去。summary が削除/空化された
+    // モールの stale 行も確実に除去する（source_file = テーブル名で識別）。
+    // historical-excel 由来や米国Amazon(mgmt_row, historical由来)の行は対象外で保護される。
+    for (const mt of MALL_TABLES) {
+      db.prepare('DELETE FROM mart_monthly_segment_sales WHERE year_month = ? AND source_file = ?').run(year_month, mt.table);
+    }
+    // 自動登録の FBA運賃 も冒頭で消去（Amazon summary が消えた月の stale 運賃を残さない）。
+    // 手入力分は note で除外して保護。FBA手数料がある場合のみ下で再投入する。
+    db.prepare("DELETE FROM mgmt_freight_costs WHERE year_month = ? AND carrier = 'FBA運賃' AND note LIKE 'auto from%'").run(year_month);
     for (const mt of MALL_TABLES) {
       let row;
       try {
@@ -292,8 +313,11 @@ router.post('/api/sync-segment-sales', (req, res) => {
             'auto from mart_amazon_monthly_summary.by_segment.FBA手数料', 'system-sync', now, now);
           fbaFreightInserted = fbaFeeTaxEx;
         }
+        // fee=0 / summary 無しの場合は冒頭で削除済みなので何もしない
       }
 
+      // セグメント行を組み立てる（by_segment 形式でないモール=米国Amazon mgmt_row 等は 0 行）
+      const segRows = [];
       for (const [segKey, segData] of Object.entries(allSegs)) {
         const seg = segKey === 'other' ? null : parseInt(segKey);
         if (seg === null || isNaN(seg)) continue;
@@ -326,25 +350,130 @@ router.post('/api/sync-segment-sales', (req, res) => {
         const segRatio = segSalesTotal > 0 ? sales / segSalesTotal : 0;
         const adCost = Math.round(adCostTotal * segRatio);
 
-        insertStmt.run(year_month, mt.mall_id, seg, Math.round(sales), Math.round(cost), Math.round(pfFee), adCost, now, mt.table, 'v1');
+        segRows.push({ seg, sales: Math.round(sales), cost: Math.round(cost), pfFee: Math.round(pfFee), adCost });
+      }
+
+      // by_segment 形式で 1 行も作れないモール(米国Amazon等)は何も挿入しない
+      // （source-owned 行は上で消去済みなので、historical 由来の既存行だけが残る）
+      if (segRows.length === 0) continue;
+
+      mallsPresent.add(mt.mall_id);
+      for (const r of segRows) {
+        insertStmt.run(year_month, mt.mall_id, r.seg, r.sales, r.cost, r.pfFee, r.adCost, now, mt.table, 'v1');
         totalInserted++;
       }
     }
   });
   tx();
-  res.json({ ok: true, inserted: totalInserted, fba_freight_tax_excluded: fbaFreightInserted });
+  return { inserted: totalInserted, fba_freight_tax_excluded: fbaFreightInserted, malls: [...mallsPresent] };
+}
+
+// 当月運賃合計（確定時 freight_total と比較して変動検知に使う）
+function freightTotalForMonth(db, ym) {
+  return db.prepare('SELECT COALESCE(SUM(amount),0) s FROM mgmt_freight_costs WHERE year_month = ?').get(ym).s;
+}
+
+// 確定時に写した mgmt_monthly_pl と再同期後 segment_sales を行単位で突合（合計一致でも入替を検知）
+function inputsChangedForMonth(db, ym) {
+  const segCount = db.prepare('SELECT COUNT(*) c FROM mart_monthly_segment_sales WHERE year_month = ?').get(ym).c;
+  const plCount = db.prepare('SELECT COUNT(*) c FROM mgmt_monthly_pl WHERE year_month = ?').get(ym).c;
+  if (segCount !== plCount) return true;
+  const diff = db.prepare(`SELECT COUNT(*) c FROM (
+    SELECT mall_id, segment, sales, cost, pf_fee, ad_cost FROM mart_monthly_segment_sales WHERE year_month = ?
+    EXCEPT
+    SELECT mall_id, segment, sales, cost, pf_fee, ad_cost FROM mgmt_monthly_pl WHERE year_month = ?
+  )`).get(ym, ym).c;
+  return diff > 0;
+}
+
+// 同一トランザクションで「完全置換 → 差分判定 → confirmed なら needs_review 降格」。
+// 手動「売上同期」と daily-sync の自動同期の両方が同じ不変条件を共有する。
+function syncAndReconcileMonth(db, ym, now) {
+  return db.transaction(() => {
+    const closing = db.prepare('SELECT status, freight_total FROM mgmt_monthly_closing WHERE year_month = ?').get(ym);
+    const r = syncSegmentSalesForMonth(db, ym, now); // 内部 tx は savepoint としてネスト
+    let flagged = false;
+    if (closing && closing.status === 'confirmed') {
+      const changed = inputsChangedForMonth(db, ym) || Math.abs(freightTotalForMonth(db, ym) - (closing.freight_total || 0)) > 1;
+      if (changed) {
+        db.prepare("UPDATE mgmt_monthly_closing SET status='needs_review' WHERE year_month = ?").run(ym);
+        flagged = true;
+      }
+    }
+    return { ...r, flagged };
+  })();
+}
+
+router.post('/api/sync-segment-sales', (req, res) => {
+  const db = getMirrorDB();
+  const { year_month } = req.body;
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  // 手動同期も confirmed 月の入力が変われば needs_review に降格（auto-sync と同じ不変条件）
+  const r = syncAndReconcileMonth(db, year_month, now);
+  res.json({ ok: true, inserted: r.inserted, fba_freight_tax_excluded: r.fba_freight_tax_excluded, needs_review: r.flagged });
+});
+
+// ─── 売上自動同期（daily-sync から MIRROR_SYNC_KEY 認証で呼ぶ）───
+// mart_*_monthly_summary に存在する全月の売上を mart_monthly_segment_sales へ再同期。
+// 確定済み(confirmed)の月で売上が変動していたら status='needs_review'（要再確定）へ落とし、
+// 表示ゲートで自動的にグラフから外す。運賃込みPLの最終確定は人手のまま。
+router.post('/auto-sync-sales', (req, res) => {
+  // machine endpoint は fail-closed（key 未設定で無認証公開にしない）
+  if (!process.env.MIRROR_SYNC_KEY) return res.status(503).json({ error: 'MIRROR_SYNC_KEY 未設定 (fail-closed)' });
+  if (!checkAuth(req, res)) return;
+  const db = getMirrorDB();
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+
+  // 対象月: 各モール summary + 既存 segment_sales + 確定済み closing の和集合。
+  // summary が全消えした月も candidate に含めることで segment_sales を空にして整合させる。
+  const monthsSet = new Set();
+  for (const mt of MALL_TABLES) {
+    try {
+      for (const r of db.prepare(`SELECT DISTINCT year_month FROM ${mt.table}`).all()) monthsSet.add(r.year_month);
+    } catch {}
+  }
+  for (const r of db.prepare('SELECT DISTINCT year_month FROM mart_monthly_segment_sales').all()) monthsSet.add(r.year_month);
+  for (const r of db.prepare("SELECT year_month FROM mgmt_monthly_closing WHERE status = 'confirmed'").all()) monthsSet.add(r.year_month);
+  const months = [...monthsSet].sort();
+
+  const flagged = [];
+  let syncedCount = 0;
+  for (const ym of months) {
+    const r = syncAndReconcileMonth(db, ym, now); // 月単位の同一tx（完全置換→差分判定→降格）
+    syncedCount++;
+    if (r.flagged) flagged.push({ year_month: ym });
+  }
+
+  res.json({ ok: true, months: months.length, synced: syncedCount, flagged });
 });
 
 // 集計計算＆確定
 router.post('/api/calculate', (req, res) => {
   const db = getMirrorDB();
-  const { year_month } = req.body;
+  const { year_month, allow_partial } = req.body;
   const user = req.session?.email || 'unknown';
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
 
   // 1. セグメント売上を取得
   const segSales = db.prepare('SELECT * FROM mart_monthly_segment_sales WHERE year_month = ?').all(year_month);
   if (segSales.length === 0) return res.status(400).json({ error: '売上データがありません' });
+
+  // 1.5 完全性チェック: 直近3ヶ月で来ているモールが当月に揃っているか。
+  //     揃う前に確定すると「売上過少 × 運賃満額 → 粗利マイナス」事故になるため、
+  //     欠けモールがあれば確定をブロック（allow_partial で明示的に強制可能）。
+  const presentMalls = new Set(segSales.map(r => r.mall_id));
+  const expectedMalls = db.prepare(
+    'SELECT DISTINCT mall_id FROM mart_monthly_segment_sales WHERE year_month >= ? AND year_month < ?'
+  ).all(addMonths(year_month, -3), year_month).map(r => r.mall_id);
+  const missingMalls = expectedMalls.filter(m => !presentMalls.has(m));
+  if (missingMalls.length > 0 && allow_partial !== true) {
+    const names = missingMalls.map(m => MALL_NAMES[m] || m);
+    return res.status(409).json({
+      error: 'incomplete_malls',
+      missing_malls: missingMalls,
+      message: names.join('・') + ' のデータがまだ取り込まれていません。全モール揃ってから確定してください。',
+    });
+  }
 
   // 2. 運賃・資材費を取得
   const freightRows = db.prepare('SELECT * FROM mgmt_freight_costs WHERE year_month = ?').all(year_month);
@@ -402,6 +531,8 @@ router.post('/api/calculate', (req, res) => {
 
   // 5. DB保存
   const tx = db.transaction(() => {
+    // 完全置換: 消えたモール/セグメントの旧PL行を残さない
+    db.prepare('DELETE FROM mgmt_monthly_pl WHERE year_month = ?').run(year_month);
     // PL行
     const plStmt = db.prepare(`INSERT OR REPLACE INTO mgmt_monthly_pl
       (year_month, mall_id, segment, sales, sales_ratio, cost, pf_fee, ad_cost, freight, material, variable_cost, gross_profit, gross_margin, fiscal_year)
@@ -442,7 +573,11 @@ router.get('/api/monthly-pl/:yearMonth', (req, res) => {
 router.get('/api/annual-pl/:fiscalYear', (req, res) => {
   const db = getMirrorDB();
   const fy = parseInt(req.params.fiscalYear);
-  const months = getFiscalYearMonths(fy);
+  // 表示は確定済みの月のみ（未確定月がゼロ列で出ないようにする）
+  const confirmedSet = new Set(
+    db.prepare("SELECT year_month FROM mgmt_monthly_closing WHERE fiscal_year = ? AND status = 'confirmed'").all(fy).map(r => r.year_month)
+  );
+  const months = getFiscalYearMonths(fy).filter(m => confirmedSet.has(m));
 
   // セグメント別×月で集約
   const rows = db.prepare(`
@@ -451,6 +586,7 @@ router.get('/api/annual-pl/:fiscalYear', (req, res) => {
       SUM(ad_cost) as ad_cost, SUM(freight) as freight, SUM(material) as material,
       SUM(variable_cost) as variable_cost, SUM(gross_profit) as gross_profit
     FROM mgmt_monthly_pl WHERE fiscal_year = ?
+      AND year_month IN (SELECT year_month FROM mgmt_monthly_closing WHERE status = 'confirmed')
     GROUP BY year_month, segment ORDER BY year_month, segment
   `).all(fy);
 
@@ -465,15 +601,10 @@ router.get('/api/historical', (req, res) => {
   const db = getMirrorDB();
   const limit = parseInt(req.query.months) || 48;
 
-  // 直近N ヶ月の月リストを取得（全データソースを結合）
-  const monthsSet = new Set();
-  for (const t of ['mgmt_freight_costs', 'mgmt_material_costs', 'mart_monthly_segment_sales', 'mgmt_monthly_pl']) {
-    try {
-      const rows = db.prepare(`SELECT DISTINCT year_month FROM ${t}`).all();
-      for (const r of rows) monthsSet.add(r.year_month);
-    } catch {}
-  }
-  const months = Array.from(monthsSet).sort().slice(-limit);
+  // 表示は確定済み(status='confirmed')の月のみ。未確定・要再確定(needs_review)は除外し、
+  // 途中・不完全な月（売上過少→粗利マイナス）がグラフに出るのを防ぐ。
+  const months = db.prepare("SELECT year_month FROM mgmt_monthly_closing WHERE status = 'confirmed' ORDER BY year_month")
+    .all().map(r => r.year_month).slice(-limit);
   if (months.length === 0) return res.json({ months: [], freight: [], material: [], sales: [], pl: [] });
 
   const placeholders = months.map(() => '?').join(',');
@@ -565,6 +696,7 @@ tr:hover { background: #f0f4ff; }
 .status-badge { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 12px; font-weight: 500; }
 .status-confirmed { background: #e6f4ea; color: #1e8e3e; }
 .status-draft { background: #fef7e0; color: #b06000; }
+.status-needs_review { background: #fce8e6; color: #c5221f; }
 .negative { color: #d93025; }
 .positive { color: #1e8e3e; }
 .note-text { font-size: 12px; color: #888; margin-top: 8px; }
@@ -728,6 +860,12 @@ const fmt = n => (n || 0).toLocaleString('ja-JP');
 const fmtPct = n => ((n || 0) * 100).toFixed(1) + '%';
 const fmtRatio = (n, d) => d > 0 ? fmtPct(n / d) : '-';
 const clsVal = n => n < 0 ? 'negative' : n > 0 ? 'positive' : '';
+const STATUS_LABELS = { confirmed: '確定済', draft: '未確定', needs_review: '要再確定' };
+const statusLabel = s => STATUS_LABELS[s] || s;
+function statusBadge(closing) {
+  if (!closing) return '<span class="status-badge status-draft">未確定</span>';
+  return '<span class="status-badge status-' + closing.status + '">' + statusLabel(closing.status) + '</span> ' + (closing.confirmed_at || '');
+}
 
 function toast(msg) {
   const t = document.getElementById('toast');
@@ -804,12 +942,7 @@ async function loadCosts() {
   buildCostRows('exportFreightBody', EXPORT_CARRIERS, (data.freight || []).filter(f => f.cost_scope !== 'shared'), 'carrier');
   buildCostRows('materialBody', SUPPLIERS, data.material || [], 'supplier');
   updateTotals();
-  const st = document.getElementById('closingStatus');
-  if (data.closing) {
-    st.innerHTML = '<span class="status-badge status-' + data.closing.status + '">' + data.closing.status + '</span> ' + (data.closing.confirmed_at || '');
-  } else {
-    st.innerHTML = '<span class="status-badge status-draft">未確定</span>';
-  }
+  document.getElementById('closingStatus').innerHTML = statusBadge(data.closing);
 }
 
 async function saveCosts() {
@@ -861,8 +994,21 @@ async function doCalculate() {
   if (!ym) return;
   if (!confirm(ym + ' の集計を確定しますか？')) return;
   await saveCosts();
-  const res = await fetch(BASE + '/api/calculate', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ year_month: ym }) });
+  await postCalculate(ym, false);
+}
+
+async function postCalculate(ym, allowPartial) {
+  const res = await fetch(BASE + '/api/calculate', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ year_month: ym, allow_partial: allowPartial }),
+  });
   const data = await res.json();
+  if (res.status === 409 && data.error === 'incomplete_malls') {
+    if (confirm(data.message + '\n\nこのまま不完全な状態で確定しますか？（推奨しません）')) {
+      await postCalculate(ym, true);
+    }
+    return;
+  }
   if (data.error) { toast('エラー: ' + data.error); return; }
   toast('確定しました（' + data.rows + '行）');
   loadCosts();
@@ -875,12 +1021,7 @@ async function loadMonthlyPL() {
   const res = await fetch(BASE + '/api/monthly-pl/' + ym);
   const data = await res.json();
 
-  const st = document.getElementById('monthlyStatus');
-  if (data.closing) {
-    st.innerHTML = '<span class="status-badge status-' + data.closing.status + '">' + data.closing.status + '</span> ' + (data.closing.confirmed_at || '');
-  } else {
-    st.innerHTML = '<span class="status-badge status-draft">未確定</span>';
-  }
+  document.getElementById('monthlyStatus').innerHTML = statusBadge(data.closing);
 
   if (data.rows.length === 0) {
     document.getElementById('monthlyBody').innerHTML = '<tr><td colspan="17">データがありません。運賃・資材費を入力して集計確定してください。</td></tr>';
