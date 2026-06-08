@@ -325,6 +325,18 @@ export async function initDb() {
     )
   `);
 
+  // --- 10b. replenishment_excluded: 納品推奨から恒久的に除外するSKU ---
+  // 用途: 販売はしていたが価格が合わない等で「もう FBA に納品しない」と決めた商品。
+  //   stockout_hidden / new_product_hidden が「そのタブの一時非表示」なのに対し、
+  //   これは全推奨 (納品推奨 / FBA欠品 / 新規商品) 横断の恒久除外。reason に理由を残す。
+  db.run(`
+    CREATE TABLE IF NOT EXISTS replenishment_excluded (
+      amazon_sku TEXT PRIMARY KEY,
+      reason TEXT,
+      excluded_at TEXT DEFAULT (datetime('now','localtime'))
+    )
+  `);
+
   // --- 11. shipment_draft: 納品作業ドラフト（1つだけ保持） ---
   db.run(`
     CREATE TABLE IF NOT EXISTS shipment_draft (
@@ -463,9 +475,16 @@ export async function initDb() {
       item_count INTEGER DEFAULT 0,
       total_qty INTEGER DEFAULT 0,
       file_data BLOB,
+      sku_list TEXT,
       created_at TEXT DEFAULT (datetime('now','localtime'))
     )
   `);
+  // マイグレーション: sku_list (出力ファイルに含まれる amazon_sku の JSON 配列。
+  // 後から恒久除外された SKU を含む古い履歴の再DLをブロックするため)
+  {
+    const ehCols = queryAll('PRAGMA table_info(export_history)').map(r => r.name);
+    if (!ehCols.includes('sku_list')) db.run(`ALTER TABLE export_history ADD COLUMN sku_list TEXT`);
+  }
 
   // --- 14. restock_latest: RESTOCKレポート最新1回分（発注判定の主軸データソース） ---
   db.run(`
@@ -1540,6 +1559,24 @@ export function unhideNewProductSku(amazonSku) {
   saveToFile();
 }
 
+// ===== 納品推奨 恒久除外管理 (replenishment_excluded) =====
+// 全推奨 (納品推奨 / FBA欠品 / 新規商品) 横断で「もう納品しない」SKU を管理する。
+
+export function getReplenishmentExcluded() {
+  return queryAll('SELECT * FROM replenishment_excluded ORDER BY excluded_at DESC');
+}
+
+export function excludeReplenishmentSku(amazonSku, reason) {
+  db.run(`INSERT OR REPLACE INTO replenishment_excluded (amazon_sku, reason, excluded_at) VALUES (?, ?, datetime('now','localtime'))`,
+    [amazonSku, reason || null]);
+  saveToFile();
+}
+
+export function unexcludeReplenishmentSku(amazonSku) {
+  db.run('DELETE FROM replenishment_excluded WHERE amazon_sku = ?', [amazonSku]);
+  saveToFile();
+}
+
 // ===== 納品作業ドラフト =====
 
 export function saveDraft(items, memo) {
@@ -1764,10 +1801,12 @@ export function removeProvisionalItem(amazonSku) {
 
 // ===== 出力履歴 =====
 
-export function saveExportHistory(type, filename, itemCount, totalQty, fileData) {
+export function saveExportHistory(type, filename, itemCount, totalQty, fileData, skuList) {
+  // skuList: 出力ファイルに含まれる amazon_sku 配列 (再DL時の除外チェック用)。null 可。
+  const skuListJson = Array.isArray(skuList) ? JSON.stringify(skuList) : null;
   db.run(
-    `INSERT INTO export_history (type, filename, item_count, total_qty, file_data) VALUES (?, ?, ?, ?, ?)`,
-    [type, filename, itemCount, totalQty, fileData]
+    `INSERT INTO export_history (type, filename, item_count, total_qty, file_data, sku_list) VALUES (?, ?, ?, ?, ?, ?)`,
+    [type, filename, itemCount, totalQty, fileData, skuListJson]
   );
   // タイプ別に100件を超えたら古いものを削除
   const oldest = queryAll(

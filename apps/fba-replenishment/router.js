@@ -10,6 +10,7 @@ import { initDb, savePlanningData, savePlanningDataWithHistory, getLatestSnapsho
          getShipmentPlans, getShipmentPlanItems, getDailySnapshots,
          getStockoutHidden, hideStockoutSku, unhideStockoutSku, hideStockoutSkuBulk,
          getNewProductHidden, hideNewProductSkuBulk, unhideNewProductSku,
+         getReplenishmentExcluded, excludeReplenishmentSku, unexcludeReplenishmentSku,
          saveDraft, getDraft, clearDraft, updateFnskuBatch, syncFnskuBatch,
          saveProvisionalItems, mergeProvisionalItems, getProvisionalItems, clearProvisionalItems,
          updateProvisionalItemQty, removeProvisionalItem,
@@ -472,8 +473,13 @@ router.get('/api/recommendations', async (req, res) => {
     for (const item of result.items) {
       item.fnsku = fnskuMap[item.amazon_sku] || '';
     }
+    // 恒久除外フラグを付与 (クライアントの3タブフィルタ + サマリーが参照。除外SKUも行自体は返す)
+    const excludedSet = new Set(getReplenishmentExcluded().map(r => r.amazon_sku));
+    for (const item of result.items) {
+      item.is_excluded = excludedSet.has(item.amazon_sku);
+    }
     const itemsWithFnsku = result.items.filter(i => i.fnsku).length;
-    console.log(`[FBA] 推奨items: ${result.items.length}件, fnsku付与=${itemsWithFnsku}件`);
+    console.log(`[FBA] 推奨items: ${result.items.length}件, fnsku付与=${itemsWithFnsku}件, 除外=${result.items.filter(i => i.is_excluded).length}件`);
     res.json(result);
   } catch (e) {
     console.error('[FBA] 推奨リスト生成エラー:', e);
@@ -511,8 +517,17 @@ let inboundPlanInProgress = false;
 router.post('/api/create-inbound-plan', express.json(), async (req, res) => {
   if (inboundPlanInProgress) return res.status(409).json({ error: '納品プラン作成中です。しばらくお待ちください。' });
 
-  const { items, planName } = req.body;
+  let { items, planName } = req.body;
   if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items[] が必要です' });
+
+  // 恒久除外SKUはサーバ側でも納品プランから除く (stale画面/直接API 経由の漏れ防止)
+  {
+    const excludedSet = new Set(getReplenishmentExcluded().map(r => r.amazon_sku));
+    const before = items.length;
+    items = items.filter(it => !excludedSet.has(it.amazon_sku || it.msku || it.sku));
+    if (items.length < before) console.log(`[FBA] create-inbound-plan: 除外SKU ${before - items.length}件をスキップ`);
+    if (items.length === 0) return res.status(400).json({ error: '納品対象がありません（全て除外指定SKUでした）' });
+  }
 
   // 設定から住所・ラベル設定を取得
   const settings = getSettings();
@@ -767,6 +782,31 @@ router.delete('/api/stockout-hidden/:sku', (req, res) => {
   res.json({ success: true });
 });
 
+// ===== 納品推奨 恒久除外 (replenishment_excluded) =====
+router.get('/api/replenishment-excluded', (req, res) => {
+  res.json(getReplenishmentExcluded());
+});
+
+router.post('/api/replenishment-excluded', express.json(), (req, res) => {
+  const { amazon_sku, reason } = req.body;
+  if (!amazon_sku) return res.status(400).json({ error: 'amazon_sku が必要です' });
+  // 任意文字列の保存→一覧表示(inline onclick/属性)時の XSS/属性破壊を防ぐ。
+  // 実SKUは空白や / を含み得るので許可し、HTML/JS文脈を壊す文字 (引用符・山括弧・バッククォート・
+  // バックスラッシュ・制御文字) と過長のみ弾く。
+  if (typeof amazon_sku !== 'string' || amazon_sku.length > 100 || /['"<>`\\\x00-\x1f]/.test(amazon_sku)) {
+    return res.status(400).json({ error: 'amazon_sku に使用できない文字が含まれています' });
+  }
+  excludeReplenishmentSku(amazon_sku, reason);
+  // 除外と同時に仮確定からも落とす (既に仮確定済みの SKU が納品されないように cascade)
+  try { removeProvisionalItem(amazon_sku); } catch (e) { console.error('[FBA] 除外時の仮確定削除エラー:', e.message); }
+  res.json({ success: true });
+});
+
+router.delete('/api/replenishment-excluded/:sku', (req, res) => {
+  unexcludeReplenishmentSku(req.params.sku);
+  res.json({ success: true });
+});
+
 // ===== ステータス =====
 router.get('/api/status', (req, res) => {
   const snapshots = getLatestSnapshots();
@@ -811,9 +851,12 @@ router.get('/api/provisional', (req, res) => {
 });
 
 router.post('/api/provisional', express.json(), (req, res) => {
-  const { items } = req.body;
+  let { items } = req.body;
   if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items[] が必要です' });
   try {
+    // 恒久除外SKUは仮確定に残さない
+    const excludedSet = new Set(getReplenishmentExcluded().map(r => r.amazon_sku));
+    items = items.filter(it => !excludedSet.has(it.amazon_sku));
     const count = saveProvisionalItems(items);
     res.json({ success: true, count });
   } catch (e) {
@@ -824,9 +867,13 @@ router.post('/api/provisional', express.json(), (req, res) => {
 
 // 仮確定データに差分マージ（既存データを保持しつつ追加・更新）
 router.post('/api/provisional/merge', express.json(), (req, res) => {
-  const { items } = req.body;
+  let { items } = req.body;
   if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items[] が必要です' });
   try {
+    // 恒久除外SKUは仮確定にも入れない (stale画面/直接API 経由の漏れ防止)
+    const excludedSet = new Set(getReplenishmentExcluded().map(r => r.amazon_sku));
+    items = items.filter(it => !excludedSet.has(it.amazon_sku));
+    if (items.length === 0) return res.json({ success: true, merged: 0, total: getProvisionalItems().items.length, skipped_excluded: true });
     const count = mergeProvisionalItems(items);
     const result = getProvisionalItems();
     res.json({ success: true, merged: count, total: result.items.length });
@@ -855,8 +902,14 @@ router.delete('/api/provisional/:sku', (req, res) => {
 
 // ===== 納品Excel出力 =====
 router.post('/api/export-manifest', express.json(), async (req, res) => {
-  const { items } = req.body;
+  let { items } = req.body;
   if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items[] が必要です' });
+  // 恒久除外SKUはサーバ側でも納品Excelから除く (stale画面/直接API 経由の漏れ防止)
+  {
+    const excludedSet = new Set(getReplenishmentExcluded().map(r => r.amazon_sku));
+    items = items.filter(it => !excludedSet.has(it.amazon_sku || it.msku || it.sku));
+    if (items.length === 0) return res.status(400).json({ error: '出力対象がありません（全て除外指定SKUでした）' });
+  }
 
   const settings = getSettings();
   const prepOwner = 'Seller';
@@ -913,7 +966,7 @@ router.post('/api/export-manifest', express.json(), async (req, res) => {
     const dateStr = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
     const filename = `FBA_Manifest_${dateStr}.xlsx`;
     const totalQty = items.reduce((sum, it) => sum + (parseInt(it.ship_qty) || 0), 0);
-    try { saveExportHistory('manifest_excel', filename, items.length, totalQty, Buffer.from(buffer)); } catch(he) { console.error('[FBA] 履歴保存エラー:', he); }
+    try { saveExportHistory('manifest_excel', filename, items.length, totalQty, Buffer.from(buffer), items.map(it => it.amazon_sku || it.msku || it.sku).filter(Boolean)); } catch(he) { console.error('[FBA] 履歴保存エラー:', he); }
 
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename=${filename}`);
@@ -978,12 +1031,19 @@ router.post('/api/export-ne-csv', express.json(), async (req, res) => {
   const mappings = getSkuMappings();
   const mappingMap = {};
   for (const m of mappings) mappingMap[m.amazon_sku] = m;
+  // 恒久除外SKUはサーバ側でも納品させない (stale画面/直接API 経由の漏れ防止)
+  const excludedSet = new Set(getReplenishmentExcluded().map(r => r.amazon_sku));
 
   // SKU → NE商品コードに展開し、同一NE商品コードは合算
   const neAggregated = {};
   const warnings = [];
+  const includedSkus = []; // 実際にCSVに入った amazon_sku (履歴の再DL除外チェック用)
 
   for (const item of items) {
+    if (excludedSet.has(item.amazon_sku)) {
+      warnings.push(`${item.amazon_sku}: 納品除外指定のためスキップ`);
+      continue;
+    }
     const mapping = mappingMap[item.amazon_sku];
     if (!mapping) {
       warnings.push(`${item.amazon_sku}: SKUマッピングなし（スキップ）`);
@@ -1011,6 +1071,7 @@ router.post('/api/export-ne-csv', express.json(), async (req, res) => {
       }
     }
 
+    includedSkus.push(item.amazon_sku);
     const shipQty = parseInt(item.ship_qty) || 0;
     for (const comp of components) {
       const neCode = comp.ne_code;
@@ -1106,7 +1167,7 @@ router.post('/api/export-ne-csv', express.json(), async (req, res) => {
     const encoded = iconv.encode(csvContent, 'Shift_JIS');
     const csvFilename = `hanyo-jyuchu_invoice_${dateStr}.csv`;
     const totalQty = neItems.reduce((sum, it) => sum + (parseInt(it.qty) || 0), 0);
-    try { saveExportHistory('ne_csv', csvFilename, neItems.length, totalQty, encoded); } catch(he) { console.error('[FBA] 履歴保存エラー:', he); }
+    try { saveExportHistory('ne_csv', csvFilename, neItems.length, totalQty, encoded, includedSkus); } catch(he) { console.error('[FBA] 履歴保存エラー:', he); }
     res.setHeader('Content-Type', 'text/csv; charset=Shift_JIS');
     res.setHeader('Content-Disposition', `attachment; filename=${csvFilename}`);
     res.send(encoded);
@@ -1133,6 +1194,20 @@ router.get('/api/export-history/:id/download', (req, res) => {
   try {
     const record = getExportHistoryFile(parseInt(req.params.id));
     if (!record || !record.file_data) return res.status(404).json({ error: '履歴が見つかりません' });
+    // 後から恒久除外された SKU を含む古い履歴ファイルの再DLを拒否 (stale経路からの納品防止)。
+    // sku_list 未記録 (本機能以前の履歴) はチェック対象外。
+    if (record.sku_list) {
+      try {
+        const fileSkus = JSON.parse(record.sku_list);
+        if (Array.isArray(fileSkus) && fileSkus.length > 0) {
+          const excludedSet = new Set(getReplenishmentExcluded().map(r => r.amazon_sku));
+          const hit = fileSkus.filter(s => excludedSet.has(s));
+          if (hit.length > 0) {
+            return res.status(409).json({ error: `この履歴ファイルには現在「納品除外」指定のSKUが含まれます (${hit.slice(0, 5).join(', ')}${hit.length > 5 ? ' 他' : ''})。再出力してください。`, excluded_skus: hit });
+          }
+        }
+      } catch (e) { /* sku_list 壊れていてもDL自体は通す */ }
+    }
     const contentType = record.type === 'manifest_excel'
       ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
       : 'text/csv; charset=Shift_JIS';
