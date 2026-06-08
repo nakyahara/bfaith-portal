@@ -124,6 +124,7 @@
       <h1>FBA在庫補充</h1>
     </div>
     <div class="header-right" style="display:flex;align-items:center;gap:12px;">
+      <button class="settings-btn" onclick="openExcludeManager()">🚫<span>除外SKU管理</span></button>
       <button class="settings-btn" onclick="openManual()">📖<span>マニュアル</span></button>
       <button class="settings-btn" onclick="openSettings()">⚙<span>設定</span></button>
       <span><%= displayName || username %></span>
@@ -262,7 +263,6 @@
         <label style="font-weight:bold;"><input type="radio" name="recFilter" value="recommended" checked onchange="filterRecList()"> 推奨のみ</label>
         <label><input type="radio" name="recFilter" value="all" onchange="filterRecList()"> 全SKU</label>
         <input type="text" id="recSearch" placeholder="商品名・SKU・NE商品コードで検索" oninput="filterRecList()" style="padding:5px 10px; border:1px solid #d1d5db; border-radius:4px; font-size:13px; width:280px;">
-        <label style="color:#666;font-size:12px;white-space:nowrap;" title="「もう納品しない」と指定したSKU。通常は推奨から除外され、ここをチェックするとグレー表示で復元できます。"><input type="checkbox" id="recShowExcluded" onchange="filterRecList()"> 除外も含める <span id="recExcludedCount" style="font-size:11px;"></span></label>
         <span style="margin-left:auto;color:#666;font-size:12px;" id="recFilterCount"></span>
       </div>
 
@@ -959,8 +959,8 @@
       document.getElementById('totalSkus').textContent = recMeta.total_skus || 0;
       document.getElementById('snapshotDateDisp').textContent = recMeta.snapshot_date || '-';
 
-      // 赤/黄の内訳 (除外SKUを除く)
-      const allRec = [...recData.filter(r => r.recommended_qty > 0 && !excludedSet.has(r.amazon_sku)), ...manualItems];
+      // 赤/黄の内訳 (除外SKUを除く。手動追加分も除外SKUは省く)
+      const allRec = [...recData.filter(r => r.recommended_qty > 0 && !excludedSet.has(r.amazon_sku)), ...manualItems.filter(m => !excludedSet.has(m.amazon_sku))];
       const redItems = allRec.filter(r => r.urgency_score >= 80);
       const yellowItems = allRec.filter(r => r.urgency_score >= 40 && r.urgency_score < 80);
       document.getElementById('recRedSkus').textContent = redItems.length + ' SKU';
@@ -1037,7 +1037,6 @@
     function filterRecList() {
       const mode = document.querySelector('input[name="recFilter"]:checked')?.value || 'recommended';
       const searchQuery = (document.getElementById('recSearch')?.value || '').trim().toLowerCase();
-      const showExcluded = document.getElementById('recShowExcluded')?.checked || false;
       let filtered = recData;
       // 検索中は全SKUから検索（推奨のみフィルターをバイパス）
       if (!searchQuery && mode === 'recommended') filtered = filtered.filter(r => r.recommended_qty > 0 || r._manual);
@@ -1049,33 +1048,13 @@
           (r.ne_code || '').toLowerCase().includes(searchQuery)
         );
       }
-      // 恒久除外フィルター（デフォルトは除外SKUを省く。手動追加した行は意図的なので残す）
-      if (!showExcluded) {
-        filtered = filtered.filter(r => !excludedSet.has(r.amazon_sku) || r._manual);
-      }
-      // 手動追加アイテムを先頭に含める
-      let combined = [...manualItems.filter(m => !filtered.find(r => r.amazon_sku === m.amazon_sku)), ...filtered];
-      // 「除外も含める」時: recData に出てこない除外SKUも復元できるよう stub 行を末尾に追加
-      if (showExcluded) {
-        const present = new Set(combined.map(r => r.amazon_sku));
-        for (const sku of excludedSet) {
-          if (present.has(sku)) continue;
-          const snap = snapshotData.find(s => s.amazon_sku === sku) || skuMappingMap[sku] || {};
-          combined.push({
-            amazon_sku: sku,
-            product_name: snap.product_name || '(除外SKU)',
-            asin: snap.asin || '',
-            urgency_score: 0,
-            fba_available: '-', effective_fba_stock: '-', days_of_supply: '-', reorder_point: '-',
-            target_days: '-', units_sold_7d: '-', units_sold_30d: '-', warehouse_available: '-',
-            recommended_qty: '-', adjusted_qty: '-', raw_needed: 0,
-            _excludedStub: true,
-          });
-        }
-      }
+      // 恒久除外フィルター: 除外SKUは常に省く（手動追加分・_manual 行も例外なく除外）。
+      // 管理・復元は「除外SKU管理」ボタンの画面で行う。
+      filtered = filtered.filter(r => !excludedSet.has(r.amazon_sku));
+      // 手動追加アイテムを先頭に含める（除外SKUは省く）
+      const combined = [...manualItems.filter(m => !excludedSet.has(m.amazon_sku) && !filtered.find(r => r.amazon_sku === m.amazon_sku)), ...filtered];
       renderRecList(combined);
-      const excludedShown = combined.filter(r => excludedSet.has(r.amazon_sku)).length;
-      document.getElementById('recFilterCount').textContent = `表示: ${combined.length} 件${showExcluded && excludedShown ? `（うち除外 ${excludedShown}）` : ''}`;
+      document.getElementById('recFilterCount').textContent = `表示: ${combined.length} 件`;
 
       syncSnapshotSearch(searchQuery);
     }
@@ -1101,6 +1080,7 @@
       const qty = parseInt(qtyInput.value) || 0;
       if (!sku) { msgEl.textContent = 'SKUを入力してください'; return; }
       if (qty <= 0) { msgEl.textContent = '数量を入力してください'; return; }
+      if (excludedSet.has(sku)) { msgEl.textContent = `${sku} は納品除外中です（「🚫除外SKU管理」で復元してください）`; msgEl.style.color = '#dc2626'; return; }
 
       // 既存データから探す（recData + manualItems）
       const existing = recData.find(r => r.amazon_sku === sku);
@@ -1226,17 +1206,11 @@
         // チェック状態
         const isChecked = selectedSkus.has(r.amazon_sku);
         const urgTag = r.urgency_score >= 80 ? 'red' : r.urgency_score >= 40 ? 'yellow' : 'white';
-        // 恒久除外: グレー表示 + 行頭バッジ。リンクは除外SKUなら「復元」、それ以外は「除外」
-        const isExcluded = excludedSet.has(r.amazon_sku);
-        const trStyle = isExcluded ? 'style="background:#f3f4f6;opacity:0.65;"' : manualCls;
-        const excludeLink = isExcluded
-          ? `<span style="font-size:10px;color:#2563eb;cursor:pointer;text-decoration:underline;margin-left:4px;" title="${esc(excludedReasonMap[r.amazon_sku] || '')}" onclick="unexcludeReplenishmentSku('${r.amazon_sku}')">復元</span>`
-          : `<span style="font-size:10px;color:#dc2626;cursor:pointer;text-decoration:underline;margin-left:4px;" title="もう納品しない (推奨から除外)" onclick="excludeReplenishmentSku('${r.amazon_sku}')">除外</span>`;
-        return `<tr class="${urgCls}" ${trStyle}>
-          <td style="text-align:center;"><input type="checkbox" class="rec-check" data-sku="${r.amazon_sku}" data-qty="${shipQtyMap[r.amazon_sku] ?? (r.adjusted_qty || 0)}" data-urg="${urgTag}" ${isChecked && !isExcluded ? 'checked' : ''} ${isExcluded ? 'disabled title="除外SKUは選択できません"' : ''} onchange="onCheckChange(this)"></td>
-          <td style="text-align:center;font-size:11px;color:#666;">${isExcluded ? '除外' : rowNum}</td>
+        return `<tr class="${urgCls}" ${manualCls}>
+          <td style="text-align:center;"><input type="checkbox" class="rec-check" data-sku="${r.amazon_sku}" data-qty="${shipQtyMap[r.amazon_sku] ?? (r.adjusted_qty || 0)}" data-urg="${urgTag}" ${isChecked ? 'checked' : ''} onchange="onCheckChange(this)"></td>
+          <td style="text-align:center;font-size:11px;color:#666;">${rowNum}</td>
           <td>${r._manual ? '手動' : r.urgency_score}</td>
-          <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')">${r.amazon_sku}</span>${excludeLink}</td>
+          <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')">${r.amazon_sku}</span></td>
           <td class="product-name" title="${esc(r.product_name)}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${esc(r.product_name)}</a>` : esc(r.product_name)}</td>
           ${renderComponentCell(r)}
           <td>${r.fba_available}</td>
@@ -1256,7 +1230,7 @@
           <td style="${(r.non_fba_reserve || 0) > 0 ? 'font-weight:bold;color:#dc2626' : 'color:#999'}">${r.non_fba_reserve || 0}</td>
           <td class="rec-qty" style="${r.recommended_qty !== r.adjusted_qty ? 'color:#999;font-size:12px;text-decoration:line-through' : ''}">${r.recommended_qty || '-'}</td>
           <td class="rec-qty" style="font-size:11px;color:#666;">${r.adjusted_qty || '-'}${r.location_adjusted ? ' 📍' : ''}</td>
-          <td style="padding:2px 4px;"><input type="number" class="ship-qty-input" data-sku="${r.amazon_sku}" value="${shipQtyMap[r.amazon_sku] ?? (r.adjusted_qty || 0)}" min="0" ${isExcluded ? 'disabled' : ''} onchange="onShipQtyChange(this)" onfocus="this.select()" style="width:60px;padding:3px 4px;border:1px solid #d1d5db;border-radius:4px;font-size:13px;text-align:right;${isExcluded ? 'background:#f3f4f6;color:#999;' : (shipQtyMap[r.amazon_sku] !== undefined && shipQtyMap[r.amazon_sku] !== (r.adjusted_qty || 0)) ? 'background:#fef3c7;border-color:#d97706;font-weight:bold;' : ''}"></td>
+          <td style="padding:2px 4px;"><input type="number" class="ship-qty-input" data-sku="${r.amazon_sku}" value="${shipQtyMap[r.amazon_sku] ?? (r.adjusted_qty || 0)}" min="0" onchange="onShipQtyChange(this)" onfocus="this.select()" style="width:60px;padding:3px 4px;border:1px solid #d1d5db;border-radius:4px;font-size:13px;text-align:right;${(shipQtyMap[r.amazon_sku] !== undefined && shipQtyMap[r.amazon_sku] !== (r.adjusted_qty || 0)) ? 'background:#fef3c7;border-color:#d97706;font-weight:bold;' : ''}"></td>
           <td>${alertsHtml}</td>
         </tr>`;
       }).join('');
@@ -1535,12 +1509,13 @@
           <div class="settings-group">
             <h4>納品推奨から「除外」する（もう納品しない商品）</h4>
             <p style="font-size:12px;color:#444;margin:0 0 8px;">販売はしていたが価格が合わなくなった等で「もう FBA に納品しない」と決めた商品を、推奨リストから恒久的に省く機能です。</p>
+            <p style="font-size:12px;color:#444;margin:0 0 8px;">画面右上の <strong>「🚫 除外SKU管理」ボタン</strong> から開く管理画面で操作します。</p>
             <table style="width:100%;font-size:12px;border-collapse:collapse;">
               <tr style="background:#f3f4f6;"><th style="padding:6px;border:1px solid #e5e7eb;">操作</th><th style="padding:6px;border:1px solid #e5e7eb;">説明</th></tr>
-              <tr><td style="padding:6px;border:1px solid #e5e7eb;font-weight:bold;color:#dc2626;">除外</td><td style="padding:6px;border:1px solid #e5e7eb;">納品推奨タブの各行（SKUの右）の「<span style="color:#dc2626;">除外</span>」リンクをクリック → 理由（任意。例:「価格が合わない」）を入力して登録。以後そのSKUは<strong>納品推奨・FBA欠品・新規商品・発注推奨(在庫0) の全タブから消えます</strong>。</td></tr>
-              <tr><td style="padding:6px;border:1px solid #e5e7eb;font-weight:bold;">除外も含める</td><td style="padding:6px;border:1px solid #e5e7eb;">納品推奨タブ上部のチェックボックス。ONにすると除外SKUがグレー表示で出てきます（件数も表示）。</td></tr>
-              <tr><td style="padding:6px;border:1px solid #e5e7eb;font-weight:bold;color:#2563eb;">復元</td><td style="padding:6px;border:1px solid #e5e7eb;">「除外も含める」をONにしてグレー行の「<span style="color:#2563eb;">復元</span>」をクリックすると除外解除。再び推奨に戻ります。</td></tr>
-              <tr><td style="padding:6px;border:1px solid #e5e7eb;">安全装置</td><td style="padding:6px;border:1px solid #e5e7eb;">除外SKUはチェック・数量入力ができず、「緊急を全選択」等でも選ばれません。仮確定・納品プラン作成・Manifest/NE受注CSV出力でもサーバ側で必ず除外されるため、誤って納品されることはありません。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;font-weight:bold;color:#dc2626;">除外を追加</td><td style="padding:6px;border:1px solid #e5e7eb;">「🚫除外SKU管理」を開く → 上段の検索ボックスに<strong>商品名かSKU</strong>を入れて候補を絞り込み → 理由（任意。例:「価格が合わない」）を入れて候補の「除外」ボタン。以後そのSKUは<strong>納品推奨・FBA欠品・新規商品・発注推奨(在庫0) の全タブから消えます</strong>。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;font-weight:bold;">現在の除外一覧</td><td style="padding:6px;border:1px solid #e5e7eb;">同じ管理画面の下段に、いま除外中のSKUが<strong>商品名・理由・除外日つきで一覧表示</strong>されます。何を除外したか一目で確認できます。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;font-weight:bold;color:#2563eb;">復元</td><td style="padding:6px;border:1px solid #e5e7eb;">一覧の各行の「<span style="color:#2563eb;">復元</span>」ボタンで除外解除。再び推奨に戻ります。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">安全装置</td><td style="padding:6px;border:1px solid #e5e7eb;">除外SKUは仮確定・納品プラン作成・Manifest/NE受注CSV出力でもサーバ側で必ず除外されるため、誤って納品されることはありません。登録内容はDB保存で<strong>次回以降もずっと保持</strong>されます。</td></tr>
             </table>
             <p style="font-size:11px;color:#666;margin-top:8px;">※ あくまで「今後の推奨・納品から省く」機能です。<strong>すでにセラセン/Amazon側で作成済みの納品プランは取り消されません</strong>（それは Seller Central 側で対応してください）。再び納品したくなったら「復元」でいつでも戻せます。</p>
           </div>
@@ -2278,19 +2253,15 @@ Step10: アラート判定
       } catch(e) { /* ignore */ }
     }
 
-    // ===== 納品推奨 恒久除外 (全推奨横断: 納品推奨/FBA欠品/新規商品) =====
-    let excludedSet = new Set();          // 除外SKUセット
-    let excludedReasonMap = {};           // amazon_sku -> reason
+    // ===== 納品推奨 恒久除外 (全推奨横断: 納品推奨/FBA欠品/新規商品/発注推奨) =====
+    // 管理は「🚫除外SKU管理」ボタン → モーダルで行う。除外SKUは全推奨タブから常に省かれる。
+    let excludedSet = new Set();          // 除外SKUセット (各タブのフィルタが参照)
 
     async function loadExcluded() {
       try {
         const res = await fetch(`${BASE}/api/replenishment-excluded`);
         const list = await res.json();
         excludedSet = new Set(list.map(r => r.amazon_sku));
-        excludedReasonMap = {};
-        for (const r of list) excludedReasonMap[r.amazon_sku] = r.reason || '';
-        const cb = document.getElementById('recExcludedCount');
-        if (cb) cb.textContent = `(${excludedSet.size}件)`;
       } catch(e) { /* ignore */ }
     }
 
@@ -2303,46 +2274,146 @@ Step10: アラート判定
       try { updateOrderList(); } catch(e) {}
     }
 
-    async function excludeReplenishmentSku(sku) {
-      const reason = prompt(`「${sku}」を納品推奨から除外します。\n理由 (任意。例: 価格が合わない):`, '');
-      if (reason === null) return; // キャンセル
+    // SKUを除外登録 (理由つき)。成功で true。管理モーダルから呼ぶ。
+    async function excludeReplenishmentSku(sku, reason) {
       try {
         const res = await fetch(`${BASE}/api/replenishment-excluded`, {
           method: 'POST', headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ amazon_sku: sku, reason: reason.trim() || null }),
+          body: JSON.stringify({ amazon_sku: sku, reason: (reason || '').trim() || null }),
         });
-        if (!res.ok) { alert('除外に失敗しました'); return; }
+        if (!res.ok) { const e = await res.json().catch(()=>({})); alert('除外に失敗: ' + (e.error || res.status)); return false; }
         excludedSet.add(sku);
-        excludedReasonMap[sku] = reason.trim();
-        // 選択状態・数量入力から除去 (除外SKUが納品プラン/仮確定/Excelに混入しないように)
+        // 選択状態・数量入力・手動追加・仮確定から除去 (除外SKUが納品プラン/仮確定/Excelに混入しないように)
         try { selectedSkus.delete(sku); } catch(e) {}
         try { delete shipQtyMap[sku]; } catch(e) {}
         try { stockoutCheckedSkus.delete(sku); } catch(e) {}
         try { newCheckedSkus.delete(sku); } catch(e) {}
-        // 仮確定リストからも除去 (サーバ側でも cascade 削除済み。画面状態を揃える)
+        try { if (Array.isArray(manualItems)) manualItems = manualItems.filter(m => m.amazon_sku !== sku); } catch(e) {}
         try {
           if (Array.isArray(provisionalData) && provisionalData.some(i => i.amazon_sku === sku)) {
             provisionalData = provisionalData.filter(i => i.amazon_sku !== sku);
             renderProvisionalTable();
           }
         } catch(e) {}
-        const cb = document.getElementById('recExcludedCount');
-        if (cb) cb.textContent = `(${excludedSet.size}件)`;
-        log(`納品推奨から除外: ${esc(sku)}${reason.trim() ? ' (' + esc(reason.trim()) + ')' : ''}`);
         rerenderAllTabsForExclusion();
-      } catch(e) { alert('エラー: ' + e.message); }
+        return true;
+      } catch(e) { alert('エラー: ' + e.message); return false; }
     }
 
     async function unexcludeReplenishmentSku(sku) {
       try {
-        await fetch(`${BASE}/api/replenishment-excluded/${encodeURIComponent(sku)}`, { method: 'DELETE' });
+        const res = await fetch(`${BASE}/api/replenishment-excluded/${encodeURIComponent(sku)}`, { method: 'DELETE' });
+        if (!res.ok) { alert('復元に失敗しました'); return false; }
         excludedSet.delete(sku);
-        delete excludedReasonMap[sku];
-        const cb = document.getElementById('recExcludedCount');
-        if (cb) cb.textContent = `(${excludedSet.size}件)`;
-        log(`除外を解除: ${esc(sku)}`);
         rerenderAllTabsForExclusion();
-      } catch(e) { alert('エラー: ' + e.message); }
+        return true;
+      } catch(e) { alert('エラー: ' + e.message); return false; }
+    }
+
+    // ===== 除外SKU管理モーダル =====
+    // onclick に SKU を渡す際は encodeURIComponent + ' を %27 にして属性/JS文字列の破壊を防ぐ
+    function encSku(sku) { return encodeURIComponent(sku).replace(/'/g, '%27'); }
+
+    async function openExcludeManager() {
+      const html = `<div class="settings-overlay" onclick="closeExcludeManager()"></div>
+        <div class="settings-modal" id="excludeManagerModal" style="max-width:780px;max-height:90vh;display:flex;flex-direction:column;">
+          <span class="settings-close" onclick="closeExcludeManager()">&times;</span>
+          <h3 style="margin:0 0 4px;">🚫 納品除外SKU管理</h3>
+          <p style="font-size:12px;color:#666;margin:0 0 12px;">ここで指定したSKUは、全推奨（納品推奨／FBA欠品／新規商品／発注推奨）から恒久的に除外されます。価格が合わない等で「もう納品しない」商品に。次回以降もずっと保持されます。</p>
+          <div class="settings-group" style="margin-bottom:12px;">
+            <h4 style="margin:0 0 6px;">SKUを除外に追加</h4>
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px;">
+              <input type="text" id="exclSearch" placeholder="商品名・SKUで検索" oninput="renderExcludeCandidates()" style="flex:1;min-width:220px;padding:6px 10px;border:1px solid #d1d5db;border-radius:4px;font-size:13px;">
+              <input type="text" id="exclReason" placeholder="理由(任意 例:価格が合わない)" style="width:230px;padding:6px 10px;border:1px solid #d1d5db;border-radius:4px;font-size:13px;">
+            </div>
+            <div id="exclCandidates" style="max-height:220px;overflow:auto;border:1px solid #eee;border-radius:4px;"></div>
+          </div>
+          <div class="settings-group" style="flex:1;overflow:auto;min-height:120px;">
+            <h4 style="margin:0 0 6px;">現在の除外SKU <span id="exclCount" style="font-size:12px;color:#666;"></span></h4>
+            <div id="exclList"></div>
+          </div>
+        </div>`;
+      const div = document.createElement('div');
+      div.id = 'excludeManagerContainer';
+      div.innerHTML = html;
+      document.body.appendChild(div);
+      if (Object.keys(skuMappingMap).length === 0) { try { await loadSkuMappingMap(); } catch(e) {} }
+      await renderExcludeManagerList();
+      renderExcludeCandidates();
+    }
+
+    function closeExcludeManager() {
+      const c = document.getElementById('excludeManagerContainer');
+      if (c) c.remove();
+    }
+
+    // 現在の除外一覧 (商品名つき) を描画。サーバから取得し excludedSet も最新化。
+    async function renderExcludeManagerList() {
+      const listEl = document.getElementById('exclList');
+      const countEl = document.getElementById('exclCount');
+      if (!listEl) return;
+      let list = [];
+      try {
+        const res = await fetch(`${BASE}/api/replenishment-excluded`);
+        list = await res.json();
+      } catch(e) { listEl.innerHTML = '<p style="color:#dc2626;font-size:12px;padding:8px;">読み込みに失敗しました</p>'; return; }
+      excludedSet = new Set(list.map(r => r.amazon_sku));
+      if (countEl) countEl.textContent = `(${list.length}件)`;
+      if (list.length === 0) { listEl.innerHTML = '<p style="color:#666;font-size:12px;padding:8px;">除外中のSKUはありません。</p>'; return; }
+      let html = '<table style="width:100%;font-size:12px;border-collapse:collapse;"><tr style="background:#f3f4f6;"><th style="padding:6px;border:1px solid #e5e7eb;text-align:left;">商品名</th><th style="padding:6px;border:1px solid #e5e7eb;">SKU</th><th style="padding:6px;border:1px solid #e5e7eb;">理由</th><th style="padding:6px;border:1px solid #e5e7eb;">除外日</th><th style="padding:6px;border:1px solid #e5e7eb;"></th></tr>';
+      for (const r of list) {
+        html += `<tr>
+          <td style="padding:6px;border:1px solid #e5e7eb;">${esc(r.product_name || '(商品名なし)')}</td>
+          <td style="padding:6px;border:1px solid #e5e7eb;font-size:11px;">${esc(r.amazon_sku)}</td>
+          <td style="padding:6px;border:1px solid #e5e7eb;font-size:11px;color:#666;">${esc(r.reason || '')}</td>
+          <td style="padding:6px;border:1px solid #e5e7eb;font-size:11px;color:#666;white-space:nowrap;">${esc((r.excluded_at || '').slice(0,10))}</td>
+          <td style="padding:6px;border:1px solid #e5e7eb;text-align:center;"><button onclick="restoreFromManager('${encSku(r.amazon_sku)}')" style="font-size:11px;color:#2563eb;background:none;border:1px solid #2563eb;border-radius:4px;padding:2px 10px;cursor:pointer;">復元</button></td>
+        </tr>`;
+      }
+      html += '</table>';
+      listEl.innerHTML = html;
+    }
+
+    // 検索候補 (sku_mapping から、未除外のものを最大50件) を描画
+    function renderExcludeCandidates() {
+      const el = document.getElementById('exclCandidates');
+      if (!el) return;
+      const q = (document.getElementById('exclSearch')?.value || '').trim().toLowerCase();
+      if (!q) { el.innerHTML = '<p style="color:#999;font-size:11px;padding:8px;">商品名かSKUで検索すると候補が出ます。</p>'; return; }
+      const matches = Object.values(skuMappingMap).filter(m =>
+        !excludedSet.has(m.amazon_sku) &&
+        ((m.amazon_sku || '').toLowerCase().includes(q) || (m.product_name || '').toLowerCase().includes(q))
+      ).slice(0, 50);
+      if (matches.length === 0) { el.innerHTML = '<p style="color:#999;font-size:11px;padding:8px;">一致する商品がありません（既に除外済みかも）。</p>'; return; }
+      let html = '';
+      for (const m of matches) {
+        html += `<div style="display:flex;align-items:center;gap:8px;padding:5px 8px;border-bottom:1px solid #f0f0f0;">
+          <span style="flex:1;font-size:12px;">${esc(m.product_name || '(商品名なし)')} <span style="color:#999;font-size:11px;">${esc(m.amazon_sku)}</span></span>
+          <button onclick="addExcludeFromManager('${encSku(m.amazon_sku)}')" style="font-size:11px;color:#fff;background:#dc2626;border:none;border-radius:4px;padding:3px 12px;cursor:pointer;white-space:nowrap;">除外</button>
+        </div>`;
+      }
+      el.innerHTML = html;
+    }
+
+    async function addExcludeFromManager(skuEnc) {
+      const sku = decodeURIComponent(skuEnc);
+      const reason = document.getElementById('exclReason')?.value || '';
+      const ok = await excludeReplenishmentSku(sku, reason);
+      if (ok) {
+        log(`納品推奨から除外: ${esc(sku)}`);
+        await renderExcludeManagerList();
+        renderExcludeCandidates();
+      }
+    }
+
+    async function restoreFromManager(skuEnc) {
+      const sku = decodeURIComponent(skuEnc);
+      const ok = await unexcludeReplenishmentSku(sku);
+      if (ok) {
+        log(`除外を解除: ${esc(sku)}`);
+        await renderExcludeManagerList();
+        renderExcludeCandidates();
+      }
     }
 
     function addStockoutToShip() {
@@ -3364,6 +3435,7 @@ Step10: アラート判定
 
       // 欠品・新規商品・手動追加アイテムを復元
       for (const di of draft.items) {
+        if (excludedSet.has(di.amazon_sku)) continue; // 除外SKUはドラフトからも復元しない
         if (di.from_stockout || di.from_new_product || di.is_manual) {
           const existing = recData.find(r => r.amazon_sku === di.amazon_sku);
           if (existing) {
@@ -3412,6 +3484,7 @@ Step10: アラート判定
       // チェック状態と数量を復元
       selectedSkus.clear();
       for (const di of draft.items) {
+        if (excludedSet.has(di.amazon_sku)) continue; // 除外SKUは選択状態/数量も復元しない
         if (di.checked) selectedSkus.add(di.amazon_sku);
         if (di.ship_qty > 0) {
           const item = recData.find(r => r.amazon_sku === di.amazon_sku) || manualItems.find(m => m.amazon_sku === di.amazon_sku);
