@@ -1004,7 +1004,7 @@ async function postCalculate(ym, allowPartial) {
   });
   const data = await res.json();
   if (res.status === 409 && data.error === 'incomplete_malls') {
-    if (confirm(data.message + '\n\nこのまま不完全な状態で確定しますか？（推奨しません）')) {
+    if (confirm(data.message + '\\n\\nこのまま不完全な状態で確定しますか？（推奨しません）')) {
       await postCalculate(ym, true);
     }
     return;
