@@ -275,6 +275,9 @@ function syncSegmentSalesForMonth(db, year_month, now) {
     for (const mt of MALL_TABLES) {
       db.prepare('DELETE FROM mart_monthly_segment_sales WHERE year_month = ? AND source_file = ?').run(year_month, mt.table);
     }
+    // 自動登録の FBA運賃 も冒頭で消去（Amazon summary が消えた月の stale 運賃を残さない）。
+    // 手入力分は note で除外して保護。FBA手数料がある場合のみ下で再投入する。
+    db.prepare("DELETE FROM mgmt_freight_costs WHERE year_month = ? AND carrier = 'FBA運賃' AND note LIKE 'auto from%'").run(year_month);
     for (const mt of MALL_TABLES) {
       let row;
       try {
@@ -309,10 +312,8 @@ function syncSegmentSalesForMonth(db, year_month, now) {
           freightStmt.run(year_month, 'FBA運賃', fbaFeeTaxEx, 'shared', null, null,
             'auto from mart_amazon_monthly_summary.by_segment.FBA手数料', 'system-sync', now, now);
           fbaFreightInserted = fbaFeeTaxEx;
-        } else {
-          // FBA手数料が消えた月は自動登録分の FBA運賃 を残さない（手入力分は note で除外して保護）
-          db.prepare("DELETE FROM mgmt_freight_costs WHERE year_month = ? AND carrier = 'FBA運賃' AND note LIKE 'auto from%'").run(year_month);
         }
+        // fee=0 / summary 無しの場合は冒頭で削除済みなので何もしない
       }
 
       // セグメント行を組み立てる（by_segment 形式でないモール=米国Amazon mgmt_row 等は 0 行）
