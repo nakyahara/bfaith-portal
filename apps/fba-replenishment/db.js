@@ -6,6 +6,10 @@ import initSqlJs from 'sql.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+// SKUマスタ直結 PR2: mirror 直読み adapter 用 (better-sqlite3 / 別DB)。
+// import 時点では mirror DB を初期化しない (getMirrorDB を呼んだ時に lazy、未初期化なら throw)。
+// FBA DB(sql.js) と mirror DB(better-sqlite3) はエンジンが違うので結合は JS 側で行う。
+import { getMirrorDB } from '../warehouse-mirror/db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', '..', 'data');
@@ -81,6 +85,29 @@ export async function initDb() {
       db.run(`ALTER TABLE sku_mapping ADD COLUMN ${col} INTEGER DEFAULT 0`);
     }
   }
+
+  // --- 1b. fba_sku_attrs: FBAローカル属性 (fnsku/asin) ---
+  // SKUマスタ直結 PR2: マッピング正本を mirror_sku_resolved に移すと sku_mapping の fnsku/asin が失われるため、
+  // FBA 固有のローカル属性を分離して保持する。fnsku は SP-API snapshot 由来 (sheet にはない)。
+  //   sheet モード: fnsku の正は従来どおり sku_mapping.fnsku (本テーブルは dual-write で追従)
+  //   mirror モード: fnsku/asin の正は本テーブル (mirror_sku_resolved には fnsku/asin が無いため)
+  db.run(`
+    CREATE TABLE IF NOT EXISTS fba_sku_attrs (
+      amazon_sku TEXT PRIMARY KEY,
+      asin TEXT,
+      fnsku TEXT,
+      source TEXT,
+      updated_at TEXT DEFAULT (datetime('now','localtime'))
+    )
+  `);
+  // backfill: 既存 sku_mapping の asin/fnsku から未登録 SKU 分だけ初期投入 (非空 attrs は上書きしない)。
+  // INSERT ... WHERE NOT EXISTS なので既存 fba_sku_attrs 行には一切触れない。
+  db.run(`
+    INSERT INTO fba_sku_attrs (amazon_sku, asin, fnsku, source)
+    SELECT m.amazon_sku, m.asin, m.fnsku, 'sheet_backfill'
+    FROM sku_mapping m
+    WHERE m.amazon_sku NOT IN (SELECT amazon_sku FROM fba_sku_attrs)
+  `);
 
   // --- 2. sku_exceptions: FBA優先送りマスタ ---
   db.run(`
@@ -912,11 +939,172 @@ export function replaceWarehouseInventory(items) {
 
 // ===== 読み取り =====
 
-export function getSkuMappings() {
+// ===== SKUマッピング取得 (SKUマスタ直結 PR2) =====
+// FBA_SKU_MAPPING_SOURCE 環境変数でソースを切替:
+//   'sheet'  (default) : 従来どおり sku_mapping (Google Sheet 同期)
+//   'mirror'           : warehouse-mirror.db の mirror_sku_resolved 直読み (master 正本)
+//   'shadow'           : 本番は sheet を返すが、内部で mirror も組み立てて差分を log (観測用、非破壊)
+// 切替の本番化は PR4。PR2 では default sheet / shadow とも本番挙動を変えない。
+function getSkuMappingSource() {
+  return process.env.FBA_SKU_MAPPING_SOURCE || 'sheet';
+}
+
+export function getSkuMappingsFromSheet() {
   return queryAll('SELECT * FROM sku_mapping ORDER BY amazon_sku');
 }
 
+// mirror_sku_resolved の component 行群 (sort_order 昇順) を既存 sku_mapping と同じ shape の1行に変換。
+//   - ne_code / logizard_code = 代表 (sort_order 先頭) の ne_code
+//   - is_set = 構成 > 1 or 単品でも qty > 1
+//   - set_components = [{ne_code, qty}] の JSON 文字列 (既存 DB shape 互換)
+//   - asin / fnsku = fba_sku_attrs 由来 (mirror には無い)
+//   - non_fba_sales_* = 当面 sku_mapping から持ち越し (正確な再計算は PR3)
+//   - per_unit_volume / storage_type = null (元々 snap 由来、mapping 側未使用)
+function buildMirrorRow(amazonSku, compRows, attr, nonFba) {
+  const components = compRows.map(c => ({ ne_code: c.ne_code, qty: c.quantity }));
+  const isSet = components.length > 1 || (components[0] && (Number(components[0].qty) || 1) > 1);
+  return {
+    amazon_sku: amazonSku,
+    asin: attr?.asin || null,
+    product_name: compRows[0]?.['商品名'] || '',
+    ne_code: components[0]?.ne_code || null,
+    logizard_code: components[0]?.ne_code || null,
+    fnsku: attr?.fnsku || null,
+    jan: null,
+    is_set: isSet ? 1 : 0,
+    set_components: JSON.stringify(components),
+    per_unit_volume: null,
+    storage_type: null,
+    non_fba_sales_7d: nonFba?.non_fba_sales_7d || 0,
+    non_fba_sales_30d: nonFba?.non_fba_sales_30d || 0,
+    updated_at: null,
+  };
+}
+
+export function getSkuMappingsFromMirror() {
+  const mdb = getMirrorDB(); // better-sqlite3 (mirror 未初期化なら throw)
+  const rows = mdb.prepare(`
+    SELECT seller_sku, ne_code, quantity, 商品名, sort_order
+    FROM mirror_sku_resolved
+    WHERE source = 'master'
+    ORDER BY seller_sku, sort_order, ne_code
+  `).all();
+  // JS group by seller_sku (SQL GROUP BY ではなく順序保持の JS group)
+  const bySku = new Map();
+  for (const r of rows) {
+    if (!bySku.has(r.seller_sku)) bySku.set(r.seller_sku, []);
+    bySku.get(r.seller_sku).push(r);
+  }
+  // FBA ローカル属性 (sql.js) を Map 化して JS join
+  const attrs = new Map();
+  for (const a of queryAll('SELECT amazon_sku, asin, fnsku FROM fba_sku_attrs')) attrs.set(a.amazon_sku, a);
+  const nonFba = new Map();
+  for (const s of queryAll('SELECT amazon_sku, non_fba_sales_7d, non_fba_sales_30d FROM sku_mapping')) nonFba.set(s.amazon_sku, s);
+
+  const result = [];
+  for (const [sku, compRows] of bySku) {
+    result.push(buildMirrorRow(sku, compRows, attrs.get(sku), nonFba.get(sku)));
+  }
+  result.sort((x, y) => String(x.amazon_sku).localeCompare(String(y.amazon_sku)));
+  return result;
+}
+
+function getSkuMappingFromMirror(amazonSku) {
+  const mdb = getMirrorDB();
+  const compRows = mdb.prepare(`
+    SELECT seller_sku, ne_code, quantity, 商品名, sort_order
+    FROM mirror_sku_resolved
+    WHERE source = 'master' AND seller_sku = ?
+    ORDER BY sort_order, ne_code
+  `).all(amazonSku);
+  if (compRows.length === 0) return null;
+  const attr = queryOne('SELECT asin, fnsku FROM fba_sku_attrs WHERE amazon_sku = ?', [amazonSku]);
+  const nonFba = queryOne('SELECT non_fba_sales_7d, non_fba_sales_30d FROM sku_mapping WHERE amazon_sku = ?', [amazonSku]);
+  return buildMirrorRow(amazonSku, compRows, attr, nonFba);
+}
+
+// set_components (文字列 or 配列) を比較用の正規化文字列に (ne_code は case 無視、qty 含む)
+function normComponents(sc) {
+  let arr = [];
+  if (Array.isArray(sc)) arr = sc;
+  else if (typeof sc === 'string' && sc) { try { arr = JSON.parse(sc); } catch { arr = []; } }
+  if (!Array.isArray(arr)) arr = [];
+  return arr.map(c => `${String(c.ne_code || '').trim().toLowerCase()}:${c.qty ?? c.数量 ?? 1}`).sort().join(',');
+}
+
+// shadow: sheet と mirror の core 差分を集計 (確定はしない、観測用)
+function compareSkuMappings(sheetRows, mirrorRows) {
+  const sheetMap = new Map(sheetRows.map(r => [r.amazon_sku, r]));
+  const mirrorMap = new Map(mirrorRows.map(r => [r.amazon_sku, r]));
+  const observed = new Set([...getAllEverSeenSkus(), ...getAllSnapshotSkus()]);
+  const sheetOnly = [], mirrorOnlyObserved = [], mirrorOnlyScopeUnknown = [], fieldDiffs = [];
+  for (const sku of sheetMap.keys()) if (!mirrorMap.has(sku)) sheetOnly.push(sku);
+  for (const sku of mirrorMap.keys()) {
+    if (!sheetMap.has(sku)) (observed.has(sku) ? mirrorOnlyObserved : mirrorOnlyScopeUnknown).push(sku);
+  }
+  for (const [sku, s] of sheetMap) {
+    const m = mirrorMap.get(sku);
+    if (!m) continue;
+    const d = {};
+    if ((s.ne_code || null) !== (m.ne_code || null)) d.ne_code = [s.ne_code, m.ne_code];
+    if ((s.is_set ? 1 : 0) !== (m.is_set ? 1 : 0)) d.is_set = [s.is_set, m.is_set];
+    if (normComponents(s.set_components) !== normComponents(m.set_components)) d.components = true;
+    if ((s.fnsku || null) !== (m.fnsku || null)) d.fnsku = [s.fnsku, m.fnsku];
+    if (Object.keys(d).length) fieldDiffs.push({ amazon_sku: sku, ...d });
+  }
+  return {
+    summary: {
+      sheet_count: sheetRows.length,
+      mirror_count: mirrorRows.length,
+      sheet_only: sheetOnly.length,                       // sheet にあるが mirror に無い
+      mirror_only_observed: mirrorOnlyObserved.length,    // mirror のみ & FBA観測あり = core 差分 (要調査)
+      mirror_only_scope_unknown: mirrorOnlyScopeUnknown.length, // mirror のみ & 未観測 = 新規商品候補 or 非Amazon混入 (判定不能、PR4前にscope filter決定)
+      field_diffs: fieldDiffs.length,                     // 共通SKUの core フィールド差分
+    },
+    samples: [
+      ...sheetOnly.slice(0, 10).map(s => ({ type: 'sheet_only', amazon_sku: s })),
+      ...mirrorOnlyObserved.slice(0, 10).map(s => ({ type: 'mirror_only_observed', amazon_sku: s })),
+      ...mirrorOnlyScopeUnknown.slice(0, 10).map(s => ({ type: 'mirror_only_scope_unknown', amazon_sku: s })),
+      ...fieldDiffs.slice(0, 10),
+    ],
+  };
+}
+
+const SHADOW_TTL_MS = 60000;
+let _shadowLastRun = 0;
+// shadow 差分の実行は完全隔離 + TTL。失敗しても sheet 結果には一切影響しない。
+function runShadowDiff(sheetRows) {
+  try {
+    const now = Date.now();
+    if (now - _shadowLastRun < SHADOW_TTL_MS) return; // ログ洪水 / event loop ブロック回避
+    _shadowLastRun = now;
+    let mirrorRows;
+    try {
+      mirrorRows = getSkuMappingsFromMirror();
+    } catch (e) {
+      console.warn('[FBA shadow] mirror 読取スキップ (未初期化/読取失敗): ' + e.message);
+      return;
+    }
+    const diff = compareSkuMappings(sheetRows, mirrorRows);
+    console.log('[FBA shadow] sku_mapping diff summary: ' + JSON.stringify(diff.summary));
+    if (diff.samples.length) console.log('[FBA shadow] sku_mapping diff samples: ' + JSON.stringify(diff.samples));
+  } catch (e) {
+    console.warn('[FBA shadow] diff 失敗 (本番は sheet 継続): ' + e.message);
+  }
+}
+
+export function getSkuMappings() {
+  const mode = getSkuMappingSource();
+  if (mode === 'mirror') return getSkuMappingsFromMirror();
+  const sheetRows = getSkuMappingsFromSheet();
+  if (mode === 'shadow') runShadowDiff(sheetRows); // 本番は必ず sheet を返す
+  return sheetRows;
+}
+
 export function getSkuMapping(amazonSku) {
+  const mode = getSkuMappingSource();
+  if (mode === 'mirror') return getSkuMappingFromMirror(amazonSku);
+  // sheet / shadow: 単票は sheet を返す (差分集計は getSkuMappings 側で TTL 付き実行)
   return queryOne('SELECT * FROM sku_mapping WHERE amazon_sku = ?', [amazonSku]);
 }
 
@@ -1398,6 +1586,13 @@ export function updateFnskuBatch(items) {
     for (const item of items) {
       if (item.sku && item.fnsku) {
         db.run('UPDATE sku_mapping SET fnsku = ? WHERE amazon_sku = ?', [item.fnsku, item.sku]);
+        // dual-write: mirror モードの正となる fba_sku_attrs にも追従 (falsy は無視 = 旧FNSKU保持)
+        db.run(
+          `INSERT INTO fba_sku_attrs (amazon_sku, fnsku, source, updated_at)
+           VALUES (?, ?, 'restock', datetime('now','localtime'))
+           ON CONFLICT(amazon_sku) DO UPDATE SET fnsku=excluded.fnsku, source='restock', updated_at=excluded.updated_at`,
+          [item.sku, item.fnsku]
+        );
       }
     }
     db.run('COMMIT');
@@ -1419,6 +1614,13 @@ export function syncFnskuBatch(items) {
     for (const item of items) {
       if (!item.sku) continue;
       db.run('UPDATE sku_mapping SET fnsku = ? WHERE amazon_sku = ?', [item.fnsku || null, item.sku]);
+      // dual-write: null も反映 (FNSKU が外れた商品をクリア)。sku_mapping に無い mirror-only SKU でも upsert。
+      db.run(
+        `INSERT INTO fba_sku_attrs (amazon_sku, fnsku, source, updated_at)
+         VALUES (?, ?, 'planning', datetime('now','localtime'))
+         ON CONFLICT(amazon_sku) DO UPDATE SET fnsku=excluded.fnsku, source='planning', updated_at=excluded.updated_at`,
+        [item.sku, item.fnsku || null]
+      );
     }
     db.run('COMMIT');
     saveToFile();

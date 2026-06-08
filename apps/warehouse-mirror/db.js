@@ -108,6 +108,8 @@ function createTables() {
   //   - source_updated_at は m_sku_master.updated_at
   //   - synced_at はこのミラーへの取り込み時刻
   //   - source='auto' は SKU管理統合 Step 4-0 で廃止だが、過渡期 row の互換のため列値は許容
+  //   - sort_order は m_sku_components.sort_order 由来。セット構成の表示順 + 代表 ne_code
+  //     (sort_order=0) の確定に使う。FBA 在庫補充の mirror 直読み adapter (primary ne_code 決定) が依存。
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_sku_resolved (
     seller_sku         TEXT NOT NULL,
     ne_code            TEXT NOT NULL,
@@ -115,9 +117,12 @@ function createTables() {
     source             TEXT NOT NULL CHECK (source IN ('master', 'auto')),
     商品名             TEXT,
     source_updated_at  TEXT,
+    sort_order         INTEGER NOT NULL DEFAULT 0,
     synced_at          TEXT NOT NULL,
     PRIMARY KEY (seller_sku, ne_code)
   )`);
+  // 既存 mirror DB への migration (CREATE TABLE IF NOT EXISTS は新列を足さない)
+  addColumnIfMissing('mirror_sku_resolved', 'sort_order', 'INTEGER NOT NULL DEFAULT 0');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirres_sku ON mirror_sku_resolved(seller_sku)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirres_ne ON mirror_sku_resolved(ne_code)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirres_src ON mirror_sku_resolved(source)');

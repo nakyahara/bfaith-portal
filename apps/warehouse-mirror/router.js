@@ -104,70 +104,97 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
       log.push(`set_components: ${set_components.length}件`);
     }
 
-    // sku_resolved（全件置換、新規ツールはこちらを参照）
-    // 0件payloadも受け付ける（meta.clear_sku_resolved=trueで明示クリア可、無くても全件置換動作）
-    if (req.body.sku_resolved && Array.isArray(req.body.sku_resolved)) {
-      const resolved = req.body.sku_resolved;
-      const tx = db.transaction(() => {
-        db.exec('DELETE FROM mirror_sku_resolved');
-        const stmt = db.prepare(`INSERT INTO mirror_sku_resolved (
-          seller_sku, ne_code, quantity, source, 商品名, source_updated_at, synced_at
-        ) VALUES (?,?,?,?,?,?,?)`);
-        for (const r of resolved) {
-          stmt.run(
-            r.seller_sku,
-            r.ne_code,
-            r.quantity ?? r.数量 ?? 1,
-            r.source,
-            r.商品名 ?? null,
-            r.source_updated_at ?? null,
-            now
-          );
-        }
-      });
-      tx();
-      log.push(`sku_resolved: ${resolved.length}件`);
-    }
-
-    // sku_master (1 SKU = 1 行、Sheets 商品コード変換テーブルとの差分検出用)
+    // sku_resolved + sku_master（SKUマスタ由来のペア。1 transaction で atomic に適用）
     //
-    // fail-closed 設計 (Codex review 2026-05-13 round 1 + round 2 反映):
-    //   N>0 件 → 全件置換 (DELETE → INSERT)
-    //   0 件 + meta.clear_sku_master=true → 明示 clear、DELETE のみ実行
-    //     ※ daily sync (sync-to-render.js) はこの flag を絶対に自動付与しない設計。
-    //        手動オペ (curl 直送 / 管理スクリプト) 専用の escape hatch。
-    //   0 件 + flag 無し → 反映拒否 (上流異常 / worktree 別 DB / 送信側 bug の可能性)、前回の mirror 保持
-    //
-    // 過去事故 (2026-05-08〜10 Yahoo VPS proxy regression: 取得失敗を「空配列の正常同期」として
-    // 流し mirror 3 日間全空文字) と (2026-05-06 worktree で別 DB が静かに分裂) の再発防止。
-    // daily sync 側で 0 件のときに送信スキップする (sync-to-render.js) ので、通常 daily sync で
-    // 当ブランチ (0 件 + flag 無し) に入ること自体が異常検知ポイント。
-    if (req.body.sku_master !== undefined && Array.isArray(req.body.sku_master)) {
-      const masterRows = req.body.sku_master;
-      const explicitClear = req.body.meta?.clear_sku_master === true;
-      if (masterRows.length === 0 && !explicitClear) {
-        log.push(`sku_master: 0件 + clear flag 無し → 反映拒否 (前回 mirror を保持)`);
-        console.warn('[Mirror] sku_master 0件 + meta.clear_sku_master 無し: 上流異常の可能性、mirror_sku_master は前回値を保持');
+    // fail-closed + ペア整合 設計 (2026-06-07 FBA SKUマスタ直結 PR1、Codex round1〜4 反映):
+    //   ・両者は同一 m_sku_master スナップショット由来 (sku_resolved=seller_sku×ne_code 派生、
+    //     sku_master=1 SKU 1 行)。FBA 在庫補充の mirror 直読み / recent-missing-candidates が
+    //     「新しい master + 古い components」(またはその逆) を消費すると、誤った/欠落 NE コードを
+    //     掴む穴になるため、受信側でも必ずペアで整合させる。
+    //   ・各キー: N>0 → 全件置換 (DELETE→INSERT) / 0 件 + clear flag → 明示 clear (DELETE のみ) /
+    //     0 件 + flag 無し → 異常。**片側でも異常ならペア全体を未反映** (前回 mirror を保持)。
+    //   ・反映する場合は mirror_sku_resolved と mirror_sku_master の DELETE/INSERT を
+    //     **1 つの db.transaction** にまとめ、片方 commit 後にもう片方が失敗して split snapshot が
+    //     残る事故 (round4 High) を防ぐ。
+    //   ・clear flag (clear_sku_resolved / clear_sku_master) は daily sync では絶対に付与しない手動オペ専用。
+    //   過去事故 (2026-05-08〜10 Yahoo proxy regression で mirror 全空 / 2026-05-06 worktree 別 DB 分裂) の再発防止。
+    const hasResolved = req.body.sku_resolved !== undefined && Array.isArray(req.body.sku_resolved);
+    const hasMaster = req.body.sku_master !== undefined && Array.isArray(req.body.sku_master);
+    if (hasResolved || hasMaster) {
+      const resolved = hasResolved ? req.body.sku_resolved : null;
+      const masterRows = hasMaster ? req.body.sku_master : null;
+      const resolvedClear = req.body.meta?.clear_sku_resolved === true;
+      const masterClear = req.body.meta?.clear_sku_master === true;
+      // 各キーの「意図」を分類し、ペアとして整合する組合せだけ反映する (Codex round5 High)。
+      //   'apply'   : N>0 件 → 全件置換
+      //   'clear'   : 0 件 + clear flag → 明示クリア (手動オペ専用)
+      //   'abnormal': 0 件 + flag 無し → 上流異常
+      //   'absent'  : キー自体が payload に無い
+      // 整合する組合せは (apply, apply) と (clear, clear) のみ。それ以外 (片側のみ / apply×clear /
+      //   abnormal を含む) は split snapshot を作るため両テーブルとも未反映で前回 mirror を保持する。
+      const intentOf = (has, rows, clear) =>
+        !has ? 'absent' : (rows.length > 0 ? 'apply' : (clear ? 'clear' : 'abnormal'));
+      const resolvedIntent = intentOf(hasResolved, resolved, resolvedClear);
+      const masterIntent = intentOf(hasMaster, masterRows, masterClear);
+      const pairConsistent =
+        (resolvedIntent === 'apply' && masterIntent === 'apply') ||
+        (resolvedIntent === 'clear' && masterIntent === 'clear');
+      if (!pairConsistent) {
+        log.push(`sku_resolved/sku_master: ペア不整合のため反映拒否 (resolved=${resolvedIntent} master=${masterIntent}、前回 mirror を保持)`);
+        console.warn(`[Mirror] sku_resolved/sku_master ペア不整合 (resolved=${resolvedIntent}, master=${masterIntent}) → 両テーブルとも前回値を保持 (split snapshot 防止)`);
       } else {
         const tx = db.transaction(() => {
-          db.exec('DELETE FROM mirror_sku_master');
-          if (masterRows.length > 0) {
-            const stmt = db.prepare(`INSERT INTO mirror_sku_master (
-              seller_sku, 商品名, source_created_at, source_updated_at, synced_at
-            ) VALUES (?,?,?,?,?)`);
-            for (const r of masterRows) {
-              stmt.run(
-                r.seller_sku,
-                r.商品名 ?? null,
-                r.source_created_at ?? null,
-                r.source_updated_at ?? null,
-                now
-              );
+          if (hasResolved) {
+            db.exec('DELETE FROM mirror_sku_resolved');
+            if (resolved.length > 0) {
+              const stmt = db.prepare(`INSERT INTO mirror_sku_resolved (
+                seller_sku, ne_code, quantity, source, 商品名, source_updated_at, sort_order, synced_at
+              ) VALUES (?,?,?,?,?,?,?,?)`);
+              // 旧送信側 (sort_order 未送信) との互換: payload は seller_sku 内で sort_order 昇順に
+              // 並んでいる前提なので、sort_order が欠落している行は到着順の連番で補完する
+              // (全行 0 に潰さない)。新送信側は sort_order を明示するのでそのまま使う。
+              const seqBySku = new Map();
+              for (const r of resolved) {
+                let sortOrder = r.sort_order;
+                if (sortOrder == null) {
+                  const n = seqBySku.get(r.seller_sku) ?? 0;
+                  sortOrder = n;
+                  seqBySku.set(r.seller_sku, n + 1);
+                }
+                stmt.run(
+                  r.seller_sku,
+                  r.ne_code,
+                  r.quantity ?? r.数量 ?? 1,
+                  r.source,
+                  r.商品名 ?? null,
+                  r.source_updated_at ?? null,
+                  sortOrder,
+                  now
+                );
+              }
+            }
+          }
+          if (hasMaster) {
+            db.exec('DELETE FROM mirror_sku_master');
+            if (masterRows.length > 0) {
+              const stmt = db.prepare(`INSERT INTO mirror_sku_master (
+                seller_sku, 商品名, source_created_at, source_updated_at, synced_at
+              ) VALUES (?,?,?,?,?)`);
+              for (const r of masterRows) {
+                stmt.run(
+                  r.seller_sku,
+                  r.商品名 ?? null,
+                  r.source_created_at ?? null,
+                  r.source_updated_at ?? null,
+                  now
+                );
+              }
             }
           }
         });
         tx();
-        log.push(`sku_master: ${masterRows.length}件${explicitClear && masterRows.length === 0 ? ' (explicit clear)' : ''}`);
+        if (hasResolved) log.push(`sku_resolved: ${resolved.length}件${resolvedClear && resolved.length === 0 ? ' (explicit clear)' : ''}`);
+        if (hasMaster) log.push(`sku_master: ${masterRows.length}件${masterClear && masterRows.length === 0 ? ' (explicit clear)' : ''}`);
       }
     }
 
@@ -2198,11 +2225,13 @@ router.get('/api/status', (req, res) => {
       const r = db.prepare(`SELECT
         COUNT(*) AS cnt,
         SUM(CASE WHEN source='master' THEN 1 ELSE 0 END) AS master_cnt,
-        SUM(CASE WHEN source='auto'   THEN 1 ELSE 0 END) AS auto_cnt
+        SUM(CASE WHEN source='auto'   THEN 1 ELSE 0 END) AS auto_cnt,
+        MAX(synced_at) AS synced
         FROM mirror_sku_resolved`).get();
       status.sku_resolved_count = r.cnt;
       status.sku_resolved_master_count = r.master_cnt ?? 0;
       status.sku_resolved_auto_count = r.auto_cnt ?? 0;
+      status.sku_resolved_synced_at = r.synced ?? null;
     } catch {
       status.sku_resolved_count = 0;
     }
@@ -2258,15 +2287,20 @@ router.get('/api/status', (req, res) => {
 //   {
 //     since_days: 7,
 //     server_time_utc: 'YYYY-MM-DDTHH:MM:SS.fffZ',
-//     mirror_last_synced_at: 'YYYY-MM-DD HH:MM:SS' | null,    // mirror_sync_status.last_sync
-//     mirror_sku_master_synced_at: 'YYYY-MM-DD HH:MM:SS' | null, // 当テーブルの最新 synced_at
+//     mirror_last_synced_at: 'YYYY-MM-DD HH:MM:SS' | null,    // ★SKUペアの有効鮮度 (pair一致時=masterSyncedAt / 不一致時=null)
+//     mirror_global_last_synced_at: 'YYYY-MM-DD HH:MM:SS' | null, // mirror_sync_status.last_sync (観測用)
+//     mirror_sku_master_synced_at: 'YYYY-MM-DD HH:MM:SS' | null, // mirror_sku_master の最新 synced_at
+//     mirror_sku_resolved_synced_at: 'YYYY-MM-DD HH:MM:SS' | null, // mirror_sku_resolved の最新 synced_at
+//     pair_consistent: <boolean>,                            // master/components の synced_at 一致 (不一致なら items 空)
 //     count: <number>,
-//     items: [ { seller_sku, 商品名, source_updated_at: 'ISO 8601 Z' }, ... ]
+//     items: [ { seller_sku, 商品名, source_updated_at: 'ISO 8601 Z', components: [{ne_code, quantity, sort_order}] }, ... ]
 //   }
 //
-// 仕様メモ (Codex review 2026-05-13 反映):
+// 仕様メモ (Codex review 2026-05-13 + 2026-06-07 PR1 反映):
 //   ・since_days は固定 7、パラメータ受け付けない (誤用防止)
-//   ・GAS 側はレスポンスの mirror_last_synced_at が当日かを必ず検証 (古ければ処理停止)
+//   ・GAS 側はレスポンスの mirror_last_synced_at が当日かを必ず検証 (古ければ処理停止)。
+//     この endpoint の mirror_last_synced_at は global last_sync ではなく SKUペアの有効鮮度を返すので、
+//     マスタペアがスキップ/不整合の同期では古い値/null になり、GAS の既存 staleness チェックが自動停止する。
 //   ・Cache-Control: no-store
 //   ・件数 0 でも 200 で返す (差分判定は呼び出し側)
 function requireReadToken(req, res, next) {
@@ -2294,58 +2328,85 @@ router.get('/api/sku-master/recent-missing-candidates', requireReadToken, (req, 
     // GAS 側の「商品コード変換テーブル」直接追記運用 (2026-05-15 仕様変更) のため、
     // components (NE商品コード + 数量) を JSON 配列で返す。セット商品 (1 SKU が複数 NE) は
     // GAS 側で components.length 行に展開して書き込む。
-    const masters = db.prepare(`
-      SELECT seller_sku, 商品名, source_updated_at
-      FROM mirror_sku_master
-      WHERE source_updated_at IS NOT NULL
-        AND source_updated_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days')
-      ORDER BY source_updated_at DESC, seller_sku
-    `).all();
+    // master / components / 鮮度timestamp を 1 read transaction で読む (Codex round6 High)。
+    //   GET 中に sync commit が挟まると、別々の autocommit SELECT では
+    //   「旧 master snapshot + 新 components snapshot」(またはその逆) の read-side split が成立し、
+    //   GAS / FBA 直読みが「片側だけ新しい」入力を消費し得る。同一スナップショットを保証する。
+    const snap = db.transaction(() => {
+      const masters = db.prepare(`
+        SELECT seller_sku, 商品名, source_updated_at
+        FROM mirror_sku_master
+        WHERE source_updated_at IS NOT NULL
+          AND source_updated_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days')
+        ORDER BY source_updated_at DESC, seller_sku
+      `).all();
+      // mirror_sku_resolved には source='master' の component 行が入っている。
+      // sort_order でセット構成順を再現 (代表 ne_code = sort_order 0)。
+      // GAS は components を順に展開して書き込むため、ne_code 順に潰すと代表/構成順がずれる。
+      let resolvedRows = [];
+      if (masters.length > 0) {
+        const placeholders = masters.map(() => '?').join(',');
+        resolvedRows = db.prepare(`
+          SELECT seller_sku, ne_code, quantity, sort_order
+          FROM mirror_sku_resolved
+          WHERE seller_sku IN (${placeholders})
+            AND source = 'master'
+          ORDER BY seller_sku, sort_order, ne_code
+        `).all(...masters.map(m => m.seller_sku));
+      }
+      const lastSyncRow = db.prepare(`SELECT value FROM mirror_sync_status WHERE key='last_sync'`).get();
+      const masterSyncRow = db.prepare(`SELECT MAX(synced_at) AS s FROM mirror_sku_master`).get();
+      const resolvedSyncRow = db.prepare(`SELECT MAX(synced_at) AS s FROM mirror_sku_resolved`).get();
+      return {
+        masters,
+        resolvedRows,
+        mirrorLastSync: lastSyncRow?.value ?? null,
+        masterSyncedAt: masterSyncRow?.s ?? null,
+        resolvedSyncedAt: resolvedSyncRow?.s ?? null,
+      };
+    });
+    const { masters, resolvedRows, mirrorLastSync, masterSyncedAt, resolvedSyncedAt } = snap();
 
-    // mirror_sku_resolved には source='master' の component 行が入っている
-    // (sync-to-render.js が m_sku_components × m_sku_master を JOIN して送ってる)
-    // 該当 SKU の component 行を取り出して seller_sku 単位でグループ化
-    let resolvedRows = [];
-    if (masters.length > 0) {
-      const placeholders = masters.map(() => '?').join(',');
-      resolvedRows = db.prepare(`
-        SELECT seller_sku, ne_code, quantity
-        FROM mirror_sku_resolved
-        WHERE seller_sku IN (${placeholders})
-          AND source = 'master'
-        ORDER BY seller_sku, ne_code
-      `).all(...masters.map(m => m.seller_sku));
-    }
+    // master と components の最新 synced_at が一致しないのは split snapshot
+    // (旧バージョン由来 or 手動 DB 変更)。受信側は対で atomic 更新するので通常は必ず一致する。
+    // fail-closed: 不一致なら items を空で返し、GAS が「新 master + 古い components」等を
+    // 商品コード変換テーブルに書き込まないよう停止させる (今回の発端バグと同種の欠落防止)。
+    const pairConsistent = masterSyncedAt === resolvedSyncedAt;
+
     const componentsBySku = new Map();
-    for (const r of resolvedRows) {
-      if (!componentsBySku.has(r.seller_sku)) componentsBySku.set(r.seller_sku, []);
-      componentsBySku.get(r.seller_sku).push({ ne_code: r.ne_code, quantity: r.quantity });
+    if (pairConsistent) {
+      for (const r of resolvedRows) {
+        if (!componentsBySku.has(r.seller_sku)) componentsBySku.set(r.seller_sku, []);
+        componentsBySku.get(r.seller_sku).push({ ne_code: r.ne_code, quantity: r.quantity, sort_order: r.sort_order });
+      }
+    } else {
+      console.warn(`[sku-master/recent-missing-candidates] pair stale: master_synced=${masterSyncedAt} resolved_synced=${resolvedSyncedAt} → items 空で返す (GAS 停止、split snapshot 消費防止)`);
     }
-    const items = masters.map(m => ({
+    const items = pairConsistent ? masters.map(m => ({
       seller_sku: m.seller_sku,
       商品名: m['商品名'],
       source_updated_at: m.source_updated_at,
       components: componentsBySku.get(m.seller_sku) || [],
-    }));
+    })) : [];
 
-    // mirror freshness 情報 (GAS 側で stale 判定に使う)
-    let mirrorLastSync = null;
-    let masterSyncedAt = null;
-    try {
-      const r = db.prepare(`SELECT value FROM mirror_sync_status WHERE key='last_sync'`).get();
-      mirrorLastSync = r?.value ?? null;
-    } catch {}
-    try {
-      const r = db.prepare(`SELECT MAX(synced_at) AS s FROM mirror_sku_master`).get();
-      masterSyncedAt = r?.s ?? null;
-    } catch {}
+    // mirror_last_synced_at は GAS が live append の鮮度判定 (当日/26h 以内か) に使う値。
+    // この endpoint は SKU 専用なので、global な mirror_sync_status.last_sync ではなく
+    // 「SKU ペアの有効鮮度」を返す (Codex PR1 round7 adjudication)。
+    //   マスタペアがスキップされた同期 (送信側 masterPairOk=false) では last_sync は進むが
+    //   mirror_sku_master/_resolved の synced_at は古いまま → masterSyncedAt を返せば GAS の
+    //   既存 staleness チェックが自動的に stale 判定して停止する (GAS 契約変更も時間閾値も不要)。
+    //   pair 不整合時は null (= GAS は停止)。global 値は観測用に別フィールドで併記。
+    const effectiveSkuSyncedAt = pairConsistent ? masterSyncedAt : null;
 
     res.setHeader('Cache-Control', 'no-store');
     res.json({
       since_days: SINCE_DAYS,
       server_time_utc: new Date().toISOString(),
-      mirror_last_synced_at: mirrorLastSync,
+      mirror_last_synced_at: effectiveSkuSyncedAt,
+      mirror_global_last_synced_at: mirrorLastSync,
       mirror_sku_master_synced_at: masterSyncedAt,
+      mirror_sku_resolved_synced_at: resolvedSyncedAt,
+      pair_consistent: pairConsistent,
       count: items.length,
       items,
     });

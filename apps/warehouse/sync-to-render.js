@@ -160,70 +160,82 @@ export async function syncToRender() {
   //   - source は常に 'master' (auto fallback は Step 4-0 で撤廃済み)
   //   - 商品名: m_sku_master.商品名 (社内独自名)
   //   - source_updated_at: m_sku_master.updated_at
-  let sku_resolved = [];
-  try {
-    sku_resolved = db.prepare(`
-      SELECT
-        c.seller_sku,
-        c.ne_code,
-        c.数量 AS quantity,
-        'master' AS source,
-        m.商品名,
-        m.updated_at AS source_updated_at
-      FROM m_sku_components c
-      INNER JOIN m_sku_master m ON c.seller_sku = m.seller_sku
-      ORDER BY c.seller_sku, c.sort_order
-    `).all();
-    console.log(`[Sync→Render]   sku_resolved: ${sku_resolved.length}件 (全 master、m_sku_components 直結)`);
-  } catch (e) {
-    console.log(`[Sync→Render]   sku_resolved: 取得失敗（スキップ）: ${e.message}`);
-  }
-
   // 2b-2b. sku_master (1 SKU = 1 行、Sheets 商品コード変換テーブルとの差分検出用)
-  //   sku_resolved は seller_sku × ne_code 粒度 (派生) なので、SKU 一覧用途には不自然
-  //   m_sku_master.{seller_sku, 商品名, created_at, updated_at} をそのまま 1 SKU 1 行で送る
-  //   (Codex review 2026-05-13: A''案 = master の mirror を独立に持つ)
+  //   sku_resolved は seller_sku × ne_code 粒度 (派生)、sku_master は 1 SKU 1 行 (一覧/差分用)。
+  //   両者は同一 m_sku_master スナップショット由来 (Codex review 2026-05-13: A''案)。
   //
-  // ★ fail-closed 設計 (Codex round 1 + round 2 反映):
-  //   ・SELECT 失敗 → payload に sku_master キーを含めない → mirror 前回値保持
-  //   ・SELECT 成功 0 件 → 通常運用で m_sku_master が 0 件になることはない (新規初期化のみ)
-  //     worktree で空 DB を見ている / DB 壊れ / 初期セットアップ前 等の異常を示唆
-  //     → **送信スキップ** + GChat warn 通知 + mirror 前回値保持
-  //     daily sync では絶対に自動 clear flag を立てない (round 2 high: 自動付与は防御の素通し)
-  //   ・SELECT 成功 N>0 件 → 通常通り全件置換 payload を送る
-  //
-  //   過去事故 (2026-05-08〜10 Yahoo VPS proxy regression: 取得失敗を「空配列の正常同期」として
-  //   流し mirror 3 日間全空文字) + (2026-05-06 worktree で別 DB が静かに分裂) の再発防止。
-  //   mirror_sku_master を明示的に全消ししたい運用 (リセット時等) は別手段で行う想定:
-  //     例) curl で meta.clear_sku_master=true を付けた payload を直送、or 手動 DB 削除。
-  // sku_master_state は後段の verify / allMatch / 通知判定で参照
-  //   'ok'             : SELECT 成功かつ N>0 件、payload 送信
-  //   'empty_skipped'  : SELECT 成功 0 件、送信スキップ (異常検知ポイント)
-  //   'select_failed'  : SELECT 失敗 (schema drift / DB lock 等)、送信スキップ
+  // ★ fail-closed + 一貫スナップショット設計 (2026-06-07 FBA SKUマスタ直結 PR1、Codex round1〜3 反映):
+  //   ・両 SELECT を 1 つの db.transaction で読む。別々の autocommit SELECT だと間にマスタ更新が
+  //     commit され「旧 components + 新 master」の不整合 payload が成立する (round3 High)。
+  //     transaction で同一スナップショットを保証する。better-sqlite3 transaction は同期実行なので
+  //     GChat notify(async) は transaction の外で行う。
+  //   ・state: 'ok'(成功&N>0) / 'empty_skipped'(成功0件) / 'select_failed'(SELECT失敗)。
+  //     非ok のテーブルは payload に乗せず mirror 前回値を保持 (受信側 DELETE→INSERT の全消し事故防止)。
+  //     さらに後段で「両方 ok のときだけ対で送る」(masterPairOk) ため、片側更新による鮮度ずれも防ぐ。
+  //   ・明示全消し (clear_sku_resolved / clear_sku_master flag) は daily sync では絶対に発行しない。
+  //   過去事故 (2026-05-08〜10 Yahoo proxy regression で mirror 全空 / 2026-05-06 worktree 別 DB 分裂) の再発防止。
+  let sku_resolved = null;
+  let sku_resolved_state = 'ok';
   let sku_master = null;
   let sku_master_state = 'ok';
+  let masterSelectError = null;
   try {
-    const rows = db.prepare(`
-      SELECT
-        seller_sku,
-        商品名,
-        created_at AS source_created_at,
-        updated_at AS source_updated_at
-      FROM m_sku_master
-      ORDER BY seller_sku
-    `).all();
-    if (rows.length === 0) {
-      sku_master_state = 'empty_skipped';
-      console.warn('[Sync→Render]   sku_master: SELECT 成功 0件 → 送信スキップ (worktree/別DB/壊れたDB の可能性、mirror は前回値を保持)');
-      await notify('⚠️ *Sync sku_master 異常*\nm_sku_master が 0 件。送信スキップ。worktree 別 DB / 壊れた DB / 初期セットアップ前の可能性を疑ってください。');
+    const readMasterSnapshot = db.transaction(() => {
+      const resolvedRows = db.prepare(`
+        SELECT
+          c.seller_sku,
+          c.ne_code,
+          c.数量 AS quantity,
+          'master' AS source,
+          m.商品名,
+          m.updated_at AS source_updated_at,
+          c.sort_order
+        FROM m_sku_components c
+        INNER JOIN m_sku_master m ON c.seller_sku = m.seller_sku
+        ORDER BY c.seller_sku, c.sort_order
+      `).all();
+      const masterRows = db.prepare(`
+        SELECT
+          seller_sku,
+          商品名,
+          created_at AS source_created_at,
+          updated_at AS source_updated_at
+        FROM m_sku_master
+        ORDER BY seller_sku
+      `).all();
+      return { resolvedRows, masterRows };
+    });
+    const { resolvedRows, masterRows } = readMasterSnapshot();
+    if (resolvedRows.length > 0) {
+      sku_resolved = resolvedRows;
+      console.log(`[Sync→Render]   sku_resolved: ${resolvedRows.length}件 (全 master、m_sku_components 直結)`);
     } else {
-      sku_master = rows;
-      console.log(`[Sync→Render]   sku_master: ${rows.length}件 (1 SKU = 1 行)`);
+      sku_resolved_state = 'empty_skipped';
+    }
+    if (masterRows.length > 0) {
+      sku_master = masterRows;
+      console.log(`[Sync→Render]   sku_master: ${masterRows.length}件 (1 SKU = 1 行)`);
+    } else {
+      sku_master_state = 'empty_skipped';
     }
   } catch (e) {
+    // transaction は atomic に失敗するため、どちらの SELECT が落ちても両方 select_failed 扱い
+    sku_resolved_state = 'select_failed';
     sku_master_state = 'select_failed';
-    console.error(`[Sync→Render]   sku_master: 取得失敗（送信スキップ、mirror は前回値を保持）: ${e.message}`);
-    await notify(`⚠️ *Sync sku_master 取得失敗*\n${e.message.slice(0, 300)}\n送信スキップ、mirror は前回値を保持。schema drift / DB lock を疑ってください。`);
+    masterSelectError = e.message;
+    console.error(`[Sync→Render]   sku_resolved/sku_master: 取得失敗（送信スキップ、mirror は前回値を保持）: ${e.message}`);
+  }
+  // notify は transaction 外で await。state ごとに 1 回だけ通知。
+  if (sku_resolved_state === 'empty_skipped') {
+    console.warn('[Sync→Render]   sku_resolved: SELECT 成功 0件 → 送信スキップ (worktree/別DB/壊れたDB の可能性、mirror は前回値を保持)');
+    await notify('⚠️ *Sync sku_resolved 異常*\nm_sku_components が 0 件。送信スキップ。worktree 別 DB / 壊れた DB / 初期セットアップ前の可能性を疑ってください。');
+  }
+  if (sku_master_state === 'empty_skipped') {
+    console.warn('[Sync→Render]   sku_master: SELECT 成功 0件 → 送信スキップ (worktree/別DB/壊れたDB の可能性、mirror は前回値を保持)');
+    await notify('⚠️ *Sync sku_master 異常*\nm_sku_master が 0 件。送信スキップ。worktree 別 DB / 壊れた DB / 初期セットアップ前の可能性を疑ってください。');
+  }
+  if (masterSelectError !== null) {
+    await notify(`⚠️ *Sync sku_resolved/sku_master 取得失敗*\n${masterSelectError.slice(0, 300)}\n送信スキップ、mirror は前回値を保持。schema drift / DB lock を疑ってください。`);
   }
 
   // 2c. amazon_sku_fees（手数料キャッシュ）
@@ -317,13 +329,23 @@ export async function syncToRender() {
 
   try {
     // Part 1: マスタデータ
-    //   sku_master は SELECT 成功 & N>0 件のときだけ payload に含める (fail-closed)。
+    //   sku_resolved / sku_master は SELECT 成功 & N>0 件のときだけ payload に含める (fail-closed)。
     //   SELECT 失敗 / 0 件 / その他異常時は payload に乗せない → 受信側は前回 mirror を保持。
-    //   明示的な全消し (clear_sku_master flag) は daily sync では絶対に発行しない (round 2 high)。
+    //   明示的な全消し (clear_sku_resolved / clear_sku_master flag) は daily sync では絶対に発行しない (round 2 high)。
     const masterPart = {
-      products, set_components, sku_resolved, amazon_sku_fees, rakuten_sku_map, inv_daily_summary,
+      products, set_components, amazon_sku_fees, rakuten_sku_map, inv_daily_summary,
     };
-    if (Array.isArray(sku_master) && sku_master.length > 0) {
+    // sku_resolved と sku_master は同一の m_sku_master スナップショット由来。
+    // 「両方とも state=ok かつ N>0」のときだけ対で送る (Codex PR1 review round2 High)。
+    //   片方だけ mirror を更新すると、recent-missing-candidates (GAS が読む) が
+    //   「新しい master + 古い/欠落 components」を返し、商品コード変換テーブルに誤った/欠落 NE コードを
+    //   書き込む穴になる (今回の発端バグと同種)。どちらか異常なら両方スキップし前回 mirror を保持。
+    //   ※ どちらか異常時は下段の sku_master_failure / sku_resolved_failure で run 自体が ok:false になり retry される。
+    const masterPairOk = sku_resolved_state === 'ok' && sku_master_state === 'ok';
+    if (masterPairOk && Array.isArray(sku_resolved) && sku_resolved.length > 0) {
+      masterPart.sku_resolved = sku_resolved;
+    }
+    if (masterPairOk && Array.isArray(sku_master) && sku_master.length > 0) {
       masterPart.sku_master = sku_master;
     }
     await sendPart(masterPart, 'マスタ');
@@ -406,6 +428,12 @@ export async function syncToRender() {
         sent: Array.isArray(sku_master) ? sku_master.length : 0,
         received: status.sku_master_count ?? 0,
       },
+      // FBA 在庫補充の mirror 直読み入力。sku_master と同様 state + count 突合を verify に乗せる。
+      sku_resolved: {
+        state: sku_resolved_state,
+        sent: Array.isArray(sku_resolved) ? sku_resolved.length : 0,
+        received: status.sku_resolved_count ?? 0,
+      },
     };
 
     // stock_snapshot: fetched=false（SELECT失敗で同期スキップ）なら検証対象外。
@@ -420,18 +448,23 @@ export async function syncToRender() {
     const skuMasterMatch = sku_master_state === 'ok'
       && verify.sku_master.sent === verify.sku_master.received;
 
+    // sku_resolved も sku_master と同方針: 状態 ok かつ 送受信件数一致のときだけ match
+    const skuResolvedMatch = sku_resolved_state === 'ok'
+      && verify.sku_resolved.sent === verify.sku_resolved.received;
+
     const allMatch = verify.products.sent === verify.products.received
       && verify.monthly.sent === verify.monthly.received
       && verify.daily.sent === verify.daily.received
       && stockMatch
-      && skuMasterMatch;
+      && skuMasterMatch
+      && skuResolvedMatch;
 
     if (allMatch) {
       console.log(`[Sync→Render] ✅ 検証OK — 全データ一致`);
       const stockLine = stockSyncPlan.fetched
         ? `\n月末在庫: ${verify.stock_snapshot.received}件`
         : `\n月末在庫: 取得スキップ`;
-      await notify(`✅ *Render同期完了*\n商品マスタ: ${verify.products.received}件\n月次集計: ${verify.monthly.received}件\n日次集計: ${verify.daily.received}件${stockLine}\nSKUマスタ: ${verify.sku_master.received}件\n同期時刻: ${ts}`);
+      await notify(`✅ *Render同期完了*\n商品マスタ: ${verify.products.received}件\n月次集計: ${verify.monthly.received}件\n日次集計: ${verify.daily.received}件${stockLine}\nSKUマスタ: ${verify.sku_master.received}件\nSKU解決: ${verify.sku_resolved.received}件\n同期時刻: ${ts}`);
     } else {
       console.log(`[Sync→Render] ⚠️ 検証NG — データ不一致`);
       console.log(`  products: 送信${verify.products.sent} / 受信${verify.products.received}`);
@@ -439,10 +472,14 @@ export async function syncToRender() {
       console.log(`  daily: 送信${verify.daily.sent} / 受信${verify.daily.received}`);
       console.log(`  stock_snapshot: 送信${verify.stock_snapshot.sent} / 受信${verify.stock_snapshot.received} / fetched=${stockSyncPlan.fetched}`);
       console.log(`  sku_master: 状態=${sku_master_state} / 送信${verify.sku_master.sent} / 受信${verify.sku_master.received}`);
+      console.log(`  sku_resolved: 状態=${sku_resolved_state} / 送信${verify.sku_resolved.sent} / 受信${verify.sku_resolved.received}`);
       const skuMasterLine = sku_master_state === 'ok'
         ? `SKUマスタ: ${verify.sku_master.sent}→${verify.sku_master.received}`
         : `SKUマスタ: 状態=${sku_master_state} (送信スキップ、mirror=${verify.sku_master.received})`;
-      await notify(`⚠️ *Render同期 データ不一致*\n商品: ${verify.products.sent}→${verify.products.received}\n月次: ${verify.monthly.sent}→${verify.monthly.received}\n日次: ${verify.daily.sent}→${verify.daily.received}\n在庫: ${verify.stock_snapshot.sent}→${verify.stock_snapshot.received}${stockSyncPlan.fetched ? '' : ' (skipped)'}\n${skuMasterLine}`);
+      const skuResolvedLine = sku_resolved_state === 'ok'
+        ? `SKU解決: ${verify.sku_resolved.sent}→${verify.sku_resolved.received}`
+        : `SKU解決: 状態=${sku_resolved_state} (送信スキップ、mirror=${verify.sku_resolved.received})`;
+      await notify(`⚠️ *Render同期 データ不一致*\n商品: ${verify.products.sent}→${verify.products.received}\n月次: ${verify.monthly.sent}→${verify.monthly.received}\n日次: ${verify.daily.sent}→${verify.daily.received}\n在庫: ${verify.stock_snapshot.sent}→${verify.stock_snapshot.received}${stockSyncPlan.fetched ? '' : ' (skipped)'}\n${skuMasterLine}\n${skuResolvedLine}`);
     }
 
     // ok の判定方針 (Codex round 4 high 反映):
@@ -454,7 +491,15 @@ export async function syncToRender() {
     const sku_master_failure =
       sku_master_state !== 'ok' ||
       verify.sku_master.sent !== verify.sku_master.received;
-    return { ok: !sku_master_failure, verify };
+    // sku_resolved は FBA 在庫補充の mirror 直読み入力になるため、状態異常 (送信スキップ) も
+    // 送受信件数不一致も ok:false にして daily-sync 側で retry-failed-jobs に拾わせる (sku_master と同方針)。
+    const sku_resolved_failure =
+      sku_resolved_state !== 'ok' ||
+      verify.sku_resolved.sent !== verify.sku_resolved.received;
+    if (sku_resolved_failure) {
+      console.warn(`[Sync→Render] sku_resolved 状態異常: ${sku_resolved_state} → ok:false`);
+    }
+    return { ok: !(sku_master_failure || sku_resolved_failure), verify };
   } catch (e) {
     console.error(`[Sync→Render] ❌ 送信失敗:`, e.message);
     await notify(`❌ *Render同期失敗*\n${e.message.slice(0, 200)}`);
