@@ -269,15 +269,12 @@ function syncSegmentSalesForMonth(db, year_month, now) {
     ON CONFLICT(year_month, carrier) DO UPDATE SET amount=excluded.amount, cost_scope=excluded.cost_scope, note=excluded.note, updated_at=excluded.updated_at`);
 
   const tx = db.transaction(() => {
-    // 完全置換: summary から消えたモール/セグメントの残骸を残さない（欠けモール検知・変動検知の正確性のため）
-    db.prepare('DELETE FROM mart_monthly_segment_sales WHERE year_month = ?').run(year_month);
     for (const mt of MALL_TABLES) {
       let row;
       try {
         row = db.prepare(`SELECT * FROM ${mt.table} WHERE year_month = ?`).get(year_month);
       } catch { continue; }
       if (!row) continue;
-      mallsPresent.add(mt.mall_id);
 
       const bySegment = JSON.parse(row.by_segment || '{}');
       const excluded = JSON.parse(row.excluded || '{}');
@@ -312,6 +309,8 @@ function syncSegmentSalesForMonth(db, year_month, now) {
         }
       }
 
+      // セグメント行を組み立てる（by_segment 形式でないモール=米国Amazon mgmt_row 等は 0 行）
+      const segRows = [];
       for (const [segKey, segData] of Object.entries(allSegs)) {
         const seg = segKey === 'other' ? null : parseInt(segKey);
         if (seg === null || isNaN(seg)) continue;
@@ -344,7 +343,18 @@ function syncSegmentSalesForMonth(db, year_month, now) {
         const segRatio = segSalesTotal > 0 ? sales / segSalesTotal : 0;
         const adCost = Math.round(adCostTotal * segRatio);
 
-        insertStmt.run(year_month, mt.mall_id, seg, Math.round(sales), Math.round(cost), Math.round(pfFee), adCost, now, mt.table, 'v1');
+        segRows.push({ seg, sales: Math.round(sales), cost: Math.round(cost), pfFee: Math.round(pfFee), adCost });
+      }
+
+      // by_segment 形式で 1 行も作れないモール(米国Amazon等)は既存行を保護してスキップ
+      if (segRows.length === 0) continue;
+
+      // モール単位の完全置換: そのモールの当月行だけ入替（他モール/historical/米国Amazon は保持）。
+      // 同一モール内で消えたセグメントの残骸はこの delete で除去される。
+      mallsPresent.add(mt.mall_id);
+      db.prepare('DELETE FROM mart_monthly_segment_sales WHERE year_month = ? AND mall_id = ?').run(year_month, mt.mall_id);
+      for (const r of segRows) {
+        insertStmt.run(year_month, mt.mall_id, r.seg, r.sales, r.cost, r.pfFee, r.adCost, now, mt.table, 'v1');
         totalInserted++;
       }
     }
@@ -353,12 +363,49 @@ function syncSegmentSalesForMonth(db, year_month, now) {
   return { inserted: totalInserted, fba_freight_tax_excluded: fbaFreightInserted, malls: [...mallsPresent] };
 }
 
+// 当月運賃合計（確定時 freight_total と比較して変動検知に使う）
+function freightTotalForMonth(db, ym) {
+  return db.prepare('SELECT COALESCE(SUM(amount),0) s FROM mgmt_freight_costs WHERE year_month = ?').get(ym).s;
+}
+
+// 確定時に写した mgmt_monthly_pl と再同期後 segment_sales を行単位で突合（合計一致でも入替を検知）
+function inputsChangedForMonth(db, ym) {
+  const segCount = db.prepare('SELECT COUNT(*) c FROM mart_monthly_segment_sales WHERE year_month = ?').get(ym).c;
+  const plCount = db.prepare('SELECT COUNT(*) c FROM mgmt_monthly_pl WHERE year_month = ?').get(ym).c;
+  if (segCount !== plCount) return true;
+  const diff = db.prepare(`SELECT COUNT(*) c FROM (
+    SELECT mall_id, segment, sales, cost, pf_fee, ad_cost FROM mart_monthly_segment_sales WHERE year_month = ?
+    EXCEPT
+    SELECT mall_id, segment, sales, cost, pf_fee, ad_cost FROM mgmt_monthly_pl WHERE year_month = ?
+  )`).get(ym, ym).c;
+  return diff > 0;
+}
+
+// 同一トランザクションで「完全置換 → 差分判定 → confirmed なら needs_review 降格」。
+// 手動「売上同期」と daily-sync の自動同期の両方が同じ不変条件を共有する。
+function syncAndReconcileMonth(db, ym, now) {
+  return db.transaction(() => {
+    const closing = db.prepare('SELECT status, freight_total FROM mgmt_monthly_closing WHERE year_month = ?').get(ym);
+    const r = syncSegmentSalesForMonth(db, ym, now); // 内部 tx は savepoint としてネスト
+    let flagged = false;
+    if (closing && closing.status === 'confirmed') {
+      const changed = inputsChangedForMonth(db, ym) || Math.abs(freightTotalForMonth(db, ym) - (closing.freight_total || 0)) > 1;
+      if (changed) {
+        db.prepare("UPDATE mgmt_monthly_closing SET status='needs_review' WHERE year_month = ?").run(ym);
+        flagged = true;
+      }
+    }
+    return { ...r, flagged };
+  })();
+}
+
 router.post('/api/sync-segment-sales', (req, res) => {
   const db = getMirrorDB();
   const { year_month } = req.body;
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
-  const r = syncSegmentSalesForMonth(db, year_month, now);
-  res.json({ ok: true, inserted: r.inserted, fba_freight_tax_excluded: r.fba_freight_tax_excluded });
+  // 手動同期も confirmed 月の入力が変われば needs_review に降格（auto-sync と同じ不変条件）
+  const r = syncAndReconcileMonth(db, year_month, now);
+  res.json({ ok: true, inserted: r.inserted, fba_freight_tax_excluded: r.fba_freight_tax_excluded, needs_review: r.flagged });
 });
 
 // ─── 売上自動同期（daily-sync から MIRROR_SYNC_KEY 認証で呼ぶ）───
@@ -384,37 +431,13 @@ router.post('/auto-sync-sales', (req, res) => {
   for (const r of db.prepare("SELECT year_month FROM mgmt_monthly_closing WHERE status = 'confirmed'").all()) monthsSet.add(r.year_month);
   const months = [...monthsSet].sort();
 
-  const sumFreight = ym => db.prepare('SELECT COALESCE(SUM(amount),0) s FROM mgmt_freight_costs WHERE year_month = ?').get(ym).s;
-  // 行単位の差分検知（合計一致でもモール/セグメント間の入替を検知）。
-  // confirmed 時に segment_sales を写した mgmt_monthly_pl と、再同期後の segment_sales を突合。
-  const inputsChanged = ym => {
-    const segCount = db.prepare('SELECT COUNT(*) c FROM mart_monthly_segment_sales WHERE year_month = ?').get(ym).c;
-    const plCount = db.prepare('SELECT COUNT(*) c FROM mgmt_monthly_pl WHERE year_month = ?').get(ym).c;
-    if (segCount !== plCount) return true;
-    const diff = db.prepare(`SELECT COUNT(*) c FROM (
-      SELECT mall_id, segment, sales, cost, pf_fee, ad_cost FROM mart_monthly_segment_sales WHERE year_month = ?
-      EXCEPT
-      SELECT mall_id, segment, sales, cost, pf_fee, ad_cost FROM mgmt_monthly_pl WHERE year_month = ?
-    )`).get(ym, ym).c;
-    return diff > 0;
-  };
-
   const flagged = [];
   let syncedCount = 0;
-  // 月単位で「完全置換 → 差分判定 → closing降格」を同一トランザクションに入れて原子性を担保。
-  const runMonth = db.transaction(ym => {
-    const closing = db.prepare('SELECT status, freight_total FROM mgmt_monthly_closing WHERE year_month = ?').get(ym);
-    syncSegmentSalesForMonth(db, ym, now); // 内部 tx は savepoint としてネスト
+  for (const ym of months) {
+    const r = syncAndReconcileMonth(db, ym, now); // 月単位の同一tx（完全置換→差分判定→降格）
     syncedCount++;
-    if (closing && closing.status === 'confirmed') {
-      const changed = inputsChanged(ym) || Math.abs(sumFreight(ym) - (closing.freight_total || 0)) > 1;
-      if (changed) {
-        db.prepare("UPDATE mgmt_monthly_closing SET status='needs_review' WHERE year_month = ?").run(ym);
-        flagged.push({ year_month: ym });
-      }
-    }
-  });
-  for (const ym of months) runMonth(ym);
+    if (r.flagged) flagged.push({ year_month: ym });
+  }
 
   res.json({ ok: true, months: months.length, synced: syncedCount, flagged });
 });
