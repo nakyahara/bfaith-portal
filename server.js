@@ -7,6 +7,7 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import linegiftRouter from './apps/linegift-sync/router.js';
 import mercariRouter from './apps/mercari-sync/router.js';
+import rakutenYahooSyncRouter from './apps/rakuten-yahoo-sync/router.js';
 import aesRouter, { startPythonBackend, stopPythonBackend } from './apps/aes-pdf-sorter/router.js';
 import rankingRouter from './apps/ranking-checker/router.js';
 import { startScheduler } from './apps/ranking-checker/scheduler.js';
@@ -262,6 +263,15 @@ const apps = [
     description: '楽天商品をメルカリShops形式に変換・CSV出力',
     icon: '🛒',
     path: '/apps/mercari-sync',
+    status: 'active',
+    category: 'product-sync',
+  },
+  {
+    id: 'rakuten-yahoo-sync',
+    name: '楽天→Yahoo!ショッピング 商品移行',
+    description: '楽天商品をYahoo!ショッピングへ移行 (Notion 補完 + readiness ゲート)',
+    icon: '🟣',
+    path: '/apps/rakuten-yahoo-sync',
     status: 'active',
     category: 'product-sync',
   },
@@ -683,6 +693,7 @@ app.post('/change-password', requireAuth, (req, res) => {
 // アプリルート
 app.use('/apps/linegift-sync', requireAppAccess('linegift-sync'), linegiftRouter);
 app.use('/apps/mercari-sync', requireAppAccess('mercari-sync'), mercariRouter);
+app.use('/apps/rakuten-yahoo-sync', requireAppAccess('rakuten-yahoo-sync'), rakutenYahooSyncRouter);
 app.use('/apps/aes-pdf-sorter', requireAppAccess('aes-pdf-sorter'), aesRouter);
 app.use('/apps/ranking-checker', requireAppAccess('ranking-checker'), rankingRouter);
 app.use('/apps/profit-calculator', requireAppAccess('profit-calculator'), profitRouter);
