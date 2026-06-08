@@ -1533,6 +1533,19 @@
           </div>
 
           <div class="settings-group">
+            <h4>納品推奨から「除外」する（もう納品しない商品）</h4>
+            <p style="font-size:12px;color:#444;margin:0 0 8px;">販売はしていたが価格が合わなくなった等で「もう FBA に納品しない」と決めた商品を、推奨リストから恒久的に省く機能です。</p>
+            <table style="width:100%;font-size:12px;border-collapse:collapse;">
+              <tr style="background:#f3f4f6;"><th style="padding:6px;border:1px solid #e5e7eb;">操作</th><th style="padding:6px;border:1px solid #e5e7eb;">説明</th></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;font-weight:bold;color:#dc2626;">除外</td><td style="padding:6px;border:1px solid #e5e7eb;">納品推奨タブの各行（SKUの右）の「<span style="color:#dc2626;">除外</span>」リンクをクリック → 理由（任意。例:「価格が合わない」）を入力して登録。以後そのSKUは<strong>納品推奨・FBA欠品・新規商品・発注推奨(在庫0) の全タブから消えます</strong>。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;font-weight:bold;">除外も含める</td><td style="padding:6px;border:1px solid #e5e7eb;">納品推奨タブ上部のチェックボックス。ONにすると除外SKUがグレー表示で出てきます（件数も表示）。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;font-weight:bold;color:#2563eb;">復元</td><td style="padding:6px;border:1px solid #e5e7eb;">「除外も含める」をONにしてグレー行の「<span style="color:#2563eb;">復元</span>」をクリックすると除外解除。再び推奨に戻ります。</td></tr>
+              <tr><td style="padding:6px;border:1px solid #e5e7eb;">安全装置</td><td style="padding:6px;border:1px solid #e5e7eb;">除外SKUはチェック・数量入力ができず、「緊急を全選択」等でも選ばれません。仮確定・納品プラン作成・Manifest/NE受注CSV出力でもサーバ側で必ず除外されるため、誤って納品されることはありません。</td></tr>
+            </table>
+            <p style="font-size:11px;color:#666;margin-top:8px;">※ あくまで「今後の推奨・納品から省く」機能です。<strong>すでにセラセン/Amazon側で作成済みの納品プランは取り消されません</strong>（それは Seller Central 側で対応してください）。再び納品したくなったら「復元」でいつでも戻せます。</p>
+          </div>
+
+          <div class="settings-group">
             <h4>Amazon仮確定タブの使い方</h4>
             <table style="width:100%;font-size:12px;border-collapse:collapse;">
               <tr style="background:#f3f4f6;"><th style="padding:6px;border:1px solid #e5e7eb;">操作</th><th style="padding:6px;border:1px solid #e5e7eb;">説明</th></tr>
