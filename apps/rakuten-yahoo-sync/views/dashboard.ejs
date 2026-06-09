@@ -27,17 +27,66 @@
       </div>
     </div>
 
+    <% if (notionStats) { %>
+    <div class="card mb-3">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <strong>Notion 商品マスター cache (notion_overrides)</strong>
+        <div class="btn-group btn-group-sm">
+          <button class="btn btn-outline-secondary" onclick="runSync(true)">🧪 dry-run</button>
+          <button class="btn btn-primary" onclick="runSync(false)">▶️ 本 sync 実行</button>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="row">
+          <div class="col-md-3">
+            <div class="text-muted small">取込済み</div>
+            <div class="h3 mb-0"><%= notionStats.total || 0 %> <small class="text-muted">件</small></div>
+          </div>
+          <div class="col-md-3">
+            <div class="text-muted small">Yahoo!タイトル入力済</div>
+            <div class="h4 mb-0"><%= notionStats.with_title || 0 %></div>
+          </div>
+          <div class="col-md-3">
+            <div class="text-muted small">売価入力済</div>
+            <div class="h4 mb-0"><%= notionStats.with_price || 0 %></div>
+          </div>
+          <div class="col-md-3">
+            <div class="text-muted small">配送方法選択済</div>
+            <div class="h4 mb-0"><%= notionStats.with_delivery || 0 %></div>
+          </div>
+        </div>
+        <% if (syncState) { %>
+        <hr>
+        <div class="small text-muted">
+          最終 sync (成功): <code><%= syncState.last_successful_sync_at || '—' %></code><br>
+          最終 sync (試行): <code><%= syncState.last_attempted_sync_at || '—' %></code>
+          (errors: <%= syncState.last_error_count || 0 %>)<br>
+          last_sync_run_id: <code><%= syncState.last_sync_run_id || '—' %></code>
+        </div>
+        <% } else { %>
+        <hr>
+        <div class="small text-muted">まだ sync を実行していません。 「dry-run」 で取込件数の試算 → 「本 sync 実行」 で DB へ書き込みします。</div>
+        <% } %>
+      </div>
+    </div>
+    <% } %>
+
+    <% if (readiness) { %>
+    <div class="card mb-3">
+      <div class="card-header"><strong>readiness 集計 (jobs テーブル、 E-5 で実 publish に使う)</strong></div>
+      <div class="card-body row">
+        <div class="col"><div class="text-muted small">total</div><div class="h4"><%= readiness.total %></div></div>
+        <div class="col"><div class="text-muted small">pending</div><div class="h4"><%= readiness.pending %></div></div>
+        <div class="col"><div class="text-success small">ok</div><div class="h4 text-success"><%= readiness.ok %></div></div>
+        <div class="col"><div class="text-danger small">blocked</div><div class="h4 text-danger"><%= readiness.blocked %></div></div>
+      </div>
+    </div>
+    <% } %>
+
     <div class="card mb-3">
       <div class="card-header"><strong>必須 env (REQUIRED)</strong></div>
       <table class="table table-sm mb-0">
-        <thead>
-          <tr>
-            <th>Key</th>
-            <th>用途</th>
-            <th>Status</th>
-            <th>値 / 長さ</th>
-          </tr>
-        </thead>
+        <thead><tr><th>Key</th><th>用途</th><th>Status</th><th>値 / 長さ</th></tr></thead>
         <tbody>
           <% for (const r of status.required) { %>
             <tr class="<%= r.set ? '' : 'table-danger' %>">
@@ -45,41 +94,8 @@
               <td><%= r.purpose %></td>
               <td><%= r.set ? '✅ set' : '❌ unset' %></td>
               <td>
-                <% if (!r.set) { %>—<% } else if (r.value !== undefined) { %>
-                  <code><%= r.value %></code>
-                <% } else { %>
-                  <small class="text-muted">length=<%= r.length %></small>
-                <% } %>
-              </td>
-            </tr>
-          <% } %>
-        </tbody>
-      </table>
-    </div>
-
-    <div class="card mb-3">
-      <div class="card-header"><strong>任意 env (OPTIONAL)</strong></div>
-      <table class="table table-sm mb-0">
-        <thead>
-          <tr>
-            <th>Key</th>
-            <th>用途</th>
-            <th>Status</th>
-            <th>値 / 長さ</th>
-          </tr>
-        </thead>
-        <tbody>
-          <% for (const o of status.optional) { %>
-            <tr>
-              <td><code><%= o.key %></code></td>
-              <td><%= o.purpose %></td>
-              <td><%= o.set ? '✅ set' : '— unset' %></td>
-              <td>
-                <% if (!o.set) { %>—<% } else if (o.value !== undefined) { %>
-                  <code><%= o.value %></code>
-                <% } else { %>
-                  <small class="text-muted">length=<%= o.length %></small>
-                <% } %>
+                <% if (!r.set) { %>—<% } else if (r.value !== undefined) { %><code><%= r.value %></code>
+                <% } else { %><small class="text-muted">length=<%= r.length %></small><% } %>
               </td>
             </tr>
           <% } %>
@@ -88,21 +104,63 @@
     </div>
 
     <div class="card">
-      <div class="card-header"><strong>次のステップ (Phase E-2 以降)</strong></div>
+      <div class="card-header"><strong>次のステップ</strong></div>
       <div class="card-body">
         <ol class="mb-0">
-          <li><strong>E-1 (現在)</strong>: skeleton + env 確認画面 ← イマココ</li>
-          <li><strong>E-2</strong>: Notion 商品マスター sync (専用 RYS DB に 271 件取込)</li>
-          <li><strong>E-3</strong>: delivery / variation / readiness resolver 移植</li>
-          <li><strong>E-4</strong>: field-mapper + buildYahooEditItemFields + dry-run endpoint</li>
-          <li><strong>E-5</strong>: 実 publish (idempotency + lease、 RYS_PUBLISH_ENABLED=1 で初稼働)</li>
+          <li>E-1 ✅ skeleton + env 確認画面</li>
+          <li><strong>E-2 (現在)</strong>: Notion 商品マスター sync ← イマココ</li>
+          <li>E-3: delivery / variation / readiness resolver 移植</li>
+          <li>E-4: field-mapper + buildYahooEditItemFields + dry-run endpoint</li>
+          <li>E-5: 実 publish (RYS_PUBLISH_ENABLED=1 で初稼働)</li>
         </ol>
       </div>
     </div>
 
-    <div class="mt-3 small text-muted">
-      API: <a href="/apps/rakuten-yahoo-sync/api/health"><code>GET /apps/rakuten-yahoo-sync/api/health</code></a>
-    </div>
+    <div id="syncResult" class="mt-3"></div>
   </div>
+
+<script>
+async function runSync(dryRun) {
+  const btn = event.target;
+  btn.disabled = true;
+  btn.innerText = '実行中...';
+  const out = document.getElementById('syncResult');
+  out.innerHTML = '<div class="alert alert-info">Notion sync 実行中... (271 件で 30 秒前後)</div>';
+  try {
+    const res = await fetch('/apps/rakuten-yahoo-sync/api/notion/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dryRun, mode: 'full' }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      out.innerHTML = '<div class="alert alert-danger"><strong>fail</strong><pre>' + JSON.stringify(data, null, 2) + '</pre></div>';
+    } else {
+      const errors = (data.errors || []).length;
+      const klass = errors > 0 ? 'alert-warning' : 'alert-success';
+      out.innerHTML = '<div class="alert ' + klass + '">'
+        + '<strong>' + (dryRun ? 'dry-run 完了' : 'sync 完了') + '</strong>'
+        + '<div class="mt-2 small">runId: <code>' + data.runId + '</code></div>'
+        + '<table class="table table-sm mt-2"><tbody>'
+        + '<tr><th>取込ページ</th><td>' + data.totalPages + '</td></tr>'
+        + '<tr><th>insert</th><td>' + (data.inserted || 0) + '</td></tr>'
+        + '<tr><th>update</th><td>' + (data.updated || 0) + '</td></tr>'
+        + '<tr><th>skip</th><td>' + (data.skipped || 0) + '</td></tr>'
+        + '<tr><th>delete</th><td>' + (data.deleted || 0) + '</td></tr>'
+        + '<tr><th>errors</th><td>' + errors + '</td></tr>'
+        + '<tr><th>duration</th><td>' + data.durationMs + ' ms</td></tr>'
+        + '</tbody></table>'
+        + (errors > 0 ? '<details><summary>errors 詳細</summary><pre>' + JSON.stringify(data.errors, null, 2) + '</pre></details>' : '')
+        + '</div>';
+      if (!dryRun) setTimeout(() => location.reload(), 2000);
+    }
+  } catch (e) {
+    out.innerHTML = '<div class="alert alert-danger">network error: ' + e.message + '</div>';
+  } finally {
+    btn.disabled = false;
+    btn.innerText = dryRun ? '🧪 dry-run' : '▶️ 本 sync 実行';
+  }
+}
+</script>
 </body>
 </html>
