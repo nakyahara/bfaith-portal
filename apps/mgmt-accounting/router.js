@@ -544,8 +544,13 @@ router.post('/api/calculate', (req, res) => {
   const user = req.session?.email || 'unknown';
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
 
-  // 0. 確定直前に各モール確定済みデータを取り込み segment_sales を最新化（サーバ側で確実に実行）
-  try { syncSegmentSalesForMonth(db, year_month, now); } catch (e) { /* 取り込み失敗時も既存データで続行 */ }
+  // 0. 確定直前に各モール確定済みデータを取り込み segment_sales を最新化（サーバ側で確実に実行）。
+  //    同期失敗時は古いデータで確定しないよう fail-closed（確定を中止）。
+  try {
+    syncSegmentSalesForMonth(db, year_month, now);
+  } catch (e) {
+    return res.status(500).json({ error: '売上同期に失敗したため確定を中止しました: ' + e.message });
+  }
 
   // 1. セグメント売上を取得
   const segSales = db.prepare('SELECT * FROM mart_monthly_segment_sales WHERE year_month = ?').all(year_month);
