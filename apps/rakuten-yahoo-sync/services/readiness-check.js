@@ -95,12 +95,12 @@ export function extractRequiredAxes(rakutenItem) {
 export function evaluateReadiness(input) {
   const reasons = [];
 
-  // #1 name (Notion yahoo_title 強制、 65 字以下)
+  // #1 name (Notion yahoo_title 強制)
+  //   Codex E-4 R1 H-1: 65 字超は blocked にせず field-mapper 側で truncate (仕様は「65 字 truncate」 であり、 ハード reject ではない)。
+  //   ここでは「空文字」 のみ fail-closed。
   const yt = input.notionOverride?.yahoo_title;
   if (!yt) {
     reasons.push('notion_title_missing');
-  } else if (yt.length > NAME_MAX_LENGTH) {
-    reasons.push(`notion_title_too_long:${yt.length}>${NAME_MAX_LENGTH}`);
   }
 
   // #2 product_category
