@@ -859,6 +859,7 @@ function createTables() {
     mf_row            TEXT,
     ad_cost           REAL DEFAULT 0,
     billing           TEXT,
+    pf_fee            REAL DEFAULT 0,
     confirmed_at      TEXT NOT NULL
   )`);
 
@@ -951,8 +952,12 @@ function createTables() {
     mf_row            TEXT,
     ad_cost           REAL DEFAULT 0,
     billing           TEXT,
+    pf_fee            REAL DEFAULT 0,
     confirmed_at      TEXT NOT NULL
   )`);
+  // 既存DBへの migration: 楽天/Yahoo summary に pf_fee 列を追加（mgmt-accounting が読む）
+  addColumnIfMissing('mart_rakuten_monthly_summary', 'pf_fee', 'REAL DEFAULT 0');
+  addColumnIfMissing('mart_yahoo_monthly_summary', 'pf_fee', 'REAL DEFAULT 0');
 
   // mart_yahoo_upload_log — アップロード履歴
   db.exec(`CREATE TABLE IF NOT EXISTS mart_yahoo_upload_log (

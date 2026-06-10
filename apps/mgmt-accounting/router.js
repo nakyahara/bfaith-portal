@@ -243,14 +243,36 @@ router.get('/api/segment-sales/:yearMonth', (req, res) => {
 // 各モール集計テーブルから mart_monthly_segment_sales を同期生成
 const MALL_TABLES = [
   { table: 'mart_amazon_monthly_summary', mall_id: 'amazon_jp', adField: 'ad_cost', feeField: null },
-  { table: 'mart_rakuten_monthly_summary', mall_id: 'rakuten', adField: 'ad_cost', feeField: 'billing' },
-  { table: 'mart_yahoo_monthly_summary', mall_id: 'yahoo', adField: null, feeField: 'billing' },
+  { table: 'mart_rakuten_monthly_summary', mall_id: 'rakuten', adField: 'ad_cost', feeField: 'pf_fee' },
+  { table: 'mart_yahoo_monthly_summary', mall_id: 'yahoo', adField: null, feeField: 'pf_fee' },
   { table: 'mart_aupay_monthly_summary', mall_id: 'aupay', adField: null, feeField: 'pf_fee' },
   { table: 'mart_qoo10_monthly_summary', mall_id: 'qoo10', adField: 'ad_cost', feeField: 'pf_fee' },
   { table: 'mart_linegift_monthly_summary', mall_id: 'linegift', adField: null, feeField: 'pf_fee' },
   { table: 'mart_mercari_monthly_summary', mall_id: 'mercari', adField: null, feeField: 'pf_fee' },
   { table: 'mart_amazon_usa_monthly_summary', mall_id: 'amazon_usa', adField: 'ad_cost', feeField: null },
 ];
+
+// 楽天/Yahoo の pf_fee 未保存(列追加前に確定された既存)月向け: billing(byCategory) から
+// PF手数料を best-effort 再計算。再確定すれば app が正確値を pf_fee に保存して上書きする。
+function backfillBillingPfFee(mallId, row) {
+  let billing;
+  try { billing = JSON.parse(row.billing || '[]'); } catch { return 0; }
+  if (!Array.isArray(billing)) return 0;
+  const adCost = Number(row.ad_cost) || 0;
+  if (mallId === 'yahoo') {
+    // Yahoo: 請求合計(税込) − 広告費（byCategory は請求明細のみ＝正確）
+    const totalTaxIncl = billing.reduce((s, c) => s + (Number(c['金額(税込)']) || 0), 0);
+    return Math.max(0, Math.round(totalTaxIncl - adCost));
+  }
+  // 楽天: 請求合計(税込) − 広告費 − クーポン値引（byCategory は支払/相殺も含むため概算）
+  const totalTaxIncl = billing.reduce((s, c) => s + (Number(c['税込合計']) || 0), 0);
+  let coupon = 0;
+  try {
+    const byTax = JSON.parse(row.by_tax || '{}');
+    for (const k of Object.keys(byTax)) coupon += Number(byTax[k]['クーポン値引額']) || 0;
+  } catch {}
+  return Math.max(0, Math.round(totalTaxIncl - adCost - coupon));
+}
 
 // 各モール集計テーブル(mart_*_monthly_summary)から指定月の mart_monthly_segment_sales を生成。
 // 各モールアプリは「確定」時のみ summary 行を作るため、行の存在 = そのモールの当月確定済み。
@@ -298,7 +320,11 @@ function syncSegmentSalesForMonth(db, year_month, now) {
       const segSalesTotal = Object.values(allSegs).reduce((s, v) => s + (v['売上合計'] || v['合計'] || v['商品売上'] || 0), 0);
 
       // PF手数料の全体値（テーブルカラムから取得）
-      const pfFeeTotal = mt.feeField ? (row[mt.feeField] || 0) : 0;
+      let pfFeeTotal = mt.feeField ? (Number(row[mt.feeField]) || 0) : 0;
+      // 楽天/Yahoo: pf_fee 未保存の既存月は billing から best-effort 再計算（再確定で正確値に置換）
+      if ((mt.mall_id === 'rakuten' || mt.mall_id === 'yahoo') && !pfFeeTotal) {
+        pfFeeTotal = backfillBillingPfFee(mt.mall_id, row);
+      }
 
       // Amazon JP: FBA手数料は販売手数料ではなく運賃として扱う（Excel運用踏襲）
       // by_segment の FBA手数料（全セグメント合計、税込負数）を |x|/1.1 で税抜化し
