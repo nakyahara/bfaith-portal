@@ -574,7 +574,7 @@ router.post('/confirm', (req, res) => {
     `).run(
       yearMonth, totalRows || 0, resolvedCount || 0, unresolvedCount || 0,
       JSON.stringify(byTax), JSON.stringify(bySegment), JSON.stringify(excluded),
-      JSON.stringify(mfRow), adCost || 0, JSON.stringify(billing || {}), Math.round(pfFee || 0), now
+      JSON.stringify(mfRow), adCost || 0, JSON.stringify(billing || {}), Math.max(0, Math.round(pfFee || 0)), now
     );
 
     db.prepare(`INSERT INTO mart_yahoo_upload_log

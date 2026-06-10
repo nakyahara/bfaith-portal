@@ -252,11 +252,16 @@ const MALL_TABLES = [
   { table: 'mart_amazon_usa_monthly_summary', mall_id: 'amazon_usa', adField: 'ad_cost', feeField: null },
 ];
 
-// 楽天/Yahoo の pf_fee 未保存(列追加前に確定された既存)月向け: billing(byCategory) から
-// PF手数料を best-effort 再計算。再確定すれば app が正確値を pf_fee に保存して上書きする。
+// 楽天/Yahoo の pf_fee 未保存(列追加前に確定された既存)月向け: billing から PF手数料を
+// best-effort 再計算。再確定すれば app が正確値を pf_fee に保存して上書きする。
+// pf_fee は他モール(auPay/Qoo10/LINEギフト/メルカリ)と同様 税込ベースで揃える。
 function backfillBillingPfFee(mallId, row) {
   let billing;
-  try { billing = JSON.parse(row.billing || '[]'); } catch { return 0; }
+  try { billing = JSON.parse(row.billing || '{}'); } catch { return 0; }
+  // 旧Excel/一括登録形状: { 変動費: { PF手数料, 広告費, ... } } は PF手数料 を直接持つ
+  if (billing && !Array.isArray(billing) && billing.変動費 && billing.変動費['PF手数料'] != null) {
+    return Math.max(0, Math.round(Number(billing.変動費['PF手数料']) || 0));
+  }
   if (!Array.isArray(billing)) return 0;
   const adCost = Number(row.ad_cost) || 0;
   if (mallId === 'yahoo') {
