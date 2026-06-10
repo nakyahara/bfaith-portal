@@ -20,6 +20,8 @@ import { inspectEnvStatus } from './env-check.js';
 import { getDB } from './db.js';
 import { acquire, SyncLockError } from './lib/sync-lock.js';
 import { syncNotionOverrides } from './services/notion-sync.js';
+import { evaluateItemForPublish } from './services/publish-pipeline.js';
+import { fetchAllItemCodes } from './lib/rakuten-rms-proxy.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -169,6 +171,79 @@ router.post('/api/notion/sync', async (req, res) => {
     if (release) {
       try { release(); } catch (_) {}
     }
+  }
+});
+
+// ───────────────── Phase E-4: publish dry-run ─────────────────
+
+/**
+ * 単商品の Phase 0 publish-pipeline を dry-run。
+ *   body: {
+ *     manageNumber?: string,        // 省略時は jobs.payload_json の rakuten_manage_number
+ *     productCategory?: string,     // E-4 では未解決でも OK (readiness 側で fail-closed)
+ *     pathName?: string,
+ *     yahooProductCategoryId?: number,
+ *     aucPrefCode?: number,
+ *     dryRun?: boolean              // default true (E-4 では false 不可、 E-5 で flip)
+ *   }
+ */
+router.post('/api/publish/evaluate/:itemCode', async (req, res) => {
+  try {
+    const itemCode = req.params.itemCode;
+    const body = req.body || {};
+    const dryRun = body.dryRun !== false;
+    if (!dryRun) {
+      return res.status(403).json({
+        status: 'fail',
+        error: 'Real publish not yet implemented (E-5). Only dryRun=true is allowed.',
+      });
+    }
+    const db = getDB();
+    const job = db.prepare(`SELECT payload_json FROM jobs WHERE item_code = ?`).get(itemCode);
+    let payload = {};
+    if (job?.payload_json) {
+      try { payload = JSON.parse(job.payload_json); } catch (_) {}
+    }
+    const bodyMn = typeof body.manageNumber === 'string' ? body.manageNumber.trim() : '';
+    const payloadMn = typeof payload.rakuten_manage_number === 'string' ? payload.rakuten_manage_number.trim() : '';
+    // Codex E-4 R1 M-2: itemCode (= itemNumber) を manageNumber に誤用すると false blocked
+    // が出るので、 fallback は itemNumber → manageNumber map で解決。
+    let manageNumber = bodyMn || payloadMn || null;
+    if (!manageNumber) {
+      try {
+        const mapping = await fetchAllItemCodes();
+        manageNumber = mapping[itemCode] || null;
+      } catch (e) {
+        return res.status(502).json({
+          status: 'fail',
+          error: `failed to resolve manage_number from itemNumber via warehouse proxy: ${e.message}`,
+        });
+      }
+    }
+    if (!manageNumber) {
+      return res.status(400).json({
+        error: 'manage_number_required',
+        itemCode,
+        hint: 'pass body.manageNumber explicitly, set payload.rakuten_manage_number in jobs, or ensure warehouse all-codes map includes this itemNumber',
+      });
+    }
+    const result = await evaluateItemForPublish({
+      db,
+      itemCode,
+      manageNumber,
+      dryRun: true,
+      productCategory: body.productCategory || null,
+      pathName: body.pathName || null,
+      yahooProductCategoryId: body.yahooProductCategoryId ?? null,
+      aucPrefCode: body.aucPrefCode ?? null,
+    });
+    audit(db, 'publish_evaluate', {
+      itemCode, manageNumber, dryRun: true, status: result.status,
+      reason_count: result.reasons.length,
+    });
+    return res.json(result);
+  } catch (e) {
+    return res.status(500).json({ status: 'fail', error: e.message });
   }
 });
 
