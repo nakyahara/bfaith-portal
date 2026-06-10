@@ -1627,13 +1627,19 @@ export function unhideNewProductSku(amazonSku) {
 export function getReplenishmentExcluded() {
   // 商品名/ASIN を sku_mapping から引いて返す (管理画面で「何を除外したか」を商品名で確認できるように)。
   // amazon_sku は必ず返るのでサーバ側の除外セット生成 (.map(r=>r.amazon_sku)) はそのまま動く。
-  return queryAll(`
-    SELECT e.amazon_sku, e.reason, e.excluded_at,
-           m.product_name AS product_name, m.asin AS asin
-    FROM replenishment_excluded e
-    LEFT JOIN sku_mapping m ON e.amazon_sku = m.amazon_sku
-    ORDER BY e.excluded_at DESC
-  `);
+  try {
+    return queryAll(`
+      SELECT e.amazon_sku, e.reason, e.excluded_at,
+             m.product_name AS product_name, m.asin AS asin
+      FROM replenishment_excluded e
+      LEFT JOIN sku_mapping m ON e.amazon_sku = m.amazon_sku
+      ORDER BY e.excluded_at DESC
+    `);
+  } catch (e) {
+    // JOIN が失敗しても最低限 amazon_sku/reason/excluded_at は返す (一覧が真っ白/エラーにならない)
+    console.error('[FBA] getReplenishmentExcluded JOIN 失敗、単純SELECTにフォールバック:', e.message);
+    return queryAll('SELECT amazon_sku, reason, excluded_at, NULL AS product_name, NULL AS asin FROM replenishment_excluded ORDER BY excluded_at DESC');
+  }
 }
 
 export function excludeReplenishmentSku(amazonSku, reason) {

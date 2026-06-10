@@ -787,7 +787,14 @@ router.delete('/api/stockout-hidden/:sku', (req, res) => {
 
 // ===== 納品推奨 恒久除外 (replenishment_excluded) =====
 router.get('/api/replenishment-excluded', (req, res) => {
-  res.json(getReplenishmentExcluded());
+  // error handling: 例外時も JSON で返す (HTML 500 だと frontend の res.json() がコケて「読み込み失敗」になる)。
+  // 実エラーは Render ログで追えるよう console.error。
+  try {
+    res.json(getReplenishmentExcluded());
+  } catch (e) {
+    console.error('[FBA] GET /api/replenishment-excluded エラー:', e.message, e.stack);
+    res.status(500).json({ error: e.message || 'failed' });
+  }
 });
 
 router.post('/api/replenishment-excluded', express.json(), (req, res) => {

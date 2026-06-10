@@ -2358,8 +2358,13 @@ Step10: アラート判定
       let list = [];
       try {
         const res = await fetch(`${BASE}/api/replenishment-excluded`);
+        if (!res.ok) throw new Error('status ' + res.status);
         list = await res.json();
-      } catch(e) { listEl.innerHTML = '<p style="color:#dc2626;font-size:12px;padding:8px;">読み込みに失敗しました</p>'; return; }
+        if (!Array.isArray(list)) throw new Error('unexpected response');
+      } catch(e) {
+        listEl.innerHTML = '<p style="color:#dc2626;font-size:12px;padding:8px;">読み込みに失敗しました。少し時間をおいて開き直してください（デプロイ直後は一時的に失敗することがあります）。</p>';
+        return;
+      }
       excludedSet = new Set(list.map(r => r.amazon_sku));
       if (countEl) countEl.textContent = `(${list.length}件)`;
       if (list.length === 0) { listEl.innerHTML = '<p style="color:#666;font-size:12px;padding:8px;">除外中のSKUはありません。</p>'; return; }
