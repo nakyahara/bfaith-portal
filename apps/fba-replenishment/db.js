@@ -1052,24 +1052,30 @@ function normComponents(sc) {
 }
 
 // shadow: sheet と mirror の core 差分を集計 (確定はしない、観測用)
+// ★ case 非依存で突き合わせる: SKUマスタ/mirror は seller_sku・ne_code を小文字正規化して保存する一方、
+//   スプレッドシート(sku_mapping)は元の大小文字を保持する。case 区別で突き合わせると同一SKUが
+//   sheet_only(大文字) と mirror_only(小文字) に二重計上され擬似差分が大量発生するため、
+//   キー・ne_code・fnsku は norm() で小文字揃えして比較する (case 差自体は実害でないので無視)。
+//   ※ ただし PR4 の本番切替では adapter/consumer 側で case-insensitive 化が必須 (元バグ再発防止)。
 function compareSkuMappings(sheetRows, mirrorRows) {
-  const sheetMap = new Map(sheetRows.map(r => [r.amazon_sku, r]));
-  const mirrorMap = new Map(mirrorRows.map(r => [r.amazon_sku, r]));
-  const observed = new Set([...getAllEverSeenSkus(), ...getAllSnapshotSkus()]);
+  const norm = (v) => String(v ?? '').trim().toLowerCase();
+  const sheetMap = new Map(sheetRows.map(r => [norm(r.amazon_sku), r]));
+  const mirrorMap = new Map(mirrorRows.map(r => [norm(r.amazon_sku), r]));
+  const observed = new Set([...getAllEverSeenSkus(), ...getAllSnapshotSkus()].map(norm));
   const sheetOnly = [], mirrorOnlyObserved = [], mirrorOnlyScopeUnknown = [], fieldDiffs = [];
-  for (const sku of sheetMap.keys()) if (!mirrorMap.has(sku)) sheetOnly.push(sku);
-  for (const sku of mirrorMap.keys()) {
-    if (!sheetMap.has(sku)) (observed.has(sku) ? mirrorOnlyObserved : mirrorOnlyScopeUnknown).push(sku);
+  for (const [k, r] of sheetMap) if (!mirrorMap.has(k)) sheetOnly.push(r.amazon_sku);
+  for (const [k, r] of mirrorMap) {
+    if (!sheetMap.has(k)) (observed.has(k) ? mirrorOnlyObserved : mirrorOnlyScopeUnknown).push(r.amazon_sku);
   }
-  for (const [sku, s] of sheetMap) {
-    const m = mirrorMap.get(sku);
+  for (const [k, s] of sheetMap) {
+    const m = mirrorMap.get(k);
     if (!m) continue;
     const d = {};
-    if ((s.ne_code || null) !== (m.ne_code || null)) d.ne_code = [s.ne_code, m.ne_code];
+    if (norm(s.ne_code) !== norm(m.ne_code)) d.ne_code = [s.ne_code, m.ne_code];
     if ((s.is_set ? 1 : 0) !== (m.is_set ? 1 : 0)) d.is_set = [s.is_set, m.is_set];
     if (normComponents(s.set_components) !== normComponents(m.set_components)) d.components = true;
-    if ((s.fnsku || null) !== (m.fnsku || null)) d.fnsku = [s.fnsku, m.fnsku];
-    if (Object.keys(d).length) fieldDiffs.push({ amazon_sku: sku, ...d });
+    if (norm(s.fnsku) !== norm(m.fnsku)) d.fnsku = [s.fnsku, m.fnsku];
+    if (Object.keys(d).length) fieldDiffs.push({ amazon_sku: s.amazon_sku, ...d });
   }
   return {
     summary: {
