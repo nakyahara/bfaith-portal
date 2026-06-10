@@ -1540,6 +1540,61 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_mfsbl_run    ON mirror_f_sales_by_listing(source_run_id)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mfsbl_item   ON mirror_f_sales_by_listing(item_code, date_jst)');
 
+  // ---- 商品管理リスト スナップショット ミラー (⑤、商品管理リスト④の published run を受信) ----
+  //   ミニPC build-product-management-snapshot.js → sync-to-render.js → ここ。
+  //   受信時に checksum 検証 (recompute == 送信元 payload_checksum) してから atomic swap。
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_pml_snapshot_rows (
+    run_id                TEXT NOT NULL,
+    商品コード            TEXT NOT NULL,
+    商品名                TEXT,
+    仕入先                TEXT,
+    取扱区分              TEXT,
+    商品区分              TEXT,
+    最終仕入日            TEXT,
+    在庫保管日数          INTEGER,
+    総在庫数              INTEGER,
+    FBA在庫数             INTEGER,
+    フリー在庫            INTEGER,
+    注残数                INTEGER,
+    引当数                INTEGER,
+    総在庫数_引当なし     INTEGER,
+    販売数7日_FBA         INTEGER,
+    販売数7日_FBA以外     INTEGER,
+    販売数7日_合計        INTEGER,
+    販売数30日_FBA        INTEGER,
+    販売数30日_FBA以外    INTEGER,
+    販売数30日_合計       INTEGER,
+    発注ロット単位        INTEGER,
+    推奨保有月数          REAL,
+    売価                  REAL,
+    原価                  REAL,
+    想定見込み利益        REAL,
+    概算利益率            REAL,
+    代表商品コード        TEXT,
+    ロケーションコード    TEXT,
+    商品分類タグ          TEXT,
+    登録日                TEXT,
+    PRIMARY KEY (run_id, 商品コード)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mpsr_run ON mirror_pml_snapshot_rows(run_id)');
+  // 公開ポインタ + メタ (単一行 id=1)。Render 画面/CSV/JSON はこの run_id のみ参照。
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_pml_published (
+    id                        INTEGER PRIMARY KEY CHECK (id = 1),
+    run_id                    TEXT NOT NULL,
+    status                    TEXT NOT NULL,
+    as_of_date                TEXT,
+    generated_at              TEXT,
+    payload_checksum          TEXT,
+    row_count                 INTEGER,
+    src_ne_products_synced_at TEXT,
+    src_velocity_as_of        TEXT,
+    src_fba_business_date     TEXT,
+    src_reorder_updated_at    TEXT,
+    ne_fba_overlap            INTEGER,
+    published_at              TEXT,
+    synced_at                 TEXT NOT NULL
+  )`);
+
   // ---- biz-ops-overview: 全モール売上日次統合 view (2026-05-19 PR #156)
   db.exec('DROP VIEW IF EXISTS v_mall_sales_daily_unified');
   db.exec(`CREATE VIEW v_mall_sales_daily_unified AS

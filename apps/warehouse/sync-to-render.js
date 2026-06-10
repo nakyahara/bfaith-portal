@@ -405,6 +405,39 @@ export async function syncToRender() {
       );
     }
 
+    // Part 3d: 商品管理リスト スナップショット (④ の published run)
+    //   fail-closed: published が指す run の meta が status≠'failed' のときだけ送る (skip はエラーでない)。
+    //   送信(HTTP)エラーは握り潰さず throw させ、Render同期 job 全体を失敗させて retry に乗せる
+    //   (サイレント成功で mirror が stale のまま成功通知される事故を防ぐ、Codex⑤R1 High)。
+    let pmlSync = { state: 'skipped', run_id: null, count: 0 };
+    {
+      const PML_COLS = [
+        '商品コード','商品名','仕入先','取扱区分','商品区分','最終仕入日','在庫保管日数',
+        '総在庫数','FBA在庫数','フリー在庫','注残数','引当数','総在庫数_引当なし',
+        '販売数7日_FBA','販売数7日_FBA以外','販売数7日_合計',
+        '販売数30日_FBA','販売数30日_FBA以外','販売数30日_合計',
+        '発注ロット単位','推奨保有月数','売価','原価','想定見込み利益','概算利益率',
+        '代表商品コード','ロケーションコード','商品分類タグ','登録日',
+      ];
+      const pub = db.prepare('SELECT run_id FROM product_management_published WHERE id=1').get();
+      const pmeta = pub ? db.prepare('SELECT * FROM product_management_snapshot_meta WHERE run_id=?').get(pub.run_id) : null;
+      if (pmeta && pmeta.status !== 'failed') {
+        const pmlRows = db.prepare(`SELECT ${PML_COLS.join(', ')} FROM product_management_snapshot_rows WHERE run_id=? ORDER BY 商品コード`).all(pmeta.run_id);
+        await sendPart({
+          pml_snapshot: {
+            run_id: pmeta.run_id, status: pmeta.status, as_of_date: pmeta.as_of_date,
+            generated_at: pmeta.generated_at, payload_checksum: pmeta.payload_checksum, row_count: pmeta.row_count,
+            src_ne_products_synced_at: pmeta.src_ne_products_synced_at, src_velocity_as_of: pmeta.src_velocity_as_of,
+            src_fba_business_date: pmeta.src_fba_business_date, src_reorder_updated_at: pmeta.src_reorder_updated_at,
+            ne_fba_overlap: pmeta.ne_fba_overlap, rows: pmlRows,
+          },
+        }, `商品管理リスト snapshot (${pmlRows.length}件, ${pmeta.status})`);
+        pmlSync = { state: 'sent', run_id: pmeta.run_id, count: pmlRows.length };
+      } else {
+        console.log('[Sync→Render]   商品管理リスト snapshot: 送信スキップ (published 無し or failed)');
+      }
+    }
+
     // Part 4: 最終メタデータ
     await sendPart({
       meta: { source: 'minipc', synced_at: ts, products_count: products.length,
@@ -434,7 +467,15 @@ export async function syncToRender() {
         sent: Array.isArray(sku_resolved) ? sku_resolved.length : 0,
         received: status.sku_resolved_count ?? 0,
       },
+      // 商品管理リスト snapshot (⑤)。skip(published無し/failed)は対象外、sent は run_id+件数一致を要求。
+      pml: {
+        state: pmlSync.state, sent: pmlSync.count, received: status.pml_snapshot_count ?? 0,
+        sent_run: pmlSync.run_id, received_run: status.pml_published_run_id ?? null,
+      },
     };
+    // pmlMatch: skip は OK、sent は mirror の published run_id と件数が一致していること (allMatch より前に評価)
+    const pmlMatch = pmlSync.state !== 'sent'
+      || (status.pml_published_run_id === pmlSync.run_id && (status.pml_snapshot_count ?? 0) === pmlSync.count);
 
     // stock_snapshot: fetched=false（SELECT失敗で同期スキップ）なら検証対象外。
     // fetched=true なら送信件数と受信件数が一致すべき。
@@ -457,14 +498,16 @@ export async function syncToRender() {
       && verify.daily.sent === verify.daily.received
       && stockMatch
       && skuMasterMatch
-      && skuResolvedMatch;
+      && skuResolvedMatch
+      && pmlMatch;
 
     if (allMatch) {
       console.log(`[Sync→Render] ✅ 検証OK — 全データ一致`);
       const stockLine = stockSyncPlan.fetched
         ? `\n月末在庫: ${verify.stock_snapshot.received}件`
         : `\n月末在庫: 取得スキップ`;
-      await notify(`✅ *Render同期完了*\n商品マスタ: ${verify.products.received}件\n月次集計: ${verify.monthly.received}件\n日次集計: ${verify.daily.received}件${stockLine}\nSKUマスタ: ${verify.sku_master.received}件\nSKU解決: ${verify.sku_resolved.received}件\n同期時刻: ${ts}`);
+      const pmlLine = pmlSync.state === 'sent' ? `\n商品管理リスト: ${verify.pml.received}件 (run=${verify.pml.received_run})` : `\n商品管理リスト: 送信スキップ`;
+      await notify(`✅ *Render同期完了*\n商品マスタ: ${verify.products.received}件\n月次集計: ${verify.monthly.received}件\n日次集計: ${verify.daily.received}件${stockLine}\nSKUマスタ: ${verify.sku_master.received}件\nSKU解決: ${verify.sku_resolved.received}件${pmlLine}\n同期時刻: ${ts}`);
     } else {
       console.log(`[Sync→Render] ⚠️ 検証NG — データ不一致`);
       console.log(`  products: 送信${verify.products.sent} / 受信${verify.products.received}`);
@@ -479,7 +522,11 @@ export async function syncToRender() {
       const skuResolvedLine = sku_resolved_state === 'ok'
         ? `SKU解決: ${verify.sku_resolved.sent}→${verify.sku_resolved.received}`
         : `SKU解決: 状態=${sku_resolved_state} (送信スキップ、mirror=${verify.sku_resolved.received})`;
-      await notify(`⚠️ *Render同期 データ不一致*\n商品: ${verify.products.sent}→${verify.products.received}\n月次: ${verify.monthly.sent}→${verify.monthly.received}\n日次: ${verify.daily.sent}→${verify.daily.received}\n在庫: ${verify.stock_snapshot.sent}→${verify.stock_snapshot.received}${stockSyncPlan.fetched ? '' : ' (skipped)'}\n${skuMasterLine}\n${skuResolvedLine}`);
+      const pmlLineNg = pmlSync.state === 'sent'
+        ? `商品管理リスト: 送信run=${verify.pml.sent_run}(${verify.pml.sent}件) / mirror run=${verify.pml.received_run}(${verify.pml.received}件)`
+        : `商品管理リスト: 送信スキップ`;
+      console.log(`  pml: ${pmlLineNg}`);
+      await notify(`⚠️ *Render同期 データ不一致*\n商品: ${verify.products.sent}→${verify.products.received}\n月次: ${verify.monthly.sent}→${verify.monthly.received}\n日次: ${verify.daily.sent}→${verify.daily.received}\n在庫: ${verify.stock_snapshot.sent}→${verify.stock_snapshot.received}${stockSyncPlan.fetched ? '' : ' (skipped)'}\n${skuMasterLine}\n${skuResolvedLine}\n${pmlLineNg}`);
     }
 
     // ok の判定方針 (Codex round 4 high 反映):
@@ -499,7 +546,13 @@ export async function syncToRender() {
     if (sku_resolved_failure) {
       console.warn(`[Sync→Render] sku_resolved 状態異常: ${sku_resolved_state} → ok:false`);
     }
-    return { ok: !(sku_master_failure || sku_resolved_failure), verify };
+    // 商品管理リスト snapshot: 送信した(state='sent')のに mirror の published run_id/件数が一致しないなら失敗
+    //   (送信HTTPエラーは上で throw 済。pmlMatch は allMatch より前で評価済み = 成功通知判定にも反映済み)。
+    const pml_failure = !pmlMatch;
+    if (pml_failure) {
+      console.warn(`[Sync→Render] pml_snapshot 反映不一致: 送信run=${pmlSync.run_id}(${pmlSync.count}件) / mirror run=${status.pml_published_run_id}(${status.pml_snapshot_count}件) → ok:false`);
+    }
+    return { ok: !(sku_master_failure || sku_resolved_failure || pml_failure), verify };
   } catch (e) {
     console.error(`[Sync→Render] ❌ 送信失敗:`, e.message);
     await notify(`❌ *Render同期失敗*\n${e.message.slice(0, 200)}`);
