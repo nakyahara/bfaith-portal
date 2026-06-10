@@ -544,6 +544,9 @@ router.post('/api/calculate', (req, res) => {
   const user = req.session?.email || 'unknown';
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
 
+  // 0. 確定直前に各モール確定済みデータを取り込み segment_sales を最新化（サーバ側で確実に実行）
+  try { syncSegmentSalesForMonth(db, year_month, now); } catch (e) { /* 取り込み失敗時も既存データで続行 */ }
+
   // 1. セグメント売上を取得
   const segSales = db.prepare('SELECT * FROM mart_monthly_segment_sales WHERE year_month = ?').all(year_month);
   if (segSales.length === 0) return res.status(400).json({ error: '売上データがありません' });
@@ -1099,10 +1102,7 @@ async function doCalculate() {
   if (!ym) return;
   if (!confirm(ym + ' の集計を確定しますか？')) return;
   await saveCosts();
-  // 各モールアプリで確定済みの最新データを取り込んでから確定（手動「売上同期」忘れでも揃う）
-  try {
-    await fetch(BASE + '/api/sync-segment-sales', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ year_month: ym }) });
-  } catch (e) { /* 同期失敗時も確定処理側のチェックに委ねる */ }
+  // 集計確定（サーバ側で確定直前に売上同期を行うため、ここでの手動同期は不要）
   await postCalculate(ym, false);
 }
 
