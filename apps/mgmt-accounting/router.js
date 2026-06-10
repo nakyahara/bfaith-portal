@@ -972,9 +972,16 @@ function buildCostRows(containerId, names, data, keyField) {
     const amountInc = existing ? toTaxIn(existing.amount) : 0; // 税抜→税込表示
     const note = existing ? (existing.note || '') : '';
     const tr = document.createElement('tr');
-    tr.innerHTML = '<td>' + name + '</td>'
-      + '<td><input type="number" class="input-amount" data-name="' + name + '" value="' + amountInc + '" onchange="updateTotals()"></td>'
-      + '<td><input type="text" style="width:150px;padding:6px;border:1px solid #ddd;border-radius:4px;font-size:13px;" data-note="' + name + '" value="' + note + '"></td>';
+    // FBA運賃 は Amazon FBA手数料から自動計算。手入力で上書きさせない（読み取り専用・保存対象外）
+    if (name === 'FBA運賃') {
+      tr.innerHTML = '<td>' + name + ' <span style="font-size:11px;color:#888">（自動）</span></td>'
+        + '<td><input type="number" class="input-amount" data-name="' + name + '" data-auto="1" value="' + amountInc + '" readonly style="background:#f1f3f4;color:#666;cursor:not-allowed"></td>'
+        + '<td style="font-size:12px;color:#888">Amazon FBA手数料から自動計算（売上同期で更新）</td>';
+    } else {
+      tr.innerHTML = '<td>' + name + '</td>'
+        + '<td><input type="number" class="input-amount" data-name="' + name + '" value="' + amountInc + '" onchange="updateTotals()"></td>'
+        + '<td><input type="text" style="width:150px;padding:6px;border:1px solid #ddd;border-radius:4px;font-size:13px;" data-note="' + name + '" value="' + note + '"></td>';
+    }
     tbody.appendChild(tr);
   }
 }
@@ -1014,6 +1021,7 @@ async function saveCosts() {
   // 運賃（国内）入力は税込→税抜で保存
   const freightItems = [];
   document.querySelectorAll('#freightBody .input-amount').forEach(i => {
+    if (i.dataset.auto) return; // FBA運賃は自動管理なので保存対象外（手入力で上書きしない）
     freightItems.push({ carrier: i.dataset.name, amount: toTaxEx(Number(i.value) || 0), cost_scope: 'shared' });
   });
   // 運賃（輸出）
