@@ -85,11 +85,16 @@
 
     <% if (typeof publish !== 'undefined' && publish) { %>
     <div class="card mb-3">
-      <div class="card-header">
-        <strong>publish 状況 (publish_idempotency)</strong>
-        <span class="badge <%= publishEnabled ? 'bg-success' : 'bg-secondary' %> ms-2">
-          <%= publishEnabled ? 'RYS_PUBLISH_ENABLED=1 (ON)' : 'RYS_PUBLISH_ENABLED=0 (OFF)' %>
-        </span>
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <div>
+          <strong>publish 状況 (publish_idempotency)</strong>
+          <span class="badge <%= publishEnabled ? 'bg-success' : 'bg-secondary' %> ms-2">
+            <%= publishEnabled ? 'RYS_PUBLISH_ENABLED=1 (ON)' : 'RYS_PUBLISH_ENABLED=0 (OFF)' %>
+          </span>
+        </div>
+        <% if (publishEnabled) { %>
+        <button class="btn btn-danger btn-sm" onclick="openPublishModal()">▶️ 1 商品 publish</button>
+        <% } %>
       </div>
       <div class="card-body row">
         <div class="col"><div class="text-muted small">total</div><div class="h4"><%= publish.total %></div></div>
@@ -100,9 +105,45 @@
       </div>
       <% if (!publishEnabled) { %>
       <div class="card-footer small text-muted">
-        実 publish は kill-switch で停止中です。 Render env に <code>RYS_PUBLISH_ENABLED=1</code> を set すると有効化されます (E-5b で vps-proxy 拡張完了後に推奨)。
+        実 publish は kill-switch で停止中です。 Render env に <code>RYS_PUBLISH_ENABLED=1</code> を set すると有効化されます。
       </div>
       <% } %>
+    </div>
+    <% } %>
+
+    <!-- Publish モーダル (RYS_PUBLISH_ENABLED=1 のときのみ表示) -->
+    <% if (typeof publishEnabled !== 'undefined' && publishEnabled) { %>
+    <div id="publishModal" class="modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:1050;">
+      <div class="card" style="max-width:520px; margin:80px auto;">
+        <div class="card-header bg-danger text-white">
+          <strong>⚠️ 1 商品で実 publish</strong>
+        </div>
+        <div class="card-body">
+          <div class="alert alert-warning small">
+            これは <strong>実際に Yahoo!ショッピングへ商品を登録する</strong> 操作です。 readiness が ok の商品のみ進みます。 idempotency_key で 2 回目以降は dedupe されます。
+          </div>
+          <div class="mb-3">
+            <label class="form-label">item_code (= 楽天 itemNumber)</label>
+            <input type="text" class="form-control" id="pub_itemCode" placeholder="例: seaweedp">
+          </div>
+          <div class="mb-3">
+            <label class="form-label">manage_number (省略可、 warehouse 経由で自動解決)</label>
+            <input type="text" class="form-control" id="pub_manageNumber">
+          </div>
+          <div class="mb-3">
+            <label class="form-label">productCategory (Yahoo)</label>
+            <input type="text" class="form-control" id="pub_productCategory" placeholder="例: 1933">
+          </div>
+          <div class="mb-3">
+            <label class="form-label">pathName (売り場)</label>
+            <input type="text" class="form-control" id="pub_pathName" placeholder="例: 食品 > 海藻">
+          </div>
+        </div>
+        <div class="card-footer d-flex justify-content-end gap-2">
+          <button class="btn btn-secondary" onclick="closePublishModal()">キャンセル</button>
+          <button class="btn btn-danger" onclick="executePublish()">実行</button>
+        </div>
+      </div>
     </div>
     <% } %>
 
@@ -144,6 +185,51 @@
   </div>
 
 <script>
+function openPublishModal() { document.getElementById('publishModal').style.display = 'block'; }
+function closePublishModal() { document.getElementById('publishModal').style.display = 'none'; }
+
+async function executePublish() {
+  const itemCode = document.getElementById('pub_itemCode').value.trim();
+  if (!itemCode) { alert('item_code を入力してください'); return; }
+  const body = {
+    manageNumber: document.getElementById('pub_manageNumber').value.trim() || undefined,
+    productCategory: document.getElementById('pub_productCategory').value.trim() || undefined,
+    pathName: document.getElementById('pub_pathName').value.trim() || undefined,
+  };
+  if (!confirm(`item_code=${itemCode} で実 publish を実行します。 良いですか?`)) return;
+  const out = document.getElementById('syncResult');
+  out.innerHTML = '<div class="alert alert-info">実 publish 実行中... (画像 download → JPEG 変換 → uploadItemImage → editItem)</div>';
+  closePublishModal();
+  try {
+    const res = await fetch('/apps/rakuten-yahoo-sync/api/publish/execute/' + encodeURIComponent(itemCode), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    const klass = data.status === 'success' ? 'alert-success'
+      : data.status === 'dedupe' ? 'alert-secondary'
+      : data.status === 'readiness_blocked' ? 'alert-warning'
+      : 'alert-danger';
+    // Codex E-5b R1 M-1: JSON.stringify を innerHTML 直挿入する代わりに textContent で escape
+    const wrap = document.createElement('div');
+    wrap.className = 'alert ' + klass;
+    const head = document.createElement('strong');
+    head.textContent = data.status || 'unknown';
+    const pre = document.createElement('pre');
+    pre.textContent = JSON.stringify(data, null, 2);
+    wrap.appendChild(head);
+    wrap.appendChild(pre);
+    out.replaceChildren(wrap);
+    if (data.status === 'success' || data.status === 'dedupe') setTimeout(() => location.reload(), 2500);
+  } catch (e) {
+    const wrap = document.createElement('div');
+    wrap.className = 'alert alert-danger';
+    wrap.textContent = 'network error: ' + e.message;
+    out.replaceChildren(wrap);
+  }
+}
+
 async function runSync(dryRun) {
   const btn = event.target;
   btn.disabled = true;

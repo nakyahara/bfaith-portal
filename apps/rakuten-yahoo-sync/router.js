@@ -324,12 +324,14 @@ router.post('/api/publish/execute/:itemCode', async (req, res) => {
       },
     });
 
-    // status マッピング
+    // status マッピング (Codex E-5b R1 H-3: publish_failed / lease_lost 追加)
     if (result.status === 'in_progress_conflict') return res.status(409).json(result);
     if (result.status === 'dedupe') return res.status(200).json(result);
     if (result.status === 'readiness_blocked') return res.status(422).json(result);
     if (result.status === 'not_implemented') return res.status(501).json(result);
     if (result.status === 'flag_off') return res.status(403).json(result);
+    if (result.status === 'publish_failed') return res.status(502).json(result);  // Yahoo / proxy 起因の publish 失敗
+    if (result.status === 'lease_lost') return res.status(423).json(result);      // CAS 喪失 (locked / 競合)
     if (result.status === 'fail') return res.status(500).json(result);
     return res.json(result);
   } catch (e) {

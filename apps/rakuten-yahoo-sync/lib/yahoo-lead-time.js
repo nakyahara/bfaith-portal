@@ -1,25 +1,33 @@
 /**
- * Yahoo lead_time_instock=1000 preflight (Codex R5 high-6 + Phase 0 Q26):
+ * Yahoo lead_time_instock=1000 preflight (Phase 0 Q26 + Codex R5 high-6 確定):
  *   全商品で固定 1000 を送る方針だが、 Yahoo ストア発送日設定マスタに ID=1000 が
  *   実在するかを publish 試行前にチェックする。
  *
- * E-4 (本ファイル): caller 差し替え可能な stub。 default は env RYS_LEAD_TIME_VERIFIED=1 のときのみ ok=true。
- *   E-5 で Yahoo getLeadTimeList API を実呼び出しする実装に置き換え予定。
+ * Phase E-5b 改: vps-proxy 経由で実 API 呼び出しに差替。
+ *   - vps-proxy /yahoo/getLeadTimeList を叩いて ID 一覧取得
+ *   - 1000 が含まれているか確認
+ *   - process 内 cache あり (forceRefresh で破棄)
+ *
+ * 旧 stub 経路 (env RYS_LEAD_TIME_VERIFIED=1) は、 vps-proxy が未 deploy or 障害時の
+ * 緊急回避用に残置 (env で明示的に強制 ok を返せる)。
  */
+
+import { fetchLeadTimeList, YahooProxyError } from './yahoo-publish-proxy.js';
 
 export const TARGET_ID = 1000;
 
 let _cachedResult = null;
 let _inflight = null;
 
-/**
- * 1000 が実在するかを判定。
- *   - env RYS_LEAD_TIME_VERIFIED=1 なら ok=true (中原さんが手動で 1000 実在を Yahoo Store で確認した状態)
- *   - そうでなければ ok=false (E-5 で実 API 呼び出しに切り替えるまでの fail-closed)
- *   - caller オプションで実 API 呼び出しに差し替え可能
- */
 export async function runLeadTimePreflight({ forceRefresh = false, caller = null } = {}) {
   if (!forceRefresh && _cachedResult) return _cachedResult;
+
+  // 緊急回避 stub: env 明示時のみ ok を返す (vps-proxy 障害時の退避)
+  if (String(process.env.RYS_LEAD_TIME_VERIFIED || '0').trim() === '1') {
+    _cachedResult = { ok: true, targetId: TARGET_ID, source: 'env_override_stub' };
+    return _cachedResult;
+  }
+
   if (caller) {
     if (!_inflight) {
       _inflight = (async () => {
@@ -35,12 +43,28 @@ export async function runLeadTimePreflight({ forceRefresh = false, caller = null
     await _inflight;
     return _cachedResult || { ok: false, error: 'unknown', targetId: TARGET_ID };
   }
-  // default stub: env flag で OK/NG
-  const verified = String(process.env.RYS_LEAD_TIME_VERIFIED || '0').trim() === '1';
-  _cachedResult = verified
-    ? { ok: true, targetId: TARGET_ID, source: 'env_stub' }
-    : { ok: false, error: `lead_time_preflight_stub: set RYS_LEAD_TIME_VERIFIED=1 after confirming ID ${TARGET_ID} exists in Yahoo Store master`, targetId: TARGET_ID, source: 'env_stub' };
-  return _cachedResult;
+
+  // 本実装: vps-proxy 経由で getLeadTimeList を叩く
+  if (!_inflight) {
+    _inflight = (async () => {
+      try {
+        const { ids } = await fetchLeadTimeList();
+        const ok = ids.includes(TARGET_ID);
+        _cachedResult = ok
+          ? { ok: true, targetId: TARGET_ID, totalIds: ids.length, source: 'yahoo_api' }
+          : { ok: false, error: `target_id_${TARGET_ID}_not_found_in_yahoo_store`, totalIds: ids.length, source: 'yahoo_api' };
+      } catch (e) {
+        const errMsg = e instanceof YahooProxyError
+          ? `vps-proxy: ${e.message}`
+          : (e.message || String(e));
+        _cachedResult = { ok: false, error: errMsg, targetId: TARGET_ID, source: 'yahoo_api_failed' };
+      } finally {
+        _inflight = null;
+      }
+    })();
+  }
+  await _inflight;
+  return _cachedResult || { ok: false, error: 'unknown', targetId: TARGET_ID };
 }
 
 export function _resetForTest() {
