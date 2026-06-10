@@ -117,6 +117,15 @@ router.post('/api/notion/sync', async (req, res) => {
   const body = req.body || {};
   const mode = body.mode || 'full';
   const dryRun = !!body.dryRun;
+
+  // Codex E-2 R1 M-2: delta mode は実装未完なので 400 reject (since/cursor 未配線)
+  if (mode === 'delta') {
+    return res.status(400).json({
+      status: 'fail',
+      error: 'mode=delta is experimental and not yet implemented (since/cursor wiring pending)',
+    });
+  }
+
   const lockPath = getLockPath();
   let release;
   try {
@@ -131,13 +140,24 @@ router.post('/api/notion/sync', async (req, res) => {
     try {
       const db = getDB();
       const result = await syncNotionOverrides({ db, mode, dryRun });
+      const errorCount = result.errors.length;
+      // Codex E-2 R1 M-1: 行レベル errors > 0 は partial fail として 207 で返す + audit failed
+      if (errorCount > 0) {
+        audit(db, 'notion_sync_partial_fail', {
+          mode, dryRun, runId: result.runId,
+          inserted: result.inserted, updated: result.updated,
+          skipped: result.skipped, deleted: result.deleted,
+          errors: errorCount,
+        }, { result: 'failed', errorMessage: `partial-fail: ${errorCount} row error(s)` });
+        return res.status(207).json({ status: 'partial-fail', ...result });
+      }
       audit(db, 'notion_sync', {
         mode, dryRun, runId: result.runId,
         inserted: result.inserted, updated: result.updated,
         skipped: result.skipped, deleted: result.deleted,
-        errors: result.errors.length,
+        errors: 0,
       });
-      return res.json(result);
+      return res.json({ status: 'ok', ...result });
     } catch (e) {
       try {
         const db = getDB();

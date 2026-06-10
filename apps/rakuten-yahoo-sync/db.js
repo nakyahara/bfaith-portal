@@ -27,6 +27,10 @@ let _db = null;
 /**
  * migrations フォルダから NNN_*.sql を昇順で集める。
  *   NNN は migration version (3 桁ゼロ埋め推奨だが parseInt で許容)。
+ *
+ * Codex E-2 R1 Low-1: 同 version の重複 file は起動時 throw で fail-closed。
+ *   例: 001_initial.sql と 001_legacy.sql が両方あると、 どちらが「正」 か不定で
+ *       挙動が緩い (両方 apply される) → 静かに schema 競合する可能性。
  */
 function listMigrationFiles() {
   if (!fs.existsSync(MIGRATIONS_DIR)) return [];
@@ -39,6 +43,16 @@ function listMigrationFiles() {
     }))
     .filter((e) => Number.isFinite(e.version));
   entries.sort((a, b) => a.version - b.version);
+  // 重複 version 検出
+  const seen = new Map();
+  for (const e of entries) {
+    if (seen.has(e.version)) {
+      throw new Error(
+        `[rys-migrate] duplicate migration version ${e.version}: ${seen.get(e.version)} vs ${e.file}`
+      );
+    }
+    seen.set(e.version, e.file);
+  }
   return entries;
 }
 
