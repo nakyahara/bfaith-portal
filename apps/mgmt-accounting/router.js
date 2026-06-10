@@ -548,20 +548,27 @@ router.post('/api/calculate', (req, res) => {
   const segSales = db.prepare('SELECT * FROM mart_monthly_segment_sales WHERE year_month = ?').all(year_month);
   if (segSales.length === 0) return res.status(400).json({ error: '売上データがありません' });
 
-  // 1.5 完全性チェック: 直近3ヶ月で来ているモールが当月に揃っているか。
-  //     揃う前に確定すると「売上過少 × 運賃満額 → 粗利マイナス」事故になるため、
-  //     欠けモールがあれば確定をブロック（allow_partial で明示的に強制可能）。
-  const presentMalls = new Set(segSales.map(r => r.mall_id));
-  const expectedMalls = db.prepare(
-    'SELECT DISTINCT mall_id FROM mart_monthly_segment_sales WHERE year_month >= ? AND year_month < ?'
-  ).all(addMonths(year_month, -3), year_month).map(r => r.mall_id);
-  const missingMalls = expectedMalls.filter(m => !presentMalls.has(m));
+  // 1.5 完全性チェック: 直近3ヶ月で当月を確定しているモールが当月も確定済みか。
+  //     揃う前に確定すると「売上過少 × 運賃満額 → 粗利マイナス」事故になるため。
+  //     判定は「各モール集計テーブル(mart_<mall>_monthly_summary)にその月の確定があるか」で行う。
+  //     segment_sales の分類済み行ではなく確定の有無で見る（分類行ゼロ＝全て"その他"でも
+  //     確定済みなら揃いとみなす。低頻度モールや未分類SKUでの誤検知を防ぐ）。allow_partial で強制可。
+  const hasSummary = (table, fromYm, toYm) => {
+    try {
+      return toYm
+        ? !!db.prepare(`SELECT 1 FROM ${table} WHERE year_month >= ? AND year_month < ? LIMIT 1`).get(fromYm, toYm)
+        : !!db.prepare(`SELECT 1 FROM ${table} WHERE year_month = ? LIMIT 1`).get(fromYm);
+    } catch { return false; }
+  };
+  const missingMalls = MALL_TABLES
+    .filter(mt => hasSummary(mt.table, addMonths(year_month, -3), year_month) && !hasSummary(mt.table, year_month))
+    .map(mt => mt.mall_id);
   if (missingMalls.length > 0 && allow_partial !== true) {
     const names = missingMalls.map(m => MALL_NAMES[m] || m);
     return res.status(409).json({
       error: 'incomplete_malls',
       missing_malls: missingMalls,
-      message: names.join('・') + ' のデータがまだ取り込まれていません。全モール揃ってから確定してください。',
+      message: names.join('・') + ' の当月データがまだ確定されていません。全モール確定してから確定してください。',
     });
   }
 
@@ -1092,6 +1099,10 @@ async function doCalculate() {
   if (!ym) return;
   if (!confirm(ym + ' の集計を確定しますか？')) return;
   await saveCosts();
+  // 各モールアプリで確定済みの最新データを取り込んでから確定（手動「売上同期」忘れでも揃う）
+  try {
+    await fetch(BASE + '/api/sync-segment-sales', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ year_month: ym }) });
+  } catch (e) { /* 同期失敗時も確定処理側のチェックに委ねる */ }
   await postCalculate(ym, false);
 }
 
