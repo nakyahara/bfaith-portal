@@ -681,41 +681,8 @@ async function main() {
   const monitorFeeResult = runScript('apps/warehouse/monitor-fee-coverage.js', '手数料カバー率監視', 60000);
   results.push({ name: '手数料カバー率監視', ...monitorFeeResult });
 
-  // 売上分類別粗利集計 (mgmt-accounting): 各モール確定済みデータから売上を自動同期。
-  // 確定済み月の売上が変動したら needs_review に落として表示から外す。運賃込みの最終確定は人手のまま。
-  if (syncResult.success) {
-    console.log('\n=== 売上分類別粗利集計 売上自動同期 ===');
-    try {
-      const base = (process.env.RENDER_MIRROR_URL || 'https://bfaith-portal.onrender.com/apps/mirror').replace(/\/apps\/mirror\/?$/, '');
-      const syncKey = process.env.MIRROR_SYNC_KEY;
-      if (!syncKey) {
-        results.push({ name: '粗利集計 売上同期', success: false, summary: '❌ MIRROR_SYNC_KEY 未設定 (.env に追加してください)' });
-      } else {
-        const resp = await fetch(`${base}/apps/mgmt-accounting/auto-sync-sales`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'x-sync-key': syncKey },
-          body: JSON.stringify({}),
-          signal: AbortSignal.timeout(120000),
-        });
-        const data = await resp.json().catch(() => ({}));
-        if (resp.ok && data.ok) {
-          const flaggedNote = (data.flagged && data.flagged.length > 0)
-            ? ` ⚠️要再確定: ${data.flagged.map(f => f.year_month).join(',')}` : '';
-          console.log(`[粗利集計] 売上同期 ${data.synced}/${data.months}ヶ月${flaggedNote}`);
-          results.push({ name: '粗利集計 売上同期', success: true, summary: `${data.synced}ヶ月同期${flaggedNote}` });
-        } else {
-          const err = data.error || `HTTP ${resp.status}`;
-          console.error('[粗利集計] 売上同期失敗:', err);
-          results.push({ name: '粗利集計 売上同期', success: false, summary: extractErrorSummary(err) });
-        }
-      }
-    } catch (e) {
-      console.error('[粗利集計] 売上同期 例外:', e.message);
-      results.push({ name: '粗利集計 売上同期', success: false, summary: extractErrorSummary(e.message) });
-    }
-  } else {
-    results.push({ name: '粗利集計 売上同期', success: true, skipped: true, summary: '⏸️ skipped (Render同期 失敗)' });
-  }
+  // 売上分類別粗利集計 (mgmt-accounting) の売上自動同期は Render 完結（server.js の常駐
+  // スケジューラが in-process で実行）に移行したため、daily-sync(miniPC)からの起動は撤去。
 
   // 月初の自動 月末確定値保存
   // 条件: 今日が月初 (JST) かつ アップストリームのデータ取得が全部成功してる

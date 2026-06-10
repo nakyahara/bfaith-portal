@@ -476,19 +476,13 @@ router.post('/api/sync-segment-sales', (req, res) => {
   res.json({ ok: true, inserted: r.inserted, fba_freight_tax_excluded: r.fba_freight_tax_excluded, needs_review: r.flagged });
 });
 
-// ─── 売上自動同期（daily-sync から MIRROR_SYNC_KEY 認証で呼ぶ）───
-// mart_*_monthly_summary に存在する全月の売上を mart_monthly_segment_sales へ再同期。
-// 確定済み(confirmed)の月で売上が変動していたら status='needs_review'（要再確定）へ落とし、
+// ─── 売上自動同期の本体（in-process）───
+// 各モール summary + 既存 segment_sales + 確定済み closing の和集合の月を再同期。
+// summary が全消えした月も candidate に含めて segment_sales を空にし整合させる。
+// 確定済み(confirmed)月で入力が変動したら status='needs_review'（要再確定）へ落とし、
 // 表示ゲートで自動的にグラフから外す。運賃込みPLの最終確定は人手のまま。
-router.post('/auto-sync-sales', (req, res) => {
-  // machine endpoint は fail-closed（key 未設定で無認証公開にしない）
-  if (!process.env.MIRROR_SYNC_KEY) return res.status(503).json({ error: 'MIRROR_SYNC_KEY 未設定 (fail-closed)' });
-  if (!checkAuth(req, res)) return;
-  const db = getMirrorDB();
+function runMgmtAutoSync(db) {
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
-
-  // 対象月: 各モール summary + 既存 segment_sales + 確定済み closing の和集合。
-  // summary が全消えした月も candidate に含めることで segment_sales を空にして整合させる。
   const monthsSet = new Set();
   for (const mt of MALL_TABLES) {
     try {
@@ -500,15 +494,48 @@ router.post('/auto-sync-sales', (req, res) => {
   const months = [...monthsSet].sort();
 
   const flagged = [];
-  let syncedCount = 0;
   for (const ym of months) {
     const r = syncAndReconcileMonth(db, ym, now); // 月単位の同一tx（完全置換→差分判定→降格）
-    syncedCount++;
     if (r.flagged) flagged.push({ year_month: ym });
   }
+  return { months: months.length, synced: months.length, flagged };
+}
 
-  res.json({ ok: true, months: months.length, synced: syncedCount, flagged });
+// 売上自動同期エンドポイント（手動/デバッグ用。MIRROR_SYNC_KEY 認証）。
+// 定期実行は Render 常駐スケジューラ(startMgmtAutoSyncScheduler)が in-process で行う。
+router.post('/auto-sync-sales', (req, res) => {
+  if (!process.env.MIRROR_SYNC_KEY) return res.status(503).json({ error: 'MIRROR_SYNC_KEY 未設定 (fail-closed)' });
+  if (!checkAuth(req, res)) return;
+  res.json({ ok: true, ...runMgmtAutoSync(getMirrorDB()) });
 });
+
+// ─── Render 常駐スケジューラ ───
+// この集計は Render の mart_*_monthly_summary を読み Render mirror に書く = Render 完結。
+// miniPC に依存せず、Render の web プロセス内で定期的に自動同期する（server.js が RENDER 環境でのみ起動）。
+let _mgmtAutoSyncTimer = null;
+let _mgmtAutoSyncRunning = false;
+function runMgmtAutoSyncSafely(label) {
+  if (_mgmtAutoSyncRunning) return;
+  _mgmtAutoSyncRunning = true;
+  try {
+    const r = runMgmtAutoSync(getMirrorDB());
+    const note = r.flagged.length ? ` / 要再確定: ${r.flagged.map(f => f.year_month).join(',')}` : '';
+    console.log(`[mgmt-auto-sync] ${label}: ${r.synced}ヶ月同期${note}`);
+  } catch (e) {
+    console.error(`[mgmt-auto-sync] ${label} 失敗:`, e.message);
+  } finally {
+    _mgmtAutoSyncRunning = false;
+  }
+}
+export function startMgmtAutoSyncScheduler() {
+  if (_mgmtAutoSyncTimer) return;
+  const intervalMin = Math.max(10, parseInt(process.env.MGMT_AUTOSYNC_INTERVAL_MIN) || 120);
+  // 起動直後に1回（DB初期化を待って60秒後）、以降は intervalMin ごと
+  setTimeout(() => runMgmtAutoSyncSafely('boot'), 60 * 1000).unref?.();
+  _mgmtAutoSyncTimer = setInterval(() => runMgmtAutoSyncSafely('interval'), intervalMin * 60 * 1000);
+  _mgmtAutoSyncTimer.unref?.();
+  console.log(`[mgmt-auto-sync] scheduler started (interval=${intervalMin}min)`);
+}
 
 // 集計計算＆確定
 router.post('/api/calculate', (req, res) => {
@@ -517,24 +544,39 @@ router.post('/api/calculate', (req, res) => {
   const user = req.session?.email || 'unknown';
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
 
+  // 0. 確定直前に各モール確定済みデータを取り込み segment_sales を最新化（サーバ側で確実に実行）。
+  //    同期失敗時は古いデータで確定しないよう fail-closed（確定を中止）。
+  try {
+    syncSegmentSalesForMonth(db, year_month, now);
+  } catch (e) {
+    return res.status(500).json({ error: '売上同期に失敗したため確定を中止しました: ' + e.message });
+  }
+
   // 1. セグメント売上を取得
   const segSales = db.prepare('SELECT * FROM mart_monthly_segment_sales WHERE year_month = ?').all(year_month);
   if (segSales.length === 0) return res.status(400).json({ error: '売上データがありません' });
 
-  // 1.5 完全性チェック: 直近3ヶ月で来ているモールが当月に揃っているか。
-  //     揃う前に確定すると「売上過少 × 運賃満額 → 粗利マイナス」事故になるため、
-  //     欠けモールがあれば確定をブロック（allow_partial で明示的に強制可能）。
-  const presentMalls = new Set(segSales.map(r => r.mall_id));
-  const expectedMalls = db.prepare(
-    'SELECT DISTINCT mall_id FROM mart_monthly_segment_sales WHERE year_month >= ? AND year_month < ?'
-  ).all(addMonths(year_month, -3), year_month).map(r => r.mall_id);
-  const missingMalls = expectedMalls.filter(m => !presentMalls.has(m));
+  // 1.5 完全性チェック: 直近3ヶ月で当月を確定しているモールが当月も確定済みか。
+  //     揃う前に確定すると「売上過少 × 運賃満額 → 粗利マイナス」事故になるため。
+  //     判定は「各モール集計テーブル(mart_<mall>_monthly_summary)にその月の確定があるか」で行う。
+  //     segment_sales の分類済み行ではなく確定の有無で見る（分類行ゼロ＝全て"その他"でも
+  //     確定済みなら揃いとみなす。低頻度モールや未分類SKUでの誤検知を防ぐ）。allow_partial で強制可。
+  const hasSummary = (table, fromYm, toYm) => {
+    try {
+      return toYm
+        ? !!db.prepare(`SELECT 1 FROM ${table} WHERE year_month >= ? AND year_month < ? LIMIT 1`).get(fromYm, toYm)
+        : !!db.prepare(`SELECT 1 FROM ${table} WHERE year_month = ? LIMIT 1`).get(fromYm);
+    } catch { return false; }
+  };
+  const missingMalls = MALL_TABLES
+    .filter(mt => hasSummary(mt.table, addMonths(year_month, -3), year_month) && !hasSummary(mt.table, year_month))
+    .map(mt => mt.mall_id);
   if (missingMalls.length > 0 && allow_partial !== true) {
     const names = missingMalls.map(m => MALL_NAMES[m] || m);
     return res.status(409).json({
       error: 'incomplete_malls',
       missing_malls: missingMalls,
-      message: names.join('・') + ' のデータがまだ取り込まれていません。全モール揃ってから確定してください。',
+      message: names.join('・') + ' の当月データがまだ確定されていません。全モール確定してから確定してください。',
     });
   }
 
@@ -972,9 +1014,16 @@ function buildCostRows(containerId, names, data, keyField) {
     const amountInc = existing ? toTaxIn(existing.amount) : 0; // 税抜→税込表示
     const note = existing ? (existing.note || '') : '';
     const tr = document.createElement('tr');
-    tr.innerHTML = '<td>' + name + '</td>'
-      + '<td><input type="number" class="input-amount" data-name="' + name + '" value="' + amountInc + '" onchange="updateTotals()"></td>'
-      + '<td><input type="text" style="width:150px;padding:6px;border:1px solid #ddd;border-radius:4px;font-size:13px;" data-note="' + name + '" value="' + note + '"></td>';
+    // FBA運賃 は Amazon FBA手数料から自動計算。手入力で上書きさせない（読み取り専用・保存対象外）
+    if (name === 'FBA運賃') {
+      tr.innerHTML = '<td>' + name + ' <span style="font-size:11px;color:#888">（自動）</span></td>'
+        + '<td><input type="number" class="input-amount" data-name="' + name + '" data-auto="1" value="' + amountInc + '" readonly style="background:#f1f3f4;color:#666;cursor:not-allowed"></td>'
+        + '<td style="font-size:12px;color:#888">Amazon FBA手数料から自動計算（売上同期で更新）</td>';
+    } else {
+      tr.innerHTML = '<td>' + name + '</td>'
+        + '<td><input type="number" class="input-amount" data-name="' + name + '" value="' + amountInc + '" onchange="updateTotals()"></td>'
+        + '<td><input type="text" style="width:150px;padding:6px;border:1px solid #ddd;border-radius:4px;font-size:13px;" data-note="' + name + '" value="' + note + '"></td>';
+    }
     tbody.appendChild(tr);
   }
 }
@@ -1014,6 +1063,7 @@ async function saveCosts() {
   // 運賃（国内）入力は税込→税抜で保存
   const freightItems = [];
   document.querySelectorAll('#freightBody .input-amount').forEach(i => {
+    if (i.dataset.auto) return; // FBA運賃は自動管理なので保存対象外（手入力で上書きしない）
     freightItems.push({ carrier: i.dataset.name, amount: toTaxEx(Number(i.value) || 0), cost_scope: 'shared' });
   });
   // 運賃（輸出）
@@ -1057,6 +1107,7 @@ async function doCalculate() {
   if (!ym) return;
   if (!confirm(ym + ' の集計を確定しますか？')) return;
   await saveCosts();
+  // 集計確定（サーバ側で確定直前に売上同期を行うため、ここでの手動同期は不要）
   await postCalculate(ym, false);
 }
 
