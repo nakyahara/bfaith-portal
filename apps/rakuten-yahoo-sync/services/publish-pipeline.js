@@ -162,6 +162,8 @@ export async function evaluateItemForPublish({
       variant_count: variationResult.variantCount,
       lead_time_ok: leadTimePreflight?.ok,
       image_ok: imagePreflight?.ok,
+      // Phase E-5b: executor が performRealPublish で使う楽天 raw images を渡す
+      rakutenImages: rakutenItem.images || [],
     },
   };
 }

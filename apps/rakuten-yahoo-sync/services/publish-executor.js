@@ -17,11 +17,17 @@
 
 import crypto from 'crypto';
 import { evaluateItemForPublish } from './publish-pipeline.js';
+import { callEditItem, YahooProxyError } from '../lib/yahoo-publish-proxy.js';
+import { uploadRakutenImagesToYahoo } from '../lib/image-uploader.js';
 
 const ALLOWED_STATUSES = new Set(['in_progress', 'success', 'failed', 'not_implemented']);
 
-// Codex E-5a R1 M-2: in_progress lease の TTL (process crash 時に永続残留しない)
-const LEASE_TTL_MS = 10 * 60 * 1000; // 10 分
+// Codex E-5a R1 M-2 + E-5b R1 H-4: in_progress lease の TTL。
+//   実 publish の典型処理: filter → download (10 枚 × 20s timeout) + JPEG 変換 (sharp 数秒)
+//   + uploadItemImage (10 枚 × 60s timeout) + editItem (60s timeout) = 最悪 ~15 分。
+//   TTL を 30 分に設定して、 long-running publish 中の race を最小化。
+//   E-5b R1 H-4: 10 分は短すぎ画像多 publish で stale steal による重複 Yahoo 副作用リスクあり。
+const LEASE_TTL_MS = 30 * 60 * 1000; // 30 分
 
 // Codex E-5a R1 M-1: 'not_implemented' は terminal だが dedupe 対象外。
 //   E-5b で同 key で再投げると実 publish に進めるようにする (placeholder を再実行可能)。
@@ -136,6 +142,29 @@ function dedupeResponse(existing, idempotencyKey) {
     executorResult: existing.result_json ? JSON.parse(existing.result_json) : null,
     previousError: existing.error_message,
     previousAttempt: existing.attempt,
+  };
+}
+
+/**
+ * 実 publish 本体 (Phase E-5b):
+ *   1. 楽天画像を Yahoo に upload (filter + JPEG + 順次)
+ *   2. editItem を form-encoded で叩いて商品登録 (fields.display=1 で公開)
+ *   失敗時は throw (caller が CAS finalize で 'failed' に倒す)
+ */
+async function performRealPublish({ rakutenImages, fields, itemCode }) {
+  if (!fields) throw new Error('performRealPublish: fields required');
+
+  // 1. 画像 upload
+  const imageResult = await uploadRakutenImagesToYahoo({ rakutenImages: rakutenImages || [], itemCode });
+  if (imageResult.uploaded === 0) {
+    throw new Error(`image_upload_zero: failed=${imageResult.failed}, errors=${imageResult.errors.join('; ')}`);
+  }
+
+  // 2. editItem (form-encoded) — fields は publish-pipeline で組み立て済
+  const editResult = await callEditItem(fields);
+  return {
+    images: imageResult,
+    editItem: { status: editResult.status, bodyPreview: String(editResult.body).slice(0, 300) },
   };
 }
 
@@ -304,26 +333,58 @@ export async function executePublish({
       };
     }
 
-    // Phase E-5a: Yahoo API 呼び出し本体は未実装 (501 placeholder)
+    // Phase E-5b: 実 publish — 画像 upload → editItem 呼び出し
+    let publishResult;
+    try {
+      publishResult = await performRealPublish({
+        rakutenImages: evalResult.debug?.rakutenImages || [],
+        fields: evalResult.fields,
+        itemCode,
+      });
+    } catch (e) {
+      const errMsg = e instanceof YahooProxyError ? `yahoo_proxy: ${e.message}` : (e.message || String(e));
+      const finalized = finalize(db, {
+        idempotencyKey,
+        status: 'failed',
+        resultJson: JSON.stringify({ ...evalResult, publishError: errMsg }),
+        errorMessage: `real_publish_failed: ${errMsg}`,
+        ownAttempt,
+      });
+      if (!finalized) {
+        return {
+          status: 'lease_lost',
+          idempotencyKey,
+          error: `publish threw "${errMsg}" but lease was stolen before finalize`,
+        };
+      }
+      audit(db, 'publish_execute_publish_fail', { itemCode, error: errMsg }, { result: 'failed', errorMessage: errMsg });
+      return {
+        status: 'publish_failed',
+        idempotencyKey,
+        error: errMsg,
+        executorResult: evalResult,
+      };
+    }
+
     const finalized = finalize(db, {
       idempotencyKey,
-      status: 'not_implemented',
-      resultJson: JSON.stringify({ ...evalResult, executor_note: 'E-5a placeholder, Yahoo API call deferred to E-5b' }),
-      errorMessage: 'Yahoo editItem call not yet implemented (E-5b)',
+      status: 'success',
+      resultJson: JSON.stringify({ ...evalResult, publishResult }),
       ownAttempt,
     });
     if (!finalized) {
       return {
         status: 'lease_lost',
         idempotencyKey,
-        error: 'finalize CAS failed: another caller has stolen the lease before we could write the result.',
+        error: 'finalize CAS failed: lease was stolen after Yahoo publish call. Manual reconciliation required (the editItem call may have succeeded on Yahoo side).',
+        publishResult,
       };
     }
-    audit(db, 'publish_execute_placeholder', { itemCode, idempotencyKey }, { result: 'success' });
+    audit(db, 'publish_execute_success', { itemCode, idempotencyKey, publishResult }, { result: 'success' });
     return {
-      status: 'not_implemented',
+      status: 'success',
       idempotencyKey,
-      message: 'Phase E-5a placeholder. readiness check passed and fields built; Yahoo editItem call will be implemented in E-5b.',
+      publishResult,
       fields: evalResult.fields,
       executorResult: evalResult,
     };
