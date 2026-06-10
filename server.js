@@ -33,6 +33,7 @@ import fbaProfitabilityRouter from './apps/fba-profitability/router.js';
 import mercariAccountingRouter from './apps/mercari-accounting/router.js';
 import profitAnalysisRouter from './apps/profit-analysis/router.js';
 import bizOpsOverviewRouter from './apps/biz-ops-overview/router.js';
+import productManagementListRouter from './apps/product-management-list/router.js';
 import execDashboardRouter from './apps/exec-dashboard/router.js';
 import mgmtAccountingRouter from './apps/mgmt-accounting/router.js';
 import crossSellFinderRouter from './apps/cross-sell-finder/router.js';
@@ -416,6 +417,15 @@ const apps = [
     description: '全モール売上 (前日/今月/30日) + 出荷率等の日次経営指標集約',
     icon: '📊',
     path: '/apps/biz-ops-overview',
+    status: 'active',
+    category: 'analysis',
+  },
+  {
+    id: 'product-management-list',
+    name: '商品管理リスト',
+    description: 'NE全商品コード軸の在庫×販売(7d/30d FBA別)×利益×発注 統合表 (毎朝更新・CSV出力)',
+    icon: '📋',
+    path: '/apps/product-management-list',
     status: 'active',
     category: 'analysis',
   },
@@ -824,6 +834,7 @@ app.use('/apps/qoo10-accounting', (req, res, next) => {
 app.use('/apps/fba-profitability', requireAppAccess('fba-profitability'), fbaProfitabilityRouter);
 app.use('/apps/profit-analysis', requireAppAccess('profit-analysis'), profitAnalysisRouter);
 app.use('/apps/biz-ops-overview', requireAppAccess('biz-ops-overview'), bizOpsOverviewRouter);
+app.use('/apps/product-management-list', requireAppAccess('product-management-list'), productManagementListRouter);
 app.use('/apps/exec-dashboard', requireAppAccess('exec-dashboard'), express.json({ limit: '1mb' }), execDashboardRouter);
 app.use('/apps/cross-sell-finder', requireAppAccess('cross-sell-finder'), crossSellFinderRouter);
 app.use('/apps/giftset-assembly', requireAppAccess('giftset-assembly'), express.json({ limit: '256kb' }), giftsetAssemblyRouter);

@@ -2381,6 +2381,61 @@ function requireReadToken(req, res, next) {
   next();
 }
 
+// ─── GET /api/pml/published ───
+// 商品管理リスト snapshot の published run を GAS 向けに返す read-only endpoint (⑥ GAS が読む)。
+// 認証: x-read-token (MIRROR_READ_TOKEN)。商品管理リスト専用の固定レスポンス (汎用DB読み取りにしない)。
+// GAS 側ゲート: status='ok' かつ payload_checksum を行から再計算して一致 かつ 鮮度OK のときだけシート上書き。
+//   Cache-Control: no-store。published 無しは 200 + ok:false で返す (呼び出し側で判定)。
+const PML_COLS_OUT = [
+  '商品コード','商品名','仕入先','取扱区分','商品区分','最終仕入日','在庫保管日数',
+  '総在庫数','FBA在庫数','フリー在庫','注残数','引当数','総在庫数_引当なし',
+  '販売数7日_FBA','販売数7日_FBA以外','販売数7日_合計',
+  '販売数30日_FBA','販売数30日_FBA以外','販売数30日_合計',
+  '発注ロット単位','推奨保有月数','売価','原価','想定見込み利益','概算利益率',
+  '代表商品コード','ロケーションコード','商品分類タグ','登録日',
+];
+router.get('/api/pml/published', requireReadToken, (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const db = getMirrorDB();
+  try {
+    const snap = db.transaction(() => {
+      const pub = db.prepare('SELECT * FROM mirror_pml_published WHERE id=1').get();
+      if (!pub) return { ok: false, reason: 'no_published' };
+      const rows = db.prepare(`SELECT ${PML_COLS_OUT.join(', ')} FROM mirror_pml_snapshot_rows WHERE run_id=? ORDER BY 商品コード`).all(pub.run_id);
+      return { pub, rows };
+    })();
+    if (snap.ok === false) {
+      return res.json({ ok: false, reason: snap.reason, columns: PML_COLS_OUT });
+    }
+    const { pub, rows } = snap;
+    res.json({
+      ok: true,
+      run_id: pub.run_id,
+      status: pub.status,                       // GAS は 'ok' のみ上書き
+      as_of_date: pub.as_of_date,
+      generated_at: pub.generated_at,
+      published_at: pub.published_at,
+      synced_at: pub.synced_at,
+      payload_checksum: pub.payload_checksum,   // GAS は受信行から再計算し一致検証
+      row_count: pub.row_count,
+      actual_row_count: rows.length,
+      ne_fba_overlap: pub.ne_fba_overlap,
+      watermarks: {
+        ne_products_synced_at: pub.src_ne_products_synced_at,
+        velocity_as_of: pub.src_velocity_as_of,
+        fba_business_date: pub.src_fba_business_date,
+        reorder_updated_at: pub.src_reorder_updated_at,
+      },
+      server_time_utc: new Date().toISOString(),
+      columns: PML_COLS_OUT,                    // GAS の列順・checksum 再計算用 (null='' tab/改行)
+      rows,
+    });
+  } catch (e) {
+    console.error('[Mirror] /api/pml/published エラー:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 router.get('/api/sku-master/recent-missing-candidates', requireReadToken, (req, res) => {
   const db = getMirrorDB();
   const SINCE_DAYS = 7; // 固定 (Codex review #2: パラメータ受け付けない)
