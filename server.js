@@ -34,7 +34,7 @@ import mercariAccountingRouter from './apps/mercari-accounting/router.js';
 import profitAnalysisRouter from './apps/profit-analysis/router.js';
 import bizOpsOverviewRouter from './apps/biz-ops-overview/router.js';
 import execDashboardRouter from './apps/exec-dashboard/router.js';
-import mgmtAccountingRouter from './apps/mgmt-accounting/router.js';
+import mgmtAccountingRouter, { startMgmtAutoSyncScheduler } from './apps/mgmt-accounting/router.js';
 import crossSellFinderRouter from './apps/cross-sell-finder/router.js';
 import giftsetAssemblyRouter from './apps/giftset-assembly/router.js';
 import salesAnalyticsLinegiftRouter from './apps/sales-analytics-linegift/router.js';
@@ -971,6 +971,12 @@ app.listen(PORT, () => {
 
   // 楽天順位チェッカー スケジューラー
   startScheduler();
+
+  // 売上分類別粗利集計 売上自動同期スケジューラー（Render完結。Render 環境でのみ起動）
+  if (process.env.RENDER) {
+    try { startMgmtAutoSyncScheduler(); }
+    catch (e) { console.warn('[mgmt-auto-sync] scheduler 起動スキップ:', e.message); }
+  }
 
   // ミニPC warehouse死活監視
   startWarehouseHealthcheck();
