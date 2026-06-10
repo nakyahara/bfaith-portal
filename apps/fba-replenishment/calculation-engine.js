@@ -27,17 +27,24 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
   const exceptions = getSkuExceptions();
   const warehouseSummary = getWarehouseSummary();
 
+  // PR4: SKU/コード正規化 (mirror は seller_sku・ne_code を小文字保存、FBA側データ(snapshot/restock/warehouse)は
+  // 元ケース → 突き合わせを case 非依存にして SKU 欠落・在庫0誤判定を防ぐ。sheet モードでも同値同士なので無害)。
+  const normCode = (v) => String(v ?? '').trim().toLowerCase();
+
   // --- データソース: RESTOCK (主軸) + PLANNING (補助、欠落許容) ---
   // 旧: getLatestSnapshots() → 新: getRestockLatest() をベースに PLANNING を上乗せ
   const restockRows = getRestockLatest();
-  const planningMap = getPlanningLatestMap();
+  const planningMapRaw = getPlanningLatestMap();
+  // PLANNING を norm キーで再キー (RESTOCK/PLANNING 間の case 差で補助値が落ちるのを防ぐ)
+  const planningMap = {};
+  for (const k of Object.keys(planningMapRaw)) planningMap[normCode(k)] = planningMapRaw[k];
 
   // RESTOCK が空 (初回 or 取得失敗) の場合は旧 daily_snapshots にフォールバック (移行期間の保険)
   let snapshots;
   let dataSource;
   if (restockRows.length > 0) {
     dataSource = 'restock';
-    snapshots = restockRows.map(r => mergeRestockWithPlanning(r, planningMap[r.amazon_sku]));
+    snapshots = restockRows.map(r => mergeRestockWithPlanning(r, planningMap[normCode(r.amazon_sku)]));
   } else {
     // フォールバック: 旧 daily_snapshots
     dataSource = 'legacy_snapshots';
@@ -47,15 +54,17 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
   if (!snapshots.length) return { items: [], errors: ['スナップショットがありません。SP-APIレポートを取得してください。'] };
   if (!mappings.length) return { items: [], errors: ['SKUマッピングがありません。スプシ同期してください。'] };
 
-  // ルックアップ用マップ
+  // ルックアップ用マップ (mappingMap は norm キーで構築・参照 → mirror 小文字 vs snapshot 元ケースでも
+  // 確実に一致し SKU 欠落しない。これが切替時の SKU ドロップ=元バグを構造的に防ぐ要)。
   const mappingMap = {};
-  for (const m of mappings) mappingMap[m.amazon_sku] = m;
+  for (const m of mappings) mappingMap[normCode(m.amazon_sku)] = m;
 
   const exceptionMap = {};
   for (const e of exceptions) exceptionMap[e.amazon_sku] = e;
 
+  // warehouse join も case 非依存に (mirror は ne_code/logizard_code 小文字保存、倉庫CSVは元ケース)
   const warehouseMap = {};
-  for (const w of warehouseSummary) warehouseMap[w.logizard_code] = w;
+  for (const w of warehouseSummary) warehouseMap[normCode(w.logizard_code)] = w;
 
   // 他CH売上の60日間最大値 (表示用に残す、発注判定には使わない)
   const nonFbaMax60dList = getAllNonFbaMax60d();
@@ -68,7 +77,7 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
 
   for (const snap of snapshots) {
     const sku = snap.amazon_sku;
-    const mapping = mappingMap[sku];
+    const mapping = mappingMap[normCode(sku)]; // norm 参照で case 差でも一致
     if (!mapping) continue; // マッピングがないSKUはスキップ
 
     // --- 期限管理商品判定 (effectiveFbaStock 計算と min_shipment_days フィルタで使用) ---
@@ -141,7 +150,7 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
       // 構成商品の最小在庫がボトルネック（qty倍率を考慮）
       let minSets = Infinity;
       for (const comp of components) {
-        const wh = warehouseMap[comp.ne_code];
+        const wh = warehouseMap[normCode(comp.ne_code)];
         const compRaw = wh?.warehouse_available || 0;
         const setsFromComp = Math.floor(compRaw / (comp.qty || 1));
         minSets = Math.min(minSets, setsFromComp);
@@ -150,13 +159,13 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
       warehouseRaw = minSets === Infinity ? 0 : minSets;
     } else {
       // componentsなし（マッピングにNE商品コードがない場合など）
-      const wh = warehouseMap[mapping.logizard_code || mapping.ne_code];
+      const wh = warehouseMap[normCode(mapping.logizard_code || mapping.ne_code)];
       warehouseRaw = wh?.warehouse_available || 0;
       warehouseYQty = wh?.y_location_qty || 0;
     }
 
     // --- 最終入荷日から入荷経過日数を算出 ---
-    const whLookup = (components && components.length > 1) ? null : warehouseMap[mapping.logizard_code || mapping.ne_code];
+    const whLookup = (components && components.length > 1) ? null : warehouseMap[normCode(mapping.logizard_code || mapping.ne_code)];
     const lastArrivalDate = whLookup?.last_arrival_date || null;
     let daysSinceArrival = null;
     if (lastArrivalDate) {

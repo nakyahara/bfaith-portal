@@ -1000,6 +1000,30 @@ function buildMirrorRow(amazonSku, compRows, attr, nonFba) {
   };
 }
 
+// SKU/コード正規化 (case 非依存の突き合わせ用、PR4)
+const normSku = (v) => String(v ?? '').trim().toLowerCase();
+
+// 案C: mirror は seller_sku を小文字保存するので、amazon_sku の「元ケース」を FBA 側データから復元する
+// (consumer 無改修で動かすため。recData.find / mappingMap など多数の exact 比較を壊さない)。
+// 優先度 低→高 の順に入れて後勝ち上書き: sku_mapping → ever_seen → daily_snapshots → restock_latest → planning_latest
+function buildAmazonSkuCaseMap() {
+  const m = new Map();
+  // first-write-wins: 高優先のソースを先に入れる。
+  // calc-engine の主キー snap.amazon_sku は restock_latest 由来 (snapshots = restockRows.map(...)) なので、
+  // emit する amazon_sku を restock_latest のケースに揃えれば mappingMap[snap.amazon_sku] が確実に一致し SKU 欠落しない。
+  const add = (sku) => { const k = normSku(sku); if (k && !m.has(k)) m.set(k, sku); };
+  for (const sql of [
+    'SELECT amazon_sku FROM restock_latest',          // 最優先 (推奨生成の主キー)
+    'SELECT amazon_sku FROM planning_latest',
+    'SELECT DISTINCT amazon_sku FROM daily_snapshots',
+    'SELECT amazon_sku FROM ever_seen_skus',
+    'SELECT amazon_sku FROM sku_mapping',
+  ]) {
+    try { for (const r of queryAll(sql)) add(r.amazon_sku); } catch (e) { /* テーブル未作成等は無視 */ }
+  }
+  return m;
+}
+
 export function getSkuMappingsFromMirror() {
   const mdb = getMirrorDB(); // better-sqlite3 (mirror 未初期化なら throw)
   const rows = mdb.prepare(`
@@ -1014,15 +1038,18 @@ export function getSkuMappingsFromMirror() {
     if (!bySku.has(r.seller_sku)) bySku.set(r.seller_sku, []);
     bySku.get(r.seller_sku).push(r);
   }
-  // FBA ローカル属性 (sql.js) を Map 化して JS join
+  // FBA ローカル属性 (sql.js) を norm キーで Map 化して JS join (mirror 小文字 ⇔ 元ケース attrs の取りこぼし防止)
   const attrs = new Map();
-  for (const a of queryAll('SELECT amazon_sku, asin, fnsku FROM fba_sku_attrs')) attrs.set(a.amazon_sku, a);
+  for (const a of queryAll('SELECT amazon_sku, asin, fnsku FROM fba_sku_attrs')) attrs.set(normSku(a.amazon_sku), a);
   const nonFba = new Map();
-  for (const s of queryAll('SELECT amazon_sku, non_fba_sales_7d, non_fba_sales_30d FROM sku_mapping')) nonFba.set(s.amazon_sku, s);
+  for (const s of queryAll('SELECT amazon_sku, non_fba_sales_7d, non_fba_sales_30d FROM sku_mapping')) nonFba.set(normSku(s.amazon_sku), s);
+  const caseMap = buildAmazonSkuCaseMap();
 
   const result = [];
   for (const [sku, compRows] of bySku) {
-    result.push(buildMirrorRow(sku, compRows, attrs.get(sku), nonFba.get(sku)));
+    const k = normSku(sku);
+    const origSku = caseMap.get(k) || sku; // 元ケース復元、無ければ小文字 fallback
+    result.push(buildMirrorRow(origSku, compRows, attrs.get(k), nonFba.get(k)));
   }
   result.sort((x, y) => String(x.amazon_sku).localeCompare(String(y.amazon_sku)));
   return result;
@@ -1030,16 +1057,19 @@ export function getSkuMappingsFromMirror() {
 
 function getSkuMappingFromMirror(amazonSku) {
   const mdb = getMirrorDB();
+  const k = normSku(amazonSku);
   const compRows = mdb.prepare(`
     SELECT seller_sku, ne_code, quantity, 商品名, sort_order
     FROM mirror_sku_resolved
     WHERE source = 'master' AND seller_sku = ?
     ORDER BY sort_order, ne_code
-  `).all(amazonSku);
+  `).all(k);
   if (compRows.length === 0) return null;
-  const attr = queryOne('SELECT asin, fnsku FROM fba_sku_attrs WHERE amazon_sku = ?', [amazonSku]);
-  const nonFba = queryOne('SELECT non_fba_sales_7d, non_fba_sales_30d FROM sku_mapping WHERE amazon_sku = ?', [amazonSku]);
-  return buildMirrorRow(amazonSku, compRows, attr, nonFba);
+  // 補助 join も norm キーで (single も case 非依存に)
+  const attrRows = queryAll('SELECT asin, fnsku FROM fba_sku_attrs WHERE LOWER(TRIM(amazon_sku)) = ?', [k]);
+  const nfRows = queryAll('SELECT non_fba_sales_7d, non_fba_sales_30d FROM sku_mapping WHERE LOWER(TRIM(amazon_sku)) = ?', [k]);
+  // 呼び出し側が渡したケースをそのまま返す (元ケース保持)
+  return buildMirrorRow(amazonSku, compRows, attrRows[0], nfRows[0]);
 }
 
 // set_components (文字列 or 配列) を比較用の正規化文字列に (ne_code は case 無視、qty 含む)
@@ -1077,19 +1107,40 @@ function compareSkuMappings(sheetRows, mirrorRows) {
     if (norm(s.fnsku) !== norm(m.fnsku)) d.fnsku = [s.fnsku, m.fnsku];
     if (Object.keys(d).length) fieldDiffs.push({ amazon_sku: s.amazon_sku, ...d });
   }
+  // ★切替前ゲート (PR4): FBA観測SKU(restock/ever_seen/snapshot)が mirror に存在するか。
+  //   mappingMap は norm 参照になったので、case 差では落ちない。落ちるのは「norm キーが mirror に無い」=真にmaster欠落。
+  //   mirror_missing_observed が 0 = mirror 切替で推奨から落ちる観測SKUは無い (切替可の主ゲート)。
+  //   mirror_case_mismatch_observed は norm一致だが exact ケース違い (lookup正規化済で無害、情報のみ)。
+  const mirrorExactSet = new Set(mirrorRows.map(r => r.amazon_sku));
+  const mirrorNormSet = new Set(mirrorRows.map(r => norm(r.amazon_sku)));
+  const observedSkus = [...new Set([...getAllEverSeenSkus(), ...getAllSnapshotSkus()])].filter(Boolean);
+  const missingObserved = observedSkus.filter(s => !mirrorNormSet.has(norm(s)));
+  const caseMismatchObserved = observedSkus.filter(s => mirrorNormSet.has(norm(s)) && !mirrorExactSet.has(s));
+  // case-only collision: norm 後に複数の異なる原ケースが衝突する SKU 数 (sheet 側で検出、>0 は要注意)
+  const normGroups = new Map();
+  for (const r of sheetRows) {
+    const k = norm(r.amazon_sku);
+    if (!normGroups.has(k)) normGroups.set(k, new Set());
+    normGroups.get(k).add(r.amazon_sku);
+  }
+  const caseCollisions = [...normGroups.values()].filter(set => set.size > 1).length;
   return {
     summary: {
       sheet_count: sheetRows.length,
       mirror_count: mirrorRows.length,
       sheet_only: sheetOnly.length,                       // sheet にあるが mirror に無い
       mirror_only_observed: mirrorOnlyObserved.length,    // mirror のみ & FBA観測あり = core 差分 (要調査)
-      mirror_only_scope_unknown: mirrorOnlyScopeUnknown.length, // mirror のみ & 未観測 = 新規商品候補 or 非Amazon混入 (判定不能、PR4前にscope filter決定)
+      mirror_only_scope_unknown: mirrorOnlyScopeUnknown.length, // mirror のみ & 未観測 = 新規商品候補 or 非Amazon混入
       field_diffs: fieldDiffs.length,                     // 共通SKUの core フィールド差分
+      mirror_missing_observed: missingObserved.length,    // ★切替可ゲート: FBA観測SKUがmirrorに無い数。0 必須
+      mirror_case_mismatch_observed: caseMismatchObserved.length, // 参考: case のみ違い (norm参照で無害)
+      mapping_case_collisions: caseCollisions,            // 参考: 大小文字だけ違う別SKUの衝突数 (>0 は要確認)
     },
     samples: [
       ...sheetOnly.slice(0, 10).map(s => ({ type: 'sheet_only', amazon_sku: s })),
       ...mirrorOnlyObserved.slice(0, 10).map(s => ({ type: 'mirror_only_observed', amazon_sku: s })),
       ...mirrorOnlyScopeUnknown.slice(0, 10).map(s => ({ type: 'mirror_only_scope_unknown', amazon_sku: s })),
+      ...missingObserved.slice(0, 10).map(s => ({ type: 'mirror_missing_observed', amazon_sku: s })),
       ...fieldDiffs.slice(0, 10),
     ],
   };
@@ -1141,9 +1192,11 @@ export function getWarehouseInventory() {
   return queryAll('SELECT * FROM warehouse_inventory ORDER BY logizard_code');
 }
 
+// PR4: logizard_code は case 非依存で引く (mirror は小文字、倉庫CSVは元ケース)。
+// LOWER(TRIM()) 同士で突き合わせ。sheet モードでも同一値同士なので無害。
 export function getWarehouseQtyByCode(logizardCode) {
   const row = queryOne(
-    'SELECT SUM(quantity) as total, SUM(available_qty) as available FROM warehouse_inventory WHERE logizard_code = ? AND is_y_location = 0',
+    'SELECT SUM(quantity) as total, SUM(available_qty) as available FROM warehouse_inventory WHERE LOWER(TRIM(logizard_code)) = LOWER(TRIM(?)) AND is_y_location = 0',
     [logizardCode]
   );
   return { total: row?.total || 0, available: row?.available || 0 };
@@ -1151,7 +1204,7 @@ export function getWarehouseQtyByCode(logizardCode) {
 
 export function getWarehouseYQtyByCode(logizardCode) {
   const row = queryOne(
-    'SELECT SUM(quantity) as total FROM warehouse_inventory WHERE logizard_code = ? AND is_y_location = 1',
+    'SELECT SUM(quantity) as total FROM warehouse_inventory WHERE LOWER(TRIM(logizard_code)) = LOWER(TRIM(?)) AND is_y_location = 1',
     [logizardCode]
   );
   return row?.total || 0;
@@ -1162,7 +1215,7 @@ export function getWarehouseLocationsByCode(logizardCode) {
   return queryAll(`
     SELECT location, block, available_qty, location_biz_type, block_alloc_order, expiry_date
     FROM warehouse_inventory
-    WHERE logizard_code = ? AND is_y_location = 0 AND available_qty > 0
+    WHERE LOWER(TRIM(logizard_code)) = LOWER(TRIM(?)) AND is_y_location = 0 AND available_qty > 0
     ORDER BY
       CASE WHEN location_biz_type = '卸し' THEN 0
            WHEN location_biz_type = '通販' THEN 1
@@ -1176,9 +1229,12 @@ export function getWarehouseLocationsByCode(logizardCode) {
  * 商品コード別の在庫サマリー（倉庫在庫 + Yロケ在庫）
  */
 export function getWarehouseSummary() {
+  // PR4: logizard_code を LOWER(TRIM()) で集約 (倉庫CSVに ABC/abc 混在があっても1行に合算)。
+  // 利用側 (warehouseMap/warehouseSummaryMap) は normCode キーで引くので by-code 系 (LOWER(TRIM())) と一致する。
+  // 表示用 logizard_code は代表値 (MIN) を返す。
   return queryAll(`
     SELECT
-      logizard_code,
+      MIN(logizard_code) as logizard_code,
       MAX(product_name) as product_name,
       SUM(CASE WHEN is_y_location = 0 THEN quantity ELSE 0 END) as warehouse_qty,
       SUM(CASE WHEN is_y_location = 0 THEN available_qty ELSE 0 END) as warehouse_available,
@@ -1187,8 +1243,8 @@ export function getWarehouseSummary() {
       MAX(last_arrival_date) as last_arrival_date,
       COUNT(DISTINCT location) as location_count
     FROM warehouse_inventory
-    GROUP BY logizard_code
-    ORDER BY logizard_code
+    GROUP BY LOWER(TRIM(logizard_code))
+    ORDER BY 1
   `);
 }
 
