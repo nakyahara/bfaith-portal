@@ -532,20 +532,21 @@ router.post('/upload-billing', upload.single('file'), (req, res) => {
 router.post('/confirm', (req, res) => {
   const db = getMirrorDB();
   const { yearMonth, totalRows, resolvedCount, unresolvedCount,
-    byTax, bySegment, excluded, mfRow, adCost, billing } = req.body;
+    byTax, bySegment, excluded, mfRow, adCost, billing, pfFee } = req.body;
 
   if (!yearMonth) return res.status(400).json({ error: 'yearMonth は必須です' });
 
   try {
     const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+    // pf_fee = 請求合計(税込) − 広告費 − クーポン値引（mgmt-accounting の PF手数料として直結）
     db.prepare(`INSERT OR REPLACE INTO mart_rakuten_monthly_summary
       (year_month, total_rows, resolved_count, unresolved_count,
-       by_tax, by_segment, excluded, mf_row, ad_cost, billing, confirmed_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?)
+       by_tax, by_segment, excluded, mf_row, ad_cost, billing, pf_fee, confirmed_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
     `).run(
       yearMonth, totalRows || 0, resolvedCount || 0, unresolvedCount || 0,
       JSON.stringify(byTax), JSON.stringify(bySegment), JSON.stringify(excluded),
-      JSON.stringify(mfRow), adCost || 0, JSON.stringify(billing || {}), now
+      JSON.stringify(mfRow), adCost || 0, JSON.stringify(billing || {}), Math.max(0, Math.round(pfFee || 0)), now
     );
 
     db.prepare(`INSERT INTO mart_rakuten_upload_log
@@ -1191,6 +1192,7 @@ function renderPage() {
             mfRow: lastData.mfRow,
             adCost,
             billing: billingData ? billingData.byCategory : null,
+            pfFee: getBillingTotals() ? getBillingTotals().pfFee : 0,
           }),
         });
         const result = await r.json();
