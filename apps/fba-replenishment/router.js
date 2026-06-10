@@ -460,10 +460,12 @@ router.get('/api/recommendations', async (req, res) => {
     const debug = req.query.debug === '1' || req.query.debug === 'true';
     const inboundOverride = await getInboundWorkingData();
     const result = generateRecommendations(debug, inboundOverride);
+    // PR4: norm キーで join (mirror 小文字 vs item 元ケースでも fnsku/除外が取りこぼれない)
+    const normSku = (v) => String(v ?? '').trim().toLowerCase();
     // FNSKU情報を付与
     const mappings = getSkuMappings();
     const fnskuMap = {};
-    for (const m of mappings) if (m.fnsku) fnskuMap[m.amazon_sku] = m.fnsku;
+    for (const m of mappings) if (m.fnsku) fnskuMap[normSku(m.amazon_sku)] = m.fnsku;
     const fnskuCount = Object.keys(fnskuMap).length;
     console.log(`[FBA] 推奨API: mappings=${mappings.length}, fnsku有り=${fnskuCount}, inboundOverride=${inboundOverride ? Object.keys(inboundOverride).length + ' SKU' : 'なし'}`);
     if (fnskuCount > 0) {
@@ -471,12 +473,12 @@ router.get('/api/recommendations', async (req, res) => {
       console.log(`[FBA] FNSKUサンプル:`, sample);
     }
     for (const item of result.items) {
-      item.fnsku = fnskuMap[item.amazon_sku] || '';
+      item.fnsku = fnskuMap[normSku(item.amazon_sku)] || '';
     }
     // 恒久除外フラグを付与 (クライアントの3タブフィルタ + サマリーが参照。除外SKUも行自体は返す)
-    const excludedSet = new Set(getReplenishmentExcluded().map(r => r.amazon_sku));
+    const excludedSet = new Set(getReplenishmentExcluded().map(r => normSku(r.amazon_sku)));
     for (const item of result.items) {
-      item.is_excluded = excludedSet.has(item.amazon_sku);
+      item.is_excluded = excludedSet.has(normSku(item.amazon_sku));
     }
     const itemsWithFnsku = result.items.filter(i => i.fnsku).length;
     console.log(`[FBA] 推奨items: ${result.items.length}件, fnsku付与=${itemsWithFnsku}件, 除外=${result.items.filter(i => i.is_excluded).length}件`);
@@ -520,11 +522,12 @@ router.post('/api/create-inbound-plan', express.json(), async (req, res) => {
   let { items, planName } = req.body;
   if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items[] が必要です' });
 
-  // 恒久除外SKUはサーバ側でも納品プランから除く (stale画面/直接API 経由の漏れ防止)
+  // 恒久除外SKUはサーバ側でも納品プランから除く (stale画面/直接API 経由の漏れ防止)。norm で case 差も拾う
   {
-    const excludedSet = new Set(getReplenishmentExcluded().map(r => r.amazon_sku));
+    const normSku = (v) => String(v ?? '').trim().toLowerCase();
+    const excludedSet = new Set(getReplenishmentExcluded().map(r => normSku(r.amazon_sku)));
     const before = items.length;
-    items = items.filter(it => !excludedSet.has(it.amazon_sku || it.msku || it.sku));
+    items = items.filter(it => !excludedSet.has(normSku(it.amazon_sku || it.msku || it.sku)));
     if (items.length < before) console.log(`[FBA] create-inbound-plan: 除外SKU ${before - items.length}件をスキップ`);
     if (items.length === 0) return res.status(400).json({ error: '納品対象がありません（全て除外指定SKUでした）' });
   }
@@ -854,9 +857,10 @@ router.post('/api/provisional', express.json(), (req, res) => {
   let { items } = req.body;
   if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items[] が必要です' });
   try {
-    // 恒久除外SKUは仮確定に残さない
-    const excludedSet = new Set(getReplenishmentExcluded().map(r => r.amazon_sku));
-    items = items.filter(it => !excludedSet.has(it.amazon_sku));
+    // 恒久除外SKUは仮確定に残さない (norm で case 差も拾う)
+    const normSku = (v) => String(v ?? '').trim().toLowerCase();
+    const excludedSet = new Set(getReplenishmentExcluded().map(r => normSku(r.amazon_sku)));
+    items = items.filter(it => !excludedSet.has(normSku(it.amazon_sku)));
     const count = saveProvisionalItems(items);
     res.json({ success: true, count });
   } catch (e) {
@@ -870,9 +874,10 @@ router.post('/api/provisional/merge', express.json(), (req, res) => {
   let { items } = req.body;
   if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items[] が必要です' });
   try {
-    // 恒久除外SKUは仮確定にも入れない (stale画面/直接API 経由の漏れ防止)
-    const excludedSet = new Set(getReplenishmentExcluded().map(r => r.amazon_sku));
-    items = items.filter(it => !excludedSet.has(it.amazon_sku));
+    // 恒久除外SKUは仮確定にも入れない (stale画面/直接API 経由の漏れ防止)。norm で case 差も拾う
+    const normSku = (v) => String(v ?? '').trim().toLowerCase();
+    const excludedSet = new Set(getReplenishmentExcluded().map(r => normSku(r.amazon_sku)));
+    items = items.filter(it => !excludedSet.has(normSku(it.amazon_sku)));
     if (items.length === 0) return res.json({ success: true, merged: 0, total: getProvisionalItems().items.length, skipped_excluded: true });
     const count = mergeProvisionalItems(items);
     const result = getProvisionalItems();
@@ -904,10 +909,11 @@ router.delete('/api/provisional/:sku', (req, res) => {
 router.post('/api/export-manifest', express.json(), async (req, res) => {
   let { items } = req.body;
   if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items[] が必要です' });
-  // 恒久除外SKUはサーバ側でも納品Excelから除く (stale画面/直接API 経由の漏れ防止)
+  // 恒久除外SKUはサーバ側でも納品Excelから除く (stale画面/直接API 経由の漏れ防止)。norm で case 差も拾う
   {
-    const excludedSet = new Set(getReplenishmentExcluded().map(r => r.amazon_sku));
-    items = items.filter(it => !excludedSet.has(it.amazon_sku || it.msku || it.sku));
+    const normSku = (v) => String(v ?? '').trim().toLowerCase();
+    const excludedSet = new Set(getReplenishmentExcluded().map(r => normSku(r.amazon_sku)));
+    items = items.filter(it => !excludedSet.has(normSku(it.amazon_sku || it.msku || it.sku)));
     if (items.length === 0) return res.status(400).json({ error: '出力対象がありません（全て除外指定SKUでした）' });
   }
 
@@ -988,8 +994,10 @@ router.get('/api/picking-list/:planId', async (req, res) => {
 
     const result = [];
     const mappings = getSkuMappings();
+    // PR4: norm キーで構築 (mirror 小文字 vs Amazon msku 元ケースでも一致)
+    const normSku = (v) => String(v ?? '').trim().toLowerCase();
     const mappingMap = {};
-    for (const m of mappings) mappingMap[m.amazon_sku] = m;
+    for (const m of mappings) mappingMap[normSku(m.amazon_sku)] = m;
 
     for (const sd of shipmentData) {
       const shipment = sd.shipment;
@@ -1000,7 +1008,7 @@ router.get('/api/picking-list/:planId', async (req, res) => {
         destination: shipment.destination || '',
         status: shipment.status || '',
         items: items.map(item => {
-          const mapping = mappingMap[item.msku] || {};
+          const mapping = mappingMap[normSku(item.msku)] || {};
           return {
             msku: item.msku,
             fnsku: item.fnsku || '',
@@ -1029,10 +1037,12 @@ router.post('/api/export-ne-csv', express.json(), async (req, res) => {
   if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items[] が必要です' });
 
   const mappings = getSkuMappings();
+  // PR4: mappingMap は norm キーで構築・参照 (mirror 小文字 vs item 元ケースでも一致、SKU欠落防止)
+  const normSku = (v) => String(v ?? '').trim().toLowerCase();
   const mappingMap = {};
-  for (const m of mappings) mappingMap[m.amazon_sku] = m;
-  // 恒久除外SKUはサーバ側でも納品させない (stale画面/直接API 経由の漏れ防止)
-  const excludedSet = new Set(getReplenishmentExcluded().map(r => r.amazon_sku));
+  for (const m of mappings) mappingMap[normSku(m.amazon_sku)] = m;
+  // 恒久除外SKUはサーバ側でも納品させない (stale画面/直接API 経由の漏れ防止)。norm で case 差も拾う
+  const excludedSet = new Set(getReplenishmentExcluded().map(r => normSku(r.amazon_sku)));
 
   // SKU → NE商品コードに展開し、同一NE商品コードは合算
   const neAggregated = {};
@@ -1040,11 +1050,11 @@ router.post('/api/export-ne-csv', express.json(), async (req, res) => {
   const includedSkus = []; // 実際にCSVに入った amazon_sku (履歴の再DL除外チェック用)
 
   for (const item of items) {
-    if (excludedSet.has(item.amazon_sku)) {
+    if (excludedSet.has(normSku(item.amazon_sku))) {
       warnings.push(`${item.amazon_sku}: 納品除外指定のためスキップ`);
       continue;
     }
-    const mapping = mappingMap[item.amazon_sku];
+    const mapping = mappingMap[normSku(item.amazon_sku)];
     if (!mapping) {
       warnings.push(`${item.amazon_sku}: SKUマッピングなし（スキップ）`);
       continue;
@@ -1200,8 +1210,9 @@ router.get('/api/export-history/:id/download', (req, res) => {
       try {
         const fileSkus = JSON.parse(record.sku_list);
         if (Array.isArray(fileSkus) && fileSkus.length > 0) {
-          const excludedSet = new Set(getReplenishmentExcluded().map(r => r.amazon_sku));
-          const hit = fileSkus.filter(s => excludedSet.has(s));
+          const normSku = (v) => String(v ?? '').trim().toLowerCase();
+          const excludedSet = new Set(getReplenishmentExcluded().map(r => normSku(r.amazon_sku)));
+          const hit = fileSkus.filter(s => excludedSet.has(normSku(s)));
           if (hit.length > 0) {
             return res.status(409).json({ error: `この履歴ファイルには現在「納品除外」指定のSKUが含まれます (${hit.slice(0, 5).join(', ')}${hit.length > 5 ? ' 他' : ''})。再出力してください。`, excluded_skus: hit });
           }

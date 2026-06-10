@@ -707,12 +707,15 @@
       } catch(e) { /* 無視 */ }
     }
 
+    // PR4: コード正規化 (mirror は ne_code/logizard_code 小文字、倉庫は元ケース → case 非依存で突合)
+    function normCode(v) { return String(v ?? '').trim().toLowerCase(); }
+
     async function loadWarehouseSummaryMap() {
       try {
         const res = await fetch(`${BASE}/api/warehouse/summary`);
         const data = await res.json();
         warehouseSummaryMap = {};
-        for (const w of data) warehouseSummaryMap[w.logizard_code] = w;
+        for (const w of data) warehouseSummaryMap[normCode(w.logizard_code)] = w;
       } catch(e) { /* 無視 */ }
     }
 
@@ -2527,19 +2530,20 @@ Step10: アラート判定
       await loadNewProductHidden();
 
       // 全期間のスナップショットSKUを取得（過去にFBAに送ったことがあるSKUを除外）
+      // PR4: case 非依存で判定 (mirror 由来の skuMappingMap キー vs snapshot 元ケース。observed誤判定→タブ汚染を防ぐ)
       let snapshotSkuSet;
       try {
         const res = await fetch(`${BASE}/api/all-snapshot-skus`);
         const skus = await res.json();
-        snapshotSkuSet = new Set(skus);
+        snapshotSkuSet = new Set(skus.map(s => normCode(s)));
       } catch(e) {
         // フォールバック: recDataから取得
-        snapshotSkuSet = new Set(recData.map(r => r.amazon_sku));
+        snapshotSkuSet = new Set(recData.map(r => normCode(r.amazon_sku)));
       }
 
       newProductData = [];
       for (const [sku, mapping] of Object.entries(skuMappingMap)) {
-        if (snapshotSkuSet.has(sku)) continue;
+        if (snapshotSkuSet.has(normCode(sku))) continue;
         if (excludedSet.has(sku)) continue; // 恒久除外SKUは新規商品タブにも出さない (復元は納品推奨タブで)
 
         let warehouseQty = 0;
@@ -2551,14 +2555,14 @@ Step10: アラート判定
         if (comps && comps.length > 0) {
           let minSets = Infinity;
           for (const comp of comps) {
-            const whRows = warehouseSummaryMap[comp.ne_code];
+            const whRows = warehouseSummaryMap[normCode(comp.ne_code)];
             const available = whRows?.warehouse_available || 0;
             minSets = Math.min(minSets, Math.floor(available / (comp.qty || 1)));
             yQty += whRows?.y_location_qty || 0;
           }
           warehouseQty = minSets === Infinity ? 0 : minSets;
         } else {
-          const whRows = warehouseSummaryMap[mapping.logizard_code || mapping.ne_code];
+          const whRows = warehouseSummaryMap[normCode(mapping.logizard_code || mapping.ne_code)];
           warehouseQty = whRows?.warehouse_available || 0;
           yQty = whRows?.y_location_qty || 0;
         }
