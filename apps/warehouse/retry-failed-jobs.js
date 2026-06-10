@@ -39,14 +39,15 @@ const MAX_RETRY_COUNT = 3;
 // ジョブ定義 (daily-sync.js と一致させる)
 //   f_sales のみ retry 時は 30分 (初回 10分でタイムアウトした場合の余裕)
 const JOB_DEFINITIONS = {
-  'f_sales':        { script: 'apps/warehouse/rebuild-f-sales.js',         timeoutMs: 1800000 },
-  'sales_velocity': { script: 'apps/warehouse/rebuild-sales-velocity.js',  timeoutMs: 900000  },
-  '楽天sku_map':    { script: 'apps/warehouse/rebuild-rakuten-sku-map.js', timeoutMs: 600000  },
-  'Render同期':     { script: 'apps/warehouse/sync-to-render.js',          timeoutMs: 600000  },
+  'f_sales':        { script: 'apps/warehouse/rebuild-f-sales.js',                timeoutMs: 1800000 },
+  'sales_velocity': { script: 'apps/warehouse/rebuild-sales-velocity.js',         timeoutMs: 900000  },
+  'pml_snapshot':   { script: 'apps/warehouse/build-product-management-snapshot.js', timeoutMs: 600000 },
+  '楽天sku_map':    { script: 'apps/warehouse/rebuild-rakuten-sku-map.js',        timeoutMs: 600000  },
+  'Render同期':     { script: 'apps/warehouse/sync-to-render.js',                 timeoutMs: 600000  },
 };
 
-// 実行順序 (依存関係順)。sales_velocity は f_sales と同じ raw 受注 + マスタ依存なので直後。
-const RETRY_ORDER = ['f_sales', 'sales_velocity', '楽天sku_map', 'Render同期'];
+// 実行順序 (依存関係順)。sales_velocity → pml_snapshot は f_sales と同じ raw + マスタ依存なので直後。
+const RETRY_ORDER = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期'];
 
 async function notify(text) {
   try {
