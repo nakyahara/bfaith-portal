@@ -22,6 +22,7 @@ import { acquire, SyncLockError } from './lib/sync-lock.js';
 import { syncNotionOverrides } from './services/notion-sync.js';
 import { evaluateItemForPublish } from './services/publish-pipeline.js';
 import { fetchAllItemCodes } from './lib/rakuten-rms-proxy.js';
+import { executePublish, isPublishEnabled, buildIdempotencyKey } from './services/publish-executor.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -42,6 +43,23 @@ function audit(db, action, detail, { actor = 'http', result = 'success', errorMe
       VALUES (?, ?, ?, ?, ?)
     `).run(actor, action, detail ? JSON.stringify(detail) : null, result, errorMessage);
   } catch (_) { /* best-effort */ }
+}
+
+function getPublishSummary(db) {
+  let rows;
+  try {
+    rows = db.prepare(`
+      SELECT status, COUNT(*) AS n FROM publish_idempotency GROUP BY status
+    `).all();
+  } catch (_) {
+    return null; // table 未作成 (migration 003 未適用)
+  }
+  const out = { in_progress: 0, success: 0, failed: 0, not_implemented: 0, total: 0 };
+  for (const r of rows) {
+    if (Object.prototype.hasOwnProperty.call(out, r.status)) out[r.status] = r.n;
+    out.total += r.n;
+  }
+  return out;
 }
 
 function getReadinessSummary(db) {
@@ -79,20 +97,24 @@ router.get('/', (_req, res) => {
   let syncState = null;
   let notionStats = null;
   let readiness = null;
+  let publish = null;
   try {
     const db = getDB();
     syncState = getSyncState(db);
     notionStats = getNotionOverrideStats(db);
     readiness = getReadinessSummary(db);
+    publish = getPublishSummary(db);
   } catch (_) {
     // DB 未初期化等は dashboard 表示自体は continue
   }
   renderView(res, 'dashboard', {
     status,
-    phase: 'E-2 (Notion sync)',
+    phase: 'E-5a (publish infra)',
     syncState,
     notionStats,
     readiness,
+    publish,
+    publishEnabled: isPublishEnabled(),
   });
 });
 
@@ -244,6 +266,86 @@ router.post('/api/publish/evaluate/:itemCode', async (req, res) => {
     return res.json(result);
   } catch (e) {
     return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+// ───────────────── Phase E-5a: 実 publish (placeholder) ─────────────────
+
+/**
+ * 実 publish 実行。 Phase E-5a では Yahoo API 呼び出し本体は未実装、 readiness pass + idempotency 監査のみ。
+ *
+ * body: {
+ *   manageNumber?: string,
+ *   idempotencyKey?: string,    // 省略時は executor が生成 (caller 指定推奨)
+ *   productCategory?, pathName?, yahooProductCategoryId?, aucPrefCode?
+ * }
+ */
+router.post('/api/publish/execute/:itemCode', async (req, res) => {
+  try {
+    // 受理時 dual check #1
+    if (!isPublishEnabled()) {
+      return res.status(403).json({
+        status: 'fail',
+        error: 'RYS_PUBLISH_ENABLED=0 (kill-switch). Set env to 1 to enable real publish.',
+      });
+    }
+    const itemCode = req.params.itemCode;
+    const body = req.body || {};
+    const db = getDB();
+
+    // manageNumber resolve (E-4 と同じロジック)
+    const job = db.prepare(`SELECT payload_json FROM jobs WHERE item_code = ?`).get(itemCode);
+    let payload = {};
+    if (job?.payload_json) { try { payload = JSON.parse(job.payload_json); } catch (_) {} }
+    const bodyMn = typeof body.manageNumber === 'string' ? body.manageNumber.trim() : '';
+    const payloadMn = typeof payload.rakuten_manage_number === 'string' ? payload.rakuten_manage_number.trim() : '';
+    let manageNumber = bodyMn || payloadMn || null;
+    if (!manageNumber) {
+      try {
+        const mapping = await fetchAllItemCodes();
+        manageNumber = mapping[itemCode] || null;
+      } catch (e) {
+        return res.status(502).json({ status: 'fail', error: `warehouse proxy: ${e.message}` });
+      }
+    }
+    if (!manageNumber) {
+      return res.status(400).json({ error: 'manage_number_required', itemCode });
+    }
+
+    const result = await executePublish({
+      db, itemCode, manageNumber,
+      createdBy: 'http',
+      idempotencyKey: body.idempotencyKey || null,
+      publishOpts: {
+        productCategory: body.productCategory || null,
+        pathName: body.pathName || null,
+        yahooProductCategoryId: body.yahooProductCategoryId ?? null,
+        aucPrefCode: body.aucPrefCode ?? null,
+      },
+    });
+
+    // status マッピング
+    if (result.status === 'in_progress_conflict') return res.status(409).json(result);
+    if (result.status === 'dedupe') return res.status(200).json(result);
+    if (result.status === 'readiness_blocked') return res.status(422).json(result);
+    if (result.status === 'not_implemented') return res.status(501).json(result);
+    if (result.status === 'flag_off') return res.status(403).json(result);
+    if (result.status === 'fail') return res.status(500).json(result);
+    return res.json(result);
+  } catch (e) {
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+// idempotency key を caller 側で確認できる helper
+router.post('/api/publish/idempotency-key', (req, res) => {
+  try {
+    const { itemCode, manageNumber, scope, isoDate } = req.body || {};
+    if (!itemCode) return res.status(400).json({ error: 'itemCode required' });
+    const key = buildIdempotencyKey({ itemCode, manageNumber, scope, isoDate });
+    return res.json({ idempotencyKey: key });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
   }
 });
 

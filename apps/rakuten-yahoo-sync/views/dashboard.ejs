@@ -73,13 +73,36 @@
 
     <% if (readiness) { %>
     <div class="card mb-3">
-      <div class="card-header"><strong>readiness 集計 (jobs テーブル、 E-5 で実 publish に使う)</strong></div>
+      <div class="card-header"><strong>readiness 集計 (jobs テーブル)</strong></div>
       <div class="card-body row">
         <div class="col"><div class="text-muted small">total</div><div class="h4"><%= readiness.total %></div></div>
         <div class="col"><div class="text-muted small">pending</div><div class="h4"><%= readiness.pending %></div></div>
         <div class="col"><div class="text-success small">ok</div><div class="h4 text-success"><%= readiness.ok %></div></div>
         <div class="col"><div class="text-danger small">blocked</div><div class="h4 text-danger"><%= readiness.blocked %></div></div>
       </div>
+    </div>
+    <% } %>
+
+    <% if (typeof publish !== 'undefined' && publish) { %>
+    <div class="card mb-3">
+      <div class="card-header">
+        <strong>publish 状況 (publish_idempotency)</strong>
+        <span class="badge <%= publishEnabled ? 'bg-success' : 'bg-secondary' %> ms-2">
+          <%= publishEnabled ? 'RYS_PUBLISH_ENABLED=1 (ON)' : 'RYS_PUBLISH_ENABLED=0 (OFF)' %>
+        </span>
+      </div>
+      <div class="card-body row">
+        <div class="col"><div class="text-muted small">total</div><div class="h4"><%= publish.total %></div></div>
+        <div class="col"><div class="text-warning small">in_progress</div><div class="h4 text-warning"><%= publish.in_progress %></div></div>
+        <div class="col"><div class="text-success small">success</div><div class="h4 text-success"><%= publish.success %></div></div>
+        <div class="col"><div class="text-danger small">failed</div><div class="h4 text-danger"><%= publish.failed %></div></div>
+        <div class="col"><div class="text-info small">not_impl</div><div class="h4 text-info"><%= publish.not_implemented %></div></div>
+      </div>
+      <% if (!publishEnabled) { %>
+      <div class="card-footer small text-muted">
+        実 publish は kill-switch で停止中です。 Render env に <code>RYS_PUBLISH_ENABLED=1</code> を set すると有効化されます (E-5b で vps-proxy 拡張完了後に推奨)。
+      </div>
+      <% } %>
     </div>
     <% } %>
 
@@ -104,14 +127,15 @@
     </div>
 
     <div class="card">
-      <div class="card-header"><strong>次のステップ</strong></div>
+      <div class="card-header"><strong>進捗</strong></div>
       <div class="card-body">
         <ol class="mb-0">
           <li>E-1 ✅ skeleton + env 確認画面</li>
-          <li><strong>E-2 (現在)</strong>: Notion 商品マスター sync ← イマココ</li>
-          <li>E-3: delivery / variation / readiness resolver 移植</li>
-          <li>E-4: field-mapper + buildYahooEditItemFields + dry-run endpoint</li>
-          <li>E-5: 実 publish (RYS_PUBLISH_ENABLED=1 で初稼働)</li>
+          <li>E-2 ✅ Notion 商品マスター sync (289 件取込)</li>
+          <li>E-3 ✅ delivery / variation / readiness resolver 移植</li>
+          <li>E-4 ✅ field-mapper + dry-run pipeline</li>
+          <li><strong>E-5a (現在)</strong>: publish インフラ (idempotency + dual check) ← イマココ</li>
+          <li>E-5b: vps-proxy 拡張 + 実 publish (RYS_PUBLISH_ENABLED=1 で初稼働)</li>
         </ol>
       </div>
     </div>
