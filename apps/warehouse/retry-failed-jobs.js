@@ -39,13 +39,14 @@ const MAX_RETRY_COUNT = 3;
 // ジョブ定義 (daily-sync.js と一致させる)
 //   f_sales のみ retry 時は 30分 (初回 10分でタイムアウトした場合の余裕)
 const JOB_DEFINITIONS = {
-  'f_sales':     { script: 'apps/warehouse/rebuild-f-sales.js',         timeoutMs: 1800000 },
-  '楽天sku_map': { script: 'apps/warehouse/rebuild-rakuten-sku-map.js', timeoutMs: 600000  },
-  'Render同期':  { script: 'apps/warehouse/sync-to-render.js',          timeoutMs: 600000  },
+  'f_sales':        { script: 'apps/warehouse/rebuild-f-sales.js',         timeoutMs: 1800000 },
+  'sales_velocity': { script: 'apps/warehouse/rebuild-sales-velocity.js',  timeoutMs: 900000  },
+  '楽天sku_map':    { script: 'apps/warehouse/rebuild-rakuten-sku-map.js', timeoutMs: 600000  },
+  'Render同期':     { script: 'apps/warehouse/sync-to-render.js',          timeoutMs: 600000  },
 };
 
-// 実行順序 (依存関係順)
-const RETRY_ORDER = ['f_sales', '楽天sku_map', 'Render同期'];
+// 実行順序 (依存関係順)。sales_velocity は f_sales と同じ raw 受注 + マスタ依存なので直後。
+const RETRY_ORDER = ['f_sales', 'sales_velocity', '楽天sku_map', 'Render同期'];
 
 async function notify(text) {
   try {
@@ -212,6 +213,15 @@ async function main() {
     const def = JOB_DEFINITIONS[jobName];
     const result = runScript(def.script, jobName, def.timeoutMs);
     results.push({ name: jobName, ...result });
+  }
+
+  // fail-closed: remaining_jobs のうち runner に定義が無いジョブ (daily-sync の RETRYABLE_JOBS には
+  // あるが JOB_DEFINITIONS/RETRY_ORDER 未登録、例: Amazon Ads/Settlement/finance build) は上の
+  // ループで実行されない。results に載らないと stillFailed=0 となり state削除→誤「復旧成功」で
+  // サイレントに落ちる。未対応ジョブは失敗扱いで残し、最終的に 🔴 通知で顕在化させる。
+  const unhandled = state.remaining_jobs.filter(j => !JOB_DEFINITIONS[j]);
+  for (const j of unhandled) {
+    results.push({ name: j, success: false, summary: '⚠️ retry runner 未対応 (JOB_DEFINITIONS 未登録) のため未実行' });
   }
 
   const stillFailed = results.filter(r => !r.success).map(r => r.name);

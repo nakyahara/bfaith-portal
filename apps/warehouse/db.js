@@ -507,6 +507,24 @@ function createTables() {
   )`);
   // 値域は DB CHECK + API/取り込み側バリデーションの二重防御
 
+  // 12d. 販売速度サマリ（商品管理リスト用）— FBA/FBA以外 × 7日/30日 の純販売数(受注日ベース)
+  //   FBA      = raw_sp_orders(fulfillment_channel='Amazon') を SKUマップで NE商品コードへ解決・セット展開
+  //   FBA以外  = raw_ne_orders(キャンセル区分='有効'、_ignore店舗除外) を商品コード単位で集計
+  //     ※ NE受注は Amazon FBM/楽天/Yahoo/auPay/LINEギフト/メルカリ/Qoo10/卸 を含み、FBAは構造的に非含有
+  //       (ne_fba_overlap 実測 2026-06-08: FBA注文ID∩NE受注番号=0/175,097)。
+  //   毎朝 rebuild-sales-velocity.js で洗い替え(as_of=前日JST)。母集団は売上のある商品コードのみ(疎)。
+  db.exec(`CREATE TABLE IF NOT EXISTS f_sales_velocity_by_product (
+    商品コード        TEXT PRIMARY KEY,
+    qty_7d_fba        INTEGER NOT NULL DEFAULT 0,
+    qty_7d_nonfba     INTEGER NOT NULL DEFAULT 0,
+    qty_7d_total      INTEGER NOT NULL DEFAULT 0,
+    qty_30d_fba       INTEGER NOT NULL DEFAULT 0,
+    qty_30d_nonfba    INTEGER NOT NULL DEFAULT 0,
+    qty_30d_total     INTEGER NOT NULL DEFAULT 0,
+    as_of_date        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL
+  )`);
+
   // ─── 統合商品マスタ系 ───
 
   // 13. m_products（統合商品マスタ）
@@ -1811,7 +1829,7 @@ function insertDefaultShops() {
 // ─── 統計取得 ───
 
 export function getStats() {
-  const tables = ['raw_ne_products', 'raw_ne_orders', 'raw_ne_set_products', 'raw_sp_orders', 'raw_sp_orders_log', 'raw_rakuten_orders', 'raw_rakuten_orders_log', 'raw_lz_inventory', 'product_shipping', 'shipping_rates', 'exception_genka', 'product_sales_class', 'm_reorder_setting', 'shops', 'm_products', 'm_set_components', 'f_sales_by_listing', 'f_sales_by_product', 'unmapped_sales', 'amazon_sku_fees', 'stock_monthly_snapshot', 'm_sku_master', 'm_sku_components'];
+  const tables = ['raw_ne_products', 'raw_ne_orders', 'raw_ne_set_products', 'raw_sp_orders', 'raw_sp_orders_log', 'raw_rakuten_orders', 'raw_rakuten_orders_log', 'raw_lz_inventory', 'product_shipping', 'shipping_rates', 'exception_genka', 'product_sales_class', 'm_reorder_setting', 'f_sales_velocity_by_product', 'shops', 'm_products', 'm_set_components', 'f_sales_by_listing', 'f_sales_by_product', 'unmapped_sales', 'amazon_sku_fees', 'stock_monthly_snapshot', 'm_sku_master', 'm_sku_components'];
   const stats = {};
 
   for (const table of tables) {
