@@ -12,6 +12,7 @@
  *   GET  /api/status        — 同期状態
  */
 import { Router } from 'express';
+import crypto from 'crypto';
 import { initMirrorDB, getMirrorDB } from './db.js';
 import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
 
@@ -396,6 +397,62 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
       });
       tx();
       log.push(`stock_monthly_snapshot: ${snapshotData.length}件${meta?.clear_stock_snapshot ? ' (clear)' : ''}`);
+    }
+
+    // 商品管理リスト スナップショット (⑤) — checksum 検証 → atomic swap
+    //   payload: req.body.pml_snapshot = { run_id, status, as_of_date, generated_at,
+    //     payload_checksum, row_count, src_*, ne_fba_overlap, rows: [...] }
+    //   fail-closed: status='failed' / rows欠落 / checksum不一致 / 件数不一致 は反映せず前回 published を保持。
+    if (req.body.pml_snapshot && typeof req.body.pml_snapshot === 'object') {
+      const p = req.body.pml_snapshot;
+      const PML_COLS = [
+        '商品コード','商品名','仕入先','取扱区分','商品区分','最終仕入日','在庫保管日数',
+        '総在庫数','FBA在庫数','フリー在庫','注残数','引当数','総在庫数_引当なし',
+        '販売数7日_FBA','販売数7日_FBA以外','販売数7日_合計',
+        '販売数30日_FBA','販売数30日_FBA以外','販売数30日_合計',
+        '発注ロット単位','推奨保有月数','売価','原価','想定見込み利益','概算利益率',
+        '代表商品コード','ロケーションコード','商品分類タグ','登録日',
+      ];
+      const rows = Array.isArray(p.rows) ? p.rows : null;
+      let reason = null;
+      // fail-closed: checksum / row_count は必須。欠落・空・不一致は反映しない (前回 published 保持)。
+      if (!p.run_id || !p.status) reason = 'run_id/status 欠落';
+      else if (p.status === 'failed') reason = `status=failed (${p.run_id})`;
+      else if (!rows) reason = 'rows 欠落';
+      else if (!Number.isInteger(p.row_count) || p.row_count !== rows.length) reason = `件数不一致/欠落 meta=${p.row_count} actual=${rows.length}`;
+      else if (typeof p.payload_checksum !== 'string' || p.payload_checksum.length === 0) reason = 'payload_checksum 欠落';
+      else {
+        // checksum 再計算 (送信元 build-product-management-snapshot.js と同一規約: 列順固定・null='' ・tab/改行)
+        const canonical = rows.map(r => PML_COLS.map(c => r[c] == null ? '' : String(r[c])).join('\t')).join('\n');
+        const recomputed = crypto.createHash('sha256').update(canonical).digest('hex');
+        if (recomputed !== p.payload_checksum) {
+          reason = `checksum不一致 (recompute≠送信元)`;
+        } else {
+          const swap = db.transaction(() => {
+            db.exec('DELETE FROM mirror_pml_snapshot_rows');
+            const ins = db.prepare(`INSERT INTO mirror_pml_snapshot_rows (run_id, ${PML_COLS.join(', ')})
+              VALUES (?, ${PML_COLS.map(() => '?').join(', ')})`);
+            for (const r of rows) ins.run(p.run_id, ...PML_COLS.map(c => r[c] ?? null));
+            db.prepare(`INSERT INTO mirror_pml_published
+              (id, run_id, status, as_of_date, generated_at, payload_checksum, row_count,
+               src_ne_products_synced_at, src_velocity_as_of, src_fba_business_date, src_reorder_updated_at,
+               ne_fba_overlap, published_at, synced_at)
+              VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              ON CONFLICT(id) DO UPDATE SET run_id=excluded.run_id, status=excluded.status,
+               as_of_date=excluded.as_of_date, generated_at=excluded.generated_at,
+               payload_checksum=excluded.payload_checksum, row_count=excluded.row_count,
+               src_ne_products_synced_at=excluded.src_ne_products_synced_at, src_velocity_as_of=excluded.src_velocity_as_of,
+               src_fba_business_date=excluded.src_fba_business_date, src_reorder_updated_at=excluded.src_reorder_updated_at,
+               ne_fba_overlap=excluded.ne_fba_overlap, published_at=excluded.published_at, synced_at=excluded.synced_at`)
+              .run(p.run_id, p.status, p.as_of_date || null, p.generated_at || null, p.payload_checksum || null, rows.length,
+                p.src_ne_products_synced_at || null, p.src_velocity_as_of || null, p.src_fba_business_date || null,
+                p.src_reorder_updated_at || null, p.ne_fba_overlap ?? null, p.generated_at || now, now);
+          });
+          swap();
+          log.push(`pml_snapshot: ${rows.length}件 (run=${p.run_id}, status=${p.status})`);
+        }
+      }
+      if (reason) log.push(`pml_snapshot: スキップ (${reason}) — 前回 published 保持`);
     }
 
     // 同期状態更新
@@ -2221,6 +2278,13 @@ router.get('/api/status', (req, res) => {
     try { status.rakuten_sku_map_count = db.prepare('SELECT COUNT(*) as cnt FROM mirror_rakuten_sku_map').get().cnt; } catch { status.rakuten_sku_map_count = 0; }
     // Codex PR2a Round 4 非ブロッカー #3 反映: stock_snapshot 件数も同期検証に乗せる
     try { status.stock_snapshot_count = db.prepare('SELECT COUNT(*) as cnt FROM mirror_stock_monthly_snapshot').get().cnt; } catch { status.stock_snapshot_count = 0; }
+    // 商品管理リスト snapshot (⑤): published run の行数 + run_id を検証用に公開
+    try {
+      const pub = db.prepare('SELECT run_id, status, payload_checksum FROM mirror_pml_published WHERE id=1').get();
+      status.pml_published_run_id = pub?.run_id ?? null;
+      status.pml_published_status = pub?.status ?? null;
+      status.pml_snapshot_count = pub ? db.prepare('SELECT COUNT(*) as cnt FROM mirror_pml_snapshot_rows WHERE run_id=?').get(pub.run_id).cnt : 0;
+    } catch { status.pml_published_run_id = null; status.pml_snapshot_count = 0; }
     try {
       const r = db.prepare(`SELECT
         COUNT(*) AS cnt,
@@ -2316,6 +2380,61 @@ function requireReadToken(req, res, next) {
   }
   next();
 }
+
+// ─── GET /api/pml/published ───
+// 商品管理リスト snapshot の published run を GAS 向けに返す read-only endpoint (⑥ GAS が読む)。
+// 認証: x-read-token (MIRROR_READ_TOKEN)。商品管理リスト専用の固定レスポンス (汎用DB読み取りにしない)。
+// GAS 側ゲート: status='ok' かつ payload_checksum を行から再計算して一致 かつ 鮮度OK のときだけシート上書き。
+//   Cache-Control: no-store。published 無しは 200 + ok:false で返す (呼び出し側で判定)。
+const PML_COLS_OUT = [
+  '商品コード','商品名','仕入先','取扱区分','商品区分','最終仕入日','在庫保管日数',
+  '総在庫数','FBA在庫数','フリー在庫','注残数','引当数','総在庫数_引当なし',
+  '販売数7日_FBA','販売数7日_FBA以外','販売数7日_合計',
+  '販売数30日_FBA','販売数30日_FBA以外','販売数30日_合計',
+  '発注ロット単位','推奨保有月数','売価','原価','想定見込み利益','概算利益率',
+  '代表商品コード','ロケーションコード','商品分類タグ','登録日',
+];
+router.get('/api/pml/published', requireReadToken, (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const db = getMirrorDB();
+  try {
+    const snap = db.transaction(() => {
+      const pub = db.prepare('SELECT * FROM mirror_pml_published WHERE id=1').get();
+      if (!pub) return { ok: false, reason: 'no_published' };
+      const rows = db.prepare(`SELECT ${PML_COLS_OUT.join(', ')} FROM mirror_pml_snapshot_rows WHERE run_id=? ORDER BY 商品コード`).all(pub.run_id);
+      return { pub, rows };
+    })();
+    if (snap.ok === false) {
+      return res.json({ ok: false, reason: snap.reason, columns: PML_COLS_OUT });
+    }
+    const { pub, rows } = snap;
+    res.json({
+      ok: true,
+      run_id: pub.run_id,
+      status: pub.status,                       // GAS は 'ok' のみ上書き
+      as_of_date: pub.as_of_date,
+      generated_at: pub.generated_at,
+      published_at: pub.published_at,
+      synced_at: pub.synced_at,
+      payload_checksum: pub.payload_checksum,   // GAS は受信行から再計算し一致検証
+      row_count: pub.row_count,
+      actual_row_count: rows.length,
+      ne_fba_overlap: pub.ne_fba_overlap,
+      watermarks: {
+        ne_products_synced_at: pub.src_ne_products_synced_at,
+        velocity_as_of: pub.src_velocity_as_of,
+        fba_business_date: pub.src_fba_business_date,
+        reorder_updated_at: pub.src_reorder_updated_at,
+      },
+      server_time_utc: new Date().toISOString(),
+      columns: PML_COLS_OUT,                    // GAS の列順・checksum 再計算用 (null='' tab/改行)
+      rows,
+    });
+  } catch (e) {
+    console.error('[Mirror] /api/pml/published エラー:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
 
 router.get('/api/sku-master/recent-missing-candidates', requireReadToken, (req, res) => {
   const db = getMirrorDB();

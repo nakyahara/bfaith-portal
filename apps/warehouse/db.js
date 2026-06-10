@@ -495,6 +495,97 @@ function createTables() {
   )`);
   // CHECK制約はSQLiteでは制限があるため、取り込み時にバリデーション
 
+  // 12c. 発注設定マスタ（手動入力）— 推奨保有月数（「何ヶ月分の在庫を持つか」の係数）
+  //   商品管理リストの「推奨保有在庫」列に相当。販売データから自動算出できない手動パラメータ。
+  //   新商品は GET /api/reorder/unregistered（未登録リスト）に上がってきて、register UI で登録する。
+  db.exec(`CREATE TABLE IF NOT EXISTS m_reorder_setting (
+    sku               TEXT PRIMARY KEY,
+    推奨保有月数      REAL NOT NULL CHECK (推奨保有月数 >= 0 AND 推奨保有月数 <= 60),
+    商品名            TEXT,
+    updated_by        TEXT,
+    synced_at         TEXT
+  )`);
+  // 値域は DB CHECK + API/取り込み側バリデーションの二重防御
+
+  // 12d. 販売速度サマリ（商品管理リスト用）— FBA/FBA以外 × 7日/30日 の純販売数(受注日ベース)
+  //   FBA      = raw_sp_orders(fulfillment_channel='Amazon') を SKUマップで NE商品コードへ解決・セット展開
+  //   FBA以外  = raw_ne_orders(キャンセル区分='有効'、_ignore店舗除外) を商品コード単位で集計
+  //     ※ NE受注は Amazon FBM/楽天/Yahoo/auPay/LINEギフト/メルカリ/Qoo10/卸 を含み、FBAは構造的に非含有
+  //       (ne_fba_overlap 実測 2026-06-08: FBA注文ID∩NE受注番号=0/175,097)。
+  //   毎朝 rebuild-sales-velocity.js で洗い替え(as_of=前日JST)。母集団は売上のある商品コードのみ(疎)。
+  db.exec(`CREATE TABLE IF NOT EXISTS f_sales_velocity_by_product (
+    商品コード        TEXT PRIMARY KEY,
+    qty_7d_fba        INTEGER NOT NULL DEFAULT 0,
+    qty_7d_nonfba     INTEGER NOT NULL DEFAULT 0,
+    qty_7d_total      INTEGER NOT NULL DEFAULT 0,
+    qty_30d_fba       INTEGER NOT NULL DEFAULT 0,
+    qty_30d_nonfba    INTEGER NOT NULL DEFAULT 0,
+    qty_30d_total     INTEGER NOT NULL DEFAULT 0,
+    as_of_date        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL
+  )`);
+
+  // 12e. 商品管理リスト スナップショット（現スプレッドシート互換の完成行を warehouse 側で確定）
+  //   meta(run_id) + rows(run_id, 商品コード) を append、published_run_id を一括切替(atomic publish)。
+  //   Render/GAS/画面は published_run_id のみ参照。母集団は m_products 起点(全件 left join)。
+  //   ソース: m_products + raw_ne_products(自社在庫/最終仕入日等) + inv_daily_detail(FBA在庫)
+  //          + f_sales_velocity_by_product(販売数) + m_reorder_setting(推奨保有月数)。
+  db.exec(`CREATE TABLE IF NOT EXISTS product_management_snapshot_meta (
+    run_id                    TEXT PRIMARY KEY,
+    as_of_date                TEXT,
+    generated_at              TEXT NOT NULL,
+    status                    TEXT NOT NULL,          -- ok / partial / failed
+    row_count                 INTEGER NOT NULL DEFAULT 0,
+    payload_checksum          TEXT,
+    -- ソース別 watermark / 健全性
+    src_ne_products_synced_at TEXT,
+    src_velocity_as_of        TEXT,
+    src_fba_business_date     TEXT,
+    src_reorder_updated_at    TEXT,
+    fba_unmapped_qty          INTEGER,
+    ne_fba_overlap            INTEGER,
+    notes                     TEXT
+  )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS product_management_snapshot_rows (
+    run_id                TEXT NOT NULL,
+    商品コード            TEXT NOT NULL,
+    商品名                TEXT,
+    仕入先                TEXT,
+    取扱区分              TEXT,
+    商品区分              TEXT,
+    最終仕入日            TEXT,
+    在庫保管日数          INTEGER,
+    総在庫数              INTEGER,
+    FBA在庫数             INTEGER,
+    フリー在庫            INTEGER,
+    注残数                INTEGER,
+    引当数                INTEGER,
+    総在庫数_引当なし     INTEGER,
+    販売数7日_FBA         INTEGER,
+    販売数7日_FBA以外     INTEGER,
+    販売数7日_合計        INTEGER,
+    販売数30日_FBA        INTEGER,
+    販売数30日_FBA以外    INTEGER,
+    販売数30日_合計       INTEGER,
+    発注ロット単位        INTEGER,
+    推奨保有月数          REAL,
+    売価                  REAL,
+    原価                  REAL,
+    想定見込み利益        REAL,
+    概算利益率            REAL,
+    代表商品コード        TEXT,
+    ロケーションコード    TEXT,
+    商品分類タグ          TEXT,
+    登録日                TEXT,
+    PRIMARY KEY (run_id, 商品コード)
+  )`);
+  // 公開ポインタ（単一行、id=1）。生成完了後に run_id を一括切替。
+  db.exec(`CREATE TABLE IF NOT EXISTS product_management_published (
+    id            INTEGER PRIMARY KEY CHECK (id = 1),
+    run_id        TEXT NOT NULL,
+    published_at  TEXT NOT NULL
+  )`);
+
   // ─── 統合商品マスタ系 ───
 
   // 13. m_products（統合商品マスタ）
@@ -1799,7 +1890,7 @@ function insertDefaultShops() {
 // ─── 統計取得 ───
 
 export function getStats() {
-  const tables = ['raw_ne_products', 'raw_ne_orders', 'raw_ne_set_products', 'raw_sp_orders', 'raw_sp_orders_log', 'raw_rakuten_orders', 'raw_rakuten_orders_log', 'raw_lz_inventory', 'product_shipping', 'shipping_rates', 'exception_genka', 'product_sales_class', 'shops', 'm_products', 'm_set_components', 'f_sales_by_listing', 'f_sales_by_product', 'unmapped_sales', 'amazon_sku_fees', 'stock_monthly_snapshot', 'm_sku_master', 'm_sku_components'];
+  const tables = ['raw_ne_products', 'raw_ne_orders', 'raw_ne_set_products', 'raw_sp_orders', 'raw_sp_orders_log', 'raw_rakuten_orders', 'raw_rakuten_orders_log', 'raw_lz_inventory', 'product_shipping', 'shipping_rates', 'exception_genka', 'product_sales_class', 'm_reorder_setting', 'f_sales_velocity_by_product', 'product_management_snapshot_rows', 'shops', 'm_products', 'm_set_components', 'f_sales_by_listing', 'f_sales_by_product', 'unmapped_sales', 'amazon_sku_fees', 'stock_monthly_snapshot', 'm_sku_master', 'm_sku_components'];
   const stats = {};
 
   for (const table of tables) {

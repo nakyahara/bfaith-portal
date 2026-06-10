@@ -21,7 +21,7 @@ const RETRY_STATE_FILE = path.join(PROJECT_DIR, 'data', 'daily-sync-retry-state.
 // Codex Round 1 #2: 'Amazon finance sync' は RETRYABLE_JOBS に入れない。
 //   sync 単独 retry すると build やり直さずに古い fact を sync する事故になる。
 //   build を retryable に残し、sync は build 成功時のみ実行 (依存連鎖は cron 単位で完結)。
-const RETRYABLE_JOBS = ['f_sales', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build'];
+const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK || 'https://chat.googleapis.com/v1/spaces/AAQAL5zHy-w/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=yER7IJx_9CkKhYnzzre0WcWuqfgXc1oh8ldR35k01zE';
 
@@ -345,6 +345,16 @@ async function main() {
   // 販売集計テーブル再構築
   const fSalesResult = runScript('apps/warehouse/rebuild-f-sales.js', 'f_sales 再構築');
   results.push({ name: 'f_sales', ...fSalesResult });
+
+  // 販売速度サマリ再構築 (商品管理リスト用: FBA/FBA以外 × 7d/30d)
+  // m_products / v_sku_resolved / raw受注 が揃った後に実行。
+  const velocityResult = runScript('apps/warehouse/rebuild-sales-velocity.js', 'sales velocity 再構築');
+  results.push({ name: 'sales_velocity', ...velocityResult });
+
+  // 商品管理リスト スナップショット生成 (在庫集計 + velocity の後)
+  // m_products 起点で在庫/販売/利益/発注パラメータを1表に確定し published_run_id を切替。
+  const pmlSnapResult = runScript('apps/warehouse/build-product-management-snapshot.js', '商品管理リスト snapshot');
+  results.push({ name: 'pml_snapshot', ...pmlSnapResult });
 
   // Amazon Settlement mart 再構築 (Phase 3.5)
   // dirty queue から rebuild。Refund qty 推定込みで long+wide 生成。
