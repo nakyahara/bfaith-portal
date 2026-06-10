@@ -1107,15 +1107,25 @@ function compareSkuMappings(sheetRows, mirrorRows) {
     if (norm(s.fnsku) !== norm(m.fnsku)) d.fnsku = [s.fnsku, m.fnsku];
     if (Object.keys(d).length) fieldDiffs.push({ amazon_sku: s.amazon_sku, ...d });
   }
-  // ★切替前ゲート (PR4): FBA観測SKU(restock/ever_seen/snapshot)が mirror に存在するか。
-  //   mappingMap は norm 参照になったので、case 差では落ちない。落ちるのは「norm キーが mirror に無い」=真にmaster欠落。
-  //   mirror_missing_observed が 0 = mirror 切替で推奨から落ちる観測SKUは無い (切替可の主ゲート)。
-  //   mirror_case_mismatch_observed は norm一致だが exact ケース違い (lookup正規化済で無害、情報のみ)。
+  // ★切替前ゲート (PR4 修正): 母集団は「いま推奨で実際に使う SKU」= calc-engine と同じ
+  //   restock_latest + 最新 daily_snapshots に限定する。ever_seen / 全 snapshot は廃番を含む歴史的集合で、
+  //   それらが mirror に無いのは当然 (旧シートにも無い) → ゲートに使うと大量過検知する (旧実装の誤り)。
+  //   mappingMap は norm 参照なので case 差では落ちない。落ちるのは「現行SKUの norm キーが mirror に無い」場合のみ。
+  //   判定: mirror_missing_observed が sheet_missing_baseline と同じ (理想は両方 0/小) なら、
+  //         現行シートと同等の網羅性 = 切替えても推奨から失われる現行 SKU は増えない。
   const mirrorExactSet = new Set(mirrorRows.map(r => r.amazon_sku));
   const mirrorNormSet = new Set(mirrorRows.map(r => norm(r.amazon_sku)));
-  const observedSkus = [...new Set([...getAllEverSeenSkus(), ...getAllSnapshotSkus()])].filter(Boolean);
-  const missingObserved = observedSkus.filter(s => !mirrorNormSet.has(norm(s)));
-  const caseMismatchObserved = observedSkus.filter(s => mirrorNormSet.has(norm(s)) && !mirrorExactSet.has(s));
+  const sheetNormSet = new Set(sheetRows.map(r => norm(r.amazon_sku)));
+  const currentSkus = [...new Set([
+    ...getRestockLatest().map(r => r.amazon_sku),
+    ...getLatestSnapshots().map(r => r.amazon_sku),
+  ])].filter(Boolean);
+  const missingFromMirror = currentSkus.filter(s => !mirrorNormSet.has(norm(s)));
+  const missingFromSheet  = currentSkus.filter(s => !sheetNormSet.has(norm(s)));
+  const caseMismatchObserved = currentSkus.filter(s => mirrorNormSet.has(norm(s)) && !mirrorExactSet.has(s));
+  // 参考: 歴史的 ever_seen + 全 snapshot のうち mirror に無い数 (廃番を含むので大きくて正常。ゲートではない)
+  const everSeenMissing = [...new Set([...getAllEverSeenSkus(), ...getAllSnapshotSkus()])]
+    .filter(Boolean).filter(s => !mirrorNormSet.has(norm(s)));
   // case-only collision: norm 後に複数の異なる原ケースが衝突する SKU 数 (sheet 側で検出、>0 は要注意)
   const normGroups = new Map();
   for (const r of sheetRows) {
@@ -1132,15 +1142,19 @@ function compareSkuMappings(sheetRows, mirrorRows) {
       mirror_only_observed: mirrorOnlyObserved.length,    // mirror のみ & FBA観測あり = core 差分 (要調査)
       mirror_only_scope_unknown: mirrorOnlyScopeUnknown.length, // mirror のみ & 未観測 = 新規商品候補 or 非Amazon混入
       field_diffs: fieldDiffs.length,                     // 共通SKUの core フィールド差分
-      mirror_missing_observed: missingObserved.length,    // ★切替可ゲート: FBA観測SKUがmirrorに無い数。0 必須
+      current_recommendation_skus: currentSkus.length,    // いま推奨で使う現行SKU数 (ゲートの母集団)
+      mirror_missing_observed: missingFromMirror.length,  // ★切替可ゲート: 現行SKUのうち mirror に無い数
+      sheet_missing_baseline: missingFromSheet.length,    // 基準: 同じ現行SKUのうち現行シートに無い数 (これと同じなら切替で損失なし)
       mirror_case_mismatch_observed: caseMismatchObserved.length, // 参考: case のみ違い (norm参照で無害)
       mapping_case_collisions: caseCollisions,            // 参考: 大小文字だけ違う別SKUの衝突数 (>0 は要確認)
+      ever_seen_missing_info: everSeenMissing.length,     // 参考のみ: 歴史的(廃番含む)集合の欠落数。大きくて正常、ゲートではない
     },
     samples: [
       ...sheetOnly.slice(0, 10).map(s => ({ type: 'sheet_only', amazon_sku: s })),
       ...mirrorOnlyObserved.slice(0, 10).map(s => ({ type: 'mirror_only_observed', amazon_sku: s })),
       ...mirrorOnlyScopeUnknown.slice(0, 10).map(s => ({ type: 'mirror_only_scope_unknown', amazon_sku: s })),
-      ...missingObserved.slice(0, 10).map(s => ({ type: 'mirror_missing_observed', amazon_sku: s })),
+      ...missingFromMirror.slice(0, 10).map(s => ({ type: 'mirror_missing_observed', amazon_sku: s })),
+      ...missingFromSheet.slice(0, 10).map(s => ({ type: 'sheet_missing_baseline', amazon_sku: s })),
       ...fieldDiffs.slice(0, 10),
     ],
   };
