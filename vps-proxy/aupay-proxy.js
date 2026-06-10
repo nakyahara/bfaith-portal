@@ -281,6 +281,41 @@ async function yahooOrderList(startDate, endDate) {
   return await callYahooAPI('orderList', xml);
 }
 
+/**
+ * Yahoo API の汎用呼び出し (Phase E-5b で追加)。
+ *   - method, contentType, body を指定可能 (既存 callYahooAPI は POST + XML 固定)
+ *   - editItem (form-encoded) / uploadItemImage (multipart) / getLeadTimeList (GET) で共有
+ *   - 署名 (RSA + X-sws-signature) と Bearer token は既存と同じロジック
+ *   - body は Buffer 受け取り可 (binary multipart 用途)
+ */
+async function callYahooAPIRaw(endpoint, { method = 'POST', contentType = 'application/xml; charset=utf-8', body = null, queryString = '' } = {}) {
+  const accessToken = await getAccessToken();
+  const url = `${YAHOO_API_BASE}/${endpoint}${queryString ? '?' + queryString : ''}`;
+  const headers = {
+    'Authorization': `Bearer ${accessToken}`,
+  };
+  if (body !== null) headers['Content-Type'] = contentType;
+  try {
+    if (fs.existsSync(YAHOO_PUBLIC_KEY_PATH)) {
+      const publicKeyPem = fs.readFileSync(YAHOO_PUBLIC_KEY_PATH, 'utf-8');
+      const publicKey = crypto.createPublicKey(publicKeyPem);
+      const timestamp = Math.floor(Date.now() / 1000).toString();
+      const message = `${YAHOO_SELLER_ID}:${timestamp}`;
+      const encrypted = crypto.publicEncrypt(
+        { key: publicKey, padding: crypto.constants.RSA_PKCS1_PADDING },
+        Buffer.from(message, 'utf-8')
+      );
+      headers['X-sws-signature'] = encrypted.toString('base64');
+      headers['X-sws-signature-version'] = YAHOO_SIGNATURE_VERSION;
+    }
+  } catch (e) { console.log(`[${ts()}] 署名スキップ: ${e.message}`); }
+  const fetchOpts = { method, headers };
+  if (body !== null) fetchOpts.body = body;
+  const res = await fetch(url, fetchOpts);
+  const text = await res.text();
+  return { status: res.status, body: text };
+}
+
 async function yahooOrderInfo(orderId) {
   // 2026-05-11 fix: <Field> を <Target> 内に戻す + Item. prefix 削除 + IsGetOrderDetail 削除
   //   (5/8 PROXY_SECRET rotation 修正のついでに 4/11 修正前の壊れた構造に regression していた)
@@ -303,6 +338,16 @@ function readBody(req) {
     const chunks = [];
     req.on('data', c => chunks.push(c));
     req.on('end', () => resolve(Buffer.concat(chunks).toString()));
+    req.on('error', reject);
+  });
+}
+
+// multipart / binary body 用 (Phase E-5b で追加、 uploadItemImage が使う)
+function readBodyBuffer(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -518,6 +563,65 @@ const server = http.createServer(async (req, res) => {
       const xml = await yahooOrderInfo(orderId);
       res.writeHead(200, { 'Content-Type': 'application/xml' });
       res.end(xml);
+      return;
+    }
+
+    // ─── Phase E-5b: Yahoo publish 系 endpoint (RYS = RakutenYahooSync 用) ───
+
+    // GET /yahoo/getLeadTimeList?seller_id=xxx
+    //   Yahoo getLeadTimeList API へ token + 署名付きで forward
+    //   leads(発送日設定)マスタの id 一覧を取得 (RYS readiness preflight 用)
+    if (pathname === '/yahoo/getLeadTimeList' && req.method === 'GET') {
+      const sellerId = url.searchParams.get('seller_id') || YAHOO_SELLER_ID;
+      console.log(`[${ts()}] Yahoo getLeadTimeList: seller=${sellerId}`);
+      const r = await callYahooAPIRaw('getLeadTimeList', {
+        method: 'GET',
+        body: null,
+        queryString: `seller_id=${encodeURIComponent(sellerId)}`,
+      });
+      res.writeHead(r.status, { 'Content-Type': 'application/xml' });
+      res.end(r.body);
+      return;
+    }
+
+    // POST /yahoo/editItem
+    //   caller (RYS) が application/x-www-form-urlencoded で fields を投げる
+    //   そのまま Yahoo editItem.xml に forward (token + 署名は proxy 側で付与)
+    if (pathname === '/yahoo/editItem' && req.method === 'POST') {
+      // Codex R1 軽微 1 対応: form-encoded のみ許可 (JSON 等の誤投入を早く検知)
+      const contentType = req.headers['content-type'] || '';
+      if (!contentType.startsWith('application/x-www-form-urlencoded')) {
+        throw new Error('editItem は application/x-www-form-urlencoded である必要があります');
+      }
+      const formBody = await readBody(req);
+      console.log(`[${ts()}] Yahoo editItem: body=${formBody.length}b`);
+      const r = await callYahooAPIRaw('editItem', {
+        method: 'POST',
+        contentType,
+        body: formBody,
+      });
+      res.writeHead(r.status, { 'Content-Type': 'application/xml' });
+      res.end(r.body);
+      return;
+    }
+
+    // POST /yahoo/uploadItemImage
+    //   caller (RYS) が multipart/form-data で binary + meta を投げる
+    //   Content-Type に boundary が含まれるのでそのまま forward
+    if (pathname === '/yahoo/uploadItemImage' && req.method === 'POST') {
+      const contentType = req.headers['content-type'];
+      if (!contentType || !contentType.startsWith('multipart/form-data')) {
+        throw new Error('uploadItemImage は multipart/form-data である必要があります');
+      }
+      const buf = await readBodyBuffer(req);
+      console.log(`[${ts()}] Yahoo uploadItemImage: ${buf.length}b multipart`);
+      const r = await callYahooAPIRaw('uploadItemImage', {
+        method: 'POST',
+        contentType,
+        body: buf,
+      });
+      res.writeHead(r.status, { 'Content-Type': 'application/xml' });
+      res.end(r.body);
       return;
     }
 
