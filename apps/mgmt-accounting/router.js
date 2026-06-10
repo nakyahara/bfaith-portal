@@ -316,8 +316,40 @@ function syncSegmentSalesForMonth(db, year_month, now) {
         // fee=0 / summary 無しの場合は冒頭で削除済みなので何もしない
       }
 
-      // セグメント行を組み立てる（by_segment 形式でないモール=米国Amazon mgmt_row 等は 0 行）
+      // セグメント行を組み立てる
       const segRows = [];
+      if (mt.mall_id === 'amazon_usa') {
+        // 米国Amazon: mgmt_row(USD→JPY換算済の管理会計15列) を「PF=amazon_usa / セグメント4」の1行へマッピング。
+        // 国内モールと同じ作り（売上=商品売上+配送料、手数料系は変動費として別建て）。US は消費税なしなので /1.1 しない。
+        const mg = JSON.parse(row.mgmt_row || '{}');
+        const jr = JSON.parse(row.jpy_row || '{}'); // 列別JPY換算値（手数料を税と分離して取る）
+        const usSales = Math.round((mg['商品売上'] || 0) + (mg['配送料'] || 0));
+        const usCost = Math.round((mg['原価合計'] != null ? mg['原価合計'] : row.cost_total) || 0);
+        // PF手数料 = 販売系手数料のみ（手数料は控除(負値)→絶対値で変動費化）。
+        let feeSigned;
+        if (Object.keys(jr).length > 0) {
+          // 通常のCSV確定経路: jpy_row から個別に取り、marketplace withheld tax
+          // (Amazonが代理徴収・納付する米国Sales Taxの pass-through) は除外する。
+          // 売上側も売上税/配送料の税金を含めないため整合する。
+          feeSigned = (jr['selling fees'] || 0)
+                    + (jr['fba fees'] || 0)
+                    + (jr['other transaction fees'] || 0)
+                    + (jr['promotional rebates'] || 0);
+        } else {
+          // 履歴インポート月(jpy_row='{}')は mgmt_row から。'手数料' は
+          // (withheld tax + selling fees) 合算で分離不能なため withheld tax を含む
+          // (=粗利わずかに保守的)。fees=0 で粗利過大にするよりは正確。
+          feeSigned = (mg['手数料'] || 0)
+                    + (mg['FBA手数料'] || 0)
+                    + (mg['トランザクションに関するその他の手数料'] || 0)
+                    + (mg['プロモーション割引額'] || 0);
+        }
+        const usPfFee = Math.round(Math.abs(feeSigned));
+        const usAdCost = Math.round(row.ad_cost || 0);
+        if (usSales || usCost || usPfFee || usAdCost) {
+          segRows.push({ seg: 4, sales: usSales, cost: usCost, pfFee: usPfFee, adCost: usAdCost });
+        }
+      } else
       for (const [segKey, segData] of Object.entries(allSegs)) {
         const seg = segKey === 'other' ? null : parseInt(segKey);
         if (seg === null || isNaN(seg)) continue;
