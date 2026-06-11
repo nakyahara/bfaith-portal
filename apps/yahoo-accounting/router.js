@@ -342,8 +342,9 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
     let yearMonth = '';
     for (const row of allRows) {
       if (row.日付) {
-        yearMonth = row.日付.slice(0, 7).replace(/\//g, '-');
-        break;
+        // 月をゼロ埋め (例 2026/3 → 2026-03)
+        const ym = String(row.日付).match(/(\d{4})\D+(\d{1,2})/);
+        if (ym) { yearMonth = `${ym[1]}-${String(parseInt(ym[2], 10)).padStart(2, '0')}`; break; }
       }
     }
 
@@ -456,7 +457,8 @@ router.post('/upload-billing', upload.array('files', 10), (req, res) => {
     // 利用日から年月推定
     let billingYearMonth = '';
     if (allBillingRows.length > 0 && allBillingRows[0].利用日) {
-      billingYearMonth = allBillingRows[0].利用日.slice(0, 7).replace(/\//g, '-');
+      const _m = String(allBillingRows[0].利用日).match(/(\d{4})\D+(\d{1,2})/);
+      if (_m) billingYearMonth = `${_m[1]}-${String(parseInt(_m[2], 10)).padStart(2, '0')}`;
     }
 
     res.json({
@@ -513,7 +515,8 @@ router.post('/upload-receipt', upload.array('files', 10), (req, res) => {
     // 利用日から年月推定
     let receiptYearMonth = '';
     if (allReceiptRows[0]?.利用日) {
-      receiptYearMonth = allReceiptRows[0].利用日.slice(0, 7).replace(/\//g, '-');
+      const _m = String(allReceiptRows[0].利用日).match(/(\d{4})\D+(\d{1,2})/);
+      if (_m) receiptYearMonth = `${_m[1]}-${String(parseInt(_m[2], 10)).padStart(2, '0')}`;
     }
 
     res.json({
