@@ -321,8 +321,11 @@ function syncSegmentSalesForMonth(db, year_month, now) {
       // excluded のキー: "4" （輸出）
       for (const [k, v] of Object.entries(excluded)) allSegs[k] = v;
 
-      // セグメント全体の売上合計（広告費・PF手数料按分用）
-      const segSalesTotal = Object.values(allSegs).reduce((s, v) => s + (v['売上合計'] || v['合計'] || v['商品売上'] || 0), 0);
+      // セグメント全体の売上合計（広告費・PF手数料按分の分母）。
+      // 按分の分子（各segの sales）と基準を揃える：Amazon は 商品売上(gross)、他は 売上合計。
+      const segSalesTotal = Object.values(allSegs).reduce((s, v) => s + (
+        mt.mall_id === 'amazon_jp' ? (v['商品売上'] || 0) : (v['売上合計'] || v['合計'] || v['商品売上'] || 0)
+      ), 0);
 
       // PF手数料の全体値（テーブルカラムから取得）
       let pfFeeTotal = mt.feeField ? (Number(row[mt.feeField]) || 0) : 0;
