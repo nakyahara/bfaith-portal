@@ -967,7 +967,7 @@ router.get('/api/missing/prioritized', (req, res) => {
         LEFT JOIN (
           SELECT 商品コード, SUM(数量) as qty, MAX(日付) as last_sold FROM f_sales_by_product WHERE 日付 >= ? GROUP BY 商品コード
         ) s30 ON m.商品コード = s30.商品コード
-        WHERE m.商品区分 IN ('単品', '例外') AND r.sku IS NULL
+        WHERE m.商品区分 = '単品' AND r.sku IS NULL
           AND m.取扱区分 = '取扱中'
         ORDER BY priority, sales_7d DESC, sales_30d DESC
         LIMIT 200
@@ -1151,7 +1151,7 @@ router.get('/api/reorder/unregistered', (req, res) => {
       SELECT 商品コード, SUM(数量) as qty FROM f_sales_by_product WHERE 日付 >= ? GROUP BY 商品コード
     ) s30 ON p.商品コード = s30.商品コード COLLATE NOCASE
     WHERE r.sku IS NULL
-      AND p.商品区分 IN ('単品', '例外')
+      AND p.商品区分 = '単品'
       AND p.取扱区分 = '取扱中'
     ORDER BY 直近30日販売数 DESC, p.new_product_launch_date DESC, p.商品コード
     LIMIT ?
@@ -1330,7 +1330,7 @@ router.get('/api/missing/download', (req, res) => {
         SELECT m.商品コード, m.商品名, m.商品区分, m.取扱区分, m.標準売価, m.原価, m.原価状態, '' as 推奨保有月数
         FROM m_products m
         LEFT JOIN m_reorder_setting r ON m.商品コード = r.sku COLLATE NOCASE
-        WHERE m.商品区分 IN ('単品', '例外') AND r.sku IS NULL
+        WHERE m.商品区分 = '単品' AND r.sku IS NULL
           AND m.取扱区分 = '取扱中'
         ORDER BY m.取扱区分, m.商品コード
       `).all();
@@ -1373,7 +1373,7 @@ router.get('/api/missing/counts', (req, res) => {
     const tax_rate = db.prepare("SELECT COUNT(*) as cnt FROM m_products WHERE 商品区分 IN ('単品', '例外') AND 消費税率 IS NULL").get().cnt;
     const reorder = db.prepare(`SELECT COUNT(*) as cnt FROM m_products m
       LEFT JOIN m_reorder_setting r ON m.商品コード = r.sku COLLATE NOCASE
-      WHERE m.商品区分 IN ('単品', '例外') AND r.sku IS NULL
+      WHERE m.商品区分 = '単品' AND r.sku IS NULL
         AND m.取扱区分 = '取扱中'`).get().cnt;
     res.json({ shipping, genka, sku_map, sales_class, tax_rate, reorder });
   } catch {
