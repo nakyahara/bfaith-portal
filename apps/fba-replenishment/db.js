@@ -1122,6 +1122,10 @@ function compareSkuMappings(sheetRows, mirrorRows) {
   ])].filter(Boolean);
   const missingFromMirror = currentSkus.filter(s => !mirrorNormSet.has(norm(s)));
   const missingFromSheet  = currentSkus.filter(s => !sheetNormSet.has(norm(s)));
+  // ★★最重要ゲート: 「今シートでマッピングできてる現行SKUのうち、mirror に無い=切替で実際に落ちる」数。
+  //   net 比較 (missing 同士) では相殺で隠れる regression を、集合差で直接捕捉する。0 で「1件も落ちない」が確定。
+  const wouldDropOnSwitch = currentSkus.filter(s => sheetNormSet.has(norm(s)) && !mirrorNormSet.has(norm(s)));
+  const wouldGainOnSwitch = currentSkus.filter(s => mirrorNormSet.has(norm(s)) && !sheetNormSet.has(norm(s)));
   const caseMismatchObserved = currentSkus.filter(s => mirrorNormSet.has(norm(s)) && !mirrorExactSet.has(s));
   // 参考: 歴史的 ever_seen + 全 snapshot のうち mirror に無い数 (廃番を含むので大きくて正常。ゲートではない)
   const everSeenMissing = [...new Set([...getAllEverSeenSkus(), ...getAllSnapshotSkus()])]
@@ -1143,8 +1147,10 @@ function compareSkuMappings(sheetRows, mirrorRows) {
       mirror_only_scope_unknown: mirrorOnlyScopeUnknown.length, // mirror のみ & 未観測 = 新規商品候補 or 非Amazon混入
       field_diffs: fieldDiffs.length,                     // 共通SKUの core フィールド差分
       current_recommendation_skus: currentSkus.length,    // いま推奨で使う現行SKU数 (ゲートの母集団)
-      mirror_missing_observed: missingFromMirror.length,  // ★切替可ゲート: 現行SKUのうち mirror に無い数
-      sheet_missing_baseline: missingFromSheet.length,    // 基準: 同じ現行SKUのうち現行シートに無い数 (これと同じなら切替で損失なし)
+      would_drop_on_switch: wouldDropOnSwitch.length,      // ★★最重要ゲート: シートで推奨できてるのにmirror切替で落ちる現行SKU。0必須
+      would_gain_on_switch: wouldGainOnSwitch.length,      // 参考: mirror切替で新たに拾える現行SKU
+      mirror_missing_observed: missingFromMirror.length,  // 現行SKUのうち mirror に無い数 (sheetにも無い分を含む)
+      sheet_missing_baseline: missingFromSheet.length,    // 基準: 同じ現行SKUのうち現行シートに無い数
       mirror_case_mismatch_observed: caseMismatchObserved.length, // 参考: case のみ違い (norm参照で無害)
       mapping_case_collisions: caseCollisions,            // 参考: 大小文字だけ違う別SKUの衝突数 (>0 は要確認)
       ever_seen_missing_info: everSeenMissing.length,     // 参考のみ: 歴史的(廃番含む)集合の欠落数。大きくて正常、ゲートではない
@@ -1153,8 +1159,8 @@ function compareSkuMappings(sheetRows, mirrorRows) {
       ...sheetOnly.slice(0, 10).map(s => ({ type: 'sheet_only', amazon_sku: s })),
       ...mirrorOnlyObserved.slice(0, 10).map(s => ({ type: 'mirror_only_observed', amazon_sku: s })),
       ...mirrorOnlyScopeUnknown.slice(0, 10).map(s => ({ type: 'mirror_only_scope_unknown', amazon_sku: s })),
-      ...missingFromMirror.slice(0, 10).map(s => ({ type: 'mirror_missing_observed', amazon_sku: s })),
-      ...missingFromSheet.slice(0, 10).map(s => ({ type: 'sheet_missing_baseline', amazon_sku: s })),
+      ...wouldDropOnSwitch.slice(0, 20).map(s => ({ type: 'would_drop_on_switch', amazon_sku: s })),
+      ...wouldGainOnSwitch.slice(0, 10).map(s => ({ type: 'would_gain_on_switch', amazon_sku: s })),
       ...fieldDiffs.slice(0, 10),
     ],
   };
