@@ -439,6 +439,11 @@ function syncSegmentSalesForMonth(db, year_month, now) {
 // /api/calculate（人手の確定）と auto-sync（自動再計算）で共有。
 function recomputeMonthlyPL(db, year_month, now, user) {
   const segSales = db.prepare('SELECT * FROM mart_monthly_segment_sales WHERE year_month = ?').all(year_month);
+  // 売上が空のとき（同期元障害・summary欠落等）は既存PLを壊さない（確定履歴を守る）
+  if (segSales.length === 0) return { rows: 0, freight_total: 0, material_total: 0, skipped: true };
+  // 既に確定済みなら confirmed_at（人が確定した日時）は保持し、再計算で上書きしない
+  const prevConfirmedAt = db.prepare('SELECT confirmed_at FROM mgmt_monthly_closing WHERE year_month = ?').get(year_month)?.confirmed_at;
+  const confirmedAt = prevConfirmedAt || now;
   const freightRows = db.prepare('SELECT * FROM mgmt_freight_costs WHERE year_month = ?').all(year_month);
   const materialRows = db.prepare('SELECT * FROM mgmt_material_costs WHERE year_month = ?').all(year_month);
   const sharedFreight = freightRows.filter(r => r.cost_scope === 'shared').reduce((s, r) => s + r.amount, 0);
@@ -481,11 +486,11 @@ function recomputeMonthlyPL(db, year_month, now, user) {
     db.prepare(`INSERT OR REPLACE INTO mgmt_monthly_closing
       (year_month, fiscal_year, fiscal_month, status, freight_total, material_total, confirmed_at, confirmed_by, calc_version)
       VALUES (?,?,?,?,?,?,?,?,?)`).run(
-      year_month, fiscalYear, getFiscalMonth(year_month), 'confirmed', freightTotal, materialTotal, now, user, 'v1');
+      year_month, fiscalYear, getFiscalMonth(year_month), 'confirmed', freightTotal, materialTotal, confirmedAt, user, 'v1');
     db.prepare(`INSERT OR REPLACE INTO mart_monthly_shared_costs
       (year_month, freight_total, material_total, confirmed_at, freight_detail, material_detail)
       VALUES (?,?,?,?,?,?)`).run(
-      year_month, freightTotal, materialTotal, now,
+      year_month, freightTotal, materialTotal, confirmedAt,
       JSON.stringify(Object.fromEntries(freightRows.map(r => [r.carrier, r.amount]))),
       JSON.stringify(Object.fromEntries(materialRows.map(r => [r.supplier, r.amount]))));
   });
@@ -498,12 +503,13 @@ function recomputeMonthlyPL(db, year_month, now, user) {
 // 非表示になる問題があったため「自動再計算して確定維持」に変更（人手の再確定は不要）。
 function syncAndRefreshMonth(db, ym, now) {
   return db.transaction(() => {
-    const closing = db.prepare('SELECT confirmed_by FROM mgmt_monthly_closing WHERE year_month = ?').get(ym);
+    // 過去に確定された月のみ自動再計算（新規/下書き月は人手の確定が必要）
+    const closing = db.prepare("SELECT confirmed_by FROM mgmt_monthly_closing WHERE year_month = ? AND status IN ('confirmed','needs_review')").get(ym);
     const r = syncSegmentSalesForMonth(db, ym, now); // 内部 tx は savepoint としてネスト
     let refreshed = false;
-    if (closing) { // 既に確定実績のある月のみ自動再計算（新規月は人手の確定が必要）
-      recomputeMonthlyPL(db, ym, now, closing.confirmed_by || 'auto-sync');
-      refreshed = true;
+    if (closing) {
+      const res = recomputeMonthlyPL(db, ym, now, closing.confirmed_by || 'auto-sync');
+      refreshed = !res.skipped;
     }
     return { ...r, refreshed };
   })();
