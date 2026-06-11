@@ -385,8 +385,12 @@ function syncSegmentSalesForMonth(db, year_month, now) {
         const seg = segKey === 'other' ? null : parseInt(segKey);
         if (seg === null || isNaN(seg)) continue;
 
-        // 売上・原価（by_segmentの構造は売上合計/原価合計が標準）
-        const sales = segData['売上合計'] || segData['合計'] || segData['商品売上'] || 0;
+        // 売上・原価（by_segmentの構造は売上合計/原価合計が標準）。
+        // Amazon の by_segment '合計' は手数料・FBA手数料を控除後のネットなので、これを売上に使うと
+        // 後段で手数料/FBA運賃を再控除して二重控除になる → Amazon は 商品売上(gross) を使う。
+        const sales = mt.mall_id === 'amazon_jp'
+          ? (segData['商品売上'] || 0)
+          : (segData['売上合計'] || segData['合計'] || segData['商品売上'] || 0);
         const cost = segData['原価合計'] || 0;
 
         // PF手数料計算
@@ -431,39 +435,77 @@ function syncSegmentSalesForMonth(db, year_month, now) {
   return { inserted: totalInserted, fba_freight_tax_excluded: fbaFreightInserted, malls: [...mallsPresent] };
 }
 
-// 当月運賃合計（確定時 freight_total と比較して変動検知に使う）
-function freightTotalForMonth(db, ym) {
-  return db.prepare('SELECT COALESCE(SUM(amount),0) s FROM mgmt_freight_costs WHERE year_month = ?').get(ym).s;
-}
+// 指定月のPLを「現在の segment_sales + 既存の運賃・資材費」で再計算して保存し confirmed にする。
+// /api/calculate（人手の確定）と auto-sync（自動再計算）で共有。
+function recomputeMonthlyPL(db, year_month, now, user) {
+  const segSales = db.prepare('SELECT * FROM mart_monthly_segment_sales WHERE year_month = ?').all(year_month);
+  const freightRows = db.prepare('SELECT * FROM mgmt_freight_costs WHERE year_month = ?').all(year_month);
+  const materialRows = db.prepare('SELECT * FROM mgmt_material_costs WHERE year_month = ?').all(year_month);
+  const sharedFreight = freightRows.filter(r => r.cost_scope === 'shared').reduce((s, r) => s + r.amount, 0);
+  const directFreight = freightRows.filter(r => r.cost_scope !== 'shared');
+  const materialTotal = materialRows.reduce((s, r) => s + r.amount, 0);
+  const salesForAlloc = segSales.filter(r => r.segment !== 4).reduce((s, r) => s + (r.sales || 0), 0);
+  const salesTotal = segSales.reduce((s, r) => s + (r.sales || 0), 0);
+  const fiscalYear = getFiscalYear(year_month);
+  const freightTotal = sharedFreight + directFreight.reduce((s, d) => s + d.amount, 0);
 
-// 確定時に写した mgmt_monthly_pl と再同期後 segment_sales を行単位で突合（合計一致でも入替を検知）
-function inputsChangedForMonth(db, ym) {
-  const segCount = db.prepare('SELECT COUNT(*) c FROM mart_monthly_segment_sales WHERE year_month = ?').get(ym).c;
-  const plCount = db.prepare('SELECT COUNT(*) c FROM mgmt_monthly_pl WHERE year_month = ?').get(ym).c;
-  if (segCount !== plCount) return true;
-  const diff = db.prepare(`SELECT COUNT(*) c FROM (
-    SELECT mall_id, segment, sales, cost, pf_fee, ad_cost FROM mart_monthly_segment_sales WHERE year_month = ?
-    EXCEPT
-    SELECT mall_id, segment, sales, cost, pf_fee, ad_cost FROM mgmt_monthly_pl WHERE year_month = ?
-  )`).get(ym, ym).c;
-  return diff > 0;
-}
-
-// 同一トランザクションで「完全置換 → 差分判定 → confirmed なら needs_review 降格」。
-// 手動「売上同期」と daily-sync の自動同期の両方が同じ不変条件を共有する。
-function syncAndReconcileMonth(db, ym, now) {
-  return db.transaction(() => {
-    const closing = db.prepare('SELECT status, freight_total FROM mgmt_monthly_closing WHERE year_month = ?').get(ym);
-    const r = syncSegmentSalesForMonth(db, ym, now); // 内部 tx は savepoint としてネスト
-    let flagged = false;
-    if (closing && closing.status === 'confirmed') {
-      const changed = inputsChangedForMonth(db, ym) || Math.abs(freightTotalForMonth(db, ym) - (closing.freight_total || 0)) > 1;
-      if (changed) {
-        db.prepare("UPDATE mgmt_monthly_closing SET status='needs_review' WHERE year_month = ?").run(ym);
-        flagged = true;
-      }
+  const plRows = segSales.map(row => {
+    const sales = Math.round(row.sales || 0);
+    const cost = Math.round(row.cost || 0);
+    const pfFee = Math.round(row.pf_fee || 0);
+    const adCost = Math.round(row.ad_cost || 0);
+    let freight = 0;
+    if (row.segment === 4) {
+      freight = directFreight.filter(d => d.target_segment === 4 || d.target_mall_id === 'amazon_usa').reduce((s, d) => s + d.amount, 0);
+      const exportTotal = segSales.filter(r => r.segment === 4).reduce((s, r) => s + (r.sales || 0), 0);
+      if (exportTotal > 0 && exportTotal !== sales) freight = Math.round(freight * sales / exportTotal);
+    } else {
+      freight = salesForAlloc > 0 ? Math.round(sharedFreight * sales / salesForAlloc) : 0;
     }
-    return { ...r, flagged };
+    const material = salesTotal > 0 ? Math.round(materialTotal * sales / salesTotal) : 0;
+    const salesRatio = salesTotal > 0 ? sales / salesTotal : 0;
+    const variableCost = cost + pfFee + adCost + freight + material;
+    const grossProfit = sales - variableCost;
+    const grossMargin = sales > 0 ? grossProfit / sales : 0;
+    return { year_month, mall_id: row.mall_id, segment: row.segment, sales, sales_ratio: salesRatio,
+      cost, pf_fee: pfFee, ad_cost: adCost, freight, material, variable_cost: variableCost,
+      gross_profit: grossProfit, gross_margin: grossMargin, fiscal_year: fiscalYear };
+  });
+
+  const tx = db.transaction(() => {
+    db.prepare('DELETE FROM mgmt_monthly_pl WHERE year_month = ?').run(year_month);
+    const plStmt = db.prepare(`INSERT OR REPLACE INTO mgmt_monthly_pl
+      (year_month, mall_id, segment, sales, sales_ratio, cost, pf_fee, ad_cost, freight, material, variable_cost, gross_profit, gross_margin, fiscal_year)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    for (const r of plRows) plStmt.run(r.year_month, r.mall_id, r.segment, r.sales, r.sales_ratio, r.cost, r.pf_fee, r.ad_cost, r.freight, r.material, r.variable_cost, r.gross_profit, r.gross_margin, r.fiscal_year);
+    db.prepare(`INSERT OR REPLACE INTO mgmt_monthly_closing
+      (year_month, fiscal_year, fiscal_month, status, freight_total, material_total, confirmed_at, confirmed_by, calc_version)
+      VALUES (?,?,?,?,?,?,?,?,?)`).run(
+      year_month, fiscalYear, getFiscalMonth(year_month), 'confirmed', freightTotal, materialTotal, now, user, 'v1');
+    db.prepare(`INSERT OR REPLACE INTO mart_monthly_shared_costs
+      (year_month, freight_total, material_total, confirmed_at, freight_detail, material_detail)
+      VALUES (?,?,?,?,?,?)`).run(
+      year_month, freightTotal, materialTotal, now,
+      JSON.stringify(Object.fromEntries(freightRows.map(r => [r.carrier, r.amount]))),
+      JSON.stringify(Object.fromEntries(materialRows.map(r => [r.supplier, r.amount]))));
+  });
+  tx();
+  return { rows: plRows.length, freight_total: freightTotal, material_total: materialTotal };
+}
+
+// 同期 → 確定実績(closing)のある月は現在データでPLを再計算して confirmed を維持。
+// 旧実装は入力変動で needs_review に降格していたが、データ修正のたびに過去月が一斉に
+// 非表示になる問題があったため「自動再計算して確定維持」に変更（人手の再確定は不要）。
+function syncAndRefreshMonth(db, ym, now) {
+  return db.transaction(() => {
+    const closing = db.prepare('SELECT confirmed_by FROM mgmt_monthly_closing WHERE year_month = ?').get(ym);
+    const r = syncSegmentSalesForMonth(db, ym, now); // 内部 tx は savepoint としてネスト
+    let refreshed = false;
+    if (closing) { // 既に確定実績のある月のみ自動再計算（新規月は人手の確定が必要）
+      recomputeMonthlyPL(db, ym, now, closing.confirmed_by || 'auto-sync');
+      refreshed = true;
+    }
+    return { ...r, refreshed };
   })();
 }
 
@@ -471,16 +513,14 @@ router.post('/api/sync-segment-sales', (req, res) => {
   const db = getMirrorDB();
   const { year_month } = req.body;
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
-  // 手動同期も confirmed 月の入力が変われば needs_review に降格（auto-sync と同じ不変条件）
-  const r = syncAndReconcileMonth(db, year_month, now);
-  res.json({ ok: true, inserted: r.inserted, fba_freight_tax_excluded: r.fba_freight_tax_excluded, needs_review: r.flagged });
+  // 同期 + 確定実績のある月は自動再計算（confirmed 維持）
+  const r = syncAndRefreshMonth(db, year_month, now);
+  res.json({ ok: true, inserted: r.inserted, fba_freight_tax_excluded: r.fba_freight_tax_excluded, refreshed: r.refreshed });
 });
 
 // ─── 売上自動同期の本体（in-process）───
-// 各モール summary + 既存 segment_sales + 確定済み closing の和集合の月を再同期。
-// summary が全消えした月も candidate に含めて segment_sales を空にし整合させる。
-// 確定済み(confirmed)月で入力が変動したら status='needs_review'（要再確定）へ落とし、
-// 表示ゲートで自動的にグラフから外す。運賃込みPLの最終確定は人手のまま。
+// 各モール summary + 既存 segment_sales + 確定実績のある closing の和集合の月を再同期し、
+// 確定実績のある月は現在データでPLを再計算して confirmed を維持する（過去月の表示を保つ）。
 function runMgmtAutoSync(db) {
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
   const monthsSet = new Set();
@@ -490,15 +530,16 @@ function runMgmtAutoSync(db) {
     } catch {}
   }
   for (const r of db.prepare('SELECT DISTINCT year_month FROM mart_monthly_segment_sales').all()) monthsSet.add(r.year_month);
-  for (const r of db.prepare("SELECT year_month FROM mgmt_monthly_closing WHERE status = 'confirmed'").all()) monthsSet.add(r.year_month);
+  // status を問わず確定実績のある全月（needs_review の旧データも再計算して confirmed に戻す）
+  for (const r of db.prepare('SELECT year_month FROM mgmt_monthly_closing').all()) monthsSet.add(r.year_month);
   const months = [...monthsSet].sort();
 
-  const flagged = [];
+  let refreshed = 0;
   for (const ym of months) {
-    const r = syncAndReconcileMonth(db, ym, now); // 月単位の同一tx（完全置換→差分判定→降格）
-    if (r.flagged) flagged.push({ year_month: ym });
+    const r = syncAndRefreshMonth(db, ym, now); // 月単位の同一tx（同期→確定実績があれば再計算）
+    if (r.refreshed) refreshed++;
   }
-  return { months: months.length, synced: months.length, flagged };
+  return { months: months.length, synced: months.length, refreshed };
 }
 
 // 売上自動同期エンドポイント（手動/デバッグ用。MIRROR_SYNC_KEY 認証）。
@@ -519,8 +560,7 @@ function runMgmtAutoSyncSafely(label) {
   _mgmtAutoSyncRunning = true;
   try {
     const r = runMgmtAutoSync(getMirrorDB());
-    const note = r.flagged.length ? ` / 要再確定: ${r.flagged.map(f => f.year_month).join(',')}` : '';
-    console.log(`[mgmt-auto-sync] ${label}: ${r.synced}ヶ月同期${note}`);
+    console.log(`[mgmt-auto-sync] ${label}: ${r.synced}ヶ月同期 / ${r.refreshed}ヶ月再計算`);
   } catch (e) {
     console.error(`[mgmt-auto-sync] ${label} 失敗:`, e.message);
   } finally {
@@ -580,90 +620,9 @@ router.post('/api/calculate', (req, res) => {
     });
   }
 
-  // 2. 運賃・資材費を取得
-  const freightRows = db.prepare('SELECT * FROM mgmt_freight_costs WHERE year_month = ?').all(year_month);
-  const materialRows = db.prepare('SELECT * FROM mgmt_material_costs WHERE year_month = ?').all(year_month);
-
-  // 共通運賃（按分対象）と直課運賃を分離
-  const sharedFreight = freightRows.filter(r => r.cost_scope === 'shared').reduce((s, r) => s + r.amount, 0);
-  const directFreight = freightRows.filter(r => r.cost_scope !== 'shared');
-  const materialTotal = materialRows.reduce((s, r) => s + r.amount, 0);
-
-  // 3. 売上合計（按分ベース: shared scope対象のみ = segment 1,2,3）
-  const salesForAlloc = segSales.filter(r => r.segment !== 4).reduce((s, r) => s + (r.sales || 0), 0);
-  const salesTotal = segSales.reduce((s, r) => s + (r.sales || 0), 0);
-
-  const fiscalYear = getFiscalYear(year_month);
-
-  // 4. PL行を生成
-  const plRows = segSales.map(row => {
-    const sales = Math.round(row.sales || 0);
-    const cost = Math.round(row.cost || 0);
-    const pfFee = Math.round(row.pf_fee || 0);
-    const adCost = Math.round(row.ad_cost || 0);
-
-    let freight = 0;
-    if (row.segment === 4) {
-      // 輸出: 直課運賃のみ
-      freight = directFreight
-        .filter(d => d.target_segment === 4 || d.target_mall_id === 'amazon_usa')
-        .reduce((s, d) => s + d.amount, 0);
-      // 輸出セグメントが複数行ある場合は売上比で按分（通常1行だが安全策）
-      const exportTotal = segSales.filter(r => r.segment === 4).reduce((s, r) => s + (r.sales || 0), 0);
-      if (exportTotal > 0 && exportTotal !== sales) {
-        freight = Math.round(freight * sales / exportTotal);
-      }
-    } else {
-      // 国内: 共通運賃を売上按分
-      freight = salesForAlloc > 0 ? Math.round(sharedFreight * sales / salesForAlloc) : 0;
-    }
-
-    // 資材費: 全セグメント売上で按分
-    const material = salesTotal > 0 ? Math.round(materialTotal * sales / salesTotal) : 0;
-
-    const salesRatio = salesTotal > 0 ? sales / salesTotal : 0;
-    const variableCost = cost + pfFee + adCost + freight + material;
-    const grossProfit = sales - variableCost;
-    const grossMargin = sales > 0 ? grossProfit / sales : 0;
-
-    return {
-      year_month, mall_id: row.mall_id, segment: row.segment,
-      sales, sales_ratio: salesRatio, cost, pf_fee: pfFee, ad_cost: adCost,
-      freight, material, variable_cost: variableCost,
-      gross_profit: grossProfit, gross_margin: grossMargin, fiscal_year: fiscalYear,
-    };
-  });
-
-  // 5. DB保存
-  const tx = db.transaction(() => {
-    // 完全置換: 消えたモール/セグメントの旧PL行を残さない
-    db.prepare('DELETE FROM mgmt_monthly_pl WHERE year_month = ?').run(year_month);
-    // PL行
-    const plStmt = db.prepare(`INSERT OR REPLACE INTO mgmt_monthly_pl
-      (year_month, mall_id, segment, sales, sales_ratio, cost, pf_fee, ad_cost, freight, material, variable_cost, gross_profit, gross_margin, fiscal_year)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
-    for (const r of plRows) {
-      plStmt.run(r.year_month, r.mall_id, r.segment, r.sales, r.sales_ratio, r.cost, r.pf_fee, r.ad_cost, r.freight, r.material, r.variable_cost, r.gross_profit, r.gross_margin, r.fiscal_year);
-    }
-    // 締めヘッダ
-    db.prepare(`INSERT OR REPLACE INTO mgmt_monthly_closing
-      (year_month, fiscal_year, fiscal_month, status, freight_total, material_total, confirmed_at, confirmed_by, calc_version)
-      VALUES (?,?,?,?,?,?,?,?,?)`).run(
-      year_month, fiscalYear, getFiscalMonth(year_month), 'confirmed',
-      sharedFreight + directFreight.reduce((s, d) => s + d.amount, 0), materialTotal,
-      now, user, 'v1');
-    // 互換: mart_monthly_shared_costs にも書き込み
-    db.prepare(`INSERT OR REPLACE INTO mart_monthly_shared_costs
-      (year_month, freight_total, material_total, confirmed_at, freight_detail, material_detail)
-      VALUES (?,?,?,?,?,?)`).run(
-      year_month,
-      sharedFreight + directFreight.reduce((s, d) => s + d.amount, 0), materialTotal, now,
-      JSON.stringify(Object.fromEntries(freightRows.map(r => [r.carrier, r.amount]))),
-      JSON.stringify(Object.fromEntries(materialRows.map(r => [r.supplier, r.amount]))));
-  });
-  tx();
-
-  res.json({ ok: true, rows: plRows.length, freight_total: sharedFreight + directFreight.reduce((s, d) => s + d.amount, 0), material_total: materialTotal });
+  // 2-5. PLを再計算して確定保存（auto-sync と共有ロジック）
+  const result = recomputeMonthlyPL(db, year_month, now, user);
+  res.json({ ok: true, rows: result.rows, freight_total: result.freight_total, material_total: result.material_total });
 });
 
 // 月次PL取得
