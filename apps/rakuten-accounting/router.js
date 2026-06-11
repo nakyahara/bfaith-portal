@@ -350,7 +350,9 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
 
     // 対象年月を推定（注文確定日時から）
     const firstDate = allRows[0]?.注文確定日時 || '';
-    const yearMonth = firstDate.slice(0, 7).replace(/\//g, '-');
+    // 月をゼロ埋め (例 2026/3 → 2026-03)
+    const _rm = String(firstDate).match(/(\d{4})\D+(\d{1,2})/);
+    const yearMonth = _rm ? `${_rm[1]}-${String(parseInt(_rm[2], 10)).padStart(2, '0')}` : '';
 
     // 商品番号解決
     const { resolved, unresolved, unresolvedTax, unresolvedSegment, zeroGenka } = resolveProducts(allRows, db);

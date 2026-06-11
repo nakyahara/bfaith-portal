@@ -1113,6 +1113,33 @@ function createTables() {
     material_detail TEXT DEFAULT '{}'
   )`);
 
+  // migration: 各モール集計の year_month を正規化（'2026-3-' 等 → '2026-03'）。
+  // CSV日付の月ゼロ埋め漏れで slice(0,7) が生成した不正値を修復し、mgmt-accounting や
+  // 各アプリ履歴が '2026-03' で一致して引けるようにする。collision 時は安全側で skip（無損失）。
+  const normalizeYearMonth = (table) => {
+    let bad;
+    try {
+      bad = db.prepare(`SELECT year_month FROM ${table} WHERE year_month NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]'`).all();
+    } catch { return; }
+    for (const r of bad) {
+      const m = String(r.year_month).match(/(\d{4})\D*(\d{1,2})/);
+      if (!m) continue;
+      const fixed = `${m[1]}-${String(parseInt(m[2], 10)).padStart(2, '0')}`;
+      if (fixed === r.year_month) continue;
+      if (db.prepare(`SELECT 1 FROM ${table} WHERE year_month = ? LIMIT 1`).get(fixed)) {
+        console.warn(`[normalize-ym ${table}] '${r.year_month}' → '${fixed}' は既存と衝突のためスキップ`);
+        continue;
+      }
+      db.prepare(`UPDATE ${table} SET year_month = ? WHERE year_month = ?`).run(fixed, r.year_month);
+      console.log(`[normalize-ym ${table}] '${r.year_month}' → '${fixed}'`);
+    }
+  };
+  for (const t of [
+    'mart_amazon_monthly_summary', 'mart_rakuten_monthly_summary', 'mart_yahoo_monthly_summary',
+    'mart_aupay_monthly_summary', 'mart_qoo10_monthly_summary', 'mart_linegift_monthly_summary',
+    'mart_mercari_monthly_summary', 'mart_amazon_usa_monthly_summary',
+  ]) normalizeYearMonth(t);
+
   // ─── 売上分類別粗利集計（管理会計） ───
 
   // mgmt_freight_costs — 運賃明細（ヒストリカル保持）

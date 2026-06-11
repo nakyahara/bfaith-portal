@@ -357,9 +357,9 @@ router.post('/upload', upload.array('files', 10), (req, res) => {
     for (const row of allRows) {
       const dateStr = row.発送日 || row.注文日時 || '';
       if (dateStr) {
-        const d = dateStr.replace(/\//g, '-');
-        yearMonth = d.slice(0, 7);
-        break;
+        // 月をゼロ埋め (例 2026/3 → 2026-03)。slice(0,7) だと '2026-3-' 等の壊れた値になる
+        const ym = String(dateStr).match(/(\d{4})\D+(\d{1,2})/);
+        if (ym) { yearMonth = `${ym[1]}-${String(parseInt(ym[2], 10)).padStart(2, '0')}`; break; }
       }
     }
 
