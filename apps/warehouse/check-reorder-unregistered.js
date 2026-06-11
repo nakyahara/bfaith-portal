@@ -34,7 +34,7 @@ export function checkReorderUnregistered(opts = {}) {
       SELECT 商品コード, SUM(数量) as qty FROM f_sales_by_product WHERE 日付 >= date('now', '-30 days') GROUP BY 商品コード
     ) s30 ON p.商品コード = s30.商品コード COLLATE NOCASE
     WHERE r.sku IS NULL
-      AND p.商品区分 IN ('単品', '例外')
+      AND p.商品区分 = '単品'
       AND p.取扱区分 = '取扱中'
     ORDER BY 直近30日販売数 DESC, p.new_product_launch_date DESC, p.商品コード
   `).all();
