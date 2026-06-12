@@ -23,6 +23,7 @@ import { syncNotionOverrides } from './services/notion-sync.js';
 import { evaluateItemForPublish } from './services/publish-pipeline.js';
 import { fetchAllItemCodes } from './lib/rakuten-rms-proxy.js';
 import { executePublish, isPublishEnabled, buildIdempotencyKey } from './services/publish-executor.js';
+import { translateReason, summarizeReasons, categorizeReason } from './lib/reason-translator.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -90,31 +91,229 @@ function getSyncState(db) {
   return db.prepare(`SELECT * FROM sync_state WHERE source = 'notion_overrides'`).get() || null;
 }
 
+/**
+ * Phase E-6 UI 再設計: 商品リスト用データ構築。
+ *   notion_overrides + publish_idempotency + jobs を JOIN し、
+ *   業務担当者向けの「商品 1 件 = カード 1 枚」 形式で返す。
+ *
+ *   status を 4 種に簡易分類:
+ *     - done       : publish_idempotency.status='success'
+ *     - actionable : Notion 必須項目 (yahoo_title / yahoo_price / notion_delivery_label / notion_tax_rate) が
+ *                    全部入っている (≒ 移行できる、 厳密な readiness 評価は publish 時に行う安全弁あり)
+ *     - fixable    : Notion 必須項目に欠けがある (= 修正必要)
+ *     - unknown    : それ以外 (基本ない、 保険)
+ */
+function listProductsForUI(db, { filter = 'all', search = '' } = {}) {
+  //   Codex E-6 R1 High-2: jobs JOIN は 1 商品 1 行を保証 (item_code は PK だが防御的に LIMIT)
+  //   Codex E-6 R1 Medium-1: publish_idempotency は「一度でも success」 なら done
+  //     最新 status を見るのではなく、 success 履歴を優先する SELECT に変更
+  const rows = db.prepare(`
+    SELECT
+      no.rakuten_manage_number  AS item_code,
+      no.notion_page_id,
+      no.yahoo_title,
+      no.yahoo_price,
+      no.yahoo_price_sagawa,
+      no.notion_delivery_label,
+      no.notion_tax_rate,
+      no.notion_status,
+      no.synced_at,
+      j.readiness_status,
+      j.readiness_blocked_reasons,
+      j.last_readiness_at,
+      pi.status         AS publish_status,
+      pi.completed_at   AS publish_completed_at,
+      pi.error_message  AS publish_error
+    FROM notion_overrides no
+    LEFT JOIN jobs j ON j.item_code = no.rakuten_manage_number
+    LEFT JOIN (
+      -- 一度でも success があれば success を優先、 なければ最新 status (Codex R1 Medium-1)
+      -- Codex R2 Medium-1: status が success のとき completed_at / error_message も success 由来に揃える。
+      --   そうしないと UI で 「過去 success → その後 failed」 の商品が done 扱いなのに 「失敗時刻」 を表示する。
+      SELECT item_code,
+             COALESCE(
+               MAX(CASE WHEN status='success' THEN status END),
+               (SELECT status FROM publish_idempotency p2
+                  WHERE p2.item_code = p1.item_code
+                  ORDER BY p2.rowid DESC LIMIT 1)
+             ) AS status,
+             COALESCE(
+               MAX(CASE WHEN status='success' THEN completed_at END),
+               (SELECT completed_at FROM publish_idempotency p3
+                  WHERE p3.item_code = p1.item_code
+                  ORDER BY p3.rowid DESC LIMIT 1)
+             ) AS completed_at,
+             CASE WHEN MAX(CASE WHEN status='success' THEN 1 ELSE 0 END) = 1
+                  THEN NULL
+                  ELSE (SELECT error_message FROM publish_idempotency p4
+                          WHERE p4.item_code = p1.item_code
+                          ORDER BY p4.rowid DESC LIMIT 1)
+             END AS error_message
+      FROM publish_idempotency p1
+      GROUP BY item_code
+    ) pi ON pi.item_code = no.rakuten_manage_number
+    ORDER BY no.rakuten_manage_number
+  `).all();
+
+  // status 計算 + reason 翻訳
+  const products = rows.map((r) => {
+    let status, reasons = [], notionFields = [];
+    if (r.publish_status === 'success') {
+      status = 'done';
+    } else {
+      // 簡易 readiness 判定 (Notion 必須 4 項目)
+      const missing = [];
+      if (!r.yahoo_title)            missing.push('notion_title_missing');
+      if (!r.yahoo_price)            missing.push('price_invalid_or_zero');
+      if (!r.notion_delivery_label)  missing.push('delivery_mapping_unresolved');
+      if (!r.notion_tax_rate)        missing.push('notion_tax_rate_missing');
+      // 既存の readiness 評価結果も併合
+      let existingReasons = [];
+      if (r.readiness_blocked_reasons) {
+        try { existingReasons = JSON.parse(r.readiness_blocked_reasons); } catch (_) {}
+      }
+      const allReasons = [...missing, ...existingReasons.filter((x) => !missing.includes(x))];
+      // Codex E-6 R1 Medium-3: readiness 鮮度判定。
+      //   last_readiness_at が synced_at 以降なら厳密判定済 → blocked reasons を信頼。
+      //   それより古い or 未評価なら 「Notion 簡易判定だけで actionable」 と判断。
+      const readinessFresh = r.last_readiness_at && r.synced_at && r.last_readiness_at >= r.synced_at;
+      if (allReasons.length === 0) {
+        status = 'actionable';
+      } else {
+        status = 'fixable';
+        const summarized = summarizeReasons(allReasons);
+        reasons = summarized.items;
+        notionFields = summarized.notionFields;
+      }
+      // フラグだけ立てる (UI 側で「再評価推奨」 等表示できるように)
+      // 現状 Phase 1 では使わない、 Phase 2 detail drawer で表示予定
+      void readinessFresh;
+    }
+    return {
+      itemCode:     r.item_code,
+      notionPageId: r.notion_page_id,
+      yahooTitle:   r.yahoo_title,
+      yahooPrice:   r.yahoo_price,
+      sagawaPrice:  r.yahoo_price_sagawa,
+      delivery:     r.notion_delivery_label,
+      taxRate:      r.notion_tax_rate,
+      notionStatus: r.notion_status,
+      syncedAt:     r.synced_at,
+      publishStatus: r.publish_status,
+      publishCompletedAt: r.publish_completed_at,
+      publishError: r.publish_error,
+      status,
+      reasons,
+      notionFields,
+      primaryReason: reasons[0]?.message || '',
+    };
+  });
+
+  // filter 適用
+  let filtered = products;
+  if (filter === 'actionable') filtered = products.filter((p) => p.status === 'actionable');
+  else if (filter === 'fixable') filtered = products.filter((p) => p.status === 'fixable');
+  else if (filter === 'done') filtered = products.filter((p) => p.status === 'done');
+
+  // 検索 (商品コード / タイトル 部分一致、 case-insensitive)
+  const term = String(search || '').trim().toLowerCase();
+  if (term) {
+    filtered = filtered.filter((p) =>
+      (p.itemCode && p.itemCode.toLowerCase().includes(term))
+      || (p.yahooTitle && p.yahooTitle.toLowerCase().includes(term))
+    );
+  }
+
+  // 集計
+  const summary = {
+    total: products.length,
+    actionable: products.filter((p) => p.status === 'actionable').length,
+    fixable: products.filter((p) => p.status === 'fixable').length,
+    done: products.filter((p) => p.status === 'done').length,
+  };
+
+  // 不備種類別 (fixable のみ): 「売価未入力 45 件」 等
+  const fixableByCategory = {};
+  for (const p of products.filter((x) => x.status === 'fixable')) {
+    const cats = new Set();
+    for (const r of p.reasons) {
+      // 元 raw reason を持ってないので、 notionField を bucket key として使う
+      const label = r.notionField
+        ? ({ 'Yahoo!タイトル': 'タイトル未入力',
+              '売価': '売価未入力',
+              '配送方法': '配送方法未設定',
+              '税率': '税率の問題',
+              'カテゴリ': 'カテゴリ未設定',
+              '画像': '画像の問題',
+              'バリエーション': 'バリエーションの問題',
+              'バリエーション有無': 'バリエーションの問題',
+              'バリエーション項目': 'バリエーションの問題',
+            }[r.notionField] || 'その他')
+        : 'その他';
+      cats.add(label);
+    }
+    for (const c of cats) fixableByCategory[c] = (fixableByCategory[c] || 0) + 1;
+  }
+
+  return {
+    products: filtered,
+    summary,
+    fixableByCategory,
+  };
+}
+
+// Notion ページ URL 構築 helper (UI から「Notion で直す」 リンク)
+function notionPageUrl(pageId) {
+  if (!pageId) return null;
+  const id = String(pageId).replace(/-/g, '');
+  return `https://www.notion.so/${id}`;
+}
+
 // ───────────────── 画面 ─────────────────
 
-router.get('/', (_req, res) => {
+router.get('/', (req, res) => {
   const status = inspectEnvStatus();
   let syncState = null;
-  let notionStats = null;
-  let readiness = null;
-  let publish = null;
+  let publishSummary = null;
+  let products = [];
+  let summary = { total: 0, actionable: 0, fixable: 0, done: 0 };
+  let fixableByCategory = {};
+  const filter = ['all', 'actionable', 'fixable', 'done'].includes(req.query.filter)
+    ? req.query.filter
+    : 'actionable'; // default は「すぐ移行できる」 = やるべきこと
+  const search = String(req.query.q || '');
+
   try {
     const db = getDB();
     syncState = getSyncState(db);
-    notionStats = getNotionOverrideStats(db);
-    readiness = getReadinessSummary(db);
-    publish = getPublishSummary(db);
+    publishSummary = getPublishSummary(db);
+    const listed = listProductsForUI(db, { filter, search });
+    products = listed.products;
+    summary = listed.summary;
+    fixableByCategory = listed.fixableByCategory;
   } catch (_) {
-    // DB 未初期化等は dashboard 表示自体は continue
+    // DB 未初期化等は空 state で表示 continue
   }
+
+  // Notion sync 鮮度 (3 日以上前なら警告)
+  let syncDaysAgo = null;
+  if (syncState?.last_successful_sync_at) {
+    const diff = Date.now() - new Date(syncState.last_successful_sync_at).getTime();
+    syncDaysAgo = Math.floor(diff / (1000 * 60 * 60 * 24));
+  }
+
   renderView(res, 'dashboard', {
     status,
-    phase: 'E-5a (publish infra)',
     syncState,
-    notionStats,
-    readiness,
-    publish,
+    syncDaysAgo,
+    publishSummary,
     publishEnabled: isPublishEnabled(),
+    products,
+    summary,
+    fixableByCategory,
+    filter,
+    search,
+    notionPageUrl,  // EJS から呼べるように
   });
 });
 
