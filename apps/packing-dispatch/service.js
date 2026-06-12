@@ -1354,6 +1354,7 @@ export function importTrackingCsv({ source, buffer, filename }, user) {
     return { import_id: existing.import_id, source, row_count: 0,
       matched_count: 0, unmatched_count: 0, conflict_count: 0,
       method_match_count: 0, method_change_count: 0, method_unknown_count: 0, method_skipped_count: 0,
+      method_corrected_count: 0,
       duplicate: true, message: 'このファイルは既に取込済みです' };
   }
   // 同じファイルを別 source で取込済みなら警告 (中原さん指示: 種別ミス防止)
@@ -1372,6 +1373,7 @@ export function importTrackingCsv({ source, buffer, filename }, user) {
   if (!parsed.rows.length) {
     return { import_id: null, source, row_count: 0, matched_count: 0, unmatched_count: 0, conflict_count: 0,
       method_match_count: 0, method_change_count: 0, method_unknown_count: 0, method_skipped_count: 0,
+      method_corrected_count: 0,
       duplicate: false, message: 'データ行がありません' };
   }
 
@@ -1379,15 +1381,23 @@ export function importTrackingCsv({ source, buffer, filename }, user) {
   const now = utcIsoNow();
   let matched = 0, unmatched = 0, conflict = 0;
   let methodMatch = 0, methodChange = 0, methodUnknown = 0, methodSkipped = 0;
+  let methodCorrected = 0;       // 現在の配送方法を CSV 実方法に矯正した件数 (High fix 2026-06-11)
   const unmatchedList = [];
   const conflictList = [];
+  const methodCorrectedList = [];
 
   // pd_shipment_tracking の現状取得 (配送方法変更判定用に method_at_export も含める)
-  const sel = db.prepare(`SELECT ne_uketsuke_no, tracking_no, tracking_source, sync_status,
+  const sel = db.prepare(`SELECT ne_uketsuke_no, shipping_method_code, tracking_no, tracking_source, sync_status,
     method_at_export, product_summary, shop_name, order_no
     FROM pd_shipment_tracking WHERE ne_uketsuke_no=?`);
   const upd = db.prepare(`UPDATE pd_shipment_tracking
     SET tracking_no=?, tracking_source=?, updated_at=?, updated_by=?
+    WHERE ne_uketsuke_no=? AND sync_status IN ('pending','ready','error','conflict','manual_review')`);
+  // High fix (2026-06-11): キャリア CSV は「実際にどのキャリアで出荷したか」の権威ソース。
+  // judgeActualMethod が確定 (takkyu50/yupacketpuff/hatsubarai/nekopos) し、現在値と食い違うときは
+  // 現在の配送方法も実方法に矯正する (誤分類 / 手動誤設定の self-heal、NE反映は shipping_method_code を使う)。
+  const updWithMethod = db.prepare(`UPDATE pd_shipment_tracking
+    SET shipping_method_code=?, tracking_no=?, tracking_source=?, updated_at=?, updated_by=?
     WHERE ne_uketsuke_no=? AND sync_status IN ('pending','ready','error','conflict','manual_review')`);
   const updConflict = db.prepare(`UPDATE pd_shipment_tracking
     SET sync_status='conflict', last_error=?, updated_at=?, updated_by=?
@@ -1419,6 +1429,8 @@ export function importTrackingCsv({ source, buffer, filename }, user) {
       // 配送方法変更判定は紐付けと独立 (Codex R1 High 2 対応): synced であっても KPI 判定する。
       const isSynced = cur.sync_status === 'synced';
       const isConflict = !!cur.tracking_no && cur.tracking_no !== r.tracking_no;
+      // judged = CSV が示す実キャリア (物理出荷キャリアの権威ソース)。matched/method 矯正の両方で使う。
+      const judged = judgeActualMethod(source, r);
       if (isSynced) {
         unmatched++;
         if (unmatchedList.length < 50) unmatchedList.push({ ne_uketsuke_no: r.ne_uketsuke_no, tracking_no: r.tracking_no, row_no: r.row_no, note: 'synced' });
@@ -1428,19 +1440,27 @@ export function importTrackingCsv({ source, buffer, filename }, user) {
           ne_uketsuke_no: r.ne_uketsuke_no, current: cur.tracking_no, incoming: r.tracking_no });
         updConflict.run(`既存=${cur.tracking_no} / 新=${r.tracking_no} (source=${source})`,
           now, user || null, r.ne_uketsuke_no);
+      } else if (judged.method && judged.method !== cur.shipping_method_code) {
+        // High fix: 現在の配送方法を CSV 実方法に矯正 (tracking も同時に紐付け)。
+        const info = updWithMethod.run(judged.method, r.tracking_no, source, now, user || null, r.ne_uketsuke_no);
+        if (info.changes > 0) {
+          methodCorrected++;
+          if (methodCorrectedList.length < 50) methodCorrectedList.push({
+            ne_uketsuke_no: r.ne_uketsuke_no, from: cur.shipping_method_code, to: judged.method });
+        }
+        matched++;
       } else {
         upd.run(r.tracking_no, source, now, user || null, r.ne_uketsuke_no);
         matched++;
       }
 
       // ── 配送方法変更判定 (matched/synced 関係なく、conflict 以外で method_at_export あり) ──
-      // conflict は別の運用問題、変更ログ KPI 対象外
+      // conflict は別の運用問題、変更ログ KPI 対象外。基準は method_at_export (出力時方法) のまま。
       if (isConflict) continue;
       if (!cur.method_at_export) {
         methodSkipped++;
         continue;
       }
-      const judged = judgeActualMethod(source, r);
       if (!judged.method) {
         methodUnknown++;
         continue;
@@ -1458,24 +1478,29 @@ export function importTrackingCsv({ source, buffer, filename }, user) {
     db.prepare(`UPDATE pd_tracking_import
       SET matched_count=?, unmatched_count=?, conflict_count=?,
           method_match_count=?, method_change_count=?, method_unknown_count=?, method_skipped_count=?,
+          method_corrected_count=?,
           detail_json=?
       WHERE import_id=?`).run(
       matched, unmatched, conflict,
       methodMatch, methodChange, methodUnknown, methodSkipped,
-      JSON.stringify({ unmatched: unmatchedList, conflict: conflictList }),
+      methodCorrected,
+      JSON.stringify({ unmatched: unmatchedList, conflict: conflictList, method_corrected: methodCorrectedList }),
       import_id);
   });
   tx();
   // 軽い maintenance: 90日超ログ purge (1日1回まで、Codex R2 Medium 1)
   purgeOldMethodChangeLogOncePerDay();
   audit('tracking_import', import_id, { source, filename, file_hash, row_count: parsed.rows.length,
-    matched, unmatched, conflict,
-    method_match: methodMatch, method_change: methodChange, method_unknown: methodUnknown, method_skipped: methodSkipped }, user);
+    matched, unmatched, conflict, method_corrected: methodCorrected,
+    method_match: methodMatch, method_change: methodChange, method_unknown: methodUnknown, method_skipped: methodSkipped,
+    method_corrected_samples: methodCorrectedList.slice(0, 20) }, user);
   return { import_id, source, row_count: parsed.rows.length,
     matched_count: matched, unmatched_count: unmatched, conflict_count: conflict,
     method_match_count: methodMatch, method_change_count: methodChange,
     method_unknown_count: methodUnknown, method_skipped_count: methodSkipped,
-    duplicate: false, unmatched_samples: unmatchedList.slice(0, 10), conflict_samples: conflictList.slice(0, 10) };
+    method_corrected_count: methodCorrected,
+    duplicate: false, unmatched_samples: unmatchedList.slice(0, 10), conflict_samples: conflictList.slice(0, 10),
+    method_corrected_samples: methodCorrectedList.slice(0, 10) };
 }
 
 // ─── 手動入力 (レターパック / 定形外 等) ───
@@ -1770,7 +1795,7 @@ export function listTracking({ status, source, shop, q, scope = 'all', limit = 1
 export function listTrackingImports(limit = 50) {
   const db = ensureSchema();
   return db.prepare(`SELECT import_id, source, filename, row_count, matched_count, unmatched_count,
-    conflict_count, imported_by, imported_at
+    conflict_count, method_corrected_count, imported_by, imported_at
     FROM pd_tracking_import ORDER BY imported_at DESC LIMIT ?`).all(Math.min(limit, 200));
 }
 
@@ -2054,26 +2079,31 @@ export function listMissingTracking() {
 //   #1: UPDATE 後 changes 確認、0 件なら conflict エラー (SELECT/UPDATE 間の race 検出)
 // changeShippingMethod (2026-06-07 中原さん指示で waiting 行全対応に拡張):
 //   未割当 (waiting = pending + tracking_no NULL + tracking_source != 'no_tracking') の伝票なら
-//   レターパック または 定形外 に手動で変更可。
-//   想定: 「ゆうパケットパフにしてたが、サイズオーバーでレターパックに変更」等。
+//   レターパック / 定形外 / キャリア (ネコポス・発払い・50サイズ) に手動で変更可。
+//   想定: 「ゆうパケットパフにしてたが、サイズオーバーでレターパックに変更」「ネコポスにして追跡番号も入れる」等。
 //
-//   変更先は letterpack / teikeigai の 2 つに限定 (2026-06-07 中原さん指示):
-//   - キャリア (ヤマト/ゆうパケパフ等) への変更はサポートしない (CSV 取込で shipping_method が
-//     上書きされるため、手動変更しても意味がない)
+//   変更先は letterpack / teikeigai / nekopos / hatsubarai / takkyu50 (2026-06-11 中原さん指示で
+//   キャリア 3 種を追加):
+//   - 手動で配送方法を確定でき、追跡番号も任意で同時入力できる。
+//   - なお、後でキャリア CSV を取り込んだとき、CSV の実方法 (judgeActualMethod) が手動設定と
+//     食い違う場合は importTrackingCsv 側で「実方法に矯正」して上書きする (self-heal、
+//     method_corrected_count で可視化)。手動設定はあくまで暫定で、CSV (物理出荷の権威) が優先。
 //
 //   引数:
-//     shipping_method_code (new): letterpack / teikeigai のみ
+//     shipping_method_code (new): letterpack / teikeigai / nekopos / hatsubarai / takkyu50
 //     tracking_no:
-//       - new='teikeigai' → 引数無視、tracking_source='no_tracking' 自動セット
+//       - new='teikeigai'  → 引数無視、tracking_source='no_tracking' 自動セット
 //       - new='letterpack' → 必須。空ならエラー。tracking_source='manual_letterpack'
-const ALLOWED_CHANGE_TARGETS = new Set(['letterpack', 'teikeigai']);
+//       - new=キャリア      → 任意。入力あり→tracking_source='manual_carrier' で linked、
+//                            空なら tracking_no/source とも NULL のまま waiting (キャリア CSV 取込が後で紐付け)
+const ALLOWED_CHANGE_TARGETS = new Set(['letterpack', 'teikeigai', 'nekopos', 'hatsubarai', 'takkyu50']);
 export function changeShippingMethod({ ne_uketsuke_no, shipping_method_code, tracking_no }, user) {
   const uke = norm(ne_uketsuke_no);
   if (!uke) throw vErr('ne_uketsuke_no が空です');
   if (!shipping_method_code) throw vErr('shipping_method_code が空です');
-  // 変更先 whitelist (Codex R2 High: パーサーなし method 廃止 + 中原さん指示で LP/teikeigai に限定)
+  // 変更先 whitelist (Codex R2 High: パーサーなし method 廃止)
   if (!ALLOWED_CHANGE_TARGETS.has(shipping_method_code)) {
-    throw vErr(`変更先は letterpack / teikeigai のみ対応 (指定=${shipping_method_code})`);
+    throw vErr(`変更先は ${[...ALLOWED_CHANGE_TARGETS].join(' / ')} のみ対応 (指定=${shipping_method_code})`);
   }
   const db = ensureSchema();
   const sm = db.prepare(`SELECT code, is_locked FROM pd_shipping_method WHERE code=?`).get(shipping_method_code);
@@ -2098,18 +2128,26 @@ export function changeShippingMethod({ ne_uketsuke_no, shipping_method_code, tra
     throw vErr(`未割当 (waiting) 状態の伝票のみ変更できます (現在=${cur.sync_status}, tracking_no=${cur.tracking_no ? 'あり' : 'なし'}, source=${cur.tracking_source || 'なし'})`);
   }
   // 新配送方法別の tracking 設定
+  //   teikeigai            : 追跡なし (no_tracking) で linked
+  //   letterpack           : 追跡番号 必須 (manual_letterpack)
+  //   nekopos/hatsubarai/takkyu50 (キャリア): 追跡番号 任意。
+  //     入力あり → manual_carrier で linked。
+  //     入力なし → tracking_no/source とも NULL のまま waiting で残し、後でキャリア CSV 取込が紐付ける。
   let newTrk = null;
   let newSource = null;
   const trkInput = norm(tracking_no);
   if (shipping_method_code === 'teikeigai') {
     newTrk = null;
     newSource = 'no_tracking';
-  } else {
-    // letterpack (whitelist で他は到達しない)
+  } else if (shipping_method_code === 'letterpack') {
     // Codex R1 High 4: LP 変更は追跡番号必須。空だと LP カード (pd_import_line 起点) に出ず宙ぶらりんになる。
     if (!trkInput) throw vErr('レターパックへ変更する場合は追跡番号が必須です');
     newTrk = trkInput;
     newSource = 'manual_letterpack';
+  } else {
+    // キャリア (nekopos/hatsubarai/takkyu50、whitelist で他は到達しない): 追跡番号は任意
+    if (trkInput) { newTrk = trkInput; newSource = 'manual_carrier'; }
+    else { newTrk = null; newSource = null; } // waiting のまま、キャリア CSV 取込で後から紐付け
   }
   if (cur.shipping_method_code === shipping_method_code && cur.tracking_no === newTrk
       && (cur.tracking_source || null) === newSource) {
@@ -2146,26 +2184,37 @@ export function changeShippingMethod({ ne_uketsuke_no, shipping_method_code, tra
 export function setTrackingOne({ ne_uketsuke_no, tracking_no, source }, user) {
   const uke = norm(ne_uketsuke_no);
   if (!uke) throw vErr('ne_uketsuke_no が空です');
-  const SOURCE_TO_METHOD = { manual_letterpack: 'letterpack', no_tracking: 'teikeigai' };
-  const requiredMethod = SOURCE_TO_METHOD[source];
-  if (!requiredMethod) throw vErr(`source は ${Object.keys(SOURCE_TO_METHOD).join(' / ')} のいずれか`);
+  // source ごとに対象配送方法を限定 (CSV取込→紐付けと整合する source のみ受け付ける)。
+  //   manual_letterpack → letterpack
+  //   no_tracking       → teikeigai (追跡なし)
+  //   manual_carrier    → nekopos / hatsubarai / takkyu50 (キャリア手入力の追跡番号 修正用、2026-06-11)
+  const SOURCE_TO_METHODS = {
+    manual_letterpack: ['letterpack'],
+    no_tracking: ['teikeigai'],
+    manual_carrier: ['nekopos', 'hatsubarai', 'takkyu50'],
+  };
+  const allowedMethods = SOURCE_TO_METHODS[source];
+  if (!allowedMethods) throw vErr(`source は ${Object.keys(SOURCE_TO_METHODS).join(' / ')} のいずれか`);
   const trk = source === 'no_tracking' ? null : norm(tracking_no);
-  if (source === 'manual_letterpack' && !trk) throw vErr('レターパックは追跡番号が必要です');
+  if (source !== 'no_tracking' && !trk) throw vErr('追跡番号が必要です');
   const db = ensureSchema();
   const now = utcIsoNow();
   const cur = db.prepare(`SELECT shipping_method_code, tracking_no, sync_status
     FROM pd_shipment_tracking WHERE ne_uketsuke_no=?`).get(uke);
   if (!cur) throw vErr('該当の伝票が見つかりません');
   // 配送方法ガード (CSV取込→紐付けと整合する source のみ受け付ける)
-  if (cur.shipping_method_code !== requiredMethod) {
-    throw vErr(`source=${source} は ${requiredMethod} の伝票にのみ使えます (この伝票=${cur.shipping_method_code})`);
+  if (!allowedMethods.includes(cur.shipping_method_code)) {
+    throw vErr(`source=${source} は ${allowedMethods.join(' / ')} の伝票にのみ使えます (この伝票=${cur.shipping_method_code})`);
   }
   // 更新可能な状態のみ受け付ける
   const editableStatuses = ['pending', 'ready', 'error', 'conflict', 'manual_review'];
   if (!editableStatuses.includes(cur.sync_status)) {
     throw vErr(`状態が ${cur.sync_status} のため変更できません (編集可: ${editableStatuses.join(',')})`);
   }
-  if (cur.tracking_no && trk && cur.tracking_no !== trk) {
+  // manual_carrier は「修正導線」(スタッフが明示的に打ち直す) なので、既存値と違っても
+  // conflict にせず上書きする (Codex R2 High 対応)。CSV 起点/レターパック手入力など他 source は
+  // 既存値との差分を運用ミスとして conflict 記録する従来挙動を維持。
+  if (source !== 'manual_carrier' && cur.tracking_no && trk && cur.tracking_no !== trk) {
     // 構成 4: positive whitelist (pending/ready/error/conflict/manual_review のみ)。
     // syncing/synced/skipped/ne_unknown は触らない。
     db.prepare(`UPDATE pd_shipment_tracking

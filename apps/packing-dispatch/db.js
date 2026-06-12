@@ -242,7 +242,7 @@ export function ensureSchema() {
       shop_name TEXT,
       order_no TEXT,                            -- モール注文番号 (表示用)
       tracking_no TEXT,                         -- nullable (定形外/欠品はなし)
-      tracking_source TEXT,                     -- 'yamato_b2' | 'yamato_b2_50' | 'yupacketpuff' | 'manual_letterpack' | 'no_tracking'
+      tracking_source TEXT,                     -- 'yamato_b2' | 'yamato_b2_50' | 'yupacketpuff' | 'manual_letterpack' | 'manual_carrier' | 'no_tracking'
       sync_status TEXT NOT NULL DEFAULT 'pending',
       sync_requested_at TEXT,                   -- ready ボタン押下時刻
       claim_id TEXT,                            -- ミニPCの claim UUID
@@ -284,6 +284,7 @@ export function ensureSchema() {
       method_change_count INTEGER DEFAULT 0,    -- 配送方法 変更 (現場で別配送方法に変えた)
       method_unknown_count INTEGER DEFAULT 0,   -- yamato_b2 で送り状種類が "0"/"A" 以外
       method_skipped_count INTEGER DEFAULT 0,   -- method_at_export NULL 等で判定不能
+      method_corrected_count INTEGER DEFAULT 0, -- CSV実方法に合わせ現在の配送方法を矯正した件数 (2026-06-11)
       imported_by TEXT,
       imported_at TEXT,
       detail_json TEXT,                         -- 紐付け失敗の詳細 (デバッグ用)
@@ -347,6 +348,7 @@ export function ensureSchema() {
   safeAlter(`ALTER TABLE pd_tracking_import ADD COLUMN method_change_count INTEGER DEFAULT 0`);
   safeAlter(`ALTER TABLE pd_tracking_import ADD COLUMN method_unknown_count INTEGER DEFAULT 0`);
   safeAlter(`ALTER TABLE pd_tracking_import ADD COLUMN method_skipped_count INTEGER DEFAULT 0`);
+  safeAlter(`ALTER TABLE pd_tracking_import ADD COLUMN method_corrected_count INTEGER DEFAULT 0`);
 
   // コードテーブルの seed (INSERT OR IGNORE: 既存は壊さない)
   const insSM = db.prepare(`INSERT OR IGNORE INTO pd_shipping_method

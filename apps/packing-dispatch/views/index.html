@@ -426,6 +426,7 @@
           <option value="yamato_b2_50">ヤマト50</option>
           <option value="yupacketpuff">ゆうパケパフ</option>
           <option value="manual_letterpack">レターパック手入力</option>
+          <option value="manual_carrier">キャリア手入力</option>
           <option value="no_tracking">追跡なし(定形外)</option>
         </select></label>
         <label class="muted">店舗 <select id="trkFilterShop"><option value="">すべて</option></select></label>
@@ -490,7 +491,7 @@
       </div>
       <div class="scroll" style="max-height:30vh">
         <table>
-          <thead><tr><th>日時</th><th>取込者</th><th>取込元</th><th>ファイル名</th><th>行数</th><th>紐付け</th><th>未マッチ</th><th>競合</th><th></th></tr></thead>
+          <thead><tr><th>日時</th><th>取込者</th><th>取込元</th><th>ファイル名</th><th>行数</th><th>紐付け</th><th>未マッチ</th><th>競合</th><th>矯正</th><th></th></tr></thead>
           <tbody id="trkImportsBody"></tbody>
         </table>
       </div>
@@ -797,7 +798,7 @@
   <div class="db">
     <div class="muted">NE 受注番号: <code id="trkLpMethodUke"></code></div>
     <div class="muted" style="margin-top:6px">現在の配送方法: <span id="trkLpMethodCurrent" style="font-weight:bold"></span></div>
-    <div class="muted" style="margin-top:6px">例: サイズ超過で <b>ゆうパケパフ → レターパック</b>、規格外で <b>ヤマト → 定形外</b> 等。</div>
+    <div class="muted" style="margin-top:6px">例: サイズ超過で <b>ゆうパケパフ → レターパック</b>、規格外で <b>ヤマト → 定形外</b>、<b>ネコポス / 発払い / 50サイズ</b> へ変更し追跡番号も入力 等。</div>
     <div class="row" style="margin-top:12px">
       <label>新しい配送方法 <select id="trkLpMethodSelect"></select></label>
     </div>
@@ -840,6 +841,15 @@
         <table>
           <thead><tr><th>NE受注番号</th><th>既存追跡番号</th><th>新追跡番号</th><th>店舗</th><th>注文番号</th><th>商品 (コード+名称+数量)</th></tr></thead>
           <tbody id="trkImpDetailConflictBody"></tbody>
+        </table>
+      </div>
+    </div>
+    <div id="trkImpDetailCorrectedWrap" style="margin-top:12px">
+      <strong style="color:#1565c0">🔧 配送方法 矯正 (CSV実方法に合わせて書換)</strong>
+      <div class="scroll" style="max-height:35vh; margin-top:4px">
+        <table>
+          <thead><tr><th>NE受注番号</th><th>矯正前</th><th>矯正後</th></tr></thead>
+          <tbody id="trkImpDetailCorrectedBody"></tbody>
         </table>
       </div>
     </div>
@@ -2127,9 +2137,10 @@ $('#btnTrkLetterpackReload').onclick = loadTrkLetterpack;
 function openMethodChangeDialog(uke, currentMethod){
   $('#trkLpMethodUke').textContent = uke;
   $('#trkLpMethodCurrent').textContent = methodName(currentMethod) + ' (' + currentMethod + ')';
-  // 変更先 whitelist: letterpack / teikeigai のみ (2026-06-07 中原さん指示)
-  // 「キャリアに変えても CSV 取込で上書きされるので意味ない」と確定
-  const ALLOWED_CHANGE_TARGETS = new Set(['letterpack', 'teikeigai']);
+  // 変更先 whitelist: letterpack / teikeigai + キャリア (ネコポス・発払い・50サイズ)
+  // 2026-06-11 中原さん指示でキャリア 3 種を追加 (追跡番号も任意で同時入力可)。
+  // ※ サーバ側 ALLOWED_CHANGE_TARGETS と一致させること。
+  const ALLOWED_CHANGE_TARGETS = new Set(['letterpack', 'teikeigai', 'nekopos', 'hatsubarai', 'takkyu50']);
   const allowed = (OPTIONS.methods || []).filter(m => ALLOWED_CHANGE_TARGETS.has(m.code) && !m.is_locked);
   const sel = $('#trkLpMethodSelect');
   sel.innerHTML = allowed
@@ -2161,12 +2172,17 @@ function updateMethodChangeTrackingHint(){
     trkInput.style.background = '#f0f0f0';
     hint.style.color = '#2e7d32';
     hint.textContent = '定形外は追跡番号不要 (no_tracking として linked 状態にします)';
-  } else {
-    // letterpack (whitelist で他は到達しない)
+  } else if(newMethod === 'letterpack'){
     trkInput.disabled = false;
     trkInput.style.background = '';
     hint.style.color = '#c0392b';
     hint.textContent = '⚠️ レターパックへ変更する場合は追跡番号が必須です';
+  } else {
+    // キャリア (ネコポス/発払い/50サイズ): 追跡番号は任意
+    trkInput.disabled = false;
+    trkInput.style.background = '';
+    hint.style.color = '#555';
+    hint.textContent = '追跡番号は任意です。入力すれば即 linked、空ならキャリアCSV取込で後から紐付けます。';
   }
 }
 
@@ -2176,7 +2192,7 @@ $('#btnTrkLpMethodApply').onclick = async () => {
   const uke = $('#trkLpMethodUke').textContent;
   const newMethod = $('#trkLpMethodSelect').value;
   const trkRaw = $('#trkLpMethodTracking').value.trim();
-  // letterpack のみ tracking_no を採用、他 method は送らない
+  // teikeigai は追跡番号を送らない / letterpack は必須 / キャリアは任意
   let trk = '';
   if(newMethod === 'letterpack'){
     if(!trkRaw){
@@ -2185,8 +2201,14 @@ $('#btnTrkLpMethodApply').onclick = async () => {
       return;
     }
     trk = trkRaw;
+  } else if(newMethod !== 'teikeigai'){
+    // キャリア (ネコポス/発払い/50サイズ): 任意入力
+    trk = trkRaw;
   }
-  const trkLabel = newMethod === 'letterpack' ? ` + 追跡番号「${trk}」` : ' (追跡番号不要)';
+  let trkLabel;
+  if(newMethod === 'teikeigai') trkLabel = ' (追跡番号不要)';
+  else if(trk) trkLabel = ` + 追跡番号「${trk}」`;
+  else trkLabel = ' (追跡番号は後で紐付け)';
   if(!confirm(`受注 ${uke} の配送方法を「${methodName(newMethod)}」に変更します${trkLabel}。よろしいですか?`)) return;
   $('#btnTrkLpMethodApply').disabled = true;
   $('#trkLpMethodStatus').textContent = '変更中…';
@@ -2422,6 +2444,12 @@ async function loadTrackingList(){
       && r.shipping_method_code !== 'aes';
     const changeBtn = isWaiting
       ? `<button class="sub" data-trk-change-method="${esc(r.ne_uketsuke_no)}" data-trk-cur-method="${esc(r.shipping_method_code)}" title="配送方法を変更 + 追跡番号を入力">✏️ 変更</button> ` : '';
+    // キャリア手入力 (manual_carrier) の追跡番号 修正導線 (2026-06-11、Codex Medium 対応)
+    const isManualCarrier = r.tracking_source === 'manual_carrier'
+      && ['nekopos','hatsubarai','takkyu50'].includes(r.shipping_method_code)
+      && ['pending','ready','error','conflict','manual_review'].includes(r.sync_status);
+    const fixTrkBtn = isManualCarrier
+      ? `<button class="sub" data-trk-fix-carrier="${esc(r.ne_uketsuke_no)}" title="キャリア手入力の追跡番号を修正">✏️ 追跡修正</button> ` : '';
     const skipBtn = (r.sync_status==='pending' || r.sync_status==='ready' || r.sync_status==='error')
       ? `<button class="sub" data-trk-skip="${esc(r.ne_uketsuke_no)}">欠品</button>` : '';
     tr.innerHTML = `<td>${trkStatusBadge(r)}</td>`+
@@ -2432,13 +2460,29 @@ async function loadTrackingList(){
       `<td>${trkMaskTracking(r.tracking_no)}</td>`+
       `<td class="muted">${esc(r.tracking_source||'')}</td>`+
       `<td class="muted">${esc(upd)}</td>`+
-      `<td>${changeBtn}${skipBtn}</td>`;
+      `<td>${changeBtn}${fixTrkBtn}${skipBtn}</td>`;
     tb.appendChild(tr);
   }
   // 配送方法変更ボタン: 共通ダイアログ起動
   $('#trackingBody').querySelectorAll('button[data-trk-change-method]').forEach(btn => {
     btn.onclick = () => {
       openMethodChangeDialog(btn.dataset.trkChangeMethod, btn.dataset.trkCurMethod);
+    };
+  });
+  // キャリア手入力の追跡番号 修正 (setTrackingOne source=manual_carrier)
+  $('#trackingBody').querySelectorAll('button[data-trk-fix-carrier]').forEach(btn => {
+    btn.onclick = async () => {
+      const uke = btn.dataset.trkFixCarrier;
+      const input = prompt(`受注 ${uke} のキャリア追跡番号を入力し直してください`);
+      if(input === null) return;
+      const trk = input.trim();
+      if(!trk){ alert('追跡番号が空です'); return; }
+      try{
+        await api('api/tracking/set-one', { method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ ne_uketsuke_no: uke, tracking_no: trk, source: 'manual_carrier' }) });
+        loadTrackingAll && loadTrackingAll();
+      }catch(e){ alert('❌ '+e.message); }
     };
   });
   $('#trackingBody').querySelectorAll('button[data-trk-skip]').forEach(btn => {
@@ -2469,7 +2513,8 @@ async function loadTrkImports(){
       `<td style="text-align:right; color:#2e7d32">${r.matched_count}</td>`+
       `<td style="text-align:right; color:${r.unmatched_count>0?'#c0392b':'#777'}">${r.unmatched_count}</td>`+
       `<td style="text-align:right; color:${r.conflict_count>0?'#e67e22':'#777'}">${r.conflict_count}</td>`+
-      `<td>${r.unmatched_count>0||r.conflict_count>0 ? `<button class="sub" data-trk-imp-detail="${esc(r.import_id)}">詳細</button>` : ''}</td>`;
+      `<td style="text-align:right; color:${r.method_corrected_count>0?'#1565c0':'#777'}">${r.method_corrected_count||0}</td>`+
+      `<td>${r.unmatched_count>0||r.conflict_count>0||r.method_corrected_count>0 ? `<button class="sub" data-trk-imp-detail="${esc(r.import_id)}">詳細</button>` : ''}</td>`;
     tb.appendChild(tr);
   }
   tb.querySelectorAll('button[data-trk-imp-detail]').forEach(btn => {
@@ -2491,6 +2536,7 @@ function openTrkImportDetailDialog(d){
   const detail = d.detail || {};
   const um = detail.unmatched || [];
   const cf = detail.conflict || [];
+  const mcorr = detail.method_corrected || [];
   const umTotal = detail.unmatched_total != null ? detail.unmatched_total : (d.unmatched_count || 0);
   const cfTotal = detail.conflict_total != null ? detail.conflict_total : (d.conflict_count || 0);
   const sampleLimit = detail.sample_limit || 50;
@@ -2500,6 +2546,8 @@ function openTrkImportDetailDialog(d){
   // 件数ラベル
   document.querySelector('#trkImpDetailUnmatchedWrap strong').innerHTML = `❌ 未マッチ (${umTotal} 件)${truncNote(umTotal)}`;
   document.querySelector('#trkImpDetailConflictWrap strong').innerHTML = `⚠️ 競合 (${cfTotal} 件)${truncNote(cfTotal)}`;
+  const mcorrTotal = d.method_corrected_count != null ? d.method_corrected_count : mcorr.length;
+  document.querySelector('#trkImpDetailCorrectedWrap strong').innerHTML = `🔧 配送方法 矯正 (${mcorrTotal} 件)${truncNote(mcorrTotal)}`;
   // 未マッチ行 (note='synced' のタイプ② は反映ボタン非表示)
   $('#trkImpDetailUnmatchedBody').innerHTML = um.length
     ? um.map((x, idx) => {
@@ -2565,6 +2613,15 @@ function openTrkImportDetailDialog(d){
       }).join('')
     : '<tr><td colspan="6" class="muted">競合なし</td></tr>';
   $('#trkImpDetailConflictWrap').style.display = cf.length ? 'block' : 'none';
+  // 配送方法 矯正行
+  $('#trkImpDetailCorrectedBody').innerHTML = mcorr.length
+    ? mcorr.map(x => `<tr>
+          <td><code>${esc(x.ne_uketsuke_no || '')}</code></td>
+          <td>${esc(methodName(x.from))}</td>
+          <td>${esc(methodName(x.to))}</td>
+        </tr>`).join('')
+    : '<tr><td colspan="3" class="muted">矯正なし</td></tr>';
+  $('#trkImpDetailCorrectedWrap').style.display = mcorr.length ? 'block' : 'none';
   $('#trkImpDetailDlg').showModal();
 }
 const _trkImpDetailClose = $('#btnTrkImpDetailClose');
@@ -2597,7 +2654,8 @@ document.querySelectorAll('[data-trk-import]').forEach(btn => {
       if(res.duplicate){
         $('#'+statusId).textContent = `重複: 既に取込済み (${res.row_count}行)`;
       } else {
-        $('#'+statusId).textContent = `取込完了: 全${res.row_count} / 紐付け${res.matched_count} / 未マッチ${res.unmatched_count} / 競合${res.conflict_count}`;
+        $('#'+statusId).textContent = `取込完了: 全${res.row_count} / 紐付け${res.matched_count} / 未マッチ${res.unmatched_count} / 競合${res.conflict_count}`
+          + (res.method_corrected_count > 0 ? ` / 配送方法矯正${res.method_corrected_count}` : '');
         renderTrkImportResult(res);
       }
       await loadTrackingAll();
@@ -2614,6 +2672,11 @@ function renderTrkImportResult(res){
   html += `<tr><td style="color:#2e7d32">紐付け成功</td><td style="text-align:right; color:#2e7d32">${res.matched_count}</td></tr>`;
   html += `<tr><td style="color:#c0392b">未マッチ (pd_shipment_tracking に該当なし)</td><td style="text-align:right; color:#c0392b">${res.unmatched_count}</td></tr>`;
   html += `<tr><td style="color:#e67e22">競合 (既存追跡番号と異なる)</td><td style="text-align:right; color:#e67e22">${res.conflict_count}</td></tr>`;
+  // 配送方法 矯正 (High fix 2026-06-11): CSV 実方法に合わせて現在の配送方法を書き換えた件数
+  const mc = res.method_corrected_count || 0;
+  if(mc > 0){
+    html += `<tr><td style="color:#1565c0">配送方法 矯正 (CSV実方法に合わせて書換)</td><td style="text-align:right; color:#1565c0">${mc}</td></tr>`;
+  }
   // 配送方法変更ログ (中原さん 2026-06-04 指示)
   const m = res.method_match_count || 0;
   const c = res.method_change_count || 0;
@@ -2638,7 +2701,11 @@ function renderTrkImportResult(res){
     html += `<div class="muted" style="margin-top:6px">競合サンプル (最大10):</div><ul>` +
       res.conflict_samples.map(x => `<li>${esc(x.ne_uketsuke_no)}: 既存=${esc(x.current)} / 新=${esc(x.incoming)}</li>`).join('') + `</ul>`;
   }
-  if((res.unmatched_count > 0 || res.conflict_count > 0) && res.import_id){
+  if((res.method_corrected_samples||[]).length){
+    html += `<div class="muted" style="margin-top:6px">配送方法 矯正サンプル (最大10):</div><ul>` +
+      res.method_corrected_samples.map(x => `<li>${esc(x.ne_uketsuke_no)}: ${esc(methodName(x.from))} → ${esc(methodName(x.to))}</li>`).join('') + `</ul>`;
+  }
+  if((res.unmatched_count > 0 || res.conflict_count > 0 || res.method_corrected_count > 0) && res.import_id){
     html += `<div style="margin-top:8px"><button class="sub" id="btnTrkImportResultDetail" data-imp-id="${esc(res.import_id)}">📋 注文内容まで詳細を見る</button></div>`;
   }
   box.innerHTML = html;
