@@ -279,6 +279,24 @@ function backfillBillingPfFee(mallId, row) {
   return Math.max(0, Math.round(totalTaxIncl - adCost - coupon));
 }
 
+// 楽天/Yahoo の仕訳書(billing)に含まれる「物流費」の合計(税込)。
+// RSL費用等は pf_fee(請求合計ベース)にも入るが、手入力の運賃でも計上するため二重になる。
+// pf_fee からこの分を差し引いて二重計上を解消する。物流系の費目名だけを対象にする(安全側)。
+const FULFILLMENT_KEYWORDS = ['RSL', 'ロジスティ', 'フルフィルメント', '配送代行', '物流代行'];
+function fulfillmentInBilling(row) {
+  let billing;
+  try { billing = JSON.parse(row.billing || '[]'); } catch { return 0; }
+  if (!Array.isArray(billing)) return 0; // 変動費shape等は対象外(0)
+  let sum = 0;
+  for (const c of billing) {
+    const name = String(c['品目'] || '');
+    if (FULFILLMENT_KEYWORDS.some(k => name.includes(k))) {
+      sum += Number(c['税込合計'] != null ? c['税込合計'] : c['金額(税込)']) || 0;
+    }
+  }
+  return Math.max(0, Math.round(sum));
+}
+
 // 各モール集計テーブル(mart_*_monthly_summary)から指定月の mart_monthly_segment_sales を生成。
 // 各モールアプリは「確定」時のみ summary 行を作るため、行の存在 = そのモールの当月確定済み。
 function syncSegmentSalesForMonth(db, year_month, now) {
@@ -332,6 +350,11 @@ function syncSegmentSalesForMonth(db, year_month, now) {
       // 楽天/Yahoo: pf_fee 未保存の既存月は billing から best-effort 再計算（再確定で正確値に置換）
       if ((mt.mall_id === 'rakuten' || mt.mall_id === 'yahoo') && !pfFeeTotal) {
         pfFeeTotal = backfillBillingPfFee(mt.mall_id, row);
+      }
+      // 楽天/Yahoo の pf_fee は「仕訳書の請求合計」ベースで、RSL費用等の物流費も含む。
+      // 物流費は手入力の運賃で別途計上しているため、二重計上を避けて pf_fee から差し引く。
+      if (mt.mall_id === 'rakuten' || mt.mall_id === 'yahoo') {
+        pfFeeTotal = Math.max(0, pfFeeTotal - fulfillmentInBilling(row));
       }
 
       // Amazon JP: FBA手数料は販売手数料ではなく運賃として扱う（Excel運用踏襲）
@@ -449,13 +472,19 @@ function recomputeMonthlyPL(db, year_month, now, user) {
   const confirmedAt = prevConfirmedAt || now;
   const freightRows = db.prepare('SELECT * FROM mgmt_freight_costs WHERE year_month = ?').all(year_month);
   const materialRows = db.prepare('SELECT * FROM mgmt_material_costs WHERE year_month = ?').all(year_month);
-  const sharedFreight = freightRows.filter(r => r.cost_scope === 'shared').reduce((s, r) => s + r.amount, 0);
   const directFreight = freightRows.filter(r => r.cost_scope !== 'shared');
+  // FBA運賃(Amazonの手数料由来)は Amazon の売上だけに配賦する。全モール按分すると
+  // 楽天・Yahoo・仕入れ商品など非FBA商品にAmazonのFBA運賃が乗り「運賃の二重負担」になるため。
+  const fbaFreight = freightRows.filter(r => r.cost_scope === 'shared' && r.carrier === 'FBA運賃').reduce((s, r) => s + r.amount, 0);
+  let sharedManual = freightRows.filter(r => r.cost_scope === 'shared' && r.carrier !== 'FBA運賃').reduce((s, r) => s + r.amount, 0);
   const materialTotal = materialRows.reduce((s, r) => s + r.amount, 0);
   const salesForAlloc = segSales.filter(r => r.segment !== 4).reduce((s, r) => s + (r.sales || 0), 0);
+  const amazonSalesForAlloc = segSales.filter(r => r.segment !== 4 && r.mall_id === 'amazon_jp').reduce((s, r) => s + (r.sales || 0), 0);
+  // Amazon売上が無い月はFBA運賃を全体按分にフォールバック（運賃合計を保存するため）
+  if (amazonSalesForAlloc === 0) sharedManual += fbaFreight;
   const salesTotal = segSales.reduce((s, r) => s + (r.sales || 0), 0);
   const fiscalYear = getFiscalYear(year_month);
-  const freightTotal = sharedFreight + directFreight.reduce((s, d) => s + d.amount, 0);
+  const freightTotal = sharedManual + (amazonSalesForAlloc > 0 ? fbaFreight : 0) + directFreight.reduce((s, d) => s + d.amount, 0);
 
   const plRows = segSales.map(row => {
     const sales = Math.round(row.sales || 0);
@@ -468,7 +497,11 @@ function recomputeMonthlyPL(db, year_month, now, user) {
       const exportTotal = segSales.filter(r => r.segment === 4).reduce((s, r) => s + (r.sales || 0), 0);
       if (exportTotal > 0 && exportTotal !== sales) freight = Math.round(freight * sales / exportTotal);
     } else {
-      freight = salesForAlloc > 0 ? Math.round(sharedFreight * sales / salesForAlloc) : 0;
+      // 国内: 手入力運賃は全モール売上按分。FBA運賃は Amazon の売上だけに按分。
+      freight = salesForAlloc > 0 ? Math.round(sharedManual * sales / salesForAlloc) : 0;
+      if (row.mall_id === 'amazon_jp' && amazonSalesForAlloc > 0) {
+        freight += Math.round(fbaFreight * sales / amazonSalesForAlloc);
+      }
     }
     const material = salesTotal > 0 ? Math.round(materialTotal * sales / salesTotal) : 0;
     const salesRatio = salesTotal > 0 ? sales / salesTotal : 0;
