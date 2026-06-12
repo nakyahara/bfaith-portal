@@ -3,186 +3,444 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>楽天→Yahoo!ショッピング 商品移行 (RYS)</title>
+  <title>Yahoo商品移行</title>
   <link rel="icon" type="image/png" href="/favicon.png"><link rel="icon" type="image/x-icon" href="/favicon.ico">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+  <style>
+    body { background: #f5f5f7; }
+    .navbar-brand { font-weight: 700; }
+    .badge-safety {
+      background: #fff3cd; color: #8a6d3b; border: 1px solid #ffe69c; padding: .3em .65em;
+      border-radius: .5em; font-weight: 600;
+    }
+    .badge-live {
+      background: #d1f5d3; color: #155724; border: 1px solid #95dc9b; padding: .3em .65em;
+      border-radius: .5em; font-weight: 600;
+    }
+    .product-card {
+      background: #fff; border-radius: .75rem; padding: 1rem 1.25rem; margin-bottom: .75rem;
+      box-shadow: 0 1px 2px rgba(0,0,0,.04); display: grid;
+      grid-template-columns: 56px 1fr auto; gap: 1rem; align-items: center;
+    }
+    .thumb-placeholder {
+      width: 56px; height: 56px; border-radius: .5rem; background: #e9ecef;
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 700; font-size: 1.3rem; color: #6c757d;
+    }
+    .product-title { font-weight: 600; font-size: 1.05rem; color: #212529; margin: 0; }
+    .product-meta  { color: #6c757d; font-size: .87rem; margin-top: .15rem; }
+    .product-reason {
+      background: #fff8e1; border-left: 3px solid #ffb300; padding: .4rem .7rem;
+      margin-top: .5rem; border-radius: .25rem; font-size: .9rem; color: #5d4037;
+    }
+    .product-done-meta {
+      background: #e8f5e9; border-left: 3px solid #43a047; padding: .4rem .7rem;
+      margin-top: .5rem; border-radius: .25rem; font-size: .87rem; color: #1b5e20;
+    }
+    .status-dot { font-size: 1.4rem; line-height: 1; }
+    .actions { display: flex; flex-direction: column; gap: .35rem; align-items: stretch; min-width: 160px; }
+    .actions .btn { white-space: nowrap; }
+    .filter-chip { font-size: .9rem; padding: .4rem .9rem; border-radius: 2em; }
+    .summary-card { background: #fff; border-radius: .75rem; padding: 1.25rem; margin-bottom: 1rem; }
+    .next-todo li { margin: .35rem 0; }
+    .category-pill {
+      display: inline-block; background: #fff8e1; color: #5d4037; padding: .15em .7em;
+      border-radius: 1em; font-size: .85rem; margin: .15rem .3rem .15rem 0;
+    }
+  </style>
 </head>
 <body>
   <nav class="navbar navbar-dark bg-primary px-3">
-    <a class="navbar-brand fw-bold" href="/apps/rakuten-yahoo-sync/">楽天→Yahoo!ショッピング 商品移行</a>
+    <a class="navbar-brand" href="/apps/rakuten-yahoo-sync/">Yahoo商品移行</a>
     <div class="ms-auto d-flex align-items-center gap-2">
-      <span class="badge bg-warning text-dark">Phase <%= phase %></span>
+      <% if (publishEnabled) { %>
+        <span class="badge-live">本番モード: ON</span>
+      <% } else { %>
+        <span class="badge-safety">テストモード: 本登録しません</span>
+      <% } %>
       <a href="/" class="btn btn-outline-light btn-sm">ポータルに戻る</a>
     </div>
   </nav>
 
-  <div class="container py-4">
-    <div class="alert <%= status.healthy ? 'alert-success' : 'alert-danger' %>">
-      <strong><%= status.healthy ? '✅ env 設定 OK' : '⚠️ 必須 env 不足' %></strong>
-      <% if (!status.healthy) { %>
-        <div class="mt-2">未設定: <code><%= status.missing_required.join(', ') %></code></div>
+  <div class="container py-4" style="max-width: 1100px;">
+    <!-- 👇 今日やること (案 C ヘッダー) -->
+    <div class="summary-card">
+      <h5 class="mb-3">📋 きょうやること</h5>
+      <ol class="next-todo mb-0">
+        <li>
+          <strong>Notion を最新にする</strong>
+          <% if (syncState?.last_successful_sync_at) { %>
+            <span class="text-muted small">
+              （前回: <code><%= syncState.last_successful_sync_at %></code>
+              <% if (syncDaysAgo !== null) { %>
+                ・<%= syncDaysAgo %> 日前
+                <% if (syncDaysAgo >= 3) { %>
+                  <span class="text-danger">⚠ 古いです、 取り込み推奨</span>
+                <% } %>
+              <% } %>）
+            </span>
+          <% } else { %>
+            <span class="text-muted small">（まだ取り込んでいません）</span>
+          <% } %>
+          <button class="btn btn-sm btn-outline-primary ms-2" onclick="runSync()">いま取り込む</button>
+        </li>
+        <li>
+          <strong><%= summary.actionable %> 商品</strong> が Yahoo に出せます
+          <a href="?filter=actionable" class="btn btn-sm btn-outline-success ms-2">出せる商品を見る</a>
+        </li>
+        <li>
+          <strong><%= summary.fixable %> 商品</strong> が Notion 修正待ち
+          <a href="?filter=fixable" class="btn btn-sm btn-outline-warning ms-2">修正リストを見る</a>
+          <% if (summary.fixable > 0 && Object.keys(fixableByCategory).length > 0) { %>
+            <div class="mt-2">
+              <% for (const cat of Object.keys(fixableByCategory).sort((a, b) => fixableByCategory[b] - fixableByCategory[a])) { %>
+                <a href="?filter=fixable" class="category-pill text-decoration-none">
+                  <%= cat %> <strong><%= fixableByCategory[cat] %></strong> 件
+                </a>
+              <% } %>
+            </div>
+          <% } %>
+        </li>
+        <li>
+          <strong><%= summary.done %> 商品</strong> 移行済み
+          <% if (summary.done > 0) { %>
+            <a href="?filter=done" class="btn btn-sm btn-outline-secondary ms-2">移行済みを見る</a>
+          <% } %>
+        </li>
+      </ol>
+      <% if (!publishEnabled) { %>
+        <div class="alert alert-warning mt-3 mb-0 py-2 small">
+          ⚠️ いま <strong>テストモード</strong> です。 「Yahoo に出す」 ボタンを押しても **本番に登録されません** (確認のみ)。
+          本登録するには管理者が Render の <code>RYS_PUBLISH_ENABLED=1</code> を設定する必要があります。
+        </div>
       <% } %>
-      <div class="mt-2 small">
-        実 publish: <strong><%= status.publish_enabled ? 'ON (RYS_PUBLISH_ENABLED=1)' : 'OFF (default、 dry-run only)' %></strong>
-      </div>
     </div>
 
-    <% if (notionStats) { %>
-    <div class="card mb-3">
-      <div class="card-header d-flex justify-content-between align-items-center">
-        <strong>Notion 商品マスター cache (notion_overrides)</strong>
-        <div class="btn-group btn-group-sm">
-          <button class="btn btn-outline-secondary" onclick="runSync(true)">🧪 dry-run</button>
-          <button class="btn btn-primary" onclick="runSync(false)">▶️ 本 sync 実行</button>
+    <!-- env が足りなければ警告 -->
+    <% if (!status.healthy) { %>
+      <div class="alert alert-danger">
+        <strong>⚠ 設定が足りません:</strong> <code><%= status.missing_required.join(', ') %></code>
+        <span class="small text-muted ms-2">（管理者が Render env を設定する必要があります）</span>
+      </div>
+    <% } %>
+
+    <!-- 👇 商品リスト (案 B カードベース) -->
+    <div class="summary-card">
+      <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+        <h5 class="mb-0">🛒 商品リスト</h5>
+        <form method="GET" class="d-flex gap-2 align-items-center">
+          <input type="hidden" name="filter" value="<%= filter %>">
+          <input class="form-control form-control-sm" type="search" name="q" placeholder="商品コード / タイトルで絞り込み"
+                 value="<%= search %>" style="width: 280px;">
+          <% if (search) { %>
+            <a href="?filter=<%= filter %>" class="btn btn-sm btn-outline-secondary">クリア</a>
+          <% } %>
+        </form>
+      </div>
+
+      <div class="mb-3">
+        <a href="?filter=all" class="btn btn-sm filter-chip <%= filter === 'all' ? 'btn-dark' : 'btn-outline-secondary' %>">全部 (<%= summary.total %>)</a>
+        <a href="?filter=actionable" class="btn btn-sm filter-chip <%= filter === 'actionable' ? 'btn-success' : 'btn-outline-success' %>">🟢 出せる (<%= summary.actionable %>)</a>
+        <a href="?filter=fixable" class="btn btn-sm filter-chip <%= filter === 'fixable' ? 'btn-warning' : 'btn-outline-warning' %>">🟡 修正必要 (<%= summary.fixable %>)</a>
+        <a href="?filter=done" class="btn btn-sm filter-chip <%= filter === 'done' ? 'btn-secondary' : 'btn-outline-secondary' %>">✅ 移行済み (<%= summary.done %>)</a>
+      </div>
+
+      <% if (products.length === 0) { %>
+        <div class="text-center text-muted py-5">
+          <% if (search) { %>
+            「<%= search %>」 に一致する商品はありません。
+          <% } else { %>
+            <% if (filter === 'actionable') { %>
+              出せる商品はまだありません。 Notion から取り込んでみてください。
+            <% } else if (filter === 'fixable') { %>
+              修正が必要な商品はありません。 🎉
+            <% } else if (filter === 'done') { %>
+              移行済みの商品はまだありません。
+            <% } else { %>
+              商品データがありません。 Notion から取り込んでみてください。
+            <% } %>
+          <% } %>
+        </div>
+      <% } else { %>
+        <% for (const p of products) { %>
+          <div class="product-card">
+            <div class="thumb-placeholder">
+              <%= (p.yahooTitle || p.itemCode).slice(0, 1).toUpperCase() %>
+            </div>
+            <div>
+              <p class="product-title">
+                <span class="status-dot">
+                  <% if (p.status === 'actionable') { %>🟢
+                  <% } else if (p.status === 'fixable') { %>🟡
+                  <% } else if (p.status === 'done') { %>✅
+                  <% } else { %>⚪<% } %>
+                </span>
+                <%= p.yahooTitle || '(タイトル未入力)' %>
+              </p>
+              <div class="product-meta">
+                <code><%= p.itemCode %></code>
+                <% if (p.yahooPrice) { %> ・ ¥<%= p.yahooPrice.toLocaleString() %><% } %>
+                <% if (p.delivery) { %> ・ <%= p.delivery %><% } %>
+              </div>
+
+              <% if (p.status === 'fixable' && p.primaryReason) { %>
+                <div class="product-reason">
+                  💡 <%= p.primaryReason %>
+                  <% if (p.reasons.length > 1) { %>
+                    <span class="text-muted small">（他 <%= p.reasons.length - 1 %> 件の修正項目）</span>
+                  <% } %>
+                </div>
+              <% } %>
+
+              <% if (p.status === 'done') { %>
+                <div class="product-done-meta">
+                  ✅ <% if (p.publishCompletedAt) { %>
+                    <code><%= p.publishCompletedAt %></code> に登録
+                  <% } else { %>登録済み<% } %>
+                </div>
+              <% } %>
+            </div>
+            <div class="actions">
+              <% if (p.status === 'actionable') { %>
+                <button class="btn btn-success btn-sm js-publish-btn"
+                        data-item-code="<%= p.itemCode %>"
+                        data-yahoo-title="<%= p.yahooTitle || '' %>"
+                        data-yahoo-price="<%= p.yahooPrice || 0 %>"
+                        data-delivery="<%= p.delivery || '' %>">
+                  <% if (publishEnabled) { %>▶️ Yahoo に出す<% } else { %>🧪 登録テスト<% } %>
+                </button>
+                <% if (p.notionPageId) { %>
+                  <a href="<%= notionPageUrl(p.notionPageId) %>" target="_blank" class="btn btn-outline-secondary btn-sm">📝 Notion で開く</a>
+                <% } %>
+              <% } else if (p.status === 'fixable') { %>
+                <% if (p.notionPageId) { %>
+                  <a href="<%= notionPageUrl(p.notionPageId) %>" target="_blank" class="btn btn-warning btn-sm">📝 Notion で修正</a>
+                <% } %>
+              <% } else if (p.status === 'done') { %>
+                <% if (p.notionPageId) { %>
+                  <a href="<%= notionPageUrl(p.notionPageId) %>" target="_blank" class="btn btn-outline-secondary btn-sm">📝 Notion で開く</a>
+                <% } %>
+              <% } %>
+            </div>
+          </div>
+        <% } %>
+      <% } %>
+    </div>
+
+    <!-- 👇 システム設定 (アコーディオン、 普段閉じてる) -->
+    <div class="summary-card">
+      <details>
+        <summary class="text-muted" style="cursor: pointer;">⚙ システム設定 (管理者向け)</summary>
+        <div class="mt-3">
+          <h6>環境変数</h6>
+          <table class="table table-sm">
+            <thead><tr><th>Key</th><th>用途</th><th>状態</th></tr></thead>
+            <tbody>
+              <% for (const r of status.required) { %>
+                <tr class="<%= r.set ? '' : 'table-danger' %>">
+                  <td><code><%= r.key %></code></td>
+                  <td class="small"><%= r.purpose %></td>
+                  <td><%= r.set ? '✅' : '❌' %></td>
+                </tr>
+              <% } %>
+              <% for (const o of status.optional) { %>
+                <tr>
+                  <td><code><%= o.key %></code></td>
+                  <td class="small"><%= o.purpose %></td>
+                  <td><%= o.set ? '✅' : '—' %></td>
+                </tr>
+              <% } %>
+            </tbody>
+          </table>
+
+          <% if (publishSummary) { %>
+            <h6 class="mt-4">Yahoo 登録履歴 (内部集計)</h6>
+            <p class="small">
+              total <%= publishSummary.total %> ・ 進行中 <%= publishSummary.in_progress %> ・
+              成功 <%= publishSummary.success %> ・ 失敗 <%= publishSummary.failed %> ・
+              テスト <%= publishSummary.not_implemented %>
+            </p>
+          <% } %>
+          <p class="small text-muted">
+            実 publish は <code>RYS_PUBLISH_ENABLED</code> = <%= publishEnabled ? '1 (ON)' : '0 (OFF)' %>。
+            これは Render の環境変数で管理者が切り替えます。
+          </p>
+        </div>
+      </details>
+    </div>
+
+    <div id="actionResult"></div>
+  </div>
+
+  <!-- Notion sync 結果モーダル -->
+  <div id="syncModal" class="modal" tabindex="-1" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,.5); z-index:1050;">
+    <div class="card" style="max-width: 580px; margin: 80px auto;">
+      <div class="card-body">
+        <h5 id="syncTitle">Notion 取り込み中...</h5>
+        <div id="syncBody" class="mt-3"></div>
+        <div class="text-end mt-3">
+          <button class="btn btn-secondary btn-sm" onclick="closeSyncModal()">閉じる</button>
         </div>
       </div>
+    </div>
+  </div>
+
+  <!-- Publish 確認モーダル -->
+  <div id="pubModal" class="modal" tabindex="-1" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,.5); z-index:1050;">
+    <div class="card" style="max-width: 580px; margin: 80px auto;">
+      <div class="card-header bg-warning">
+        <strong id="pubModalTitle">Yahoo に登録しますか?</strong>
+      </div>
       <div class="card-body">
-        <div class="row">
-          <div class="col-md-3">
-            <div class="text-muted small">取込済み</div>
-            <div class="h3 mb-0"><%= notionStats.total || 0 %> <small class="text-muted">件</small></div>
-          </div>
-          <div class="col-md-3">
-            <div class="text-muted small">Yahoo!タイトル入力済</div>
-            <div class="h4 mb-0"><%= notionStats.with_title || 0 %></div>
-          </div>
-          <div class="col-md-3">
-            <div class="text-muted small">売価入力済</div>
-            <div class="h4 mb-0"><%= notionStats.with_price || 0 %></div>
-          </div>
-          <div class="col-md-3">
-            <div class="text-muted small">配送方法選択済</div>
-            <div class="h4 mb-0"><%= notionStats.with_delivery || 0 %></div>
-          </div>
+        <div id="pubModalSafety" class="alert alert-warning small mb-3">
+          <% if (!publishEnabled) { %>
+            これは <strong>テスト実行</strong> です。 Yahoo には登録されません。
+          <% } else { %>
+            これは <strong>本番</strong> です。 Yahoo!ショッピングに商品が登録され、 取り消せません。
+          <% } %>
         </div>
-        <% if (syncState) { %>
-        <hr>
-        <div class="small text-muted">
-          最終 sync (成功): <code><%= syncState.last_successful_sync_at || '—' %></code><br>
-          最終 sync (試行): <code><%= syncState.last_attempted_sync_at || '—' %></code>
-          (errors: <%= syncState.last_error_count || 0 %>)<br>
-          last_sync_run_id: <code><%= syncState.last_sync_run_id || '—' %></code>
-        </div>
-        <% } else { %>
-        <hr>
-        <div class="small text-muted">まだ sync を実行していません。 「dry-run」 で取込件数の試算 → 「本 sync 実行」 で DB へ書き込みします。</div>
+        <p class="mb-2">登録対象:</p>
+        <ul class="mb-3">
+          <li>商品コード: <code id="pubItemCode"></code></li>
+          <li>タイトル: <span id="pubTitle"></span></li>
+          <li>売価: ¥<span id="pubPrice"></span></li>
+          <li>配送方法: <span id="pubDelivery"></span></li>
+        </ul>
+        <% if (publishEnabled) { %>
+          <div class="form-check mb-3">
+            <input class="form-check-input" type="checkbox" id="pubConfirmCheckbox">
+            <label class="form-check-label" for="pubConfirmCheckbox">
+              <strong>取り消せないことを理解しました</strong>
+            </label>
+          </div>
         <% } %>
       </div>
-    </div>
-    <% } %>
-
-    <% if (readiness) { %>
-    <div class="card mb-3">
-      <div class="card-header"><strong>readiness 集計 (jobs テーブル)</strong></div>
-      <div class="card-body row">
-        <div class="col"><div class="text-muted small">total</div><div class="h4"><%= readiness.total %></div></div>
-        <div class="col"><div class="text-muted small">pending</div><div class="h4"><%= readiness.pending %></div></div>
-        <div class="col"><div class="text-success small">ok</div><div class="h4 text-success"><%= readiness.ok %></div></div>
-        <div class="col"><div class="text-danger small">blocked</div><div class="h4 text-danger"><%= readiness.blocked %></div></div>
+      <div class="card-footer d-flex justify-content-end gap-2">
+        <button class="btn btn-secondary" onclick="closePublishConfirm()">キャンセル</button>
+        <button class="btn btn-warning" id="pubConfirmBtn" onclick="executePublish()">
+          <% if (publishEnabled) { %>本番登録する<% } else { %>テスト実行する<% } %>
+        </button>
       </div>
     </div>
-    <% } %>
-
-    <% if (typeof publish !== 'undefined' && publish) { %>
-    <div class="card mb-3">
-      <div class="card-header">
-        <strong>publish 状況 (publish_idempotency)</strong>
-        <span class="badge <%= publishEnabled ? 'bg-success' : 'bg-secondary' %> ms-2">
-          <%= publishEnabled ? 'RYS_PUBLISH_ENABLED=1 (ON)' : 'RYS_PUBLISH_ENABLED=0 (OFF)' %>
-        </span>
-      </div>
-      <div class="card-body row">
-        <div class="col"><div class="text-muted small">total</div><div class="h4"><%= publish.total %></div></div>
-        <div class="col"><div class="text-warning small">in_progress</div><div class="h4 text-warning"><%= publish.in_progress %></div></div>
-        <div class="col"><div class="text-success small">success</div><div class="h4 text-success"><%= publish.success %></div></div>
-        <div class="col"><div class="text-danger small">failed</div><div class="h4 text-danger"><%= publish.failed %></div></div>
-        <div class="col"><div class="text-info small">not_impl</div><div class="h4 text-info"><%= publish.not_implemented %></div></div>
-      </div>
-      <% if (!publishEnabled) { %>
-      <div class="card-footer small text-muted">
-        実 publish は kill-switch で停止中です。 Render env に <code>RYS_PUBLISH_ENABLED=1</code> を set すると有効化されます (E-5b で vps-proxy 拡張完了後に推奨)。
-      </div>
-      <% } %>
-    </div>
-    <% } %>
-
-    <div class="card mb-3">
-      <div class="card-header"><strong>必須 env (REQUIRED)</strong></div>
-      <table class="table table-sm mb-0">
-        <thead><tr><th>Key</th><th>用途</th><th>Status</th><th>値 / 長さ</th></tr></thead>
-        <tbody>
-          <% for (const r of status.required) { %>
-            <tr class="<%= r.set ? '' : 'table-danger' %>">
-              <td><code><%= r.key %></code></td>
-              <td><%= r.purpose %></td>
-              <td><%= r.set ? '✅ set' : '❌ unset' %></td>
-              <td>
-                <% if (!r.set) { %>—<% } else if (r.value !== undefined) { %><code><%= r.value %></code>
-                <% } else { %><small class="text-muted">length=<%= r.length %></small><% } %>
-              </td>
-            </tr>
-          <% } %>
-        </tbody>
-      </table>
-    </div>
-
-    <div class="card">
-      <div class="card-header"><strong>進捗</strong></div>
-      <div class="card-body">
-        <ol class="mb-0">
-          <li>E-1 ✅ skeleton + env 確認画面</li>
-          <li>E-2 ✅ Notion 商品マスター sync (289 件取込)</li>
-          <li>E-3 ✅ delivery / variation / readiness resolver 移植</li>
-          <li>E-4 ✅ field-mapper + dry-run pipeline</li>
-          <li><strong>E-5a (現在)</strong>: publish インフラ (idempotency + dual check) ← イマココ</li>
-          <li>E-5b: vps-proxy 拡張 + 実 publish (RYS_PUBLISH_ENABLED=1 で初稼働)</li>
-        </ol>
-      </div>
-    </div>
-
-    <div id="syncResult" class="mt-3"></div>
   </div>
 
 <script>
-async function runSync(dryRun) {
-  const btn = event.target;
-  btn.disabled = true;
-  btn.innerText = '実行中...';
-  const out = document.getElementById('syncResult');
-  out.innerHTML = '<div class="alert alert-info">Notion sync 実行中... (271 件で 30 秒前後)</div>';
+// ───── Notion sync ─────
+function openSyncModal() { document.getElementById('syncModal').style.display = 'block'; }
+function closeSyncModal() { document.getElementById('syncModal').style.display = 'none'; location.reload(); }
+
+async function runSync() {
+  openSyncModal();
+  document.getElementById('syncTitle').textContent = 'Notion 取り込み中...';
+  const body = document.getElementById('syncBody');
+  body.innerHTML = '<div class="text-muted small">30 秒前後かかります。</div>';
   try {
     const res = await fetch('/apps/rakuten-yahoo-sync/api/notion/sync', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ dryRun, mode: 'full' }),
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ dryRun: false, mode: 'full' }),
     });
     const data = await res.json();
-    if (!res.ok) {
-      out.innerHTML = '<div class="alert alert-danger"><strong>fail</strong><pre>' + JSON.stringify(data, null, 2) + '</pre></div>';
-    } else {
+    document.getElementById('syncTitle').textContent = res.ok ? '取り込み完了' : '取り込みに失敗しました';
+    const wrap = document.createElement('div');
+    if (res.ok) {
       const errors = (data.errors || []).length;
-      const klass = errors > 0 ? 'alert-warning' : 'alert-success';
-      out.innerHTML = '<div class="alert ' + klass + '">'
-        + '<strong>' + (dryRun ? 'dry-run 完了' : 'sync 完了') + '</strong>'
-        + '<div class="mt-2 small">runId: <code>' + data.runId + '</code></div>'
-        + '<table class="table table-sm mt-2"><tbody>'
-        + '<tr><th>取込ページ</th><td>' + data.totalPages + '</td></tr>'
-        + '<tr><th>insert</th><td>' + (data.inserted || 0) + '</td></tr>'
-        + '<tr><th>update</th><td>' + (data.updated || 0) + '</td></tr>'
-        + '<tr><th>skip</th><td>' + (data.skipped || 0) + '</td></tr>'
-        + '<tr><th>delete</th><td>' + (data.deleted || 0) + '</td></tr>'
-        + '<tr><th>errors</th><td>' + errors + '</td></tr>'
-        + '<tr><th>duration</th><td>' + data.durationMs + ' ms</td></tr>'
-        + '</tbody></table>'
-        + (errors > 0 ? '<details><summary>errors 詳細</summary><pre>' + JSON.stringify(data.errors, null, 2) + '</pre></details>' : '')
+      wrap.innerHTML = '<div class="alert ' + (errors > 0 ? 'alert-warning' : 'alert-success') + '">'
+        + '<div>新規取込: <strong>' + (data.inserted || 0) + '</strong></div>'
+        + '<div>更新: <strong>' + (data.updated || 0) + '</strong></div>'
+        + '<div>変更なし: <strong>' + (data.skipped || 0) + '</strong></div>'
+        + (data.deleted > 0 ? '<div>削除: <strong>' + data.deleted + '</strong></div>' : '')
+        + (errors > 0 ? '<div class="text-danger">エラー: <strong>' + errors + '</strong></div>' : '')
         + '</div>';
-      if (!dryRun) setTimeout(() => location.reload(), 2000);
+    } else {
+      const msg = document.createElement('pre');
+      msg.style.fontSize = '.8rem';
+      msg.textContent = JSON.stringify(data, null, 2);
+      wrap.appendChild(msg);
     }
+    body.replaceChildren(wrap);
   } catch (e) {
-    out.innerHTML = '<div class="alert alert-danger">network error: ' + e.message + '</div>';
-  } finally {
-    btn.disabled = false;
-    btn.innerText = dryRun ? '🧪 dry-run' : '▶️ 本 sync 実行';
+    const div = document.createElement('div');
+    div.className = 'alert alert-danger';
+    div.textContent = 'ネットワークエラー: ' + e.message;
+    body.replaceChildren(div);
+  }
+}
+
+// ───── Publish ─────
+let _pubItemCode = null;
+function openPublishConfirm(itemCode, title, price, delivery) {
+  _pubItemCode = itemCode;
+  document.getElementById('pubItemCode').textContent = itemCode;
+  document.getElementById('pubTitle').textContent = title || '(未入力)';
+  document.getElementById('pubPrice').textContent = price ? price.toLocaleString() : '0';
+  document.getElementById('pubDelivery').textContent = delivery || '(未設定)';
+  const cb = document.getElementById('pubConfirmCheckbox');
+  if (cb) cb.checked = false;
+  document.getElementById('pubModal').style.display = 'block';
+}
+
+// Codex E-6 R1 High-1: 商品データを onclick に injection しない。
+//   data-* attribute (EJS escaped output 済) を addEventListener で読む。
+document.addEventListener('DOMContentLoaded', () => {
+  for (const btn of document.querySelectorAll('.js-publish-btn')) {
+    btn.addEventListener('click', (ev) => {
+      const ds = ev.currentTarget.dataset;
+      const price = Number(ds.yahooPrice) || 0;
+      openPublishConfirm(ds.itemCode, ds.yahooTitle, price, ds.delivery);
+    });
+  }
+});
+function closePublishConfirm() { document.getElementById('pubModal').style.display = 'none'; }
+
+async function executePublish() {
+  const cb = document.getElementById('pubConfirmCheckbox');
+  if (cb && !cb.checked) {
+    alert('「取り消せないことを理解しました」 にチェックを入れてください。');
+    return;
+  }
+  closePublishConfirm();
+  const out = document.getElementById('actionResult');
+  out.innerHTML = '<div class="alert alert-info">登録中... (画像変換 + Yahoo 登録で 1-2 分かかります)</div>';
+  try {
+    const res = await fetch('/apps/rakuten-yahoo-sync/api/publish/execute/' + encodeURIComponent(_pubItemCode), {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({}),
+    });
+    const data = await res.json();
+    const klass = data.status === 'success' ? 'alert-success'
+      : data.status === 'dedupe' ? 'alert-secondary'
+      : data.status === 'readiness_blocked' ? 'alert-warning'
+      : data.status === 'not_implemented' ? 'alert-info'
+      : 'alert-danger';
+    const wrap = document.createElement('div');
+    wrap.className = 'alert ' + klass;
+    const head = document.createElement('strong');
+    head.textContent = labelForStatus(data.status);
+    wrap.appendChild(head);
+    const pre = document.createElement('pre');
+    pre.style.fontSize = '.8rem'; pre.style.margin = '.5rem 0 0';
+    pre.textContent = JSON.stringify(data, null, 2);
+    wrap.appendChild(pre);
+    out.replaceChildren(wrap);
+    if (data.status === 'success') setTimeout(() => location.reload(), 2500);
+  } catch (e) {
+    const wrap = document.createElement('div');
+    wrap.className = 'alert alert-danger';
+    wrap.textContent = 'ネットワークエラー: ' + e.message;
+    out.replaceChildren(wrap);
+  }
+}
+
+function labelForStatus(s) {
+  switch (s) {
+    case 'success': return '✅ Yahoo に登録できました';
+    case 'dedupe': return '⚠ すでに登録済みです (重複防止)';
+    case 'readiness_blocked': return '🟡 まだ Notion 修正が必要です';
+    case 'not_implemented': return '🧪 テスト実行完了 (本登録は OFF です)';
+    case 'flag_off': return '🔒 本登録は OFF です';
+    case 'in_progress_conflict': return '⚠ 別の処理が進行中です';
+    case 'publish_failed': return '❌ Yahoo 登録に失敗しました';
+    case 'lease_lost': return '⚠ 処理が競合しました (確認が必要)';
+    default: return '⚠ 結果: ' + s;
   }
 }
 </script>
