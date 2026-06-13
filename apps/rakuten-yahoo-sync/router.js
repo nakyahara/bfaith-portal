@@ -114,12 +114,23 @@ function getSyncState(db) {
  *     - unknown    : それ以外 (基本ない、 保険)
  */
 function listProductsForUI(db, { filter = 'all', search = '' } = {}) {
-  //   Codex E-6 R1 High-2: jobs JOIN は 1 商品 1 行を保証 (item_code は PK だが防御的に LIMIT)
-  //   Codex E-6 R1 Medium-1: publish_idempotency は「一度でも success」 なら done
-  //     最新 status を見るのではなく、 success 履歴を優先する SELECT に変更
-  const rows = db.prepare(`
+  // Codex E-7 R1/R2 確定:
+  //   - 起点 = migration_candidates (楽天有 ∩ Yahoo無)
+  //   - JOIN: notion_overrides は **rakuten_manage_number** で結合 (R2 Critical D-0)
+  //   - migration_excluded は restored_at IS NULL の active のみ
+  //   - publish_idempotency は 「一度でも success」 を success 優先で集約 (R2 Critical D-1)
+  //   - yahoo_registered_items に居れば done 扱い (Yahoo 実存ベース)
+  //   - タブ precedence: excluded > done > actionable > fixable > stale (R2 Critical D-2)
+  //   - 「Notion override あるが候補にない」 は別ビュー orphan_overrides (R1 ⑥確定)
+  const candidateRows = db.prepare(`
     SELECT
-      no.rakuten_manage_number  AS item_code,
+      c.item_code,
+      c.rakuten_manage_number,
+      c.status                          AS candidate_status,
+      c.first_detected_at,
+      c.last_detected_at,
+      c.missing_rakuten_count,
+      c.stale_at,
       no.notion_page_id,
       no.yahoo_title,
       no.yahoo_price,
@@ -131,15 +142,23 @@ function listProductsForUI(db, { filter = 'all', search = '' } = {}) {
       j.readiness_status,
       j.readiness_blocked_reasons,
       j.last_readiness_at,
+      e.id              AS exclusion_id,
+      e.exclude_kind    AS exclusion_kind,
+      e.reason          AS exclusion_reason,
+      e.excluded_at     AS exclusion_at,
       pi.status         AS publish_status,
       pi.completed_at   AS publish_completed_at,
-      pi.error_message  AS publish_error
-    FROM notion_overrides no
-    LEFT JOIN jobs j ON j.item_code = no.rakuten_manage_number
+      pi.error_message  AS publish_error,
+      r.yahoo_item_code AS yahoo_observed_code
+    FROM migration_candidates c
+    LEFT JOIN notion_overrides no
+      ON no.rakuten_manage_number = COALESCE(c.rakuten_manage_number, c.item_code)
+    LEFT JOIN jobs j
+      ON j.item_code = c.item_code     -- Codex R1 High: jobs.item_code は楽天 itemNumber 前提 (manage_number ではない)、 候補の item_code と一致させる
+    LEFT JOIN migration_excluded e
+      ON e.item_code = c.item_code AND e.restored_at IS NULL
     LEFT JOIN (
-      -- 一度でも success があれば success を優先、 なければ最新 status (Codex R1 Medium-1)
-      -- Codex R2 Medium-1: status が success のとき completed_at / error_message も success 由来に揃える。
-      --   そうしないと UI で 「過去 success → その後 failed」 の商品が done 扱いなのに 「失敗時刻」 を表示する。
+      -- 一度でも success があれば success を優先 (E-6-1 と同じ集約 SQL を流用)
       SELECT item_code,
              COALESCE(
                MAX(CASE WHEN status='success' THEN status END),
@@ -161,32 +180,37 @@ function listProductsForUI(db, { filter = 'all', search = '' } = {}) {
              END AS error_message
       FROM publish_idempotency p1
       GROUP BY item_code
-    ) pi ON pi.item_code = no.rakuten_manage_number
-    ORDER BY no.rakuten_manage_number
+    ) pi ON pi.item_code = c.item_code
+    LEFT JOIN yahoo_registered_items r
+      ON r.item_code = c.item_code
+    ORDER BY c.item_code
   `).all();
 
-  // status 計算 + reason 翻訳
-  const products = rows.map((r) => {
+  // status 計算 + reason 翻訳 (Codex R2 D-2 precedence: excluded > done > actionable > fixable > stale)
+  const products = candidateRows.map((r) => {
+    const isExcluded = r.exclusion_id !== null && r.exclusion_id !== undefined;
+    const isDone = (r.yahoo_observed_code !== null && r.yahoo_observed_code !== undefined)
+                || r.publish_status === 'success';
+
     let status, reasons = [], notionFields = [];
-    if (r.publish_status === 'success') {
+    if (isExcluded) {
+      status = 'excluded';
+    } else if (isDone) {
       status = 'done';
+    } else if (r.candidate_status === 'stale') {
+      status = 'stale';
     } else {
-      // 簡易 readiness 判定 (Notion 必須 4 項目)
+      // candidate / resolved 状態だがまだ done でない → Notion 必須 4 項目で actionable/fixable 判定
       const missing = [];
       if (!r.yahoo_title)            missing.push('notion_title_missing');
       if (!r.yahoo_price)            missing.push('price_invalid_or_zero');
       if (!r.notion_delivery_label)  missing.push('delivery_mapping_unresolved');
       if (!r.notion_tax_rate)        missing.push('notion_tax_rate_missing');
-      // 既存の readiness 評価結果も併合
       let existingReasons = [];
       if (r.readiness_blocked_reasons) {
         try { existingReasons = JSON.parse(r.readiness_blocked_reasons); } catch (_) {}
       }
       const allReasons = [...missing, ...existingReasons.filter((x) => !missing.includes(x))];
-      // Codex E-6 R1 Medium-3: readiness 鮮度判定。
-      //   last_readiness_at が synced_at 以降なら厳密判定済 → blocked reasons を信頼。
-      //   それより古い or 未評価なら 「Notion 簡易判定だけで actionable」 と判断。
-      const readinessFresh = r.last_readiness_at && r.synced_at && r.last_readiness_at >= r.synced_at;
       if (allReasons.length === 0) {
         status = 'actionable';
       } else {
@@ -195,23 +219,28 @@ function listProductsForUI(db, { filter = 'all', search = '' } = {}) {
         reasons = summarized.items;
         notionFields = summarized.notionFields;
       }
-      // フラグだけ立てる (UI 側で「再評価推奨」 等表示できるように)
-      // 現状 Phase 1 では使わない、 Phase 2 detail drawer で表示予定
-      void readinessFresh;
     }
+
     return {
-      itemCode:     r.item_code,
-      notionPageId: r.notion_page_id,
-      yahooTitle:   r.yahoo_title,
-      yahooPrice:   r.yahoo_price,
-      sagawaPrice:  r.yahoo_price_sagawa,
-      delivery:     r.notion_delivery_label,
-      taxRate:      r.notion_tax_rate,
-      notionStatus: r.notion_status,
-      syncedAt:     r.synced_at,
-      publishStatus: r.publish_status,
+      itemCode:           r.item_code,
+      rakutenManageNumber: r.rakuten_manage_number,
+      candidateStatus:    r.candidate_status,
+      notionPageId:       r.notion_page_id,
+      yahooTitle:         r.yahoo_title,
+      yahooPrice:         r.yahoo_price,
+      sagawaPrice:        r.yahoo_price_sagawa,
+      delivery:           r.notion_delivery_label,
+      taxRate:            r.notion_tax_rate,
+      notionStatus:       r.notion_status,
+      syncedAt:           r.synced_at,
+      exclusionKind:      r.exclusion_kind,
+      exclusionReason:    r.exclusion_reason,
+      exclusionAt:        r.exclusion_at,
+      publishStatus:      r.publish_status,
       publishCompletedAt: r.publish_completed_at,
-      publishError: r.publish_error,
+      publishError:       r.publish_error,
+      yahooObservedCode:  r.yahoo_observed_code,
+      isExcluded, isDone,
       status,
       reasons,
       notionFields,
@@ -219,11 +248,39 @@ function listProductsForUI(db, { filter = 'all', search = '' } = {}) {
     };
   });
 
+  // 救済タブ用: notion_overrides にあるが migration_candidates に居ない商品 (R1 ⑥確定)
+  //   候補生成と起点が違う = 楽天 RMS で消えた / 楽天に最初から居ない / Notion 先行登録
+  const orphanRows = db.prepare(`
+    SELECT
+      no.rakuten_manage_number AS item_code,
+      no.notion_page_id,
+      no.yahoo_title,
+      no.notion_status,
+      no.synced_at
+    FROM notion_overrides no
+    LEFT JOIN migration_candidates c
+      ON c.rakuten_manage_number = no.rakuten_manage_number
+      OR c.item_code = no.rakuten_manage_number
+    WHERE c.item_code IS NULL
+    ORDER BY no.rakuten_manage_number
+  `).all();
+  const orphanProducts = orphanRows.map((r) => ({
+    itemCode:     r.item_code,
+    notionPageId: r.notion_page_id,
+    yahooTitle:   r.yahoo_title,
+    notionStatus: r.notion_status,
+    syncedAt:     r.synced_at,
+    status:       'orphan',
+  }));
+
   // filter 適用
   let filtered = products;
   if (filter === 'actionable') filtered = products.filter((p) => p.status === 'actionable');
   else if (filter === 'fixable') filtered = products.filter((p) => p.status === 'fixable');
-  else if (filter === 'done') filtered = products.filter((p) => p.status === 'done');
+  else if (filter === 'done')   filtered = products.filter((p) => p.status === 'done');
+  else if (filter === 'excluded') filtered = products.filter((p) => p.status === 'excluded');
+  else if (filter === 'stale')  filtered = products.filter((p) => p.status === 'stale');
+  else if (filter === 'orphan') filtered = orphanProducts;
 
   // 検索 (商品コード / タイトル 部分一致、 case-insensitive)
   const term = String(search || '').trim().toLowerCase();
@@ -234,12 +291,15 @@ function listProductsForUI(db, { filter = 'all', search = '' } = {}) {
     );
   }
 
-  // 集計
+  // 集計 (excluded + stale + orphan も含めて全タブを表示)
   const summary = {
-    total: products.length,
+    total:      products.length,
     actionable: products.filter((p) => p.status === 'actionable').length,
-    fixable: products.filter((p) => p.status === 'fixable').length,
-    done: products.filter((p) => p.status === 'done').length,
+    fixable:    products.filter((p) => p.status === 'fixable').length,
+    done:       products.filter((p) => p.status === 'done').length,
+    excluded:   products.filter((p) => p.status === 'excluded').length,
+    stale:      products.filter((p) => p.status === 'stale').length,
+    orphan:     orphanProducts.length,
   };
 
   // 不備種類別 (fixable のみ): 「売価未入力 45 件」 等
@@ -286,10 +346,10 @@ router.get('/', (req, res) => {
   let syncState = null;
   let publishSummary = null;
   let products = [];
-  let summary = { total: 0, actionable: 0, fixable: 0, done: 0 };
+  let summary = { total: 0, actionable: 0, fixable: 0, done: 0, excluded: 0, stale: 0, orphan: 0 };
   let fixableByCategory = {};
   let exclusionCount = { temporary: 0, permanent: 0, total: 0 };
-  const filter = ['all', 'actionable', 'fixable', 'done'].includes(req.query.filter)
+  const filter = ['all', 'actionable', 'fixable', 'done', 'excluded', 'stale', 'orphan'].includes(req.query.filter)
     ? req.query.filter
     : 'actionable'; // default は「すぐ移行できる」 = やるべきこと
   const search = String(req.query.q || '');
@@ -689,5 +749,8 @@ router.post('/api/exclusions/change-kind', (req, res) => {
     return res.status(500).json({ status: 'fail', error: e.message });
   }
 });
+
+// Codex E-7-d-1 R1 Medium: テストから直接呼べるよう named export
+export { listProductsForUI, notionPageUrl };
 
 export default router;
