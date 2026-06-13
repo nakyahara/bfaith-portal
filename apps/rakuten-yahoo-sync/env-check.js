@@ -29,6 +29,8 @@ const OPTIONAL_ENVS = Object.freeze([
   // RYS 制御
   { key: 'RYS_PUBLISH_ENABLED',     purpose: '実 publish ON/OFF kill-switch (default=0、 E-5 で 1 に flip)',  sensitive: false },
   { key: 'AUC_PREF_CODE',           purpose: 'ヤフオク発送地 prefecture code (default=27 大阪)',              sensitive: false },
+  // E-7-a Yahoo baseline
+  { key: 'YAHOO_DIFF_QUERIES',      purpose: 'Yahoo baseline 検証用 query 上書き (本番未設定、 設定中は baseline 確立も write も拒否)', sensitive: false },
 ]);
 
 function summarize(key, sensitive) {
