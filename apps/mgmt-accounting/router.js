@@ -425,12 +425,20 @@ function pickNum(obj, keys) {
   for (const k of keys) if (obj && obj[k] != null) return Number(obj[k]) || 0;
   return 0;
 }
-// Amazon は手数料控除後ネットの '合計' ではなく gross の '商品売上' を使う
-// （後段で手数料/FBA運賃を再控除するため、ネットを使うと二重控除になる）。
+// 国内非Amazonモール: mart の 売上/PF手数料/広告費 が「税込」で入る。mgmt は税抜基準なので /1.1 する。
+// amazon_jp は税が別カラムで税抜分離済み、amazon_usa は米国(消費税なし)なので対象外(中原さん 2026-06-14)。
+const TAX_INCLUDED_MALLS = new Set(['rakuten', 'yahoo', 'aupay', 'qoo10', 'linegift', 'mercari', 'dshop']);
+
+// 売上の解決:
+//  - amazon_jp: 商品売上 + 配送料 + ギフト包装手数料（顧客請求の売上性項目、すべて税抜=税は別カラム。中原さん 2026-06-14 確定）。
+//    ネットの '合計' を使わないのは、後段で手数料/FBA運賃を再控除するため二重控除になるから。
+//  - 非Amazon国内モール: 税込売上を /1.1 で税抜化。amazon_usa 等は税抜のまま。
 function segmentSales(mallId, segData) {
-  return mallId === 'amazon_jp'
-    ? pickNum(segData, ['商品売上'])
-    : pickNum(segData, ['売上合計', '売上', '合計', '商品売上']);
+  if (mallId === 'amazon_jp') {
+    return pickNum(segData, ['商品売上']) + pickNum(segData, ['配送料']) + pickNum(segData, ['ギフト包装手数料']);
+  }
+  const raw = pickNum(segData, ['売上合計', '売上', '合計', '商品売上']);
+  return TAX_INCLUDED_MALLS.has(mallId) ? raw / 1.1 : raw;
 }
 function segmentCost(segData) {
   return pickNum(segData, ['原価合計', '原価']);
@@ -562,20 +570,25 @@ function syncSegmentSalesForMonth(db, year_month, now) {
                        + (segData['Amazonポイント費用'] || 0);
           pfFee = Math.round(Math.abs(signed) / 1.1);
         } else if (segData['手数料'] !== undefined || segData['FBA手数料'] !== undefined) {
-          pfFee += segData['手数料'] || 0;
-          pfFee += segData['FBA手数料'] || 0;
+          // 手数料/FBA手数料は費用(正値)として変動費に積む。返金等で符号が負で入る月でも
+          // 粗利を押し上げないよう abs で正規化(Amazon JP/USA と同方針、Codex High 対応)。
+          pfFee += Math.abs(segData['手数料'] || 0);
+          pfFee += Math.abs(segData['FBA手数料'] || 0);
           if (segData['トランザクション他'] !== undefined) pfFee += Math.abs(segData['トランザクション他'] || 0);
         } else {
           // 全体PF手数料を売上按分
           const segRatio = segSalesTotal > 0 ? sales / segSalesTotal : 0;
-          pfFee = Math.round(pfFeeTotal * segRatio);
+          pfFee = pfFeeTotal * segRatio;
         }
 
         // 広告費: 全体広告費をセグメント売上比で按分
         const segRatio = segSalesTotal > 0 ? sales / segSalesTotal : 0;
-        const adCost = Math.round(adCostTotal * segRatio);
+        let adCost = adCostTotal * segRatio;
 
-        segRows.push({ seg, sales: Math.round(sales), cost: Math.round(cost), pfFee: Math.round(pfFee), adCost });
+        // 非Amazon国内モールは PF手数料・広告費も税込 → 税抜化（Amazon JP は手数料を上で /1.1 済み）。
+        if (TAX_INCLUDED_MALLS.has(mt.mall_id)) { pfFee = pfFee / 1.1; adCost = adCost / 1.1; }
+
+        segRows.push({ seg, sales: Math.round(sales), cost: Math.round(cost), pfFee: Math.round(pfFee), adCost: Math.round(adCost) });
       }
 
       // by_segment 形式で 1 行も作れないモール(米国Amazon等)は何も挿入しない
