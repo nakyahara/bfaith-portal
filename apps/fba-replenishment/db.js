@@ -979,7 +979,7 @@ export function getSkuMappingsFromSheet() {
 //   - asin / fnsku = fba_sku_attrs 由来 (mirror には無い)
 //   - non_fba_sales_* = 当面 sku_mapping から持ち越し (正確な再計算は PR3)
 //   - per_unit_volume / storage_type = null (元々 snap 由来、mapping 側未使用)
-function buildMirrorRow(amazonSku, compRows, attr, nonFba) {
+function buildMirrorRow(amazonSku, compRows, attr, nonFba, registeredAt) {
   const components = compRows.map(c => ({ ne_code: c.ne_code, qty: c.quantity }));
   const isSet = components.length > 1 || (components[0] && (Number(components[0].qty) || 1) > 1);
   return {
@@ -997,6 +997,9 @@ function buildMirrorRow(amazonSku, compRows, attr, nonFba) {
     non_fba_sales_7d: nonFba?.non_fba_sales_7d || 0,
     non_fba_sales_30d: nonFba?.non_fba_sales_30d || 0,
     updated_at: null,
+    // SKUマスタ登録日 (m_sku_master.created_at → mirror_sku_master.source_created_at)。
+    // 新規商品タブで「いつ登録した商品か」を表示するため。ISO 8601 UTC 文字列 or null。
+    registered_at: registeredAt || null,
   };
 }
 
@@ -1043,13 +1046,20 @@ export function getSkuMappingsFromMirror() {
   for (const a of queryAll('SELECT amazon_sku, asin, fnsku FROM fba_sku_attrs')) attrs.set(normSku(a.amazon_sku), a);
   const nonFba = new Map();
   for (const s of queryAll('SELECT amazon_sku, non_fba_sales_7d, non_fba_sales_30d FROM sku_mapping')) nonFba.set(normSku(s.amazon_sku), s);
+  // 登録日 (source_created_at) を mirror_sku_master から norm キーで join (1 SKU 1 行)。
+  const regAt = new Map();
+  try {
+    for (const r of mdb.prepare('SELECT seller_sku, source_created_at FROM mirror_sku_master').all()) {
+      regAt.set(normSku(r.seller_sku), r.source_created_at || null);
+    }
+  } catch (e) { /* mirror_sku_master 未作成 (旧 mirror) は登録日なしで続行 */ }
   const caseMap = buildAmazonSkuCaseMap();
 
   const result = [];
   for (const [sku, compRows] of bySku) {
     const k = normSku(sku);
     const origSku = caseMap.get(k) || sku; // 元ケース復元、無ければ小文字 fallback
-    result.push(buildMirrorRow(origSku, compRows, attrs.get(k), nonFba.get(k)));
+    result.push(buildMirrorRow(origSku, compRows, attrs.get(k), nonFba.get(k), regAt.get(k)));
   }
   result.sort((x, y) => String(x.amazon_sku).localeCompare(String(y.amazon_sku)));
   return result;
@@ -1068,8 +1078,13 @@ function getSkuMappingFromMirror(amazonSku) {
   // 補助 join も norm キーで (single も case 非依存に)
   const attrRows = queryAll('SELECT asin, fnsku FROM fba_sku_attrs WHERE LOWER(TRIM(amazon_sku)) = ?', [k]);
   const nfRows = queryAll('SELECT non_fba_sales_7d, non_fba_sales_30d FROM sku_mapping WHERE LOWER(TRIM(amazon_sku)) = ?', [k]);
+  let registeredAt = null;
+  try {
+    const mr = mdb.prepare('SELECT source_created_at FROM mirror_sku_master WHERE LOWER(TRIM(seller_sku)) = ?').get(k);
+    registeredAt = mr?.source_created_at || null;
+  } catch (e) { /* mirror_sku_master 未作成は無視 */ }
   // 呼び出し側が渡したケースをそのまま返す (元ケース保持)
-  return buildMirrorRow(amazonSku, compRows, attrRows[0], nfRows[0]);
+  return buildMirrorRow(amazonSku, compRows, attrRows[0], nfRows[0], registeredAt);
 }
 
 // set_components (文字列 or 配列) を比較用の正規化文字列に (ne_code は case 無視、qty 含む)
@@ -1446,6 +1461,48 @@ export function getAllEverSeenSkus() {
 
 export function isEverSeenSku(amazonSku) {
   return !!queryOne('SELECT 1 FROM ever_seen_skus WHERE amazon_sku = ?', [amazonSku]);
+}
+
+// ===== ever_stocked: 過去に一度でも「実FBA在庫 / 入荷」があったSKU =====
+// 新規商品タブ / FBA欠品タブの正しい振り分け軸。
+//   ever_seen_skus は RESTOCK/PLANNING レポートに「載った」だけで付くため、まだ一度も
+//   FBAへ納品していない新規出品 (出荷可能在庫0・入荷0) まで「観測済み」になってしまい、
+//   本来「新規商品」であるべきSKUが新規商品タブから漏れていた (2026-06-13 修正)。
+//   そこで「FBA倉庫在庫の構成列 (fba_available + fc_transfer + fc_processing + customer_order)、
+//   入荷 (working/shipped/received)、不良在庫 (unfulfillable)、working_first_seen のいずれかを
+//   一度でも観測したSKU」だけを ever_stocked として返す。
+//   ※ fba_warehouse = fba_available + fba_fc_transfer + fba_fc_processing + fba_customer_order なので、
+//     fba_available=0 でも FC間移動/処理中/顧客注文引当の在庫があれば「在庫経験あり」= 新規ではない。
+//   daily_snapshots は履歴蓄積 (過去に在庫を持って今0でも拾える)。これら fc_*/unfulfillable 列は
+//     initDb の ALTER 移行で必ず存在する。restock_latest は当日分の補完 (fc_* 列は無く unfulfillable まで)。
+export function getEverStockedSkus() {
+  let fromSnap = [];
+  try {
+    fromSnap = queryAll(`
+      SELECT DISTINCT amazon_sku FROM daily_snapshots
+      WHERE fba_available > 0
+         OR fba_inbound_working > 0
+         OR fba_inbound_shipped > 0
+         OR fba_inbound_received > 0
+         OR fba_fc_transfer > 0
+         OR fba_fc_processing > 0
+         OR fba_customer_order > 0
+         OR fba_unfulfillable > 0
+         OR (working_first_seen IS NOT NULL AND TRIM(working_first_seen) <> '')
+    `).map(r => r.amazon_sku);
+  } catch (e) { /* 旧スキーマ (移行前) は無視 */ }
+  let fromRestock = [];
+  try {
+    fromRestock = queryAll(`
+      SELECT amazon_sku FROM restock_latest
+      WHERE fba_available > 0
+         OR fba_inbound_working > 0
+         OR fba_inbound_shipped > 0
+         OR fba_inbound_received > 0
+         OR fba_unfulfillable > 0
+    `).map(r => r.amazon_sku);
+  } catch (e) { /* restock_latest 未作成は無視 */ }
+  return [...new Set([...fromSnap, ...fromRestock])];
 }
 
 // ===== 納品計画 =====

@@ -15,7 +15,7 @@ import { initDb, savePlanningData, savePlanningDataWithHistory, getLatestSnapsho
          saveProvisionalItems, mergeProvisionalItems, getProvisionalItems, clearProvisionalItems,
          updateProvisionalItemQty, removeProvisionalItem,
          saveExportHistory, getExportHistoryList, getExportHistoryFile,
-         getRestockLatest, getPlanningLatestMap, getAllEverSeenSkus,
+         getRestockLatest, getPlanningLatestMap, getAllEverSeenSkus, getEverStockedSkus,
          saveRestockLatest, savePlanningLatest } from './db.js';
 // SP-API関連はミニPC経由で実行（APIキーはミニPC側に一元管理）
 // import { fetchAllReports, normalizePlanningRow } from './sp-api-reports.js';
@@ -258,6 +258,13 @@ router.get('/api/all-snapshot-skus', (req, res) => {
 // ===== 過去FBA観測SKU一覧 (Phase1+で蓄積、新規商品判定の正) =====
 router.get('/api/ever-seen-skus', (req, res) => {
   res.json(getAllEverSeenSkus());
+});
+
+// ===== 過去に実FBA在庫/入荷があったSKU一覧 (新規商品/FBA欠品の正しい振り分け軸) =====
+// all-snapshot-skus / ever-seen-skus は「FBA出品に載った」だけで付くため未納品の新規出品も含む。
+// これは「実在庫・入荷を一度でも観測した」SKUのみ。新規商品タブはこれに不在のSKUを新規とみなす。
+router.get('/api/ever-stocked-skus', (req, res) => {
+  res.json(getEverStockedSkus());
 });
 
 // ===== RESTOCK最新データ一覧 =====
