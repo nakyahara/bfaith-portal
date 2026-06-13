@@ -1165,8 +1165,12 @@ async function loadMonthlyPL() {
     return;
   }
 
+  // 米国Amazon輸出(segment 4) は 米国Amazon(amazon_usa) PF 以外では非表示 (他モールは常に0の空行)。
+  // segment は数値前提だが念のため Number() で型ゆれ吸収。
+  const visibleRows = data.rows.filter(r => !(Number(r.segment) === 4 && r.mall_id !== 'amazon_usa'));
+
   // サマリー
-  const totals = data.rows.reduce((a, r) => ({
+  const totals = visibleRows.reduce((a, r) => ({
     sales: a.sales + r.sales, cost: a.cost + r.cost, pf_fee: a.pf_fee + r.pf_fee,
     ad_cost: a.ad_cost + r.ad_cost, freight: a.freight + r.freight, material: a.material + r.material,
     variable_cost: a.variable_cost + r.variable_cost, gross_profit: a.gross_profit + r.gross_profit,
@@ -1178,28 +1182,66 @@ async function loadMonthlyPL() {
     '<div class="summary-item"><div class="label">粗利益</div><div class="value ' + clsVal(totals.gross_profit) + '">' + fmt(totals.gross_profit) + '</div></div>' +
     '<div class="summary-item"><div class="label">粗利率</div><div class="value ' + clsVal(totals.gross_profit) + '">' + fmtRatio(totals.gross_profit, totals.sales) + '</div></div>';
 
-  // テーブル
+  // テーブル: PF(プラットフォーム) ごとにアコーディオン。
+  // PF 小計ヘッダー(クリックで開閉) → 配下に セグメント詳細行(デフォルト折りたたみ)。
+  const sumRows = (rows) => rows.reduce((a, r) => ({
+    sales: a.sales + r.sales, cost: a.cost + r.cost, pf_fee: a.pf_fee + r.pf_fee,
+    ad_cost: a.ad_cost + r.ad_cost, freight: a.freight + r.freight, material: a.material + r.material,
+    variable_cost: a.variable_cost + r.variable_cost, gross_profit: a.gross_profit + r.gross_profit,
+  }), { sales:0, cost:0, pf_fee:0, ad_cost:0, freight:0, material:0, variable_cost:0, gross_profit:0 });
+
+  // PF の出現順を維持してグループ化 (Map で proto 汚染回避)。
+  const pfOrder = [];
+  const pfGroups = new Map();
+  for (const r of visibleRows) {
+    if (!pfGroups.has(r.mall_id)) { pfGroups.set(r.mall_id, []); pfOrder.push(r.mall_id); }
+    pfGroups.get(r.mall_id).push(r);
+  }
+
   let html = '';
-  for (const r of data.rows) {
-    html += '<tr>'
-      + '<td>' + (MALL_NAMES[r.mall_id] || r.mall_id) + '</td>'
-      + '<td>' + (SEGMENT_NAMES[r.segment] || r.segment) + '</td>'
-      + '<td>' + fmt(r.sales) + '</td>'
-      + '<td>' + fmtPct(r.sales_ratio) + '</td>'
-      + '<td>' + fmt(r.cost) + '</td>'
-      + '<td>' + fmtRatio(r.cost, r.sales) + '</td>'
-      + '<td>' + fmt(r.pf_fee) + '</td>'
-      + '<td>' + fmtRatio(r.pf_fee, r.sales) + '</td>'
-      + '<td>' + fmt(r.ad_cost) + '</td>'
-      + '<td>' + fmtRatio(r.ad_cost, r.sales) + '</td>'
-      + '<td>' + fmt(r.freight) + '</td>'
-      + '<td>' + fmtRatio(r.freight, r.sales) + '</td>'
-      + '<td>' + fmt(r.material) + '</td>'
-      + '<td>' + fmtRatio(r.material, r.sales) + '</td>'
-      + '<td>' + fmt(r.variable_cost) + '</td>'
-      + '<td class="' + clsVal(r.gross_profit) + '">' + fmt(r.gross_profit) + '</td>'
-      + '<td class="' + clsVal(r.gross_profit) + '">' + fmtPct(r.gross_margin) + '</td>'
+  // DOM キーは mall_id ではなく行番号(index)を使う → onclick/class/selector への文字列注入面を排除。
+  for (let pfIdx = 0; pfIdx < pfOrder.length; pfIdx++) {
+    const mallId = pfOrder[pfIdx];
+    const rows = pfGroups.get(mallId);
+    const t = sumRows(rows);
+    const pfName = MALL_NAMES[mallId] || mallId;
+    // PF 小計ヘッダー(クリックで配下セグメントを開閉)。売上比率は PF売上 / 全体売上。
+    html += '<tr class="pf-header" onclick="togglePF(' + pfIdx + ')" style="cursor:pointer; background:#eef2f7; font-weight:600;">'
+      + '<td><span class="pf-caret" id="caret-' + pfIdx + '">▶</span> ' + pfName + '</td>'
+      + '<td>（全体）</td>'
+      + '<td>' + fmt(t.sales) + '</td>'
+      + '<td>' + fmtRatio(t.sales, totals.sales) + '</td>'
+      + '<td>' + fmt(t.cost) + '</td><td>' + fmtRatio(t.cost, t.sales) + '</td>'
+      + '<td>' + fmt(t.pf_fee) + '</td><td>' + fmtRatio(t.pf_fee, t.sales) + '</td>'
+      + '<td>' + fmt(t.ad_cost) + '</td><td>' + fmtRatio(t.ad_cost, t.sales) + '</td>'
+      + '<td>' + fmt(t.freight) + '</td><td>' + fmtRatio(t.freight, t.sales) + '</td>'
+      + '<td>' + fmt(t.material) + '</td><td>' + fmtRatio(t.material, t.sales) + '</td>'
+      + '<td>' + fmt(t.variable_cost) + '</td>'
+      + '<td class="' + clsVal(t.gross_profit) + '">' + fmt(t.gross_profit) + '</td>'
+      + '<td class="' + clsVal(t.gross_profit) + '">' + fmtRatio(t.gross_profit, t.sales) + '</td>'
       + '</tr>';
+    // セグメント詳細 (デフォルト折りたたみ)
+    for (const r of rows) {
+      html += '<tr class="pf-detail pf-detail-' + pfIdx + '" style="display:none; background:#fbfcfe;">'
+        + '<td></td>'
+        + '<td style="padding-left:1.6em;">' + (SEGMENT_NAMES[r.segment] || r.segment) + '</td>'
+        + '<td>' + fmt(r.sales) + '</td>'
+        + '<td>' + fmtPct(r.sales_ratio) + '</td>'
+        + '<td>' + fmt(r.cost) + '</td>'
+        + '<td>' + fmtRatio(r.cost, r.sales) + '</td>'
+        + '<td>' + fmt(r.pf_fee) + '</td>'
+        + '<td>' + fmtRatio(r.pf_fee, r.sales) + '</td>'
+        + '<td>' + fmt(r.ad_cost) + '</td>'
+        + '<td>' + fmtRatio(r.ad_cost, r.sales) + '</td>'
+        + '<td>' + fmt(r.freight) + '</td>'
+        + '<td>' + fmtRatio(r.freight, r.sales) + '</td>'
+        + '<td>' + fmt(r.material) + '</td>'
+        + '<td>' + fmtRatio(r.material, r.sales) + '</td>'
+        + '<td>' + fmt(r.variable_cost) + '</td>'
+        + '<td class="' + clsVal(r.gross_profit) + '">' + fmt(r.gross_profit) + '</td>'
+        + '<td class="' + clsVal(r.gross_profit) + '">' + fmtPct(r.gross_margin) + '</td>'
+        + '</tr>';
+    }
   }
   // 合計行
   html += '<tr class="total-row">'
@@ -1215,6 +1257,17 @@ async function loadMonthlyPL() {
     + '<td class="' + clsVal(totals.gross_profit) + '">' + fmtRatio(totals.gross_profit, totals.sales) + '</td>'
     + '</tr>';
   document.getElementById('monthlyBody').innerHTML = html;
+}
+
+// PF アコーディオン開閉: 配下の .pf-detail-<index> 行を一括トグル + キャレット切替。
+// キーは行番号(数値)なので class/selector への文字列注入はない。
+function togglePF(pfIdx) {
+  const rows = document.querySelectorAll('.pf-detail-' + pfIdx);
+  if (!rows.length) return;
+  const willShow = rows[0].style.display === 'none';
+  rows.forEach(function (tr) { tr.style.display = willShow ? '' : 'none'; });
+  const caret = document.getElementById('caret-' + pfIdx);
+  if (caret) caret.textContent = willShow ? '▼' : '▶';
 }
 
 // ─── タブ3: 年間PL ───
