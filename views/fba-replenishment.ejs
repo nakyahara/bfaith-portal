@@ -428,6 +428,7 @@
                 <th>状態</th>
                 <th class="sortable-new" data-key="amazon_sku">SKU</th>
                 <th class="sortable-new" data-key="product_name">商品名</th>
+                <th class="sortable-new" data-key="registered_at">登録日</th>
                 <th>構成</th>
                 <th class="sortable-new" data-key="fba_available" data-type="num">FBA在庫</th>
                 <th class="sortable-new" data-key="fba_inbound_working" data-type="num">準備中</th>
@@ -2011,12 +2012,16 @@ Step10: アラート判定
     async function updateStockoutList() {
       // 非表示リストを先に読み込む
       await loadStockoutHidden();
+      if (!everStockedLoaded) await loadEverStocked();
 
       // FBA販売可能在庫 = 0 かつ 倉庫在庫>0 or 納品推奨済み の商品のみ表示
       // 在庫なし (FBA=0 & 倉庫=0 & 未推奨) は「発注推奨(在庫0)」タブで扱うので除外
       stockoutData = recData.filter(r => {
         if (excludedSet.has(r.amazon_sku)) return false; // 恒久除外SKUは欠品タブにも出さない (復元は納品推奨タブで)
         if (r.fba_available !== 0) return false;
+        // 一度も実FBA在庫/入荷が無いSKUは「新規商品」側で扱う。FBA欠品(=切らした品)には出さない。
+        // (everStocked 読込前なら従来挙動を維持して取りこぼさない)
+        if (everStockedLoaded && !everStockedSet.has(normCode(r.amazon_sku))) return false;
         const isAlready = r.recommended_qty > 0 || manualItems.find(m => m.amazon_sku === r.amazon_sku);
         const hasWarehouse = (r.warehouse_raw || 0) > 0;
         return isAlready || hasWarehouse;
@@ -2266,6 +2271,21 @@ Step10: アラート判定
         const list = await res.json();
         excludedSet = new Set(list.map(r => r.amazon_sku));
       } catch(e) { /* ignore */ }
+    }
+
+    // 過去に一度でも「実FBA在庫/入荷」があったSKU (normCode 正規化済)。
+    // 新規商品タブ=この集合に不在のマスタSKU、FBA欠品タブ=この集合に在籍するSKU、で振り分ける。
+    // 旧実装は all-snapshot-skus (FBA出品在籍=未納品の新規出品も含む) を使っていたため、
+    // 一度も納品していない新規商品が新規商品タブから漏れ、FBA欠品タブの廃番候補に紛れていた (2026-06-13 修正)。
+    let everStockedSet = new Set();
+    let everStockedLoaded = false;
+    async function loadEverStocked() {
+      try {
+        const res = await fetch(`${BASE}/api/ever-stocked-skus`);
+        const list = await res.json();
+        everStockedSet = new Set((list || []).map(s => normCode(s)));
+        everStockedLoaded = true;
+      } catch(e) { /* 失敗時は空集合のまま (フォールバックは各タブ側で実施) */ }
     }
 
     // 全タブを再描画 (除外状態が各推奨タブ横断で効くため)
@@ -2533,22 +2553,22 @@ Step10: アラート判定
     async function updateNewProductList() {
       if (Object.keys(skuMappingMap).length === 0) await loadSkuMappingMap();
       await loadNewProductHidden();
+      if (!everStockedLoaded) await loadEverStocked();
 
-      // 全期間のスナップショットSKUを取得（過去にFBAに送ったことがあるSKUを除外）
-      // PR4: case 非依存で判定 (mirror 由来の skuMappingMap キー vs snapshot 元ケース。observed誤判定→タブ汚染を防ぐ)
-      let snapshotSkuSet;
-      try {
-        const res = await fetch(`${BASE}/api/all-snapshot-skus`);
-        const skus = await res.json();
-        snapshotSkuSet = new Set(skus.map(s => normCode(s)));
-      } catch(e) {
-        // フォールバック: recDataから取得
-        snapshotSkuSet = new Set(recData.map(r => normCode(r.amazon_sku)));
+      // 新規商品 = マスタにあり「過去に一度も実FBA在庫/入荷が無い (=未納品)」SKU。
+      // case 非依存で判定 (mirror 由来の skuMappingMap キー vs 実在庫SKUの元ケース)。
+      // everStockedSet は先頭の loadEverStocked で読込済。空集合(0件)は正常値として扱う。
+      // 読込失敗時のみ recData の実在庫/入荷から構成してフォールバック (タブ汚染を防ぐ)。
+      let stockedSkuSet = everStockedSet;
+      if (!everStockedLoaded) {
+        stockedSkuSet = new Set(recData
+          .filter(r => (r.fba_available || 0) > 0 || (r.fba_inbound_working || 0) > 0 || (r.fba_inbound_shipped || 0) > 0 || (r.fba_inbound_received || 0) > 0 || (r.effective_fba_stock || 0) > 0)
+          .map(r => normCode(r.amazon_sku)));
       }
 
       newProductData = [];
       for (const [sku, mapping] of Object.entries(skuMappingMap)) {
-        if (snapshotSkuSet.has(normCode(sku))) continue;
+        if (stockedSkuSet.has(normCode(sku))) continue; // 実在庫/入荷を持ったことがある=新規ではない
         if (excludedSet.has(sku)) continue; // 恒久除外SKUは新規商品タブにも出さない (復元は納品推奨タブで)
 
         let warehouseQty = 0;
@@ -2576,6 +2596,7 @@ Step10: アラート判定
           amazon_sku: sku,
           asin: mapping.asin || '',
           product_name: mapping.product_name || '',
+          registered_at: mapping.registered_at || null, // SKUマスタ登録日 (ISO UTC) — いつ登録した商品か
           ne_code: mapping.ne_code || '',
           set_components: comps,
           is_set: mapping.is_set ? true : false,
@@ -2644,9 +2665,18 @@ Step10: アラート判定
       syncSnapshotSearch(searchQuery);
     }
 
+    // SKUマスタ登録日 (ISO UTC) を JST の YYYY-MM-DD で表示。toISOString の UTC ずれを避けるため +9h して UTC 部品で組む。
+    function fmtRegDate(iso) {
+      if (!iso) return '-';
+      const d = new Date(iso);
+      if (isNaN(d.getTime())) return '-';
+      const j = new Date(d.getTime() + 9 * 3600 * 1000);
+      return `${j.getUTCFullYear()}-${String(j.getUTCMonth() + 1).padStart(2, '0')}-${String(j.getUTCDate()).padStart(2, '0')}`;
+    }
+
     function renderNewList(data) {
       const tbody = document.getElementById('newBody');
-      if (!data.length) { tbody.innerHTML = '<tr><td colspan="23">該当なし</td></tr>'; return; }
+      if (!data.length) { tbody.innerHTML = '<tr><td colspan="24">該当なし</td></tr>'; return; }
 
       data.sort((a, b) => {
         const th = document.querySelector(`th.sortable-new[data-key="${newSortKey}"]`);
@@ -2690,6 +2720,7 @@ Step10: アラート判定
           <td>${statusHtml}</td>
           <td><span class="sku-link" onclick="showCalcDetail('${r.amazon_sku}')">${r.amazon_sku}</span></td>
           <td class="product-name" title="${esc(r.product_name)}">${r.asin ? `<a href="https://www.amazon.co.jp/dp/${r.asin}" target="_blank" style="color:inherit;text-decoration:none;" title="Amazonで開く">${esc(r.product_name)}</a>` : esc(r.product_name)}</td>
+          <td style="white-space:nowrap;color:#666;font-size:11px;" title="SKUマスタ登録日">${fmtRegDate(r.registered_at)}</td>
           ${renderComponentCell(r)}
           <td>${r.fba_available ?? '-'}</td>
           <td style="${r.fba_inbound_working > 0 ? (r.fba_inbound_working_source === 'API' ? 'color:#2563eb;font-weight:bold' : 'color:#16a34a') : 'color:#ccc'}">${r.fba_inbound_working || 0}${r.fba_inbound_working_source === 'API' ? '<span style="font-size:9px;color:#2563eb;"> ⚡</span>' : ''}</td>
@@ -3981,6 +4012,8 @@ Step10: アラート判定
 
       // 恒久除外リストを先に読み込む (3タブのフィルタが参照する)
       await loadExcluded();
+      // 実在庫経験SKU集合を先に読み込む (新規商品/FBA欠品の振り分けが参照する)
+      await loadEverStocked();
 
       // ドラフトがあるか確認
       const draft = await checkDraftOnLoad();
