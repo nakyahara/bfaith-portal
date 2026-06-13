@@ -33,6 +33,7 @@ import {
   countActiveByKind,
   kindLabel,
 } from './lib/exclusion.js';
+import { runRysFullSync } from './services/rys-full-sync.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -618,6 +619,59 @@ router.post('/api/exclusions/restore', (req, res) => {
     if (e.code === 'EXCLUSION_NOT_ACTIVE') return res.status(404).json({ status: 'fail', code: e.code, error: e.message });
     if (/exclusion:/.test(e.message)) return res.status(400).json({ status: 'fail', error: e.message });
     return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+// ───────────────── Phase E-7-e: 楽天↔Yahoo 差分手動同期 ─────────────────
+
+/**
+ * 「いま再取得」 ボタンの実体: Yahoo baseline → 楽天 diff の順序実行を同期で run。
+ * Render 完結なので polling 不要 (同 DB / 同プロセス)、 完了まで blocked、 結果を JSON で返す。
+ *   body: { dryRun?: boolean, allowZeroOverlap?: boolean, triggerRequestId?: string }
+ *   res:  200 + 結果、 409 (running 競合)、 412 (baseline guard)、 500 (失敗)
+ */
+router.post('/api/diff-sync/trigger', async (req, res) => {
+  const body = req.body || {};
+  const dryRun = !!body.dryRun;
+  const triggerRequestId = typeof body.triggerRequestId === 'string' ? body.triggerRequestId : null;
+  try {
+    const db = getDB();
+    const r = await runRysFullSync({
+      db, triggeredBy: 'manual', triggerRequestId, dryRun, allowZeroOverlap: !!body.allowZeroOverlap,
+    });
+    audit(db, 'rys_diff_sync_manual', {
+      rysFullSyncRunId: r.rysFullSyncRunId,
+      baselineId: r.baseline?.syncRunId,
+      diffId: r.diff?.syncRunId,
+      newlyDetected: r.diff?.newlyDetected,
+      resolved: r.diff?.resolved,
+      triggerRequestId, dryRun,
+      durationMs: r.durationMs,
+    });
+    return res.json({ status: 'ok', ...r });
+  } catch (e) {
+    // Codex R1 Medium-3: 失敗時にも audit を残す (stage / partial sync_run_ids / triggerRequestId / dryRun)
+    try {
+      const db = getDB();
+      audit(db, 'rys_diff_sync_manual_fail', {
+        stage: e.stage || 'unknown',
+        rysFullSyncRunId: e.partial?.rysFullSyncRunId,
+        baselineId: e.partial?.baseline?.syncRunId,
+        diffId: e.partial?.diff?.syncRunId,
+        triggerRequestId, dryRun,
+        error: e.message,
+      }, { result: 'failed', errorMessage: String(e.message).slice(0, 4000) });
+    } catch (_) { /* best-effort */ }
+
+    // running 競合 → 409
+    if (/UNIQUE/.test(e.message) && /sync_runs/.test(e.message)) {
+      return res.status(409).json({ status: 'fail', stage: e.stage || 'lock', error: 'A sync is already running' });
+    }
+    // baseline guard / precondition 失敗 → 412
+    if (e.statusCode === 412 || e.cause?.statusCode === 412) {
+      return res.status(412).json({ status: 'fail', stage: e.stage || 'baseline_guard', error: e.message, partial: e.partial });
+    }
+    return res.status(500).json({ status: 'fail', stage: e.stage || 'unknown', error: e.message, partial: e.partial });
   }
 });
 

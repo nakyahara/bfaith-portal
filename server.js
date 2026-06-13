@@ -18,6 +18,7 @@ import profitRouter from './apps/profit-calculator/router.js';
 import { startPriceWorker, startMaintenanceJobs } from './apps/profit-calculator/price-scheduler.js';
 import { startNotificationJob as startInventoryNotificationJob } from './apps/profit-analysis/notify-job.js';
 import { startSalesNotificationJob } from './apps/biz-ops-overview/notify-job.js';
+import { startRysCron } from './apps/rakuten-yahoo-sync/services/rys-cron.js';
 import fbaRouter from './apps/fba-replenishment/router.js';
 import warehouseRouter from './apps/warehouse/router.js';
 import ordersLookupRouter from './apps/warehouse/orders-lookup-router.js';
@@ -1005,6 +1006,9 @@ app.listen(PORT, () => {
   startInventoryNotificationJob();
   // biz-ops-overview 売上サマリ GChat 通知 (在庫と独立メッセージ、SALES_NOTIFY_ENABLED=true で起動)
   startSalesNotificationJob();
+
+  // RYS 楽天↔Yahoo 差分検出 daily sync (RYS_FULL_SYNC_CRON_ENABLED=true で起動、 Dark Launch)
+  startRysCron();
 });
 
 process.on('SIGTERM', () => {
