@@ -1304,6 +1304,43 @@ const PICKING_UPLOAD_FIELDS = [
   ...PLAN_SLOTS.map(s => ({ name: s.id, maxCount: 1 })),
   { name: 'lz', maxCount: 1 },
 ];
+// 1ファイルあたりの最大行数 (DB肥大化・イベントループ停止の防止, Codex #3)。
+const MAX_LZ_ROWS = 50000;
+const MAX_PLAN_ROWS = 20000;
+
+// multer のエラー (サイズ超過/ファイル数超過) を JSON で返すラッパー (Codex #3)。
+function runUpload(mw) {
+  return (req, res, next) => mw(req, res, (err) => {
+    if (err) {
+      const status = err.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
+      return res.status(status).json({ error: `アップロードエラー: ${err.message}` });
+    }
+    next();
+  });
+}
+
+// マスタ置換前の安全ガード (Codex #1: 誤アップロードによる全消去/大幅欠損の防止)。
+// confirm=true で明示承認された場合のみ 0件/急減を許可する。
+function checkMasterReplace(res, prev, dataRowCount, matchedCount, confirm) {
+  if (dataRowCount === 0) {
+    res.status(400).json({ error: 'CSVにデータ行がありません（ヘッダのみ/空ファイルの可能性）' });
+    return false;
+  }
+  if (!confirm) {
+    if (matchedCount === 0) {
+      res.status(409).json({ needConfirm: true, prev, count: 0,
+        message: `抽出件数が0件でした（列ずれ・別ファイルの可能性）。既存${prev}件を全消去して置換しますか？` });
+      return false;
+    }
+    if (prev > 0 && matchedCount < prev * 0.5) {
+      res.status(409).json({ needConfirm: true, prev, count: matchedCount,
+        message: `件数が前回(${prev}件)から大きく減少(${matchedCount}件)します。置換を続行しますか？` });
+      return false;
+    }
+  }
+  return true;
+}
+const isConfirm = (req) => req.body?.confirm === 'true' || req.body?.confirm === '1';
 
 // 正規化 norm キーで mapping を引けるよう Map 化。空なら fail-closed (Codex #2)。
 function buildMappingMap() {
@@ -1334,11 +1371,12 @@ router.get('/api/picking-prep/master-status', (req, res) => {
 });
 
 // バーコードマスタ アップロード (A列=商品ID, D列=バーコード, 1行目ヘッダ)
-router.post('/api/picking-prep/master/barcode', pickingUpload.single('csv'), (req, res) => {
+router.post('/api/picking-prep/master/barcode', runUpload(pickingUpload.single('csv')), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'CSVファイルが必要です' });
   try {
     const { text } = decodeCsvBuffer(req.file.buffer);
     const all = parseCsv(text);
+    const dataRowCount = Math.max(0, all.length - 1); // 1行目ヘッダ
     const rows = [];
     for (let r = 1; r < all.length; r++) {
       const row = all[r] || [];
@@ -1346,7 +1384,8 @@ router.post('/api/picking-prep/master/barcode', pickingUpload.single('csv'), (re
       const barcode = String(row[3] ?? '').trim();
       if (code) rows.push({ logizard_code: code, barcode });
     }
-    if (rows.length === 0) return res.status(400).json({ error: '有効な行がありません (A列=商品ID, D列=バーコード)' });
+    const prev = getPickingMasterStatus().barcode.count || 0;
+    if (!checkMasterReplace(res, prev, dataRowCount, rows.length, isConfirm(req))) return;
     const r = replaceBarcodeMaster(rows, { filename: req.file.originalname, uploadedBy: req.session?.email });
     res.json({ success: true, ...r });
   } catch (e) {
@@ -1356,11 +1395,12 @@ router.post('/api/picking-prep/master/barcode', pickingUpload.single('csv'), (re
 });
 
 // 土台商品マスタ アップロード (A列=SKU, F列=1 なら土台商品)
-router.post('/api/picking-prep/master/dodai', pickingUpload.single('csv'), (req, res) => {
+router.post('/api/picking-prep/master/dodai', runUpload(pickingUpload.single('csv')), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'CSVファイルが必要です' });
   try {
     const { text } = decodeCsvBuffer(req.file.buffer);
     const all = parseCsv(text);
+    const dataRowCount = all.length; // 土台マスタは固定ヘッダ無し前提 (F列=1 で判定)
     const rows = [];
     for (let r = 0; r < all.length; r++) {
       const row = all[r] || [];
@@ -1368,6 +1408,8 @@ router.post('/api/picking-prep/master/dodai', pickingUpload.single('csv'), (req,
       const flag = String(row[5] ?? '').trim();
       if (sku && flag === '1') rows.push({ sku });
     }
+    const prev = getPickingMasterStatus().dodai.count || 0;
+    if (!checkMasterReplace(res, prev, dataRowCount, rows.length, isConfirm(req))) return;
     const r = replaceDodaiMaster(rows, { filename: req.file.originalname, uploadedBy: req.session?.email });
     res.json({ success: true, ...r });
   } catch (e) {
@@ -1377,7 +1419,7 @@ router.post('/api/picking-prep/master/dodai', pickingUpload.single('csv'), (req,
 });
 
 // メイン処理: プランCSV群 + lzpickinglist を突合し、ピッキングリスト/ラベルCSV/プラン別シートを生成
-router.post('/api/picking-prep/process', pickingUpload.fields(PICKING_UPLOAD_FIELDS), (req, res) => {
+router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_UPLOAD_FIELDS)), (req, res) => {
   try {
     const files = req.files || {};
     const lzFile = files.lz?.[0];
@@ -1412,6 +1454,9 @@ router.post('/api/picking-prep/process', pickingUpload.fields(PICKING_UPLOAD_FIE
       const labelPrefix = String(req.body?.[`label_${slot.id}`] || slot.label).trim() || slot.label;
       const { text } = decodeCsvBuffer(f.buffer);
       const rows = parseCsv(text);
+      if (rows.length > MAX_PLAN_ROWS) {
+        return res.status(413).json({ error: `${slot.plan}/${slot.kind} のCSV行数が上限(${MAX_PLAN_ROWS})を超えています (${rows.length}行)` });
+      }
       const { items } = pp.parsePlanFile(labelPrefix, rows, dodaiSet);
       allPlanItems.push(...items);
       planSheets.push({
@@ -1423,16 +1468,38 @@ router.post('/api/picking-prep/process', pickingUpload.fields(PICKING_UPLOAD_FIE
     }
     if (usedSlots === 0) return res.status(400).json({ error: 'プランCSVが1つも指定されていません' });
 
+    // 誤出力防止: プランから商品行を1つも抽出できない場合は中止 (Codex #2)
+    if (allPlanItems.length === 0) {
+      return res.status(422).json({ error: 'プランCSVから商品行(SKU)を抽出できませんでした。CSVの形式(7行目からデータ・A列=SKU)を確認してください。' });
+    }
+
     // SKU → 商品コード展開
     const { codeIndex, warnings: convWarn } = pp.expandToCodes(allPlanItems, mappingMap);
+    // 全SKUが変換不能なら中止 (Codex #2)
+    if (codeIndex.size === 0) {
+      return res.status(422).json({ error: '商品コードに変換できたSKUがありません（全件マッピングなし）。SKUマスタ・プランCSVを確認してください。', warnings: convWarn });
+    }
 
     // lzpickinglist 突合
     const { text: lzText } = decodeCsvBuffer(lzFile.buffer);
     const lzRows = parseCsv(lzText);
+    if (lzRows.length > MAX_LZ_ROWS) {
+      return res.status(413).json({ error: `ピッキングリストCSVの行数が上限(${MAX_LZ_ROWS})を超えています (${lzRows.length}行)` });
+    }
     const { rows: pickingRows, warnings: pickWarn, matchedCodes } = pp.buildPickingList(lzRows, codeIndex);
 
     // P-touch ラベル行
     const { csvRows: labelCsvRows, warnings: labelWarn } = pp.buildLabelRows(pickingRows, barcodeMap);
+
+    // 誤出力防止: プランとピッキングリストが1件も突合しない場合は中止 (Codex #2)。
+    // (lz/プランの取り違え・別日のファイル等。プランNo空のピッキングリストは無意味)
+    const matchedRowCount = pickingRows.filter(r => r.planNo).length;
+    if (matchedRowCount === 0) {
+      return res.status(422).json({
+        error: 'プランの商品コードがピッキングリストと1件も一致しませんでした。ファイルの取り違え（別日のlzpickinglist等）の可能性があります。',
+        warnings: [...convWarn, ...pickWarn],
+      });
+    }
 
     // 展開したが倉庫ピッキングに出てこなかった商品コード
     const notInPicking = pp.findCodesNotInPicking(codeIndex, matchedCodes);

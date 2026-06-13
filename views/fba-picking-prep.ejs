@@ -165,14 +165,19 @@ function onSlotFile(input){
   slot.classList.toggle('has-file', input.files.length>0);
 }
 
-async function uploadMaster(type){
+async function uploadMaster(type, confirm){
   const fileEl = document.getElementById(type==='barcode'?'barcodeFile':'dodaiFile');
   if (!fileEl.files.length){ alert('CSVファイルを選択してください'); return; }
   const fd = new FormData();
   fd.append('csv', fileEl.files[0]);
+  if (confirm) fd.append('confirm', 'true');
   try {
     const r = await fetch('/apps/fba-replenishment/api/picking-prep/master/'+type, { method:'POST', body: fd });
     const d = await r.json();
+    if (r.status === 409 && d.needConfirm){
+      if (window.confirm((d.message||'置換を続行しますか？'))) { return uploadMaster(type, true); }
+      return; // キャンセル: 既存マスタは保持
+    }
     if (!r.ok){ alert('エラー: '+(d.error||r.status)); return; }
     alert((type==='barcode'?'バーコード':'土台商品')+'マスタを更新しました: '+d.count+'件 (前回 '+d.prev+'件)');
     fileEl.value='';
@@ -202,7 +207,12 @@ async function runProcess(){
   try {
     const r = await fetch('/apps/fba-replenishment/api/picking-prep/process', { method:'POST', body: fd });
     const d = await r.json();
-    if (!r.ok){ document.getElementById('runMsg').textContent=''; alert('エラー: '+(d.error||r.status)); return; }
+    if (!r.ok){
+      document.getElementById('runMsg').textContent='';
+      const warns = (d.warnings&&d.warnings.length) ? '\n\n警告:\n'+d.warnings.slice(0,10).join('\n') : '';
+      alert('エラー: '+(d.error||r.status)+warns);
+      return;
+    }
     renderResult(d);
     document.getElementById('runMsg').textContent = '完了';
     loadRuns();
