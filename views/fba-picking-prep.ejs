@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FBA納品ピッキング準備 - B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png"><link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    .pp-container { max-width: 1200px; margin: 0 auto; padding: 12px 20px; }
+    .section { margin-top: 24px; }
+    .section h3 { border-bottom: 2px solid #2563eb; padding-bottom: 8px; }
+    .btn { display: inline-block; padding: 10px 20px; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500; }
+    .btn-primary { background: #2563eb; color: white; }
+    .btn-primary:hover { background: #1d4ed8; }
+    .btn-primary:disabled { background: #93c5fd; cursor: not-allowed; }
+    .btn-secondary { background: #e5e7eb; color: #374151; text-decoration: none; }
+    .btn-sm { padding: 6px 12px; font-size: 13px; }
+    .stat { background: white; border-radius: 6px; padding: 12px 16px; min-width: 160px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    .stat .label { font-size: 12px; color: #666; }
+    .stat .value { font-size: 22px; font-weight: bold; margin-top: 4px; }
+    .status-row { display: flex; gap: 16px; flex-wrap: wrap; }
+    .slot-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; margin-top: 12px; }
+    .slot { border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px; background: #fafafa; }
+    .slot.has-file { border-color: #16a34a; background: #f0fdf4; }
+    .slot .slot-title { font-weight: 600; font-size: 13px; margin-bottom: 6px; }
+    .slot label.lbl { font-size: 11px; color: #666; display: block; margin: 6px 0 2px; }
+    .slot input[type=text] { width: 100%; padding: 4px 6px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 12px; box-sizing: border-box; }
+    .slot input[type=file] { font-size: 11px; width: 100%; }
+    .data-table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 12px; }
+    .data-table th, .data-table td { border: 1px solid #e5e7eb; padding: 4px 6px; text-align: left; }
+    .data-table th { background: #f3f4f6; position: sticky; top: 0; }
+    .table-wrap { max-height: 420px; overflow: auto; border: 1px solid #e5e7eb; border-radius: 8px; }
+    .warn-box { background: #fffbeb; border: 1px solid #fcd34d; border-radius: 8px; padding: 12px; margin-top: 12px; max-height: 240px; overflow: auto; }
+    .warn-box .w { font-size: 12px; color: #92400e; padding: 2px 0; }
+    .master-row { display: flex; gap: 24px; flex-wrap: wrap; }
+    .master-card { flex: 1; min-width: 280px; border: 1px solid #e5e7eb; border-radius: 8px; padding: 14px; }
+    .master-card h4 { margin: 0 0 6px; }
+    .muted { color: #6b7280; font-size: 12px; }
+    .badge-dodai { display:inline-block; background:#fee2e2; color:#b91c1c; font-weight:bold; font-size:11px; padding:1px 6px; border-radius:4px; }
+    .src-warn { background:#fef3c7; color:#92400e; border-radius:6px; padding:8px 12px; margin-top:8px; font-size:13px; }
+    .src-ok { background:#dcfce7; color:#166534; border-radius:6px; padding:8px 12px; margin-top:8px; font-size:13px; }
+    .spinner { display:inline-block; width:16px;height:16px;border:2px solid #fff;border-top-color:transparent;border-radius:50%;animation:spin .8s linear infinite;margin-right:6px;vertical-align:middle;}
+    @keyframes spin { to { transform: rotate(360deg);} }
+    .result-actions { display:flex; gap:10px; flex-wrap:wrap; margin:12px 0; }
+    .hint { font-size:12px; color:#6b7280; margin-top:4px; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <a href="/apps/fba-replenishment" class="back-link">&larr; FBA在庫補充</a>
+      <h1>FBA納品ピッキング準備</h1>
+    </div>
+    <div class="header-right" style="display:flex;align-items:center;gap:12px;">
+      <span><%= displayName || username %></span>
+    </div>
+  </header>
+
+  <div class="pp-container">
+    <p class="hint">Amazonで納品プランを作成した後の工程です。納品プランCSV群とロジザードのピッキングリストCSVをアップロードすると、納品プランNo付きのピッキングリスト・P-touchラベル印刷用CSV・プラン別のラベル貼り作業シートを生成します。</p>
+
+    <!-- マッピングソース表示 -->
+    <div id="srcIndicator"></div>
+
+    <!-- マスタ管理 -->
+    <div class="section">
+      <h3>マスタ (サーバー保存・更新時のみ再アップロード)</h3>
+      <div class="master-row">
+        <div class="master-card">
+          <h4>バーコードマスタ</h4>
+          <div class="muted" id="barcodeStatus">読込中…</div>
+          <div style="margin-top:8px;">
+            <input type="file" id="barcodeFile" accept=".csv">
+            <button class="btn btn-secondary btn-sm" onclick="uploadMaster('barcode')">更新</button>
+          </div>
+          <div class="hint">A列=商品ID, D列=バーコード (1行目ヘッダ)</div>
+        </div>
+        <div class="master-card">
+          <h4>土台商品マスタ</h4>
+          <div class="muted" id="dodaiStatus">読込中…</div>
+          <div style="margin-top:8px;">
+            <input type="file" id="dodaiFile" accept=".csv">
+            <button class="btn btn-secondary btn-sm" onclick="uploadMaster('dodai')">更新</button>
+          </div>
+          <div class="hint">A列=SKU, F列=1 なら土台商品</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 入力CSV -->
+    <div class="section">
+      <h3>① 納品プランCSV (Amazon)</h3>
+      <p class="hint">該当するスロットにCSVをアップロードしてください。納品プランNoの接頭辞は編集できます (現場が参照する番号になります)。</p>
+      <div class="slot-grid">
+        <% slots.forEach(function(s){ %>
+          <div class="slot" id="slot-<%= s.id %>">
+            <div class="slot-title"><%= s.plan %> / <%= s.kind %></div>
+            <input type="file" accept=".csv" data-slot="<%= s.id %>" onchange="onSlotFile(this)">
+            <label class="lbl">納品プランNo 接頭辞</label>
+            <input type="text" id="label-<%= s.id %>" value="<%= s.label %>">
+          </div>
+        <% }); %>
+      </div>
+    </div>
+
+    <div class="section">
+      <h3>② ピッキングリストCSV (ロジザード lzpickinglist)</h3>
+      <input type="file" id="lzFile" accept=".csv">
+      <div class="hint">H列=ブロック略称, I列=ロケーション, J列=商品ID, K列=商品名</div>
+    </div>
+
+    <div class="section">
+      <button class="btn btn-primary" id="runBtn" onclick="runProcess()">処理を実行</button>
+      <span id="runMsg" class="muted" style="margin-left:12px;"></span>
+    </div>
+
+    <!-- 結果 -->
+    <div class="section" id="resultSection" style="display:none;">
+      <h3>結果</h3>
+      <div class="status-row" id="resultStats"></div>
+      <div class="result-actions" id="resultActions"></div>
+      <div id="warnArea"></div>
+      <div id="pickingPreview"></div>
+    </div>
+
+    <!-- 履歴 -->
+    <div class="section">
+      <h3>実行履歴</h3>
+      <div id="runsArea" class="muted">読込中…</div>
+    </div>
+  </div>
+
+<script>
+const SLOTS = <%- JSON.stringify(slots) %>;
+const MAPPING_SOURCE = <%- JSON.stringify(mappingSource) %>;
+
+function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c])); }
+
+function renderSrc(src){
+  const el = document.getElementById('srcIndicator');
+  if (src === 'mirror') {
+    el.innerHTML = '<div class="src-ok">SKUマッピング: SKUマスタ直結 (mirror) — 正常</div>';
+  } else {
+    el.innerHTML = '<div class="src-warn">⚠ SKUマッピングのデータソースが <b>'+esc(src)+'</b> です。本番ではSKUマスタ直結(mirror)を推奨します (環境変数 FBA_SKU_MAPPING_SOURCE=mirror)。</div>';
+  }
+}
+
+async function loadStatus(){
+  try {
+    const r = await fetch('/apps/fba-replenishment/api/picking-prep/master-status');
+    const d = await r.json();
+    renderSrc(d.mappingSource || MAPPING_SOURCE);
+    const b = d.barcode || {count:0};
+    const dd = d.dodai || {count:0};
+    document.getElementById('barcodeStatus').innerHTML = b.count
+      ? esc(b.count)+'件 (更新: '+esc(b.updated_at||'-')+')' : '<span style="color:#b91c1c;">未登録</span>';
+    document.getElementById('dodaiStatus').innerHTML = dd.count
+      ? esc(dd.count)+'件 (更新: '+esc(dd.updated_at||'-')+')' : '<span style="color:#b91c1c;">未登録</span>';
+  } catch(e){ /* ignore */ }
+}
+
+function onSlotFile(input){
+  const slot = document.getElementById('slot-'+input.dataset.slot);
+  slot.classList.toggle('has-file', input.files.length>0);
+}
+
+async function uploadMaster(type, confirm){
+  const fileEl = document.getElementById(type==='barcode'?'barcodeFile':'dodaiFile');
+  if (!fileEl.files.length){ alert('CSVファイルを選択してください'); return; }
+  const fd = new FormData();
+  fd.append('csv', fileEl.files[0]);
+  if (confirm) fd.append('confirm', 'true');
+  try {
+    const r = await fetch('/apps/fba-replenishment/api/picking-prep/master/'+type, { method:'POST', body: fd });
+    const d = await r.json();
+    if (r.status === 409 && d.needConfirm){
+      if (window.confirm((d.message||'置換を続行しますか？'))) { return uploadMaster(type, true); }
+      return; // キャンセル: 既存マスタは保持
+    }
+    if (!r.ok){ alert('エラー: '+(d.error||r.status)); return; }
+    alert((type==='barcode'?'バーコード':'土台商品')+'マスタを更新しました: '+d.count+'件 (前回 '+d.prev+'件)');
+    fileEl.value='';
+    loadStatus();
+  } catch(e){ alert('通信エラー: '+e.message); }
+}
+
+async function runProcess(){
+  const lz = document.getElementById('lzFile');
+  if (!lz.files.length){ alert('ピッキングリスト(lzpickinglist)CSV を選択してください'); return; }
+  const fd = new FormData();
+  let planCount = 0;
+  for (const s of SLOTS){
+    const input = document.querySelector('input[type=file][data-slot="'+s.id+'"]');
+    if (input && input.files.length){
+      fd.append(s.id, input.files[0]);
+      planCount++;
+    }
+    fd.append('label_'+s.id, document.getElementById('label-'+s.id).value);
+  }
+  if (planCount === 0){ alert('納品プランCSVを1つ以上アップロードしてください'); return; }
+  fd.append('lz', lz.files[0]);
+
+  const btn = document.getElementById('runBtn');
+  btn.disabled = true;
+  document.getElementById('runMsg').innerHTML = '<span class="spinner"></span>処理中…';
+  try {
+    const r = await fetch('/apps/fba-replenishment/api/picking-prep/process', { method:'POST', body: fd });
+    const d = await r.json();
+    if (!r.ok){
+      document.getElementById('runMsg').textContent='';
+      const warns = (d.warnings&&d.warnings.length) ? '\n\n警告:\n'+d.warnings.slice(0,10).join('\n') : '';
+      alert('エラー: '+(d.error||r.status)+warns);
+      return;
+    }
+    renderResult(d);
+    document.getElementById('runMsg').textContent = '完了';
+    loadRuns();
+  } catch(e){ alert('通信エラー: '+e.message); }
+  finally { btn.disabled = false; }
+}
+
+function renderResult(d){
+  const sec = document.getElementById('resultSection');
+  sec.style.display='';
+  const s = d.summary||{};
+  document.getElementById('resultStats').innerHTML =
+    stat('ピッキング行', s.pickingRowCount) +
+    stat('プランNo一致', s.pickingMatchedCount) +
+    stat('ラベル件数', s.labelRowCount) +
+    stat('プラン別シート', (d.planSheets||[]).length) +
+    stat('警告', (d.warnings||[]).length);
+
+  document.getElementById('resultActions').innerHTML =
+    '<a class="btn btn-primary btn-sm" href="/apps/fba-replenishment/picking-prep/print/'+d.runId+'?view=picking" target="_blank">📄 ピッキングリスト印刷</a>' +
+    '<a class="btn btn-primary btn-sm" href="/apps/fba-replenishment/picking-prep/print/'+d.runId+'?view=plan" target="_blank">📄 プラン別シート印刷</a>' +
+    '<a class="btn btn-secondary btn-sm" href="/apps/fba-replenishment/api/picking-prep/run/'+d.runId+'/label-csv">⬇ P-touchラベルCSV</a>';
+
+  const warns = d.warnings||[];
+  document.getElementById('warnArea').innerHTML = warns.length
+    ? '<div class="warn-box">'+warns.map(w=>'<div class="w">⚠ '+esc(w)+'</div>').join('')+'</div>'
+    : '<p class="muted" style="margin-top:8px;">警告なし</p>';
+
+  const rows = (d.pickingRows||[]).slice(0,200);
+  let html = '<h4 style="margin-top:16px;">ピッキングリスト (先頭'+rows.length+'件プレビュー)</h4><div class="table-wrap"><table class="data-table"><thead><tr>'+
+    '<th>ブロック</th><th>ロケーション</th><th>商品ID</th><th>商品名</th><th>納品プランNo</th><th>土台</th></tr></thead><tbody>';
+  for (const r of rows){
+    html += '<tr><td>'+esc(r.block)+'</td><td>'+esc(r.location)+'</td><td>'+esc(r.code)+'</td><td>'+esc(r.name)+
+      '</td><td>'+esc(String(r.planNo||'').replace(/\n/g,' / '))+'</td><td>'+(r.dodai?'<span class="badge-dodai">土台</span>':'')+'</td></tr>';
+  }
+  html += '</tbody></table></div>';
+  document.getElementById('pickingPreview').innerHTML = html;
+}
+
+function stat(label, val){
+  return '<div class="stat"><div class="label">'+esc(label)+'</div><div class="value">'+esc(val==null?'-':val)+'</div></div>';
+}
+
+async function loadRuns(){
+  try {
+    const r = await fetch('/apps/fba-replenishment/api/picking-prep/runs');
+    const d = await r.json();
+    const runs = d.runs||[];
+    if (!runs.length){ document.getElementById('runsArea').textContent='履歴なし'; return; }
+    let html = '<div class="table-wrap"><table class="data-table"><thead><tr><th>実行日時</th><th>実行者</th><th>プラン</th><th>ピッキング</th><th>ラベル</th><th>警告</th><th></th></tr></thead><tbody>';
+    for (const run of runs){
+      const files = (run.plan_files||[]).map(f=>esc(f.label)+'('+f.count+')').join(', ');
+      html += '<tr><td>'+esc(run.run_at)+'</td><td>'+esc(run.run_by||'-')+'</td><td>'+files+'</td><td>'+esc(run.picking_count)+
+        '</td><td>'+esc(run.label_count)+'</td><td>'+esc(run.warning_count)+
+        '</td><td><a class="btn btn-secondary btn-sm" href="/apps/fba-replenishment/picking-prep/print/'+run.id+'" target="_blank">印刷</a> '+
+        '<a class="btn btn-secondary btn-sm" href="/apps/fba-replenishment/api/picking-prep/run/'+run.id+'/label-csv">CSV</a></td></tr>';
+    }
+    html += '</tbody></table></div>';
+    document.getElementById('runsArea').innerHTML = html;
+  } catch(e){ document.getElementById('runsArea').textContent='履歴の取得に失敗しました'; }
+}
+
+loadStatus();
+loadRuns();
+</script>
+</body>
+</html>
