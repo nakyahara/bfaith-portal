@@ -838,6 +838,19 @@ tr:hover { background: #f0f4ff; }
   table { font-size: 11px; }
   th, td { padding: 6px 4px; }
 }
+/* ── 月次/年間 PL テーブル 視覚強調 ── */
+/* 合計列(年間PL 右端)を強調 */
+#annualTable td:last-child, #annualTable th:last-child { background:#eef4ff; font-weight:700; }
+/* セグメントブロックの区切り線 */
+#annualTable tr.seg-start > td { border-top:2px solid #c7d2e8; }
+/* 粗利益率の行を一段目立たせる(ボトムライン) */
+#annualTable tr.pl-margin { background:#f5f8ff; }
+#annualTable tr.pl-margin td { font-weight:700; }
+#annualTable tr.total-row.pl-margin td { border-bottom:2px solid #1a73e8; }
+/* 月次PL アコーディオン: PF ヘッダーのホバー強調 */
+#monthlyTable tr.pf-header:hover > td { background:#e3ebf7; }
+/* 月次PL: 詳細行(セグメント)の行頭を少し沈める */
+#monthlyTable tr.pf-detail td:nth-child(2) { color:#555; }
 </style>
 </head>
 <body>
@@ -1326,7 +1339,7 @@ async function loadAnnualPL() {
 
     for (let fi = 0; fi < fields.length; fi++) {
       const f = fields[fi];
-      html += '<tr>';
+      html += (fi === 0 ? '<tr class="seg-start">' : '<tr>');
       if (fi === 0) html += '<td rowspan="' + (fields.length + 1) + '">' + segName + '</td>';
       html += '<td>' + (f.indent ? '　' : '') + f.label + '</td>';
       let rowTotal = 0;
@@ -1342,7 +1355,7 @@ async function loadAnnualPL() {
       else grandTotals.variable_cost += rowTotal;
     }
     // 粗利率行
-    html += '<tr><td>粗利益率</td>';
+    html += '<tr class="pl-margin"><td>粗利益率</td>';
     for (const m of data.months) {
       const r = byMonth[m];
       const margin = r && r.sales > 0 ? r.gross_profit / r.sales : 0;
@@ -1379,7 +1392,7 @@ async function loadAnnualPL() {
     html += '<td class="' + cls + '">' + fmt(rowSum) + '</td></tr>';
   }
   // 合計粗利率
-  html += '<tr class="total-row"><td>粗利益率</td>';
+  html += '<tr class="total-row pl-margin"><td>粗利益率</td>';
   for (const m of data.months) {
     const d = allByMonth[m];
     const margin = d && d.sales > 0 ? d.gross_profit / d.sales : 0;
