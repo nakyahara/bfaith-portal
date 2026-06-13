@@ -968,6 +968,84 @@ function getSkuMappingSource() {
   return process.env.FBA_SKU_MAPPING_SOURCE || 'sheet';
 }
 
+// ===== non_fba_sales (他チャネル=FBA以外の販売数) のソース選択 (PR3) =====
+// 従来は Google Sheet「商品コード変換テーブル」(Step3 同期 → sku_mapping) に依存していたが、
+// 商品管理リスト案件で NE受注の FBA以外 7日/30日 を商品コード単位に集計する
+// f_sales_velocity_by_product → published snapshot が出来、Renderミラー
+// (mirror_pml_snapshot_rows.販売数{7,30}日_FBA以外) まで届いている。これを正にしてシート卒業する。
+//
+// FBA_NONFBA_SOURCE:
+//   'sheet'  (default): 従来どおり sku_mapping の non_fba_sales_*
+//   'pml'             : ミラーの商品管理リスト published snapshot を 商品コード(=代表ne_code)単位で採用。
+//                       snapshot が未公開/未同期/不整合なら sheet へ自動フォールバック (fail-safe)。
+//   'shadow'          : 本番は sheet を返すが pml との差分を log するだけ (観測用、非破壊)。
+// 突合キー = SKU の代表 ne_code (sort_order 先頭)。snapshot は m_products 全件網羅のため、
+// 「snapshot 在り & 該当 ne_code 無し」= その商品の他CH販売は 0 とみなす (0 採用)。
+// ★ このフラグは mirror 読み経路 (FBA_SKU_MAPPING_SOURCE=mirror) でのみ効く。sheet/shadow モードの
+//   getSkuMappings() は sku_mapping を素直に返すため non_fba も sheet のまま。本番は mirror 稼働中なのでOK。
+function getNonFbaSource() {
+  return (process.env.FBA_NONFBA_SOURCE || 'sheet').toLowerCase();
+}
+
+let _pmlNonFbaCache = null; // { at, map | null }
+// published snapshot の 商品コード→{n7,n30} Map。未公開/テーブル無し/mirror未init は null (=sheetフォールバック)。
+function getNonFbaFromPmlMap() {
+  const now = Date.now();
+  if (_pmlNonFbaCache && (now - _pmlNonFbaCache.at) < 60000) return _pmlNonFbaCache.map; // 日次更新なので60秒メモで十分
+  let map = null;
+  try {
+    const mdb = getMirrorDB();
+    const pub = mdb.prepare('SELECT run_id, status, row_count FROM mirror_pml_published WHERE id = 1').get();
+    if (pub && pub.run_id && pub.status === 'ok') {
+      const rows = mdb.prepare(
+        'SELECT 商品コード AS code, 販売数7日_FBA以外 AS n7, 販売数30日_FBA以外 AS n30 FROM mirror_pml_snapshot_rows WHERE run_id = ?'
+      ).all(pub.run_id);
+      // 整合性チェック: 行が空 / row_count と不一致 = 壊れた published とみなし sheet フォールバック。
+      //   (空Mapを「snapshot在り」と誤採用すると全SKUの他CH販売が 0 化してしまうため)
+      if (rows.length > 0 && (pub.row_count == null || rows.length === pub.row_count)) {
+        map = new Map();
+        for (const r of rows) map.set(normSku(r.code), { n7: Number(r.n7) || 0, n30: Number(r.n30) || 0 });
+      } else {
+        console.warn(`[FBA] mirror_pml published 不整合 (rows=${rows.length} / row_count=${pub.row_count} / status=${pub.status}) → non_fba は sheet フォールバック`);
+      }
+    }
+  } catch (e) {
+    map = null; // mirror_pml_* 未作成 / 未公開 / mirror 未init → sheet フォールバック
+  }
+  _pmlNonFbaCache = { at: now, map };
+  return map;
+}
+
+// 代表 ne_code から non_fba_sales を解決。pmlMap 不在(=snapshot無し)時は sheetRow にフォールバック。
+function resolveNonFba(repNe, sheetRow, pmlMap) {
+  if (pmlMap) {
+    const p = pmlMap.get(normSku(repNe));
+    return { non_fba_sales_7d: p?.n7 || 0, non_fba_sales_30d: p?.n30 || 0 };
+  }
+  return { non_fba_sales_7d: sheetRow?.non_fba_sales_7d || 0, non_fba_sales_30d: sheetRow?.non_fba_sales_30d || 0 };
+}
+
+// shadow: sheet と pml の non_fba_30d 集計差を log (1時間に1回)。切替前の本番検証用、非破壊。
+let _nonFbaShadowAt = 0;
+function logNonFbaShadowDiff(bySku, sheetMap) {
+  const now = Date.now();
+  if (now - _nonFbaShadowAt < 3600000) return;
+  _nonFbaShadowAt = now;
+  const pmlMap = getNonFbaFromPmlMap();
+  if (!pmlMap) { console.warn('[FBA shadow] non_fba: pml snapshot 無し → sheet のみ'); return; }
+  let n = 0, exact = 0, sheetSum = 0, pmlSum = 0, pml0sheetPos = 0, sheet0pmlPos = 0;
+  for (const [sku, compRows] of bySku) {
+    const sheetV = sheetMap.get(normSku(sku))?.non_fba_sales_30d || 0;
+    const pmlV = pmlMap.get(normSku(compRows[0]?.ne_code))?.n30 || 0;
+    n++; sheetSum += sheetV; pmlSum += pmlV;
+    if (sheetV === pmlV) exact++;
+    if (pmlV === 0 && sheetV > 0) pml0sheetPos++;
+    if (sheetV === 0 && pmlV > 0) sheet0pmlPos++;
+  }
+  const pct = n ? (exact / n * 100).toFixed(1) : '0';
+  console.log(`[FBA shadow] non_fba_30d sheet vs pml: n=${n} exact=${exact}(${pct}%) sheetSum=${sheetSum} pmlSum=${pmlSum} diff=${sheetSum - pmlSum} pml0&sheet>0=${pml0sheetPos} sheet0&pml>0=${sheet0pmlPos}`);
+}
+
 export function getSkuMappingsFromSheet() {
   return queryAll('SELECT * FROM sku_mapping ORDER BY amazon_sku');
 }
@@ -977,7 +1055,8 @@ export function getSkuMappingsFromSheet() {
 //   - is_set = 構成 > 1 or 単品でも qty > 1
 //   - set_components = [{ne_code, qty}] の JSON 文字列 (既存 DB shape 互換)
 //   - asin / fnsku = fba_sku_attrs 由来 (mirror には無い)
-//   - non_fba_sales_* = 当面 sku_mapping から持ち越し (正確な再計算は PR3)
+//   - non_fba_sales_* = 呼び出し側 (getSkuMappings*FromMirror) が FBA_NONFBA_SOURCE に応じて
+//       sheet(sku_mapping) か pml(商品管理リストsnapshot) で解決して nonFba 引数に渡す (PR3)
 //   - per_unit_volume / storage_type = null (元々 snap 由来、mapping 側未使用)
 function buildMirrorRow(amazonSku, compRows, attr, nonFba, registeredAt) {
   const components = compRows.map(c => ({ ne_code: c.ne_code, qty: c.quantity }));
@@ -1055,11 +1134,20 @@ export function getSkuMappingsFromMirror() {
   } catch (e) { /* mirror_sku_master 未作成 (旧 mirror) は登録日なしで続行 */ }
   const caseMap = buildAmazonSkuCaseMap();
 
+  // non_fba_sales のソース選択 (PR3)。pml モードのみ snapshot を引く (sheet/shadow は従来どおり sheet 値)。
+  const nonFbaSource = getNonFbaSource();
+  const pmlMap = (nonFbaSource === 'pml') ? getNonFbaFromPmlMap() : null;
+  if (nonFbaSource === 'pml' && !pmlMap) {
+    console.warn('[FBA] FBA_NONFBA_SOURCE=pml だが商品管理リスト snapshot が未公開/未同期 → sheet にフォールバック');
+  }
+  if (nonFbaSource === 'shadow') { try { logNonFbaShadowDiff(bySku, nonFba); } catch (e) { /* best-effort */ } }
+
   const result = [];
   for (const [sku, compRows] of bySku) {
     const k = normSku(sku);
     const origSku = caseMap.get(k) || sku; // 元ケース復元、無ければ小文字 fallback
-    result.push(buildMirrorRow(origSku, compRows, attrs.get(k), nonFba.get(k), regAt.get(k)));
+    const nf = resolveNonFba(compRows[0]?.ne_code, nonFba.get(k), pmlMap);
+    result.push(buildMirrorRow(origSku, compRows, attrs.get(k), nf, regAt.get(k)));
   }
   result.sort((x, y) => String(x.amazon_sku).localeCompare(String(y.amazon_sku)));
   return result;
@@ -1083,8 +1171,11 @@ function getSkuMappingFromMirror(amazonSku) {
     const mr = mdb.prepare('SELECT source_created_at FROM mirror_sku_master WHERE LOWER(TRIM(seller_sku)) = ?').get(k);
     registeredAt = mr?.source_created_at || null;
   } catch (e) { /* mirror_sku_master 未作成は無視 */ }
+  // non_fba_sales のソース選択 (PR3、list と同じ規則)。pml 不在は sheet フォールバック。
+  const pmlMap = (getNonFbaSource() === 'pml') ? getNonFbaFromPmlMap() : null;
+  const nf = resolveNonFba(compRows[0]?.ne_code, nfRows[0], pmlMap);
   // 呼び出し側が渡したケースをそのまま返す (元ケース保持)
-  return buildMirrorRow(amazonSku, compRows, attrRows[0], nfRows[0], registeredAt);
+  return buildMirrorRow(amazonSku, compRows, attrRows[0], nf, registeredAt);
 }
 
 // set_components (文字列 or 配列) を比較用の正規化文字列に (ne_code は case 無視、qty 含む)
