@@ -312,6 +312,24 @@ function fulfillmentInBilling(row) {
   return Math.max(0, Math.round(sum));
 }
 
+// by_segment のキーはモールで異なる（楽天/Qoo10等='売上合計'・'原価合計' / Yahoo='売上'・'原価'）。
+// 分母(按分基準 segSalesTotal)と分子(各segの sales)で必ず同じ解決を使うためヘルパー化する。
+// 「0 が正当値で別キーに非ゼロが残る」データでの誤フォールバックを避けるため != null で判定する。
+function pickNum(obj, keys) {
+  for (const k of keys) if (obj && obj[k] != null) return Number(obj[k]) || 0;
+  return 0;
+}
+// Amazon は手数料控除後ネットの '合計' ではなく gross の '商品売上' を使う
+// （後段で手数料/FBA運賃を再控除するため、ネットを使うと二重控除になる）。
+function segmentSales(mallId, segData) {
+  return mallId === 'amazon_jp'
+    ? pickNum(segData, ['商品売上'])
+    : pickNum(segData, ['売上合計', '売上', '合計', '商品売上']);
+}
+function segmentCost(segData) {
+  return pickNum(segData, ['原価合計', '原価']);
+}
+
 // 各モール集計テーブル(mart_*_monthly_summary)から指定月の mart_monthly_segment_sales を生成。
 // 各モールアプリは「確定」時のみ summary 行を作るため、行の存在 = そのモールの当月確定済み。
 function syncSegmentSalesForMonth(db, year_month, now) {
@@ -354,11 +372,8 @@ function syncSegmentSalesForMonth(db, year_month, now) {
       // excluded のキー: "4" （輸出）
       for (const [k, v] of Object.entries(excluded)) allSegs[k] = v;
 
-      // セグメント全体の売上合計（広告費・PF手数料按分の分母）。
-      // 按分の分子（各segの sales）と基準を揃える：Amazon は 商品売上(gross)、他は 売上合計。
-      const segSalesTotal = Object.values(allSegs).reduce((s, v) => s + (
-        mt.mall_id === 'amazon_jp' ? (v['商品売上'] || 0) : (v['売上合計'] || v['合計'] || v['商品売上'] || 0)
-      ), 0);
+      // セグメント全体の売上合計（広告費・PF手数料按分の分母）。各segの sales と同じ解決を使う。
+      const segSalesTotal = Object.values(allSegs).reduce((s, v) => s + segmentSales(mt.mall_id, v), 0);
 
       // PF手数料の全体値（テーブルカラムから取得）
       let pfFeeTotal = mt.feeField ? (Number(row[mt.feeField]) || 0) : 0;
@@ -426,13 +441,9 @@ function syncSegmentSalesForMonth(db, year_month, now) {
         const seg = segKey === 'other' ? null : parseInt(segKey);
         if (seg === null || isNaN(seg)) continue;
 
-        // 売上・原価（by_segmentの構造は売上合計/原価合計が標準）。
-        // Amazon の by_segment '合計' は手数料・FBA手数料を控除後のネットなので、これを売上に使うと
-        // 後段で手数料/FBA運賃を再控除して二重控除になる → Amazon は 商品売上(gross) を使う。
-        const sales = mt.mall_id === 'amazon_jp'
-          ? (segData['商品売上'] || 0)
-          : (segData['売上合計'] || segData['合計'] || segData['商品売上'] || 0);
-        const cost = segData['原価合計'] || 0;
+        // 売上・原価（モール別キー差は segmentSales/segmentCost が吸収。分母 segSalesTotal と同じ解決）。
+        const sales = segmentSales(mt.mall_id, segData);
+        const cost = segmentCost(segData);
 
         // PF手数料計算
         let pfFee = 0;
