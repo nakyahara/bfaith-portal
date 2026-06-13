@@ -24,6 +24,15 @@ import { evaluateItemForPublish } from './services/publish-pipeline.js';
 import { fetchAllItemCodes } from './lib/rakuten-rms-proxy.js';
 import { executePublish, isPublishEnabled, buildIdempotencyKey } from './services/publish-executor.js';
 import { translateReason, summarizeReasons, categorizeReason } from './lib/reason-translator.js';
+import {
+  excludeMigrationItem,
+  restoreMigrationExclusion,
+  changeExclusionKind,
+  listActiveExclusions,
+  listExclusionHistory,
+  countActiveByKind,
+  kindLabel,
+} from './lib/exclusion.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -278,6 +287,7 @@ router.get('/', (req, res) => {
   let products = [];
   let summary = { total: 0, actionable: 0, fixable: 0, done: 0 };
   let fixableByCategory = {};
+  let exclusionCount = { temporary: 0, permanent: 0, total: 0 };
   const filter = ['all', 'actionable', 'fixable', 'done'].includes(req.query.filter)
     ? req.query.filter
     : 'actionable'; // default は「すぐ移行できる」 = やるべきこと
@@ -291,6 +301,7 @@ router.get('/', (req, res) => {
     products = listed.products;
     summary = listed.summary;
     fixableByCategory = listed.fixableByCategory;
+    exclusionCount = countActiveByKind(db);
   } catch (_) {
     // DB 未初期化等は空 state で表示 continue
   }
@@ -311,9 +322,11 @@ router.get('/', (req, res) => {
     products,
     summary,
     fixableByCategory,
+    exclusionCount,                                       // E-7-c: 移行除外管理 header 集計
     filter,
     search,
     notionPageUrl,  // EJS から呼べるように
+    kindLabel,                                            // EJS から英語 enum → 日本語ラベル変換
   });
 });
 
@@ -545,6 +558,81 @@ router.post('/api/publish/idempotency-key', (req, res) => {
     return res.json({ idempotencyKey: key });
   } catch (e) {
     return res.status(500).json({ error: e.message });
+  }
+});
+
+// ───────────────── Phase E-7-c: 移行除外管理 API ─────────────────
+
+router.get('/api/exclusions', (req, res) => {
+  try {
+    const db = getDB();
+    const kind = req.query.kind ? String(req.query.kind) : null;
+    const search = req.query.q ? String(req.query.q) : '';
+    const items = listActiveExclusions(db, { kind, search });
+    const counts = countActiveByKind(db);
+    return res.json({ items, counts });
+  } catch (e) {
+    // Codex R1 Medium: assertKind 等の validation error は 400 にマップ
+    if (/exclusion:/.test(e.message)) return res.status(400).json({ status: 'fail', error: e.message });
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+router.get('/api/exclusions/history/:itemCode', (req, res) => {
+  try {
+    const db = getDB();
+    const history = listExclusionHistory(db, req.params.itemCode);
+    return res.json({ item_code: req.params.itemCode, history });
+  } catch (e) {
+    return res.status(400).json({ status: 'fail', error: e.message });
+  }
+});
+
+router.post('/api/exclusions', (req, res) => {
+  try {
+    const db = getDB();
+    const { itemCode, excludeKind, reason } = req.body || {};
+    const r = excludeMigrationItem({ db, itemCode, excludeKind, reason, actor: 'http' });
+    audit(db, 'migration_exclude', { id: r.id, itemCode: r.item_code, excludeKind: r.exclude_kind });
+    return res.status(201).json({ status: 'ok', ...r });
+  } catch (e) {
+    if (e.code === 'EXCLUSION_ALREADY_ACTIVE') return res.status(409).json({ status: 'fail', code: e.code, error: e.message });
+    // Codex R1 Medium: race で事前 select すり抜け → SQLite UNIQUE constraint error も 409 にマップ
+    //   (better-sqlite3 の SqliteError は code: 'SQLITE_CONSTRAINT_UNIQUE' を持つ)
+    if (e.code === 'SQLITE_CONSTRAINT_UNIQUE' && /idx_migration_excluded_active|migration_excluded/.test(e.message)) {
+      return res.status(409).json({ status: 'fail', code: 'EXCLUSION_ALREADY_ACTIVE', error: 'item_code already has an active exclusion (race)' });
+    }
+    if (/exclusion:/.test(e.message)) return res.status(400).json({ status: 'fail', error: e.message });
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+router.post('/api/exclusions/restore', (req, res) => {
+  try {
+    const db = getDB();
+    const { itemCode, reason } = req.body || {};
+    const r = restoreMigrationExclusion({ db, itemCode, reason, actor: 'http' });
+    audit(db, 'migration_exclude_restore', { restored_id: r.restored_id, itemCode: r.item_code, priorKind: r.prior_kind });
+    return res.json({ status: 'ok', ...r });
+  } catch (e) {
+    if (e.code === 'EXCLUSION_NOT_ACTIVE') return res.status(404).json({ status: 'fail', code: e.code, error: e.message });
+    if (/exclusion:/.test(e.message)) return res.status(400).json({ status: 'fail', error: e.message });
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+router.post('/api/exclusions/change-kind', (req, res) => {
+  try {
+    const db = getDB();
+    const { itemCode, newKind, reason } = req.body || {};
+    const r = changeExclusionKind({ db, itemCode, newKind, reason, actor: 'http' });
+    audit(db, 'migration_exclude_change_kind', { restoredId: r.restored_id, newId: r.new_id, itemCode: r.item_code, priorKind: r.prior_kind, newKind: r.new_kind });
+    return res.json({ status: 'ok', ...r });
+  } catch (e) {
+    if (e.code === 'EXCLUSION_NOT_ACTIVE') return res.status(404).json({ status: 'fail', code: e.code, error: e.message });
+    if (e.code === 'EXCLUSION_KIND_UNCHANGED') return res.status(409).json({ status: 'fail', code: e.code, error: e.message });
+    if (/exclusion:/.test(e.message)) return res.status(400).json({ status: 'fail', error: e.message });
+    return res.status(500).json({ status: 'fail', error: e.message });
   }
 });
 
