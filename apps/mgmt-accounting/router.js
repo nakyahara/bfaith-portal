@@ -252,6 +252,18 @@ const MALL_TABLES = [
   { table: 'mart_amazon_usa_monthly_summary', mall_id: 'amazon_usa', adField: 'ad_cost', feeField: null },
 ];
 
+// 仕訳書(billing)の「素通り金額」= 楽天ペイ等が顧客から集めた決済金の店舗への入金。
+// これは費用(手数料)ではなく単なる入金で、本来は仕訳書の 支払/相殺区分='相殺'。
+// 確定時のクライアント計算は請求行のみ合計するため正しいが、byCategory に集計された後は
+// 支払/相殺区分が失われるため、下の backfill では品目名で識別して PF手数料 から除外する。
+// 例: 「楽天ﾍﾟｲ_決済金等」(売上の約半分に達する巨額) を手数料に混ぜると粗利が大きく潰れる。
+const SETTLEMENT_PASSTHROUGH_KEYWORDS = ['決済金等', '決済金'];
+function isSettlementPassthrough(name) {
+  const s = String(name || '');
+  if (s.includes('手数料')) return false; // 「後払い決済_手数料」等は費用なので除外しない
+  return SETTLEMENT_PASSTHROUGH_KEYWORDS.some(k => s.includes(k));
+}
+
 // 楽天/Yahoo の pf_fee 未保存(列追加前に確定された既存)月向け: billing から PF手数料を
 // best-effort 再計算。再確定すれば app が正確値を pf_fee に保存して上書きする。
 // pf_fee は他モール(auPay/Qoo10/LINEギフト/メルカリ)と同様 税込ベースで揃える。
@@ -265,12 +277,15 @@ function backfillBillingPfFee(mallId, row) {
   if (!Array.isArray(billing)) return 0;
   const adCost = Number(row.ad_cost) || 0;
   if (mallId === 'yahoo') {
-    // Yahoo: 請求合計(税込) − 広告費（byCategory は請求明細のみ＝正確）
+    // Yahoo: 請求合計(税込) − 広告費（byCategory は請求明細のみ＝正確）。
+    // Yahoo の確定側(yahoo-accounting)も決済金除外をしておらず、素通り決済金が混ざる仕様も
+    // 確認できていないため、ここでは楽天のような除外はしない(再確定値との不一致を避ける)。
     const totalTaxIncl = billing.reduce((s, c) => s + (Number(c['金額(税込)']) || 0), 0);
     return Math.max(0, Math.round(totalTaxIncl - adCost));
   }
-  // 楽天: 請求合計(税込) − 広告費 − クーポン値引（byCategory は支払/相殺も含むため概算）
-  const totalTaxIncl = billing.reduce((s, c) => s + (Number(c['税込合計']) || 0), 0);
+  // 楽天: 請求合計(税込) − 広告費 − クーポン値引（決済金等の素通り入金は除外）
+  const totalTaxIncl = billing.reduce((s, c) =>
+    isSettlementPassthrough(c['品目']) ? s : s + (Number(c['税込合計']) || 0), 0);
   let coupon = 0;
   try {
     const byTax = JSON.parse(row.by_tax || '{}');
