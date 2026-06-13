@@ -154,6 +154,15 @@
         <a href="?filter=actionable" class="btn btn-sm filter-chip <%= filter === 'actionable' ? 'btn-success' : 'btn-outline-success' %>">🟢 出せる (<%= summary.actionable %>)</a>
         <a href="?filter=fixable" class="btn btn-sm filter-chip <%= filter === 'fixable' ? 'btn-warning' : 'btn-outline-warning' %>">🟡 修正必要 (<%= summary.fixable %>)</a>
         <a href="?filter=done" class="btn btn-sm filter-chip <%= filter === 'done' ? 'btn-secondary' : 'btn-outline-secondary' %>">✅ 移行済み (<%= summary.done %>)</a>
+        <% if (summary.excluded > 0) { %>
+          <a href="?filter=excluded" class="btn btn-sm filter-chip <%= filter === 'excluded' ? 'btn-danger' : 'btn-outline-danger' %>">🚫 除外中 (<%= summary.excluded %>)</a>
+        <% } %>
+        <% if (summary.stale > 0) { %>
+          <a href="?filter=stale" class="btn btn-sm filter-chip <%= filter === 'stale' ? 'btn-secondary' : 'btn-outline-secondary' %>">⚪ 楽天で消えた (<%= summary.stale %>)</a>
+        <% } %>
+        <% if (summary.orphan > 0) { %>
+          <a href="?filter=orphan" class="btn btn-sm filter-chip <%= filter === 'orphan' ? 'btn-info' : 'btn-outline-info' %>">📦 救済 (<%= summary.orphan %>)</a>
+        <% } %>
       </div>
 
       <% if (products.length === 0) { %>
@@ -184,9 +193,16 @@
                   <% if (p.status === 'actionable') { %>🟢
                   <% } else if (p.status === 'fixable') { %>🟡
                   <% } else if (p.status === 'done') { %>✅
+                  <% } else if (p.status === 'excluded') { %>🚫
+                  <% } else if (p.status === 'stale') { %>⚪
+                  <% } else if (p.status === 'orphan') { %>📦
                   <% } else { %>⚪<% } %>
                 </span>
                 <%= p.yahooTitle || '(タイトル未入力)' %>
+                <%# Codex R2 D-2: 「Yahoo に手動 publish された除外商品」 の「移行済み (除外指定済)」 バッジ %>
+                <% if (p.status === 'excluded' && p.isDone) { %>
+                  <span class="badge bg-success ms-1 small">移行済み (除外指定済)</span>
+                <% } %>
               </p>
               <div class="product-meta">
                 <code><%= p.itemCode %></code>
@@ -205,9 +221,30 @@
 
               <% if (p.status === 'done') { %>
                 <div class="product-done-meta">
-                  ✅ <% if (p.publishCompletedAt) { %>
-                    <code><%= p.publishCompletedAt %></code> に登録
-                  <% } else { %>登録済み<% } %>
+                  ✅ <% if (p.yahooObservedCode) { %>Yahoo で観測済み<% } else if (p.publishCompletedAt) { %>
+                    <code><%= p.publishCompletedAt %></code> に登録<% } else { %>登録済み<% } %>
+                </div>
+              <% } %>
+
+              <% if (p.status === 'excluded') { %>
+                <div class="product-reason" style="background: #ffeaea; border-left-color: #d9534f;">
+                  🚫 <%= p.exclusionKind === 'permanent' ? '永続除外' : '一時除外' %>
+                  <% if (p.exclusionReason) { %>： <%= p.exclusionReason %><% } %>
+                  <% if (p.exclusionAt) { %>
+                    <span class="text-muted small">（<%= p.exclusionAt %>）</span>
+                  <% } %>
+                </div>
+              <% } %>
+
+              <% if (p.status === 'stale') { %>
+                <div class="product-reason" style="background: #f0f0f0; border-left-color: #6c757d;">
+                  ⚪ 楽天で確認できなくなった (連続欠落カウント済み)
+                </div>
+              <% } %>
+
+              <% if (p.status === 'orphan') { %>
+                <div class="product-reason" style="background: #e0f2ff; border-left-color: #17a2b8;">
+                  📦 Notion にはあるが現在の楽天差分にない (廃番 / 候補化前 / 楽天未登録)
                 </div>
               <% } %>
             </div>
@@ -227,7 +264,7 @@
                 <% if (p.notionPageId) { %>
                   <a href="<%= notionPageUrl(p.notionPageId) %>" target="_blank" class="btn btn-warning btn-sm">📝 Notion で修正</a>
                 <% } %>
-              <% } else if (p.status === 'done') { %>
+              <% } else if (p.status === 'done' || p.status === 'excluded' || p.status === 'stale' || p.status === 'orphan') { %>
                 <% if (p.notionPageId) { %>
                   <a href="<%= notionPageUrl(p.notionPageId) %>" target="_blank" class="btn btn-outline-secondary btn-sm">📝 Notion で開く</a>
                 <% } %>
