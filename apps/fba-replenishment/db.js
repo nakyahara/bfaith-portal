@@ -545,6 +545,54 @@ export async function initDb() {
     )
   `);
 
+  // --- 17. picking_barcode_master: P-touch ラベル用バーコードマスタ (商品ID→バーコード、置換保存) ---
+  db.run(`
+    CREATE TABLE IF NOT EXISTS picking_barcode_master (
+      logizard_code TEXT PRIMARY KEY,
+      barcode TEXT,
+      updated_at TEXT DEFAULT (datetime('now','localtime'))
+    )
+  `);
+
+  // --- 18. picking_dodai_master: 土台商品マスタ (土台商品の SKU のみ保持、置換保存) ---
+  db.run(`
+    CREATE TABLE IF NOT EXISTS picking_dodai_master (
+      sku TEXT PRIMARY KEY,
+      updated_at TEXT DEFAULT (datetime('now','localtime'))
+    )
+  `);
+
+  // --- 19. picking_master_audit: マスタ更新の監査ログ (Codex #1: 更新日時/件数/置換前後) ---
+  db.run(`
+    CREATE TABLE IF NOT EXISTS picking_master_audit (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      master_type TEXT NOT NULL,
+      filename TEXT,
+      prev_count INTEGER,
+      new_count INTEGER,
+      uploaded_by TEXT,
+      uploaded_at TEXT DEFAULT (datetime('now','localtime'))
+    )
+  `);
+
+  // --- 20. picking_run_history: ピッキング準備の実行履歴 (Codex #8: その日何を出したか後追い) ---
+  db.run(`
+    CREATE TABLE IF NOT EXISTS picking_run_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_at TEXT DEFAULT (datetime('now','localtime')),
+      run_by TEXT,
+      plan_files TEXT,
+      lz_filename TEXT,
+      picking_count INTEGER,
+      label_count INTEGER,
+      plan_sheet_count INTEGER,
+      warning_count INTEGER,
+      summary TEXT,
+      warnings TEXT,
+      result TEXT
+    )
+  `);
+
   saveToFile();
   console.log('[FBA-DB] 初期化完了');
 }
@@ -966,6 +1014,11 @@ export function replaceWarehouseInventory(items) {
 // 切替の本番化は PR4。PR2 では default sheet / shadow とも本番挙動を変えない。
 function getSkuMappingSource() {
   return process.env.FBA_SKU_MAPPING_SOURCE || 'sheet';
+}
+
+// マッピングのデータソース (sheet / mirror / shadow) を外部に公開 (ピッキング準備画面の透明化用)
+export function getSkuMappingSourceMode() {
+  return getSkuMappingSource();
 }
 
 // ===== non_fba_sales (他チャネル=FBA以外の販売数) のソース選択 (PR3) =====
@@ -2071,4 +2124,122 @@ export function getExportHistoryList() {
 
 export function getExportHistoryFile(id) {
   return queryOne(`SELECT * FROM export_history WHERE id = ?`, [id]);
+}
+
+// ===== ピッキング準備: マスタ永続化 + 監査 + 実行履歴 =====
+
+function insertMasterAudit(masterType, filename, prevCount, newCount, uploadedBy) {
+  db.run(
+    `INSERT INTO picking_master_audit (master_type, filename, prev_count, new_count, uploaded_by) VALUES (?, ?, ?, ?, ?)`,
+    [masterType, filename || null, prevCount, newCount, uploadedBy || null]
+  );
+}
+
+// バーコードマスタを全置換 (商品ID→バーコード)。rows: [{ logizard_code, barcode }]
+export function replaceBarcodeMaster(rows, meta = {}) {
+  const prev = queryOne('SELECT COUNT(*) AS c FROM picking_barcode_master')?.c || 0;
+  db.run('BEGIN TRANSACTION');
+  try {
+    db.run('DELETE FROM picking_barcode_master');
+    for (const r of rows) {
+      if (!r.logizard_code) continue;
+      db.run(
+        `INSERT OR REPLACE INTO picking_barcode_master (logizard_code, barcode) VALUES (?, ?)`,
+        [r.logizard_code, r.barcode || '']
+      );
+    }
+    const newCount = queryOne('SELECT COUNT(*) AS c FROM picking_barcode_master')?.c || 0;
+    insertMasterAudit('barcode', meta.filename, prev, newCount, meta.uploadedBy);
+    db.run('COMMIT');
+    saveToFile();
+    return { prev, count: newCount };
+  } catch (e) {
+    db.run('ROLLBACK');
+    throw e;
+  }
+}
+
+export function getBarcodeMaster() {
+  return queryAll('SELECT logizard_code, barcode FROM picking_barcode_master');
+}
+
+// 土台商品マスタを全置換 (土台商品の SKU のみ)。rows: [{ sku }]
+export function replaceDodaiMaster(rows, meta = {}) {
+  const prev = queryOne('SELECT COUNT(*) AS c FROM picking_dodai_master')?.c || 0;
+  db.run('BEGIN TRANSACTION');
+  try {
+    db.run('DELETE FROM picking_dodai_master');
+    for (const r of rows) {
+      if (!r.sku) continue;
+      db.run(`INSERT OR REPLACE INTO picking_dodai_master (sku) VALUES (?)`, [r.sku]);
+    }
+    const newCount = queryOne('SELECT COUNT(*) AS c FROM picking_dodai_master')?.c || 0;
+    insertMasterAudit('dodai', meta.filename, prev, newCount, meta.uploadedBy);
+    db.run('COMMIT');
+    saveToFile();
+    return { prev, count: newCount };
+  } catch (e) {
+    db.run('ROLLBACK');
+    throw e;
+  }
+}
+
+export function getDodaiMaster() {
+  return queryAll('SELECT sku FROM picking_dodai_master');
+}
+
+// 両マスタの件数 + 最終更新日時 + 直近監査
+export function getPickingMasterStatus() {
+  const barcode = queryOne(
+    `SELECT COUNT(*) AS count, MAX(updated_at) AS updated_at FROM picking_barcode_master`
+  ) || { count: 0, updated_at: null };
+  const dodai = queryOne(
+    `SELECT COUNT(*) AS count, MAX(updated_at) AS updated_at FROM picking_dodai_master`
+  ) || { count: 0, updated_at: null };
+  const audit = queryAll(
+    `SELECT master_type, filename, prev_count, new_count, uploaded_by, uploaded_at
+     FROM picking_master_audit ORDER BY id DESC LIMIT 10`
+  );
+  return { barcode, dodai, audit };
+}
+
+// 実行履歴を保存し、id を返す。type別に最新100件を保持。
+export function savePickingRun(rec) {
+  db.run(
+    `INSERT INTO picking_run_history
+       (run_by, plan_files, lz_filename, picking_count, label_count, plan_sheet_count, warning_count, summary, warnings, result)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      rec.run_by || null,
+      JSON.stringify(rec.plan_files || []),
+      rec.lz_filename || null,
+      rec.picking_count || 0,
+      rec.label_count || 0,
+      rec.plan_sheet_count || 0,
+      rec.warning_count || 0,
+      JSON.stringify(rec.summary || {}),
+      JSON.stringify(rec.warnings || []),
+      JSON.stringify(rec.result || {}),
+    ]
+  );
+  const idRow = queryOne('SELECT last_insert_rowid() AS id');
+  // 最新100件を超えたら古い履歴を削除
+  const oldest = queryAll(
+    `SELECT id FROM picking_run_history ORDER BY id DESC LIMIT -1 OFFSET 100`
+  );
+  for (const row of oldest) db.run(`DELETE FROM picking_run_history WHERE id = ?`, [row.id]);
+  saveToFile();
+  return idRow?.id;
+}
+
+export function getPickingRuns(limit = 30) {
+  return queryAll(
+    `SELECT id, run_at, run_by, plan_files, lz_filename, picking_count, label_count, plan_sheet_count, warning_count
+     FROM picking_run_history ORDER BY id DESC LIMIT ?`,
+    [limit]
+  );
+}
+
+export function getPickingRun(id) {
+  return queryOne(`SELECT * FROM picking_run_history WHERE id = ?`, [id]);
 }

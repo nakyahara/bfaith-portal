@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title><%= title %></title>
+  <style>
+    body { font-family: "Hiragino Sans", "Meiryo", sans-serif; margin: 12px; color: #111; }
+    h2 { font-size: 16px; margin: 4px 0 8px; }
+    h3 { font-size: 14px; margin: 16px 0 6px; }
+    table { width: 100%; border-collapse: collapse; font-size: 11px; }
+    th, td { border: 1px solid #999; padding: 3px 5px; text-align: left; vertical-align: top; }
+    th { background: #e0e0e0; font-weight: bold; }
+    tbody tr:nth-child(even) { background: #f5f5f5; }
+    tr.dodai-row { background: #fde2e2 !important; }
+    .dodai-tag { color: #b91c1c; font-weight: bold; }
+    .meta { font-size: 11px; color: #555; margin-bottom: 8px; }
+    .toolbar { margin-bottom: 12px; }
+    .toolbar button, .toolbar a { padding: 8px 16px; font-size: 13px; border: 1px solid #ccc; border-radius: 6px; background: #2563eb; color: #fff; cursor: pointer; text-decoration: none; }
+    .toolbar a.sec { background: #e5e7eb; color: #374151; }
+    .plan-sheet { page-break-before: always; }
+    .plan-sheet:first-of-type { page-break-before: avoid; }
+    .planno { white-space: pre-line; }
+    @media print {
+      .toolbar { display: none; }
+      body { margin: 0; }
+      thead { display: table-header-group; }
+    }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <button onclick="window.print()">🖨 印刷 / PDF保存</button>
+    <a class="sec" href="/apps/fba-replenishment/picking-prep">&larr; 戻る</a>
+    <a class="sec" href="?view=picking">ピッキングリストのみ</a>
+    <a class="sec" href="?view=plan">プラン別シートのみ</a>
+    <a class="sec" href="?view=all">両方</a>
+  </div>
+
+  <div class="meta">実行ID: <%= runId %> / 実行日時: <%= runAt %></div>
+
+  <% if (view === 'all' || view === 'picking') { %>
+    <h2>納品ピッキングリスト</h2>
+    <table>
+      <thead>
+        <tr><th>ブロック略称</th><th>ロケーション</th><th>商品ID</th><th>商品名</th><th>納品プランNo</th><th>土台商品</th></tr>
+      </thead>
+      <tbody>
+        <% pickingRows.forEach(function(r){ %>
+          <tr class="<%= r.dodai ? 'dodai-row' : '' %>">
+            <td><%= r.block %></td>
+            <td><%= r.location %></td>
+            <td><%= r.code %></td>
+            <td><%= r.name %></td>
+            <td class="planno"><%= r.planNo %></td>
+            <td><% if (r.dodai) { %><span class="dodai-tag"><%= r.dodai %></span><% } %></td>
+          </tr>
+        <% }); %>
+      </tbody>
+    </table>
+  <% } %>
+
+  <% if (view === 'all' || view === 'plan') { %>
+    <% planSheets.forEach(function(ps){ %>
+      <div class="plan-sheet">
+        <h3><%= ps.sheet %> (<%= ps.plan %> / <%= ps.kind %>) — プランNo接頭辞: <%= ps.label %></h3>
+        <table>
+          <thead>
+            <tr><th>No</th><th>FNSKU</th><th>SKU</th><th>商品コード</th><th>数量</th><th>ラベル貼り担当者</th><th>確認担当者</th><th>納品箱No</th><th>土台</th></tr>
+          </thead>
+          <tbody>
+            <% ps.rows.forEach(function(row){ %>
+              <tr class="<%= row.isDodai ? 'dodai-row' : '' %>">
+                <td><%= row.no %></td>
+                <td><%= row.fnsku %></td>
+                <td><%= row.sku %></td>
+                <td><%= row.code %></td>
+                <td><%= row.qty %></td>
+                <td></td>
+                <td></td>
+                <td></td>
+                <td><% if (row.isDodai) { %><span class="dodai-tag">土台</span><% } %></td>
+              </tr>
+            <% }); %>
+          </tbody>
+        </table>
+      </div>
+    <% }); %>
+  <% } %>
+</body>
+</html>
