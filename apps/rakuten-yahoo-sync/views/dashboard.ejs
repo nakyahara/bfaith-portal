@@ -21,7 +21,30 @@
       background: #fff; border-radius: .75rem; padding: 1rem 1.25rem; margin-bottom: .75rem;
       box-shadow: 0 1px 2px rgba(0,0,0,.04); display: grid;
       grid-template-columns: 56px 1fr auto; gap: 1rem; align-items: center;
+      cursor: pointer;
     }
+    .product-card:hover { box-shadow: 0 2px 8px rgba(0,0,0,.08); }
+    .product-card .actions, .product-card .actions a, .product-card .actions button { cursor: pointer; }
+    /* drawer */
+    .drawer-backdrop {
+      display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      background: rgba(0,0,0,.4); z-index: 1080;
+    }
+    .drawer-backdrop.show { display: block; }
+    .drawer-panel {
+      position: fixed; top: 0; right: 0; width: 680px; max-width: 95vw; height: 100%;
+      background: #fff; box-shadow: -4px 0 12px rgba(0,0,0,.15); z-index: 1090;
+      transform: translateX(100%); transition: transform .25s ease; overflow-y: auto;
+    }
+    .drawer-backdrop.show .drawer-panel { transform: translateX(0); }
+    .drawer-section { padding: 1rem 1.25rem; border-bottom: 1px solid #eee; }
+    .drawer-section:last-child { border-bottom: none; }
+    .drawer-section h6 { margin-bottom: .5rem; font-weight: 600; color: #333; }
+    .drawer-section dl { margin: 0; }
+    .drawer-section dt { font-size: .8rem; color: #6c757d; font-weight: normal; margin-top: .3rem; }
+    .drawer-section dd { margin: 0 0 .25rem 0; font-size: .95rem; }
+    .drawer-history-row { font-size: .85rem; padding: .35rem 0; border-bottom: 1px solid #f4f4f4; }
+    .drawer-history-row:last-child { border-bottom: none; }
     .thumb-placeholder {
       width: 56px; height: 56px; border-radius: .5rem; background: #e9ecef;
       display: flex; align-items: center; justify-content: center;
@@ -183,7 +206,7 @@
         </div>
       <% } else { %>
         <% for (const p of products) { %>
-          <div class="product-card">
+          <div class="product-card js-open-detail" data-item-code="<%= p.itemCode %>" role="button" tabindex="0" aria-label="<%= p.itemCode %> の詳細を見る">
             <div class="thumb-placeholder">
               <%= (p.yahooTitle || p.itemCode).slice(0, 1).toUpperCase() %>
             </div>
@@ -318,6 +341,19 @@
     </div>
 
     <div id="actionResult"></div>
+  </div>
+
+  <!-- 商品詳細ドロワー (Phase E-6-2) -->
+  <div id="detailDrawerBackdrop" class="drawer-backdrop" role="dialog" aria-modal="true" aria-labelledby="detailDrawerTitle">
+    <div id="detailDrawerPanel" class="drawer-panel">
+      <div class="drawer-section" style="display:flex; justify-content:space-between; align-items:center; padding-top:.75rem; padding-bottom:.75rem;">
+        <h5 id="detailDrawerTitle" class="mb-0">商品詳細</h5>
+        <button class="btn-close js-close-detail-drawer" aria-label="閉じる"></button>
+      </div>
+      <div id="detailDrawerContent">
+        <div class="drawer-section text-muted small">読み込み中...</div>
+      </div>
+    </div>
   </div>
 
   <!-- 楽天↔Yahoo 差分再取得 進行モーダル (Phase E-7-e) -->
@@ -803,6 +839,219 @@ async function triggerDiffSync() {
   }
 }
 
+// ───── 商品詳細ドロワー (Phase E-6-2) ─────
+// Codex R1 Medium-1: open 時の focus を覚えて、 閉じた時に復帰させる (キーボード操作のアクセシビリティ)
+let _drawerPreviouslyFocused = null;
+
+// Codex R1 High: 可変文字列を innerHTML に連結しない。 static class のみ wrap、 message は textContent。
+function drawerMessage(className, message) {
+  const div = document.createElement('div');
+  div.className = className;
+  div.textContent = message;
+  return div;
+}
+
+function openDetailDrawer(itemCode) {
+  const backdrop = document.getElementById('detailDrawerBackdrop');
+  const content = document.getElementById('detailDrawerContent');
+  document.getElementById('detailDrawerTitle').textContent = '商品詳細: ' + itemCode;
+  content.replaceChildren(drawerMessage('drawer-section text-muted small', '読み込み中...'));
+  backdrop.classList.add('show');
+  _drawerPreviouslyFocused = document.activeElement;
+  // close button に focus 移動 (drawer 内のキーボード操作)
+  setTimeout(() => {
+    const closeBtn = backdrop.querySelector('.js-close-detail-drawer');
+    if (closeBtn) closeBtn.focus();
+  }, 50);
+  fetchDetailAndRender(itemCode);
+}
+
+function closeDetailDrawer() {
+  document.getElementById('detailDrawerBackdrop').classList.remove('show');
+  // focus 復帰
+  if (_drawerPreviouslyFocused && typeof _drawerPreviouslyFocused.focus === 'function') {
+    try { _drawerPreviouslyFocused.focus(); } catch (_) {}
+  }
+  _drawerPreviouslyFocused = null;
+}
+
+async function fetchDetailAndRender(itemCode) {
+  const content = document.getElementById('detailDrawerContent');
+  try {
+    const res = await fetch('/apps/rakuten-yahoo-sync/api/products/' + encodeURIComponent(itemCode) + '/detail');
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      // Codex R1 High: data.error は server から来た任意文字列 → textContent で出す
+      content.replaceChildren(drawerMessage(
+        'drawer-section alert alert-danger small',
+        '読み込み失敗: ' + (data.error || ('HTTP ' + res.status))
+      ));
+      return;
+    }
+    const data = await res.json();
+    content.replaceChildren(buildDetailContent(data));
+  } catch (e) {
+    // Codex R1 High: e.message も textContent で出す
+    content.replaceChildren(drawerMessage(
+      'drawer-section alert alert-danger small',
+      'ネットワークエラー: ' + e.message
+    ));
+  }
+}
+
+function fragment() { return document.createDocumentFragment(); }
+function el(tag, opts = {}) {
+  const e = document.createElement(tag);
+  if (opts.className) e.className = opts.className;
+  if (opts.text !== undefined) e.textContent = opts.text;
+  if (opts.html !== undefined) e.innerHTML = opts.html;
+  return e;
+}
+function dlSection(title, items) {
+  const sec = el('div', { className: 'drawer-section' });
+  sec.appendChild(el('h6', { text: title }));
+  const dl = el('dl');
+  for (const [label, value] of items) {
+    if (value === null || value === undefined || value === '') continue;
+    const dt = el('dt', { text: label });
+    const dd = el('dd');
+    if (typeof value === 'string' || typeof value === 'number') {
+      dd.textContent = String(value);
+    } else if (value instanceof Node) {
+      dd.appendChild(value);
+    }
+    dl.appendChild(dt);
+    dl.appendChild(dd);
+  }
+  if (dl.children.length === 0) sec.appendChild(el('div', { className: 'text-muted small', text: '(データなし)' }));
+  else sec.appendChild(dl);
+  return sec;
+}
+
+function buildDetailContent(data) {
+  const frag = fragment();
+
+  // 基本情報 (candidate)
+  if (data.candidate) {
+    frag.appendChild(dlSection('🛒 候補メタ', [
+      ['楽天商品コード', data.candidate.item_code],
+      ['楽天 manage_number', data.candidate.rakuten_manage_number],
+      ['候補ステータス', data.candidate.status],
+      ['初検出日時', data.candidate.first_detected_at],
+      ['最終検出日時', data.candidate.last_detected_at],
+      ['楽天最終観測', data.candidate.last_seen_in_rakuten_at],
+      ['Yahoo 最終比較', data.candidate.last_checked_yahoo_baseline_at],
+      ['楽天で連続欠落数', data.candidate.missing_rakuten_count],
+      ['stale 化日時', data.candidate.stale_at],
+      ['resolved 日時', data.candidate.resolved_at],
+    ]));
+  } else {
+    frag.appendChild(el('div', { className: 'drawer-section text-muted small', text: '⚠ migration_candidates に登録なし (orphan 扱い)' }));
+  }
+
+  // Notion
+  if (data.notion) {
+    const pageLink = data.notionPageUrl ? (() => {
+      const a = el('a', { text: 'Notion で開く' });
+      a.href = data.notionPageUrl; a.target = '_blank'; a.rel = 'noopener noreferrer';
+      return a;
+    })() : null;
+    frag.appendChild(dlSection('📝 Notion 上書き値', [
+      ['Yahoo!タイトル', data.notion.yahoo_title],
+      ['売価', data.notion.yahoo_price !== null && data.notion.yahoo_price !== undefined ? '¥' + Number(data.notion.yahoo_price).toLocaleString() : null],
+      ['佐川価格', data.notion.yahoo_price_sagawa !== null && data.notion.yahoo_price_sagawa !== undefined ? '¥' + Number(data.notion.yahoo_price_sagawa).toLocaleString() : null],
+      ['配送方法', data.notion.notion_delivery_label],
+      ['税率', data.notion.notion_tax_rate],
+      ['Notion ステータス', data.notion.notion_status],
+      ['Notion 同期日時', data.notion.synced_at],
+      ['Notion ページ', pageLink],
+    ]));
+  } else {
+    frag.appendChild(el('div', { className: 'drawer-section', html: '<h6>📝 Notion 上書き値</h6><div class="text-muted small">(Notion 商品マスターに該当行なし)</div>' }));
+  }
+
+  // Yahoo 観測
+  if (data.yahoo) {
+    frag.appendChild(dlSection('✅ Yahoo!ショッピング観測', [
+      ['Yahoo ItemCode', data.yahoo.yahoo_item_code],
+      ['HasSubCode', data.yahoo.has_sub_code ? 'true' : 'false'],
+      ['最終観測日時', data.yahoo.last_seen_at],
+      ['source', data.yahoo.source],
+    ]));
+  } else {
+    frag.appendChild(el('div', { className: 'drawer-section', html: '<h6>✅ Yahoo!ショッピング観測</h6><div class="text-muted small">(まだ Yahoo に居ません)</div>' }));
+  }
+
+  // readiness
+  if (data.readiness) {
+    const sec = el('div', { className: 'drawer-section' });
+    sec.appendChild(el('h6', { text: '🔍 readiness 評価' }));
+    const dl = el('dl');
+    dl.appendChild(el('dt', { text: 'ステータス' }));
+    dl.appendChild(el('dd', { text: data.readiness.status || '(未評価)' }));
+    if (data.readiness.lastReadinessAt) {
+      dl.appendChild(el('dt', { text: '最終評価日時' }));
+      dl.appendChild(el('dd', { text: data.readiness.lastReadinessAt }));
+    }
+    if (data.readiness.blockedReasonsTranslated?.length > 0) {
+      dl.appendChild(el('dt', { text: '不備理由' }));
+      const dd = el('dd');
+      const ul = el('ul'); ul.style.margin = '0'; ul.style.paddingLeft = '1.2em';
+      for (const r of data.readiness.blockedReasonsTranslated) {
+        ul.appendChild(el('li', { text: r.message + (r.notionField ? '（' + r.notionField + '）' : '') }));
+      }
+      dd.appendChild(ul);
+      dl.appendChild(dd);
+    }
+    sec.appendChild(dl);
+    frag.appendChild(sec);
+  }
+
+  // publish 履歴
+  const pubSec = el('div', { className: 'drawer-section' });
+  pubSec.appendChild(el('h6', { text: '▶️ Yahoo 登録履歴' }));
+  if (!data.publishHistory || data.publishHistory.length === 0) {
+    pubSec.appendChild(el('div', { className: 'text-muted small', text: '(登録試行なし)' }));
+  } else {
+    for (const p of data.publishHistory) {
+      const row = el('div', { className: 'drawer-history-row' });
+      const status = el('span');
+      status.textContent = (p.status === 'success' ? '✅ ' : p.status === 'failed' ? '❌ ' : p.status === 'not_implemented' ? '🧪 ' : '⚪ ') + p.status;
+      row.appendChild(status);
+      row.appendChild(el('span', { className: 'text-muted small ms-2', text: (p.completed_at || p.created_at || '') + (p.attempt > 1 ? ' (試行 ' + p.attempt + ')' : '') }));
+      if (p.error_message) {
+        row.appendChild(el('div', { className: 'small text-danger', text: p.error_message }));
+      }
+      pubSec.appendChild(row);
+    }
+  }
+  frag.appendChild(pubSec);
+
+  // 除外履歴
+  const excSec = el('div', { className: 'drawer-section' });
+  excSec.appendChild(el('h6', { text: '🚫 除外履歴' }));
+  if (!data.exclusionHistory || data.exclusionHistory.length === 0) {
+    excSec.appendChild(el('div', { className: 'text-muted small', text: '(除外履歴なし)' }));
+  } else {
+    for (const ex of data.exclusionHistory) {
+      const row = el('div', { className: 'drawer-history-row' });
+      const kindLabel = ex.exclude_kind === 'permanent' ? '永続除外' : '一時除外';
+      const status = ex.restored_at ? '↩ 復元済み' : '🔴 active';
+      row.appendChild(el('strong', { text: kindLabel }));
+      row.appendChild(el('span', { className: 'ms-2 small', text: status }));
+      row.appendChild(el('div', { className: 'small', text: '理由: ' + (ex.reason || '(なし)') }));
+      row.appendChild(el('div', { className: 'small text-muted', text: '除外: ' + ex.excluded_at + (ex.excluded_by ? ' / ' + ex.excluded_by : '') }));
+      if (ex.restored_at) {
+        row.appendChild(el('div', { className: 'small text-muted', text: '復元: ' + ex.restored_at + (ex.restored_by ? ' / ' + ex.restored_by : '') + (ex.restored_reason ? ' / 理由: ' + ex.restored_reason : '') }));
+      }
+      excSec.appendChild(row);
+    }
+  }
+  frag.appendChild(excSec);
+
+  return frag;
+}
+
 // 起動時 event 配線
 document.addEventListener('DOMContentLoaded', () => {
   document.querySelector('.js-open-exclusion-mgmt')?.addEventListener('click', openExclusionModal);
@@ -816,6 +1065,33 @@ document.addEventListener('DOMContentLoaded', () => {
   // E-7-e
   document.querySelector('.js-trigger-diff-sync')?.addEventListener('click', triggerDiffSync);
   document.querySelectorAll('.js-close-diff-sync-modal').forEach((el) => el.addEventListener('click', closeDiffSyncModal));
+
+  // E-6-2: card クリック → drawer 表示。
+  //   action buttons (.actions 内) のクリックは drawer を開かない (publish / Notion link 優先)。
+  for (const card of document.querySelectorAll('.js-open-detail')) {
+    card.addEventListener('click', (ev) => {
+      if (ev.target.closest('.actions')) return;
+      const code = ev.currentTarget.dataset.itemCode;
+      if (code) openDetailDrawer(code);
+    });
+    card.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' || ev.key === ' ') {
+        if (ev.target.closest('.actions')) return;
+        ev.preventDefault();
+        const code = ev.currentTarget.dataset.itemCode;
+        if (code) openDetailDrawer(code);
+      }
+    });
+  }
+  document.querySelectorAll('.js-close-detail-drawer').forEach((el) => el.addEventListener('click', closeDetailDrawer));
+  // backdrop click (panel 外をクリック) で閉じる
+  document.getElementById('detailDrawerBackdrop')?.addEventListener('click', (ev) => {
+    if (ev.target === ev.currentTarget) closeDetailDrawer();
+  });
+  // ESC で閉じる
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape') closeDetailDrawer();
+  });
 });
 </script>
 </body>

@@ -622,6 +622,83 @@ router.post('/api/publish/idempotency-key', (req, res) => {
   }
 });
 
+// ───────────────── Phase E-6-2: 商品詳細ドロワー API ─────────────────
+
+/**
+ * 1 商品の full context を返す (drawer 表示用)。
+ *   - candidate: migration_candidates の status + detected_at 等
+ *   - notion:    notion_overrides の Yahoo!タイトル / 売価 / 配送方法 / 税率 等
+ *   - yahoo:     yahoo_registered_items の観測情報
+ *   - publishHistory: publish_idempotency の全 row (時系列、 最新が先)
+ *   - exclusionHistory: listExclusionHistory (active + restored)
+ *   - readiness: jobs.readiness_blocked_reasons + last_readiness_at
+ *
+ * itemCode が migration_candidates にない場合でも notion_overrides にあれば 「orphan」 として返す。
+ * どちらにもなければ 404。
+ */
+router.get('/api/products/:itemCode/detail', (req, res) => {
+  try {
+    const db = getDB();
+    const itemCode = String(req.params.itemCode || '').trim();
+    if (!itemCode) return res.status(400).json({ status: 'fail', error: 'itemCode required' });
+
+    const candidate = db.prepare('SELECT * FROM migration_candidates WHERE item_code = ?').get(itemCode);
+
+    // notion_overrides は rakuten_manage_number が PK だが、 itemCode 直接 or candidate.rakuten_manage_number で検索
+    const notion = db.prepare(`
+      SELECT * FROM notion_overrides
+      WHERE rakuten_manage_number = COALESCE(?, ?)
+    `).get(candidate?.rakuten_manage_number || null, itemCode);
+
+    if (!candidate && !notion) {
+      return res.status(404).json({ status: 'fail', error: `product not found: ${itemCode}` });
+    }
+
+    const yahoo = db.prepare('SELECT * FROM yahoo_registered_items WHERE item_code = ?').get(itemCode);
+
+    const publishHistory = db.prepare(`
+      SELECT idempotency_key, manage_number, status, attempt, completed_at, error_message, created_at, updated_at
+      FROM publish_idempotency
+      WHERE item_code = ?
+      ORDER BY created_at DESC, rowid DESC
+    `).all(itemCode);
+
+    const exclusionHistory = listExclusionHistory(db, itemCode);
+
+    const job = db.prepare(`
+      SELECT readiness_status, readiness_blocked_reasons, last_readiness_at, current_state
+      FROM jobs WHERE item_code = ?
+    `).get(itemCode);
+
+    let readinessReasons = [];
+    if (job?.readiness_blocked_reasons) {
+      try { readinessReasons = JSON.parse(job.readiness_blocked_reasons); } catch (_) {}
+    }
+    const translatedReadiness = readinessReasons.length > 0
+      ? summarizeReasons(readinessReasons).items
+      : [];
+
+    return res.json({
+      itemCode,
+      candidate: candidate || null,
+      notion: notion || null,
+      yahoo: yahoo || null,
+      publishHistory,
+      exclusionHistory,
+      readiness: job ? {
+        status: job.readiness_status,
+        blockedReasons: readinessReasons,
+        blockedReasonsTranslated: translatedReadiness,
+        lastReadinessAt: job.last_readiness_at,
+        currentState: job.current_state,
+      } : null,
+      notionPageUrl: notion?.notion_page_id ? notionPageUrl(notion.notion_page_id) : null,
+    });
+  } catch (e) {
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
 // ───────────────── Phase E-7-c: 移行除外管理 API ─────────────────
 
 router.get('/api/exclusions', (req, res) => {
