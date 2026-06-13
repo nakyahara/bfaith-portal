@@ -488,18 +488,16 @@ function recomputeMonthlyPL(db, year_month, now, user) {
   const freightRows = db.prepare('SELECT * FROM mgmt_freight_costs WHERE year_month = ?').all(year_month);
   const materialRows = db.prepare('SELECT * FROM mgmt_material_costs WHERE year_month = ?').all(year_month);
   const directFreight = freightRows.filter(r => r.cost_scope !== 'shared');
-  // FBA運賃(Amazonの手数料由来)は Amazon の売上だけに配賦する。全モール按分すると
-  // 楽天・Yahoo・仕入れ商品など非FBA商品にAmazonのFBA運賃が乗り「運賃の二重負担」になるため。
-  const fbaFreight = freightRows.filter(r => r.cost_scope === 'shared' && r.carrier === 'FBA運賃').reduce((s, r) => s + r.amount, 0);
-  let sharedManual = freightRows.filter(r => r.cost_scope === 'shared' && r.carrier !== 'FBA運賃').reduce((s, r) => s + r.amount, 0);
+  // 運賃按分 (2026-06-13 中原さん指示): FBA / FBM / ヤマト 等を区別せず、shared 運賃 (FBA運賃含む)
+  // を全モール売上で一律按分する。元アップロードのスプレッドシート (全運賃→売上按分) の挙動に合わせる。
+  // 旧実装は FBA運賃を Amazon 売上だけに分離していたが、Amazon の FBM(自社出荷)分にも FBA手数料が乗り、
+  // 逆に FBM の実運賃(ヤマト)が他モールへ逃げる歪みがあったため撤廃。bulk-calculate と同一ロジック。
+  const sharedFreight = freightRows.filter(r => r.cost_scope === 'shared').reduce((s, r) => s + r.amount, 0);
   const materialTotal = materialRows.reduce((s, r) => s + r.amount, 0);
   const salesForAlloc = segSales.filter(r => r.segment !== 4).reduce((s, r) => s + (r.sales || 0), 0);
-  const amazonSalesForAlloc = segSales.filter(r => r.segment !== 4 && r.mall_id === 'amazon_jp').reduce((s, r) => s + (r.sales || 0), 0);
-  // Amazon売上が無い月はFBA運賃を全体按分にフォールバック（運賃合計を保存するため）
-  if (amazonSalesForAlloc === 0) sharedManual += fbaFreight;
   const salesTotal = segSales.reduce((s, r) => s + (r.sales || 0), 0);
   const fiscalYear = getFiscalYear(year_month);
-  const freightTotal = sharedManual + (amazonSalesForAlloc > 0 ? fbaFreight : 0) + directFreight.reduce((s, d) => s + d.amount, 0);
+  const freightTotal = sharedFreight + directFreight.reduce((s, d) => s + d.amount, 0);
 
   const plRows = segSales.map(row => {
     const sales = Math.round(row.sales || 0);
@@ -512,11 +510,8 @@ function recomputeMonthlyPL(db, year_month, now, user) {
       const exportTotal = segSales.filter(r => r.segment === 4).reduce((s, r) => s + (r.sales || 0), 0);
       if (exportTotal > 0 && exportTotal !== sales) freight = Math.round(freight * sales / exportTotal);
     } else {
-      // 国内: 手入力運賃は全モール売上按分。FBA運賃は Amazon の売上だけに按分。
-      freight = salesForAlloc > 0 ? Math.round(sharedManual * sales / salesForAlloc) : 0;
-      if (row.mall_id === 'amazon_jp' && amazonSalesForAlloc > 0) {
-        freight += Math.round(fbaFreight * sales / amazonSalesForAlloc);
-      }
+      // 国内: shared 運賃 (FBA運賃含む全運賃) を全モール売上で一律按分。
+      freight = salesForAlloc > 0 ? Math.round(sharedFreight * sales / salesForAlloc) : 0;
     }
     const material = salesTotal > 0 ? Math.round(materialTotal * sales / salesTotal) : 0;
     const salesRatio = salesTotal > 0 ? sales / salesTotal : 0;
