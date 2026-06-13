@@ -11,7 +11,11 @@
  */
 import { Router } from 'express';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
 
 // B-Faith会計年度: 7月始まり
@@ -36,6 +40,14 @@ function addMonths(yearMonth, delta) {
   const idx = y * 12 + (m - 1) + delta;
   return `${Math.floor(idx / 12)}-${String((idx % 12) + 1).padStart(2, '0')}`;
 }
+
+// 凍結月（2026-02以前）: Excel 初期データ(seed)をそのまま確定値として表示する月。
+// 2026-03以降はアプリが各モール売上集計から計算する(ライブ)。中原さん指示 2026-06-13:
+// 「2月末以前は初期データなので計算せずそのまま入れる」→ 凍結月はライブ同期/再計算/一括計算の
+// 対象外にして seed を保護する。seed は /admin/load-historical-seed で投入。
+const FROZEN_THROUGH_YM = '2026-02';
+function isFrozenMonth(ym) { return typeof ym === 'string' && ym <= FROZEN_THROUGH_YM; }
+const HISTORICAL_SEED_PATH = path.join(__dirname, 'seed', 'historical-pl-seed.json');
 
 // 運送会社・仕入先のプリセット（Excel「運賃集計」「輸出運賃」「梱包資材費」シートのヘッダーに合わせる）
 const CARRIERS = ['FBA運賃', 'RSL費用', 'ヤマト', 'ヤマト2', '佐川', '西濃', '福山通運', '郵便局（UPSIDER1）', '郵便局（UPSIDER2）', 'クリックポスト'];
@@ -68,7 +80,14 @@ router.post('/import-historical', (req, res) => {
   if (!checkAuth(req, res)) return;
 
   const db = getMirrorDB();
-  const { freight = [], material = [], sales = [] } = req.body;
+  let { freight = [], material = [], sales = [] } = req.body;
+  // 凍結月(2026-02以前)は seed ローダー(/admin/load-historical-seed)が唯一の入口。
+  // 古い汎用インポートで凍結月の入力テーブルを書くと seed と不整合になるためここでは除外。
+  const beforeCounts = { freight: freight.length, material: material.length, sales: sales.length };
+  freight = freight.filter(f => !isFrozenMonth(f.year_month));
+  material = material.filter(m => !isFrozenMonth(m.year_month));
+  sales = sales.filter(s => !isFrozenMonth(s.year_month));
+  const skippedFrozen = (beforeCounts.freight - freight.length) + (beforeCounts.material - material.length) + (beforeCounts.sales - sales.length);
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
 
   const freightStmt = db.prepare(`INSERT INTO mgmt_freight_costs
@@ -96,7 +115,7 @@ router.post('/import-historical', (req, res) => {
   });
   tx();
 
-  res.json({ ok: true, freight: freight.length, material: material.length, sales: sales.length });
+  res.json({ ok: true, freight: freight.length, material: material.length, sales: sales.length, skipped_frozen: skippedFrozen });
 });
 
 // 無効レコード削除（carrier/supplier に「合計」等が紛れ込んだ場合のクリーンアップ）
@@ -110,6 +129,83 @@ router.post('/cleanup-invalid', (req, res) => {
   res.json({ ok: true, freight_deleted: f.changes, material_deleted: m.changes });
 });
 
+// ── 過去データ(Excel初期値)シードの投入 (中原さん指示 2026-06-13) ──
+// 2026-02以前(凍結月)の各月を、Excel 月次シート由来の確定PL(mgmt_monthly_pl)へ「そのまま」投入。
+// 計算なし: seed の値(売上/原価/PF手数料/広告費/運賃/資材費/粗利益)を直接格納。
+// closing は確定 + frozen マーカー(calc_version='excel_seed')。dryRun=1 で投入せず seed vs 現状の差分を返す。
+router.post('/admin/load-historical-seed', (req, res) => {
+  if (!checkAuth(req, res)) return;
+  const db = getMirrorDB();
+  const dryRun = req.query.dryRun === '1' || (req.body && req.body.dryRun === true);
+  let seed;
+  try {
+    seed = JSON.parse(fs.readFileSync(HISTORICAL_SEED_PATH, 'utf8'));
+  } catch (e) {
+    return res.status(500).json({ error: 'seed_read_failed', message: e.message });
+  }
+  if (!Array.isArray(seed) || !seed.length) return res.status(500).json({ error: 'seed_empty' });
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+
+  // 月ごとにグループ化 + 全行が凍結月であることを検証(ライブ月を誤って seed しない安全網)
+  const byMonth = new Map();
+  for (const r of seed) {
+    if (!isFrozenMonth(r.year_month)) {
+      return res.status(400).json({ error: 'non_frozen_in_seed',
+        message: `seed に凍結対象外(${FROZEN_THROUGH_YM}超)の月が含まれます: ${r.year_month}` });
+    }
+    if (!byMonth.has(r.year_month)) byMonth.set(r.year_month, []);
+    byMonth.get(r.year_month).push(r);
+  }
+
+  // 比較レポート: seed の月別合計 vs 現状 mgmt_monthly_pl の月別合計
+  const curTotal = db.prepare('SELECT COALESCE(SUM(sales),0) sales, COALESCE(SUM(gross_profit),0) gp FROM mgmt_monthly_pl WHERE year_month=?');
+  const report = [];
+  for (const [ym, rows] of [...byMonth.entries()].sort()) {
+    const sSales = rows.reduce((s, r) => s + (r.sales || 0), 0);
+    const sGp = rows.reduce((s, r) => s + (r.gross_profit || 0), 0);
+    const cur = curTotal.get(ym);
+    report.push({ year_month: ym, rows: rows.length,
+      seed_sales: Math.round(sSales), seed_margin: sSales ? +(sGp / sSales * 100).toFixed(1) : 0,
+      current_sales: Math.round(cur.sales), current_margin: cur.sales ? +(cur.gp / cur.sales * 100).toFixed(1) : 0 });
+  }
+  if (dryRun) return res.json({ ok: true, dry_run: true, months: report.length, report });
+
+  // 本投入: 各凍結月の mgmt_monthly_pl を seed で全置換 + closing を frozen 確定。
+  const insPL = db.prepare(`INSERT INTO mgmt_monthly_pl
+    (year_month, mall_id, segment, sales, sales_ratio, cost, pf_fee, ad_cost, freight, material, variable_cost, gross_profit, gross_margin, fiscal_year)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  const insClosing = db.prepare(`INSERT OR REPLACE INTO mgmt_monthly_closing
+    (year_month, fiscal_year, fiscal_month, status, freight_total, material_total, confirmed_at, confirmed_by, calc_version)
+    VALUES (?,?,?,?,?,?,?,?,?)`);
+  // mart_monthly_segment_sales も seed 値に揃える(ヒストリカルタブの売上×モール系列が
+  // seed PL と整合するように。凍結月は syncSegmentSalesForMonth 対象外なので上書きされない)。
+  const insSeg = db.prepare(`INSERT INTO mart_monthly_segment_sales
+    (year_month, mall_id, segment, sales, cost, pf_fee, ad_cost, confirmed_at, source_file, logic_version)
+    VALUES (?,?,?,?,?,?,?,?,?,?)`);
+  const tx = db.transaction(() => {
+    for (const [ym, rows] of byMonth.entries()) {
+      const monthSales = rows.reduce((s, r) => s + (r.sales || 0), 0);
+      db.prepare('DELETE FROM mgmt_monthly_pl WHERE year_month = ?').run(ym);
+      db.prepare('DELETE FROM mart_monthly_segment_sales WHERE year_month = ?').run(ym);
+      let fTot = 0, mTot = 0;
+      for (const r of rows) {
+        const sales = Math.round(r.sales || 0);
+        const gp = Math.round(r.gross_profit || 0);
+        const varCost = sales - gp; // 整合性保証: sales = variable_cost + gross_profit
+        const cost = Math.round(r.cost || 0), pf = Math.round(r.pf_fee || 0), ad = Math.round(r.ad_cost || 0);
+        const fr = Math.round(r.freight || 0), mat = Math.round(r.material || 0);
+        insPL.run(ym, r.mall_id, r.segment, sales, monthSales > 0 ? sales / monthSales : 0,
+          cost, pf, ad, fr, mat, varCost, gp, sales > 0 ? gp / sales : 0, getFiscalYear(ym));
+        insSeg.run(ym, r.mall_id, r.segment, sales, cost, pf, ad, now, 'historical-excel-seed', 'excel_seed');
+        fTot += fr; mTot += mat;
+      }
+      insClosing.run(ym, getFiscalYear(ym), getFiscalMonth(ym), 'confirmed', fTot, mTot, now, 'excel-seed', 'excel_seed');
+    }
+  });
+  tx();
+  res.json({ ok: true, dry_run: false, months_loaded: byMonth.size, rows: seed.length, report });
+});
+
 // 一括確定: 指定月を除く全月について calculate を実行
 router.post('/bulk-calculate', (req, res) => {
   if (!checkAuth(req, res)) return;
@@ -119,10 +215,11 @@ router.post('/bulk-calculate', (req, res) => {
   const user = req.session?.email || 'historical-bulk';
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
 
-  // 対象月: mart_monthly_segment_sales にデータがあり exclude に含まれない月
+  // 対象月: mart_monthly_segment_sales にデータがあり exclude に含まれない月。
+  // 凍結月(2026-02以前)は Excel seed が確定値なので一括計算の対象外。
   const months = db.prepare('SELECT DISTINCT year_month FROM mart_monthly_segment_sales ORDER BY year_month').all()
     .map(r => r.year_month)
-    .filter(m => !exclude_months.includes(m));
+    .filter(m => !exclude_months.includes(m) && !isFrozenMonth(m));
 
   const results = [];
   for (const ym of months) {
@@ -197,6 +294,11 @@ router.get('/api/costs/:yearMonth', (req, res) => {
 router.post('/api/freight', (req, res) => {
   const db = getMirrorDB();
   const { year_month, items } = req.body;
+  // 凍結月(2026-02以前)は Excel 初期データで確定済み。運賃編集→needs_review 降格で
+  // 凍結月が表示から消える事故を防ぐため拒否(Codex High 対応)。
+  if (isFrozenMonth(year_month)) {
+    return res.status(400).json({ error: 'frozen_month', message: '2026年2月以前は初期データ(Excel)で確定済みのため編集できません。' });
+  }
   const user = req.session?.email || 'unknown';
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
   const stmt = db.prepare(`INSERT INTO mgmt_freight_costs (year_month, carrier, amount, cost_scope, target_segment, target_mall_id, note, entered_by, entered_at, updated_at)
@@ -217,6 +319,10 @@ router.post('/api/freight', (req, res) => {
 router.post('/api/material', (req, res) => {
   const db = getMirrorDB();
   const { year_month, items } = req.body;
+  // 凍結月(2026-02以前)は編集不可(Codex High 対応、freight と同方針)
+  if (isFrozenMonth(year_month)) {
+    return res.status(400).json({ error: 'frozen_month', message: '2026年2月以前は初期データ(Excel)で確定済みのため編集できません。' });
+  }
   const user = req.session?.email || 'unknown';
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
   const stmt = db.prepare(`INSERT INTO mgmt_material_costs (year_month, supplier, amount, note, entered_by, entered_at, updated_at)
@@ -490,6 +596,8 @@ function syncSegmentSalesForMonth(db, year_month, now) {
 // 指定月のPLを「現在の segment_sales + 既存の運賃・資材費」で再計算して保存し confirmed にする。
 // /api/calculate（人手の確定）と auto-sync（自動再計算）で共有。
 function recomputeMonthlyPL(db, year_month, now, user) {
+  // 凍結月(2026-02以前)は Excel seed が確定値。ライブ再計算で mgmt_monthly_pl を上書きしない。
+  if (isFrozenMonth(year_month)) return { rows: 0, freight_total: 0, material_total: 0, skipped: true, frozen: true };
   const segSales = db.prepare('SELECT * FROM mart_monthly_segment_sales WHERE year_month = ?').all(year_month);
   // 売上が空のとき（同期元障害・summary欠落等）は既存PLを壊さない（確定履歴を守る）
   if (segSales.length === 0) return { rows: 0, freight_total: 0, material_total: 0, skipped: true };
@@ -559,6 +667,8 @@ function recomputeMonthlyPL(db, year_month, now, user) {
 // 旧実装は入力変動で needs_review に降格していたが、データ修正のたびに過去月が一斉に
 // 非表示になる問題があったため「自動再計算して確定維持」に変更（人手の再確定は不要）。
 function syncAndRefreshMonth(db, ym, now) {
+  // 凍結月(2026-02以前)は Excel seed が確定値。segment_sales 再生成も再計算もしない。
+  if (isFrozenMonth(ym)) return { inserted: 0, refreshed: false, frozen: true };
   return db.transaction(() => {
     // 過去に確定された月のみ自動再計算（新規/下書き月は人手の確定が必要）
     const closing = db.prepare("SELECT confirmed_by FROM mgmt_monthly_closing WHERE year_month = ? AND status IN ('confirmed','needs_review')").get(ym);
@@ -646,6 +756,12 @@ router.post('/api/calculate', (req, res) => {
   const { year_month, allow_partial } = req.body;
   const user = req.session?.email || 'unknown';
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+
+  // 凍結月(2026-02以前)は Excel 初期データで確定済み。ライブ再計算は不可。
+  if (isFrozenMonth(year_month)) {
+    return res.status(400).json({ error: 'frozen_month',
+      message: '2026年2月以前は初期データ(Excel)で確定済みのため、ここでは再計算できません。' });
+  }
 
   // 0. 確定直前に各モール確定済みデータを取り込み segment_sales を最新化（サーバ側で確実に実行）。
   //    同期失敗時は古いデータで確定しないよう fail-closed（確定を中止）。
@@ -905,6 +1021,17 @@ tr:hover { background: #f0f4ff; }
     </table>
   </div>
   <p class="note-text">※ 粗利分析は現行原価・現行料率ベースの管理指標であり、過去時点の再現値ではありません。</p>
+
+  <div class="card" style="border:1px solid #d7e0ef; background:#fafcff;">
+    <h3>📥 過去データ(Excel初期値)投入 — 2026年2月以前</h3>
+    <p class="note-text">2026年2月以前は Excel 初期データを<b>そのまま確定値</b>として表示します(ライブ計算・上書きなし)。まず「差分を確認」で Excel値 と 現状表示 を見比べ、問題なければ「投入する」を押してください。</p>
+    <div class="controls">
+      <button class="btn btn-outline" onclick="seedDryRun()">差分を確認（ドライラン）</button>
+      <button class="btn btn-success" id="btnSeedApply" onclick="seedApply()" style="display:none">この内容で投入する</button>
+      <span id="seedStatus" class="note-text"></span>
+    </div>
+    <div id="seedReport"></div>
+  </div>
 </div>
 
 <!-- ===== タブ2: 月次PL ===== -->
@@ -1144,6 +1271,41 @@ async function doCalculate() {
   await saveCosts();
   // 集計確定（サーバ側で確定直前に売上同期を行うため、ここでの手動同期は不要）
   await postCalculate(ym, false);
+}
+
+// ── 過去データ(Excel初期値)投入 ──
+function renderSeedReport(report) {
+  let h = '<table style="margin-top:10px"><thead><tr><th>月</th><th>Excel売上</th><th>Excel粗利率</th><th>現状売上</th><th>現状粗利率</th></tr></thead><tbody>';
+  for (const r of report) {
+    const diff = (r.seed_margin !== r.current_margin);
+    h += '<tr><td>' + r.year_month + '</td><td>' + fmt(r.seed_sales) + '</td>'
+      + '<td>' + r.seed_margin + '%</td><td>' + fmt(r.current_sales) + '</td>'
+      + '<td class="' + (diff ? 'negative' : '') + '">' + r.current_margin + '%</td></tr>';
+  }
+  h += '</tbody></table>';
+  document.getElementById('seedReport').innerHTML = h;
+}
+async function seedDryRun() {
+  const st = document.getElementById('seedStatus'); st.textContent = '確認中…';
+  try {
+    const res = await fetch(BASE + '/admin/load-historical-seed?dryRun=1', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}' });
+    const d = await res.json();
+    if (!d.ok) throw new Error(d.message || d.error || 'error');
+    renderSeedReport(d.report);
+    document.getElementById('btnSeedApply').style.display = '';
+    st.textContent = d.months + 'ヶ月。投入すると左(Excel)の値で確定表示になります。';
+  } catch (e) { st.textContent = 'エラー: ' + e.message; }
+}
+async function seedApply() {
+  if (!confirm('2026年2月以前の各月を Excel 初期データで確定表示に置き換えます。よろしいですか？')) return;
+  const st = document.getElementById('seedStatus'); st.textContent = '投入中…';
+  try {
+    const res = await fetch(BASE + '/admin/load-historical-seed', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}' });
+    const d = await res.json();
+    if (!d.ok) throw new Error(d.message || d.error || 'error');
+    st.textContent = '✅ ' + d.months_loaded + 'ヶ月投入完了（' + d.rows + '行）。年間PL/月次PLを再表示して確認してください。';
+    document.getElementById('btnSeedApply').style.display = 'none';
+  } catch (e) { st.textContent = 'エラー: ' + e.message; }
 }
 
 async function postCalculate(ym, allowPartial) {
