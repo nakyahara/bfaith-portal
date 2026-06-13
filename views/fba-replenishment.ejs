@@ -3925,6 +3925,12 @@ Step10: アラート判定
           alert('エラー: ' + (err.error || 'CSV出力に失敗'));
           return;
         }
+        // スキップされたSKUを成功時でも明示 (従来はCSVが返ると無音で欠落していた)
+        const skippedCount = parseInt(res.headers.get('X-NE-Skipped-Count') || '0') || 0;
+        let skippedWarns = [];
+        const warnHeader = res.headers.get('X-NE-Warnings');
+        if (warnHeader) { try { skippedWarns = JSON.parse(decodeURIComponent(warnHeader)); } catch(e) { skippedWarns = []; } }
+
         const blob = await res.blob();
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -3932,7 +3938,13 @@ Step10: アラート判定
         a.download = `hanyo-jyuchu_invoice_${new Date().toISOString().slice(0,10)}.csv`;
         a.click();
         URL.revokeObjectURL(url);
-        log(`NE受注CSV出力: ${allItems.length} SKU → NE商品コードに変換済み`);
+        log(`NE受注CSV出力: ${allItems.length - skippedCount} SKU 出力 / ${skippedCount} SKU スキップ`);
+        if (skippedCount > 0) {
+          skippedWarns.forEach(w => log(`⚠️ NE CSVスキップ: ${w}`));
+          const shown = skippedWarns.join('\n');
+          const more = skippedCount > skippedWarns.length ? `\n…ほか ${skippedCount - skippedWarns.length} 件` : '';
+          alert(`NE受注CSVを出力しましたが、${skippedCount} 件のSKUがCSVに含まれませんでした:\n\n${shown}${more}`);
+        }
       } catch(e) { alert('エラー: ' + e.message); }
     }
 

@@ -1095,11 +1095,26 @@ router.post('/api/export-ne-csv', express.json(), async (req, res) => {
       }
     }
 
-    includedSkus.push(item.amazon_sku);
+    // 有効な ne_code を持つ構成だけ採用。全滅なら無音欠落させずスキップ+警告。
+    const validComponents = components.filter(c => c && c.ne_code);
+    if (validComponents.length === 0) {
+      warnings.push(`${item.amazon_sku} (${mapping.product_name || ''}): 構成のNE商品コードが空（スキップ）`);
+      continue;
+    }
+    if (validComponents.length < components.length) {
+      warnings.push(`${item.amazon_sku} (${mapping.product_name || ''}): 一部構成のNE商品コードが空（その分のみ除外）`);
+    }
+
     const shipQty = parseInt(item.ship_qty) || 0;
-    for (const comp of components) {
+    if (shipQty <= 0) {
+      // 数量未入力(0)のSKUは黙ってqty0行を作らず、明示スキップ+警告。
+      // 新規商品は既定 recommended_qty=0 のため、数量入力を忘れるとここで漏れやすい。
+      warnings.push(`${item.amazon_sku} (${mapping.product_name || ''}): 出荷数量が0のためスキップ（仮確定タブで数量を入力してください）`);
+      continue;
+    }
+    includedSkus.push(item.amazon_sku);
+    for (const comp of validComponents) {
       const neCode = comp.ne_code;
-      if (!neCode) continue;
       const neQty = shipQty * (parseInt(comp.qty) || 1);
       if (neAggregated[neCode]) {
         neAggregated[neCode].qty += neQty;
@@ -1194,6 +1209,20 @@ router.post('/api/export-ne-csv', express.json(), async (req, res) => {
     try { saveExportHistory('ne_csv', csvFilename, neItems.length, totalQty, encoded, includedSkus); } catch(he) { console.error('[FBA] 履歴保存エラー:', he); }
     res.setHeader('Content-Type', 'text/csv; charset=Shift_JIS');
     res.setHeader('Content-Disposition', `attachment; filename=${csvFilename}`);
+    // スキップされたSKUを成功時(200+CSV)でもクライアントに伝える (従来は失敗時しか warnings を返さず無音欠落だった)。
+    // 件数は常に返す。詳細はヘッダー過大で CSV ダウンロード自体が失敗しないよう byte 上限(約6KB)で詰める。
+    res.setHeader('X-NE-Skipped-Count', String(warnings.length));
+    if (warnings.length > 0) {
+      const picked = [];
+      let bytes = 2; // "[]" 分
+      for (const w of warnings) {
+        const enc = encodeURIComponent(JSON.stringify(w));
+        if (bytes + enc.length + 1 > 6000) break; // +1 はカンマ区切り相当
+        picked.push(w);
+        bytes += enc.length + 1;
+      }
+      if (picked.length > 0) res.setHeader('X-NE-Warnings', encodeURIComponent(JSON.stringify(picked)));
+    }
     res.send(encoded);
     console.log(`[FBA] NE CSV出力: ${neItems.length}件 (警告: ${warnings.length}件)`);
     if (warnings.length > 0) console.log(`[FBA] NE CSV警告:`, warnings);
