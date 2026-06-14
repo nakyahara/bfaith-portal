@@ -87,12 +87,22 @@ export function extractRow(page) {
 }
 
 /**
- * 12 列だけを key 名 alphabetical 順で canonical JSON 化 → SHA-256。
+ * canonical JSON 化 → SHA-256。
  *   publish に影響しない列の変更で UPDATE 発火しないようにする。
+ *
+ * Codex E-11 R1 H-1 修正: migration 014 未適用環境では新列を hash 対象から除外する。
+ *   そうしないと: insert 時に hash は新列込みで保存される が 新列は DB に書かれない →
+ *   後で migration 014 適用後に同 Notion ページを sync しても hash が一致して
+ *   touchStmt 経路に落ちて、 実カラムは永久 NULL のままになる。
+ *   includeNewColumns=false で hash 算出すれば、 migration 適用後の sync で hash が
+ *   変わり update が発火する。
  */
-export function canonicalHash(row) {
+const NEW_NOTION_COLUMNS = ['notion_product_category', 'notion_path'];
+export function canonicalHash(row, { includeNewColumns = true } = {}) {
   if (!row) throw new Error('canonicalHash: row is required');
-  const keys = Object.keys(PROPERTY_EXTRACTORS).sort();
+  const keys = Object.keys(PROPERTY_EXTRACTORS)
+    .filter((k) => includeNewColumns || !NEW_NOTION_COLUMNS.includes(k))
+    .sort();
   const canon = {};
   for (const k of keys) canon[k] = row[k] === undefined ? null : row[k];
   const json = JSON.stringify(canon);
@@ -101,8 +111,12 @@ export function canonicalHash(row) {
 
 /**
  * Notion page から「sync 対象 12 列 + 監査列」 record を組み立てる。
+ *
+ * @param {object} page  Notion API page object
+ * @param {object} [opts]
+ * @param {boolean} [opts.includeNewColumnsInHash=true]  migration 014 未適用環境では false を渡す
  */
-export function buildSyncRecord(page) {
+export function buildSyncRecord(page, { includeNewColumnsInHash = true } = {}) {
   const row = extractRow(page);
   if (!row) return null;
   return {
@@ -110,6 +124,6 @@ export function buildSyncRecord(page) {
     notion_page_id: page.id,
     source_updated_at: page.last_edited_time || null,
     raw_properties_json: JSON.stringify(page.properties),
-    source_hash: canonicalHash(row),
+    source_hash: canonicalHash(row, { includeNewColumns: includeNewColumnsInHash }),
   };
 }
