@@ -139,6 +139,13 @@
               📥 楽天 RMS から商品名取得 (<%= rakutenTitleMissing %> 件未取得)
             </button>
           <% } %>
+          <%# Phase E-11-b: Yahoo カテゴリ学習。 既存 130 件から逆引きで learn、 publish 自動推定の基盤。 %>
+          <% if (typeof yahooCategoryMissing !== 'undefined' && (yahooCategoryMissing > 0 || (typeof yahooCategoryLearnedGenres !== 'undefined' && yahooCategoryLearnedGenres === 0)) ) { %>
+            <button class="btn btn-sm btn-outline-info ms-2 js-yahoo-category-learn"
+                    title="既存 Yahoo!ショッピング出品から Yahoo カテゴリと path を取得し、 楽天 genre との対応辞書を作ります。 学習後の publish は自動推定されます">
+              📚 Yahoo カテゴリ学習<% if (yahooCategoryMissing > 0) { %> (<%= yahooCategoryMissing %> 件未取得)<% } %><% if (typeof yahooCategoryLearnedGenres !== 'undefined' && yahooCategoryLearnedGenres > 0) { %> (学習済 <%= yahooCategoryLearnedGenres %> genre)<% } %>
+            </button>
+          <% } %>
         </li>
         <li>
           <strong><%= summary.actionable %> 商品</strong> が Yahoo に出せます
@@ -1604,6 +1611,37 @@ async function backfillRakutenTitle(evt) {
   }
 }
 
+// ───── Yahoo カテゴリ学習 (Phase E-11-b) ─────
+async function yahooCategoryLearn(evt) {
+  const btn = evt.currentTarget;
+  if (!btn || btn.disabled) return;
+  if (!confirm('Yahoo!ショッピング既存出品から商品カテゴリと path を順次取得します (50 件ずつ)。 ' +
+    '\n100-130 件あるため、 完了まで 1-3 分かかります。 \n続行しますか?')) return;
+  const original = btn.innerHTML;
+  btn.disabled = true;
+  btn.textContent = '取得中...';
+  try {
+    const res = await fetch('/apps/rakuten-yahoo-sync/api/yahoo-category/backfill-and-learn', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ limit: 100 }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      alert('取得失敗: ' + (data.error || ('HTTP ' + res.status)));
+      btn.disabled = false; btn.innerHTML = original;
+      return;
+    }
+    const lrn = data.learning || {};
+    alert('Yahoo カテゴリ取得 ' + data.updated + ' 件 / 失敗 ' + data.failed + ' 件\n' +
+      '学習辞書: ' + (lrn.genresLearned || 0) + ' genre / ' + (lrn.mappingRowsUpserted || 0) + ' 対応\n' +
+      '残 ' + data.remaining + ' 件 (続けるにはもう一度押してください)');
+    location.reload();
+  } catch (e) {
+    alert('ネットワークエラー: ' + e.message);
+    btn.disabled = false; btn.innerHTML = original;
+  }
+}
+
 // ───── 画像除外パターン管理 (Phase E-8) ─────
 // Codex E-8 R1 M-4: モーダル open 前に他モーダル (移行除外、 Notion sync, publish 確認、 一括 publish) を閉じる helper。
 function closeAllModals() {
@@ -1721,6 +1759,7 @@ document.addEventListener('DOMContentLoaded', () => {
   document.querySelector('.js-open-exclusion-mgmt')?.addEventListener('click', openExclusionModal);
   document.querySelector('.js-open-image-exclusion-mgmt')?.addEventListener('click', openImageExclusionModal);
   document.querySelector('.js-backfill-rakuten-title')?.addEventListener('click', backfillRakutenTitle);
+  document.querySelector('.js-yahoo-category-learn')?.addEventListener('click', yahooCategoryLearn);
   document.querySelectorAll('.js-close-image-exclusion-modal').forEach((el) => el.addEventListener('click', closeImageExclusionModal));
   document.querySelector('.js-add-image-pattern')?.addEventListener('click', addImagePattern);
   document.querySelectorAll('.js-close-exclusion-modal').forEach((el) => el.addEventListener('click', closeExclusionModal));
