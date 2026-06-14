@@ -88,11 +88,12 @@ function imageFileName(itemCode, index) {
  * @param {Array} args.rakutenImages 楽天 raw images 配列 (location 含む)
  * @param {string} args.itemCode     Yahoo item_code (= 楽天 itemNumber)
  * @param {number} [args.maxImages=10] 最大 upload 枚数 (Yahoo 1 商品の上限を超えないため、 安全側)
+ * @param {string[]} [args.customPatterns=[]] image_exclusion_patterns 由来のユーザー追加パターン
  * @returns {Promise<{uploaded: number, failed: number, errors: string[]}>}
  */
-export async function uploadRakutenImagesToYahoo({ rakutenImages, itemCode, maxImages = 10 } = {}) {
+export async function uploadRakutenImagesToYahoo({ rakutenImages, itemCode, maxImages = 10, customPatterns = [] } = {}) {
   if (!itemCode) throw new ImageUploadError('itemCode is required');
-  const urls = filterUploadableImageUrls(rakutenImages);
+  const urls = filterUploadableImageUrls(rakutenImages, { customPatterns });
   if (urls.length === 0) {
     return { uploaded: 0, failed: 0, errors: ['no_uploadable_image_after_filter'] };
   }
