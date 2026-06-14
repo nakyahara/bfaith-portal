@@ -49,6 +49,12 @@ import {
 } from './lib/image-exclusion-patterns.js';
 import { filterUploadableImageUrlsDetailed } from './lib/yahoo-image.js';
 import { backfillRakutenTitles, countMissingRakutenTitles } from './lib/rakuten-title-backfill.js';
+import {
+  countMissingYahooCategories,
+  backfillYahooCategoriesAndPaths,
+  learnGenreCategoryMapping,
+  countLearnedGenres,
+} from './lib/yahoo-category-backfill.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -367,6 +373,8 @@ router.get('/', (req, res) => {
   let fixableByCategory = {};
   let exclusionCount = { temporary: 0, permanent: 0, total: 0 };
   let rakutenTitleMissing = 0;
+  let yahooCategoryMissing = 0;
+  let yahooCategoryLearnedGenres = 0;
   const filter = ['all', 'actionable', 'fixable', 'done', 'excluded', 'stale', 'orphan'].includes(req.query.filter)
     ? req.query.filter
     : 'actionable'; // default は「すぐ移行できる」 = やるべきこと
@@ -382,6 +390,8 @@ router.get('/', (req, res) => {
     fixableByCategory = listed.fixableByCategory;
     exclusionCount = countActiveByKind(db);
     try { rakutenTitleMissing = countMissingRakutenTitles(db); } catch (_) { /* migration 011 未適用 */ }
+    try { yahooCategoryMissing = countMissingYahooCategories(db); } catch (_) { /* migration 012 未適用 */ }
+    try { yahooCategoryLearnedGenres = countLearnedGenres(db); } catch (_) { /* migration 013 未適用 */ }
   } catch (_) {
     // DB 未初期化等は空 state で表示 continue
   }
@@ -404,6 +414,8 @@ router.get('/', (req, res) => {
     fixableByCategory,
     exclusionCount,                                       // E-7-c: 移行除外管理 header 集計
     rakutenTitleMissing,                                  // E-9: 楽天タイトル backfill ボタンの未取得件数 badge
+    yahooCategoryMissing,                                 // E-11-b: Yahoo category backfill ボタンの未取得件数
+    yahooCategoryLearnedGenres,                           // E-11-b: 学習済 genre 数
     filter,
     search,
     notionPageUrl,  // EJS から呼べるように
@@ -1055,6 +1067,44 @@ router.post('/api/rakuten-title-backfill', async (req, res) => {
     const remaining = countMissingRakutenTitles(db);
     audit(db, 'rakuten_title_backfill', { ...r, remaining });
     return res.json({ status: 'ok', ...r, remaining });
+  } catch (e) {
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+// ───────────────── Phase E-11-b: Yahoo カテゴリ backfill + 学習辞書 ─────────────────
+
+/**
+ * Yahoo 既存出品の category/path を取得 + 学習辞書を構築。
+ *   body: { limit?: number } default 50、 max 100
+ *   res: { ok, picked, updated, failed, errors, learning: {...}, remaining }
+ */
+router.post('/api/yahoo-category/backfill-and-learn', async (req, res) => {
+  try {
+    const db = getDB();
+    const body = req.body || {};
+    const limit = Number.isInteger(body.limit) && body.limit > 0 && body.limit <= 100 ? body.limit : 50;
+    const backfill = await backfillYahooCategoriesAndPaths({ db, limit });
+    let learning = null;
+    try { learning = learnGenreCategoryMapping(db); }
+    catch (e) { learning = { error: e.message }; }
+    const remaining = countMissingYahooCategories(db);
+    const genresLearned = countLearnedGenres(db);
+    audit(db, 'yahoo_category_backfill_and_learn', { ...backfill, learning, remaining, genresLearned });
+    return res.json({ status: 'ok', ...backfill, learning, remaining, genresLearned });
+  } catch (e) {
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+router.get('/api/yahoo-category/status', (req, res) => {
+  try {
+    const db = getDB();
+    return res.json({
+      status: 'ok',
+      remaining: countMissingYahooCategories(db),
+      genresLearned: countLearnedGenres(db),
+    });
   } catch (e) {
     return res.status(500).json({ status: 'fail', error: e.message });
   }

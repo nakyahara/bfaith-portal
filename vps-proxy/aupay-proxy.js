@@ -362,6 +362,39 @@ function decodeXmlEntities(s) {
     .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
     .replace(/&amp;/g, '&');
 }
+/**
+ * Phase E-11-b: Yahoo getItemDetail (item info) の XML response から
+ *   productCategory + path を抜き出す。
+ *
+ * Yahoo!ショッピングストアエディタ API の itemInfo (getItemDetail) は
+ *   ItemCode 指定で 1 件の商品情報 XML を返す。 我々が欲しいのは:
+ *     - <ProductCategory>NNN</ProductCategory>   (数値、 Yahoo カテゴリ ID)
+ *     - <Path>some-path</Path>                   (ストア内 path)
+ *   他にも多数フィールドあるが、 学習辞書では category + path しか使わない。
+ *
+ *   XML shape は ResultSet で wrap される or single Result block の可能性両方ある:
+ *     <ResultSet> <Result> <ItemCode>...</ItemCode> <ProductCategory>...</ProductCategory> <Path>...</Path> ... </Result> </ResultSet>
+ *   single レスポンスでも Result wrapper があるので、 そこから抜く。
+ *   完全一致でなくケースバラつきも考慮 (例: <productCategory>) して i フラグで対応。
+ */
+function parseGetItemDetailXml(xml) {
+  const out = { ItemCode: null, ProductCategory: null, Path: null, Name: null };
+  if (typeof xml !== 'string' || xml.length === 0) return out;
+  const tag = (name) => {
+    const m = xml.match(new RegExp(`<${name}>([^<]*)</${name}>`, 'i'));
+    return m ? decodeXmlEntities(m[1]).trim() : null;
+  };
+  out.ItemCode = tag('ItemCode');
+  const pc = tag('ProductCategory');
+  if (pc != null && pc !== '') {
+    const n = parseInt(pc, 10);
+    out.ProductCategory = Number.isFinite(n) ? n : null;
+  }
+  out.Path = tag('Path');
+  out.Name = tag('Name');
+  return out;
+}
+
 function parseMyItemListXml(xml) {
   const out = { items: [], totalResultsAvailable: null, totalResultsReturned: null, firstResultPosition: null };
   if (typeof xml !== 'string' || xml.length === 0) return out;
@@ -710,6 +743,49 @@ const server = http.createServer(async (req, res) => {
         totalResultsAvailable: parsed.totalResultsAvailable,
         totalResultsReturned: parsed.totalResultsReturned,
         firstResultPosition: parsed.firstResultPosition,
+      }));
+      return;
+    }
+
+    // POST /yahoo/get-item-detail
+    //   Phase E-11-b: 既存 Yahoo 出品 1 件の category/path を取得する。
+    //   request body: { itemCode: string }
+    //   Yahoo itemInfo (getItemDetail) API へ token + 署名付きで forward。
+    //   レスポンス XML を JSON に変換して返す:
+    //     { ok: true, ItemCode, ProductCategory, Path, Name }
+    if (pathname === '/yahoo/get-item-detail' && req.method === 'POST') {
+      const raw = await readBody(req);
+      let body;
+      try { body = JSON.parse(raw); }
+      catch (_) {
+        throw new Error('get-item-detail: invalid JSON body');
+      }
+      const itemCode = String(body.itemCode || '').trim();
+      if (!itemCode) throw new Error('get-item-detail: itemCode is required');
+      const qs = new URLSearchParams({
+        seller_id: YAHOO_SELLER_ID,
+        item_code: itemCode,
+      }).toString();
+      console.log(`[${ts()}] Yahoo getItemDetail: item_code=${itemCode}`);
+      const r = await callYahooAPIRaw('itemInfo', {
+        method: 'GET',
+        body: null,
+        queryString: qs,
+      });
+      if (r.status !== 200) {
+        // 上流エラーはそのまま XML で返す
+        res.writeHead(r.status, { 'Content-Type': 'application/xml' });
+        res.end(r.body);
+        return;
+      }
+      const parsed = parseGetItemDetailXml(r.body);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        ItemCode: parsed.ItemCode,
+        ProductCategory: parsed.ProductCategory,
+        Path: parsed.Path,
+        Name: parsed.Name,
       }));
       return;
     }
