@@ -20,6 +20,7 @@ import {
   stealStaleRunningRuns,
 } from '../lib/yahoo-store-sync.js';
 import { detectMigrationCandidates } from '../lib/diff-detector.js';
+import { backfillRakutenTitles, countMissingRakutenTitles } from '../lib/rakuten-title-backfill.js';
 
 const RYS_FULL_LEASE_MS = 90 * 60 * 1000; // baseline ~数十秒 + diff ~数十秒、 余裕 90 分
 
@@ -125,6 +126,18 @@ export async function runRysFullSync({
       if (e.statusCode) err.statusCode = e.statusCode;
       err.partial = { ...result, durationMs: Date.now() - t0 };
       throwToCaller = err;
+    }
+  }
+
+  // (2.5) Phase E-9: candidate に楽天タイトルを backfill (best-effort)
+  //       diff 成功時のみ実行 (dryRun でも書く: title cache は表示用なので consistency 不問)。
+  //       throw されても sync 全体は止めず result.titleBackfill に記録。
+  if (!throwToCaller) {
+    try {
+      const r = await backfillRakutenTitles({ db, limit: 100 });
+      result.titleBackfill = { ...r, remaining: countMissingRakutenTitles(db) };
+    } catch (e) {
+      result.titleBackfill = { error: String(e.message || e).slice(0, 500) };
     }
   }
 
