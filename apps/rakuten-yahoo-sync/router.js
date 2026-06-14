@@ -34,6 +34,13 @@ import {
   kindLabel,
 } from './lib/exclusion.js';
 import { runRysFullSync } from './services/rys-full-sync.js';
+import {
+  startBulkPublish,
+  listFailedItemCodes,
+  getBatchStatus,
+  getBatchItems,
+  getRunningBatch,
+} from './services/bulk-publish.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -825,6 +832,91 @@ router.post('/api/exclusions/change-kind', (req, res) => {
     if (e.code === 'EXCLUSION_NOT_ACTIVE') return res.status(404).json({ status: 'fail', code: e.code, error: e.message });
     if (e.code === 'EXCLUSION_KIND_UNCHANGED') return res.status(409).json({ status: 'fail', code: e.code, error: e.message });
     if (/exclusion:/.test(e.message)) return res.status(400).json({ status: 'fail', error: e.message });
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+// ───────────────── Phase E-6-3: 一括 publish + エラー再実行 ─────────────────
+
+/**
+ * 一括 publish trigger。 itemCodes [] を順次 publish。 即時に batch_id を返し、 実行は背景で続行。
+ *   body: { itemCodes: string[], triggeredBy?: 'manual' | 'retry_failed' }
+ *   res:  202 + { batchId, total } / 400 / 403 (kill-switch) / 409 (concurrent batch)
+ */
+router.post('/api/publish/bulk/start', (req, res) => {
+  try {
+    const db = getDB();
+    const body = req.body || {};
+    const itemCodes = body.itemCodes;
+    const triggeredBy = body.triggeredBy === 'retry_failed' ? 'retry_failed' : 'manual';
+    const result = startBulkPublish({ db, itemCodes, triggeredBy });
+    audit(db, 'bulk_publish_start', { batchId: result.batchId, total: result.total, triggeredBy });
+    return res.status(202).json({ status: 'ok', ...result });
+  } catch (e) {
+    if (e.statusCode === 400) return res.status(400).json({ status: 'fail', error: e.message });
+    if (e.statusCode === 403) return res.status(403).json({ status: 'fail', error: e.message });
+    if (/UNIQUE/.test(e.message) && /bulk_publish_batches/.test(e.message)) {
+      return res.status(409).json({ status: 'fail', error: 'A bulk publish batch is already running' });
+    }
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+/**
+ * 失敗 publish の itemCodes を一括再実行 (= retry_failed)。
+ *   body: { limit?: number } default 50
+ */
+router.post('/api/publish/bulk/retry-failed', (req, res) => {
+  try {
+    const db = getDB();
+    const body = req.body || {};
+    // Codex R1 Medium-4: limit は最大 50 (E-6-3 設計スコープに準拠、 retry 大量実行で Yahoo レート逸脱を防ぐ)
+    const limit = Number.isInteger(body.limit) && body.limit > 0 && body.limit <= 50 ? body.limit : 50;
+    const itemCodes = listFailedItemCodes(db, { limit });
+    if (itemCodes.length === 0) {
+      return res.json({ status: 'ok', batchId: null, total: 0, message: '失敗中の publish はありません' });
+    }
+    const result = startBulkPublish({ db, itemCodes, triggeredBy: 'retry_failed' });
+    audit(db, 'bulk_publish_retry_failed', { batchId: result.batchId, total: result.total });
+    return res.status(202).json({ status: 'ok', ...result, itemCodes });
+  } catch (e) {
+    if (e.statusCode === 400) return res.status(400).json({ status: 'fail', error: e.message });
+    if (e.statusCode === 403) return res.status(403).json({ status: 'fail', error: e.message });
+    if (/UNIQUE/.test(e.message)) return res.status(409).json({ status: 'fail', error: 'A bulk publish batch is already running' });
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+/**
+ * 現在 running な batch を返す (UI ヘッダーで 「実行中: N/M」 を表示するため)。
+ *   Codex R1 Medium-1: static route は parameter route より前に登録 (Express は :batchId が active を食う)。
+ */
+router.get('/api/publish/bulk/active/current', (req, res) => {
+  try {
+    const db = getDB();
+    return res.json({ status: 'ok', batch: getRunningBatch(db) });
+  } catch (e) {
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+/**
+ * batch の進捗 (polling 用)。
+ *   res: { batch, items? } (items は ?withItems=1 で含める、 進捗 polling 中は省略)
+ */
+router.get('/api/publish/bulk/:batchId', (req, res) => {
+  try {
+    const db = getDB();
+    const batchId = Number(req.params.batchId);
+    if (!Number.isInteger(batchId) || batchId <= 0) {
+      return res.status(400).json({ status: 'fail', error: 'invalid batchId' });
+    }
+    const batch = getBatchStatus(db, batchId);
+    if (!batch) return res.status(404).json({ status: 'fail', error: 'batch not found' });
+    const includeItems = req.query.withItems === '1' || req.query.withItems === 'true';
+    const items = includeItems ? getBatchItems(db, batchId) : null;
+    return res.json({ status: 'ok', batch, items });
+  } catch (e) {
     return res.status(500).json({ status: 'fail', error: e.message });
   }
 });

@@ -70,6 +70,16 @@
       display: inline-block; background: #fff8e1; color: #5d4037; padding: .15em .7em;
       border-radius: 1em; font-size: .85rem; margin: .15rem .3rem .15rem 0;
     }
+    /* E-6-3 一括選択モード */
+    .bulk-checkbox-wrap { display: none; padding-right: .75rem; }
+    body.bulk-mode .product-card { cursor: default; grid-template-columns: 28px 56px 1fr auto; }
+    body.bulk-mode .bulk-checkbox-wrap { display: flex; align-items: center; }
+    .bulk-bar {
+      position: sticky; top: 0; z-index: 1040; background: #fff8c5; border: 1px solid #f0d97a;
+      border-radius: .5rem; padding: .6rem 1rem; margin-bottom: .75rem;
+      display: none; justify-content: space-between; align-items: center;
+    }
+    body.bulk-mode .bulk-bar { display: flex; }
   </style>
 </head>
 <body>
@@ -162,14 +172,34 @@
     <div class="summary-card">
       <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
         <h5 class="mb-0">🛒 商品リスト</h5>
-        <form method="GET" class="d-flex gap-2 align-items-center">
-          <input type="hidden" name="filter" value="<%= filter %>">
-          <input class="form-control form-control-sm" type="search" name="q" placeholder="商品コード / タイトルで絞り込み"
-                 value="<%= search %>" style="width: 280px;">
-          <% if (search) { %>
-            <a href="?filter=<%= filter %>" class="btn btn-sm btn-outline-secondary">クリア</a>
+        <div class="d-flex gap-2 align-items-center">
+          <!-- E-6-3: 一括選択モード toggle + 失敗再実行 -->
+          <% if (filter === 'actionable' && summary.actionable > 0) { %>
+            <button class="btn btn-sm btn-outline-info js-toggle-bulk-mode">☑ 一括選択モード</button>
           <% } %>
-        </form>
+          <button class="btn btn-sm btn-outline-warning js-retry-failed-publish" title="失敗中の publish をまとめて再実行">🔁 失敗中を再実行</button>
+          <form method="GET" class="d-flex gap-2 align-items-center">
+            <input type="hidden" name="filter" value="<%= filter %>">
+            <input class="form-control form-control-sm" type="search" name="q" placeholder="商品コード / タイトルで絞り込み"
+                   value="<%= search %>" style="width: 240px;">
+            <% if (search) { %>
+              <a href="?filter=<%= filter %>" class="btn btn-sm btn-outline-secondary">クリア</a>
+            <% } %>
+          </form>
+        </div>
+      </div>
+
+      <!-- E-6-3: 一括選択中のバー -->
+      <div class="bulk-bar">
+        <div>
+          ☑ <strong id="bulkSelectedCount">0</strong> 商品選択中
+          <button class="btn btn-sm btn-link js-bulk-select-all">すべて選択</button>
+          <button class="btn btn-sm btn-link js-bulk-deselect-all">すべて解除</button>
+        </div>
+        <div>
+          <button class="btn btn-sm btn-success js-bulk-publish-execute" disabled>▶️ 選択した N 商品を一括登録</button>
+          <button class="btn btn-sm btn-outline-secondary js-toggle-bulk-mode">キャンセル</button>
+        </div>
       </div>
 
       <div class="mb-3">
@@ -207,6 +237,13 @@
       <% } else { %>
         <% for (const p of products) { %>
           <div class="product-card js-open-detail" data-item-code="<%= p.itemCode %>" role="button" tabindex="0" aria-label="<%= p.itemCode %> の詳細を見る">
+            <% if (p.status === 'actionable') { %>
+              <div class="bulk-checkbox-wrap">
+                <input type="checkbox" class="form-check-input js-bulk-checkbox" data-item-code="<%= p.itemCode %>" aria-label="<%= p.itemCode %> を一括選択">
+              </div>
+            <% } else { %>
+              <div class="bulk-checkbox-wrap"></div>
+            <% } %>
             <div class="thumb-placeholder">
               <%= (p.yahooTitle || p.itemCode).slice(0, 1).toUpperCase() %>
             </div>
@@ -341,6 +378,27 @@
     </div>
 
     <div id="actionResult"></div>
+  </div>
+
+  <!-- 一括 publish 進行モーダル (Phase E-6-3) -->
+  <div id="bulkPublishModal" class="modal" tabindex="-1" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,.5); z-index:1080;">
+    <div class="card" style="max-width: 640px; margin: 60px auto;">
+      <div class="card-header">
+        <strong id="bulkPublishTitle">一括登録中...</strong>
+      </div>
+      <div class="card-body">
+        <div id="bulkPublishProgress" class="mb-3">
+          <div class="progress" style="height: 8px;">
+            <div id="bulkPublishProgressBar" class="progress-bar bg-success" style="width: 0%;"></div>
+          </div>
+          <div class="small text-muted mt-1" id="bulkPublishProgressText">準備中...</div>
+        </div>
+        <div id="bulkPublishResults" style="max-height: 320px; overflow-y: auto;"></div>
+      </div>
+      <div class="card-footer d-flex justify-content-end gap-2">
+        <button class="btn btn-secondary btn-sm js-close-bulk-publish-modal" disabled>閉じる</button>
+      </div>
+    </div>
   </div>
 
   <!-- 商品詳細ドロワー (Phase E-6-2) -->
@@ -1052,6 +1110,162 @@ function buildDetailContent(data) {
   return frag;
 }
 
+// ───── 一括 publish (Phase E-6-3) ─────
+const bulkSelected = new Set();
+function updateBulkBar() {
+  const count = bulkSelected.size;
+  document.getElementById('bulkSelectedCount').textContent = String(count);
+  const btn = document.querySelector('.js-bulk-publish-execute');
+  if (btn) {
+    btn.textContent = '▶️ 選択した ' + count + ' 商品を一括登録';
+    btn.disabled = count === 0;
+  }
+}
+function toggleBulkMode() {
+  const on = document.body.classList.toggle('bulk-mode');
+  if (!on) {
+    bulkSelected.clear();
+    document.querySelectorAll('.js-bulk-checkbox').forEach((cb) => { cb.checked = false; });
+  }
+  updateBulkBar();
+}
+function bulkSelectAll() {
+  for (const cb of document.querySelectorAll('.js-bulk-checkbox')) {
+    cb.checked = true;
+    bulkSelected.add(cb.dataset.itemCode);
+  }
+  updateBulkBar();
+}
+function bulkDeselectAll() {
+  bulkSelected.clear();
+  document.querySelectorAll('.js-bulk-checkbox').forEach((cb) => { cb.checked = false; });
+  updateBulkBar();
+}
+
+function openBulkPublishModal(title) {
+  const modal = document.getElementById('bulkPublishModal');
+  document.getElementById('bulkPublishTitle').textContent = title || '一括登録中...';
+  document.getElementById('bulkPublishProgressBar').style.width = '0%';
+  document.getElementById('bulkPublishProgressText').textContent = '準備中...';
+  document.getElementById('bulkPublishResults').innerHTML = '';
+  document.querySelector('.js-close-bulk-publish-modal').disabled = true;
+  modal.style.display = 'block';
+}
+function closeBulkPublishModal() {
+  document.getElementById('bulkPublishModal').style.display = 'none';
+  // 成功あれば reload して件数集計を更新
+  if (window._bulkPublishSucceededCount > 0) location.reload();
+}
+function setBulkProgress(batch) {
+  const done = (batch.succeeded || 0) + (batch.failed || 0);
+  const total = batch.total || 0;
+  const pct = total > 0 ? Math.round(done * 100 / total) : 0;
+  document.getElementById('bulkPublishProgressBar').style.width = pct + '%';
+  document.getElementById('bulkPublishProgressText').textContent =
+    done + '/' + total + ' 完了 (成功 ' + (batch.succeeded || 0) + ' / 失敗 ' + (batch.failed || 0) + ')';
+}
+function appendBulkResultRow(item) {
+  const wrap = document.getElementById('bulkPublishResults');
+  const row = document.createElement('div');
+  row.className = 'small py-1 border-bottom';
+  const status = item.status === 'success' ? '✅'
+    : item.status === 'dedupe' ? '⚠'
+    : item.status === 'flag_off' ? '🔒'
+    : item.status === 'readiness_blocked' ? '🟡'
+    : '❌';
+  row.textContent = status + ' ' + item.item_code + ': ' + (item.status || '?');
+  if (item.error_message) {
+    const err = document.createElement('div');
+    err.className = 'text-danger small ms-3';
+    err.textContent = item.error_message;
+    row.appendChild(err);
+  }
+  wrap.appendChild(row);
+}
+
+async function pollBulkBatch(batchId) {
+  let lastDone = 0;
+  while (true) {
+    try {
+      const res = await fetch('/apps/rakuten-yahoo-sync/api/publish/bulk/' + batchId + '?withItems=1');
+      const data = await res.json();
+      if (!data.batch) break;
+      setBulkProgress(data.batch);
+      // 完了/失敗状態に到達したら items を一覧化して終了
+      if (data.batch.status !== 'running') {
+        document.getElementById('bulkPublishResults').innerHTML = '';
+        for (const it of (data.items || [])) appendBulkResultRow(it);
+        document.querySelector('.js-close-bulk-publish-modal').disabled = false;
+        window._bulkPublishSucceededCount = data.batch.succeeded || 0;
+        document.getElementById('bulkPublishTitle').textContent =
+          data.batch.status === 'completed' ? '✅ 一括登録完了' :
+          data.batch.status === 'failed' ? '❌ 一括登録失敗' : '⚠ 一括登録中止';
+        break;
+      }
+      lastDone = (data.batch.succeeded || 0) + (data.batch.failed || 0);
+    } catch (e) {
+      document.getElementById('bulkPublishProgressText').textContent = '進捗取得エラー: ' + e.message;
+      document.querySelector('.js-close-bulk-publish-modal').disabled = false;
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 800));
+  }
+}
+
+async function executeBulkPublish() {
+  const itemCodes = Array.from(bulkSelected);
+  if (itemCodes.length === 0) return;
+  openBulkPublishModal('一括登録中... (' + itemCodes.length + ' 商品)');
+  window._bulkPublishSucceededCount = 0;
+  try {
+    const res = await fetch('/apps/rakuten-yahoo-sync/api/publish/bulk/start', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ itemCodes, triggeredBy: 'manual' }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.batchId) {
+      document.getElementById('bulkPublishTitle').textContent = '❌ 開始失敗';
+      document.getElementById('bulkPublishProgressText').textContent = data.error || ('HTTP ' + res.status);
+      document.querySelector('.js-close-bulk-publish-modal').disabled = false;
+      return;
+    }
+    await pollBulkBatch(data.batchId);
+  } catch (e) {
+    document.getElementById('bulkPublishTitle').textContent = '❌ ネットワークエラー';
+    document.getElementById('bulkPublishProgressText').textContent = e.message;
+    document.querySelector('.js-close-bulk-publish-modal').disabled = false;
+  }
+}
+
+async function retryFailedPublish() {
+  if (!confirm('失敗中の publish をまとめて再実行します。\nよろしいですか?')) return;
+  openBulkPublishModal('失敗中の publish を再実行中...');
+  window._bulkPublishSucceededCount = 0;
+  try {
+    const res = await fetch('/apps/rakuten-yahoo-sync/api/publish/bulk/retry-failed', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ limit: 50 }),
+    });
+    const data = await res.json();
+    if (data.batchId === null && data.total === 0) {
+      document.getElementById('bulkPublishTitle').textContent = '⚠ 失敗中の publish はありません';
+      document.querySelector('.js-close-bulk-publish-modal').disabled = false;
+      return;
+    }
+    if (!res.ok || !data.batchId) {
+      document.getElementById('bulkPublishTitle').textContent = '❌ 開始失敗';
+      document.getElementById('bulkPublishProgressText').textContent = data.error || ('HTTP ' + res.status);
+      document.querySelector('.js-close-bulk-publish-modal').disabled = false;
+      return;
+    }
+    await pollBulkBatch(data.batchId);
+  } catch (e) {
+    document.getElementById('bulkPublishTitle').textContent = '❌ ネットワークエラー';
+    document.getElementById('bulkPublishProgressText').textContent = e.message;
+    document.querySelector('.js-close-bulk-publish-modal').disabled = false;
+  }
+}
+
 // 起動時 event 配線
 document.addEventListener('DOMContentLoaded', () => {
   document.querySelector('.js-open-exclusion-mgmt')?.addEventListener('click', openExclusionModal);
@@ -1067,20 +1281,40 @@ document.addEventListener('DOMContentLoaded', () => {
   document.querySelectorAll('.js-close-diff-sync-modal').forEach((el) => el.addEventListener('click', closeDiffSyncModal));
 
   // E-6-2: card クリック → drawer 表示。
-  //   action buttons (.actions 内) のクリックは drawer を開かない (publish / Notion link 優先)。
+  //   action buttons (.actions 内) と bulk checkbox のクリックは drawer を開かない。
   for (const card of document.querySelectorAll('.js-open-detail')) {
     card.addEventListener('click', (ev) => {
       if (ev.target.closest('.actions')) return;
+      if (ev.target.closest('.bulk-checkbox-wrap')) return;
+      if (document.body.classList.contains('bulk-mode')) return; // bulk mode 中は drawer 開かない
       const code = ev.currentTarget.dataset.itemCode;
       if (code) openDetailDrawer(code);
     });
     card.addEventListener('keydown', (ev) => {
       if (ev.key === 'Enter' || ev.key === ' ') {
         if (ev.target.closest('.actions')) return;
+        if (ev.target.closest('.bulk-checkbox-wrap')) return;
+        if (document.body.classList.contains('bulk-mode')) return;
         ev.preventDefault();
         const code = ev.currentTarget.dataset.itemCode;
         if (code) openDetailDrawer(code);
       }
+    });
+  }
+
+  // E-6-3: 一括選択 + 一括 publish
+  document.querySelectorAll('.js-toggle-bulk-mode').forEach((el) => el.addEventListener('click', toggleBulkMode));
+  document.querySelector('.js-bulk-select-all')?.addEventListener('click', bulkSelectAll);
+  document.querySelector('.js-bulk-deselect-all')?.addEventListener('click', bulkDeselectAll);
+  document.querySelector('.js-bulk-publish-execute')?.addEventListener('click', executeBulkPublish);
+  document.querySelector('.js-retry-failed-publish')?.addEventListener('click', retryFailedPublish);
+  document.querySelectorAll('.js-close-bulk-publish-modal').forEach((el) => el.addEventListener('click', closeBulkPublishModal));
+  for (const cb of document.querySelectorAll('.js-bulk-checkbox')) {
+    cb.addEventListener('change', (ev) => {
+      const code = ev.currentTarget.dataset.itemCode;
+      if (ev.currentTarget.checked) bulkSelected.add(code);
+      else bulkSelected.delete(code);
+      updateBulkBar();
     });
   }
   document.querySelectorAll('.js-close-detail-drawer').forEach((el) => el.addEventListener('click', closeDetailDrawer));
