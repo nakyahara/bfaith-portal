@@ -1384,7 +1384,7 @@ async function seedApply() {
 // ── 2024年7月より前の誤りデータ削除 ──
 const PURGE_BEFORE = '2024-07';
 function renderPurgeReport(d) {
-  const c = d.counts || {};
+  const c = d.deleted || d.counts || {};
   let h = '<div class="note-text" style="margin-top:8px">削除対象月（' + (d.months || []).length + 'ヶ月）: ' + ((d.months || []).join(', ') || 'なし') + '</div>';
   h += '<table style="margin-top:6px"><thead><tr><th>テーブル</th><th>削除件数</th></tr></thead><tbody>';
   for (const t of Object.keys(c)) h += '<tr><td>' + t + '</td><td>' + c[t] + '</td></tr>';
