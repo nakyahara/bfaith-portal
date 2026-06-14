@@ -16,6 +16,7 @@ import { evaluateReadiness, persistJobReadiness } from './readiness-check.js';
 import { runLeadTimePreflight } from '../lib/yahoo-lead-time.js';
 import { imagePreflightStub } from '../lib/yahoo-image.js';
 import { getCustomPatternStrings } from '../lib/image-exclusion-patterns.js';
+import { resolveCategoryAndPath } from './category-resolver.js';
 import { buildYahooEditItemFields, resolvePrice } from './field-mapper.js';
 
 function loadNotionOverride(db, manageNumber) {
@@ -122,6 +123,24 @@ export async function evaluateItemForPublish({
   }
   const imagePreflight = _imagePreflight(rakutenItem, { customPatterns });
 
+  // 5.5. Phase E-11-c: category-resolver で productCategory + path を自動解決
+  //   - 引数 productCategory / pathName が明示されてればそれを優先 (caller が手動指定可能)
+  //   - 無ければ Notion override → 学習辞書 (genre_yahoo_category_mapping) の順
+  //   - 解決できなければ readiness が product_category_unresolved / path_unresolved で blocked
+  let resolvedCategory = productCategory;
+  let resolvedPath = pathName;
+  let categorySource = 'caller';   // 「呼び出し側で明示指定」
+  let categorySampleCount = null;
+  if (!resolvedCategory || !resolvedPath) {
+    const candidate = db.prepare('SELECT rakuten_genre_id FROM migration_candidates WHERE item_code = ?').get(itemCode);
+    const rakutenGenreId = candidate?.rakuten_genre_id || null;
+    const r = resolveCategoryAndPath({ db, rakutenGenreId, notionOverride });
+    if (!resolvedCategory && r.category != null) resolvedCategory = r.category;
+    if (!resolvedPath && r.path) resolvedPath = r.path;
+    categorySource = r.source;
+    categorySampleCount = r.sampleCount || null;
+  }
+
   // 6. readiness
   const rakutenTaxRate = rakutenItem.payment?.taxRate;
   const resolvedPrice = resolvePrice({ notionOverride, deliveryRow, rakutenItem });
@@ -131,9 +150,9 @@ export async function evaluateItemForPublish({
     rakutenTaxRate,
     deliveryRow,
     variationResult,
-    productCategory,
-    yahooProductCategoryId,
-    path: pathName,
+    productCategory: resolvedCategory,
+    yahooProductCategoryId: yahooProductCategoryId || resolvedCategory,
+    path: resolvedPath,
     resolvedPrice,
     imagePreflight,
     leadTimePreflight,
@@ -154,7 +173,7 @@ export async function evaluateItemForPublish({
     }
   }
 
-  // 8. ok なら fields 構築
+  // 8. ok なら fields 構築 (E-11-c: 自動解決後の category/path を渡す)
   let fields;
   if (readiness.status === 'ok') {
     fields = buildYahooEditItemFields({
@@ -162,8 +181,8 @@ export async function evaluateItemForPublish({
       notionOverride,
       deliveryRow,
       variationResult,
-      productCategory,
-      pathName,
+      productCategory: resolvedCategory,
+      pathName: resolvedPath,
       aucPrefCode,
     });
     fields.display = 1; // readiness pass → display=1 昇格
@@ -184,6 +203,11 @@ export async function evaluateItemForPublish({
       rakutenImages: rakutenItem.images || [],
       // Phase E-8: executor が uploadRakutenImagesToYahoo に渡す custom patterns (snapshot)
       customImagePatterns: customPatterns,
+      // Phase E-11-c: category 解決元 (notion / learned / unresolved / caller) と sample count を debug に残す
+      categorySource,
+      categorySampleCount,
+      resolvedCategory,
+      resolvedPath,
     },
   };
 }
