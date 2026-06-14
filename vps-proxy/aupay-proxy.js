@@ -288,9 +288,10 @@ async function yahooOrderList(startDate, endDate) {
  *   - 署名 (RSA + X-sws-signature) と Bearer token は既存と同じロジック
  *   - body は Buffer 受け取り可 (binary multipart 用途)
  */
-async function callYahooAPIRaw(endpoint, { method = 'POST', contentType = 'application/xml; charset=utf-8', body = null, queryString = '' } = {}) {
+async function callYahooAPIRaw(endpoint, { method = 'POST', contentType = 'application/xml; charset=utf-8', body = null, queryString = '', rawUrl = null } = {}) {
   const accessToken = await getAccessToken();
-  const url = `${YAHOO_API_BASE}/${endpoint}${queryString ? '?' + queryString : ''}`;
+  // rawUrl があれば base 無視で直接使う (Phase E-7-a: getLeadTimeList は別 base /shopping/ で叩く必要があるため)
+  const url = rawUrl || `${YAHOO_API_BASE}/${endpoint}${queryString ? '?' + queryString : ''}`;
   const headers = {
     'Authorization': `Bearer ${accessToken}`,
   };
@@ -571,13 +572,18 @@ const server = http.createServer(async (req, res) => {
     // GET /yahoo/getLeadTimeList?seller_id=xxx
     //   Yahoo getLeadTimeList API へ token + 署名付きで forward
     //   leads(発送日設定)マスタの id 一覧を取得 (RYS readiness preflight 用)
+    //   注: getLeadTimeList は他 publish 系 (editItem / myItemList) と base が違う。
+    //       publish 系: https://circus.shopping.yahooapis.jp/ShoppingWebService/V1/...
+    //       lead time:  https://circus.shopping.yahooapis.jp/shopping/getLeadTimeList
+    //       (ローカル RYS src/services/yahoo-lead-time.js の LEAD_TIME_ENDPOINT='/shopping/getLeadTimeList' と整合)
     if (pathname === '/yahoo/getLeadTimeList' && req.method === 'GET') {
       const sellerId = url.searchParams.get('seller_id') || YAHOO_SELLER_ID;
       console.log(`[${ts()}] Yahoo getLeadTimeList: seller=${sellerId}`);
+      const leadTimeUrl = `https://circus.shopping.yahooapis.jp/shopping/getLeadTimeList?seller_id=${encodeURIComponent(sellerId)}`;
       const r = await callYahooAPIRaw('getLeadTimeList', {
         method: 'GET',
         body: null,
-        queryString: `seller_id=${encodeURIComponent(sellerId)}`,
+        rawUrl: leadTimeUrl,
       });
       res.writeHead(r.status, { 'Content-Type': 'application/xml' });
       res.end(r.body);
