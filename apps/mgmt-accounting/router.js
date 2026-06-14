@@ -215,8 +215,8 @@ router.post('/admin/purge-months-before', (req, res) => {
   if (!checkAuth(req, res)) return;
   const db = getMirrorDB();
   const before = String((req.body && req.body.before) || req.query.before || '').trim();
-  if (!/^\d{4}-\d{2}$/.test(before)) {
-    return res.status(400).json({ error: 'bad_before', message: 'before は YYYY-MM 形式で指定してください' });
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(before)) {
+    return res.status(400).json({ error: 'bad_before', message: 'before は YYYY-MM 形式(月は01〜12)で指定してください' });
   }
   if (before > PURGE_MAX_BEFORE) {
     return res.status(400).json({ error: 'before_too_large',
@@ -237,13 +237,22 @@ router.post('/admin/purge-months-before', (req, res) => {
   }
   const months = [...monthSet].sort();
   if (dryRun) return res.json({ ok: true, dry_run: true, before, months, counts });
-  const tx = db.transaction(() => {
-    for (const t of tables) {
-      try { db.prepare(`DELETE FROM ${t} WHERE year_month < ?`).run(before); } catch {}
-    }
-  });
-  tx();
-  res.json({ ok: true, dry_run: false, before, months, deleted: counts });
+  // 本削除: 1tx で全テーブル DELETE。1つでも失敗したら例外を外へ出して全 rollback(Codex High:
+  // catch で握りつぶすと一部だけ削除されて commit される事故になるため catch しない)。
+  // 実削除件数(.changes)を返す。before<=PURGE_MAX_BEFORE<FROZEN_THROUGH_YM なので対象は全て凍結月
+  // = 削除後にライブ再計算で復活しない。
+  let deleted;
+  try {
+    const tx = db.transaction(() => {
+      const out = {};
+      for (const t of tables) out[t] = db.prepare(`DELETE FROM ${t} WHERE year_month < ?`).run(before).changes;
+      return out;
+    });
+    deleted = tx();
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: 'delete_failed', message: e.message });
+  }
+  res.json({ ok: true, dry_run: false, before, months, deleted });
 });
 
 // 一括確定: 指定月を除く全月について calculate を実行
