@@ -24,6 +24,7 @@ import { evaluateItemForPublish } from './services/publish-pipeline.js';
 import { fetchAllItemCodes, fetchItemDetail } from './lib/rakuten-rms-proxy.js';
 import { executePublish, isPublishEnabled, buildIdempotencyKey } from './services/publish-executor.js';
 import { translateReason, summarizeReasons, categorizeReason } from './lib/reason-translator.js';
+import { resolveCategoryAndPath } from './services/category-resolver.js';
 import {
   excludeMigrationItem,
   restoreMigrationExclusion,
@@ -148,6 +149,7 @@ function listProductsForUI(db, { filter = 'all', search = '' } = {}) {
       c.item_code,
       c.rakuten_manage_number,
       c.rakuten_title,
+      c.rakuten_genre_id,
       c.status                          AS candidate_status,
       c.first_detected_at,
       c.last_detected_at,
@@ -161,6 +163,9 @@ function listProductsForUI(db, { filter = 'all', search = '' } = {}) {
       no.notion_tax_rate,
       no.notion_status,
       no.synced_at,
+      -- Phase E-11-d: Notion 商品マスターからの Yahoo!カテゴリ確定値 (列が無ければ NULL)
+      COALESCE(no.notion_product_category, NULL) AS notion_product_category,
+      COALESCE(no.notion_path, NULL) AS notion_path,
       j.readiness_status,
       j.readiness_blocked_reasons,
       j.last_readiness_at,
@@ -222,12 +227,26 @@ function listProductsForUI(db, { filter = 'all', search = '' } = {}) {
     } else if (r.candidate_status === 'stale') {
       status = 'stale';
     } else {
-      // candidate / resolved 状態だがまだ done でない → Notion 必須 4 項目で actionable/fixable 判定
+      // candidate / resolved 状態だがまだ done でない → Notion 必須 4 項目 + Yahoo カテゴリ 2 項目で判定
       const missing = [];
       if (!r.yahoo_title)            missing.push('notion_title_missing');
       if (!r.yahoo_price)            missing.push('price_invalid_or_zero');
       if (!r.notion_delivery_label)  missing.push('delivery_mapping_unresolved');
       if (!r.notion_tax_rate)        missing.push('notion_tax_rate_missing');
+      // Phase E-11-d: category-resolver と整合させる。 自動推定で取れるなら actionable、 取れないなら fixable
+      let categoryResolved = null;
+      try {
+        categoryResolved = resolveCategoryAndPath({
+          db,
+          rakutenGenreId: r.rakuten_genre_id,
+          notionOverride: {
+            product_category: r.notion_product_category || null,
+            path: r.notion_path || null,
+          },
+        });
+      } catch (_) { categoryResolved = { category: null, path: null, source: 'unresolved' }; }
+      if (categoryResolved?.category == null) missing.push('product_category_unresolved');
+      if (!categoryResolved?.path)            missing.push('path_unresolved');
       let existingReasons = [];
       if (r.readiness_blocked_reasons) {
         try { existingReasons = JSON.parse(r.readiness_blocked_reasons); } catch (_) {}
@@ -241,12 +260,20 @@ function listProductsForUI(db, { filter = 'all', search = '' } = {}) {
         reasons = summarized.items;
         notionFields = summarized.notionFields;
       }
+      // 表示用に保持 (drawer / list で 「推定: NNN / source: learned」 等を出す)
+      r._categoryResolved = categoryResolved;
     }
 
     return {
       itemCode:           r.item_code,
       rakutenManageNumber: r.rakuten_manage_number,
       rakutenTitle:       r.rakuten_title,
+      rakutenGenreId:     r.rakuten_genre_id,
+      // Phase E-11-d: 推定された Yahoo カテゴリ / path (drawer 表示用)
+      yahooCategoryResolved: r._categoryResolved?.category ?? null,
+      yahooPathResolved:     r._categoryResolved?.path ?? null,
+      categorySource:        r._categoryResolved?.source ?? 'unresolved',
+      categorySampleCount:   r._categoryResolved?.sampleCount ?? null,
       candidateStatus:    r.candidate_status,
       notionPageId:       r.notion_page_id,
       yahooTitle:         r.yahoo_title,
@@ -708,6 +735,19 @@ router.get('/api/products/:itemCode/detail', (req, res) => {
     if (job?.readiness_blocked_reasons) {
       try { readinessReasons = JSON.parse(job.readiness_blocked_reasons); } catch (_) {}
     }
+
+    // Phase E-11-d: drawer 表示用に Yahoo カテゴリ resolved を計算
+    let yahooCategoryResolved = null;
+    try {
+      yahooCategoryResolved = resolveCategoryAndPath({
+        db,
+        rakutenGenreId: candidate?.rakuten_genre_id || null,
+        notionOverride: notion ? {
+          product_category: notion.notion_product_category || null,
+          path: notion.notion_path || null,
+        } : null,
+      });
+    } catch (_) { yahooCategoryResolved = { category: null, path: null, source: 'unresolved' }; }
     const translatedReadiness = readinessReasons.length > 0
       ? summarizeReasons(readinessReasons).items
       : [];
@@ -727,6 +767,8 @@ router.get('/api/products/:itemCode/detail', (req, res) => {
         currentState: job.current_state,
       } : null,
       notionPageUrl: notion?.notion_page_id ? notionPageUrl(notion.notion_page_id) : null,
+      // Phase E-11-d: Yahoo カテゴリ resolved (drawer 表示)
+      yahooCategoryResolved,
     });
   } catch (e) {
     return res.status(500).json({ status: 'fail', error: e.message });

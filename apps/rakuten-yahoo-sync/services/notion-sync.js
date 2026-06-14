@@ -55,7 +55,29 @@ export function reconcilePages(db, pages, { allowDeleteDetection, runId }) {
   const selectByPageId = db.prepare(
     `SELECT rakuten_manage_number, source_hash FROM notion_overrides WHERE notion_page_id = ?`
   );
-  const insertStmt = db.prepare(`
+  // Phase E-11-d: notion_product_category / notion_path 列を sync 経路に追加。
+  //   - migration 014 未適用環境では prepare で例外 → fallback (旧 12 列のみ) で進める。
+  const NEW_COLUMNS_SUPPORTED = (() => {
+    try { db.prepare('SELECT notion_product_category FROM notion_overrides LIMIT 0').get(); return true; }
+    catch (_) { return false; }
+  })();
+  const insertStmt = db.prepare(NEW_COLUMNS_SUPPORTED ? `
+    INSERT INTO notion_overrides (
+      rakuten_manage_number, yahoo_title, yahoo_price, yahoo_price_sagawa,
+      notion_delivery_label, notion_tax_rate, notion_has_variation,
+      yahoo_headline, yahoo_caption_text, yahoo_caption_html, yahoo_jan,
+      notion_status, notion_product_category, notion_path,
+      raw_properties_json, source_hash, notion_page_id,
+      source_updated_at, sync_run_id, synced_at
+    ) VALUES (
+      @rakuten_manage_number, @yahoo_title, @yahoo_price, @yahoo_price_sagawa,
+      @notion_delivery_label, @notion_tax_rate, @notion_has_variation,
+      @yahoo_headline, @yahoo_caption_text, @yahoo_caption_html, @yahoo_jan,
+      @notion_status, @notion_product_category, @notion_path,
+      @raw_properties_json, @source_hash, @notion_page_id,
+      @source_updated_at, @sync_run_id, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    )
+  ` : `
     INSERT INTO notion_overrides (
       rakuten_manage_number, yahoo_title, yahoo_price, yahoo_price_sagawa,
       notion_delivery_label, notion_tax_rate, notion_has_variation,
@@ -70,7 +92,29 @@ export function reconcilePages(db, pages, { allowDeleteDetection, runId }) {
       @source_updated_at, @sync_run_id, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
     )
   `);
-  const updateStmt = db.prepare(`
+  const updateStmt = db.prepare(NEW_COLUMNS_SUPPORTED ? `
+    UPDATE notion_overrides SET
+      rakuten_manage_number = @rakuten_manage_number,
+      yahoo_title           = @yahoo_title,
+      yahoo_price           = @yahoo_price,
+      yahoo_price_sagawa    = @yahoo_price_sagawa,
+      notion_delivery_label = @notion_delivery_label,
+      notion_tax_rate       = @notion_tax_rate,
+      notion_has_variation  = @notion_has_variation,
+      yahoo_headline        = @yahoo_headline,
+      yahoo_caption_text    = @yahoo_caption_text,
+      yahoo_caption_html    = @yahoo_caption_html,
+      yahoo_jan             = @yahoo_jan,
+      notion_status         = @notion_status,
+      notion_product_category = @notion_product_category,
+      notion_path           = @notion_path,
+      raw_properties_json   = @raw_properties_json,
+      source_hash           = @source_hash,
+      source_updated_at     = @source_updated_at,
+      sync_run_id           = @sync_run_id,
+      synced_at             = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    WHERE notion_page_id = @notion_page_id
+  ` : `
     UPDATE notion_overrides SET
       rakuten_manage_number = @rakuten_manage_number,
       yahoo_title           = @yahoo_title,

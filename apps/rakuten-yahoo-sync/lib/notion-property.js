@@ -63,6 +63,11 @@ export const PROPERTY_EXTRACTORS = {
   yahoo_caption_html:    { prop: 'HTML_商品説明文',                        extract: extractRichText },
   yahoo_jan:             { prop: 'JANコード',                              extract: extractNumberAsString },
   notion_status:         { prop: 'Status',                                 extract: extractSelect },
+  // Phase E-11-d: Yahoo!ショッピング カテゴリ確定値 + path 確定値
+  // Notion 商品マスターに 「Yahoo!カテゴリID」 + 「Yahoo!path」 列を追加すると取り込まれる。
+  // 列が無い場合は extract が null を返すので無害 (publish 時は学習辞書 fallback)。
+  notion_product_category: { prop: 'Yahoo!カテゴリID',                       extract: extractNumber },
+  notion_path:             { prop: 'Yahoo!path',                            extract: extractRichText },
 };
 
 /**

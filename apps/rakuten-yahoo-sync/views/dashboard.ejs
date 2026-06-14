@@ -1270,10 +1270,23 @@ function buildDetailContent(data) {
 
   // 基本情報 (candidate)
   if (data.candidate) {
+    // Phase E-11-d: Yahoo カテゴリ自動推定の表示行
+    const ycr = data.yahooCategoryResolved || {};
+    const ycrLabel = (() => {
+      if (!ycr.category) return '(未解決)';
+      const src = ycr.source === 'notion' ? '✓ Notion 確定値' :
+                  ycr.source === 'learned' ? '🤖 自動推定 (sample=' + (ycr.sampleCount || '?') + ')' :
+                  ycr.source;
+      return ycr.category + ' / ' + (ycr.path || '(path 無し)') + ' [' + src + ']';
+    })();
+
     frag.appendChild(dlSection('🛒 候補メタ', [
       ['楽天商品コード', data.candidate.item_code],
       ['楽天 manage_number', data.candidate.rakuten_manage_number],
       ['楽天タイトル', data.candidate.rakuten_title || '(未取得)'],
+      ['楽天 genreId', data.candidate.rakuten_genre_id || '(未取得)'],
+      ['楽天 genre 階層', data.candidate.rakuten_genre_path || '(未取得)'],
+      ['Yahoo カテゴリ (推定)', ycrLabel],
       ['候補ステータス', data.candidate.status],
       ['初検出日時', data.candidate.first_detected_at],
       ['最終検出日時', data.candidate.last_detected_at],
@@ -1300,6 +1313,9 @@ function buildDetailContent(data) {
       ['佐川価格', data.notion.yahoo_price_sagawa !== null && data.notion.yahoo_price_sagawa !== undefined ? '¥' + Number(data.notion.yahoo_price_sagawa).toLocaleString() : null],
       ['配送方法', data.notion.notion_delivery_label],
       ['税率', data.notion.notion_tax_rate],
+      // Phase E-11-d: Notion master の確定 Yahoo!カテゴリ + path (列が無ければ null)
+      ['Yahoo!カテゴリ (Notion)', data.notion.notion_product_category || '(未入力)'],
+      ['Yahoo!path (Notion)', data.notion.notion_path || '(未入力)'],
       ['Notion ステータス', data.notion.notion_status],
       ['Notion 同期日時', data.notion.synced_at],
       ['Notion ページ', pageLink],
