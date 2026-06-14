@@ -151,11 +151,15 @@ function dedupeResponse(existing, idempotencyKey) {
  *   2. editItem を form-encoded で叩いて商品登録 (fields.display=1 で公開)
  *   失敗時は throw (caller が CAS finalize で 'failed' に倒す)
  */
-async function performRealPublish({ rakutenImages, fields, itemCode }) {
+async function performRealPublish({ rakutenImages, fields, itemCode, customPatterns = [] }) {
   if (!fields) throw new Error('performRealPublish: fields required');
 
-  // 1. 画像 upload
-  const imageResult = await uploadRakutenImagesToYahoo({ rakutenImages: rakutenImages || [], itemCode });
+  // 1. 画像 upload — Phase E-8: customPatterns で楽天ファイル名除外も反映
+  const imageResult = await uploadRakutenImagesToYahoo({
+    rakutenImages: rakutenImages || [],
+    itemCode,
+    customPatterns,
+  });
   if (imageResult.uploaded === 0) {
     throw new Error(`image_upload_zero: failed=${imageResult.failed}, errors=${imageResult.errors.join('; ')}`);
   }
@@ -340,6 +344,7 @@ export async function executePublish({
         rakutenImages: evalResult.debug?.rakutenImages || [],
         fields: evalResult.fields,
         itemCode,
+        customPatterns: evalResult.debug?.customImagePatterns || [],
       });
     } catch (e) {
       const errMsg = e instanceof YahooProxyError ? `yahoo_proxy: ${e.message}` : (e.message || String(e));

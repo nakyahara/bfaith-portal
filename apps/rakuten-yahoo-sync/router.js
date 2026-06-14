@@ -21,7 +21,7 @@ import { getDB } from './db.js';
 import { acquire, SyncLockError } from './lib/sync-lock.js';
 import { syncNotionOverrides } from './services/notion-sync.js';
 import { evaluateItemForPublish } from './services/publish-pipeline.js';
-import { fetchAllItemCodes } from './lib/rakuten-rms-proxy.js';
+import { fetchAllItemCodes, fetchItemDetail } from './lib/rakuten-rms-proxy.js';
 import { executePublish, isPublishEnabled, buildIdempotencyKey } from './services/publish-executor.js';
 import { translateReason, summarizeReasons, categorizeReason } from './lib/reason-translator.js';
 import {
@@ -41,6 +41,13 @@ import {
   getBatchItems,
   getRunningBatch,
 } from './services/bulk-publish.js';
+import {
+  listAllPatterns,
+  getCustomPatternStrings,
+  addPattern,
+  removePattern,
+} from './lib/image-exclusion-patterns.js';
+import { filterUploadableImageUrlsDetailed } from './lib/yahoo-image.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -916,6 +923,112 @@ router.get('/api/publish/bulk/:batchId', (req, res) => {
     const includeItems = req.query.withItems === '1' || req.query.withItems === 'true';
     const items = includeItems ? getBatchItems(db, batchId) : null;
     return res.json({ status: 'ok', batch, items });
+  } catch (e) {
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+// ───────────────── Phase E-8: 楽天画像ファイル名パターン除外管理 + 楽天画像ドロワー表示 ─────────────────
+
+/**
+ * 組込み (coupon/review) + ユーザー追加分の image_exclusion_patterns を返す。
+ *   res: { patterns: [{pattern, reason, source, id?, created_at?, created_by?}] }
+ */
+router.get('/api/image-exclusion/patterns', (req, res) => {
+  try {
+    const db = getDB();
+    const patterns = listAllPatterns(db);
+    return res.json({ status: 'ok', patterns });
+  } catch (e) {
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+/**
+ * 画像除外パターンを追加 (ユーザー追加分のみ。 組込みは追加不可)。
+ *   body: { pattern: string, reason: string }
+ */
+router.post('/api/image-exclusion/patterns', (req, res) => {
+  try {
+    const db = getDB();
+    const { pattern, reason } = req.body || {};
+    const r = addPattern({ db, pattern, reason, actor: 'http' });
+    audit(db, 'image_exclusion_add', { id: r.id, pattern: r.pattern });
+    return res.status(201).json({ status: 'ok', ...r });
+  } catch (e) {
+    if (e.code === 'PATTERN_DUPLICATE') return res.status(409).json({ status: 'fail', code: e.code, error: e.message });
+    if (e.code === 'PATTERN_CONFLICT_BUILTIN') return res.status(409).json({ status: 'fail', code: e.code, error: e.message });
+    if (/image-exclusion:/.test(e.message)) return res.status(400).json({ status: 'fail', error: e.message });
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+/**
+ * 画像除外パターンを削除 (ユーザー追加分のみ。 組込みは id を持たない)。
+ */
+router.delete('/api/image-exclusion/patterns/:id', (req, res) => {
+  try {
+    const db = getDB();
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ status: 'fail', error: 'invalid id' });
+    }
+    const r = removePattern({ db, id });
+    audit(db, 'image_exclusion_remove', { id });
+    return res.json({ status: 'ok', ...r });
+  } catch (e) {
+    if (e.code === 'PATTERN_NOT_FOUND') return res.status(404).json({ status: 'fail', code: e.code, error: e.message });
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+/**
+ * 1 商品の楽天画像 + 除外結果を返す (ドロワー 「楽天画像」 タブ用)。
+ *   楽天 RMS から live で fetch (cache 無し、 ドロワーを開いた時のみ)。
+ *   - kept:     Yahoo へ移行する URL
+ *   - excluded: 除外 URL + どのパターン (builtin/custom) でマッチしたか
+ *
+ *   itemCode → manageNumber は migration_candidates / notion_overrides から resolve。
+ *   どちらにも無ければ 404。 楽天 RMS が失敗したら 502 で詳細を返す。
+ */
+router.get('/api/products/:itemCode/rakuten-images', async (req, res) => {
+  try {
+    const db = getDB();
+    const itemCode = String(req.params.itemCode || '').trim();
+    if (!itemCode) return res.status(400).json({ status: 'fail', error: 'itemCode required' });
+
+    const cand = db.prepare('SELECT rakuten_manage_number FROM migration_candidates WHERE item_code = ?').get(itemCode);
+    let manageNumber = cand?.rakuten_manage_number || null;
+    if (!manageNumber) {
+      const notion = db.prepare('SELECT rakuten_manage_number FROM notion_overrides WHERE rakuten_manage_number = ?').get(itemCode);
+      manageNumber = notion?.rakuten_manage_number || itemCode;  // fallback: itemCode == manageNumber 規約
+    }
+
+    let fetchResult;
+    try {
+      fetchResult = await fetchItemDetail(manageNumber);
+    } catch (e) {
+      return res.status(502).json({ status: 'fail', stage: 'rakuten_fetch', error: e.message });
+    }
+    if (fetchResult?.status === 'failed' || !fetchResult?.item) {
+      return res.status(404).json({
+        status: 'fail',
+        error: `rakuten item not found: ${manageNumber} (${fetchResult?.reason || 'no_item'})`,
+      });
+    }
+
+    const customPatterns = getCustomPatternStrings(db);
+    const detail = filterUploadableImageUrlsDetailed(fetchResult.item.images || [], { customPatterns });
+
+    return res.json({
+      status: 'ok',
+      itemCode,
+      manageNumber,
+      keptCount: detail.kept.length,
+      excludedCount: detail.excluded.length,
+      kept: detail.kept,
+      excluded: detail.excluded,
+    });
   } catch (e) {
     return res.status(500).json({ status: 'fail', error: e.message });
   }

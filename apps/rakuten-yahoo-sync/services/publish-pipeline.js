@@ -15,6 +15,7 @@ import { resolveVariation } from './variation-resolver.js';
 import { evaluateReadiness, persistJobReadiness } from './readiness-check.js';
 import { runLeadTimePreflight } from '../lib/yahoo-lead-time.js';
 import { imagePreflightStub } from '../lib/yahoo-image.js';
+import { getCustomPatternStrings } from '../lib/image-exclusion-patterns.js';
 import { buildYahooEditItemFields, resolvePrice } from './field-mapper.js';
 
 function loadNotionOverride(db, manageNumber) {
@@ -102,7 +103,24 @@ export async function evaluateItemForPublish({
   }
 
   // 5. image preflight (E-4 stub、 E-5 で実 upload)
-  const imagePreflight = _imagePreflight(rakutenItem);
+  //    Phase E-8: 楽天画像 URL に対し DB の image_exclusion_patterns + builtin (coupon/review) で除外判定
+  //    Codex E-8 R1 H-1: 取得失敗時は fail-closed (空配列で続行すると custom 除外が無音で無効化される)
+  let customPatterns = [];
+  let imagePatternsLoadError = null;
+  try {
+    customPatterns = getCustomPatternStrings(db);
+  } catch (e) {
+    imagePatternsLoadError = e.message || String(e);
+  }
+  if (imagePatternsLoadError) {
+    return {
+      itemCode,
+      status: 'blocked',
+      reasons: [`image_patterns_load_failed:${imagePatternsLoadError}`],
+      debug: { stage: 'image_patterns_load' },
+    };
+  }
+  const imagePreflight = _imagePreflight(rakutenItem, { customPatterns });
 
   // 6. readiness
   const rakutenTaxRate = rakutenItem.payment?.taxRate;
@@ -164,6 +182,8 @@ export async function evaluateItemForPublish({
       image_ok: imagePreflight?.ok,
       // Phase E-5b: executor が performRealPublish で使う楽天 raw images を渡す
       rakutenImages: rakutenItem.images || [],
+      // Phase E-8: executor が uploadRakutenImagesToYahoo に渡す custom patterns (snapshot)
+      customImagePatterns: customPatterns,
     },
   };
 }
