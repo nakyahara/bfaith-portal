@@ -562,13 +562,14 @@
     </div>
   </div>
 
-  <!-- Publish 確認モーダル -->
+  <!-- Publish 確認 + 進行状況モーダル (Phase E-9 中原さん指摘: 押した後何も起きてないように見える) -->
   <div id="pubModal" class="modal" tabindex="-1" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,.5); z-index:1050;">
     <div class="card" style="max-width: 580px; margin: 80px auto;">
-      <div class="card-header bg-warning">
+      <div class="card-header bg-warning" id="pubModalHeader">
         <strong id="pubModalTitle">Yahoo に登録しますか?</strong>
       </div>
-      <div class="card-body">
+      <!-- 確認 view -->
+      <div class="card-body" id="pubModalConfirmBody">
         <div id="pubModalSafety" class="alert alert-warning small mb-3">
           <% if (!publishEnabled) { %>
             これは <strong>テスト実行</strong> です。 Yahoo には登録されません。
@@ -592,8 +593,29 @@
           </div>
         <% } %>
       </div>
-      <div class="card-footer d-flex justify-content-end gap-2">
-        <button class="btn btn-secondary" onclick="closePublishConfirm()">キャンセル</button>
+      <!-- 進行中 view -->
+      <div class="card-body" id="pubModalProgressBody" style="display:none;">
+        <div class="text-center py-3">
+          <div class="spinner-border text-warning mb-3" role="status" style="width:3rem; height:3rem;"></div>
+          <div><strong id="pubProgressStep">⚙️ Yahoo に登録中...</strong></div>
+          <div class="small text-muted mt-2">商品コード: <code id="pubProgressItemCode"></code></div>
+          <div class="small text-muted mt-1" id="pubProgressTime">経過: 0 秒</div>
+          <div class="small text-muted mt-3">
+            <p class="mb-1">楽天画像の取得 → JPEG 変換 → Yahoo!ショッピングへの登録を順に実行しています。</p>
+            <p class="mb-0">通常 30 秒〜 2 分かかります。 完了するまでこの画面は閉じないでください。</p>
+          </div>
+        </div>
+      </div>
+      <!-- 結果 view -->
+      <div class="card-body" id="pubModalResultBody" style="display:none;">
+        <div id="pubResultMain"></div>
+        <details class="mt-2">
+          <summary class="small text-muted">詳細 (技術情報)</summary>
+          <pre id="pubResultRaw" style="font-size:.75rem; max-height: 240px; overflow:auto; background:#f8f9fa; padding:8px; border-radius:4px;"></pre>
+        </details>
+      </div>
+      <div class="card-footer d-flex justify-content-end gap-2" id="pubModalFooter">
+        <button class="btn btn-secondary" id="pubCancelBtn" onclick="closePublishConfirm()">キャンセル</button>
         <button class="btn btn-warning" id="pubConfirmBtn" onclick="executePublish()">
           <% if (publishEnabled) { %>本番登録する<% } else { %>テスト実行する<% } %>
         </button>
@@ -645,6 +667,16 @@ async function runSync() {
 
 // ───── Publish ─────
 let _pubItemCode = null;
+let _pubTimerId = null;
+let _pubAutoReloadId = null;
+
+function showPubView(name) {
+  // name: 'confirm' | 'progress' | 'result'
+  document.getElementById('pubModalConfirmBody').style.display = name === 'confirm' ? '' : 'none';
+  document.getElementById('pubModalProgressBody').style.display = name === 'progress' ? '' : 'none';
+  document.getElementById('pubModalResultBody').style.display = name === 'result' ? '' : 'none';
+}
+
 function openPublishConfirm(itemCode, title, price, delivery) {
   _pubItemCode = itemCode;
   document.getElementById('pubItemCode').textContent = itemCode;
@@ -653,6 +685,16 @@ function openPublishConfirm(itemCode, title, price, delivery) {
   document.getElementById('pubDelivery').textContent = delivery || '(未設定)';
   const cb = document.getElementById('pubConfirmCheckbox');
   if (cb) cb.checked = false;
+  // 確認 view にリセット
+  showPubView('confirm');
+  document.getElementById('pubModalHeader').className = 'card-header bg-warning';
+  document.getElementById('pubModalTitle').textContent = 'Yahoo に登録しますか?';
+  document.getElementById('pubCancelBtn').style.display = '';
+  document.getElementById('pubCancelBtn').disabled = false;
+  document.getElementById('pubCancelBtn').textContent = 'キャンセル';
+  const confirmBtn = document.getElementById('pubConfirmBtn');
+  confirmBtn.style.display = '';
+  confirmBtn.disabled = false;
   document.getElementById('pubModal').style.display = 'block';
 }
 
@@ -667,7 +709,12 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 });
-function closePublishConfirm() { document.getElementById('pubModal').style.display = 'none'; }
+function closePublishConfirm() {
+  // 進行中タイマー / 自動 reload を必ず止める (modal close で leak しない)
+  if (_pubTimerId) { clearInterval(_pubTimerId); _pubTimerId = null; }
+  if (_pubAutoReloadId) { clearTimeout(_pubAutoReloadId); _pubAutoReloadId = null; }
+  document.getElementById('pubModal').style.display = 'none';
+}
 
 async function executePublish() {
   const cb = document.getElementById('pubConfirmCheckbox');
@@ -675,36 +722,99 @@ async function executePublish() {
     alert('「取り消せないことを理解しました」 にチェックを入れてください。');
     return;
   }
-  closePublishConfirm();
-  const out = document.getElementById('actionResult');
-  out.innerHTML = '<div class="alert alert-info">登録中... (画像変換 + Yahoo 登録で 1-2 分かかります)</div>';
+  // Phase E-9 中原さん指摘: 確認 view → 進行中 view に切り替えて modal を開きっぱなしにする。
+  //   これで 「押した後に何も起きてない」 ように見える問題を解消。
+  showPubView('progress');
+  document.getElementById('pubModalHeader').className = 'card-header bg-info text-white';
+  document.getElementById('pubModalTitle').textContent = '⚙️ Yahoo に登録しています...';
+  document.getElementById('pubProgressItemCode').textContent = _pubItemCode || '';
+  document.getElementById('pubProgressStep').textContent = '⚙️ Yahoo に登録中...';
+  // 進行 view 中はキャンセル/実行ボタンは見せない
+  document.getElementById('pubCancelBtn').style.display = 'none';
+  document.getElementById('pubConfirmBtn').style.display = 'none';
+  // 経過時間タイマー
+  const startedAt = Date.now();
+  if (_pubTimerId) { clearInterval(_pubTimerId); }
+  _pubTimerId = setInterval(() => {
+    const sec = Math.round((Date.now() - startedAt) / 1000);
+    const m = Math.floor(sec / 60), s = sec % 60;
+    document.getElementById('pubProgressTime').textContent =
+      '経過: ' + (m > 0 ? m + ' 分 ' + s + ' 秒' : s + ' 秒');
+  }, 1000);
+
+  let data, error;
   try {
     const res = await fetch('/apps/rakuten-yahoo-sync/api/publish/execute/' + encodeURIComponent(_pubItemCode), {
       method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({}),
     });
-    const data = await res.json();
+    data = await res.json();
+  } catch (e) {
+    error = e;
+  }
+  // タイマー停止
+  if (_pubTimerId) { clearInterval(_pubTimerId); _pubTimerId = null; }
+
+  // 結果 view へ
+  showPubView('result');
+  const main = document.getElementById('pubResultMain');
+  const rawPre = document.getElementById('pubResultRaw');
+
+  if (error) {
+    document.getElementById('pubModalHeader').className = 'card-header bg-danger text-white';
+    document.getElementById('pubModalTitle').textContent = '❌ ネットワークエラー';
+    const wrap = document.createElement('div');
+    wrap.className = 'alert alert-danger';
+    wrap.textContent = 'ネットワークエラー: ' + error.message;
+    main.replaceChildren(wrap);
+    rawPre.textContent = String(error.stack || error.message || '');
+  } else {
     const klass = data.status === 'success' ? 'alert-success'
       : data.status === 'dedupe' ? 'alert-secondary'
       : data.status === 'readiness_blocked' ? 'alert-warning'
       : data.status === 'not_implemented' ? 'alert-info'
       : 'alert-danger';
+    const headerKlass = data.status === 'success' ? 'card-header bg-success text-white'
+      : data.status === 'readiness_blocked' ? 'card-header bg-warning'
+      : data.status === 'not_implemented' ? 'card-header bg-info text-white'
+      : data.status === 'dedupe' ? 'card-header bg-secondary text-white'
+      : 'card-header bg-danger text-white';
+    document.getElementById('pubModalHeader').className = headerKlass;
+    document.getElementById('pubModalTitle').textContent = labelForStatus(data.status);
+
     const wrap = document.createElement('div');
-    wrap.className = 'alert ' + klass;
+    wrap.className = 'alert ' + klass + ' mb-2';
     const head = document.createElement('strong');
     head.textContent = labelForStatus(data.status);
     wrap.appendChild(head);
-    const pre = document.createElement('pre');
-    pre.style.fontSize = '.8rem'; pre.style.margin = '.5rem 0 0';
-    pre.textContent = JSON.stringify(data, null, 2);
-    wrap.appendChild(pre);
-    out.replaceChildren(wrap);
-    if (data.status === 'success') setTimeout(() => location.reload(), 2500);
-  } catch (e) {
-    const wrap = document.createElement('div');
-    wrap.className = 'alert alert-danger';
-    wrap.textContent = 'ネットワークエラー: ' + e.message;
-    out.replaceChildren(wrap);
+    if (data.status === 'success') {
+      const note = document.createElement('div');
+      note.className = 'small mt-2';
+      note.innerHTML = '画面を更新して 「移行済み」 タブに反映します...<br>' +
+        '<span class="small text-muted">※ Yahoo!ショッピング側で実際に商品ページが表示されるまで 数分かかる場合があります</span>';
+      wrap.appendChild(note);
+    } else if (data.status === 'readiness_blocked' && data.reasons?.length) {
+      const ul = document.createElement('ul');
+      ul.className = 'mb-0 mt-2 small';
+      for (const r of data.reasons.slice(0, 5)) {
+        const li = document.createElement('li');
+        li.textContent = typeof r === 'string' ? r : (r.message || JSON.stringify(r));
+        ul.appendChild(li);
+      }
+      wrap.appendChild(ul);
+    }
+    main.replaceChildren(wrap);
+    rawPre.textContent = JSON.stringify(data, null, 2);
+
+    if (data.status === 'success') {
+      _pubAutoReloadId = setTimeout(() => location.reload(), 3000);
+    }
   }
+
+  // 結果 view では 「閉じる」 だけ。 success は auto-reload するが、 手動で閉じるオプションも残す。
+  const cancelBtn = document.getElementById('pubCancelBtn');
+  cancelBtn.style.display = '';
+  cancelBtn.disabled = false;
+  cancelBtn.textContent = '閉じる';
 }
 
 function labelForStatus(s) {
@@ -1305,14 +1415,32 @@ function bulkDeselectAll() {
   updateBulkBar();
 }
 
-function openBulkPublishModal(title) {
+function openBulkPublishModal(title, itemCodes = []) {
   const modal = document.getElementById('bulkPublishModal');
   document.getElementById('bulkPublishTitle').textContent = title || '一括登録中...';
   document.getElementById('bulkPublishProgressBar').style.width = '0%';
-  document.getElementById('bulkPublishProgressText').textContent = '準備中...';
+  document.getElementById('bulkPublishProgressText').textContent = '⏳ サーバーに送信中...';
   document.getElementById('bulkPublishResults').innerHTML = '';
   document.querySelector('.js-close-bulk-publish-modal').disabled = true;
   modal.style.display = 'block';
+  // Phase E-9 中原さん指摘: 「押した直後に何も起きてないように見える」 を解消。
+  //   送信前に対象 itemCode を 「⏳ 待機中」 として全部表示する。
+  if (itemCodes.length > 0) {
+    const wrap = document.getElementById('bulkPublishResults');
+    wrap.innerHTML = '';
+    for (const code of itemCodes) {
+      const row = document.createElement('div');
+      row.className = 'small py-1 border-bottom bulk-item-row';
+      row.id = 'bulk-item-' + cssId(code);
+      row.dataset.itemCode = code;
+      row.innerHTML = '<span class="bulk-item-status">⏳</span> <code>' + escapeHtml(code) + '</code> <span class="bulk-item-label text-muted">待機中</span>';
+      wrap.appendChild(row);
+    }
+  }
+}
+function cssId(s) { return String(s).replace(/[^a-zA-Z0-9_-]/g, '_'); }
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 function closeBulkPublishModal() {
   document.getElementById('bulkPublishModal').style.display = 'none';
@@ -1325,39 +1453,59 @@ function setBulkProgress(batch) {
   const pct = total > 0 ? Math.round(done * 100 / total) : 0;
   document.getElementById('bulkPublishProgressBar').style.width = pct + '%';
   document.getElementById('bulkPublishProgressText').textContent =
-    done + '/' + total + ' 完了 (成功 ' + (batch.succeeded || 0) + ' / 失敗 ' + (batch.failed || 0) + ')';
+    done + '/' + total + ' 完了 (成功 ' + (batch.succeeded || 0) + ' / 失敗 ' + (batch.failed || 0) + ')'
+    + (batch.status === 'running' ? ' — ⚙️ 処理中…' : '');
 }
-function appendBulkResultRow(item) {
-  const wrap = document.getElementById('bulkPublishResults');
-  const row = document.createElement('div');
-  row.className = 'small py-1 border-bottom';
-  const status = item.status === 'success' ? '✅'
+
+// Phase E-9 中原さん指摘: 1 商品ずつ状態が見えるよう、 poll 毎に各 item の行を更新する。
+function updateBulkResultRow(item) {
+  const id = 'bulk-item-' + cssId(item.item_code);
+  let row = document.getElementById(id);
+  if (!row) {
+    // 開始前 itemCode リストに無かった (retry-failed 等) → 新規 append
+    const wrap = document.getElementById('bulkPublishResults');
+    row = document.createElement('div');
+    row.className = 'small py-1 border-bottom bulk-item-row';
+    row.id = id;
+    row.dataset.itemCode = item.item_code;
+    wrap.appendChild(row);
+  }
+  const statusIcon = item.status === 'success' ? '✅'
+    : item.status === 'failed' ? '❌'
+    : item.status === 'running' ? '🔄'
     : item.status === 'dedupe' ? '⚠'
     : item.status === 'flag_off' ? '🔒'
     : item.status === 'readiness_blocked' ? '🟡'
-    : '❌';
-  row.textContent = status + ' ' + item.item_code + ': ' + (item.status || '?');
+    : '⏳';
+  const label = item.status === 'success' ? 'Yahoo に登録しました'
+    : item.status === 'failed' ? '失敗'
+    : item.status === 'running' ? '楽天から取得 → Yahoo に登録中…'
+    : item.status === 'dedupe' ? '重複検出 (既に処理済み)'
+    : item.status === 'flag_off' ? '本番モード OFF のためスキップ'
+    : item.status === 'readiness_blocked' ? 'Notion 必須項目に不足 — スキップ'
+    : item.status === 'pending' ? '待機中'
+    : (item.status || '?');
+  // background highlight for running row
+  row.style.backgroundColor = item.status === 'running' ? '#fff3cd' : '';
+  let html = '<span class="bulk-item-status">' + statusIcon + '</span> '
+           + '<code>' + escapeHtml(item.item_code) + '</code> '
+           + '<span class="bulk-item-label">' + escapeHtml(label) + '</span>';
   if (item.error_message) {
-    const err = document.createElement('div');
-    err.className = 'text-danger small ms-3';
-    err.textContent = item.error_message;
-    row.appendChild(err);
+    html += '<div class="text-danger small ms-3">' + escapeHtml(item.error_message) + '</div>';
   }
-  wrap.appendChild(row);
+  row.innerHTML = html;
 }
 
 async function pollBulkBatch(batchId) {
-  let lastDone = 0;
   while (true) {
     try {
       const res = await fetch('/apps/rakuten-yahoo-sync/api/publish/bulk/' + batchId + '?withItems=1');
       const data = await res.json();
       if (!data.batch) break;
       setBulkProgress(data.batch);
-      // 完了/失敗状態に到達したら items を一覧化して終了
+      // Phase E-9: poll 毎に items を更新 (running も含む)
+      for (const it of (data.items || [])) updateBulkResultRow(it);
       if (data.batch.status !== 'running') {
-        document.getElementById('bulkPublishResults').innerHTML = '';
-        for (const it of (data.items || [])) appendBulkResultRow(it);
         document.querySelector('.js-close-bulk-publish-modal').disabled = false;
         window._bulkPublishSucceededCount = data.batch.succeeded || 0;
         document.getElementById('bulkPublishTitle').textContent =
@@ -1365,13 +1513,12 @@ async function pollBulkBatch(batchId) {
           data.batch.status === 'failed' ? '❌ 一括登録失敗' : '⚠ 一括登録中止';
         break;
       }
-      lastDone = (data.batch.succeeded || 0) + (data.batch.failed || 0);
     } catch (e) {
       document.getElementById('bulkPublishProgressText').textContent = '進捗取得エラー: ' + e.message;
       document.querySelector('.js-close-bulk-publish-modal').disabled = false;
       break;
     }
-    await new Promise((r) => setTimeout(r, 800));
+    await new Promise((r) => setTimeout(r, 600));
   }
 }
 
