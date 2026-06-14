@@ -138,6 +138,13 @@
         <li>
           <strong><%= summary.fixable %> 商品</strong> が Notion 修正待ち
           <a href="?filter=fixable" class="btn btn-sm btn-outline-warning ms-2">修正リストを見る</a>
+          <%# Phase E-9: 楽天タイトル backfill ボタン (未取得が 1 件以上ある時だけ表示) %>
+          <% if (typeof rakutenTitleMissing !== 'undefined' && rakutenTitleMissing > 0) { %>
+            <button class="btn btn-sm btn-outline-secondary ms-2 js-backfill-rakuten-title"
+                    title="楽天 RMS から商品名を取得して、 修正必要リストに 「何の商品か」 を表示できるようにします">
+              📥 楽天タイトル取得 (<%= rakutenTitleMissing %>)
+            </button>
+          <% } %>
           <% if (summary.fixable > 0 && Object.keys(fixableByCategory).length > 0) { %>
             <div class="mt-2">
               <% for (const cat of Object.keys(fixableByCategory).sort((a, b) => fixableByCategory[b] - fixableByCategory[a])) { %>
@@ -248,7 +255,7 @@
               <div class="bulk-checkbox-wrap"></div>
             <% } %>
             <div class="thumb-placeholder">
-              <%= (p.yahooTitle || p.itemCode).slice(0, 1).toUpperCase() %>
+              <%= (p.yahooTitle || p.rakutenTitle || p.itemCode).slice(0, 1).toUpperCase() %>
             </div>
             <div>
               <p class="product-title">
@@ -261,7 +268,15 @@
                   <% } else if (p.status === 'orphan') { %>📦
                   <% } else { %>⚪<% } %>
                 </span>
-                <%= p.yahooTitle || '(タイトル未入力)' %>
+                <%# Phase E-9 中原さん依頼: 何の商品か分かるよう yahoo_title が無いとき 楽天タイトルを fallback で見せる %>
+                <% if (p.yahooTitle) { %>
+                  <%= p.yahooTitle %>
+                <% } else if (p.rakutenTitle) { %>
+                  <%= p.rakutenTitle %>
+                  <span class="badge bg-light text-dark border ms-1 small" title="Yahoo!タイトルが未入力のため、 楽天の商品名を表示しています">楽天タイトル</span>
+                <% } else { %>
+                  (タイトル未入力)
+                <% } %>
                 <%# Codex R2 D-2: 「Yahoo に手動 publish された除外商品」 の「移行済み (除外指定済)」 バッジ %>
                 <% if (p.status === 'excluded' && p.isDone) { %>
                   <span class="badge bg-success ms-1 small">移行済み (除外指定済)</span>
@@ -994,6 +1009,9 @@ async function fetchDetailAndRender(itemCode) {
       return;
     }
     const data = await res.json();
+    // Phase E-9: ドロワーのヘッダーにも楽天タイトル fallback を入れる
+    const titleHeader = data.notion?.yahoo_title || data.candidate?.rakuten_title || itemCode;
+    document.getElementById('detailDrawerTitle').textContent = '商品詳細: ' + titleHeader + ' (' + itemCode + ')';
     content.replaceChildren(buildDetailContent(data));
     // Phase E-8: 楽天画像セクションを非同期で追加 (楽天 RMS fetch 失敗時もドロワーは出す)
     loadRakutenImagesIntoDrawer(itemCode);
@@ -1007,12 +1025,17 @@ async function fetchDetailAndRender(itemCode) {
 }
 
 // Codex E-8 R1 M-1: 楽天 RMS 由来 URL を a.href / img.src に入れる前に scheme allowlist で検査。
-//   javascript:/data: 等を弾く。 失敗時は空文字 → リンク非活性表示。
+//   javascript:/data: 等を弾く。
+// Phase E-9 hotfix: 楽天 RMS は protocol-relative URL (`//image.rakuten.co.jp/...`) で
+//   返してくることが多いので、 そのケースは https: 補完して通す。
+//   (E-8 deploy 後、 中原さん画面で kept 18 枚が表示されない事故から修正)
 function safeImageUrl(u) {
   if (typeof u !== 'string') return '';
   const s = u.trim();
-  if (!/^https?:\/\//i.test(s)) return '';
-  return s;
+  if (!s) return '';
+  if (/^https?:\/\//i.test(s)) return s;
+  if (/^\/\//.test(s)) return 'https:' + s;
+  return '';
 }
 
 async function loadRakutenImagesIntoDrawer(itemCode) {
@@ -1131,6 +1154,7 @@ function buildDetailContent(data) {
     frag.appendChild(dlSection('🛒 候補メタ', [
       ['楽天商品コード', data.candidate.item_code],
       ['楽天 manage_number', data.candidate.rakuten_manage_number],
+      ['楽天タイトル', data.candidate.rakuten_title || '(未取得)'],
       ['候補ステータス', data.candidate.status],
       ['初検出日時', data.candidate.first_detected_at],
       ['最終検出日時', data.candidate.last_detected_at],
@@ -1403,6 +1427,34 @@ async function retryFailedPublish() {
   }
 }
 
+// ───── 楽天タイトル backfill (Phase E-9) ─────
+async function backfillRakutenTitle(evt) {
+  const btn = evt.currentTarget;
+  if (!btn || btn.disabled) return;
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '取得中...';
+  try {
+    const res = await fetch('/apps/rakuten-yahoo-sync/api/rakuten-title-backfill', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ limit: 200 }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      alert('取得失敗: ' + (data.error || ('HTTP ' + res.status)));
+      btn.disabled = false; btn.textContent = original;
+      return;
+    }
+    // 成功: 取得件数 / 残件数 を表示してリロード
+    const msg = `楽天タイトル ${data.updated} 件取得しました (残 ${data.remaining} 件)。 ページを再読み込みします。`;
+    alert(msg);
+    location.reload();
+  } catch (e) {
+    alert('ネットワークエラー: ' + e.message);
+    btn.disabled = false; btn.textContent = original;
+  }
+}
+
 // ───── 画像除外パターン管理 (Phase E-8) ─────
 // Codex E-8 R1 M-4: モーダル open 前に他モーダル (移行除外、 Notion sync, publish 確認、 一括 publish) を閉じる helper。
 function closeAllModals() {
@@ -1519,6 +1571,7 @@ async function deleteImagePattern(id, pattern) {
 document.addEventListener('DOMContentLoaded', () => {
   document.querySelector('.js-open-exclusion-mgmt')?.addEventListener('click', openExclusionModal);
   document.querySelector('.js-open-image-exclusion-mgmt')?.addEventListener('click', openImageExclusionModal);
+  document.querySelector('.js-backfill-rakuten-title')?.addEventListener('click', backfillRakutenTitle);
   document.querySelectorAll('.js-close-image-exclusion-modal').forEach((el) => el.addEventListener('click', closeImageExclusionModal));
   document.querySelector('.js-add-image-pattern')?.addEventListener('click', addImagePattern);
   document.querySelectorAll('.js-close-exclusion-modal').forEach((el) => el.addEventListener('click', closeExclusionModal));

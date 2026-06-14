@@ -48,6 +48,7 @@ import {
   removePattern,
 } from './lib/image-exclusion-patterns.js';
 import { filterUploadableImageUrlsDetailed } from './lib/yahoo-image.js';
+import { backfillRakutenTitles, countMissingRakutenTitles } from './lib/rakuten-title-backfill.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -140,6 +141,7 @@ function listProductsForUI(db, { filter = 'all', search = '' } = {}) {
     SELECT
       c.item_code,
       c.rakuten_manage_number,
+      c.rakuten_title,
       c.status                          AS candidate_status,
       c.first_detected_at,
       c.last_detected_at,
@@ -238,6 +240,7 @@ function listProductsForUI(db, { filter = 'all', search = '' } = {}) {
     return {
       itemCode:           r.item_code,
       rakutenManageNumber: r.rakuten_manage_number,
+      rakutenTitle:       r.rakuten_title,
       candidateStatus:    r.candidate_status,
       notionPageId:       r.notion_page_id,
       yahooTitle:         r.yahoo_title,
@@ -363,6 +366,7 @@ router.get('/', (req, res) => {
   let summary = { total: 0, actionable: 0, fixable: 0, done: 0, excluded: 0, stale: 0, orphan: 0 };
   let fixableByCategory = {};
   let exclusionCount = { temporary: 0, permanent: 0, total: 0 };
+  let rakutenTitleMissing = 0;
   const filter = ['all', 'actionable', 'fixable', 'done', 'excluded', 'stale', 'orphan'].includes(req.query.filter)
     ? req.query.filter
     : 'actionable'; // default は「すぐ移行できる」 = やるべきこと
@@ -377,6 +381,7 @@ router.get('/', (req, res) => {
     summary = listed.summary;
     fixableByCategory = listed.fixableByCategory;
     exclusionCount = countActiveByKind(db);
+    try { rakutenTitleMissing = countMissingRakutenTitles(db); } catch (_) { /* migration 011 未適用 */ }
   } catch (_) {
     // DB 未初期化等は空 state で表示 continue
   }
@@ -398,6 +403,7 @@ router.get('/', (req, res) => {
     summary,
     fixableByCategory,
     exclusionCount,                                       // E-7-c: 移行除外管理 header 集計
+    rakutenTitleMissing,                                  // E-9: 楽天タイトル backfill ボタンの未取得件数 badge
     filter,
     search,
     notionPageUrl,  // EJS から呼べるように
@@ -1029,6 +1035,35 @@ router.get('/api/products/:itemCode/rakuten-images', async (req, res) => {
       kept: detail.kept,
       excluded: detail.excluded,
     });
+  } catch (e) {
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+// ───────────────── Phase E-9: 楽天タイトル backfill API ─────────────────
+
+/**
+ * 不足してる楽天タイトルを bulk fetch して埋める手動 trigger。
+ *   body: { limit?: number } default 100、 max 200 (proxy timeout 保護)
+ */
+router.post('/api/rakuten-title-backfill', async (req, res) => {
+  try {
+    const db = getDB();
+    const body = req.body || {};
+    const limit = Number.isInteger(body.limit) && body.limit > 0 && body.limit <= 200 ? body.limit : 100;
+    const r = await backfillRakutenTitles({ db, limit });
+    const remaining = countMissingRakutenTitles(db);
+    audit(db, 'rakuten_title_backfill', { ...r, remaining });
+    return res.json({ status: 'ok', ...r, remaining });
+  } catch (e) {
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+router.get('/api/rakuten-title-backfill/status', (req, res) => {
+  try {
+    const db = getDB();
+    return res.json({ status: 'ok', remaining: countMissingRakutenTitles(db) });
   } catch (e) {
     return res.status(500).json({ status: 'fail', error: e.message });
   }
