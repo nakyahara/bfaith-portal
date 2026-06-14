@@ -342,6 +342,59 @@ function readBody(req) {
   });
 }
 
+// ─── Yahoo myItemList XML parser (Phase E-7-a) ───
+//   Yahoo myItemList API のレスポンス XML を JSON 風 object に変換する。
+//   RYS client は { items: [{ItemCode, Name?, HasSubCode?}], totalResultsAvailable, totalResultsReturned, firstResultPosition }
+//   を期待 (yahoo-myitemlist-proxy.js)。 XML スキーマ:
+//     <ResultSet totalResultsAvailable="N" firstResultPosition="K" [totalResultsReturned="M"]>
+//       <Result>
+//         <ItemCode>...</ItemCode>
+//         <Name>...</Name>
+//         <HasSubCode>0|1</HasSubCode>
+//       </Result>
+//       ...
+//     </ResultSet>
+//   依存ゼロ (regex で抽出)、 XML entity (&lt; 等) は decodeXmlEntities で復元。
+function decodeXmlEntities(s) {
+  return String(s)
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+function parseMyItemListXml(xml) {
+  const out = { items: [], totalResultsAvailable: null, totalResultsReturned: null, firstResultPosition: null };
+  if (typeof xml !== 'string' || xml.length === 0) return out;
+  const rsMatch = xml.match(/<ResultSet\s+([^>]*)>/);
+  if (rsMatch) {
+    const attrs = rsMatch[1];
+    const totalMatch = attrs.match(/totalResultsAvailable\s*=\s*"(\d+)"/);
+    const firstMatch = attrs.match(/firstResultPosition\s*=\s*"(\d+)"/);
+    const returnedMatch = attrs.match(/totalResultsReturned\s*=\s*"(\d+)"/);
+    if (totalMatch) out.totalResultsAvailable = parseInt(totalMatch[1], 10);
+    if (firstMatch) out.firstResultPosition = parseInt(firstMatch[1], 10);
+    if (returnedMatch) out.totalResultsReturned = parseInt(returnedMatch[1], 10);
+  }
+  const resultRegex = /<Result>([\s\S]*?)<\/Result>/g;
+  let m;
+  while ((m = resultRegex.exec(xml)) !== null) {
+    const block = m[1];
+    const codeMatch = block.match(/<ItemCode>([^<]*)<\/ItemCode>/);
+    if (!codeMatch) continue;
+    const item = { ItemCode: decodeXmlEntities(codeMatch[1]) };
+    const nameMatch = block.match(/<Name>([^<]*)<\/Name>/);
+    if (nameMatch) item.Name = decodeXmlEntities(nameMatch[1]);
+    const subMatch = block.match(/<HasSubCode>([^<]*)<\/HasSubCode>/);
+    if (subMatch) {
+      const v = subMatch[1].trim();
+      item.HasSubCode = v === '1' || v.toLowerCase() === 'true';
+    }
+    out.items.push(item);
+  }
+  // totalResultsReturned が XML 属性に無くても items.length で補う (RYS の strict validation 用)
+  if (out.totalResultsReturned === null) out.totalResultsReturned = out.items.length;
+  return out;
+}
+
 // multipart / binary body 用 (Phase E-5b で追加、 uploadItemImage が使う)
 function readBodyBuffer(req) {
   return new Promise((resolve, reject) => {
@@ -602,6 +655,56 @@ const server = http.createServer(async (req, res) => {
       });
       res.writeHead(r.status, { 'Content-Type': 'application/xml' });
       res.end(r.body);
+      return;
+    }
+
+    // POST /yahoo/my-item-list
+    //   request body: { query: string, offset?: number, results?: number }
+    //   Yahoo myItemList API (GET + query string、 start は 1-based) へ token + 署名付きで forward。
+    //   レスポンス XML を JSON に変換して返す (RYS client 期待 contract):
+    //     { ok, items: [{ItemCode, Name?, HasSubCode?}], totalResultsAvailable, totalResultsReturned, firstResultPosition }
+    if (pathname === '/yahoo/my-item-list' && req.method === 'POST') {
+      const raw = await readBody(req);
+      let body;
+      try { body = JSON.parse(raw); }
+      catch (_) {
+        throw new Error('my-item-list: invalid JSON body');
+      }
+      const queryParam = String(body.query || '').trim();
+      const offset = Number.isInteger(body.offset) ? body.offset : 0;
+      const results = Number.isInteger(body.results) ? body.results : 100;
+      if (!queryParam) throw new Error('my-item-list: query is required (non-empty string)');
+      if (offset < 0 || results < 1 || results > 100) {
+        throw new Error('my-item-list: invalid offset/results (offset>=0, 1<=results<=100)');
+      }
+      const start = offset + 1; // RYS は 0-based offset、 Yahoo API は 1-based start
+      const qs = new URLSearchParams({
+        seller_id: YAHOO_SELLER_ID,
+        query: queryParam,
+        start: String(start),
+        results: String(results),
+      }).toString();
+      console.log(`[${ts()}] Yahoo myItemList: q=${queryParam} start=${start} results=${results}`);
+      const r = await callYahooAPIRaw('myItemList', {
+        method: 'GET',
+        body: null,
+        queryString: qs,
+      });
+      if (r.status !== 200) {
+        // 上流エラーはそのまま XML で返す (RYS は !== 200 を errored として扱う)
+        res.writeHead(r.status, { 'Content-Type': 'application/xml' });
+        res.end(r.body);
+        return;
+      }
+      const parsed = parseMyItemListXml(r.body);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        items: parsed.items,
+        totalResultsAvailable: parsed.totalResultsAvailable,
+        totalResultsReturned: parsed.totalResultsReturned,
+        firstResultPosition: parsed.firstResultPosition,
+      }));
       return;
     }
 
