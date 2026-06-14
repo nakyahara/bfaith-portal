@@ -26,9 +26,9 @@ export function translateReason(rawReason) {
     case 'notion_title_too_long':
       return { message: 'Yahoo!タイトルが 65 字を超えています', notionField: 'Yahoo!タイトル', severity: 'must' };
     case 'product_category_unresolved':
-      return { message: 'Yahoo の商品カテゴリが決まっていません', notionField: 'カテゴリ', severity: 'must' };
+      return { message: 'Yahoo!カテゴリが解決できません (楽天 genre が学習済 130 件に無い、 または学習辞書未構築)。 Notion に 「Yahoo!カテゴリID」 列を作って入力してください。 または既存出品から学習し直してください', notionField: 'Yahoo!カテゴリID', severity: 'must' };
     case 'path_unresolved':
-      return { message: 'Yahoo の販売カテゴリが決まっていません', notionField: 'カテゴリ', severity: 'must' };
+      return { message: 'Yahoo!path が解決できません (同上、 楽天 genre が学習済 130 件に無い)。 Notion に 「Yahoo!path」 列を作って入力してください', notionField: 'Yahoo!path', severity: 'must' };
     case 'price_invalid_or_zero':
       return { message: '売価が未入力、 または 0 円です', notionField: '売価', severity: 'must' };
     case 'delivery_mapping_unresolved':

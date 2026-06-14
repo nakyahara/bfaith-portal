@@ -63,6 +63,9 @@ async function run() {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', 'h')
   `);
   insertOverride.run('N-c1', 'page1', 'title-1', 1000, 1200, 'ネコポス', '10', 'OK', now);              // full → actionable
+  // Phase E-11-d: actionable 判定に Yahoo!カテゴリ + path も必要。 c-1 は Notion で確定値を持ってる想定で actionable に
+  db.prepare(`UPDATE notion_overrides SET notion_product_category = ?, notion_path = ? WHERE rakuten_manage_number = ?`)
+    .run(12345, 'zakka/main', 'N-c1');
   insertOverride.run('N-c2', 'page2', 'title-2', null, 1200, 'ネコポス', '10', 'OK', now);              // missing price → fixable
   insertOverride.run('N-c3', 'page3', 'title-3', 1500, 1700, 'ヤマト宅急便', '10', 'OK', now);          // full but excluded
   insertOverride.run('N-c4', 'page4', 'title-4', 2000, 2200, 'ネコポス', '10', 'OK', now);              // done (yahoo observed)
