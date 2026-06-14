@@ -11,7 +11,7 @@
  */
 
 import Database from 'better-sqlite3';
-import { backfillRakutenTitles, countMissingRakutenTitles } from '../lib/rakuten-title-backfill.js';
+import { backfillRakutenTitles, countMissingRakutenTitles, extractRakutenGenre } from '../lib/rakuten-title-backfill.js';
 
 const checks = [];
 function expect(label, cond, detail) {
@@ -39,6 +39,9 @@ db.exec(`
 // migration 011 — title 列
 db.exec(`ALTER TABLE migration_candidates ADD COLUMN rakuten_title TEXT;`);
 db.exec(`ALTER TABLE migration_candidates ADD COLUMN last_title_synced_at TEXT;`);
+// migration 012 — genre 列
+db.exec(`ALTER TABLE migration_candidates ADD COLUMN rakuten_genre_id TEXT;`);
+db.exec(`ALTER TABLE migration_candidates ADD COLUMN rakuten_genre_path TEXT;`);
 
 const NOW = '2026-06-14T10:00:00Z';
 const seed = db.prepare(`
@@ -61,7 +64,8 @@ expect('initial missing count = 5 (A002-A005-fail + S001、 A001 は埋まって
 
 // mock fetchItemDetailsBulkDetailed
 const mockBulk = async (manageNumbers) => {
-  // A005-fail だけ failed、 他は itemName を返す
+  // A005-fail だけ failed、 他は itemName + genre を返す
+  // mn-a002 だけ top-level genreId、 mn-a003 は genres[]、 mn-a004 は categories[]、 mn-s001 は genre なし
   const items = [];
   const failed = [];
   for (const mn of manageNumbers) {
@@ -69,10 +73,12 @@ const mockBulk = async (manageNumbers) => {
       failed.push({ manageNumber: mn, reason: 'rms_500' });
       continue;
     }
-    items.push({
-      manageNumber: mn,
-      itemName: `Title for ${mn}`,
-    });
+    const item = { manageNumber: mn, itemName: `Title for ${mn}` };
+    if (mn === 'mn-a002') item.genreId = '100371';
+    else if (mn === 'mn-a003') item.genres = [{ genreId: 200500, genrePath: '雑貨 > 文具' }];
+    else if (mn === 'mn-a004') item.categories = [{ categoryId: 300, path: '日用品 > 洗剤' }];
+    // mn-s001 は genre 情報なし → null のまま、 既存値を維持
+    items.push(item);
   }
   return { items, failed };
 };
@@ -104,6 +110,41 @@ expect('再実行 updated = 0', r2.updated === 0, JSON.stringify(r2));
 const ts = db.prepare(`SELECT last_title_synced_at FROM migration_candidates WHERE item_code = 'A002'`).get();
 expect('A002 last_title_synced_at が ISO で入る', !!ts.last_title_synced_at && /^\d{4}-\d{2}-\d{2}T/.test(ts.last_title_synced_at),
   ts.last_title_synced_at);
+
+// ───── Phase E-11-a: genre 抽出 + 保存 ─────
+
+// extractRakutenGenre の単体動作
+expect('extractRakutenGenre: top-level genreId',
+  extractRakutenGenre({ genreId: 100371 }).genreId === '100371');
+expect('extractRakutenGenre: genres[]',
+  extractRakutenGenre({ genres: [{ genreId: 200500, genrePath: '雑貨 > 文具' }] }).genreId === '200500');
+expect('extractRakutenGenre: genres[] path',
+  extractRakutenGenre({ genres: [{ genreId: 200500, genrePath: '雑貨 > 文具' }] }).genrePath === '雑貨 > 文具');
+expect('extractRakutenGenre: categories[] fallback',
+  extractRakutenGenre({ categories: [{ categoryId: 300, path: '日用品 > 洗剤' }] }).genreId === '300');
+expect('extractRakutenGenre: empty → null',
+  extractRakutenGenre({}).genreId === null && extractRakutenGenre({}).genrePath === null);
+expect('extractRakutenGenre: null safe', extractRakutenGenre(null).genreId === null);
+
+// DB 保存の確認: A002 (top-level genreId='100371'), A003 (genres[]), A004 (categories[])
+const after2 = db.prepare(`
+  SELECT item_code, rakuten_genre_id, rakuten_genre_path
+  FROM migration_candidates
+  WHERE item_code IN ('A002','A003','A004','S001','A005-fail','R001','A001')
+  ORDER BY item_code
+`).all();
+const gmap = Object.fromEntries(after2.map((r) => [r.item_code, r]));
+expect('A002 genreId=100371 (top-level)', gmap['A002'].rakuten_genre_id === '100371',
+  JSON.stringify(gmap['A002']));
+expect('A003 genreId=200500 (genres[])', gmap['A003'].rakuten_genre_id === '200500',
+  JSON.stringify(gmap['A003']));
+expect('A003 genrePath=雑貨 > 文具', gmap['A003'].rakuten_genre_path === '雑貨 > 文具');
+expect('A004 genreId=300 (categories[]) + path',
+  gmap['A004'].rakuten_genre_id === '300' && gmap['A004'].rakuten_genre_path === '日用品 > 洗剤');
+expect('S001 genre 入ってない (RMS が返さなかった、 COALESCE で既存維持=null)',
+  gmap['S001'].rakuten_genre_id === null);
+expect('A001 (既に title 入ってる) は触られない',
+  gmap['A001'].rakuten_genre_id === null && gmap['A001'].rakuten_genre_path === null);
 
 const failed = checks.filter((c) => !c.ok);
 if (failed.length > 0) {
