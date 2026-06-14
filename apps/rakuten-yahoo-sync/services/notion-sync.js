@@ -145,7 +145,9 @@ export function reconcilePages(db, pages, { allowDeleteDetection, runId }) {
   for (const page of pages) {
     let record;
     try {
-      record = buildSyncRecord(page);
+      // Codex E-11 R1 H-1: migration 014 未適用環境では hash 計算から新列を除外。
+      //   migration 適用後の sync で hash が変わって UPDATE が発火するように。
+      record = buildSyncRecord(page, { includeNewColumnsInHash: NEW_COLUMNS_SUPPORTED });
     } catch (e) {
       stats.errors.push({ page_id: page?.id, error: String(e.message || e) });
       continue;

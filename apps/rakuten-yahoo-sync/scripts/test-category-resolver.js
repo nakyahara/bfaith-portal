@@ -30,7 +30,8 @@ const NOW = '2026-06-14T10:00:00Z';
 const ins = db.prepare(`INSERT INTO genre_yahoo_category_mapping (rakuten_genre_id, yahoo_category_id, yahoo_path, sample_count, is_primary, first_learned_at, last_learned_at) VALUES (?, ?, ?, ?, ?, ?, ?)`);
 ins.run('100371', 12345, 'zakka/main', 5, 1, NOW, NOW);
 ins.run('100371', 12346, 'zakka/sub', 1, 0, NOW, NOW);   // not primary
-ins.run('200500', 99999, 'bungu', 1, 1, NOW, NOW);
+ins.run('200500', 99999, 'bungu', 2, 1, NOW, NOW);       // Codex R1 H-2: sample>=2 で primary 採用
+ins.run('300700', 11111, 'risky', 1, 1, NOW, NOW);       // Codex R1 H-2: sample=1 → 採用しない想定
 
 // 1. resolveByGenreId 単体
 expect('resolveByGenreId(100371) → primary (12345, zakka/main, count=5)',
@@ -52,12 +53,8 @@ const r2 = resolveCategoryAndPath({
 });
 expect('Notion override > 学習辞書 (両方 in)', r2.source === 'notion' && r2.category === 77777 && r2.path === 'manual/path');
 
-// 4. Notion override 不完全 (category だけ、 path 無し) → 学習辞書にフォールバック
-const r3 = resolveCategoryAndPath({
-  db, rakutenGenreId: '100371',
-  notionOverride: { product_category: 77777, path: null },
-});
-expect('Notion category だけ → 学習辞書 fallback', r3.source === 'learned' && r3.category === 12345);
+// 4. (R1 H-3 で挙動変更) Notion override 不完全は notion_partial で blocked、 学習辞書 fallback しない。
+//    詳細テストは下記 R1 H-3 セクション参照。
 
 // 5. genre 未学習 → unresolved
 const r4 = resolveCategoryAndPath({ db, rakutenGenreId: 'UNKNOWN' });
@@ -71,6 +68,43 @@ expect('no input → unresolved', r5.source === 'unresolved');
 const db2 = new Database(':memory:');
 const r6 = resolveCategoryAndPath({ db: db2, rakutenGenreId: '100371' });
 expect('migration 013 未適用環境でも crash しない', r6.source === 'unresolved');
+
+// ───── Codex R1 H-2: sample_count 閾値 ─────
+const rSample1 = resolveCategoryAndPath({ db, rakutenGenreId: '300700' });
+expect('R1 H-2: sample=1 primary は採用しない (unresolved)', rSample1.source === 'unresolved',
+  `got source=${rSample1.source}`);
+
+// 環境変数で閾値を下げると sample=1 でも採用される
+process.env.RYS_CATEGORY_MIN_SAMPLE = '1';
+const rSample1Allowed = resolveCategoryAndPath({ db, rakutenGenreId: '300700' });
+expect('R1 H-2: RYS_CATEGORY_MIN_SAMPLE=1 なら sample=1 も learned',
+  rSample1Allowed.source === 'learned' && rSample1Allowed.category === 11111);
+delete process.env.RYS_CATEGORY_MIN_SAMPLE;
+
+// ───── Codex R1 H-3: Notion override 片方だけは notion_partial で blocked ─────
+const rPartialCat = resolveCategoryAndPath({
+  db, rakutenGenreId: '100371',
+  notionOverride: { product_category: 77777, path: null },
+});
+expect('R1 H-3: Notion category だけ → notion_partial (学習辞書 fallback しない)',
+  rPartialCat.source === 'notion_partial' && rPartialCat.category === null,
+  JSON.stringify(rPartialCat));
+
+const rPartialPath = resolveCategoryAndPath({
+  db, rakutenGenreId: '100371',
+  notionOverride: { product_category: null, path: 'manual/path' },
+});
+expect('R1 H-3: Notion path だけ → notion_partial',
+  rPartialPath.source === 'notion_partial' && rPartialPath.path === null,
+  JSON.stringify(rPartialPath));
+
+// 両方空 → 学習辞書 fallback (H-3 影響なし)
+const rEmpty = resolveCategoryAndPath({
+  db, rakutenGenreId: '100371',
+  notionOverride: { product_category: null, path: null },
+});
+expect('R1 H-3: Notion 両方空 → 学習辞書 fallback OK',
+  rEmpty.source === 'learned' && rEmpty.category === 12345);
 
 const failed = checks.filter((c) => !c.ok);
 if (failed.length > 0) {

@@ -29,6 +29,8 @@ export function translateReason(rawReason) {
       return { message: 'Yahoo!カテゴリが解決できません (楽天 genre が学習済 130 件に無い、 または学習辞書未構築)。 Notion に 「Yahoo!カテゴリID」 列を作って入力してください。 または既存出品から学習し直してください', notionField: 'Yahoo!カテゴリID', severity: 'must' };
     case 'path_unresolved':
       return { message: 'Yahoo!path が解決できません (同上、 楽天 genre が学習済 130 件に無い)。 Notion に 「Yahoo!path」 列を作って入力してください', notionField: 'Yahoo!path', severity: 'must' };
+    case 'notion_category_partial':
+      return { message: 'Notion で Yahoo!カテゴリID と Yahoo!path のどちらか片方しか入力されていません。 両方入力してください (片方だけだと自動推定との混在を避けるため publish が止まります)', notionField: 'Yahoo!カテゴリID', severity: 'must' };
     case 'price_invalid_or_zero':
       return { message: '売価が未入力、 または 0 円です', notionField: '売価', severity: 'must' };
     case 'delivery_mapping_unresolved':

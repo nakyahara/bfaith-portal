@@ -136,6 +136,17 @@ function getSyncState(db) {
  *     - unknown    : それ以外 (基本ない、 保険)
  */
 function listProductsForUI(db, { filter = 'all', search = '' } = {}) {
+  // Codex E-11 R1 H-5: migration 014 未適用環境で no.notion_product_category / no.notion_path
+  // を SELECT すると SQLite が 「no such column」 で throw → 上位 catch で空一覧化される (致命的)。
+  // schema detection で SELECT 列を切り替える。
+  const HAS_NOTION_CATEGORY_COLUMNS = (() => {
+    try { db.prepare('SELECT notion_product_category, notion_path FROM notion_overrides LIMIT 0').get(); return true; }
+    catch (_) { return false; }
+  })();
+  const NOTION_CATEGORY_SELECT = HAS_NOTION_CATEGORY_COLUMNS
+    ? 'no.notion_product_category, no.notion_path,'
+    : 'NULL AS notion_product_category, NULL AS notion_path,';
+
   // Codex E-7 R1/R2 確定:
   //   - 起点 = migration_candidates (楽天有 ∩ Yahoo無)
   //   - JOIN: notion_overrides は **rakuten_manage_number** で結合 (R2 Critical D-0)
@@ -163,9 +174,9 @@ function listProductsForUI(db, { filter = 'all', search = '' } = {}) {
       no.notion_tax_rate,
       no.notion_status,
       no.synced_at,
-      -- Phase E-11-d: Notion 商品マスターからの Yahoo!カテゴリ確定値 (列が無ければ NULL)
-      COALESCE(no.notion_product_category, NULL) AS notion_product_category,
-      COALESCE(no.notion_path, NULL) AS notion_path,
+      -- Phase E-11-d + R1 H-5: Notion 商品マスターからの Yahoo!カテゴリ確定値
+      --   migration 014 未適用環境では NULL を返す (schema detection で SELECT 切替)
+      ${NOTION_CATEGORY_SELECT}
       j.readiness_status,
       j.readiness_blocked_reasons,
       j.last_readiness_at,
@@ -245,8 +256,13 @@ function listProductsForUI(db, { filter = 'all', search = '' } = {}) {
           },
         });
       } catch (_) { categoryResolved = { category: null, path: null, source: 'unresolved' }; }
-      if (categoryResolved?.category == null) missing.push('product_category_unresolved');
-      if (!categoryResolved?.path)            missing.push('path_unresolved');
+      // Codex E-11 R1 H-3 整合: notion_partial は固有の reason で見せる
+      if (categoryResolved?.source === 'notion_partial') {
+        missing.push('notion_category_partial');
+      } else {
+        if (categoryResolved?.category == null) missing.push('product_category_unresolved');
+        if (!categoryResolved?.path)            missing.push('path_unresolved');
+      }
       let existingReasons = [];
       if (r.readiness_blocked_reasons) {
         try { existingReasons = JSON.parse(r.readiness_blocked_reasons); } catch (_) {}

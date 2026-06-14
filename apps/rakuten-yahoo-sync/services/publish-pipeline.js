@@ -124,19 +124,34 @@ export async function evaluateItemForPublish({
   const imagePreflight = _imagePreflight(rakutenItem, { customPatterns });
 
   // 5.5. Phase E-11-c: category-resolver で productCategory + path を自動解決
-  //   - 引数 productCategory / pathName が明示されてればそれを優先 (caller が手動指定可能)
-  //   - 無ければ Notion override → 学習辞書 (genre_yahoo_category_mapping) の順
+  //   - 引数 productCategory / pathName が両方明示されてれば caller 値を採用
+  //   - 片方だけは Codex R1 H-4 で禁止 (caller と learned の混在を避ける)
+  //   - 両方 null なら Notion override → 学習辞書 (genre_yahoo_category_mapping) の順
   //   - 解決できなければ readiness が product_category_unresolved / path_unresolved で blocked
-  let resolvedCategory = productCategory;
-  let resolvedPath = pathName;
-  let categorySource = 'caller';   // 「呼び出し側で明示指定」
+  let resolvedCategory = null;
+  let resolvedPath = null;
+  let categorySource = 'unresolved';
   let categorySampleCount = null;
-  if (!resolvedCategory || !resolvedPath) {
+  const callerHasCategory = productCategory != null;
+  const callerHasPath = typeof pathName === 'string' && pathName.length > 0;
+  if (callerHasCategory && callerHasPath) {
+    resolvedCategory = productCategory;
+    resolvedPath = pathName;
+    categorySource = 'caller';
+  } else if (callerHasCategory || callerHasPath) {
+    // Codex E-11 R1 H-4: 片方だけ caller 指定は blocked にする (混在防止)
+    return {
+      itemCode,
+      status: 'blocked',
+      reasons: ['caller_category_partial:caller specified only one of productCategory/pathName — must be both or none'],
+      debug: { stage: 'caller_partial', callerHasCategory, callerHasPath },
+    };
+  } else {
     const candidate = db.prepare('SELECT rakuten_genre_id FROM migration_candidates WHERE item_code = ?').get(itemCode);
     const rakutenGenreId = candidate?.rakuten_genre_id || null;
     const r = resolveCategoryAndPath({ db, rakutenGenreId, notionOverride });
-    if (!resolvedCategory && r.category != null) resolvedCategory = r.category;
-    if (!resolvedPath && r.path) resolvedPath = r.path;
+    resolvedCategory = r.category;
+    resolvedPath = r.path;
     categorySource = r.source;
     categorySampleCount = r.sampleCount || null;
   }
