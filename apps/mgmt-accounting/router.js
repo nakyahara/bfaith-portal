@@ -206,6 +206,55 @@ router.post('/admin/load-historical-seed', (req, res) => {
   res.json({ ok: true, dry_run: false, months_loaded: byMonth.size, rows: seed.length, report });
 });
 
+// ── 指定月より前の mgmt データを削除 (誤った旧データ除去、中原さん 2026-06-14) ──
+// 2024-07 より前(=2024-06以前)は誤りなので削除。凍結月のため削除後に再計算で復活しない。
+// dryRun=1 で削除せず対象月・件数を返す。before は YYYY-MM、安全のため '2024-07' 以下に制限
+// (= 良データ開始月 2024-07 以降は誤って消せない)。
+const PURGE_MAX_BEFORE = '2024-07'; // これ以降(良データ=Excel seed範囲)は purge 対象にできない
+router.post('/admin/purge-months-before', (req, res) => {
+  if (!checkAuth(req, res)) return;
+  const db = getMirrorDB();
+  const before = String((req.body && req.body.before) || req.query.before || '').trim();
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(before)) {
+    return res.status(400).json({ error: 'bad_before', message: 'before は YYYY-MM 形式(月は01〜12)で指定してください' });
+  }
+  if (before > PURGE_MAX_BEFORE) {
+    return res.status(400).json({ error: 'before_too_large',
+      message: `安全のため ${PURGE_MAX_BEFORE} より後ろは削除できません(良データを誤削除しないため)。指定=${before}` });
+  }
+  const dryRun = req.query.dryRun === '1' || (req.body && req.body.dryRun === true);
+  const tables = ['mgmt_monthly_pl', 'mgmt_monthly_closing', 'mart_monthly_segment_sales', 'mgmt_freight_costs', 'mgmt_material_costs'];
+  // 削除対象の件数(テーブル別) + 影響する月一覧(削除前にスナップショット)
+  const counts = {};
+  for (const t of tables) {
+    try { counts[t] = db.prepare(`SELECT COUNT(*) c FROM ${t} WHERE year_month < ?`).get(before).c; }
+    catch (e) { counts[t] = 'err: ' + e.message; }
+  }
+  const monthSet = new Set();
+  for (const t of tables) {
+    try { for (const r of db.prepare(`SELECT DISTINCT year_month FROM ${t} WHERE year_month < ?`).all(before)) monthSet.add(r.year_month); }
+    catch {}
+  }
+  const months = [...monthSet].sort();
+  if (dryRun) return res.json({ ok: true, dry_run: true, before, months, counts });
+  // 本削除: 1tx で全テーブル DELETE。1つでも失敗したら例外を外へ出して全 rollback(Codex High:
+  // catch で握りつぶすと一部だけ削除されて commit される事故になるため catch しない)。
+  // 実削除件数(.changes)を返す。before<=PURGE_MAX_BEFORE<FROZEN_THROUGH_YM なので対象は全て凍結月
+  // = 削除後にライブ再計算で復活しない。
+  let deleted;
+  try {
+    const tx = db.transaction(() => {
+      const out = {};
+      for (const t of tables) out[t] = db.prepare(`DELETE FROM ${t} WHERE year_month < ?`).run(before).changes;
+      return out;
+    });
+    deleted = tx();
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: 'delete_failed', message: e.message });
+  }
+  res.json({ ok: true, dry_run: false, before, months, deleted });
+});
+
 // 一括確定: 指定月を除く全月について calculate を実行
 router.post('/bulk-calculate', (req, res) => {
   if (!checkAuth(req, res)) return;
@@ -1045,6 +1094,17 @@ tr:hover { background: #f0f4ff; }
     </div>
     <div id="seedReport"></div>
   </div>
+
+  <div class="card" style="border:1px solid #f0c8c8; background:#fff8f8;">
+    <h3>🗑️ 2024年7月より前の誤りデータを削除</h3>
+    <p class="note-text">2024年7月より前（＝<b>2024年6月以前</b>）のデータは誤りのため削除します。凍結月なので削除後に再計算で復活しません。まず「削除対象を確認」で対象月・件数を見て、問題なければ「削除する」を押してください。<b>取り消せません。</b></p>
+    <div class="controls">
+      <button class="btn btn-outline" onclick="purgeDryRun()">削除対象を確認（ドライラン）</button>
+      <button class="btn" id="btnPurgeApply" onclick="purgeApply()" style="display:none; background:#c5221f; color:#fff">この内容で削除する</button>
+      <span id="purgeStatus" class="note-text"></span>
+    </div>
+    <div id="purgeReport"></div>
+  </div>
 </div>
 
 <!-- ===== タブ2: 月次PL ===== -->
@@ -1318,6 +1378,40 @@ async function seedApply() {
     if (!d.ok) throw new Error(d.message || d.error || 'error');
     st.textContent = '✅ ' + d.months_loaded + 'ヶ月投入完了（' + d.rows + '行）。年間PL/月次PLを再表示して確認してください。';
     document.getElementById('btnSeedApply').style.display = 'none';
+  } catch (e) { st.textContent = 'エラー: ' + e.message; }
+}
+
+// ── 2024年7月より前の誤りデータ削除 ──
+const PURGE_BEFORE = '2024-07';
+function renderPurgeReport(d) {
+  const c = d.deleted || d.counts || {};
+  let h = '<div class="note-text" style="margin-top:8px">削除対象月（' + (d.months || []).length + 'ヶ月）: ' + ((d.months || []).join(', ') || 'なし') + '</div>';
+  h += '<table style="margin-top:6px"><thead><tr><th>テーブル</th><th>削除件数</th></tr></thead><tbody>';
+  for (const t of Object.keys(c)) h += '<tr><td>' + t + '</td><td>' + c[t] + '</td></tr>';
+  h += '</tbody></table>';
+  document.getElementById('purgeReport').innerHTML = h;
+}
+async function purgeDryRun() {
+  const st = document.getElementById('purgeStatus'); st.textContent = '確認中…';
+  try {
+    const res = await fetch(BASE + '/admin/purge-months-before?dryRun=1', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ before: PURGE_BEFORE }) });
+    const d = await res.json();
+    if (!d.ok) throw new Error(d.message || d.error || 'error');
+    renderPurgeReport(d);
+    document.getElementById('btnPurgeApply').style.display = (d.months || []).length ? '' : 'none';
+    st.textContent = (d.months || []).length ? '上の対象を削除します（取り消せません）。' : '削除対象はありません。';
+  } catch (e) { st.textContent = 'エラー: ' + e.message; }
+}
+async function purgeApply() {
+  if (!confirm('2024年7月より前（2024年6月以前）のmgmtデータを削除します。取り消せません。よろしいですか？')) return;
+  const st = document.getElementById('purgeStatus'); st.textContent = '削除中…';
+  try {
+    const res = await fetch(BASE + '/admin/purge-months-before', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ before: PURGE_BEFORE }) });
+    const d = await res.json();
+    if (!d.ok) throw new Error(d.message || d.error || 'error');
+    renderPurgeReport(d);
+    st.textContent = '✅ 削除完了（' + (d.months || []).length + 'ヶ月）。年間PL/会計年度プルダウンを再表示して確認してください。';
+    document.getElementById('btnPurgeApply').style.display = 'none';
   } catch (e) { st.textContent = 'エラー: ' + e.message; }
 }
 
