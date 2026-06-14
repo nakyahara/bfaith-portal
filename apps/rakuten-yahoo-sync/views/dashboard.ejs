@@ -130,6 +130,15 @@
           <strong>楽天↔Yahoo 差分を取り直す</strong>
           <span class="text-muted small">（毎朝自動、 今すぐ取りたい時だけボタン）</span>
           <button class="btn btn-sm btn-outline-info ms-2 js-trigger-diff-sync">いま再取得</button>
+          <%# Phase E-9 中原さん指摘修正: 「Notion 修正待ち」 の横にあると Notion から取ってる
+              ように見える → 楽天 RMS から取得するボタンなので 「楽天↔Yahoo 差分」 行に移動。
+              ラベルも 「楽天 RMS から」 を明示。 %>
+          <% if (typeof rakutenTitleMissing !== 'undefined' && rakutenTitleMissing > 0) { %>
+            <button class="btn btn-sm btn-outline-info ms-2 js-backfill-rakuten-title"
+                    title="楽天 RMS の getItem API で商品名を直接取得します (Notion は経由しません)。 取得後、 修正必要リストに 「何の商品か」 が表示されます">
+              📥 楽天 RMS から商品名取得 (<%= rakutenTitleMissing %> 件未取得)
+            </button>
+          <% } %>
         </li>
         <li>
           <strong><%= summary.actionable %> 商品</strong> が Yahoo に出せます
@@ -138,13 +147,6 @@
         <li>
           <strong><%= summary.fixable %> 商品</strong> が Notion 修正待ち
           <a href="?filter=fixable" class="btn btn-sm btn-outline-warning ms-2">修正リストを見る</a>
-          <%# Phase E-9: 楽天タイトル backfill ボタン (未取得が 1 件以上ある時だけ表示) %>
-          <% if (typeof rakutenTitleMissing !== 'undefined' && rakutenTitleMissing > 0) { %>
-            <button class="btn btn-sm btn-outline-secondary ms-2 js-backfill-rakuten-title"
-                    title="楽天 RMS から商品名を取得して、 修正必要リストに 「何の商品か」 を表示できるようにします">
-              📥 楽天タイトル取得 (<%= rakutenTitleMissing %>)
-            </button>
-          <% } %>
           <% if (summary.fixable > 0 && Object.keys(fixableByCategory).length > 0) { %>
             <div class="mt-2">
               <% for (const cat of Object.keys(fixableByCategory).sort((a, b) => fixableByCategory[b] - fixableByCategory[a])) { %>
