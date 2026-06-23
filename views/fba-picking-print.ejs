@@ -65,20 +65,19 @@
         <h3><%= ps.sheet %> (<%= ps.plan %> / <%= ps.kind %>) — プランNo接頭辞: <%= ps.label %></h3>
         <table>
           <thead>
-            <tr><th>No</th><th>FNSKU</th><th>SKU</th><th>商品コード</th><th>数量</th><th>ラベル貼り担当者</th><th>確認担当者</th><th>納品箱No</th><th>土台</th></tr>
+            <tr><th>No</th><th>FNSKU</th><th>商品名</th><th>数量</th><th>ラベル貼り担当者</th><th>ラベル貼り確認担当者</th><th>納品箱No</th><th>期限管理商品</th></tr>
           </thead>
           <tbody>
             <% ps.rows.forEach(function(row){ %>
-              <tr class="<%= row.isDodai ? 'dodai-row' : '' %>">
+              <tr>
                 <td><%= row.no %></td>
                 <td><%= row.fnsku %></td>
-                <td><%= row.sku %></td>
-                <td><%= row.code %></td>
+                <td><%= row.productName %></td>
                 <td><%= row.qty %></td>
                 <td></td>
                 <td></td>
                 <td></td>
-                <td><% if (row.isDodai) { %><span class="dodai-tag">土台</span><% } %></td>
+                <td></td>
               </tr>
             <% }); %>
           </tbody>
