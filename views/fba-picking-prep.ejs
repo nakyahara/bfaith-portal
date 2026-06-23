@@ -73,13 +73,12 @@
           <div class="hint">P-touchラベルのバーコードは、FBA補充の「Step2 ロジザード在庫CSV」アップロードから自動取得します。専用アップロードは不要です。<a href="/apps/fba-replenishment">→ FBA補充で在庫CSVを更新</a></div>
         </div>
         <div class="master-card">
-          <h4>土台商品マスタ</h4>
+          <h4>土台商品 <span class="muted" style="font-weight:normal;">(スプレッドシート直結)</span></h4>
           <div class="muted" id="dodaiStatus">読込中…</div>
           <div style="margin-top:8px;">
-            <input type="file" id="dodaiFile" accept=".csv">
-            <button class="btn btn-secondary btn-sm" onclick="uploadDodaiMaster()">更新</button>
+            <button class="btn btn-secondary btn-sm" id="dodaiSyncBtn" onclick="syncDodai()">土台シート取込</button>
           </div>
-          <div class="hint">A列=SKU, F列=1 なら土台商品</div>
+          <div class="hint">FBA土台商品管理シート(A列=SKU, F列=1)を直接読込。毎朝自動同期 + 手動取込。</div>
         </div>
       </div>
     </div>
@@ -162,24 +161,24 @@ function onSlotFile(input){
   slot.classList.toggle('has-file', input.files.length>0);
 }
 
-async function uploadDodaiMaster(confirm){
-  const fileEl = document.getElementById('dodaiFile');
-  if (!fileEl.files.length){ alert('CSVファイルを選択してください'); return; }
-  const fd = new FormData();
-  fd.append('csv', fileEl.files[0]);
-  if (confirm) fd.append('confirm', 'true');
+async function syncDodai(force){
+  const btn = document.getElementById('dodaiSyncBtn');
+  btn.disabled = true;
+  const prevLabel = btn.textContent;
+  btn.textContent = '取込中…';
   try {
-    const r = await fetch('/apps/fba-replenishment/api/picking-prep/master/dodai', { method:'POST', body: fd });
+    const url = '/apps/fba-replenishment/api/picking-prep/sync-dodai' + (force ? '?force=1' : '');
+    const r = await fetch(url, { method:'POST' });
     const d = await r.json();
     if (r.status === 409 && d.needConfirm){
-      if (window.confirm((d.message||'置換を続行しますか？'))) { return uploadDodaiMaster(true); }
+      if (window.confirm(d.message||'件数が大きく減少します。続行しますか？')) { return syncDodai(true); }
       return; // キャンセル: 既存マスタは保持
     }
-    if (!r.ok){ alert('エラー: '+(d.error||r.status)); return; }
-    alert('土台商品マスタを更新しました: '+d.count+'件 (前回 '+d.prev+'件)');
-    fileEl.value='';
+    if (!r.ok){ alert('土台シート取込エラー: '+(d.error||r.status)); return; }
+    alert('土台商品シートを取込みました: '+d.count+'件 (前回 '+d.prev+'件)');
     loadStatus();
   } catch(e){ alert('通信エラー: '+e.message); }
+  finally { btn.disabled = false; btn.textContent = prevLabel; }
 }
 
 async function runProcess(){
