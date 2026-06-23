@@ -18,14 +18,14 @@ import { initDb, savePlanningData, savePlanningDataWithHistory, getLatestSnapsho
          getRestockLatest, getPlanningLatestMap, getAllEverSeenSkus, getEverStockedSkus,
          saveRestockLatest, savePlanningLatest,
          getSkuMappingSourceMode,
-         getWarehouseBarcodeRows, replaceDodaiMaster, getDodaiMaster,
+         getWarehouseBarcodeRows, getDodaiMaster,
          getPickingMasterStatus, savePickingRun, getPickingRuns, getPickingRun } from './db.js';
 import { parseCsv, decodeCsvBuffer, buildShiftJisCsv } from './picking-csv.js';
 import * as pp from './picking-prep.js';
 // SP-API関連はミニPC経由で実行（APIキーはミニPC側に一元管理）
 // import { fetchAllReports, normalizePlanningRow } from './sp-api-reports.js';
 // import { createInboundPlan, checkInboundEligibility, findErrorSkusByBinarySearch, listShipments, listShipmentItems, fetchActiveInboundQuantities } from './inbound-plans.js';
-import { syncSkuMappings } from './sheets-sync.js';
+import { syncSkuMappings, syncDodaiMaster } from './sheets-sync.js';
 import { generateRecommendations } from './calculation-engine.js';
 import { normalizePlanningRow } from './sp-api-reports.js';
 import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
@@ -115,6 +115,13 @@ initDb().then(() => {
       console.log(`[FBA-Cron] 完了: ${result.total}件 (スナップショット: ${result.snapshots}件)`);
     } catch (e) {
       console.error('[FBA-Cron] SKUマッピング同期エラー:', e);
+    }
+    // 土台商品マスタ(ピッキング準備)も同期。失敗しても他処理に影響させない (best-effort)。
+    try {
+      const dr = await syncDodaiMaster();
+      console.log(`[FBA-Cron] 土台商品マスタ同期完了: ${dr.count}件`);
+    } catch (e) {
+      console.error('[FBA-Cron] 土台商品マスタ同期エラー:', e);
     }
   });
   console.log('[FBA] 定期同期スケジュール設定: 毎日06:00 JST');
@@ -1319,29 +1326,6 @@ function runUpload(mw) {
   });
 }
 
-// マスタ置換前の安全ガード (Codex #1: 誤アップロードによる全消去/大幅欠損の防止)。
-// confirm=true で明示承認された場合のみ 0件/急減を許可する。
-function checkMasterReplace(res, prev, dataRowCount, matchedCount, confirm) {
-  if (dataRowCount === 0) {
-    res.status(400).json({ error: 'CSVにデータ行がありません（ヘッダのみ/空ファイルの可能性）' });
-    return false;
-  }
-  if (!confirm) {
-    if (matchedCount === 0) {
-      res.status(409).json({ needConfirm: true, prev, count: 0,
-        message: `抽出件数が0件でした（列ずれ・別ファイルの可能性）。既存${prev}件を全消去して置換しますか？` });
-      return false;
-    }
-    if (prev > 0 && matchedCount < prev * 0.5) {
-      res.status(409).json({ needConfirm: true, prev, count: matchedCount,
-        message: `件数が前回(${prev}件)から大きく減少(${matchedCount}件)します。置換を続行しますか？` });
-      return false;
-    }
-  }
-  return true;
-}
-const isConfirm = (req) => req.body?.confirm === 'true' || req.body?.confirm === '1';
-
 // 正規化 norm キーで mapping を引けるよう Map 化。空なら fail-closed (Codex #2)。
 function buildMappingMap() {
   const mappings = getSkuMappings();
@@ -1373,26 +1357,14 @@ router.get('/api/picking-prep/master-status', (req, res) => {
 // バーコードは専用マスタを廃止し、FBA補充 Step2 のロジザード在庫(warehouse_inventory.barcode)
 // から商品コードで引く。アップロード口は持たない。
 
-// 土台商品マスタ アップロード (A列=SKU, F列=1 なら土台商品)
-router.post('/api/picking-prep/master/dodai', runUpload(pickingUpload.single('csv')), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'CSVファイルが必要です' });
+// 土台商品マスタ取込: FBA土台商品管理シート(スプレッドシート)を直読みして picking_dodai_master に同期。
+// 手動ボタン用。毎朝の cron でも自動同期される。0件(列ずれ/権限)時は既存を保持して例外。
+router.post('/api/picking-prep/sync-dodai', async (req, res) => {
   try {
-    const { text } = decodeCsvBuffer(req.file.buffer);
-    const all = parseCsv(text);
-    const dataRowCount = all.length; // 土台マスタは固定ヘッダ無し前提 (F列=1 で判定)
-    const rows = [];
-    for (let r = 0; r < all.length; r++) {
-      const row = all[r] || [];
-      const sku = String(row[0] ?? '').trim();
-      const flag = String(row[5] ?? '').trim();
-      if (sku && flag === '1') rows.push({ sku });
-    }
-    const prev = getPickingMasterStatus().dodai.count || 0;
-    if (!checkMasterReplace(res, prev, dataRowCount, rows.length, isConfirm(req))) return;
-    const r = replaceDodaiMaster(rows, { filename: req.file.originalname, uploadedBy: req.session?.email });
+    const r = await syncDodaiMaster();
     res.json({ success: true, ...r });
   } catch (e) {
-    console.error('[Picking] 土台商品マスタ取込エラー:', e);
+    console.error('[Picking] 土台シート取込エラー:', e);
     res.status(500).json({ error: e.message });
   }
 });
