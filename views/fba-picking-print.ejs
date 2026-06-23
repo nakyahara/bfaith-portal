@@ -20,6 +20,13 @@
     .plan-sheet { page-break-before: always; }
     .plan-sheet:first-of-type { page-break-before: avoid; }
     .planno { white-space: pre-line; }
+    /* プラン別シート: 列幅を固定し、商品名を狭く(2行折返し可)、納品箱Noを広く。行高を一定寄りに。 */
+    .plan-table { table-layout: fixed; }
+    .plan-table td { vertical-align: middle; word-break: break-word; overflow-wrap: anywhere; }
+    .plan-table .c-num { text-align: center; }
+    .plan-table .c-qty { text-align: right; }
+    /* どのプラン/種類のシートかを各ページ(改ページ後)にも表示する繰り返しタイトル行 */
+    .plan-sheet-title { background: #222; color: #fff; font-size: 13px; font-weight: bold; text-align: left; padding: 5px 6px; }
     @media print {
       .toolbar { display: none; }
       body { margin: 0; }
@@ -62,18 +69,22 @@
   <% if (view === 'all' || view === 'plan') { %>
     <% planSheets.forEach(function(ps){ %>
       <div class="plan-sheet">
-        <h3><%= ps.sheet %> (<%= ps.plan %> / <%= ps.kind %>) — プランNo接頭辞: <%= ps.label %></h3>
-        <table>
+        <table class="plan-table">
+          <colgroup>
+            <col style="width:4%"><col style="width:11%"><col style="width:27%"><col style="width:6%">
+            <col style="width:12%"><col style="width:12%"><col style="width:19%"><col style="width:9%">
+          </colgroup>
           <thead>
+            <tr><th colspan="8" class="plan-sheet-title"><%= ps.plan %> / <%= ps.kind %> （<%= ps.sheet %>）　〔納品プランNo接頭辞: <%= ps.label %>〕</th></tr>
             <tr><th>No</th><th>FNSKU</th><th>商品名</th><th>数量</th><th>ラベル貼り担当者</th><th>ラベル貼り確認担当者</th><th>納品箱No</th><th>期限管理商品</th></tr>
           </thead>
           <tbody>
             <% ps.rows.forEach(function(row){ %>
               <tr>
-                <td><%= row.no %></td>
+                <td class="c-num"><%= row.no %></td>
                 <td><%= row.fnsku %></td>
                 <td><%= row.productName %></td>
-                <td><%= row.qty %></td>
+                <td class="c-qty"><%= row.qty %></td>
                 <td></td>
                 <td></td>
                 <td></td>
