@@ -30,6 +30,11 @@ function isoNow() { return new Date().toISOString(); }
 
 /**
  * mirror DB を ATTACH。 失敗 (ファイル無し / table 無し) は throw して呼び出し側で fail-closed。
+ *
+ * 必須 table: mirror_sku_resolved 1 つだけ。
+ *   全モール seller_sku × ne_code 統一辞書 (SKU 管理統合 Step 4-0 で master only 化済)。
+ *   楽天 itemNumber も Yahoo ItemCode も同じ table の seller_sku 列に居る前提。
+ *   sort_order=0 が代表 ne_code (セット商品でも先頭 構成 ne_code)。
  */
 function attachMirror(db, mirrorPath) {
   if (!mirrorPath) {
@@ -37,13 +42,11 @@ function attachMirror(db, mirrorPath) {
     e.code = 'MIRROR_DB_UNAVAILABLE';
     throw e;
   }
-  // 既に ATTACH 済みなら skip (better-sqlite3 で再 ATTACH は error)
   const attached = db.prepare(`PRAGMA database_list`).all().some((r) => r.name === 'wh');
   if (!attached) {
     db.prepare(`ATTACH DATABASE ? AS wh`).run(mirrorPath);
   }
-  // 必須 3 テーブルの存在チェック
-  const required = ['m_products', 'f_yahoo_sku_map', 'f_rakuten_finance_sku_daily_v1'];
+  const required = ['mirror_sku_resolved'];
   for (const t of required) {
     const row = db.prepare(`SELECT name FROM wh.sqlite_master WHERE type='table' AND name=?`).get(t);
     if (!row) {
@@ -63,15 +66,16 @@ function detachMirror(db) {
 }
 
 /**
- * CTE: yahoo_registered_items → ne_code 解決 (m_products 直結 主、 f_yahoo_sku_map 補完)
- *   不一致は除外、 conflict / none は ymap_safe / diag CTE で別カウント。
+ * CTE: yahoo_registered_items → ne_code → 楽天 itemNumber を mirror_sku_resolved で 1 hop。
  *
- * Codex 推奨パターンを そのまま実装:
- *   y_norm  → yahoo_item_code 正規化
- *   ymap    → m と fy 両方 LEFT JOIN
- *   ymap_safe → fail-closed (両 hit 不一致除外)
- *   fr_dedup  → 日次 fact を rakuten_code, ne_code dedup
- *   linked  → ymap_safe × fr_dedup で yahoo_item_code → rakuten_code 解決
+ *   mirror_sku_resolved は seller_sku → ne_code の全モール統一辞書。
+ *   楽天 itemNumber も Yahoo ItemCode も同じ列 (seller_sku) に居る。
+ *   sort_order=0 が代表 ne_code (セット商品で複数 ne_code 紐付くケース対応)。
+ *
+ *   Codex H 反映:
+ *     H2. LOWER(TRIM()) 正規化 統一
+ *     H4. 1 yahoo_item → 多 rakuten ambiguous は HAVING で除外 (呼び出し側)
+ *     H1. mirror_sku_resolved は seller_sku × ne_code で PK、 sort_order=0 限定で 1:1
  */
 const CTE_LINKED = `
   WITH
@@ -82,45 +86,37 @@ const CTE_LINKED = `
            LOWER(TRIM(y.item_code)) AS y_key
     FROM yahoo_registered_items y
   ),
-  ymap AS (
+  y_resolved AS (
+    -- Yahoo ItemCode → ne_code (sort_order=0 の代表 ne_code)
     SELECT
       y.yahoo_item_code,
       y.yahoo_category_id,
       y.yahoo_path,
-      LOWER(TRIM(m."商品コード")) AS m_ne,
-      LOWER(TRIM(fy.ne_code))    AS fy_ne
+      LOWER(TRIM(s.ne_code)) AS ne_code
     FROM y_norm y
-    LEFT JOIN wh.m_products m
-      ON LOWER(TRIM(m."商品コード")) = y.y_key
-    LEFT JOIN wh.f_yahoo_sku_map fy
-      ON LOWER(TRIM(fy.yahoo_key)) = y.y_key
+    INNER JOIN wh.mirror_sku_resolved s
+      ON LOWER(TRIM(s.seller_sku)) = y.y_key
+     AND s.sort_order = 0
+    WHERE s.ne_code IS NOT NULL AND TRIM(s.ne_code) <> ''
   ),
-  ymap_safe AS (
-    SELECT
-      yahoo_item_code,
-      yahoo_category_id,
-      yahoo_path,
-      COALESCE(m_ne, fy_ne) AS ne_code
-    FROM ymap
-    WHERE COALESCE(m_ne, fy_ne) IS NOT NULL
-      AND (m_ne IS NULL OR fy_ne IS NULL OR m_ne = fy_ne)
-  ),
-  fr_dedup AS (
+  r_resolved AS (
+    -- seller_sku → ne_code (楽天側で使う、 sort_order=0 のみ)
     SELECT DISTINCT
-      LOWER(TRIM(rakuten_code)) AS rakuten_code,
-      LOWER(TRIM(ne_code))      AS ne_code
-    FROM wh.f_rakuten_finance_sku_daily_v1
-    WHERE rakuten_code IS NOT NULL AND ne_code IS NOT NULL
-      AND TRIM(rakuten_code) <> '' AND TRIM(ne_code) <> ''
+      LOWER(TRIM(s.seller_sku)) AS rakuten_code,
+      LOWER(TRIM(s.ne_code))    AS ne_code
+    FROM wh.mirror_sku_resolved s
+    WHERE s.sort_order = 0
+      AND s.ne_code IS NOT NULL AND TRIM(s.ne_code) <> ''
   ),
   linked AS (
     SELECT
-      ys.yahoo_item_code,
-      ys.yahoo_category_id,
-      ys.yahoo_path,
-      fr.rakuten_code
-    FROM ymap_safe ys
-    INNER JOIN fr_dedup fr ON fr.ne_code = ys.ne_code
+      y.yahoo_item_code,
+      y.yahoo_category_id,
+      y.yahoo_path,
+      r.rakuten_code
+    FROM y_resolved y
+    INNER JOIN r_resolved r ON r.ne_code = y.ne_code
+    WHERE r.rakuten_code <> y.yahoo_item_code  -- 同じ seller_sku は drop (= 自己 join 排除、 楽天と Yahoo は別)
   )
 `;
 
@@ -137,32 +133,15 @@ export function diagnoseOverlap({ db, mirrorPath } = {}) {
   }
   try {
     const totalYahoo = db.prepare(`SELECT COUNT(*) AS n FROM yahoo_registered_items`).get().n;
-    const diag = db.prepare(`
-      WITH
-      y_norm AS (
-        SELECT y.item_code AS yahoo_item_code, LOWER(TRIM(y.item_code)) AS y_key
-        FROM yahoo_registered_items y
-      ),
-      ymap AS (
-        SELECT
-          y.yahoo_item_code,
-          LOWER(TRIM(m."商品コード")) AS m_ne,
-          LOWER(TRIM(fy.ne_code))    AS fy_ne
-        FROM y_norm y
-        LEFT JOIN wh.m_products m   ON LOWER(TRIM(m."商品コード")) = y.y_key
-        LEFT JOIN wh.f_yahoo_sku_map fy ON LOWER(TRIM(fy.yahoo_key)) = y.y_key
-      )
-      SELECT
-        SUM(CASE WHEN m_ne IS NOT NULL AND fy_ne IS NULL THEN 1 ELSE 0 END) AS m_only,
-        SUM(CASE WHEN m_ne IS NULL AND fy_ne IS NOT NULL THEN 1 ELSE 0 END) AS fy_only,
-        SUM(CASE WHEN m_ne IS NOT NULL AND fy_ne IS NOT NULL AND m_ne = fy_ne THEN 1 ELSE 0 END) AS both_agree,
-        SUM(CASE WHEN m_ne IS NOT NULL AND fy_ne IS NOT NULL AND m_ne <> fy_ne THEN 1 ELSE 0 END) AS both_conflict,
-        SUM(CASE WHEN m_ne IS NULL AND fy_ne IS NULL THEN 1 ELSE 0 END) AS none
-      FROM ymap
-    `).get();
-    // linked (rakuten_code 解決) 件数
+    // Yahoo ItemCode 単位の解決状況: mirror_sku_resolved に居る / 居ない
+    const yahooResolved = db.prepare(`
+      SELECT COUNT(*) AS n
+      FROM yahoo_registered_items y
+      INNER JOIN wh.mirror_sku_resolved s
+        ON LOWER(TRIM(s.seller_sku)) = LOWER(TRIM(y.item_code))
+       AND s.sort_order = 0
+    `).get().n;
     const linked = db.prepare(`${CTE_LINKED} SELECT COUNT(DISTINCT yahoo_item_code) AS n FROM linked`).get().n;
-    // ambiguous = 1 Yahoo item に複数 rakuten_code 解決
     const ambiguous = db.prepare(`
       ${CTE_LINKED}
       SELECT COUNT(*) AS n FROM (
@@ -173,13 +152,10 @@ export function diagnoseOverlap({ db, mirrorPath } = {}) {
     return {
       ok: true,
       totalYahooScanned: totalYahoo,
-      m_only: diag.m_only || 0,
-      fy_only: diag.fy_only || 0,
-      both_agree: diag.both_agree || 0,
-      both_conflict: diag.both_conflict || 0,
-      none: diag.none || 0,
-      linked,
-      ambiguous,
+      yahoo_resolved_to_ne: yahooResolved,         // mirror_sku_resolved に居る Yahoo ItemCode 数
+      yahoo_unresolved: totalYahoo - yahooResolved, // mirror_sku_resolved に居ない (master 未登録)
+      linked,                                       // 楽天側にも同 ne_code が居る件数 (= 学習対象母数)
+      ambiguous,                                    // 1 yahoo → 多 rakuten 解決 (除外)
     };
   } finally {
     detachMirror(db);
