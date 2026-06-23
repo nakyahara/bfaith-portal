@@ -1649,12 +1649,20 @@ async function yahooCategoryLearn(evt) {
       return;
     }
     const lrn = data.learning || {};
+    const d = data.diag || {};
     const remainMsg = data.remaining > 0
       ? '\n残 ' + data.remaining + ' 件 (もう一度押すと続きを取れます)'
       : '\n対象全件完了';
+    const diagSection = '\n\n[診断: mirror_sku_resolved 経由の ne_code overlap]\n' +
+      '  Yahoo 出品 総数: ' + (d.totalYahooScanned ?? '?') + '\n' +
+      '  ne_code 解決済 Yahoo 数: ' + (d.yahoo_resolved_to_ne ?? '?') + '\n' +
+      '  未解決 (master 未登録): ' + (d.yahoo_unresolved ?? '?') + '\n' +
+      '  楽天と ne_code 一致 (学習対象母数): ' + (d.linked ?? '?') + ' 件\n' +
+      '  ambiguous 除外: ' + (d.ambiguous ?? '?') + ' 件' +
+      (d.error ? '\n  ⚠️ mirror error: ' + d.error : '');
     alert('Yahoo カテゴリ取得 ' + data.updated + ' 件 / 失敗 ' + data.failed + ' 件\n' +
       '学習辞書: ' + (lrn.genresLearned || 0) + ' genre / ' + (lrn.mappingRowsUpserted || 0) + ' 対応' +
-      remainMsg);
+      remainMsg + diagSection);
     location.reload();
   } catch (e) {
     alert('ネットワークエラー: ' + e.message);
