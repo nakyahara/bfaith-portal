@@ -17,8 +17,12 @@
     .toolbar { margin-bottom: 12px; }
     .toolbar button, .toolbar a { padding: 8px 16px; font-size: 13px; border: 1px solid #ccc; border-radius: 6px; background: #2563eb; color: #fff; cursor: pointer; text-decoration: none; }
     .toolbar a.sec { background: #e5e7eb; color: #374151; }
-    .plan-sheet { page-break-before: always; }
-    .plan-sheet:first-of-type { page-break-before: avoid; }
+    /* プラン別シートは「前にプラン別シートがある時だけ」改ページ。先頭シートは改ページしないので
+       1枚目が meta だけの空白ページにならない。
+       ※ 旧 .plan-sheet:first-of-type はタグ(最初のdiv=toolbar)を指し効かなかった。隣接セレクタで確実化。 */
+    .plan-sheet + .plan-sheet { page-break-before: always; }
+    /* view=all のみ: ピッキングリストの後で最初のプラン別シートを改ページして開始する */
+    .plan-sheet.break-before { page-break-before: always; }
     .planno { white-space: pre-line; }
     /* プラン別シート: 列幅を固定し、商品名を狭く(2行折返し可)、納品箱Noを広く。行高を一定寄りに。 */
     .plan-table { table-layout: fixed; }
@@ -67,8 +71,8 @@
   <% } %>
 
   <% if (view === 'all' || view === 'plan') { %>
-    <% planSheets.forEach(function(ps){ %>
-      <div class="plan-sheet">
+    <% planSheets.forEach(function(ps, i){ %>
+      <div class="plan-sheet<%= (view === 'all' && i === 0) ? ' break-before' : '' %>">
         <table class="plan-table">
           <colgroup>
             <col style="width:4%"><col style="width:11%"><col style="width:27%"><col style="width:6%">
