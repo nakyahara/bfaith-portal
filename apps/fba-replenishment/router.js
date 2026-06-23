@@ -18,7 +18,7 @@ import { initDb, savePlanningData, savePlanningDataWithHistory, getLatestSnapsho
          getRestockLatest, getPlanningLatestMap, getAllEverSeenSkus, getEverStockedSkus,
          saveRestockLatest, savePlanningLatest,
          getSkuMappingSourceMode,
-         replaceBarcodeMaster, getBarcodeMaster, replaceDodaiMaster, getDodaiMaster,
+         getWarehouseBarcodeRows, replaceDodaiMaster, getDodaiMaster,
          getPickingMasterStatus, savePickingRun, getPickingRuns, getPickingRun } from './db.js';
 import { parseCsv, decodeCsvBuffer, buildShiftJisCsv } from './picking-csv.js';
 import * as pp from './picking-prep.js';
@@ -1370,29 +1370,8 @@ router.get('/api/picking-prep/master-status', (req, res) => {
   }
 });
 
-// バーコードマスタ アップロード (A列=商品ID, D列=バーコード, 1行目ヘッダ)
-router.post('/api/picking-prep/master/barcode', runUpload(pickingUpload.single('csv')), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'CSVファイルが必要です' });
-  try {
-    const { text } = decodeCsvBuffer(req.file.buffer);
-    const all = parseCsv(text);
-    const dataRowCount = Math.max(0, all.length - 1); // 1行目ヘッダ
-    const rows = [];
-    for (let r = 1; r < all.length; r++) {
-      const row = all[r] || [];
-      const code = String(row[0] ?? '').trim();
-      const barcode = String(row[3] ?? '').trim();
-      if (code) rows.push({ logizard_code: code, barcode });
-    }
-    const prev = getPickingMasterStatus().barcode.count || 0;
-    if (!checkMasterReplace(res, prev, dataRowCount, rows.length, isConfirm(req))) return;
-    const r = replaceBarcodeMaster(rows, { filename: req.file.originalname, uploadedBy: req.session?.email });
-    res.json({ success: true, ...r });
-  } catch (e) {
-    console.error('[Picking] バーコードマスタ取込エラー:', e);
-    res.status(500).json({ error: e.message });
-  }
-});
+// バーコードは専用マスタを廃止し、FBA補充 Step2 のロジザード在庫(warehouse_inventory.barcode)
+// から商品コードで引く。アップロード口は持たない。
 
 // 土台商品マスタ アップロード (A列=SKU, F列=1 なら土台商品)
 router.post('/api/picking-prep/master/dodai', runUpload(pickingUpload.single('csv')), (req, res) => {
@@ -1438,9 +1417,9 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
 
     // 土台商品セット
     const dodaiSet = new Set(getDodaiMaster().map(d => pp.normSku(d.sku)));
-    // バーコード Map (normCode キー)
+    // バーコード Map (normCode キー)。FBA補充 Step2 のロジザード在庫から取得。
     const barcodeMap = new Map();
-    for (const b of getBarcodeMaster()) barcodeMap.set(pp.normCode(b.logizard_code), b.barcode || '');
+    for (const b of getWarehouseBarcodeRows()) barcodeMap.set(pp.normCode(b.logizard_code), b.barcode || '');
 
     // 各プランスロットをパース
     const allPlanItems = [];

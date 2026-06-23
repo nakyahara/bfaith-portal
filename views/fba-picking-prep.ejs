@@ -68,13 +68,9 @@
       <h3>マスタ (サーバー保存・更新時のみ再アップロード)</h3>
       <div class="master-row">
         <div class="master-card">
-          <h4>バーコードマスタ</h4>
+          <h4>バーコード <span class="muted" style="font-weight:normal;">(FBA補充 Step2 在庫由来)</span></h4>
           <div class="muted" id="barcodeStatus">読込中…</div>
-          <div style="margin-top:8px;">
-            <input type="file" id="barcodeFile" accept=".csv">
-            <button class="btn btn-secondary btn-sm" onclick="uploadMaster('barcode')">更新</button>
-          </div>
-          <div class="hint">A列=商品ID, D列=バーコード (1行目ヘッダ)</div>
+          <div class="hint">P-touchラベルのバーコードは、FBA補充の「Step2 ロジザード在庫CSV」アップロードから自動取得します。専用アップロードは不要です。<a href="/apps/fba-replenishment">→ FBA補充で在庫CSVを更新</a></div>
         </div>
         <div class="master-card">
           <h4>土台商品マスタ</h4>
@@ -151,10 +147,11 @@ async function loadStatus(){
     const r = await fetch('/apps/fba-replenishment/api/picking-prep/master-status');
     const d = await r.json();
     renderSrc(d.mappingSource || MAPPING_SOURCE);
-    const b = d.barcode || {count:0};
+    const b = d.barcode || {total:0, withBarcode:0};
     const dd = d.dodai || {count:0};
-    document.getElementById('barcodeStatus').innerHTML = b.count
-      ? esc(b.count)+'件 (更新: '+esc(b.updated_at||'-')+')' : '<span style="color:#b91c1c;">未登録</span>';
+    document.getElementById('barcodeStatus').innerHTML = b.total
+      ? esc(b.withBarcode)+' / '+esc(b.total)+'件にバーコードあり (在庫更新: '+esc(b.uploaded_at||'-')+')'
+      : '<span style="color:#b91c1c;">在庫CSV未取込 — 先にFBA補充 Step2 を実行してください</span>';
     document.getElementById('dodaiStatus').innerHTML = dd.count
       ? esc(dd.count)+'件 (更新: '+esc(dd.updated_at||'-')+')' : '<span style="color:#b91c1c;">未登録</span>';
   } catch(e){ /* ignore */ }

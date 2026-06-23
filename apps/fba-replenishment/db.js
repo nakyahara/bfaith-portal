@@ -545,14 +545,8 @@ export async function initDb() {
     )
   `);
 
-  // --- 17. picking_barcode_master: P-touch ラベル用バーコードマスタ (商品ID→バーコード、置換保存) ---
-  db.run(`
-    CREATE TABLE IF NOT EXISTS picking_barcode_master (
-      logizard_code TEXT PRIMARY KEY,
-      barcode TEXT,
-      updated_at TEXT DEFAULT (datetime('now','localtime'))
-    )
-  `);
+  // P-touch ラベル用バーコードは専用マスタを廃止し、FBA補充 Step2 のロジザード在庫
+  // (warehouse_inventory.barcode) を商品コードで引く方式に一本化 (二重メンテ回避)。
 
   // --- 18. picking_dodai_master: 土台商品マスタ (土台商品の SKU のみ保持、置換保存) ---
   db.run(`
@@ -2135,32 +2129,27 @@ function insertMasterAudit(masterType, filename, prevCount, newCount, uploadedBy
   );
 }
 
-// バーコードマスタを全置換 (商品ID→バーコード)。rows: [{ logizard_code, barcode }]
-export function replaceBarcodeMaster(rows, meta = {}) {
-  const prev = queryOne('SELECT COUNT(*) AS c FROM picking_barcode_master')?.c || 0;
-  db.run('BEGIN TRANSACTION');
-  try {
-    db.run('DELETE FROM picking_barcode_master');
-    for (const r of rows) {
-      if (!r.logizard_code) continue;
-      db.run(
-        `INSERT OR REPLACE INTO picking_barcode_master (logizard_code, barcode) VALUES (?, ?)`,
-        [r.logizard_code, r.barcode || '']
-      );
-    }
-    const newCount = queryOne('SELECT COUNT(*) AS c FROM picking_barcode_master')?.c || 0;
-    insertMasterAudit('barcode', meta.filename, prev, newCount, meta.uploadedBy);
-    db.run('COMMIT');
-    saveToFile();
-    return { prev, count: newCount };
-  } catch (e) {
-    db.run('ROLLBACK');
-    throw e;
-  }
+// P-touch ラベル用バーコードは専用マスタを持たず、FBA補充 Step2 でアップ済みの
+// ロジザード在庫(warehouse_inventory.barcode)を商品コード(logizard_code)で引く。
+// (同一CSV由来でバーコードを内包するため、二重メンテを避ける)
+export function getWarehouseBarcodeRows() {
+  return queryAll(
+    `SELECT logizard_code, MAX(barcode) AS barcode
+     FROM warehouse_inventory
+     WHERE barcode IS NOT NULL AND TRIM(barcode) != ''
+     GROUP BY LOWER(TRIM(logizard_code))`
+  );
 }
 
-export function getBarcodeMaster() {
-  return queryAll('SELECT logizard_code, barcode FROM picking_barcode_master');
+export function getWarehouseBarcodeStats() {
+  const row = queryOne(
+    `SELECT
+       COUNT(DISTINCT LOWER(TRIM(logizard_code))) AS total,
+       COUNT(DISTINCT CASE WHEN barcode IS NOT NULL AND TRIM(barcode) != '' THEN LOWER(TRIM(logizard_code)) END) AS with_barcode,
+       MAX(uploaded_at) AS uploaded_at
+     FROM warehouse_inventory`
+  ) || { total: 0, with_barcode: 0, uploaded_at: null };
+  return { total: row.total || 0, withBarcode: row.with_barcode || 0, uploaded_at: row.uploaded_at || null };
 }
 
 // 土台商品マスタを全置換 (土台商品の SKU のみ)。rows: [{ sku }]
@@ -2188,11 +2177,9 @@ export function getDodaiMaster() {
   return queryAll('SELECT sku FROM picking_dodai_master');
 }
 
-// 両マスタの件数 + 最終更新日時 + 直近監査
+// マスタ状態: バーコードは在庫(Step2)由来の網羅状況、土台商品は専用マスタの件数 + 直近監査
 export function getPickingMasterStatus() {
-  const barcode = queryOne(
-    `SELECT COUNT(*) AS count, MAX(updated_at) AS updated_at FROM picking_barcode_master`
-  ) || { count: 0, updated_at: null };
+  const barcode = getWarehouseBarcodeStats(); // { total, withBarcode, uploaded_at }
   const dodai = queryOne(
     `SELECT COUNT(*) AS count, MAX(updated_at) AS updated_at FROM picking_dodai_master`
   ) || { count: 0, updated_at: null };
