@@ -1141,7 +1141,9 @@ router.post('/api/yahoo-category/backfill-and-learn', async (req, res) => {
   try {
     const db = getDB();
     const body = req.body || {};
-    const limit = Number.isInteger(body.limit) && body.limit > 0 && body.limit <= 100 ? body.limit : 50;
+    // 母集団は overlap 行 (= migration_candidates と重なる Yahoo 出品) のみ。 数百件で
+    // 終わるよう、 上限 500 まで許可。 1 click で全部取れることが目標。
+    const limit = Number.isInteger(body.limit) && body.limit > 0 && body.limit <= 500 ? body.limit : 300;
     const backfill = await backfillYahooCategoriesAndPaths({ db, limit });
     let learning = null;
     try { learning = learnGenreCategoryMapping(db); }

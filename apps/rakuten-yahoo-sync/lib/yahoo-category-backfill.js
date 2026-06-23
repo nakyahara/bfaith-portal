@@ -23,11 +23,20 @@ const DEFAULT_BATCH_LIMIT = 50;
 
 function isoNow() { return new Date().toISOString(); }
 
+/**
+ * 学習に使える Yahoo 出品行 (= 楽天 migration_candidates と overlap してる行) のうち
+ * category 未取得な件数を返す。 学習辞書には overlap 行しか使えないので、 全 yahoo
+ * 出品 (b-faith01 ストアなら 3,000+ 件) を取りに行く必要はない。
+ *
+ * 中原さんが 「📚 Yahoo カテゴリ学習」 ボタンを 1-2 回押せば終わるよう、 母集団を
+ * 「migration_candidates にある item_code に限定」 する。
+ */
 export function countMissingYahooCategories(db) {
   return db.prepare(`
     SELECT COUNT(*) AS n
-    FROM yahoo_registered_items
-    WHERE yahoo_category_id IS NULL
+    FROM yahoo_registered_items y
+    INNER JOIN migration_candidates c ON c.item_code = y.item_code
+    WHERE y.yahoo_category_id IS NULL
   `).get().n;
 }
 
@@ -35,11 +44,14 @@ export async function backfillYahooCategoriesAndPaths({ db, limit = DEFAULT_BATC
   if (!db) throw new Error('backfillYahooCategoriesAndPaths: db required');
   const _bulk = deps.fetchYahooItemDetailsBulk || fetchYahooItemDetailsBulk;
 
+  // E-11-b 改: overlap している (= migration_candidates に居る) item_code のみを取りに行く。
+  //   3,604 件 全部取らずに 269 件 (移行対象楽天) 内の overlap だけで学習辞書を作る。
   const targets = db.prepare(`
-    SELECT item_code
-    FROM yahoo_registered_items
-    WHERE yahoo_category_id IS NULL
-    ORDER BY last_seen_at DESC
+    SELECT y.item_code
+    FROM yahoo_registered_items y
+    INNER JOIN migration_candidates c ON c.item_code = y.item_code
+    WHERE y.yahoo_category_id IS NULL
+    ORDER BY y.last_seen_at DESC
     LIMIT ?
   `).all(limit).map((r) => r.item_code);
 
