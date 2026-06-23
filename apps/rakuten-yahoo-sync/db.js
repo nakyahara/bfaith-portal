@@ -129,8 +129,11 @@ export function getCurrentDBPath() {
  *   - mirror 経路は通常 getMirrorDB() (RW connection) と別 instance を持つ
  *   - 開く側 (RYS) は close 責任あり
  */
-export function openMirrorReadonly() {
-  const mirrorPath = process.env.WAREHOUSE_MIRROR_DB_FILE
+export function getMirrorDbPath() {
+  return process.env.WAREHOUSE_MIRROR_DB_FILE
     || path.join(DATA_DIR, 'warehouse-mirror.db');
-  return new Database(mirrorPath, { readonly: true, fileMustExist: true });
+}
+
+export function openMirrorReadonly() {
+  return new Database(getMirrorDbPath(), { readonly: true, fileMustExist: true });
 }
