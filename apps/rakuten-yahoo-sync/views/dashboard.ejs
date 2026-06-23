@@ -1631,15 +1631,16 @@ async function backfillRakutenTitle(evt) {
 async function yahooCategoryLearn(evt) {
   const btn = evt.currentTarget;
   if (!btn || btn.disabled) return;
-  if (!confirm('Yahoo!ショッピング既存出品から商品カテゴリと path を順次取得します (50 件ずつ)。 ' +
-    '\n100-130 件あるため、 完了まで 1-3 分かかります。 \n続行しますか?')) return;
+  if (!confirm('楽天移行候補商品が Yahoo にも出ているもの (overlap 行) のカテゴリと path を ' +
+    '楽天 genre と紐付けて学習辞書を作ります。\n' +
+    '対象は数十〜数百件、 1 回押せばたいてい完了します。\n続行しますか?')) return;
   const original = btn.innerHTML;
   btn.disabled = true;
   btn.textContent = '取得中...';
   try {
     const res = await fetch('/apps/rakuten-yahoo-sync/api/yahoo-category/backfill-and-learn', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ limit: 100 }),
+      body: JSON.stringify({ limit: 500 }),
     });
     const data = await res.json();
     if (!res.ok) {
@@ -1648,9 +1649,12 @@ async function yahooCategoryLearn(evt) {
       return;
     }
     const lrn = data.learning || {};
+    const remainMsg = data.remaining > 0
+      ? '\n残 ' + data.remaining + ' 件 (もう一度押すと続きを取れます)'
+      : '\n対象全件完了';
     alert('Yahoo カテゴリ取得 ' + data.updated + ' 件 / 失敗 ' + data.failed + ' 件\n' +
-      '学習辞書: ' + (lrn.genresLearned || 0) + ' genre / ' + (lrn.mappingRowsUpserted || 0) + ' 対応\n' +
-      '残 ' + data.remaining + ' 件 (続けるにはもう一度押してください)');
+      '学習辞書: ' + (lrn.genresLearned || 0) + ' genre / ' + (lrn.mappingRowsUpserted || 0) + ' 対応' +
+      remainMsg);
     location.reload();
   } catch (e) {
     alert('ネットワークエラー: ' + e.message);
