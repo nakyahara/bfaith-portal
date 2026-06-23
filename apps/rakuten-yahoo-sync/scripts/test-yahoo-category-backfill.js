@@ -71,15 +71,17 @@ db.exec(`
 const tmpMirror = path.join(os.tmpdir(), `rys-test-mirror-${process.pid}-${Date.now()}.db`);
 const mirrorDb = new Database(tmpMirror);
 mirrorDb.exec(`
-  CREATE TABLE mirror_sku_resolved (
-    seller_sku  TEXT NOT NULL,
-    ne_code     TEXT NOT NULL,
-    quantity    INTEGER NOT NULL DEFAULT 1,
-    source      TEXT NOT NULL DEFAULT 'master',
-    商品名      TEXT,
-    sort_order  INTEGER NOT NULL DEFAULT 0,
-    synced_at   TEXT NOT NULL DEFAULT '2026-06-23T00:00:00Z',
-    PRIMARY KEY (seller_sku, ne_code)
+  CREATE TABLE mirror_yahoo_finance_sku_daily (
+    date_jst       TEXT NOT NULL,
+    yahoo_sku_key  TEXT NOT NULL,
+    ne_code        TEXT,
+    PRIMARY KEY (date_jst, yahoo_sku_key)
+  );
+  CREATE TABLE mirror_rakuten_finance_sku_daily (
+    date_jst       TEXT NOT NULL,
+    rakuten_code   TEXT NOT NULL,
+    ne_code        TEXT,
+    PRIMARY KEY (date_jst, rakuten_code)
   );
 `);
 mirrorDb.close();
@@ -102,20 +104,22 @@ ci.run('algi50',        'mn-3', NOW, NOW, NOW, NOW, 'candidate', '200500');
 ci.run('ITEM_X',        'mn-4', NOW, NOW, NOW, NOW, 'candidate', '999999');
 ci.run('ITEM_Y',        'mn-5', NOW, NOW, NOW, NOW, 'candidate', '999999');
 
-// mirror_sku_resolved に seed
+// daily fact mirror に seed (Codex H1 dedupe を検証するため日次重複も入れる)
 db.prepare(`ATTACH DATABASE ? AS wh`).run(tmpMirror);
-const sku = db.prepare(`INSERT INTO wh.mirror_sku_resolved (seller_sku, ne_code, quantity, source, sort_order, synced_at) VALUES (?, ?, 1, 'master', 0, ?)`);
-// Yahoo 側
-sku.run('0726-001001', 'NE001', NOW);
-sku.run('0726-001002', 'NE002', NOW);
-sku.run('0726-001003', 'NE003', NOW);
-sku.run('0726-001004', 'NE004', NOW);
-// 楽天側 (同じ ne_code に解決される、 これで overlap 成立)
-sku.run('abura100',    'NE001', NOW);
-sku.run('oilstone200', 'NE002', NOW);
-sku.run('algi50',      'NE003', NOW);
-sku.run('ITEM_X',      'NE004', NOW);   // ambiguous (X と Y 両方が NE004)
-sku.run('ITEM_Y',      'NE004', NOW);
+const yf = db.prepare(`INSERT INTO wh.mirror_yahoo_finance_sku_daily (date_jst, yahoo_sku_key, ne_code) VALUES (?, ?, ?)`);
+yf.run('2026-06-01', '0726-001001', 'NE001');
+yf.run('2026-06-02', '0726-001001', 'NE001');  // 日次重複
+yf.run('2026-06-01', '0726-001002', 'NE002');
+yf.run('2026-06-01', '0726-001003', 'NE003');
+yf.run('2026-06-01', '0726-001004', 'NE004');
+// 0726-001005 は yahoo daily fact にも居ない
+const rf = db.prepare(`INSERT INTO wh.mirror_rakuten_finance_sku_daily (date_jst, rakuten_code, ne_code) VALUES (?, ?, ?)`);
+rf.run('2026-06-01', 'abura100',    'NE001');
+rf.run('2026-06-02', 'abura100',    'NE001');  // 日次重複
+rf.run('2026-06-01', 'oilstone200', 'NE002');
+rf.run('2026-06-01', 'algi50',      'NE003');
+rf.run('2026-06-01', 'ITEM_X',      'NE004');  // ambiguous
+rf.run('2026-06-01', 'ITEM_Y',      'NE004');
 db.prepare('DETACH DATABASE wh').run();
 
 // ───── 診断 ─────

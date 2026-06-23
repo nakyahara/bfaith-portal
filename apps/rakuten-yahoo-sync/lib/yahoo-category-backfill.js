@@ -46,7 +46,9 @@ function attachMirror(db, mirrorPath) {
   if (!attached) {
     db.prepare(`ATTACH DATABASE ? AS wh`).run(mirrorPath);
   }
-  const required = ['mirror_sku_resolved'];
+  // 全販売 SKU カバーする daily fact mirror を使う (master 登録に依存しない)。
+  // mirror_sku_resolved は master 登録分しか持たないので NG (b-faith01 で 6/3604 件しか hit しない)。
+  const required = ['mirror_yahoo_finance_sku_daily', 'mirror_rakuten_finance_sku_daily'];
   for (const t of required) {
     const row = db.prepare(`SELECT name FROM wh.sqlite_master WHERE type='table' AND name=?`).get(t);
     if (!row) {
@@ -66,47 +68,32 @@ function detachMirror(db) {
 }
 
 /**
- * CTE: yahoo_registered_items → ne_code → 楽天 itemNumber を mirror_sku_resolved で 1 hop。
- *
- *   mirror_sku_resolved は seller_sku → ne_code の全モール統一辞書。
- *   楽天 itemNumber も Yahoo ItemCode も同じ列 (seller_sku) に居る。
- *   sort_order=0 が代表 ne_code (セット商品で複数 ne_code 紐付くケース対応)。
- *
- *   Codex H 反映:
- *     H2. LOWER(TRIM()) 正規化 統一
- *     H4. 1 yahoo_item → 多 rakuten ambiguous は HAVING で除外 (呼び出し側)
- *     H1. mirror_sku_resolved は seller_sku × ne_code で PK、 sort_order=0 限定で 1:1
+ * CTE: Yahoo / 楽天 daily fact mirror から ne_code を取得して overlap 計算。
+ *   - mirror_yahoo_finance_sku_daily.yahoo_sku_key → ne_code (全販売 SKU カバー)
+ *   - mirror_rakuten_finance_sku_daily.rakuten_code → ne_code
+ *   日次重複は GROUP BY で潰す (Codex H1)、 LOWER(TRIM) 統一 (H2)、 NULL/empty 除外。
  */
 const CTE_LINKED = `
   WITH
-  y_norm AS (
-    SELECT y.item_code AS yahoo_item_code,
-           y.yahoo_category_id,
-           y.yahoo_path,
-           LOWER(TRIM(y.item_code)) AS y_key
-    FROM yahoo_registered_items y
-  ),
   y_resolved AS (
-    -- Yahoo ItemCode → ne_code (sort_order=0 の代表 ne_code)
     SELECT
-      y.yahoo_item_code,
+      y.item_code              AS yahoo_item_code,
       y.yahoo_category_id,
       y.yahoo_path,
-      LOWER(TRIM(s.ne_code)) AS ne_code
-    FROM y_norm y
-    INNER JOIN wh.mirror_sku_resolved s
-      ON LOWER(TRIM(s.seller_sku)) = y.y_key
-     AND s.sort_order = 0
-    WHERE s.ne_code IS NOT NULL AND TRIM(s.ne_code) <> ''
+      LOWER(TRIM(yf.ne_code))  AS ne_code
+    FROM yahoo_registered_items y
+    INNER JOIN wh.mirror_yahoo_finance_sku_daily yf
+      ON LOWER(TRIM(yf.yahoo_sku_key)) = LOWER(TRIM(y.item_code))
+    WHERE yf.ne_code IS NOT NULL AND TRIM(yf.ne_code) <> ''
+    GROUP BY y.item_code, LOWER(TRIM(yf.ne_code))
   ),
   r_resolved AS (
-    -- seller_sku → ne_code (楽天側で使う、 sort_order=0 のみ)
-    SELECT DISTINCT
-      LOWER(TRIM(s.seller_sku)) AS rakuten_code,
-      LOWER(TRIM(s.ne_code))    AS ne_code
-    FROM wh.mirror_sku_resolved s
-    WHERE s.sort_order = 0
-      AND s.ne_code IS NOT NULL AND TRIM(s.ne_code) <> ''
+    SELECT
+      LOWER(TRIM(rakuten_code)) AS rakuten_code,
+      LOWER(TRIM(ne_code))      AS ne_code
+    FROM wh.mirror_rakuten_finance_sku_daily
+    WHERE ne_code IS NOT NULL AND TRIM(ne_code) <> ''
+    GROUP BY LOWER(TRIM(rakuten_code)), LOWER(TRIM(ne_code))
   ),
   linked AS (
     SELECT
@@ -116,7 +103,7 @@ const CTE_LINKED = `
       r.rakuten_code
     FROM y_resolved y
     INNER JOIN r_resolved r ON r.ne_code = y.ne_code
-    WHERE r.rakuten_code <> y.yahoo_item_code  -- 同じ seller_sku は drop (= 自己 join 排除、 楽天と Yahoo は別)
+    WHERE r.rakuten_code <> LOWER(TRIM(y.yahoo_item_code))
   )
 `;
 
@@ -135,11 +122,11 @@ export function diagnoseOverlap({ db, mirrorPath } = {}) {
     const totalYahoo = db.prepare(`SELECT COUNT(*) AS n FROM yahoo_registered_items`).get().n;
     // Yahoo ItemCode 単位の解決状況: mirror_sku_resolved に居る / 居ない
     const yahooResolved = db.prepare(`
-      SELECT COUNT(*) AS n
+      SELECT COUNT(DISTINCT y.item_code) AS n
       FROM yahoo_registered_items y
-      INNER JOIN wh.mirror_sku_resolved s
-        ON LOWER(TRIM(s.seller_sku)) = LOWER(TRIM(y.item_code))
-       AND s.sort_order = 0
+      INNER JOIN wh.mirror_yahoo_finance_sku_daily yf
+        ON LOWER(TRIM(yf.yahoo_sku_key)) = LOWER(TRIM(y.item_code))
+      WHERE yf.ne_code IS NOT NULL AND TRIM(yf.ne_code) <> ''
     `).get().n;
     const linked = db.prepare(`${CTE_LINKED} SELECT COUNT(DISTINCT yahoo_item_code) AS n FROM linked`).get().n;
     const ambiguous = db.prepare(`
