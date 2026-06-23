@@ -382,9 +382,21 @@ function decodeXmlEntities(s) {
 function parseGetItemDetailXml(xml) {
   const out = { ItemCode: null, ProductCategory: null, Path: null, Name: null };
   if (typeof xml !== 'string' || xml.length === 0) return out;
+  // PR #322 で getItem 対応した時 path/name が null だった件:
+  //   Yahoo getItem の <Path>/<Name> は CDATA wrap (`<![CDATA[...]]>`) で返ってくる。
+  //   `[^<]*` だと CDATA の `<!` で停止して空文字を返してた。
+  //   helper を CDATA / plain text 両方に対応させる。
+  const unwrapCdata = (s) => {
+    if (typeof s !== 'string') return null;
+    const m = s.match(/<!\[CDATA\[([\s\S]*?)\]\]>/);
+    return m ? m[1] : s;
+  };
   const tag = (name) => {
-    const m = xml.match(new RegExp(`<${name}>([^<]*)</${name}>`, 'i'));
-    return m ? decodeXmlEntities(m[1]).trim() : null;
+    // multiline + non-greedy で開閉タグ間の全テキストを掴み、 CDATA を unwrap、 entity decode + trim
+    const m = xml.match(new RegExp(`<${name}\\b[^>]*>([\\s\\S]*?)</${name}>`, 'i'));
+    if (!m) return null;
+    const inner = unwrapCdata(m[1]);
+    return decodeXmlEntities(inner).trim();
   };
   out.ItemCode = tag('ItemCode');
   const pc = tag('ProductCategory');
@@ -393,16 +405,16 @@ function parseGetItemDetailXml(xml) {
     out.ProductCategory = Number.isFinite(n) ? n : null;
   }
   // path 抽出: <PathList> 内の origFlag="1" の <Path>...</Path> を優先、
-  //   無ければ最初の <Path>...</Path> を採用、 古い実装の <Path>直書き fallback。
+  //   無ければ最初の <Path>...</Path> を採用。 CDATA wrap も unwrap する。
   out.Path = (() => {
     const listMatch = xml.match(/<PathList[^>]*>([\s\S]*?)<\/PathList>/i);
     const scope = listMatch ? listMatch[1] : xml;
     // origFlag="1" の <Path ...>VALUE</Path>
-    const orig = scope.match(/<Path\b[^>]*\borigFlag\s*=\s*"1"[^>]*>([^<]*)<\/Path>/i);
-    if (orig) return decodeXmlEntities(orig[1]).trim();
+    const orig = scope.match(/<Path\b[^>]*\borigFlag\s*=\s*"1"[^>]*>([\s\S]*?)<\/Path>/i);
+    if (orig) return decodeXmlEntities(unwrapCdata(orig[1])).trim();
     // 最初の <Path>...</Path> (origFlag 無し)
-    const any = scope.match(/<Path\b[^>]*>([^<]*)<\/Path>/i);
-    if (any) return decodeXmlEntities(any[1]).trim();
+    const any = scope.match(/<Path\b[^>]*>([\s\S]*?)<\/Path>/i);
+    if (any) return decodeXmlEntities(unwrapCdata(any[1])).trim();
     return null;
   })();
   out.Name = tag('Name');
