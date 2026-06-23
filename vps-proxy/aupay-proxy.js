@@ -363,19 +363,21 @@ function decodeXmlEntities(s) {
     .replace(/&amp;/g, '&');
 }
 /**
- * Phase E-11-b: Yahoo getItemDetail (item info) の XML response から
+ * Phase E-11-b hotfix: Yahoo getItem (商品詳細取得) の XML response から
  *   productCategory + path を抜き出す。
  *
- * Yahoo!ショッピングストアエディタ API の itemInfo (getItemDetail) は
- *   ItemCode 指定で 1 件の商品情報 XML を返す。 我々が欲しいのは:
- *     - <ProductCategory>NNN</ProductCategory>   (数値、 Yahoo カテゴリ ID)
- *     - <Path>some-path</Path>                   (ストア内 path)
- *   他にも多数フィールドあるが、 学習辞書では category + path しか使わない。
+ * 当初 itemInfo というエンドポイント名で実装したが、 Yahoo API は px-04400 (URL 不存在) を返した。
+ * 設計書 v6 (AI_reference) を確認したところ正しいエンドポイントは getItem だった (GET /V1/getItem)。
  *
- *   XML shape は ResultSet で wrap される or single Result block の可能性両方ある:
- *     <ResultSet> <Result> <ItemCode>...</ItemCode> <ProductCategory>...</ProductCategory> <Path>...</Path> ... </Result> </ResultSet>
- *   single レスポンスでも Result wrapper があるので、 そこから抜く。
- *   完全一致でなくケースバラつきも考慮 (例: <productCategory>) して i フラグで対応。
+ * Response XML shape:
+ *   <ProductCategory>NNN</ProductCategory>   (数値、 Yahoo カテゴリ ID)
+ *   <PathList>
+ *     <Path origFlag="1">メインパス</Path>    ← origFlag="1" がメイン path
+ *     <Path>サブパス</Path>                    ← メイン以外の表示パス
+ *   </PathList>
+ *   <Name>...</Name>
+ *
+ *   <Path>直書き  ではなく <PathList> 内の <Path> なので、 古い実装の単純 tag マッチでは取れない。
  */
 function parseGetItemDetailXml(xml) {
   const out = { ItemCode: null, ProductCategory: null, Path: null, Name: null };
@@ -390,7 +392,19 @@ function parseGetItemDetailXml(xml) {
     const n = parseInt(pc, 10);
     out.ProductCategory = Number.isFinite(n) ? n : null;
   }
-  out.Path = tag('Path');
+  // path 抽出: <PathList> 内の origFlag="1" の <Path>...</Path> を優先、
+  //   無ければ最初の <Path>...</Path> を採用、 古い実装の <Path>直書き fallback。
+  out.Path = (() => {
+    const listMatch = xml.match(/<PathList[^>]*>([\s\S]*?)<\/PathList>/i);
+    const scope = listMatch ? listMatch[1] : xml;
+    // origFlag="1" の <Path ...>VALUE</Path>
+    const orig = scope.match(/<Path\b[^>]*\borigFlag\s*=\s*"1"[^>]*>([^<]*)<\/Path>/i);
+    if (orig) return decodeXmlEntities(orig[1]).trim();
+    // 最初の <Path>...</Path> (origFlag 無し)
+    const any = scope.match(/<Path\b[^>]*>([^<]*)<\/Path>/i);
+    if (any) return decodeXmlEntities(any[1]).trim();
+    return null;
+  })();
   out.Name = tag('Name');
   return out;
 }
@@ -766,8 +780,8 @@ const server = http.createServer(async (req, res) => {
         seller_id: YAHOO_SELLER_ID,
         item_code: itemCode,
       }).toString();
-      console.log(`[${ts()}] Yahoo getItemDetail: item_code=${itemCode}`);
-      const r = await callYahooAPIRaw('itemInfo', {
+      console.log(`[${ts()}] Yahoo getItem: item_code=${itemCode}`);
+      const r = await callYahooAPIRaw('getItem', {
         method: 'GET',
         body: null,
         queryString: qs,
