@@ -202,23 +202,22 @@ export function buildLabelRows(pickingRows, barcodeMap) {
 
 /**
  * プラン別 ラベル貼り作業シート行を作る。
- *  - 数量: プラン CSV の J列(SKU数量)をそのまま (Codex #3: 倉庫ピッキングは数量を持たない)
+ * 列レイアウト (現場の正本に合わせる): No / FNSKU / 商品名 / 数量 / ラベル貼り担当者 /
+ *   ラベル貼り確認担当者 / 納品箱No / 期限管理商品
  *  - FNSKU: プラン CSV の D列を正 (Codex #4)
- *  - 商品コード: mapping の構成 ne_code (セットは ' / ' 連結)
- * @returns {Array<{No,fnsku,sku,code,qty}>}
+ *  - 商品名: SKUマップ (getSkuMappings) の product_name を使う (Amazonタイトルでなくマスタ商品名)
+ *  - 数量: プラン CSV の J列(SKU数量)をそのまま
+ *  - ラベル貼り担当者/確認担当者/納品箱No/期限管理商品: 現場手動記入のため空欄
+ * @returns {Array<{no,fnsku,productName,qty}>}
  */
 export function buildPlanSheet(planItems, mappingMap) {
   return planItems.map((item, i) => {
     const mapping = mappingMap.get(normSku(item.sku));
-    const codes = mapping ? codesForMapping(mapping).map(c => c.ne_code) : [];
     return {
       no: i + 1,
       fnsku: item.fnsku,
-      sku: item.sku,
-      code: codes.join(' / '),
+      productName: mapping?.product_name || '',
       qty: item.qty,
-      label: item.label,
-      isDodai: item.isDodai,
     };
   });
 }
