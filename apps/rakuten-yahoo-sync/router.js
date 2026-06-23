@@ -17,7 +17,7 @@ import { Router } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { inspectEnvStatus } from './env-check.js';
-import { getDB } from './db.js';
+import { getDB, getMirrorDbPath } from './db.js';
 import { acquire, SyncLockError } from './lib/sync-lock.js';
 import { syncNotionOverrides } from './services/notion-sync.js';
 import { evaluateItemForPublish } from './services/publish-pipeline.js';
@@ -55,6 +55,7 @@ import {
   backfillYahooCategoriesAndPaths,
   learnGenreCategoryMapping,
   countLearnedGenres,
+  diagnoseOverlap,
 } from './lib/yahoo-category-backfill.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -433,7 +434,7 @@ router.get('/', (req, res) => {
     fixableByCategory = listed.fixableByCategory;
     exclusionCount = countActiveByKind(db);
     try { rakutenTitleMissing = countMissingRakutenTitles(db); } catch (_) { /* migration 011 未適用 */ }
-    try { yahooCategoryMissing = countMissingYahooCategories(db); } catch (_) { /* migration 012 未適用 */ }
+    try { yahooCategoryMissing = countMissingYahooCategories(db, getMirrorDbPath()); } catch (_) { /* migration 012 未適用 or mirror 未設定 */ }
     try { yahooCategoryLearnedGenres = countLearnedGenres(db); } catch (_) { /* migration 013 未適用 */ }
   } catch (_) {
     // DB 未初期化等は空 state で表示 continue
@@ -1140,18 +1141,20 @@ router.post('/api/rakuten-title-backfill', async (req, res) => {
 router.post('/api/yahoo-category/backfill-and-learn', async (req, res) => {
   try {
     const db = getDB();
+    const mirrorPath = getMirrorDbPath();
     const body = req.body || {};
-    // 母集団は overlap 行 (= migration_candidates と重なる Yahoo 出品) のみ。 数百件で
-    // 終わるよう、 上限 500 まで許可。 1 click で全部取れることが目標。
+    // 母集団は ne_code 経由の overlap (m_products / f_yahoo_sku_map / f_rakuten_finance) 限定 + ambiguous 除外。
+    // 数十〜数百件で終わる想定、 上限 500 まで許可。
     const limit = Number.isInteger(body.limit) && body.limit > 0 && body.limit <= 500 ? body.limit : 300;
-    const backfill = await backfillYahooCategoriesAndPaths({ db, limit });
+    const backfill = await backfillYahooCategoriesAndPaths({ db, mirrorPath, limit });
     let learning = null;
-    try { learning = learnGenreCategoryMapping(db); }
+    try { learning = learnGenreCategoryMapping({ db, mirrorPath }); }
     catch (e) { learning = { error: e.message }; }
-    const remaining = countMissingYahooCategories(db);
+    const remaining = countMissingYahooCategories(db, mirrorPath);
     const genresLearned = countLearnedGenres(db);
-    audit(db, 'yahoo_category_backfill_and_learn', { ...backfill, learning, remaining, genresLearned });
-    return res.json({ status: 'ok', ...backfill, learning, remaining, genresLearned });
+    const diag = diagnoseOverlap({ db, mirrorPath });
+    audit(db, 'yahoo_category_backfill_and_learn', { ...backfill, learning, remaining, genresLearned, diag });
+    return res.json({ status: 'ok', ...backfill, learning, remaining, genresLearned, diag });
   } catch (e) {
     return res.status(500).json({ status: 'fail', error: e.message });
   }
@@ -1160,11 +1163,22 @@ router.post('/api/yahoo-category/backfill-and-learn', async (req, res) => {
 router.get('/api/yahoo-category/status', (req, res) => {
   try {
     const db = getDB();
+    const mirrorPath = getMirrorDbPath();
     return res.json({
       status: 'ok',
-      remaining: countMissingYahooCategories(db),
+      remaining: countMissingYahooCategories(db, mirrorPath),
       genresLearned: countLearnedGenres(db),
     });
+  } catch (e) {
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+router.get('/api/yahoo-category/diagnose', (req, res) => {
+  try {
+    const db = getDB();
+    const mirrorPath = getMirrorDbPath();
+    return res.json({ status: 'ok', ...diagnoseOverlap({ db, mirrorPath }) });
   } catch (e) {
     return res.status(500).json({ status: 'fail', error: e.message });
   }
