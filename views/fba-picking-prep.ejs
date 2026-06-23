@@ -161,14 +161,19 @@ function onSlotFile(input){
   slot.classList.toggle('has-file', input.files.length>0);
 }
 
-async function syncDodai(){
+async function syncDodai(force){
   const btn = document.getElementById('dodaiSyncBtn');
   btn.disabled = true;
   const prevLabel = btn.textContent;
   btn.textContent = '取込中…';
   try {
-    const r = await fetch('/apps/fba-replenishment/api/picking-prep/sync-dodai', { method:'POST' });
+    const url = '/apps/fba-replenishment/api/picking-prep/sync-dodai' + (force ? '?force=1' : '');
+    const r = await fetch(url, { method:'POST' });
     const d = await r.json();
+    if (r.status === 409 && d.needConfirm){
+      if (window.confirm(d.message||'件数が大きく減少します。続行しますか？')) { return syncDodai(true); }
+      return; // キャンセル: 既存マスタは保持
+    }
     if (!r.ok){ alert('土台シート取込エラー: '+(d.error||r.status)); return; }
     alert('土台商品シートを取込みました: '+d.count+'件 (前回 '+d.prev+'件)');
     loadStatus();

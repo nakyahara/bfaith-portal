@@ -1361,9 +1361,14 @@ router.get('/api/picking-prep/master-status', (req, res) => {
 // 手動ボタン用。毎朝の cron でも自動同期される。0件(列ずれ/権限)時は既存を保持して例外。
 router.post('/api/picking-prep/sync-dodai', async (req, res) => {
   try {
-    const r = await syncDodaiMaster();
+    const force = req.query.force === '1' || req.query.force === 'true';
+    const r = await syncDodaiMaster({ force });
     res.json({ success: true, ...r });
   } catch (e) {
+    // 急減ガード: 既存を保持したまま承認を求める (UI が force=1 で再実行)
+    if (e.needConfirm) {
+      return res.status(409).json({ needConfirm: true, prev: e.prev, count: e.count, message: e.message });
+    }
     console.error('[Picking] 土台シート取込エラー:', e);
     res.status(500).json({ error: e.message });
   }
