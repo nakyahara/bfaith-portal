@@ -548,11 +548,13 @@ export async function initDb() {
   // P-touch ラベル用バーコードは専用マスタを廃止し、FBA補充 Step2 のロジザード在庫
   // (warehouse_inventory.barcode) を商品コードで引く方式に一本化 (二重メンテ回避)。
 
+  // 注: Render コンテナの TZ は UTC のため datetime('now','localtime') は UTC になる。
+  // ピッキング準備の表示時刻は JST 固定 (日本は DST 無しなので UTC+9) で保存する。
   // --- 18. picking_dodai_master: 土台商品マスタ (土台商品の SKU のみ保持、置換保存) ---
   db.run(`
     CREATE TABLE IF NOT EXISTS picking_dodai_master (
       sku TEXT PRIMARY KEY,
-      updated_at TEXT DEFAULT (datetime('now','localtime'))
+      updated_at TEXT DEFAULT (datetime('now','+9 hours'))
     )
   `);
 
@@ -565,7 +567,7 @@ export async function initDb() {
       prev_count INTEGER,
       new_count INTEGER,
       uploaded_by TEXT,
-      uploaded_at TEXT DEFAULT (datetime('now','localtime'))
+      uploaded_at TEXT DEFAULT (datetime('now','+9 hours'))
     )
   `);
 
@@ -573,7 +575,7 @@ export async function initDb() {
   db.run(`
     CREATE TABLE IF NOT EXISTS picking_run_history (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      run_at TEXT DEFAULT (datetime('now','localtime')),
+      run_at TEXT DEFAULT (datetime('now','+9 hours')),
       run_by TEXT,
       plan_files TEXT,
       lz_filename TEXT,
@@ -588,6 +590,15 @@ export async function initDb() {
   `);
   // 注: 旧 public_token 列/index は #335 で作成済みだが、公開印刷は固定URL+実行ID方式に変更したため
   // 現在は未使用 (既存DBの列はNULLのまま放置=無害)。
+
+  // 既存行 (UTCで保存済み) の表示時刻を一度だけ JST(+9h) に補正。settings フラグで冪等化 (再実行で二重シフトしない)。
+  const tzFixed = queryOne(`SELECT value FROM settings WHERE key = 'picking_time_jst_fixed'`);
+  if (!tzFixed) {
+    db.run(`UPDATE picking_run_history SET run_at = datetime(run_at, '+9 hours') WHERE run_at IS NOT NULL AND run_at != ''`);
+    db.run(`UPDATE picking_dodai_master SET updated_at = datetime(updated_at, '+9 hours') WHERE updated_at IS NOT NULL AND updated_at != ''`);
+    db.run(`UPDATE picking_master_audit SET uploaded_at = datetime(uploaded_at, '+9 hours') WHERE uploaded_at IS NOT NULL AND uploaded_at != ''`);
+    db.run(`INSERT OR REPLACE INTO settings (key, value) VALUES ('picking_time_jst_fixed', '1')`);
+  }
 
   saveToFile();
   console.log('[FBA-DB] 初期化完了');
@@ -2126,7 +2137,8 @@ export function getExportHistoryFile(id) {
 
 function insertMasterAudit(masterType, filename, prevCount, newCount, uploadedBy) {
   db.run(
-    `INSERT INTO picking_master_audit (master_type, filename, prev_count, new_count, uploaded_by) VALUES (?, ?, ?, ?, ?)`,
+    `INSERT INTO picking_master_audit (master_type, filename, prev_count, new_count, uploaded_by, uploaded_at)
+     VALUES (?, ?, ?, ?, ?, datetime('now','+9 hours'))`,
     [masterType, filename || null, prevCount, newCount, uploadedBy || null]
   );
 }
@@ -2148,7 +2160,8 @@ export function getWarehouseBarcodeStats() {
     `SELECT
        COUNT(DISTINCT LOWER(TRIM(logizard_code))) AS total,
        COUNT(DISTINCT CASE WHEN barcode IS NOT NULL AND TRIM(barcode) != '' THEN LOWER(TRIM(logizard_code)) END) AS with_barcode,
-       MAX(uploaded_at) AS uploaded_at
+       -- warehouse_inventory.uploaded_at は主アプリ(Step2)が UTC で書くため、表示時に JST(+9h) へ変換 (書き込みは非変更)
+       MAX(datetime(uploaded_at, '+9 hours')) AS uploaded_at
      FROM warehouse_inventory`
   ) || { total: 0, with_barcode: 0, uploaded_at: null };
   return { total: row.total || 0, withBarcode: row.with_barcode || 0, uploaded_at: row.uploaded_at || null };
@@ -2162,7 +2175,7 @@ export function replaceDodaiMaster(rows, meta = {}) {
     db.run('DELETE FROM picking_dodai_master');
     for (const r of rows) {
       if (!r.sku) continue;
-      db.run(`INSERT OR REPLACE INTO picking_dodai_master (sku) VALUES (?)`, [r.sku]);
+      db.run(`INSERT OR REPLACE INTO picking_dodai_master (sku, updated_at) VALUES (?, datetime('now','+9 hours'))`, [r.sku]);
     }
     const newCount = queryOne('SELECT COUNT(*) AS c FROM picking_dodai_master')?.c || 0;
     insertMasterAudit('dodai', meta.filename, prev, newCount, meta.uploadedBy);
@@ -2196,8 +2209,8 @@ export function getPickingMasterStatus() {
 export function savePickingRun(rec) {
   db.run(
     `INSERT INTO picking_run_history
-       (run_by, plan_files, lz_filename, picking_count, label_count, plan_sheet_count, warning_count, summary, warnings, result)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (run_at, run_by, plan_files, lz_filename, picking_count, label_count, plan_sheet_count, warning_count, summary, warnings, result)
+     VALUES (datetime('now','+9 hours'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       rec.run_by || null,
       JSON.stringify(rec.plan_files || []),
