@@ -5,7 +5,13 @@
 import initSqlJs from 'sql.js';
 import fs from 'fs';
 import path from 'path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'url';
+
+// 公開印刷URL用の推測不能トークン (ログイン不要で渡すため十分な乱数長)
+function genPublicToken() {
+  return crypto.randomBytes(18).toString('base64url');
+}
 // SKUマスタ直結 PR2: mirror 直読み adapter 用 (better-sqlite3 / 別DB)。
 // import 時点では mirror DB を初期化しない (getMirrorDB を呼んだ時に lazy、未初期化なら throw)。
 // FBA DB(sql.js) と mirror DB(better-sqlite3) はエンジンが違うので結合は JS 側で行う。
@@ -583,9 +589,20 @@ export async function initDb() {
       warning_count INTEGER,
       summary TEXT,
       warnings TEXT,
-      result TEXT
+      result TEXT,
+      public_token TEXT
     )
   `);
+  // マイグレーション: public_token (子会社向けログイン不要の公開印刷URL用)。既存行にも採番。
+  const runCols = queryAll('PRAGMA table_info(picking_run_history)').map(r => r.name);
+  if (!runCols.includes('public_token')) {
+    db.run(`ALTER TABLE picking_run_history ADD COLUMN public_token TEXT`);
+  }
+  for (const row of queryAll(`SELECT id FROM picking_run_history WHERE public_token IS NULL OR public_token = ''`)) {
+    db.run(`UPDATE picking_run_history SET public_token = ? WHERE id = ?`, [genPublicToken(), row.id]);
+  }
+  // public_token は実行を一意に解決するキー。重複で別実行へ誤解決しないよう unique index (Codex Low)。
+  db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_picking_run_public_token ON picking_run_history(public_token)`);
 
   saveToFile();
   console.log('[FBA-DB] 初期化完了');
@@ -2190,12 +2207,13 @@ export function getPickingMasterStatus() {
   return { barcode, dodai, audit };
 }
 
-// 実行履歴を保存し、id を返す。type別に最新100件を保持。
+// 実行履歴を保存し、{id, public_token} を返す。type別に最新100件を保持。
 export function savePickingRun(rec) {
+  const token = genPublicToken();
   db.run(
     `INSERT INTO picking_run_history
-       (run_by, plan_files, lz_filename, picking_count, label_count, plan_sheet_count, warning_count, summary, warnings, result)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (run_by, plan_files, lz_filename, picking_count, label_count, plan_sheet_count, warning_count, summary, warnings, result, public_token)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       rec.run_by || null,
       JSON.stringify(rec.plan_files || []),
@@ -2207,6 +2225,7 @@ export function savePickingRun(rec) {
       JSON.stringify(rec.summary || {}),
       JSON.stringify(rec.warnings || []),
       JSON.stringify(rec.result || {}),
+      token,
     ]
   );
   const idRow = queryOne('SELECT last_insert_rowid() AS id');
@@ -2216,12 +2235,12 @@ export function savePickingRun(rec) {
   );
   for (const row of oldest) db.run(`DELETE FROM picking_run_history WHERE id = ?`, [row.id]);
   saveToFile();
-  return idRow?.id;
+  return { id: idRow?.id, public_token: token };
 }
 
 export function getPickingRuns(limit = 30) {
   return queryAll(
-    `SELECT id, run_at, run_by, plan_files, lz_filename, picking_count, label_count, plan_sheet_count, warning_count
+    `SELECT id, run_at, run_by, plan_files, lz_filename, picking_count, label_count, plan_sheet_count, warning_count, public_token
      FROM picking_run_history ORDER BY id DESC LIMIT ?`,
     [limit]
   );
@@ -2229,4 +2248,10 @@ export function getPickingRuns(limit = 30) {
 
 export function getPickingRun(id) {
   return queryOne(`SELECT * FROM picking_run_history WHERE id = ?`, [id]);
+}
+
+// 公開印刷URL用: トークンで実行履歴を引く (ログイン不要ルートから使用)
+export function getPickingRunByToken(token) {
+  if (!token) return null;
+  return queryOne(`SELECT * FROM picking_run_history WHERE public_token = ?`, [token]);
 }

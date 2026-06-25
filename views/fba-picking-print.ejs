@@ -21,8 +21,6 @@
        1枚目が meta だけの空白ページにならない。
        ※ 旧 .plan-sheet:first-of-type はタグ(最初のdiv=toolbar)を指し効かなかった。隣接セレクタで確実化。 */
     .plan-sheet + .plan-sheet { page-break-before: always; }
-    /* view=all のみ: ピッキングリストの後で最初のプラン別シートを改ページして開始する */
-    .plan-sheet.break-before { page-break-before: always; }
     .planno { white-space: pre-line; }
     /* プラン別シート: 列幅を固定し、商品名を狭く(2行折返し可)、納品箱Noを広く。行高を一定寄りに。 */
     .plan-table { table-layout: fixed; }
@@ -41,38 +39,16 @@
 <body>
   <div class="toolbar">
     <button onclick="window.print()">🖨 印刷 / PDF保存</button>
-    <a class="sec" href="/apps/fba-replenishment/picking-prep">&larr; 戻る</a>
-    <a class="sec" href="?view=picking">ピッキングリストのみ</a>
-    <a class="sec" href="?view=plan">プラン別シートのみ</a>
-    <a class="sec" href="?view=all">両方</a>
+    <% if (!isPublic) { %><a class="sec" href="/apps/fba-replenishment/picking-prep">&larr; 戻る</a><% } %>
   </div>
 
   <div class="meta">実行ID: <%= runId %> / 実行日時: <%= runAt %></div>
 
-  <% if (view === 'all' || view === 'picking') { %>
-    <h2>納品ピッキングリスト</h2>
-    <table>
-      <thead>
-        <tr><th>ブロック略称</th><th>ロケーション</th><th>商品ID</th><th>商品名</th><th>納品プランNo</th><th>土台商品</th></tr>
-      </thead>
-      <tbody>
-        <% pickingRows.forEach(function(r){ %>
-          <tr class="<%= r.dodai ? 'dodai-row' : '' %>">
-            <td><%= r.block %></td>
-            <td><%= r.location %></td>
-            <td><%= r.code %></td>
-            <td><%= r.name %></td>
-            <td class="planno"><%= r.planNo %></td>
-            <td><% if (r.dodai) { %><span class="dodai-tag"><%= r.dodai %></span><% } %></td>
-          </tr>
-        <% }); %>
-      </tbody>
-    </table>
+  <% if (!planSheets || planSheets.length === 0) { %>
+    <p>プラン別シートのデータがありません。</p>
   <% } %>
-
-  <% if (view === 'all' || view === 'plan') { %>
-    <% planSheets.forEach(function(ps, i){ %>
-      <div class="plan-sheet<%= (view === 'all' && i === 0) ? ' break-before' : '' %>">
+  <% (planSheets || []).forEach(function(ps, i){ %>
+      <div class="plan-sheet">
         <table class="plan-table">
           <colgroup>
             <col style="width:4%"><col style="width:11%"><col style="width:27%"><col style="width:6%">
@@ -98,7 +74,6 @@
           </tbody>
         </table>
       </div>
-    <% }); %>
-  <% } %>
+  <% }); %>
 </body>
 </html>

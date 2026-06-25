@@ -255,10 +255,11 @@ function renderResult(d){
     stat('プラン別シート', (d.planSheets||[]).length) +
     stat('警告', (d.warnings||[]).length);
 
+  const publicUrl = d.publicPrintPath ? (location.origin + d.publicPrintPath) : '';
   document.getElementById('resultActions').innerHTML =
-    '<a class="btn btn-primary btn-sm" href="/apps/fba-replenishment/picking-prep/print/'+d.runId+'?view=picking" target="_blank">📄 ピッキングリスト印刷</a>' +
-    '<a class="btn btn-primary btn-sm" href="/apps/fba-replenishment/picking-prep/print/'+d.runId+'?view=plan" target="_blank">📄 プラン別シート印刷</a>' +
-    '<a class="btn btn-secondary btn-sm" href="/apps/fba-replenishment/api/picking-prep/run/'+d.runId+'/label-csv">⬇ P-touchラベルCSV</a>';
+    '<a class="btn btn-primary btn-sm" href="/apps/fba-replenishment/picking-prep/print/'+d.runId+'" target="_blank">📄 プラン別シート印刷</a>' +
+    '<a class="btn btn-secondary btn-sm" href="/apps/fba-replenishment/api/picking-prep/run/'+d.runId+'/label-csv">⬇ P-touchラベルCSV</a>' +
+    (publicUrl ? '<button class="btn btn-secondary btn-sm" onclick="copyPublicUrl(\''+publicUrl+'\')">🔗 子会社用 公開印刷URLをコピー</button>' : '');
 
   const warns = d.warnings||[];
   document.getElementById('warnArea').innerHTML = warns.length
@@ -293,11 +294,22 @@ async function loadRuns(){
         '</td><td>'+esc(run.label_count)+'</td><td>'+
         (run.warning_count>0 ? '<a class="warn-link" onclick="showWarnings('+run.id+')">'+esc(run.warning_count)+'件</a>' : '0')+
         '</td><td><a class="btn btn-secondary btn-sm" href="/apps/fba-replenishment/picking-prep/print/'+run.id+'" target="_blank">印刷</a> '+
-        '<a class="btn btn-secondary btn-sm" href="/apps/fba-replenishment/api/picking-prep/run/'+run.id+'/label-csv">CSV</a></td></tr>';
+        '<a class="btn btn-secondary btn-sm" href="/apps/fba-replenishment/api/picking-prep/run/'+run.id+'/label-csv">CSV</a> '+
+        (run.public_token ? '<button class="btn btn-secondary btn-sm" onclick="copyPublicUrl(\''+location.origin+'/print/picking/'+run.public_token+'\')">🔗公開URL</button>' : '')+
+        '</td></tr>';
     }
     html += '</tbody></table></div>';
     document.getElementById('runsArea').innerHTML = html;
   } catch(e){ document.getElementById('runsArea').textContent='履歴の取得に失敗しました'; }
+}
+
+function copyPublicUrl(url){
+  const msg = '公開印刷URLをコピーしました（ログイン不要）。子会社にこのURLを共有してください:\n\n'+url;
+  if (navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(url).then(()=>alert(msg), ()=>prompt('以下のURLをコピーしてください（ログイン不要）:', url));
+  } else {
+    prompt('以下のURLをコピーしてください（ログイン不要）:', url);
+  }
 }
 
 async function showWarnings(id){
