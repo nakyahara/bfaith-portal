@@ -55,8 +55,8 @@ router.get('/picking', (req, res) => {
 
 // 過去の指定実行
 router.get('/picking/:id', (req, res) => {
-  const id = parseInt(req.params.id, 10);
-  if (!Number.isInteger(id)) return res.status(404).send('無効なURLです。');
+  if (!/^\d+$/.test(req.params.id)) return res.status(404).send('無効なURLです。');
+  const id = Number(req.params.id);
   let rec, runs;
   try {
     rec = getPickingRun(id);
