@@ -132,9 +132,9 @@
     </div>
 
     <div class="section">
-      <h3>④ 納品予定日 (任意)</h3>
-      <input type="date" id="deliveryDate" style="padding:6px 8px;border:1px solid #d1d5db;border-radius:6px;font-size:14px;">
-      <div class="hint">入力すると、注番済みPDFを Notion カード「<b>○月○日納品予定FBA納品ピッキング</b>」に添付します。公開ページ(/print/picking)の「回」表示もこの日付になります。未入力ならNotion連携はスキップ。</div>
+      <h3>④ 納品予定日 <span style="color:#b91c1c;">(必須)</span></h3>
+      <input type="date" id="deliveryDate" required style="padding:6px 8px;border:1px solid #d1d5db;border-radius:6px;font-size:14px;">
+      <div class="hint">注番済みPDFを Notion カード「<b>○月○日納品予定FBA納品ピッキング</b>」に添付します。公開ページ(/print/picking)の「回」表示もこの日付になります。</div>
     </div>
 
     <div class="section">
@@ -247,6 +247,8 @@ async function syncDodai(force){
 }
 
 async function runProcess(){
+  const dd = document.getElementById('deliveryDate');
+  if (!dd || !dd.value){ alert('納品予定日を入力してください'); if (dd) dd.focus(); return; }
   const lz = document.getElementById('lzFile');
   if (!lz.files.length){ alert('ピッキングリスト(lzpickinglist)CSV を選択してください'); return; }
   const fd = new FormData();
@@ -263,8 +265,7 @@ async function runProcess(){
   fd.append('lz', lz.files[0]);
   const tmp1 = document.getElementById('tmp1File');
   if (tmp1 && tmp1.files.length){ fd.append('tmp1', tmp1.files[0]); }
-  const dd = document.getElementById('deliveryDate');
-  if (dd && dd.value){ fd.append('delivery_date', dd.value); }
+  fd.append('delivery_date', dd.value); // 必須 (冒頭で検証済み)
 
   const btn = document.getElementById('runBtn');
   btn.disabled = true;

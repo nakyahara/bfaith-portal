@@ -1390,6 +1390,11 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
     const lzFile = files.lz?.[0];
     if (!lzFile) return res.status(400).json({ error: 'ピッキングリスト(lzpickinglist)CSV が必要です' });
 
+    // ④ 納品予定日 (YYYY-MM-DD) は必須。Notionカード名・公開ナビ表示に使用。
+    const deliveryDate = /^\d{4}-\d{2}-\d{2}$/.test(String(req.body?.delivery_date || '').trim())
+      ? String(req.body.delivery_date).trim() : null;
+    if (!deliveryDate) return res.status(400).json({ error: '納品予定日を入力してください' });
+
     // マッピング (fail-closed)
     let mappingMap;
     try {
@@ -1484,10 +1489,6 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
     };
     const result = { pickingRows, planSheets, labelCsvRows, notInPicking };
 
-    // ④ 納品予定日 (YYYY-MM-DD)。Notionカード名・公開ナビ表示に使用 (任意)。
-    const deliveryDate = /^\d{4}-\d{2}-\d{2}$/.test(String(req.body?.delivery_date || '').trim())
-      ? String(req.body.delivery_date).trim() : null;
-
     const runId = savePickingRun({
       run_by: req.session?.email,
       plan_files: planFileMeta,
@@ -1531,7 +1532,7 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
       }
     }
 
-    // 納品予定日が入力されていれば Notion カードを作成し、注番済みPDF(公開URL)を添付 (best-effort)。
+    // 納品予定日(必須)で Notion カードを作成し、注番済みPDF(公開URL)を添付 (best-effort)。
     let notion = { attempted: false };
     if (deliveryDate) {
       const title = pp.buildPickingCardTitle(deliveryDate); // 例: 6月27日納品予定FBA納品ピッキング
