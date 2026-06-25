@@ -27,7 +27,7 @@ function buildRunsNav() {
       id: r.id,
       run_at: r.run_at,
       delivery_date: r.delivery_date || null,
-      display: dj || r.run_at,
+      display: dj ? `${dj}納品分` : r.run_at, // 例: 6月27日納品分
     };
   });
 }

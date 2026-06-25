@@ -51,21 +51,29 @@ async function getSchema(dbId) {
   }
   if (!titleProp) throw new Error('Notion DBにタイトルプロパティが見つかりません');
 
-  let status = null;
+  return { titleProp, status: pickStatusProp(props) };
+}
+
+// ステータス対象プロパティの決定 (優先順):
+//  1. env FBA_PICKING_NOTION_STATUS_PROP で明示指定
+//  2. 名前が「ステータス」/「Status」のプロパティ (DBに別名のselectがあるので名前で狙い撃ち)
+//  3. status型の先頭
+//  4. select型の先頭 (最終手段。複数selectがあると誤爆しうるので最後)
+// @returns {{name, type}|null}
+export function pickStatusProp(props = {}) {
+  const isSel = (def) => def && (def.type === 'status' || def.type === 'select');
   const wantName = (process.env.FBA_PICKING_NOTION_STATUS_PROP || '').trim();
-  if (wantName && props[wantName] && (props[wantName].type === 'status' || props[wantName].type === 'select')) {
-    status = { name: wantName, type: props[wantName].type };
-  } else {
-    for (const [name, def] of Object.entries(props)) {
-      if (def && def.type === 'status') { status = { name, type: 'status' }; break; }
-    }
-    if (!status) {
-      for (const [name, def] of Object.entries(props)) {
-        if (def && def.type === 'select') { status = { name, type: 'select' }; break; }
-      }
-    }
+  if (wantName && isSel(props[wantName])) return { name: wantName, type: props[wantName].type };
+  for (const cand of ['ステータス', 'Status', 'status', 'ステータス ']) {
+    if (isSel(props[cand])) return { name: cand, type: props[cand].type };
   }
-  return { titleProp, status };
+  for (const [name, def] of Object.entries(props)) {
+    if (def && def.type === 'status') return { name, type: 'status' };
+  }
+  for (const [name, def] of Object.entries(props)) {
+    if (def && def.type === 'select') return { name, type: 'select' };
+  }
+  return null;
 }
 
 /**
