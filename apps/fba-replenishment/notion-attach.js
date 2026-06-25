@@ -36,24 +36,49 @@ async function notionFetch(path, opts = {}) {
   return json;
 }
 
-// DB のタイトルプロパティ名を取得 (プロパティ名はDBによって異なるため動的に検出)
-async function getTitlePropName(dbId) {
+// 設定するステータス値 (env で上書き可)
+function getStatusValue() { return process.env.FBA_PICKING_NOTION_STATUS_VALUE || '本日のやること'; }
+
+// DB スキーマから タイトル/ステータス プロパティを検出。
+// status: env FBA_PICKING_NOTION_STATUS_PROP 指定があればその名前、無ければ
+//   type='status' を優先、無ければ type='select' の先頭を採用 ({name,type} or null)。
+async function getSchema(dbId) {
   const db = await notionFetch(`/databases/${dbId}`, { method: 'GET' });
-  for (const [name, def] of Object.entries(db.properties || {})) {
-    if (def && def.type === 'title') return name;
+  const props = db.properties || {};
+  let titleProp = null;
+  for (const [name, def] of Object.entries(props)) {
+    if (def && def.type === 'title') { titleProp = name; break; }
   }
-  throw new Error('Notion DBにタイトルプロパティが見つかりません');
+  if (!titleProp) throw new Error('Notion DBにタイトルプロパティが見つかりません');
+
+  let status = null;
+  const wantName = (process.env.FBA_PICKING_NOTION_STATUS_PROP || '').trim();
+  if (wantName && props[wantName] && (props[wantName].type === 'status' || props[wantName].type === 'select')) {
+    status = { name: wantName, type: props[wantName].type };
+  } else {
+    for (const [name, def] of Object.entries(props)) {
+      if (def && def.type === 'status') { status = { name, type: 'status' }; break; }
+    }
+    if (!status) {
+      for (const [name, def] of Object.entries(props)) {
+        if (def && def.type === 'select') { status = { name, type: 'select' }; break; }
+      }
+    }
+  }
+  return { titleProp, status };
 }
 
 /**
  * カードを作成。pdfUrl があれば external ファイルブロックで添付。
- * @returns {Promise<{ pageId: string, url: string }>}
+ * ステータス(セレクト/ステータス型)を「本日のやること」に設定。設定で失敗したらステータス無しで再作成
+ * (カードは必ず作る)。
+ * @returns {Promise<{ pageId: string, url: string, statusSet: boolean }>}
  */
 export async function createPickingCard({ title, pdfUrl }) {
   if (!getToken()) throw new Error('FBA_PICKING_NOTION_TOKEN が未設定です');
   if (!title) throw new Error('カード名(納品予定日)が空です');
   const dbId = getNotionDbId();
-  const titleProp = await getTitlePropName(dbId);
+  const { titleProp, status } = await getSchema(dbId);
 
   const children = [];
   if (pdfUrl) {
@@ -63,11 +88,27 @@ export async function createPickingCard({ title, pdfUrl }) {
       file: { type: 'external', external: { url: pdfUrl }, caption: [] },
     });
   }
-  const body = {
-    parent: { database_id: dbId },
-    properties: { [titleProp]: { title: [{ text: { content: title } }] } },
-    children,
-  };
-  const page = await notionFetch('/pages', { method: 'POST', body: JSON.stringify(body) });
-  return { pageId: page.id, url: page.url };
+
+  const baseProps = { [titleProp]: { title: [{ text: { content: title } }] } };
+  const statusProps = { ...baseProps };
+  if (status) {
+    statusProps[status.name] = status.type === 'status'
+      ? { status: { name: getStatusValue() } }
+      : { select: { name: getStatusValue() } };
+  }
+  const mkBody = (properties) => JSON.stringify({ parent: { database_id: dbId }, properties, children });
+
+  if (status) {
+    try {
+      const page = await notionFetch('/pages', { method: 'POST', body: mkBody(statusProps) });
+      return { pageId: page.id, url: page.url, statusSet: true };
+    } catch (e) {
+      // ステータス設定で弾かれた可能性 → ステータス無しで必ずカードは作る
+      console.error('[Notion] ステータス付き作成に失敗、ステータス無しで再作成:', e.message);
+      const page = await notionFetch('/pages', { method: 'POST', body: mkBody(baseProps) });
+      return { pageId: page.id, url: page.url, statusSet: false };
+    }
+  }
+  const page = await notionFetch('/pages', { method: 'POST', body: mkBody(baseProps) });
+  return { pageId: page.id, url: page.url, statusSet: false };
 }

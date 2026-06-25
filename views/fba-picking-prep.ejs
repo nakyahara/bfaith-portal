@@ -55,6 +55,19 @@
     .modal-body { padding:12px 16px; overflow:auto; }
     .modal-close { cursor:pointer; border:none; background:#e5e7eb; color:#374151; border-radius:6px; padding:6px 14px; font-size:13px; }
     .warn-list .w { font-size:12px; color:#92400e; padding:3px 0; border-bottom:1px solid #fef3c7; }
+    .req { display:inline-block; font-size:11px; font-weight:bold; padding:1px 8px; border-radius:10px; vertical-align:middle; margin-left:8px; }
+    .req.must { background:#fee2e2; color:#b91c1c; }
+    .req.opt { background:#e5e7eb; color:#6b7280; }
+    .howto { background:#eff6ff; border:1px solid #bfdbfe; border-radius:8px; padding:12px 16px; margin-bottom:8px; }
+    .howto ol { margin:6px 0 0; padding-left:22px; }
+    .howto li { font-size:13px; margin:3px 0; }
+    .howto .out { color:#374151; font-size:12px; margin-top:8px; }
+    .help-btn { background:#e5e7eb; color:#374151; border:none; border-radius:6px; padding:8px 14px; font-size:13px; cursor:pointer; }
+    .setup-section { margin-top:32px; border-top:1px dashed #d1d5db; padding-top:8px; }
+    .setup-section > h3 { border:none; color:#6b7280; font-size:14px; }
+    .run-area { background:#f0fdf4; border:1px solid #bbf7d0; border-radius:8px; padding:16px; margin-top:20px; text-align:center; }
+    .run-area .btn-primary { font-size:16px; padding:12px 32px; }
+    .modal-body ol { padding-left:20px; } .modal-body h4 { margin:14px 0 4px; } .modal-body li, .modal-body p { font-size:13px; line-height:1.6; }
   </style>
 </head>
 <body>
@@ -64,40 +77,27 @@
       <h1>FBA納品ピッキング準備</h1>
     </div>
     <div class="header-right" style="display:flex;align-items:center;gap:12px;">
+      <button class="help-btn" onclick="openManual()">📖 使い方</button>
       <span><%= displayName || username %></span>
     </div>
   </header>
 
   <div class="pp-container">
-    <p class="hint">Amazonで納品プランを作成した後の工程です。納品プランCSV群とロジザードのピッキングリストCSVをアップロードすると、納品プランNo付きのピッキングリスト・P-touchラベル印刷用CSV・プラン別のラベル貼り作業シートを生成します。</p>
+    <div class="howto">
+      <b>このページでやること</b>：Amazonで納品プランを作成した後、下の①〜④をアップロード／入力して「処理を実行」を押すと、以下を一括生成します。
+      <ol>
+        <li><b>①</b> 納品プランCSV（Amazon）＋ <b>②</b> ピッキングリストCSV（ロジザード lzpickinglist）＋ <b>③</b> トータルピッキングリストPDF（ロジザード TMP1）＋ <b>④</b> 納品予定日</li>
+      </ol>
+      <div class="out">📦 生成物：納品プランNo付きの<b>ピッキングリストPDF</b>（TMP1に注番）／<b>P-touchラベルCSV</b>／<b>プラン別ラベル貼り作業シート</b>。さらに④の日付でNotionカードを作成しPDFを添付、子会社向け公開URLからも閲覧可。詳しくは右上「📖 使い方」。</div>
+    </div>
 
     <!-- マッピングソース表示 -->
     <div id="srcIndicator"></div>
 
-    <!-- マスタ管理 -->
-    <div class="section">
-      <h3>マスタ (サーバー保存・更新時のみ再アップロード)</h3>
-      <div class="master-row">
-        <div class="master-card">
-          <h4>バーコード <span class="muted" style="font-weight:normal;">(FBA補充 Step2 在庫由来)</span></h4>
-          <div class="muted" id="barcodeStatus">読込中…</div>
-          <div class="hint">P-touchラベルのバーコードは、FBA補充の「Step2 ロジザード在庫CSV」アップロードから自動取得します。専用アップロードは不要です。<a href="/apps/fba-replenishment">→ FBA補充で在庫CSVを更新</a></div>
-        </div>
-        <div class="master-card">
-          <h4>土台商品 <span class="muted" style="font-weight:normal;">(スプレッドシート直結)</span></h4>
-          <div class="muted" id="dodaiStatus">読込中…</div>
-          <div style="margin-top:8px;">
-            <button class="btn btn-secondary btn-sm" id="dodaiSyncBtn" onclick="syncDodai()">土台シート取込</button>
-          </div>
-          <div class="hint">FBA土台商品管理シート(A列=SKU, F列=1)を直接読込。毎朝自動同期 + 手動取込。</div>
-        </div>
-      </div>
-    </div>
-
     <!-- 入力CSV -->
     <div class="section">
-      <h3>① 納品プランCSV (Amazon)</h3>
-      <p class="hint">該当するスロットにCSVをアップロードしてください。納品プランNoの接頭辞は編集できます (現場が参照する番号になります)。</p>
+      <h3>① 納品プランCSV (Amazon)<span class="req must">1つ以上 必須</span></h3>
+      <p class="hint">該当するスロットにCSVをアップロードしてください（使う分だけでOK）。納品プランNoの接頭辞は編集できます (現場が参照する番号になります)。</p>
       <div class="slot-grid">
         <% slots.forEach(function(s){ %>
           <div class="slot" id="slot-<%= s.id %>">
@@ -114,7 +114,7 @@
     </div>
 
     <div class="section">
-      <h3>② ピッキングリストCSV (ロジザード lzpickinglist)</h3>
+      <h3>② ピッキングリストCSV (ロジザード lzpickinglist)<span class="req must">必須</span></h3>
       <div class="slot-file" style="max-width:480px;">
         <input type="file" id="lzFile" accept=".csv">
         <button type="button" class="clear-btn" onclick="clearLzFile()" title="選択を取消">✕ 取消</button>
@@ -123,23 +123,23 @@
     </div>
 
     <div class="section">
-      <h3>③ トータルピッキングリストPDF (ロジザード TMP1・任意)</h3>
+      <h3>③ トータルピッキングリストPDF (ロジザード TMP1)<span class="req must">必須</span></h3>
       <div class="slot-file" style="max-width:480px;">
         <input type="file" id="tmp1File" accept=".pdf">
         <button type="button" class="clear-btn" onclick="clearTmp1File()" title="選択を取消">✕ 取消</button>
       </div>
-      <div class="hint">指定すると、このPDFの各行に「納品プランNo」列を追記したPDFを生成します（公開URLからもダウンロード可）。未指定でもOK。</div>
+      <div class="hint">このPDFの各行に「納品プランNo」列を追記したPDFを生成します（公開URL・Notionからも閲覧可）。</div>
     </div>
 
     <div class="section">
-      <h3>④ 納品予定日 <span style="color:#b91c1c;">(必須)</span></h3>
+      <h3>④ 納品予定日<span class="req must">必須</span></h3>
       <input type="date" id="deliveryDate" required style="padding:6px 8px;border:1px solid #d1d5db;border-radius:6px;font-size:14px;">
-      <div class="hint">注番済みPDFを Notion カード「<b>○月○日納品予定FBA納品ピッキング</b>」に添付します。公開ページ(/print/picking)の「回」表示もこの日付になります。</div>
+      <div class="hint">注番済みPDFを Notion カード「<b>○月○日納品予定FBA納品ピッキング</b>」（ステータス「本日のやること」）に添付します。公開ページ(/print/picking)の「回」表示もこの日付になります。</div>
     </div>
 
-    <div class="section">
+    <div class="run-area">
       <button class="btn btn-primary" id="runBtn" onclick="runProcess()">処理を実行</button>
-      <span id="runMsg" class="muted" style="margin-left:12px;"></span>
+      <div id="runMsg" class="muted" style="margin-top:8px;"></div>
     </div>
 
     <!-- 結果 -->
@@ -160,6 +160,59 @@
         <a href="/print/picking" target="_blank">開く</a>
       </div>
       <div id="runsArea" class="muted">読込中…</div>
+    </div>
+
+    <!-- マスタ・設定 (初回／更新時のみ。通常の処理では触らない) -->
+    <div class="section setup-section">
+      <h3>🔧 マスタ・設定 <span class="muted" style="font-weight:normal;">(初回／更新時のみ・通常は変更不要)</span></h3>
+      <div class="master-row">
+        <div class="master-card">
+          <h4>バーコード <span class="muted" style="font-weight:normal;">(FBA補充 Step2 在庫由来)</span></h4>
+          <div class="muted" id="barcodeStatus">読込中…</div>
+          <div class="hint">P-touchラベルのバーコードは、FBA補充の「Step2 ロジザード在庫CSV」アップロードから自動取得します。専用アップロードは不要です。<a href="/apps/fba-replenishment">→ FBA補充で在庫CSVを更新</a></div>
+        </div>
+        <div class="master-card">
+          <h4>土台商品 <span class="muted" style="font-weight:normal;">(スプレッドシート直結)</span></h4>
+          <div class="muted" id="dodaiStatus">読込中…</div>
+          <div style="margin-top:8px;">
+            <button class="btn btn-secondary btn-sm" id="dodaiSyncBtn" onclick="syncDodai()">土台シート取込</button>
+          </div>
+          <div class="hint">FBA土台商品管理シート(A列=SKU, F列=1)を直接読込。毎朝自動同期 + 手動取込。</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 使い方マニュアル モーダル -->
+  <div class="modal-overlay" id="manualModal" onclick="if(event.target===this)closeManual()">
+    <div class="modal-box">
+      <div class="modal-head">
+        <b>📖 FBA納品ピッキング準備 使い方</b>
+        <button class="modal-close" onclick="closeManual()">閉じる</button>
+      </div>
+      <div class="modal-body">
+        <p>Amazonで納品プランを作成した後の工程です。下の①〜④を用意して「処理を実行」を押すと、必要な帳票を一括生成します。</p>
+        <h4>① 納品プランCSV (Amazon)　<span class="req must">1つ以上 必須</span></h4>
+        <p>Amazon の納品プランから出力したCSVを、該当スロット(P1/P2 × 通常/危険物/大型…)にアップロード。使う分だけでOK。「納品プランNo 接頭辞」は現場が参照する番号(例:通常_1)の頭になります。</p>
+        <h4>② ピッキングリストCSV (ロジザード lzpickinglist)　<span class="req must">必須</span></h4>
+        <p>ロジザードの lzpickinglist.csv。商品コードと納品プランNoの突合に使います。</p>
+        <h4>③ トータルピッキングリストPDF (ロジザード TMP1)　<span class="req must">必須</span></h4>
+        <p>ロジザードのトータルピッキングリストPDF。各行の右に「納品プランNo」列を追記したPDFを生成します。</p>
+        <h4>④ 納品予定日　<span class="req must">必須</span></h4>
+        <p>カレンダーで選択。この日付でNotionカード「○月○日納品予定FBA納品ピッキング」(ステータス「本日のやること」)を作成し、注番済みPDFを添付します。公開ページの「回」表示もこの日付になります。</p>
+        <h4>生成物</h4>
+        <ol>
+          <li><b>納品プランNo付きピッキングリストPDF</b>(③に注番) — 結果の「⬇ 納品プランNo付きPDF」/公開URL/Notionから取得</li>
+          <li><b>P-touchラベルCSV</b> — 結果の「⬇ P-touchラベルCSV」。共有ドライブにも自動上書き保存(fbanouhinbangoulist.csv)</li>
+          <li><b>プラン別ラベル貼り作業シート</b> — 結果の「📄 プラン別シート印刷」/公開URL</li>
+        </ol>
+        <h4>子会社向け 公開URL (ログイン不要)</h4>
+        <p>実行履歴の「🔗 固定URLをコピー」で <code>/print/picking</code> を共有。最新回が表示され、「回を選択」で過去分も閲覧・印刷でき、注番済みPDFもDLできます。</p>
+        <h4>マスタ・設定 (通常は変更不要)</h4>
+        <p>バーコードはFBA補充Step2の在庫から自動取得。土台商品はスプレッドシートを「土台シート取込」または毎朝の自動同期で取り込みます。</p>
+        <h4>うまくいかない時</h4>
+        <p>結果や履歴の「警告」で、変換できないSKU・バーコード未登録などを確認できます。Notion保存が失敗する場合は、専用Integrationのトークン設定とデータベースへの接続(共有)を確認してください。</p>
+      </div>
     </div>
   </div>
 
@@ -251,6 +304,8 @@ async function runProcess(){
   if (!dd || !dd.value){ alert('納品予定日を入力してください'); if (dd) dd.focus(); return; }
   const lz = document.getElementById('lzFile');
   if (!lz.files.length){ alert('ピッキングリスト(lzpickinglist)CSV を選択してください'); return; }
+  const tmp1El = document.getElementById('tmp1File');
+  if (!tmp1El || !tmp1El.files.length){ alert('トータルピッキングリストPDF(TMP1)を選択してください'); return; }
   const fd = new FormData();
   let planCount = 0;
   for (const s of SLOTS){
@@ -397,6 +452,8 @@ async function showWarnings(id){
   } catch(e){ body.textContent = '通信エラー: '+e.message; }
 }
 function closeWarnModal(){ document.getElementById('warnModal').style.display='none'; }
+function openManual(){ document.getElementById('manualModal').style.display='block'; }
+function closeManual(){ document.getElementById('manualModal').style.display='none'; }
 
 loadStatus();
 loadRuns();

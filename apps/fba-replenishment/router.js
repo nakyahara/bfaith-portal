@@ -1395,6 +1395,9 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
       ? String(req.body.delivery_date).trim() : null;
     if (!deliveryDate) return res.status(400).json({ error: '納品予定日を入力してください' });
 
+    // ③ トータルピッキングリストPDF (TMP1) は必須。
+    if (!files.tmp1?.[0]) return res.status(400).json({ error: 'トータルピッキングリストPDF(TMP1)をアップロードしてください' });
+
     // マッピング (fail-closed)
     let mappingMap;
     try {
