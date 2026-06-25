@@ -20,6 +20,7 @@ import { inspectEnvStatus } from './env-check.js';
 import { getDB, getMirrorDbPath } from './db.js';
 import { acquire, SyncLockError } from './lib/sync-lock.js';
 import { syncNotionOverrides } from './services/notion-sync.js';
+import { patchPageProperties } from './lib/notion-client.js';
 import { evaluateItemForPublish } from './services/publish-pipeline.js';
 import { fetchAllItemCodes, fetchItemDetail } from './lib/rakuten-rms-proxy.js';
 import { executePublish, isPublishEnabled, buildIdempotencyKey } from './services/publish-executor.js';
@@ -542,6 +543,67 @@ router.post('/api/notion/sync', async (req, res) => {
     if (release) {
       try { release(); } catch (_) {}
     }
+  }
+});
+
+// ───────────────── Phase E-11 後追い: Notion master に Yahoo!カテゴリ seed ─────────────────
+
+/**
+ * Notion 商品マスター page の 「Yahoo!カテゴリID」 + 「Yahoo!path」 を直書きする。
+ *   body: { rakutenManageNumber, yahooCategoryId, yahooPath }
+ *   - 内部で notion_overrides を引いて notion_page_id を取る
+ *   - notion-client.patchPageProperties で API PATCH
+ *   - 成功後 syncNotionOverrides を走らせて RYS DB に反映 (= Notion を最新にする 1 click 兼ねる)
+ */
+router.post('/api/notion/seed-category', async (req, res) => {
+  try {
+    const db = getDB();
+    const body = req.body || {};
+    const rakutenManageNumber = String(body.rakutenManageNumber || '').trim();
+    const yahooCategoryId = Number(body.yahooCategoryId);
+    const yahooPath = String(body.yahooPath || '').trim();
+    if (!rakutenManageNumber) {
+      return res.status(400).json({ status: 'fail', error: 'rakutenManageNumber required' });
+    }
+    if (!Number.isFinite(yahooCategoryId) || yahooCategoryId <= 0) {
+      return res.status(400).json({ status: 'fail', error: 'yahooCategoryId must be a positive number' });
+    }
+    if (!yahooPath) {
+      return res.status(400).json({ status: 'fail', error: 'yahooPath required' });
+    }
+    const row = db.prepare(`SELECT notion_page_id FROM notion_overrides WHERE rakuten_manage_number = ?`).get(rakutenManageNumber);
+    if (!row || !row.notion_page_id) {
+      return res.status(404).json({
+        status: 'fail',
+        error: `notion_overrides に rakuten_manage_number=${rakutenManageNumber} が居ません (まず Notion sync で取り込みが必要)`,
+      });
+    }
+    const patchResult = await patchPageProperties(row.notion_page_id, {
+      'Yahoo!カテゴリID': yahooCategoryId,
+      'Yahoo!path': yahooPath,
+    });
+    audit(db, 'notion_seed_category', {
+      rakutenManageNumber, yahooCategoryId, yahooPath,
+      notion_page_id: row.notion_page_id,
+    });
+    // 自 DB にも即反映 (Notion から再取り込みする時間を待たない)
+    try {
+      db.prepare(`
+        UPDATE notion_overrides
+        SET notion_product_category = ?, notion_path = ?, synced_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE notion_page_id = ?
+      `).run(yahooCategoryId, yahooPath, row.notion_page_id);
+    } catch (_) { /* migration 014 未適用環境 (本番では適用済) */ }
+    return res.json({
+      status: 'ok',
+      rakutenManageNumber,
+      yahooCategoryId,
+      yahooPath,
+      notion_page_id: row.notion_page_id,
+      notion_patch: { page_url: patchResult?.url || null },
+    });
+  } catch (e) {
+    return res.status(500).json({ status: 'fail', error: e.message });
   }
 });
 
