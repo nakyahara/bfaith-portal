@@ -230,6 +230,16 @@ async function runProcess(){
     renderResult(d);
     document.getElementById('runMsg').textContent = '完了';
     loadRuns();
+    // 共有ドライブへの fbanouhinbangoulist.csv 保存結果をメッセージ表示
+    const ds = d.driveSave;
+    if (ds && ds.saved){
+      alert(ds.action === 'updated'
+        ? '作成したラベルCSVを共有ドライブに上書き保存しました（'+ds.filename+'）'
+        : '作成したラベルCSVを共有ドライブに保存しました（'+ds.filename+' / 新規作成）');
+    } else if (ds){
+      alert('処理は完了しました。ただし共有ドライブへのCSV保存に失敗しました:\n'+(ds.error||'不明')+
+        '\n（必要なら「P-touchラベルCSV」ボタンから手動ダウンロードしてください）');
+    }
   } catch(e){ alert('通信エラー: '+e.message); }
   finally { btn.disabled = false; }
 }
