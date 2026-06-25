@@ -32,32 +32,48 @@ function getDriveAuth() {
 export async function uploadCsvToDrive(buffer, filename, folderId, mimeType = 'text/csv') {
   const auth = getDriveAuth();
   const drive = google.drive({ version: 'v3', auth });
+  const TIMEOUT = 20000; // Drive応答が遅延しても処理全体を待たせない (Codex Low)
+  const esc = (s) => String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'"); // 検索クエリ用エスケープ
 
-  // 同名・同フォルダ・非ゴミ箱の既存ファイルを検索 (共有ドライブ横断)
-  const escaped = filename.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-  const list = await drive.files.list({
-    q: `name = '${escaped}' and '${folderId}' in parents and trashed = false`,
-    fields: 'files(id, name)',
+  // 保存先フォルダが属する共有ドライブIDを取得し、検索を当該ドライブ内に限定する。
+  // corpora=allDrives は incompleteSearch を返し得て、既存を見落とし重複作成する恐れがあるため避ける (Codex Medium)。
+  let driveId = null;
+  try {
+    const meta = await drive.files.get(
+      { fileId: folderId, fields: 'id, driveId', supportsAllDrives: true },
+      { timeout: TIMEOUT }
+    );
+    driveId = meta.data.driveId || null;
+  } catch (e) {
+    throw new Error(`保存先フォルダにアクセスできません (サービスアカウントの共有/権限を確認してください): ${e.message}`);
+  }
+
+  const listParams = {
+    q: `name = '${esc(filename)}' and '${esc(folderId)}' in parents and trashed = false`,
+    fields: 'files(id, name), incompleteSearch',
     pageSize: 10,
     supportsAllDrives: true,
     includeItemsFromAllDrives: true,
-    corpora: 'allDrives',
-  });
+    ...(driveId ? { corpora: 'drive', driveId } : { corpora: 'user' }),
+  };
+  const list = await drive.files.list(listParams, { timeout: TIMEOUT });
+  // 検索が不完全なら、既存を見落として重複作成するのを防ぐため中止 (best-effort 失敗)
+  if (list.data.incompleteSearch) {
+    throw new Error('Drive検索が不完全(incompleteSearch)でした。重複作成防止のため保存を中止しました');
+  }
 
   const media = { mimeType, body: Readable.from(buffer) };
   const existing = list.data.files && list.data.files[0];
 
   if (existing) {
     // 既存ファイルの中身だけ差し替え (fileId/共有設定は維持)
-    await drive.files.update({ fileId: existing.id, media, supportsAllDrives: true });
+    await drive.files.update({ fileId: existing.id, media, supportsAllDrives: true }, { timeout: TIMEOUT });
     return { action: 'updated', fileId: existing.id };
   }
 
-  const created = await drive.files.create({
-    requestBody: { name: filename, parents: [folderId] },
-    media,
-    fields: 'id',
-    supportsAllDrives: true,
-  });
+  const created = await drive.files.create(
+    { requestBody: { name: filename, parents: [folderId] }, media, fields: 'id', supportsAllDrives: true },
+    { timeout: TIMEOUT }
+  );
   return { action: 'created', fileId: created.data.id };
 }
