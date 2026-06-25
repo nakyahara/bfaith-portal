@@ -144,7 +144,6 @@ export function buildPickingList(lzRows, codeIndex) {
   const rows = [];
   const warnings = [];
   const matchedCodes = new Set();      // codeIndex のうち lz に存在したもの
-  const locCountByCode = new Map();    // normCode → ロケ数 (複数ロケ警告用)
 
   for (let r = LZ_DATA_START; r < lzRows.length; r++) {
     const row = lzRows[r] || [];
@@ -161,18 +160,10 @@ export function buildPickingList(lzRows, codeIndex) {
       : '';
     const dodai = entry ? entry.dodai : '';
     if (entry) matchedCodes.add(key);
-    if (key) locCountByCode.set(key, (locCountByCode.get(key) || 0) + 1);
 
     rows.push({ block, location, code, name, planNo, dodai });
   }
 
-  // 複数ロケに同一商品コードがある (= ピッキング箇所が分かれる) → 警告
-  for (const [key, cnt] of locCountByCode) {
-    if (cnt > 1 && codeIndex.has(key)) {
-      const labels = Array.from(codeIndex.get(key).labels).sort().join(' / ');
-      warnings.push(`商品コード ${key} (${labels}): ピッキングリストに複数ロケーション(${cnt}件)`);
-    }
-  }
   return { rows, warnings, matchedCodes };
 }
 
