@@ -146,6 +146,11 @@
               📚 Yahoo カテゴリ学習<% if (yahooCategoryMissing > 0) { %> (<%= yahooCategoryMissing %> 件未取得)<% } %><% if (typeof yahooCategoryLearnedGenres !== 'undefined' && yahooCategoryLearnedGenres > 0) { %> (学習済 <%= yahooCategoryLearnedGenres %> genre)<% } %>
             </button>
           <% } %>
+          <%# Phase E-11 後追い: aburatoishioil100 smoke 用 1 click ボタン (Claude が Notion master に値を書き込む) %>
+          <button class="btn btn-sm btn-outline-success ms-2 js-seed-aburatoishi"
+                  title="aburatoishioil100 の Notion master に Yahoo!カテゴリID=43494 / Yahoo!path=生活雑貨・日用品:掃除用品 を書き込み + Notion sync を 1 click で実行 (smoke test 用、 後で値変えたい時は Notion で直接編集)">
+            🧪 aburatoishi に Yahoo カテゴリ書込 (テスト)
+          </button>
         </li>
         <li>
           <strong><%= summary.actionable %> 商品</strong> が Yahoo に出せます
@@ -1628,6 +1633,40 @@ async function backfillRakutenTitle(evt) {
 }
 
 // ───── Yahoo カテゴリ学習 (Phase E-11-b) ─────
+async function seedAburatoishiCategory(evt) {
+  const btn = evt.currentTarget;
+  if (!btn || btn.disabled) return;
+  if (!confirm('aburatoishioil100 の Notion master に\nYahoo!カテゴリID = 43494\nYahoo!path = 生活雑貨・日用品:掃除用品\nを書き込みます。 続行しますか?')) return;
+  const original = btn.innerHTML;
+  btn.disabled = true;
+  btn.textContent = '書き込み中...';
+  try {
+    const res = await fetch('/apps/rakuten-yahoo-sync/api/notion/seed-category', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        rakutenManageNumber: 'aburatoishioil100',
+        yahooCategoryId: 43494,
+        yahooPath: '生活雑貨・日用品:掃除用品',
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      alert('書き込み失敗: ' + (data.error || ('HTTP ' + res.status)));
+      btn.disabled = false; btn.innerHTML = original;
+      return;
+    }
+    alert('Notion 書き込み完了!\n' +
+      'rakuten_manage_number: ' + data.rakutenManageNumber + '\n' +
+      'Yahoo!カテゴリID: ' + data.yahooCategoryId + '\n' +
+      'Yahoo!path: ' + data.yahooPath + '\n\n' +
+      '続けて 「いま取り込む」 (Notion を最新にする) → 「修正必要」 タブで aburatoishioil100 が 「出せる」 に移動してるか確認 → 「Yahoo に出す」 で publish smoke');
+    btn.disabled = false; btn.innerHTML = '✅ 書込完了';
+  } catch (e) {
+    alert('ネットワークエラー: ' + e.message);
+    btn.disabled = false; btn.innerHTML = original;
+  }
+}
+
 async function yahooCategoryLearn(evt) {
   const btn = evt.currentTarget;
   if (!btn || btn.disabled) return;
@@ -1788,6 +1827,7 @@ document.addEventListener('DOMContentLoaded', () => {
   document.querySelector('.js-open-image-exclusion-mgmt')?.addEventListener('click', openImageExclusionModal);
   document.querySelector('.js-backfill-rakuten-title')?.addEventListener('click', backfillRakutenTitle);
   document.querySelector('.js-yahoo-category-learn')?.addEventListener('click', yahooCategoryLearn);
+  document.querySelector('.js-seed-aburatoishi')?.addEventListener('click', seedAburatoishiCategory);
   document.querySelectorAll('.js-close-image-exclusion-modal').forEach((el) => el.addEventListener('click', closeImageExclusionModal));
   document.querySelector('.js-add-image-pattern')?.addEventListener('click', addImagePattern);
   document.querySelectorAll('.js-close-exclusion-modal').forEach((el) => el.addEventListener('click', closeExclusionModal));

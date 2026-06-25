@@ -163,6 +163,34 @@ export async function queryDatabaseAll(opts = {}) {
   throw new NotionApiError('queryDatabase', `pagination did not complete in 50 iterations (got ${pages.length} pages)`);
 }
 
+/**
+ * Notion master page の properties を update する。
+ *   Phase E-11 後追い: Yahoo!カテゴリID と Yahoo!path を Notion 直書きする経路。
+ *   secret hygiene 上 RYS_NOTION_TOKEN は env のみで、 関数内で getConfig() 経由でしか触らない。
+ *
+ * @param {string} pageId  Notion page UUID (notion_overrides.notion_page_id)
+ * @param {object} props   { 'Yahoo!カテゴリID': 43494, 'Yahoo!path': '生活雑貨・日用品:掃除用品' }
+ *   Notion property 名は商品マスター DB のプロパティ表示名 (extractors と同名)
+ */
+export async function patchPageProperties(pageId, props, opts = {}) {
+  if (!pageId || typeof pageId !== 'string') throw new Error('patchPageProperties: pageId required');
+  if (!props || typeof props !== 'object') throw new Error('patchPageProperties: props required');
+  // Notion API は properties value を type 別の object で要求する
+  const properties = {};
+  for (const [name, value] of Object.entries(props)) {
+    if (value === null || value === undefined) continue;
+    if (typeof value === 'number') {
+      properties[name] = { number: value };
+    } else if (typeof value === 'string') {
+      properties[name] = { rich_text: [{ type: 'text', text: { content: value } }] };
+    } else {
+      // pre-formatted Notion property value をそのまま渡せる脱出口
+      properties[name] = value;
+    }
+  }
+  return await notionRequest(`/pages/${pageId}`, { method: 'PATCH', body: { properties }, ...opts });
+}
+
 // テスト用 (rate-limit 状態をリセット)
 export function _resetForTest() {
   _lastRequestAt = 0;
