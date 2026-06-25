@@ -1532,7 +1532,7 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
       }
     }
 
-    // 納品予定日が入力されていれば Notion カードを作成し、注番済みPDF(公開URL)を添付 (best-effort)。
+    // 納品予定日(必須)で Notion カードを作成し、注番済みPDF(公開URL)を添付 (best-effort)。
     let notion = { attempted: false };
     if (deliveryDate) {
       const title = pp.buildPickingCardTitle(deliveryDate); // 例: 6月27日納品予定FBA納品ピッキング
