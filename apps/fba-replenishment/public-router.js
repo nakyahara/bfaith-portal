@@ -9,6 +9,7 @@
  */
 import express from 'express';
 import { getPickingRun, getPickingRuns } from './db.js';
+import { pickingPdfPath } from './picking-pdf-store.js';
 
 const router = express.Router();
 
@@ -35,6 +36,7 @@ function renderRun(res, rec, runs) {
     isPublic: true,
     runs,
     currentRunId: rec.id,
+    hasPdf: !!pickingPdfPath(rec.id),
   });
 }
 
@@ -45,7 +47,7 @@ router.get('/picking', (req, res) => {
   if (!runs.length) {
     return res.render('fba-picking-print', {
       title: 'FBA納品 プラン別シート（公開）',
-      runId: null, runAt: '', planSheets: [], isPublic: true, runs: [], currentRunId: null,
+      runId: null, runAt: '', planSheets: [], isPublic: true, runs: [], currentRunId: null, hasPdf: false,
     });
   }
   const latest = getPickingRun(runs[0].id);
@@ -66,6 +68,16 @@ router.get('/picking/:id', (req, res) => {
   }
   if (!rec) return res.status(404).send('該当の回が見つかりません。');
   renderRun(res, rec, runs);
+});
+
+// 注番済み TMP1 PDF (ログイン不要)。:id 厳密数値。
+router.get('/picking/:id/pdf', (req, res) => {
+  if (!/^\d+$/.test(req.params.id)) return res.status(404).send('無効なURLです。');
+  const p = pickingPdfPath(req.params.id);
+  if (!p) return res.status(404).send('この回には納品プランNo付きPDFがありません。');
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `inline; filename="picking_list_planno_${req.params.id}.pdf"`);
+  res.sendFile(p);
 });
 
 export default router;
