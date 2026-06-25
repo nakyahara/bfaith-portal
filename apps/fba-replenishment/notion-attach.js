@@ -103,8 +103,11 @@ export async function createPickingCard({ title, pdfUrl }) {
       const page = await notionFetch('/pages', { method: 'POST', body: mkBody(statusProps) });
       return { pageId: page.id, url: page.url, statusSet: true };
     } catch (e) {
-      // ステータス設定で弾かれた可能性 → ステータス無しで必ずカードは作る
-      console.error('[Notion] ステータス付き作成に失敗、ステータス無しで再作成:', e.message);
+      // 400(validation_error)= ステータス指定が原因でNotion側はページ未作成と判断できる場合のみ、
+      // ステータス無しで再作成する。タイムアウト/ネットワーク/5xx はページ作成済みの可能性があり
+      // 重複作成を招くため再作成しない (Codex Medium)。
+      if (e.status !== 400) throw e;
+      console.error('[Notion] ステータス付き作成が400、ステータス無しで再作成:', e.message);
       const page = await notionFetch('/pages', { method: 'POST', body: mkBody(baseProps) });
       return { pageId: page.id, url: page.url, statusSet: false };
     }
