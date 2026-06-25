@@ -601,6 +601,8 @@ export async function initDb() {
   for (const row of queryAll(`SELECT id FROM picking_run_history WHERE public_token IS NULL OR public_token = ''`)) {
     db.run(`UPDATE picking_run_history SET public_token = ? WHERE id = ?`, [genPublicToken(), row.id]);
   }
+  // public_token は実行を一意に解決するキー。重複で別実行へ誤解決しないよう unique index (Codex Low)。
+  db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_picking_run_public_token ON picking_run_history(public_token)`);
 
   saveToFile();
   console.log('[FBA-DB] 初期化完了');
