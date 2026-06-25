@@ -16,6 +16,19 @@
 // SKU 正規化 (db.js の normSku と同一: case 非依存の突き合わせ)
 export const normSku = (v) => String(v ?? '').trim().toLowerCase();
 
+// 納品予定日 'YYYY-MM-DD' → 'M月D日' (不正なら '')
+export function formatDeliveryDateJa(ymd) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(ymd ?? '').trim());
+  if (!m) return '';
+  return `${parseInt(m[2], 10)}月${parseInt(m[3], 10)}日`;
+}
+
+// Notion カード名: 「6月27日納品予定FBA納品ピッキング」。日付不正なら null。
+export function buildPickingCardTitle(ymd) {
+  const d = formatDeliveryDateJa(ymd);
+  return d ? `${d}納品予定FBA納品ピッキング` : null;
+}
+
 // 商品コード正規化 (GAS PL_normCode_ 相当: 全角→半角, ダッシュ統一, 空白除去, 小文字化)
 export function normCode(v) {
   if (v == null) return '';

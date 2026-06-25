@@ -132,6 +132,12 @@
     </div>
 
     <div class="section">
+      <h3>④ 納品予定日 (任意)</h3>
+      <input type="date" id="deliveryDate" style="padding:6px 8px;border:1px solid #d1d5db;border-radius:6px;font-size:14px;">
+      <div class="hint">入力すると、注番済みPDFを Notion カード「<b>○月○日納品予定FBA納品ピッキング</b>」に添付します。公開ページ(/print/picking)の「回」表示もこの日付になります。未入力ならNotion連携はスキップ。</div>
+    </div>
+
+    <div class="section">
       <button class="btn btn-primary" id="runBtn" onclick="runProcess()">処理を実行</button>
       <span id="runMsg" class="muted" style="margin-left:12px;"></span>
     </div>
@@ -257,6 +263,8 @@ async function runProcess(){
   fd.append('lz', lz.files[0]);
   const tmp1 = document.getElementById('tmp1File');
   if (tmp1 && tmp1.files.length){ fd.append('tmp1', tmp1.files[0]); }
+  const dd = document.getElementById('deliveryDate');
+  if (dd && dd.value){ fd.append('delivery_date', dd.value); }
 
   const btn = document.getElementById('runBtn');
   btn.disabled = true;
@@ -287,6 +295,13 @@ async function runProcess(){
     const an = d.annotate;
     if (an && an.attempted && !an.ok){
       alert('処理は完了しましたが、TMP1 PDFへの納品プランNo注番に失敗しました:\n'+(an.error||'不明'));
+    }
+    // Notion カード作成の結果
+    const no = d.notion;
+    if (no && no.attempted && no.ok){
+      alert('Notionカードを作成しました'+(no.attached?'（PDF添付済み）':'（PDFなし）')+':\n'+(no.title||''));
+    } else if (no && no.attempted && !no.ok){
+      alert('処理は完了しましたが、Notionカード作成に失敗しました:\n'+(no.error||'不明'));
     }
   } catch(e){ alert('通信エラー: '+e.message); }
   finally { btn.disabled = false; }

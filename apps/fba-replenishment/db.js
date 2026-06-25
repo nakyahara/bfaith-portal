@@ -585,11 +585,17 @@ export async function initDb() {
       warning_count INTEGER,
       summary TEXT,
       warnings TEXT,
-      result TEXT
+      result TEXT,
+      delivery_date TEXT
     )
   `);
   // 注: 旧 public_token 列/index は #335 で作成済みだが、公開印刷は固定URL+実行ID方式に変更したため
   // 現在は未使用 (既存DBの列はNULLのまま放置=無害)。
+  // delivery_date: ④で入力する納品予定日 (YYYY-MM-DD)。Notionカード名/公開ナビ表示に使用。
+  const runHistCols = queryAll('PRAGMA table_info(picking_run_history)').map(r => r.name);
+  if (!runHistCols.includes('delivery_date')) {
+    db.run(`ALTER TABLE picking_run_history ADD COLUMN delivery_date TEXT`);
+  }
 
   // 既存行 (UTCで保存済み) の表示時刻を一度だけ JST(+9h) に補正。settings フラグで冪等化 (再実行で二重シフトしない)。
   const tzFixed = queryOne(`SELECT value FROM settings WHERE key = 'picking_time_jst_fixed'`);
@@ -2209,8 +2215,8 @@ export function getPickingMasterStatus() {
 export function savePickingRun(rec) {
   db.run(
     `INSERT INTO picking_run_history
-       (run_at, run_by, plan_files, lz_filename, picking_count, label_count, plan_sheet_count, warning_count, summary, warnings, result)
-     VALUES (datetime('now','+9 hours'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (run_at, run_by, plan_files, lz_filename, picking_count, label_count, plan_sheet_count, warning_count, summary, warnings, result, delivery_date)
+     VALUES (datetime('now','+9 hours'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       rec.run_by || null,
       JSON.stringify(rec.plan_files || []),
@@ -2222,6 +2228,7 @@ export function savePickingRun(rec) {
       JSON.stringify(rec.summary || {}),
       JSON.stringify(rec.warnings || []),
       JSON.stringify(rec.result || {}),
+      rec.delivery_date || null,
     ]
   );
   const idRow = queryOne('SELECT last_insert_rowid() AS id');
@@ -2236,7 +2243,7 @@ export function savePickingRun(rec) {
 
 export function getPickingRuns(limit = 30) {
   return queryAll(
-    `SELECT id, run_at, run_by, plan_files, lz_filename, picking_count, label_count, plan_sheet_count, warning_count
+    `SELECT id, run_at, run_by, plan_files, lz_filename, picking_count, label_count, plan_sheet_count, warning_count, delivery_date
      FROM picking_run_history ORDER BY id DESC LIMIT ?`,
     [limit]
   );
