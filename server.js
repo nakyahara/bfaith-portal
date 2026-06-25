@@ -20,6 +20,7 @@ import { startNotificationJob as startInventoryNotificationJob } from './apps/pr
 import { startSalesNotificationJob } from './apps/biz-ops-overview/notify-job.js';
 import { startRysCron } from './apps/rakuten-yahoo-sync/services/rys-cron.js';
 import fbaRouter from './apps/fba-replenishment/router.js';
+import fbaPublicPrintRouter from './apps/fba-replenishment/public-router.js';
 import warehouseRouter from './apps/warehouse/router.js';
 import ordersLookupRouter from './apps/warehouse/orders-lookup-router.js';
 import mirrorRouter from './apps/warehouse-mirror/router.js';
@@ -709,6 +710,8 @@ app.use('/apps/aes-pdf-sorter', requireAppAccess('aes-pdf-sorter'), aesRouter);
 app.use('/apps/ranking-checker', requireAppAccess('ranking-checker'), rankingRouter);
 app.use('/apps/profit-calculator', requireAppAccess('profit-calculator'), profitRouter);
 app.use('/apps/fba-replenishment', requireAppAccess('fba-replenishment'), fbaRouter);
+// 子会社向け公開印刷 (ログイン不要・トークン認可)。requireAppAccess の外側に置く。
+app.use('/print', fbaPublicPrintRouter);
 app.use('/apps/warehouse', requireAppAccess('warehouse'), warehouseRouter);
 
 // === Mirror subtree middleware (Codex 6周レビュー反映) ===
