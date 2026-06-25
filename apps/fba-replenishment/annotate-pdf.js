@@ -56,6 +56,6 @@ export async function annotatePickingPdf(tmp1Buffer, mappingCsvBuffer, { timeout
       unmatched: Array.isArray(stats.unmatched) ? stats.unmatched : [],
     };
   } finally {
-    fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+    await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
   }
 }

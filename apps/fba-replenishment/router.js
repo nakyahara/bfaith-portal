@@ -1572,6 +1572,7 @@ router.get('/api/picking-prep/run/:id/label-csv', (req, res) => {
 
 // 納品プランNo注番済み TMP1 PDF ダウンロード (生成済みのみ)
 router.get('/api/picking-prep/run/:id/annotated-pdf', (req, res) => {
+  if (!/^\d+$/.test(req.params.id)) return res.status(404).json({ error: '無効なIDです' });
   const p = pickingPdfPath(req.params.id);
   if (!p) return res.status(404).json({ error: '注番済みPDFがありません (この回はTMP1未指定か生成失敗)' });
   res.setHeader('Content-Type', 'application/pdf');
