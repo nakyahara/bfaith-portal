@@ -29,8 +29,13 @@
     .plan-table .c-qty { text-align: right; }
     /* どのプラン/種類のシートかを各ページ(改ページ後)にも表示する繰り返しタイトル行 */
     .plan-sheet-title { background: #222; color: #fff; font-size: 13px; font-weight: bold; text-align: left; padding: 5px 6px; }
+    .runs-nav { margin: 8px 0 12px; font-size: 12px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .runs-nav .rn-label { color: #555; font-weight: bold; }
+    .runs-nav a { padding: 3px 8px; border: 1px solid #ccc; border-radius: 4px; text-decoration: none; color: #2563eb; background: #fff; }
+    .runs-nav a.cur { background: #2563eb; color: #fff; border-color: #2563eb; }
     @media print {
       .toolbar { display: none; }
+      .runs-nav { display: none; }
       body { margin: 0; }
       thead { display: table-header-group; }
     }
@@ -42,7 +47,16 @@
     <% if (!isPublic) { %><a class="sec" href="/apps/fba-replenishment/picking-prep">&larr; 戻る</a><% } %>
   </div>
 
-  <div class="meta">実行ID: <%= runId %> / 実行日時: <%= runAt %></div>
+  <% if (locals.runs && locals.runs.length) { %>
+    <div class="runs-nav">
+      <span class="rn-label">回を選択:</span>
+      <% locals.runs.forEach(function(rn){ %>
+        <a class="<%= rn.id === currentRunId ? 'cur' : '' %>" href="/print/picking/<%= rn.id %>"><%= rn.run_at %></a>
+      <% }); %>
+    </div>
+  <% } %>
+
+  <% if (runId) { %><div class="meta">実行ID: <%= runId %> / 実行日時: <%= runAt %></div><% } %>
 
   <% if (!planSheets || planSheets.length === 0) { %>
     <p>プラン別シートのデータがありません。</p>
