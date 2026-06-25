@@ -129,6 +129,11 @@
     <!-- 履歴 -->
     <div class="section">
       <h3>実行履歴</h3>
+      <div class="hint" style="margin-bottom:8px;">
+        子会社用 <b>公開印刷URL（固定・ログイン不要・過去分も一覧から閲覧可）</b>:
+        <button class="btn btn-secondary btn-sm" onclick="copyPublicUrl(location.origin+'/print/picking')">🔗 固定URLをコピー</button>
+        <a href="/print/picking" target="_blank">開く</a>
+      </div>
       <div id="runsArea" class="muted">読込中…</div>
     </div>
   </div>
@@ -255,11 +260,11 @@ function renderResult(d){
     stat('プラン別シート', (d.planSheets||[]).length) +
     stat('警告', (d.warnings||[]).length);
 
-  const publicUrl = d.publicPrintPath ? (location.origin + d.publicPrintPath) : '';
+  const publicUrl = location.origin + '/print/picking'; // 固定URL(過去分も一覧から閲覧可)
   document.getElementById('resultActions').innerHTML =
     '<a class="btn btn-primary btn-sm" href="/apps/fba-replenishment/picking-prep/print/'+d.runId+'" target="_blank">📄 プラン別シート印刷</a>' +
     '<a class="btn btn-secondary btn-sm" href="/apps/fba-replenishment/api/picking-prep/run/'+d.runId+'/label-csv">⬇ P-touchラベルCSV</a>' +
-    (publicUrl ? '<button class="btn btn-secondary btn-sm" onclick="copyPublicUrl(\''+publicUrl+'\')">🔗 子会社用 公開印刷URLをコピー</button>' : '');
+    '<button class="btn btn-secondary btn-sm" onclick="copyPublicUrl(\''+publicUrl+'\')">🔗 子会社用 公開印刷URL(固定)をコピー</button>';
 
   const warns = d.warnings||[];
   document.getElementById('warnArea').innerHTML = warns.length
@@ -295,7 +300,7 @@ async function loadRuns(){
         (run.warning_count>0 ? '<a class="warn-link" onclick="showWarnings('+run.id+')">'+esc(run.warning_count)+'件</a>' : '0')+
         '</td><td><a class="btn btn-secondary btn-sm" href="/apps/fba-replenishment/picking-prep/print/'+run.id+'" target="_blank">印刷</a> '+
         '<a class="btn btn-secondary btn-sm" href="/apps/fba-replenishment/api/picking-prep/run/'+run.id+'/label-csv">CSV</a> '+
-        (run.public_token ? '<button class="btn btn-secondary btn-sm" onclick="copyPublicUrl(\''+location.origin+'/print/picking/'+run.public_token+'\')">🔗公開URL</button>' : '')+
+        '<button class="btn btn-secondary btn-sm" onclick="copyPublicUrl(\''+location.origin+'/print/picking/'+run.id+'\')">🔗公開URL</button>'+
         '</td></tr>';
     }
     html += '</tbody></table></div>';

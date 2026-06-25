@@ -1480,7 +1480,7 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
     };
     const result = { pickingRows, planSheets, labelCsvRows, notInPicking };
 
-    const { id: runId, public_token: publicToken } = savePickingRun({
+    const runId = savePickingRun({
       run_by: req.session?.email,
       plan_files: planFileMeta,
       lz_filename: lzFile.originalname,
@@ -1505,7 +1505,7 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
       driveSave = { attempted: true, saved: false, filename: FBA_NOUHIN_CSV_NAME, error: e.message };
     }
 
-    res.json({ success: true, runId, publicToken, publicPrintPath: `/print/picking/${publicToken}`, summary, warnings, driveSave, ...result });
+    res.json({ success: true, runId, summary, warnings, driveSave, ...result });
   } catch (e) {
     console.error('[Picking] 処理エラー:', e);
     res.status(500).json({ error: e.message });
