@@ -22,6 +22,7 @@ import { initDb, savePlanningData, savePlanningDataWithHistory, getLatestSnapsho
          getPickingMasterStatus, savePickingRun, getPickingRuns, getPickingRun } from './db.js';
 import { parseCsv, decodeCsvBuffer, buildShiftJisCsv } from './picking-csv.js';
 import * as pp from './picking-prep.js';
+import { uploadCsvToDrive } from './drive-upload.js';
 // SP-API関連はミニPC経由で実行（APIキーはミニPC側に一元管理）
 // import { fetchAllReports, normalizePlanningRow } from './sp-api-reports.js';
 // import { createInboundPlan, checkInboundEligibility, findErrorSkusByBinarySearch, listShipments, listShipmentItems, fetchActiveInboundQuantities } from './inbound-plans.js';
@@ -1315,6 +1316,10 @@ const PICKING_UPLOAD_FIELDS = [
 const MAX_LZ_ROWS = 50000;
 const MAX_PLAN_ROWS = 20000;
 
+// 生成したラベルCSVを固定名で上書き保存する共有ドライブのフォルダ (GAS PL_FBA_NOUHIN_* 相当)。
+const FBA_NOUHIN_DRIVE_FOLDER_ID = process.env.FBA_NOUHIN_DRIVE_FOLDER_ID || '17SRNd4yOEX3Mr8aCEgkyXgOz5cvBcwK7';
+const FBA_NOUHIN_CSV_NAME = 'fbanouhinbangoulist.csv';
+
 // multer のエラー (サイズ超過/ファイル数超過) を JSON で返すラッパー (Codex #3)。
 function runUpload(mw) {
   return (req, res, next) => mw(req, res, (err) => {
@@ -1375,7 +1380,7 @@ router.post('/api/picking-prep/sync-dodai', async (req, res) => {
 });
 
 // メイン処理: プランCSV群 + lzpickinglist を突合し、ピッキングリスト/ラベルCSV/プラン別シートを生成
-router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_UPLOAD_FIELDS)), (req, res) => {
+router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_UPLOAD_FIELDS)), async (req, res) => {
   try {
     const files = req.files || {};
     const lzFile = files.lz?.[0];
@@ -1488,7 +1493,19 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
       result,
     });
 
-    res.json({ success: true, runId, summary, warnings, ...result });
+    // ラベルCSV(P-touch)を固定名で共有ドライブに上書き保存 (GAS同等)。best-effort:
+    // 失敗しても処理は成功扱いで履歴は残す。UIメッセージで保存可否を伝える。
+    let driveSave = { attempted: true, saved: false };
+    try {
+      const labelBuf = buildShiftJisCsv(labelCsvRows, { guardFormula: false });
+      const up = await uploadCsvToDrive(labelBuf, FBA_NOUHIN_CSV_NAME, FBA_NOUHIN_DRIVE_FOLDER_ID);
+      driveSave = { attempted: true, saved: true, action: up.action, filename: FBA_NOUHIN_CSV_NAME };
+    } catch (e) {
+      console.error('[Picking] 共有ドライブへのCSV保存失敗:', e);
+      driveSave = { attempted: true, saved: false, filename: FBA_NOUHIN_CSV_NAME, error: e.message };
+    }
+
+    res.json({ success: true, runId, summary, warnings, driveSave, ...result });
   } catch (e) {
     console.error('[Picking] 処理エラー:', e);
     res.status(500).json({ error: e.message });
