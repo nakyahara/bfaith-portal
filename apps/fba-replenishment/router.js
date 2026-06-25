@@ -25,6 +25,7 @@ import * as pp from './picking-prep.js';
 import { uploadCsvToDrive } from './drive-upload.js';
 import { annotatePickingPdf } from './annotate-pdf.js';
 import { savePickingPdf, pickingPdfPath } from './picking-pdf-store.js';
+import { createPickingCard, notionConfigured } from './notion-attach.js';
 // SP-API関連はミニPC経由で実行（APIキーはミニPC側に一元管理）
 // import { fetchAllReports, normalizePlanningRow } from './sp-api-reports.js';
 // import { createInboundPlan, checkInboundEligibility, findErrorSkusByBinarySearch, listShipments, listShipmentItems, fetchActiveInboundQuantities } from './inbound-plans.js';
@@ -1483,6 +1484,10 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
     };
     const result = { pickingRows, planSheets, labelCsvRows, notInPicking };
 
+    // ④ 納品予定日 (YYYY-MM-DD)。Notionカード名・公開ナビ表示に使用 (任意)。
+    const deliveryDate = /^\d{4}-\d{2}-\d{2}$/.test(String(req.body?.delivery_date || '').trim())
+      ? String(req.body.delivery_date).trim() : null;
+
     const runId = savePickingRun({
       run_by: req.session?.email,
       plan_files: planFileMeta,
@@ -1494,6 +1499,7 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
       summary,
       warnings,
       result,
+      delivery_date: deliveryDate,
     });
 
     // ラベルCSV(P-touch)を固定名で共有ドライブに上書き保存 (GAS同等)。best-effort:
@@ -1525,7 +1531,27 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
       }
     }
 
-    res.json({ success: true, runId, summary, warnings, driveSave, annotate, ...result });
+    // 納品予定日が入力されていれば Notion カードを作成し、注番済みPDF(公開URL)を添付 (best-effort)。
+    let notion = { attempted: false };
+    if (deliveryDate) {
+      const title = pp.buildPickingCardTitle(deliveryDate); // 例: 6月27日納品予定FBA納品ピッキング
+      if (!notionConfigured()) {
+        notion = { attempted: true, ok: false, skipped: true, error: 'Notion未設定 (FBA_PICKING_NOTION_TOKEN)' };
+      } else {
+        notion = { attempted: true, ok: false, title };
+        try {
+          const base = process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`;
+          const pdfUrl = annotate.ok ? `${base}/print/picking/${runId}/pdf` : null;
+          const card = await createPickingCard({ title, pdfUrl });
+          notion = { attempted: true, ok: true, title, url: card.url, attached: !!pdfUrl };
+        } catch (e) {
+          console.error('[Picking] Notionカード作成失敗:', e);
+          notion = { attempted: true, ok: false, title, error: e.message };
+        }
+      }
+    }
+
+    res.json({ success: true, runId, summary, warnings, driveSave, annotate, notion, ...result });
   } catch (e) {
     console.error('[Picking] 処理エラー:', e);
     res.status(500).json({ error: e.message });

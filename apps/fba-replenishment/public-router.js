@@ -10,6 +10,7 @@
 import express from 'express';
 import { getPickingRun, getPickingRuns } from './db.js';
 import { pickingPdfPath } from './picking-pdf-store.js';
+import { formatDeliveryDateJa } from './picking-prep.js';
 
 const router = express.Router();
 
@@ -17,13 +18,18 @@ function parseJson(s, fallback) {
   try { return s ? JSON.parse(s) : fallback; } catch { return fallback; }
 }
 
-// 過去実行の一覧 (印刷ビューのナビ用、新しい順)
+// 過去実行の一覧 (印刷ビューのナビ用、新しい順)。
+// display = ④納品予定日(6月27日) があればそれ、無ければ実行日時。
 function buildRunsNav() {
-  return getPickingRuns(50).map(r => ({
-    id: r.id,
-    run_at: r.run_at,
-    plan_files: parseJson(r.plan_files, []),
-  }));
+  return getPickingRuns(50).map(r => {
+    const dj = formatDeliveryDateJa(r.delivery_date);
+    return {
+      id: r.id,
+      run_at: r.run_at,
+      delivery_date: r.delivery_date || null,
+      display: dj || r.run_at,
+    };
+  });
 }
 
 function renderRun(res, rec, runs) {

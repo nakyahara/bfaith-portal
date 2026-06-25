@@ -54,7 +54,7 @@
     <div class="runs-nav">
       <span class="rn-label">回を選択:</span>
       <% locals.runs.forEach(function(rn){ %>
-        <a class="<%= rn.id === currentRunId ? 'cur' : '' %>" href="/print/picking/<%= rn.id %>"><%= rn.run_at %></a>
+        <a class="<%= rn.id === currentRunId ? 'cur' : '' %>" href="/print/picking/<%= rn.id %>"><%= rn.display %></a>
       <% }); %>
     </div>
   <% } %>
