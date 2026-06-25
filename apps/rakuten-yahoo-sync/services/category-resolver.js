@@ -57,8 +57,11 @@ export function resolveCategoryAndPath({ db, rakutenGenreId, notionOverride = nu
   //   Codex E-11 R1 H-3: 「片方だけ入力」 は中原さんが手で書き換えた意図のはずなので、
   //   その意図を尊重して fail-closed (学習辞書に勝手にフォールバックしない)。
   if (notionOverride) {
-    const nc = notionOverride.product_category;
-    const np = notionOverride.path;
+    // publish-pipeline.js から SELECT * で渡される時は notion_product_category / notion_path、
+    // router.js (listProductsForUI / detail) から短縮 mapping で渡される時は product_category / path。
+    // どちらの形でも読めるよう両方試す (PR #343 deploy 後の column-name mismatch fix)。
+    const nc = notionOverride.product_category ?? notionOverride.notion_product_category;
+    const np = notionOverride.path ?? notionOverride.notion_path;
     const hasCategory = nc != null && nc !== '' && Number.isFinite(Number(nc));
     const hasPath = typeof np === 'string' && np.trim().length > 0;
     if (hasCategory && hasPath) {
