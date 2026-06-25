@@ -21,6 +21,15 @@ function getDriveAuth() {
   });
 }
 
+// サービスアカウントのメールアドレス (共有設定で使う識別子。private_key は出さない)。
+// 取得できなければ null。フォルダ共有エラー時の案内に使う。
+function getServiceAccountEmail() {
+  try {
+    const keyJson = JSON.parse(Buffer.from(process.env.GOOGLE_SERVICE_ACCOUNT_KEY || '', 'base64').toString('utf-8'));
+    return keyJson.client_email || null;
+  } catch { return null; }
+}
+
 /**
  * 指定フォルダ内の同名ファイルを上書き、無ければ新規作成する。共有ドライブ対応。
  * @param {Buffer} buffer 保存する中身 (バイト列。Shift_JIS等エンコード済みでよい)
@@ -45,7 +54,11 @@ export async function uploadCsvToDrive(buffer, filename, folderId, mimeType = 't
     );
     driveId = meta.data.driveId || null;
   } catch (e) {
-    throw new Error(`保存先フォルダにアクセスできません (サービスアカウントの共有/権限を確認してください): ${e.message}`);
+    const email = getServiceAccountEmail();
+    throw new Error(
+      `保存先フォルダにアクセスできません。共有ドライブに サービスアカウント${email ? ` 「${email}」` : ''} を` +
+      `「コンテンツ管理者」で追加し、GCPで Drive API を有効化してください。(詳細: ${e.message})`
+    );
   }
 
   const listParams = {

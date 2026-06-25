@@ -27,6 +27,10 @@
     .slot label.lbl { font-size: 11px; color: #666; display: block; margin: 6px 0 2px; }
     .slot input[type=text] { width: 100%; padding: 4px 6px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 12px; box-sizing: border-box; }
     .slot input[type=file] { font-size: 11px; width: 100%; }
+    .slot-file { display: flex; gap: 6px; align-items: center; }
+    .slot-file input[type=file] { flex: 1; min-width: 0; }
+    .clear-btn { flex: none; padding: 3px 8px; font-size: 11px; border: 1px solid #d1d5db; border-radius: 4px; background: #f3f4f6; color: #6b7280; cursor: pointer; white-space: nowrap; }
+    .clear-btn:hover { background: #fee2e2; color: #b91c1c; border-color: #fca5a5; }
     .data-table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 12px; }
     .data-table th, .data-table td { border: 1px solid #e5e7eb; padding: 4px 6px; text-align: left; }
     .data-table th { background: #f3f4f6; position: sticky; top: 0; }
@@ -98,7 +102,10 @@
         <% slots.forEach(function(s){ %>
           <div class="slot" id="slot-<%= s.id %>">
             <div class="slot-title"><%= s.plan %> / <%= s.kind %></div>
-            <input type="file" accept=".csv" data-slot="<%= s.id %>" onchange="onSlotFile(this)">
+            <div class="slot-file">
+              <input type="file" accept=".csv" data-slot="<%= s.id %>" onchange="onSlotFile(this)">
+              <button type="button" class="clear-btn" onclick="clearSlotFile('<%= s.id %>')" title="選択を取消">✕ 取消</button>
+            </div>
             <label class="lbl">納品プランNo 接頭辞</label>
             <input type="text" id="label-<%= s.id %>" value="<%= s.label %>">
           </div>
@@ -108,7 +115,10 @@
 
     <div class="section">
       <h3>② ピッキングリストCSV (ロジザード lzpickinglist)</h3>
-      <input type="file" id="lzFile" accept=".csv">
+      <div class="slot-file" style="max-width:480px;">
+        <input type="file" id="lzFile" accept=".csv">
+        <button type="button" class="clear-btn" onclick="clearLzFile()" title="選択を取消">✕ 取消</button>
+      </div>
       <div class="hint">H列=ブロック略称, I列=ロケーション, J列=商品ID, K列=商品名</div>
     </div>
 
@@ -182,6 +192,18 @@ async function loadStatus(){
 function onSlotFile(input){
   const slot = document.getElementById('slot-'+input.dataset.slot);
   slot.classList.toggle('has-file', input.files.length>0);
+}
+
+function clearSlotFile(id){
+  const input = document.querySelector('input[type=file][data-slot="'+id+'"]');
+  if (input) input.value = '';
+  const slot = document.getElementById('slot-'+id);
+  if (slot) slot.classList.remove('has-file');
+}
+
+function clearLzFile(){
+  const el = document.getElementById('lzFile');
+  if (el) el.value = '';
 }
 
 async function syncDodai(force){
