@@ -123,6 +123,15 @@
     </div>
 
     <div class="section">
+      <h3>③ トータルピッキングリストPDF (ロジザード TMP1・任意)</h3>
+      <div class="slot-file" style="max-width:480px;">
+        <input type="file" id="tmp1File" accept=".pdf">
+        <button type="button" class="clear-btn" onclick="clearTmp1File()" title="選択を取消">✕ 取消</button>
+      </div>
+      <div class="hint">指定すると、このPDFの各行に「納品プランNo」列を追記したPDFを生成します（公開URLからもダウンロード可）。未指定でもOK。</div>
+    </div>
+
+    <div class="section">
       <button class="btn btn-primary" id="runBtn" onclick="runProcess()">処理を実行</button>
       <span id="runMsg" class="muted" style="margin-left:12px;"></span>
     </div>
@@ -206,6 +215,11 @@ function clearLzFile(){
   if (el) el.value = '';
 }
 
+function clearTmp1File(){
+  const el = document.getElementById('tmp1File');
+  if (el) el.value = '';
+}
+
 async function syncDodai(force){
   const btn = document.getElementById('dodaiSyncBtn');
   btn.disabled = true;
@@ -241,6 +255,8 @@ async function runProcess(){
   }
   if (planCount === 0){ alert('納品プランCSVを1つ以上アップロードしてください'); return; }
   fd.append('lz', lz.files[0]);
+  const tmp1 = document.getElementById('tmp1File');
+  if (tmp1 && tmp1.files.length){ fd.append('tmp1', tmp1.files[0]); }
 
   const btn = document.getElementById('runBtn');
   btn.disabled = true;
@@ -267,6 +283,11 @@ async function runProcess(){
       alert('処理は完了しました。ただし共有ドライブへのCSV保存に失敗しました:\n'+(ds.error||'不明')+
         '\n（必要なら「P-touchラベルCSV」ボタンから手動ダウンロードしてください）');
     }
+    // TMP1 PDF 注番の結果
+    const an = d.annotate;
+    if (an && an.attempted && !an.ok){
+      alert('処理は完了しましたが、TMP1 PDFへの納品プランNo注番に失敗しました:\n'+(an.error||'不明'));
+    }
   } catch(e){ alert('通信エラー: '+e.message); }
   finally { btn.disabled = false; }
 }
@@ -283,9 +304,11 @@ function renderResult(d){
     stat('警告', (d.warnings||[]).length);
 
   const publicUrl = location.origin + '/print/picking'; // 固定URL(過去分も一覧から閲覧可)
+  const an = d.annotate;
   document.getElementById('resultActions').innerHTML =
     '<a class="btn btn-primary btn-sm" href="/apps/fba-replenishment/picking-prep/print/'+d.runId+'" target="_blank">📄 プラン別シート印刷</a>' +
     '<a class="btn btn-secondary btn-sm" href="/apps/fba-replenishment/api/picking-prep/run/'+d.runId+'/label-csv">⬇ P-touchラベルCSV</a>' +
+    ((an && an.ok) ? '<a class="btn btn-primary btn-sm" href="/apps/fba-replenishment/api/picking-prep/run/'+d.runId+'/annotated-pdf">⬇ 納品プランNo付きPDF ('+an.matched+'/'+an.total+'行)</a>' : '') +
     '<button class="btn btn-secondary btn-sm" onclick="copyPublicUrl(\''+publicUrl+'\')">🔗 子会社用 公開印刷URL(固定)をコピー</button>';
 
   const warns = d.warnings||[];

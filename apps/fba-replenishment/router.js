@@ -23,6 +23,8 @@ import { initDb, savePlanningData, savePlanningDataWithHistory, getLatestSnapsho
 import { parseCsv, decodeCsvBuffer, buildShiftJisCsv } from './picking-csv.js';
 import * as pp from './picking-prep.js';
 import { uploadCsvToDrive } from './drive-upload.js';
+import { annotatePickingPdf } from './annotate-pdf.js';
+import { savePickingPdf, pickingPdfPath } from './picking-pdf-store.js';
 // SP-API関連はミニPC経由で実行（APIキーはミニPC側に一元管理）
 // import { fetchAllReports, normalizePlanningRow } from './sp-api-reports.js';
 // import { createInboundPlan, checkInboundEligibility, findErrorSkusByBinarySearch, listShipments, listShipmentItems, fetchActiveInboundQuantities } from './inbound-plans.js';
@@ -1311,6 +1313,7 @@ const pickingUpload = multer({
 const PICKING_UPLOAD_FIELDS = [
   ...PLAN_SLOTS.map(s => ({ name: s.id, maxCount: 1 })),
   { name: 'lz', maxCount: 1 },
+  { name: 'tmp1', maxCount: 1 }, // ロジザード トータルピッキングリストPDF (任意・納品プランNo注番用)
 ];
 // 1ファイルあたりの最大行数 (DB肥大化・イベントループ停止の防止, Codex #3)。
 const MAX_LZ_ROWS = 50000;
@@ -1505,7 +1508,24 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
       driveSave = { attempted: true, saved: false, filename: FBA_NOUHIN_CSV_NAME, error: e.message };
     }
 
-    res.json({ success: true, runId, summary, warnings, driveSave, ...result });
+    // TMP1 PDF が指定されていれば 納品プランNo を注番した PDF を生成・保存 (best-effort)。
+    // マッピングはこの回のラベルCSV(商品ID→納品プランNo)を流用。失敗しても処理は成功扱い。
+    let annotate = { attempted: false };
+    const tmp1File = files.tmp1?.[0];
+    if (tmp1File) {
+      annotate = { attempted: true, ok: false };
+      try {
+        const mappingBuf = buildShiftJisCsv(labelCsvRows, { guardFormula: false });
+        const r = await annotatePickingPdf(tmp1File.buffer, mappingBuf);
+        savePickingPdf(runId, r.pdfBuffer);
+        annotate = { attempted: true, ok: true, matched: r.matched, total: r.total, unmatchedCount: r.unmatched.length };
+      } catch (e) {
+        console.error('[Picking] TMP1 PDF注番失敗:', e);
+        annotate = { attempted: true, ok: false, error: e.message };
+      }
+    }
+
+    res.json({ success: true, runId, summary, warnings, driveSave, annotate, ...result });
   } catch (e) {
     console.error('[Picking] 処理エラー:', e);
     res.status(500).json({ error: e.message });
@@ -1548,6 +1568,15 @@ router.get('/api/picking-prep/run/:id/label-csv', (req, res) => {
   res.setHeader('Content-Type', 'text/csv; charset=Shift_JIS');
   res.setHeader('Content-Disposition', `attachment; filename="fbanouhinbangoulist_${rec.id}.csv"`);
   res.send(buf);
+});
+
+// 納品プランNo注番済み TMP1 PDF ダウンロード (生成済みのみ)
+router.get('/api/picking-prep/run/:id/annotated-pdf', (req, res) => {
+  const p = pickingPdfPath(req.params.id);
+  if (!p) return res.status(404).json({ error: '注番済みPDFがありません (この回はTMP1未指定か生成失敗)' });
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename="picking_list_planno_${String(req.params.id).replace(/[^0-9]/g,'')}.pdf"`);
+  res.sendFile(p);
 });
 
 // 印刷ビュー (プラン別シートのみ。ピッキングリストPDFは廃止=ロジザード側PDFを使うため)

@@ -44,6 +44,9 @@
 <body>
   <div class="toolbar">
     <button onclick="window.print()">🖨 印刷 / PDF保存</button>
+    <% if (locals.hasPdf && currentRunId) { %>
+      <a class="sec" href="/print/picking/<%= currentRunId %>/pdf" target="_blank">📄 納品プランNo付きピッキングリストPDF</a>
+    <% } %>
     <% if (!isPublic) { %><a class="sec" href="/apps/fba-replenishment/picking-prep">&larr; 戻る</a><% } %>
   </div>
 
