@@ -1,6 +1,7 @@
 import express from 'express';
 import session from 'express-session';
 import connectSqlite3 from 'connect-sqlite3';
+import BetterSqlite3 from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
 import path from 'path';
 import fs from 'fs';
@@ -167,6 +168,23 @@ app.use((req, res, next) => {
   return globalJsonParser(req, res, next);
 });
 app.use(express.static(path.join(__dirname, 'public')));
+
+// セッションストア(connect-sqlite3)は全リクエストで sessions.db を読み書きする。Render の
+// network-attached disk では rollback-journal モードの fsync が遅く、どのページでも TTFB を
+// 底上げしてしまう。journal_mode=WAL は DB ヘッダに永続記録されるため、ここで一度だけ
+// better-sqlite3 で設定しておけば、後段の connect-sqlite3 接続も WAL を引き継ぐ(書き込み軽量化)。
+// 認証ロジックには一切触れない。失敗してもセッションは動くので起動は止めない(best-effort)。
+try {
+  const SESSIONS_DB = path.join(DATA_DIR, 'sessions.db');
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  const sdb = new BetterSqlite3(SESSIONS_DB);
+  const mode = sdb.pragma('journal_mode = WAL', { simple: true });
+  sdb.pragma('busy_timeout = 5000');
+  sdb.close();
+  console.log(`[session-store] sessions.db journal_mode=${mode}`);
+} catch (e) {
+  console.warn('[session-store] WAL 設定スキップ:', e.message);
+}
 
 app.use(session({
   store: new SQLiteStore({ db: 'sessions.db', dir: DATA_DIR }),
