@@ -28,19 +28,28 @@ export class ImageUploadError extends Error {
  * 楽天 RMS の画像 location を完全 URL に正規化。
  *   - https://... or http://... → そのまま
  *   - //image.rakuten.co.jp/... → https: 補完
- *   - /image3/12960221/foo.jpg (相対パス) → https://image.rakuten.co.jp{path}
- *   - その他 (相対 path で / 始まりでない / 不正) → null (download 不可)
+ *   - /image3/12960221/foo.jpg (相対パス) → https://image.rakuten.co.jp/{shopSlug}/cabinet{path}
  *
- *   2026-06-25 中原さん smoke で発覚: aburatoishioil100 の楽天画像 location が
- *   `/image3/12960221/...` で 完全 URL じゃなく、 fetch が 「Failed to parse URL」 で全失敗。
+ *   楽天 RMS の images[].location は相対パス (`/image3/...` 等) で返ってくる。
+ *   正式 URL 構造 (AI_reference rakuten-linegift-sync 開発経緯.md 等で確認):
+ *     https://image.rakuten.co.jp/{shopSlug}/cabinet{location}
+ *
+ *   shopSlug は b-faith01 ストアでは `b-faith` (env RAKUTEN_SHOP_SLUG で上書き可)。
+ *
+ *   2026-06-25 中原さん smoke で 2 連発判明:
+ *     1. host 抜け → Failed to parse URL (PR #346 で normalize 追加)
+ *     2. shopSlug + cabinet 抜け → HTTP 404 (本 PR で修正)
  */
-export function normalizeRakutenImageUrl(loc) {
+export function normalizeRakutenImageUrl(loc, { shopSlug = null } = {}) {
   if (typeof loc !== 'string') return null;
   const s = loc.trim();
   if (!s) return null;
   if (/^https?:\/\//i.test(s)) return s;
   if (/^\/\//.test(s)) return 'https:' + s;
-  if (s.startsWith('/')) return 'https://image.rakuten.co.jp' + s;
+  if (s.startsWith('/')) {
+    const slug = (shopSlug || process.env.RAKUTEN_SHOP_SLUG || 'b-faith').trim();
+    return `https://image.rakuten.co.jp/${slug}/cabinet${s}`;
+  }
   return null;
 }
 
