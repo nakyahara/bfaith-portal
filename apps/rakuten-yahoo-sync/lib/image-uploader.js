@@ -105,9 +105,12 @@ async function toJpegUnderLimit(rawBuffer, { maxBytes = MAX_BYTES } = {}) {
 }
 
 function imageFileName(itemCode, index) {
-  // Yahoo は item_code 連動の命名規約あり (例: <item_code>_01.jpg)
-  const idx = String(index + 1).padStart(2, '0');
-  return `${itemCode}_${idx}.jpg`;
+  // Yahoo の画像命名規約 (AI_reference 設計書 v6 §3.6 + Phase 0 実測):
+  //   - メイン画像 (index=0): {item_code}.jpg
+  //   - サブ画像 (index>=1):  {item_code}_{1..20}.jpg  ← 1 桁、 zero-padding なし
+  // 旧実装の _01/_02 (2 桁 padding) は Yahoo が HTTP 400 (2026-06-25 smoke で発覚)。
+  if (index === 0) return `${itemCode}.jpg`;
+  return `${itemCode}_${index}.jpg`;
 }
 
 /**
