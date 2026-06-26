@@ -24,6 +24,26 @@ export class ImageUploadError extends Error {
   }
 }
 
+/**
+ * 楽天 RMS の画像 location を完全 URL に正規化。
+ *   - https://... or http://... → そのまま
+ *   - //image.rakuten.co.jp/... → https: 補完
+ *   - /image3/12960221/foo.jpg (相対パス) → https://image.rakuten.co.jp{path}
+ *   - その他 (相対 path で / 始まりでない / 不正) → null (download 不可)
+ *
+ *   2026-06-25 中原さん smoke で発覚: aburatoishioil100 の楽天画像 location が
+ *   `/image3/12960221/...` で 完全 URL じゃなく、 fetch が 「Failed to parse URL」 で全失敗。
+ */
+export function normalizeRakutenImageUrl(loc) {
+  if (typeof loc !== 'string') return null;
+  const s = loc.trim();
+  if (!s) return null;
+  if (/^https?:\/\//i.test(s)) return s;
+  if (/^\/\//.test(s)) return 'https:' + s;
+  if (s.startsWith('/')) return 'https://image.rakuten.co.jp' + s;
+  return null;
+}
+
 async function downloadImage(url, timeoutMs = DEFAULT_DOWNLOAD_TIMEOUT_MS) {
   let res;
   try {
@@ -93,11 +113,23 @@ function imageFileName(itemCode, index) {
  */
 export async function uploadRakutenImagesToYahoo({ rakutenImages, itemCode, maxImages = 10, customPatterns = [] } = {}) {
   if (!itemCode) throw new ImageUploadError('itemCode is required');
-  const urls = filterUploadableImageUrls(rakutenImages, { customPatterns });
-  if (urls.length === 0) {
+  const filtered = filterUploadableImageUrls(rakutenImages, { customPatterns });
+  if (filtered.length === 0) {
     return { uploaded: 0, failed: 0, errors: ['no_uploadable_image_after_filter'] };
   }
-  const limited = urls.slice(0, maxImages);
+  // 楽天 RMS の location は相対パスで返ることがあるので host 補完してから download。
+  // normalize で null になったもの (= 不正 URL) は除外し、 errors に残す。
+  const normalized = [];
+  const normalizeErrors = [];
+  for (const raw of filtered) {
+    const u = normalizeRakutenImageUrl(raw);
+    if (u) normalized.push(u);
+    else normalizeErrors.push(`${raw}: cannot normalize to absolute URL`);
+  }
+  if (normalized.length === 0) {
+    return { uploaded: 0, failed: filtered.length, errors: ['no_normalizable_image_url', ...normalizeErrors] };
+  }
+  const limited = normalized.slice(0, maxImages);
   let uploaded = 0;
   let failed = 0;
   const errors = [];
@@ -116,6 +148,11 @@ export async function uploadRakutenImagesToYahoo({ rakutenImages, itemCode, maxI
         : (e instanceof ImageUploadError ? `${url}: ${e.message}` : `${url}: ${e.message || e}`);
       errors.push(msg);
     }
+  }
+  // normalize で除外したものも errors に積んで可視化 (failed カウントは uploaded されたもの以外)
+  if (normalizeErrors.length > 0) {
+    errors.push(...normalizeErrors);
+    failed += normalizeErrors.length;
   }
   return { uploaded, failed, errors };
 }
