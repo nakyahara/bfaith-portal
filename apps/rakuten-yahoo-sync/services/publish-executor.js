@@ -259,29 +259,60 @@ export async function executePublish({
       // 'not_implemented' / 'failed' は dedupe しない → 既存 row を残したまま再実行可能。
       //   'not_implemented': E-5b で実 publish に flip された時の placeholder
       //   'failed':          中間バグ修正後 / 一時障害から復旧して再実行したいケース
-      // 一旦 in_progress に書き戻し (UPDATE)
-      const r = db.prepare(`
-        UPDATE publish_idempotency
-           SET status           = 'in_progress',
-               attempt          = attempt + 1,
-               lease_expires_at = ?,
-               error_message    = NULL,
-               result_json      = NULL,
-               created_by       = ?,
-               updated_at       = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         WHERE idempotency_key  = ?
-           AND status           IN ('not_implemented', 'failed')
-      `).run(leaseExpiresAt(), createdBy, idempotencyKey);
-      if (r.changes === 0) {
-        // race で別 caller が状態変えた → 再 read してハンドリング
+      //
+      // Codex 2026-06-25 race guard:
+      //   2 caller が同 retryable row を読んだ場合、 片方の UPDATE は changes=1、 もう片方は 0。
+      //   既存 (PR #347) 実装は 0 で in_progress_conflict 返してたが、 race で諦めると
+      //   後発 caller が何も出来ない。 refreshed.status が retryable のままなら短期 retry。
+      //   上限 RETRY_RACE_MAX で無限ループ防止。
+      const RETRY_RACE_MAX = 3;
+      let succeeded = false;
+      for (let i = 0; i < RETRY_RACE_MAX; i += 1) {
+        const r = db.prepare(`
+          UPDATE publish_idempotency
+             SET status           = 'in_progress',
+                 attempt          = attempt + 1,
+                 lease_expires_at = ?,
+                 error_message    = NULL,
+                 result_json      = NULL,
+                 created_by       = ?,
+                 updated_at       = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+           WHERE idempotency_key  = ?
+             AND status           IN ('not_implemented', 'failed')
+        `).run(leaseExpiresAt(), createdBy, idempotencyKey);
+        if (r.changes === 1) { succeeded = true; break; }
+        // changes === 0: race で別 caller が status を変えた
         const refreshed = getRow(db, idempotencyKey);
-        if (refreshed && DEDUPE_TERMINAL_STATUSES.has(refreshed.status)) {
+        if (!refreshed) {
+          // row 自体が消えた (rare): 通常経路に流す = insert in_progress 試行
+          return {
+            status: 'in_progress_conflict',
+            idempotencyKey,
+            error: `${existing.status} row disappeared mid-retry`,
+          };
+        }
+        if (DEDUPE_TERMINAL_STATUSES.has(refreshed.status)) {
           return dedupeResponse(refreshed, idempotencyKey);
         }
+        if (refreshed.status === 'in_progress') {
+          return {
+            status: 'in_progress_conflict',
+            idempotencyKey,
+            error: `${existing.status} → in_progress retry race lost to concurrent caller`,
+            leaseExpiresAt: refreshed.lease_expires_at,
+          };
+        }
+        if (!RETRYABLE_STATUSES.has(refreshed.status)) {
+          // 既知 retryable でも success でも in_progress でもない → dedupe (fail-closed)
+          return dedupeResponse(refreshed, idempotencyKey);
+        }
+        // refreshed.status は retryable のまま → 短期 race、 もう一度 UPDATE 試す
+      }
+      if (!succeeded) {
         return {
           status: 'in_progress_conflict',
           idempotencyKey,
-          error: `${existing.status} → in_progress retry race lost (current status=${refreshed?.status})`,
+          error: `retryable → in_progress UPDATE failed ${RETRY_RACE_MAX} times (race exhausted)`,
         };
       }
       // retryable → in_progress 再取得成功 → attempt 固定
