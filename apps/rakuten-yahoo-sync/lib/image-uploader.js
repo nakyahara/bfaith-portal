@@ -150,8 +150,13 @@ export async function uploadRakutenImagesToYahoo({ rakutenImages, itemCode, maxI
     const fileName = imageFileName(itemCode, i);
     try {
       const raw = await downloadImage(url);
-      const { buffer } = await toJpegUnderLimit(raw);
+      const { buffer, quality } = await toJpegUnderLimit(raw);
+      // smoke gate 観測ログ: JPEG magic / size / filename 規約を VPS 送信前に確認
+      //   (validateUploadFileName と JPEG magic / size は callUploadItemImage 内でも gate)
+      const magicHex = Buffer.from(buffer.slice(0, 2)).toString('hex');
+      console.log(`[rys-upload] item=${itemCode} idx=${i} file=${fileName} ${buffer.length}B q=${quality} magic=${magicHex}`);
       await callUploadItemImage({ buffer, fileName, itemCode });
+      console.log(`[rys-upload] item=${itemCode} idx=${i} file=${fileName} OK`);
       uploaded += 1;
     } catch (e) {
       failed += 1;
