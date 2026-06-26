@@ -31,7 +31,11 @@ const LEASE_TTL_MS = 30 * 60 * 1000; // 30 分
 
 // Codex E-5a R1 M-1: 'not_implemented' は terminal だが dedupe 対象外。
 //   E-5b で同 key で再投げると実 publish に進めるようにする (placeholder を再実行可能)。
-const DEDUPE_TERMINAL_STATUSES = new Set(['success', 'failed']);
+// 2026-06-25 中原さん smoke で発覚: status='failed' を terminal 扱いすると同日中の retry が
+// 全部 dedupe され、 中間バグ修正後の再実行ができない。 'success' のみ terminal とする。
+// 'failed' / 'not_implemented' は retryable で、 既存 row を UPDATE in_progress して再実行する。
+const DEDUPE_TERMINAL_STATUSES = new Set(['success']);
+const RETRYABLE_STATUSES = new Set(['not_implemented', 'failed']);
 
 export function isPublishEnabled() {
   return String(process.env.RYS_PUBLISH_ENABLED || '0').trim() === '1';
@@ -251,8 +255,10 @@ export async function executePublish({
       ownAttempt = getRow(db, idempotencyKey)?.attempt ?? null;
     } else if (DEDUPE_TERMINAL_STATUSES.has(existing.status)) {
       return dedupeResponse(existing, idempotencyKey);
-    } else {
-      // 'not_implemented' は dedupe しない → 既存 row を残したまま再実行可能にするため
+    } else if (RETRYABLE_STATUSES.has(existing.status)) {
+      // 'not_implemented' / 'failed' は dedupe しない → 既存 row を残したまま再実行可能。
+      //   'not_implemented': E-5b で実 publish に flip された時の placeholder
+      //   'failed':          中間バグ修正後 / 一時障害から復旧して再実行したいケース
       // 一旦 in_progress に書き戻し (UPDATE)
       const r = db.prepare(`
         UPDATE publish_idempotency
@@ -264,7 +270,7 @@ export async function executePublish({
                created_by       = ?,
                updated_at       = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          WHERE idempotency_key  = ?
-           AND status           = 'not_implemented'
+           AND status           IN ('not_implemented', 'failed')
       `).run(leaseExpiresAt(), createdBy, idempotencyKey);
       if (r.changes === 0) {
         // race で別 caller が状態変えた → 再 read してハンドリング
@@ -275,11 +281,14 @@ export async function executePublish({
         return {
           status: 'in_progress_conflict',
           idempotencyKey,
-          error: `not_implemented → in_progress retry race lost (current status=${refreshed?.status})`,
+          error: `${existing.status} → in_progress retry race lost (current status=${refreshed?.status})`,
         };
       }
-      // not_implemented → in_progress 再取得成功 → attempt 固定
+      // retryable → in_progress 再取得成功 → attempt 固定
       ownAttempt = getRow(db, idempotencyKey)?.attempt ?? null;
+    } else {
+      // 未知 status → 安全側で dedupe
+      return dedupeResponse(existing, idempotencyKey);
     }
   } else {
     // insert in_progress (lease 取得)
