@@ -25,6 +25,10 @@ export function initMirrorDB() {
   // 設計書: 誤出荷管理システム_設計書_v5.md (中身 v7.3) の「実装要件」セクション参照。
   db.pragma('foreign_keys = ON');
   db.pragma('journal_mode = WAL');
+  // WAL 下では synchronous=NORMAL が安全かつ高速 (commit ごとの fsync を省き、checkpoint 時のみ同期)。
+  // Render の persistent disk は network-attached で fsync が遅く、daily-sync 取込 / mgmt 自動同期 /
+  // マート再構築など書き込みのたびに体感が固まる主因になりうるため明示する (既定 FULL → NORMAL)。
+  db.pragma('synchronous = NORMAL');
   db.pragma('busy_timeout = 5000');
   db.pragma('recursive_triggers = ON');
   createTables();
