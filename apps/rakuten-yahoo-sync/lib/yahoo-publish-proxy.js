@@ -10,10 +10,42 @@
  * 提供 endpoint:
  *   GET  /yahoo/getLeadTimeList     — 発送日設定マスタ ID 一覧
  *   POST /yahoo/editItem            — form-encoded fields で商品登録
- *   POST /yahoo/uploadItemImage     — multipart binary で画像 upload
+ *   POST /yahoo/uploadItemImage     — JSON {fileName,itemCode,bufferBase64} で画像 upload
+ *                                     (VPS proxy 側で Yahoo 公式 contract の multipart に再構築)
  */
 
 const DEFAULT_TIMEOUT_MS = 60_000;
+const MAX_IMAGE_BYTES = 2 * 1024 * 1024;
+
+// Yahoo uploadItemImage の画像命名規約 (AI_reference 設計書 v6 §3.6):
+//   - メイン: {item_code}.jpg
+//   - サブ:   {item_code}_{1..20}.jpg  (1 桁、 zero-padding なし)
+//   - item_code: 英数字 / _ / - で 1-80 文字
+const ITEM_CODE_RE = /^[A-Za-z0-9_-]{1,80}$/;
+const FILE_NAME_RE_GENERIC = /^[A-Za-z0-9_-]{1,80}(_(?:[1-9]|1[0-9]|20))?\.jpg$/;
+
+export function validateUploadFileName(fileName, itemCode) {
+  if (typeof fileName !== 'string' || fileName.length === 0 || fileName.length > 100) {
+    throw new YahooProxyError('uploadItemImage', `fileName invalid length: ${fileName?.length}`);
+  }
+  if (fileName.includes('/') || fileName.includes('\\')) {
+    throw new YahooProxyError('uploadItemImage', `fileName must be basename: ${JSON.stringify(fileName)}`);
+  }
+  if (/[\x00-\x1F\x7F]/.test(fileName)) {
+    throw new YahooProxyError('uploadItemImage', 'fileName has control chars');
+  }
+  if (!FILE_NAME_RE_GENERIC.test(fileName)) {
+    throw new YahooProxyError('uploadItemImage', `fileName format invalid (expected {item_code}.jpg or {item_code}_N.jpg): ${fileName}`);
+  }
+  if (!ITEM_CODE_RE.test(itemCode)) {
+    throw new YahooProxyError('uploadItemImage', `itemCode format invalid: ${itemCode}`);
+  }
+  // ITEM_CODE_RE 通過後 → [A-Za-z0-9_-] のみ → regex literal で escape 不要
+  const expected = new RegExp(`^${itemCode}(?:_(?:[1-9]|1[0-9]|20))?\\.jpg$`);
+  if (!expected.test(fileName)) {
+    throw new YahooProxyError('uploadItemImage', `fileName ${fileName} does not match itemCode ${itemCode}`);
+  }
+}
 
 export class YahooProxyError extends Error {
   constructor(endpoint, message, { status = null, body = null } = {}) {
@@ -155,30 +187,51 @@ export async function callEditItem(fields, { timeoutMs = DEFAULT_TIMEOUT_MS } = 
 }
 
 /**
- * POST /yahoo/uploadItemImage に multipart で 1 枚 upload。
+ * POST /yahoo/uploadItemImage に JSON で 1 枚 upload。
  *
- * @param {{ buffer: Buffer, fileName: string, itemCode: string }} args
+ * 旧 RakutenYahooSync (Downloads/RakutenYahooSync/src/services/yahoo-api.js:250) で
+ * 動作実績ある Yahoo 公式 contract:
+ *   - URL: ${apiBase}/uploadItemImage?seller_id=xxx
+ *   - form: `file` 単数のみ + Blob(image/jpeg) + filename
+ *   - headers: Authorization のみ (Content-Type は undici が boundary 付きで自動付与)
+ *
+ * bfaith-portal → VPS proxy は JSON {fileName, itemCode, bufferBase64} で送り、
+ * VPS proxy 側で上記 contract に再構築する。
+ * 余計な field (seller_id / item_code / file_name) を multipart に入れる旧実装は
+ * Yahoo が 400 を返すので廃止。
+ *
+ * @param {{ buffer: Buffer|Uint8Array, fileName: string, itemCode: string }} args
  * @returns {Promise<{status, body}>}
  */
 export async function callUploadItemImage({ buffer, fileName, itemCode }, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
   if (!buffer || !(buffer instanceof Uint8Array)) {
-    throw new YahooProxyError('uploadItemImage', 'buffer is required');
+    throw new YahooProxyError('uploadItemImage', 'buffer must be Buffer/Uint8Array');
   }
   if (!fileName) throw new YahooProxyError('uploadItemImage', 'fileName is required');
   if (!itemCode) throw new YahooProxyError('uploadItemImage', 'itemCode is required');
-  const seller = requireEnv('YAHOO_SELLER_ID');
-  const form = new FormData();
-  form.append('seller_id', seller);
-  form.append('item_code', itemCode);
-  form.append('file_name', fileName);
-  const blob = new Blob([buffer], { type: 'image/jpeg' });
-  form.append('file', blob, fileName);
+  // smoke gate: fileName 規約 + itemCode との完全結合
+  validateUploadFileName(fileName, itemCode);
+  // smoke gate: JPEG magic FF D8
+  if (buffer.length < 4 || buffer[0] !== 0xFF || buffer[1] !== 0xD8) {
+    const head = Buffer.from(buffer.slice(0, 4)).toString('hex');
+    throw new YahooProxyError('uploadItemImage', `invalid JPEG magic: ${head}`);
+  }
+  // smoke gate: 2MB 未満 (Yahoo 仕様)
+  if (buffer.length >= MAX_IMAGE_BYTES) {
+    throw new YahooProxyError('uploadItemImage', `image too large: ${buffer.length}B (>= ${MAX_IMAGE_BYTES}B)`);
+  }
 
+  const bufBase = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+  const payload = {
+    fileName,
+    itemCode,
+    bufferBase64: bufBase.toString('base64'),
+  };
   const url = `${getProxyBaseUrl()}/yahoo/uploadItemImage`;
   const res = await fetch(url, {
     method: 'POST',
-    headers: getProxyHeaders(),
-    body: form,
+    headers: { ...getProxyHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
     signal: AbortSignal.timeout(timeoutMs),
   });
   const text = await res.text();

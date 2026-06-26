@@ -295,7 +295,7 @@ async function callYahooAPIRaw(endpoint, { method = 'POST', contentType = 'appli
   const headers = {
     'Authorization': `Bearer ${accessToken}`,
   };
-  if (body !== null) headers['Content-Type'] = contentType;
+  if (body !== null && contentType) headers['Content-Type'] = contentType;
   try {
     if (fs.existsSync(YAHOO_PUBLIC_KEY_PATH)) {
       const publicKeyPem = fs.readFileSync(YAHOO_PUBLIC_KEY_PATH, 'utf-8');
@@ -463,6 +463,73 @@ function readBodyBuffer(req) {
     req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
+}
+
+// JSON body 用 (size cap 付き)。
+//   Codex Phase E upload contract rewrite R1 H-1:
+//   uploadItemImage の bufferBase64 上限を防御するため、 Content-Length 事前 check +
+//   streaming chunk 累計 cap (超過後は drain して body は捨てる) で 413 を確実に返す。
+const UPLOAD_JSON_BODY_MAX_BYTES = 4 * 1024 * 1024; // 2MB JPEG → base64 2.67MB + JSON overhead 余裕
+function readJsonBodyWithCap(req, maxBytes = UPLOAD_JSON_BODY_MAX_BYTES) {
+  return new Promise((resolve, reject) => {
+    const cl = req.headers['content-length'];
+    if (cl) {
+      const n = Number(cl);
+      if (Number.isFinite(n) && n > maxBytes) {
+        return reject(Object.assign(new Error(`request body too large: ${n}B > ${maxBytes}B`), { httpStatus: 413 }));
+      }
+    }
+    let total = 0;
+    let rejected = false;
+    const chunks = [];
+    req.on('data', c => {
+      total += c.length;
+      if (total > maxBytes) {
+        if (!rejected) {
+          rejected = true;
+          reject(Object.assign(new Error(`request body too large: > ${maxBytes}B`), { httpStatus: 413 }));
+        }
+        return; // drain: 残り chunk は捨てる (socket は閉じない → 413 response が届く)
+      }
+      if (!rejected) chunks.push(c);
+    });
+    req.on('end', () => {
+      if (!rejected) resolve(Buffer.concat(chunks).toString('utf8'));
+    });
+    req.on('error', e => {
+      if (!rejected) {
+        rejected = true;
+        reject(e);
+      }
+    });
+  });
+}
+
+// uploadItemImage の画像命名規約 (bfaith-portal apps/rakuten-yahoo-sync/lib/yahoo-publish-proxy.js と同期):
+//   メイン: {item_code}.jpg / サブ: {item_code}_{1..20}.jpg
+//   item_code: [A-Za-z0-9_-] 1-80 chars
+const UPLOAD_ITEM_CODE_RE = /^[A-Za-z0-9_-]{1,80}$/;
+const UPLOAD_FILE_NAME_RE_GENERIC = /^[A-Za-z0-9_-]{1,80}(_(?:[1-9]|1[0-9]|20))?\.jpg$/;
+function validateUploadFileName(fileName, itemCode) {
+  if (typeof fileName !== 'string' || fileName.length === 0 || fileName.length > 100) {
+    throw new Error(`fileName invalid length: ${fileName?.length}`);
+  }
+  if (fileName.includes('/') || fileName.includes('\\')) {
+    throw new Error(`fileName must be basename: ${JSON.stringify(fileName)}`);
+  }
+  if (/[\x00-\x1F\x7F]/.test(fileName)) {
+    throw new Error('fileName has control chars');
+  }
+  if (!UPLOAD_FILE_NAME_RE_GENERIC.test(fileName)) {
+    throw new Error(`fileName format invalid: ${fileName}`);
+  }
+  if (!UPLOAD_ITEM_CODE_RE.test(itemCode)) {
+    throw new Error(`itemCode format invalid: ${itemCode}`);
+  }
+  const expected = new RegExp(`^${itemCode}(?:_(?:[1-9]|1[0-9]|20))?\\.jpg$`);
+  if (!expected.test(fileName)) {
+    throw new Error(`fileName ${fileName} does not match itemCode ${itemCode}`);
+  }
 }
 
 // ─── HTTPサーバー ───
@@ -817,20 +884,88 @@ const server = http.createServer(async (req, res) => {
     }
 
     // POST /yahoo/uploadItemImage
-    //   caller (RYS) が multipart/form-data で binary + meta を投げる
-    //   Content-Type に boundary が含まれるのでそのまま forward
+    //   caller (RYS bfaith-portal) は JSON {fileName, itemCode, bufferBase64} で送る。
+    //   VPS proxy 側で旧 RakutenYahooSync (Downloads/RakutenYahooSync/src/services/yahoo-api.js:250)
+    //   と同じ Yahoo 公式 contract に再構築:
+    //     - URL: ?seller_id=xxx  (URL query)
+    //     - form: `file` 単数のみ + Blob(image/jpeg) + filename
+    //     - headers: Authorization のみ (Content-Type は undici が boundary 付きで自動付与)
+    //   旧透過 forward は余計な field (seller_id/item_code/file_name) を Yahoo に送ってしまい
+    //   HTTP 400 になっていた (2026-06-25/26 smoke で連続失敗)。
     if (pathname === '/yahoo/uploadItemImage' && req.method === 'POST') {
-      const contentType = req.headers['content-type'];
-      if (!contentType || !contentType.startsWith('multipart/form-data')) {
-        throw new Error('uploadItemImage は multipart/form-data である必要があります');
+      const ct = (req.headers['content-type'] || '').toLowerCase();
+      if (!ct.includes('application/json')) {
+        res.writeHead(415, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'uploadItemImage requires application/json' }));
+        return;
       }
-      const buf = await readBodyBuffer(req);
-      console.log(`[${ts()}] Yahoo uploadItemImage: ${buf.length}b multipart`);
+
+      let rawBody;
+      try {
+        rawBody = await readJsonBodyWithCap(req);
+      } catch (e) {
+        const code = e.httpStatus || 500;
+        console.error(`[${ts()}] uploadItemImage body read error: ${e.message}`);
+        res.writeHead(code, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+        return;
+      }
+
+      let payload;
+      try { payload = JSON.parse(rawBody); }
+      catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `invalid JSON: ${e.message}` }));
+        return;
+      }
+
+      const { fileName, bufferBase64, itemCode } = payload || {};
+      if (!fileName || !bufferBase64 || !itemCode) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'fileName, itemCode, bufferBase64 are required' }));
+        return;
+      }
+      // type guard: Buffer.from(non-string, 'base64') は環境により TypeError → 外側 catch 500 化を避ける
+      if (typeof fileName !== 'string' || typeof bufferBase64 !== 'string' || typeof itemCode !== 'string') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'fileName, itemCode, bufferBase64 must be string' }));
+        return;
+      }
+      try {
+        validateUploadFileName(fileName, itemCode);
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+        return;
+      }
+
+      const buf = Buffer.from(bufferBase64, 'base64');
+      if (buf.length < 4 || buf[0] !== 0xFF || buf[1] !== 0xD8) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `invalid JPEG magic: ${buf.slice(0, 4).toString('hex')}` }));
+        return;
+      }
+      if (buf.length >= 2 * 1024 * 1024) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `image too large: ${buf.length}B (>= 2MB)` }));
+        return;
+      }
+
+      // 旧 RakutenYahooSync yahoo-api.js:250 と同じ contract で再構築:
+      //   form.append('file', Blob(image/jpeg), fileName)  だけ
+      //   URL ?seller_id=xxx
+      //   Content-Type は undici に boundary 付きで自動付与させる (contentType: null)
+      const form = new FormData();
+      form.append('file', new Blob([buf], { type: 'image/jpeg' }), fileName);
+
+      console.log(`[${ts()}] Yahoo uploadItemImage: itemCode=${itemCode} file=${fileName} ${buf.length}B (json→multipart, seller_id in URL)`);
       const r = await callYahooAPIRaw('uploadItemImage', {
         method: 'POST',
-        contentType,
-        body: buf,
+        contentType: null,
+        body: form,
+        queryString: `seller_id=${encodeURIComponent(YAHOO_SELLER_ID)}`,
       });
+      console.log(`[${ts()}] Yahoo uploadItemImage response: status=${r.status} body=${String(r.body).substring(0, 300)}`);
       res.writeHead(r.status, { 'Content-Type': 'application/xml' });
       res.end(r.body);
       return;
