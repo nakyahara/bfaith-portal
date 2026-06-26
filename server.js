@@ -6,6 +6,7 @@ import bcrypt from 'bcryptjs';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import { monitorEventLoopDelay, performance } from 'node:perf_hooks';
 import linegiftRouter from './apps/linegift-sync/router.js';
 import mercariRouter from './apps/mercari-sync/router.js';
 import rakutenYahooSyncRouter from './apps/rakuten-yahoo-sync/router.js';
@@ -141,6 +142,108 @@ app.get('/readyz', loopbackOnly, (req, res) => {
   res.status(200).json({ status: 'ready', pid: process.pid });
 });
 
+// === [perf] 一時計測ミドルウェア（「重い」原因の切り分け用） ===========================
+// PERF_LOG=1 のときだけ有効。OFF時はオーバーヘッドゼロ（middleware を一切挟まない）。
+// 出力は JSON 1行。閾値超過のみログするので Render ログを汚さない。機微値は出さない。
+//  - perf.req  : リクエスト総時間 totalMs / セッションストア読込 sessionMs / 応答バイト
+//  - perf.loop : イベントループ遅延 p50/p95/p99 と RSS/heap/external（同期ブロック検知）
+const PERF_ON = process.env.PERF_LOG === '1' || process.env.PERF_LOG === 'true';
+// 下限クランプ: 不正/極小値で自爆的にログ・CPUを増やさない（Codex指摘）
+const PERF_REQ_MS = Math.max(50, parseInt(process.env.PERF_REQ_MS, 10) || 300);   // この ms 以上の req だけログ
+const PERF_LOOP_MS = Math.max(5000, parseInt(process.env.PERF_LOOP_MS, 10) || 30000); // ループ計測の出力間隔
+const PERF_SESSION_MS = Math.max(20, parseInt(process.env.PERF_SESSION_MS, 10) || 50); // 単発セッション操作のログ閾値
+// パス中の業務ID(SKU/ASIN/商品コード/一時ファイルID等)を Render ログに残さない（Codex指摘）。
+// ルート形状は保ちつつ、ID らしいセグメントを :x に伏せる。
+function perfSafePath(p) {
+  if (!p) return p;
+  return p.split('/').map((seg) => {
+    if (!seg) return seg;
+    if (/^\d+$/.test(seg)) return ':x';                       // 数値ID
+    if (seg.length >= 20) return ':x';                        // 長いトークン/ファイルID
+    if (/\d/.test(seg) && /[A-Za-z]/.test(seg) && seg.length >= 8) return ':x'; // SKU/ASIN風
+    return seg;
+  }).join('/');
+}
+// セッションストア操作の集計（loop ごとに flush）。set/touch=書込はネットワークディスクfsyncで重くなりやすい。
+const perfSession = { get: [0, 0], set: [0, 0], touch: [0, 0], destroy: [0, 0] }; // op -> [count, totalMs]
+function wrapSessionStore(store) {
+  if (!PERF_ON || !store) return store;
+  for (const op of ['get', 'set', 'touch', 'destroy']) {
+    const orig = store[op];
+    if (typeof orig !== 'function') continue;
+    store[op] = function (...args) {
+      const cb = args[args.length - 1];
+      if (typeof cb !== 'function') return orig.apply(this, args);
+      const s = performance.now();
+      args[args.length - 1] = function (...cbArgs) {
+        const ms = performance.now() - s;
+        perfSession[op][0] += 1;
+        perfSession[op][1] += ms;
+        if (ms >= PERF_SESSION_MS) console.log(JSON.stringify({ t: 'perf.session', op, ms: Math.round(ms) }));
+        return cb.apply(this, cbArgs);
+      };
+      return orig.apply(this, args);
+    };
+  }
+  return store;
+}
+let _perfMonitorStarted = false;
+function startPerfMonitor() {
+  if (!PERF_ON || _perfMonitorStarted) return;
+  _perfMonitorStarted = true;
+  const eld = monitorEventLoopDelay({ resolution: 20 });
+  eld.enable();
+  let lastElu = performance.eventLoopUtilization();
+  const timer = setInterval(() => {
+    const elu = performance.eventLoopUtilization(lastElu);
+    lastElu = performance.eventLoopUtilization();
+    const mem = process.memoryUsage();
+    // セッション集計のスナップショット＆リセット
+    const sess = {};
+    for (const op of ['get', 'set', 'touch', 'destroy']) {
+      sess[op] = perfSession[op][0];
+      sess[op + 'Ms'] = Math.round(perfSession[op][1]);
+      perfSession[op][0] = 0; perfSession[op][1] = 0;
+    }
+    console.log(JSON.stringify({
+      t: 'perf.loop',
+      elu: Number(elu.utilization.toFixed(3)),        // 1.0 に近いほどループが詰まっている
+      d50: Math.round(eld.percentile(50) / 1e6),
+      d95: Math.round(eld.percentile(95) / 1e6),      // p95 遅延(ms)が跳ねる時間帯=ブロック発生
+      d99: Math.round(eld.percentile(99) / 1e6),
+      rssMb: Math.round(mem.rss / 1048576),
+      heapMb: Math.round(mem.heapUsed / 1048576),
+      extMb: Math.round((mem.external || 0) / 1048576),
+      sess,                                            // セッションストア get/set/touch の件数と合計ms
+    }));
+    eld.reset();
+  }, PERF_LOOP_MS);
+  timer.unref?.();
+  console.log(`[perf] monitor started (reqLog>=${PERF_REQ_MS}ms, loopEvery=${PERF_LOOP_MS}ms)`);
+}
+if (PERF_ON) {
+  app.use((req, res, next) => {
+    const start = performance.now();
+    req._perf = { start, sessionMs: 0 };
+    res.on('finish', () => {
+      const totalMs = performance.now() - start;
+      if (totalMs >= PERF_REQ_MS) {
+        const len = Number(res.getHeader('content-length'));
+        console.log(JSON.stringify({
+          t: 'perf.req',
+          m: req.method,
+          path: perfSafePath((req.baseUrl || '') + (req.path || '')),
+          s: res.statusCode,
+          totalMs: Math.round(totalMs),
+          sessionMs: Math.round(req._perf.sessionMs),   // session load(get) の所要。書込は perf.loop.sess を見る
+          bytes: Number.isFinite(len) ? len : null,
+        }));
+      }
+    });
+    next();
+  });
+}
+
 app.use(express.urlencoded({ extended: true }));
 // グローバル JSON parser (10MB)。ただし大容量受信が必要な endpoint は除外。
 // 除外対象 endpoint は route 側で独自の parser (例: 50MB) を定義する。
@@ -186,8 +289,8 @@ try {
   console.warn('[session-store] WAL 設定スキップ:', e.message);
 }
 
-app.use(session({
-  store: new SQLiteStore({ db: 'sessions.db', dir: DATA_DIR }),
+const sessionMiddleware = session({
+  store: wrapSessionStore(new SQLiteStore({ db: 'sessions.db', dir: DATA_DIR })),
   secret: SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
@@ -197,7 +300,19 @@ app.use(session({
     secure: true,
     sameSite: 'lax',
   }
-}));
+});
+// [perf] PERF_LOG=1 のときはセッションストア読込(store.get)の所要時間を計測。
+// connect-sqlite3 はネットワークディスク上の sessions.db を全リクエストで読むため、
+// ここが遅いと「どのページでも常に重い」の主因になりうる（Codex 本命仮説の検証）。
+app.use(PERF_ON
+  ? (req, res, next) => {
+      const s = performance.now();
+      sessionMiddleware(req, res, (err) => {
+        if (req._perf) req._perf.sessionMs = performance.now() - s;
+        next(err);
+      });
+    }
+  : sessionMiddleware);
 
 // --- 認証ミドルウェア ---
 // /api/ パスへの未認証アクセスはHTMLリダイレクトではなくJSONで401/403を返す
@@ -993,6 +1108,9 @@ bootStart('web', 'express-listen');
 app.listen(PORT, () => {
   bootEnd('web', 'express-listen', `port=${PORT}`);
   console.log(`B-Faith Portal running at http://localhost:${PORT}`);
+
+  // [perf] イベントループ遅延 / メモリ推移の定期計測（PERF_LOG=1 のときのみ）
+  try { startPerfMonitor(); } catch (e) { console.warn('[perf] monitor 起動スキップ:', e.message); }
 
   try {
     startPythonBackend();
