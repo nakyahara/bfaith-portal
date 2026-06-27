@@ -1546,8 +1546,14 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
         try {
           const base = process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`;
           const pdfUrl = annotate.ok ? `${base}/print/picking/${runId}/pdf` : null;
-          // ⑤ FBA納品プランURL (http(s)のみ採用、それ以外は無視)。Notion URL_1/URL_2 に設定。
-          const httpOnly = (v) => /^https?:\/\//i.test(String(v || '').trim()) ? String(v).trim() : null;
+          // ⑤ FBA納品プランURL。new URL で http(s)+ホスト名を厳密検証し、不正URLはNotionへ送らない
+          // (不正値でNotion /pages が400→カード作成自体が失敗するのを防ぐ, Codex Medium)。
+          const httpOnly = (v) => {
+            const s = String(v || '').trim();
+            if (!s) return null;
+            try { const u = new URL(s); return (u.protocol === 'http:' || u.protocol === 'https:') && u.hostname ? s : null; }
+            catch { return null; }
+          };
           const plan1Url = httpOnly(req.body?.plan1_url);
           const plan2Url = httpOnly(req.body?.plan2_url);
           const card = await createPickingCard({ title, pdfUrl, plan1Url, plan2Url });
