@@ -19,6 +19,7 @@ import crypto from 'crypto';
 import { evaluateItemForPublish } from './publish-pipeline.js';
 import { callEditItem, YahooProxyError } from '../lib/yahoo-publish-proxy.js';
 import { uploadRakutenImagesToYahoo } from '../lib/image-uploader.js';
+import { validateYahooEditItemFields, YahooFieldValidationError } from '../lib/yahoo-edititem-validator.js';
 
 const ALLOWED_STATUSES = new Set(['in_progress', 'success', 'failed', 'not_implemented']);
 
@@ -157,6 +158,19 @@ function dedupeResponse(existing, idempotencyKey) {
  */
 async function performRealPublish({ rakutenImages, fields, itemCode, customPatterns = [] }) {
   if (!fields) throw new Error('performRealPublish: fields required');
+
+  // 0. editItem preflight (Codex Phase E editItem R2): 画像 upload より前に
+  //    Yahoo 仕様 (explanation 500字、 caption 5000字、 item_code 形式等) を fail-closed で検証。
+  //    Yahoo HTTP 400 を表面化前に止めて、 画像 upload 後の editItem 失敗 (リソース無駄遣い)
+  //    を防ぐ。
+  try {
+    validateYahooEditItemFields(fields);
+  } catch (e) {
+    if (e instanceof YahooFieldValidationError) {
+      throw new Error(`editItem_preflight_failed: ${e.message}`);
+    }
+    throw e;
+  }
 
   // 1. 画像 upload — Phase E-8: customPatterns で楽天ファイル名除外も反映
   const imageResult = await uploadRakutenImagesToYahoo({
