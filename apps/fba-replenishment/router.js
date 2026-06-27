@@ -1398,6 +1398,19 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
     // ③ トータルピッキングリストPDF (TMP1) は必須。
     if (!files.tmp1?.[0]) return res.status(400).json({ error: 'トータルピッキングリストPDF(TMP1)をアップロードしてください' });
 
+    // ① FBA納品プラン1/2 URL は必須。new URL で http(s)+ホスト名を厳密検証 (不正URLは Notion /pages 400 の原因)。
+    const httpUrl = (v) => {
+      const s = String(v || '').trim();
+      if (!s) return null;
+      try { const u = new URL(s); return (u.protocol === 'http:' || u.protocol === 'https:') && u.hostname ? s : null; }
+      catch { return null; }
+    };
+    const plan1Url = httpUrl(req.body?.plan1_url);
+    const plan2Url = httpUrl(req.body?.plan2_url);
+    if (!plan1Url || !plan2Url) {
+      return res.status(400).json({ error: 'FBA納品プラン1・プラン2のURL(http/https)を入力してください' });
+    }
+
     // マッピング (fail-closed)
     let mappingMap;
     try {
@@ -1546,18 +1559,9 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
         try {
           const base = process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`;
           const pdfUrl = annotate.ok ? `${base}/print/picking/${runId}/pdf` : null;
-          // ⑤ FBA納品プランURL。new URL で http(s)+ホスト名を厳密検証し、不正URLはNotionへ送らない
-          // (不正値でNotion /pages が400→カード作成自体が失敗するのを防ぐ, Codex Medium)。
-          const httpOnly = (v) => {
-            const s = String(v || '').trim();
-            if (!s) return null;
-            try { const u = new URL(s); return (u.protocol === 'http:' || u.protocol === 'https:') && u.hostname ? s : null; }
-            catch { return null; }
-          };
-          const plan1Url = httpOnly(req.body?.plan1_url);
-          const plan2Url = httpOnly(req.body?.plan2_url);
+          // ① FBA納品プランURL (冒頭で必須検証済み) を Notion URL_1/URL_2 に設定。
           const card = await createPickingCard({ title, pdfUrl, plan1Url, plan2Url });
-          notion = { attempted: true, ok: true, title, url: card.url, attached: !!pdfUrl, commentAdded: card.commentAdded, statusSet: card.statusSet };
+          notion = { attempted: true, ok: true, title, url: card.url, attached: !!pdfUrl, statusSet: card.statusSet };
         } catch (e) {
           console.error('[Picking] Notionカード作成失敗:', e);
           notion = { attempted: true, ok: false, title, error: e.message };
