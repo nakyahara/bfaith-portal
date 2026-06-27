@@ -22,7 +22,7 @@
  *
  * スクリプトプロパティ:
  *   ENDPOINT_URL   = https://<render>/apps/mirror/api/pml/published  (実際の mount に合わせる)
- *   READ_TOKEN     = <MIRROR_READ_TOKEN と同じ値>
+ *   READ_TOKEN     = <Render env PML_READ_TOKEN と同じ値> (商品管理リスト専用トークン)
  *   SPREADSHEET_ID = 15L_BU6WrXNX8aMblTs4yBqwkDFJOg0oDRKDTRHovLDE
  *   SHEET_NAME     = 商品管理リスト
  *   WRITE_MODE     = dry_run   (検証OKまで dry_run、その後 live)
