@@ -1,21 +1,21 @@
 /**
- * Phase E-11-c: 楽天 genre → Yahoo カテゴリ自動推定。
+ * 楽天 genre → Yahoo カテゴリ自動推定。
  *
- * 設計:
- *   - genre_yahoo_category_mapping から primary mapping を取得
- *   - resolved category + path を返す
- *   - 未学習 genre は null を返して publish-pipeline 側で blocked にする
+ * 設計 (Phase E-12 拡張、 2026-06-27):
+ *   ローカル RYS (Downloads/RakutenYahooSync) 由来の変換表 (migration 015) を統合し、
+ *   多段 fallback で resolve する。
  *
- *   E-11-d で Notion override (`notion_overrides.product_category` / `notion_overrides.path`)
- *   が入った場合は そちらを優先する優先順位:
- *     1. Notion override 値 (中原さん確定値)
- *     2. 学習辞書の primary (自動推定値)
- *     3. null (blocked、 学習要)
+ *   優先順序 (Codex Phase E-12 R1):
+ *     1. Notion override (`notion_overrides.product_category` + `notion_path`)
+ *        中原さんが意図的に片方だけ入れてる場合は fail-closed (notion_partial)
+ *     2. category_manual (genre 単位、 中原さん人手確定済)
+ *     3. category_decisions (overlap 学習、 locked=1 AND ambiguous=0 のみ自動採用)
+ *     4. legacy genre_yahoo_category_mapping (PR #318 由来、 130 件)
+ *     5. null (blocked、 学習要)
  *
- * 提供:
- *   - resolveCategoryAndPath({db, rakutenGenreId, notionOverride?}): {category, path, source}
- *     source: 'notion' | 'learned' | 'unresolved'
- *   - resolveByGenreId(db, genreId): {category, path, sample_count} | null
+ *   yahoo_path 補完:
+ *     - manual/decisions に yahoo_path がなければ category_default_path から引く
+ *     - それでも無ければ category は確定でも path null で blocked
  */
 
 /**
@@ -39,6 +39,72 @@ export function resolveByGenreId(db, genreId, { minSample = null } = {}) {
     `).get(genreId, threshold) || null;
   } catch (_) {
     // migration 013 未適用
+    return null;
+  }
+}
+
+/**
+ * category_manual (中原さん人手確定値) を引く。 yahoo_path NULL なら category_default_path で補完。
+ * migration 015 未適用 (table 無し) の場合は null (silent fallback で legacy へ)。
+ *
+ * Codex R2 medium: silent catch は schema drift / SQL typo も握ってしまうため、
+ *   table 不在 (no such table) は静かに null、 他のエラーは console.warn で可視化。
+ */
+function resolveFromManual(db, genreId) {
+  if (!db || !genreId) return null;
+  try {
+    const row = db.prepare(`
+      SELECT m.yahoo_category_id, m.yahoo_path, m.note,
+             COALESCE(m.yahoo_path, dp.yahoo_path) AS resolved_path
+      FROM category_manual m
+      LEFT JOIN category_default_path dp
+        ON dp.yahoo_category_id = m.yahoo_category_id
+      WHERE m.rakuten_genre_id = ?
+      LIMIT 1
+    `).get(genreId);
+    if (!row || !Number.isFinite(row.yahoo_category_id)) return null;
+    return {
+      category: row.yahoo_category_id,
+      path: row.resolved_path || null,
+      note: row.note,
+    };
+  } catch (e) {
+    if (!/no such table/i.test(e.message || '')) {
+      console.warn(`[category-resolver] resolveFromManual error: ${e.message}`);
+    }
+    return null;
+  }
+}
+
+/**
+ * category_decisions (overlap 学習) を引く。 locked=1 AND ambiguous=0 のみ自動採用。
+ * conditional (locked=0) や ambiguous=1 は採用しない (Codex E-12 R1: conditional は保存のみ)。
+ */
+function resolveFromDecisions(db, genreId) {
+  if (!db || !genreId) return null;
+  try {
+    const row = db.prepare(`
+      SELECT cd.yahoo_category_id, cd.yahoo_path, cd.confidence, cd.sample_count,
+             COALESCE(cd.yahoo_path, dp.yahoo_path) AS resolved_path
+      FROM category_decisions cd
+      LEFT JOIN category_default_path dp
+        ON dp.yahoo_category_id = cd.yahoo_category_id
+      WHERE cd.rakuten_genre_id = ?
+        AND cd.locked = 1
+        AND cd.ambiguous = 0
+      LIMIT 1
+    `).get(genreId);
+    if (!row || !Number.isFinite(row.yahoo_category_id)) return null;
+    return {
+      category: row.yahoo_category_id,
+      path: row.resolved_path || null,
+      confidence: row.confidence,
+      sampleCount: row.sample_count,
+    };
+  } catch (e) {
+    if (!/no such table/i.test(e.message || '')) {
+      console.warn(`[category-resolver] resolveFromDecisions error: ${e.message}`);
+    }
     return null;
   }
 }
@@ -80,13 +146,47 @@ export function resolveCategoryAndPath({ db, rakutenGenreId, notionOverride = nu
       };
     }
   }
-  // 2. 学習辞書 (rakuten_genre_id から primary mapping、 sample 閾値あり)
+  // 2. category_manual (Phase E-12: ローカル RYS 由来の中原さん人手確定値)
+  //   Codex R3 high: hit したのに path 補完できない場合は fail-closed (下位 fallback 禁止)。
+  //   manual の確定カテゴリを legacy 学習で上書きされるのを防ぐ。
+  if (rakutenGenreId) {
+    const manual = resolveFromManual(db, rakutenGenreId);
+    if (manual && Number.isFinite(manual.category)) {
+      if (manual.path) {
+        return { category: manual.category, path: manual.path, source: 'manual', note: manual.note };
+      }
+      return {
+        category: null, path: null,
+        source: 'manual_path_missing',
+        manualCategory: manual.category, manualNote: manual.note,
+      };
+    }
+  }
+  // 3. category_decisions (Phase E-12: ローカル RYS 由来の overlap 学習結果、 locked かつ非 ambiguous のみ)
+  //   Codex R3 high: 同様に hit + path 欠落は fail-closed。
+  if (rakutenGenreId) {
+    const decided = resolveFromDecisions(db, rakutenGenreId);
+    if (decided && Number.isFinite(decided.category)) {
+      if (decided.path) {
+        return {
+          category: decided.category, path: decided.path,
+          source: 'decisions', confidence: decided.confidence, sampleCount: decided.sampleCount,
+        };
+      }
+      return {
+        category: null, path: null,
+        source: 'decisions_path_missing',
+        decisionsCategory: decided.category,
+      };
+    }
+  }
+  // 4. legacy genre_yahoo_category_mapping (PR #318 由来)
   if (rakutenGenreId) {
     const learned = resolveByGenreId(db, rakutenGenreId);
     if (learned && Number.isFinite(learned.category) && learned.path) {
       return { category: learned.category, path: learned.path, source: 'learned', sampleCount: learned.sample_count };
     }
   }
-  // 3. 解決できず
+  // 5. 解決できず
   return { category: null, path: null, source: 'unresolved' };
 }
