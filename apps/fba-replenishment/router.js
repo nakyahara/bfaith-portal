@@ -1390,12 +1390,12 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
     const lzFile = files.lz?.[0];
     if (!lzFile) return res.status(400).json({ error: 'ピッキングリスト(lzpickinglist)CSV が必要です' });
 
-    // ④ 納品予定日 (YYYY-MM-DD) は必須。Notionカード名・公開ナビ表示に使用。
+    // ⑤ 納品予定日 (YYYY-MM-DD) は必須。Notionカード名・公開ナビ表示に使用。
     const deliveryDate = /^\d{4}-\d{2}-\d{2}$/.test(String(req.body?.delivery_date || '').trim())
       ? String(req.body.delivery_date).trim() : null;
     if (!deliveryDate) return res.status(400).json({ error: '納品予定日を入力してください' });
 
-    // ③ トータルピッキングリストPDF (TMP1) は必須。
+    // ④ トータルピッキングリストPDF (TMP1) は必須。
     if (!files.tmp1?.[0]) return res.status(400).json({ error: 'トータルピッキングリストPDF(TMP1)をアップロードしてください' });
 
     // ① FBA納品プラン1/2 URL は必須。new URL で http(s)+ホスト名を厳密検証 (不正URLは Notion /pages 400 の原因)。

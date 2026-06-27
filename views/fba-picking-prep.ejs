@@ -315,10 +315,12 @@ async function syncDodai(force){
 }
 
 async function runProcess(){
-  // ① FBA納品プラン URL (必須)
+  // ① FBA納品プラン URL (必須・http/httpsのURL形式)
   const p1 = document.getElementById('plan1Url');
   const p2 = document.getElementById('plan2Url');
   if (!p1.value.trim() || !p2.value.trim()){ alert('FBA納品プラン1・プラン2のURLを入力してください'); (!p1.value.trim()?p1:p2).focus(); return; }
+  const validHttpUrl = (s)=>{ try{ const u=new URL(s.trim()); return u.protocol==='http:'||u.protocol==='https:'; }catch{ return false; } };
+  if (!validHttpUrl(p1.value) || !validHttpUrl(p2.value)){ alert('FBA納品プランのURLは http:// または https:// から始まる正しいURLを入力してください'); (!validHttpUrl(p1.value)?p1:p2).focus(); return; }
   // ⑤ 納品予定日 (必須)
   const dd = document.getElementById('deliveryDate');
   if (!dd || !dd.value){ alert('納品予定日を入力してください'); if (dd) dd.focus(); return; }
