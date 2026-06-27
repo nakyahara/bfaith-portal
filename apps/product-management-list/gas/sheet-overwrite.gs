@@ -26,6 +26,7 @@
  *   SPREADSHEET_ID = 15L_BU6WrXNX8aMblTs4yBqwkDFJOg0oDRKDTRHovLDE
  *   SHEET_NAME     = 商品管理リスト
  *   WRITE_MODE     = dry_run   (検証OKまで dry_run、その後 live)
+ *   GCHAT_WEBHOOK  = (任意) 失敗時に通知する Google Chat Webhook URL。未設定なら通知なし
  */
 
 var MAX_LAG_DAYS = 2;
@@ -145,10 +146,21 @@ function main() {
     Logger.log('部分上書き完了: ' + resolved.length + '列 × 一致' + matched + '行 (run=' + data.run_id + ')');
   } catch (e) {
     Logger.log('ERROR: ' + e.message);
+    notifyGChat_('🔴 *商品管理リスト シート上書き失敗*\n' + e.message);
     throw e;
   } finally {
     lock.releaseLock();
   }
+}
+
+// 失敗時 GChat 通知 (任意。スクリプトプロパティ GCHAT_WEBHOOK 未設定ならスキップ)。
+// 通知自体の失敗で元エラーを覆い隠さないよう best-effort。
+function notifyGChat_(text) {
+  try {
+    var url = PropertiesService.getScriptProperties().getProperty('GCHAT_WEBHOOK');
+    if (!url) return;
+    UrlFetchApp.fetch(url, { method: 'post', contentType: 'application/json', payload: JSON.stringify({ text: text }), muteHttpExceptions: true });
+  } catch (e2) { Logger.log('GChat通知失敗: ' + e2.message); }
 }
 
 function freshEnough_(asOf) {
