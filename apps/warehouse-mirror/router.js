@@ -2381,9 +2381,23 @@ function requireReadToken(req, res, next) {
   next();
 }
 
+// 商品管理リスト専用の read-only トークン (既存 MIRROR_READ_TOKEN とは分離=権限分離)。
+// Render env PML_READ_TOKEN にのみ置く。未設定なら 503 (fail-closed)、header only。
+function requirePmlReadToken(req, res, next) {
+  const token = process.env.PML_READ_TOKEN;
+  if (!token) {
+    return res.status(503).json({ error: 'pml_read_token_unset' });
+  }
+  const provided = req.headers['x-read-token'];
+  if (!provided || provided !== token) {
+    return res.status(401).json({ error: 'invalid_read_token' });
+  }
+  next();
+}
+
 // ─── GET /api/pml/published ───
 // 商品管理リスト snapshot の published run を GAS 向けに返す read-only endpoint (⑥ GAS が読む)。
-// 認証: x-read-token (MIRROR_READ_TOKEN)。商品管理リスト専用の固定レスポンス (汎用DB読み取りにしない)。
+// 認証: x-read-token (専用 PML_READ_TOKEN)。商品管理リスト専用の固定レスポンス (汎用DB読み取りにしない)。
 // GAS 側ゲート: status='ok' かつ payload_checksum を行から再計算して一致 かつ 鮮度OK のときだけシート上書き。
 //   Cache-Control: no-store。published 無しは 200 + ok:false で返す (呼び出し側で判定)。
 const PML_COLS_OUT = [
@@ -2394,7 +2408,7 @@ const PML_COLS_OUT = [
   '発注ロット単位','推奨保有月数','売価','原価','想定見込み利益','概算利益率',
   '代表商品コード','ロケーションコード','商品分類タグ','登録日',
 ];
-router.get('/api/pml/published', requireReadToken, (req, res) => {
+router.get('/api/pml/published', requirePmlReadToken, (req, res) => {
   res.set('Cache-Control', 'no-store');
   const db = getMirrorDB();
   try {
