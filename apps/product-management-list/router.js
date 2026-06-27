@@ -16,7 +16,7 @@ const router = Router();
 
 // 出力列順 (現スプレッドシート互換 / mirror_pml_snapshot_rows と一致)
 const COLS = [
-  '商品コード', '商品名', '仕入先', '取扱区分', '商品区分', '最終仕入日', '在庫保管日数',
+  '商品コード', '商品名', '仕入先', '取扱区分', '商品区分', '売上分類', '最終仕入日', '在庫保管日数',
   '総在庫数', 'FBA在庫数', 'フリー在庫', '注残数', '引当数', '総在庫数_引当なし',
   '販売数7日_FBA', '販売数7日_FBA以外', '販売数7日_合計',
   '販売数30日_FBA', '販売数30日_FBA以外', '販売数30日_合計',
@@ -70,7 +70,7 @@ router.get('/', (req, res) => {
     : '<span class="b b-f">failed</span>';
 
   const wm = pub ? `NE: ${he(pub.src_ne_products_synced_at)} / 販売: ${he(pub.src_velocity_as_of)} / FBA在庫: ${he(pub.src_fba_business_date)} / 発注設定: ${he(pub.src_reorder_updated_at)}` : '';
-  const numCols = new Set(['在庫保管日数','総在庫数','FBA在庫数','フリー在庫','注残数','引当数','総在庫数_引当なし','販売数7日_FBA','販売数7日_FBA以外','販売数7日_合計','販売数30日_FBA','販売数30日_FBA以外','販売数30日_合計','発注ロット単位','推奨保有月数','売価','原価','想定見込み利益','概算利益率']);
+  const numCols = new Set(['売上分類','在庫保管日数','総在庫数','FBA在庫数','フリー在庫','注残数','引当数','総在庫数_引当なし','販売数7日_FBA','販売数7日_FBA以外','販売数7日_合計','販売数30日_FBA','販売数30日_FBA以外','販売数30日_合計','発注ロット単位','推奨保有月数','売価','原価','想定見込み利益','概算利益率']);
 
   const head = '<tr>' + COLS.map(c => `<th${numCols.has(c) ? ' class="r"' : ''}>${he(c)}</th>`).join('') + '</tr>';
   const body = rows.map(r => '<tr>' + COLS.map(c => `<td${numCols.has(c) ? ' class="r"' : ''}>${he(r[c])}</td>`).join('') + '</tr>').join('');

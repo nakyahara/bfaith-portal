@@ -553,6 +553,7 @@ function createTables() {
     仕入先                TEXT,
     取扱区分              TEXT,
     商品区分              TEXT,
+    売上分類              INTEGER,
     最終仕入日            TEXT,
     在庫保管日数          INTEGER,
     総在庫数              INTEGER,
@@ -585,6 +586,8 @@ function createTables() {
     run_id        TEXT NOT NULL,
     published_at  TEXT NOT NULL
   )`);
+  // 既存テーブルへの列追加 (売上分類=商品管理リストの「商品区分 1自社/2AMC/3仕入」)
+  addColumnIfMissing('product_management_snapshot_rows', '売上分類', 'INTEGER');
 
   // ─── 統合商品マスタ系 ───
 
