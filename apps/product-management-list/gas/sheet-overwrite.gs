@@ -1,41 +1,38 @@
 /**
- * 商品管理リスト 毎朝シート上書き (⑥) — Google Apps Script【部分上書き版】
+ * 商品管理リスト 毎朝シート上書き (⑥) — Google Apps Script【部分上書き / Sheets API版】
  *
  * Render mirror の /api/pml/published を読み、status/checksum/鮮度/件数を検証してから、
  * 既存「商品管理リスト」シートの【指定列だけ】を 商品コード をキーに更新する。
  * 他の列・関数・行レイアウトには一切触れない（行の追加/削除もしない）。
  *
+ * ★書き込みは Advanced Sheets Service (Sheets API) の values.batchUpdate を使う。
+ *   SpreadsheetApp.setValues を列ごとに呼ぶと、数式が多い大きいシートでは毎回フル再計算が走り
+ *   「Service Spreadsheets timed out」になるため、10列を1回のAPI呼び出しでまとめて書く。
+ *   → 事前に「サービス」で Google Sheets API を有効化しておくこと(下記セットアップ)。
+ *
  * 更新する列 (シート見出し → DB項目):
- *   FBA在庫数                 → FBA在庫数
- *   FBA直近7日販売数合計       → 販売数7日_FBA
- *   FBA直近30日販売数合計      → 販売数30日_FBA
- *   FBA以外直近7日販売数合計   → 販売数7日_FBA以外
- *   FBA以外直近30日販売数合計  → 販売数30日_FBA以外
- *   商品名                    → 商品名
- *   仕入先                    → 仕入先
- *   取扱区分                  → 取扱区分
- *   商品区分(1自社/2AMC/3仕入) → 売上分類   ※見出しは「商品区分」で始まる多行セル
- *   推奨保有在庫              → 推奨保有月数
+ *   FBA在庫数 / FBA直近7日販売数合計 / FBA直近30日販売数合計 / FBA以外直近7日販売数合計 /
+ *   FBA以外直近30日販売数合計 / 商品名 / 仕入先 / 取扱区分 / 商品区分(=売上分類) / 推奨保有在庫
  *
- * 安全装置: LockService / WRITE_MODE dry_run|live / checksum(全列再計算)一致 / 鮮度 /
- *   件数一致 / 上書き前バックアップ / 指定列以外は不変 / DBに無い商品コードの行は据え置き。
- *
- * スクリプトプロパティ:
- *   ENDPOINT_URL   = https://<render>/apps/mirror/api/pml/published  (実際の mount に合わせる)
- *   READ_TOKEN     = <Render env PML_READ_TOKEN と同じ値> (商品管理リスト専用トークン)
- *   SPREADSHEET_ID = 15L_BU6WrXNX8aMblTs4yBqwkDFJOg0oDRKDTRHovLDE
- *   SHEET_NAME     = 商品管理リスト
- *   WRITE_MODE     = dry_run   (検証OKまで dry_run、その後 live)
- *   GCHAT_WEBHOOK  = (任意) 失敗時に通知する Google Chat Webhook URL。未設定なら通知なし
+ * セットアップ:
+ *   1) Apps Script 左の「サービス(＋)」→ "Google Sheets API" を追加 (識別子 Sheets)。
+ *   2) スクリプトプロパティ:
+ *      ENDPOINT_URL   = https://<render>/apps/mirror/api/pml/published
+ *      READ_TOKEN     = <Render env PML_READ_TOKEN と同じ値>
+ *      SPREADSHEET_ID = 15L_BU6WrXNX8aMblTs4yBqwkDFJOg0oDRKDTRHovLDE
+ *      SHEET_NAME     = 商品管理リスト
+ *      WRITE_MODE     = dry_run   (検証OKまで dry_run、その後 live)
+ *      GCHAT_WEBHOOK  = (任意) 失敗時通知の Google Chat Webhook URL
  */
 
 var MAX_LAG_DAYS = 2;
 var KEY_HEADER = '商品コード';
-var MIN_ROWS = 1000;          // payload 行数の下限 (全商品base想定。極端に少ない=異常→反映しない)
-var MAX_ROWS = 20000;         // 暴走ガード
-var MIN_MATCH_RATE = 0.5;     // シート行のうち DB と一致した割合の下限 (キー形式ズレ等の検知)
+var MIN_ROWS = 1000;
+var MAX_ROWS = 20000;
+var MIN_MATCH_RATE = 0.5;
+var FETCH_RETRY = 3;          // 一過性 5xx (Render の 502/503/504) のリトライ回数
+var FETCH_RETRY_WAIT_MS = 4000;
 
-// シート見出し(空白/改行除去後) → DB項目。prefix:true は「で始まる」で照合(多行見出し用)。
 var TARGETS = [
   { hdr: 'FBA在庫数',                field: 'FBA在庫数' },
   { hdr: 'FBA直近7日販売数合計',     field: '販売数7日_FBA' },
@@ -61,11 +58,8 @@ function main() {
     var writeMode = props.getProperty('WRITE_MODE') || 'dry_run';
     if (!endpoint || !token || !ssId) throw new Error('スクリプトプロパティ未設定 (ENDPOINT_URL/READ_TOKEN/SPREADSHEET_ID)');
 
-    // 1. 取得
-    var resp = UrlFetchApp.fetch(endpoint, { method: 'get', headers: { 'x-read-token': token }, muteHttpExceptions: true });
-    var code = resp.getResponseCode();
-    if (code !== 200) throw new Error('HTTP ' + code + ': ' + resp.getContentText().slice(0, 200));
-    var data = JSON.parse(resp.getContentText());
+    // 1. 取得 (一過性 5xx はリトライ)
+    var data = fetchPublished_(endpoint, token);
 
     // 2. 検証 (fail-closed)
     if (!data.ok) throw new Error('published なし: ' + (data.reason || ''));
@@ -75,13 +69,13 @@ function main() {
     if (typeof data.row_count !== 'number' || data.row_count !== rows.length || data.actual_row_count !== rows.length) {
       throw new Error('件数不一致 row_count=' + data.row_count + ' actual=' + data.actual_row_count + ' rows=' + rows.length);
     }
-    if (rows.length < MIN_ROWS || rows.length > MAX_ROWS) throw new Error('件数が範囲外: ' + rows.length + ' (' + MIN_ROWS + '〜' + MAX_ROWS + ')');
+    if (rows.length < MIN_ROWS || rows.length > MAX_ROWS) throw new Error('件数が範囲外: ' + rows.length);
     if (!freshEnough_(data.as_of_date)) throw new Error('鮮度NG as_of_date=' + data.as_of_date);
     var recomputed = sha256Hex_(rows.map(function (r) {
       return cols.map(function (c) { return (r[c] === null || r[c] === undefined) ? '' : String(r[c]); }).join('\t');
     }).join('\n'));
-    if (typeof data.payload_checksum !== 'string' || !data.payload_checksum) throw new Error('payload_checksum 欠落 (fail-closed)');
-    if (recomputed !== data.payload_checksum) throw new Error('checksum 不一致 (改ざん/欠落の疑い)');
+    if (typeof data.payload_checksum !== 'string' || !data.payload_checksum) throw new Error('payload_checksum 欠落');
+    if (recomputed !== data.payload_checksum) throw new Error('checksum 不一致');
 
     // 3. DB を 商品コード(小文字) でマップ
     var dbMap = {};
@@ -110,7 +104,7 @@ function main() {
         if (ok && tg.must && header[h].indexOf(tg.must) < 0) ok = false;
         if (ok) hits.push(h);
       }
-      if (hits.length !== 1) throw new Error('見出し「' + tg.hdr + '」の一致が ' + hits.length + ' 列 (1列であるべき。誤上書き防止のため中止)');
+      if (hits.length !== 1) throw new Error('見出し「' + tg.hdr + '」の一致が ' + hits.length + ' 列 (1列であるべき。中止)');
       resolved.push({ col: hits[0] + 1, field: tg.field, hdr: tg.hdr });
     }
 
@@ -127,28 +121,33 @@ function main() {
 
     Logger.log('検証OK run=' + data.run_id + ' status=' + data.status + ' as_of=' + data.as_of_date
       + ' / シート行=' + n + ' 一致=' + matched + ' DB未一致(据え置き)=' + unmatchedRows + ' mode=' + writeMode);
-    if (matched === 0) throw new Error('商品コードが1件も一致しない (キー列/大小文字を確認)');
-    if (matched / n < MIN_MATCH_RATE) throw new Error('一致率が低い: ' + matched + '/' + n + ' (< ' + MIN_MATCH_RATE + ')。キー形式ズレ等の疑いで中止');
+    if (matched === 0) throw new Error('商品コードが1件も一致しない');
+    if (matched / n < MIN_MATCH_RATE) throw new Error('一致率が低い: ' + matched + '/' + n);
     if (writeMode !== 'live') { Logger.log('[dry_run] 書き込みスキップ'); return; }
 
-    // 6. 本番反映: 全対象列の現在値を先読み(=バックアップ素材) → 軽量バックアップ → まとめて書く。
-    //    重い copyTo(全シート複製=全数式再計算) は使わない。読み込みを全部先に済ませ書き込みを
-    //    連続させることで数式の再計算回数を最小化 (Spreadsheets timeout 対策)。
+    if (typeof Sheets === 'undefined') {
+      throw new Error('Advanced Sheets Service 未有効。Apps Script 左「サービス(＋)」→ Google Sheets API を追加してください');
+    }
+
+    // 6. 本番反映: 全対象列の現在値を先読み → 軽量バックアップ → Sheets API で1回でまとめ書き。
     var curArrays = [];
     for (var c = 0; c < resolved.length; c++) {
       curArrays[c] = sheet.getRange(2, resolved[c].col, n, 1).getValues();
     }
     backupColumns_(ss, data.as_of_date, resolved, keyVals, curArrays, n);
+
+    var dataReqs = [];
     for (var c2 = 0; c2 < resolved.length; c2++) {
       var arr = curArrays[c2], field = resolved[c2].field;
       for (var rr = 0; rr < n; rr++) {
         var dbr = dbRowForSheetRow[rr];
         if (dbr) { var v = dbr[field]; arr[rr][0] = (v === null || v === undefined) ? '' : v; }
       }
-      sheet.getRange(2, resolved[c2].col, n, 1).setValues(arr);
+      var a1 = colA1_(resolved[c2].col);
+      dataReqs.push({ range: "'" + sheetName + "'!" + a1 + '2:' + a1 + lastRow, values: arr });
     }
-    SpreadsheetApp.flush();
-    Logger.log('部分上書き完了: ' + resolved.length + '列 × 一致' + matched + '行 (run=' + data.run_id + ')');
+    Sheets.Spreadsheets.Values.batchUpdate({ valueInputOption: 'RAW', data: dataReqs }, ssId);
+    Logger.log('部分上書き完了(Sheets API): ' + resolved.length + '列 × 一致' + matched + '行');
   } catch (e) {
     Logger.log('ERROR: ' + e.message);
     notifyGChat_('🔴 *商品管理リスト シート上書き失敗*\n' + e.message);
@@ -158,8 +157,20 @@ function main() {
   }
 }
 
-// 失敗時 GChat 通知 (任意。スクリプトプロパティ GCHAT_WEBHOOK 未設定ならスキップ)。
-// 通知自体の失敗で元エラーを覆い隠さないよう best-effort。
+// /api/pml/published 取得。一過性 5xx (Render 502/503/504) は数秒待ってリトライ。
+function fetchPublished_(endpoint, token) {
+  var lastErr = '';
+  for (var attempt = 1; attempt <= FETCH_RETRY; attempt++) {
+    var resp = UrlFetchApp.fetch(endpoint, { method: 'get', headers: { 'x-read-token': token }, muteHttpExceptions: true });
+    var code = resp.getResponseCode();
+    if (code === 200) return JSON.parse(resp.getContentText());
+    lastErr = 'HTTP ' + code + ': ' + resp.getContentText().slice(0, 150);
+    if (code >= 500 && code < 600 && attempt < FETCH_RETRY) { Utilities.sleep(FETCH_RETRY_WAIT_MS); continue; }
+    break; // 4xx は即中止 (トークン違い等、待っても直らない)
+  }
+  throw new Error(lastErr);
+}
+
 function notifyGChat_(text) {
   try {
     var url = PropertiesService.getScriptProperties().getProperty('GCHAT_WEBHOOK');
@@ -177,8 +188,14 @@ function freshEnough_(asOf) {
   return lag >= 0 && lag <= MAX_LAG_DAYS;
 }
 
+// 列番号(1始まり) → A1 列記号 (例 1→A, 27→AA)
+function colA1_(col) {
+  var s = '';
+  while (col > 0) { var m = (col - 1) % 26; s = String.fromCharCode(65 + m) + s; col = Math.floor((col - 1) / 26); }
+  return s;
+}
+
 // 軽量バックアップ: 商品コード + 対象列の「現在値」だけを隠しシートに退避。
-// 全シート複製(copyTo)は対象シートの数式が多いと全再計算で重くタイムアウトするため使わない。
 function backupColumns_(ss, asOf, resolved, keyVals, curArrays, n) {
   var name = '_pmlbak_' + (asOf || Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyyMMdd'));
   var old = ss.getSheetByName(name);
