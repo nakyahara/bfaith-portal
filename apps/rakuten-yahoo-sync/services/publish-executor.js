@@ -20,6 +20,8 @@ import { evaluateItemForPublish } from './publish-pipeline.js';
 import { callEditItem, YahooProxyError } from '../lib/yahoo-publish-proxy.js';
 import { uploadRakutenImagesToYahoo } from '../lib/image-uploader.js';
 import { validateYahooEditItemFields, YahooFieldValidationError } from '../lib/yahoo-edititem-validator.js';
+import { extractRakutenImageUrls } from '../lib/yahoo-image-extract.js';
+import { rewriteAndSanitizeYahooHtml, YahooHtmlRewriteError } from '../lib/yahoo-html-image-rewriter.js';
 
 const ALLOWED_STATUSES = new Set(['in_progress', 'success', 'failed', 'not_implemented']);
 
@@ -42,14 +44,21 @@ export function isPublishEnabled() {
   return String(process.env.RYS_PUBLISH_ENABLED || '0').trim() === '1';
 }
 
+// Codex Phase E image-html R2 H-3: publish logic 改訂時に古い success record と
+// 同じ key にならないよう version を必ず混ぜる。 次の破壊的改訂で v3 に上げる。
+export const IDEMPOTENCY_VERSION = 'rewrite_v2';
+
 /**
  * idempotency_key 生成 (caller が override 可能、 ない場合は deterministic に組み立て)。
- *   key = sha256(item_code + manage_number + isoDate(scope) + extraSalt)
+ *   key = sha256(IDEMPOTENCY_VERSION + item_code + manage_number + isoDate(scope) + extraSalt)
+ *
+ * Codex Phase E image-html R2 H-3: IDEMPOTENCY_VERSION を seed に含めることで、 logic 変更後の
+ * 再 publish が古い success record に dedupe で吸収されない。
  */
 export function buildIdempotencyKey({ itemCode, manageNumber, scope = 'day', extraSalt = '', isoDate = null }) {
   if (!itemCode) throw new Error('buildIdempotencyKey: itemCode required');
   const date = isoDate || new Date().toISOString().slice(0, 10);
-  const seed = [itemCode, manageNumber || '', scope, date, extraSalt].join('|');
+  const seed = [IDEMPOTENCY_VERSION, itemCode, manageNumber || '', scope, date, extraSalt].join('|');
   return crypto.createHash('sha256').update(seed, 'utf8').digest('hex');
 }
 
@@ -156,13 +165,11 @@ function dedupeResponse(existing, idempotencyKey) {
  *   2. editItem を form-encoded で叩いて商品登録 (fields.display=1 で公開)
  *   失敗時は throw (caller が CAS finalize で 'failed' に倒す)
  */
-async function performRealPublish({ rakutenImages, fields, itemCode, customPatterns = [] }) {
+async function performRealPublish({ rakutenImages, fields, itemCode, customPatterns = [], rakutenItem = null }) {
   if (!fields) throw new Error('performRealPublish: fields required');
 
-  // 0. editItem preflight (Codex Phase E editItem R2): 画像 upload より前に
+  // 0. editItem preflight 仮版 (Codex Phase E editItem R2): 画像 upload より前に
   //    Yahoo 仕様 (explanation 500字、 caption 5000字、 item_code 形式等) を fail-closed で検証。
-  //    Yahoo HTTP 400 を表面化前に止めて、 画像 upload 後の editItem 失敗 (リソース無駄遣い)
-  //    を防ぐ。
   try {
     validateYahooEditItemFields(fields);
   } catch (e) {
@@ -172,21 +179,69 @@ async function performRealPublish({ rakutenImages, fields, itemCode, customPatte
     throw e;
   }
 
-  // 1. 画像 upload — Phase E-8: customPatterns で楽天ファイル名除外も反映
+  // 1. 説明文画像 URL 抽出 (PC/SP)
+  //    Codex Phase E image-html R2 medium: PC/SP まとめて + dedupe suffix 一貫割当
+  const salesDescriptionHtml = rakutenItem?.salesDescription || '';
+  const spDescriptionHtml = rakutenItem?.productDescription?.sp || '';
+  const descUrlsRaw = [
+    ...extractRakutenImageUrls(salesDescriptionHtml),
+    ...extractRakutenImageUrls(spDescriptionHtml),
+  ];
+  const descUrlsDeduped = [...new Set(descUrlsRaw)]; // 順序保持で dedupe
+
+  // 2. 画像 upload (main + desc 統合、 fail-closed)
   const imageResult = await uploadRakutenImagesToYahoo({
     rakutenImages: rakutenImages || [],
     itemCode,
     customPatterns,
+    descriptionImageUrls: descUrlsDeduped,
   });
-  if (imageResult.uploaded === 0) {
-    throw new Error(`image_upload_zero: failed=${imageResult.failed}, errors=${imageResult.errors.join('; ')}`);
+
+  // 3. additional1 / sp_additional を 楽天 URL → Yahoo CDN URL に rewrite + sanitize
+  //    Codex Phase E image-html R2: immutable な rewrittenFields を新規 construct
+  let rewrittenAdditional1, rewrittenSpAdditional;
+  try {
+    rewrittenAdditional1 = rewriteAndSanitizeYahooHtml(salesDescriptionHtml, imageResult.urlMap, {
+      allowedYahooHosts: imageResult.allowedYahooHosts,
+      excludedRakutenUrls: imageResult.excludedRakutenUrls,
+    });
+    rewrittenSpAdditional = rewriteAndSanitizeYahooHtml(spDescriptionHtml, imageResult.urlMap, {
+      allowedYahooHosts: imageResult.allowedYahooHosts,
+      excludedRakutenUrls: imageResult.excludedRakutenUrls,
+    });
+  } catch (e) {
+    if (e instanceof YahooHtmlRewriteError) {
+      throw new Error(`image_html_rewrite_failed: ${e.message}`);
+    }
+    throw e;
   }
 
-  // 2. editItem (form-encoded) — fields は publish-pipeline で組み立て済
-  const editResult = await callEditItem(fields);
+  const rewrittenFields = {
+    ...fields,
+    additional1: rewrittenAdditional1,
+    sp_additional: rewrittenSpAdditional,
+  };
+
+  // 4. editItem preflight 確定 (rewrite 後の長さ + img host check)
+  try {
+    validateYahooEditItemFields(rewrittenFields, { allowedImgHosts: imageResult.allowedYahooHosts });
+  } catch (e) {
+    if (e instanceof YahooFieldValidationError) {
+      throw new Error(`editItem_preflight_failed_post_rewrite: ${e.message}`);
+    }
+    throw e;
+  }
+
+  // 5. editItem (form-encoded) — rewrittenFields を送信
+  const editResult = await callEditItem(rewrittenFields);
   return {
-    images: imageResult,
+    images: {
+      uploaded: imageResult.uploaded,
+      mainCount: imageResult.urlMap?.size || 0,
+      yahooHosts: imageResult.allowedYahooHosts,
+    },
     editItem: { status: editResult.status, bodyPreview: String(editResult.body).slice(0, 300) },
+    fields: rewrittenFields,
   };
 }
 
@@ -399,6 +454,7 @@ export async function executePublish({
         fields: evalResult.fields,
         itemCode,
         customPatterns: evalResult.debug?.customImagePatterns || [],
+        rakutenItem: evalResult.debug?.rakutenItem || null,
       });
     } catch (e) {
       const errMsg = e instanceof YahooProxyError ? `yahoo_proxy: ${e.message}` : (e.message || String(e));

@@ -218,6 +218,10 @@ export async function evaluateItemForPublish({
       rakutenImages: rakutenItem.images || [],
       // Phase E-8: executor が uploadRakutenImagesToYahoo に渡す custom patterns (snapshot)
       customImagePatterns: customPatterns,
+      // Phase E image-html rewrite (2026-06-27): executor が salesDescription /
+      // productDescription.sp の <img src> を Yahoo CDN URL に置換する必要があるため raw item を渡す。
+      // diagnose endpoint 経由で返るのでサイズ警戒: HTML 本体を含むが 1 SKU で数十 KB 程度。
+      rakutenItem,
       // Phase E-11-c: category 解決元 (notion / learned / unresolved / caller) と sample count を debug に残す
       categorySource,
       categorySampleCount,
