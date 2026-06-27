@@ -1581,6 +1581,7 @@ function createTables() {
     仕入先                TEXT,
     取扱区分              TEXT,
     商品区分              TEXT,
+    売上分類              INTEGER,
     最終仕入日            TEXT,
     在庫保管日数          INTEGER,
     総在庫数              INTEGER,
@@ -1625,6 +1626,8 @@ function createTables() {
     published_at              TEXT,
     synced_at                 TEXT NOT NULL
   )`);
+  // 既存テーブルへの列追加 (売上分類=商品管理リストの「商品区分 1自社/2AMC/3仕入」)
+  addColumnIfMissing('mirror_pml_snapshot_rows', '売上分類', 'INTEGER');
 
   // ---- biz-ops-overview: 全モール売上日次統合 view (2026-05-19 PR #156)
   db.exec('DROP VIEW IF EXISTS v_mall_sales_daily_unified');

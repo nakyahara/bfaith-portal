@@ -406,7 +406,7 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
     if (req.body.pml_snapshot && typeof req.body.pml_snapshot === 'object') {
       const p = req.body.pml_snapshot;
       const PML_COLS = [
-        '商品コード','商品名','仕入先','取扱区分','商品区分','最終仕入日','在庫保管日数',
+        '商品コード','商品名','仕入先','取扱区分','商品区分','売上分類','最終仕入日','在庫保管日数',
         '総在庫数','FBA在庫数','フリー在庫','注残数','引当数','総在庫数_引当なし',
         '販売数7日_FBA','販売数7日_FBA以外','販売数7日_合計',
         '販売数30日_FBA','販売数30日_FBA以外','販売数30日_合計',
@@ -2387,7 +2387,7 @@ function requireReadToken(req, res, next) {
 // GAS 側ゲート: status='ok' かつ payload_checksum を行から再計算して一致 かつ 鮮度OK のときだけシート上書き。
 //   Cache-Control: no-store。published 無しは 200 + ok:false で返す (呼び出し側で判定)。
 const PML_COLS_OUT = [
-  '商品コード','商品名','仕入先','取扱区分','商品区分','最終仕入日','在庫保管日数',
+  '商品コード','商品名','仕入先','取扱区分','商品区分','売上分類','最終仕入日','在庫保管日数',
   '総在庫数','FBA在庫数','フリー在庫','注残数','引当数','総在庫数_引当なし',
   '販売数7日_FBA','販売数7日_FBA以外','販売数7日_合計',
   '販売数30日_FBA','販売数30日_FBA以外','販売数30日_合計',

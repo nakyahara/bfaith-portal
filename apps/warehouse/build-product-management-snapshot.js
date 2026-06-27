@@ -42,7 +42,7 @@ function r1(n) { return n == null ? null : Math.round(n * 10) / 10; }
 
 // 列順を固定 (checksum / 出力で一貫)。snapshot_rows の列と一致させる。
 const COLUMNS = [
-  '商品コード', '商品名', '仕入先', '取扱区分', '商品区分', '最終仕入日', '在庫保管日数',
+  '商品コード', '商品名', '仕入先', '取扱区分', '商品区分', '売上分類', '最終仕入日', '在庫保管日数',
   '総在庫数', 'FBA在庫数', 'フリー在庫', '注残数', '引当数', '総在庫数_引当なし',
   '販売数7日_FBA', '販売数7日_FBA以外', '販売数7日_合計',
   '販売数30日_FBA', '販売数30日_FBA以外', '販売数30日_合計',
@@ -95,7 +95,7 @@ export async function buildProductManagementSnapshot() {
   const params = fbaBizDate ? [fbaBizDate] : [];
   const srcRows = db.prepare(`
     SELECT
-      m.商品コード, m.商品名, m.取扱区分, m.商品区分,
+      m.商品コード, m.商品名, m.取扱区分, m.商品区分, m.売上分類,
       m.標準売価 AS 売価, m.原価, m.送料,
       COALESCE(ne.仕入先コード, m.仕入先コード) AS 仕入先,
       ne.最終仕入日, ne.在庫数 AS 自社在庫, ne.引当数, ne.発注残数 AS 注残数,
@@ -120,7 +120,7 @@ export async function buildProductManagementSnapshot() {
     const profit = (s.売価 != null && s.原価 != null) ? s.売価 - s.原価 - (s.送料 ?? 0) : null;
     const margin = (profit != null && s.売価 != null && s.売価 !== 0) ? r1((profit / s.売価) * 100) : null;
     return {
-      商品コード: s.商品コード, 商品名: s.商品名, 仕入先: s.仕入先, 取扱区分: s.取扱区分, 商品区分: s.商品区分,
+      商品コード: s.商品コード, 商品名: s.商品名, 仕入先: s.仕入先, 取扱区分: s.取扱区分, 商品区分: s.商品区分, 売上分類: s.売上分類 ?? null,
       最終仕入日: s.最終仕入日 || null,
       在庫保管日数: daysBetween(s.最終仕入日, today),
       総在庫数: total, FBA在庫数: fba, フリー在庫: own - alloc, 注残数: s.注残数 ?? 0, 引当数: alloc,
