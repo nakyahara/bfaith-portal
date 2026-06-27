@@ -15,6 +15,7 @@
  *   editItem 厳格仕様の `^[A-Za-z0-9-]{1,80}$` に寄せ、 uploadItemImage 経路で通ったが
  *   editItem で落ちる SKU を事前検知する。
  */
+import * as cheerio from 'cheerio';
 import { yahooTextUnits } from './yahoo-text.js';
 
 const LIMITS_UNITS = {
@@ -45,7 +46,53 @@ export class YahooFieldValidationError extends Error {
   }
 }
 
-export function validateYahooEditItemFields(fields) {
+/**
+ * additional1 / sp_additional / caption 内に img タグがあり、 src の host が
+ * allowedHosts に含まれていなければ throw (Codex Phase E image-html R3: 楽天直リンク残存防止)。
+ *
+ * @param {object} fields
+ * @param {string[]} allowedHosts hostname (lower-case) のリスト
+ */
+function checkImgHostInHtmlFields(fields, allowedHosts) {
+  if (!Array.isArray(allowedHosts) || allowedHosts.length === 0) return;
+  const allowedSet = new Set(allowedHosts.map((h) => String(h).trim().toLowerCase()).filter(Boolean));
+  const HTML_FIELDS_TO_CHECK = ['additional1', 'sp_additional', 'caption'];
+  for (const k of HTML_FIELDS_TO_CHECK) {
+    const v = fields[k];
+    if (v == null || v === '') continue;
+    const $ = cheerio.load(`<root>${String(v)}</root>`, { decodeEntities: true });
+    $('img').each((_, el) => {
+      const src = el.attribs?.src;
+      if (!src) {
+        throw new YahooFieldValidationError(k, `img without src`);
+      }
+      try {
+        const u = new URL(src);
+        if (u.protocol !== 'https:') {
+          throw new YahooFieldValidationError(k, `img src must be https: ${src}`);
+        }
+        if (!allowedSet.has(u.hostname.toLowerCase())) {
+          throw new YahooFieldValidationError(
+            k,
+            `img src host not allowed: ${u.hostname} (allowed: ${[...allowedSet].join(', ')})`,
+            { value: src }
+          );
+        }
+      } catch (e) {
+        if (e instanceof YahooFieldValidationError) throw e;
+        throw new YahooFieldValidationError(k, `img src parse failed: ${src}`);
+      }
+    });
+  }
+}
+
+/**
+ * @param {object} fields
+ * @param {object} [opts]
+ * @param {string[]} [opts.allowedImgHosts]
+ *   指定時は additional1/sp_additional/caption 内の img src を host check (fail-closed)。
+ */
+export function validateYahooEditItemFields(fields, opts = {}) {
   if (!fields || typeof fields !== 'object') {
     throw new YahooFieldValidationError('_root', 'fields must be object');
   }
@@ -91,5 +138,10 @@ export function validateYahooEditItemFields(fields) {
         throw new YahooFieldValidationError('path', `segment too long (> ${PATH_SEGMENT_MAX_UNITS} units = 全角 ${PATH_SEGMENT_MAX_UNITS / 2}): ${s}`);
       }
     }
+  }
+
+  // additional1 / sp_additional / caption の img host check (allowedImgHosts 指定時のみ)
+  if (Array.isArray(opts.allowedImgHosts) && opts.allowedImgHosts.length > 0) {
+    checkImgHostInHtmlFields(fields, opts.allowedImgHosts);
   }
 }

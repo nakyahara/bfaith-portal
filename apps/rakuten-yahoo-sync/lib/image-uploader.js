@@ -10,7 +10,7 @@
 
 import sharp from 'sharp';
 import { filterUploadableImageUrls } from './yahoo-image.js';
-import { callUploadItemImage, YahooProxyError } from './yahoo-publish-proxy.js';
+import { callUploadItemImage } from './yahoo-publish-proxy.js';
 
 const DEFAULT_DOWNLOAD_TIMEOUT_MS = 20_000;
 const MAX_BYTES = 2 * 1024 * 1024;
@@ -53,17 +53,84 @@ export function normalizeRakutenImageUrl(loc, { shopSlug = null } = {}) {
   return null;
 }
 
-async function downloadImage(url, timeoutMs = DEFAULT_DOWNLOAD_TIMEOUT_MS) {
+// R6 H-1: redirect SSRF 防御 — fetch のデフォルト follow は危険なので manual + hop 毎再検証。
+// R6 H-2: download body 上限 — JPEG 変換前の raw bytes も cap (sharp 入力で memory DoS 防止)。
+const DOWNLOAD_MAX_REDIRECTS = 3;
+const DOWNLOAD_RAW_MAX_BYTES = 16 * 1024 * 1024; // 圧縮前の raw 画像は 2MB target だが余裕で 16MB cap
+
+async function downloadImage(initialUrl, timeoutMs = DEFAULT_DOWNLOAD_TIMEOUT_MS) {
+  let url = initialUrl;
   let res;
-  try {
-    res = await fetch(url, { method: 'GET', signal: AbortSignal.timeout(timeoutMs) });
-  } catch (e) {
-    throw new ImageUploadError(`download network/timeout: ${e.message}`, { url, cause: e });
+  for (let hop = 0; hop <= DOWNLOAD_MAX_REDIRECTS; hop += 1) {
+    if (!isAllowedDownloadUrl(url)) {
+      throw new ImageUploadError(
+        `download host not allowed (SSRF guard hop=${hop}): ${url}`, { url }
+      );
+    }
+    try {
+      res = await fetch(url, {
+        method: 'GET',
+        redirect: 'manual',
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch (e) {
+      throw new ImageUploadError(`download network/timeout: ${e.message}`, { url, cause: e });
+    }
+    // 3xx → Location を絶対 URL 化して再 check
+    if (res.status >= 300 && res.status < 400) {
+      const loc = res.headers.get('location');
+      if (!loc) {
+        throw new ImageUploadError(`download HTTP ${res.status} without Location`, { url });
+      }
+      try {
+        url = new URL(loc, url).toString();
+      } catch (_) {
+        throw new ImageUploadError(`download redirect to invalid Location: ${loc}`, { url });
+      }
+      continue;
+    }
+    break;
+  }
+  if (!res || res.status >= 300) {
+    throw new ImageUploadError(
+      `download HTTP ${res?.status || '?'} after ${DOWNLOAD_MAX_REDIRECTS} hops`, { url }
+    );
   }
   if (!res.ok) {
     throw new ImageUploadError(`download HTTP ${res.status}`, { url });
   }
-  return Buffer.from(await res.arrayBuffer());
+  // R6 H-2: Content-Length 事前拒否
+  const cl = res.headers.get('content-length');
+  if (cl) {
+    const n = Number(cl);
+    if (Number.isFinite(n) && n > DOWNLOAD_RAW_MAX_BYTES) {
+      throw new ImageUploadError(
+        `download body too large: Content-Length ${n} > ${DOWNLOAD_RAW_MAX_BYTES}`, { url }
+      );
+    }
+  }
+  // streaming で読み、 cap 超過したら abort
+  if (!res.body) {
+    throw new ImageUploadError(`download no body`, { url });
+  }
+  const reader = res.body.getReader();
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) {
+      total += value.length;
+      if (total > DOWNLOAD_RAW_MAX_BYTES) {
+        try { reader.cancel(); } catch (_) {}
+        throw new ImageUploadError(
+          `download body too large: ${total} > ${DOWNLOAD_RAW_MAX_BYTES} (streaming cap)`, { url }
+        );
+      }
+      chunks.push(value);
+    }
+  }
+  return Buffer.concat(chunks.map((c) => Buffer.from(c)));
 }
 
 async function toJpegUnderLimit(rawBuffer, { maxBytes = MAX_BYTES } = {}) {
@@ -113,63 +180,160 @@ function imageFileName(itemCode, index) {
   return `${itemCode}_${index}.jpg`;
 }
 
+// Codex Phase E image-html R2 H-2 + R3 H-1: suffix 割当 + 上限を明文化
+//   main[0]    → `{itemCode}.jpg`
+//   main[1..9] → `{itemCode}_1.jpg` 〜 `{itemCode}_9.jpg`   (main は最大 10 枚)
+//   desc[0..10] → `{itemCode}_10.jpg` 〜 `{itemCode}_20.jpg` (desc は最大 11 枚)
+//   合計: base + _1..20 = 21 枚 cap (Yahoo 仕様)
+const MAIN_MAX = 10;
+const DESC_MAX = 11;
+const DESC_SUFFIX_START = 10;
+
+// Codex Phase E image-html R5 H-1: SSRF 防御. download 対象は **https: + 楽天 host のみ**。
+//   楽天 cabinet 画像は `image.rakuten.co.jp` か `*.r10s.jp` ドメイン。
+//   外部 URL や内部向け (localhost / 169.254.169.254 等) は弾く。
+const ALLOWED_DOWNLOAD_HOSTS_SUFFIX = ['.rakuten.co.jp', '.r10s.jp'];
+
+function isAllowedDownloadUrl(url) {
+  if (typeof url !== 'string') return false;
+  let u;
+  try { u = new URL(url); } catch (_) { return false; }
+  if (u.protocol !== 'https:') return false;
+  const host = u.hostname.toLowerCase();
+  // hostname が rakuten.co.jp / r10s.jp の subdomain か exact match
+  return ALLOWED_DOWNLOAD_HOSTS_SUFFIX.some((suffix) => {
+    const s = suffix.startsWith('.') ? suffix.slice(1) : suffix;
+    return host === s || host.endsWith(suffix);
+  });
+}
+
 /**
- * 楽天 images[] → filter → download → JPEG 変換 → uploadItemImage (順次)。
+ * 楽天 images[] (メイン画像) + 説明文画像 URL list (salesDescription/productDescription.sp 由来) を
+ * 統合 upload して、 楽天 URL → Yahoo CDN URL の map と Yahoo CDN hostname allowlist を返す。
+ *
+ * 設計 (Codex Phase E image-html R1-R3 stop, fail-closed):
+ *   - main は images[] (filter + normalize) 先頭 10 枚まで、 `{itemCode}.jpg` + `_1..9`
+ *   - desc は descriptionImageUrls (normalize 済を期待) - main 重複排除 後 11 枚まで、 `_10..20`
+ *   - 上限超過 → throw (publish 停止、 中原さんが楽天で画像減らす)
+ *   - upload 1 件失敗 → throw (旧 fallback の `<br>` 化は禁止: R1 H-1)
+ *   - Yahoo response の <ModeA> から URL を抽出して urlMap に積む
  *
  * @param {object} args
- * @param {Array} args.rakutenImages 楽天 raw images 配列 (location 含む)
- * @param {string} args.itemCode     Yahoo item_code (= 楽天 itemNumber)
- * @param {number} [args.maxImages=10] 最大 upload 枚数 (Yahoo 1 商品の上限を超えないため、 安全側)
- * @param {string[]} [args.customPatterns=[]] image_exclusion_patterns 由来のユーザー追加パターン
- * @returns {Promise<{uploaded: number, failed: number, errors: string[]}>}
+ * @param {Array}    args.rakutenImages          楽天 images[] (`{location, alt, type}` 配列)
+ * @param {string}   args.itemCode               Yahoo item_code
+ * @param {string[]} [args.customPatterns=[]]    image_exclusion_patterns
+ * @param {string[]} [args.descriptionImageUrls=[]] salesDescription/productDescription.sp から
+ *                                                抽出済の normalize 済楽天 URL (PC/SP 統合 dedupe 後)
+ * @returns {Promise<{uploaded, urlMap: Map<string,string>, allowedYahooHosts: string[], errors}>}
  */
-export async function uploadRakutenImagesToYahoo({ rakutenImages, itemCode, maxImages = 10, customPatterns = [] } = {}) {
+export async function uploadRakutenImagesToYahoo({
+  rakutenImages,
+  itemCode,
+  customPatterns = [],
+  descriptionImageUrls = [],
+} = {}) {
   if (!itemCode) throw new ImageUploadError('itemCode is required');
+
+  // 1. main 画像: filter + normalize + dedupe + host check (順序保持)
+  //    R5 H-1: 楽天 host 以外の URL は弾く (SSRF 防御)
   const filtered = filterUploadableImageUrls(rakutenImages, { customPatterns });
-  if (filtered.length === 0) {
-    return { uploaded: 0, failed: 0, errors: ['no_uploadable_image_after_filter'] };
-  }
-  // 楽天 RMS の location は相対パスで返ることがあるので host 補完してから download。
-  // normalize で null になったもの (= 不正 URL) は除外し、 errors に残す。
-  const normalized = [];
-  const normalizeErrors = [];
+  const mainUrls = [];
+  const seen = new Set();
   for (const raw of filtered) {
     const u = normalizeRakutenImageUrl(raw);
-    if (u) normalized.push(u);
-    else normalizeErrors.push(`${raw}: cannot normalize to absolute URL`);
-  }
-  if (normalized.length === 0) {
-    return { uploaded: 0, failed: filtered.length, errors: ['no_normalizable_image_url', ...normalizeErrors] };
-  }
-  const limited = normalized.slice(0, maxImages);
-  let uploaded = 0;
-  let failed = 0;
-  const errors = [];
-  for (let i = 0; i < limited.length; i += 1) {
-    const url = limited[i];
-    const fileName = imageFileName(itemCode, i);
-    try {
-      const raw = await downloadImage(url);
-      const { buffer, quality } = await toJpegUnderLimit(raw);
-      // smoke gate 観測ログ: JPEG magic / size / filename 規約を VPS 送信前に確認
-      //   (validateUploadFileName と JPEG magic / size は callUploadItemImage 内でも gate)
-      const magicHex = Buffer.from(buffer.slice(0, 2)).toString('hex');
-      console.log(`[rys-upload] item=${itemCode} idx=${i} file=${fileName} ${buffer.length}B q=${quality} magic=${magicHex}`);
-      await callUploadItemImage({ buffer, fileName, itemCode });
-      console.log(`[rys-upload] item=${itemCode} idx=${i} file=${fileName} OK`);
-      uploaded += 1;
-    } catch (e) {
-      failed += 1;
-      const msg = e instanceof YahooProxyError
-        ? `${url}: yahoo_proxy ${e.message}`
-        : (e instanceof ImageUploadError ? `${url}: ${e.message}` : `${url}: ${e.message || e}`);
-      errors.push(msg);
+    if (!u) continue;
+    if (!isAllowedDownloadUrl(u)) continue; // 楽天 host 以外は silent skip
+    if (!seen.has(u)) {
+      seen.add(u);
+      mainUrls.push(u);
     }
   }
-  // normalize で除外したものも errors に積んで可視化 (failed カウントは uploaded されたもの以外)
-  if (normalizeErrors.length > 0) {
-    errors.push(...normalizeErrors);
-    failed += normalizeErrors.length;
+  if (mainUrls.length > MAIN_MAX) {
+    throw new ImageUploadError(
+      `${itemCode}: メイン画像 ${mainUrls.length} 枚は上限 ${MAIN_MAX} 枚を超過しました。 楽天で画像を ${MAIN_MAX} 枚以下に減らしてください。`
+    );
   }
-  return { uploaded, failed, errors };
+
+  // 2. desc 画像: filter (Codex R4 H-1: customPatterns + builtin coupon/review を desc にも適用)
+  //    + dedupe + main との overlap 排除
+  // descriptionImageUrls は string URL の配列 (publish-executor で抽出済) なので、
+  // filterUploadableImageUrls に「URL 文字列」 として渡せばよい。
+  const descFiltered = filterUploadableImageUrls(descriptionImageUrls, { customPatterns });
+  const excludedRakutenUrls = new Set(
+    descriptionImageUrls.filter((u) => typeof u === 'string' && !descFiltered.includes(u))
+  );
+  const descUrls = [];
+  const descSeen = new Set();
+  for (const u of descFiltered) {
+    if (!u || typeof u !== 'string') continue;
+    // R5 H-1: SSRF 防御。 楽天 host 以外は throw (説明文 HTML から拾った URL に対する安全境界)
+    if (!isAllowedDownloadUrl(u)) {
+      throw new ImageUploadError(
+        `${itemCode}: 説明文画像 URL が楽天 host ではありません (https + image.rakuten.co.jp / r10s.jp のみ許可): ${u}`,
+        { url: u }
+      );
+    }
+    if (seen.has(u)) continue; // main と重複 → main 側で upload するので skip
+    if (!descSeen.has(u)) {
+      descSeen.add(u);
+      descUrls.push(u);
+    }
+  }
+  if (descUrls.length > DESC_MAX) {
+    throw new ImageUploadError(
+      `${itemCode}: 説明文画像 ${descUrls.length} 枚は上限 ${DESC_MAX} 枚を超過しました。 ` +
+        `(メイン画像との重複除外後の説明文専用画像枚数)。 楽天の販売説明文/スマホ用商品説明文の <img> を ${DESC_MAX} 枚以下に減らしてください。 ` +
+        `該当 URL: ${descUrls.slice(0, 5).join(', ')}${descUrls.length > 5 ? ' ...' : ''}`
+    );
+  }
+
+  // 3. 順次 upload (main → desc)、 urlMap と allowedYahooHosts を構築
+  const urlMap = new Map();
+  const allowedYahooHosts = new Set();
+  const errors = [];
+  let uploaded = 0;
+
+  for (let i = 0; i < mainUrls.length; i += 1) {
+    const url = mainUrls[i];
+    const fileName = imageFileName(itemCode, i);
+    await uploadOne(url, fileName, itemCode, urlMap, allowedYahooHosts);
+    uploaded += 1;
+  }
+  for (let i = 0; i < descUrls.length; i += 1) {
+    const url = descUrls[i];
+    const fileName = imageFileName(itemCode, DESC_SUFFIX_START + i);
+    await uploadOne(url, fileName, itemCode, urlMap, allowedYahooHosts);
+    uploaded += 1;
+  }
+
+  return {
+    uploaded,
+    urlMap,
+    allowedYahooHosts: [...allowedYahooHosts],
+    excludedRakutenUrls: [...excludedRakutenUrls],
+    errors,
+  };
+}
+
+/**
+ * 1 枚 upload して urlMap / allowedYahooHosts に積む。 失敗時は throw (fail-closed)。
+ */
+async function uploadOne(rakutenUrl, fileName, itemCode, urlMap, allowedYahooHosts) {
+  const raw = await downloadImage(rakutenUrl);
+  const { buffer, quality } = await toJpegUnderLimit(raw);
+  const magicHex = Buffer.from(buffer.slice(0, 2)).toString('hex');
+  console.log(`[rys-upload] item=${itemCode} file=${fileName} ${buffer.length}B q=${quality} magic=${magicHex} src=${rakutenUrl}`);
+  const result = await callUploadItemImage({ buffer, fileName, itemCode });
+  if (!result.yahooUrl) {
+    throw new ImageUploadError(
+      `${rakutenUrl}: upload OK but no Yahoo URL extracted from response (file=${fileName})`,
+      { url: rakutenUrl }
+    );
+  }
+  urlMap.set(rakutenUrl, result.yahooUrl);
+  try {
+    const u = new URL(result.yahooUrl);
+    if (u.protocol === 'https:') allowedYahooHosts.add(u.hostname.toLowerCase());
+  } catch (_) { /* malformed URL, skip host allowlist */ }
+  console.log(`[rys-upload] item=${itemCode} file=${fileName} OK → ${result.yahooUrl}`);
 }

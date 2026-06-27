@@ -240,7 +240,26 @@ export async function callUploadItemImage({ buffer, fileName, itemCode }, { time
   }
   // Codex E-5b R1 H-1: HTTP 200 でも XML semantic check
   assertYahooXmlOk('uploadItemImage', text);
-  return { status: res.status, body: text };
+  // Codex Phase E image-html R1: Yahoo response の <Url><ModeA>URL</ModeA></Url> を抽出して返す。
+  //   additional1 / sp_additional の楽天画像 URL を Yahoo CDN URL に置換する rewriter で使う。
+  const yahooUrl = extractYahooImageUrl(text);
+  return { status: res.status, body: text, yahooUrl };
+}
+
+/**
+ * Yahoo uploadItemImage の response XML から <Url><ModeA>...</ModeA></Url> の URL を抽出。
+ *   shape: <ResultSet><Result><Status>OK</Status><Id>...</Id><Name>...</Name>
+ *            <Url><ModeA>https://item-shopping.c.yimg.jp/...</ModeA></Url></Result></ResultSet>
+ *   抽出失敗時は null (caller 側で fail-closed)。
+ */
+export function extractYahooImageUrl(xml) {
+  if (!xml || typeof xml !== 'string') return null;
+  // Codex R3 medium 反映: regex より具体的な階層 match で誤抽出を避ける
+  //   (例えば caption に <ModeA> という文字列が混入しないよう Url 直下に限定)
+  const m = xml.match(/<Url\b[^>]*>[\s\S]*?<ModeA\b[^>]*>([\s\S]*?)<\/ModeA>[\s\S]*?<\/Url>/i);
+  if (!m) return null;
+  const url = m[1].trim();
+  return url || null;
 }
 
 export { assertYahooXmlOk };
