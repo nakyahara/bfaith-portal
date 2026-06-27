@@ -19,7 +19,7 @@ function parseJson(s, fallback) {
 }
 
 // 過去実行の一覧 (印刷ビューのナビ用、新しい順)。
-// display = ④納品予定日(6月27日) があればそれ、無ければ実行日時。
+// display = ⑤納品予定日(6月27日) があればそれ、無ければ実行日時。
 function buildRunsNav() {
   return getPickingRuns(50).map(r => {
     const dj = formatDeliveryDateJa(r.delivery_date);

@@ -84,19 +84,32 @@
 
   <div class="pp-container">
     <div class="howto">
-      <b>このページでやること</b>：Amazonで納品プランを作成した後、下の①〜⑤をアップロード／入力して「処理を実行」を押すと、以下を一括生成します。
+      <b>このページでやること</b>：Amazonで納品プランを作成した後、下の①〜⑤をすべて入力／アップロードして「処理を実行」を押すと、以下を一括生成します。
       <ol>
-        <li><b>①</b> 納品プランCSV（Amazon）＋ <b>②</b> ピッキングリストCSV（lzpickinglist）＋ <b>③</b> トータルピッキングリストPDF（TMP1）＋ <b>④</b> 納品予定日 ＋ <b>⑤</b> FBA納品プランURL（任意）</li>
+        <li><b>①</b> FBA納品プランURL ＋ <b>②</b> 納品プランCSV（Amazon）＋ <b>③</b> ピッキングリストCSV（lzpickinglist）＋ <b>④</b> トータルピッキングリストPDF（TMP1）＋ <b>⑤</b> 納品予定日</li>
       </ol>
-      <div class="out">📦 生成物：納品プランNo付きの<b>ピッキングリストPDF</b>（TMP1に注番）／<b>P-touchラベルCSV</b>／<b>プラン別ラベル貼り作業シート</b>。さらに④の日付でNotionカードを作成しPDFを添付、子会社向け公開URLからも閲覧可。詳しくは右上「📖 使い方」。</div>
+      <div class="out">📦 生成物：納品プランNo付きの<b>ピッキングリストPDF</b>（TMP1に注番）／<b>P-touchラベルCSV</b>／<b>プラン別ラベル貼り作業シート</b>。さらに⑤の日付でNotionカードを作成しPDFを添付（URL_1/URL_2に①のURL、本文に送り状発行手順リンク）、子会社向け公開URLからも閲覧可。詳しくは右上「📖 使い方」。</div>
     </div>
 
     <!-- マッピングソース表示 -->
     <div id="srcIndicator"></div>
 
-    <!-- 入力CSV -->
+    <!-- 入力 -->
     <div class="section">
-      <h3>① 納品プランCSV (Amazon)<span class="req must">1つ以上 必須</span></h3>
+      <h3>① FBA納品プラン URL<span class="req must">必須</span></h3>
+      <div style="display:flex;flex-direction:column;gap:8px;max-width:640px;">
+        <label class="lbl" style="margin:0;">FBA納品プラン1 URL
+          <input type="url" id="plan1Url" placeholder="https://..." style="width:100%;padding:6px 8px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;box-sizing:border-box;">
+        </label>
+        <label class="lbl" style="margin:0;">FBA納品プラン2 URL
+          <input type="url" id="plan2Url" placeholder="https://..." style="width:100%;padding:6px 8px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;box-sizing:border-box;">
+        </label>
+      </div>
+      <div class="hint">入力したURLは Notion カードの <b>URL_1</b>（プラン1）／<b>URL_2</b>（プラン2）プロパティに設定されます。</div>
+    </div>
+
+    <div class="section">
+      <h3>② 納品プランCSV (Amazon)<span class="req must">1つ以上 必須</span></h3>
       <p class="hint">該当するスロットにCSVをアップロードしてください（使う分だけでOK）。納品プランNoの接頭辞は編集できます (現場が参照する番号になります)。</p>
       <div class="slot-grid">
         <% slots.forEach(function(s){ %>
@@ -114,7 +127,7 @@
     </div>
 
     <div class="section">
-      <h3>② ピッキングリストCSV (ロジザード lzpickinglist)<span class="req must">必須</span></h3>
+      <h3>③ ピッキングリストCSV (ロジザード lzpickinglist)<span class="req must">必須</span></h3>
       <div class="slot-file" style="max-width:480px;">
         <input type="file" id="lzFile" accept=".csv">
         <button type="button" class="clear-btn" onclick="clearLzFile()" title="選択を取消">✕ 取消</button>
@@ -123,7 +136,7 @@
     </div>
 
     <div class="section">
-      <h3>③ トータルピッキングリストPDF (ロジザード TMP1)<span class="req must">必須</span></h3>
+      <h3>④ トータルピッキングリストPDF (ロジザード TMP1)<span class="req must">必須</span></h3>
       <div class="slot-file" style="max-width:480px;">
         <input type="file" id="tmp1File" accept=".pdf">
         <button type="button" class="clear-btn" onclick="clearTmp1File()" title="選択を取消">✕ 取消</button>
@@ -132,22 +145,9 @@
     </div>
 
     <div class="section">
-      <h3>④ 納品予定日<span class="req must">必須</span></h3>
+      <h3>⑤ 納品予定日<span class="req must">必須</span></h3>
       <input type="date" id="deliveryDate" required style="padding:6px 8px;border:1px solid #d1d5db;border-radius:6px;font-size:14px;">
       <div class="hint">注番済みPDFを Notion カード「<b>○月○日納品予定FBA納品ピッキング</b>」（ステータス「本日のやること」）に添付します。公開ページ(/print/picking)の「回」表示もこの日付になります。</div>
-    </div>
-
-    <div class="section">
-      <h3>⑤ FBA納品プラン URL <span class="req opt">任意</span></h3>
-      <div style="display:flex;flex-direction:column;gap:8px;max-width:640px;">
-        <label class="lbl" style="margin:0;">FBA納品プラン1 URL
-          <input type="url" id="plan1Url" placeholder="https://..." style="width:100%;padding:6px 8px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;box-sizing:border-box;">
-        </label>
-        <label class="lbl" style="margin:0;">FBA納品プラン2 URL
-          <input type="url" id="plan2Url" placeholder="https://..." style="width:100%;padding:6px 8px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;box-sizing:border-box;">
-        </label>
-      </div>
-      <div class="hint">入力したURLは Notion カードの <b>URL_1</b>（プラン1）／<b>URL_2</b>（プラン2）プロパティに設定されます。</div>
     </div>
 
     <div class="run-area">
@@ -204,17 +204,17 @@
         <button class="modal-close" onclick="closeManual()">閉じる</button>
       </div>
       <div class="modal-body">
-        <p>Amazonで納品プランを作成した後の工程です。下の①〜④を用意して「処理を実行」を押すと、必要な帳票を一括生成します。</p>
-        <h4>① 納品プランCSV (Amazon)　<span class="req must">1つ以上 必須</span></h4>
+        <p>Amazonで納品プランを作成した後の工程です。下の①〜⑤をすべて用意して「処理を実行」を押すと、必要な帳票を一括生成します。</p>
+        <h4>① FBA納品プラン URL　<span class="req must">必須</span></h4>
+        <p>FBA納品プラン1／2のURLを入力。NotionカードのプロパティURL_1（プラン1）／URL_2（プラン2）に設定されます。</p>
+        <h4>② 納品プランCSV (Amazon)　<span class="req must">1つ以上 必須</span></h4>
         <p>Amazon の納品プランから出力したCSVを、該当スロット(P1/P2 × 通常/危険物/大型…)にアップロード。使う分だけでOK。「納品プランNo 接頭辞」は現場が参照する番号(例:通常_1)の頭になります。</p>
-        <h4>② ピッキングリストCSV (ロジザード lzpickinglist)　<span class="req must">必須</span></h4>
+        <h4>③ ピッキングリストCSV (ロジザード lzpickinglist)　<span class="req must">必須</span></h4>
         <p>ロジザードの lzpickinglist.csv。商品コードと納品プランNoの突合に使います。</p>
-        <h4>③ トータルピッキングリストPDF (ロジザード TMP1)　<span class="req must">必須</span></h4>
+        <h4>④ トータルピッキングリストPDF (ロジザード TMP1)　<span class="req must">必須</span></h4>
         <p>ロジザードのトータルピッキングリストPDF。各行の右に「納品プランNo」列を追記したPDFを生成します。</p>
-        <h4>④ 納品予定日　<span class="req must">必須</span></h4>
-        <p>カレンダーで選択。この日付でNotionカード「○月○日納品予定FBA納品ピッキング」(ステータス「本日のやること」)を作成し、注番済みPDFを添付します。公開ページの「回」表示もこの日付になります。カード作成時、コメント欄に「送り状発行手順」リンクも自動追加されます。</p>
-        <h4>⑤ FBA納品プラン URL　<span class="req opt">任意</span></h4>
-        <p>FBA納品プラン1／2のURLを入力すると、NotionカードのプロパティURL_1（プラン1）／URL_2（プラン2）に設定されます。「処理を実行」時にURL入力の確認ダイアログが出ます。</p>
+        <h4>⑤ 納品予定日　<span class="req must">必須</span></h4>
+        <p>カレンダーで選択。この日付でNotionカード「○月○日納品予定FBA納品ピッキング」(ステータス「本日のやること」)を作成し、注番済みPDFを添付します。公開ページの「回」表示もこの日付になります。カード本文(メモ)に「送り状発行手順」リンクも自動追加されます。</p>
         <h4>生成物</h4>
         <ol>
           <li><b>納品プランNo付きピッキングリストPDF</b>(③に注番) — 結果の「⬇ 納品プランNo付きPDF」/公開URL/Notionから取得</li>
@@ -315,15 +315,24 @@ async function syncDodai(force){
 }
 
 async function runProcess(){
+  // ① FBA納品プラン URL (必須・http/httpsのURL形式)
+  const p1 = document.getElementById('plan1Url');
+  const p2 = document.getElementById('plan2Url');
+  if (!p1.value.trim() || !p2.value.trim()){ alert('FBA納品プラン1・プラン2のURLを入力してください'); (!p1.value.trim()?p1:p2).focus(); return; }
+  const validHttpUrl = (s)=>{ try{ const u=new URL(s.trim()); return u.protocol==='http:'||u.protocol==='https:'; }catch{ return false; } };
+  if (!validHttpUrl(p1.value) || !validHttpUrl(p2.value)){ alert('FBA納品プランのURLは http:// または https:// から始まる正しいURLを入力してください'); (!validHttpUrl(p1.value)?p1:p2).focus(); return; }
+  // ⑤ 納品予定日 (必須)
   const dd = document.getElementById('deliveryDate');
   if (!dd || !dd.value){ alert('納品予定日を入力してください'); if (dd) dd.focus(); return; }
+  // ③ ピッキングリストCSV (必須)
   const lz = document.getElementById('lzFile');
   if (!lz.files.length){ alert('ピッキングリスト(lzpickinglist)CSV を選択してください'); return; }
+  // ④ トータルピッキングリストPDF (必須)
   const tmp1El = document.getElementById('tmp1File');
   if (!tmp1El || !tmp1El.files.length){ alert('トータルピッキングリストPDF(TMP1)を選択してください'); return; }
-  // ⑤ FBA納品プランURL の入力確認 (Yes/No)
-  if (!confirm('FBA納品プラン1・プラン2のURLを入力しましたか？\n\n[OK]=入力済み・このまま実行 / [キャンセル]=戻って入力')) return;
+
   const fd = new FormData();
+  // ② 納品プランCSV (1つ以上 必須)
   let planCount = 0;
   for (const s of SLOTS){
     const input = document.querySelector('input[type=file][data-slot="'+s.id+'"]');
@@ -335,11 +344,10 @@ async function runProcess(){
   }
   if (planCount === 0){ alert('納品プランCSVを1つ以上アップロードしてください'); return; }
   fd.append('lz', lz.files[0]);
-  const tmp1 = document.getElementById('tmp1File');
-  if (tmp1 && tmp1.files.length){ fd.append('tmp1', tmp1.files[0]); }
-  fd.append('delivery_date', dd.value); // 必須 (冒頭で検証済み)
-  const p1 = document.getElementById('plan1Url'); if (p1 && p1.value.trim()) fd.append('plan1_url', p1.value.trim());
-  const p2 = document.getElementById('plan2Url'); if (p2 && p2.value.trim()) fd.append('plan2_url', p2.value.trim());
+  fd.append('tmp1', tmp1El.files[0]);
+  fd.append('delivery_date', dd.value);
+  fd.append('plan1_url', p1.value.trim());
+  fd.append('plan2_url', p2.value.trim());
 
   const btn = document.getElementById('runBtn');
   btn.disabled = true;

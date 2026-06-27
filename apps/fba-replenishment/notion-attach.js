@@ -59,18 +59,16 @@ function urlPropName(props, name) {
   return props[name] && props[name].type === 'url' ? name : null;
 }
 
-// カードのコメント欄に「送り状発行手順」リンクを投稿 (best-effort)
-async function addInvoiceGuideComment(pageId) {
+// カード本文(メモ)に置く「送り状発行手順」リンクの段落ブロック
+function invoiceGuideBlock() {
   const url = process.env.FBA_PICKING_INVOICE_GUIDE_URL
     || 'https://app.notion.com/p/FBA-38cfc7bb5f3080ffbafdded6cee4727a';
   const label = process.env.FBA_PICKING_INVOICE_GUIDE_LABEL || '送り状発行手順';
-  await notionFetch('/comments', {
-    method: 'POST',
-    body: JSON.stringify({
-      parent: { page_id: pageId },
-      rich_text: [{ type: 'text', text: { content: label, link: { url } } }],
-    }),
-  });
+  return {
+    object: 'block',
+    type: 'paragraph',
+    paragraph: { rich_text: [{ type: 'text', text: { content: label, link: { url } } }] },
+  };
 }
 
 // ステータス対象プロパティの決定 (優先順):
@@ -115,6 +113,8 @@ export async function createPickingCard({ title, pdfUrl, plan1Url, plan2Url }) {
       file: { type: 'external', external: { url: pdfUrl }, caption: [] },
     });
   }
+  // 本文(メモ)に「送り状発行手順」リンクを残す (コメントではなくページ本文)
+  children.push(invoiceGuideBlock());
 
   // タイトル + URL_1/URL_2 (リンク型プロパティが存在し値がある場合のみ)
   const commonProps = { [titleProp]: { title: [{ text: { content: title } }] } };
@@ -146,14 +146,5 @@ export async function createPickingCard({ title, pdfUrl, plan1Url, plan2Url }) {
     page = await notionFetch('/pages', { method: 'POST', body: mkBody(commonProps) });
   }
 
-  // コメント欄に「送り状発行手順」リンクを投稿 (best-effort: 失敗してもカードは成功)
-  let commentAdded = false;
-  try {
-    await addInvoiceGuideComment(page.id);
-    commentAdded = true;
-  } catch (e) {
-    console.error('[Notion] コメント投稿失敗:', e.message);
-  }
-
-  return { pageId: page.id, url: page.url, statusSet, commentAdded };
+  return { pageId: page.id, url: page.url, statusSet };
 }

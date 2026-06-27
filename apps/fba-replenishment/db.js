@@ -591,7 +591,7 @@ export async function initDb() {
   `);
   // 注: 旧 public_token 列/index は #335 で作成済みだが、公開印刷は固定URL+実行ID方式に変更したため
   // 現在は未使用 (既存DBの列はNULLのまま放置=無害)。
-  // delivery_date: ④で入力する納品予定日 (YYYY-MM-DD)。Notionカード名/公開ナビ表示に使用。
+  // delivery_date: ⑤で入力する納品予定日 (YYYY-MM-DD)。Notionカード名/公開ナビ表示に使用。
   const runHistCols = queryAll('PRAGMA table_info(picking_run_history)').map(r => r.name);
   if (!runHistCols.includes('delivery_date')) {
     db.run(`ALTER TABLE picking_run_history ADD COLUMN delivery_date TEXT`);
