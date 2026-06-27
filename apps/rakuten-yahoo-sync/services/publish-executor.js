@@ -45,8 +45,10 @@ export function isPublishEnabled() {
 }
 
 // Codex Phase E image-html R2 H-3: publish logic 改訂時に古い success record と
-// 同じ key にならないよう version を必ず混ぜる。 次の破壊的改訂で v3 に上げる。
-export const IDEMPOTENCY_VERSION = 'rewrite_v2';
+// 同じ key にならないよう version を必ず混ぜる。
+// v2: PR #355 image-html rewrite (uploadItemImage で desc も) 採用版
+// v3: PR #356 uploadLibImage 採用 (Yahoo it-14061 修正) 後の版
+export const IDEMPOTENCY_VERSION = 'rewrite_v3';
 
 /**
  * idempotency_key 生成 (caller が override 可能、 ない場合は deterministic に組み立て)。
@@ -201,12 +203,14 @@ async function performRealPublish({ rakutenImages, fields, itemCode, customPatte
   //    Codex Phase E image-html R2: immutable な rewrittenFields を新規 construct
   let rewrittenAdditional1, rewrittenSpAdditional;
   try {
-    rewrittenAdditional1 = rewriteAndSanitizeYahooHtml(salesDescriptionHtml, imageResult.urlMap, {
-      allowedYahooHosts: imageResult.allowedYahooHosts,
+    // Yahoo it-14061 修正 (2026-06-27): additional1/sp_additional の <img> は
+    // 「追加画像」 (uploadLibImage) のみ許可。 商品画像 (mainUrlMap) は it-14061 で拒否される。
+    rewrittenAdditional1 = rewriteAndSanitizeYahooHtml(salesDescriptionHtml, imageResult.libUrlMap, {
+      allowedYahooHosts: imageResult.allowedYahooLibHosts,
       excludedRakutenUrls: imageResult.excludedRakutenUrls,
     });
-    rewrittenSpAdditional = rewriteAndSanitizeYahooHtml(spDescriptionHtml, imageResult.urlMap, {
-      allowedYahooHosts: imageResult.allowedYahooHosts,
+    rewrittenSpAdditional = rewriteAndSanitizeYahooHtml(spDescriptionHtml, imageResult.libUrlMap, {
+      allowedYahooHosts: imageResult.allowedYahooLibHosts,
       excludedRakutenUrls: imageResult.excludedRakutenUrls,
     });
   } catch (e) {
@@ -224,7 +228,7 @@ async function performRealPublish({ rakutenImages, fields, itemCode, customPatte
 
   // 4. editItem preflight 確定 (rewrite 後の長さ + img host check)
   try {
-    validateYahooEditItemFields(rewrittenFields, { allowedImgHosts: imageResult.allowedYahooHosts });
+    validateYahooEditItemFields(rewrittenFields, { allowedImgHosts: imageResult.allowedYahooLibHosts });
   } catch (e) {
     if (e instanceof YahooFieldValidationError) {
       throw new Error(`editItem_preflight_failed_post_rewrite: ${e.message}`);
@@ -237,8 +241,9 @@ async function performRealPublish({ rakutenImages, fields, itemCode, customPatte
   return {
     images: {
       uploaded: imageResult.uploaded,
-      mainCount: imageResult.urlMap?.size || 0,
-      yahooHosts: imageResult.allowedYahooHosts,
+      mainCount: imageResult.mainUrlMap?.size || 0,
+      libCount: imageResult.libUrlMap?.size || 0,
+      yahooLibHosts: imageResult.allowedYahooLibHosts,
     },
     editItem: { status: editResult.status, bodyPreview: String(editResult.body).slice(0, 300) },
     fields: rewrittenFields,

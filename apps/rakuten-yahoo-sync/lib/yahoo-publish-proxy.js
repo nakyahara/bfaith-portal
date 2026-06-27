@@ -24,6 +24,32 @@ const MAX_IMAGE_BYTES = 2 * 1024 * 1024;
 const ITEM_CODE_RE = /^[A-Za-z0-9_-]{1,80}$/;
 const FILE_NAME_RE_GENERIC = /^[A-Za-z0-9_-]{1,80}(_(?:[1-9]|1[0-9]|20))?\.jpg$/;
 
+// uploadLibImage 用 filename 規約 (Yahoo it-14061 修正 2026-06-27):
+//   `{item_code}_lib_{1..20}.jpg` (1 桁、 zero-padding なし)
+//   item_code は uploadItemImage と同じ ^[A-Za-z0-9_-]{1,80}$
+const LIB_FILE_NAME_RE = /^[A-Za-z0-9_-]{1,80}_lib_([1-9]|1[0-9]|20)\.jpg$/;
+
+export function validateUploadLibFileName(fileName, itemCode) {
+  if (typeof fileName !== 'string' || fileName.length === 0 || fileName.length > 100) {
+    throw new YahooProxyError('uploadLibImage', `fileName invalid length: ${fileName?.length}`);
+  }
+  if (fileName.includes('/') || fileName.includes('\\')) {
+    throw new YahooProxyError('uploadLibImage', `fileName must be basename: ${JSON.stringify(fileName)}`);
+  }
+  if (/[\x00-\x1F\x7F]/.test(fileName)) {
+    throw new YahooProxyError('uploadLibImage', 'fileName has control chars');
+  }
+  if (!LIB_FILE_NAME_RE.test(fileName)) {
+    throw new YahooProxyError('uploadLibImage', `fileName format invalid (expected {item_code}_lib_N.jpg): ${fileName}`);
+  }
+  if (!ITEM_CODE_RE.test(itemCode)) {
+    throw new YahooProxyError('uploadLibImage', `itemCode format invalid: ${itemCode}`);
+  }
+  if (!fileName.startsWith(`${itemCode}_lib_`)) {
+    throw new YahooProxyError('uploadLibImage', `fileName ${fileName} does not match itemCode ${itemCode}`);
+  }
+}
+
 export function validateUploadFileName(fileName, itemCode) {
   if (typeof fileName !== 'string' || fileName.length === 0 || fileName.length > 100) {
     throw new YahooProxyError('uploadItemImage', `fileName invalid length: ${fileName?.length}`);
@@ -260,6 +286,64 @@ export function extractYahooImageUrl(xml) {
   if (!m) return null;
   const url = m[1].trim();
   return url || null;
+}
+
+/**
+ * POST /yahoo/uploadLibImage に JSON で 1 枚 upload (Yahoo it-14061 修正 2026-06-27)。
+ *
+ * uploadItemImage と別 API (Yahoo 仕様で 「商品画像/商品詳細画像」 とは別の 「追加画像 (lib)」):
+ *   - additional1/sp_additional の <img src> に貼れる URL を発行する唯一の手段
+ *   - Yahoo response は <Status>OK</Status> のみで <Url> 返さないので、 VPS proxy 側で
+ *     `https://shopping.c.yimg.jp/lib/{store}/{fileName}` を合成して返却 (Codex R2 critical)
+ *   - 200 時のレスポンスは JSON { ok:true, yahooUrl, body } 形式
+ *
+ * @param {{ buffer: Buffer|Uint8Array, fileName: string, itemCode: string }} args
+ * @returns {Promise<{status, yahooUrl, body}>}
+ */
+export async function callUploadLibImage({ buffer, fileName, itemCode }, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+  if (!buffer || !(buffer instanceof Uint8Array)) {
+    throw new YahooProxyError('uploadLibImage', 'buffer must be Buffer/Uint8Array');
+  }
+  if (!fileName) throw new YahooProxyError('uploadLibImage', 'fileName is required');
+  if (!itemCode) throw new YahooProxyError('uploadLibImage', 'itemCode is required');
+  validateUploadLibFileName(fileName, itemCode);
+  if (buffer.length < 4 || buffer[0] !== 0xFF || buffer[1] !== 0xD8) {
+    const head = Buffer.from(buffer.slice(0, 4)).toString('hex');
+    throw new YahooProxyError('uploadLibImage', `invalid JPEG magic: ${head}`);
+  }
+  if (buffer.length >= MAX_IMAGE_BYTES) {
+    throw new YahooProxyError('uploadLibImage', `image too large: ${buffer.length}B (>= ${MAX_IMAGE_BYTES}B)`);
+  }
+
+  const bufBase = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+  const payload = {
+    fileName,
+    itemCode,
+    bufferBase64: bufBase.toString('base64'),
+  };
+  const url = `${getProxyBaseUrl()}/yahoo/uploadLibImage`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { ...getProxyHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new YahooProxyError('uploadLibImage', `HTTP ${res.status}`, { status: res.status, body: text.slice(0, 500) });
+  }
+  // proxy は 200 時に JSON { ok, yahooUrl, body }、 それ以外は XML をそのまま返す
+  let parsed;
+  try { parsed = JSON.parse(text); }
+  catch (e) {
+    throw new YahooProxyError('uploadLibImage', `proxy returned non-JSON 200: ${text.slice(0, 200)}`);
+  }
+  if (!parsed?.ok || !parsed?.yahooUrl) {
+    throw new YahooProxyError('uploadLibImage', `proxy did not return yahooUrl: ${text.slice(0, 200)}`);
+  }
+  // Yahoo XML semantic check (proxy が body を渡してくる)
+  if (parsed.body) assertYahooXmlOk('uploadLibImage', parsed.body);
+  return { status: res.status, yahooUrl: parsed.yahooUrl, body: parsed.body };
 }
 
 export { assertYahooXmlOk };
