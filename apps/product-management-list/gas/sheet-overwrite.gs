@@ -131,16 +131,21 @@ function main() {
     if (matched / n < MIN_MATCH_RATE) throw new Error('一致率が低い: ' + matched + '/' + n + ' (< ' + MIN_MATCH_RATE + ')。キー形式ズレ等の疑いで中止');
     if (writeMode !== 'live') { Logger.log('[dry_run] 書き込みスキップ'); return; }
 
-    // 6. 本番反映: バックアップ → 各ターゲット列だけ更新 (一致行のみ値差し替え、非一致は現状維持)
-    backup_(ss, sheet, data.as_of_date);
+    // 6. 本番反映: 全対象列の現在値を先読み(=バックアップ素材) → 軽量バックアップ → まとめて書く。
+    //    重い copyTo(全シート複製=全数式再計算) は使わない。読み込みを全部先に済ませ書き込みを
+    //    連続させることで数式の再計算回数を最小化 (Spreadsheets timeout 対策)。
+    var curArrays = [];
     for (var c = 0; c < resolved.length; c++) {
-      var col = resolved[c].col, field = resolved[c].field;
-      var cur = sheet.getRange(2, col, n, 1).getValues(); // 現状値 (非一致行はこのまま戻す)
+      curArrays[c] = sheet.getRange(2, resolved[c].col, n, 1).getValues();
+    }
+    backupColumns_(ss, data.as_of_date, resolved, keyVals, curArrays, n);
+    for (var c2 = 0; c2 < resolved.length; c2++) {
+      var arr = curArrays[c2], field = resolved[c2].field;
       for (var rr = 0; rr < n; rr++) {
         var dbr = dbRowForSheetRow[rr];
-        if (dbr) { var v = dbr[field]; cur[rr][0] = (v === null || v === undefined) ? '' : v; }
+        if (dbr) { var v = dbr[field]; arr[rr][0] = (v === null || v === undefined) ? '' : v; }
       }
-      sheet.getRange(2, col, n, 1).setValues(cur);
+      sheet.getRange(2, resolved[c2].col, n, 1).setValues(arr);
     }
     SpreadsheetApp.flush();
     Logger.log('部分上書き完了: ' + resolved.length + '列 × 一致' + matched + '行 (run=' + data.run_id + ')');
@@ -172,16 +177,26 @@ function freshEnough_(asOf) {
   return lag >= 0 && lag <= MAX_LAG_DAYS;
 }
 
-function backup_(ss, sheet, asOf) {
-  var name = '_backup_' + (asOf || Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyyMMdd'));
+// 軽量バックアップ: 商品コード + 対象列の「現在値」だけを隠しシートに退避。
+// 全シート複製(copyTo)は対象シートの数式が多いと全再計算で重くタイムアウトするため使わない。
+function backupColumns_(ss, asOf, resolved, keyVals, curArrays, n) {
+  var name = '_pmlbak_' + (asOf || Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyyMMdd'));
   var old = ss.getSheetByName(name);
   if (old) ss.deleteSheet(old);
-  var copy = sheet.copyTo(ss);
-  copy.setName(name);
-  copy.hideSheet();
-  var backups = ss.getSheets().filter(function (s) { return s.getName().indexOf('_backup_') === 0; })
+  var bak = ss.insertSheet(name);
+  bak.hideSheet();
+  var headers = ['商品コード'];
+  for (var c = 0; c < resolved.length; c++) headers.push(resolved[c].hdr);
+  var out = [headers];
+  for (var r = 0; r < n; r++) {
+    var row = [keyVals[r][0]];
+    for (var c2 = 0; c2 < resolved.length; c2++) row.push(curArrays[c2][r][0]);
+    out.push(row);
+  }
+  bak.getRange(1, 1, out.length, headers.length).setValues(out);
+  var baks = ss.getSheets().filter(function (s) { return s.getName().indexOf('_pmlbak_') === 0; })
     .sort(function (a, b) { return a.getName() < b.getName() ? 1 : -1; });
-  for (var i = 7; i < backups.length; i++) ss.deleteSheet(backups[i]);
+  for (var i = 7; i < baks.length; i++) ss.deleteSheet(baks[i]);
 }
 
 function sha256Hex_(str) {
