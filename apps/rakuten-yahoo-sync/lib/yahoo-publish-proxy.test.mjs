@@ -16,7 +16,9 @@ import assert from 'node:assert/strict';
 
 import {
   callUploadItemImage,
+  callUploadLibImage,
   validateUploadFileName,
+  validateUploadLibFileName,
   YahooProxyError,
 } from './yahoo-publish-proxy.js';
 
@@ -158,6 +160,79 @@ test('callUploadItemImage throws YahooProxyError on proxy HTTP 400', async () =>
   } finally {
     global.fetch = origFetch;
   }
+});
+
+// ── validateUploadLibFileName ──────────────────────────────────────
+test('validateUploadLibFileName: accepts {itemCode}_lib_N.jpg (N=1..20)', () => {
+  for (const n of [1, 5, 10, 20]) {
+    validateUploadLibFileName(`aburatoishioil100_lib_${n}.jpg`, 'aburatoishioil100');
+  }
+});
+
+test('validateUploadLibFileName: rejects N=0 / 21', () => {
+  assert.throws(() => validateUploadLibFileName('aburatoishioil100_lib_0.jpg', 'aburatoishioil100'), YahooProxyError);
+  assert.throws(() => validateUploadLibFileName('aburatoishioil100_lib_21.jpg', 'aburatoishioil100'), YahooProxyError);
+});
+
+test('validateUploadLibFileName: rejects format mismatch', () => {
+  assert.throws(() => validateUploadLibFileName('abc.jpg', 'abc'), YahooProxyError);
+  assert.throws(() => validateUploadLibFileName('abc_1.jpg', 'abc'), YahooProxyError);
+  assert.throws(() => validateUploadLibFileName('abc_lib_1.png', 'abc'), YahooProxyError);
+  assert.throws(() => validateUploadLibFileName('../abc_lib_1.jpg', 'abc'), YahooProxyError);
+});
+
+test('validateUploadLibFileName: rejects itemCode mismatch', () => {
+  assert.throws(() => validateUploadLibFileName('abc_lib_1.jpg', 'def'), YahooProxyError);
+});
+
+// ── callUploadLibImage ────────────────────────────────────────────
+test('callUploadLibImage: sends JSON {fileName,itemCode,bufferBase64} and parses proxy JSON', async () => {
+  const buf = jpegBuffer(2048);
+  const captured = { url: null, body: null, headers: null };
+  const origFetch = global.fetch;
+  global.fetch = async (url, opts) => {
+    captured.url = url;
+    captured.body = opts.body;
+    captured.headers = opts.headers;
+    return new Response(
+      JSON.stringify({ ok: true, yahooUrl: 'https://shopping.c.yimg.jp/lib/b-faith/aburatoishioil100_lib_1.jpg', body: '<ResultSet><Status>OK</Status></ResultSet>' }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    );
+  };
+  try {
+    const r = await callUploadLibImage({ buffer: buf, fileName: 'aburatoishioil100_lib_1.jpg', itemCode: 'aburatoishioil100' });
+    assert.equal(r.yahooUrl, 'https://shopping.c.yimg.jp/lib/b-faith/aburatoishioil100_lib_1.jpg');
+  } finally {
+    global.fetch = origFetch;
+  }
+  assert.equal(captured.url, 'http://127.0.0.1:9999/yahoo/uploadLibImage');
+  assert.equal(captured.headers['Content-Type'], 'application/json');
+  const json = JSON.parse(captured.body);
+  assert.equal(json.fileName, 'aburatoishioil100_lib_1.jpg');
+  assert.equal(json.itemCode, 'aburatoishioil100');
+  assert.equal(typeof json.bufferBase64, 'string');
+});
+
+test('callUploadLibImage: proxy 200 with no yahooUrl throws', async () => {
+  const buf = jpegBuffer(2048);
+  const origFetch = global.fetch;
+  global.fetch = async () => new Response(JSON.stringify({ ok: true, body: 'x' }), { status: 200 });
+  try {
+    await assert.rejects(
+      callUploadLibImage({ buffer: buf, fileName: 'aburatoishioil100_lib_1.jpg', itemCode: 'aburatoishioil100' }),
+      (e) => e instanceof YahooProxyError && /did not return yahooUrl/.test(e.message),
+    );
+  } finally {
+    global.fetch = origFetch;
+  }
+});
+
+test('callUploadLibImage: rejects bad fileName (validateUploadLibFileName)', async () => {
+  const buf = jpegBuffer(1024);
+  await assert.rejects(
+    callUploadLibImage({ buffer: buf, fileName: 'aburatoishioil100.jpg', itemCode: 'aburatoishioil100' }),
+    (e) => e instanceof YahooProxyError && /lib_N\.jpg/.test(e.message),
+  );
 });
 
 // ── callUploadItemImage : Yahoo XML <Error> ────────────────────────

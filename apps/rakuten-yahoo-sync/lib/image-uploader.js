@@ -10,7 +10,7 @@
 
 import sharp from 'sharp';
 import { filterUploadableImageUrls } from './yahoo-image.js';
-import { callUploadItemImage } from './yahoo-publish-proxy.js';
+import { callUploadItemImage, callUploadLibImage } from './yahoo-publish-proxy.js';
 
 const DEFAULT_DOWNLOAD_TIMEOUT_MS = 20_000;
 const MAX_BYTES = 2 * 1024 * 1024;
@@ -180,14 +180,18 @@ function imageFileName(itemCode, index) {
   return `${itemCode}_${index}.jpg`;
 }
 
-// Codex Phase E image-html R2 H-2 + R3 H-1: suffix 割当 + 上限を明文化
-//   main[0]    → `{itemCode}.jpg`
-//   main[1..9] → `{itemCode}_1.jpg` 〜 `{itemCode}_9.jpg`   (main は最大 10 枚)
-//   desc[0..10] → `{itemCode}_10.jpg` 〜 `{itemCode}_20.jpg` (desc は最大 11 枚)
-//   合計: base + _1..20 = 21 枚 cap (Yahoo 仕様)
+// uploadLibImage 用 filename (Yahoo it-14061 修正 2026-06-27): `{item_code}_lib_{N}.jpg`
+function libImageFileName(itemCode, index) {
+  return `${itemCode}_lib_${index + 1}.jpg`;
+}
+
+// Yahoo it-14061 修正 (2026-06-27): main は uploadItemImage、 desc は uploadLibImage (別 API)。
+//   main:  uploadItemImage で `{itemCode}.jpg + _1..9` の最大 10 枚
+//   desc:  uploadLibImage で `{itemCode}_lib_1..20` の最大 20 枚
+//          → additional1/sp_additional に貼れる Yahoo CDN URL
+//          (uploadItemImage で得た URL は it-14061 で additional1 に貼れない)
 const MAIN_MAX = 10;
-const DESC_MAX = 11;
-const DESC_SUFFIX_START = 10;
+const DESC_MAX = 20;
 
 // Codex Phase E image-html R5 H-1: SSRF 防御. download 対象は **https: + 楽天 host のみ**。
 //   楽天 cabinet 画像は `image.rakuten.co.jp` か `*.r10s.jp` ドメイン。
@@ -273,7 +277,9 @@ export async function uploadRakutenImagesToYahoo({
         { url: u }
       );
     }
-    if (seen.has(u)) continue; // main と重複 → main 側で upload するので skip
+    // Yahoo it-14061 修正: desc 画像は uploadLibImage で 別 API に upload するため、
+    // main URL と重複してても **別 upload する** (main URL は uploadItemImage に行くので
+    // additional1/sp_additional には貼れない)。 つまり dedupe は desc 内のみで行う。
     if (!descSeen.has(u)) {
       descSeen.add(u);
       descUrls.push(u);
@@ -282,58 +288,83 @@ export async function uploadRakutenImagesToYahoo({
   if (descUrls.length > DESC_MAX) {
     throw new ImageUploadError(
       `${itemCode}: 説明文画像 ${descUrls.length} 枚は上限 ${DESC_MAX} 枚を超過しました。 ` +
-        `(メイン画像との重複除外後の説明文専用画像枚数)。 楽天の販売説明文/スマホ用商品説明文の <img> を ${DESC_MAX} 枚以下に減らしてください。 ` +
+        `楽天の販売説明文/スマホ用商品説明文の <img> を ${DESC_MAX} 枚以下に減らしてください。 ` +
         `該当 URL: ${descUrls.slice(0, 5).join(', ')}${descUrls.length > 5 ? ' ...' : ''}`
     );
   }
 
-  // 3. 順次 upload (main → desc)、 urlMap と allowedYahooHosts を構築
-  const urlMap = new Map();
-  const allowedYahooHosts = new Set();
+  // 3. 順次 upload — main は uploadItemImage、 desc は uploadLibImage
+  //   main は商品画像 URL (item-shopping.c.yimg.jp) → caption 用 (実運用では caption に img なし)
+  //   desc は追加画像 URL (shopping.c.yimg.jp/lib/...) → additional1/sp_additional 用
+  const mainUrlMap = new Map();          // 楽天URL → Yahoo item URL
+  const libUrlMap = new Map();           // 楽天URL → Yahoo lib URL
+  const allowedYahooLibHosts = new Set();
   const errors = [];
   let uploaded = 0;
 
   for (let i = 0; i < mainUrls.length; i += 1) {
     const url = mainUrls[i];
     const fileName = imageFileName(itemCode, i);
-    await uploadOne(url, fileName, itemCode, urlMap, allowedYahooHosts);
+    await uploadMainOne(url, fileName, itemCode, mainUrlMap);
     uploaded += 1;
   }
   for (let i = 0; i < descUrls.length; i += 1) {
     const url = descUrls[i];
-    const fileName = imageFileName(itemCode, DESC_SUFFIX_START + i);
-    await uploadOne(url, fileName, itemCode, urlMap, allowedYahooHosts);
+    const fileName = libImageFileName(itemCode, i);
+    await uploadLibOne(url, fileName, itemCode, libUrlMap, allowedYahooLibHosts);
     uploaded += 1;
   }
 
   return {
     uploaded,
-    urlMap,
-    allowedYahooHosts: [...allowedYahooHosts],
+    mainUrlMap,                           // 旧 urlMap (main 用、 caption rewriter で使う想定 — 実運用では使わない)
+    libUrlMap,                            // additional1/sp_additional rewriter で使う
+    allowedYahooLibHosts: [...allowedYahooLibHosts],
     excludedRakutenUrls: [...excludedRakutenUrls],
     errors,
   };
 }
 
 /**
- * 1 枚 upload して urlMap / allowedYahooHosts に積む。 失敗時は throw (fail-closed)。
+ * main 画像 1 枚 upload (uploadItemImage) して mainUrlMap に積む。 fail-closed。
  */
-async function uploadOne(rakutenUrl, fileName, itemCode, urlMap, allowedYahooHosts) {
+async function uploadMainOne(rakutenUrl, fileName, itemCode, mainUrlMap) {
   const raw = await downloadImage(rakutenUrl);
   const { buffer, quality } = await toJpegUnderLimit(raw);
   const magicHex = Buffer.from(buffer.slice(0, 2)).toString('hex');
-  console.log(`[rys-upload] item=${itemCode} file=${fileName} ${buffer.length}B q=${quality} magic=${magicHex} src=${rakutenUrl}`);
+  console.log(`[rys-upload main] item=${itemCode} file=${fileName} ${buffer.length}B q=${quality} magic=${magicHex} src=${rakutenUrl}`);
   const result = await callUploadItemImage({ buffer, fileName, itemCode });
   if (!result.yahooUrl) {
     throw new ImageUploadError(
-      `${rakutenUrl}: upload OK but no Yahoo URL extracted from response (file=${fileName})`,
+      `${rakutenUrl}: uploadItemImage OK but no Yahoo URL extracted (file=${fileName})`,
       { url: rakutenUrl }
     );
   }
-  urlMap.set(rakutenUrl, result.yahooUrl);
+  mainUrlMap.set(rakutenUrl, result.yahooUrl);
+  console.log(`[rys-upload main] item=${itemCode} file=${fileName} OK → ${result.yahooUrl}`);
+}
+
+/**
+ * desc (追加画像) 1 枚 upload (uploadLibImage) して libUrlMap / allowedYahooLibHosts に積む。 fail-closed。
+ * uploadLibImage は Yahoo response が <Status>OK</Status> のみで URL を返さないので
+ * VPS proxy 側で合成 (`https://shopping.c.yimg.jp/lib/{store}/{fileName}`) して JSON で返却する。
+ */
+async function uploadLibOne(rakutenUrl, fileName, itemCode, libUrlMap, allowedYahooLibHosts) {
+  const raw = await downloadImage(rakutenUrl);
+  const { buffer, quality } = await toJpegUnderLimit(raw);
+  const magicHex = Buffer.from(buffer.slice(0, 2)).toString('hex');
+  console.log(`[rys-upload lib] item=${itemCode} file=${fileName} ${buffer.length}B q=${quality} magic=${magicHex} src=${rakutenUrl}`);
+  const result = await callUploadLibImage({ buffer, fileName, itemCode });
+  if (!result.yahooUrl) {
+    throw new ImageUploadError(
+      `${rakutenUrl}: uploadLibImage OK but proxy did not return yahooUrl (file=${fileName})`,
+      { url: rakutenUrl }
+    );
+  }
+  libUrlMap.set(rakutenUrl, result.yahooUrl);
   try {
     const u = new URL(result.yahooUrl);
-    if (u.protocol === 'https:') allowedYahooHosts.add(u.hostname.toLowerCase());
+    if (u.protocol === 'https:') allowedYahooLibHosts.add(u.hostname.toLowerCase());
   } catch (_) { /* malformed URL, skip host allowlist */ }
-  console.log(`[rys-upload] item=${itemCode} file=${fileName} OK → ${result.yahooUrl}`);
+  console.log(`[rys-upload lib] item=${itemCode} file=${fileName} OK → ${result.yahooUrl}`);
 }

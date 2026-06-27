@@ -532,6 +532,43 @@ function validateUploadFileName(fileName, itemCode) {
   }
 }
 
+// uploadLibImage の画像命名規約 (Yahoo it-14061 修正 2026-06-27):
+//   ストア内 library 画像。 uploadItemImage と別 API。
+//   公式仕様: 255 byte 以内、 半角英数字 + - _ . のみ。
+//   実運用: {item_code}_lib_{N}.jpg (1-20)。 path separator/制御文字は不可。
+//   itemCode は監査ログ用 (Yahoo には送らない、 prefix 検証のみ)。
+const UPLOAD_LIB_FILE_NAME_RE = /^[A-Za-z0-9_.-]{1,80}\.(?:jpe?g|png|gif)$/i;
+function validateUploadLibFileName(fileName, itemCode) {
+  if (typeof fileName !== 'string' || fileName.length === 0 || fileName.length > 100) {
+    throw new Error(`fileName invalid length: ${fileName?.length}`);
+  }
+  if (fileName.includes('/') || fileName.includes('\\')) {
+    throw new Error(`fileName must be basename: ${JSON.stringify(fileName)}`);
+  }
+  if (/[\x00-\x1F\x7F]/.test(fileName)) {
+    throw new Error('fileName has control chars');
+  }
+  if (!UPLOAD_LIB_FILE_NAME_RE.test(fileName)) {
+    throw new Error(`fileName format invalid (expected [A-Za-z0-9_.-]+\\.(jpg|png|gif)): ${fileName}`);
+  }
+  // itemCode prefix 検証 (任意): bfaith 側で `{itemCode}_lib_N.jpg` 命名で送るので prefix 一致を確認
+  if (itemCode != null) {
+    if (!UPLOAD_ITEM_CODE_RE.test(itemCode)) {
+      throw new Error(`itemCode format invalid: ${itemCode}`);
+    }
+    if (!fileName.startsWith(`${itemCode}_lib_`)) {
+      throw new Error(`fileName ${fileName} does not match itemCode ${itemCode} (expected ${itemCode}_lib_N.jpg)`);
+    }
+  }
+}
+
+// uploadLibImage の Yahoo response は <Status>OK</Status> のみで URL を返さない (Codex R2 critical)。
+// 公式 URL pattern は `https://shopping.c.yimg.jp/lib/{store}/{fileName}` 固定なので、
+// proxy 側で合成して bfaith に返す。
+function buildLibImageUrl(fileName) {
+  return `https://shopping.c.yimg.jp/lib/${encodeURIComponent(YAHOO_SELLER_ID)}/${encodeURIComponent(fileName)}`;
+}
+
 // ─── HTTPサーバー ───
 
 const server = http.createServer(async (req, res) => {
@@ -966,6 +1003,109 @@ const server = http.createServer(async (req, res) => {
         queryString: `seller_id=${encodeURIComponent(YAHOO_SELLER_ID)}`,
       });
       console.log(`[${ts()}] Yahoo uploadItemImage response: status=${r.status} body=${String(r.body).substring(0, 300)}`);
+      res.writeHead(r.status, { 'Content-Type': 'application/xml' });
+      res.end(r.body);
+      return;
+    }
+
+    // POST /yahoo/uploadLibImage  (Yahoo it-14061 修正 2026-06-27)
+    //   caller (RYS bfaith-portal) は JSON {fileName, itemCode, bufferBase64} で送る。
+    //   uploadItemImage と別の API で、 「追加画像 (lib)」 用。 additional1/sp_additional の
+    //   <img src> に貼れる画像をここで upload する。
+    //   contract:
+    //     - URL: ${apiBase}/uploadLibImage?seller_id=xxx
+    //     - form: `file` 単数 + Blob + filename + (optional) directory
+    //     - headers: Authorization + 署名 (uploadItemImage と同じ)
+    //   response は <Status>OK</Status> のみで <Url> を返さないので、 proxy 側で
+    //   `https://shopping.c.yimg.jp/lib/{store}/{fileName}` を合成して bfaith に返す
+    //   (公式仕様、 Codex R2 critical)。
+    if (pathname === '/yahoo/uploadLibImage' && req.method === 'POST') {
+      const ct = (req.headers['content-type'] || '').toLowerCase();
+      if (!ct.includes('application/json')) {
+        res.writeHead(415, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'uploadLibImage requires application/json' }));
+        return;
+      }
+
+      let rawBody;
+      try {
+        rawBody = await readJsonBodyWithCap(req);
+      } catch (e) {
+        const code = e.httpStatus || 500;
+        console.error(`[${ts()}] uploadLibImage body read error: ${e.message}`);
+        res.writeHead(code, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+        return;
+      }
+
+      let payload;
+      try { payload = JSON.parse(rawBody); }
+      catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `invalid JSON: ${e.message}` }));
+        return;
+      }
+
+      const { fileName, bufferBase64, itemCode } = payload || {};
+      if (!fileName || !bufferBase64) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'fileName, bufferBase64 are required' }));
+        return;
+      }
+      if (typeof fileName !== 'string' || typeof bufferBase64 !== 'string' ||
+          (itemCode != null && typeof itemCode !== 'string')) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'fileName, bufferBase64 must be string' }));
+        return;
+      }
+      try {
+        validateUploadLibFileName(fileName, itemCode);
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+        return;
+      }
+
+      const buf = Buffer.from(bufferBase64, 'base64');
+      // JPEG/PNG/GIF magic check
+      const head = buf.slice(0, 4).toString('hex');
+      const isJpeg = head.startsWith('ffd8');
+      const isPng = head.startsWith('89504e47');
+      const isGif = head.startsWith('474946');
+      if (!isJpeg && !isPng && !isGif) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `invalid image magic: ${head}` }));
+        return;
+      }
+      // 2MB cap (公式: 2022/5 以降 2MB、 以前は 500KB だったので店舗により im-06001 が出る可能性あり、
+      // その場合は bfaith 側で更に圧縮して retry)
+      if (buf.length >= 2 * 1024 * 1024) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `image too large: ${buf.length}B (>= 2MB)` }));
+        return;
+      }
+
+      const mimeType = isJpeg ? 'image/jpeg' : (isPng ? 'image/png' : 'image/gif');
+      const form = new FormData();
+      form.append('file', new Blob([buf], { type: mimeType }), fileName);
+
+      console.log(`[${ts()}] Yahoo uploadLibImage: itemCode=${itemCode || '?'} file=${fileName} ${buf.length}B mime=${mimeType}`);
+      const r = await callYahooAPIRaw('uploadLibImage', {
+        method: 'POST',
+        contentType: null,
+        body: form,
+        queryString: `seller_id=${encodeURIComponent(YAHOO_SELLER_ID)}`,
+      });
+      console.log(`[${ts()}] Yahoo uploadLibImage response: status=${r.status} body=${String(r.body).substring(0, 300)}`);
+
+      // R2 critical: response から URL を取れないので、 上流が 200 (= <Status>OK</Status> 想定) なら
+      // proxy 側で合成 URL を json body で返す。 200 でなければ Yahoo XML をそのまま forward。
+      if (r.status === 200) {
+        const yahooUrl = buildLibImageUrl(fileName);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, yahooUrl, body: r.body }));
+        return;
+      }
       res.writeHead(r.status, { 'Content-Type': 'application/xml' });
       res.end(r.body);
       return;
