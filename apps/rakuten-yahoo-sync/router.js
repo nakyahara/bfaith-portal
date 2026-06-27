@@ -22,7 +22,8 @@ import { acquire, SyncLockError } from './lib/sync-lock.js';
 import { syncNotionOverrides } from './services/notion-sync.js';
 import { patchPageProperties } from './lib/notion-client.js';
 import { evaluateItemForPublish } from './services/publish-pipeline.js';
-import { fetchAllItemCodes, fetchItemDetail } from './lib/rakuten-rms-proxy.js';
+import { fetchAllItemCodes, fetchItemDetail, fetchItemDetailsBulkDetailed } from './lib/rakuten-rms-proxy.js';
+import { buildNotionDraftProposal, toNotionProperties } from './lib/rakuten-to-notion-draft.js';
 import { executePublish, isPublishEnabled, buildIdempotencyKey } from './services/publish-executor.js';
 import { translateReason, summarizeReasons, categorizeReason } from './lib/reason-translator.js';
 import { resolveCategoryAndPath } from './services/category-resolver.js';
@@ -601,6 +602,125 @@ router.post('/api/notion/seed-category', async (req, res) => {
       yahooPath,
       notion_page_id: row.notion_page_id,
       notion_patch: { page_url: patchResult?.url || null },
+    });
+  } catch (e) {
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+// ───────────────── Phase E-13: Notion 自動下書き一括 ─────────────────
+
+/**
+ * 楽天 RMS から rakutenItem を取得し、 Notion override の空欄項目を自動下書き。
+ *
+ *   body:
+ *     dryRun (bool, default true): true なら PATCH せずに proposed/skipped 一覧のみ返す
+ *     itemCodes (string[]): 対象 item_code list (省略時は notion_overrides 全件で必須項目空欄あり)
+ *     limit (int): 1 回の最大処理 SKU 数 (default 200)
+ *
+ *   補完対象 (Notion 列):
+ *     Yahoo!タイトル ← 楽天 title 65 字 truncate
+ *     売価           ← 楽天 variants[].standardPrice (最小値)
+ *     税率           ← 楽天 payment.taxRate (0.1 → '10%')
+ *   配送方法は本 endpoint 対象外 (Codex R1 H-1: 楽天 normalDeliveryDateId は配送業者でなく lead time)
+ *
+ *   Notion PATCH 前に notion_overrides の cache 値を見て空欄判定 (Codex R1 H-2 の簡易版)。
+ *   既存値あれば skip。
+ */
+router.post('/api/admin/seed-notion-drafts', async (req, res) => {
+  try {
+    const db = getDB();
+    const body = req.body || {};
+    const dryRun = body.dryRun !== false; // default true
+    const limit = Math.max(1, Math.min(parseInt(body.limit, 10) || 200, 500));
+    const explicitCodes = Array.isArray(body.itemCodes) ? body.itemCodes.map(String).filter(Boolean) : null;
+
+    // 1. 対象 SKU 取得 (notion_overrides に居て、 yahoo_title/yahoo_price/notion_tax_rate のいずれかが空欄)
+    const filterSql = explicitCodes && explicitCodes.length > 0
+      ? `WHERE no.rakuten_manage_number IN (${explicitCodes.map(() => '?').join(',')})`
+      : `WHERE (no.yahoo_title IS NULL OR no.yahoo_title = ''
+              OR no.yahoo_price IS NULL OR no.yahoo_price <= 0
+              OR no.notion_tax_rate IS NULL OR no.notion_tax_rate = '')`;
+    const rows = db.prepare(`
+      SELECT no.notion_page_id, no.rakuten_manage_number AS manage_number,
+             no.yahoo_title, no.yahoo_price, no.notion_tax_rate, no.notion_delivery_label
+      FROM notion_overrides no
+      ${filterSql}
+      ORDER BY no.rakuten_manage_number
+      LIMIT ${limit}
+    `).all(...(explicitCodes || []));
+
+    if (rows.length === 0) {
+      return res.json({ status: 'ok', totalScanned: 0, proposed: [], skipped: [], applied: [], errors: [] });
+    }
+
+    // 2. 楽天 RMS bulk fetch
+    const manageNumbers = rows.map((r) => r.manage_number);
+    let rakutenItems = [];
+    let rakutenFailed = [];
+    try {
+      const r = await fetchItemDetailsBulkDetailed(manageNumbers);
+      rakutenItems = r.items || [];
+      rakutenFailed = r.failed || [];
+    } catch (e) {
+      return res.status(502).json({ status: 'fail', error: `rakuten_rms: ${e.message}` });
+    }
+    const rakutenByMn = new Map(rakutenItems.map((it) => [it.manageNumber, it]));
+
+    // 3. 各 SKU で proposal 構築 + (apply mode なら) PATCH
+    const proposed = [];
+    const skipped = [];
+    const applied = [];
+    const errors = [];
+    for (const r of rows) {
+      const rakutenItem = rakutenByMn.get(r.manage_number);
+      if (!rakutenItem) {
+        // Codex R2 軽微: fetchItemDetailsBulkDetailed の failed shape は { manageNumber, reason }
+        const f = rakutenFailed.find((f) => f.manageNumber === r.manage_number);
+        skipped.push({ itemCode: r.manage_number, reason: 'rakuten_fetch_failed', detail: f?.reason || null });
+        continue;
+      }
+      const { proposed: prop, skipped: skip } = buildNotionDraftProposal(rakutenItem, r);
+      if (Object.keys(prop).length === 0) {
+        skipped.push({ itemCode: r.manage_number, reason: 'all_skipped', detail: skip });
+        continue;
+      }
+      proposed.push({ itemCode: r.manage_number, manage_number: r.manage_number, proposed: prop, skipped: skip });
+
+      if (!dryRun) {
+        try {
+          const properties = toNotionProperties(prop);
+          await patchPageProperties(r.notion_page_id, properties);
+          // 自 DB cache も即反映 (Notion 側の次回 sync を待たない)
+          try {
+            const updates = [];
+            const params = [];
+            if (prop.yahoo_title)      { updates.push('yahoo_title = ?');      params.push(prop.yahoo_title); }
+            if (prop.yahoo_price != null) { updates.push('yahoo_price = ?');    params.push(prop.yahoo_price); }
+            if (prop.notion_tax_rate)  { updates.push('notion_tax_rate = ?');   params.push(prop.notion_tax_rate); }
+            if (updates.length > 0) {
+              updates.push(`synced_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`);
+              params.push(r.notion_page_id);
+              db.prepare(`UPDATE notion_overrides SET ${updates.join(', ')} WHERE notion_page_id = ?`).run(...params);
+            }
+          } catch (_) { /* best-effort */ }
+          applied.push({ itemCode: r.manage_number, proposed: prop });
+          audit(db, 'notion_seed_draft', { itemCode: r.manage_number, proposed: prop });
+        } catch (e) {
+          errors.push({ itemCode: r.manage_number, error: e.message });
+        }
+      }
+    }
+
+    return res.json({
+      status: 'ok',
+      dryRun,
+      totalScanned: rows.length,
+      proposed: proposed.length,
+      skipped: skipped.length,
+      applied: applied.length,
+      errors: errors.length,
+      details: { proposed, skipped, applied, errors },
     });
   } catch (e) {
     return res.status(500).json({ status: 'fail', error: e.message });

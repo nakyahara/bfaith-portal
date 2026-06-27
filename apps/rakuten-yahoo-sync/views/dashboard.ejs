@@ -151,6 +151,15 @@
                   title="aburatoishioil100 の Notion master に Yahoo!カテゴリID=43494 / Yahoo!path=生活雑貨・日用品:掃除用品 を書き込み + Notion sync を 1 click で実行 (smoke test 用、 後で値変えたい時は Notion で直接編集)">
             🧪 aburatoishi に Yahoo カテゴリ書込 (テスト)
           </button>
+          <%# Phase E-13: 楽天 RMS → Notion 自動下書き (Yahoo!タイトル/売価/税率 を空欄補完) %>
+          <button class="btn btn-sm btn-outline-warning ms-2 js-seed-notion-drafts-dry"
+                  title="楽天 RMS から Yahoo!タイトル/売価/税率 を取って Notion の空欄に下書きする。 dry-run で何が補完されるか先に確認">
+            🪄 楽天から下書き (dry-run)
+          </button>
+          <button class="btn btn-sm btn-outline-danger ms-2 js-seed-notion-drafts-apply"
+                  title="dry-run で確認後にこれを押すと実際に Notion に書き込む。 既存値あれば skip">
+            ✏️ 楽天から下書き (本実行)
+          </button>
         </li>
         <li>
           <strong><%= summary.actionable %> 商品</strong> が Yahoo に出せます
@@ -1667,6 +1676,50 @@ async function seedAburatoishiCategory(evt) {
   }
 }
 
+// ───── Phase E-13: 楽天 RMS → Notion 自動下書き ─────
+async function seedNotionDrafts({ dryRun }) {
+  if (!dryRun) {
+    if (!confirm('楽天 RMS から取った Yahoo!タイトル/売価/税率 を Notion の空欄に書き込みます。\n既存値は触りません。\n続行しますか?')) return;
+  }
+  try {
+    const res = await fetch('/apps/rakuten-yahoo-sync/api/admin/seed-notion-drafts', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dryRun, limit: 200 }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      alert('失敗: ' + (data.error || ('HTTP ' + res.status)));
+      return;
+    }
+    const mode = dryRun ? '🔍 dry-run' : '✅ 本実行';
+    const lines = [];
+    lines.push(mode + ' 結果');
+    lines.push(`総対象 SKU: ${data.totalScanned}`);
+    lines.push(`補完予定/補完済: ${data.proposed}`);
+    lines.push(`skip: ${data.skipped}`);
+    if (!dryRun) lines.push(`Notion 書込済: ${data.applied}`);
+    if (data.errors > 0) lines.push(`エラー: ${data.errors}`);
+    if (data.details?.proposed?.length > 0) {
+      lines.push('\n--- 補完予定 (最大 10 件) ---');
+      data.details.proposed.slice(0, 10).forEach((p) => {
+        lines.push(`${p.itemCode}: ${Object.entries(p.proposed).map(([k,v]) => `${k}=${typeof v === 'string' ? v.slice(0, 30) : v}`).join(' / ')}`);
+      });
+    }
+    if (data.details?.skipped?.length > 0 && data.details.skipped.length < 20) {
+      lines.push('\n--- skip 理由 ---');
+      data.details.skipped.slice(0, 10).forEach((s) => {
+        lines.push(`${s.itemCode}: ${s.reason}`);
+      });
+    }
+    alert(lines.join('\n'));
+    if (!dryRun && data.applied > 0) {
+      if (confirm('Notion sync を実行して dashboard 反映しますか?')) location.reload();
+    }
+  } catch (e) {
+    alert('ネットワークエラー: ' + e.message);
+  }
+}
+
 async function yahooCategoryLearn(evt) {
   const btn = evt.currentTarget;
   if (!btn || btn.disabled) return;
@@ -1828,6 +1881,8 @@ document.addEventListener('DOMContentLoaded', () => {
   document.querySelector('.js-backfill-rakuten-title')?.addEventListener('click', backfillRakutenTitle);
   document.querySelector('.js-yahoo-category-learn')?.addEventListener('click', yahooCategoryLearn);
   document.querySelector('.js-seed-aburatoishi')?.addEventListener('click', seedAburatoishiCategory);
+  document.querySelector('.js-seed-notion-drafts-dry')?.addEventListener('click', () => seedNotionDrafts({ dryRun: true }));
+  document.querySelector('.js-seed-notion-drafts-apply')?.addEventListener('click', () => seedNotionDrafts({ dryRun: false }));
   document.querySelectorAll('.js-close-image-exclusion-modal').forEach((el) => el.addEventListener('click', closeImageExclusionModal));
   document.querySelector('.js-add-image-pattern')?.addEventListener('click', addImagePattern);
   document.querySelectorAll('.js-close-exclusion-modal').forEach((el) => el.addEventListener('click', closeExclusionModal));
