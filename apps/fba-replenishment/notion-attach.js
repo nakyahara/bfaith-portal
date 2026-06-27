@@ -51,7 +51,26 @@ async function getSchema(dbId) {
   }
   if (!titleProp) throw new Error('Notion DBにタイトルプロパティが見つかりません');
 
-  return { titleProp, status: pickStatusProp(props) };
+  return { titleProp, status: pickStatusProp(props), props };
+}
+
+// 指定名の URL(リンク)型プロパティが存在すれば名前を返す
+function urlPropName(props, name) {
+  return props[name] && props[name].type === 'url' ? name : null;
+}
+
+// カードのコメント欄に「送り状発行手順」リンクを投稿 (best-effort)
+async function addInvoiceGuideComment(pageId) {
+  const url = process.env.FBA_PICKING_INVOICE_GUIDE_URL
+    || 'https://app.notion.com/p/FBA-38cfc7bb5f3080ffbafdded6cee4727a';
+  const label = process.env.FBA_PICKING_INVOICE_GUIDE_LABEL || '送り状発行手順';
+  await notionFetch('/comments', {
+    method: 'POST',
+    body: JSON.stringify({
+      parent: { page_id: pageId },
+      rich_text: [{ type: 'text', text: { content: label, link: { url } } }],
+    }),
+  });
 }
 
 // ステータス対象プロパティの決定 (優先順):
@@ -82,11 +101,11 @@ export function pickStatusProp(props = {}) {
  * (カードは必ず作る)。
  * @returns {Promise<{ pageId: string, url: string, statusSet: boolean }>}
  */
-export async function createPickingCard({ title, pdfUrl }) {
+export async function createPickingCard({ title, pdfUrl, plan1Url, plan2Url }) {
   if (!getToken()) throw new Error('FBA_PICKING_NOTION_TOKEN が未設定です');
   if (!title) throw new Error('カード名(納品予定日)が空です');
   const dbId = getNotionDbId();
-  const { titleProp, status } = await getSchema(dbId);
+  const { titleProp, status, props } = await getSchema(dbId);
 
   const children = [];
   if (pdfUrl) {
@@ -97,8 +116,14 @@ export async function createPickingCard({ title, pdfUrl }) {
     });
   }
 
-  const baseProps = { [titleProp]: { title: [{ text: { content: title } }] } };
-  const statusProps = { ...baseProps };
+  // タイトル + URL_1/URL_2 (リンク型プロパティが存在し値がある場合のみ)
+  const commonProps = { [titleProp]: { title: [{ text: { content: title } }] } };
+  const p1 = urlPropName(props, process.env.FBA_PICKING_NOTION_URL1_PROP || 'URL_1');
+  const p2 = urlPropName(props, process.env.FBA_PICKING_NOTION_URL2_PROP || 'URL_2');
+  if (p1 && plan1Url) commonProps[p1] = { url: plan1Url };
+  if (p2 && plan2Url) commonProps[p2] = { url: plan2Url };
+
+  const statusProps = { ...commonProps };
   if (status) {
     statusProps[status.name] = status.type === 'status'
       ? { status: { name: getStatusValue() } }
@@ -106,20 +131,29 @@ export async function createPickingCard({ title, pdfUrl }) {
   }
   const mkBody = (properties) => JSON.stringify({ parent: { database_id: dbId }, properties, children });
 
+  // ページ作成 (ステータス付き → 400ならステータス無しで再作成。重複防止のため400限定)
+  let page, statusSet = false;
   if (status) {
     try {
-      const page = await notionFetch('/pages', { method: 'POST', body: mkBody(statusProps) });
-      return { pageId: page.id, url: page.url, statusSet: true };
+      page = await notionFetch('/pages', { method: 'POST', body: mkBody(statusProps) });
+      statusSet = true;
     } catch (e) {
-      // 400(validation_error)= ステータス指定が原因でNotion側はページ未作成と判断できる場合のみ、
-      // ステータス無しで再作成する。タイムアウト/ネットワーク/5xx はページ作成済みの可能性があり
-      // 重複作成を招くため再作成しない (Codex Medium)。
       if (e.status !== 400) throw e;
       console.error('[Notion] ステータス付き作成が400、ステータス無しで再作成:', e.message);
-      const page = await notionFetch('/pages', { method: 'POST', body: mkBody(baseProps) });
-      return { pageId: page.id, url: page.url, statusSet: false };
+      page = await notionFetch('/pages', { method: 'POST', body: mkBody(commonProps) });
     }
+  } else {
+    page = await notionFetch('/pages', { method: 'POST', body: mkBody(commonProps) });
   }
-  const page = await notionFetch('/pages', { method: 'POST', body: mkBody(baseProps) });
-  return { pageId: page.id, url: page.url, statusSet: false };
+
+  // コメント欄に「送り状発行手順」リンクを投稿 (best-effort: 失敗してもカードは成功)
+  let commentAdded = false;
+  try {
+    await addInvoiceGuideComment(page.id);
+    commentAdded = true;
+  } catch (e) {
+    console.error('[Notion] コメント投稿失敗:', e.message);
+  }
+
+  return { pageId: page.id, url: page.url, statusSet, commentAdded };
 }

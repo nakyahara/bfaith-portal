@@ -1546,8 +1546,18 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
         try {
           const base = process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`;
           const pdfUrl = annotate.ok ? `${base}/print/picking/${runId}/pdf` : null;
-          const card = await createPickingCard({ title, pdfUrl });
-          notion = { attempted: true, ok: true, title, url: card.url, attached: !!pdfUrl };
+          // ⑤ FBA納品プランURL。new URL で http(s)+ホスト名を厳密検証し、不正URLはNotionへ送らない
+          // (不正値でNotion /pages が400→カード作成自体が失敗するのを防ぐ, Codex Medium)。
+          const httpOnly = (v) => {
+            const s = String(v || '').trim();
+            if (!s) return null;
+            try { const u = new URL(s); return (u.protocol === 'http:' || u.protocol === 'https:') && u.hostname ? s : null; }
+            catch { return null; }
+          };
+          const plan1Url = httpOnly(req.body?.plan1_url);
+          const plan2Url = httpOnly(req.body?.plan2_url);
+          const card = await createPickingCard({ title, pdfUrl, plan1Url, plan2Url });
+          notion = { attempted: true, ok: true, title, url: card.url, attached: !!pdfUrl, commentAdded: card.commentAdded, statusSet: card.statusSet };
         } catch (e) {
           console.error('[Picking] Notionカード作成失敗:', e);
           notion = { attempted: true, ok: false, title, error: e.message };
