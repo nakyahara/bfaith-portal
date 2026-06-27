@@ -14,6 +14,7 @@
  */
 
 import { sanitizeProductHtml } from '../lib/html-sanitize.js';
+import { buildYahooExplanation, buildYahooHeadline } from '../lib/yahoo-text.js';
 import { shouldUseSagawaPrice } from './delivery-resolver.js';
 
 export const YAHOO_TITLE_MAX_LEN = 65;
@@ -150,13 +151,29 @@ export function buildYahooEditItemFields({
   }
 
   // caption / explanation / additional1 / sp_additional (Q33)
+  //
+  //   2026-06-27 editItem HTTP 400 (Code it-01033) で判明: Yahoo の explanation は
+  //   HTML 不可 + 全角 500 字以内 (= 1000 units)。 旧 RakutenYahooSync は productDescription.pc を
+  //   HTML のまま入れていたため、 1 SKU smoke で即 400。 buildYahooExplanation で:
+  //     - headline → itemName → 楽天 PC description 先頭 (HTML→text) で結合
+  //     - 1000 units (= 全角 500) で grapheme cluster 単位 truncate
+  //   caption / additional1 / sp_additional は HTML 可なので現状維持 (sanitize のみ)。
   fields.caption = pickCaptionField(notionOverride, rakutenItem);
-  fields.explanation = sanitizeProductHtml(rakutenItem.productDescription?.pc || '');
+  fields.explanation = buildYahooExplanation({
+    headline: notionOverride?.yahoo_headline,
+    itemName: rakutenItem.itemName || rakutenItem.title || '',
+    html: rakutenItem.productDescription?.pc || '',
+  });
   fields.additional1 = sanitizeProductHtml(rakutenItem.salesDescription || '');
   fields.sp_additional = sanitizeProductHtml(rakutenItem.productDescription?.sp || '');
 
   // headline / jan (Notion override 任意)
-  if (notionOverride?.yahoo_headline) fields.headline = notionOverride.yahoo_headline;
+  //   Codex R3 H-1: headline は Yahoo HTML 不可 + 全角 30 以内なので、 buildYahooHeadline で
+  //   plain 化 + truncate してから代入 (Notion に `<b>` 等が混入していても安全)。
+  if (notionOverride?.yahoo_headline) {
+    const h = buildYahooHeadline(notionOverride.yahoo_headline);
+    if (h) fields.headline = h;
+  }
   if (notionOverride?.yahoo_jan) fields.jan = String(notionOverride.yahoo_jan);
 
   // 楽天 features 由来 flags
