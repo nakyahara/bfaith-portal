@@ -13,8 +13,8 @@
  */
 import express from 'express';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
-import { getSupplierReport, getUnresolvedStats, MALL_LABELS } from './aggregate.js';
-import { buildCsv } from './csv.js';
+import { getSupplierReport, getSupplierDailyDetail, getUnresolvedStats, MALL_LABELS } from './aggregate.js';
+import { buildCsv, buildDailyCsv } from './csv.js';
 import {
   listSuppliers, upsertSupplierName, getSupplierName,
   listTokens, createToken, revokeToken,
@@ -99,6 +99,23 @@ router.get('/api/summary.csv', (req, res) => {
     res.send(buildCsv(report, MALL_LABELS));
   } catch (e) {
     console.error('[supplier-sales] csv error:', e.message);
+    res.status(500).send('CSV 生成に失敗しました');
+  }
+});
+
+// 確定(精算ベース)の日次CSV: 日付×モール×出品×数量/売上
+router.get('/api/daily.csv', (req, res) => {
+  try {
+    const code = String(req.query.code || '').trim();
+    if (!code) return res.status(400).send('code は必須です');
+    const name = getSupplierName(code) || code;
+    const report = getSupplierDailyDetail(getMirrorDB(), code, periodOpts(req));
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition',
+      `attachment; filename="supplier_daily_${encodeURIComponent(name)}_${report.period ? report.period.start + '_' + report.period.end : ''}.csv"`);
+    res.send(buildDailyCsv(report, MALL_LABELS));
+  } catch (e) {
+    console.error('[supplier-sales] daily csv error:', e.message);
     res.status(500).send('CSV 生成に失敗しました');
   }
 });

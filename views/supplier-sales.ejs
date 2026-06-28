@@ -96,7 +96,8 @@
               <option value="30d" selected>30日</option>
               <option value="90d">90日</option>
             </select>
-            <a class="btn btn-sec" id="btnCsv" href="#">CSVダウンロード</a>
+            <a class="btn btn-sec" id="btnCsv" href="#">商品別CSV</a>
+            <a class="btn btn-sec" id="btnDailyCsv" href="#">日次CSV(日付×モール)</a>
           </div>
         </div>
         <div id="prevMeta" class="muted" style="margin:8px 0;"></div>
@@ -165,6 +166,7 @@
     function curPeriod(){ return document.getElementById('prevPeriod').value || '30d'; }
     function syncCsvHref(){
       document.getElementById('btnCsv').href = base+'/api/summary.csv?code='+encodeURIComponent(current.code)+'&period='+curPeriod();
+      document.getElementById('btnDailyCsv').href = base+'/api/daily.csv?code='+encodeURIComponent(current.code)+'&period='+curPeriod();
     }
 
     async function openDetail(code, name){
