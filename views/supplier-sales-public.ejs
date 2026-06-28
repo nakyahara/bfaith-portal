@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow, noarchive">
+  <title><%= title %></title>
+  <style>
+    :root { --line:#e2e8f0; --muted:#64748b; --accent:#2563eb; --bg:#f8fafc; }
+    * { box-sizing: border-box; }
+    body { font-family: "Hiragino Sans","Meiryo",system-ui,sans-serif; margin:0; color:#0f172a; background:var(--bg); }
+    .wrap { max-width: 1040px; margin: 0 auto; padding: 20px 16px 64px; }
+    header.hd { padding: 8px 0 16px; border-bottom: 2px solid var(--accent); margin-bottom: 16px; }
+    .hd h1 { font-size: 20px; margin: 0 0 4px; }
+    .hd .sub { color: var(--muted); font-size: 13px; }
+    .period { display:inline-block; background:#eff6ff; color:#1e40af; border:1px solid #bfdbfe; border-radius:6px; padding:4px 10px; font-size:12px; margin-top:8px; }
+    .cards { display:flex; flex-wrap:wrap; gap:12px; margin:16px 0 8px; }
+    .card { flex:1 1 150px; background:#fff; border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
+    .card .k { color:var(--muted); font-size:12px; }
+    .card .v { font-size:22px; font-weight:700; margin-top:2px; }
+    .card .v small { font-size:12px; color:var(--muted); font-weight:400; }
+    table { width:100%; border-collapse:collapse; background:#fff; font-size:13px; border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+    th, td { padding:9px 10px; border-bottom:1px solid var(--line); text-align:right; white-space:nowrap; }
+    th { background:#f1f5f9; color:#334155; font-weight:600; font-size:12px; position:sticky; top:0; }
+    td.l, th.l { text-align:left; white-space:normal; }
+    tbody tr:hover { background:#f8fafc; }
+    .name { font-weight:600; }
+    .code { color:var(--muted); font-size:11px; }
+    .malls { color:var(--muted); font-size:11px; margin-top:3px; }
+    .trend-up { color:#16a34a; } .trend-dn { color:#dc2626; } .trend-fl { color:var(--muted); }
+    .note { color:var(--muted); font-size:11px; margin-top:18px; line-height:1.7; }
+    .empty { background:#fff; border:1px solid var(--line); border-radius:10px; padding:40px; text-align:center; color:var(--muted); }
+    .scroll { overflow-x:auto; }
+    @media (max-width:640px){ .hd h1{font-size:17px;} .card .v{font-size:18px;} }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <header class="hd">
+    <h1><%= supplierName %> 様 販売実績</h1>
+    <div class="sub">B-Faith / 全モール（Amazon・楽天 ほか）合算</div>
+    <% if (windows) { %>
+      <div class="period">集計対象: <%= windows.w30start %> 〜 <%= windows.cutoff %>（直近30日／<%= windows.cutoff %> まで確定分）</div>
+    <% } %>
+  </header>
+
+  <% if (!windows || !products || products.length === 0) { %>
+    <div class="empty">この期間に対象商品の販売実績データがありません。</div>
+  <% } else {
+       const yen = n => '¥' + Math.round(n).toLocaleString('ja-JP');
+       const trend = (cur, prev) => {
+         if (prev === 0 && cur === 0) return { cls:'trend-fl', mark:'—' };
+         if (prev === 0) return { cls:'trend-up', mark:'▲ new' };
+         const r = (cur - prev) / prev;
+         if (r > 0.05) return { cls:'trend-up', mark:'▲ ' + Math.round(r*100) + '%' };
+         if (r < -0.05) return { cls:'trend-dn', mark:'▼ ' + Math.round(Math.abs(r)*100) + '%' };
+         return { cls:'trend-fl', mark:'→' };
+       };
+  %>
+    <div class="cards">
+      <div class="card"><div class="k">対象商品数</div><div class="v"><%= totals.productCount.toLocaleString('ja-JP') %><small> 点</small></div></div>
+      <div class="card"><div class="k">直近7日 販売数</div><div class="v"><%= totals.units7.toLocaleString('ja-JP') %><small> 個</small></div></div>
+      <div class="card"><div class="k">直近30日 販売数</div><div class="v"><%= totals.units30.toLocaleString('ja-JP') %><small> 個</small></div></div>
+      <div class="card"><div class="k">直近30日 売上</div><div class="v"><%= yen(totals.sales30) %></div></div>
+    </div>
+
+    <div class="scroll">
+    <table>
+      <thead>
+        <tr>
+          <th class="l">商品</th>
+          <th>7日<br>販売数</th>
+          <th>7日<br>傾向</th>
+          <th>30日<br>販売数</th>
+          <th>30日<br>日平均</th>
+          <th>30日<br>売上</th>
+          <th>最終<br>販売日</th>
+        </tr>
+      </thead>
+      <tbody>
+        <% products.forEach(p => {
+             const t = trend(p.units7, p.units7prev);
+             const mallStr = Object.keys(p.malls).map(m => `${mallLabels[m]||m} ${p.malls[m].units}`).join(' / ');
+        %>
+          <tr>
+            <td class="l">
+              <div class="name"><%= p.product_name || '(商品名なし)' %></div>
+              <div class="code"><%= p.ne_code %></div>
+              <% if (mallStr) { %><div class="malls"><%= mallStr %></div><% } %>
+            </td>
+            <td><%= p.units7.toLocaleString('ja-JP') %></td>
+            <td class="<%= t.cls %>"><%= t.mark %></td>
+            <td><%= p.units30.toLocaleString('ja-JP') %></td>
+            <td><%= p.avgPerDay30.toFixed(1) %></td>
+            <td><%= yen(p.sales30) %></td>
+            <td><%= p.lastSold || '—' %></td>
+          </tr>
+        <% }) %>
+      </tbody>
+    </table>
+    </div>
+
+    <div class="note">
+      ・販売数は返品・キャンセルを差し引いた「純販売数」です。<br>
+      ・売上は各モールの販売価格（税込）の合計です。手数料・送料等は含みません。<br>
+      ・直近の数日はモール側の確定処理の都合で数値が変動するため、<%= windows.cutoff %> までの確定分で集計しています。<br>
+      ・本ページは B-Faith が共有用に発行した専用リンクです。第三者への転送はお控えください。
+    </div>
+  <% } %>
+</div>
+</body>
+</html>
