@@ -52,7 +52,7 @@ import {
   removePattern,
 } from './lib/image-exclusion-patterns.js';
 import { filterUploadableImageUrlsDetailed } from './lib/yahoo-image.js';
-import { backfillRakutenTitles, countMissingRakutenTitles } from './lib/rakuten-title-backfill.js';
+import { backfillRakutenTitles, countMissingRakutenTitles, backfillRakutenGenre, countMissingRakutenGenre } from './lib/rakuten-title-backfill.js';
 import {
   countMissingYahooCategories,
   backfillYahooCategoriesAndPaths,
@@ -428,6 +428,7 @@ router.get('/', (req, res) => {
   let fixableByCategory = {};
   let exclusionCount = { temporary: 0, permanent: 0, total: 0 };
   let rakutenTitleMissing = 0;
+  let rakutenGenreMissing = 0;
   let yahooCategoryMissing = 0;
   let yahooCategoryLearnedGenres = 0;
   const filter = ['all', 'actionable', 'fixable', 'done', 'excluded', 'stale', 'orphan'].includes(req.query.filter)
@@ -445,6 +446,7 @@ router.get('/', (req, res) => {
     fixableByCategory = listed.fixableByCategory;
     exclusionCount = countActiveByKind(db);
     try { rakutenTitleMissing = countMissingRakutenTitles(db); } catch (_) { /* migration 011 未適用 */ }
+    try { rakutenGenreMissing = countMissingRakutenGenre(db); } catch (_) { /* migration 012 未適用 */ }
     try { yahooCategoryMissing = countMissingYahooCategories(db, getMirrorDbPath()); } catch (_) { /* migration 012 未適用 or mirror 未設定 */ }
     try { yahooCategoryLearnedGenres = countLearnedGenres(db); } catch (_) { /* migration 013 未適用 */ }
   } catch (_) {
@@ -469,6 +471,7 @@ router.get('/', (req, res) => {
     fixableByCategory,
     exclusionCount,                                       // E-7-c: 移行除外管理 header 集計
     rakutenTitleMissing,                                  // E-9: 楽天タイトル backfill ボタンの未取得件数 badge
+    rakutenGenreMissing,                                  // E-16: 楽天 genre_id backfill ボタンの未取得件数 badge
     yahooCategoryMissing,                                 // E-11-b: Yahoo category backfill ボタンの未取得件数
     yahooCategoryLearnedGenres,                           // E-11-b: 学習済 genre 数
     filter,
@@ -1411,6 +1414,35 @@ router.post('/api/rakuten-title-backfill', async (req, res) => {
     const remaining = countMissingRakutenTitles(db);
     audit(db, 'rakuten_title_backfill', { ...r, remaining });
     return res.json({ status: 'ok', ...r, remaining });
+  } catch (e) {
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+// ───────────────── Phase E-16: 楽天 genre_id backfill (取りこぼし埋め戻し) ─────────────────
+
+/**
+ * Phase E-16: rakuten_genre_id が NULL の候補を楽天 RMS から再取得して埋める手動 trigger。
+ *
+ *   背景: title backfill (E-9) が先行し、 genre 抽出 (E-11-a) 追加前に title だけ埋まった候補は
+ *   genre が永久に NULL のまま残り、 カテゴリ自動解決が全滅 →「出せる」 が増えない真因だった。
+ *
+ *   body: { limit?: number (default 100, max 200), dryRun?: boolean (default false) }
+ *   dryRun=true なら DB 更新せず 「何件 genre 取れるか / 楽天側 genre 無しが何件か」 を試算。
+ */
+router.post('/api/rakuten-genre-backfill', async (req, res) => {
+  try {
+    const db = getDB();
+    const body = req.body || {};
+    const limit = Number.isInteger(body.limit) && body.limit > 0 && body.limit <= 200 ? body.limit : 100;
+    const dryRun = body.dryRun === true;
+    const r = await backfillRakutenGenre({ db, limit, dryRun });
+    // Codex R1 High: genre 列が無い環境 (migration 012 未適用) では countMissingRakutenGenre が
+    //   throw して endpoint が 500 になる。 try/catch で remaining=null に落として 200 を返す。
+    let remaining = null;
+    try { remaining = countMissingRakutenGenre(db); } catch (_) { /* genre 列なし環境 */ }
+    if (!dryRun) audit(db, 'rakuten_genre_backfill', { ...r, remaining });
+    return res.json({ status: 'ok', dryRun, ...r, remaining });
   } catch (e) {
     return res.status(500).json({ status: 'fail', error: e.message });
   }

@@ -139,6 +139,18 @@
               📥 楽天 RMS から商品名取得 (<%= rakutenTitleMissing %> 件未取得)
             </button>
           <% } %>
+          <%# Phase E-16: 楽天 genre_id 取りこぼし埋め戻し。 title だけ先に埋まり genre が NULL の候補を
+              楽天 RMS から再取得。 これが埋まらないとカテゴリ自動解決が全滅し「出せる」 が増えない。 %>
+          <% if (typeof rakutenGenreMissing !== 'undefined' && rakutenGenreMissing > 0) { %>
+            <button class="btn btn-sm btn-outline-info ms-2 js-backfill-rakuten-genre-dry"
+                    title="楽天 genre_id が未取得の商品を楽天 RMS から再取得します。 まず dry-run で 「何件 genre が取れるか / 楽天側に genre 設定が無い商品が何件か」 を確認">
+              🔍 楽天 genre 取得 (dry-run) (<%= rakutenGenreMissing %> 件未取得)
+            </button>
+            <button class="btn btn-sm btn-outline-danger ms-2 js-backfill-rakuten-genre-apply"
+                    title="dry-run 確認後にこれを押すと楽天 genre_id を実際に DB へ保存します。 保存後、 カテゴリ自動解決が効いて「出せる」 が増えます">
+              📥 楽天 genre 取得 (本実行)
+            </button>
+          <% } %>
           <%# Phase E-11-b: Yahoo カテゴリ学習。 既存 130 件から逆引きで learn、 publish 自動推定の基盤。 %>
           <% if (typeof yahooCategoryMissing !== 'undefined' && (yahooCategoryMissing > 0 || (typeof yahooCategoryLearnedGenres !== 'undefined' && yahooCategoryLearnedGenres === 0)) ) { %>
             <button class="btn btn-sm btn-outline-info ms-2 js-yahoo-category-learn"
@@ -1650,6 +1662,51 @@ async function backfillRakutenTitle(evt) {
   }
 }
 
+// ───── 楽天 genre_id backfill (Phase E-16) ─────
+async function backfillRakutenGenre(evt, dryRun) {
+  const btn = evt.currentTarget;
+  if (!btn || btn.disabled) return;
+  if (!dryRun && !confirm('楽天 RMS から genre_id を取得して DB に保存します。\n先に dry-run で件数を確認しましたか?\n\n続行しますか?')) return;
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = dryRun ? '試算中...' : '取得中...';
+  try {
+    const res = await fetch('/apps/rakuten-yahoo-sync/api/rakuten-genre-backfill', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ limit: 200, dryRun: !!dryRun }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      alert('失敗: ' + (data.error || ('HTTP ' + res.status)));
+      btn.disabled = false; btn.textContent = original;
+      return;
+    }
+    if (dryRun) {
+      // dry-run: DB 更新せず、 取れる件数 / 楽天側 genre 無し / fetch 失敗 を表示
+      const msg = `【dry-run 試算】\n`
+        + `対象 ${data.picked} 件をチェック\n`
+        + `・genre 取得できる: ${data.updated} 件\n`
+        + `・楽天側に genre 設定が無い: ${data.stillNull} 件\n`
+        + `・楽天 fetch 失敗: ${data.failed} 件\n`
+        + `(未取得 残 ${data.remaining} 件)\n\n`
+        + `この内容で本実行するなら「📥 楽天 genre 取得 (本実行)」 を押してください。`;
+      alert(msg);
+      btn.disabled = false; btn.textContent = original;
+    } else {
+      const msg = `楽天 genre を ${data.updated} 件保存しました。\n`
+        + `・楽天側に genre 無し: ${data.stillNull} 件\n`
+        + `・fetch 失敗: ${data.failed} 件\n`
+        + `(未取得 残 ${data.remaining} 件)\n\n`
+        + `カテゴリ自動解決が効いて「出せる」 が増えているか確認します。 ページを再読み込みします。`;
+      alert(msg);
+      location.reload();
+    }
+  } catch (e) {
+    alert('ネットワークエラー: ' + e.message);
+    btn.disabled = false; btn.textContent = original;
+  }
+}
+
 // ───── Yahoo カテゴリ学習 (Phase E-11-b) ─────
 async function seedAburatoishiCategory(evt) {
   const btn = evt.currentTarget;
@@ -1926,6 +1983,8 @@ document.addEventListener('DOMContentLoaded', () => {
   document.querySelector('.js-open-exclusion-mgmt')?.addEventListener('click', openExclusionModal);
   document.querySelector('.js-open-image-exclusion-mgmt')?.addEventListener('click', openImageExclusionModal);
   document.querySelector('.js-backfill-rakuten-title')?.addEventListener('click', backfillRakutenTitle);
+  document.querySelector('.js-backfill-rakuten-genre-dry')?.addEventListener('click', (e) => backfillRakutenGenre(e, true));
+  document.querySelector('.js-backfill-rakuten-genre-apply')?.addEventListener('click', (e) => backfillRakutenGenre(e, false));
   document.querySelector('.js-yahoo-category-learn')?.addEventListener('click', yahooCategoryLearn);
   document.querySelector('.js-seed-aburatoishi')?.addEventListener('click', seedAburatoishiCategory);
   document.querySelector('.js-seed-notion-drafts-dry')?.addEventListener('click', () => seedNotionDrafts({ dryRun: true }));

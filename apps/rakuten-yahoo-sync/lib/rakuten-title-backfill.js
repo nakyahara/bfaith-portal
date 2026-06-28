@@ -63,6 +63,124 @@ export function extractRakutenGenre(item) {
 }
 
 /**
+ * Phase E-16: active (candidate / stale) の中で rakuten_genre_id が NULL の件数。
+ *   title は既に埋まっているが genre が NULL の取りこぼし (E-11-a 以前に title backfill された分) を数える。
+ *   rakuten_manage_number があるものだけ (楽天 RMS で再取得可能なもの)。
+ */
+export function countMissingRakutenGenre(db) {
+  return db.prepare(`
+    SELECT COUNT(*) AS n
+    FROM migration_candidates
+    WHERE status IN ('candidate', 'stale')
+      AND (rakuten_genre_id IS NULL OR rakuten_genre_id = '')
+      AND rakuten_manage_number IS NOT NULL
+      AND rakuten_manage_number <> ''
+  `).get().n;
+}
+
+/**
+ * Phase E-16: rakuten_genre_id が NULL の候補を楽天 RMS から再取得して埋める専用 backfill。
+ *
+ * 背景: backfillRakutenTitles は `rakuten_title IS NULL` のみを対象とするため、
+ *   E-11-a (genre 抽出) 追加より前に title だけ埋まった候補は genre が永久に NULL のまま残る。
+ *   この関数は genre_id NULL を起点に再取得し、 genre 列だけを更新する (title は touch しない)。
+ *
+ * 無限再取得対策: dryRun で事前検証でき、 本実行は中原さんの明示操作 (専用ボタン) のみ。
+ *   楽天側に genre 設定が無い SKU は updated されず stillNull に計上され、 中原さんが把握できる。
+ *   Codex R1 Medium 既知の制約: stillNull な行は更新されないため、 古い順 limit 件の先頭が
+ *   全部 genre 無しだと後続に進めない。 ただし limit=200 + 実データの stillNull は少数の見込みで、
+ *   ボタン連打すれば genre 取得済み行は対象から外れて進む。 恒久対策が要るなら試行マーカー列を追加する。
+ *
+ * @param {object} opts
+ * @param {Database} opts.db
+ * @param {number}   [opts.limit=100]
+ * @param {boolean}  [opts.dryRun=false]  true なら DB 更新せず 「何件 genre 取れるか」 だけ返す
+ * @param {object}   [opts.deps]          { fetchItemDetailsBulkDetailed } テスト用差し替え
+ * @returns {Promise<{picked, updated, stillNull, failed, errors}>}
+ */
+export async function backfillRakutenGenre({ db, limit = DEFAULT_BATCH_LIMIT, dryRun = false, deps = {} } = {}) {
+  if (!db) throw new Error('backfillRakutenGenre: db required');
+  const _bulk = deps.fetchItemDetailsBulkDetailed || fetchItemDetailsBulkDetailed;
+
+  // genre 列が存在しない (migration 012 未適用) 環境では何もしない
+  try {
+    db.prepare('SELECT rakuten_genre_id FROM migration_candidates LIMIT 0').get();
+  } catch (_) {
+    return { picked: 0, updated: 0, stillNull: 0, failed: 0, errors: ['genre_columns_missing'] };
+  }
+
+  const targets = db.prepare(`
+    SELECT item_code, rakuten_manage_number
+    FROM migration_candidates
+    WHERE status IN ('candidate', 'stale')
+      AND (rakuten_genre_id IS NULL OR rakuten_genre_id = '')
+      AND rakuten_manage_number IS NOT NULL
+      AND rakuten_manage_number <> ''
+    ORDER BY first_detected_at ASC
+    LIMIT ?
+  `).all(limit);
+
+  if (targets.length === 0) return { picked: 0, updated: 0, stillNull: 0, failed: 0, errors: [] };
+
+  // Codex R1 Medium: 同一 manage_number が複数 item_code 行に存在しうる。
+  //   batch 境界を picked 行に厳密に限定するため mn → item_code[] で持ち、
+  //   UPDATE も item_code IN (...) で picked 行だけに絞る (updated > picked を防止)。
+  const itemCodesByMn = new Map();
+  for (const t of targets) {
+    if (!itemCodesByMn.has(t.rakuten_manage_number)) itemCodesByMn.set(t.rakuten_manage_number, []);
+    itemCodesByMn.get(t.rakuten_manage_number).push(t.item_code);
+  }
+  const manageNumbers = Array.from(itemCodesByMn.keys());
+
+  const { items, failed } = await _bulk(manageNumbers);
+
+  let updated = 0;
+  let stillNull = 0;
+  const apply = db.transaction(() => {
+    for (const item of items) {
+      const mn = item?.manageNumber || item?.itemNumber;
+      if (!mn) continue;
+      const itemCodes = itemCodesByMn.get(mn);
+      if (!itemCodes || itemCodes.length === 0) continue;
+      const { genreId, genrePath } = extractRakutenGenre(item);
+      if (!genreId) { stillNull += 1; continue; }   // 楽天側に genre が無い → 埋められない
+      if (dryRun) {
+        // dryRun: 本実行の changes と同じ意味になるよう、 picked 対象行のうち実際に
+        //   genre IS NULL のままの行数を数える (本実行の UPDATE と同条件)。
+        const cnt = db.prepare(`
+          SELECT COUNT(*) AS n FROM migration_candidates
+          WHERE item_code IN (${itemCodes.map(() => '?').join(',')})
+            AND status IN ('candidate', 'stale')
+            AND (rakuten_genre_id IS NULL OR rakuten_genre_id = '')
+        `).get(...itemCodes).n;
+        updated += cnt;
+      } else {
+        // genre 列のみ更新。 title / last_title_synced_at は touch しない。 picked 行だけに限定。
+        const r = db.prepare(`
+          UPDATE migration_candidates
+          SET rakuten_genre_id   = COALESCE(?, rakuten_genre_id),
+              rakuten_genre_path = COALESCE(?, rakuten_genre_path)
+          WHERE item_code IN (${itemCodes.map(() => '?').join(',')})
+            AND status IN ('candidate', 'stale')
+            AND (rakuten_genre_id IS NULL OR rakuten_genre_id = '')
+        `).run(genreId, genrePath, ...itemCodes);
+        updated += r.changes;
+      }
+    }
+  });
+  apply();
+
+  const errors = (failed || []).map((f) => `${f.manageNumber}: ${f.reason}`);
+  return {
+    picked: targets.length,
+    updated,
+    stillNull,
+    failed: (failed || []).length,
+    errors,
+  };
+}
+
+/**
  * active (candidate / stale) の中で rakuten_title が NULL or 空文字の件数。
  */
 export function countMissingRakutenTitles(db) {
