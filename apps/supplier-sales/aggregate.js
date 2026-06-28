@@ -388,7 +388,31 @@ export function getSupplierDailyDetail(db, supplierCode, opts = {}) {
   const params = { s: supplierCode, start: P.start, end: P.end };
   const rows = [];
 
-  // Amazon: 日次 × seller_sku（FBA/FBM 判別、仕入先解決）
+  // 1出品行を構成品に展開し、対象仕入先の構成品だけを按分して日次行に出す。
+  //   数量=出品販売数×構成数量(実出荷ピース)、売上=標準売価×数量比で按分(混在セットで
+  //   他仕入先分を載せない=サマリと同一ロジック)。価格欠損時は数量按分にフォールバック。
+  function emit({ date, mall, is_fba, listingId, asin, comps, u, sales }) {
+    if (!comps || !comps.length) return;
+    const allPriced = comps.every(c => (prod.get(c.code)?.price || 0) > 0);
+    const weights = comps.map(c => allPriced ? (prod.get(c.code).price * c.qty) : c.qty);
+    const wsum = weights.reduce((a, b) => a + b, 0);
+    for (let i = 0; i < comps.length; i++) {
+      const c = comps[i];
+      const info = prod.get(c.code);
+      if (!info || info.supplier !== supplierCode) continue; // 対象仕入先の構成品のみ
+      const share = wsum > 0 ? weights[i] / wsum : 1 / comps.length;
+      const pieces = u * c.qty;
+      const sAlloc = sales * share;
+      if (!pieces && !sAlloc) continue;
+      rows.push({
+        date, mall, is_fba, listingId, asin,
+        ne_code: c.code, product_name: info.name || '',
+        units: round1(pieces), sales: Math.round(sAlloc),
+      });
+    }
+  }
+
+  // Amazon: 日次 × seller_sku（FBA/FBM 判別、構成品展開）
   const amz = db.prepare(`
     SELECT date_jst, seller_sku, asin_norm, product_name,
            CAST(units_net_sold AS REAL) u, sales_principal_jpy sales,
@@ -400,19 +424,10 @@ export function getSupplierDailyDetail(db, supplierCode, opts = {}) {
         WHERE ne_code IN (SELECT 商品コード FROM mirror_products WHERE 仕入先コード = @s))
   `).all(params);
   for (const r of amz) {
-    if (!r.u && !r.sales) continue;
-    const comps = amzMap.get(r.seller_sku) || [];
-    const sup = comps.find(c => prod.get(c.code)?.supplier === supplierCode);
-    const ne = sup ? sup.code : '';
-    rows.push({
-      date: r.date_jst, mall: 'amazon', is_fba: r.fbaFee > 0,
-      listingId: r.seller_sku, asin: r.asin_norm || '',
-      ne_code: ne, product_name: (ne && prod.get(ne)?.name) || r.product_name || '',
-      units: r.u, sales: Math.round(r.sales),
-    });
+    emit({ date: r.date_jst, mall: 'amazon', is_fba: r.fbaFee > 0, listingId: r.seller_sku, asin: r.asin_norm || '', comps: amzMap.get(r.seller_sku), u: r.u, sales: r.sales });
   }
 
-  // 非 Amazon: 日次 × 出品（fact の ne_code、セットは仕入先構成品へ寄せる）
+  // 非 Amazon: 日次 × 出品（fact の ne_code、セットは構成品展開）
   for (const c of NON_AMAZON_MALLS) {
     const rs = db.prepare(`
       SELECT date_jst, ${c.key} k, ne_code, product_name,
@@ -425,20 +440,8 @@ export function getSupplierDailyDetail(db, supplierCode, opts = {}) {
                             WHERE 構成商品コード IN (SELECT 商品コード FROM mirror_products WHERE 仕入先コード = @s)))
     `).all(params);
     for (const r of rs) {
-      if (!r.u && !r.sales) continue;
-      let ne = r.ne_code, name = r.product_name || '';
-      const comps = setMap.get(r.ne_code);
-      if (comps) {
-        const sup = comps.find(x => prod.get(x.code)?.supplier === supplierCode);
-        if (sup) { ne = sup.code; name = prod.get(ne)?.name || name; }
-      } else {
-        name = prod.get(r.ne_code)?.name || name;
-      }
-      rows.push({
-        date: r.date_jst, mall: c.mall, is_fba: false,
-        listingId: r.k, asin: '', ne_code: ne, product_name: name,
-        units: r.u, sales: Math.round(r.sales),
-      });
+      const comps = setMap.get(r.ne_code) || [{ code: r.ne_code, qty: 1 }];
+      emit({ date: r.date_jst, mall: c.mall, is_fba: false, listingId: r.k, asin: '', comps, u: r.u, sales: r.sales });
     }
   }
 
