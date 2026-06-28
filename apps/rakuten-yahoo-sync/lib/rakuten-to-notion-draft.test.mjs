@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import Db from 'better-sqlite3';
 
 import {
   truncateYahooTitle, convertTaxRate, pickRepresentativePrice,
@@ -66,10 +65,10 @@ test('pickRepresentativePrice: standardPrice 0/欠落はスキップ', () => {
 });
 
 // ── buildNotionDraftProposal ──────────────────────
-test('buildNotionDraftProposal: 全空欄なら全項目補完予定', () => {
+test('buildNotionDraftProposal: 全空欄なら全項目補完予定 (shippingMethodGroup あり)', () => {
   const rakutenItem = {
     title: '青森ひば ロールオン 10ml',
-    variants: { v1: { standardPrice: '880' } },
+    variants: { v1: { standardPrice: '880', shipping: { shippingMethodGroup: '5' } } },
     payment: { taxRate: '0.1' },
   };
   const notion = {}; // 全部空
@@ -77,14 +76,14 @@ test('buildNotionDraftProposal: 全空欄なら全項目補完予定', () => {
   assert.equal(proposed.yahoo_title, '青森ひば ロールオン 10ml');
   assert.equal(proposed.yahoo_price, 880);
   assert.equal(proposed.notion_tax_rate, '10%');
-  // Phase E-15 で warehouseDb 未指定なら warehouse_db_unavailable で skip
-  assert.equal(skipped.notion_delivery_label, 'warehouse_db_unavailable');
+  assert.equal(proposed.notion_delivery_label, 'ネコポス'); // 楽天 ID 5 → ネコポス
+  assert.equal(skipped.notion_delivery_label, undefined);
 });
 
 test('buildNotionDraftProposal: 既存値ある項目は skip', () => {
   const rakutenItem = {
     title: '楽天タイトル',
-    variants: { v1: { standardPrice: '999' } },
+    variants: { v1: { standardPrice: '999', shipping: { shippingMethodGroup: '5' } } },
     payment: { taxRate: '0.1' },
   };
   const notion = {
@@ -108,7 +107,7 @@ test('buildNotionDraftProposal: itemName 優先、 title は fallback (Codex R3 
   const rakutenItem = {
     itemName: 'itemName 由来',
     title: 'title 由来',
-    variants: { v1: { standardPrice: '880' } },
+    variants: { v1: { standardPrice: '880', shipping: { shippingMethodGroup: '5' } } },
     payment: { taxRate: '0.1' },
   };
   const { proposed } = buildNotionDraftProposal(rakutenItem, {});
@@ -118,7 +117,7 @@ test('buildNotionDraftProposal: itemName 優先、 title は fallback (Codex R3 
 test('buildNotionDraftProposal: itemName 欠落なら title fallback', () => {
   const rakutenItem = {
     title: 'title 由来',
-    variants: { v1: { standardPrice: '880' } },
+    variants: { v1: { standardPrice: '880', shipping: { shippingMethodGroup: '5' } } },
     payment: { taxRate: '0.1' },
   };
   const { proposed } = buildNotionDraftProposal(rakutenItem, {});
@@ -128,43 +127,50 @@ test('buildNotionDraftProposal: itemName 欠落なら title fallback', () => {
 test('buildNotionDraftProposal: 65 字超は truncate', () => {
   const rakutenItem = {
     title: 'あ'.repeat(100),
-    variants: { v1: { standardPrice: '880' } },
+    variants: { v1: { standardPrice: '880', shipping: { shippingMethodGroup: '5' } } },
     payment: { taxRate: '0.1' },
   };
   const { proposed } = buildNotionDraftProposal(rakutenItem, {});
   assert.equal(proposed.yahoo_title.length, 65);
 });
 
-// ── mapShippingToNotion (Phase E-15) ─────────────
-test('mapShippingToNotion: nekopos → ネコポス', () => {
-  assert.equal(mapShippingToNotion('nekopos'), 'ネコポス');
+// ── mapShippingToNotion (Phase E-16: 楽天 shippingMethodGroup ID → Notion) ─────────────
+test('mapShippingToNotion: 楽天 ID 5 (ネコポス) → ネコポス', () => {
+  assert.equal(mapShippingToNotion('5'), 'ネコポス');
+  assert.equal(mapShippingToNotion(5), 'ネコポス');
 });
-test('mapShippingToNotion: takkyu50 → ヤマト50サイズ', () => {
-  assert.equal(mapShippingToNotion('takkyu50'), 'ヤマト50サイズ');
+test('mapShippingToNotion: 楽天 ID 7 (ヤマト運輸宅急便) → ヤマト宅急便', () => {
+  assert.equal(mapShippingToNotion('7'), 'ヤマト宅急便');
 });
-test('mapShippingToNotion: hatsubarai → ヤマト宅急便', () => {
-  assert.equal(mapShippingToNotion('hatsubarai'), 'ヤマト宅急便');
+test('mapShippingToNotion: 楽天 ID 8 (宅急便50サイズ以上) → ヤマト50サイズ', () => {
+  assert.equal(mapShippingToNotion('8'), 'ヤマト50サイズ');
 });
-test('mapShippingToNotion: yupacketpuff → ゆうパケットパフ', () => {
-  assert.equal(mapShippingToNotion('yupacketpuff'), 'ゆうパケットパフ');
+test('mapShippingToNotion: 楽天 ID 9 (ゆうパケットパフ) → ゆうパケットパフ', () => {
+  assert.equal(mapShippingToNotion('9'), 'ゆうパケットパフ');
 });
-test('mapShippingToNotion: clickpost → クリックポスト', () => {
-  assert.equal(mapShippingToNotion('clickpost'), 'クリックポスト');
+test('mapShippingToNotion: 楽天 ID 2/6 (クリックポスト系) → クリックポスト', () => {
+  assert.equal(mapShippingToNotion('2'), 'クリックポスト');
+  assert.equal(mapShippingToNotion('6'), 'クリックポスト');
 });
-test('mapShippingToNotion: teikeigai は skip (Codex R2 H-1)', () => {
-  // packing から「ネコポスサイズ vs 宅急便50」 判別できないため skip
-  assert.equal(mapShippingToNotion('teikeigai'), null);
+test('mapShippingToNotion: 楽天 ID 1 (定形外) は判別不能 → null (Notion 8 値の どちら にも振れない)', () => {
+  // 定形外（ヤフーのみ宅急便50） or 定形外（ヤフーのみネコポス） どちらか不明
+  assert.equal(mapShippingToNotion('1'), null);
 });
-test('mapShippingToNotion: letterpack/aes/yupack/福山/西濃 は skip (Notion 8 値に無い)', () => {
-  assert.equal(mapShippingToNotion('letterpack'), null);
-  assert.equal(mapShippingToNotion('aes'), null);
-  assert.equal(mapShippingToNotion('yupack'), null);
-  assert.equal(mapShippingToNotion('fukuyamaistar2'), null);
-  assert.equal(mapShippingToNotion('seinokangaroom2'), null);
+test('mapShippingToNotion: 楽天 ID 3 (飛脚宅配便) は Notion 8 値に対応無し → null', () => {
+  assert.equal(mapShippingToNotion('3'), null);
 });
-test('mapShippingToNotion: null/undefined safe', () => {
+test('mapShippingToNotion: 楽天 ID 4 (宅急便 / Yahoo デフォルト設定) は Notion 8 値に対応無し → null', () => {
+  assert.equal(mapShippingToNotion('4'), null);
+});
+test('mapShippingToNotion: 不明な ID は null', () => {
+  assert.equal(mapShippingToNotion('99'), null);
+  assert.equal(mapShippingToNotion('0'), null);
+});
+test('mapShippingToNotion: null/undefined/空文字 safe', () => {
   assert.equal(mapShippingToNotion(null), null);
   assert.equal(mapShippingToNotion(undefined), null);
+  assert.equal(mapShippingToNotion(''), null);
+  assert.equal(mapShippingToNotion('  '), null);
 });
 
 // ── toNotionProperties ────────────────────────────
@@ -186,140 +192,134 @@ test('toNotionProperties: notion_delivery_label → 配送方法 select (Phase E
   assert.deepEqual(out['配送方法'], { select: { name: 'ネコポス' } });
 });
 
-// ── buildNotionDraftProposal: 配送方法 lookup (Phase E-15) ────────
-test('buildNotionDraftProposal: warehouseDb なら pd_shipping_rule から配送方法補完', () => {
-  // mock warehouseDb (better-sqlite3 in-memory)
-  const db = new Db(':memory:');
-  db.exec(`
-    CREATE TABLE pd_shipping_rule (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      sku_key TEXT NOT NULL,
-      product_code TEXT NOT NULL,
-      mall_group TEXT NOT NULL,
-      qty_min INTEGER NOT NULL,
-      qty_max INTEGER,
-      shipping_method_code TEXT NOT NULL,
-      packing_machine_code TEXT NOT NULL
-    );
-    INSERT INTO pd_shipping_rule (sku_key, product_code, mall_group, qty_min, qty_max, shipping_method_code, packing_machine_code)
-    VALUES ('aigeshou5set::::','aigeshou5set','rakuten',1,NULL,'nekopos','pasline3つ折り');
-  `);
+// ── buildNotionDraftProposal: 配送方法 lookup (Phase E-16: 楽天 shippingMethodGroup) ────────
+test('buildNotionDraftProposal: variants[].shipping.shippingMethodGroup から配送方法補完', () => {
   const rakutenItem = {
     manageNumber: 'aigeshou5set',
     title: 'お試し',
-    variants: { v1: { standardPrice: '880' } },
+    variants: { v1: { standardPrice: '880', shipping: { shippingMethodGroup: '5' } } },
     payment: { taxRate: '0.1' },
   };
-  const { proposed, skipped } = buildNotionDraftProposal(rakutenItem, {}, { warehouseDb: db });
+  const { proposed, skipped } = buildNotionDraftProposal(rakutenItem, {});
   assert.equal(proposed.notion_delivery_label, 'ネコポス');
   assert.equal(skipped.notion_delivery_label, undefined);
 });
 
-test('buildNotionDraftProposal: warehouseDb なしは skip', () => {
+test('buildNotionDraftProposal: variants なしは rakuten_variants_missing', () => {
   const rakutenItem = {
     manageNumber: 'x',
     title: 't',
-    variants: { v1: { standardPrice: '100' } },
     payment: { taxRate: '0.1' },
   };
   const { skipped } = buildNotionDraftProposal(rakutenItem, {});
-  assert.equal(skipped.notion_delivery_label, 'warehouse_db_unavailable');
+  assert.equal(skipped.notion_delivery_label, 'rakuten_variants_missing');
 });
 
-test('buildNotionDraftProposal: pd_shipping_rule に row なしは pd_shipping_rule_missing', () => {
-  const db = new Db(':memory:');
-  db.exec(`
-    CREATE TABLE pd_shipping_rule (
-      sku_key TEXT, product_code TEXT, mall_group TEXT, qty_min INTEGER, qty_max INTEGER,
-      shipping_method_code TEXT, packing_machine_code TEXT
-    );
-  `);
-  const rakutenItem = {
-    manageNumber: 'unknown_sku',
-    title: 't',
-    variants: { v1: { standardPrice: '100' } },
-    payment: { taxRate: '0.1' },
-  };
-  const { skipped } = buildNotionDraftProposal(rakutenItem, {}, { warehouseDb: db });
-  assert.equal(skipped.notion_delivery_label, 'pd_shipping_rule_missing');
-});
-
-test('buildNotionDraftProposal: variant 別 distinct label が複数なら ambiguous_shipping_rule (R3 H-1)', () => {
-  const db = new Db(':memory:');
-  db.exec(`
-    CREATE TABLE pd_shipping_rule (
-      sku_key TEXT, product_code TEXT, mall_group TEXT, qty_min INTEGER, qty_max INTEGER,
-      shipping_method_code TEXT, packing_machine_code TEXT
-    );
-    INSERT INTO pd_shipping_rule VALUES ('a::red::S','a','rakuten',1,NULL,'nekopos','pasline3つ折り');
-    INSERT INTO pd_shipping_rule VALUES ('a::blue::L','a','rakuten',1,NULL,'takkyu50','manual');
-  `);
-  const rakutenItem = {
-    manageNumber: 'a',
-    title: 't',
-    variants: { v1: { standardPrice: '100' } },
-    payment: { taxRate: '0.1' },
-  };
-  const { proposed, skipped } = buildNotionDraftProposal(rakutenItem, {}, { warehouseDb: db });
-  assert.equal(proposed.notion_delivery_label, undefined);
-  assert.match(skipped.notion_delivery_label, /ambiguous_shipping_rule/);
-});
-
-test('buildNotionDraftProposal: 全 variant 同じ shipping なら distinct=1 で採用', () => {
-  const db = new Db(':memory:');
-  db.exec(`
-    CREATE TABLE pd_shipping_rule (
-      sku_key TEXT, product_code TEXT, mall_group TEXT, qty_min INTEGER, qty_max INTEGER,
-      shipping_method_code TEXT, packing_machine_code TEXT
-    );
-    INSERT INTO pd_shipping_rule VALUES ('a::red::S','a','rakuten',1,NULL,'nekopos','pasline3つ折り');
-    INSERT INTO pd_shipping_rule VALUES ('a::blue::L','a','rakuten',1,NULL,'nekopos','pasline3つ折り');
-  `);
-  const rakutenItem = {
-    manageNumber: 'a',
-    title: 't',
-    variants: { v1: { standardPrice: '100' } },
-    payment: { taxRate: '0.1' },
-  };
-  const { proposed } = buildNotionDraftProposal(rakutenItem, {}, { warehouseDb: db });
-  assert.equal(proposed.notion_delivery_label, 'ネコポス');
-});
-
-test('buildNotionDraftProposal: rakuten で hit なし → default にフォールバック', () => {
-  const db = new Db(':memory:');
-  db.exec(`
-    CREATE TABLE pd_shipping_rule (
-      sku_key TEXT, product_code TEXT, mall_group TEXT, qty_min INTEGER, qty_max INTEGER,
-      shipping_method_code TEXT, packing_machine_code TEXT
-    );
-    INSERT INTO pd_shipping_rule VALUES ('a::::','a','default',1,NULL,'nekopos','pasline3つ折り');
-  `);
-  const rakutenItem = {
-    manageNumber: 'a',
-    title: 't',
-    variants: { v1: { standardPrice: '100' } },
-    payment: { taxRate: '0.1' },
-  };
-  const { proposed } = buildNotionDraftProposal(rakutenItem, {}, { warehouseDb: db });
-  assert.equal(proposed.notion_delivery_label, 'ネコポス');
-});
-
-test('buildNotionDraftProposal: teikeigai は unmappable_shipping (Codex R2 H-1)', () => {
-  const db = new Db(':memory:');
-  db.exec(`
-    CREATE TABLE pd_shipping_rule (
-      sku_key TEXT, product_code TEXT, mall_group TEXT, qty_min INTEGER, qty_max INTEGER,
-      shipping_method_code TEXT, packing_machine_code TEXT
-    );
-    INSERT INTO pd_shipping_rule VALUES ('x::::','x','rakuten',1,NULL,'teikeigai','manual');
-  `);
+test('buildNotionDraftProposal: shippingMethodGroup 全 variant 欠落なら rakuten_shipping_method_group_missing', () => {
   const rakutenItem = {
     manageNumber: 'x',
     title: 't',
-    variants: { v1: { standardPrice: '100' } },
+    variants: { v1: { standardPrice: '100' } }, // shipping 無し
     payment: { taxRate: '0.1' },
   };
-  const { proposed, skipped } = buildNotionDraftProposal(rakutenItem, {}, { warehouseDb: db });
+  const { skipped } = buildNotionDraftProposal(rakutenItem, {});
+  assert.equal(skipped.notion_delivery_label, 'rakuten_shipping_method_group_missing');
+});
+
+test('buildNotionDraftProposal: variant 別 distinct label が複数なら ambiguous_rakuten_shipping_group', () => {
+  const rakutenItem = {
+    manageNumber: 'a',
+    title: 't',
+    variants: {
+      v1: { standardPrice: '100', shipping: { shippingMethodGroup: '5' } },  // ネコポス
+      v2: { standardPrice: '200', shipping: { shippingMethodGroup: '7' } },  // ヤマト宅急便
+    },
+    payment: { taxRate: '0.1' },
+  };
+  const { proposed, skipped } = buildNotionDraftProposal(rakutenItem, {});
   assert.equal(proposed.notion_delivery_label, undefined);
-  assert.match(skipped.notion_delivery_label, /unmappable_shipping:teikeigai/);
+  assert.match(skipped.notion_delivery_label, /ambiguous_rakuten_shipping_group/);
+});
+
+test('buildNotionDraftProposal: 全 variant 同じ shipping ID なら distinct=1 で採用', () => {
+  const rakutenItem = {
+    manageNumber: 'a',
+    title: 't',
+    variants: {
+      v1: { standardPrice: '100', shipping: { shippingMethodGroup: '5' } },
+      v2: { standardPrice: '200', shipping: { shippingMethodGroup: '5' } },
+    },
+    payment: { taxRate: '0.1' },
+  };
+  const { proposed } = buildNotionDraftProposal(rakutenItem, {});
+  assert.equal(proposed.notion_delivery_label, 'ネコポス');
+});
+
+test('buildNotionDraftProposal: 楽天 ID 1 (定形外) は unmappable_rakuten_shipping_group', () => {
+  const rakutenItem = {
+    manageNumber: 'x',
+    title: 't',
+    variants: { v1: { standardPrice: '100', shipping: { shippingMethodGroup: '1' } } },
+    payment: { taxRate: '0.1' },
+  };
+  const { proposed, skipped } = buildNotionDraftProposal(rakutenItem, {});
+  assert.equal(proposed.notion_delivery_label, undefined);
+  assert.match(skipped.notion_delivery_label, /unmappable_rakuten_shipping_group:1/);
+});
+
+test('buildNotionDraftProposal: 楽天 ID 3/4 (Notion 8 値に対応無し) は unmappable_rakuten_shipping_group', () => {
+  for (const id of ['3', '4']) {
+    const rakutenItem = {
+      manageNumber: 'x',
+      title: 't',
+      variants: { v1: { standardPrice: '100', shipping: { shippingMethodGroup: id } } },
+      payment: { taxRate: '0.1' },
+    };
+    const { proposed, skipped } = buildNotionDraftProposal(rakutenItem, {});
+    assert.equal(proposed.notion_delivery_label, undefined);
+    assert.match(skipped.notion_delivery_label, new RegExp(`unmappable_rakuten_shipping_group:${id}`));
+  }
+});
+
+test('buildNotionDraftProposal: mapped ID + unmappable ID 混在 → mixed ambiguous (Codex R1 改善 diagnostics)', () => {
+  const rakutenItem = {
+    manageNumber: 'a',
+    title: 't',
+    variants: {
+      v1: { standardPrice: '100', shipping: { shippingMethodGroup: '5' } },  // ネコポス (mapped)
+      v2: { standardPrice: '200', shipping: { shippingMethodGroup: '1' } },  // 定形外 (unmappable)
+    },
+    payment: { taxRate: '0.1' },
+  };
+  const { proposed, skipped } = buildNotionDraftProposal(rakutenItem, {});
+  assert.equal(proposed.notion_delivery_label, undefined);
+  assert.match(skipped.notion_delivery_label, /ambiguous_rakuten_shipping_group/);
+  assert.match(skipped.notion_delivery_label, /unmappable:1/);
+});
+
+test('buildNotionDraftProposal: 一部 variant だけ shippingMethodGroup 欠落でも残りで採用', () => {
+  const rakutenItem = {
+    manageNumber: 'a',
+    title: 't',
+    variants: {
+      v1: { standardPrice: '100' }, // shipping 無し
+      v2: { standardPrice: '200', shipping: { shippingMethodGroup: '5' } },
+    },
+    payment: { taxRate: '0.1' },
+  };
+  const { proposed, skipped } = buildNotionDraftProposal(rakutenItem, {});
+  // hasShippingGroup=true (v2 が持ってる)、 labels={ネコポス}、 unmappable=0 → 採用
+  assert.equal(proposed.notion_delivery_label, 'ネコポス');
+  assert.equal(skipped.notion_delivery_label, undefined);
+});
+
+test('buildNotionDraftProposal: 楽天 ID 数値型 (string でなく number) も safe', () => {
+  const rakutenItem = {
+    manageNumber: 'x',
+    title: 't',
+    variants: { v1: { standardPrice: '100', shipping: { shippingMethodGroup: 5 } } },
+    payment: { taxRate: '0.1' },
+  };
+  const { proposed } = buildNotionDraftProposal(rakutenItem, {});
+  assert.equal(proposed.notion_delivery_label, 'ネコポス');
 });

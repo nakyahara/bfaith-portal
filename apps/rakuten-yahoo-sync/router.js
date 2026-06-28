@@ -17,7 +17,7 @@ import { Router } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { inspectEnvStatus } from './env-check.js';
-import { getDB, getMirrorDbPath, openMirrorReadonly } from './db.js';
+import { getDB, getMirrorDbPath } from './db.js';
 import { acquire, SyncLockError } from './lib/sync-lock.js';
 import { syncNotionOverrides } from './services/notion-sync.js';
 import { patchPageProperties } from './lib/notion-client.js';
@@ -657,12 +657,6 @@ router.post('/api/admin/seed-notion-drafts', async (req, res) => {
       return res.json({ status: 'ok', totalScanned: 0, proposed: [], skipped: [], applied: [], errors: [] });
     }
 
-    // Phase E-15: 配送方法 lookup 用に warehouse-mirror.db を read-only で open
-    let warehouseDb = null;
-    try {
-      warehouseDb = openMirrorReadonly();
-    } catch (_) { /* mirror 未配備 or open 失敗時は配送方法 skip 扱い */ }
-
     // 2. 楽天 RMS bulk fetch
     const manageNumbers = rows.map((r) => r.manage_number);
     let rakutenItems = [];
@@ -689,7 +683,7 @@ router.post('/api/admin/seed-notion-drafts', async (req, res) => {
         skipped.push({ itemCode: r.manage_number, reason: 'rakuten_fetch_failed', detail: f?.reason || null });
         continue;
       }
-      const { proposed: prop, skipped: skip } = buildNotionDraftProposal(rakutenItem, r, { warehouseDb });
+      const { proposed: prop, skipped: skip } = buildNotionDraftProposal(rakutenItem, r);
       if (Object.keys(prop).length === 0) {
         skipped.push({ itemCode: r.manage_number, reason: 'all_skipped', detail: skip });
         continue;
@@ -721,8 +715,6 @@ router.post('/api/admin/seed-notion-drafts', async (req, res) => {
         }
       }
     }
-
-    if (warehouseDb) { try { warehouseDb.close(); } catch (_) {} }
 
     return res.json({
       status: 'ok',

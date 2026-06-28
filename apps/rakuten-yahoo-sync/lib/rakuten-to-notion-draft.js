@@ -51,31 +51,39 @@ export function convertTaxRate(rakutenTaxRate) {
 }
 
 /**
- * Phase E-15 (2026-06-28): pd_shipping_rule.shipping_method_code → Notion 配送方法 (8 値) マッピング。
+ * Phase E-16 (2026-06-28): 楽天 variants[].shipping.shippingMethodGroup ID → Notion 配送方法 (8 値) マッピング。
  *
- *   notion_overrides.notion_delivery_label の CHECK 制約 + delivery_mapping FK seed (migration 012) と整合:
- *     ネコポス / ヤマト50サイズ / ヤマト宅急便 / 沖縄北海道別送料_ヤマト宅急便 / クリックポスト /
- *     ゆうパケットパフ / 定形外（ヤフーのみ宅急便50サイズ） / 定形外（ヤフーのみネコポス）
+ *   中原さん指定の変換表 (Notion新規商品登録 - 変換表.csv):
+ *     楽天 ID 1 (定形外) → Yahoo 3 (定形外) → Notion 8 値で判別不能 (定形外（ヤフーのみ宅急便50）か ネコポス か)
+ *     楽天 ID 2 (クリックポスト 旧/使用不可) → Yahoo 9 (クリックポスト) → Notion 「クリックポスト」
+ *     楽天 ID 3 (飛脚宅配便) → Yahoo 4 (佐川宅急便) → Notion 8 値に対応無し
+ *     楽天 ID 4 (宅急便) → Yahoo 1 (デフォルト設定) → Notion 8 値に対応無し
+ *     楽天 ID 5 (ネコポス) → Yahoo 6 (ネコポス) → Notion 「ネコポス」
+ *     楽天 ID 6 (クリックポスト) → Yahoo 9 (クリックポスト) → Notion 「クリックポスト」
+ *     楽天 ID 7 (ヤマト運輸宅急便) → Yahoo 11 (クロネコ宅急便) → Notion 「ヤマト宅急便」
+ *     楽天 ID 8 (宅急便50サイズ以上) → Yahoo 10 (宅急便ヤマト50サイズ用) → Notion 「ヤマト50サイズ」
+ *     楽天 ID 9 (ゆうパケットパフ) → Yahoo 12 (ゆうパケットパフ) → Notion 「ゆうパケットパフ」
  *
- *   Codex Phase E-15 R2 H-1: teikeigai は pd_shipping_rule CHECK 制約 (packing='manual' OR shipping='nekopos')
- *   により packing=manual のみで存在し、 packing から「ネコポスサイズ vs 宅急便50サイズ」 を判別できない。
- *   よって teikeigai は本 PR では skip (中原さん手動入力、 将来 商品サイズマスタ追加時に分岐実装)。
+ *   override (delivery_mapping seed 001_initial.sql:22-23 で実装済): Notion が 定形外（ヤフーのみ宅急便50）→
+ *   Yahoo 10、 定形外（ヤフーのみネコポス）→ Yahoo 6 に変換 (本関数の責務外、 publish 時に処理)。
  */
-export function mapShippingToNotion(shippingMethodCode) {
-  if (!shippingMethodCode) return null;
-  switch (shippingMethodCode) {
-    case 'nekopos': return 'ネコポス';
-    case 'takkyu50': return 'ヤマト50サイズ';
-    case 'hatsubarai': return 'ヤマト宅急便';
-    case 'yupacketpuff': return 'ゆうパケットパフ';
-    case 'clickpost': return 'クリックポスト';
-    // teikeigai は Notion 8 値の 「定形外（ヤフーのみ宅急便50）」 か 「定形外（ヤフーのみネコポス）」
-    //   どちらかになるが、 packing からは判別できない (Codex R2 H-1) → skip
-    case 'teikeigai': return null;
-    // letterpack (沖縄北海道別送料用) / aes / yupack / fukuyamaistar2 / seinokangaroom2 は
-    //   Notion 8 値に対応なし → skip (中原さん手動入力)
-    default: return null;
-  }
+const RAKUTEN_GROUP_TO_NOTION = {
+  '1': null,                  // 定形外 — 判別不能 (人間判断)
+  '2': 'クリックポスト',
+  '3': null,                  // 飛脚宅配便 — Notion 8 値に対応無し
+  '4': null,                  // 宅急便 (Yahoo デフォルト設定) — Notion 8 値に対応無し
+  '5': 'ネコポス',
+  '6': 'クリックポスト',
+  '7': 'ヤマト宅急便',
+  '8': 'ヤマト50サイズ',
+  '9': 'ゆうパケットパフ',
+};
+
+export function mapShippingToNotion(rakutenShippingMethodGroupId) {
+  if (rakutenShippingMethodGroupId == null) return null;
+  const key = String(rakutenShippingMethodGroupId).trim();
+  if (!key) return null;
+  return RAKUTEN_GROUP_TO_NOTION[key] ?? null;
 }
 
 /**
@@ -101,7 +109,7 @@ export function pickRepresentativePrice(rakutenItem) {
  * @param {object} notionOverride 既存の Notion override 値 (空欄判定用)
  * @returns {{ proposed: object, skipped: object }} proposed=新規補完したい値、 skipped={ reason }
  */
-export function buildNotionDraftProposal(rakutenItem, notionOverride, opts = {}) {
+export function buildNotionDraftProposal(rakutenItem, notionOverride) {
   const proposed = {};
   const skipped = {};
 
@@ -109,8 +117,6 @@ export function buildNotionDraftProposal(rakutenItem, notionOverride, opts = {})
     return { proposed, skipped: { _all: 'no_rakuten_item' } };
   }
   const existing = notionOverride || {};
-  const warehouseDb = opts.warehouseDb || null;
-  const manageNumber = rakutenItem.manageNumber || rakutenItem.itemNumber;
 
   // Yahoo!タイトル — RMS の field 名は itemName か title (field-mapper と同形 fallback、 Codex R3 H-1)
   if (existing.yahoo_title && String(existing.yahoo_title).trim()) {
@@ -139,62 +145,42 @@ export function buildNotionDraftProposal(rakutenItem, notionOverride, opts = {})
     else skipped.notion_tax_rate = 'rakuten_tax_rate_unknown';
   }
 
-  // 配送方法 (Phase E-15 2026-06-28): packing-dispatch アプリの pd_shipping_rule から lookup。
-  //   product_code (= 楽天 manage_number) で引いて、 shipping_method_code → Notion 配送方法 8 値 にマッピング。
+  // 配送方法 (Phase E-16 2026-06-28): 楽天 RMS variants[].shipping.shippingMethodGroup ID から直接 Notion マッピング。
+  //   中原さん変換表 (Notion新規商品登録 - 変換表.csv) に基づく: 楽天 ID → Notion 配送方法 8 値。
+  //   各 variant の shippingMethodGroup ID を取って distinct mapping。 1 種類なら採用、 複数なら ambiguous で skip。
+  //   ID 1/3/4 は Notion 8 値に対応無し or 判別不能 → unmappable で skip (中原さん手動入力)。
   if (existing.notion_delivery_label && String(existing.notion_delivery_label).trim()) {
     skipped.notion_delivery_label = 'already_filled';
-  } else if (!warehouseDb) {
-    skipped.notion_delivery_label = 'warehouse_db_unavailable';
-  } else if (!manageNumber) {
-    skipped.notion_delivery_label = 'manage_number_missing';
   } else {
-    let rows = [];
-    try {
-      // Codex Phase E-15 R3 H-1: product_code 配下に variant 別の rule が複数ある場合、
-      //   各 sku_key で配送方法が違う可能性 → distinct label で全部取って 1 種類なら採用、
-      //   複数なら ambiguous_shipping_rule で skip (Notion 親項目に誤った 1 variant を固定化させない)。
-      //   mall_group 優先順位は rakuten > default。 rakuten で hit したらそれを使い、 default は見ない。
-      rows = warehouseDb.prepare(`
-        SELECT DISTINCT shipping_method_code, packing_machine_code
-        FROM pd_shipping_rule
-        WHERE product_code = ?
-          AND mall_group = ?
-          AND qty_min <= 1 AND (qty_max IS NULL OR qty_max >= 1)
-      `).all(manageNumber, 'rakuten');
-      if (rows.length === 0) {
-        rows = warehouseDb.prepare(`
-          SELECT DISTINCT shipping_method_code, packing_machine_code
-          FROM pd_shipping_rule
-          WHERE product_code = ?
-            AND mall_group = ?
-            AND qty_min <= 1 AND (qty_max IS NULL OR qty_max >= 1)
-        `).all(manageNumber, 'default');
-      }
-    } catch (e) {
-      // pd_shipping_rule table 不在 (warehouse-mirror.db に同居してない環境) は silent
-      skipped.notion_delivery_label = `pd_shipping_rule_query_failed:${e.message}`;
-    }
-    if (rows.length > 0) {
-      // 各 row を Notion label にマッピングして distinct 集計
+    const variants = rakutenItem.variants;
+    if (!variants || typeof variants !== 'object') {
+      skipped.notion_delivery_label = 'rakuten_variants_missing';
+    } else {
       const labels = new Set();
-      const unmappable = new Set();
-      for (const r of rows) {
-        const label = mapShippingToNotion(r.shipping_method_code);
+      const unmappableIds = new Set();
+      const variantList = Object.values(variants);
+      let hasShippingGroup = false;
+      for (const v of variantList) {
+        const groupId = v?.shipping?.shippingMethodGroup;
+        if (groupId == null || String(groupId).trim() === '') continue;
+        hasShippingGroup = true;
+        const label = mapShippingToNotion(groupId);
         if (label) labels.add(label);
-        else unmappable.add(r.shipping_method_code);
+        else unmappableIds.add(String(groupId));
       }
-      if (labels.size === 1 && unmappable.size === 0) {
+      if (!hasShippingGroup) {
+        skipped.notion_delivery_label = 'rakuten_shipping_method_group_missing';
+      } else if (labels.size === 1 && unmappableIds.size === 0) {
         proposed.notion_delivery_label = [...labels][0];
-      } else if (labels.size === 0 && unmappable.size > 0) {
-        skipped.notion_delivery_label = `unmappable_shipping:${[...unmappable].join(',')}`;
-      } else if (labels.size > 1) {
-        skipped.notion_delivery_label = `ambiguous_shipping_rule:${[...labels].join('|')}`;
+      } else if (labels.size === 0 && unmappableIds.size > 0) {
+        skipped.notion_delivery_label = `unmappable_rakuten_shipping_group:${[...unmappableIds].join(',')}`;
+      } else if (labels.size >= 1 && unmappableIds.size > 0) {
+        // Codex R1 改善: mapped + unmappable mixed は ambiguous より先に判定 (診断性向上)
+        skipped.notion_delivery_label = `ambiguous_rakuten_shipping_group:${[...labels].join('|')},unmappable:${[...unmappableIds].join(',')}`;
       } else {
-        // labels=1 + unmappable も同時にあるケース → variant 別で対応分かれてるので skip
-        skipped.notion_delivery_label = `ambiguous_shipping_rule:${[...labels].join('|')},unmappable:${[...unmappable].join(',')}`;
+        // labels.size > 1 && unmappable=0
+        skipped.notion_delivery_label = `ambiguous_rakuten_shipping_group:${[...labels].join('|')}`;
       }
-    } else if (!skipped.notion_delivery_label) {
-      skipped.notion_delivery_label = 'pd_shipping_rule_missing';
     }
   }
 
