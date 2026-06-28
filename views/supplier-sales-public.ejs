@@ -49,7 +49,15 @@
     table.matrix td.tot { font-weight:700; }
     .note { color:var(--muted); font-size:11px; margin-top:18px; line-height:1.8; background:#fff; border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
     .empty { background:#fff; border:1px solid var(--line); border-radius:10px; padding:40px; text-align:center; color:var(--muted); }
-    .scroll { overflow-x:auto; }
+    .scroll { overflow:auto; max-height:74vh; }
+    /* 見出し行を追随（縦スクロールで列名が消えない） */
+    .scroll table thead th { position:sticky; top:0; z-index:2; }
+    /* 商品列を左固定（横スクロールで商品名が消えない） */
+    table.matrix td.l, table.matrix th.l { position:sticky; left:0; z-index:1; background:#fff; }
+    table.matrix thead th.l { z-index:3; background:#f1f5f9; }
+    table.matrix tr.prod-top td.l { background:#fff; }
+    /* ネストした出品内訳サブ表の見出しは固定しない */
+    .scroll table.sub-tbl thead th { position:static; }
     @media (max-width:640px){ .hd h1{font-size:17px;} .card .v{font-size:18px;} }
   </style>
 </head>
@@ -94,10 +102,11 @@
       <% if (!sokuhoProducts.length) { %>
         <div class="empty">速報データがまだありません。</div>
       <% } else {
-           // モール列 = 全商品に出現するモールの和集合（表示順 order でソート）
-           const mallColMap = new Map();
-           sokuhoProducts.forEach(p => (p.sokuhoMalls || []).forEach(m => { if (!mallColMap.has(m.key)) mallColMap.set(m.key, { key: m.key, label: m.label, order: (m.order == null || m.order < 0) ? 99 : m.order }); }));
-           const mallCols = [...mallColMap.values()].sort((a, b) => a.order - b.order);
+           // モール列 = 固定列(楽天/Yahoo!/au PAY/Qoo10/メルカリ/LINEギフト/Amazon FBA/FBM)を常時表示。
+           //   売上0でも列を出す(auが消えない)。「その他」は実データがある時だけ末尾に追加。
+           const mallCols = [...(sokuhoMallDefs || [])];
+           const hasOther = sokuhoProducts.some(p => (p.sokuhoMalls || []).some(m => m.key === 'other' && (m.q7 || m.q30)));
+           if (hasOther) mallCols.push({ key: 'other', label: 'その他' });
       %>
       <div class="scroll">
       <table class="matrix">
