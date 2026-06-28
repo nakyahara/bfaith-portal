@@ -106,7 +106,16 @@ router.get('/api/summary.csv', (req, res) => {
 router.get('/api/tokens', (req, res) => {
   try {
     const code = req.query.code ? String(req.query.code).trim() : null;
-    res.json({ ok: true, tokens: listTokens(code) });
+    // token_plain は社内画面で過去発行URLを再表示するため sharePath に変換して返す
+    // （PR #370 以前に発行した行は token_plain=NULL=再表示不可）。
+    const nowIso = new Date().toISOString();
+    const tokens = listTokens(code).map(t => {
+      const { token_plain, ...rest } = t;
+      // 失効・期限切れトークンは API レスポンス上も sharePath を返さない（有効なものだけ）
+      const active = t.active && !t.revoked_at && (!t.expires_at || t.expires_at > nowIso);
+      return { ...rest, sharePath: (active && token_plain) ? `/share/supplier/${token_plain}` : null };
+    });
+    res.json({ ok: true, tokens });
   } catch (e) {
     console.error('[supplier-sales] tokens error:', e.message);
     res.status(500).json({ ok: false, error: e.message });
