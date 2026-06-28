@@ -160,6 +160,15 @@
                   title="dry-run で確認後にこれを押すと実際に Notion に書き込む。 既存値あれば skip">
             ✏️ 楽天から下書き (本実行)
           </button>
+          <%# Phase E-14: Notion master 未登録 SKU に新規 page 作成 %>
+          <button class="btn btn-sm btn-outline-warning ms-2 js-create-notion-pages-dry"
+                  title="楽天 RMS から Notion master 未登録 SKU の new page を作成する。 dry-run で対象件数 + 内容を先に確認">
+            🆕 楽天から Notion 新規作成 (dry-run)
+          </button>
+          <button class="btn btn-sm btn-outline-danger ms-2 js-create-notion-pages-apply"
+                  title="dry-run で確認後にこれを押すと Notion master DB に新規 page を作成する">
+            🆕 楽天から Notion 新規作成 (本実行)
+          </button>
         </li>
         <li>
           <strong><%= summary.actionable %> 商品</strong> が Yahoo に出せます
@@ -1720,6 +1729,44 @@ async function seedNotionDrafts({ dryRun }) {
   }
 }
 
+// ───── Phase E-14: 楽天 RMS → Notion master 新規 page 作成 ─────
+async function createNotionPages({ dryRun }) {
+  if (!dryRun) {
+    if (!confirm('楽天 RMS から取った値で Notion master に新規 page を作成します。\n既存 page がある SKU は重複作成しません。\n続行しますか?')) return;
+  }
+  try {
+    const res = await fetch('/apps/rakuten-yahoo-sync/api/admin/create-notion-pages-from-rakuten', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dryRun, limit: 100 }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      alert('失敗: ' + (data.error || ('HTTP ' + res.status)));
+      return;
+    }
+    const lines = [];
+    lines.push((dryRun ? '🔍 dry-run' : '✅ 本実行') + ' 結果');
+    lines.push(`総対象 SKU: ${data.totalScanned}`);
+    lines.push('--- outcome 集計 ---');
+    for (const [k, v] of Object.entries(data.summary || {})) {
+      lines.push(`  ${k}: ${v}`);
+    }
+    if (data.error) lines.push('error: ' + data.error);
+    if (data.results?.length > 0 && data.results.length <= 5) {
+      lines.push('\n--- 詳細 ---');
+      data.results.forEach((r) => {
+        lines.push(`${r.itemCode}: ${r.outcome}${r.notionPageId ? ' page=' + r.notionPageId.slice(0, 8) : ''}${r.preview ? ' preview=' + JSON.stringify(r.preview).slice(0, 80) : ''}`);
+      });
+    }
+    alert(lines.join('\n'));
+    if (!dryRun && data.summary?.created > 0) {
+      if (confirm('Notion sync を実行して dashboard 反映しますか?')) location.reload();
+    }
+  } catch (e) {
+    alert('ネットワークエラー: ' + e.message);
+  }
+}
+
 async function yahooCategoryLearn(evt) {
   const btn = evt.currentTarget;
   if (!btn || btn.disabled) return;
@@ -1883,6 +1930,8 @@ document.addEventListener('DOMContentLoaded', () => {
   document.querySelector('.js-seed-aburatoishi')?.addEventListener('click', seedAburatoishiCategory);
   document.querySelector('.js-seed-notion-drafts-dry')?.addEventListener('click', () => seedNotionDrafts({ dryRun: true }));
   document.querySelector('.js-seed-notion-drafts-apply')?.addEventListener('click', () => seedNotionDrafts({ dryRun: false }));
+  document.querySelector('.js-create-notion-pages-dry')?.addEventListener('click', () => createNotionPages({ dryRun: true }));
+  document.querySelector('.js-create-notion-pages-apply')?.addEventListener('click', () => createNotionPages({ dryRun: false }));
   document.querySelectorAll('.js-close-image-exclusion-modal').forEach((el) => el.addEventListener('click', closeImageExclusionModal));
   document.querySelector('.js-add-image-pattern')?.addEventListener('click', addImagePattern);
   document.querySelectorAll('.js-close-exclusion-modal').forEach((el) => el.addEventListener('click', closeExclusionModal));
