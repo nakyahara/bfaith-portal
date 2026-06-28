@@ -1682,6 +1682,48 @@ function createTables() {
   // Codex 16 ラウンドレビュー完全 FIX、PR: feature/mis-shipment
   createMisShipmentTables();
   createGiftsetTables();
+  createSupplierShareTables();
+}
+
+// ▼▼▼ 仕入れ先向け売れ筋共有（apps/supplier-sales）正本テーブル ▼▼▼
+// 方針: Render 完結書込（mirror_* と prefix 分離、ミニPC 不使用）。
+//   売上データ自体は mirror_*_finance_sku_daily を読むだけで、このアプリは
+//   「仕入先コード→表示名」と「公開共有トークン」のみを正本として持つ。
+// セキュリティ: 公開トークンURLは認証なしで仕入先別売上を出すため "弱い認可" として扱う。
+//   生トークンは DB に保存せず SHA-256 ハッシュのみ保存（漏洩時の被害最小化）。
+function createSupplierShareTables() {
+  // 仕入先コード→表示名（NE の仕入先コードは数値/記号のみで人間が読めないため）。
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS supplier_share_master (
+      仕入先コード   TEXT PRIMARY KEY,
+      表示名         TEXT NOT NULL,
+      memo           TEXT,
+      created_at     TEXT NOT NULL,
+      updated_at     TEXT NOT NULL,
+      CHECK (trim(仕入先コード) <> ''),
+      CHECK (trim(表示名) <> '')
+    )
+  `);
+  // 公開共有トークン。token_hash = sha256(raw token)。raw token は発行時に一度だけ表示。
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS supplier_share_tokens (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      token_hash       TEXT NOT NULL UNIQUE,
+      仕入先コード     TEXT NOT NULL,
+      label            TEXT,
+      active           INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
+      expires_at       TEXT,
+      revoked_at       TEXT,
+      created_by       TEXT,
+      created_at       TEXT NOT NULL,
+      last_accessed_at TEXT,
+      access_count     INTEGER NOT NULL DEFAULT 0,
+      CHECK (trim(仕入先コード) <> ''),
+      CHECK (trim(token_hash) <> '')
+    )
+  `);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_sst_supplier ON supplier_share_tokens(仕入先コード)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_sst_hash ON supplier_share_tokens(token_hash)');
 }
 
 // ▼▼▼ ギフトセット組み依頼（apps/giftset-assembly）正本テーブル ▼▼▼

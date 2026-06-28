@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>仕入れ先 売れ筋共有 - B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png"><link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    .container { max-width: 1280px; margin: 0 auto; padding: 16px 20px; }
+    .header-row { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px; margin-bottom:12px; }
+    .header-row h2 { margin:0; }
+    .back-link { font-size:13px; color:#2563eb; text-decoration:none; }
+    .panel { background:#fff; border:1px solid #e5e7eb; border-radius:8px; padding:14px 16px; margin-bottom:14px; box-shadow:0 1px 3px rgba(0,0,0,.06); }
+    .panel h3 { margin:0 0 10px; font-size:14px; }
+    .health { font-size:13px; padding:8px 12px; border-radius:6px; }
+    .h-ok { background:#ecfdf5; color:#065f46; } .h-notice{ background:#fefce8; color:#854d0e; }
+    .h-warn{ background:#fff7ed; color:#9a3412; } .h-block{ background:#fef2f2; color:#991b1b; }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th,td { padding:7px 9px; border-bottom:1px solid #eef0f3; text-align:right; white-space:nowrap; }
+    th { background:#f8fafc; color:#475569; font-weight:600; font-size:12px; }
+    td.l, th.l { text-align:left; white-space:normal; }
+    tbody tr:hover { background:#f8fafc; }
+    .btn { border:none; border-radius:6px; padding:6px 12px; font-size:13px; cursor:pointer; }
+    .btn-primary { background:#2563eb; color:#fff; } .btn-sec { background:#e5e7eb; color:#374151; }
+    .btn-danger { background:#fee2e2; color:#991b1b; }
+    input[type=text], input[type=date] { padding:6px 9px; border:1px solid #d1d5db; border-radius:5px; font-size:13px; }
+    .muted { color:#64748b; font-size:12px; }
+    .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .pill { display:inline-block; padding:1px 7px; border-radius:10px; font-size:11px; }
+    .pill-on { background:#dcfce7; color:#166534; } .pill-off { background:#f1f5f9; color:#64748b; }
+    .token-box { background:#0f172a; color:#a7f3d0; font-family:ui-monospace,monospace; font-size:12px; padding:10px; border-radius:6px; word-break:break-all; margin-top:8px; }
+    dialog { border:none; border-radius:10px; padding:0; max-width:1100px; width:92vw; }
+    dialog .dlg-hd { display:flex; justify-content:space-between; align-items:center; padding:12px 16px; border-bottom:1px solid #e5e7eb; }
+    dialog .dlg-bd { padding:14px 16px; max-height:70vh; overflow:auto; }
+    .hide { display:none; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header-row">
+      <h2>🏭 仕入れ先 売れ筋共有</h2>
+      <a class="back-link" href="/">← ダッシュボードに戻る</a>
+    </div>
+    <p class="muted">全モール（Amazon・楽天 ほか）の販売実績を仕入先別に集計し、ログイン不要の共有URLを発行します。原価・粗利は出ません（販売数・売上のみ）。</p>
+
+    <div class="panel">
+      <h3>名寄せ健全性（全社・直近30日）</h3>
+      <div id="health" class="health h-ok">読み込み中…</div>
+    </div>
+
+    <div class="panel">
+      <h3>仕入先一覧</h3>
+      <div class="muted" style="margin-bottom:8px;">商品数の多い順。表示名を登録してから共有URLを発行できます。</div>
+      <div style="overflow-x:auto;">
+        <table id="supTable">
+          <thead><tr>
+            <th class="l">仕入先コード</th><th class="l">表示名</th><th>商品数</th><th>有効URL</th><th class="l">操作</th>
+          </tr></thead>
+          <tbody><tr><td colspan="5" class="muted">読み込み中…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- 詳細ダイアログ -->
+  <dialog id="dlg">
+    <div class="dlg-hd">
+      <strong id="dlgTitle"></strong>
+      <button class="btn btn-sec" onclick="document.getElementById('dlg').close()">閉じる</button>
+    </div>
+    <div class="dlg-bd">
+      <div class="panel">
+        <h3>共有URL（トークン）</h3>
+        <div class="row" style="margin-bottom:8px;">
+          <input type="text" id="tkLabel" placeholder="ラベル（例: 営業担当用）" style="min-width:200px;">
+          <label class="muted">有効期限 <input type="date" id="tkExpires"></label>
+          <button class="btn btn-primary" id="btnIssue">URL発行</button>
+        </div>
+        <div id="newToken" class="hide">
+          <div class="muted">⚠ このURLは今だけ表示されます。コピーして仕入先に渡してください（再表示不可）。</div>
+          <div class="token-box" id="newTokenUrl"></div>
+          <button class="btn btn-sec" id="btnCopy" style="margin-top:6px;">コピー</button>
+        </div>
+        <table id="tkTable" style="margin-top:10px;">
+          <thead><tr><th class="l">ラベル</th><th>状態</th><th class="l">期限</th><th>アクセス</th><th class="l">最終</th><th class="l">操作</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="panel">
+        <div class="row" style="justify-content:space-between;">
+          <h3 style="margin:0;">商品別 売上プレビュー</h3>
+          <a class="btn btn-sec" id="btnCsv" href="#">CSVダウンロード</a>
+        </div>
+        <div id="prevMeta" class="muted" style="margin:8px 0;"></div>
+        <div style="overflow-x:auto;">
+          <table id="prevTable">
+            <thead><tr>
+              <th class="l">商品</th><th>7日</th><th>30日</th><th>30日日平均</th><th>30日売上</th><th class="l">最終販売日</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </dialog>
+
+  <script>
+    const base = '/apps/supplier-sales';
+    const yen = n => '¥' + Math.round(n||0).toLocaleString('ja-JP');
+    const esc = s => String(s==null?'':s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+    let current = null; // { code, name }
+
+    async function jget(u){ const r = await fetch(u); return r.json(); }
+    async function jpost(u,b){ const r = await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}); return r.json(); }
+
+    async function loadHealth(){
+      const d = await jget(base+'/api/health');
+      const el = document.getElementById('health');
+      if(!d.ok || !d.health){ el.textContent = '健全性データなし'; return; }
+      const h = d.health;
+      const map = { ok:'h-ok', notice:'h-notice', warn:'h-warn', block:'h-block' };
+      el.className = 'health ' + (map[h.level]||'h-ok');
+      const pct = (h.unresolvedRate*100).toFixed(1);
+      el.textContent = `未解決率 ${pct}%（未名寄せ売上 ${yen(h.unresolvedSales30)} / 全社 ${yen(h.totalSales30)}）`
+        + (h.level==='block' ? ' — 高すぎます。発行前に名寄せ確認を推奨。'
+        : h.level==='warn' ? ' — やや高め。'
+        : h.level==='notice' ? ' — 軽微。' : ' — 良好。');
+    }
+
+    async function loadSuppliers(){
+      const d = await jget(base+'/api/suppliers');
+      const tb = document.querySelector('#supTable tbody');
+      if(!d.ok || !d.suppliers.length){ tb.innerHTML='<tr><td colspan="5" class="muted">仕入先がありません</td></tr>'; return; }
+      tb.innerHTML = d.suppliers.map(s => {
+        const nm = s.display_name ? esc(s.display_name) : '<span class="muted">未登録</span>';
+        return `<tr>
+          <td class="l"><code>${esc(s.code)}</code></td>
+          <td class="l">${nm}</td>
+          <td>${s.product_count.toLocaleString('ja-JP')}</td>
+          <td>${s.active_token_count>0 ? '<span class="pill pill-on">'+s.active_token_count+'</span>' : '<span class="pill pill-off">0</span>'}</td>
+          <td class="l">
+            <button class="btn btn-sec js-edit" data-code="${esc(s.code)}" data-name="${esc(s.display_name||'')}">名称</button>
+            <button class="btn btn-primary js-detail" data-code="${esc(s.code)}" data-name="${esc(s.display_name||'')}">詳細/URL</button>
+          </td>
+        </tr>`;
+      }).join('');
+    }
+
+    async function editName(code, cur){
+      const name = prompt('仕入先「'+code+'」の表示名を入力してください', cur||'');
+      if(name===null) return;
+      const d = await jpost(base+'/api/supplier-name', { code, name });
+      if(!d.ok){ alert('保存失敗: '+(d.error||'')); return; }
+      loadSuppliers();
+    }
+
+    async function openDetail(code, name){
+      current = { code, name };
+      document.getElementById('dlgTitle').textContent = (name||code) + '（' + code + '）';
+      document.getElementById('newToken').classList.add('hide');
+      document.getElementById('btnCsv').href = base+'/api/summary.csv?code='+encodeURIComponent(code);
+      document.getElementById('dlg').showModal();
+      loadTokens(); loadPreview();
+    }
+
+    async function loadTokens(){
+      const d = await jget(base+'/api/tokens?code='+encodeURIComponent(current.code));
+      const tb = document.querySelector('#tkTable tbody');
+      if(!d.ok || !d.tokens.length){ tb.innerHTML='<tr><td colspan="6" class="muted">発行済みURLなし</td></tr>'; return; }
+      tb.innerHTML = d.tokens.map(t => {
+        const active = t.active && !t.revoked_at && (!t.expires_at || t.expires_at > new Date().toISOString());
+        const state = t.revoked_at ? '<span class="pill pill-off">失効</span>'
+          : !active ? '<span class="pill pill-off">期限切れ</span>'
+          : '<span class="pill pill-on">有効</span>';
+        return `<tr>
+          <td class="l">${esc(t.label||'—')}</td>
+          <td>${state}</td>
+          <td class="l">${t.expires_at ? esc(t.expires_at.slice(0,10)) : '無期限'}</td>
+          <td>${t.access_count}</td>
+          <td class="l">${t.last_accessed_at ? esc(t.last_accessed_at.slice(0,16).replace('T',' ')) : '—'}</td>
+          <td class="l">${active ? '<button class="btn btn-danger" onclick="revoke('+t.id+')">失効</button>' : ''}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    async function revoke(id){
+      if(!confirm('このURLを失効しますか？仕入先はアクセスできなくなります。')) return;
+      const d = await jpost(base+'/api/tokens/'+id+'/revoke', {});
+      if(!d.ok){ alert('失効失敗: '+(d.error||'')); return; }
+      loadTokens(); loadSuppliers();
+    }
+
+    document.getElementById('btnIssue').addEventListener('click', async () => {
+      const label = document.getElementById('tkLabel').value.trim();
+      const exp = document.getElementById('tkExpires').value;
+      const expiresAt = exp ? new Date(exp+'T23:59:59').toISOString() : null;
+      const d = await jpost(base+'/api/tokens', { code: current.code, label, expiresAt });
+      if(!d.ok){ alert('発行失敗: '+(d.error||'')); return; }
+      const url = location.origin + d.sharePath;
+      document.getElementById('newTokenUrl').textContent = url;
+      document.getElementById('newToken').classList.remove('hide');
+      document.getElementById('tkLabel').value=''; document.getElementById('tkExpires').value='';
+      loadTokens(); loadSuppliers();
+    });
+
+    document.getElementById('btnCopy').addEventListener('click', () => {
+      navigator.clipboard.writeText(document.getElementById('newTokenUrl').textContent)
+        .then(()=>{ document.getElementById('btnCopy').textContent='コピーしました'; });
+    });
+
+    async function loadPreview(){
+      const d = await jget(base+'/api/summary?code='+encodeURIComponent(current.code));
+      const tb = document.querySelector('#prevTable tbody');
+      const meta = document.getElementById('prevMeta');
+      if(!d.ok){ tb.innerHTML='<tr><td colspan="6" class="muted">取得失敗</td></tr>'; return; }
+      if(!d.windows || !d.products.length){ meta.textContent=''; tb.innerHTML='<tr><td colspan="6" class="muted">対象期間に販売実績なし</td></tr>'; return; }
+      meta.textContent = `集計対象: ${d.windows.w30start} 〜 ${d.windows.cutoff}　商品 ${d.totals.productCount} 点　30日売上 ${yen(d.totals.sales30)}`;
+      tb.innerHTML = d.products.map(p => `<tr>
+        <td class="l"><strong>${esc(p.product_name||'(商品名なし)')}</strong><br><span class="muted">${esc(p.ne_code)}</span></td>
+        <td>${p.units7.toLocaleString('ja-JP')}</td>
+        <td>${p.units30.toLocaleString('ja-JP')}</td>
+        <td>${p.avgPerDay30.toFixed(1)}</td>
+        <td>${yen(p.sales30)}</td>
+        <td class="l">${p.lastSold||'—'}</td>
+      </tr>`).join('');
+    }
+
+    // イベント委譲（DB由来値を onclick へ文字列展開しない＝DOM XSS 回避）
+    document.getElementById('supTable').addEventListener('click', (e) => {
+      const b = e.target.closest('button'); if (!b) return;
+      if (b.classList.contains('js-edit')) editName(b.dataset.code, b.dataset.name);
+      else if (b.classList.contains('js-detail')) openDetail(b.dataset.code, b.dataset.name);
+    });
+
+    loadHealth(); loadSuppliers();
+  </script>
+</body>
+</html>

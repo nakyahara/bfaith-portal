@@ -46,6 +46,8 @@ import salesAnalyticsLinegiftRouter from './apps/sales-analytics-linegift/router
 import packingDispatchRouter, { neSyncWorkerRouter as packingDispatchNeSyncWorkerRouter } from './apps/packing-dispatch/router.js';
 import inventoryMonthlyRouter, { apiRouter as inventoryMonthlyApiRouter } from './apps/inventory-monthly/router.js';
 import misShipmentRouter from './apps/mis-shipment/router.js';
+import supplierSalesRouter from './apps/supplier-sales/router.js';
+import supplierSalesPublicRouter from './apps/supplier-sales/public-router.js';
 import serviceRouter from './apps/warehouse/service-router.js';
 import { serviceAuth } from './apps/warehouse/service-auth.js';
 import { neSyncControlRouter } from './apps/warehouse/ne-sync-control-router.js';
@@ -636,6 +638,15 @@ const apps = [
     status: 'active',
     category: 'shipping',
   },
+  {
+    id: 'supplier-sales',
+    name: '仕入れ先 売れ筋共有',
+    description: '全モール(Amazon・楽天 ほか)の販売実績を仕入先別に集計し、ログイン不要の共有URLを発行。原価非開示・販売数/売上のみ',
+    icon: '🏭',
+    path: '/apps/supplier-sales',
+    status: 'active',
+    category: 'analysis',
+  },
 ];
 
 // ─── PORTAL_VARIANT (どの環境で動かしているか) ───
@@ -845,6 +856,8 @@ app.use('/apps/profit-calculator', requireAppAccess('profit-calculator'), profit
 app.use('/apps/fba-replenishment', requireAppAccess('fba-replenishment'), fbaRouter);
 // 子会社向け公開印刷 (ログイン不要・トークン認可)。requireAppAccess の外側に置く。
 app.use('/print', fbaPublicPrintRouter);
+// 仕入れ先向け 売れ筋共有 (ログイン不要・トークンURL)。requireAuth/requireAppAccess の外側。
+app.use('/share', supplierSalesPublicRouter);
 app.use('/apps/warehouse', requireAppAccess('warehouse'), warehouseRouter);
 
 // === Mirror subtree middleware (Codex 6周レビュー反映) ===
@@ -982,6 +995,8 @@ app.use('/apps/packing-dispatch/api/ne-sync-worker', express.json({ limit: '2mb'
 app.use('/apps/packing-dispatch', requireAppAccess('packing-dispatch'), express.json({ limit: '2mb' }), packingDispatchRouter);
 // 誤出荷管理 (apps/mis-shipment): warehouse-mirror.db 同居の f_mis_shipments を CRUD、注文 lookup は miniPC GET 経由
 app.use('/apps/mis-shipment', requireAppAccess('mis-shipment'), express.json({ limit: '256kb' }), misShipmentRouter);
+// 仕入れ先向け 売れ筋共有 (社内管理): 仕入先名登録・共有URL発行・プレビュー
+app.use('/apps/supplier-sales', requireAppAccess('supplier-sales'), express.json({ limit: '256kb' }), supplierSalesRouter);
 app.use('/apps/mgmt-accounting', express.json({ limit: '50mb' }), (req, res, next) => {
   // 管理系APIはセッション認証スキップ（内部で checkAuth により key/session のいずれか必須）
   const adminPaths = ['/import-historical', '/bulk-calculate', '/cleanup-invalid'];
