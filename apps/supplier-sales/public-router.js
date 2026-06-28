@@ -107,6 +107,7 @@ router.get('/supplier/:token', (req, res) => {
     token: req.params.token,
     mallLabels: MALL_LABELS,
     period: report.period,
+    sokuho: report.sokuho || { asOf: null, status: null },
     products: report.products,
     totals: report.totals,
     query: { period: periodOpts(req).period, start: req.query.start || '', end: req.query.end || '' },
