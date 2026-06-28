@@ -373,22 +373,30 @@ function listProductsForUI(db, { filter = 'all', search = '' } = {}) {
   };
 
   // 不備種類別 (fixable のみ): 「売価未入力 45 件」 等
+  //   Codex E-16 fix: reason-translator が返す notionField は 11 種あるが、 旧辞書は
+  //   'Yahoo!カテゴリID' / 'Yahoo!path' を含んでおらず、 カテゴリ未解決の SKU が全部
+  //   「その他」 バケットに落ちて真のボトルネックが隠れていた。 全 notionField を網羅する。
+  const NOTION_FIELD_TO_BUCKET = {
+    'Yahoo!タイトル':       'タイトル未入力',
+    '売価':                 '売価未入力',
+    '配送方法':             '配送方法未設定',
+    '税率':                 '税率の問題',
+    'Yahoo!カテゴリID':     'カテゴリ未設定',
+    'Yahoo!path':           'カテゴリ未設定',
+    'カテゴリ':             'カテゴリ未設定',
+    '画像':                 '画像の問題',
+    'バリエーション':       'バリエーションの問題',
+    'バリエーション有無':   'バリエーションの問題',
+    'バリエーション項目':   'バリエーションの問題',
+  };
   const fixableByCategory = {};
   for (const p of products.filter((x) => x.status === 'fixable')) {
     const cats = new Set();
     for (const r of p.reasons) {
-      // 元 raw reason を持ってないので、 notionField を bucket key として使う
+      // 元 raw reason を持ってないので、 notionField を bucket key として使う。
+      // notionField=null (severity=check 系) は 'その他' へ。
       const label = r.notionField
-        ? ({ 'Yahoo!タイトル': 'タイトル未入力',
-              '売価': '売価未入力',
-              '配送方法': '配送方法未設定',
-              '税率': '税率の問題',
-              'カテゴリ': 'カテゴリ未設定',
-              '画像': '画像の問題',
-              'バリエーション': 'バリエーションの問題',
-              'バリエーション有無': 'バリエーションの問題',
-              'バリエーション項目': 'バリエーションの問題',
-            }[r.notionField] || 'その他')
+        ? (NOTION_FIELD_TO_BUCKET[r.notionField] || 'その他')
         : 'その他';
       cats.add(label);
     }
@@ -766,6 +774,56 @@ router.post('/api/admin/create-notion-pages-from-rakuten', async (req, res) => {
       summary,
       error: r.error || null,
       results: r.results,
+    });
+  } catch (e) {
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+/**
+ * Phase E-16: カテゴリ自動解決の内訳統計。
+ *   「出せる」 が増えない真因 (大半がカテゴリ未解決) を画面/console で可視化するための診断 endpoint。
+ *
+ *   migration_candidates を起点に、 done/excluded を除く全候補について:
+ *     - rakuten_genre_id が NULL の件数 (= 楽天 RMS 取得時に genre 欠落)
+ *     - resolveCategoryAndPath の source 別件数 (notion/manual/decisions/learned/unresolved/notion_partial/*_path_missing)
+ *   を集計して返す。 副作用なし (read-only)。
+ */
+router.get('/api/admin/category-resolution-stats', (_req, res) => {
+  try {
+    const db = getDB();
+    // listProductsForUI と同じ起点・JOIN を流用 (status 判定込み)。
+    const { products } = listProductsForUI(db, { filter: 'all' });
+    // done / excluded / stale は移行対象外なので除外、 fixable + actionable のみ集計。
+    const targets = products.filter((p) => p.status === 'fixable' || p.status === 'actionable');
+
+    const bySource = {};
+    let genreIdNull = 0;
+    for (const p of targets) {
+      if (p.rakutenGenreId == null || p.rakutenGenreId === '') genreIdNull += 1;
+      const src = p.categorySource || 'unresolved';
+      bySource[src] = (bySource[src] || 0) + 1;
+    }
+
+    // unresolved な genre_id の頻度 top (どの genre を学習させれば効くか)
+    const unresolvedGenreFreq = {};
+    for (const p of targets) {
+      if (p.categorySource === 'unresolved' && p.rakutenGenreId != null && p.rakutenGenreId !== '') {
+        const g = String(p.rakutenGenreId);
+        unresolvedGenreFreq[g] = (unresolvedGenreFreq[g] || 0) + 1;
+      }
+    }
+    const topUnresolvedGenres = Object.entries(unresolvedGenreFreq)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 20)
+      .map(([genreId, count]) => ({ genreId, count }));
+
+    return res.json({
+      status: 'ok',
+      targetCount: targets.length,
+      genreIdNull,
+      bySource,
+      topUnresolvedGenres,
     });
   } catch (e) {
     return res.status(500).json({ status: 'fail', error: e.message });
