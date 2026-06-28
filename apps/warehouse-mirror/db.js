@@ -1704,11 +1704,16 @@ function createSupplierShareTables() {
       CHECK (trim(表示名) <> '')
     )
   `);
-  // 公開共有トークン。token_hash = sha256(raw token)。raw token は発行時に一度だけ表示。
+  // 公開共有トークン。token_hash = sha256(raw token)（解決用）。
+  // token_plain = 生トークン（社内管理画面で過去発行URLを再表示するために保持）。
+  //   この共有URLは売上・販売数のみ（原価非開示）で、DB 自体に同じデータがあるため、
+  //   生トークン保持の追加リスクは限定的（DB アクセス権者＝既にデータ閲覧可）。
+  //   token_plain は requireAppAccess 配下の社内 API でのみ返し、公開側には出さない。
   db.exec(`
     CREATE TABLE IF NOT EXISTS supplier_share_tokens (
       id               INTEGER PRIMARY KEY AUTOINCREMENT,
       token_hash       TEXT NOT NULL UNIQUE,
+      token_plain      TEXT,
       仕入先コード     TEXT NOT NULL,
       label            TEXT,
       active           INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
@@ -1722,6 +1727,8 @@ function createSupplierShareTables() {
       CHECK (trim(token_hash) <> '')
     )
   `);
+  // 既存 DB(PR #368 で作成済) への migration: 生トークン列を追加（既存行は NULL=再表示不可）
+  addColumnIfMissing('supplier_share_tokens', 'token_plain', 'TEXT');
   db.exec('CREATE INDEX IF NOT EXISTS idx_sst_supplier ON supplier_share_tokens(仕入先コード)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_sst_hash ON supplier_share_tokens(token_hash)');
 }

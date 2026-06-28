@@ -78,10 +78,11 @@ export function createToken({ supplierCode, label, expiresAt, createdBy }) {
   const rawToken = generateRawToken();
   const info = db.prepare(`
     INSERT INTO supplier_share_tokens
-      (token_hash, 仕入先コード, label, active, expires_at, created_by, created_at, access_count)
-    VALUES (@hash, @code, @label, 1, @expires, @by, @now, 0)
+      (token_hash, token_plain, 仕入先コード, label, active, expires_at, created_by, created_at, access_count)
+    VALUES (@hash, @plain, @code, @label, 1, @expires, @by, @now, 0)
   `).run({
     hash: hashToken(rawToken),
+    plain: rawToken,
     code: supplierCode,
     label: label || null,
     expires: expiresAt || null,
@@ -97,7 +98,7 @@ export function listTokens(supplierCode) {
   const args = supplierCode ? [supplierCode] : [];
   return db.prepare(`
     SELECT id, 仕入先コード AS supplier_code, label, active, expires_at, revoked_at,
-           created_by, created_at, last_accessed_at, access_count
+           created_by, created_at, last_accessed_at, access_count, token_plain
     FROM supplier_share_tokens
     ${where}
     ORDER BY created_at DESC

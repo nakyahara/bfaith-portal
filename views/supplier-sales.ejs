@@ -78,12 +78,12 @@
           <button class="btn btn-primary" id="btnIssue">URL発行</button>
         </div>
         <div id="newToken" class="hide">
-          <div class="muted">⚠ このURLは今だけ表示されます。コピーして仕入先に渡してください（再表示不可）。</div>
+          <div class="muted">✅ 発行しました。下の一覧からいつでもコピー・再表示できます。</div>
           <div class="token-box" id="newTokenUrl"></div>
           <button class="btn btn-sec" id="btnCopy" style="margin-top:6px;">コピー</button>
         </div>
         <table id="tkTable" style="margin-top:10px;">
-          <thead><tr><th class="l">ラベル</th><th>状態</th><th class="l">期限</th><th>アクセス</th><th class="l">最終</th><th class="l">操作</th></tr></thead>
+          <thead><tr><th class="l">ラベル</th><th>状態</th><th class="l">期限</th><th>アクセス</th><th class="l">最終</th><th class="l">共有URL</th><th class="l">操作</th></tr></thead>
           <tbody></tbody>
         </table>
       </div>
@@ -179,18 +179,23 @@
     async function loadTokens(){
       const d = await jget(base+'/api/tokens?code='+encodeURIComponent(current.code));
       const tb = document.querySelector('#tkTable tbody');
-      if(!d.ok || !d.tokens.length){ tb.innerHTML='<tr><td colspan="6" class="muted">発行済みURLなし</td></tr>'; return; }
+      if(!d.ok || !d.tokens.length){ tb.innerHTML='<tr><td colspan="7" class="muted">発行済みURLなし</td></tr>'; return; }
       tb.innerHTML = d.tokens.map(t => {
         const active = t.active && !t.revoked_at && (!t.expires_at || t.expires_at > new Date().toISOString());
         const state = t.revoked_at ? '<span class="pill pill-off">失効</span>'
           : !active ? '<span class="pill pill-off">期限切れ</span>'
           : '<span class="pill pill-on">有効</span>';
+        const fullUrl = t.sharePath ? (location.origin + t.sharePath) : '';
+        const urlCell = !t.sharePath ? '<span class="muted">再取得不可</span>'
+          : !active ? '<span class="muted">（失効済）</span>'
+          : `<button class="btn btn-sec js-copyurl" data-url="${esc(fullUrl)}">コピー</button> <a class="btn btn-sec" href="${esc(t.sharePath)}" target="_blank" rel="noopener">開く</a>`;
         return `<tr>
           <td class="l">${esc(t.label||'—')}</td>
           <td>${state}</td>
           <td class="l">${t.expires_at ? esc(t.expires_at.slice(0,10)) : '無期限'}</td>
           <td>${t.access_count}</td>
           <td class="l">${t.last_accessed_at ? esc(t.last_accessed_at.slice(0,16).replace('T',' ')) : '—'}</td>
+          <td class="l">${urlCell}</td>
           <td class="l">${active ? '<button class="btn btn-danger" onclick="revoke('+t.id+')">失効</button>' : ''}</td>
         </tr>`;
       }).join('');
@@ -265,6 +270,15 @@
       const b = e.target.closest('button'); if (!b) return;
       if (b.classList.contains('js-edit')) editName(b.dataset.code, b.dataset.name);
       else if (b.classList.contains('js-detail')) openDetail(b.dataset.code, b.dataset.name);
+    });
+
+    // 過去発行URLのコピー（委譲）
+    document.getElementById('tkTable').addEventListener('click', (e) => {
+      const b = e.target.closest('.js-copyurl'); if (!b) return;
+      navigator.clipboard.writeText(b.dataset.url).then(() => {
+        const o = b.textContent; b.textContent = 'コピー✓';
+        setTimeout(() => { b.textContent = o; }, 1500);
+      });
     });
 
     loadHealth(); loadSuppliers();
