@@ -373,6 +373,83 @@ function round1(n) { return Math.round(n * 10) / 10; }
 function round2(n) { return Math.round(n * 100) / 100; }
 
 /**
+ * 確定(精算ベース)の日次明細を返す。日付 × モール × 出品 の粒度。
+ *   = 「いつ・どのモールで・何個・いくら」の確定データ（CSV用）。
+ *   finance マート(date_jst 粒度)由来。原価は出さない。期間 P 内のみ(prev は含めない)。
+ *   Amazon は seller_sku→仕入先解決＋FBA/FBM判別、他モールは fact の ne_code。
+ * @returns { period, rows:[{date, mall, is_fba, listingId, asin, ne_code, product_name, units, sales}] }
+ */
+export function getSupplierDailyDetail(db, supplierCode, opts = {}) {
+  const P = resolvePeriod(db, opts);
+  if (!P) return { period: null, rows: [] };
+  const prod = loadProductMap(db);
+  const amzMap = loadAmazonMap(db, supplierCode);
+  const setMap = loadSetMap(db, supplierCode);
+  const params = { s: supplierCode, start: P.start, end: P.end };
+  const rows = [];
+
+  // Amazon: 日次 × seller_sku（FBA/FBM 判別、仕入先解決）
+  const amz = db.prepare(`
+    SELECT date_jst, seller_sku, asin_norm, product_name,
+           CAST(units_net_sold AS REAL) u, sales_principal_jpy sales,
+           (fba_fulfillment_jpy + fba_storage_jpy) fbaFee
+    FROM mirror_amazon_finance_sku_daily
+    WHERE date_jst BETWEEN @start AND @end
+      AND seller_sku IN (
+        SELECT seller_sku FROM mirror_sku_resolved
+        WHERE ne_code IN (SELECT 商品コード FROM mirror_products WHERE 仕入先コード = @s))
+  `).all(params);
+  for (const r of amz) {
+    if (!r.u && !r.sales) continue;
+    const comps = amzMap.get(r.seller_sku) || [];
+    const sup = comps.find(c => prod.get(c.code)?.supplier === supplierCode);
+    const ne = sup ? sup.code : '';
+    rows.push({
+      date: r.date_jst, mall: 'amazon', is_fba: r.fbaFee > 0,
+      listingId: r.seller_sku, asin: r.asin_norm || '',
+      ne_code: ne, product_name: (ne && prod.get(ne)?.name) || r.product_name || '',
+      units: r.u, sales: Math.round(r.sales),
+    });
+  }
+
+  // 非 Amazon: 日次 × 出品（fact の ne_code、セットは仕入先構成品へ寄せる）
+  for (const c of NON_AMAZON_MALLS) {
+    const rs = db.prepare(`
+      SELECT date_jst, ${c.key} k, ne_code, product_name,
+             CAST(units_net_sold AS REAL) u, ${c.sales} sales
+      FROM ${c.table}
+      WHERE date_jst BETWEEN @start AND @end
+        AND ne_code IS NOT NULL AND trim(ne_code) <> ''
+        AND (ne_code IN (SELECT 商品コード FROM mirror_products WHERE 仕入先コード = @s)
+             OR ne_code IN (SELECT セット商品コード FROM mirror_set_components
+                            WHERE 構成商品コード IN (SELECT 商品コード FROM mirror_products WHERE 仕入先コード = @s)))
+    `).all(params);
+    for (const r of rs) {
+      if (!r.u && !r.sales) continue;
+      let ne = r.ne_code, name = r.product_name || '';
+      const comps = setMap.get(r.ne_code);
+      if (comps) {
+        const sup = comps.find(x => prod.get(x.code)?.supplier === supplierCode);
+        if (sup) { ne = sup.code; name = prod.get(ne)?.name || name; }
+      } else {
+        name = prod.get(r.ne_code)?.name || name;
+      }
+      rows.push({
+        date: r.date_jst, mall: c.mall, is_fba: false,
+        listingId: r.k, asin: '', ne_code: ne, product_name: name,
+        units: r.u, sales: Math.round(r.sales),
+      });
+    }
+  }
+
+  // 日付降順 → モール → 出品
+  rows.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0)
+    || (a.mall < b.mall ? -1 : a.mall > b.mall ? 1 : 0)
+    || (a.listingId < b.listingId ? -1 : 1));
+  return { period: P, rows };
+}
+
+/**
  * 社内向け: SKU 名寄せの未解決率（直近30日・全社）。仕入先別が過少表示でないかの健全性チェック。
  * 公開側には出さない。
  */

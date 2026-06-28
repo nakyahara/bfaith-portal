@@ -39,3 +39,15 @@ export function buildCsv(report, mallLabels) {
   }
   return '﻿' + lines.join('\r\n') + '\r\n';
 }
+
+// 確定(精算ベース)の日次明細CSV: 日付 × モール × 出品 × 数量/売上。
+//   「いつ・どのモールで・何個・いくら」を行ごとに。Amazon は FBA/FBM をモール列に反映。
+export function buildDailyCsv(report, mallLabels) {
+  const header = ['受注日(確定)', 'モール', '出品ID', '商品コード', '商品名', '数量', '売上(税込)'];
+  const lines = [row(header)];
+  for (const r of (report.rows || [])) {
+    const mall = r.mall === 'amazon' ? (r.is_fba ? 'Amazon FBA' : 'Amazon FBM') : (mallLabels[r.mall] || r.mall);
+    lines.push(row([r.date, mall, r.listingId, r.ne_code, r.product_name, r.units, r.sales]));
+  }
+  return '﻿' + lines.join('\r\n') + '\r\n';
+}

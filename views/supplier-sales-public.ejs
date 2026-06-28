@@ -148,7 +148,8 @@
           <input type="date" name="start" value="<%= query.start %>"><span>〜</span><input type="date" name="end" value="<%= query.end %>">
           <button type="submit">表示</button>
         </form>
-        <a class="csv" href="<%= '/share/supplier/' + token + '/csv' + qstr(query.period||'30d') %>">CSVダウンロード</a>
+        <a class="csv" href="<%= '/share/supplier/' + token + '/csv' + qstr(query.period||'30d') %>">商品別CSV</a>
+        <a class="csv" href="<%= '/share/supplier/' + token + '/daily.csv' + qstr(query.period||'30d') %>">日次CSV(日付×モール)</a>
       </div>
       <div class="period"><% if (period) { %>確定（精算ベース）: <%= period.start %> 〜 <%= period.end %>（<%= period.label %>・<%= period.cutoff %>まで確定分）<% } else { %>確定（精算ベース）: 集計対象データがまだありません<% } %></div>
       <div class="cards">
