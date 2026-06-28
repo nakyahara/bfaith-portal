@@ -17,7 +17,7 @@ import { Router } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { inspectEnvStatus } from './env-check.js';
-import { getDB, getMirrorDbPath } from './db.js';
+import { getDB, getMirrorDbPath, openMirrorReadonly } from './db.js';
 import { acquire, SyncLockError } from './lib/sync-lock.js';
 import { syncNotionOverrides } from './services/notion-sync.js';
 import { patchPageProperties } from './lib/notion-client.js';
@@ -636,12 +636,14 @@ router.post('/api/admin/seed-notion-drafts', async (req, res) => {
     const limit = Math.max(1, Math.min(parseInt(body.limit, 10) || 200, 500));
     const explicitCodes = Array.isArray(body.itemCodes) ? body.itemCodes.map(String).filter(Boolean) : null;
 
-    // 1. 対象 SKU 取得 (notion_overrides に居て、 yahoo_title/yahoo_price/notion_tax_rate のいずれかが空欄)
+    // 1. 対象 SKU 取得 (notion_overrides に居て、 yahoo_title/yahoo_price/notion_tax_rate/notion_delivery_label のいずれかが空欄)
+    //    Codex Phase E-15 R2 H-2: 配送方法 missing も対象に追加
     const filterSql = explicitCodes && explicitCodes.length > 0
       ? `WHERE no.rakuten_manage_number IN (${explicitCodes.map(() => '?').join(',')})`
       : `WHERE (no.yahoo_title IS NULL OR no.yahoo_title = ''
               OR no.yahoo_price IS NULL OR no.yahoo_price <= 0
-              OR no.notion_tax_rate IS NULL OR no.notion_tax_rate = '')`;
+              OR no.notion_tax_rate IS NULL OR no.notion_tax_rate = ''
+              OR no.notion_delivery_label IS NULL OR no.notion_delivery_label = '')`;
     const rows = db.prepare(`
       SELECT no.notion_page_id, no.rakuten_manage_number AS manage_number,
              no.yahoo_title, no.yahoo_price, no.notion_tax_rate, no.notion_delivery_label
@@ -654,6 +656,12 @@ router.post('/api/admin/seed-notion-drafts', async (req, res) => {
     if (rows.length === 0) {
       return res.json({ status: 'ok', totalScanned: 0, proposed: [], skipped: [], applied: [], errors: [] });
     }
+
+    // Phase E-15: 配送方法 lookup 用に warehouse-mirror.db を read-only で open
+    let warehouseDb = null;
+    try {
+      warehouseDb = openMirrorReadonly();
+    } catch (_) { /* mirror 未配備 or open 失敗時は配送方法 skip 扱い */ }
 
     // 2. 楽天 RMS bulk fetch
     const manageNumbers = rows.map((r) => r.manage_number);
@@ -681,7 +689,7 @@ router.post('/api/admin/seed-notion-drafts', async (req, res) => {
         skipped.push({ itemCode: r.manage_number, reason: 'rakuten_fetch_failed', detail: f?.reason || null });
         continue;
       }
-      const { proposed: prop, skipped: skip } = buildNotionDraftProposal(rakutenItem, r);
+      const { proposed: prop, skipped: skip } = buildNotionDraftProposal(rakutenItem, r, { warehouseDb });
       if (Object.keys(prop).length === 0) {
         skipped.push({ itemCode: r.manage_number, reason: 'all_skipped', detail: skip });
         continue;
@@ -699,6 +707,7 @@ router.post('/api/admin/seed-notion-drafts', async (req, res) => {
             if (prop.yahoo_title)      { updates.push('yahoo_title = ?');      params.push(prop.yahoo_title); }
             if (prop.yahoo_price != null) { updates.push('yahoo_price = ?');    params.push(prop.yahoo_price); }
             if (prop.notion_tax_rate)  { updates.push('notion_tax_rate = ?');   params.push(prop.notion_tax_rate); }
+            if (prop.notion_delivery_label) { updates.push('notion_delivery_label = ?'); params.push(prop.notion_delivery_label); }
             if (updates.length > 0) {
               updates.push(`synced_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`);
               params.push(r.notion_page_id);
@@ -712,6 +721,8 @@ router.post('/api/admin/seed-notion-drafts', async (req, res) => {
         }
       }
     }
+
+    if (warehouseDb) { try { warehouseDb.close(); } catch (_) {} }
 
     return res.json({
       status: 'ok',
