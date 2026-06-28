@@ -157,7 +157,10 @@ export async function evaluateItemForPublish({
   }
 
   // 6. readiness
-  const rakutenTaxRate = rakutenItem.payment?.taxRate;
+  // Codex Phase E-15 R1 H-1: 楽天 RMS で taxRate 省略 = 店舗 default 10% (B-Faith 運用)。
+  //   軽減税率 (8%) の商品のみ payment.taxRate が明示される (実測: aburatoishioil100 のみ '0.1' 明示、
+  //   他 5 件 sample は省略)。 missing は 0.1 として readiness に渡し、 Notion 税率 '10%' と整合させる。
+  const rakutenTaxRate = rakutenItem.payment?.taxRate ?? 0.1;
   const resolvedPrice = resolvePrice({ notionOverride, deliveryRow, rakutenItem });
   const readiness = evaluateReadiness({
     notionOverride,
