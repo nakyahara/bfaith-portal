@@ -91,7 +91,7 @@
       <% } else { %>
       <div class="scroll">
       <table>
-        <thead><tr><th class="l">商品</th><th>速報<br>7日</th><th>速報<br>30日</th><th>内Amazon<br>FBA(30日)</th><th>現在庫</th><th>在庫<br>日数</th></tr></thead>
+        <thead><tr><th class="l">商品</th><th>速報<br>7日</th><th>速報<br>30日</th><th>内Amazon<br>FBA(30日)</th></tr></thead>
         <tbody>
           <% sokuhoProducts.forEach(p => { %>
             <tr>
@@ -99,8 +99,6 @@
               <td><strong><%= num(p.sokuho7) %></strong></td>
               <td><strong><%= num(p.sokuho30) %></strong></td>
               <td><%= num(p.sokuho30Fba) %></td>
-              <td><%= p.stock == null ? '—' : num(p.stock) %></td>
-              <td><%= p.stockDays == null ? '—' : num(p.stockDays) %></td>
             </tr>
           <% }) %>
         </tbody>
@@ -109,8 +107,7 @@
       <% } %>
       <div class="note">
         <b>速報（注文ベース）</b>とは … 注文が入った日でカウントした直近の販売数です（ほぼ前日まで反映・Amazon FBA含む・返品/キャンセル後の精算は未反映の暫定値）。<br>
-        対象は<b>全モール</b>です。<b>楽天・Yahoo!・Amazon FBM など「FBA以外」はまとめて</b>この数字に含まれます（うち Amazon FBA 分だけ「内Amazon FBA」で分離表示）。モール別・出品別に分けて見るには「確定」タブの<b>出品内訳</b>をご覧ください。<br>
-        ・<b>在庫日数</b> … 現在庫 ÷ 直近の販売ペースの目安日数です。
+        対象は<b>全モール</b>です。<b>楽天・Yahoo!・Amazon FBM など「FBA以外」はまとめて</b>この数字に含まれます（うち Amazon FBA 分だけ「内Amazon FBA」で分離表示）。モール別・出品別に分けて見るには「確定」タブの<b>出品内訳</b>をご覧ください。
       </div>
     </section>
 
