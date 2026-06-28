@@ -231,7 +231,7 @@
     async function loadPreview(){
       const tb = document.querySelector('#prevTable tbody');
       const meta = document.getElementById('prevMeta');
-      tb.innerHTML='<tr><td colspan="6" class="muted">読み込み中…</td></tr>';
+      tb.innerHTML='<tr><td colspan="7" class="muted">読み込み中…</td></tr>';
       const d = await jget(base+'/api/summary?code='+encodeURIComponent(current.code)+'&period='+curPeriod());
       if(!d.ok){ tb.innerHTML='<tr><td colspan="7" class="muted">取得失敗</td></tr>'; return; }
       // 速報のみ(確定finance空=period null)でも表示する。空判定は products 件数だけで行う。
