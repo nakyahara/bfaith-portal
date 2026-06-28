@@ -250,7 +250,7 @@
         return `<tr>
           <td class="l"><strong>${esc(p.product_name||'(商品名なし)')}</strong><br><span class="muted">${esc(p.ne_code)}</span></td>
           <td><strong>${num(p.sokuho7)}</strong></td>
-          <td><strong>${num(p.sokuho30)}</strong>${p.sokuho30Fba?`<br><span class="muted">内FBA ${num(p.sokuho30Fba)}</span>`:''}</td>
+          <td><strong>${num(p.sokuho30)}</strong>${(p.sokuhoMalls&&p.sokuhoMalls.length)?`<br><span class="muted">${p.sokuhoMalls.map(m=>esc(m.label)+' '+num(m.q30)).join(' / ')}</span>`:''}</td>
           <td>${num(p.pieces)}</td>
           <td>${yen(p.sales)}</td>
           <td class="l">${p.lastSold||'—'}</td>

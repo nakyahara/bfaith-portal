@@ -1548,6 +1548,20 @@ function createTables() {
   } catch (e) {
     // テーブル未存在等は無視 (CREATE で作る)
   }
+  // 販売速度 モール別ミラー（仕入れ先売れ筋共有の「速報モール別」用）。
+  //   miniPC f_sales_velocity_by_product_mall を /api/sync(velocity_mall) で受信。
+  //   商品コード=NE商品コード、mall=platform / 'amazon_fba'、qty_7d/30d は注文ベース数量。
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_f_sales_velocity_by_product_mall (
+    商品コード   TEXT NOT NULL,
+    mall         TEXT NOT NULL,
+    qty_7d       INTEGER NOT NULL DEFAULT 0,
+    qty_30d      INTEGER NOT NULL DEFAULT 0,
+    as_of_date   TEXT NOT NULL,
+    synced_at    TEXT NOT NULL,
+    PRIMARY KEY (商品コード, mall)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mfsvm_code ON mirror_f_sales_velocity_by_product_mall(商品コード)');
+
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_f_sales_by_listing (
     date_jst          TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
     month_ym          TEXT NOT NULL,

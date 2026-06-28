@@ -399,6 +399,29 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
       log.push(`stock_monthly_snapshot: ${snapshotData.length}件${meta?.clear_stock_snapshot ? ' (clear)' : ''}`);
     }
 
+    // velocity_mall（速報モール別: 商品コード×mall×7/30日数量）
+    //   payload: req.body.velocity_mall = { as_of_date, rows: [{商品コード, mall, qty_7d, qty_30d}] }
+    //   注文ベース・毎朝再構築。fail-closed: rows 欠落/空は反映せず前回 mirror を保持
+    //   （sync 失敗時に速報モール別が全消えするのを防ぐ）。
+    if (req.body.velocity_mall && typeof req.body.velocity_mall === 'object' && Array.isArray(req.body.velocity_mall.rows)) {
+      const vm = req.body.velocity_mall;
+      const rows = vm.rows;
+      if (rows.length === 0) {
+        log.push('velocity_mall: 0件 → 送信スキップ扱い（前回 mirror を保持）');
+      } else {
+        const tx = db.transaction(() => {
+          db.exec('DELETE FROM mirror_f_sales_velocity_by_product_mall');
+          const stmt = db.prepare(`INSERT INTO mirror_f_sales_velocity_by_product_mall
+            (商品コード, mall, qty_7d, qty_30d, as_of_date, synced_at) VALUES (?,?,?,?,?,?)`);
+          for (const r of rows) {
+            stmt.run(r.商品コード, r.mall, r.qty_7d ?? 0, r.qty_30d ?? 0, vm.as_of_date || '', now);
+          }
+        });
+        tx();
+        log.push(`velocity_mall: ${rows.length}件 (as_of=${vm.as_of_date || '?'})`);
+      }
+    }
+
     // 商品管理リスト スナップショット (⑤) — checksum 検証 → atomic swap
     //   payload: req.body.pml_snapshot = { run_id, status, as_of_date, generated_at,
     //     payload_checksum, row_count, src_*, ne_fba_overlap, rows: [...] }
