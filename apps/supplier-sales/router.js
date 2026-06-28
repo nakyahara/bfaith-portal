@@ -13,7 +13,8 @@
  */
 import express from 'express';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
-import { getSupplierSummary, getUnresolvedStats, MALL_LABELS } from './aggregate.js';
+import { getSupplierReport, getUnresolvedStats, MALL_LABELS } from './aggregate.js';
+import { buildCsv } from './csv.js';
 import {
   listSuppliers, upsertSupplierName, getSupplierName,
   listTokens, createToken, revokeToken,
@@ -60,16 +61,25 @@ router.post('/api/supplier-name', (req, res) => {
   }
 });
 
+// 期間パラメータを query から取り出す（period=7d|30d|90d|custom, start, end）
+function periodOpts(req) {
+  return {
+    period: req.query.period ? String(req.query.period) : '30d',
+    start: req.query.start ? String(req.query.start) : null,
+    end: req.query.end ? String(req.query.end) : null,
+  };
+}
+
 router.get('/api/summary', (req, res) => {
   try {
     const code = String(req.query.code || '').trim();
     if (!code) return res.status(400).json({ ok: false, error: 'code は必須です' });
-    const summary = getSupplierSummary(getMirrorDB(), code);
+    const report = getSupplierReport(getMirrorDB(), code, periodOpts(req));
     res.json({
       ok: true,
       supplierName: getSupplierName(code) || code,
       mallLabels: MALL_LABELS,
-      ...summary,
+      ...report,
     });
   } catch (e) {
     console.error('[supplier-sales] summary error:', e.message);
@@ -81,24 +91,12 @@ router.get('/api/summary.csv', (req, res) => {
   try {
     const code = String(req.query.code || '').trim();
     if (!code) return res.status(400).send('code は必須です');
-    const { products, windows } = getSupplierSummary(getMirrorDB(), code);
     const name = getSupplierName(code) || code;
-    const header = ['商品コード', '商品名', '7日販売数', '7日売上', '30日販売数', '30日売上', '30日日平均', '最終販売日'];
-    const lines = [header.join(',')];
-    for (const p of products) {
-      lines.push([
-        p.ne_code, csvCell(p.product_name),
-        p.units7, p.sales7, p.units30, p.sales30,
-        p.avgPerDay30.toFixed(2), p.lastSold || '',
-      ].join(','));
-    }
-    const cutoff = windows ? windows.cutoff : '';
-    // UTF-8 BOM 付き（Excel で文字化けしないよう）
-    const csv = '﻿' + lines.join('\r\n') + '\r\n';
+    const report = getSupplierReport(getMirrorDB(), code, periodOpts(req));
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition',
-      `attachment; filename="supplier_sales_${encodeURIComponent(name)}_${cutoff}.csv"`);
-    res.send(csv);
+      `attachment; filename="supplier_sales_${encodeURIComponent(name)}_${report.period ? report.period.start + '_' + report.period.end : ''}.csv"`);
+    res.send(buildCsv(report, MALL_LABELS));
   } catch (e) {
     console.error('[supplier-sales] csv error:', e.message);
     res.status(500).send('CSV 生成に失敗しました');
@@ -148,12 +146,5 @@ router.post('/api/tokens/:id/revoke', (req, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
-
-function csvCell(s) {
-  let v = String(s ?? '');
-  // CSV インジェクション対策: =,+,-,@ 始まりは Excel 等で式評価されるため ' を前置
-  if (/^[=+\-@]/.test(v)) v = `'${v}`;
-  return /[",\r\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
-}
 
 export default router;

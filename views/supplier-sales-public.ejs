@@ -9,26 +9,36 @@
     :root { --line:#e2e8f0; --muted:#64748b; --accent:#2563eb; --bg:#f8fafc; }
     * { box-sizing: border-box; }
     body { font-family: "Hiragino Sans","Meiryo",system-ui,sans-serif; margin:0; color:#0f172a; background:var(--bg); }
-    .wrap { max-width: 1040px; margin: 0 auto; padding: 20px 16px 64px; }
-    header.hd { padding: 8px 0 16px; border-bottom: 2px solid var(--accent); margin-bottom: 16px; }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 20px 16px 64px; }
+    header.hd { padding: 8px 0 14px; border-bottom: 2px solid var(--accent); margin-bottom: 14px; }
     .hd h1 { font-size: 20px; margin: 0 0 4px; }
     .hd .sub { color: var(--muted); font-size: 13px; }
-    .period { display:inline-block; background:#eff6ff; color:#1e40af; border:1px solid #bfdbfe; border-radius:6px; padding:4px 10px; font-size:12px; margin-top:8px; }
-    .cards { display:flex; flex-wrap:wrap; gap:12px; margin:16px 0 8px; }
-    .card { flex:1 1 150px; background:#fff; border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
-    .card .k { color:var(--muted); font-size:12px; }
-    .card .v { font-size:22px; font-weight:700; margin-top:2px; }
+    .toolbar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin:14px 0; }
+    .seg a { display:inline-block; padding:6px 12px; border:1px solid var(--line); border-radius:6px; text-decoration:none; color:#334155; background:#fff; font-size:13px; }
+    .seg a.on { background:var(--accent); color:#fff; border-color:var(--accent); }
+    .custom { display:flex; gap:6px; align-items:center; font-size:13px; color:var(--muted); }
+    .custom input { padding:5px 8px; border:1px solid var(--line); border-radius:6px; font-size:13px; }
+    .custom button, .csv { padding:6px 12px; border:1px solid var(--accent); background:var(--accent); color:#fff; border-radius:6px; font-size:13px; cursor:pointer; text-decoration:none; }
+    .csv { background:#fff; color:var(--accent); }
+    .period { display:inline-block; background:#eff6ff; color:#1e40af; border:1px solid #bfdbfe; border-radius:6px; padding:4px 10px; font-size:12px; }
+    .cards { display:flex; flex-wrap:wrap; gap:12px; margin:8px 0 14px; }
+    .card { flex:1 1 160px; background:#fff; border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
+    .card .k { color:var(--muted); font-size:12px; } .card .v { font-size:22px; font-weight:700; margin-top:2px; }
     .card .v small { font-size:12px; color:var(--muted); font-weight:400; }
     table { width:100%; border-collapse:collapse; background:#fff; font-size:13px; border:1px solid var(--line); border-radius:10px; overflow:hidden; }
     th, td { padding:9px 10px; border-bottom:1px solid var(--line); text-align:right; white-space:nowrap; }
-    th { background:#f1f5f9; color:#334155; font-weight:600; font-size:12px; position:sticky; top:0; }
+    th { background:#f1f5f9; color:#334155; font-weight:600; font-size:12px; }
     td.l, th.l { text-align:left; white-space:normal; }
-    tbody tr:hover { background:#f8fafc; }
-    .name { font-weight:600; }
-    .code { color:var(--muted); font-size:11px; }
-    .malls { color:var(--muted); font-size:11px; margin-top:3px; }
+    .name { font-weight:600; } .code { color:var(--muted); font-size:11px; }
     .trend-up { color:#16a34a; } .trend-dn { color:#dc2626; } .trend-fl { color:var(--muted); }
-    .note { color:var(--muted); font-size:11px; margin-top:18px; line-height:1.7; }
+    .toggle { cursor:pointer; color:var(--accent); font-size:12px; user-select:none; }
+    .sub-row td { background:#fbfcfe; border-bottom:1px dashed var(--line); }
+    .sub-tbl { width:100%; border:none; border-radius:0; }
+    .sub-tbl th, .sub-tbl td { border-bottom:1px solid #eef2f7; font-size:12px; padding:6px 8px; }
+    .badge { display:inline-block; padding:0 6px; border-radius:8px; font-size:10px; }
+    .b-fba { background:#dcfce7; color:#166534; } .b-fbm { background:#fef3c7; color:#92400e; }
+    .b-mall { background:#eef2ff; color:#3730a3; }
+    .note { color:var(--muted); font-size:11px; margin-top:18px; line-height:1.8; background:#fff; border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
     .empty { background:#fff; border:1px solid var(--line); border-radius:10px; padding:40px; text-align:center; color:var(--muted); }
     .scroll { overflow-x:auto; }
     @media (max-width:640px){ .hd h1{font-size:17px;} .card .v{font-size:18px;} }
@@ -38,16 +48,34 @@
 <div class="wrap">
   <header class="hd">
     <h1><%= supplierName %> 様 販売実績</h1>
-    <div class="sub">B-Faith / 全モール（Amazon・楽天 ほか）合算</div>
-    <% if (windows) { %>
-      <div class="period">集計対象: <%= windows.w30start %> 〜 <%= windows.cutoff %>（直近30日／<%= windows.cutoff %> まで確定分）</div>
-    <% } %>
+    <div class="sub">B-Faith / 全モール（Amazon・楽天 ほか）合算・実出荷ピース数ベース</div>
   </header>
 
-  <% if (!windows || !products || products.length === 0) { %>
-    <div class="empty">この期間に対象商品の販売実績データがありません。</div>
+  <% function qstr(p){ return p==='custom' ? `?period=custom&start=${encodeURIComponent(query.start)}&end=${encodeURIComponent(query.end)}` : `?period=${p}`; } %>
+  <div class="toolbar">
+    <div class="seg">
+      <a href="?period=7d"  class="<%= query.period==='7d'?'on':'' %>">7日</a>
+      <a href="?period=30d" class="<%= (query.period==='30d'||!query.period)?'on':'' %>">30日</a>
+      <a href="?period=90d" class="<%= query.period==='90d'?'on':'' %>">90日</a>
+    </div>
+    <form class="custom" method="get">
+      <input type="hidden" name="period" value="custom">
+      <input type="date" name="start" value="<%= query.start %>">
+      <span>〜</span>
+      <input type="date" name="end" value="<%= query.end %>">
+      <button type="submit">表示</button>
+    </form>
+    <% if (period) { %>
+      <a class="csv" href="<%= '/share/supplier/' + token + '/csv' + qstr(query.period||'30d') %>">CSVダウンロード</a>
+    <% } %>
+  </div>
+
+  <% if (!period || !products || products.length === 0) { %>
+    <% if (period) { %><div class="period">集計対象: <%= period.start %> 〜 <%= period.end %></div><% } %>
+    <div class="empty" style="margin-top:12px;">この期間に対象商品の販売実績データがありません。</div>
   <% } else {
        const yen = n => '¥' + Math.round(n).toLocaleString('ja-JP');
+       const num = n => (Math.round(n*10)/10).toLocaleString('ja-JP');
        const trend = (cur, prev) => {
          if (prev === 0 && cur === 0) return { cls:'trend-fl', mark:'—' };
          if (prev === 0) return { cls:'trend-up', mark:'▲ new' };
@@ -57,56 +85,77 @@
          return { cls:'trend-fl', mark:'→' };
        };
   %>
+    <div class="period">集計対象: <%= period.start %> 〜 <%= period.end %>（<%= period.label %>／<%= period.cutoff %> まで確定分）</div>
     <div class="cards">
       <div class="card"><div class="k">対象商品数</div><div class="v"><%= totals.productCount.toLocaleString('ja-JP') %><small> 点</small></div></div>
-      <div class="card"><div class="k">直近7日 販売数</div><div class="v"><%= totals.units7.toLocaleString('ja-JP') %><small> 個</small></div></div>
-      <div class="card"><div class="k">直近30日 販売数</div><div class="v"><%= totals.units30.toLocaleString('ja-JP') %><small> 個</small></div></div>
-      <div class="card"><div class="k">直近30日 売上</div><div class="v"><%= yen(totals.sales30) %></div></div>
+      <div class="card"><div class="k">販売ピース数</div><div class="v"><%= num(totals.pieces) %><small> 個</small></div></div>
+      <div class="card"><div class="k">売上(税込)</div><div class="v"><%= yen(totals.sales) %></div></div>
+      <div class="card"><div class="k">前同期間比(個数)</div><div class="v"><% const tt=trend(totals.pieces, totals.prevPieces); %><span class="<%= tt.cls %>"><%= tt.mark %></span></div></div>
     </div>
 
     <div class="scroll">
     <table>
-      <thead>
-        <tr>
-          <th class="l">商品</th>
-          <th>7日<br>販売数</th>
-          <th>7日<br>傾向</th>
-          <th>30日<br>販売数</th>
-          <th>30日<br>日平均</th>
-          <th>30日<br>売上</th>
-          <th>最終<br>販売日</th>
-        </tr>
-      </thead>
+      <thead><tr>
+        <th class="l">商品</th>
+        <th>ピース数</th><th>傾向</th><th>日平均</th><th>売上(税込)</th><th>最終販売日</th><th class="l">明細</th>
+      </tr></thead>
       <tbody>
-        <% products.forEach(p => {
-             const t = trend(p.units7, p.units7prev);
-             const mallStr = Object.keys(p.malls).map(m => `${mallLabels[m]||m} ${p.malls[m].units}`).join(' / ');
-        %>
+        <% products.forEach((p, idx) => { const t = trend(p.pieces, p.prevPieces); %>
           <tr>
-            <td class="l">
-              <div class="name"><%= p.product_name || '(商品名なし)' %></div>
-              <div class="code"><%= p.ne_code %></div>
-              <% if (mallStr) { %><div class="malls"><%= mallStr %></div><% } %>
-            </td>
-            <td><%= p.units7.toLocaleString('ja-JP') %></td>
+            <td class="l"><div class="name"><%= p.product_name || '(商品名なし)' %></div><div class="code"><%= p.ne_code %></div></td>
+            <td><%= num(p.pieces) %></td>
             <td class="<%= t.cls %>"><%= t.mark %></td>
-            <td><%= p.units30.toLocaleString('ja-JP') %></td>
-            <td><%= p.avgPerDay30.toFixed(1) %></td>
-            <td><%= yen(p.sales30) %></td>
+            <td><%= num(p.avgPerDay) %></td>
+            <td><%= yen(p.sales) %></td>
             <td><%= p.lastSold || '—' %></td>
+            <td class="l"><span class="toggle" data-tgt="lst-<%= idx %>">出品内訳 (<%= p.listings.length %>) ▼</span></td>
+          </tr>
+          <tr class="sub-row" id="lst-<%= idx %>" style="display:none;">
+            <td colspan="7" class="l">
+              <table class="sub-tbl">
+                <thead><tr><th class="l">モール</th><th class="l">出品ページ</th><th>販売件数</th><th>ピース数</th><th>売上(税込)</th></tr></thead>
+                <tbody>
+                  <% p.listings.forEach(L => { %>
+                    <tr>
+                      <td class="l">
+                        <span class="badge b-mall"><%= mallLabels[L.mall] || L.mall %></span>
+                        <% if (L.mall==='amazon') { %><span class="badge <%= L.is_fba?'b-fba':'b-fbm' %>"><%= L.is_fba?'FBA':'FBM' %></span><% } %>
+                      </td>
+                      <td class="l"><%= L.listingName || '(名称なし)' %><br><span class="code"><%= L.listingId %><%= L.asin?(' / '+L.asin):'' %></span></td>
+                      <td><%= num(L.sold) %></td>
+                      <td><%= num(L.pieces) %></td>
+                      <td><%= yen(L.sales) %></td>
+                    </tr>
+                  <% }) %>
+                </tbody>
+              </table>
+            </td>
           </tr>
         <% }) %>
       </tbody>
     </table>
     </div>
-
-    <div class="note">
-      ・販売数は返品・キャンセルを差し引いた「純販売数」です。<br>
-      ・売上は各モールの販売価格（税込）の合計です。手数料・送料等は含みません。<br>
-      ・直近の数日はモール側の確定処理の都合で数値が変動するため、<%= windows.cutoff %> までの確定分で集計しています。<br>
-      ・本ページは B-Faith が共有用に発行した専用リンクです。第三者への転送はお控えください。
-    </div>
   <% } %>
+
+  <div class="note">
+    <strong>数値の見方</strong><br>
+    ・<b>ピース数</b> … 実際に出荷された自社商品の個数です。3個セットが1件売れた場合は「3個」として数えます（全モール共通）。<br>
+    ・<b>販売件数</b>（出品内訳） … その出品ページが売れた件数です（3個セットページが1件売れた = 1件、ピース数は3）。<br>
+    ・<b>売上(税込)</b> … その出品ページが実際に売れた金額の合計です。手数料・送料等は含みません。複数商品が入ったセットは標準売価比で各商品に按分しています。<br>
+    ・直近の数日はモール側の確定処理の都合で数値が変動するため、<%= period ? period.cutoff : '' %> までの確定分で集計しています。<br>
+    ・本ページは B-Faith が共有用に発行した専用リンクです。第三者への転送はお控えください。
+  </div>
 </div>
+<script>
+  document.querySelectorAll('.toggle').forEach(function(el){
+    el.addEventListener('click', function(){
+      var row = document.getElementById(el.dataset.tgt);
+      if(!row) return;
+      var open = row.style.display !== 'none';
+      row.style.display = open ? 'none' : 'table-row';
+      el.textContent = el.textContent.replace(open?'▲':'▼', open?'▼':'▲');
+    });
+  });
+</script>
 </body>
 </html>
