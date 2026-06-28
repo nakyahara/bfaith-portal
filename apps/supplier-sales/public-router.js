@@ -15,7 +15,7 @@
  */
 import express from 'express';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
-import { getSupplierReport, getSupplierDailyDetail, MALL_LABELS } from './aggregate.js';
+import { getSupplierReport, getSupplierDailyDetail, MALL_LABELS, SOKUHO_MALL_COLUMNS } from './aggregate.js';
 import { buildCsv, buildDailyCsv } from './csv.js';
 import { resolveActiveToken, getSupplierName } from './share-db.js';
 
@@ -106,6 +106,7 @@ router.get('/supplier/:token', (req, res) => {
     supplierName,
     token: req.params.token,
     mallLabels: MALL_LABELS,
+    sokuhoMallDefs: SOKUHO_MALL_COLUMNS,
     period: report.period,
     sokuho: report.sokuho || { asOf: null, status: null },
     products: report.products,

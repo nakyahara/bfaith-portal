@@ -333,6 +333,12 @@ const SOKUHO_MALL_LABELS = {
 const SOKUHO_EXCLUDE = new Set(['wholesale']);
 const SOKUHO_MALL_ORDER = ['rakuten', 'yahoo', 'aupay', 'qoo10', 'mercari', 'linegift', 'amazon_fba', 'amazon_fbm', 'other'];
 
+// 速報モール別マトリクスの「常時表示する固定列」（売上0でも列を出す＝au PAY等が消えない）。
+// 'other'(その他) は固定列に含めず、実データがある時だけ末尾に追加する（views 側で処理）。
+export const SOKUHO_MALL_COLUMNS = SOKUHO_MALL_ORDER
+  .filter(k => k !== 'other')
+  .map(k => ({ key: k, label: SOKUHO_MALL_LABELS[k] }));
+
 // 速報モール別マート(mirror_f_sales_velocity_by_product_mall)から仕入先別の速報販売数を取得。
 // 注文ベース・毎朝更新・モール別(楽天/Yahoo/Amazon FBA/FBM…)。卸は除外、未定義モールは「その他」。
 // 注意:
