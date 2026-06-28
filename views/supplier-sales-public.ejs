@@ -85,30 +85,34 @@
          return { cls:'trend-fl', mark:'→' };
        };
   %>
-    <div class="period">集計対象: <%= period.start %> 〜 <%= period.end %>（<%= period.label %>／<%= period.cutoff %> まで確定分）</div>
+    <div class="period">
+      <% if (sokuho && sokuho.asOf) { %>🟢 速報（注文ベース・FBA含む）: <%= sokuho.asOf %> 朝時点　／　<% } %>
+      確定（精算ベース）: <%= period.start %> 〜 <%= period.end %>（<%= period.label %>・<%= period.cutoff %>まで）
+    </div>
     <div class="cards">
       <div class="card"><div class="k">対象商品数</div><div class="v"><%= totals.productCount.toLocaleString('ja-JP') %><small> 点</small></div></div>
-      <div class="card"><div class="k">販売ピース数</div><div class="v"><%= num(totals.pieces) %><small> 個</small></div></div>
-      <div class="card"><div class="k">売上(税込)</div><div class="v"><%= yen(totals.sales) %></div></div>
-      <div class="card"><div class="k">前同期間比(個数)</div><div class="v"><% const tt=trend(totals.pieces, totals.prevPieces); %><span class="<%= tt.cls %>"><%= tt.mark %></span></div></div>
+      <div class="card"><div class="k">速報 直近7日 販売数</div><div class="v"><%= num(totals.sokuho7) %><small> 個</small></div></div>
+      <div class="card"><div class="k">速報 直近30日 販売数</div><div class="v"><%= num(totals.sokuho30) %><small> 個</small></div></div>
+      <div class="card"><div class="k">確定 売上(税込)</div><div class="v"><%= yen(totals.sales) %><small> ／<%= period.label %></small></div></div>
     </div>
 
     <div class="scroll">
     <table>
       <thead><tr>
         <th class="l">商品</th>
-        <th>ピース数</th><th>傾向</th><th>日平均</th><th>売上(税込)</th><th>最終販売日</th><th class="l">明細</th>
+        <th>速報<br>7日</th><th>速報<br>30日</th>
+        <th>確定<br>ピース数</th><th>確定<br>売上(税込)</th><th>最終<br>販売日</th><th class="l">明細</th>
       </tr></thead>
       <tbody>
-        <% products.forEach((p, idx) => { const t = trend(p.pieces, p.prevPieces); %>
+        <% products.forEach((p, idx) => { %>
           <tr>
             <td class="l"><div class="name"><%= p.product_name || '(商品名なし)' %></div><div class="code"><%= p.ne_code %></div></td>
+            <td><strong><%= num(p.sokuho7) %></strong></td>
+            <td><strong><%= num(p.sokuho30) %></strong><% if (p.sokuho30Fba) { %><br><span class="code">内FBA <%= num(p.sokuho30Fba) %></span><% } %></td>
             <td><%= num(p.pieces) %></td>
-            <td class="<%= t.cls %>"><%= t.mark %></td>
-            <td><%= num(p.avgPerDay) %></td>
             <td><%= yen(p.sales) %></td>
             <td><%= p.lastSold || '—' %></td>
-            <td class="l"><span class="toggle" data-tgt="lst-<%= idx %>">出品内訳 (<%= p.listings.length %>) ▼</span></td>
+            <td class="l"><% if (p.listings.length) { %><span class="toggle" data-tgt="lst-<%= idx %>">出品内訳 (<%= p.listings.length %>) ▼</span><% } else { %><span class="code">—</span><% } %></td>
           </tr>
           <tr class="sub-row" id="lst-<%= idx %>" style="display:none;">
             <td colspan="7" class="l">
@@ -139,10 +143,12 @@
 
   <div class="note">
     <strong>数値の見方</strong><br>
-    ・<b>ピース数</b> … 実際に出荷された自社商品の個数です。3個セットが1件売れた場合は「3個」として数えます（全モール共通）。<br>
-    ・<b>販売件数</b>（出品内訳） … その出品ページが売れた件数です（3個セットページが1件売れた = 1件、ピース数は3）。<br>
-    ・<b>売上(税込)</b> … その出品ページが実際に売れた金額の合計です。手数料・送料等は含みません。複数商品が入ったセットは標準売価比で各商品に按分しています。<br>
-    ・直近の数日はモール側の確定処理の都合で数値が変動するため、<%= period ? period.cutoff : '' %> までの確定分で集計しています。<br>
+    ・<b>速報 7日／30日</b>（注文ベース） … 注文が入った日でカウントした直近の販売数です。Amazon FBA も含み、ほぼ前日まで反映されます。「今売れているか」はこちらを見てください（返品・キャンセル後の精算は未反映の速報値）。<br>
+    ・<b>確定 ピース数／売上</b>（精算ベース） … 各モールの精算確定後の数字で、返品・キャンセルを差し引いた実績です。確定処理の都合で直近2週間ほどは遅れて反映されるため、上の速報より対象期間が手前（<%= period ? period.cutoff : '' %>まで）になります。<br>
+    ・<b>確定 ピース数</b> … 実出荷ベース。3個セットが1件売れたら「3個」として数えます（全モール共通）。<br>
+    ・<b>確定 売上(税込)</b> … 出品ページが実際に売れた金額の合計（手数料・送料等は含まず）。複数商品セットは標準売価比で各商品に按分。<br>
+    ・「出品内訳」では、楽天の3個セットページや Amazon の FBA/FBM 別など、どの出品で売れたかを確定ベースで確認できます。<br>
+    ・速報と確定は集計基準（注文日／精算）が異なるため数字は一致しません。<br>
     ・本ページは B-Faith が共有用に発行した専用リンクです。第三者への転送はお控えください。
   </div>
 </div>

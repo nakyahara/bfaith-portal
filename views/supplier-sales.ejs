@@ -103,7 +103,7 @@
         <div style="overflow-x:auto;">
           <table id="prevTable">
             <thead><tr>
-              <th class="l">商品</th><th>ピース数</th><th>日平均</th><th>売上(税込)</th><th class="l">最終販売日</th><th class="l">出品内訳</th>
+              <th class="l">商品</th><th>速報7日</th><th>速報30日</th><th>確定ピース数</th><th>確定売上(税込)</th><th class="l">最終販売日</th><th class="l">出品内訳</th>
             </tr></thead>
             <tbody></tbody>
           </table>
@@ -233,25 +233,30 @@
       const meta = document.getElementById('prevMeta');
       tb.innerHTML='<tr><td colspan="6" class="muted">読み込み中…</td></tr>';
       const d = await jget(base+'/api/summary?code='+encodeURIComponent(current.code)+'&period='+curPeriod());
-      if(!d.ok){ tb.innerHTML='<tr><td colspan="6" class="muted">取得失敗</td></tr>'; return; }
-      if(!d.period || !d.products.length){ meta.textContent=''; tb.innerHTML='<tr><td colspan="6" class="muted">対象期間に販売実績なし</td></tr>'; return; }
+      if(!d.ok){ tb.innerHTML='<tr><td colspan="7" class="muted">取得失敗</td></tr>'; return; }
+      if(!d.period || !d.products.length){ meta.textContent=''; tb.innerHTML='<tr><td colspan="7" class="muted">対象期間に販売実績なし</td></tr>'; return; }
       const ml = d.mallLabels || {};
-      meta.textContent = `集計対象: ${d.period.start} 〜 ${d.period.end}（${d.period.label}）　商品 ${d.totals.productCount} 点　ピース ${num(d.totals.pieces)}　売上 ${yen(d.totals.sales)}`;
+      const sokuhoAsOf = d.sokuho && d.sokuho.asOf ? d.sokuho.asOf : '—';
+      meta.innerHTML = `🟢 速報(注文ベース・FBA含む): <b>${esc(sokuhoAsOf)}</b>朝時点　7日 ${num(d.totals.sokuho7)} / 30日 ${num(d.totals.sokuho30)}　｜　確定(精算ベース): ${d.period.start}〜${d.period.end}（${d.period.label}）売上 ${yen(d.totals.sales)}`;
       tb.innerHTML = d.products.map((p, i) => {
         const sub = p.listings.map(L => `<tr>
             <td class="l">${esc(ml[L.mall]||L.mall)}${L.mall==='amazon' ? (L.is_fba?' <span class="pill pill-on">FBA</span>':' <span class="pill pill-off">FBM</span>') : ''}</td>
             <td class="l">${esc(L.listingName||'(名称なし)')}<br><span class="muted">${esc(L.listingId)}</span></td>
             <td>${num(L.sold)}</td><td>${num(L.pieces)}</td><td>${yen(L.sales)}</td>
           </tr>`).join('');
+        const subToggle = p.listings.length
+          ? `<span class="prev-toggle" data-tgt="psub-${i}" style="cursor:pointer;color:#2563eb;font-size:12px;">出品 (${p.listings.length}) ▼</span>`
+          : '<span class="muted">—</span>';
         return `<tr>
           <td class="l"><strong>${esc(p.product_name||'(商品名なし)')}</strong><br><span class="muted">${esc(p.ne_code)}</span></td>
+          <td><strong>${num(p.sokuho7)}</strong></td>
+          <td><strong>${num(p.sokuho30)}</strong>${p.sokuho30Fba?`<br><span class="muted">内FBA ${num(p.sokuho30Fba)}</span>`:''}</td>
           <td>${num(p.pieces)}</td>
-          <td>${num(p.avgPerDay)}</td>
           <td>${yen(p.sales)}</td>
           <td class="l">${p.lastSold||'—'}</td>
-          <td class="l"><span class="prev-toggle" data-tgt="psub-${i}" style="cursor:pointer;color:#2563eb;font-size:12px;">出品 (${p.listings.length}) ▼</span></td>
+          <td class="l">${subToggle}</td>
         </tr>
-        <tr id="psub-${i}" style="display:none;"><td colspan="6" class="l" style="background:#fbfcfe;">
+        <tr id="psub-${i}" style="display:none;"><td colspan="7" class="l" style="background:#fbfcfe;">
           <table style="width:100%;font-size:12px;"><thead><tr><th class="l">モール</th><th class="l">出品ページ</th><th>件数</th><th>ピース</th><th>売上</th></tr></thead><tbody>${sub}</tbody></table>
         </td></tr>`;
       }).join('');
