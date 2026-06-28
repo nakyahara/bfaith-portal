@@ -24,6 +24,7 @@ import { patchPageProperties } from './lib/notion-client.js';
 import { evaluateItemForPublish } from './services/publish-pipeline.js';
 import { fetchAllItemCodes, fetchItemDetail, fetchItemDetailsBulkDetailed } from './lib/rakuten-rms-proxy.js';
 import { buildNotionDraftProposal, toNotionProperties } from './lib/rakuten-to-notion-draft.js';
+import { createNotionPagesFromRakuten } from './services/notion-create-page.js';
 import { executePublish, isPublishEnabled, buildIdempotencyKey } from './services/publish-executor.js';
 import { translateReason, summarizeReasons, categorizeReason } from './lib/reason-translator.js';
 import { resolveCategoryAndPath } from './services/category-resolver.js';
@@ -721,6 +722,47 @@ router.post('/api/admin/seed-notion-drafts', async (req, res) => {
       applied: applied.length,
       errors: errors.length,
       details: { proposed, skipped, applied, errors },
+    });
+  } catch (e) {
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+// ───────────────── Phase E-14: Notion master 新規 page 作成 ─────────────────
+
+/**
+ * 楽天 RMS から rakutenItem を取得し、 Notion master 未登録 SKU の new page を作成。
+ *
+ * body:
+ *   dryRun (bool, default true)
+ *   itemCodes (string[]): 対象 item_code list (省略時は migration_candidates + notion_overrides に居ない SKU 全部)
+ *   limit (int, default 100, max 500)
+ *
+ * 設計 (Codex Phase E-14 R1〜R7 stop):
+ *   重複作成防止 = DB CAS lock (notion_page_create_requests) + Notion pre-check 2 段
+ *   lease_token + deadlineAt で worker 競合と長 create 防止
+ */
+router.post('/api/admin/create-notion-pages-from-rakuten', async (req, res) => {
+  try {
+    const db = getDB();
+    const body = req.body || {};
+    const dryRun = body.dryRun !== false;
+    const limit = Math.max(1, Math.min(parseInt(body.limit, 10) || 100, 500));
+    const itemCodes = Array.isArray(body.itemCodes) ? body.itemCodes.map(String).filter(Boolean) : null;
+
+    const r = await createNotionPagesFromRakuten(db, { dryRun, itemCodes, limit });
+    const summary = r.results.reduce((acc, x) => {
+      acc[x.outcome] = (acc[x.outcome] || 0) + 1;
+      return acc;
+    }, {});
+
+    return res.json({
+      status: 'ok',
+      dryRun,
+      totalScanned: r.totalScanned,
+      summary,
+      error: r.error || null,
+      results: r.results,
     });
   } catch (e) {
     return res.status(500).json({ status: 'fail', error: e.message });

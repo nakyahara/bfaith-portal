@@ -17,13 +17,15 @@ const DEFAULT_MAX_RETRIES = 5;
 const DEFAULT_MIN_INTERVAL_MS = 350; // ~3 req/sec
 
 export class NotionApiError extends Error {
-  constructor(endpoint, message, { status = null, body = null, cause = null } = {}) {
+  constructor(endpoint, message, { status = null, body = null, cause = null, retryAfterMs = null } = {}) {
     super(`[notion:${endpoint}] ${message}`);
     this.name = 'NotionApiError';
     this.endpoint = endpoint;
     this.status = status;
     this.body = body;
     if (cause) this.cause = cause;
+    // Codex Phase E-14 R5 H-2: 429/503 時の Retry-After 値 (ms) を caller が読めるよう保持
+    this.retryAfterMs = retryAfterMs;
   }
 }
 
@@ -100,7 +102,10 @@ async function rawRequest(endpoint, { method = 'GET', body = null, cfg }) {
 }
 
 export async function notionRequest(endpoint, opts = {}) {
-  const cfg = opts.cfg || getConfig();
+  // Codex Phase E-14 R6 H-1: 部分 cfg を渡しても token/base/version 等が欠落しないよう、
+  //   getConfig() 結果と opts.cfg を spread merge する (caller は { timeoutMs, maxRetries: 0 } 等の
+  //   部分指定が可能、 既存 caller は cfg 未指定 or 完全 cfg のいずれでも互換)。
+  const cfg = { ...getConfig(), ...(opts.cfg || {}) };
   const maxRetries = opts.maxRetries ?? cfg.maxRetries;
   let lastErr = null;
 
@@ -119,11 +124,15 @@ export async function notionRequest(endpoint, opts = {}) {
     }
     if (res.status >= 200 && res.status < 300) return res.body;
     if (res.status === 429 || (res.status >= 500 && res.status < 600)) {
+      const retryAfterMs = parseRetryAfter(res.headers);
       if (attempt >= maxRetries) {
-        throw new NotionApiError(endpoint, `${res.status} after ${maxRetries + 1} attempts`, { status: res.status, body: res.body });
+        // Codex Phase E-14 R5 H-2: NotionApiError に retryAfterMs を載せる
+        //   caller (createPageWithBudget 等) が残り budget 計算に使うため
+        throw new NotionApiError(endpoint, `${res.status} after ${maxRetries + 1} attempts`, {
+          status: res.status, body: res.body, retryAfterMs,
+        });
       }
-      const retryAfter = parseRetryAfter(res.headers);
-      const wait = retryAfter !== null ? retryAfter : backoffDelay(attempt);
+      const wait = retryAfterMs !== null ? retryAfterMs : backoffDelay(attempt);
       await sleep(wait);
       continue;
     }
@@ -140,7 +149,7 @@ export async function notionRequest(endpoint, opts = {}) {
  * databases/:id/query を pagination 完走まで pull する。
  */
 export async function queryDatabaseAll(opts = {}) {
-  const cfg = opts.cfg || getConfig();
+  const cfg = { ...getConfig(), ...(opts.cfg || {}) };
   const dbId = cfg.databaseId;
   const pages = [];
   let cursor = null;
@@ -189,6 +198,57 @@ export async function patchPageProperties(pageId, props, opts = {}) {
     }
   }
   return await notionRequest(`/pages/${pageId}`, { method: 'PATCH', body: { properties }, ...opts });
+}
+
+/**
+ * Phase E-14 (2026-06-28): Notion master DB に新規 page を作成する。
+ *   楽天 RMS → Notion master 未登録 SKU を一括追加するための endpoint で使う。
+ *
+ * @param {object} properties  Notion API の properties value 形式
+ *   (例: { 'Name': {title:[...]}, '商品コード': {rich_text:[...]}, ... })
+ * @param {object} [opts]      { cfg?, databaseId? }
+ * @returns {object} Notion page object (含 id)
+ */
+export async function createPage(properties, opts = {}) {
+  if (!properties || typeof properties !== 'object') throw new Error('createPage: properties required');
+  const cfg = { ...getConfig(), ...(opts.cfg || {}) };
+  const dbId = opts.databaseId || cfg.databaseId;
+  if (!dbId) throw new Error('createPage: databaseId required');
+  return await notionRequest('/pages', {
+    method: 'POST',
+    body: { parent: { database_id: dbId }, properties },
+    cfg,
+    ...(opts.maxRetries != null ? { maxRetries: opts.maxRetries } : {}),
+  });
+}
+
+/**
+ * Phase E-14: Notion master DB を `商品コード` で query して既存 page を検索。
+ *   重複 page 作成防止の pre-check で使う (Codex R1 H-1 第 2 段)。
+ *
+ * @param {string} manageNumber 楽天 manage_number (= Notion `商品コード` rich_text)
+ * @returns {object|null} 一致した Notion page object (なければ null)
+ */
+export async function findPageByManageNumber(manageNumber, opts = {}) {
+  if (!manageNumber || typeof manageNumber !== 'string') {
+    throw new Error('findPageByManageNumber: manageNumber required');
+  }
+  const cfg = { ...getConfig(), ...(opts.cfg || {}) };
+  const dbId = opts.databaseId || cfg.databaseId;
+  const body = {
+    filter: {
+      property: '商品コード',
+      rich_text: { equals: manageNumber },
+    },
+    page_size: 1,
+  };
+  const res = await notionRequest(`/databases/${dbId}/query`, {
+    method: 'POST',
+    body,
+    cfg,
+    ...(opts.maxRetries != null ? { maxRetries: opts.maxRetries } : {}),
+  });
+  return res?.results?.[0] || null;
 }
 
 // テスト用 (rate-limit 状態をリセット)
