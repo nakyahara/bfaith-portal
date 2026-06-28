@@ -42,6 +42,11 @@
     .tabbtn { border:none; background:none; padding:9px 18px; font-size:14px; font-weight:700; color:var(--muted); cursor:pointer; border-bottom:3px solid transparent; margin-bottom:-2px; }
     .tabbtn.on { color:var(--accent); border-bottom-color:var(--accent); }
     .tabpanel { display:none; }
+    table.matrix td, table.matrix th { white-space:nowrap; }
+    table.matrix td.l { vertical-align:top; }
+    table.matrix tr.prod-top td { border-top:2px solid #cbd5e1; }
+    table.matrix td.per { color:var(--muted); font-size:12px; text-align:center; }
+    table.matrix td.tot { font-weight:700; }
     .note { color:var(--muted); font-size:11px; margin-top:18px; line-height:1.8; background:#fff; border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
     .empty { background:#fff; border:1px solid var(--line); border-radius:10px; padding:40px; text-align:center; color:var(--muted); }
     .scroll { overflow-x:auto; }
@@ -88,37 +93,35 @@
       </div>
       <% if (!sokuhoProducts.length) { %>
         <div class="empty">速報データがまだありません。</div>
-      <% } else { %>
+      <% } else {
+           // モール列 = 全商品に出現するモールの和集合（表示順 order でソート）
+           const mallColMap = new Map();
+           sokuhoProducts.forEach(p => (p.sokuhoMalls || []).forEach(m => { if (!mallColMap.has(m.key)) mallColMap.set(m.key, { key: m.key, label: m.label, order: (m.order == null || m.order < 0) ? 99 : m.order }); }));
+           const mallCols = [...mallColMap.values()].sort((a, b) => a.order - b.order);
+      %>
       <div class="scroll">
-      <table>
-        <thead><tr><th class="l">商品</th><th>速報<br>7日</th><th>速報<br>30日</th><th class="l">モール別内訳</th></tr></thead>
+      <table class="matrix">
+        <thead>
+          <tr>
+            <th class="l">商品</th><th>期間</th><th>合計</th>
+            <% mallCols.forEach(c => { %><th><%= c.label %></th><% }) %>
+          </tr>
+        </thead>
         <tbody>
-          <% sokuhoProducts.forEach((p, idx) => { %>
-            <tr>
-              <td class="l"><div class="name"><%= p.product_name || '(商品名なし)' %></div><div class="code"><%= p.ne_code %></div></td>
-              <td><strong><%= num(p.sokuho7) %></strong></td>
-              <td><strong><%= num(p.sokuho30) %></strong></td>
-              <td class="l">
-                <% if (p.sokuhoMalls && p.sokuhoMalls.length) { %>
-                  <% p.sokuhoMalls.slice(0,3).forEach(m => { %><span class="badge b-mall" style="margin-right:4px;"><%= m.label %> <%= num(m.q30) %></span><% }) %>
-                  <% if (p.sokuhoMalls.length > 3) { %><span class="toggle" data-tgt="skm-<%= idx %>">ほか<%= p.sokuhoMalls.length - 3 %> ▼</span><% } %>
-                <% } else { %><span class="code">—</span><% } %>
-              </td>
+          <% sokuhoProducts.forEach(p => {
+               const byKey = {}; (p.sokuhoMalls || []).forEach(m => { byKey[m.key] = m; });
+          %>
+            <tr class="prod-top">
+              <td class="l" rowspan="2"><div class="name"><%= p.product_name || '(商品名なし)' %></div><div class="code"><%= p.ne_code %></div></td>
+              <td class="per">7日</td>
+              <td class="tot"><%= num(p.sokuho7) %></td>
+              <% mallCols.forEach(c => { const m = byKey[c.key]; %><td><%= (m && m.q7) ? num(m.q7) : '' %></td><% }) %>
             </tr>
-            <% if (p.sokuhoMalls && p.sokuhoMalls.length > 3) { %>
-            <tr class="sub-row" id="skm-<%= idx %>" style="display:none;">
-              <td colspan="4" class="l">
-                <table class="sub-tbl">
-                  <thead><tr><th class="l">モール</th><th>7日</th><th>30日</th></tr></thead>
-                  <tbody>
-                    <% p.sokuhoMalls.forEach(m => { %>
-                      <tr><td class="l"><span class="badge b-mall"><%= m.label %></span></td><td><%= num(m.q7) %></td><td><%= num(m.q30) %></td></tr>
-                    <% }) %>
-                  </tbody>
-                </table>
-              </td>
+            <tr class="prod-bot">
+              <td class="per">30日</td>
+              <td class="tot"><%= num(p.sokuho30) %></td>
+              <% mallCols.forEach(c => { const m = byKey[c.key]; %><td><%= (m && m.q30) ? num(m.q30) : '' %></td><% }) %>
             </tr>
-            <% } %>
           <% }) %>
         </tbody>
       </table>
@@ -126,7 +129,7 @@
       <% } %>
       <div class="note">
         <b>速報（注文ベース）</b>とは … 注文が入った日でカウントした直近の販売数です（ほぼ前日まで反映・Amazon FBA含む・返品/キャンセル後の精算は未反映の暫定値）。<br>
-        <b>モール別内訳</b>に 楽天・Yahoo!・au PAY・Qoo10・メルカリ・LINEギフト・Amazon FBA・Amazon FBM 別の数量を表示します（4モール以上は「ほか◯ ▼」で展開）。<br>
+        各モール列（楽天・Yahoo!・au PAY・Qoo10・メルカリ・LINEギフト・Amazon FBA・Amazon FBM ほか）に、上段＝直近7日／下段＝直近30日 の販売数を表示します。空欄はその期間に販売なし。<br>
         速報と確定（精算ベース）は集計基準が違うため数字は一致しません。
       </div>
     </section>
