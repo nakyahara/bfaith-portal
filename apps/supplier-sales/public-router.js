@@ -110,7 +110,7 @@ router.get('/supplier/:token', (req, res) => {
     sokuho: report.sokuho || { asOf: null, status: null },
     products: report.products,
     totals: report.totals,
-    query: { period: periodOpts(req).period, start: req.query.start || '', end: req.query.end || '' },
+    query: { period: periodOpts(req).period, start: req.query.start || '', end: req.query.end || '', tab: req.query.tab === 'kakutei' ? 'kakutei' : 'sokuho' },
   });
 });
 
