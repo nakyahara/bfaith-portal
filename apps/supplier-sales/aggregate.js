@@ -168,8 +168,9 @@ function loadAmazonMap(db, supplier) {
  *            listings:[{mall,listingId,listingName,asin,is_fba,sold,pieces,sales}]}], totals }
  */
 export function getSupplierReport(db, supplierCode, opts = {}) {
+  // 確定(精算)期間。finance マートが空だと null になり得るが、速報(注文ベース)は
+  // それと独立に出すため、P が null でも処理を続け、確定パートだけスキップする。
   const P = resolvePeriod(db, opts);
-  if (!P) return { period: null, sokuho: { asOf: null, status: null }, products: [], totals: null };
 
   const prod = loadProductMap(db);
   const setMap = loadSetMap(db, supplierCode);
@@ -226,44 +227,47 @@ export function getSupplierReport(db, supplierCode, opts = {}) {
     }
   }
 
-  const params = { s: supplierCode, start: P.prevStart, end: P.end };
+  // 確定(精算ベース)パート。期間 P が無い(finance マート空)場合はスキップ＝速報のみ返す。
+  if (P) {
+    const params = { s: supplierCode, start: P.prevStart, end: P.end };
 
-  // Amazon: seller_sku を構成品へ展開
-  const amzRows = db.prepare(`
-    SELECT date_jst d, seller_sku k, asin_norm asin, product_name name,
-           CAST(units_net_sold AS REAL) u, sales_principal_jpy sales,
-           (fba_fulfillment_jpy + fba_storage_jpy) fbaFee
-    FROM mirror_amazon_finance_sku_daily
-    WHERE date_jst BETWEEN @start AND @end
-      AND seller_sku IN (
-        SELECT seller_sku FROM mirror_sku_resolved
-        WHERE ne_code IN (SELECT 商品コード FROM mirror_products WHERE 仕入先コード = @s))
-  `).all(params);
-  for (const r of amzRows) {
-    const comps = amzMap.get(r.k);
-    if (!comps || !comps.length) continue;
-    attribute({ mall: 'amazon', listingId: r.k, listingName: r.name, asin: r.asin, fbaFee: r.fbaFee, date: r.d, u: r.u, sales: r.sales, comps });
-  }
-
-  // 非 Amazon: fact の ne_code がセットなら展開、単品ならそのまま
-  for (const c of NON_AMAZON_MALLS) {
-    const rows = db.prepare(`
-      SELECT date_jst d, ${c.key} k, ne_code ne, product_name name,
-             CAST(units_net_sold AS REAL) u, ${c.sales} sales
-      FROM ${c.table}
+    // Amazon: seller_sku を構成品へ展開
+    const amzRows = db.prepare(`
+      SELECT date_jst d, seller_sku k, asin_norm asin, product_name name,
+             CAST(units_net_sold AS REAL) u, sales_principal_jpy sales,
+             (fba_fulfillment_jpy + fba_storage_jpy) fbaFee
+      FROM mirror_amazon_finance_sku_daily
       WHERE date_jst BETWEEN @start AND @end
-        AND ne_code IS NOT NULL AND trim(ne_code) <> ''
-        AND (ne_code IN (SELECT 商品コード FROM mirror_products WHERE 仕入先コード = @s)
-             OR ne_code IN (SELECT セット商品コード FROM mirror_set_components
-                            WHERE 構成商品コード IN (SELECT 商品コード FROM mirror_products WHERE 仕入先コード = @s)))
+        AND seller_sku IN (
+          SELECT seller_sku FROM mirror_sku_resolved
+          WHERE ne_code IN (SELECT 商品コード FROM mirror_products WHERE 仕入先コード = @s))
     `).all(params);
-    for (const r of rows) {
-      const comps = setMap.get(r.ne) || [{ code: r.ne, qty: 1 }];
-      attribute({ mall: c.mall, listingId: r.k, listingName: r.name, asin: '', fbaFee: 0, date: r.d, u: r.u, sales: r.sales, comps });
+    for (const r of amzRows) {
+      const comps = amzMap.get(r.k);
+      if (!comps || !comps.length) continue;
+      attribute({ mall: 'amazon', listingId: r.k, listingName: r.name, asin: r.asin, fbaFee: r.fbaFee, date: r.d, u: r.u, sales: r.sales, comps });
+    }
+
+    // 非 Amazon: fact の ne_code がセットなら展開、単品ならそのまま
+    for (const c of NON_AMAZON_MALLS) {
+      const rows = db.prepare(`
+        SELECT date_jst d, ${c.key} k, ne_code ne, product_name name,
+               CAST(units_net_sold AS REAL) u, ${c.sales} sales
+        FROM ${c.table}
+        WHERE date_jst BETWEEN @start AND @end
+          AND ne_code IS NOT NULL AND trim(ne_code) <> ''
+          AND (ne_code IN (SELECT 商品コード FROM mirror_products WHERE 仕入先コード = @s)
+               OR ne_code IN (SELECT セット商品コード FROM mirror_set_components
+                              WHERE 構成商品コード IN (SELECT 商品コード FROM mirror_products WHERE 仕入先コード = @s)))
+      `).all(params);
+      for (const r of rows) {
+        const comps = setMap.get(r.ne) || [{ code: r.ne, qty: 1 }];
+        attribute({ mall: c.mall, listingId: r.k, listingName: r.name, asin: '', fbaFee: 0, date: r.d, u: r.u, sales: r.sales, comps });
+      }
     }
   }
 
-  // 速報（注文ベース・FBA含む・毎朝更新）を既存の商品管理リスト mirror から取得しマージ。
+  // 速報（注文ベース・モール別・毎朝更新）をモール別マート mirror から取得しマージ。
   // 確定(精算ベース,期間可変)と速報(注文ベース,固定7/30日)は基準が違うため列を分けて持つ。
   const sokuho = loadSokuho(db, supplierCode);
 
@@ -272,31 +276,34 @@ export function getSupplierReport(db, supplierCode, opts = {}) {
     sales: Math.round(p.sales),
     prevPieces: round1(p.prevPieces),
     prevSales: round1(p.prevSales),
-    avgPerDay: round2(p.pieces / P.len),
+    avgPerDay: P ? round2(p.pieces / P.len) : 0,
     lastSold: p.lastSold,
     listings: [...p.listings.values()]
       .map(L => ({ ...L, pieces: round1(L.pieces), sales: Math.round(L.sales) }))
       .sort((a, b) => b.pieces - a.pieces || b.sales - a.sales),
   });
   const emptyFinance = { pieces: 0, sales: 0, prevPieces: 0, prevSales: 0, avgPerDay: 0, lastSold: null, listings: [] };
-  const emptySokuho = { s7: 0, s7fba: 0, s30: 0, s30fba: 0, stock: null, fbaStock: null, stockDays: null };
+  const emptySokuho = { name: '', s7: 0, s30: 0, byMall: new Map() };
 
-  // 確定(finance)と速報(PML)の商品コード和集合
+  // 確定(finance)と速報(モール別マート)の商品コード和集合
   const allNe = new Set([...out.keys(), ...sokuho.byNe.keys()]);
   const products = [...allNe]
     .map(ne => {
       const f = out.get(ne);
       const sk = sokuho.byNe.get(ne) || emptySokuho;
       const fin = f ? financePart(f) : emptyFinance;
+      // 速報モール別内訳（数量0は除外、30日降順）
+      const sokuhoMalls = [...(sk.byMall ? sk.byMall.values() : [])]
+        .filter(m => m.q7 || m.q30)
+        .sort((a, b) => b.q30 - a.q30 || b.q7 - a.q7);
       return {
         ne_code: ne,
         product_name: (f && f.name) || sk.name || '',
         ...fin,
-        // 速報（注文ベース）
-        sokuho7: sk.s7 || 0, sokuho7Fba: sk.s7fba || 0,
-        sokuho30: sk.s30 || 0, sokuho30Fba: sk.s30fba || 0,
-        stock: (sk.stock == null ? null : sk.stock),
-        stockDays: (sk.stockDays == null ? null : sk.stockDays),
+        // 速報（注文ベース）。sokuhoMalls にモール別内訳（楽天/Yahoo/Amazon FBA/FBM…、卸は除外）
+        sokuho7: sk.s7 || 0,
+        sokuho30: sk.s30 || 0,
+        sokuhoMalls,
       };
     })
     .filter(p => p.pieces !== 0 || p.sales !== 0 || p.sokuho30 !== 0 || p.sokuho7 !== 0)
@@ -316,35 +323,45 @@ export function getSupplierReport(db, supplierCode, opts = {}) {
   return { period: P, sokuho: { asOf: sokuho.asOf, status: sokuho.status }, products, totals };
 }
 
-// 商品管理リスト snapshot(mirror_pml_snapshot_rows) から仕入先別の速報販売数を取得。
-// 注文ベース(NE非FBA + SP-API FBA 統合)・毎朝更新・FBA/FBA以外split・在庫付き。
+// 速報モール別の表示ラベルとグルーピング。
+//   卸(wholesale)等は仕入先に見せない → SOKUHO_EXCLUDE で完全除外(合計にも入れない)。
+//   ラベルに無いモール(rakuma/yahoo_auction/mysmartstore/dshopping 等)は「その他」に集約。
+const SOKUHO_MALL_LABELS = {
+  rakuten: '楽天', yahoo: 'Yahoo!', aupay: 'au PAY', qoo10: 'Qoo10', mercari: 'メルカリ',
+  linegift: 'LINEギフト', amazon_fba: 'Amazon FBA', amazon_fbm: 'Amazon FBM',
+};
+const SOKUHO_EXCLUDE = new Set(['wholesale']);
+const SOKUHO_MALL_ORDER = ['rakuten', 'yahoo', 'aupay', 'qoo10', 'mercari', 'linegift', 'amazon_fba', 'amazon_fbm', 'other'];
+
+// 速報モール別マート(mirror_f_sales_velocity_by_product_mall)から仕入先別の速報販売数を取得。
+// 注文ベース・毎朝更新・モール別(楽天/Yahoo/Amazon FBA/FBM…)。卸は除外、未定義モールは「その他」。
 // 注意:
-//  - published(pub) と rows は db.transaction で一括読みする。mirror 同期側は
-//    DELETE→insert→published upsert を行うため、別 statement で読むと「旧 run_id を
-//    読んだ直後に rows 全削除」と競合し速報が一時的に全0になり得る (Codex High)。
-//  - PML 未生成/未移行(テーブル・列なし)環境でも throw でレポート全体を500にしないよう
-//    全体を try/catch し、失敗時は空(byNe空)で安全に縮退する (Codex High)。
+//  - rows と as_of は db.transaction で一括読み(mirror 同期 DELETE→INSERT との競合回避)。
+//  - マート未生成/未移行(テーブルなし)でも throw でレポート全体を500にしないよう try/catch で空縮退。
 function loadSokuho(db, supplier) {
   try {
     return db.transaction(() => {
-      const pub = db.prepare('SELECT run_id, as_of_date, status FROM mirror_pml_published WHERE id = 1').get();
-      if (!pub || !pub.run_id) return { asOf: null, status: null, byNe: new Map() };
       const rows = db.prepare(`
-        SELECT 商品コード c, 商品名 n,
-               販売数7日_合計 s7, 販売数7日_FBA s7f,
-               販売数30日_合計 s30, 販売数30日_FBA s30f,
-               総在庫数 stock, FBA在庫数 fbaStock, 在庫保管日数 stockDays
-        FROM mirror_pml_snapshot_rows
-        WHERE run_id = @r AND 仕入先 = @s
-      `).all({ r: pub.run_id, s: supplier });
+        SELECT v.商品コード c, p.商品名 n, v.mall mall, v.qty_7d q7, v.qty_30d q30, v.as_of_date asof
+        FROM mirror_f_sales_velocity_by_product_mall v
+        JOIN mirror_products p ON p.商品コード = v.商品コード
+        WHERE p.仕入先コード = @s
+      `).all({ s: supplier });
       const byNe = new Map();
+      let asOf = null;
       for (const r of rows) {
-        byNe.set(r.c, {
-          name: r.n || '', s7: r.s7 || 0, s7fba: r.s7f || 0, s30: r.s30 || 0, s30fba: r.s30f || 0,
-          stock: r.stock, fbaStock: r.fbaStock, stockDays: r.stockDays,
-        });
+        if (SOKUHO_EXCLUDE.has(r.mall)) continue; // 卸など除外（合計にも含めない）
+        if (r.asof && (!asOf || r.asof > asOf)) asOf = r.asof;
+        const key = SOKUHO_MALL_LABELS[r.mall] ? r.mall : 'other';
+        const label = SOKUHO_MALL_LABELS[r.mall] || 'その他';
+        let e = byNe.get(r.c);
+        if (!e) { e = { name: r.n || '', s7: 0, s30: 0, byMall: new Map() }; byNe.set(r.c, e); }
+        e.s7 += r.q7 || 0; e.s30 += r.q30 || 0;
+        let m = e.byMall.get(key);
+        if (!m) { m = { key, label, q7: 0, q30: 0, order: SOKUHO_MALL_ORDER.indexOf(key) }; e.byMall.set(key, m); }
+        m.q7 += r.q7 || 0; m.q30 += r.q30 || 0;
       }
-      return { asOf: pub.as_of_date, status: pub.status, byNe };
+      return { asOf, status: null, byNe };
     })();
   } catch (e) {
     console.error('[supplier-sales] loadSokuho skipped:', e.message);

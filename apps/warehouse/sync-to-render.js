@@ -438,6 +438,24 @@ export async function syncToRender() {
       }
     }
 
+    // Part 3e: 販売速度 モール別 (速報モール別マート)。
+    //   fail-closed: SELECT 成功 & 0件超 のときだけ送る。0件/失敗時は payload に乗せない
+    //   → 受信側は前回 mirror を保持 (sync 失敗で速報モール別が全消えするのを防ぐ)。
+    try {
+      const vmRows = db.prepare(
+        'SELECT 商品コード, mall, qty_7d, qty_30d FROM f_sales_velocity_by_product_mall'
+      ).all();
+      if (vmRows.length > 0) {
+        const vmAsOf = db.prepare('SELECT MAX(as_of_date) AS v FROM f_sales_velocity_by_product_mall').get()?.v || '';
+        await sendPart({ velocity_mall: { as_of_date: vmAsOf, rows: vmRows } },
+          `販売速度モール別 (${vmRows.length}件, as_of=${vmAsOf})`);
+      } else {
+        console.log('[Sync→Render]   velocity_mall: 0件 → 送信スキップ (mirror は前回値を保持)');
+      }
+    } catch (e) {
+      console.warn(`[Sync→Render]   velocity_mall: 取得失敗（送信スキップ、mirror は前回値を保持）: ${e.message}`);
+    }
+
     // Part 4: 最終メタデータ
     await sendPart({
       meta: { source: 'minipc', synced_at: ts, products_count: products.length,

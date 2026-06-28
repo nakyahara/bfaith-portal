@@ -56,7 +56,7 @@
   </header>
 
   <% function qstr(p){ const t='&tab=kakutei'; return p==='custom' ? `?period=custom&start=${encodeURIComponent(query.start)}&end=${encodeURIComponent(query.end)}${t}` : `?period=${p}${t}`; } %>
-  <% if (!period) { %>
+  <% if (!period && (!products || !products.length)) { %>
     <div class="empty" style="margin-top:14px;">対象商品の販売実績データがまだありません。</div>
   <% } else {
        const yen = n => '¥' + Math.round(n||0).toLocaleString('ja-JP');
@@ -80,7 +80,7 @@
 
     <!-- ===== 速報タブ ===== -->
     <section class="tabpanel" data-panel="sokuho">
-      <div class="period">速報（注文ベース）: <%= hasSokuho ? sokuho.asOf + ' 朝時点' : '準備中' %>　／　全モール合算（Amazon FBA ＋ 楽天・Yahoo! など FBA以外）</div>
+      <div class="period">速報（注文ベース）: <%= hasSokuho ? sokuho.asOf + ' 朝時点' : '準備中' %>　／　全モール（楽天・Yahoo!・Amazon FBA/FBM ほか）</div>
       <div class="cards">
         <div class="card"><div class="k">対象商品数</div><div class="v"><%= sokuhoProducts.length.toLocaleString('ja-JP') %><small> 点</small></div></div>
         <div class="card"><div class="k">直近7日 販売数</div><div class="v"><%= num(totals.sokuho7) %><small> 個</small></div></div>
@@ -91,15 +91,34 @@
       <% } else { %>
       <div class="scroll">
       <table>
-        <thead><tr><th class="l">商品</th><th>速報<br>7日</th><th>速報<br>30日</th><th>内Amazon<br>FBA(30日)</th></tr></thead>
+        <thead><tr><th class="l">商品</th><th>速報<br>7日</th><th>速報<br>30日</th><th class="l">モール別内訳</th></tr></thead>
         <tbody>
-          <% sokuhoProducts.forEach(p => { %>
+          <% sokuhoProducts.forEach((p, idx) => { %>
             <tr>
               <td class="l"><div class="name"><%= p.product_name || '(商品名なし)' %></div><div class="code"><%= p.ne_code %></div></td>
               <td><strong><%= num(p.sokuho7) %></strong></td>
               <td><strong><%= num(p.sokuho30) %></strong></td>
-              <td><%= num(p.sokuho30Fba) %></td>
+              <td class="l">
+                <% if (p.sokuhoMalls && p.sokuhoMalls.length) { %>
+                  <% p.sokuhoMalls.slice(0,3).forEach(m => { %><span class="badge b-mall" style="margin-right:4px;"><%= m.label %> <%= num(m.q30) %></span><% }) %>
+                  <% if (p.sokuhoMalls.length > 3) { %><span class="toggle" data-tgt="skm-<%= idx %>">ほか<%= p.sokuhoMalls.length - 3 %> ▼</span><% } %>
+                <% } else { %><span class="code">—</span><% } %>
+              </td>
             </tr>
+            <% if (p.sokuhoMalls && p.sokuhoMalls.length > 3) { %>
+            <tr class="sub-row" id="skm-<%= idx %>" style="display:none;">
+              <td colspan="4" class="l">
+                <table class="sub-tbl">
+                  <thead><tr><th class="l">モール</th><th>7日</th><th>30日</th></tr></thead>
+                  <tbody>
+                    <% p.sokuhoMalls.forEach(m => { %>
+                      <tr><td class="l"><span class="badge b-mall"><%= m.label %></span></td><td><%= num(m.q7) %></td><td><%= num(m.q30) %></td></tr>
+                    <% }) %>
+                  </tbody>
+                </table>
+              </td>
+            </tr>
+            <% } %>
           <% }) %>
         </tbody>
       </table>
@@ -107,7 +126,8 @@
       <% } %>
       <div class="note">
         <b>速報（注文ベース）</b>とは … 注文が入った日でカウントした直近の販売数です（ほぼ前日まで反映・Amazon FBA含む・返品/キャンセル後の精算は未反映の暫定値）。<br>
-        対象は<b>全モール</b>です。<b>楽天・Yahoo!・Amazon FBM など「FBA以外」はまとめて</b>この数字に含まれます（うち Amazon FBA 分だけ「内Amazon FBA」で分離表示）。モール別・出品別に分けて見るには「確定」タブの<b>出品内訳</b>をご覧ください。
+        <b>モール別内訳</b>に 楽天・Yahoo!・au PAY・Qoo10・メルカリ・LINEギフト・Amazon FBA・Amazon FBM 別の数量を表示します（4モール以上は「ほか◯ ▼」で展開）。<br>
+        速報と確定（精算ベース）は集計基準が違うため数字は一致しません。
       </div>
     </section>
 
@@ -127,7 +147,7 @@
         </form>
         <a class="csv" href="<%= '/share/supplier/' + token + '/csv' + qstr(query.period||'30d') %>">CSVダウンロード</a>
       </div>
-      <div class="period">確定（精算ベース）: <%= period.start %> 〜 <%= period.end %>（<%= period.label %>・<%= period.cutoff %>まで確定分）</div>
+      <div class="period"><% if (period) { %>確定（精算ベース）: <%= period.start %> 〜 <%= period.end %>（<%= period.label %>・<%= period.cutoff %>まで確定分）<% } else { %>確定（精算ベース）: 集計対象データがまだありません<% } %></div>
       <div class="cards">
         <div class="card"><div class="k">対象商品数</div><div class="v"><%= kakuteiProducts.length.toLocaleString('ja-JP') %><small> 点</small></div></div>
         <div class="card"><div class="k">販売ピース数</div><div class="v"><%= num(totals.pieces) %><small> 個</small></div></div>
@@ -173,7 +193,7 @@
       </div>
       <% } %>
       <div class="note">
-        <b>確定（精算ベース）</b>とは … 各モールの精算が確定した後の数字で、返品・キャンセルを差し引いた実績です。精算の都合で直近〜2週間ほどは遅れて反映されるため、速報より対象期間が手前（<%= period.cutoff %>まで）になります。<br>
+        <b>確定（精算ベース）</b>とは … 各モールの精算が確定した後の数字で、返品・キャンセルを差し引いた実績です。精算の都合で直近〜2週間ほどは遅れて反映されるため、速報より対象期間が手前<% if (period) { %>（<%= period.cutoff %>まで）<% } %>になります。<br>
         ・<b>ピース数</b> … 実際に出荷した個数。3個セットが1件売れたら「3個」（全モール共通）。<br>
         ・<b>売上(税込)</b> … 出品が実際に売れた金額の合計（手数料・送料は含まず／複数商品セットは標準売価比で按分）。<br>
         ・<b>出品内訳</b> … 楽天の3個セットページ、Amazon の FBA / FBM 別など、どの出品で売れたかを確認できます。

@@ -231,13 +231,15 @@
     async function loadPreview(){
       const tb = document.querySelector('#prevTable tbody');
       const meta = document.getElementById('prevMeta');
-      tb.innerHTML='<tr><td colspan="6" class="muted">読み込み中…</td></tr>';
+      tb.innerHTML='<tr><td colspan="7" class="muted">読み込み中…</td></tr>';
       const d = await jget(base+'/api/summary?code='+encodeURIComponent(current.code)+'&period='+curPeriod());
       if(!d.ok){ tb.innerHTML='<tr><td colspan="7" class="muted">取得失敗</td></tr>'; return; }
-      if(!d.period || !d.products.length){ meta.textContent=''; tb.innerHTML='<tr><td colspan="7" class="muted">対象期間に販売実績なし</td></tr>'; return; }
+      // 速報のみ(確定finance空=period null)でも表示する。空判定は products 件数だけで行う。
+      if(!d.products || !d.products.length){ meta.textContent=''; tb.innerHTML='<tr><td colspan="7" class="muted">対象商品の販売実績なし</td></tr>'; return; }
       const ml = d.mallLabels || {};
       const sokuhoAsOf = d.sokuho && d.sokuho.asOf ? d.sokuho.asOf : '—';
-      meta.innerHTML = `🟢 速報(注文ベース・FBA含む): <b>${esc(sokuhoAsOf)}</b>朝時点　7日 ${num(d.totals.sokuho7)} / 30日 ${num(d.totals.sokuho30)}　｜　確定(精算ベース): ${d.period.start}〜${d.period.end}（${d.period.label}）売上 ${yen(d.totals.sales)}`;
+      const kakuteiMeta = d.period ? `確定(精算ベース): ${d.period.start}〜${d.period.end}（${d.period.label}）売上 ${yen(d.totals.sales)}` : '確定(精算ベース): 集計対象データなし';
+      meta.innerHTML = `🟢 速報(注文ベース): <b>${esc(sokuhoAsOf)}</b>朝時点　7日 ${num(d.totals.sokuho7)} / 30日 ${num(d.totals.sokuho30)}　｜　${kakuteiMeta}`;
       tb.innerHTML = d.products.map((p, i) => {
         const sub = p.listings.map(L => `<tr>
             <td class="l">${esc(ml[L.mall]||L.mall)}${L.mall==='amazon' ? (L.is_fba?' <span class="pill pill-on">FBA</span>':' <span class="pill pill-off">FBM</span>') : ''}</td>
@@ -250,7 +252,7 @@
         return `<tr>
           <td class="l"><strong>${esc(p.product_name||'(商品名なし)')}</strong><br><span class="muted">${esc(p.ne_code)}</span></td>
           <td><strong>${num(p.sokuho7)}</strong></td>
-          <td><strong>${num(p.sokuho30)}</strong>${p.sokuho30Fba?`<br><span class="muted">内FBA ${num(p.sokuho30Fba)}</span>`:''}</td>
+          <td><strong>${num(p.sokuho30)}</strong>${(p.sokuhoMalls&&p.sokuhoMalls.length)?`<br><span class="muted">${p.sokuhoMalls.map(m=>esc(m.label)+' '+num(m.q30)).join(' / ')}</span>`:''}</td>
           <td>${num(p.pieces)}</td>
           <td>${yen(p.sales)}</td>
           <td class="l">${p.lastSold||'—'}</td>

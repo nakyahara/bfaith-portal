@@ -525,6 +525,22 @@ function createTables() {
     updated_at        TEXT NOT NULL
   )`);
 
+  // 12d-2. 販売速度 モール別版（仕入れ先売れ筋共有の「速報モール別」用）
+  //   f_sales_velocity_by_product と同じ注文ベース集計を mall 次元込みで持つ。
+  //   mall = shops.platform（rakuten/yahoo/aupay/qoo10/mercari/linegift/amazon_fbm 等）
+  //          ＋ Amazon FBA は SP-API 由来を 'amazon_fba' として別計上（FBM=NE と二重計上しない）。
+  //   商品コード は NE商品コード（NE側はセット展開済 / FBA側は seller_sku→ne_code→構成数 展開）。
+  db.exec(`CREATE TABLE IF NOT EXISTS f_sales_velocity_by_product_mall (
+    商品コード        TEXT NOT NULL,
+    mall              TEXT NOT NULL,
+    qty_7d            INTEGER NOT NULL DEFAULT 0,
+    qty_30d           INTEGER NOT NULL DEFAULT 0,
+    as_of_date        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL,
+    PRIMARY KEY (商品コード, mall)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_fsvm_code ON f_sales_velocity_by_product_mall(商品コード)');
+
   // 12e. 商品管理リスト スナップショット（現スプレッドシート互換の完成行を warehouse 側で確定）
   //   meta(run_id) + rows(run_id, 商品コード) を append、published_run_id を一括切替(atomic publish)。
   //   Render/GAS/画面は published_run_id のみ参照。母集団は m_products 起点(全件 left join)。
