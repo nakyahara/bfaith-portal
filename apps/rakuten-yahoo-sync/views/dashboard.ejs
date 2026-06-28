@@ -1663,47 +1663,88 @@ async function backfillRakutenTitle(evt) {
 }
 
 // ───── 楽天 genre_id backfill (Phase E-16) ─────
+// 楽天 RMS は 1 件ずつ getItem を叩くため重く、 大 limit だと Render エッジ timeout (~100s) で切れる。
+//   → 1 リクエストは小 batch (GENRE_BATCH=20) に抑え、 本実行は remaining=0 まで自動ループする。
+const GENRE_BATCH = 20;
+
+async function callGenreBackfillOnce(dryRun) {
+  const res = await fetch('/apps/rakuten-yahoo-sync/api/rakuten-genre-backfill', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ limit: GENRE_BATCH, dryRun: !!dryRun }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+  return data;
+}
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
 async function backfillRakutenGenre(evt, dryRun) {
   const btn = evt.currentTarget;
   if (!btn || btn.disabled) return;
-  if (!dryRun && !confirm('楽天 RMS から genre_id を取得して DB に保存します。\n先に dry-run で件数を確認しましたか?\n\n続行しますか?')) return;
   const original = btn.textContent;
-  btn.disabled = true;
-  btn.textContent = dryRun ? '試算中...' : '取得中...';
-  try {
-    const res = await fetch('/apps/rakuten-yahoo-sync/api/rakuten-genre-backfill', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ limit: 200, dryRun: !!dryRun }),
-    });
-    const data = await res.json();
-    if (!res.ok) {
-      alert('失敗: ' + (data.error || ('HTTP ' + res.status)));
-      btn.disabled = false; btn.textContent = original;
-      return;
-    }
-    if (dryRun) {
-      // dry-run: DB 更新せず、 取れる件数 / 楽天側 genre 無し / fetch 失敗 を表示
-      const msg = `【dry-run 試算】\n`
-        + `対象 ${data.picked} 件をチェック\n`
+
+  if (dryRun) {
+    // dry-run: 先頭 20 件サンプルで傾向 (取れる / 楽天側 genre 無し) を確認。 DB 更新なし。
+    btn.disabled = true;
+    btn.textContent = '試算中...';
+    try {
+      const data = await callGenreBackfillOnce(true);
+      const msg = `【dry-run サンプル試算 (先頭 ${data.picked} 件)】\n`
         + `・genre 取得できる: ${data.updated} 件\n`
         + `・楽天側に genre 設定が無い: ${data.stillNull} 件\n`
         + `・楽天 fetch 失敗: ${data.failed} 件\n`
         + `(未取得 残 ${data.remaining} 件)\n\n`
-        + `この内容で本実行するなら「📥 楽天 genre 取得 (本実行)」 を押してください。`;
+        + `傾向が良ければ「📥 楽天 genre 取得 (本実行)」 を押してください。\n`
+        + `本実行は残り全部を ${GENRE_BATCH} 件ずつ自動で処理します。`;
       alert(msg);
-      btn.disabled = false; btn.textContent = original;
-    } else {
-      const msg = `楽天 genre を ${data.updated} 件保存しました。\n`
-        + `・楽天側に genre 無し: ${data.stillNull} 件\n`
-        + `・fetch 失敗: ${data.failed} 件\n`
-        + `(未取得 残 ${data.remaining} 件)\n\n`
-        + `カテゴリ自動解決が効いて「出せる」 が増えているか確認します。 ページを再読み込みします。`;
-      alert(msg);
-      location.reload();
+    } catch (e) {
+      alert('試算失敗: ' + e.message);
     }
-  } catch (e) {
-    alert('ネットワークエラー: ' + e.message);
     btn.disabled = false; btn.textContent = original;
+    return;
+  }
+
+  // 本実行: remaining=0 になるまで小 batch で自動ループ。
+  if (!confirm(`楽天 RMS から genre_id を取得して DB に保存します。\n残り全部を ${GENRE_BATCH} 件ずつ自動処理します (数分かかる場合あり)。\n\n続行しますか?`)) return;
+  btn.disabled = true;
+  let totalUpdated = 0, totalStillNull = 0, totalFailed = 0;
+  let lastRemaining = null;
+  let stuckRounds = 0;
+  try {
+    for (let round = 1; round <= 50; round++) {
+      btn.textContent = `取得中... (${totalUpdated} 件保存 / 残 ${lastRemaining ?? '?'})`;
+      const data = await callGenreBackfillOnce(false);
+      totalUpdated += data.updated || 0;
+      totalStillNull += data.stillNull || 0;
+      totalFailed += data.failed || 0;
+
+      // 進捗が止まったら停止 (この batch で 1 件も DB 更新されず remaining も減らない = 先頭が全部 genre 無し/失敗)
+      if ((data.updated || 0) === 0 && data.remaining === lastRemaining) {
+        stuckRounds++;
+        if (stuckRounds >= 2) { lastRemaining = data.remaining; break; }
+      } else {
+        stuckRounds = 0;
+      }
+      lastRemaining = data.remaining;
+      if (!data.remaining || data.remaining <= 0) break;
+      await sleep(1200); // 楽天 proxy への連続叩きを緩和
+    }
+    const done = !lastRemaining || lastRemaining <= 0;
+    const head = done
+      ? `楽天 genre 取得 完了`
+      : `楽天 genre 取得 一区切り (まだ残あり、 もう一度ボタンを押すと続きから)`;
+    const msg = `${head}\n`
+      + `・保存できた: ${totalUpdated} 件\n`
+      + `・楽天側に genre 無し: ${totalStillNull} 件\n`
+      + `・fetch 失敗: ${totalFailed} 件\n`
+      + `(未取得 残 ${lastRemaining ?? '?'} 件)\n\n`
+      + `カテゴリ自動解決が効いて「出せる」 が増えているか確認します。 ページを再読み込みします。`;
+    alert(msg);
+    location.reload();
+  } catch (e) {
+    alert(`途中でエラー: ${e.message}\nここまで ${totalUpdated} 件保存済み。 もう一度ボタンを押せば続きから再開します。 ページを再読み込みします。`);
+    location.reload();
   }
 }
 
