@@ -89,14 +89,21 @@
       </div>
       <div class="panel">
         <div class="row" style="justify-content:space-between;">
-          <h3 style="margin:0;">商品別 売上プレビュー</h3>
-          <a class="btn btn-sec" id="btnCsv" href="#">CSVダウンロード</a>
+          <h3 style="margin:0;">商品別 売上プレビュー（仕入先が見る内容）</h3>
+          <div class="row">
+            <select id="prevPeriod">
+              <option value="7d">7日</option>
+              <option value="30d" selected>30日</option>
+              <option value="90d">90日</option>
+            </select>
+            <a class="btn btn-sec" id="btnCsv" href="#">CSVダウンロード</a>
+          </div>
         </div>
         <div id="prevMeta" class="muted" style="margin:8px 0;"></div>
         <div style="overflow-x:auto;">
           <table id="prevTable">
             <thead><tr>
-              <th class="l">商品</th><th>7日</th><th>30日</th><th>30日日平均</th><th>30日売上</th><th class="l">最終販売日</th>
+              <th class="l">商品</th><th>ピース数</th><th>日平均</th><th>売上(税込)</th><th class="l">最終販売日</th><th class="l">出品内訳</th>
             </tr></thead>
             <tbody></tbody>
           </table>
@@ -155,11 +162,16 @@
       loadSuppliers();
     }
 
+    function curPeriod(){ return document.getElementById('prevPeriod').value || '30d'; }
+    function syncCsvHref(){
+      document.getElementById('btnCsv').href = base+'/api/summary.csv?code='+encodeURIComponent(current.code)+'&period='+curPeriod();
+    }
+
     async function openDetail(code, name){
       current = { code, name };
       document.getElementById('dlgTitle').textContent = (name||code) + '（' + code + '）';
       document.getElementById('newToken').classList.add('hide');
-      document.getElementById('btnCsv').href = base+'/api/summary.csv?code='+encodeURIComponent(code);
+      syncCsvHref();
       document.getElementById('dlg').showModal();
       loadTokens(); loadPreview();
     }
@@ -209,22 +221,44 @@
         .then(()=>{ document.getElementById('btnCopy').textContent='コピーしました'; });
     });
 
+    const num = n => (Math.round((n||0)*10)/10).toLocaleString('ja-JP');
+
     async function loadPreview(){
-      const d = await jget(base+'/api/summary?code='+encodeURIComponent(current.code));
       const tb = document.querySelector('#prevTable tbody');
       const meta = document.getElementById('prevMeta');
+      tb.innerHTML='<tr><td colspan="6" class="muted">読み込み中…</td></tr>';
+      const d = await jget(base+'/api/summary?code='+encodeURIComponent(current.code)+'&period='+curPeriod());
       if(!d.ok){ tb.innerHTML='<tr><td colspan="6" class="muted">取得失敗</td></tr>'; return; }
-      if(!d.windows || !d.products.length){ meta.textContent=''; tb.innerHTML='<tr><td colspan="6" class="muted">対象期間に販売実績なし</td></tr>'; return; }
-      meta.textContent = `集計対象: ${d.windows.w30start} 〜 ${d.windows.cutoff}　商品 ${d.totals.productCount} 点　30日売上 ${yen(d.totals.sales30)}`;
-      tb.innerHTML = d.products.map(p => `<tr>
-        <td class="l"><strong>${esc(p.product_name||'(商品名なし)')}</strong><br><span class="muted">${esc(p.ne_code)}</span></td>
-        <td>${p.units7.toLocaleString('ja-JP')}</td>
-        <td>${p.units30.toLocaleString('ja-JP')}</td>
-        <td>${p.avgPerDay30.toFixed(1)}</td>
-        <td>${yen(p.sales30)}</td>
-        <td class="l">${p.lastSold||'—'}</td>
-      </tr>`).join('');
+      if(!d.period || !d.products.length){ meta.textContent=''; tb.innerHTML='<tr><td colspan="6" class="muted">対象期間に販売実績なし</td></tr>'; return; }
+      const ml = d.mallLabels || {};
+      meta.textContent = `集計対象: ${d.period.start} 〜 ${d.period.end}（${d.period.label}）　商品 ${d.totals.productCount} 点　ピース ${num(d.totals.pieces)}　売上 ${yen(d.totals.sales)}`;
+      tb.innerHTML = d.products.map((p, i) => {
+        const sub = p.listings.map(L => `<tr>
+            <td class="l">${esc(ml[L.mall]||L.mall)}${L.mall==='amazon' ? (L.is_fba?' <span class="pill pill-on">FBA</span>':' <span class="pill pill-off">FBM</span>') : ''}</td>
+            <td class="l">${esc(L.listingName||'(名称なし)')}<br><span class="muted">${esc(L.listingId)}</span></td>
+            <td>${num(L.sold)}</td><td>${num(L.pieces)}</td><td>${yen(L.sales)}</td>
+          </tr>`).join('');
+        return `<tr>
+          <td class="l"><strong>${esc(p.product_name||'(商品名なし)')}</strong><br><span class="muted">${esc(p.ne_code)}</span></td>
+          <td>${num(p.pieces)}</td>
+          <td>${num(p.avgPerDay)}</td>
+          <td>${yen(p.sales)}</td>
+          <td class="l">${p.lastSold||'—'}</td>
+          <td class="l"><span class="prev-toggle" data-tgt="psub-${i}" style="cursor:pointer;color:#2563eb;font-size:12px;">出品 (${p.listings.length}) ▼</span></td>
+        </tr>
+        <tr id="psub-${i}" style="display:none;"><td colspan="6" class="l" style="background:#fbfcfe;">
+          <table style="width:100%;font-size:12px;"><thead><tr><th class="l">モール</th><th class="l">出品ページ</th><th>件数</th><th>ピース</th><th>売上</th></tr></thead><tbody>${sub}</tbody></table>
+        </td></tr>`;
+      }).join('');
+      tb.querySelectorAll('.prev-toggle').forEach(el => el.addEventListener('click', () => {
+        const r = document.getElementById(el.dataset.tgt); if(!r) return;
+        const open = r.style.display !== 'none';
+        r.style.display = open ? 'none' : 'table-row';
+        el.textContent = el.textContent.replace(open?'▲':'▼', open?'▼':'▲');
+      }));
     }
+
+    document.getElementById('prevPeriod').addEventListener('change', () => { syncCsvHref(); loadPreview(); });
 
     // イベント委譲（DB由来値を onclick へ文字列展開しない＝DOM XSS 回避）
     document.getElementById('supTable').addEventListener('click', (e) => {
