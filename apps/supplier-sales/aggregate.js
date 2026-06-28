@@ -169,7 +169,7 @@ function loadAmazonMap(db, supplier) {
  */
 export function getSupplierReport(db, supplierCode, opts = {}) {
   const P = resolvePeriod(db, opts);
-  if (!P) return { period: null, products: [], totals: null };
+  if (!P) return { period: null, sokuho: { asOf: null, status: null }, products: [], totals: null };
 
   const prod = loadProductMap(db);
   const setMap = loadSetMap(db, supplierCode);
@@ -263,23 +263,45 @@ export function getSupplierReport(db, supplierCode, opts = {}) {
     }
   }
 
-  // 整形
-  const products = [...out.values()]
-    .filter(p => p.pieces !== 0 || p.sales !== 0)
-    .map(p => ({
-      ne_code: p.ne_code,
-      product_name: p.name,
-      pieces: round1(p.pieces),
-      sales: Math.round(p.sales),
-      prevPieces: round1(p.prevPieces),
-      prevSales: Math.round(p.prevSales),
-      avgPerDay: round2(p.pieces / P.len),
-      lastSold: p.lastSold,
-      listings: [...p.listings.values()]
-        .map(L => ({ ...L, pieces: round1(L.pieces), sales: Math.round(L.sales) }))
-        .sort((a, b) => b.pieces - a.pieces || b.sales - a.sales),
-    }))
-    .sort((a, b) => b.sales - a.sales || b.pieces - a.pieces);
+  // 速報（注文ベース・FBA含む・毎朝更新）を既存の商品管理リスト mirror から取得しマージ。
+  // 確定(精算ベース,期間可変)と速報(注文ベース,固定7/30日)は基準が違うため列を分けて持つ。
+  const sokuho = loadSokuho(db, supplierCode);
+
+  const financePart = (p) => ({
+    pieces: round1(p.pieces),
+    sales: Math.round(p.sales),
+    prevPieces: round1(p.prevPieces),
+    prevSales: round1(p.prevSales),
+    avgPerDay: round2(p.pieces / P.len),
+    lastSold: p.lastSold,
+    listings: [...p.listings.values()]
+      .map(L => ({ ...L, pieces: round1(L.pieces), sales: Math.round(L.sales) }))
+      .sort((a, b) => b.pieces - a.pieces || b.sales - a.sales),
+  });
+  const emptyFinance = { pieces: 0, sales: 0, prevPieces: 0, prevSales: 0, avgPerDay: 0, lastSold: null, listings: [] };
+  const emptySokuho = { s7: 0, s7fba: 0, s30: 0, s30fba: 0, stock: null, fbaStock: null, stockDays: null };
+
+  // 確定(finance)と速報(PML)の商品コード和集合
+  const allNe = new Set([...out.keys(), ...sokuho.byNe.keys()]);
+  const products = [...allNe]
+    .map(ne => {
+      const f = out.get(ne);
+      const sk = sokuho.byNe.get(ne) || emptySokuho;
+      const fin = f ? financePart(f) : emptyFinance;
+      return {
+        ne_code: ne,
+        product_name: (f && f.name) || sk.name || '',
+        ...fin,
+        // 速報（注文ベース）
+        sokuho7: sk.s7 || 0, sokuho7Fba: sk.s7fba || 0,
+        sokuho30: sk.s30 || 0, sokuho30Fba: sk.s30fba || 0,
+        stock: (sk.stock == null ? null : sk.stock),
+        stockDays: (sk.stockDays == null ? null : sk.stockDays),
+      };
+    })
+    .filter(p => p.pieces !== 0 || p.sales !== 0 || p.sokuho30 !== 0 || p.sokuho7 !== 0)
+    // 速報30日(今売れてるか)を主、確定売上を従にソート
+    .sort((a, b) => b.sokuho30 - a.sokuho30 || b.sales - a.sales || b.pieces - a.pieces);
 
   const totals = {
     productCount: products.length,
@@ -287,9 +309,47 @@ export function getSupplierReport(db, supplierCode, opts = {}) {
     sales: products.reduce((a, p) => a + p.sales, 0),
     prevPieces: round1(products.reduce((a, p) => a + p.prevPieces, 0)),
     prevSales: products.reduce((a, p) => a + p.prevSales, 0),
+    sokuho7: products.reduce((a, p) => a + p.sokuho7, 0),
+    sokuho30: products.reduce((a, p) => a + p.sokuho30, 0),
   };
 
-  return { period: P, products, totals };
+  return { period: P, sokuho: { asOf: sokuho.asOf, status: sokuho.status }, products, totals };
+}
+
+// 商品管理リスト snapshot(mirror_pml_snapshot_rows) から仕入先別の速報販売数を取得。
+// 注文ベース(NE非FBA + SP-API FBA 統合)・毎朝更新・FBA/FBA以外split・在庫付き。
+// 注意:
+//  - published(pub) と rows は db.transaction で一括読みする。mirror 同期側は
+//    DELETE→insert→published upsert を行うため、別 statement で読むと「旧 run_id を
+//    読んだ直後に rows 全削除」と競合し速報が一時的に全0になり得る (Codex High)。
+//  - PML 未生成/未移行(テーブル・列なし)環境でも throw でレポート全体を500にしないよう
+//    全体を try/catch し、失敗時は空(byNe空)で安全に縮退する (Codex High)。
+function loadSokuho(db, supplier) {
+  try {
+    return db.transaction(() => {
+      const pub = db.prepare('SELECT run_id, as_of_date, status FROM mirror_pml_published WHERE id = 1').get();
+      if (!pub || !pub.run_id) return { asOf: null, status: null, byNe: new Map() };
+      const rows = db.prepare(`
+        SELECT 商品コード c, 商品名 n,
+               販売数7日_合計 s7, 販売数7日_FBA s7f,
+               販売数30日_合計 s30, 販売数30日_FBA s30f,
+               総在庫数 stock, FBA在庫数 fbaStock, 在庫保管日数 stockDays
+        FROM mirror_pml_snapshot_rows
+        WHERE run_id = @r AND 仕入先 = @s
+      `).all({ r: pub.run_id, s: supplier });
+      const byNe = new Map();
+      for (const r of rows) {
+        byNe.set(r.c, {
+          name: r.n || '', s7: r.s7 || 0, s7fba: r.s7f || 0, s30: r.s30 || 0, s30fba: r.s30f || 0,
+          stock: r.stock, fbaStock: r.fbaStock, stockDays: r.stockDays,
+        });
+      }
+      return { asOf: pub.as_of_date, status: pub.status, byNe };
+    })();
+  } catch (e) {
+    console.error('[supplier-sales] loadSokuho skipped:', e.message);
+    return { asOf: null, status: null, byNe: new Map() };
+  }
 }
 
 function round1(n) { return Math.round(n * 10) / 10; }

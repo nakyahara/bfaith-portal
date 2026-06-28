@@ -19,19 +19,21 @@ function row(cells) {
 }
 
 export function buildCsv(report, mallLabels) {
-  const header = ['種別', 'モール', '商品コード/出品ID', '名称', 'FBA', '販売件数', 'ピース数', '売上(税込)', '最終販売日'];
+  const header = ['種別', 'モール', '商品コード/出品ID', '名称', 'FBA',
+    '確定販売件数', '確定ピース数', '確定売上(税込)',
+    '速報7日販売数(注文ベース)', '速報30日販売数(注文ベース)', '最終販売日'];
   const lines = [row(header)];
   const products = report.products || [];
   for (const p of products) {
     lines.push(row([
       '商品', '合計', p.ne_code, p.product_name, '',
-      '', p.pieces, p.sales, p.lastSold || '',
+      '', p.pieces, p.sales, p.sokuho7 ?? '', p.sokuho30 ?? '', p.lastSold || '',
     ]));
     for (const L of (p.listings || [])) {
       lines.push(row([
         '出品', (mallLabels[L.mall] || L.mall), L.listingId, L.listingName,
         L.mall === 'amazon' ? (L.is_fba ? 'FBA' : 'FBM') : '',
-        L.sold, L.pieces, L.sales, '',
+        L.sold, L.pieces, L.sales, '', '', '',
       ]));
     }
   }
