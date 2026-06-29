@@ -56,8 +56,51 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('商品管理リスト')
     .addItem('FBA在庫を今すぐ更新 → シート反映', 'refreshFbaAndWrite')
-    .addItem('シートに最新を反映 (取り込みのみ)', 'main')
+    .addItem('シートに最新を反映 (取り込みのみ)', 'reflectLatestToSheet')
     .addToUi();
+}
+
+// ISO → JST 'MM/dd HH:mm' 表示
+function fmtJstGas_(iso) {
+  if (!iso) return '—';
+  var d = new Date(iso);
+  if (isNaN(d.getTime())) return String(iso);
+  return Utilities.formatDate(d, 'Asia/Tokyo', 'MM/dd HH:mm') + ' JST';
+}
+
+// main() の結果を人間向けメッセージに整形 (鮮度・件数・書込モードを必ず出す)
+function summarizeWrite_(r) {
+  if (!r) return '完了 (詳細なし)';
+  if (r.skipped) return '別の実行中だったためスキップしました。少し待って再実行してください。';
+  var fresh = 'FBA在庫: ' + (r.fba_source_kind === 'live' ? (fmtJstGas_(r.fba_fetched_at) + ' 取得(最新)') : ((r.as_of_date || '?') + ' (朝同期)'))
+    + '\n自社在庫・販売数: ' + (r.as_of_date || '?') + ' 時点';
+  if (r.mode !== 'live') {
+    return '【dry_run】検証のみ・シートには書いていません\n一致 ' + r.matched + '/' + r.n + ' 行\n' + fresh
+      + '\n\n実際に書くには スクリプトプロパティ WRITE_MODE=live にしてください。';
+  }
+  if (!r.wrote) return '更新対象なし(変更ゼロ)でした。\n' + fresh;
+  return '✅ シート反映 完了\n一致 ' + r.matched + '/' + r.n + ' 行 / 変更セル ' + r.changed + '\n' + fresh;
+}
+
+// メニュー「取り込みのみ」: main() を実行し、結果(鮮度/件数/書込)を必ずダイアログで返す。
+function reflectLatestToSheet() {
+  var ui = SpreadsheetApp.getUi();
+  try {
+    ui.alert(summarizeWrite_(main()));
+  } catch (e) {
+    ui.alert('❌ シート反映に失敗しました:\n' + e.message);
+  }
+}
+
+// Render published が startTs 以降に取得された live になっているか (タイムアウト後の判定用)
+function checkReflected_(endpoint, readToken, startTs) {
+  try {
+    var resp = UrlFetchApp.fetch(endpoint, { method: 'get', muteHttpExceptions: true, headers: { 'x-read-token': readToken } });
+    if (resp.getResponseCode() !== 200) return null;
+    var d = JSON.parse(resp.getContentText());
+    var fetchedMs = d.fba_fetched_at ? new Date(d.fba_fetched_at).getTime() : 0;
+    return { fresh: d.fba_source_kind === 'live' && fetchedMs >= startTs - 60000 };
+  } catch (e) { return null; }
 }
 
 // ─── オンデマンドFBA更新 (Part2): miniPC で RESTOCK取得→build(live)→同期 を起動し、
@@ -69,9 +112,11 @@ function refreshFbaAndWrite() {
   var props = PropertiesService.getScriptProperties();
   var endpoint = props.getProperty('ENDPOINT_URL');      // .../api/pml/published
   var refreshToken = props.getProperty('REFRESH_TOKEN');  // = PML_REFRESH_TOKEN (更新トリガ専用、READ_TOKENとは別)
+  var readToken = props.getProperty('READ_TOKEN');        // published 確認用
   if (!endpoint || !refreshToken) { ui.alert('スクリプトプロパティ未設定 (ENDPOINT_URL / REFRESH_TOKEN)'); return; }
   var base = endpoint.replace(/\/published\/?$/, ''); // → .../api/pml
   var triggerUrl = base + '/refresh-fba';
+  var startTs = Date.now();
 
   // 1. 起動 (更新トリガ専用 token認証)
   var resp = UrlFetchApp.fetch(triggerUrl, { method: 'post', muteHttpExceptions: true, headers: { 'x-refresh-token': refreshToken } });
@@ -79,32 +124,45 @@ function refreshFbaAndWrite() {
   var j = JSON.parse(resp.getContentText());
   if (!j.jobId) { ui.alert((j.message || j.error || '実行中です') + '\n少し待って再実行してください。'); return; }
 
-  // 2. 完了ポーリング (最大 ~4.5 分。8 秒間隔)
+  // 2. 完了ポーリング (最大 ~4.5 分。8 秒間隔)。最後に見えた進捗段階を覚えておく。
   var jobUrl = triggerUrl + '/jobs/' + encodeURIComponent(j.jobId);
   var deadline = Date.now() + 4.5 * 60 * 1000;
   var st = 'running';
+  var lastStep = '起動';
   while (Date.now() < deadline) {
     Utilities.sleep(8000);
     var jr = UrlFetchApp.fetch(jobUrl, { muteHttpExceptions: true, headers: { 'x-refresh-token': refreshToken } });
     if (jr.getResponseCode() >= 300) continue;
     var job = JSON.parse(jr.getContentText());
     st = job.status;
+    if (job.progress && job.progress.message) lastStep = job.progress.message;
     if (st === 'completed') break;
-    if (st === 'failed') { ui.alert('FBA更新に失敗しました:\n' + (job.error || '(理由不明)')); return; }
+    if (st === 'failed') { ui.alert('❌ FBA更新に失敗しました:\n' + (job.error || '(理由不明)')); return; }
   }
-  if (st !== 'completed') {
-    ui.alert('FBA在庫の更新は継続中です（数分かかります）。\n完了後にメニュー「シートに最新を反映 (取り込みのみ)」を実行してください。\n※状況は Render 管理画面でも確認できます。');
+
+  // 3a. ジョブ完了 → そのままシート反映 + 結果表示
+  if (st === 'completed') {
+    ui.alert('✅ FBA在庫を最新化しました。\n' + summarizeWrite_(main()));
     return;
   }
 
-  // 3. 反映 (既存の main をそのまま使う = 検証/fail-closed/部分上書きを再利用)
-  main();
-  ui.alert('✅ FBA在庫を最新化してシートに反映しました。');
+  // 3b. タイムアウト: ジョブはまだ走行中。Render に反映済みになっていれば書き込む。
+  var reflected = readToken ? checkReflected_(endpoint, readToken, startTs) : null;
+  if (reflected && reflected.fresh) {
+    ui.alert('✅ 取得完了を確認。シートに反映しました。\n' + summarizeWrite_(main()));
+    return;
+  }
+
+  // まだ処理中 → 「どこまで進んだか」を明示して案内
+  ui.alert('⏳ まだ処理中です (Amazonの取得に時間がかかっています)。\n'
+    + '現在の段階: ' + lastStep + '\n\n'
+    + 'あと数分待ってから、メニュー「シートに最新を反映 (取り込みのみ)」を押すとシートに書き込めます。\n'
+    + '(進捗は Render 管理画面の「FBA在庫を今すぐ更新」横の表示でも確認できます)');
 }
 
 function main() {
   var lock = LockService.getScriptLock();
-  if (!lock.tryLock(10000)) { Logger.log('別実行中のためスキップ'); return; }
+  if (!lock.tryLock(10000)) { Logger.log('別実行中のためスキップ'); return { skipped: true }; }
   try {
     var props = PropertiesService.getScriptProperties();
     var endpoint = props.getProperty('ENDPOINT_URL');
@@ -216,7 +274,11 @@ function main() {
       + ' / シート行=' + n + ' 一致=' + matched + ' DB未一致(据え置き)=' + unmatchedRows + ' mode=' + writeMode);
     if (matched === 0) throw new Error('商品コードが1件も一致しない');
     if (matched / n < MIN_MATCH_RATE) throw new Error('一致率が低い: ' + matched + '/' + n);
-    if (writeMode !== 'live') { Logger.log('[dry_run] 書き込みスキップ'); return; }
+    var summaryBase = {
+      ok: true, mode: writeMode, matched: matched, n: n, run_id: data.run_id, status: data.status,
+      as_of_date: data.as_of_date, fba_source_kind: data.fba_source_kind, fba_fetched_at: data.fba_fetched_at,
+    };
+    if (writeMode !== 'live') { Logger.log('[dry_run] 書き込みスキップ'); return Object.assign({ wrote: false }, summaryBase); }
 
     // 8. バックアップ(Drive JSON、シートは触らない) → Sheets API で10列を1回書き込み
     backupToDrive_(ssId, sheetName, data, resolved, keyCol, curCols, n);
@@ -240,12 +302,13 @@ function main() {
         dataReqs.push({ range: q + a1 + (start + 2) + ':' + a1 + (start + 1 + vals.length), majorDimension: 'ROWS', values: vals });
       }
     }
-    if (dataReqs.length === 0) { Logger.log('更新対象なし'); return; }
+    if (dataReqs.length === 0) { Logger.log('更新対象なし'); return Object.assign({ wrote: false, changed: 0 }, summaryBase); }
     if (dataReqs.length > MAX_WRITE_RANGES) {
       throw new Error('書込range断片化が異常: ' + dataReqs.length + ' (>' + MAX_WRITE_RANGES + ')。一致/非一致が細かく交互の疑いで中止');
     }
     Sheets.Spreadsheets.Values.batchUpdate({ valueInputOption: 'RAW', data: dataReqs }, ssId);
     Logger.log('部分上書き完了(Sheets API): 一致' + matched + '行 / 書込range' + dataReqs.length + ' / 変更セル' + changed);
+    return Object.assign({ wrote: true, changed: changed }, summaryBase);
   } catch (e) {
     Logger.log('ERROR: ' + e.message);
     notifyGChat_('🔴 *商品管理リスト シート上書き失敗*\n' + e.message);
