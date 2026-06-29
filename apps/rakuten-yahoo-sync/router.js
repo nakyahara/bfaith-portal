@@ -838,6 +838,83 @@ router.get('/api/admin/category-resolution-stats', (_req, res) => {
   }
 });
 
+/**
+ * Phase E-17: 未解決 genre 一覧 (紐付け画面の土台)。
+ *   カテゴリが解決できてない楽天 genre を「何の商品か分かる形」 で集約して返す。
+ *   各 genre に: 件数、 サンプル商品名、 楽天カテゴリ名(rakuten_genre_path=自動pathの素)、
+ *   既に持ってる yahoo_category_id (manual_path_missing 判別用)。
+ *
+ *   中原さんはこの一覧を見て、 各 genre に Yahoo数字ID を割り当てる (path は楽天から自動)。
+ *   read-only。
+ */
+router.get('/api/yahoo-category/unresolved-genres', (_req, res) => {
+  try {
+    const db = getDB();
+    const { products } = listProductsForUI(db, { filter: 'all' });
+    // カテゴリ未解決 (unresolved / *_path_missing / notion_partial) かつ genre_id がある fixable のみ
+    const UNRESOLVED_SOURCES = new Set([
+      'unresolved', 'manual_path_missing', 'decisions_path_missing', 'notion_partial',
+    ]);
+    const targets = products.filter((p) =>
+      p.status === 'fixable'
+      && UNRESOLVED_SOURCES.has(p.categorySource)
+      && p.rakutenGenreId != null && p.rakutenGenreId !== '');
+
+    // genre 単位で集約
+    const byGenre = new Map();
+    for (const p of targets) {
+      const g = String(p.rakutenGenreId);
+      if (!byGenre.has(g)) byGenre.set(g, { genreId: g, count: 0, sampleTitles: [], itemCodes: [] });
+      const e = byGenre.get(g);
+      e.count += 1;
+      if (e.sampleTitles.length < 3 && p.rakutenTitle) e.sampleTitles.push(p.rakutenTitle);
+      if (e.itemCodes.length < 5) e.itemCodes.push(p.itemCode);
+    }
+
+    // genre ごとに rakuten_genre_path (自動pathの素) と 既存 yahoo_category_id を DB から補完。
+    // Codex High: 列/テーブル未適用環境では prepare 自体が throw する → prepare を try で包み、
+    //   作れなければ該当補完だけ null にして endpoint 全体は 500 にしない (resolver と同じ fail-soft)。
+    const prep = (sql) => { try { return db.prepare(sql); } catch (_) { return null; } };
+    const genrePathStmt = prep(`
+      SELECT rakuten_genre_path FROM migration_candidates
+      WHERE rakuten_genre_id = ? AND rakuten_genre_path IS NOT NULL AND rakuten_genre_path <> ''
+      LIMIT 1
+    `);
+    const manualCatStmt = prep(`SELECT yahoo_category_id, yahoo_path FROM category_manual WHERE rakuten_genre_id = ?`);
+    const decisionsCatStmt = prep(`SELECT yahoo_category_id, yahoo_path FROM category_decisions WHERE rakuten_genre_id = ? AND locked = 1 AND ambiguous = 0`);
+
+    const genres = [...byGenre.values()].map((e) => {
+      let rakutenGenrePath = null;
+      try { rakutenGenrePath = genrePathStmt?.get(e.genreId)?.rakuten_genre_path ?? null; } catch (_) {}
+      // 既に yahoo_category_id を持ってるか (manual_path_missing = ID有/path無)
+      let existingCategoryId = null;
+      let existingPath = null;
+      try {
+        const m = (manualCatStmt?.get(e.genreId)) || (decisionsCatStmt?.get(e.genreId));
+        if (m) { existingCategoryId = m.yahoo_category_id ?? null; existingPath = m.yahoo_path ?? null; }
+      } catch (_) {}
+      return {
+        genreId: e.genreId,
+        count: e.count,
+        sampleTitles: e.sampleTitles,
+        itemCodes: e.itemCodes,
+        rakutenGenrePath,        // 楽天カテゴリ名 (= 店の棚 path の素、 中原さん運用で一致)
+        existingCategoryId,      // 既にあれば path だけ足りない (manual_path_missing)
+        existingPath,
+      };
+    }).sort((a, b) => b.count - a.count);
+
+    return res.json({
+      status: 'ok',
+      totalGenres: genres.length,
+      totalItems: targets.length,
+      genres,
+    });
+  } catch (e) {
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
 // ───────────────── Phase E-4: publish dry-run ─────────────────
 
 /**
