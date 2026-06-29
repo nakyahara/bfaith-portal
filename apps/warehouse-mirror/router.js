@@ -459,17 +459,21 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
             db.prepare(`INSERT INTO mirror_pml_published
               (id, run_id, status, as_of_date, generated_at, payload_checksum, row_count,
                src_ne_products_synced_at, src_velocity_as_of, src_fba_business_date, src_reorder_updated_at,
-               ne_fba_overlap, published_at, synced_at)
-              VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ne_fba_overlap, published_at, synced_at,
+               fba_source_kind, fba_source_run_id, fba_fetched_at, fba_latest_row_count)
+              VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
               ON CONFLICT(id) DO UPDATE SET run_id=excluded.run_id, status=excluded.status,
                as_of_date=excluded.as_of_date, generated_at=excluded.generated_at,
                payload_checksum=excluded.payload_checksum, row_count=excluded.row_count,
                src_ne_products_synced_at=excluded.src_ne_products_synced_at, src_velocity_as_of=excluded.src_velocity_as_of,
                src_fba_business_date=excluded.src_fba_business_date, src_reorder_updated_at=excluded.src_reorder_updated_at,
-               ne_fba_overlap=excluded.ne_fba_overlap, published_at=excluded.published_at, synced_at=excluded.synced_at`)
+               ne_fba_overlap=excluded.ne_fba_overlap, published_at=excluded.published_at, synced_at=excluded.synced_at,
+               fba_source_kind=excluded.fba_source_kind, fba_source_run_id=excluded.fba_source_run_id,
+               fba_fetched_at=excluded.fba_fetched_at, fba_latest_row_count=excluded.fba_latest_row_count`)
               .run(p.run_id, p.status, p.as_of_date || null, p.generated_at || null, p.payload_checksum || null, rows.length,
                 p.src_ne_products_synced_at || null, p.src_velocity_as_of || null, p.src_fba_business_date || null,
-                p.src_reorder_updated_at || null, p.ne_fba_overlap ?? null, p.generated_at || now, now);
+                p.src_reorder_updated_at || null, p.ne_fba_overlap ?? null, p.generated_at || now, now,
+                p.fba_source_kind || null, p.fba_source_run_id || null, p.fba_fetched_at || null, p.fba_latest_row_count ?? null);
           });
           swap();
           log.push(`pml_snapshot: ${rows.length}件 (run=${p.run_id}, status=${p.status})`);
@@ -2418,6 +2422,38 @@ function requirePmlReadToken(req, res, next) {
   next();
 }
 
+// ─── オンデマンドFBA更新 (Part2) GAS用トリガ ───
+// GAS はセッションを持てないため、PML_READ_TOKEN (x-read-token) で認証して miniPC にプロキシする。
+// (ブラウザ管理UIは /apps/product-management-list 側の session-gated proxy を使う)
+const WH_URL_PML = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
+function whServiceHeadersPml() {
+  return {
+    'CF-Access-Client-Id': process.env.CF_ACCESS_CLIENT_ID || '',
+    'CF-Access-Client-Secret': process.env.CF_ACCESS_CLIENT_SECRET || '',
+    'Authorization': `Bearer ${process.env.WAREHOUSE_SERVICE_TOKEN || ''}`,
+    'Content-Type': 'application/json',
+  };
+}
+async function callWhPml(fullPath, { method = 'GET', timeout = 30000 } = {}) {
+  const r = await fetch(`${WH_URL_PML}${fullPath}`, {
+    method, headers: whServiceHeadersPml(), redirect: 'manual', signal: AbortSignal.timeout(timeout),
+  });
+  if (!r.ok) { const t = await r.text().catch(() => ''); throw new Error(`warehouse HTTP ${r.status}: ${t.slice(0, 200)}`); }
+  const ct = r.headers.get('content-type') || '';
+  if (!ct.includes('application/json')) throw new Error(`warehouse 応答形式異常 (ct=${ct || 'none'})`);
+  return r.json();
+}
+router.post('/api/pml/refresh-fba', requirePmlReadToken, async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try { res.json(await callWhPml('/service-api/fba/pml/fba-refresh', { method: 'POST', timeout: 30000 })); }
+  catch (e) { res.status(502).json({ error: 'ミニPC接続失敗: ' + e.message }); }
+});
+router.get('/api/pml/refresh-fba/jobs/:jobId', requirePmlReadToken, async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try { res.json(await callWhPml(`/service-api/jobs/${encodeURIComponent(req.params.jobId)}`, { timeout: 15000 })); }
+  catch (e) { res.status(502).json({ error: 'ジョブ状態取得失敗: ' + e.message }); }
+});
+
 // ─── GET /api/pml/published ───
 // 商品管理リスト snapshot の published run を GAS 向けに返す read-only endpoint (⑥ GAS が読む)。
 // 認証: x-read-token (専用 PML_READ_TOKEN)。商品管理リスト専用の固定レスポンス (汎用DB読み取りにしない)。
@@ -2457,6 +2493,11 @@ router.get('/api/pml/published', requirePmlReadToken, (req, res) => {
       row_count: pub.row_count,
       actual_row_count: rows.length,
       ne_fba_overlap: pub.ne_fba_overlap,
+      // FBA鮮度 (Part2): daily=朝の日次 / live=オンデマンドRESTOCK。GAS/UI で「FBA在庫はHH:MM時点」を出す。
+      fba_source_kind: pub.fba_source_kind || 'daily',
+      fba_source_run_id: pub.fba_source_run_id || null,
+      fba_fetched_at: pub.fba_fetched_at || null,
+      fba_latest_row_count: pub.fba_latest_row_count ?? null,
       watermarks: {
         ne_products_synced_at: pub.src_ne_products_synced_at,
         velocity_as_of: pub.src_velocity_as_of,

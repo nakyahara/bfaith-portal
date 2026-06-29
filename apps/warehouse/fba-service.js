@@ -26,6 +26,13 @@ import {
 import { syncSkuMappings } from '../fba-replenishment/sheets-sync.js';
 import { generateRecommendations } from '../fba-replenishment/calculation-engine.js';
 
+// --- 商品管理リスト(PML) オンデマンドFBA更新 (Part2) ---
+import { getDB as getWarehouseDB } from './db.js';
+import { acquireLock, releaseLock, heartbeatLock } from './job-locks.js';
+import { refreshFbaLive } from './refresh-fba-live.js';
+import { buildProductManagementSnapshot } from './build-product-management-snapshot.js';
+import { syncPmlSnapshotOnly } from './sync-to-render.js';
+
 // db.jsは default export + named exports の混在なので動的importで対応
 let db;
 async function getDb() {
@@ -152,6 +159,77 @@ router.post('/fetch-reports', rateLimitMiddleware('sp-api'), async (req, res) =>
   });
 
   fetchReportsJobId = job.jobId;
+  okResponse(res, job, 202);
+});
+
+// ==========================================
+// 商品管理リスト(PML) オンデマンドFBA更新 (Part2)
+//   RESTOCK取得 → fba_restock_live 全件置換 → build(live) → pml-only Render同期 を1ジョブで実行。
+//   直列化: pml-pipeline lock (job_locks、cross-process) で daily-sync の build と排他。
+//   SP-API は refreshFbaLive 内で fba-fetch-lock を取得 (cron / 手動取得と排他)。
+// ==========================================
+let pmlRefreshJobId = null;
+router.post('/pml/fba-refresh', rateLimitMiddleware('sp-api'), async (req, res) => {
+  // プロセス内: 二重起動防止
+  if (pmlRefreshJobId) {
+    const { getJob } = await import('./job-manager.js');
+    const existing = getJob(pmlRefreshJobId);
+    if (existing && existing.status === 'running') {
+      return okResponse(res, { jobId: pmlRefreshJobId, status: 'already_running', message: 'FBA在庫の更新が既に実行中です' }, 202);
+    }
+    pmlRefreshJobId = null;
+  }
+
+  // プロセス跨ぎ: daily-sync の build / 別セッションの更新と排他 (warehouse.db job_locks)
+  const wdb = getWarehouseDB();
+  const lock = acquireLock(wdb, 'pml-pipeline', { ttlMs: 40 * 60 * 1000 });
+  if (!lock) {
+    return okResponse(res, {
+      status: 'already_running',
+      message: '別の更新または日次同期が実行中です。完了後にもう一度お試しください。',
+    }, 202);
+  }
+
+  let job;
+  try {
+    job = createJob('pml-fba-refresh', async (updateProgress) => {
+      const hb = setInterval(() => { try { heartbeatLock(wdb, lock); } catch {} }, 60 * 1000);
+      try {
+        updateProgress({ step: 'fetch-restock', message: 'AmazonからRESTOCK在庫を取得中…(数分かかります)' });
+        const live = await refreshFbaLive();
+
+        updateProgress({ step: 'build', message: `スナップショット再生成中 (FBA ${live.row_count}件)…` });
+        const built = await buildProductManagementSnapshot({ fbaSource: 'live' });
+        if (!built.ok) {
+          throw new Error(`snapshot生成に失敗 (status=${built.status}): ${(built.reasons || []).join('; ')}`);
+        }
+
+        updateProgress({ step: 'sync', message: 'Renderへ反映中…' });
+        const synced = await syncPmlSnapshotOnly();
+        if (synced.state !== 'sent') {
+          throw new Error(`Render同期に失敗/スキップ: ${synced.reason || synced.state}`);
+        }
+
+        return {
+          fba_fetched_at: live.fetched_at,
+          fba_row_count: live.row_count,
+          pml_run_id: built.run_id,
+          synced_count: synced.count,
+        };
+      } finally {
+        clearInterval(hb);
+        releaseLock(wdb, lock);
+        pmlRefreshJobId = null;
+      }
+    });
+  } catch (e) {
+    // createJob 同期失敗時は lock を確実に解放 (TTL takeover 待ちを避ける)
+    releaseLock(wdb, lock);
+    pmlRefreshJobId = null;
+    return errorResponse(res, { status: 500, error: 'INTERNAL_ERROR', message: e.message, requestId: req.requestId });
+  }
+
+  pmlRefreshJobId = job.jobId;
   okResponse(res, job, 202);
 });
 

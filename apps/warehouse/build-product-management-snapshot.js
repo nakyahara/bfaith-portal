@@ -39,6 +39,13 @@ function daysBetween(fromStr, toStr) {
   return Math.floor((t - f) / 86400000);
 }
 function r1(n) { return n == null ? null : Math.round(n * 10) / 10; }
+// ISOタイムスタンプ → JST 日付 (YYYY-MM-DD)
+function jstDateOf(ts) {
+  const t = Date.parse(ts);
+  if (Number.isNaN(t)) return null;
+  const j = new Date(t + 9 * 3600 * 1000);
+  return `${j.getUTCFullYear()}-${String(j.getUTCMonth() + 1).padStart(2, '0')}-${String(j.getUTCDate()).padStart(2, '0')}`;
+}
 
 // 列順を固定 (checksum / 出力で一貫)。snapshot_rows の列と一致させる。
 const COLUMNS = [
@@ -50,7 +57,7 @@ const COLUMNS = [
   '代表商品コード', 'ロケーションコード', '商品分類タグ', '登録日',
 ];
 
-export async function buildProductManagementSnapshot() {
+export async function buildProductManagementSnapshot({ fbaSource = 'daily' } = {}) {
   const db = getDB();
   const generatedAt = nowTs();
   const today = jstToday();
@@ -60,8 +67,29 @@ export async function buildProductManagementSnapshot() {
   const neSynced = db.prepare('SELECT MAX(synced_at) AS v FROM raw_ne_products').get()?.v || null;
   const velAsOf = db.prepare('SELECT MAX(as_of_date) AS v FROM f_sales_velocity_by_product').get()?.v || null;
   const velCount = db.prepare('SELECT COUNT(*) AS c FROM f_sales_velocity_by_product').get()?.c || 0;
-  const fbaBizDate = db.prepare("SELECT MAX(business_date) AS v FROM inv_daily_detail WHERE category = 'fba_warehouse'").get()?.v || null;
   const reorderUpdated = db.prepare('SELECT MAX(synced_at) AS v FROM m_reorder_setting').get()?.v || null;
+
+  // ─── FBAソース選択 (daily=inv_daily_detail 最新日 / live=fba_restock_live オンデマンドRESTOCK) ───
+  //   src_fba_business_date は「FBA値が表す日付」(date-only) の意味を保つ。
+  //   live の取得時刻(HH:MM)は fba_fetched_at に分離して持つ。
+  const LIVE_MAX_AGE_MIN = parseInt(process.env.PML_FBA_LIVE_MAX_AGE_MIN || '120', 10);
+  let fbaBizDate, fbaSourceKind, fbaSourceRunId = null, fbaFetchedAt = null, fbaLatestRowCount = null;
+  let liveStaleReason = null;
+  if (fbaSource === 'live') {
+    fbaSourceKind = 'live';
+    const lm = db.prepare('SELECT source_run_id AS run, MAX(fetched_at) AS fetched, COUNT(*) AS cnt FROM fba_restock_live').get() || {};
+    fbaLatestRowCount = lm.cnt || 0;
+    fbaFetchedAt = lm.fetched || null;
+    fbaSourceRunId = lm.run || null;
+    fbaBizDate = fbaFetchedAt ? jstDateOf(fbaFetchedAt) : null;
+    if (fbaLatestRowCount > 0 && fbaFetchedAt) {
+      const ageMin = (Date.now() - Date.parse(fbaFetchedAt)) / 60000;
+      if (ageMin > LIVE_MAX_AGE_MIN) liveStaleReason = `live FBA ${Math.round(ageMin)}分前(>${LIVE_MAX_AGE_MIN}分)`;
+    }
+  } else {
+    fbaSourceKind = 'daily';
+    fbaBizDate = db.prepare("SELECT MAX(business_date) AS v FROM inv_daily_detail WHERE category = 'fba_warehouse'").get()?.v || null;
+  }
 
   // ─── ne_fba_overlap (DQ ゲート: 本集計と同条件) ───
   let overlap = 0;
@@ -83,7 +111,8 @@ export async function buildProductManagementSnapshot() {
   const reasons = [];
   let status = 'ok';
   if (velCount === 0) { status = 'failed'; reasons.push('velocity空'); }
-  if (!fbaBizDate) { status = 'failed'; reasons.push('FBA在庫日付なし'); }
+  if (!fbaBizDate) { status = 'failed'; reasons.push(fbaSource === 'live' ? 'live FBA空' : 'FBA在庫日付なし'); }
+  if (liveStaleReason) { status = 'failed'; reasons.push(liveStaleReason); }
   if (overlap > 0) { status = 'failed'; reasons.push(`ne_fba_overlap=${overlap}`); }
   if (velLag != null && velLag > VELOCITY_MAX_LAG_DAYS) { status = 'failed'; reasons.push(`velocity ${velLag}日遅延`); }
   if (status !== 'failed' && fbaLag != null && fbaLag > FBA_MAX_LAG_DAYS) { status = 'partial'; reasons.push(`FBA在庫 ${fbaLag}日遅延`); }
@@ -91,10 +120,26 @@ export async function buildProductManagementSnapshot() {
   // ─── 行構築 (m_products 起点 left join) ───
   // FBA在庫数 = FBA倉庫内(fba_warehouse) + 入荷待ち(fba_inbound)。中原さん要望(2026-06)。
   //   fba_warehouse = available+fc_transfer+fc_processing+customer_order、fba_inbound = inbound_working+shipped+received。
-  const fbaSub = fbaBizDate
+  // live: fba_restock_live を v_sku_resolved で展開 (master) + m_products直接一致 (direct fallback)。
+  //   snapshot-inventory-aggregate.js の解決ロジック(master + direct)と同一。SUMは倉庫7列の合算×構成数。
+  const liveFbaSum = '(l.fba_available + l.fba_fc_transfer + l.fba_fc_processing + l.fba_customer_order + l.fba_inbound_working + l.fba_inbound_shipped + l.fba_inbound_received)';
+  const liveFbaSub = `LEFT JOIN (
+      SELECT ne_code, SUM(q) AS qty FROM (
+        SELECT r.ne_code AS ne_code, ${liveFbaSum} * COALESCE(r.数量, 1) AS q
+          FROM fba_restock_live l
+          JOIN v_sku_resolved r ON r.seller_sku = l.amazon_sku COLLATE NOCASE
+        UNION ALL
+        SELECT l.amazon_sku AS ne_code, ${liveFbaSum} AS q
+          FROM fba_restock_live l
+          WHERE LOWER(l.amazon_sku) NOT IN (SELECT LOWER(seller_sku) FROM v_sku_resolved)
+            AND EXISTS (SELECT 1 FROM m_products mp WHERE mp.商品コード = l.amazon_sku COLLATE NOCASE)
+      ) GROUP BY ne_code
+    ) fba ON m.商品コード = fba.ne_code COLLATE NOCASE`;
+  const dailyFbaSub = fbaBizDate
     ? `LEFT JOIN (SELECT ne_code, SUM(qty) AS qty FROM inv_daily_detail WHERE category IN ('fba_warehouse','fba_inbound') AND business_date = ? GROUP BY ne_code) fba ON m.商品コード = fba.ne_code COLLATE NOCASE`
     : `LEFT JOIN (SELECT NULL AS ne_code, 0 AS qty) fba ON 1=0`;
-  const params = fbaBizDate ? [fbaBizDate] : [];
+  const fbaSub = fbaSource === 'live' ? liveFbaSub : dailyFbaSub;
+  const params = (fbaSource === 'live' || !fbaBizDate) ? [] : [fbaBizDate];
   const srcRows = db.prepare(`
     SELECT
       m.商品コード, m.商品名, m.取扱区分, m.商品区分, m.売上分類,
@@ -145,14 +190,16 @@ export async function buildProductManagementSnapshot() {
   const insMeta = db.prepare(`INSERT INTO product_management_snapshot_meta
     (run_id, as_of_date, generated_at, status, row_count, payload_checksum,
      src_ne_products_synced_at, src_velocity_as_of, src_fba_business_date, src_reorder_updated_at,
-     fba_unmapped_qty, ne_fba_overlap, notes)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+     fba_unmapped_qty, ne_fba_overlap, notes,
+     fba_source_kind, fba_source_run_id, fba_fetched_at, fba_latest_row_count)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
   const insRow = db.prepare(`INSERT INTO product_management_snapshot_rows
     (run_id, ${COLUMNS.join(', ')}) VALUES (?, ${COLUMNS.map(() => '?').join(', ')})`);
 
   const tx = db.transaction(() => {
     insMeta.run(runId, velAsOf, generatedAt, status, rows.length, checksum,
-      neSynced, velAsOf, fbaBizDate, reorderUpdated, null, overlap, reasons.join('; ') || null);
+      neSynced, velAsOf, fbaBizDate, reorderUpdated, null, overlap, reasons.join('; ') || null,
+      fbaSourceKind, fbaSourceRunId, fbaFetchedAt, fbaLatestRowCount);
     for (const row of rows) insRow.run(runId, ...COLUMNS.map(c => row[c]));
 
     // published 切替 (failed 以外)
@@ -174,15 +221,35 @@ export async function buildProductManagementSnapshot() {
   tx();
   try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch {}
 
-  console.log(`[pml-snapshot] ${status} run=${runId} rows=${rows.length} as_of=${velAsOf} fba=${fbaBizDate} overlap=${overlap}${reasons.length ? ' | ' + reasons.join('; ') : ''}`);
-  return { ok: status !== 'failed', run_id: runId, status, row_count: rows.length, checksum, as_of: velAsOf, ne_fba_overlap: overlap, reasons };
+  console.log(`[pml-snapshot] ${status} run=${runId} rows=${rows.length} as_of=${velAsOf} fba=${fbaBizDate}(${fbaSourceKind}${fbaFetchedAt ? ' @' + fbaFetchedAt : ''}) overlap=${overlap}${reasons.length ? ' | ' + reasons.join('; ') : ''}`);
+  return {
+    ok: status !== 'failed', run_id: runId, status, row_count: rows.length, checksum, as_of: velAsOf,
+    ne_fba_overlap: overlap, reasons,
+    fba_source_kind: fbaSourceKind, fba_source_run_id: fbaSourceRunId, fba_fetched_at: fbaFetchedAt, fba_latest_row_count: fbaLatestRowCount,
+  };
 }
 
 // ─── 単体実行 ───
 const isMain = process.argv[1]?.includes('build-product-management-snapshot');
 if (isMain) {
   await initDB();
-  const r = await buildProductManagementSnapshot();
+  const fbaSource = process.argv.includes('--fba-source=live') ? 'live' : 'daily';
+  // CLI実行(daily-sync 子プロセス / 手動)のときだけ pml-pipeline lock を取得し、
+  // オンデマンドFBA更新(fba-service.js が pml-pipeline 保持中に関数として build を呼ぶ)と排他する。
+  // ※ 関数呼び出し経路(オンデマンド)はロックを取らない=自己デッドロックしない。
+  const { acquireLock, releaseLock } = await import('./job-locks.js');
+  const db = getDB();
+  const lock = acquireLock(db, 'pml-pipeline', { ttlMs: 40 * 60 * 1000 });
+  if (!lock) {
+    console.error('[pml-snapshot] pml-pipeline lock 取得失敗 (別の更新/同期が実行中)。今回はスキップ (retry対象)。');
+    process.exit(75); // EX_TEMPFAIL
+  }
+  let r;
+  try {
+    r = await buildProductManagementSnapshot({ fbaSource });
+  } finally {
+    releaseLock(db, lock);
+  }
   console.log('\n結果:', JSON.stringify(r, null, 2));
   process.exit(r.status === 'failed' ? 1 : 0);
 }

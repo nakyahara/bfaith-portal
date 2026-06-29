@@ -605,6 +605,28 @@ function createTables() {
   // 既存テーブルへの列追加 (売上分類=商品管理リストの「商品区分 1自社/2AMC/3仕入」)
   addColumnIfMissing('product_management_snapshot_rows', '売上分類', 'INTEGER');
 
+  // 商品管理リスト オンデマンドFBA更新 (Part2): RESTOCK ライブ在庫 (warehouse.db 内、全件入替)
+  //   build --fba-source=live がこの表を v_sku_resolved で展開して FBA在庫数を算出する。
+  //   daily_snapshots(日次の不変スナップショット)は触らず、ライブ取得はこの1表だけに入れる。
+  //   全行が同一 source_run_id / fetched_at を持つ (取得ジョブが1トランザクションで全件置換)。
+  db.exec(`CREATE TABLE IF NOT EXISTS fba_restock_live (
+    amazon_sku            TEXT PRIMARY KEY,
+    fba_available         INTEGER DEFAULT 0,
+    fba_fc_transfer       INTEGER DEFAULT 0,
+    fba_fc_processing     INTEGER DEFAULT 0,
+    fba_customer_order    INTEGER DEFAULT 0,
+    fba_inbound_working   INTEGER DEFAULT 0,
+    fba_inbound_shipped   INTEGER DEFAULT 0,
+    fba_inbound_received  INTEGER DEFAULT 0,
+    source_run_id         TEXT NOT NULL,
+    fetched_at            TEXT NOT NULL
+  )`);
+  // PMLスナップショットの「FBA値の鮮度」メタ (daily=朝の日次 / live=オンデマンドRESTOCK)
+  addColumnIfMissing('product_management_snapshot_meta', 'fba_source_kind', 'TEXT');        // 'daily' | 'live'
+  addColumnIfMissing('product_management_snapshot_meta', 'fba_source_run_id', 'TEXT');      // live時: RESTOCK取得run_id
+  addColumnIfMissing('product_management_snapshot_meta', 'fba_fetched_at', 'TEXT');         // live時: SP-API取得時刻
+  addColumnIfMissing('product_management_snapshot_meta', 'fba_latest_row_count', 'INTEGER');// live時: 取得SKU件数
+
   // ─── 統合商品マスタ系 ───
 
   // 13. m_products（統合商品マスタ）
