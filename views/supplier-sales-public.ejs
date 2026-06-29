@@ -60,6 +60,24 @@
     table.matrix tr.prod-top td.l { background:#fff; }
     /* ネストした出品内訳サブ表の見出しは固定しない */
     .scroll table.sub-tbl thead th { position:static; }
+    /* レスポンシブ: スマホでは速報マトリクスをカード表示に切替 */
+    .only-mobile { display:none; }
+    .sokuho-cards .scard { background:#fff; border:1px solid var(--line); border-radius:10px; padding:10px 12px; margin-bottom:10px; }
+    .sokuho-cards .scard-name { font-weight:700; font-size:13px; margin-bottom:4px; }
+    .sokuho-cards .scard-tot { font-size:13px; margin-bottom:6px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:6px; padding:4px 8px; display:inline-block; }
+    .sokuho-cards table.scard-malls { width:100%; font-size:12px; border:1px solid var(--line); border-radius:8px; }
+    .sokuho-cards .scard-malls th, .sokuho-cards .scard-malls td { border-bottom:1px solid #eef2f7; padding:5px 8px; }
+    .sokuho-cards .scard-malls th { background:#f1f5f9; }
+    @media (max-width:640px) {
+      .wrap { padding:14px 10px 48px; }
+      .only-desktop { display:none !important; }
+      .only-mobile { display:block; }
+      .hd h1 { font-size:16px; }
+      .cards .card { flex:1 1 45%; padding:9px 10px; }
+      .card .v { font-size:18px; }
+      .toolbar { gap:8px; }
+      .seg a { padding:6px 12px; }
+    }
     @media (max-width:640px){ .hd h1{font-size:17px;} .card .v{font-size:18px;} }
   </style>
 </head>
@@ -110,7 +128,8 @@
            const hasOther = sokuhoProducts.some(p => (p.sokuhoMalls || []).some(m => m.key === 'other' && (m.q7 || m.q30)));
            if (hasOther) mallCols.push({ key: 'other', label: 'その他' });
       %>
-      <div class="scroll">
+      <!-- デスクトップ: マトリクス表 -->
+      <div class="scroll only-desktop">
       <table class="matrix">
         <thead>
           <tr>
@@ -136,6 +155,23 @@
           <% }) %>
         </tbody>
       </table>
+      </div>
+      <!-- スマホ: 商品ごとのカード -->
+      <div class="sokuho-cards only-mobile">
+        <% sokuhoProducts.forEach(p => { const ms = [...(p.sokuhoMalls || [])].sort((a,b)=>a.order-b.order); %>
+          <div class="scard">
+            <div class="scard-name"><%= p.product_name || '(商品名なし)' %> <span class="code"><%= p.ne_code %></span></div>
+            <div class="scard-tot">直近7日 <b><%= num(p.sokuho7) %></b>　/　直近30日 <b><%= num(p.sokuho30) %></b></div>
+            <% if (ms.length) { %>
+            <table class="scard-malls">
+              <thead><tr><th class="l">モール</th><th>7日</th><th>30日</th></tr></thead>
+              <tbody>
+                <% ms.forEach(m => { %><tr><td class="l"><%= m.label %></td><td><%= num(m.q7) %></td><td><%= num(m.q30) %></td></tr><% }) %>
+              </tbody>
+            </table>
+            <% } %>
+          </div>
+        <% }) %>
       </div>
       <% } %>
       <div class="note">
