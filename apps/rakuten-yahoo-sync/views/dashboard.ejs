@@ -201,6 +201,8 @@
         <li>
           <strong><%= summary.fixable %> 商品</strong> が Notion 修正待ち
           <a href="?filter=fixable" class="btn btn-sm btn-outline-warning ms-2">修正リストを見る</a>
+          <%# Phase E-17: カテゴリ未設定を genre 単位で一括紐付けする専用画面 %>
+          <a href="/apps/rakuten-yahoo-sync/category-binding" class="btn btn-sm btn-outline-primary ms-2" title="カテゴリ未設定の楽天genreに Yahoo数字ID + path を1回割り当てると、 そのgenreの商品が全部「出せる」に動きます">🏷️ カテゴリ紐付け画面</a>
           <% if (summary.fixable > 0 && Object.keys(fixableByCategory).length > 0) { %>
             <div class="mt-2">
               <% for (const cat of Object.keys(fixableByCategory).sort((a, b) => fixableByCategory[b] - fixableByCategory[a])) { %>

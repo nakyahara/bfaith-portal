@@ -486,6 +486,11 @@ router.get('/', (req, res) => {
   });
 });
 
+// Phase E-17: 楽天genre → Yahooカテゴリ 紐付け画面
+router.get('/category-binding', (_req, res) => {
+  renderView(res, 'category-binding', {});
+});
+
 // ───────────────── API ─────────────────
 
 router.get('/api/health', (_req, res) => {
