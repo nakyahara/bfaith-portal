@@ -7,7 +7,7 @@
  * ソース (m_products 起点・全件 left join):
  *   m_products              … 商品名/商品区分/取扱区分/標準売価/原価/送料/仕入先
  *   raw_ne_products         … 自社在庫/引当/発注残(注残)/最終仕入日/発注ロット/代表コード/ロケーション/分類タグ/作成日(登録日)
- *   inv_daily_detail        … FBA在庫 (category='fba_warehouse'、最新 business_date)
+ *   inv_daily_detail        … FBA在庫数 = fba_warehouse + fba_inbound(入荷待ち) (最新 business_date)
  *   f_sales_velocity_by_product … 7日/30日 × FBA/FBA以外 販売数 (③)
  *   m_reorder_setting       … 推奨保有月数 (②)
  *
@@ -89,8 +89,10 @@ export async function buildProductManagementSnapshot() {
   if (status !== 'failed' && fbaLag != null && fbaLag > FBA_MAX_LAG_DAYS) { status = 'partial'; reasons.push(`FBA在庫 ${fbaLag}日遅延`); }
 
   // ─── 行構築 (m_products 起点 left join) ───
+  // FBA在庫数 = FBA倉庫内(fba_warehouse) + 入荷待ち(fba_inbound)。中原さん要望(2026-06)。
+  //   fba_warehouse = available+fc_transfer+fc_processing+customer_order、fba_inbound = inbound_working+shipped+received。
   const fbaSub = fbaBizDate
-    ? `LEFT JOIN (SELECT ne_code, SUM(qty) AS qty FROM inv_daily_detail WHERE category='fba_warehouse' AND business_date = ? GROUP BY ne_code) fba ON m.商品コード = fba.ne_code COLLATE NOCASE`
+    ? `LEFT JOIN (SELECT ne_code, SUM(qty) AS qty FROM inv_daily_detail WHERE category IN ('fba_warehouse','fba_inbound') AND business_date = ? GROUP BY ne_code) fba ON m.商品コード = fba.ne_code COLLATE NOCASE`
     : `LEFT JOIN (SELECT NULL AS ne_code, 0 AS qty) fba ON 1=0`;
   const params = fbaBizDate ? [fbaBizDate] : [];
   const srcRows = db.prepare(`
