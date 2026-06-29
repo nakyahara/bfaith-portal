@@ -331,7 +331,8 @@ const SOKUHO_MALL_LABELS = {
   linegift: 'LINEギフト', amazon_fba: 'Amazon FBA', amazon_fbm: 'Amazon FBM',
 };
 const SOKUHO_EXCLUDE = new Set(['wholesale']);
-const SOKUHO_MALL_ORDER = ['rakuten', 'yahoo', 'aupay', 'qoo10', 'mercari', 'linegift', 'amazon_fba', 'amazon_fbm', 'other'];
+// 表示順（中原さん指定）: Amazon(FBA→FBM) → 楽天 → Yahoo! → au PAY → Qoo10 → メルカリ → LINEギフト → その他
+const SOKUHO_MALL_ORDER = ['amazon_fba', 'amazon_fbm', 'rakuten', 'yahoo', 'aupay', 'qoo10', 'mercari', 'linegift', 'other'];
 
 // 速報モール別マトリクスの「常時表示する固定列」（売上0でも列を出す＝au PAY等が消えない）。
 // 'other'(その他) は固定列に含めず、実データがある時だけ末尾に追加する（views 側で処理）。

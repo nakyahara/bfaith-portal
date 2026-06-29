@@ -42,8 +42,10 @@
     .tabbtn { border:none; background:none; padding:9px 18px; font-size:14px; font-weight:700; color:var(--muted); cursor:pointer; border-bottom:3px solid transparent; margin-bottom:-2px; }
     .tabbtn.on { color:var(--accent); border-bottom-color:var(--accent); }
     .tabpanel { display:none; }
-    table.matrix td, table.matrix th { white-space:nowrap; }
-    table.matrix td.l { vertical-align:top; }
+    table.matrix td, table.matrix th { white-space:nowrap; padding:6px 7px; font-size:12px; }
+    /* 商品名は狭く・折り返し可（横スクロールせず全モール列が収まるように） */
+    table.matrix td.l, table.matrix th.l { width:200px; max-width:200px; white-space:normal; word-break:break-word; vertical-align:top; }
+    table.matrix .name { font-size:12px; line-height:1.35; }
     table.matrix tr.prod-top td { border-top:2px solid #cbd5e1; }
     table.matrix td.per { color:var(--muted); font-size:12px; text-align:center; }
     table.matrix td.tot { font-weight:700; }
@@ -93,7 +95,7 @@
 
     <!-- ===== 速報タブ ===== -->
     <section class="tabpanel" data-panel="sokuho">
-      <div class="period">速報（注文ベース）: <%= hasSokuho ? sokuho.asOf + ' 朝時点' : '準備中' %>　／　全モール（楽天・Yahoo!・Amazon FBA/FBM ほか）</div>
+      <div class="period">速報（注文ベース）: <%= hasSokuho ? sokuho.asOf + ' 朝時点' : '準備中' %>　／　全モール（Amazon FBA/FBM・楽天・Yahoo! ほか）</div>
       <div class="cards">
         <div class="card"><div class="k">対象商品数</div><div class="v"><%= sokuhoProducts.length.toLocaleString('ja-JP') %><small> 点</small></div></div>
         <div class="card"><div class="k">直近7日 販売数</div><div class="v"><%= num(totals.sokuho7) %><small> 個</small></div></div>
