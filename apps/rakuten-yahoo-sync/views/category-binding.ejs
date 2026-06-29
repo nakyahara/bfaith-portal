@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>カテゴリ紐付け | Yahoo商品移行</title>
+  <link rel="icon" type="image/png" href="/favicon.png"><link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+  <style>
+    body { background: #f5f5f7; }
+    .genre-card { background:#fff; border:1px solid #e3e3e6; border-radius:.6em; padding:1em 1.2em; margin-bottom:1em; }
+    .genre-card.done { opacity:.5; background:#f0fff2; }
+    .rk-cat { color:#0a58ca; font-weight:600; }
+    .rk-path { color:#666; font-size:.85em; }
+    .sample { color:#444; font-size:.85em; margin:.3em 0; }
+    .count-badge { background:#fff3cd; color:#8a6d3b; border:1px solid #ffe69c; padding:.15em .6em; border-radius:.5em; font-weight:600; font-size:.85em; }
+    .has-id { background:#d1ecf1; color:#0c5460; border:1px solid #bee5eb; padding:.1em .5em; border-radius:.4em; font-size:.8em; }
+  </style>
+</head>
+<body>
+  <nav class="navbar navbar-dark bg-primary mb-3">
+    <div class="container-fluid">
+      <span class="navbar-brand">🏷️ 楽天genre → Yahooカテゴリ 紐付け</span>
+      <a href="/apps/rakuten-yahoo-sync/" class="btn btn-sm btn-outline-light">← 商品移行に戻る</a>
+    </div>
+  </nav>
+
+  <div class="container-fluid" style="max-width:1100px;">
+    <div class="alert alert-info">
+      未解決の楽天genreに <strong>Yahooの数字ID</strong>(管理画面で見える番号)と <strong>path</strong>(店の棚)を1回だけ割り当てると、
+      その genre の商品が全部「出せる」に動きます。 一度入れた path は対応表に残り、 同じIDの genre では自動で入ります。
+      <br>「<span class="has-id">ID済</span>」 が付いてる genre は、 数字IDは既にあるので <strong>path だけ</strong>入れればOKです。
+    </div>
+
+    <div id="summary" class="mb-3 text-muted">読み込み中...</div>
+    <div id="list"></div>
+  </div>
+
+  <script>
+    const API = '/apps/rakuten-yahoo-sync/api/yahoo-category';
+    const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+    async function load() {
+      const res = await fetch(API + '/unresolved-genres');
+      const j = await res.json();
+      if (j.status !== 'ok') { document.getElementById('summary').textContent = '読み込み失敗: ' + (j.error || ''); return; }
+      document.getElementById('summary').innerHTML =
+        '未解決 <strong>' + j.totalGenres + '</strong> genre / <strong>' + j.totalItems + '</strong> 商品。 多い順。';
+      const list = document.getElementById('list');
+      list.innerHTML = '';
+      for (const g of j.genres) {
+        list.appendChild(renderGenre(g));
+      }
+    }
+
+    function renderGenre(g) {
+      const div = document.createElement('div');
+      div.className = 'genre-card';
+      div.dataset.genreId = g.genreId;
+      const idBadge = g.existingCategoryId ? ' <span class="has-id">ID済</span>' : '';
+      const rkCat = g.rakutenGenreName ? '<span class="rk-cat">' + esc(g.rakutenGenreName) + '</span>' : '<span class="text-muted">(楽天カテゴリ名 不明)</span>';
+      const rkPath = g.rakutenGenrePath ? '<div class="rk-path">楽天: ' + esc(g.rakutenGenrePath) + '</div>' : '';
+      const samples = (g.sampleTitles || []).slice(0,2).map((t) => '<div class="sample">・' + esc(t.slice(0,60)) + (t.length>60?'…':'') + '</div>').join('');
+      div.innerHTML =
+        '<div class="d-flex justify-content-between align-items-start">' +
+          '<div style="flex:1;">' +
+            '<div>' + rkCat + idBadge + ' <span class="count-badge">' + g.count + '商品</span> <span class="text-muted small">genre ' + esc(g.genreId) + '</span></div>' +
+            rkPath + samples +
+          '</div>' +
+        '</div>' +
+        '<div class="row g-2 mt-2 align-items-center">' +
+          '<div class="col-auto"><label class="small text-muted">Yahoo数字ID</label>' +
+            '<input type="text" inputmode="numeric" class="form-control form-control-sm js-cat" style="width:140px;" value="' + (g.existingCategoryId || '') + '" placeholder="例 43494"></div>' +
+          '<div class="col"><label class="small text-muted">path (店の棚)</label>' +
+            '<input type="text" class="form-control form-control-sm js-path" value="' + esc(g.existingPath || '') + '" placeholder="例 生活雑貨・日用品:掃除用品"></div>' +
+          '<div class="col-auto pt-3"><button class="btn btn-sm btn-success js-save">保存</button></div>' +
+          '<div class="col-auto pt-3"><span class="js-msg small"></span></div>' +
+        '</div>';
+      div.querySelector('.js-save').addEventListener('click', () => saveGenre(div, g));
+      return div;
+    }
+
+    async function saveGenre(div, g) {
+      const cat = div.querySelector('.js-cat').value.trim();
+      const path = div.querySelector('.js-path').value.trim();
+      const msg = div.querySelector('.js-msg');
+      const btn = div.querySelector('.js-save');
+      if (!/^[1-9]\d*$/.test(cat)) { msg.textContent = '数字IDを入れてください'; msg.className = 'js-msg small text-danger'; return; }
+      btn.disabled = true; msg.textContent = '保存中...'; msg.className = 'js-msg small text-muted';
+      try {
+        const res = await fetch(API + '/bind', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ genreId: g.genreId, yahooCategoryId: Number(cat), yahooPath: path || undefined }),
+        });
+        const j = await res.json();
+        if (j.status !== 'ok') { msg.textContent = '失敗: ' + (j.error || res.status); msg.className = 'js-msg small text-danger'; btn.disabled = false; return; }
+        msg.textContent = '✅ 保存しました (' + g.count + '商品が「出せる」に)';
+        msg.className = 'js-msg small text-success';
+        div.classList.add('done');
+      } catch (e) {
+        msg.textContent = 'エラー: ' + e.message; msg.className = 'js-msg small text-danger'; btn.disabled = false;
+      }
+    }
+
+    load();
+  </script>
+</body>
+</html>
