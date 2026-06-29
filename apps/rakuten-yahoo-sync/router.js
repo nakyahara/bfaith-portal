@@ -875,17 +875,19 @@ router.get('/api/yahoo-category/unresolved-genres', (_req, res) => {
     // Codex High: 列/テーブル未適用環境では prepare 自体が throw する → prepare を try で包み、
     //   作れなければ該当補完だけ null にして endpoint 全体は 500 にしない (resolver と同じ fail-soft)。
     const prep = (sql) => { try { return db.prepare(sql); } catch (_) { return null; } };
-    const genrePathStmt = prep(`
-      SELECT rakuten_genre_path FROM migration_candidates
-      WHERE rakuten_genre_id = ? AND rakuten_genre_path IS NOT NULL AND rakuten_genre_path <> ''
-      LIMIT 1
-    `);
+    // 楽天カテゴリ名/階層は rakuten_genre (migration 016 で 3551 genre seed済) が正。
+    //   中原さんが「何のカテゴリか」 を一目で判断でき、 「店カテゴリ=楽天カテゴリ」 運用の path 素にもなる。
+    const genreNameStmt = prep(`SELECT name_ja, path_ja FROM rakuten_genre WHERE genre_id = ?`);
     const manualCatStmt = prep(`SELECT yahoo_category_id, yahoo_path FROM category_manual WHERE rakuten_genre_id = ?`);
     const decisionsCatStmt = prep(`SELECT yahoo_category_id, yahoo_path FROM category_decisions WHERE rakuten_genre_id = ? AND locked = 1 AND ambiguous = 0`);
 
     const genres = [...byGenre.values()].map((e) => {
-      let rakutenGenrePath = null;
-      try { rakutenGenrePath = genrePathStmt?.get(e.genreId)?.rakuten_genre_path ?? null; } catch (_) {}
+      let rakutenGenreName = null;   // 例「潤滑油・サビ止めオイル」
+      let rakutenGenrePath = null;   // 例「花・ガーデン・DIY > DIY・工具 > ... > 潤滑油・サビ止めオイル」
+      try {
+        const g = genreNameStmt?.get(e.genreId);
+        if (g) { rakutenGenreName = g.name_ja ?? null; rakutenGenrePath = g.path_ja ?? null; }
+      } catch (_) {}
       // 既に yahoo_category_id を持ってるか (manual_path_missing = ID有/path無)
       let existingCategoryId = null;
       let existingPath = null;
@@ -898,7 +900,8 @@ router.get('/api/yahoo-category/unresolved-genres', (_req, res) => {
         count: e.count,
         sampleTitles: e.sampleTitles,
         itemCodes: e.itemCodes,
-        rakutenGenrePath,        // 楽天カテゴリ名 (= 店の棚 path の素、 中原さん運用で一致)
+        rakutenGenreName,        // 楽天カテゴリ名 (何のカテゴリか一目で分かる)
+        rakutenGenrePath,        // 楽天カテゴリ階層 (= 店の棚 path の素、 中原さん運用で一致)
         existingCategoryId,      // 既にあれば path だけ足りない (manual_path_missing)
         existingPath,
       };
@@ -910,6 +913,68 @@ router.get('/api/yahoo-category/unresolved-genres', (_req, res) => {
       totalItems: targets.length,
       genres,
     });
+  } catch (e) {
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+/**
+ * Phase E-17: 楽天genre ↔ Yahooカテゴリ の紐付けを保存 (中原さんが画面で1回バインド)。
+ *
+ *   body: {
+ *     genreId: string            // 楽天 genre_id
+ *     yahooCategoryId: number     // Yahoo 商品カテゴリの数値ID (中原さんが管理画面で見た値)
+ *     yahooPath?: string          // 店の棚パス (省略時は既存 category_default_path を維持)
+ *   }
+ *   - category_manual に (genre → yahoo_category_id, yahoo_path) を upsert (source='dashboard_input')
+ *   - yahooPath があれば category_default_path に (yahoo_category_id → path) も upsert
+ *     → ID↔path 対応表が育ち、 次から同じIDの genre は path 自動
+ *   - 1 transaction、 監査ログ
+ */
+router.post('/api/yahoo-category/bind', (req, res) => {
+  try {
+    const db = getDB();
+    const body = req.body || {};
+    const genreId = typeof body.genreId === 'string' ? body.genreId.trim() : '';
+    const yahooPath = typeof body.yahooPath === 'string' ? body.yahooPath.trim() : '';
+
+    if (!genreId) return res.status(400).json({ status: 'fail', error: 'genreId required' });
+    // Codex High: parseInt は "123abc" / 1.9 を通すので、 厳密に正整数だけ受ける。
+    const rawCat = body.yahooCategoryId;
+    let yahooCategoryId = null;
+    if (Number.isInteger(rawCat) && rawCat > 0) {
+      yahooCategoryId = rawCat;
+    } else if (typeof rawCat === 'string' && /^[1-9]\d*$/.test(rawCat.trim())) {
+      yahooCategoryId = parseInt(rawCat.trim(), 10);
+    }
+    if (yahooCategoryId == null) {
+      return res.status(400).json({ status: 'fail', error: 'yahooCategoryId must be a positive integer' });
+    }
+
+    const tx = db.transaction(() => {
+      db.prepare(`
+        INSERT INTO category_manual (rakuten_genre_id, yahoo_category_id, yahoo_path, source, updated_at)
+        VALUES (@genreId, @cat, @path, 'dashboard_input', strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        ON CONFLICT(rakuten_genre_id) DO UPDATE SET
+          yahoo_category_id = excluded.yahoo_category_id,
+          yahoo_path        = COALESCE(NULLIF(excluded.yahoo_path, ''), category_manual.yahoo_path),
+          source            = 'dashboard_input',
+          updated_at        = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      `).run({ genreId, cat: yahooCategoryId, path: yahooPath || null });
+
+      // path があれば ID→path 対応表 (default_path) も育てる
+      if (yahooPath) {
+        db.prepare(`
+          INSERT INTO category_default_path (yahoo_category_id, yahoo_path)
+          VALUES (?, ?)
+          ON CONFLICT(yahoo_category_id) DO UPDATE SET yahoo_path = excluded.yahoo_path
+        `).run(yahooCategoryId, yahooPath);
+      }
+    });
+    tx();
+
+    audit(db, 'yahoo_category_bind', { genreId, yahooCategoryId, hasPath: !!yahooPath });
+    return res.json({ status: 'ok', genreId, yahooCategoryId, path: yahooPath || null });
   } catch (e) {
     return res.status(500).json({ status: 'fail', error: e.message });
   }
