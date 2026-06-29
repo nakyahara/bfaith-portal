@@ -54,6 +54,7 @@ import {
 import { filterUploadableImageUrlsDetailed } from './lib/yahoo-image.js';
 import { backfillRakutenTitles, countMissingRakutenTitles, backfillRakutenGenre, countMissingRakutenGenre } from './lib/rakuten-title-backfill.js';
 import { repairMissingCategoryPaths, countMissingCategoryPaths } from './services/category-path-repair.js';
+import { fetchYahooItemDetailsBulk } from './lib/yahoo-detail-proxy.js';
 import {
   countMissingYahooCategories,
   backfillYahooCategoriesAndPaths,
@@ -1444,6 +1445,65 @@ router.post('/api/yahoo-category/repair-paths', async (req, res) => {
     try { remaining = countMissingCategoryPaths(db); } catch (_) { /* テーブル未整備 */ }
     if (!dryRun) audit(db, 'yahoo_category_repair_paths', { ...r, remaining });
     return res.json({ status: 'ok', dryRun, ...r, remaining });
+  } catch (e) {
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+// ───────────────── Phase E-17: 既存Yahoo出品からカテゴリ実取得 probe ─────────────────
+
+/**
+ * Phase E-17: 既存 Yahoo 出品の ItemCode を Yahoo getItem (vps-proxy /yahoo/get-item-detail) に通して、
+ *   実際の ProductCategory(数値=editItemのproduct_category) + Path を取得して返す read-only probe。
+ *
+ *   目的: 「カテゴリデータを実際に取れるか」 を検証 + 中原さんが過去に手作業設定した実カテゴリ値を可視化。
+ *   これが取れれば Track① (既存出品逆引きでgenre↔カテゴリ自動構築) の土台が確定する。
+ *
+ *   body: {
+ *     itemCodes?: string[]   // 既存 Yahoo の ItemCode を直接指定 (中原さんが数件貼る)
+ *     limit?: number         // 省略時 yahoo_registered_items から自動 pick (default 10, max 30)
+ *   }
+ *   副作用なし。 DB 書き込みしない (純粋に Yahoo から取得して見せるだけ)。
+ */
+router.post('/api/yahoo-category/probe-detail', async (req, res) => {
+  try {
+    const db = getDB();
+    const body = req.body || {};
+    // Codex High: 1件20s timeout × chunk逐次 → Render ~100s 制約。 数件見れれば検証十分なので
+    //   default 5 / max 10 / concurrency 5 (最悪 2chunk × 20s = 40s) に抑える。
+    const limit = Number.isInteger(body.limit) && body.limit > 0 && body.limit <= 10 ? body.limit : 5;
+
+    let codes = Array.isArray(body.itemCodes)
+      ? body.itemCodes.map((c) => String(c).trim()).filter(Boolean)
+      : [];
+    let source = 'body';
+    if (codes.length === 0) {
+      // yahoo_registered_items (myItemList で観測した既存 Yahoo 出品) から自動 pick
+      try {
+        codes = db.prepare(`
+          SELECT yahoo_item_code FROM yahoo_registered_items
+          WHERE yahoo_item_code IS NOT NULL AND yahoo_item_code <> ''
+          ORDER BY last_seen_at DESC
+          LIMIT ?
+        `).all(limit).map((r) => r.yahoo_item_code);
+        source = 'yahoo_registered_items';
+      } catch (_) { /* テーブル未整備 */ }
+    }
+    if (codes.length === 0) {
+      return res.json({
+        status: 'ok', source, requested: 0, items: [], failed: [],
+        note: 'ItemCode が無い (yahoo_registered_items 空 or 未取得)。 body.itemCodes に既存YahooのItemCodeを数件渡してください',
+      });
+    }
+
+    const r = await fetchYahooItemDetailsBulk(codes.slice(0, 10), { concurrency: 5 });
+    return res.json({
+      status: 'ok',
+      source,
+      requested: codes.length,
+      items: r.items || [],   // [{ ItemCode, ProductCategory, Path, Name }]
+      failed: r.failed || [],
+    });
   } catch (e) {
     return res.status(500).json({ status: 'fail', error: e.message });
   }
