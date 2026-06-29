@@ -20,6 +20,7 @@
  *   2) スクリプトプロパティ:
  *      ENDPOINT_URL   = https://<render>/apps/mirror/api/pml/published
  *      READ_TOKEN     = <Render env PML_READ_TOKEN と同じ値>
+ *      REFRESH_TOKEN  = <Render env PML_REFRESH_TOKEN と同じ値> (任意: 「今すぐ更新」メニュー用、未設定なら取り込みのみ)
  *      SPREADSHEET_ID = 15L_BU6WrXNX8aMblTs4yBqwkDFJOg0oDRKDTRHovLDE
  *      SHEET_NAME     = 商品管理リスト
  *      WRITE_MODE     = dry_run   (検証OKまで dry_run、その後 live)
@@ -49,6 +50,57 @@ var TARGETS = [
   { hdr: '商品区分',                 field: '売上分類', prefix: true, must: '自社' },
   { hdr: '推奨保有在庫',             field: '推奨保有月数' },
 ];
+
+// ─── スプレッドシートを開いたときにカスタムメニューを追加 (Part2 補助入口) ───
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('商品管理リスト')
+    .addItem('FBA在庫を今すぐ更新 → シート反映', 'refreshFbaAndWrite')
+    .addItem('シートに最新を反映 (取り込みのみ)', 'main')
+    .addToUi();
+}
+
+// ─── オンデマンドFBA更新 (Part2): miniPC で RESTOCK取得→build(live)→同期 を起動し、
+//     完了をポーリングしてからシートへ反映する。
+//     SP-API のレポート生成が非同期で数分かかるため、GAS の 6 分制限内 (最大 ~4.5 分) で待ち、
+//     終わらなければ「取り込みのみ」を後で実行するよう案内する (主入口は Render 管理画面)。
+function refreshFbaAndWrite() {
+  var ui = SpreadsheetApp.getUi();
+  var props = PropertiesService.getScriptProperties();
+  var endpoint = props.getProperty('ENDPOINT_URL');      // .../api/pml/published
+  var refreshToken = props.getProperty('REFRESH_TOKEN');  // = PML_REFRESH_TOKEN (更新トリガ専用、READ_TOKENとは別)
+  if (!endpoint || !refreshToken) { ui.alert('スクリプトプロパティ未設定 (ENDPOINT_URL / REFRESH_TOKEN)'); return; }
+  var base = endpoint.replace(/\/published\/?$/, ''); // → .../api/pml
+  var triggerUrl = base + '/refresh-fba';
+
+  // 1. 起動 (更新トリガ専用 token認証)
+  var resp = UrlFetchApp.fetch(triggerUrl, { method: 'post', muteHttpExceptions: true, headers: { 'x-refresh-token': refreshToken } });
+  if (resp.getResponseCode() >= 300) { ui.alert('起動失敗: HTTP ' + resp.getResponseCode() + '\n' + resp.getContentText().slice(0, 300)); return; }
+  var j = JSON.parse(resp.getContentText());
+  if (!j.jobId) { ui.alert((j.message || j.error || '実行中です') + '\n少し待って再実行してください。'); return; }
+
+  // 2. 完了ポーリング (最大 ~4.5 分。8 秒間隔)
+  var jobUrl = triggerUrl + '/jobs/' + encodeURIComponent(j.jobId);
+  var deadline = Date.now() + 4.5 * 60 * 1000;
+  var st = 'running';
+  while (Date.now() < deadline) {
+    Utilities.sleep(8000);
+    var jr = UrlFetchApp.fetch(jobUrl, { muteHttpExceptions: true, headers: { 'x-refresh-token': refreshToken } });
+    if (jr.getResponseCode() >= 300) continue;
+    var job = JSON.parse(jr.getContentText());
+    st = job.status;
+    if (st === 'completed') break;
+    if (st === 'failed') { ui.alert('FBA更新に失敗しました:\n' + (job.error || '(理由不明)')); return; }
+  }
+  if (st !== 'completed') {
+    ui.alert('FBA在庫の更新は継続中です（数分かかります）。\n完了後にメニュー「シートに最新を反映 (取り込みのみ)」を実行してください。\n※状況は Render 管理画面でも確認できます。');
+    return;
+  }
+
+  // 3. 反映 (既存の main をそのまま使う = 検証/fail-closed/部分上書きを再利用)
+  main();
+  ui.alert('✅ FBA在庫を最新化してシートに反映しました。');
+}
 
 function main() {
   var lock = LockService.getScriptLock();

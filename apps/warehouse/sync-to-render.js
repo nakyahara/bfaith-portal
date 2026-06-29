@@ -16,12 +16,14 @@ import { getDB } from './db.js';
 const RENDER_URL = process.env.RENDER_MIRROR_URL || 'https://bfaith-portal.onrender.com/apps/mirror';
 const SYNC_KEY = process.env.MIRROR_SYNC_KEY || '';
 
-// Phase 1a.1 (Issue #82) 完了: KEY 必須に揃える (Render 側 ALLOW_INSECURE 解除済)
-// 起動時に MIRROR_SYNC_KEY 未設定なら fail-fast (sync 全部 401 になるので)
-if (!SYNC_KEY) {
-  console.error('FATAL: MIRROR_SYNC_KEY env が未設定です。.env に追加してください。');
-  console.error('       (Phase 1a.1 で Render の ALLOW_INSECURE_MIRROR_SYNC は解除済、KEY なしでは sync 401)');
-  process.exit(2);
+// MIRROR_SYNC_KEY 必須 (Render 側 ALLOW_INSECURE 解除済、KEY なしでは sync 401)。
+// ※ モジュール先頭では process.exit しない: 本ファイルは WarehouseServer (fba-service の
+//   オンデマンドFBA更新) からも import されるため、import 時点で落とすとサーバごと停止する。
+//   実際に同期を行う関数の入口で fail-fast する。
+function requireSyncKey() {
+  if (!SYNC_KEY) {
+    throw new Error('MIRROR_SYNC_KEY env が未設定です (.env に追加してください)。KEY なしでは Render sync が 401 になります。');
+  }
 }
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK || 'https://chat.googleapis.com/v1/spaces/AAQAL5zHy-w/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=yER7IJx_9CkKhYnzzre0WcWuqfgXc1oh8ldR35k01zE';
 
@@ -94,6 +96,7 @@ export function buildStockSnapshotSyncParts(db, monthCutoff, chunkSize = 20000) 
 }
 
 export async function syncToRender() {
+  requireSyncKey();
   const db = getDB();
   const ts = now();
   console.log('[Sync→Render] 開始...');
@@ -578,12 +581,71 @@ export async function syncToRender() {
   }
 }
 
+// ─── pml-only 同期 (オンデマンドFBA更新 ④) ───
+// 公開中のPMLスナップショット(meta+rows)だけを送り、mirror で atomic swap させる。
+// 重い月次/日次/inv_daily_detail は送らない(数秒)。daily の full sync とは独立に走れる
+// (mirror 側は run 単位 atomic swap、他テーブルとは無関係)。FBA鮮度メタも一緒に送る。
+const PML_SYNC_COLS = [
+  '商品コード', '商品名', '仕入先', '取扱区分', '商品区分', '売上分類', '最終仕入日', '在庫保管日数',
+  '総在庫数', 'FBA在庫数', 'フリー在庫', '注残数', '引当数', '総在庫数_引当なし',
+  '販売数7日_FBA', '販売数7日_FBA以外', '販売数7日_合計',
+  '販売数30日_FBA', '販売数30日_FBA以外', '販売数30日_合計',
+  '発注ロット単位', '推奨保有月数', '売価', '原価', '想定見込み利益', '概算利益率',
+  '代表商品コード', 'ロケーションコード', '商品分類タグ', '登録日',
+];
+
+export async function syncPmlSnapshotOnly() {
+  requireSyncKey();
+  const db = getDB();
+  const pub = db.prepare('SELECT run_id FROM product_management_published WHERE id=1').get();
+  if (!pub) return { state: 'skipped', reason: 'published無し' };
+  const pmeta = db.prepare('SELECT * FROM product_management_snapshot_meta WHERE run_id=?').get(pub.run_id);
+  if (!pmeta || pmeta.status === 'failed') return { state: 'skipped', reason: `status=${pmeta?.status || 'none'}` };
+  const rows = db.prepare(`SELECT ${PML_SYNC_COLS.join(', ')} FROM product_management_snapshot_rows WHERE run_id=? ORDER BY 商品コード`).all(pmeta.run_id);
+
+  const headers = { 'Content-Type': 'application/json' };
+  if (SYNC_KEY) headers['x-sync-key'] = SYNC_KEY;
+
+  console.log(`[pml-only-sync] 送信: run=${pmeta.run_id} rows=${rows.length} fba=${pmeta.fba_source_kind || 'daily'}${pmeta.fba_fetched_at ? ' @' + pmeta.fba_fetched_at : ''}`);
+  const resp = await fetch(`${RENDER_URL}/api/sync`, {
+    method: 'POST', headers,
+    body: JSON.stringify({
+      pml_snapshot: {
+        run_id: pmeta.run_id, status: pmeta.status, as_of_date: pmeta.as_of_date,
+        generated_at: pmeta.generated_at, payload_checksum: pmeta.payload_checksum, row_count: pmeta.row_count,
+        src_ne_products_synced_at: pmeta.src_ne_products_synced_at, src_velocity_as_of: pmeta.src_velocity_as_of,
+        src_fba_business_date: pmeta.src_fba_business_date, src_reorder_updated_at: pmeta.src_reorder_updated_at,
+        ne_fba_overlap: pmeta.ne_fba_overlap,
+        fba_source_kind: pmeta.fba_source_kind, fba_source_run_id: pmeta.fba_source_run_id,
+        fba_fetched_at: pmeta.fba_fetched_at, fba_latest_row_count: pmeta.fba_latest_row_count,
+        rows,
+      },
+    }),
+    signal: AbortSignal.timeout(120000),
+  });
+  if (!resp.ok) {
+    const err = await resp.text().catch(() => '');
+    throw new Error(`pml-only sync: HTTP ${resp.status} ${err.slice(0, 200)}`);
+  }
+  await resp.json().catch(() => ({}));
+
+  // 検証: mirror の published run_id + 件数が一致 (fail-closed)
+  const statusRes = await fetch(`${RENDER_URL}/api/status`, { signal: AbortSignal.timeout(30000) });
+  const status = await statusRes.json();
+  if (status.pml_published_run_id !== pmeta.run_id || (status.pml_snapshot_count ?? 0) !== rows.length) {
+    throw new Error(`pml-only sync 検証失敗: mirror run=${status.pml_published_run_id}(${status.pml_snapshot_count}件) / sent run=${pmeta.run_id}(${rows.length}件)`);
+  }
+  console.log(`[pml-only-sync] ✅ 検証OK run=${pmeta.run_id} rows=${rows.length}`);
+  return { state: 'sent', run_id: pmeta.run_id, count: rows.length, fba_source_kind: pmeta.fba_source_kind, fba_fetched_at: pmeta.fba_fetched_at };
+}
+
 // 単体実行
 import { initDB } from './db.js';
 const isMain = process.argv[1]?.includes('sync-to-render');
 if (isMain) {
   await initDB();
-  const result = await syncToRender();
+  const pmlOnly = process.argv.includes('--pml-only');
+  const result = pmlOnly ? await syncPmlSnapshotOnly() : await syncToRender();
   console.log('\n結果:', JSON.stringify(result, null, 2));
-  process.exit(result.ok ? 0 : 1);
+  process.exit(result.ok === false ? 1 : 0);
 }

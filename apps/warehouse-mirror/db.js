@@ -1642,6 +1642,11 @@ function createTables() {
   )`);
   // 既存テーブルへの列追加 (売上分類=商品管理リストの「商品区分 1自社/2AMC/3仕入」)
   addColumnIfMissing('mirror_pml_snapshot_rows', '売上分類', 'INTEGER');
+  // FBA鮮度メタ (Part2 オンデマンドFBA更新: daily=朝の日次 / live=オンデマンドRESTOCK)
+  addColumnIfMissing('mirror_pml_published', 'fba_source_kind', 'TEXT');
+  addColumnIfMissing('mirror_pml_published', 'fba_source_run_id', 'TEXT');
+  addColumnIfMissing('mirror_pml_published', 'fba_fetched_at', 'TEXT');
+  addColumnIfMissing('mirror_pml_published', 'fba_latest_row_count', 'INTEGER');
 
   // ---- biz-ops-overview: 全モール売上日次統合 view (2026-05-19 PR #156)
   db.exec('DROP VIEW IF EXISTS v_mall_sales_daily_unified');
