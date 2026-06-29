@@ -77,14 +77,19 @@ export async function buildProductManagementSnapshot({ fbaSource = 'daily' } = {
   let liveStaleReason = null;
   if (fbaSource === 'live') {
     fbaSourceKind = 'live';
-    const lm = db.prepare('SELECT source_run_id AS run, MAX(fetched_at) AS fetched, COUNT(*) AS cnt FROM fba_restock_live').get() || {};
+    const lm = db.prepare('SELECT MIN(source_run_id) AS run, MAX(fetched_at) AS fetched, COUNT(*) AS cnt, COUNT(DISTINCT source_run_id) AS runs, COUNT(DISTINCT fetched_at) AS fetches FROM fba_restock_live').get() || {};
     fbaLatestRowCount = lm.cnt || 0;
     fbaFetchedAt = lm.fetched || null;
     fbaSourceRunId = lm.run || null;
     fbaBizDate = fbaFetchedAt ? jstDateOf(fbaFetchedAt) : null;
-    if (fbaLatestRowCount > 0 && fbaFetchedAt) {
-      const ageMin = (Date.now() - Date.parse(fbaFetchedAt)) / 60000;
-      if (ageMin > LIVE_MAX_AGE_MIN) liveStaleReason = `live FBA ${Math.round(ageMin)}分前(>${LIVE_MAX_AGE_MIN}分)`;
+    if (fbaLatestRowCount > 0) {
+      // fail-closed: 全件1txn置換のはずなので run_id / fetched_at は単一であるべき。混在は信用しない。
+      if ((lm.runs || 0) > 1 || (lm.fetches || 0) > 1) {
+        liveStaleReason = `live FBA 混在 (runs=${lm.runs}, fetches=${lm.fetches})`;
+      } else if (fbaFetchedAt) {
+        const ageMin = (Date.now() - Date.parse(fbaFetchedAt)) / 60000;
+        if (ageMin > LIVE_MAX_AGE_MIN) liveStaleReason = `live FBA ${Math.round(ageMin)}分前(>${LIVE_MAX_AGE_MIN}分)`;
+      }
     }
   } else {
     fbaSourceKind = 'daily';
@@ -131,7 +136,7 @@ export async function buildProductManagementSnapshot({ fbaSource = 'daily' } = {
         UNION ALL
         SELECT l.amazon_sku AS ne_code, ${liveFbaSum} AS q
           FROM fba_restock_live l
-          WHERE LOWER(l.amazon_sku) NOT IN (SELECT LOWER(seller_sku) FROM v_sku_resolved)
+          WHERE NOT EXISTS (SELECT 1 FROM v_sku_resolved r WHERE r.seller_sku = l.amazon_sku COLLATE NOCASE)
             AND EXISTS (SELECT 1 FROM m_products mp WHERE mp.商品コード = l.amazon_sku COLLATE NOCASE)
       ) GROUP BY ne_code
     ) fba ON m.商品コード = fba.ne_code COLLATE NOCASE`;

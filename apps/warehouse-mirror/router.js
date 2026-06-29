@@ -450,6 +450,17 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
         const recomputed = crypto.createHash('sha256').update(canonical).digest('hex');
         if (recomputed !== p.payload_checksum) {
           reason = `checksum不一致 (recompute≠送信元)`;
+        } else if ((() => {
+          // 巻き戻し防止: 既存 published より古い generated_at の run では上書きしない。
+          // (daily の full sync が、後発の on-demand live run を古い daily run で潰す事故を防ぐ)
+          const cur = db.prepare('SELECT run_id, generated_at FROM mirror_pml_published WHERE id=1').get();
+          if (cur && cur.run_id !== p.run_id && cur.generated_at && p.generated_at && p.generated_at < cur.generated_at) {
+            reason = `古いrun skip (incoming generated_at=${p.generated_at} < current ${cur.generated_at}, 巻き戻し防止)`;
+            return true;
+          }
+          return false;
+        })()) {
+          // reason 設定済 (skip)
         } else {
           const swap = db.transaction(() => {
             db.exec('DELETE FROM mirror_pml_snapshot_rows');
@@ -2422,8 +2433,19 @@ function requirePmlReadToken(req, res, next) {
   next();
 }
 
+// 商品管理リスト オンデマンドFBA更新の「起動(書き込み系アクション)」専用トークン。
+// 読み取り専用の PML_READ_TOKEN とは権限分離する (read token 所持者が更新を起動できないように)。
+// Render env PML_REFRESH_TOKEN にのみ置く。未設定なら 503 (fail-closed)、header(x-refresh-token) only。
+function requirePmlRefreshToken(req, res, next) {
+  const token = process.env.PML_REFRESH_TOKEN;
+  if (!token) return res.status(503).json({ error: 'pml_refresh_token_unset' });
+  const provided = req.headers['x-refresh-token'];
+  if (!provided || provided !== token) return res.status(401).json({ error: 'invalid_refresh_token' });
+  next();
+}
+
 // ─── オンデマンドFBA更新 (Part2) GAS用トリガ ───
-// GAS はセッションを持てないため、PML_READ_TOKEN (x-read-token) で認証して miniPC にプロキシする。
+// GAS はセッションを持てないため、専用 PML_REFRESH_TOKEN (x-refresh-token) で認証して miniPC にプロキシする。
 // (ブラウザ管理UIは /apps/product-management-list 側の session-gated proxy を使う)
 const WH_URL_PML = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
 function whServiceHeadersPml() {
@@ -2443,12 +2465,12 @@ async function callWhPml(fullPath, { method = 'GET', timeout = 30000 } = {}) {
   if (!ct.includes('application/json')) throw new Error(`warehouse 応答形式異常 (ct=${ct || 'none'})`);
   return r.json();
 }
-router.post('/api/pml/refresh-fba', requirePmlReadToken, async (req, res) => {
+router.post('/api/pml/refresh-fba', requirePmlRefreshToken, async (req, res) => {
   res.set('Cache-Control', 'no-store');
   try { res.json(await callWhPml('/service-api/fba/pml/fba-refresh', { method: 'POST', timeout: 30000 })); }
   catch (e) { res.status(502).json({ error: 'ミニPC接続失敗: ' + e.message }); }
 });
-router.get('/api/pml/refresh-fba/jobs/:jobId', requirePmlReadToken, async (req, res) => {
+router.get('/api/pml/refresh-fba/jobs/:jobId', requirePmlRefreshToken, async (req, res) => {
   res.set('Cache-Control', 'no-store');
   try { res.json(await callWhPml(`/service-api/jobs/${encodeURIComponent(req.params.jobId)}`, { timeout: 15000 })); }
   catch (e) { res.status(502).json({ error: 'ジョブ状態取得失敗: ' + e.message }); }

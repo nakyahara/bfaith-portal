@@ -20,6 +20,7 @@
  *   2) スクリプトプロパティ:
  *      ENDPOINT_URL   = https://<render>/apps/mirror/api/pml/published
  *      READ_TOKEN     = <Render env PML_READ_TOKEN と同じ値>
+ *      REFRESH_TOKEN  = <Render env PML_REFRESH_TOKEN と同じ値> (任意: 「今すぐ更新」メニュー用、未設定なら取り込みのみ)
  *      SPREADSHEET_ID = 15L_BU6WrXNX8aMblTs4yBqwkDFJOg0oDRKDTRHovLDE
  *      SHEET_NAME     = 商品管理リスト
  *      WRITE_MODE     = dry_run   (検証OKまで dry_run、その後 live)
@@ -66,14 +67,14 @@ function onOpen() {
 function refreshFbaAndWrite() {
   var ui = SpreadsheetApp.getUi();
   var props = PropertiesService.getScriptProperties();
-  var endpoint = props.getProperty('ENDPOINT_URL'); // .../api/pml/published
-  var token = props.getProperty('READ_TOKEN');      // = PML_READ_TOKEN
-  if (!endpoint || !token) { ui.alert('スクリプトプロパティ未設定 (ENDPOINT_URL / READ_TOKEN)'); return; }
+  var endpoint = props.getProperty('ENDPOINT_URL');      // .../api/pml/published
+  var refreshToken = props.getProperty('REFRESH_TOKEN');  // = PML_REFRESH_TOKEN (更新トリガ専用、READ_TOKENとは別)
+  if (!endpoint || !refreshToken) { ui.alert('スクリプトプロパティ未設定 (ENDPOINT_URL / REFRESH_TOKEN)'); return; }
   var base = endpoint.replace(/\/published\/?$/, ''); // → .../api/pml
   var triggerUrl = base + '/refresh-fba';
 
-  // 1. 起動 (token認証)
-  var resp = UrlFetchApp.fetch(triggerUrl, { method: 'post', muteHttpExceptions: true, headers: { 'x-read-token': token } });
+  // 1. 起動 (更新トリガ専用 token認証)
+  var resp = UrlFetchApp.fetch(triggerUrl, { method: 'post', muteHttpExceptions: true, headers: { 'x-refresh-token': refreshToken } });
   if (resp.getResponseCode() >= 300) { ui.alert('起動失敗: HTTP ' + resp.getResponseCode() + '\n' + resp.getContentText().slice(0, 300)); return; }
   var j = JSON.parse(resp.getContentText());
   if (!j.jobId) { ui.alert((j.message || j.error || '実行中です') + '\n少し待って再実行してください。'); return; }
@@ -84,7 +85,7 @@ function refreshFbaAndWrite() {
   var st = 'running';
   while (Date.now() < deadline) {
     Utilities.sleep(8000);
-    var jr = UrlFetchApp.fetch(jobUrl, { muteHttpExceptions: true, headers: { 'x-read-token': token } });
+    var jr = UrlFetchApp.fetch(jobUrl, { muteHttpExceptions: true, headers: { 'x-refresh-token': refreshToken } });
     if (jr.getResponseCode() >= 300) continue;
     var job = JSON.parse(jr.getContentText());
     st = job.status;
