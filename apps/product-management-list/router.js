@@ -24,6 +24,10 @@ const COLS = [
   '代表商品コード', 'ロケーションコード', '商品分類タグ', '登録日',
 ];
 
+// 表示見出しの差し替え (DB列名・checksum・同期契約は COLS のまま据え置き、見出しテキストのみ別名)
+const LABELS = { 'FBA在庫数': 'FBA在庫数(倉庫+入荷待ち)' };
+const label = c => LABELS[c] || c;
+
 function loadPublished() {
   const db = getMirrorDB();
   // pub + rows を 1 read transaction で読む。sync 側 atomic swap (DELETE→INSERT→published upsert) と
@@ -48,7 +52,7 @@ router.get('/export.csv', (req, res) => {
   try { ({ pub, rows } = loadPublished()); }
   catch (e) { return res.status(500).send('error: ' + e.message); }
   if (!pub) return res.status(404).send('published snapshot なし');
-  const lines = [COLS.map(csvCell).join(',')];
+  const lines = [COLS.map(c => csvCell(label(c))).join(',')];
   for (const r of rows) lines.push(COLS.map(c => csvCell(r[c])).join(','));
   const buf = iconv.encode(lines.join('\r\n') + '\r\n', 'Shift_JIS');
   const fname = `product_management_${pub.as_of_date || pub.run_id}.csv`;
@@ -72,7 +76,7 @@ router.get('/', (req, res) => {
   const wm = pub ? `NE: ${he(pub.src_ne_products_synced_at)} / 販売: ${he(pub.src_velocity_as_of)} / FBA在庫: ${he(pub.src_fba_business_date)} / 発注設定: ${he(pub.src_reorder_updated_at)}` : '';
   const numCols = new Set(['売上分類','在庫保管日数','総在庫数','FBA在庫数','フリー在庫','注残数','引当数','総在庫数_引当なし','販売数7日_FBA','販売数7日_FBA以外','販売数7日_合計','販売数30日_FBA','販売数30日_FBA以外','販売数30日_合計','発注ロット単位','推奨保有月数','売価','原価','想定見込み利益','概算利益率']);
 
-  const head = '<tr>' + COLS.map(c => `<th${numCols.has(c) ? ' class="r"' : ''}>${he(c)}</th>`).join('') + '</tr>';
+  const head = '<tr>' + COLS.map(c => `<th${numCols.has(c) ? ' class="r"' : ''}>${he(label(c))}</th>`).join('') + '</tr>';
   const body = rows.map(r => '<tr>' + COLS.map(c => `<td${numCols.has(c) ? ' class="r"' : ''}>${he(r[c])}</td>`).join('') + '</tr>').join('');
 
   res.send(`<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8">
