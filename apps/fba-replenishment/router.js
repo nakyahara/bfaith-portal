@@ -19,7 +19,8 @@ import { initDb, savePlanningData, savePlanningDataWithHistory, getLatestSnapsho
          saveRestockLatest, savePlanningLatest,
          getSkuMappingSourceMode,
          getWarehouseBarcodeRows, getDodaiMaster,
-         getPickingMasterStatus, savePickingRun, getPickingRuns, getPickingRun } from './db.js';
+         getPickingMasterStatus, savePickingRun, getPickingRuns, getPickingRun,
+         getLastRecommendationRun, saveRecommendationRun, getRecentRecommendationRuns } from './db.js';
 import { parseCsv, decodeCsvBuffer, buildShiftJisCsv } from './picking-csv.js';
 import * as pp from './picking-prep.js';
 import { uploadCsvToDrive } from './drive-upload.js';
@@ -476,6 +477,84 @@ router.post('/api/refresh-inbound-working', async (req, res) => {
   }
 });
 
+// ───────────────────────────────────────────────────────────
+// 推奨の健全性チェック (③観測性/DQ + ④一律=SKU一致率検知)
+//   2026-06-30 事故: 準備中(納品プラン)取得が静かに欠損 → 在庫過小評価 → 前日納品分を一律再提示。
+//   毎runでスナップショットを残し、欠損/急増/前回一致 を即フラグする。
+// ───────────────────────────────────────────────────────────
+function computeRecommendationHealth(result, inboundOverride) {
+  const normSku = (v) => String(v ?? '').trim().toLowerCase();
+  const ov = (inboundOverride && typeof inboundOverride === 'object') ? inboundOverride : {};
+  const workingSkuCount = Object.keys(ov).length;
+  const workingQtyTotal = Object.values(ov).reduce((s, q) => s + (Number(q) || 0), 0);
+
+  // 推奨に上がったSKU (恒久除外を除く)。amazon_sku を正規化しユニーク化 (行重複で件数水増ししない)。
+  const recSet = new Set();
+  for (const i of (result.items || [])) {
+    if (i.recommended_qty > 0 && !i.is_excluded) {
+      const s = normSku(i.amazon_sku);
+      if (s) recSet.add(s);
+    }
+  }
+  const recommendedSkuCount = recSet.size;
+
+  const prev = getLastRecommendationRun();
+
+  // ─── シグナル抽出 ───
+  const sig = {};
+  let prevOverlap = null;
+  if (prev && Array.isArray(prev.recommended_skus) && prev.recommended_skus.length && recommendedSkuCount > 0) {
+    const prevSet = new Set(prev.recommended_skus.map(normSku));
+    let inter = 0;
+    for (const s of recSet) if (prevSet.has(s)) inter++;
+    prevOverlap = inter / recSet.size;
+    if (prevOverlap >= 0.5 && recommendedSkuCount >= 30) sig.high_overlap = { rate: prevOverlap, inter, n: recSet.size };
+  }
+  if (workingSkuCount === 0) sig.working_empty = true;
+  else if (prev && prev.working_sku_count >= 20 && workingSkuCount < prev.working_sku_count * 0.3) sig.working_drop = { prev: prev.working_sku_count, now: workingSkuCount };
+  if (prev && prev.recommended_sku_count >= 20 && recommendedSkuCount >= prev.recommended_sku_count * 1.8) sig.recommend_spike = { prev: prev.recommended_sku_count, now: recommendedSkuCount };
+
+  // ─── 重大度判定: 単独では誤検知しやすいので複合で重大化 ───
+  //   供給側異常(準備中の急減/欠損) と 出力側異常(一律/急増) が重なると今回の事故パターン。
+  const supplyAnomaly = !!(sig.working_drop || sig.working_empty);
+  const outputAnomaly = !!(sig.high_overlap || sig.recommend_spike);
+  const flags = [];
+
+  // working_drop: 健全な前回からの急減=取得欠損が濃厚 → 単独でも重大
+  if (sig.working_drop) {
+    flags.push({ level: 'critical', code: 'working_drop', msg: `準備中SKUが急減 (前回${sig.working_drop.prev}→今回${sig.working_drop.now})。納品プラン取得の欠損疑い → 在庫過小評価で過大推奨の恐れ` });
+  }
+  // working_empty: 本当にプラン無しの平常日もある → 単独は注意。出力異常と重なれば重大。
+  if (sig.working_empty) {
+    flags.push({ level: outputAnomaly ? 'critical' : 'warning', code: 'working_empty', msg: `準備中(納品プラン)が0件${outputAnomaly ? ' かつ 推奨が一律/急増 → 取得欠損で前回納品分を再提示している恐れ' : '。取得失敗か、本当にプラン無しかを確認'}` });
+  }
+  // 一律(高一致): 定番の連日補充なら正常 → 単独は注意。準備中異常と重なれば重大。
+  if (sig.high_overlap) {
+    flags.push({ level: supplyAnomaly ? 'critical' : 'warning', code: 'high_prev_overlap', msg: `前回推奨とSKU一致率 ${(sig.high_overlap.rate * 100).toFixed(0)}% (${sig.high_overlap.inter}/${sig.high_overlap.n})${supplyAnomaly ? ' かつ 準備中データ異常 → 前回納品分の再提示が濃厚。発送前に開いている納品プランと突合を' : '。定番の連日補充なら正常だが念のため確認'}` });
+  }
+  // 急増: 単独は注意。準備中異常と重なれば重大。
+  if (sig.recommend_spike) {
+    flags.push({ level: supplyAnomaly ? 'critical' : 'warning', code: 'recommend_spike', msg: `推奨SKU数が急増 (前回${sig.recommend_spike.prev}→今回${sig.recommend_spike.now})${supplyAnomaly ? ' かつ 準備中データ異常 → 在庫過小評価の疑い' : ''}` });
+  }
+
+  return {
+    working_sku_count: workingSkuCount,
+    working_qty_total: workingQtyTotal,
+    recommended_sku_count: recommendedSkuCount,
+    recommended_skus: Array.from(recSet),
+    prev_overlap_rate: prevOverlap,
+    prev_run_at: prev ? prev.run_at : null,
+    flags,
+    degraded: flags.some(f => f.level === 'critical'),
+  };
+}
+
+// 健全性ログ履歴 (画面表示用)
+router.get('/api/recommendation-health', (req, res) => {
+  try { res.json({ runs: getRecentRecommendationRuns(30) }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ===== ステータス =====
 // ===== 推奨リスト =====
 router.get('/api/recommendations', async (req, res) => {
@@ -505,6 +584,32 @@ router.get('/api/recommendations', async (req, res) => {
     }
     const itemsWithFnsku = result.items.filter(i => i.fnsku).length;
     console.log(`[FBA] 推奨items: ${result.items.length}件, fnsku付与=${itemsWithFnsku}件, 除外=${result.items.filter(i => i.is_excluded).length}件`);
+
+    // ─── ③観測性 + ④一律検知: 推奨の健全性を毎回スナップショット ───
+    //   事故(2026-06-30: 準備中データ静かに欠損→大量再提示)の再発を即検知する。
+    try {
+      result.health = computeRecommendationHealth(result, inboundOverride);
+      // 保存は「明示的に推奨生成した時(?persist=1)」のみ。画面リロード/タブ操作/補助fetchでは
+      // 保存しない → 「前回」が数秒前の同一結果になって一致率検知が無意味化&ログ汚染するのを防ぐ。
+      const persist = req.query.persist === '1' || req.query.persist === 'true';
+      if (persist) {
+        saveRecommendationRun({
+          working_sku_count: result.health.working_sku_count,
+          working_qty_total: result.health.working_qty_total,
+          recommended_sku_count: result.health.recommended_sku_count,
+          recommended_skus: result.health.recommended_skus,
+          prev_overlap_rate: result.health.prev_overlap_rate,
+          health_flags: result.health.flags,
+          degraded: result.health.degraded,
+        });
+      }
+      if (result.health.flags.length) {
+        console.warn(`[FBA] 推奨健全性: degraded=${result.health.degraded} persist=${persist} flags=${JSON.stringify(result.health.flags.map(f => f.code))}`);
+      }
+      delete result.health.recommended_skus; // 応答は軽量に
+    } catch (e) {
+      console.error('[FBA] 推奨健全性チェック失敗(推奨自体は返す):', e.message);
+    }
     res.json(result);
   } catch (e) {
     console.error('[FBA] 推奨リスト生成エラー:', e);

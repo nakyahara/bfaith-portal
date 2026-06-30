@@ -195,6 +195,8 @@
 
     <!-- 推奨リスト -->
     <div class="section" id="recSection" style="display:none;">
+      <!-- 健全性バナー (準備中データ欠損 / 前回と一律 などを警告) -->
+      <div id="healthBanner" style="display:none;margin-bottom:10px;padding:10px 14px;border-radius:6px;font-size:13px;line-height:1.6;"></div>
       <!-- タブ切り替え -->
       <div style="display:flex;gap:0;margin-bottom:0;">
         <button class="tab-btn active" id="tabShip" onclick="switchTab('ship')">納品推奨</button>
@@ -925,7 +927,7 @@
       }
 
       try {
-        const res = await fetch(`${BASE}/api/recommendations?debug=1`);
+        const res = await fetch(`${BASE}/api/recommendations?debug=1&persist=1`);
         const d = await res.json();
         if (d.error) { log('エラー: ' + d.error); return; }
         if (d.errors && d.errors.length) { d.errors.forEach(e => log('警告: ' + e)); }
@@ -933,6 +935,7 @@
         recMeta = d;
         manualItems = [];
         log(`完了! 全${d.total_skus}SKU / 推奨${d.recommended_skus}SKU / 合計${d.recommended_units}個`);
+        renderHealthBanner(d.health);
         document.getElementById('recSection').style.display = '';
         updateRecSummary();
         filterRecList();
@@ -947,6 +950,26 @@
         btn.disabled = false;
         btn.textContent = '推奨リスト生成';
       }
+    }
+
+    // 推奨健全性バナー (③観測性 + ④一律検知)
+    function renderHealthBanner(health) {
+      const el = document.getElementById('healthBanner');
+      if (!el) return;
+      if (!health || !health.flags || health.flags.length === 0) { el.style.display = 'none'; el.innerHTML = ''; return; }
+      const crit = !!health.degraded;
+      el.style.background = crit ? '#fdecea' : '#fff8e1';
+      el.style.border = crit ? '1px solid #e57373' : '1px solid #ffd54f';
+      el.style.color = crit ? '#c0392b' : '#8a6d00';
+      const head = crit
+        ? '🔴 <b>発注推奨に異常の可能性。発送前に「開いている納品プラン」と必ず突合してください。</b>'
+        : '🟡 <b>発注推奨に注意点があります。</b>';
+      const lines = health.flags.map(f => '・' + (f.level === 'critical' ? '【重大】' : '【注意】') + (typeof esc === 'function' ? esc(f.msg) : f.msg)).join('<br>');
+      const meta = '<div style="margin-top:6px;font-size:11px;opacity:.8;">準備中SKU ' + health.working_sku_count
+        + ' / 推奨SKU ' + health.recommended_sku_count
+        + (health.prev_overlap_rate != null ? ' / 前回一致率 ' + (health.prev_overlap_rate * 100).toFixed(0) + '%' : '') + '</div>';
+      el.innerHTML = head + '<br>' + lines + meta;
+      el.style.display = '';
     }
 
     // 選択管理
