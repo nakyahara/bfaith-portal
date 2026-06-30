@@ -259,14 +259,15 @@ export async function checkInboundEligibility(items) {
 
 /**
  * ACTIVEな納品プランから、SKU別の準備中数量を集計
- * （3日以内に作成されたプランのみ対象 ※以前は7日）
+ * （7日以内に作成されたプランのみ対象 ※二重計上回避と「放置プラン」除外のための窓。
+ *   恒久対策は「未出荷の箱数量のみ計上」だが shipment API が権限不足のため当面は日付窓で運用）
  * 期限管理商品もここで取得されるが、calculation-engine 側で「別期限を送るため除外」の例外処理あり
  * @returns {Object} { [msku]: quantity, ... }
  */
 export async function fetchActiveInboundQuantities() {
   const sp = getClient();
-  // 3日以内に作成されたプランのみ対象 (変数名は互換性のため据え置き)
-  const sevenDaysAgo = new Date(Date.now() - 3 * 86400000);
+  // 7日以内に作成されたプランのみ対象 (作成→出荷のリードタイムを跨ぐ谷間対策で 3日→7日。2026-06-30)
+  const sevenDaysAgo = new Date(Date.now() - 7 * 86400000);
 
   // 1. ACTIVEプラン一覧を取得
   const allPlans = [];
@@ -286,14 +287,18 @@ export async function fetchActiveInboundQuantities() {
     });
 
     if (result.inboundPlans) allPlans.push(...result.inboundPlans);
-    nextToken = result.pagination?.token || null;
+    // SP-API 応答のページングトークンは pagination.nextToken (旧コードは .token を読んでいて
+    // 常に undefined → 1ページ=先頭10件しか取得できず、ACTIVEが10件超だと作成日が窓内でも
+    // 取りこぼしていた。2026-06-30 修正)。
+    nextToken = result.pagination?.nextToken || null;
+    if (nextToken) await sleep(200); // 多ページ取得時のスロットリング回避
   } while (nextToken);
 
   console.log(`[Inbound] ACTIVEプラン: ${allPlans.length}件`);
 
-  // 2. 3日以内のプランだけフィルタ
+  // 2. 7日以内のプランだけフィルタ
   const recentPlans = allPlans.filter(p => new Date(p.createdAt) >= sevenDaysAgo);
-  console.log(`[Inbound] 3日以内: ${recentPlans.length}件`);
+  console.log(`[Inbound] 7日以内: ${recentPlans.length}件`);
 
   // 3. 各プランのアイテムを取得してSKU別に集計
   const skuQtyMap = {};
@@ -304,13 +309,13 @@ export async function fetchActiveInboundQuantities() {
     let itemToken = null;
 
     do {
-      const params = itemToken ? `?pageToken=${encodeURIComponent(itemToken)}` : '';
+      const params = itemToken ? `?paginationToken=${encodeURIComponent(itemToken)}` : '';
       const result = await sp.callAPI({
         api_path: `/inbound/fba/2024-03-20/inboundPlans/${plan.inboundPlanId}/items${params}`,
         method: 'GET',
       });
       if (result.items) items.push(...result.items);
-      itemToken = result.pagination?.token || null;
+      itemToken = result.pagination?.nextToken || null;
     } while (itemToken);
 
     if (items.length === 0) continue;
