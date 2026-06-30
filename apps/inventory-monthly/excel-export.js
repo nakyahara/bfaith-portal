@@ -11,6 +11,7 @@ const CATEGORY_LABEL = {
   fba_inbound: 'FBA輸送中在庫',
   own_warehouse: '自社倉庫在庫',
   fba_us: '米国FBA在庫',
+  fba_us_inbound: '米国FBA輸送中在庫',
 };
 
 export async function exportSnapshotToXlsx(snap) {
@@ -28,7 +29,9 @@ export async function exportSnapshotToXlsx(snap) {
   sm.addRow({ label: 'FBA輸送中在庫', amount: s.fba_inbound });
   sm.addRow({ label: '自社倉庫在庫', amount: s.own_warehouse });
   sm.addRow({ label: '米国FBA在庫', amount: s.fba_us });
+  sm.addRow({ label: '米国FBA輸送中在庫', amount: s.fba_us_inbound });
   sm.addRow({ label: '発注後未着商品', amount: s.pending_orders });
+  sm.addRow({ label: '手動調整在庫金額' + (s.manual_adjustment_note ? `（${s.manual_adjustment_note}）` : ''), amount: s.manual_adjustment });
   const totalRow = sm.addRow({ label: '合計', amount: s.total });
   totalRow.font = { bold: true };
   totalRow.eachCell(c => { c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF3CD' } }; });
