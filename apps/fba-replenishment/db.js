@@ -606,8 +606,68 @@ export async function initDb() {
     db.run(`INSERT OR REPLACE INTO settings (key, value) VALUES ('picking_time_jst_fixed', '1')`);
   }
 
+  // --- 21. recommendation_run_log: 発注推奨を出すたびの健全性スナップショット ---
+  //   「準備中(納品プラン)データが静かに欠損したまま大量再提示」事故(2026-06-30)の再発検知用。
+  //   各runで 準備中SKU数/合計数量・推奨SKU数・前回推奨との一致率・健全性フラグ を残す。
+  db.run(`
+    CREATE TABLE IF NOT EXISTS recommendation_run_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_at TEXT DEFAULT (datetime('now','+9 hours')),
+      working_sku_count INTEGER,       -- 準備中(inbound override)に計上されたSKU数
+      working_qty_total INTEGER,       -- 準備中の合計数量
+      recommended_sku_count INTEGER,   -- 推奨に上がったSKU数(恒久除外を除く)
+      recommended_skus TEXT,           -- JSON配列: 推奨amazon_sku
+      prev_overlap_rate REAL,          -- 前回推奨とのSKU一致率 (0-1)
+      health_flags TEXT,               -- JSON配列: 警告/重大フラグ
+      degraded INTEGER DEFAULT 0       -- 0/1 (重大フラグありで1)
+    )
+  `);
+
   saveToFile();
   console.log('[FBA-DB] 初期化完了');
+}
+
+// ===== 発注推奨 健全性ログ (③ 観測性 / ④ 一律検知) =====
+
+// 直近(=今回より前)の run を1件返す。初回は null。
+export function getLastRecommendationRun() {
+  const r = queryOne(`SELECT * FROM recommendation_run_log ORDER BY id DESC LIMIT 1`);
+  if (!r) return null;
+  let skus = [];
+  try { skus = JSON.parse(r.recommended_skus || '[]'); } catch {}
+  let flags = [];
+  try { flags = JSON.parse(r.health_flags || '[]'); } catch {}
+  return { ...r, recommended_skus: skus, health_flags: flags };
+}
+
+// run を保存。直近 KEEP 件のみ保持 (肥大化防止)。
+export function saveRecommendationRun(rec) {
+  const KEEP = 500;
+  db.run(
+    `INSERT INTO recommendation_run_log
+      (working_sku_count, working_qty_total, recommended_sku_count, recommended_skus, prev_overlap_rate, health_flags, degraded)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [
+      rec.working_sku_count ?? 0,
+      rec.working_qty_total ?? 0,
+      rec.recommended_sku_count ?? 0,
+      JSON.stringify(rec.recommended_skus || []),
+      rec.prev_overlap_rate ?? null,
+      JSON.stringify(rec.health_flags || []),
+      rec.degraded ? 1 : 0,
+    ]
+  );
+  db.run(`DELETE FROM recommendation_run_log WHERE id NOT IN (SELECT id FROM recommendation_run_log ORDER BY id DESC LIMIT ${KEEP})`);
+  saveToFile();
+}
+
+// 画面の履歴表示用 (直近 limit 件、recommended_skus は除いて軽量に)
+export function getRecentRecommendationRuns(limit = 20) {
+  return queryAll(
+    `SELECT id, run_at, working_sku_count, working_qty_total, recommended_sku_count, prev_overlap_rate, health_flags, degraded
+       FROM recommendation_run_log ORDER BY id DESC LIMIT ?`,
+    [limit]
+  ).map(r => { let f = []; try { f = JSON.parse(r.health_flags || '[]'); } catch {} return { ...r, health_flags: f }; });
 }
 
 // ===== SP-APIレポートデータの一括保存 =====
