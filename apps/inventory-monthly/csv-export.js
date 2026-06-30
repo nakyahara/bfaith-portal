@@ -10,6 +10,7 @@ const CATEGORY_LABEL = {
   fba_inbound: 'FBA輸送中在庫',
   own_warehouse: '自社倉庫在庫',
   fba_us: '米国FBA在庫',
+  fba_us_inbound: '米国FBA輸送中在庫',
 };
 
 /**
@@ -51,7 +52,9 @@ export function buildSnapshotCsv(snap) {
   out += row(['FBA輸送中在庫', s.fba_inbound]);
   out += row(['自社倉庫在庫', s.own_warehouse]);
   out += row(['米国FBA在庫', s.fba_us]);
+  out += row(['米国FBA輸送中在庫', s.fba_us_inbound]);
   out += row(['発注後未着商品', s.pending_orders]);
+  out += row(['手動調整在庫金額' + (s.manual_adjustment_note ? `（${s.manual_adjustment_note}）` : ''), s.manual_adjustment]);
   out += row(['合計', s.total]);
   out += row([]);
   out += row(['基準日', s.snapshot_date]);

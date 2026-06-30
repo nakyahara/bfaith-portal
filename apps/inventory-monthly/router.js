@@ -160,6 +160,20 @@ function renderInputPage() {
     <button type="button" class="secondary" onclick="addPending()">+ 行を追加</button>
   </div>
 
+  <div class="card">
+    <label>⑤ 米国FBA在庫輸送中 <small class="hint">手動金額（円・税抜）。Amazon US の FBA 輸送中(inbound)在庫</small></label>
+    <input type="number" name="us_fba_inbound_amount" min="0" step="1" value="0">
+    <small class="hint">⚠️ ③で「米国CSVから自動算出」を選んだ場合、輸送中はCSV側(③)に既に含まれるため、この⑤欄は<b>自動的に無視されます</b>（サーバ側で強制0・二重計上防止）。手動で③を直接入力するときだけ使ってください。</small>
+  </div>
+
+  <div class="card">
+    <label>⑥ 手動調整在庫金額 <small class="hint">捕捉漏れの最終調整。マイナス可（控除）</small></label>
+    <div class="pending-row">
+      <input type="number" name="manual_adjustment" step="1" value="0" placeholder="金額（税抜、±）" style="flex:1">
+      <input type="text" name="manual_adjustment_note" placeholder="メモ（調整理由）" style="flex:2">
+    </div>
+  </div>
+
   <div style="display:flex;gap:12px;align-items:center;margin-top:10px">
     <button type="submit" data-save="0">プレビュー集計</button>
     <button type="submit" data-save="1" style="background:#198754">集計して履歴に保存</button>
@@ -270,6 +284,7 @@ const CATEGORY_LABEL = {
   fba_inbound: 'FBA輸送中在庫',
   own_warehouse: '自社倉庫在庫',
   fba_us: '米国FBA在庫',
+  fba_us_inbound: '米国FBA輸送中在庫',
 };
 const INCOMPLETE_COST_STATUSES = ['MISSING','PARTIAL','PARTIAL_SET','NOT_IN_MASTER'];
 
@@ -282,7 +297,9 @@ function dlSummary() {
     ['FBA輸送中在庫', t.fba_inbound],
     ['自社倉庫在庫', t.own_warehouse],
     ['米国FBA在庫', t.fba_us],
+    ['米国FBA輸送中在庫', t.fba_us_inbound],
     ['発注後未着商品', t.pending],
+    ['手動調整在庫金額', t.manual_adjustment],
     ['合計', t.total],
   ];
   downloadCsv('月末棚卸し_サマリー.csv', rowsToCsv(rows));
@@ -330,7 +347,9 @@ function renderResult(d) {
     ['FBA輸送中在庫', t.fba_inbound],
     ['自社倉庫在庫',   t.own_warehouse],
     ['米国FBA在庫',    t.fba_us],
+    ['米国FBA輸送中在庫', t.fba_us_inbound],
     ['発注後未着商品', t.pending],
+    ['手動調整在庫金額', t.manual_adjustment],
   ].map(([k,v]) => '<tr><td>'+esc(k)+'</td><td class="num">'+yen(v)+'</td></tr>').join('');
 
   // ダウンロードボタン群（集計結果直下）
@@ -406,6 +425,18 @@ router.post('/aggregate', upload.fields([
       return res.status(400).json({ error: '棚卸し基準日が不正です' });
     }
 
+    // 全ての手動金額入力に使う sanitize: 非有限(NaN/Infinity)は0に、上限±1兆で
+    // クランプ、整数化。誤入力(1e309等)で Infinity が total/DB/CSV/Excel/グラフへ
+    // 流れる事故を防ぐ。allowNeg=false はマイナスを0に丸める（在庫の実額用）。
+    const MONEY_CAP = 1e12;
+    const sanitizeMoney = (v, allowNeg) => {
+      let n = Number(v);
+      if (!Number.isFinite(n)) return 0;
+      if (!allowNeg && n < 0) n = 0;
+      n = Math.max(-MONEY_CAP, Math.min(MONEY_CAP, n));
+      return Math.round(n);
+    };
+
     const fbaFile = req.files?.fba_csv?.[0];
     const ownFile = req.files?.own_csv?.[0];
     if (!fbaFile || !ownFile) {
@@ -425,7 +456,7 @@ router.post('/aggregate', upload.fields([
     const ownRows = parseOwnWarehouse(ownBuf);
     // ③ 米国FBA: CSVが来ていればパースしてaggregatorに渡す（金額直入力より優先）
     const usFbaRows = usFbaBuf ? parseRestockReport(usFbaBuf) : null;
-    const usFbaAmount = usFbaRows ? 0 : (Number(req.body.us_fba_amount) || 0);
+    const usFbaAmount = usFbaRows ? 0 : sanitizeMoney(req.body.us_fba_amount, false);
 
     // multer (append-field) は HTML name="pending_supplier[]" を見ると
     // 末尾の `[]` を「配列appendマーカー」として解釈し、req.body には
@@ -435,12 +466,18 @@ router.post('/aggregate', upload.fields([
     const suppliers = [].concat(req.body.pending_supplier || []);
     const amounts = [].concat(req.body.pending_amount || []);
     const pendingRows = suppliers
-      .map((s, i) => ({ supplier_name: (s || '').trim(), amount: Number(amounts[i]) || 0 }))
+      .map((s, i) => ({ supplier_name: (s || '').trim().slice(0, 200), amount: sanitizeMoney(amounts[i], false) }))
       .filter(p => p.supplier_name && p.amount > 0);
+
+    // ⑤ 米国FBA在庫輸送中（手動金額・税抜、＋のみ）
+    const usFbaInbound = sanitizeMoney(req.body.us_fba_inbound_amount, false);
+    // ⑥ 手動調整在庫金額（符号付き＝マイナス可）＋メモ
+    const manualAdjustment = sanitizeMoney(req.body.manual_adjustment, true);
+    const manualAdjustmentNote = (req.body.manual_adjustment_note || '').trim().slice(0, 500);
 
     // 集計と保存はどちらも mirror DB が必要。
     if (!ensureDbOrFail(res)) return;
-    const result = aggregateInventory({ fbaRows, ownRows, usFbaRows, usFbaAmount, pendingRows });
+    const result = aggregateInventory({ fbaRows, ownRows, usFbaRows, usFbaAmount, pendingRows, usFbaInbound, manualAdjustment, manualAdjustmentNote });
 
     let snapshot_id = null;
     if (wantSave) {
@@ -463,7 +500,9 @@ router.get('/history', (req, res) => {
       <td class="num">${yen(s.fba_inbound)}</td>
       <td class="num">${yen(s.own_warehouse)}</td>
       <td class="num">${yen(s.fba_us)}</td>
+      <td class="num">${yen(s.fba_us_inbound)}</td>
       <td class="num">${yen(s.pending_orders)}</td>
+      <td class="num">${yen(s.manual_adjustment)}</td>
       <td class="num"><b>${yen(s.total)}</b></td>
       <td>${esc(s.created_at)}</td>
     </tr>`).join('');
@@ -475,7 +514,9 @@ router.get('/history', (req, res) => {
     fba_inbound: s.fba_inbound || 0,
     own_warehouse: s.own_warehouse || 0,
     fba_us: s.fba_us || 0,
+    fba_us_inbound: s.fba_us_inbound || 0,
     pending_orders: s.pending_orders || 0,
+    manual_adjustment: s.manual_adjustment || 0,
     total: s.total || 0,
   }));
   const chartJson = JSON.stringify(chartData);
@@ -489,7 +530,7 @@ ${list.length === 0 ? '<p>まだ履歴がありません。</p>' : `
 
 <h2>履歴一覧</h2>
 <table>
-  <thead><tr><th>基準日</th><th>FBA倉庫</th><th>FBA輸送中</th><th>自社倉庫</th><th>米国FBA</th><th>発注後未着</th><th>合計</th><th>作成日時</th></tr></thead>
+  <thead><tr><th>基準日</th><th>FBA倉庫</th><th>FBA輸送中</th><th>自社倉庫</th><th>米国FBA</th><th>米国FBA輸送中</th><th>発注後未着</th><th>手動調整</th><th>合計</th><th>作成日時</th></tr></thead>
   <tbody>${rows}</tbody>
 </table>
 
@@ -502,14 +543,18 @@ ${list.length === 0 ? '<p>まだ履歴がありません。</p>' : `
     fba_inbound:   '#5b9bd5',  // 水色
     own_warehouse: '#70ad47',  // 緑 (一番大きいので分かりやすい色)
     fba_us:        '#ed7d31',  // オレンジ
+    fba_us_inbound:'#f4b183',  // 薄オレンジ
     pending_orders:'#a5a5a5',  // グレー
+    manual_adjustment:'#7030a0', // 紫
   };
   const labelMap = {
     fba_warehouse: 'FBA倉庫',
     fba_inbound:   'FBA輸送中',
     own_warehouse: '自社倉庫',
     fba_us:        '米国FBA',
+    fba_us_inbound:'米国FBA輸送中',
     pending_orders:'発注後未着',
+    manual_adjustment:'手動調整',
   };
   const datasets = Object.keys(palette).map(key => ({
     label: labelMap[key],
@@ -1122,7 +1167,9 @@ ${snap.pending.map(p => `<tr><td>${esc(p.supplier_name)}</td><td class="num">${y
     ${totalRow('FBA輸送中在庫', s.fba_inbound)}
     ${totalRow('自社倉庫在庫', s.own_warehouse)}
     ${totalRow('米国FBA在庫', s.fba_us)}
+    ${totalRow('米国FBA輸送中在庫', s.fba_us_inbound)}
     ${totalRow('発注後未着商品', s.pending_orders)}
+    ${totalRow('手動調整在庫金額' + (s.manual_adjustment_note ? `（${esc(s.manual_adjustment_note)}）` : ''), s.manual_adjustment)}
     <tr class="total-row"><td>合計</td><td class="num">${yen(s.total)}</td></tr>
   </tbody>
 </table>

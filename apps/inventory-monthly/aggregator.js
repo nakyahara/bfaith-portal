@@ -148,7 +148,7 @@ function valueAmazonRow(seller_sku, qty, lookups, warnings) {
   return { value: total, lines };
 }
 
-export function aggregateInventory({ fbaRows = [], ownRows = [], usFbaRows = null, usFbaAmount = 0, pendingRows = [] }) {
+export function aggregateInventory({ fbaRows = [], ownRows = [], usFbaRows = null, usFbaAmount = 0, pendingRows = [], usFbaInbound = 0, manualAdjustment = 0, manualAdjustmentNote = '' }) {
   const db = getDB();
   const lookups = buildLookups(db);
 
@@ -247,13 +247,26 @@ export function aggregateInventory({ fbaRows = [], ownRows = [], usFbaRows = nul
   // 4) 発注後未着 はシンプルに金額のみ
   const pendingTotal = pendingRows.reduce((s, p) => s + (Number(p.amount) || 0), 0);
 
+  // 5) 米国FBA在庫輸送中（手動金額・税抜）。実額なのでマイナス・非有限値(NaN/Infinity)は弾く。
+  //    ③が米国CSV(usFbaRows)経由のときは輸送中が既に fba_us に含まれているため、
+  //    手入力⑤を加えると二重計上になる。UIでも0を促しているが、ここでも強制0にして事故を防ぐ。
+  const fbaUsInboundRaw = Number(usFbaInbound);
+  let fbaUsInboundTotal = Number.isFinite(fbaUsInboundRaw) ? Math.max(0, fbaUsInboundRaw) : 0;
+  if (Array.isArray(usFbaRows)) fbaUsInboundTotal = 0;
+  // 6) 手動調整在庫金額（符号付き＝マイナス可）。非有限値は 0 に丸める。
+  const manualAdjustmentRaw = Number(manualAdjustment);
+  const manualAdjustmentTotal = Number.isFinite(manualAdjustmentRaw) ? manualAdjustmentRaw : 0;
+
   const totals = {
     fba_warehouse: Math.round(fbaWarehouseTotal),
     fba_inbound: Math.round(fbaInboundTotal),
     own_warehouse: Math.round(ownWarehouseTotal),
     fba_us: Math.round(fbaUsTotal),
+    fba_us_inbound: Math.round(fbaUsInboundTotal),
     pending: Math.round(pendingTotal),
-    total: Math.round(fbaWarehouseTotal + fbaInboundTotal + ownWarehouseTotal + fbaUsTotal + pendingTotal),
+    manual_adjustment: Math.round(manualAdjustmentTotal),
+    manual_adjustment_note: manualAdjustmentNote || '',
+    total: Math.round(fbaWarehouseTotal + fbaInboundTotal + ownWarehouseTotal + fbaUsTotal + fbaUsInboundTotal + pendingTotal + manualAdjustmentTotal),
   };
 
   // 警告は重複除去
@@ -399,15 +412,18 @@ export function saveSnapshot({ snapshot_date, result, pendingRows = [], note = '
     }
     db.prepare('DELETE FROM inv_snapshot WHERE snapshot_date = ?').run(snapshot_date);
     const info = db.prepare(`
-      INSERT INTO inv_snapshot (snapshot_date, fba_warehouse, fba_inbound, own_warehouse, fba_us, pending_orders, total, note, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO inv_snapshot (snapshot_date, fba_warehouse, fba_inbound, own_warehouse, fba_us, fba_us_inbound, pending_orders, manual_adjustment, manual_adjustment_note, total, note, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       snapshot_date,
       result.totals.fba_warehouse,
       result.totals.fba_inbound,
       result.totals.own_warehouse,
       result.totals.fba_us,
+      result.totals.fba_us_inbound || 0,
       result.totals.pending,
+      result.totals.manual_adjustment || 0,
+      result.totals.manual_adjustment_note || null,
       result.totals.total,
       note || null,
       now,
