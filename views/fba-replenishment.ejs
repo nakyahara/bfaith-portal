@@ -927,7 +927,7 @@
       }
 
       try {
-        const res = await fetch(`${BASE}/api/recommendations?debug=1`);
+        const res = await fetch(`${BASE}/api/recommendations?debug=1&persist=1`);
         const d = await res.json();
         if (d.error) { log('エラー: ' + d.error); return; }
         if (d.errors && d.errors.length) { d.errors.forEach(e => log('警告: ' + e)); }
