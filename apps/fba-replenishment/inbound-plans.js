@@ -303,6 +303,10 @@ export async function fetchActiveInboundQuantities() {
     if (nextToken) await sleep(200);
   } while (nextToken && pageCount < 30);
 
+  // サイレント欠落防止: 30ページ上限に当たったのに「7日より古い」に到達していない=取りこぼしの疑い。
+  if (!reachedOld && nextToken && pageCount >= 30) {
+    console.warn(`[Inbound] ⚠️ ページ上限(30)到達で打ち切り。7日以内プランを取りこぼした可能性 (recentPlans=${recentPlans.length})`);
+  }
   console.log(`[Inbound] 取得ページ=${pageCount} / 7日以内のACTIVEプラン: ${recentPlans.length}件 (打ち切り=${reachedOld})`);
 
   // 3. 各プランのアイテムを取得してSKU別に集計
