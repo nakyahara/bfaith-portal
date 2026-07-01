@@ -269,15 +269,21 @@ export async function fetchActiveInboundQuantities() {
   // 7日以内に作成されたプランのみ対象 (作成→出荷のリードタイムを跨ぐ谷間対策で 3日→7日。2026-06-30)
   const sevenDaysAgo = new Date(Date.now() - 7 * 86400000);
 
-  // 1. ACTIVEプラン一覧を取得
-  const allPlans = [];
+  // 1. ACTIVEプランを「作成日の新しい順」で取得し、7日より古いプランが出たら即停止。
+  //   ※ ACTIVEは出荷・受領後も数ヶ月残る(2026-07時点で471件)。LAST_UPDATED順+全件取得だと
+  //     49ページ/約24秒かかり、/refresh-inbound-working がタイムアウト/throttleで失敗→準備中が空に
+  //     なる事故が出た(2026-07-01)。CREATION_TIME DESC なら7日以内(数件)は先頭に固まるので
+  //     実質1ページで済み、高速・安定する。pageSize=30 (API最大)。
+  let recentPlans = [];
   let nextToken = null;
+  let pageCount = 0;
+  let reachedOld = false;
 
   do {
     const params = new URLSearchParams();
     params.set('status', 'ACTIVE');
-    params.set('pageSize', '10');
-    params.set('sortBy', 'LAST_UPDATED_TIME');
+    params.set('pageSize', '30');
+    params.set('sortBy', 'CREATION_TIME');
     params.set('sortOrder', 'DESC');
     if (nextToken) params.set('paginationToken', nextToken);
 
@@ -286,19 +292,18 @@ export async function fetchActiveInboundQuantities() {
       method: 'GET',
     });
 
-    if (result.inboundPlans) allPlans.push(...result.inboundPlans);
-    // SP-API 応答のページングトークンは pagination.nextToken (旧コードは .token を読んでいて
-    // 常に undefined → 1ページ=先頭10件しか取得できず、ACTIVEが10件超だと作成日が窓内でも
-    // 取りこぼしていた。2026-06-30 修正)。
+    for (const p of (result.inboundPlans || [])) {
+      if (new Date(p.createdAt) >= sevenDaysAgo) recentPlans.push(p);
+      else { reachedOld = true; } // CREATION_TIME DESC: 以降は全て7日より古い
+    }
+    // SP-API 応答のページングトークンは pagination.nextToken (.token ではない)。
     nextToken = result.pagination?.nextToken || null;
-    if (nextToken) await sleep(200); // 多ページ取得時のスロットリング回避
-  } while (nextToken);
+    pageCount++;
+    if (reachedOld) break; // これ以上新しい(7日以内)プランは無いので打ち切り
+    if (nextToken) await sleep(200);
+  } while (nextToken && pageCount < 30);
 
-  console.log(`[Inbound] ACTIVEプラン: ${allPlans.length}件`);
-
-  // 2. 7日以内のプランだけフィルタ
-  const recentPlans = allPlans.filter(p => new Date(p.createdAt) >= sevenDaysAgo);
-  console.log(`[Inbound] 7日以内: ${recentPlans.length}件`);
+  console.log(`[Inbound] 取得ページ=${pageCount} / 7日以内のACTIVEプラン: ${recentPlans.length}件 (打ち切り=${reachedOld})`);
 
   // 3. 各プランのアイテムを取得してSKU別に集計
   const skuQtyMap = {};
