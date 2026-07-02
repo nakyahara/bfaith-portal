@@ -83,7 +83,9 @@
     function applyCandidate(div, c, clickedBtn) {
       div.querySelector('.js-cat').value = String(c.categoryId);
       const pathInput = div.querySelector('.js-path');
-      if (c.defaultPath) pathInput.value = c.defaultPath;
+      // path 不明の候補では必ずクリア (前候補の path が残ったまま保存されると
+      // ID→path 対応表を誤学習するため。 Codex R3-R1 Medium)
+      pathInput.value = c.defaultPath || '';
       div.querySelectorAll('.cand-btn').forEach((b) => b.classList.remove('selected'));
       if (clickedBtn) clickedBtn.classList.add('selected');
       const msg = div.querySelector('.js-msg');
@@ -120,7 +122,7 @@
         '</div>' +
         '<div class="row g-2 mt-1 align-items-center">' +
           '<div class="col-auto"><label class="small text-muted">Yahoo数字ID</label>' +
-            '<input type="text" inputmode="numeric" class="form-control form-control-sm js-cat" style="width:140px;" value="' + (g.existingCategoryId || '') + '" placeholder="例 43494"></div>' +
+            '<input type="text" inputmode="numeric" class="form-control form-control-sm js-cat" style="width:140px;" value="' + esc(g.existingCategoryId || '') + '" placeholder="例 43494"></div>' +
           '<div class="col"><label class="small text-muted">path (店の棚)</label>' +
             '<input type="text" class="form-control form-control-sm js-path" value="' + esc(g.existingPath || '') + '" placeholder="例 生活雑貨・日用品:掃除用品"></div>' +
           '<div class="col-auto pt-3"><button class="btn btn-sm btn-success js-save">保存</button></div>' +

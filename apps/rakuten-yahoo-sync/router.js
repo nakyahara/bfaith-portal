@@ -995,7 +995,13 @@ router.post('/api/yahoo-category/bind', (req, res) => {
         VALUES (@genreId, @cat, @path, 'dashboard_input', strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         ON CONFLICT(rakuten_genre_id) DO UPDATE SET
           yahoo_category_id = excluded.yahoo_category_id,
-          yahoo_path        = COALESCE(NULLIF(excluded.yahoo_path, ''), category_manual.yahoo_path),
+          -- Codex R3-R1 Medium: 旧 path の保持は「ID が変わらない場合」のみ。
+          -- ID を変えて path 空で保存したとき、 旧 ID 用の path が新 ID に残るのを防ぐ。
+          yahoo_path        = CASE
+                                WHEN NULLIF(excluded.yahoo_path, '') IS NOT NULL THEN excluded.yahoo_path
+                                WHEN category_manual.yahoo_category_id = excluded.yahoo_category_id THEN category_manual.yahoo_path
+                                ELSE NULL
+                              END,
           source            = 'dashboard_input',
           updated_at        = strftime('%Y-%m-%dT%H:%M:%fZ','now')
       `).run({ genreId, cat: yahooCategoryId, path: yahooPath || null });
