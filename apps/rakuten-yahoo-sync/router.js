@@ -25,7 +25,7 @@ import { evaluateItemForPublish } from './services/publish-pipeline.js';
 import { fetchAllItemCodes, fetchItemDetail } from './lib/rakuten-rms-proxy.js';
 import { createNotionPagesFromRakuten } from './services/notion-create-page.js';
 import { seedNotionDrafts } from './services/notion-draft-seed.js';
-import { runRefreshPipeline, getRefreshRun, findActiveRefreshRun } from './services/refresh-pipeline.js';
+import { startRefreshRun, executeRefreshPipeline, getRefreshRun } from './services/refresh-pipeline.js';
 import { executePublish, isPublishEnabled, buildIdempotencyKey } from './services/publish-executor.js';
 import { translateReason, summarizeReasons, categorizeReason } from './lib/reason-translator.js';
 import { resolveCategoryAndPath } from './services/category-resolver.js';
@@ -719,27 +719,19 @@ router.post('/api/admin/create-notion-pages-from-rakuten', async (req, res) => {
 router.post('/api/refresh/start', (req, res) => {
   try {
     const db = getDB();
-    const active = findActiveRefreshRun(db);
-    if (active) {
-      return res.status(409).json({ status: 'already_running', runId: active.run_id, currentStep: active.current_step });
-    }
-    // background 実行 (bulk-publish と同パターン)。 排他は runRefreshPipeline 内で再チェック。
-    let started = false;
-    const p = runRefreshPipeline({ db, triggeredBy: 'manual' });
-    started = true;
-    p.then((r) => {
-      console.log(`[rys-refresh] pipeline OK run_id=${r.runId}`);
-    }).catch((e) => {
-      if (e.statusCode === 409) {
-        console.warn(`[rys-refresh] concurrent start rejected: ${e.message}`);
-      } else {
-        console.error(`[rys-refresh] pipeline failed run_id=${e.runId ?? '?'} step=${e.failedStep ?? '?'}: ${e.message}`);
-      }
-    });
-    // 起動直後の run を返す (INSERT は runRefreshPipeline 冒頭で同期実行済)
-    const run = getRefreshRun(db);
-    audit(db, 'refresh_pipeline_start', { runId: run?.run_id ?? null });
-    return res.json({ status: 'ok', started, runId: run?.run_id ?? null });
+    // 排他確定 + run 行確保は同期 (Codex R4-R1 Medium: 開始失敗を 200 で隠さない)。
+    // 二重起動は partial UNIQUE INDEX (status='running') で DB 制約的に 409。
+    const { runId, runToken } = startRefreshRun(db, { triggeredBy: 'manual' });
+    // 実行本体は background (bulk-publish と同パターン)
+    executeRefreshPipeline({ db, runId, runToken, triggeredBy: 'manual' })
+      .then((r) => {
+        console.log(`[rys-refresh] pipeline OK run_id=${r.runId}`);
+      })
+      .catch((e) => {
+        console.error(`[rys-refresh] pipeline failed run_id=${e.runId ?? runId} step=${e.failedStep ?? '?'}: ${e.message}`);
+      });
+    audit(db, 'refresh_pipeline_start', { runId });
+    return res.json({ status: 'ok', started: true, runId });
   } catch (e) {
     if (e.statusCode === 409) {
       return res.status(409).json({ status: 'already_running', runId: e.runId });

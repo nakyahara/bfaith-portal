@@ -1,5 +1,5 @@
 /**
- * refresh-pipeline (再設計 R4) の test。 外部 I/O は deps 注入で stub。
+ * refresh-pipeline (再設計 R4、 Codex R4-R1 反映版) の test。 外部 I/O は deps 注入で stub。
  *
  * 実行: node --test apps/rakuten-yahoo-sync/services/refresh-pipeline.test.mjs
  */
@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import Db from 'better-sqlite3';
 
-import { runRefreshPipeline, getRefreshRun, findActiveRefreshRun } from './refresh-pipeline.js';
+import { startRefreshRun, executeRefreshPipeline, getRefreshRun, findActiveRefreshRun } from './refresh-pipeline.js';
 
 function setupDb() {
   const db = new Db(':memory:');
@@ -21,8 +21,10 @@ function setupDb() {
       current_step      TEXT,
       steps_json        TEXT CHECK(steps_json IS NULL OR json_valid(steps_json)),
       error_message     TEXT,
+      run_token         TEXT NOT NULL,
       lease_expires_at  TEXT
     );
+    CREATE UNIQUE INDEX idx_refresh_runs_single_running ON refresh_runs(status) WHERE status = 'running';
   `);
   return db;
 }
@@ -47,13 +49,19 @@ function okDeps(overrides = {}) {
       return async () => ({ applied: calls++ === 0 ? 4 : 0, errors: 0 });
     })(),
     syncNotionOverrides: async () => ({ inserted: 1, updated: 2, skipped: 0, deleted: 0, errors: [] }),
+    acquireNotionSyncLock: () => () => {}, // lock 取得成功 (release は no-op)
     ...overrides,
   };
 }
 
+async function runPipeline(db, deps, triggeredBy = 'manual') {
+  const { runId, runToken } = startRefreshRun(db, { triggeredBy });
+  return executeRefreshPipeline({ db, runId, runToken, triggeredBy, deps });
+}
+
 test('happy path: 5 ステップ全部走って success + steps 記録', async () => {
   const db = setupDb();
-  const r = await runRefreshPipeline({ db, triggeredBy: 'manual', deps: okDeps() });
+  const r = await runPipeline(db, okDeps());
   assert.equal(r.status, 'success');
   const run = getRefreshRun(db, r.runId);
   assert.equal(run.status, 'success');
@@ -62,50 +70,92 @@ test('happy path: 5 ステップ全部走って success + steps 記録', async (
   assert.equal(run.steps.full_sync.ok, true);
   assert.equal(run.steps.full_sync.candidatesNew, 2);
   assert.equal(run.steps.genre_backfill.updated, 5);
-  assert.equal(run.steps.notion_pages.created, 1); // 1round 目 created 1 → 2round 目 0 で打ち切り
+  assert.equal(run.steps.notion_pages.created, 1);
   assert.equal(run.steps.draft_seed.applied, 4);
   assert.equal(run.steps.notion_sync.inserted, 1);
 });
 
-test('途中失敗 (notion_pages) → failed + 以降ステップ未実行 + error 記録', async () => {
+test('二重起動: running 中の startRefreshRun は 409 (DB unique 制約)', async () => {
+  const db = setupDb();
+  startRefreshRun(db); // running 行を作る (lease 有効)
+  assert.throws(() => startRefreshRun(db), (e) => e.statusCode === 409);
+});
+
+test('lease 切れ running は steal して新 run 開始できる + 旧 run は failed 化', async () => {
+  const db = setupDb();
+  const first = startRefreshRun(db);
+  db.prepare('UPDATE refresh_runs SET lease_expires_at = ? WHERE run_id = ?')
+    .run(new Date(Date.now() - 60_000).toISOString(), first.runId); // 期限切れに
+  const r = await runPipeline(db, okDeps());
+  assert.equal(r.status, 'success');
+  const stale = getRefreshRun(db, first.runId);
+  assert.equal(stale.status, 'failed');
+  assert.match(stale.error_message, /stale lease/);
+});
+
+test('steal された旧 run の finalize は新 run を上書きしない (owner CAS)', async () => {
+  const db = setupDb();
+  const first = startRefreshRun(db);
+  // 旧 run のステップ実行中に steal された状況を再現: run_token を別物に書き換え
+  const deps = okDeps({
+    runRysFullSync: async () => {
+      db.prepare("UPDATE refresh_runs SET run_token = 'stolen' WHERE run_id = ?").run(first.runId);
+      return { diff: {}, titleBackfill: {} };
+    },
+  });
+  await assert.rejects(
+    () => executeRefreshPipeline({ db, runId: first.runId, runToken: first.runToken, deps }),
+    (e) => e.code === 'LEASE_LOST',
+  );
+  // DB は steal 側の所有のまま (旧 run が failed/success を書いていない)
+  const row = db.prepare('SELECT status, run_token FROM refresh_runs WHERE run_id = ?').get(first.runId);
+  assert.equal(row.status, 'running');
+  assert.equal(row.run_token, 'stolen');
+});
+
+test('notion_pages: service が {error} を返したら fail-closed (Codex R4-R1)', async () => {
   const db = setupDb();
   let syncCalled = false;
   const deps = okDeps({
-    createNotionPagesFromRakuten: async () => { throw new Error('notion 500'); },
-    syncNotionOverrides: async () => { syncCalled = true; return {}; },
+    createNotionPagesFromRakuten: async () => ({ error: 'rakuten_rms: 502', results: [] }),
+    syncNotionOverrides: async () => { syncCalled = true; return { errors: [] }; },
   });
-  await assert.rejects(
-    () => runRefreshPipeline({ db, deps }),
-    (e) => e.failedStep === 'notion_pages' && /notion 500/.test(e.message),
-  );
+  await assert.rejects(() => runPipeline(db, deps), (e) => e.failedStep === 'notion_pages' && /rakuten_rms/.test(e.message));
   assert.equal(syncCalled, false);
   const run = getRefreshRun(db);
   assert.equal(run.status, 'failed');
-  assert.equal(run.current_step, 'notion_pages');
-  assert.equal(run.steps.full_sync.ok, true);
   assert.equal(run.steps.notion_pages.ok, false);
-  assert.match(run.error_message, /notion 500/);
 });
 
-test('running 中は 409 (二重起動拒否)', async () => {
+test('draft_seed: PATCH エラー > 0 は fail-closed (Codex R4-R1)', async () => {
   const db = setupDb();
-  db.prepare(`INSERT INTO refresh_runs (status, current_step, lease_expires_at) VALUES ('running', 'full_sync', ?)`)
-    .run(new Date(Date.now() + 60_000).toISOString());
-  await assert.rejects(
-    () => runRefreshPipeline({ db, deps: okDeps() }),
-    (e) => e.statusCode === 409,
-  );
+  const deps = okDeps({
+    seedNotionDrafts: async () => ({ applied: 2, errors: 3 }),
+  });
+  await assert.rejects(() => runPipeline(db, deps), (e) => e.failedStep === 'draft_seed' && /3 件/.test(e.message));
 });
 
-test('lease 切れ running は steal して新 run 開始できる', async () => {
+test('notion_sync: row error > 0 は fail-closed (Codex R4-R1)', async () => {
   const db = setupDb();
-  db.prepare(`INSERT INTO refresh_runs (status, current_step, lease_expires_at) VALUES ('running', 'full_sync', ?)`)
-    .run(new Date(Date.now() - 60_000).toISOString()); // 期限切れ
-  const r = await runRefreshPipeline({ db, deps: okDeps() });
-  assert.equal(r.status, 'success');
-  const stale = db.prepare(`SELECT status, error_message FROM refresh_runs WHERE run_id = 1`).get();
-  assert.equal(stale.status, 'failed');
-  assert.match(stale.error_message, /stale lease/);
+  const deps = okDeps({
+    syncNotionOverrides: async () => ({ inserted: 1, updated: 0, skipped: 0, deleted: 0, errors: [{ pageId: 'x', error: 'bad' }] }),
+  });
+  await assert.rejects(() => runPipeline(db, deps), (e) => e.failedStep === 'notion_sync' && /1 行/.test(e.message));
+});
+
+test('notion_sync: sync-lock が取れなければ fail (手動 sync との並列防止) + lock は release される', async () => {
+  const db = setupDb();
+  const { SyncLockError } = await import('../lib/sync-lock.js');
+  const busy = okDeps({
+    acquireNotionSyncLock: () => { throw new SyncLockError('locked', { reason: 'alive' }); },
+  });
+  await assert.rejects(() => runPipeline(db, busy), (e) => e.failedStep === 'notion_sync' && /実行中のため中断/.test(e.message));
+  // 成功時に release が呼ばれる
+  let released = false;
+  const db2 = setupDb();
+  const deps2 = okDeps({ acquireNotionSyncLock: () => () => { released = true; } });
+  await runPipeline(db2, deps2);
+  assert.equal(released, true);
 });
 
 test('findActiveRefreshRun: migration 未適用 (table 無し) でも crash しない', () => {
@@ -120,8 +170,19 @@ test('genre backfill: 進捗ゼロで打ち切り (無限ループしない)', a
     countMissingRakutenGenre: () => 100, // 常に残あり
     backfillRakutenGenre: async () => { backfillCalls++; return { updated: 0 }; }, // 進捗なし
   });
-  const r = await runRefreshPipeline({ db, deps });
+  const r = await runPipeline(db, deps);
   assert.equal(r.status, 'success');
   assert.equal(backfillCalls, 1); // updated=0 で即 break
   assert.equal(r.steps.genre_backfill.remaining, 100);
+});
+
+test('triggeredBy が full_sync まで伝播する (Codex R4-R1 Low)', async () => {
+  const db = setupDb();
+  let seen = null;
+  const deps = okDeps({
+    runRysFullSync: async ({ triggeredBy }) => { seen = triggeredBy; return { diff: {}, titleBackfill: {} }; },
+  });
+  await runPipeline(db, deps, 'cron');
+  assert.equal(seen, 'cron');
+  assert.equal(getRefreshRun(db).triggered_by, 'cron');
 });

@@ -2049,17 +2049,22 @@ async function refreshAll(evt) {
   try {
     const res = await fetch('/apps/rakuten-yahoo-sync/api/refresh/start', { method: 'POST' });
     const j = await res.json().catch(() => ({}));
+    let watchRunId = null;
     if (res.status === 409) {
-      statusEl.textContent = '既に実行中です (' + (REFRESH_STEP_LABELS[j.currentStep] || j.currentStep || '?') + ')。 このまま待ちます...';
+      statusEl.textContent = '既に実行中です。 このまま待ちます...';
+      watchRunId = j.runId || null; // 実行中の run を追う
     } else if (!res.ok) {
       throw new Error(j.error || ('HTTP ' + res.status));
+    } else {
+      watchRunId = j.runId; // Codex R4-R1 Medium: 自分が起動した run を明示的に追う
     }
     // polling (3 秒間隔、 最大 30 分)
     for (let i = 0; i < 600; i++) {
       await sleep(3000);
       let run = null;
       try {
-        const sres = await fetch('/apps/rakuten-yahoo-sync/api/refresh/status');
+        const q = watchRunId ? ('?runId=' + encodeURIComponent(watchRunId)) : '';
+        const sres = await fetch('/apps/rakuten-yahoo-sync/api/refresh/status' + q);
         const sj = await sres.json();
         run = sj.run;
       } catch (_) { continue; } // 一時的な fetch 失敗は次の poll で拾う

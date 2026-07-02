@@ -14,6 +14,9 @@ CREATE TABLE refresh_runs (
   current_step      TEXT,                                    -- 実行中ステップ key
   steps_json        TEXT CHECK(steps_json IS NULL OR json_valid(steps_json)),  -- 各ステップの要約結果
   error_message     TEXT,
+  run_token         TEXT NOT NULL,                           -- owner token (update は run_token 一致の CAS、 Codex R4-R1 High)
   lease_expires_at  TEXT                                     -- running の stale 判定 (steal 用)
 );
 CREATE INDEX idx_refresh_runs_status ON refresh_runs(status);
+-- Codex R4-R1 High: running は同時に 1 行だけ (SELECT→INSERT の race を DB 制約で塞ぐ)
+CREATE UNIQUE INDEX idx_refresh_runs_single_running ON refresh_runs(status) WHERE status = 'running';

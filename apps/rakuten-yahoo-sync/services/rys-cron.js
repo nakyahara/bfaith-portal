@@ -13,7 +13,7 @@
 import cron from 'node-cron';
 import { getDB } from '../db.js';
 import { runRysFullSync } from './rys-full-sync.js';
-import { runRefreshPipeline } from './refresh-pipeline.js';
+import { startRefreshRun, executeRefreshPipeline } from './refresh-pipeline.js';
 
 const DEFAULT_CRON_EXPR = '30 22 * * *'; // UTC 22:30 = JST 07:30
 
@@ -35,7 +35,8 @@ export async function runRysCronTick() {
   if (isAutoRefreshEnabled()) {
     try {
       const db = getDB();
-      const r = await runRefreshPipeline({ db, triggeredBy: 'cron' });
+      const { runId, runToken } = startRefreshRun(db, { triggeredBy: 'cron' });
+      const r = await executeRefreshPipeline({ db, runId, runToken, triggeredBy: 'cron' });
       console.log(`[rys-cron] refresh pipeline OK run_id=${r.runId} (${Date.now() - t0}ms)`);
       return { ok: true, pipeline: true, runId: r.runId, steps: r.steps };
     } catch (e) {
