@@ -421,6 +421,18 @@ function notionPageUrl(pageId) {
   return `https://www.notion.so/${id}`;
 }
 
+/**
+ * 再設計 R7: Notion デスクトップアプリで直接開く URL (notion:// プロトコル)。
+ *   中原さんは Notion をアプリで使っており、 ブラウザ側の Notion セッションが無いと
+ *   https リンクはローディングで止まる (「タブは開くがページが表示されない」報告)。
+ *   アプリ deep link ならブラウザのログイン状態に依存しない。
+ */
+function notionAppUrl(pageId) {
+  if (!pageId) return null;
+  const id = String(pageId).replace(/-/g, '');
+  return `notion://www.notion.so/${id}`;
+}
+
 // ───────────────── 画面 ─────────────────
 
 router.get('/', (req, res) => {
@@ -493,6 +505,7 @@ router.get('/', (req, res) => {
     filter,
     search,
     notionPageUrl,  // EJS から呼べるように
+    notionAppUrl,   // R7: Notion アプリ deep link (ブラウザの Notion セッションに依存しない)
     kindLabel,                                            // EJS から英語 enum → 日本語ラベル変換
   });
 });
@@ -1242,6 +1255,7 @@ router.get('/api/products/:itemCode/detail', (req, res) => {
         currentState: job.current_state,
       } : null,
       notionPageUrl: notion?.notion_page_id ? notionPageUrl(notion.notion_page_id) : null,
+      notionAppUrl: notion?.notion_page_id ? notionAppUrl(notion.notion_page_id) : null,
       // Phase E-11-d: Yahoo カテゴリ resolved (drawer 表示)
       yahooCategoryResolved,
     });

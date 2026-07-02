@@ -331,15 +331,19 @@
                   <% if (publishEnabled) { %>▶️ Yahoo に出す<% } else { %>🧪 登録テスト<% } %>
                 </button>
                 <% if (p.notionPageId) { %>
-                  <a href="<%= notionPageUrl(p.notionPageId) %>" target="_blank" class="btn btn-outline-secondary btn-sm">📝 Notion で開く</a>
+                  <%# R7: 主ボタン = Notion アプリ deep link (ブラウザ側の Notion 未ログインだと https は表示されないため)。 副リンク = ブラウザ %>
+                  <a href="<%= notionAppUrl(p.notionPageId) %>" class="btn btn-outline-secondary btn-sm">📝 Notion で開く</a>
+                  <a href="<%= notionPageUrl(p.notionPageId) %>" target="_blank" rel="noopener" class="small text-muted text-center">ブラウザで開く</a>
                 <% } %>
               <% } else if (p.status === 'fixable') { %>
                 <% if (p.notionPageId) { %>
-                  <a href="<%= notionPageUrl(p.notionPageId) %>" target="_blank" class="btn btn-warning btn-sm">📝 Notion で修正</a>
+                  <a href="<%= notionAppUrl(p.notionPageId) %>" class="btn btn-warning btn-sm">📝 Notion で修正</a>
+                  <a href="<%= notionPageUrl(p.notionPageId) %>" target="_blank" rel="noopener" class="small text-muted text-center">ブラウザで開く</a>
                 <% } %>
               <% } else if (p.status === 'done' || p.status === 'excluded' || p.status === 'stale' || p.status === 'orphan') { %>
                 <% if (p.notionPageId) { %>
-                  <a href="<%= notionPageUrl(p.notionPageId) %>" target="_blank" class="btn btn-outline-secondary btn-sm">📝 Notion で開く</a>
+                  <a href="<%= notionAppUrl(p.notionPageId) %>" class="btn btn-outline-secondary btn-sm">📝 Notion で開く</a>
+                  <a href="<%= notionPageUrl(p.notionPageId) %>" target="_blank" rel="noopener" class="small text-muted text-center">ブラウザで開く</a>
                 <% } %>
               <% } %>
             </div>
@@ -1341,9 +1345,16 @@ function buildDetailContent(data) {
   // Notion
   if (data.notion) {
     const pageLink = data.notionPageUrl ? (() => {
+      const wrap = el('span', {});
+      // R7: 主 = アプリ deep link / 副 = ブラウザ
       const a = el('a', { text: 'Notion で開く' });
-      a.href = data.notionPageUrl; a.target = '_blank'; a.rel = 'noopener noreferrer';
-      return a;
+      a.href = data.notionAppUrl || data.notionPageUrl;
+      wrap.appendChild(a);
+      const b = el('a', { text: ' (ブラウザで)' });
+      b.href = data.notionPageUrl; b.target = '_blank'; b.rel = 'noopener noreferrer';
+      b.className = 'small text-muted';
+      wrap.appendChild(b);
+      return wrap;
     })() : null;
     frag.appendChild(dlSection('📝 Notion 上書き値', [
       ['Yahoo!タイトル', data.notion.yahoo_title],
