@@ -457,7 +457,8 @@ router.get('/', (req, res) => {
     try { rakutenGenreMissing = countMissingRakutenGenre(db); } catch (_) { /* migration 012 未適用 */ }
     // 再設計 R6: countMissingYahooCategories は mirror fact 2表のフルスキャンで本番規模だと分単位。
     // dashboard 毎リクエストで呼んでいたのが「画面が重い」の主因 → cache 参照のみに変更。
-    // 実計算は学習/診断 endpoint を回したときだけ (その際 cache が更新される)。
+    // 実計算は countMissingYahooCategories を呼ぶ endpoint (backfill-and-learn / status) を
+    // 明示的に叩いたときだけ (その際 cache が更新される)。
     try { yahooCategoryMissing = getCachedMissingYahooCategories() ?? 0; } catch (_) { /* noop */ }
     try { yahooCategoryLearnedGenres = countLearnedGenres(db); } catch (_) { /* migration 013 未適用 */ }
   } catch (_) {
