@@ -41,7 +41,7 @@ function okDeps(overrides = {}) {
       let calls = 0;
       return async () => ({
         totalScanned: 10,
-        results: calls++ === 0 ? [{ outcome: 'created' }, { outcome: 'skipped_exists' }] : [{ outcome: 'skipped_exists' }],
+        results: calls++ === 0 ? [{ outcome: 'created' }, { outcome: 'already_exists_in_notion' }] : [{ outcome: 'already_exists_in_notion' }],
       });
     })(),
     seedNotionDrafts: (() => {
@@ -185,4 +185,20 @@ test('triggeredBy が full_sync まで伝播する (Codex R4-R1 Low)', async () 
   await runPipeline(db, deps, 'cron');
   assert.equal(seen, 'cron');
   assert.equal(getRefreshRun(db).triggered_by, 'cron');
+});
+
+test('notion_pages: 行単位の失敗 outcome (create_failed 等) も fail-closed (Codex R4-R2)', async () => {
+  const db = setupDb();
+  const deps = okDeps({
+    createNotionPagesFromRakuten: async () => ({
+      totalScanned: 3,
+      results: [{ outcome: 'created' }, { outcome: 'create_failed', error: 'notion 500' }, { outcome: 'rakuten_fetch_failed' }],
+    }),
+  });
+  await assert.rejects(
+    () => runPipeline(db, deps),
+    (e) => e.failedStep === 'notion_pages' && /create_failed=1/.test(e.message) && /rakuten_fetch_failed=1/.test(e.message),
+  );
+  const run = getRefreshRun(db);
+  assert.equal(run.status, 'failed');
 });

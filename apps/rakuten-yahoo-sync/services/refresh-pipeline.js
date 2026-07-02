@@ -180,9 +180,11 @@ export async function executeRefreshPipeline({ db, runId, runToken, triggeredBy 
     }
 
     // ── 3. Notion 未登録 SKU に page 自動作成 ──
-    //   Codex R4-R1 High: createNotionPagesFromRakuten は RMS fetch 失敗を throw せず
-    //   { error } で返すので、 error を成功扱いにせず fail-closed。
+    //   Codex R4-R1/R2 High: createNotionPagesFromRakuten は失敗を throw せず
+    //   { error } や行 outcome (precheck_failed / rakuten_fetch_failed / rakuten_itemName_missing /
+    //   create_failed / lease_lost) で返すので、 許容 outcome の allowlist 以外は fail-closed。
     {
+      const NOTION_PAGE_OK_OUTCOMES = new Set(['created', 'already_exists_in_notion', 'skip_locked']);
       const t0 = Date.now();
       let created = 0, rounds = 0, lastSummary = null;
       for (; rounds < NOTION_PAGES_MAX_ROUNDS; rounds++) {
@@ -193,9 +195,10 @@ export async function executeRefreshPipeline({ db, runId, runToken, triggeredBy 
         const summary = (r.results || []).reduce((acc, x) => { acc[x.outcome] = (acc[x.outcome] || 0) + 1; return acc; }, {});
         lastSummary = summary;
         created += summary.created || 0;
-        const rowErrors = (summary.error || 0) + (summary.failed || 0);
-        if (rowErrors > 0) {
-          throw new Error(`notion_pages: ${rowErrors} 件の page 作成エラー (created=${created} まで反映済み)`);
+        const badOutcomes = Object.entries(summary).filter(([k]) => !NOTION_PAGE_OK_OUTCOMES.has(k));
+        if (badOutcomes.length > 0) {
+          const detail = badOutcomes.map(([k, v]) => `${k}=${v}`).join(', ');
+          throw new Error(`notion_pages: 行単位の失敗 ${detail} (created=${created} まで反映済み、 再実行で続きから)`);
         }
         if ((summary.created || 0) === 0) break;
       }
