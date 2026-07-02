@@ -108,6 +108,15 @@
     <!-- 👇 今日やること (案 C ヘッダー) -->
     <div class="summary-card">
       <h5 class="mb-3">📋 きょうやること</h5>
+      <%# 再設計 R4: データ最新化を 1 ボタンに集約 (差分再取得→genre取得→Notionページ作成→下書き補完→Notion取込) %>
+      <div class="mb-3 p-2" style="background:#eef6ff; border:1px solid #b6d4fe; border-radius:.5em;">
+        <button class="btn btn-primary btn-sm js-refresh-all">🔄 全部更新 (データ最新化を一括実行)</button>
+        <span class="js-refresh-status small text-muted ms-2"></span>
+        <div class="small text-muted mt-1">
+          楽天↔Yahoo差分の再取得 → 楽天情報の取りこぼし埋め → Notionページ自動作成 → 下書き自動補完 → Notion取込 を順に実行します (数分かかります)。
+          下の個別ボタンを順に押すのと同じです。
+        </div>
+      </div>
       <ol class="next-todo mb-0">
         <li>
           <strong>Notion を最新にする</strong>
@@ -2021,8 +2030,76 @@ async function deleteImagePattern(id, pattern) {
   }
 }
 
+// ───── 全部更新 (再設計 R4) ─────
+const REFRESH_STEP_LABELS = {
+  full_sync: '楽天↔Yahoo差分の再取得',
+  genre_backfill: '楽天ジャンル情報の取得',
+  notion_pages: 'Notionページ自動作成',
+  draft_seed: 'Notion下書き自動補完',
+  notion_sync: 'Notion取込',
+};
+
+async function refreshAll(evt) {
+  const btn = evt.currentTarget;
+  const statusEl = document.querySelector('.js-refresh-status');
+  if (!btn || btn.disabled) return;
+  if (!confirm('データ最新化を一括実行します (数分かかります)。 続行しますか?')) return;
+  btn.disabled = true;
+  statusEl.textContent = '開始中...';
+  try {
+    const res = await fetch('/apps/rakuten-yahoo-sync/api/refresh/start', { method: 'POST' });
+    const j = await res.json().catch(() => ({}));
+    if (res.status === 409) {
+      statusEl.textContent = '既に実行中です (' + (REFRESH_STEP_LABELS[j.currentStep] || j.currentStep || '?') + ')。 このまま待ちます...';
+    } else if (!res.ok) {
+      throw new Error(j.error || ('HTTP ' + res.status));
+    }
+    // polling (3 秒間隔、 最大 30 分)
+    for (let i = 0; i < 600; i++) {
+      await sleep(3000);
+      let run = null;
+      try {
+        const sres = await fetch('/apps/rakuten-yahoo-sync/api/refresh/status');
+        const sj = await sres.json();
+        run = sj.run;
+      } catch (_) { continue; } // 一時的な fetch 失敗は次の poll で拾う
+      if (!run) continue;
+      if (run.status === 'running') {
+        statusEl.textContent = '実行中: ' + (REFRESH_STEP_LABELS[run.current_step] || run.current_step || '...') ;
+        continue;
+      }
+      if (run.status === 'success') {
+        const s = run.steps || {};
+        alert('全部更新が完了しました。\n'
+          + '・新しい移行候補: ' + (s.full_sync?.candidatesNew ?? '?') + ' 件\n'
+          + '・ジャンル取得: ' + (s.genre_backfill?.updated ?? '?') + ' 件\n'
+          + '・Notionページ作成: ' + (s.notion_pages?.created ?? '?') + ' 件\n'
+          + '・下書き補完: ' + (s.draft_seed?.applied ?? '?') + ' 件\n'
+          + '・Notion取込 更新: ' + ((s.notion_sync?.inserted ?? 0) + (s.notion_sync?.updated ?? 0)) + ' 件\n\n'
+          + 'ページを再読み込みします。');
+        location.reload();
+        return;
+      }
+      // failed
+      alert('全部更新が途中で失敗しました。\n'
+        + '失敗ステップ: ' + (REFRESH_STEP_LABELS[run.current_step] || run.current_step || '?') + '\n'
+        + 'エラー: ' + (run.error_message || '?') + '\n\n'
+        + 'もう一度「全部更新」を押すと続きから相当の処理をやり直します。');
+      statusEl.textContent = '失敗 (' + (REFRESH_STEP_LABELS[run.current_step] || run.current_step || '?') + ')';
+      btn.disabled = false;
+      return;
+    }
+    statusEl.textContent = 'タイムアウト (バックグラウンドで継続中の可能性)。 後でページを再読み込みしてください';
+    btn.disabled = false;
+  } catch (e) {
+    statusEl.textContent = '失敗: ' + e.message;
+    btn.disabled = false;
+  }
+}
+
 // 起動時 event 配線
 document.addEventListener('DOMContentLoaded', () => {
+  document.querySelector('.js-refresh-all')?.addEventListener('click', refreshAll);
   document.querySelector('.js-open-exclusion-mgmt')?.addEventListener('click', openExclusionModal);
   document.querySelector('.js-open-image-exclusion-mgmt')?.addEventListener('click', openImageExclusionModal);
   document.querySelector('.js-backfill-rakuten-title')?.addEventListener('click', backfillRakutenTitle);

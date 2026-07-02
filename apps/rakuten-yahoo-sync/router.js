@@ -22,9 +22,10 @@ import { acquire, SyncLockError } from './lib/sync-lock.js';
 import { syncNotionOverrides } from './services/notion-sync.js';
 import { patchPageProperties } from './lib/notion-client.js';
 import { evaluateItemForPublish } from './services/publish-pipeline.js';
-import { fetchAllItemCodes, fetchItemDetail, fetchItemDetailsBulkDetailed } from './lib/rakuten-rms-proxy.js';
-import { buildNotionDraftProposal, toNotionProperties } from './lib/rakuten-to-notion-draft.js';
+import { fetchAllItemCodes, fetchItemDetail } from './lib/rakuten-rms-proxy.js';
 import { createNotionPagesFromRakuten } from './services/notion-create-page.js';
+import { seedNotionDrafts } from './services/notion-draft-seed.js';
+import { runRefreshPipeline, getRefreshRun, findActiveRefreshRun } from './services/refresh-pipeline.js';
 import { executePublish, isPublishEnabled, buildIdempotencyKey } from './services/publish-executor.js';
 import { translateReason, summarizeReasons, categorizeReason } from './lib/reason-translator.js';
 import { resolveCategoryAndPath } from './services/category-resolver.js';
@@ -650,101 +651,19 @@ router.post('/api/admin/seed-notion-drafts', async (req, res) => {
   try {
     const db = getDB();
     const body = req.body || {};
-    const dryRun = body.dryRun !== false; // default true
-    const limit = Math.max(1, Math.min(parseInt(body.limit, 10) || 200, 500));
-    const explicitCodes = Array.isArray(body.itemCodes) ? body.itemCodes.map(String).filter(Boolean) : null;
-
-    // 1. 対象 SKU 取得 (notion_overrides に居て、 yahoo_title/yahoo_price/notion_tax_rate/notion_delivery_label のいずれかが空欄)
-    //    Codex Phase E-15 R2 H-2: 配送方法 missing も対象に追加
-    const filterSql = explicitCodes && explicitCodes.length > 0
-      ? `WHERE no.rakuten_manage_number IN (${explicitCodes.map(() => '?').join(',')})`
-      : `WHERE (no.yahoo_title IS NULL OR no.yahoo_title = ''
-              OR no.yahoo_price IS NULL OR no.yahoo_price <= 0
-              OR no.notion_tax_rate IS NULL OR no.notion_tax_rate = ''
-              OR no.notion_delivery_label IS NULL OR no.notion_delivery_label = '')`;
-    const rows = db.prepare(`
-      SELECT no.notion_page_id, no.rakuten_manage_number AS manage_number,
-             no.yahoo_title, no.yahoo_price, no.notion_tax_rate, no.notion_delivery_label
-      FROM notion_overrides no
-      ${filterSql}
-      ORDER BY no.rakuten_manage_number
-      LIMIT ${limit}
-    `).all(...(explicitCodes || []));
-
-    if (rows.length === 0) {
-      return res.json({ status: 'ok', totalScanned: 0, proposed: [], skipped: [], applied: [], errors: [] });
-    }
-
-    // 2. 楽天 RMS bulk fetch
-    const manageNumbers = rows.map((r) => r.manage_number);
-    let rakutenItems = [];
-    let rakutenFailed = [];
-    try {
-      const r = await fetchItemDetailsBulkDetailed(manageNumbers);
-      rakutenItems = r.items || [];
-      rakutenFailed = r.failed || [];
-    } catch (e) {
-      return res.status(502).json({ status: 'fail', error: `rakuten_rms: ${e.message}` });
-    }
-    const rakutenByMn = new Map(rakutenItems.map((it) => [it.manageNumber, it]));
-
-    // 3. 各 SKU で proposal 構築 + (apply mode なら) PATCH
-    const proposed = [];
-    const skipped = [];
-    const applied = [];
-    const errors = [];
-    for (const r of rows) {
-      const rakutenItem = rakutenByMn.get(r.manage_number);
-      if (!rakutenItem) {
-        // Codex R2 軽微: fetchItemDetailsBulkDetailed の failed shape は { manageNumber, reason }
-        const f = rakutenFailed.find((f) => f.manageNumber === r.manage_number);
-        skipped.push({ itemCode: r.manage_number, reason: 'rakuten_fetch_failed', detail: f?.reason || null });
-        continue;
-      }
-      const { proposed: prop, skipped: skip } = buildNotionDraftProposal(rakutenItem, r);
-      if (Object.keys(prop).length === 0) {
-        skipped.push({ itemCode: r.manage_number, reason: 'all_skipped', detail: skip });
-        continue;
-      }
-      proposed.push({ itemCode: r.manage_number, manage_number: r.manage_number, proposed: prop, skipped: skip });
-
-      if (!dryRun) {
-        try {
-          const properties = toNotionProperties(prop);
-          await patchPageProperties(r.notion_page_id, properties);
-          // 自 DB cache も即反映 (Notion 側の次回 sync を待たない)
-          try {
-            const updates = [];
-            const params = [];
-            if (prop.yahoo_title)      { updates.push('yahoo_title = ?');      params.push(prop.yahoo_title); }
-            if (prop.yahoo_price != null) { updates.push('yahoo_price = ?');    params.push(prop.yahoo_price); }
-            if (prop.notion_tax_rate)  { updates.push('notion_tax_rate = ?');   params.push(prop.notion_tax_rate); }
-            if (prop.notion_delivery_label) { updates.push('notion_delivery_label = ?'); params.push(prop.notion_delivery_label); }
-            if (updates.length > 0) {
-              updates.push(`synced_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`);
-              params.push(r.notion_page_id);
-              db.prepare(`UPDATE notion_overrides SET ${updates.join(', ')} WHERE notion_page_id = ?`).run(...params);
-            }
-          } catch (_) { /* best-effort */ }
-          applied.push({ itemCode: r.manage_number, proposed: prop });
-          audit(db, 'notion_seed_draft', { itemCode: r.manage_number, proposed: prop });
-        } catch (e) {
-          errors.push({ itemCode: r.manage_number, error: e.message });
-        }
-      }
-    }
-
-    return res.json({
-      status: 'ok',
-      dryRun,
-      totalScanned: rows.length,
-      proposed: proposed.length,
-      skipped: skipped.length,
-      applied: applied.length,
-      errors: errors.length,
-      details: { proposed, skipped, applied, errors },
+    // 再設計 R4: 実装は services/notion-draft-seed.js に抽出 (refresh-pipeline と共用)。 ロジック不変。
+    const r = await seedNotionDrafts({
+      db,
+      dryRun: body.dryRun !== false, // default true
+      itemCodes: Array.isArray(body.itemCodes) ? body.itemCodes : null,
+      limit: parseInt(body.limit, 10) || 200,
+      audit,
     });
+    return res.json({ status: 'ok', dryRun: body.dryRun !== false, ...r });
   } catch (e) {
+    if (e.statusCode === 502) {
+      return res.status(502).json({ status: 'fail', error: e.message });
+    }
     return res.status(500).json({ status: 'fail', error: e.message });
   }
 });
@@ -785,6 +704,61 @@ router.post('/api/admin/create-notion-pages-from-rakuten', async (req, res) => {
       error: r.error || null,
       results: r.results,
     });
+  } catch (e) {
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+// ───────────────── 再設計 R4: 「全部更新」パイプライン ─────────────────
+
+/**
+ * 再設計 R4: 全部更新 (差分再取得→genre backfill→Notionページ作成→下書き補完→Notion sync) を
+ *   1 ボタンで直列実行する。 background 起動で即 runId を返し、 進捗は status endpoint で polling。
+ *   同時実行は refresh_runs の running + lease で 409。
+ */
+router.post('/api/refresh/start', (req, res) => {
+  try {
+    const db = getDB();
+    const active = findActiveRefreshRun(db);
+    if (active) {
+      return res.status(409).json({ status: 'already_running', runId: active.run_id, currentStep: active.current_step });
+    }
+    // background 実行 (bulk-publish と同パターン)。 排他は runRefreshPipeline 内で再チェック。
+    let started = false;
+    const p = runRefreshPipeline({ db, triggeredBy: 'manual' });
+    started = true;
+    p.then((r) => {
+      console.log(`[rys-refresh] pipeline OK run_id=${r.runId}`);
+    }).catch((e) => {
+      if (e.statusCode === 409) {
+        console.warn(`[rys-refresh] concurrent start rejected: ${e.message}`);
+      } else {
+        console.error(`[rys-refresh] pipeline failed run_id=${e.runId ?? '?'} step=${e.failedStep ?? '?'}: ${e.message}`);
+      }
+    });
+    // 起動直後の run を返す (INSERT は runRefreshPipeline 冒頭で同期実行済)
+    const run = getRefreshRun(db);
+    audit(db, 'refresh_pipeline_start', { runId: run?.run_id ?? null });
+    return res.json({ status: 'ok', started, runId: run?.run_id ?? null });
+  } catch (e) {
+    if (e.statusCode === 409) {
+      return res.status(409).json({ status: 'already_running', runId: e.runId });
+    }
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+/**
+ * 再設計 R4: 最新 (または指定 runId の) パイプライン実行状態。
+ *   { run_id, status: running|success|failed, current_step, steps: {step: {ok, ...}}, ... }
+ */
+router.get('/api/refresh/status', (req, res) => {
+  try {
+    const db = getDB();
+    const runId = req.query.runId ? Number(req.query.runId) : null;
+    const run = getRefreshRun(db, Number.isFinite(runId) && runId > 0 ? runId : null);
+    if (!run) return res.json({ status: 'ok', run: null });
+    return res.json({ status: 'ok', run });
   } catch (e) {
     return res.status(500).json({ status: 'fail', error: e.message });
   }

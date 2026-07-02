@@ -13,14 +13,40 @@
 import cron from 'node-cron';
 import { getDB } from '../db.js';
 import { runRysFullSync } from './rys-full-sync.js';
+import { runRefreshPipeline } from './refresh-pipeline.js';
 
 const DEFAULT_CRON_EXPR = '30 22 * * *'; // UTC 22:30 = JST 07:30
+
+/**
+ * 再設計 R4: RYS_AUTO_REFRESH='1'|'true' なら daily tick で「全部更新」パイプライン
+ * (full sync + genre backfill + Notion ページ作成 + 下書き補完 + Notion sync) を回す。
+ * 未設定なら従来通り full sync のみ (後方互換)。
+ */
+function isAutoRefreshEnabled() {
+  const v = process.env.RYS_AUTO_REFRESH;
+  return v === '1' || v === 'true';
+}
 
 /**
  * cron で 1 回 fire される実体。 例外を飲んで logger に出す。
  */
 export async function runRysCronTick() {
   const t0 = Date.now();
+  if (isAutoRefreshEnabled()) {
+    try {
+      const db = getDB();
+      const r = await runRefreshPipeline({ db, triggeredBy: 'cron' });
+      console.log(`[rys-cron] refresh pipeline OK run_id=${r.runId} (${Date.now() - t0}ms)`);
+      return { ok: true, pipeline: true, runId: r.runId, steps: r.steps };
+    } catch (e) {
+      if (e.statusCode === 409) {
+        console.warn(`[rys-cron] refresh pipeline skip (already running): ${e.message}`);
+        return { ok: false, pipeline: true, skipped: 'already_running' };
+      }
+      console.error(`[rys-cron] refresh pipeline failed step=${e.failedStep ?? '?'}: ${e.message} (${Date.now() - t0}ms)`);
+      return { ok: false, pipeline: true, error: e.message, failedStep: e.failedStep ?? null };
+    }
+  }
   try {
     const db = getDB();
     const r = await runRysFullSync({ db, triggeredBy: 'cron' });
