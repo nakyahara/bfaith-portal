@@ -52,12 +52,21 @@ function setupDb() {
     CREATE TABLE category_ai (
       rakuten_genre_id   TEXT PRIMARY KEY,
       yahoo_category_id  INTEGER NOT NULL,
-      confidence         REAL,
+      confidence         REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
       decided_by         TEXT NOT NULL DEFAULT 'llm' CHECK(decided_by IN ('exact_match', 'llm')),
       note               TEXT,
       created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
     );
+    CREATE TABLE yahoo_category_master (
+      product_category   TEXT PRIMARY KEY,
+      name               TEXT NOT NULL,
+      path_name          TEXT,
+      is_active          INTEGER NOT NULL DEFAULT 1
+    );
   `);
+  // AI tier テストで使う master 行 (1843=active / 7777=inactive)
+  db.prepare("INSERT INTO yahoo_category_master (product_category, name, is_active) VALUES ('1843', 'ハンドケア用品', 1)").run();
+  db.prepare("INSERT INTO yahoo_category_master (product_category, name, is_active) VALUES ('7777', '廃止カテゴリ', 0)").run();
   return db;
 }
 
@@ -274,4 +283,26 @@ test('category_ai テーブル未適用 (migration 020 前) でも crash せず 
   db.exec('CREATE TABLE category_manual (rakuten_genre_id TEXT PRIMARY KEY, yahoo_category_id INTEGER NOT NULL, yahoo_path TEXT, note TEXT)');
   const r = resolveCategoryAndPath({ db, rakutenGenreId: '304759' });
   assert.equal(r.source, 'unresolved');
+});
+
+test('category_ai: confidence < 0.6 の llm 行は採用しない (Codex R2 R1)', () => {
+  const db = setupDb();
+  db.prepare('INSERT INTO category_ai (rakuten_genre_id, yahoo_category_id, confidence, decided_by) VALUES (?, ?, ?, ?)')
+    .run('304759', 1843, 0.5, 'llm');
+  db.prepare('INSERT INTO category_default_path (yahoo_category_id, yahoo_path) VALUES (?, ?)')
+    .run(1843, 'コスメ:ハンドケア');
+  const r = resolveCategoryAndPath({ db, rakutenGenreId: '304759' });
+  assert.equal(r.source, 'unresolved');
+});
+
+test('category_ai: master に無い / is_active=0 のカテゴリは採用しない (Codex R2 R1)', () => {
+  const db = setupDb();
+  db.prepare('INSERT INTO category_ai (rakuten_genre_id, yahoo_category_id, confidence) VALUES (?, ?, ?)')
+    .run('111', 7777, 0.9); // inactive
+  db.prepare('INSERT INTO category_ai (rakuten_genre_id, yahoo_category_id, confidence) VALUES (?, ?, ?)')
+    .run('222', 99999, 0.9); // master に無い
+  db.prepare('INSERT INTO category_default_path (yahoo_category_id, yahoo_path) VALUES (?, ?)').run(7777, 'x');
+  db.prepare('INSERT INTO category_default_path (yahoo_category_id, yahoo_path) VALUES (?, ?)').run(99999, 'y');
+  assert.equal(resolveCategoryAndPath({ db, rakutenGenreId: '111' }).source, 'unresolved');
+  assert.equal(resolveCategoryAndPath({ db, rakutenGenreId: '222' }).source, 'unresolved');
 });

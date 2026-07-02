@@ -115,7 +115,13 @@ function resolveFromDecisions(db, genreId) {
 /**
  * category_ai (再設計 R2: Claude Code 一括生成の AI 初期紐づけ) を引く。
  * path は category_default_path からのみ補完 (AI は path=店の棚 を推定しない。 店カテゴリは人の管轄)。
+ *
+ * Codex R2 R1 Medium ×2:
+ *   - exact_match 以外は confidence >= 0.6 を要求 (seed 生成ミスの低確信行を採用しない二重ゲート)
+ *   - yahoo_category_master に実在 + is_active=1 のカテゴリのみ採用 (廃止 ID の publish を防ぐ)
  */
+const AI_MIN_CONFIDENCE = 0.6;
+
 function resolveFromAi(db, genreId) {
   if (!db || !genreId) return null;
   try {
@@ -123,9 +129,13 @@ function resolveFromAi(db, genreId) {
       SELECT ai.yahoo_category_id, ai.confidence, ai.decided_by,
              dp.yahoo_path AS resolved_path
       FROM category_ai ai
+      JOIN yahoo_category_master m
+        ON m.product_category = CAST(ai.yahoo_category_id AS TEXT)
+       AND m.is_active = 1
       LEFT JOIN category_default_path dp
         ON dp.yahoo_category_id = ai.yahoo_category_id
       WHERE ai.rakuten_genre_id = ?
+        AND (ai.decided_by = 'exact_match' OR ai.confidence >= ${AI_MIN_CONFIDENCE})
       LIMIT 1
     `).get(genreId);
     if (!row || !Number.isFinite(row.yahoo_category_id)) return null;

@@ -19,10 +19,12 @@
 -- 021 失敗時も 020 の表が空で残るだけ (resolver は fail-soft) なので 019 のような統合は不要。
 
 -- AI 確定分 (1 genre = 1 決定)
+-- Codex R2 R1 Medium: confidence は NOT NULL + 0..1 CHECK (seed 生成ミスの混入を schema で弾く)。
+--   resolver 側も exact_match 以外は confidence >= 0.6 を要求する二重ゲート。
 CREATE TABLE category_ai (
   rakuten_genre_id   TEXT PRIMARY KEY,
   yahoo_category_id  INTEGER NOT NULL,
-  confidence         REAL,                                   -- 0..1 (exact_match は 1.0)
+  confidence         REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),  -- exact_match は 1.0
   decided_by         TEXT NOT NULL DEFAULT 'llm'
                        CHECK(decided_by IN ('exact_match', 'llm')),
   note               TEXT,                                   -- 判定理由 (短文)
@@ -30,10 +32,12 @@ CREATE TABLE category_ai (
 );
 
 -- AI 候補 top3 (全 genre、 棄権分含む。 紐付け画面 v2 の「候補から選ぶ」表示素)
+-- Codex R2 R1 Low: 同一 genre への同一カテゴリ重複投入を UNIQUE で弾く。
 CREATE TABLE category_ai_candidates (
   rakuten_genre_id   TEXT NOT NULL,
   rank               INTEGER NOT NULL CHECK(rank BETWEEN 1 AND 3),
   yahoo_category_id  INTEGER NOT NULL,
   score              REAL,                                   -- 機械スコア (参考値)
-  PRIMARY KEY (rakuten_genre_id, rank)
+  PRIMARY KEY (rakuten_genre_id, rank),
+  UNIQUE (rakuten_genre_id, yahoo_category_id)
 );
