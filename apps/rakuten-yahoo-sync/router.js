@@ -58,6 +58,7 @@ import { fetchYahooItemDetailsBulk } from './lib/yahoo-detail-proxy.js';
 import { searchCategoryMaster, countCategoryMaster } from './lib/category-master-search.js';
 import {
   countMissingYahooCategories,
+  getCachedMissingYahooCategories,
   backfillYahooCategoriesAndPaths,
   learnGenreCategoryMapping,
   countLearnedGenres,
@@ -439,21 +440,32 @@ router.get('/', (req, res) => {
     : 'actionable'; // default は「すぐ移行できる」 = やるべきこと
   const search = String(req.query.q || '');
 
+  const perfT0 = performance.now();
+  let perfListMs = null;
   try {
     const db = getDB();
     syncState = getSyncState(db);
     publishSummary = getPublishSummary(db);
+    const tList = performance.now();
     const listed = listProductsForUI(db, { filter, search });
+    perfListMs = performance.now() - tList;
     products = listed.products;
     summary = listed.summary;
     fixableByCategory = listed.fixableByCategory;
     exclusionCount = countActiveByKind(db);
     try { rakutenTitleMissing = countMissingRakutenTitles(db); } catch (_) { /* migration 011 未適用 */ }
     try { rakutenGenreMissing = countMissingRakutenGenre(db); } catch (_) { /* migration 012 未適用 */ }
-    try { yahooCategoryMissing = countMissingYahooCategories(db, getMirrorDbPath()); } catch (_) { /* migration 012 未適用 or mirror 未設定 */ }
+    // 再設計 R6: countMissingYahooCategories は mirror fact 2表のフルスキャンで本番規模だと分単位。
+    // dashboard 毎リクエストで呼んでいたのが「画面が重い」の主因 → cache 参照のみに変更。
+    // 実計算は学習/診断 endpoint を回したときだけ (その際 cache が更新される)。
+    try { yahooCategoryMissing = getCachedMissingYahooCategories() ?? 0; } catch (_) { /* noop */ }
     try { yahooCategoryLearnedGenres = countLearnedGenres(db); } catch (_) { /* migration 013 未適用 */ }
   } catch (_) {
     // DB 未初期化等は空 state で表示 continue
+  }
+  // R6: PERF_LOG=1 のとき dashboard 表示のサーバ側コストを観測 (portal 共通の計測基盤と同じ流儀)
+  if (process.env.PERF_LOG === '1') {
+    console.log(`[rys-perf] GET / filter=${filter} products=${products.length} listMs=${perfListMs?.toFixed(1)} totalMs=${(performance.now() - perfT0).toFixed(1)}`);
   }
 
   // Notion sync 鮮度 (3 日以上前なら警告)
