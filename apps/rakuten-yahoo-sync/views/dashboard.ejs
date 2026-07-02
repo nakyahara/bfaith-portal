@@ -105,102 +105,37 @@
   </nav>
 
   <div class="container py-4" style="max-width: 1100px;">
-    <!-- 👇 今日やること (案 C ヘッダー) -->
+    <!-- 👇 進め方 3 ステップ (再設計 R5) -->
     <div class="summary-card">
-      <h5 class="mb-3">📋 きょうやること</h5>
-      <%# 再設計 R4: データ最新化を 1 ボタンに集約 (差分再取得→genre取得→Notionページ作成→下書き補完→Notion取込) %>
-      <div class="mb-3 p-2" style="background:#eef6ff; border:1px solid #b6d4fe; border-radius:.5em;">
-        <button class="btn btn-primary btn-sm js-refresh-all">🔄 全部更新 (データ最新化を一括実行)</button>
+      <h5 class="mb-3">📋 進め方 (3ステップ)</h5>
+
+      <%# STEP 1: データ最新化 = 「全部更新」1 ボタン (再設計 R4 パイプライン)。 個別ボタンは ⚙ 詳細設定へ退避 %>
+      <div class="mb-3 p-3" style="background:#eef6ff; border:1px solid #b6d4fe; border-radius:.5em;">
+        <div class="mb-1"><span class="badge bg-primary">STEP 1</span> <strong>データを最新にする</strong></div>
+        <button class="btn btn-primary btn-sm js-refresh-all">🔄 全部更新</button>
         <span class="js-refresh-status small text-muted ms-2"></span>
         <div class="small text-muted mt-1">
-          楽天↔Yahoo差分の再取得 → 楽天情報の取りこぼし埋め → Notionページ自動作成 → 下書き自動補完 → Notion取込 を順に実行します (数分かかります)。
-          下の個別ボタンを順に押すのと同じです。
+          楽天とYahoo!の最新状態を取り直し、 Notionのページ作成・下書き補完・取り込みまで自動で行います (数分かかります)。
+          <% if (syncState?.last_successful_sync_at) { %>
+            前回のNotion取込: <code><%= syncState.last_successful_sync_at %></code>
+            <% if (syncDaysAgo !== null) { %>
+              (<%= syncDaysAgo %> 日前<% if (syncDaysAgo >= 3) { %> <span class="text-danger">⚠ 古いので実行推奨</span><% } %>)
+            <% } %>
+          <% } else { %>
+            (まだ一度も取り込んでいません → まずこのボタン)
+          <% } %>
         </div>
       </div>
-      <ol class="next-todo mb-0">
-        <li>
-          <strong>Notion を最新にする</strong>
-          <% if (syncState?.last_successful_sync_at) { %>
-            <span class="text-muted small">
-              （前回: <code><%= syncState.last_successful_sync_at %></code>
-              <% if (syncDaysAgo !== null) { %>
-                ・<%= syncDaysAgo %> 日前
-                <% if (syncDaysAgo >= 3) { %>
-                  <span class="text-danger">⚠ 古いです、 取り込み推奨</span>
-                <% } %>
-              <% } %>）
-            </span>
-          <% } else { %>
-            <span class="text-muted small">（まだ取り込んでいません）</span>
-          <% } %>
-          <button class="btn btn-sm btn-outline-primary ms-2" onclick="runSync()">いま取り込む</button>
-        </li>
-        <li>
-          <strong>楽天↔Yahoo 差分を取り直す</strong>
-          <span class="text-muted small">（毎朝自動、 今すぐ取りたい時だけボタン）</span>
-          <button class="btn btn-sm btn-outline-info ms-2 js-trigger-diff-sync">いま再取得</button>
-          <%# Phase E-9 中原さん指摘修正: 「Notion 修正待ち」 の横にあると Notion から取ってる
-              ように見える → 楽天 RMS から取得するボタンなので 「楽天↔Yahoo 差分」 行に移動。
-              ラベルも 「楽天 RMS から」 を明示。 %>
-          <% if (typeof rakutenTitleMissing !== 'undefined' && rakutenTitleMissing > 0) { %>
-            <button class="btn btn-sm btn-outline-info ms-2 js-backfill-rakuten-title"
-                    title="楽天 RMS の getItem API で商品名を直接取得します (Notion は経由しません)。 取得後、 修正必要リストに 「何の商品か」 が表示されます">
-              📥 楽天 RMS から商品名取得 (<%= rakutenTitleMissing %> 件未取得)
-            </button>
-          <% } %>
-          <%# Phase E-16: 楽天 genre_id 取りこぼし埋め戻し。 title だけ先に埋まり genre が NULL の候補を
-              楽天 RMS から再取得。 これが埋まらないとカテゴリ自動解決が全滅し「出せる」 が増えない。 %>
-          <% if (typeof rakutenGenreMissing !== 'undefined' && rakutenGenreMissing > 0) { %>
-            <button class="btn btn-sm btn-outline-info ms-2 js-backfill-rakuten-genre-dry"
-                    title="楽天 genre_id が未取得の商品を楽天 RMS から再取得します。 まず dry-run で 「何件 genre が取れるか / 楽天側に genre 設定が無い商品が何件か」 を確認">
-              🔍 楽天 genre 取得 (dry-run) (<%= rakutenGenreMissing %> 件未取得)
-            </button>
-            <button class="btn btn-sm btn-outline-danger ms-2 js-backfill-rakuten-genre-apply"
-                    title="dry-run 確認後にこれを押すと楽天 genre_id を実際に DB へ保存します。 保存後、 カテゴリ自動解決が効いて「出せる」 が増えます">
-              📥 楽天 genre 取得 (本実行)
-            </button>
-          <% } %>
-          <%# Phase E-11-b: Yahoo カテゴリ学習。 既存 130 件から逆引きで learn、 publish 自動推定の基盤。 %>
-          <% if (typeof yahooCategoryMissing !== 'undefined' && (yahooCategoryMissing > 0 || (typeof yahooCategoryLearnedGenres !== 'undefined' && yahooCategoryLearnedGenres === 0)) ) { %>
-            <button class="btn btn-sm btn-outline-info ms-2 js-yahoo-category-learn"
-                    title="既存 Yahoo!ショッピング出品から Yahoo カテゴリと path を取得し、 楽天 genre との対応辞書を作ります。 学習後の publish は自動推定されます">
-              📚 Yahoo カテゴリ学習<% if (yahooCategoryMissing > 0) { %> (<%= yahooCategoryMissing %> 件未取得)<% } %><% if (typeof yahooCategoryLearnedGenres !== 'undefined' && yahooCategoryLearnedGenres > 0) { %> (学習済 <%= yahooCategoryLearnedGenres %> genre)<% } %>
-            </button>
-          <% } %>
-          <%# Phase E-11 後追い: aburatoishioil100 smoke 用 1 click ボタン (Claude が Notion master に値を書き込む) %>
-          <button class="btn btn-sm btn-outline-success ms-2 js-seed-aburatoishi"
-                  title="aburatoishioil100 の Notion master に Yahoo!カテゴリID=43494 / Yahoo!path=生活雑貨・日用品:掃除用品 を書き込み + Notion sync を 1 click で実行 (smoke test 用、 後で値変えたい時は Notion で直接編集)">
-            🧪 aburatoishi に Yahoo カテゴリ書込 (テスト)
-          </button>
-          <%# Phase E-13: 楽天 RMS → Notion 自動下書き (Yahoo!タイトル/売価/税率 を空欄補完) %>
-          <button class="btn btn-sm btn-outline-warning ms-2 js-seed-notion-drafts-dry"
-                  title="楽天 RMS から Yahoo!タイトル/売価/税率 を取って Notion の空欄に下書きする。 dry-run で何が補完されるか先に確認">
-            🪄 楽天から下書き (dry-run)
-          </button>
-          <button class="btn btn-sm btn-outline-danger ms-2 js-seed-notion-drafts-apply"
-                  title="dry-run で確認後にこれを押すと実際に Notion に書き込む。 既存値あれば skip">
-            ✏️ 楽天から下書き (本実行)
-          </button>
-          <%# Phase E-14: Notion master 未登録 SKU に新規 page 作成 %>
-          <button class="btn btn-sm btn-outline-warning ms-2 js-create-notion-pages-dry"
-                  title="楽天 RMS から Notion master 未登録 SKU の new page を作成する。 dry-run で対象件数 + 内容を先に確認">
-            🆕 楽天から Notion 新規作成 (dry-run)
-          </button>
-          <button class="btn btn-sm btn-outline-danger ms-2 js-create-notion-pages-apply"
-                  title="dry-run で確認後にこれを押すと Notion master DB に新規 page を作成する">
-            🆕 楽天から Notion 新規作成 (本実行)
-          </button>
-        </li>
-        <li>
-          <strong><%= summary.actionable %> 商品</strong> が Yahoo に出せます
-          <a href="?filter=actionable" class="btn btn-sm btn-outline-success ms-2">出せる商品を見る</a>
-        </li>
-        <li>
-          <strong><%= summary.fixable %> 商品</strong> が Notion 修正待ち
-          <a href="?filter=fixable" class="btn btn-sm btn-outline-warning ms-2">修正リストを見る</a>
-          <%# Phase E-17: カテゴリ未設定を genre 単位で一括紐付けする専用画面 %>
-          <a href="/apps/rakuten-yahoo-sync/category-binding" class="btn btn-sm btn-outline-primary ms-2" title="カテゴリ未設定の楽天genreに Yahoo数字ID + path を1回割り当てると、 そのgenreの商品が全部「出せる」に動きます">🏷️ カテゴリ紐付け画面</a>
-          <% if (summary.fixable > 0 && Object.keys(fixableByCategory).length > 0) { %>
+
+      <%# STEP 2: 要対応 — 理由別にまとめて、 そのまま解決アクションへ %>
+      <div class="mb-3 p-3" style="background:#fff8e6; border:1px solid #ffe69c; border-radius:.5em;">
+        <div class="mb-1"><span class="badge bg-warning text-dark">STEP 2</span> <strong>要対応を解決する</strong>
+          <span class="text-muted">— いま <strong><%= summary.fixable %></strong> 商品</span></div>
+        <% if (summary.fixable > 0) { %>
+          <a href="/apps/rakuten-yahoo-sync/category-binding" class="btn btn-sm btn-outline-primary"
+             title="カテゴリ未設定の楽天genreに候補クリックで Yahoo カテゴリを割り当てます。 1 genre 確定でそのgenreの商品が全部「出せる」に動きます">🏷️ カテゴリを紐付ける (クリックで選ぶだけ)</a>
+          <a href="?filter=fixable" class="btn btn-sm btn-outline-warning">📝 修正リストを見る (Notion入力へ)</a>
+          <% if (Object.keys(fixableByCategory).length > 0) { %>
             <div class="mt-2">
               <% for (const cat of Object.keys(fixableByCategory).sort((a, b) => fixableByCategory[b] - fixableByCategory[a])) { %>
                 <a href="?filter=fixable" class="category-pill text-decoration-none">
@@ -209,14 +144,19 @@
               <% } %>
             </div>
           <% } %>
-        </li>
-        <li>
-          <strong><%= summary.done %> 商品</strong> 移行済み
-          <% if (summary.done > 0) { %>
-            <a href="?filter=done" class="btn btn-sm btn-outline-secondary ms-2">移行済みを見る</a>
-          <% } %>
-        </li>
-      </ol>
+        <% } else { %>
+          <span class="text-success small">🎉 要対応はありません</span>
+        <% } %>
+      </div>
+
+      <%# STEP 3: 出せる商品を承認式で一括出品 %>
+      <div class="p-3" style="background:#eafbee; border:1px solid #b7e4c7; border-radius:.5em;">
+        <div class="mb-1"><span class="badge bg-success">STEP 3</span> <strong>出せる商品を出品する</strong>
+          <span class="text-muted">— いま <strong><%= summary.actionable %></strong> 商品が出せます (移行済み <%= summary.done %>)</span></div>
+        <a href="?filter=actionable" class="btn btn-sm btn-success">🚀 出せる商品を見る</a>
+        <span class="small text-muted ms-2">→ 商品リストの「☑ 一括選択モード」→「一括登録」でまとめて出品できます</span>
+      </div>
+
       <% if (!publishEnabled) { %>
         <div class="alert alert-warning mt-3 mb-0 py-2 small">
           ⚠️ いま <strong>テストモード</strong> です。 「Yahoo に出す」 ボタンを押しても **本番に登録されません** (確認のみ)。
@@ -411,8 +351,60 @@
     <!-- 👇 システム設定 (アコーディオン、 普段閉じてる) -->
     <div class="summary-card">
       <details>
-        <summary class="text-muted" style="cursor: pointer;">⚙ システム設定 (管理者向け)</summary>
+        <summary class="text-muted" style="cursor: pointer;">⚙ システム設定・手動メンテナンス (管理者向け)</summary>
         <div class="mt-3">
+          <%# 再設計 R5: 個別メンテナンスボタンを STEP1「全部更新」に集約したためここへ退避。
+              通常運用では不要 (全部更新が同じ処理を直列実行する)。 切り分け・部分再実行用に残す。 %>
+          <h6>手動メンテナンス (通常は STEP1 の「全部更新」で足ります)</h6>
+          <div class="mb-3">
+            <button class="btn btn-sm btn-outline-primary ms-2 mb-1" onclick="runSync()"
+                    title="Notion 商品マスターを取り込みます">📥 Notion 取込のみ</button>
+            <button class="btn btn-sm btn-outline-info ms-2 mb-1 js-trigger-diff-sync"
+                    title="Yahoo baseline + 楽天差分を取り直します">🔁 楽天↔Yahoo 差分再取得のみ</button>
+            <% if (typeof rakutenTitleMissing !== 'undefined' && rakutenTitleMissing > 0) { %>
+              <button class="btn btn-sm btn-outline-info ms-2 mb-1 js-backfill-rakuten-title"
+                      title="楽天 RMS の getItem API で商品名を直接取得します (Notion は経由しません)">
+                📥 楽天 RMS から商品名取得 (<%= rakutenTitleMissing %> 件未取得)
+              </button>
+            <% } %>
+            <% if (typeof rakutenGenreMissing !== 'undefined' && rakutenGenreMissing > 0) { %>
+              <button class="btn btn-sm btn-outline-info ms-2 mb-1 js-backfill-rakuten-genre-dry"
+                      title="楽天 genre_id が未取得の商品を楽天 RMS から再取得します。 まず dry-run で確認">
+                🔍 楽天 genre 取得 (dry-run) (<%= rakutenGenreMissing %> 件未取得)
+              </button>
+              <button class="btn btn-sm btn-outline-danger ms-2 mb-1 js-backfill-rakuten-genre-apply"
+                      title="dry-run 確認後にこれを押すと楽天 genre_id を実際に DB へ保存します">
+                📥 楽天 genre 取得 (本実行)
+              </button>
+            <% } %>
+            <% if (typeof yahooCategoryMissing !== 'undefined' && (yahooCategoryMissing > 0 || (typeof yahooCategoryLearnedGenres !== 'undefined' && yahooCategoryLearnedGenres === 0)) ) { %>
+              <button class="btn btn-sm btn-outline-info ms-2 mb-1 js-yahoo-category-learn"
+                      title="既存 Yahoo!ショッピング出品から Yahoo カテゴリと path を取得し、 楽天 genre との対応辞書を作ります">
+                📚 Yahoo カテゴリ学習<% if (yahooCategoryMissing > 0) { %> (<%= yahooCategoryMissing %> 件未取得)<% } %><% if (typeof yahooCategoryLearnedGenres !== 'undefined' && yahooCategoryLearnedGenres > 0) { %> (学習済 <%= yahooCategoryLearnedGenres %> genre)<% } %>
+              </button>
+            <% } %>
+            <button class="btn btn-sm btn-outline-warning ms-2 mb-1 js-seed-notion-drafts-dry"
+                    title="楽天 RMS から Yahoo!タイトル/売価/税率 を取って Notion の空欄に下書きする。 dry-run で先に確認">
+              🪄 楽天から下書き (dry-run)
+            </button>
+            <button class="btn btn-sm btn-outline-danger ms-2 mb-1 js-seed-notion-drafts-apply"
+                    title="dry-run で確認後にこれを押すと実際に Notion に書き込む。 既存値あれば skip">
+              ✏️ 楽天から下書き (本実行)
+            </button>
+            <button class="btn btn-sm btn-outline-warning ms-2 mb-1 js-create-notion-pages-dry"
+                    title="楽天 RMS から Notion master 未登録 SKU の new page を作成する。 dry-run で先に確認">
+              🆕 楽天から Notion 新規作成 (dry-run)
+            </button>
+            <button class="btn btn-sm btn-outline-danger ms-2 mb-1 js-create-notion-pages-apply"
+                    title="dry-run で確認後にこれを押すと Notion master DB に新規 page を作成する">
+              🆕 楽天から Notion 新規作成 (本実行)
+            </button>
+            <button class="btn btn-sm btn-outline-success ms-2 mb-1 js-seed-aburatoishi"
+                    title="aburatoishioil100 の Notion master に Yahoo!カテゴリID=43494 / Yahoo!path を書き込み + Notion sync (smoke test 用)">
+              🧪 aburatoishi に Yahoo カテゴリ書込 (テスト)
+            </button>
+          </div>
+
           <h6>環境変数</h6>
           <table class="table table-sm">
             <thead><tr><th>Key</th><th>用途</th><th>状態</th></tr></thead>
