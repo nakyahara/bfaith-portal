@@ -15,6 +15,16 @@
     .sample { color:#444; font-size:.85em; margin:.3em 0; }
     .count-badge { background:#fff3cd; color:#8a6d3b; border:1px solid #ffe69c; padding:.15em .6em; border-radius:.5em; font-weight:600; font-size:.85em; }
     .has-id { background:#d1ecf1; color:#0c5460; border:1px solid #bee5eb; padding:.1em .5em; border-radius:.4em; font-size:.8em; }
+    .ai-badge { background:#e7d9f7; color:#5b2d90; border:1px solid #d3b9f0; padding:.1em .5em; border-radius:.4em; font-size:.8em; }
+    /* 候補ボタン (AI候補・検索結果 共通)。 選択中は青枠 */
+    .cand-btn { display:block; width:100%; text-align:left; background:#f8f9fb; border:1px solid #dfe3e8; border-radius:.5em;
+                padding:.4em .7em; margin:.25em 0; font-size:.88em; cursor:pointer; }
+    .cand-btn:hover { background:#eef4ff; border-color:#9ec5fe; }
+    .cand-btn.selected { background:#e7f1ff; border-color:#0d6efd; }
+    .cand-name { font-weight:600; }
+    .cand-path { color:#777; font-size:.9em; }
+    .cand-meta { color:#999; font-size:.85em; }
+    .search-results { margin-top:.3em; }
   </style>
 </head>
 <body>
@@ -27,9 +37,12 @@
 
   <div class="container-fluid" style="max-width:1100px;">
     <div class="alert alert-info">
-      未解決の楽天genreに <strong>Yahooの数字ID</strong>(管理画面で見える番号)と <strong>path</strong>(店の棚)を1回だけ割り当てると、
-      その genre の商品が全部「出せる」に動きます。 一度入れた path は対応表に残り、 同じIDの genre では自動で入ります。
-      <br>「<span class="has-id">ID済</span>」 が付いてる genre は、 数字IDは既にあるので <strong>path だけ</strong>入れればOKです。
+      未解決の楽天genreを <strong>候補をクリックするだけ</strong>で紐付けできます。
+      候補が合わないときは「🔍 カテゴリを検索」で探すか、 Yahoo数字IDを直接入力してください。
+      <br>path (店の棚) は分かっていれば自動で入ります。 空のままの場合だけ手で入れてください
+      (一度入れた path は対応表に残り、 同じIDでは次から自動)。
+      <br>「<span class="has-id">ID済</span>」 は数字IDが確定済み = <strong>path だけ</strong>入れれば OK。
+      「<span class="ai-badge">AI提案</span>」 は AI の初期紐づけ値です (保存すると人手確定に昇格)。
     </div>
 
     <div id="summary" class="mb-3 text-muted">読み込み中...</div>
@@ -53,22 +66,59 @@
       }
     }
 
+    // 候補 1 件 (AI候補 or 検索結果) をクリック可能なボタンにする
+    function candidateButton(c) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'cand-btn';
+      const scoreTxt = c.score != null ? Math.round(Number(c.score) * 100) + '%' : '';
+      btn.innerHTML =
+        '<span class="cand-name">' + esc(c.name || ('ID ' + c.categoryId)) + '</span>' +
+        ' <span class="cand-meta">ID ' + esc(c.categoryId) + (scoreTxt ? ' / 類似 ' + scoreTxt : '') + (c.defaultPath ? ' / path自動' : '') + '</span>' +
+        (c.pathName ? '<div class="cand-path">' + esc(c.pathName) + '</div>' : '');
+      return btn;
+    }
+
+    // 候補クリック → ID と path (既知なら) を入力欄に反映
+    function applyCandidate(div, c, clickedBtn) {
+      div.querySelector('.js-cat').value = String(c.categoryId);
+      const pathInput = div.querySelector('.js-path');
+      if (c.defaultPath) pathInput.value = c.defaultPath;
+      div.querySelectorAll('.cand-btn').forEach((b) => b.classList.remove('selected'));
+      if (clickedBtn) clickedBtn.classList.add('selected');
+      const msg = div.querySelector('.js-msg');
+      msg.textContent = c.defaultPath ? 'ID と path を入れました。「保存」で確定します'
+                                      : 'ID を入れました。 path (店の棚) を入力して「保存」してください';
+      msg.className = 'js-msg small text-primary';
+    }
+
     function renderGenre(g) {
       const div = document.createElement('div');
       div.className = 'genre-card';
       div.dataset.genreId = g.genreId;
       const idBadge = g.existingCategoryId ? ' <span class="has-id">ID済</span>' : '';
+      const aiBadge = g.aiSuggestion ? ' <span class="ai-badge">AI提案' +
+        (g.aiSuggestion.confidence != null ? ' ' + Math.round(g.aiSuggestion.confidence * 100) + '%' : '') + '</span>' : '';
       const rkCat = g.rakutenGenreName ? '<span class="rk-cat">' + esc(g.rakutenGenreName) + '</span>' : '<span class="text-muted">(楽天カテゴリ名 不明)</span>';
       const rkPath = g.rakutenGenrePath ? '<div class="rk-path">楽天: ' + esc(g.rakutenGenrePath) + '</div>' : '';
       const samples = (g.sampleTitles || []).slice(0,2).map((t) => '<div class="sample">・' + esc(t.slice(0,60)) + (t.length>60?'…':'') + '</div>').join('');
       div.innerHTML =
         '<div class="d-flex justify-content-between align-items-start">' +
           '<div style="flex:1;">' +
-            '<div>' + rkCat + idBadge + ' <span class="count-badge">' + g.count + '商品</span> <span class="text-muted small">genre ' + esc(g.genreId) + '</span></div>' +
+            '<div>' + rkCat + idBadge + aiBadge + ' <span class="count-badge">' + g.count + '商品</span> <span class="text-muted small">genre ' + esc(g.genreId) + '</span></div>' +
             rkPath + samples +
           '</div>' +
         '</div>' +
-        '<div class="row g-2 mt-2 align-items-center">' +
+        '<div class="js-candidates mt-2"></div>' +
+        '<div class="mt-1">' +
+          '<button type="button" class="btn btn-sm btn-outline-secondary js-search-toggle">🔍 カテゴリを検索</button>' +
+          '<span class="js-search-area" style="display:none;">' +
+            '<input type="text" class="form-control form-control-sm d-inline-block ms-2 js-search-q" style="width:260px;" placeholder="例: ハンドクリーム">' +
+            '<button type="button" class="btn btn-sm btn-primary ms-1 js-search-run">検索</button>' +
+          '</span>' +
+          '<div class="search-results js-search-results"></div>' +
+        '</div>' +
+        '<div class="row g-2 mt-1 align-items-center">' +
           '<div class="col-auto"><label class="small text-muted">Yahoo数字ID</label>' +
             '<input type="text" inputmode="numeric" class="form-control form-control-sm js-cat" style="width:140px;" value="' + (g.existingCategoryId || '') + '" placeholder="例 43494"></div>' +
           '<div class="col"><label class="small text-muted">path (店の棚)</label>' +
@@ -76,6 +126,61 @@
           '<div class="col-auto pt-3"><button class="btn btn-sm btn-success js-save">保存</button></div>' +
           '<div class="col-auto pt-3"><span class="js-msg small"></span></div>' +
         '</div>';
+
+      // AI 候補 top3 (unresolved-genres が返す。 無ければ非表示)
+      const candBox = div.querySelector('.js-candidates');
+      const cands = (g.aiCandidates || []).filter((c) => c && c.categoryId != null);
+      if (cands.length) {
+        const label = document.createElement('div');
+        label.className = 'small text-muted';
+        label.textContent = 'AI候補 (クリックで選択):';
+        candBox.appendChild(label);
+        for (const c of cands) {
+          const btn = candidateButton(c);
+          btn.addEventListener('click', () => applyCandidate(div, c, btn));
+          candBox.appendChild(btn);
+        }
+      }
+
+      // キーワード検索 (Yahoo 公式カテゴリマスタ 12,044 件から)
+      const searchToggle = div.querySelector('.js-search-toggle');
+      const searchArea = div.querySelector('.js-search-area');
+      const searchQ = div.querySelector('.js-search-q');
+      const searchRun = div.querySelector('.js-search-run');
+      const searchResults = div.querySelector('.js-search-results');
+      searchToggle.addEventListener('click', () => {
+        searchArea.style.display = searchArea.style.display === 'none' ? 'inline' : 'none';
+        if (searchArea.style.display === 'inline') {
+          if (!searchQ.value && g.rakutenGenreName) searchQ.value = g.rakutenGenreName; // 楽天カテゴリ名を初期クエリに
+          searchQ.focus();
+        }
+      });
+      async function runSearch() {
+        const q = searchQ.value.trim();
+        if (!q) return;
+        searchResults.innerHTML = '<span class="small text-muted">検索中...</span>';
+        try {
+          const res = await fetch(API + '/search?q=' + encodeURIComponent(q) + '&limit=8');
+          const j = await res.json();
+          if (j.status !== 'ok') throw new Error(j.error || res.status);
+          searchResults.innerHTML = '';
+          if (!j.results.length) {
+            searchResults.innerHTML = '<span class="small text-muted">見つかりませんでした。 別の言い方で検索してみてください</span>';
+            return;
+          }
+          for (const r of j.results) {
+            const c = { categoryId: r.productCategory, name: r.name, pathName: r.pathName, score: r.score, defaultPath: r.defaultPath };
+            const btn = candidateButton(c);
+            btn.addEventListener('click', () => applyCandidate(div, c, btn));
+            searchResults.appendChild(btn);
+          }
+        } catch (e) {
+          searchResults.innerHTML = '<span class="small text-danger">検索失敗: ' + esc(e.message) + '</span>';
+        }
+      }
+      searchRun.addEventListener('click', runSearch);
+      searchQ.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); runSearch(); } });
+
       div.querySelector('.js-save').addEventListener('click', () => saveGenre(div, g));
       return div;
     }
