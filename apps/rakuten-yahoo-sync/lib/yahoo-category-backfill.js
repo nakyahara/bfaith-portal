@@ -152,6 +152,13 @@ export function diagnoseOverlap({ db, mirrorPath } = {}) {
 /**
  * 「学習対象になりうる Yahoo 出品」 のうち category 未取得な件数。
  *   ne_code 軸の overlap + ambiguous 除外。
+ *
+ * ⚠️ 再設計 R6 (2026-07-02 パフォーマンス修正):
+ *   この関数は mirror の日次 fact 2 表を LOWER(TRIM()) 付きでフルスキャンするため
+ *   本番規模 (fact 20万行×2 + registered 3,600) では**分単位**かかる。
+ *   dashboard GET / が毎リクエスト呼んでいたのが「画面遷移が遅すぎる」の主因だった。
+ *   → リクエスト経路では絶対に呼ばないこと。 UI 表示は下の cached 版を使い、
+ *     実計算は学習 (backfill-and-learn / diagnose) を回したときだけ行う。
  */
 export function countMissingYahooCategories(db, mirrorPath = null) {
   if (!db) throw new Error('countMissingYahooCategories: db required');
@@ -162,7 +169,7 @@ export function countMissingYahooCategories(db, mirrorPath = null) {
     return 0;
   }
   try {
-    return db.prepare(`
+    const n = db.prepare(`
       ${CTE_LINKED}
       SELECT COUNT(*) AS n FROM (
         SELECT yahoo_item_code FROM linked
@@ -172,9 +179,28 @@ export function countMissingYahooCategories(db, mirrorPath = null) {
       INNER JOIN yahoo_registered_items y ON y.item_code = one.yahoo_item_code
       WHERE y.yahoo_category_id IS NULL
     `).get().n;
+    _missingCountCache = { value: n, at: Date.now() };
+    return n;
   } finally {
     detachMirror(db);
   }
+}
+
+// ── R6: dashboard 表示用の cache (プロセス内)。 リクエスト経路で重い CTE を走らせない ──
+let _missingCountCache = { value: null, at: 0 };
+
+/**
+ * dashboard 用: 最後に計算した「学習対象の未取得件数」を返す (計算はしない)。
+ *   まだ一度も計算していなければ null (UI は件数バッジ無しでボタンだけ出す/出さない)。
+ *   実計算は countMissingYahooCategories() を呼ぶ経路 (学習・診断) が担い、 その際に cache 更新。
+ */
+export function getCachedMissingYahooCategories() {
+  return _missingCountCache.value;
+}
+
+/** テスト用: cache 破棄 */
+export function resetMissingYahooCategoriesCache() {
+  _missingCountCache = { value: null, at: 0 };
 }
 
 export async function backfillYahooCategoriesAndPaths({ db, mirrorPath = null, limit = DEFAULT_BATCH_LIMIT, deps = {} } = {}) {

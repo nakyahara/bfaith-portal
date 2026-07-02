@@ -30,11 +30,28 @@ function minSampleCount() {
   return Number.isFinite(v) && v >= 1 ? v : 2;
 }
 
+/**
+ * 再設計 R6 (パフォーマンス): prepared statement を db 接続ごとに cache する。
+ *   listProductsForUI が候補全件 (数百行) × 各 tier で resolver を呼ぶため、
+ *   毎回 db.prepare() (SQL コンパイル) すると dashboard 表示のたびに
+ *   数百×5 回のコンパイルが走っていた。 better-sqlite3 は自動 cache しない。
+ *   WeakMap なので接続が閉じられれば cache も回収される。
+ */
+const _stmtCache = new WeakMap();
+
+function cachedStmt(db, key, sql) {
+  let m = _stmtCache.get(db);
+  if (!m) { m = new Map(); _stmtCache.set(db, m); }
+  let s = m.get(key);
+  if (!s) { s = db.prepare(sql); m.set(key, s); }
+  return s;
+}
+
 export function resolveByGenreId(db, genreId, { minSample = null } = {}) {
   if (!db || !genreId) return null;
   const threshold = minSample == null ? minSampleCount() : minSample;
   try {
-    return db.prepare(`
+    return cachedStmt(db, 'learned', `
       SELECT yahoo_category_id AS category, yahoo_path AS path, sample_count
       FROM genre_yahoo_category_mapping
       WHERE rakuten_genre_id = ? AND is_primary = 1 AND sample_count >= ?
@@ -56,7 +73,7 @@ export function resolveByGenreId(db, genreId, { minSample = null } = {}) {
 function resolveFromManual(db, genreId) {
   if (!db || !genreId) return null;
   try {
-    const row = db.prepare(`
+    const row = cachedStmt(db, 'manual', `
       SELECT m.yahoo_category_id, m.yahoo_path, m.note,
              COALESCE(m.yahoo_path, dp.yahoo_path) AS resolved_path
       FROM category_manual m
@@ -86,7 +103,7 @@ function resolveFromManual(db, genreId) {
 function resolveFromDecisions(db, genreId) {
   if (!db || !genreId) return null;
   try {
-    const row = db.prepare(`
+    const row = cachedStmt(db, 'decisions', `
       SELECT cd.yahoo_category_id, cd.yahoo_path, cd.confidence, cd.sample_count,
              COALESCE(cd.yahoo_path, dp.yahoo_path) AS resolved_path
       FROM category_decisions cd
@@ -125,7 +142,7 @@ const AI_MIN_CONFIDENCE = 0.6;
 function resolveFromAi(db, genreId) {
   if (!db || !genreId) return null;
   try {
-    const row = db.prepare(`
+    const row = cachedStmt(db, 'ai', `
       SELECT ai.yahoo_category_id, ai.confidence, ai.decided_by,
              dp.yahoo_path AS resolved_path
       FROM category_ai ai
