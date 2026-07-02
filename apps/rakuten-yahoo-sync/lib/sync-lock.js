@@ -15,8 +15,19 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { fileURLToPath } from 'url';
 
 export const DEFAULT_TTL_MS = 30 * 60 * 1000;
+
+/**
+ * Notion sync 用 lockfile の標準パス (再設計 R4: router と refresh-pipeline で共用)。
+ * router.js の getLockPath() と同一ロジックをここに寄せた。
+ */
+export function getNotionSyncLockPath() {
+  const libDir = path.dirname(fileURLToPath(import.meta.url)); // apps/rakuten-yahoo-sync/lib
+  const dataDir = process.env.DATA_DIR || path.join(libDir, '..', '..', '..', 'data');
+  return path.resolve(dataDir, 'rakuten-yahoo-sync.notion-sync.lock');
+}
 
 export class SyncLockError extends Error {
   constructor(message, { holder = null, reason = null } = {}) {
