@@ -856,6 +856,7 @@ router.get('/api/yahoo-category/unresolved-genres', (_req, res) => {
     // カテゴリ未解決 (unresolved / *_path_missing / notion_partial) かつ genre_id がある fixable のみ
     const UNRESOLVED_SOURCES = new Set([
       'unresolved', 'manual_path_missing', 'decisions_path_missing', 'notion_partial',
+      'ai_path_missing', // 再設計 R2: AI が ID 提案済みだが path (店の棚) が未確定
     ]);
     const targets = products.filter((p) =>
       p.status === 'fixable'
@@ -882,6 +883,19 @@ router.get('/api/yahoo-category/unresolved-genres', (_req, res) => {
     const genreNameStmt = prep(`SELECT name_ja, path_ja FROM rakuten_genre WHERE genre_id = ?`);
     const manualCatStmt = prep(`SELECT yahoo_category_id, yahoo_path FROM category_manual WHERE rakuten_genre_id = ?`);
     const decisionsCatStmt = prep(`SELECT yahoo_category_id, yahoo_path FROM category_decisions WHERE rakuten_genre_id = ? AND locked = 1 AND ambiguous = 0`);
+    // 再設計 R2: AI 初期紐づけ (確定分) と候補 top3 (紐付け画面 v2 の「候補から選ぶ」素)
+    const aiCatStmt = prep(`SELECT yahoo_category_id, confidence FROM category_ai WHERE rakuten_genre_id = ?`);
+    const aiCandStmt = prep(`
+      SELECT c.yahoo_category_id, c.score,
+             m.name AS master_name, m.path_name AS master_path,
+             dp.yahoo_path AS default_path
+      FROM category_ai_candidates c
+      LEFT JOIN yahoo_category_master m ON m.product_category = CAST(c.yahoo_category_id AS TEXT)
+      LEFT JOIN category_default_path dp ON dp.yahoo_category_id = c.yahoo_category_id
+      WHERE c.rakuten_genre_id = ?
+      ORDER BY c.rank
+      LIMIT 3
+    `);
 
     const genres = [...byGenre.values()].map((e) => {
       let rakutenGenreName = null;   // 例「潤滑油・サビ止めオイル」
@@ -897,6 +911,26 @@ router.get('/api/yahoo-category/unresolved-genres', (_req, res) => {
         const m = (manualCatStmt?.get(e.genreId)) || (decisionsCatStmt?.get(e.genreId));
         if (m) { existingCategoryId = m.yahoo_category_id ?? null; existingPath = m.yahoo_path ?? null; }
       } catch (_) {}
+      // 再設計 R2: AI 確定分 (ai_path_missing なら ID はあるので「path だけ入力」動線に)
+      let aiSuggestion = null;
+      try {
+        const a = aiCatStmt?.get(e.genreId);
+        if (a && a.yahoo_category_id != null) {
+          aiSuggestion = { categoryId: a.yahoo_category_id, confidence: a.confidence ?? null };
+          if (existingCategoryId == null) existingCategoryId = a.yahoo_category_id;
+        }
+      } catch (_) {}
+      // 再設計 R2: AI 候補 top3 (画面でクリック選択する素。 master 名と既知 path も添える)
+      let aiCandidates = [];
+      try {
+        aiCandidates = (aiCandStmt?.all(e.genreId) || []).map((c) => ({
+          categoryId: c.yahoo_category_id,
+          name: c.master_name || null,
+          pathName: c.master_path || null,
+          score: c.score ?? null,
+          defaultPath: c.default_path || null,
+        }));
+      } catch (_) {}
       return {
         genreId: e.genreId,
         count: e.count,
@@ -904,8 +938,10 @@ router.get('/api/yahoo-category/unresolved-genres', (_req, res) => {
         itemCodes: e.itemCodes,
         rakutenGenreName,        // 楽天カテゴリ名 (何のカテゴリか一目で分かる)
         rakutenGenrePath,        // 楽天カテゴリ階層 (= 店の棚 path の素、 中原さん運用で一致)
-        existingCategoryId,      // 既にあれば path だけ足りない (manual_path_missing)
+        existingCategoryId,      // 既にあれば path だけ足りない (*_path_missing)
         existingPath,
+        aiSuggestion,            // AI 確定分 { categoryId, confidence } (無ければ null)
+        aiCandidates,            // AI 候補 top3 [{ categoryId, name, pathName, score, defaultPath }]
       };
     }).sort((a, b) => b.count - a.count);
 
