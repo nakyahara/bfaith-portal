@@ -15,7 +15,7 @@ import { normalizeForMatch, charBigrams, jaccard, containsNormalized } from './t
 
 const MIN_CONTAIN_LEN = 3;
 
-let _cache = null; // { count, list: [{ productCategory, name, pathName, nameNorm, nameBigrams, pathSegsNorm }] }
+let _cache = null; // { key, list: [{ productCategory, name, pathName, nameNorm, nameBigrams, pathSegsNorm }] }
 
 function buildIndex(db) {
   const rows = db.prepare(
@@ -32,12 +32,25 @@ function buildIndex(db) {
       pathSegsNorm: (r.path_name || '').split('>').map((s) => normalizeForMatch(s)).filter(Boolean),
     };
   });
-  return { count: rows.length, list };
+  return { list };
+}
+
+// cache 無効化キー: 件数だけだと「同件数で name/path が変わる再取込」を検知できない (Codex R1 Medium)
+// → 件数 + MAX(imported_at) の複合キーで判定。 再取込経路は resetCategoryMasterCache() も呼ぶこと。
+function cacheKey(db) {
+  try {
+    const r = db.prepare(
+      'SELECT COUNT(*) AS c, MAX(imported_at) AS m FROM yahoo_category_master WHERE is_active = 1'
+    ).get();
+    return `${r.c}:${r.m || ''}`;
+  } catch (_) {
+    return '0:'; // migration 019 未適用
+  }
 }
 
 function getIndex(db) {
-  const count = countCategoryMaster(db);
-  if (!_cache || _cache.count !== count) _cache = buildIndex(db);
+  const key = cacheKey(db);
+  if (!_cache || _cache.key !== key) _cache = { key, ...buildIndex(db) };
   return _cache;
 }
 
@@ -56,9 +69,12 @@ export function resetCategoryMasterCache() {
 
 function scoreEntry(entry, qNorm, qBigrams) {
   let score = 0;
-  // 名前スコア
+  // 名前スコア。 包含満点はクエリ・カテゴリ名の両方が 3 文字以上のときだけ
+  // (「服」等の 1〜2 文字クエリで大量満点になるノイズ防止、 Codex R1 Low)。
   const nameLen = entry.nameNorm.replace(/\s+/g, '').length;
-  if (nameLen >= MIN_CONTAIN_LEN && (containsNormalized(entry.nameNorm, qNorm) || containsNormalized(qNorm, entry.nameNorm))) {
+  const qLen = qNorm.replace(/\s+/g, '').length;
+  if (nameLen >= MIN_CONTAIN_LEN && qLen >= MIN_CONTAIN_LEN
+      && (containsNormalized(entry.nameNorm, qNorm) || containsNormalized(qNorm, entry.nameNorm))) {
     score = 1;
   } else {
     score = jaccard(qBigrams, entry.nameBigrams);
