@@ -31,8 +31,6 @@ const OPTIONAL_ENVS = Object.freeze([
   { key: 'AUC_PREF_CODE',           purpose: 'ヤフオク発送地 prefecture code (default=27 大阪)',              sensitive: false },
   // E-7-a Yahoo baseline
   { key: 'YAHOO_DIFF_QUERIES',      purpose: 'Yahoo baseline 検証用 query 上書き (本番未設定、 設定中は baseline 確立も write も拒否)', sensitive: false },
-  // E-17 Yahoo カテゴリマスタ (categorySearch、 appid=Client ID のみ、 OAuth 不要の公開 API)
-  { key: 'YAHOO_APP_ID',            purpose: 'Yahoo categorySearch の appid (Client ID)。 カテゴリ path 補完 + 検索/ツリー UI 用', sensitive: false },
 ]);
 
 function summarize(key, sensitive) {

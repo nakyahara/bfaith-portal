@@ -53,8 +53,8 @@ import {
 } from './lib/image-exclusion-patterns.js';
 import { filterUploadableImageUrlsDetailed } from './lib/yahoo-image.js';
 import { backfillRakutenTitles, countMissingRakutenTitles, backfillRakutenGenre, countMissingRakutenGenre } from './lib/rakuten-title-backfill.js';
-import { repairMissingCategoryPaths, countMissingCategoryPaths } from './services/category-path-repair.js';
 import { fetchYahooItemDetailsBulk } from './lib/yahoo-detail-proxy.js';
+import { searchCategoryMaster, countCategoryMaster } from './lib/category-master-search.js';
 import {
   countMissingYahooCategories,
   backfillYahooCategoriesAndPaths,
@@ -431,7 +431,6 @@ router.get('/', (req, res) => {
   let exclusionCount = { temporary: 0, permanent: 0, total: 0 };
   let rakutenTitleMissing = 0;
   let rakutenGenreMissing = 0;
-  let categoryPathMissing = 0;
   let yahooCategoryMissing = 0;
   let yahooCategoryLearnedGenres = 0;
   const filter = ['all', 'actionable', 'fixable', 'done', 'excluded', 'stale', 'orphan'].includes(req.query.filter)
@@ -450,7 +449,6 @@ router.get('/', (req, res) => {
     exclusionCount = countActiveByKind(db);
     try { rakutenTitleMissing = countMissingRakutenTitles(db); } catch (_) { /* migration 011 未適用 */ }
     try { rakutenGenreMissing = countMissingRakutenGenre(db); } catch (_) { /* migration 012 未適用 */ }
-    try { categoryPathMissing = countMissingCategoryPaths(db); } catch (_) { /* migration 015 未適用 */ }
     try { yahooCategoryMissing = countMissingYahooCategories(db, getMirrorDbPath()); } catch (_) { /* migration 012 未適用 or mirror 未設定 */ }
     try { yahooCategoryLearnedGenres = countLearnedGenres(db); } catch (_) { /* migration 013 未適用 */ }
   } catch (_) {
@@ -476,7 +474,6 @@ router.get('/', (req, res) => {
     exclusionCount,                                       // E-7-c: 移行除外管理 header 集計
     rakutenTitleMissing,                                  // E-9: 楽天タイトル backfill ボタンの未取得件数 badge
     rakutenGenreMissing,                                  // E-16: 楽天 genre_id backfill ボタンの未取得件数 badge
-    categoryPathMissing,                                  // E-17: カテゴリ path 補完ボタンの欠落件数 badge
     yahooCategoryMissing,                                 // E-11-b: Yahoo category backfill ボタンの未取得件数
     yahooCategoryLearnedGenres,                           // E-11-b: 学習済 genre 数
     filter,
@@ -1571,27 +1568,27 @@ router.post('/api/rakuten-title-backfill', async (req, res) => {
   }
 });
 
-// ───────────────── Phase E-17: Yahoo カテゴリ path 補完 (manual_path_missing 解消) ─────────────────
+// ───────────────── 再設計 R1: Yahoo 公式カテゴリマスタ キーワード検索 ─────────────────
 
 /**
- * Phase E-17 PR1: path 欠落 (manual_path_missing) の yahoo_category_id を
- *   Yahoo categorySearch から path 取得して category_default_path に補完する手動 trigger。
+ * 再設計 R1: Yahoo 公式カテゴリマスタ (downloadShopCategories 由来、 migration 019/020 seed) を
+ *   キーワードで lexical 検索して候補を返す。 紐付け画面 v2 の「候補から選ぶ」用。
  *
- *   body: { limit?: number (default 30, max 100), dryRun?: boolean (default false) }
- *   dryRun=true なら DB 更新せず 「何件 path 取れるか」 を試算。
- *   1 件ずつ Yahoo API を叩くため小 batch + UI 自動ループ前提。
+ *   query: q (必須、 1〜100 文字) / limit (default 20, max 50)
+ *   返り: { status, total, results: [{ productCategory, name, pathName, score, defaultPath }] }
+ *   defaultPath = category_default_path に既知の店カテゴリ path があればそれ (選択時に自動補完できる)。
  */
-router.post('/api/yahoo-category/repair-paths', async (req, res) => {
+router.get('/api/yahoo-category/search', (req, res) => {
   try {
     const db = getDB();
-    const body = req.body || {};
-    const limit = Number.isInteger(body.limit) && body.limit > 0 && body.limit <= 100 ? body.limit : 30;
-    const dryRun = body.dryRun === true;
-    const r = await repairMissingCategoryPaths({ db, limit, dryRun });
-    let remaining = null;
-    try { remaining = countMissingCategoryPaths(db); } catch (_) { /* テーブル未整備 */ }
-    if (!dryRun) audit(db, 'yahoo_category_repair_paths', { ...r, remaining });
-    return res.json({ status: 'ok', dryRun, ...r, remaining });
+    const q = String(req.query.q || '').trim();
+    if (!q || q.length > 100) {
+      return res.status(400).json({ status: 'fail', error: 'q は 1〜100 文字で指定してください' });
+    }
+    const limitRaw = Number.parseInt(String(req.query.limit || ''), 10);
+    const limit = Number.isInteger(limitRaw) && limitRaw > 0 && limitRaw <= 50 ? limitRaw : 20;
+    const results = searchCategoryMaster(db, q, { limit });
+    return res.json({ status: 'ok', total: countCategoryMaster(db), results });
   } catch (e) {
     return res.status(500).json({ status: 'fail', error: e.message });
   }

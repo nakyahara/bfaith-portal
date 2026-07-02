@@ -151,18 +151,6 @@
               📥 楽天 genre 取得 (本実行)
             </button>
           <% } %>
-          <%# Phase E-17: カテゴリ path 補完。 Yahoo カテゴリID は確定済みだが path だけ欠落 (manual_path_missing) の
-              商品を、 Yahoo categorySearch から path を取って一括補完。 補完すれば即「出せる」 に動く。 %>
-          <% if (typeof categoryPathMissing !== 'undefined' && categoryPathMissing > 0) { %>
-            <button class="btn btn-sm btn-outline-info ms-2 js-repair-category-path-dry"
-                    title="Yahoo カテゴリID は確定済みだが path だけ欠落している商品の path を Yahoo categorySearch から取得します。 まず dry-run で何件 path が取れるか確認">
-              🔍 カテゴリ path 補完 (dry-run) (<%= categoryPathMissing %> カテゴリ欠落)
-            </button>
-            <button class="btn btn-sm btn-outline-danger ms-2 js-repair-category-path-apply"
-                    title="dry-run 確認後にこれを押すと path を実際に DB へ補完します。 補完後、 該当 genre の商品が「出せる」 に動きます">
-              📥 カテゴリ path 補完 (本実行)
-            </button>
-          <% } %>
           <%# Phase E-11-b: Yahoo カテゴリ学習。 既存 130 件から逆引きで learn、 publish 自動推定の基盤。 %>
           <% if (typeof yahooCategoryMissing !== 'undefined' && (yahooCategoryMissing > 0 || (typeof yahooCategoryLearnedGenres !== 'undefined' && yahooCategoryLearnedGenres === 0)) ) { %>
             <button class="btn btn-sm btn-outline-info ms-2 js-yahoo-category-learn"
@@ -1762,82 +1750,6 @@ async function backfillRakutenGenre(evt, dryRun) {
   }
 }
 
-// ───── カテゴリ path 補完 (Phase E-17) ─────
-// 1 件ずつ Yahoo categorySearch を叩くため、 本実行は小 batch (CATPATH_BATCH=20) で自動ループ。
-const CATPATH_BATCH = 20;
-
-async function callRepairCategoryPathOnce(dryRun) {
-  const res = await fetch('/apps/rakuten-yahoo-sync/api/yahoo-category/repair-paths', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ limit: CATPATH_BATCH, dryRun: !!dryRun }),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
-  return data;
-}
-
-async function repairCategoryPath(evt, dryRun) {
-  const btn = evt.currentTarget;
-  if (!btn || btn.disabled) return;
-  const original = btn.textContent;
-
-  if (dryRun) {
-    btn.disabled = true;
-    btn.textContent = '試算中...';
-    try {
-      const data = await callRepairCategoryPathOnce(true);
-      const msg = `【dry-run サンプル試算 (先頭 ${data.processed} カテゴリ)】\n`
-        + `・path 取得できる: ${data.repaired} カテゴリ\n`
-        + `・Yahoo から path 組めない: ${data.stillMissing} カテゴリ\n`
-        + `・fetch 失敗: ${data.failed} カテゴリ\n`
-        + `(path 欠落 残 ${data.remaining} カテゴリ)\n\n`
-        + `傾向が良ければ「📥 カテゴリ path 補完 (本実行)」 を押してください。\n`
-        + `本実行は残り全部を ${CATPATH_BATCH} カテゴリずつ自動で処理します。`;
-      alert(msg);
-    } catch (e) {
-      alert('試算失敗: ' + e.message + '\n(YAHOO_APP_ID env が未設定の可能性)');
-    }
-    btn.disabled = false; btn.textContent = original;
-    return;
-  }
-
-  if (!confirm(`Yahoo categorySearch から path を取得して DB に補完します。\n残り全部を ${CATPATH_BATCH} カテゴリずつ自動処理します。\n\n続行しますか?`)) return;
-  btn.disabled = true;
-  let totalRepaired = 0, totalStill = 0, totalFailed = 0;
-  let lastRemaining = null, stuckRounds = 0;
-  try {
-    for (let round = 1; round <= 50; round++) {
-      btn.textContent = `補完中... (${totalRepaired} 補完 / 残 ${lastRemaining ?? '?'})`;
-      const data = await callRepairCategoryPathOnce(false);
-      totalRepaired += data.repaired || 0;
-      totalStill += data.stillMissing || 0;
-      totalFailed += data.failed || 0;
-      if ((data.repaired || 0) === 0 && data.remaining === lastRemaining) {
-        stuckRounds++;
-        if (stuckRounds >= 2) { lastRemaining = data.remaining; break; }
-      } else {
-        stuckRounds = 0;
-      }
-      lastRemaining = data.remaining;
-      if (!data.remaining || data.remaining <= 0) break;
-      await sleep(1200);
-    }
-    const done = !lastRemaining || lastRemaining <= 0;
-    const head = done ? `カテゴリ path 補完 完了` : `カテゴリ path 補完 一区切り (残あり、 もう一度押すと続き)`;
-    const msg = `${head}\n`
-      + `・補完できた: ${totalRepaired} カテゴリ\n`
-      + `・Yahoo から path 組めない: ${totalStill} カテゴリ\n`
-      + `・fetch 失敗: ${totalFailed} カテゴリ\n`
-      + `(path 欠落 残 ${lastRemaining ?? '?'} カテゴリ)\n\n`
-      + `該当 genre の商品が「出せる」 に動いているか確認します。 ページを再読み込みします。`;
-    alert(msg);
-    location.reload();
-  } catch (e) {
-    alert(`途中でエラー: ${e.message}\nここまで ${totalRepaired} カテゴリ補完済み。 もう一度押せば続きから。 ページを再読み込みします。`);
-    location.reload();
-  }
-}
-
 // ───── Yahoo カテゴリ学習 (Phase E-11-b) ─────
 async function seedAburatoishiCategory(evt) {
   const btn = evt.currentTarget;
@@ -2116,8 +2028,6 @@ document.addEventListener('DOMContentLoaded', () => {
   document.querySelector('.js-backfill-rakuten-title')?.addEventListener('click', backfillRakutenTitle);
   document.querySelector('.js-backfill-rakuten-genre-dry')?.addEventListener('click', (e) => backfillRakutenGenre(e, true));
   document.querySelector('.js-backfill-rakuten-genre-apply')?.addEventListener('click', (e) => backfillRakutenGenre(e, false));
-  document.querySelector('.js-repair-category-path-dry')?.addEventListener('click', (e) => repairCategoryPath(e, true));
-  document.querySelector('.js-repair-category-path-apply')?.addEventListener('click', (e) => repairCategoryPath(e, false));
   document.querySelector('.js-yahoo-category-learn')?.addEventListener('click', yahooCategoryLearn);
   document.querySelector('.js-seed-aburatoishi')?.addEventListener('click', seedAburatoishiCategory);
   document.querySelector('.js-seed-notion-drafts-dry')?.addEventListener('click', () => seedNotionDrafts({ dryRun: true }));
