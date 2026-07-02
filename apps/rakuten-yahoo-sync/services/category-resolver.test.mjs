@@ -49,6 +49,14 @@ function setupDb() {
       source            TEXT NOT NULL DEFAULT 'imported_from_local_rys',
       imported_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
     );
+    CREATE TABLE category_ai (
+      rakuten_genre_id   TEXT PRIMARY KEY,
+      yahoo_category_id  INTEGER NOT NULL,
+      confidence         REAL,
+      decided_by         TEXT NOT NULL DEFAULT 'llm' CHECK(decided_by IN ('exact_match', 'llm')),
+      note               TEXT,
+      created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    );
   `);
   return db;
 }
@@ -211,4 +219,59 @@ test('migration 015 未適用 (table 無し) でも fail せず legacy にフォ
     .run('999', 1, 'legacy');
   const r = resolveCategoryAndPath({ db, rakutenGenreId: '999' });
   assert.equal(r.source, 'learned');
+});
+
+// ── 再設計 R2: category_ai tier (実績系の下、 unresolved の上) ─────────
+
+test('実績系すべて空 → category_ai を採用 (path は default_path 補完)', () => {
+  const db = setupDb();
+  db.prepare('INSERT INTO category_ai (rakuten_genre_id, yahoo_category_id, confidence, decided_by) VALUES (?, ?, ?, ?)')
+    .run('304759', 1843, 0.75, 'llm');
+  db.prepare('INSERT INTO category_default_path (yahoo_category_id, yahoo_path) VALUES (?, ?)')
+    .run(1843, 'コスメ:ハンドケア');
+  const r = resolveCategoryAndPath({ db, rakutenGenreId: '304759' });
+  assert.equal(r.source, 'ai');
+  assert.equal(r.category, 1843);
+  assert.equal(r.path, 'コスメ:ハンドケア');
+  assert.equal(r.confidence, 0.75);
+  assert.equal(r.decidedBy, 'llm');
+});
+
+test('category_ai は manual より弱い (manual が勝つ)', () => {
+  const db = setupDb();
+  db.prepare('INSERT INTO category_manual (rakuten_genre_id, yahoo_category_id, yahoo_path) VALUES (?, ?, ?)')
+    .run('304759', 34706, '手動確定');
+  db.prepare('INSERT INTO category_ai (rakuten_genre_id, yahoo_category_id, confidence) VALUES (?, ?, ?)')
+    .run('304759', 1843, 0.9);
+  const r = resolveCategoryAndPath({ db, rakutenGenreId: '304759' });
+  assert.equal(r.source, 'manual');
+  assert.equal(r.category, 34706);
+});
+
+test('category_ai は learned (legacy) より弱い (learned が勝つ)', () => {
+  const db = setupDb();
+  db.prepare('INSERT INTO genre_yahoo_category_mapping (rakuten_genre_id, yahoo_category_id, yahoo_path, sample_count, is_primary) VALUES (?, ?, ?, 5, 1)')
+    .run('304759', 22222, '実績path');
+  db.prepare('INSERT INTO category_ai (rakuten_genre_id, yahoo_category_id, confidence) VALUES (?, ?, ?)')
+    .run('304759', 1843, 0.9);
+  const r = resolveCategoryAndPath({ db, rakutenGenreId: '304759' });
+  assert.equal(r.source, 'learned');
+  assert.equal(r.category, 22222);
+});
+
+test('category_ai hit + default_path 無し → ai_path_missing (fail-closed)', () => {
+  const db = setupDb();
+  db.prepare('INSERT INTO category_ai (rakuten_genre_id, yahoo_category_id, confidence) VALUES (?, ?, ?)')
+    .run('304759', 1843, 0.75);
+  const r = resolveCategoryAndPath({ db, rakutenGenreId: '304759' });
+  assert.equal(r.source, 'ai_path_missing');
+  assert.equal(r.category, null);
+  assert.equal(r.aiCategory, 1843);
+});
+
+test('category_ai テーブル未適用 (migration 020 前) でも crash せず unresolved', () => {
+  const db = new Db(':memory:');
+  db.exec('CREATE TABLE category_manual (rakuten_genre_id TEXT PRIMARY KEY, yahoo_category_id INTEGER NOT NULL, yahoo_path TEXT, note TEXT)');
+  const r = resolveCategoryAndPath({ db, rakutenGenreId: '304759' });
+  assert.equal(r.source, 'unresolved');
 });

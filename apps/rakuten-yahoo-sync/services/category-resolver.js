@@ -5,16 +5,19 @@
  *   ローカル RYS (Downloads/RakutenYahooSync) 由来の変換表 (migration 015) を統合し、
  *   多段 fallback で resolve する。
  *
- *   優先順序 (Codex Phase E-12 R1):
+ *   優先順序 (Codex Phase E-12 R1 → 再設計 R2 で ai を追加):
  *     1. Notion override (`notion_overrides.product_category` + `notion_path`)
  *        中原さんが意図的に片方だけ入れてる場合は fail-closed (notion_partial)
  *     2. category_manual (genre 単位、 中原さん人手確定済)
  *     3. category_decisions (overlap 学習、 locked=1 AND ambiguous=0 のみ自動採用)
  *     4. legacy genre_yahoo_category_mapping (PR #318 由来、 130 件)
- *     5. null (blocked、 学習要)
+ *     5. category_ai (再設計 R2: Claude Code 一括生成の AI 初期紐づけ)
+ *        実績ベース (manual/decisions/learned) が無い genre の空白を埋める最終 fallback。
+ *        AI 推定は実出品の観測より弱い根拠なので、 人手・実績の全 tier より下位に置く。
+ *     6. null (blocked、 紐付け画面で人が確定)
  *
  *   yahoo_path 補完:
- *     - manual/decisions に yahoo_path がなければ category_default_path から引く
+ *     - manual/decisions/ai に yahoo_path がなければ category_default_path から引く
  *     - それでも無ければ category は確定でも path null で blocked
  */
 
@@ -110,6 +113,37 @@ function resolveFromDecisions(db, genreId) {
 }
 
 /**
+ * category_ai (再設計 R2: Claude Code 一括生成の AI 初期紐づけ) を引く。
+ * path は category_default_path からのみ補完 (AI は path=店の棚 を推定しない。 店カテゴリは人の管轄)。
+ */
+function resolveFromAi(db, genreId) {
+  if (!db || !genreId) return null;
+  try {
+    const row = db.prepare(`
+      SELECT ai.yahoo_category_id, ai.confidence, ai.decided_by,
+             dp.yahoo_path AS resolved_path
+      FROM category_ai ai
+      LEFT JOIN category_default_path dp
+        ON dp.yahoo_category_id = ai.yahoo_category_id
+      WHERE ai.rakuten_genre_id = ?
+      LIMIT 1
+    `).get(genreId);
+    if (!row || !Number.isFinite(row.yahoo_category_id)) return null;
+    return {
+      category: row.yahoo_category_id,
+      path: row.resolved_path || null,
+      confidence: row.confidence,
+      decidedBy: row.decided_by,
+    };
+  } catch (e) {
+    if (!/no such table/i.test(e.message || '')) {
+      console.warn(`[category-resolver] resolveFromAi error: ${e.message}`);
+    }
+    return null;
+  }
+}
+
+/**
  * Notion override > 学習辞書 > null の優先順位で category/path を返す。
  *
  * @param {object} opts
@@ -187,6 +221,25 @@ export function resolveCategoryAndPath({ db, rakutenGenreId, notionOverride = nu
       return { category: learned.category, path: learned.path, source: 'learned', sampleCount: learned.sample_count };
     }
   }
-  // 5. 解決できず
+  // 5. category_ai (再設計 R2: AI 初期紐づけ。 実績系 tier が全部空振りした genre の空白を埋める)
+  //   path が default_path で補完できない場合は fail-closed (ai_path_missing)。
+  //   紐付け画面には「ID は AI 提案済、 path だけ入力」として出る (unresolved-genres 側で扱う)。
+  if (rakutenGenreId) {
+    const ai = resolveFromAi(db, rakutenGenreId);
+    if (ai && Number.isFinite(ai.category)) {
+      if (ai.path) {
+        return {
+          category: ai.category, path: ai.path,
+          source: 'ai', confidence: ai.confidence, decidedBy: ai.decidedBy,
+        };
+      }
+      return {
+        category: null, path: null,
+        source: 'ai_path_missing',
+        aiCategory: ai.category,
+      };
+    }
+  }
+  // 6. 解決できず
   return { category: null, path: null, source: 'unresolved' };
 }
