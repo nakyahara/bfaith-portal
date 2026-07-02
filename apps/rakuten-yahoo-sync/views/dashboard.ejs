@@ -1554,7 +1554,7 @@ function updateBulkResultRow(item) {
     : item.status === 'running' ? '楽天から取得 → Yahoo に登録中…'
     : item.status === 'dedupe' ? '重複検出 (既に処理済み)'
     : item.status === 'flag_off' ? '本番モード OFF のためスキップ'
-    : item.status === 'readiness_blocked' ? 'Notion 必須項目に不足 — スキップ'
+    : item.status === 'readiness_blocked' ? '出品条件チェックで止まりました — スキップ'
     : item.status === 'pending' ? '待機中'
     : (item.status || '?');
   // background highlight for running row

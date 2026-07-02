@@ -16,6 +16,7 @@
 
 import { executePublish, isPublishEnabled } from './publish-executor.js';
 import { fetchAllItemCodes } from '../lib/rakuten-rms-proxy.js';
+import { summarizeReasons } from '../lib/reason-translator.js';
 
 function isoNow() { return new Date().toISOString(); }
 
@@ -117,11 +118,19 @@ async function publishOneItem({ db, itemCode, batchItemId, codeMappingCache }) {
     else if (result.status === 'readiness_blocked') normalized = 'readiness_blocked';
     else if (result.status === 'not_implemented') normalized = 'skipped';
     else normalized = 'failed';
+    // R7: readiness_blocked は executePublish が返す reasons (本当の理由) を日本語で保存する。
+    //   従来は null 保存 → モーダルに総称ラベルしか出ず「なぜ弾かれたか」が見えなかった
+    //   (「出せる」一覧は Notion 項目+カテゴリの静的判定で、 出品時は画像/税率整合/バリエーション等の
+    //    実チェックが加わるため、 ここで初めて弾かれる商品がある)。
+    let errorMessage = result.error || result.message || null;
+    if (result.status === 'readiness_blocked' && Array.isArray(result.reasons) && result.reasons.length > 0) {
+      errorMessage = summarizeReasons(result.reasons).items.map((i) => i.message).join(' / ');
+    }
     markItemDone(db, batchItemId, {
       status: normalized,
       publishStatus: result.status,
       idempotencyKey: result.idempotencyKey || result.idempotency_key || null,
-      errorMessage: result.error || result.message || null,
+      errorMessage,
     });
     return { status: normalized, publishStatus: result.status, idempotencyKey: result.idempotencyKey || null, error: result.error || null };
   } catch (e) {
