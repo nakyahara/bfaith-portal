@@ -68,3 +68,101 @@ test('通常品 (variants 1 件) は subcodes 無し + auc 送る', () => {
   assert.equal(r.subcodes, null);
   assert.equal(r.sendAucFields, true);
 });
+
+// ── R11: options/subcodes 自動構築 (Yahoo 正式書式) ──
+import { buildVariationOptionFields } from './variation-resolver.js';
+
+test('R11: 単一軸の options/subcodes を正式書式で構築', () => {
+  const r = buildVariationOptionFields(RMS_ITEM);
+  assert.equal(r.ok, true);
+  assert.equal(r.options, '香り#アロマベルガモット,ローズ');
+  assert.equal(r.subcodes, '香り:アロマベルガモット=aromamist20-am|香り:ローズ=aromamist20-ro');
+});
+
+test('R11: 半角スペースは全角に置換して救済', () => {
+  const item = {
+    variantSelectors: [{ key: 'K', displayName: '香り', values: [{ displayValue: 'ホワイト ムスク' }] }],
+    variants: { a: { merchantDefinedSkuId: 'x-wm', selectorValues: { K: 'ホワイト ムスク' } } },
+  };
+  const r = buildVariationOptionFields(item);
+  assert.equal(r.ok, true);
+  assert.equal(r.options, '香り#ホワイト　ムスク');
+  assert.equal(r.subcodes, '香り:ホワイト　ムスク=x-wm');
+});
+
+test('R11: 禁止文字 (#等) を含む選択肢は fail-closed', () => {
+  const item = {
+    variantSelectors: [{ key: 'K', displayName: '香り', values: [] }],
+    variants: { a: { merchantDefinedSkuId: 'x-1', selectorValues: { K: 'A#B' } } },
+  };
+  const r = buildVariationOptionFields(item);
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.some((e) => e.startsWith('variation_option_invalid_char')));
+});
+
+test('R11: 選択肢値の欠落 variant があれば fail-closed (部分登録しない)', () => {
+  const item = {
+    variantSelectors: [{ key: 'K', displayName: '香り', values: [] }],
+    variants: {
+      a: { merchantDefinedSkuId: 'x-1', selectorValues: { K: 'ローズ' } },
+      b: { merchantDefinedSkuId: 'x-2', selectorValues: {} },
+    },
+  };
+  const r = buildVariationOptionFields(item);
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.some((e) => e.startsWith('variation_option_value_missing:x-2')));
+});
+
+test('R11: 2軸で全組み合わせが揃えば OK、歯抜けは fail-closed', () => {
+  const mk = (rows) => ({
+    variantSelectors: [
+      { key: 'C', displayName: 'カラー', values: [{ displayValue: '黒' }, { displayValue: '白' }] },
+      { key: 'S', displayName: 'サイズ', values: [{ displayValue: 'S' }, { displayValue: 'M' }] },
+    ],
+    variants: Object.fromEntries(rows.map(([id, c, s]) => [id, { merchantDefinedSkuId: id, selectorValues: { C: c, S: s } }])),
+  });
+  const full = buildVariationOptionFields(mk([['a-1', '黒', 'S'], ['a-2', '黒', 'M'], ['a-3', '白', 'S'], ['a-4', '白', 'M']]));
+  assert.equal(full.ok, true);
+  assert.equal(full.options, 'カラー#黒,白|サイズ#S,M');
+  assert.ok(full.subcodes.includes('カラー:黒#サイズ:S=a-1'));
+  const sparse = buildVariationOptionFields(mk([['a-1', '黒', 'S'], ['a-2', '黒', 'M'], ['a-3', '白', 'S']]));
+  assert.equal(sparse.ok, false);
+  assert.ok(sparse.errors.some((e) => e.startsWith('variation_combos_incomplete:3/4')));
+});
+
+test('R11: resolveVariation が optionFields を含み、readiness がそれで判定できる', () => {
+  const r = resolveVariation({ rakutenItem: RMS_ITEM, notionHasVariation: 'バリエーション登録あり' });
+  assert.equal(r.optionFields.ok, true);
+  assert.match(r.optionFields.subcodes, /=aromamist20-am/);
+});
+
+test('R11 Codex反映: 重複組み合わせは件数が合っていても fail-closed', () => {
+  const item = {
+    variantSelectors: [
+      { key: 'C', displayName: 'カラー', values: [{ displayValue: '黒' }, { displayValue: '白' }] },
+      { key: 'S', displayName: 'サイズ', values: [{ displayValue: 'S' }, { displayValue: 'M' }] },
+    ],
+    variants: {
+      a: { merchantDefinedSkuId: 'a-1', selectorValues: { C: '黒', S: 'S' } },
+      b: { merchantDefinedSkuId: 'a-2', selectorValues: { C: '黒', S: 'S' } }, // 重複 (白-M 欠落なのに件数4)
+      c: { merchantDefinedSkuId: 'a-3', selectorValues: { C: '黒', S: 'M' } },
+      d: { merchantDefinedSkuId: 'a-4', selectorValues: { C: '白', S: 'S' } },
+    },
+  };
+  const r = buildVariationOptionFields(item);
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.some((e) => e.startsWith('variation_combo_duplicate:黒#S')));
+});
+
+test('R11 Codex反映: 単一軸でも同一選択肢の重複SKUは fail-closed', () => {
+  const item = {
+    variantSelectors: [{ key: 'K', displayName: '香り', values: [] }],
+    variants: {
+      a: { merchantDefinedSkuId: 'x-1', selectorValues: { K: 'ローズ' } },
+      b: { merchantDefinedSkuId: 'x-2', selectorValues: { K: 'ローズ' } },
+    },
+  };
+  const r = buildVariationOptionFields(item);
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.some((e) => e.startsWith('variation_combo_duplicate')));
+});
