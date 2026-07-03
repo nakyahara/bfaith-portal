@@ -186,11 +186,14 @@ function libImageFileName(itemCode, index) {
 }
 
 // Yahoo it-14061 修正 (2026-06-27): main は uploadItemImage、 desc は uploadLibImage (別 API)。
-//   main:  uploadItemImage で `{itemCode}.jpg + _1..9` の最大 10 枚
+//   main:  uploadItemImage で `{itemCode}.jpg + _1..20` の最大 21 枚
+//          (R14 2026-07-03 中原さん指摘: Yahoo 公式はメイン1+サブ20=21枚。
+//           旧 MAIN_MAX=10 は Phase E の保守的決め打ちで、 楽天11枚の商品が誤って止まっていた。
+//           ファイル名検証 (yahoo-publish-proxy) と imageFileName は元から _20 まで対応済み)
 //   desc:  uploadLibImage で `{itemCode}_lib_1..20` の最大 20 枚
 //          → additional1/sp_additional に貼れる Yahoo CDN URL
 //          (uploadItemImage で得た URL は it-14061 で additional1 に貼れない)
-const MAIN_MAX = 10;
+const MAIN_MAX = 21;
 const DESC_MAX = 20;
 
 // Codex Phase E image-html R5 H-1: SSRF 防御. download 対象は **https: + 楽天 host のみ**。
@@ -216,8 +219,8 @@ function isAllowedDownloadUrl(url) {
  * 統合 upload して、 楽天 URL → Yahoo CDN URL の map と Yahoo CDN hostname allowlist を返す。
  *
  * 設計 (Codex Phase E image-html R1-R3 stop, fail-closed):
- *   - main は images[] (filter + normalize) 先頭 10 枚まで、 `{itemCode}.jpg` + `_1..9`
- *   - desc は descriptionImageUrls (normalize 済を期待) - main 重複排除 後 11 枚まで、 `_10..20`
+ *   - main は images[] (filter + normalize) 最大 21 枚 (Yahoo 公式: メイン1+サブ20)、 `{itemCode}.jpg` + `_1..20`
+ *   - desc は descriptionImageUrls (normalize 済を期待) 最大 20 枚、 `{itemCode}_lib_1..20` (uploadLibImage)
  *   - 上限超過 → throw (publish 停止、 中原さんが楽天で画像減らす)
  *   - upload 1 件失敗 → throw (旧 fallback の `<br>` 化は禁止: R1 H-1)
  *   - Yahoo response の <ModeA> から URL を抽出して urlMap に積む
