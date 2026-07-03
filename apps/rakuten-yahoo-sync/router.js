@@ -276,6 +276,17 @@ function listProductsForUI(db, { filter = 'all', search = '' } = {}) {
       if (r.readiness_blocked_reasons) {
         try { existingReasons = JSON.parse(r.readiness_blocked_reasons); } catch (_) {}
       }
+      // R10 (中原さん指摘: カテゴリを紐付けたのに古い「カテゴリが解決できません」が残る):
+      //   jobs に persist された理由のうち、 この一覧でいま再計算している項目
+      //   (Notion 4項目 + カテゴリ/path) は「過去のスナップショット」なので捨てて
+      //   live 判定を正とする。 live で再計算できない項目 (画像/税率整合/バリエーション等、
+      //   楽天実データが要るもの) だけ persist 値を残す。
+      const LIVE_RECOMPUTED_HEADS = new Set([
+        'notion_title_missing', 'price_invalid_or_zero', 'delivery_mapping_unresolved',
+        'notion_tax_rate_missing', 'notion_category_partial',
+        'product_category_unresolved', 'path_unresolved',
+      ]);
+      existingReasons = existingReasons.filter((x) => !LIVE_RECOMPUTED_HEADS.has(String(x).split(':')[0]));
       const allReasons = [...missing, ...existingReasons.filter((x) => !missing.includes(x))];
       if (allReasons.length === 0) {
         status = 'actionable';

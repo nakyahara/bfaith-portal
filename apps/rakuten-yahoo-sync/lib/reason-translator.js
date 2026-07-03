@@ -26,9 +26,9 @@ export function translateReason(rawReason) {
     case 'notion_title_too_long':
       return { message: 'Yahoo!タイトルが 65 字を超えています', notionField: 'Yahoo!タイトル', severity: 'must' };
     case 'product_category_unresolved':
-      return { message: 'Yahoo!カテゴリが解決できません (楽天 genre が学習済 130 件に無い、 または学習辞書未構築)。 Notion に 「Yahoo!カテゴリID」 列を作って入力してください。 または既存出品から学習し直してください', notionField: 'Yahoo!カテゴリID', severity: 'must' };
+      return { message: 'Yahoo!カテゴリが未設定です。「🏷️ カテゴリ紐付け画面」で候補から選んでください (AI候補・検索・階層選択)', notionField: 'Yahoo!カテゴリID', severity: 'must' };
     case 'path_unresolved':
-      return { message: 'Yahoo!path が解決できません (同上、 楽天 genre が学習済 130 件に無い)。 Notion に 「Yahoo!path」 列を作って入力してください', notionField: 'Yahoo!path', severity: 'must' };
+      return { message: '店の棚 (path) が未設定です。「🏷️ カテゴリ紐付け画面」で棚を選んでください (実績のある棚 or 楽天カテゴリに合わせる)', notionField: 'Yahoo!path', severity: 'must' };
     case 'notion_category_partial':
       return { message: 'Notion で Yahoo!カテゴリID と Yahoo!path のどちらか片方しか入力されていません。 両方入力してください (片方だけだと自動推定との混在を避けるため publish が止まります)', notionField: 'Yahoo!カテゴリID', severity: 'must' };
     case 'price_invalid_or_zero':
@@ -90,7 +90,7 @@ export function translateReason(rawReason) {
       };
     }
     case 'variation_axes_missing':
-      return { message: 'バリエーション項目が楽天側で取得できません', notionField: null, severity: 'check' };
+      return { message: 'バリエーションの項目名 (軸) が楽天データから読み取れません (通常は起きません。 発生したら開発に連絡)', notionField: null, severity: 'check' };
     case 'rakuten_fetch_failed':
       return { message: '楽天から商品データを取得できませんでした', notionField: null, severity: 'check' };
     case 'rakuten_item_not_found':
