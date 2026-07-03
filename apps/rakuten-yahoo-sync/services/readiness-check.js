@@ -71,11 +71,26 @@ export function evaluateVariationSpec(db, requiredAxes, yahooProductCategory) {
 
 export function extractRequiredAxes(rakutenItem) {
   if (!rakutenItem) return [];
+  // R10 (2026-07-03 中原さん指摘の実データ検証で判明):
+  //   楽天 RMS Items API 2.0 の実レスポンスでは、 バリエーション軸 (項目名) は
+  //   item.variantSelectors [{ key, displayName, values }] にある (item 直下)。
+  //   旧実装は variants[].axes / axis1Name を探しており実データでは常に空
+  //   → 全バリ品が variation_axes_missing で誤 blocked になっていた。
+  const selectors = rakutenItem.variantSelectors;
+  const selList = Array.isArray(selectors)
+    ? selectors
+    : (selectors && typeof selectors === 'object' ? [selectors] : []);
+  const axes = new Set();
+  for (const s of selList) {
+    const name = s?.displayName || s?.key;
+    if (name) axes.add(String(name));
+  }
+  if (axes.size > 0) return [...axes];
+  // 旧 shape fallback (テスト/互換)
   const variants = rakutenItem.variants;
   const list = Array.isArray(variants)
     ? variants
     : (variants && typeof variants === 'object' ? Object.values(variants) : []);
-  const axes = new Set();
   for (const v of list) {
     if (!v) continue;
     if (Array.isArray(v.axes)) {

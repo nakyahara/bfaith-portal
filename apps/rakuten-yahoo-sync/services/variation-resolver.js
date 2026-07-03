@@ -6,9 +6,13 @@
  * 設計原則 (Phase 0 §「商品タイプ分岐」 + Q12/Q34 + Codex B2 R1 M-1/M-2/L-1):
  *   - SoT: 楽天 variants.length >= 2 が真 (Notion はクロスチェック専用)
  *   - 通常品 (variants < 2): condition=2 / auc_* 送る / subcodes=null
- *   - バリ品 (variants >= 2): condition=1 / auc_* 送らない / subcodes=['${itemNumber}-${skuId}', ...]
+ *   - バリ品 (variants >= 2): condition=1 / auc_* 送らない / subcodes=[merchantDefinedSkuId, ...]
+ *     ⚠️ R10 (2026-07-03 中原さん指示): Yahoo バリエーションコード = 楽天「システム連携用SKU番号」
+ *     (= merchantDefinedSkuId) **そのまま**。 システム連携用SKU番号は既に「商品番号+項目選択肢」
+ *     形式なので、 旧実装の `${itemNumber}-${skuId}` は商品番号が二重になっていた
+ *     (例: aromamist20-aromamist20-am)。
  *   - subcode は半角英数+ハイフンのみ (Yahoo 仕様、 Codex R5 確定)
- *   - subcode 重複検知 (M-2: 同 itemNumber 内で skuId 重複 → 同一 subcode 発生)
+ *   - subcode 重複検知 (M-2)
  *   - Notion 想定外値は unknown_notion_variation_value conflict として返す (L-1)
  */
 
@@ -33,12 +37,8 @@ export function resolveVariation({ rakutenItem, notionHasVariation }) {
   let subcodes = null;
   const subcodeErrors = [];
   if (isVariation) {
-    const itemNumber = rakutenItem?.itemNumber ? String(rakutenItem.itemNumber).trim() : '';
-    if (!itemNumber) {
-      subcodeErrors.push('rakuten_item_number_empty');
-    } else if (!SUBCODE_REGEX.test(itemNumber)) {
-      subcodeErrors.push(`rakuten_item_number_invalid_format: ${itemNumber}`);
-    }
+    // R10: subcode = merchantDefinedSkuId (楽天「システム連携用SKU番号」) そのまま。
+    //   既に「商品番号+項目選択肢」形式のため itemNumber prefix は付けない (二重防止)。
     subcodes = [];
     for (const v of variants) {
       const skuId = v?.merchantDefinedSkuId ? String(v.merchantDefinedSkuId).trim() : '';
@@ -50,8 +50,7 @@ export function resolveVariation({ rakutenItem, notionHasVariation }) {
         subcodeErrors.push(`variant_sku_id_invalid_format: ${skuId}`);
         continue;
       }
-      if (!itemNumber || !SUBCODE_REGEX.test(itemNumber)) continue;
-      subcodes.push(`${itemNumber}-${skuId}`);
+      subcodes.push(skuId);
     }
     if (subcodes.length === 0) subcodes = null;
     // M-2: 重複検知

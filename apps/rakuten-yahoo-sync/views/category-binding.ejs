@@ -372,9 +372,23 @@
         });
         const j = await res.json();
         if (j.status !== 'ok') { msg.textContent = '失敗: ' + (j.error || res.status); msg.className = 'js-msg small text-danger'; btn.disabled = false; return; }
-        msg.textContent = '✅ 保存しました (' + g.count + '商品が「出せる」候補に)';
-        msg.className = 'js-msg small text-success';
+        // R10: グレーアウトだと「入力できたのか分からない」(中原さん指摘) →
+        //   カードを緑の完了パネルに置き換えて、 保存された値を明示する
+        const savedName = div.dataset.selectedName || g.existingCategoryName || '';
         div.classList.add('done');
+        div.style.opacity = '1';
+        div.style.background = '#e8f5e9';
+        div.style.borderColor = '#43a047';
+        div.innerHTML =
+          '<div style="display:flex; align-items:center; gap:.8em;">' +
+            '<span style="font-size:1.6em;">✅</span>' +
+            '<div>' +
+              '<div><strong>紐付け完了</strong>: ' + (g.rakutenGenreName ? esc(g.rakutenGenreName) : 'genre ' + esc(g.genreId)) + '</div>' +
+              '<div class="small">Yahoo!カテゴリ: <strong>' + esc(cat) + '</strong>' + (savedName ? ' (' + esc(savedName) + ')' : '') +
+              (path ? ' ／ 店の棚: <strong>' + esc(path) + '</strong>' : ' ／ <span class="text-danger">店の棚は未設定 (棚が決まるまで出品は止まります)</span>') + '</div>' +
+              '<div class="small text-muted">' + g.count + ' 商品が「出せる」候補に動きます (次の一覧更新で反映)</div>' +
+            '</div>' +
+          '</div>';
       } catch (e) {
         msg.textContent = 'エラー: ' + e.message; msg.className = 'js-msg small text-danger'; btn.disabled = false;
       }
