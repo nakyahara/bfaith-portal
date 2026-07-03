@@ -193,13 +193,17 @@ export function persistJobReadiness(db, itemCode, result) {
     throw new Error('persistJobReadiness: blocked status requires at least one reason');
   }
   const reasonsJson = result.status === 'blocked' ? JSON.stringify(result.reasons) : null;
+  // R8 Codex Critical: 旧実装は UPDATE のみで、 jobs 行が無い候補 (diff 検出直後の商品) には
+  // 何も書かれず readiness が UI に出なかった。 upsert 化 (新規行は current_state='pending')。
   db.prepare(`
-    UPDATE jobs
-       SET readiness_status         = ?,
-           readiness_blocked_reasons = ?,
-           last_readiness_at         = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-     WHERE item_code = ?
-  `).run(result.status, reasonsJson, itemCode);
+    INSERT INTO jobs (item_code, current_state, readiness_status, readiness_blocked_reasons, last_readiness_at)
+    VALUES (?, 'pending', ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    ON CONFLICT(item_code) DO UPDATE SET
+      readiness_status          = excluded.readiness_status,
+      readiness_blocked_reasons = excluded.readiness_blocked_reasons,
+      last_readiness_at         = excluded.last_readiness_at,
+      updated_at                = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+  `).run(itemCode, result.status, reasonsJson);
 }
 
 export { TAX_RATE_MAP, NAME_MAX_LENGTH };

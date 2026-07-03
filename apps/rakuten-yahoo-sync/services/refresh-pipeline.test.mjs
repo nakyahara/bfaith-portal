@@ -50,6 +50,7 @@ function okDeps(overrides = {}) {
     })(),
     syncNotionOverrides: async () => ({ inserted: 1, updated: 2, skipped: 0, deleted: 0, errors: [] }),
     acquireNotionSyncLock: () => () => {}, // lock 取得成功 (release は no-op)
+    sweepReadiness: async () => ({ picked: 10, evaluated: 10, okCount: 8, blockedCount: 2, errors: 0, errorSamples: [] }),
     ...overrides,
   };
 }
@@ -201,4 +202,23 @@ test('notion_pages: 行単位の失敗 outcome (create_failed 等) も fail-clos
   );
   const run = getRefreshRun(db);
   assert.equal(run.status, 'failed');
+});
+
+test('readiness_check: sweep 結果が steps に記録される (R8)', async () => {
+  const db = setupDb();
+  const r = await runPipeline(db, okDeps());
+  assert.equal(r.steps.readiness_check.ok, true);
+  assert.equal(r.steps.readiness_check.evaluated, 10);
+  assert.equal(r.steps.readiness_check.blockedCount, 2);
+});
+
+test('readiness_check: sweep の throw (全滅等) は pipeline failure (R8)', async () => {
+  const db = setupDb();
+  const deps = okDeps({
+    sweepReadiness: async () => { throw new Error('readiness sweep: 1件も評価できませんでした (picked=5, errors=5)'); },
+  });
+  await assert.rejects(() => runPipeline(db, deps), (e) => e.failedStep === 'readiness_check' && /評価できません/.test(e.message));
+  const run = getRefreshRun(db);
+  assert.equal(run.status, 'failed');
+  assert.equal(run.current_step, 'readiness_check');
 });
