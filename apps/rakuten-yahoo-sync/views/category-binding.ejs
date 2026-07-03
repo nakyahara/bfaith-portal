@@ -14,8 +14,11 @@
     .rk-path { color:#666; font-size:.85em; }
     .sample { color:#444; font-size:.85em; margin:.3em 0; }
     .count-badge { background:#fff3cd; color:#8a6d3b; border:1px solid #ffe69c; padding:.15em .6em; border-radius:.5em; font-weight:600; font-size:.85em; }
-    .has-id { background:#d1ecf1; color:#0c5460; border:1px solid #bee5eb; padding:.1em .5em; border-radius:.4em; font-size:.8em; }
-    .ai-badge { background:#e7d9f7; color:#5b2d90; border:1px solid #d3b9f0; padding:.1em .5em; border-radius:.4em; font-size:.8em; }
+    /* R9: 状態チェックリスト (何が設定済みで何が足りないか) */
+    .status-check { background:#f8f9fb; border:1px solid #e6e9ee; border-radius:.5em; padding:.5em .8em; margin:.5em 0; font-size:.9em; }
+    .status-check .ok  { color:#1b7f37; }
+    .status-check .ng  { color:#b02a37; font-weight:600; }
+    .status-check .auto{ color:#0a58ca; }
     /* 候補ボタン (AI候補・検索結果 共通)。 選択中は青枠 */
     .cand-btn { display:block; width:100%; text-align:left; background:#f8f9fb; border:1px solid #dfe3e8; border-radius:.5em;
                 padding:.4em .7em; margin:.25em 0; font-size:.88em; cursor:pointer; }
@@ -25,6 +28,20 @@
     .cand-path { color:#777; font-size:.9em; }
     .cand-meta { color:#999; font-size:.85em; }
     .search-results { margin-top:.3em; }
+    /* R9: ツリー (階層ごとの絞り込み) */
+    .tree-panel { border:1px solid #cfe2ff; background:#f5f9ff; border-radius:.5em; padding:.6em .8em; margin-top:.4em; }
+    .tree-crumb { font-size:.85em; margin-bottom:.4em; }
+    .tree-crumb a { cursor:pointer; text-decoration:underline; color:#0a58ca; }
+    .tree-crumb .sep { color:#999; margin:0 .25em; }
+    .tree-row { display:flex; align-items:center; gap:.5em; background:#fff; border:1px solid #e3e8ef; border-radius:.4em;
+                padding:.3em .6em; margin:.2em 0; font-size:.88em; }
+    .tree-row .drill { cursor:pointer; color:#0a58ca; flex:1; }
+    .tree-row .drill:hover { text-decoration:underline; }
+    .tree-row .leafname { flex:1; color:#333; }
+    .tree-row .child-count { color:#999; font-size:.85em; }
+    .shelf-chip { display:inline-block; background:#e7f5ec; border:1px solid #b7e4c7; color:#14532d; border-radius:1em;
+                  padding:.15em .8em; margin:.2em .3em .2em 0; font-size:.85em; cursor:pointer; }
+    .shelf-chip:hover { background:#d3f0dd; }
   </style>
 </head>
 <body>
@@ -37,12 +54,9 @@
 
   <div class="container-fluid" style="max-width:1100px;">
     <div class="alert alert-info">
-      未解決の楽天genreを <strong>候補をクリックするだけ</strong>で紐付けできます。
-      候補が合わないときは「🔍 カテゴリを検索」で探すか、 Yahoo数字IDを直接入力してください。
-      <br>path (店の棚) は分かっていれば自動で入ります。 空のままの場合だけ手で入れてください
-      (一度入れた path は対応表に残り、 同じIDでは次から自動)。
-      <br>「<span class="has-id">ID済</span>」 は数字IDが確定済み = <strong>path だけ</strong>入れれば OK。
-      「<span class="ai-badge">AI提案</span>」 は AI の初期紐づけ値です (保存すると人手確定に昇格)。
+      各カテゴリの<strong>チェックリストの ❌ を埋めるだけ</strong>です。
+      Yahoo!カテゴリは <strong>AI候補クリック / 検索 / 階層をたどって選択</strong>、
+      店の棚は <strong>実績のある棚から選ぶ / 楽天カテゴリに合わせる</strong> で入ります。保存すると該当カテゴリの商品が全部「出せる」候補に動きます。
     </div>
 
     <div id="summary" class="mb-3 text-muted">読み込み中...</div>
@@ -58,12 +72,34 @@
       const j = await res.json();
       if (j.status !== 'ok') { document.getElementById('summary').textContent = '読み込み失敗: ' + (j.error || ''); return; }
       document.getElementById('summary').innerHTML =
-        '未解決 <strong>' + j.totalGenres + '</strong> genre / <strong>' + j.totalItems + '</strong> 商品。 多い順。';
+        '未解決 <strong>' + j.totalGenres + '</strong> カテゴリ / <strong>' + j.totalItems + '</strong> 商品。 商品数の多い順。';
       const list = document.getElementById('list');
       list.innerHTML = '';
       for (const g of j.genres) {
         list.appendChild(renderGenre(g));
       }
+    }
+
+    // ── 状態チェックリスト: 何が設定済みで何が足りないかを一目で ──
+    function renderStatusCheck(div, g) {
+      const box = div.querySelector('.status-check');
+      const cat = div.querySelector('.js-cat').value.trim();
+      const path = div.querySelector('.js-path').value.trim();
+      const lines = [];
+      if (cat) {
+        const name = div.dataset.selectedName || g.existingCategoryName || '';
+        lines.push('<span class="ok">✅ Yahoo!カテゴリID: ' + esc(cat) + (name ? ' (' + esc(name) + ')' : '') + '</span>');
+      } else {
+        lines.push('<span class="ng">❌ Yahoo!カテゴリIDが未設定</span> — 下の候補・検索・階層から選んでください');
+      }
+      if (path) {
+        lines.push('<span class="ok">✅ 店の棚: ' + esc(path) + '</span>');
+      } else if (cat) {
+        lines.push('<span class="ng">❌ 店の棚が未設定</span> — これだけ選べば完了です (実績のある棚 or 楽天カテゴリに合わせる)');
+      } else {
+        lines.push('<span class="auto">⏳ 店の棚: IDを選ぶと自動で入る場合があります</span>');
+      }
+      box.innerHTML = lines.join('<br>');
     }
 
     // 候補 1 件 (AI候補 or 検索結果) をクリック可能なボタンにする
@@ -74,62 +110,141 @@
       const scoreTxt = c.score != null ? Math.round(Number(c.score) * 100) + '%' : '';
       btn.innerHTML =
         '<span class="cand-name">' + esc(c.name || ('ID ' + c.categoryId)) + '</span>' +
-        ' <span class="cand-meta">ID ' + esc(c.categoryId) + (scoreTxt ? ' / 類似 ' + scoreTxt : '') + (c.defaultPath ? ' / path自動' : '') + '</span>' +
+        ' <span class="cand-meta">ID ' + esc(c.categoryId) + (scoreTxt ? ' / 類似 ' + scoreTxt : '') + (c.defaultPath ? ' / 棚自動' : '') + '</span>' +
         (c.pathName ? '<div class="cand-path">' + esc(c.pathName) + '</div>' : '');
       return btn;
     }
 
-    // 候補クリック → ID と path (既知なら) を入力欄に反映
-    function applyCandidate(div, c, clickedBtn) {
+    // 候補クリック → ID と棚 (既知なら) を入力欄に反映
+    function applyCandidate(div, g, c, clickedBtn) {
       div.querySelector('.js-cat').value = String(c.categoryId);
+      div.dataset.selectedName = c.name || '';
       const pathInput = div.querySelector('.js-path');
-      // path 不明の候補では必ずクリア (前候補の path が残ったまま保存されると
-      // ID→path 対応表を誤学習するため。 Codex R3-R1 Medium)
+      // path 不明の候補では必ずクリア (前候補の棚が残ったまま保存されると対応表を誤学習するため)
       pathInput.value = c.defaultPath || '';
       div.querySelectorAll('.cand-btn').forEach((b) => b.classList.remove('selected'));
       if (clickedBtn) clickedBtn.classList.add('selected');
-      const msg = div.querySelector('.js-msg');
-      msg.textContent = c.defaultPath ? 'ID と path を入れました。「保存」で確定します'
-                                      : 'ID を入れました。 path (店の棚) を入力して「保存」してください';
-      msg.className = 'js-msg small text-primary';
+      renderStatusCheck(div, g);
+    }
+
+    // ── R9: 汎用ドリルダウンツリー (階層ごとに絞り込み) ──
+    //   endpoint: /tree (Yahoo!カテゴリ、' > ' 区切り) or /shelf-tree (店の棚、':' 区切り)
+    function mountTree(container, { endpoint, sep, onPick, pickLabel, selectableMiddle }) {
+      let crumb = []; // 現在の親パス (segments)
+      async function render() {
+        container.innerHTML = '<span class="small text-muted">読み込み中...</span>';
+        let j;
+        try {
+          const res = await fetch(API + endpoint + '?path=' + encodeURIComponent(crumb.join(sep)));
+          j = await res.json();
+          if (j.status !== 'ok') throw new Error(j.error || 'error');
+        } catch (e) {
+          container.innerHTML = '<span class="small text-danger">読み込み失敗: ' + esc(e.message) + '</span>';
+          return;
+        }
+        container.innerHTML = '';
+        // パンくず
+        const crumbDiv = document.createElement('div');
+        crumbDiv.className = 'tree-crumb';
+        const top = document.createElement('a');
+        top.textContent = 'トップ';
+        top.addEventListener('click', () => { crumb = []; render(); });
+        crumbDiv.appendChild(top);
+        crumb.forEach((seg, i) => {
+          const sepSpan = document.createElement('span'); sepSpan.className = 'sep'; sepSpan.textContent = '›';
+          crumbDiv.appendChild(sepSpan);
+          const a = document.createElement('a');
+          a.textContent = seg;
+          a.addEventListener('click', () => { crumb = crumb.slice(0, i + 1); render(); });
+          crumbDiv.appendChild(a);
+        });
+        container.appendChild(crumbDiv);
+        if (j.children.length === 0) {
+          const empty = document.createElement('div');
+          empty.className = 'small text-muted';
+          empty.textContent = 'この下にはありません';
+          container.appendChild(empty);
+        }
+        for (const c of j.children) {
+          const row = document.createElement('div');
+          row.className = 'tree-row';
+          if (c.childCount > 0) {
+            const drill = document.createElement('span');
+            drill.className = 'drill';
+            drill.textContent = c.name + ' ›';
+            drill.title = 'この階層をひらく';
+            drill.addEventListener('click', () => { crumb = [...crumb, c.name]; render(); });
+            row.appendChild(drill);
+            const cnt = document.createElement('span');
+            cnt.className = 'child-count';
+            cnt.textContent = c.childCount + '件';
+            row.appendChild(cnt);
+          } else {
+            const leaf = document.createElement('span');
+            leaf.className = 'leafname';
+            leaf.textContent = c.name;
+            row.appendChild(leaf);
+          }
+          // 選択ボタン (Yahoo!カテゴリ = categoryId のあるノード / 店の棚 = すべてのノード)
+          const pickable = selectableMiddle ? true : (c.categoryId != null);
+          if (pickable) {
+            const pick = document.createElement('button');
+            pick.type = 'button';
+            pick.className = 'btn btn-sm btn-outline-primary';
+            pick.textContent = pickLabel;
+            pick.addEventListener('click', () => onPick(c));
+            row.appendChild(pick);
+          }
+          container.appendChild(row);
+        }
+      }
+      render();
     }
 
     function renderGenre(g) {
       const div = document.createElement('div');
       div.className = 'genre-card';
       div.dataset.genreId = g.genreId;
-      const idBadge = g.existingCategoryId ? ' <span class="has-id">ID済</span>' : '';
-      const aiBadge = g.aiSuggestion ? ' <span class="ai-badge">AI提案' +
+      const aiBadge = g.aiSuggestion ? ' <span class="badge text-bg-light border">AI提案' +
         (g.aiSuggestion.confidence != null ? ' ' + Math.round(g.aiSuggestion.confidence * 100) + '%' : '') + '</span>' : '';
       const rkCat = g.rakutenGenreName ? '<span class="rk-cat">' + esc(g.rakutenGenreName) + '</span>' : '<span class="text-muted">(楽天カテゴリ名 不明)</span>';
       const rkPath = g.rakutenGenrePath ? '<div class="rk-path">楽天: ' + esc(g.rakutenGenrePath) + '</div>' : '';
       const samples = (g.sampleTitles || []).slice(0,2).map((t) => '<div class="sample">・' + esc(t.slice(0,60)) + (t.length>60?'…':'') + '</div>').join('');
       div.innerHTML =
-        '<div class="d-flex justify-content-between align-items-start">' +
-          '<div style="flex:1;">' +
-            '<div>' + rkCat + idBadge + aiBadge + ' <span class="count-badge">' + g.count + '商品</span> <span class="text-muted small">genre ' + esc(g.genreId) + '</span></div>' +
-            rkPath + samples +
-          '</div>' +
-        '</div>' +
-        '<div class="js-candidates mt-2"></div>' +
+        '<div>' + rkCat + aiBadge + ' <span class="count-badge">' + g.count + '商品</span> <span class="text-muted small">genre ' + esc(g.genreId) + '</span></div>' +
+        rkPath + samples +
+        '<div class="status-check"></div>' +
+        '<div class="js-candidates mt-1"></div>' +
         '<div class="mt-1">' +
-          '<button type="button" class="btn btn-sm btn-outline-secondary js-search-toggle">🔍 カテゴリを検索</button>' +
+          '<button type="button" class="btn btn-sm btn-outline-secondary js-search-toggle">🔍 検索で探す</button> ' +
+          '<button type="button" class="btn btn-sm btn-outline-secondary js-tree-toggle">📂 階層をたどって選ぶ</button>' +
           '<span class="js-search-area" style="display:none;">' +
             '<input type="text" class="form-control form-control-sm d-inline-block ms-2 js-search-q" style="width:260px;" placeholder="例: ハンドクリーム">' +
             '<button type="button" class="btn btn-sm btn-primary ms-1 js-search-run">検索</button>' +
           '</span>' +
           '<div class="search-results js-search-results"></div>' +
+          '<div class="tree-panel js-tree-panel" style="display:none;"></div>' +
         '</div>' +
         '<div class="row g-2 mt-1 align-items-center">' +
           '<div class="col-auto"><label class="small text-muted">Yahoo数字ID</label>' +
             '<input type="text" inputmode="numeric" class="form-control form-control-sm js-cat" style="width:140px;" value="' + esc(g.existingCategoryId || '') + '" placeholder="例 43494"></div>' +
-          '<div class="col"><label class="small text-muted">path (店の棚)</label>' +
-            '<input type="text" class="form-control form-control-sm js-path" value="' + esc(g.existingPath || '') + '" placeholder="例 生活雑貨・日用品:掃除用品"></div>' +
+          '<div class="col"><label class="small text-muted">店の棚 (path)</label>' +
+            '<input type="text" class="form-control form-control-sm js-path" value="' + esc(g.existingPath || '') + '" placeholder="下のボタンから選べます"></div>' +
           '<div class="col-auto pt-3"><button class="btn btn-sm btn-success js-save">保存</button></div>' +
           '<div class="col-auto pt-3"><span class="js-msg small"></span></div>' +
+        '</div>' +
+        '<div class="mt-1 js-shelf-tools">' +
+          '<button type="button" class="btn btn-sm btn-outline-success js-shelf-tree-toggle">📂 実績のある棚から選ぶ</button>' +
+          '<span class="js-shelf-suggest"></span>' +
+          '<div class="tree-panel js-shelf-tree-panel" style="display:none;"></div>' +
         '</div>';
 
-      // AI 候補 top3 (unresolved-genres が返す。 無ければ非表示)
+      // 状態チェックリスト 初期表示 + 入力変化で更新
+      renderStatusCheck(div, g);
+      div.querySelector('.js-cat').addEventListener('input', () => { div.dataset.selectedName = ''; renderStatusCheck(div, g); });
+      div.querySelector('.js-path').addEventListener('input', () => renderStatusCheck(div, g));
+
+      // AI 候補 top3
       const candBox = div.querySelector('.js-candidates');
       const cands = (g.aiCandidates || []).filter((c) => c && c.categoryId != null);
       if (cands.length) {
@@ -139,12 +254,12 @@
         candBox.appendChild(label);
         for (const c of cands) {
           const btn = candidateButton(c);
-          btn.addEventListener('click', () => applyCandidate(div, c, btn));
+          btn.addEventListener('click', () => applyCandidate(div, g, c, btn));
           candBox.appendChild(btn);
         }
       }
 
-      // キーワード検索 (Yahoo 公式カテゴリマスタ 12,044 件から)
+      // キーワード検索
       const searchToggle = div.querySelector('.js-search-toggle');
       const searchArea = div.querySelector('.js-search-area');
       const searchQ = div.querySelector('.js-search-q');
@@ -153,7 +268,7 @@
       searchToggle.addEventListener('click', () => {
         searchArea.style.display = searchArea.style.display === 'none' ? 'inline' : 'none';
         if (searchArea.style.display === 'inline') {
-          if (!searchQ.value && g.rakutenGenreName) searchQ.value = g.rakutenGenreName; // 楽天カテゴリ名を初期クエリに
+          if (!searchQ.value && g.rakutenGenreName) searchQ.value = g.rakutenGenreName;
           searchQ.focus();
         }
       });
@@ -167,13 +282,13 @@
           if (j.status !== 'ok') throw new Error(j.error || res.status);
           searchResults.innerHTML = '';
           if (!j.results.length) {
-            searchResults.innerHTML = '<span class="small text-muted">見つかりませんでした。 別の言い方で検索してみてください</span>';
+            searchResults.innerHTML = '<span class="small text-muted">見つかりませんでした。 「📂 階層をたどって選ぶ」も試してください</span>';
             return;
           }
           for (const r of j.results) {
             const c = { categoryId: r.productCategory, name: r.name, pathName: r.pathName, score: r.score, defaultPath: r.defaultPath };
             const btn = candidateButton(c);
-            btn.addEventListener('click', () => applyCandidate(div, c, btn));
+            btn.addEventListener('click', () => applyCandidate(div, g, c, btn));
             searchResults.appendChild(btn);
           }
         } catch (e) {
@@ -182,6 +297,59 @@
       }
       searchRun.addEventListener('click', runSearch);
       searchQ.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); runSearch(); } });
+
+      // R9: Yahoo!カテゴリ 階層ドリルダウン
+      const treeToggle = div.querySelector('.js-tree-toggle');
+      const treePanel = div.querySelector('.js-tree-panel');
+      let treeMounted = false;
+      treeToggle.addEventListener('click', () => {
+        const show = treePanel.style.display === 'none';
+        treePanel.style.display = show ? 'block' : 'none';
+        if (show && !treeMounted) {
+          treeMounted = true;
+          mountTree(treePanel, {
+            endpoint: '/tree', sep: ' > ', pickLabel: 'このカテゴリにする', selectableMiddle: false,
+            onPick: (c) => {
+              applyCandidate(div, g, { categoryId: c.categoryId, name: c.name, defaultPath: c.defaultPath }, null);
+            },
+          });
+        }
+      });
+
+      // R9: 店の棚 — 実績のある棚ツリー + 楽天カテゴリに合わせる提案チップ
+      const shelfToggle = div.querySelector('.js-shelf-tree-toggle');
+      const shelfPanel = div.querySelector('.js-shelf-tree-panel');
+      let shelfMounted = false;
+      shelfToggle.addEventListener('click', () => {
+        const show = shelfPanel.style.display === 'none';
+        shelfPanel.style.display = show ? 'block' : 'none';
+        if (show && !shelfMounted) {
+          shelfMounted = true;
+          mountTree(shelfPanel, {
+            endpoint: '/shelf-tree', sep: ':', pickLabel: 'この棚にする', selectableMiddle: true,
+            onPick: (c) => {
+              div.querySelector('.js-path').value = c.fullPath;
+              renderStatusCheck(div, g);
+            },
+          });
+        }
+      });
+      // 楽天カテゴリに合わせる (中原さん運用: 店の棚 = 楽天カテゴリと一致)
+      if (g.rakutenGenrePath) {
+        const segs = g.rakutenGenrePath.split('>').map((s) => s.trim()).filter(Boolean);
+        if (segs.length) {
+          const suggestion = segs.join(':');
+          const chip = document.createElement('span');
+          chip.className = 'shelf-chip';
+          chip.textContent = '🏬 楽天カテゴリに合わせる: ' + suggestion;
+          chip.title = '店の棚を楽天カテゴリと同じ構成で運用している場合はこれをクリック (Yahoo!ストアに同名の棚が無い場合は出品時にエラーで分かります)';
+          chip.addEventListener('click', () => {
+            div.querySelector('.js-path').value = suggestion;
+            renderStatusCheck(div, g);
+          });
+          div.querySelector('.js-shelf-suggest').appendChild(chip);
+        }
+      }
 
       div.querySelector('.js-save').addEventListener('click', () => saveGenre(div, g));
       return div;
@@ -192,7 +360,7 @@
       const path = div.querySelector('.js-path').value.trim();
       const msg = div.querySelector('.js-msg');
       const btn = div.querySelector('.js-save');
-      if (!/^[1-9]\d*$/.test(cat)) { msg.textContent = '数字IDを入れてください'; msg.className = 'js-msg small text-danger'; return; }
+      if (!/^[1-9]\d*$/.test(cat)) { msg.textContent = 'Yahoo!カテゴリIDを選んでください'; msg.className = 'js-msg small text-danger'; return; }
       btn.disabled = true; msg.textContent = '保存中...'; msg.className = 'js-msg small text-muted';
       try {
         const res = await fetch(API + '/bind', {
@@ -201,7 +369,7 @@
         });
         const j = await res.json();
         if (j.status !== 'ok') { msg.textContent = '失敗: ' + (j.error || res.status); msg.className = 'js-msg small text-danger'; btn.disabled = false; return; }
-        msg.textContent = '✅ 保存しました (' + g.count + '商品が「出せる」に)';
+        msg.textContent = '✅ 保存しました (' + g.count + '商品が「出せる」候補に)';
         msg.className = 'js-msg small text-success';
         div.classList.add('done');
       } catch (e) {

@@ -56,6 +56,7 @@ import { filterUploadableImageUrlsDetailed } from './lib/yahoo-image.js';
 import { backfillRakutenTitles, countMissingRakutenTitles, backfillRakutenGenre, countMissingRakutenGenre } from './lib/rakuten-title-backfill.js';
 import { fetchYahooItemDetailsBulk } from './lib/yahoo-detail-proxy.js';
 import { searchCategoryMaster, countCategoryMaster } from './lib/category-master-search.js';
+import { getYahooTreeChildren, getShelfTreeChildren } from './lib/category-tree.js';
 import {
   countMissingYahooCategories,
   getCachedMissingYahooCategories,
@@ -875,6 +876,8 @@ router.get('/api/yahoo-category/unresolved-genres', (_req, res) => {
     const genreNameStmt = prep(`SELECT name_ja, path_ja FROM rakuten_genre WHERE genre_id = ?`);
     const manualCatStmt = prep(`SELECT yahoo_category_id, yahoo_path FROM category_manual WHERE rakuten_genre_id = ?`);
     const decisionsCatStmt = prep(`SELECT yahoo_category_id, yahoo_path FROM category_decisions WHERE rakuten_genre_id = ? AND locked = 1 AND ambiguous = 0`);
+    // 再設計 R9: 既存 ID のカテゴリ名 (状態チェックリスト表示用)
+    const masterNameStmt = prep(`SELECT name FROM yahoo_category_master WHERE product_category = ? AND is_active = 1`);
     // 再設計 R2: AI 初期紐づけ (確定分) と候補 top3 (紐付け画面 v2 の「候補から選ぶ」素)
     const aiCatStmt = prep(`SELECT yahoo_category_id, confidence FROM category_ai WHERE rakuten_genre_id = ?`);
     const aiCandStmt = prep(`
@@ -923,6 +926,11 @@ router.get('/api/yahoo-category/unresolved-genres', (_req, res) => {
           defaultPath: c.default_path || null,
         }));
       } catch (_) {}
+      // R9: 既存 ID のカテゴリ名 (「何が設定済みで何が足りないか」を明示するため)
+      let existingCategoryName = null;
+      if (existingCategoryId != null) {
+        try { existingCategoryName = masterNameStmt?.get(String(existingCategoryId))?.name ?? null; } catch (_) {}
+      }
       return {
         genreId: e.genreId,
         count: e.count,
@@ -931,6 +939,7 @@ router.get('/api/yahoo-category/unresolved-genres', (_req, res) => {
         rakutenGenreName,        // 楽天カテゴリ名 (何のカテゴリか一目で分かる)
         rakutenGenrePath,        // 楽天カテゴリ階層 (= 店の棚 path の素、 中原さん運用で一致)
         existingCategoryId,      // 既にあれば path だけ足りない (*_path_missing)
+        existingCategoryName,    // R9: 既存 ID の Yahoo カテゴリ名
         existingPath,
         aiSuggestion,            // AI 確定分 { categoryId, confidence } (無ければ null)
         aiCandidates,            // AI 候補 top3 [{ categoryId, name, pathName, score, defaultPath }]
@@ -1613,6 +1622,46 @@ router.post('/api/rakuten-title-backfill', async (req, res) => {
  *   返り: { status, total, results: [{ productCategory, name, pathName, score, defaultPath }] }
  *   defaultPath = category_default_path に既知の店カテゴリ path があればそれ (選択時に自動補完できる)。
  */
+/**
+ * 再設計 R9: Yahoo!商品カテゴリツリー (階層ごとの絞り込み選択)。
+ *   query: path (省略/空 = トップ。 ' > ' 連結の親パス)
+ *   返り: { status, children: [{ name, fullPath, categoryId, childCount, defaultPath }] }
+ *   マスタ 12,044 件の path_name から構築 (ローカル完結、 外部 API 不要)。
+ */
+router.get('/api/yahoo-category/tree', (req, res) => {
+  try {
+    const db = getDB();
+    const parentPath = String(req.query.path || '');
+    if (parentPath.length > 300) {
+      return res.status(400).json({ status: 'fail', error: 'path が長すぎます' });
+    }
+    const r = getYahooTreeChildren(db, parentPath);
+    if (!r.ok) return res.status(404).json({ status: 'fail', error: r.error });
+    return res.json({ status: 'ok', children: r.children });
+  } catch (e) {
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+/**
+ * 再設計 R9: 店の棚 (path) ツリー。 category_default_path の実績棚から構築。
+ *   query: path (省略/空 = トップ。 ':' 連結の親パス)
+ */
+router.get('/api/yahoo-category/shelf-tree', (req, res) => {
+  try {
+    const db = getDB();
+    const parentPath = String(req.query.path || '');
+    if (parentPath.length > 300) {
+      return res.status(400).json({ status: 'fail', error: 'path が長すぎます' });
+    }
+    const r = getShelfTreeChildren(db, parentPath);
+    if (!r.ok) return res.status(404).json({ status: 'fail', error: r.error });
+    return res.json({ status: 'ok', children: r.children });
+  } catch (e) {
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
 router.get('/api/yahoo-category/search', (req, res) => {
   try {
     const db = getDB();
