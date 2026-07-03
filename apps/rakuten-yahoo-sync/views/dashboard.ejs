@@ -115,7 +115,8 @@
         <button class="btn btn-primary btn-sm js-refresh-all">🔄 全部更新</button>
         <span class="js-refresh-status small text-muted ms-2"></span>
         <div class="small text-muted mt-1">
-          楽天とYahoo!の最新状態を取り直し、 Notionのページ作成・下書き補完・取り込みまで自動で行います (数分かかります)。
+          楽天とYahoo!の最新状態を取り直し、 Notionのページ作成・下書き補完・取り込み・<strong>出品前チェック (全商品の実データ検査)</strong> まで自動で行います (10分前後かかります)。
+          出品前チェックで問題が見つかった商品は理由付きで「修正必要」に移るので、 <strong>「出せる」に残っている商品はそのまま出品できます</strong>。
           <% if (syncState?.last_successful_sync_at) { %>
             前回のNotion取込: <code><%= syncState.last_successful_sync_at %></code>
             <% if (syncDaysAgo !== null) { %>
@@ -2040,6 +2041,7 @@ const REFRESH_STEP_LABELS = {
   notion_pages: 'Notionページ自動作成',
   draft_seed: 'Notion下書き自動補完',
   notion_sync: 'Notion取込',
+  readiness_check: '出品前チェック (全商品の実データ検査)',
 };
 
 async function refreshAll(evt) {
@@ -2083,7 +2085,8 @@ async function refreshAll(evt) {
           + '・ジャンル取得: ' + (s.genre_backfill?.updated ?? '?') + ' 件\n'
           + '・Notionページ作成: ' + (s.notion_pages?.created ?? '?') + ' 件\n'
           + '・下書き補完: ' + (s.draft_seed?.applied ?? '?') + ' 件\n'
-          + '・Notion取込 更新: ' + ((s.notion_sync?.inserted ?? 0) + (s.notion_sync?.updated ?? 0)) + ' 件\n\n'
+          + '・Notion取込 更新: ' + ((s.notion_sync?.inserted ?? 0) + (s.notion_sync?.updated ?? 0)) + ' 件\n'
+          + '・出品前チェック: 出せる ' + (s.readiness_check?.okCount ?? '?') + ' 件 / 要修正 ' + (s.readiness_check?.blockedCount ?? '?') + ' 件\n\n'
           + 'ページを再読み込みします。');
         location.reload();
         return;

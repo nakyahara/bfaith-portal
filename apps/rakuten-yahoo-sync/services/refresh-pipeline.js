@@ -2,11 +2,13 @@
  * 再設計 R4: 「全部更新」パイプライン。
  *
  * 手動ボタン連打だった日次運用を 1 本に直列化する:
- *   1. full_sync      : Yahoo baseline → 楽天 diff → 候補 upsert (+title backfill)  … rys-full-sync.js
- *   2. genre_backfill : 楽天 genre_id 取りこぼし埋め (カテゴリ自動解決の前提)        … rakuten-title-backfill.js
- *   3. notion_pages   : Notion 未登録 SKU に page 自動作成                            … notion-create-page.js
- *   4. draft_seed     : Notion 空欄 (タイトル/売価/税率) を楽天から自動下書き         … notion-draft-seed.js
- *   5. notion_sync    : Notion → notion_overrides full sync (sync-lock 下)            … notion-sync.js
+ *   1. full_sync       : Yahoo baseline → 楽天 diff → 候補 upsert (+title backfill)  … rys-full-sync.js
+ *   2. genre_backfill  : 楽天 genre_id 取りこぼし埋め (カテゴリ自動解決の前提)        … rakuten-title-backfill.js
+ *   3. notion_pages    : Notion 未登録 SKU に page 自動作成                            … notion-create-page.js
+ *   4. draft_seed      : Notion 空欄 (タイトル/売価/税率) を楽天から自動下書き         … notion-draft-seed.js
+ *   5. notion_sync     : Notion → notion_overrides full sync (sync-lock 下)            … notion-sync.js
+ *   6. readiness_check : 出品前チェック sweep (楽天実値・税率整合・画像等を事前検査し   … readiness-sweep.js
+ *                        jobs に persist → 問題商品は「出せる」でなく「修正必要」に出る。 R8)
  *
  * 設計原則 (Codex R4-R1 High ×4 反映):
  *   - 排他: refresh_runs は partial UNIQUE INDEX (status='running') で running 1 行を DB 制約で保証。
@@ -31,13 +33,14 @@ import { backfillRakutenGenre, countMissingRakutenGenre } from '../lib/rakuten-t
 import { createNotionPagesFromRakuten } from './notion-create-page.js';
 import { seedNotionDrafts } from './notion-draft-seed.js';
 import { syncNotionOverrides } from './notion-sync.js';
+import { sweepReadiness } from './readiness-sweep.js';
 import { acquire, SyncLockError, getNotionSyncLockPath } from '../lib/sync-lock.js';
 
 const LEASE_MS = 90 * 60 * 1000;          // ステップごとに延長するので「1 ステップの最大想定時間」
 const GENRE_BACKFILL_MAX_ROUNDS = 10;     // 100 件/round × 10 = 最大 1,000 genre/run
 const NOTION_PAGES_MAX_ROUNDS = 5;        // 100 件/round × 5
 const DRAFT_SEED_MAX_ROUNDS = 3;          // 200 件/round × 3
-const STEP_NAMES = ['full_sync', 'genre_backfill', 'notion_pages', 'draft_seed', 'notion_sync'];
+const STEP_NAMES = ['full_sync', 'genre_backfill', 'notion_pages', 'draft_seed', 'notion_sync', 'readiness_check'];
 
 function isoNow() { return new Date().toISOString(); }
 function leaseFromNow() { return new Date(Date.now() + LEASE_MS).toISOString(); }
@@ -146,6 +149,7 @@ export async function executeRefreshPipeline({ db, runId, runToken, triggeredBy 
   const impl = {
     runRysFullSync, backfillRakutenGenre, countMissingRakutenGenre,
     createNotionPagesFromRakuten, seedNotionDrafts, syncNotionOverrides,
+    sweepReadiness,
     acquireNotionSyncLock: () => acquire(getNotionSyncLockPath()),
     ...deps, // テスト注入用
   };
@@ -251,6 +255,17 @@ export async function executeRefreshPipeline({ db, runId, runToken, triggeredBy 
       } finally {
         if (release) { try { release(); } catch (_) {} }
       }
+      persistSteps('readiness_check');
+    }
+
+    // ── 6. 出品前チェック sweep (R8: 中原さん指摘「出せるタブなのに出せない」対策) ──
+    //   全候補に出品時と同じ実データ検査を回して jobs に persist。
+    //   問題商品は次の一覧表示から理由付きで「修正必要」タブに出る。
+    //   個別エラーは sweep 側が飲む (全滅/過半数エラーだけ throw = fail-closed)。
+    {
+      const t0 = Date.now();
+      const r = await impl.sweepReadiness({ db });
+      steps.readiness_check = { ok: true, ms: Date.now() - t0, ...r };
     }
 
     updateRunCAS(db, runId, runToken, {
