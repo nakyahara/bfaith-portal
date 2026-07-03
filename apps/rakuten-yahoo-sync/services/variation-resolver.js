@@ -5,8 +5,11 @@
  *
  * 設計原則 (Phase 0 §「商品タイプ分岐」 + Q12/Q34 + Codex B2 R1 M-1/M-2/L-1):
  *   - SoT: 楽天 variants.length >= 2 が真 (Notion はクロスチェック専用)
- *   - 通常品 (variants < 2): condition=2 / auc_* 送る / subcodes=null
- *   - バリ品 (variants >= 2): condition=1 / auc_* 送らない / subcodes=[merchantDefinedSkuId, ...]
+ *   - 通常品 (variants < 2): auc_* 送る / subcodes=null
+ *   - バリ品 (variants >= 2): auc_* 送らない (ヤフオク併売不可) / subcodes=[merchantDefinedSkuId, ...]
+ *   - condition は常に 2 (新品)。 R13 (2026-07-03): Phase 0 の「バリ品 condition=1」は誤りで、
+ *     Yahoo editItem の condition=1 は「中古」の意味 (実機 it-14196
+ *     「商品状態を『中古』に設定することはできません」で確定)。 B-Faith は全品新品。
  *     ⚠️ R10 (2026-07-03 中原さん指示): Yahoo バリエーションコード = 楽天「システム連携用SKU番号」
  *     (= merchantDefinedSkuId) **そのまま**。 システム連携用SKU番号は既に「商品番号+項目選択肢」
  *     形式なので、 旧実装の `${itemNumber}-${skuId}` は商品番号が二重になっていた
@@ -167,7 +170,8 @@ export function resolveVariation({ rakutenItem, notionHasVariation }) {
   const variants = normalizeVariants(rakutenItem);
   const variantCount = variants.length;
   const isVariation = variantCount >= 2;
-  const condition = isVariation ? 1 : 2;
+  // R13: 常に新品 (condition=2)。 1 は「中古」 — バリ品で it-14196 を実機再現して確定
+  const condition = 2;
   const sendAucFields = !isVariation;
 
   let subcodes = null;

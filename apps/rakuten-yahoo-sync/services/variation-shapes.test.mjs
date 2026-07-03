@@ -166,3 +166,10 @@ test('R11 Codex反映: 単一軸でも同一選択肢の重複SKUは fail-closed
   assert.equal(r.ok, false);
   assert.ok(r.errors.some((e) => e.startsWith('variation_combo_duplicate')));
 });
+
+test('R13: condition は常に 2 (新品)。1=中古で it-14196 になる (実機確定)', () => {
+  const vari = resolveVariation({ rakutenItem: RMS_ITEM, notionHasVariation: 'バリエーション登録あり' });
+  assert.equal(vari.condition, 2);
+  const single = resolveVariation({ rakutenItem: { itemNumber: 's', variants: { a: { merchantDefinedSkuId: 's-a' } } }, notionHasVariation: null });
+  assert.equal(single.condition, 2);
+});
