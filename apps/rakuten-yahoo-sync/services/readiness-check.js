@@ -167,25 +167,19 @@ export function evaluateReadiness(input) {
     reasons.push(`lead_time_invalid:${input.leadTimePreflight.error || 'unknown'}`);
   }
 
-  // #11 variation_spec_mapping (バリ品のみ)
+  // #11 バリエーション options/subcodes 自動構築チェック (バリ品のみ)
+  //   R11 (2026-07-03): 旧 variation_spec_mapping (手動対応表) は field-mapper で一度も
+  //   使われておらず、 未整備のまま全バリ品を止めていた。 Yahoo editItem は
+  //   options + subcodes (+ variation*_free_title) で登録でき、 これらは楽天の
+  //   variantSelectors / selectorValues / merchantDefinedSkuId から全自動で組める
+  //   (公式 spec Webリサーチ + 実RMSデータで確認) → 手動対応表を廃止し
+  //   「自動構築が成立するか」を fail-closed 条件にする。
   if (vr?.isVariation) {
-    if (!input.db) {
-      reasons.push('variation_spec_db_missing');
-    } else {
-      const axes = extractRequiredAxes(input.rakutenItem);
-      // Codex E-3 R1 H-1: バリ品なのに axes が空 (RMS shape 違い or rakutenItem 欠落) は fail-closed
-      if (axes.length === 0) {
-        reasons.push('variation_axes_missing');
-      } else {
-        const specRes = evaluateVariationSpec(input.db, axes, input.yahooProductCategoryId);
-        if (specRes.categoryUnknown) {
-          reasons.push('variation_spec_category_unknown');
-        } else if (specRes.tableMissing) {
-          reasons.push('variation_spec_table_missing');
-        } else if (!specRes.ok) {
-          reasons.push(`variation_spec_unresolved:${specRes.missing.join(',')}`);
-        }
-      }
+    const of = vr.optionFields;
+    if (!of) {
+      reasons.push('variation_axes_missing'); // optionFields 未構築 (旧 caller / rakutenItem 欠落)
+    } else if (!of.ok) {
+      for (const e of (of.errors.length ? of.errors : ['variation_axes_missing'])) reasons.push(e);
     }
   }
 

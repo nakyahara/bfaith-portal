@@ -141,8 +141,13 @@ export function buildYahooEditItemFields({
   // condition / variation
   fields.condition = variationResult.condition;
   if (variationResult.isVariation) {
-    if (variationResult.subcodes?.length > 0) {
-      fields.subcodes = variationResult.subcodes;
+    // R11: options + subcodes を Yahoo 正式書式の文字列で送る (楽天データから自動構築済み)。
+    //   options:  `軸名#選択肢1,選択肢2|...`
+    //   subcodes: `軸名:選択肢=サブコード|...` (サブコード = 楽天システム連携用SKU番号)
+    //   旧実装は subcodes をベア配列で送っており editItem の期待書式と不一致だった。
+    if (variationResult.optionFields?.ok) {
+      fields.options = variationResult.optionFields.options;
+      fields.subcodes = variationResult.optionFields.subcodes;
     }
   } else if (variationResult.sendAucFields) {
     fields.auc_pref_code = Number.isFinite(aucPrefCode) ? aucPrefCode : FIXED_FIELDS.AUC_PREF_CODE;

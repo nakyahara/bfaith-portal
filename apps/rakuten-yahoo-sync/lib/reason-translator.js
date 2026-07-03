@@ -91,6 +91,18 @@ export function translateReason(rawReason) {
     }
     case 'variation_axes_missing':
       return { message: 'バリエーションの項目名 (軸) が楽天データから読み取れません (通常は起きません。 発生したら開発に連絡)', notionField: null, severity: 'check' };
+    case 'variation_option_value_missing': {
+      const detail = rawReason.slice(head.length + 1);
+      return { message: `バリエーションの選択肢が楽天側で欠落しています (${detail})。 楽天RMSでこのSKUの選択肢を確認してください`, notionField: null, severity: 'must' };
+    }
+    case 'variation_option_invalid_char': {
+      const detail = rawReason.slice(head.length + 1);
+      return { message: `バリエーションの項目名/選択肢に Yahoo で使えない記号が含まれています (${detail})。 楽天側の表記から | ; : & = # 引用符 を外してください`, notionField: null, severity: 'must' };
+    }
+    case 'variation_combos_incomplete': {
+      const detail = rawReason.slice(head.length + 1);
+      return { message: `バリエーションの組み合わせが不完全です (${detail})。 Yahoo は全組み合わせにSKUが必要なため、 楽天側で歯抜けの組み合わせがあると登録できません`, notionField: null, severity: 'must' };
+    }
     case 'rakuten_fetch_failed':
       return { message: '楽天から商品データを取得できませんでした', notionField: null, severity: 'check' };
     case 'rakuten_item_not_found':

@@ -17,6 +17,9 @@
  */
 
 const SUBCODE_REGEX = /^[A-Za-z0-9-]+$/;
+// Yahoo editItem: オプション項目/値に 半角スペース と 半角記号 |;:&=#"\ は使用不可 (公式 spec)。
+// 半角スペースは全角に置換して救済、 他の禁止文字は fail-closed。
+const OPTION_FORBIDDEN = /[|;:&=#"\\]/;
 
 export function normalizeVariants(rakutenItem) {
   if (!rakutenItem) return [];
@@ -25,6 +28,122 @@ export function normalizeVariants(rakutenItem) {
   if (Array.isArray(v)) return v;
   if (typeof v === 'object') return Object.values(v);
   return [];
+}
+
+/** 楽天 RMS 2.0 の variantSelectors を [{key, name}] に正規化 (単一 object も許容)。 */
+export function normalizeSelectors(rakutenItem) {
+  const s = rakutenItem?.variantSelectors;
+  const list = Array.isArray(s) ? s : (s && typeof s === 'object' ? [s] : []);
+  return list
+    .map((sel) => ({ key: sel?.key != null ? String(sel.key) : null, name: sel?.displayName || sel?.key || null }))
+    .filter((sel) => sel.key && sel.name);
+}
+
+function sanitizeOptionText(raw) {
+  // 半角スペース → 全角スペース (Yahoo は半角スペース不可)
+  return String(raw).trim().replace(/ /g, '　');
+}
+
+/**
+ * 再設計 R11 (2026-07-03 中原さん要望「エラーにならない方法を。楽天から取得できるはず」):
+ * Yahoo editItem のバリエーション 3 フィールドを楽天 RMS データだけから自動構築する。
+ *   - options:  `軸名#選択肢1,選択肢2|軸名2#...` (公式 spec: 名前と値の区切り #、値間 ,、軸間 |)
+ *   - subcodes: `軸名:選択肢=サブコード|...` (公式例: 色:ネイビー#サイズ:S=subcodetest-1|...)
+ *     サブコード = merchantDefinedSkuId (楽天「システム連携用SKU番号」) そのまま
+ *   - subcode_param は Phase では送らない (価格は item price を継承。 Notion 売価 SoT と矛盾させない)
+ *
+ * 旧 variation_spec_mapping (手動対応表) はこの自動構築で不要になった。
+ *
+ * fail-closed 条件 (errors に理由を積む):
+ *   - 軸が取れない / 選択肢値が欠落 / 禁止文字 / サブコード不正
+ *   - 多軸 (2軸以上) で組み合わせが不完全 (Yahoo は指定オプションの全組み合わせに
+ *     サブコード必須のため、 楽天側が疎な組み合わせだと登録できない)
+ *
+ * @returns {{ ok: boolean, options: string|null, subcodes: string|null, errors: string[] }}
+ */
+export function buildVariationOptionFields(rakutenItem) {
+  const errors = [];
+  const selectors = normalizeSelectors(rakutenItem);
+  if (selectors.length === 0) {
+    return { ok: false, options: null, subcodes: null, errors: ['variation_axes_missing'] };
+  }
+
+  // 軸名 sanitize + 禁止文字チェック
+  const axes = [];
+  for (const sel of selectors) {
+    const name = sanitizeOptionText(sel.name);
+    if (OPTION_FORBIDDEN.test(name)) {
+      errors.push(`variation_option_invalid_char:axis=${name}`);
+      continue;
+    }
+    axes.push({ key: sel.key, name });
+  }
+  if (axes.length === 0) {
+    return { ok: false, options: null, subcodes: null, errors: errors.length ? errors : ['variation_axes_missing'] };
+  }
+
+  // 各 variant の (軸 → 選択肢値) と subcode を抽出
+  const variants = normalizeVariants(rakutenItem);
+  const rows = []; // { subcode, values: { [axisKey]: sanitizedValue } }
+  for (const v of variants) {
+    const subcode = v?.merchantDefinedSkuId ? String(v.merchantDefinedSkuId).trim() : '';
+    if (!subcode) { errors.push('variant_sku_id_empty'); continue; }
+    if (!SUBCODE_REGEX.test(subcode)) { errors.push(`variant_sku_id_invalid_format: ${subcode}`); continue; }
+    const values = {};
+    let rowOk = true;
+    for (const axis of axes) {
+      const rawVal = v?.selectorValues?.[axis.key];
+      if (rawVal == null || String(rawVal).trim() === '') {
+        errors.push(`variation_option_value_missing:${subcode}/${axis.name}`);
+        rowOk = false;
+        break;
+      }
+      const val = sanitizeOptionText(rawVal);
+      if (OPTION_FORBIDDEN.test(val)) {
+        errors.push(`variation_option_invalid_char:${subcode}/${val}`);
+        rowOk = false;
+        break;
+      }
+      values[axis.key] = val;
+    }
+    if (rowOk) rows.push({ subcode, values });
+  }
+  if (rows.length === 0) {
+    return { ok: false, options: null, subcodes: null, errors: errors.length ? errors : ['variation_axes_missing'] };
+  }
+  if (errors.length > 0) {
+    // 一部 variant が欠けたまま出すと Yahoo 側で組み合わせ不足エラーになるため fail-closed
+    return { ok: false, options: null, subcodes: null, errors };
+  }
+
+  // 軸ごとの選択肢一覧 (variantSelectors の定義順を優先し、 実際に使われている値のみ)
+  const usedByAxis = new Map(); // axisKey → ordered unique values
+  for (const axis of axes) {
+    const declared = (Array.isArray(rakutenItem?.variantSelectors)
+      ? rakutenItem.variantSelectors
+      : [rakutenItem?.variantSelectors]).find((s) => s?.key === axis.key);
+    const declaredOrder = (declared?.values || []).map((x) => sanitizeOptionText(x?.displayValue ?? '')).filter(Boolean);
+    const used = new Set(rows.map((r) => r.values[axis.key]));
+    const ordered = [...declaredOrder.filter((v) => used.has(v)), ...[...used].filter((v) => !declaredOrder.includes(v))];
+    usedByAxis.set(axis.key, ordered);
+  }
+
+  // 多軸: Yahoo は「指定オプションの全組み合わせにサブコード必須」→ 疎な組み合わせは登録不可
+  if (axes.length >= 2) {
+    const comboCount = axes.reduce((acc, a) => acc * usedByAxis.get(a.key).length, 1);
+    if (rows.length !== comboCount) {
+      return {
+        ok: false, options: null, subcodes: null,
+        errors: [`variation_combos_incomplete:${rows.length}/${comboCount}`],
+      };
+    }
+  }
+
+  const options = axes.map((a) => `${a.name}#${usedByAxis.get(a.key).join(',')}`).join('|');
+  const subcodes = rows
+    .map((r) => axes.map((a) => `${a.name}:${r.values[a.key]}`).join('#') + '=' + r.subcode)
+    .join('|');
+  return { ok: true, options, subcodes, errors: [] };
 }
 
 export function resolveVariation({ rakutenItem, notionHasVariation }) {
@@ -81,12 +200,16 @@ export function resolveVariation({ rakutenItem, notionHasVariation }) {
     conflict = `unknown_notion_variation_value:${notionHasVariation}`;
   }
 
+  // R11: options + subcodes (Yahoo 正式書式の文字列) を楽天データから自動構築
+  const optionFields = isVariation ? buildVariationOptionFields(rakutenItem) : null;
+
   return {
     isVariation,
     variantCount,
     condition,
     sendAucFields,
-    subcodes,
+    subcodes,        // 後方互換: サブコード id の配列 (表示/検証用)
+    optionFields,    // R11: { ok, options, subcodes(正式書式文字列), errors } — editItem 用
     conflict,
     subcodeErrors,
   };
