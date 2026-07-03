@@ -99,6 +99,10 @@ export function translateReason(rawReason) {
       const detail = rawReason.slice(head.length + 1);
       return { message: `バリエーションの項目名/選択肢に Yahoo で使えない記号が含まれています (${detail})。 楽天側の表記から | ; : & = # 引用符 を外してください`, notionField: null, severity: 'must' };
     }
+    case 'variation_combo_duplicate': {
+      const detail = rawReason.slice(head.length + 1);
+      return { message: `同じバリエーション組み合わせが複数のSKUに設定されています (${detail})。 楽天RMSで選択肢の重複を解消してください`, notionField: null, severity: 'must' };
+    }
     case 'variation_combos_incomplete': {
       const detail = rawReason.slice(head.length + 1);
       return { message: `バリエーションの組み合わせが不完全です (${detail})。 Yahoo は全組み合わせにSKUが必要なため、 楽天側で歯抜けの組み合わせがあると登録できません`, notionField: null, severity: 'must' };

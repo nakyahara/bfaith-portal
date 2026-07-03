@@ -128,13 +128,30 @@ export function buildVariationOptionFields(rakutenItem) {
     usedByAxis.set(axis.key, ordered);
   }
 
+  // 組み合わせの重複検知 (Codex R11-R1 High: 重複があると件数比較だけでは歯抜けを見逃す。
+  //   同一組み合わせが複数 SKU にあると Yahoo 側でも不正なので全軸数で fail-closed)
+  const comboKeys = new Set();
+  const dupCombos = new Set();
+  for (const r of rows) {
+    const key = axes.map((a) => r.values[a.key]).join('#');
+    if (comboKeys.has(key)) dupCombos.add(key);
+    comboKeys.add(key);
+  }
+  if (dupCombos.size > 0) {
+    return {
+      ok: false, options: null, subcodes: null,
+      errors: [`variation_combo_duplicate:${[...dupCombos].join(',')}`],
+    };
+  }
+
   // 多軸: Yahoo は「指定オプションの全組み合わせにサブコード必須」→ 疎な組み合わせは登録不可
+  //   (ユニーク組み合わせ数で判定)
   if (axes.length >= 2) {
     const comboCount = axes.reduce((acc, a) => acc * usedByAxis.get(a.key).length, 1);
-    if (rows.length !== comboCount) {
+    if (comboKeys.size !== comboCount) {
       return {
         ok: false, options: null, subcodes: null,
-        errors: [`variation_combos_incomplete:${rows.length}/${comboCount}`],
+        errors: [`variation_combos_incomplete:${comboKeys.size}/${comboCount}`],
       };
     }
   }

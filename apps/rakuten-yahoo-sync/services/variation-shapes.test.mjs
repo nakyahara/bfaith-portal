@@ -135,3 +135,34 @@ test('R11: resolveVariation が optionFields を含み、readiness がそれで�
   assert.equal(r.optionFields.ok, true);
   assert.match(r.optionFields.subcodes, /=aromamist20-am/);
 });
+
+test('R11 Codex反映: 重複組み合わせは件数が合っていても fail-closed', () => {
+  const item = {
+    variantSelectors: [
+      { key: 'C', displayName: 'カラー', values: [{ displayValue: '黒' }, { displayValue: '白' }] },
+      { key: 'S', displayName: 'サイズ', values: [{ displayValue: 'S' }, { displayValue: 'M' }] },
+    ],
+    variants: {
+      a: { merchantDefinedSkuId: 'a-1', selectorValues: { C: '黒', S: 'S' } },
+      b: { merchantDefinedSkuId: 'a-2', selectorValues: { C: '黒', S: 'S' } }, // 重複 (白-M 欠落なのに件数4)
+      c: { merchantDefinedSkuId: 'a-3', selectorValues: { C: '黒', S: 'M' } },
+      d: { merchantDefinedSkuId: 'a-4', selectorValues: { C: '白', S: 'S' } },
+    },
+  };
+  const r = buildVariationOptionFields(item);
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.some((e) => e.startsWith('variation_combo_duplicate:黒#S')));
+});
+
+test('R11 Codex反映: 単一軸でも同一選択肢の重複SKUは fail-closed', () => {
+  const item = {
+    variantSelectors: [{ key: 'K', displayName: '香り', values: [] }],
+    variants: {
+      a: { merchantDefinedSkuId: 'x-1', selectorValues: { K: 'ローズ' } },
+      b: { merchantDefinedSkuId: 'x-2', selectorValues: { K: 'ローズ' } },
+    },
+  };
+  const r = buildVariationOptionFields(item);
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.some((e) => e.startsWith('variation_combo_duplicate')));
+});
