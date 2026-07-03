@@ -56,7 +56,7 @@ import { filterUploadableImageUrlsDetailed } from './lib/yahoo-image.js';
 import { backfillRakutenTitles, countMissingRakutenTitles, backfillRakutenGenre, countMissingRakutenGenre } from './lib/rakuten-title-backfill.js';
 import { fetchYahooItemDetailsBulk } from './lib/yahoo-detail-proxy.js';
 import { searchCategoryMaster, countCategoryMaster } from './lib/category-master-search.js';
-import { getYahooTreeChildren, getShelfTreeChildren } from './lib/category-tree.js';
+import { getYahooTreeChildren, getShelfTreeChildren, resetCategoryTreeCache } from './lib/category-tree.js';
 import {
   countMissingYahooCategories,
   getCachedMissingYahooCategories,
@@ -1017,6 +1017,9 @@ router.post('/api/yahoo-category/bind', (req, res) => {
       }
     });
     tx();
+    // Codex R9-R1 Medium: category_default_path を更新したので棚ツリー cache を破棄
+    // (cache key が件数ベースのため、 既存 ID の path 変更は件数が変わらず検知できない)
+    resetCategoryTreeCache();
 
     audit(db, 'yahoo_category_bind', { genreId, yahooCategoryId, hasPath: !!yahooPath });
     return res.json({ status: 'ok', genreId, yahooCategoryId, path: yahooPath || null });

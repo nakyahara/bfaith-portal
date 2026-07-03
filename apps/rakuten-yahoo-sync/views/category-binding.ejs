@@ -87,7 +87,10 @@
       const path = div.querySelector('.js-path').value.trim();
       const lines = [];
       if (cat) {
-        const name = div.dataset.selectedName || g.existingCategoryName || '';
+        // Codex R9-R1 Low: existingCategoryName は入力値が既存 ID と一致するときだけ表示
+        // (手入力で ID を変えた後に古い名前が残る誤認を防ぐ)
+        const name = div.dataset.selectedName
+          || (cat === String(g.existingCategoryId ?? '') ? (g.existingCategoryName || '') : '');
         lines.push('<span class="ok">✅ Yahoo!カテゴリID: ' + esc(cat) + (name ? ' (' + esc(name) + ')' : '') + '</span>');
       } else {
         lines.push('<span class="ng">❌ Yahoo!カテゴリIDが未設定</span> — 下の候補・検索・階層から選んでください');
