@@ -52,34 +52,29 @@ export async function evaluateItemForPublish({
   const _leadTimePreflight = deps.runLeadTimePreflight || runLeadTimePreflight;
   const _imagePreflight = deps.imagePreflight || imagePreflightStub;
 
+  // R8 Codex High: 早期 blocked (楽天取得失敗等の商品状態) も !dryRun なら jobs に persist する。
+  //   これが無いと sweep (readiness-sweep.js) で RMS 実値検査に失敗した商品が UI の
+  //   「修正必要」に出ない。 persist 失敗は評価結果を壊さない (best-effort)。
+  const blockedEarly = (reasons, debug) => {
+    if (!dryRun) {
+      try { persistJobReadiness(db, itemCode, { status: 'blocked', reasons }); } catch (_) { /* best-effort */ }
+    }
+    return { itemCode, status: 'blocked', reasons, debug };
+  };
+
   // 1. 楽天 RMS getItem (miniPC proxy)
   //   Codex E-4 R1 M-1: fetchItemDetail は { item, status, reason? } で返るので partial failure を残す
   let fetchResult;
   try {
     fetchResult = await _fetchItemDetail(manageNumber);
   } catch (e) {
-    return {
-      itemCode,
-      status: 'blocked',
-      reasons: [`rakuten_fetch_failed:${e.message || e}`],
-      debug: { stage: 'rakuten_fetch' },
-    };
+    return blockedEarly([`rakuten_fetch_failed:${e.message || e}`], { stage: 'rakuten_fetch' });
   }
   if (fetchResult?.status === 'failed') {
-    return {
-      itemCode,
-      status: 'blocked',
-      reasons: [`rakuten_fetch_failed:${fetchResult.reason || 'rms_failure'}`],
-      debug: { stage: 'rakuten_fetch' },
-    };
+    return blockedEarly([`rakuten_fetch_failed:${fetchResult.reason || 'rms_failure'}`], { stage: 'rakuten_fetch' });
   }
   if (!fetchResult?.item) {
-    return {
-      itemCode,
-      status: 'blocked',
-      reasons: ['rakuten_item_not_found'],
-      debug: { stage: 'rakuten_fetch' },
-    };
+    return blockedEarly(['rakuten_item_not_found'], { stage: 'rakuten_fetch' });
   }
   const rakutenItem = fetchResult.item;
 
@@ -114,6 +109,8 @@ export async function evaluateItemForPublish({
     imagePatternsLoadError = e.message || String(e);
   }
   if (imagePatternsLoadError) {
+    // persist しない (R8): これは商品の状態でなく DB/インフラの一時障害。
+    // jobs に書くと全商品が誤って「修正必要」化する。 評価としては fail-closed で blocked を返す。
     return {
       itemCode,
       status: 'blocked',
@@ -140,6 +137,7 @@ export async function evaluateItemForPublish({
     categorySource = 'caller';
   } else if (callerHasCategory || callerHasPath) {
     // Codex E-11 R1 H-4: 片方だけ caller 指定は blocked にする (混在防止)
+    // persist しない (R8): これは呼び出し側の引数ミスで商品の状態ではない (sweep は引数を渡さないので通らない)
     return {
       itemCode,
       status: 'blocked',
