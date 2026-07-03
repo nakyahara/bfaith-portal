@@ -102,6 +102,20 @@ function getProxyHeaders() {
 }
 
 /**
+ * R12 (2026-07-03): 4xx/5xx の Yahoo XML 応答から <Code>/<Message> を抽出して
+ * エラーメッセージに含める。 従来は「HTTP 400」だけで真因 (it-xxxx) が UI に出ず、
+ * 中原さんが原因を判断できなかった。
+ */
+function httpErrorDetail(text) {
+  const t = String(text || '');
+  const code = t.match(/<Code>\s*([^<]+)\s*<\/Code>/i)?.[1]?.trim();
+  const msg = t.match(/<Message>\s*([\s\S]*?)\s*<\/Message>/i)?.[1]?.trim();
+  if (code || msg) return ` — Yahoo応答: ${[code, msg].filter(Boolean).join(' ')}`;
+  const plain = t.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  return plain ? ` — 応答: ${plain.slice(0, 300)}` : '';
+}
+
+/**
  * GET /yahoo/getLeadTimeList?seller_id=xxx で発送日設定マスタを取得。
  *   - response は XML
  *   - <LeadTime><Id>1000</Id>...</LeadTime> を抽出
@@ -117,7 +131,7 @@ export async function fetchLeadTimeList({ sellerId = null, timeoutMs = DEFAULT_T
   });
   const text = await res.text();
   if (!res.ok) {
-    throw new YahooProxyError('getLeadTimeList', `HTTP ${res.status}`, { status: res.status, body: text.slice(0, 300) });
+    throw new YahooProxyError('getLeadTimeList', `HTTP ${res.status}${httpErrorDetail(text)}`, { status: res.status, body: text.slice(0, 300) });
   }
   // 簡易 XML パース: <Id>NNN</Id> を全部抽出 (LeadTime 要素内)
   const ids = [];
@@ -205,7 +219,7 @@ export async function callEditItem(fields, { timeoutMs = DEFAULT_TIMEOUT_MS } = 
   });
   const text = await res.text();
   if (!res.ok) {
-    throw new YahooProxyError('editItem', `HTTP ${res.status}`, { status: res.status, body: text.slice(0, 500) });
+    throw new YahooProxyError('editItem', `HTTP ${res.status}${httpErrorDetail(text)}`, { status: res.status, body: text.slice(0, 1000) });
   }
   // Codex E-5b R1 H-1: HTTP 200 でも XML semantic check
   assertYahooXmlOk('editItem', text);
@@ -262,7 +276,7 @@ export async function callUploadItemImage({ buffer, fileName, itemCode }, { time
   });
   const text = await res.text();
   if (!res.ok) {
-    throw new YahooProxyError('uploadItemImage', `HTTP ${res.status}`, { status: res.status, body: text.slice(0, 500) });
+    throw new YahooProxyError('uploadItemImage', `HTTP ${res.status}${httpErrorDetail(text)}`, { status: res.status, body: text.slice(0, 500) });
   }
   // Codex E-5b R1 H-1: HTTP 200 でも XML semantic check
   assertYahooXmlOk('uploadItemImage', text);
@@ -330,7 +344,7 @@ export async function callUploadLibImage({ buffer, fileName, itemCode }, { timeo
   });
   const text = await res.text();
   if (!res.ok) {
-    throw new YahooProxyError('uploadLibImage', `HTTP ${res.status}`, { status: res.status, body: text.slice(0, 500) });
+    throw new YahooProxyError('uploadLibImage', `HTTP ${res.status}${httpErrorDetail(text)}`, { status: res.status, body: text.slice(0, 500) });
   }
   // proxy は 200 時に JSON { ok, yahooUrl, body }、 それ以外は XML をそのまま返す
   let parsed;
