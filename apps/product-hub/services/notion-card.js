@@ -81,9 +81,10 @@ export async function attemptCardCreation(draftId, { actor = null } = {}) {
     return row && row.notion_card_status === 'creating' && row.notion_card_claim === claimToken;
   };
 
-  // finalize は claim 一致時のみ書き込む CAS (奪取した新 worker の結果を旧 worker が上書きしない)
+  // finalize は claim 一致時のみ書き込む CAS (奪取した新 worker の結果を旧 worker が上書きしない)。
+  // changes === 0 は claim 喪失 (Codex R2 low: 呼び出し側に伝える)
   const finalize = (status, pageId, error) => {
-    db.prepare(`
+    const info = db.prepare(`
       UPDATE product_drafts SET
         notion_card_status = ?,
         notion_page_id = COALESCE(?, notion_page_id),
@@ -92,13 +93,14 @@ export async function attemptCardCreation(draftId, { actor = null } = {}) {
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
       WHERE id = ? AND notion_card_status = 'creating' AND notion_card_claim = ?
     `).run(status, pageId || null, error || null, draftId, claimToken);
+    return info.changes > 0;
   };
 
   try {
     // pre-check: 既に同じ商品コードのカードがあれば作らず採用 (冪等)
     const existing = await findPageByManageNumber(String(draft.ne_code));
     if (existing?.id) {
-      finalize('created', existing.id, null);
+      if (!finalize('created', existing.id, null)) return { outcome: 'claim_lost' };
       logEvent(db, draftId, 'notion_card_adopted', existing.id, actor);
       return { outcome: 'adopted_existing', notionPageId: existing.id };
     }
@@ -107,13 +109,18 @@ export async function attemptCardCreation(draftId, { actor = null } = {}) {
     if (!holdsClaim()) return { outcome: 'claim_lost' };
 
     const page = await createPage(buildProperties(draft));
-    finalize('created', page.id, null);
+    if (!finalize('created', page.id, null)) {
+      // 作成は成功したが claim を失った (stale 奪取後)。page.id を握ったまま黙らない
+      logEvent(db, draftId, 'notion_card_claim_lost_after_create', page.id, actor);
+      return { outcome: 'claim_lost_after_create', notionPageId: page.id };
+    }
     logEvent(db, draftId, 'notion_card_created', page.id, actor);
     return { outcome: 'created', notionPageId: page.id };
   } catch (e) {
     const error = truncateError(e);
-    finalize('failed', null, error);
-    logEvent(db, draftId, 'notion_card_failed', error, actor);
+    if (finalize('failed', null, error)) {
+      logEvent(db, draftId, 'notion_card_failed', error, actor);
+    }
     return { outcome: 'failed', error };
   }
 }

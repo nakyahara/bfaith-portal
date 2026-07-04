@@ -43,12 +43,13 @@ function canTransition(from, to) {
   return (TRANSITIONS[from] || []).includes(to);
 }
 
-// 金額 sanitize (inventory-monthly の sanitizeMoney と同方針: 非有限→null、±1兆 clamp、整数化)
+// 金額 sanitize (非有限→null、0〜1兆 clamp、整数化)。
+// 売価に負数は無意味なので 0 に clamp — DB の CHECK (0..1e12) と必ず整合させる (Codex R2 medium)
 function sanitizeMoney(v) {
   if (v == null || v === '') return null;
   const n = Number(v);
   if (!Number.isFinite(n)) return null;
-  const clamped = Math.max(-1e12, Math.min(1e12, n));
+  const clamped = Math.max(0, Math.min(1e12, n));
   return Math.round(clamped);
 }
 

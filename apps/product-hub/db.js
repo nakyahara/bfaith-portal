@@ -39,6 +39,9 @@ export function initProductHubDB() {
   if (initialized) return getMirrorDB();
   const db = getMirrorDB();
 
+  // 注意: CHECK 制約は CREATE TABLE 時のみ有効。本アプリは PR #1 で新規テーブルとして
+  // デプロイされるため既存 DB の retrofit は不要だが、将来 CHECK を変更する場合は
+  // テーブル再作成型マイグレーション (swap) が必要 (Codex R2 low)。
   db.exec(`
     CREATE TABLE IF NOT EXISTS product_drafts (
       id                  INTEGER PRIMARY KEY AUTOINCREMENT,
