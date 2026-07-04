@@ -1,0 +1,71 @@
+<%- include('_header') %>
+<div class="wrap" style="max-width:640px">
+  <div class="card">
+    <h2>新規商品ドラフト</h2>
+    <p class="muted" style="margin-top:-6px">
+      登録すると Notion 商品マスターにカードが自動作成されます。画像・参考URLは登録後の詳細画面で追加します。
+    </p>
+    <div class="field">
+      <label class="req">商品名</label>
+      <input type="text" id="f-name" placeholder="例: ○○ ギフトセット 5種入り">
+    </div>
+    <div class="field">
+      <label class="req">NE商品コード</label>
+      <input type="text" id="f-ne-code" placeholder="例: ABC-001">
+    </div>
+    <div class="field">
+      <label>公式ページURL (AI生成に必須。後からでも可)</label>
+      <input type="url" id="f-official-url" placeholder="https://...">
+    </div>
+    <div class="field" style="display:flex; gap:12px;">
+      <div style="flex:1">
+        <label>売価 (税込・円)</label>
+        <input type="number" id="f-price" min="0" step="1">
+      </div>
+      <div style="flex:1">
+        <label>JANコード</label>
+        <input type="text" id="f-jan" inputmode="numeric">
+      </div>
+    </div>
+    <div style="display:flex; gap:10px; align-items:center; margin-top:16px;">
+      <button class="btn btn-primary" id="create-btn">登録する</button>
+      <span class="muted" id="create-result"></span>
+    </div>
+  </div>
+</div>
+
+<script>
+  const btn = document.getElementById('create-btn');
+  const out = document.getElementById('create-result');
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    out.textContent = '登録中… (Notionカードも作成します)';
+    try {
+      const res = await fetch('/apps/product-hub/api/drafts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: document.getElementById('f-name').value,
+          ne_code: document.getElementById('f-ne-code').value,
+          official_url: document.getElementById('f-official-url').value,
+          price: document.getElementById('f-price').value,
+          jan_code: document.getElementById('f-jan').value,
+        }),
+      });
+      const json = await res.json();
+      if (!json.ok) {
+        out.textContent = 'エラー: ' + (json.error || '登録に失敗しました');
+        btn.disabled = false;
+        return;
+      }
+      const notionOk = json.notion && (json.notion.outcome === 'created' || json.notion.outcome === 'adopted_existing');
+      out.textContent = notionOk
+        ? '登録しました。Notionカードも作成済み。詳細画面へ移動します…'
+        : '登録しました (Notionカードは未作成 — 一覧のバナーから再作成できます)。詳細画面へ…';
+      setTimeout(() => { location.href = '/apps/product-hub/detail/' + json.id; }, 900);
+    } catch (e) {
+      out.textContent = '通信エラー: ' + e.message;
+      btn.disabled = false;
+    }
+  });
+</script>

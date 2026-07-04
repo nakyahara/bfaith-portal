@@ -1,0 +1,57 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title><%= title %> | B-Faith ポータル</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, 'Segoe UI', 'Hiragino Sans', 'Noto Sans JP', sans-serif;
+         margin: 0; background: #f5f6f8; color: #1f2430; }
+  .topbar { background: #1e293b; color: #fff; padding: 10px 20px; display: flex; align-items: center; gap: 14px; }
+  .topbar a { color: #cbd5e1; text-decoration: none; font-size: 13px; }
+  .topbar a:hover { color: #fff; }
+  .topbar .app-title { font-weight: 700; font-size: 15px; }
+  .topbar .spacer { flex: 1; }
+  .topbar .user { font-size: 12px; color: #94a3b8; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 20px; }
+  .card { background: #fff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 16px 18px; margin-bottom: 16px; }
+  .card h2 { font-size: 15px; margin: 0 0 12px; }
+  .btn { display: inline-block; border: 1px solid #cbd5e1; background: #fff; color: #1f2430; border-radius: 7px;
+         padding: 7px 14px; font-size: 13px; cursor: pointer; text-decoration: none; }
+  .btn:hover { background: #f1f5f9; }
+  .btn-primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+  .btn-primary:hover { background: #1d4ed8; }
+  .btn-danger { color: #b91c1c; border-color: #fecaca; }
+  .btn-sm { padding: 3px 9px; font-size: 12px; }
+  .badge { display: inline-block; border-radius: 999px; padding: 2px 10px; font-size: 12px; font-weight: 600; }
+  .badge-draft { background: #e2e8f0; color: #475569; }
+  .badge-ready_for_ai { background: #fef3c7; color: #92400e; }
+  .badge-review { background: #dbeafe; color: #1d4ed8; }
+  .badge-approved { background: #dcfce7; color: #166534; }
+  .badge-listed { background: #ede9fe; color: #6d28d9; }
+  .badge-expanded { background: #cffafe; color: #0e7490; }
+  .badge-on_hold { background: #f1f5f9; color: #64748b; }
+  .badge-excluded { background: #fee2e2; color: #b91c1c; }
+  .banner-warn { background: #fef9c3; border: 1px solid #fde047; border-radius: 8px; padding: 10px 14px;
+                 font-size: 13px; margin-bottom: 16px; display: flex; align-items: center; gap: 12px; }
+  input[type=text], input[type=number], input[type=url], textarea, select {
+    width: 100%; border: 1px solid #cbd5e1; border-radius: 7px; padding: 7px 10px; font-size: 13px;
+    font-family: inherit; background: #fff; }
+  textarea { resize: vertical; }
+  label { font-size: 12px; color: #64748b; display: block; margin-bottom: 3px; }
+  .field { margin-bottom: 12px; }
+  .req::after { content: ' *必須'; color: #dc2626; font-size: 11px; }
+  table.list { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.list th { text-align: left; color: #64748b; font-size: 12px; font-weight: 600;
+                  border-bottom: 2px solid #e2e8f0; padding: 8px; }
+  table.list td { border-bottom: 1px solid #f1f5f9; padding: 8px; vertical-align: middle; }
+  table.list tr:hover td { background: #f8fafc; }
+  .thumb { width: 52px; height: 52px; object-fit: cover; border-radius: 6px; border: 1px solid #e2e8f0; background: #f8fafc; }
+  .muted { color: #94a3b8; font-size: 12px; }
+</style>
+<div class="topbar">
+  <a href="/">← ポータル</a>
+  <span class="app-title">📦 商品登録ハブ</span>
+  <a href="/apps/product-hub">ドラフト一覧</a>
+  <a href="/apps/product-hub/new">新規登録</a>
+  <span class="spacer"></span>
+  <span class="user"><%= displayName %></span>
+</div>
