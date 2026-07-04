@@ -31,6 +31,25 @@ const RAKUTEN_FAMILY_SUFFIXES = [
 //     ドメイン文字列そのもので検知する (エンコードでドメイン名の文字自体は変わらない)。
 export const RAKUTEN_RESIDUE_RE = /(?:rakuten\.(?:co\.jp|ne\.jp|com)|r10s\.jp|rakuten-static\.com)/i;
 
+/**
+ * Codex R16 R1 High: `.` が `%2E` 等に percent-encode されていると raw 文字列への
+ * regex が素通りする。 最大 3 回まで反復 decode して安定形を得る (二重エンコード対策)。
+ */
+export function deepDecode(s) {
+  let cur = String(s);
+  for (let i = 0; i < 3; i += 1) {
+    let next;
+    try {
+      next = decodeURIComponent(cur);
+    } catch (_) {
+      break; // 不正 encode はそこまでの decode 結果を使う
+    }
+    if (next === cur) break;
+    cur = next;
+  }
+  return cur;
+}
+
 export function isRakutenFamilyHost(hostname) {
   if (!hostname) return false;
   const h = String(hostname).toLowerCase();
@@ -75,14 +94,17 @@ export function classifyRakutenHref(href, { shopSlug = null, sellerId = null } =
     // parse 不能 (相対 URL 等) は isSafeHref (http/https のみ) 側で落ちるので host 判定は skip
   }
   // host が楽天系でなくても、 URL 文字列中に楽天ドメインが埋まっていれば楽天系として扱う
-  // (bouncer / redirect / dest_path percent-encode 形式)
-  if (!isRakuten && !RAKUTEN_RESIDUE_RE.test(raw)) return { kind: 'not_rakuten' };
+  // (bouncer / redirect / dest_path percent-encode 形式)。
+  // Codex R16 R1 High: `%2E` 等で `.` までエンコードされた形をすり抜けさせないため、
+  // raw と反復 decode 済みの両方を検査する。
+  const decoded = deepDecode(raw);
+  if (!isRakuten && !RAKUTEN_RESIDUE_RE.test(raw) && !RAKUTEN_RESIDUE_RE.test(decoded)) {
+    return { kind: 'not_rakuten' };
+  }
 
   // 自店商品リンク抽出: percent-encode されていても decode して item.rakuten.co.jp/{slug}/{code} を探す
   const seller = getSellerId(sellerId);
   if (seller) {
-    let decoded = raw;
-    try { decoded = decodeURIComponent(raw); } catch (_) { /* 不正 encode は raw のまま */ }
     const m = decoded.match(
       new RegExp(`item\\.rakuten\\.co\\.jp/${escapeRegExp(getShopSlug(shopSlug))}/([A-Za-z0-9._-]+)`, 'i')
     );
@@ -124,10 +146,12 @@ export function findRakutenResidueInFields(fields) {
   if (!fields || typeof fields !== 'object') return residues;
   for (const [k, v] of Object.entries(fields)) {
     if (typeof v !== 'string' || v === '') continue;
-    const m = v.match(RAKUTEN_RESIDUE_RE);
+    // Codex R16 R1 High: raw と反復 decode 済みの両方を検査 (%2E エンコード形も検知)
+    const target = RAKUTEN_RESIDUE_RE.test(v) ? v : deepDecode(v);
+    const m = target.match(RAKUTEN_RESIDUE_RE);
     if (m) {
-      const idx = Math.max(0, v.toLowerCase().indexOf(m[0].toLowerCase()) - 60);
-      residues.push({ field: k, sample: v.slice(idx, idx + 160) });
+      const idx = Math.max(0, target.toLowerCase().indexOf(m[0].toLowerCase()) - 60);
+      residues.push({ field: k, sample: target.slice(idx, idx + 160) });
     }
   }
   return residues;

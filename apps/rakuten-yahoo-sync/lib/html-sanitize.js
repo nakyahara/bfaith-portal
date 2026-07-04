@@ -15,7 +15,7 @@
 
 import * as cheerio from 'cheerio';
 
-import { classifyRakutenHref } from './rakuten-link-sanitizer.js';
+import { classifyRakutenHref, scrubRakutenUrlsFromText } from './rakuten-link-sanitizer.js';
 
 const ALLOWED_TAGS = new Set([
   'a', 'b', 'strong', 'i', 'em', 'u', 'br', 'p', 'div', 'span',
@@ -100,6 +100,21 @@ export function sanitizeProductHtml(html, opts = {}) {
       $el.replaceWith($el.contents());
     }
   });
+
+  // R16: テキストノードに生の楽天 URL が書かれているケース (リンクではなく文字列) もスクラブ
+  //   (自店商品 URL → Yahoo URL 文字列に書換、 その他の楽天 URL → 削除)。
+  //   これをやらないと validator の residue backstop で送信中止になり 「修正必要」 に落ちるだけなので、
+  //   自動で直せるものはここで直す。
+  (function scrubTextNodes(nodes) {
+    nodes.each((_, node) => {
+      if (node.type === 'text' && node.data) {
+        const scrubbed = scrubRakutenUrlsFromText(node.data);
+        if (scrubbed !== node.data) node.data = scrubbed;
+      } else if (node.type === 'tag') {
+        scrubTextNodes($(node).contents());
+      }
+    });
+  })(root.contents());
 
   // strip-only (中身を残してタグだけ unwrap)
   STRIP_BUT_KEEP_CONTENT.forEach((tag) => {

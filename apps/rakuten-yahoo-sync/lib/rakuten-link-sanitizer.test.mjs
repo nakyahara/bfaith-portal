@@ -44,6 +44,24 @@ test('bouncer 形式 (percent-encode 埋込) も自店商品なら書換', () =>
   assert.equal(c.yahooUrl, 'https://store.shopping.yahoo.co.jp/b-faith/aa0203-2.html');
 });
 
+test('Codex R1 High: %2E エンコード (ドットまでエンコード) もすり抜けさせない', () => {
+  const c = classifyRakutenHref(
+    'https://shopping.yahoo.co.jp/stores/wrap/bouncer.html?dest_path=https%3A%2F%2Fitem%2Erakuten%2Eco%2Ejp%2Fb-faith%2FAA0203%2F'
+  );
+  assert.equal(c.kind, 'rewrite');
+  assert.equal(c.yahooUrl, 'https://store.shopping.yahoo.co.jp/b-faith/aa0203.html');
+});
+
+test('Codex R1 High: 二重エンコードも反復 decode で検知', () => {
+  // %253A = %3A の二重エンコード
+  const doubled = 'https://example.com/r?u=https%253A%252F%252Fitem%252Erakuten%252Eco%252Ejp%252Fb-faith%252Fxyz%252F';
+  const c = classifyRakutenHref(doubled);
+  assert.equal(c.kind, 'rewrite');
+  assert.equal(c.yahooUrl, 'https://store.shopping.yahoo.co.jp/b-faith/xyz.html');
+  const r = findRakutenResidueInFields({ additional1: doubled });
+  assert.equal(r.length, 1, 'residue backstop も二重エンコードを検知');
+});
+
 test('他店の楽天商品リンク → remove', () => {
   const c = classifyRakutenHref('https://item.rakuten.co.jp/other-shop/xyz123/');
   assert.equal(c.kind, 'remove');
@@ -112,6 +130,14 @@ test('sanitize: 書換不能な楽天リンクは unwrap (テキストは残し�
 test('sanitize: 楽天と無関係な <a href> は従来通り保持', () => {
   const out = sanitizeProductHtml('<a href="https://store.shopping.yahoo.co.jp/b-faith/x.html">既存リンク</a>');
   assert.ok(out.includes('href="https://store.shopping.yahoo.co.jp/b-faith/x.html"'));
+});
+
+test('sanitize: テキストノード内の生楽天 URL (リンクでない文字列) もスクラブされる', () => {
+  const out = sanitizeProductHtml(
+    '<p>詳細は https://item.rakuten.co.jp/b-faith/AA0203/ を参照。検索は https://search.rakuten.co.jp/mall/x/ で。</p>'
+  );
+  assert.ok(out.includes('https://store.shopping.yahoo.co.jp/b-faith/aa0203.html'), '自店商品は書換');
+  assert.ok(!/rakuten/i.test(out), `楽天 URL 消滅: ${out}`);
 });
 
 // ── scrubRakutenUrlsFromText (explanation プレーンテキスト経路) ──
