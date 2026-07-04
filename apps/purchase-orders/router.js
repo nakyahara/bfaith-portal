@@ -1482,10 +1482,10 @@ function renderUnlinked(j) {
     '<span class="muted">取扱中なのに発注条件/原料グループ等が未登録の商品。' +
     '<b>新商品が入ると翌朝ここに自動で載ります</b>（グループ対象外の商品はそのままでOK）。</span>' +
     '<span style="margin-left:auto">表示: <select id="uDays">' +
-      '<option value="30">直近30日の新商品</option>' +
-      '<option value="60" selected>直近60日の新商品</option>' +
-      '<option value="90">直近90日の新商品</option>' +
-      '<option value="0">全部 (' + j.totalUnlinked + '件)</option>' +
+      ['30:直近30日の新商品','60:直近60日の新商品','90:直近90日の新商品','0:全部 (' + j.totalUnlinked + '件)'].map(function(o){
+        var v = o.split(':')[0];
+        return '<option value="' + v + '"' + (String(j.days) === v ? ' selected' : '') + '>' + o.slice(o.indexOf(':') + 1) + '</option>';
+      }).join('') +
     '</select></span></div>';
   h += '<div class="muted" style="margin-bottom:8px">該当 ' + j.count + ' 件' + (j.count > 500 ? ' (先頭500件表示)' : '') + '</div>';
   h += '<table class="t"><thead><tr><th>登録日</th><th>商品コード</th><th>商品名</th><th>仕入先</th></tr></thead><tbody>';
