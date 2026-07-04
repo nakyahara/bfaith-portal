@@ -207,6 +207,9 @@
 
   function showAndReload(json, okMsg) {
     if (json.ok) {
+      if (json.demoted) {
+        alert('必須項目が欠けたため、ステータスを「下書き」に戻しました:\n' + json.demoted.join('\n'));
+      }
       result.textContent = okMsg;
       setTimeout(() => location.reload(), 600);
     } else {

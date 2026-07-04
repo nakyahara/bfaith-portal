@@ -11,7 +11,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 import {
-  getDB, logEvent, gateReasons,
+  getDB, logEvent, gateReasons, demoteIfGateBroken,
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS,
 } from './db.js';
 import { parseDriveLink, thumbnailUrl, fileViewUrl } from './lib/drive-link.js';
@@ -216,7 +216,9 @@ router.post('/api/drafts/:id', (req, res) => {
     draft.id,
   );
   logEvent(db, draft.id, 'updated', null, actorOf(req));
-  res.json({ ok: true });
+  // ゲート必須項目 (公式URL等) を消したら ready_for_ai を draft に自動差し戻し (Codex R1 high)
+  const demoted = demoteIfGateBroken(db, draft.id, actorOf(req));
+  res.json({ ok: true, demoted: demoted || undefined });
 });
 
 // ─── API: 参考URL / 画像 / 仕様表 / AI出力 ─────────────────
@@ -274,7 +276,9 @@ router.post('/api/drafts/:id/images/:imageId/delete', (req, res) => {
   const db = getDB();
   db.prepare('DELETE FROM draft_images WHERE id = ? AND draft_id = ?')
     .run(Number.parseInt(req.params.imageId, 10) || 0, draft.id);
-  res.json({ ok: true });
+  // 最後の画像を消したら ready_for_ai を draft に自動差し戻し (Codex R1 high)
+  const demoted = demoteIfGateBroken(db, draft.id, actorOf(req));
+  res.json({ ok: true, demoted: demoted || undefined });
 });
 
 router.post('/api/drafts/:id/specs', (req, res) => {
@@ -325,7 +329,8 @@ router.post('/api/drafts/:id/status', (req, res) => {
     return res.status(400).json({ ok: false, error: `${STATUS_LABELS[draft.status] || draft.status} から ${STATUS_LABELS[to] || to} へは遷移できません` });
   }
   const db = getDB();
-  if (to === 'ready_for_ai') {
+  // review へ進むときも再チェック (ready_for_ai 到達後に必須項目が壊された場合のすり抜け防止)
+  if (to === 'ready_for_ai' || to === 'review') {
     const reasons = gateReasons(db, draft);
     if (reasons.length > 0) {
       return res.status(400).json({ ok: false, error: '必須項目が未入力です', reasons });

@@ -6,14 +6,19 @@
  *     env も RYS と共通: RYS_NOTION_TOKEN / NOTION_PRODUCT_MASTER_DB_ID (token 流用は中原さん決定 2026-07-04)
  *   - fail-retry 方式: Notion 失敗でもドラフト登録は成功のまま。notion_card_status で追跡し、
  *     画面バナー + リトライで最終的に必ず作る
- *   - 冪等: (1) DB CAS で二重実行防止 (2) 作成前に 商品コード で Notion pre-check、既存なら採用
+ *   - 冪等: (1) DB CAS + claim token で二重実行防止 (2) 作成前に 商品コード で Notion pre-check、既存なら採用
  *   - status 遷移: pending → creating → created / failed。creating のまま
  *     STALE_CREATING_MS 経過したものは crash 扱いでリトライ対象に戻す
+ *   - claim token (Codex R1 medium 対応): stale 奪取と旧 worker が競合しても、
+ *     createPage 直前の claim 再確認 + finalize の claim 一致 CAS で二重カードを防ぐ
  */
+import crypto from 'crypto';
+
 import { createPage, findPageByManageNumber } from '../../rakuten-yahoo-sync/lib/notion-client.js';
 import { getDB, logEvent } from '../db.js';
 
-const STALE_CREATING_MS = 10 * 60 * 1000;
+// notion-client の worst case (timeout 30s × retry 5 + backoff) を大きく上回る保守的な値
+const STALE_CREATING_MS = 30 * 60 * 1000;
 const ERROR_MAX_LEN = 500;
 
 function defaultNotionStatus() {
@@ -53,29 +58,40 @@ export async function attemptCardCreation(draftId, { actor = null } = {}) {
   if (!draft) return { outcome: 'not_found' };
   if (draft.notion_page_id) return { outcome: 'already_created', notionPageId: draft.notion_page_id };
 
-  // CAS claim: pending/failed → creating (creating は stale のときだけ奪取可)
+  // CAS claim: pending/failed → creating (creating は stale のときだけ奪取可)。
+  // claim token で「どの試行がロックを持っているか」を識別する
+  const claimToken = crypto.randomUUID();
   const staleBefore = new Date(Date.now() - STALE_CREATING_MS).toISOString();
   const claim = db.prepare(`
     UPDATE product_drafts SET
       notion_card_status = 'creating',
+      notion_card_claim = ?,
       notion_card_attempts = notion_card_attempts + 1,
       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
     WHERE id = ?
       AND notion_page_id IS NULL
       AND (notion_card_status IN ('pending','failed')
            OR (notion_card_status = 'creating' AND updated_at < ?))
-  `).run(draftId, staleBefore);
+  `).run(claimToken, draftId, staleBefore);
   if (claim.changes === 0) return { outcome: 'skip_locked' };
 
+  // claim がまだ自分のものか (stale 奪取されていないか) を確認する
+  const holdsClaim = () => {
+    const row = db.prepare('SELECT notion_card_status, notion_card_claim FROM product_drafts WHERE id = ?').get(draftId);
+    return row && row.notion_card_status === 'creating' && row.notion_card_claim === claimToken;
+  };
+
+  // finalize は claim 一致時のみ書き込む CAS (奪取した新 worker の結果を旧 worker が上書きしない)
   const finalize = (status, pageId, error) => {
     db.prepare(`
       UPDATE product_drafts SET
         notion_card_status = ?,
         notion_page_id = COALESCE(?, notion_page_id),
         notion_card_error = ?,
+        notion_card_claim = NULL,
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-      WHERE id = ? AND notion_card_status = 'creating'
-    `).run(status, pageId || null, error || null, draftId);
+      WHERE id = ? AND notion_card_status = 'creating' AND notion_card_claim = ?
+    `).run(status, pageId || null, error || null, draftId, claimToken);
   };
 
   try {
@@ -86,6 +102,9 @@ export async function attemptCardCreation(draftId, { actor = null } = {}) {
       logEvent(db, draftId, 'notion_card_adopted', existing.id, actor);
       return { outcome: 'adopted_existing', notionPageId: existing.id };
     }
+
+    // createPage 直前に claim 再確認: stale 奪取されていたら作成せず撤退 (二重カード防止)
+    if (!holdsClaim()) return { outcome: 'claim_lost' };
 
     const page = await createPage(buildProperties(draft));
     finalize('created', page.id, null);

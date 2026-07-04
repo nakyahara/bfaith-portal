@@ -66,6 +66,20 @@ let trigErr = null;
 try { db.prepare('UPDATE draft_events SET detail = ? WHERE draft_id = ?').run('tamper', draft.id); } catch (e) { trigErr = e; }
 check('draft_events append-only', trigErr && String(trigErr.message).includes('append-only'));
 
+// ─── CHECK 制約 (Codex R1 low: 同居DBの不正状態防止) ───
+let checkErr = null;
+try { db.prepare(`INSERT INTO product_drafts (ne_code, name, status) VALUES ('SMOKE-BAD', 'x', 'bogus')`).run(); } catch (e) { checkErr = e; }
+check('status CHECK enforced', checkErr && String(checkErr.message).includes('CHECK'));
+
+// ─── 自動差し戻し (Codex R1 high: ゲートすり抜け防止) ───
+db.prepare(`UPDATE product_drafts SET status = 'ready_for_ai' WHERE id = ?`).run(draft.id);
+check('demote no-op while gate ok', dbmod.demoteIfGateBroken(db, draft.id, 'smoke') === null);
+db.prepare(`UPDATE product_drafts SET official_url = NULL WHERE id = ?`).run(draft.id);
+const demoteReasons = dbmod.demoteIfGateBroken(db, draft.id, 'smoke');
+check('demote fires when url cleared', Array.isArray(demoteReasons) && demoteReasons.length === 1);
+check('demoted back to draft', db.prepare('SELECT status FROM product_drafts WHERE id = ?').get(draft.id).status === 'draft');
+db.prepare(`UPDATE product_drafts SET official_url = 'https://example.com/item' WHERE id = ?`).run(draft.id);
+
 // ─── notion-card fail-closed (env 未設定 → failed で残り、登録は無事) ───
 delete process.env.RYS_NOTION_TOKEN;
 const notionCard = await import('../services/notion-card.js');

@@ -44,16 +44,20 @@ export function initProductHubDB() {
       id                  INTEGER PRIMARY KEY AUTOINCREMENT,
       ne_code             TEXT NOT NULL UNIQUE,
       name                TEXT NOT NULL,
-      status              TEXT NOT NULL DEFAULT 'draft',
+      status              TEXT NOT NULL DEFAULT 'draft'
+                          CHECK (status IN ('draft','ready_for_ai','review','approved','listed','expanded','on_hold','excluded')),
       official_url        TEXT,
-      price               INTEGER,            -- 売価 (税込・円・整数)
+      price               INTEGER             -- 売価 (税込・円・整数)
+                          CHECK (price IS NULL OR (price BETWEEN 0 AND 1000000000000)),
       jan_code            TEXT,
-      has_variation       INTEGER NOT NULL DEFAULT 0,
+      has_variation       INTEGER NOT NULL DEFAULT 0 CHECK (has_variation IN (0, 1)),
       drive_folder_url    TEXT,               -- 商品画像フォルダ (商品コード_商品名 規則を推奨)
       memo                TEXT,
       notion_page_id      TEXT,
-      notion_card_status  TEXT NOT NULL DEFAULT 'pending',  -- pending / created / failed
+      notion_card_status  TEXT NOT NULL DEFAULT 'pending'
+                          CHECK (notion_card_status IN ('pending','creating','created','failed')),
       notion_card_error   TEXT,
+      notion_card_claim   TEXT,               -- creating 中の claim token (stale 奪取の二重作成防止)
       notion_card_attempts INTEGER NOT NULL DEFAULT 0,
       created_by          TEXT,
       created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
@@ -114,6 +118,12 @@ export function initProductHubDB() {
     CREATE INDEX IF NOT EXISTS idx_draft_events_draft ON draft_events(draft_id);
   `);
 
+  // 既存 DB へのカラム追加 (warehouse-mirror/db.js の addColumnIfMissing と同方針の冪等 ALTER)
+  const draftCols = new Set(db.prepare('PRAGMA table_info(product_drafts)').all().map((c) => c.name));
+  if (!draftCols.has('notion_card_claim')) {
+    db.exec('ALTER TABLE product_drafts ADD COLUMN notion_card_claim TEXT');
+  }
+
   // draft_events は append-only (mis-shipment と同じ trigger ガード)
   db.exec(`
     CREATE TRIGGER IF NOT EXISTS trg_draft_events_no_update
@@ -151,5 +161,23 @@ export function gateReasons(db, draft) {
   if (!draft.official_url || !String(draft.official_url).trim()) reasons.push('公式ページURLが未入力です');
   const imgCount = db.prepare('SELECT COUNT(*) AS c FROM draft_images WHERE draft_id = ?').get(draft.id).c;
   if (imgCount === 0) reasons.push('商品画像 (Driveリンク) が1枚もありません');
+  return reasons;
+}
+
+/**
+ * ゲート必須項目が後から壊された場合 (公式URL削除・最後の画像削除など) に
+ * ready_for_ai を draft に自動差し戻す (Codex R1 high 対応: ゲートすり抜け防止)。
+ * @returns {string[]|null} 差し戻した場合はその理由、しなかった場合は null
+ */
+export function demoteIfGateBroken(db, draftId, actor) {
+  const draft = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draftId);
+  if (!draft || draft.status !== 'ready_for_ai') return null;
+  const reasons = gateReasons(db, draft);
+  if (reasons.length === 0) return null;
+  db.prepare(`
+    UPDATE product_drafts SET status = 'draft', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    WHERE id = ? AND status = 'ready_for_ai'
+  `).run(draftId);
+  logEvent(db, draftId, 'auto_demoted_to_draft', reasons.join(' / '), actor);
   return reasons;
 }
