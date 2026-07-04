@@ -48,7 +48,9 @@ export function isPublishEnabled() {
 // 同じ key にならないよう version を必ず混ぜる。
 // v2: PR #355 image-html rewrite (uploadItemImage で desc も) 採用版
 // v3: PR #356 uploadLibImage 採用 (Yahoo it-14061 修正) 後の版
-export const IDEMPOTENCY_VERSION = 'rewrite_v3';
+// v4: R16 楽天リンク根絶 (2026-07-04)。 v3 以前に publish した商品は楽天リンクが残っている
+//     可能性があるため、 同日でも dedupe されず再 publish で上書き修正できるようにする。
+export const IDEMPOTENCY_VERSION = 'rewrite_v4';
 
 /**
  * idempotency_key 生成 (caller が override 可能、 ない場合は deterministic に組み立て)。

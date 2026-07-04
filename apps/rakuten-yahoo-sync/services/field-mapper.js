@@ -14,6 +14,7 @@
  */
 
 import { sanitizeProductHtml } from '../lib/html-sanitize.js';
+import { scrubRakutenUrlsFromText } from '../lib/rakuten-link-sanitizer.js';
 import { buildYahooExplanation, buildYahooHeadline } from '../lib/yahoo-text.js';
 import { shouldUseSagawaPrice } from './delivery-resolver.js';
 
@@ -164,11 +165,13 @@ export function buildYahooEditItemFields({
   //     - 1000 units (= 全角 500) で grapheme cluster 単位 truncate
   //   caption / additional1 / sp_additional は HTML 可なので現状維持 (sanitize のみ)。
   fields.caption = pickCaptionField(notionOverride, rakutenItem);
-  fields.explanation = buildYahooExplanation({
+  // R16: explanation はプレーンテキストで sanitizeProductHtml を通らないため、
+  //   テキスト中に生の楽天 URL が残っていたらここでスクラブする (自店商品→Yahoo URL、他→削除)。
+  fields.explanation = scrubRakutenUrlsFromText(buildYahooExplanation({
     headline: notionOverride?.yahoo_headline,
     itemName: rakutenItem.itemName || rakutenItem.title || '',
     html: rakutenItem.productDescription?.pc || '',
-  });
+  }));
   fields.additional1 = sanitizeProductHtml(rakutenItem.salesDescription || '');
   fields.sp_additional = sanitizeProductHtml(rakutenItem.productDescription?.sp || '');
 
