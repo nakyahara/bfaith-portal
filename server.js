@@ -48,6 +48,7 @@ import inventoryMonthlyRouter, { apiRouter as inventoryMonthlyApiRouter } from '
 import misShipmentRouter from './apps/mis-shipment/router.js';
 import supplierSalesRouter from './apps/supplier-sales/router.js';
 import productHubRouter, { serviceApiRouter as productHubServiceApiRouter } from './apps/product-hub/router.js';
+import purchaseOrdersRouter from './apps/purchase-orders/router.js';
 import supplierSalesPublicRouter from './apps/supplier-sales/public-router.js';
 import serviceRouter from './apps/warehouse/service-router.js';
 import { serviceAuth } from './apps/warehouse/service-auth.js';
@@ -649,6 +650,15 @@ const apps = [
     category: 'shipping',
   },
   {
+    id: 'purchase-orders',
+    name: '発注補助',
+    description: '仕入先への発注を1画面で完結。要発注判定・推奨発注量・最低発注条件ゲージ・ついで買い候補・発注履歴 (旧: 発注対象商品シート+発注条件マスタ)',
+    icon: '🛒',
+    path: '/apps/purchase-orders',
+    status: 'active',
+    category: 'purchasing',
+  },
+  {
     id: 'supplier-sales',
     name: '仕入れ先 売れ筋共有',
     description: '全モール(Amazon・楽天 ほか)の販売実績を仕入先別に集計し、ログイン不要の共有URLを発行。原価非開示・販売数/売上のみ',
@@ -1009,6 +1019,8 @@ app.use('/apps/mis-shipment', requireAppAccess('mis-shipment'), express.json({ l
 app.use('/apps/supplier-sales', requireAppAccess('supplier-sales'), express.json({ limit: '256kb' }), supplierSalesRouter);
 app.use('/apps/product-hub/service-api', productHubServiceApiRouter); // トークン認証 (PH_SERVICE_TOKEN, fail-closed)
 app.use('/apps/product-hub', requireAppAccess('product-hub'), productHubRouter);
+// 仕入先発注補助: mirror PML(read-only) + po_* マスタ/発注履歴 (warehouse-mirror.db 同居)
+app.use('/apps/purchase-orders', requireAppAccess('purchase-orders'), express.json({ limit: '1mb' }), purchaseOrdersRouter);
 app.use('/apps/mgmt-accounting', express.json({ limit: '50mb' }), (req, res, next) => {
   // 管理系APIはセッション認証スキップ（内部で checkAuth により key/session のいずれか必須）
   const adminPaths = ['/import-historical', '/bulk-calculate', '/cleanup-invalid'];
