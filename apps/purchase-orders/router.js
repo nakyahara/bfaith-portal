@@ -547,37 +547,62 @@ router.post('/api/ne-overlay/csv', upload.single('file'), (req, res) => {
         error: 'NE商品マスタCSVの見出しが見つかりません (商品コード/在庫数/発注残数 が必要)。ネクストエンジンの商品マスタDL CSVをそのままアップロードしてください',
       });
     }
+    // NE CSVの数値セルは "1,234" 形式もあり得るためカンマ除去してから数値化
+    const numLoose = v => {
+      const s = trimS(v).replace(/,/g, '');
+      if (s === '') return null;
+      const n = Number(s);
+      return Number.isFinite(n) ? n : null;
+    };
     const db = getDB();
     const now = nowIso();
     let count = 0;
-    db.transaction(() => {
-      db.prepare('DELETE FROM po_ne_overlay_rows').run();
-      const ins = db.prepare(`INSERT OR REPLACE INTO po_ne_overlay_rows
-        (product_key, product_code, 仕入先コード, 原価, 売価, 取扱区分, 発注ロット単位, 最終仕入日, 在庫数, 引当数, 発注残数)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
-      for (let i = 1; i < rows.length; i++) {
-        const c = rows[i];
-        const code = trimS(c[idx.product_code]);
-        if (!code) continue;
-        ins.run(
-          normProductCode(code), code,
-          idx.仕入先コード != null ? (trimS(c[idx.仕入先コード]) || null) : null,
-          idx.原価 != null ? numOrNull(c[idx.原価]) : null,
-          idx.売価 != null ? numOrNull(c[idx.売価]) : null,
-          idx.取扱区分 != null ? (trimS(c[idx.取扱区分]) || null) : null,
-          idx.発注ロット単位 != null ? numOrNull(c[idx.発注ロット単位]) : null,
-          idx.最終仕入日 != null ? (trimS(c[idx.最終仕入日]) || null) : null,
-          numOrNull(c[idx.在庫数]),
-          idx.引当数 != null ? numOrNull(c[idx.引当数]) : null,
-          numOrNull(c[idx.発注残数]),
-        );
-        count++;
+    const errors = [];
+    try {
+      db.transaction(() => {
+        db.prepare('DELETE FROM po_ne_overlay_rows').run();
+        const ins = db.prepare(`INSERT OR REPLACE INTO po_ne_overlay_rows
+          (product_key, product_code, 仕入先コード, 原価, 売価, 取扱区分, 発注ロット単位, 最終仕入日, 在庫数, 引当数, 発注残数)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
+        for (let i = 1; i < rows.length; i++) {
+          const c = rows[i];
+          const code = trimS(c[idx.product_code]);
+          if (!code) continue;
+          // 発注計算の根幹となる在庫数・発注残数が数値でない行は fail-closed (Codex Medium)
+          const zaiko = numLoose(c[idx.在庫数]);
+          const chuzan = numLoose(c[idx.発注残数]);
+          if (zaiko == null) { errors.push(`行${i + 1} (${code}): 在庫数が数値ではありません`); continue; }
+          if (chuzan == null) { errors.push(`行${i + 1} (${code}): 発注残数が数値ではありません`); continue; }
+          ins.run(
+            normProductCode(code), code,
+            idx.仕入先コード != null ? (trimS(c[idx.仕入先コード]) || null) : null,
+            idx.原価 != null ? numLoose(c[idx.原価]) : null,
+            idx.売価 != null ? numLoose(c[idx.売価]) : null,
+            idx.取扱区分 != null ? (trimS(c[idx.取扱区分]) || null) : null,
+            idx.発注ロット単位 != null ? numLoose(c[idx.発注ロット単位]) : null,
+            idx.最終仕入日 != null ? (trimS(c[idx.最終仕入日]) || null) : null,
+            zaiko,
+            idx.引当数 != null ? numLoose(c[idx.引当数]) : null,
+            chuzan,
+          );
+          count++;
+        }
+        if (errors.length > 0) throw new Error('validation');
+        if (count === 0) throw new Error('有効な行がありません');
+        db.prepare(`INSERT INTO po_ne_overlay_meta (id, uploaded_at, row_count, filename) VALUES (1,?,?,?)
+                    ON CONFLICT(id) DO UPDATE SET uploaded_at=excluded.uploaded_at, row_count=excluded.row_count, filename=excluded.filename`)
+          .run(now, count, req.file.originalname || null);
+      })();
+    } catch (e) {
+      if (errors.length > 0) {
+        return res.status(400).json({
+          ok: false,
+          error: `数値でない行が ${errors.length} 件あるため全件取り込みを中止しました (1件も反映していません)`,
+          errors: errors.slice(0, 10),
+        });
       }
-      if (count === 0) throw new Error('有効な行がありません');
-      db.prepare(`INSERT INTO po_ne_overlay_meta (id, uploaded_at, row_count, filename) VALUES (1,?,?,?)
-                  ON CONFLICT(id) DO UPDATE SET uploaded_at=excluded.uploaded_at, row_count=excluded.row_count, filename=excluded.filename`)
-        .run(now, count, req.file.originalname || null);
-    })();
+      throw e;
+    }
     res.json({ ok: true, rowCount: count, uploadedAt: now });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
@@ -707,7 +732,9 @@ ${script || ''}
 /** データ鮮度の表示テキスト (NE=朝同期 or 手動CSV / FBA=朝同期 or live) */
 function freshnessText(pub, overlay) {
   const ne = overlay && overlay.applied
-    ? `NE: 🟢手動CSV ${fmtJst(overlay.uploaded_at)} 取込済 (${overlay.mergedCount || overlay.row_count}件)`
+    ? (overlay.mergedCount === 0
+      ? `NE: ⚠️手動CSV ${fmtJst(overlay.uploaded_at)} — 1件も一致していません (${overlay.row_count}件中0件)。CSVを確認してください`
+      : `NE: 🟢手動CSV ${fmtJst(overlay.uploaded_at)} 取込済 (反映 ${overlay.mergedCount}/${overlay.row_count}件)`)
     : `NE: ${pub && pub.src_ne_products_synced_at ? fmtJst(pub.src_ne_products_synced_at) + ' (朝同期)' : '—'}`;
   const fba = pub && pub.fba_source_kind === 'live'
     ? `FBA: 🟢${fmtJst(pub.fba_fetched_at)} 取得(最新)`
@@ -822,6 +849,7 @@ function pollFba(jobId, startTs) {
     fetch('/apps/purchase-orders/api/refresh-fba/jobs/' + encodeURIComponent(jobId))
       .then(function(r){ return r.json(); })
       .then(function(job) {
+        if (job.error && !job.status) { setStatus('状態取得エラー: ' + job.error); btnFba.disabled = false; return; }
         if (job.status === 'completed') { setStatus('完了。最新データで再読み込みします...'); location.reload(); }
         else if (job.status === 'failed') { setStatus('失敗: ' + (job.error || '理由不明')); btnFba.disabled = false; }
         else {

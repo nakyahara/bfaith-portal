@@ -220,6 +220,23 @@ const badNe = new FormData();
 badNe.append('file', new Blob(['foo,bar\r\n1,2\r\n']), 'bad.csv');
 r = await j('/api/ne-overlay/csv', { method: 'POST', body: badNe });
 ok(r.status === 400, 'NE CSV見出し不正は 400');
+// 在庫数が数値でない行があれば全件rollback
+const badNumNe = new FormData();
+badNumNe.append('file', new Blob(['"商品コード","在庫数","発注残数"\r\n"a1","10","0"\r\n"a2","abc","0"\r\n']), 'badnum.csv');
+r = await j('/api/ne-overlay/csv', { method: 'POST', body: badNumNe });
+ok(r.status === 400 && r.body.errors && r.body.errors.length === 1, 'NE CSV数値不正行は全件rollback + errors', r.body);
+r = await j('/api/supplier/1');
+ok(r.body.overlay === null, '不正CSVは一切反映されない');
+// カンマ区切り数値は許容
+const commaNe = new FormData();
+commaNe.append('file', new Blob(['"商品コード","在庫数","発注残数"\r\n"noflyersticker","1,234","0"\r\n']), 'comma.csv');
+r = await j('/api/ne-overlay/csv', { method: 'POST', body: commaNe });
+ok(r.status === 200, 'カンマ入り数値は許容');
+r = await j('/api/supplier/1');
+const noflyComma = [...r.body.targets, ...r.body.candidates, ...r.body.horikoshi].find(p => p.code === 'noflyersticker');
+// NE1,234 + FBA20 (この時点ではまだFBA=20のまま)
+ok(noflyComma && noflyComma.stock === 1254, 'カンマ除去して数値化 (1,234→1234 +FBA20)', noflyComma && noflyComma.stock);
+await j('/api/ne-overlay', { method: 'DELETE' });
 db.prepare(`UPDATE mirror_pml_snapshot_rows SET FBA在庫数=NULL WHERE 商品コード='noflyersticker'`).run();
 
 console.log('── 画面 (HTML) ──');
