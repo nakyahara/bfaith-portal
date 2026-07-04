@@ -17,6 +17,7 @@
 
 import crypto from 'crypto';
 import { evaluateItemForPublish } from './publish-pipeline.js';
+import { applyAucFreespaceFallback } from './field-mapper.js';
 import { callEditItem, YahooProxyError } from '../lib/yahoo-publish-proxy.js';
 import { uploadRakutenImagesToYahoo } from '../lib/image-uploader.js';
 import { validateYahooEditItemFields, YahooFieldValidationError } from '../lib/yahoo-edititem-validator.js';
@@ -227,6 +228,11 @@ async function performRealPublish({ rakutenImages, fields, itemCode, customPatte
     additional1: rewrittenAdditional1,
     sp_additional: rewrittenSpAdditional,
   };
+
+  // R15 再適用 (R16 発覚): 上の rewrite は additional1 を生 salesDescription から再構築して
+  // 上書きするため、 salesDescription が空のヤフオク併売品では field-mapper 側の
+  // 「additional1 空欄 → caption 補完」 が消えてしまう。 rewrite 後の最終段でもう一度適用する。
+  applyAucFreespaceFallback(rewrittenFields);
 
   // 4. editItem preflight 確定 (rewrite 後の長さ + img host check)
   try {

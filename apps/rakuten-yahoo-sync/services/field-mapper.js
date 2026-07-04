@@ -206,13 +206,27 @@ export function buildYahooEditItemFields({
   fields.display = 0;
 
   // ── 最終処理 (R15 2026-07-04 中原さん指示): ヤフオク併売時の PC用フリースペース1 必須対応 ──
-  //   Yahoo!ショッピングで商品状態「新品：Yahoo!オークション併売」(= auc_* を送る通常品) は
-  //   「PC用フリースペース1」(additional1) が必須。 空欄なら商品説明 (caption) と同じ内容を入れる。
   //   ※中原さん指示により、 他の全 field 組み立てが終わった一番最後に適用する。
+  applyAucFreespaceFallback(fields);
+
+  return fields;
+}
+
+/**
+ * R15 (2026-07-04 中原さん指示): ヤフオク併売時の PC用フリースペース1 必須対応。
+ *   Yahoo!ショッピングで商品状態「新品：Yahoo!オークション併売」(= auc_* を送る通常品) は
+ *   「PC用フリースペース1」(additional1) が必須。 空欄なら商品説明 (caption) と同じ内容を入れる。
+ *
+ * fields を in-place で書き換える。 呼び出し箇所は 2 つ:
+ *   1. buildYahooEditItemFields の最終行 (dry-run / readiness 用の fields)
+ *   2. publish-executor の performRealPublish (R16 発覚): executor は additional1 を
+ *      生 salesDescription から rewriteAndSanitizeYahooHtml で「再構築して上書き」するため、
+ *      salesDescription が空の商品では 1. の補完が消える。 rewrite 後にもう一度適用が必要。
+ */
+export function applyAucFreespaceFallback(fields) {
   const isAucCrossListing = fields.auc_bcid !== undefined;
   if (isAucCrossListing && (!fields.additional1 || String(fields.additional1).trim() === '')) {
     fields.additional1 = fields.caption || fields.explanation || '';
   }
-
   return fields;
 }

@@ -9,7 +9,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { buildYahooEditItemFields } from './field-mapper.js';
+import { buildYahooEditItemFields, applyAucFreespaceFallback } from './field-mapper.js';
 import { resolveVariation } from './variation-resolver.js';
 
 const NOTION = { yahoo_title: 'テスト商品', yahoo_price: 1000, notion_tax_rate: '10%' };
@@ -41,6 +41,19 @@ test('ヤフオク併売 + additional1 に元々値あり → 上書きしない
   const fields = build(mkSingleItem({ salesDescription: '<p>元々のフリースペース</p>' }));
   assert.ok(fields.auc_bcid);
   assert.match(fields.additional1, /元々のフリースペース/, '元の値が保持される');
+});
+
+test('executor rewrite 後の再適用 (R16 発覚回帰): 上書きで空に戻った additional1 を再補完', () => {
+  // performRealPublish は additional1 を生 salesDescription から再構築して上書きする。
+  // salesDescription 空のヤフオク併売品では '' に戻るため、 rewrite 後の再適用で復元されること。
+  const rewrittenFields = {
+    auc_bcid: 'testitem1',
+    caption: '<p>商品説明</p>',
+    explanation: 'テキスト説明',
+    additional1: '', // rewrite で空に戻った状態
+  };
+  applyAucFreespaceFallback(rewrittenFields);
+  assert.equal(rewrittenFields.additional1, '<p>商品説明</p>');
 });
 
 test('バリ品 (auc 送らない) → additional1 空のままでも補完しない', () => {
