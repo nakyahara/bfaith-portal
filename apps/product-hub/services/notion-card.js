@@ -118,9 +118,11 @@ export async function attemptCardCreation(draftId, { actor = null } = {}) {
     return { outcome: 'created', notionPageId: page.id };
   } catch (e) {
     const error = truncateError(e);
-    if (finalize('failed', null, error)) {
-      logEvent(db, draftId, 'notion_card_failed', error, actor);
+    if (!finalize('failed', null, error)) {
+      // claim 喪失後の旧 worker の失敗 — DB は新 worker の結果が正なので上書きしない
+      return { outcome: 'claim_lost', error };
     }
+    logEvent(db, draftId, 'notion_card_failed', error, actor);
     return { outcome: 'failed', error };
   }
 }
