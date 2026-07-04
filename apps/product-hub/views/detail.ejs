@@ -1,0 +1,288 @@
+<%- include('_header') %>
+<div class="wrap">
+
+  <!-- ステータス + Notion -->
+  <div class="card">
+    <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+      <span class="badge badge-<%= draft.status %>" style="font-size:13px"><%= statusLabels[draft.status] || draft.status %></span>
+      <strong style="font-size:16px"><%= draft.name %></strong>
+      <code class="muted"><%= draft.ne_code %></code>
+      <span style="flex:1"></span>
+      <% for (const s of nextStatuses) { %>
+        <button class="btn btn-sm status-btn" data-to="<%= s %>"><%= statusLabels[s] %> にする</button>
+      <% } %>
+    </div>
+    <% if (draft.status === 'draft' && gate.length > 0) { %>
+      <div class="banner-warn" style="margin:12px 0 0;">
+        <div>
+          「生成待ち」に進むには以下が必要です:
+          <ul style="margin:6px 0 0 18px; padding:0;">
+            <% for (const r of gate) { %><li><%= r %></li><% } %>
+          </ul>
+        </div>
+      </div>
+    <% } %>
+    <div style="margin-top:10px; font-size:13px;">
+      Notionカード:
+      <% if (draft.notion_card_status === 'created' && draft.notion_page_id) { %>
+        ✅ 作成済み <a href="https://www.notion.so/<%= draft.notion_page_id.replace(/-/g, '') %>" target="_blank" rel="noopener">Notionで開く ↗</a>
+      <% } else { %>
+        <% if (draft.notion_card_status === 'failed') { %>
+          ❌ 作成失敗 <span class="muted"><%= draft.notion_card_error || '' %></span>
+        <% } else { %>
+          ⏳ 未作成
+        <% } %>
+        <button class="btn btn-sm" id="notion-retry-btn">再作成</button>
+      <% } %>
+      <span class="muted" id="action-result" style="margin-left:8px"></span>
+    </div>
+  </div>
+
+  <div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px;">
+    <!-- 基本情報 -->
+    <div class="card">
+      <h2>基本情報</h2>
+      <div class="field">
+        <label class="req">商品名</label>
+        <input type="text" id="f-name" value="<%= draft.name %>">
+      </div>
+      <div class="field">
+        <label class="req">公式ページURL (AI生成の参照元)</label>
+        <input type="url" id="f-official-url" value="<%= draft.official_url || '' %>" placeholder="https://...">
+      </div>
+      <div class="field" style="display:flex; gap:12px;">
+        <div style="flex:1">
+          <label>売価 (税込・円)</label>
+          <input type="number" id="f-price" min="0" step="1" value="<%= draft.price != null ? draft.price : '' %>">
+        </div>
+        <div style="flex:1">
+          <label>JANコード</label>
+          <input type="text" id="f-jan" inputmode="numeric" value="<%= draft.jan_code || '' %>">
+        </div>
+      </div>
+      <div class="field">
+        <label>画像フォルダURL (共有ドライブ。「商品コード_商品名」規則を推奨)</label>
+        <input type="url" id="f-drive-folder" value="<%= draft.drive_folder_url || '' %>" placeholder="https://drive.google.com/drive/folders/...">
+      </div>
+      <div class="field">
+        <label><input type="checkbox" id="f-has-variation" style="width:auto" <%= draft.has_variation ? 'checked' : '' %>> バリエーションあり (サイズ・色違い)</label>
+      </div>
+      <div class="field">
+        <label>メモ</label>
+        <textarea id="f-memo" rows="3"><%= draft.memo || '' %></textarea>
+      </div>
+      <button class="btn btn-primary" id="save-basic-btn">基本情報を保存</button>
+    </div>
+
+    <!-- 参考URL -->
+    <div class="card">
+      <h2>参考URL (公式ページ以外の参照元)</h2>
+      <% if (refs.length === 0) { %>
+        <p class="muted">まだありません。メーカーの商品ページや類似商品ページなど、AI が説明文を書くときに参考にする URL を追加してください。</p>
+      <% } %>
+      <ul style="list-style:none; margin:0 0 12px; padding:0;">
+        <% for (const r of refs) { %>
+          <li style="display:flex; gap:8px; align-items:center; padding:4px 0; font-size:13px;">
+            <a href="<%= r.url %>" target="_blank" rel="noopener" style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"><%= r.url %></a>
+            <button class="btn btn-sm btn-danger del-ref-btn" data-id="<%= r.id %>">削除</button>
+          </li>
+        <% } %>
+      </ul>
+      <div style="display:flex; gap:8px;">
+        <input type="url" id="new-ref-url" placeholder="https://...">
+        <button class="btn" id="add-ref-btn" style="white-space:nowrap">追加</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 画像 -->
+  <div class="card">
+    <h2>商品画像 (Driveリンク)</h2>
+    <div style="display:flex; gap:8px; margin-bottom:12px;">
+      <input type="url" id="new-image-url" placeholder="https://drive.google.com/file/d/... (画像ファイルのリンク)">
+      <button class="btn" id="add-image-btn" style="white-space:nowrap">追加</button>
+    </div>
+    <% if (images.length === 0) { %>
+      <p class="muted">まだ画像がありません。Drive で画像ファイルを右クリック →「リンクをコピー」で取得した URL を貼ってください。</p>
+    <% } else { %>
+      <div style="display:flex; gap:12px; flex-wrap:wrap;">
+        <% for (const img of images) { %>
+          <div style="text-align:center;">
+            <a href="<%= img.view_url %>" target="_blank" rel="noopener">
+              <img src="<%= img.thumb %>" alt="" loading="lazy" referrerpolicy="no-referrer"
+                   style="width:140px; height:140px; object-fit:cover; border-radius:8px; border:1px solid #e2e8f0; background:#f8fafc;">
+            </a>
+            <div><button class="btn btn-sm btn-danger del-image-btn" data-id="<%= img.id %>">削除</button></div>
+          </div>
+        <% } %>
+      </div>
+      <p class="muted" style="margin-bottom:0">※ サムネイルは Drive の閲覧権限があるアカウントでログインしたブラウザでのみ表示されます</p>
+    <% } %>
+  </div>
+
+  <!-- 仕様表 -->
+  <div class="card">
+    <h2>仕様表 (サイズ・素材・容量など。説明文と各モールのスペック欄に再利用)</h2>
+    <table class="list" style="margin-bottom:12px;">
+      <% if (specs.length > 0) { %>
+        <thead><tr><th style="width:200px">項目</th><th>値</th><th style="width:70px"></th></tr></thead>
+      <% } %>
+      <tbody>
+        <% for (const sp of specs) { %>
+          <tr>
+            <td><%= sp.spec_key %></td>
+            <td><%= sp.spec_value || '' %></td>
+            <td><button class="btn btn-sm btn-danger del-spec-btn" data-id="<%= sp.id %>">削除</button></td>
+          </tr>
+        <% } %>
+      </tbody>
+    </table>
+    <div style="display:flex; gap:8px;">
+      <input type="text" id="new-spec-key" placeholder="項目 (例: サイズ)" style="width:200px">
+      <input type="text" id="new-spec-value" placeholder="値 (例: W10×D10×H15cm)">
+      <button class="btn" id="add-spec-btn" style="white-space:nowrap">追加</button>
+    </div>
+  </div>
+
+  <!-- AI出力 -->
+  <div class="card">
+    <h2>タイトル・説明文</h2>
+    <p class="muted" style="margin-top:-6px">「生成待ち」にすると夜間バッチが AI で下書きを作ります (P2 で稼働予定)。手で書く/直すこともできます。</p>
+    <%
+      const aiLabels = {
+        rakuten_title: '楽天タイトル',
+        yahoo_title: 'Yahoo!タイトル',
+        desc_catch: 'キャッチコピー',
+        desc_features: '特徴 (箇条書き)',
+        desc_spec: '仕様 (説明文用)',
+        desc_notes: '注意書き',
+      };
+    %>
+    <% for (const kind of aiKinds) { %>
+      <div class="field">
+        <label>
+          <%= aiLabels[kind] || kind %>
+          <% if (aiOutputs[kind] && aiOutputs[kind].generated_at && !aiOutputs[kind].edited_by_human) { %>
+            <span class="badge badge-ready_for_ai" style="margin-left:6px">AI生成・未レビュー</span>
+          <% } %>
+        </label>
+        <textarea class="ai-output" data-kind="<%= kind %>" rows="<%= kind.startsWith('desc_') ? 4 : 2 %>"><%= aiOutputs[kind] ? (aiOutputs[kind].content || '') : '' %></textarea>
+      </div>
+    <% } %>
+    <button class="btn btn-primary" id="save-ai-btn">タイトル・説明文を保存</button>
+  </div>
+
+  <!-- 履歴 -->
+  <div class="card">
+    <details>
+      <summary style="cursor:pointer; font-size:14px; font-weight:600;">操作履歴 (<%= events.length %>件)</summary>
+      <table class="list" style="margin-top:10px;">
+        <tbody>
+          <% for (const ev of events) { %>
+            <tr>
+              <td class="muted" style="width:150px"><%= (ev.created_at || '').replace('T', ' ').slice(0, 19) %></td>
+              <td style="width:180px"><%= ev.event %></td>
+              <td class="muted"><%= ev.detail || '' %></td>
+              <td class="muted" style="width:180px"><%= ev.actor || '' %></td>
+            </tr>
+          <% } %>
+        </tbody>
+      </table>
+    </details>
+  </div>
+</div>
+
+<script>
+  const BASE = '/apps/product-hub/api/drafts/<%= draft.id %>';
+  const result = document.getElementById('action-result');
+
+  async function post(url, body) {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    return res.json();
+  }
+
+  function showAndReload(json, okMsg) {
+    if (json.ok) {
+      if (json.demoted) {
+        alert('必須項目が欠けたため、ステータスを「下書き」に戻しました:\n' + json.demoted.join('\n'));
+      }
+      result.textContent = okMsg;
+      setTimeout(() => location.reload(), 600);
+    } else {
+      const detail = json.reasons ? json.reasons.join(' / ') : '';
+      alert((json.error || 'エラーが発生しました') + (detail ? '\n' + detail : ''));
+    }
+  }
+
+  document.querySelectorAll('.status-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      showAndReload(await post(BASE + '/status', { to: btn.dataset.to }), 'ステータスを変更しました');
+    });
+  });
+
+  const notionRetryBtn = document.getElementById('notion-retry-btn');
+  if (notionRetryBtn) {
+    notionRetryBtn.addEventListener('click', async () => {
+      notionRetryBtn.disabled = true;
+      const json = await post(BASE + '/notion-retry');
+      showAndReload(json, 'Notionカードを作成しました');
+      if (!json.ok) notionRetryBtn.disabled = false;
+    });
+  }
+
+  document.getElementById('save-basic-btn').addEventListener('click', async () => {
+    showAndReload(await post(BASE, {
+      name: document.getElementById('f-name').value,
+      official_url: document.getElementById('f-official-url').value,
+      price: document.getElementById('f-price').value,
+      jan_code: document.getElementById('f-jan').value,
+      has_variation: document.getElementById('f-has-variation').checked,
+      drive_folder_url: document.getElementById('f-drive-folder').value,
+      memo: document.getElementById('f-memo').value,
+    }), '保存しました');
+  });
+
+  document.getElementById('add-ref-btn').addEventListener('click', async () => {
+    showAndReload(await post(BASE + '/refs', { url: document.getElementById('new-ref-url').value }), '追加しました');
+  });
+  document.querySelectorAll('.del-ref-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      showAndReload(await post(BASE + '/refs/' + btn.dataset.id + '/delete'), '削除しました');
+    });
+  });
+
+  document.getElementById('add-image-btn').addEventListener('click', async () => {
+    showAndReload(await post(BASE + '/images', { url: document.getElementById('new-image-url').value }), '追加しました');
+  });
+  document.querySelectorAll('.del-image-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      showAndReload(await post(BASE + '/images/' + btn.dataset.id + '/delete'), '削除しました');
+    });
+  });
+
+  document.getElementById('add-spec-btn').addEventListener('click', async () => {
+    showAndReload(await post(BASE + '/specs', {
+      spec_key: document.getElementById('new-spec-key').value,
+      spec_value: document.getElementById('new-spec-value').value,
+    }), '追加しました');
+  });
+  document.querySelectorAll('.del-spec-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      showAndReload(await post(BASE + '/specs/' + btn.dataset.id + '/delete'), '削除しました');
+    });
+  });
+
+  document.getElementById('save-ai-btn').addEventListener('click', async () => {
+    const areas = document.querySelectorAll('.ai-output');
+    for (const ta of areas) {
+      const json = await post(BASE + '/ai-outputs', { kind: ta.dataset.kind, content: ta.value });
+      if (!json.ok) { alert('保存失敗 (' + ta.dataset.kind + '): ' + (json.error || '')); return; }
+    }
+    result.textContent = '保存しました';
+    setTimeout(() => location.reload(), 600);
+  });
+</script>

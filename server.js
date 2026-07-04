@@ -47,6 +47,7 @@ import packingDispatchRouter, { neSyncWorkerRouter as packingDispatchNeSyncWorke
 import inventoryMonthlyRouter, { apiRouter as inventoryMonthlyApiRouter } from './apps/inventory-monthly/router.js';
 import misShipmentRouter from './apps/mis-shipment/router.js';
 import supplierSalesRouter from './apps/supplier-sales/router.js';
+import productHubRouter from './apps/product-hub/router.js';
 import supplierSalesPublicRouter from './apps/supplier-sales/public-router.js';
 import serviceRouter from './apps/warehouse/service-router.js';
 import { serviceAuth } from './apps/warehouse/service-auth.js';
@@ -386,6 +387,15 @@ const categories = [
 
 // --- アプリ一覧 ---
 const apps = [
+  {
+    id: 'product-hub',
+    name: '商品登録ハブ',
+    description: '新商品ドラフト一元管理 (Notionカード自動作成 + AI生成 + 楽天出品へ)',
+    icon: '📦',
+    path: '/apps/product-hub',
+    status: 'active',
+    category: 'product-sync',
+  },
   {
     id: 'linegift-sync',
     name: '楽天→LINEギフト同期',
@@ -997,6 +1007,7 @@ app.use('/apps/packing-dispatch', requireAppAccess('packing-dispatch'), express.
 app.use('/apps/mis-shipment', requireAppAccess('mis-shipment'), express.json({ limit: '256kb' }), misShipmentRouter);
 // 仕入れ先向け 売れ筋共有 (社内管理): 仕入先名登録・共有URL発行・プレビュー
 app.use('/apps/supplier-sales', requireAppAccess('supplier-sales'), express.json({ limit: '256kb' }), supplierSalesRouter);
+app.use('/apps/product-hub', requireAppAccess('product-hub'), productHubRouter);
 app.use('/apps/mgmt-accounting', express.json({ limit: '50mb' }), (req, res, next) => {
   // 管理系APIはセッション認証スキップ（内部で checkAuth により key/session のいずれか必須）
   const adminPaths = ['/import-historical', '/bulk-calculate', '/cleanup-invalid'];
