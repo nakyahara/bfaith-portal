@@ -60,6 +60,19 @@
           <input type="text" id="f-jan" inputmode="numeric" value="<%= draft.jan_code || '' %>">
         </div>
       </div>
+      <div class="field" style="display:flex; gap:12px;">
+        <div style="flex:1">
+          <label>ASIN</label>
+          <input type="text" id="f-asin" value="<%= draft.asin || '' %>" placeholder="B0XXXXXXXX">
+        </div>
+        <div style="flex:2">
+          <label>Amazon URL</label>
+          <input type="url" id="f-amazon-url" value="<%= draft.amazon_url || '' %>" placeholder="https://www.amazon.co.jp/dp/...">
+        </div>
+      </div>
+      <div class="field">
+        <label><input type="checkbox" id="f-own-brand" style="width:auto" <%= draft.own_brand ? 'checked' : '' %>> 自社商品 (画像制作ワークフローを使う)</label>
+      </div>
       <div class="field">
         <label>画像フォルダURL (共有ドライブ。「商品コード_商品名」規則を推奨)</label>
         <input type="url" id="f-drive-folder" value="<%= draft.drive_folder_url || '' %>" placeholder="https://drive.google.com/drive/folders/...">
@@ -92,6 +105,126 @@
         <input type="url" id="new-ref-url" placeholder="https://...">
         <button class="btn" id="add-ref-btn" style="white-space:nowrap">追加</button>
       </div>
+    </div>
+  </div>
+
+  <div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px;">
+    <!-- Yahoo!向け追記項目 -->
+    <div class="card">
+      <h2>Yahoo!向け追記項目 <span class="muted" style="font-weight:400">(楽天→Yahoo移行で使用)</span></h2>
+      <div class="field" style="display:flex; gap:12px;">
+        <div style="flex:1">
+          <label>Yahoo!売価 (税込・円)</label>
+          <input type="number" id="y-price" min="0" step="1" value="<%= yahoo && yahoo.yahoo_price != null ? yahoo.yahoo_price : '' %>">
+        </div>
+        <div style="flex:1">
+          <label>Yahoo!売価 (佐川の場合)</label>
+          <input type="number" id="y-price-sagawa" min="0" step="1" value="<%= yahoo && yahoo.yahoo_price_sagawa != null ? yahoo.yahoo_price_sagawa : '' %>">
+        </div>
+      </div>
+      <div class="field" style="display:flex; gap:12px;">
+        <div style="flex:1">
+          <label>配送方法</label>
+          <input type="text" id="y-delivery" value="<%= yahoo ? (yahoo.delivery_label || '') : '' %>" placeholder="例: ネコポス">
+        </div>
+        <div style="flex:1">
+          <label>税率</label>
+          <input type="text" id="y-tax" value="<%= yahoo ? (yahoo.tax_rate || '') : '' %>" placeholder="例: 10%">
+        </div>
+      </div>
+      <div class="field" style="display:flex; gap:12px;">
+        <div style="flex:1">
+          <label>Yahoo!カテゴリID</label>
+          <input type="number" id="y-category-id" value="<%= yahoo && yahoo.yahoo_category_id != null ? yahoo.yahoo_category_id : '' %>">
+        </div>
+        <div style="flex:2">
+          <label>Yahoo!path (店カテゴリ)</label>
+          <input type="text" id="y-path" value="<%= yahoo ? (yahoo.yahoo_path || '') : '' %>">
+        </div>
+      </div>
+      <button class="btn btn-primary" id="save-yahoo-btn">Yahoo!項目を保存</button>
+    </div>
+
+    <!-- 画像制作 (自社商品のみ) -->
+    <div class="card">
+      <h2>画像制作 <span class="muted" style="font-weight:400">(自社商品のみ)</span></h2>
+      <% if (!draft.own_brand) { %>
+        <p class="muted">基本情報で「自社商品」をONにすると、画像制作の管理項目が使えます。</p>
+      <% } else { %>
+        <% const ip = imageProduction || {}; %>
+        <div class="field" style="display:flex; gap:12px;">
+          <div style="flex:1">
+            <label>ステータス</label>
+            <input type="text" id="ip-status" list="dl-ip-status" value="<%= ip.status || '' %>">
+            <datalist id="dl-ip-status">
+              <option value="参考画像収集"><option value="A+コンテンツ作成"><option value="楽天登録">
+              <option value="AUpayマーケットに画像登録"><option value="メルカリshopsに画像登録"><option value="Qoo10登録">
+              <option value="完了">
+            </datalist>
+          </div>
+          <div style="flex:1">
+            <label>重要商品区分</label>
+            <input type="text" id="ip-tier" list="dl-ip-tier" value="<%= ip.importance_tier || '' %>">
+            <datalist id="dl-ip-tier">
+              <option value="力を入れて画像を作る（9〜12枚）"><option value="そこそこ力を入れる（6〜8枚）">
+              <option value="あまり力を入れない（4～５枚）"><option value="過去に作成した画像を参考に作る">
+            </datalist>
+          </div>
+        </div>
+        <div class="field" style="display:flex; gap:12px;">
+          <div style="flex:1">
+            <label>画像作成指示</label>
+            <input type="text" id="ip-type" list="dl-ip-type" value="<%= ip.production_type || '' %>">
+            <datalist id="dl-ip-type"><option value="画像を新規で作成"><option value="既存の他容量の画像を差替え"></datalist>
+          </div>
+          <div style="flex:1">
+            <label>A+コンテンツ</label>
+            <input type="text" id="ip-aplus" list="dl-ip-aplus" value="<%= ip.aplus_content || '' %>">
+            <datalist id="dl-ip-aplus"><option value="新規作成"><option value="既存コンテンツに追加"><option value="作成必要なし"></datalist>
+          </div>
+        </div>
+        <div class="field" style="display:flex; gap:12px;">
+          <div style="flex:1">
+            <label>撮影商品発送</label>
+            <input type="text" id="ip-shipping" list="dl-ip-shipping" value="<%= ip.shipping_status || '' %>">
+            <datalist id="dl-ip-shipping">
+              <option value="撮影依頼不要"><option value="撮影商品発送手配済み"><option value="撮影商品未発送"><option value="社内準備">
+            </datalist>
+          </div>
+          <div style="flex:1">
+            <label>参考画像・レビュー収集</label>
+            <input type="text" id="ip-refcol" list="dl-ip-refcol" value="<%= ip.reference_collection || '' %>">
+            <datalist id="dl-ip-refcol"><option value="画像レビュー新規収集"><option value="画像レビュー収集不要"></datalist>
+          </div>
+        </div>
+        <div class="field" style="display:flex; gap:12px;">
+          <div style="flex:1">
+            <label>画像作成担当者</label>
+            <input type="text" id="ip-designer" list="dl-ip-designer" value="<%= ip.designer || '' %>">
+            <datalist id="dl-ip-designer">
+              <option value="外注_大川さん"><option value="外注_三木さん"><option value="外注_成田さん"><option value="高島さん"><option value="田中さん">
+            </datalist>
+          </div>
+          <div style="flex:1">
+            <label>商品ページ構成担当者</label>
+            <input type="text" id="ip-composer" list="dl-ip-composer" value="<%= ip.page_composer || '' %>">
+            <datalist id="dl-ip-composer"><option value="田中美祐"><option value="大川さん"><option value="中原大輔"></datalist>
+          </div>
+        </div>
+        <div class="field">
+          <label>カメラ撮影指示URL</label>
+          <input type="url" id="ip-camera-url" value="<%= ip.camera_instruction_url || '' %>" placeholder="https://docs.google.com/spreadsheets/...">
+        </div>
+        <div class="field">
+          <label>A+関連商品 (ASIN等)</label>
+          <input type="text" id="ip-aplus-related" value="<%= ip.aplus_related || '' %>">
+        </div>
+        <div class="field">
+          <label>依頼文 (外注への画像作成依頼)</label>
+          <textarea id="ip-request" rows="4"><%= ip.request_text || '' %></textarea>
+        </div>
+        <button class="btn btn-primary" id="save-ip-btn">画像制作情報を保存</button>
+      <% } %>
     </div>
   </div>
 
@@ -240,11 +373,44 @@
       official_url: document.getElementById('f-official-url').value,
       price: document.getElementById('f-price').value,
       jan_code: document.getElementById('f-jan').value,
+      asin: document.getElementById('f-asin').value,
+      amazon_url: document.getElementById('f-amazon-url').value,
+      own_brand: document.getElementById('f-own-brand').checked,
       has_variation: document.getElementById('f-has-variation').checked,
       drive_folder_url: document.getElementById('f-drive-folder').value,
       memo: document.getElementById('f-memo').value,
     }), '保存しました');
   });
+
+  document.getElementById('save-yahoo-btn').addEventListener('click', async () => {
+    showAndReload(await post(BASE + '/yahoo', {
+      yahoo_price: document.getElementById('y-price').value,
+      yahoo_price_sagawa: document.getElementById('y-price-sagawa').value,
+      delivery_label: document.getElementById('y-delivery').value,
+      tax_rate: document.getElementById('y-tax').value,
+      yahoo_category_id: document.getElementById('y-category-id').value,
+      yahoo_path: document.getElementById('y-path').value,
+    }), 'Yahoo!項目を保存しました');
+  });
+
+  const saveIpBtn = document.getElementById('save-ip-btn');
+  if (saveIpBtn) {
+    saveIpBtn.addEventListener('click', async () => {
+      showAndReload(await post(BASE + '/image-production', {
+        status: document.getElementById('ip-status').value,
+        importance_tier: document.getElementById('ip-tier').value,
+        production_type: document.getElementById('ip-type').value,
+        aplus_content: document.getElementById('ip-aplus').value,
+        aplus_related: document.getElementById('ip-aplus-related').value,
+        camera_instruction_url: document.getElementById('ip-camera-url').value,
+        shipping_status: document.getElementById('ip-shipping').value,
+        reference_collection: document.getElementById('ip-refcol').value,
+        designer: document.getElementById('ip-designer').value,
+        page_composer: document.getElementById('ip-composer').value,
+        request_text: document.getElementById('ip-request').value,
+      }), '画像制作情報を保存しました');
+    });
+  }
 
   document.getElementById('add-ref-btn').addEventListener('click', async () => {
     showAndReload(await post(BASE + '/refs', { url: document.getElementById('new-ref-url').value }), '追加しました');
