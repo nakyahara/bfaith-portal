@@ -339,11 +339,18 @@ router.post('/api/drafts/:id/yahoo', (req, res) => {
   if (!draft) return;
   const db = getDB();
   const b = req.body || {};
-  const catId = b.yahoo_category_id !== undefined && b.yahoo_category_id !== '' && b.yahoo_category_id !== null
-    ? Number.parseInt(b.yahoo_category_id, 10)
-    : (b.yahoo_category_id === '' || b.yahoo_category_id === null ? null : undefined);
-  if (catId !== undefined && catId !== null && !Number.isInteger(catId)) {
-    return res.status(400).json({ ok: false, error: 'Yahoo!カテゴリIDは数値で入力してください' });
+  // カテゴリIDは識別子: 完全一致の数字のみ受理 (Codex R1 medium: parseInt は "123abc" を通す)
+  let catId;
+  if (b.yahoo_category_id === undefined) catId = undefined;
+  else if (b.yahoo_category_id === '' || b.yahoo_category_id === null) catId = null;
+  else if (/^\d+$/.test(String(b.yahoo_category_id).trim())) catId = Number.parseInt(String(b.yahoo_category_id).trim(), 10);
+  else return res.status(400).json({ ok: false, error: 'Yahoo!カテゴリIDは数値で入力してください' });
+  // 金額: 非空の不正値は既存値クリアでなく 400 (Codex R1 low)
+  for (const [key, label] of [['yahoo_price', 'Yahoo!売価'], ['yahoo_price_sagawa', 'Yahoo!売価(佐川)']]) {
+    const v = b[key];
+    if (v !== undefined && v !== null && String(v).trim() !== '' && !Number.isFinite(Number(v))) {
+      return res.status(400).json({ ok: false, error: `${label}は数値で入力してください` });
+    }
   }
   upsertDraftYahoo(db, draft.id, {
     yahoo_price: b.yahoo_price !== undefined ? sanitizeMoney(b.yahoo_price) : undefined,
@@ -473,10 +480,21 @@ serviceApiRouter.post('/drafts/:id/ai-outputs', (req, res) => {
   if (badKinds.length > 0) {
     return res.status(400).json({ ok: false, error: `invalid kinds: ${badKinds.join(', ')}` });
   }
+  // 空出力での review 遷移を防ぐ (Codex R1 high): 1件以上 + 全 content 非空を必須にする
+  const cleaned = {};
+  for (const [kind, content] of Object.entries(outputs)) {
+    const c = cleanText(content, 50000);
+    if (!c) return res.status(400).json({ ok: false, error: `outputs.${kind} が空です` });
+    cleaned[kind] = c;
+  }
+  if (Object.keys(cleaned).length === 0) {
+    return res.status(400).json({ ok: false, error: 'outputs が空です' });
+  }
+  const wantAdvance = req.body?.advance === true; // truthy でなく厳密比較 (Codex R1 high)
   const modelNote = cleanText(req.body?.model_note, 200);
 
   const write = db.transaction(() => {
-    for (const [kind, content] of Object.entries(outputs)) {
+    for (const [kind, content] of Object.entries(cleaned)) {
       db.prepare(`
         INSERT INTO draft_ai_outputs (draft_id, kind, content, generated_at, model_note, edited_by_human)
         VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?, 0)
@@ -485,17 +503,23 @@ serviceApiRouter.post('/drafts/:id/ai-outputs', (req, res) => {
           generated_at = excluded.generated_at,
           model_note = excluded.model_note,
           edited_by_human = 0
-      `).run(id, kind, cleanText(content, 50000), modelNote);
+      `).run(id, kind, content, modelNote);
     }
-    logEvent(db, id, 'ai_generated', Object.keys(outputs).join(','), 'service-api');
+    logEvent(db, id, 'ai_generated', Object.keys(cleaned).join(','), 'service-api');
+    // CAS: changes を見て実際に遷移した時だけ advanced/ログ (Codex R1 medium: 監査ログを嘘にしない)
     let advanced = false;
-    if (req.body?.advance && draft.status === 'ready_for_ai') {
-      db.prepare(`UPDATE product_drafts SET status = 'review', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ? AND status = 'ready_for_ai'`).run(id);
-      logEvent(db, id, 'status_changed', 'ready_for_ai -> review (ai_generated)', 'service-api');
-      advanced = true;
+    if (wantAdvance) {
+      const info = db.prepare(`
+        UPDATE product_drafts SET status = 'review', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ? AND status = 'ready_for_ai'
+      `).run(id);
+      if (info.changes === 1) {
+        logEvent(db, id, 'status_changed', 'ready_for_ai -> review (ai_generated)', 'service-api');
+        advanced = true;
+      }
     }
     return advanced;
   });
   const advanced = write();
-  res.json({ ok: true, written: Object.keys(outputs).length, advanced });
+  res.json({ ok: true, written: Object.keys(cleaned).length, advanced });
 });
