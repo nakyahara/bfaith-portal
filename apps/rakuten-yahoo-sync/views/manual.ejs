@@ -164,7 +164,8 @@ Yahoo!出品状況 ─(VPS)──┘
 
       <h3>安全設計</h3>
       <ul>
-        <li><strong>楽天リンク根絶 (Yahoo!規約対応)</strong>: 説明文内の自店楽天商品リンクは Yahoo!ストアの同商品リンクに自動書換、その他の楽天リンク (検索・他店・画像CDN等) は自動除去。万一楽天ドメインが残っていた場合は送信を中止します</li>
+        <li><strong>楽天リンク根絶 (Yahoo!規約対応)</strong>: 説明文内の自店楽天商品リンクは Yahoo!ストアの同商品リンクに自動書換、その他の楽天リンク (検索・他店・カテゴリページ・画像CDN等) は自動除去。万一楽天ドメインが残っていた場合は送信を中止します</li>
+        <li><strong>楽天の自動挿入パーツは移行しない</strong>: 楽天が説明文に自動で入れるカテゴリパンくず (<code>&lt;!--ECMPAN--&gt;</code>〜<code>&lt;!--/ECMPAN--&gt;</code>) は全項目で丸ごと除去します</li>
         <li><strong>重複防止</strong>: 同じ商品の二重登録は自動でブロック (再実行しても安全)</li>
         <li><strong>fail-closed</strong>: 迷ったら止まる。中途半端な状態でYahoo!に登録しない</li>
         <li><strong>本番スイッチ</strong>: 環境変数 <code>RYS_PUBLISH_ENABLED=0</code> にすると全出品を止められます (緊急用)</li>
