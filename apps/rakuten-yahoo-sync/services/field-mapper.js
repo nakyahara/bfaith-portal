@@ -202,5 +202,14 @@ export function buildYahooEditItemFields({
   // display は readiness pass 後に caller が 1 に上げる
   fields.display = 0;
 
+  // ── 最終処理 (R15 2026-07-04 中原さん指示): ヤフオク併売時の PC用フリースペース1 必須対応 ──
+  //   Yahoo!ショッピングで商品状態「新品：Yahoo!オークション併売」(= auc_* を送る通常品) は
+  //   「PC用フリースペース1」(additional1) が必須。 空欄なら商品説明 (caption) と同じ内容を入れる。
+  //   ※中原さん指示により、 他の全 field 組み立てが終わった一番最後に適用する。
+  const isAucCrossListing = fields.auc_bcid !== undefined;
+  if (isAucCrossListing && (!fields.additional1 || String(fields.additional1).trim() === '')) {
+    fields.additional1 = fields.caption || fields.explanation || '';
+  }
+
   return fields;
 }

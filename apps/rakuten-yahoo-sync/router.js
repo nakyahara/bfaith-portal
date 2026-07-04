@@ -527,6 +527,11 @@ router.get('/category-binding', (_req, res) => {
   renderView(res, 'category-binding', {});
 });
 
+// R15: アプリ内マニュアル (操作編 + 仕組み編)
+router.get('/manual', (_req, res) => {
+  renderView(res, 'manual', {});
+});
+
 // ───────────────── API ─────────────────
 
 router.get('/api/health', (_req, res) => {

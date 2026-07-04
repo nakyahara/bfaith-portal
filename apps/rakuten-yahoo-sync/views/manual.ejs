@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>マニュアル | Yahoo商品移行</title>
+  <link rel="icon" type="image/png" href="/favicon.png"><link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+  <style>
+    body { background: #f5f5f7; }
+    .doc { background:#fff; border-radius:.75rem; padding:1.5rem 2rem; margin-bottom:1.25rem; }
+    .doc h2 { font-size:1.3rem; border-bottom:2px solid #0d6efd; padding-bottom:.4rem; margin-bottom:1rem; }
+    .doc h3 { font-size:1.05rem; margin-top:1.4rem; color:#0a58ca; }
+    .doc table { font-size:.92rem; }
+    .doc code { background:#f1f3f5; padding:.1em .4em; border-radius:.3em; }
+    .step-badge { background:#0d6efd; color:#fff; border-radius:.4em; padding:.1em .6em; font-weight:700; font-size:.85em; }
+    .toc a { text-decoration:none; }
+    .note { background:#fff8e1; border-left:4px solid #ffb300; padding:.6em .9em; border-radius:.3em; margin:.6em 0; font-size:.92rem; }
+    .flow { background:#f8f9fb; border:1px solid #e3e8ef; border-radius:.5em; padding:.8em 1em; font-size:.9rem; overflow-x:auto; white-space:pre; font-family:monospace; }
+  </style>
+</head>
+<body>
+  <nav class="navbar navbar-dark bg-primary mb-3">
+    <div class="container-fluid">
+      <span class="navbar-brand">📖 楽天→Yahoo!商品移行 マニュアル</span>
+      <a href="/apps/rakuten-yahoo-sync/" class="btn btn-sm btn-outline-light">← 商品移行に戻る</a>
+    </div>
+  </nav>
+
+  <div class="container" style="max-width:960px;">
+
+    <div class="doc toc">
+      <strong>目次</strong>
+      <ol class="mb-0">
+        <li><a href="#about">このアプリは何をするか</a></li>
+        <li><a href="#daily">毎日の使い方 (操作編)</a></li>
+        <li><a href="#binding">カテゴリ紐付け画面の使い方</a></li>
+        <li><a href="#errors">エラーが出たとき</a></li>
+        <li><a href="#system">裏側の仕組み (仕組み編)</a></li>
+        <li><a href="#maintenance">定期メンテナンス</a></li>
+      </ol>
+    </div>
+
+    <div class="doc" id="about">
+      <h2>1. このアプリは何をするか</h2>
+      <p>楽天市場に出品している商品を、<strong>Yahoo!ショッピングにも自動で出品する</strong>ためのツールです。</p>
+      <ul>
+        <li>楽天に出した新商品を<strong>毎朝自動で検知</strong>して出品候補に載せます</li>
+        <li>商品名・価格・画像・説明文・カテゴリ・バリエーションを<strong>楽天とNotionから自動で組み立て</strong>ます</li>
+        <li>人がやるのは「<strong>要対応の解消</strong>」と「<strong>出せる商品の一括出品ボタン</strong>」だけです</li>
+        <li>在庫と受注の連携はこのアプリの範囲外です (ネクストエンジンが担当)</li>
+      </ul>
+    </div>
+
+    <div class="doc" id="daily">
+      <h2>2. 毎日の使い方 (操作編)</h2>
+
+      <h3><span class="step-badge">STEP 1</span> データを最新にする</h3>
+      <p>毎朝7:30に自動で実行されます (「全部更新」)。今すぐ最新にしたいときだけ <strong>「🔄 全部更新」ボタン</strong>を押してください (10分前後、待たずに他の作業をしてOK)。</p>
+      <p>全部更新が終わると、全商品が「出せる」「修正必要」に正しく仕分けられた状態になります。<strong>「出せる」に残っている商品はそのまま出品できます</strong>。</p>
+
+      <h3><span class="step-badge">STEP 2</span> 要対応を解消する</h3>
+      <table class="table table-bordered">
+        <thead><tr><th>表示される理由</th><th>やること</th></tr></thead>
+        <tbody>
+          <tr><td>カテゴリ/店の棚が未設定</td><td><strong>「🏷️ カテゴリを紐付ける」</strong>画面へ (→ 3章)</td></tr>
+          <tr><td>Yahoo!タイトル/売価/配送/税率が未入力</td><td>商品カードの<strong>「📝 Notion で修正」</strong>でNotionを開いて入力 (Notionアプリが直接開きます)</td></tr>
+          <tr><td>楽天側のデータ不備 (画像・バリエーション等)</td><td>表示された案内に従って<strong>楽天RMS側</strong>を修正 → 次の全部更新で解消</td></tr>
+        </tbody>
+      </table>
+
+      <h3><span class="step-badge">STEP 3</span> 出せる商品を出品する</h3>
+      <ol>
+        <li>「🚀 出せる商品を見る」→ 「☑ 一括選択モード」→「すべて選択」</li>
+        <li>「選択した N 商品を一括登録」→ 進捗が表示され、1商品ずつ順に登録されます</li>
+        <li>失敗した商品は<strong>赤字で理由</strong>が出て「修正必要」に移ります。成功分はそのまま「移行済み」へ</li>
+      </ol>
+      <div class="note">💡 同じ商品を2回登録しようとしても自動で重複防止されるので、失敗後の再実行は安全です。</div>
+    </div>
+
+    <div class="doc" id="binding">
+      <h2>3. カテゴリ紐付け画面の使い方</h2>
+      <p>楽天のカテゴリとYahoo!のカテゴリの対応を1回教えると、同じカテゴリの商品は以後すべて自動で解決されます。</p>
+      <h3>各カテゴリのチェックリストの ❌ を埋めるだけ</h3>
+      <ul>
+        <li><strong>Yahoo!カテゴリID</strong> を選ぶ方法は3つ (どれでも同じ):
+          <ol>
+            <li><strong>AI候補をクリック</strong> — AIが用意した候補top3 (一番速い)</li>
+            <li><strong>🔍 検索</strong> — キーワードでYahoo!の全カテゴリ約12,000件から探す</li>
+            <li><strong>📂 階層をたどって選ぶ</strong> — 「食品 › 麺類、パスタ › …」と絞り込む</li>
+          </ol>
+        </li>
+        <li><strong>店の棚 (path)</strong> は:
+          <ul>
+            <li>過去に使った棚なら<strong>自動で入ります</strong></li>
+            <li>入らないときは「📂 実績のある棚から選ぶ」か「🏬 楽天カテゴリに合わせる」をクリック</li>
+          </ul>
+        </li>
+        <li>「保存」→ <strong>緑の完了パネル</strong>が出れば完了。そのカテゴリの全商品が次の一覧更新で「出せる」候補に動きます</li>
+      </ul>
+      <div class="note">💡 店の棚 = Yahoo!ストア上の陳列棚 (楽天カテゴリと同じ構成で運用)。Yahoo!側にまだ無い棚を指定すると出品時にエラーで教えてくれるので、そのときはストアクリエイターProで棚を作ってください。</div>
+    </div>
+
+    <div class="doc" id="errors">
+      <h2>4. エラーが出たとき</h2>
+      <table class="table table-bordered">
+        <thead><tr><th>エラー</th><th>意味と対処</th></tr></thead>
+        <tbody>
+          <tr><td>出品条件チェックで止まりました (＋赤字の理由)</td><td>商品ごとの不備。赤字の理由に従って Notion か楽天RMSを修正</td></tr>
+          <tr><td><code>Yahoo応答: it-xxxxx …</code></td><td>Yahoo!が登録を拒否した理由がそのまま表示されます。意味が分からなければ Claude にそのまま貼って相談</td></tr>
+          <tr><td><code>invalid_grant - refresh token has expired</code></td><td><strong>Yahoo!の認証が失効</strong> (28日ごとに発生する仕様)。Claude に「Yahooトークンの再認可して」と依頼 → 認可URLが来るのでブラウザで許可 → code を貼る (2〜3分で完了)</td></tr>
+          <tr><td>全部更新が途中で失敗</td><td>失敗ステップとエラーが表示されます。もう一度「全部更新」を押せば続きから相当の処理をやり直します</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="doc" id="system">
+      <h2>5. 裏側の仕組み (仕組み編)</h2>
+
+      <h3>データの流れ</h3>
+      <div class="flow">楽天RMS ──(miniPC経由)──┐
+Notion商品マスター ────┼──▶ このアプリ (Render) ──(VPS経由)──▶ Yahoo!ショッピング
+Yahoo!出品状況 ─(VPS)──┘
+※楽天・Yahoo!のAPIキーはこのアプリには置かず、miniPC/VPSが仲介します (セキュリティ設計)</div>
+
+      <h3>「全部更新」パイプライン (毎朝7:30 自動 / 手動ボタン)</h3>
+      <ol>
+        <li><strong>差分再取得</strong> — Yahoo!の出品一覧と楽天の商品一覧を突き合わせ、「楽天にあってYahoo!に無い商品」を候補化</li>
+        <li><strong>楽天情報の補完</strong> — 商品名・楽天カテゴリの取りこぼしを埋める</li>
+        <li><strong>Notionページ自動作成</strong> — Notion商品マスターに無い商品のページを新規作成</li>
+        <li><strong>Notion下書き補完</strong> — Yahoo!タイトル/売価/税率の空欄を楽天の値で下書き (人が確認・修正できる)</li>
+        <li><strong>Notion取込</strong> — Notionの確定値をアプリに取り込む</li>
+        <li><strong>出品前チェック</strong> — 全商品に出品時と同じ実データ検査を実行し、「出せる/修正必要」を確定</li>
+      </ol>
+      <p>途中で失敗すると安全のためそこで停止し (fail-closed)、失敗ステップを表示します。各ステップは「不足分だけ処理する」ので再実行で続きから進みます。</p>
+
+      <h3>カテゴリの自動解決 (優先順位)</h3>
+      <ol>
+        <li><strong>Notionの値</strong> (人が明示指定したもの)</li>
+        <li><strong>紐付け画面で保存した値</strong> (人手確定)</li>
+        <li><strong>実績からの学習値</strong> (過去の出品実績)</li>
+        <li><strong>AIの初期紐づけ</strong> — 楽天カテゴリ3,551件×Yahoo!カテゴリ12,044件をAIが照合済み (2,206件を自動確定、自信のないものは候補として紐付け画面に提示)</li>
+        <li>どれも無ければ「未解決」→ 紐付け画面に出る</li>
+      </ol>
+      <p>人手・実績は常にAIより優先されます。AIの値もYahoo!公式カテゴリマスタに実在するものだけ採用されます。</p>
+
+      <h3>出品前チェック (11項目)</h3>
+      <p>タイトル / カテゴリ / 店の棚 / 売価 / 配送方法 / 税率 (楽天との整合含む) / 画像 / バリエーション整合 / 配送日数 ほか。1つでも欠けると出品せず理由付きで止まります (誤登録防止)。</p>
+
+      <h3>バリエーション商品の自動構築</h3>
+      <ul>
+        <li>項目名 (例: 香り) ← 楽天のバリエーション項目</li>
+        <li>選択肢 ← 各SKUの選択肢値</li>
+        <li>バリエーションコード ← 楽天の<strong>システム連携用SKU番号そのまま</strong></li>
+        <li>商品状態は常に「新品」。ヤフオク併売設定の商品は「PC用フリースペース1」が必須のため、空欄なら商品説明と同じ内容を自動で入れます</li>
+      </ul>
+
+      <h3>画像</h3>
+      <ul>
+        <li>商品画像: メイン1枚+サブ20枚の計21枚まで (Yahoo!仕様)。JPEG変換・2MB以下に自動圧縮</li>
+        <li>説明文内の画像: 20枚まで別枠でアップロード</li>
+        <li>クーポン/レビュー系のバナー画像は自動除外 (「画像除外パターン」で追加可能)</li>
+      </ul>
+
+      <h3>安全設計</h3>
+      <ul>
+        <li><strong>重複防止</strong>: 同じ商品の二重登録は自動でブロック (再実行しても安全)</li>
+        <li><strong>fail-closed</strong>: 迷ったら止まる。中途半端な状態でYahoo!に登録しない</li>
+        <li><strong>本番スイッチ</strong>: 環境変数 <code>RYS_PUBLISH_ENABLED=0</code> にすると全出品を止められます (緊急用)</li>
+      </ul>
+    </div>
+
+    <div class="doc" id="maintenance">
+      <h2>6. 定期メンテナンス</h2>
+      <table class="table table-bordered">
+        <thead><tr><th>頻度</th><th>作業</th><th>やり方</th></tr></thead>
+        <tbody>
+          <tr><td><strong>月1回</strong> (28日ごと)</td><td>Yahoo!認証の再認可</td><td>出品が <code>invalid_grant</code> で失敗したら Claude に依頼 → 認可URLをブラウザで開いて許可 → code を貼る</td></tr>
+          <tr><td>随時</td><td>新カテゴリの紐付け</td><td>「修正必要」にカテゴリ未設定が出たら紐付け画面で選ぶ (1カテゴリ1回だけ)</td></tr>
+          <tr><td>不要</td><td>日次のデータ更新</td><td>毎朝7:30に自動 (環境変数 <code>RYS_AUTO_REFRESH=1</code> で有効)</td></tr>
+        </tbody>
+      </table>
+      <p class="text-muted small mb-0">開発者向けの詳細設計は AI_reference『システム設計/RakutenYahooSync_再設計要件定義_20260702.md』『同_再設計実装_引き継ぎ_20260702.md』を参照。</p>
+    </div>
+
+  </div>
+</body>
+</html>
