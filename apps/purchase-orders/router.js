@@ -115,6 +115,11 @@ function resolveSupplierName(supplierCode) {
   return (s && s.name) || `仕入先 ${supplierCode}`;
 }
 
+function insertItems(db, orderId, items) {
+  const ins = db.prepare('INSERT INTO po_order_items (order_id, product_code, product_key, product_name, qty, unit_cost) VALUES (?,?,?,?,?,?)');
+  for (const it of items) ins.run(orderId, it.code, it.key, it.name, it.qty, it.cost);
+}
+
 function upsertDraft(supplierCode, supplierName, rawItems, note) {
   const db = getDB();
   const { items, pmlAsOf } = enrichItems(rawItems, supplierCode);
@@ -131,9 +136,27 @@ function upsertDraft(supplierCode, supplierName, rawItems, note) {
         .run(note || null, pmlAsOf, now, supplierName, order.id);
     }
     db.prepare('DELETE FROM po_order_items WHERE order_id=?').run(order.id);
-    const ins = db.prepare('INSERT INTO po_order_items (order_id, product_code, product_key, product_name, qty, unit_cost) VALUES (?,?,?,?,?,?)');
-    for (const it of items) ins.run(order.id, it.code, it.key, it.name, it.qty, it.cost);
+    insertItems(db, order.id, items);
     return order.id;
+  })();
+}
+
+/**
+ * 発注確定 (Codex R2 High): draft を mutate せず issued order を新規 insert し、
+ * 既存 draft の削除まで1トランザクションで行う。並行する draft 更新と混ざらない。
+ */
+function issueOrder(supplierCode, supplierName, rawItems, note) {
+  const db = getDB();
+  const { items, pmlAsOf } = enrichItems(rawItems, supplierCode);
+  const now = nowIso();
+  return db.transaction(() => {
+    const info = db.prepare(
+      "INSERT INTO po_orders (supplier_code, supplier_name, status, note, pml_as_of_date, created_at, updated_at, issued_at) VALUES (?,?,'issued',?,?,?,?,?)"
+    ).run(supplierCode, supplierName, note || null, pmlAsOf, now, now, now);
+    const id = Number(info.lastInsertRowid);
+    insertItems(db, id, items);
+    db.prepare("DELETE FROM po_orders WHERE supplier_code=? AND status='draft'").run(supplierCode);
+    return id;
   })();
 }
 
@@ -158,7 +181,7 @@ function productDto(p) {
 }
 
 function supplierWorkspaceData(code) {
-  const { pub, bySupplier, masters } = computeAll();
+  const { pub, products, bySupplier, masters } = computeAll();
   const g = bySupplier.get(code);
   const sm = masters.suppliers.get(code);
   if (!g && !sm) return null;
@@ -166,9 +189,22 @@ function supplierWorkspaceData(code) {
   const draftRow = db.prepare("SELECT id, note FROM po_orders WHERE supplier_code=? AND status='draft'").get(code);
   const draft = draftRow ? {
     id: draftRow.id, note: draftRow.note || '',
-    items: db.prepare('SELECT product_code AS code, qty FROM po_order_items WHERE order_id=? ORDER BY id').all(draftRow.id),
+    items: db.prepare('SELECT product_code AS code, product_key AS key, product_name AS name, qty, unit_cost AS cost FROM po_order_items WHERE order_id=? ORDER BY id').all(draftRow.id),
   } : null;
   const all = g ? [...g.targets, ...g.candidates, ...g.horikoshi] : [];
+  // draft 明細のうち現在の表示リスト外の商品 (PML更新で対象外化・取扱中止化した等) も
+  // 黙って落とさず「リスト外」として返す (Codex R2 Medium)
+  let draftExtras = [];
+  if (draft) {
+    const listKeys = new Set(all.map(p => p.key));
+    const byKey = new Map(products.map(p => [p.key, p]));
+    draftExtras = draft.items.filter(it => !listKeys.has(it.key)).map(it => {
+      const p = byKey.get(it.key);
+      return p
+        ? { ...productDto(p), extra: true }
+        : { code: it.code, name: it.name || '', cost: it.cost, stock: null, backOrder: null, sales30: null, sales7: null, lot: null, stockMonths: null, recQty: null, extra: true, missing: true };
+    });
+  }
   const memberOf = (fieldVal, field) => all.filter(p => p[field] === fieldVal).map(p => p.code);
   const condIds = new Set(all.map(p => p.conditionId).filter(Boolean));
   const conditions = masters.conditions
@@ -193,7 +229,7 @@ function supplierWorkspaceData(code) {
     targets: g ? g.targets.map(productDto) : [],
     candidates: g ? g.candidates.map(productDto) : [],
     horikoshi: g ? g.horikoshi.map(productDto) : [],
-    conditions, materialGroups, draft,
+    conditions, materialGroups, draft, draftExtras,
   };
 }
 
@@ -246,10 +282,7 @@ router.post('/api/supplier/:code/issue', (req, res) => {
     const code = normSupplierCode(req.params.code);
     const { items, note } = req.body || {};
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ ok: false, error: '発注明細が空です' });
-    const db = getDB();
-    const id = upsertDraft(code, resolveSupplierName(code), items, trimS(note));
-    const now = nowIso();
-    db.prepare("UPDATE po_orders SET status='issued', issued_at=?, updated_at=? WHERE id=?").run(now, now, id);
+    const id = issueOrder(code, resolveSupplierName(code), items, trimS(note));
     res.json({ ok: true, id });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
@@ -428,19 +461,31 @@ router.post('/api/masters/:kind/csv', upload.single('file'), (req, res) => {
         }
       }
     }
+    // fail-closed (Codex R2 Medium): 1行でも検証エラーがあれば全件 rollback (マスタの部分反映を防ぐ)
     const db = getDB();
     let upserted = 0; const errors = [];
-    db.transaction(() => {
-      for (let i = 1; i < rows.length; i++) {
-        const row = def.fromCsv(rows[i]);
-        const err = def.validate(row);
-        if (err) { errors.push(`行${i + 1}: ${err}`); continue; }
-        upsertMasterRow(def, row);
-        upserted++;
+    try {
+      db.transaction(() => {
+        for (let i = 1; i < rows.length; i++) {
+          const row = def.fromCsv(rows[i]);
+          const err = def.validate(row);
+          if (err) { errors.push(`行${i + 1}: ${err}`); continue; }
+          upsertMasterRow(def, row);
+          upserted++;
+        }
+        if (errors.length > 0) throw new Error('validation');
+      })();
+    } catch (e) {
+      if (errors.length > 0) {
+        return res.status(400).json({
+          ok: false,
+          error: `検証エラー ${errors.length} 件のため全件取り込みを中止しました (1件も反映していません)`,
+          errors: errors.slice(0, 20),
+        });
       }
-      if (errors.length > 20) throw new Error(`エラー多数のため全件中止 (${errors.length}件)。例: ${errors.slice(0, 3).join(' / ')}`);
-    })();
-    res.json({ ok: true, upserted, skipped: errors.length, errors: errors.slice(0, 10) });
+      throw e;
+    }
+    res.json({ ok: true, upserted });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
@@ -640,7 +685,7 @@ router.get('/supplier/:code', (req, res) => {
 var D = ${jsonEmbed(data)};
 var CART = {}; // code -> qty
 var byCode = {};
-[].concat(D.targets, D.candidates, D.horikoshi).forEach(function(p){ byCode[p.code] = p; });
+[].concat(D.targets, D.candidates, D.horikoshi, D.draftExtras || []).forEach(function(p){ byCode[p.code] = p; });
 
 // 初期カート: draft があれば復元、なければ要発注全件を推奨量で
 if (D.draft && D.draft.items.length) {
@@ -749,7 +794,8 @@ function renderCart() {
     items.forEach(function(i) {
       var p = byCode[i.code];
       totQ += i.qty; totA += i.qty * (p.cost || 0);
-      h += '<tr><td>' + esc(String(p.name || '').slice(0, 60)) + '</td><td class="r">' + i.qty.toLocaleString('ja-JP') + '</td><td class="r">' + (p.cost ? yen(i.qty * p.cost) : '—') + '</td>' +
+      var extraBadge = p.extra ? ' <span class="badge b-warn" title="現在の要発注/候補リストに出てこない商品 (下書き保存後にPMLが更新された等)。確定エラーになる場合は ✕ で外してください">リスト外</span>' : '';
+      h += '<tr><td>' + esc(String(p.name || '').slice(0, 60)) + extraBadge + '</td><td class="r">' + i.qty.toLocaleString('ja-JP') + '</td><td class="r">' + (p.cost ? yen(i.qty * p.cost) : '—') + '</td>' +
         '<td><button class="ghost" data-del="' + esc(i.code) + '">✕</button></td></tr>';
     });
     h += '</table>';
@@ -919,8 +965,12 @@ function render(rows) {
     var fd = new FormData(ev.target);
     fetch('/apps/purchase-orders/api/masters/' + TAB + '/csv', { method: 'POST', body: fd })
       .then(function(r){ return r.json(); }).then(function(j) {
-        if (!j.ok) { toast('取込エラー: ' + j.error); return; }
-        toast('取込完了: ' + j.upserted + '件' + (j.skipped ? ' (スキップ' + j.skipped + '件)' : ''));
+        if (!j.ok) {
+          var detail = (j.errors && j.errors.length) ? '\\n\\n' + j.errors.join('\\n') : '';
+          alert('取込エラー: ' + j.error + detail);
+          return;
+        }
+        toast('取込完了: ' + j.upserted + '件');
         load();
       });
   });

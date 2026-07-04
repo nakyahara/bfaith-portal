@@ -126,9 +126,11 @@ export function loadRecentIssued(issuedDays = 14) {
  * 戻り値の products は PML 全行の computeProduct 結果 (attrs 情報を付与済み)。
  */
 export function computeAll() {
-  const { pub, rows } = loadPml();
-  const masters = loadMasters();
-  const recentIssued = loadRecentIssued();
+  // PML・マスタ・直近発注を1つの read transaction で読む (途中の書き込みと混在させない、Codex R2 Low)
+  const db = getDB();
+  const { pub, rows, masters, recentIssued } = db.transaction(() => ({
+    ...loadPml(), masters: loadMasters(), recentIssued: loadRecentIssued(),
+  }))();
   const products = [];
   const bySupplier = new Map();
   for (const r of rows) {
