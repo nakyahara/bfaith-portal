@@ -186,6 +186,42 @@ ok(cond && cond.memberCodes.includes('noflyersticker'), 'リスト外明細も�
 db.prepare(`UPDATE mirror_pml_snapshot_rows SET 取扱区分='取扱中' WHERE 商品コード='noflyersticker'`).run();
 await j('/api/supplier/1/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ items: [] }) });
 
+console.log('── NEオーバーレイ (手動CSV) ──');
+// NE商品マスタCSV (実ヘッダー準拠)。noflyersticker: 在庫100 / 注残50 に更新 → 総在庫_引当なし=100+FBA(20)=120
+db.prepare(`UPDATE mirror_pml_snapshot_rows SET FBA在庫数=20 WHERE 商品コード='noflyersticker'`).run();
+const neCsv = '"商品コード","商品名","仕入先コード","原価","売価","取扱区分","代表商品コード","ロケーションコード","配送業者","発注ロット単位","最終仕入日","商品分類タグ","作成日","在庫数","引当数","最終更新日","消費税率（%）","発注残数"\r\n' +
+  '"noflyersticker","チラシ お断り","0001","75.00","380.00","取扱中","","","","100","2026-07-04 12:00:00","","2020-05-24","100","0","2026-07-04 15:00:00","10","50"\r\n' +
+  '"unknown-in-ne","NEにしかない商品","0001","100.00","500.00","取扱中","","","","10","","","2026-01-01","5","0","2026-07-04","10","0"\r\n';
+const fdNe = new FormData();
+fdNe.append('file', new Blob([neCsv], { type: 'text/csv' }), 'nedldata.csv');
+r = await j('/api/ne-overlay/csv', { method: 'POST', body: fdNe });
+ok(r.status === 200 && r.body.rowCount === 2, 'NE CSV取込 2件', r.body);
+r = await j('/api/supplier/1');
+ok(r.body.overlay && r.body.overlay.applied === true, 'overlay 適用中フラグ');
+const noflyOv = [...r.body.targets, ...r.body.candidates, ...r.body.horikoshi].find(p => p.code === 'noflyersticker');
+ok(noflyOv && noflyOv.stock === 120 && noflyOv.backOrder === 50, 'overlay: 在庫=NE100+FBA20, 注残=50', noflyOv && { stock: noflyOv.stock, back: noflyOv.backOrder });
+ok(noflyOv && noflyOv.cost === 75, 'overlay: 原価も最新化 (70→75)', noflyOv && noflyOv.cost);
+// L=(120+50)/368=0.46 → 発注対象のまま、推奨量再計算 = ROUND((2.5-0.4620)*368/100)*100 = 800
+ok(noflyOv && noflyOv.recQty === 800, 'overlay: 推奨発注量が再計算される (800)', noflyOv && noflyOv.recQty);
+// 朝同期の方が新しい場合は自動で無視
+db.prepare(`UPDATE mirror_pml_published SET src_ne_products_synced_at=? WHERE id=1`).run(new Date(Date.now() + 3600000).toISOString());
+r = await j('/api/supplier/1');
+ok(r.body.overlay && r.body.overlay.applied === false, '朝同期が新しければ overlay 無視');
+db.prepare(`UPDATE mirror_pml_published SET src_ne_products_synced_at=NULL WHERE id=1`).run();
+// 解除
+r = await j('/api/ne-overlay', { method: 'DELETE' });
+ok(r.status === 200, 'overlay 解除');
+r = await j('/api/supplier/1');
+ok(r.body.overlay === null, '解除後 overlay なし');
+const noflyBack = [...r.body.targets, ...r.body.candidates, ...r.body.horikoshi].find(p => p.code === 'noflyersticker');
+ok(noflyBack && noflyBack.backOrder === 0, '解除後は PML の値に戻る', noflyBack && noflyBack.backOrder);
+// 見出し不正CSV
+const badNe = new FormData();
+badNe.append('file', new Blob(['foo,bar\r\n1,2\r\n']), 'bad.csv');
+r = await j('/api/ne-overlay/csv', { method: 'POST', body: badNe });
+ok(r.status === 400, 'NE CSV見出し不正は 400');
+db.prepare(`UPDATE mirror_pml_snapshot_rows SET FBA在庫数=NULL WHERE 商品コード='noflyersticker'`).run();
+
 console.log('── 画面 (HTML) ──');
 for (const p of ['/', '/supplier/1', '/orders', '/admin']) {
   const res = await fetch(base + p);

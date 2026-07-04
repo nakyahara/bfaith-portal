@@ -17,7 +17,7 @@ import { getDB, normSupplierCode, normProductCode } from './db.js';
 
 const PML_COLS = [
   '商品コード', '商品名', '仕入先', '取扱区分', '売上分類',
-  '総在庫数_引当なし', '注残数', '販売数7日_合計', '販売数30日_合計',
+  '総在庫数_引当なし', 'FBA在庫数', '注残数', '販売数7日_合計', '販売数30日_合計',
   '発注ロット単位', '推奨保有月数', '売価', '原価', '最終仕入日',
 ];
 
@@ -87,6 +87,60 @@ export function loadPml() {
   })();
 }
 
+/** NE商品マスタCSVオーバーレイをロード */
+export function loadNeOverlay() {
+  const db = getDB();
+  const meta = db.prepare('SELECT * FROM po_ne_overlay_meta WHERE id=1').get() || null;
+  const rows = new Map();
+  if (meta) {
+    for (const r of db.prepare('SELECT * FROM po_ne_overlay_rows').all()) rows.set(r.product_key, r);
+  }
+  return { meta, rows };
+}
+
+/**
+ * published PML に NEオーバーレイ (日中手動DLのNE商品マスタCSV) をマージして返す。
+ * 上書き対象: 取扱区分 / 仕入先 / 原価 / 売価 / 発注ロット単位 / 最終仕入日 / 注残数(=NE発注残数) /
+ *             総在庫数_引当なし (= NE在庫数 + PML.FBA在庫数)
+ * 据え置き: FBA在庫数・販売数・推奨保有月数 (PMLのまま)。
+ * overlay が朝のNE同期より古い場合は自動で無視する (applied=false)。
+ */
+export function loadPmlMerged() {
+  const db = getDB();
+  return db.transaction(() => {
+    const { pub, rows } = loadPml();
+    const ov = loadNeOverlay();
+    let overlay = null;
+    let applied = false;
+    if (ov.meta) {
+      applied = true;
+      if (pub && pub.src_ne_products_synced_at) {
+        const a = Date.parse(ov.meta.uploaded_at);
+        const b = Date.parse(pub.src_ne_products_synced_at);
+        if (!Number.isNaN(a) && !Number.isNaN(b) && a < b) applied = false; // 朝同期の方が新しい
+      }
+      overlay = { uploaded_at: ov.meta.uploaded_at, row_count: ov.meta.row_count, filename: ov.meta.filename, applied, mergedCount: 0 };
+    }
+    const merged = !applied ? rows : rows.map(r => {
+      const o = ov.rows.get(normProductCode(r['商品コード']));
+      if (!o) return r;
+      overlay.mergedCount++;
+      return {
+        ...r,
+        '取扱区分': o.取扱区分 != null && o.取扱区分 !== '' ? o.取扱区分 : r['取扱区分'],
+        '仕入先': o.仕入先コード != null && o.仕入先コード !== '' ? o.仕入先コード : r['仕入先'],
+        '原価': o.原価 != null ? o.原価 : r['原価'],
+        '売価': o.売価 != null ? o.売価 : r['売価'],
+        '発注ロット単位': o.発注ロット単位 != null ? o.発注ロット単位 : r['発注ロット単位'],
+        '最終仕入日': o.最終仕入日 != null && o.最終仕入日 !== '' ? o.最終仕入日 : r['最終仕入日'],
+        '注残数': o.発注残数 != null ? o.発注残数 : r['注残数'],
+        '総在庫数_引当なし': o.在庫数 != null ? o.在庫数 + num(r['FBA在庫数']) : r['総在庫数_引当なし'],
+      };
+    });
+    return { pub, rows: merged, overlay };
+  })();
+}
+
 /** マスタ一式をロード */
 export function loadMasters() {
   const db = getDB();
@@ -126,10 +180,10 @@ export function loadRecentIssued(issuedDays = 14) {
  * 戻り値の products は PML 全行の computeProduct 結果 (attrs 情報を付与済み)。
  */
 export function computeAll() {
-  // PML・マスタ・直近発注を1つの read transaction で読む (途中の書き込みと混在させない、Codex R2 Low)
+  // PML(+NEオーバーレイ)・マスタ・直近発注を1つの read transaction で読む (途中の書き込みと混在させない、Codex R2 Low)
   const db = getDB();
-  const { pub, rows, masters, recentIssued } = db.transaction(() => ({
-    ...loadPml(), masters: loadMasters(), recentIssued: loadRecentIssued(),
+  const { pub, rows, overlay, masters, recentIssued } = db.transaction(() => ({
+    ...loadPmlMerged(), masters: loadMasters(), recentIssued: loadRecentIssued(),
   }))();
   const products = [];
   const bySupplier = new Map();
@@ -165,7 +219,7 @@ export function computeAll() {
     g.horikoshi.sort((a, b) => (b.lastPurchase || '').localeCompare(a.lastPurchase || ''));
     g.estAmount = Math.round(g.targets.reduce((s, p) => s + (p.recQty || 0) * p.cost, 0));
   }
-  return { pub, products, bySupplier, masters };
+  return { pub, overlay, products, bySupplier, masters };
 }
 
 /**

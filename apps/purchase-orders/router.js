@@ -18,7 +18,31 @@ import fs from 'fs';
 import multer from 'multer';
 import iconv from 'iconv-lite';
 import { getDB, normSupplierCode, normProductCode } from './db.js';
-import { computeAll, loadPml, loadMasters, evaluateCondition } from './logic.js';
+import { computeAll, loadPmlMerged, loadMasters, evaluateCondition } from './logic.js';
+
+// ─── miniPC (WarehouseServer) service-api 呼び出し (オンデマンドFBA更新、product-management-list と同一エンドポイント) ───
+const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
+function getServiceHeaders() {
+  return {
+    'CF-Access-Client-Id': process.env.CF_ACCESS_CLIENT_ID || '',
+    'CF-Access-Client-Secret': process.env.CF_ACCESS_CLIENT_SECRET || '',
+    'Authorization': `Bearer ${process.env.WAREHOUSE_SERVICE_TOKEN || ''}`,
+    'Content-Type': 'application/json',
+  };
+}
+async function callWarehouse(fullPath, { method = 'GET', timeout = 30000 } = {}) {
+  const requestId = `po-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const res = await fetch(`${WAREHOUSE_URL}${fullPath}`, {
+    method, headers: { ...getServiceHeaders(), 'x-request-id': requestId },
+    redirect: 'manual', signal: AbortSignal.timeout(timeout),
+  });
+  if (res.status === 302 || res.status === 303) throw new Error(`CF Access認証構成異常 (${res.status})`);
+  if (res.status === 401 || res.status === 403) throw new Error(`認証失敗 HTTP ${res.status}`);
+  if (!res.ok) { const t = await res.text().catch(() => ''); throw new Error(`ミニPC HTTP ${res.status}: ${t.slice(0, 200)}`); }
+  const ct = res.headers.get('content-type') || '';
+  if (!ct.includes('application/json')) throw new Error(`レスポンス形式異常 (ct=${ct || 'none'})`);
+  return res.json();
+}
 
 const router = Router();
 
@@ -82,9 +106,9 @@ const numOrNull = v => {
 
 // ─── 発注 draft/issue の永続化 ───
 function enrichItems(rawItems, supplierCode) {
-  // 現 PML に存在し「かつ当該仕入先の」商品コードのみ許可し、商品名・原価をスナップショットする
+  // 現 PML(+NEオーバーレイ) に存在し「かつ当該仕入先の」商品コードのみ許可し、商品名・原価をスナップショットする
   // (Codex R1 High: 仕入先突合なしだと別仕入先の商品を混入できる)
-  const { pub, rows } = loadPml();
+  const { pub, rows } = loadPmlMerged();
   if (!pub) throw new Error('PMLスナップショット未同期のため保存できません');
   const byKey = new Map();
   for (const r of rows) byKey.set(normProductCode(r['商品コード']), r);
@@ -181,7 +205,7 @@ function productDto(p) {
 }
 
 function supplierWorkspaceData(code) {
-  const { pub, products, bySupplier, masters } = computeAll();
+  const { pub, overlay, products, bySupplier, masters } = computeAll();
   const g = bySupplier.get(code);
   const sm = masters.suppliers.get(code);
   if (!g && !sm) return null;
@@ -225,7 +249,13 @@ function supplierWorkspaceData(code) {
     };
   });
   return {
-    pub: pub ? { as_of_date: pub.as_of_date, status: pub.status, synced_at: pub.synced_at } : null,
+    pub: pub ? {
+      as_of_date: pub.as_of_date, status: pub.status, synced_at: pub.synced_at,
+      src_ne_products_synced_at: pub.src_ne_products_synced_at || null,
+      fba_source_kind: pub.fba_source_kind || null, fba_fetched_at: pub.fba_fetched_at || null,
+      src_fba_business_date: pub.src_fba_business_date || null,
+    } : null,
+    overlay,
     supplier: { code, name: (sm && sm.name) || (g && g.name) || `仕入先 ${code}`, memo: (sm && sm.order_memo) || '' },
     targets: g ? g.targets.map(productDto) : [],
     candidates: g ? g.candidates.map(productDto) : [],
@@ -490,10 +520,97 @@ router.post('/api/masters/:kind/csv', upload.single('file'), (req, res) => {
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
+// ─── NE商品マスタCSV オーバーレイ (日中の最新化) ───
+// NE管理画面から手動DLした商品マスタCSV (Shift-JIS) を取り込み、在庫数・注残数・原価等を最新値で上書き計算する。
+// FBA在庫・販売数・推奨保有月数はPMLのまま。翌朝の同期より古くなったら自動で無視される。
+const NE_CSV_COLS = {
+  商品コード: 'product_code', 仕入先コード: '仕入先コード', 原価: '原価', 売価: '売価',
+  取扱区分: '取扱区分', 発注ロット単位: '発注ロット単位', 最終仕入日: '最終仕入日',
+  在庫数: '在庫数', 引当数: '引当数', 発注残数: '発注残数',
+};
+router.post('/api/ne-overlay/csv', upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ ok: false, error: 'CSVファイルが必要です' });
+  let buf;
+  try { buf = fs.readFileSync(req.file.path); } finally { try { fs.unlinkSync(req.file.path); } catch {} }
+  try {
+    const rows = parseCsvBuffer(buf);
+    if (rows.length < 2) return res.status(400).json({ ok: false, error: 'データ行がありません' });
+    const header = rows[0].map(trimS);
+    const idx = {};
+    for (const [jp, key] of Object.entries(NE_CSV_COLS)) {
+      const i = header.findIndex(h => h.replace(/[\s"（(].*$/, '') === jp || h === jp);
+      if (i >= 0) idx[key] = i;
+    }
+    if (idx.product_code == null || idx.在庫数 == null || idx.発注残数 == null) {
+      return res.status(400).json({
+        ok: false,
+        error: 'NE商品マスタCSVの見出しが見つかりません (商品コード/在庫数/発注残数 が必要)。ネクストエンジンの商品マスタDL CSVをそのままアップロードしてください',
+      });
+    }
+    const db = getDB();
+    const now = nowIso();
+    let count = 0;
+    db.transaction(() => {
+      db.prepare('DELETE FROM po_ne_overlay_rows').run();
+      const ins = db.prepare(`INSERT OR REPLACE INTO po_ne_overlay_rows
+        (product_key, product_code, 仕入先コード, 原価, 売価, 取扱区分, 発注ロット単位, 最終仕入日, 在庫数, 引当数, 発注残数)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
+      for (let i = 1; i < rows.length; i++) {
+        const c = rows[i];
+        const code = trimS(c[idx.product_code]);
+        if (!code) continue;
+        ins.run(
+          normProductCode(code), code,
+          idx.仕入先コード != null ? (trimS(c[idx.仕入先コード]) || null) : null,
+          idx.原価 != null ? numOrNull(c[idx.原価]) : null,
+          idx.売価 != null ? numOrNull(c[idx.売価]) : null,
+          idx.取扱区分 != null ? (trimS(c[idx.取扱区分]) || null) : null,
+          idx.発注ロット単位 != null ? numOrNull(c[idx.発注ロット単位]) : null,
+          idx.最終仕入日 != null ? (trimS(c[idx.最終仕入日]) || null) : null,
+          numOrNull(c[idx.在庫数]),
+          idx.引当数 != null ? numOrNull(c[idx.引当数]) : null,
+          numOrNull(c[idx.発注残数]),
+        );
+        count++;
+      }
+      if (count === 0) throw new Error('有効な行がありません');
+      db.prepare(`INSERT INTO po_ne_overlay_meta (id, uploaded_at, row_count, filename) VALUES (1,?,?,?)
+                  ON CONFLICT(id) DO UPDATE SET uploaded_at=excluded.uploaded_at, row_count=excluded.row_count, filename=excluded.filename`)
+        .run(now, count, req.file.originalname || null);
+    })();
+    res.json({ ok: true, rowCount: count, uploadedAt: now });
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+
+router.delete('/api/ne-overlay', (req, res) => {
+  try {
+    const db = getDB();
+    db.transaction(() => {
+      db.prepare('DELETE FROM po_ne_overlay_rows').run();
+      db.prepare('DELETE FROM po_ne_overlay_meta').run();
+    })();
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ─── オンデマンドFBA更新 (miniPCジョブ起動 + 状態プロキシ、product-management-list Part2 と同一) ───
+router.post('/api/refresh-fba', async (req, res) => {
+  try {
+    const r = await callWarehouse('/service-api/fba/pml/fba-refresh', { method: 'POST', timeout: 30000 });
+    res.json(r);
+  } catch (e) { res.status(502).json({ error: 'ミニPCへの接続に失敗: ' + e.message }); }
+});
+router.get('/api/refresh-fba/jobs/:jobId', async (req, res) => {
+  try {
+    const r = await callWarehouse(`/service-api/jobs/${encodeURIComponent(req.params.jobId)}`, { timeout: 15000 });
+    res.json(r);
+  } catch (e) { res.status(502).json({ error: 'ジョブ状態の取得に失敗: ' + e.message }); }
+});
+
 // 取扱中なのにどのグループにも未紐付けの商品 (登録漏れチェック用)
 router.get('/api/attrs/unlinked', (req, res) => {
   try {
-    const { rows } = loadPml();
+    const { rows } = loadPmlMerged();
     const { attrs } = loadMasters();
     const unlinked = [];
     for (const r of rows) {
@@ -587,11 +704,22 @@ ${script || ''}
 </body></html>`;
 }
 
+/** データ鮮度の表示テキスト (NE=朝同期 or 手動CSV / FBA=朝同期 or live) */
+function freshnessText(pub, overlay) {
+  const ne = overlay && overlay.applied
+    ? `NE: 🟢手動CSV ${fmtJst(overlay.uploaded_at)} 取込済 (${overlay.mergedCount || overlay.row_count}件)`
+    : `NE: ${pub && pub.src_ne_products_synced_at ? fmtJst(pub.src_ne_products_synced_at) + ' (朝同期)' : '—'}`;
+  const fba = pub && pub.fba_source_kind === 'live'
+    ? `FBA: 🟢${fmtJst(pub.fba_fetched_at)} 取得(最新)`
+    : `FBA: ${pub && pub.src_fba_business_date ? he(String(pub.src_fba_business_date)) + ' (朝同期)' : '—'}`;
+  return ne + ' ／ ' + fba;
+}
+
 // ─── 画面1: ダッシュボード ───
 router.get('/', (req, res) => {
   let data;
   try {
-    const { pub, bySupplier, products } = computeAll();
+    const { pub, overlay, bySupplier, products } = computeAll();
     const db = getDB();
     const draftCodes = new Set(db.prepare("SELECT supplier_code FROM po_orders WHERE status='draft'").all().map(r => r.supplier_code));
     const cards = [];
@@ -607,12 +735,12 @@ router.get('/', (req, res) => {
     cards.sort((a, b) => b.targetCount - a.targetCount || b.estAmount - a.estAmount);
     others.sort((a, b) => b.productCount - a.productCount);
     const searchIndex = products.filter(p => p.active).map(p => ({ c: p.code, n: p.name, s: p.supplierCode }));
-    data = { pub, cards, others, searchIndex };
+    data = { pub, overlay, cards, others, searchIndex };
   } catch (e) { return res.status(500).send('error: ' + he(e.message)); }
 
-  const { pub, cards, others, searchIndex } = data;
+  const { pub, overlay, cards, others, searchIndex } = data;
   const stale = pub && pub.as_of_date ? (Date.now() - Date.parse(pub.as_of_date + 'T00:00:00+09:00')) > 3 * 86400000 : true;
-  const freshNote = pub ? `データ: ${he(pub.as_of_date || '?')} 時点 (PML published)` : 'PML未同期';
+  const freshNote = pub ? freshnessText(pub, overlay) : 'PML未同期';
   const cardHtml = c => `
     <a class="card" href="/apps/purchase-orders/supplier/${encodeURIComponent(c.code)}">
       <div class="nm">${he(c.name)} ${c.hasDraft ? '<span class="badge b-draft">下書きあり</span>' : ''}</div>
@@ -627,6 +755,15 @@ router.get('/', (req, res) => {
     <div class="toolbar">
       <input type="text" id="q" placeholder="商品コード / 商品名で検索 → 仕入先を探す" style="width:340px">
       <span class="muted">${freshNote}</span>
+    </div>
+    <div class="toolbar">
+      <button id="btnFba">🔄 FBA在庫を今すぐ更新</button>
+      <form id="neForm" style="display:flex;gap:6px;align-items:center">
+        <input type="file" name="file" accept=".csv" required>
+        <button type="submit">📥 NE最新CSVを取込</button>
+      </form>
+      ${overlay ? '<button id="btnNeClear" title="手動CSVの上書きをやめて朝同期の値に戻す">✕ CSV取込を解除</button>' : ''}
+      <span id="opStatus" class="muted"></span>
     </div>
     <div id="searchResult"></div>
     <h2 style="font-size:15px">発注が必要な仕入先 (${cards.length})</h2>
@@ -653,6 +790,69 @@ box.addEventListener('input', function() {
     h += '<tr><td>' + esc(p2.c) + '</td><td>' + esc(p2.n) + '</td><td><a href="/apps/purchase-orders/supplier/' + encodeURIComponent(p2.s) + '">' + esc(p2.s) + ' →</a></td></tr>';
   }
   out.innerHTML = h + '</table>';
+});
+
+// ── FBA在庫 オンデマンド更新 (miniPCジョブ、数分かかる) ──
+var opStatus = document.getElementById('opStatus');
+function setStatus(msg) { opStatus.textContent = msg; }
+var btnFba = document.getElementById('btnFba');
+btnFba.addEventListener('click', function() {
+  btnFba.disabled = true;
+  setStatus('FBA更新ジョブを起動中...');
+  fetch('/apps/purchase-orders/api/refresh-fba', { method: 'POST' })
+    .then(function(r){ return r.json(); })
+    .then(function(j) {
+      if (!j.jobId) {
+        setStatus(j.message || j.error || '起動できませんでした (既に実行中の可能性)。数分後に再読み込みしてください');
+        btnFba.disabled = false;
+        return;
+      }
+      setStatus('実行中... (Amazonのレポート生成に数分かかります)');
+      pollFba(j.jobId, Date.now());
+    })
+    .catch(function(e){ setStatus('通信エラー: ' + e.message); btnFba.disabled = false; });
+});
+function pollFba(jobId, startTs) {
+  if (Date.now() - startTs > 5 * 60 * 1000) {
+    setStatus('まだ処理中です。数分後にページを再読み込みすると最新FBA在庫で表示されます');
+    btnFba.disabled = false;
+    return;
+  }
+  setTimeout(function() {
+    fetch('/apps/purchase-orders/api/refresh-fba/jobs/' + encodeURIComponent(jobId))
+      .then(function(r){ return r.json(); })
+      .then(function(job) {
+        if (job.status === 'completed') { setStatus('完了。最新データで再読み込みします...'); location.reload(); }
+        else if (job.status === 'failed') { setStatus('失敗: ' + (job.error || '理由不明')); btnFba.disabled = false; }
+        else {
+          if (job.progress && job.progress.message) setStatus('実行中: ' + job.progress.message);
+          pollFba(jobId, startTs);
+        }
+      })
+      .catch(function(){ pollFba(jobId, startTs); });
+  }, 8000);
+}
+
+// ── NE商品マスタCSV オーバーレイ取込 ──
+document.getElementById('neForm').addEventListener('submit', function(ev) {
+  ev.preventDefault();
+  var fd = new FormData(ev.target);
+  setStatus('NE CSVを取込中...');
+  fetch('/apps/purchase-orders/api/ne-overlay/csv', { method: 'POST', body: fd })
+    .then(function(r){ return r.json(); })
+    .then(function(j) {
+      if (!j.ok) { setStatus(''); alert('取込エラー: ' + j.error); return; }
+      setStatus('取込完了 (' + j.rowCount + '件)。再読み込みします...');
+      location.reload();
+    })
+    .catch(function(e){ setStatus('通信エラー: ' + e.message); });
+});
+var btnNeClear = document.getElementById('btnNeClear');
+if (btnNeClear) btnNeClear.addEventListener('click', function() {
+  if (!confirm('手動CSVの上書きを解除して、朝同期の値に戻しますか?')) return;
+  fetch('/apps/purchase-orders/api/ne-overlay', { method: 'DELETE' })
+    .then(function(r){ return r.json(); })
+    .then(function(j){ if (j.ok) location.reload(); else alert(j.error); });
 });`;
   res.send(pageShell('発注補助 — ダッシュボード', '', body, script));
 });
@@ -669,7 +869,7 @@ router.get('/supplier/:code', (req, res) => {
     <div class="toolbar">
       <h2 style="margin:0;font-size:17px">${he(data.supplier.name)} <span class="muted">(コード ${he(data.supplier.code)})</span></h2>
       ${data.supplier.memo ? `<span class="badge b-warn">📌 ${he(data.supplier.memo)}</span>` : ''}
-      <span class="muted">データ: ${he(data.pub ? data.pub.as_of_date : '未同期')} 時点</span>
+      <span class="muted">${data.pub ? freshnessText(data.pub, data.overlay) : 'PML未同期'}</span>
     </div>
     <div id="condArea"></div>
     <div class="grid2">

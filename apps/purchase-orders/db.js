@@ -80,6 +80,28 @@ export function initPurchaseOrders() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_po_attrs_cond ON po_product_attrs(condition_id)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_po_attrs_mat ON po_product_attrs(material_group_id)');
 
+  // NE商品マスタCSV オーバーレイ (日中に手動DLした最新値で 在庫/注残/原価等 を上書き計算する)
+  // 正本は毎朝の PML。overlay は「その日の作業用の一時データ」で、翌朝同期より古くなったら自動で無視される。
+  db.exec(`CREATE TABLE IF NOT EXISTS po_ne_overlay_meta (
+    id            INTEGER PRIMARY KEY CHECK (id = 1),
+    uploaded_at   TEXT NOT NULL,
+    row_count     INTEGER NOT NULL,
+    filename      TEXT
+  )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS po_ne_overlay_rows (
+    product_key   TEXT PRIMARY KEY,
+    product_code  TEXT NOT NULL,
+    仕入先コード  TEXT,
+    原価          REAL,
+    売価          REAL,
+    取扱区分      TEXT,
+    発注ロット単位 REAL,
+    最終仕入日    TEXT,
+    在庫数        REAL,
+    引当数        REAL,
+    発注残数      REAL
+  )`);
+
   db.exec(`CREATE TABLE IF NOT EXISTS po_orders (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     supplier_code   TEXT NOT NULL,
