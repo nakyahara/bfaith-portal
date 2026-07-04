@@ -527,6 +527,11 @@ router.get('/category-binding', (_req, res) => {
   renderView(res, 'category-binding', {});
 });
 
+// R15: アプリ内マニュアル (操作編 + 仕組み編)
+router.get('/manual', (_req, res) => {
+  renderView(res, 'manual', {});
+});
+
 // ───────────────── API ─────────────────
 
 router.get('/api/health', (_req, res) => {
@@ -1457,6 +1462,37 @@ router.post('/api/publish/bulk/retry-failed', (req, res) => {
     }
     const result = startBulkPublish({ db, itemCodes, triggeredBy: 'retry_failed' });
     audit(db, 'bulk_publish_retry_failed', { batchId: result.batchId, total: result.total });
+    return res.status(202).json({ status: 'ok', ...result, itemCodes });
+  } catch (e) {
+    if (e.statusCode === 400) return res.status(400).json({ status: 'fail', error: e.message });
+    if (e.statusCode === 403) return res.status(403).json({ status: 'fail', error: e.message });
+    if (/UNIQUE/.test(e.message)) return res.status(409).json({ status: 'fail', error: 'A bulk publish batch is already running' });
+    return res.status(500).json({ status: 'fail', error: e.message });
+  }
+});
+
+/**
+ * R16 (2026-07-04 中原さん指示・重大): 移行済み商品の一括再登録。
+ *
+ * 背景: R16 以前にこのアプリで publish した商品は、 説明文内の楽天内部リンク
+ * (item.rakuten.co.jp 等) がそのまま Yahoo に登録されている (Yahoo 規約違反)。
+ * 本 endpoint は publish 成功済みの全 item_code を集めて bulk publish を再実行し、
+ * R16 の楽天リンク除去/書換ロジックを反映した説明文で editItem 上書きする。
+ *
+ * 対象はこのアプリで publish 成功した商品のみ (yahoo_registered_items の既存出品 =
+ * 手動出品分は item_code 体系が別で楽天データから再構築できないため対象外)。
+ */
+router.post('/api/publish/bulk/republish-migrated', (req, res) => {
+  try {
+    const db = getDB();
+    const itemCodes = db.prepare(`
+      SELECT DISTINCT item_code FROM publish_idempotency WHERE status = 'success' ORDER BY item_code
+    `).all().map((r) => r.item_code);
+    if (itemCodes.length === 0) {
+      return res.json({ status: 'ok', batchId: null, total: 0, message: 'このアプリで移行済みの商品はありません' });
+    }
+    const result = startBulkPublish({ db, itemCodes, triggeredBy: 'manual' });
+    audit(db, 'bulk_publish_republish_migrated', { batchId: result.batchId, total: result.total });
     return res.status(202).json({ status: 'ok', ...result, itemCodes });
   } catch (e) {
     if (e.statusCode === 400) return res.status(400).json({ status: 'fail', error: e.message });

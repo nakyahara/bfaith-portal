@@ -15,6 +15,8 @@
 
 import * as cheerio from 'cheerio';
 
+import { classifyRakutenHref, scrubRakutenUrlsFromText, stripEcmpanBlocks } from './rakuten-link-sanitizer.js';
+
 const ALLOWED_TAGS = new Set([
   'a', 'b', 'strong', 'i', 'em', 'u', 'br', 'p', 'div', 'span',
   'ul', 'ol', 'li', 'table', 'thead', 'tbody', 'tr', 'th', 'td',
@@ -58,7 +60,9 @@ function isImgFromAllowedHost(src, allowedHostsLower) {
  */
 export function sanitizeProductHtml(html, opts = {}) {
   if (html == null) return '';
-  const s = String(html);
+  // R18 (2026-07-04 中原さん指示): 楽天自動挿入のカテゴリパンくず <!--ECMPAN-->...<!--/ECMPAN--> は
+  // Yahoo への移行対象外として、 parse 前に丸ごと除去する。
+  const s = stripEcmpanBlocks(String(html));
   if (s.trim() === '') return '';
   const allowedHostsLower = new Set(
     (opts.allowImgFromHosts || []).map((h) => String(h).trim().toLowerCase()).filter(Boolean)
@@ -81,6 +85,42 @@ export function sanitizeProductHtml(html, opts = {}) {
       }
     });
   }
+
+  // 楽天リンク根絶 (R16 2026-07-04 中原さん指示・重大):
+  //   Yahoo!ショッピング規約上、他モール (楽天) への誘導リンクは違反。
+  //   - 自店商品リンク item.rakuten.co.jp/{shop}/{code}/ → Yahoo ストア URL に書換
+  //   - その他の楽天系リンク (他店/検索/CDN/rakuten.ne.jp 等) → <a> を unwrap (リンク除去)
+  //   YAHOO_SELLER_ID 未設定でも楽天リンクは絶対に残さない (書換不能なら unwrap)。
+  root.find('a').each((_, el) => {
+    const href = el.attribs?.href;
+    if (!href) return;
+    const c = classifyRakutenHref(href);
+    if (c.kind === 'rewrite') {
+      $(el).attr('href', c.yahooUrl);
+    } else if (c.kind === 'remove') {
+      const $el = $(el);
+      $el.replaceWith($el.contents());
+    }
+  });
+
+  // R16: テキストノードに生の楽天 URL が書かれているケース (リンクではなく文字列) もスクラブ
+  //   (自店商品 URL → Yahoo URL 文字列に書換、 その他の楽天 URL → 削除)。
+  //   これをやらないと validator の residue backstop で送信中止になり 「修正必要」 に落ちるだけなので、
+  //   自動で直せるものはここで直す。
+  // R18: HTML コメントノードも全除去 (Yahoo に不要 + <!--ECMPAN--> 残骸や
+  //   コメント内 URL が residue backstop に引っかかるのを防ぐ)。
+  (function scrubTextNodes(nodes) {
+    nodes.each((_, node) => {
+      if (node.type === 'comment') {
+        $(node).remove();
+      } else if (node.type === 'text' && node.data) {
+        const scrubbed = scrubRakutenUrlsFromText(node.data);
+        if (scrubbed !== node.data) node.data = scrubbed;
+      } else if (node.type === 'tag') {
+        scrubTextNodes($(node).contents());
+      }
+    });
+  })(root.contents());
 
   // strip-only (中身を残してタグだけ unwrap)
   STRIP_BUT_KEEP_CONTENT.forEach((tag) => {

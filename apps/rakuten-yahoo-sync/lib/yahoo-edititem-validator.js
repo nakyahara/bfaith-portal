@@ -17,6 +17,7 @@
  */
 import * as cheerio from 'cheerio';
 import { yahooTextUnits } from './yahoo-text.js';
+import { findRakutenResidueInFields } from './rakuten-link-sanitizer.js';
 
 const LIMITS_UNITS = {
   explanation:   1000,    // 全角 500
@@ -143,5 +144,18 @@ export function validateYahooEditItemFields(fields, opts = {}) {
   // additional1 / sp_additional / caption の img host check (allowedImgHosts 指定時のみ)
   if (Array.isArray(opts.allowedImgHosts) && opts.allowedImgHosts.length > 0) {
     checkImgHostInHtmlFields(fields, opts.allowedImgHosts);
+  }
+
+  // R16 (2026-07-04 中原さん指示・重大) 最終 backstop: Yahoo 規約違反となる楽天ドメイン残存を
+  //   全 string field で走査し fail-closed で止める。 通常は sanitize / scrub 段で除去済みで
+  //   ここには到達しない。 到達した場合は除去ロジックの取りこぼし = 送信してはいけない。
+  const residues = findRakutenResidueInFields(fields);
+  if (residues.length > 0) {
+    const r = residues[0];
+    throw new YahooFieldValidationError(
+      r.field,
+      `rakuten_link_residue: 楽天ドメインが残存しています (Yahoo規約違反防止のため送信中止): …${r.sample}…`,
+      { value: r.sample }
+    );
   }
 }

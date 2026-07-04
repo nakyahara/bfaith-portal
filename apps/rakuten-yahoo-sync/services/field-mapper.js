@@ -14,6 +14,7 @@
  */
 
 import { sanitizeProductHtml } from '../lib/html-sanitize.js';
+import { scrubRakutenUrlsFromText, stripEcmpanBlocks } from '../lib/rakuten-link-sanitizer.js';
 import { buildYahooExplanation, buildYahooHeadline } from '../lib/yahoo-text.js';
 import { shouldUseSagawaPrice } from './delivery-resolver.js';
 
@@ -155,6 +156,18 @@ export function buildYahooEditItemFields({
     fields.auc_category = FIXED_FIELDS.AUC_CATEGORY;
   }
 
+  // headline 解決 (R17 2026-07-04 中原さん指示): 楽天キャッチコピーを Yahoo キャッチコピーに移行。
+  //   優先順位は他 field と同じ Notion override > 楽天 fallback。
+  //   楽天キャッチコピーに <br> が含まれる場合は除去して詰める (中原さん指示)。
+  //   RMS Items API 2.0 の field 名は tagline (旧 1.0 は catchcopy) — 両対応で読む。
+  //   buildYahooHeadline で HTML 除去 + 全角 30 truncate、 残った改行も除去 (headline は 1 行)。
+  const rakutenTagline = rakutenItem.tagline ?? rakutenItem.catchcopy ?? '';
+  const headlineSource = notionOverride?.yahoo_headline
+    || String(rakutenTagline).replace(/<br\s*\/?>/gi, '');
+  const resolvedHeadline = headlineSource
+    ? buildYahooHeadline(headlineSource).replace(/\n+/g, '')
+    : '';
+
   // caption / explanation / additional1 / sp_additional (Q33)
   //
   //   2026-06-27 editItem HTTP 400 (Code it-01033) で判明: Yahoo の explanation は
@@ -164,21 +177,23 @@ export function buildYahooEditItemFields({
   //     - 1000 units (= 全角 500) で grapheme cluster 単位 truncate
   //   caption / additional1 / sp_additional は HTML 可なので現状維持 (sanitize のみ)。
   fields.caption = pickCaptionField(notionOverride, rakutenItem);
-  fields.explanation = buildYahooExplanation({
-    headline: notionOverride?.yahoo_headline,
+  // R16: explanation はプレーンテキストで sanitizeProductHtml を通らないため、
+  //   テキスト中に生の楽天 URL が残っていたらここでスクラブする (自店商品→Yahoo URL、他→削除)。
+  //   R17: headline は Notion > 楽天キャッチコピー の解決済み値を使う (explanation 先頭行と headline 欄が一致)。
+  //   R18: explanation の元 HTML からも ECMPAN ブロック (楽天カテゴリパンくず) を除去
+  //   (htmlToPlainText 経由だとパンくず文字列が本文として混入するため)。
+  fields.explanation = scrubRakutenUrlsFromText(buildYahooExplanation({
+    headline: resolvedHeadline,
     itemName: rakutenItem.itemName || rakutenItem.title || '',
-    html: rakutenItem.productDescription?.pc || '',
-  });
+    html: stripEcmpanBlocks(rakutenItem.productDescription?.pc || ''),
+  }));
   fields.additional1 = sanitizeProductHtml(rakutenItem.salesDescription || '');
   fields.sp_additional = sanitizeProductHtml(rakutenItem.productDescription?.sp || '');
 
-  // headline / jan (Notion override 任意)
+  // headline (R17: Notion override > 楽天キャッチコピー、 上で解決済み)
   //   Codex R3 H-1: headline は Yahoo HTML 不可 + 全角 30 以内なので、 buildYahooHeadline で
-  //   plain 化 + truncate してから代入 (Notion に `<b>` 等が混入していても安全)。
-  if (notionOverride?.yahoo_headline) {
-    const h = buildYahooHeadline(notionOverride.yahoo_headline);
-    if (h) fields.headline = h;
-  }
+  //   plain 化 + truncate 済みの resolvedHeadline を代入。
+  if (resolvedHeadline) fields.headline = resolvedHeadline;
   if (notionOverride?.yahoo_jan) fields.jan = String(notionOverride.yahoo_jan);
 
   // 楽天 features 由来 flags
@@ -202,5 +217,28 @@ export function buildYahooEditItemFields({
   // display は readiness pass 後に caller が 1 に上げる
   fields.display = 0;
 
+  // ── 最終処理 (R15 2026-07-04 中原さん指示): ヤフオク併売時の PC用フリースペース1 必須対応 ──
+  //   ※中原さん指示により、 他の全 field 組み立てが終わった一番最後に適用する。
+  applyAucFreespaceFallback(fields);
+
+  return fields;
+}
+
+/**
+ * R15 (2026-07-04 中原さん指示): ヤフオク併売時の PC用フリースペース1 必須対応。
+ *   Yahoo!ショッピングで商品状態「新品：Yahoo!オークション併売」(= auc_* を送る通常品) は
+ *   「PC用フリースペース1」(additional1) が必須。 空欄なら商品説明 (caption) と同じ内容を入れる。
+ *
+ * fields を in-place で書き換える。 呼び出し箇所は 2 つ:
+ *   1. buildYahooEditItemFields の最終行 (dry-run / readiness 用の fields)
+ *   2. publish-executor の performRealPublish (R16 発覚): executor は additional1 を
+ *      生 salesDescription から rewriteAndSanitizeYahooHtml で「再構築して上書き」するため、
+ *      salesDescription が空の商品では 1. の補完が消える。 rewrite 後にもう一度適用が必要。
+ */
+export function applyAucFreespaceFallback(fields) {
+  const isAucCrossListing = fields.auc_bcid !== undefined;
+  if (isAucCrossListing && (!fields.additional1 || String(fields.additional1).trim() === '')) {
+    fields.additional1 = fields.caption || fields.explanation || '';
+  }
   return fields;
 }

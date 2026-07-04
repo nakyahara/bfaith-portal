@@ -17,6 +17,8 @@
 
 import crypto from 'crypto';
 import { evaluateItemForPublish } from './publish-pipeline.js';
+import { applyAucFreespaceFallback } from './field-mapper.js';
+import { stripEcmpanBlocks } from '../lib/rakuten-link-sanitizer.js';
 import { callEditItem, YahooProxyError } from '../lib/yahoo-publish-proxy.js';
 import { uploadRakutenImagesToYahoo } from '../lib/image-uploader.js';
 import { validateYahooEditItemFields, YahooFieldValidationError } from '../lib/yahoo-edititem-validator.js';
@@ -48,7 +50,9 @@ export function isPublishEnabled() {
 // 同じ key にならないよう version を必ず混ぜる。
 // v2: PR #355 image-html rewrite (uploadItemImage で desc も) 採用版
 // v3: PR #356 uploadLibImage 採用 (Yahoo it-14061 修正) 後の版
-export const IDEMPOTENCY_VERSION = 'rewrite_v3';
+// v4: R16 楽天リンク根絶 (2026-07-04)。 v3 以前に publish した商品は楽天リンクが残っている
+//     可能性があるため、 同日でも dedupe されず再 publish で上書き修正できるようにする。
+export const IDEMPOTENCY_VERSION = 'rewrite_v4';
 
 /**
  * idempotency_key 生成 (caller が override 可能、 ない場合は deterministic に組み立て)。
@@ -183,8 +187,10 @@ async function performRealPublish({ rakutenImages, fields, itemCode, customPatte
 
   // 1. 説明文画像 URL 抽出 (PC/SP)
   //    Codex Phase E image-html R2 medium: PC/SP まとめて + dedupe suffix 一貫割当
-  const salesDescriptionHtml = rakutenItem?.salesDescription || '';
-  const spDescriptionHtml = rakutenItem?.productDescription?.sp || '';
+  //    R18 (2026-07-04 中原さん指示): ECMPAN ブロック (楽天カテゴリパンくず) は移行対象外。
+  //    画像抽出より前に除去する (ブロック内の画像を無駄に Yahoo へ upload しない)。
+  const salesDescriptionHtml = stripEcmpanBlocks(rakutenItem?.salesDescription || '');
+  const spDescriptionHtml = stripEcmpanBlocks(rakutenItem?.productDescription?.sp || '');
   const descUrlsRaw = [
     ...extractRakutenImageUrls(salesDescriptionHtml),
     ...extractRakutenImageUrls(spDescriptionHtml),
@@ -225,6 +231,11 @@ async function performRealPublish({ rakutenImages, fields, itemCode, customPatte
     additional1: rewrittenAdditional1,
     sp_additional: rewrittenSpAdditional,
   };
+
+  // R15 再適用 (R16 発覚): 上の rewrite は additional1 を生 salesDescription から再構築して
+  // 上書きするため、 salesDescription が空のヤフオク併売品では field-mapper 側の
+  // 「additional1 空欄 → caption 補完」 が消えてしまう。 rewrite 後の最終段でもう一度適用する。
+  applyAucFreespaceFallback(rewrittenFields);
 
   // 4. editItem preflight 確定 (rewrite 後の長さ + img host check)
   try {

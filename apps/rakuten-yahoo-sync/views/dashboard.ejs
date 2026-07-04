@@ -100,6 +100,7 @@
       <button class="btn btn-outline-light btn-sm js-open-image-exclusion-mgmt" title="楽天画像のファイル名に特定の文字列が入っているとき、 その画像を Yahoo に登録しない">
         🖼️ 画像除外パターン
       </button>
+      <a href="/apps/rakuten-yahoo-sync/manual" class="btn btn-outline-light btn-sm" title="使い方 (操作編) と裏側の仕組み (仕組み編)">📖 マニュアル</a>
       <a href="/" class="btn btn-outline-light btn-sm">ポータルに戻る</a>
     </div>
   </nav>
@@ -184,6 +185,9 @@
             <button class="btn btn-sm btn-outline-info js-toggle-bulk-mode">☑ 一括選択モード</button>
           <% } %>
           <button class="btn btn-sm btn-outline-warning js-retry-failed-publish" title="失敗中の publish をまとめて再実行">🔁 失敗中を再実行</button>
+          <% if (filter === 'done') { %>
+            <button class="btn btn-sm btn-outline-danger js-republish-migrated" title="このアプリで移行済みの全商品を再登録し、説明文の楽天リンク除去 (R16) 等の最新ロジックを反映します">🧹 全件再登録 (楽天リンク修正)</button>
+          <% } %>
           <form method="GET" class="d-flex gap-2 align-items-center">
             <input type="hidden" name="filter" value="<%= filter %>">
             <input class="form-control form-control-sm" type="search" name="q" placeholder="商品コード / タイトルで絞り込み"
@@ -1649,6 +1653,35 @@ async function retryFailedPublish() {
   }
 }
 
+// R16 (2026-07-04): 移行済み全件を再登録して楽天リンク除去 (規約違反修正) を反映する
+async function republishMigrated() {
+  if (!confirm('このアプリで移行済みの全商品を Yahoo に再登録します。\n説明文内の楽天リンクが Yahoo 内リンクに修正されます。\n商品数によっては時間がかかります。よろしいですか?')) return;
+  openBulkPublishModal('移行済み商品を再登録中... (楽天リンク修正)');
+  window._bulkPublishSucceededCount = 0;
+  try {
+    const res = await fetch('/apps/rakuten-yahoo-sync/api/publish/bulk/republish-migrated', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}',
+    });
+    const data = await res.json();
+    if (data.batchId === null && data.total === 0) {
+      document.getElementById('bulkPublishTitle').textContent = '⚠ 移行済みの商品はありません';
+      document.querySelector('.js-close-bulk-publish-modal').disabled = false;
+      return;
+    }
+    if (!res.ok || !data.batchId) {
+      document.getElementById('bulkPublishTitle').textContent = '❌ 開始失敗';
+      document.getElementById('bulkPublishProgressText').textContent = data.error || ('HTTP ' + res.status);
+      document.querySelector('.js-close-bulk-publish-modal').disabled = false;
+      return;
+    }
+    await pollBulkBatch(data.batchId);
+  } catch (e) {
+    document.getElementById('bulkPublishTitle').textContent = '❌ ネットワークエラー';
+    document.getElementById('bulkPublishProgressText').textContent = e.message;
+    document.querySelector('.js-close-bulk-publish-modal').disabled = false;
+  }
+}
+
 // ───── 楽天タイトル backfill (Phase E-9) ─────
 async function backfillRakutenTitle(evt) {
   const btn = evt.currentTarget;
@@ -2163,6 +2196,7 @@ document.addEventListener('DOMContentLoaded', () => {
   document.querySelector('.js-bulk-deselect-all')?.addEventListener('click', bulkDeselectAll);
   document.querySelector('.js-bulk-publish-execute')?.addEventListener('click', executeBulkPublish);
   document.querySelector('.js-retry-failed-publish')?.addEventListener('click', retryFailedPublish);
+  document.querySelector('.js-republish-migrated')?.addEventListener('click', republishMigrated);
   document.querySelectorAll('.js-close-bulk-publish-modal').forEach((el) => el.addEventListener('click', closeBulkPublishModal));
   for (const cb of document.querySelectorAll('.js-bulk-checkbox')) {
     cb.addEventListener('change', (ev) => {
