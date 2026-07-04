@@ -4,6 +4,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { pathToFileURL, fileURLToPath } from 'url';
+import iconv from 'iconv-lite';
 
 const SCRATCH = fs.mkdtempSync(path.join(os.tmpdir(), 'po-smoke-'));
 process.env.DATA_DIR = SCRATCH;
@@ -268,6 +269,33 @@ const fdBad = new FormData();
 fdBad.append('files', new Blob(['foo,bar\r\n1,2\r\n']), 'nazo.csv');
 r = await j('/api/import', { method: 'POST', body: fdBad });
 ok(r.status === 400 && r.body.errors && r.body.errors.length === 1, '種類判別不能ファイルは 400 + errors', r.body);
+
+// Shift_JIS 実バイト列 (丸数字①/半角ｶﾅ/波ダッシュ〜 を含む) の fallback デコード
+const sjisGenryo = '原料グループID,原料グループ名,最低発注量,単位\r\n' +
+  'sjistest,①ﾃｽﾄ原料ｰA,500,g\r\n';
+const fdSjis = new FormData();
+fdSjis.append('files', new Blob([iconv.encode(sjisGenryo, 'Shift_JIS')], { type: 'text/csv' }), '発注条件マスタ - 原料グループマスタ.csv');
+r = await j('/api/import', { method: 'POST', body: fdSjis });
+ok(r.status === 200 && r.body.ok, 'Shift_JIS 実バイトCSV 取込成功', r.body && r.body.summary);
+r = await j('/api/masters/materials');
+const sjisRow = r.body.rows.find(x => x.group_id === 'sjistest');
+ok(sjisRow && sjisRow.name === '①ﾃｽﾄ原料ｰA', 'Shift_JIS: 丸数字/半角カナを正しくデコード', sjisRow && sjisRow.name);
+
+// 数値不正・dangling は「スキップ+warnings」で取込は続行 (rollbackしない)
+const fdWarn = new FormData();
+fdWarn.append('files', new Blob(['条件ID,仕入先,条件タイプ,条件値,単位\r\nWARNCOND,1,数量,36O,個\r\n'], { type: 'text/csv' }), '発注条件マスタ - 発注条件マスタ.csv');
+fdWarn.append('files', new Blob(['商品コード,商品名,仕入先,商品グループID,原料グループID\r\ndanglingprod,ダングリング,1,,nonexistgroup\r\n'], { type: 'text/csv' }), '発注条件マスタ - 商品マスタ.csv');
+r = await j('/api/import', { method: 'POST', body: fdWarn });
+ok(r.status === 200 && r.body.ok, '数値不正/dangling でも200で続行', r.body && r.body.summary);
+ok(r.body.skipped && r.body.skipped.conditions === 1, '条件値36O は数値不正でスキップ', r.body && r.body.skipped);
+ok(r.body.warnings && r.body.warnings.some(w => w.includes('36O')), '不正数値がwarningsに記録される', r.body && r.body.warnings);
+ok(r.body.warnings && r.body.warnings.some(w => w.includes('原料グループ')), 'dangling原料グループ参照がwarningsに記録される', r.body && r.body.warnings);
+
+// NE商品マスタCSV (商品コード+仕入先だけ、発注特有列なし) は shohin と誤判定しない
+const fdNeMaster = new FormData();
+fdNeMaster.append('files', new Blob(['商品コード,仕入先コード,在庫数,発注残数\r\nx1,1,10,0\r\n'], { type: 'text/csv' }), 'ネクストエンジン商品マスタ.csv');
+r = await j('/api/import', { method: 'POST', body: fdNeMaster });
+ok(r.status === 400, 'NE商品マスタCSVは /api/import で誤判定しない (400)', r.body);
 
 console.log('── 未紐付け 新商品フィルタ ──');
 // 登録日が古い商品は既定(60日)では出ない、days=0で全件

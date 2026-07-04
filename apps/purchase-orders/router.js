@@ -539,18 +539,28 @@ function colIndex(header, ...aliases) {
 }
 const hasCol = (header, ...a) => colIndex(header, ...a) >= 0;
 
+// 数値パース (カンマ許容)。非空なのに数値化できない値は warn に記録して null (黙って欠落させない)。
+function numOrWarn(raw, warn, ctx) {
+  const s = trimS(raw).replace(/,/g, '');
+  if (s === '') return null;
+  const n = Number(s);
+  if (!Number.isFinite(n)) { if (warn) warn(`${ctx}: 数値でない値「${trimS(raw)}」を無視しました`); return null; }
+  return n;
+}
+
 // 各シート形式の判別 + 抽出。商品マスタは1枚から「仕入先(重複排除)」と「商品紐付け」の2種を作る。
+// extract(header, rows, warn): warn(msg) で行単位の注意を報告できる。
 const IMPORT_RECIPES = [
   {
     key: 'materials', label: '原料グループマスタ',
     detect: h => hasCol(h, '原料グループID') && (hasCol(h, '最低発注量') || hasCol(h, '原料グループ名')),
-    extract(header, rows) {
+    extract(header, rows, warn) {
       const iId = colIndex(header, '原料グループID'), iName = colIndex(header, '原料グループ名', '名称', '名前');
       const iMin = colIndex(header, '最低発注量'), iUnit = colIndex(header, '単位');
       const out = [];
       for (let r = 1; r < rows.length; r++) {
         const c = rows[r]; const id = trimS(c[iId]); if (!id) continue;
-        out.push({ table: 'materials', row: { group_id: id, name: trimS(c[iName]) || id, min_order_qty: iMin >= 0 ? numOrNull(c[iMin]) : null, unit: iUnit >= 0 ? (trimS(c[iUnit]) || null) : null } });
+        out.push({ table: 'materials', row: { group_id: id, name: trimS(c[iName]) || id, min_order_qty: iMin >= 0 ? numOrWarn(c[iMin], warn, `原料グループマスタ ${r + 1}行目 最低発注量`) : null, unit: iUnit >= 0 ? (trimS(c[iUnit]) || null) : null } });
       }
       return out;
     },
@@ -558,7 +568,7 @@ const IMPORT_RECIPES = [
   {
     key: 'conditions', label: '発注条件マスタ',
     detect: h => hasCol(h, '条件ID') && hasCol(h, '条件タイプ'),
-    extract(header, rows) {
+    extract(header, rows, warn) {
       const iId = colIndex(header, '条件ID'), iSup = colIndex(header, '仕入先コード', '仕入先');
       const iMaker = colIndex(header, 'メーカー名', 'メーカー'), iName = colIndex(header, '管理名', '商品グループID管理名', 'グループ管理名');
       const iType = colIndex(header, '条件タイプ'), iVal = colIndex(header, '条件値'), iUnit = colIndex(header, '単位');
@@ -570,7 +580,7 @@ const IMPORT_RECIPES = [
           supplier_code: iSup >= 0 ? (normSupplierCode(c[iSup]) || null) : null,
           maker_name: iMaker >= 0 ? (trimS(c[iMaker]) || null) : null,
           display_name: iName >= 0 ? (trimS(c[iName]) || id) : id,
-          condition_type: trimS(c[iType]), condition_value: numOrNull(c[iVal]),
+          condition_type: trimS(c[iType]), condition_value: numOrWarn(c[iVal], warn, `発注条件マスタ ${r + 1}行目(${id}) 条件値`),
           unit: iUnit >= 0 ? (trimS(c[iUnit]) || null) : null,
         } });
       }
@@ -579,8 +589,9 @@ const IMPORT_RECIPES = [
   },
   {
     key: 'shohin', label: '商品マスタ (→ 仕入先 + 商品紐付け)',
-    detect: h => hasCol(h, '商品コード') && (hasCol(h, '仕入先') || hasCol(h, '仕入先コード') || hasCol(h, '商品グループID') || hasCol(h, '原料グループID')),
-    extract(header, rows) {
+    // 商品コード + 発注特有の列 (グループID/容量/ケース) が揃うものだけ。NE商品マスタCSV(商品コード+仕入先のみ)は弾く。
+    detect: h => hasCol(h, '商品コード') && (hasCol(h, '商品グループID') || hasCol(h, '発注条件グループID') || hasCol(h, '原料グループID') || hasCol(h, '容量/個') || hasCol(h, '容量') || hasCol(h, 'ケースグループ') || hasCol(h, 'ケースロット')),
+    extract(header, rows, warn) {
       const iCode = colIndex(header, '商品コード'), iSup = colIndex(header, '仕入先コード', '仕入先'), iSupName = colIndex(header, '仕入れ先名', '仕入先名');
       const iGrp = colIndex(header, '商品グループID', '発注条件グループID'), iMat = colIndex(header, '原料グループID');
       const iCap = colIndex(header, '容量/個', '容量_per_個', '容量'), iCg = colIndex(header, 'ケースグループ'), iCl = colIndex(header, 'ケースロット');
@@ -592,7 +603,8 @@ const IMPORT_RECIPES = [
           if (sc && sc.toUpperCase() !== '#N/A') { if (!suppliers.has(sc) || (sn && !suppliers.get(sc))) suppliers.set(sc, sn); }
         }
         const cond = iGrp >= 0 ? (trimS(c[iGrp]) || null) : null, mat = iMat >= 0 ? (trimS(c[iMat]) || null) : null;
-        const cap = iCap >= 0 ? numOrNull(c[iCap]) : null, cg = iCg >= 0 ? (trimS(c[iCg]) || null) : null, cl = iCl >= 0 ? numOrNull(c[iCl]) : null;
+        const cap = iCap >= 0 ? numOrWarn(c[iCap], warn, `商品マスタ ${r + 1}行目(${code}) 容量/個`) : null;
+        const cg = iCg >= 0 ? (trimS(c[iCg]) || null) : null, cl = iCl >= 0 ? numOrWarn(c[iCl], warn, `商品マスタ ${r + 1}行目(${code}) ケースロット`) : null;
         if (cond || mat || cap || cg || cl) {
           out.push({ table: 'attrs', row: {
             product_key: normProductCode(code), product_code: code,
@@ -615,11 +627,26 @@ function bulkValid(table, row) {
   if (table === 'attrs') return !!row.product_code;
   return false;
 }
+// スキップ理由 (どの必須が欠けたか) を人間に返す
+function bulkInvalidReason(table, row) {
+  if (table === 'materials') return `${row.group_id || '(ID空)'} — 原料グループID/名称が不足`;
+  if (table === 'conditions') {
+    const bits = [];
+    if (!row.condition_type) bits.push('条件タイプ空');
+    if (row.condition_value == null) bits.push('条件値が数値でない');
+    else if (row.condition_value < 0) bits.push('条件値が負');
+    return `${row.condition_id || '(ID空)'} — ${bits.join('/') || '必須不足'}`;
+  }
+  if (table === 'suppliers') return `${row.supplier_code || '(コード空)'} — 仕入先コード/名称が不足`;
+  if (table === 'attrs') return '商品コードが空';
+  return '不正な行';
+}
 const TABLE_LABEL = { materials: '原料グループ', conditions: '発注条件グループ', suppliers: '仕入先', attrs: '商品紐付け' };
 
 router.post('/api/import', upload.array('files', 12), (req, res) => {
   if (!req.files || !req.files.length) return res.status(400).json({ ok: false, error: 'CSVファイルを選択してください' });
-  const classified = []; const fileErrors = [];
+  const classified = []; const fileErrors = []; const warnings = [];
+  const warn = m => { if (warnings.length < 200) warnings.push(m); };
   for (const f of req.files) {
     let buf; try { buf = fs.readFileSync(f.path); } finally { try { fs.unlinkSync(f.path); } catch {} }
     let rows;
@@ -628,7 +655,14 @@ router.post('/api/import', upload.array('files', 12), (req, res) => {
     const header = rows[0].map(trimS);
     const recipe = IMPORT_RECIPES.find(rc => rc.detect(header));
     if (!recipe) { fileErrors.push(`${f.originalname}: 種類を判別できません (見出し: ${header.slice(0, 6).join(' / ')})`); continue; }
-    classified.push({ name: f.originalname, recipe, items: recipe.extract(header, rows) });
+    // 列数ズレ検出 (未閉じクォート等で行が壊れていないか)。空行は無視。
+    let mismatch = 0;
+    for (let r = 1; r < rows.length; r++) {
+      const c = rows[r]; if (c.length === 1 && trimS(c[0]) === '') continue;
+      if (c.length !== header.length) mismatch++;
+    }
+    if (mismatch) warn(`${f.originalname}: 見出し${header.length}列に対し列数が違う行が${mismatch}件あります (CSVの破損の可能性、値ズレに注意)`);
+    classified.push({ name: f.originalname, recipe, items: recipe.extract(header, rows, warn) });
   }
   if (fileErrors.length) return res.status(400).json({ ok: false, error: '取り込めないファイルがあります', errors: fileErrors });
   // 依存順 (原料/条件 → 仕入先 → 紐付け) に並べて1トランザクションで upsert
@@ -640,15 +674,26 @@ router.post('/api/import', upload.array('files', 12), (req, res) => {
   try {
     db.transaction(() => {
       for (const it of all) {
-        if (!bulkValid(it.table, it.row)) { skipped[it.table]++; continue; }
+        if (!bulkValid(it.table, it.row)) {
+          skipped[it.table]++;
+          warn(`${TABLE_LABEL[it.table]}: ${bulkInvalidReason(it.table, it.row)} — 1件スキップ`);
+          continue;
+        }
         upsertMasterRow(MASTER_DEFS[it.table], it.row);
         counts[it.table]++;
       }
     })();
   } catch (e) { return res.status(500).json({ ok: false, error: '取込中にエラー: ' + e.message }); }
+  // dangling参照チェック (attrs が指す 発注条件グループ / 原料グループ が未登録)。取込は止めず警告のみ。
+  try {
+    const dCond = db.prepare(`SELECT COUNT(*) n FROM po_product_attrs a WHERE a.condition_id IS NOT NULL AND a.condition_id<>'' AND NOT EXISTS (SELECT 1 FROM po_order_conditions c WHERE c.condition_id=a.condition_id)`).get().n;
+    const dMat = db.prepare(`SELECT COUNT(*) n FROM po_product_attrs a WHERE a.material_group_id IS NOT NULL AND a.material_group_id<>'' AND NOT EXISTS (SELECT 1 FROM po_material_groups g WHERE g.group_id=a.material_group_id)`).get().n;
+    if (dCond) warn(`未登録の発注条件グループを参照している商品が${dCond}件あります (発注条件マスタ側の登録漏れの可能性)`);
+    if (dMat) warn(`未登録の原料グループを参照している商品が${dMat}件あります (原料グループマスタ側の登録漏れの可能性)`);
+  } catch {}
   const summary = Object.keys(counts).filter(k => counts[k] || skipped[k])
     .map(k => `${TABLE_LABEL[k]} ${counts[k]}件${skipped[k] ? ` (スキップ${skipped[k]})` : ''}`);
-  res.json({ ok: true, counts, skipped, summary, files: classified.map(c => ({ name: c.name, type: c.recipe.label })) });
+  res.json({ ok: true, counts, skipped, summary, warnings, files: classified.map(c => ({ name: c.name, type: c.recipe.label })) });
 });
 
 // ─── NE商品マスタCSV オーバーレイ (日中の最新化) ───
@@ -770,7 +815,9 @@ router.get('/api/attrs/unlinked', (req, res) => {
   try {
     const daysParam = req.query.days == null ? 60 : parseInt(req.query.days, 10);
     const days = Number.isFinite(daysParam) ? daysParam : 60;
-    const since = days > 0 ? Date.now() - days * 86400000 : null;
+    // JST「今日0時」を基準に N 日前0時から (時刻依存の1日ズレを防ぐ、登録日は日単位)
+    const jstMidnight = Date.parse(new Date(Date.now() + 9 * 3600000).toISOString().slice(0, 10) + 'T00:00:00+09:00');
+    const since = days > 0 ? jstMidnight - (days - 1) * 86400000 : null;
     const { rows } = loadPmlMerged();
     const { attrs } = loadMasters();
     const all = [];
@@ -1380,8 +1427,15 @@ document.getElementById('importForm').addEventListener('submit', function(ev) {
         return;
       }
       var pr = document.getElementById('importResult');
-      pr.innerHTML = (j.summary || []).map(function(s){ return '<span class="pill">✅ ' + esc(s) + '</span>'; }).join('');
-      toast('取り込みました');
+      var html = (j.summary || []).map(function(s){ return '<span class="pill">✅ ' + esc(s) + '</span>'; }).join('');
+      var w = j.warnings || [];
+      if (w.length) {
+        html += '<div class="warn" style="margin-top:10px">⚠️ 注意 ' + w.length + '件<ul style="margin:6px 0 0;padding-left:18px">' +
+          w.slice(0, 30).map(function(x){ return '<li>' + esc(x) + '</li>'; }).join('') +
+          (w.length > 30 ? '<li>…ほか ' + (w.length - 30) + '件</li>' : '') + '</ul></div>';
+      }
+      pr.innerHTML = html;
+      toast(w.length ? '取り込みました (注意' + w.length + '件)' : '取り込みました');
       load();
     })
     .catch(function(e){ st.textContent = ''; alert('通信エラー: ' + e.message); });
