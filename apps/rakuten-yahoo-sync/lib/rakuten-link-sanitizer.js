@@ -32,8 +32,28 @@ const RAKUTEN_FAMILY_SUFFIXES = [
 export const RAKUTEN_RESIDUE_RE = /(?:rakuten\.(?:co\.jp|ne\.jp|com)|r10s\.jp|rakuten-static\.com)/i;
 
 /**
+ * Codex R16 R2 High: 文字列全体への decodeURIComponent は、 どこか 1 箇所でも不正な `%`
+ * (例: `%ZZ`) があると全体が throw して decode が中断し、 別の場所にある `%2E` 等の
+ * エンコード済み楽天ドメインを見逃す。 有効な `%xx` トークンだけを部分的に復号する
+ * tolerant decode で、 不正 `%` が混ざっていてもドメイン部分は必ず復号されるようにする。
+ * (multibyte UTF-8 の %E3 等は単独 decode 不能でそのまま残るが、 ドメイン検知に必要なのは
+ *  ASCII の `%2E`/`%2F`/`%3A` だけなので問題ない)
+ */
+function tolerantDecodeOnce(s) {
+  return String(s).replace(/%[0-9A-Fa-f]{2}/g, (m) => {
+    try {
+      return decodeURIComponent(m);
+    } catch (_) {
+      return m;
+    }
+  });
+}
+
+/**
  * Codex R16 R1 High: `.` が `%2E` 等に percent-encode されていると raw 文字列への
  * regex が素通りする。 最大 3 回まで反復 decode して安定形を得る (二重エンコード対策)。
+ * 通常は decodeURIComponent (multibyte も正しく復号)、 throw したら tolerant decode に
+ * フォールバック (Codex R2 High)。
  */
 export function deepDecode(s) {
   let cur = String(s);
@@ -42,7 +62,7 @@ export function deepDecode(s) {
     try {
       next = decodeURIComponent(cur);
     } catch (_) {
-      break; // 不正 encode はそこまでの decode 結果を使う
+      next = tolerantDecodeOnce(cur);
     }
     if (next === cur) break;
     cur = next;

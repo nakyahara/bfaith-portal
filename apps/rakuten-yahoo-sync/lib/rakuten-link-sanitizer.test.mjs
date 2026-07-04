@@ -62,6 +62,15 @@ test('Codex R1 High: 二重エンコードも反復 decode で検知', () => {
   assert.equal(r.length, 1, 'residue backstop も二重エンコードを検知');
 });
 
+test('Codex R2 High: 不正 % (%ZZ) が混在しても %2E エンコード楽天ドメインを検知', () => {
+  const href = 'https://shopping.yahoo.co.jp/bouncer.html?bad=%ZZ&dest_path=https%3A%2F%2Fitem%2Erakuten%2Eco%2Ejp%2Fb-faith%2FAA0203%2F';
+  const c = classifyRakutenHref(href);
+  assert.equal(c.kind, 'rewrite');
+  assert.equal(c.yahooUrl, 'https://store.shopping.yahoo.co.jp/b-faith/aa0203.html');
+  const r = findRakutenResidueInFields({ additional1: href });
+  assert.equal(r.length, 1, 'residue backstop も不正%混在形を検知');
+});
+
 test('他店の楽天商品リンク → remove', () => {
   const c = classifyRakutenHref('https://item.rakuten.co.jp/other-shop/xyz123/');
   assert.equal(c.kind, 'remove');
