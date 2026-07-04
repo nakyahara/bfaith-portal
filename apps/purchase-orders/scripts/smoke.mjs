@@ -4,6 +4,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { pathToFileURL, fileURLToPath } from 'url';
+import iconv from 'iconv-lite';
 
 const SCRATCH = fs.mkdtempSync(path.join(os.tmpdir(), 'po-smoke-'));
 process.env.DATA_DIR = SCRATCH;
@@ -239,6 +240,86 @@ ok(noflyComma && noflyComma.stock === 1254, 'カンマ除去して数値化 (1,2
 await j('/api/ne-overlay', { method: 'DELETE' });
 db.prepare(`UPDATE mirror_pml_snapshot_rows SET FBA在庫数=NULL WHERE 商品コード='noflyersticker'`).run();
 
+console.log('── 生スプシCSV 自動判別取込 + 文字コード ──');
+// 生の「発注条件マスタ」スプレッドシートDL形式 (列名が仕入先/商品グループID管理名 等)。商品名に壊れ文字 � を混ぜる
+const rawShohin = '商品コード,商品名,確認FLG,仕入先,仕入れ先名,商品グループID,商品グループID管理名,原料グループID,原料グループID管理名,容量/個,取扱区分,原価,発注ロット単位,ケースグループ,ケースロット\r\n' +
+  'cardbarrierperfect100,KMCカードバリアー,1,0199,テスト�商事,KMC,KMCカードバリア,,,,取扱中,230,360,,\r\n' +
+  'diyorangeoil100,木工用オレンジオイル,1,0199,テスト�商事,,,mokouorange,木工用オレンジオイル,100,取扱中,270,600,,\r\n' +
+  'noflyersticker,チラシお断り,1,0199,テスト�商事,,,,,,取扱中,70,100,,\r\n';
+const rawJyoken = '条件ID,仕入先,メーカー名,商品グループID管理名,条件タイプ,条件値,単位\r\n' +
+  'KMC,1,KMC,KMCカードバリア,数量,360,個\r\n';
+const rawGenryo = '原料グループID,原料グループ名,最低発注量,単位\r\n' +
+  'mokouorange,木工用オレンジオイル,100000,ml\r\n';
+const fdImp = new FormData();
+fdImp.append('files', new Blob([rawShohin], { type: 'text/csv' }), '発注条件マスタ - 商品マスタ.csv');
+fdImp.append('files', new Blob([rawJyoken], { type: 'text/csv' }), '発注条件マスタ - 発注条件マスタ.csv');
+fdImp.append('files', new Blob([rawGenryo], { type: 'text/csv' }), '発注条件マスタ - 原料グループマスタ.csv');
+r = await j('/api/import', { method: 'POST', body: fdImp });
+ok(r.status === 200 && r.body.ok, '生スプシ3ファイル 一括取込 成功', r.body && r.body.summary);
+ok(r.body.counts && r.body.counts.suppliers === 1 && r.body.counts.conditions === 1 && r.body.counts.materials === 1 && r.body.counts.attrs === 2,
+  '商品マスタ→仕入先1+紐付け2 / 条件1 / 原料1', r.body && r.body.counts);
+r = await j('/api/masters/suppliers');
+const sup199 = r.body.rows.find(x => x.supplier_code === '199');
+ok(sup199 && sup199.name === 'テスト�商事', '文字コード: 壊れ文字�を含む名前もそのまま保持 (Shift-JIS誤判定しない)', sup199 && sup199.name);
+r = await j('/api/masters/attrs');
+const cbp = r.body.rows.find(x => x.product_key === 'cardbarrierperfect100');
+ok(cbp && cbp.condition_id === 'KMC', '同一バッチ内で条件を先に入れて紐付けが成立 (dangling回避)', cbp && cbp.condition_id);
+// 判別できないファイルは 400
+const fdBad = new FormData();
+fdBad.append('files', new Blob(['foo,bar\r\n1,2\r\n']), 'nazo.csv');
+r = await j('/api/import', { method: 'POST', body: fdBad });
+ok(r.status === 400 && r.body.errors && r.body.errors.length === 1, '種類判別不能ファイルは 400 + errors', r.body);
+
+// Shift_JIS 実バイト列 (丸数字①/半角ｶﾅ/波ダッシュ〜 を含む) の fallback デコード
+const sjisGenryo = '原料グループID,原料グループ名,最低発注量,単位\r\n' +
+  'sjistest,①ﾃｽﾄ原料ｰA,500,g\r\n';
+const fdSjis = new FormData();
+fdSjis.append('files', new Blob([iconv.encode(sjisGenryo, 'Shift_JIS')], { type: 'text/csv' }), '発注条件マスタ - 原料グループマスタ.csv');
+r = await j('/api/import', { method: 'POST', body: fdSjis });
+ok(r.status === 200 && r.body.ok, 'Shift_JIS 実バイトCSV 取込成功', r.body && r.body.summary);
+r = await j('/api/masters/materials');
+const sjisRow = r.body.rows.find(x => x.group_id === 'sjistest');
+ok(sjisRow && sjisRow.name === '①ﾃｽﾄ原料ｰA', 'Shift_JIS: 丸数字/半角カナを正しくデコード', sjisRow && sjisRow.name);
+
+// 数値不正・dangling は「スキップ+warnings」で取込は続行 (rollbackしない)
+const fdWarn = new FormData();
+fdWarn.append('files', new Blob(['条件ID,仕入先,条件タイプ,条件値,単位\r\nWARNCOND,1,数量,36O,個\r\n'], { type: 'text/csv' }), '発注条件マスタ - 発注条件マスタ.csv');
+fdWarn.append('files', new Blob(['商品コード,商品名,仕入先,商品グループID,原料グループID\r\ndanglingprod,ダングリング,1,,nonexistgroup\r\n'], { type: 'text/csv' }), '発注条件マスタ - 商品マスタ.csv');
+r = await j('/api/import', { method: 'POST', body: fdWarn });
+ok(r.status === 200 && r.body.ok, '数値不正/dangling でも200で続行', r.body && r.body.summary);
+ok(r.body.skipped && r.body.skipped.conditions === 1, '条件値36O は数値不正でスキップ', r.body && r.body.skipped);
+ok(r.body.warnings && r.body.warnings.some(w => w.includes('36O')), '不正数値がwarningsに記録される', r.body && r.body.warnings);
+ok(r.body.warnings && r.body.warnings.some(w => w.includes('原料グループ')), 'dangling原料グループ参照がwarningsに記録される', r.body && r.body.warnings);
+
+// NE商品マスタCSV (商品コード+仕入先だけ、発注特有列なし) は shohin と誤判定しない
+const fdNeMaster = new FormData();
+fdNeMaster.append('files', new Blob(['商品コード,仕入先コード,在庫数,発注残数\r\nx1,1,10,0\r\n'], { type: 'text/csv' }), 'ネクストエンジン商品マスタ.csv');
+r = await j('/api/import', { method: 'POST', body: fdNeMaster });
+ok(r.status === 400, 'NE商品マスタCSVは /api/import で誤判定しない (400)', r.body);
+
+// 負の最低発注量はDB CHECKで500にせず、null化+警告で取込続行 (CRUD挙動と整合)
+const fdNeg = new FormData();
+fdNeg.append('files', new Blob(['原料グループID,原料グループ名,最低発注量,単位\r\nneggrp,負テスト,-5,個\r\n'], { type: 'text/csv' }), '発注条件マスタ - 原料グループマスタ.csv');
+r = await j('/api/import', { method: 'POST', body: fdNeg });
+ok(r.status === 200 && r.body.counts.materials === 1, '負の最低発注量でも500にならず取込続行', r.body);
+ok(r.body.warnings && r.body.warnings.some(w => w.includes('最低発注量')), '負の最低発注量がwarningsに記録', r.body && r.body.warnings);
+r = await j('/api/masters/materials');
+const negRow = r.body.rows.find(x => x.group_id === 'neggrp');
+ok(negRow && negRow.min_order_qty == null, '負値はnull化されて格納', negRow && negRow.min_order_qty);
+
+// dangling (未登録グループ参照) は unlinked API の dangling で可視化される
+r = await j('/api/attrs/unlinked?days=0');
+ok(r.body.ok && Array.isArray(r.body.dangling), 'unlinked APIに dangling リスト', r.body && r.body.danglingCount);
+ok(r.body.dangling.some(x => x.missMat === 'nonexistgroup'), 'dangling: danglingprod の未登録原料グループが可視化', r.body && r.body.dangling);
+
+console.log('── 未紐付け 新商品フィルタ ──');
+// 登録日が古い商品は既定(60日)では出ない、days=0で全件
+db.prepare(`UPDATE mirror_pml_snapshot_rows SET 登録日='2020-01-01' WHERE 商品コード='0726-001060'`).run();
+r = await j('/api/attrs/unlinked?days=60');
+ok(r.body.ok && r.body.rows.every(x => x.code !== '0726-001060'), '古い商品は直近60日フィルタで除外', r.body && r.body.count);
+r = await j('/api/attrs/unlinked?days=0');
+ok(r.body.ok && typeof r.body.totalUnlinked === 'number', 'days=0 で全件モード');
+
 console.log('── 画面 (HTML) ──');
 for (const p of ['/', '/supplier/1', '/orders', '/admin']) {
   const res = await fetch(base + p);
@@ -246,9 +327,9 @@ for (const p of ['/', '/supplier/1', '/orders', '/admin']) {
   ok(res.status === 200 && html.includes('<!DOCTYPE html>'), `GET ${p} → 200 HTML`);
   ok(!html.includes('undefined') || p === '/', `GET ${p} に undefined 露出なし`);
 }
-r = await j('/api/attrs/unlinked');
+r = await j('/api/attrs/unlinked?days=0');
 ok(r.body.ok && r.body.rows.every(x => x.code.toLowerCase() !== 'diyorangeoil100'), 'unlinked: 紐付け済みは出ない');
-ok(r.body.rows.some(x => x.code === '0726-001060'), 'unlinked: 未紐付け取扱中は出る');
+ok(r.body.rows.some(x => x.code === '0726-001060'), 'unlinked: 未紐付け取扱中は出る (全件)');
 
 server.close();
 console.log(`\n=== RESULT: pass=${pass} fail=${fail} ===`);

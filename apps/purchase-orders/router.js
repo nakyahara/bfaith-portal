@@ -64,15 +64,22 @@ function fmtJst(iso) {
   return `${j.getUTCFullYear()}-${p(j.getUTCMonth() + 1)}-${p(j.getUTCDate())} ${p(j.getUTCHours())}:${p(j.getUTCMinutes())}`;
 }
 
-/** CSV バッファ → 行配列 (UTF-8優先判定、失敗時 Shift_JIS)。RFC4180 対応の自前パーサ */
-function parseCsvBuffer(buf) {
-  let text;
+/** CSV バッファ → 行配列。文字コードは厳密UTF-8判定→ダメなら Shift_JIS。RFC4180 対応の自前パーサ */
+function decodeCsvBuffer(buf) {
+  // UTF-8 BOM は除去
   if (buf.length >= 3 && buf[0] === 0xEF && buf[1] === 0xBB && buf[2] === 0xBF) {
-    text = buf.slice(3).toString('utf8');
-  } else {
-    const utf8 = buf.toString('utf8');
-    text = utf8.includes('�') ? iconv.decode(buf, 'Shift_JIS') : utf8;
+    return buf.slice(3).toString('utf8');
   }
+  // 厳密UTF-8デコードを試す。成功すれば UTF-8 (商品名に壊れ文字 � が含まれていても、
+  //   バイト列として妥当な UTF-8 なら化けさせずそのまま採用する)。失敗時のみ Shift_JIS。
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(buf);
+  } catch {
+    return iconv.decode(buf, 'Shift_JIS');
+  }
+}
+function parseCsvBuffer(buf) {
+  const text = decodeCsvBuffer(buf);
   const rows = [];
   let row = [], field = '', inQ = false;
   for (let i = 0; i < text.length; i++) {
@@ -97,8 +104,9 @@ function parseCsvBuffer(buf) {
 }
 
 const trimS = v => String(v == null ? '' : v).trim();
+// 数値化。スプレッドシート由来の "20,000" 等のカンマ区切りも許容する。
 const numOrNull = v => {
-  const s = trimS(v);
+  const s = trimS(v).replace(/,/g, '');
   if (s === '') return null;
   const n = Number(s);
   return Number.isFinite(n) ? n : null;
@@ -520,6 +528,177 @@ router.post('/api/masters/:kind/csv', upload.single('file'), (req, res) => {
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
+// ─── スプレッドシートCSV 自動判別取込 (生のダウンロードCSVをそのまま受ける) ───
+// ヘッダー名の正規化 (空白/改行/全角空白/引用符を除去)。列名の表記ゆれを吸収する。
+const normHeader = s => String(s == null ? '' : s).replace(/[\s　"']/g, '');
+function colIndex(header, ...aliases) {
+  const norm = header.map(normHeader);
+  const wants = aliases.map(normHeader);
+  for (let i = 0; i < norm.length; i++) if (wants.includes(norm[i])) return i;
+  return -1;
+}
+const hasCol = (header, ...a) => colIndex(header, ...a) >= 0;
+
+// 数値パース (カンマ許容)。非空なのに数値化不能/範囲外の値は warn に記録して null (黙って欠落させない)。
+//   opts.min: これ未満(n<min)を却下 / opts.gt: これ以下(n<=gt)を却下 — DBのCHECK制約と揃える。
+function numOrWarn(raw, warn, ctx, opts = {}) {
+  const s = trimS(raw).replace(/,/g, '');
+  if (s === '') return null;
+  const n = Number(s);
+  if (!Number.isFinite(n)) { if (warn) warn(`${ctx}: 数値でない値「${trimS(raw)}」を無視しました`); return null; }
+  if (opts.min != null && n < opts.min) { if (warn) warn(`${ctx}: 範囲外の値「${n}」(${opts.min}以上が必要) を無視しました`); return null; }
+  if (opts.gt != null && n <= opts.gt) { if (warn) warn(`${ctx}: 範囲外の値「${n}」(${opts.gt}より大きい値が必要) を無視しました`); return null; }
+  return n;
+}
+
+// 各シート形式の判別 + 抽出。商品マスタは1枚から「仕入先(重複排除)」と「商品紐付け」の2種を作る。
+// extract(header, rows, warn): warn(msg) で行単位の注意を報告できる。
+const IMPORT_RECIPES = [
+  {
+    key: 'materials', label: '原料グループマスタ',
+    detect: h => hasCol(h, '原料グループID') && (hasCol(h, '最低発注量') || hasCol(h, '原料グループ名')),
+    extract(header, rows, warn) {
+      const iId = colIndex(header, '原料グループID'), iName = colIndex(header, '原料グループ名', '名称', '名前');
+      const iMin = colIndex(header, '最低発注量'), iUnit = colIndex(header, '単位');
+      const out = [];
+      for (let r = 1; r < rows.length; r++) {
+        const c = rows[r]; const id = trimS(c[iId]); if (!id) continue;
+        out.push({ table: 'materials', row: { group_id: id, name: trimS(c[iName]) || id, min_order_qty: iMin >= 0 ? numOrWarn(c[iMin], warn, `原料グループマスタ ${r + 1}行目 最低発注量`, { min: 0 }) : null, unit: iUnit >= 0 ? (trimS(c[iUnit]) || null) : null } });
+      }
+      return out;
+    },
+  },
+  {
+    key: 'conditions', label: '発注条件マスタ',
+    detect: h => hasCol(h, '条件ID') && hasCol(h, '条件タイプ'),
+    extract(header, rows, warn) {
+      const iId = colIndex(header, '条件ID'), iSup = colIndex(header, '仕入先コード', '仕入先');
+      const iMaker = colIndex(header, 'メーカー名', 'メーカー'), iName = colIndex(header, '管理名', '商品グループID管理名', 'グループ管理名');
+      const iType = colIndex(header, '条件タイプ'), iVal = colIndex(header, '条件値'), iUnit = colIndex(header, '単位');
+      const out = [];
+      for (let r = 1; r < rows.length; r++) {
+        const c = rows[r]; const id = trimS(c[iId]); if (!id) continue;
+        out.push({ table: 'conditions', row: {
+          condition_id: id,
+          supplier_code: iSup >= 0 ? (normSupplierCode(c[iSup]) || null) : null,
+          maker_name: iMaker >= 0 ? (trimS(c[iMaker]) || null) : null,
+          display_name: iName >= 0 ? (trimS(c[iName]) || id) : id,
+          condition_type: trimS(c[iType]), condition_value: numOrWarn(c[iVal], warn, `発注条件マスタ ${r + 1}行目(${id}) 条件値`),
+          unit: iUnit >= 0 ? (trimS(c[iUnit]) || null) : null,
+        } });
+      }
+      return out;
+    },
+  },
+  {
+    key: 'shohin', label: '商品マスタ (→ 仕入先 + 商品紐付け)',
+    // 商品コード + 発注特有の列 (グループID/容量/ケース) が揃うものだけ。NE商品マスタCSV(商品コード+仕入先のみ)は弾く。
+    detect: h => hasCol(h, '商品コード') && (hasCol(h, '商品グループID') || hasCol(h, '発注条件グループID') || hasCol(h, '原料グループID') || hasCol(h, '容量/個') || hasCol(h, '容量') || hasCol(h, 'ケースグループ') || hasCol(h, 'ケースロット')),
+    extract(header, rows, warn) {
+      const iCode = colIndex(header, '商品コード'), iSup = colIndex(header, '仕入先コード', '仕入先'), iSupName = colIndex(header, '仕入れ先名', '仕入先名');
+      const iGrp = colIndex(header, '商品グループID', '発注条件グループID'), iMat = colIndex(header, '原料グループID');
+      const iCap = colIndex(header, '容量/個', '容量_per_個', '容量'), iCg = colIndex(header, 'ケースグループ'), iCl = colIndex(header, 'ケースロット');
+      const out = []; const suppliers = new Map();
+      for (let r = 1; r < rows.length; r++) {
+        const c = rows[r]; const code = trimS(c[iCode]); if (!code) continue;
+        if (iSup >= 0) {
+          const sc = normSupplierCode(c[iSup]); const sn = iSupName >= 0 ? trimS(c[iSupName]) : '';
+          if (sc && sc.toUpperCase() !== '#N/A') { if (!suppliers.has(sc) || (sn && !suppliers.get(sc))) suppliers.set(sc, sn); }
+        }
+        const cond = iGrp >= 0 ? (trimS(c[iGrp]) || null) : null, mat = iMat >= 0 ? (trimS(c[iMat]) || null) : null;
+        const cap = iCap >= 0 ? numOrWarn(c[iCap], warn, `商品マスタ ${r + 1}行目(${code}) 容量/個`, { gt: 0 }) : null;
+        const cg = iCg >= 0 ? (trimS(c[iCg]) || null) : null, cl = iCl >= 0 ? numOrWarn(c[iCl], warn, `商品マスタ ${r + 1}行目(${code}) ケースロット`, { gt: 0 }) : null;
+        if (cond || mat || cap || cg || cl) {
+          out.push({ table: 'attrs', row: {
+            product_key: normProductCode(code), product_code: code,
+            condition_id: cond, material_group_id: mat,
+            capacity_per_unit: cap, case_group: cg, case_lot: cl,
+          } });
+        }
+      }
+      for (const [sc, sn] of suppliers) out.push({ table: 'suppliers', row: { supplier_code: sc, name: sn || `仕入先 ${sc}`, order_memo: null } });
+      return out;
+    },
+  },
+];
+
+// bulk取込の最低限バリデーション (満たさない行はスキップし件数を報告。全件rollbackはしない)
+function bulkValid(table, row) {
+  if (table === 'materials') return !!row.group_id && !!row.name;
+  if (table === 'conditions') return !!row.condition_id && !!row.display_name && !!row.condition_type && row.condition_value != null && row.condition_value >= 0;
+  if (table === 'suppliers') return !!row.supplier_code && !!row.name;
+  if (table === 'attrs') return !!row.product_code;
+  return false;
+}
+// スキップ理由 (どの必須が欠けたか) を人間に返す
+function bulkInvalidReason(table, row) {
+  if (table === 'materials') return `${row.group_id || '(ID空)'} — 原料グループID/名称が不足`;
+  if (table === 'conditions') {
+    const bits = [];
+    if (!row.condition_type) bits.push('条件タイプ空');
+    if (row.condition_value == null) bits.push('条件値が数値でない');
+    else if (row.condition_value < 0) bits.push('条件値が負');
+    return `${row.condition_id || '(ID空)'} — ${bits.join('/') || '必須不足'}`;
+  }
+  if (table === 'suppliers') return `${row.supplier_code || '(コード空)'} — 仕入先コード/名称が不足`;
+  if (table === 'attrs') return '商品コードが空';
+  return '不正な行';
+}
+const TABLE_LABEL = { materials: '原料グループ', conditions: '発注条件グループ', suppliers: '仕入先', attrs: '商品紐付け' };
+
+router.post('/api/import', upload.array('files', 12), (req, res) => {
+  if (!req.files || !req.files.length) return res.status(400).json({ ok: false, error: 'CSVファイルを選択してください' });
+  const classified = []; const fileErrors = []; const warnings = [];
+  const warn = m => { if (warnings.length < 200) warnings.push(m); };
+  for (const f of req.files) {
+    let buf; try { buf = fs.readFileSync(f.path); } finally { try { fs.unlinkSync(f.path); } catch {} }
+    let rows;
+    try { rows = parseCsvBuffer(buf); } catch (e) { fileErrors.push(`${f.originalname}: 読込失敗 (${e.message})`); continue; }
+    if (rows.length < 2) { fileErrors.push(`${f.originalname}: データ行がありません`); continue; }
+    const header = rows[0].map(trimS);
+    const recipe = IMPORT_RECIPES.find(rc => rc.detect(header));
+    if (!recipe) { fileErrors.push(`${f.originalname}: 種類を判別できません (見出し: ${header.slice(0, 6).join(' / ')})`); continue; }
+    // 列数ズレ検出 (未閉じクォート等で行が壊れていないか)。空行は無視。
+    let mismatch = 0;
+    for (let r = 1; r < rows.length; r++) {
+      const c = rows[r]; if (c.length === 1 && trimS(c[0]) === '') continue;
+      if (c.length !== header.length) mismatch++;
+    }
+    if (mismatch) warn(`${f.originalname}: 見出し${header.length}列に対し列数が違う行が${mismatch}件あります (CSVの破損の可能性、値ズレに注意)`);
+    classified.push({ name: f.originalname, recipe, items: recipe.extract(header, rows, warn) });
+  }
+  if (fileErrors.length) return res.status(400).json({ ok: false, error: '取り込めないファイルがあります', errors: fileErrors });
+  // 依存順 (原料/条件 → 仕入先 → 紐付け) に並べて1トランザクションで upsert
+  const order = { materials: 1, conditions: 2, suppliers: 3, attrs: 4 };
+  const all = classified.flatMap(c => c.items).sort((a, b) => order[a.table] - order[b.table]);
+  const counts = { materials: 0, conditions: 0, suppliers: 0, attrs: 0 };
+  const skipped = { materials: 0, conditions: 0, suppliers: 0, attrs: 0 };
+  const db = getDB();
+  try {
+    db.transaction(() => {
+      for (const it of all) {
+        if (!bulkValid(it.table, it.row)) {
+          skipped[it.table]++;
+          warn(`${TABLE_LABEL[it.table]}: ${bulkInvalidReason(it.table, it.row)} — 1件スキップ`);
+          continue;
+        }
+        upsertMasterRow(MASTER_DEFS[it.table], it.row);
+        counts[it.table]++;
+      }
+    })();
+  } catch (e) { return res.status(500).json({ ok: false, error: '取込中にエラー: ' + e.message }); }
+  // dangling参照チェック (attrs が指す 発注条件グループ / 原料グループ が未登録)。取込は止めず警告のみ。
+  try {
+    const dCond = db.prepare(`SELECT COUNT(*) n FROM po_product_attrs a WHERE a.condition_id IS NOT NULL AND a.condition_id<>'' AND NOT EXISTS (SELECT 1 FROM po_order_conditions c WHERE c.condition_id=a.condition_id)`).get().n;
+    const dMat = db.prepare(`SELECT COUNT(*) n FROM po_product_attrs a WHERE a.material_group_id IS NOT NULL AND a.material_group_id<>'' AND NOT EXISTS (SELECT 1 FROM po_material_groups g WHERE g.group_id=a.material_group_id)`).get().n;
+    if (dCond) warn(`未登録の発注条件グループを参照している商品が${dCond}件あります (発注条件マスタ側の登録漏れの可能性)`);
+    if (dMat) warn(`未登録の原料グループを参照している商品が${dMat}件あります (原料グループマスタ側の登録漏れの可能性)`);
+  } catch {}
+  const summary = Object.keys(counts).filter(k => counts[k] || skipped[k])
+    .map(k => `${TABLE_LABEL[k]} ${counts[k]}件${skipped[k] ? ` (スキップ${skipped[k]})` : ''}`);
+  res.json({ ok: true, counts, skipped, summary, warnings, files: classified.map(c => ({ name: c.name, type: c.recipe.label })) });
+});
+
 // ─── NE商品マスタCSV オーバーレイ (日中の最新化) ───
 // NE管理画面から手動DLした商品マスタCSV (Shift-JIS) を取り込み、在庫数・注残数・原価等を最新値で上書き計算する。
 // FBA在庫・販売数・推奨保有月数はPMLのまま。翌朝の同期より古くなったら自動で無視される。
@@ -632,87 +811,146 @@ router.get('/api/refresh-fba/jobs/:jobId', async (req, res) => {
   } catch (e) { res.status(502).json({ error: 'ジョブ状態の取得に失敗: ' + e.message }); }
 });
 
-// 取扱中なのにどのグループにも未紐付けの商品 (登録漏れチェック用)
+// 取扱中なのにどのグループにも未紐付けの商品。新商品の登録漏れチェック用。
+//   ?days=N (既定60): 登録日が直近N日以内の「新商品」だけに絞る (0=全件、日中に増えた分を検知)。
+//   PMLは毎朝同期なので、NE登録された新商品は翌朝ここに自動で載る (このAPIは都度ライブ計算)。
 router.get('/api/attrs/unlinked', (req, res) => {
   try {
+    const daysParam = req.query.days == null ? 60 : parseInt(req.query.days, 10);
+    const days = Number.isFinite(daysParam) ? daysParam : 60;
+    // JST「今日0時」を基準に N 日前0時から (時刻依存の1日ズレを防ぐ、登録日は日単位)
+    const jstMidnight = Date.parse(new Date(Date.now() + 9 * 3600000).toISOString().slice(0, 10) + 'T00:00:00+09:00');
+    const since = days > 0 ? jstMidnight - (days - 1) * 86400000 : null;
     const { rows } = loadPmlMerged();
     const { attrs } = loadMasters();
-    const unlinked = [];
+    const all = [];
+    let recentCount = 0;
     for (const r of rows) {
       if (String(r['取扱区分'] || '') !== '取扱中') continue;
       const key = normProductCode(r['商品コード']);
-      if (!attrs.has(key)) unlinked.push({ code: r['商品コード'], name: r['商品名'] || '', supplier: normSupplierCode(r['仕入先']) });
+      if (attrs.has(key)) continue;
+      const reg = r['登録日'] ? String(r['登録日']).slice(0, 10) : '';
+      const regTs = reg ? Date.parse(reg + 'T00:00:00+09:00') : NaN;
+      const isRecent = since != null && !Number.isNaN(regTs) && regTs >= since;
+      if (isRecent) recentCount++;
+      all.push({ code: r['商品コード'], name: r['商品名'] || '', supplier: normSupplierCode(r['仕入先']), reg, isRecent });
     }
-    res.json({ ok: true, count: unlinked.length, rows: unlinked.slice(0, 500) });
+    const filtered = since != null ? all.filter(x => x.isRecent) : all;
+    filtered.sort((a, b) => (b.reg || '').localeCompare(a.reg || ''));
+    // 紐付けはあるが未登録グループを参照している商品 (取込警告が消えても見失わないよう常時可視化)
+    const db = getDB();
+    const dangling = db.prepare(`
+      SELECT a.product_code AS code,
+             CASE WHEN a.condition_id IS NOT NULL AND a.condition_id<>'' AND c.condition_id IS NULL THEN a.condition_id END AS missCond,
+             CASE WHEN a.material_group_id IS NOT NULL AND a.material_group_id<>'' AND g.group_id IS NULL THEN a.material_group_id END AS missMat
+      FROM po_product_attrs a
+      LEFT JOIN po_order_conditions c ON c.condition_id = a.condition_id
+      LEFT JOIN po_material_groups g ON g.group_id = a.material_group_id
+      WHERE (a.condition_id IS NOT NULL AND a.condition_id<>'' AND c.condition_id IS NULL)
+         OR (a.material_group_id IS NOT NULL AND a.material_group_id<>'' AND g.group_id IS NULL)
+      LIMIT 500
+    `).all();
+    res.json({ ok: true, totalUnlinked: all.length, recentCount, days, count: filtered.length, rows: filtered.slice(0, 500), danglingCount: dangling.length, dangling });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
 // ═══════════════════════════ 画面 ═══════════════════════════
 
 const CSS = `
+  :root {
+    --bg: #eef1f6; --card: #ffffff; --ink: #1f2733; --sub: #64748b; --line: #e6eaf0;
+    --accent: #2563eb; --accent-d: #1d4ed8; --accent-soft: #eef4ff;
+    --ok: #16a34a; --ok-soft: #e9f7ee; --warnc: #b45309; --warn-soft: #fff7e6; --danger: #dc2626; --danger-soft: #fdecec;
+    --shadow: 0 1px 2px rgba(16,24,40,.06), 0 1px 3px rgba(16,24,40,.10);
+    --shadow-h: 0 6px 18px rgba(37,99,235,.14);
+  }
   * { box-sizing: border-box; }
-  body { font-family: 'Hiragino Sans', 'Yu Gothic UI', Meiryo, sans-serif; margin: 0; background: #f2f4f7; color: #1f2733; }
-  header.app { background: #16324f; color: #fff; padding: 10px 18px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
-  header.app h1 { font-size: 16px; margin: 0; }
-  header.app a { color: #bcd6f0; text-decoration: none; font-size: 13px; }
-  header.app a:hover { text-decoration: underline; }
-  .fresh { font-size: 12px; color: #cfe0f2; margin-left: auto; }
-  .wrap { padding: 16px 18px; max-width: 1500px; margin: 0 auto; }
-  .warn { background: #fff3cd; border: 1px solid #e0c05a; color: #6b5308; padding: 8px 12px; border-radius: 6px; margin-bottom: 12px; font-size: 13px; }
-  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
-  .card { background: #fff; border: 1px solid #dde3ea; border-radius: 8px; padding: 14px; display: block; text-decoration: none; color: inherit; }
-  .card:hover { border-color: #4a7fb5; box-shadow: 0 2px 6px rgba(22,50,79,.12); }
-  .card .nm { font-weight: 600; font-size: 14px; margin-bottom: 4px; }
-  .card .memo { font-size: 11px; color: #8a6d1a; }
-  .card .stats { display: flex; gap: 14px; margin-top: 8px; font-size: 12px; color: #4a5568; }
-  .card .stats b { font-size: 17px; color: #16324f; }
-  .badge { display: inline-block; font-size: 11px; border-radius: 10px; padding: 1px 8px; vertical-align: middle; }
-  .b-draft { background: #e7f0fb; color: #205493; border: 1px solid #a9c6e8; }
-  .b-issued { background: #e8f6ec; color: #1c7c3c; border: 1px solid #a3d9b3; }
-  .b-warn { background: #fdecea; color: #9c2b23; border: 1px solid #efb7b2; }
-  table.t { border-collapse: collapse; width: 100%; background: #fff; font-size: 12px; }
-  table.t th, table.t td { border: 1px solid #dde3ea; padding: 4px 7px; }
-  table.t th { background: #eef2f7; position: sticky; top: 0; white-space: nowrap; }
+  body { font-family: 'Hiragino Sans','Yu Gothic UI',Meiryo,system-ui,sans-serif; margin: 0; background: var(--bg); color: var(--ink); -webkit-font-smoothing: antialiased; }
+  header.app { background: linear-gradient(90deg,#111c33,#1e3a63); color: #fff; padding: 0 20px; display: flex; align-items: center; gap: 4px; position: sticky; top: 0; z-index: 40; box-shadow: 0 1px 8px rgba(0,0,0,.18); }
+  header.app h1 { font-size: 16px; margin: 0 18px 0 0; font-weight: 700; letter-spacing: .01em; display: flex; align-items: center; height: 52px; }
+  header.app nav.tabs { display: flex; gap: 2px; height: 52px; }
+  header.app nav.tabs a { color: #c8d6ec; text-decoration: none; font-size: 13.5px; padding: 0 14px; display: flex; align-items: center; border-bottom: 3px solid transparent; }
+  header.app nav.tabs a:hover { color: #fff; background: rgba(255,255,255,.06); }
+  header.app nav.tabs a.on { color: #fff; border-bottom-color: #5b9bff; font-weight: 600; }
+  header.app .sp { margin-left: auto; }
+  header.app a.back { color: #9fb3d4; text-decoration: none; font-size: 13px; padding: 0 8px; }
+  header.app a.back:hover { color: #fff; }
+  .wrap { padding: 20px 22px 60px; max-width: 1560px; margin: 0 auto; }
+  h2.page { font-size: 19px; margin: 4px 0 16px; font-weight: 700; }
+  .warn { background: var(--warn-soft); border: 1px solid #f0d089; color: var(--warnc); padding: 10px 14px; border-radius: 10px; margin-bottom: 14px; font-size: 13px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(268px, 1fr)); gap: 14px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px 16px 14px; display: block; text-decoration: none; color: inherit; box-shadow: var(--shadow); transition: transform .08s, box-shadow .12s, border-color .12s; }
+  a.card:hover { border-color: #b9d0ff; box-shadow: var(--shadow-h); transform: translateY(-2px); }
+  .card .nm { font-weight: 700; font-size: 15px; margin-bottom: 6px; line-height: 1.4; }
+  .card .memo { font-size: 11.5px; color: var(--warnc); background: var(--warn-soft); border-radius: 6px; padding: 2px 7px; display: inline-block; margin-bottom: 6px; }
+  .card .stats { display: flex; gap: 18px; margin-top: 10px; font-size: 12px; color: var(--sub); }
+  .card .stats .n { font-size: 21px; color: var(--ink); font-weight: 700; display: block; line-height: 1.1; font-variant-numeric: tabular-nums; }
+  .card .stats .n.acc { color: var(--accent); }
+  .badge { display: inline-block; font-size: 11px; border-radius: 999px; padding: 2px 9px; vertical-align: middle; font-weight: 600; }
+  .b-draft { background: var(--accent-soft); color: var(--accent-d); }
+  .b-issued { background: var(--ok-soft); color: var(--ok); }
+  .b-warn { background: var(--danger-soft); color: var(--danger); }
+  table.t { border-collapse: separate; border-spacing: 0; width: 100%; background: var(--card); font-size: 12.5px; }
+  table.t th, table.t td { border-bottom: 1px solid var(--line); padding: 8px 10px; text-align: left; }
+  table.t th { background: #f7f9fc; color: var(--sub); font-weight: 600; position: sticky; top: 52px; white-space: nowrap; font-size: 11.5px; letter-spacing: .02em; z-index: 1; }
+  table.t tbody tr:hover td { background: #f9fbff; }
   table.t td.r, table.t th.r { text-align: right; font-variant-numeric: tabular-nums; }
-  .sec { background: #fff; border: 1px solid #dde3ea; border-radius: 8px; margin-bottom: 14px; overflow: hidden; }
-  .sec > h2 { font-size: 13px; margin: 0; padding: 8px 12px; background: #eef2f7; border-bottom: 1px solid #dde3ea; cursor: pointer; user-select: none; }
-  .sec .bd { padding: 10px 12px; overflow-x: auto; }
-  button { font: inherit; border-radius: 6px; border: 1px solid #c3ccd6; background: #fff; padding: 6px 14px; cursor: pointer; }
-  button:hover { background: #f0f4f8; }
-  button.pri { background: #16324f; border-color: #16324f; color: #fff; }
-  button.pri:hover { background: #234a70; }
-  button.ghost { border: none; background: none; color: #205493; padding: 2px 6px; }
-  input[type=text], input[type=number], select, textarea { font: inherit; border: 1px solid #c3ccd6; border-radius: 5px; padding: 4px 7px; }
-  input[type=number] { width: 84px; text-align: right; }
-  .gauge { margin: 4px 0; font-size: 12px; }
-  .gauge .bar { height: 8px; border-radius: 4px; background: #e3e8ee; overflow: hidden; margin-top: 2px; }
-  .gauge .bar > div { height: 100%; background: #d9822b; }
-  .gauge.met .bar > div { background: #2f9e44; }
-  .muted { color: #7a8694; font-size: 11px; }
-  .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
-  #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #16324f; color: #fff; padding: 10px 22px; border-radius: 8px; display: none; z-index: 50; font-size: 13px; }
-  .tabbar { display: flex; gap: 4px; margin-bottom: 12px; }
-  .tabbar button.on { background: #16324f; color: #fff; border-color: #16324f; }
-  .grid2 { display: grid; grid-template-columns: 1fr 340px; gap: 14px; align-items: start; }
+  .sec { background: var(--card); border: 1px solid var(--line); border-radius: 14px; margin-bottom: 16px; overflow: hidden; box-shadow: var(--shadow); }
+  .sec > h2 { font-size: 14px; margin: 0; padding: 12px 16px; background: #f7f9fc; border-bottom: 1px solid var(--line); user-select: none; font-weight: 700; }
+  .sec > h2[data-sec] { cursor: pointer; }
+  .sec .bd { padding: 14px 16px; overflow-x: auto; }
+  button { font: inherit; font-size: 13px; border-radius: 9px; border: 1px solid #cbd5e1; background: #fff; padding: 8px 15px; cursor: pointer; color: var(--ink); transition: background .1s, border-color .1s, box-shadow .1s; font-weight: 500; }
+  button:hover { background: #f1f5f9; border-color: #94a3b8; }
+  button.pri { background: var(--accent); border-color: var(--accent); color: #fff; box-shadow: 0 1px 2px rgba(37,99,235,.3); }
+  button.pri:hover { background: var(--accent-d); border-color: var(--accent-d); }
+  button.ok { background: var(--ok); border-color: var(--ok); color: #fff; }
+  button.ok:hover { filter: brightness(.94); }
+  button.ghost { border: none; background: none; color: var(--accent); padding: 3px 6px; font-weight: 500; }
+  button.ghost:hover { background: var(--accent-soft); }
+  button.sm { padding: 4px 10px; font-size: 12px; }
+  button:disabled { opacity: .5; cursor: default; }
+  input[type=text], input[type=number], select, textarea { font: inherit; font-size: 13px; border: 1px solid #cbd5e1; border-radius: 8px; padding: 7px 10px; background: #fff; color: var(--ink); }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  input[type=number] { width: 88px; text-align: right; }
+  input[type=file] { font-size: 12px; }
+  .gauge { margin: 8px 0; font-size: 12.5px; }
+  .gauge .bar { height: 9px; border-radius: 999px; background: #e8edf3; overflow: hidden; margin-top: 4px; }
+  .gauge .bar > div { height: 100%; background: linear-gradient(90deg,#f0a94b,#e0872b); border-radius: 999px; transition: width .3s; }
+  .gauge.met .bar > div { background: linear-gradient(90deg,#4ade80,#16a34a); }
+  .muted { color: var(--sub); font-size: 12px; }
+  .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
+  #toast { position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%); background: #111c33; color: #fff; padding: 11px 24px; border-radius: 10px; display: none; z-index: 60; font-size: 13.5px; box-shadow: 0 8px 24px rgba(0,0,0,.25); }
+  .tabbar { display: flex; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }
+  .tabbar button { border-radius: 999px; background: #fff; }
+  .tabbar button.on { background: var(--accent); color: #fff; border-color: var(--accent); box-shadow: 0 1px 3px rgba(37,99,235,.3); }
+  .grid2 { display: grid; grid-template-columns: 1fr 360px; gap: 16px; align-items: start; }
   @media (max-width: 1000px) { .grid2 { grid-template-columns: 1fr; } }
-  .cart { position: sticky; top: 10px; }
-  .cart .tot { font-size: 13px; margin: 6px 0; }
-  .cart .tot b { font-size: 18px; }
-  pre.copy { background: #f6f8fa; border: 1px solid #dde3ea; border-radius: 6px; padding: 10px; font-size: 12px; max-height: 300px; overflow: auto; white-space: pre; }
+  .cart { position: sticky; top: 68px; }
+  .cart .tot { font-size: 13px; margin: 8px 0; }
+  .cart .tot b { font-size: 19px; }
+  pre.copy { background: #0f172a; color: #e2e8f0; border-radius: 10px; padding: 12px 14px; font-size: 12.5px; max-height: 320px; overflow: auto; white-space: pre; line-height: 1.5; }
+  .import-zone { background: linear-gradient(135deg,#f0f6ff,#eef4ff); border: 1.5px dashed #9fbdf5; border-radius: 14px; padding: 18px 20px; margin-bottom: 18px; }
+  .import-zone h3 { margin: 0 0 6px; font-size: 15px; }
+  .import-zone .hint { font-size: 12.5px; color: var(--sub); margin-bottom: 12px; line-height: 1.6; }
+  .import-zone .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .pill-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+  .pill { background: #fff; border: 1px solid var(--line); border-radius: 999px; padding: 3px 11px; font-size: 12px; color: var(--sub); }
 `;
 
-function pageShell(title, nav, body, script) {
+function pageShell(title, active, body, script) {
+  const tab = (href, label, key) => `<a href="${href}"${active === key ? ' class="on"' : ''}>${label}</a>`;
   return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${he(title)}</title><style>${CSS}</style></head>
 <body>
 <header class="app">
   <h1>📦 発注補助</h1>
-  <a href="/apps/purchase-orders">ダッシュボード</a>
-  <a href="/apps/purchase-orders/orders">発注履歴</a>
-  <a href="/apps/purchase-orders/admin">マスタ管理</a>
-  <a href="/dashboard">← ポータル</a>
-  ${nav || ''}
+  <nav class="tabs">
+    ${tab('/apps/purchase-orders', 'ダッシュボード', 'dash')}
+    ${tab('/apps/purchase-orders/orders', '発注履歴', 'orders')}
+    ${tab('/apps/purchase-orders/admin', 'マスタ管理', 'admin')}
+  </nav>
+  <a href="/dashboard" class="back sp">← ポータルに戻る</a>
 </header>
 <div class="wrap">${body}</div>
 <div id="toast"></div>
@@ -720,7 +958,7 @@ function pageShell(title, nav, body, script) {
 function toast(msg) {
   var t = document.getElementById('toast');
   t.textContent = msg; t.style.display = 'block';
-  clearTimeout(t._h); t._h = setTimeout(function(){ t.style.display = 'none'; }, 2500);
+  clearTimeout(t._h); t._h = setTimeout(function(){ t.style.display = 'none'; }, 2800);
 }
 function yen(n) { return '¥' + Math.round(n).toLocaleString('ja-JP'); }
 function esc(s) { s = (s == null ? '' : String(s)); return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
@@ -773,8 +1011,8 @@ router.get('/', (req, res) => {
       <div class="nm">${he(c.name)} ${c.hasDraft ? '<span class="badge b-draft">下書きあり</span>' : ''}</div>
       ${c.memo ? `<div class="memo">📌 ${he(c.memo)}</div>` : ''}
       <div class="stats">
-        <span>要発注 <b>${c.targetCount}</b> SKU</span>
-        <span>推奨額 <b>¥${c.estAmount.toLocaleString('ja-JP')}</b></span>
+        <span><span class="n${c.targetCount ? ' acc' : ''}">${c.targetCount}</span>要発注 SKU</span>
+        <span><span class="n">¥${c.estAmount.toLocaleString('ja-JP')}</span>推奨額(原価)</span>
       </div>
     </a>`;
   const body = `
@@ -793,7 +1031,7 @@ router.get('/', (req, res) => {
       <span id="opStatus" class="muted"></span>
     </div>
     <div id="searchResult"></div>
-    <h2 style="font-size:15px">発注が必要な仕入先 (${cards.length})</h2>
+    <h2 class="page" style="font-size:16px">発注が必要な仕入先 <span class="muted">(${cards.length})</span></h2>
     <div class="cards">${cards.map(cardHtml).join('')}</div>
     <details style="margin-top:18px"><summary class="muted" style="cursor:pointer">その他の仕入先 (${others.length}) — 要発注なし</summary>
       <div class="cards" style="margin-top:10px">${others.map(cardHtml).join('')}</div>
@@ -882,7 +1120,7 @@ if (btnNeClear) btnNeClear.addEventListener('click', function() {
     .then(function(r){ return r.json(); })
     .then(function(j){ if (j.ok) location.reload(); else alert(j.error); });
 });`;
-  res.send(pageShell('発注補助 — ダッシュボード', '', body, script));
+  res.send(pageShell('発注補助 — ダッシュボード', 'dash', body, script));
 });
 
 // ─── 画面2: 仕入先ワークスペース ───
@@ -895,7 +1133,7 @@ router.get('/supplier/:code', (req, res) => {
 
   const body = `
     <div class="toolbar">
-      <h2 style="margin:0;font-size:17px">${he(data.supplier.name)} <span class="muted">(コード ${he(data.supplier.code)})</span></h2>
+      <h2 class="page" style="margin:0">${he(data.supplier.name)} <span class="muted">(コード ${he(data.supplier.code)})</span></h2>
       ${data.supplier.memo ? `<span class="badge b-warn">📌 ${he(data.supplier.memo)}</span>` : ''}
       <span class="muted">${data.pub ? freshnessText(data.pub, data.overlay) : 'PML未同期'}</span>
     </div>
@@ -1104,8 +1342,8 @@ renderAll();`;
 // ─── 画面3: 発注履歴 ───
 router.get('/orders', (req, res) => {
   const body = `
-    <h2 style="font-size:15px">発注履歴</h2>
-    <div id="list">読み込み中…</div>
+    <h2 class="page">発注履歴</h2>
+    <div class="sec"><div class="bd" id="list">読み込み中…</div></div>
     <div class="sec" id="detail" style="display:none"><h2 id="detailTitle"></h2><div class="bd" id="detailBody"></div></div>`;
   const script = `
 function load() {
@@ -1144,19 +1382,33 @@ document.addEventListener('click', function(ev) {
   });
 });
 load();`;
-  res.send(pageShell('発注補助 — 発注履歴', '', body, script));
+  res.send(pageShell('発注補助 — 発注履歴', 'orders', body, script));
 });
 
 // ─── 画面4: マスタ管理 ───
 router.get('/admin', (req, res) => {
   const body = `
-    <h2 style="font-size:15px">マスタ管理 <span class="muted">(本アプリが正本。旧スプシ「発注条件マスタ」は凍結してください)</span></h2>
+    <h2 class="page">マスタ管理</h2>
+    <div class="import-zone">
+      <h3>📥 スプレッドシートから取り込む</h3>
+      <div class="hint">
+        「発注条件マスタ」スプレッドシートから <b>ダウンロードしたCSVをそのまま</b>ここに入れてください（文字コード・列名は自動で判別します）。<br>
+        対応: <b>商品マスタ</b>（→ 仕入先＋商品紐付け）／ <b>発注条件マスタ</b> ／ <b>原料グループマスタ</b>。まとめて複数選択もできます。
+      </div>
+      <form id="importForm" class="row">
+        <input type="file" name="files" accept=".csv" multiple required>
+        <button type="submit" class="pri">取り込む</button>
+        <span id="importStatus" class="muted"></span>
+      </form>
+      <div id="importResult" class="pill-row"></div>
+    </div>
+
     <div class="tabbar">
       <button data-tab="suppliers" class="on">仕入先</button>
       <button data-tab="conditions">発注条件グループ</button>
       <button data-tab="materials">原料グループ</button>
       <button data-tab="attrs">商品紐付け</button>
-      <button data-tab="unlinked">未紐付けチェック</button>
+      <button data-tab="unlinked">🆕 未紐付けの新商品</button>
     </div>
     <div class="sec"><div class="bd" id="tabBody">読み込み中…</div></div>`;
   const script = `
@@ -1173,36 +1425,51 @@ var DEFS = {
     { k: 'product_code', l: '商品コード', pk: 1 }, { k: 'condition_id', l: '発注条件グループID' }, { k: 'material_group_id', l: '原料グループID' },
     { k: 'capacity_per_unit', l: '容量/個', num: 1 }, { k: 'case_group', l: 'ケースグループ' }, { k: 'case_lot', l: 'ケースロット', num: 1 } ] },
 };
+
+// ── 一括取込 (自動判別) ──
+document.getElementById('importForm').addEventListener('submit', function(ev) {
+  ev.preventDefault();
+  var fd = new FormData(ev.target);
+  var st = document.getElementById('importStatus');
+  st.textContent = '取込中...';
+  document.getElementById('importResult').innerHTML = '';
+  fetch('/apps/purchase-orders/api/import', { method: 'POST', body: fd })
+    .then(function(r){ return r.json(); })
+    .then(function(j) {
+      st.textContent = '';
+      if (!j.ok) {
+        var d = (j.errors && j.errors.length) ? '\\n\\n' + j.errors.join('\\n') : '';
+        alert('取込エラー: ' + j.error + d);
+        return;
+      }
+      var pr = document.getElementById('importResult');
+      var html = (j.summary || []).map(function(s){ return '<span class="pill">✅ ' + esc(s) + '</span>'; }).join('');
+      var w = j.warnings || [];
+      if (w.length) {
+        html += '<div class="warn" style="margin-top:10px">⚠️ 注意 ' + w.length + '件<ul style="margin:6px 0 0;padding-left:18px">' +
+          w.slice(0, 30).map(function(x){ return '<li>' + esc(x) + '</li>'; }).join('') +
+          (w.length > 30 ? '<li>…ほか ' + (w.length - 30) + '件</li>' : '') + '</ul></div>';
+      }
+      pr.innerHTML = html;
+      toast(w.length ? '取り込みました (注意' + w.length + '件)' : '取り込みました');
+      load();
+    })
+    .catch(function(e){ st.textContent = ''; alert('通信エラー: ' + e.message); });
+});
+
 function render(rows) {
   var def = DEFS[TAB];
-  var h = '<div class="toolbar">' +
-    '<form id="csvForm" style="display:flex;gap:6px;align-items:center">' +
-    '<input type="file" name="file" accept=".csv" required> <button type="submit">CSV一括取込 (upsert)</button>' +
-    '<span class="muted">見出し: ' + def.cols.map(function(c){ return c.l; }).join(' / ').slice(0, 120) + '</span></form>' +
+  var h = '<div class="toolbar"><span class="muted">' + rows.length + ' 件 — セルを直接編集して「保存」／最上行から追加</span>' +
     '<input type="text" id="filter" placeholder="絞り込み" style="margin-left:auto"></div>';
-  h += '<table class="t" id="mtable"><tr>' + def.cols.map(function(c){ return '<th>' + c.l + '</th>'; }).join('') + '<th></th></tr>';
-  h += '<tr>' + def.cols.map(function(c){ return '<td><input type="text" style="width:98%" id="new_' + c.k + '"></td>'; }).join('') + '<td><button id="btnAdd">追加</button></td></tr>';
+  h += '<table class="t" id="mtable"><thead><tr>' + def.cols.map(function(c){ return '<th' + (c.num ? ' class="r"' : '') + '>' + c.l + '</th>'; }).join('') + '<th></th></tr></thead><tbody>';
+  h += '<tr>' + def.cols.map(function(c){ return '<td><input type="text" style="width:99%" id="new_' + c.k + '"></td>'; }).join('') + '<td><button class="pri sm" id="btnAdd">追加</button></td></tr>';
   rows.forEach(function(r) {
     h += '<tr data-row="1">' + def.cols.map(function(c) {
-      return '<td' + (c.pk ? '' : ' contenteditable data-k="' + c.k + '"') + '>' + esc(r[c.k] == null ? '' : r[c.k]) + '</td>';
-    }).join('') + '<td><button class="ghost" data-save="' + esc(r[def.cols[0].k]) + '">保存</button> <button class="ghost" data-rm="' + esc(r[def.cols[0].k]) + '">削除</button></td></tr>';
+      return '<td' + (c.pk ? '' : ' contenteditable data-k="' + c.k + '"') + (c.num ? ' class="r"' : '') + '>' + esc(r[c.k] == null ? '' : r[c.k]) + '</td>';
+    }).join('') + '<td style="white-space:nowrap"><button class="ghost" data-save="' + esc(r[def.cols[0].k]) + '">保存</button><button class="ghost" data-rm="' + esc(r[def.cols[0].k]) + '">削除</button></td></tr>';
   });
-  h += '</table><div class="muted" style="margin-top:6px">' + rows.length + ' 件 — セルを直接編集して「保存」。追加は最上行。</div>';
+  h += '</tbody></table>';
   document.getElementById('tabBody').innerHTML = h;
-  document.getElementById('csvForm').addEventListener('submit', function(ev) {
-    ev.preventDefault();
-    var fd = new FormData(ev.target);
-    fetch('/apps/purchase-orders/api/masters/' + TAB + '/csv', { method: 'POST', body: fd })
-      .then(function(r){ return r.json(); }).then(function(j) {
-        if (!j.ok) {
-          var detail = (j.errors && j.errors.length) ? '\\n\\n' + j.errors.join('\\n') : '';
-          alert('取込エラー: ' + j.error + detail);
-          return;
-        }
-        toast('取込完了: ' + j.upserted + '件');
-        load();
-      });
-  });
   document.getElementById('filter').addEventListener('input', function(ev) {
     var q = ev.target.value.trim().toLowerCase();
     document.querySelectorAll('#mtable tr[data-row]').forEach(function(tr) {
@@ -1211,18 +1478,40 @@ function render(rows) {
   });
 }
 function renderUnlinked(j) {
-  var h = '<div class="muted" style="margin-bottom:8px">取扱中なのに商品紐付け (発注条件/原料グループ等) が未登録の商品。グループ対象外の商品はそのままで問題ありません。全 ' + j.count + ' 件' + (j.count > 500 ? ' (先頭500件表示)' : '') + '</div>';
-  h += '<table class="t"><tr><th>商品コード</th><th>商品名</th><th>仕入先</th></tr>';
-  j.rows.forEach(function(r){ h += '<tr><td>' + esc(r.code) + '</td><td>' + esc(r.name) + '</td><td>' + esc(r.supplier) + '</td></tr>'; });
-  document.getElementById('tabBody').innerHTML = h + '</table>';
+  var h = '<div class="toolbar">' +
+    '<span class="muted">取扱中なのに発注条件/原料グループ等が未登録の商品。' +
+    '<b>新商品が入ると翌朝ここに自動で載ります</b>（グループ対象外の商品はそのままでOK）。</span>' +
+    '<span style="margin-left:auto">表示: <select id="uDays">' +
+      ['30:直近30日の新商品','60:直近60日の新商品','90:直近90日の新商品','0:全部 (' + j.totalUnlinked + '件)'].map(function(o){
+        var v = o.split(':')[0];
+        return '<option value="' + v + '"' + (String(j.days) === v ? ' selected' : '') + '>' + o.slice(o.indexOf(':') + 1) + '</option>';
+      }).join('') +
+    '</select></span></div>';
+  h += '<div class="muted" style="margin-bottom:8px">該当 ' + j.count + ' 件' + (j.count > 500 ? ' (先頭500件表示)' : '') + '</div>';
+  h += '<table class="t"><thead><tr><th>登録日</th><th>商品コード</th><th>商品名</th><th>仕入先</th></tr></thead><tbody>';
+  if (!j.rows.length) h += '<tr><td colspan="4" class="muted">該当なし 🎉</td></tr>';
+  j.rows.forEach(function(r){ h += '<tr><td>' + esc(r.reg || '—') + '</td><td>' + esc(r.code) + '</td><td>' + esc(r.name) + '</td><td>' + esc(r.supplier) + '</td></tr>'; });
+  h += '</tbody></table>';
+  // 未登録グループを参照している商品 (紐付けはあるが参照先が無い = マスタ側の登録漏れ)
+  var dg = j.dangling || [];
+  if (dg.length) {
+    h += '<div class="warn" style="margin-top:18px">⚠️ 未登録グループを参照している商品が ' + dg.length + ' 件あります（発注条件/原料グループマスタの登録漏れ）</div>';
+    h += '<table class="t"><thead><tr><th>商品コード</th><th>未登録の発注条件グループ</th><th>未登録の原料グループ</th></tr></thead><tbody>';
+    dg.forEach(function(r){ h += '<tr><td>' + esc(r.code) + '</td><td>' + esc(r.missCond || '—') + '</td><td>' + esc(r.missMat || '—') + '</td></tr>'; });
+    h += '</tbody></table>';
+  }
+  document.getElementById('tabBody').innerHTML = h;
+  document.getElementById('uDays').addEventListener('change', function(ev){ loadUnlinked(ev.target.value); });
+}
+function loadUnlinked(days) {
+  document.getElementById('tabBody').textContent = '読み込み中…';
+  fetch('/apps/purchase-orders/api/attrs/unlinked?days=' + encodeURIComponent(days == null ? 60 : days))
+    .then(function(r){ return r.json(); })
+    .then(function(j){ if (j.ok) renderUnlinked(j); else document.getElementById('tabBody').textContent = j.error; });
 }
 function load() {
+  if (TAB === 'unlinked') { loadUnlinked(60); return; }
   document.getElementById('tabBody').textContent = '読み込み中…';
-  if (TAB === 'unlinked') {
-    fetch('/apps/purchase-orders/api/attrs/unlinked').then(function(r){ return r.json(); })
-      .then(function(j){ if (j.ok) renderUnlinked(j); else document.getElementById('tabBody').textContent = j.error; });
-    return;
-  }
   fetch('/apps/purchase-orders/api/masters/' + TAB).then(function(r){ return r.json(); })
     .then(function(j){ if (j.ok) render(j.rows); else document.getElementById('tabBody').textContent = j.error; });
 }
@@ -1236,35 +1525,35 @@ document.addEventListener('click', function(ev) {
     return;
   }
   if (t.id === 'btnAdd') {
-    var def = DEFS[TAB], body = {};
-    def.cols.forEach(function(c){ body[c.k] = document.getElementById('new_' + c.k).value; });
-    post(body);
+    var def = DEFS[TAB], b = {};
+    def.cols.forEach(function(c){ b[c.k] = document.getElementById('new_' + c.k).value; });
+    post(b);
     return;
   }
   var saveKey = t.getAttribute && t.getAttribute('data-save');
-  if (saveKey) {
-    var def2 = DEFS[TAB], tr = t.closest('tr'), body2 = {};
-    body2[def2.cols[0].k] = saveKey;
-    tr.querySelectorAll('[data-k]').forEach(function(td){ body2[td.getAttribute('data-k')] = td.textContent; });
-    post(body2);
+  if (saveKey != null) {
+    var def2 = DEFS[TAB], tr = t.closest('tr'), b2 = {};
+    b2[def2.cols[0].k] = saveKey;
+    tr.querySelectorAll('[data-k]').forEach(function(td){ b2[td.getAttribute('data-k')] = td.textContent; });
+    post(b2);
     return;
   }
   var rmKey = t.getAttribute && t.getAttribute('data-rm');
-  if (rmKey) {
+  if (rmKey != null) {
     if (!confirm('削除しますか? ' + rmKey)) return;
     fetch('/apps/purchase-orders/api/masters/' + TAB + '/' + encodeURIComponent(rmKey), { method: 'DELETE' })
       .then(function(r){ return r.json(); }).then(function(j){ if (j.ok) { toast('削除しました'); load(); } else toast(j.error); });
   }
 });
-function post(body) {
+function post(b) {
   fetch('/apps/purchase-orders/api/masters/' + TAB, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b),
   }).then(function(r){ return r.json(); }).then(function(j) {
     if (j.ok) { toast('保存しました'); load(); } else toast('エラー: ' + j.error);
   });
 }
 load();`;
-  res.send(pageShell('発注補助 — マスタ管理', '', body, script));
+  res.send(pageShell('発注補助 — マスタ管理', 'admin', body, script));
 });
 
 export default router;
