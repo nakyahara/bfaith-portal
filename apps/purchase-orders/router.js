@@ -195,18 +195,19 @@ function supplierWorkspaceData(code) {
   // draft 明細のうち現在の表示リスト外の商品 (PML更新で対象外化・取扱中止化した等) も
   // 黙って落とさず「リスト外」として返す (Codex R2 Medium)
   let draftExtras = [];
+  const extraProducts = []; // 条件/原料グループ membership 集計にも含める (Codex R3 Medium)
   if (draft) {
     const listKeys = new Set(all.map(p => p.key));
     const byKey = new Map(products.map(p => [p.key, p]));
     draftExtras = draft.items.filter(it => !listKeys.has(it.key)).map(it => {
       const p = byKey.get(it.key);
-      return p
-        ? { ...productDto(p), extra: true }
-        : { code: it.code, name: it.name || '', cost: it.cost, stock: null, backOrder: null, sales30: null, sales7: null, lot: null, stockMonths: null, recQty: null, extra: true, missing: true };
+      if (p) { extraProducts.push(p); return { ...productDto(p), extra: true }; }
+      return { code: it.code, name: it.name || '', cost: it.cost, stock: null, backOrder: null, sales30: null, sales7: null, lot: null, stockMonths: null, recQty: null, extra: true, missing: true };
     });
   }
-  const memberOf = (fieldVal, field) => all.filter(p => p[field] === fieldVal).map(p => p.code);
-  const condIds = new Set(all.map(p => p.conditionId).filter(Boolean));
+  const memberBase = [...all, ...extraProducts];
+  const memberOf = (fieldVal, field) => memberBase.filter(p => p[field] === fieldVal).map(p => p.code);
+  const condIds = new Set(memberBase.map(p => p.conditionId).filter(Boolean));
   const conditions = masters.conditions
     .filter(c => condIds.has(c.condition_id) || normSupplierCode(c.supplier_code) === code)
     .map(c => ({
@@ -214,7 +215,7 @@ function supplierWorkspaceData(code) {
       conditionType: c.condition_type, conditionValue: c.condition_value, unit: c.unit || '',
       memberCodes: memberOf(c.condition_id, 'conditionId'),
     }));
-  const matIds = new Set(all.map(p => p.materialGroupId).filter(Boolean));
+  const matIds = new Set(memberBase.map(p => p.materialGroupId).filter(Boolean));
   const materialGroups = [...matIds].map(id => {
     const m = masters.materialGroups.get(id);
     return {
