@@ -81,8 +81,9 @@ const numOrNull = v => {
 };
 
 // ─── 発注 draft/issue の永続化 ───
-function enrichItems(rawItems) {
-  // 現 PML に存在する商品コードのみ許可し、商品名・原価をスナップショットする
+function enrichItems(rawItems, supplierCode) {
+  // 現 PML に存在し「かつ当該仕入先の」商品コードのみ許可し、商品名・原価をスナップショットする
+  // (Codex R1 High: 仕入先突合なしだと別仕入先の商品を混入できる)
   const { pub, rows } = loadPml();
   if (!pub) throw new Error('PMLスナップショット未同期のため保存できません');
   const byKey = new Map();
@@ -99,14 +100,24 @@ function enrichItems(rawItems) {
     if (!Number.isInteger(qty) || qty <= 0) throw new Error(`数量が不正です (${code}: ${it.qty})`);
     const r = byKey.get(key);
     if (!r) throw new Error(`PMLに存在しない商品コード: ${code}`);
+    if (normSupplierCode(r['仕入先']) !== supplierCode) {
+      throw new Error(`仕入先が一致しない商品コード: ${code} (この商品の仕入先: ${r['仕入先'] || '未設定'})`);
+    }
     items.push({ code: r['商品コード'], key, name: r['商品名'] || '', qty, cost: r['原価'] == null ? null : Number(r['原価']) });
   }
   return { items, pmlAsOf: pub.as_of_date || null };
 }
 
+/** 仕入先名はサーバ側で解決 (クライアント値は信用しない) */
+function resolveSupplierName(supplierCode) {
+  const db = getDB();
+  const s = db.prepare('SELECT name FROM po_suppliers WHERE supplier_code=?').get(supplierCode);
+  return (s && s.name) || `仕入先 ${supplierCode}`;
+}
+
 function upsertDraft(supplierCode, supplierName, rawItems, note) {
   const db = getDB();
-  const { items, pmlAsOf } = enrichItems(rawItems);
+  const { items, pmlAsOf } = enrichItems(rawItems, supplierCode);
   const now = nowIso();
   return db.transaction(() => {
     let order = db.prepare("SELECT id FROM po_orders WHERE supplier_code=? AND status='draft'").get(supplierCode);
@@ -218,14 +229,14 @@ router.get('/api/supplier/:code', (req, res) => {
 router.post('/api/supplier/:code/draft', (req, res) => {
   try {
     const code = normSupplierCode(req.params.code);
-    const { items, note, supplierName } = req.body || {};
+    const { items, note } = req.body || {};
     if (!Array.isArray(items)) return res.status(400).json({ ok: false, error: 'items が必要です' });
     if (items.length === 0) {
       const db = getDB();
       db.prepare("DELETE FROM po_orders WHERE supplier_code=? AND status='draft'").run(code);
       return res.json({ ok: true, deleted: true });
     }
-    const id = upsertDraft(code, trimS(supplierName) || `仕入先 ${code}`, items, trimS(note));
+    const id = upsertDraft(code, resolveSupplierName(code), items, trimS(note));
     res.json({ ok: true, id });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
@@ -233,10 +244,10 @@ router.post('/api/supplier/:code/draft', (req, res) => {
 router.post('/api/supplier/:code/issue', (req, res) => {
   try {
     const code = normSupplierCode(req.params.code);
-    const { items, note, supplierName } = req.body || {};
+    const { items, note } = req.body || {};
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ ok: false, error: '発注明細が空です' });
     const db = getDB();
-    const id = upsertDraft(code, trimS(supplierName) || `仕入先 ${code}`, items, trimS(note));
+    const id = upsertDraft(code, resolveSupplierName(code), items, trimS(note));
     const now = nowIso();
     db.prepare("UPDATE po_orders SET status='issued', issued_at=?, updated_at=? WHERE id=?").run(now, now, id);
     res.json({ ok: true, id });
@@ -309,23 +320,44 @@ const MASTER_DEFS = {
     fromCsv: c => ({ group_id: trimS(c[0]), name: trimS(c[1]), min_order_qty: numOrNull(c[2]), unit: trimS(c[3]) || null }),
   },
   attrs: {
-    table: 'po_product_attrs', pk: 'product_code',
+    table: 'po_product_attrs', pk: 'product_key', normId: normProductCode,
     fromBody: b => ({
-      product_code: trimS(b.product_code), product_key: normProductCode(b.product_code),
+      product_key: normProductCode(b.product_code), product_code: trimS(b.product_code),
       condition_id: trimS(b.condition_id) || null, material_group_id: trimS(b.material_group_id) || null,
       capacity_per_unit: numOrNull(b.capacity_per_unit), case_group: trimS(b.case_group) || null, case_lot: numOrNull(b.case_lot),
     }),
     validate: r => {
       if (!r.product_code) return '商品コード必須';
       if (r.capacity_per_unit != null && r.capacity_per_unit <= 0) return '容量/個が不正';
+      if (r.case_lot != null && r.case_lot <= 0) return 'ケースロットが不正';
+      // 参照整合性 (Codex R1 Medium): 存在しないグループへの紐付けは静かに欠落するため fail-closed
+      const db = getDB();
+      if (r.condition_id && !db.prepare('SELECT 1 FROM po_order_conditions WHERE condition_id=?').get(r.condition_id)) {
+        return `発注条件グループが未登録: ${r.condition_id}`;
+      }
+      if (r.material_group_id && !db.prepare('SELECT 1 FROM po_material_groups WHERE group_id=?').get(r.material_group_id)) {
+        return `原料グループが未登録: ${r.material_group_id}`;
+      }
       return null;
     },
     csvHeader: ['商品コード', '発注条件グループID', '原料グループID', '容量_per_個', 'ケースグループ', 'ケースロット'],
     fromCsv: c => ({
-      product_code: trimS(c[0]), product_key: normProductCode(c[0]),
+      product_key: normProductCode(c[0]), product_code: trimS(c[0]),
       condition_id: trimS(c[1]) || null, material_group_id: trimS(c[2]) || null,
       capacity_per_unit: numOrNull(c[3]), case_group: trimS(c[4]) || null, case_lot: numOrNull(c[5]),
     }),
+  },
+};
+
+/** マスタ削除前の被参照チェック (dangling reference 防止、Codex R1 Medium) */
+const DELETE_REF_CHECKS = {
+  conditions: id => {
+    const n = getDB().prepare('SELECT COUNT(*) c FROM po_product_attrs WHERE condition_id=?').get(id).c;
+    return n ? `商品紐付け ${n} 件から参照されています。先に紐付けを外してください` : null;
+  },
+  materials: id => {
+    const n = getDB().prepare('SELECT COUNT(*) c FROM po_product_attrs WHERE material_group_id=?').get(id).c;
+    return n ? `商品紐付け ${n} 件から参照されています。先に紐付けを外してください` : null;
   },
 };
 
@@ -365,7 +397,13 @@ router.delete('/api/masters/:kind/:id', (req, res) => {
   const def = MASTER_DEFS[req.params.kind];
   if (!def) return res.status(404).json({ ok: false, error: 'unknown master' });
   try {
-    const info = getDB().prepare(`DELETE FROM ${def.table} WHERE ${def.pk}=?`).run(req.params.id);
+    const id = def.normId ? def.normId(req.params.id) : req.params.id;
+    const refCheck = DELETE_REF_CHECKS[req.params.kind];
+    if (refCheck) {
+      const err = refCheck(id);
+      if (err) return res.status(400).json({ ok: false, error: err });
+    }
+    const info = getDB().prepare(`DELETE FROM ${def.table} WHERE ${def.pk}=?`).run(id);
     res.json({ ok: true, deleted: info.changes });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
@@ -734,8 +772,10 @@ document.addEventListener('click', function(ev) {
   var del = ev.target.getAttribute && ev.target.getAttribute('data-del');
   if (del) {
     delete CART[del];
-    var inp = document.querySelector('input[data-code="' + del.replace(/"/g, '\\\\"') + '"]');
-    if (inp) inp.value = '';
+    // querySelector の attribute selector は商品コード中の記号でこわれるので全走査で消す
+    document.querySelectorAll('input[data-code]').forEach(function(inp) {
+      if (inp.getAttribute('data-code') === del) inp.value = '';
+    });
     renderAll();
     return;
   }
@@ -755,7 +795,7 @@ function save(issue) {
   var url = '/apps/purchase-orders/api/supplier/' + encodeURIComponent(D.supplier.code) + (issue ? '/issue' : '/draft');
   fetch(url, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ items: items, note: document.getElementById('orderNote').value, supplierName: D.supplier.name }),
+    body: JSON.stringify({ items: items, note: document.getElementById('orderNote').value }),
   }).then(function(r){ return r.json(); }).then(function(j) {
     if (!j.ok) { toast('エラー: ' + j.error); return; }
     if (issue) { showDone(j.id); toast('発注確定しました'); }

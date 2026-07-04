@@ -65,18 +65,18 @@ export function initPurchaseOrders() {
     updated_at      TEXT NOT NULL
   )`);
 
+  // PK は正規化キー (product_key)。大文字小文字/空白違いの重複登録を1行に collapse する (Codex R1 Medium)
   db.exec(`CREATE TABLE IF NOT EXISTS po_product_attrs (
-    product_code      TEXT PRIMARY KEY,
-    product_key       TEXT NOT NULL,
+    product_key       TEXT PRIMARY KEY,
+    product_code      TEXT NOT NULL,
     condition_id      TEXT,
     material_group_id TEXT,
     capacity_per_unit REAL CHECK(capacity_per_unit IS NULL OR capacity_per_unit > 0),
     case_group        TEXT,
-    case_lot          REAL,
+    case_lot          REAL CHECK(case_lot IS NULL OR case_lot > 0),
     created_at        TEXT NOT NULL,
     updated_at        TEXT NOT NULL
   )`);
-  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_po_attrs_key ON po_product_attrs(product_key)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_po_attrs_cond ON po_product_attrs(condition_id)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_po_attrs_mat ON po_product_attrs(material_group_id)');
 
