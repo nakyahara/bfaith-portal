@@ -10,8 +10,11 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+import crypto from 'crypto';
+
 import {
   getDB, logEvent, gateReasons, demoteIfGateBroken,
+  upsertDraftYahoo, upsertImageProduction, listGenerationQueue,
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS,
 } from './db.js';
 import { parseDriveLink, thumbnailUrl, fileViewUrl } from './lib/drive-link.js';
@@ -126,6 +129,8 @@ router.get('/detail/:id', (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
   const db = getDB();
+  const yahoo = db.prepare('SELECT * FROM draft_yahoo WHERE draft_id = ?').get(draft.id) || null;
+  const imageProduction = db.prepare('SELECT * FROM draft_image_production WHERE draft_id = ?').get(draft.id) || null;
   const refs = db.prepare('SELECT * FROM draft_reference_urls WHERE draft_id = ? ORDER BY sort, id').all(draft.id);
   const images = db.prepare('SELECT * FROM draft_images WHERE draft_id = ? ORDER BY sort, id').all(draft.id);
   for (const img of images) {
@@ -144,7 +149,7 @@ router.get('/detail/:id', (req, res) => {
   res.render(view('detail.ejs'), {
     title: `商品ドラフト #${draft.id}`,
     displayName: req.session?.displayName || req.session?.email || '',
-    draft, refs, images, specs, aiOutputs, events,
+    draft, refs, images, specs, aiOutputs, events, yahoo, imageProduction,
     gate: gateReasons(db, draft),
     nextStatuses,
     statusLabels: STATUS_LABELS,
@@ -200,10 +205,14 @@ router.post('/api/drafts/:id', (req, res) => {
     return res.status(400).json({ ok: false, error: '画像フォルダURLの形式が不正です (http/https)' });
   }
 
+  const amazonUrl = req.body?.amazon_url !== undefined ? cleanText(req.body.amazon_url, 1000) : draft.amazon_url;
+  if (amazonUrl && !isHttpUrl(amazonUrl)) {
+    return res.status(400).json({ ok: false, error: 'Amazon URLの形式が不正です (http/https)' });
+  }
   db.prepare(`
     UPDATE product_drafts SET
       name = ?, official_url = ?, price = ?, jan_code = ?, has_variation = ?,
-      drive_folder_url = ?, memo = ?,
+      drive_folder_url = ?, memo = ?, asin = ?, amazon_url = ?, own_brand = ?,
       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
     WHERE id = ?
   `).run(
@@ -214,6 +223,9 @@ router.post('/api/drafts/:id', (req, res) => {
     req.body?.has_variation !== undefined ? (req.body.has_variation ? 1 : 0) : draft.has_variation,
     driveFolderUrl,
     req.body?.memo !== undefined ? cleanText(req.body.memo, 4000) : draft.memo,
+    req.body?.asin !== undefined ? cleanText(req.body.asin, 20) : draft.asin,
+    amazonUrl,
+    req.body?.own_brand !== undefined ? (req.body.own_brand ? 1 : 0) : draft.own_brand,
     draft.id,
   );
   logEvent(db, draft.id, 'updated', null, actorOf(req));
@@ -320,6 +332,61 @@ router.post('/api/drafts/:id/ai-outputs', (req, res) => {
   res.json({ ok: true });
 });
 
+// ─── API: Yahoo 向け追記項目 / 画像制作 (P1.5) ─────────────
+
+router.post('/api/drafts/:id/yahoo', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const db = getDB();
+  const b = req.body || {};
+  const catId = b.yahoo_category_id !== undefined && b.yahoo_category_id !== '' && b.yahoo_category_id !== null
+    ? Number.parseInt(b.yahoo_category_id, 10)
+    : (b.yahoo_category_id === '' || b.yahoo_category_id === null ? null : undefined);
+  if (catId !== undefined && catId !== null && !Number.isInteger(catId)) {
+    return res.status(400).json({ ok: false, error: 'Yahoo!カテゴリIDは数値で入力してください' });
+  }
+  upsertDraftYahoo(db, draft.id, {
+    yahoo_price: b.yahoo_price !== undefined ? sanitizeMoney(b.yahoo_price) : undefined,
+    yahoo_price_sagawa: b.yahoo_price_sagawa !== undefined ? sanitizeMoney(b.yahoo_price_sagawa) : undefined,
+    delivery_label: b.delivery_label !== undefined ? cleanText(b.delivery_label, 100) : undefined,
+    tax_rate: b.tax_rate !== undefined ? cleanText(b.tax_rate, 20) : undefined,
+    yahoo_category_id: catId,
+    yahoo_path: b.yahoo_path !== undefined ? cleanText(b.yahoo_path, 500) : undefined,
+  });
+  logEvent(db, draft.id, 'yahoo_updated', null, actorOf(req));
+  res.json({ ok: true });
+});
+
+router.post('/api/drafts/:id/image-production', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  if (!draft.own_brand) {
+    return res.status(400).json({ ok: false, error: '画像制作情報は自社商品のみ登録できます (基本情報で「自社商品」をONにしてください)' });
+  }
+  const db = getDB();
+  const b = req.body || {};
+  const urlVal = b.camera_instruction_url !== undefined ? cleanText(b.camera_instruction_url, 1000) : undefined;
+  if (urlVal && !isHttpUrl(urlVal)) {
+    return res.status(400).json({ ok: false, error: '撮影指示URLの形式が不正です (http/https)' });
+  }
+  const clean = (v, len) => (v !== undefined ? cleanText(v, len) : undefined);
+  upsertImageProduction(db, draft.id, {
+    status: clean(b.status, 100),
+    importance_tier: clean(b.importance_tier, 100),
+    production_type: clean(b.production_type, 100),
+    aplus_content: clean(b.aplus_content, 100),
+    aplus_related: clean(b.aplus_related, 2000),
+    camera_instruction_url: urlVal,
+    shipping_status: clean(b.shipping_status, 100),
+    reference_collection: clean(b.reference_collection, 100),
+    designer: clean(b.designer, 100),
+    page_composer: clean(b.page_composer, 100),
+    request_text: clean(b.request_text, 10000),
+  });
+  logEvent(db, draft.id, 'image_production_updated', null, actorOf(req));
+  res.json({ ok: true });
+});
+
 // ─── API: ステータス遷移 (§4 ゲート) ───────────────────────
 
 router.post('/api/drafts/:id/status', (req, res) => {
@@ -360,3 +427,75 @@ router.post('/api/notion-retry-all', async (req, res) => {
 });
 
 export default router;
+
+// ─── service-api (P2 スキル接続用、トークン認証) ─────────────
+// 中原さんの PC の Claude Code (/rakuten-title スキル) がここを叩く。
+// 認証: Authorization: Bearer <PH_SERVICE_TOKEN>。env 未設定なら 503 (fail-closed)。
+// mount: server.js で /apps/product-hub/service-api (セッション認証の外)
+
+function requireServiceToken(req, res, next) {
+  const expected = process.env.PH_SERVICE_TOKEN;
+  if (!expected || !expected.trim()) {
+    return res.status(503).json({ ok: false, error: 'PH_SERVICE_TOKEN not configured (fail-closed)' });
+  }
+  const got = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  const a = Buffer.from(got);
+  const b = Buffer.from(expected.trim());
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+  next();
+}
+
+export const serviceApiRouter = express.Router();
+serviceApiRouter.use(express.json({ limit: '1mb' }));
+serviceApiRouter.use(requireServiceToken);
+
+// 生成待ち一覧 (AI 生成の材料つき)
+serviceApiRouter.get('/generation-queue', (req, res) => {
+  const db = getDB();
+  res.json({ ok: true, drafts: listGenerationQueue(db) });
+});
+
+// AI 生成結果の一括書き戻し + status ready_for_ai → review
+// body: { outputs: { rakuten_title: "...", yahoo_title: "...", desc_catch: ... }, model_note?, advance? }
+serviceApiRouter.post('/drafts/:id/ai-outputs', (req, res) => {
+  const id = Number.parseInt(req.params.id, 10);
+  const db = getDB();
+  const draft = Number.isInteger(id) && id > 0 ? db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(id) : null;
+  if (!draft) return res.status(404).json({ ok: false, error: 'draft not found' });
+
+  const outputs = req.body?.outputs;
+  if (!outputs || typeof outputs !== 'object' || Array.isArray(outputs)) {
+    return res.status(400).json({ ok: false, error: 'outputs (object) is required' });
+  }
+  const badKinds = Object.keys(outputs).filter((k) => !AI_OUTPUT_KINDS.includes(k));
+  if (badKinds.length > 0) {
+    return res.status(400).json({ ok: false, error: `invalid kinds: ${badKinds.join(', ')}` });
+  }
+  const modelNote = cleanText(req.body?.model_note, 200);
+
+  const write = db.transaction(() => {
+    for (const [kind, content] of Object.entries(outputs)) {
+      db.prepare(`
+        INSERT INTO draft_ai_outputs (draft_id, kind, content, generated_at, model_note, edited_by_human)
+        VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?, 0)
+        ON CONFLICT(draft_id, kind) DO UPDATE SET
+          content = excluded.content,
+          generated_at = excluded.generated_at,
+          model_note = excluded.model_note,
+          edited_by_human = 0
+      `).run(id, kind, cleanText(content, 50000), modelNote);
+    }
+    logEvent(db, id, 'ai_generated', Object.keys(outputs).join(','), 'service-api');
+    let advanced = false;
+    if (req.body?.advance && draft.status === 'ready_for_ai') {
+      db.prepare(`UPDATE product_drafts SET status = 'review', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ? AND status = 'ready_for_ai'`).run(id);
+      logEvent(db, id, 'status_changed', 'ready_for_ai -> review (ai_generated)', 'service-api');
+      advanced = true;
+    }
+    return advanced;
+  });
+  const advanced = write();
+  res.json({ ok: true, written: Object.keys(outputs).length, advanced });
+});
