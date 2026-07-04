@@ -14,7 +14,7 @@
  */
 
 import { sanitizeProductHtml } from '../lib/html-sanitize.js';
-import { scrubRakutenUrlsFromText } from '../lib/rakuten-link-sanitizer.js';
+import { scrubRakutenUrlsFromText, stripEcmpanBlocks } from '../lib/rakuten-link-sanitizer.js';
 import { buildYahooExplanation, buildYahooHeadline } from '../lib/yahoo-text.js';
 import { shouldUseSagawaPrice } from './delivery-resolver.js';
 
@@ -180,10 +180,12 @@ export function buildYahooEditItemFields({
   // R16: explanation はプレーンテキストで sanitizeProductHtml を通らないため、
   //   テキスト中に生の楽天 URL が残っていたらここでスクラブする (自店商品→Yahoo URL、他→削除)。
   //   R17: headline は Notion > 楽天キャッチコピー の解決済み値を使う (explanation 先頭行と headline 欄が一致)。
+  //   R18: explanation の元 HTML からも ECMPAN ブロック (楽天カテゴリパンくず) を除去
+  //   (htmlToPlainText 経由だとパンくず文字列が本文として混入するため)。
   fields.explanation = scrubRakutenUrlsFromText(buildYahooExplanation({
     headline: resolvedHeadline,
     itemName: rakutenItem.itemName || rakutenItem.title || '',
-    html: rakutenItem.productDescription?.pc || '',
+    html: stripEcmpanBlocks(rakutenItem.productDescription?.pc || ''),
   }));
   fields.additional1 = sanitizeProductHtml(rakutenItem.salesDescription || '');
   fields.sp_additional = sanitizeProductHtml(rakutenItem.productDescription?.sp || '');

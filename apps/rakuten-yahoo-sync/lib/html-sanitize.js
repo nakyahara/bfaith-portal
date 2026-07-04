@@ -15,7 +15,7 @@
 
 import * as cheerio from 'cheerio';
 
-import { classifyRakutenHref, scrubRakutenUrlsFromText } from './rakuten-link-sanitizer.js';
+import { classifyRakutenHref, scrubRakutenUrlsFromText, stripEcmpanBlocks } from './rakuten-link-sanitizer.js';
 
 const ALLOWED_TAGS = new Set([
   'a', 'b', 'strong', 'i', 'em', 'u', 'br', 'p', 'div', 'span',
@@ -60,7 +60,9 @@ function isImgFromAllowedHost(src, allowedHostsLower) {
  */
 export function sanitizeProductHtml(html, opts = {}) {
   if (html == null) return '';
-  const s = String(html);
+  // R18 (2026-07-04 中原さん指示): 楽天自動挿入のカテゴリパンくず <!--ECMPAN-->...<!--/ECMPAN--> は
+  // Yahoo への移行対象外として、 parse 前に丸ごと除去する。
+  const s = stripEcmpanBlocks(String(html));
   if (s.trim() === '') return '';
   const allowedHostsLower = new Set(
     (opts.allowImgFromHosts || []).map((h) => String(h).trim().toLowerCase()).filter(Boolean)
@@ -105,9 +107,13 @@ export function sanitizeProductHtml(html, opts = {}) {
   //   (自店商品 URL → Yahoo URL 文字列に書換、 その他の楽天 URL → 削除)。
   //   これをやらないと validator の residue backstop で送信中止になり 「修正必要」 に落ちるだけなので、
   //   自動で直せるものはここで直す。
+  // R18: HTML コメントノードも全除去 (Yahoo に不要 + <!--ECMPAN--> 残骸や
+  //   コメント内 URL が residue backstop に引っかかるのを防ぐ)。
   (function scrubTextNodes(nodes) {
     nodes.each((_, node) => {
-      if (node.type === 'text' && node.data) {
+      if (node.type === 'comment') {
+        $(node).remove();
+      } else if (node.type === 'text' && node.data) {
         const scrubbed = scrubRakutenUrlsFromText(node.data);
         if (scrubbed !== node.data) node.data = scrubbed;
       } else if (node.type === 'tag') {

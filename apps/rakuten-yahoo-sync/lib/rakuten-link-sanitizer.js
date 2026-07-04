@@ -90,6 +90,21 @@ function escapeRegExp(s) {
 }
 
 /**
+ * R18 (2026-07-04 中原さん指示): 楽天が商品説明に自動挿入するカテゴリパンくず
+ * `<!--ECMPAN--> ... <!--/ECMPAN-->` ブロックは Yahoo への移行対象外として丸ごと除去する。
+ * (実例: GONESH-no4-2 の SP用フリースペースに楽天カテゴリページへのリンク列が入っていた)
+ * 閉じ忘れ等で対にならない stray マーカーも除去する (中身は通常の link sanitize に任せる)。
+ * Yahoo の全項目に適用するため、 sanitizeProductHtml の入口 + explanation/executor の
+ * 生 HTML 読み取り箇所で呼ぶ。
+ */
+const ECMPAN_BLOCK_RE = /<!--\s*ECMPAN\s*-->[\s\S]*?<!--\s*\/\s*ECMPAN\s*-->/gi;
+const ECMPAN_MARKER_RE = /<!--\s*\/?\s*ECMPAN\s*-->/gi;
+export function stripEcmpanBlocks(html) {
+  if (html == null || html === '') return html == null ? '' : html;
+  return String(html).replace(ECMPAN_BLOCK_RE, '').replace(ECMPAN_MARKER_RE, '');
+}
+
+/**
  * 楽天 URL 1 本を判定して Yahoo 側の扱いを返す。
  *
  * 対応する形:
@@ -122,13 +137,19 @@ export function classifyRakutenHref(href, { shopSlug = null, sellerId = null } =
     return { kind: 'not_rakuten' };
   }
 
-  // 自店商品リンク抽出: percent-encode されていても decode して item.rakuten.co.jp/{slug}/{code} を探す
+  // 自店商品リンク抽出: percent-encode されていても decode して item.rakuten.co.jp/{slug}/{code} を探す。
+  //   R18 (GONESH-no4-2 実例で発覚): /b-faith/c/0000000220/ はカテゴリページ (c/ prefix) であって
+  //   商品ではない。 終端 lookahead (次が更なる path segment なら不一致) + code 'c' 除外で、
+  //   カテゴリ URL を誤って /c.html に書換せず remove に落とす。
   const seller = getSellerId(sellerId);
   if (seller) {
     const m = decoded.match(
-      new RegExp(`item\\.rakuten\\.co\\.jp/${escapeRegExp(getShopSlug(shopSlug))}/([A-Za-z0-9._-]+)`, 'i')
+      new RegExp(
+        `item\\.rakuten\\.co\\.jp/${escapeRegExp(getShopSlug(shopSlug))}/([A-Za-z0-9._-]+)/?(?=[?#"'<>&|\\s]|$)`,
+        'i'
+      )
     );
-    if (m) {
+    if (m && m[1].toLowerCase() !== 'c') {
       const code = m[1].toLowerCase();
       return { kind: 'rewrite', yahooUrl: `https://store.shopping.yahoo.co.jp/${seller}/${code}.html` };
     }

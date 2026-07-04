@@ -18,6 +18,7 @@ const {
   scrubRakutenUrlsFromText,
   findRakutenResidueInFields,
   isRakutenFamilyHost,
+  stripEcmpanBlocks,
 } = await import('./rakuten-link-sanitizer.js');
 const { sanitizeProductHtml } = await import('./html-sanitize.js');
 const { validateYahooEditItemFields, YahooFieldValidationError } = await import('./yahoo-edititem-validator.js');
@@ -147,6 +148,41 @@ test('sanitize: テキストノード内の生楽天 URL (リンクでない文�
   );
   assert.ok(out.includes('https://store.shopping.yahoo.co.jp/b-faith/aa0203.html'), '自店商品は書換');
   assert.ok(!/rakuten/i.test(out), `楽天 URL 消滅: ${out}`);
+});
+
+// ── R18: ECMPAN ブロック除去 + カテゴリ URL 誤書換の回帰 (GONESH-no4-2 実例) ──
+
+const GONESH_ECMPAN_FIXTURE = '<!--ECMPAN--><a target="_blank" href="https://shopping.yahoo.co.jp/stores/wrap/bouncer.html?dest_path=https%3A%2F%2Fitem.rakuten.co.jp%2Fb-faith%2Fc%2F0000000220%2F">アロマスプレー・香料</a> ＞ <a target="_blank" href="https://shopping.yahoo.co.jp/stores/wrap/bouncer.html?dest_path=https%3A%2F%2Fitem.rakuten.co.jp%2Fb-faith%2Fc%2F0000000305%2F">ルームフレグランス</a><br><br><!--/ECMPAN-->本文はここから';
+
+test('R18: ECMPAN ブロックは丸ごと移行対象外 (GONESH-no4-2 実例)', () => {
+  const out = sanitizeProductHtml(GONESH_ECMPAN_FIXTURE);
+  assert.ok(!out.includes('アロマスプレー・香料'), 'パンくずテキスト消滅');
+  assert.ok(!out.includes('ECMPAN'), 'マーカー消滅');
+  assert.ok(!/rakuten/i.test(out), '楽天ドメイン消滅');
+  assert.ok(out.includes('本文はここから'), 'ブロック外の本文は残る');
+});
+
+test('R18: stripEcmpanBlocks 単体 — 対ブロック除去 + stray マーカーも除去', () => {
+  assert.equal(stripEcmpanBlocks('a<!--ECMPAN-->x<!--/ECMPAN-->b'), 'ab');
+  assert.equal(stripEcmpanBlocks('a<!-- ECMPAN -->x<!-- /ECMPAN -->b'), 'ab', '空白入りマーカー');
+  assert.equal(stripEcmpanBlocks('a<!--ECMPAN-->閉じ忘れb'), 'a閉じ忘れb', 'stray はマーカーのみ除去');
+  assert.equal(stripEcmpanBlocks(''), '');
+  assert.equal(stripEcmpanBlocks(null), '');
+});
+
+test('R18: 楽天カテゴリページ URL (/c/NNNN/) は商品と誤認せず remove (旧実装は c.html に誤書換)', () => {
+  assert.equal(classifyRakutenHref('https://item.rakuten.co.jp/b-faith/c/0000000220/').kind, 'remove');
+  const bouncer = classifyRakutenHref(
+    'https://shopping.yahoo.co.jp/stores/wrap/bouncer.html?dest_path=https%3A%2F%2Fitem.rakuten.co.jp%2Fb-faith%2Fc%2F0000000220%2F'
+  );
+  assert.equal(bouncer.kind, 'remove');
+});
+
+test('R18: HTML コメントは全除去 (コメント内の楽天 URL も residue に残らない)', () => {
+  const out = sanitizeProductHtml('<p>本文</p><!-- https://item.rakuten.co.jp/b-faith/x/ メモ -->');
+  assert.ok(!out.includes('<!--'), out);
+  assert.ok(!/rakuten/i.test(out));
+  assert.ok(out.includes('本文'));
 });
 
 // ── scrubRakutenUrlsFromText (explanation プレーンテキスト経路) ──

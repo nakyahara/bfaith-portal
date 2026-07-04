@@ -18,6 +18,7 @@
 import crypto from 'crypto';
 import { evaluateItemForPublish } from './publish-pipeline.js';
 import { applyAucFreespaceFallback } from './field-mapper.js';
+import { stripEcmpanBlocks } from '../lib/rakuten-link-sanitizer.js';
 import { callEditItem, YahooProxyError } from '../lib/yahoo-publish-proxy.js';
 import { uploadRakutenImagesToYahoo } from '../lib/image-uploader.js';
 import { validateYahooEditItemFields, YahooFieldValidationError } from '../lib/yahoo-edititem-validator.js';
@@ -186,8 +187,10 @@ async function performRealPublish({ rakutenImages, fields, itemCode, customPatte
 
   // 1. 説明文画像 URL 抽出 (PC/SP)
   //    Codex Phase E image-html R2 medium: PC/SP まとめて + dedupe suffix 一貫割当
-  const salesDescriptionHtml = rakutenItem?.salesDescription || '';
-  const spDescriptionHtml = rakutenItem?.productDescription?.sp || '';
+  //    R18 (2026-07-04 中原さん指示): ECMPAN ブロック (楽天カテゴリパンくず) は移行対象外。
+  //    画像抽出より前に除去する (ブロック内の画像を無駄に Yahoo へ upload しない)。
+  const salesDescriptionHtml = stripEcmpanBlocks(rakutenItem?.salesDescription || '');
+  const spDescriptionHtml = stripEcmpanBlocks(rakutenItem?.productDescription?.sp || '');
   const descUrlsRaw = [
     ...extractRakutenImageUrls(salesDescriptionHtml),
     ...extractRakutenImageUrls(spDescriptionHtml),
