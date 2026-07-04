@@ -297,6 +297,21 @@ fdNeMaster.append('files', new Blob(['商品コード,仕入先コード,在庫�
 r = await j('/api/import', { method: 'POST', body: fdNeMaster });
 ok(r.status === 400, 'NE商品マスタCSVは /api/import で誤判定しない (400)', r.body);
 
+// 負の最低発注量はDB CHECKで500にせず、null化+警告で取込続行 (CRUD挙動と整合)
+const fdNeg = new FormData();
+fdNeg.append('files', new Blob(['原料グループID,原料グループ名,最低発注量,単位\r\nneggrp,負テスト,-5,個\r\n'], { type: 'text/csv' }), '発注条件マスタ - 原料グループマスタ.csv');
+r = await j('/api/import', { method: 'POST', body: fdNeg });
+ok(r.status === 200 && r.body.counts.materials === 1, '負の最低発注量でも500にならず取込続行', r.body);
+ok(r.body.warnings && r.body.warnings.some(w => w.includes('最低発注量')), '負の最低発注量がwarningsに記録', r.body && r.body.warnings);
+r = await j('/api/masters/materials');
+const negRow = r.body.rows.find(x => x.group_id === 'neggrp');
+ok(negRow && negRow.min_order_qty == null, '負値はnull化されて格納', negRow && negRow.min_order_qty);
+
+// dangling (未登録グループ参照) は unlinked API の dangling で可視化される
+r = await j('/api/attrs/unlinked?days=0');
+ok(r.body.ok && Array.isArray(r.body.dangling), 'unlinked APIに dangling リスト', r.body && r.body.danglingCount);
+ok(r.body.dangling.some(x => x.missMat === 'nonexistgroup'), 'dangling: danglingprod の未登録原料グループが可視化', r.body && r.body.dangling);
+
 console.log('── 未紐付け 新商品フィルタ ──');
 // 登録日が古い商品は既定(60日)では出ない、days=0で全件
 db.prepare(`UPDATE mirror_pml_snapshot_rows SET 登録日='2020-01-01' WHERE 商品コード='0726-001060'`).run();

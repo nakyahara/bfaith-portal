@@ -539,12 +539,15 @@ function colIndex(header, ...aliases) {
 }
 const hasCol = (header, ...a) => colIndex(header, ...a) >= 0;
 
-// 数値パース (カンマ許容)。非空なのに数値化できない値は warn に記録して null (黙って欠落させない)。
-function numOrWarn(raw, warn, ctx) {
+// 数値パース (カンマ許容)。非空なのに数値化不能/範囲外の値は warn に記録して null (黙って欠落させない)。
+//   opts.min: これ未満(n<min)を却下 / opts.gt: これ以下(n<=gt)を却下 — DBのCHECK制約と揃える。
+function numOrWarn(raw, warn, ctx, opts = {}) {
   const s = trimS(raw).replace(/,/g, '');
   if (s === '') return null;
   const n = Number(s);
   if (!Number.isFinite(n)) { if (warn) warn(`${ctx}: 数値でない値「${trimS(raw)}」を無視しました`); return null; }
+  if (opts.min != null && n < opts.min) { if (warn) warn(`${ctx}: 範囲外の値「${n}」(${opts.min}以上が必要) を無視しました`); return null; }
+  if (opts.gt != null && n <= opts.gt) { if (warn) warn(`${ctx}: 範囲外の値「${n}」(${opts.gt}より大きい値が必要) を無視しました`); return null; }
   return n;
 }
 
@@ -560,7 +563,7 @@ const IMPORT_RECIPES = [
       const out = [];
       for (let r = 1; r < rows.length; r++) {
         const c = rows[r]; const id = trimS(c[iId]); if (!id) continue;
-        out.push({ table: 'materials', row: { group_id: id, name: trimS(c[iName]) || id, min_order_qty: iMin >= 0 ? numOrWarn(c[iMin], warn, `原料グループマスタ ${r + 1}行目 最低発注量`) : null, unit: iUnit >= 0 ? (trimS(c[iUnit]) || null) : null } });
+        out.push({ table: 'materials', row: { group_id: id, name: trimS(c[iName]) || id, min_order_qty: iMin >= 0 ? numOrWarn(c[iMin], warn, `原料グループマスタ ${r + 1}行目 最低発注量`, { min: 0 }) : null, unit: iUnit >= 0 ? (trimS(c[iUnit]) || null) : null } });
       }
       return out;
     },
@@ -603,13 +606,13 @@ const IMPORT_RECIPES = [
           if (sc && sc.toUpperCase() !== '#N/A') { if (!suppliers.has(sc) || (sn && !suppliers.get(sc))) suppliers.set(sc, sn); }
         }
         const cond = iGrp >= 0 ? (trimS(c[iGrp]) || null) : null, mat = iMat >= 0 ? (trimS(c[iMat]) || null) : null;
-        const cap = iCap >= 0 ? numOrWarn(c[iCap], warn, `商品マスタ ${r + 1}行目(${code}) 容量/個`) : null;
-        const cg = iCg >= 0 ? (trimS(c[iCg]) || null) : null, cl = iCl >= 0 ? numOrWarn(c[iCl], warn, `商品マスタ ${r + 1}行目(${code}) ケースロット`) : null;
+        const cap = iCap >= 0 ? numOrWarn(c[iCap], warn, `商品マスタ ${r + 1}行目(${code}) 容量/個`, { gt: 0 }) : null;
+        const cg = iCg >= 0 ? (trimS(c[iCg]) || null) : null, cl = iCl >= 0 ? numOrWarn(c[iCl], warn, `商品マスタ ${r + 1}行目(${code}) ケースロット`, { gt: 0 }) : null;
         if (cond || mat || cap || cg || cl) {
           out.push({ table: 'attrs', row: {
             product_key: normProductCode(code), product_code: code,
             condition_id: cond, material_group_id: mat,
-            capacity_per_unit: (cap != null && cap > 0) ? cap : null, case_group: cg, case_lot: (cl != null && cl > 0) ? cl : null,
+            capacity_per_unit: cap, case_group: cg, case_lot: cl,
           } });
         }
       }
@@ -834,7 +837,20 @@ router.get('/api/attrs/unlinked', (req, res) => {
     }
     const filtered = since != null ? all.filter(x => x.isRecent) : all;
     filtered.sort((a, b) => (b.reg || '').localeCompare(a.reg || ''));
-    res.json({ ok: true, totalUnlinked: all.length, recentCount, days, count: filtered.length, rows: filtered.slice(0, 500) });
+    // 紐付けはあるが未登録グループを参照している商品 (取込警告が消えても見失わないよう常時可視化)
+    const db = getDB();
+    const dangling = db.prepare(`
+      SELECT a.product_code AS code,
+             CASE WHEN a.condition_id IS NOT NULL AND a.condition_id<>'' AND c.condition_id IS NULL THEN a.condition_id END AS missCond,
+             CASE WHEN a.material_group_id IS NOT NULL AND a.material_group_id<>'' AND g.group_id IS NULL THEN a.material_group_id END AS missMat
+      FROM po_product_attrs a
+      LEFT JOIN po_order_conditions c ON c.condition_id = a.condition_id
+      LEFT JOIN po_material_groups g ON g.group_id = a.material_group_id
+      WHERE (a.condition_id IS NOT NULL AND a.condition_id<>'' AND c.condition_id IS NULL)
+         OR (a.material_group_id IS NOT NULL AND a.material_group_id<>'' AND g.group_id IS NULL)
+      LIMIT 500
+    `).all();
+    res.json({ ok: true, totalUnlinked: all.length, recentCount, days, count: filtered.length, rows: filtered.slice(0, 500), danglingCount: dangling.length, dangling });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
@@ -1475,7 +1491,16 @@ function renderUnlinked(j) {
   h += '<table class="t"><thead><tr><th>登録日</th><th>商品コード</th><th>商品名</th><th>仕入先</th></tr></thead><tbody>';
   if (!j.rows.length) h += '<tr><td colspan="4" class="muted">該当なし 🎉</td></tr>';
   j.rows.forEach(function(r){ h += '<tr><td>' + esc(r.reg || '—') + '</td><td>' + esc(r.code) + '</td><td>' + esc(r.name) + '</td><td>' + esc(r.supplier) + '</td></tr>'; });
-  document.getElementById('tabBody').innerHTML = h + '</tbody></table>';
+  h += '</tbody></table>';
+  // 未登録グループを参照している商品 (紐付けはあるが参照先が無い = マスタ側の登録漏れ)
+  var dg = j.dangling || [];
+  if (dg.length) {
+    h += '<div class="warn" style="margin-top:18px">⚠️ 未登録グループを参照している商品が ' + dg.length + ' 件あります（発注条件/原料グループマスタの登録漏れ）</div>';
+    h += '<table class="t"><thead><tr><th>商品コード</th><th>未登録の発注条件グループ</th><th>未登録の原料グループ</th></tr></thead><tbody>';
+    dg.forEach(function(r){ h += '<tr><td>' + esc(r.code) + '</td><td>' + esc(r.missCond || '—') + '</td><td>' + esc(r.missMat || '—') + '</td></tr>'; });
+    h += '</tbody></table>';
+  }
+  document.getElementById('tabBody').innerHTML = h;
   document.getElementById('uDays').addEventListener('change', function(ev){ loadUnlinked(ev.target.value); });
 }
 function loadUnlinked(days) {
