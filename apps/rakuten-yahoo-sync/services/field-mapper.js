@@ -156,6 +156,18 @@ export function buildYahooEditItemFields({
     fields.auc_category = FIXED_FIELDS.AUC_CATEGORY;
   }
 
+  // headline 解決 (R17 2026-07-04 中原さん指示): 楽天キャッチコピーを Yahoo キャッチコピーに移行。
+  //   優先順位は他 field と同じ Notion override > 楽天 fallback。
+  //   楽天キャッチコピーに <br> が含まれる場合は除去して詰める (中原さん指示)。
+  //   RMS Items API 2.0 の field 名は tagline (旧 1.0 は catchcopy) — 両対応で読む。
+  //   buildYahooHeadline で HTML 除去 + 全角 30 truncate、 残った改行も除去 (headline は 1 行)。
+  const rakutenTagline = rakutenItem.tagline ?? rakutenItem.catchcopy ?? '';
+  const headlineSource = notionOverride?.yahoo_headline
+    || String(rakutenTagline).replace(/<br\s*\/?>/gi, '');
+  const resolvedHeadline = headlineSource
+    ? buildYahooHeadline(headlineSource).replace(/\n+/g, '')
+    : '';
+
   // caption / explanation / additional1 / sp_additional (Q33)
   //
   //   2026-06-27 editItem HTTP 400 (Code it-01033) で判明: Yahoo の explanation は
@@ -167,21 +179,19 @@ export function buildYahooEditItemFields({
   fields.caption = pickCaptionField(notionOverride, rakutenItem);
   // R16: explanation はプレーンテキストで sanitizeProductHtml を通らないため、
   //   テキスト中に生の楽天 URL が残っていたらここでスクラブする (自店商品→Yahoo URL、他→削除)。
+  //   R17: headline は Notion > 楽天キャッチコピー の解決済み値を使う (explanation 先頭行と headline 欄が一致)。
   fields.explanation = scrubRakutenUrlsFromText(buildYahooExplanation({
-    headline: notionOverride?.yahoo_headline,
+    headline: resolvedHeadline,
     itemName: rakutenItem.itemName || rakutenItem.title || '',
     html: rakutenItem.productDescription?.pc || '',
   }));
   fields.additional1 = sanitizeProductHtml(rakutenItem.salesDescription || '');
   fields.sp_additional = sanitizeProductHtml(rakutenItem.productDescription?.sp || '');
 
-  // headline / jan (Notion override 任意)
+  // headline (R17: Notion override > 楽天キャッチコピー、 上で解決済み)
   //   Codex R3 H-1: headline は Yahoo HTML 不可 + 全角 30 以内なので、 buildYahooHeadline で
-  //   plain 化 + truncate してから代入 (Notion に `<b>` 等が混入していても安全)。
-  if (notionOverride?.yahoo_headline) {
-    const h = buildYahooHeadline(notionOverride.yahoo_headline);
-    if (h) fields.headline = h;
-  }
+  //   plain 化 + truncate 済みの resolvedHeadline を代入。
+  if (resolvedHeadline) fields.headline = resolvedHeadline;
   if (notionOverride?.yahoo_jan) fields.jan = String(notionOverride.yahoo_jan);
 
   // 楽天 features 由来 flags
