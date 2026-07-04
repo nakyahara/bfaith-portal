@@ -80,6 +80,33 @@ check('demote fires when url cleared', Array.isArray(demoteReasons) && demoteRea
 check('demoted back to draft', db.prepare('SELECT status FROM product_drafts WHERE id = ?').get(draft.id).status === 'draft');
 db.prepare(`UPDATE product_drafts SET official_url = 'https://example.com/item' WHERE id = ?`).run(draft.id);
 
+// ─── P1.5: draft_yahoo / draft_image_production / 新列 / 生成キュー ───
+const cols = new Set(db.prepare('PRAGMA table_info(product_drafts)').all().map((c) => c.name));
+check('new columns exist', ['asin', 'amazon_url', 'own_brand'].every((c) => cols.has(c)));
+
+dbmod.upsertDraftYahoo(db, draft.id, { yahoo_price: 1980, delivery_label: 'ネコポス' });
+dbmod.upsertDraftYahoo(db, draft.id, { tax_rate: '10%' }); // 部分更新: 既存値が残ること
+const y = db.prepare('SELECT * FROM draft_yahoo WHERE draft_id = ?').get(draft.id);
+check('draft_yahoo partial upsert', y.yahoo_price === 1980 && y.delivery_label === 'ネコポス' && y.tax_rate === '10%');
+
+let yahooCheckErr = null;
+try { dbmod.upsertDraftYahoo(db, draft.id, { yahoo_price: -5 }); } catch (e) { yahooCheckErr = e; }
+check('draft_yahoo price CHECK', yahooCheckErr && String(yahooCheckErr.message).includes('CHECK'));
+
+dbmod.upsertImageProduction(db, draft.id, { status: '参考画像収集', designer: '外注_大川さん' });
+dbmod.upsertImageProduction(db, draft.id, { request_text: '画像作成お願いします' });
+const ip = db.prepare('SELECT * FROM draft_image_production WHERE draft_id = ?').get(draft.id);
+check('image_production partial upsert', ip.status === '参考画像収集' && ip.designer === '外注_大川さん' && ip.request_text === '画像作成お願いします');
+
+db.prepare(`UPDATE product_drafts SET status = 'ready_for_ai' WHERE id = ?`).run(draft.id);
+db.prepare(`INSERT INTO draft_reference_urls (draft_id, url) VALUES (?, 'https://example.com/ref1')`).run(draft.id);
+db.prepare(`INSERT INTO draft_specs (draft_id, spec_key, spec_value) VALUES (?, 'サイズ', 'W10cm')`).run(draft.id);
+const queue = dbmod.listGenerationQueue(db);
+const qd = queue.find((q) => q.id === draft.id);
+check('generation queue shape', qd && qd.ne_code === 'SMOKE-1' && qd.reference_urls.length === 1
+  && qd.specs[0].key === 'サイズ' && qd.yahoo?.yahoo_price === 1980 && qd.image_count === 1, JSON.stringify(qd));
+db.prepare(`UPDATE product_drafts SET status = 'draft' WHERE id = ?`).run(draft.id);
+
 // ─── notion-card fail-closed (env 未設定 → failed で残り、登録は無事) ───
 delete process.env.RYS_NOTION_TOKEN;
 const notionCard = await import('../services/notion-card.js');
@@ -106,9 +133,9 @@ const renders = [
     statuses, statusLabels, notionPending: 0,
   }],
   ['new.ejs', 'new.ejs', { title: 't', displayName: 'smoke' }],
-  ['detail.ejs (full)', 'detail.ejs', {
+  ['detail.ejs (full/own_brand)', 'detail.ejs', {
     title: 't', displayName: 'smoke',
-    draft: after,
+    draft: { ...after, own_brand: 1, asin: 'B0TEST', amazon_url: 'https://www.amazon.co.jp/dp/B0TEST' },
     refs: [{ id: 1, url: 'https://example.com/ref' }],
     images: [{ id: 1, drive_file_id: 'x', thumb: 'https://x', view_url: 'https://x' }],
     specs: [{ id: 1, spec_key: 'サイズ', spec_value: 'W10' }],
@@ -118,14 +145,17 @@ const renders = [
     nextStatuses: ['ready_for_ai', 'on_hold', 'excluded'],
     statusLabels,
     aiKinds: dbmod.AI_OUTPUT_KINDS,
+    yahoo: { yahoo_price: 1980, yahoo_price_sagawa: null, delivery_label: 'ネコポス', tax_rate: '10%', yahoo_category_id: 43494, yahoo_path: 'おもちゃ' },
+    imageProduction: { status: '参考画像収集', importance_tier: 'そこそこ力を入れる（6〜8枚）', production_type: null, aplus_content: null, aplus_related: null, camera_instruction_url: null, shipping_status: null, reference_collection: null, designer: '外注_大川さん', page_composer: null, request_text: '依頼文' },
   }],
-  ['detail.ejs (created notion)', 'detail.ejs', {
+  ['detail.ejs (created notion / non-own-brand)', 'detail.ejs', {
     title: 't', displayName: 'smoke',
-    draft: { ...after, status: 'review', notion_card_status: 'created', notion_page_id: 'abcd-ef', has_variation: 1, memo: 'm', price: 1980, jan_code: '49', drive_folder_url: 'https://drive.google.com/drive/folders/x', official_url: 'https://x' },
+    draft: { ...after, status: 'review', notion_card_status: 'created', notion_page_id: 'abcd-ef', has_variation: 1, own_brand: 0, asin: null, amazon_url: null, memo: 'm', price: 1980, jan_code: '49', drive_folder_url: 'https://drive.google.com/drive/folders/x', official_url: 'https://x' },
     refs: [], images: [], specs: [],
     aiOutputs: Object.fromEntries(dbmod.AI_OUTPUT_KINDS.map((k) => [k, null])),
     events: [], gate: [], nextStatuses: ['approved', 'draft', 'on_hold', 'excluded'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
+    yahoo: null, imageProduction: null,
   }],
 ];
 for (const [name, file, data] of renders) {

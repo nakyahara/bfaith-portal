@@ -53,6 +53,9 @@ export function initProductHubDB() {
       price               INTEGER             -- 売価 (税込・円・整数)
                           CHECK (price IS NULL OR (price BETWEEN 0 AND 1000000000000)),
       jan_code            TEXT,
+      asin                TEXT,
+      amazon_url          TEXT,
+      own_brand           INTEGER NOT NULL DEFAULT 0 CHECK (own_brand IN (0, 1)),
       has_variation       INTEGER NOT NULL DEFAULT 0 CHECK (has_variation IN (0, 1)),
       drive_folder_url    TEXT,               -- 商品画像フォルダ (商品コード_商品名 規則を推奨)
       memo                TEXT,
@@ -110,6 +113,36 @@ export function initProductHubDB() {
       UNIQUE(draft_id, kind)
     );
 
+    -- Yahoo 向け追記項目 (要件定義 §12: RYS notion_overrides と同じ意味論。
+    -- 将来 RYS の参照先を Notion → ここへアダプタ方式で切替するための受け皿)
+    CREATE TABLE IF NOT EXISTS draft_yahoo (
+      draft_id            INTEGER PRIMARY KEY REFERENCES product_drafts(id) ON DELETE CASCADE,
+      yahoo_price         INTEGER CHECK (yahoo_price IS NULL OR (yahoo_price BETWEEN 0 AND 1000000000000)),
+      yahoo_price_sagawa  INTEGER CHECK (yahoo_price_sagawa IS NULL OR (yahoo_price_sagawa BETWEEN 0 AND 1000000000000)),
+      delivery_label      TEXT,
+      tax_rate            TEXT,
+      yahoo_category_id   INTEGER,
+      yahoo_path          TEXT,
+      updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+
+    -- 画像制作ワークフロー (要件定義 §13: Notion「商品ページ商品画像登録」の固有項目。自社商品のみ作成)
+    CREATE TABLE IF NOT EXISTS draft_image_production (
+      draft_id               INTEGER PRIMARY KEY REFERENCES product_drafts(id) ON DELETE CASCADE,
+      status                 TEXT,
+      importance_tier        TEXT,
+      production_type        TEXT,
+      aplus_content          TEXT,
+      aplus_related          TEXT,
+      camera_instruction_url TEXT,
+      shipping_status        TEXT,
+      reference_collection   TEXT,
+      designer               TEXT,
+      page_composer          TEXT,
+      request_text           TEXT,
+      updated_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+
     CREATE TABLE IF NOT EXISTS draft_events (
       id         INTEGER PRIMARY KEY AUTOINCREMENT,
       draft_id   INTEGER NOT NULL,
@@ -125,6 +158,16 @@ export function initProductHubDB() {
   const draftCols = new Set(db.prepare('PRAGMA table_info(product_drafts)').all().map((c) => c.name));
   if (!draftCols.has('notion_card_claim')) {
     db.exec('ALTER TABLE product_drafts ADD COLUMN notion_card_claim TEXT');
+  }
+  // P1.5: 自社商品フラグ + Amazon 識別子 (要件定義 §13)
+  if (!draftCols.has('asin')) {
+    db.exec('ALTER TABLE product_drafts ADD COLUMN asin TEXT');
+  }
+  if (!draftCols.has('amazon_url')) {
+    db.exec('ALTER TABLE product_drafts ADD COLUMN amazon_url TEXT');
+  }
+  if (!draftCols.has('own_brand')) {
+    db.exec('ALTER TABLE product_drafts ADD COLUMN own_brand INTEGER NOT NULL DEFAULT 0 CHECK (own_brand IN (0, 1))');
   }
 
   // draft_events は append-only (mis-shipment と同じ trigger ガード)
@@ -165,6 +208,76 @@ export function gateReasons(db, draft) {
   const imgCount = db.prepare('SELECT COUNT(*) AS c FROM draft_images WHERE draft_id = ?').get(draft.id).c;
   if (imgCount === 0) reasons.push('商品画像 (Driveリンク) が1枚もありません');
   return reasons;
+}
+
+/** draft_yahoo の upsert (部分更新: undefined のキーは既存値を維持) */
+export function upsertDraftYahoo(db, draftId, fields) {
+  const existing = db.prepare('SELECT * FROM draft_yahoo WHERE draft_id = ?').get(draftId) || {};
+  const merged = {
+    yahoo_price: fields.yahoo_price !== undefined ? fields.yahoo_price : (existing.yahoo_price ?? null),
+    yahoo_price_sagawa: fields.yahoo_price_sagawa !== undefined ? fields.yahoo_price_sagawa : (existing.yahoo_price_sagawa ?? null),
+    delivery_label: fields.delivery_label !== undefined ? fields.delivery_label : (existing.delivery_label ?? null),
+    tax_rate: fields.tax_rate !== undefined ? fields.tax_rate : (existing.tax_rate ?? null),
+    yahoo_category_id: fields.yahoo_category_id !== undefined ? fields.yahoo_category_id : (existing.yahoo_category_id ?? null),
+    yahoo_path: fields.yahoo_path !== undefined ? fields.yahoo_path : (existing.yahoo_path ?? null),
+  };
+  db.prepare(`
+    INSERT INTO draft_yahoo (draft_id, yahoo_price, yahoo_price_sagawa, delivery_label, tax_rate, yahoo_category_id, yahoo_path)
+    VALUES (@draft_id, @yahoo_price, @yahoo_price_sagawa, @delivery_label, @tax_rate, @yahoo_category_id, @yahoo_path)
+    ON CONFLICT(draft_id) DO UPDATE SET
+      yahoo_price = excluded.yahoo_price,
+      yahoo_price_sagawa = excluded.yahoo_price_sagawa,
+      delivery_label = excluded.delivery_label,
+      tax_rate = excluded.tax_rate,
+      yahoo_category_id = excluded.yahoo_category_id,
+      yahoo_path = excluded.yahoo_path,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  `).run({ draft_id: draftId, ...merged });
+}
+
+const IMAGE_PRODUCTION_FIELDS = [
+  'status', 'importance_tier', 'production_type', 'aplus_content', 'aplus_related',
+  'camera_instruction_url', 'shipping_status', 'reference_collection',
+  'designer', 'page_composer', 'request_text',
+];
+
+/** draft_image_production の upsert (部分更新)。自社商品のみ呼ぶ想定 (router 側でガード) */
+export function upsertImageProduction(db, draftId, fields) {
+  const existing = db.prepare('SELECT * FROM draft_image_production WHERE draft_id = ?').get(draftId) || {};
+  const merged = {};
+  for (const f of IMAGE_PRODUCTION_FIELDS) {
+    merged[f] = fields[f] !== undefined ? fields[f] : (existing[f] ?? null);
+  }
+  db.prepare(`
+    INSERT INTO draft_image_production (draft_id, ${IMAGE_PRODUCTION_FIELDS.join(', ')})
+    VALUES (@draft_id, ${IMAGE_PRODUCTION_FIELDS.map((f) => `@${f}`).join(', ')})
+    ON CONFLICT(draft_id) DO UPDATE SET
+      ${IMAGE_PRODUCTION_FIELDS.map((f) => `${f} = excluded.${f}`).join(', ')},
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  `).run({ draft_id: draftId, ...merged });
+}
+
+/**
+ * 生成待ち (ready_for_ai) の一覧を、AI 生成に必要な材料つきで返す (P2 スキル接続用)。
+ * 返す形: [{ id, ne_code, name, official_url, price, jan_code, drive_folder_url,
+ *            reference_urls: [], specs: [{key,value}], yahoo: {...}|null, image_count }]
+ */
+export function listGenerationQueue(db, { limit = 50 } = {}) {
+  const drafts = db.prepare(`
+    SELECT id, ne_code, name, official_url, price, jan_code, drive_folder_url, own_brand
+    FROM product_drafts WHERE status = 'ready_for_ai' ORDER BY updated_at ASC LIMIT ?
+  `).all(limit);
+  const refStmt = db.prepare('SELECT url FROM draft_reference_urls WHERE draft_id = ? ORDER BY sort, id');
+  const specStmt = db.prepare('SELECT spec_key, spec_value FROM draft_specs WHERE draft_id = ? ORDER BY sort, id');
+  const yahooStmt = db.prepare('SELECT yahoo_price, yahoo_price_sagawa, delivery_label, tax_rate, yahoo_category_id, yahoo_path FROM draft_yahoo WHERE draft_id = ?');
+  const imgStmt = db.prepare('SELECT COUNT(*) AS c FROM draft_images WHERE draft_id = ?');
+  return drafts.map((d) => ({
+    ...d,
+    reference_urls: refStmt.all(d.id).map((r) => r.url),
+    specs: specStmt.all(d.id).map((s) => ({ key: s.spec_key, value: s.spec_value })),
+    yahoo: yahooStmt.get(d.id) || null,
+    image_count: imgStmt.get(d.id).c,
+  }));
 }
 
 /**
