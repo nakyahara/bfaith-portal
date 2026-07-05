@@ -168,14 +168,19 @@ router.post('/api/drafts', async (req, res) => {
   if (officialUrl && !isHttpUrl(officialUrl)) {
     return res.status(400).json({ ok: false, error: '公式ページURLの形式が不正です (http/https)' });
   }
+  const amazonUrlCreate = cleanText(req.body?.amazon_url, 1000);
+  if (amazonUrlCreate && !isHttpUrl(amazonUrlCreate)) {
+    return res.status(400).json({ ok: false, error: 'Amazon URLの形式が不正です (http/https)' });
+  }
 
   const db = getDB();
   let draftId;
   try {
     const info = db.prepare(`
-      INSERT INTO product_drafts (ne_code, name, official_url, price, jan_code, created_by)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(neCode, name, officialUrl, sanitizeMoney(req.body?.price), cleanText(req.body?.jan_code, 20), actorOf(req));
+      INSERT INTO product_drafts (ne_code, name, official_url, price, jan_code, asin, amazon_url, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(neCode, name, officialUrl, sanitizeMoney(req.body?.price), cleanText(req.body?.jan_code, 20),
+      cleanText(req.body?.asin, 20), amazonUrlCreate, actorOf(req));
     draftId = info.lastInsertRowid;
   } catch (e) {
     if (String(e.message).includes('UNIQUE')) {

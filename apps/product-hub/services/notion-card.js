@@ -62,11 +62,13 @@ export async function syncCardLinks(draftId, { actor = null } = {}) {
   if (!draft) return { outcome: 'not_found' };
   if (!draft.notion_page_id) return { outcome: 'no_card' };
   try {
+    // 保存レスポンスを道連れにしないよう短い timeout + リトライ1回に制限 (Codex medium)。
+    // 失敗しても fail-soft でイベントに残るだけなので、粘るより早く返す方が UX が良い
     await patchPageProperties(draft.notion_page_id, {
       // { url: null } で Notion 側もクリアされる (ポータルで消したら Notion も消す)
       'メーカーページURL': { url: draft.official_url || null },
       'amazon販売ページ': { url: draft.amazon_url || null },
-    });
+    }, { cfg: { timeoutMs: 10_000 }, maxRetries: 1 });
     logEvent(db, draftId, 'notion_card_links_synced', null, actor);
     return { outcome: 'synced' };
   } catch (e) {
