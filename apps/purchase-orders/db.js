@@ -80,6 +80,18 @@ export function initPurchaseOrders() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_po_attrs_cond ON po_product_attrs(condition_id)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_po_attrs_mat ON po_product_attrs(material_group_id)');
 
+  // 「選べる◯種セット」構成商品 (楽天/Yahooの項目選択肢セット販売、在庫を切らさない前提の商品)。
+  // 在庫+注残 が min_stock 以下になったら要発注リストに「選べるセット構成の在庫減」として載せる。
+  // min_stock NULL は既定値 (logic.js SELECTABLE_DEFAULT_MIN) を使う。
+  db.exec(`CREATE TABLE IF NOT EXISTS po_selectable_products (
+    product_key   TEXT PRIMARY KEY,
+    product_code  TEXT NOT NULL,
+    set_names     TEXT,
+    min_stock     REAL CHECK(min_stock IS NULL OR min_stock >= 0),
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+  )`);
+
   // NE商品マスタCSV オーバーレイ (日中に手動DLした最新値で 在庫/注残/原価等 を上書き計算する)
   // 正本は毎朝の PML。overlay は「その日の作業用の一時データ」で、翌朝同期より古くなったら自動で無視される。
   db.exec(`CREATE TABLE IF NOT EXISTS po_ne_overlay_meta (
@@ -131,6 +143,8 @@ export function initPurchaseOrders() {
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_po_items_order ON po_order_items(order_id)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_po_items_key ON po_order_items(product_key)');
+  // 発注時点の発注条件グループのスナップショット (月次上限=出荷制限の累計判定用)。既存DBには後付け
+  try { db.exec('ALTER TABLE po_order_items ADD COLUMN condition_id TEXT'); } catch (e) { /* 既に存在 */ }
 
   initialized = true;
   return db;

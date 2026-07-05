@@ -393,6 +393,46 @@ console.log('── 商品別モール販売内訳 API ──');
   ok(r.status === 200 && r.body.sokuho.rows.length === 0, '存在しない商品コードは空で200');
 }
 
+console.log('── 選べるセット構成 / 月次上限 / bind ──');
+{
+  // 今月発注済み数量 (issue済み noflyersticker 400) が issuedMonth に載る
+  r = await j('/api/supplier/1');
+  ok(r.body.issuedMonth && r.body.issuedMonth['noflyersticker'] >= 400, '上限用: 今月確定済み数量 issuedMonth', r.body.issuedMonth);
+  const nfCond = r.body.conditions.find(c => c.memberCodes.includes('noflyersticker'));
+  ok(nfCond && r.body.issuedByCond && r.body.issuedByCond[nfCond.conditionId] >= 400, '上限用: 条件別スナップショット issuedByCond', r.body.issuedByCond);
+  ok(r.body.issuedTotal >= 10400, '上限用: 仕入先全体 issuedTotal', r.body.issuedTotal);
+  ok(r.body.allGroups && r.body.allGroups.conditions.length > 0 && r.body.allGroups.materials.length > 0, 'グループ紐付けUI用 allGroups');
+
+  // 選べるセット構成: deaditem (掘り起こし=在庫50) を最低在庫60で登録 → 在庫が下回るので要発注に昇格 + selectableLow
+  r = await j('/api/masters/selectable', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ product_code: 'deaditem', set_names: '選べる5種セット', min_stock: 60 }) });
+  ok(r.status === 200 && r.body.ok, '選べるセット構成 登録', r.body);
+  r = await j('/api/supplier/1');
+  const dead = r.body.targets.find(p => p.code === 'deaditem');
+  ok(dead && dead.selectableLow && dead.selectableLow.sets === '選べる5種セット', '在庫減の構成商品が要発注に昇格 + selectableLow', dead && dead.selectableLow);
+  ok(!r.body.horikoshi.some(p => p.code === 'deaditem'), '昇格後は掘り起こしから消える');
+  ok(dead && dead.recQty > 0, '販売0でも推奨発注が入る (最低在庫×2まで補充をロット切上げ)', dead && dead.recQty);
+
+  // bind API: 条件だけ更新しても既存の原料/容量は保持される
+  r = await j('/api/attrs/bind', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ product_code: 'diyorangeoil100', condition_id: 'KMC' }) });
+  ok(r.status === 200 && r.body.ok, 'bind: 条件のみ更新 200', r.body);
+  r = await j('/api/masters/attrs');
+  const oil = r.body.rows.find(x => x.product_key === 'diyorangeoil100');
+  ok(oil && oil.condition_id === 'KMC' && oil.material_group_id === 'mokouorange' && oil.capacity_per_unit === 100, 'bind: 原料/容量を保持したまま条件だけ変わる', oil);
+  r = await j('/api/attrs/bind', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ product_code: 'diyorangeoil100', condition_id: '', material_group_id: 'mokouorange' }) });
+  ok(r.status === 200, 'bind: 条件解除もできる');
+  r = await j('/api/attrs/bind', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ product_code: 'diyorangeoil100', condition_id: 'NOEXIST' }) });
+  ok(r.status === 400, 'bind: 未登録グループは400 (fail-closed)');
+
+  // 選べるセットCSV取込 (自動判別、同一商品の複数セットはセット名を束ねる)
+  const fdSel = new FormData();
+  fdSel.append('files', new Blob(['商品コード,セット名,最低在庫数\r\ndeaditem,選べる5種セット,5\r\ndeaditem,選べる7種セット,8\r\n'], { type: 'text/csv' }), '選べるセット.csv');
+  r = await j('/api/import', { method: 'POST', body: fdSel });
+  ok(r.status === 200 && r.body.counts.selectable === 1, '選べるセットCSV自動判別取込 (2行→1商品にマージ)', r.body && r.body.counts);
+  r = await j('/api/masters/selectable');
+  const deadSel = r.body.rows.find(x => x.product_key === 'deaditem');
+  ok(deadSel && deadSel.set_names.includes('5種') && deadSel.set_names.includes('7種') && deadSel.min_stock === 8, 'セット名マージ+最低在庫はmax', deadSel);
+}
+
 console.log('── 画面 (HTML) ──');
 for (const p of ['/', '/supplier/1', '/products', '/orders', '/admin']) {
   const res = await fetch(base + p);
@@ -415,7 +455,11 @@ for (const p of ['/', '/supplier/1', '/products', '/orders', '/admin']) {
   ok(html.includes('renderTargets') && html.includes('accHtml') && html.includes('condCheck'), '/supplier グループ化+アコーディオン+条件チェックのJSを配信');
   ok(html.includes('renderBar') && html.includes('fbar') && !html.includes('cartArea'), '/supplier カート廃止→下部固定バー');
   ok(html.includes('needQty') && html.includes('updateSim'), '/supplier ◯ヶ月分シミュレーション');
-  ok(html.includes('pageQ') && html.includes('filterRows'), '/supplier ページ内商品検索');
+  ok(html.includes('pageQ') && html.includes('applySearch'), '/supplier ページ内商品検索 (debounce再描画方式)');
+  ok(html.includes('data-dis') && html.includes('data-undis'), '/supplier 要発注の✕非表示+戻す');
+  ok(html.includes('bindSave') && html.includes('bindCond'), '/supplier アコーディオンからグループ紐付け');
+  ok(html.includes('issuedMonthFor'), '/supplier 上限=月次累計 (今月確定分込み)');
+  ok(html.includes('overflow: clip'), 'テーブル見出しsticky (secのoverflow:hidden廃止)');
   ok(html.includes('追加発注候補') && !html.includes('ついで買い'), '/supplier 「ついで買い」→「追加発注候補」に改名');
   ok(!html.includes('condArea'), '/supplier 独立した発注条件セクションは廃止済み');
   ok(html.includes('未達の発注条件'), '/supplier 確定前の条件未達警告');
