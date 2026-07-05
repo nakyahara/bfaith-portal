@@ -240,18 +240,20 @@ function supplierWorkspaceData(code) {
   const memberBase = [...all, ...extraProducts];
   const memberOf = (fieldVal, field) => memberBase.filter(p => p[field] === fieldVal).map(p => p.code);
   const condIds = new Set(memberBase.map(p => p.conditionId).filter(Boolean));
+  // 全attrs (画面外の商品含む) で1件でも紐付けがある条件は「商品別条件」。
+  // 画面内リストの memberCodes だけで判定すると、紐付け商品が今リストに出ていないだけの商品別条件を
+  // 仕入先全体条件と誤判定してカート全体で達成扱いにしてしまう (Codex P5 R2 High)
+  const globallyBoundCondIds = new Set();
+  for (const a of masters.attrs.values()) if (a.condition_id) globallyBoundCondIds.add(a.condition_id);
   const conditions = masters.conditions
     .filter(c => condIds.has(c.condition_id) || normSupplierCode(c.supplier_code) === code)
-    .map(c => {
-      const memberCodes = memberOf(c.condition_id, 'conditionId');
-      return {
-        conditionId: c.condition_id, displayName: c.display_name, makerName: c.maker_name || '',
-        conditionType: c.condition_type, conditionValue: c.condition_value, unit: c.unit || '',
-        memberCodes,
-        // 商品紐付けのない仕入先直付き条件 (例: 仕入先全体で¥50,000以上) はカート全体を対象に評価する
-        supplierWide: memberCodes.length === 0 && normSupplierCode(c.supplier_code) === code,
-      };
-    });
+    .map(c => ({
+      conditionId: c.condition_id, displayName: c.display_name, makerName: c.maker_name || '',
+      conditionType: c.condition_type, conditionValue: c.condition_value, unit: c.unit || '',
+      memberCodes: memberOf(c.condition_id, 'conditionId'),
+      // 商品紐付けが全attrsで0件の仕入先直付き条件 (例: 仕入先全体で¥50,000以上) だけカート全体を対象に評価する
+      supplierWide: !globallyBoundCondIds.has(c.condition_id) && normSupplierCode(c.supplier_code) === code,
+    }));
   const matIds = new Set(memberBase.map(p => p.materialGroupId).filter(Boolean));
   const materialGroups = [...matIds].map(id => {
     const m = masters.materialGroups.get(id);
