@@ -501,6 +501,10 @@ router.post('/api/attrs/bind', (req, res) => {
     const code = trimS(b.product_code);
     if (!code) return res.status(400).json({ ok: false, error: '商品コード必須' });
     const key = normProductCode(code);
+    // PMLに実在する商品のみ (API直叩きで任意コードに紐付けられるのを防ぐ、Codex P9 High)
+    if (!loadPml().rows.some(r => normProductCode(r['商品コード']) === key)) {
+      return res.status(400).json({ ok: false, error: `商品がPMLに存在しません: ${code}` });
+    }
     const db = getDB();
     const cur = db.prepare('SELECT * FROM po_product_attrs WHERE product_key=?').get(key) || {};
     const row = {
@@ -2472,8 +2476,9 @@ function normGroupVal(kind, v) {
   var dash = v.indexOf(' — ');
   if (dash >= 0) return v.slice(0, dash).trim(); // 「ID — 名前」→ ID
   if (GROUPS) {
-    var byName = (GROUPS[kind] || []).filter(function(x){ return x.name === v; })[0];
-    if (byName) return byName.id; // 名前だけの入力もIDに解決
+    // 名前だけの入力は一意に決まる場合のみIDへ解決 (重複名は誤紐付けの元、Codex P9 Med)
+    var byName = (GROUPS[kind] || []).filter(function(x){ return x.name === v; });
+    if (byName.length === 1) return byName[0].id;
   }
   return v;
 }
@@ -2504,6 +2509,7 @@ document.getElementById('importForm').addEventListener('submit', function(ev) {
       }
       pr.innerHTML = html;
       toast(w.length ? '取り込みました (注意' + w.length + '件)' : '取り込みました');
+      GROUPS = null; // 取込でグループが増えた場合に datalist を更新
       load();
     })
     .catch(function(e){ st.textContent = ''; alert('通信エラー: ' + e.message); });

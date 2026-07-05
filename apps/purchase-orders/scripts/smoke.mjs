@@ -422,6 +422,8 @@ console.log('── 選べるセット構成 / 月次上限 / bind ──');
   ok(r.status === 200, 'bind: 条件解除もできる');
   r = await j('/api/attrs/bind', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ product_code: 'diyorangeoil100', condition_id: 'NOEXIST' }) });
   ok(r.status === 400, 'bind: 未登録グループは400 (fail-closed)');
+  r = await j('/api/attrs/bind', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ product_code: 'ghost-product-xyz', condition_id: 'KMC' }) });
+  ok(r.status === 400 && r.body.error.includes('PML'), 'bind: PML非存在の商品コードは400 (Codex P9 High)');
 
   // マスタAPIのユーザビリティ: attrs/selectableに商品名、conditionsに仕入先名が付く
   r = await j('/api/masters/attrs');
