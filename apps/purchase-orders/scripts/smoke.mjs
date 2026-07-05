@@ -484,6 +484,12 @@ for (const p of ['/', '/supplier/1', '/products', '/orders', '/admin']) {
   ok(html.includes('dlCsv') && html.includes('btnCsv'), '/supplier 確定リストCSVダウンロード');
   ok(html.includes('<a href="/" class="back sp">'), 'ポータルに戻るリンクは / (修正済)');
 }
+// ダッシュボード: 仕入先カードの✕非表示+戻す
+{
+  const res = await fetch(base + '/');
+  const html = await res.text();
+  ok(html.includes('data-cdis=') && html.includes('data-cundis'), '/ 仕入先カードの✕非表示+戻す');
+}
 r = await j('/api/attrs/unlinked?days=0');
 ok(r.body.ok && r.body.rows.every(x => x.code.toLowerCase() !== 'diyorangeoil100'), 'unlinked: 紐付け済みは出ない');
 ok(r.body.rows.some(x => x.code === '0726-001060'), 'unlinked: 未紐付け取扱中は出る (全件)');

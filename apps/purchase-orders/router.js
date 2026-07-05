@@ -1113,7 +1113,9 @@ const CSS = `
   h2.page { font-size: 19px; margin: 4px 0 16px; font-weight: 700; }
   .warn { background: var(--warn-soft); border: 1px solid #f0d089; color: var(--warnc); padding: 10px 14px; border-radius: 10px; margin-bottom: 14px; font-size: 13px; }
   .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(268px, 1fr)); gap: 14px; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px 16px 14px; display: block; text-decoration: none; color: inherit; box-shadow: var(--shadow); transition: transform .08s, box-shadow .12s, border-color .12s; }
+  .card { position: relative; background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px 16px 14px; display: block; text-decoration: none; color: inherit; box-shadow: var(--shadow); transition: transform .08s, box-shadow .12s, border-color .12s; }
+  .card .cdis { position: absolute; top: 8px; right: 8px; border: none; background: none; color: #9aa7b5; padding: 2px 7px; font-size: 13px; cursor: pointer; border-radius: 7px; }
+  .card .cdis:hover { background: var(--danger-soft); color: var(--danger); }
   a.card:hover { border-color: #b9d0ff; box-shadow: var(--shadow-h); transform: translateY(-2px); }
   .card .nm { font-weight: 700; font-size: 15px; margin-bottom: 6px; line-height: 1.4; }
   .card .memo { font-size: 11.5px; color: var(--warnc); background: var(--warn-soft); border-radius: 6px; padding: 2px 7px; display: inline-block; margin-bottom: 6px; }
@@ -1300,7 +1302,8 @@ router.get('/', (req, res) => {
   const stale = pub && pub.as_of_date ? (Date.now() - Date.parse(pub.as_of_date + 'T00:00:00+09:00')) > 3 * 86400000 : true;
   const freshNote = pub ? freshnessText(pub, overlay) : 'PML未同期';
   const cardHtml = c => `
-    <a class="card" href="/apps/purchase-orders/supplier/${encodeURIComponent(c.code)}">
+    <a class="card" data-sup="${he(c.code)}" data-supname="${he(c.name)}" href="/apps/purchase-orders/supplier/${encodeURIComponent(c.code)}">
+      <button class="cdis" data-cdis="${he(c.code)}" title="この仕入先を非表示 (下の「非表示の仕入先」から戻せます)">✕</button>
       <div class="nm">${he(c.name)} ${c.hasDraft ? '<span class="badge b-draft">下書きあり</span>' : ''}</div>
       ${c.memo ? `<div class="memo">📌 ${he(c.memo)}</div>` : ''}
       <div class="stats">
@@ -1324,13 +1327,57 @@ router.get('/', (req, res) => {
       <span id="opStatus" class="muted"></span>
     </div>
     <div id="searchResult"></div>
-    <h2 class="page" style="font-size:16px">発注が必要な仕入先 <span class="muted">(${cards.length})</span></h2>
-    <div class="cards">${cards.map(cardHtml).join('')}</div>
+    <h2 class="page" style="font-size:16px">発注が必要な仕入先 <span class="muted">(<span id="cntSup">${cards.length}</span>)</span></h2>
+    <div class="cards" id="mainCards">${cards.map(cardHtml).join('')}</div>
+    <div id="dashDis" style="margin-top:12px"></div>
     <details style="margin-top:18px"><summary class="muted" style="cursor:pointer">その他の仕入先 (${others.length}) — 要発注なし</summary>
       <div class="cards" style="margin-top:10px">${others.map(cardHtml).join('')}</div>
     </details>`;
   const script = `
 var IDX = ${jsonEmbed(searchIndex)};
+// 仕入先カードの非表示 (当日データ単位で保持=翌朝リセット。「非表示の仕入先」から戻せる)
+var DASH_KEY = 'po_dash_dis:' + ${jsonEmbed(pub ? pub.as_of_date : '')};
+var HID = {};
+try { (JSON.parse(localStorage.getItem(DASH_KEY) || '[]')).forEach(function(c){ HID[c] = 1; }); } catch (e) {}
+function saveHid(){ try { localStorage.setItem(DASH_KEY, JSON.stringify(Object.keys(HID))); } catch (e) {} }
+function applyHid() {
+  var hidden = [], visMain = 0;
+  document.querySelectorAll('a.card[data-sup]').forEach(function(card) {
+    var code = card.getAttribute('data-sup');
+    var hide = !!HID[code];
+    card.style.display = hide ? 'none' : '';
+    if (hide) hidden.push({ code: code, name: card.getAttribute('data-supname') || code });
+    else if (card.parentNode && card.parentNode.id === 'mainCards') visMain++;
+  });
+  var cnt = document.getElementById('cntSup');
+  if (cnt) cnt.textContent = visMain;
+  var seen = {};
+  hidden = hidden.filter(function(x){ if (seen[x.code]) return false; seen[x.code] = 1; return true; });
+  document.getElementById('dashDis').innerHTML = hidden.length
+    ? '<span class="muted">🗑 非表示の仕入先 ' + hidden.length + ' 件:</span> ' +
+      hidden.map(function(x) {
+        return '<span class="badge" style="background:#f1f5f9;color:#334155;margin:2px 4px 2px 0">' + esc(x.name) +
+          ' <a data-cundis="' + esc(x.code) + '" style="cursor:pointer;color:var(--accent)">↩戻す</a></span>';
+      }).join('') +
+      ' <a data-cundis="*" style="cursor:pointer;color:var(--accent);font-size:12px">全て戻す</a>'
+    : '';
+}
+document.addEventListener('click', function(ev) {
+  var cd = ev.target.getAttribute && ev.target.getAttribute('data-cdis');
+  if (cd) {
+    ev.preventDefault(); ev.stopPropagation(); // カード(リンク)への遷移を止める
+    HID[cd] = 1; saveHid(); applyHid();
+    toast('非表示にしました (「非表示の仕入先」から戻せます)');
+    return;
+  }
+  var ud = ev.target.getAttribute && ev.target.getAttribute('data-cundis');
+  if (ud) {
+    if (ud === '*') HID = {}; else delete HID[ud];
+    saveHid(); applyHid();
+    return;
+  }
+});
+applyHid();
 var box = document.getElementById('q');
 var out = document.getElementById('searchResult');
 box.addEventListener('input', function() {
