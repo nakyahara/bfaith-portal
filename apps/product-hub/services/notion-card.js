@@ -14,7 +14,7 @@
  */
 import crypto from 'crypto';
 
-import { createPage, findPageByManageNumber } from '../../rakuten-yahoo-sync/lib/notion-client.js';
+import { createPage, findPageByManageNumber, patchPageProperties } from '../../rakuten-yahoo-sync/lib/notion-client.js';
 import { getDB, logEvent } from '../db.js';
 
 // notion-client の worst case (timeout 30s × retry 5 + backoff) を大きく上回る保守的な値
@@ -26,7 +26,7 @@ function defaultNotionStatus() {
   return process.env.PH_NOTION_STATUS_DEFAULT || '⓪新規商品_高島';
 }
 
-function buildProperties(draft) {
+export function buildProperties(draft) {
   const properties = {
     'Name': { title: [{ type: 'text', text: { content: String(draft.name) } }] },
     '商品コード': { rich_text: [{ type: 'text', text: { content: String(draft.ne_code) } }] },
@@ -40,7 +40,40 @@ function buildProperties(draft) {
     const jan = Number(String(draft.jan_code).trim());
     if (Number.isFinite(jan)) properties['JANコード'] = { number: jan };
   }
+  // URL 系 (notion-schema.json 実測: どちらも url 型)。公式ページ = メーカーページURL
+  if (draft.official_url) {
+    properties['メーカーページURL'] = { url: draft.official_url };
+  }
+  if (draft.amazon_url) {
+    properties['amazon販売ページ'] = { url: draft.amazon_url };
+  }
   return properties;
+}
+
+/**
+ * 既存カードへ URL 項目だけを再同期する (基本情報の保存時に呼ぶ)。
+ * URL はポータル起点の項目なので上書きしてよい。売価/JAN 等は Notion 側が
+ * RYS 運用の正データ (人が編集する) のため、作成時のみ設定し更新では触らない。
+ * fail-soft: 失敗しても保存自体は成功のまま。イベントに記録して返す。
+ */
+export async function syncCardLinks(draftId, { actor = null } = {}) {
+  const db = getDB();
+  const draft = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draftId);
+  if (!draft) return { outcome: 'not_found' };
+  if (!draft.notion_page_id) return { outcome: 'no_card' };
+  try {
+    await patchPageProperties(draft.notion_page_id, {
+      // { url: null } で Notion 側もクリアされる (ポータルで消したら Notion も消す)
+      'メーカーページURL': { url: draft.official_url || null },
+      'amazon販売ページ': { url: draft.amazon_url || null },
+    });
+    logEvent(db, draftId, 'notion_card_links_synced', null, actor);
+    return { outcome: 'synced' };
+  } catch (e) {
+    const error = truncateError(e);
+    logEvent(db, draftId, 'notion_card_sync_failed', error, actor);
+    return { outcome: 'failed', error };
+  }
 }
 
 function truncateError(e) {
