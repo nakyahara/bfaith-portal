@@ -472,6 +472,9 @@ for (const p of ['/', '/supplier/1', '/products', '/orders', '/admin']) {
   ok(html.includes('gaddQ') && html.includes('data-gadd'), '/supplier グループへの商品追加検索');
   ok(html.includes('needAll') && html.includes('(この商品)'), '/supplier 必要数一括コピー+同グループ表に自分自身');
   ok(html.includes('accApply') && html.includes('＋追加'), '/supplier 要発注リストに反映して閉じる+追加行バッジ');
+  ok(html.includes('data-copy=') && html.includes('data-copyq='), '/supplier 商品コード/発注数のクリックコピー');
+  ok(html.includes('data-gdis=') && html.includes('グループごと非表示'), '/supplier グループ一括✕');
+  ok(html.includes('1換算'), '/supplier 容量未設定=1換算でゲージが動く');
   ok(html.includes('issuedMonthFor'), '/supplier 上限=月次累計 (今月確定分込み)');
   ok(html.includes('max-height: 74vh; overflow: auto'), '見出し追随: .bd自体をスクロール領域化 (確実に効く方式)');
   ok(html.includes('position: sticky; top: 0;'), '見出しは.bd上端に貼り付く');
@@ -480,6 +483,12 @@ for (const p of ['/', '/supplier/1', '/products', '/orders', '/admin']) {
   ok(html.includes('未達の発注条件'), '/supplier 確定前の条件未達警告');
   ok(html.includes('dlCsv') && html.includes('btnCsv'), '/supplier 確定リストCSVダウンロード');
   ok(html.includes('<a href="/" class="back sp">'), 'ポータルに戻るリンクは / (修正済)');
+}
+// ダッシュボード: 仕入先カードの✕非表示+戻す
+{
+  const res = await fetch(base + '/');
+  const html = await res.text();
+  ok(html.includes('data-cdis=') && html.includes('data-cundis'), '/ 仕入先カードの✕非表示+戻す');
 }
 r = await j('/api/attrs/unlinked?days=0');
 ok(r.body.ok && r.body.rows.every(x => x.code.toLowerCase() !== 'diyorangeoil100'), 'unlinked: 紐付け済みは出ない');

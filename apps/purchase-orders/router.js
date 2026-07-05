@@ -1113,7 +1113,9 @@ const CSS = `
   h2.page { font-size: 19px; margin: 4px 0 16px; font-weight: 700; }
   .warn { background: var(--warn-soft); border: 1px solid #f0d089; color: var(--warnc); padding: 10px 14px; border-radius: 10px; margin-bottom: 14px; font-size: 13px; }
   .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(268px, 1fr)); gap: 14px; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px 16px 14px; display: block; text-decoration: none; color: inherit; box-shadow: var(--shadow); transition: transform .08s, box-shadow .12s, border-color .12s; }
+  .card { position: relative; background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px 16px 14px; display: block; text-decoration: none; color: inherit; box-shadow: var(--shadow); transition: transform .08s, box-shadow .12s, border-color .12s; }
+  .card .cdis { position: absolute; top: 8px; right: 8px; border: none; background: none; color: #9aa7b5; padding: 2px 7px; font-size: 13px; cursor: pointer; border-radius: 7px; }
+  .card .cdis:hover { background: var(--danger-soft); color: var(--danger); }
   a.card:hover { border-color: #b9d0ff; box-shadow: var(--shadow-h); transform: translateY(-2px); }
   .card .nm { font-weight: 700; font-size: 15px; margin-bottom: 6px; line-height: 1.4; }
   .card .memo { font-size: 11.5px; color: var(--warnc); background: var(--warn-soft); border-radius: 6px; padding: 2px 7px; display: inline-block; margin-bottom: 6px; }
@@ -1171,6 +1173,10 @@ const CSS = `
   tr.ghead .ggwrap { float: right; }
   a.pname { color: var(--accent); cursor: pointer; text-decoration: none; border-bottom: 1px dashed #b9d0ff; }
   a.pname:hover { color: var(--accent-d); border-bottom-style: solid; }
+  a.copyv { color: inherit; cursor: copy; text-decoration: none; border-bottom: 1px dotted #c4cede; }
+  a.copyv:hover { color: var(--accent-d); background: var(--accent-soft); }
+  a.copyq { cursor: copy; margin-left: 5px; font-size: 12px; opacity: .5; text-decoration: none; }
+  a.copyq:hover { opacity: 1; }
   tr.accrow > td { background: #fbfcff !important; padding: 0 10px 12px !important; }
   .accbox { border-left: 3px solid var(--accent); padding: 10px 14px; margin-top: 8px; background: #fff; border-radius: 0 10px 10px 0; box-shadow: var(--shadow); }
   .accbox .kv { display: flex; flex-wrap: wrap; gap: 4px 22px; font-size: 13px; margin-bottom: 8px; }
@@ -1296,7 +1302,8 @@ router.get('/', (req, res) => {
   const stale = pub && pub.as_of_date ? (Date.now() - Date.parse(pub.as_of_date + 'T00:00:00+09:00')) > 3 * 86400000 : true;
   const freshNote = pub ? freshnessText(pub, overlay) : 'PML未同期';
   const cardHtml = c => `
-    <a class="card" href="/apps/purchase-orders/supplier/${encodeURIComponent(c.code)}">
+    <a class="card" data-sup="${he(c.code)}" data-supname="${he(c.name)}" href="/apps/purchase-orders/supplier/${encodeURIComponent(c.code)}">
+      <button class="cdis" data-cdis="${he(c.code)}" title="この仕入先を非表示 (下の「非表示の仕入先」から戻せます)">✕</button>
       <div class="nm">${he(c.name)} ${c.hasDraft ? '<span class="badge b-draft">下書きあり</span>' : ''}</div>
       ${c.memo ? `<div class="memo">📌 ${he(c.memo)}</div>` : ''}
       <div class="stats">
@@ -1320,13 +1327,57 @@ router.get('/', (req, res) => {
       <span id="opStatus" class="muted"></span>
     </div>
     <div id="searchResult"></div>
-    <h2 class="page" style="font-size:16px">発注が必要な仕入先 <span class="muted">(${cards.length})</span></h2>
-    <div class="cards">${cards.map(cardHtml).join('')}</div>
+    <h2 class="page" style="font-size:16px">発注が必要な仕入先 <span class="muted">(<span id="cntSup">${cards.length}</span>)</span></h2>
+    <div class="cards" id="mainCards">${cards.map(cardHtml).join('')}</div>
+    <div id="dashDis" style="margin-top:12px"></div>
     <details style="margin-top:18px"><summary class="muted" style="cursor:pointer">その他の仕入先 (${others.length}) — 要発注なし</summary>
       <div class="cards" style="margin-top:10px">${others.map(cardHtml).join('')}</div>
     </details>`;
   const script = `
 var IDX = ${jsonEmbed(searchIndex)};
+// 仕入先カードの非表示 (当日データ単位で保持=翌朝リセット。「非表示の仕入先」から戻せる)
+var DASH_KEY = 'po_dash_dis:' + ${jsonEmbed(pub ? pub.as_of_date : '')};
+var HID = {};
+try { (JSON.parse(localStorage.getItem(DASH_KEY) || '[]')).forEach(function(c){ HID[c] = 1; }); } catch (e) {}
+function saveHid(){ try { localStorage.setItem(DASH_KEY, JSON.stringify(Object.keys(HID))); } catch (e) {} }
+function applyHid() {
+  var hidden = [], visMain = 0;
+  document.querySelectorAll('a.card[data-sup]').forEach(function(card) {
+    var code = card.getAttribute('data-sup');
+    var hide = !!HID[code];
+    card.style.display = hide ? 'none' : '';
+    if (hide) hidden.push({ code: code, name: card.getAttribute('data-supname') || code });
+    else if (card.parentNode && card.parentNode.id === 'mainCards') visMain++;
+  });
+  var cnt = document.getElementById('cntSup');
+  if (cnt) cnt.textContent = visMain;
+  var seen = {};
+  hidden = hidden.filter(function(x){ if (seen[x.code]) return false; seen[x.code] = 1; return true; });
+  document.getElementById('dashDis').innerHTML = hidden.length
+    ? '<span class="muted">🗑 非表示の仕入先 ' + hidden.length + ' 件:</span> ' +
+      hidden.map(function(x) {
+        return '<span class="badge" style="background:#f1f5f9;color:#334155;margin:2px 4px 2px 0">' + esc(x.name) +
+          ' <a data-cundis="' + esc(x.code) + '" style="cursor:pointer;color:var(--accent)">↩戻す</a></span>';
+      }).join('') +
+      ' <a data-cundis="*" style="cursor:pointer;color:var(--accent);font-size:12px">全て戻す</a>'
+    : '';
+}
+document.addEventListener('click', function(ev) {
+  var cd = ev.target.getAttribute && ev.target.getAttribute('data-cdis');
+  if (cd) {
+    ev.preventDefault(); ev.stopPropagation(); // カード(リンク)への遷移を止める
+    HID[cd] = 1; saveHid(); applyHid();
+    toast('非表示にしました (「非表示の仕入先」から戻せます)');
+    return;
+  }
+  var ud = ev.target.getAttribute && ev.target.getAttribute('data-cundis');
+  if (ud) {
+    if (ud === '*') HID = {}; else delete HID[ud];
+    saveHid(); applyHid();
+    return;
+  }
+});
+applyHid();
 var box = document.getElementById('q');
 var out = document.getElementById('searchResult');
 box.addEventListener('input', function() {
@@ -1504,7 +1555,7 @@ function addedBadge(p) {
 function rowHtml(p, kind) {
   var rec = p.recQty ? p.recQty.toLocaleString('ja-JP') : '—';
   return '<tr>' +
-    '<td>' + esc(p.code) + issuedBadge(p) + selBadge(p) + addedBadge(p) + '</td>' +
+    '<td><a class="copyv" data-copy="' + esc(p.code) + '" title="クリックで商品コードをコピー">' + esc(p.code) + '</a>' + issuedBadge(p) + selBadge(p) + addedBadge(p) + '</td>' +
     '<td><a class="pname" data-acc="' + esc(p.code) + '" title="クリックで詳細・発注条件・同グループ商品">' + esc(p.name) + '</a></td>' +
     '<td class="r">' + months(p) + '</td>' +
     '<td class="r">' + p.sales30.toLocaleString('ja-JP') + '</td>' +
@@ -1512,7 +1563,7 @@ function rowHtml(p, kind) {
     '<td class="r">' + (p.lot || '—') + '</td>' +
     '<td class="r">' + (kind === 'hori' ? esc(p.lastPurchase || '—') : rec) + '</td>' +
     '<td class="r">' + (p.cost ? yen(p.cost) : '—') + '</td>' +
-    '<td>' + qtyCell(p) + '</td>' +
+    '<td style="white-space:nowrap">' + qtyCell(p) + '<a class="copyq" data-copyq="' + esc(p.code) + '" title="クリックで発注数をコピー">📋</a></td>' +
     (kind === 'tgt' ? '<td><button class="ghost" data-dis="' + esc(p.code) + '" title="このリストから非表示 (下の「非表示」から戻せます)">✕</button></td>' : '') +
     '</tr>';
 }
@@ -1579,6 +1630,7 @@ function renderTargets() {
       if (b.key.slice(0, 5) !== 'solo:') {
         h += '<tr class="ghead"><td colspan="10"><span class="gname">' + (b.key[0] === 'm' ? '🧪 原料: ' : '📦 ') + esc(groupName(b.key)) + '</span>' +
           ' <span class="muted">' + b.items.length + '商品 / 推奨計 ' + yen(b.amt) + '</span>' +
+          ' <button class="ghost" data-gdis="' + esc(b.key) + '" title="このグループの商品をまとめて非表示 (下の「非表示」から戻せます)">✕ グループごと非表示</button>' +
           '<span class="ggwrap" data-gauge="' + esc(b.key) + '"></span></td></tr>';
       }
       b.items.forEach(function(p){ h += rowHtml(p, 'tgt'); });
@@ -1662,11 +1714,15 @@ function gaugeHtml(k) {
     var sum = 0, noCap = 0;
     items.forEach(function(i) {
       var p = byCode[i.code];
-      if (mem2[i.code] && p) { if (p.capacityPerUnit) sum += i.qty * p.capacityPerUnit; else noCap++; }
+      if (mem2[i.code] && p) {
+        // 容量/個 未設定は 1個=1 として加算 (0のまま動かないより人間の期待に近い。件数は注記)
+        sum += i.qty * (p.capacityPerUnit || 1);
+        if (!p.capacityPerUnit) noCap++;
+      }
     });
     return barHtml(sum, m.minOrderQty, sum.toLocaleString('ja-JP') + ' / ' + m.minOrderQty.toLocaleString('ja-JP') + esc(m.unit || ''),
       'あと ' + Math.max(0, m.minOrderQty - sum).toLocaleString('ja-JP') + esc(m.unit || '')) +
-      (noCap ? ' <span class="badge b-warn" title="容量/個が未設定の商品はグループ数量に加算できません">容量未設定 ' + noCap + '件</span>' : '');
+      (noCap ? ' <span class="badge b-warn" title="容量/個が未設定の商品は1個=1として計算しています (マスタ管理→商品紐付けで設定)">容量未設定' + noCap + '件=1換算</span>' : '');
   }
   return '';
 }
@@ -1699,7 +1755,7 @@ function membersTable(k, selfCode) {
     h += '<table class="t sub"><tr><th>商品コード</th><th>商品名</th><th class="r">在庫月数</th><th class="r">30日販売</th><th class="r">在庫+注残</th><th class="r">ロット</th><th class="r">原価</th><th class="r">必要数</th><th>発注数</th></tr>';
     rows.forEach(function(p) {
       var isSelf = p.code === selfCode;
-      h += '<tr' + (isSelf ? ' style="background:#f0f6ff"' : '') + '><td>' + (isSelf ? '★ ' : '') + esc(p.code) + issuedBadge(p) + '</td><td>' + esc(p.name) + (isSelf ? ' <span class="muted">(この商品)</span>' : '') + '</td>' +
+      h += '<tr' + (isSelf ? ' style="background:#f0f6ff"' : '') + '><td>' + (isSelf ? '★ ' : '') + '<a class="copyv" data-copy="' + esc(p.code) + '" title="クリックで商品コードをコピー">' + esc(p.code) + '</a>' + issuedBadge(p) + '</td><td>' + esc(p.name) + (isSelf ? ' <span class="muted">(この商品)</span>' : '') + '</td>' +
         '<td class="r">' + months(p) + '</td><td class="r">' + numFmt(p.sales30) + '</td>' +
         '<td class="r">' + numFmt((p.stock || 0) + (p.backOrder || 0)) + '</td>' +
         '<td class="r">' + (p.lot || '—') + '</td><td class="r">' + (p.cost ? yen(p.cost) : '—') + '</td>' +
@@ -1843,7 +1899,7 @@ function condCheck() {
     var sum = 0;
     items.forEach(function(i) {
       var p = byCode[i.code];
-      if (mem[i.code] && p && p.capacityPerUnit) sum += i.qty * p.capacityPerUnit;
+      if (mem[i.code] && p) sum += i.qty * (p.capacityPerUnit || 1); // 容量未設定=1換算 (ゲージと同じ)
     });
     if (sum < m.minOrderQty) unmet.push('原料 ' + m.name + ': あと ' + (m.minOrderQty - sum).toLocaleString('ja-JP') + (m.unit || ''));
   });
@@ -2033,6 +2089,18 @@ document.addEventListener('click', function(ev) {
     renderAll();
     return;
   }
+  // クリックでコピー (商品コード / 発注数)
+  var cv = ev.target.getAttribute && ev.target.getAttribute('data-copy');
+  if (cv) {
+    navigator.clipboard.writeText(cv).then(function(){ toast('商品コードをコピー: ' + cv); }, function(){ toast('コピーに失敗しました'); });
+    return;
+  }
+  var cq = ev.target.getAttribute && ev.target.getAttribute('data-copyq');
+  if (cq) {
+    var qv = String(CART[cq] || 0);
+    navigator.clipboard.writeText(qv).then(function(){ toast('発注数をコピー: ' + qv); }, function(){ toast('コピーに失敗しました'); });
+    return;
+  }
   // 要発注リストから非表示 (✕)
   var dis = ev.target.getAttribute && ev.target.getAttribute('data-dis');
   if (dis) {
@@ -2041,6 +2109,26 @@ document.addEventListener('click', function(ev) {
     saveDis();
     renderLists(); renderAll();
     toast(dis + ' を非表示にしました (リスト下の「非表示」から戻せます)');
+    return;
+  }
+  // グループごと非表示 (✕)
+  var gdis = ev.target.getAttribute && ev.target.getAttribute('data-gdis');
+  if (gdis) {
+    var members3 = [];
+    D.targets.forEach(function(p){ if (!DIS.has(p.code) && (groupKeyOf(p) || 'solo:' + p.code) === gdis) members3.push(p.code); });
+    Object.keys(ADDED).forEach(function(code) {
+      var p = byCode[code];
+      if (p && (groupKeyOf(p) || 'solo:' + p.code) === gdis && members3.indexOf(code) < 0) members3.push(code);
+    });
+    if (!members3.length) return;
+    if (!confirm('「' + groupName(gdis) + '」の ' + members3.length + ' 商品をまとめて非表示にしますか? (発注数も外れます。下の「非表示」から戻せます)')) return;
+    members3.forEach(function(code) {
+      DIS.set(code, CART[code] || 0);
+      delete CART[code];
+    });
+    saveDis();
+    renderLists(); renderAll();
+    toast(members3.length + ' 商品を非表示にしました');
     return;
   }
   // 非表示から戻す (発注数も復元)
