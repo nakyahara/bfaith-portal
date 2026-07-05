@@ -1171,6 +1171,10 @@ const CSS = `
   tr.ghead .ggwrap { float: right; }
   a.pname { color: var(--accent); cursor: pointer; text-decoration: none; border-bottom: 1px dashed #b9d0ff; }
   a.pname:hover { color: var(--accent-d); border-bottom-style: solid; }
+  a.copyv { color: inherit; cursor: copy; text-decoration: none; border-bottom: 1px dotted #c4cede; }
+  a.copyv:hover { color: var(--accent-d); background: var(--accent-soft); }
+  a.copyq { cursor: copy; margin-left: 5px; font-size: 12px; opacity: .5; text-decoration: none; }
+  a.copyq:hover { opacity: 1; }
   tr.accrow > td { background: #fbfcff !important; padding: 0 10px 12px !important; }
   .accbox { border-left: 3px solid var(--accent); padding: 10px 14px; margin-top: 8px; background: #fff; border-radius: 0 10px 10px 0; box-shadow: var(--shadow); }
   .accbox .kv { display: flex; flex-wrap: wrap; gap: 4px 22px; font-size: 13px; margin-bottom: 8px; }
@@ -1504,7 +1508,7 @@ function addedBadge(p) {
 function rowHtml(p, kind) {
   var rec = p.recQty ? p.recQty.toLocaleString('ja-JP') : '—';
   return '<tr>' +
-    '<td>' + esc(p.code) + issuedBadge(p) + selBadge(p) + addedBadge(p) + '</td>' +
+    '<td><a class="copyv" data-copy="' + esc(p.code) + '" title="クリックで商品コードをコピー">' + esc(p.code) + '</a>' + issuedBadge(p) + selBadge(p) + addedBadge(p) + '</td>' +
     '<td><a class="pname" data-acc="' + esc(p.code) + '" title="クリックで詳細・発注条件・同グループ商品">' + esc(p.name) + '</a></td>' +
     '<td class="r">' + months(p) + '</td>' +
     '<td class="r">' + p.sales30.toLocaleString('ja-JP') + '</td>' +
@@ -1512,7 +1516,7 @@ function rowHtml(p, kind) {
     '<td class="r">' + (p.lot || '—') + '</td>' +
     '<td class="r">' + (kind === 'hori' ? esc(p.lastPurchase || '—') : rec) + '</td>' +
     '<td class="r">' + (p.cost ? yen(p.cost) : '—') + '</td>' +
-    '<td>' + qtyCell(p) + '</td>' +
+    '<td style="white-space:nowrap">' + qtyCell(p) + '<a class="copyq" data-copyq="' + esc(p.code) + '" title="クリックで発注数をコピー">📋</a></td>' +
     (kind === 'tgt' ? '<td><button class="ghost" data-dis="' + esc(p.code) + '" title="このリストから非表示 (下の「非表示」から戻せます)">✕</button></td>' : '') +
     '</tr>';
 }
@@ -1579,6 +1583,7 @@ function renderTargets() {
       if (b.key.slice(0, 5) !== 'solo:') {
         h += '<tr class="ghead"><td colspan="10"><span class="gname">' + (b.key[0] === 'm' ? '🧪 原料: ' : '📦 ') + esc(groupName(b.key)) + '</span>' +
           ' <span class="muted">' + b.items.length + '商品 / 推奨計 ' + yen(b.amt) + '</span>' +
+          ' <button class="ghost" data-gdis="' + esc(b.key) + '" title="このグループの商品をまとめて非表示 (下の「非表示」から戻せます)">✕ グループごと非表示</button>' +
           '<span class="ggwrap" data-gauge="' + esc(b.key) + '"></span></td></tr>';
       }
       b.items.forEach(function(p){ h += rowHtml(p, 'tgt'); });
@@ -1662,11 +1667,15 @@ function gaugeHtml(k) {
     var sum = 0, noCap = 0;
     items.forEach(function(i) {
       var p = byCode[i.code];
-      if (mem2[i.code] && p) { if (p.capacityPerUnit) sum += i.qty * p.capacityPerUnit; else noCap++; }
+      if (mem2[i.code] && p) {
+        // 容量/個 未設定は 1個=1 として加算 (0のまま動かないより人間の期待に近い。件数は注記)
+        sum += i.qty * (p.capacityPerUnit || 1);
+        if (!p.capacityPerUnit) noCap++;
+      }
     });
     return barHtml(sum, m.minOrderQty, sum.toLocaleString('ja-JP') + ' / ' + m.minOrderQty.toLocaleString('ja-JP') + esc(m.unit || ''),
       'あと ' + Math.max(0, m.minOrderQty - sum).toLocaleString('ja-JP') + esc(m.unit || '')) +
-      (noCap ? ' <span class="badge b-warn" title="容量/個が未設定の商品はグループ数量に加算できません">容量未設定 ' + noCap + '件</span>' : '');
+      (noCap ? ' <span class="badge b-warn" title="容量/個が未設定の商品は1個=1として計算しています (マスタ管理→商品紐付けで設定)">容量未設定' + noCap + '件=1換算</span>' : '');
   }
   return '';
 }
@@ -1699,7 +1708,7 @@ function membersTable(k, selfCode) {
     h += '<table class="t sub"><tr><th>商品コード</th><th>商品名</th><th class="r">在庫月数</th><th class="r">30日販売</th><th class="r">在庫+注残</th><th class="r">ロット</th><th class="r">原価</th><th class="r">必要数</th><th>発注数</th></tr>';
     rows.forEach(function(p) {
       var isSelf = p.code === selfCode;
-      h += '<tr' + (isSelf ? ' style="background:#f0f6ff"' : '') + '><td>' + (isSelf ? '★ ' : '') + esc(p.code) + issuedBadge(p) + '</td><td>' + esc(p.name) + (isSelf ? ' <span class="muted">(この商品)</span>' : '') + '</td>' +
+      h += '<tr' + (isSelf ? ' style="background:#f0f6ff"' : '') + '><td>' + (isSelf ? '★ ' : '') + '<a class="copyv" data-copy="' + esc(p.code) + '" title="クリックで商品コードをコピー">' + esc(p.code) + '</a>' + issuedBadge(p) + '</td><td>' + esc(p.name) + (isSelf ? ' <span class="muted">(この商品)</span>' : '') + '</td>' +
         '<td class="r">' + months(p) + '</td><td class="r">' + numFmt(p.sales30) + '</td>' +
         '<td class="r">' + numFmt((p.stock || 0) + (p.backOrder || 0)) + '</td>' +
         '<td class="r">' + (p.lot || '—') + '</td><td class="r">' + (p.cost ? yen(p.cost) : '—') + '</td>' +
@@ -1843,7 +1852,7 @@ function condCheck() {
     var sum = 0;
     items.forEach(function(i) {
       var p = byCode[i.code];
-      if (mem[i.code] && p && p.capacityPerUnit) sum += i.qty * p.capacityPerUnit;
+      if (mem[i.code] && p) sum += i.qty * (p.capacityPerUnit || 1); // 容量未設定=1換算 (ゲージと同じ)
     });
     if (sum < m.minOrderQty) unmet.push('原料 ' + m.name + ': あと ' + (m.minOrderQty - sum).toLocaleString('ja-JP') + (m.unit || ''));
   });
@@ -2033,6 +2042,18 @@ document.addEventListener('click', function(ev) {
     renderAll();
     return;
   }
+  // クリックでコピー (商品コード / 発注数)
+  var cv = ev.target.getAttribute && ev.target.getAttribute('data-copy');
+  if (cv) {
+    navigator.clipboard.writeText(cv).then(function(){ toast('商品コードをコピー: ' + cv); }, function(){ toast('コピーに失敗しました'); });
+    return;
+  }
+  var cq = ev.target.getAttribute && ev.target.getAttribute('data-copyq');
+  if (cq) {
+    var qv = String(CART[cq] || 0);
+    navigator.clipboard.writeText(qv).then(function(){ toast('発注数をコピー: ' + qv); }, function(){ toast('コピーに失敗しました'); });
+    return;
+  }
   // 要発注リストから非表示 (✕)
   var dis = ev.target.getAttribute && ev.target.getAttribute('data-dis');
   if (dis) {
@@ -2041,6 +2062,26 @@ document.addEventListener('click', function(ev) {
     saveDis();
     renderLists(); renderAll();
     toast(dis + ' を非表示にしました (リスト下の「非表示」から戻せます)');
+    return;
+  }
+  // グループごと非表示 (✕)
+  var gdis = ev.target.getAttribute && ev.target.getAttribute('data-gdis');
+  if (gdis) {
+    var members3 = [];
+    D.targets.forEach(function(p){ if (!DIS.has(p.code) && (groupKeyOf(p) || 'solo:' + p.code) === gdis) members3.push(p.code); });
+    Object.keys(ADDED).forEach(function(code) {
+      var p = byCode[code];
+      if (p && (groupKeyOf(p) || 'solo:' + p.code) === gdis && members3.indexOf(code) < 0) members3.push(code);
+    });
+    if (!members3.length) return;
+    if (!confirm('「' + groupName(gdis) + '」の ' + members3.length + ' 商品をまとめて非表示にしますか? (発注数も外れます。下の「非表示」から戻せます)')) return;
+    members3.forEach(function(code) {
+      DIS.set(code, CART[code] || 0);
+      delete CART[code];
+    });
+    saveDis();
+    renderLists(); renderAll();
+    toast(members3.length + ' 商品を非表示にしました');
     return;
   }
   // 非表示から戻す (発注数も復元)
