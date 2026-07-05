@@ -351,12 +351,19 @@ for (const p of ['/', '/supplier/1', '/products', '/orders', '/admin']) {
   ok(html.includes('noflyersticker') && html.includes('全商品情報'), '/products にPML商品が埋め込まれる');
   ok(html.includes('"t":1') || html.includes('"h":1'), '/products に要発注/掘り起こしフラグ');
 }
-// 仕入先ページ: グループ化アコーディオンUIの部品が含まれる (発注条件の独立セクションは廃止)
+// 仕入先ページ: グループ化アコーディオン+下部固定バー+シミュレーション+検索 (カート/独立条件セクション廃止)
 {
   const res = await fetch(base + '/supplier/1');
   const html = await res.text();
-  ok(html.includes('renderTargets') && html.includes('accHtml') && html.includes('cartCondSummary'), '/supplier グループ化+アコーディオン+条件チェックのJSを配信');
+  ok(html.includes('renderTargets') && html.includes('accHtml') && html.includes('condCheck'), '/supplier グループ化+アコーディオン+条件チェックのJSを配信');
+  ok(html.includes('renderBar') && html.includes('fbar') && !html.includes('cartArea'), '/supplier カート廃止→下部固定バー');
+  ok(html.includes('needQty') && html.includes('updateSim'), '/supplier ◯ヶ月分シミュレーション');
+  ok(html.includes('pageQ') && html.includes('filterRows'), '/supplier ページ内商品検索');
+  ok(html.includes('追加発注候補') && !html.includes('ついで買い'), '/supplier 「ついで買い」→「追加発注候補」に改名');
   ok(!html.includes('condArea'), '/supplier 独立した発注条件セクションは廃止済み');
+  ok(html.includes('未達の発注条件'), '/supplier 確定前の条件未達警告');
+  ok(html.includes('dlCsv') && html.includes('btnCsv'), '/supplier 確定リストCSVダウンロード');
+  ok(html.includes('<a href="/" class="back sp">'), 'ポータルに戻るリンクは / (修正済)');
 }
 r = await j('/api/attrs/unlinked?days=0');
 ok(r.body.ok && r.body.rows.every(x => x.code.toLowerCase() !== 'diyorangeoil100'), 'unlinked: 紐付け済みは出ない');
