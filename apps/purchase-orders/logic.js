@@ -157,8 +157,15 @@ export function loadMasters() {
   for (const a of db.prepare('SELECT * FROM po_product_attrs').all()) {
     attrs.set(a.product_key, a);
   }
-  return { suppliers, conditions, materialGroups, attrs };
+  const selectable = new Map();
+  for (const s of db.prepare('SELECT * FROM po_selectable_products').all()) {
+    selectable.set(s.product_key, s);
+  }
+  return { suppliers, conditions, materialGroups, attrs, selectable };
 }
+
+/** 選べるセット構成商品の既定最低在庫 (min_stock 未設定時) */
+export const SELECTABLE_DEFAULT_MIN = 10;
 
 /** 直近 issuedDays 日以内に発注確定済みの商品 → { product_key: {orderId, issuedAt, qty} } */
 export function loadRecentIssued(issuedDays = 14) {
@@ -196,6 +203,11 @@ export function computeAll() {
     p.caseLot = a ? (a.case_lot || null) : null;
     const ri = recentIssued.get(p.key);
     p.recentIssued = ri || null;
+    // 選べる◯種セット構成商品: 在庫を切らさない前提のため、在庫+注残 が最低在庫以下なら要発注扱い
+    const sel = masters.selectable.get(p.key);
+    const selMin = sel ? (sel.min_stock != null ? sel.min_stock : SELECTABLE_DEFAULT_MIN) : null;
+    p.selectableLow = (sel && p.active && (p.stock + p.backOrder) <= selMin)
+      ? { sets: sel.set_names || '', minStock: selMin } : null;
     products.push(p);
     if (!p.supplierCode) continue;
     let g = bySupplier.get(p.supplierCode);
@@ -209,7 +221,7 @@ export function computeAll() {
       };
       bySupplier.set(p.supplierCode, g);
     }
-    if (p.isTarget) g.targets.push(p);
+    if (p.isTarget || p.selectableLow) g.targets.push(p);
     else if (p.isHorikoshi) g.horikoshi.push(p);
     else if (p.active && p.stockMonths > 0) g.candidates.push(p);
   }

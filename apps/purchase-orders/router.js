@@ -209,6 +209,7 @@ function productDto(p) {
     cost: p.cost, price: p.price, lastPurchase: p.lastPurchase ? String(p.lastPurchase).slice(0, 10) : '',
     conditionId: p.conditionId, materialGroupId: p.materialGroupId,
     capacityPerUnit: p.capacityPerUnit, recentIssued: p.recentIssued,
+    selectableLow: p.selectableLow || null,
   };
 }
 
@@ -263,6 +264,26 @@ function supplierWorkspaceData(code) {
       memberCodes: memberOf(id, 'materialGroupId'),
     };
   });
+  // 今月 (JST) にこの仕入先へ発注確定済みの数量 (上限=出荷制限の月次累計判定用。毎月1日に自動リセット)
+  const jstNow = new Date(Date.now() + 9 * 3600000);
+  const monthStartIso = new Date(Date.parse(jstNow.toISOString().slice(0, 7) + '-01T00:00:00+09:00')).toISOString();
+  const issuedMonth = {};
+  for (const r of db.prepare(`
+    SELECT i.product_key k, SUM(i.qty) q
+    FROM po_order_items i JOIN po_orders o ON o.id = i.order_id
+    WHERE o.supplier_code = ? AND o.status = 'issued' AND o.issued_at >= ?
+    GROUP BY i.product_key
+  `).all(code, monthStartIso)) issuedMonth[r.k] = r.q;
+  // グループ紐付けUI用の全グループ一覧 (この仕入先関連を先頭に)
+  const supFirst = (aSup) => (normSupplierCode(aSup) === code ? 0 : 1);
+  const allGroups = {
+    conditions: masters.conditions
+      .map(c => ({ id: c.condition_id, name: c.display_name, mine: supFirst(c.supplier_code) === 0 }))
+      .sort((a, b) => (b.mine - a.mine) || a.id.localeCompare(b.id, 'ja')),
+    materials: [...masters.materialGroups.values()]
+      .map(m => ({ id: m.group_id, name: m.name }))
+      .sort((a, b) => a.id.localeCompare(b.id, 'ja')),
+  };
   return {
     pub: pub ? {
       as_of_date: pub.as_of_date, status: pub.status, synced_at: pub.synced_at,
@@ -275,7 +296,8 @@ function supplierWorkspaceData(code) {
     targets: g ? g.targets.map(productDto) : [],
     candidates: g ? g.candidates.map(productDto) : [],
     horikoshi: g ? g.horikoshi.map(productDto) : [],
-    conditions, materialGroups, draft, draftExtras,
+    conditions, materialGroups, draft, draftExtras, issuedMonth, allGroups,
+    monthLabel: jstNow.toISOString().slice(0, 7),
   };
 }
 
@@ -426,6 +448,24 @@ const MASTER_DEFS = {
       capacity_per_unit: numOrNull(c[3]), case_group: trimS(c[4]) || null, case_lot: numOrNull(c[5]),
     }),
   },
+  // 「選べる◯種セット」構成商品 (在庫を切らさない前提。在庫+注残≦最低在庫で要発注入り)
+  selectable: {
+    table: 'po_selectable_products', pk: 'product_key', normId: normProductCode,
+    fromBody: b => ({
+      product_key: normProductCode(b.product_code), product_code: trimS(b.product_code),
+      set_names: trimS(b.set_names) || null, min_stock: numOrNull(b.min_stock),
+    }),
+    validate: r => {
+      if (!r.product_code) return '商品コード必須';
+      if (r.min_stock != null && r.min_stock < 0) return '最低在庫数が不正';
+      return null;
+    },
+    csvHeader: ['商品コード', 'セット名', '最低在庫数'],
+    fromCsv: c => ({
+      product_key: normProductCode(c[0]), product_code: trimS(c[0]),
+      set_names: trimS(c[1]) || null, min_stock: numOrNull(c[2]),
+    }),
+  },
 };
 
 /** マスタ削除前の被参照チェック (dangling reference 防止、Codex R1 Medium) */
@@ -439,6 +479,30 @@ const DELETE_REF_CHECKS = {
     return n ? `商品紐付け ${n} 件から参照されています。先に紐付けを外してください` : null;
   },
 };
+
+// アコーディオンからのグループ紐付け (既存attrsの容量/ケース等を保持したまま条件/原料だけ更新)
+router.post('/api/attrs/bind', (req, res) => {
+  try {
+    const b = req.body || {};
+    const code = trimS(b.product_code);
+    if (!code) return res.status(400).json({ ok: false, error: '商品コード必須' });
+    const key = normProductCode(code);
+    const db = getDB();
+    const cur = db.prepare('SELECT * FROM po_product_attrs WHERE product_key=?').get(key) || {};
+    const row = {
+      product_key: key, product_code: cur.product_code || code,
+      condition_id: 'condition_id' in b ? (trimS(b.condition_id) || null) : (cur.condition_id || null),
+      material_group_id: 'material_group_id' in b ? (trimS(b.material_group_id) || null) : (cur.material_group_id || null),
+      capacity_per_unit: cur.capacity_per_unit != null ? cur.capacity_per_unit : null,
+      case_group: cur.case_group || null,
+      case_lot: cur.case_lot != null ? cur.case_lot : null,
+    };
+    const err = MASTER_DEFS.attrs.validate(row);
+    if (err) return res.status(400).json({ ok: false, error: err });
+    upsertMasterRow(MASTER_DEFS.attrs, row);
+    res.json({ ok: true, row });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
 
 function upsertMasterRow(def, row) {
   const db = getDB();
@@ -598,6 +662,31 @@ const IMPORT_RECIPES = [
     },
   },
   {
+    key: 'selectable', label: '選べるセット構成商品',
+    // 商品コード + セット名 だけのリスト (楽天/Yahooの項目選択肢セット)。商品マスタ判別より先に評価
+    detect: h => hasCol(h, '商品コード') && hasCol(h, 'セット名', '選べるセット名', 'セット', '商品名（セット）') && !hasCol(h, '商品グループID') && !hasCol(h, '原料グループID'),
+    extract(header, rows, warn) {
+      const iCode = colIndex(header, '商品コード'), iSet = colIndex(header, 'セット名', '選べるセット名', 'セット', '商品名（セット）');
+      const iMin = colIndex(header, '最低在庫数', '最低在庫', 'しきい値');
+      // 同一商品が複数セットに出る場合はセット名を「、」で束ねて1行に
+      const byKey = new Map();
+      for (let r = 1; r < rows.length; r++) {
+        const c = rows[r]; const code = trimS(c[iCode]); if (!code) continue;
+        const key = normProductCode(code);
+        const setName = iSet >= 0 ? trimS(c[iSet]) : '';
+        const min = iMin >= 0 ? numOrWarn(c[iMin], warn, `選べるセット ${r + 1}行目(${code}) 最低在庫数`, { min: 0 }) : null;
+        let cur = byKey.get(key);
+        if (!cur) { cur = { product_key: key, product_code: code, sets: [], min_stock: null }; byKey.set(key, cur); }
+        if (setName && !cur.sets.includes(setName)) cur.sets.push(setName);
+        if (min != null) cur.min_stock = cur.min_stock == null ? min : Math.max(cur.min_stock, min);
+      }
+      return [...byKey.values()].map(v => ({ table: 'selectable', row: {
+        product_key: v.product_key, product_code: v.product_code,
+        set_names: v.sets.join('、') || null, min_stock: v.min_stock,
+      } }));
+    },
+  },
+  {
     key: 'shohin', label: '商品マスタ (→ 仕入先 + 商品紐付け)',
     // 商品コード + 発注特有の列 (グループID/容量/ケース) が揃うものだけ。NE商品マスタCSV(商品コード+仕入先のみ)は弾く。
     detect: h => hasCol(h, '商品コード') && (hasCol(h, '商品グループID') || hasCol(h, '発注条件グループID') || hasCol(h, '原料グループID') || hasCol(h, '容量/個') || hasCol(h, '容量') || hasCol(h, 'ケースグループ') || hasCol(h, 'ケースロット')),
@@ -635,6 +724,7 @@ function bulkValid(table, row) {
   if (table === 'conditions') return !!row.condition_id && !!row.display_name && !!row.condition_type && row.condition_value != null && row.condition_value >= 0;
   if (table === 'suppliers') return !!row.supplier_code && !!row.name;
   if (table === 'attrs') return !!row.product_code;
+  if (table === 'selectable') return !!row.product_code;
   return false;
 }
 // スキップ理由 (どの必須が欠けたか) を人間に返す
@@ -649,9 +739,10 @@ function bulkInvalidReason(table, row) {
   }
   if (table === 'suppliers') return `${row.supplier_code || '(コード空)'} — 仕入先コード/名称が不足`;
   if (table === 'attrs') return '商品コードが空';
+  if (table === 'selectable') return '商品コードが空';
   return '不正な行';
 }
-const TABLE_LABEL = { materials: '原料グループ', conditions: '発注条件グループ', suppliers: '仕入先', attrs: '商品紐付け' };
+const TABLE_LABEL = { materials: '原料グループ', conditions: '発注条件グループ', suppliers: '仕入先', attrs: '商品紐付け', selectable: '選べるセット構成' };
 
 router.post('/api/import', upload.array('files', 12), (req, res) => {
   if (!req.files || !req.files.length) return res.status(400).json({ ok: false, error: 'CSVファイルを選択してください' });
@@ -676,10 +767,10 @@ router.post('/api/import', upload.array('files', 12), (req, res) => {
   }
   if (fileErrors.length) return res.status(400).json({ ok: false, error: '取り込めないファイルがあります', errors: fileErrors });
   // 依存順 (原料/条件 → 仕入先 → 紐付け) に並べて1トランザクションで upsert
-  const order = { materials: 1, conditions: 2, suppliers: 3, attrs: 4 };
+  const order = { materials: 1, conditions: 2, suppliers: 3, attrs: 4, selectable: 5 };
   const all = classified.flatMap(c => c.items).sort((a, b) => order[a.table] - order[b.table]);
-  const counts = { materials: 0, conditions: 0, suppliers: 0, attrs: 0 };
-  const skipped = { materials: 0, conditions: 0, suppliers: 0, attrs: 0 };
+  const counts = { materials: 0, conditions: 0, suppliers: 0, attrs: 0, selectable: 0 };
+  const skipped = { materials: 0, conditions: 0, suppliers: 0, attrs: 0, selectable: 0 };
   const db = getDB();
   try {
     db.transaction(() => {
@@ -1003,7 +1094,8 @@ const CSS = `
   table.t th { background: #f7f9fc; color: var(--sub); font-weight: 600; position: sticky; top: 52px; white-space: nowrap; font-size: 11.5px; letter-spacing: .02em; z-index: 1; }
   table.t tbody tr:hover td { background: #f9fbff; }
   table.t td.r, table.t th.r { text-align: right; font-variant-numeric: tabular-nums; }
-  .sec { background: var(--card); border: 1px solid var(--line); border-radius: 14px; margin-bottom: 16px; overflow: hidden; box-shadow: var(--shadow); }
+  /* overflow:hidden だと子孫の position:sticky (見出し追随) が死ぬため clip (スクロールコンテナを作らない) */
+  .sec { background: var(--card); border: 1px solid var(--line); border-radius: 14px; margin-bottom: 16px; overflow: clip; box-shadow: var(--shadow); }
   .sec > h2 { font-size: 14px; margin: 0; padding: 12px 16px; background: #f7f9fc; border-bottom: 1px solid var(--line); user-select: none; font-weight: 700; }
   .sec > h2[data-sec] { cursor: pointer; }
   .sec .bd { padding: 14px 16px; overflow-x: auto; }
@@ -1313,12 +1405,29 @@ var byCode = {};
 var condById = {}; D.conditions.forEach(function(c){ condById[c.conditionId] = c; });
 var matById = {}; D.materialGroups.forEach(function(m){ matById[m.groupId] = m; });
 
-// 初期カート: draft があれば復元、なければ要発注全件を推奨量で
+// ページ内検索語 (小文字)
+var Q = '';
+// 非表示にした要発注行 (code → 非表示時の発注数)。localStorage に当日データ(as_of)単位で保持 = 翌朝自動リセット
+var DIS = new Map();
+var DIS_KEY = 'po_dis:' + D.supplier.code + ':' + (D.pub ? D.pub.as_of_date : '');
+try {
+  (JSON.parse(localStorage.getItem(DIS_KEY) || '[]')).forEach(function(e){ DIS.set(e.code, e.qty || 0); });
+} catch (e) {}
+function saveDis() {
+  try {
+    var arr = [];
+    DIS.forEach(function(qty, code){ arr.push({ code: code, qty: qty }); });
+    localStorage.setItem(DIS_KEY, JSON.stringify(arr));
+  } catch (e) {}
+}
+
+// 初期カート: draft があれば復元、なければ要発注全件を推奨量で (非表示分は除く)
 if (D.draft && D.draft.items.length) {
   D.draft.items.forEach(function(it){ if (byCode[it.code]) CART[it.code] = it.qty; });
 } else {
-  D.targets.forEach(function(p){ if (p.recQty && !p.recentIssued) CART[p.code] = p.recQty; });
+  D.targets.forEach(function(p){ if (p.recQty && !p.recentIssued && !DIS.has(p.code)) CART[p.code] = p.recQty; });
 }
+DIS.forEach(function(_, code){ delete CART[code]; });
 
 function months(p){ return p.stockMonths == null ? '—' : (Math.round(p.stockMonths * 100) / 100).toFixed(2); }
 function issuedBadge(p){
@@ -1330,10 +1439,14 @@ function qtyCell(p) {
   var step = p.lot > 0 ? p.lot : 1;
   return '<input type="number" min="0" step="' + step + '" data-code="' + esc(p.code) + '" value="' + v + '">';
 }
+function selBadge(p) {
+  if (!p.selectableLow) return '';
+  return ' <span class="badge" style="background:#ede9fe;color:#6d28d9" title="選べるセット構成商品 (' + esc(p.selectableLow.sets || '') + ')。在庫+注残が最低在庫 ' + p.selectableLow.minStock + ' 以下">🧩選べるセット構成の在庫減</span>';
+}
 function rowHtml(p, kind) {
   var rec = p.recQty ? p.recQty.toLocaleString('ja-JP') : '—';
-  return '<tr data-search="' + esc((p.code + ' ' + p.name).toLowerCase()) + '">' +
-    '<td>' + esc(p.code) + issuedBadge(p) + '</td>' +
+  return '<tr>' +
+    '<td>' + esc(p.code) + issuedBadge(p) + selBadge(p) + '</td>' +
     '<td><a class="pname" data-acc="' + esc(p.code) + '" title="クリックで詳細・発注条件・同グループ商品">' + esc(p.name) + '</a></td>' +
     '<td class="r">' + months(p) + '</td>' +
     '<td class="r">' + p.sales30.toLocaleString('ja-JP') + '</td>' +
@@ -1341,14 +1454,26 @@ function rowHtml(p, kind) {
     '<td class="r">' + (p.lot || '—') + '</td>' +
     '<td class="r">' + (kind === 'hori' ? esc(p.lastPurchase || '—') : rec) + '</td>' +
     '<td class="r">' + (p.cost ? yen(p.cost) : '—') + '</td>' +
-    '<td>' + qtyCell(p) + '</td></tr>';
+    '<td>' + qtyCell(p) + '</td>' +
+    (kind === 'tgt' ? '<td><button class="ghost" data-dis="' + esc(p.code) + '" title="このリストから非表示 (下の「非表示」から戻せます)">✕</button></td>' : '') +
+    '</tr>';
 }
+function matchQ(p) {
+  return !Q || (p.code + ' ' + p.name).toLowerCase().indexOf(Q) >= 0;
+}
+// 検索なし時の描画上限 (DOMを軽くしてページ無応答を防ぐ。検索時は全件から探す)
+var LIST_CAP = 150;
 function tableHtml(list, kind) {
-  if (!list.length) return '<div class="muted">なし</div>';
+  var data = list.filter(matchQ);
+  if (!data.length) return '<div class="muted">' + (Q ? '「' + esc(Q) + '」に一致なし' : 'なし') + '</div>';
+  var capped = !Q && data.length > LIST_CAP;
+  var rows = capped ? data.slice(0, LIST_CAP) : data;
   var h7 = kind === 'hori' ? '最終仕入日' : '推奨発注';
   var h = '<table class="t"><tr><th>商品コード</th><th>商品名</th><th class="r">在庫月数</th><th class="r">30日販売</th><th class="r">在庫+注残</th><th class="r">ロット</th><th class="r">' + h7 + '</th><th class="r">原価</th><th>発注数</th></tr>';
-  list.forEach(function(p){ h += rowHtml(p, kind); });
-  return h + '</table>';
+  rows.forEach(function(p){ h += rowHtml(p, kind); });
+  h += '</table>';
+  if (capped) h += '<div class="muted" style="padding:8px 12px">先頭 ' + LIST_CAP + ' 件を表示 (全 ' + data.length + ' 件)。上の🔍検索で全件から絞り込めます</div>';
+  return h;
 }
 // ── 要発注: 発注条件グループ/原料グループごとにまとめ、グループ計(推奨発注×原価)の大きい順 ──
 function groupKeyOf(p){ return p.conditionId ? 'c:' + p.conditionId : (p.materialGroupId ? 'm:' + p.materialGroupId : ''); }
@@ -1363,34 +1488,48 @@ function groupMembers(k) {
   return [];
 }
 function renderTargets() {
-  if (!D.targets.length) { document.getElementById('secTargets').innerHTML = '<div class="muted">なし</div>'; return; }
-  var buckets = {}, order = [];
-  D.targets.forEach(function(p) {
-    var k = groupKeyOf(p) || 'solo:' + p.code;
-    if (!buckets[k]) { buckets[k] = { key: k, items: [], amt: 0 }; order.push(k); }
-    buckets[k].items.push(p);
-    buckets[k].amt += (p.recQty || 0) * (p.cost || 0);
-  });
-  var list = order.map(function(k){ return buckets[k]; });
-  list.sort(function(a, b){ return b.amt - a.amt; });
-  var h = '<table class="t"><tr><th>商品コード</th><th>商品名</th><th class="r">在庫月数</th><th class="r">30日販売</th><th class="r">在庫+注残</th><th class="r">ロット</th><th class="r">推奨発注</th><th class="r">原価</th><th>発注数</th></tr>';
-  list.forEach(function(b) {
-    b.items.sort(function(x, y){ return ((y.recQty || 0) * (y.cost || 0)) - ((x.recQty || 0) * (x.cost || 0)); });
-    if (b.key.slice(0, 5) !== 'solo:') {
-      h += '<tr class="ghead"><td colspan="9"><span class="gname">' + (b.key[0] === 'm' ? '🧪 原料: ' : '📦 ') + esc(groupName(b.key)) + '</span>' +
-        ' <span class="muted">' + b.items.length + '商品 / 推奨計 ' + yen(b.amt) + '</span>' +
-        '<span class="ggwrap" data-gauge="' + esc(b.key) + '"></span></td></tr>';
-    }
-    b.items.forEach(function(p){ h += rowHtml(p, 'tgt'); });
-  });
-  document.getElementById('secTargets').innerHTML = h + '</table>';
+  var visible = D.targets.filter(function(p){ return !DIS.has(p.code) && matchQ(p); });
+  var h = '';
+  if (!visible.length) h = '<div class="muted">' + (Q ? '「' + esc(Q) + '」に一致なし' : 'なし') + '</div>';
+  else {
+    var buckets = {}, order = [];
+    visible.forEach(function(p) {
+      var k = groupKeyOf(p) || 'solo:' + p.code;
+      if (!buckets[k]) { buckets[k] = { key: k, items: [], amt: 0 }; order.push(k); }
+      buckets[k].items.push(p);
+      buckets[k].amt += (p.recQty || 0) * (p.cost || 0);
+    });
+    var list = order.map(function(k){ return buckets[k]; });
+    list.sort(function(a, b){ return b.amt - a.amt; });
+    h = '<table class="t"><tr><th>商品コード</th><th>商品名</th><th class="r">在庫月数</th><th class="r">30日販売</th><th class="r">在庫+注残</th><th class="r">ロット</th><th class="r">推奨発注</th><th class="r">原価</th><th>発注数</th><th></th></tr>';
+    list.forEach(function(b) {
+      b.items.sort(function(x, y){ return ((y.recQty || 0) * (y.cost || 0)) - ((x.recQty || 0) * (x.cost || 0)); });
+      if (b.key.slice(0, 5) !== 'solo:') {
+        h += '<tr class="ghead"><td colspan="10"><span class="gname">' + (b.key[0] === 'm' ? '🧪 原料: ' : '📦 ') + esc(groupName(b.key)) + '</span>' +
+          ' <span class="muted">' + b.items.length + '商品 / 推奨計 ' + yen(b.amt) + '</span>' +
+          '<span class="ggwrap" data-gauge="' + esc(b.key) + '"></span></td></tr>';
+      }
+      b.items.forEach(function(p){ h += rowHtml(p, 'tgt'); });
+    });
+    h += '</table>';
+  }
+  // 非表示にした行の復元リスト
+  if (DIS.size) {
+    h += '<div style="padding:10px 14px;border-top:1px solid var(--line)"><span class="muted">🗑 非表示 ' + DIS.size + ' 件:</span> ';
+    DIS.forEach(function(qty, code) {
+      var p = byCode[code];
+      h += '<span class="badge" style="background:#f1f5f9;color:#334155;margin:2px 4px 2px 0">' + esc(code) + (p ? ' ' + esc(String(p.name).slice(0, 18)) : '') +
+        ' <a data-undis="' + esc(code) + '" style="cursor:pointer;color:var(--accent)" title="リストに戻す">↩戻す</a></span>';
+    });
+    h += ' <a data-undis="*" style="cursor:pointer;color:var(--accent);font-size:12px">全て戻す</a></div>';
+  }
+  document.getElementById('secTargets').innerHTML = h;
 }
 function renderLists() {
   renderTargets();
-  // 全件描画 (キャップするとページ内検索が後方の候補を拾えない、Codex P6-1)
   document.getElementById('secCands').innerHTML = tableHtml(D.candidates, 'cand');
   document.getElementById('secHori').innerHTML = tableHtml(D.horikoshi, 'hori');
-  document.getElementById('cntTargets').textContent = D.targets.length;
+  document.getElementById('cntTargets').textContent = D.targets.length - DIS.size;
   document.getElementById('cntCands').textContent = D.candidates.length;
   document.getElementById('cntHori').textContent = D.horikoshi.length;
 }
@@ -1409,13 +1548,24 @@ function barHtml(cur, req, label, remain) {
   return '<span class="gg' + (met ? ' met' : '') + '">' + label + (met ? ' ✅' : ' — <b>' + remain + '</b>') +
     '<span class="bar"><span style="width:' + pct + '%"></span></span></span>';
 }
-// 上限ゲージ (出荷制限)。上限以下=OK(緑)、超過=赤
-function capBarHtml(cur, cap, unit) {
+// 今月(JST)発注確定済みの数量合計。上限=出荷制限は月次累計で判定し、毎月1日に自動リセットされる
+function issuedMonthFor(memberCodes, supplierWide) {
+  var im = D.issuedMonth || {};
+  var sum = 0;
+  if (supplierWide) Object.keys(im).forEach(function(k){ sum += im[k]; });
+  else memberCodes.forEach(function(x){ sum += im[String(x).toLowerCase().trim()] || 0; });
+  return sum;
+}
+// 上限ゲージ (出荷制限、今月確定済み+今回の累計)。上限以下=OK(緑)、超過=赤
+function capBarHtml(cartQ, issuedQ, cap, unit) {
+  var cur = cartQ + issuedQ;
   var over = cur > cap;
   var pct = Math.min(100, cap > 0 ? cur / cap * 100 : 100);
-  return '<span class="gg' + (over ? ' over' : ' met') + '">' +
-    cur.toLocaleString('ja-JP') + ' / 上限 ' + cap.toLocaleString('ja-JP') + esc(unit || '個') +
-    (over ? ' — <b>⚠ ' + (cur - cap).toLocaleString('ja-JP') + esc(unit || '個') + ' 超過</b>' : ' ✅') +
+  var u = esc(unit || '個');
+  return '<span class="gg' + (over ? ' over' : ' met') + '" title="今月(' + esc(D.monthLabel || '') + ')の発注確定分を含む累計。毎月1日にリセット">' +
+    (issuedQ ? '今月済 ' + issuedQ.toLocaleString('ja-JP') + ' + 今回 ' + cartQ.toLocaleString('ja-JP') + ' = ' : '') +
+    cur.toLocaleString('ja-JP') + ' / 上限 ' + cap.toLocaleString('ja-JP') + u + '/月' +
+    (over ? ' — <b>⚠ ' + (cur - cap).toLocaleString('ja-JP') + u + ' 超過</b>' : ' ✅') +
     '<span class="bar"><span style="width:' + pct + '%"></span></span></span>';
 }
 function gaugeHtml(k) {
@@ -1431,7 +1581,7 @@ function gaugeHtml(k) {
     if (c.conditionType === '数量' && (c.unit === '個' || !c.unit))
       return barHtml(sumQ, c.conditionValue, sumQ.toLocaleString('ja-JP') + ' / ' + c.conditionValue.toLocaleString('ja-JP') + ' 個', 'あと ' + Math.max(0, c.conditionValue - sumQ).toLocaleString('ja-JP') + ' 個');
     if (c.conditionType === '上限')
-      return capBarHtml(sumQ, c.conditionValue, c.unit);
+      return capBarHtml(sumQ, issuedMonthFor(c.memberCodes, c.supplierWide), c.conditionValue, c.unit);
     return '<span class="badge b-warn">条件 ' + esc(c.conditionType) + ' ' + c.conditionValue.toLocaleString('ja-JP') + esc(c.unit || '') + ' (手動確認)</span>' +
       ' <span class="muted">現在 ' + sumQ.toLocaleString('ja-JP') + '個 / ' + yen(sumA) + '</span>';
   }
@@ -1509,7 +1659,21 @@ function accHtml(p) {
       '<div class="muted" style="margin-top:6px">同じ原料を使う商品 — 合わせて最低発注量(容量換算)を満たせます</div>' +
       membersTable('m:' + p.materialGroupId, p.code) + '</div>';
   }
-  if (!hasGroup) h += '<div class="accg muted">発注条件グループ・原料グループ未設定 (単品発注。紐付けは マスタ管理 → 商品紐付け)</div>';
+  if (!hasGroup) h += '<div class="accg muted">発注条件グループ・原料グループ未設定 (単品発注)。下の「グループ紐付け」でその場で設定できます</div>';
+  if (p.selectableLow) {
+    h += '<div class="accg" style="color:#6d28d9">🧩 <b>選べるセット構成商品</b>: ' + esc(p.selectableLow.sets || '(セット名未設定)') +
+      ' — 在庫+注残 ' + numFmt((p.stock || 0) + (p.backOrder || 0)) + ' が最低在庫 ' + p.selectableLow.minStock + ' 以下のため要発注に載せています (在庫を切らさない前提の商品)</div>';
+  }
+  // その場でグループ紐付けを変更 (保存先: 商品紐付けマスタ。容量/ケース設定は保持される)
+  var condOpts = '<option value="">(なし)</option>' + (D.allGroups && D.allGroups.conditions || []).map(function(g) {
+    return '<option value="' + esc(g.id) + '"' + (g.id === p.conditionId ? ' selected' : '') + '>' + esc(g.id) + ' — ' + esc(g.name) + (g.mine ? '' : ' (他仕入先)') + '</option>';
+  }).join('');
+  var matOpts = '<option value="">(なし)</option>' + (D.allGroups && D.allGroups.materials || []).map(function(g) {
+    return '<option value="' + esc(g.id) + '"' + (g.id === p.materialGroupId ? ' selected' : '') + '>' + esc(g.id) + ' — ' + esc(g.name) + '</option>';
+  }).join('');
+  h += '<div class="accg">🔗 グループ紐付け: 発注条件 <select class="bindCond" style="max-width:240px">' + condOpts + '</select>' +
+    ' 原料 <select class="bindMat" style="max-width:240px">' + matOpts + '</select>' +
+    ' <button class="bindSave" data-bind="' + esc(p.code) + '">保存</button></div>';
   return h + '</div>';
 }
 // アコーディオン内の「必要数」列を月数入力に合わせて再計算
@@ -1578,7 +1742,11 @@ function condCheck() {
     } else if (c.conditionType === '数量' && (c.unit === '個' || !c.unit)) {
       if (sumQ < c.conditionValue) unmet.push(c.displayName + ': あと ' + (c.conditionValue - sumQ).toLocaleString('ja-JP') + ' 個');
     } else if (c.conditionType === '上限') {
-      if (sumQ > c.conditionValue) unmet.push('🚫出荷制限超過 ' + c.displayName + ': 上限 ' + c.conditionValue.toLocaleString('ja-JP') + (c.unit || '個') + ' に対し ' + sumQ.toLocaleString('ja-JP') + ' (' + (sumQ - c.conditionValue).toLocaleString('ja-JP') + ' 超過)');
+      var issuedQ = issuedMonthFor(c.memberCodes, c.supplierWide);
+      var totalQ = sumQ + issuedQ;
+      if (totalQ > c.conditionValue) unmet.push('🚫出荷制限超過 ' + c.displayName + ': 上限 ' + c.conditionValue.toLocaleString('ja-JP') + (c.unit || '個') + '/月 に対し ' +
+        (issuedQ ? '今月済 ' + issuedQ.toLocaleString('ja-JP') + ' + 今回 ' + sumQ.toLocaleString('ja-JP') + ' = ' : '') + totalQ.toLocaleString('ja-JP') +
+        ' (' + (totalQ - c.conditionValue).toLocaleString('ja-JP') + ' 超過)');
     } else {
       manual.push(c.displayName + ' (条件 ' + c.conditionType + ' ' + c.conditionValue.toLocaleString('ja-JP') + (c.unit || '') + ')');
     }
@@ -1686,6 +1854,57 @@ document.addEventListener('click', function(ev) {
     renderAll();
     return;
   }
+  // 要発注リストから非表示 (✕)
+  var dis = ev.target.getAttribute && ev.target.getAttribute('data-dis');
+  if (dis) {
+    DIS.set(dis, CART[dis] || 0);
+    delete CART[dis];
+    saveDis();
+    renderLists(); renderAll();
+    toast(dis + ' を非表示にしました (リスト下の「非表示」から戻せます)');
+    return;
+  }
+  // 非表示から戻す (発注数も復元)
+  var undis = ev.target.getAttribute && ev.target.getAttribute('data-undis');
+  if (undis) {
+    var restore = undis === '*' ? [...DIS.keys()] : [undis];
+    restore.forEach(function(code) {
+      var qty = DIS.get(code);
+      DIS.delete(code);
+      if (qty > 0) CART[code] = qty;
+    });
+    saveDis();
+    renderLists(); renderAll();
+    toast(restore.length + ' 件をリストに戻しました');
+    return;
+  }
+  // アコーディオンからのグループ紐付け保存
+  if (ev.target.classList && ev.target.classList.contains('bindSave')) {
+    var bcode = ev.target.getAttribute('data-bind');
+    var box2 = ev.target.closest('.accg');
+    var condSel = box2.querySelector('.bindCond').value;
+    var matSel = box2.querySelector('.bindMat').value;
+    ev.target.disabled = true;
+    fetch('/apps/purchase-orders/api/attrs/bind', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ product_code: byCode[bcode] ? byCode[bcode].code : bcode, condition_id: condSel, material_group_id: matSel }),
+    }).then(function(r){ return r.json(); }).then(function(j) {
+      ev.target.disabled = false;
+      if (!j.ok) { toast('エラー: ' + j.error); return; }
+      var p = byCode[bcode];
+      if (p) {
+        // 画面上のグループ membership も更新 (ゲージ・グループ分けに即時反映)
+        if (p.conditionId && condById[p.conditionId]) condById[p.conditionId].memberCodes = condById[p.conditionId].memberCodes.filter(function(x){ return x !== p.code; });
+        if (p.materialGroupId && matById[p.materialGroupId]) matById[p.materialGroupId].memberCodes = matById[p.materialGroupId].memberCodes.filter(function(x){ return x !== p.code; });
+        p.conditionId = condSel; p.materialGroupId = matSel;
+        if (condSel && condById[condSel] && condById[condSel].memberCodes.indexOf(p.code) < 0) condById[condSel].memberCodes.push(p.code);
+        if (matSel && matById[matSel] && matById[matSel].memberCodes.indexOf(p.code) < 0) matById[matSel].memberCodes.push(p.code);
+      }
+      renderLists(); renderAll();
+      toast('紐付けを保存しました' + ((condSel && !condById[condSel]) || (matSel && !matById[matSel]) ? ' (他仕入先グループのゲージは再読み込み後に表示)' : ''));
+    }).catch(function(e){ ev.target.disabled = false; toast('通信エラー: ' + e.message); });
+    return;
+  }
   var sec = ev.target.getAttribute && ev.target.getAttribute('data-sec');
   if (sec === 'hori') {
     var el = document.getElementById('secHori');
@@ -1760,33 +1979,23 @@ function showDone(orderId) {
   area.scrollIntoView({ behavior: 'smooth' });
 }
 
-// ── ページ内商品検索 (全セクションの行を絞り込み) ──
+// ── ページ内商品検索 (データから再描画。debounceで連打時の無応答を防ぐ) ──
 var horiAutoOpened = false;
-function filterRows(q) {
-  q = q.trim().toLowerCase();
+var qTimer = null;
+function applySearch(raw) {
+  Q = String(raw || '').trim().toLowerCase();
   var hori = document.getElementById('secHori');
-  if (q && hori.style.display === 'none') { hori.style.display = ''; horiAutoOpened = true; } // 検索時は掘り起こしも対象に
-  if (!q && horiAutoOpened) { hori.style.display = 'none'; horiAutoOpened = false; } // 検索クリアで元に戻す
-  ['secTargets', 'secCands', 'secHori'].forEach(function(id) {
-    var sec = document.getElementById(id);
-    sec.querySelectorAll('tr[data-search]').forEach(function(tr) {
-      var show = !q || tr.getAttribute('data-search').indexOf(q) >= 0;
-      tr.style.display = show ? '' : 'none';
-      var next = tr.nextElementSibling;
-      if (next && next.classList.contains('accrow')) next.style.display = show ? '' : 'none';
-    });
-    // グループ見出しは配下に表示行がなければ隠す
-    sec.querySelectorAll('tr.ghead').forEach(function(gh) {
-      var el = gh.nextElementSibling, any = false;
-      while (el && !el.classList.contains('ghead')) {
-        if (el.hasAttribute('data-search') && el.style.display !== 'none') { any = true; break; }
-        el = el.nextElementSibling;
-      }
-      gh.style.display = any ? '' : 'none';
-    });
-  });
+  if (Q && hori.style.display === 'none') { hori.style.display = ''; horiAutoOpened = true; } // 検索時は掘り起こしも対象に
+  if (!Q && horiAutoOpened) { hori.style.display = 'none'; horiAutoOpened = false; } // 検索クリアで元に戻す
+  renderLists();
+  renderAll();
 }
-document.addEventListener('input', function(ev){ if (ev.target.id === 'pageQ') filterRows(ev.target.value); });
+document.addEventListener('input', function(ev) {
+  if (ev.target.id !== 'pageQ') return;
+  clearTimeout(qTimer);
+  var v = ev.target.value;
+  qTimer = setTimeout(function(){ applySearch(v); }, 250);
+});
 
 document.getElementById('orderNote').value = D.draft ? D.draft.note : '';
 renderLists();
@@ -1953,7 +2162,12 @@ function loadMallSales(code, days, td) {
     })
     .catch(function(e){ td.innerHTML = '<div class="muted" style="padding:8px">通信エラー: ' + esc(e.message) + '</div>'; });
 }
-document.addEventListener('input', function(ev){ if (ev.target.id === 'q') { shown = CAP; render(); } });
+var qTimer = null;
+document.addEventListener('input', function(ev) {
+  if (ev.target.id !== 'q') return;
+  clearTimeout(qTimer);
+  qTimer = setTimeout(function(){ shown = CAP; render(); }, 250); // debounce (1万行フィルタ+1000行再描画の連打で固まるのを防ぐ)
+});
 document.addEventListener('change', function(ev) {
   if (['fAct','fState','fSup'].indexOf(ev.target.id) >= 0) { shown = CAP; render(); return; }
   if (ev.target.classList && ev.target.classList.contains('msDays')) {
@@ -2049,7 +2263,7 @@ router.get('/admin', (req, res) => {
       <h3>📥 スプレッドシートから取り込む</h3>
       <div class="hint">
         「発注条件マスタ」スプレッドシートから <b>ダウンロードしたCSVをそのまま</b>ここに入れてください（文字コード・列名は自動で判別します）。<br>
-        対応: <b>商品マスタ</b>（→ 仕入先＋商品紐付け）／ <b>発注条件マスタ</b> ／ <b>原料グループマスタ</b>。まとめて複数選択もできます。
+        対応: <b>商品マスタ</b>（→ 仕入先＋商品紐付け）／ <b>発注条件マスタ</b> ／ <b>原料グループマスタ</b> ／ <b>選べるセット構成</b>（商品コード＋セット名＋最低在庫数）。まとめて複数選択もできます。
       </div>
       <form id="importForm" class="row">
         <input type="file" name="files" accept=".csv" multiple required>
@@ -2064,6 +2278,7 @@ router.get('/admin', (req, res) => {
       <button data-tab="conditions">発注条件グループ</button>
       <button data-tab="materials">原料グループ</button>
       <button data-tab="attrs">商品紐付け</button>
+      <button data-tab="selectable">🧩 選べるセット構成</button>
       <button data-tab="unlinked">🆕 未紐付けの新商品</button>
     </div>
     <div class="sec"><div class="bd" id="tabBody">読み込み中…</div></div>`;
@@ -2080,6 +2295,8 @@ var DEFS = {
   attrs: { title: '商品紐付け', cols: [
     { k: 'product_code', l: '商品コード', pk: 1 }, { k: 'condition_id', l: '発注条件グループID' }, { k: 'material_group_id', l: '原料グループID' },
     { k: 'capacity_per_unit', l: '容量/個', num: 1 }, { k: 'case_group', l: 'ケースグループ' }, { k: 'case_lot', l: 'ケースロット', num: 1 } ] },
+  selectable: { title: '選べるセット構成商品 (在庫+注残≦最低在庫で要発注入り。最低在庫 空欄=既定10)', cols: [
+    { k: 'product_code', l: '商品コード', pk: 1 }, { k: 'set_names', l: 'セット名 (複数は「、」区切り)' }, { k: 'min_stock', l: '最低在庫数', num: 1 } ] },
 };
 
 // ── 一括取込 (自動判別) ──
