@@ -1126,13 +1126,17 @@ const CSS = `
   .b-warn { background: var(--danger-soft); color: var(--danger); }
   table.t { border-collapse: separate; border-spacing: 0; width: 100%; background: var(--card); font-size: 13.5px; }
   table.t th, table.t td { border-bottom: 1px solid var(--line); padding: 9px 10px; text-align: left; line-height: 1.5; }
-  table.t th { background: #f7f9fc; color: var(--sub); font-weight: 600; position: sticky; top: 52px; white-space: nowrap; font-size: 12.5px; letter-spacing: .02em; z-index: 1; }
+  /* top:0 = スクロール領域 (.bd) の上端に貼り付く */
+  table.t th { background: #f7f9fc; color: var(--sub); font-weight: 600; position: sticky; top: 0; white-space: nowrap; font-size: 12.5px; letter-spacing: .02em; z-index: 2; box-shadow: 0 1px 0 var(--line); }
+  /* グループ見出し行も見出しのすぐ下に貼り付く (どのグループを見ているか迷子にならない) */
+  tr.ghead td { position: sticky; top: 34px; z-index: 1; }
   table.t tbody tr:hover td { background: #f9fbff; }
   table.t td.r, table.t th.r { text-align: right; font-variant-numeric: tabular-nums; }
-  /* overflow を visible 以外にすると子孫の position:sticky (見出し追随) がブラウザによって死ぬ。
-     見出し固定を最優先し overflow は visible、角丸は先頭/末尾要素側で処理する */
+  /* 見出し追随: ページ全体のstickyはヘッダ構成やブラウザ差で不安定だったため、
+     各セクションの中身(.bd)自体をスクロール領域にし、その中で th を固定する (確実に効く方式) */
   .sec { background: var(--card); border: 1px solid var(--line); border-radius: 14px; margin-bottom: 16px; overflow: visible; box-shadow: var(--shadow); }
   .sec > h2:first-child { border-radius: 13px 13px 0 0; }
+  .sec > .bd { max-height: 74vh; overflow: auto; }
   .sec > .bd > table.t tr:last-child td { border-bottom: none; }
   .sec > h2 { font-size: 14px; margin: 0; padding: 12px 16px; background: #f7f9fc; border-bottom: 1px solid var(--line); user-select: none; font-weight: 700; }
   .sec > h2[data-sec] { cursor: pointer; }
@@ -2208,7 +2212,7 @@ router.get('/products', (req, res) => {
       <select id="fSup"><option value="">仕入先: 全部</option></select>
       <span class="muted" style="margin-left:auto">列見出しクリックで並び替え</span>
     </div>
-    <div class="sec"><div id="tbl">読み込み中…</div></div>`;
+    <div class="sec"><div class="bd" id="tbl">読み込み中…</div></div>`;
 
   const script = `
 var ROWS = ${jsonEmbed(rows)};

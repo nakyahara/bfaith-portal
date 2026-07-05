@@ -473,7 +473,8 @@ for (const p of ['/', '/supplier/1', '/products', '/orders', '/admin']) {
   ok(html.includes('needAll') && html.includes('(この商品)'), '/supplier 必要数一括コピー+同グループ表に自分自身');
   ok(html.includes('accApply') && html.includes('＋追加'), '/supplier 要発注リストに反映して閉じる+追加行バッジ');
   ok(html.includes('issuedMonthFor'), '/supplier 上限=月次累計 (今月確定分込み)');
-  ok(html.includes('overflow: visible; box-shadow'), 'テーブル見出しsticky (secはoverflow:visible、hidden/clipはstickyを殺す)');
+  ok(html.includes('max-height: 74vh; overflow: auto'), '見出し追随: .bd自体をスクロール領域化 (確実に効く方式)');
+  ok(html.includes('position: sticky; top: 0;'), '見出しは.bd上端に貼り付く');
   ok(html.includes('追加発注候補') && !html.includes('ついで買い'), '/supplier 「ついで買い」→「追加発注候補」に改名');
   ok(!html.includes('condArea'), '/supplier 独立した発注条件セクションは廃止済み');
   ok(html.includes('未達の発注条件'), '/supplier 確定前の条件未達警告');
