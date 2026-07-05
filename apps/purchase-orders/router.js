@@ -1129,8 +1129,11 @@ const CSS = `
   table.t th { background: #f7f9fc; color: var(--sub); font-weight: 600; position: sticky; top: 52px; white-space: nowrap; font-size: 12.5px; letter-spacing: .02em; z-index: 1; }
   table.t tbody tr:hover td { background: #f9fbff; }
   table.t td.r, table.t th.r { text-align: right; font-variant-numeric: tabular-nums; }
-  /* overflow:hidden だと子孫の position:sticky (見出し追随) が死ぬため clip (スクロールコンテナを作らない) */
-  .sec { background: var(--card); border: 1px solid var(--line); border-radius: 14px; margin-bottom: 16px; overflow: clip; box-shadow: var(--shadow); }
+  /* overflow を visible 以外にすると子孫の position:sticky (見出し追随) がブラウザによって死ぬ。
+     見出し固定を最優先し overflow は visible、角丸は先頭/末尾要素側で処理する */
+  .sec { background: var(--card); border: 1px solid var(--line); border-radius: 14px; margin-bottom: 16px; overflow: visible; box-shadow: var(--shadow); }
+  .sec > h2:first-child { border-radius: 13px 13px 0 0; }
+  .sec > .bd > table.t tr:last-child td { border-bottom: none; }
   .sec > h2 { font-size: 14px; margin: 0; padding: 12px 16px; background: #f7f9fc; border-bottom: 1px solid var(--line); user-select: none; font-weight: 700; }
   .sec > h2[data-sec] { cursor: pointer; }
   .sec .bd { padding: 14px 16px; overflow-x: auto; }
@@ -1488,10 +1491,16 @@ function selBadge(p) {
   if (!p.selectableLow) return '';
   return ' <span class="badge" style="background:#ede9fe;color:#6d28d9" title="選べるセット構成商品 (' + esc(p.selectableLow.sets || '') + ')。在庫+注残が最低在庫 ' + p.selectableLow.minStock + ' 以下">🧩選べるセット構成の在庫減</span>';
 }
+// 要発注リストに「発注数を入れたから並んでいる」行 (本来は追加候補/掘り起こし)。renderTargetsで再構築
+var ADDED = {};
+function addedBadge(p) {
+  if (!ADDED[p.code]) return '';
+  return ' <span class="badge" style="background:var(--accent-soft);color:var(--accent-d)" title="要発注判定ではないが発注数が入っているためこのグループに表示中 (発注数を消すと戻ります)">＋追加</span>';
+}
 function rowHtml(p, kind) {
   var rec = p.recQty ? p.recQty.toLocaleString('ja-JP') : '—';
   return '<tr>' +
-    '<td>' + esc(p.code) + issuedBadge(p) + selBadge(p) + '</td>' +
+    '<td>' + esc(p.code) + issuedBadge(p) + selBadge(p) + addedBadge(p) + '</td>' +
     '<td><a class="pname" data-acc="' + esc(p.code) + '" title="クリックで詳細・発注条件・同グループ商品">' + esc(p.name) + '</a></td>' +
     '<td class="r">' + months(p) + '</td>' +
     '<td class="r">' + p.sales30.toLocaleString('ja-JP') + '</td>' +
@@ -1534,6 +1543,20 @@ function groupMembers(k) {
 }
 function renderTargets() {
   var visible = D.targets.filter(function(p){ return !DIS.has(p.code) && matchQ(p); });
+  // 要発注判定外でも発注数が入っている商品は、所属グループの下に「＋追加」行として並べる
+  // (アコーディオンで数量を決めて閉じたあとも、要発注リスト上でグループごとに見える)
+  ADDED = {};
+  var inTargets = {};
+  visible.forEach(function(p){ inTargets[p.code] = 1; });
+  Object.keys(CART).forEach(function(code) {
+    if (!(CART[code] > 0) || inTargets[code] || DIS.has(code)) return;
+    var p = byCode[code];
+    if (!p || p.isTarget || p.selectableLow || p.extra) return;
+    if (!matchQ(p)) return;
+    ADDED[code] = 1;
+    visible.push(p);
+  });
+  document.getElementById('cntTargets').textContent = visible.length;
   var h = '';
   if (!visible.length) h = '<div class="muted">' + (Q ? '「' + esc(Q) + '」に一致なし' : 'なし') + '</div>';
   else {
@@ -1542,7 +1565,7 @@ function renderTargets() {
       var k = groupKeyOf(p) || 'solo:' + p.code;
       if (!buckets[k]) { buckets[k] = { key: k, items: [], amt: 0 }; order.push(k); }
       buckets[k].items.push(p);
-      buckets[k].amt += (p.recQty || 0) * (p.cost || 0);
+      buckets[k].amt += (ADDED[p.code] ? (CART[p.code] || 0) : (p.recQty || 0)) * (p.cost || 0);
     });
     var list = order.map(function(k){ return buckets[k]; });
     list.sort(function(a, b){ return b.amt - a.amt; });
@@ -1571,10 +1594,9 @@ function renderTargets() {
   document.getElementById('secTargets').innerHTML = h;
 }
 function renderLists() {
-  renderTargets();
+  renderTargets(); // cntTargets は renderTargets 内で設定 (＋追加行を含むため)
   document.getElementById('secCands').innerHTML = tableHtml(D.candidates, 'cand');
   document.getElementById('secHori').innerHTML = tableHtml(D.horikoshi, 'hori');
-  document.getElementById('cntTargets').textContent = D.targets.length - DIS.size;
   document.getElementById('cntCands').textContent = D.candidates.length;
   document.getElementById('cntHori').textContent = D.horikoshi.length;
 }
@@ -1732,6 +1754,9 @@ function accHtml(p) {
     ' 原料 <select class="bindMat" style="max-width:260px">' + matOpts + '</select>' +
     ' <button class="bindSave" data-bind="' + esc(p.code) + '">保存</button>' +
     ' <span class="muted">(グループに他の商品を足すのは各グループ表の下の「➕このグループに商品を追加」)</span></div>';
+  h += '<div class="accg" style="display:flex;justify-content:flex-end;align-items:center;gap:10px">' +
+    '<span class="muted">発注数を決めたら →</span>' +
+    '<button class="pri accApply" data-apply="' + esc(p.code) + '">💾 要発注リストに反映して閉じる</button></div>';
   return h + '</div>';
 }
 // アコーディオン内の「必要数」列を月数入力に合わせて再計算
@@ -1894,6 +1919,8 @@ document.addEventListener('change', function(ev) {
   document.querySelectorAll('input[data-code]').forEach(function(inp) {
     if (inp.getAttribute('data-code') === code && String(inp.value) !== String(norm)) inp.value = norm;
   });
+  // 「＋追加」行の発注数を 0/空 にしたら、確定時にリストから消す (入力途中は再描画しない=フォーカス保持)
+  if (ADDED[code] && !(CART[code] > 0)) { renderLists(); renderAll(); }
 });
 // 指定商品のアコーディオンを開く (再描画後の復元にも使う)
 function openAccFor(code) {
@@ -1951,6 +1978,16 @@ document.addEventListener('click', function(ev) {
     });
     renderAll();
     toast(applied ? applied + ' 商品に必要数を入れました (充足済みは変更なし)' : '必要数のある商品がありません (充足済み)');
+    return;
+  }
+  // アコーディオンで決めた発注数を要発注リストへ反映して閉じる
+  if (ev.target.classList && ev.target.classList.contains('accApply')) {
+    var ownCode = ev.target.getAttribute('data-apply');
+    renderLists(); renderAll(); // 再描画でアコーディオンは閉じ、発注数入り商品が各グループ配下に「＋追加」で並ぶ
+    var anchor2 = null;
+    document.querySelectorAll('a.pname[data-acc]').forEach(function(a){ if (!anchor2 && a.getAttribute('data-acc') === ownCode) anchor2 = a; });
+    if (anchor2) anchor2.closest('tr').scrollIntoView({ behavior: 'smooth', block: 'center' });
+    toast('発注数を入れた商品を要発注リストの各グループに並べました');
     return;
   }
   // グループへの商品追加 (検索結果から)

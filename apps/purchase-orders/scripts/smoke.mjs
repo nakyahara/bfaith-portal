@@ -471,8 +471,9 @@ for (const p of ['/', '/supplier/1', '/products', '/orders', '/admin']) {
   ok(html.includes('bindSave') && html.includes('bindCond'), '/supplier アコーディオンからグループ紐付け');
   ok(html.includes('gaddQ') && html.includes('data-gadd'), '/supplier グループへの商品追加検索');
   ok(html.includes('needAll') && html.includes('(この商品)'), '/supplier 必要数一括コピー+同グループ表に自分自身');
+  ok(html.includes('accApply') && html.includes('＋追加'), '/supplier 要発注リストに反映して閉じる+追加行バッジ');
   ok(html.includes('issuedMonthFor'), '/supplier 上限=月次累計 (今月確定分込み)');
-  ok(html.includes('overflow: clip'), 'テーブル見出しsticky (secのoverflow:hidden廃止)');
+  ok(html.includes('overflow: visible; box-shadow'), 'テーブル見出しsticky (secはoverflow:visible、hidden/clipはstickyを殺す)');
   ok(html.includes('追加発注候補') && !html.includes('ついで買い'), '/supplier 「ついで買い」→「追加発注候補」に改名');
   ok(!html.includes('condArea'), '/supplier 独立した発注条件セクションは廃止済み');
   ok(html.includes('未達の発注条件'), '/supplier 確定前の条件未達警告');
