@@ -1672,12 +1672,10 @@ function renderGauges() {
 // ── 商品名クリックで開く詳細アコーディオン ──
 function kvHtml(label, val){ return '<span>' + label + '<b>' + val + '</b></span>'; }
 function numFmt(v){ return v == null ? '—' : Number(v).toLocaleString('ja-JP'); }
-// ◯ヶ月分保有に必要な発注数 = max(0, 30日販売×月数 − 在庫 − 注残) をロット単位で切上げ
+// ◯ヶ月分保有に必要な数 = max(0, 30日販売×月数 − 在庫 − 注残)。
+// ロットは無視した素の参照値 (中原さん指定)。実際の発注数はロットを見て人が決める
 function needQty(p, m) {
-  var need = Math.max(0, (p.sales30 || 0) * m - ((p.stock || 0) + (p.backOrder || 0)));
-  if (!need) return 0;
-  var lot = p.lot > 0 ? p.lot : 1;
-  return Math.ceil(need / lot) * lot;
+  return Math.ceil(Math.max(0, (p.sales30 || 0) * m - ((p.stock || 0) + (p.backOrder || 0))));
 }
 function needCell(code) {
   return '<td class="r"><a class="need" data-nc="' + esc(code) + '" title="クリックで発注数に反映">—</a></td>';
@@ -1722,9 +1720,9 @@ function accHtml(p) {
     kvHtml('最終仕入日 ', esc(p.lastPurchase || '—')) +
     (p.capacityPerUnit ? kvHtml('容量/個 ', numFmt(p.capacityPerUnit)) : '') + '</div>';
   // ◯ヶ月分シミュレーション (旧GAS参照ツールの機能)。必要数は下の同グループ表の「必要数」列にも反映
-  h += '<div class="accg">📐 <b><input type="number" class="simM" value="' + (p.holdMonths > 0 ? p.holdMonths : 2) + '" min="0.5" step="0.5" style="width:64px;text-align:right"> ヶ月分</b>を保有するのに必要な発注数: ' +
+  h += '<div class="accg">📐 <b><input type="number" class="simM" value="' + (p.holdMonths > 0 ? p.holdMonths : 2) + '" min="0.5" step="0.5" style="width:64px;text-align:right"> ヶ月分</b>を保有するのに必要な数: ' +
     '<a class="need" data-nc="' + esc(p.code) + '" title="クリックで発注数に反映" style="font-weight:700">—</a>' +
-    ' <span class="muted">(30日販売 × 月数 − 在庫 − 注残 をロット単位で切上げ。クリックで発注数へ)</span></div>';
+    ' <span class="muted">(30日販売 × 月数 − 在庫 − 注残。ロットは考慮しない参照値。クリックで発注数へ)</span></div>';
   var hasGroup = false;
   if (p.conditionId) {
     hasGroup = true;
