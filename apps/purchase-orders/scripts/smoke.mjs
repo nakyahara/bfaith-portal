@@ -321,11 +321,25 @@ r = await j('/api/attrs/unlinked?days=0');
 ok(r.body.ok && typeof r.body.totalUnlinked === 'number', 'days=0 で全件モード');
 
 console.log('── 画面 (HTML) ──');
-for (const p of ['/', '/supplier/1', '/orders', '/admin']) {
+for (const p of ['/', '/supplier/1', '/products', '/orders', '/admin']) {
   const res = await fetch(base + p);
   const html = await res.text();
   ok(res.status === 200 && html.includes('<!DOCTYPE html>'), `GET ${p} → 200 HTML`);
   ok(!html.includes('undefined') || p === '/', `GET ${p} に undefined 露出なし`);
+}
+// 全商品情報: PML全行が埋め込まれる (取扱中止含む) + 仕入先名map
+{
+  const res = await fetch(base + '/products');
+  const html = await res.text();
+  ok(html.includes('noflyersticker') && html.includes('全商品情報'), '/products にPML商品が埋め込まれる');
+  ok(html.includes('"t":1') || html.includes('"h":1'), '/products に要発注/掘り起こしフラグ');
+}
+// 仕入先ページ: グループ化アコーディオンUIの部品が含まれる (発注条件の独立セクションは廃止)
+{
+  const res = await fetch(base + '/supplier/1');
+  const html = await res.text();
+  ok(html.includes('renderTargets') && html.includes('accHtml') && html.includes('cartCondSummary'), '/supplier グループ化+アコーディオン+条件チェックのJSを配信');
+  ok(!html.includes('condArea'), '/supplier 独立した発注条件セクションは廃止済み');
 }
 r = await j('/api/attrs/unlinked?days=0');
 ok(r.body.ok && r.body.rows.every(x => x.code.toLowerCase() !== 'diyorangeoil100'), 'unlinked: 紐付け済みは出ない');
