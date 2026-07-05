@@ -107,6 +107,23 @@ ok(r.body.targets.length === 2, 'supplier: targets=2', r.body.targets.map(t => t
 ok(r.body.horikoshi.length === 1 && r.body.horikoshi[0].code === 'deaditem', 'supplier: 掘り起こし=deaditem');
 ok(r.body.conditions.length === 1 && r.body.conditions[0].memberCodes.includes('noflyersticker'), 'supplier: 条件メンバー解決', r.body.conditions);
 ok(r.body.materialGroups.length === 1 && r.body.materialGroups[0].memberCodes.includes('diyorangeoil100'), 'supplier: 原料グループ解決');
+// 商品紐付けのない仕入先直付き条件は supplierWide=true でカート全体評価 (Codex P5 High)
+db.prepare(`INSERT INTO po_order_conditions (condition_id, supplier_code, display_name, condition_type, condition_value, unit, created_at, updated_at)
+  VALUES ('SUPWIDE', '1', '仕入先全体5万', '金額', 50000, '円', ?, ?)`).run(new Date().toISOString(), new Date().toISOString());
+r = await j('/api/supplier/1');
+const supWide = r.body.conditions.find(c => c.conditionId === 'SUPWIDE');
+ok(supWide && supWide.supplierWide === true && supWide.memberCodes.length === 0, 'supplier: 紐付けなし直付き条件は supplierWide', supWide);
+ok(r.body.conditions.find(c => c.conditionId !== 'SUPWIDE' && !c.supplierWide), 'supplier: 商品紐付きの条件は supplierWide でない');
+// 紐付け商品が現在リスト外でも、attrsに1件でも紐付けがあれば supplierWide にしない (Codex P5 R2 High)
+db.prepare(`INSERT INTO po_order_conditions (condition_id, supplier_code, display_name, condition_type, condition_value, unit, created_at, updated_at)
+  VALUES ('OFFLIST', '1', 'リスト外紐付き条件', '金額', 30000, '円', ?, ?)`).run(new Date().toISOString(), new Date().toISOString());
+db.prepare(`INSERT INTO po_product_attrs (product_key, product_code, condition_id, created_at, updated_at)
+  VALUES ('gyoumuhandcream60-bi', 'gyoumuhandcream60-BI', 'OFFLIST', ?, ?)`).run(new Date().toISOString(), new Date().toISOString());
+r = await j('/api/supplier/1');
+const offList = r.body.conditions.find(c => c.conditionId === 'OFFLIST');
+ok(offList && offList.supplierWide === false, 'supplier: リスト外商品に紐付く条件は supplierWide でない (カート全体で誤達成しない)', offList);
+db.prepare(`DELETE FROM po_product_attrs WHERE product_key='gyoumuhandcream60-bi'`).run();
+db.prepare(`DELETE FROM po_order_conditions WHERE condition_id='OFFLIST'`).run();
 
 console.log('── draft / issue ──');
 r = await j('/api/supplier/1/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 400 }], note: 'メモ1', supplierName: 'アメージングクラフト様' }) });
@@ -321,11 +338,25 @@ r = await j('/api/attrs/unlinked?days=0');
 ok(r.body.ok && typeof r.body.totalUnlinked === 'number', 'days=0 で全件モード');
 
 console.log('── 画面 (HTML) ──');
-for (const p of ['/', '/supplier/1', '/orders', '/admin']) {
+for (const p of ['/', '/supplier/1', '/products', '/orders', '/admin']) {
   const res = await fetch(base + p);
   const html = await res.text();
   ok(res.status === 200 && html.includes('<!DOCTYPE html>'), `GET ${p} → 200 HTML`);
   ok(!html.includes('undefined') || p === '/', `GET ${p} に undefined 露出なし`);
+}
+// 全商品情報: PML全行が埋め込まれる (取扱中止含む) + 仕入先名map
+{
+  const res = await fetch(base + '/products');
+  const html = await res.text();
+  ok(html.includes('noflyersticker') && html.includes('全商品情報'), '/products にPML商品が埋め込まれる');
+  ok(html.includes('"t":1') || html.includes('"h":1'), '/products に要発注/掘り起こしフラグ');
+}
+// 仕入先ページ: グループ化アコーディオンUIの部品が含まれる (発注条件の独立セクションは廃止)
+{
+  const res = await fetch(base + '/supplier/1');
+  const html = await res.text();
+  ok(html.includes('renderTargets') && html.includes('accHtml') && html.includes('cartCondSummary'), '/supplier グループ化+アコーディオン+条件チェックのJSを配信');
+  ok(!html.includes('condArea'), '/supplier 独立した発注条件セクションは廃止済み');
 }
 r = await j('/api/attrs/unlinked?days=0');
 ok(r.body.ok && r.body.rows.every(x => x.code.toLowerCase() !== 'diyorangeoil100'), 'unlinked: 紐付け済みは出ない');
