@@ -885,7 +885,10 @@ const CSS = `
   .wrap { padding: 20px 22px 130px; max-width: 1560px; margin: 0 auto; }
   /* 下部固定の発注バー (カート廃止に伴い集計・条件・確定をここへ) */
   .foot { position: fixed; left: 0; right: 0; bottom: 0; z-index: 60; }
-  .fbar { display: flex; gap: 10px; align-items: center; background: linear-gradient(90deg,#111c33,#1e3a63); color: #fff; padding: 10px 22px; box-shadow: 0 -4px 16px rgba(0,0,0,.22); }
+  .fbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; background: linear-gradient(90deg,#111c33,#1e3a63); color: #fff; padding: 10px 22px; box-shadow: 0 -4px 16px rgba(0,0,0,.22); }
+  .fbar button { white-space: nowrap; }
+  .fbar input { flex: 1 1 160px; }
+  @media (max-width: 760px) { .fbar { padding: 8px 12px; gap: 8px; } .fbar input { order: 9; flex-basis: 100%; } }
   .fbar .ftot { font-size: 13px; white-space: nowrap; font-variant-numeric: tabular-nums; }
   .fbar .ftot b { font-size: 17px; }
   .fbar input { flex: 1; min-width: 100px; background: rgba(255,255,255,.12); border: 1px solid rgba(255,255,255,.25); color: #fff; border-radius: 8px; padding: 7px 10px; }
@@ -1005,11 +1008,18 @@ function toast(msg) {
 function yen(n) { return '¥' + Math.round(n).toLocaleString('ja-JP'); }
 function esc(s) { s = (s == null ? '' : String(s)); return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function dlCsv(filename, rows) {
-  var csv = rows.map(function(r){ return r.map(function(v){ return '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"'; }).join(','); }).join('\\r\\n');
+  var csv = rows.map(function(r) {
+    return r.map(function(v) {
+      var s = String(v == null ? '' : v);
+      // CSV injection対策: 数式に化ける先頭文字は ' を前置 (文字列セルのみ)
+      if (typeof v === 'string' && /^[=+\\-@\\t\\r]/.test(s)) s = "'" + s;
+      return '"' + s.replace(/"/g, '""') + '"';
+    }).join(',');
+  }).join('\\r\\n');
   var blob = new Blob([new Uint8Array([0xEF, 0xBB, 0xBF]), csv], { type: 'text/csv' }); // BOM付きUTF-8 (Excel対応)
   var a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = filename;
+  a.download = String(filename).replace(/[\\\\/:*?"<>|\\x00-\\x1f]/g, '_'); // ファイル名に使えない文字を無害化
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
   URL.revokeObjectURL(a.href);
 }
@@ -1288,7 +1298,8 @@ function renderTargets() {
 }
 function renderLists() {
   renderTargets();
-  document.getElementById('secCands').innerHTML = tableHtml(D.candidates.slice(0, 120), 'cand');
+  // 全件描画 (キャップするとページ内検索が後方の候補を拾えない、Codex P6-1)
+  document.getElementById('secCands').innerHTML = tableHtml(D.candidates, 'cand');
   document.getElementById('secHori').innerHTML = tableHtml(D.horikoshi, 'hori');
   document.getElementById('cntTargets').textContent = D.targets.length;
   document.getElementById('cntCands').textContent = D.candidates.length;
@@ -1494,7 +1505,9 @@ function renderBar() {
   var cc = condCheck();
   document.getElementById('fCond').innerHTML = cc.unmet.length
     ? '<span class="badge b-warn">⚠ ' + cc.unmet.length + '件未達</span>'
-    : (items.length ? '<span class="badge b-issued">✅</span>' : '');
+    : (cc.manual.length
+      ? '<span class="badge" style="background:#fff7e6;color:#b45309">📝 手動確認' + cc.manual.length + '件</span>'
+      : (items.length ? '<span class="badge b-issued">✅</span>' : ''));
   if (openPanel === 'items') renderPanelItems(items);
   if (openPanel === 'conds') renderPanelConds(items);
 }
@@ -1595,15 +1608,26 @@ function save(issue) {
     if (cc.manual.length) msg += '\\n\\n※手動確認が必要な条件: ' + cc.manual.join(' / ');
     if (!confirm(msg)) return;
   }
+  // 二重送信ガード (確定連打で同内容の発注が複数作られるのを防ぐ)
+  var btnI = document.getElementById('btnIssue'), btnS = document.getElementById('btnSave');
+  btnI.disabled = btnS.disabled = true;
+  var unlock = function(){ btnI.disabled = btnS.disabled = false; };
   var url = '/apps/purchase-orders/api/supplier/' + encodeURIComponent(D.supplier.code) + (issue ? '/issue' : '/draft');
   fetch(url, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ items: items, note: document.getElementById('orderNote').value }),
   }).then(function(r){ return r.json(); }).then(function(j) {
+    unlock();
     if (!j.ok) { toast('エラー: ' + j.error); return; }
-    if (issue) { showDone(j.id); toast('発注確定しました'); }
+    if (issue) {
+      showDone(j.id); // CART を読むのでクリア前に
+      CART = {};
+      document.querySelectorAll('input[data-code]').forEach(function(inp){ inp.value = ''; });
+      renderAll();
+      toast('発注確定しました');
+    }
     else toast(j.deleted ? '下書きを削除しました' : '下書きを保存しました');
-  }).catch(function(e){ toast('通信エラー: ' + e.message); });
+  }).catch(function(e){ unlock(); toast('通信エラー: ' + e.message); });
 }
 function copyText(text, btn) {
   navigator.clipboard.writeText(text).then(function(){ toast('コピーしました'); },
@@ -1634,9 +1658,12 @@ function showDone(orderId) {
 }
 
 // ── ページ内商品検索 (全セクションの行を絞り込み) ──
+var horiAutoOpened = false;
 function filterRows(q) {
   q = q.trim().toLowerCase();
-  if (q) document.getElementById('secHori').style.display = ''; // 検索時は掘り起こしも対象に
+  var hori = document.getElementById('secHori');
+  if (q && hori.style.display === 'none') { hori.style.display = ''; horiAutoOpened = true; } // 検索時は掘り起こしも対象に
+  if (!q && horiAutoOpened) { hori.style.display = 'none'; horiAutoOpened = false; } // 検索クリアで元に戻す
   ['secTargets', 'secCands', 'secHori'].forEach(function(id) {
     var sec = document.getElementById(id);
     sec.querySelectorAll('tr[data-search]').forEach(function(tr) {
