@@ -143,6 +143,8 @@ export function initPurchaseOrders() {
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_po_items_order ON po_order_items(order_id)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_po_items_key ON po_order_items(product_key)');
+  // 発注時点の発注条件グループのスナップショット (月次上限=出荷制限の累計判定用)。既存DBには後付け
+  try { db.exec('ALTER TABLE po_order_items ADD COLUMN condition_id TEXT'); } catch (e) { /* 既に存在 */ }
 
   initialized = true;
   return db;

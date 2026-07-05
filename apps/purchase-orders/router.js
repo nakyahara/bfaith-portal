@@ -148,8 +148,13 @@ function resolveSupplierName(supplierCode) {
 }
 
 function insertItems(db, orderId, items) {
-  const ins = db.prepare('INSERT INTO po_order_items (order_id, product_code, product_key, product_name, qty, unit_cost) VALUES (?,?,?,?,?,?)');
-  for (const it of items) ins.run(orderId, it.code, it.key, it.name, it.qty, it.cost);
+  // condition_id は発注時点のスナップショット。後で紐付けを変えても過去発注の月次上限カウントが動かない (Codex P8-2)
+  const condOf = db.prepare('SELECT condition_id FROM po_product_attrs WHERE product_key=?');
+  const ins = db.prepare('INSERT INTO po_order_items (order_id, product_code, product_key, product_name, qty, unit_cost, condition_id) VALUES (?,?,?,?,?,?,?)');
+  for (const it of items) {
+    const a = condOf.get(it.key);
+    ins.run(orderId, it.code, it.key, it.name, it.qty, it.cost, (a && a.condition_id) || null);
+  }
 }
 
 function upsertDraft(supplierCode, supplierName, rawItems, note) {
@@ -265,15 +270,24 @@ function supplierWorkspaceData(code) {
     };
   });
   // 今月 (JST) にこの仕入先へ発注確定済みの数量 (上限=出荷制限の月次累計判定用。毎月1日に自動リセット)
+  // 条件グループは発注時スナップショット (i.condition_id) 優先。列追加前の旧明細のみ現在の紐付けで補完
   const jstNow = new Date(Date.now() + 9 * 3600000);
   const monthStartIso = new Date(Date.parse(jstNow.toISOString().slice(0, 7) + '-01T00:00:00+09:00')).toISOString();
   const issuedMonth = {};
+  const issuedByCond = {};
+  let issuedTotal = 0;
   for (const r of db.prepare(`
-    SELECT i.product_key k, SUM(i.qty) q
-    FROM po_order_items i JOIN po_orders o ON o.id = i.order_id
+    SELECT i.product_key k, COALESCE(i.condition_id, a.condition_id) cid, SUM(i.qty) q
+    FROM po_order_items i
+    JOIN po_orders o ON o.id = i.order_id
+    LEFT JOIN po_product_attrs a ON a.product_key = i.product_key
     WHERE o.supplier_code = ? AND o.status = 'issued' AND o.issued_at >= ?
-    GROUP BY i.product_key
-  `).all(code, monthStartIso)) issuedMonth[r.k] = r.q;
+    GROUP BY i.product_key, cid
+  `).all(code, monthStartIso)) {
+    issuedMonth[r.k] = (issuedMonth[r.k] || 0) + r.q;
+    if (r.cid) issuedByCond[r.cid] = (issuedByCond[r.cid] || 0) + r.q;
+    issuedTotal += r.q;
+  }
   // グループ紐付けUI用の全グループ一覧 (この仕入先関連を先頭に)
   const supFirst = (aSup) => (normSupplierCode(aSup) === code ? 0 : 1);
   const allGroups = {
@@ -296,7 +310,7 @@ function supplierWorkspaceData(code) {
     targets: g ? g.targets.map(productDto) : [],
     candidates: g ? g.candidates.map(productDto) : [],
     horikoshi: g ? g.horikoshi.map(productDto) : [],
-    conditions, materialGroups, draft, draftExtras, issuedMonth, allGroups,
+    conditions, materialGroups, draft, draftExtras, issuedMonth, issuedByCond, issuedTotal, allGroups,
     monthLabel: jstNow.toISOString().slice(0, 7),
   };
 }
@@ -1421,13 +1435,18 @@ function saveDis() {
   } catch (e) {}
 }
 
-// 初期カート: draft があれば復元、なければ要発注全件を推奨量で (非表示分は除く)
+// 初期カート: draft があれば復元、なければ要発注全件を推奨量で (非表示分は除く)。
+// 下書き明細に入っている商品は明示的に保存された発注なので、非表示より優先して復活させる (Codex P8-3)
 if (D.draft && D.draft.items.length) {
-  D.draft.items.forEach(function(it){ if (byCode[it.code]) CART[it.code] = it.qty; });
+  var disChanged = false;
+  D.draft.items.forEach(function(it) {
+    if (byCode[it.code]) CART[it.code] = it.qty;
+    if (DIS.has(it.code)) { DIS.delete(it.code); disChanged = true; }
+  });
+  if (disChanged) saveDis();
 } else {
   D.targets.forEach(function(p){ if (p.recQty && !p.recentIssued && !DIS.has(p.code)) CART[p.code] = p.recQty; });
 }
-DIS.forEach(function(_, code){ delete CART[code]; });
 
 function months(p){ return p.stockMonths == null ? '—' : (Math.round(p.stockMonths * 100) / 100).toFixed(2); }
 function issuedBadge(p){
@@ -1548,13 +1567,11 @@ function barHtml(cur, req, label, remain) {
   return '<span class="gg' + (met ? ' met' : '') + '">' + label + (met ? ' ✅' : ' — <b>' + remain + '</b>') +
     '<span class="bar"><span style="width:' + pct + '%"></span></span></span>';
 }
-// 今月(JST)発注確定済みの数量合計。上限=出荷制限は月次累計で判定し、毎月1日に自動リセットされる
-function issuedMonthFor(memberCodes, supplierWide) {
-  var im = D.issuedMonth || {};
-  var sum = 0;
-  if (supplierWide) Object.keys(im).forEach(function(k){ sum += im[k]; });
-  else memberCodes.forEach(function(x){ sum += im[String(x).toLowerCase().trim()] || 0; });
-  return sum;
+// 今月(JST)発注確定済みの数量合計。上限=出荷制限は月次累計で判定し、毎月1日に自動リセットされる。
+// 条件グループ別は発注時スナップショット (issuedByCond) を使う — 月中に紐付けを変えても過去分は動かない
+function issuedMonthFor(cond) {
+  if (cond.supplierWide) return D.issuedTotal || 0;
+  return (D.issuedByCond && D.issuedByCond[cond.conditionId]) || 0;
 }
 // 上限ゲージ (出荷制限、今月確定済み+今回の累計)。上限以下=OK(緑)、超過=赤
 function capBarHtml(cartQ, issuedQ, cap, unit) {
@@ -1581,7 +1598,7 @@ function gaugeHtml(k) {
     if (c.conditionType === '数量' && (c.unit === '個' || !c.unit))
       return barHtml(sumQ, c.conditionValue, sumQ.toLocaleString('ja-JP') + ' / ' + c.conditionValue.toLocaleString('ja-JP') + ' 個', 'あと ' + Math.max(0, c.conditionValue - sumQ).toLocaleString('ja-JP') + ' 個');
     if (c.conditionType === '上限')
-      return capBarHtml(sumQ, issuedMonthFor(c.memberCodes, c.supplierWide), c.conditionValue, c.unit);
+      return capBarHtml(sumQ, issuedMonthFor(c), c.conditionValue, c.unit);
     return '<span class="badge b-warn">条件 ' + esc(c.conditionType) + ' ' + c.conditionValue.toLocaleString('ja-JP') + esc(c.unit || '') + ' (手動確認)</span>' +
       ' <span class="muted">現在 ' + sumQ.toLocaleString('ja-JP') + '個 / ' + yen(sumA) + '</span>';
   }
@@ -1742,7 +1759,7 @@ function condCheck() {
     } else if (c.conditionType === '数量' && (c.unit === '個' || !c.unit)) {
       if (sumQ < c.conditionValue) unmet.push(c.displayName + ': あと ' + (c.conditionValue - sumQ).toLocaleString('ja-JP') + ' 個');
     } else if (c.conditionType === '上限') {
-      var issuedQ = issuedMonthFor(c.memberCodes, c.supplierWide);
+      var issuedQ = issuedMonthFor(c);
       var totalQ = sumQ + issuedQ;
       if (totalQ > c.conditionValue) unmet.push('🚫出荷制限超過 ' + c.displayName + ': 上限 ' + c.conditionValue.toLocaleString('ja-JP') + (c.unit || '個') + '/月 に対し ' +
         (issuedQ ? '今月済 ' + issuedQ.toLocaleString('ja-JP') + ' + 今回 ' + sumQ.toLocaleString('ja-JP') + ' = ' : '') + totalQ.toLocaleString('ja-JP') +

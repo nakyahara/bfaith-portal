@@ -208,6 +208,12 @@ export function computeAll() {
     const selMin = sel ? (sel.min_stock != null ? sel.min_stock : SELECTABLE_DEFAULT_MIN) : null;
     p.selectableLow = (sel && p.active && (p.stock + p.backOrder) <= selMin)
       ? { sets: sel.set_names || '', minStock: selMin } : null;
+    // 通常式で推奨発注が出ない場合 (販売30日=0等) は「最低在庫の2倍まで補充」をロット切上げで推奨 (Codex P8-1)
+    if (p.selectableLow && !p.recQty) {
+      const lot = p.lot > 0 ? p.lot : 1;
+      const need = Math.max(0, selMin * 2 - (p.stock + p.backOrder));
+      p.recQty = need > 0 ? Math.ceil(need / lot) * lot : lot;
+    }
     products.push(p);
     if (!p.supplierCode) continue;
     let g = bySupplier.get(p.supplierCode);
