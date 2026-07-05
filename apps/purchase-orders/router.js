@@ -1129,8 +1129,11 @@ const CSS = `
   table.t th { background: #f7f9fc; color: var(--sub); font-weight: 600; position: sticky; top: 52px; white-space: nowrap; font-size: 12.5px; letter-spacing: .02em; z-index: 1; }
   table.t tbody tr:hover td { background: #f9fbff; }
   table.t td.r, table.t th.r { text-align: right; font-variant-numeric: tabular-nums; }
-  /* overflow:hidden だと子孫の position:sticky (見出し追随) が死ぬため clip (スクロールコンテナを作らない) */
-  .sec { background: var(--card); border: 1px solid var(--line); border-radius: 14px; margin-bottom: 16px; overflow: clip; box-shadow: var(--shadow); }
+  /* overflow を visible 以外にすると子孫の position:sticky (見出し追随) がブラウザによって死ぬ。
+     見出し固定を最優先し overflow は visible、角丸は先頭/末尾要素側で処理する */
+  .sec { background: var(--card); border: 1px solid var(--line); border-radius: 14px; margin-bottom: 16px; overflow: visible; box-shadow: var(--shadow); }
+  .sec > h2:first-child { border-radius: 13px 13px 0 0; }
+  .sec > .bd > table.t tr:last-child td { border-bottom: none; }
   .sec > h2 { font-size: 14px; margin: 0; padding: 12px 16px; background: #f7f9fc; border-bottom: 1px solid var(--line); user-select: none; font-weight: 700; }
   .sec > h2[data-sec] { cursor: pointer; }
   .sec .bd { padding: 14px 16px; overflow-x: auto; }
@@ -1916,6 +1919,8 @@ document.addEventListener('change', function(ev) {
   document.querySelectorAll('input[data-code]').forEach(function(inp) {
     if (inp.getAttribute('data-code') === code && String(inp.value) !== String(norm)) inp.value = norm;
   });
+  // 「＋追加」行の発注数を 0/空 にしたら、確定時にリストから消す (入力途中は再描画しない=フォーカス保持)
+  if (ADDED[code] && !(CART[code] > 0)) { renderLists(); renderAll(); }
 });
 // 指定商品のアコーディオンを開く (再描画後の復元にも使う)
 function openAccFor(code) {
