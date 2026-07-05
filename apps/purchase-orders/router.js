@@ -861,6 +861,93 @@ router.get('/api/attrs/unlinked', (req, res) => {
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
+// ─── 商品別モール販売内訳 (売れ筋の在庫切れ防止の定点観測用) ───
+// 速報 = mirror_f_sales_velocity_by_product_mall (NE受注ベース、毎朝、7/30日固定、全チャネル)
+// 確定 = mirror_*_finance_sku_daily 6モール (精算/受注fact)。セット構成を展開して実出荷ピース数で数える
+//        (supplier-sales と同じ数え方。3個セット1件=構成品3個)。期間は 30/90/180/365日
+const MALL_LABELS = {
+  rakuten: '楽天', yahoo: 'Yahoo!', aupay: 'au PAY', qoo10: 'Qoo10', mercari: 'メルカリ',
+  linegift: 'LINEギフト', amazon: 'Amazon', amazon_fba: 'Amazon FBA', amazon_fbm: 'Amazon FBM',
+  wholesale: '卸', base: 'BASE',
+};
+const FIN_MALLS = [
+  { mall: 'rakuten', table: 'mirror_rakuten_finance_sku_daily' },
+  { mall: 'yahoo', table: 'mirror_yahoo_finance_sku_daily' },
+  { mall: 'aupay', table: 'mirror_aupay_finance_sku_daily' },
+  { mall: 'linegift', table: 'mirror_linegift_finance_sku_daily' },
+  { mall: 'qoo10', table: 'mirror_qoo10_finance_sku_daily' },
+];
+router.get('/api/products/:code/mall-sales', (req, res) => {
+  try {
+    const code = trimS(req.params.code);
+    if (!code) return res.status(400).json({ ok: false, error: '商品コードが必要です' });
+    const daysParam = parseInt(req.query.days, 10);
+    const days = [30, 90, 180, 365].includes(daysParam) ? daysParam : 90;
+    const db = getDB();
+
+    // 速報 (NE受注ベース・モール別 7/30日)
+    const sokuho = db.prepare(`
+      SELECT mall, qty_7d, qty_30d, as_of_date
+      FROM mirror_f_sales_velocity_by_product_mall
+      WHERE LOWER(TRIM(商品コード)) = LOWER(TRIM(?))
+      ORDER BY qty_30d DESC, qty_7d DESC
+    `).all(code).map(r => ({ mall: r.mall, label: MALL_LABELS[r.mall] || r.mall, qty7: r.qty_7d, qty30: r.qty_30d, asOf: r.as_of_date }));
+
+    // 確定 (finance fact)。期間 = 全モール fact の最新日から days 日
+    let maxDate = null;
+    for (const t of ['mirror_amazon_finance_sku_daily', ...FIN_MALLS.map(c => c.table)]) {
+      const r = db.prepare(`SELECT MAX(date_jst) d FROM ${t}`).get();
+      if (r && r.d && (!maxDate || r.d > maxDate)) maxDate = r.d;
+    }
+    const finance = { available: !!maxDate, days, start: null, end: null, rows: [] };
+    if (maxDate) {
+      const end = maxDate;
+      const start = new Date(Date.parse(end + 'T00:00:00Z') - (days - 1) * 86400000).toISOString().slice(0, 10);
+      finance.start = start; finance.end = end;
+      const acc = new Map(); // mallKey -> pieces
+      const add = (k, pieces) => acc.set(k, (acc.get(k) || 0) + pieces);
+      // このNEコード自身 + このNEコードを構成品に含むセット商品 (qty=構成数量)
+      const keyQty = new Map([[code.toLowerCase().trim(), 1]]);
+      for (const r of db.prepare('SELECT セット商品コード sc, 数量 q FROM mirror_set_components WHERE LOWER(TRIM(構成商品コード)) = LOWER(TRIM(?))').all(code)) {
+        keyQty.set(String(r.sc).toLowerCase().trim(), r.q || 1);
+      }
+      const keys = [...keyQty.keys()];
+      const ph = keys.map(() => '?').join(',');
+      for (const c of FIN_MALLS) {
+        const rows = db.prepare(`
+          SELECT LOWER(TRIM(ne_code)) ne, SUM(CAST(units_net_sold AS REAL)) u
+          FROM ${c.table}
+          WHERE date_jst BETWEEN ? AND ? AND LOWER(TRIM(ne_code)) IN (${ph})
+          GROUP BY LOWER(TRIM(ne_code))
+        `).all(start, end, ...keys);
+        for (const r of rows) add(c.mall, (r.u || 0) * (keyQty.get(r.ne) || 1));
+      }
+      // Amazon: seller_sku を構成解決 (mirror_sku_resolved)。FBA/FBM は行(日)単位の手数料発生有無で推定
+      // (SKU単位で合算してから判定すると期間内にFBA/FBM混在したSKUが全量FBAに寄る、Codex P7-1)
+      const amzKeys = db.prepare('SELECT LOWER(TRIM(seller_sku)) k, quantity q FROM mirror_sku_resolved WHERE LOWER(TRIM(ne_code)) = LOWER(TRIM(?))').all(code);
+      if (amzKeys.length) {
+        const qBySku = new Map(amzKeys.map(r => [r.k, r.q || 1]));
+        const keys2 = [...qBySku.keys()];
+        const ph2 = keys2.map(() => '?').join(',');
+        const rows = db.prepare(`
+          SELECT LOWER(TRIM(seller_sku)) k,
+                 (COALESCE(fba_fulfillment_jpy,0) + COALESCE(fba_storage_jpy,0)) > 0 isFba,
+                 SUM(CAST(units_net_sold AS REAL)) u
+          FROM mirror_amazon_finance_sku_daily
+          WHERE date_jst BETWEEN ? AND ? AND LOWER(TRIM(seller_sku)) IN (${ph2})
+          GROUP BY LOWER(TRIM(seller_sku)), isFba
+        `).all(start, end, ...keys2);
+        for (const r of rows) add(r.isFba ? 'amazon_fba' : 'amazon_fbm', (r.u || 0) * (qBySku.get(r.k) || 1));
+      }
+      finance.rows = [...acc.entries()]
+        .map(([mall, pieces]) => ({ mall, label: MALL_LABELS[mall] || mall, pieces: Math.round(pieces * 10) / 10 }))
+        .filter(r => r.pieces > 0)
+        .sort((a, b) => b.pieces - a.pieces);
+    }
+    res.json({ ok: true, code, sokuho: { rows: sokuho, asOf: sokuho.length ? sokuho[0].asOf : null }, finance });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
 // ═══════════════════════════ 画面 ═══════════════════════════
 
 const CSS = `
@@ -943,6 +1030,8 @@ const CSS = `
   .gg .bar { width: 140px; height: 8px; border-radius: 999px; background: #e8edf3; overflow: hidden; display: inline-block; vertical-align: middle; flex: none; }
   .gg .bar > span { display: block; height: 100%; background: linear-gradient(90deg,#f0a94b,#e0872b); border-radius: 999px; transition: width .3s; }
   .gg.met .bar > span { background: linear-gradient(90deg,#4ade80,#16a34a); }
+  .gg.over .bar > span { background: linear-gradient(90deg,#f87171,#dc2626); }
+  .gg.over { color: var(--danger); }
   tr.ghead td { background: var(--accent-soft) !important; border-top: 2px solid #cfe0fb; padding: 9px 10px; }
   tr.ghead .gname { font-weight: 700; font-size: 13px; }
   tr.ghead .ggwrap { float: right; }
@@ -1320,6 +1409,15 @@ function barHtml(cur, req, label, remain) {
   return '<span class="gg' + (met ? ' met' : '') + '">' + label + (met ? ' ✅' : ' — <b>' + remain + '</b>') +
     '<span class="bar"><span style="width:' + pct + '%"></span></span></span>';
 }
+// 上限ゲージ (出荷制限)。上限以下=OK(緑)、超過=赤
+function capBarHtml(cur, cap, unit) {
+  var over = cur > cap;
+  var pct = Math.min(100, cap > 0 ? cur / cap * 100 : 100);
+  return '<span class="gg' + (over ? ' over' : ' met') + '">' +
+    cur.toLocaleString('ja-JP') + ' / 上限 ' + cap.toLocaleString('ja-JP') + esc(unit || '個') +
+    (over ? ' — <b>⚠ ' + (cur - cap).toLocaleString('ja-JP') + esc(unit || '個') + ' 超過</b>' : ' ✅') +
+    '<span class="bar"><span style="width:' + pct + '%"></span></span></span>';
+}
 function gaugeHtml(k) {
   var items = cartItems();
   if (k.slice(0, 2) === 'c:') {
@@ -1332,6 +1430,8 @@ function gaugeHtml(k) {
       return barHtml(sumA, c.conditionValue, yen(sumA) + ' / ' + yen(c.conditionValue), 'あと ' + yen(Math.max(0, c.conditionValue - sumA)));
     if (c.conditionType === '数量' && (c.unit === '個' || !c.unit))
       return barHtml(sumQ, c.conditionValue, sumQ.toLocaleString('ja-JP') + ' / ' + c.conditionValue.toLocaleString('ja-JP') + ' 個', 'あと ' + Math.max(0, c.conditionValue - sumQ).toLocaleString('ja-JP') + ' 個');
+    if (c.conditionType === '上限')
+      return capBarHtml(sumQ, c.conditionValue, c.unit);
     return '<span class="badge b-warn">条件 ' + esc(c.conditionType) + ' ' + c.conditionValue.toLocaleString('ja-JP') + esc(c.unit || '') + ' (手動確認)</span>' +
       ' <span class="muted">現在 ' + sumQ.toLocaleString('ja-JP') + '個 / ' + yen(sumA) + '</span>';
   }
@@ -1477,6 +1577,8 @@ function condCheck() {
       if (sumA < c.conditionValue) unmet.push(c.displayName + ': あと ' + yen(c.conditionValue - sumA));
     } else if (c.conditionType === '数量' && (c.unit === '個' || !c.unit)) {
       if (sumQ < c.conditionValue) unmet.push(c.displayName + ': あと ' + (c.conditionValue - sumQ).toLocaleString('ja-JP') + ' 個');
+    } else if (c.conditionType === '上限') {
+      if (sumQ > c.conditionValue) unmet.push('🚫出荷制限超過 ' + c.displayName + ': 上限 ' + c.conditionValue.toLocaleString('ja-JP') + (c.unit || '個') + ' に対し ' + sumQ.toLocaleString('ja-JP') + ' (' + (sumQ - c.conditionValue).toLocaleString('ja-JP') + ' 超過)');
     } else {
       manual.push(c.displayName + ' (条件 ' + c.conditionType + ' ' + c.conditionValue.toLocaleString('ja-JP') + (c.unit || '') + ')');
     }
@@ -1606,6 +1708,7 @@ function save(issue) {
       msg = '⚠️ 未達の発注条件があります:\\n・' + cc.unmet.join('\\n・') + '\\n\\nこのまま確定しますか?';
     }
     if (cc.manual.length) msg += '\\n\\n※手動確認が必要な条件: ' + cc.manual.join(' / ');
+    if (D.supplier.memo) msg += '\\n\\n📌 発注メモ: ' + D.supplier.memo;
     if (!confirm(msg)) return;
   }
   // 二重送信ガード (確定連打で同内容の発注が複数作られるのを防ぐ)
@@ -1784,7 +1887,7 @@ function render() {
     return '<th' + (c.r ? ' class="r"' : '') + ' data-sort="' + c.k + '" style="cursor:pointer">' + c.l + arrow + '</th>';
   }).join('') + '</tr>';
   list.slice(0, shown).forEach(function(r) {
-    h += '<tr><td>' + esc(r.c) + '</td><td>' + esc(r.n) + '</td>' +
+    h += '<tr><td>' + esc(r.c) + '</td><td><a class="pname" data-acc="' + esc(r.c) + '" title="クリックでモール別販売内訳">' + esc(r.n) + '</a></td>' +
       '<td><a href="/apps/purchase-orders/supplier/' + encodeURIComponent(r.s) + '">' + esc(SUP[r.s] || r.s || '—') + '</a></td>' +
       '<td>' + stateBadge(r) + '</td>' +
       '<td class="r">' + (r.st == null ? '—' : r.st.toLocaleString('ja-JP')) + '</td>' +
@@ -1805,10 +1908,74 @@ function render() {
   }
   document.getElementById('tbl').innerHTML = h;
 }
+// ── 商品名クリック → モール別販売内訳 (速報7/30日 + 確定30〜365日) ──
+function mallBoxHtml(code, j, days) {
+  var h = '<div class="accbox">';
+  h += '<div style="font-size:13px"><b>📈 速報モール別 (NE受注ベース・毎朝更新' + (j.sokuho.asOf ? '、' + esc(j.sokuho.asOf) + ' 時点' : '') + ')</b></div>';
+  if (!j.sokuho.rows.length) h += '<div class="muted" style="margin-top:4px">直近30日のNE受注なし (または速報マート未同期)</div>';
+  else {
+    var t7 = 0, t30 = 0;
+    h += '<table class="t sub"><tr><th>モール</th><th class="r">7日</th><th class="r">30日</th></tr>';
+    j.sokuho.rows.forEach(function(r) {
+      t7 += r.qty7; t30 += r.qty30;
+      h += '<tr><td>' + esc(r.label) + '</td><td class="r">' + r.qty7.toLocaleString('ja-JP') + '</td><td class="r">' + r.qty30.toLocaleString('ja-JP') + '</td></tr>';
+    });
+    h += '<tr><td><b>合計</b></td><td class="r"><b>' + t7.toLocaleString('ja-JP') + '</b></td><td class="r"><b>' + t30.toLocaleString('ja-JP') + '</b></td></tr></table>';
+  }
+  h += '<div class="accg"><b>🏪 長期モール別販売ピース数 (確定データ・セット構成展開)</b> ' +
+    '期間: <select class="msDays" data-mscode="' + esc(code) + '">' +
+    [30, 90, 180, 365].map(function(d){ return '<option value="' + d + '"' + (d === days ? ' selected' : '') + '>直近' + d + '日</option>'; }).join('') +
+    '</select>';
+  if (!j.finance.available) h += '<div class="muted" style="margin-top:4px">モール別確定データ未同期</div>';
+  else {
+    h += ' <span class="muted">(' + esc(j.finance.start) + ' 〜 ' + esc(j.finance.end) + '。精算/受注factをNEコードに名寄せ、3個セット1件=3個。メルカリ・卸は確定マート未整備のため上の速報のみ)</span>';
+    if (!j.finance.rows.length) h += '<div class="muted" style="margin-top:4px">この期間の販売なし</div>';
+    else {
+      var tp = 0;
+      h += '<table class="t sub"><tr><th>モール</th><th class="r">ピース数</th><th class="r">日平均</th></tr>';
+      j.finance.rows.forEach(function(r) {
+        tp += r.pieces;
+        h += '<tr><td>' + esc(r.label) + '</td><td class="r">' + r.pieces.toLocaleString('ja-JP') + '</td><td class="r">' + (Math.round(r.pieces / j.finance.days * 100) / 100).toFixed(2) + '</td></tr>';
+      });
+      h += '<tr><td><b>合計</b></td><td class="r"><b>' + (Math.round(tp * 10) / 10).toLocaleString('ja-JP') + '</b></td><td class="r"><b>' + (Math.round(tp / j.finance.days * 100) / 100).toFixed(2) + '</b></td></tr></table>';
+    }
+  }
+  h += '</div></div>';
+  return h;
+}
+function loadMallSales(code, days, td) {
+  td.innerHTML = '<div class="muted" style="padding:8px">モール別販売を読み込み中…</div>';
+  fetch('/apps/purchase-orders/api/products/' + encodeURIComponent(code) + '/mall-sales?days=' + days)
+    .then(function(r){ return r.json(); })
+    .then(function(j) {
+      if (!j.ok) { td.innerHTML = '<div class="muted" style="padding:8px">エラー: ' + esc(j.error) + '</div>'; return; }
+      td.innerHTML = mallBoxHtml(code, j, days);
+    })
+    .catch(function(e){ td.innerHTML = '<div class="muted" style="padding:8px">通信エラー: ' + esc(e.message) + '</div>'; });
+}
 document.addEventListener('input', function(ev){ if (ev.target.id === 'q') { shown = CAP; render(); } });
-document.addEventListener('change', function(ev){ if (['fAct','fState','fSup'].indexOf(ev.target.id) >= 0) { shown = CAP; render(); } });
+document.addEventListener('change', function(ev) {
+  if (['fAct','fState','fSup'].indexOf(ev.target.id) >= 0) { shown = CAP; render(); return; }
+  if (ev.target.classList && ev.target.classList.contains('msDays')) {
+    loadMallSales(ev.target.getAttribute('data-mscode'), parseInt(ev.target.value, 10), ev.target.closest('td'));
+  }
+});
 document.addEventListener('click', function(ev) {
   if (ev.target.id === 'btnMore') { shown += CAP; render(); return; }
+  var acc = ev.target.getAttribute && ev.target.getAttribute('data-acc');
+  if (acc) {
+    var tr = ev.target.closest('tr');
+    var next = tr && tr.nextElementSibling;
+    if (next && next.classList.contains('accrow')) { next.parentNode.removeChild(next); return; }
+    var nr = document.createElement('tr');
+    nr.className = 'accrow';
+    var td = document.createElement('td');
+    td.colSpan = tr.children.length;
+    nr.appendChild(td);
+    tr.parentNode.insertBefore(nr, tr.nextSibling);
+    loadMallSales(acc, 90, td);
+    return;
+  }
   var k = ev.target.getAttribute && ev.target.getAttribute('data-sort');
   if (!k) return;
   var col = null;

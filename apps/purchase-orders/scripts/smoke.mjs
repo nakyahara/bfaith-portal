@@ -14,7 +14,7 @@ const imp = p => import(pathToFileURL(path.join(WORK, p)).href);
 const { initMirrorDB } = await imp('apps/warehouse-mirror/db.js');
 initMirrorDB(); // 本番では server.js (warehouse-mirror router import) が起動時に実行する
 const { getDB } = await imp('apps/purchase-orders/db.js');
-const { computeProduct, stockConstant } = await imp('apps/purchase-orders/logic.js');
+const { computeProduct, stockConstant, evaluateCondition } = await imp('apps/purchase-orders/logic.js');
 const routerMod = await imp('apps/purchase-orders/router.js');
 const express = (await import('express')).default;
 
@@ -337,6 +337,62 @@ ok(r.body.ok && r.body.rows.every(x => x.code !== '0726-001060'), '古い商品�
 r = await j('/api/attrs/unlinked?days=0');
 ok(r.body.ok && typeof r.body.totalUnlinked === 'number', 'days=0 で全件モード');
 
+console.log('── 上限条件 (出荷制限) ──');
+{
+  const cap = { condition_type: '上限', condition_value: 300, unit: '枚' };
+  const keys = new Set(['biwako-ki']);
+  let ev = evaluateCondition(cap, keys, [{ key: 'biwako-ki', qty: 300, cost: 100 }]);
+  ok(ev.auto && ev.auto.kind === 'cap' && ev.auto.met === true, '上限: ちょうど300はOK', ev.auto);
+  ev = evaluateCondition(cap, keys, [{ key: 'biwako-ki', qty: 360, cost: 100 }]);
+  ok(ev.auto && ev.auto.met === false, '上限: 360は超過でNG', ev.auto);
+}
+
+console.log('── 商品別モール販売内訳 API ──');
+{
+  const now = new Date().toISOString();
+  const today = now.slice(0, 10);
+  // 速報 (NE受注ベース)
+  db.prepare(`INSERT INTO mirror_f_sales_velocity_by_product_mall (商品コード, mall, qty_7d, qty_30d, as_of_date, synced_at) VALUES (?,?,?,?,?,?)`)
+    .run('noflyersticker', 'rakuten', 5, 20, today, now);
+  db.prepare(`INSERT INTO mirror_f_sales_velocity_by_product_mall (商品コード, mall, qty_7d, qty_30d, as_of_date, synced_at) VALUES (?,?,?,?,?,?)`)
+    .run('noflyersticker', 'amazon_fba', 3, 10, today, now);
+  // 確定: 楽天 直接 (ne_code=自身) 2個 + セット経由 (3個セット×2件=6個)
+  db.prepare(`INSERT INTO mirror_set_components (セット商品コード, 構成商品コード, 数量, updated_at) VALUES ('noflyset3', 'noflyersticker', 3, ?)`).run(now);
+  // NOT NULL/CHECK制約の多いミラーfact表に最小fixtureを入れる汎用insert
+  const insFact = (table, want) => {
+    const cols = db.prepare(`SELECT * FROM pragma_table_info('${table}') WHERE "notnull"=1 AND dflt_value IS NULL AND pk=0`).all().map(c => c.name);
+    const vals = { ...want };
+    for (const c of cols) if (!(c in vals)) {
+      if (c.includes('quality')) vals[c] = 'actual';
+      else if (c === 'cost_status') vals[c] = 'complete';
+      else if (c === 'sku_resolution') vals[c] = 'resolved';
+      else if (c.includes('_at') || c.includes('date')) vals[c] = now;
+      else vals[c] = 0;
+    }
+    const names = Object.keys(vals);
+    db.prepare(`INSERT INTO ${table} (${names.join(',')}) VALUES (${names.map(n => '@' + n).join(',')})`).run(vals);
+  };
+  insFact('mirror_rakuten_finance_sku_daily', { date_jst: today, rakuten_code: 'rk-nofly', ne_code: 'noflyersticker', sku_resolution: 'resolved', units_net_sold: 2 });
+  insFact('mirror_rakuten_finance_sku_daily', { date_jst: today, rakuten_code: 'rk-noflyset', ne_code: 'noflyset3', sku_resolution: 'resolved', units_net_sold: 2 });
+  // 確定: Amazon (sku_resolved経由)。同一SKUでFBA日とFBM日が混在するケース
+  db.prepare(`INSERT INTO mirror_sku_resolved (seller_sku, ne_code, quantity, source, synced_at) VALUES ('AMZ-NOFLY', 'noflyersticker', 1, 'master', ?)`).run(now);
+  const yesterday = new Date(Date.parse(today + 'T00:00:00Z') - 86400000).toISOString().slice(0, 10);
+  insFact('mirror_amazon_finance_sku_daily', { date_jst: today, seller_sku: 'AMZ-NOFLY', units_net_sold: 4, fba_fulfillment_jpy: 500 });
+  insFact('mirror_amazon_finance_sku_daily', { date_jst: yesterday, seller_sku: 'AMZ-NOFLY', units_net_sold: 3, fba_fulfillment_jpy: 0 });
+
+  r = await j('/api/products/noflyersticker/mall-sales?days=90');
+  ok(r.status === 200 && r.body.ok, 'mall-sales API 200', r.body);
+  ok(r.body.sokuho.rows.length === 2 && r.body.sokuho.rows[0].qty30 === 20, '速報: モール別 7/30日', r.body.sokuho.rows);
+  const fin = {};
+  r.body.finance.rows.forEach(x => { fin[x.mall] = x.pieces; });
+  ok(fin.rakuten === 8, '確定: 楽天 直接2 + セット3×2=8ピース', fin);
+  ok(fin.amazon_fba === 4 && fin.amazon_fbm === 3, '確定: Amazon FBA4/FBM3 (同一SKU混在を行単位で判定)', fin);
+  r = await j('/api/products/noflyersticker/mall-sales?days=9999');
+  ok(r.status === 200 && r.body.finance.days === 90, '不正daysは90にフォールバック', r.body.finance && r.body.finance.days);
+  r = await j('/api/products/zzz-nonexistent/mall-sales');
+  ok(r.status === 200 && r.body.sokuho.rows.length === 0, '存在しない商品コードは空で200');
+}
+
 console.log('── 画面 (HTML) ──');
 for (const p of ['/', '/supplier/1', '/products', '/orders', '/admin']) {
   const res = await fetch(base + p);
@@ -344,12 +400,13 @@ for (const p of ['/', '/supplier/1', '/products', '/orders', '/admin']) {
   ok(res.status === 200 && html.includes('<!DOCTYPE html>'), `GET ${p} → 200 HTML`);
   ok(!html.includes('undefined') || p === '/', `GET ${p} に undefined 露出なし`);
 }
-// 全商品情報: PML全行が埋め込まれる (取扱中止含む) + 仕入先名map
+// 全商品情報: PML全行が埋め込まれる (取扱中止含む) + 仕入先名map + モール別内訳UI
 {
   const res = await fetch(base + '/products');
   const html = await res.text();
   ok(html.includes('noflyersticker') && html.includes('全商品情報'), '/products にPML商品が埋め込まれる');
   ok(html.includes('"t":1') || html.includes('"h":1'), '/products に要発注/掘り起こしフラグ');
+  ok(html.includes('mall-sales') && html.includes('mallBoxHtml') && html.includes('msDays'), '/products 商品名クリック→モール別販売内訳のJSを配信');
 }
 // 仕入先ページ: グループ化アコーディオン+下部固定バー+シミュレーション+検索 (カート/独立条件セクション廃止)
 {
