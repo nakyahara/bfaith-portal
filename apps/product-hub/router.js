@@ -18,7 +18,7 @@ import {
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS,
 } from './db.js';
 import { parseDriveLink, thumbnailUrl, fileViewUrl } from './lib/drive-link.js';
-import { attemptCardCreation, retryPendingCards, pendingCardCount } from './services/notion-card.js';
+import { attemptCardCreation, retryPendingCards, pendingCardCount, syncCardLinks } from './services/notion-card.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
@@ -168,14 +168,19 @@ router.post('/api/drafts', async (req, res) => {
   if (officialUrl && !isHttpUrl(officialUrl)) {
     return res.status(400).json({ ok: false, error: '公式ページURLの形式が不正です (http/https)' });
   }
+  const amazonUrlCreate = cleanText(req.body?.amazon_url, 1000);
+  if (amazonUrlCreate && !isHttpUrl(amazonUrlCreate)) {
+    return res.status(400).json({ ok: false, error: 'Amazon URLの形式が不正です (http/https)' });
+  }
 
   const db = getDB();
   let draftId;
   try {
     const info = db.prepare(`
-      INSERT INTO product_drafts (ne_code, name, official_url, price, jan_code, created_by)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(neCode, name, officialUrl, sanitizeMoney(req.body?.price), cleanText(req.body?.jan_code, 20), actorOf(req));
+      INSERT INTO product_drafts (ne_code, name, official_url, price, jan_code, asin, amazon_url, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(neCode, name, officialUrl, sanitizeMoney(req.body?.price), cleanText(req.body?.jan_code, 20),
+      cleanText(req.body?.asin, 20), amazonUrlCreate, actorOf(req));
     draftId = info.lastInsertRowid;
   } catch (e) {
     if (String(e.message).includes('UNIQUE')) {
@@ -190,7 +195,7 @@ router.post('/api/drafts', async (req, res) => {
   res.json({ ok: true, id: draftId, notion });
 });
 
-router.post('/api/drafts/:id', (req, res) => {
+router.post('/api/drafts/:id', async (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
   const db = getDB();
@@ -231,7 +236,9 @@ router.post('/api/drafts/:id', (req, res) => {
   logEvent(db, draft.id, 'updated', null, actorOf(req));
   // ゲート必須項目 (公式URL等) を消したら ready_for_ai を draft に自動差し戻し (Codex R1 high)
   const demoted = demoteIfGateBroken(db, draft.id, actorOf(req));
-  res.json({ ok: true, demoted: demoted || undefined });
+  // 既存 Notion カードへ URL 項目を再同期 (fail-soft — 失敗しても保存は成功のまま)
+  const notionSync = await syncCardLinks(draft.id, { actor: actorOf(req) });
+  res.json({ ok: true, demoted: demoted || undefined, notion_sync: notionSync.outcome });
 });
 
 // ─── API: 参考URL / 画像 / 仕様表 / AI出力 ─────────────────

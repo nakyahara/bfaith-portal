@@ -110,6 +110,25 @@ db.prepare(`UPDATE product_drafts SET status = 'draft' WHERE id = ?`).run(draft.
 // ─── notion-card fail-closed (env 未設定 → failed で残り、登録は無事) ───
 delete process.env.RYS_NOTION_TOKEN;
 const notionCard = await import('../services/notion-card.js');
+
+// buildProperties: 公式URL/Amazon URL が url 型プロパティで含まれる (2026-07-05 修正の回帰チェック)
+const props = notionCard.buildProperties({
+  name: 'テスト', ne_code: 'X-1', price: 1980, jan_code: '4901234567890',
+  official_url: 'https://example.com/official', amazon_url: 'https://www.amazon.co.jp/dp/B0TEST',
+});
+check('buildProperties includes メーカーページURL', props['メーカーページURL']?.url === 'https://example.com/official');
+check('buildProperties includes amazon販売ページ', props['amazon販売ページ']?.url === 'https://www.amazon.co.jp/dp/B0TEST');
+const propsNoUrl = notionCard.buildProperties({ name: 'テスト', ne_code: 'X-2' });
+check('buildProperties omits URL props when empty', !('メーカーページURL' in propsNoUrl) && !('amazon販売ページ' in propsNoUrl));
+
+// syncCardLinks: カード未作成なら no_card / カードありで API 失敗なら fail-soft
+check('syncCardLinks no_card', (await notionCard.syncCardLinks(draft.id, { actor: 'smoke' })).outcome === 'no_card');
+db.prepare(`UPDATE product_drafts SET notion_page_id = 'fake-page-id' WHERE id = ?`).run(draft.id);
+const syncFail = await notionCard.syncCardLinks(draft.id, { actor: 'smoke' });
+check('syncCardLinks fail-soft (env欠落)', syncFail.outcome === 'failed' && !!syncFail.error, JSON.stringify(syncFail));
+check('syncCardLinks failure logged', db.prepare(`SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'notion_card_sync_failed'`).get(draft.id).c === 1);
+db.prepare(`UPDATE product_drafts SET notion_page_id = NULL WHERE id = ?`).run(draft.id);
+
 const attempt = await notionCard.attemptCardCreation(draft.id, { actor: 'smoke' });
 check('notion attempt fails safely', attempt.outcome === 'failed', JSON.stringify(attempt));
 const after = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draft.id);
