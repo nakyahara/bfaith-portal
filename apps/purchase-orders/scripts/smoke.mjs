@@ -374,9 +374,11 @@ console.log('── 商品別モール販売内訳 API ──');
   };
   insFact('mirror_rakuten_finance_sku_daily', { date_jst: today, rakuten_code: 'rk-nofly', ne_code: 'noflyersticker', sku_resolution: 'resolved', units_net_sold: 2 });
   insFact('mirror_rakuten_finance_sku_daily', { date_jst: today, rakuten_code: 'rk-noflyset', ne_code: 'noflyset3', sku_resolution: 'resolved', units_net_sold: 2 });
-  // 確定: Amazon FBA (sku_resolved経由、fba手数料あり)
+  // 確定: Amazon (sku_resolved経由)。同一SKUでFBA日とFBM日が混在するケース
   db.prepare(`INSERT INTO mirror_sku_resolved (seller_sku, ne_code, quantity, source, synced_at) VALUES ('AMZ-NOFLY', 'noflyersticker', 1, 'master', ?)`).run(now);
+  const yesterday = new Date(Date.parse(today + 'T00:00:00Z') - 86400000).toISOString().slice(0, 10);
   insFact('mirror_amazon_finance_sku_daily', { date_jst: today, seller_sku: 'AMZ-NOFLY', units_net_sold: 4, fba_fulfillment_jpy: 500 });
+  insFact('mirror_amazon_finance_sku_daily', { date_jst: yesterday, seller_sku: 'AMZ-NOFLY', units_net_sold: 3, fba_fulfillment_jpy: 0 });
 
   r = await j('/api/products/noflyersticker/mall-sales?days=90');
   ok(r.status === 200 && r.body.ok, 'mall-sales API 200', r.body);
@@ -384,7 +386,7 @@ console.log('── 商品別モール販売内訳 API ──');
   const fin = {};
   r.body.finance.rows.forEach(x => { fin[x.mall] = x.pieces; });
   ok(fin.rakuten === 8, '確定: 楽天 直接2 + セット3×2=8ピース', fin);
-  ok(fin.amazon_fba === 4, '確定: Amazon FBA 4ピース (sku_resolved+fee判定)', fin);
+  ok(fin.amazon_fba === 4 && fin.amazon_fbm === 3, '確定: Amazon FBA4/FBM3 (同一SKU混在を行単位で判定)', fin);
   r = await j('/api/products/noflyersticker/mall-sales?days=9999');
   ok(r.status === 200 && r.body.finance.days === 90, '不正daysは90にフォールバック', r.body.finance && r.body.finance.days);
   r = await j('/api/products/zzz-nonexistent/mall-sales');

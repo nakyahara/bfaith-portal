@@ -922,19 +922,22 @@ router.get('/api/products/:code/mall-sales', (req, res) => {
         `).all(start, end, ...keys);
         for (const r of rows) add(c.mall, (r.u || 0) * (keyQty.get(r.ne) || 1));
       }
-      // Amazon: seller_sku を構成解決 (mirror_sku_resolved)。FBA/FBM は手数料発生有無で推定
-      const amzKeys = db.prepare('SELECT seller_sku k, quantity q FROM mirror_sku_resolved WHERE LOWER(TRIM(ne_code)) = LOWER(TRIM(?))').all(code);
+      // Amazon: seller_sku を構成解決 (mirror_sku_resolved)。FBA/FBM は行(日)単位の手数料発生有無で推定
+      // (SKU単位で合算してから判定すると期間内にFBA/FBM混在したSKUが全量FBAに寄る、Codex P7-1)
+      const amzKeys = db.prepare('SELECT LOWER(TRIM(seller_sku)) k, quantity q FROM mirror_sku_resolved WHERE LOWER(TRIM(ne_code)) = LOWER(TRIM(?))').all(code);
       if (amzKeys.length) {
         const qBySku = new Map(amzKeys.map(r => [r.k, r.q || 1]));
-        const ph2 = amzKeys.map(() => '?').join(',');
+        const keys2 = [...qBySku.keys()];
+        const ph2 = keys2.map(() => '?').join(',');
         const rows = db.prepare(`
-          SELECT seller_sku k, SUM(CAST(units_net_sold AS REAL)) u,
-                 SUM(COALESCE(fba_fulfillment_jpy,0) + COALESCE(fba_storage_jpy,0)) fee
+          SELECT LOWER(TRIM(seller_sku)) k,
+                 (COALESCE(fba_fulfillment_jpy,0) + COALESCE(fba_storage_jpy,0)) > 0 isFba,
+                 SUM(CAST(units_net_sold AS REAL)) u
           FROM mirror_amazon_finance_sku_daily
-          WHERE date_jst BETWEEN ? AND ? AND seller_sku IN (${ph2})
-          GROUP BY seller_sku
-        `).all(start, end, ...amzKeys.map(r => r.k));
-        for (const r of rows) add(r.fee > 0 ? 'amazon_fba' : 'amazon_fbm', (r.u || 0) * (qBySku.get(r.k) || 1));
+          WHERE date_jst BETWEEN ? AND ? AND LOWER(TRIM(seller_sku)) IN (${ph2})
+          GROUP BY LOWER(TRIM(seller_sku)), isFba
+        `).all(start, end, ...keys2);
+        for (const r of rows) add(r.isFba ? 'amazon_fba' : 'amazon_fbm', (r.u || 0) * (qBySku.get(r.k) || 1));
       }
       finance.rows = [...acc.entries()]
         .map(([mall, pieces]) => ({ mall, label: MALL_LABELS[mall] || mall, pieces: Math.round(pieces * 10) / 10 }))
@@ -1925,7 +1928,7 @@ function mallBoxHtml(code, j, days) {
     '</select>';
   if (!j.finance.available) h += '<div class="muted" style="margin-top:4px">モール別確定データ未同期</div>';
   else {
-    h += ' <span class="muted">(' + esc(j.finance.start) + ' 〜 ' + esc(j.finance.end) + '。精算/受注factをNEコードに名寄せ、3個セット1件=3個)</span>';
+    h += ' <span class="muted">(' + esc(j.finance.start) + ' 〜 ' + esc(j.finance.end) + '。精算/受注factをNEコードに名寄せ、3個セット1件=3個。メルカリ・卸は確定マート未整備のため上の速報のみ)</span>';
     if (!j.finance.rows.length) h += '<div class="muted" style="margin-top:4px">この期間の販売なし</div>';
     else {
       var tp = 0;
