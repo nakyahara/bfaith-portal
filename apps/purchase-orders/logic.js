@@ -223,8 +223,9 @@ export function computeAll() {
 }
 
 /**
- * 発注条件の充足評価 (自動判定は 数量[個] / 金額[円] のみ。他タイプは表示専用)。
- * items: [{key, qty, cost}] — カート内容 (qty=発注数量, cost=単価原価)
+ * 発注条件の充足評価 (自動判定は 数量[個]=下限 / 金額[円]=下限 / 上限=数量上限。他タイプは表示専用)。
+ * 「上限」= 仕入先の出荷制限 (例: びわこふきん300枚まで)。数量が条件値以下なら met。
+ * items: [{key, qty, cost}] — 発注内容 (qty=発注数量, cost=単価原価)
  */
 export function evaluateCondition(cond, memberKeys, items) {
   const inGroup = items.filter(i => memberKeys.has(i.key));
@@ -235,6 +236,8 @@ export function evaluateCondition(cond, memberKeys, items) {
     auto = { current: sumQty, required: cond.condition_value, met: sumQty >= cond.condition_value, kind: 'qty' };
   } else if (cond.condition_type === '金額') {
     auto = { current: sumAmount, required: cond.condition_value, met: sumAmount >= cond.condition_value, kind: 'amount' };
+  } else if (cond.condition_type === '上限') {
+    auto = { current: sumQty, required: cond.condition_value, met: sumQty <= cond.condition_value, kind: 'cap' };
   }
   return { sumQty, sumAmount, auto };
 }
