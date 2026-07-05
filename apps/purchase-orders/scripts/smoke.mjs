@@ -422,6 +422,17 @@ console.log('── 選べるセット構成 / 月次上限 / bind ──');
   ok(r.status === 200, 'bind: 条件解除もできる');
   r = await j('/api/attrs/bind', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ product_code: 'diyorangeoil100', condition_id: 'NOEXIST' }) });
   ok(r.status === 400, 'bind: 未登録グループは400 (fail-closed)');
+  r = await j('/api/attrs/bind', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ product_code: 'ghost-product-xyz', condition_id: 'KMC' }) });
+  ok(r.status === 400 && r.body.error.includes('PML'), 'bind: PML非存在の商品コードは400 (Codex P9 High)');
+
+  // マスタAPIのユーザビリティ: attrs/selectableに商品名、conditionsに仕入先名が付く
+  r = await j('/api/masters/attrs');
+  const oilNamed = r.body.rows.find(x => x.product_key === 'diyorangeoil100');
+  ok(oilNamed && oilNamed.商品名 && oilNamed.商品名.length > 0, 'masters/attrs に商品名が付与される', oilNamed && oilNamed.商品名);
+  r = await j('/api/masters/conditions');
+  ok(r.body.rows.some(x => x.仕入先名 === 'アメージングクラフト様'), 'masters/conditions に仕入先名が付与される (placeholder上書きバグの回帰込み)');
+  r = await j('/api/masters/selectable');
+  ok(r.body.rows.every(x => '商品名' in x), 'masters/selectable に商品名列');
 
   // 選べるセットCSV取込 (自動判別、同一商品の複数セットはセット名を束ねる)
   const fdSel = new FormData();
@@ -458,6 +469,8 @@ for (const p of ['/', '/supplier/1', '/products', '/orders', '/admin']) {
   ok(html.includes('pageQ') && html.includes('applySearch'), '/supplier ページ内商品検索 (debounce再描画方式)');
   ok(html.includes('data-dis') && html.includes('data-undis'), '/supplier 要発注の✕非表示+戻す');
   ok(html.includes('bindSave') && html.includes('bindCond'), '/supplier アコーディオンからグループ紐付け');
+  ok(html.includes('gaddQ') && html.includes('data-gadd'), '/supplier グループへの商品追加検索');
+  ok(html.includes('needAll') && html.includes('(この商品)'), '/supplier 必要数一括コピー+同グループ表に自分自身');
   ok(html.includes('issuedMonthFor'), '/supplier 上限=月次累計 (今月確定分込み)');
   ok(html.includes('overflow: clip'), 'テーブル見出しsticky (secのoverflow:hidden廃止)');
   ok(html.includes('追加発注候補') && !html.includes('ついで買い'), '/supplier 「ついで買い」→「追加発注候補」に改名');
