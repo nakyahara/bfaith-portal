@@ -274,6 +274,12 @@ app.use((req, res, next) => {
     // mirror read API (GET専用、監査S-2で認証追加) への POST も認証前 body parse を避ける
     // (POST は router 側に route が無く 404 になるだけなので parse 不要)。
     if (/^\/apps\/mirror\/api\/(products|sales|status|download)(\/|$)/.test(normalizedPath)) return next();
+    // 会計系 /import-history (監査S-4でアプリ別envトークン化) は requireImportKey 認証後に
+    // 専用 parser (importJsonParser) が走るため、認証前 body parse を避ける。
+    if (/^\/apps\/[a-z0-9-]+-accounting\/import-history$/.test(normalizedPath)) return next();
+    // mgmt-accounting は mount 側で「認証ゲート → 50MB parser」の順に処理する (Excel seed 等の
+    // 大容量投入があるため global 10MB を通すと mount 側 50MB が無効化される問題も同時に解消)。
+    if (normalizedPath.startsWith('/apps/mgmt-accounting')) return next();
     if (LARGE_BODY_ROUTES.includes(normalizedPath)) return next();
   }
   return globalJsonParser(req, res, next);
@@ -1041,7 +1047,10 @@ app.use('/apps/aupay-accounting', (req, res, next) => {
   if (req.path === '/import-history' && req.method === 'POST') return next();
   requireAuth(req, res, next);
 }, aupayAccountingRouter);
-app.use('/apps/yahoo-accounting', requireAuth, yahooAccountingRouter);
+app.use('/apps/yahoo-accounting', (req, res, next) => {
+  if (req.path === '/import-history' && req.method === 'POST') return next();  // requireImportKey に委譲 (他6アプリと統一)
+  requireAuth(req, res, next);
+}, yahooAccountingRouter);
 app.use('/apps/linegift-accounting', (req, res, next) => {
   if (req.path === '/import-history' && req.method === 'POST') return next();
   requireAuth(req, res, next);
@@ -1071,12 +1080,25 @@ app.use('/apps/product-hub/service-api', productHubServiceApiRouter); // トー�
 app.use('/apps/product-hub', requireAppAccess('product-hub'), productHubRouter);
 // 仕入先発注補助: mirror PML(read-only) + po_* マスタ/発注履歴 (warehouse-mirror.db 同居)
 app.use('/apps/purchase-orders', requireAppAccess('purchase-orders'), express.json({ limit: '1mb' }), purchaseOrdersRouter);
-app.use('/apps/mgmt-accounting', express.json({ limit: '50mb' }), (req, res, next) => {
-  // 管理系APIはセッション認証スキップ（内部で checkAuth により key/session のいずれか必須）
-  const adminPaths = ['/import-historical', '/bulk-calculate', '/cleanup-invalid'];
-  if (req.method === 'POST' && adminPaths.includes(req.path)) return next();
+app.use('/apps/mgmt-accounting', (req, res, next) => {
+  // 管理系API (x-sync-key 直呼び対象) はセッション認証の代わりに parser より前で key 認証。
+  // 監査 2026-07-06 I-43: 従来は 50MB parser が認証より前 + router 内 checkAuth が
+  // MIRROR_SYNC_KEY 未設定で素通り (fail-open) だった。router 内 checkAuth は二重防御として残る。
+  // /auto-sync-sales, /admin/* は router 内コメントで「MIRROR_SYNC_KEY 認証」と明記されながら
+  // session バイパスが無く key 単体で到達不能だったため対象に追加 (Codex R1 medium)。
+  const adminPaths = [
+    '/import-historical', '/bulk-calculate', '/cleanup-invalid',
+    '/auto-sync-sales', '/admin/load-historical-seed', '/admin/purge-months-before',
+  ];
+  if (req.method === 'POST' && adminPaths.includes(req.path)) {
+    if (req.session?.authenticated) return next();
+    const key = process.env.MIRROR_SYNC_KEY;
+    if (!key) return res.status(503).json({ error: 'mirror_sync_key_unset' });
+    if (req.headers['x-sync-key'] !== key) return res.status(401).json({ error: 'Invalid sync key' });
+    return next();
+  }
   requireAuth(req, res, next);
-}, mgmtAccountingRouter);
+}, express.json({ limit: '50mb' }), mgmtAccountingRouter);
 app.use('/apps/mercari-accounting', (req, res, next) => {
   if (req.path === '/import-history' && req.method === 'POST') return next();
   requireAuth(req, res, next);
