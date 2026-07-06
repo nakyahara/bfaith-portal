@@ -63,12 +63,19 @@ const SEGMENT_NAMES = { 1: '自社商品', 2: '取引先限定商品', 3: '仕�
 
 // ─── API ───
 
-// 認証ガード（APIキー認証 or セッション認証、未設定時はスキップ）
+// 認証ガード（セッション認証 or APIキー認証）
+// 監査 2026-07-06 I-43 対応: MIRROR_SYNC_KEY 未設定時に素通りする fail-open を
+// 「session なし + key 未設定なら 503 拒否」の fail-closed に反転。
 function checkAuth(req, res) {
-  const key = process.env.MIRROR_SYNC_KEY;
-  const provided = req.headers['x-sync-key'];
   const sessionOK = req.session?.authenticated;
-  if (key && !sessionOK && provided !== key) {
+  if (sessionOK) return true;
+  const key = process.env.MIRROR_SYNC_KEY;
+  if (!key) {
+    res.status(503).json({ error: 'mirror_sync_key_unset' });
+    return false;
+  }
+  const provided = req.headers['x-sync-key'];
+  if (provided !== key) {
     res.status(401).json({ error: 'Invalid sync key' });
     return false;
   }

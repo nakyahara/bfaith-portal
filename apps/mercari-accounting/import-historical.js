@@ -13,7 +13,8 @@
  *
  * リモート実行（Render等）:
  *   POST /apps/mercari-accounting/import-history
- *   Header: x-import-key: bfaith-import-2026
+ *   Header: x-import-key: <Render env IMPORT_KEY_MERCARI の値>
+ *   ※ env 未設定時は 503 (fail-closed)。投入時だけ設定し、済んだら消す運用。
  *   Body: { months: [{ yearMonth, bySegment, pfFee, shippingFee, couponTotal }, ...] }
  */
 import Database from 'better-sqlite3';

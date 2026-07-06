@@ -16,6 +16,7 @@ import multer from 'multer';
 import fs from 'fs';
 import iconv from 'iconv-lite';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
+import { requireImportKey } from '../../lib/import-key-auth.js';
 
 const router = Router();
 const UPLOAD_DIR = process.env.DATA_DIR ? process.env.DATA_DIR + '/import' : 'data/import';
@@ -593,10 +594,7 @@ router.post('/confirm', (req, res) => {
 
 // ─── POST /import-history — 過去データ一括投入 ───
 
-router.post('/import-history', (req, res) => {
-  const importKey = req.headers['x-import-key'];
-  if (importKey !== 'bfaith-import-2026') return res.status(403).json({ error: '認証エラー' });
-
+router.post('/import-history', requireImportKey('IMPORT_KEY_YAHOO'), (req, res) => {
   const db = getMirrorDB();
   const data = req.body;
   if (!Array.isArray(data)) return res.status(400).json({ error: 'JSON配列が必要です' });
