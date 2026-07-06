@@ -40,7 +40,7 @@ const ymPrev = q.addMonths(ymNow, -1);
 
 // ─── fixture ───
 const tx = db.transaction(() => {
-  for (const t of ['mirror_yahoo_finance_sku_daily', 'mart_yahoo_monthly_summary', 'mirror_products']) {
+  for (const t of ['mirror_yahoo_finance_sku_daily', 'mart_yahoo_monthly_summary', 'mirror_products', 'yadash_settings', 'yadash_rate_master']) {
     try { db.exec(`DELETE FROM ${t}`); } catch {}
   }
 
@@ -331,6 +331,85 @@ check('getSkuProfit 期間内に未解決日があれば最新日が解決済み
   assert(e.flag === 'unresolved', `期間内未解決あり→警告flag (got ${e.flag})`);
   assert(e.cost_status !== 'complete', '原価状態も不完全表示');
   db.prepare(`DELETE FROM mirror_yahoo_finance_sku_daily WHERE yahoo_sku_key = 'ya-eps'`).run();
+});
+
+// ─── P3: 売れ筋 + 設定 ───
+
+check('getBestsellers ランキング/ABC/前期比', () => {
+  const r = q.getBestsellers(d(6), today, 'sales');
+  assert(r.total_skus === 3, `3 SKU (got ${r.total_skus})`);
+  assert(r.ranking[0].yahoo_sku_key === 'ya-alpha-bk', '売上軸の先頭=alpha');
+  // ABC は加算前累積比で判定 (Codex P3-R1 medium): 境界をまたぐSKUはA群に含める。
+  // alpha(累積0%開始)=A, beta(54%開始<80)=A, gamma(97%開始)=C。先頭SKUは構成比がどれだけ大きくても必ずA
+  assert(r.ranking[0].abc === 'A', `先頭SKUは必ずA群 (got ${r.ranking[0].abc})`);
+  const beta = r.ranking.find(x => x.yahoo_sku_key === 'ya-beta');
+  const gammaR = r.ranking.find(x => x.yahoo_sku_key === 'ya-gamma');
+  assert(beta.abc === 'A' && gammaR.abc === 'C', `beta=A/gamma=C (got ${beta.abc}/${gammaR.abc})`);
+  assert(r.abc.count.A + r.abc.count.B + r.abc.count.C === 3, 'ABC合計');
+  assert(r.abc.total_revenue === (10000 + 8000 + 500) * 7, `売上合計 (got ${r.abc.total_revenue})`);
+  // 前期 (同量) → 成長率0%
+  const alpha = r.ranking.find(x => x.yahoo_sku_key === 'ya-alpha-bk');
+  assert(alpha.units_growth_pct === 0, `前期同量→0% (got ${alpha.units_growth_pct})`);
+  assert(alpha.is_new === false, '90日前初売上→NEWでない');
+  assert(r.risers.length === 0 && r.fallers.length === 0, '同量なので急上昇/急落なし');
+  // 軸切替
+  const u = q.getBestsellers(d(6), today, 'units');
+  assert(u.axis === 'units_net' && u.ranking[0].yahoo_sku_key === 'ya-alpha-bk', '数量軸');
+  const m = q.getBestsellers(d(6), today, 'margin');
+  assert(m.axis === 'variable_margin', '粗利軸');
+});
+
+check('getBestsellers 曜日パターン + 5のつく日 + スパークライン', () => {
+  const r = q.getBestsellers(d(6), today, 'sales');
+  assert(r.weekday.length === 7, `曜日7種 (got ${r.weekday.length})`);
+  for (const w of r.weekday) assert(w.avg_units === 15, `全日15個/日 (got ${w.avg_units})`);
+  const spark = r.ranking[0].spark;
+  assert(Array.isArray(spark) && spark.length === 7, `スパークライン7日分 (got ${spark?.length})`);
+  // 30日窓なら 5/15/25 が必ず含まれ、全日同量なので lift=0%
+  const g30 = q.getBestsellers(d(29), today, 'sales').goen;
+  assert(g30.goen_days >= 2, `5のつく日 (got ${g30.goen_days})`);
+  assert(g30.lift_pct === 0, `同量→lift 0% (got ${g30.lift_pct})`);
+});
+
+check('settings 既定値 + 保存 + バリデーション (Codex P3-R1 medium)', () => {
+  const s0 = q.getSettings();
+  assert(s0.abc_a_pct === 80 && s0.movers_min_units === 5, '既定値');
+  const s1 = q.saveSettings({ abc_a_pct: 70, bogus_key: 1 });
+  assert(s1.abc_a_pct === 70, '保存反映');
+  assert(!('bogus_key' in s1), '不正キー無視');
+  // 範囲外・非数値・A>=B は 400 で reject (部分適用しない)
+  let threw = 0;
+  try { q.saveSettings({ new_product_days: 'abc' }); } catch (e) { if (e.status === 400) threw++; }
+  try { q.saveSettings({ abc_a_pct: 200 }); } catch (e) { if (e.status === 400) threw++; }
+  try { q.saveSettings({ movers_min_units: -5 }); } catch (e) { if (e.status === 400) threw++; }
+  try { q.saveSettings({ abc_a_pct: 96, abc_b_pct: 95 }); } catch (e) { if (e.status === 400) threw++; }
+  assert(threw === 4, `バリデーション4件 (got ${threw})`);
+  assert(q.getSettings().abc_a_pct === 70, 'reject時は部分適用なし');
+  q.saveSettings({ abc_a_pct: 80 });
+});
+
+check('料率マスタ CRUD + 改定日ロジック', () => {
+  const r0 = q.getRates();
+  assert(Object.keys(r0.current).length === 0 && r0.history.length === 0, '初期は空');
+  // 過去日から有効な料率
+  q.addRate({ rate_key: 'promo_package', rate_pct: 3, effective_from: '2025-01-01', memo: '加入時' });
+  // 未来日の改定予約 (2026-09改定)
+  const r1 = q.addRate({ rate_key: 'promo_package', rate_pct: 2, effective_from: '2099-09-01', memo: '改定予約' });
+  assert(r1.current.promo_package.rate_pct === 3, `現在有効=3% (got ${r1.current.promo_package?.rate_pct})`);
+  assert(r1.upcoming.length === 1 && r1.upcoming[0].rate_pct === 2, '未来日は改定予約');
+  // 後から追加した「より新しい過去日」が現在有効になる
+  const r2 = q.addRate({ rate_key: 'promo_package', rate_pct: 2.5, effective_from: '2025-06-01', memo: '' });
+  assert(r2.current.promo_package.rate_pct === 2.5, `改定日順で最新 (got ${r2.current.promo_package.rate_pct})`);
+  // 削除で1つ前に戻る
+  const r3 = q.deleteRate(r2.current.promo_package.id);
+  assert(r3.current.promo_package.rate_pct === 3, `削除で前の料率に (got ${r3.current.promo_package.rate_pct})`);
+  // バリデーション
+  let threw = 0;
+  try { q.addRate({ rate_key: 'bogus', rate_pct: 1, effective_from: '2025-01-01' }); } catch { threw++; }
+  try { q.addRate({ rate_key: 'point_base', rate_pct: 101, effective_from: '2025-01-01' }); } catch { threw++; }
+  try { q.addRate({ rate_key: 'point_base', rate_pct: 1, effective_from: '2025-13-01' }); } catch { threw++; }
+  try { q.deleteRate(999999); } catch { threw++; }
+  assert(threw === 4, `バリデーション4件 (got ${threw})`);
 });
 
 console.log(`\n=== smoke: ${pass} PASS / ${fail} FAIL ===`);
