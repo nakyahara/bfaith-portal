@@ -80,9 +80,11 @@ function extractBuybox(product) {
   const bb = prices.find(p => String(p.CompetitivePriceId) === '1' && (p.condition || 'New') === 'New')
           || prices.find(p => String(p.CompetitivePriceId) === '1');
   if (!bb) return { price: null, isMine: null };
+  // belongsToRequester はモデル上 optional。未返却を「他社」に落とすと
+  // buybox_lost が大量 false positive になるため、未知は NULL (Codex R1 High #1)
   return {
     price: bb?.Price?.LandedPrice?.Amount ?? bb?.Price?.ListingPrice?.Amount ?? null,
-    isMine: bb?.belongsToRequester === true ? 1 : 0,
+    isMine: bb?.belongsToRequester === true ? 1 : (bb?.belongsToRequester === false ? 0 : null),
   };
 }
 
@@ -119,6 +121,11 @@ async function main() {
   const today = jstToday();
   const fetchedAt = new Date().toISOString();
 
+  // 失敗 batch の SKU/ASIN は UPSERT 対象外にする (成功扱いで NULL 上書きすると
+  // 再実行時に当日データを破壊するため、Codex R1 High #2)
+  const failedSkus = new Set();
+  const failedAsins = new Set();
+
   // ── パス1: 自分の価格 (Sku batch) ──
   const myPriceMap = new Map();
   let priceErrors = 0;
@@ -141,6 +148,7 @@ async function main() {
       }
     } catch (e) {
       priceErrors++;
+      for (const t of batch) failedSkus.add(t.seller_sku);
       console.error(`  ✗ getPricing batch ${i / BATCH_SIZE}: ${(e.message || '').slice(0, 150)}`);
     }
     if ((i / BATCH_SIZE) % 20 === 0) console.log(`  [my-price] ${Math.min(i + BATCH_SIZE, targets.length)}/${targets.length}`);
@@ -170,6 +178,7 @@ async function main() {
       }
     } catch (e) {
       bbErrors++;
+      for (const asin of batch) failedAsins.add(asin);
       console.error(`  ✗ getCompetitivePricing batch ${i / BATCH_SIZE}: ${(e.message || '').slice(0, 150)}`);
     }
     if ((i / BATCH_SIZE) % 20 === 0) console.log(`  [buybox] ${Math.min(i + BATCH_SIZE, asins.length)}/${asins.length}`);
@@ -186,8 +195,11 @@ async function main() {
       buybox_is_mine = excluded.buybox_is_mine, fetched_at = excluded.fetched_at
   `);
   let saved = 0;
+  let skipped = 0;
   const tx = db.transaction(() => {
     for (const t of targets) {
+      // どちらかのパスで batch 失敗した SKU は書かない (前回値を NULL で潰さない)
+      if (failedSkus.has(t.seller_sku) || failedAsins.has(t.asin)) { skipped++; continue; }
       const bb = buyboxMap.get(t.asin) || { price: null, isMine: null };
       upsert.run(today, t.seller_sku, t.asin, t.channel || null,
         myPriceMap.get(t.seller_sku) ?? null, bb.price, bb.isMine, fetchedAt);
@@ -200,9 +212,14 @@ async function main() {
 
   const withBb = targets.filter(t => (buyboxMap.get(t.asin) || {}).price != null).length;
   const mineCnt = targets.filter(t => (buyboxMap.get(t.asin) || {}).isMine === 1).length;
-  console.log(`[Prices] ✓ ${saved} SKU 保存 (${today}) / カートあり ${withBb} / 自社カート保有 ${mineCnt} / batchエラー price=${priceErrors} bb=${bbErrors}`);
-  // 全 batch 失敗のような壊れ方は非ゼロ exit で通知に載せる
-  if (saved > 0 && myPriceMap.size === 0 && buyboxMap.size === 0) process.exit(1);
+  const totalBatches = Math.ceil(targets.length / BATCH_SIZE) + Math.ceil(asins.length / BATCH_SIZE);
+  console.log(`[Prices] ✓ ${saved} SKU 保存 / ${skipped} SKU skip (batch失敗) (${today}) / カートあり ${withBb} / 自社カート保有 ${mineCnt} / batchエラー price=${priceErrors} bb=${bbErrors}/${totalBatches}`);
+  // batch エラー率 10% 超は失敗扱い (通知に載せ、daily-sync の sync gate を止める)。
+  // 少数の flaky batch は skip 済みなので成功扱いで sync に進めてよい
+  if ((priceErrors + bbErrors) > totalBatches * 0.1) {
+    console.error(`[Prices] FATAL: batch エラー率が閾値超過 (${priceErrors + bbErrors}/${totalBatches})`);
+    process.exit(1);
+  }
 }
 
 main().then(() => process.exit(0)).catch(e => {

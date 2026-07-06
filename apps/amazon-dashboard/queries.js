@@ -971,8 +971,12 @@ export function getDiagnosis() {
       SELECT seller_sku, asin, channel, my_price, buybox_price, buybox_is_mine
       FROM mirror_amazon_price_snapshot_daily WHERE date_jst = ?
     `).all(priceSnapDate);
-    // 直近30日売上マップ (buybox_lost の「売れてる SKU」判定 + 並び順用)
-    const recentRevMap = new Map(recent.map(r => [r.seller_sku.toLowerCase(), Math.round(r.revenue_excl)]));
+    // 直近30日売上マップ (buybox_lost の「売れてる SKU」判定 + 並び順用)。
+    // ad_bleed_days 設定に連動させず 30 日固定 (Codex R1 Medium)
+    const recentRevMap = new Map(db.prepare(`
+      SELECT seller_sku, SUM(sales_principal_jpy + sales_shipping_jpy + sales_giftwrap_jpy) AS rev
+      FROM mirror_amazon_finance_sku_daily WHERE date_jst >= ? GROUP BY seller_sku
+    `).all(addDays(today, -29)).map(r => [r.seller_sku.toLowerCase(), Math.round(r.rev)]));
     for (const s of snaps) {
       if (s.buybox_price == null || s.buybox_is_mine === 1) continue;
       // カートを他社に取られている + 直近30日に売上がある SKU
