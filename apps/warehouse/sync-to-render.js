@@ -33,11 +33,16 @@ async function notify(text) {
     return;
   }
   try {
-    await fetch(GCHAT_WEBHOOK, {
+    const res = await fetch(GCHAT_WEBHOOK, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text }),
     });
+    if (!res.ok) {
+      console.error(`[sync-to-render] [NOTIFY:status=failed] GChat HTTP ${res.status}`);
+      return;
+    }
+    console.log('[sync-to-render] [NOTIFY:status=sent]');
   } catch (e) { console.error('[sync-to-render] [NOTIFY:status=failed]', e.message); }
 }
 
