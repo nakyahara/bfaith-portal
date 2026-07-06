@@ -270,6 +270,9 @@ app.use((req, res, next) => {
     if (normalizedPath.startsWith('/service-api/') || normalizedPath === '/service-api') return next();
     // /apps/mirror/api/sync* も同様に API key 認証前 body parse を避ける。
     if (normalizedPath.startsWith('/apps/mirror/api/sync')) return next();
+    // mirror read API (GET専用、監査S-2で認証追加) への POST も認証前 body parse を避ける
+    // (POST は router 側に route が無く 404 になるだけなので parse 不要)。
+    if (/^\/apps\/mirror\/api\/(products|sales|status|download)(\/|$)/.test(normalizedPath)) return next();
     if (LARGE_BODY_ROUTES.includes(normalizedPath)) return next();
   }
   return globalJsonParser(req, res, next);
@@ -946,16 +949,22 @@ app.use('/apps/mirror/api/sync', express.json({
 app.use('/apps/mirror/api/sync', mirrorParserErrorHandler);
 
 // read API 認証 (監査 S-2 対応): portal セッション or x-read-token (MIRROR_READ_TOKEN) のどちらかで許可。
-//   ・対象は認証が無かった 5 endpoint のみ (products / sales/monthly / sales/daily / status / download/:table)。
+//   ・対象は認証が無かった read 系 (products / sales配下全体 / status / download配下全体)。
+//     sales/download は prefix mount なので将来の追加 route も自動的に保護される (安全側デフォルト)。
 //   ・独自 token を持つ既存ルート (/api/sync* = sync key, /api/pml/* = PML_*_TOKEN,
 //     /api/sku-master/* = MIRROR_READ_TOKEN) は各自の認証を維持するため対象外 (二重認証にしない)。
-//   ・MIRROR_READ_TOKEN 未設定でも session 経路は生きる。token 経路は不一致/未設定で拒否 (fail-closed)。
+//   ・token 提示あり + MIRROR_READ_TOKEN 未設定は 503 (requireReadToken と同じ fail-closed シグナル)、
+//     不一致は 401。session も token も無ければ 401。
 //   ・token は header only (query 受理は URL/アクセスログ残留のため禁止。requireReadToken と同方針)。
 function requireSessionOrReadToken(req, res, next) {
   if (req.session && req.session.authenticated) return next();
-  const token = process.env.MIRROR_READ_TOKEN;
   const provided = req.headers['x-read-token'];
-  if (token && provided && provided === token) return next();
+  if (provided) {
+    const token = process.env.MIRROR_READ_TOKEN;
+    if (!token) return res.status(503).json({ error: 'mirror_read_token_unset' });
+    if (provided === token) return next();
+    return res.status(401).json({ error: 'invalid_read_token' });
+  }
   return res.status(401).json({ error: 'auth_required' });
 }
 app.use(
