@@ -613,6 +613,8 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_myfsd_ne    ON mirror_yahoo_finance_sku_daily(ne_code)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_myfsd_month ON mirror_yahoo_finance_sku_daily(substr(date_jst, 1, 7))');
   db.exec('CREATE INDEX IF NOT EXISTS idx_myfsd_run   ON mirror_yahoo_finance_sku_daily(source_run_id)');
+  // SKU 軸の全期間集計用 (yahoo-analytics 売れ筋タブの初売上 MIN 等。PK は date_jst 先頭のため別途必要)
+  db.exec('CREATE INDEX IF NOT EXISTS idx_myfsd_sku   ON mirror_yahoo_finance_sku_daily(yahoo_sku_key, date_jst)');
 
   // Phase 1c-3 用 migration framework (Codex R5 #1 反映、PRAGMA table_info 方式)
   // 現状追加列なし、Phase 1c-3 着手時にここに ALTER TABLE 追加する形

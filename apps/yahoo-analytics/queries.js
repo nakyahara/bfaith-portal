@@ -21,6 +21,147 @@
  */
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 
+// ─── アプリ専用テーブル (Render-local。yadash_ prefix、amazon-dashboard の amzdash_ と同パターン) ───
+let _initialized = false;
+export function ensureAppTables() {
+  if (_initialized) return;
+  const db = getMirrorDB();
+  db.exec(`CREATE TABLE IF NOT EXISTS yadash_settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`);
+  // 料率マスタ (改定日付き履歴 — 要件 F-5。2026-09 手数料改定を履歴として表現できる構造)
+  db.exec(`CREATE TABLE IF NOT EXISTS yadash_rate_master (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    rate_key       TEXT NOT NULL CHECK (rate_key IN (
+      'point_base', 'campaign_base', 'payment_fee', 'promo_package', 'sales_royalty', 'pr_option_default'
+    )),
+    rate_pct       REAL NOT NULL CHECK (rate_pct >= 0 AND rate_pct <= 100),
+    effective_from TEXT NOT NULL CHECK (effective_from GLOB '????-??-??'),
+    memo           TEXT NOT NULL DEFAULT '',
+    created_at     TEXT NOT NULL,
+    deleted_at     TEXT
+  )`);
+  _initialized = true;
+}
+
+// バリデーションエラー (router 側で 400 + メッセージ表示にする)
+export function validationError(msg) {
+  const e = new Error(msg);
+  e.status = 400;
+  return e;
+}
+
+// ─── 診断・分析閾値 (設定タブで変更可) ───
+export const DEFAULT_SETTINGS = {
+  abc_a_pct: 80,          // ABC: A = 売上累積 N% まで
+  abc_b_pct: 95,
+  new_product_days: 60,   // 新商品バッジ: 初売上から N 日
+  movers_min_units: 5,    // 急上昇/急落: 当期 or 前期 N 個以上のみ (ノイズ除去)
+};
+// キーごとの許容範囲 (Codex P3-R1 medium: 範囲外値でランキング分類・NEW判定が壊れるのを防ぐ)
+const SETTING_RANGES = {
+  abc_a_pct: [1, 99],
+  abc_b_pct: [2, 99.9],
+  new_product_days: [1, 365],
+  movers_min_units: [0, 1000],
+};
+
+export function getSettings() {
+  ensureAppTables();
+  const db = getMirrorDB();
+  const rows = db.prepare(`SELECT key, value FROM yadash_settings`).all();
+  const out = { ...DEFAULT_SETTINGS };
+  for (const r of rows) {
+    if (r.key in out) {
+      const n = Number(r.value);
+      if (Number.isFinite(n)) out[r.key] = n;
+    }
+  }
+  return out;
+}
+
+export function saveSettings(patch) {
+  ensureAppTables();
+  const db = getMirrorDB();
+  const now = new Date().toISOString();
+  // 先に patch 全体を検証してから書く (部分適用しない)
+  const validated = {};
+  for (const [k, v] of Object.entries(patch)) {
+    if (!(k in DEFAULT_SETTINGS)) continue;
+    const n = Number(v);
+    if (!Number.isFinite(n)) throw validationError(`${k} は数値で指定してください`);
+    const [min, max] = SETTING_RANGES[k];
+    if (n < min || n > max) throw validationError(`${k} は ${min}〜${max} の範囲で指定してください`);
+    validated[k] = n;
+  }
+  const merged = { ...getSettings(), ...validated };
+  if (merged.abc_a_pct >= merged.abc_b_pct) throw validationError('abc_a_pct は abc_b_pct より小さくしてください');
+  const stmt = db.prepare(`
+    INSERT INTO yadash_settings (key, value, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+  `);
+  const tx = db.transaction(() => {
+    for (const [k, n] of Object.entries(validated)) stmt.run(k, String(n), now);
+  });
+  tx();
+  return getSettings();
+}
+
+// ─── 料率マスタ (F-5: 現状一覧 + 改定日付き履歴 — 専用管理画面原則) ───
+export const RATE_KEYS = {
+  point_base: 'ストアポイント原資 (既定%)',
+  campaign_base: 'キャンペーン原資',
+  payment_fee: '決済手数料',
+  promo_package: 'プロモーションパッケージ料',
+  sales_royalty: '売上ロイヤリティ (2026-09新設)',
+  pr_option_default: 'PRオプション既定料率',
+};
+
+export function getRates() {
+  ensureAppTables();
+  const db = getMirrorDB();
+  const today = jstToday();
+  const history = db.prepare(`
+    SELECT id, rate_key, rate_pct, effective_from, memo, created_at
+    FROM yadash_rate_master
+    WHERE deleted_at IS NULL
+    ORDER BY rate_key, effective_from DESC, id DESC
+  `).all();
+  // 現在有効な料率 = rate_key ごとに effective_from <= 今日 の最新行
+  const current = {};
+  for (const r of history) {
+    if (r.effective_from <= today && !(r.rate_key in current)) current[r.rate_key] = r;
+  }
+  // 予約済み改定 (未来日) も見えるように
+  const upcoming = history.filter(r => r.effective_from > today);
+  return { keys: RATE_KEYS, current, upcoming, history };
+}
+
+export function addRate({ rate_key, rate_pct, effective_from, memo }) {
+  ensureAppTables();
+  if (!(rate_key in RATE_KEYS)) throw validationError('rate_key が不正です');
+  const pct = Number(rate_pct);
+  if (!Number.isFinite(pct) || pct < 0 || pct > 100) throw validationError('料率は 0〜100 の数値で指定してください');
+  if (!isValidDate(effective_from)) throw validationError('適用開始日は YYYY-MM-DD で指定してください');
+  const db = getMirrorDB();
+  db.prepare(`
+    INSERT INTO yadash_rate_master (rate_key, rate_pct, effective_from, memo, created_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(rate_key, pct, effective_from, String(memo || '').slice(0, 200), new Date().toISOString());
+  return getRates();
+}
+
+export function deleteRate(id) {
+  ensureAppTables();
+  const db = getMirrorDB();
+  const r = db.prepare(`UPDATE yadash_rate_master SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL`)
+    .run(new Date().toISOString(), Number(id));
+  if (r.changes === 0) throw validationError('対象の料率が見つかりません');
+  return getRates();
+}
+
 // ─── 日付 helper (JST。Date.toISOString の UTC 罠に注意: feedback_jst_to_iso_string_trap) ───
 export function jstToday() {
   return new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
@@ -436,6 +577,158 @@ export function getSkuDetail(sku, from, to) {
     `).get(latest.ne_code) || null;
   }
   return { sku, from, to, latest, master, daily };
+}
+
+// ─── 売れ筋分析タブ (F-4b) ───
+// 軸: units (販売数) / sales (売上) / margin (粗利L1)。ABC分析・急上昇急落・曜日パターン
+// (Yahoo独自: 5のつく日 = 毎月5/15/25日 と 日曜 のハイライト)・スパークライン・新商品バッジ。
+// カテゴリ別売れ筋は分類SSoTテーブルが mirror 未同期のため将来PR (要件 F-4b-4)。
+function bestsellerSkuAgg(db, from, to) {
+  return db.prepare(`
+    SELECT
+      yahoo_sku_key,
+      MAX(product_name)                     AS product_name,
+      ${LATEST_EXPR}                        AS latest_key,
+      MAX(unresolved_sku_flag)              AS ever_unresolved,
+      SUM(units_net_sold)                   AS units_net,
+      SUM(gross_sales_jpy_incl)             AS sales_incl,
+      SUM(variable_margin_partial_jpy_incl) AS variable_margin
+    FROM mirror_yahoo_finance_sku_daily
+    WHERE date_jst >= ? AND date_jst <= ?
+    GROUP BY yahoo_sku_key
+  `).all(from, to);
+}
+
+export function getBestsellers(from, to, axis) {
+  const db = getMirrorDB();
+  const settings = getSettings();
+  const days = Math.round((new Date(to + 'T00:00:00Z') - new Date(from + 'T00:00:00Z')) / 86400000) + 1;
+  const prevTo = addDays(from, -1);
+  const prevFrom = addDays(prevTo, -(days - 1));
+
+  const cur = bestsellerSkuAgg(db, from, to);
+  const prevMap = new Map(bestsellerSkuAgg(db, prevFrom, prevTo).map(r => [r.yahoo_sku_key, r]));
+
+  // 初売上日 (新商品バッジ用)。当期に売上のある SKU に限定して全期間 MIN を取る
+  // (全 SKU 全履歴 GROUP BY はデータ増で重くなる — Codex P3-R1 low)
+  const firstSaleMap = new Map(db.prepare(`
+    SELECT yahoo_sku_key, MIN(date_jst) AS first_date
+    FROM mirror_yahoo_finance_sku_daily
+    WHERE units_net_sold > 0
+      AND yahoo_sku_key IN (
+        SELECT DISTINCT yahoo_sku_key FROM mirror_yahoo_finance_sku_daily
+        WHERE date_jst >= ? AND date_jst <= ?
+      )
+    GROUP BY yahoo_sku_key
+  `).all(from, to).map(r => [r.yahoo_sku_key, r.first_date]));
+  const newCutoff = addDays(jstToday(), -settings.new_product_days);
+
+  let rows = cur.map(r => {
+    const parts = (r.latest_key || '||').split('|');
+    const prev = prevMap.get(r.yahoo_sku_key);
+    return {
+      yahoo_sku_key: r.yahoo_sku_key,
+      ne_code: parts[1] || null,
+      product_name: r.product_name || '',
+      unresolved: r.ever_unresolved === 1,
+      units_net: r.units_net,
+      sales_incl: Math.round(r.sales_incl),
+      variable_margin: Math.round(r.variable_margin),
+      margin_pct: r.sales_incl > 0 ? Math.round(r.variable_margin / r.sales_incl * 1000) / 10 : null,
+      prev_units: prev ? prev.units_net : 0,
+      units_growth_pct: prev && prev.units_net > 0
+        ? Math.round((r.units_net - prev.units_net) / prev.units_net * 1000) / 10
+        : (r.units_net > 0 ? null : 0),   // null = 前期実績なし (新規扱い)
+      is_new: (firstSaleMap.get(r.yahoo_sku_key) || '') >= newCutoff,
+      first_sale_date: firstSaleMap.get(r.yahoo_sku_key) || null,
+    };
+  });
+
+  // ABC 分析 (売上累積構成比)
+  const byRevenue = [...rows].sort((a, b) => b.sales_incl - a.sales_incl);
+  const totalRevenue = byRevenue.reduce((s, r) => s + Math.max(0, r.sales_incl), 0);
+  // 分類は「加算前の累積比」で判定 (加算後だと売上が1SKUに集中した時にA群が0件になる —
+  // 例: 構成比90%の先頭SKUが加算後90%>80でB落ち。Codex P3-R1 medium)
+  let cum = 0;
+  const abcCount = { A: 0, B: 0, C: 0 };
+  const abcRevenue = { A: 0, B: 0, C: 0 };
+  for (const r of byRevenue) {
+    const pctBefore = totalRevenue > 0 ? cum / totalRevenue * 100 : 100;
+    cum += Math.max(0, r.sales_incl);
+    r.abc = pctBefore < settings.abc_a_pct ? 'A' : pctBefore < settings.abc_b_pct ? 'B' : 'C';
+    abcCount[r.abc]++;
+    abcRevenue[r.abc] += Math.max(0, r.sales_incl);
+  }
+
+  const axisKey = axis === 'units' ? 'units_net' : axis === 'margin' ? 'variable_margin' : 'sales_incl';
+  rows = [...rows].sort((a, b) => b[axisKey] - a[axisKey]);
+
+  // 急上昇 / 急落 (当期 or 前期 N 個以上のみ)
+  const minU = settings.movers_min_units;
+  const movers = rows.filter(r => r.prev_units >= minU || r.units_net >= minU);
+  const risers = [...movers].filter(r => r.units_growth_pct !== null && r.units_growth_pct > 0).sort((a, b) => b.units_growth_pct - a.units_growth_pct).slice(0, 20);
+  const fallers = [...movers].filter(r => r.units_growth_pct !== null && r.units_growth_pct < 0).sort((a, b) => a.units_growth_pct - b.units_growth_pct).slice(0, 20);
+
+  // 曜日パターン (販売数と売上。日曜 = LYPプレミアム系イベントで強い想定 → UI でハイライト)
+  const weekday = db.prepare(`
+    SELECT CAST(strftime('%w', date_jst) AS INTEGER) AS dow,
+      SUM(units_net_sold) AS units, SUM(gross_sales_jpy_incl) AS sales,
+      COUNT(DISTINCT date_jst) AS days
+    FROM mirror_yahoo_finance_sku_daily
+    WHERE date_jst >= ? AND date_jst <= ?
+    GROUP BY dow ORDER BY dow
+  `).all(from, to).map(r => ({
+    dow: r.dow, days: r.days,
+    avg_units: r.days > 0 ? Math.round(r.units / r.days * 10) / 10 : 0,
+    avg_sales: r.days > 0 ? Math.round(r.sales / r.days) : 0,
+  }));
+
+  // 5のつく日 (毎月5/15/25日) vs 通常日 — Yahoo独自の販売リズム可視化
+  const goen = db.prepare(`
+    SELECT CASE WHEN substr(date_jst, 9, 2) IN ('05', '15', '25') THEN 1 ELSE 0 END AS is_goen,
+      SUM(units_net_sold) AS units, SUM(gross_sales_jpy_incl) AS sales,
+      COUNT(DISTINCT date_jst) AS days
+    FROM mirror_yahoo_finance_sku_daily
+    WHERE date_jst >= ? AND date_jst <= ?
+    GROUP BY is_goen
+  `).all(from, to);
+  const goenRow = goen.find(g => g.is_goen === 1);
+  const normalRow = goen.find(g => g.is_goen === 0);
+  const goenSummary = {
+    goen_days: goenRow?.days || 0,
+    goen_avg_sales: goenRow?.days > 0 ? Math.round(goenRow.sales / goenRow.days) : null,
+    normal_days: normalRow?.days || 0,
+    normal_avg_sales: normalRow?.days > 0 ? Math.round(normalRow.sales / normalRow.days) : null,
+    lift_pct: goenRow?.days > 0 && normalRow?.days > 0 && normalRow.sales > 0
+      ? Math.round((goenRow.sales / goenRow.days) / (normalRow.sales / normalRow.days) * 1000) / 10 - 100
+      : null,
+  };
+
+  // 上位 30 SKU の日次スパークライン
+  const topSkus = rows.slice(0, 30).map(r => r.yahoo_sku_key);
+  const sparkMap = new Map();
+  if (topSkus.length > 0) {
+    const ph = topSkus.map(() => '?').join(',');
+    const sparkRows = db.prepare(`
+      SELECT yahoo_sku_key, date_jst, SUM(units_net_sold) AS units
+      FROM mirror_yahoo_finance_sku_daily
+      WHERE date_jst >= ? AND date_jst <= ? AND yahoo_sku_key IN (${ph})
+      GROUP BY yahoo_sku_key, date_jst ORDER BY date_jst
+    `).all(from, to, ...topSkus);
+    for (const r of sparkRows) {
+      if (!sparkMap.has(r.yahoo_sku_key)) sparkMap.set(r.yahoo_sku_key, []);
+      sparkMap.get(r.yahoo_sku_key).push({ d: r.date_jst, u: r.units });
+    }
+  }
+  for (const r of rows.slice(0, 30)) r.spark = sparkMap.get(r.yahoo_sku_key) || [];
+
+  return {
+    from, to, prev_from: prevFrom, prev_to: prevTo, axis: axisKey,
+    total_skus: rows.length,
+    abc: { count: abcCount, revenue: { A: Math.round(abcRevenue.A), B: Math.round(abcRevenue.B), C: Math.round(abcRevenue.C) }, total_revenue: Math.round(totalRevenue) },
+    ranking: rows.slice(0, 100),
+    risers, fallers, weekday, goen: goenSummary,
+  };
 }
 
 // ─── SKU 未解決一覧 (F-4: f_yahoo_sku_map 登録の解消導線) ───
