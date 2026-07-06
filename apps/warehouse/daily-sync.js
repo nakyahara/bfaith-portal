@@ -438,6 +438,24 @@ async function main() {
       console.log('[DailySync] Amazon Ads sync は fetch 失敗 (campaign/SKU いずれか) のためスキップ (fetch retry 後に翌 cron で sync 実行)');
     }
 
+    // === Amazon アカウント単位フィー月次 (amazon-dashboard PR-C) ===
+    // 保管料/長期在庫追加手数料/返送等の SKU 無しフィーを月次集計して mirror へ。
+    // raw settlement は上の fetch-amazon-settlements.js で更新済みの前提 (失敗時も前回分で再集計、冪等)。
+    const accountFeesBuildResult = runScript(
+      `apps/warehouse/rebuild-amazon-account-fees.js --data-dir ${DATA_DIR_ARG} --months 14`,
+      'Amazonアカウントフィー build', 300000
+    );
+    results.push({ name: 'Amazonアカウントフィー build', ...accountFeesBuildResult });
+    if (accountFeesBuildResult.success) {
+      const accountFeesSyncResult = runScript(
+        `apps/warehouse/sync-amazon-account-fees.js --data-dir ${DATA_DIR_ARG} --months 14`,
+        'Amazonアカウントフィー sync', 300000
+      );
+      results.push({ name: 'Amazonアカウントフィー sync', ...accountFeesSyncResult });
+    } else {
+      console.log('[DailySync] Amazonアカウントフィー sync は build 失敗のためスキップ');
+    }
+
     // === 楽天 finance daily fact (Phase 1a #R-3c、#R-1 + #R-2 + #R-3a 統合) ===
     // 1. f_rakuten_finance_sku_daily_v1 build (status IN (500,600,700) D 案、snapshot UPSERT)
     // 2. DQ gate (6 check、severity error で exit 1)

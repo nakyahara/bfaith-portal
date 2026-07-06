@@ -211,6 +211,45 @@ function estimatedProfit(db, from, to) {
   return { est_profit_before_ads: row.est_profit_before_ads, coverage_pct: Math.round(coverage * 1000) / 10 };
 }
 
+// ─── アカウント単位フィー月次 (mirror_amazon_account_fees_monthly、PR-C) ───
+// SKU に紐付かない保管料/長期在庫追加手数料/返送等。SKU 別利益には含まれないため、
+// 月次の最終利益で別枠控除する。戻り値の cost は正の値 = 費用 (Amazon 符号を反転)。
+export const ACCOUNT_FEE_LABELS = {
+  storage: '在庫保管料 (月次)',
+  long_term_storage: '長期在庫追加手数料',
+  removal: '返送・廃棄 (Removal)',
+  inbound_defect: '納品不備',
+  low_inventory: '低在庫レベル手数料',
+  subscription: '月額登録料',
+  other_account_fee: 'その他アカウントフィー',
+};
+export function getAccountFees(monthsBack = 13) {
+  const db = getMirrorDB();
+  const fromMonth = monthStart(addMonths(monthOf(jstToday()), -(monthsBack - 1)));
+  const raw = db.prepare(`
+    SELECT date_jst, fee_type, amount_jpy, row_count
+    FROM mirror_amazon_account_fees_monthly
+    WHERE date_jst >= ? ORDER BY date_jst, fee_type
+  `).all(fromMonth);
+  const byMonth = new Map();
+  for (const r of raw) {
+    const ym = r.date_jst.slice(0, 7);
+    if (!byMonth.has(ym)) byMonth.set(ym, { ym, total_cost: 0, fees: {} });
+    const m = byMonth.get(ym);
+    const cost = Math.round(-r.amount_jpy);   // 負=費用 → 正のコストに反転
+    m.fees[r.fee_type] = cost;
+    m.total_cost += cost;
+  }
+  return { months: [...byMonth.values()], labels: ACCOUNT_FEE_LABELS };
+}
+function accountFeesCostForMonth(db, ym) {
+  const r = db.prepare(`
+    SELECT COALESCE(SUM(amount_jpy), 0) AS net
+    FROM mirror_amazon_account_fees_monthly WHERE date_jst = ?
+  `).get(`${ym}-01`);
+  return Math.round(-r.net);
+}
+
 // ─── カスタム経費 (月次): 対象月に効く経費合計。sales_pct は確定売上(税抜)基準 ───
 function customExpensesForMonth(db, ym, settledRevenueExcl) {
   ensureAppTables();
@@ -269,12 +308,13 @@ export function getOverview() {
       days_in_period: daysInPeriod,
       settled_coverage_pct: Math.round((settled.days_with_data / daysInPeriod) * 1000) / 10,
     };
-    // 月タイルのみカスタム経費を載せる
+    // 月タイルのみ: アカウント単位フィー (保管料/LTSF等、SKU利益に未計上) + カスタム経費を控除
     if (p.key === 'this_month' || p.key === 'last_month') {
       const targetYm = p.key === 'this_month' ? ym : lastYm;
       const exp = customExpensesForMonth(db, targetYm, settled.revenue_excl);
       tile.custom_expenses = exp.total;
-      tile.settled_profit_final = tile.settled_profit_after_ads - exp.total;
+      tile.account_fees = accountFeesCostForMonth(db, targetYm);
+      tile.settled_profit_final = tile.settled_profit_after_ads - tile.account_fees - exp.total;
     }
     return tile;
   });
@@ -921,6 +961,25 @@ export function getDiagnosis() {
     `).all(latestInvDate, deadCutoff).map(r => ({ ...r, stock_value: Math.round(r.stock_value) }));
   }
 
+  // 🚱 出したのに売れてない (立ち上がり不発): 発売 180 日以内 + 在庫あり + 直近30日販売 ≦1
+  const flopLaunchCutoff = addDays(today, -180);
+  let launchFlop = [];
+  if (latestInvDate) {
+    launchFlop = db.prepare(`
+      SELECT ne_code, MAX(product_name) AS product_name, SUM(qty) AS qty,
+             SUM(COALESCE(total_value,0)) AS stock_value,
+             MAX(new_product_launch_date) AS launch_date,
+             MAX(COALESCE(sales_30d_qty,0)) AS sales_30d,
+             MAX(last_sold_date) AS last_sold_date
+      FROM mirror_inv_daily_detail
+      WHERE business_date = ? AND market = 'jp' AND category IN ('fba_warehouse','fba_inbound')
+        AND new_product_launch_date IS NOT NULL AND new_product_launch_date >= ?
+      GROUP BY ne_code
+      HAVING SUM(qty) > 0 AND MAX(COALESCE(sales_30d_qty,0)) <= 1
+      ORDER BY stock_value DESC LIMIT 50
+    `).all(latestInvDate, flopLaunchCutoff).map(r => ({ ...r, stock_value: Math.round(r.stock_value) }));
+  }
+
   // 価格ミス疑い (実売単価(税込換算) < 標準売価 × ratio)
   const priceMiss = attachProductNames(db, db.prepare(`
     WITH sold AS (
@@ -947,6 +1006,7 @@ export function getDiagnosis() {
     base_month: m1, prev_month: m2, settings,
     earners: earners.slice(0, 30), loss_skus: lossSkus, worsened, ad_bleed: adBleed,
     dead_stock: deadStock, dead_stock_as_of: latestInvDate, price_miss: priceMiss,
+    launch_flop: launchFlop,
   };
 }
 

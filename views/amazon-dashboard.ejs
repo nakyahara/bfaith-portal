@@ -180,8 +180,12 @@
         </div>
         <div class="charts-grid">
           <div class="chart-card" style="grid-column: 1 / -1;">
-            <h3>利益ウォーターフォール <span class="pbadge settled">確定</span> <span id="pf-wf-title"></span></h3>
+            <h3>利益ウォーターフォール <span class="pbadge settled">確定</span> <span id="pf-wf-title"></span> <span class="note">※アカウント単位フィー(保管料等)はSKUに紐付かないため下のチャートで別掲</span></h3>
             <div class="chart-wrap tall"><canvas id="chart-waterfall"></canvas></div>
+          </div>
+          <div class="chart-card" style="grid-column: 1 / -1;">
+            <h3>Amazonアカウントフィー月次 <span class="pbadge settled">確定</span> <span class="note">SKU利益に含まれない控除 — 月タイルの「最終利益」で反映済み</span></h3>
+            <div class="chart-wrap"><canvas id="chart-account-fees"></canvas></div>
           </div>
         </div>
         <div class="note" id="pf-adnote"></div>
@@ -339,6 +343,7 @@ async function loadOverview() {
     document.getElementById('meta-updated').textContent = '更新: ' + new Date(data.generated_at).toLocaleString('ja-JP');
     const tiles = data.tiles.map(t => {
       const monthExtra = t.custom_expenses !== undefined ? `
+        <div class="row"><span>アカウントフィー <span class="note">(保管/長期/返送等)</span></span><span class="v">−${fmtYen(t.account_fees || 0)}</span></div>
         <div class="row"><span>自社経費</span><span class="v">−${fmtYen(t.custom_expenses)}</span></div>
         <div class="row"><span>最終利益 <span class="pbadge settled">確定</span></span><span class="v ${signClass(t.settled_profit_final)}">${fmtJPY(t.settled_profit_final)}</span></div>` : '';
       return `<div class="tile">
@@ -495,9 +500,36 @@ async function loadProfit() {
     window.location.href = `${API}/sku-profit.csv?preset=${pfPreset}&sort=${pfSort}&dir=${pfDir}&q=${encodeURIComponent(pfQ)}`;
   });
   document.getElementById('pf-more').addEventListener('click', () => { pfOffset += 100; fetchSkuTable(false); });
-  fetchWaterfall(); fetchSkuTable(true);
+  fetchWaterfall(); fetchSkuTable(true); fetchAccountFees();
 }
 function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
+
+const FEE_COLORS = { storage: '#60a5fa', long_term_storage: '#f59e0b', removal: '#a78bfa', inbound_defect: '#f87171', low_inventory: '#fb923c', subscription: '#9ca3af', other_account_fee: '#d1d5db' };
+async function fetchAccountFees() {
+  try {
+    const data = await getJSON(`${API}/account-fees?months=13`);
+    if (!data.months.length) return;
+    const feeTypes = Object.keys(data.labels).filter(k => data.months.some(m => (m.fees[k] || 0) !== 0));
+    mkChart('chart-account-fees', {
+      type: 'bar',
+      data: {
+        labels: data.months.map(m => m.ym),
+        datasets: feeTypes.map(k => ({
+          label: data.labels[k],
+          data: data.months.map(m => m.fees[k] || 0),
+          backgroundColor: FEE_COLORS[k] || '#ddd',
+          stack: 'fees',
+        })),
+      },
+      options: { responsive: true, maintainAspectRatio: false,
+        scales: { x: { stacked: true }, y: { stacked: true, ticks: { callback: v => fmtJPY(v) } } },
+        plugins: { tooltip: { callbacks: {
+          label: c => `${c.dataset.label}: ${fmtYen(c.parsed.y)}`,
+          footer: (items) => '月計: ' + fmtYen(items.reduce((s, i) => s + i.parsed.y, 0)),
+        } } } },
+    });
+  } catch (e) { console.error(e); }
+}
 
 function renderWaterfall(canvasId, wf) {
   // floating bar でウォーターフォール: 各 step の [開始, 終了] を累積計算
@@ -670,10 +702,25 @@ async function loadInventory() {
       return;
     }
     const s = data.summary;
+    let feeTiles = '';
+    try {
+      const fees = await getJSON(`${API}/account-fees?months=2`);
+      const latest = fees.months[fees.months.length - 1];
+      const prev = fees.months.length > 1 ? fees.months[fees.months.length - 2] : null;
+      const pick = (m, k) => (m && m.fees[k]) || 0;
+      if (latest) feeTiles = `
+        <div class="tile"><h3>在庫保管料 <span class="pbadge settled">確定</span></h3>
+          <div class="row"><span>${latest.ym}</span><span class="v">${fmtYen(pick(latest, 'storage'))}</span></div>
+          ${prev ? `<div class="row"><span>${prev.ym}</span><span class="v">${fmtYen(pick(prev, 'storage'))}</span></div>` : ''}</div>
+        <div class="tile"><h3>長期在庫追加手数料 (LTSF)</h3>
+          <div class="row"><span>${latest.ym}</span><span class="v ${pick(latest, 'long_term_storage') > 100000 ? 'negv' : ''}">${fmtYen(pick(latest, 'long_term_storage'))}</span></div>
+          ${prev ? `<div class="row"><span>${prev.ym}</span><span class="v">${fmtYen(pick(prev, 'long_term_storage'))}</span></div>` : ''}
+          <div class="note">271日超の在庫に課金。詳細月次は利益分析タブ</div></div>`;
+    } catch (e) { /* フィー未同期でも在庫表示は継続 */ }
     document.getElementById('inv-summary').innerHTML = `
       <div class="tile"><h3>在庫金額 (FBA+入荷待ち)</h3><div class="row hero"><span></span><span class="v">${fmtJPY(s.total_value)}</span></div><div class="note">${data.as_of} 時点 / ${s.sku_count} 商品</div></div>
       <div class="tile"><h3>残30日未満 (要補充検討)</h3><div class="row hero"><span></span><span class="v ${s.low_cover_count > 0 ? 'negv' : ''}">${s.low_cover_count} 商品</span></div></div>
-      <div class="tile"><h3>直近30日販売なし</h3><div class="row hero"><span></span><span class="v">${s.no_velocity_count} 商品</span></div></div>`;
+      <div class="tile"><h3>直近30日販売なし</h3><div class="row hero"><span></span><span class="v">${s.no_velocity_count} 商品</span></div></div>` + feeTiles;
     document.getElementById('inv-table').innerHTML = `<thead><tr>
       <th class="noclick">商品コード</th><th class="noclick">商品名</th><th class="noclick">FBA在庫</th><th class="noclick">入荷待ち</th>
       <th class="noclick">30日販売</th><th class="noclick">在庫残日数</th><th class="noclick">在庫金額</th><th class="noclick">最終販売日</th>
@@ -711,7 +758,9 @@ async function loadDiagnosis() {
       <div class="diag-card"><h4>💤 死に筋 (販売0×${d.settings.dead_stock_days}日+在庫あり、${d.dead_stock.length}件) — <a href="/apps/profit-analysis" target="_blank">撤退判断タブへ</a></h4>
         ${li(d.dead_stock, r => `<tr><td>${esc(r.ne_code)}</td><td class="name-cell">${esc(r.product_name || '')}</td><td class="num">${r.qty}個</td><td class="num">${fmtYen(r.stock_value)}</td><td>${esc(r.last_sold_date || '販売実績なし')}</td></tr>`)}</div>
       <div class="diag-card"><h4>⚠️ 価格ミス疑い (実売単価<標準売価×${d.settings.price_miss_ratio}、${d.price_miss.length}件) — Seller Central要確認</h4>
-        ${li(d.price_miss, r => `<tr><td>${esc(r.seller_sku)}</td><td class="name-cell">${esc(r.product_name || '')}</td><td class="num">実売 ${fmtYen(r.avg_price_incl)}</td><td class="num">標準 ${fmtYen(r.standard_price)}</td></tr>`)}</div>`;
+        ${li(d.price_miss, r => `<tr><td>${esc(r.seller_sku)}</td><td class="name-cell">${esc(r.product_name || '')}</td><td class="num">実売 ${fmtYen(r.avg_price_incl)}</td><td class="num">標準 ${fmtYen(r.standard_price)}</td></tr>`)}</div>
+      <div class="diag-card"><h4>🚱 出したのに売れてない (発売180日以内×直近30日販売≦1×在庫あり、${(d.launch_flop || []).length}件) — 露出/価格/画像の見直し候補</h4>
+        ${li(d.launch_flop || [], r => `<tr><td>${esc(r.ne_code)}</td><td class="name-cell">${esc(r.product_name || '')}</td><td class="num">${r.qty}個 / ${fmtYen(r.stock_value)}</td><td>発売 ${esc(r.launch_date || '?')}</td><td class="num">30日販売 ${r.sales_30d}</td></tr>`)}</div>`;
   } catch (e) {
     document.getElementById('diag-cards').innerHTML = `<div class="warn-note">取得失敗: ${esc(e.message)}</div>`;
   }
