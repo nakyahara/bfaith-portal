@@ -2230,6 +2230,24 @@ router.post('/api/sync/runs/:run_id/rebuild-marts', requireSyncKey, (req, res) =
   });
 });
 
+// ─── 監査PR-4後続: GET /api/sync/mf/runs/:run_id/status ─────────────────
+// sender (sync-mf-marts-to-render.js) が送信前に「mirror が既に success か」を照会し、
+// 確定済 run の再送 (子 chunk が parent_run_not_pending 409 で弾かれる) を送信前に
+// スキップするための read-only 照会。requireSyncKey (sync 系と同じ鍵、server.js 側でも二重防御)。
+router.get('/api/sync/mf/runs/:run_id/status', requireSyncKey, (req, res) => {
+  const runId = parseInt(req.params.run_id, 10);
+  if (!Number.isInteger(runId) || runId <= 0) {
+    return res.status(400).json({ error: 'run_id must be positive integer' });
+  }
+  const db = getMirrorDB();
+  const row = db.prepare(`
+    SELECT run_id, status, source_run_hash, finalized_at, synced_at
+    FROM mirror_mf_publish_runs WHERE run_id = ?
+  `).get(runId);
+  if (!row) return res.status(404).json({ error: 'run_not_found', run_id: runId });
+  res.json(row);
+});
+
 // ─── MF Phase 1a: POST /api/sync/mf/runs/:run_id/finalize ─────────────────
 // 全 entity の chunk 受信完了を検証し、mirror_mf_publish_runs.status を
 // 'pending_sync' → 'success' に flip。VIEW v_mirror_mf_*_latest がこの瞬間に活性化。

@@ -104,6 +104,47 @@ console.log(`  miniPC mf_publish_runs: status=${runRow.status} started=${runRow.
 console.log(`  dry-run: ${isDryRun}`);
 
 // ============================================================
+// 1.5 Render 側の run 状態を事前照会 (監査PR-4後続: 確定済 run の再送スキップ)
+// ============================================================
+// PR #435 で親 upsert が status を正しく保持するようになった結果、mirror が既に
+// success の run へ子 chunk を再送すると受信側ガード (parent_run_not_pending 409)
+// で弾かれる。mirror が success ならこの run は同期済み = 送信自体を no-op スキップ。
+// (旧コードは親 OR REPLACE が status を pending_sync に巻き戻すことで"偶然"再送が
+//  通っており、その代償として CASCADE で子 mart が毎回消えていた = 監査 S-3)
+// 照会失敗時は送信を続行 (照会 endpoint 未デプロイの旧 Render 互換 + fail-open でも
+// 子 chunk 側 409 ガードが最終防衛線なので確定済データは壊れない)。
+if (!isDryRun) {
+  try {
+    const probeRes = await fetch(`${renderUrl}/api/sync/mf/runs/${runId}/status`, {
+      headers: syncKey ? { 'x-sync-key': syncKey } : {},
+      signal: AbortSignal.timeout(30000),
+    });
+    if (probeRes.ok) {
+      const probe = await probeRes.json();
+      console.log(`  Render mirror: status=${probe.status} finalized_at=${probe.finalized_at || '(null)'}`);
+      if (probe.status === 'success') {
+        if (probe.source_run_hash && runRow.source_run_hash && probe.source_run_hash !== runRow.source_run_hash) {
+          console.warn(`⚠️  mirror は success 済みだが source_run_hash 不一致 (miniPC=${runRow.source_run_hash} / mirror=${probe.source_run_hash})。確定済 run は不変契約のため送信せずスキップ。要調査。`);
+        }
+        console.log(`[mf-sync] SKIP: run_id=${runId} は mirror 側で既に success (同期済み)。送信不要。`);
+        process.exit(0);
+      }
+      if (probe.status !== 'pending_sync') {
+        console.error(`[mf-sync] FATAL: mirror 側 run_id=${runId} が想定外 status=${probe.status} (手動調査要)`);
+        process.exit(1);
+      }
+      console.log(`  → mirror は pending_sync (前回途中失敗の可能性) — 埋め直し送信を続行`);
+    } else if (probeRes.status === 404) {
+      console.log(`  Render mirror: run 未送信 (404) — 初回送信を続行`);
+    } else {
+      console.warn(`⚠️  status 照会 HTTP ${probeRes.status} — 照会をスキップして送信続行`);
+    }
+  } catch (e) {
+    console.warn(`⚠️  status 照会失敗 (${e.message}) — 照会をスキップして送信続行`);
+  }
+}
+
+// ============================================================
 // 2. Entity 配列定義 + payload build
 // ============================================================
 const syncedAt = new Date().toISOString();
