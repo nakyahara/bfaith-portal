@@ -11,6 +11,7 @@
  *
  * daily-sync.js から呼び出す or 単体実行可能。
  */
+import 'dotenv/config';
 import { getDB } from './db.js';
 
 const RENDER_URL = process.env.RENDER_MIRROR_URL || 'https://bfaith-portal.onrender.com/apps/mirror';
