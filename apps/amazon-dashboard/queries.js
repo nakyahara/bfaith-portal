@@ -769,6 +769,22 @@ export function getDiagnosis() {
     return r.profit_before_ads - a.direct - a.allocated;
   };
 
+  // 赤字SKU判定用: 直近 loss_months ヶ月分の SKU 別広告後利益 (m1 から遡る)
+  // (Codex R2 Medium #1: loss_months 設定を実際に判定へ反映)
+  const lossMonths = Math.max(2, Math.min(12, Math.round(settings.loss_months)));
+  const monthlyProfit = [];   // [{ym, map<sku, profit_after>}] 新しい順
+  for (let i = 0; i < lossMonths; i++) {
+    const targetYm = addMonths(ym, -(i + 1));
+    let skuAgg, alloc;
+    if (i === 0) { skuAgg = cur; alloc = allocCur; }
+    else if (i === 1) { skuAgg = prev; alloc = allocPrev; }
+    else {
+      skuAgg = settledBySku(db, monthStart(targetYm), monthEnd(targetYm));
+      alloc = allocateAdCost(db, monthStart(targetYm), monthEnd(targetYm), skuAgg).alloc;
+    }
+    monthlyProfit.push({ ym: targetYm, map: new Map(skuAgg.map(r => [r.seller_sku, profitAfter(r, alloc)])) });
+  }
+
   // ABC A 群 (稼ぎ頭)
   const byProfit = [...cur].sort((a, b) => profitAfter(b, allocCur) - profitAfter(a, allocCur));
   const totalProfit = byProfit.reduce((s, r) => s + Math.max(0, profitAfter(r, allocCur)), 0);
@@ -782,16 +798,17 @@ export function getDiagnosis() {
     if (totalProfit > 0 && cum / totalProfit * 100 >= settings.abc_a_pct) break;
   }
 
-  // 赤字 SKU (2ヶ月連続 広告後赤字)
+  // 赤字 SKU (loss_months ヶ月連続 広告後赤字。全対象月に実績があり、かつ全月赤字)
   const lossSkus = cur.filter(r => {
-    const pCur = profitAfter(r, allocCur);
-    const rPrev = prevMap.get(r.seller_sku);
-    const pPrev = rPrev ? profitAfter(rPrev, allocPrev) : null;
-    return pCur < 0 && pPrev !== null && pPrev < 0;
+    return monthlyProfit.every(mp => {
+      const p = mp.map.get(r.seller_sku);
+      return p !== undefined && p < 0;
+    });
   }).map(r => ({
     seller_sku: r.seller_sku, product_name: r.product_name,
-    profit_cur: Math.round(profitAfter(r, allocCur)),
-    profit_prev: Math.round(profitAfter(prevMap.get(r.seller_sku), allocPrev)),
+    profit_cur: Math.round(monthlyProfit[0].map.get(r.seller_sku)),
+    profit_prev: Math.round(monthlyProfit[1].map.get(r.seller_sku)),
+    months_checked: lossMonths,
     revenue_excl: Math.round(r.revenue_excl),
   })).sort((a, b) => a.profit_cur - b.profit_cur).slice(0, 50);
 
@@ -810,7 +827,9 @@ export function getDiagnosis() {
     };
   }).filter(Boolean).sort((a, b) => b.drop_pt - a.drop_pt).slice(0, 50);
 
-  // 広告垂れ流し (直近30日: 実ACOS > 損益分岐)
+  // 広告垂れ流し (直近 ad_bleed_days 日の**合算** ACOS > 損益分岐 ACOS)
+  // 日次連続性ではなく期間合算での判定 (仕様、Codex R2 Medium #2 で明確化)。
+  // 単日ノイズ排除のため期間広告費 ¥1,000 未満は対象外。
   const adFrom = addDays(today, -(settings.ad_bleed_days - 1));
   const recent = settledBySku(db, adFrom, today);
   const { alloc: allocRecent } = allocateAdCost(db, adFrom, today, recent);
@@ -822,7 +841,7 @@ export function getDiagnosis() {
   `).all().map(r => [r.sku, r.unit_cost]));
   const adBleed = recent.map(r => {
     const a = allocRecent.get(r.seller_sku);
-    if (!a || a.direct <= 0 || a.ad_sales <= 0) return null;
+    if (!a || a.direct < 1000 || a.ad_sales <= 0) return null;
     const acos = a.direct / a.ad_sales * 100;
     const avgPrice = r.units_net > 0 ? r.principal_excl / r.units_net : null;
     const fee = feeMap.get(r.seller_sku.toLowerCase());

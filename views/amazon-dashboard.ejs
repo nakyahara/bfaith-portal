@@ -701,11 +701,11 @@ async function loadDiagnosis() {
     document.getElementById('diag-cards').innerHTML = `
       <div class="diag-card"><h4>💪 稼ぎ頭 (利益上位、A群 ${d.earners.length}件) — 在庫切れ防止最優先</h4>
         ${li(d.earners, r => `<tr><td>${esc(r.seller_sku)}</td><td class="name-cell">${esc(r.product_name || '')}</td><td class="num pos">${fmtYen(r.profit_after_ads)}</td></tr>`)}</div>
-      <div class="diag-card"><h4>🩸 赤字SKU (広告後赤字 2ヶ月連続、${d.loss_skus.length}件) — 値上げ/広告停止/撤退判断</h4>
+      <div class="diag-card"><h4>🩸 赤字SKU (広告後赤字 ${d.settings.loss_months}ヶ月連続、${d.loss_skus.length}件) — 値上げ/広告停止/撤退判断</h4>
         ${li(d.loss_skus, r => `<tr><td>${esc(r.seller_sku)}</td><td class="name-cell">${esc(r.product_name || '')}</td><td class="num negv">${fmtYen(r.profit_cur)}</td><td class="num negv">${fmtYen(r.profit_prev)}</td></tr>`)}</div>
       <div class="diag-card"><h4>📉 悪化SKU (利益率 前月比−${d.settings.margin_drop_pt}pt超、${d.worsened.length}件)</h4>
         ${li(d.worsened, r => `<tr><td>${esc(r.seller_sku)}</td><td class="name-cell">${esc(r.product_name || '')}</td><td class="num">${r.margin_prev_pct}%→${r.margin_cur_pct}%</td><td class="num negv">−${r.drop_pt}pt</td></tr>`)}</div>
-      <div class="diag-card"><h4>🔥 広告垂れ流し (実ACOS>損益分岐、直近${d.settings.ad_bleed_days}日、${d.ad_bleed.length}件)</h4>
+      <div class="diag-card"><h4>🔥 広告垂れ流し (直近${d.settings.ad_bleed_days}日合算ACOS>損益分岐、${d.ad_bleed.length}件)</h4>
         ${li(d.ad_bleed, r => `<tr><td>${esc(r.seller_sku)}</td><td class="name-cell">${esc(r.product_name || '')}</td><td class="num">ACOS ${r.acos_pct}% > 分岐 ${r.breakeven_acos_pct}%</td><td class="num">${fmtYen(r.ad_cost)}</td></tr>`)}</div>
       <div class="diag-card"><h4>💤 死に筋 (販売0×${d.settings.dead_stock_days}日+在庫あり、${d.dead_stock.length}件) — <a href="/apps/profit-analysis" target="_blank">撤退判断タブへ</a></h4>
         ${li(d.dead_stock, r => `<tr><td>${esc(r.ne_code)}</td><td class="name-cell">${esc(r.product_name || '')}</td><td class="num">${r.qty}個</td><td class="num">${fmtYen(r.stock_value)}</td><td>${esc(r.last_sold_date || '販売実績なし')}</td></tr>`)}</div>
