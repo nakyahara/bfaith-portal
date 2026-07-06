@@ -305,6 +305,17 @@ async function main() {
     results.push({ name: 'Amazon手数料', success: false, summary: '⏭️ skipped (SP-API失敗のため)' });
   }
 
+  // Amazon カート(Buy Box)価格スナップショット (amazon-dashboard PR-D)
+  // Product Pricing v0 batch (0.5 RPS)。~2,500 SKU で 2 パス ≈ 9 分想定、30 分余裕。
+  // 対象 SKU は amazon_sku_fees キャッシュ流用のため、SP-API 失敗時はスキップ。
+  if (spResult.success) {
+    const pricesResult = runScript('apps/warehouse/fetch-amazon-prices.js', 'Amazonカート価格', 1800000);
+    results.push({ name: 'Amazonカート価格', ...pricesResult });
+  } else {
+    console.log('[DailySync] SP-API 失敗のため Amazonカート価格取得をスキップ');
+    results.push({ name: 'Amazonカート価格', success: false, summary: '⏭️ skipped (SP-API失敗のため)' });
+  }
+
   // FBA 在庫スナップショット (RESTOCK + PLANNING) — daily_snapshots に履歴蓄積
   // 手動 /fetch-reports と lockfile で排他、既に走ってればスキップ (失敗扱いにしない)
   // SP-API レポート polling のため最大 15 分余裕
@@ -436,6 +447,19 @@ async function main() {
       results.push({ name: 'Amazon Ads sync', ...adsSyncResult });
     } else {
       console.log('[DailySync] Amazon Ads sync は fetch 失敗 (campaign/SKU いずれか) のためスキップ (fetch retry 後に翌 cron で sync 実行)');
+    }
+
+    // === Amazon カート価格 mirror sync (amazon-dashboard PR-D) ===
+    // 日次スナップショットなので直近 3 日窓で十分 (取り漏れ日の再送用)。
+    const pricesFetchOk = results.some(r => r.name === 'Amazonカート価格' && r.success);
+    if (pricesFetchOk) {
+      const priceSyncResult = runScript(
+        `apps/warehouse/sync-amazon-price-snapshot.js --data-dir ${DATA_DIR_ARG} --days 3`,
+        'Amazonカート価格 sync', 300000
+      );
+      results.push({ name: 'Amazonカート価格 sync', ...priceSyncResult });
+    } else {
+      console.log('[DailySync] Amazonカート価格 sync は fetch 失敗のためスキップ');
     }
 
     // === Amazon アカウント単位フィー月次 (amazon-dashboard PR-C) ===

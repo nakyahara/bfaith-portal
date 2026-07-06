@@ -59,6 +59,7 @@ export const DEFAULT_SETTINGS = {
   abc_a_pct: 80,              // ABC: A = 売上累積 N% まで
   abc_b_pct: 95,
   new_product_days: 60,       // 新商品バッジ: 初売上から N 日
+  price_gap_pct: 5,           // カート価格ズレ: |自分の価格−カート価格|/カート価格 ≥ N%
 };
 
 export function getSettings() {
@@ -961,6 +962,46 @@ export function getDiagnosis() {
     `).all(latestInvDate, deadCutoff).map(r => ({ ...r, stock_value: Math.round(r.stock_value) }));
   }
 
+  // 💱 カート価格ズレ + 🛒 カート非保有 (mirror_amazon_price_snapshot_daily 最新日、PR-D)
+  const priceSnapDate = db.prepare(`SELECT MAX(date_jst) AS d FROM mirror_amazon_price_snapshot_daily`).get()?.d;
+  let priceGap = [];
+  let buyboxLost = [];
+  if (priceSnapDate) {
+    const snaps = db.prepare(`
+      SELECT seller_sku, asin, channel, my_price, buybox_price, buybox_is_mine
+      FROM mirror_amazon_price_snapshot_daily WHERE date_jst = ?
+    `).all(priceSnapDate);
+    // 直近30日売上マップ (buybox_lost の「売れてる SKU」判定 + 並び順用)。
+    // ad_bleed_days 設定に連動させず 30 日固定 (Codex R1 Medium)
+    const recentRevMap = new Map(db.prepare(`
+      SELECT seller_sku, SUM(sales_principal_jpy + sales_shipping_jpy + sales_giftwrap_jpy) AS rev
+      FROM mirror_amazon_finance_sku_daily WHERE date_jst >= ? GROUP BY seller_sku
+    `).all(addDays(today, -29)).map(r => [r.seller_sku.toLowerCase(), Math.round(r.rev)]));
+    for (const s of snaps) {
+      // buybox_is_mine が明示的に 0 (他社保有) のときだけ検知対象。
+      // NULL (belongsToRequester 未返却 = 保有者不明) を lost 扱いすると偽陽性 (Codex R2 High)
+      if (s.buybox_price == null || s.buybox_is_mine !== 0) continue;
+      // カートを他社に取られている + 直近30日に売上がある SKU
+      const rev = recentRevMap.get(s.seller_sku.toLowerCase());
+      if (rev !== undefined && rev > 0) {
+        buyboxLost.push({ seller_sku: s.seller_sku, asin: s.asin, my_price: s.my_price, buybox_price: s.buybox_price, revenue_30d: rev });
+      }
+      // 価格ズレ (自分の出品価格があるものだけ)
+      if (s.my_price == null) continue;
+      const gapPct = Math.round((s.my_price - s.buybox_price) / s.buybox_price * 1000) / 10;
+      if (Math.abs(gapPct) >= settings.price_gap_pct) {
+        priceGap.push({
+          seller_sku: s.seller_sku, asin: s.asin,
+          my_price: Math.round(s.my_price), buybox_price: Math.round(s.buybox_price),
+          gap_pct: gapPct, direction: gapPct > 0 ? 'higher' : 'lower',
+          revenue_30d: rev || 0,
+        });
+      }
+    }
+    priceGap = attachProductNames(db, priceGap.sort((a, b) => Math.abs(b.gap_pct) - Math.abs(a.gap_pct)).slice(0, 50));
+    buyboxLost = attachProductNames(db, buyboxLost.sort((a, b) => b.revenue_30d - a.revenue_30d).slice(0, 50));
+  }
+
   // 🚱 出したのに売れてない (立ち上がり不発): 発売 180 日以内 + 在庫あり + 直近30日販売 ≦1
   const flopLaunchCutoff = addDays(today, -180);
   let launchFlop = [];
@@ -1007,6 +1048,7 @@ export function getDiagnosis() {
     earners: earners.slice(0, 30), loss_skus: lossSkus, worsened, ad_bleed: adBleed,
     dead_stock: deadStock, dead_stock_as_of: latestInvDate, price_miss: priceMiss,
     launch_flop: launchFlop,
+    price_gap: priceGap, buybox_lost: buyboxLost, price_snapshot_date: priceSnapDate || null,
   };
 }
 

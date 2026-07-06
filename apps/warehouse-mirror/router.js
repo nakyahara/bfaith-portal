@@ -632,6 +632,23 @@ function getAmazonAdsCampaignInsert(db) {
   return b.amazonAdsCampaignInsert;
 }
 
+// カート価格スナップショット (amazon-dashboard PR-D)
+function getAmazonPriceSnapshotInsert(db) {
+  const b = getStmtBundle(db);
+  if (!b.amazonPriceSnapshotInsert) {
+    b.amazonPriceSnapshotInsert = db.prepare(`
+      INSERT OR REPLACE INTO mirror_amazon_price_snapshot_daily (
+        date_jst, seller_sku, asin, channel, my_price, buybox_price, buybox_is_mine,
+        fetched_at, source_run_id, source_row_hash, synced_at
+      ) VALUES (
+        @date_jst, @seller_sku, @asin, @channel, @my_price, @buybox_price, @buybox_is_mine,
+        @fetched_at, @source_run_id, @source_row_hash, @synced_at
+      )
+    `);
+  }
+  return b.amazonPriceSnapshotInsert;
+}
+
 // アカウント単位フィー月次 (amazon-dashboard PR-C)
 function getAmazonAccountFeesInsert(db) {
   const b = getStmtBundle(db);
@@ -1111,6 +1128,15 @@ const ENTITY_REGISTRY = {
     clear_meta_key: 'clear_amazon_account_fees_dates',
     getInsertStmt: getAmazonAccountFeesInsert,
     normalizeRow: (r) => normalizeAmazonAccountFeesRow(r),
+  },
+  // カート(Buy Box)価格 日次スナップショット (amazon-dashboard PR-D)
+  amazon_price_snapshot_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_amazon_price_snapshot_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_amazon_price_snapshot_dates',
+    getInsertStmt: getAmazonPriceSnapshotInsert,
+    normalizeRow: (r) => normalizeAmazonPriceSnapshotRow(r),
   },
   rakuten_finance_sku_daily: {
     contract_version: 1,
@@ -1924,6 +1950,23 @@ function normalizeAmazonAdsCampaignRow(r) {
     ad_sales_1d: r.ad_sales_1d ?? 0, ad_sales_7d: r.ad_sales_7d ?? 0,
     ad_sales_14d: r.ad_sales_14d ?? 0, ad_sales_30d: r.ad_sales_30d ?? 0,
     ad_units_1d: r.ad_units_1d ?? 0,
+    source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,
+    synced_at: r.synced_at,
+  };
+}
+
+// row 列正規化 (mirror_amazon_price_snapshot_daily 用、amazon-dashboard PR-D)
+function normalizeAmazonPriceSnapshotRow(r) {
+  const isMine = r.buybox_is_mine;
+  return {
+    date_jst: r.date_jst,
+    seller_sku: requireAdKey(r, 'seller_sku'),
+    asin: (r.asin === null || r.asin === undefined) ? '' : String(r.asin),
+    channel: r.channel ?? null,
+    my_price: r.my_price ?? null,
+    buybox_price: r.buybox_price ?? null,
+    buybox_is_mine: (isMine === 0 || isMine === 1) ? isMine : null,
+    fetched_at: r.fetched_at ?? null,
     source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,
     synced_at: r.synced_at,
   };
