@@ -932,7 +932,8 @@ function getLedgerInsert(db) {
 }
 
 // ─── MF Phase 1a: insert factory + 列定義 (ENTITY_REGISTRY より先に必要) ───
-// 全 MF mirror テーブル共通: INSERT OR REPLACE (run_id+業務PK でユニーク、idempotent)
+// 子 MF mirror テーブル共通: INSERT OR REPLACE (run_id+業務PK でユニーク、idempotent)
+// ※ 親 mf_publish_runs にはこの factory を使わない (下の makeMfPublishRunsUpsertFactory 参照)
 function makeMfInsertFactory(table, cols) {
   return (db) => {
     const b = getStmtBundle(db);
@@ -941,6 +942,36 @@ function makeMfInsertFactory(table, cols) {
       const colsList = cols.join(', ');
       const placeholders = cols.map(c => '@' + c).join(', ');
       b[cacheKey] = db.prepare(`INSERT OR REPLACE INTO ${table} (${colsList}) VALUES (${placeholders})`);
+    }
+    return b[cacheKey];
+  };
+}
+
+// 親 mf_publish_runs 専用 UPSERT (設計監査 2026-07-06 S-3/V-1 対応):
+// SQLite の INSERT OR REPLACE は内部的に DELETE+INSERT なので、親行の REPLACE が
+// ON DELETE CASCADE で同 run_id の子 mart 全行を巻き添え削除していた。
+// sender (sync-mf-marts-to-render.js) は毎回「miniPC 最新 success run」を選ぶため
+// 同一 run_id の再送が常態で、再送が途中失敗すると子 mart が消えたまま
+// status='pending_sync' に戻り、過去 run が無ければ経営ダッシュボードが空になる
+// (feedback_mf_atomic_publish の「DELETE→INSERT 空テーブル」と同型の穴)。
+// → UPDATE 型 UPSERT に変更し、既存の status / finalized_at は保持する:
+//   ・既存 run が success のまま再送されても view から消えない (子行は row 単位で
+//     OR REPLACE され、同一 run_id の内容は決定的なので混在しても実害なし)
+//   ・新規 run は従来通り status='pending_sync' で INSERT され finalize で flip
+//   ・前回途中失敗 (pending_sync) の再送も従来通り finalize まで進めば success
+function makeMfPublishRunsUpsertFactory(cols) {
+  return (db) => {
+    const b = getStmtBundle(db);
+    const cacheKey = '_mfUpsert_mirror_mf_publish_runs';
+    if (!b[cacheKey]) {
+      const colsList = cols.join(', ');
+      const placeholders = cols.map(c => '@' + c).join(', ');
+      const updatable = cols.filter(c => !['run_id', 'status', 'finalized_at'].includes(c));
+      const setList = updatable.map(c => `${c} = excluded.${c}`).join(', ');
+      b[cacheKey] = db.prepare(
+        `INSERT INTO mirror_mf_publish_runs (${colsList}) VALUES (${placeholders})
+         ON CONFLICT(run_id) DO UPDATE SET ${setList}`
+      );
     }
     return b[cacheKey];
   };
@@ -1124,7 +1155,8 @@ const ENTITY_REGISTRY = {
     mirror_table: 'mirror_mf_publish_runs',
     clear_strategy: 'no_clear',
     requires_parent_run: false,
-    getInsertStmt: makeMfInsertFactory('mirror_mf_publish_runs', MF_PUBLISH_RUNS_COLS),
+    // OR REPLACE 禁止: CASCADE で子 mart が消える (makeMfPublishRunsUpsertFactory のコメント参照)
+    getInsertStmt: makeMfPublishRunsUpsertFactory(MF_PUBLISH_RUNS_COLS),
     normalizeRow: (r) => normalizeMfPublishRunRow(r),
   },
   mf_executive_top: {
