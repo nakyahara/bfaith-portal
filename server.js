@@ -883,7 +883,8 @@ app.use('/apps/warehouse', requireAppAccess('warehouse'), warehouseRouter);
 // === Mirror subtree middleware (Codex 6周レビュー反映) ===
 // accessLog は /apps/mirror 全体に掛ける (401含めて全requestを観測できる)。
 // 認証+8MB parser+parser error handler は /apps/mirror/api/sync* のみ (mutation専用)。
-// 既存の read API (/apps/mirror/api/products など) は従来通り認証なしで素通し。
+// read API (/apps/mirror/api/products 等) は「portalセッション or MIRROR_READ_TOKEN」必須
+// (設計監査 2026-07-06 S-2: 原価・仕入先・全モール売上・全件CSVが公開URLから素通しだった)。
 function mirrorAccessLog(req, res, next) {
   const start = Date.now();
   res.on('finish', () => {
@@ -944,7 +945,29 @@ app.use('/apps/mirror/api/sync', express.json({
 }));
 app.use('/apps/mirror/api/sync', mirrorParserErrorHandler);
 
-// read API (/api/products 等) は従来通り認証なしで素通し。
+// read API 認証 (監査 S-2 対応): portal セッション or x-read-token (MIRROR_READ_TOKEN) のどちらかで許可。
+//   ・対象は認証が無かった 5 endpoint のみ (products / sales/monthly / sales/daily / status / download/:table)。
+//   ・独自 token を持つ既存ルート (/api/sync* = sync key, /api/pml/* = PML_*_TOKEN,
+//     /api/sku-master/* = MIRROR_READ_TOKEN) は各自の認証を維持するため対象外 (二重認証にしない)。
+//   ・MIRROR_READ_TOKEN 未設定でも session 経路は生きる。token 経路は不一致/未設定で拒否 (fail-closed)。
+//   ・token は header only (query 受理は URL/アクセスログ残留のため禁止。requireReadToken と同方針)。
+function requireSessionOrReadToken(req, res, next) {
+  if (req.session && req.session.authenticated) return next();
+  const token = process.env.MIRROR_READ_TOKEN;
+  const provided = req.headers['x-read-token'];
+  if (token && provided && provided === token) return next();
+  return res.status(401).json({ error: 'auth_required' });
+}
+app.use(
+  [
+    '/apps/mirror/api/products',
+    '/apps/mirror/api/sales',
+    '/apps/mirror/api/status',
+    '/apps/mirror/api/download',
+  ],
+  requireSessionOrReadToken
+);
+
 // mirrorRouter 内部の `router.post('/api/sync', requireSyncKey, ...)` が二重防御として残る。
 app.use('/apps/mirror', mirrorRouter);
 
