@@ -49,14 +49,14 @@ const tx = db.transaction(() => {
     product_name, units_ordered, units_cancelled, units_net_sold,
     sales_principal_jpy_incl, postage_allocated_jpy_incl, gross_sales_jpy_incl,
     net_sales_after_coupon_jpy_incl, request_price_jpy_incl,
-    coupon_shop_jpy_incl, gift_point_jpy_incl,
+    coupon_shop_jpy_incl, gift_point_jpy_incl, premium_member_point_jpy_incl, point_cost_pending_jpy_incl,
     mall_fee_jpy_incl, mall_fee_rate_applied, mall_fee_calc_method,
     shipping_cost_jpy_incl, shipping_quality,
     unit_cost_snapshot_incl, cogs_amount_jpy_incl,
     variable_margin_partial_jpy_incl, margin_confidence,
     cost_status, is_cost_complete, data_quality_score,
     source_run_id, source_row_hash, synced_at
-  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'partial', ?, ?, ?, 'smoke', 'h', 't')`);
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'partial', ?, ?, ?, 'smoke', 'h', 't')`);
 
   const insListing = db.prepare(`INSERT INTO mirror_f_sales_by_listing (
     date_jst, month_ym, mall, item_code, channel, item_name, units, sales_jpy_incl, order_count,
@@ -67,12 +67,13 @@ const tx = db.transaction(() => {
   for (let i = 0; i < 90; i++) {
     const date = d(i);
     {
-      // alpha (master_match): 10個/日 単価1000。クーポン300。手数料13% (推定)。送料負担が重い
-      const gross = 10000, coupon = 300, fee = 1261, shipping = 1700, cogs = 5000, gift = 93;
+      // alpha (master_match): 10個/日 単価1000。クーポン300。手数料13% (推定)。送料負担が重い。
+      // premium 7 円 → point_cost_pending (=gift+premium) が gift 単独と異なるケース (Codex R1 medium の検証)
+      const gross = 10000, coupon = 300, fee = 1261, shipping = 1700, cogs = 5000, gift = 93, premium = 7;
       const vm = gross - cogs - fee - shipping - coupon; // 1739
       ins.run(date, 'apa-alpha-bk', 'NE-A', 'BK', 'master_match', 0, 'アルファ精油BK', 10, 10,
         gross, gross, gross - coupon, gross - coupon,
-        coupon, gift, fee, 0.13, 'estimated_rate', shipping, 'estimated_rates',
+        coupon, gift, premium, gift + premium, fee, 0.13, 'estimated_rate', shipping, 'estimated_rates',
         500, cogs, vm, 'complete', 1, 100);
     }
     {
@@ -81,7 +82,7 @@ const tx = db.transaction(() => {
       const vm = gross - cogs - fee - shipping; // 1600
       ins.run(date, 'apa-beta', 'NE-B', '', 'master_match', 0, 'ベータ茶葉', 4, 4,
         gross, gross, gross, gross,
-        0, gift, fee, 0.13, 'estimated_rate', shipping, 'estimated_rates',
+        0, gift, 0, gift, fee, 0.13, 'estimated_rate', shipping, 'estimated_rates',
         1000, cogs, vm, 'complete', 1, 100);
     }
     {
@@ -90,7 +91,7 @@ const tx = db.transaction(() => {
       const vm = gross; // 500 (原価/手数料/送料とも計上なし)
       ins.run(date, 'apa-gamma', null, '', 'unresolved', 1, 'ガンマ雑貨', 1, 1,
         gross, gross, gross, gross,
-        0, gift, null, null, 'unknown', 0, 'missing',
+        0, gift, 0, gift, null, null, 'unknown', 0, 'missing',
         null, 0, vm, 'missing_cost', 0, 40);
     }
     // 速報 (NE受注): fact より大きい = 未完了注文を含む。他モール行はフィルタされること
@@ -116,8 +117,8 @@ function assert(cond, msg) { if (!cond) throw new Error(msg); }
 
 const DAY_SALES = 10000 + 8000 + 500;   // 18500
 const DAY_L1 = 1739 + 1600 + 500;       // 3839
-const DAY_GIFT = 93 + 74 + 5;           // 172
-const DAY_L2 = DAY_L1 - DAY_GIFT;       // 3667
+const DAY_POINT = (93 + 7) + 74 + 5;    // 179 (gift+premium = point_cost_pending)
+const DAY_L2 = DAY_L1 - DAY_POINT;      // 3660
 const DAY_SHIP = 1700 + 1360;           // 3060
 
 check('resolvePeriod', () => {
@@ -152,9 +153,11 @@ check('getOverview', () => {
   assert(tYest.flash_units === 16 && tYest.flash_orders === 12, '速報 units/orders');
   assert(tYest.units_net === 15, `昨日販売数 (got ${tYest.units_net})`);
   assert(tYest.variable_margin === DAY_L1, `昨日L1 (got ${tYest.variable_margin})`);
-  assert(tYest.gift_point === DAY_GIFT, `付与pt (got ${tYest.gift_point})`);
-  assert(tYest.l2_margin === DAY_L2, `L2 = L1 − 付与pt (got ${tYest.l2_margin})`);
+  assert(tYest.point_cost === DAY_POINT, `ポイント原資 (gift+premium) (got ${tYest.point_cost})`);
+  assert(tYest.l2_margin === DAY_L2, `L2 = L1 − ポイント原資 (got ${tYest.l2_margin})`);
   assert(tYest.mall_fee_est === 1261 + 1040, `手数料 (NULL は 0 扱い) (got ${tYest.mall_fee_est})`);
+  assert(tYest.fee_unknown_pct === Math.round(500 / 18500 * 1000) / 10,
+    `手数料未設定売上の割合 (gamma分、got ${tYest.fee_unknown_pct})`);
   assert(tYest.shipping === DAY_SHIP, `送料 (got ${tYest.shipping})`);
   assert(tYest.shipping_pct === Math.round(DAY_SHIP / DAY_SALES * 1000) / 10, `送料負担率 (got ${tYest.shipping_pct})`);
   assert(tYest.cost_coverage_pct === Math.round(18000 / 18500 * 1000) / 10, `原価カバー率 (got ${tYest.cost_coverage_pct})`);
@@ -173,6 +176,7 @@ check('getTrend day + 三太郎フラグ', () => {
   assert(r.rows.length === 30, `30日分 (got ${r.rows.length})`);
   const row = r.rows[0];
   assert(row.sales_incl === DAY_SALES, `日次売上 (got ${row.sales_incl})`);
+  assert(row.point_cost === DAY_POINT, `日次ポイント原資 (got ${row.point_cost})`);
   assert(row.l2_margin === DAY_L2, `日次L2 (got ${row.l2_margin})`);
   assert(row.margin_pct !== null && row.l2_pct !== null, 'margin_pct / l2_pct');
   assert(row.shipping_pct === Math.round(DAY_SHIP / DAY_SALES * 1000) / 10, `送料負担率 (got ${row.shipping_pct})`);

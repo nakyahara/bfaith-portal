@@ -72,7 +72,7 @@
       </div>
     </div>
     <div class="meta-bar">
-      <span>精度: <span class="pbadge flash">速報</span>=NE受注(当日含む) <span class="pbadge auto">自動(日次)</span>=完了ベースfact(毎朝更新) <span class="pbadge act">実額(API)</span>=付与ポイント <span class="pbadge est">推定13%</span>=成約手数料 / 金額はすべて<b>税込</b></span>
+      <span>精度: <span class="pbadge flash">速報</span>=NE受注(当日含む) <span class="pbadge auto">自動(日次)</span>=完了ベースfact(毎朝更新) <span class="pbadge act">実額(API)</span>=ポイント原資(付与pt+プレミアム負担) <span class="pbadge est">推定13%</span>=成約手数料 / 金額はすべて<b>税込</b></span>
       <span id="meta-updated"></span>
     </div>
 
@@ -100,7 +100,7 @@
         <div class="charts-grid">
           <div class="chart-card" style="grid-column: 1 / -1;">
             <h3>売上 × 粗利(L1) × ポイント後利益(L2) <span class="pbadge auto">自動(日次)</span>
-              <span class="note">L1 = 売上 − 原価 − 手数料<span class="pbadge est">推定13%</span> − 送料 − クーポン / L2 = L1 − 付与ポイント<span class="pbadge act">実額(API)</span>。日次表示では<b style="color:#eb5505;">三太郎の日 (3・13・23日)</b> をオレンジでハイライト</span>
+              <span class="note">L1 = 売上 − 原価 − 手数料<span class="pbadge est">推定13%</span> − 送料 − クーポン / L2 = L1 − ポイント原資<span class="pbadge act">実額(API)</span>。日次表示では<b style="color:#eb5505;">三太郎の日 (3・13・23日)</b> をオレンジでハイライト</span>
             </h3>
             <div class="chart-wrap tall"><canvas id="chart-trend"></canvas></div>
           </div>
@@ -109,7 +109,7 @@
             <div class="chart-wrap"><canvas id="chart-units"></canvas></div>
           </div>
           <div class="chart-card">
-            <h3>送料 × クーポン × 付与ポイントの推移 <span class="note">送料負担率 (全店~17%) が au PAY 最重要の監視指標</span></h3>
+            <h3>送料 × クーポン × ポイント原資の推移 <span class="note">送料負担率 (全店~17%) が au PAY 最重要の監視指標</span></h3>
             <div class="chart-wrap"><canvas id="chart-deductions"></canvas></div>
           </div>
         </div>
@@ -238,18 +238,23 @@ async function loadOverview() {
       document.getElementById('ov-unresolved').innerHTML =
         `<div class="warn-note">⚠️ SKU未解決: 今月 <b>${data.unresolved.sku_count}</b> SKU / 売上 ${fmtJPY(data.unresolved.sales_incl)} (${fmtPct(data.unresolved.share_pct)}) が商品マスタに紐づいていません (原価0円計上のため粗利が過大に出ます)。P2で f_aupay_sku_map 登録導線を実装予定。</div>`;
     }
-    const tiles = data.tiles.map(t => `<div class="tile">
+    const tiles = data.tiles.map(t => {
+      // 手数料率が未設定 (calc_method='unknown') のまま 0 円合算された売上がある期間は L1/L2 過大の警告
+      const feeWarn = t.fee_unknown_pct > 0
+        ? ` <span class="pbadge est" title="手数料率が未設定の売上が${t.fee_unknown_pct}%あり、その分のL1/L2は過大です">⚠未設定${fmtPct(t.fee_unknown_pct)}</span>` : '';
+      return `<div class="tile">
         <h3>${t.label} <span class="note">(${t.from}${t.from !== t.to ? '〜' + t.to : ''})</span></h3>
         <div class="row"><span>売上 <span class="pbadge flash">速報</span></span><span class="v">${fmtJPY(t.flash_sales_incl)}</span></div>
         <div class="row"><span>売上 <span class="pbadge auto">完了ベース</span></span><span class="v">${fmtJPY(t.sales_incl)}</span></div>
         <div class="row"><span>販売数 (速報 / 完了)</span><span class="v">${t.flash_units.toLocaleString()} / ${t.units_net.toLocaleString()}</span></div>
         <div class="row"><span>原価 <span class="note">ｶﾊﾞｰ${fmtPct(t.cost_coverage_pct)}</span></span><span class="v">−${fmtYen(t.cogs)}</span></div>
-        <div class="row"><span>手数料 <span class="pbadge est">推定13%</span> / クーポン</span><span class="v">−${fmtYen(t.mall_fee_est)} / −${fmtYen(t.coupon_shop)}</span></div>
+        <div class="row"><span>手数料 <span class="pbadge est">推定13%</span>${feeWarn} / クーポン</span><span class="v">−${fmtYen(t.mall_fee_est)} / −${fmtYen(t.coupon_shop)}</span></div>
         <div class="row"><span>送料 <span class="note">負担率${fmtPct(t.shipping_pct)}</span></span><span class="v">−${fmtYen(t.shipping)}</span></div>
         <div class="row hero"><span>粗利 L1 <span class="note">${fmtPct(t.margin_pct)}</span></span><span class="v ${signClass(t.variable_margin)}">${fmtJPY(t.variable_margin)}</span></div>
-        <div class="row"><span>付与ポイント <span class="pbadge act">実額(API)</span></span><span class="v">−${fmtYen(t.gift_point)}</span></div>
+        <div class="row"><span>ポイント原資 <span class="pbadge act">実額(API)</span></span><span class="v">−${fmtYen(t.point_cost)}</span></div>
         <div class="row hero"><span>ポイント後利益 L2 <span class="note">${fmtPct(t.l2_pct)}</span></span><span class="v ${signClass(t.l2_margin)}">${fmtJPY(t.l2_margin)}</span></div>
-      </div>`).join('');
+      </div>`;
+    }).join('');
     document.getElementById('ov-tiles').innerHTML = tiles;
   } catch (e) {
     document.getElementById('ov-tiles').innerHTML = `<div class="warn-note">概要の取得に失敗: ${esc(e.message)}</div>`;
@@ -301,7 +306,7 @@ async function loadTrend() {
       data: { labels, datasets: [
         { label: '送料', data: data.rows.map(r => r.shipping), borderColor: '#dc2626', backgroundColor: 'rgba(220,38,38,0.08)', fill: true, pointRadius: 0, yAxisID: 'y' },
         { label: 'クーポン店舗負担', data: data.rows.map(r => r.coupon_shop), borderColor: '#7c3aed', backgroundColor: 'rgba(124,58,237,0.08)', fill: true, pointRadius: 0, yAxisID: 'y' },
-        { label: '付与ポイント', data: data.rows.map(r => r.gift_point), borderColor: '#0369a1', backgroundColor: 'rgba(3,105,161,0.08)', fill: true, pointRadius: 0, yAxisID: 'y' },
+        { label: 'ポイント原資', data: data.rows.map(r => r.point_cost), borderColor: '#0369a1', backgroundColor: 'rgba(3,105,161,0.08)', fill: true, pointRadius: 0, yAxisID: 'y' },
         { label: '送料負担率%', data: data.rows.map(r => r.shipping_pct), type: 'line', borderColor: '#f59e0b', borderDash: [4, 3], pointRadius: 0, yAxisID: 'y1' },
       ]},
       options: { responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false },

@@ -13,8 +13,10 @@
  *
  * 利益概念 (要件 §2.5、税はすべて税込):
  *   L1 = variable_margin_partial (売上(送料按分込) − 原価snapshot − 手数料13%推定 − 送料 − ストアクーポン)
- *   L2 = L1 − 付与ポイント (gift_point_jpy_incl = au API が明細単位で返す実額。SKU別ポイント原資が
- *        API で取れるのは4モール中 au PAY だけ — 本アプリの独自価値)
+ *   L2 = L1 − ポイント原資 (point_cost_pending_jpy_incl = 付与ポイント gift_point + プレミアム会員
+ *        ショップ負担分。au API が明細単位で返す実額。SKU別ポイント原資が API で取れるのは
+ *        4モール中 au PAY だけ — 本アプリの独自価値。Codex R1 medium: gift_point 単独でなく
+ *        pending 集約列を使う — premium 分の取りこぼし防止)
  *   広告費は現在未出稿のため L2 に含めない (§13-②。出稿開始時に C-1 CSV 取込を有効化して控除を追加)
  *   L3 (月次確定) は P4 の請求明細取込で実装予定
  *
@@ -94,12 +96,13 @@ function factSummary(db, from, to) {
       COALESCE(SUM(units_ordered),0)                     AS units_ordered,
       COALESCE(SUM(units_net_sold),0)                    AS units_net,
       COALESCE(SUM(coupon_shop_jpy_incl),0)              AS coupon_shop,
-      COALESCE(SUM(gift_point_jpy_incl),0)               AS gift_point,
+      COALESCE(SUM(point_cost_pending_jpy_incl),0)       AS point_cost,
       COALESCE(SUM(mall_fee_jpy_incl),0)                 AS mall_fee_est,
       COALESCE(SUM(shipping_cost_jpy_incl),0)            AS shipping,
       COALESCE(SUM(cogs_amount_jpy_incl),0)              AS cogs,
       COALESCE(SUM(variable_margin_partial_jpy_incl),0)  AS variable_margin,
       COALESCE(SUM(CASE WHEN is_cost_complete = 1 THEN gross_sales_jpy_incl END),0) AS sales_cost_complete,
+      COALESCE(SUM(CASE WHEN mall_fee_calc_method = 'unknown' THEN gross_sales_jpy_incl END),0) AS sales_fee_unknown,
       COUNT(DISTINCT date_jst)                           AS days_with_data
     FROM mirror_aupay_finance_sku_daily
     WHERE date_jst >= ? AND date_jst <= ?
@@ -144,7 +147,7 @@ export function getOverview() {
   const tiles = periods.map(p => {
     const s = factSummary(db, p.from, p.to);
     const flash = listingSummary(db, p.from, p.to);
-    const l2 = s.variable_margin - s.gift_point;
+    const l2 = s.variable_margin - s.point_cost;
     const daysInPeriod = Math.round((new Date(p.to + 'T00:00:00Z') - new Date(p.from + 'T00:00:00Z')) / 86400000) + 1;
     return {
       ...p,
@@ -159,12 +162,15 @@ export function getOverview() {
       shipping: Math.round(s.shipping),
       cogs: Math.round(s.cogs),
       variable_margin: Math.round(s.variable_margin),
-      gift_point: Math.round(s.gift_point),
+      point_cost: Math.round(s.point_cost),
       l2_margin: Math.round(l2),
       margin_pct: s.sales_incl > 0 ? Math.round(s.variable_margin / s.sales_incl * 1000) / 10 : null,
       l2_pct: s.sales_incl > 0 ? Math.round(l2 / s.sales_incl * 1000) / 10 : null,
       shipping_pct: s.sales_incl > 0 ? Math.round(s.shipping / s.sales_incl * 1000) / 10 : null,
       cost_coverage_pct: s.sales_incl > 0 ? Math.round(s.sales_cost_complete / s.sales_incl * 1000) / 10 : null,
+      // 手数料が率未設定 (calc_method='unknown') のまま 0 円で合算されている売上の割合。
+      // >0 なら L1/L2 が過大 (Codex R1 medium: COALESCE で隠さず可視化する)
+      fee_unknown_pct: s.sales_incl > 0 ? Math.round(s.sales_fee_unknown / s.sales_incl * 1000) / 10 : null,
       days_with_data: s.days_with_data,
       days_in_period: daysInPeriod,
     };
@@ -185,13 +191,24 @@ export function getOverview() {
       ? Math.round(un.sales_incl / monthTile.sales_incl * 1000) / 10 : null,
   };
 
-  // 三太郎の日効果 (直近90日): 三太郎日の日次売上中央値 ÷ 平常日の日次売上中央値 (fact ベース)
-  const daily = db.prepare(`
+  // 三太郎の日効果 (直近90日): 三太郎日の日次売上中央値 ÷ 平常日の日次売上中央値 (fact ベース)。
+  // fact に行がない日は売上 0 としてカレンダー 0 埋めする (Codex R1 low: 欠損日を母集団から
+  // 落とすと中央値が上振れする)。窓の終端は data_to (未同期の未来日を 0 と誤計上しない)
+  const santaroFrom = addDays(today, -89);
+  const santaroTo = freshFact.data_to && freshFact.data_to < today ? freshFact.data_to : today;
+  const dailyRows = db.prepare(`
     SELECT date_jst, SUM(gross_sales_jpy_incl) AS sales
     FROM mirror_aupay_finance_sku_daily
     WHERE date_jst >= ? AND date_jst <= ?
     GROUP BY date_jst
-  `).all(addDays(today, -89), today);
+  `).all(santaroFrom, santaroTo);
+  const salesByDate = new Map(dailyRows.map(r => [r.date_jst, r.sales]));
+  const daily = [];
+  if (santaroFrom <= santaroTo) {
+    for (let dt = santaroFrom; dt <= santaroTo; dt = addDays(dt, 1)) {
+      daily.push({ date_jst: dt, sales: salesByDate.get(dt) || 0 });
+    }
+  }
   const median = (arr) => {
     if (!arr.length) return null;
     const s = [...arr].sort((a, b) => a - b);
@@ -240,21 +257,21 @@ export function getTrend(from, to, granularity) {
       SUM(variable_margin_partial_jpy_incl) AS variable_margin,
       SUM(units_net_sold)                   AS units_net,
       SUM(coupon_shop_jpy_incl)             AS coupon_shop,
-      SUM(gift_point_jpy_incl)              AS gift_point,
-      SUM(mall_fee_jpy_incl)                AS mall_fee_est,
+      SUM(point_cost_pending_jpy_incl)      AS point_cost,
+      COALESCE(SUM(mall_fee_jpy_incl),0)    AS mall_fee_est,
       SUM(shipping_cost_jpy_incl)           AS shipping,
       SUM(cogs_amount_jpy_incl)             AS cogs
     FROM mirror_aupay_finance_sku_daily
     WHERE date_jst >= ? AND date_jst <= ?
     GROUP BY bucket ORDER BY bucket
   `).all(from, to).map(r => {
-    const l2 = r.variable_margin - r.gift_point;
+    const l2 = r.variable_margin - r.point_cost;
     return {
       ...r,
       sales_incl: Math.round(r.sales_incl),
       variable_margin: Math.round(r.variable_margin),
       coupon_shop: Math.round(r.coupon_shop),
-      gift_point: Math.round(r.gift_point),
+      point_cost: Math.round(r.point_cost),
       mall_fee_est: Math.round(r.mall_fee_est),
       shipping: Math.round(r.shipping),
       cogs: Math.round(r.cogs),
