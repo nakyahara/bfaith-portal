@@ -57,7 +57,21 @@
 
     .note { font-size: 11.5px; color: #6b7280; margin: 6px 0; }
     .warn-note { background: #fffbeb; border-left: 4px solid #f59e0b; padding: 8px 12px; font-size: 12px; color: #92400e; border-radius: 4px; margin-bottom: 12px; }
+    .ok-note { background: #ecfdf5; border-left: 4px solid #10b981; padding: 8px 12px; font-size: 12px; color: #065f46; border-radius: 4px; margin-bottom: 8px; }
+    .err-note { background: #fef2f2; border-left: 4px solid #dc2626; padding: 8px 12px; font-size: 12px; color: #991b1b; border-radius: 4px; margin-bottom: 8px; }
     .loading { color: #6b7280; font-size: 13px; padding: 30px; text-align: center; }
+    .section-h { font-size: 14px; font-weight: 700; color: #1f2937; margin: 18px 0 8px; }
+    table.data { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+    table.data th, table.data td { border: 1px solid #e5e7eb; padding: 5px 8px; }
+    table.data th { background: #f9fafb; font-weight: 600; color: #374151; text-align: left; white-space: nowrap; }
+    table.data td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .table-scroll { overflow-x: auto; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+    .pill.ok { background: #d1fae5; color: #065f46; }
+    .pill.err { background: #fee2e2; color: #991b1b; }
+    .pill.todo { background: #f3f4f6; color: #6b7280; }
+    .pill.warn { background: #fef3c7; color: #92400e; }
+    #drop-zone.dragover { border-color: #bf0000; background: #fef2f2; color: #bf0000; }
   </style>
 </head>
 <body>
@@ -136,7 +150,21 @@
 
       <!-- 📥 取込 (P2) -->
       <div class="tab-pane" id="pane-import">
-        <div class="warn-note">準備中 (P2 — 次のPRで最優先実装)。実装予定: RPP全商品/全キーワードレポート (zip対応) / クーポンアドバンス / データ分析CSV / 月次費用明細 のドラッグ&ドロップ取込 (ヘッダ自動判別・同期間UPSERT) + データ鮮度ボード。</div>
+        <div class="note" style="margin-bottom:10px;">
+          RMS → 広告(プロモーションメニュー) → 検索連動型広告(RPP) → パフォーマンスレポート →
+          <b>集計単位「日別」</b>で「全商品レポート」「全キーワードレポート」をダウンロード →
+          <b>zipのまま</b>ここにドロップしてください (複数可・CSV直接も可)。
+          売上・CVは30日間さかのぼって加算されるため、<b>直近30日分は次回まとめて再アップロードすれば上書き更新</b>されます。
+        </div>
+        <div id="drop-zone" style="border:2px dashed #d1d5db; border-radius:10px; padding:36px; text-align:center; color:#6b7280; cursor:pointer; margin-bottom:14px;">
+          📥 ここにファイルをドロップ / クリックして選択 (CSV, zip)
+          <input type="file" id="file-input" multiple accept=".csv,.zip" style="display:none;">
+        </div>
+        <div id="import-result"></div>
+        <div class="section-h">データ鮮度ボード</div>
+        <div class="table-scroll"><table class="data" id="freshness-table"><tbody><tr><td class="loading">読み込み中…</td></tr></tbody></table></div>
+        <div class="section-h">取込履歴 (最近50件)</div>
+        <div class="table-scroll"><table class="data" id="import-log-table"></table></div>
       </div>
 
       <!-- ⚙️ 設定 (P7) -->
@@ -207,7 +235,7 @@ document.getElementById('tabs').addEventListener('click', (e) => {
 function loadTab(tab) {
   if (loaded[tab]) return;
   loaded[tab] = true;
-  ({ overview: loadOverview }[tab] || (() => {}))();
+  ({ overview: loadOverview, import: loadImport }[tab] || (() => {}))();
 }
 
 // ============================================================
@@ -292,6 +320,91 @@ async function loadTrend() {
         plugins: { tooltip: { callbacks: { label: c => c.dataset.label + ': ' + fmtJPY(c.parsed.y) } } } },
     });
   } catch (e) { console.error(e); }
+}
+
+// ============================================================
+// 📥 取込
+// ============================================================
+async function loadImport() {
+  const zone = document.getElementById('drop-zone');
+  const input = document.getElementById('file-input');
+  zone.addEventListener('click', () => input.click());
+  input.addEventListener('change', () => { if (input.files.length) uploadFiles(input.files); });
+  zone.addEventListener('dragover', (e) => { e.preventDefault(); zone.classList.add('dragover'); });
+  zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
+  zone.addEventListener('drop', (e) => {
+    e.preventDefault(); zone.classList.remove('dragover');
+    if (e.dataTransfer.files.length) uploadFiles(e.dataTransfer.files);
+  });
+  refreshImportViews();
+}
+
+async function uploadFiles(fileList) {
+  const resultEl = document.getElementById('import-result');
+  const files = [...fileList];
+  document.getElementById('file-input').value = '';
+  const allResults = [];
+  // サーバーは1リクエスト4ファイルまで (メモリ保護) → 4件ずつ順次送信
+  for (let i = 0; i < files.length; i += 4) {
+    const batch = files.slice(i, i + 4);
+    resultEl.innerHTML = `<div class="loading">取込中… (${Math.min(i + 4, files.length)}/${files.length})</div>`;
+    const fd = new FormData();
+    for (const f of batch) fd.append('files', f);
+    try {
+      const res = await fetch(API + '/import', { method: 'POST', body: fd });
+      const data = await res.json();
+      if (!res.ok) {
+        allResults.push(...batch.map(f => ({ file: f.name, ok: false, error: data.error || ('HTTP ' + res.status) })));
+      } else {
+        allResults.push(...data.results);
+      }
+    } catch (e) {
+      allResults.push(...batch.map(f => ({ file: f.name, ok: false, error: 'アップロード失敗: ' + e.message })));
+    }
+  }
+  resultEl.innerHTML = allResults.map(r => r.ok
+    ? `<div class="ok-note">✓ ${esc(r.file)} — ${esc(r.label)} / 期間 ${esc(r.date_from)}〜${esc(r.date_to)} / ${r.rows.toLocaleString()}行 (新規 ${r.inserted.toLocaleString()} / 上書き ${r.updated.toLocaleString()}${r.dedup_in_file ? ` / ファイル内重複統合 ${r.dedup_in_file}` : ''})</div>`
+    : r.skipped
+    ? `<div class="warn-note">⏸ ${esc(r.file)} — ${esc(r.error)}</div>`
+    : `<div class="err-note">✗ ${esc(r.file)} — ${esc(r.error)}</div>`).join('');
+  refreshImportViews();
+}
+
+async function refreshImportViews() {
+  try {
+    const st = await getJSON(API + '/import/status');
+    document.getElementById('freshness-table').innerHTML = `<thead><tr>
+      <th>データ種別</th><th>状態</th><th>データ期間</th><th>行数</th><th>最終取込</th><th>未取込の月</th>
+    </tr></thead><tbody>` + st.types.map(t => {
+      if (!t.implemented) return `<tr><td>${esc(t.label)}</td><td><span class="pill todo">準備中</span></td><td colspan="4" class="note">${esc(t.note || '')}</td></tr>`;
+      const missing = (t.missing_months || []);
+      return `<tr>
+        <td>${esc(t.label)}</td>
+        <td>${t.row_count > 0 ? '<span class="pill ok">取込済</span>' : '<span class="pill warn">未取込</span>'}</td>
+        <td>${t.data_from ? esc(t.data_from) + ' 〜 ' + esc(t.data_to) : '−'}</td>
+        <td class="num">${(t.row_count || 0).toLocaleString()}</td>
+        <td>${t.last_imported_at ? esc(new Date(t.last_imported_at).toLocaleString('ja-JP')) : '−'}</td>
+        <td>${missing.length ? `<span class="pill warn">${missing.length}ヶ月</span> ${esc(missing.slice(0, 8).join(', '))}${missing.length > 8 ? ' …' : ''}` : (t.row_count > 0 ? '<span class="pill ok">なし</span>' : '−')}</td>
+      </tr>`;
+    }).join('') + '</tbody>';
+
+    const log = await getJSON(API + '/import/log?limit=50');
+    document.getElementById('import-log-table').innerHTML = `<thead><tr>
+      <th>日時</th><th>ファイル</th><th>種別</th><th>結果</th><th>期間</th><th>行数</th><th>新規/上書き</th><th>メッセージ</th>
+    </tr></thead><tbody>` + (log.items.length === 0 ? '<tr><td colspan="8" class="note">履歴なし</td></tr>' :
+      log.items.map(r => `<tr>
+        <td>${esc(new Date(r.imported_at).toLocaleString('ja-JP'))}</td>
+        <td style="max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${esc(r.file_name)}</td>
+        <td>${esc(r.file_type)}</td>
+        <td>${r.status === 'ok' ? '<span class="pill ok">OK</span>' : r.status === 'skipped' ? '<span class="pill warn">スキップ</span>' : '<span class="pill err">エラー</span>'}</td>
+        <td>${r.date_from ? esc(r.date_from) + '〜' + esc(r.date_to) : '−'}</td>
+        <td class="num">${(r.row_count || 0).toLocaleString()}</td>
+        <td class="num">${(r.inserted || 0).toLocaleString()} / ${(r.updated || 0).toLocaleString()}</td>
+        <td style="max-width:320px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${esc(r.message || '')}">${esc(r.message || '')}</td>
+      </tr>`).join('')) + '</tbody>';
+  } catch (e) {
+    document.getElementById('freshness-table').innerHTML = `<tbody><tr><td class="err-note">取得失敗: ${esc(e.message)}</td></tr></tbody>`;
+  }
 }
 
 // 初期ロード
