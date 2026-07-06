@@ -24,6 +24,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { initDB, getDB, updateSyncMeta } from './db.js';
+import { makeNeOrdersUpserter } from './ne-orders-upsert.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
@@ -318,18 +319,15 @@ async function fetchOrders(days = 7) {
   console.log('[NE] Step 2: 受注明細取得 + JOIN');
   const rowFields = 'receive_order_row_receive_order_id,receive_order_row_shop_cut_form_id,receive_order_row_no,receive_order_row_goods_id,receive_order_row_goods_name,receive_order_row_goods_option,receive_order_row_quantity,receive_order_row_stock_allocation_quantity,receive_order_row_sub_total_price,receive_order_row_cancel_flag';
 
-  const stmt = db.prepare(`
-    INSERT OR IGNORE INTO raw_ne_orders (
-      伝票番号, 受注番号, 受注状態区分, 受注状態, 受注キャンセル,
-      受注キャンセル日, 受注日, 店舗コード, 出荷確定日,
-      明細行番号, レコードナンバー, キャンセル区分,
-      商品コード, 商品名, 商品OP, 受注数, 引当数, 小計金額, synced_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-  `);
+  // 監査 S-5/V-3: INSERT OR IGNORE → 状態更新つき UPSERT (キャンセル・状態変化を反映)
+  const upsertOrderRow = makeNeOrdersUpserter(db);
 
   let rowOffset = 0;
   let total = 0;
   let inserted = 0;
+  let updated = 0;
+  let unchanged = 0;
+  let errors = 0;
 
   while (true) {
     const data = await callNE('/api_v1_receiveorder_row/search', {
@@ -353,7 +351,7 @@ async function fetchOrders(days = 7) {
         const base = baseMap.get(denpyo) || {};
 
         try {
-          stmt.run(
+          const outcome = upsertOrderRow(
             denpyo,
             item.receive_order_row_shop_cut_form_id || base.receive_order_shop_cut_form_id || '',
             base.receive_order_order_status_id || '',
@@ -374,24 +372,33 @@ async function fetchOrders(days = 7) {
             parseFloat(item.receive_order_row_sub_total_price) || 0,
             ts
           );
-          inserted++;
-        } catch {
-          // 重複はスキップ
+          if (outcome === 'inserted') inserted++;
+          else if (outcome === 'updated') updated++;
+          else unchanged++;
+        } catch (e) {
+          // UPSERT 化により重複は例外を投げない — ここに来るのは実エラー。
+          // 無音 skip は PR #155 (¥0 が 2 週間潜伏) の轍なので必ず可視化する。
+          errors++;
+          if (errors <= 3) console.error(`[NE] 受注明細 UPSERT エラー (伝票=${denpyo} 行=${lineNo}): ${e.message}`);
         }
         total++;
       }
     });
     tx();
 
-    console.log(`[NE] 受注明細: ${total}件処理, ${inserted}件挿入 (offset: ${rowOffset})`);
+    console.log(`[NE] 受注明細: ${total}件処理, ${inserted}件挿入, ${updated}件更新 (offset: ${rowOffset})`);
     rowOffset += 1000;
     if (items.length < 1000) break;
   }
 
+  console.log(`[NE] 受注データ取得完了: base ${baseMap.size}件, row ${total}件処理, ${inserted}件挿入, ${updated}件更新(キャンセル/状態変化), ${unchanged}件変化なし, ${errors}件エラー`);
+  // Codex R1 high: 成功メタの更新は「エラー0件」を確認してから (失敗した同期を成功済みと記録しない)
+  if (errors > 0) {
+    throw new Error(`[NE] 受注明細 UPSERT で ${errors} 件のエラー (ログ先頭3件参照)`);
+  }
   updateSyncMeta('ne_api_orders_last', now());
   updateSyncMeta('ne_api_orders_range', `${startStr} ~ ${endStr}`);
-  console.log(`[NE] 受注データ取得完了: base ${baseMap.size}件, row ${total}件処理, ${inserted}件挿入`);
-  return { total, inserted };
+  return { total, inserted, updated, unchanged };
 }
 
 // ─── メイン ───

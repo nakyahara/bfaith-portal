@@ -16,6 +16,7 @@
 import fs from 'fs';
 import iconv from 'iconv-lite';
 import { initDB, getDB, saveToFile, updateSyncMeta } from './db.js';
+import { makeNeOrdersUpserter } from './ne-orders-upsert.js';
 
 function now() { return new Date().toISOString().replace('T', ' ').slice(0, 19); }
 
@@ -124,34 +125,39 @@ function importOrders(filePath) {
   console.log(`[Import] データ行数: ${rows.length}`);
   const db = getDB();
 
-  const stmt = db.prepare(`
-    INSERT OR IGNORE INTO raw_ne_orders (
-      伝票番号, 受注番号, 受注状態区分, 受注状態, 受注キャンセル,
-      受注キャンセル日, 受注日, 店舗コード, 出荷確定日,
-      明細行番号, レコードナンバー, キャンセル区分,
-      商品コード, 商品名, 商品OP, 受注数, 引当数, 小計金額, synced_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?)
-  `);
+  // 監査 S-5/V-3: INSERT OR IGNORE → 状態更新つき UPSERT。
+  // 広い期間の CSV を再投入すれば、過去分のキャンセル・状態変化も遡及反映される。
+  const upsertOrderRow = makeNeOrdersUpserter(db);
 
   const tx = db.transaction(() => {
-    let inserted = 0, skipped = 0;
+    let inserted = 0, updated = 0, unchanged = 0, skipped = 0, errors = 0;
     for (const row of rows) {
       const denpyo = row[0]?.trim();
       const lineNo = parseInt(row[9]);
       if (!denpyo || isNaN(lineNo)) { skipped++; continue; }
       try {
-        stmt.run(denpyo, row[1]||'', row[2]||'', row[3]||'', row[4]||'',
+        const outcome = upsertOrderRow(denpyo, row[1]||'', row[2]||'', row[3]||'', row[4]||'',
           row[5]||'', row[6]||'', row[7]||'', row[8]||'',
           lineNo, row[10]||'', row[11]||'', (row[12] || '').toLowerCase(), row[13]||'',
           row[14]||'', parseInt(row[15])||0, parseInt(row[16])||0, parseFloat(row[17])||0, now());
-        inserted++;
-      } catch { skipped++; }
+        if (outcome === 'inserted') inserted++;
+        else if (outcome === 'updated') updated++;
+        else unchanged++;
+      } catch (e) {
+        errors++;
+        if (errors <= 3) console.error(`[Import] 受注明細 UPSERT エラー (伝票=${denpyo} 行=${lineNo}): ${e.message}`);
+      }
     }
-    return { inserted, skipped };
+    return { inserted, updated, unchanged, skipped, errors };
   });
 
   const result = tx();
-  console.log(`[Import] 受注明細投入完了: ${result.inserted}件挿入, ${result.skipped}件スキップ`);
+  console.log(`[Import] 受注明細投入完了: ${result.inserted}件挿入, ${result.updated}件更新(キャンセル/状態変化), ${result.unchanged}件変化なし, ${result.skipped}件スキップ, ${result.errors}件エラー`);
+  // Codex R1 high: エラー行があるのに成功扱いにしない (成功行はコミット済み +
+  // UPSERT 冪等なので、修正後の再実行で安全に埋め直せる)
+  if (result.errors > 0) {
+    throw new Error(`[Import] 受注明細 UPSERT で ${result.errors} 件のエラー (ログ先頭3件参照)`);
+  }
   return result;
 }
 
