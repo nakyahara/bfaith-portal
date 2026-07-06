@@ -39,6 +39,7 @@ import profitAnalysisRouter from './apps/profit-analysis/router.js';
 import amazonDashboardRouter from './apps/amazon-dashboard/router.js';
 import rakutenAnalyticsRouter from './apps/rakuten-analytics/router.js';
 import yahooAnalyticsRouter from './apps/yahoo-analytics/router.js';
+import qoo10AnalyticsRouter from './apps/qoo10-analytics/router.js';
 import bizOpsOverviewRouter from './apps/biz-ops-overview/router.js';
 import productManagementListRouter from './apps/product-management-list/router.js';
 import execDashboardRouter from './apps/exec-dashboard/router.js';
@@ -599,6 +600,15 @@ const apps = [
     category: 'analysis',
   },
   {
+    id: 'qoo10-analytics',
+    name: 'Qoo10分析ツール',
+    description: 'Qoo10の売上・広告・利益・メガ割損益を統合管理 (タイル速報 + 手数料実額 + メガ割セラー負担 + 開催回損益)',
+    icon: '🛒',
+    path: '/apps/qoo10-analytics',
+    status: 'active',
+    category: 'analysis',
+  },
+  {
     id: 'biz-ops-overview',
     name: '業務オペ概要',
     description: '全モール売上 (前日/今月/30日) + 出荷率等の日次経営指標集約',
@@ -1084,6 +1094,7 @@ app.use('/apps/profit-analysis', requireAppAccess('profit-analysis'), profitAnal
 app.use('/apps/amazon-dashboard', requireAppAccess('amazon-dashboard'), express.json({ limit: '256kb' }), amazonDashboardRouter);
 app.use('/apps/rakuten-analytics', requireAppAccess('rakuten-analytics'), rakutenAnalyticsRouter);
 app.use('/apps/yahoo-analytics', requireAppAccess('yahoo-analytics'), express.json({ limit: '256kb' }), yahooAnalyticsRouter);
+app.use('/apps/qoo10-analytics', requireAppAccess('qoo10-analytics'), qoo10AnalyticsRouter);
 app.use('/apps/biz-ops-overview', requireAppAccess('biz-ops-overview'), bizOpsOverviewRouter);
 app.use('/apps/product-management-list', requireAppAccess('product-management-list'), productManagementListRouter);
 app.use('/apps/exec-dashboard', requireAppAccess('exec-dashboard'), express.json({ limit: '1mb' }), execDashboardRouter);
