@@ -52,6 +52,34 @@ const result = db.transaction(() => {
   db.prepare(`DELETE FROM f_amazon_account_fees_monthly_v1 WHERE month_start_jst >= ?`).run(fromDate);
   const info = db.prepare(`
     INSERT INTO f_amazon_account_fees_monthly_v1 (month_start_jst, fee_type, amount_jpy, row_count, built_at)
+    WITH dedup AS (
+      -- 同一 settlement が sp_api_v1 / manual_csv の両 layer で raw に存在し得るため、
+      -- SKU別 mart (rebuild-amazon-settlement-mart.js) と同じ business dedup を挟む
+      -- (Codex High 指摘: dedup 無しだと保管料/LTSF が二重計上)
+      SELECT economic_date, transaction_type, other_amount_micro,
+        ROW_NUMBER() OVER (
+          PARTITION BY source_settlement_id, business_line_key
+          ORDER BY CASE source_layer
+                     WHEN 'sp_api_v1' THEN 1
+                     WHEN 'manual_csv' THEN 2
+                     ELSE 3
+                   END,
+                   ingested_at DESC
+        ) AS rn
+      FROM raw_amazon_settlement_lines
+      WHERE economic_date >= ?
+        -- SKU 無し行のみ対象。SKU 付きフィー行 (Inbound Defect 等の一部) は
+        -- SKU daily fact 側に流れるため、ここに入れると二重計上になる
+        AND (seller_sku_normalized IS NULL OR seller_sku_normalized = '')
+        AND (
+          transaction_type IN (
+            'Storage Fee', 'Storage Fee - Correction', 'Storage Fee - Reversal',
+            'StorageRenewalBilling', 'RemovalComplete', 'Subscription Fee'
+          )
+          OR transaction_type LIKE 'Inbound Defect Fee%'
+          OR transaction_type LIKE '%LowInventory%' OR transaction_type LIKE '%Low-Inventory%'
+        )
+    )
     SELECT
       substr(economic_date, 1, 7) || '-01' AS month_start_jst,
       CASE
@@ -66,21 +94,10 @@ const result = db.transaction(() => {
       SUM(COALESCE(other_amount_micro, 0)) / 1000000.0 AS amount_jpy,
       COUNT(*) AS row_count,
       ? AS built_at
-    FROM raw_amazon_settlement_lines
-    WHERE economic_date >= ?
-      -- SKU 無し行のみ対象。SKU 付きフィー行 (Inbound Defect 等の一部) は
-      -- SKU daily fact 側に流れるため、ここに入れると二重計上になる
-      AND (seller_sku_normalized IS NULL OR seller_sku_normalized = '')
-      AND (
-        transaction_type IN (
-          'Storage Fee', 'Storage Fee - Correction', 'Storage Fee - Reversal',
-          'StorageRenewalBilling', 'RemovalComplete', 'Subscription Fee'
-        )
-        OR transaction_type LIKE 'Inbound Defect Fee%'
-        OR transaction_type LIKE '%LowInventory%' OR transaction_type LIKE '%Low-Inventory%'
-      )
+    FROM dedup
+    WHERE rn = 1
     GROUP BY 1, 2
-  `).run(builtAt, fromDate);
+  `).run(fromDate, builtAt);
   return info.changes;
 })();
 
