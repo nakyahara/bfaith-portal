@@ -476,8 +476,17 @@ export async function syncToRender() {
     }, 'メタデータ');
 
     // Part 5: Render側のデータ件数を検証
+    // 監査PR-2で /api/status に認証が付いたため x-sync-key を送る (2026-07-07 朝の
+    // 「全カウント0のデータ不一致」誤アラートの修正。sync key は既に本ファイルで送信に使用中)。
     console.log('[Sync→Render]   検証中...');
-    const statusRes = await fetch(`${RENDER_URL}/api/status`, { signal: AbortSignal.timeout(30000) });
+    const statusRes = await fetch(`${RENDER_URL}/api/status`, {
+      headers: SYNC_KEY ? { 'x-sync-key': SYNC_KEY } : {},
+      signal: AbortSignal.timeout(30000),
+    });
+    if (!statusRes.ok) {
+      // 認証エラー等を「全カウント0=不一致」と誤読しない (検証不能として明示)
+      throw new Error(`検証読み取り失敗: /api/status HTTP ${statusRes.status}`);
+    }
     const status = await statusRes.json();
 
     const verify = {
