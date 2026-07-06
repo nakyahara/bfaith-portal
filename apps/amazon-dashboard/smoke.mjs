@@ -84,13 +84,18 @@ const tx = db.transaction(() => {
   db.prepare(`INSERT INTO mirror_amazon_sku_fees (seller_sku, asin, fulfillment_channel, referral_fee, referral_fee_rate, fba_fee, variable_closing_fee, per_item_fee, total_fee, price_used, fetched_at)
     VALUES ('pr_beta', 'B0BETA', 'AMAZON_JP', 120, 0.15, 200, 0, 0, 320, 880, 't')`).run();
 
+  // pr_gamma: settlement fact の商品名が空 (フォールバック解決のテスト用)
+  insFin.run(d(3), 'pr_gamma', 'B0GAMMA', '', 2, 2, 1600, 240, 200, 20, 30, 0, 40, 100, d(3), 100, 200, 770);
+
   const insRes = db.prepare(`INSERT INTO mirror_sku_resolved (seller_sku, ne_code, quantity, source, 商品名, source_updated_at, synced_at) VALUES (?, ?, ?, 'master', ?, 't', 't')`);
   insRes.run('pr_alpha', 'NE-A', 1, 'アルファ商品');
   insRes.run('pr_beta', 'NE-B', 1, 'ベータ商品');
+  insRes.run('pr_gamma', 'NE-G', 1, '');
 
   const insProd = db.prepare(`INSERT INTO mirror_products (商品コード, 商品名, 商品区分, 原価状態, 標準売価, 原価, updated_at) VALUES (?, ?, '単品', 'ok', ?, ?, 't')`);
   insProd.run('NE-A', 'アルファ商品', 1500, 300);   // alpha 実売1100(税込) < 1500*0.9 → 価格ミス検出想定
   insProd.run('NE-B', 'ベータ商品', 900, 240);
+  insProd.run('NE-G', 'ガンマ商品(マスタ名)', 900, 100);
 
   const insInv = db.prepare(`INSERT INTO mirror_inv_daily_detail (
     business_date, market, category, source_system, source_item_code, ne_code, qty, unit_cost, total_value,
@@ -155,7 +160,9 @@ check('getWaterfall SKU', () => {
 
 const sp = check('getSkuProfit', () => {
   const r = q.getSkuProfit(d(29), today, {});
-  assert(r.rows.length === 2, '2 SKU');
+  assert(r.rows.length === 3, '3 SKU');
+  const gamma = r.rows.find(x => x.seller_sku === 'pr_gamma');
+  assert(gamma.product_name === 'ガンマ商品(マスタ名)', 'fact空の商品名がマスタ名でフォールバック解決 (got ' + gamma.product_name + ')');
   assert(r.ad_unallocated > 0, '未配賦>0 (C3分)');
   const beta = r.rows.find(x => x.seller_sku === 'pr_beta');
   assert(beta.ad_direct > 0, 'ASIN粒度広告がbetaに配賦されている');
@@ -175,7 +182,7 @@ check('getAdsAnalysis', () => {
 
 check('getBestsellers', () => {
   const r = q.getBestsellers(d(29), today, 'sales');
-  assert(r.ranking.length === 2, 'ranking 2');
+  assert(r.ranking.length === 3, 'ranking 3 (gamma含む)');
   assert(['A', 'B', 'C'].includes(r.ranking[0].abc), 'ABC');
   assert(r.weekday.length === 7, '曜日7');
   assert(r.ranking[0].spark.length > 0, 'spark');

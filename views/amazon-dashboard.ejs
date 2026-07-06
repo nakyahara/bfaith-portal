@@ -296,7 +296,7 @@ function signClass(n) { return n < 0 ? 'negv' : n > 0 ? 'pos' : ''; }
 // 期間プリセット (Helium 10 方式)
 const PRESETS = [
   ['7d', '7日'], ['14d', '14日'], ['30d', '30日'], ['90d', '90日'],
-  ['this_month', '今月'], ['last_month', '先月'], ['this_year', '今年'],
+  ['this_month', '今月'], ['last_month', '先月'], ['12m', '12ヶ月'], ['this_year', '今年'],
 ];
 function mountPeriodSwitcher(elId, defaultPreset, onChange) {
   const el = document.getElementById(elId);
@@ -362,7 +362,8 @@ async function loadOverview() {
 
 async function loadTrend() {
   try {
-    const gran = ['90d', 'this_year'].includes(ovPreset) ? 'week' : 'day';
+    // 月ごとの売上・利益の変化を追える月次粒度 (12ヶ月/今年)、90日は週次、それ以外は日次
+    const gran = ['12m', 'this_year'].includes(ovPreset) ? 'month' : ovPreset === '90d' ? 'week' : 'day';
     const data = await getJSON(`${API}/trend?preset=${ovPreset}&granularity=${gran}`);
     const labels = data.rows.map(r => r.bucket);
     const pendingIdx = data.rows.findIndex(r => (r.bucket_start || r.bucket) >= data.settlement_pending_from);
