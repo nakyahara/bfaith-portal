@@ -953,11 +953,17 @@ app.use('/apps/mirror/api/sync', mirrorParserErrorHandler);
 //     sales/download は prefix mount なので将来の追加 route も自動的に保護される (安全側デフォルト)。
 //   ・独自 token を持つ既存ルート (/api/sync* = sync key, /api/pml/* = PML_*_TOKEN,
 //     /api/sku-master/* = MIRROR_READ_TOKEN) は各自の認証を維持するため対象外 (二重認証にしない)。
+//   ・session 経路は requireAppAccess('warehouse') 相当の認可まで要求 (Codex R2 high:
+//     原価・仕入先・全モール売上を含むため、ログイン済みなら誰でも可では低権限ユーザーへ横展開する)。
 //   ・token 提示あり + MIRROR_READ_TOKEN 未設定は 503 (requireReadToken と同じ fail-closed シグナル)、
-//     不一致は 401。session も token も無ければ 401。
+//     不一致は 401。warehouse 権限なし session は 403、session も token も無ければ 401。
 //   ・token は header only (query 受理は URL/アクセスログ残留のため禁止。requireReadToken と同方針)。
 function requireSessionOrReadToken(req, res, next) {
-  if (req.session && req.session.authenticated) return next();
+  const sessionAuthed = !!(req.session && req.session.authenticated);
+  if (sessionAuthed) {
+    const allowed = req.session.allowedApps;
+    if (allowed === '*' || (Array.isArray(allowed) && allowed.includes('warehouse'))) return next();
+  }
   const provided = req.headers['x-read-token'];
   if (provided) {
     const token = process.env.MIRROR_READ_TOKEN;
@@ -965,6 +971,7 @@ function requireSessionOrReadToken(req, res, next) {
     if (provided === token) return next();
     return res.status(401).json({ error: 'invalid_read_token' });
   }
+  if (sessionAuthed) return res.status(403).json({ error: 'forbidden' });
   return res.status(401).json({ error: 'auth_required' });
 }
 app.use(
