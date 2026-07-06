@@ -153,6 +153,11 @@ function importOrders(filePath) {
 
   const result = tx();
   console.log(`[Import] 受注明細投入完了: ${result.inserted}件挿入, ${result.updated}件更新(キャンセル/状態変化), ${result.unchanged}件変化なし, ${result.skipped}件スキップ, ${result.errors}件エラー`);
+  // Codex R1 high: エラー行があるのに成功扱いにしない (成功行はコミット済み +
+  // UPSERT 冪等なので、修正後の再実行で安全に埋め直せる)
+  if (result.errors > 0) {
+    throw new Error(`[Import] 受注明細 UPSERT で ${result.errors} 件のエラー (ログ先頭3件参照)`);
+  }
   return result;
 }
 

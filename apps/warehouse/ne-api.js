@@ -391,12 +391,13 @@ async function fetchOrders(days = 7) {
     if (items.length < 1000) break;
   }
 
-  updateSyncMeta('ne_api_orders_last', now());
-  updateSyncMeta('ne_api_orders_range', `${startStr} ~ ${endStr}`);
   console.log(`[NE] 受注データ取得完了: base ${baseMap.size}件, row ${total}件処理, ${inserted}件挿入, ${updated}件更新(キャンセル/状態変化), ${unchanged}件変化なし, ${errors}件エラー`);
+  // Codex R1 high: 成功メタの更新は「エラー0件」を確認してから (失敗した同期を成功済みと記録しない)
   if (errors > 0) {
     throw new Error(`[NE] 受注明細 UPSERT で ${errors} 件のエラー (ログ先頭3件参照)`);
   }
+  updateSyncMeta('ne_api_orders_last', now());
+  updateSyncMeta('ne_api_orders_range', `${startStr} ~ ${endStr}`);
   return { total, inserted, updated, unchanged };
 }
 

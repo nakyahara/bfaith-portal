@@ -130,7 +130,14 @@ function importOrders(filePath) {
     }
     return { inserted, updated, unchanged, skipped, errors };
   });
-  return tx();
+  const result = tx();
+  // Codex R1 high: エラー行があるのに done/ へ移動すると再処理機会を失う。
+  // throw すればファイルは import/ に残り毎分の監視で再試行される
+  // (成功行はコミット済み + UPSERT 冪等なので再試行は安全)。
+  if (result.errors > 0) {
+    throw new Error(`[Auto] 受注明細 UPSERT で ${result.errors} 件のエラー — ファイルは import/ に残して再試行`);
+  }
+  return result;
 }
 
 function importSetProducts(filePath) {
