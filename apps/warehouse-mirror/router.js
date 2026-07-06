@@ -1831,12 +1831,24 @@ function normalizeAmazonFinanceRow(r) {
   };
 }
 
+// 広告 entity 共通: 必須キーの欠落を 400 で拒否 (String(undefined)="undefined" の混入防止、Codex R1 Medium #4)
+function requireAdKey(r, field) {
+  const v = r[field];
+  const s = v === null || v === undefined ? '' : String(v).trim();
+  if (s === '') {
+    throw new HttpError(400, { error: 'bad_row', message: `${field} is required (got ${JSON.stringify(v)})` });
+  }
+  return s;
+}
+
 // row 列正規化 (mirror_amazon_ads_sku_daily 用、amazon-dashboard PR-A)
+// target は受信側でも trim + LOWER を保証 (送信元の正規化漏れによる PK 重複・按分漏れ防止)
 function normalizeAmazonAdsSkuRow(r) {
   return {
-    date_jst: r.date_jst, mall: r.mall || 'amazon',
-    campaign_id: String(r.campaign_id), ad_type: r.ad_type || 'SP',
-    target: r.target, target_granularity: r.target_granularity,
+    date_jst: r.date_jst, mall: (r.mall || 'amazon'),
+    campaign_id: requireAdKey(r, 'campaign_id'), ad_type: r.ad_type || 'SP',
+    target: requireAdKey(r, 'target').toLowerCase(),
+    target_granularity: requireAdKey(r, 'target_granularity'),
     clicks: r.clicks ?? 0, impressions: r.impressions ?? 0,
     ad_cost: r.ad_cost ?? 0, ad_sales: r.ad_sales ?? 0, ad_units: r.ad_units ?? 0,
     source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,
@@ -1847,8 +1859,8 @@ function normalizeAmazonAdsSkuRow(r) {
 // row 列正規化 (mirror_amazon_ads_campaign_daily 用、amazon-dashboard PR-A)
 function normalizeAmazonAdsCampaignRow(r) {
   return {
-    date_jst: r.date_jst, mall: r.mall || 'amazon',
-    campaign_id: String(r.campaign_id), campaign_name: r.campaign_name || '',
+    date_jst: r.date_jst, mall: (r.mall || 'amazon'),
+    campaign_id: requireAdKey(r, 'campaign_id'), campaign_name: r.campaign_name || '',
     ad_type: r.ad_type || 'SP', campaign_status: r.campaign_status || '',
     clicks: r.clicks ?? 0, impressions: r.impressions ?? 0, ad_cost: r.ad_cost ?? 0,
     ad_sales_1d: r.ad_sales_1d ?? 0, ad_sales_7d: r.ad_sales_7d ?? 0,

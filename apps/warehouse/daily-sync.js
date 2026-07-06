@@ -426,16 +426,16 @@ async function main() {
     // fact_ad_spend / fact_ad_spend_campaign を Render mirror へ sync。
     // 取得ジョブ (上の Amazon Ads (campaign)/(SKU)) は直近 30 日窓なので、
     // attribution 遡及の取りこぼし余裕を見て 35 日窓で scope clear + 再投入。
-    // UPSERT 蓄積テーブルのため fetch 片方失敗でも既存データの sync は安全 (冪等)。
-    // 両方失敗時のみスキップ (古いデータの再送で通知が green に見えるのを防ぐ)。
-    if (adsCampaignResult.success || adsProductResult.success) {
+    // campaign と SKU の鮮度がズレると dashboard の未配賦率/TACOS が歪むため、
+    // **両方成功時のみ** sync する (Codex R1 Medium #2)。片方失敗は fetch retry 後の翌 cron に委ねる。
+    if (adsCampaignResult.success && adsProductResult.success) {
       const adsSyncResult = runScript(
         `apps/warehouse/sync-amazon-ads-daily.js --data-dir ${DATA_DIR_ARG} --days 35`,
         'Amazon Ads sync', 600000
       );
       results.push({ name: 'Amazon Ads sync', ...adsSyncResult });
     } else {
-      console.log('[DailySync] Amazon Ads sync は fetch 両方失敗のためスキップ (fetch retry 後に翌 cron で sync 実行)');
+      console.log('[DailySync] Amazon Ads sync は fetch 失敗 (campaign/SKU いずれか) のためスキップ (fetch retry 後に翌 cron で sync 実行)');
     }
 
     // === 楽天 finance daily fact (Phase 1a #R-3c、#R-1 + #R-2 + #R-3a 統合) ===

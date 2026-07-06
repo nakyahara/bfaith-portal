@@ -29,7 +29,8 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import Database from 'better-sqlite3';
 
-const CHUNK_SIZE = parseInt(process.env.CHUNK_SIZE, 10) || 3000;
+// 上限 cap: 巨大値の env 設定で Render 側 payload/timeout を踏む事故防止 (Codex R1 Low)
+const CHUNK_SIZE = Math.min(parseInt(process.env.CHUNK_SIZE, 10) || 3000, 5000);
 
 const args = process.argv.slice(2);
 function getArg(flag) { const i = args.indexOf(flag); return i >= 0 && i < args.length - 1 ? args[i + 1] : null; }

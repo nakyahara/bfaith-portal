@@ -117,7 +117,11 @@ export function addMonths(ym, n) {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
 }
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-export function isValidDate(s) { return typeof s === 'string' && DATE_RE.test(s); }
+export function isValidDate(s) {
+  if (typeof s !== 'string' || !DATE_RE.test(s)) return false;
+  const d = new Date(s + 'T00:00:00Z');
+  return !isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
+}
 
 // preset → {from, to} (JST)
 export function resolvePeriod(preset, fromQ, toQ) {
@@ -355,16 +359,18 @@ function allocateAdCost(db, from, to, skuRows) {
     return result.get(sku);
   };
 
-  let directTotal = 0;
-  let unmatchedDirect = 0;       // target が現 SKU 群に居ない (販売0の広告など)
+  // matchedDirect = 現 SKU 群に直接貼れた広告費のみ。
+  // 未マッチ direct (販売0 SKU の広告等) も Auto-Targeting も campaignTotal に含まれるため、
+  // unallocated = campaignTotal − matchedDirect の一本で二重計上しない (Codex R1 Medium #1)。
+  let matchedDirect = 0;
   for (const a of adRows) {
-    directTotal += a.cost;
     if (a.target_granularity === 'sku' && bySku.has(a.target)) {
       const e = ensure(bySku.get(a.target).seller_sku);
       e.direct += a.cost;
       e.ad_sales += a.sales;
+      matchedDirect += a.cost;
     } else if (a.target_granularity === 'asin' && byAsin.has(a.target)) {
-      // ASIN 行 → 同 ASIN の SKU 群に広告経由売上比…は行単位で持ってないので確定売上比で按分
+      // ASIN 行 → 同 ASIN の SKU 群に確定売上比で按分 (行単位の広告経由売上内訳は持っていない)
       const group = byAsin.get(a.target);
       const totalRev = group.reduce((s, r) => s + (r.revenue_excl || 0), 0);
       for (const r of group) {
@@ -373,12 +379,13 @@ function allocateAdCost(db, from, to, skuRows) {
         e.direct += a.cost * share;
         e.ad_sales += a.sales * share;
       }
-    } else {
-      unmatchedDirect += a.cost;
+      matchedDirect += a.cost;
     }
+    // 未マッチ direct は unallocated 側に自然に残る (campaignTotal に含まれるため)
   }
-  // 未配賦 = campaign 全額 − SKU 別合計 (Auto-Targeting 等) + マッチしなかった direct
-  const unallocated = Math.max(0, campaignTotal - directTotal) + unmatchedDirect;
+  // 未配賦 = campaign 正本 − SKU に貼れた分。配賦総額が campaign 正本を超えない invariant
+  const unallocated = Math.max(0, campaignTotal - matchedDirect);
+  const directTotal = matchedDirect;
   // 按分基準: 広告経由売上比 → 全ゼロなら確定売上比
   let basisTotal = 0;
   for (const [, v] of result) basisTotal += v.ad_sales;
@@ -527,7 +534,7 @@ export function getSkuProfit(from, to, opts = {}) {
   });
 
   const total = rows.length;
-  const limit = Math.min(Number(opts.limit) || 100, 1000);
+  const limit = Math.min(Number(opts.limit) || 100, 20000);
   const offset = Math.max(Number(opts.offset) || 0, 0);
   return {
     from, to, total,

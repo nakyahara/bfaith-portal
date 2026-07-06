@@ -463,7 +463,7 @@ async function fetchBestsellers() {
 
     const rows = data.ranking.map((r, i) => `<tr>
       <td class="num">${i + 1}</td>
-      <td><a class="sku-link" onclick="openSkuDialog('${esc(r.seller_sku)}', '${bsPreset}')">${esc(r.seller_sku)}</a> ${r.abc ? `<span class="pill ${r.abc}">${r.abc}</span>` : ''} ${r.is_new ? '<span class="pill new">NEW</span>' : ''}</td>
+      <td><a class="sku-link" data-sku="${esc(r.seller_sku)}" data-preset="${bsPreset}">${esc(r.seller_sku)}</a> ${r.abc ? `<span class="pill ${r.abc}">${r.abc}</span>` : ''} ${r.is_new ? '<span class="pill new">NEW</span>' : ''}</td>
       <td class="name-cell">${esc(r.product_name || '')}</td>
       <td class="num">${r.units_net.toLocaleString()}</td>
       <td class="num">${r.units_growth_pct === null ? '<span class="pill new">新規</span>' : `<span class="${r.units_growth_pct >= 0 ? 'pos' : 'negv'}">${r.units_growth_pct}%</span>`}</td>
@@ -542,7 +542,7 @@ async function fetchSkuTable(reset) {
     const thead = `<thead><tr>${cols.map(([k, label]) =>
       `<th data-sort="${k}">${label}${pfSort === k ? (pfDir === 'desc' ? ' ▼' : ' ▲') : ''}</th>`).join('')}</tr></thead>`;
     const rowsHtml = data.rows.map(r => `<tr class="flag-${r.flag}">
-      <td><a class="sku-link" onclick="openSkuDialog('${esc(r.seller_sku)}', '${pfPreset}')">${esc(r.seller_sku)}</a></td>
+      <td><a class="sku-link" data-sku="${esc(r.seller_sku)}" data-preset="${pfPreset}">${esc(r.seller_sku)}</a></td>
       <td class="name-cell">${esc(r.product_name || '')}</td>
       <td class="num">${r.units_net.toLocaleString()}</td>
       <td class="num">${fmtYen(r.revenue_excl)}</td>
@@ -571,6 +571,14 @@ async function fetchSkuTable(reset) {
     document.getElementById('pf-table').innerHTML = `<tr><td class="warn-note">取得失敗: ${esc(e.message)}</td></tr>`;
   }
 }
+// SKU リンクは data 属性 + 委譲 listener (onclick 属性への文字列埋め込みは XSS になるため禁止)
+document.addEventListener('click', (e) => {
+  const a = e.target.closest('a.sku-link[data-sku]');
+  if (!a) return;
+  e.preventDefault();
+  openSkuDialog(a.dataset.sku, a.dataset.preset);
+});
+
 async function openSkuDialog(sku, preset) {
   const dlg = document.getElementById('sku-dialog');
   document.getElementById('sku-dialog-title').textContent = `SKU: ${sku} のウォーターフォール`;
@@ -621,7 +629,7 @@ async function fetchAds() {
       <th class="noclick">SKU</th><th class="noclick">商品名</th><th class="noclick">広告費(直+按分)</th><th class="noclick">広告経由売上</th>
       <th class="noclick">実ACOS</th><th class="noclick">損益分岐ACOS</th><th class="noclick">判定</th><th class="noclick">TACOS</th><th class="noclick">広告後利益</th>
     </tr></thead><tbody>` + data.skus.slice(0, 150).map(s => `<tr>
-      <td><a class="sku-link" onclick="openSkuDialog('${esc(s.seller_sku)}', '${adPreset}')">${esc(s.seller_sku)}</a></td>
+      <td><a class="sku-link" data-sku="${esc(s.seller_sku)}" data-preset="${adPreset}">${esc(s.seller_sku)}</a></td>
       <td class="name-cell">${esc(s.product_name || '')}</td>
       <td class="num">${fmtYen(s.ad_cost)}</td>
       <td class="num">${fmtYen(s.ad_sales)}</td>
