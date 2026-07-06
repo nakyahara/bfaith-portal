@@ -1,0 +1,17 @@
+{
+  "entity": "amazon_ads_campaign_daily",
+  "contract_version": 1,
+  "source_system": "minipc-warehouse",
+  "source_object": "fact_ad_spend_campaign",
+  "target_table": "mirror_amazon_ads_campaign_daily",
+  "grain_definition": "one row = one (date_jst, mall, campaign_id, ad_type)",
+  "key_columns_json": "[\"date_jst\", \"mall\", \"campaign_id\", \"ad_type\"]",
+  "payload_schema_json": "{\"type\":\"object\",\"required\":[\"date_jst\",\"mall\",\"campaign_id\",\"ad_type\"],\"properties\":{\"date_jst\":{\"type\":\"string\",\"pattern\":\"^\\\\d{4}-\\\\d{2}-\\\\d{2}$\"},\"mall\":{\"type\":\"string\"},\"campaign_id\":{\"type\":\"string\"},\"campaign_name\":{\"type\":\"string\",\"default\":\"\"},\"ad_type\":{\"type\":\"string\"},\"campaign_status\":{\"type\":\"string\",\"default\":\"\"},\"clicks\":{\"type\":\"integer\"},\"impressions\":{\"type\":\"integer\"},\"ad_cost\":{\"type\":\"number\"},\"ad_sales_1d\":{\"type\":\"number\"},\"ad_sales_7d\":{\"type\":\"number\"},\"ad_sales_14d\":{\"type\":\"number\"},\"ad_sales_30d\":{\"type\":\"number\"},\"ad_units_1d\":{\"type\":\"integer\"}}}",
+  "clear_strategy": "scope_clear_per_run",
+  "clear_strategy_detail": "First chunk of run includes meta.clear_amazon_ads_campaign_dates=[<all dates in scope, including 0-row dates>] for Render side to DELETE before insert",
+  "apply_mode": "insert_or_replace",
+  "apply_mode_detail": "INSERT OR REPLACE on (date_jst, mall, campaign_id, ad_type). source_run_id / source_row_hash track origin",
+  "enabled": 1,
+  "owner": "amazon-dashboard",
+  "notes": "amazon-dashboard PR-A (2026-07-06) で導入。spCampaigns 由来のキャンペーン単位全広告費 (Amazon Ads Console 完全一致の正本、2026-04 実測 ¥1,221,943)。SKU 別 (amazon_ads_sku_daily) との差分 = Auto-Targeting 等の未配賦広告費"
+}

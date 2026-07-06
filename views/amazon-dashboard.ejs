@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Amazon統合ダッシュボード - B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="stylesheet" href="/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"
+          integrity="sha384-9nhczxUqK87bcKHh20fSQcTGD4qq5GhayNYSYWqwBkINBhOfQLg/P5HG5lF1urn4"
+          crossorigin="anonymous"></script>
+  <style>
+    body { background: #f5f7fa; }
+    .container { max-width: 1500px; margin: 0 auto; padding: 16px 20px; }
+    .header-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; flex-wrap: wrap; gap: 12px; }
+    .header-row h2 { margin: 0; }
+    .back-link { font-size: 13px; color: #2563eb; text-decoration: none; }
+    .back-link:hover { text-decoration: underline; }
+    .meta-bar { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px 14px; margin-bottom: 12px; font-size: 12px; color: #555; display: flex; gap: 16px; flex-wrap: wrap; align-items: center; }
+
+    /* 精度バッジ (要件 §9-2: 確定/速報/推定を常時区別) */
+    .pbadge { display: inline-block; padding: 1px 7px; border-radius: 4px; font-size: 10px; font-weight: 700; vertical-align: middle; }
+    .pbadge.settled { background: #d1fae5; color: #065f46; }
+    .pbadge.flash { background: #dbeafe; color: #1e40af; }
+    .pbadge.est { background: #fef3c7; color: #92400e; }
+    .pbadge.alloc { background: #ede9fe; color: #5b21b6; }
+
+    /* タブ */
+    .tabs { display: flex; gap: 4px; margin-bottom: -1px; flex-wrap: wrap; }
+    .tab-btn { background: #fff; border: 1px solid #e5e7eb; border-bottom: none; border-radius: 6px 6px 0 0; padding: 10px 16px; cursor: pointer; font-size: 13px; color: #555; }
+    .tab-btn.active { background: #2563eb; color: white; border-color: #2563eb; }
+    .tab-content { background: white; border: 1px solid #e5e7eb; border-radius: 0 8px 8px 8px; padding: 16px; min-height: 400px; }
+    .tab-pane { display: none; }
+    .tab-pane.active { display: block; }
+
+    /* 期間切替 */
+    .period-switcher { display: inline-flex; gap: 4px; background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 6px; padding: 2px; flex-wrap: wrap; }
+    .period-switcher button { background: transparent; border: none; padding: 6px 10px; font-size: 12px; cursor: pointer; border-radius: 4px; color: #555; }
+    .period-switcher button.active { background: #2563eb; color: white; }
+    .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+    .toolbar input[type=text] { border: 1px solid #d1d5db; border-radius: 6px; padding: 6px 10px; font-size: 12px; }
+
+    /* タイル (Sellerboard 方式) */
+    .tile-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin-bottom: 16px; }
+    .tile { background: white; border: 1px solid #e5e7eb; border-radius: 10px; padding: 14px 18px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); cursor: pointer; }
+    .tile:hover { border-color: #93c5fd; }
+    .tile h3 { margin: 0 0 8px; font-size: 14px; color: #374151; }
+    .tile .row { display: flex; justify-content: space-between; font-size: 13px; padding: 3px 0; color: #4b5563; }
+    .tile .row .v { font-variant-numeric: tabular-nums; font-weight: 600; color: #111; }
+    .tile .row.hero { border-top: 1px dashed #e5e7eb; margin-top: 6px; padding-top: 8px; }
+    .tile .row.hero .v { font-size: 20px; font-weight: 700; }
+    .pos { color: #047857 !important; } .negv { color: #dc2626 !important; }
+
+    .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
+    .chart-card { background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 14px; }
+    .chart-card h3 { margin: 0 0 8px; font-size: 13px; color: #374151; font-weight: 600; }
+    .chart-wrap { position: relative; height: 300px; }
+    .chart-wrap.tall { height: 420px; }
+    @media (max-width: 900px) { .charts-grid { grid-template-columns: 1fr; } }
+
+    /* テーブル */
+    table.data { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+    table.data th, table.data td { border: 1px solid #e5e7eb; padding: 5px 8px; }
+    table.data th { background: #f9fafb; font-weight: 600; color: #374151; text-align: left; white-space: nowrap; cursor: pointer; user-select: none; }
+    table.data th.noclick { cursor: default; }
+    table.data td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    table.data tr.flag-loss td { background: #fef2f2; }
+    table.data tr.flag-ad_bleed td { background: #fff7ed; }
+    .table-scroll { overflow-x: auto; }
+    .sku-link { color: #2563eb; cursor: pointer; text-decoration: none; }
+    .sku-link:hover { text-decoration: underline; }
+    .name-cell { max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    .note { font-size: 11.5px; color: #6b7280; margin: 6px 0; }
+    .warn-note { background: #fffbeb; border-left: 4px solid #f59e0b; padding: 8px 12px; font-size: 12px; color: #92400e; border-radius: 4px; margin-bottom: 12px; }
+    .section-h { font-size: 14px; font-weight: 700; color: #1f2937; margin: 18px 0 8px; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+    .pill.safe { background: #d1fae5; color: #065f46; }
+    .pill.edge { background: #fef3c7; color: #92400e; }
+    .pill.bleed { background: #fee2e2; color: #991b1b; }
+    .pill.no_data { background: #f3f4f6; color: #6b7280; }
+    .pill.A { background: #dbeafe; color: #1e40af; } .pill.B { background: #e0e7ff; color: #4338ca; } .pill.C { background: #f3f4f6; color: #6b7280; }
+    .pill.new { background: #fce7f3; color: #9d174d; }
+    .diag-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 1100px) { .diag-grid { grid-template-columns: 1fr; } }
+    .diag-card { border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px 14px; }
+    .diag-card h4 { margin: 0 0 8px; font-size: 13.5px; }
+    .spark { vertical-align: middle; }
+    .btn { background: #2563eb; color: #fff; border: none; border-radius: 6px; padding: 6px 14px; font-size: 12px; cursor: pointer; }
+    .btn.secondary { background: #6b7280; }
+    .btn.danger { background: #dc2626; }
+    .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; margin-bottom: 10px; }
+    .form-grid label { font-size: 11px; color: #6b7280; display: block; }
+    .form-grid input, .form-grid select { width: 100%; border: 1px solid #d1d5db; border-radius: 6px; padding: 6px 8px; font-size: 12px; box-sizing: border-box; }
+    dialog { border: 1px solid #e5e7eb; border-radius: 10px; max-width: 900px; width: 90%; padding: 18px; }
+    dialog::backdrop { background: rgba(0,0,0,0.35); }
+    .loading { color: #6b7280; font-size: 13px; padding: 30px; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header-row">
+      <h2>🛒 Amazon統合ダッシュボード</h2>
+      <div style="display:flex; gap:14px; align-items:center;">
+        <span style="font-size:12px; color:#6b7280;"><%= displayName || username || '' %></span>
+        <a class="back-link" href="/">← ポータルへ戻る</a>
+      </div>
+    </div>
+    <div class="meta-bar">
+      <span>精度: <span class="pbadge settled">確定</span>=settlement <span class="pbadge flash">速報</span>=受注ベース(税込) <span class="pbadge est">推定</span>=速報売上−手数料参考値−最新原価−広告費 <span class="pbadge alloc">按分</span>=未配賦広告費の配賦値</span>
+      <span id="meta-updated"></span>
+    </div>
+
+    <div class="tabs" id="tabs">
+      <button class="tab-btn active" data-tab="overview">🏠 概要</button>
+      <button class="tab-btn" data-tab="bestsellers">🏆 売れ筋</button>
+      <button class="tab-btn" data-tab="profit">💰 利益分析</button>
+      <button class="tab-btn" data-tab="ads">📣 広告</button>
+      <button class="tab-btn" data-tab="inventory">📦 在庫</button>
+      <button class="tab-btn" data-tab="diagnosis">🔍 診断</button>
+      <button class="tab-btn" data-tab="recovery">🛡️ 回収・異常</button>
+      <button class="tab-btn" data-tab="settings">⚙️ 設定</button>
+    </div>
+
+    <div class="tab-content">
+      <!-- 🏠 概要 -->
+      <div class="tab-pane active" id="pane-overview">
+        <div id="ov-tiles" class="tile-grid"><div class="loading">読み込み中…</div></div>
+        <div class="toolbar">
+          <div class="period-switcher" id="ov-period"></div>
+          <span class="note">直近14日はsettlement確定待ち (グラフ網掛け)。この期間の利益は<span class="pbadge est">推定</span>です。</span>
+        </div>
+        <div class="charts-grid">
+          <div class="chart-card" style="grid-column: 1 / -1;">
+            <h3>売上 × 利益 × 利益率 <span class="pbadge settled">確定</span><span class="pbadge flash">速報</span></h3>
+            <div class="chart-wrap tall"><canvas id="chart-trend"></canvas></div>
+          </div>
+          <div class="chart-card">
+            <h3>利益2層の推移 (広告前粗利 / 広告後利益) <span class="pbadge settled">確定</span></h3>
+            <div class="chart-wrap"><canvas id="chart-profit-layers"></canvas></div>
+          </div>
+          <div class="chart-card">
+            <h3>TACOS推移 (広告費÷確定売上、月次)</h3>
+            <div class="chart-wrap"><canvas id="chart-tacos"></canvas></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 🏆 売れ筋 -->
+      <div class="tab-pane" id="pane-bestsellers">
+        <div class="toolbar">
+          <div class="period-switcher" id="bs-period"></div>
+          <div class="period-switcher" id="bs-axis">
+            <button data-axis="sales" class="active">売上</button>
+            <button data-axis="units">数量</button>
+            <button data-axis="profit">広告後利益</button>
+          </div>
+        </div>
+        <div id="bs-abc" class="note"></div>
+        <div class="charts-grid">
+          <div class="chart-card">
+            <h3>曜日別 平均販売数 <span class="pbadge flash">速報</span></h3>
+            <div class="chart-wrap" style="height:200px;"><canvas id="chart-weekday"></canvas></div>
+          </div>
+          <div class="chart-card">
+            <h3>急上昇 / 急落 TOP10 (販売数 前期比)</h3>
+            <div id="bs-movers" style="font-size:12px; max-height:200px; overflow-y:auto;"></div>
+          </div>
+        </div>
+        <div class="section-h">売れ筋ランキング <span class="pbadge settled">確定</span> <span class="note" id="bs-note"></span></div>
+        <div class="table-scroll"><table class="data" id="bs-table"></table></div>
+      </div>
+
+      <!-- 💰 利益分析 -->
+      <div class="tab-pane" id="pane-profit">
+        <div class="toolbar">
+          <div class="period-switcher" id="pf-period"></div>
+          <input type="text" id="pf-search" placeholder="SKU / 商品名 / ASIN 検索">
+          <button class="btn secondary" id="pf-csv">CSV出力</button>
+        </div>
+        <div class="charts-grid">
+          <div class="chart-card" style="grid-column: 1 / -1;">
+            <h3>利益ウォーターフォール <span class="pbadge settled">確定</span> <span id="pf-wf-title"></span></h3>
+            <div class="chart-wrap tall"><canvas id="chart-waterfall"></canvas></div>
+          </div>
+        </div>
+        <div class="note" id="pf-adnote"></div>
+        <div class="section-h">SKU別利益 <span class="pbadge settled">確定</span>+<span class="pbadge alloc">按分広告</span> — 行色: <span style="background:#fff7ed; padding:1px 6px;">橙=粗利黒字が広告で赤字転落</span> / <span style="background:#fef2f2; padding:1px 6px;">赤=広告前から赤字</span></div>
+        <div class="table-scroll"><table class="data" id="pf-table"></table></div>
+        <div class="toolbar" style="justify-content:center;"><button class="btn secondary" id="pf-more" style="display:none;">さらに表示</button></div>
+      </div>
+
+      <!-- 📣 広告 -->
+      <div class="tab-pane" id="pane-ads">
+        <div class="toolbar"><div class="period-switcher" id="ad-period"></div></div>
+        <div class="tile-grid" id="ad-totals"></div>
+        <div class="charts-grid">
+          <div class="chart-card">
+            <h3>TACOS × 売上の4象限 (SKU別、バブル=広告費)</h3>
+            <div class="chart-wrap"><canvas id="chart-quadrant"></canvas></div>
+          </div>
+          <div class="chart-card">
+            <h3>TACOS月次トレンド (下降=オーガニック健全化)</h3>
+            <div class="chart-wrap"><canvas id="chart-tacos2"></canvas></div>
+          </div>
+        </div>
+        <div class="section-h">SKU別 広告効率 — 損益分岐ACOSとの比較 <span class="pbadge est">損益分岐=推定</span></div>
+        <div class="table-scroll"><table class="data" id="ad-sku-table"></table></div>
+        <div class="section-h">キャンペーン別</div>
+        <div class="table-scroll"><table class="data" id="ad-camp-table"></table></div>
+      </div>
+
+      <!-- 📦 在庫 -->
+      <div class="tab-pane" id="pane-inventory">
+        <div class="note">FBA在庫 (倉庫+入荷待ち) と直近30日販売からの在庫残日数。発注・納品計画は <a href="/apps/fba-replenishment" target="_blank">FBA在庫補充ツール</a> へ。</div>
+        <div class="tile-grid" id="inv-summary"></div>
+        <div class="table-scroll"><table class="data" id="inv-table"></table></div>
+      </div>
+
+      <!-- 🔍 診断 -->
+      <div class="tab-pane" id="pane-diagnosis">
+        <div class="note" id="diag-meta"></div>
+        <div class="diag-grid" id="diag-cards"><div class="loading">読み込み中…</div></div>
+      </div>
+
+      <!-- 🛡️ 回収・異常 (将来Phase) -->
+      <div class="tab-pane" id="pane-recovery">
+        <div class="warn-note">準備中 (Phase 2)。ここに実装予定: ①FBA紛失・破損の未補填検知 ②返金済み未返送 (45日) 検知 ③手数料過大請求検知 ④GChatアラート履歴。<br>
+        必要データ (Inventory Ledger / 返品レポート / 補填レポート) の取得追加は要件定義書 §2.3 参照。</div>
+      </div>
+
+      <!-- ⚙️ 設定 -->
+      <div class="tab-pane" id="pane-settings">
+        <div class="section-h">カスタム経費 (月タイルと最終利益に反映)</div>
+        <div class="form-grid" id="exp-form">
+          <div><label>名称</label><input type="text" id="exp-name" placeholder="例: ツール利用料"></div>
+          <div><label>種別</label><select id="exp-type">
+            <option value="fixed_monthly">毎月定額</option>
+            <option value="oneoff">単発 (開始月のみ)</option>
+            <option value="sales_pct">売上比% (確定売上×%)</option>
+          </select></div>
+          <div><label>金額(円) / %値</label><input type="text" id="exp-amount" placeholder="5280"></div>
+          <div><label>開始月</label><input type="text" id="exp-from" placeholder="2026-07"></div>
+          <div><label>終了月 (任意)</label><input type="text" id="exp-to" placeholder=""></div>
+          <div><label>メモ</label><input type="text" id="exp-memo" placeholder=""></div>
+          <div style="align-self:end;"><button class="btn" id="exp-add">追加</button></div>
+        </div>
+        <div class="table-scroll"><table class="data" id="exp-table"></table></div>
+
+        <div class="section-h">診断閾値</div>
+        <div class="form-grid" id="settings-form"></div>
+        <button class="btn" id="settings-save">閾値を保存</button>
+        <span class="note" id="settings-status"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- SKU詳細ダイアログ -->
+  <dialog id="sku-dialog">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+      <h3 style="margin:0; font-size:15px;" id="sku-dialog-title"></h3>
+      <button class="btn secondary" onclick="document.getElementById('sku-dialog').close()">閉じる</button>
+    </div>
+    <div class="chart-wrap"><canvas id="chart-sku-waterfall"></canvas></div>
+  </dialog>
+
+<script>
+// ============================================================
+// 共通 util
+// ============================================================
+const API = '/apps/amazon-dashboard/api/v1';
+const charts = {};
+function destroyChart(id) { if (charts[id]) { charts[id].destroy(); delete charts[id]; } }
+function mkChart(id, cfg) { destroyChart(id); charts[id] = new Chart(document.getElementById(id).getContext('2d'), cfg); return charts[id]; }
+
+// 金額: 経営向け日本語単位 (億/万) — feedback_japanese_currency_units
+function fmtJPY(n) {
+  if (n === null || n === undefined) return '−';
+  const neg = n < 0; const a = Math.abs(Math.round(n));
+  let s;
+  if (a >= 100000000) s = (a / 100000000).toFixed(2).replace(/\.?0+$/, '') + '億円';
+  else if (a >= 10000) s = Math.round(a / 10000).toLocaleString() + '万円';
+  else s = '¥' + a.toLocaleString();
+  return neg ? '−' + s : s;
+}
+function fmtYen(n) { if (n === null || n === undefined) return '−'; return '¥' + Math.round(n).toLocaleString(); }
+function fmtPct(n) { return (n === null || n === undefined) ? '−' : n + '%'; }
+function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+async function getJSON(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return res.json();
+}
+function signClass(n) { return n < 0 ? 'negv' : n > 0 ? 'pos' : ''; }
+
+// 期間プリセット (Helium 10 方式)
+const PRESETS = [
+  ['7d', '7日'], ['14d', '14日'], ['30d', '30日'], ['90d', '90日'],
+  ['this_month', '今月'], ['last_month', '先月'], ['this_year', '今年'],
+];
+function mountPeriodSwitcher(elId, defaultPreset, onChange) {
+  const el = document.getElementById(elId);
+  el.innerHTML = PRESETS.map(([k, label]) =>
+    `<button data-preset="${k}" class="${k === defaultPreset ? 'active' : ''}">${label}</button>`).join('');
+  el.addEventListener('click', (e) => {
+    const btn = e.target.closest('button'); if (!btn) return;
+    el.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    onChange(btn.dataset.preset);
+  });
+}
+
+// ============================================================
+// タブ制御 (lazy load)
+// ============================================================
+const loaded = {};
+document.getElementById('tabs').addEventListener('click', (e) => {
+  const btn = e.target.closest('.tab-btn'); if (!btn) return;
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('pane-' + btn.dataset.tab).classList.add('active');
+  loadTab(btn.dataset.tab);
+});
+function loadTab(tab) {
+  if (loaded[tab]) return;
+  loaded[tab] = true;
+  ({ overview: loadOverview, bestsellers: loadBestsellers, profit: loadProfit,
+     ads: loadAds, inventory: loadInventory, diagnosis: loadDiagnosis, settings: loadSettings }[tab] || (() => {}))();
+}
+
+// ============================================================
+// 🏠 概要
+// ============================================================
+let ovPreset = '30d';
+async function loadOverview() {
+  try {
+    const data = await getJSON(API + '/overview');
+    document.getElementById('meta-updated').textContent = '更新: ' + new Date(data.generated_at).toLocaleString('ja-JP');
+    const tiles = data.tiles.map(t => {
+      const monthExtra = t.custom_expenses !== undefined ? `
+        <div class="row"><span>自社経費</span><span class="v">−${fmtYen(t.custom_expenses)}</span></div>
+        <div class="row"><span>最終利益 <span class="pbadge settled">確定</span></span><span class="v ${signClass(t.settled_profit_final)}">${fmtJPY(t.settled_profit_final)}</span></div>` : '';
+      return `<div class="tile">
+        <h3>${t.label} <span class="note">(${t.from}${t.from !== t.to ? '〜' + t.to : ''})</span></h3>
+        <div class="row"><span>売上 <span class="pbadge flash">速報</span></span><span class="v">${fmtJPY(t.flash_sales_incl)}</span></div>
+        <div class="row"><span>販売数 / 注文</span><span class="v">${t.flash_units.toLocaleString()} / ${t.flash_orders.toLocaleString()}</span></div>
+        <div class="row"><span>広告費</span><span class="v">${fmtYen(t.ad_cost)}</span></div>
+        <div class="row"><span>返金 <span class="pbadge settled">確定</span></span><span class="v">${fmtYen(t.settled_refunds)}</span></div>
+        <div class="row"><span>確定利益(広告後) <span class="pbadge settled">確定</span> <span class="note">${t.settled_coverage_pct}%確定</span></span><span class="v ${signClass(t.settled_profit_after_ads)}">${fmtJPY(t.settled_profit_after_ads)}</span></div>
+        <div class="row hero"><span>速報利益 <span class="pbadge est">推定</span> <span class="note">ｶﾊﾞｰ${t.est_coverage_pct}%</span></span><span class="v ${signClass(t.est_profit)}">${fmtJPY(t.est_profit)}</span></div>
+        ${monthExtra}
+      </div>`;
+    }).join('');
+    document.getElementById('ov-tiles').innerHTML = tiles;
+  } catch (e) {
+    document.getElementById('ov-tiles').innerHTML = `<div class="warn-note">概要の取得に失敗: ${esc(e.message)}</div>`;
+  }
+  mountPeriodSwitcher('ov-period', ovPreset, (p) => { ovPreset = p; loadTrend(); });
+  loadTrend();
+}
+
+async function loadTrend() {
+  try {
+    const gran = ['90d', 'this_year'].includes(ovPreset) ? 'week' : 'day';
+    const data = await getJSON(`${API}/trend?preset=${ovPreset}&granularity=${gran}`);
+    const labels = data.rows.map(r => r.bucket);
+    const pendingIdx = data.rows.findIndex(r => (r.bucket_start || r.bucket) >= data.settlement_pending_from);
+    const shade = {
+      id: 'pendingShade',
+      beforeDraw(chart) {
+        if (pendingIdx < 0) return;
+        const { ctx, chartArea, scales } = chart;
+        const x = scales.x.getPixelForValue(Math.max(0, pendingIdx - 0.5));
+        ctx.save();
+        ctx.fillStyle = 'rgba(251, 191, 36, 0.10)';
+        ctx.fillRect(x, chartArea.top, chartArea.right - x, chartArea.bottom - chartArea.top);
+        ctx.restore();
+      }
+    };
+    mkChart('chart-trend', {
+      type: 'bar',
+      data: { labels, datasets: [
+        { label: '確定売上(税抜)', data: data.rows.map(r => r.revenue_excl), backgroundColor: '#93c5fd', yAxisID: 'y', order: 3 },
+        { label: '速報売上(税込)', data: data.rows.map(r => r.flash_sales_incl), type: 'line', borderColor: '#2563eb', borderDash: [4, 3], pointRadius: 0, yAxisID: 'y', order: 2 },
+        { label: '広告後利益', data: data.rows.map(r => r.profit_after_ads), type: 'line', borderColor: '#047857', pointRadius: 0, yAxisID: 'y', order: 1 },
+        { label: '利益率%', data: data.rows.map(r => r.margin_pct), type: 'line', borderColor: '#f59e0b', pointRadius: 0, yAxisID: 'y1', order: 0 },
+      ]},
+      options: { responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false },
+        scales: { y: { position: 'left', ticks: { callback: v => fmtJPY(v) } }, y1: { position: 'right', grid: { drawOnChartArea: false }, ticks: { callback: v => v + '%' } } },
+        plugins: { tooltip: { callbacks: { label: c => c.dataset.label + ': ' + (c.dataset.yAxisID === 'y1' ? fmtPct(c.parsed.y) : fmtJPY(c.parsed.y)) } } } },
+      plugins: [shade],
+    });
+    mkChart('chart-profit-layers', {
+      type: 'line',
+      data: { labels, datasets: [
+        { label: '補填込み粗利(広告前)', data: data.rows.map(r => r.profit_before_ads), borderColor: '#7c3aed', backgroundColor: 'rgba(124,58,237,0.08)', fill: true, pointRadius: 0 },
+        { label: '広告後利益', data: data.rows.map(r => r.profit_after_ads), borderColor: '#047857', backgroundColor: 'rgba(4,120,87,0.08)', fill: true, pointRadius: 0 },
+      ]},
+      options: { responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false },
+        scales: { y: { ticks: { callback: v => fmtJPY(v) } } },
+        plugins: { tooltip: { callbacks: { label: c => c.dataset.label + ': ' + fmtJPY(c.parsed.y) } } } },
+    });
+    // TACOS 月次 (広告タブと同データ、ここでは ads API から)
+    const ads = await getJSON(`${API}/ads?preset=this_month`);
+    const tt = ads.tacos_trend;
+    mkChart('chart-tacos', {
+      type: 'bar',
+      data: { labels: tt.map(r => r.ym), datasets: [
+        { label: '広告費', data: tt.map(r => r.ad_cost), backgroundColor: '#fca5a5', yAxisID: 'y' },
+        { label: 'TACOS%', data: tt.map(r => r.tacos_pct), type: 'line', borderColor: '#dc2626', yAxisID: 'y1' },
+      ]},
+      options: { responsive: true, maintainAspectRatio: false,
+        scales: { y: { ticks: { callback: v => fmtJPY(v) } }, y1: { position: 'right', grid: { drawOnChartArea: false }, ticks: { callback: v => v + '%' } } } },
+    });
+  } catch (e) { console.error(e); }
+}
+
+// ============================================================
+// 🏆 売れ筋
+// ============================================================
+let bsPreset = '30d', bsAxis = 'sales';
+async function loadBestsellers() {
+  mountPeriodSwitcher('bs-period', bsPreset, (p) => { bsPreset = p; fetchBestsellers(); });
+  document.getElementById('bs-axis').addEventListener('click', (e) => {
+    const btn = e.target.closest('button'); if (!btn) return;
+    document.querySelectorAll('#bs-axis button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    bsAxis = btn.dataset.axis;
+    fetchBestsellers();
+  });
+  fetchBestsellers();
+}
+function sparkSvg(points) {
+  if (!points || points.length < 2) return '';
+  const max = Math.max(...points.map(p => p.u), 1);
+  const w = 80, h = 22;
+  const step = w / (points.length - 1);
+  const d = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${(i * step).toFixed(1)},${(h - p.u / max * (h - 2) - 1).toFixed(1)}`).join('');
+  return `<svg class="spark" width="${w}" height="${h}"><path d="${d}" fill="none" stroke="#2563eb" stroke-width="1.5"/></svg>`;
+}
+async function fetchBestsellers() {
+  try {
+    const data = await getJSON(`${API}/bestsellers?preset=${bsPreset}&axis=${bsAxis}`);
+    document.getElementById('bs-note').textContent = `期間 ${data.from}〜${data.to} (前期: ${data.prev_from}〜${data.prev_to}) / 全${data.total_skus} SKU`;
+    const abc = data.abc;
+    document.getElementById('bs-abc').innerHTML =
+      `ABC分析: <span class="pill A">A ${abc.count.A} SKU (${fmtJPY(abc.revenue.A)})</span> <span class="pill B">B ${abc.count.B} SKU (${fmtJPY(abc.revenue.B)})</span> <span class="pill C">C ${abc.count.C} SKU (${fmtJPY(abc.revenue.C)})</span> — A群の在庫切れが最優先リスク`;
+
+    const dows = ['日', '月', '火', '水', '木', '金', '土'];
+    mkChart('chart-weekday', {
+      type: 'bar',
+      data: { labels: data.weekday.map(r => dows[r.dow]), datasets: [{ label: '平均販売数/日', data: data.weekday.map(r => r.avg_units), backgroundColor: data.weekday.map(r => r.dow === 0 || r.dow === 6 ? '#fca5a5' : '#93c5fd') }] },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } },
+    });
+
+    const mover = (r, up) => `<div style="display:flex; justify-content:space-between; padding:2px 0; border-bottom:1px dashed #eee;">
+      <span class="name-cell" style="max-width:60%;">${esc(r.seller_sku)} <span class="note">${esc((r.product_name || '').slice(0, 24))}</span></span>
+      <span class="${up ? 'pos' : 'negv'}" style="font-weight:600;">${up ? '↗' : '↘'} ${r.units_growth_pct}% (${r.prev_units}→${r.units_net})</span></div>`;
+    document.getElementById('bs-movers').innerHTML =
+      data.risers.slice(0, 10).map(r => mover(r, true)).join('') +
+      data.fallers.slice(0, 10).map(r => mover(r, false)).join('') || '<div class="note">対象なし</div>';
+
+    const rows = data.ranking.map((r, i) => `<tr>
+      <td class="num">${i + 1}</td>
+      <td><a class="sku-link" data-sku="${esc(r.seller_sku)}" data-preset="${bsPreset}">${esc(r.seller_sku)}</a> ${r.abc ? `<span class="pill ${r.abc}">${r.abc}</span>` : ''} ${r.is_new ? '<span class="pill new">NEW</span>' : ''}</td>
+      <td class="name-cell">${esc(r.product_name || '')}</td>
+      <td class="num">${r.units_net.toLocaleString()}</td>
+      <td class="num">${r.units_growth_pct === null ? '<span class="pill new">新規</span>' : `<span class="${r.units_growth_pct >= 0 ? 'pos' : 'negv'}">${r.units_growth_pct}%</span>`}</td>
+      <td class="num">${fmtYen(r.revenue_excl)}</td>
+      <td class="num ${signClass(r.profit_after_ads)}">${fmtYen(r.profit_after_ads)}</td>
+      <td class="num">${fmtPct(r.margin_pct)}</td>
+      <td class="num">${r.fba_units.toLocaleString()} / ${r.fbm_units.toLocaleString()}</td>
+      <td>${sparkSvg(r.spark)}</td>
+    </tr>`).join('');
+    document.getElementById('bs-table').innerHTML = `<thead><tr>
+      <th class="noclick">#</th><th class="noclick">SKU</th><th class="noclick">商品名</th><th class="noclick">販売数</th><th class="noclick">前期比</th>
+      <th class="noclick">売上(税抜)</th><th class="noclick">広告後利益</th><th class="noclick">利益率</th><th class="noclick">FBA/FBM</th><th class="noclick">推移</th>
+    </tr></thead><tbody>${rows}</tbody>`;
+  } catch (e) {
+    document.getElementById('bs-table').innerHTML = `<tr><td class="warn-note">取得失敗: ${esc(e.message)}</td></tr>`;
+  }
+}
+
+// ============================================================
+// 💰 利益分析
+// ============================================================
+let pfPreset = 'last_month', pfSort = 'profit_after_ads', pfDir = 'desc', pfOffset = 0, pfQ = '';
+const WF_COLORS = { total: '#2563eb', subtotal: '#7c3aed', cost: '#ef4444', income: '#10b981' };
+async function loadProfit() {
+  mountPeriodSwitcher('pf-period', pfPreset, (p) => { pfPreset = p; pfOffset = 0; fetchWaterfall(); fetchSkuTable(true); });
+  document.getElementById('pf-search').addEventListener('input', debounce(() => { pfQ = document.getElementById('pf-search').value; pfOffset = 0; fetchSkuTable(true); }, 400));
+  document.getElementById('pf-csv').addEventListener('click', () => {
+    window.location.href = `${API}/sku-profit.csv?preset=${pfPreset}&sort=${pfSort}&dir=${pfDir}&q=${encodeURIComponent(pfQ)}`;
+  });
+  document.getElementById('pf-more').addEventListener('click', () => { pfOffset += 100; fetchSkuTable(false); });
+  fetchWaterfall(); fetchSkuTable(true);
+}
+function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
+
+function renderWaterfall(canvasId, wf) {
+  // floating bar でウォーターフォール: 各 step の [開始, 終了] を累積計算
+  let cum = 0;
+  const bars = [], colors = [], labels = [];
+  for (const s of wf.steps) {
+    labels.push(s.label);
+    if (s.kind === 'total' && s.key === 'revenue') { bars.push([0, s.amount]); cum = s.amount; colors.push(WF_COLORS.total); }
+    else if (s.kind === 'subtotal' || s.kind === 'total') { bars.push([0, s.amount]); cum = s.amount; colors.push(s.kind === 'total' ? WF_COLORS.total : WF_COLORS.subtotal); }
+    else if (s.kind === 'income') { bars.push([cum, cum + s.amount]); cum += s.amount; colors.push(WF_COLORS.income); }
+    else { bars.push([cum - s.amount, cum]); cum -= s.amount; colors.push(WF_COLORS.cost); }
+  }
+  mkChart(canvasId, {
+    type: 'bar',
+    data: { labels, datasets: [{ data: bars, backgroundColor: colors, borderSkipped: false }] },
+    options: { indexAxis: 'y', responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: { callbacks: {
+        label: (c) => {
+          const s = wf.steps[c.dataIndex];
+          const v = s.kind === 'cost' ? -s.amount : s.amount;
+          return `${s.label}: ${fmtJPY(s.kind === 'cost' || s.kind === 'income' ? s.amount * (s.kind === 'cost' ? -1 : 1) : v)}${s.precision === 'allocated' ? ' (按分込)' : ''}`;
+        } } } },
+      scales: { x: { ticks: { callback: v => fmtJPY(v) } } } },
+  });
+}
+async function fetchWaterfall() {
+  try {
+    const wf = await getJSON(`${API}/waterfall?preset=${pfPreset}`);
+    document.getElementById('pf-wf-title').textContent = `(${wf.from}〜${wf.to} 全体)`;
+    renderWaterfall('chart-waterfall', wf);
+  } catch (e) { console.error(e); }
+}
+async function fetchSkuTable(reset) {
+  try {
+    const data = await getJSON(`${API}/sku-profit?preset=${pfPreset}&sort=${pfSort}&dir=${pfDir}&q=${encodeURIComponent(pfQ)}&limit=100&offset=${pfOffset}`);
+    document.getElementById('pf-adnote').innerHTML = `広告費 期間合計 ${fmtYen(data.ad_campaign_total)} (うち未配賦 ${fmtYen(data.ad_unallocated)} を広告経由売上比で<span class="pbadge alloc">按分</span>)`;
+    const cols = [
+      ['seller_sku', 'SKU'], ['product_name', '商品名'], ['units_net', '販売数'], ['revenue_excl', '売上(税抜)'],
+      ['fees', '手数料計'], ['refunds', '返金'], ['reimbursements', '補填'], ['cogs', '原価'],
+      ['profit_before_ads', '粗利(広告前)'], ['ad_direct', '広告(直接)'], ['ad_allocated', '広告(按分)'],
+      ['profit_after_ads', '広告後利益'], ['margin_pct', '利益率'], ['cost_status', '原価状態'],
+    ];
+    const thead = `<thead><tr>${cols.map(([k, label]) =>
+      `<th data-sort="${k}">${label}${pfSort === k ? (pfDir === 'desc' ? ' ▼' : ' ▲') : ''}</th>`).join('')}</tr></thead>`;
+    const rowsHtml = data.rows.map(r => `<tr class="flag-${r.flag}">
+      <td><a class="sku-link" data-sku="${esc(r.seller_sku)}" data-preset="${pfPreset}">${esc(r.seller_sku)}</a></td>
+      <td class="name-cell">${esc(r.product_name || '')}</td>
+      <td class="num">${r.units_net.toLocaleString()}</td>
+      <td class="num">${fmtYen(r.revenue_excl)}</td>
+      <td class="num">${fmtYen(r.fees)}</td>
+      <td class="num">${fmtYen(r.refunds)}</td>
+      <td class="num">${fmtYen(r.reimbursements)}</td>
+      <td class="num">${fmtYen(r.cogs)}</td>
+      <td class="num ${signClass(r.profit_before_ads)}">${fmtYen(r.profit_before_ads)}</td>
+      <td class="num">${fmtYen(r.ad_direct)}</td>
+      <td class="num">${fmtYen(r.ad_allocated)}</td>
+      <td class="num ${signClass(r.profit_after_ads)}"><b>${fmtYen(r.profit_after_ads)}</b></td>
+      <td class="num">${fmtPct(r.margin_pct)}</td>
+      <td>${r.cost_status === 'complete' ? '✓' : '<span class="pill edge">' + esc(r.cost_status || '?') + '</span>'}</td>
+    </tr>`).join('');
+    const table = document.getElementById('pf-table');
+    if (reset) table.innerHTML = thead + `<tbody>${rowsHtml}</tbody>`;
+    else table.querySelector('tbody').insertAdjacentHTML('beforeend', rowsHtml);
+    document.getElementById('pf-more').style.display = (pfOffset + 100 < data.total) ? '' : 'none';
+    table.querySelector('thead').onclick = (e) => {
+      const th = e.target.closest('th[data-sort]'); if (!th) return;
+      const k = th.dataset.sort;
+      if (pfSort === k) pfDir = pfDir === 'desc' ? 'asc' : 'desc'; else { pfSort = k; pfDir = 'desc'; }
+      pfOffset = 0; fetchSkuTable(true);
+    };
+  } catch (e) {
+    document.getElementById('pf-table').innerHTML = `<tr><td class="warn-note">取得失敗: ${esc(e.message)}</td></tr>`;
+  }
+}
+// SKU リンクは data 属性 + 委譲 listener (onclick 属性への文字列埋め込みは XSS になるため禁止)
+document.addEventListener('click', (e) => {
+  const a = e.target.closest('a.sku-link[data-sku]');
+  if (!a) return;
+  e.preventDefault();
+  openSkuDialog(a.dataset.sku, a.dataset.preset);
+});
+
+async function openSkuDialog(sku, preset) {
+  const dlg = document.getElementById('sku-dialog');
+  document.getElementById('sku-dialog-title').textContent = `SKU: ${sku} のウォーターフォール`;
+  dlg.showModal();
+  try {
+    const wf = await getJSON(`${API}/waterfall?preset=${preset}&sku=${encodeURIComponent(sku)}`);
+    renderWaterfall('chart-sku-waterfall', wf);
+  } catch (e) { console.error(e); }
+}
+
+// ============================================================
+// 📣 広告
+// ============================================================
+let adPreset = '30d';
+async function loadAds() {
+  mountPeriodSwitcher('ad-period', adPreset, (p) => { adPreset = p; fetchAds(); });
+  fetchAds();
+}
+async function fetchAds() {
+  try {
+    const data = await getJSON(`${API}/ads?preset=${adPreset}`);
+    const t = data.totals;
+    document.getElementById('ad-totals').innerHTML = `
+      <div class="tile"><h3>広告費 全体 (キャンペーン正本)</h3><div class="row hero"><span></span><span class="v">${fmtJPY(t.campaign_total)}</span></div></div>
+      <div class="tile"><h3>SKU直接紐付け分</h3><div class="row hero"><span></span><span class="v">${fmtJPY(t.sku_direct_total)}</span></div></div>
+      <div class="tile"><h3>未配賦 (Auto-Targeting等)</h3><div class="row hero"><span></span><span class="v">${fmtJPY(t.unallocated)} <span class="note">(${t.unallocated_pct}%)</span></span></div></div>`;
+
+    // 4象限: x=TACOS, y=売上, bubble=広告費
+    const pts = data.skus.filter(s => s.tacos_pct !== null && s.revenue_excl > 0).slice(0, 200);
+    mkChart('chart-quadrant', {
+      type: 'bubble',
+      data: { datasets: [{
+        label: 'SKU',
+        data: pts.map(s => ({ x: s.tacos_pct, y: s.revenue_excl, r: Math.min(20, 3 + Math.sqrt(s.ad_cost / 1000)), sku: s.seller_sku, name: s.product_name, profit: s.profit_after_ads })),
+        backgroundColor: pts.map(s => s.profit_after_ads < 0 ? 'rgba(220,38,38,0.5)' : 'rgba(37,99,235,0.4)'),
+      }]},
+      options: { responsive: true, maintainAspectRatio: false,
+        scales: { x: { title: { display: true, text: 'TACOS% (右=広告依存)' } }, y: { title: { display: true, text: '売上(税抜)' }, ticks: { callback: v => fmtJPY(v) } } },
+        plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => `${c.raw.sku}: TACOS ${c.raw.x}% / 売上 ${fmtJPY(c.raw.y)} / 広告後利益 ${fmtJPY(c.raw.profit)}` } } } },
+    });
+    mkChart('chart-tacos2', {
+      type: 'line',
+      data: { labels: data.tacos_trend.map(r => r.ym), datasets: [{ label: 'TACOS%', data: data.tacos_trend.map(r => r.tacos_pct), borderColor: '#dc2626', backgroundColor: 'rgba(220,38,38,0.08)', fill: true }] },
+      options: { responsive: true, maintainAspectRatio: false, scales: { y: { ticks: { callback: v => v + '%' } } } },
+    });
+
+    document.getElementById('ad-sku-table').innerHTML = `<thead><tr>
+      <th class="noclick">SKU</th><th class="noclick">商品名</th><th class="noclick">広告費(直+按分)</th><th class="noclick">広告経由売上</th>
+      <th class="noclick">実ACOS</th><th class="noclick">損益分岐ACOS</th><th class="noclick">判定</th><th class="noclick">TACOS</th><th class="noclick">広告後利益</th>
+    </tr></thead><tbody>` + data.skus.slice(0, 150).map(s => `<tr>
+      <td><a class="sku-link" data-sku="${esc(s.seller_sku)}" data-preset="${adPreset}">${esc(s.seller_sku)}</a></td>
+      <td class="name-cell">${esc(s.product_name || '')}</td>
+      <td class="num">${fmtYen(s.ad_cost)}</td>
+      <td class="num">${fmtYen(s.ad_sales)}</td>
+      <td class="num">${fmtPct(s.acos_pct)}</td>
+      <td class="num">${fmtPct(s.breakeven_acos_pct)}</td>
+      <td>${{ safe: '<span class="pill safe">🟢 余裕</span>', edge: '<span class="pill edge">🟡 限界</span>', bleed: '<span class="pill bleed">🔴 広告赤字</span>', no_data: '<span class="pill no_data">データ不足</span>' }[s.verdict]}</td>
+      <td class="num">${fmtPct(s.tacos_pct)}</td>
+      <td class="num ${signClass(s.profit_after_ads)}">${fmtYen(s.profit_after_ads)}</td>
+    </tr>`).join('') + '</tbody>';
+
+    document.getElementById('ad-camp-table').innerHTML = `<thead><tr>
+      <th class="noclick">キャンペーン</th><th class="noclick">状態</th><th class="noclick">広告費</th><th class="noclick">売上(14d)</th>
+      <th class="noclick">ACOS</th><th class="noclick">クリック</th><th class="noclick">CTR</th><th class="noclick">CPC</th>
+    </tr></thead><tbody>` + data.campaigns.slice(0, 100).map(c => `<tr>
+      <td class="name-cell">${esc(c.campaign_name || c.campaign_id)}</td>
+      <td>${esc(c.status || '')}</td>
+      <td class="num">${fmtYen(c.ad_cost)}</td>
+      <td class="num">${fmtYen(c.ad_sales_14d)}</td>
+      <td class="num">${fmtPct(c.acos_pct)}</td>
+      <td class="num">${(c.clicks || 0).toLocaleString()}</td>
+      <td class="num">${c.ctr_pct === null ? '−' : c.ctr_pct + '%'}</td>
+      <td class="num">${c.cpc === null ? '−' : '¥' + c.cpc}</td>
+    </tr>`).join('') + '</tbody>';
+  } catch (e) {
+    document.getElementById('ad-totals').innerHTML = `<div class="warn-note">取得失敗: ${esc(e.message)} — 広告mirror同期 (PR-A) がまだ流れていない可能性があります。</div>`;
+  }
+}
+
+// ============================================================
+// 📦 在庫
+// ============================================================
+async function loadInventory() {
+  try {
+    const data = await getJSON(API + '/inventory');
+    if (!data.as_of) {
+      document.getElementById('inv-summary').innerHTML = '<div class="warn-note">在庫スナップショットがありません。</div>';
+      return;
+    }
+    const s = data.summary;
+    document.getElementById('inv-summary').innerHTML = `
+      <div class="tile"><h3>在庫金額 (FBA+入荷待ち)</h3><div class="row hero"><span></span><span class="v">${fmtJPY(s.total_value)}</span></div><div class="note">${data.as_of} 時点 / ${s.sku_count} 商品</div></div>
+      <div class="tile"><h3>残30日未満 (要補充検討)</h3><div class="row hero"><span></span><span class="v ${s.low_cover_count > 0 ? 'negv' : ''}">${s.low_cover_count} 商品</span></div></div>
+      <div class="tile"><h3>直近30日販売なし</h3><div class="row hero"><span></span><span class="v">${s.no_velocity_count} 商品</span></div></div>`;
+    document.getElementById('inv-table').innerHTML = `<thead><tr>
+      <th class="noclick">商品コード</th><th class="noclick">商品名</th><th class="noclick">FBA在庫</th><th class="noclick">入荷待ち</th>
+      <th class="noclick">30日販売</th><th class="noclick">在庫残日数</th><th class="noclick">在庫金額</th><th class="noclick">最終販売日</th>
+    </tr></thead><tbody>` + data.rows.map(r => `<tr>
+      <td>${esc(r.ne_code)}</td><td class="name-cell">${esc(r.product_name || '')}</td>
+      <td class="num">${r.fba_qty.toLocaleString()}</td><td class="num">${r.inbound_qty.toLocaleString()}</td>
+      <td class="num">${(r.sales_30d || 0).toLocaleString()}</td>
+      <td class="num ${r.days_of_cover !== null && r.days_of_cover < 30 ? 'negv' : ''}">${r.days_of_cover === null ? '−' : r.days_of_cover + '日'}</td>
+      <td class="num">${fmtYen(r.stock_value)}</td>
+      <td>${esc(r.last_sold_date || '−')}</td>
+    </tr>`).join('') + '</tbody>';
+  } catch (e) {
+    document.getElementById('inv-summary').innerHTML = `<div class="warn-note">取得失敗: ${esc(e.message)}</div>`;
+  }
+}
+
+// ============================================================
+// 🔍 診断
+// ============================================================
+async function loadDiagnosis() {
+  try {
+    const d = await getJSON(API + '/diagnosis');
+    document.getElementById('diag-meta').textContent = `基準月: ${d.base_month} (前月比較: ${d.prev_month}) / 生成: ${new Date(d.generated_at).toLocaleString('ja-JP')}`;
+    const li = (rows, fmt) => rows.length === 0 ? '<div class="note">該当なし 🎉</div>'
+      : `<div class="table-scroll"><table class="data"><tbody>${rows.map(fmt).join('')}</tbody></table></div>`;
+    document.getElementById('diag-cards').innerHTML = `
+      <div class="diag-card"><h4>💪 稼ぎ頭 (利益上位、A群 ${d.earners.length}件) — 在庫切れ防止最優先</h4>
+        ${li(d.earners, r => `<tr><td>${esc(r.seller_sku)}</td><td class="name-cell">${esc(r.product_name || '')}</td><td class="num pos">${fmtYen(r.profit_after_ads)}</td></tr>`)}</div>
+      <div class="diag-card"><h4>🩸 赤字SKU (広告後赤字 ${d.settings.loss_months}ヶ月連続、${d.loss_skus.length}件) — 値上げ/広告停止/撤退判断</h4>
+        ${li(d.loss_skus, r => `<tr><td>${esc(r.seller_sku)}</td><td class="name-cell">${esc(r.product_name || '')}</td><td class="num negv">${fmtYen(r.profit_cur)}</td><td class="num negv">${fmtYen(r.profit_prev)}</td></tr>`)}</div>
+      <div class="diag-card"><h4>📉 悪化SKU (利益率 前月比−${d.settings.margin_drop_pt}pt超、${d.worsened.length}件)</h4>
+        ${li(d.worsened, r => `<tr><td>${esc(r.seller_sku)}</td><td class="name-cell">${esc(r.product_name || '')}</td><td class="num">${r.margin_prev_pct}%→${r.margin_cur_pct}%</td><td class="num negv">−${r.drop_pt}pt</td></tr>`)}</div>
+      <div class="diag-card"><h4>🔥 広告垂れ流し (直近${d.settings.ad_bleed_days}日合算ACOS>損益分岐、${d.ad_bleed.length}件)</h4>
+        ${li(d.ad_bleed, r => `<tr><td>${esc(r.seller_sku)}</td><td class="name-cell">${esc(r.product_name || '')}</td><td class="num">ACOS ${r.acos_pct}% > 分岐 ${r.breakeven_acos_pct}%</td><td class="num">${fmtYen(r.ad_cost)}</td></tr>`)}</div>
+      <div class="diag-card"><h4>💤 死に筋 (販売0×${d.settings.dead_stock_days}日+在庫あり、${d.dead_stock.length}件) — <a href="/apps/profit-analysis" target="_blank">撤退判断タブへ</a></h4>
+        ${li(d.dead_stock, r => `<tr><td>${esc(r.ne_code)}</td><td class="name-cell">${esc(r.product_name || '')}</td><td class="num">${r.qty}個</td><td class="num">${fmtYen(r.stock_value)}</td><td>${esc(r.last_sold_date || '販売実績なし')}</td></tr>`)}</div>
+      <div class="diag-card"><h4>⚠️ 価格ミス疑い (実売単価<標準売価×${d.settings.price_miss_ratio}、${d.price_miss.length}件) — Seller Central要確認</h4>
+        ${li(d.price_miss, r => `<tr><td>${esc(r.seller_sku)}</td><td class="name-cell">${esc(r.product_name || '')}</td><td class="num">実売 ${fmtYen(r.avg_price_incl)}</td><td class="num">標準 ${fmtYen(r.standard_price)}</td></tr>`)}</div>`;
+  } catch (e) {
+    document.getElementById('diag-cards').innerHTML = `<div class="warn-note">取得失敗: ${esc(e.message)}</div>`;
+  }
+}
+
+// ============================================================
+// ⚙️ 設定
+// ============================================================
+const SETTING_LABELS = {
+  acos_safe_ratio: 'ACOS余裕判定比率 (損益分岐×N)', loss_months: '赤字SKU連続月数',
+  margin_drop_pt: '悪化SKU閾値 (pt)', ad_bleed_days: '広告垂れ流し判定日数',
+  dead_stock_days: '死に筋判定日数', price_miss_ratio: '価格ミス判定比率',
+  abc_a_pct: 'ABC: A群 累積%', abc_b_pct: 'ABC: B群 累積%', new_product_days: '新商品バッジ日数',
+};
+async function loadSettings() {
+  await refreshExpenses();
+  const s = await getJSON(API + '/settings');
+  document.getElementById('settings-form').innerHTML = Object.entries(SETTING_LABELS).map(([k, label]) =>
+    `<div><label>${label}</label><input type="text" data-setting="${k}" value="${s[k]}"></div>`).join('');
+  document.getElementById('settings-save').onclick = async () => {
+    const patch = {};
+    document.querySelectorAll('[data-setting]').forEach(el => { patch[el.dataset.setting] = el.value; });
+    await fetch(API + '/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) });
+    document.getElementById('settings-status').textContent = '保存しました ✓';
+    setTimeout(() => document.getElementById('settings-status').textContent = '', 3000);
+  };
+  document.getElementById('exp-add').onclick = async () => {
+    const body = {
+      name: document.getElementById('exp-name').value,
+      expense_type: document.getElementById('exp-type').value,
+      amount_jpy: document.getElementById('exp-amount').value,
+      month_from: document.getElementById('exp-from').value,
+      month_to: document.getElementById('exp-to').value || null,
+      memo: document.getElementById('exp-memo').value,
+    };
+    const res = await fetch(API + '/expenses', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (!res.ok) { const j = await res.json().catch(() => ({})); alert('追加失敗: ' + (j.error || res.status)); return; }
+    document.getElementById('exp-name').value = ''; document.getElementById('exp-amount').value = '';
+    await refreshExpenses();
+  };
+}
+async function refreshExpenses() {
+  const data = await getJSON(API + '/expenses');
+  const typeLabel = { fixed_monthly: '毎月定額', oneoff: '単発', sales_pct: '売上比%' };
+  document.getElementById('exp-table').innerHTML = `<thead><tr>
+    <th class="noclick">名称</th><th class="noclick">種別</th><th class="noclick">金額/%</th><th class="noclick">期間</th><th class="noclick">メモ</th><th class="noclick"></th>
+  </tr></thead><tbody>` + (data.items.length === 0 ? '<tr><td colspan="6" class="note">登録なし</td></tr>' :
+    data.items.map(r => `<tr>
+      <td>${esc(r.name)}</td><td>${typeLabel[r.expense_type]}</td>
+      <td class="num">${r.expense_type === 'sales_pct' ? r.amount_jpy + '%' : fmtYen(r.amount_jpy)}</td>
+      <td>${esc(r.month_from)}${r.expense_type === 'oneoff' ? '' : ' 〜 ' + esc(r.month_to || '継続中')}</td>
+      <td>${esc(r.memo || '')}</td>
+      <td><button class="btn danger" onclick="deleteExpenseRow(${r.id})">削除</button></td>
+    </tr>`).join('')) + '</tbody>';
+}
+async function deleteExpenseRow(id) {
+  if (!confirm('この経費を削除しますか?')) return;
+  await fetch(`${API}/expenses/${id}`, { method: 'DELETE' });
+  await refreshExpenses();
+}
+
+// 初期ロード
+loadTab('overview');
+</script>
+</body>
+</html>

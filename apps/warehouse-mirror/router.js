@@ -592,6 +592,46 @@ function getAmazonFinanceInsert(db) {
   return b.amazonFinanceInsert;
 }
 
+// Amazon 広告費 SKU 別 (amazon-dashboard PR-A)
+function getAmazonAdsSkuInsert(db) {
+  const b = getStmtBundle(db);
+  if (!b.amazonAdsSkuInsert) {
+    b.amazonAdsSkuInsert = db.prepare(`
+      INSERT OR REPLACE INTO mirror_amazon_ads_sku_daily (
+        date_jst, mall, campaign_id, ad_type, target, target_granularity,
+        clicks, impressions, ad_cost, ad_sales, ad_units,
+        source_run_id, source_row_hash, synced_at
+      ) VALUES (
+        @date_jst, @mall, @campaign_id, @ad_type, @target, @target_granularity,
+        @clicks, @impressions, @ad_cost, @ad_sales, @ad_units,
+        @source_run_id, @source_row_hash, @synced_at
+      )
+    `);
+  }
+  return b.amazonAdsSkuInsert;
+}
+
+// Amazon 広告費 キャンペーン単位 (amazon-dashboard PR-A)
+function getAmazonAdsCampaignInsert(db) {
+  const b = getStmtBundle(db);
+  if (!b.amazonAdsCampaignInsert) {
+    b.amazonAdsCampaignInsert = db.prepare(`
+      INSERT OR REPLACE INTO mirror_amazon_ads_campaign_daily (
+        date_jst, mall, campaign_id, campaign_name, ad_type, campaign_status,
+        clicks, impressions, ad_cost,
+        ad_sales_1d, ad_sales_7d, ad_sales_14d, ad_sales_30d, ad_units_1d,
+        source_run_id, source_row_hash, synced_at
+      ) VALUES (
+        @date_jst, @mall, @campaign_id, @campaign_name, @ad_type, @campaign_status,
+        @clicks, @impressions, @ad_cost,
+        @ad_sales_1d, @ad_sales_7d, @ad_sales_14d, @ad_sales_30d, @ad_units_1d,
+        @source_run_id, @source_row_hash, @synced_at
+      )
+    `);
+  }
+  return b.amazonAdsCampaignInsert;
+}
+
 function getRakutenFinanceInsert(db) {
   const b = getStmtBundle(db);
   if (!b.rakutenFinanceInsert) {
@@ -997,6 +1037,23 @@ const ENTITY_REGISTRY = {
     clear_meta_key: 'clear_amazon_finance_dates',
     getInsertStmt: getAmazonFinanceInsert,
     normalizeRow: (r) => normalizeAmazonFinanceRow(r),
+  },
+  // Amazon 広告費 2 entity (amazon-dashboard PR-A、2026-07-06)
+  amazon_ads_sku_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_amazon_ads_sku_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_amazon_ads_sku_dates',
+    getInsertStmt: getAmazonAdsSkuInsert,
+    normalizeRow: (r) => normalizeAmazonAdsSkuRow(r),
+  },
+  amazon_ads_campaign_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_amazon_ads_campaign_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_amazon_ads_campaign_dates',
+    getInsertStmt: getAmazonAdsCampaignInsert,
+    normalizeRow: (r) => normalizeAmazonAdsCampaignRow(r),
   },
   rakuten_finance_sku_daily: {
     contract_version: 1,
@@ -1769,6 +1826,46 @@ function normalizeAmazonFinanceRow(r) {
     profit_amount: r.profit_amount ?? 0,
     is_cost_complete: r.is_cost_complete ?? 0,
     cost_status: r.cost_status,
+    source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,
+    synced_at: r.synced_at,
+  };
+}
+
+// 広告 entity 共通: 必須キーの欠落を 400 で拒否 (String(undefined)="undefined" の混入防止、Codex R1 Medium #4)
+function requireAdKey(r, field) {
+  const v = r[field];
+  const s = v === null || v === undefined ? '' : String(v).trim();
+  if (s === '') {
+    throw new HttpError(400, { error: 'bad_row', message: `${field} is required (got ${JSON.stringify(v)})` });
+  }
+  return s;
+}
+
+// row 列正規化 (mirror_amazon_ads_sku_daily 用、amazon-dashboard PR-A)
+// target は受信側でも trim + LOWER を保証 (送信元の正規化漏れによる PK 重複・按分漏れ防止)
+function normalizeAmazonAdsSkuRow(r) {
+  return {
+    date_jst: r.date_jst, mall: (r.mall || 'amazon'),
+    campaign_id: requireAdKey(r, 'campaign_id'), ad_type: r.ad_type || 'SP',
+    target: requireAdKey(r, 'target').toLowerCase(),
+    target_granularity: requireAdKey(r, 'target_granularity'),
+    clicks: r.clicks ?? 0, impressions: r.impressions ?? 0,
+    ad_cost: r.ad_cost ?? 0, ad_sales: r.ad_sales ?? 0, ad_units: r.ad_units ?? 0,
+    source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,
+    synced_at: r.synced_at,
+  };
+}
+
+// row 列正規化 (mirror_amazon_ads_campaign_daily 用、amazon-dashboard PR-A)
+function normalizeAmazonAdsCampaignRow(r) {
+  return {
+    date_jst: r.date_jst, mall: (r.mall || 'amazon'),
+    campaign_id: requireAdKey(r, 'campaign_id'), campaign_name: r.campaign_name || '',
+    ad_type: r.ad_type || 'SP', campaign_status: r.campaign_status || '',
+    clicks: r.clicks ?? 0, impressions: r.impressions ?? 0, ad_cost: r.ad_cost ?? 0,
+    ad_sales_1d: r.ad_sales_1d ?? 0, ad_sales_7d: r.ad_sales_7d ?? 0,
+    ad_sales_14d: r.ad_sales_14d ?? 0, ad_sales_30d: r.ad_sales_30d ?? 0,
+    ad_units_1d: r.ad_units_1d ?? 0,
     source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,
     synced_at: r.synced_at,
   };
