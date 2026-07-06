@@ -32,7 +32,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(__dirname, '..', '..');
 const RETRY_STATE_FILE = path.join(PROJECT_DIR, 'data', 'daily-sync-retry-state.json');
 
-const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK || 'https://chat.googleapis.com/v1/spaces/AAQAL5zHy-w/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=yER7IJx_9CkKhYnzzre0WcWuqfgXc1oh8ldR35k01zE';
+const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
 const MAX_RETRY_COUNT = 3;
 
@@ -50,14 +50,23 @@ const JOB_DEFINITIONS = {
 const RETRY_ORDER = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期'];
 
 async function notify(text) {
+  if (!GCHAT_WEBHOOK) {
+    console.warn('[Retry] [NOTIFY:status=skipped] GCHAT_WEBHOOK未設定のため通知スキップ');
+    return;
+  }
   try {
-    await fetch(GCHAT_WEBHOOK, {
+    const res = await fetch(GCHAT_WEBHOOK, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text }),
     });
+    if (!res.ok) {
+      console.error(`[Retry] [NOTIFY:status=failed] GChat HTTP ${res.status}`);
+      return;
+    }
+    console.log('[Retry] [NOTIFY:status=sent]');
   } catch (e) {
-    console.error('[Retry] 通知エラー:', e.message);
+    console.error('[Retry] [NOTIFY:status=failed] 通知エラー:', e.message);
   }
 }
 
