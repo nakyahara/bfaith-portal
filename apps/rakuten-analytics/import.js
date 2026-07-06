@@ -1,17 +1,22 @@
 /**
  * rakuten-analytics import.js — 取込タブ (P2) のデータ層
  *
- * 楽天RMSからDLしたレポートCSV (RPP全商品/全キーワード、zip対応) を取り込む。
+ * 楽天RMSからDLしたRPPパフォーマンスレポートCSV (zip対応) を取り込む。
  * 要件定義 F-7: ヘッダ自動判別 (RECIPES方式) + 同期間UPSERT上書き + 鮮度ボード。
  *
+ * RMS実画面の仕様 (2026-07-06 中原さんスクリーンショットで確認):
+ *   - 商品別/キーワード別レポートは集計期間「月ごとに表示」「全期間で表示」のみ
+ *     → SKU別・キーワード別は【月次】粒度で取り込む (日別は楽天側に存在しない)
+ *   - 「すべての広告」「キャンペーン」単位なら「日ごとに表示」が可能
+ *     → 店舗全体の【日次】広告費は別レシピ (rpp_daily) で取り込む
+ *   - 期間は3ヶ月以内に絞る必要あり / 集計結果は昨日まで / 過去分は変動する可能性
+ *     (不正クリック控除) → 再アップロードで PK 単位 UPSERT 上書き (冪等)
+ *   - 出力項目は 顧客種類(合計/新規/既存) × CV種類(12時間/720時間) × 効果項目 のマトリクス
+ *
  * 設計メモ:
- *   - RPPのCV系指標 (売上金額/件数/CVR/ROAS) は720時間(30日)アトリビューションで
- *     過去日付に遡及加算される → 同じ期間を再アップロードすると PK 単位で上書き (UPSERT)。
- *     同一ソース(RMS)の再取込は冪等なので確認ダイアログは設けず、結果サマリで新規/上書き件数を返す
- *   - RPPレポートの正確なヘッダ名は RMS ログイン内でしか確認できないため、
- *     列名は正規化 + パターンマッチで解決する。判別できないファイルは
- *     ヘッダ一覧を返して「未対応形式」として報告 (→ レシピ追記で対応)
- *   - 新テーブル名は楽天Phase1a設計書 §9 予約済みの fact_rakuten_ads_rpp / _rpp_keyword
+ *   - 正確なCSVヘッダ名はDLしないと確認できないため、列名は正規化+パターンマッチで解決。
+ *     判別できないファイルはヘッダ一覧を返して「未対応形式」として報告 (→ レシピ追記で対応)
+ *   - テーブル名は楽天Phase1a設計書 §9 予約済みの fact_rakuten_ads_rpp / _rpp_keyword
  */
 import AdmZip from 'adm-zip';
 import iconv from 'iconv-lite';
@@ -23,8 +28,9 @@ let _initialized = false;
 export function ensureImportTables() {
   if (_initialized) return;
   const db = getMirrorDB();
+  // 商品別 (月次 — RMSの仕様上、商品別レポートは月ごと表示のみ)
   db.exec(`CREATE TABLE IF NOT EXISTS fact_rakuten_ads_rpp (
-    date_jst            TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+    month_ym            TEXT NOT NULL CHECK(month_ym GLOB '????-??'),
     item_manage_number  TEXT NOT NULL CHECK(trim(item_manage_number) <> ''),
     campaign_id         TEXT NOT NULL DEFAULT '',
     campaign_name       TEXT NOT NULL DEFAULT '',
@@ -45,14 +51,14 @@ export function ensureImportTables() {
     source_file         TEXT NOT NULL DEFAULT '',
     import_id           INTEGER NOT NULL,
     imported_at         TEXT NOT NULL,
-    PRIMARY KEY (date_jst, item_manage_number, campaign_id)
+    PRIMARY KEY (month_ym, item_manage_number, campaign_id)
   )`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_frar_item ON fact_rakuten_ads_rpp(item_manage_number, date_jst)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_frar_month ON fact_rakuten_ads_rpp(substr(date_jst,1,7))`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_frar_item ON fact_rakuten_ads_rpp(item_manage_number, month_ym)`);
 
+  // キーワード別 (月次)
   db.exec(`CREATE TABLE IF NOT EXISTS fact_rakuten_ads_rpp_keyword (
-    date_jst            TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
-    item_manage_number  TEXT NOT NULL DEFAULT '',
+    month_ym            TEXT NOT NULL CHECK(month_ym GLOB '????-??'),
+    item_manage_number  TEXT NOT NULL CHECK(trim(item_manage_number) <> ''),
     keyword             TEXT NOT NULL CHECK(trim(keyword) <> ''),
     campaign_id         TEXT NOT NULL DEFAULT '',
     keyword_cpc         REAL,
@@ -68,9 +74,34 @@ export function ensureImportTables() {
     source_file         TEXT NOT NULL DEFAULT '',
     import_id           INTEGER NOT NULL,
     imported_at         TEXT NOT NULL,
-    PRIMARY KEY (date_jst, item_manage_number, keyword, campaign_id)
+    PRIMARY KEY (month_ym, item_manage_number, keyword, campaign_id)
   )`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_frark_kw ON fact_rakuten_ads_rpp_keyword(keyword, date_jst)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_frark_kw ON fact_rakuten_ads_rpp_keyword(keyword, month_ym)`);
+
+  // 店舗全体/キャンペーン別 (日次 — 集計単位「すべての広告」or「キャンペーン」×「日ごとに表示」)
+  db.exec(`CREATE TABLE IF NOT EXISTS fact_rakuten_ads_rpp_daily (
+    date_jst            TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+    campaign_id         TEXT NOT NULL DEFAULT '',
+    campaign_name       TEXT NOT NULL DEFAULT '',
+    clicks              INTEGER NOT NULL DEFAULT 0,
+    impressions         INTEGER,
+    ad_cost             REAL NOT NULL DEFAULT 0,
+    ad_cost_discounted  REAL,
+    cpc_actual          REAL,
+    ctr_pct             REAL,
+    sales_720h          REAL NOT NULL DEFAULT 0,
+    orders_720h         INTEGER NOT NULL DEFAULT 0,
+    cvr_720h_pct        REAL,
+    roas_720h_pct       REAL,
+    sales_12h           REAL,
+    orders_12h          INTEGER,
+    sales_720h_new      REAL,
+    sales_720h_repeat   REAL,
+    source_file         TEXT NOT NULL DEFAULT '',
+    import_id           INTEGER NOT NULL,
+    imported_at         TEXT NOT NULL,
+    PRIMARY KEY (date_jst, campaign_id)
+  )`);
 
   db.exec(`CREATE TABLE IF NOT EXISTS radash_import_log (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -150,8 +181,39 @@ export function normalizeDate(v) {
   return iso;
 }
 
+// 年月を YYYY-MM に正規化 (2026/07, 2026-7, 2026年7月, 202607, フル日付も月に丸め)
+export function normalizeMonth(v) {
+  const s = trimS(v);
+  let m = s.match(/^(\d{4})[/\-年](\d{1,2})月?$/);
+  if (!m) m = s.match(/^(\d{4})(\d{2})$/);
+  if (m) {
+    const [, y, mo] = m;
+    const n = Number(mo);
+    if (n < 1 || n > 12) return null;
+    return `${y}-${String(n).padStart(2, '0')}`;
+  }
+  const d = normalizeDate(s);
+  return d ? d.slice(0, 7) : null;
+}
+
+// RPP商品別/KW別レポートの「日付」列は期間文字列 (実データ確認 2026-07-06):
+//   「2026年07月01日～2026年07月05日」(範囲) / 「2026年07月」等。
+// 範囲が同一月内なら月に丸め、複数月にまたがる場合は spans (=「月ごとに表示」でDLし直し案内)
+export function parseMonthPeriod(v) {
+  const s = trimS(v);
+  if (!s) return { ym: null };
+  const parts = s.split(/[～〜~]/).map(x => x.trim()).filter(Boolean);
+  if (parts.length === 2) {
+    const d1 = normalizeDate(parts[0]) || (normalizeMonth(parts[0]) ? normalizeMonth(parts[0]) + '-01' : null);
+    const d2 = normalizeDate(parts[1]) || (normalizeMonth(parts[1]) ? normalizeMonth(parts[1]) + '-01' : null);
+    if (!d1 || !d2) return { ym: null };
+    if (d1.slice(0, 7) !== d2.slice(0, 7)) return { ym: null, spans: true };
+    return { ym: d1.slice(0, 7) };
+  }
+  return { ym: normalizeMonth(s) };
+}
+
 // ─── ヘッダ列解決 (正規化 + include/exclude パターン) ───
-// 全角括弧/％/空白を正規化して比較する。RMSのDL項目選択で列構成が変わるため、位置でなく名前で解決
 function normHeader(h) {
   return trimS(h)
     .replace(/[（]/g, '(').replace(/[）]/g, ')')
@@ -171,126 +233,173 @@ function pickCol(headers, includes, excludes = []) {
 // CV系 (売上金額/件数/CVR/ROAS) の窓・顧客区分。「合計」列を最優先、無ければ区分なし列
 function pickMetric(headers, base, window, opts = {}) {
   const ex = ['新規', '既存', ...(opts.excludes || [])];
-  // 1) base + window + 合計
-  let i = pickCol(headers, [base, window, '合計'], opts.excludes || []);
+  let i = window ? pickCol(headers, [base, window, '合計'], opts.excludes || []) : -1;
   if (i >= 0) return i;
-  // 2) base + window (新規/既存を除く)
-  i = pickCol(headers, [base, window], ex);
+  if (window) {
+    i = pickCol(headers, [base, window], ex);
+    if (i >= 0) return i;
+  }
+  // 「合計」付き・窓なし → 窓なし
+  i = pickCol(headers, [base, '合計'], ['12時間', '720時間', ...(opts.excludes || [])]);
   if (i >= 0) return i;
-  // 3) window 表記なし (レポートに窓の区別がない場合)
   i = pickCol(headers, [base], ['12時間', '720時間', ...ex]);
   return i;
 }
 
+// 期間列 (年月 or 日付)。product/keyword は月次、daily は日次
+function pickPeriodCol(headers) {
+  let i = pickCol(headers, ['年月']);
+  if (i >= 0) return i;
+  i = pickCol(headers, ['集計期間']);
+  if (i >= 0) return i;
+  i = pickCol(headers, ['日付']);
+  if (i >= 0) return i;
+  return pickCol(headers, ['日'], ['曜日']);
+}
+
+// 共通のメトリクス列解決
+function metricCols(headers) {
+  return {
+    clicks: pickMetric(headers, 'クリック数', ''),
+    impressions: pickCol(headers, ['表示回数']) >= 0 ? pickCol(headers, ['表示回数']) : pickCol(headers, ['インプレッション']),
+    adCost: pickMetric(headers, '実績額', ''),
+    cpcActual: pickCol(headers, ['cpc実績']) >= 0 ? pickCol(headers, ['cpc実績']) : pickCol(headers, ['cpc'], ['キーワード', '目安', '商品']),
+    ctr: pickCol(headers, ['ctr']),
+    sales720: pickMetric(headers, '売上金額', '720時間'),
+    orders720: pickMetric(headers, '売上件数', '720時間'),
+    cvr720: pickMetric(headers, 'cvr', '720時間'),
+    roas720: pickMetric(headers, 'roas', '720時間', { excludes: ['値引'] }),
+    sales12: pickMetric(headers, '売上金額', '12時間'),
+    orders12: pickMetric(headers, '売上件数', '12時間'),
+    sales720New: pickCol(headers, ['売上金額', '720時間', '新規']),
+    sales720Repeat: pickCol(headers, ['売上金額', '720時間', '既存']),
+  };
+}
+function metricRecord(cells, col) {
+  return {
+    clicks: col.clicks >= 0 ? Math.round(num0(cells[col.clicks])) : 0,
+    impressions: col.impressions >= 0 ? numOrNull(cells[col.impressions]) : null,
+    ad_cost: col.adCost >= 0 ? num0(cells[col.adCost]) : 0,
+    cpc_actual: col.cpcActual >= 0 ? numOrNull(cells[col.cpcActual]) : null,
+    ctr_pct: col.ctr >= 0 ? numOrNull(cells[col.ctr]) : null,
+    sales_720h: col.sales720 >= 0 ? num0(cells[col.sales720]) : 0,
+    orders_720h: col.orders720 >= 0 ? Math.round(num0(cells[col.orders720])) : 0,
+    cvr_720h_pct: col.cvr720 >= 0 ? numOrNull(cells[col.cvr720]) : null,
+    roas_720h_pct: col.roas720 >= 0 ? numOrNull(cells[col.roas720]) : null,
+    sales_12h: col.sales12 >= 0 ? numOrNull(cells[col.sales12]) : null,
+    orders_12h: col.orders12 >= 0 ? numOrNull(cells[col.orders12]) : null,
+    sales_720h_new: col.sales720New >= 0 ? numOrNull(cells[col.sales720New]) : null,
+    sales_720h_repeat: col.sales720Repeat >= 0 ? numOrNull(cells[col.sales720Repeat]) : null,
+  };
+}
+
 // ─── RECIPES: ヘッダからファイル種別を判別し、行→レコード変換を提供 ───
+// period: 'month' = 商品別/KW別 (RMS仕様で月次のみ) / 'day' = すべての広告・キャンペーン日次
 export const IMPORT_RECIPES = [
   {
     type: 'rpp_keyword',
-    label: 'RPP 全キーワードレポート',
-    table: 'fact_rakuten_ads_rpp_keyword',
-    detect: (headers) => pickCol(headers, ['キーワード']) >= 0
+    label: 'RPP 全キーワードレポート (月次)',
+    period: 'month',
+    detect: (headers) => pickCol(headers, ['キーワード'], ['cpc', '入札']) >= 0
       && (pickCol(headers, ['実績額']) >= 0 || pickCol(headers, ['クリック']) >= 0),
     columns: (headers) => ({
-      date: pickCol(headers, ['日付']) >= 0 ? pickCol(headers, ['日付']) : pickCol(headers, ['日']),
+      period: pickPeriodCol(headers),
       keyword: pickCol(headers, ['キーワード'], ['cpc', '入札']),
       item: pickCol(headers, ['商品管理番号']),
       campaignId: pickCol(headers, ['キャンペーンid']),
       keywordCpc: pickCol(headers, ['キーワード', 'cpc']),
-      clicks: pickMetric(headers, 'クリック数', ''),
-      impressions: pickCol(headers, ['表示回数'], []) >= 0 ? pickCol(headers, ['表示回数']) : pickCol(headers, ['インプレッション']),
-      adCost: pickMetric(headers, '実績額', ''),
-      cpcActual: pickCol(headers, ['cpc実績']),
-      ctr: pickCol(headers, ['ctr']),
-      sales720: pickMetric(headers, '売上金額', '720時間'),
-      orders720: pickMetric(headers, '売上件数', '720時間'),
-      cvr720: pickMetric(headers, 'cvr', '720時間'),
-      roas720: pickMetric(headers, 'roas', '720時間', { excludes: ['値引'] }),
+      ...metricCols(headers),
     }),
-    // item は PK 構成要素 (欠けると複数商品が同一PKに潰れる — Codex R1 High)。
-    // clicks/adCost/sales720/orders720 は分析の根幹 (列解決失敗を0値で静かに取り込まない)
-    required: ['date', 'keyword', 'item', 'clicks', 'adCost', 'sales720', 'orders720'],
-    toRecord: (cells, col) => ({
-      date_jst: normalizeDate(cells[col.date]),
-      item_manage_number: col.item >= 0 ? trimS(cells[col.item]) : '',
-      keyword: trimS(cells[col.keyword]),
-      campaign_id: col.campaignId >= 0 ? trimS(cells[col.campaignId]) : '',
-      keyword_cpc: col.keywordCpc >= 0 ? numOrNull(cells[col.keywordCpc]) : null,
-      clicks: col.clicks >= 0 ? Math.round(num0(cells[col.clicks])) : 0,
-      impressions: col.impressions >= 0 ? numOrNull(cells[col.impressions]) : null,
-      ad_cost: col.adCost >= 0 ? num0(cells[col.adCost]) : 0,
-      cpc_actual: col.cpcActual >= 0 ? numOrNull(cells[col.cpcActual]) : null,
-      ctr_pct: col.ctr >= 0 ? numOrNull(cells[col.ctr]) : null,
-      sales_720h: col.sales720 >= 0 ? num0(cells[col.sales720]) : 0,
-      orders_720h: col.orders720 >= 0 ? Math.round(num0(cells[col.orders720])) : 0,
-      cvr_720h_pct: col.cvr720 >= 0 ? numOrNull(cells[col.cvr720]) : null,
-      roas_720h_pct: col.roas720 >= 0 ? numOrNull(cells[col.roas720]) : null,
-    }),
-    validRecord: (r) => r.date_jst && r.keyword !== '' && r.item_manage_number !== '',
-    invalidReason: (r) => !r.date_jst ? '日付が不正' : r.keyword === '' ? 'キーワードが空' : '商品管理番号が空',
+    // item は PK 構成要素 (欠けると複数商品が同一PKに潰れる)。根幹メトリクスは0値で静かに取り込まない
+    required: ['period', 'keyword', 'item', 'clicks', 'adCost', 'sales720', 'orders720'],
+    toRecord: (cells, col) => {
+      const p = parseMonthPeriod(cells[col.period]);
+      return {
+        period_raw: trimS(cells[col.period]),
+        month_ym: p.ym,
+        period_spans: !!p.spans,
+        item_manage_number: trimS(cells[col.item]),
+        keyword: trimS(cells[col.keyword]),
+        campaign_id: col.campaignId >= 0 ? trimS(cells[col.campaignId]) : '',
+        keyword_cpc: col.keywordCpc >= 0 ? numOrNull(cells[col.keywordCpc]) : null,
+        ...metricRecord(cells, col),
+      };
+    },
+    validRecord: (r) => r.month_ym && !r.period_spans && r.keyword !== '' && r.item_manage_number !== '',
+    invalidReason: (r) => r.period_spans ? '期間が複数月にまたがっています。集計期間「月ごとに表示」でDLし直してください'
+      : !r.month_ym ? '年月が不正' : r.keyword === '' ? 'キーワードが空' : '商品管理番号が空',
+    pk: (r) => `${r.month_ym}\x1f${r.item_manage_number}\x1f${r.keyword}\x1f${r.campaign_id}`,
   },
   {
     type: 'rpp_product',
-    label: 'RPP 全商品レポート',
-    table: 'fact_rakuten_ads_rpp',
+    label: 'RPP 全商品レポート (月次)',
+    period: 'month',
     // キーワード列が無く、商品管理番号 + (実績額 or クリック) がある
-    detect: (headers) => pickCol(headers, ['キーワード']) < 0
+    detect: (headers) => pickCol(headers, ['キーワード'], ['cpc', '入札']) < 0
       && pickCol(headers, ['商品管理番号']) >= 0
       && (pickCol(headers, ['実績額']) >= 0 || pickCol(headers, ['クリック']) >= 0),
     columns: (headers) => ({
-      date: pickCol(headers, ['日付']) >= 0 ? pickCol(headers, ['日付']) : pickCol(headers, ['日']),
+      period: pickPeriodCol(headers),
       item: pickCol(headers, ['商品管理番号']),
       itemName: pickCol(headers, ['商品名']),
       campaignId: pickCol(headers, ['キャンペーンid']),
       campaignName: pickCol(headers, ['キャンペーン名']),
-      clicks: pickMetric(headers, 'クリック数', ''),
-      impressions: pickCol(headers, ['表示回数']) >= 0 ? pickCol(headers, ['表示回数']) : pickCol(headers, ['インプレッション']),
-      adCost: pickMetric(headers, '実績額', ''),
-      cpcActual: pickCol(headers, ['cpc実績']),
-      ctr: pickCol(headers, ['ctr']),
-      sales720: pickMetric(headers, '売上金額', '720時間'),
-      orders720: pickMetric(headers, '売上件数', '720時間'),
-      cvr720: pickMetric(headers, 'cvr', '720時間'),
-      roas720: pickMetric(headers, 'roas', '720時間', { excludes: ['値引'] }),
-      sales12: pickCol(headers, ['売上金額', '12時間', '合計']) >= 0
-        ? pickCol(headers, ['売上金額', '12時間', '合計'])
-        : pickCol(headers, ['売上金額', '12時間'], ['新規', '既存']),
-      orders12: pickCol(headers, ['売上件数', '12時間', '合計']) >= 0
-        ? pickCol(headers, ['売上件数', '12時間', '合計'])
-        : pickCol(headers, ['売上件数', '12時間'], ['新規', '既存']),
-      sales720New: pickCol(headers, ['売上金額', '720時間', '新規']),
-      sales720Repeat: pickCol(headers, ['売上金額', '720時間', '既存']),
+      ...metricCols(headers),
     }),
-    required: ['date', 'item', 'clicks', 'adCost', 'sales720', 'orders720'],
+    required: ['period', 'item', 'clicks', 'adCost', 'sales720', 'orders720'],
+    toRecord: (cells, col) => {
+      const p = parseMonthPeriod(cells[col.period]);
+      return {
+        period_raw: trimS(cells[col.period]),
+        month_ym: p.ym,
+        period_spans: !!p.spans,
+        item_manage_number: trimS(cells[col.item]),
+        campaign_id: col.campaignId >= 0 ? trimS(cells[col.campaignId]) : '',
+        campaign_name: col.campaignName >= 0 ? trimS(cells[col.campaignName]) : '',
+        item_name: col.itemName >= 0 ? trimS(cells[col.itemName]) : '',
+        ...metricRecord(cells, col),
+      };
+    },
+    validRecord: (r) => r.month_ym && !r.period_spans && r.item_manage_number !== '',
+    invalidReason: (r) => r.period_spans ? '期間が複数月にまたがっています。集計期間「月ごとに表示」でDLし直してください'
+      : !r.month_ym ? '年月が不正' : '商品管理番号が空',
+    pk: (r) => `${r.month_ym}\x1f${r.item_manage_number}\x1f${r.campaign_id}`,
+  },
+  {
+    type: 'rpp_daily',
+    label: 'RPP 日次広告費 (すべての広告/キャンペーン)',
+    period: 'day',
+    // 日付があり、商品管理番号・キーワードが無い (集計単位「すべての広告」or「キャンペーン」の日別DL)
+    detect: (headers) => (pickCol(headers, ['日付']) >= 0 || pickCol(headers, ['日'], ['曜日']) >= 0)
+      && pickCol(headers, ['商品管理番号']) < 0
+      && pickCol(headers, ['キーワード'], ['cpc', '入札']) < 0
+      && (pickCol(headers, ['実績額']) >= 0 || pickCol(headers, ['クリック']) >= 0),
+    columns: (headers) => ({
+      period: pickCol(headers, ['日付']) >= 0 ? pickCol(headers, ['日付']) : pickCol(headers, ['日'], ['曜日']),
+      campaignId: pickCol(headers, ['キャンペーンid']),
+      campaignName: pickCol(headers, ['キャンペーン名']),
+      adCostDiscounted: pickCol(headers, ['割引後実績額']),
+      ...metricCols(headers),
+    }),
+    required: ['period', 'clicks', 'adCost', 'sales720', 'orders720'],
     toRecord: (cells, col) => ({
-      date_jst: normalizeDate(cells[col.date]),
-      item_manage_number: trimS(cells[col.item]),
+      period_raw: trimS(cells[col.period]),
+      date_jst: normalizeDate(cells[col.period]),
       campaign_id: col.campaignId >= 0 ? trimS(cells[col.campaignId]) : '',
       campaign_name: col.campaignName >= 0 ? trimS(cells[col.campaignName]) : '',
-      item_name: col.itemName >= 0 ? trimS(cells[col.itemName]) : '',
-      clicks: col.clicks >= 0 ? Math.round(num0(cells[col.clicks])) : 0,
-      impressions: col.impressions >= 0 ? numOrNull(cells[col.impressions]) : null,
-      ad_cost: col.adCost >= 0 ? num0(cells[col.adCost]) : 0,
-      cpc_actual: col.cpcActual >= 0 ? numOrNull(cells[col.cpcActual]) : null,
-      ctr_pct: col.ctr >= 0 ? numOrNull(cells[col.ctr]) : null,
-      sales_720h: col.sales720 >= 0 ? num0(cells[col.sales720]) : 0,
-      orders_720h: col.orders720 >= 0 ? Math.round(num0(cells[col.orders720])) : 0,
-      cvr_720h_pct: col.cvr720 >= 0 ? numOrNull(cells[col.cvr720]) : null,
-      roas_720h_pct: col.roas720 >= 0 ? numOrNull(cells[col.roas720]) : null,
-      sales_12h: col.sales12 >= 0 ? numOrNull(cells[col.sales12]) : null,
-      orders_12h: col.orders12 >= 0 ? numOrNull(cells[col.orders12]) : null,
-      sales_720h_new: col.sales720New >= 0 ? numOrNull(cells[col.sales720New]) : null,
-      sales_720h_repeat: col.sales720Repeat >= 0 ? numOrNull(cells[col.sales720Repeat]) : null,
+      ad_cost_discounted: col.adCostDiscounted >= 0 ? numOrNull(cells[col.adCostDiscounted]) : null,
+      ...metricRecord(cells, col),
     }),
-    validRecord: (r) => r.date_jst && r.item_manage_number !== '',
-    invalidReason: (r) => !r.date_jst ? '日付が不正' : '商品管理番号が空',
+    validRecord: (r) => !!r.date_jst,
+    invalidReason: () => '日付が不正',
+    pk: (r) => `${r.date_jst}\x1f${r.campaign_id}`,
   },
 ];
 
 // ─── zip 展開 (zip爆弾ガード付き) ───
-// 方針 (Codex R1 High / Medium): ①展開前に全エントリを宣言値で検証し、1つでも違反したら
-// その zip 全体を reject (部分成功にしない) ②展開後の実測サイズが宣言を大きく超えたら
-// zip 全体を破棄 (宣言詐称)。adm-zip は stream 展開できないため、上限値を小さめに取り
-// メモリスパイクの上限を1エントリ実測30MB強に抑える (認可済み社内ユーザー限定の入口)
+// 方針: ①展開前に全エントリを宣言値で検証し、1つでも違反したらその zip 全体を reject
+// ②展開後の実測サイズが宣言を大きく超えたら zip 全体を破棄 (宣言詐称)。
+// adm-zip は stream 展開できないため、上限値を小さめに取りメモリスパイクを抑える
 const ZIP_MAX_ENTRIES = 100;
 const ZIP_MAX_ENTRY_BYTES = 30 * 1024 * 1024;   // 1エントリ (宣言/実測) 30MB
 const ZIP_MAX_TOTAL_BYTES = 60 * 1024 * 1024;   // 1 zip の展開後合計 (宣言) 60MB
@@ -360,23 +469,33 @@ function prepareOne(name, buffer) {
   try { rows = parseCsvBuffer(buffer); } catch (e) { return fail('unknown', `読込失敗: ${e.message}`); }
   if (rows.length < 2) return fail('unknown', 'データ行がありません');
 
-  const headersRaw = rows[0].map(trimS);
-  const headers = headersRaw.map(normHeader);
-  const recipe = IMPORT_RECIPES.find(rc => rc.detect(headers));
-  if (!recipe) {
-    return fail('unknown', `種類を判別できません。見出し: ${headersRaw.slice(0, 12).join(' / ')}${headersRaw.length > 12 ? ' …' : ''}`);
+  // ヘッダ行の探索: RMSの実CSVは先頭に前置行がある (実データ確認 2026-07-06):
+  //   L0「実行日時: …」/ L2「検索条件」/「集計単位: 商品別」/「■■■…削除してください■■■」など。
+  // 先頭12行のうち「5列以上あり、いずれかのレシピに一致する行」をヘッダとする
+  let headerIdx = -1, recipe = null, headersRaw = null, headers = null;
+  for (let i = 0; i < Math.min(rows.length, 12); i++) {
+    if (rows[i].length < 5) continue;
+    const raw = rows[i].map(trimS);
+    const norm = raw.map(normHeader);
+    const rc = IMPORT_RECIPES.find(x => x.detect(norm));
+    if (rc) { headerIdx = i; recipe = rc; headersRaw = raw; headers = norm; break; }
   }
+  if (!recipe) {
+    const preview = rows.slice(0, 3).map(r => r.slice(0, 6).join(' / ')).join(' | ');
+    return fail('unknown', `種類を判別できません。先頭行: ${preview.slice(0, 300)}`);
+  }
+  rows = rows.slice(headerIdx);  // rows[0] = ヘッダ行に正規化
   const col = recipe.columns(headers);
   const missing = recipe.required.filter(k => col[k] < 0);
   if (missing.length) {
     const COL_LABEL = {
-      date: '日付', item: '商品管理番号', keyword: 'キーワード',
+      period: '年月/日付', item: '商品管理番号', keyword: 'キーワード',
       clicks: 'クリック数', adCost: '実績額', sales720: '売上金額(720時間)', orders720: '売上件数(720時間)',
     };
     const names = missing.map(k => COL_LABEL[k] || k).join(' / ');
-    const hint = missing.includes('date')
-      ? `日付列が見つかりません。RMSのレポートDLで集計単位「日別」を選んでください。`
-      : `必須列が見つかりません: ${names}。RMSのDL時に出力項目をすべて含めてください。`;
+    const hint = missing.includes('period')
+      ? `期間列 (年月/日付) が見つかりません。集計期間「月ごとに表示」でDLしてください。`
+      : `必須列が見つかりません: ${names}。RMSのDL時に表示/出力項目「全てを選択」にしてください。`;
     return fail(recipe.type, `${hint} (見出し: ${headersRaw.slice(0, 12).join(' / ')})`);
   }
 
@@ -387,18 +506,36 @@ function prepareOne(name, buffer) {
     if (cells.length === 1 && trimS(cells[0]) === '') continue;
     const r = recipe.toRecord(cells, col);
     if (!recipe.validRecord(r)) {
-      return fail(recipe.type, `${i + 1}行目: ${recipe.invalidReason(r)} (値: ${trimS(cells[col.date] ?? '')} / ${trimS(cells[col.item >= 0 ? col.item : 0] ?? '')})`);
+      return fail(recipe.type, `${i + 1}行目: ${recipe.invalidReason(r)} (期間値: ${trimS(cells[col.period] ?? '')})`);
     }
     records.push(r);
   }
   if (records.length === 0) return fail(recipe.type, '有効なデータ行がありません');
 
-  // CSV 内 PK 重複は後勝ちで統合 (同一ファイル内の同 PK は RMS 側の集計重複)
-  const pkOf = recipe.type === 'rpp_keyword'
-    ? (r) => `${r.date_jst}\x1f${r.item_manage_number}\x1f${r.keyword}\x1f${r.campaign_id}`
-    : (r) => `${r.date_jst}\x1f${r.item_manage_number}\x1f${r.campaign_id}`;
+  // 月次レシピに日別データが来ていないか検査: 同一PKに異なる期間文字列が複数あれば
+  // 「全期間で表示」や日別集計の可能性 → 黙って後勝ち統合せずエラーにする
+  if (recipe.period === 'month') {
+    const periodsByPk = new Map();
+    for (const r of records) {
+      const k = recipe.pk(r);
+      if (!periodsByPk.has(k)) periodsByPk.set(k, new Set());
+      periodsByPk.get(k).add(r.period_raw);
+    }
+    for (const [, set] of periodsByPk) {
+      if (set.size > 1) {
+        return fail(recipe.type, `同じ商品×月に複数の期間値があります (${[...set].slice(0, 3).join(', ')})。集計期間「月ごとに表示」でDLし直してください。`);
+      }
+    }
+  }
+
+  // ファイル内 PK 重複は後勝ちで統合 (RMS 側の集計重複)
   const dedup = new Map();
-  for (const r of records) dedup.set(pkOf(r), r);
+  for (const r of records) dedup.set(recipe.pk(r), r);
+  // 日次レシピで同一日付が複数行 = キャンペーン単位CSVにキャンペーンID列が無い可能性
+  // (黙って後勝ち統合すると広告費が欠落する — Codex Medium)
+  if (recipe.type === 'rpp_daily' && dedup.size < records.length) {
+    return fail(recipe.type, `同一日付の行が複数あります (${records.length}行→${dedup.size}件)。キャンペーン単位のCSVはキャンペーンID列を含めてDLするか、集計単位「すべての広告」でDLしてください。`);
+  }
   return { name, ok: true, recipe, records: [...dedup.values()], rawCount: records.length };
 }
 
@@ -410,60 +547,86 @@ class GroupAbortError extends Error {
 // ─── 確定: 検証済み1ファイル分を upsert (呼び出し元の transaction 内で実行) ───
 function commitOne(db, logStmt, p, importedAt, uploadedBy) {
   const { name, recipe, records: finalRecords, rawCount } = p;
-    let inserted = 0, updated = 0;
-    let dateFrom = null, dateTo = null;
-    const logInfo = logStmt.run(importedAt, uploadedBy, name, recipe.type, null, null, finalRecords.length, 0, 0, 'ok', '');
-    const importId = logInfo.lastInsertRowid;
+  let inserted = 0, updated = 0;
+  let periodFrom = null, periodTo = null;
+  const logInfo = logStmt.run(importedAt, uploadedBy, name, recipe.type, null, null, finalRecords.length, 0, 0, 'ok', '');
+  const importId = logInfo.lastInsertRowid;
 
-    let existsStmt, upsertStmt;
-    if (recipe.type === 'rpp_product') {
-      existsStmt = db.prepare(`SELECT 1 FROM fact_rakuten_ads_rpp WHERE date_jst=? AND item_manage_number=? AND campaign_id=?`);
-      upsertStmt = db.prepare(`INSERT INTO fact_rakuten_ads_rpp
-        (date_jst, item_manage_number, campaign_id, campaign_name, item_name, clicks, impressions, ad_cost,
-         cpc_actual, ctr_pct, sales_720h, orders_720h, cvr_720h_pct, roas_720h_pct,
-         sales_12h, orders_12h, sales_720h_new, sales_720h_repeat, source_file, import_id, imported_at)
-        VALUES (@date_jst, @item_manage_number, @campaign_id, @campaign_name, @item_name, @clicks, @impressions, @ad_cost,
-         @cpc_actual, @ctr_pct, @sales_720h, @orders_720h, @cvr_720h_pct, @roas_720h_pct,
-         @sales_12h, @orders_12h, @sales_720h_new, @sales_720h_repeat, @source_file, @import_id, @imported_at)
-        ON CONFLICT (date_jst, item_manage_number, campaign_id) DO UPDATE SET
-          campaign_name=excluded.campaign_name, item_name=excluded.item_name,
-          clicks=excluded.clicks, impressions=excluded.impressions, ad_cost=excluded.ad_cost,
-          cpc_actual=excluded.cpc_actual, ctr_pct=excluded.ctr_pct,
-          sales_720h=excluded.sales_720h, orders_720h=excluded.orders_720h,
-          cvr_720h_pct=excluded.cvr_720h_pct, roas_720h_pct=excluded.roas_720h_pct,
-          sales_12h=excluded.sales_12h, orders_12h=excluded.orders_12h,
-          sales_720h_new=excluded.sales_720h_new, sales_720h_repeat=excluded.sales_720h_repeat,
-          source_file=excluded.source_file, import_id=excluded.import_id, imported_at=excluded.imported_at`);
-    } else {
-      existsStmt = db.prepare(`SELECT 1 FROM fact_rakuten_ads_rpp_keyword WHERE date_jst=? AND item_manage_number=? AND keyword=? AND campaign_id=?`);
-      upsertStmt = db.prepare(`INSERT INTO fact_rakuten_ads_rpp_keyword
-        (date_jst, item_manage_number, keyword, campaign_id, keyword_cpc, clicks, impressions, ad_cost,
-         cpc_actual, ctr_pct, sales_720h, orders_720h, cvr_720h_pct, roas_720h_pct, source_file, import_id, imported_at)
-        VALUES (@date_jst, @item_manage_number, @keyword, @campaign_id, @keyword_cpc, @clicks, @impressions, @ad_cost,
-         @cpc_actual, @ctr_pct, @sales_720h, @orders_720h, @cvr_720h_pct, @roas_720h_pct, @source_file, @import_id, @imported_at)
-        ON CONFLICT (date_jst, item_manage_number, keyword, campaign_id) DO UPDATE SET
-          keyword_cpc=excluded.keyword_cpc, clicks=excluded.clicks, impressions=excluded.impressions,
-          ad_cost=excluded.ad_cost, cpc_actual=excluded.cpc_actual, ctr_pct=excluded.ctr_pct,
-          sales_720h=excluded.sales_720h, orders_720h=excluded.orders_720h,
-          cvr_720h_pct=excluded.cvr_720h_pct, roas_720h_pct=excluded.roas_720h_pct,
-          source_file=excluded.source_file, import_id=excluded.import_id, imported_at=excluded.imported_at`);
-    }
+  let existsStmt, upsertStmt, periodKey;
+  if (recipe.type === 'rpp_product') {
+    periodKey = 'month_ym';
+    existsStmt = db.prepare(`SELECT 1 FROM fact_rakuten_ads_rpp WHERE month_ym=? AND item_manage_number=? AND campaign_id=?`);
+    upsertStmt = db.prepare(`INSERT INTO fact_rakuten_ads_rpp
+      (month_ym, item_manage_number, campaign_id, campaign_name, item_name, clicks, impressions, ad_cost,
+       cpc_actual, ctr_pct, sales_720h, orders_720h, cvr_720h_pct, roas_720h_pct,
+       sales_12h, orders_12h, sales_720h_new, sales_720h_repeat, source_file, import_id, imported_at)
+      VALUES (@month_ym, @item_manage_number, @campaign_id, @campaign_name, @item_name, @clicks, @impressions, @ad_cost,
+       @cpc_actual, @ctr_pct, @sales_720h, @orders_720h, @cvr_720h_pct, @roas_720h_pct,
+       @sales_12h, @orders_12h, @sales_720h_new, @sales_720h_repeat, @source_file, @import_id, @imported_at)
+      ON CONFLICT (month_ym, item_manage_number, campaign_id) DO UPDATE SET
+        campaign_name=excluded.campaign_name, item_name=excluded.item_name,
+        clicks=excluded.clicks, impressions=excluded.impressions, ad_cost=excluded.ad_cost,
+        cpc_actual=excluded.cpc_actual, ctr_pct=excluded.ctr_pct,
+        sales_720h=excluded.sales_720h, orders_720h=excluded.orders_720h,
+        cvr_720h_pct=excluded.cvr_720h_pct, roas_720h_pct=excluded.roas_720h_pct,
+        sales_12h=excluded.sales_12h, orders_12h=excluded.orders_12h,
+        sales_720h_new=excluded.sales_720h_new, sales_720h_repeat=excluded.sales_720h_repeat,
+        source_file=excluded.source_file, import_id=excluded.import_id, imported_at=excluded.imported_at`);
+  } else if (recipe.type === 'rpp_keyword') {
+    periodKey = 'month_ym';
+    existsStmt = db.prepare(`SELECT 1 FROM fact_rakuten_ads_rpp_keyword WHERE month_ym=? AND item_manage_number=? AND keyword=? AND campaign_id=?`);
+    upsertStmt = db.prepare(`INSERT INTO fact_rakuten_ads_rpp_keyword
+      (month_ym, item_manage_number, keyword, campaign_id, keyword_cpc, clicks, impressions, ad_cost,
+       cpc_actual, ctr_pct, sales_720h, orders_720h, cvr_720h_pct, roas_720h_pct, source_file, import_id, imported_at)
+      VALUES (@month_ym, @item_manage_number, @keyword, @campaign_id, @keyword_cpc, @clicks, @impressions, @ad_cost,
+       @cpc_actual, @ctr_pct, @sales_720h, @orders_720h, @cvr_720h_pct, @roas_720h_pct, @source_file, @import_id, @imported_at)
+      ON CONFLICT (month_ym, item_manage_number, keyword, campaign_id) DO UPDATE SET
+        keyword_cpc=excluded.keyword_cpc, clicks=excluded.clicks, impressions=excluded.impressions,
+        ad_cost=excluded.ad_cost, cpc_actual=excluded.cpc_actual, ctr_pct=excluded.ctr_pct,
+        sales_720h=excluded.sales_720h, orders_720h=excluded.orders_720h,
+        cvr_720h_pct=excluded.cvr_720h_pct, roas_720h_pct=excluded.roas_720h_pct,
+        source_file=excluded.source_file, import_id=excluded.import_id, imported_at=excluded.imported_at`);
+  } else {
+    periodKey = 'date_jst';
+    existsStmt = db.prepare(`SELECT 1 FROM fact_rakuten_ads_rpp_daily WHERE date_jst=? AND campaign_id=?`);
+    upsertStmt = db.prepare(`INSERT INTO fact_rakuten_ads_rpp_daily
+      (date_jst, campaign_id, campaign_name, clicks, impressions, ad_cost, ad_cost_discounted,
+       cpc_actual, ctr_pct, sales_720h, orders_720h, cvr_720h_pct, roas_720h_pct,
+       sales_12h, orders_12h, sales_720h_new, sales_720h_repeat, source_file, import_id, imported_at)
+      VALUES (@date_jst, @campaign_id, @campaign_name, @clicks, @impressions, @ad_cost, @ad_cost_discounted,
+       @cpc_actual, @ctr_pct, @sales_720h, @orders_720h, @cvr_720h_pct, @roas_720h_pct,
+       @sales_12h, @orders_12h, @sales_720h_new, @sales_720h_repeat, @source_file, @import_id, @imported_at)
+      ON CONFLICT (date_jst, campaign_id) DO UPDATE SET
+        campaign_name=excluded.campaign_name,
+        clicks=excluded.clicks, impressions=excluded.impressions, ad_cost=excluded.ad_cost,
+        ad_cost_discounted=excluded.ad_cost_discounted,
+        cpc_actual=excluded.cpc_actual, ctr_pct=excluded.ctr_pct,
+        sales_720h=excluded.sales_720h, orders_720h=excluded.orders_720h,
+        cvr_720h_pct=excluded.cvr_720h_pct, roas_720h_pct=excluded.roas_720h_pct,
+        sales_12h=excluded.sales_12h, orders_12h=excluded.orders_12h,
+        sales_720h_new=excluded.sales_720h_new, sales_720h_repeat=excluded.sales_720h_repeat,
+        source_file=excluded.source_file, import_id=excluded.import_id, imported_at=excluded.imported_at`);
+  }
 
-    for (const r of finalRecords) {
-      const exists = recipe.type === 'rpp_keyword'
-        ? existsStmt.get(r.date_jst, r.item_manage_number, r.keyword, r.campaign_id)
-        : existsStmt.get(r.date_jst, r.item_manage_number, r.campaign_id);
-      upsertStmt.run({ ...r, source_file: name.slice(0, 200), import_id: importId, imported_at: importedAt });
-      if (exists) updated++; else inserted++;
-      if (dateFrom === null || r.date_jst < dateFrom) dateFrom = r.date_jst;
-      if (dateTo === null || r.date_jst > dateTo) dateTo = r.date_jst;
-    }
-    db.prepare(`UPDATE radash_import_log SET date_from=?, date_to=?, inserted=?, updated=? WHERE id=?`)
-      .run(dateFrom, dateTo, inserted, updated, importId);
+  for (const r of finalRecords) {
+    const exists = recipe.type === 'rpp_keyword'
+      ? existsStmt.get(r.month_ym, r.item_manage_number, r.keyword, r.campaign_id)
+      : recipe.type === 'rpp_product'
+        ? existsStmt.get(r.month_ym, r.item_manage_number, r.campaign_id)
+        : existsStmt.get(r.date_jst, r.campaign_id);
+    const { period_raw, period_spans, ...rest } = r;
+    upsertStmt.run({ ...rest, source_file: name.slice(0, 200), import_id: importId, imported_at: importedAt });
+    if (exists) updated++; else inserted++;
+    const pv = r[periodKey];
+    if (periodFrom === null || pv < periodFrom) periodFrom = pv;
+    if (periodTo === null || pv > periodTo) periodTo = pv;
+  }
+  db.prepare(`UPDATE radash_import_log SET date_from=?, date_to=?, inserted=?, updated=? WHERE id=?`)
+    .run(periodFrom, periodTo, inserted, updated, importId);
 
   return {
     file: name, ok: true, type: recipe.type, label: recipe.label,
-    date_from: dateFrom, date_to: dateTo,
+    date_from: periodFrom, date_to: periodTo,
     rows: finalRecords.length, inserted, updated,
     dedup_in_file: rawCount - finalRecords.length,
   };
@@ -482,14 +645,12 @@ export function importFiles(uploads, uploadedBy) {
         .run(new Date().toISOString(), uploadedBy, fileName, fileType, status, String(message || '').slice(0, 500));
     } catch {}
   };
-
   const logStmt = db.prepare(`INSERT INTO radash_import_log
     (imported_at, uploaded_by, file_name, file_type, date_from, date_to, row_count, inserted, updated, status, message)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
 
   // upload 1件ずつ展開し、グループ (zip 1個 or 単体CSV) を 1 トランザクションで取り込む。
-  // メモリ対策 (Codex R3/R4 High): 全 upload の展開データを同時保持せず、さらにグループ内も
-  // 「1ファイルずつ parse→upsert」で処理する (parse済みレコードの全ファイル同時保持をしない)。
+  // メモリ対策: 全 upload の展開データを同時保持せず、グループ内も「1ファイルずつ parse→upsert」。
   // 途中のファイルで不良を検出したら GroupAbortError で transaction ごと rollback = 原子性維持。
   // 同時保持の最大 ≈ multer受信分 (4×30MB) + 処理中1 zip の展開分 (60MB) + parse中1ファイル分
   for (const uploadFile of uploads) {
@@ -528,7 +689,7 @@ export function importFiles(uploads, uploadedBy) {
             results.push({ file: name, ok: false, skipped: true, type: 'unknown', error: msg });
           }
         } else {
-          // 予期しない DB エラー (tx は rollback 済み)。失敗履歴を tx 外で残す (Codex R1 Medium)
+          // 予期しない DB エラー (tx は rollback 済み)。失敗履歴を tx 外で残す
           console.error(`[rakuten-analytics] import group ${g.name}: ${e.stack || e.message}`);
           for (const name of fileNames) {
             logError(name, 'unknown', 'error', `内部エラー: ${String(e.message).slice(0, 400)}`);
@@ -559,16 +720,17 @@ export function getImportStatus() {
   const db = getMirrorDB();
   const currentYm = monthOf(jstToday());
 
-  function statusOf(table, type, label) {
-    const agg = db.prepare(`SELECT MIN(date_jst) AS d_from, MAX(date_jst) AS d_to, COUNT(*) AS rows FROM ${table}`).get();
+  function statusOf(table, periodCol, type, label, granularity) {
+    const monthExpr = periodCol === 'month_ym' ? 'month_ym' : `substr(${periodCol},1,7)`;
+    const agg = db.prepare(`SELECT MIN(${periodCol}) AS d_from, MAX(${periodCol}) AS d_to, COUNT(*) AS rows FROM ${table}`).get();
     const lastLog = db.prepare(`SELECT imported_at, file_name FROM radash_import_log WHERE file_type=? AND status='ok' ORDER BY id DESC LIMIT 1`).get(type);
     let missingMonths = [];
     if (agg.d_from) {
-      const have = new Set(db.prepare(`SELECT DISTINCT substr(date_jst,1,7) AS ym FROM ${table}`).all().map(r => r.ym));
-      missingMonths = monthsBetween(monthOf(agg.d_from), currentYm).filter(ym => !have.has(ym));
+      const have = new Set(db.prepare(`SELECT DISTINCT ${monthExpr} AS ym FROM ${table}`).all().map(r => r.ym));
+      missingMonths = monthsBetween(agg.d_from.slice(0, 7), currentYm).filter(ym => !have.has(ym));
     }
     return {
-      type, label, implemented: true,
+      type, label, granularity, implemented: true,
       row_count: agg.rows, data_from: agg.d_from, data_to: agg.d_to,
       last_imported_at: lastLog?.imported_at || null,
       last_file: lastLog?.file_name || null,
@@ -579,8 +741,9 @@ export function getImportStatus() {
   return {
     generated_at: new Date().toISOString(),
     types: [
-      statusOf('fact_rakuten_ads_rpp', 'rpp_product', 'RPP 全商品レポート'),
-      statusOf('fact_rakuten_ads_rpp_keyword', 'rpp_keyword', 'RPP 全キーワードレポート'),
+      statusOf('fact_rakuten_ads_rpp', 'month_ym', 'rpp_product', 'RPP 全商品レポート', '月次'),
+      { ...statusOf('fact_rakuten_ads_rpp_keyword', 'month_ym', 'rpp_keyword', 'RPP 全キーワードレポート', '月次'), optional: true, note: 'キーワード入札 未使用のため取込不要' },
+      statusOf('fact_rakuten_ads_rpp_daily', 'date_jst', 'rpp_daily', 'RPP 日次広告費 (すべての広告)', '日次'),
       { type: 'ca', label: 'クーポンアドバンス', implemented: false, note: 'P7 で対応予定' },
       { type: 'access', label: 'データ分析 (売上・アクセス)', implemented: false, note: 'P9 (Phase 2) で対応予定' },
       { type: 'monthly_costs', label: '月次費用明細', implemented: false, note: 'P8 で対応予定' },

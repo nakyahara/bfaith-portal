@@ -151,10 +151,11 @@
       <!-- 📥 取込 (P2) -->
       <div class="tab-pane" id="pane-import">
         <div class="note" style="margin-bottom:10px;">
-          RMS → 広告(プロモーションメニュー) → 検索連動型広告(RPP) → パフォーマンスレポート →
-          <b>集計単位「日別」</b>で「全商品レポート」「全キーワードレポート」をダウンロード →
-          <b>zipのまま</b>ここにドロップしてください (複数可・CSV直接も可)。
-          売上・CVは30日間さかのぼって加算されるため、<b>直近30日分は次回まとめて再アップロードすれば上書き更新</b>されます。
+          <b>RMS → 広告(プロモーションメニュー) → 検索連動型広告(RPP) → パフォーマンスレポート</b> から2種類をDLしてドロップ (zipのままでOK・複数可):<br>
+          ① <b>商品別 (月次)</b>: 集計期間 <b>「月ごとに表示」</b> + 期間3ヶ月以内 + 表示/出力項目 <b>「全てを選択」</b> → 「全商品レポートダウンロード」<br>
+          ② <b>日次広告費</b>: 集計単位 <b>「すべての広告」</b> + <b>「日ごとに集計」</b> + 期間3ヶ月以内 → 「この条件でダウンロード」<br>
+          ※商品別レポートは楽天の仕様で月次のみ (日別は選べません)。過去分は3ヶ月ずつ遡って全期間分。
+          売上・CVは30日間さかのぼって加算されるため、<b>直近分は次回まとめて再アップロードすれば上書き更新</b>されます。
         </div>
         <div id="drop-zone" style="border:2px dashed #d1d5db; border-radius:10px; padding:36px; text-align:center; color:#6b7280; cursor:pointer; margin-bottom:14px;">
           📥 ここにファイルをドロップ / クリックして選択 (CSV, zip)
@@ -377,6 +378,7 @@ async function refreshImportViews() {
       <th>データ種別</th><th>状態</th><th>データ期間</th><th>行数</th><th>最終取込</th><th>未取込の月</th>
     </tr></thead><tbody>` + st.types.map(t => {
       if (!t.implemented) return `<tr><td>${esc(t.label)}</td><td><span class="pill todo">準備中</span></td><td colspan="4" class="note">${esc(t.note || '')}</td></tr>`;
+      if (t.optional && t.row_count === 0) return `<tr><td>${esc(t.label)}</td><td><span class="pill todo">任意</span></td><td colspan="4" class="note">${esc(t.note || '')}</td></tr>`;
       const missing = (t.missing_months || []);
       return `<tr>
         <td>${esc(t.label)}</td>

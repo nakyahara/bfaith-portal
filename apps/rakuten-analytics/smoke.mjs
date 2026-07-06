@@ -45,7 +45,7 @@ const ymPrev = q.addMonths(ymNow, -1);
 imp.ensureImportTables();
 const tx = db.transaction(() => {
   for (const t of ['mirror_rakuten_finance_sku_daily', 'mart_rakuten_monthly_summary',
-    'fact_rakuten_ads_rpp', 'fact_rakuten_ads_rpp_keyword', 'radash_import_log']) {
+    'fact_rakuten_ads_rpp', 'fact_rakuten_ads_rpp_keyword', 'fact_rakuten_ads_rpp_daily', 'radash_import_log']) {
     try { db.exec(`DELETE FROM ${t}`); } catch {}
   }
 
@@ -181,91 +181,125 @@ check('空期間 (データなし) は 0 で返る', () => {
 });
 
 // ============================================================
-// P2: 取込 (RPP CSV/zip)
+// P2: 取込 (RPP CSV/zip) — fixture は 2026-07-06 実DLファイルのフォーマットに準拠
+// (前置行 + コントロールカラム + 期間range + 「売上金額(合計720時間)」形式ヘッダ)
 // ============================================================
 const BOM = '﻿';
-const productCsv = (dates) => BOM + [
-  '日付,キャンペーンID,キャンペーン名,商品管理番号,商品名,クリック数(合計),実績額(合計),CPC実績,CTR,売上金額(720時間)(合計),売上件数(720時間)(合計),CVR(720時間),ROAS(720時間),売上金額(12時間)(合計),売上金額(720時間)(新規),売上金額(720時間)(既存)',
-  ...dates.map(dt => `${dt},C001,"通常キャンペーン",rk-alpha,"アルファ精油, 10ml",25,"1,250",50,1.25%,"12,000",4,16%,960%,"6,000","5,000","7,000"`),
-  ...dates.map(dt => `${dt},C001,"通常キャンペーン",rk-beta,ベータ茶葉,10,500,50,0.8%,0,0,-,-,-,-,-`),
+const PREAMBLE = [
+  '"実行日時: 2026-07-06 21:02:24"',
+  '',
+  '"検索条件"',
+  '"集計単位: 商品別"',
+  '"集計期間: 月ごとに集計"',
+  '"■■■■■商品・キーワードCPCを設定される際にはここから上は行ごと削除してください■■■■■"',
+].join('\r\n') + '\r\n';
+const PRODUCT_HEADER = '"コントロールカラム","日付","商品ページURL","商品管理番号","入札単価","CTR(%)","商品CPC","クリック数(合計)","実績額(合計)","CPC実績(合計)","売上金額(合計12時間)","売上件数(合計12時間)","売上金額(合計720時間)","売上件数(合計720時間)","CVR(合計720時間)(%)","ROAS(合計720時間)(%)","売上金額(新規720時間)","売上金額(既存720時間)"';
+// period 値は実データ同様の range 形式 (例 "2026年06月01日～2026年06月30日")
+const monthRange = (ym) => {
+  const [y, m] = ym.split('-');
+  const last = new Date(Date.UTC(Number(y), Number(m), 0)).getUTCDate();
+  return `${y}年${m}月01日～${y}年${m}月${String(last).padStart(2, '0')}日`;
+};
+const productCsv = (yms) => BOM + PREAMBLE + [PRODUCT_HEADER,
+  ...yms.map(ym => `"","${monthRange(ym)}","https://item.rakuten.co.jp/x/","rk-alpha","20","1.25","","25","1,250","50","6,000","2","12,000","4","16.00","960.00","5,000","7,000"`),
+  ...yms.map(ym => `"","${monthRange(ym)}","https://item.rakuten.co.jp/x/","rk-beta","20","0.80","","10","500","50","-","-","0","0","0.00","0.00","-","-"`),
 ].join('\r\n');
 
-const keywordCsvSjis = (dates) => iconv.encode([
-  '日付,キャンペーンID,商品管理番号,キーワード,キーワードCPC,クリック数,実績額,CPC実績,CTR,売上金額(720時間),売上件数(720時間),CVR(720時間),ROAS(720時間)',
-  ...dates.map(dt => `${dt},C001,rk-alpha,アロマオイル,60,12,720,60,2.0%,"8,000",2,16.7%,1111%`),
-  ...dates.map(dt => `${dt},C001,rk-alpha,精油 セット,55,5,275,55,1.1%,0,0,-,-`),
+const KEYWORD_HEADER = '"日付","商品管理番号","キーワード","キーワードCPC","クリック数(合計)","実績額(合計)","CPC実績(合計)","CTR(%)","売上金額(合計720時間)","売上件数(合計720時間)","CVR(合計720時間)(%)","ROAS(合計720時間)(%)"';
+const keywordCsvSjis = (yms) => iconv.encode(PREAMBLE + [KEYWORD_HEADER,
+  ...yms.map(ym => `"${monthRange(ym)}","rk-alpha","アロマオイル","60","12","720","60","2.00","8,000","2","16.70","1111.00"`),
+  ...yms.map(ym => `"${monthRange(ym)}","rk-alpha","精油 セット","55","5","275","55","1.10","0","0","-","-"`),
 ].join('\r\n'), 'Shift_JIS');
 
-const mkFile = (name, content) => ({ originalname: name, buffer: Buffer.isBuffer(content) ? content : Buffer.from(content, 'utf8') });
+const DAILY_HEADER = '"日付","CTR(%)","割引後実績額","クリック数(合計)","実績額(合計)","CPC実績(合計)","売上金額(合計12時間)","売上件数(合計12時間)","売上金額(合計720時間)","売上件数(合計720時間)","CVR(合計720時間)(%)","ROAS(合計720時間)(%)"';
+const jpDate = (iso) => { const [y, m, dd] = iso.split('-'); return `${y}年${m}月${dd}日`; };
+const dailyCsv = (dates) => BOM + PREAMBLE.replace('集計単位: 商品別', '集計単位: すべての広告') + [DAILY_HEADER,
+  ...dates.map(dt => `"${jpDate(dt)}","0.26","-","2611","47,038","19","188,192","138","236,442","174","6.66","502.66"`),
+].join('\r\n');
 
-check('import: RPP商品CSV (UTF-8 BOM、日付ゆらぎ 2026/7/3形式)', () => {
-  const dates = [`${ymPrev}/01`.replace('-', '/'), `${ymPrev.split('-')[0]}/${Number(ymPrev.split('-')[1])}/2`];
-  const r = imp.importFiles([mkFile('rpp_product.csv', productCsv(dates))], 'smoke@test');
+const mkFile = (name, content) => ({ originalname: name, buffer: Buffer.isBuffer(content) ? content : Buffer.from(content, 'utf8') });
+const ymPrev2 = q.addMonths(ymPrev, -1);
+
+check('import: RPP商品CSV (実形式: 前置行+range期間+UTF-8 BOM)', () => {
+  const r = imp.importFiles([mkFile('rpp_item_reports.csv', productCsv([ymPrev2, ymPrev]))], 'smoke@test');
   assert(r.imported === 1 && r.failed === 0, `結果 (${JSON.stringify(r.results)})`);
   const res = r.results[0];
   assert(res.type === 'rpp_product', 'type');
-  assert(res.rows === 4 && res.inserted === 4 && res.updated === 0, `4行新規 (got ${JSON.stringify(res)})`);
-  assert(res.date_from === `${ymPrev}-01` && res.date_to === `${ymPrev}-02`, `日付正規化 (got ${res.date_from}〜${res.date_to})`);
-  const row = db.prepare(`SELECT * FROM fact_rakuten_ads_rpp WHERE item_manage_number='rk-alpha' AND date_jst=?`).get(`${ymPrev}-01`);
+  assert(res.rows === 4 && res.inserted === 4 && res.updated === 0, `2ヶ月×2商品=4行新規 (got ${JSON.stringify(res)})`);
+  assert(res.date_from === ymPrev2 && res.date_to === ymPrev, `月正規化 (got ${res.date_from}〜${res.date_to})`);
+  const row = db.prepare(`SELECT * FROM fact_rakuten_ads_rpp WHERE item_manage_number='rk-alpha' AND month_ym=?`).get(ymPrev);
   assert(row.ad_cost === 1250 && row.clicks === 25, 'カンマ区切り数値');
   assert(row.sales_720h === 12000 && row.orders_720h === 4, '720h売上');
   assert(row.sales_12h === 6000 && row.sales_720h_new === 5000, '12h/新規列');
-  assert(row.item_name === 'アルファ精油, 10ml', 'クォート内カンマ');
-  const beta = db.prepare(`SELECT * FROM fact_rakuten_ads_rpp WHERE item_manage_number='rk-beta' AND date_jst=?`).get(`${ymPrev}-01`);
-  assert(beta.cvr_720h_pct === null && beta.sales_720h === 0, `"-" は null / 売上0 (got ${JSON.stringify(beta)})`);
+  assert(row.roas_720h_pct === 960, 'ROAS');
+  const beta = db.prepare(`SELECT * FROM fact_rakuten_ads_rpp WHERE item_manage_number='rk-beta' AND month_ym=?`).get(ymPrev);
+  assert(beta.sales_12h === null && beta.sales_720h === 0, `"-"はnull/売上0 (got ${JSON.stringify(beta)})`);
 });
 
-check('import: 再アップロード = UPSERT上書き (720h遡及対応)', () => {
-  const dates = [`${ymPrev}-01`, `${ymPrev}-02`];
-  const r = imp.importFiles([mkFile('rpp_product_v2.csv', productCsv(dates))], 'smoke@test');
+check('import: 再アップロード = UPSERT上書き (遡及CV対応)', () => {
+  const r = imp.importFiles([mkFile('rpp_item_reports_v2.csv', productCsv([ymPrev2, ymPrev]))], 'smoke@test');
   const res = r.results[0];
   assert(res.inserted === 0 && res.updated === 4, `全行上書き (got ${JSON.stringify(res)})`);
-  const cnt = db.prepare(`SELECT COUNT(*) AS c FROM fact_rakuten_ads_rpp`).get().c;
-  assert(cnt === 4, `行数増えない (got ${cnt})`);
+  assert(db.prepare(`SELECT COUNT(*) AS c FROM fact_rakuten_ads_rpp`).get().c === 4, '行数増えない');
 });
 
-check('import: RPPキーワードCSV (Shift_JIS)', () => {
-  const r = imp.importFiles([mkFile('rpp_keyword.csv', keywordCsvSjis([`${ymPrev}-01`]))], 'smoke@test');
+check('import: RPPキーワードCSV (Shift_JIS、月次)', () => {
+  const r = imp.importFiles([mkFile('rpp_keyword_reports.csv', keywordCsvSjis([ymPrev]))], 'smoke@test');
   const res = r.results[0];
   assert(res.type === 'rpp_keyword' && res.inserted === 2, `keyword 2行 (got ${JSON.stringify(res)})`);
   const kw = db.prepare(`SELECT * FROM fact_rakuten_ads_rpp_keyword WHERE keyword='アロマオイル'`).get();
   assert(kw.ad_cost === 720 && kw.sales_720h === 8000 && kw.keyword_cpc === 60, 'キーワード行の値');
+  assert(kw.month_ym === ymPrev, '月キー');
 });
 
-check('import: zip展開 (商品+キーワード同梱)', () => {
-  db.exec(`DELETE FROM fact_rakuten_ads_rpp; DELETE FROM fact_rakuten_ads_rpp_keyword`);
+check('import: RPP日次広告費 (すべての広告、和暦日付+割引後実績額"-")', () => {
+  const dates = [q.addDays(today, -3), q.addDays(today, -2)];
+  const r = imp.importFiles([mkFile('rpp_reports_daily.csv', dailyCsv(dates))], 'smoke@test');
+  const res = r.results[0];
+  assert(res.type === 'rpp_daily' && res.inserted === 2, `daily 2行 (got ${JSON.stringify(res)})`);
+  const row = db.prepare(`SELECT * FROM fact_rakuten_ads_rpp_daily WHERE date_jst=?`).get(dates[0]);
+  assert(row.ad_cost === 47038 && row.clicks === 2611, '日次値');
+  assert(row.ad_cost_discounted === null, '割引後"-"はnull');
+  assert(row.sales_720h === 236442 && row.roas_720h_pct === 502.66, '720h値');
+});
+
+check('import: zip展開 (商品月次+日次同梱)', () => {
+  db.exec(`DELETE FROM fact_rakuten_ads_rpp; DELETE FROM fact_rakuten_ads_rpp_daily`);
   const zip = new AdmZip();
-  zip.addFile('product.csv', Buffer.from(productCsv([`${ymPrev}-05`]), 'utf8'));
-  zip.addFile('keyword.csv', keywordCsvSjis([`${ymPrev}-05`]));
+  zip.addFile('rpp_item_reports_1.csv', Buffer.from(productCsv([ymPrev]), 'utf8'));
+  zip.addFile('rpp_reports_d.csv', Buffer.from(dailyCsv([q.addDays(today, -5)]), 'utf8'));
   zip.addFile('readme.txt', Buffer.from('ignore me'));
-  const r = imp.importFiles([mkFile('report.zip', zip.toBuffer())], 'smoke@test');
+  const r = imp.importFiles([mkFile('全商品レポートダウンロード.zip', zip.toBuffer())], 'smoke@test');
   assert(r.imported === 2 && r.failed === 0, `zip内CSV 2件取込 (got ${JSON.stringify(r.results.map(x => x.file + ':' + (x.ok ? 'ok' : x.error)))})`);
 });
 
-check('import: 不正行で全件rollback', () => {
+check('import: 複数月にまたがる期間rangeはエラー (月ごとDL案内)', () => {
   const before = db.prepare(`SELECT COUNT(*) AS c FROM fact_rakuten_ads_rpp`).get().c;
-  const bad = productCsv([`${ymPrev}-10`]) + '\r\n不正な日付,C001,x,rk-gamma,G,1,1,1,1%,0,0,-,-,-,-,-';
-  const r = imp.importFiles([mkFile('broken.csv', bad)], 'smoke@test');
-  assert(r.failed === 1, 'エラー扱い');
-  assert(/日付が不正/.test(r.results[0].error), `理由 (got ${r.results[0].error})`);
-  const after = db.prepare(`SELECT COUNT(*) AS c FROM fact_rakuten_ads_rpp`).get().c;
-  assert(after === before, `rollback (before=${before} after=${after})`);
+  const [y2, m2] = ymPrev2.split('-');
+  const [y1, m1] = ymPrev.split('-');
+  const spanRow = `"","${y2}年${m2}月01日～${y1}年${m1}月05日","https://x/","rk-gamma","20","1","","1","10","10","0","0","0","0","0.00","0.00","0","0"`;
+  const csv = BOM + PREAMBLE + [PRODUCT_HEADER, spanRow].join('\r\n');
+  const r = imp.importFiles([mkFile('rpp_zenkikan.csv', csv)], 'smoke@test');
+  assert(r.failed === 1 && /月ごと/.test(r.results[0].error), r.results[0].error);
+  assert(db.prepare(`SELECT COUNT(*) AS c FROM fact_rakuten_ads_rpp`).get().c === before, 'rollback');
 });
 
-check('import: 未知の形式はヘッダ付きエラー', () => {
+check('import: 不正な期間値で全件rollback', () => {
+  const before = db.prepare(`SELECT COUNT(*) AS c FROM fact_rakuten_ads_rpp`).get().c;
+  const bad = productCsv([ymPrev2]) + '\r\n"","不正な期間","https://x/","rk-gamma","20","1","","1","10","10","0","0","0","0","0.00","0.00","0","0"';
+  const r = imp.importFiles([mkFile('broken.csv', bad)], 'smoke@test');
+  assert(r.failed === 1 && /年月が不正/.test(r.results[0].error), r.results[0].error);
+  assert(db.prepare(`SELECT COUNT(*) AS c FROM fact_rakuten_ads_rpp`).get().c === before, 'rollback');
+});
+
+check('import: 未知の形式は先頭行付きエラー', () => {
   const r = imp.importFiles([mkFile('mystery.csv', '謎列1,謎列2\n1,2')], 'smoke@test');
   assert(r.failed === 1 && /種類を判別できません/.test(r.results[0].error), r.results[0].error);
-  assert(/謎列1/.test(r.results[0].error), 'ヘッダをエラーに含む');
-});
-
-check('import: 日付列なし (月別DL) は案内エラー', () => {
-  const noDate = '商品管理番号,クリック数,実績額\nrk-alpha,10,500';
-  const r = imp.importFiles([mkFile('monthly.csv', noDate)], 'smoke@test');
-  assert(r.failed === 1 && /日別/.test(r.results[0].error), r.results[0].error);
+  assert(/謎列1/.test(r.results[0].error), '先頭行をエラーに含む');
 });
 
 check('import: 根幹メトリクス列欠落はエラー (0値で取り込まない)', () => {
-  const noCost = `日付,商品管理番号,クリック数(合計),売上金額(720時間)(合計),売上件数(720時間)(合計)\n${ymPrev}-01,rk-alpha,10,100,1`;
+  const noCost = BOM + PREAMBLE + `"日付","商品管理番号","クリック数(合計)","売上金額(合計720時間)","売上件数(合計720時間)"\r\n"${monthRange(ymPrev)}","rk-alpha","10","100","1"`;
   const r = imp.importFiles([mkFile('no_cost.csv', noCost)], 'smoke@test');
   assert(r.failed === 1 && /実績額/.test(r.results[0].error), r.results[0].error);
 });
@@ -273,48 +307,38 @@ check('import: 根幹メトリクス列欠落はエラー (0値で取り込ま�
 check('import: zip爆弾 (異常圧縮率) は丸ごと拒否・部分取込なし', () => {
   const before = db.prepare(`SELECT COUNT(*) AS c FROM fact_rakuten_ads_rpp`).get().c;
   const zip = new AdmZip();
-  zip.addFile('good.csv', Buffer.from(productCsv([`${ymPrev}-20`]), 'utf8'));
-  zip.addFile('bomb.csv', Buffer.alloc(10 * 1024 * 1024, 0x30));  // 10MBの'0'連続 → 超高圧縮率
+  zip.addFile('good.csv', Buffer.from(productCsv([ymPrev]), 'utf8'));
+  zip.addFile('bomb.csv', Buffer.alloc(10 * 1024 * 1024, 0x30));
   const r = imp.importFiles([mkFile('bomb.zip', zip.toBuffer())], 'smoke@test');
   assert(r.failed === 1 && r.imported === 0, `丸ごと拒否 (got ${JSON.stringify(r.results.map(x => x.ok))})`);
   assert(/爆弾|圧縮率/.test(r.results[0].error), r.results[0].error);
-  const after = db.prepare(`SELECT COUNT(*) AS c FROM fact_rakuten_ads_rpp`).get().c;
-  assert(after === before, `good.csv も取り込まれていない (before=${before} after=${after})`);
+  assert(db.prepare(`SELECT COUNT(*) AS c FROM fact_rakuten_ads_rpp`).get().c === before, 'good.csv も取り込まれていない');
 });
 
 check('import: zip内に不良CSVがあれば正常CSVも取り込まない (グループ原子性)', () => {
   const before = db.prepare(`SELECT COUNT(*) AS c FROM fact_rakuten_ads_rpp`).get().c;
   const zip = new AdmZip();
-  zip.addFile('good.csv', Buffer.from(productCsv([`${ymPrev}-25`]), 'utf8'));
-  zip.addFile('broken.csv', Buffer.from(productCsv([`${ymPrev}-26`]) + '\r\n不正な日付,C001,x,rk-gamma,G,1,1,1,1%,0,0,-,-,-,-,-', 'utf8'));
+  zip.addFile('good.csv', Buffer.from(productCsv([ymPrev2]), 'utf8'));
+  zip.addFile('broken.csv', Buffer.from(productCsv([ymPrev]) + '\r\n"","不正な期間","u","rk-g","1","1","","1","1","1","0","0","0","0","0","0","0","0"', 'utf8'));
   const r = imp.importFiles([mkFile('mixed.zip', zip.toBuffer())], 'smoke@test');
   assert(r.imported === 0 && r.failed === 1 && r.skipped === 1, `error1+skip1 (got imported=${r.imported} failed=${r.failed} skipped=${r.skipped})`);
   const good = r.results.find(x => x.file.includes('good.csv'));
   assert(good.skipped === true && /取込を中止/.test(good.error), `goodはskip理由 (got ${good.error})`);
-  const after = db.prepare(`SELECT COUNT(*) AS c FROM fact_rakuten_ads_rpp`).get().c;
-  assert(after === before, `1行も入らない (before=${before} after=${after})`);
-  const log = imp.getImportLog(5);
-  assert(log.some(l => l.status === 'skipped'), 'skippedログが残る');
+  assert(db.prepare(`SELECT COUNT(*) AS c FROM fact_rakuten_ads_rpp`).get().c === before, '1行も入らない');
+  assert(imp.getImportLog(5).some(l => l.status === 'skipped'), 'skippedログが残る');
 });
 
-check('import: キーワードレポートに商品管理番号列が無ければエラー', () => {
-  const noItem = `日付,キーワード,クリック数,実績額,売上金額(720時間),売上件数(720時間)\n${ymPrev}-01,アロマ,1,50,0,0`;
-  const r = imp.importFiles([mkFile('kw_no_item.csv', noItem)], 'smoke@test');
-  assert(r.failed === 1 && /商品管理番号/.test(r.results[0].error), r.results[0].error);
-});
-
-check('import: 鮮度ボード + 未取込月 + 履歴', () => {
+check('import: 鮮度ボード + 未取込月 + 履歴 + キーワード任意', () => {
   const st = imp.getImportStatus();
   const prod = st.types.find(t => t.type === 'rpp_product');
-  assert(prod.implemented && prod.row_count > 0, '商品レポート取込済');
-  assert(prod.data_from === `${ymPrev}-05`, `data_from (got ${prod.data_from})`);
-  // 先月〜今月の2ヶ月レンジでデータは先月のみ → 今月が未取込
+  assert(prod.implemented && prod.row_count > 0 && prod.granularity === '月次', '商品レポート月次');
   assert(prod.missing_months.includes(ymNow), `今月が未取込月 (got ${JSON.stringify(prod.missing_months)})`);
-  const ca = st.types.find(t => t.type === 'ca');
-  assert(ca.implemented === false, 'CAは準備中');
+  const daily = st.types.find(t => t.type === 'rpp_daily');
+  assert(daily.granularity === '日次' && daily.row_count > 0, '日次あり');
+  const kw = st.types.find(t => t.type === 'rpp_keyword');
+  assert(kw.optional === true, 'キーワードは任意扱い');
   const log = imp.getImportLog(10);
-  assert(log.length > 0 && log[0].imported_at, '履歴あり');
-  assert(log.some(l => l.status === 'error'), 'エラー履歴も残る');
+  assert(log.length > 0 && log.some(l => l.status === 'error'), '履歴+エラー履歴');
 });
 
 console.log(`\n=== smoke: ${pass} PASS / ${fail} FAIL ===`);
