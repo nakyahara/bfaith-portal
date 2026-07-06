@@ -25,7 +25,7 @@ const tx = db.transaction(() => {
   // クリア (再実行冪等)
   for (const t of ['mirror_amazon_finance_sku_daily', 'mirror_f_sales_by_listing', 'mirror_amazon_ads_sku_daily',
     'mirror_amazon_ads_campaign_daily', 'mirror_amazon_sku_fees', 'mirror_sku_resolved', 'mirror_products',
-    'mirror_inv_daily_detail', 'amzdash_custom_expenses', 'amzdash_settings']) {
+    'mirror_inv_daily_detail', 'mirror_amazon_account_fees_monthly', 'amzdash_custom_expenses', 'amzdash_settings']) {
     try { db.exec(`DELETE FROM ${t}`); } catch {}
   }
 
@@ -104,6 +104,16 @@ const tx = db.transaction(() => {
   insInv.run(today, 'fba_warehouse', 'pr_alpha', 'NE-A', 120, 300, 36000, 'アルファ商品', d(1), 300);
   insInv.run(today, 'fba_inbound', 'pr_alpha', 'NE-A', 60, 300, 18000, 'アルファ商品', d(1), 300);
   insInv.run(today, 'fba_warehouse', 'pr_dead', 'NE-DEAD', 40, 500, 20000, '死に筋商品', d(120), 0);
+
+  // 立ち上がり不発: 発売60日前・在庫あり・30日販売0
+  db.prepare("INSERT INTO mirror_inv_daily_detail (business_date, market, category, source_system, source_item_code, ne_code, qty, unit_cost, total_value, cost_status, product_name, new_product_launch_date, sales_30d_qty, synced_at) VALUES (?, 'jp', 'fba_warehouse', 'fba', 'pr_flop', 'NE-FLOP', 30, 400, 12000, 'ok', '新商品売れず', ?, 0, 't')").run(today, d(60));
+
+  // アカウント単位フィー (当月+前月、負=費用)
+  const insFee = db.prepare("INSERT INTO mirror_amazon_account_fees_monthly (date_jst, fee_type, amount_jpy, row_count, source_run_id, source_row_hash, synced_at) VALUES (?, ?, ?, 1, 'smoke', 'h', 't')");
+  insFee.run(ymNow + '-01', 'storage', -50000);
+  insFee.run(ymNow + '-01', 'long_term_storage', -20000);
+  insFee.run(ymPrev + '-01', 'storage', -48000);
+  insFee.run(ymPrev + '-01', 'removal', -3000);
 });
 tx();
 
@@ -206,6 +216,25 @@ check('getInventory', () => {
   assert(alpha.days_of_cover === 18, `残日数 180/10=18 (got ${alpha.days_of_cover})`);
 });
 
+check('getAccountFees + 月タイル控除', () => {
+  const fees = q.getAccountFees(13);
+  assert(fees.months.length >= 2, '2ヶ月分');
+  const cur = fees.months.find(m => m.ym === ymNow);
+  assert(cur.fees.storage === 50000 && cur.fees.long_term_storage === 20000, 'コスト正値変換');
+  assert(cur.total_cost === 70000, 'total 70000 (got ' + cur.total_cost + ')');
+  const ov3 = q.getOverview();
+  const tm = ov3.tiles.find(t => t.key === 'this_month');
+  assert(tm.account_fees === 70000, '月タイル account_fees (got ' + tm.account_fees + ')');
+  assert(tm.settled_profit_final === tm.settled_profit_after_ads - 70000 - (tm.custom_expenses || 0), '最終利益にフィー反映');
+});
+
+check('診断 launch_flop', () => {
+  const r = q.getDiagnosis();
+  assert(Array.isArray(r.launch_flop), 'launch_flop array');
+  assert(r.launch_flop.some(x => x.ne_code === 'NE-FLOP'), 'NE-FLOP 検出');
+  assert(!r.launch_flop.some(x => x.ne_code === 'NE-A'), '売れてるNE-Aは非検出');
+});
+
 check('expenses CRUD + settings', () => {
   const { id } = q.addExpense({ name: 'ツール代', expense_type: 'fixed_monthly', amount_jpy: 5280, month_from: ymPrev2, month_to: null, memo: '' });
   assert(id > 0, 'insert');
@@ -213,7 +242,7 @@ check('expenses CRUD + settings', () => {
   const ov2 = q.getOverview();
   const tm = ov2.tiles.find(t => t.key === 'this_month');
   assert(tm.custom_expenses === 5280, `経費反映 (got ${tm.custom_expenses})`);
-  assert(tm.settled_profit_final === tm.settled_profit_after_ads - 5280, '最終利益');
+  assert(tm.settled_profit_final === tm.settled_profit_after_ads - (tm.account_fees || 0) - 5280, '最終利益 (アカウントフィー込み)');
   q.deleteExpense(id);
   assert(q.listExpenses().length === 0, 'delete');
   const s = q.saveSettings({ dead_stock_days: 90, bogus_key: 1 });

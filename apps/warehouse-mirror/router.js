@@ -632,6 +632,23 @@ function getAmazonAdsCampaignInsert(db) {
   return b.amazonAdsCampaignInsert;
 }
 
+// アカウント単位フィー月次 (amazon-dashboard PR-C)
+function getAmazonAccountFeesInsert(db) {
+  const b = getStmtBundle(db);
+  if (!b.amazonAccountFeesInsert) {
+    b.amazonAccountFeesInsert = db.prepare(`
+      INSERT OR REPLACE INTO mirror_amazon_account_fees_monthly (
+        date_jst, fee_type, amount_jpy, row_count,
+        source_run_id, source_row_hash, synced_at
+      ) VALUES (
+        @date_jst, @fee_type, @amount_jpy, @row_count,
+        @source_run_id, @source_row_hash, @synced_at
+      )
+    `);
+  }
+  return b.amazonAccountFeesInsert;
+}
+
 function getRakutenFinanceInsert(db) {
   const b = getStmtBundle(db);
   if (!b.rakutenFinanceInsert) {
@@ -1054,6 +1071,15 @@ const ENTITY_REGISTRY = {
     clear_meta_key: 'clear_amazon_ads_campaign_dates',
     getInsertStmt: getAmazonAdsCampaignInsert,
     normalizeRow: (r) => normalizeAmazonAdsCampaignRow(r),
+  },
+  // アカウント単位フィー月次 (amazon-dashboard PR-C)。date_jst = 月初日
+  amazon_account_fees_monthly: {
+    contract_version: 1,
+    mirror_table: 'mirror_amazon_account_fees_monthly',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_amazon_account_fees_dates',
+    getInsertStmt: getAmazonAccountFeesInsert,
+    normalizeRow: (r) => normalizeAmazonAccountFeesRow(r),
   },
   rakuten_finance_sku_daily: {
     contract_version: 1,
@@ -1866,6 +1892,21 @@ function normalizeAmazonAdsCampaignRow(r) {
     ad_sales_1d: r.ad_sales_1d ?? 0, ad_sales_7d: r.ad_sales_7d ?? 0,
     ad_sales_14d: r.ad_sales_14d ?? 0, ad_sales_30d: r.ad_sales_30d ?? 0,
     ad_units_1d: r.ad_units_1d ?? 0,
+    source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,
+    synced_at: r.synced_at,
+  };
+}
+
+// row 列正規化 (mirror_amazon_account_fees_monthly 用、amazon-dashboard PR-C)
+const ACCOUNT_FEE_TYPES = new Set(['storage', 'long_term_storage', 'removal', 'inbound_defect', 'low_inventory', 'subscription', 'other_account_fee']);
+function normalizeAmazonAccountFeesRow(r) {
+  const feeType = requireAdKey(r, 'fee_type');
+  if (!ACCOUNT_FEE_TYPES.has(feeType)) {
+    throw new HttpError(400, { error: 'bad_row', message: `unknown fee_type: ${feeType}` });
+  }
+  return {
+    date_jst: r.date_jst, fee_type: feeType,
+    amount_jpy: r.amount_jpy ?? 0, row_count: r.row_count ?? 0,
     source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,
     synced_at: r.synced_at,
   };

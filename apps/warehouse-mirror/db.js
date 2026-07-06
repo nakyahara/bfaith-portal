@@ -425,6 +425,23 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_maacd_date ON mirror_amazon_ads_campaign_daily(date_jst)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_maacd_month ON mirror_amazon_ads_campaign_daily(substr(date_jst, 1, 7))');
 
+  // mirror_amazon_account_fees_monthly — アカウント単位フィー月次 (amazon-dashboard PR-C)
+  // SKU に紐付かない保管料/長期在庫追加手数料/返送等。date_jst = 月初日 (YYYY-MM-01)。
+  // 金額は Amazon 符号のまま (負 = 費用、Correction/Reversal 込み net)。
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_amazon_account_fees_monthly (
+    date_jst        TEXT NOT NULL CHECK(date_jst GLOB '????-??-01'),
+    fee_type        TEXT NOT NULL CHECK(fee_type IN (
+      'storage','long_term_storage','removal','inbound_defect','low_inventory','subscription','other_account_fee'
+    )),
+    amount_jpy      REAL NOT NULL DEFAULT 0,
+    row_count       INTEGER NOT NULL DEFAULT 0,
+    source_run_id   TEXT NOT NULL,
+    source_row_hash TEXT NOT NULL,
+    synced_at       TEXT NOT NULL,
+    PRIMARY KEY (date_jst, fee_type)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_maafm_date ON mirror_amazon_account_fees_monthly(date_jst)');
+
   // mirror_rakuten_finance_sku_daily — 楽天 Phase 1a #R-3b (Render 側 daily fact mirror)
   // miniPC の f_rakuten_finance_sku_daily_v1 の payload を受信。
   // contract_version は sync_contracts.contract_version と整合。

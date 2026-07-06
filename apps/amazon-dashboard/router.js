@@ -13,7 +13,7 @@ import { Router } from 'express';
 import {
   resolvePeriod, isValidDate,
   getOverview, getTrend, getWaterfall, getSkuProfit,
-  getAdsAnalysis, getBestsellers, getDiagnosis, getInventory,
+  getAdsAnalysis, getBestsellers, getDiagnosis, getInventory, getAccountFees,
   getSettings, saveSettings, listExpenses, addExpense, deleteExpense,
 } from './queries.js';
 
@@ -114,6 +114,12 @@ router.get('/api/v1/diagnosis', api(() => getDiagnosis()));
 
 // ─── 在庫 (v1) ───
 router.get('/api/v1/inventory', api(() => getInventory()));
+
+// ─── アカウント単位フィー月次 (保管料/LTSF/返送等、PR-C) ───
+router.get('/api/v1/account-fees', api((req) => {
+  const monthsBack = Math.min(Math.max(parseInt(req.query.months, 10) || 13, 1), 36);
+  return getAccountFees(monthsBack);
+}));
 
 // ─── 設定 (カスタム経費 + 診断閾値) ───
 router.get('/api/v1/settings', api(() => getSettings()));

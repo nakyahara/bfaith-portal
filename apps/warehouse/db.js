@@ -1591,6 +1591,39 @@ function createTables() {
       updated_at          = excluded.updated_at
   `);
 
+  // ---- Amazon アカウント単位フィー月次: contract auto-seed (amazon-dashboard PR-C、2026-07-06)
+  // SKU に紐付かない保管料/長期在庫追加手数料/返送等。grain は月次だが clear 機構と
+  // 整合させるため key は月初日 (date_jst = YYYY-MM-01)。金額は Amazon 符号のまま (負=費用)。
+  db.exec(`
+    INSERT INTO sync_contracts (
+      entity, contract_version, source_system, source_object, target_table,
+      grain_definition, key_columns_json, payload_schema_json,
+      clear_strategy, apply_mode, enabled, owner, created_at, updated_at
+    ) VALUES (
+      'amazon_account_fees_monthly', 1, 'minipc-warehouse',
+      'f_amazon_account_fees_monthly_v1', 'mirror_amazon_account_fees_monthly',
+      'one row = one (date_jst = month start YYYY-MM-01, fee_type) — SKU 無し settlement 行のアカウント単位フィー月次 net',
+      '["date_jst","fee_type"]',
+      '{"required":["date_jst","fee_type"],"date_jst_pattern":"^\\d{4}-\\d{2}-01$","fee_type_enum":["storage","long_term_storage","removal","inbound_defect","low_inventory","subscription","other_account_fee"]}',
+      'scope_clear_per_run', 'insert_or_replace', 1, 'amazon-dashboard',
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    )
+    ON CONFLICT(entity) DO UPDATE SET
+      contract_version    = excluded.contract_version,
+      source_system       = excluded.source_system,
+      source_object       = excluded.source_object,
+      target_table        = excluded.target_table,
+      grain_definition    = excluded.grain_definition,
+      key_columns_json    = excluded.key_columns_json,
+      payload_schema_json = excluded.payload_schema_json,
+      clear_strategy      = excluded.clear_strategy,
+      apply_mode          = excluded.apply_mode,
+      enabled             = excluded.enabled,
+      owner               = excluded.owner,
+      updated_at          = excluded.updated_at
+  `);
+
   // ---- Phase 1 #1-4a: sync_runs (run ledger、miniPC 側で sync 開始記録)
   // status 遷移: started → applied (全 chunk Render から 2xx)
   //              | → failed (途中失敗、error_message に記録)
