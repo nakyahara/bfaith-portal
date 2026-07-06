@@ -97,6 +97,7 @@
           <div class="period-switcher" id="ov-period"></div>
           <span class="note" id="ov-freshness"></span>
         </div>
+        <div id="ov-trend-error"></div>
         <div class="charts-grid">
           <div class="chart-card" style="grid-column: 1 / -1;">
             <h3>売上 × 粗利 × 粗利率 <span class="note">棒=確定売上(GMV)<span class="pbadge fact">確定</span> 桃色棒=メガ割開催 / 青線=速報売上(NE受注)<span class="pbadge flash">速報</span> / 粗利L1はセラー負担・広告費 控除前</span></h3>
@@ -107,7 +108,7 @@
             <div class="chart-wrap"><canvas id="chart-units"></canvas></div>
           </div>
           <div class="chart-card">
-            <h3>プロモ割引の推移 (メガ割 / メガポ / その他 — Qoo10負担20%全体) <span class="pbadge fact">確定</span></h3>
+            <h3>プロモ割引の推移 (メガ割 / メガポ / その他 — プラットフォーム割引<b>全体</b>。セラー負担はこの約50% <span class="pbadge est">推定</span>) <span class="pbadge fact">確定</span></h3>
             <div class="chart-wrap"><canvas id="chart-promo"></canvas></div>
           </div>
         </div>
@@ -243,7 +244,7 @@ async function loadOverview() {
         <div class="row"><span>注文数 / 販売数 <span class="pbadge flash">速報</span></span><span class="v">${(t.flash.orders ?? 0).toLocaleString()} / ${(t.flash.units ?? 0).toLocaleString()}</span></div>
         <div class="row sep"><span>売上(GMV・配送完了分) <span class="pbadge fact">確定</span></span><span class="v">${fmtJPY(f.gmv)}</span></div>
         <div class="row"><span>手数料 <span class="pbadge fact">実額</span> <span class="note">${fmtPct(f.fee_pct)}</span></span><span class="v">−${fmtYen(f.platform_fee)}</span></div>
-        <div class="row"><span>プロモ割引 <span class="note">ﾒｶﾞ割${fmtYen(f.megawari_discount)}/ﾒｶﾞﾎﾟ${fmtYen(f.megapo_discount)}</span></span><span class="v">${fmtYen(f.promo_total)}</span></div>
+        <div class="row"><span>プロモ割引(全体) <span class="note">ﾒｶﾞ割${fmtYen(f.megawari_discount)}/ﾒｶﾞﾎﾟ${fmtYen(f.megapo_discount)}</span></span><span class="v">${fmtYen(f.promo_total)}</span></div>
         <div class="row"><span>送料(想定) / 原価 <span class="note">ｶﾊﾞｰ${fmtPct(f.cost_coverage_pct)}</span></span><span class="v">−${fmtYen(f.shipping)} / −${fmtYen(f.cogs)}</span></div>
         <div class="row hero"><span>粗利 L1 <span class="pbadge fact">確定</span> <span class="note">${fmtPct(f.margin_pct)}</span></span><span class="v ${signClass(f.variable_margin)}">${fmtJPY(f.variable_margin)}</span></div>
         <div class="row"><span>セラー負担 <span class="pbadge est">推定${burdenPct}%</span> → L2参考</span><span class="v ${signClass(f.l2_ref)}">−${fmtYen(f.burden_est)} → ${fmtJPY(f.l2_ref)}</span></div>
@@ -260,6 +261,7 @@ async function loadOverview() {
 
 async function loadTrend() {
   try {
+    document.getElementById('ov-trend-error').innerHTML = '';
     const gran = ['12m', 'this_year'].includes(ovPreset) ? 'month' : ovPreset === '90d' ? 'week' : 'day';
     const data = await getJSON(`${API}/trend?preset=${ovPreset}&granularity=${gran}`);
     const labels = data.rows.map(r => r.bucket);
@@ -306,7 +308,12 @@ async function loadTrend() {
         scales: { y: { ticks: { callback: v => fmtJPY(v) } } },
         plugins: { tooltip: { callbacks: { label: c => c.dataset.label + ': ' + fmtJPY(c.parsed.y) } } } },
     });
-  } catch (e) { console.error(e); }
+  } catch (e) {
+    console.error(e);
+    // グラフ側の失敗も沈黙させない (空データと誤認させない — Codex R1 low)
+    document.getElementById('ov-trend-error').innerHTML =
+      `<div class="warn-note">トレンドの取得に失敗: ${esc(e.message)} (グラフは前回表示のまま/未描画です)</div>`;
+  }
 }
 
 // 初期ロード
