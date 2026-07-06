@@ -37,6 +37,7 @@ import fbaProfitabilityRouter from './apps/fba-profitability/router.js';
 import mercariAccountingRouter from './apps/mercari-accounting/router.js';
 import profitAnalysisRouter from './apps/profit-analysis/router.js';
 import amazonDashboardRouter from './apps/amazon-dashboard/router.js';
+import rakutenAnalyticsRouter from './apps/rakuten-analytics/router.js';
 import yahooAnalyticsRouter from './apps/yahoo-analytics/router.js';
 import bizOpsOverviewRouter from './apps/biz-ops-overview/router.js';
 import productManagementListRouter from './apps/product-management-list/router.js';
@@ -580,6 +581,15 @@ const apps = [
     category: 'analysis',
   },
   {
+    id: 'rakuten-analytics',
+    name: '楽天分析ツール',
+    description: '楽天の売上・広告・利益・検索順位を統合管理 (タイル速報 + 実質利益 + RPP×損益分岐ROAS + 順位重ね合わせ)',
+    icon: '📊',
+    path: '/apps/rakuten-analytics',
+    status: 'active',
+    category: 'analysis',
+  },
+  {
     id: 'yahoo-analytics',
     name: 'ヤフー分析ツール',
     description: 'Yahoo!ショッピングの売上・広告・利益・検索順位を統合管理 (タイル速報 + 実質利益 + 広告×利益 + キャンペーン損益)',
@@ -1072,6 +1082,7 @@ app.use('/apps/qoo10-accounting', (req, res, next) => {
 app.use('/apps/fba-profitability', requireAppAccess('fba-profitability'), fbaProfitabilityRouter);
 app.use('/apps/profit-analysis', requireAppAccess('profit-analysis'), profitAnalysisRouter);
 app.use('/apps/amazon-dashboard', requireAppAccess('amazon-dashboard'), express.json({ limit: '256kb' }), amazonDashboardRouter);
+app.use('/apps/rakuten-analytics', requireAppAccess('rakuten-analytics'), rakutenAnalyticsRouter);
 app.use('/apps/yahoo-analytics', requireAppAccess('yahoo-analytics'), yahooAnalyticsRouter);
 app.use('/apps/biz-ops-overview', requireAppAccess('biz-ops-overview'), bizOpsOverviewRouter);
 app.use('/apps/product-management-list', requireAppAccess('product-management-list'), productManagementListRouter);

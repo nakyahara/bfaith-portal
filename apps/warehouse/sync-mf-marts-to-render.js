@@ -34,6 +34,8 @@ import path from 'node:path';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import os from 'node:os';
+import https from 'node:https';
+import http from 'node:http';
 import Database from 'better-sqlite3';
 
 const CONTRACT_VERSION = 1;
@@ -113,31 +115,52 @@ console.log(`  dry-run: ${isDryRun}`);
 //  通っており、その代償として CASCADE で子 mart が毎回消えていた = 監査 S-3)
 // 照会失敗時は送信を続行 (照会 endpoint 未デプロイの旧 Render 互換 + fail-open でも
 // 子 chunk 側 409 ガードが最終防衛線なので確定済データは壊れない)。
+// ※ この照会だけは fetch (undici) を使わない: undici の keep-alive socket handle が
+//   残ったまま process.exit(0) すると Windows node で libuv assertion
+//   (STATUS_STACK_BUFFER_OVERRUN = -1073740791) の異常終了になり、mf-daily-sync が
+//   SKIP を失敗と誤認する (2026-07-06 miniPC 実測)。agent:false の node:https なら
+//   レスポンス受信後に socket が閉じ、直後の process.exit が安全。
+function probeMirrorRunStatus(url, key) {
+  return new Promise((resolve, reject) => {
+    const mod = url.startsWith('https:') ? https : http;
+    const req = mod.get(url, {
+      agent: false,
+      headers: key ? { 'x-sync-key': key } : {},
+      timeout: 30000,
+    }, (res) => {
+      let body = '';
+      res.on('data', (d) => { body += d; });
+      res.on('end', () => resolve({ statusCode: res.statusCode, body }));
+    });
+    req.on('timeout', () => req.destroy(new Error('probe timeout (30s)')));
+    req.on('error', reject);
+  });
+}
+
 if (!isDryRun) {
   try {
-    const probeRes = await fetch(`${renderUrl}/api/sync/mf/runs/${runId}/status`, {
-      headers: syncKey ? { 'x-sync-key': syncKey } : {},
-      signal: AbortSignal.timeout(30000),
-    });
-    if (probeRes.ok) {
-      const probe = await probeRes.json();
+    const probeRes = await probeMirrorRunStatus(`${renderUrl}/api/sync/mf/runs/${runId}/status`, syncKey);
+    if (probeRes.statusCode === 200) {
+      const probe = JSON.parse(probeRes.body);
       console.log(`  Render mirror: status=${probe.status} finalized_at=${probe.finalized_at || '(null)'}`);
       if (probe.status === 'success') {
         if (probe.source_run_hash && runRow.source_run_hash && probe.source_run_hash !== runRow.source_run_hash) {
           console.warn(`⚠️  mirror は success 済みだが source_run_hash 不一致 (miniPC=${runRow.source_run_hash} / mirror=${probe.source_run_hash})。確定済 run は不変契約のため送信せずスキップ。要調査。`);
         }
         console.log(`[mf-sync] SKIP: run_id=${runId} は mirror 側で既に success (同期済み)。送信不要。`);
+        db.close();
         process.exit(0);
       }
       if (probe.status !== 'pending_sync') {
         console.error(`[mf-sync] FATAL: mirror 側 run_id=${runId} が想定外 status=${probe.status} (手動調査要)`);
+        db.close();
         process.exit(1);
       }
       console.log(`  → mirror は pending_sync (前回途中失敗の可能性) — 埋め直し送信を続行`);
-    } else if (probeRes.status === 404) {
+    } else if (probeRes.statusCode === 404) {
       console.log(`  Render mirror: run 未送信 (404) — 初回送信を続行`);
     } else {
-      console.warn(`⚠️  status 照会 HTTP ${probeRes.status} — 照会をスキップして送信続行`);
+      console.warn(`⚠️  status 照会 HTTP ${probeRes.statusCode} — 照会をスキップして送信続行`);
     }
   } catch (e) {
     console.warn(`⚠️  status 照会失敗 (${e.message}) — 照会をスキップして送信続行`);

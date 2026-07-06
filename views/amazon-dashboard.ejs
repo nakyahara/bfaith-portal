@@ -760,7 +760,11 @@ async function loadDiagnosis() {
       <div class="diag-card"><h4>⚠️ 価格ミス疑い (実売単価<標準売価×${d.settings.price_miss_ratio}、${d.price_miss.length}件) — Seller Central要確認</h4>
         ${li(d.price_miss, r => `<tr><td>${esc(r.seller_sku)}</td><td class="name-cell">${esc(r.product_name || '')}</td><td class="num">実売 ${fmtYen(r.avg_price_incl)}</td><td class="num">標準 ${fmtYen(r.standard_price)}</td></tr>`)}</div>
       <div class="diag-card"><h4>🚱 出したのに売れてない (発売180日以内×直近30日販売≦1×在庫あり、${(d.launch_flop || []).length}件) — 露出/価格/画像の見直し候補</h4>
-        ${li(d.launch_flop || [], r => `<tr><td>${esc(r.ne_code)}</td><td class="name-cell">${esc(r.product_name || '')}</td><td class="num">${r.qty}個 / ${fmtYen(r.stock_value)}</td><td>発売 ${esc(r.launch_date || '?')}</td><td class="num">30日販売 ${r.sales_30d}</td></tr>`)}</div>`;
+        ${li(d.launch_flop || [], r => `<tr><td>${esc(r.ne_code)}</td><td class="name-cell">${esc(r.product_name || '')}</td><td class="num">${r.qty}個 / ${fmtYen(r.stock_value)}</td><td>発売 ${esc(r.launch_date || '?')}</td><td class="num">30日販売 ${r.sales_30d}</td></tr>`)}</div>
+      <div class="diag-card"><h4>💱 カート価格ズレ (乖離≥${d.settings.price_gap_pct}%、${(d.price_gap || []).length}件) ${d.price_snapshot_date ? `<span class="note">${d.price_snapshot_date} 時点</span>` : '<span class="pill no_data">価格データ未取得 (翌朝から)</span>'}</h4>
+        ${li(d.price_gap || [], r => `<tr><td>${esc(r.seller_sku)}</td><td class="name-cell">${esc(r.product_name || '')}</td><td class="num">自分 ${fmtYen(r.my_price)}</td><td class="num">カート ${fmtYen(r.buybox_price)}</td><td class="num ${r.direction === 'higher' ? 'negv' : ''}">${r.direction === 'higher' ? '▲高い' : '▼安い'} ${Math.abs(r.gap_pct)}%</td></tr>`)}</div>
+      <div class="diag-card"><h4>🛒 カート非保有 (他社がカート取得中×直近30日売上あり、${(d.buybox_lost || []).length}件) — 価格/在庫/配送スピード確認</h4>
+        ${li(d.buybox_lost || [], r => `<tr><td>${esc(r.seller_sku)}</td><td class="name-cell">${esc(r.product_name || '')}</td><td class="num">自分 ${r.my_price != null ? fmtYen(r.my_price) : '出品なし'}</td><td class="num">カート ${fmtYen(r.buybox_price)}</td><td class="num">30日売上 ${fmtYen(r.revenue_30d)}</td></tr>`)}</div>`;
   } catch (e) {
     document.getElementById('diag-cards').innerHTML = `<div class="warn-note">取得失敗: ${esc(e.message)}</div>`;
   }
@@ -774,6 +778,7 @@ const SETTING_LABELS = {
   margin_drop_pt: '悪化SKU閾値 (pt)', ad_bleed_days: '広告垂れ流し判定日数',
   dead_stock_days: '死に筋判定日数', price_miss_ratio: '価格ミス判定比率',
   abc_a_pct: 'ABC: A群 累積%', abc_b_pct: 'ABC: B群 累積%', new_product_days: '新商品バッジ日数',
+  price_gap_pct: 'カート価格ズレ閾値 (%)',
 };
 async function loadSettings() {
   await refreshExpenses();
