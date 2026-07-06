@@ -422,6 +422,22 @@ async function main() {
       console.log(`[DailySync] Amazon finance sync は build 失敗のため記録せず (build retry 後に翌 cron で sync 実行)`);
     }
 
+    // === Amazon Ads mirror sync (amazon-dashboard PR-A) ===
+    // fact_ad_spend / fact_ad_spend_campaign を Render mirror へ sync。
+    // 取得ジョブ (上の Amazon Ads (campaign)/(SKU)) は直近 30 日窓なので、
+    // attribution 遡及の取りこぼし余裕を見て 35 日窓で scope clear + 再投入。
+    // UPSERT 蓄積テーブルのため fetch 片方失敗でも既存データの sync は安全 (冪等)。
+    // 両方失敗時のみスキップ (古いデータの再送で通知が green に見えるのを防ぐ)。
+    if (adsCampaignResult.success || adsProductResult.success) {
+      const adsSyncResult = runScript(
+        `apps/warehouse/sync-amazon-ads-daily.js --data-dir ${DATA_DIR_ARG} --days 35`,
+        'Amazon Ads sync', 600000
+      );
+      results.push({ name: 'Amazon Ads sync', ...adsSyncResult });
+    } else {
+      console.log('[DailySync] Amazon Ads sync は fetch 両方失敗のためスキップ (fetch retry 後に翌 cron で sync 実行)');
+    }
+
     // === 楽天 finance daily fact (Phase 1a #R-3c、#R-1 + #R-2 + #R-3a 統合) ===
     // 1. f_rakuten_finance_sku_daily_v1 build (status IN (500,600,700) D 案、snapshot UPSERT)
     // 2. DQ gate (6 check、severity error で exit 1)

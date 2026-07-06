@@ -1,0 +1,17 @@
+{
+  "entity": "amazon_ads_sku_daily",
+  "contract_version": 1,
+  "source_system": "minipc-warehouse",
+  "source_object": "fact_ad_spend",
+  "target_table": "mirror_amazon_ads_sku_daily",
+  "grain_definition": "one row = one (date_jst, mall, campaign_id, ad_type, target, target_granularity)",
+  "key_columns_json": "[\"date_jst\", \"mall\", \"campaign_id\", \"ad_type\", \"target\", \"target_granularity\"]",
+  "payload_schema_json": "{\"type\":\"object\",\"required\":[\"date_jst\",\"mall\",\"campaign_id\",\"ad_type\",\"target\",\"target_granularity\"],\"properties\":{\"date_jst\":{\"type\":\"string\",\"pattern\":\"^\\\\d{4}-\\\\d{2}-\\\\d{2}$\"},\"mall\":{\"type\":\"string\"},\"campaign_id\":{\"type\":\"string\"},\"ad_type\":{\"type\":\"string\"},\"target\":{\"type\":\"string\",\"minLength\":1},\"target_granularity\":{\"type\":\"string\",\"enum\":[\"sku\",\"asin\"]},\"clicks\":{\"type\":\"integer\"},\"impressions\":{\"type\":\"integer\"},\"ad_cost\":{\"type\":\"number\"},\"ad_sales\":{\"type\":\"number\"},\"ad_units\":{\"type\":\"integer\"}}}",
+  "clear_strategy": "scope_clear_per_run",
+  "clear_strategy_detail": "First chunk of run includes meta.clear_amazon_ads_sku_dates=[<all dates in scope, including 0-row dates>] for Render side to DELETE before insert. Ads attribution restates past days, so full-scope clear removes stale rows.",
+  "apply_mode": "insert_or_replace",
+  "apply_mode_detail": "INSERT OR REPLACE on (date_jst, mall, campaign_id, ad_type, target, target_granularity). source_run_id / source_row_hash track origin",
+  "enabled": 1,
+  "owner": "amazon-dashboard",
+  "notes": "amazon-dashboard PR-A (2026-07-06) で導入。spAdvertisedProduct 由来の SKU/ASIN 別広告費。target は LOWER 済み (fetch-amazon-ads.js が正規化)。Auto-Targeting の未配賦分は amazon_ads_campaign_daily との差分で導出する。日本語列 (fact_ad_spend) → 英語キー (payload/mirror) の mapping は sync-amazon-ads-daily.js の SELECT で実施"
+}

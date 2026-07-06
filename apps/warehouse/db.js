@@ -1527,6 +1527,70 @@ function createTables() {
       updated_at          = excluded.updated_at
   `);
 
+  // ---- Amazon 広告費 mirror sync: contract auto-seed (amazon-dashboard PR-A、2026-07-06)
+  // fact_ad_spend (SKU別) / fact_ad_spend_campaign (キャンペーン単位) を Render mirror へ sync。
+  // 広告レポートは attribution 遡及で過去日の値が更新されるため scope_clear_per_run。
+  // payload は英語キー (mirror 側英語列、f_sales_by_listing PR #156 と同方針)。
+  db.exec(`
+    INSERT INTO sync_contracts (
+      entity, contract_version, source_system, source_object, target_table,
+      grain_definition, key_columns_json, payload_schema_json,
+      clear_strategy, apply_mode, enabled, owner, created_at, updated_at
+    ) VALUES (
+      'amazon_ads_sku_daily', 1, 'minipc-warehouse',
+      'fact_ad_spend', 'mirror_amazon_ads_sku_daily',
+      'one row = one (date_jst, mall, campaign_id, ad_type, target, target_granularity) — spAdvertisedProduct 由来の SKU/ASIN 別広告費 (Auto-Targeting 未配賦分は含まない)',
+      '["date_jst","mall","campaign_id","ad_type","target","target_granularity"]',
+      '{"required":["date_jst","mall","campaign_id","ad_type","target","target_granularity"],"date_jst_pattern":"^\\d{4}-\\d{2}-\\d{2}$","target_granularity_enum":["sku","asin"]}',
+      'scope_clear_per_run', 'insert_or_replace', 1, 'amazon-dashboard',
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    )
+    ON CONFLICT(entity) DO UPDATE SET
+      contract_version    = excluded.contract_version,
+      source_system       = excluded.source_system,
+      source_object       = excluded.source_object,
+      target_table        = excluded.target_table,
+      grain_definition    = excluded.grain_definition,
+      key_columns_json    = excluded.key_columns_json,
+      payload_schema_json = excluded.payload_schema_json,
+      clear_strategy      = excluded.clear_strategy,
+      apply_mode          = excluded.apply_mode,
+      enabled             = excluded.enabled,
+      owner               = excluded.owner,
+      updated_at          = excluded.updated_at
+  `);
+
+  db.exec(`
+    INSERT INTO sync_contracts (
+      entity, contract_version, source_system, source_object, target_table,
+      grain_definition, key_columns_json, payload_schema_json,
+      clear_strategy, apply_mode, enabled, owner, created_at, updated_at
+    ) VALUES (
+      'amazon_ads_campaign_daily', 1, 'minipc-warehouse',
+      'fact_ad_spend_campaign', 'mirror_amazon_ads_campaign_daily',
+      'one row = one (date_jst, mall, campaign_id, ad_type) — spCampaigns 由来のキャンペーン単位全広告費 (Amazon Ads Console と一致する正本)',
+      '["date_jst","mall","campaign_id","ad_type"]',
+      '{"required":["date_jst","mall","campaign_id","ad_type"],"date_jst_pattern":"^\\d{4}-\\d{2}-\\d{2}$"}',
+      'scope_clear_per_run', 'insert_or_replace', 1, 'amazon-dashboard',
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    )
+    ON CONFLICT(entity) DO UPDATE SET
+      contract_version    = excluded.contract_version,
+      source_system       = excluded.source_system,
+      source_object       = excluded.source_object,
+      target_table        = excluded.target_table,
+      grain_definition    = excluded.grain_definition,
+      key_columns_json    = excluded.key_columns_json,
+      payload_schema_json = excluded.payload_schema_json,
+      clear_strategy      = excluded.clear_strategy,
+      apply_mode          = excluded.apply_mode,
+      enabled             = excluded.enabled,
+      owner               = excluded.owner,
+      updated_at          = excluded.updated_at
+  `);
+
   // ---- Phase 1 #1-4a: sync_runs (run ledger、miniPC 側で sync 開始記録)
   // status 遷移: started → applied (全 chunk Render から 2xx)
   //              | → failed (途中失敗、error_message に記録)

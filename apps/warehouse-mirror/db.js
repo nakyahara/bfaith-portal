@@ -374,6 +374,57 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_mafsd_month ON mirror_amazon_finance_sku_daily(substr(date_jst, 1, 7))');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mafsd_run ON mirror_amazon_finance_sku_daily(source_run_id)');
 
+  // mirror_amazon_ads_sku_daily — Amazon 広告費 SKU/ASIN 別 (amazon-dashboard PR-A、2026-07-06)
+  // miniPC fact_ad_spend (spAdvertisedProduct 由来、日本語列) の英語キー payload を受信。
+  // target は LOWER 済み SKU または ASIN (target_granularity で区別)。
+  // Auto-Targeting 等の未配賦広告費は含まない → campaign_daily との差分で導出。
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_amazon_ads_sku_daily (
+    date_jst            TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+    mall                TEXT NOT NULL DEFAULT 'amazon',
+    campaign_id         TEXT NOT NULL,
+    ad_type             TEXT NOT NULL DEFAULT 'SP',
+    target              TEXT NOT NULL CHECK(trim(target) <> ''),
+    target_granularity  TEXT NOT NULL CHECK(target_granularity IN ('sku','asin')),
+    clicks              INTEGER NOT NULL DEFAULT 0,
+    impressions         INTEGER NOT NULL DEFAULT 0,
+    ad_cost             REAL NOT NULL DEFAULT 0,
+    ad_sales            REAL NOT NULL DEFAULT 0,
+    ad_units            INTEGER NOT NULL DEFAULT 0,
+    source_run_id       TEXT NOT NULL,
+    source_row_hash     TEXT NOT NULL,
+    synced_at           TEXT NOT NULL,
+    PRIMARY KEY (date_jst, mall, campaign_id, ad_type, target, target_granularity)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_maask_date ON mirror_amazon_ads_sku_daily(date_jst)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_maask_target ON mirror_amazon_ads_sku_daily(target)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_maask_month ON mirror_amazon_ads_sku_daily(substr(date_jst, 1, 7))');
+
+  // mirror_amazon_ads_campaign_daily — Amazon 広告費 キャンペーン単位 (amazon-dashboard PR-A)
+  // miniPC fact_ad_spend_campaign (spCampaigns 由来) の英語キー payload を受信。
+  // キャンペーン単位の全広告費 = Amazon Ads Console と一致する正本。
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_amazon_ads_campaign_daily (
+    date_jst        TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+    mall            TEXT NOT NULL DEFAULT 'amazon',
+    campaign_id     TEXT NOT NULL,
+    campaign_name   TEXT NOT NULL DEFAULT '',
+    ad_type         TEXT NOT NULL DEFAULT 'SP',
+    campaign_status TEXT NOT NULL DEFAULT '',
+    clicks          INTEGER NOT NULL DEFAULT 0,
+    impressions     INTEGER NOT NULL DEFAULT 0,
+    ad_cost         REAL NOT NULL DEFAULT 0,
+    ad_sales_1d     REAL NOT NULL DEFAULT 0,
+    ad_sales_7d     REAL NOT NULL DEFAULT 0,
+    ad_sales_14d    REAL NOT NULL DEFAULT 0,
+    ad_sales_30d    REAL NOT NULL DEFAULT 0,
+    ad_units_1d     INTEGER NOT NULL DEFAULT 0,
+    source_run_id   TEXT NOT NULL,
+    source_row_hash TEXT NOT NULL,
+    synced_at       TEXT NOT NULL,
+    PRIMARY KEY (date_jst, mall, campaign_id, ad_type)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_maacd_date ON mirror_amazon_ads_campaign_daily(date_jst)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_maacd_month ON mirror_amazon_ads_campaign_daily(substr(date_jst, 1, 7))');
+
   // mirror_rakuten_finance_sku_daily — 楽天 Phase 1a #R-3b (Render 側 daily fact mirror)
   // miniPC の f_rakuten_finance_sku_daily_v1 の payload を受信。
   // contract_version は sync_contracts.contract_version と整合。
