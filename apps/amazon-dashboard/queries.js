@@ -138,6 +138,7 @@ export function resolvePeriod(preset, fromQ, toQ) {
     this_month: { from: monthStart(ym), to: today },
     last_month: { from: monthStart(addMonths(ym, -1)), to: monthEnd(addMonths(ym, -1)) },
     this_year: { from: `${today.slice(0, 4)}-01-01`, to: today },
+    '12m': { from: monthStart(addMonths(ym, -11)), to: today },
   };
   const r = map[preset] || map['30d'];
   return { ...r, preset: map[preset] ? preset : '30d' };
@@ -403,9 +404,57 @@ function allocateAdCost(db, from, to, skuRows) {
   return { alloc: result, campaignTotal, directTotal, unallocated: Math.round(unallocated) };
 }
 
+// ─── 商品名フォールバック解決 ───
+// settlement fact の product_name は空の SKU が多い (2026-07-06 実データで確認) ため、
+// SKUマスタ (mirror_sku_resolved.商品名 / mirror_products.商品名) → 速報 listing 名 の順で補完。
+// マップ構築は速報全期間 GROUP BY を含むため 10 分キャッシュ。
+// キャッシュは DB 接続単位 (WeakMap)。initMirrorDB() 再実行で接続が差し替わっても
+// 旧 DB 由来の名前を返さない (Codex 指摘)。TTL 10 分。
+const _nameCacheByDb = new WeakMap();
+function getNameMap(db) {
+  const now = Date.now();
+  const cached = _nameCacheByDb.get(db);
+  if (cached && now - cached.at < 10 * 60 * 1000) return cached.map;
+  const map = new Map();
+  // 1) 速報 listing 名 (優先度低: 先に入れて後からマスタ名で上書き)。
+  //    全期間 GROUP BY は重いため直近 180 日に限定 (idx_mfsbl_mall (mall, date_jst) が効く)。
+  //    それ以前にしか売れていない SKU はマスタ名 (2) 側で概ね拾える。
+  const flashFrom = addDays(jstToday(), -180);
+  for (const x of db.prepare(`
+    SELECT LOWER(item_code) AS sku, MAX(NULLIF(TRIM(item_name), '')) AS name
+    FROM mirror_f_sales_by_listing
+    WHERE mall = 'amazon' AND date_jst >= ?
+    GROUP BY LOWER(item_code)
+  `).all(flashFrom)) {
+    if (x.name) map.set(x.sku, x.name);
+  }
+  // 2) SKUマスタ経由 (mirror_sku_resolved → mirror_products)
+  for (const x of db.prepare(`
+    SELECT LOWER(r.seller_sku) AS sku,
+           MAX(COALESCE(NULLIF(TRIM(r.商品名), ''), NULLIF(TRIM(p.商品名), ''))) AS name
+    FROM mirror_sku_resolved r
+    LEFT JOIN mirror_products p ON p.商品コード = r.ne_code
+    GROUP BY LOWER(r.seller_sku)
+  `).all()) {
+    if (x.name) map.set(x.sku, x.name);
+  }
+  _nameCacheByDb.set(db, { at: now, map });
+  return map;
+}
+function attachProductNames(db, rows, skuField = 'seller_sku') {
+  if (!rows.some(r => !r.product_name || !String(r.product_name).trim())) return rows;
+  const map = getNameMap(db);
+  for (const r of rows) {
+    if (!r.product_name || !String(r.product_name).trim()) {
+      r.product_name = map.get(String(r[skuField] || '').toLowerCase()) || '';
+    }
+  }
+  return rows;
+}
+
 // ─── SKU 別 確定集計 (利益分析/広告/売れ筋/診断の共通ベース) ───
 function settledBySku(db, from, to) {
-  return db.prepare(`
+  return attachProductNames(db, db.prepare(`
     SELECT seller_sku, MAX(asin_norm) AS asin_norm, MAX(product_name) AS product_name,
       SUM(units_net_sold) AS units_net,
       SUM(units_ordered) AS units_ordered,
@@ -424,7 +473,7 @@ function settledBySku(db, from, to) {
     FROM mirror_amazon_finance_sku_daily
     WHERE date_jst >= ? AND date_jst <= ?
     GROUP BY seller_sku
-  `).all(from, to);
+  `).all(from, to));
 }
 
 // ─── 利益分析タブ: ウォーターフォール ───
@@ -873,7 +922,7 @@ export function getDiagnosis() {
   }
 
   // 価格ミス疑い (実売単価(税込換算) < 標準売価 × ratio)
-  const priceMiss = db.prepare(`
+  const priceMiss = attachProductNames(db, db.prepare(`
     WITH sold AS (
       SELECT seller_sku, SUM(sales_principal_jpy) AS principal, SUM(units_net_sold) AS units,
              MAX(product_name) AS product_name
@@ -891,7 +940,7 @@ export function getDiagnosis() {
       AND s.principal / s.units * ${TAX_RATE} < p.標準売価 * ?
     ORDER BY p.標準売価 - s.principal / s.units * ${TAX_RATE} DESC
     LIMIT 50
-  `).all(monthStart(m1), today, settings.price_miss_ratio);
+  `).all(monthStart(m1), today, settings.price_miss_ratio));
 
   return {
     generated_at: new Date().toISOString(),
