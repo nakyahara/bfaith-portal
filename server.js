@@ -36,6 +36,7 @@ import qoo10AccountingRouter from './apps/qoo10-accounting/router.js';
 import fbaProfitabilityRouter from './apps/fba-profitability/router.js';
 import mercariAccountingRouter from './apps/mercari-accounting/router.js';
 import profitAnalysisRouter from './apps/profit-analysis/router.js';
+import amazonDashboardRouter from './apps/amazon-dashboard/router.js';
 import bizOpsOverviewRouter from './apps/biz-ops-overview/router.js';
 import productManagementListRouter from './apps/product-management-list/router.js';
 import execDashboardRouter from './apps/exec-dashboard/router.js';
@@ -560,6 +561,15 @@ const apps = [
     category: 'analysis',
   },
   {
+    id: 'amazon-dashboard',
+    name: 'Amazon統合ダッシュボード',
+    description: 'Amazonの売上・広告・利益を統合管理 (タイル速報 + 利益ウォーターフォール + 広告×利益 + 売れ筋 + 診断)',
+    icon: '🛒',
+    path: '/apps/amazon-dashboard',
+    status: 'active',
+    category: 'analysis',
+  },
+  {
     id: 'biz-ops-overview',
     name: '業務オペ概要',
     description: '全モール売上 (前日/今月/30日) + 出荷率等の日次経営指標集約',
@@ -1003,6 +1013,7 @@ app.use('/apps/qoo10-accounting', (req, res, next) => {
 }, qoo10AccountingRouter);
 app.use('/apps/fba-profitability', requireAppAccess('fba-profitability'), fbaProfitabilityRouter);
 app.use('/apps/profit-analysis', requireAppAccess('profit-analysis'), profitAnalysisRouter);
+app.use('/apps/amazon-dashboard', requireAppAccess('amazon-dashboard'), express.json({ limit: '256kb' }), amazonDashboardRouter);
 app.use('/apps/biz-ops-overview', requireAppAccess('biz-ops-overview'), bizOpsOverviewRouter);
 app.use('/apps/product-management-list', requireAppAccess('product-management-list'), productManagementListRouter);
 app.use('/apps/exec-dashboard', requireAppAccess('exec-dashboard'), express.json({ limit: '1mb' }), execDashboardRouter);
