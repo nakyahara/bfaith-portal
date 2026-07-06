@@ -442,6 +442,25 @@ function createTables() {
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_maafm_date ON mirror_amazon_account_fees_monthly(date_jst)');
 
+  // mirror_amazon_price_snapshot_daily — カート(Buy Box)価格 日次スナップショット (amazon-dashboard PR-D)
+  // my_price / buybox_price = landed (税込)。buybox_is_mine: 1=自社 / 0=他社 / NULL=カート不在
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_amazon_price_snapshot_daily (
+    date_jst        TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+    seller_sku      TEXT NOT NULL CHECK(trim(seller_sku) <> ''),
+    asin            TEXT NOT NULL DEFAULT '',
+    channel         TEXT,
+    my_price        REAL,
+    buybox_price    REAL,
+    buybox_is_mine  INTEGER CHECK(buybox_is_mine IN (0, 1) OR buybox_is_mine IS NULL),
+    fetched_at      TEXT,
+    source_run_id   TEXT NOT NULL,
+    source_row_hash TEXT NOT NULL,
+    synced_at       TEXT NOT NULL,
+    PRIMARY KEY (date_jst, seller_sku)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mapsd_date ON mirror_amazon_price_snapshot_daily(date_jst)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mapsd_sku ON mirror_amazon_price_snapshot_daily(seller_sku)');
+
   // mirror_rakuten_finance_sku_daily — 楽天 Phase 1a #R-3b (Render 側 daily fact mirror)
   // miniPC の f_rakuten_finance_sku_daily_v1 の payload を受信。
   // contract_version は sync_contracts.contract_version と整合。

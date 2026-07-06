@@ -25,7 +25,7 @@ const tx = db.transaction(() => {
   // クリア (再実行冪等)
   for (const t of ['mirror_amazon_finance_sku_daily', 'mirror_f_sales_by_listing', 'mirror_amazon_ads_sku_daily',
     'mirror_amazon_ads_campaign_daily', 'mirror_amazon_sku_fees', 'mirror_sku_resolved', 'mirror_products',
-    'mirror_inv_daily_detail', 'mirror_amazon_account_fees_monthly', 'amzdash_custom_expenses', 'amzdash_settings']) {
+    'mirror_inv_daily_detail', 'mirror_amazon_price_snapshot_daily', 'mirror_amazon_account_fees_monthly', 'amzdash_custom_expenses', 'amzdash_settings']) {
     try { db.exec(`DELETE FROM ${t}`); } catch {}
   }
 
@@ -107,6 +107,11 @@ const tx = db.transaction(() => {
 
   // 立ち上がり不発: 発売60日前・在庫あり・30日販売0
   db.prepare("INSERT INTO mirror_inv_daily_detail (business_date, market, category, source_system, source_item_code, ne_code, qty, unit_cost, total_value, cost_status, product_name, new_product_launch_date, sales_30d_qty, synced_at) VALUES (?, 'jp', 'fba_warehouse', 'fba', 'pr_flop', 'NE-FLOP', 30, 400, 12000, 'ok', '新商品売れず', ?, 0, 't')").run(today, d(60));
+
+  // カート価格スナップショット: alpha=自分が5%以上高い+カート他社 / beta=カート自社保有
+  const insSnap = db.prepare("INSERT INTO mirror_amazon_price_snapshot_daily (date_jst, seller_sku, asin, channel, my_price, buybox_price, buybox_is_mine, fetched_at, source_run_id, source_row_hash, synced_at) VALUES (?, ?, ?, 'FBA', ?, ?, ?, 't', 'smoke', 'h', 't')");
+  insSnap.run(today, 'pr_alpha', 'B0ALPHA', 1200, 1000, 0);
+  insSnap.run(today, 'pr_beta', 'B0BETA', 880, 880, 1);
 
   // アカウント単位フィー (当月+前月、負=費用)
   const insFee = db.prepare("INSERT INTO mirror_amazon_account_fees_monthly (date_jst, fee_type, amount_jpy, row_count, source_run_id, source_row_hash, synced_at) VALUES (?, ?, ?, 1, 'smoke', 'h', 't')");
@@ -233,6 +238,16 @@ check('診断 launch_flop', () => {
   assert(Array.isArray(r.launch_flop), 'launch_flop array');
   assert(r.launch_flop.some(x => x.ne_code === 'NE-FLOP'), 'NE-FLOP 検出');
   assert(!r.launch_flop.some(x => x.ne_code === 'NE-A'), '売れてるNE-Aは非検出');
+});
+
+check('診断 カート価格ズレ+カート非保有', () => {
+  const r = q.getDiagnosis();
+  assert(r.price_snapshot_date === today, 'snapshot date');
+  const gap = r.price_gap.find(x => x.seller_sku === 'pr_alpha');
+  assert(gap && gap.direction === 'higher' && gap.gap_pct === 20, 'alpha 20%高い検出 (got ' + JSON.stringify(gap) + ')');
+  assert(!r.price_gap.some(x => x.seller_sku === 'pr_beta'), 'カート自社保有betaは非検出');
+  assert(r.buybox_lost.some(x => x.seller_sku === 'pr_alpha'), 'alpha カート非保有検出');
+  assert(!r.buybox_lost.some(x => x.seller_sku === 'pr_beta'), 'beta 非該当');
 });
 
 check('expenses CRUD + settings', () => {
