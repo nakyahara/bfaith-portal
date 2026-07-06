@@ -356,7 +356,13 @@ async function fetchOrders(days = 7) {
             item.receive_order_row_shop_cut_form_id || base.receive_order_shop_cut_form_id || '',
             base.receive_order_order_status_id || '',
             base.receive_order_order_status_name || '',
-            base.receive_order_cancel_type_id ? 'キャンセル' : '有効な受注です。',
+            // NE API は非キャンセル受注に cancel_type_id='0' (文字列) を返す。'0' は JS で
+            // truthy のため、素の truthy 判定だと全 API 取込行が「キャンセル」に誤ラベルされる
+            // (2026-07-06 実測: 伝票1485081 = 有効な新規受注で cancel_type_id="0"。106,740行が誤ラベル)。
+            // 実害は f_sales には無し (フィルタは行レベルのキャンセル区分) だが、UPSERT 化後は
+            // この列も更新されるため、誤ラベルの churn を止める。
+            (base.receive_order_cancel_type_id && base.receive_order_cancel_type_id !== '0')
+              ? 'キャンセル' : '有効な受注です。',
             base.receive_order_cancel_date || '',
             base.receive_order_date || '',
             base.receive_order_shop_id || '',
