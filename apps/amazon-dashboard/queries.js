@@ -408,16 +408,24 @@ function allocateAdCost(db, from, to, skuRows) {
 // settlement fact の product_name は空の SKU が多い (2026-07-06 実データで確認) ため、
 // SKUマスタ (mirror_sku_resolved.商品名 / mirror_products.商品名) → 速報 listing 名 の順で補完。
 // マップ構築は速報全期間 GROUP BY を含むため 10 分キャッシュ。
-let _nameCache = { at: 0, map: null };
+// キャッシュは DB 接続単位 (WeakMap)。initMirrorDB() 再実行で接続が差し替わっても
+// 旧 DB 由来の名前を返さない (Codex 指摘)。TTL 10 分。
+const _nameCacheByDb = new WeakMap();
 function getNameMap(db) {
   const now = Date.now();
-  if (_nameCache.map && now - _nameCache.at < 10 * 60 * 1000) return _nameCache.map;
+  const cached = _nameCacheByDb.get(db);
+  if (cached && now - cached.at < 10 * 60 * 1000) return cached.map;
   const map = new Map();
-  // 1) 速報 listing 名 (優先度低: 先に入れて後からマスタ名で上書き)
+  // 1) 速報 listing 名 (優先度低: 先に入れて後からマスタ名で上書き)。
+  //    全期間 GROUP BY は重いため直近 180 日に限定 (idx_mfsbl_mall (mall, date_jst) が効く)。
+  //    それ以前にしか売れていない SKU はマスタ名 (2) 側で概ね拾える。
+  const flashFrom = addDays(jstToday(), -180);
   for (const x of db.prepare(`
     SELECT LOWER(item_code) AS sku, MAX(NULLIF(TRIM(item_name), '')) AS name
-    FROM mirror_f_sales_by_listing WHERE mall = 'amazon' GROUP BY LOWER(item_code)
-  `).all()) {
+    FROM mirror_f_sales_by_listing
+    WHERE mall = 'amazon' AND date_jst >= ?
+    GROUP BY LOWER(item_code)
+  `).all(flashFrom)) {
     if (x.name) map.set(x.sku, x.name);
   }
   // 2) SKUマスタ経由 (mirror_sku_resolved → mirror_products)
@@ -430,7 +438,7 @@ function getNameMap(db) {
   `).all()) {
     if (x.name) map.set(x.sku, x.name);
   }
-  _nameCache = { at: now, map };
+  _nameCacheByDb.set(db, { at: now, map });
   return map;
 }
 function attachProductNames(db, rows, skuField = 'seller_sku') {
