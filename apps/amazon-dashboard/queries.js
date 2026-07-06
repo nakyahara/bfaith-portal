@@ -978,7 +978,9 @@ export function getDiagnosis() {
       FROM mirror_amazon_finance_sku_daily WHERE date_jst >= ? GROUP BY seller_sku
     `).all(addDays(today, -29)).map(r => [r.seller_sku.toLowerCase(), Math.round(r.rev)]));
     for (const s of snaps) {
-      if (s.buybox_price == null || s.buybox_is_mine === 1) continue;
+      // buybox_is_mine が明示的に 0 (他社保有) のときだけ検知対象。
+      // NULL (belongsToRequester 未返却 = 保有者不明) を lost 扱いすると偽陽性 (Codex R2 High)
+      if (s.buybox_price == null || s.buybox_is_mine !== 0) continue;
       // カートを他社に取られている + 直近30日に売上がある SKU
       const rev = recentRevMap.get(s.seller_sku.toLowerCase());
       if (rev !== undefined && rev > 0) {

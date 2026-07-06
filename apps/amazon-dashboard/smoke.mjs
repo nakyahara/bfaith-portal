@@ -112,6 +112,7 @@ const tx = db.transaction(() => {
   const insSnap = db.prepare("INSERT INTO mirror_amazon_price_snapshot_daily (date_jst, seller_sku, asin, channel, my_price, buybox_price, buybox_is_mine, fetched_at, source_run_id, source_row_hash, synced_at) VALUES (?, ?, ?, 'FBA', ?, ?, ?, 't', 'smoke', 'h', 't')");
   insSnap.run(today, 'pr_alpha', 'B0ALPHA', 1200, 1000, 0);
   insSnap.run(today, 'pr_beta', 'B0BETA', 880, 880, 1);
+  insSnap.run(today, 'pr_gamma', 'B0GAMMA', 900, 700, null);  // 保有者不明 → 非検出であるべき
 
   // アカウント単位フィー (当月+前月、負=費用)
   const insFee = db.prepare("INSERT INTO mirror_amazon_account_fees_monthly (date_jst, fee_type, amount_jpy, row_count, source_run_id, source_row_hash, synced_at) VALUES (?, ?, ?, 1, 'smoke', 'h', 't')");
@@ -248,6 +249,7 @@ check('診断 カート価格ズレ+カート非保有', () => {
   assert(!r.price_gap.some(x => x.seller_sku === 'pr_beta'), 'カート自社保有betaは非検出');
   assert(r.buybox_lost.some(x => x.seller_sku === 'pr_alpha'), 'alpha カート非保有検出');
   assert(!r.buybox_lost.some(x => x.seller_sku === 'pr_beta'), 'beta 非該当');
+  assert(!r.price_gap.some(x => x.seller_sku === 'pr_gamma') && !r.buybox_lost.some(x => x.seller_sku === 'pr_gamma'), '保有者不明gammaは両リスト非検出');
 });
 
 check('expenses CRUD + settings', () => {
