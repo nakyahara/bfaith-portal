@@ -25,16 +25,20 @@ function requireSyncKey() {
     throw new Error('MIRROR_SYNC_KEY env が未設定です (.env に追加してください)。KEY なしでは Render sync が 401 になります。');
   }
 }
-const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK || 'https://chat.googleapis.com/v1/spaces/AAQAL5zHy-w/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=yER7IJx_9CkKhYnzzre0WcWuqfgXc1oh8ldR35k01zE';
+const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
 async function notify(text) {
+  if (!GCHAT_WEBHOOK) {
+    console.warn('[sync-to-render] [NOTIFY:status=skipped] GCHAT_WEBHOOK未設定のため通知スキップ');
+    return;
+  }
   try {
     await fetch(GCHAT_WEBHOOK, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text }),
     });
-  } catch (e) { console.error('[通知エラー]', e.message); }
+  } catch (e) { console.error('[sync-to-render] [NOTIFY:status=failed]', e.message); }
 }
 
 function now() {

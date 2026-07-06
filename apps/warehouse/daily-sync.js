@@ -23,9 +23,13 @@ const RETRY_STATE_FILE = path.join(PROJECT_DIR, 'data', 'daily-sync-retry-state.
 //   build を retryable に残し、sync は build 成功時のみ実行 (依存連鎖は cron 単位で完結)。
 const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build'];
 
-const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK || 'https://chat.googleapis.com/v1/spaces/AAQAL5zHy-w/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=yER7IJx_9CkKhYnzzre0WcWuqfgXc1oh8ldR35k01zE';
+const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
 async function notify(text) {
+  if (!GCHAT_WEBHOOK) {
+    console.warn('[daily-sync] [NOTIFY:status=skipped] GCHAT_WEBHOOK未設定のため通知スキップ');
+    return;
+  }
   try {
     await fetch(GCHAT_WEBHOOK, {
       method: 'POST',
@@ -33,7 +37,7 @@ async function notify(text) {
       body: JSON.stringify({ text }),
     });
   } catch (e) {
-    console.error('[通知エラー]', e.message);
+    console.error('[daily-sync] [NOTIFY:status=failed]', e.message);
   }
 }
 
