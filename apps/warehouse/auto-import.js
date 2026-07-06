@@ -17,6 +17,7 @@ import fs from 'fs';
 import path from 'path';
 import iconv from 'iconv-lite';
 import { initDB, getDB, saveToFile, updateSyncMeta } from './db.js';
+import { makeNeOrdersUpserter } from './ne-orders-upsert.js';
 
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 const IMPORT_DIR = path.join(DATA_DIR, 'import');
@@ -106,26 +107,28 @@ function importProducts(filePath) {
 function importOrders(filePath) {
   const { rows } = readCsvFile(filePath);
   const db = getDB();
-  const stmt = db.prepare(`INSERT OR IGNORE INTO raw_ne_orders (
-    伝票番号, 受注番号, 受注状態区分, 受注状態, 受注キャンセル, 受注キャンセル日,
-    受注日, 店舗コード, 出荷確定日, 明細行番号, レコードナンバー, キャンセル区分,
-    商品コード, 商品名, 商品OP, 受注数, 引当数, 小計金額, synced_at
-  ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  // 監査 S-5/V-3: INSERT OR IGNORE → 状態更新つき UPSERT (キャンセル・状態変化を反映)
+  const upsertOrderRow = makeNeOrdersUpserter(db);
   const tx = db.transaction(() => {
-    let inserted = 0, skipped = 0;
+    let inserted = 0, updated = 0, unchanged = 0, skipped = 0, errors = 0;
     for (const row of rows) {
       const denpyo = row[0]?.trim();
       const lineNo = parseInt(row[9]);
       if (!denpyo || isNaN(lineNo)) { skipped++; continue; }
       try {
-        stmt.run(denpyo, row[1]||'', row[2]||'', row[3]||'', row[4]||'',
+        const outcome = upsertOrderRow(denpyo, row[1]||'', row[2]||'', row[3]||'', row[4]||'',
           row[5]||'', row[6]||'', row[7]||'', row[8]||'',
           lineNo, row[10]||'', row[11]||'', (row[12] || '').toLowerCase(), row[13]||'',
           row[14]||'', parseInt(row[15])||0, parseInt(row[16])||0, parseFloat(row[17])||0, now());
-        inserted++;
-      } catch { skipped++; }
+        if (outcome === 'inserted') inserted++;
+        else if (outcome === 'updated') updated++;
+        else unchanged++;
+      } catch (e) {
+        errors++;
+        if (errors <= 3) console.error(`[Auto] 受注明細 UPSERT エラー (伝票=${denpyo} 行=${lineNo}): ${e.message}`);
+      }
     }
-    return { inserted, skipped };
+    return { inserted, updated, unchanged, skipped, errors };
   });
   return tx();
 }
@@ -223,7 +226,7 @@ function checkAndImport() {
     try {
       let result;
       if (type === 'products') { result = importProducts(filePath); console.log(`[Auto] 商品マスタ: ${result}件`); }
-      else if (type === 'orders') { result = importOrders(filePath); console.log(`[Auto] 受注明細: ${result.inserted}件挿入, ${result.skipped}件スキップ`); }
+      else if (type === 'orders') { result = importOrders(filePath); console.log(`[Auto] 受注明細: ${result.inserted}件挿入, ${result.updated}件更新, ${result.unchanged}件変化なし, ${result.skipped}件スキップ, ${result.errors}件エラー`); }
       else if (type === 'sets') { result = importSetProducts(filePath); console.log(`[Auto] セット商品: ${result}件`); }
       else if (type === 'logizard') { result = importLogizard(filePath); console.log(`[Auto] ロジザード: ${result}件`); }
       const dest = moveToDone(filePath);
