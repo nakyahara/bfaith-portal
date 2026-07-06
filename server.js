@@ -39,6 +39,7 @@ import profitAnalysisRouter from './apps/profit-analysis/router.js';
 import amazonDashboardRouter from './apps/amazon-dashboard/router.js';
 import rakutenAnalyticsRouter from './apps/rakuten-analytics/router.js';
 import yahooAnalyticsRouter from './apps/yahoo-analytics/router.js';
+import aupayAnalyticsRouter from './apps/aupay-analytics/router.js';
 import bizOpsOverviewRouter from './apps/biz-ops-overview/router.js';
 import productManagementListRouter from './apps/product-management-list/router.js';
 import execDashboardRouter from './apps/exec-dashboard/router.js';
@@ -599,6 +600,15 @@ const apps = [
     category: 'analysis',
   },
   {
+    id: 'aupay-analytics',
+    name: 'auPAY分析ツール',
+    description: 'au PAYマーケットの売上・利益・キャンペーンを統合管理 (タイル速報 + ポイント後利益L2 + 三太郎の日ハイライト + 送料負け診断)',
+    icon: '🧡',
+    path: '/apps/aupay-analytics',
+    status: 'active',
+    category: 'analysis',
+  },
+  {
     id: 'biz-ops-overview',
     name: '業務オペ概要',
     description: '全モール売上 (前日/今月/30日) + 出荷率等の日次経営指標集約',
@@ -1084,6 +1094,7 @@ app.use('/apps/profit-analysis', requireAppAccess('profit-analysis'), profitAnal
 app.use('/apps/amazon-dashboard', requireAppAccess('amazon-dashboard'), express.json({ limit: '256kb' }), amazonDashboardRouter);
 app.use('/apps/rakuten-analytics', requireAppAccess('rakuten-analytics'), rakutenAnalyticsRouter);
 app.use('/apps/yahoo-analytics', requireAppAccess('yahoo-analytics'), yahooAnalyticsRouter);
+app.use('/apps/aupay-analytics', requireAppAccess('aupay-analytics'), aupayAnalyticsRouter);
 app.use('/apps/biz-ops-overview', requireAppAccess('biz-ops-overview'), bizOpsOverviewRouter);
 app.use('/apps/product-management-list', requireAppAccess('product-management-list'), productManagementListRouter);
 app.use('/apps/exec-dashboard', requireAppAccess('exec-dashboard'), express.json({ limit: '1mb' }), execDashboardRouter);
