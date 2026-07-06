@@ -14,7 +14,7 @@ import { Router } from 'express';
 import multer from 'multer';
 import fs from 'fs';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
-import { requireImportKey } from '../../lib/import-key-auth.js';
+import { requireImportKey, importJsonParser } from '../../lib/import-key-auth.js';
 
 const router = Router();
 const UPLOAD_DIR = process.env.DATA_DIR ? process.env.DATA_DIR + '/import' : 'data/import';
@@ -479,7 +479,7 @@ router.get('/history', (req, res) => {
 
 // ─── POST /import-history — ヒストリカルデータ一括投入 ───
 
-router.post('/import-history', requireImportKey('IMPORT_KEY_AMAZON_USA'), (req, res) => {
+router.post('/import-history', requireImportKey('IMPORT_KEY_AMAZON_USA'), importJsonParser, (req, res) => {
   const db = getMirrorDB();
   const { months } = req.body;
   if (!Array.isArray(months)) return res.status(400).json({ error: 'months 配列が必要です' });

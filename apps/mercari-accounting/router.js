@@ -15,7 +15,7 @@ import multer from 'multer';
 import fs from 'fs';
 import iconv from 'iconv-lite';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
-import { requireImportKey } from '../../lib/import-key-auth.js';
+import { requireImportKey, importJsonParser } from '../../lib/import-key-auth.js';
 
 const router = Router();
 const UPLOAD_DIR = process.env.DATA_DIR ? process.env.DATA_DIR + '/import' : 'data/import';
@@ -514,7 +514,7 @@ router.get('/history', (req, res) => {
 
 // ─── POST /import-history ───
 
-router.post('/import-history', requireImportKey('IMPORT_KEY_MERCARI'), (req, res) => {
+router.post('/import-history', requireImportKey('IMPORT_KEY_MERCARI'), importJsonParser, (req, res) => {
   const db = getMirrorDB();
   const { months } = req.body;
   if (!Array.isArray(months)) return res.status(400).json({ error: 'months 配列が必要です' });
