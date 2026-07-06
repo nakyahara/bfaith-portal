@@ -270,6 +270,9 @@ app.use((req, res, next) => {
     if (normalizedPath.startsWith('/service-api/') || normalizedPath === '/service-api') return next();
     // /apps/mirror/api/sync* も同様に API key 認証前 body parse を避ける。
     if (normalizedPath.startsWith('/apps/mirror/api/sync')) return next();
+    // mirror read API (GET専用、監査S-2で認証追加) への POST も認証前 body parse を避ける
+    // (POST は router 側に route が無く 404 になるだけなので parse 不要)。
+    if (/^\/apps\/mirror\/api\/(products|sales|status|download)(\/|$)/.test(normalizedPath)) return next();
     if (LARGE_BODY_ROUTES.includes(normalizedPath)) return next();
   }
   return globalJsonParser(req, res, next);
@@ -883,7 +886,8 @@ app.use('/apps/warehouse', requireAppAccess('warehouse'), warehouseRouter);
 // === Mirror subtree middleware (Codex 6周レビュー反映) ===
 // accessLog は /apps/mirror 全体に掛ける (401含めて全requestを観測できる)。
 // 認証+8MB parser+parser error handler は /apps/mirror/api/sync* のみ (mutation専用)。
-// 既存の read API (/apps/mirror/api/products など) は従来通り認証なしで素通し。
+// read API (/apps/mirror/api/products 等) は「portalセッション or MIRROR_READ_TOKEN」必須
+// (設計監査 2026-07-06 S-2: 原価・仕入先・全モール売上・全件CSVが公開URLから素通しだった)。
 function mirrorAccessLog(req, res, next) {
   const start = Date.now();
   res.on('finish', () => {
@@ -944,7 +948,42 @@ app.use('/apps/mirror/api/sync', express.json({
 }));
 app.use('/apps/mirror/api/sync', mirrorParserErrorHandler);
 
-// read API (/api/products 等) は従来通り認証なしで素通し。
+// read API 認証 (監査 S-2 対応): portal セッション or x-read-token (MIRROR_READ_TOKEN) のどちらかで許可。
+//   ・対象は認証が無かった read 系 (products / sales配下全体 / status / download配下全体)。
+//     sales/download は prefix mount なので将来の追加 route も自動的に保護される (安全側デフォルト)。
+//   ・独自 token を持つ既存ルート (/api/sync* = sync key, /api/pml/* = PML_*_TOKEN,
+//     /api/sku-master/* = MIRROR_READ_TOKEN) は各自の認証を維持するため対象外 (二重認証にしない)。
+//   ・session 経路は requireAppAccess('warehouse') 相当の認可まで要求 (Codex R2 high:
+//     原価・仕入先・全モール売上を含むため、ログイン済みなら誰でも可では低権限ユーザーへ横展開する)。
+//   ・token 提示あり + MIRROR_READ_TOKEN 未設定は 503 (requireReadToken と同じ fail-closed シグナル)、
+//     不一致は 401。warehouse 権限なし session は 403、session も token も無ければ 401。
+//   ・token は header only (query 受理は URL/アクセスログ残留のため禁止。requireReadToken と同方針)。
+function requireSessionOrReadToken(req, res, next) {
+  const sessionAuthed = !!(req.session && req.session.authenticated);
+  if (sessionAuthed) {
+    const allowed = req.session.allowedApps;
+    if (allowed === '*' || (Array.isArray(allowed) && allowed.includes('warehouse'))) return next();
+  }
+  const provided = req.headers['x-read-token'];
+  if (provided) {
+    const token = process.env.MIRROR_READ_TOKEN;
+    if (!token) return res.status(503).json({ error: 'mirror_read_token_unset' });
+    if (provided === token) return next();
+    return res.status(401).json({ error: 'invalid_read_token' });
+  }
+  if (sessionAuthed) return res.status(403).json({ error: 'forbidden' });
+  return res.status(401).json({ error: 'auth_required' });
+}
+app.use(
+  [
+    '/apps/mirror/api/products',
+    '/apps/mirror/api/sales',
+    '/apps/mirror/api/status',
+    '/apps/mirror/api/download',
+  ],
+  requireSessionOrReadToken
+);
+
 // mirrorRouter 内部の `router.post('/api/sync', requireSyncKey, ...)` が二重防御として残る。
 app.use('/apps/mirror', mirrorRouter);
 
