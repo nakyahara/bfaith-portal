@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>auPAY分析ツール - B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="stylesheet" href="/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"
+          integrity="sha384-9nhczxUqK87bcKHh20fSQcTGD4qq5GhayNYSYWqwBkINBhOfQLg/P5HG5lF1urn4"
+          crossorigin="anonymous"></script>
+  <style>
+    body { background: #f5f7fa; }
+    .container { max-width: 1500px; margin: 0 auto; padding: 16px 20px; }
+    .header-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; flex-wrap: wrap; gap: 12px; }
+    .header-row h2 { margin: 0; }
+    .back-link { font-size: 13px; color: #eb5505; text-decoration: none; }
+    .back-link:hover { text-decoration: underline; }
+    .meta-bar { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px 14px; margin-bottom: 12px; font-size: 12px; color: #555; display: flex; gap: 16px; flex-wrap: wrap; align-items: center; }
+
+    /* 精度バッジ (要件 §11-2: 速報/自動/実額/推定を常時区別。税はすべて税込) */
+    .pbadge { display: inline-block; padding: 1px 7px; border-radius: 4px; font-size: 10px; font-weight: 700; vertical-align: middle; }
+    .pbadge.flash { background: #dbeafe; color: #1e40af; }
+    .pbadge.auto { background: #e5e7eb; color: #374151; }
+    .pbadge.act { background: #d1fae5; color: #065f46; }
+    .pbadge.est { background: #fef3c7; color: #92400e; }
+
+    /* タブ (au オレンジ) */
+    .tabs { display: flex; gap: 4px; margin-bottom: -1px; flex-wrap: wrap; }
+    .tab-btn { background: #fff; border: 1px solid #e5e7eb; border-bottom: none; border-radius: 6px 6px 0 0; padding: 10px 16px; cursor: pointer; font-size: 13px; color: #555; }
+    .tab-btn.active { background: #eb5505; color: white; border-color: #eb5505; }
+    .tab-content { background: white; border: 1px solid #e5e7eb; border-radius: 0 8px 8px 8px; padding: 16px; min-height: 400px; }
+    .tab-pane { display: none; }
+    .tab-pane.active { display: block; }
+
+    /* 期間切替 */
+    .period-switcher { display: inline-flex; gap: 4px; background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 6px; padding: 2px; flex-wrap: wrap; }
+    .period-switcher button { background: transparent; border: none; padding: 6px 10px; font-size: 12px; cursor: pointer; border-radius: 4px; color: #555; }
+    .period-switcher button.active { background: #eb5505; color: white; }
+    .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+
+    /* タイル */
+    .tile-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin-bottom: 16px; }
+    .tile { background: white; border: 1px solid #e5e7eb; border-radius: 10px; padding: 14px 18px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
+    .tile h3 { margin: 0 0 8px; font-size: 14px; color: #374151; }
+    .tile .row { display: flex; justify-content: space-between; font-size: 13px; padding: 3px 0; color: #4b5563; }
+    .tile .row .v { font-variant-numeric: tabular-nums; font-weight: 600; color: #111; }
+    .tile .row.hero { border-top: 1px dashed #e5e7eb; margin-top: 6px; padding-top: 8px; }
+    .tile .row.hero .v { font-size: 18px; font-weight: 700; }
+    .pos { color: #047857 !important; } .negv { color: #dc2626 !important; }
+
+    .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
+    .chart-card { background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 14px; }
+    .chart-card h3 { margin: 0 0 8px; font-size: 13px; color: #374151; font-weight: 600; }
+    .chart-wrap { position: relative; height: 300px; }
+    .chart-wrap.tall { height: 420px; }
+    @media (max-width: 900px) { .charts-grid { grid-template-columns: 1fr; } }
+
+    .note { font-size: 11.5px; color: #6b7280; margin: 6px 0; }
+    .warn-note { background: #fffbeb; border-left: 4px solid #f59e0b; padding: 8px 12px; font-size: 12px; color: #92400e; border-radius: 4px; margin-bottom: 12px; }
+    .info-note { background: #fff7ed; border-left: 4px solid #eb5505; padding: 8px 12px; font-size: 12px; color: #9a3412; border-radius: 4px; margin-bottom: 12px; }
+    .loading { color: #6b7280; font-size: 13px; padding: 30px; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header-row">
+      <h2>🧡 auPAY分析ツール</h2>
+      <div style="display:flex; gap:14px; align-items:center;">
+        <span style="font-size:12px; color:#6b7280;"><%= displayName || username || '' %></span>
+        <a class="back-link" href="/">← ポータルへ戻る</a>
+      </div>
+    </div>
+    <div class="meta-bar">
+      <span>精度: <span class="pbadge flash">速報</span>=NE受注(当日含む) <span class="pbadge auto">自動(日次)</span>=完了ベースfact(毎朝更新) <span class="pbadge act">実額(API)</span>=ポイント原資(付与pt+プレミアム負担) <span class="pbadge est">推定13%</span>=成約手数料 / 金額はすべて<b>税込</b></span>
+      <span id="meta-updated"></span>
+    </div>
+
+    <div class="tabs" id="tabs">
+      <button class="tab-btn active" data-tab="overview">🏠 概要</button>
+      <button class="tab-btn" data-tab="bestsellers">🏆 売れ筋</button>
+      <button class="tab-btn" data-tab="profit">💰 利益分析</button>
+      <button class="tab-btn" data-tab="ads">📣 広告</button>
+      <button class="tab-btn" data-tab="device">📱 デバイス・決済</button>
+      <button class="tab-btn" data-tab="campaign">🎪 キャンペーン</button>
+      <button class="tab-btn" data-tab="diagnosis">🔍 診断</button>
+      <button class="tab-btn" data-tab="import">📥 取込</button>
+      <button class="tab-btn" data-tab="settings">⚙️ 設定</button>
+    </div>
+
+    <div class="tab-content">
+      <!-- 🏠 概要 -->
+      <div class="tab-pane active" id="pane-overview">
+        <div id="ov-unresolved"></div>
+        <div id="ov-tiles" class="tile-grid"><div class="loading">読み込み中…</div></div>
+        <div class="toolbar">
+          <div class="period-switcher" id="ov-period"></div>
+          <span class="note" id="ov-freshness"></span>
+        </div>
+        <div class="charts-grid">
+          <div class="chart-card" style="grid-column: 1 / -1;">
+            <h3>売上 × 粗利(L1) × ポイント後利益(L2) <span class="pbadge auto">自動(日次)</span>
+              <span class="note">L1 = 売上 − 原価 − 手数料<span class="pbadge est">推定13%</span> − 送料 − クーポン / L2 = L1 − ポイント原資<span class="pbadge act">実額(API)</span>。日次表示では<b style="color:#eb5505;">三太郎の日 (3・13・23日)</b> をオレンジでハイライト</span>
+            </h3>
+            <div class="chart-wrap tall"><canvas id="chart-trend"></canvas></div>
+          </div>
+          <div class="chart-card">
+            <h3>販売数 × 客単価 <span class="pbadge auto">自動(日次)</span></h3>
+            <div class="chart-wrap"><canvas id="chart-units"></canvas></div>
+          </div>
+          <div class="chart-card">
+            <h3>送料 × クーポン × ポイント原資の推移 <span class="note">送料負担率 (全店~17%) が au PAY 最重要の監視指標</span></h3>
+            <div class="chart-wrap"><canvas id="chart-deductions"></canvas></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 🏆 売れ筋 (P2) -->
+      <div class="tab-pane" id="pane-bestsellers">
+        <div class="warn-note">準備中 (P2 — 次のPRで実装)。実装予定: 売れ筋ランキング (数量/売上/粗利の3軸) / 急上昇・急落 / ABC分析 / カテゴリ別 / 曜日×日付パターン (三太郎の日効果の定量表示) / 販売速度スパークライン。</div>
+      </div>
+
+      <!-- 💰 利益分析 (P2) -->
+      <div class="tab-pane" id="pane-profit">
+        <div class="warn-note">準備中 (P2 — 次のPRで実装)。実装予定: 利益ウォーターフォール (原価→手数料→送料→クーポン→L1→付与pt→L2) / SKU別利益テーブル (variant粒度・cost_status付き・<b>送料負担率&gt;30%の送料負けSKU色分け</b>) / SKU未解決の解消導線 (f_aupay_sku_map 登録)。</div>
+      </div>
+
+      <!-- 📣 広告 (将来枠 F-14) -->
+      <div class="tab-pane" id="pane-ads">
+        <div class="warn-note">準備中 (将来枠 F-14)。プラチナマッチ広告は<b>現在未出稿</b>のため保留中 (要件 §13-②)。出稿を開始したら: Wow!manager の広告レポートCSV (日別×商品別 imp/クリック/CTR/CPC/広告経由売上/ROAS/広告費) を📥取込タブから月1回アップロード → SKU別の実ACOS / 損益分岐広告費率 (🟢余裕/🟡限界/🔴広告赤字) / 広告費×売上4象限 を有効化します。設計は要件定義書 F-7 に確定済み。</div>
+      </div>
+
+      <!-- 📱 デバイス・決済 (P3) -->
+      <div class="tab-pane" id="pane-device">
+        <div class="warn-note">準備中 (P3)。実装予定: デバイス別 (SPアプリ/Web/PC) × 決済手段別 (auかんたん決済/ポイント全額/クレカ) の売上・構成比推移 / SKU×デバイスのクロス分析。<br>データは miniPC の f_aupay_sku_device_daily / f_aupay_sku_settlement_daily の mirror 同期追加 (承認済み §13-③) で入ります。SKU別のデバイス×決済データが受注APIで取れるのは4モール中 au PAY だけです。</div>
+      </div>
+
+      <!-- 🎪 キャンペーン (P5) -->
+      <div class="tab-pane" id="pane-campaign">
+        <div class="warn-note">準備中 (P5)。実装予定: キャンペーン損益カレンダー (三太郎の日=毎月3・13・23日は自動 / BIG SALE・お買い物ラリー・PontaパスポイントUPセレクト等は設定タブで登録) / 開催日別の売上×付与ポイント実額×L2利益のベースライン比較 =「セールで売れても儲かったのか」判定 / ポイント増量参加の損益シミュレーション。</div>
+      </div>
+
+      <!-- 🔍 診断 (P5) -->
+      <div class="tab-pane" id="pane-diagnosis">
+        <div class="warn-note">準備中 (P5)。実装予定: 稼ぎ頭 / 赤字SKU / <b>送料負け (au PAY 最重要 — 全送料無料プランで送料負担~17%)</b> / 死に筋 / 価格ミス疑い / SKU未解決 / セール依存 / モール間格差 (同一NEコードの楽天・Yahoo比) の自動判定リスト。</div>
+      </div>
+
+      <!-- 📥 取込 (P4) -->
+      <div class="tab-pane" id="pane-import">
+        <div class="warn-note">準備中 (P4)。実装予定: 請求書・システム利用料明細 (成約手数料実額/ストアポイント原資/CSVオプション料) の月1回アップロード (種別自動判別・file_hash重複排除・dry-run) + データ鮮度ボード (前月分が翌月15日まで未取込ならGChat通知) + 手数料13%設定の実額較正 + 新費目検知 (広告費が現れたら広告タブ有効化の合図)。</div>
+      </div>
+
+      <!-- ⚙️ 設定 (P4) -->
+      <div class="tab-pane" id="pane-settings">
+        <div class="warn-note">準備中 (P4)。実装予定: 料率マスタ (成約手数料13%・改定日付き履歴 / CSVオプション料 / 付与ポイント既定率) / キャンペーン参加日の登録 (F-10用) / 診断閾値 / GChat通知。</div>
+      </div>
+    </div>
+  </div>
+
+<script>
+// ============================================================
+// 共通 util
+// ============================================================
+const API = '/apps/aupay-analytics/api/v1';
+const charts = {};
+function destroyChart(id) { if (charts[id]) { charts[id].destroy(); delete charts[id]; } }
+function mkChart(id, cfg) { destroyChart(id); charts[id] = new Chart(document.getElementById(id).getContext('2d'), cfg); return charts[id]; }
+
+// 金額: 経営向け日本語単位 (億/万) — feedback_japanese_currency_units
+function fmtJPY(n) {
+  if (n === null || n === undefined) return '−';
+  const neg = n < 0; const a = Math.abs(Math.round(n));
+  let s;
+  if (a >= 100000000) s = (a / 100000000).toFixed(2).replace(/\.?0+$/, '') + '億円';
+  else if (a >= 10000) s = Math.round(a / 10000).toLocaleString() + '万円';
+  else s = '¥' + a.toLocaleString();
+  return neg ? '−' + s : s;
+}
+function fmtYen(n) { if (n === null || n === undefined) return '−'; return '¥' + Math.round(n).toLocaleString(); }
+function fmtPct(n) { return (n === null || n === undefined) ? '−' : n + '%'; }
+function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+async function getJSON(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return res.json();
+}
+function signClass(n) { return n < 0 ? 'negv' : n > 0 ? 'pos' : ''; }
+
+// 期間プリセット
+const PRESETS = [
+  ['7d', '7日'], ['14d', '14日'], ['30d', '30日'], ['90d', '90日'],
+  ['this_month', '今月'], ['last_month', '先月'], ['12m', '12ヶ月'], ['this_year', '今年'],
+];
+function mountPeriodSwitcher(elId, defaultPreset, onChange) {
+  const el = document.getElementById(elId);
+  el.innerHTML = PRESETS.map(([k, label]) =>
+    `<button data-preset="${k}" class="${k === defaultPreset ? 'active' : ''}">${label}</button>`).join('');
+  el.addEventListener('click', (e) => {
+    const btn = e.target.closest('button'); if (!btn) return;
+    el.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    onChange(btn.dataset.preset);
+  });
+}
+
+// ============================================================
+// タブ制御 (lazy load)
+// ============================================================
+const loaded = {};
+document.getElementById('tabs').addEventListener('click', (e) => {
+  const btn = e.target.closest('.tab-btn'); if (!btn) return;
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('pane-' + btn.dataset.tab).classList.add('active');
+  loadTab(btn.dataset.tab);
+});
+function loadTab(tab) {
+  if (loaded[tab]) return;
+  loaded[tab] = true;
+  ({ overview: loadOverview }[tab] || (() => {}))();
+}
+
+// ============================================================
+// 🏠 概要
+// ============================================================
+let ovPreset = '30d';
+async function loadOverview() {
+  try {
+    const data = await getJSON(API + '/overview');
+    const santaroTxt = data.santaro && data.santaro.lift_ratio !== null
+      ? ` / 三太郎の日効果 (直近90日・日次売上中央値比): ×${data.santaro.lift_ratio}` : '';
+    document.getElementById('meta-updated').textContent =
+      `完了ベース最終日: ${data.data_to || '−'} / 速報最終日: ${data.flash_data_to || '−'}${santaroTxt}`;
+    document.getElementById('ov-freshness').textContent =
+      'factは毎朝07:00更新 (注文ステータス「完了」のみ計上 = 出荷完了までのラグあり)。今日/昨日の売上は速報 (NE受注) 行を見てください。';
+    if (data.unresolved && data.unresolved.sku_count > 0) {
+      document.getElementById('ov-unresolved').innerHTML =
+        `<div class="warn-note">⚠️ SKU未解決: 今月 <b>${data.unresolved.sku_count}</b> SKU / 売上 ${fmtJPY(data.unresolved.sales_incl)} (${fmtPct(data.unresolved.share_pct)}) が商品マスタに紐づいていません (原価0円計上のため粗利が過大に出ます)。P2で f_aupay_sku_map 登録導線を実装予定。</div>`;
+    }
+    const tiles = data.tiles.map(t => {
+      // 手数料率が未設定 (calc_method='unknown') のまま 0 円合算された売上がある期間は L1/L2 過大の警告
+      const feeWarn = t.fee_unknown_pct > 0
+        ? ` <span class="pbadge est" title="手数料率が未設定の売上が${t.fee_unknown_pct}%あり、その分のL1/L2は過大です">⚠未設定${fmtPct(t.fee_unknown_pct)}</span>` : '';
+      return `<div class="tile">
+        <h3>${t.label} <span class="note">(${t.from}${t.from !== t.to ? '〜' + t.to : ''})</span></h3>
+        <div class="row"><span>売上 <span class="pbadge flash">速報</span></span><span class="v">${fmtJPY(t.flash_sales_incl)}</span></div>
+        <div class="row"><span>売上 <span class="pbadge auto">完了ベース</span></span><span class="v">${fmtJPY(t.sales_incl)}</span></div>
+        <div class="row"><span>販売数 (速報 / 完了)</span><span class="v">${t.flash_units.toLocaleString()} / ${t.units_net.toLocaleString()}</span></div>
+        <div class="row"><span>原価 <span class="note">ｶﾊﾞｰ${fmtPct(t.cost_coverage_pct)}</span></span><span class="v">−${fmtYen(t.cogs)}</span></div>
+        <div class="row"><span>手数料 <span class="pbadge est">推定13%</span>${feeWarn} / クーポン</span><span class="v">−${fmtYen(t.mall_fee_est)} / −${fmtYen(t.coupon_shop)}</span></div>
+        <div class="row"><span>送料 <span class="note">負担率${fmtPct(t.shipping_pct)}</span></span><span class="v">−${fmtYen(t.shipping)}</span></div>
+        <div class="row hero"><span>粗利 L1 <span class="note">${fmtPct(t.margin_pct)}</span></span><span class="v ${signClass(t.variable_margin)}">${fmtJPY(t.variable_margin)}</span></div>
+        <div class="row"><span>ポイント原資 <span class="pbadge act">実額(API)</span></span><span class="v">−${fmtYen(t.point_cost)}</span></div>
+        <div class="row hero"><span>ポイント後利益 L2 <span class="note">${fmtPct(t.l2_pct)}</span></span><span class="v ${signClass(t.l2_margin)}">${fmtJPY(t.l2_margin)}</span></div>
+      </div>`;
+    }).join('');
+    document.getElementById('ov-tiles').innerHTML = tiles;
+  } catch (e) {
+    document.getElementById('ov-tiles').innerHTML = `<div class="warn-note">概要の取得に失敗: ${esc(e.message)}</div>`;
+  }
+  mountPeriodSwitcher('ov-period', ovPreset, (p) => { ovPreset = p; loadTrend(); });
+  loadTrend();
+}
+
+async function loadTrend() {
+  try {
+    const gran = ['12m', 'this_year'].includes(ovPreset) ? 'month' : ovPreset === '90d' ? 'week' : 'day';
+    const data = await getJSON(`${API}/trend?preset=${ovPreset}&granularity=${gran}`);
+    const labels = data.rows.map(r => r.bucket);
+    // 三太郎の日 (3・13・23日) をオレンジでハイライト (日次のみ、要件 F-2-3)
+    const barColors = data.rows.map(r => r.is_santaro ? '#fb923c' : '#fed7aa');
+
+    mkChart('chart-trend', {
+      type: 'bar',
+      data: { labels, datasets: [
+        { label: '売上(税込・完了ベース)', data: data.rows.map(r => r.sales_incl), backgroundColor: barColors, yAxisID: 'y', order: 3 },
+        { label: '粗利 L1', data: data.rows.map(r => r.variable_margin), type: 'line', borderColor: '#047857', pointRadius: 0, yAxisID: 'y', order: 1 },
+        { label: 'ポイント後利益 L2', data: data.rows.map(r => r.l2_margin), type: 'line', borderColor: '#0369a1', borderDash: [5, 3], pointRadius: 0, yAxisID: 'y', order: 1 },
+        { label: '粗利率% (L1)', data: data.rows.map(r => r.margin_pct), type: 'line', borderColor: '#f59e0b', pointRadius: 0, yAxisID: 'y1', order: 0 },
+      ]},
+      options: { responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false },
+        scales: { y: { position: 'left', ticks: { callback: v => fmtJPY(v) } }, y1: { position: 'right', grid: { drawOnChartArea: false }, ticks: { callback: v => v + '%' } } },
+        plugins: { tooltip: { callbacks: {
+          label: c => c.dataset.label + ': ' + (c.dataset.yAxisID === 'y1' ? fmtPct(c.parsed.y) : fmtJPY(c.parsed.y)),
+          footer: (items) => {
+            const r = data.rows[items[0]?.dataIndex];
+            return r && r.is_santaro ? '🎪 三太郎の日' : '';
+          },
+        } } } },
+    });
+
+    mkChart('chart-units', {
+      type: 'bar',
+      data: { labels, datasets: [
+        { label: '販売数', data: data.rows.map(r => r.units_net), backgroundColor: barColors, yAxisID: 'y' },
+        { label: '客単価', data: data.rows.map(r => r.avg_unit_price), type: 'line', borderColor: '#7c3aed', pointRadius: 0, yAxisID: 'y1' },
+      ]},
+      options: { responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false },
+        scales: { y: {}, y1: { position: 'right', grid: { drawOnChartArea: false }, ticks: { callback: v => fmtYen(v) } } },
+        plugins: { tooltip: { callbacks: { label: c => c.dataset.label + ': ' + (c.dataset.yAxisID === 'y1' ? fmtYen(c.parsed.y) : c.parsed.y.toLocaleString()) } } } },
+    });
+
+    mkChart('chart-deductions', {
+      type: 'line',
+      data: { labels, datasets: [
+        { label: '送料', data: data.rows.map(r => r.shipping), borderColor: '#dc2626', backgroundColor: 'rgba(220,38,38,0.08)', fill: true, pointRadius: 0, yAxisID: 'y' },
+        { label: 'クーポン店舗負担', data: data.rows.map(r => r.coupon_shop), borderColor: '#7c3aed', backgroundColor: 'rgba(124,58,237,0.08)', fill: true, pointRadius: 0, yAxisID: 'y' },
+        { label: 'ポイント原資', data: data.rows.map(r => r.point_cost), borderColor: '#0369a1', backgroundColor: 'rgba(3,105,161,0.08)', fill: true, pointRadius: 0, yAxisID: 'y' },
+        { label: '送料負担率%', data: data.rows.map(r => r.shipping_pct), type: 'line', borderColor: '#f59e0b', borderDash: [4, 3], pointRadius: 0, yAxisID: 'y1' },
+      ]},
+      options: { responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false },
+        scales: { y: { ticks: { callback: v => fmtJPY(v) } }, y1: { position: 'right', grid: { drawOnChartArea: false }, ticks: { callback: v => v + '%' } } },
+        plugins: { tooltip: { callbacks: { label: c => c.dataset.label + ': ' + (c.dataset.yAxisID === 'y1' ? fmtPct(c.parsed.y) : fmtJPY(c.parsed.y)) } } } },
+    });
+  } catch (e) { console.error(e); }
+}
+
+// 初期ロード
+loadTab('overview');
+</script>
+</body>
+</html>
