@@ -61,37 +61,46 @@ async function snap(page, label) {
 }
 
 /**
- * 画面上に「それらしい」入力欄が現れるまで待ち、値を入れて次へ進む汎用ヘルパー。
- * RMSのDOMは変わりうるので、複数のセレクタ候補を順に試す。
- * P0の目的は「どのセレクタが効くか」を突き止めることなので、失敗しても落とさず記録する。
+ * 入力欄が「表示される」まで待ってから値を入れる汎用ヘルパー。
+ * 楽天会員ID/PW画面 (login.account.rakuten.com) はSPAで、URLを変えずに
+ * ページ内部だけ切り替わる。load完了を待っても欄がまだ描画されていないことがあるため、
+ * セレクタが可視になるまでポーリングする (P0で判明したタイミング問題への対処)。
  */
-async function tryFill(page, selectorCandidates, value, fieldLabel) {
-  for (const sel of selectorCandidates) {
-    const el = page.locator(sel).first();
-    if (await el.count().catch(() => 0)) {
+async function tryFill(page, selectorCandidates, value, fieldLabel, timeoutMs = 20000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    for (const sel of selectorCandidates) {
+      const el = page.locator(sel).first();
       try {
-        await el.fill(value, { timeout: 5000 });
-        console.log(`  [fill] ${fieldLabel}: セレクタ "${sel}" にヒット`);
-        return sel;
+        if (await el.isVisible().catch(() => false)) {
+          await el.fill(value, { timeout: 5000 });
+          console.log(`  [fill] ${fieldLabel}: セレクタ "${sel}" にヒット`);
+          return sel;
+        }
       } catch { /* 次の候補へ */ }
     }
+    await page.waitForTimeout(500);
   }
-  console.warn(`  [warn] ${fieldLabel}: 既知セレクタ候補すべて不発。spike-output のスクショでDOMを確認して候補を追加すること`);
+  console.warn(`  [warn] ${fieldLabel}: 制限時間内に入力欄が現れず。spike-output のスクショでDOMを確認し候補を追加すること`);
   return null;
 }
 
-async function tryClick(page, selectorCandidates, btnLabel) {
-  for (const sel of selectorCandidates) {
-    const el = page.locator(sel).first();
-    if (await el.count().catch(() => 0)) {
+async function tryClick(page, selectorCandidates, btnLabel, timeoutMs = 20000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    for (const sel of selectorCandidates) {
+      const el = page.locator(sel).first();
       try {
-        await el.click({ timeout: 5000 });
-        console.log(`  [click] ${btnLabel}: セレクタ "${sel}" にヒット`);
-        return sel;
+        if (await el.isVisible().catch(() => false)) {
+          await el.click({ timeout: 5000 });
+          console.log(`  [click] ${btnLabel}: セレクタ "${sel}" にヒット`);
+          return sel;
+        }
       } catch { /* 次の候補へ */ }
     }
+    await page.waitForTimeout(500);
   }
-  console.warn(`  [warn] ${btnLabel}: 押下ボタン候補すべて不発`);
+  console.warn(`  [warn] ${btnLabel}: 制限時間内にボタンが現れず`);
   return null;
 }
 
@@ -128,36 +137,43 @@ async function main() {
     await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
     await snap(page, '1b_after_rlogin');
 
-    // --- Step 2: 楽天会員ID ---
+    // --- Step 2: 楽天会員ID (login.account.rakuten.com のSPA) ---
     console.log('[Step 2] 楽天会員ID');
-    await tryFill(page, ['input[name="username"]', 'input#loginInner_u', 'input[type="email"]', 'input[type="text"]'], RMS_MEMBER_ID, '楽天会員ID');
+    await tryFill(page, ['input[name="username"]', 'input[type="email"]', 'input[type="text"]:visible'], RMS_MEMBER_ID, '楽天会員ID');
     await snap(page, '2a_member_id_filled');
-    await tryClick(page, ['button[type="submit"]', 'text=次へ', 'input[type="submit"]'], '会員ID次へ');
-    await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
+    // このSPAは「次へ」。ログイン系ボタンの表記ゆれも一応候補に入れる
+    await tryClick(page, ['button:has-text("次へ")', 'button[type="submit"]', 'text=次へ'], '会員ID次へ');
     await snap(page, '2b_after_member_id');
 
-    // --- Step 3: 楽天会員PW ---
+    // --- Step 3: 楽天会員PW (SPAが #/sign_in/password へ内部遷移してから欄が現れる) ---
     console.log('[Step 3] 楽天会員PW');
-    await tryFill(page, ['input[name="password"]', 'input#loginInner_p', 'input[type="password"]'], RMS_MEMBER_PW, '楽天会員PW');
+    // ★P0で判明: 次へ押下直後は欄が未描画。tryFill が可視になるまで待つ (最大20秒)
+    await tryFill(page, ['input[type="password"]:visible', 'input[name="password"]'], RMS_MEMBER_PW, '楽天会員PW');
     await snap(page, '3a_member_pw_filled');
-    await tryClick(page, ['button[type="submit"]', 'text=ログイン', 'input[type="submit"]'], '会員PWログイン');
+    await tryClick(page, ['button:has-text("次へ")', 'button:has-text("ログイン")', 'button[type="submit"]'], '会員PW送信');
+    // ログイン確定後、RMS側へリダイレクトされるのを待つ
+    await page.waitForURL(/rms\.rakuten\.co\.jp/, { timeout: 30000 }).catch(() => {});
     await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
     await snap(page, '3b_after_login');
 
-    // --- 判定: RMSトップに到達したか / 追加認証が出ているか ---
+    // --- 判定: RMSに到達したか / 追加認証が出ているか ---
     console.log('\n[判定] ログイン後の状態を確認');
     const url = page.url();
     const bodyText = await page.locator('body').innerText().catch(() => '');
-    const suspicious = ['認証', 'ワンタイム', 'SMS', 'コード', 'captcha', 'CAPTCHA', '確認コード', '本人確認'];
+    const suspicious = ['ワンタイム', 'SMS', '確認コード', '本人確認', 'captcha', 'CAPTCHA', '認証コード'];
     const hits = suspicious.filter((w) => bodyText.includes(w));
+    const onRakutenLogin = /login\.account\.rakuten\.com/.test(url);
+    const onRms = /rms\.rakuten\.co\.jp/.test(url);
 
     console.log(`  最終URL: ${url}`);
-    if (hits.length) {
+    if (hits.length && onRakutenLogin) {
       console.log(`  ⚠️ 追加認証らしきキーワードを検出: ${hits.join(', ')}`);
       console.log('  → 追加認証が挟まる = 完全無人化は困難。要件定義 §7 リスク表に反映すること');
-    } else if (/rms\.rakuten\.co\.jp/.test(url) && !/glogin/.test(url)) {
-      console.log('  ✅ RMS管理画面ドメインに到達 (追加認証なしの可能性)');
-      console.log('  → 次: RPPパフォーマンスレポート画面のURL/DL動線を rakuten-rpp-download.mjs で実装');
+    } else if (onRms && !/glogin\.rms\.rakuten\.co\.jp\/?$/.test(url)) {
+      console.log('  ✅ RMSにログイン成功 (追加認証なし)。3段階ログインは自動化可能');
+      console.log('  → 次: RPPパフォーマンスレポートのDL動線を rakuten-rpp-download.mjs で実装');
+    } else if (onRakutenLogin) {
+      console.log('  ❓ まだ楽天ログイン画面に留まっている。3a/3b/4のスクショでパスワード欄・ボタンのDOMを確認');
     } else {
       console.log('  ❓ 判定不能。spike-output のスクショで最終状態を目視確認すること');
     }
