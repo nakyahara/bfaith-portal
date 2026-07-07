@@ -1004,11 +1004,21 @@ app.use('/apps/mirror/api/sync', mirrorParserErrorHandler);
 //   ・token 提示あり + MIRROR_READ_TOKEN 未設定は 503 (requireReadToken と同じ fail-closed シグナル)、
 //     不一致は 401。warehouse 権限なし session は 403、session も token も無ければ 401。
 //   ・token は header only (query 受理は URL/アクセスログ残留のため禁止。requireReadToken と同方針)。
+//   ・x-sync-key (MIRROR_SYNC_KEY) も許可: miniPC sync-to-render.js が同期後の件数検証で
+//     /api/status を読む (2026-07-07 朝、認証追加でこの読み取りが 401 → 全カウント0の
+//     誤「データ不一致」アラートが発生)。sync key 保持者は write 権限持ち = read は当然許可できる。
 function requireSessionOrReadToken(req, res, next) {
   const sessionAuthed = !!(req.session && req.session.authenticated);
   if (sessionAuthed) {
     const allowed = req.session.allowedApps;
     if (allowed === '*' || (Array.isArray(allowed) && allowed.includes('warehouse'))) return next();
+  }
+  const providedSync = req.headers['x-sync-key'];
+  if (providedSync) {
+    const syncKey = process.env.MIRROR_SYNC_KEY;
+    if (!syncKey) return res.status(503).json({ error: 'mirror_sync_key_unset' });
+    if (providedSync === syncKey) return next();
+    return res.status(401).json({ error: 'invalid_sync_key' });
   }
   const provided = req.headers['x-read-token'];
   if (provided) {
