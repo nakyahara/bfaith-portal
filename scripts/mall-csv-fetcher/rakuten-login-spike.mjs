@@ -40,11 +40,18 @@ const {
   RMS_MEMBER_ID,
   RMS_MEMBER_PW,
   HEADLESS = '0', // 既定でブラウザ表示。検証はまず目視で
+  MANUAL = '0',   // 1=手動セットアップモード(人がログイン+2FA+信頼端末登録。自動入力しない)
 } = process.env;
 
 const RMS_LOGIN_URL = 'https://glogin.rms.rakuten.co.jp/';
 
+// ★信頼できる端末(14日間2FAスキップ)のCookieを焼き付ける固定プロファイル。
+// ここにセッションが残るので、初回に人が2FA+信頼端末登録すれば以後14日間は自動ログインで2FA不要。
+const PROFILE_DIR = join(__dirname, '.profile-rakuten');
+
 function requireEnv() {
+  // 手動セットアップモードでは自動入力しないので認証情報は必須ではない
+  if (MANUAL === '1') return;
   const missing = ['RMS_RLOGIN_ID', 'RMS_RLOGIN_PW', 'RMS_MEMBER_ID', 'RMS_MEMBER_PW']
     .filter((k) => !process.env[k]);
   if (missing.length) {
@@ -104,23 +111,48 @@ async function tryClick(page, selectorCandidates, btnLabel, timeoutMs = 20000) {
   return null;
 }
 
+/**
+ * 手動セットアップモード: 固定プロファイルでブラウザを開き、人が手で
+ * ログイン → 2段階認証 → 「信頼できる端末に登録」にチェック する。
+ * これでプロファイルに信頼端末Cookieが焼かれ、以後14日間は自動ログインで2FA不要になる。
+ */
+async function runManualSetup(context) {
+  const page = context.pages()[0] || await context.newPage();
+  console.log('=== 手動セットアップモード (信頼できる端末の登録) ===');
+  console.log('手順:');
+  console.log('  1. 開いたブラウザで R-Login → 楽天会員 と手でログイン');
+  console.log('  2. 2段階認証を完了 (未登録なら先に楽天会員情報で2FAを登録)');
+  console.log('  3. 「信頼できる端末として登録する」に必ずチェックを入れる');
+  console.log('  4. RMSトップまで入れたら、このプロファイルにセッションが保存される');
+  console.log('  完了後、ブラウザを閉じるか Ctrl+C で終了。以後は MANUAL=0 で自動ログインを試す\n');
+  await page.goto(RMS_LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+  console.log('ブラウザを最大15分開いたままにします。ログインが済んだら閉じてください。');
+  await page.waitForTimeout(15 * 60 * 1000).catch(() => {});
+}
+
 async function main() {
   requireEnv();
   await mkdir(OUT_DIR, { recursive: true });
 
-  console.log('=== 楽天RMS 3段階ログイン P0スパイク ===');
-  console.log(`HEADLESS=${HEADLESS} (0=ブラウザ表示 / 1=ヘッドレス)`);
-  console.log('目的: 各段階の通過可否と追加認証(CAPTCHA/SMS/メール)の有無を確認\n');
-
-  const browser = await chromium.launch({
-    headless: HEADLESS === '1',
-    slowMo: HEADLESS === '1' ? 0 : 300, // 目視しやすいよう少し遅く
-  });
-  const context = await browser.newContext({
+  // ★固定プロファイル(launchPersistentContext)で起動。信頼端末Cookieが .profile-rakuten に永続する。
+  const context = await chromium.launchPersistentContext(PROFILE_DIR, {
+    headless: MANUAL === '1' ? false : HEADLESS === '1', // 手動モードは必ず画面表示
+    slowMo: HEADLESS === '1' ? 0 : 300,
     locale: 'ja-JP',
     viewport: { width: 1280, height: 1000 },
   });
-  const page = await context.newPage();
+
+  if (MANUAL === '1') {
+    try { await runManualSetup(context); }
+    finally { await context.close(); }
+    return;
+  }
+
+  console.log('=== 楽天RMS 自動ログイン P0スパイク (信頼端末モード) ===');
+  console.log(`HEADLESS=${HEADLESS} / プロファイル=${PROFILE_DIR}`);
+  console.log('前提: 事前に MANUAL=1 で手動ログイン+信頼端末登録を済ませていること\n');
+
+  const page = context.pages()[0] || await context.newPage();
 
   try {
     // --- Step 0: ログイン入口 ---
@@ -176,8 +208,10 @@ async function main() {
     console.log(`  最終ホスト: ${hostname}`);
     if (onRakutenLogin) {
       if (hits.length) {
-        console.log(`  ⚠️ 楽天ログイン画面で追加認証キーワードを検出: ${hits.join(', ')}`);
-        console.log('  → 追加認証が挟まる = 完全無人化は困難。要件定義 §7 リスク表に反映すること');
+        console.log(`  ⚠️ 楽天ログイン画面で2段階認証を要求: ${hits.join(', ')}`);
+        console.log('  → 信頼できる端末の登録が切れている(14日経過)か、まだ未登録。');
+        console.log('  → MANUAL=1 で手動ログインし「信頼できる端末に登録」にチェックを入れ直すこと:');
+        console.log('     $env:MANUAL=1; node scripts/mall-csv-fetcher/rakuten-login-spike.mjs');
       } else {
         console.log('  ❓ まだ楽天ログイン画面に留まっている (ボタン押下失敗の可能性)。3a/3b/4のスクショでボタンDOMを確認');
       }
@@ -186,7 +220,7 @@ async function main() {
       if (backToRLogin) {
         console.log('  ❓ R-Login画面に戻っている = セッション確立失敗。認証情報を確認');
       } else {
-        console.log('  ✅ RMSにログイン成功 (追加認証なし)。3段階ログインは自動化可能');
+        console.log('  ✅ RMSにログイン成功 (信頼端末で2FAスキップ)。自動ログイン確立');
         console.log('  → 次: RPPパフォーマンスレポートのDL動線を rakuten-rpp-download.mjs で実装');
       }
     } else {
@@ -205,7 +239,7 @@ async function main() {
       // 目視確認のため待機。ヘッドレス時は即閉じる。
       await new Promise((r) => setTimeout(r, 120000));
     }
-    await browser.close();
+    await context.close();
   }
 }
 
