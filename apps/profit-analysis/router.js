@@ -11,6 +11,7 @@
  */
 import { Router } from 'express';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
+import { jstYearMonth, addMonthsYm, lastDayOfMonthStr } from '../../lib/jst-date.js';
 import inventoryDecisionRouter from './inventory-decision.js';
 
 const router = Router();
@@ -252,17 +253,17 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
  * 前月比計算用: 指定期間の粗利を月単位で集計
  */
 function calculateMonthlyProfit(db, { months = 3, mall = null } = {}) {
-  const now = new Date();
   const results = {};
 
+  // 監査M-2: toISOString月キーはUTC基準でJST月初9時間ずれる + setMonth(-i)は月末日発火で
+  // 月スキップの古典バグがあるため、年月演算はaddMonthsYm(文字列演算)に置換
+  const currentYm = jstYearMonth();
   for (let i = 0; i < months; i++) {
-    const target = new Date(now);
-    target.setMonth(target.getMonth() - i);
-    const yearMonth = target.toISOString().slice(0, 7);
+    const yearMonth = addMonthsYm(currentYm, -i);
 
-    // その月の初日〜末日
+    // その月の初日〜末日 (旧: new Date(y,m+1,0).toISOString() はJST実行で月末日の前日に化ける)
     const firstDay = `${yearMonth}-01`;
-    const lastDay = new Date(target.getFullYear(), target.getMonth() + 1, 0).toISOString().slice(0, 10);
+    const lastDay = lastDayOfMonthStr(yearMonth);
 
     let salesSql = `
       SELECT 商品コード as listing_code, モール, チャネル,
@@ -327,9 +328,9 @@ router.get('/api/profit/trend', (req, res) => {
     const mall = req.query.mall || null;
 
     // 当月 vs 前月 の日次データから粗利を比較
-    const now = new Date();
-    const thisMonth = now.toISOString().slice(0, 7);
-    const lastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1).toISOString().slice(0, 7);
+    // 監査M-2: 旧toISOString月キーはRender(UTC)で毎月月初9時間、前月比較が1ヶ月ずれていた
+    const thisMonth = jstYearMonth();
+    const lastMonth = addMonthsYm(thisMonth, -1);
 
     const thisMonthData = calculateProfitData(db, { days: 30, mall });
     const lastMonthData = calculateProfitData(db, { days: 60, mall });

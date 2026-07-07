@@ -82,6 +82,9 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_sku ON mirror_products(商品コード)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_status ON mirror_products(取扱区分)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_type ON mirror_products(商品区分)');
+  // 監査PR-10/M-7: LOWER(TRIM(商品コード)) JOIN (INV-13正規化) 用の式index。
+  // linegift/supplier-sales 等の正規化JOINがこれで index lookup になる (full scan回避)
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_sku_norm ON mirror_products(LOWER(TRIM(商品コード)))');
   // 既存テーブルへのカラム追加（マイグレーション）
   addColumnIfMissing('mirror_products', '売上分類', 'INTEGER');
   addColumnIfMissing('mirror_products', '代表商品コード', 'TEXT');

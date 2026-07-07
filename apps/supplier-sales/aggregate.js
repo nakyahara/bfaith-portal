@@ -131,12 +131,13 @@ function loadProductMap(db) {
 // セット商品コード -> [{code, qty}]（対象仕入先の構成品を含むセットのみ）
 function loadSetMap(db, supplier) {
   const m = new Map();
+  // 監査M-7: SKU比較は両辺LOWER(TRIM)で正規化 (INV-13、Yahoo PR #94事故の再発防止)
   const rows = db.prepare(`
     SELECT セット商品コード sc, 構成商品コード cc, 数量 q
     FROM mirror_set_components
-    WHERE セット商品コード IN (
-      SELECT セット商品コード FROM mirror_set_components
-      WHERE 構成商品コード IN (SELECT 商品コード FROM mirror_products WHERE 仕入先コード = @s)
+    WHERE LOWER(TRIM(セット商品コード)) IN (
+      SELECT LOWER(TRIM(セット商品コード)) FROM mirror_set_components
+      WHERE LOWER(TRIM(構成商品コード)) IN (SELECT LOWER(TRIM(商品コード)) FROM mirror_products WHERE 仕入先コード = @s)
     )`).all({ s: supplier });
   for (const r of rows) {
     if (!m.has(r.sc)) m.set(r.sc, []);
@@ -151,9 +152,9 @@ function loadAmazonMap(db, supplier) {
   const rows = db.prepare(`
     SELECT seller_sku k, ne_code c, quantity q
     FROM mirror_sku_resolved
-    WHERE seller_sku IN (
-      SELECT seller_sku FROM mirror_sku_resolved
-      WHERE ne_code IN (SELECT 商品コード FROM mirror_products WHERE 仕入先コード = @s)
+    WHERE LOWER(TRIM(seller_sku)) IN (
+      SELECT LOWER(TRIM(seller_sku)) FROM mirror_sku_resolved
+      WHERE LOWER(TRIM(ne_code)) IN (SELECT LOWER(TRIM(商品コード)) FROM mirror_products WHERE 仕入先コード = @s)
     )`).all({ s: supplier });
   for (const r of rows) {
     if (!m.has(r.k)) m.set(r.k, []);
@@ -238,9 +239,9 @@ export function getSupplierReport(db, supplierCode, opts = {}) {
              (fba_fulfillment_jpy + fba_storage_jpy) fbaFee
       FROM mirror_amazon_finance_sku_daily
       WHERE date_jst BETWEEN @start AND @end
-        AND seller_sku IN (
-          SELECT seller_sku FROM mirror_sku_resolved
-          WHERE ne_code IN (SELECT 商品コード FROM mirror_products WHERE 仕入先コード = @s))
+        AND LOWER(TRIM(seller_sku)) IN (
+          SELECT LOWER(TRIM(seller_sku)) FROM mirror_sku_resolved
+          WHERE LOWER(TRIM(ne_code)) IN (SELECT LOWER(TRIM(商品コード)) FROM mirror_products WHERE 仕入先コード = @s))
     `).all(params);
     for (const r of amzRows) {
       const comps = amzMap.get(r.k);
@@ -256,9 +257,9 @@ export function getSupplierReport(db, supplierCode, opts = {}) {
         FROM ${c.table}
         WHERE date_jst BETWEEN @start AND @end
           AND ne_code IS NOT NULL AND trim(ne_code) <> ''
-          AND (ne_code IN (SELECT 商品コード FROM mirror_products WHERE 仕入先コード = @s)
-               OR ne_code IN (SELECT セット商品コード FROM mirror_set_components
-                              WHERE 構成商品コード IN (SELECT 商品コード FROM mirror_products WHERE 仕入先コード = @s)))
+          AND (LOWER(TRIM(ne_code)) IN (SELECT LOWER(TRIM(商品コード)) FROM mirror_products WHERE 仕入先コード = @s)
+               OR LOWER(TRIM(ne_code)) IN (SELECT LOWER(TRIM(セット商品コード)) FROM mirror_set_components
+                              WHERE LOWER(TRIM(構成商品コード)) IN (SELECT LOWER(TRIM(商品コード)) FROM mirror_products WHERE 仕入先コード = @s)))
       `).all(params);
       for (const r of rows) {
         const comps = setMap.get(r.ne) || [{ code: r.ne, qty: 1 }];
@@ -351,7 +352,7 @@ function loadSokuho(db, supplier) {
       const rows = db.prepare(`
         SELECT v.商品コード c, p.商品名 n, v.mall mall, v.qty_7d q7, v.qty_30d q30, v.as_of_date asof
         FROM mirror_f_sales_velocity_by_product_mall v
-        JOIN mirror_products p ON p.商品コード = v.商品コード
+        JOIN mirror_products p ON LOWER(TRIM(p.商品コード)) = LOWER(TRIM(v.商品コード))
         WHERE p.仕入先コード = @s
       `).all({ s: supplier });
       const byNe = new Map();
