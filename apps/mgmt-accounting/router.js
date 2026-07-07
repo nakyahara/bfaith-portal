@@ -491,7 +491,9 @@ const TAX_INCLUDED_MALLS = new Set(['rakuten', 'yahoo', 'aupay', 'qoo10', 'lineg
 // 全社規約の正本: AI_reference『EC統合データウェアハウス_設計書.md』の「全社DDL・金額規約」節。
 // ※ /1.1 一律換算による軽減税率8%商品の恒常誤差は判断済みの既知事項(監査L-5)。
 const TAX_RATE_JP = 1.1;
-const toTaxExcludedJpy = v => Math.round((v || 0) / TAX_RATE_JP);  // 税込円→税抜円(整数確定)
+// 税込円→税抜円(整数確定)。|| 0 は付けない: 呼び出し元の式と厳密同一
+// (NaN を黙って 0 に化かすと上流バグの検知が遅れる。Codex R1指摘)
+const toTaxExcludedJpy = v => Math.round(v / TAX_RATE_JP);
 
 // 売上の解決:
 //  - amazon_jp: 商品売上 + 配送料 + ギフト包装手数料（顧客請求の売上性項目、すべて税抜=税は別カラム。中原さん 2026-06-14 確定）。
