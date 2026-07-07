@@ -1751,6 +1751,96 @@ function createTables() {
       'mirror_f_sales_by_listing' AS source_fact
     FROM mirror_f_sales_by_listing`);
 
+  // ---- 粗利込みモール横断 view (2026-07-07 設計監査PR-8/③「1本SQLテスト(b)」対応)
+  // 6 finance fact のモール差分 (SKU列名5種 / Amazon数量REAL / 税込基準差 / qoo10売上3候補 /
+  // margin列名・partial/full 2段構え) をこの view 1箇所に封じ込める。
+  // 下流はこの view を使い、finance fact の手書き UNION を新規に書かないこと。
+  // 列 contract:
+  //   sku_key   = モール native キーの LOWER(TRIM()) 正規化
+  //   ne_code   = 会社共通コード (amazon は fact に無いため NULL → mirror_sku_resolved で解決)
+  //   units_net_sold = INTEGER (amazon は REAL 格納だが値は整数なので CAST)
+  //   sales_gross_jpy_incl = 税込総売上。amazon は principal+shipping+giftwrap+実収税額
+  //     (×1.10 推定ではなく settlement 実額。軽減税率誤差なし)。
+  //     qoo10 は customer_paid_jpy_incl を採用 (顧客支払額=他モールの gross と同義。
+  //     vw_qoo10_finance_for_reporting の net_settlement alias とは別定義である点に注意)
+  //   margin_jpy_for_reporting = 各モールの vw_*_finance_for_reporting と同じ優先順位
+  //     (yahoo/aupay=COALESCE(full,partial)、qoo10=confidence次第、rakuten/linegift=単一列、
+  //      amazon=profit_amount)。amazon のみ税抜 → margin_basis で区別
+  //   is_fba / fba_fees_jpy / asin_norm / sales_principal_jpy = amazon 専用 (他モール NULL)
+  db.exec('DROP VIEW IF EXISTS v_mall_finance_daily_unified');
+  db.exec(`CREATE VIEW v_mall_finance_daily_unified AS
+    SELECT
+      date_jst, 'amazon' AS mall,
+      LOWER(TRIM(seller_sku)) AS sku_key,
+      NULL AS ne_code,
+      product_name,
+      CAST(units_net_sold AS INTEGER) AS units_net_sold,
+      COALESCE(sales_principal_jpy,0) + COALESCE(sales_shipping_jpy,0)
+        + COALESCE(sales_giftwrap_jpy,0) + COALESCE(sales_tax_jpy,0) AS sales_gross_jpy_incl,
+      profit_amount AS margin_jpy_for_reporting,
+      'excl_tax' AS margin_basis,
+      NULL AS margin_confidence,
+      cost_status,
+      asin_norm,
+      COALESCE(fba_fulfillment_jpy,0) + COALESCE(fba_storage_jpy,0) AS fba_fees_jpy,
+      CASE WHEN COALESCE(fba_fulfillment_jpy,0) + COALESCE(fba_storage_jpy,0) > 0 THEN 1 ELSE 0 END AS is_fba,
+      sales_principal_jpy,
+      synced_at
+    FROM mirror_amazon_finance_sku_daily
+    UNION ALL
+    SELECT
+      date_jst, 'rakuten',
+      LOWER(TRIM(rakuten_code)), LOWER(TRIM(ne_code)), product_name,
+      units_net_sold,
+      gross_sales_jpy_incl,
+      variable_margin_jpy_incl,
+      'incl_tax', NULL, cost_status,
+      NULL, NULL, NULL, NULL, synced_at
+    FROM mirror_rakuten_finance_sku_daily
+    UNION ALL
+    SELECT
+      date_jst, 'yahoo',
+      LOWER(TRIM(yahoo_sku_key)), LOWER(TRIM(ne_code)), product_name,
+      units_net_sold,
+      gross_sales_jpy_incl,
+      COALESCE(variable_margin_full_jpy_incl, variable_margin_partial_jpy_incl),
+      'incl_tax', margin_confidence, cost_status,
+      NULL, NULL, NULL, NULL, synced_at
+    FROM mirror_yahoo_finance_sku_daily
+    UNION ALL
+    SELECT
+      date_jst, 'aupay',
+      LOWER(TRIM(aupay_sku_key)), LOWER(TRIM(ne_code)), product_name,
+      units_net_sold,
+      gross_sales_jpy_incl,
+      COALESCE(variable_margin_full_jpy_incl, variable_margin_partial_jpy_incl),
+      'incl_tax', margin_confidence, cost_status,
+      NULL, NULL, NULL, NULL, synced_at
+    FROM mirror_aupay_finance_sku_daily
+    UNION ALL
+    SELECT
+      date_jst, 'qoo10',
+      LOWER(TRIM(sku_code)), LOWER(TRIM(ne_code)), product_name,
+      units_net_sold,
+      customer_paid_jpy_incl,
+      CASE
+        WHEN margin_confidence IN ('full', 'partial_minus_returns') THEN variable_margin_full_jpy_incl
+        ELSE variable_margin_jpy_incl
+      END,
+      'incl_tax', margin_confidence, cost_status,
+      NULL, NULL, NULL, NULL, synced_at
+    FROM mirror_qoo10_finance_sku_daily
+    UNION ALL
+    SELECT
+      date_jst, 'linegift',
+      LOWER(TRIM(sku_code)), LOWER(TRIM(ne_code)), product_name,
+      units_net_sold,
+      gross_sales_jpy_incl,
+      variable_margin_jpy_incl,
+      'incl_tax', margin_confidence, cost_status,
+      NULL, NULL, NULL, NULL, synced_at
+    FROM mirror_linegift_finance_sku_daily`);
+
   db.exec('DROP VIEW IF EXISTS v_mirror_mf_anomaly_signals_latest');
   db.exec(`CREATE VIEW v_mirror_mf_anomaly_signals_latest AS
     SELECT m.*, s.status AS state_status, s.suppress_until, s.acked_by, s.acked_at
