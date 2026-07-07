@@ -547,7 +547,9 @@ function createTables() {
 
   // mirror_yahoo_finance_sku_daily — Yahoo Phase 1 Y-3b (Render 側 daily fact mirror)
   // miniPC の f_yahoo_finance_sku_daily_v1 の payload を受信
-  // PK: (date_jst, yahoo_sku_key) — yahoo_sku_key = item_id-sub_code or item_id (variant 別 or 親 SKU)
+  // PK: (date_jst, yahoo_sku_key) — yahoo_sku_key = sub_code そのもの (variant あり) or item_id (variant なし)
+  //     ※連結形式ではない (build SQL: CASE WHEN sub_code<>'' THEN sub_code ELSE item_id END)。
+  //       variant_key 列 = sub_code 全体。f_yahoo_sku_map の登録キーも yahoo_sku_key と同値
   // 設計書 v0.4: g:/共有ドライブ/AI_reference/システム設計/Yahoo!Phase1a設計書_v0.4_20260510.md
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_yahoo_finance_sku_daily (
     date_jst                          TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
@@ -611,6 +613,8 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_myfsd_ne    ON mirror_yahoo_finance_sku_daily(ne_code)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_myfsd_month ON mirror_yahoo_finance_sku_daily(substr(date_jst, 1, 7))');
   db.exec('CREATE INDEX IF NOT EXISTS idx_myfsd_run   ON mirror_yahoo_finance_sku_daily(source_run_id)');
+  // SKU 軸の全期間集計用 (yahoo-analytics 売れ筋タブの初売上 MIN 等。PK は date_jst 先頭のため別途必要)
+  db.exec('CREATE INDEX IF NOT EXISTS idx_myfsd_sku   ON mirror_yahoo_finance_sku_daily(yahoo_sku_key, date_jst)');
 
   // Phase 1c-3 用 migration framework (Codex R5 #1 反映、PRAGMA table_info 方式)
   // 現状追加列なし、Phase 1c-3 着手時にここに ALTER TABLE 追加する形

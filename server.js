@@ -40,6 +40,7 @@ import amazonDashboardRouter from './apps/amazon-dashboard/router.js';
 import rakutenAnalyticsRouter from './apps/rakuten-analytics/router.js';
 import yahooAnalyticsRouter from './apps/yahoo-analytics/router.js';
 import aupayAnalyticsRouter from './apps/aupay-analytics/router.js';
+import qoo10AnalyticsRouter from './apps/qoo10-analytics/router.js';
 import bizOpsOverviewRouter from './apps/biz-ops-overview/router.js';
 import productManagementListRouter from './apps/product-management-list/router.js';
 import execDashboardRouter from './apps/exec-dashboard/router.js';
@@ -609,6 +610,15 @@ const apps = [
     category: 'analysis',
   },
   {
+    id: 'qoo10-analytics',
+    name: 'Qoo10分析ツール',
+    description: 'Qoo10の売上・広告・利益・メガ割損益を統合管理 (タイル速報 + 手数料実額 + メガ割セラー負担 + 開催回損益)',
+    icon: '🛒',
+    path: '/apps/qoo10-analytics',
+    status: 'active',
+    category: 'analysis',
+  },
+  {
     id: 'biz-ops-overview',
     name: '業務オペ概要',
     description: '全モール売上 (前日/今月/30日) + 出荷率等の日次経営指標集約',
@@ -1004,11 +1014,21 @@ app.use('/apps/mirror/api/sync', mirrorParserErrorHandler);
 //   ・token 提示あり + MIRROR_READ_TOKEN 未設定は 503 (requireReadToken と同じ fail-closed シグナル)、
 //     不一致は 401。warehouse 権限なし session は 403、session も token も無ければ 401。
 //   ・token は header only (query 受理は URL/アクセスログ残留のため禁止。requireReadToken と同方針)。
+//   ・x-sync-key (MIRROR_SYNC_KEY) も許可: miniPC sync-to-render.js が同期後の件数検証で
+//     /api/status を読む (2026-07-07 朝、認証追加でこの読み取りが 401 → 全カウント0の
+//     誤「データ不一致」アラートが発生)。sync key 保持者は write 権限持ち = read は当然許可できる。
 function requireSessionOrReadToken(req, res, next) {
   const sessionAuthed = !!(req.session && req.session.authenticated);
   if (sessionAuthed) {
     const allowed = req.session.allowedApps;
     if (allowed === '*' || (Array.isArray(allowed) && allowed.includes('warehouse'))) return next();
+  }
+  const providedSync = req.headers['x-sync-key'];
+  if (providedSync) {
+    const syncKey = process.env.MIRROR_SYNC_KEY;
+    if (!syncKey) return res.status(503).json({ error: 'mirror_sync_key_unset' });
+    if (providedSync === syncKey) return next();
+    return res.status(401).json({ error: 'invalid_sync_key' });
   }
   const provided = req.headers['x-read-token'];
   if (provided) {
@@ -1093,8 +1113,9 @@ app.use('/apps/fba-profitability', requireAppAccess('fba-profitability'), fbaPro
 app.use('/apps/profit-analysis', requireAppAccess('profit-analysis'), profitAnalysisRouter);
 app.use('/apps/amazon-dashboard', requireAppAccess('amazon-dashboard'), express.json({ limit: '256kb' }), amazonDashboardRouter);
 app.use('/apps/rakuten-analytics', requireAppAccess('rakuten-analytics'), rakutenAnalyticsRouter);
-app.use('/apps/yahoo-analytics', requireAppAccess('yahoo-analytics'), yahooAnalyticsRouter);
+app.use('/apps/yahoo-analytics', requireAppAccess('yahoo-analytics'), express.json({ limit: '256kb' }), yahooAnalyticsRouter);
 app.use('/apps/aupay-analytics', requireAppAccess('aupay-analytics'), aupayAnalyticsRouter);
+app.use('/apps/qoo10-analytics', requireAppAccess('qoo10-analytics'), qoo10AnalyticsRouter);
 app.use('/apps/biz-ops-overview', requireAppAccess('biz-ops-overview'), bizOpsOverviewRouter);
 app.use('/apps/product-management-list', requireAppAccess('product-management-list'), productManagementListRouter);
 app.use('/apps/exec-dashboard', requireAppAccess('exec-dashboard'), express.json({ limit: '1mb' }), execDashboardRouter);

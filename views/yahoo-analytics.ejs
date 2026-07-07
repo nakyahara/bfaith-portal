@@ -58,6 +58,27 @@
     .note { font-size: 11.5px; color: #6b7280; margin: 6px 0; }
     .warn-note { background: #fffbeb; border-left: 4px solid #f59e0b; padding: 8px 12px; font-size: 12px; color: #92400e; border-radius: 4px; margin-bottom: 12px; }
     .loading { color: #6b7280; font-size: 13px; padding: 30px; text-align: center; }
+
+    /* テーブル (利益分析タブ) */
+    .toolbar input[type=text] { border: 1px solid #d1d5db; border-radius: 6px; padding: 6px 10px; font-size: 12px; }
+    table.data { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+    table.data th, table.data td { border: 1px solid #e5e7eb; padding: 5px 8px; }
+    table.data th { background: #f9fafb; font-weight: 600; color: #374151; text-align: left; white-space: nowrap; cursor: pointer; user-select: none; }
+    table.data td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    table.data td.name-cell { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    table.data tr.flag-loss td { background: #fef2f2; }
+    table.data tr.flag-unresolved td { background: #fefce8; }
+    .table-scroll { overflow-x: auto; }
+    .section-h { font-size: 14px; font-weight: 700; color: #1f2937; margin: 18px 0 8px; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+    .pill.edge { background: #fef3c7; color: #92400e; }
+    .pill.unres { background: #fee2e2; color: #991b1b; }
+    .btn { background: #e6002e; color: #fff; border: none; border-radius: 6px; padding: 6px 14px; font-size: 12px; cursor: pointer; }
+    .btn.secondary { background: #6b7280; }
+    a.sku-link { color: #1d4ed8; cursor: pointer; text-decoration: none; }
+    a.sku-link:hover { text-decoration: underline; }
+    dialog { border: 1px solid #e5e7eb; border-radius: 10px; max-width: 940px; width: 92%; padding: 18px; }
+    dialog::backdrop { background: rgba(0,0,0,0.35); }
   </style>
 </head>
 <body>
@@ -113,12 +134,50 @@
 
       <!-- 🏆 売れ筋 (P3) -->
       <div class="tab-pane" id="pane-bestsellers">
-        <div class="warn-note">準備中 (P3)。実装予定: 売れ筋ランキング (数量/売上/粗利の3軸) / 急上昇・急落 / ABC分析 / カテゴリ別 / 曜日パターン (5のつく日・日曜を自動ハイライト) / 販売速度スパークライン。</div>
+        <div class="toolbar">
+          <div class="period-switcher" id="bs-period"></div>
+          <div class="period-switcher" id="bs-axis">
+            <button data-axis="sales" class="active">売上</button>
+            <button data-axis="units">販売数</button>
+            <button data-axis="margin">粗利</button>
+          </div>
+        </div>
+        <div class="note" id="bs-abc"></div>
+        <div class="charts-grid">
+          <div class="chart-card">
+            <h3>曜日パターン (平均販売数/日) <span class="pbadge flash">速報</span> <span class="note">赤=日曜 (LYPプレミアム系)</span></h3>
+            <div class="chart-wrap" style="height:200px;"><canvas id="chart-weekday"></canvas></div>
+            <div class="note" id="bs-goen"></div>
+          </div>
+          <div class="chart-card">
+            <h3>急上昇 ↗ / 急落 ↘ (前期間比・販売数)</h3>
+            <div id="bs-movers" style="max-height:230px; overflow-y:auto; font-size:12px;"></div>
+          </div>
+        </div>
+        <div class="section-h">売れ筋ランキング <span class="pbadge flash">速報</span> <span class="note" id="bs-note"></span></div>
+        <div class="table-scroll"><table class="data" id="bs-table"></table></div>
       </div>
 
       <!-- 💰 利益分析 (P2) -->
       <div class="tab-pane" id="pane-profit">
-        <div class="warn-note">準備中 (P2 — 次のPRで実装)。実装予定: Yahoo版利益ウォーターフォール (クーポン→ポイント利用→手数料→送料→原価→広告費) / SKU別利益テーブル (variant粒度・cost_status付き) / SKU未解決の解消導線 (f_yahoo_sku_map 登録)。</div>
+        <div class="toolbar">
+          <div class="period-switcher" id="pf-period"></div>
+          <input type="text" id="pf-search" placeholder="Yahoo SKU / NEコード / 商品名 検索">
+          <button class="btn secondary" id="pf-csv">CSV出力</button>
+        </div>
+        <div class="charts-grid">
+          <div class="chart-card" style="grid-column: 1 / -1;">
+            <h3>利益ウォーターフォール <span id="pf-wf-title"></span> <span class="note" id="pf-wf-note"></span></h3>
+            <div class="chart-wrap tall"><canvas id="chart-waterfall"></canvas></div>
+          </div>
+        </div>
+        <div class="section-h">SKU別利益 <span class="pbadge flash">速報</span>+<span class="pbadge est">手数料推定10%</span> — 行色: <span style="background:#fefce8; padding:1px 6px;">黄=SKU未解決 (原価0円計上で粗利が過大)</span> / <span style="background:#fef2f2; padding:1px 6px;">赤=粗利赤字</span></div>
+        <div class="table-scroll"><table class="data" id="pf-table"></table></div>
+        <div class="toolbar" style="justify-content:center;"><button class="btn secondary" id="pf-more" style="display:none;">さらに表示</button></div>
+
+        <div class="section-h">🔍 SKU未解決一覧 (直近180日) <span class="note" id="unres-note"></span> <button class="btn secondary" id="unres-csv" style="margin-left:8px;">作業用CSV出力</button></div>
+        <div class="note">解消手順: 「Yahoo SKU」列の値がそのまま <code>f_yahoo_sku_map.yahoo_key</code> の登録キーです。NEコード候補を確認 → 作業用CSVの ne_code 記入欄を埋める → miniPC の <code>f_yahoo_sku_map</code> に登録 (Claudeに「YahooのSKU未解決を登録して」と依頼でOK)。翌朝の fact rebuild から原価が反映されます。</div>
+        <div class="table-scroll"><table class="data" id="unres-table"></table></div>
       </div>
 
       <!-- 📣 広告 (P6) -->
@@ -148,10 +207,36 @@
 
       <!-- ⚙️ 設定 (P3) -->
       <div class="tab-pane" id="pane-settings">
-        <div class="warn-note">準備中 (P3)。実装予定: 料率マスタ (PRオプション料率/ポイント原資%/決済手数料/プロモーションパッケージ料/売上ロイヤリティ — 2026年9月改定対応の改定日付き履歴) / 診断閾値 / GChat通知。</div>
+        <div class="section-h">料率マスタ (改定日付き履歴) <span class="note">実質利益の精緻化・2026年9月改定シミュレーション (将来Phase) の入力になります。未来日の改定予約も登録可</span></div>
+        <div class="table-scroll"><table class="data" id="rate-current"></table></div>
+        <div class="form-grid" style="display:flex; gap:10px; flex-wrap:wrap; align-items:end; margin:12px 0;">
+          <div><label class="note">料率種別</label><br><select id="rate-key"></select></div>
+          <div><label class="note">料率 (%)</label><br><input type="text" id="rate-pct" placeholder="例: 3" style="width:80px; border:1px solid #d1d5db; border-radius:6px; padding:6px 10px;"></div>
+          <div><label class="note">適用開始日</label><br><input type="date" id="rate-from" style="border:1px solid #d1d5db; border-radius:6px; padding:5px 10px;"></div>
+          <div style="flex:1;"><label class="note">メモ</label><br><input type="text" id="rate-memo" placeholder="例: 2026-09改定" style="width:100%; border:1px solid #d1d5db; border-radius:6px; padding:6px 10px;"></div>
+          <div><button class="btn" id="rate-add">追加</button></div>
+        </div>
+        <div class="note" id="rate-status"></div>
+        <div class="section-h">改定履歴</div>
+        <div class="table-scroll"><table class="data" id="rate-history"></table></div>
+
+        <div class="section-h">分析閾値</div>
+        <div style="display:flex; gap:14px; flex-wrap:wrap; align-items:end;" id="settings-form"></div>
+        <div style="margin-top:10px;"><button class="btn" id="settings-save">閾値を保存</button> <span class="note" id="settings-status"></span></div>
       </div>
     </div>
   </div>
+
+  <!-- SKU詳細ダイアログ -->
+  <dialog id="sku-dialog">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+      <h3 style="margin:0; font-size:15px;" id="sku-dialog-title"></h3>
+      <button class="btn secondary" onclick="document.getElementById('sku-dialog').close()">閉じる</button>
+    </div>
+    <div class="note" id="sku-dialog-meta"></div>
+    <div class="chart-wrap"><canvas id="chart-sku-daily"></canvas></div>
+    <div class="chart-wrap" style="margin-top:12px;"><canvas id="chart-sku-waterfall"></canvas></div>
+  </dialog>
 
 <script>
 // ============================================================
@@ -214,8 +299,9 @@ document.getElementById('tabs').addEventListener('click', (e) => {
 function loadTab(tab) {
   if (loaded[tab]) return;
   loaded[tab] = true;
-  ({ overview: loadOverview }[tab] || (() => {}))();
+  ({ overview: loadOverview, profit: loadProfit, bestsellers: loadBestsellers, settings: loadSettings }[tab] || (() => {}))();
 }
+function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
 
 // ============================================================
 // 🏠 概要
@@ -230,7 +316,7 @@ async function loadOverview() {
       'factは毎朝07:00更新 (出荷完了+入金済のみ計上)。「今日」タイルは翌朝の更新まで0のままです。';
     if (data.unresolved && data.unresolved.sku_count > 0) {
       document.getElementById('ov-unresolved').innerHTML =
-        `<div class="warn-note">⚠️ SKU未解決: 今月 <b>${data.unresolved.sku_count}</b> SKU / 売上 ${fmtJPY(data.unresolved.sales_incl)} (${fmtPct(data.unresolved.share_pct)}) が商品マスタに紐づいていません (原価0円計上のため粗利が過大に出ます)。P2で f_yahoo_sku_map 登録画面を実装予定。</div>`;
+        `<div class="warn-note">⚠️ SKU未解決: 今月 <b>${data.unresolved.sku_count}</b> SKU / 売上 ${fmtJPY(data.unresolved.sales_incl)} (${fmtPct(data.unresolved.share_pct)}) が商品マスタに紐づいていません (原価0円計上のため粗利が過大に出ます)。💰利益分析タブ下部の「SKU未解決一覧」から解消できます。</div>`;
     }
     const tiles = data.tiles.map(t => {
       const confirmedRows = t.confirmed !== undefined ? (t.confirmed ? `
@@ -304,6 +390,319 @@ async function loadTrend() {
         plugins: { tooltip: { callbacks: { label: c => c.dataset.label + ': ' + fmtJPY(c.parsed.y) } } } },
     });
   } catch (e) { console.error(e); }
+}
+
+// ============================================================
+// 💰 利益分析 (P2)
+// ============================================================
+let pfPreset = 'last_month', pfSort = 'variable_margin', pfDir = 'desc', pfQ = '', pfOffset = 0;
+
+async function loadProfit() {
+  mountPeriodSwitcher('pf-period', pfPreset, (p) => { pfPreset = p; pfOffset = 0; fetchWaterfall(); fetchSkuTable(true); });
+  document.getElementById('pf-search').addEventListener('input', debounce(() => {
+    pfQ = document.getElementById('pf-search').value; pfOffset = 0; fetchSkuTable(true);
+  }, 400));
+  document.getElementById('pf-csv').addEventListener('click', () => {
+    window.location.href = `${API}/sku-profit.csv?preset=${pfPreset}&sort=${pfSort}&dir=${pfDir}&q=${encodeURIComponent(pfQ)}`;
+  });
+  document.getElementById('pf-more').addEventListener('click', () => { pfOffset += 100; fetchSkuTable(false); });
+  document.getElementById('unres-csv').addEventListener('click', () => {
+    window.location.href = `${API}/unresolved.csv?days=180`;
+  });
+  fetchWaterfall(); fetchSkuTable(true); fetchUnresolved();
+}
+
+const WF_COLORS = { total: '#e6002e', subtotal: '#0f766e', cost: '#94a3b8', income: '#10b981' };
+function renderWaterfall(canvasId, wf) {
+  // floating bar でウォーターフォール: 各 step の [開始, 終了] を累積計算
+  let cum = 0;
+  const bars = [], colors = [], labels = [];
+  for (const s of wf.steps) {
+    labels.push(s.label + (s.precision === 'est' ? ' (推定)' : s.precision === 'settled' ? ' (確定)' : ''));
+    if (s.kind === 'total' || s.kind === 'subtotal') { bars.push([0, s.amount]); cum = s.amount; colors.push(s.kind === 'total' ? WF_COLORS.total : WF_COLORS.subtotal); }
+    else if (s.kind === 'income') { bars.push([cum, cum + s.amount]); cum += s.amount; colors.push(WF_COLORS.income); }
+    else { bars.push([cum - s.amount, cum]); cum -= s.amount; colors.push(WF_COLORS.cost); }
+  }
+  mkChart(canvasId, {
+    type: 'bar',
+    data: { labels, datasets: [{ data: bars, backgroundColor: colors, borderSkipped: false }] },
+    options: { indexAxis: 'y', responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: { callbacks: {
+        label: (c) => {
+          const s = wf.steps[c.dataIndex];
+          return `${s.label}: ${fmtJPY(s.kind === 'cost' ? -s.amount : s.amount)}`;
+        } } } },
+      scales: { x: { ticks: { callback: v => fmtJPY(v) } } } },
+  });
+}
+
+async function fetchWaterfall() {
+  try {
+    const wf = await getJSON(`${API}/waterfall?preset=${pfPreset}`);
+    document.getElementById('pf-wf-title').textContent = `(${wf.from}〜${wf.to} 全体)`;
+    document.getElementById('pf-wf-note').textContent = wf.confirmed_applied
+      ? '請求明細取込済みの完全月のため、確定寄せ (PF手数料・広告費の実額) まで表示しています'
+      : '確定寄せ (実質利益) は「先月」など請求明細取込済みの完全月を選ぶと表示されます';
+    renderWaterfall('chart-waterfall', wf);
+  } catch (e) { console.error(e); }
+}
+
+async function fetchSkuTable(reset) {
+  try {
+    const data = await getJSON(`${API}/sku-profit?preset=${pfPreset}&sort=${pfSort}&dir=${pfDir}&q=${encodeURIComponent(pfQ)}&limit=100&offset=${pfOffset}`);
+    const cols = [
+      ['yahoo_sku_key', 'Yahoo SKU'], ['ne_code', 'NEコード'], ['product_name', '商品名'],
+      ['units_net', '販売数'], ['sales_incl', '売上(税込)'], ['coupon_shop', 'クーポン'], ['use_point', 'ポイント'],
+      ['mall_fee_est', '手数料(推)'], ['shipping', '送料'], ['cogs', '原価'],
+      ['variable_margin', '粗利'], ['margin_pct', '粗利率'], ['cost_status', '原価状態'],
+    ];
+    const thead = `<thead><tr>${cols.map(([k, label]) =>
+      `<th data-sort="${k}">${label}${pfSort === k ? (pfDir === 'desc' ? ' ▼' : ' ▲') : ''}</th>`).join('')}</tr></thead>`;
+    const rowsHtml = data.rows.map(r => `<tr class="flag-${r.flag}">
+      <td><a class="sku-link" data-sku="${esc(r.yahoo_sku_key)}" data-preset="${pfPreset}">${esc(r.yahoo_sku_key)}</a></td>
+      <td>${r.ne_code ? esc(r.ne_code) : '<span class="pill unres">未解決</span>'}</td>
+      <td class="name-cell" title="${esc(r.product_name)}">${esc(r.product_name)}</td>
+      <td class="num">${r.units_net.toLocaleString()}</td>
+      <td class="num">${fmtYen(r.sales_incl)}</td>
+      <td class="num">${fmtYen(r.coupon_shop)}</td>
+      <td class="num">${fmtYen(r.use_point)}</td>
+      <td class="num">${fmtYen(r.mall_fee_est)}</td>
+      <td class="num">${fmtYen(r.shipping)}</td>
+      <td class="num">${fmtYen(r.cogs)}</td>
+      <td class="num ${signClass(r.variable_margin)}"><b>${fmtYen(r.variable_margin)}</b></td>
+      <td class="num">${fmtPct(r.margin_pct)}</td>
+      <td>${r.cost_status === 'complete' ? '✓' : '<span class="pill edge">' + esc(r.cost_status) + '</span>'}</td>
+    </tr>`).join('');
+    const table = document.getElementById('pf-table');
+    if (reset) table.innerHTML = thead + `<tbody>${rowsHtml}</tbody>`;
+    else table.querySelector('tbody').insertAdjacentHTML('beforeend', rowsHtml);
+    document.getElementById('pf-more').style.display = (pfOffset + 100 < data.total) ? '' : 'none';
+    table.querySelector('thead').onclick = (e) => {
+      const th = e.target.closest('th[data-sort]'); if (!th) return;
+      const k = th.dataset.sort;
+      if (pfSort === k) pfDir = pfDir === 'desc' ? 'asc' : 'desc'; else { pfSort = k; pfDir = 'desc'; }
+      pfOffset = 0; fetchSkuTable(true);
+    };
+  } catch (e) {
+    document.getElementById('pf-table').innerHTML = `<tr><td class="warn-note">取得失敗: ${esc(e.message)}</td></tr>`;
+  }
+}
+
+async function fetchUnresolved() {
+  try {
+    const data = await getJSON(`${API}/unresolved?days=180`);
+    document.getElementById('unres-note').textContent = `${data.total} SKU (売上順、最大500件)`;
+    if (!data.total) {
+      document.getElementById('unres-table').innerHTML = '<tr><td>未解決SKUはありません 🎉</td></tr>';
+      return;
+    }
+    const head = '<thead><tr><th>Yahoo SKU (=登録キー)</th><th>種別</th><th>商品名</th><th>最終販売日</th><th>販売数</th><th>売上(税込)</th><th>NEコード候補 (前方一致)</th></tr></thead>';
+    const rows = data.rows.map(r => `<tr>
+      <td>${esc(r.yahoo_sku_key)}</td>
+      <td>${r.variant_key ? 'sub_code' : 'item_id'}</td>
+      <td class="name-cell" title="${esc(r.product_name)}">${esc(r.product_name)}</td>
+      <td>${esc(r.last_seen)}</td>
+      <td class="num">${r.units_net.toLocaleString()}</td>
+      <td class="num">${fmtYen(r.sales_incl)}</td>
+      <td>${r.candidates.length ? r.candidates.map(c => `<span title="${esc(c.product_name || '')}">${esc(c.ne_code)}</span>`).join(' / ') : '<span class="note">候補なし</span>'}</td>
+    </tr>`).join('');
+    document.getElementById('unres-table').innerHTML = head + `<tbody>${rows}</tbody>`;
+  } catch (e) {
+    document.getElementById('unres-table').innerHTML = `<tr><td class="warn-note">取得失敗: ${esc(e.message)}</td></tr>`;
+  }
+}
+
+// SKU リンクは data 属性 + 委譲 listener (onclick 属性への文字列埋め込みは XSS になるため禁止)
+document.addEventListener('click', (e) => {
+  const a = e.target.closest('a.sku-link[data-sku]');
+  if (!a) return;
+  e.preventDefault();
+  openSkuDialog(a.dataset.sku, a.dataset.preset);
+});
+
+async function openSkuDialog(sku, preset) {
+  const dlg = document.getElementById('sku-dialog');
+  document.getElementById('sku-dialog-title').textContent = `SKU: ${sku}`;
+  document.getElementById('sku-dialog-meta').textContent = '読み込み中…';
+  dlg.showModal();
+  try {
+    const [detail, wf] = await Promise.all([
+      getJSON(`${API}/sku-detail?preset=${preset}&sku=${encodeURIComponent(sku)}`),
+      getJSON(`${API}/waterfall?preset=${preset}&sku=${encodeURIComponent(sku)}`),
+    ]);
+    const m = detail.master, l = detail.latest;
+    document.getElementById('sku-dialog-meta').textContent = [
+      l?.ne_code ? `NEコード: ${l.ne_code}` : '⚠️ SKU未解決 (原価0円計上)',
+      l?.product_name ? `商品名: ${l.product_name}` : '',
+      m ? `マスタ原価: ¥${Math.round(m.unit_cost || 0).toLocaleString()} / 標準売価: ¥${Math.round(m.list_price || 0).toLocaleString()}` : '',
+      `期間: ${detail.from}〜${detail.to}`,
+    ].filter(Boolean).join('  |  ');
+    mkChart('chart-sku-daily', {
+      type: 'bar',
+      data: { labels: detail.daily.map(d => d.date_jst), datasets: [
+        { label: '売上(税込)', data: detail.daily.map(d => d.sales_incl), backgroundColor: '#fecdd3', yAxisID: 'y', order: 2 },
+        { label: '粗利', data: detail.daily.map(d => d.variable_margin), type: 'line', borderColor: '#047857', pointRadius: 0, yAxisID: 'y', order: 1 },
+        { label: '販売数', data: detail.daily.map(d => d.units_net), type: 'line', borderColor: '#2563eb', pointRadius: 0, yAxisID: 'y1', order: 0 },
+      ]},
+      options: { responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false },
+        scales: { y: { ticks: { callback: v => fmtJPY(v) } }, y1: { position: 'right', grid: { drawOnChartArea: false } } } },
+    });
+    renderWaterfall('chart-sku-waterfall', wf);
+  } catch (e) {
+    document.getElementById('sku-dialog-meta').textContent = '取得失敗: ' + e.message;
+  }
+}
+
+// ============================================================
+// 🏆 売れ筋 (P3)
+// ============================================================
+let bsPreset = '30d', bsAxis = 'sales';
+async function loadBestsellers() {
+  mountPeriodSwitcher('bs-period', bsPreset, (p) => { bsPreset = p; fetchBestsellers(); });
+  document.getElementById('bs-axis').addEventListener('click', (e) => {
+    const btn = e.target.closest('button'); if (!btn) return;
+    document.querySelectorAll('#bs-axis button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    bsAxis = btn.dataset.axis;
+    fetchBestsellers();
+  });
+  fetchBestsellers();
+}
+function sparkSvg(points) {
+  if (!points || points.length < 2) return '';
+  const max = Math.max(...points.map(p => p.u), 1);
+  const w = 80, h = 22;
+  const step = w / (points.length - 1);
+  const d = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${(i * step).toFixed(1)},${(h - p.u / max * (h - 2) - 1).toFixed(1)}`).join('');
+  return `<svg width="${w}" height="${h}" style="vertical-align:middle;"><path d="${d}" fill="none" stroke="#2563eb" stroke-width="1.5"/></svg>`;
+}
+async function fetchBestsellers() {
+  try {
+    const data = await getJSON(`${API}/bestsellers?preset=${bsPreset}&axis=${bsAxis}`);
+    document.getElementById('bs-note').textContent = `期間 ${data.from}〜${data.to} (前期: ${data.prev_from}〜${data.prev_to}) / 全${data.total_skus} SKU`;
+    const abc = data.abc;
+    document.getElementById('bs-abc').innerHTML =
+      `ABC分析: <span class="pill" style="background:#dbeafe;color:#1e40af;">A ${abc.count.A} SKU (${fmtJPY(abc.revenue.A)})</span> <span class="pill" style="background:#e0e7ff;color:#4338ca;">B ${abc.count.B} SKU (${fmtJPY(abc.revenue.B)})</span> <span class="pill" style="background:#f3f4f6;color:#6b7280;">C ${abc.count.C} SKU (${fmtJPY(abc.revenue.C)})</span> — A群の在庫切れが最優先リスク`;
+
+    const dows = ['日', '月', '火', '水', '木', '金', '土'];
+    mkChart('chart-weekday', {
+      type: 'bar',
+      data: { labels: data.weekday.map(r => dows[r.dow]), datasets: [{ label: '平均販売数/日', data: data.weekday.map(r => r.avg_units), backgroundColor: data.weekday.map(r => r.dow === 0 ? '#fca5a5' : '#93c5fd') }] },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false },
+        tooltip: { callbacks: { footer: (items) => { const r = data.weekday[items[0].dataIndex]; return `平均売上/日: ${fmtJPY(r.avg_sales)}`; } } } } },
+    });
+    const g = data.goen;
+    document.getElementById('bs-goen').innerHTML = g.goen_avg_sales !== null && g.normal_avg_sales !== null
+      ? `🎪 <b>5のつく日</b> (${g.goen_days}日): 平均売上 ${fmtJPY(g.goen_avg_sales)}/日 vs 通常日 ${fmtJPY(g.normal_avg_sales)}/日 → <b class="${g.lift_pct >= 0 ? 'pos' : 'negv'}">${g.lift_pct >= 0 ? '+' : ''}${g.lift_pct}%</b>`
+      : '5のつく日の比較は期間を広げると表示されます';
+
+    const mover = (r, up) => `<div style="display:flex; justify-content:space-between; padding:2px 0; border-bottom:1px dashed #eee;">
+      <span class="name-cell" style="max-width:60%;">${esc(r.yahoo_sku_key)} <span class="note">${esc((r.product_name || '').slice(0, 24))}</span></span>
+      <span class="${up ? 'pos' : 'negv'}" style="font-weight:600;">${up ? '↗' : '↘'} ${r.units_growth_pct}% (${r.prev_units}→${r.units_net})</span></div>`;
+    document.getElementById('bs-movers').innerHTML =
+      (data.risers.slice(0, 10).map(r => mover(r, true)).join('') +
+       data.fallers.slice(0, 10).map(r => mover(r, false)).join('')) || '<div class="note">対象なし</div>';
+
+    const rows = data.ranking.map((r, i) => `<tr>
+      <td class="num">${i + 1}</td>
+      <td><a class="sku-link" data-sku="${esc(r.yahoo_sku_key)}" data-preset="${bsPreset}">${esc(r.yahoo_sku_key)}</a> ${r.abc ? `<span class="pill" style="background:#f3f4f6;">${r.abc}</span>` : ''} ${r.is_new ? '<span class="pill" style="background:#fce7f3;color:#9d174d;">NEW</span>' : ''} ${r.unresolved ? '<span class="pill unres">未解決</span>' : ''}</td>
+      <td class="name-cell" title="${esc(r.product_name)}">${esc(r.product_name)}</td>
+      <td class="num">${r.units_net.toLocaleString()}</td>
+      <td class="num">${r.units_growth_pct === null ? '<span class="pill" style="background:#fce7f3;color:#9d174d;">新規</span>' : `<span class="${r.units_growth_pct >= 0 ? 'pos' : 'negv'}">${r.units_growth_pct}%</span>`}</td>
+      <td class="num">${fmtYen(r.sales_incl)}</td>
+      <td class="num ${signClass(r.variable_margin)}">${fmtYen(r.variable_margin)}</td>
+      <td class="num">${fmtPct(r.margin_pct)}</td>
+      <td>${sparkSvg(r.spark)}</td>
+    </tr>`).join('');
+    document.getElementById('bs-table').innerHTML = `<thead><tr>
+      <th>#</th><th>Yahoo SKU</th><th>商品名</th><th>販売数</th><th>前期比</th>
+      <th>売上(税込)</th><th>粗利</th><th>粗利率</th><th>推移</th>
+    </tr></thead><tbody>${rows}</tbody>`;
+  } catch (e) {
+    document.getElementById('bs-table').innerHTML = `<tr><td class="warn-note">取得失敗: ${esc(e.message)}</td></tr>`;
+  }
+}
+
+// ============================================================
+// ⚙️ 設定 (P3: 料率マスタ + 分析閾値)
+// ============================================================
+const SETTING_LABELS = {
+  abc_a_pct: 'ABC: A群の売上累積%上限',
+  abc_b_pct: 'ABC: B群の売上累積%上限',
+  new_product_days: '新商品バッジ: 初売上からの日数',
+  movers_min_units: '急上昇/急落の最低販売数 (ノイズ除去)',
+};
+async function loadSettings() {
+  document.getElementById('rate-add').addEventListener('click', addRateFromForm);
+  document.getElementById('settings-save').addEventListener('click', saveThresholds);
+  document.getElementById('rate-history').addEventListener('click', async (e) => {
+    const btn = e.target.closest('button[data-del]'); if (!btn) return;
+    if (!confirm('この料率行を削除しますか?')) return;
+    try {
+      const res = await fetch(`${API}/rates/${btn.dataset.del}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error((await res.json()).error || res.status);
+      renderRates(await res.json());
+    } catch (err) { document.getElementById('rate-status').textContent = '削除失敗: ' + err.message; }
+  });
+  try { renderRates(await getJSON(`${API}/rates`)); } catch (e) { document.getElementById('rate-status').textContent = '料率の取得に失敗: ' + e.message; }
+  try { renderThresholds(await getJSON(`${API}/settings`)); } catch (e) { console.error(e); }
+}
+function renderRates(data) {
+  const sel = document.getElementById('rate-key');
+  sel.innerHTML = Object.entries(data.keys).map(([k, label]) => `<option value="${k}">${esc(label)}</option>`).join('');
+  const upcomingByKey = {};
+  for (const u of data.upcoming) (upcomingByKey[u.rate_key] ||= []).push(u);
+  document.getElementById('rate-current').innerHTML = `<thead><tr><th>料率種別</th><th>現在有効</th><th>適用開始日</th><th>改定予約</th></tr></thead><tbody>` +
+    Object.entries(data.keys).map(([k, label]) => {
+      const c = data.current[k];
+      const up = (upcomingByKey[k] || []).map(u => `${u.effective_from}〜 ${u.rate_pct}%`).join(' / ');
+      return `<tr><td>${esc(label)}</td>
+        <td class="num">${c ? `<b>${c.rate_pct}%</b>` : '<span class="note">未登録</span>'}</td>
+        <td>${c ? esc(c.effective_from) : '−'}</td>
+        <td>${up ? '📅 ' + esc(up) : '−'}</td></tr>`;
+    }).join('') + '</tbody>';
+  document.getElementById('rate-history').innerHTML = `<thead><tr><th>料率種別</th><th>料率</th><th>適用開始日</th><th>メモ</th><th>登録日時</th><th></th></tr></thead><tbody>` +
+    (data.history.length ? data.history.map(r => `<tr>
+      <td>${esc(data.keys[r.rate_key] || r.rate_key)}</td>
+      <td class="num">${r.rate_pct}%</td>
+      <td>${esc(r.effective_from)}</td>
+      <td>${esc(r.memo)}</td>
+      <td class="note">${esc((r.created_at || '').slice(0, 10))}</td>
+      <td><button class="btn secondary" data-del="${r.id}" style="padding:2px 8px;">削除</button></td>
+    </tr>`).join('') : '<tr><td colspan="6" class="note">履歴なし。参考: ストアポイント原資1%必須〜/キャンペーン原資1.5%/プロモーションパッケージ3% (2026-09から2%)/売上ロイヤリティ2.5% (2026-09新設)</td></tr>') + '</tbody>';
+}
+async function addRateFromForm() {
+  const body = {
+    rate_key: document.getElementById('rate-key').value,
+    rate_pct: document.getElementById('rate-pct').value,
+    effective_from: document.getElementById('rate-from').value,
+    memo: document.getElementById('rate-memo').value,
+  };
+  const st = document.getElementById('rate-status');
+  try {
+    const res = await fetch(`${API}/rates`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || res.status);
+    renderRates(json);
+    st.textContent = '✅ 登録しました';
+    document.getElementById('rate-pct').value = ''; document.getElementById('rate-memo').value = '';
+  } catch (e) { st.textContent = '登録失敗: ' + e.message; }
+}
+function renderThresholds(s) {
+  document.getElementById('settings-form').innerHTML = Object.entries(SETTING_LABELS).map(([k, label]) =>
+    `<div><label class="note">${esc(label)}</label><br><input type="text" data-setting="${k}" value="${s[k]}" style="width:90px; border:1px solid #d1d5db; border-radius:6px; padding:6px 10px;"></div>`).join('');
+}
+async function saveThresholds() {
+  const patch = {};
+  document.querySelectorAll('[data-setting]').forEach(el => { patch[el.dataset.setting] = el.value; });
+  const st = document.getElementById('settings-status');
+  try {
+    const res = await fetch(`${API}/settings`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || res.status);
+    renderThresholds(json);
+    st.textContent = '✅ 保存しました';
+  } catch (e) { st.textContent = '保存失敗: ' + e.message; }
 }
 
 // 初期ロード
