@@ -524,7 +524,11 @@ export function getSkuProfit(from, to, opts = {}) {
       || r.product_name.toLowerCase().includes(q));
   }
 
-  const sortKey = ['gmv', 'units_net', 'platform_fee', 'fee_pct', 'cogs', 'variable_margin', 'l2', 'margin_pct', 'mega_dependency_pct', 'sku_code'].includes(opts.sort) ? opts.sort : 'l2';
+  // UI のテーブルヘッダ全列と1:1対応 (whitelist に無い列クリックで silently l2 に落ちない — Codex P3-R2 low)
+  const SORTABLE = ['sku_code', 'product_name', 'units_net', 'gmv', 'platform_fee', 'fee_pct',
+    'net_settlement', 'shipping', 'cogs', 'variable_margin', 'burden_est', 'l2',
+    'margin_pct', 'mega_dependency_pct', 'cost_status'];
+  const sortKey = SORTABLE.includes(opts.sort) ? opts.sort : 'l2';
   const dir = opts.dir === 'asc' ? 1 : -1;
   rows.sort((a, b) => {
     const av = a[sortKey], bv = b[sortKey];

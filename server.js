@@ -1095,6 +1095,15 @@ app.use('/apps/amazon-dashboard', requireAppAccess('amazon-dashboard'), express.
 app.use('/apps/rakuten-analytics', requireAppAccess('rakuten-analytics'), rakutenAnalyticsRouter);
 app.use('/apps/yahoo-analytics', requireAppAccess('yahoo-analytics'), yahooAnalyticsRouter);
 app.use('/apps/qoo10-analytics', requireAppAccess('qoo10-analytics'), express.json({ limit: '64kb' }), qoo10AnalyticsRouter);
+// qoo10-analytics の parser error を JSON で返す (画面 fetch が { error } 形式を期待するため。
+// mirrorParserErrorHandler は /apps/mirror 専用なのでここで個別に受ける)
+app.use('/apps/qoo10-analytics', (err, req, res, next) => {
+  if (err && (err.type === 'entity.too.large' || err.type === 'entity.parse.failed')) {
+    return res.status(err.type === 'entity.too.large' ? 413 : 400)
+      .json({ error: err.type === 'entity.too.large' ? 'リクエストが大きすぎます (64KB上限)' : 'JSON の解析に失敗しました' });
+  }
+  return next(err);
+});
 app.use('/apps/biz-ops-overview', requireAppAccess('biz-ops-overview'), bizOpsOverviewRouter);
 app.use('/apps/product-management-list', requireAppAccess('product-management-list'), productManagementListRouter);
 app.use('/apps/exec-dashboard', requireAppAccess('exec-dashboard'), express.json({ limit: '1mb' }), execDashboardRouter);
