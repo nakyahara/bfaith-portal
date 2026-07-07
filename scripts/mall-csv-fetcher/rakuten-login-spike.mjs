@@ -150,30 +150,45 @@ async function main() {
     // ★P0で判明: 次へ押下直後は欄が未描画。tryFill が可視になるまで待つ (最大20秒)
     await tryFill(page, ['input[type="password"]:visible', 'input[name="password"]'], RMS_MEMBER_PW, '楽天会員PW');
     await snap(page, '3a_member_pw_filled');
-    await tryClick(page, ['button:has-text("次へ")', 'button:has-text("ログイン")', 'button[type="submit"]'], '会員PW送信');
-    // ログイン確定後、RMS側へリダイレクトされるのを待つ
-    await page.waitForURL(/rms\.rakuten\.co\.jp/, { timeout: 30000 }).catch(() => {});
-    await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
+    // ★P0で判明: Step2で効いた text=次へ を先頭に (button:has-text は空振りした)
+    const clicked = await tryClick(page, ['text=次へ', 'button:has-text("次へ")', 'button[type="submit"]'], '会員PW送信', 10000);
+    if (!clicked) {
+      console.log('  [fallback] ボタン不発 → パスワード欄で Enter 送信を試行');
+      await page.locator('input[type="password"]:visible').first().press('Enter').catch(() => {});
+    }
+    // ログイン確定 = 楽天ログインSPA(login.account.rakuten.com)から離脱するのを待つ
+    await page.waitForURL((u) => u.hostname !== 'login.account.rakuten.com', { timeout: 30000 }).catch(() => {});
+    await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
     await snap(page, '3b_after_login');
 
     // --- 判定: RMSに到達したか / 追加認証が出ているか ---
     console.log('\n[判定] ログイン後の状態を確認');
     const url = page.url();
+    let hostname = '';
+    try { hostname = new URL(url).hostname; } catch { /* 解析不能 */ }
     const bodyText = await page.locator('body').innerText().catch(() => '');
     const suspicious = ['ワンタイム', 'SMS', '確認コード', '本人確認', 'captcha', 'CAPTCHA', '認証コード'];
     const hits = suspicious.filter((w) => bodyText.includes(w));
-    const onRakutenLogin = /login\.account\.rakuten\.com/.test(url);
-    const onRms = /rms\.rakuten\.co\.jp/.test(url);
+    const onRakutenLogin = hostname === 'login.account.rakuten.com'; // ★redirect_uri内のrms文字列に釣られないようホスト名で判定
+    const onRms = hostname.endsWith('rms.rakuten.co.jp');
 
     console.log(`  最終URL: ${url}`);
-    if (hits.length && onRakutenLogin) {
-      console.log(`  ⚠️ 追加認証らしきキーワードを検出: ${hits.join(', ')}`);
-      console.log('  → 追加認証が挟まる = 完全無人化は困難。要件定義 §7 リスク表に反映すること');
-    } else if (onRms && !/glogin\.rms\.rakuten\.co\.jp\/?$/.test(url)) {
-      console.log('  ✅ RMSにログイン成功 (追加認証なし)。3段階ログインは自動化可能');
-      console.log('  → 次: RPPパフォーマンスレポートのDL動線を rakuten-rpp-download.mjs で実装');
-    } else if (onRakutenLogin) {
-      console.log('  ❓ まだ楽天ログイン画面に留まっている。3a/3b/4のスクショでパスワード欄・ボタンのDOMを確認');
+    console.log(`  最終ホスト: ${hostname}`);
+    if (onRakutenLogin) {
+      if (hits.length) {
+        console.log(`  ⚠️ 楽天ログイン画面で追加認証キーワードを検出: ${hits.join(', ')}`);
+        console.log('  → 追加認証が挟まる = 完全無人化は困難。要件定義 §7 リスク表に反映すること');
+      } else {
+        console.log('  ❓ まだ楽天ログイン画面に留まっている (ボタン押下失敗の可能性)。3a/3b/4のスクショでボタンDOMを確認');
+      }
+    } else if (onRms) {
+      const backToRLogin = await page.locator('input[name="login_id"]').isVisible().catch(() => false);
+      if (backToRLogin) {
+        console.log('  ❓ R-Login画面に戻っている = セッション確立失敗。認証情報を確認');
+      } else {
+        console.log('  ✅ RMSにログイン成功 (追加認証なし)。3段階ログインは自動化可能');
+        console.log('  → 次: RPPパフォーマンスレポートのDL動線を rakuten-rpp-download.mjs で実装');
+      }
     } else {
       console.log('  ❓ 判定不能。spike-output のスクショで最終状態を目視確認すること');
     }
