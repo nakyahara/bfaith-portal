@@ -433,6 +433,35 @@ async function main() {
       console.log(`[DailySync] Amazon finance sync は build 失敗のため記録せず (build retry 後に翌 cron で sync 実行)`);
     }
 
+    // === Amazon finance 前月分 build+sync (月初の settlement 追い込み反映) ===
+    // settlement は約14日周期で確定するため、月初〜中旬は前月 economic_date の行が
+    // 新規 settlement で増え続ける。従来は当月のみ (「前月処理は将来」TODO) だったため、
+    // 月初に amazon_finance_sku_daily の sync が最大2週間止まって見えていた
+    // (2026-07-07 発覚: 6/29 を最後に 1 週間 no rows in range)。
+    // 毎月 20 日までは前月分も build+sync する (snapshot 原価は UPSERT 不変なので安全)。
+    const dayOfMonth = parseInt(businessDate.slice(8, 10), 10);
+    if (dayOfMonth <= 20) {
+      const prevMonthDate = new Date(Date.UTC(
+        parseInt(currentMonth.slice(0, 4), 10),
+        parseInt(currentMonth.slice(5, 7), 10) - 2, 1
+      ));
+      const prevMonth = `${prevMonthDate.getUTCFullYear()}-${String(prevMonthDate.getUTCMonth() + 1).padStart(2, '0')}`;
+      const prevBuildResult = runScript(
+        `scripts/amazon-finance/build-daily-fact.js --data-dir ${DATA_DIR_ARG} --month ${prevMonth}`,
+        'Amazon finance build (前月)', 600000
+      );
+      results.push({ name: 'Amazon finance build (前月)', ...prevBuildResult });
+      if (prevBuildResult.success) {
+        const prevSyncResult = runScript(
+          `apps/warehouse/sync-amazon-finance-daily.js --data-dir ${DATA_DIR_ARG} --month ${prevMonth}`,
+          'Amazon finance sync (前月)', 600000
+        );
+        results.push({ name: 'Amazon finance sync (前月)', ...prevSyncResult });
+      } else {
+        console.log(`[DailySync] Amazon finance sync (前月) は build 失敗のためスキップ`);
+      }
+    }
+
     // === Amazon Ads mirror sync (amazon-dashboard PR-A) ===
     // fact_ad_spend / fact_ad_spend_campaign を Render mirror へ sync。
     // 取得ジョブ (上の Amazon Ads (campaign)/(SKU)) は直近 30 日窓なので、
