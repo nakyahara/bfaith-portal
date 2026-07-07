@@ -485,6 +485,16 @@ function pickNum(obj, keys) {
 // amazon_jp は税が別カラムで税抜分離済み、amazon_usa は米国(消費税なし)なので対象外(中原さん 2026-06-14)。
 const TAX_INCLUDED_MALLS = new Set(['rakuten', 'yahoo', 'aupay', 'qoo10', 'linegift', 'mercari', 'dshop']);
 
+// ─── 金額・丸め規約 (設計監査 2026-07-06 PR-7/S-7) ───
+// 円は最終的に INTEGER で保存・出力する。丸め(Math.round=四捨五入)は「DB書き込み値/
+// 集計出力値を確定する直前の1回だけ」。中間計算(按分・税抜化の途中経過)では丸めない。
+// 全社規約の正本: AI_reference『EC統合データウェアハウス_設計書.md』の「全社DDL・金額規約」節。
+// ※ /1.1 一律換算による軽減税率8%商品の恒常誤差は判断済みの既知事項(監査L-5)。
+const TAX_RATE_JP = 1.1;
+// 税込円→税抜円(整数確定)。|| 0 は付けない: 呼び出し元の式と厳密同一
+// (NaN を黙って 0 に化かすと上流バグの検知が遅れる。Codex R1指摘)
+const toTaxExcludedJpy = v => Math.round(v / TAX_RATE_JP);
+
 // 売上の解決:
 //  - amazon_jp: 商品売上 + 配送料 + ギフト包装手数料（顧客請求の売上性項目、すべて税抜=税は別カラム。中原さん 2026-06-14 確定）。
 //    ネットの '合計' を使わないのは、後段で手数料/FBA運賃を再控除するため二重控除になるから。
@@ -565,7 +575,7 @@ function syncSegmentSalesForMonth(db, year_month, now) {
         const fbaFeeSigned = Object.values(allSegs).reduce((s, v) => s + (v['FBA手数料'] || 0), 0);
         const fbaFeeTaxInc = Math.abs(fbaFeeSigned);
         if (fbaFeeTaxInc > 0) {
-          const fbaFeeTaxEx = Math.round(fbaFeeTaxInc / 1.1);
+          const fbaFeeTaxEx = toTaxExcludedJpy(fbaFeeTaxInc);
           freightStmt.run(year_month, 'FBA運賃', fbaFeeTaxEx, 'shared', null, null,
             'auto from mart_amazon_monthly_summary.by_segment.FBA手数料', 'system-sync', now, now);
           fbaFreightInserted = fbaFeeTaxEx;
@@ -624,7 +634,7 @@ function syncSegmentSalesForMonth(db, year_month, now) {
                        + (segData['プロモーション割引額'] || 0)
                        + (segData['プロモーション割引の税金'] || 0)
                        + (segData['Amazonポイント費用'] || 0);
-          pfFee = Math.round(Math.abs(signed) / 1.1);
+          pfFee = toTaxExcludedJpy(Math.abs(signed));
         } else if (segData['手数料'] !== undefined || segData['FBA手数料'] !== undefined) {
           // 手数料/FBA手数料は費用(正値)として変動費に積む。返金等で符号が負で入る月でも
           // 粗利を押し上げないよう abs で正規化(Amazon JP/USA と同方針、Codex High 対応)。
