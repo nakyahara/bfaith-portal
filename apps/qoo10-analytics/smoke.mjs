@@ -41,9 +41,13 @@ const ymNow = today.slice(0, 7);
 // メガ割開催日 = i % 10 === 0 の日 (today 含む)。判定は fact の megawari_order_count > 0 由来
 const isMegaDay = (i) => i % 10 === 0;
 
+q.ensureAppTables();
 const tx = db.transaction(() => {
   db.exec(`DELETE FROM mirror_qoo10_finance_sku_daily`);
   db.exec(`DELETE FROM mirror_f_sales_by_listing WHERE mall = 'qoo10'`);
+  // アプリ専用テーブルも初期化 (前回 smoke 実行の設定・開催回が残ると検証が汚れる)
+  db.exec(`DELETE FROM qooda_settings`);
+  db.exec(`DELETE FROM qooda_mega_events`);
 
   const insFact = db.prepare(`INSERT INTO mirror_qoo10_finance_sku_daily (
     date_jst, sku_code, ne_code, resolution_method, match_tier, unresolved_sku_flag, product_name,
@@ -107,6 +111,18 @@ const tx = db.transaction(() => {
         shipping, 'estimated_rates', 750, cogs,
         settle - cogs - shipping, // 2700
         'complete', 1, 100, 1, 2);
+    }
+    if (i >= 35 && i <= 40) {
+      // squeeze (プロモ赤字転落の典型): L1 は黒字 (+100/日) だがメガ割負担推定 (400×50%=200/日) で
+      // L2 赤字。d(40)〜d(35) の連続6日間 = 開催回逆推定 (suggestions) のテストも兼ねる。
+      // タイル検証 (今日/昨日/今月unresolved) に影響しない日付帯に置く
+      const gmv = 2000, settle = 1800, paid = 1600, cogs = 1500, shipping = 200;
+      insFact.run(date, 'q-squeeze', 'NE-S', 'master_match', 'combined', 0, '負担転落品',
+        1, 1, gmv, paid, settle, gmv - settle,
+        1, 400, 0, 0, 0, 0, 400,
+        shipping, 'estimated_rates', 1500, cogs,
+        settle - cogs - shipping, // 100
+        'complete', 1, 100, 1, 1);
     }
     // 速報 (NE受注): 全日 20,000円/16個/6注文 (メガ日は +4,000/2個/1注文)
     const mega = isMegaDay(i);
@@ -186,7 +202,7 @@ check('getOverview メガ日タイル (今日 = i=0 メガ日)', () => {
   assert(t.fact.l2_ref === vmToday - 500, `L2参考 = L1 − 負担推定 (got ${t.fact.l2_ref})`);
   // メガ日: flash 24000 − paid (18500 + 4000) = 1500
   assert(t.pending_est === 24000 - (DAY_PAID + 4000), `メガ日 確定待ち目安 (got ${t.pending_est})`);
-  assert(r.seller_burden_rate === 0.5, 'seller_burden_rate 公開');
+  assert(r.burden_rates.megawari_pct === 50 && r.burden_rates.megapo_pct === 50, 'burden_rates 公開');
 });
 
 check('SKU未解決の可視化 (今月)', () => {
@@ -241,6 +257,121 @@ check('空期間 (データなし) は空/0 で返る', () => {
   assert(r.rows.length === 0, 'rows 空');
   const ov = q.getOverview();
   assert(ov.tiles.length === 4, 'overview は常に4枚');
+});
+
+// ═══ P3: 設定 / 利益分析 / 売れ筋 / 開催回マスタ ═══
+
+check('設定 保存・検証・APIキー期限', () => {
+  const s0 = q.getSettings();
+  assert(s0.burden_megawari_pct === 50 && s0.abc_a_pct === 80, 'デフォルト値');
+  assert(s0.cert_key_expires_on === null, '発行日未登録なら期限null');
+  const s1 = q.saveSettings({ burden_megawari_pct: 40, cert_key_issued_on: '2026-07-01' });
+  assert(s1.burden_megawari_pct === 40, '負担率更新');
+  assert(s1.cert_key_expires_on === '2027-07-01', `期限=発行+365日 (got ${s1.cert_key_expires_on})`);
+  assert(typeof s1.cert_key_days_left === 'number', '残日数');
+  let threw = false;
+  try { q.saveSettings({ abc_a_pct: 99 }); } catch (e) { threw = e.status === 400; }
+  assert(threw, 'abc_a >= abc_b は 400');
+  threw = false;
+  try { q.saveSettings({ cert_key_issued_on: 'bogus' }); } catch (e) { threw = e.status === 400; }
+  assert(threw, '不正日付は 400');
+  threw = false;
+  try { q.saveSettings({ burden_megawari_pct: 150 }); } catch (e) { threw = e.status === 400; }
+  assert(threw, '範囲外は 400');
+  q.saveSettings({ burden_megawari_pct: 50, cert_key_issued_on: '' }); // 以降の検証のため復元
+  assert(q.getSettings().burden_megawari_pct === 50, '復元');
+});
+
+check('getWaterfall (昨日 = 非メガ日)', () => {
+  const w = q.getWaterfall(d(1), d(1), null);
+  const step = (k) => w.steps.find(s => s.key === k);
+  assert(step('gmv').amount === DAY_GMV, `GMV (got ${step('gmv').amount})`);
+  assert(step('platform_fee').amount === DAY_FEE, '手数料実額');
+  assert(step('net_settlement').amount === DAY_SETTLE, '受取');
+  assert(step('variable_margin').amount === DAY_VM, 'L1');
+  assert(step('burden_megawari').amount === 0 && step('l2').amount === DAY_VM, '非メガ日はL2=L1');
+  // SKU 指定
+  const wa = q.getWaterfall(d(1), d(1), 'q-alpha-pi');
+  assert(wa.steps.find(s => s.key === 'gmv').amount === 10000, 'SKU絞り込み');
+});
+
+check('getSkuProfit (flag/fee_pct/検索/ソート)', () => {
+  const r = q.getSkuProfit(d(29), today, {});
+  assert(r.total === 4, `30日窓は4 SKU (got ${r.total})`);
+  const alpha = r.rows.find(x => x.sku_code === 'q-alpha-pi');
+  assert(alpha.fee_pct === 10, `alpha手数料10% (got ${alpha.fee_pct})`);
+  assert(alpha.ne_code === 'NE-A' && alpha.match_tier === 'combined', 'latest_key 分解');
+  const beta = r.rows.find(x => x.sku_code === 'q-beta');
+  assert(beta.fee_pct === 9, `beta手数料9% (got ${beta.fee_pct})`);
+  const gamma = r.rows.find(x => x.sku_code.startsWith('__UNRESOLVED__'));
+  assert(gamma.flag === 'unresolved', '未解決flag');
+  const mega = r.rows.find(x => x.sku_code === 'q-mega');
+  assert(mega.burden_est === Math.round(1000 * 3 * 0.5), `メガ負担 (got ${mega.burden_est})`);
+  assert(mega.mega_dependency_pct === 100, 'メガ日売上比100%');
+  // 検索
+  const rq = q.getSkuProfit(d(29), today, { q: 'q-alpha' });
+  assert(rq.total === 1, '検索1件');
+  // ソート (fee_pct asc → beta 先頭)
+  const rs = q.getSkuProfit(d(29), today, { sort: 'fee_pct', dir: 'asc' });
+  assert(rs.rows[0].sku_code === 'q-beta', `fee_pct asc 先頭=beta (got ${rs.rows[0].sku_code})`);
+});
+
+check('promo_squeeze flag (L1黒字→負担後赤字)', () => {
+  const r = q.getSkuProfit(d(40), d(35), {});
+  const sq = r.rows.find(x => x.sku_code === 'q-squeeze');
+  assert(sq, 'q-squeeze 行あり');
+  assert(sq.variable_margin === 600 && sq.burden_est === 1200 && sq.l2 === -600, `L1=600/負担1200/L2=-600 (got ${sq.variable_margin}/${sq.burden_est}/${sq.l2})`);
+  assert(sq.flag === 'promo_squeeze', `flag (got ${sq.flag})`);
+});
+
+check('getSkuDetail', () => {
+  const dd = q.getSkuDetail('q-mega', d(29), today);
+  assert(dd.daily.length === 3, `30日窓のメガ日3日分 (got ${dd.daily.length})`);
+  assert(dd.daily[0].is_mega === true && dd.daily[0].burden_est === 500, 'メガ日行の負担');
+  assert(dd.latest.ne_code === 'NE-M', 'latest');
+});
+
+check('getBestsellers (ABC加算前判定/リフト/新商品)', () => {
+  const b = q.getBestsellers(d(29), today, 'sales');
+  assert(b.total_skus === 4, `4 SKU (got ${b.total_skus})`);
+  // 先頭 (最大GMV=alpha 30万) は必ず A (加算前判定 — 1SKU集中でもA群が0にならない)
+  const top = b.ranking[0];
+  assert(top.sku_code === 'q-alpha-pi' && top.abc === 'A', `先頭はalpha/A (got ${top.sku_code}/${top.abc})`);
+  assert(b.abc.count.A >= 1, 'A群1以上');
+  assert(b.mega.mega_days === 3 && b.mega.normal_days === 27, `メガ日3/通常27 (got ${b.mega.mega_days}/${b.mega.normal_days})`);
+  assert(b.mega.lift_pct !== null && b.mega.lift_pct > 0, 'メガ日リフト正 (メガ日はgmv+5000)');
+  assert(b.ranking[0].spark.length > 0, 'スパークラインあり');
+  assert(b.weekday.length === 7, '曜日7行');
+  // 全SKUが全期間に売れている fixture なので growth はほぼ0%・新商品なし
+  assert(top.units_growth_pct === 0, `前期比0% (got ${top.units_growth_pct})`);
+  assert(top.is_new === false, '新商品バッジなし');
+});
+
+check('開催回マスタ CRUD + fact逆推定', () => {
+  const g0 = q.getMegaEvents();
+  assert(g0.events.length === 0, '初期は0件');
+  // d(40)〜d(35) の連続6日 run が候補に出る (q-squeeze 帯)
+  const run = g0.suggestions.find(s => s.kind === 'megawari' && s.days >= 6);
+  assert(run, `6日連続runの候補 (got ${JSON.stringify(g0.suggestions.slice(0, 3))})`);
+  assert(run.date_from === d(40) && run.date_to === d(35), `run期間 (got ${run.date_from}〜${run.date_to})`);
+  // 登録 → 候補から消える
+  const added = q.addMegaEvent({ kind: 'megawari', label: 'テスト回', date_from: d(40), date_to: d(35), participated: 1 });
+  assert(added.events.length === 1, '登録1件');
+  assert(!added.suggestions.find(s => s.kind === 'megawari' && s.date_from === d(40)), '登録済み期間は候補から消える');
+  // 重複期間は 400
+  let threw = false;
+  try { q.addMegaEvent({ kind: 'megawari', date_from: d(38), date_to: d(36) }); } catch (e) { threw = e.status === 400; }
+  assert(threw, '期間重複は 400');
+  // 別種別 (megapo) なら重複可
+  const mp = q.addMegaEvent({ kind: 'megapo', date_from: d(38), date_to: d(36) });
+  assert(mp.events.length === 2, 'megapo は登録可');
+  // 削除
+  const afterDel = q.deleteMegaEvent(added.id);
+  assert(afterDel.events.length === 1, '削除後1件');
+  threw = false;
+  try { q.deleteMegaEvent(99999); } catch (e) { threw = e.status === 400; }
+  assert(threw, '存在しないidは 400');
+  q.deleteMegaEvent(mp.id);
 });
 
 console.log(`\n=== smoke: ${pass} PASS / ${fail} FAIL ===`);
