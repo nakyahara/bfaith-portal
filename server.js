@@ -1094,7 +1094,7 @@ app.use('/apps/profit-analysis', requireAppAccess('profit-analysis'), profitAnal
 app.use('/apps/amazon-dashboard', requireAppAccess('amazon-dashboard'), express.json({ limit: '256kb' }), amazonDashboardRouter);
 app.use('/apps/rakuten-analytics', requireAppAccess('rakuten-analytics'), rakutenAnalyticsRouter);
 app.use('/apps/yahoo-analytics', requireAppAccess('yahoo-analytics'), yahooAnalyticsRouter);
-app.use('/apps/qoo10-analytics', requireAppAccess('qoo10-analytics'), qoo10AnalyticsRouter);
+app.use('/apps/qoo10-analytics', requireAppAccess('qoo10-analytics'), express.json({ limit: '64kb' }), qoo10AnalyticsRouter);
 app.use('/apps/biz-ops-overview', requireAppAccess('biz-ops-overview'), bizOpsOverviewRouter);
 app.use('/apps/product-management-list', requireAppAccess('product-management-list'), productManagementListRouter);
 app.use('/apps/exec-dashboard', requireAppAccess('exec-dashboard'), express.json({ limit: '1mb' }), execDashboardRouter);

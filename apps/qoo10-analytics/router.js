@@ -97,10 +97,11 @@ router.get('/api/v1/mega-events', api(() => getMegaEvents()));
 router.post('/api/v1/mega-events', api((req) => addMegaEvent(req.body || {})));
 router.delete('/api/v1/mega-events/:id', api((req) => deleteMegaEvent(req.params.id)));
 
-// CSV セルの安全化: 全セル quote + 式実行の危険先頭文字 (=+-@, tab, CR, LF) は ' を前置 (CSV injection 対策)
+// CSV セルの安全化: 全セル quote + 式実行の危険文字 (=+-@, tab, CR, LF) は ' を前置 (CSV injection 対策)。
+// 先頭の空白/BOM を挟んだ「 =HYPERLINK(...)」形もExcelは式解釈し得るため、空白スキップ後で判定 (Codex P3-R1 medium)
 function csvCell(v) {
   let s = v === null || v === undefined ? '' : String(v);
-  if (/^[=+\-@\t\r\n]/.test(s)) s = "'" + s;
+  if (/^[\s﻿]*[=+\-@\t\r\n]/.test(s)) s = "'" + s;
   return `"${s.replace(/"/g, '""')}"`;
 }
 
