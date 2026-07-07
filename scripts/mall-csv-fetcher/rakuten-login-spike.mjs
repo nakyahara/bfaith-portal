@@ -27,10 +27,12 @@ import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-loadEnv();
-
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const OUT_DIR = join(__dirname, 'spike-output');
+
+// .env はこのスクリプトと同じディレクトリから読む (どこから node を実行しても動くように)。
+// 既定の loadEnv() は process.cwd() を見るため、リポジトリルートから実行するとscripts配下の.envを読めない。
+loadEnv({ path: join(__dirname, '.env') });
 
 const {
   RMS_RLOGIN_ID,
