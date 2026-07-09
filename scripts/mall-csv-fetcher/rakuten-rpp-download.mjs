@@ -159,10 +159,26 @@ async function setPeriodInputs(page, startVal, endVal) {
     end: document.querySelector(`[data-autodl-date="${ei}"]`)?.value || '',
   }), [startIdx, endIdx]).catch(() => ({ start: '', end: '' }));
   const norm = (v) => v.trim().replace(/[/-]/g, '-').split('-').map((x, i) => i === 0 ? x : x.padStart(2, '0')).join('-');
-  if (norm(got.start) !== norm(startVal) || norm(got.end) !== norm(endVal)) {
+  if (norm(got.start) !== norm(startVal)) {
     throw new Error(`FORM_VERIFY: 期間が設定できていません (期待 ${startVal}〜${endVal} / 実際 ${got.start}〜${got.end})`);
   }
+  if (norm(got.end) !== norm(endVal)) {
+    // ⭐実測 (2026-07-10 05:32 本番初回): 早朝は「昨日まで」の集計境界がまだ前日に達しておらず、
+    // datepicker が終了日を選択可能上限 (例: 7/9指定→7/8) にクランプする。これはRMS側の
+    // データ境界で正常 → 「同月内・開始日以降への短縮」だけ許容して続行 (毎日再取得UPSERTで
+    // 翌朝埋まるため欠落しない)。それ以外の不一致は従来通りエラー
+    const isClampDown = got.end
+      && norm(got.end) < norm(endVal)
+      && norm(got.end) >= norm(startVal)
+      && norm(got.end).slice(0, 7) === norm(endVal).slice(0, 7);
+    if (!isClampDown) {
+      throw new Error(`FORM_VERIFY: 期間が設定できていません (期待 ${startVal}〜${endVal} / 実際 ${got.start}〜${got.end})`);
+    }
+    console.warn(`  [date] ⚠ 終了日がRMS側上限でクランプ: 指定 ${endVal} → 実際 ${got.end} (早朝は前日分未集計。この範囲で続行、残りは翌朝の再取得で埋まる)`);
+    return { endUsed: norm(got.end) };
+  }
   console.log(`  [date] 検証OK: ${got.start} 〜 ${got.end}`);
+  return { endUsed: norm(got.end) };
 }
 
 /** DLボタンの状態を調べる: 'enabled' | 'disabled' | 'missing' */
@@ -346,11 +362,13 @@ async function fetchOneReport(page, spec, range) {
     throw new Error(`FORM_VERIFY: ラジオ選択を確認できず (unit=${unitOk} period=${periodOk})。[DOM:reports-form-${spec.key}] のID実測が必要`);
   }
 
-  // 期間入力 (検証込み)。「月ごと」は月入力 YYYY-MM (実測)、「日ごと」は YYYY-MM-DD
+  // 期間入力 (検証込み)。「月ごと」は月入力 YYYY-MM (実測)、「日ごと」は YYYY-MM-DD。
+  // 終了日がRMS側上限でクランプされた場合は実際の範囲 (endUsed) を記録に使う
   if (spec.periodMode === 'month') {
     await setPeriodInputs(page, range.ym, range.ym);
   } else {
-    await setPeriodInputs(page, range.from, range.to);
+    const { endUsed } = await setPeriodInputs(page, range.from, range.to);
+    if (endUsed && endUsed !== range.to) range = { ...range, to: endUsed };
   }
   await page.waitForTimeout(1500); // ボタン活性化待ち
   await snap(page, `${spec.key}_${range.ym}_form_set`);
