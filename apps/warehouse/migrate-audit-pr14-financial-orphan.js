@@ -26,6 +26,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
+import crypto from 'node:crypto';
 import { initDB, getDB } from './db.js';
 
 const isDryRun = process.argv.includes('--dry-run');
@@ -87,7 +88,9 @@ if (plan.views.length === 0 && plan.tables.length === 0) {
   console.log('[pr14] 対象なし (すでに削除済み)。バックアップには触れず終了');
   process.exit(0);
 }
-const runStamp = new Date().toISOString().replace(/[:.]/g, '').slice(0, 15);
+// 一意ID規約 (feedback_unique_id_generation): 分精度では同一分内再実行で衝突するため ms+乱数まで含める
+const runStamp = new Date().toISOString().replace(/[:.]/g, '').replace('Z', '')
+  + '-' + crypto.randomBytes(3).toString('hex');
 fs.mkdirSync(BACKUP_DIR, { recursive: true });
 
 // ─── 1) view DDL 保存 ───
