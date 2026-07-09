@@ -68,6 +68,24 @@ async function snap(page, label) {
 }
 
 /**
+ * 画面上の入力欄・ボタンの実DOM属性をコンソールに書き出す診断ヘルパー。
+ * 楽天がページを変えてセレクタが合わなくなったとき、何を狙えばいいかを一目で分かるようにする。
+ */
+async function dumpControls(page, label) {
+  const info = await page.evaluate(() => {
+    const vis = (el) => !!(el.offsetParent || el.getClientRects().length);
+    const inputs = [...document.querySelectorAll('input')].filter(vis).map((el) => ({
+      name: el.name || '', id: el.id || '', type: el.type || '', placeholder: el.placeholder || '',
+    }));
+    const buttons = [...document.querySelectorAll('button, input[type=submit], a[role=button]')]
+      .filter(vis).map((el) => (el.innerText || el.value || '').trim()).filter(Boolean);
+    return { inputs, buttons };
+  }).catch(() => ({ inputs: [], buttons: [] }));
+  console.log(`  [DOM:${label}] 入力欄=${JSON.stringify(info.inputs)}`);
+  console.log(`  [DOM:${label}] ボタン=${JSON.stringify(info.buttons)}`);
+}
+
+/**
  * 入力欄が「表示される」まで待ってから値を入れる汎用ヘルパー。
  * 楽天会員ID/PW画面 (login.account.rakuten.com) はSPAで、URLを変えずに
  * ページ内部だけ切り替わる。load完了を待っても欄がまだ描画されていないことがあるため、
@@ -161,11 +179,21 @@ async function main() {
     await snap(page, '0_login_entry');
 
     // --- Step 1: R-Login ID / PW ---
+    // ※R-Loginには複数レイアウトがある(共通ID版=ボタン「楽天会員ログインへ」/旧版=「ログイン」)。
+    //   どのページか診断ダンプで確認しつつ、両対応のセレクタで埋める。
     console.log('[Step 1] R-Login 認証');
-    await tryFill(page, ['input[name="login_id"]', 'input#login_id', 'input[type="text"]'], RMS_RLOGIN_ID, 'R-Login ID');
-    await tryFill(page, ['input[name="passwd"]', 'input#passwd', 'input[type="password"]'], RMS_RLOGIN_PW, 'R-Login PW');
+    await dumpControls(page, 'rlogin');
+    await tryFill(page, [
+      'input[name="login_id"]', 'input#login_id',
+      'input[type="text"]:visible',
+      'input:not([type="password"]):not([type="hidden"]):not([type="checkbox"]):visible',
+    ], RMS_RLOGIN_ID, 'R-Login ID');
+    await tryFill(page, ['input[name="passwd"]', 'input#passwd', 'input[type="password"]:visible'], RMS_RLOGIN_PW, 'R-Login PW');
     await snap(page, '1a_rlogin_filled');
-    await tryClick(page, ['button[type="submit"]', 'input[type="submit"]', 'text=ログイン'], 'R-Loginログイン');
+    await tryClick(page, [
+      'text=楽天会員ログインへ', 'text=ログイン',
+      'button[type="submit"]', 'input[type="submit"]',
+    ], 'R-Loginログイン');
     await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
     await snap(page, '1b_after_rlogin');
 
