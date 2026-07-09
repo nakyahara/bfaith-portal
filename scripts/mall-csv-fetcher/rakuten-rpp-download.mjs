@@ -127,20 +127,40 @@ async function main() {
       console.log(`  [poll] 先頭行: ${row1 ? row1.text : '(行なし)'}`);
 
       if (row1 && row1.hasDownload && /完了/.test(row1.text)) {
-        try {
-          const link = page.locator('table tbody tr').first()
-            .getByRole('link', { name: 'ダウンロード', exact: true });
+        // 先頭行の「ダウンロード」アンカーをその場で特定してマーク+href/HTMLを取得
+        const info = await page.evaluate(() => {
+          const tr = document.querySelector('table tbody tr') || document.querySelectorAll('table tr')[1];
+          const a = tr && [...tr.querySelectorAll('a')].find((x) => x.textContent.trim() === 'ダウンロード');
+          if (!a) return null;
+          a.setAttribute('data-autodl', '1');
+          return { href: a.href || '', onclick: a.getAttribute('onclick') || '', html: a.outerHTML.slice(0, 180) };
+        }).catch(() => null);
+        console.log(`  [dl-anchor] ${JSON.stringify(info)}`);
+
+        // まずマークしたアンカーを普通にクリック → ダメなら href 直接遷移でダウンロード
+        const trySave = async (trigger) => {
           const [download] = await Promise.all([
-            page.waitForEvent('download', { timeout: 60000 }),
-            link.click(),
+            page.waitForEvent('download', { timeout: 90000 }),
+            trigger(),
           ]);
           const fname = download.suggestedFilename() || `rpp_all_products_${Date.now()}.zip`;
           const dest = join(DL_DIR, fname);
           await download.saveAs(dest);
-          saved = dest;
-          console.log(`  ✅ ダウンロード成功: ${dest}`);
+          return dest;
+        };
+        try {
+          saved = await trySave(() => page.locator('[data-autodl="1"]').click({ timeout: 15000 }));
+          console.log(`  ✅ ダウンロード成功(click): ${saved}`);
         } catch (e) {
-          console.log(`  [retry] DL押下失敗 (${String(e.message).split('\n')[0]})`);
+          console.log(`  [retry] clickでDL不可 (${String(e.message).split('\n')[0]})`);
+          if (info && /^https?:/.test(info.href)) {
+            try {
+              saved = await trySave(() => page.evaluate((h) => { window.location.href = h; }, info.href));
+              console.log(`  ✅ ダウンロード成功(href遷移): ${saved}`);
+            } catch (e2) {
+              console.log(`  [retry] href遷移もDL不可 (${String(e2.message).split('\n')[0]})`);
+            }
+          }
         }
       } else if (row1 && /待機中|生成中|処理中/.test(row1.text)) {
         console.log('  [wait] 生成中 (待機中)。20秒後に更新して再確認');
