@@ -222,15 +222,31 @@ export async function dumpLinks(page, label, max = 80) {
   }
 }
 
+/** リダイレクト連鎖が落ち着くまで待つ (mainmenu→gloginへの遷移中にログイン判定すると
+ *  「未ログインなのにセッション有効」と誤判定する — miniPC初回疎通 2026-07-09 で実発生) */
+async function settleRedirects(page) {
+  await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+  let prev = page.url();
+  for (let i = 0; i < 10; i++) {
+    await page.waitForTimeout(500);
+    const cur = page.url();
+    if (cur === prev) return;
+    prev = cur;
+  }
+}
+
 /** RMSにログイン済みの状態にする (メインメニュー到達)。2FA要求時は throw。 */
 export async function ensureRmsLogin(page) {
   await gotoSafe(page, MAINMENU_URL);
+  await settleRedirects(page);
   await passNotice(page);
   if (await looksLoggedIn(page)) {
     console.log(`[login] セッション有効 host=${safeHost(page.url())}`);
     return;
   }
+  console.log(`[login] セッション無効と判定 host=${safeHost(page.url())} → ログイン実行`);
   await runLogin(page); // 成功時は notice通過後 mainmenu に着地
+  await settleRedirects(page);
   await passNotice(page);
   if (await looksLoggedIn(page)) {
     console.log(`[login] メインメニュー到達 host=${safeHost(page.url())}`);
@@ -238,6 +254,7 @@ export async function ensureRmsLogin(page) {
   }
   // 予備: 改めてメインメニューを開く
   await gotoSafe(page, MAINMENU_URL);
+  await settleRedirects(page);
   await passNotice(page);
   if (!(await looksLoggedIn(page))) {
     throw new Error(`ログイン確認できず: ${page.url()}`);
