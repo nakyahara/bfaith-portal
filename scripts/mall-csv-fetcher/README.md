@@ -107,13 +107,25 @@ apps/warehouse/sync-rakuten-ads-daily.js (daily-sync 内、取込成功時のみ
 
 - **Task Scheduler は `fetch-all.mjs` を登録**。モールごとに子プロセスで実行し、失敗しても次のモールへ続行
   (将来のYahoo等は `FETCHERS` に1行追加)。1レポート内でも失敗は該当レポートの残月のみスキップし他レポートは続行。
-- **GChat通知はエラー時のみ** (env `GCHAT_WEBHOOK_MALL_FETCH`、無ければ `GCHAT_WEBHOOK`):
+- **GChat通知はエラー時のみ**。送り先は「⚠️ Warehouse日次同期」と同じスペース =
+  daily-sync と同じ `GCHAT_WEBHOOK` を .env (または Task Scheduler の .bat) に設定するだけ。
+  別スペースに分けたい場合のみ `GCHAT_WEBHOOK_MALL_FETCH` (優先) を使う。
   取得スクリプト自身が業務エラー(FORM_VERIFY/2FA/DL失敗)の詳細+AI調査ガイド
   (実行ログパス/スクショ/再現コマンド/切り分け表)を送信。ランナーは子が通知できない
   異常終了(env不備/クラッシュ/タイムアウト)のみ通知 — 二重通知しない。
 - 全console出力は `logs/<name>-<ts>.log` にも保存 (DOMダンプ含む、認証情報はマスク)。
   AI調査時はGChat通知のログパスをそのまま読めばよい。
 - 取込側(import/sync)の失敗は daily-sync 既存のGChatサマリに載る (このレーンの通知は取得側のみ)。
+
+### 運用ガードレール (fetch-all / 取込に内蔵)
+
+- **多重起動ロック**: `logs/fetch-all.lock`。実行中に再起動されてもスキップ (exit 0)。3時間超の
+  stale lock は前回クラッシュの残骸とみなして破棄続行。
+- **取得鮮度ウォッチドッグ**: daily-sync 内の取込 (import-rakuten-ads-rpp.js) が毎朝
+  `report_fetch_log` の最終記録を検分し、**48時間超なら「fetch-all停止の疑い」をGChat通知**
+  (Task Scheduler 自体が死んだ場合の無音停止を検知する独立監視)。fetch_log が空 = 移設前は警告しない。
+- **自動掃除**: fetch-all 起動時に `logs/` `downloads/` の30日超ファイルを削除 (disk full予防)。
+  incoming/ と processed/ (原本バックアップ) は触らない。
 - ⚠️ 「すべての広告×日ごと」のフォーム (ラジオID/日付欄DOM) は未実測。初回実行で
   `FORM_VERIFY:` エラーが出たらログの `[DOM:reports-form-*]` を見てセレクタを追記する
   (誤条件のデータを黙って取らないための設計)。

@@ -15,8 +15,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { config as loadEnv } from 'dotenv';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+// fetch-all 等がログインlibを経由せず単体で動いてもwebhookを拾えるよう、ここでも .env を読む (冪等)
+loadEnv({ path: join(__dirname, '.env') });
 export const LOG_DIR = join(__dirname, 'logs');
 
 const SECRET_ENV_KEYS = ['RMS_RLOGIN_ID', 'RMS_RLOGIN_PW', 'RMS_MEMBER_ID', 'RMS_MEMBER_PW'];
@@ -87,7 +90,8 @@ const jstStamp = () => new Date(Date.now() + 9 * 3600 * 1000).toISOString().slic
  */
 export function buildErrorReport({ mall, outcomes = [], failures = [], logPath = '', repro = '' }) {
   const L = [];
-  L.push(`*モールCSV取得エラー ${mall} (${jstStamp()})*`);
+  // 「⚠️ Warehouse日次同期」と同じスペース・同じ見た目の流儀 (⚠️ prefix)
+  L.push(`⚠️ *モールCSV自動取得エラー (${mall}) ${jstStamp()}*`);
   if (outcomes.length) {
     L.push(`結果: ${outcomes.map((o) => `${o.spec}:${o.ym}=${o.status}`).join(' / ')}`);
   }

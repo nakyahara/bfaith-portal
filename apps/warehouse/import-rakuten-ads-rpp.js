@@ -54,6 +54,39 @@ function moveTo(srcPath, destDir) {
   return dest;
 }
 
+// ─── 取得鮮度ウォッチドッグ: 自動DL (fetch-all) が無音で止まっていないか ───
+// Task Scheduler自体の停止・fetch-allの無音死は誰も通知できない → 独立スケジュールで走る
+// この取込 (daily-sync内) が report_fetch_log の鮮度を毎朝検分し、古ければ GChat へ直接通知。
+// テーブルが空 = fetch-all 未稼働 (移設前) とみなし警告しない。通知は fail-soft (取込の成否は変えない)
+const STALE_FETCH_HOURS = 48;
+async function warnIfFetchStale(db) {
+  let last;
+  try {
+    last = db.prepare(`SELECT MAX(fetched_at) AS m, COUNT(*) AS c FROM report_fetch_log WHERE mall = 'rakuten'`).get();
+  } catch { return; }
+  if (!last || last.c === 0 || !last.m) return; // 未稼働
+  const ageH = (Date.now() - new Date(last.m).getTime()) / 3600000;
+  if (!(ageH > STALE_FETCH_HOURS)) return;
+  const msg = [
+    `⚠️ *モールCSV自動取得が止まっている可能性 (rakuten)*`,
+    `report_fetch_log の最終記録が ${Math.round(ageH)} 時間前 (${last.m})。fetch-all が実行されていない疑い。`,
+    `確認: ①miniPCのTask Scheduler (fetch-all タスクの前回結果) ②scripts/mall-csv-fetcher/logs/ の最新ログ ③手動実行 node scripts/mall-csv-fetcher/fetch-all.mjs`,
+    `無停止手順: RMSから手動DL→incoming/rakuten-ads/ に置けば取込は継続`,
+  ].join('\n');
+  console.warn(`⚠ 自動DLの最終記録が${Math.round(ageH)}時間前 (${last.m})。fetch-all停止の疑い`);
+  const webhook = process.env.GCHAT_WEBHOOK_MALL_FETCH || process.env.GCHAT_WEBHOOK;
+  if (!webhook) { console.warn('[stale-fetch] [NOTIFY:status=skipped] GCHAT_WEBHOOK未設定'); return; }
+  try {
+    const res = await fetch(webhook, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: msg }),
+    });
+    console.log(`[stale-fetch] [NOTIFY:status=${res.ok ? 'sent' : 'failed'}]`);
+  } catch (e) {
+    console.error(`[stale-fetch] [NOTIFY:status=failed] ${e.message}`);
+  }
+}
+
 const entries = fs.readdirSync(incomingDir, { withFileTypes: true })
   .filter(e => e.isFile() && /\.(csv|zip)$/i.test(e.name))
   .map(e => e.name)
@@ -61,15 +94,18 @@ const entries = fs.readdirSync(incomingDir, { withFileTypes: true })
 
 console.log(`=== 楽天RPPレポート取込 (incoming: ${incomingDir}) ===`);
 console.log(`対象: ${entries.length} ファイル${isDryRun ? ' [DRY RUN]' : ''}`);
-if (entries.length === 0) {
-  console.log('取込対象なし (正常終了)');
-  process.exit(0);
-}
 
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
 db.pragma('busy_timeout = 5000');
 ensureRppTables(db);
+if (!isDryRun) await warnIfFetchStale(db); // 取込0件の朝こそ鮮度を検分する
+
+if (entries.length === 0) {
+  console.log('取込対象なし (正常終了)');
+  db.close();
+  process.exit(0);
+}
 
 let okCount = 0, dupCount = 0, failCount = 0;
 try {

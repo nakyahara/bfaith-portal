@@ -17,13 +17,59 @@
  *
  * exit code: 0=全モール成功 / 1=いずれか失敗 (全モール実行は完了)
  */
+import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { initRunLog, sendGChat, buildErrorReport } from './lib-notify.mjs';
+import { initRunLog, sendGChat, buildErrorReport, LOG_DIR } from './lib-notify.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, '..', '..');
+
+// ─── 多重起動ロック (Task Scheduler + 手動実行の同時起動で同一ブラウザプロファイルを
+// 2プロセスが触るとプロファイル破損/2FA誤検知の恐れ — Codex R1 Medium) ───
+const LOCK_PATH = join(LOG_DIR, 'fetch-all.lock');
+const LOCK_STALE_MS = 3 * 60 * 60 * 1000; // 全モール合計timeoutより長め。超過は前回クラッシュの残骸とみなす
+function acquireLock() {
+  fs.mkdirSync(LOG_DIR, { recursive: true });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      fs.writeFileSync(LOCK_PATH, `pid=${process.pid} at=${new Date().toISOString()}`, { flag: 'wx' });
+      return true;
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      const age = Date.now() - fs.statSync(LOCK_PATH).mtimeMs;
+      if (age < LOCK_STALE_MS) return false; // 実行中の別プロセスあり
+      console.warn(`[lock] stale lock (${Math.round(age / 60000)}分前) を破棄して続行 (前回クラッシュの残骸とみなす)`);
+      try { fs.unlinkSync(LOCK_PATH); } catch { /* 競合で消えていたら次のwxで決着 */ }
+    }
+  }
+  return false;
+}
+function releaseLock() { try { fs.unlinkSync(LOCK_PATH); } catch { /* noop */ } }
+
+// ─── 古いローカル出力の自動掃除 (logs/ と downloads/ の30日超。放置disk full事故の教訓) ───
+// incoming/ と processed/ は取込の正規経路・原本バックアップなので触らない
+function cleanupOldFiles() {
+  const KEEP_MS = 30 * 24 * 3600 * 1000;
+  const targets = [
+    { dir: LOG_DIR, pattern: /\.log$/ },
+    { dir: join(__dirname, 'downloads'), pattern: /^rpp_/ },
+  ];
+  for (const t of targets) {
+    let removed = 0;
+    try {
+      for (const name of fs.readdirSync(t.dir)) {
+        if (!t.pattern.test(name)) continue;
+        const p = join(t.dir, name);
+        try {
+          if (Date.now() - fs.statSync(p).mtimeMs > KEEP_MS) { fs.unlinkSync(p); removed++; }
+        } catch { /* 個別失敗は無視 */ }
+      }
+    } catch { continue; } // dir無しは初回など正常
+    if (removed > 0) console.log(`[cleanup] ${t.dir}: 30日超の ${removed} ファイルを削除`);
+  }
+}
 
 // ─── モール取得スクリプト一覧 (追加はここに1行) ───
 const DEFAULT_FETCHERS = [
@@ -41,6 +87,13 @@ const FETCHERS = process.env.MALL_FETCHERS_JSON
 
 async function main() {
   const runLog = initRunLog('fetch-all');
+  if (!acquireLock()) {
+    // 別プロセス実行中のスキップは異常ではない (Task Scheduler二重発火/手動実行との重複)
+    console.log('[lock] 別の fetch-all が実行中のためスキップ (logs/fetch-all.lock)');
+    process.exit(0);
+  }
+  process.on('exit', releaseLock); // 正常/異常どちらの終了でもロック解放
+  cleanupOldFiles();
   const only = (process.env.MALL_FETCH_ONLY || '').split(',').map((s) => s.trim()).filter(Boolean);
   const targets = only.length ? FETCHERS.filter((f) => only.includes(f.mall)) : FETCHERS;
   if (targets.length === 0) {
