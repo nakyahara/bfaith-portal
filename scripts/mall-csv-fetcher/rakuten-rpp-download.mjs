@@ -19,7 +19,7 @@
 import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { openContext, loginAndGoto, tryClick, dumpControls, safeHost } from './lib-rakuten-login.mjs';
+import { openContext, ensureRmsLogin, tryClick, dumpControls, dumpLinks, safeHost } from './lib-rakuten-login.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DL_DIR = join(__dirname, 'downloads');
@@ -55,8 +55,30 @@ async function main() {
 
   try {
     console.log('=== 楽天RPP 全商品レポート 自動DL ===');
-    await loginAndGoto(page, REPORTS_URL);
-    await snap(page, '0_reports');
+    // ⚠️RPP深いURLへの直行はsystem_errorになる。RMSメインメニューから遷移してセッション確立が必要。
+    await ensureRmsLogin(page);
+    await snap(page, '0_mainmenu');
+    await dumpLinks(page, 'mainmenu');
+
+    // RPPへ: メインメニューから「検索連動型広告(RPP)」等のリンク/メニューをたどる。
+    // 正確な導線はLINKSダンプで確認して調整。まずは候補を best-effort でクリック。
+    console.log('[nav] RPPプロモーションメニューへ遷移を試行');
+    const toRpp = await tryClick(page, [
+      'a:has-text("RPP")', 'a:has-text("検索連動型広告")',
+      'a:has-text("プロモーション")', 'a:has-text("広告")',
+    ], 'RPPメニュー', 8000);
+    if (toRpp) {
+      await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+      await snap(page, '0b_after_rpp_nav');
+      await dumpLinks(page, 'rpp-landing');
+      // パフォーマンスレポートへ
+      await tryClick(page, [
+        'a:has-text("パフォーマンスレポート")', 'text=パフォーマンスレポート',
+      ], 'パフォーマンスレポート', 8000);
+      await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+    }
+    await snap(page, '0c_reports');
+    console.log(`[nav] 現在地: ${page.url()}`);
 
     // --- フォーム状態を診断出力 ---
     console.log('[form] RPPレポート画面のフォームを確認');

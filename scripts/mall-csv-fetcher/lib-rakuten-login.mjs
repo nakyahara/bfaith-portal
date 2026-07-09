@@ -156,26 +156,44 @@ async function runLogin(page) {
   console.log(`[login] 完了 host=${safeHost(page.url())}`);
 }
 
-/**
- * RMSにログイン済みにして targetUrl を開く。
- * 既にセッションが生きていれば直接遷移し、ログインが必要ならログイン列を実行する。
- */
-export async function loginAndGoto(page, targetUrl) {
-  const targetHost = safeHost(targetUrl);
-  await gotoSafe(page, targetUrl);
-  await passNotice(page);
+const RMS_MAIN_URL = 'https://glogin.rms.rakuten.co.jp/'; // ログイン済ならお知らせ/メインメニューへ
 
-  if (safeHost(page.url()) === targetHost) {
-    console.log(`[login] セッション有効。${targetHost} に直接到達`);
+/** 本当にRMSにログインできているか (システムエラー/ログインフォームを弾く) */
+async function looksLoggedIn(page) {
+  const url = page.url();
+  if (/system_error/i.test(url)) return false;
+  if (safeHost(url) === 'login.account.rakuten.com') return false;
+  const hasLoginForm = await page.locator('input[name="login_id"]').isVisible().catch(() => false);
+  if (hasLoginForm) return false;
+  const hasLogout = await page.locator('text=ログアウト').first().isVisible().catch(() => false);
+  return hasLogout;
+}
+
+/** 画面上のリンクを一覧出力 (メニュー構造の把握用) */
+export async function dumpLinks(page, label, max = 60) {
+  const links = await page.evaluate((mx) => {
+    const vis = (el) => !!(el.offsetParent || el.getClientRects().length);
+    return [...document.querySelectorAll('a')].filter(vis)
+      .map((a) => ({ text: (a.innerText || '').trim().slice(0, 30), href: a.href }))
+      .filter((l) => l.text || l.href).slice(0, mx);
+  }, max).catch(() => []);
+  console.log(`  [LINKS:${label}] ${JSON.stringify(links)}`);
+  return links;
+}
+
+/** RMSにログイン済みの状態にする (メインメニュー到達)。2FA要求時は throw。 */
+export async function ensureRmsLogin(page) {
+  await gotoSafe(page, RMS_MAIN_URL);
+  await passNotice(page);
+  if (await looksLoggedIn(page)) {
+    console.log(`[login] セッション有効 host=${safeHost(page.url())}`);
     return;
   }
-
   await runLogin(page);
-  await gotoSafe(page, targetUrl);
+  await gotoSafe(page, RMS_MAIN_URL);
   await passNotice(page);
-
-  if (safeHost(page.url()) !== targetHost) {
-    throw new Error(`ログイン後も目的ページに到達できず: ${page.url()}`);
+  if (!(await looksLoggedIn(page))) {
+    throw new Error(`ログイン確認できず: ${page.url()}`);
   }
-  console.log(`[login] ${targetHost} に到達`);
+  console.log(`[login] メインメニュー到達 host=${safeHost(page.url())}`);
 }
