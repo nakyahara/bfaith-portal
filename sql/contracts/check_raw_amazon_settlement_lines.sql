@@ -22,9 +22,9 @@ WHERE name IN (
   'fact_amazon_settlement_monthly_wide',
   'fact_amazon_settlement_monthly_long',
   'v_amazon_sku_profit_actual_v4',
-  'v_amazon_sku_profit_actual',
+  -- v_amazon_sku_profit_actual / v_settlement_v3_v4_validation は監査PR-14で廃止
+  -- (v3孤児チェーンごとDROP。V4がSSoT)
   'v_amazon_settlement_unified',
-  'v_settlement_v3_v4_validation',
   'v_sku_costed',
   'v_sku_resolved'
 )
