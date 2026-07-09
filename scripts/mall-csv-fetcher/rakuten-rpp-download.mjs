@@ -35,6 +35,7 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, basename } from 'node:path';
 import { openContext, ensureRmsLogin, tryClick, dumpControls, safeHost, assertLoginEnv } from './lib-rakuten-login.mjs';
+import { initRunLog, sendGChat, buildErrorReport } from './lib-notify.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DL_DIR = join(__dirname, 'downloads');
@@ -431,8 +432,17 @@ const REPORT_SPECS = [
 ];
 
 async function main() {
-  // Codex高③: .env fail-fast (ブラウザを開く前に検知)
-  try { assertLoginEnv(); } catch (e) { console.error(`⚠️ ${e.message}`); process.exit(2); }
+  const runLog = initRunLog('rakuten-rpp'); // console出力をlogs/へtee (secretマスク付き)
+  // Codex高③: .env fail-fast (ブラウザを開く前に検知)。webhook設定済みなら通知してから落ちる
+  try { assertLoginEnv(); } catch (e) {
+    console.error(`⚠️ ${e.message}`);
+    await sendGChat(buildErrorReport({
+      mall: 'rakuten', logPath: runLog.logPath,
+      failures: [{ reportType: 'rpp(起動前)', error: e.message }],
+      repro: 'scripts/mall-csv-fetcher/.env を確認 (記入は中原さん)',
+    }), 'rakuten-rpp');
+    process.exit(2);
+  }
   await mkdir(DL_DIR, { recursive: true });
   await mkdir(OUT_DIR, { recursive: true });
 
@@ -453,19 +463,27 @@ async function main() {
     console.log(`対象月: ${months.map((m) => m.ym).join(', ')} (※期間は1ヶ月以内制約のため月ごとにDL)`);
     await ensureRmsLogin(page);
 
+    const failures = [];
     for (const spec of specs) {
       for (const month of months) {
         try {
           const status = await fetchOneReport(page, spec, month);
           outcomes.push({ spec: spec.key, ym: month.ym, status });
         } catch (e) {
+          // 1件の失敗で全体を止めない: 同レポートの残月のみスキップし、別レポートは続行
           console.error(`✗ ${spec.label} ${month.ym}: ${e.message}`);
+          const screenshot = join(OUT_DIR, `rpp_${spec.key}_${month.ym}_error.png`);
           await snap(page, `${spec.key}_${month.ym}_error`);
           await logFetch({
             report_type: spec.reportType, period_from: month.from, period_to: month.to,
             status: 'error', message: e.message,
           });
           outcomes.push({ spec: spec.key, ym: month.ym, status: 'error', error: e.message });
+          failures.push({
+            reportType: spec.reportType, ym: month.ym, from: month.from, to: month.to,
+            error: e.message, url: page.url(), screenshot,
+          });
+          if (String(e.message).startsWith('2FA_REQUIRED')) throw e; // ログイン切れは全レポート共倒れ → 即通知へ
           break; // 同レポートの他の月も同じ原因で落ちる可能性大 → 無駄打ちしない (別レポートは試す)
         }
       }
@@ -475,18 +493,33 @@ async function main() {
     console.log(`\n=== summary: ${outcomes.map((o) => `${o.spec}:${o.ym}=${o.status}`).join(' / ')} ===`);
     if (failed.length > 0) {
       console.log('  → 失敗分は手動DLで埋められます (取込は incoming/ に置くだけ。大原則の手動フォールバック)');
+      await sendGChat(buildErrorReport({
+        mall: 'rakuten', outcomes, failures, logPath: runLog.logPath,
+        repro: `cd ${process.cwd()}; $env:RPP_REPORTS='${targets.join(',')}'; node scripts/mall-csv-fetcher/rakuten-rpp-download.mjs`,
+      }), 'rakuten-rpp');
       process.exitCode = 1;
     } else {
       console.log('  → 取込は次回 daily-sync (import-rakuten-ads-rpp.js) が実行');
     }
   } catch (err) {
-    if (String(err.message).startsWith('2FA_REQUIRED')) {
+    const is2fa = String(err.message).startsWith('2FA_REQUIRED');
+    if (is2fa) {
       console.error(`\n⚠️ ${err.message}`);
-      console.error('  → 本番ではここでGChat通知を出し、その日は手動DLで埋める (大原則の手動フォールバック)');
+      console.error('  → その日は手動DLで埋める (大原則の手動フォールバック)');
     } else {
       console.error('[ERROR]', err.message);
     }
     await snap(page, 'error');
+    await sendGChat(buildErrorReport({
+      mall: 'rakuten', outcomes, logPath: runLog.logPath,
+      failures: [{
+        reportType: is2fa ? '2FA_REQUIRED (全レポート停止)' : 'rpp(共通処理)',
+        error: err.message, url: page.url(), screenshot: join(OUT_DIR, 'rpp_error.png'),
+      }],
+      repro: is2fa
+        ? 'miniPCで $env:MANUAL=1; node scripts/mall-csv-fetcher/rakuten-login-spike.mjs → 手動ログイン+「信頼できる端末」登録 (14日ごと)'
+        : 'node scripts/mall-csv-fetcher/rakuten-rpp-download.mjs',
+    }), 'rakuten-rpp');
     process.exitCode = 1;
   } finally {
     if (process.env.HEADLESS !== '1') {

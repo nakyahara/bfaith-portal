@@ -97,10 +97,23 @@ apps/warehouse/sync-rakuten-ads-daily.js (daily-sync 内、取込成功時のみ
   `report_fetch_log` に status='empty' で記録して正常終了 (障害アラートにしない)。
 - 単体実行:
   ```powershell
-  node scripts/mall-csv-fetcher/rakuten-rpp-download.mjs           # DL (RPP_REPORTS=item,daily で絞り込み)
+  node scripts/mall-csv-fetcher/fetch-all.mjs                      # 全モール一括 (Task Schedulerはこれを登録)
+  node scripts/mall-csv-fetcher/rakuten-rpp-download.mjs           # 楽天のみ (RPP_REPORTS=item,daily で絞り込み)
   node apps/warehouse/import-rakuten-ads-rpp.js --data-dir <DATA_DIR> [--dry-run]
   node apps/warehouse/sync-rakuten-ads-daily.js --data-dir <DATA_DIR> --days 70 [--dry-run]
   ```
+
+### エラー通知 (無音停止禁止) と多モール続行
+
+- **Task Scheduler は `fetch-all.mjs` を登録**。モールごとに子プロセスで実行し、失敗しても次のモールへ続行
+  (将来のYahoo等は `FETCHERS` に1行追加)。1レポート内でも失敗は該当レポートの残月のみスキップし他レポートは続行。
+- **GChat通知はエラー時のみ** (env `GCHAT_WEBHOOK_MALL_FETCH`、無ければ `GCHAT_WEBHOOK`):
+  取得スクリプト自身が業務エラー(FORM_VERIFY/2FA/DL失敗)の詳細+AI調査ガイド
+  (実行ログパス/スクショ/再現コマンド/切り分け表)を送信。ランナーは子が通知できない
+  異常終了(env不備/クラッシュ/タイムアウト)のみ通知 — 二重通知しない。
+- 全console出力は `logs/<name>-<ts>.log` にも保存 (DOMダンプ含む、認証情報はマスク)。
+  AI調査時はGChat通知のログパスをそのまま読めばよい。
+- 取込側(import/sync)の失敗は daily-sync 既存のGChatサマリに載る (このレーンの通知は取得側のみ)。
 - ⚠️ 「すべての広告×日ごと」のフォーム (ラジオID/日付欄DOM) は未実測。初回実行で
   `FORM_VERIFY:` エラーが出たらログの `[DOM:reports-form-*]` を見てセレクタを追記する
   (誤条件のデータを黙って取らないための設計)。
