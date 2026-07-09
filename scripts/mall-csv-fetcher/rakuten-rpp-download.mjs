@@ -441,7 +441,10 @@ async function main() {
       failures: [{ reportType: 'rpp(起動前)', error: e.message }],
       repro: 'scripts/mall-csv-fetcher/.env を確認 (記入は中原さん)',
     }), 'rakuten-rpp');
-    process.exit(2);
+    // fetch直後の process.exit() は Windows で libuv assertion crash を起こし
+    // 終了コードが化ける (実機 2026-07-09) → exitCode で自然終了させる
+    process.exitCode = 2;
+    return;
   }
   await mkdir(DL_DIR, { recursive: true });
   await mkdir(OUT_DIR, { recursive: true });
@@ -449,7 +452,7 @@ async function main() {
   const targets = (process.env.RPP_REPORTS || 'item,daily').split(',').map((s) => s.trim());
   const specs = REPORT_SPECS.filter((s) =>
     (s.key === 'item_monthly' && targets.includes('item')) || (s.key === 'all_daily' && targets.includes('daily')));
-  if (specs.length === 0) { console.error('FATAL: RPP_REPORTS に item / daily を指定してください'); process.exit(2); }
+  if (specs.length === 0) { console.error('FATAL: RPP_REPORTS に item / daily を指定してください'); process.exitCode = 2; return; }
 
   const months = computeTargetMonths();
   const context = await openContext();
