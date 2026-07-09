@@ -81,17 +81,26 @@ for (const t of plan.tables) console.log(`  DROP TABLE対象: ${t.name} (${t.n.t
 
 if (isDryRun) { console.log('[pr14] dry-run 終了 (変更なし)'); process.exit(0); }
 
+// Codex R1 high: 対象ゼロ(=実行済み)の再実行で空ファイルが既存バックアップを
+// 上書きしないよう、早期終了+全バックアップファイル名に実行時刻を付与
+if (plan.views.length === 0 && plan.tables.length === 0) {
+  console.log('[pr14] 対象なし (すでに削除済み)。バックアップには触れず終了');
+  process.exit(0);
+}
+const runStamp = new Date().toISOString().replace(/[:.]/g, '').slice(0, 15);
 fs.mkdirSync(BACKUP_DIR, { recursive: true });
 
 // ─── 1) view DDL 保存 ───
-const viewsSql = plan.views.map(v => v.sql + ';\n').join('\n');
-fs.writeFileSync(path.join(BACKUP_DIR, 'dropped-views.sql'), viewsSql);
-console.log(`[pr14] view DDL保存: dropped-views.sql (${plan.views.length}本)`);
+if (plan.views.length > 0) {
+  const viewsSql = plan.views.map(v => v.sql + ';\n').join('\n');
+  fs.writeFileSync(path.join(BACKUP_DIR, `dropped-views-${runStamp}.sql`), viewsSql);
+  console.log(`[pr14] view DDL保存: dropped-views-${runStamp}.sql (${plan.views.length}本)`);
+}
 
 // ─── 2) 非空 table をストリーミングdump (iterate+gzip、行数検証) ───
 for (const t of plan.tables) {
   if (t.n === 0) continue;
-  const out = path.join(BACKUP_DIR, `${t.name}.dump.gz`);
+  const out = path.join(BACKUP_DIR, `${t.name}-${runStamp}.dump.gz`);
   const gz = zlib.createGzip({ level: 6 });
   const sink = fs.createWriteStream(out + '.tmp');
   gz.pipe(sink);
