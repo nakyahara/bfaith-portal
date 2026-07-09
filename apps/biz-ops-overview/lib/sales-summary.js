@@ -15,16 +15,14 @@
  */
 
 // PR #155 patch v2: f_sales_by_listing 経由に変更、メルカリ含む 7 モール対応
-const MALL_ORDER = ['amazon', 'rakuten', 'yahoo', 'aupay', 'linegift', 'qoo10', 'mercari'];
-const MALL_LABEL = {
-  amazon: 'Amazon',
-  rakuten: '楽天',
-  yahoo: 'Yahoo!',
-  aupay: 'au PAY',
-  linegift: 'LINEギフト',
-  qoo10: 'Qoo10',
-  mercari: 'メルカリ',
-};
+// 監査PR-11: MALL_ORDER/MALL_LABEL のハードコードを dim_mall (in_daily_summary=1) に集約。
+// 値は従来定数と同一 (amazon→…→mercari の7モール、同ラベル)。
+import { loadDimMall } from '../../../lib/dim-mall.js';
+function mallOrder(db) { return loadDimMall(db).dailySummaryOrder; }
+function mallLabelMap(db) {
+  const dim = loadDimMall(db);
+  return Object.fromEntries(dim.dailySummaryOrder.map(k => [k, dim.labelOf(k)]));
+}
 
 /**
  * 概算粗利率 (あらり率)。中原さんの社内運用値「あらり率(税抜) 13%」を採用。
@@ -131,7 +129,7 @@ function aggregateRange(db, fromDate, toDate) {
   const byMall = {};
   let total = 0;
   let totalUnits = 0;
-  for (const m of MALL_ORDER) byMall[m] = { sales: 0, units: 0, present: false };
+  for (const m of mallOrder(db)) byMall[m] = { sales: 0, units: 0, present: false };
   for (const r of rows) {
     if (byMall[r.mall]) {
       const present = (r.sales_count || 0) > 0;
@@ -191,9 +189,10 @@ function getDataFreshness(db, asOf) {
     (ageHours != null && ageHours > staleHours);
 
   // 常時稼働モール集合 (直近7日で REGULAR_DAYS_THRESHOLD 日以上データあり)
+  const order = mallOrder(db);
   const regularMalls = new Set(
     (perMall || [])
-      .filter((m) => MALL_ORDER.includes(m.mall) && (m.recent_days || 0) >= REGULAR_DAYS_THRESHOLD)
+      .filter((m) => order.includes(m.mall) && (m.recent_days || 0) >= REGULAR_DAYS_THRESHOLD)
       .map((m) => m.mall)
   );
   const latestByMall = {};
@@ -201,7 +200,7 @@ function getDataFreshness(db, asOf) {
 
   // 「前日未取込」= 常時稼働なのに前日データが無いモール (= 同期失敗の疑い)。
   //   全体 stale 時は全モール未取込扱い (パイプライン未実行)。
-  const mallsBehind = MALL_ORDER.filter((m) => {
+  const mallsBehind = order.filter((m) => {
     const missingYesterday = (latestByMall[m] || '') < asOf;
     if (!missingYesterday) return false;
     return stale || regularMalls.has(m);
@@ -247,8 +246,8 @@ export function getSalesSummary(db) {
 
   return {
     asOf: yesterday,
-    mallOrder: MALL_ORDER,
-    mallLabel: MALL_LABEL,
+    mallOrder: mallOrder(db),
+    mallLabel: mallLabelMap(db),
     freshness: getDataFreshness(db, yesterday),
     yesterday: { date: yesterday, ...y },
     monthToDate: { period: `${monthStart}〜${yesterday}`, forecast, ...mtd },

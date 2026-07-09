@@ -82,6 +82,45 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_sku ON mirror_products(商品コード)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_status ON mirror_products(取扱区分)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_type ON mirror_products(商品区分)');
+
+  // ─── dim_mall: モールマスタ (設計監査 2026-07-06 PR-11) ───
+  // MALL_ORDER/MALL_LABEL/TAX_INCLUDED_MALLS/MALL_FEE_RATES 等の散在ハードコードの正本。
+  // code-owned config なので boot 時に seed で全置換 (手編集しない。変更はこの配列を直す)。
+  // アプリからは lib/dim-mall.js の loadDimMall() 経由で参照。
+  db.exec(`CREATE TABLE IF NOT EXISTS dim_mall (
+    mall_key         TEXT PRIMARY KEY,   -- 正準キー (小文字)
+    label            TEXT NOT NULL,      -- 正準表示ラベル
+    display_order    INTEGER NOT NULL,
+    is_channel       INTEGER NOT NULL DEFAULT 0,  -- 1=チャネル粒度 (amazon_fba 等)
+    in_daily_summary INTEGER NOT NULL DEFAULT 0,  -- 1=biz-ops 日次サマリ対象
+    tax_included     INTEGER NOT NULL DEFAULT 0,  -- 1=mart の金額が税込 (mgmt の /1.1 対象)
+    fee_rate_approx  REAL,               -- profit-analysis の管理近似手数料率 (請求実額ではない)
+    notes            TEXT
+  )`);
+  const DIM_MALL_SEED = [
+    // [mall_key, label, order, is_channel, in_daily_summary, tax_included, fee_rate_approx, notes]
+    ['amazon',     'Amazon',       10, 0, 1, 0, 0.15, 'Amazon JP。金額は税抜(税は別カラム)'],
+    ['rakuten',    '楽天',         20, 0, 1, 1, 0.10, null],
+    ['yahoo',      'Yahoo!',       30, 0, 1, 1, 0.10, null],
+    ['aupay',      'au PAY',       40, 0, 1, 1, 0.13, null],
+    ['linegift',   'LINEギフト',   50, 0, 1, 1, 0.13, null],
+    ['qoo10',      'Qoo10',        60, 0, 1, 1, 0.10, null],
+    ['mercari',    'メルカリ',     70, 0, 1, 1, 0.10, null],
+    ['dshop',      'Dショッピング', 80, 0, 0, 1, null, 'finance fact 未整備'],
+    ['amazon_usa', '米国Amazon',   90, 0, 0, 0, null, '輸出(消費税なし)'],
+    ['amazon_fba', 'Amazon FBA',  110, 1, 0, 0, null, 'チャネル粒度 (velocity/速報系)'],
+    ['amazon_fbm', 'Amazon FBM',  120, 1, 0, 0, null, 'チャネル粒度 (velocity/速報系)'],
+    ['wholesale',  '卸',          130, 1, 0, 0, null, '仕入先共有では除外 (SOKUHO_EXCLUDE)'],
+    ['base',       'BASE',        140, 1, 0, 0, null, null],
+  ];
+  const seedDimMall = db.transaction(() => {
+    db.exec('DELETE FROM dim_mall');
+    const st = db.prepare(`INSERT INTO dim_mall
+      (mall_key, label, display_order, is_channel, in_daily_summary, tax_included, fee_rate_approx, notes)
+      VALUES (?,?,?,?,?,?,?,?)`);
+    for (const r of DIM_MALL_SEED) st.run(...r);
+  });
+  seedDimMall();
   // 既存テーブルへのカラム追加（マイグレーション）
   addColumnIfMissing('mirror_products', '売上分類', 'INTEGER');
   addColumnIfMissing('mirror_products', '代表商品コード', 'TEXT');
