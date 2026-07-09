@@ -12,6 +12,7 @@
 import { Router } from 'express';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { jstYearMonth, addMonthsYm, lastDayOfMonthStr } from '../../lib/jst-date.js';
+import { loadDimMall } from '../../lib/dim-mall.js';
 import inventoryDecisionRouter from './inventory-decision.js';
 
 const router = Router();
@@ -20,16 +21,7 @@ const router = Router();
 // feature flag INVENTORY_DECISION_ENABLED でのみ有効化。Dark Launch 段階では OFF 想定。
 router.use('/api/inventory', inventoryDecisionRouter);
 
-// ─── モール別手数料率（設計書確定値、CASE文ハードコード） ───
-const MALL_FEE_RATES = {
-  amazon:   0.15,
-  rakuten:  0.10,
-  yahoo:    0.10,
-  aupay:    0.13,
-  qoo10:    0.10,
-  linegift: 0.13,
-  mercari:  0.10,
-};
+// ─── モール別手数料率 (監査PR-11: ハードコード→dim_mall.fee_rate_approx に集約。値は従来と同一) ───
 
 // ─── メイン画面 ───
 router.get('/', (req, res) => {
@@ -221,7 +213,7 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
         platformFee = revenue * 0.15;
       }
     } else {
-      const rate = MALL_FEE_RATES[mallId] || 0.10;
+      const rate = loadDimMall(db).feeRateOf(mallId, 0.10);
       platformFee = revenue * rate;
     }
 

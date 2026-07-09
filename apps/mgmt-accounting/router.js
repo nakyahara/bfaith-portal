@@ -11,6 +11,7 @@
  */
 import { Router } from 'express';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
+import { loadDimMall } from '../../lib/dim-mall.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -483,7 +484,9 @@ function pickNum(obj, keys) {
 }
 // 国内非Amazonモール: mart の 売上/PF手数料/広告費 が「税込」で入る。mgmt は税抜基準なので /1.1 する。
 // amazon_jp は税が別カラムで税抜分離済み、amazon_usa は米国(消費税なし)なので対象外(中原さん 2026-06-14)。
-const TAX_INCLUDED_MALLS = new Set(['rakuten', 'yahoo', 'aupay', 'qoo10', 'linegift', 'mercari', 'dshop']);
+// 監査PR-11: ハードコードSetを dim_mall.tax_included=1 に集約 (値=従来の7モールと同一)。
+// module初期化時はDB未初期化の可能性があるため遅延取得 (loadDimMall はプロセス内キャッシュ)。
+function taxIncludedMalls() { return loadDimMall(getMirrorDB()).taxIncludedSet; }
 
 // ─── 金額・丸め規約 (設計監査 2026-07-06 PR-7/S-7) ───
 // 円は最終的に INTEGER で保存・出力する。丸め(Math.round=四捨五入)は「DB書き込み値/
@@ -504,7 +507,7 @@ function segmentSales(mallId, segData) {
     return pickNum(segData, ['商品売上']) + pickNum(segData, ['配送料']) + pickNum(segData, ['ギフト包装手数料']);
   }
   const raw = pickNum(segData, ['売上合計', '売上', '合計', '商品売上']);
-  return TAX_INCLUDED_MALLS.has(mallId) ? raw / 1.1 : raw;
+  return taxIncludedMalls().has(mallId) ? raw / 1.1 : raw;
 }
 function segmentCost(segData) {
   return pickNum(segData, ['原価合計', '原価']);
@@ -652,7 +655,7 @@ function syncSegmentSalesForMonth(db, year_month, now) {
         let adCost = adCostTotal * segRatio;
 
         // 非Amazon国内モールは PF手数料・広告費も税込 → 税抜化（Amazon JP は手数料を上で /1.1 済み）。
-        if (TAX_INCLUDED_MALLS.has(mt.mall_id)) { pfFee = pfFee / 1.1; adCost = adCost / 1.1; }
+        if (taxIncludedMalls().has(mt.mall_id)) { pfFee = pfFee / 1.1; adCost = adCost / 1.1; }
 
         segRows.push({ seg, sales: Math.round(sales), cost: Math.round(cost), pfFee: Math.round(pfFee), adCost: Math.round(adCost) });
       }

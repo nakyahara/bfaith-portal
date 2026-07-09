@@ -14,6 +14,7 @@
  * 計算ロジックは logic.js (旧「発注対象商品」シート数式の移植) を参照。
  */
 import { Router } from 'express';
+import { loadDimMall } from '../../lib/dim-mall.js';
 import fs from 'fs';
 import multer from 'multer';
 import iconv from 'iconv-lite';
@@ -991,11 +992,8 @@ router.get('/api/attrs/unlinked', (req, res) => {
 // 速報 = mirror_f_sales_velocity_by_product_mall (NE受注ベース、毎朝、7/30日固定、全チャネル)
 // 確定 = mirror_*_finance_sku_daily 6モール (精算/受注fact)。セット構成を展開して実出荷ピース数で数える
 //        (supplier-sales と同じ数え方。3個セット1件=構成品3個)。期間は 30/90/180/365日
-const MALL_LABELS = {
-  rakuten: '楽天', yahoo: 'Yahoo!', aupay: 'au PAY', qoo10: 'Qoo10', mercari: 'メルカリ',
-  linegift: 'LINEギフト', amazon: 'Amazon', amazon_fba: 'Amazon FBA', amazon_fbm: 'Amazon FBM',
-  wholesale: '卸', base: 'BASE',
-};
+// 監査PR-11: MALL_LABELS ハードコードを dim_mall に集約 (値・フォールバック挙動は従来と同一:
+// 未登録キーはキーをそのまま表示)。
 // (監査PR-8: モール別テーブル定義 FIN_MALLS は v_mall_finance_daily_unified に集約され不要に)
 router.get('/api/products/:code/mall-sales', (req, res) => {
   try {
@@ -1011,7 +1009,7 @@ router.get('/api/products/:code/mall-sales', (req, res) => {
       FROM mirror_f_sales_velocity_by_product_mall
       WHERE LOWER(TRIM(商品コード)) = LOWER(TRIM(?))
       ORDER BY qty_30d DESC, qty_7d DESC
-    `).all(code).map(r => ({ mall: r.mall, label: MALL_LABELS[r.mall] || r.mall, qty7: r.qty_7d, qty30: r.qty_30d, asOf: r.as_of_date }));
+    `).all(code).map(r => ({ mall: r.mall, label: loadDimMall(db).labelOf(r.mall), qty7: r.qty_7d, qty30: r.qty_30d, asOf: r.as_of_date }));
 
     // 確定 (finance fact)。期間 = 全モール fact の最新日から days 日
     // 監査PR-8: 6テーブル個別MAXを v_mall_finance_daily_unified 1本に集約
@@ -1055,7 +1053,7 @@ router.get('/api/products/:code/mall-sales', (req, res) => {
         for (const r of rows2) add(r.isFba ? 'amazon_fba' : 'amazon_fbm', (r.u || 0) * (qBySku.get(r.k) || 1));
       }
       finance.rows = [...acc.entries()]
-        .map(([mall, pieces]) => ({ mall, label: MALL_LABELS[mall] || mall, pieces: Math.round(pieces * 10) / 10 }))
+        .map(([mall, pieces]) => ({ mall, label: loadDimMall(db).labelOf(mall), pieces: Math.round(pieces * 10) / 10 }))
         .filter(r => r.pieces > 0)
         .sort((a, b) => b.pieces - a.pieces);
     }
