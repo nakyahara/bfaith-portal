@@ -165,6 +165,8 @@ async function looksLoggedIn(page) {
   if (/system_error/i.test(url)) return false;
   const host = safeHost(url);
   if (host === 'login.account.rakuten.com') return false;
+  // ★glogin.* はログイン入口(未ログイン)。ここに居る=まだログインしていない
+  if (host === 'glogin.rms.rakuten.co.jp' || host.startsWith('glogin.')) return false;
   // R-Loginのログインフォームが出ている=未ログイン
   const hasLoginForm = await page.locator('input[name="login_id"]').isVisible().catch(() => false);
   if (hasLoginForm) return false;

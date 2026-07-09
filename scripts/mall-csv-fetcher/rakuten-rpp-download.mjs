@@ -26,7 +26,7 @@ const DL_DIR = join(__dirname, 'downloads');
 const OUT_DIR = join(__dirname, 'spike-output');
 
 const REPORTS_URL = 'https://ad.rms.rakuten.co.jp/rpp/reports';
-const HISTORY_URL = 'https://ad.rms.rakuten.co.jp/rpp/reports/history'; // 推定。違えば画面のタブから遷移
+const HISTORY_URL = 'https://ad.rms.rakuten.co.jp/rpp/download'; // 実測: ダウンロード履歴
 
 async function snap(page, label) {
   await page.screenshot({ path: join(OUT_DIR, `rpp_${label}.png`), fullPage: true }).catch(() => {});
@@ -62,30 +62,24 @@ async function main() {
     // まずRMSに正しくログイン (mainmenu /rms 到達)
     await ensureRmsLogin(page);
     await snap(page, '0_mainmenu');
-    await dumpLinks(page, 'mainmenu');
 
-    // セッション確立後は深いURL直行が通ることが多い。まず直行し、ダメならメニュー経由。
-    console.log('[nav] RPPレポートへ直行を試行');
-    await page.goto(REPORTS_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-    await page.waitForTimeout(1500);
-
+    // 新規ログイン直後は深いURL直行が通る(実証済)。system_errorなら再ログインして直行リトライ。
+    const gotoReports = async () => {
+      await page.goto(REPORTS_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      await page.waitForTimeout(2000);
+    };
+    console.log('[nav] RPPレポートへ直行');
+    await gotoReports();
     if (/system_error/i.test(page.url())) {
-      console.log('[nav] 直行でsystem_error → メニュー経由にフォールバック');
-      await ensureRmsLogin(page); // メインメニューに戻る
-      await dumpLinks(page, 'mainmenu-frames');
-      const toRpp = await tryClick(page, [
-        'a:has-text("RPP")', 'a:has-text("検索連動型広告")',
-        'a:has-text("プロモーション")', 'a:has-text("広告")',
-      ], 'RPPメニュー', 8000);
-      if (toRpp) {
-        await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
-        await dumpLinks(page, 'rpp-landing');
-        await tryClick(page, ['a:has-text("パフォーマンスレポート")', 'text=パフォーマンスレポート'], 'パフォーマンスレポート', 8000);
-        await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
-      }
+      console.log('[nav] system_error → 再ログインして直行リトライ');
+      await ensureRmsLogin(page);
+      await gotoReports();
     }
     await snap(page, '0c_reports');
     console.log(`[nav] 現在地: ${page.url()}`);
+    if (/system_error/i.test(page.url()) || safeHost(page.url()) !== 'ad.rms.rakuten.co.jp') {
+      throw new Error(`RPPレポート画面に到達できず: ${page.url()}`);
+    }
 
     // --- フォーム状態を診断出力 ---
     console.log('[form] RPPレポート画面のフォームを確認');
