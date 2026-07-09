@@ -33,14 +33,18 @@ async function snap(page, label) {
   console.log(`  [snap] rpp_${label}  url=${page.url()}`);
 }
 
-/** ラベル文字列でラジオ/チェックを選ぶ (Rakutenのラジオはラベルクリックで反応することが多い) */
-async function pickByLabel(page, text, label) {
-  const cands = [
-    `label:has-text("${text}")`,
-    `text="${text}"`,
-    `//label[contains(., "${text}")]`,
-  ];
-  return tryClick(page, cands, `${label}=${text}`, 8000);
+/** ラジオをIDで確実に選択 (check→ダメならラベル相当をクリック) */
+async function checkRadio(page, idSel, label) {
+  const el = page.locator(idSel).first();
+  try {
+    if (await el.count()) {
+      await el.check({ timeout: 5000, force: true });
+      console.log(`  [radio] ${label}: ${idSel} を選択`);
+      return true;
+    }
+  } catch { /* fallthrough */ }
+  // フォールバック: ラベルテキストをクリック
+  return tryClick(page, [`label:has-text("${label}")`, `text="${label}"`], `${label}(label)`, 5000);
 }
 
 async function main() {
@@ -88,10 +92,11 @@ async function main() {
     await dumpControls(page, 'reports-form');
 
     // --- 集計単位=商品別 / 集計期間=全期間で表示 ---
+    // ラジオIDは実測: rdReportTypeItem=商品別 / rdPeriodAll=全期間で表示。
     // (全期間は日付入力不要かつ常にデータあり。まずここでパイプラインを通す)
-    await pickByLabel(page, '商品別', '集計単位');
-    await pickByLabel(page, '全期間で表示', '集計期間');
-    await page.waitForTimeout(1000); // ボタン活性化待ち
+    await checkRadio(page, '#rdReportTypeItem', '商品別');
+    await checkRadio(page, '#rdPeriodAll', '全期間で表示');
+    await page.waitForTimeout(1500); // ボタン活性化待ち
     await snap(page, '1_form_set');
     await dumpControls(page, 'reports-after-set'); // ボタンのdisabledが外れたか確認
 
@@ -109,25 +114,31 @@ async function main() {
 
     // --- ダウンロード履歴で生成完了を待ってZIP取得 ---
     console.log('[history] ダウンロード履歴で生成完了を待つ');
-    // タブ「ダウンロード履歴」をクリック (URL直行が効かない場合に備え両方試す)
     const wentHistory = await tryClick(page, ['text=ダウンロード履歴', 'a:has-text("ダウンロード履歴")'], 'ダウンロード履歴タブ', 6000);
     if (!wentHistory) await page.goto(HISTORY_URL, { waitUntil: 'domcontentloaded' }).catch(() => {});
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(2000);
     await snap(page, '3_history');
-    await dumpControls(page, 'history');
 
-    // 生成完了をポーリング (最大5分)。完了行のダウンロードリンクを押してZIP取得。
-    const deadline = Date.now() + 5 * 60 * 1000;
+    // 先頭行(=今リクエストした最新行)が「完了」になり、テキストがちょうど「ダウンロード」の
+    // リンクが出るまでポーリング (生成が長いので最大15分)。誤って見出し/タブを押さないよう厳密に。
+    const deadline = Date.now() + 15 * 60 * 1000;
     let saved = null;
     while (Date.now() < deadline && !saved) {
-      // 最新行の「ダウンロード」リンク/ボタンを探す
-      const dlLink = page.locator('a:has-text("ダウンロード"), button:has-text("ダウンロード")').first();
-      const ready = await dlLink.isVisible().catch(() => false);
-      if (ready) {
+      const row1 = await page.evaluate(() => {
+        const tr = document.querySelector('table tbody tr') || document.querySelectorAll('table tr')[1];
+        if (!tr) return null;
+        const dl = [...tr.querySelectorAll('a')].find((a) => a.textContent.trim() === 'ダウンロード');
+        return { text: (tr.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 140), hasDownload: !!dl };
+      }).catch(() => null);
+      console.log(`  [poll] 先頭行: ${row1 ? row1.text : '(行なし)'}`);
+
+      if (row1 && row1.hasDownload && /完了/.test(row1.text)) {
         try {
+          const link = page.locator('table tbody tr').first()
+            .getByRole('link', { name: 'ダウンロード', exact: true });
           const [download] = await Promise.all([
             page.waitForEvent('download', { timeout: 60000 }),
-            dlLink.click(),
+            link.click(),
           ]);
           const fname = download.suggestedFilename() || `rpp_all_products_${Date.now()}.zip`;
           const dest = join(DL_DIR, fname);
@@ -135,14 +146,20 @@ async function main() {
           saved = dest;
           console.log(`  ✅ ダウンロード成功: ${dest}`);
         } catch (e) {
-          console.log(`  [retry] DLリンク押下でZIP取得できず (${e.message})。生成中の可能性→待機`);
+          console.log(`  [retry] DL押下失敗 (${String(e.message).split('\n')[0]})`);
         }
+      } else if (row1 && /待機中|生成中|処理中/.test(row1.text)) {
+        console.log('  [wait] 生成中 (待機中)。20秒後に更新して再確認');
       } else {
-        console.log('  [wait] まだ生成中 (ダウンロードリンク未出現)。30秒後に再確認');
+        console.log('  [wait] 完了リンク未検出。20秒後に更新して再確認');
       }
+
       if (!saved) {
-        await page.waitForTimeout(30000);
-        await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
+        await page.waitForTimeout(20000);
+        // 「更新」ボタンで最新状態に (無ければリロード)
+        const refreshed = await tryClick(page, ['text=更新', 'button:has-text("更新")'], '更新', 4000);
+        if (!refreshed) await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
+        await page.waitForTimeout(1500);
       }
     }
 
