@@ -16,6 +16,7 @@
     "archiver": "^7.0.0",
     "bcryptjs": "^2.4.3",
     "better-sqlite3": "^12.8.0",
+    "canonicalize": "^2.1.0",
     "cheerio": "^1.0.0",
     "connect-sqlite3": "^0.9.15",
     "dotenv": "^17.3.1",

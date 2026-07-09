@@ -243,10 +243,14 @@ async function main() {
   }
 
   // exit code: 0 (ok/warn は cron 赤くしない)、1 (critical のみ cron 赤)
-  process.exit(severity === 'critical' ? 1 : 0);
+  // ⚠️ GChat通知(fetch/undici)後の process.exit() は Windows node で libuv assertion
+  // (-1073740791) になり exit code を破壊する (GCHAT_WEBHOOK が 2026-07-06 に .env へ
+  // 設定されて通知fetchが実際に走るようになった日から発症、#439 と同根)。
+  // exitCode + 自然終了に変更 (undici socket は unref 済みで即終了する)。
+  process.exitCode = severity === 'critical' ? 1 : 0;
 }
 
 main().catch(e => {
   console.error(`[monitor-fee-coverage] 致命的エラー: ${e.message}\n${e.stack}`);
-  process.exit(1);
+  process.exitCode = 1;
 });

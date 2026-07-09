@@ -13,13 +13,16 @@
  *     （設計書 セクション14 "stock_monthly_snapshot 初期化方針" 参照）
  */
 import { getDB, initDB } from './db.js';
+import { jstYearMonth } from '../../lib/jst-date.js';
 
 function now() {
   return new Date().toISOString().replace('T', ' ').slice(0, 19);
 }
 
+// 監査M-3: 旧 toISOString().slice(0,7) は UTC 月。毎月1日 0:00〜8:59 JST の実行で
+// snapshot が前月キーに UPSERT され前月末確定を上書きする穴 → JST 月に修正
 function currentYearMonth() {
-  return new Date().toISOString().slice(0, 7); // YYYY-MM
+  return jstYearMonth();
 }
 
 /**

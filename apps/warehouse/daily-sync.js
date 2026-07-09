@@ -252,6 +252,17 @@ async function main() {
   const vpsEnvResult = runScript('apps/warehouse/sync-vps-env.js', 'VPS env同期');
   results.push({ name: 'VPS env同期', ...vpsEnvResult });
 
+  // Settlement 冪等性 smoke テスト (監査PR-13/INV-27。一時DB相手に数秒で完了、本番DBに触れない)
+  // hash設計が崩れると PR #229 (31.8M行膨張) が再発するため、Settlement 取得より前に毎朝検証。
+  // 失敗しても以降のジョブは止めない (❌通知で気付く)。
+  const idemResult = runScript('apps/warehouse/test-settlement-idempotency.js', 'Settlement冪等性テスト', 120000);
+  results.push({ name: 'Settlement冪等性テスト', ...idemResult });
+
+  // raw_*_orders_log 3本のローテ (監査PR-12(b)。保持60日+月次gzアーカイブ。
+  // 実測2.3GB/4.5M行の純無限成長を停止。定常時は前日分のみで数秒)
+  const rotateResult = runScript('apps/warehouse/rotate-order-logs.js', 'ログローテ', 1800000);
+  results.push({ name: 'ログローテ', ...rotateResult });
+
   // NE API（商品マスタ + セット商品 + 受注7日分）
   const neResult = runScript('apps/warehouse/ne-api.js sync', 'NE API');
   results.push({ name: 'NE', ...neResult });
@@ -431,6 +442,35 @@ async function main() {
       // build を再実行せずに sync 単独 retry してしまい、古い fact を sync する事故。
       // build を retryable に残し、sync は build 成功時のみ実行 = sync を retry 対象外にする。
       console.log(`[DailySync] Amazon finance sync は build 失敗のため記録せず (build retry 後に翌 cron で sync 実行)`);
+    }
+
+    // === Amazon finance 前月分 build+sync (月初の settlement 追い込み反映) ===
+    // settlement は約14日周期で確定するため、月初〜中旬は前月 economic_date の行が
+    // 新規 settlement で増え続ける。従来は当月のみ (「前月処理は将来」TODO) だったため、
+    // 月初に amazon_finance_sku_daily の sync が最大2週間止まって見えていた
+    // (2026-07-07 発覚: 6/29 を最後に 1 週間 no rows in range)。
+    // 毎月 20 日までは前月分も build+sync する (snapshot 原価は UPSERT 不変なので安全)。
+    const dayOfMonth = parseInt(businessDate.slice(8, 10), 10);
+    if (dayOfMonth <= 20) {
+      const prevMonthDate = new Date(Date.UTC(
+        parseInt(currentMonth.slice(0, 4), 10),
+        parseInt(currentMonth.slice(5, 7), 10) - 2, 1
+      ));
+      const prevMonth = `${prevMonthDate.getUTCFullYear()}-${String(prevMonthDate.getUTCMonth() + 1).padStart(2, '0')}`;
+      const prevBuildResult = runScript(
+        `scripts/amazon-finance/build-daily-fact.js --data-dir ${DATA_DIR_ARG} --month ${prevMonth}`,
+        'Amazon finance build (前月)', 600000
+      );
+      results.push({ name: 'Amazon finance build (前月)', ...prevBuildResult });
+      if (prevBuildResult.success) {
+        const prevSyncResult = runScript(
+          `apps/warehouse/sync-amazon-finance-daily.js --data-dir ${DATA_DIR_ARG} --month ${prevMonth}`,
+          'Amazon finance sync (前月)', 600000
+        );
+        results.push({ name: 'Amazon finance sync (前月)', ...prevSyncResult });
+      } else {
+        console.log(`[DailySync] Amazon finance sync (前月) は build 失敗のためスキップ`);
+      }
     }
 
     // === Amazon Ads mirror sync (amazon-dashboard PR-A) ===

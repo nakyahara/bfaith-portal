@@ -12,6 +12,7 @@ import multer from 'multer';
 import fs from 'fs';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { requireImportKey, importJsonParser } from '../../lib/import-key-auth.js';
+import { normalizeYearMonth } from '../../lib/jst-date.js';
 
 const router = Router();
 const UPLOAD_DIR = process.env.DATA_DIR ? process.env.DATA_DIR + '/import' : 'data/import';
@@ -461,9 +462,13 @@ router.post('/upload', upload.single('file'), (req, res) => {
     });
   }
 
-  // 対象年月を推定（最初の日付から）
+  // 対象年月を推定（最初の日付から）。監査M-1: slice(0,7)は '2026/3/15'→'2026-3/' の
+  // ゼロ埋め漏れで月キーJOINから脱落する(mirrorにboot時修復migrationが存在=本番発生実績)
   const firstDate = parsedRows[0]?.日付 || '';
-  const yearMonth = firstDate.slice(0, 7).replace('/', '-');
+  const yearMonth = normalizeYearMonth(firstDate);
+  if (!yearMonth) {
+    return res.status(400).json({ error: `CSVの日付から年月を特定できません: "${firstDate}"` });
+  }
 
   // SKU解決
   const { resolved, unresolved, zeroGenka, unresolvedTax, conflicts } = resolveSkus(parsedRows, db);

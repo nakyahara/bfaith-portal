@@ -82,6 +82,50 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_sku ON mirror_products(商品コード)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_status ON mirror_products(取扱区分)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_type ON mirror_products(商品区分)');
+
+  // 監査PR-12(a): mirror_sku_map は sku_map(miniPC側、writer停止済み・Step7 DROP待ち)の
+  // dead受け皿でコード参照0件。miniPC側 sku_map から再同期可能なため mirror 側は先行DROP
+  // (冪等。sku_map 本体の DROP は SKU統合Step7 の判断に従う)
+  db.exec('DROP TABLE IF EXISTS mirror_sku_map');
+
+  // ─── dim_mall: モールマスタ (設計監査 2026-07-06 PR-11) ───
+  // MALL_ORDER/MALL_LABEL/TAX_INCLUDED_MALLS/MALL_FEE_RATES 等の散在ハードコードの正本。
+  // code-owned config なので boot 時に seed で全置換 (手編集しない。変更はこの配列を直す)。
+  // アプリからは lib/dim-mall.js の loadDimMall() 経由で参照。
+  db.exec(`CREATE TABLE IF NOT EXISTS dim_mall (
+    mall_key         TEXT PRIMARY KEY,   -- 正準キー (小文字)
+    label            TEXT NOT NULL,      -- 正準表示ラベル
+    display_order    INTEGER NOT NULL,
+    is_channel       INTEGER NOT NULL DEFAULT 0,  -- 1=チャネル粒度 (amazon_fba 等)
+    in_daily_summary INTEGER NOT NULL DEFAULT 0,  -- 1=biz-ops 日次サマリ対象
+    tax_included     INTEGER NOT NULL DEFAULT 0,  -- 1=mart の金額が税込 (mgmt の /1.1 対象)
+    fee_rate_approx  REAL,               -- profit-analysis の管理近似手数料率 (請求実額ではない)
+    notes            TEXT
+  )`);
+  const DIM_MALL_SEED = [
+    // [mall_key, label, order, is_channel, in_daily_summary, tax_included, fee_rate_approx, notes]
+    ['amazon',     'Amazon',       10, 0, 1, 0, 0.15, 'Amazon JP。金額は税抜(税は別カラム)'],
+    ['rakuten',    '楽天',         20, 0, 1, 1, 0.10, null],
+    ['yahoo',      'Yahoo!',       30, 0, 1, 1, 0.10, null],
+    ['aupay',      'au PAY',       40, 0, 1, 1, 0.13, null],
+    ['linegift',   'LINEギフト',   50, 0, 1, 1, 0.13, null],
+    ['qoo10',      'Qoo10',        60, 0, 1, 1, 0.10, null],
+    ['mercari',    'メルカリ',     70, 0, 1, 1, 0.10, null],
+    ['dshop',      'Dショッピング', 80, 0, 0, 1, null, 'finance fact 未整備'],
+    ['amazon_usa', '米国Amazon',   90, 0, 0, 0, null, '輸出(消費税なし)'],
+    ['amazon_fba', 'Amazon FBA',  110, 1, 0, 0, null, 'チャネル粒度 (velocity/速報系)'],
+    ['amazon_fbm', 'Amazon FBM',  120, 1, 0, 0, null, 'チャネル粒度 (velocity/速報系)'],
+    ['wholesale',  '卸',          130, 1, 0, 0, null, '仕入先共有では除外 (SOKUHO_EXCLUDE)'],
+    ['base',       'BASE',        140, 1, 0, 0, null, null],
+  ];
+  const seedDimMall = db.transaction(() => {
+    db.exec('DELETE FROM dim_mall');
+    const st = db.prepare(`INSERT INTO dim_mall
+      (mall_key, label, display_order, is_channel, in_daily_summary, tax_included, fee_rate_approx, notes)
+      VALUES (?,?,?,?,?,?,?,?)`);
+    for (const r of DIM_MALL_SEED) st.run(...r);
+  });
+  seedDimMall();
   // 既存テーブルへのカラム追加（マイグレーション）
   addColumnIfMissing('mirror_products', '売上分類', 'INTEGER');
   addColumnIfMissing('mirror_products', '代表商品コード', 'TEXT');
@@ -612,7 +656,9 @@ function createTables() {
 
   // mirror_yahoo_finance_sku_daily — Yahoo Phase 1 Y-3b (Render 側 daily fact mirror)
   // miniPC の f_yahoo_finance_sku_daily_v1 の payload を受信
-  // PK: (date_jst, yahoo_sku_key) — yahoo_sku_key = item_id-sub_code or item_id (variant 別 or 親 SKU)
+  // PK: (date_jst, yahoo_sku_key) — yahoo_sku_key = sub_code そのもの (variant あり) or item_id (variant なし)
+  //     ※連結形式ではない (build SQL: CASE WHEN sub_code<>'' THEN sub_code ELSE item_id END)。
+  //       variant_key 列 = sub_code 全体。f_yahoo_sku_map の登録キーも yahoo_sku_key と同値
   // 設計書 v0.4: g:/共有ドライブ/AI_reference/システム設計/Yahoo!Phase1a設計書_v0.4_20260510.md
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_yahoo_finance_sku_daily (
     date_jst                          TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
@@ -676,6 +722,8 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_myfsd_ne    ON mirror_yahoo_finance_sku_daily(ne_code)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_myfsd_month ON mirror_yahoo_finance_sku_daily(substr(date_jst, 1, 7))');
   db.exec('CREATE INDEX IF NOT EXISTS idx_myfsd_run   ON mirror_yahoo_finance_sku_daily(source_run_id)');
+  // SKU 軸の全期間集計用 (yahoo-analytics 売れ筋タブの初売上 MIN 等。PK は date_jst 先頭のため別途必要)
+  db.exec('CREATE INDEX IF NOT EXISTS idx_myfsd_sku   ON mirror_yahoo_finance_sku_daily(yahoo_sku_key, date_jst)');
 
   // Phase 1c-3 用 migration framework (Codex R5 #1 反映、PRAGMA table_info 方式)
   // 現状追加列なし、Phase 1c-3 着手時にここに ALTER TABLE 追加する形
@@ -1811,6 +1859,96 @@ function createTables() {
       synced_at AS data_synced_at,
       'mirror_f_sales_by_listing' AS source_fact
     FROM mirror_f_sales_by_listing`);
+
+  // ---- 粗利込みモール横断 view (2026-07-07 設計監査PR-8/③「1本SQLテスト(b)」対応)
+  // 6 finance fact のモール差分 (SKU列名5種 / Amazon数量REAL / 税込基準差 / qoo10売上3候補 /
+  // margin列名・partial/full 2段構え) をこの view 1箇所に封じ込める。
+  // 下流はこの view を使い、finance fact の手書き UNION を新規に書かないこと。
+  // 列 contract:
+  //   sku_key   = モール native キーの LOWER(TRIM()) 正規化
+  //   ne_code   = 会社共通コード (amazon は fact に無いため NULL → mirror_sku_resolved で解決)
+  //   units_net_sold = INTEGER (amazon は REAL 格納だが値は整数なので CAST)
+  //   sales_gross_jpy_incl = 税込総売上。amazon は principal+shipping+giftwrap+実収税額
+  //     (×1.10 推定ではなく settlement 実額。軽減税率誤差なし)。
+  //     qoo10 は customer_paid_jpy_incl を採用 (顧客支払額=他モールの gross と同義。
+  //     vw_qoo10_finance_for_reporting の net_settlement alias とは別定義である点に注意)
+  //   margin_jpy_for_reporting = 各モールの vw_*_finance_for_reporting と同じ優先順位
+  //     (yahoo/aupay=COALESCE(full,partial)、qoo10=confidence次第、rakuten/linegift=単一列、
+  //      amazon=profit_amount)。amazon のみ税抜 → margin_basis で区別
+  //   is_fba / fba_fees_jpy / asin_norm / sales_principal_jpy = amazon 専用 (他モール NULL)
+  db.exec('DROP VIEW IF EXISTS v_mall_finance_daily_unified');
+  db.exec(`CREATE VIEW v_mall_finance_daily_unified AS
+    SELECT
+      date_jst, 'amazon' AS mall,
+      LOWER(TRIM(seller_sku)) AS sku_key,
+      NULL AS ne_code,
+      product_name,
+      CAST(units_net_sold AS INTEGER) AS units_net_sold,
+      COALESCE(sales_principal_jpy,0) + COALESCE(sales_shipping_jpy,0)
+        + COALESCE(sales_giftwrap_jpy,0) + COALESCE(sales_tax_jpy,0) AS sales_gross_jpy_incl,
+      profit_amount AS margin_jpy_for_reporting,
+      'excl_tax' AS margin_basis,
+      NULL AS margin_confidence,
+      cost_status,
+      asin_norm,
+      COALESCE(fba_fulfillment_jpy,0) + COALESCE(fba_storage_jpy,0) AS fba_fees_jpy,
+      CASE WHEN COALESCE(fba_fulfillment_jpy,0) + COALESCE(fba_storage_jpy,0) > 0 THEN 1 ELSE 0 END AS is_fba,
+      sales_principal_jpy,
+      synced_at
+    FROM mirror_amazon_finance_sku_daily
+    UNION ALL
+    SELECT
+      date_jst, 'rakuten',
+      LOWER(TRIM(rakuten_code)), LOWER(TRIM(ne_code)), product_name,
+      units_net_sold,
+      gross_sales_jpy_incl,
+      variable_margin_jpy_incl,
+      'incl_tax', NULL, cost_status,
+      NULL, NULL, NULL, NULL, synced_at
+    FROM mirror_rakuten_finance_sku_daily
+    UNION ALL
+    SELECT
+      date_jst, 'yahoo',
+      LOWER(TRIM(yahoo_sku_key)), LOWER(TRIM(ne_code)), product_name,
+      units_net_sold,
+      gross_sales_jpy_incl,
+      COALESCE(variable_margin_full_jpy_incl, variable_margin_partial_jpy_incl),
+      'incl_tax', margin_confidence, cost_status,
+      NULL, NULL, NULL, NULL, synced_at
+    FROM mirror_yahoo_finance_sku_daily
+    UNION ALL
+    SELECT
+      date_jst, 'aupay',
+      LOWER(TRIM(aupay_sku_key)), LOWER(TRIM(ne_code)), product_name,
+      units_net_sold,
+      gross_sales_jpy_incl,
+      COALESCE(variable_margin_full_jpy_incl, variable_margin_partial_jpy_incl),
+      'incl_tax', margin_confidence, cost_status,
+      NULL, NULL, NULL, NULL, synced_at
+    FROM mirror_aupay_finance_sku_daily
+    UNION ALL
+    SELECT
+      date_jst, 'qoo10',
+      LOWER(TRIM(sku_code)), LOWER(TRIM(ne_code)), product_name,
+      units_net_sold,
+      customer_paid_jpy_incl,
+      CASE
+        WHEN margin_confidence IN ('full', 'partial_minus_returns') THEN variable_margin_full_jpy_incl
+        ELSE variable_margin_jpy_incl
+      END,
+      'incl_tax', margin_confidence, cost_status,
+      NULL, NULL, NULL, NULL, synced_at
+    FROM mirror_qoo10_finance_sku_daily
+    UNION ALL
+    SELECT
+      date_jst, 'linegift',
+      LOWER(TRIM(sku_code)), LOWER(TRIM(ne_code)), product_name,
+      units_net_sold,
+      gross_sales_jpy_incl,
+      variable_margin_jpy_incl,
+      'incl_tax', margin_confidence, cost_status,
+      NULL, NULL, NULL, NULL, synced_at
+    FROM mirror_linegift_finance_sku_daily`);
 
   db.exec('DROP VIEW IF EXISTS v_mirror_mf_anomaly_signals_latest');
   db.exec(`CREATE VIEW v_mirror_mf_anomaly_signals_latest AS

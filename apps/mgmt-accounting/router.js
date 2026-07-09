@@ -11,6 +11,7 @@
  */
 import { Router } from 'express';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
+import { loadDimMall } from '../../lib/dim-mall.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -483,7 +484,19 @@ function pickNum(obj, keys) {
 }
 // 国内非Amazonモール: mart の 売上/PF手数料/広告費 が「税込」で入る。mgmt は税抜基準なので /1.1 する。
 // amazon_jp は税が別カラムで税抜分離済み、amazon_usa は米国(消費税なし)なので対象外(中原さん 2026-06-14)。
-const TAX_INCLUDED_MALLS = new Set(['rakuten', 'yahoo', 'aupay', 'qoo10', 'linegift', 'mercari', 'dshop']);
+// 監査PR-11: ハードコードSetを dim_mall.tax_included=1 に集約 (値=従来の7モールと同一)。
+// module初期化時はDB未初期化の可能性があるため遅延取得 (loadDimMall はプロセス内キャッシュ)。
+function taxIncludedMalls() { return loadDimMall(getMirrorDB()).taxIncludedSet; }
+
+// ─── 金額・丸め規約 (設計監査 2026-07-06 PR-7/S-7) ───
+// 円は最終的に INTEGER で保存・出力する。丸め(Math.round=四捨五入)は「DB書き込み値/
+// 集計出力値を確定する直前の1回だけ」。中間計算(按分・税抜化の途中経過)では丸めない。
+// 全社規約の正本: AI_reference『EC統合データウェアハウス_設計書.md』の「全社DDL・金額規約」節。
+// ※ /1.1 一律換算による軽減税率8%商品の恒常誤差は判断済みの既知事項(監査L-5)。
+const TAX_RATE_JP = 1.1;
+// 税込円→税抜円(整数確定)。|| 0 は付けない: 呼び出し元の式と厳密同一
+// (NaN を黙って 0 に化かすと上流バグの検知が遅れる。Codex R1指摘)
+const toTaxExcludedJpy = v => Math.round(v / TAX_RATE_JP);
 
 // 売上の解決:
 //  - amazon_jp: 商品売上 + 配送料 + ギフト包装手数料（顧客請求の売上性項目、すべて税抜=税は別カラム。中原さん 2026-06-14 確定）。
@@ -494,7 +507,7 @@ function segmentSales(mallId, segData) {
     return pickNum(segData, ['商品売上']) + pickNum(segData, ['配送料']) + pickNum(segData, ['ギフト包装手数料']);
   }
   const raw = pickNum(segData, ['売上合計', '売上', '合計', '商品売上']);
-  return TAX_INCLUDED_MALLS.has(mallId) ? raw / 1.1 : raw;
+  return taxIncludedMalls().has(mallId) ? raw / 1.1 : raw;
 }
 function segmentCost(segData) {
   return pickNum(segData, ['原価合計', '原価']);
@@ -565,7 +578,7 @@ function syncSegmentSalesForMonth(db, year_month, now) {
         const fbaFeeSigned = Object.values(allSegs).reduce((s, v) => s + (v['FBA手数料'] || 0), 0);
         const fbaFeeTaxInc = Math.abs(fbaFeeSigned);
         if (fbaFeeTaxInc > 0) {
-          const fbaFeeTaxEx = Math.round(fbaFeeTaxInc / 1.1);
+          const fbaFeeTaxEx = toTaxExcludedJpy(fbaFeeTaxInc);
           freightStmt.run(year_month, 'FBA運賃', fbaFeeTaxEx, 'shared', null, null,
             'auto from mart_amazon_monthly_summary.by_segment.FBA手数料', 'system-sync', now, now);
           fbaFreightInserted = fbaFeeTaxEx;
@@ -624,7 +637,7 @@ function syncSegmentSalesForMonth(db, year_month, now) {
                        + (segData['プロモーション割引額'] || 0)
                        + (segData['プロモーション割引の税金'] || 0)
                        + (segData['Amazonポイント費用'] || 0);
-          pfFee = Math.round(Math.abs(signed) / 1.1);
+          pfFee = toTaxExcludedJpy(Math.abs(signed));
         } else if (segData['手数料'] !== undefined || segData['FBA手数料'] !== undefined) {
           // 手数料/FBA手数料は費用(正値)として変動費に積む。返金等で符号が負で入る月でも
           // 粗利を押し上げないよう abs で正規化(Amazon JP/USA と同方針、Codex High 対応)。
@@ -642,7 +655,7 @@ function syncSegmentSalesForMonth(db, year_month, now) {
         let adCost = adCostTotal * segRatio;
 
         // 非Amazon国内モールは PF手数料・広告費も税込 → 税抜化（Amazon JP は手数料を上で /1.1 済み）。
-        if (TAX_INCLUDED_MALLS.has(mt.mall_id)) { pfFee = pfFee / 1.1; adCost = adCost / 1.1; }
+        if (taxIncludedMalls().has(mt.mall_id)) { pfFee = pfFee / 1.1; adCost = adCost / 1.1; }
 
         segRows.push({ seg, sales: Math.round(sales), cost: Math.round(cost), pfFee: Math.round(pfFee), adCost: Math.round(adCost) });
       }

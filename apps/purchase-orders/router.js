@@ -14,6 +14,7 @@
  * 計算ロジックは logic.js (旧「発注対象商品」シート数式の移植) を参照。
  */
 import { Router } from 'express';
+import { loadDimMall } from '../../lib/dim-mall.js';
 import fs from 'fs';
 import multer from 'multer';
 import iconv from 'iconv-lite';
@@ -991,18 +992,9 @@ router.get('/api/attrs/unlinked', (req, res) => {
 // 速報 = mirror_f_sales_velocity_by_product_mall (NE受注ベース、毎朝、7/30日固定、全チャネル)
 // 確定 = mirror_*_finance_sku_daily 6モール (精算/受注fact)。セット構成を展開して実出荷ピース数で数える
 //        (supplier-sales と同じ数え方。3個セット1件=構成品3個)。期間は 30/90/180/365日
-const MALL_LABELS = {
-  rakuten: '楽天', yahoo: 'Yahoo!', aupay: 'au PAY', qoo10: 'Qoo10', mercari: 'メルカリ',
-  linegift: 'LINEギフト', amazon: 'Amazon', amazon_fba: 'Amazon FBA', amazon_fbm: 'Amazon FBM',
-  wholesale: '卸', base: 'BASE',
-};
-const FIN_MALLS = [
-  { mall: 'rakuten', table: 'mirror_rakuten_finance_sku_daily' },
-  { mall: 'yahoo', table: 'mirror_yahoo_finance_sku_daily' },
-  { mall: 'aupay', table: 'mirror_aupay_finance_sku_daily' },
-  { mall: 'linegift', table: 'mirror_linegift_finance_sku_daily' },
-  { mall: 'qoo10', table: 'mirror_qoo10_finance_sku_daily' },
-];
+// 監査PR-11: MALL_LABELS ハードコードを dim_mall に集約 (値・フォールバック挙動は従来と同一:
+// 未登録キーはキーをそのまま表示)。
+// (監査PR-8: モール別テーブル定義 FIN_MALLS は v_mall_finance_daily_unified に集約され不要に)
 router.get('/api/products/:code/mall-sales', (req, res) => {
   try {
     const code = trimS(req.params.code);
@@ -1017,14 +1009,11 @@ router.get('/api/products/:code/mall-sales', (req, res) => {
       FROM mirror_f_sales_velocity_by_product_mall
       WHERE LOWER(TRIM(商品コード)) = LOWER(TRIM(?))
       ORDER BY qty_30d DESC, qty_7d DESC
-    `).all(code).map(r => ({ mall: r.mall, label: MALL_LABELS[r.mall] || r.mall, qty7: r.qty_7d, qty30: r.qty_30d, asOf: r.as_of_date }));
+    `).all(code).map(r => ({ mall: r.mall, label: loadDimMall(db).labelOf(r.mall), qty7: r.qty_7d, qty30: r.qty_30d, asOf: r.as_of_date }));
 
     // 確定 (finance fact)。期間 = 全モール fact の最新日から days 日
-    let maxDate = null;
-    for (const t of ['mirror_amazon_finance_sku_daily', ...FIN_MALLS.map(c => c.table)]) {
-      const r = db.prepare(`SELECT MAX(date_jst) d FROM ${t}`).get();
-      if (r && r.d && (!maxDate || r.d > maxDate)) maxDate = r.d;
-    }
+    // 監査PR-8: 6テーブル個別MAXを v_mall_finance_daily_unified 1本に集約
+    const maxDate = db.prepare('SELECT MAX(date_jst) d FROM v_mall_finance_daily_unified').get()?.d || null;
     const finance = { available: !!maxDate, days, start: null, end: null, rows: [] };
     if (maxDate) {
       const end = maxDate;
@@ -1039,15 +1028,15 @@ router.get('/api/products/:code/mall-sales', (req, res) => {
       }
       const keys = [...keyQty.keys()];
       const ph = keys.map(() => '?').join(',');
-      for (const c of FIN_MALLS) {
-        const rows = db.prepare(`
-          SELECT LOWER(TRIM(ne_code)) ne, SUM(CAST(units_net_sold AS REAL)) u
-          FROM ${c.table}
-          WHERE date_jst BETWEEN ? AND ? AND LOWER(TRIM(ne_code)) IN (${ph})
-          GROUP BY LOWER(TRIM(ne_code))
-        `).all(start, end, ...keys);
-        for (const r of rows) add(c.mall, (r.u || 0) * (keyQty.get(r.ne) || 1));
-      }
+      // 監査PR-8: 5モール個別クエリ → v_mall_finance_daily_unified 1クエリ
+      // (view の ne_code/sku_key は LOWER(TRIM) 済み = 従来クエリと述語同一)
+      const rows = db.prepare(`
+        SELECT mall, ne_code ne, SUM(units_net_sold) u
+        FROM v_mall_finance_daily_unified
+        WHERE mall <> 'amazon' AND date_jst BETWEEN ? AND ? AND ne_code IN (${ph})
+        GROUP BY mall, ne_code
+      `).all(start, end, ...keys);
+      for (const r of rows) add(r.mall, (r.u || 0) * (keyQty.get(r.ne) || 1));
       // Amazon: seller_sku を構成解決 (mirror_sku_resolved)。FBA/FBM は行(日)単位の手数料発生有無で推定
       // (SKU単位で合算してから判定すると期間内にFBA/FBM混在したSKUが全量FBAに寄る、Codex P7-1)
       const amzKeys = db.prepare('SELECT LOWER(TRIM(seller_sku)) k, quantity q FROM mirror_sku_resolved WHERE LOWER(TRIM(ne_code)) = LOWER(TRIM(?))').all(code);
@@ -1055,18 +1044,16 @@ router.get('/api/products/:code/mall-sales', (req, res) => {
         const qBySku = new Map(amzKeys.map(r => [r.k, r.q || 1]));
         const keys2 = [...qBySku.keys()];
         const ph2 = keys2.map(() => '?').join(',');
-        const rows = db.prepare(`
-          SELECT LOWER(TRIM(seller_sku)) k,
-                 (COALESCE(fba_fulfillment_jpy,0) + COALESCE(fba_storage_jpy,0)) > 0 isFba,
-                 SUM(CAST(units_net_sold AS REAL)) u
-          FROM mirror_amazon_finance_sku_daily
-          WHERE date_jst BETWEEN ? AND ? AND LOWER(TRIM(seller_sku)) IN (${ph2})
-          GROUP BY LOWER(TRIM(seller_sku)), isFba
+        const rows2 = db.prepare(`
+          SELECT sku_key k, is_fba isFba, SUM(units_net_sold) u
+          FROM v_mall_finance_daily_unified
+          WHERE mall = 'amazon' AND date_jst BETWEEN ? AND ? AND sku_key IN (${ph2})
+          GROUP BY sku_key, is_fba
         `).all(start, end, ...keys2);
-        for (const r of rows) add(r.isFba ? 'amazon_fba' : 'amazon_fbm', (r.u || 0) * (qBySku.get(r.k) || 1));
+        for (const r of rows2) add(r.isFba ? 'amazon_fba' : 'amazon_fbm', (r.u || 0) * (qBySku.get(r.k) || 1));
       }
       finance.rows = [...acc.entries()]
-        .map(([mall, pieces]) => ({ mall, label: MALL_LABELS[mall] || mall, pieces: Math.round(pieces * 10) / 10 }))
+        .map(([mall, pieces]) => ({ mall, label: loadDimMall(db).labelOf(mall), pieces: Math.round(pieces * 10) / 10 }))
         .filter(r => r.pieces > 0)
         .sort((a, b) => b.pieces - a.pieces);
     }

@@ -141,6 +141,10 @@ for (let i = 0; i < chunks.length; i++) {
   }
 }
 
+// ⚠️ fetch(undici) 実行後の process.exit() は Windows node で libuv assertion
+// (STATUS_STACK_BUFFER_OVERRUN=-1073740791) になり、成功していても daily-sync に
+// 失敗として報告される (2026-07-09 朝の偽❌、#439 と同根)。
+// undici の keep-alive socket は unref 済みなので、exitCode を設定して自然終了させる。
 const finishDb = new Database(dbPath);
 if (lastError) {
   finishDb.prepare(`
@@ -149,12 +153,12 @@ if (lastError) {
   `).run(lastError, new Date().toISOString(), chunksApplied, totalRowsSent, runId);
   finishDb.close();
   console.log(`✗ sync FAILED: ${lastError}`);
-  process.exit(1);
+  process.exitCode = 1;
+} else {
+  finishDb.prepare(`
+    UPDATE sync_runs SET status = 'applied', chunk_count_received = ?, row_count_received = ?,
+      completed_at = ?, applied_at = ? WHERE run_id = ?
+  `).run(chunksApplied, totalRowsSent, new Date().toISOString(), new Date().toISOString(), runId);
+  finishDb.close();
+  console.log(`✓ sync complete (run_id=${runId}, ${totalRowsSent} rows)`);
 }
-finishDb.prepare(`
-  UPDATE sync_runs SET status = 'applied', chunk_count_received = ?, row_count_received = ?,
-    completed_at = ?, applied_at = ? WHERE run_id = ?
-`).run(chunksApplied, totalRowsSent, new Date().toISOString(), new Date().toISOString(), runId);
-finishDb.close();
-console.log(`✓ sync complete (run_id=${runId}, ${totalRowsSent} rows)`);
-process.exit(0);

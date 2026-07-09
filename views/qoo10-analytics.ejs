@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Qoo10分析ツール - B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="stylesheet" href="/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"
+          integrity="sha384-9nhczxUqK87bcKHh20fSQcTGD4qq5GhayNYSYWqwBkINBhOfQLg/P5HG5lF1urn4"
+          crossorigin="anonymous"></script>
+  <style>
+    body { background: #f5f7fa; }
+    .container { max-width: 1500px; margin: 0 auto; padding: 16px 20px; }
+    .header-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; flex-wrap: wrap; gap: 12px; }
+    .header-row h2 { margin: 0; }
+    .back-link { font-size: 13px; color: #e91e63; text-decoration: none; }
+    .back-link:hover { text-decoration: underline; }
+    .meta-bar { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px 14px; margin-bottom: 12px; font-size: 12px; color: #555; display: flex; gap: 16px; flex-wrap: wrap; align-items: center; }
+
+    /* 精度バッジ (要件 §11-2: 速報/自動(日次)/推定を常時区別。税はすべて税込) */
+    .pbadge { display: inline-block; padding: 1px 7px; border-radius: 4px; font-size: 10px; font-weight: 700; vertical-align: middle; }
+    .pbadge.flash { background: #dbeafe; color: #1e40af; }
+    .pbadge.fact { background: #d1fae5; color: #065f46; }
+    .pbadge.est { background: #fef3c7; color: #92400e; }
+
+    /* タブ (Qoo10 マゼンタ) */
+    .tabs { display: flex; gap: 4px; margin-bottom: -1px; flex-wrap: wrap; }
+    .tab-btn { background: #fff; border: 1px solid #e5e7eb; border-bottom: none; border-radius: 6px 6px 0 0; padding: 10px 16px; cursor: pointer; font-size: 13px; color: #555; }
+    .tab-btn.active { background: #e91e63; color: white; border-color: #e91e63; }
+    .tab-content { background: white; border: 1px solid #e5e7eb; border-radius: 0 8px 8px 8px; padding: 16px; min-height: 400px; }
+    .tab-pane { display: none; }
+    .tab-pane.active { display: block; }
+
+    /* 期間切替 */
+    .period-switcher { display: inline-flex; gap: 4px; background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 6px; padding: 2px; flex-wrap: wrap; }
+    .period-switcher button { background: transparent; border: none; padding: 6px 10px; font-size: 12px; cursor: pointer; border-radius: 4px; color: #555; }
+    .period-switcher button.active { background: #e91e63; color: white; }
+    .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+
+    /* タイル */
+    .tile-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; margin-bottom: 16px; }
+    .tile { background: white; border: 1px solid #e5e7eb; border-radius: 10px; padding: 14px 18px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
+    .tile h3 { margin: 0 0 8px; font-size: 14px; color: #374151; }
+    .tile .row { display: flex; justify-content: space-between; font-size: 13px; padding: 3px 0; color: #4b5563; }
+    .tile .row .v { font-variant-numeric: tabular-nums; font-weight: 600; color: #111; }
+    .tile .row.hero { border-top: 1px dashed #e5e7eb; margin-top: 6px; padding-top: 8px; }
+    .tile .row.hero .v { font-size: 20px; font-weight: 700; }
+    .tile .row.sep { border-top: 1px dashed #e5e7eb; margin-top: 6px; padding-top: 8px; }
+    .pos { color: #047857 !important; } .negv { color: #dc2626 !important; }
+
+    .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
+    .chart-card { background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 14px; }
+    .chart-card h3 { margin: 0 0 8px; font-size: 13px; color: #374151; font-weight: 600; }
+    .chart-wrap { position: relative; height: 300px; }
+    .chart-wrap.tall { height: 420px; }
+    @media (max-width: 900px) { .charts-grid { grid-template-columns: 1fr; } }
+
+    .note { font-size: 11.5px; color: #6b7280; margin: 6px 0; }
+    .warn-note { background: #fffbeb; border-left: 4px solid #f59e0b; padding: 8px 12px; font-size: 12px; color: #92400e; border-radius: 4px; margin-bottom: 12px; }
+    .mega-note { background: #fdf2f8; border-left: 4px solid #e91e63; padding: 8px 12px; font-size: 12px; color: #9d174d; border-radius: 4px; margin-bottom: 12px; }
+    .loading { color: #6b7280; font-size: 13px; padding: 30px; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header-row">
+      <h2>🛒 Qoo10分析ツール</h2>
+      <div style="display:flex; gap:14px; align-items:center;">
+        <span style="font-size:12px; color:#6b7280;"><%= displayName || username || '' %></span>
+        <a class="back-link" href="/">← ポータルへ戻る</a>
+      </div>
+    </div>
+    <div class="meta-bar">
+      <span>精度: <span class="pbadge flash">速報</span>=NE受注ベース(毎朝更新) <span class="pbadge fact">確定</span>=配送完了fact(手数料<b>実額</b>) <span class="pbadge est">推定</span>=メガ割等セラー負担(割引×50%) / 金額はすべて<b>税込</b></span>
+      <span id="meta-updated"></span>
+    </div>
+
+    <div class="tabs" id="tabs">
+      <button class="tab-btn active" data-tab="overview">🏠 概要</button>
+      <button class="tab-btn" data-tab="bestsellers">🏆 売れ筋</button>
+      <button class="tab-btn" data-tab="profit">💰 利益分析</button>
+      <button class="tab-btn" data-tab="ads">📣 広告</button>
+      <button class="tab-btn" data-tab="megawari">🎪 メガ割</button>
+      <button class="tab-btn" data-tab="diagnosis">🩺 診断</button>
+      <button class="tab-btn" data-tab="import">📥 取込</button>
+      <button class="tab-btn" data-tab="claims">📦 返品・出品</button>
+      <button class="tab-btn" data-tab="settings">⚙️ 設定</button>
+    </div>
+
+    <div class="tab-content">
+      <!-- 🏠 概要 -->
+      <div class="tab-pane active" id="pane-overview">
+        <div id="ov-unresolved"></div>
+        <div id="ov-tiles" class="tile-grid"><div class="loading">読み込み中…</div></div>
+        <div class="toolbar">
+          <div class="period-switcher" id="ov-period"></div>
+          <span class="note" id="ov-freshness"></span>
+        </div>
+        <div id="ov-trend-error"></div>
+        <div class="charts-grid">
+          <div class="chart-card" style="grid-column: 1 / -1;">
+            <h3>売上 × 粗利 × 粗利率 <span class="note">棒=確定売上(GMV)<span class="pbadge fact">確定</span> 桃色棒=メガ割開催 / 青線=速報売上(NE受注)<span class="pbadge flash">速報</span> / 粗利L1はセラー負担・広告費 控除前</span></h3>
+            <div class="chart-wrap tall"><canvas id="chart-trend"></canvas></div>
+          </div>
+          <div class="chart-card">
+            <h3>販売数 × 客単価 <span class="pbadge fact">確定</span></h3>
+            <div class="chart-wrap"><canvas id="chart-units"></canvas></div>
+          </div>
+          <div class="chart-card">
+            <h3>プロモ割引の推移 (メガ割 / メガポ / その他 — プラットフォーム割引<b>全体</b>。セラー負担はこの約50% <span class="pbadge est">推定</span>) <span class="pbadge fact">確定</span></h3>
+            <div class="chart-wrap"><canvas id="chart-promo"></canvas></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 🏆 売れ筋 (P3) -->
+      <div class="tab-pane" id="pane-bestsellers">
+        <div class="warn-note">準備中 (P3)。実装予定: 売れ筋ランキング (数量/売上/L1粗利の3軸) / 急上昇・急落 / ABC分析 / メガ割依存度 (メガ割期間売上÷総売上、Qoo10独自) / 曜日・日付パターン / 販売速度スパークライン。</div>
+      </div>
+
+      <!-- 💰 利益分析 (P3) -->
+      <div class="tab-pane" id="pane-profit">
+        <div class="warn-note">準備中 (P3)。実装予定: Qoo10版利益ウォーターフォール (GMV→手数料実額→受取→原価・送料→L1→セラー負担推定→L2) / SKU別利益テーブル (手数料率の実測列 = 9%/10%混在の可視化・match_tier付き) / P4以降: 精算Excel取込でL3確定純利益 (メガ割先行差引・補償金・利用料調整の突合)。</div>
+      </div>
+
+      <!-- 📣 広告 (P5) -->
+      <div class="tab-pane" id="pane-ads">
+        <div class="warn-note">準備中 (P5)。実装予定: スマートセールス商品別実績 (Excel取込) / 実効広告率 (スマートセールス+定額広告按分)÷売上 の損益分岐判定 (🟢余裕/🟡限界/🔴広告赤字) / スマートセールス料率の妥当性診断 / 定額広告 (パワーランクアップ/Mega AD等) の期間前後比較。<br>データは 📥取込タブ (P4-P5) からのQSM Excelアップロードで入ります (Qoo10に広告APIは存在しないため)。</div>
+      </div>
+
+      <!-- 🎪 メガ割 (P6) — 本アプリの目玉 -->
+      <div class="tab-pane" id="pane-megawari">
+        <div class="mega-note">準備中 (P6 — 本アプリの目玉)。実装予定: 開催回カレンダー (開催期間・エントリーSKU管理、過去分はfactから逆推定して初期構築) / 開催回ごとの損益判定 (平常時ベースライン比の増分売上・増分L2利益 −セラー負担 −追加広告費 =「参加して儲かったのか」) / SKU別メガ割成績表 (リフト倍率×負担後利益) → 次回エントリー推奨リスト / 参加シミュレーション / エントリー資格の常時監視 (キャンセル率10%未満)。<br>市販ツールが1つも無い空白領域です (競合調査 2026-07-06)。次回メガ割 (例年9月頃) までにここへ到達するのが目標。</div>
+      </div>
+
+      <!-- 🩺 診断 (P8) -->
+      <div class="tab-pane" id="pane-diagnosis">
+        <div class="warn-note">準備中 (P8)。実装予定: 稼ぎ頭 / 赤字SKU / メガ割で赤字 / 広告垂れ流し / 死に筋 / 価格ミス疑い (メガ割期間除外判定) / 手数料異常 (SettlePrice公式一致率の急変) / SKU未解決 / CVR異常 / 出したのに売れてない の自動判定リスト + GChatアラート (QOO10_CERT_KEY 失効30日前警告含む)。</div>
+      </div>
+
+      <!-- 📥 取込 (P4) -->
+      <div class="tab-pane" id="pane-import">
+        <div class="warn-note">準備中 (P4 — 確定利益の本丸)。実装予定: QSM精算内訳Excel / スマートセールス実績Excel / Qoo10 Analyticsトラフィック・CVR Excel のドラッグ&ドロップ取込 (種別自動判別・file_hash重複排除・run_id publish) + データ鮮度ボード (前月分の精算内訳が翌月15日まで未取込ならGChat通知)。<br>精算内訳の「販売促進費 / メガプロモーション補償金 / 利用料調整」3費目を対応付けてメガ割セラー負担を<b>実額</b>確定し、L3確定純利益 (variable_margin_full) をbackfillします。DL運用は月1〜2回 (§13-②)。</div>
+      </div>
+
+      <!-- 📦 返品・出品 (P9) -->
+      <div class="tab-pane" id="pane-claims">
+        <div class="warn-note">準備中 (P9 — 新規API承認済み §13-⑥)。実装予定: 返品・クレーム統合 (GetClaimInfo_V3: SKU別返品率、メガ割参加資格 = キャンセル率10%未満の常時監視) / 出品・価格監視 (GetAllGoodsInfo: 価格ミス検知の精度向上、出品停止検知)。miniPC側の新規API取得を伴うため単独PR+smokeで実施。</div>
+      </div>
+
+      <!-- ⚙️ 設定 (P3) -->
+      <div class="tab-pane" id="pane-settings">
+        <div class="warn-note">準備中 (P3)。実装予定: メガ割/メガポ開催回マスタ (第N回・期間・参加有無 — 過去分はfactから逆推定して初期登録) / セラー負担率 (既定50%、精算実額で較正・改定履歴つき) / スマートセールス料率記録 / APIキー期限管理 (QOO10_CERT_KEYは年1回再発行) / 診断閾値 / GChat通知。</div>
+      </div>
+    </div>
+  </div>
+
+<script>
+// ============================================================
+// 共通 util
+// ============================================================
+const API = '/apps/qoo10-analytics/api/v1';
+const charts = {};
+function destroyChart(id) { if (charts[id]) { charts[id].destroy(); delete charts[id]; } }
+function mkChart(id, cfg) { destroyChart(id); charts[id] = new Chart(document.getElementById(id).getContext('2d'), cfg); return charts[id]; }
+
+// 金額: 経営向け日本語単位 (億/万) — feedback_japanese_currency_units
+function fmtJPY(n) {
+  if (n === null || n === undefined) return '−';
+  const neg = n < 0; const a = Math.abs(Math.round(n));
+  let s;
+  if (a >= 100000000) s = (a / 100000000).toFixed(2).replace(/\.?0+$/, '') + '億円';
+  else if (a >= 10000) s = Math.round(a / 10000).toLocaleString() + '万円';
+  else s = '¥' + a.toLocaleString();
+  return neg ? '−' + s : s;
+}
+function fmtYen(n) { if (n === null || n === undefined) return '−'; return '¥' + Math.round(n).toLocaleString(); }
+function fmtPct(n) { return (n === null || n === undefined) ? '−' : n + '%'; }
+function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+async function getJSON(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return res.json();
+}
+function signClass(n) { return n < 0 ? 'negv' : n > 0 ? 'pos' : ''; }
+
+// 期間プリセット
+const PRESETS = [
+  ['7d', '7日'], ['14d', '14日'], ['30d', '30日'], ['90d', '90日'],
+  ['this_month', '今月'], ['last_month', '先月'], ['12m', '12ヶ月'], ['this_year', '今年'],
+];
+function mountPeriodSwitcher(elId, defaultPreset, onChange) {
+  const el = document.getElementById(elId);
+  el.innerHTML = PRESETS.map(([k, label]) =>
+    `<button data-preset="${k}" class="${k === defaultPreset ? 'active' : ''}">${label}</button>`).join('');
+  el.addEventListener('click', (e) => {
+    const btn = e.target.closest('button'); if (!btn) return;
+    el.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    onChange(btn.dataset.preset);
+  });
+}
+
+// ============================================================
+// タブ制御 (lazy load)
+// ============================================================
+const loaded = {};
+document.getElementById('tabs').addEventListener('click', (e) => {
+  const btn = e.target.closest('.tab-btn'); if (!btn) return;
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('pane-' + btn.dataset.tab).classList.add('active');
+  loadTab(btn.dataset.tab);
+});
+function loadTab(tab) {
+  if (loaded[tab]) return;
+  loaded[tab] = true;
+  ({ overview: loadOverview }[tab] || (() => {}))();
+}
+
+// ============================================================
+// 🏠 概要
+// ============================================================
+let ovPreset = '30d';
+async function loadOverview() {
+  try {
+    const data = await getJSON(API + '/overview');
+    document.getElementById('meta-updated').textContent =
+      `確定fact最終日: ${data.fact_data_to || '−'} / 速報最終日: ${data.flash_data_to || '−'} / 生成: ${new Date(data.generated_at).toLocaleString('ja-JP')}`;
+    document.getElementById('ov-freshness').textContent =
+      '確定factは配送完了(Delivered)のみ計上のため直近数日は必ず小さく出ます。「確定待ち目安」= 速報売上 − 確定済み顧客支払 (基準が違うため参考値)。';
+    if (data.unresolved && data.unresolved.sku_count > 0) {
+      document.getElementById('ov-unresolved').innerHTML =
+        `<div class="warn-note">⚠️ SKU未解決: 今月 <b>${data.unresolved.sku_count}</b> SKU / 売上 ${fmtJPY(data.unresolved.gmv)} (${fmtPct(data.unresolved.share_pct)}) が商品マスタに紐づいていません (原価0円計上のため粗利が過大に出ます)。</div>`;
+    }
+    const burdenPct = Math.round((data.seller_burden_rate || 0.5) * 100);
+    const tiles = data.tiles.map(t => {
+      const f = t.fact;
+      return `<div class="tile">
+        <h3>${t.label} <span class="note">(${t.from}${t.from !== t.to ? '〜' + t.to : ''})</span></h3>
+        <div class="row"><span>売上(受注) <span class="pbadge flash">速報</span></span><span class="v">${fmtJPY(t.flash.sales_incl)}</span></div>
+        <div class="row"><span>注文数 / 販売数 <span class="pbadge flash">速報</span></span><span class="v">${(t.flash.orders ?? 0).toLocaleString()} / ${(t.flash.units ?? 0).toLocaleString()}</span></div>
+        <div class="row sep"><span>売上(GMV・配送完了分) <span class="pbadge fact">確定</span></span><span class="v">${fmtJPY(f.gmv)}</span></div>
+        <div class="row"><span>手数料 <span class="pbadge fact">実額</span> <span class="note">${fmtPct(f.fee_pct)}</span></span><span class="v">−${fmtYen(f.platform_fee)}</span></div>
+        <div class="row"><span>プロモ割引(全体) <span class="note">ﾒｶﾞ割${fmtYen(f.megawari_discount)}/ﾒｶﾞﾎﾟ${fmtYen(f.megapo_discount)}</span></span><span class="v">${fmtYen(f.promo_total)}</span></div>
+        <div class="row"><span>送料(想定) / 原価 <span class="note">ｶﾊﾞｰ${fmtPct(f.cost_coverage_pct)}</span></span><span class="v">−${fmtYen(f.shipping)} / −${fmtYen(f.cogs)}</span></div>
+        <div class="row hero"><span>粗利 L1 <span class="pbadge fact">確定</span> <span class="note">${fmtPct(f.margin_pct)}</span></span><span class="v ${signClass(f.variable_margin)}">${fmtJPY(f.variable_margin)}</span></div>
+        <div class="row"><span>セラー負担 <span class="pbadge est">推定${burdenPct}%</span> → L2参考</span><span class="v ${signClass(f.l2_ref)}">−${fmtYen(f.burden_est)} → ${fmtJPY(f.l2_ref)}</span></div>
+        <div class="row"><span class="note">確定待ち目安 (未配送分)</span><span class="v note">${fmtJPY(t.pending_est)}</span></div>
+      </div>`;
+    }).join('');
+    document.getElementById('ov-tiles').innerHTML = tiles;
+  } catch (e) {
+    document.getElementById('ov-tiles').innerHTML = `<div class="warn-note">概要の取得に失敗: ${esc(e.message)}</div>`;
+  }
+  mountPeriodSwitcher('ov-period', ovPreset, (p) => { ovPreset = p; loadTrend(); });
+  loadTrend();
+}
+
+async function loadTrend() {
+  try {
+    document.getElementById('ov-trend-error').innerHTML = '';
+    const gran = ['12m', 'this_year'].includes(ovPreset) ? 'month' : ovPreset === '90d' ? 'week' : 'day';
+    const data = await getJSON(`${API}/trend?preset=${ovPreset}&granularity=${gran}`);
+    const labels = data.rows.map(r => r.bucket);
+
+    mkChart('chart-trend', {
+      type: 'bar',
+      data: { labels, datasets: [
+        // メガ割開催バケットは濃い桃色でハイライト (要件 F-2③、fact の megawari 実データ由来)
+        { label: '確定売上(GMV)', data: data.rows.map(r => r.gmv), backgroundColor: data.rows.map(r => r.is_megawari ? '#f472b6' : '#fbcfe8'), yAxisID: 'y', order: 3 },
+        { label: '速報売上(受注)', data: data.rows.map(r => r.flash_sales), type: 'line', borderColor: '#2563eb', borderDash: [5, 3], pointRadius: 0, yAxisID: 'y', order: 2 },
+        { label: '粗利L1', data: data.rows.map(r => r.variable_margin), type: 'line', borderColor: '#047857', pointRadius: 0, yAxisID: 'y', order: 1 },
+        { label: '粗利率%', data: data.rows.map(r => r.margin_pct), type: 'line', borderColor: '#f59e0b', pointRadius: 0, yAxisID: 'y1', order: 0 },
+      ]},
+      options: { responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false },
+        scales: { y: { position: 'left', ticks: { callback: v => fmtJPY(v) } }, y1: { position: 'right', grid: { drawOnChartArea: false }, ticks: { callback: v => v + '%' } } },
+        plugins: { tooltip: { callbacks: {
+          label: c => c.dataset.label + ': ' + (c.dataset.yAxisID === 'y1' ? fmtPct(c.parsed.y) : fmtJPY(c.parsed.y)),
+          footer: (items) => {
+            const r = data.rows.find(x => x.bucket === items[0]?.label);
+            return r && r.is_megawari ? `🎪 メガ割/メガポ開催 (割引 ${fmtJPY(r.megawari_discount + r.megapo_discount)} / セラー負担推定 ${fmtJPY(r.burden_est)})` : '';
+          },
+        } } } },
+    });
+
+    mkChart('chart-units', {
+      type: 'bar',
+      data: { labels, datasets: [
+        { label: '販売数(確定)', data: data.rows.map(r => r.units_net), backgroundColor: '#93c5fd', yAxisID: 'y' },
+        { label: '客単価', data: data.rows.map(r => r.avg_unit_price), type: 'line', borderColor: '#7c3aed', pointRadius: 0, yAxisID: 'y1' },
+      ]},
+      options: { responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false },
+        scales: { y: {}, y1: { position: 'right', grid: { drawOnChartArea: false }, ticks: { callback: v => fmtYen(v) } } },
+        plugins: { tooltip: { callbacks: { label: c => c.dataset.label + ': ' + (c.dataset.yAxisID === 'y1' ? fmtYen(c.parsed.y) : c.parsed.y.toLocaleString()) } } } },
+    });
+
+    mkChart('chart-promo', {
+      type: 'line',
+      data: { labels, datasets: [
+        { label: 'メガ割割引', data: data.rows.map(r => r.megawari_discount), borderColor: '#e91e63', backgroundColor: 'rgba(233,30,99,0.10)', fill: true, pointRadius: 0 },
+        { label: 'メガポ割引', data: data.rows.map(r => r.megapo_discount), borderColor: '#7c3aed', backgroundColor: 'rgba(124,58,237,0.08)', fill: true, pointRadius: 0 },
+        { label: 'その他プロモ', data: data.rows.map(r => r.other_promo_discount), borderColor: '#6b7280', backgroundColor: 'rgba(107,114,128,0.08)', fill: true, pointRadius: 0 },
+      ]},
+      options: { responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false },
+        scales: { y: { ticks: { callback: v => fmtJPY(v) } } },
+        plugins: { tooltip: { callbacks: { label: c => c.dataset.label + ': ' + fmtJPY(c.parsed.y) } } } },
+    });
+  } catch (e) {
+    console.error(e);
+    // グラフ側の失敗も沈黙させない (空データと誤認させない — Codex R1 low)
+    document.getElementById('ov-trend-error').innerHTML =
+      `<div class="warn-note">トレンドの取得に失敗: ${esc(e.message)} (グラフは前回表示のまま/未描画です)</div>`;
+  }
+}
+
+// 初期ロード
+loadTab('overview');
+</script>
+</body>
+</html>
