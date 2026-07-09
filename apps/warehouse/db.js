@@ -325,6 +325,27 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_yh_orders_date ON raw_yahoo_orders(order_time)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_yh_orders_item ON raw_yahoo_orders(item_id)');
 
+  // 12b. raw_mercari_orders (監査PR-12(c)/V-4 対応)
+  // 従来は mall-orders.js (廃止済み) が自前 CREATE していた UNIQUE 制約ゼロの表で、
+  // 「毎日直近7日再取得 → 同一注文が最大7回重複append → 集計した瞬間に売上約7倍」の地雷だった
+  // (現状は writer 停止済みで 0 行)。DDL を db.js に正本化し UNIQUE index で武装。
+  // option_info は NULL があり得るため COALESCE で NULL 同士の重複も防ぐ。
+  db.exec(`CREATE TABLE IF NOT EXISTS raw_mercari_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id            TEXT,
+    order_date          TEXT,
+    order_status        TEXT,
+    item_code           TEXT,
+    item_name           TEXT,
+    quantity            INTEGER,
+    unit_price          REAL,
+    total_price         REAL,
+    option_info         TEXT,
+    synced_at           TEXT
+  )`);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS uq_mercari_order_line
+    ON raw_mercari_orders(order_id, item_code, COALESCE(option_info, ''))`);
+
   // 13. 店舗マスタ
   db.exec(`CREATE TABLE IF NOT EXISTS shops (
     shop_code           TEXT PRIMARY KEY,
@@ -1278,7 +1299,9 @@ function createTables() {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_lines_posted_utc  ON raw_amazon_settlement_lines(posted_date_utc)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_lines_tx_price    ON raw_amazon_settlement_lines(transaction_type, price_type)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_lines_tx_fee      ON raw_amazon_settlement_lines(transaction_type, item_related_fee_type)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_lines_settlement  ON raw_amazon_settlement_lines(source_settlement_id)`);
+  // 監査PR-12(d): idx_settle_lines_settlement(source_settlement_id) は idx_settle_lines_dedup の
+  // 完全prefixで冗長(67MB+INSERTコスト、INV-22) → 作成を廃止。既存DBからの削除は
+  // migrate-audit-pr12-cleanup.js が行う (boot時DROPはしない=migration実行を明示化)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_lines_order       ON raw_amazon_settlement_lines(amazon_order_id)`);
 
   // ---- dim: 自動 INSERT で蓄積 ----

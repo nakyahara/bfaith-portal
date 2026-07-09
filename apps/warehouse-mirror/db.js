@@ -83,6 +83,11 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_status ON mirror_products(取扱区分)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_type ON mirror_products(商品区分)');
 
+  // 監査PR-12(a): mirror_sku_map は sku_map(miniPC側、writer停止済み・Step7 DROP待ち)の
+  // dead受け皿でコード参照0件。miniPC側 sku_map から再同期可能なため mirror 側は先行DROP
+  // (冪等。sku_map 本体の DROP は SKU統合Step7 の判断に従う)
+  db.exec('DROP TABLE IF EXISTS mirror_sku_map');
+
   // ─── dim_mall: モールマスタ (設計監査 2026-07-06 PR-11) ───
   // MALL_ORDER/MALL_LABEL/TAX_INCLUDED_MALLS/MALL_FEE_RATES 等の散在ハードコードの正本。
   // code-owned config なので boot 時に seed で全置換 (手編集しない。変更はこの配列を直す)。
