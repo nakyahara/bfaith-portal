@@ -1319,18 +1319,10 @@ function createTables() {
     observed_first_at TEXT, observed_last_at TEXT
   )`);
 
-  // ---- bridge: 販売月リステート用 ----
-  db.exec(`CREATE TABLE IF NOT EXISTS bridge_amazon_order_sale_month (
-    amazon_order_id        TEXT NOT NULL,
-    order_item_code        TEXT NOT NULL,
-    seller_sku_normalized  TEXT NOT NULL,
-    original_year_month    INTEGER NOT NULL,
-    original_economic_date TEXT NOT NULL,
-    original_settlement_id TEXT NOT NULL,
-    ingested_at            TEXT,
-    PRIMARY KEY (amazon_order_id, order_item_code, seller_sku_normalized)
-  ) WITHOUT ROWID`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_bridge_year_month ON bridge_amazon_order_sale_month(original_year_month)`);
+  // ---- bridge: 販売月リステート用 → 監査PR-14で廃止 ----
+  // bridge_amazon_order_sale_month は CREATE のみで書き手/読み手が実装されないまま
+  // 0行 (監査F-7 dead候補)。作成を廃止 (既存DBからの削除は migrate-audit-pr14-financial-orphan.js)。
+  // 販売月リステートが将来必要になれば、その時の設計 (全社DDL規約準拠) で作り直す。
 
   // ---- mart: long fact ----
   db.exec(`CREATE TABLE IF NOT EXISTS fact_amazon_settlement_monthly_long (
@@ -1963,40 +1955,13 @@ function createTables() {
     FROM sku_agg
   `);
 
-  // ---- 切替判定 view (v3 vs v4) ----
-  db.exec(`DROP VIEW IF EXISTS v_settlement_v3_v4_validation`);
-  db.exec(`CREATE VIEW v_settlement_v3_v4_validation AS
-    WITH v3_monthly AS (
-      SELECT LOWER(TRIM(モール商品コード)) AS seller_sku_normalized,
-             CAST(strftime('%Y%m', 日付) AS INTEGER) AS year_month_int,
-             SUM(数量) AS qty_v3,
-             SUM(原価_税込)/1.1 AS cost_excl_v3,
-             SUM(商品売上)/1.1 AS sales_excl_v3
-      FROM v_amazon_sku_profit_actual
-      GROUP BY LOWER(TRIM(モール商品コード)), year_month_int
-    ),
-    v4_monthly AS (
-      SELECT seller_sku_normalized, year_month_int,
-             qty_net_sold AS qty_v4,
-             (sales_principal_micro / 1000000.0) AS sales_v4
-      FROM fact_amazon_settlement_monthly_wide
-    )
-    SELECT
-      COALESCE(v4.year_month_int, v3.year_month_int) AS year_month_int,
-      COALESCE(v4.seller_sku_normalized, v3.seller_sku_normalized) AS seller_sku_normalized,
-      v3.qty_v3, v4.qty_v4,
-      COALESCE(v4.qty_v4, 0) - COALESCE(v3.qty_v3, 0) AS qty_delta,
-      v3.sales_excl_v3, v4.sales_v4,
-      COALESCE(v4.sales_v4, 0) - COALESCE(v3.sales_excl_v3, 0) AS sales_delta,
-      CASE
-        WHEN ABS(COALESCE(v4.qty_v4, 0) - COALESCE(v3.qty_v3, 0)) <= MAX(1, CAST(ABS(COALESCE(v3.qty_v3, 0)) * 0.001 AS INTEGER))
-        THEN 1 ELSE 0
-      END AS qty_validated_flag
-    FROM v4_monthly v4
-    LEFT JOIN v3_monthly v3
-      ON v4.seller_sku_normalized = v3.seller_sku_normalized
-      AND v4.year_month_int = v3.year_month_int
-  `);
+  // ---- 切替判定 view (v3 vs v4) → 監査PR-14で廃止 ----
+  // v_settlement_v3_v4_validation は 2026-05 の settlement V3→V4 切替時の突合用で、
+  // V4 が SSoT として安定稼働済みのため役目を終えた。v3 側チェーン
+  // (v_amazon_sku_profit_actual → fact_amazon_order_level_resolved →
+  //  raw_amazon_financial_lines 1.65M行 = 運用停止した旧実験系) ごと
+  // migrate-audit-pr14-financial-orphan.js で削除。
+  // ※ 現役の v_amazon_sku_profit_actual_v4 は settlement 系のみに依存し無関係 (要検証済)。
 
   // ---- m_products trigger 廃止 (差分バッチ record-m-products-history.js に置き換え)
   // 旧 trigger が残っていると rebuild-m-products.js の DELETE+INSERT 全件で
