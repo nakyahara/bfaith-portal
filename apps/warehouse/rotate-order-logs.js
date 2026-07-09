@@ -50,26 +50,47 @@ for (const table of TABLES) {
 
   for (const month of months) {
     try {
-      const rows = db.prepare(
-        `SELECT * FROM "${table}" WHERE substr(ingested_at, 1, 7) = ? AND ingested_at < ?`
-      ).all(month, cutoff);
-      if (rows.length === 0) continue;
-
-      // 1) アーカイブ (temp→rename で書きかけファイルを残さない)
+      // 1) アーカイブ (Codex R1 high: sp log は月100万行超のため .all()+gzipSync は OOM リスク
+      //    → iterate() + gzip ストリームで1行ずつ書き出す。temp→rename で書きかけを残さない)
       const outName = `${table}-${month}-${runStamp}.jsonl.gz`;
       const outPath = path.join(ARCHIVE_DIR, outName);
-      const jsonl = rows.map(r => JSON.stringify(r)).join('\n') + '\n';
-      fs.writeFileSync(outPath + '.tmp', zlib.gzipSync(jsonl, { level: 6 }));
+      const gz = zlib.createGzip({ level: 6 });
+      const sink = fs.createWriteStream(outPath + '.tmp');
+      gz.pipe(sink);
+      let archived = 0;
+      for (const row of db.prepare(
+        `SELECT * FROM "${table}" WHERE substr(ingested_at, 1, 7) = ? AND ingested_at < ?`
+      ).iterate(month, cutoff)) {
+        if (!gz.write(JSON.stringify(row) + '\n')) {
+          await new Promise((r) => gz.once('drain', r));
+        }
+        archived++;
+      }
+      await new Promise((resolve, reject) => {
+        sink.on('finish', resolve);
+        sink.on('error', reject);
+        gz.on('error', reject);
+        gz.end();
+      });
+      if (archived === 0) { fs.rmSync(outPath + '.tmp', { force: true }); continue; }
       fs.renameSync(outPath + '.tmp', outPath);
 
-      // 2) アーカイブ成功後に同条件で DELETE (月単位tx)
-      const del = db.prepare(
-        `DELETE FROM "${table}" WHERE substr(ingested_at, 1, 7) = ? AND ingested_at < ?`
-      ).run(month, cutoff);
+      // 2) アーカイブ成功後に DELETE (5万行ずつのバッチtx = 巨大txによる長ロック/WAL膨張を回避)
+      let deleted = 0;
+      const delStmt = db.prepare(
+        `DELETE FROM "${table}" WHERE id IN (
+           SELECT id FROM "${table}" WHERE substr(ingested_at, 1, 7) = ? AND ingested_at < ? LIMIT 50000
+         )`
+      );
+      while (true) {
+        const r = delStmt.run(month, cutoff);
+        deleted += r.changes;
+        if (r.changes < 50000) break;
+      }
 
-      totalArchived += rows.length;
-      totalDeleted += del.changes;
-      console.log(`[rotate-logs] ${table} ${month}: archive=${rows.length}行 → ${outName}, delete=${del.changes}行`);
+      totalArchived += archived;
+      totalDeleted += deleted;
+      console.log(`[rotate-logs] ${table} ${month}: archive=${archived}行 → ${outName}, delete=${deleted}行`);
     } catch (e) {
       // 月単位で独立: 1月分の失敗は他の月・他のテーブルを止めない (無音にはしない)
       hadError = true;
