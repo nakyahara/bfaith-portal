@@ -392,7 +392,31 @@ const UPSERT_REFRESH_QUEUE_SQL = `
     processed_at = NULL
 `;
 
-function ingestSettlement(db, headerRow, lineRows, ctx) {
+// ─── TSV → 正規化行 (監査PR-13: 冪等性テストが本番同一経路を叩けるよう関数化+export) ───
+// main のレポート処理ループから抽出。純関数 (DB 非依存)。
+export function prepareReportTsv(tsv, reportId, runId) {
+  const sourceFileHash = sha256(tsv);
+  const { rows } = parseTsv(tsv);
+  const ctx = {
+    sourceDocumentId: reportId,
+    sourceFileHash,
+    sourcePath: `sp_api://${REPORT_TYPE}/${reportId}`,
+    runId,
+    observedAt: nowIso(),
+  };
+  let headerRow = null;
+  const lineRows = [];
+  for (const raw of rows) {
+    if (isHeaderRow(raw)) {
+      headerRow = normalizeHeaderRow(raw, ctx);
+    } else {
+      lineRows.push(normalizeLineRow(raw, ctx));
+    }
+  }
+  return { headerRow, lineRows, ctx, sourceFileHash, rowCount: rows.length };
+}
+
+export function ingestSettlement(db, headerRow, lineRows, ctx) {
   const insertHeader = db.prepare(INSERT_HEADER_SQL);
   const insertLine = db.prepare(INSERT_LINE_SQL);
   const upsertDimTx = db.prepare(UPSERT_DIM_TX_SQL);
@@ -464,29 +488,9 @@ async function main() {
     console.log(`\n[${i + 1}/${reports.length}] reportId=${r.reportId} (${r.dataStartTime?.slice(0, 10)} 〜 ${r.dataEndTime?.slice(0, 10)})`);
 
     const tsv = await downloadReportTsv(r.reportDocumentId);
-    const sourceFileHash = sha256(tsv);
+    const { headerRow, lineRows, ctx, sourceFileHash, rowCount } = prepareReportTsv(tsv, r.reportId, runId);
     console.log(`  bytes: ${tsv.length}, file_hash: ${sourceFileHash.slice(0, 12)}...`);
-
-    const { rows } = parseTsv(tsv);
-    console.log(`  rows: ${rows.length}`);
-
-    const ctx = {
-      sourceDocumentId: r.reportId,
-      sourceFileHash,
-      sourcePath: `sp_api://${REPORT_TYPE}/${r.reportId}`,
-      runId,
-      observedAt: nowIso(),
-    };
-
-    let headerRow = null;
-    const lineRows = [];
-    for (const raw of rows) {
-      if (isHeaderRow(raw)) {
-        headerRow = normalizeHeaderRow(raw, ctx);
-      } else {
-        lineRows.push(normalizeLineRow(raw, ctx));
-      }
-    }
+    console.log(`  rows: ${rowCount}`);
     console.log(`  parsed: header=${headerRow ? 1 : 0}, lines=${lineRows.length}`);
 
     if (args.dryRun) {
@@ -520,4 +524,13 @@ async function main() {
   if (args.dryRun) console.log('[dry-run] 実 DB 変更なし');
 }
 
-main().catch(e => { console.error('FATAL:', e?.message || e); if (e?.stack) console.error(e.stack); process.exit(1); });
+// 監査PR-13: テストから import できるよう、直接実行時のみ main を起動
+// (daily-sync は execFileSync で直接実行 = 従来通り動く)
+import { pathToFileURL } from 'node:url';
+const isDirectRun = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isDirectRun) {
+  main().catch(e => { console.error('FATAL:', e?.message || e); if (e?.stack) console.error(e.stack); process.exit(1); });
+}
+
+// テスト用 export (本番経路と同一の関数群。監査PR-13 冪等性smokeテストが使用)
+export { makePhysicalHash, makeBusinessKey, parseAmount, PHYSICAL_HASH_EXCLUDE };

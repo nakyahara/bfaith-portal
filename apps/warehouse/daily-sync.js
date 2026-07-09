@@ -252,6 +252,12 @@ async function main() {
   const vpsEnvResult = runScript('apps/warehouse/sync-vps-env.js', 'VPS env同期');
   results.push({ name: 'VPS env同期', ...vpsEnvResult });
 
+  // Settlement 冪等性 smoke テスト (監査PR-13/INV-27。一時DB相手に数秒で完了、本番DBに触れない)
+  // hash設計が崩れると PR #229 (31.8M行膨張) が再発するため、Settlement 取得より前に毎朝検証。
+  // 失敗しても以降のジョブは止めない (❌通知で気付く)。
+  const idemResult = runScript('apps/warehouse/test-settlement-idempotency.js', 'Settlement冪等性テスト', 120000);
+  results.push({ name: 'Settlement冪等性テスト', ...idemResult });
+
   // NE API（商品マスタ + セット商品 + 受注7日分）
   const neResult = runScript('apps/warehouse/ne-api.js sync', 'NE API');
   results.push({ name: 'NE', ...neResult });
