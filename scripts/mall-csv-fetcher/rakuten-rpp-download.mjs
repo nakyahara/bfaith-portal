@@ -5,9 +5,11 @@
  *   1. 商品別 × 月ごと (全商品レポートDL)     → fact_rakuten_ads_rpp (月次×SKU)
  *   2. すべての広告 × 日ごと (この条件でDL)   → fact_rakuten_ads_rpp_daily (日次合計)
  *
- * 日付範囲 = 先月1日〜昨日 (月初3日までは前々月1日〜)。過去分は変動する (不正クリック控除、
- * 720h遡及) ため毎回同範囲を取り直して UPSERT。
+ * 対象月 = 今月+先月 (月初3日までは前々月も)。⭐実測: 期間は「1ヶ月以内」制約があるため
+ * 月ごとに1リクエストずつDLする。過去分は変動する (不正クリック控除、720h遡及) ため
+ * 毎回同月を取り直して UPSERT。
  * ⚠️「全期間で表示」は指定日付範囲の1バケツ集計であり all-time ではない (実測 2026-07-09)。
+ * ⚠️「月ごとに表示」選択時は期間入力が YYYY-MM の月入力に変わる (placeholder=Select start/end)。
  *
  * ⭐業務仕様: 広告は「5のつく日」等スポットのみ出稿 → 期間にデータが無いことがあり得る。
  *   空=正常終了扱い (障害アラートにしない。report_fetch_log に status='empty' で記録)。
@@ -44,16 +46,29 @@ const HISTORY_URL = 'https://ad.rms.rakuten.co.jp/rpp/download'; // 実測: ダ�
 const WAREHOUSE_DATA_DIR = (process.env.WAREHOUSE_DATA_DIR || process.env.DATA_DIR || '').trim();
 const INCOMING_DIR = WAREHOUSE_DATA_DIR ? join(WAREHOUSE_DATA_DIR, 'incoming', 'rakuten-ads') : null;
 
-// ─── 日付範囲 (JST): 先月1日〜昨日。月初3日までは前々月1日〜 (720h遡及+月替わりカバー) ───
+// ─── 対象月 (JST): 今月+先月 (月初3日までは前々月も)。720h遡及+月替わりカバー ───
+// ⭐実測 (2026-07-09): RPPレポートは「※期間は1ヶ月以内に絞ってください」の制約があり
+// 複数月を1回でDLできない → 月ごとに1リクエストずつループする。
+// 「月ごとに表示」選択時は日付欄が YYYY-MM の月入力に変わる (placeholder=Select start/end)。
 function jstNow() { return new Date(Date.now() + 9 * 3600 * 1000); }
-function computeRange() {
+function computeTargetMonths() {
   const now = jstNow();
   const y = now.getUTCFullYear(), m = now.getUTCMonth(), d = now.getUTCDate();
-  const backMonths = d <= 3 ? 2 : 1;
-  const start = new Date(Date.UTC(y, m - backMonths, 1));
-  const end = new Date(Date.UTC(y, m, d - 1)); // 集計は昨日まで
+  const yesterday = new Date(Date.UTC(y, m, d - 1)); // 集計は昨日まで
   const iso = (dt) => dt.toISOString().slice(0, 10);
-  return { from: iso(start), to: iso(end) };
+  const backs = d <= 3 ? [2, 1, 0] : [1, 0]; // 古い月から順に
+  const months = [];
+  for (const back of backs) {
+    const first = new Date(Date.UTC(y, m - back, 1));
+    if (first > yesterday) continue; // 月初1日実行時の「今月」はデータなし → スキップ
+    const last = new Date(Date.UTC(y, m - back + 1, 0));
+    months.push({
+      ym: iso(first).slice(0, 7),
+      from: iso(first),
+      to: iso(last < yesterday ? last : yesterday),
+    });
+  }
+  return months;
 }
 
 async function snap(page, label) {
@@ -91,32 +106,38 @@ async function verifyRadioChecked(page, idSels) {
 }
 
 /**
- * 日付範囲を入力 (Codex高②: 設定後に読み戻して検証)。
- * RPPレポート画面の日付欄はDOM未確定のため「値が日付形式の可視テキスト入力」を
- * start/end として扱う (実測: デフォルトで今週の範囲が入っている)。
- * 形式は既存値に合わせる (2026/07/01 or 2026-07-01)。
+ * 期間入力欄に値をセット (Codex高②: 設定後に読み戻して検証)。
+ * 実測DOM (2026-07-09): 日付欄は id/name 無しの text input で placeholder="Select start" /
+ * "Select end" のみ。「月ごとに表示」選択時は値が YYYY-MM (月単位)、
+ * 「日ごと/全期間」時は YYYY-MM-DD。区切りは '-'。
+ * startVal/endVal は呼び出し側が粒度に合わせて渡す (YYYY-MM or YYYY-MM-DD)。
  */
-async function setDateRange(page, range) {
+async function setPeriodInputs(page, startVal, endVal) {
   const info = await page.evaluate(() => {
     const vis = (el) => !!(el.offsetParent || el.getClientRects().length);
-    const isDateVal = (v) => /^\d{4}[/-]\d{1,2}[/-]\d{1,2}$/.test((v || '').trim());
+    const isDateish = (v) => /^\d{4}[/-]\d{1,2}([/-]\d{1,2})?$/.test((v || '').trim());
     const els = [...document.querySelectorAll('input[type="text"], input:not([type])')].filter(vis);
-    const dateEls = els.filter((el) => isDateVal(el.value) || /date|start|end|from|to/i.test(el.name + ' ' + el.id));
+    // placeholder が第一候補 (実測: Select start / Select end)。値が日付/月形式のものも拾う
+    const dateEls = els.filter((el) =>
+      /select\s*(start|end)/i.test(el.placeholder || '')
+      || isDateish(el.value)
+      || /date|start|end|from|to/i.test(el.name + ' ' + el.id));
     return dateEls.slice(0, 4).map((el, i) => {
       el.setAttribute('data-autodl-date', String(i));
-      return { i, name: el.name || '', id: el.id || '', value: el.value || '' };
+      return { i, placeholder: el.placeholder || '', value: el.value || '' };
     });
   }).catch(() => []);
-  console.log(`  [date] 日付入力候補: ${JSON.stringify(info)}`);
+  console.log(`  [date] 期間入力候補: ${JSON.stringify(info)}`);
   if (info.length < 2) {
-    throw new Error(`FORM_VERIFY: 日付入力欄を特定できず (候補${info.length}件)。[DOM:reports-form] を確認してセレクタ追記が必要`);
+    throw new Error(`FORM_VERIFY: 期間入力欄を特定できず (候補${info.length}件)。[DOM:reports-form] を確認してセレクタ追記が必要`);
   }
+  // placeholder に start/end があればそれで開始/終了を割り当て (無ければ出現順)
+  const startIdx = info.find((x) => /start/i.test(x.placeholder))?.i ?? 0;
+  const endIdx = info.find((x) => /end/i.test(x.placeholder) && x.i !== startIdx)?.i ?? (startIdx === 0 ? 1 : 0);
 
-  // 既存値の区切り文字に合わせる
-  const sep = (info[0].value || '').includes('-') ? '-' : '/';
+  // 既存値の区切り文字に合わせる (実測は '-')
+  const sep = (info[0].value || '').includes('/') ? '/' : '-';
   const fmt = (iso) => iso.split('-').join(sep);
-  const startVal = fmt(range.from);
-  const endVal = fmt(range.to);
 
   const fillOne = async (idx, val, label) => {
     const el = page.locator(`[data-autodl-date="${idx}"]`).first();
@@ -127,18 +148,18 @@ async function setDateRange(page, range) {
     await el.evaluate((e) => e.blur()).catch(() => {});
     console.log(`  [date] ${label} = ${val}`);
   };
-  await fillOne(0, startVal, '開始日');
-  await fillOne(1, endVal, '終了日');
+  await fillOne(startIdx, fmt(startVal), '開始');
+  await fillOne(endIdx, fmt(endVal), '終了');
   await page.waitForTimeout(800);
 
   // 読み戻し検証 (datepicker に上書きされていないか)
-  const got = await page.evaluate(() => ({
-    start: document.querySelector('[data-autodl-date="0"]')?.value || '',
-    end: document.querySelector('[data-autodl-date="1"]')?.value || '',
-  })).catch(() => ({ start: '', end: '' }));
-  const norm = (v) => v.trim().replace(/[/-]/g, '/').split('/').map((x, i) => i === 0 ? x : x.padStart(2, '0')).join('/');
+  const got = await page.evaluate(([si, ei]) => ({
+    start: document.querySelector(`[data-autodl-date="${si}"]`)?.value || '',
+    end: document.querySelector(`[data-autodl-date="${ei}"]`)?.value || '',
+  }), [startIdx, endIdx]).catch(() => ({ start: '', end: '' }));
+  const norm = (v) => v.trim().replace(/[/-]/g, '-').split('-').map((x, i) => i === 0 ? x : x.padStart(2, '0')).join('-');
   if (norm(got.start) !== norm(startVal) || norm(got.end) !== norm(endVal)) {
-    throw new Error(`FORM_VERIFY: 日付が設定できていません (期待 ${startVal}〜${endVal} / 実際 ${got.start}〜${got.end})`);
+    throw new Error(`FORM_VERIFY: 期間が設定できていません (期待 ${startVal}〜${endVal} / 実際 ${got.start}〜${got.end})`);
   }
   console.log(`  [date] 検証OK: ${got.start} 〜 ${got.end}`);
 }
@@ -287,9 +308,10 @@ async function persistDownload(download, reportType, range) {
   return dest;
 }
 
-/** レポート1種類分のリクエスト〜取得。戻り値: 'ok' | 'empty' */
+/** レポート1種類×1ヶ月分のリクエスト〜取得。戻り値: 'ok' | 'empty'
+ *  range: {ym, from, to}。期間入力は spec.periodMode に応じて月(YYYY-MM) or 日(YYYY-MM-DD) */
 async function fetchOneReport(page, spec, range) {
-  console.log(`\n--- ${spec.label} (${range.from} 〜 ${range.to}) ---`);
+  console.log(`\n--- ${spec.label} ${range.ym} (${range.from} 〜 ${range.to}) ---`);
 
   // 今回レポ識別 (Codex高①): リクエスト前に履歴の先頭行をスナップショット
   const prevFirstRow = await historyFirstRowText(page);
@@ -323,10 +345,14 @@ async function fetchOneReport(page, spec, range) {
     throw new Error(`FORM_VERIFY: ラジオ選択を確認できず (unit=${unitOk} period=${periodOk})。[DOM:reports-form-${spec.key}] のID実測が必要`);
   }
 
-  // 日付範囲 (検証込み)
-  await setDateRange(page, range);
+  // 期間入力 (検証込み)。「月ごと」は月入力 YYYY-MM (実測)、「日ごと」は YYYY-MM-DD
+  if (spec.periodMode === 'month') {
+    await setPeriodInputs(page, range.ym, range.ym);
+  } else {
+    await setPeriodInputs(page, range.from, range.to);
+  }
   await page.waitForTimeout(1500); // ボタン活性化待ち
-  await snap(page, `${spec.key}_form_set`);
+  await snap(page, `${spec.key}_${range.ym}_form_set`);
 
   // DLボタン: disabled のままなら「期間にデータなし」= 空正常 (スポット出稿仕様)
   const state = await buttonState(page, spec.dlButtonTexts);
@@ -372,17 +398,18 @@ async function fetchOneReport(page, spec, range) {
 }
 
 // ─── レポート定義 ───
-// ラジオIDは実測済み: rdReportTypeItem (商品別) / rdPeriodAll (全期間)。
-// 未実測のIDは命名パターンから候補を置き、label クリックにフォールバック
-// (ただし選択の読み戻し検証が通らない限り先に進まない = 誤条件DL防止)
+// ラジオIDは全て実測済み (2026-07-09 [DOM:reports-form] ダンプ):
+//   集計単位: rdReportTypeAllAds / rdReportTypeCampaign / rdReportTypeItem / rdReportTypeKeyword
+//   集計期間: rdPeriodAll / rdPeriodMonth / rdPeriodDay
 const REPORT_SPECS = [
   {
     key: 'item_monthly',
     label: '商品別 × 月ごと (全商品レポート)',
     reportType: 'rpp_item_monthly',
+    periodMode: 'month', // 期間入力は YYYY-MM (「月ごと」選択で月入力に変わる、実測)
     unitRadio: ['#rdReportTypeItem'],
     unitLabels: ['商品別'],
-    periodRadio: ['#rdPeriodMonth', '#rdPeriodMonthly'],
+    periodRadio: ['#rdPeriodMonth'],
     periodLabels: ['月ごとに表示', '月ごと'],
     dlButtonTexts: ['全商品レポートダウンロード', '全商品レポートDL'],
     historyKeywords: ['商品'],
@@ -391,9 +418,10 @@ const REPORT_SPECS = [
     key: 'all_daily',
     label: 'すべての広告 × 日ごと (日次広告費)',
     reportType: 'rpp_all_daily',
-    unitRadio: ['#rdReportTypeAll', '#rdReportTypeTotal'],
-    unitLabels: ['すべて'],
-    periodRadio: ['#rdPeriodDay', '#rdPeriodDaily'],
+    periodMode: 'day',
+    unitRadio: ['#rdReportTypeAllAds'],
+    unitLabels: ['すべての広告', 'すべて'],
+    periodRadio: ['#rdPeriodDay'],
     periodLabels: ['日ごとに表示', '日ごと'],
     dlButtonTexts: ['この条件でダウンロード', 'この条件でDL'],
     // 履歴行の実表記は未実測。一致しない場合は poll ログの行テキストを見て追記
@@ -413,7 +441,7 @@ async function main() {
     (s.key === 'item_monthly' && targets.includes('item')) || (s.key === 'all_daily' && targets.includes('daily')));
   if (specs.length === 0) { console.error('FATAL: RPP_REPORTS に item / daily を指定してください'); process.exit(2); }
 
-  const range = computeRange();
+  const months = computeTargetMonths();
   const context = await openContext();
   const page = context.pages()[0] || await context.newPage();
   page.on('dialog', (d) => { console.log(`  [dialog] ${d.message()}`); d.accept().catch(() => {}); });
@@ -422,26 +450,29 @@ async function main() {
   try {
     console.log('=== 楽天RPP レポート自動DL ===');
     console.log(`対象: ${specs.map((s) => s.label).join(' / ')}`);
-    console.log(`期間: ${range.from} 〜 ${range.to}`);
+    console.log(`対象月: ${months.map((m) => m.ym).join(', ')} (※期間は1ヶ月以内制約のため月ごとにDL)`);
     await ensureRmsLogin(page);
 
     for (const spec of specs) {
-      try {
-        const status = await fetchOneReport(page, spec, range);
-        outcomes.push({ spec: spec.key, status });
-      } catch (e) {
-        console.error(`✗ ${spec.label}: ${e.message}`);
-        await snap(page, `${spec.key}_error`);
-        await logFetch({
-          report_type: spec.reportType, period_from: range.from, period_to: range.to,
-          status: 'error', message: e.message,
-        });
-        outcomes.push({ spec: spec.key, status: 'error', error: e.message });
+      for (const month of months) {
+        try {
+          const status = await fetchOneReport(page, spec, month);
+          outcomes.push({ spec: spec.key, ym: month.ym, status });
+        } catch (e) {
+          console.error(`✗ ${spec.label} ${month.ym}: ${e.message}`);
+          await snap(page, `${spec.key}_${month.ym}_error`);
+          await logFetch({
+            report_type: spec.reportType, period_from: month.from, period_to: month.to,
+            status: 'error', message: e.message,
+          });
+          outcomes.push({ spec: spec.key, ym: month.ym, status: 'error', error: e.message });
+          break; // 同レポートの他の月も同じ原因で落ちる可能性大 → 無駄打ちしない (別レポートは試す)
+        }
       }
     }
 
     const failed = outcomes.filter((o) => o.status === 'error');
-    console.log(`\n=== summary: ${outcomes.map((o) => `${o.spec}=${o.status}`).join(' / ')} ===`);
+    console.log(`\n=== summary: ${outcomes.map((o) => `${o.spec}:${o.ym}=${o.status}`).join(' / ')} ===`);
     if (failed.length > 0) {
       console.log('  → 失敗分は手動DLで埋められます (取込は incoming/ に置くだけ。大原則の手動フォールバック)');
       process.exitCode = 1;

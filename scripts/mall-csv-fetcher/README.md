@@ -90,7 +90,9 @@ apps/warehouse/sync-rakuten-ads-daily.js (daily-sync 内、取込成功時のみ
 
 - **手動フォールバック**: RMSから手でDLしたCSV/zipを `incoming/rakuten-ads/` に置くだけ (自動DLと同一経路)。
 - 毎晩2レポート: ①商品別×月ごと(全商品レポートDL) ②すべての広告×日ごと(この条件でDL)。
-  期間=先月1日〜昨日 (月初3日までは前々月1日〜)。720h遡及・不正クリック控除は毎日UPSERTで追従。
+  ⭐実測: 期間は「**1ヶ月以内**」制約 → **月ごとに1DLずつループ** (今月+先月、月初3日は前々月も。1晩4〜6DL)。
+  「月ごとに表示」時の期間入力は YYYY-MM の月入力 (placeholder=Select start/end、id/name無し)。
+  720h遡及・不正クリック控除は毎日UPSERTで追従。
 - **空=正常**: 広告はスポット出稿 (5のつく日等) のため期間データ無しがあり得る。DLボタン不活性は
   `report_fetch_log` に status='empty' で記録して正常終了 (障害アラートにしない)。
 - 単体実行:
