@@ -352,7 +352,7 @@ function loadSokuho(db, supplier) {
       const rows = db.prepare(`
         SELECT v.商品コード c, p.商品名 n, v.mall mall, v.qty_7d q7, v.qty_30d q30, v.as_of_date asof
         FROM mirror_f_sales_velocity_by_product_mall v
-        JOIN mirror_products p ON LOWER(TRIM(p.商品コード)) = LOWER(TRIM(v.商品コード))
+        JOIN mirror_products p ON p.商品コード = LOWER(TRIM(v.商品コード))
         WHERE p.仕入先コード = @s
       `).all({ s: supplier });
       const byNe = new Map();
