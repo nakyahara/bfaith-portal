@@ -156,44 +156,56 @@ async function runLogin(page) {
   console.log(`[login] 完了 host=${safeHost(page.url())}`);
 }
 
-const RMS_MAIN_URL = 'https://glogin.rms.rakuten.co.jp/'; // ログイン済ならお知らせ/メインメニューへ
+const MAINMENU_URL = 'https://mainmenu.rms.rakuten.co.jp/'; // ログイン済のRMSメインメニュー(gloginは入口=フォーム)
 
 /** 本当にRMSにログインできているか (システムエラー/ログインフォームを弾く) */
 async function looksLoggedIn(page) {
   const url = page.url();
   if (/system_error/i.test(url)) return false;
-  if (safeHost(url) === 'login.account.rakuten.com') return false;
+  const host = safeHost(url);
+  if (host === 'login.account.rakuten.com') return false;
+  // R-Loginのログインフォームが出ている=未ログイン
   const hasLoginForm = await page.locator('input[name="login_id"]').isVisible().catch(() => false);
   if (hasLoginForm) return false;
-  const hasLogout = await page.locator('text=ログアウト').first().isVisible().catch(() => false);
-  return hasLogout;
+  // RMSのホストにいてログインフォームが無ければログイン済とみなす
+  return host.endsWith('rms.rakuten.co.jp');
 }
 
-/** 画面上のリンクを一覧出力 (メニュー構造の把握用) */
-export async function dumpLinks(page, label, max = 60) {
-  const links = await page.evaluate((mx) => {
-    const vis = (el) => !!(el.offsetParent || el.getClientRects().length);
-    return [...document.querySelectorAll('a')].filter(vis)
-      .map((a) => ({ text: (a.innerText || '').trim().slice(0, 30), href: a.href }))
-      .filter((l) => l.text || l.href).slice(0, mx);
-  }, max).catch(() => []);
-  console.log(`  [LINKS:${label}] ${JSON.stringify(links)}`);
-  return links;
+/** 画面上のリンクを全フレームから一覧出力 (メニュー構造の把握用。RMSはframe構成のことがある) */
+export async function dumpLinks(page, label, max = 80) {
+  for (const frame of page.frames()) {
+    const links = await frame.evaluate((mx) => {
+      const vis = (el) => !!(el.offsetParent || el.getClientRects().length);
+      return [...document.querySelectorAll('a')].filter(vis)
+        .map((a) => ({ text: (a.innerText || '').trim().slice(0, 24), href: a.href }))
+        .filter((l) => l.text || l.href).slice(0, mx);
+    }, max).catch(() => []);
+    if (links.length) {
+      console.log(`  [LINKS:${label}] frame=${frame.url().slice(0, 70)}`);
+      console.log(`  [LINKS:${label}] ${JSON.stringify(links)}`);
+    }
+  }
 }
 
 /** RMSにログイン済みの状態にする (メインメニュー到達)。2FA要求時は throw。 */
 export async function ensureRmsLogin(page) {
-  await gotoSafe(page, RMS_MAIN_URL);
+  await gotoSafe(page, MAINMENU_URL);
   await passNotice(page);
   if (await looksLoggedIn(page)) {
     console.log(`[login] セッション有効 host=${safeHost(page.url())}`);
     return;
   }
-  await runLogin(page);
-  await gotoSafe(page, RMS_MAIN_URL);
+  await runLogin(page); // 成功時は notice通過後 mainmenu に着地
+  await passNotice(page);
+  if (await looksLoggedIn(page)) {
+    console.log(`[login] メインメニュー到達 host=${safeHost(page.url())}`);
+    return;
+  }
+  // 予備: 改めてメインメニューを開く
+  await gotoSafe(page, MAINMENU_URL);
   await passNotice(page);
   if (!(await looksLoggedIn(page))) {
     throw new Error(`ログイン確認できず: ${page.url()}`);
   }
-  console.log(`[login] メインメニュー到達 host=${safeHost(page.url())}`);
+  console.log(`[login] メインメニュー到達(再) host=${safeHost(page.url())}`);
 }
