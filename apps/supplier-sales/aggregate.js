@@ -120,7 +120,7 @@ function loadProductMap(db) {
   const now = Date.now();
   if (_prodCache && (now - _prodCacheAt) < PROD_CACHE_TTL_MS) return _prodCache;
   const m = new Map(); // 商品コード -> { name, price, supplier }
-  for (const r of db.prepare('SELECT 商品コード c, 商品名 n, 標準売価 p, 仕入先コード s FROM mirror_products').all()) {
+  for (const r of db.prepare('SELECT LOWER(TRIM(商品コード)) c, 商品名 n, 標準売価 p, 仕入先コード s FROM mirror_products').all()) {
     m.set(r.c, { name: r.n || '', price: (r.p == null ? 0 : r.p), supplier: r.s || '' });
   }
   _prodCache = m;
@@ -133,7 +133,7 @@ function loadSetMap(db, supplier) {
   const m = new Map();
   // 監査M-7: SKU比較は両辺LOWER(TRIM)で正規化 (INV-13、Yahoo PR #94事故の再発防止)
   const rows = db.prepare(`
-    SELECT セット商品コード sc, 構成商品コード cc, 数量 q
+    SELECT LOWER(TRIM(セット商品コード)) sc, LOWER(TRIM(構成商品コード)) cc, 数量 q
     FROM mirror_set_components
     WHERE LOWER(TRIM(セット商品コード)) IN (
       SELECT LOWER(TRIM(セット商品コード)) FROM mirror_set_components
@@ -150,7 +150,7 @@ function loadSetMap(db, supplier) {
 function loadAmazonMap(db, supplier) {
   const m = new Map();
   const rows = db.prepare(`
-    SELECT seller_sku k, ne_code c, quantity q
+    SELECT LOWER(TRIM(seller_sku)) k, LOWER(TRIM(ne_code)) c, quantity q
     FROM mirror_sku_resolved
     WHERE LOWER(TRIM(seller_sku)) IN (
       SELECT LOWER(TRIM(seller_sku)) FROM mirror_sku_resolved
@@ -234,7 +234,7 @@ export function getSupplierReport(db, supplierCode, opts = {}) {
 
     // Amazon: seller_sku を構成品へ展開
     const amzRows = db.prepare(`
-      SELECT date_jst d, seller_sku k, asin_norm asin, product_name name,
+      SELECT date_jst d, LOWER(TRIM(seller_sku)) k, asin_norm asin, product_name name,
              CAST(units_net_sold AS REAL) u, sales_principal_jpy sales,
              (fba_fulfillment_jpy + fba_storage_jpy) fbaFee
       FROM mirror_amazon_finance_sku_daily
@@ -252,7 +252,7 @@ export function getSupplierReport(db, supplierCode, opts = {}) {
     // 非 Amazon: fact の ne_code がセットなら展開、単品ならそのまま
     for (const c of NON_AMAZON_MALLS) {
       const rows = db.prepare(`
-        SELECT date_jst d, ${c.key} k, ne_code ne, product_name name,
+        SELECT date_jst d, LOWER(TRIM(${c.key})) k, LOWER(TRIM(ne_code)) ne, product_name name,
                CAST(units_net_sold AS REAL) u, ${c.sales} sales
         FROM ${c.table}
         WHERE date_jst BETWEEN @start AND @end
@@ -350,7 +350,7 @@ function loadSokuho(db, supplier) {
   try {
     return db.transaction(() => {
       const rows = db.prepare(`
-        SELECT v.商品コード c, p.商品名 n, v.mall mall, v.qty_7d q7, v.qty_30d q30, v.as_of_date asof
+        SELECT LOWER(TRIM(v.商品コード)) c, p.商品名 n, v.mall mall, v.qty_7d q7, v.qty_30d q30, v.as_of_date asof
         FROM mirror_f_sales_velocity_by_product_mall v
         JOIN mirror_products p ON p.商品コード = LOWER(TRIM(v.商品コード))
         WHERE p.仕入先コード = @s
