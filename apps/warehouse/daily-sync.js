@@ -258,6 +258,11 @@ async function main() {
   const idemResult = runScript('apps/warehouse/test-settlement-idempotency.js', 'Settlement冪等性テスト', 120000);
   results.push({ name: 'Settlement冪等性テスト', ...idemResult });
 
+  // raw_*_orders_log 3本のローテ (監査PR-12(b)。保持60日+月次gzアーカイブ。
+  // 実測2.3GB/4.5M行の純無限成長を停止。定常時は前日分のみで数秒)
+  const rotateResult = runScript('apps/warehouse/rotate-order-logs.js', 'ログローテ', 1800000);
+  results.push({ name: 'ログローテ', ...rotateResult });
+
   // NE API（商品マスタ + セット商品 + 受注7日分）
   const neResult = runScript('apps/warehouse/ne-api.js sync', 'NE API');
   results.push({ name: 'NE', ...neResult });
