@@ -90,7 +90,7 @@ async function main() {
   if (!acquireLock()) {
     // 別プロセス実行中のスキップは異常ではない (Task Scheduler二重発火/手動実行との重複)
     console.log('[lock] 別の fetch-all が実行中のためスキップ (logs/fetch-all.lock)');
-    process.exit(0);
+    return; // exitCode 0 (自然終了)
   }
   process.on('exit', releaseLock); // 正常/異常どちらの終了でもロック解放
   cleanupOldFiles();
@@ -98,7 +98,8 @@ async function main() {
   const targets = only.length ? FETCHERS.filter((f) => only.includes(f.mall)) : FETCHERS;
   if (targets.length === 0) {
     console.error(`FATAL: 対象モールなし (MALL_FETCH_ONLY=${process.env.MALL_FETCH_ONLY})`);
-    process.exit(2);
+    process.exitCode = 2;
+    return;
   }
 
   console.log(`=== モールCSV自動取得 一括実行 (${targets.map((t) => t.mall).join(', ')}) ===`);
@@ -133,8 +134,9 @@ async function main() {
   const failed = results.filter((r) => r.code !== 0);
   console.log(`\n=== summary: ${results.map((r) => `${r.mall}=${r.code === 0 ? 'ok' : (r.timedOut ? 'timeout' : `exit${r.code ?? 'kill'}`)}`).join(' / ')} ===`);
 
-  // 子が自力通知できないケースだけランナーが通知 (exit 1 は子が通知済み)
-  const unreported = failed.filter((r) => r.code !== 1);
+  // 子が自力通知できないケースだけランナーが通知 (exit 1=業務エラー / exit 2=env不備 は
+  // 子が詳細通知済み → 二重通知しない。実機 2026-07-09 で exit2 の二重通知を確認して除外追加)
+  const unreported = failed.filter((r) => r.code !== 1 && r.code !== 2);
   if (unreported.length > 0) {
     await sendGChat(buildErrorReport({
       mall: unreported.map((r) => r.mall).join(','),
@@ -151,11 +153,13 @@ async function main() {
     }), 'fetch-all');
   }
 
-  process.exit(failed.length > 0 ? 1 : 0);
+  // fetch (undici keep-alive) 直後の process.exit() は Windows で libuv assertion crash を
+  // 起こし終了コードが化ける (実機 2026-07-09: exit2 が 0xC0000409 に化けた) → exitCode で自然終了
+  process.exitCode = failed.length > 0 ? 1 : 0;
 }
 
 main().catch(async (e) => {
   console.error('[fetch-all FATAL]', e.stack || e.message);
-  await sendGChat(`*モールCSV取得ランナー自体が異常終了*\n${String(e.message).slice(0, 500)}`, 'fetch-all');
-  process.exit(1);
+  await sendGChat(`⚠️ *モールCSV取得ランナー自体が異常終了*\n${String(e.message).slice(0, 500)}`, 'fetch-all');
+  process.exitCode = 1;
 });
