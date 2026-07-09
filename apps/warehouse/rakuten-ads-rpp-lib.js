@@ -23,6 +23,7 @@
  */
 import AdmZip from 'adm-zip';
 import iconv from 'iconv-lite';
+import { normSku } from '../../lib/sku-norm.js';
 
 export const SHOP_CODE = 'b-faith';
 
@@ -301,8 +302,8 @@ function metricRecord(cells, col) {
   };
 }
 
-// SKU正規化 (feedback_sku_case_normalization: LOWER(TRIM()) 必須)
-const normSku = v => trimS(v).toLowerCase();
+// SKU正規化は全社共通 util (lib/sku-norm.js、監査PR-10で規約化)。
+// LOWER(TRIM()) に加え全角→半角/各種ダッシュ→ハイフン/内部空白除去まで正規化される
 
 // ─── RECIPES: ヘッダからファイル種別を判別し、行→レコード変換を提供 ───
 // period: 'month' = 商品別 (RMS仕様で月次のみ) / 'day' = すべての広告・キャンペーン日次
