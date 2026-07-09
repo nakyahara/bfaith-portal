@@ -156,9 +156,10 @@ async function runLogin(page) {
   console.log(`[login] 完了 host=${safeHost(page.url())}`);
 }
 
-const MAINMENU_URL = 'https://mainmenu.rms.rakuten.co.jp/'; // ログイン済のRMSメインメニュー(gloginは入口=フォーム)
+// ★正しいRMS入口は末尾 /rms。/ だけだと「再度ログインをお願いします」擬似ページに着地する。
+const MAINMENU_URL = 'https://mainmenu.rms.rakuten.co.jp/rms';
 
-/** 本当にRMSにログインできているか (システムエラー/ログインフォームを弾く) */
+/** 本当にRMSにログインできているか (システムエラー/再ログイン誘導/ログインフォームを弾く) */
 async function looksLoggedIn(page) {
   const url = page.url();
   if (/system_error/i.test(url)) return false;
@@ -167,8 +168,11 @@ async function looksLoggedIn(page) {
   // R-Loginのログインフォームが出ている=未ログイン
   const hasLoginForm = await page.locator('input[name="login_id"]').isVisible().catch(() => false);
   if (hasLoginForm) return false;
-  // RMSのホストにいてログインフォームが無ければログイン済とみなす
-  return host.endsWith('rms.rakuten.co.jp');
+  if (!host.endsWith('rms.rakuten.co.jp')) return false;
+  // 「再度ログインをお願いいたします」等の誘導ページを弾く
+  const body = await page.locator('body').innerText().catch(() => '');
+  if (/再度ログイン|操作を継続して受け付ける|利用者登録.*完了されていますか/.test(body)) return false;
+  return true;
 }
 
 /** 画面上のリンクを全フレームから一覧出力 (メニュー構造の把握用。RMSはframe構成のことがある) */

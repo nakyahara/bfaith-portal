@@ -55,27 +55,30 @@ async function main() {
 
   try {
     console.log('=== 楽天RPP 全商品レポート 自動DL ===');
-    // ⚠️RPP深いURLへの直行はsystem_errorになる。RMSメインメニューから遷移してセッション確立が必要。
+    // まずRMSに正しくログイン (mainmenu /rms 到達)
     await ensureRmsLogin(page);
     await snap(page, '0_mainmenu');
     await dumpLinks(page, 'mainmenu');
 
-    // RPPへ: メインメニューから「検索連動型広告(RPP)」等のリンク/メニューをたどる。
-    // 正確な導線はLINKSダンプで確認して調整。まずは候補を best-effort でクリック。
-    console.log('[nav] RPPプロモーションメニューへ遷移を試行');
-    const toRpp = await tryClick(page, [
-      'a:has-text("RPP")', 'a:has-text("検索連動型広告")',
-      'a:has-text("プロモーション")', 'a:has-text("広告")',
-    ], 'RPPメニュー', 8000);
-    if (toRpp) {
-      await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
-      await snap(page, '0b_after_rpp_nav');
-      await dumpLinks(page, 'rpp-landing');
-      // パフォーマンスレポートへ
-      await tryClick(page, [
-        'a:has-text("パフォーマンスレポート")', 'text=パフォーマンスレポート',
-      ], 'パフォーマンスレポート', 8000);
-      await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+    // セッション確立後は深いURL直行が通ることが多い。まず直行し、ダメならメニュー経由。
+    console.log('[nav] RPPレポートへ直行を試行');
+    await page.goto(REPORTS_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+
+    if (/system_error/i.test(page.url())) {
+      console.log('[nav] 直行でsystem_error → メニュー経由にフォールバック');
+      await ensureRmsLogin(page); // メインメニューに戻る
+      await dumpLinks(page, 'mainmenu-frames');
+      const toRpp = await tryClick(page, [
+        'a:has-text("RPP")', 'a:has-text("検索連動型広告")',
+        'a:has-text("プロモーション")', 'a:has-text("広告")',
+      ], 'RPPメニュー', 8000);
+      if (toRpp) {
+        await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+        await dumpLinks(page, 'rpp-landing');
+        await tryClick(page, ['a:has-text("パフォーマンスレポート")', 'text=パフォーマンスレポート'], 'パフォーマンスレポート', 8000);
+        await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+      }
     }
     await snap(page, '0c_reports');
     console.log(`[nav] 現在地: ${page.url()}`);
