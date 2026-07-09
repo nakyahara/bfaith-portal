@@ -555,6 +555,25 @@ async function main() {
       console.log(`[DailySync] 楽天 finance DQ/sync は build 失敗のため記録せず (build retry 後に翌 cron で実行)`);
     }
 
+    // === 楽天RPP広告費 取込 + mirror sync (mall-csv-fetcher P1) ===
+    // 自動DL (rakuten-rpp-download.mjs、別 Task Scheduler スロット) と手動バックアップが
+    // incoming/rakuten-ads/ に置いた CSV/zip を取り込む。対象0件は正常 (exit 0)。
+    // 取込成功時のみ sync (--days 70 = 今月+先月+月初の前々月をカバー、720h遡及)
+    const rakutenAdsImportResult = runScript(
+      `apps/warehouse/import-rakuten-ads-rpp.js --data-dir ${DATA_DIR_ARG}`,
+      '楽天RPP広告 取込', 600000
+    );
+    results.push({ name: '楽天RPP広告 取込', ...rakutenAdsImportResult });
+    if (rakutenAdsImportResult.success) {
+      const rakutenAdsSyncResult = runScript(
+        `apps/warehouse/sync-rakuten-ads-daily.js --data-dir ${DATA_DIR_ARG} --days 70`,
+        '楽天RPP広告 sync', 600000
+      );
+      results.push({ name: '楽天RPP広告 sync', ...rakutenAdsSyncResult });
+    } else {
+      console.log('[DailySync] 楽天RPP広告 sync は取込失敗のためスキップ (failed/ を確認、修正後に再投入)');
+    }
+
     // === Yahoo finance daily fact (Yahoo Phase 1 Y-3c、Y-1 + Y-2 + Y-3a 統合) ===
     // 1. f_yahoo_finance_sku_daily_v1 build (whitelist order=5/pay=1/ship=3、partial margin)
     // 2. DQ gate (6 check、severity error で exit 1)

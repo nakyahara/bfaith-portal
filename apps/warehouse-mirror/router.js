@@ -649,6 +649,58 @@ function getAmazonPriceSnapshotInsert(db) {
   return b.amazonPriceSnapshotInsert;
 }
 
+// 楽天RPP広告費 月次×商品 (mall-csv-fetcher P1)
+function getRakutenAdsRppInsert(db) {
+  const b = getStmtBundle(db);
+  if (!b.rakutenAdsRppInsert) {
+    b.rakutenAdsRppInsert = db.prepare(`
+      INSERT OR REPLACE INTO mirror_rakuten_ads_rpp (
+        date_jst, month_ym, item_manage_number, raw_sku_code,
+        clicks, ad_cost_yen, cpc_actual, ctr_pct, bid_cpc_yen, item_cpc_yen,
+        sales_720h_yen, orders_720h, cvr_720h_pct, roas_720h_pct,
+        sales_12h_yen, orders_12h, sales_720h_new_yen, sales_720h_repeat_yen,
+        source_report_type, report_start, report_end,
+        attribution_window_hours, is_tax_included, imported_at,
+        source_run_id, source_row_hash, synced_at
+      ) VALUES (
+        @date_jst, @month_ym, @item_manage_number, @raw_sku_code,
+        @clicks, @ad_cost_yen, @cpc_actual, @ctr_pct, @bid_cpc_yen, @item_cpc_yen,
+        @sales_720h_yen, @orders_720h, @cvr_720h_pct, @roas_720h_pct,
+        @sales_12h_yen, @orders_12h, @sales_720h_new_yen, @sales_720h_repeat_yen,
+        @source_report_type, @report_start, @report_end,
+        @attribution_window_hours, @is_tax_included, @imported_at,
+        @source_run_id, @source_row_hash, @synced_at
+      )
+    `);
+  }
+  return b.rakutenAdsRppInsert;
+}
+
+// 楽天RPP広告費 日次×キャンペーン合計 (mall-csv-fetcher P1)
+function getRakutenAdsRppDailyInsert(db) {
+  const b = getStmtBundle(db);
+  if (!b.rakutenAdsRppDailyInsert) {
+    b.rakutenAdsRppDailyInsert = db.prepare(`
+      INSERT OR REPLACE INTO mirror_rakuten_ads_rpp_daily (
+        date_jst, campaign_id, campaign_name,
+        clicks, ad_cost_yen, ad_cost_discounted_yen, cpc_actual, ctr_pct,
+        sales_720h_yen, orders_720h, cvr_720h_pct, roas_720h_pct,
+        sales_12h_yen, orders_12h, sales_720h_new_yen, sales_720h_repeat_yen,
+        source_report_type, attribution_window_hours, is_tax_included, imported_at,
+        source_run_id, source_row_hash, synced_at
+      ) VALUES (
+        @date_jst, @campaign_id, @campaign_name,
+        @clicks, @ad_cost_yen, @ad_cost_discounted_yen, @cpc_actual, @ctr_pct,
+        @sales_720h_yen, @orders_720h, @cvr_720h_pct, @roas_720h_pct,
+        @sales_12h_yen, @orders_12h, @sales_720h_new_yen, @sales_720h_repeat_yen,
+        @source_report_type, @attribution_window_hours, @is_tax_included, @imported_at,
+        @source_run_id, @source_row_hash, @synced_at
+      )
+    `);
+  }
+  return b.rakutenAdsRppDailyInsert;
+}
+
 // アカウント単位フィー月次 (amazon-dashboard PR-C)
 function getAmazonAccountFeesInsert(db) {
   const b = getStmtBundle(db);
@@ -1137,6 +1189,24 @@ const ENTITY_REGISTRY = {
     clear_meta_key: 'clear_amazon_price_snapshot_dates',
     getInsertStmt: getAmazonPriceSnapshotInsert,
     normalizeRow: (r) => normalizeAmazonPriceSnapshotRow(r),
+  },
+  // 楽天RPP広告費 2 entity (mall-csv-fetcher P1、2026-07-09)
+  // monthly は date_jst=月初日 YYYY-MM-01 を clear キーに使う (account_fees 月次と同方針)
+  rakuten_ads_rpp_monthly: {
+    contract_version: 1,
+    mirror_table: 'mirror_rakuten_ads_rpp',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_rakuten_ads_rpp_months',
+    getInsertStmt: getRakutenAdsRppInsert,
+    normalizeRow: (r) => normalizeRakutenAdsRppRow(r),
+  },
+  rakuten_ads_rpp_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_rakuten_ads_rpp_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_rakuten_ads_rpp_daily_dates',
+    getInsertStmt: getRakutenAdsRppDailyInsert,
+    normalizeRow: (r) => normalizeRakutenAdsRppDailyRow(r),
   },
   rakuten_finance_sku_daily: {
     contract_version: 1,
@@ -1967,6 +2037,59 @@ function normalizeAmazonPriceSnapshotRow(r) {
     buybox_price: r.buybox_price ?? null,
     buybox_is_mine: (isMine === 0 || isMine === 1) ? isMine : null,
     fetched_at: r.fetched_at ?? null,
+    source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,
+    synced_at: r.synced_at,
+  };
+}
+
+// row 列正規化 (mirror_rakuten_ads_rpp 用、mall-csv-fetcher P1)
+// 月次 grain: date_jst=月初日 と month_ym の整合を受信側でも保証 (ズレると clear と実 row が食い違う)
+function normalizeRakutenAdsRppRow(r) {
+  const dateJst = requireAdKey(r, 'date_jst');
+  const monthYm = requireAdKey(r, 'month_ym');
+  if (!/^\d{4}-\d{2}-01$/.test(dateJst) || dateJst.slice(0, 7) !== monthYm) {
+    throw new HttpError(400, { error: 'bad_row', message: `date_jst must be month start of month_ym (got date_jst=${dateJst}, month_ym=${monthYm})` });
+  }
+  return {
+    date_jst: dateJst, month_ym: monthYm,
+    // 送信元の正規化漏れによる PK 重複防止 (feedback_sku_case_normalization)
+    item_manage_number: requireAdKey(r, 'item_manage_number').toLowerCase(),
+    raw_sku_code: r.raw_sku_code || '',
+    clicks: r.clicks ?? 0, ad_cost_yen: r.ad_cost_yen ?? 0,
+    cpc_actual: r.cpc_actual ?? null, ctr_pct: r.ctr_pct ?? null,
+    bid_cpc_yen: r.bid_cpc_yen ?? null, item_cpc_yen: r.item_cpc_yen ?? null,
+    sales_720h_yen: r.sales_720h_yen ?? 0, orders_720h: r.orders_720h ?? 0,
+    cvr_720h_pct: r.cvr_720h_pct ?? null, roas_720h_pct: r.roas_720h_pct ?? null,
+    sales_12h_yen: r.sales_12h_yen ?? null, orders_12h: r.orders_12h ?? null,
+    sales_720h_new_yen: r.sales_720h_new_yen ?? null, sales_720h_repeat_yen: r.sales_720h_repeat_yen ?? null,
+    source_report_type: r.source_report_type || 'rpp_product_monthly',
+    report_start: r.report_start ?? null, report_end: r.report_end ?? null,
+    attribution_window_hours: r.attribution_window_hours ?? 720,
+    is_tax_included: r.is_tax_included ?? 1,
+    imported_at: r.imported_at ?? null,
+    source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,
+    synced_at: r.synced_at,
+  };
+}
+
+// row 列正規化 (mirror_rakuten_ads_rpp_daily 用、mall-csv-fetcher P1)
+// campaign_id は「すべての広告」集計だと空文字が正 (requireAdKey は使わない)
+function normalizeRakutenAdsRppDailyRow(r) {
+  return {
+    date_jst: r.date_jst,
+    campaign_id: (r.campaign_id === null || r.campaign_id === undefined) ? '' : String(r.campaign_id).trim(),
+    campaign_name: r.campaign_name || '',
+    clicks: r.clicks ?? 0, ad_cost_yen: r.ad_cost_yen ?? 0,
+    ad_cost_discounted_yen: r.ad_cost_discounted_yen ?? null,
+    cpc_actual: r.cpc_actual ?? null, ctr_pct: r.ctr_pct ?? null,
+    sales_720h_yen: r.sales_720h_yen ?? 0, orders_720h: r.orders_720h ?? 0,
+    cvr_720h_pct: r.cvr_720h_pct ?? null, roas_720h_pct: r.roas_720h_pct ?? null,
+    sales_12h_yen: r.sales_12h_yen ?? null, orders_12h: r.orders_12h ?? null,
+    sales_720h_new_yen: r.sales_720h_new_yen ?? null, sales_720h_repeat_yen: r.sales_720h_repeat_yen ?? null,
+    source_report_type: r.source_report_type || 'rpp_all_daily',
+    attribution_window_hours: r.attribution_window_hours ?? 720,
+    is_tax_included: r.is_tax_included ?? 1,
+    imported_at: r.imported_at ?? null,
     source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,
     synced_at: r.synced_at,
   };

@@ -505,6 +505,71 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_mapsd_date ON mirror_amazon_price_snapshot_daily(date_jst)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mapsd_sku ON mirror_amazon_price_snapshot_daily(seller_sku)');
 
+  // mirror_rakuten_ads_rpp — 楽天RPP広告費 月次×商品 (mall-csv-fetcher P1、2026-07-09)
+  // miniPC fact_rakuten_ads_rpp の mirror。date_jst=月初日 (date_range clear 機構のキー、
+  // amazon_account_fees_monthly と同方針)。金額=税込円INTEGER / 率=REAL。
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_rakuten_ads_rpp (
+    date_jst              TEXT NOT NULL CHECK(date_jst GLOB '????-??-01'),
+    month_ym              TEXT NOT NULL CHECK(month_ym GLOB '????-??'),
+    item_manage_number    TEXT NOT NULL CHECK(trim(item_manage_number) <> ''),
+    raw_sku_code          TEXT NOT NULL DEFAULT '',
+    clicks                INTEGER NOT NULL DEFAULT 0,
+    ad_cost_yen           INTEGER NOT NULL DEFAULT 0,
+    cpc_actual            REAL,
+    ctr_pct               REAL,
+    bid_cpc_yen           INTEGER,
+    item_cpc_yen          INTEGER,
+    sales_720h_yen        INTEGER NOT NULL DEFAULT 0,
+    orders_720h           INTEGER NOT NULL DEFAULT 0,
+    cvr_720h_pct          REAL,
+    roas_720h_pct         REAL,
+    sales_12h_yen         INTEGER,
+    orders_12h            INTEGER,
+    sales_720h_new_yen    INTEGER,
+    sales_720h_repeat_yen INTEGER,
+    source_report_type    TEXT NOT NULL DEFAULT 'rpp_product_monthly',
+    report_start          TEXT,
+    report_end            TEXT,
+    attribution_window_hours INTEGER NOT NULL DEFAULT 720,
+    is_tax_included       INTEGER NOT NULL DEFAULT 1,
+    imported_at           TEXT,
+    source_run_id         TEXT NOT NULL,
+    source_row_hash       TEXT NOT NULL,
+    synced_at             TEXT NOT NULL,
+    PRIMARY KEY (date_jst, item_manage_number)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mrar_item ON mirror_rakuten_ads_rpp(item_manage_number, month_ym)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mrar_month ON mirror_rakuten_ads_rpp(month_ym)');
+
+  // mirror_rakuten_ads_rpp_daily — 楽天RPP広告費 日次×キャンペーン合計 (SKU内訳なし)
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_rakuten_ads_rpp_daily (
+    date_jst              TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+    campaign_id           TEXT NOT NULL DEFAULT '',
+    campaign_name         TEXT NOT NULL DEFAULT '',
+    clicks                INTEGER NOT NULL DEFAULT 0,
+    ad_cost_yen           INTEGER NOT NULL DEFAULT 0,
+    ad_cost_discounted_yen INTEGER,
+    cpc_actual            REAL,
+    ctr_pct               REAL,
+    sales_720h_yen        INTEGER NOT NULL DEFAULT 0,
+    orders_720h           INTEGER NOT NULL DEFAULT 0,
+    cvr_720h_pct          REAL,
+    roas_720h_pct         REAL,
+    sales_12h_yen         INTEGER,
+    orders_12h            INTEGER,
+    sales_720h_new_yen    INTEGER,
+    sales_720h_repeat_yen INTEGER,
+    source_report_type    TEXT NOT NULL DEFAULT 'rpp_all_daily',
+    attribution_window_hours INTEGER NOT NULL DEFAULT 720,
+    is_tax_included       INTEGER NOT NULL DEFAULT 1,
+    imported_at           TEXT,
+    source_run_id         TEXT NOT NULL,
+    source_row_hash       TEXT NOT NULL,
+    synced_at             TEXT NOT NULL,
+    PRIMARY KEY (date_jst, campaign_id)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mrard_month ON mirror_rakuten_ads_rpp_daily(substr(date_jst, 1, 7))');
+
   // mirror_rakuten_finance_sku_daily — 楽天 Phase 1a #R-3b (Render 側 daily fact mirror)
   // miniPC の f_rakuten_finance_sku_daily_v1 の payload を受信。
   // contract_version は sync_contracts.contract_version と整合。

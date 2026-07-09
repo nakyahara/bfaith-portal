@@ -1,0 +1,7 @@
+# 認証情報・セッション・出力はコミットしない
+.env
+.profile-rakuten
+.profile-yahoo
+spike-output
+downloads
+logs
