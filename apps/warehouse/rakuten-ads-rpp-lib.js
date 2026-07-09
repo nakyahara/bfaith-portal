@@ -466,12 +466,28 @@ export function prepareFile(name, buffer) {
   }
   if (recipe.unsupported) return fail(recipe.type, recipe.unsupported, true);
 
-  // ファイルレベルの検索期間 (前置行「集計期間: … 2026-07-01 - 2026-07-08」) — best effort
+  // ファイルレベルの検索期間 — best effort。実測の前置行形式:
+  //   全期間:「集計期間: 全期間で集計 2026-07-01 - 2026-07-08」(日付範囲)
+  //   月ごと:「集計期間: 月ごとに集計 2026-07 - 2026-07」(月範囲のみ)
+  // 優先順: ①前置行の日付範囲 ②ファイル名の日付範囲 (自動DLの保存名 rpp_*_from_to_*.zip =
+  // 実リクエスト範囲で正確) ③前置行の月範囲 (開始=月初、終了=月末。当月分は実カバレッジより広めになり得る)
   let fileStart = null, fileEnd = null;
+  let monthStart = null, monthEnd = null;
   for (let i = 0; i < headerIdx; i++) {
     const line = rows[i].join(',');
-    const m = line.match(/(\d{4}-\d{2}-\d{2})\s*[-〜~]\s*(\d{4}-\d{2}-\d{2})/);
-    if (m) { fileStart = m[1]; fileEnd = m[2]; break; }
+    const md = line.match(/(\d{4}-\d{2}-\d{2})\s*[-〜~]\s*(\d{4}-\d{2}-\d{2})/);
+    if (md) { fileStart = md[1]; fileEnd = md[2]; break; }
+    const mm = line.match(/(\d{4}-\d{2})\s*[-〜~]\s*(\d{4}-\d{2})(?![-\d])/);
+    if (mm && !monthStart) { monthStart = mm[1]; monthEnd = mm[2]; }
+  }
+  if (!fileStart) {
+    const mf = name.match(/(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})/);
+    if (mf) { fileStart = mf[1]; fileEnd = mf[2]; }
+    else if (monthStart) {
+      fileStart = `${monthStart}-01`;
+      const [ey, em] = monthEnd.split('-').map(Number);
+      fileEnd = new Date(Date.UTC(ey, em, 0)).toISOString().slice(0, 10); // 月末日
+    }
   }
 
   rows = rows.slice(headerIdx);  // rows[0] = ヘッダ行に正規化

@@ -163,12 +163,23 @@ console.log('=== 8. 種類不明 = エラー (ヘッダ一覧つき) ===');
 
 console.log('=== 9. prepareFile: ファイルレベル期間の抽出 ===');
 {
-  const csv = productCsv('月ごとに集計 2026-06-01 - 2026-06-30', [
+  const csv = productCsv('全期間で集計 2026-06-01 - 2026-06-30', [
     productRow('2026年06月', 'x-1', '1', '10', '0'),
   ]);
   const p = prepareFile('x.csv', csv);
-  check('前置行から期間抽出', p.ok && p.reportStart === '2026-06-01' && p.reportEnd === '2026-06-30',
+  check('前置行の日付範囲から抽出', p.ok && p.reportStart === '2026-06-01' && p.reportEnd === '2026-06-30',
     JSON.stringify({ s: p.reportStart, e: p.reportEnd }));
+
+  // 月ごとDLの実測形式「月ごとに集計 2026-07 - 2026-07」+ 自動DL保存名からのフォールバック
+  const csvM = productCsv('月ごとに集計 2026-07 - 2026-07', [
+    productRow('2026年07月', 'x-2', '1', '10', '0'),
+  ]);
+  const p2 = prepareFile('rpp_rpp_item_monthly_2026-07-01_2026-07-08_20260709.zip/inner.csv', csvM);
+  check('ファイル名の日付範囲を優先', p2.ok && p2.reportStart === '2026-07-01' && p2.reportEnd === '2026-07-08',
+    JSON.stringify({ s: p2.reportStart, e: p2.reportEnd }));
+  const p3 = prepareFile('manual-upload.csv', csvM);
+  check('月範囲のみ→月初/月末', p3.ok && p3.reportStart === '2026-07-01' && p3.reportEnd === '2026-07-31',
+    JSON.stringify({ s: p3.reportStart, e: p3.reportEnd }));
 }
 
 console.log('=== 10. 取込ログ整合 ===');
