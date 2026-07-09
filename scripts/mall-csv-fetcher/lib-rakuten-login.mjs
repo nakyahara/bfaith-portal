@@ -31,6 +31,16 @@ export function safeHost(url) {
   try { return new URL(url).hostname; } catch { return ''; }
 }
 
+/** .env fail-fast (Codex高): 認証情報が欠けたまま画面遷移して途中で空振りしない。
+ *  値そのものはログに出さない (feedback_secret_hygiene)。 */
+export function assertLoginEnv() {
+  const required = { RMS_RLOGIN_ID, RMS_RLOGIN_PW, RMS_MEMBER_ID, RMS_MEMBER_PW };
+  const missing = Object.entries(required).filter(([, v]) => !v || !String(v).trim()).map(([k]) => k);
+  if (missing.length) {
+    throw new Error(`ENV_MISSING: .env に ${missing.join(', ')} がありません (scripts/mall-csv-fetcher/.env を確認。記入は中原さん)`);
+  }
+}
+
 export async function openContext() {
   return chromium.launchPersistentContext(PROFILE_DIR, {
     headless: HEADLESS === '1',

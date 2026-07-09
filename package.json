@@ -11,6 +11,7 @@
   "dependencies": {
     "@aws-sdk/client-sqs": "^3.700.0",
     "@aws-sdk/client-sts": "^3.700.0",
+    "adm-zip": "^0.5.18",
     "amazon-sp-api": "^1.2.0",
     "archiver": "^7.0.0",
     "bcryptjs": "^2.4.3",

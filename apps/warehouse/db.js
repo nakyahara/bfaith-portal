@@ -1655,6 +1655,70 @@ function createTables() {
       updated_at          = excluded.updated_at
   `);
 
+  // ---- 楽天RPP広告費 mirror sync: contract auto-seed (mall-csv-fetcher P1、2026-07-09)
+  // fact_rakuten_ads_rpp (月次×商品) / fact_rakuten_ads_rpp_daily (日次×キャンペーン合計) を
+  // Render mirror へ sync。RPPは過去分変動 (不正クリック控除、720h遡及) のため scope_clear_per_run。
+  // 月次 entity の clear キーは月初日 date_jst=YYYY-MM-01 (amazon_account_fees_monthly と同方針)。
+  db.exec(`
+    INSERT INTO sync_contracts (
+      entity, contract_version, source_system, source_object, target_table,
+      grain_definition, key_columns_json, payload_schema_json,
+      clear_strategy, apply_mode, enabled, owner, created_at, updated_at
+    ) VALUES (
+      'rakuten_ads_rpp_monthly', 1, 'minipc-warehouse',
+      'fact_rakuten_ads_rpp', 'mirror_rakuten_ads_rpp',
+      'one row = one (month_ym, item_manage_number) — RPP商品別レポート月次 (RMS仕様で商品別は月ごと/全期間のみ)。date_jst=月初日 YYYY-MM-01 は clear キー',
+      '["date_jst","item_manage_number"]',
+      '{"required":["date_jst","month_ym","item_manage_number"],"date_jst_pattern":"^\\d{4}-\\d{2}-01$","month_ym_pattern":"^\\d{4}-\\d{2}$","amount_unit":"JPY_tax_included_integer"}',
+      'scope_clear_per_run', 'insert_or_replace', 1, 'mall-csv-fetcher',
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    )
+    ON CONFLICT(entity) DO UPDATE SET
+      contract_version    = excluded.contract_version,
+      source_system       = excluded.source_system,
+      source_object       = excluded.source_object,
+      target_table        = excluded.target_table,
+      grain_definition    = excluded.grain_definition,
+      key_columns_json    = excluded.key_columns_json,
+      payload_schema_json = excluded.payload_schema_json,
+      clear_strategy      = excluded.clear_strategy,
+      apply_mode          = excluded.apply_mode,
+      enabled             = excluded.enabled,
+      owner               = excluded.owner,
+      updated_at          = excluded.updated_at
+  `);
+
+  db.exec(`
+    INSERT INTO sync_contracts (
+      entity, contract_version, source_system, source_object, target_table,
+      grain_definition, key_columns_json, payload_schema_json,
+      clear_strategy, apply_mode, enabled, owner, created_at, updated_at
+    ) VALUES (
+      'rakuten_ads_rpp_daily', 1, 'minipc-warehouse',
+      'fact_rakuten_ads_rpp_daily', 'mirror_rakuten_ads_rpp_daily',
+      'one row = one (date_jst, campaign_id) — RPP「すべての広告/キャンペーン」×日ごとの日次広告費合計 (SKU内訳なし)',
+      '["date_jst","campaign_id"]',
+      '{"required":["date_jst"],"date_jst_pattern":"^\\d{4}-\\d{2}-\\d{2}$","amount_unit":"JPY_tax_included_integer"}',
+      'scope_clear_per_run', 'insert_or_replace', 1, 'mall-csv-fetcher',
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    )
+    ON CONFLICT(entity) DO UPDATE SET
+      contract_version    = excluded.contract_version,
+      source_system       = excluded.source_system,
+      source_object       = excluded.source_object,
+      target_table        = excluded.target_table,
+      grain_definition    = excluded.grain_definition,
+      key_columns_json    = excluded.key_columns_json,
+      payload_schema_json = excluded.payload_schema_json,
+      clear_strategy      = excluded.clear_strategy,
+      apply_mode          = excluded.apply_mode,
+      enabled             = excluded.enabled,
+      owner               = excluded.owner,
+      updated_at          = excluded.updated_at
+  `);
+
   // ---- Phase 1 #1-4a: sync_runs (run ledger、miniPC 側で sync 開始記録)
   // status 遷移: started → applied (全 chunk Render から 2xx)
   //              | → failed (途中失敗、error_message に記録)

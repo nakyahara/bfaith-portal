@@ -74,9 +74,39 @@ node scripts/mall-csv-fetcher/rakuten-login-spike.mjs
 - 手順2で `✅` が出たら、そのプロファイルを使った自動ログインが14日間有効。P1でRPPレポートDLを実装。
 - 本番(miniPC)では、手動セットアップもminiPC上の同じプロファイルで行う (端末=ブラウザ単位のため、別マシンのCookieは使えない)。
 
+## P1-R: 楽天RPPレポート 取得〜取込パイプライン (2026-07-09 実装)
+
+連携は **B案**: miniPCでDL→パース→warehouse.db fact→sync→Render mirror (Render取込APIへのPOST案は廃止)。
+
+```
+rakuten-rpp-download.mjs (Task Scheduler 別スロット)
+  → downloads/ に保存 + <WAREHOUSE_DATA_DIR>/incoming/rakuten-ads/ へ投入 + report_fetch_log 記録
+apps/warehouse/import-rakuten-ads-rpp.js (daily-sync 内)
+  → incoming/ を走査、CSV/zip を fact_rakuten_ads_rpp (月次×SKU) / fact_rakuten_ads_rpp_daily (日次合計) へ UPSERT
+  → 成功 processed/YYYY-MM/ へ、失敗 failed/ へ移動。同一sha256はduplicateスキップ (冪等)
+apps/warehouse/sync-rakuten-ads-daily.js (daily-sync 内、取込成功時のみ)
+  → mirror_rakuten_ads_rpp / mirror_rakuten_ads_rpp_daily へ chunk POST (--days 70)
+```
+
+- **手動フォールバック**: RMSから手でDLしたCSV/zipを `incoming/rakuten-ads/` に置くだけ (自動DLと同一経路)。
+- 毎晩2レポート: ①商品別×月ごと(全商品レポートDL) ②すべての広告×日ごと(この条件でDL)。
+  期間=先月1日〜昨日 (月初3日までは前々月1日〜)。720h遡及・不正クリック控除は毎日UPSERTで追従。
+- **空=正常**: 広告はスポット出稿 (5のつく日等) のため期間データ無しがあり得る。DLボタン不活性は
+  `report_fetch_log` に status='empty' で記録して正常終了 (障害アラートにしない)。
+- 単体実行:
+  ```powershell
+  node scripts/mall-csv-fetcher/rakuten-rpp-download.mjs           # DL (RPP_REPORTS=item,daily で絞り込み)
+  node apps/warehouse/import-rakuten-ads-rpp.js --data-dir <DATA_DIR> [--dry-run]
+  node apps/warehouse/sync-rakuten-ads-daily.js --data-dir <DATA_DIR> --days 70 [--dry-run]
+  ```
+- ⚠️ 「すべての広告×日ごと」のフォーム (ラジオID/日付欄DOM) は未実測。初回実行で
+  `FORM_VERIFY:` エラーが出たらログの `[DOM:reports-form-*]` を見てセレクタを追記する
+  (誤条件のデータを黙って取らないための設計)。
+
 ## 次フェーズの予定
 
-- **P1-R (楽天)**: RPP/クーポンアドバンスのレポートDL → Render取込APIへPOST。720h遡及のため毎回過去30日を再取得しUPSERT。
+- **P1-R 残**: miniPC移設 (プロファイル手動セットアップ+ACL、Task Scheduler 時間帯分離/多重起動禁止)、
+  DL失敗/取込失敗の別GChat通知、クーポンアドバンスCSV横展開。
 - **P1-Y (Yahoo)**: ⚠️Yahooはデフォルト SMS 2段階認証。「パスワードのみログイン」設定 or リフレッシュトークン方式が使えるかを別途P0-2で検証してから着手。使えなければ手動DL継続。
 - **P2**: らくらくーぽん置換 (レビューCSV自動DL + フォローメール + クーポン自動発行)。
 
