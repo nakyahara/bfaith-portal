@@ -70,10 +70,12 @@ if (monthStr) {
   if (!Number.isInteger(days) || days <= 0 || days > 400) {
     console.error('FATAL: --days must be 1..400'); process.exit(2);
   }
-  // JST 基準の today (RPPレポートの日付はJST)
+  // JST 基準。RPPの集計は昨日まで (downloader も昨日までを取得) なので scope 終端=昨日。
+  // 今日を clear 対象に含めると、当日行が fact に入った場合に mirror 側だけ消える (Codex R1 Medium)
   const nowJst = new Date(Date.now() + 9 * 3600 * 1000);
-  const toDate = nowJst.toISOString().slice(0, 10);
-  const fromDate = new Date(nowJst.getTime() - (days - 1) * 86400000).toISOString().slice(0, 10);
+  const yesterdayJst = new Date(nowJst.getTime() - 86400000);
+  const toDate = yesterdayJst.toISOString().slice(0, 10);
+  const fromDate = new Date(yesterdayJst.getTime() - (days - 1) * 86400000).toISOString().slice(0, 10);
   dateRange = { from: fromDate, to: toDate };
 } else {
   console.error('FATAL: --days N or --month YYYY-MM or --from/--to YYYY-MM-DD required'); process.exit(2);

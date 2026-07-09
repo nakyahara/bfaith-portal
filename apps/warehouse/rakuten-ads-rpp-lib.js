@@ -523,13 +523,22 @@ export function prepareFile(name, buffer) {
     }
   }
 
-  // ファイル内 PK 重複は後勝ちで統合 (RMS 側の集計重複)
+  // ファイル内 PK 重複は黙って後勝ち統合せずエラー (広告費・売上の欠落防止 — Codex R1 Medium):
+  //   日次: キャンペーン単位CSVにキャンペーンID列が無い可能性
+  //   商品別: PK に含まない粒度 (キャンペーン等) の混入や RMS 仕様変化の可能性
   const dedup = new Map();
   for (const r of records) dedup.set(recipe.pk(r), r);
-  // 日次レシピで同一日付が複数行 = キャンペーン単位CSVにキャンペーンID列が無い可能性
-  // (黙って後勝ち統合すると広告費が欠落する — #445 Codex Medium)
-  if (recipe.type === 'rpp_daily' && dedup.size < records.length) {
-    return fail(recipe.type, `同一日付の行が複数あります (${records.length}行→${dedup.size}件)。キャンペーン単位のCSVはキャンペーンID列を含めてDLするか、集計単位「すべての広告」でDLしてください。`);
+  if (dedup.size < records.length) {
+    const seen = new Set(), dupKeys = [];
+    for (const r of records) {
+      const k = recipe.pk(r);
+      if (seen.has(k) && dupKeys.length < 3) dupKeys.push(k.replace(/\x1f/g, ' × '));
+      seen.add(k);
+    }
+    const hint = recipe.type === 'rpp_daily'
+      ? 'キャンペーン単位のCSVはキャンペーンID列を含めてDLするか、集計単位「すべての広告」でDLしてください。'
+      : '集計単位「商品別」×「月ごとに表示」でDLし直してください。';
+    return fail(recipe.type, `同一キーの行が複数あります (${records.length}行→${dedup.size}件、例: ${dupKeys.join(' / ')})。${hint}`);
   }
   return {
     name, ok: true, recipe, records: [...dedup.values()], rawCount: records.length,

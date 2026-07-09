@@ -103,6 +103,18 @@ console.log('=== 4. 複数月にまたがる期間 = エラー (全期間DLの�
   check('月ごと案内メッセージ', /月ごとに表示/.test(r.results[0].error), r.results[0].error);
 }
 
+console.log('=== 4b. 商品別ファイル内PK重複 = エラー (黙って後勝ち統合しない) ===');
+{
+  const csv = productCsv('月ごとに集計 2026-06-01 - 2026-06-30', [
+    productRow('2026年06月', 'dup-item', '1', '10', '0'),
+    productRow('2026年06月', 'DUP-ITEM', '2', '20', '0'), // LOWER正規化で同一PKに潰れるケース
+  ]);
+  const r = importPhysicalFile(db, { name: 'dup.csv', buffer: csv, sha256: sha(csv) });
+  check('重複はerror', r.status === 'error', r.status);
+  check('重複キー例示', /同一キーの行が複数/.test(r.results[0].error), r.results[0].error);
+  check('取込されていない', !db.prepare(`SELECT 1 FROM fact_rakuten_ads_rpp WHERE item_manage_number='dup-item'`).get());
+}
+
 console.log('=== 5. zip原子性 (良CSV+不良CSV → 全体rollback) ===');
 {
   const good = productCsv('月ごとに集計 2026-05-01 - 2026-05-31', [

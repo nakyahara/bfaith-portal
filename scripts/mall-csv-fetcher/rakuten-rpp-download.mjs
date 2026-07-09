@@ -166,8 +166,13 @@ async function historyFirstRowText(page) {
   }).catch(() => '');
 }
 
-/** 履歴で「今回の新しい行」が完了になるのを待ってDL (Codex高①: 古いZIP誤取得防止) */
-async function collectFromHistory(page, prevFirstRow, timeoutMs = 15 * 60 * 1000) {
+/** 履歴で「今回の新しい行」が完了になるのを待ってDL (Codex高①: 古いZIP誤取得防止)。
+ *  新しさ (リクエスト前の先頭行と差分) に加えて、行テキストにレポート種別キーワードが
+ *  含まれることを要求 (別ジョブ/別レポートの行を誤取得しない — Codex R1 High #2)。
+ *  履歴行の表記が想定と違いキーワードが一致しない場合は掴まずタイムアウト → エラーで
+ *  手動確認へ (RPP_LOOSE_MATCH=1 でキーワード照合を無効化できる緊急脱出口)。 */
+async function collectFromHistory(page, prevFirstRow, keywords, timeoutMs = 15 * 60 * 1000) {
+  const looseMatch = process.env.RPP_LOOSE_MATCH === '1';
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const row1 = await page.evaluate(() => {
@@ -182,8 +187,12 @@ async function collectFromHistory(page, prevFirstRow, timeoutMs = 15 * 60 * 1000
     if (row1 && !isNewRow) {
       console.log('  [poll] 先頭行がリクエスト前と同一 (今回の行はまだ未出現)。待機');
     }
+    const typeMatches = looseMatch || (row1 && keywords.some((k) => row1.text.includes(k)));
+    if (row1 && isNewRow && !typeMatches) {
+      console.log(`  [poll] 先頭行が期待レポート種別 (${keywords.join('/')}) と不一致。掴まずに待機 (誤取得防止。表記が違うだけなら RPP_LOOSE_MATCH=1)`);
+    }
 
-    if (row1 && isNewRow && row1.hasDownload && /完了/.test(row1.text)) {
+    if (row1 && isNewRow && typeMatches && row1.hasDownload && /完了/.test(row1.text)) {
       // 先頭行の「ダウンロード」アンカーをその場で特定してマーク (href/onclick無しのJSイベント駆動)
       const info = await page.evaluate(() => {
         const tr = document.querySelector('table tbody tr') || document.querySelectorAll('table tr')[1];
@@ -249,10 +258,14 @@ async function logFetch(entry) {
 
 /** DL結果を downloads/ に保存し、incoming/ へコピー + fetch log 記録 */
 async function persistDownload(download, reportType, range) {
-  const fname = download.suggestedFilename() || `rpp_${reportType}_${Date.now()}.zip`;
-  const dest = join(DL_DIR, fname);
+  // suggestedFilename は商品別/日次で同名になり得る + 再実行で同名 → 上書き事故防止のため
+  // レポート種別+期間+時刻を含む一意名にする (Codex R1 High #1)。拡張子は元名から引き継ぐ
+  const suggested = download.suggestedFilename() || '';
+  const ext = /\.(zip|csv)$/i.exec(suggested)?.[0]?.toLowerCase() || '.zip';
+  const ts = new Date().toISOString().replace(/[:.]/g, '').replace('Z', '');
+  const dest = join(DL_DIR, `rpp_${reportType}_${range.from}_${range.to}_${ts}${ext}`);
   await download.saveAs(dest);
-  console.log(`  ✅ ダウンロード成功: ${dest}`);
+  console.log(`  ✅ ダウンロード成功: ${dest} (元名: ${suggested || '(なし)'})`);
 
   const buf = await readFile(dest);
   const sha256 = createHash('sha256').update(buf).digest('hex');
@@ -322,31 +335,36 @@ async function fetchOneReport(page, spec, range) {
     throw new Error(`DLボタンが見つからず: ${spec.dlButtonTexts.join('/')}`);
   }
   if (state === 'disabled') {
-    console.log('  [empty] DLボタンが不活性 = 指定期間にデータなし (空=正常終了)');
+    // フォーム検証 (ラジオ・日付の読み戻し) は上で通過済みなので、不活性の主因は
+    // 「期間にデータなし」(スポット出稿仕様) — ただし権限/生成上限等の可能性も残るため
+    // 断定せず記録して正常終了 (Codex R1 Medium: empty が連続したら手動DLで確認すること)
+    console.log('  [empty] DLボタンが不活性。フォーム検証済みのため「期間にデータなし」と判断 (空=正常終了)');
+    if (spec.key === 'item_monthly') {
+      console.warn('  ⚠ 商品別×先月〜は通常データがあるはず。翌日も empty なら権限/生成上限/画面変更を疑い手動DLで確認');
+    }
     await logFetch({
       report_type: spec.reportType, period_from: range.from, period_to: range.to,
-      status: 'empty', message: 'DLボタン不活性 (期間にデータなし)',
+      status: 'empty', message: 'DLボタン不活性 (期間にデータなし想定。連続する場合は権限/生成上限も疑う)',
     });
     return 'empty';
   }
 
+  // 「この条件でDL」が同期DL (即ファイル) の可能性に備え、クリック前から download イベントを
+  // 待ち受ける (クリック後に waitForEvent すると同期DLを取り逃がす — Codex R1 High #2)。
+  const directDownloadPromise = page.waitForEvent('download', { timeout: 25000 }).catch(() => null);
   const clicked = await tryClick(page, spec.dlButtonTexts.map((t) => `text=${t}`), spec.label + ' DL', 10000);
   if (!clicked) throw new Error(`DLボタンを押せず: ${spec.dlButtonTexts.join('/')}`);
 
-  // 「この条件でDL」が同期DL (即ファイル) の可能性に備えて短時間 download イベントを待つ。
-  // 来なければ非同期生成 → ダウンロード履歴で今回の行の完了を待つ
-  let download = null;
-  try {
-    download = await page.waitForEvent('download', { timeout: 20000 });
+  let download = await directDownloadPromise;
+  if (download) {
     console.log('  [direct] 同期ダウンロードを検出');
-  } catch { /* 非同期生成 */ }
-
-  if (!download) {
+  } else {
+    // 非同期生成 → ダウンロード履歴で「今回の行」(新規 + 種別一致) の完了を待つ
     await snap(page, `${spec.key}_after_request`);
     console.log('[history] ダウンロード履歴で生成完了を待つ');
     await page.goto(HISTORY_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
     await page.waitForTimeout(2000);
-    download = await collectFromHistory(page, prevFirstRow);
+    download = await collectFromHistory(page, prevFirstRow, spec.historyKeywords);
   }
 
   await persistDownload(download, spec.reportType, range);
@@ -367,6 +385,7 @@ const REPORT_SPECS = [
     periodRadio: ['#rdPeriodMonth', '#rdPeriodMonthly'],
     periodLabels: ['月ごとに表示', '月ごと'],
     dlButtonTexts: ['全商品レポートダウンロード', '全商品レポートDL'],
+    historyKeywords: ['商品'],
   },
   {
     key: 'all_daily',
@@ -377,6 +396,9 @@ const REPORT_SPECS = [
     periodRadio: ['#rdPeriodDay', '#rdPeriodDaily'],
     periodLabels: ['日ごとに表示', '日ごと'],
     dlButtonTexts: ['この条件でダウンロード', 'この条件でDL'],
+    // 履歴行の実表記は未実測。一致しない場合は poll ログの行テキストを見て追記
+    // (それまでは RPP_LOOSE_MATCH=1 で回避可)
+    historyKeywords: ['すべて'],
   },
 ];
 
