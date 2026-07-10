@@ -187,8 +187,10 @@ async function persistDownload(download, reportType, range, expect) {
   if (expect.dateFrom && p.dateFrom !== expect.dateFrom) {
     throw new Error(`DL_VERIFY: 期待日 ${expect.dateFrom} と実CSV ${p.dateFrom} が不一致 (前回期間/クランプ後のCSVを掴んだ疑い)`);
   }
-  if (expect.month && !(p.dateFrom.slice(0, 7) === expect.month.ym && p.dateFrom >= expect.month.from && p.dateTo <= expect.month.to)) {
-    throw new Error(`DL_VERIFY: 期待月 ${expect.month.ym} と実CSV ${p.dateFrom}〜${p.dateTo} が不一致`);
+  // 店舗日次: 月初日から始まらないCSVは部分DL (取込はUPSERTのみで欠け日が残る) → error。
+  // dateTo は未来日=未集計スキップ設計のため月末未満を許容 (Codex R2 Medium)
+  if (expect.month && !(p.dateFrom === expect.month.from && p.dateTo <= expect.month.to)) {
+    throw new Error(`DL_VERIFY: 期待月 ${expect.month.ym} (${expect.month.from}〜) と実CSV ${p.dateFrom}〜${p.dateTo} が不一致 (部分CSVの疑い)`);
   }
   console.log(`  [verify] ${p.label} ${p.records.length}件 (${p.dateFrom}〜${p.dateTo})`);
 
@@ -291,6 +293,7 @@ async function fetchItemDaily(page, dateIso) {
   if (!zenkenOk) throw new Error('FORM_VERIFY: 「全件」radioの選択を確認できず (1,000行カット防止のため中止)');
 
   const dlPromise = page.waitForEvent('download', { timeout: 90000 });
+  dlPromise.catch(() => {}); // ボタン探索失敗でthrowする経路の未処理reject防止 (Codex R2 Medium)
   if (!(await clickExact(page, ['ダウンロード'], 'モーダルDL実行', { last: true }))) {
     throw new Error('FORM_VERIFY: モーダルの「ダウンロード」ボタンが見つからず');
   }
@@ -340,6 +343,7 @@ async function fetchStoreDaily(page, month) {
   }
   await page.waitForTimeout(1500);
   const dlPromise = page.waitForEvent('download', { timeout: 90000 });
+  dlPromise.catch(() => {}); // ボタン探索失敗でthrowする経路の未処理reject防止 (Codex R2 Medium)
   if (!(await clickExact(page, ['ダウンロード'], 'モーダルDL実行', { last: true }))) {
     throw new Error('FORM_VERIFY: モーダルの「ダウンロード」ボタンが見つからず');
   }
