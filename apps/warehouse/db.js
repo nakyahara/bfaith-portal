@@ -1734,6 +1734,70 @@ function createTables() {
       updated_at          = excluded.updated_at
   `);
 
+  // ---- 楽天データ分析 mirror sync: contract auto-seed (mall-csv-fetcher P1-R2、2026-07-10)
+  // fact_rakuten_item_daily (SKU×日次 アクセス/CVR/レビュー/在庫) /
+  // fact_rakuten_store_daily (店舗×日次 KPI+商圏ベンチ+費用内訳)。
+  // RMSデータ分析CSVは再DLで過去分が変動しうるため scope_clear_per_run。
+  db.exec(`
+    INSERT INTO sync_contracts (
+      entity, contract_version, source_system, source_object, target_table,
+      grain_definition, key_columns_json, payload_schema_json,
+      clear_strategy, apply_mode, enabled, owner, created_at, updated_at
+    ) VALUES (
+      'rakuten_item_daily', 1, 'minipc-warehouse',
+      'fact_rakuten_item_daily', 'mirror_rakuten_item_daily',
+      'one row = one (date_jst, item_manage_number) — RMSデータ分析「商品分析」SKU×日次 (売上/アクセス/CVR/レビュー/お気に入り/在庫snapshot)',
+      '["date_jst","item_manage_number"]',
+      '{"required":["date_jst","item_manage_number"],"date_jst_pattern":"^\\d{4}-\\d{2}-\\d{2}$","amount_unit":"JPY_tax_included_integer"}',
+      'scope_clear_per_run', 'insert_or_replace', 1, 'mall-csv-fetcher',
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    )
+    ON CONFLICT(entity) DO UPDATE SET
+      contract_version    = excluded.contract_version,
+      source_system       = excluded.source_system,
+      source_object       = excluded.source_object,
+      target_table        = excluded.target_table,
+      grain_definition    = excluded.grain_definition,
+      key_columns_json    = excluded.key_columns_json,
+      payload_schema_json = excluded.payload_schema_json,
+      clear_strategy      = excluded.clear_strategy,
+      apply_mode          = excluded.apply_mode,
+      enabled             = excluded.enabled,
+      owner               = excluded.owner,
+      updated_at          = excluded.updated_at
+  `);
+
+  db.exec(`
+    INSERT INTO sync_contracts (
+      entity, contract_version, source_system, source_object, target_table,
+      grain_definition, key_columns_json, payload_schema_json,
+      clear_strategy, apply_mode, enabled, owner, created_at, updated_at
+    ) VALUES (
+      'rakuten_store_daily', 1, 'minipc-warehouse',
+      'fact_rakuten_store_daily', 'mirror_rakuten_store_daily',
+      'one row = one date_jst — RMSデータ分析「日次_分析用レポート」店舗×日次 (端末別KPI+商圏ベンチマーク+クーポン/送料/決済手数料内訳)',
+      '["date_jst"]',
+      '{"required":["date_jst"],"date_jst_pattern":"^\\d{4}-\\d{2}-\\d{2}$","amount_unit":"JPY_tax_included_integer"}',
+      'scope_clear_per_run', 'insert_or_replace', 1, 'mall-csv-fetcher',
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    )
+    ON CONFLICT(entity) DO UPDATE SET
+      contract_version    = excluded.contract_version,
+      source_system       = excluded.source_system,
+      source_object       = excluded.source_object,
+      target_table        = excluded.target_table,
+      grain_definition    = excluded.grain_definition,
+      key_columns_json    = excluded.key_columns_json,
+      payload_schema_json = excluded.payload_schema_json,
+      clear_strategy      = excluded.clear_strategy,
+      apply_mode          = excluded.apply_mode,
+      enabled             = excluded.enabled,
+      owner               = excluded.owner,
+      updated_at          = excluded.updated_at
+  `);
+
   // ---- Phase 1 #1-4a: sync_runs (run ledger、miniPC 側で sync 開始記録)
   // status 遷移: started → applied (全 chunk Render から 2xx)
   //              | → failed (途中失敗、error_message に記録)

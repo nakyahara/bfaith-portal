@@ -1,29 +1,19 @@
 #!/usr/bin/env node
 /**
- * sync-rakuten-ads-daily.js — 楽天RPP広告費 mirror sync (mall-csv-fetcher P1)
+ * sync-rakuten-data-daily.js — 楽天データ分析 (店舗日次/SKU日次) mirror sync (mall-csv-fetcher P1-R2)
  *
- * fact_rakuten_ads_rpp (月次×商品) と fact_rakuten_ads_rpp_daily (日次×キャンペーン合計)
- * の 2 entity を Render mirror へ sync する。sync-amazon-ads-daily.js 同型
- * (chunk POST + ledger + scope clear)。
+ * fact_rakuten_item_daily (SKU×日次 アクセス/CVR/レビュー/在庫) と
+ * fact_rakuten_store_daily (店舗×日次 KPI+商圏ベンチ+費用内訳) を Render mirror へ sync。
+ * sync-rakuten-ads-daily.js 同型 (chunk POST + ledger + scope clear)。
  *
- * RPPレポートは過去分が変動する (不正クリック控除、720h遡及) ため、
- * scope 内は 0 行日付も含めて clear → 再投入 (stale 削除)。
- *
- * 月次 entity の clear キーは月初日 date_jst=YYYY-MM-01
- * (mirror の date_range clear 機構と整合、amazon_account_fees_monthly と同方針)。
+ * 過去分は再DLで変動しうるため scope 内は 0 行日付も含めて clear → 再投入。
  *
  * 使い方:
- *   DATA_DIR=... node apps/warehouse/sync-rakuten-ads-daily.js --days 70 --dry-run
- *   DATA_DIR=... node apps/warehouse/sync-rakuten-ads-daily.js --month 2026-06
- *   DATA_DIR=... node apps/warehouse/sync-rakuten-ads-daily.js --from 2026-01-01 --to 2026-06-30
- *   DATA_DIR=... node apps/warehouse/sync-rakuten-ads-daily.js --days 70 --entity rakuten_ads_rpp_monthly
+ *   DATA_DIR=... node apps/warehouse/sync-rakuten-data-daily.js --days 70 --dry-run
+ *   DATA_DIR=... node apps/warehouse/sync-rakuten-data-daily.js --from 2026-07-01 --to 2026-07-09
+ *   DATA_DIR=... node apps/warehouse/sync-rakuten-data-daily.js --days 70 --entity rakuten_item_daily
  *
- * env:
- *   DATA_DIR             必須
- *   RENDER_MIRROR_URL    送信先 base URL
- *   MIRROR_SYNC_KEY      認証 (x-sync-key header)
- *   CHUNK_SIZE           default 3000
- *
+ * env: DATA_DIR (必須) / RENDER_MIRROR_URL / MIRROR_SYNC_KEY / CHUNK_SIZE (default 3000)
  * exit code: 0=全 entity 成功 / 1=いずれか失敗 / 2=env・引数エラー
  */
 import path from 'node:path';
@@ -120,52 +110,60 @@ function enumerateScopeMonthStarts(from, to) {
 // ============================================================
 const ENTITIES = [
   {
-    name: 'rakuten_ads_rpp_monthly',
+    name: 'rakuten_item_daily',
     contractVersion: 1,
-    clearMetaKey: 'clear_rakuten_ads_rpp_months',
-    // 月次: date_jst=月初日 (clear/scope キー)、month_ym は substr で導出可だが明示列で持つ
-    scopeDates: (range) => enumerateScopeMonthStarts(range.from, range.to),
-    selectSql: `
-      SELECT
-        (month_ym || '-01') AS date_jst, month_ym, item_manage_number, raw_sku_code,
-        clicks, ad_cost_yen, cpc_actual, ctr_pct, bid_cpc_yen, item_cpc_yen,
-        sales_720h_yen, orders_720h, cvr_720h_pct, roas_720h_pct,
-        sales_12h_yen, orders_12h, sales_720h_new_yen, sales_720h_repeat_yen,
-        source_report_type, report_start, report_end,
-        attribution_window_hours, is_tax_included, imported_at
-      FROM fact_rakuten_ads_rpp
-      WHERE month_ym >= ? AND month_ym <= ?
-      ORDER BY month_ym, item_manage_number
-    `,
-    selectParams: (range) => [range.from.slice(0, 7), range.to.slice(0, 7)],
-    hashRow: (r) => ({
-      month_ym: r.month_ym, item: r.item_manage_number,
-      ad_cost_yen: r.ad_cost_yen, sales_720h_yen: r.sales_720h_yen, clicks: r.clicks,
-    }),
-    sampleLog: (r) => `month=${r.month_ym} item=${r.item_manage_number} cost=¥${r.ad_cost_yen}`,
-  },
-  {
-    name: 'rakuten_ads_rpp_daily',
-    contractVersion: 1,
-    clearMetaKey: 'clear_rakuten_ads_rpp_daily_dates',
+    clearMetaKey: 'clear_rakuten_item_daily_dates',
     scopeDates: (range) => enumerateScopeDates(range.from, range.to),
+    // 商品名/ジャンルは m_rakuten_items の最新値を JOIN で付与 (分析タブでの表示用)
     selectSql: `
       SELECT
-        date_jst, campaign_id, campaign_name,
-        clicks, ad_cost_yen, ad_cost_discounted_yen, cpc_actual, ctr_pct,
-        sales_720h_yen, orders_720h, cvr_720h_pct, roas_720h_pct,
-        sales_12h_yen, orders_12h, sales_720h_new_yen, sales_720h_repeat_yen,
-        source_report_type, attribution_window_hours, is_tax_included, imported_at
-      FROM fact_rakuten_ads_rpp_daily
-      WHERE date_jst >= ? AND date_jst <= ?
-      ORDER BY date_jst, campaign_id
+        f.date_jst, f.item_manage_number, f.raw_sku_code,
+        f.sales_yen, f.orders, f.units, f.access_users, f.unique_users, f.cvr_pct, f.aov_yen,
+        f.buyers_total, f.buyers_new, f.buyers_repeat, f.nonbuyer_access,
+        f.review_posts, f.review_avg, f.review_total,
+        f.stay_seconds, f.bounce_count, f.exit_count, f.exit_rate_pct,
+        f.favorites_added, f.favorites_total, f.stock_qty,
+        f.is_tax_included, f.imported_at,
+        m.item_name, m.genre_path, m.item_id, m.catalog_id
+      FROM fact_rakuten_item_daily f
+      LEFT JOIN m_rakuten_items m ON m.item_manage_number = f.item_manage_number
+      WHERE f.date_jst >= ? AND f.date_jst <= ?
+      ORDER BY f.date_jst, f.item_manage_number
     `,
     selectParams: (range) => [range.from, range.to],
     hashRow: (r) => ({
-      date_jst: r.date_jst, campaign_id: r.campaign_id,
-      ad_cost_yen: r.ad_cost_yen, sales_720h_yen: r.sales_720h_yen, clicks: r.clicks,
+      date_jst: r.date_jst, item: r.item_manage_number,
+      sales_yen: r.sales_yen, access: r.access_users, stock: r.stock_qty,
     }),
-    sampleLog: (r) => `date=${r.date_jst} campaign=${r.campaign_id || '(all)'} cost=¥${r.ad_cost_yen}`,
+    sampleLog: (r) => `date=${r.date_jst} item=${r.item_manage_number} sales=¥${r.sales_yen} access=${r.access_users}`,
+  },
+  {
+    name: 'rakuten_store_daily',
+    contractVersion: 1,
+    clearMetaKey: 'clear_rakuten_store_daily_dates',
+    scopeDates: (range) => enumerateScopeDates(range.from, range.to),
+    selectSql: `
+      SELECT
+        date_jst,
+        sales_all_yen, sales_pc_yen, sales_app_yen, sales_sp_yen,
+        orders_all, orders_pc, orders_app, orders_sp,
+        access_all, access_pc, access_app, access_sp,
+        cvr_all_pct, cvr_pc_pct, cvr_app_pct, cvr_sp_pct,
+        aov_all_yen, aov_pc_yen, aov_app_yen, aov_sp_yen,
+        bench_top10_sales_yen, bench_top10_orders, bench_top10_access, bench_top10_cvr_pct, bench_top10_aov_yen,
+        bench_class_label, bench_class_sales_yen, bench_class_orders, bench_class_access, bench_class_cvr_pct, bench_class_aov_yen,
+        tax_out_yen, shipping_yen, coupon_store_yen, coupon_rakuten_yen,
+        free_ship_coupon_yen, wrapping_yen, settlement_fee_yen,
+        is_tax_included, imported_at
+      FROM fact_rakuten_store_daily
+      WHERE date_jst >= ? AND date_jst <= ?
+      ORDER BY date_jst
+    `,
+    selectParams: (range) => [range.from, range.to],
+    hashRow: (r) => ({
+      date_jst: r.date_jst, sales: r.sales_all_yen, access: r.access_all, coupon: r.coupon_store_yen,
+    }),
+    sampleLog: (r) => `date=${r.date_jst} sales=¥${r.sales_all_yen} access=${r.access_all} cvr=${r.cvr_all_pct}%`,
   },
 ];
 
