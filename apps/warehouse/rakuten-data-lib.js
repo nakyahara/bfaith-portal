@@ -24,6 +24,7 @@ import { normSku } from '../../lib/sku-norm.js';
 import {
   parseCsvBuffer, numOrNull, normalizeDate, expandFile, GroupAbortError,
 } from './rakuten-ads-rpp-lib.js';
+import { ensureRakutenDdTables, prepareDdFile, commitDdOne, DD_TYPES } from './rakuten-dd-lib.js';
 
 const trimS = v => String(v == null ? '' : v).trim();
 const yenOrNull = v => { const n = numOrNull(v); return n === null ? null : Math.round(n); };
@@ -361,12 +362,16 @@ export function prepareDataFile(name, buffer) {
   const storeIdx = findHeaderRow(rows, ['日付', '曜日', '売上金額（すべて）']);
   if (storeIdx >= 0) return prepareStoreDaily(name, rows, storeIdx);
 
+  // データダウンロードハブ 7種 (rakuten-dd-lib.js のレシピにfall-through)
+  const dd = prepareDdFile(name, rows);
+  if (dd) return dd;
+
   // RPP系のファイルが誤ってこちらに投入されたケースへの案内
   const rppIdx = findHeaderRow(rows, ['コントロールカラム']);
   if (rppIdx >= 0) {
     return { name, ok: false, type: 'unknown', error: 'RPP広告レポートです。incoming/rakuten-ads/ に置いてください' };
   }
-  return { name, ok: false, type: 'unknown', error: '種類を判別できません (商品分析 / 日次_分析用レポート のどちらでもない)' };
+  return { name, ok: false, type: 'unknown', error: '種類を判別できません (商品分析 / 分析用レポート / データダウンロード7種 のいずれでもない)' };
 }
 
 // ─── 確定: 検証済み1ファイル分を UPSERT (呼び出し元 transaction 内) ───
@@ -376,6 +381,16 @@ function commitOne(db, logStmt, p, ctx) {
   const logInfo = logStmt.run(importedAt, source, p.name, fileSha256, p.type, p.dateFrom, p.dateTo, p.records.length, 0, 0, 'ok', '');
   const importId = logInfo.lastInsertRowid;
   const meta = { source_file: p.name.slice(0, 200), import_id: importId, imported_at: importedAt, updated_at: importedAt };
+
+  if (DD_TYPES.has(p.type)) {
+    // データダウンロードハブ 7種は rakuten-dd-lib.js の UPSERT に委譲
+    ({ inserted, updated } = commitDdOne(db, p, meta));
+    db.prepare(`UPDATE raw_rakuten_data_import_log SET inserted=?, updated=? WHERE id=?`).run(inserted, updated, importId);
+    return {
+      file: p.name, ok: true, type: p.type, label: p.label,
+      date_from: p.dateFrom, date_to: p.dateTo, rows: p.records.length, inserted, updated,
+    };
+  }
 
   if (p.type === 'rakuten_item_daily') {
     const existsStmt = db.prepare(`SELECT 1 FROM fact_rakuten_item_daily WHERE date_jst=? AND item_manage_number=?`);

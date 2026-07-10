@@ -44,6 +44,7 @@ const OUT_DIR = join(__dirname, 'spike-output');
 
 const ITEM_URL = 'https://datatool.rms.rakuten.co.jp/access/item';   // 商品ページ分析 (=商品分析CSV)
 const STORE_URL = 'https://datatool.rms.rakuten.co.jp/datatool/data/'; // 分析用レポート (店舗日次)
+const DD_URL = 'https://datatool.rms.rakuten.co.jp/datadownload';    // データダウンロードハブ (7種)
 
 const WAREHOUSE_DATA_DIR = (process.env.WAREHOUSE_DATA_DIR || process.env.DATA_DIR || '').trim();
 const INCOMING_DIR = WAREHOUSE_DATA_DIR ? join(WAREHOUSE_DATA_DIR, 'incoming', 'rakuten-data') : null;
@@ -188,9 +189,14 @@ async function persistDownload(download, reportType, range, expect) {
     throw new Error(`DL_VERIFY: 期待日 ${expect.dateFrom} と実CSV ${p.dateFrom} が不一致 (前回期間/クランプ後のCSVを掴んだ疑い)`);
   }
   // 店舗日次: 月初日から始まらないCSVは部分DL (取込はUPSERTのみで欠け日が残る) → error。
-  // dateTo は未来日=未集計スキップ設計のため月末未満を許容 (Codex R2 Medium)
-  if (expect.month && !(p.dateFrom === expect.month.from && p.dateTo <= expect.month.to)) {
-    throw new Error(`DL_VERIFY: 期待月 ${expect.month.ym} (${expect.month.from}〜) と実CSV ${p.dateFrom}〜${p.dateTo} が不一致 (部分CSVの疑い)`);
+  // dateTo は未来日=未集計スキップ設計のため月末未満を許容 (Codex R2 Medium)。
+  // loose=true (カテゴリ等、アクセスがあった日しか行が無いデータ) は月内チェックのみ
+  if (expect.month) {
+    const inMonth = p.dateFrom.slice(0, 7) === expect.month.ym && p.dateTo <= expect.month.to;
+    const startsAtFirst = p.dateFrom === expect.month.from;
+    if (!(inMonth && (expect.month.loose || startsAtFirst))) {
+      throw new Error(`DL_VERIFY: 期待月 ${expect.month.ym} (${expect.month.from}〜) と実CSV ${p.dateFrom}〜${p.dateTo} が不一致 (部分CSVの疑い)`);
+    }
   }
   console.log(`  [verify] ${p.label} ${p.records.length}件 (${p.dateFrom}〜${p.dateTo})`);
 
@@ -353,6 +359,85 @@ async function fetchStoreDaily(page, month) {
   return 'ok';
 }
 
+// ─── データダウンロードハブ 7種 (mall-csv-fetcher P1-R3、実測 2026-07-10) ───
+// select[name=name] でデータ種類を選び、期間 (calendar input) → CSVダウンロード → モーダル →
+// ダウンロード (同期DL)。新規リピート系3種は期間指定が効かない固定window (as-is DL)。
+const DD_SPECS = [
+  // period: 'month'=対象月レンジ / 'day'=1日単位ループ / null=期間指定なし (固定window)
+  { key: 'dd_store', label: '店舗データ', selectLabel: '店舗データ', period: 'month',
+    reportType: 'rdata_dd_store', expectType: 'rakuten_store_device_daily' },
+  { key: 'dd_sku', label: 'SKU別売上データ', selectLabel: 'SKU別売上データ', period: 'day',
+    reportType: 'rdata_dd_sku', expectType: 'rakuten_sku_daily' },
+  { key: 'dd_category', label: 'カテゴリページデータ', selectLabel: 'カテゴリページデータ', period: 'month',
+    reportType: 'rdata_dd_category', expectType: 'rakuten_category_daily', monthLoose: true },
+  { key: 'dd_campaign', label: 'キャンペーンデータ', selectLabel: 'キャンペーンデータ', period: 'month',
+    reportType: 'rdata_dd_campaign', expectType: 'rakuten_campaigns', noDateVerify: true },
+  { key: 'dd_purchaser', label: '新規・リピート購入者数（店舗別）', selectLabel: '新規・リピート購入者数（店舗別）', period: null,
+    reportType: 'rdata_dd_purchaser_monthly', expectType: 'rakuten_purchaser_monthly' },
+  { key: 'dd_item_purchaser', label: '新規・リピート購入者数（商品別）', selectLabel: '新規・リピート購入者数（商品別）', period: null,
+    reportType: 'rdata_dd_item_purchaser', expectType: 'rakuten_item_purchaser_snapshot' },
+  { key: 'dd_genre_purchaser', label: '新規・リピート購入者数（商品ジャンル別）', selectLabel: '新規・リピート購入者数（商品ジャンル別）', period: null,
+    reportType: 'rdata_dd_genre_purchaser', expectType: 'rakuten_genre_purchaser_snapshot' },
+];
+
+/** データダウンロードハブで1種類×1期間をDL。range=null は固定windowデータ (期間設定なし) */
+async function fetchDdOne(page, spec, range) {
+  const rangeLabel = range ? (range.from === range.to ? range.from : `${range.from}〜${range.to}`) : '固定window';
+  console.log(`\n--- ${spec.label} ${rangeLabel} ---`);
+  await gotoDatatool(page, DD_URL, 'データダウンロード');
+
+  // データ種類を選択 → 読み戻し検証
+  await page.selectOption('select[name="name"]', { label: spec.selectLabel });
+  await page.waitForTimeout(2000);
+  const sel = await page.evaluate(() => {
+    const el = document.querySelector('select[name="name"]');
+    return el ? el.selectedOptions[0]?.text || '' : '';
+  }).catch(() => '');
+  if (sel !== spec.selectLabel) throw new Error(`FORM_VERIFY: データ種類を選択できず (期待 ${spec.selectLabel} / 実際 ${sel})`);
+  console.log(`  [select] ${sel}`);
+
+  if (range) {
+    // 期間選択=日次 radio (デフォルト) を確認してから期間セット
+    const dailyOk = await page.evaluate(() => {
+      const radios = [...document.querySelectorAll('input[type=radio]')].filter((r) => !!(r.offsetParent || r.getClientRects().length));
+      return radios.some((r) => r.value === 'daily' && r.checked);
+    }).catch(() => false);
+    if (!dailyOk) throw new Error('FORM_VERIFY: 期間選択が「日次」になっていない');
+    const marked = await page.evaluate(() => {
+      const vis = (el) => !!(el.offsetParent || el.getClientRects().length);
+      const el = [...document.querySelectorAll('input[type=text]')].filter(vis)
+        .find((e) => /^\d{4}\/\d{2}\/\d{2} - \d{4}\/\d{2}\/\d{2}$/.test(e.value));
+      if (!el) return false;
+      el.setAttribute('data-rdata-date', '1');
+      return true;
+    });
+    if (!marked) throw new Error('FORM_VERIFY: 期間入力が見つからず');
+    const want = `${slashDate(range.from)} - ${slashDate(range.to)}`;
+    const got = await setRangeInput(page, 'data-rdata-date', want);
+    if (got !== want) throw new Error(`FORM_VERIFY: 期間が設定できず (期待 ${want} / 実際 ${got})`);
+    console.log(`  [date] ${got}`);
+  }
+
+  const dlPromise = page.waitForEvent('download', { timeout: 90000 });
+  dlPromise.catch(() => {});
+  if (!(await clickExact(page, ['CSVダウンロード'], 'CSVダウンロードモーダル'))) {
+    throw new Error('FORM_VERIFY: 「CSVダウンロード」ボタンが見つからず');
+  }
+  await page.waitForTimeout(1500);
+  // モーダルの「ダウンロード」(出ない同期DLパターンにも対応: 見つからなくても download を待つ)
+  await clickExact(page, ['ダウンロード'], 'モーダルDL実行', { last: true });
+  const download = await dlPromise;
+
+  const expect = { type: spec.expectType };
+  if (range && !spec.noDateVerify) {
+    if (range.from === range.to) expect.dateFrom = range.from;
+    else expect.month = { ym: range.from.slice(0, 7), from: range.from, to: range.to, loose: !!spec.monthLoose };
+  }
+  await persistDownload(download, spec.reportType,
+    range || { from: 'window', to: 'window' }, expect);
+  return 'ok';
+}
+
 async function main() {
   const runLog = initRunLog('rakuten-data');
   try { assertLoginEnv(); } catch (e) {
@@ -368,16 +453,17 @@ async function main() {
   await mkdir(DL_DIR, { recursive: true });
   await mkdir(OUT_DIR, { recursive: true });
 
-  const targets = (process.env.RDATA_REPORTS || 'item,store').split(',').map((s) => s.trim()).filter(Boolean);
-  const unknown = targets.filter((t) => !['item', 'store'].includes(t));
+  const targets = (process.env.RDATA_REPORTS || 'item,store,dd').split(',').map((s) => s.trim()).filter(Boolean);
+  const unknown = targets.filter((t) => !['item', 'store', 'dd'].includes(t));
   if (targets.length === 0 || unknown.length > 0) {
     // typo で対象0件のまま exit 0 になるのを防ぐ (Codex R1 Low、RPP側の exit 2 規約に合わせる)
-    console.error(`FATAL: RDATA_REPORTS には item / store を指定してください (不明: ${unknown.join(',') || '(空)'})`);
+    console.error(`FATAL: RDATA_REPORTS には item / store / dd を指定してください (不明: ${unknown.join(',') || '(空)'})`);
     process.exitCode = 2;
     return;
   }
   const itemDates = targets.includes('item') ? computeItemTargetDates() : [];
   const storeMonths = targets.includes('store') ? computeStoreTargetMonths() : [];
+  const ddSpecs = targets.includes('dd') ? DD_SPECS : [];
 
   // openContext 失敗 (プロファイルロック等) は fetch-all が「子が通知済み」とみなす exit 1 に
   // なるため、ここで自力通知してから落ちる (Codex R1 Medium: 通知漏れ防止)
@@ -401,7 +487,7 @@ async function main() {
   const failures = [];
   try {
     console.log('=== 楽天データ分析CSV 自動DL ===');
-    console.log(`商品分析: ${itemDates.join(', ') || '(対象外)'} / 店舗日次: ${storeMonths.map((m) => m.ym).join(', ') || '(対象外)'}`);
+    console.log(`商品分析: ${itemDates.join(', ') || '(対象外)'} / 店舗日次: ${storeMonths.map((m) => m.ym).join(', ') || '(対象外)'} / データDL: ${ddSpecs.length}種`);
     await ensureRmsLogin(page);
 
     for (const dateIso of itemDates) {
@@ -431,6 +517,43 @@ async function main() {
         failures.push({ reportType: 'rdata_store_daily', ym: month.ym, error: e.message, url: page.url(), screenshot: join(OUT_DIR, `rdata_store_${month.ym}_error.png`) });
         if (String(e.message).startsWith('2FA_REQUIRED')) throw e;
         break;
+      }
+    }
+
+    // データダウンロードハブ 7種。1種の失敗で他種を止めない (種類ごとに独立した画面操作)
+    for (const spec of ddSpecs) {
+      // 対象期間: day=商品分析と同じ日ループ / month=店舗日次と同じ月ループ / null=固定window 1DL
+      const ranges = spec.period === 'day' ? computeItemTargetDates().map((d) => ({ from: d, to: d }))
+        : spec.period === 'month' ? computeStoreTargetMonths().map((m) => ({ from: m.from, to: m.to }))
+        : [null];
+      for (const range of ranges) {
+        const ymLabel = range ? (range.from === range.to ? range.from : range.from.slice(0, 7)) : 'window';
+        try {
+          // 日単位DLはデータ更新日 (集計済み最新日) より新しい日をスキップ (商品分析と同じ構え)
+          if (spec.period === 'day') {
+            await gotoDatatool(page, DD_URL, 'データダウンロード');
+            const upd = await readUpdateDate(page);
+            if (upd && range.from > upd) {
+              console.log(`\n--- ${spec.label} ${range.from} --- [skip] 未集計 (更新日=${upd})`);
+              await logFetch({ report_type: spec.reportType, period_from: range.from, period_to: range.to, status: 'empty', message: `未集計 (データ更新日=${upd})` });
+              outcomes.push({ spec: spec.key, ym: ymLabel, status: 'empty' });
+              continue;
+            }
+          }
+          const status = await fetchDdOne(page, spec, range);
+          outcomes.push({ spec: spec.key, ym: ymLabel, status });
+        } catch (e) {
+          console.error(`✗ ${spec.label} ${ymLabel}: ${e.message}`);
+          await snap(page, `${spec.key}_${ymLabel}_error`);
+          await logFetch({
+            report_type: spec.reportType, period_from: range?.from || null, period_to: range?.to || null,
+            status: 'error', message: e.message,
+          });
+          outcomes.push({ spec: spec.key, ym: ymLabel, status: 'error' });
+          failures.push({ reportType: spec.reportType, ym: ymLabel, error: e.message, url: page.url(), screenshot: join(OUT_DIR, `rdata_${spec.key}_${ymLabel}_error.png`) });
+          if (String(e.message).startsWith('2FA_REQUIRED')) throw e;
+          break; // 同種の残り期間はスキップ (他種は続行)
+        }
       }
     }
 

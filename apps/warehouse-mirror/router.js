@@ -15,6 +15,13 @@ import { Router } from 'express';
 import crypto from 'crypto';
 import { initMirrorDB, getMirrorDB } from './db.js';
 import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
+import {
+  STORE_BENCH_COLS, STORE_DEVICE_BASE_COLS, STORE_DEVICE_OPT_COLS, CATEGORY_DEMO_COLS,
+} from '../../lib/rakuten-dd-columns.js';
+
+// 楽天データダウンロード7種の列合成 (mall-csv-fetcher P1-R3。miniPC側と共有定義)
+const DD_STORE_ALL_COLS = [...STORE_DEVICE_BASE_COLS, ...STORE_BENCH_COLS, ...STORE_DEVICE_OPT_COLS];
+const DD_CATEGORY_DEMO_COLS = CATEGORY_DEMO_COLS;
 
 const router = Router();
 
@@ -769,6 +776,111 @@ function getRakutenStoreDailyInsert(db) {
   return b.rakutenStoreDailyInsert;
 }
 
+// ─── 楽天データダウンロードハブ 7種 (mall-csv-fetcher P1-R3) ───
+// 列定義は lib/rakuten-dd-columns.js を miniPC 側と共有。insert/normalize は宣言から生成
+const RAKUTEN_DD_TABLE_SPECS = {
+  rakuten_store_device_daily: {
+    table: 'mirror_rakuten_store_device_daily',
+    required: ['date_jst', 'device'],
+    cols: ['date_jst', 'device',
+      ...DD_STORE_ALL_COLS,
+      'is_tax_included', 'imported_at'],
+    defaults: { is_tax_included: 1 },
+    validate: (r, HttpErrorCls) => {
+      if (!['all', 'pc', 'app', 'sp'].includes(r.device)) {
+        throw new HttpErrorCls(400, { error: 'bad_row', message: `unknown device: ${r.device}` });
+      }
+    },
+  },
+  rakuten_sku_daily: {
+    table: 'mirror_rakuten_sku_daily',
+    required: ['date_jst', 'sku_key'],
+    cols: ['date_jst', 'sku_key', 'raw_sku_mgmt_number', 'item_manage_number',
+      'sales_yen', 'orders', 'units',
+      'system_sku_number', 'item_number', 'catalog_id', 'item_name',
+      'sku_attr1', 'sku_attr2', 'sku_attr3', 'is_tax_included', 'imported_at'],
+    defaults: { sales_yen: 0, orders: 0, units: 0, is_tax_included: 1 },
+  },
+  rakuten_category_daily: {
+    table: 'mirror_rakuten_category_daily',
+    required: ['date_jst', 'category_key', 'device'],
+    cols: ['date_jst', 'category_key', 'device', 'hierarchy', 'category_name', 'category_url',
+      'access_users', 'unique_users', 'stay_seconds', 'bounce_count', 'exit_count', 'exit_rate_pct',
+      ...DD_CATEGORY_DEMO_COLS, 'imported_at'],
+    defaults: { access_users: 0 },
+    validate: (r, HttpErrorCls) => {
+      if (!['all', 'pc', 'app', 'sp'].includes(r.device)) {
+        throw new HttpErrorCls(400, { error: 'bad_row', message: `unknown device: ${r.device}` });
+      }
+    },
+  },
+  rakuten_campaigns: {
+    table: 'mirror_rakuten_campaigns',
+    required: ['campaign_type', 'campaign_name', 'start_at', 'date_jst'],
+    cols: ['campaign_type', 'campaign_name', 'start_at', 'end_at', 'date_jst', 'imported_at'],
+  },
+  rakuten_purchaser_monthly: {
+    table: 'mirror_rakuten_purchaser_monthly',
+    required: ['date_jst'],
+    cols: ['date_jst', 'new_buyers', 'new_aov_yen', 'new_sales_yen', 'new_orders', 'new_units',
+      'repeat_buyers', 'repeat_aov_yen', 'repeat_sales_yen', 'repeat_orders', 'repeat_units',
+      'is_tax_included', 'imported_at'],
+    defaults: { is_tax_included: 1 },
+    validate: (r, HttpErrorCls) => {
+      if (!/^\d{4}-\d{2}-01$/.test(r.date_jst)) {
+        throw new HttpErrorCls(400, { error: 'bad_row', message: `date_jst must be month start (got ${r.date_jst})` });
+      }
+    },
+  },
+  rakuten_item_purchaser_snapshot: {
+    table: 'mirror_rakuten_item_purchaser_snapshot',
+    required: ['date_jst', 'item_manage_number'],
+    cols: ['date_jst', 'item_manage_number', 'item_name', 'item_url', 'price_yen', 'is_suspended',
+      'new_buyers', 'repeat_buyers', 'repeat_rate_pct', 'window_from', 'window_to', 'imported_at'],
+  },
+  rakuten_genre_purchaser_snapshot: {
+    table: 'mirror_rakuten_genre_purchaser_snapshot',
+    required: ['date_jst', 'genre_name'],
+    cols: ['date_jst', 'genre_name', 'new_buyers', 'repeat_buyers', 'repeat_rate_pct',
+      'new_avg_purchase_yen', 'repeat_avg_purchase_yen', 'avg_purchase_count', 'avg_purchase_yen',
+      'window_from', 'window_to', 'imported_at'],
+  },
+};
+
+function getRakutenDdInsert(db, entityKey) {
+  const b = getStmtBundle(db);
+  const cacheKey = `ddInsert_${entityKey}`;
+  if (!b[cacheKey]) {
+    const spec = RAKUTEN_DD_TABLE_SPECS[entityKey];
+    const cols = [...spec.cols, 'source_run_id', 'source_row_hash', 'synced_at'];
+    b[cacheKey] = db.prepare(`INSERT OR REPLACE INTO ${spec.table}
+      (${cols.join(', ')}) VALUES (${cols.map((c) => '@' + c).join(', ')})`);
+  }
+  return b[cacheKey];
+}
+
+function normalizeRakutenDdRow(entityKey, r) {
+  const spec = RAKUTEN_DD_TABLE_SPECS[entityKey];
+  const out = {};
+  for (const k of spec.required) {
+    const v = r[k];
+    if (v === null || v === undefined || String(v).trim() === '') {
+      throw new HttpError(400, { error: 'bad_row', message: `missing required key: ${k}` });
+    }
+  }
+  if (r.date_jst !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(r.date_jst)) {
+    throw new HttpError(400, { error: 'bad_row', message: `bad date_jst: ${r.date_jst}` });
+  }
+  if (spec.validate) spec.validate(r, HttpError);
+  for (const k of spec.cols) {
+    out[k] = r[k] ?? (spec.defaults && k in spec.defaults ? spec.defaults[k] : null);
+  }
+  out.source_run_id = r.source_run_id;
+  out.source_row_hash = r.source_row_hash;
+  out.synced_at = r.synced_at;
+  return out;
+}
+
 // アカウント単位フィー月次 (amazon-dashboard PR-C)
 function getAmazonAccountFeesInsert(db) {
   const b = getStmtBundle(db);
@@ -1292,6 +1404,63 @@ const ENTITY_REGISTRY = {
     clear_meta_key: 'clear_rakuten_store_daily_dates',
     getInsertStmt: getRakutenStoreDailyInsert,
     normalizeRow: (r) => normalizeRakutenStoreDailyRow(r),
+  },
+  // 楽天データダウンロードハブ 7 entity (mall-csv-fetcher P1-R3、2026-07-10)
+  rakuten_store_device_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_rakuten_store_device_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_rakuten_store_device_dates',
+    getInsertStmt: (db) => getRakutenDdInsert(db, 'rakuten_store_device_daily'),
+    normalizeRow: (r) => normalizeRakutenDdRow('rakuten_store_device_daily', r),
+  },
+  rakuten_sku_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_rakuten_sku_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_rakuten_sku_daily_dates',
+    getInsertStmt: (db) => getRakutenDdInsert(db, 'rakuten_sku_daily'),
+    normalizeRow: (r) => normalizeRakutenDdRow('rakuten_sku_daily', r),
+  },
+  rakuten_category_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_rakuten_category_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_rakuten_category_dates',
+    getInsertStmt: (db) => getRakutenDdInsert(db, 'rakuten_category_daily'),
+    normalizeRow: (r) => normalizeRakutenDdRow('rakuten_category_daily', r),
+  },
+  rakuten_campaigns: {
+    contract_version: 1,
+    mirror_table: 'mirror_rakuten_campaigns',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_rakuten_campaign_dates',
+    getInsertStmt: (db) => getRakutenDdInsert(db, 'rakuten_campaigns'),
+    normalizeRow: (r) => normalizeRakutenDdRow('rakuten_campaigns', r),
+  },
+  rakuten_purchaser_monthly: {
+    contract_version: 1,
+    mirror_table: 'mirror_rakuten_purchaser_monthly',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_rakuten_purchaser_months',
+    getInsertStmt: (db) => getRakutenDdInsert(db, 'rakuten_purchaser_monthly'),
+    normalizeRow: (r) => normalizeRakutenDdRow('rakuten_purchaser_monthly', r),
+  },
+  rakuten_item_purchaser_snapshot: {
+    contract_version: 1,
+    mirror_table: 'mirror_rakuten_item_purchaser_snapshot',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_rakuten_item_purchaser_dates',
+    getInsertStmt: (db) => getRakutenDdInsert(db, 'rakuten_item_purchaser_snapshot'),
+    normalizeRow: (r) => normalizeRakutenDdRow('rakuten_item_purchaser_snapshot', r),
+  },
+  rakuten_genre_purchaser_snapshot: {
+    contract_version: 1,
+    mirror_table: 'mirror_rakuten_genre_purchaser_snapshot',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_rakuten_genre_purchaser_dates',
+    getInsertStmt: (db) => getRakutenDdInsert(db, 'rakuten_genre_purchaser_snapshot'),
+    normalizeRow: (r) => normalizeRakutenDdRow('rakuten_genre_purchaser_snapshot', r),
   },
   rakuten_finance_sku_daily: {
     contract_version: 1,

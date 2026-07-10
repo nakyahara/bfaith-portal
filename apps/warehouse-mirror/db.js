@@ -11,6 +11,10 @@
 import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
+import {
+  STORE_BENCH_COLS, STORE_DEVICE_BASE_COLS, STORE_DEVICE_OPT_COLS, STORE_DEVICE_REAL_COLS,
+  CATEGORY_DEMO_COLS,
+} from '../../lib/rakuten-dd-columns.js';
 
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'warehouse-mirror.db');
@@ -665,6 +669,93 @@ function createTables() {
     synced_at             TEXT NOT NULL
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_mrsd_month ON mirror_rakuten_store_daily(substr(date_jst, 1, 7))');
+
+  // ─── 楽天データダウンロードハブ 7種 (mall-csv-fetcher P1-R3、2026-07-10) ───
+  // 列定義は lib/rakuten-dd-columns.js を miniPC 側 (rakuten-dd-lib.js) と共有 (タイポ・ズレ防止)
+  const ddNum = (c) => `${c} ${STORE_DEVICE_REAL_COLS.has(c) ? 'REAL' : 'INTEGER'}`;
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_rakuten_store_device_daily (
+    date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+    device   TEXT NOT NULL CHECK(device IN ('all','pc','app','sp')),
+    ${[...STORE_DEVICE_BASE_COLS, ...STORE_BENCH_COLS, ...STORE_DEVICE_OPT_COLS].map(ddNum).join(', ')},
+    is_tax_included INTEGER NOT NULL DEFAULT 1,
+    imported_at TEXT,
+    source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+    PRIMARY KEY (date_jst, device)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mrsdd_month ON mirror_rakuten_store_device_daily(substr(date_jst, 1, 7))');
+
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_rakuten_sku_daily (
+    date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+    sku_key  TEXT NOT NULL CHECK(trim(sku_key) <> ''),
+    raw_sku_mgmt_number TEXT,
+    item_manage_number  TEXT,
+    sales_yen INTEGER NOT NULL DEFAULT 0, orders INTEGER NOT NULL DEFAULT 0, units INTEGER NOT NULL DEFAULT 0,
+    system_sku_number TEXT, item_number TEXT, catalog_id TEXT, item_name TEXT,
+    sku_attr1 TEXT, sku_attr2 TEXT, sku_attr3 TEXT,
+    is_tax_included INTEGER NOT NULL DEFAULT 1,
+    imported_at TEXT,
+    source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+    PRIMARY KEY (date_jst, sku_key)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mrskud_sku ON mirror_rakuten_sku_daily(sku_key, date_jst)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mrskud_item ON mirror_rakuten_sku_daily(item_manage_number, date_jst)');
+
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_rakuten_category_daily (
+    date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+    category_key TEXT NOT NULL CHECK(trim(category_key) <> ''),
+    device TEXT NOT NULL CHECK(device IN ('all','pc','app','sp')),
+    hierarchy TEXT, category_name TEXT, category_url TEXT,
+    access_users INTEGER NOT NULL DEFAULT 0, unique_users INTEGER, stay_seconds REAL,
+    bounce_count INTEGER, exit_count INTEGER, exit_rate_pct REAL,
+    ${CATEGORY_DEMO_COLS.map((c) => `${c} INTEGER`).join(', ')},
+    imported_at TEXT,
+    source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+    PRIMARY KEY (date_jst, category_key, device)
+  )`);
+
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_rakuten_campaigns (
+    campaign_type TEXT NOT NULL,
+    campaign_name TEXT NOT NULL,
+    start_at TEXT NOT NULL,
+    end_at TEXT,
+    date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+    imported_at TEXT,
+    source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+    PRIMARY KEY (campaign_type, campaign_name, start_at)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mrcamp_date ON mirror_rakuten_campaigns(date_jst)');
+
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_rakuten_purchaser_monthly (
+    date_jst TEXT PRIMARY KEY CHECK(date_jst GLOB '????-??-01'),
+    new_buyers INTEGER, new_aov_yen INTEGER, new_sales_yen INTEGER, new_orders INTEGER, new_units INTEGER,
+    repeat_buyers INTEGER, repeat_aov_yen INTEGER, repeat_sales_yen INTEGER, repeat_orders INTEGER, repeat_units INTEGER,
+    is_tax_included INTEGER NOT NULL DEFAULT 1,
+    imported_at TEXT,
+    source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL
+  )`);
+
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_rakuten_item_purchaser_snapshot (
+    date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+    item_manage_number TEXT NOT NULL CHECK(trim(item_manage_number) <> ''),
+    item_name TEXT, item_url TEXT, price_yen INTEGER, is_suspended INTEGER,
+    new_buyers INTEGER, repeat_buyers INTEGER, repeat_rate_pct REAL,
+    window_from TEXT, window_to TEXT,
+    imported_at TEXT,
+    source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+    PRIMARY KEY (date_jst, item_manage_number)
+  )`);
+
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_rakuten_genre_purchaser_snapshot (
+    date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+    genre_name TEXT NOT NULL CHECK(trim(genre_name) <> ''),
+    new_buyers INTEGER, repeat_buyers INTEGER, repeat_rate_pct REAL,
+    new_avg_purchase_yen INTEGER, repeat_avg_purchase_yen INTEGER,
+    avg_purchase_count REAL, avg_purchase_yen INTEGER,
+    window_from TEXT, window_to TEXT,
+    imported_at TEXT,
+    source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+    PRIMARY KEY (date_jst, genre_name)
+  )`);
 
   // mirror_rakuten_finance_sku_daily — 楽天 Phase 1a #R-3b (Render 側 daily fact mirror)
   // miniPC の f_rakuten_finance_sku_daily_v1 の payload を受信。

@@ -15,6 +15,8 @@ import Database from 'better-sqlite3';
 import AdmZip from 'adm-zip';
 import iconv from 'iconv-lite';
 import { ensureRakutenDataTables, importDataFile, prepareDataFile } from './rakuten-data-lib.js';
+import { ensureRakutenDdTables } from './rakuten-dd-lib.js';
+import { BENCH_METRICS, BENCH_GROUPS } from '../../lib/rakuten-dd-columns.js';
 
 let passed = 0, failed = 0;
 function check(name, cond, detail = '') {
@@ -26,6 +28,7 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'rdata-smoke-'));
 const db = new Database(path.join(tmp, 'warehouse.db'));
 db.pragma('journal_mode = WAL');
 ensureRakutenDataTables(db);
+ensureRakutenDdTables(db);
 
 const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
 const utf8bom = (s) => Buffer.concat([Buffer.from([0xEF, 0xBB, 0xBF]), Buffer.from(s, 'utf8')]);
@@ -222,6 +225,106 @@ console.log('=== 9. 取込ログ (raw_rakuten_data_import_log) ===');
   const logs = db.prepare(`SELECT status, COUNT(*) n FROM raw_rakuten_data_import_log GROUP BY status`).all();
   const m = Object.fromEntries(logs.map(x => [x.status, x.n]));
   check('ok/duplicate/error/skipped 全て記録', m.ok >= 4 && m.duplicate >= 1 && m.error >= 1 && m.skipped >= 1, JSON.stringify(m));
+}
+
+// ═══ データダウンロードハブ 7種 (rakuten-dd-lib.js) ═══
+// 実測ヘッダを再現した合成フィクスチャ。実ファイル全量は取扱注意データのためコミットしない
+// (実CSV 8種での検証は 2026-07-10 に実施済み: 全種取込→mirror sync→手動値と突合一致)
+
+console.log('=== 10. 店舗データ (日次×デバイス、ベンチ全クラス) ===');
+{
+  const benchHeaders = BENCH_METRICS.flatMap(([jm]) => BENCH_GROUPS.map(([jg]) => `${jg} ${jm}`));
+  const header = ['日付', '曜日', 'デバイス', '売上金額', '売上件数', 'アクセス人数', '転換率', '客単価',
+    'ユニークユーザー数', '購入者数（会員）', '購入者数（非会員）', '新規購入者数', 'リピート購入者数',
+    '税額（外税額）', '送料額', 'クーポン値引額（店舗）', 'クーポン値引額（楽天）', '送料無料クーポン',
+    'のし・ラッピング代金', '決済手数料', ...benchHeaders,
+    '楽天スーパーDEAL 売上金額', '運用型ポイント変倍経由売上金額', 'ソーシャルギフト売上'];
+  const benchVals = benchHeaders.map((_, i) => String(1000 + i));
+  const mkRow = (date, dev, sales, access) => [date, '水', dev, sales, '10', access, '3.00', '1500',
+    '90', '9', '1', '5', '5', '100', '0', '200', '30', '0', '0', '250', ...benchVals, '0', '', '0'];
+  const futureRow = ['2026/07/20', '月', 'すべて', '0', '0', '0', '0.00', '0', '0', '0', '0', '0', '0',
+    '0', '0', '0', '0', '0', '0', '0', ...benchHeaders.map(() => ''), '', '', ''];
+  const csv = sjis([
+    '"※取扱注意"', '"データ対象期間,2026/07/01 ～ 2026/07/31"',
+    header.map(h => `"${h}"`).join(','),
+    mkRow('2026/07/01', 'すべて', '150000', '1000').map(v => `"${v}"`).join(','),
+    mkRow('2026/07/01', 'PC', '50000', '300').map(v => `"${v}"`).join(','),
+    futureRow.map(v => `"${v}"`).join(','),
+  ].join('\r\n'));
+  const r = importDataFile(db, { name: 'store-device.csv', buffer: csv, sha256: sha(csv), source: 'test' });
+  check('取込ok', r.status === 'ok', JSON.stringify(r.results));
+  const rows = db.prepare(`SELECT * FROM fact_rakuten_store_device_daily ORDER BY device`).all();
+  check('未来行スキップで2行', rows.length === 2, `got ${rows.length}`);
+  check('device正規化 (すべて→all)', rows.some(x => x.device === 'all') && rows.some(x => x.device === 'pc'));
+  const a = rows.find(x => x.device === 'all');
+  check('ベンチ列マッピング (bench_top10_sales=先頭)', a.bench_top10_sales_yen === 1000, `got ${a.bench_top10_sales_yen}`);
+  check('ベンチ列マッピング (bench_cls6_aov=末尾)', a.bench_cls6_aov_yen === 1000 + benchHeaders.length - 1, `got ${a.bench_cls6_aov_yen}`);
+  check('会員別購入者', a.buyers_member === 9 && a.buyers_new === 5);
+}
+
+console.log('=== 11. SKU別売上 (複合キー、1日単位必須) ===');
+{
+  const header = ['カタログID', '商品管理番号', '商品番号', '商品名', 'SKU管理番号', 'システム連携用SKU番号',
+    'SKU項目1', 'SKU項目2', 'SKU項目3', 'SKU項目4', 'SKU項目5', 'SKU項目6', '売上金額', '売上件数', '売上個数'];
+  const mk = (rows) => utf8bom([
+    '※取扱注意', 'データ対象期間,2026/07/09 ～ 2026/07/09',
+    header.join(','), ...rows.map(r => r.join(',')),
+  ].join('\r\n'));
+  // SKU管理番号 'normal-inventory' が別商品で重複しても複合キーで共存できる (実測仕様)
+  const csv = mk([
+    ['4900000000001', 'ITEM-A', 'ITEM-A', '商品A', 'normal-inventory', '', '', '', '', '', '', '', '1000', '1', '1'],
+    ['4900000000002', 'ITEM-B', 'ITEM-B', '商品B', 'normal-inventory', '', '', '', '', '', '', '', '2000', '2', '2'],
+    ['4900000000003', 'ITEM-C', 'ITEM-C', '商品C', '60', 'ITEM-C-BK', 'ブラック', '', '', '', '', '', '3000', '1', '3'],
+  ]);
+  const r = importDataFile(db, { name: 'sku.csv', buffer: csv, sha256: sha(csv), source: 'test' });
+  check('取込ok (SKU管理番号の商品跨ぎ重複OK)', r.status === 'ok', JSON.stringify(r.results));
+  const rows = db.prepare(`SELECT * FROM fact_rakuten_sku_daily ORDER BY sku_key`).all();
+  check('3行取込', rows.length === 3, `got ${rows.length}`);
+  check('複合sku_key', rows.some(x => x.sku_key === 'item-a|normal-inventory'));
+  const dim = db.prepare(`SELECT * FROM m_rakuten_skus WHERE sku_key = 'item-c|60'`).get();
+  check('dimにシステム連携用SKU番号', dim?.system_sku_number === 'ITEM-C-BK', JSON.stringify(dim));
+  // 複数日レンジは拒否
+  const multi = utf8bom(['※', 'データ対象期間,2026/07/01 ～ 2026/07/31', header.join(','),
+    ['x', 'I', 'I', 'n', 's', '', '', '', '', '', '', '', '1', '1', '1'].join(',')].join('\r\n'));
+  const p = prepareDataFile('multi.csv', multi);
+  check('複数日レンジ → error', !p.ok && /1日単位/.test(p.error), p.error);
+}
+
+console.log('=== 12. 新規リピート月次 + キャンペーン + ジャンル別スナップショット ===');
+{
+  const pmCsv = sjis(['"※"', '"データ対象期間,2024/08 ～ 2026/07"',
+    '"日付","新規購入者数","新規購入 客単価","新規購入 売上","新規購入 売上件数","新規購入 売上個数","リピート購入者数","リピート購入 客単価","リピート購入 売上","リピート購入 売上件数","リピート購入 売上個数"',
+    '"2024年08月","9563","1603","15384862","9600","11287","2765","2256","6562207","2909","3816"'].join('\r\n'));
+  const r1 = importDataFile(db, { name: 'pm.csv', buffer: pmCsv, sha256: sha(pmCsv), source: 'test' });
+  check('購入者月次 取込ok', r1.status === 'ok', JSON.stringify(r1.results));
+  const pm = db.prepare(`SELECT * FROM fact_rakuten_purchaser_monthly WHERE date_jst = '2024-08-01'`).get();
+  check('月初日PK+金額INTEGER', pm?.new_sales_yen === 15384862 && pm?.repeat_buyers === 2765);
+
+  const cpCsv = sjis(['"※"',
+    '"キャンペーン種類","キャンペーン名","開始日時","終了日時"',
+    '"ポイント","テストキャンペーン","2026/06/01 10:00:00","2026/07/31 09:59:59"',
+    '"ポイント","テストキャンペーン","2026/06/01 10:00:00","2026/07/31 09:59:59"'].join('\r\n'));
+  const r2 = importDataFile(db, { name: 'cp.csv', buffer: cpCsv, sha256: sha(cpCsv), source: 'test' });
+  check('キャンペーン 取込ok (ファイル内重複は先勝ち)', r2.status === 'ok' && r2.results[0].rows === 1, JSON.stringify(r2.results));
+  const cp = db.prepare(`SELECT * FROM m_rakuten_campaigns`).get();
+  check('date_jst=開始日', cp?.date_jst === '2026-06-01');
+
+  const gpCsv = sjis(['"※"', '"データ対象期間,2025/07 ～ 2026/06"',
+    '"ジャンル名","新規購入者数","リピート購入者数","リピート購入率","新規購入者の平均購入金額","リピート購入者の平均購入金額","平均購入回数","1回あたりの平均購入金額"',
+    '"花・ガーデン > 園芸","25","0","0","2394","0","1.16","2064"'].join('\r\n'));
+  const r3 = importDataFile(db, { name: 'gp.csv', buffer: gpCsv, sha256: sha(gpCsv), source: 'test' });
+  check('ジャンル別snapshot 取込ok', r3.status === 'ok', JSON.stringify(r3.results));
+  const gp = db.prepare(`SELECT * FROM fact_rakuten_genre_purchaser_snapshot`).get();
+  check('snapshot=取込日+window保持', gp?.window_from === '2025-07' && gp?.avg_purchase_count === 1.16, JSON.stringify(gp));
+
+  // 同日再取込は集合置換 (構成が変わったら脱落行が消える — Codex R4 Medium)
+  const gpCsv2 = sjis(['"※"', '"データ対象期間,2025/07 ～ 2026/06"',
+    '"ジャンル名","新規購入者数","リピート購入者数","リピート購入率","新規購入者の平均購入金額","リピート購入者の平均購入金額","平均購入回数","1回あたりの平均購入金額"',
+    '"日用品 > 補修材"," 30","1","3.2","2000","1500","1.2","1900"'].join('\r\n'));
+  const r4 = importDataFile(db, { name: 'gp2.csv', buffer: gpCsv2, sha256: sha(gpCsv2), source: 'test' });
+  check('同日再取込ok', r4.status === 'ok');
+  const gpAll = db.prepare(`SELECT genre_name FROM fact_rakuten_genre_purchaser_snapshot`).all();
+  check('集合置換 (旧ジャンル行が消える)', gpAll.length === 1 && gpAll[0].genre_name === '日用品 > 補修材', JSON.stringify(gpAll));
 }
 
 db.close();

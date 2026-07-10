@@ -1798,6 +1798,56 @@ function createTables() {
       updated_at          = excluded.updated_at
   `);
 
+  // ---- 楽天データダウンロードハブ 7種: contract auto-seed (mall-csv-fetcher P1-R3、2026-07-10)
+  // datatool「データダウンロード」の公式固定フォーマットCSV。UPSERT idempotent (他 seed と同方針)
+  {
+    const ddContracts = [
+      ['rakuten_store_device_daily', 'fact_rakuten_store_device_daily',
+        'one row = one (date_jst, device) — 店舗データ日次×デバイス (売上/UU/会員別・新規リピート購入者/費用/全月商クラスベンチ/DEAL)',
+        '["date_jst","device"]'],
+      ['rakuten_sku_daily', 'fact_rakuten_sku_daily',
+        'one row = one (date_jst, sku_key) — SKU別売上日次。sku_key=商品管理番号|SKU管理番号 (SKU管理番号は商品跨ぎ重複のため複合)。システム連携用SKU番号=NE連携キー',
+        '["date_jst","sku_key"]'],
+      ['rakuten_category_daily', 'fact_rakuten_category_daily',
+        'one row = one (date_jst, category_key, device) — カテゴリページ日次 (アクセス/UU/滞在/離脱+属性・地域・会員ランク別)',
+        '["date_jst","category_key","device"]'],
+      ['rakuten_campaigns', 'm_rakuten_campaigns',
+        'one row = one (campaign_type, campaign_name, start_at) — 楽天開催キャンペーン一覧 (参照マスタ)。date_jst=開始日',
+        '["campaign_type","campaign_name","start_at"]'],
+      ['rakuten_purchaser_monthly', 'fact_rakuten_purchaser_monthly',
+        'one row = one month — 新規・リピート購入者数 (店舗別月次、DL時点の過去2年window)。date_jst=月初日',
+        '["date_jst"]'],
+      ['rakuten_item_purchaser_snapshot', 'fact_rakuten_item_purchaser_snapshot',
+        'one row = one (date_jst, item_manage_number) — 新規・リピート購入者 商品別2年通算スナップショット (RMS仕様で上位100件のみ)。date_jst=取込日',
+        '["date_jst","item_manage_number"]'],
+      ['rakuten_genre_purchaser_snapshot', 'fact_rakuten_genre_purchaser_snapshot',
+        'one row = one (date_jst, genre_name) — 新規・リピート購入者 ジャンル別1年通算スナップショット。date_jst=取込日',
+        '["date_jst","genre_name"]'],
+    ];
+    const seedStmt = db.prepare(`
+      INSERT INTO sync_contracts (
+        entity, contract_version, source_system, source_object, target_table,
+        grain_definition, key_columns_json, payload_schema_json,
+        clear_strategy, apply_mode, enabled, owner, created_at, updated_at
+      ) VALUES (
+        ?, 1, 'minipc-warehouse', ?, ?, ?, ?,
+        '{"required":["date_jst"],"date_jst_pattern":"^\\d{4}-\\d{2}-\\d{2}$","amount_unit":"JPY_tax_included_integer"}',
+        'scope_clear_per_run', 'insert_or_replace', 1, 'mall-csv-fetcher',
+        strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      )
+      ON CONFLICT(entity) DO UPDATE SET
+        contract_version = excluded.contract_version, source_system = excluded.source_system,
+        source_object = excluded.source_object, target_table = excluded.target_table,
+        grain_definition = excluded.grain_definition, key_columns_json = excluded.key_columns_json,
+        payload_schema_json = excluded.payload_schema_json, clear_strategy = excluded.clear_strategy,
+        apply_mode = excluded.apply_mode, enabled = excluded.enabled, owner = excluded.owner,
+        updated_at = excluded.updated_at
+    `);
+    for (const [entity, srcTable, grain, keys] of ddContracts) {
+      seedStmt.run(entity, srcTable, `mirror_${entity}`, grain, keys);
+    }
+  }
+
   // ---- Phase 1 #1-4a: sync_runs (run ledger、miniPC 側で sync 開始記録)
   // status 遷移: started → applied (全 chunk Render から 2xx)
   //              | → failed (途中失敗、error_message に記録)

@@ -134,6 +134,26 @@ rakuten-data-download.mjs
   ```
 - 画面調査は `rakuten-data-spike.mjs` (SPIKE_URL / SPIKE_DL / SPIKE_SETDATE / SPIKE_CLICK)。
 
+## P1-R3: データダウンロードハブ 7種 (2026-07-10 実装)
+
+`datatool.rms.rakuten.co.jp/datadownload` の公式固定フォーマットCSV。取得は同じ
+`rakuten-data-download.mjs` (RDATA_REPORTS=dd)、取込レーン・incoming も P1-R2 と共通
+(種別はヘッダ自動判別)。列定義は `lib/rakuten-dd-columns.js` で miniPC/mirror 共有。
+
+| データ | 周期 | fact | 備考 |
+|---|---|---|---|
+| 店舗データ | 今月 (月初3日は先月も) | fact_rakuten_store_device_daily | 日次×デバイス。UU/会員別/新規リピート購入者+全月商クラスベンチ+DEAL |
+| SKU別売上 | 昨日+一昨日 (日ループ) | fact_rakuten_sku_daily + m_rakuten_skus | ⭐システム連携用SKU番号=NE連携キー。SKU管理番号は商品跨ぎ重複→複合キー |
+| カテゴリページ | 今月 | fact_rakuten_category_daily | 属性・地域・会員ランク別 |
+| キャンペーン | 今月 | m_rakuten_campaigns | 参照マスタ。date_jst=開始日 |
+| 新規リピート(店舗別) | 固定window (過去2年月次) | fact_rakuten_purchaser_monthly | 初回のみ sync --from 2024-08-01 で全量投入 |
+| 新規リピート(商品別) | 固定window (2年通算) | fact_rakuten_item_purchaser_snapshot | ⚠️RMS仕様で上位100件のみ。date_jst=取込日 |
+| 新規リピート(ジャンル別) | 固定window (1年通算) | fact_rakuten_genre_purchaser_snapshot | date_jst=取込日 |
+
+- 運用型ポイントは未使用 (全行空) のため対象外。検索キーワードはRMSがCSV非提供 (画面のみ) のため対象外。
+- スナップショット系 (date_jst=取込日) は sync scope 終端=昨日のため mirror 反映が1日遅れる (仕様)。
+- キャンペーンは開始日が scope より古い/未来のものは nightly sync に乗らない → 開始後に自動で乗る。
+
 ### エラー通知 (無音停止禁止) と多モール続行
 
 - **Task Scheduler は `fetch-all.mjs` を登録**。モールごとに子プロセスで実行し、失敗しても次のモールへ続行
