@@ -20,6 +20,7 @@ import multer from 'multer';
 import iconv from 'iconv-lite';
 import { getDB, normSupplierCode, normProductCode } from './db.js';
 import { computeAll, loadPml, loadPmlMerged, loadMasters, evaluateCondition } from './logic.js';
+import { ensureTrackingStarted, nextPoNumber, isYmd, checkLedgerIntegrity } from './ledger.js';
 
 // ─── miniPC (WarehouseServer) service-api 呼び出し (オンデマンドFBA更新、product-management-list と同一エンドポイント) ───
 const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
@@ -182,20 +183,34 @@ function upsertDraft(supplierCode, supplierName, rawItems, note) {
 /**
  * 発注確定 (Codex R2 High): draft を mutate せず issued order を新規 insert し、
  * 既存 draft の削除まで1トランザクションで行う。並行する draft 更新と混ざらない。
+ *
+ * P13a: issue と同時に PO番号採番 + tracking_mode='tracked' + 希望納期の明細スナップショットを行う
+ * (移行境界 tracking_started_at 以後の発注=残数管理対象。db.js の issue gate トリガが不完全発行を拒否する)。
  */
-function issueOrder(supplierCode, supplierName, rawItems, note) {
+function issueOrder(supplierCode, supplierName, rawItems, note, requestedDate) {
   const db = getDB();
+  ensureTrackingStarted(); // 初回発行で移行境界を確定 (冪等)
   const { items, pmlAsOf } = enrichItems(rawItems, supplierCode);
+  if (requestedDate != null && requestedDate !== '' && !isYmd(String(requestedDate))) {
+    throw new Error(`希望納期が日付 (YYYY-MM-DD) ではありません: ${requestedDate}`);
+  }
+  const reqDate = requestedDate ? String(requestedDate) : null;
   const now = nowIso();
-  return db.transaction(() => {
+  const tx = db.transaction(() => {
+    const poNumber = nextPoNumber(db);
     const info = db.prepare(
-      "INSERT INTO po_orders (supplier_code, supplier_name, status, note, pml_as_of_date, created_at, updated_at, issued_at) VALUES (?,?,'issued',?,?,?,?,?)"
-    ).run(supplierCode, supplierName, note || null, pmlAsOf, now, now, now);
+      `INSERT INTO po_orders (supplier_code, supplier_name, status, note, pml_as_of_date, created_at, updated_at, issued_at,
+                              po_number, tracking_mode, requested_date)
+       VALUES (?,?,'issued',?,?,?,?,?,?,'tracked',?)`
+    ).run(supplierCode, supplierName, note || null, pmlAsOf, now, now, now, poNumber, reqDate);
     const id = Number(info.lastInsertRowid);
     insertItems(db, id, items);
+    // 希望納期はヘッダ入力値を明細へスナップショット (以後ヘッダ値を継承しない、issued後は不変)
+    if (reqDate) db.prepare('UPDATE po_order_items SET requested_date=? WHERE order_id=?').run(reqDate, id);
     db.prepare("DELETE FROM po_orders WHERE supplier_code=? AND status='draft'").run(supplierCode);
-    return id;
-  })();
+    return { id, poNumber };
+  });
+  return tx.immediate();
 }
 
 function getOrderWithItems(id) {
@@ -363,10 +378,10 @@ router.post('/api/supplier/:code/draft', (req, res) => {
 router.post('/api/supplier/:code/issue', (req, res) => {
   try {
     const code = normSupplierCode(req.params.code);
-    const { items, note } = req.body || {};
+    const { items, note, requestedDate } = req.body || {};
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ ok: false, error: '発注明細が空です' });
-    const id = issueOrder(code, resolveSupplierName(code), items, trimS(note));
-    res.json({ ok: true, id });
+    const { id, poNumber } = issueOrder(code, resolveSupplierName(code), items, trimS(note), requestedDate);
+    res.json({ ok: true, id, poNumber });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
@@ -391,6 +406,15 @@ router.get('/api/orders/:id', (req, res) => {
     const order = getOrderWithItems(Number(req.params.id));
     if (!order) return res.status(404).json({ ok: false, error: 'not found' });
     res.json({ ok: true, order });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// P13a: 台帳の整合性検査 (負残/closed不整合/発行取りこぼし/disposition規則)。P13bで管理画面に表示する
+router.get('/api/ledger/integrity', (req, res) => {
+  try {
+    const orderId = req.query.orderId ? Number(req.query.orderId) : null;
+    const issues = checkLedgerIntegrity({ orderId });
+    res.json({ ok: true, healthy: issues.length === 0, issues });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
