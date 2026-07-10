@@ -19,6 +19,7 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import Database from 'better-sqlite3';
 import { ensureRakutenDataTables, importDataFile, prepareDataFile } from './rakuten-data-lib.js';
+import { ensureRakutenDdTables } from './rakuten-dd-lib.js';
 import { expandFile } from './rakuten-ads-rpp-lib.js';
 
 const args = process.argv.slice(2);
@@ -60,6 +61,7 @@ const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
 db.pragma('busy_timeout = 5000');
 ensureRakutenDataTables(db);
+ensureRakutenDdTables(db);
 
 if (entries.length === 0) {
   console.log('取込対象なし (正常終了)');

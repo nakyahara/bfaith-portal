@@ -168,6 +168,97 @@ const ENTITIES = [
     }),
     sampleLog: (r) => `date=${r.date_jst} sales=¥${r.sales_all_yen} access=${r.access_all} cvr=${r.cvr_all_pct}%`,
   },
+  // ─── データダウンロードハブ 7種 (mall-csv-fetcher P1-R3、2026-07-10) ───
+  {
+    name: 'rakuten_store_device_daily',
+    contractVersion: 1,
+    clearMetaKey: 'clear_rakuten_store_device_dates',
+    scopeDates: (range) => enumerateScopeDates(range.from, range.to),
+    selectSql: `SELECT * FROM fact_rakuten_store_device_daily WHERE date_jst >= ? AND date_jst <= ? ORDER BY date_jst, device`,
+    selectParams: (range) => [range.from, range.to],
+    dropCols: ['source_file', 'import_id', 'updated_at'],
+    hashRow: (r) => ({ date_jst: r.date_jst, device: r.device, sales: r.sales_yen, access: r.access_users, uu: r.unique_users }),
+    sampleLog: (r) => `date=${r.date_jst} dev=${r.device} sales=¥${r.sales_yen} uu=${r.unique_users}`,
+  },
+  {
+    name: 'rakuten_sku_daily',
+    contractVersion: 1,
+    clearMetaKey: 'clear_rakuten_sku_daily_dates',
+    scopeDates: (range) => enumerateScopeDates(range.from, range.to),
+    // SKU名/連携キーは m_rakuten_skus の最新値を JOIN で付与
+    selectSql: `
+      SELECT
+        f.date_jst, f.sku_key, f.raw_sku_mgmt_number, f.item_manage_number,
+        f.sales_yen, f.orders, f.units, f.is_tax_included, f.imported_at,
+        m.system_sku_number, m.item_number, m.catalog_id, m.item_name,
+        m.sku_attr1, m.sku_attr2, m.sku_attr3
+      FROM fact_rakuten_sku_daily f
+      LEFT JOIN m_rakuten_skus m ON m.sku_key = f.sku_key
+      WHERE f.date_jst >= ? AND f.date_jst <= ?
+      ORDER BY f.date_jst, f.sku_key
+    `,
+    selectParams: (range) => [range.from, range.to],
+    hashRow: (r) => ({ date_jst: r.date_jst, sku: r.sku_key, sales: r.sales_yen, units: r.units }),
+    sampleLog: (r) => `date=${r.date_jst} sku=${r.sku_key} sales=¥${r.sales_yen}`,
+  },
+  {
+    name: 'rakuten_category_daily',
+    contractVersion: 1,
+    clearMetaKey: 'clear_rakuten_category_dates',
+    scopeDates: (range) => enumerateScopeDates(range.from, range.to),
+    selectSql: `SELECT * FROM fact_rakuten_category_daily WHERE date_jst >= ? AND date_jst <= ? ORDER BY date_jst, category_key, device`,
+    selectParams: (range) => [range.from, range.to],
+    dropCols: ['source_file', 'import_id', 'updated_at'],
+    hashRow: (r) => ({ date_jst: r.date_jst, key: r.category_key, device: r.device, access: r.access_users }),
+    sampleLog: (r) => `date=${r.date_jst} cat=${(r.category_name || '').slice(0, 20)} access=${r.access_users}`,
+  },
+  {
+    name: 'rakuten_campaigns',
+    contractVersion: 1,
+    clearMetaKey: 'clear_rakuten_campaign_dates',
+    scopeDates: (range) => enumerateScopeDates(range.from, range.to),
+    // date_jst = キャンペーン開始日。scope より前に始まった開催中キャンペーンは clear されない
+    // (一覧DLは常に「現在の開催一覧」なので、初回のみ --from を過去に広げて投入する)
+    selectSql: `SELECT campaign_type, campaign_name, start_at, end_at, date_jst, imported_at FROM m_rakuten_campaigns WHERE date_jst >= ? AND date_jst <= ? ORDER BY start_at, campaign_name`,
+    selectParams: (range) => [range.from, range.to],
+    hashRow: (r) => ({ type: r.campaign_type, name: r.campaign_name, start: r.start_at }),
+    sampleLog: (r) => `${r.campaign_type}: ${r.campaign_name.slice(0, 30)} (${r.start_at})`,
+  },
+  {
+    name: 'rakuten_purchaser_monthly',
+    contractVersion: 1,
+    clearMetaKey: 'clear_rakuten_purchaser_months',
+    // 月次 grain: clear キーは scope 内の月初日 (RPP monthly と同方針)。
+    // 過去2年が毎回全量入る → 初回のみ --from 2024-08-01 で全量 sync、以後 --days 70 で直近月を更新
+    scopeDates: (range) => enumerateScopeMonthStarts(range.from, range.to),
+    selectSql: `SELECT * FROM fact_rakuten_purchaser_monthly WHERE date_jst >= ? AND date_jst <= ? ORDER BY date_jst`,
+    selectParams: (range) => [`${range.from.slice(0, 7)}-01`, range.to],
+    dropCols: ['source_file', 'import_id', 'updated_at'],
+    hashRow: (r) => ({ date_jst: r.date_jst, nb: r.new_buyers, rb: r.repeat_buyers, ns: r.new_sales_yen }),
+    sampleLog: (r) => `month=${r.date_jst.slice(0, 7)} new=${r.new_buyers} repeat=${r.repeat_buyers}`,
+  },
+  {
+    name: 'rakuten_item_purchaser_snapshot',
+    contractVersion: 1,
+    clearMetaKey: 'clear_rakuten_item_purchaser_dates',
+    scopeDates: (range) => enumerateScopeDates(range.from, range.to),
+    selectSql: `SELECT * FROM fact_rakuten_item_purchaser_snapshot WHERE date_jst >= ? AND date_jst <= ? ORDER BY date_jst, item_manage_number`,
+    selectParams: (range) => [range.from, range.to],
+    dropCols: ['source_file', 'import_id', 'updated_at'],
+    hashRow: (r) => ({ date_jst: r.date_jst, item: r.item_manage_number, nb: r.new_buyers, rb: r.repeat_buyers }),
+    sampleLog: (r) => `snap=${r.date_jst} item=${r.item_manage_number} repeat=${r.repeat_buyers}`,
+  },
+  {
+    name: 'rakuten_genre_purchaser_snapshot',
+    contractVersion: 1,
+    clearMetaKey: 'clear_rakuten_genre_purchaser_dates',
+    scopeDates: (range) => enumerateScopeDates(range.from, range.to),
+    selectSql: `SELECT * FROM fact_rakuten_genre_purchaser_snapshot WHERE date_jst >= ? AND date_jst <= ? ORDER BY date_jst, genre_name`,
+    selectParams: (range) => [range.from, range.to],
+    dropCols: ['source_file', 'import_id', 'updated_at'],
+    hashRow: (r) => ({ date_jst: r.date_jst, genre: r.genre_name, nb: r.new_buyers, rb: r.repeat_buyers }),
+    sampleLog: (r) => `snap=${r.date_jst} genre=${(r.genre_name || '').slice(0, 25)}`,
+  },
 ];
 
 const targetEntities = entityFilter
@@ -207,6 +298,10 @@ async function syncEntity(entity) {
       return { entity: entity.name, ok: false, error: 'source_table_missing' };
     }
     rows = db.prepare(entity.selectSql).all(...entity.selectParams(dateRange));
+    // SELECT * の entity はローカル管理列を payload から落とす (mirror 側スキーマに無い列を送らない)
+    if (entity.dropCols) {
+      for (const r of rows) for (const c of entity.dropCols) delete r[c];
+    }
   } finally {
     db.close();
   }
