@@ -602,6 +602,7 @@ function createTables() {
     genre_path          TEXT,
     item_id             INTEGER,
     catalog_id          TEXT,
+    item_number         TEXT,
     is_tax_included     INTEGER NOT NULL DEFAULT 1,
     imported_at         TEXT,
     source_run_id       TEXT NOT NULL,

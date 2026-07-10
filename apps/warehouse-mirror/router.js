@@ -713,7 +713,7 @@ function getRakutenItemDailyInsert(db) {
         review_posts, review_avg, review_total,
         stay_seconds, bounce_count, exit_count, exit_rate_pct,
         favorites_added, favorites_total, stock_qty,
-        item_name, genre_path, item_id, catalog_id,
+        item_name, genre_path, item_id, catalog_id, item_number,
         is_tax_included, imported_at,
         source_run_id, source_row_hash, synced_at
       ) VALUES (
@@ -723,7 +723,7 @@ function getRakutenItemDailyInsert(db) {
         @review_posts, @review_avg, @review_total,
         @stay_seconds, @bounce_count, @exit_count, @exit_rate_pct,
         @favorites_added, @favorites_total, @stock_qty,
-        @item_name, @genre_path, @item_id, @catalog_id,
+        @item_name, @genre_path, @item_id, @catalog_id, @item_number,
         @is_tax_included, @imported_at,
         @source_run_id, @source_row_hash, @synced_at
       )
@@ -2203,6 +2203,7 @@ function normalizeRakutenItemDailyRow(r) {
     stock_qty: r.stock_qty ?? null,
     item_name: r.item_name ?? null, genre_path: r.genre_path ?? null,
     item_id: r.item_id ?? null, catalog_id: r.catalog_id ?? null,
+    item_number: r.item_number ?? null,
     is_tax_included: r.is_tax_included ?? 1,
     imported_at: r.imported_at ?? null,
     source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,

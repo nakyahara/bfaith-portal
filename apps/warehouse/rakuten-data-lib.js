@@ -71,6 +71,7 @@ export function ensureRakutenDataTables(db) {
     raw_sku_code        TEXT,
     item_id             INTEGER,
     catalog_id          TEXT,
+    item_number         TEXT,
     item_name           TEXT,
     genre_path          TEXT,
     updated_at          TEXT NOT NULL
@@ -193,7 +194,7 @@ function prepareItemDaily(name, rows, headerIdx) {
   const c = {
     genre: colIndex(header, 'ジャンル'), catalog: colIndex(header, 'カタログID'),
     itemId: colIndex(header, '商品ID'), name: colIndex(header, '商品名'),
-    manage: colIndex(header, '商品管理番号'),
+    manage: colIndex(header, '商品管理番号'), itemNumber: colIndex(header, '商品番号'),
     sales: colIndex(header, '売上'), orders: colIndex(header, '売上件数'), units: colIndex(header, '売上個数'),
     access: colIndex(header, 'アクセス人数'), uu: colIndex(header, 'ユニークユーザー数'),
     cvr: colIndex(header, '転換率'), aov: colIndex(header, '客単価'),
@@ -210,7 +211,11 @@ function prepareItemDaily(name, rows, headerIdx) {
   const dims = [];
   for (let i = headerIdx + 1; i < rows.length; i++) {
     const r = rows[i];
-    if (r.length < header.length - 2) continue; // 端数行 (フッタ等)
+    // 全セル空行はスキップ、非空の短い行は列ズレ/破損CSVの兆候 → ファイル単位でエラー (Codex R1 low)
+    if (r.every(v => trimS(v) === '')) continue;
+    if (r.length < header.length - 2) {
+      return { name, ok: false, type: 'rakuten_item_daily', error: `列数不足の行 (row ${i + 1}: ${r.length}列/${header.length}列)。CSVが破損している可能性` };
+    }
     const rawManage = trimS(r[c.manage]);
     if (!rawManage) continue;
     const sku = normSku(rawManage);
@@ -231,6 +236,7 @@ function prepareItemDaily(name, rows, headerIdx) {
     dims.push({
       item_manage_number: sku, raw_sku_code: rawManage,
       item_id: intOrNull(r[c.itemId]), catalog_id: trimS(r[c.catalog]) || null,
+      item_number: trimS(r[c.itemNumber]) || null,
       item_name: trimS(r[c.name]).slice(0, 300) || null, genre_path: trimS(r[c.genre]).slice(0, 300) || null,
     });
   }
@@ -282,19 +288,28 @@ function prepareStoreDaily(name, rows, headerIdx) {
   const at = (r, i) => (i >= 0 ? r[i] : null);
 
   const records = [];
+  let unaggregatedSkipped = 0;
   for (let i = headerIdx + 1; i < rows.length; i++) {
     const r = rows[i];
+    if (r.every(v => trimS(v) === '')) continue;
     const rawDate = trimS(r[c.date]);
     const date = normalizeDate(rawDate);
     if (!date) {
       if (/実績|合計/.test(rawDate)) continue; // 「通算実績」等の集計行はスキップ
       return { name, ok: false, type: 'rakuten_store_daily', error: `日付を解釈できない行: 「${rawDate}」` };
     }
-    // 未来日 (未集計) 行: 自店指標=0 かつ ベンチマーク空 → スキップ (0で埋めると実績と区別がつかない)
+    // 非空の短い行は列ズレ/破損CSVの兆候 → ファイル単位でエラー (Codex R1 low)
+    if (r.length < header.length - 2) {
+      return { name, ok: false, type: 'rakuten_store_daily', error: `列数不足の行 (${date}: ${r.length}列/${header.length}列)。CSVが破損している可能性` };
+    }
+    // 未集計行 (未来日、早朝DL時の当日等): 自店指標=0 かつ ベンチマーク空 → スキップ。
+    // 0で埋めると実績と区別がつかない。稼働店舗で真のゼロ日は access=0 になり得ず、
+    // 仮に休店でもベンチ (商圏平均) は埋まるため、この複合条件が偽陽性になることは実質ない。
+    // 早朝境界で前日行が未集計でも、翌日の再DL+scope clear 同期で自己修復する (RPP #467 と同じ構え)
     const salesAll = yenOrNull(r[c.sales.all]);
     const accessAll = intOrNull(r[c.access.all]);
     const btSalesRaw = trimS(at(r, c.bt.sales) ?? '');
-    if ((salesAll ?? 0) === 0 && (accessAll ?? 0) === 0 && btSalesRaw === '') continue;
+    if ((salesAll ?? 0) === 0 && (accessAll ?? 0) === 0 && btSalesRaw === '') { unaggregatedSkipped++; continue; }
 
     records.push({
       date_jst: date,
@@ -325,7 +340,10 @@ function prepareStoreDaily(name, rows, headerIdx) {
     return { name, ok: false, type: 'rakuten_store_daily', error: `ファイル内で日付が重複: ${[...new Set(dups)].join(', ')}` };
   }
   const dates = records.map(r => r.date_jst).sort();
-  return { name, ok: true, type: 'rakuten_store_daily', label: '店舗日次 (分析用レポート)', records, dateFrom: dates[0], dateTo: dates[dates.length - 1] };
+  const label = unaggregatedSkipped > 0
+    ? `店舗日次 (分析用レポート、未集計${unaggregatedSkipped}日スキップ)`
+    : '店舗日次 (分析用レポート)';
+  return { name, ok: true, type: 'rakuten_store_daily', label, records, dateFrom: dates[0], dateTo: dates[dates.length - 1] };
 }
 
 // ─── ファイル種別判別 + パース ───
@@ -369,11 +387,12 @@ function commitOne(db, logStmt, p, ctx) {
         source_file=excluded.source_file, import_id=excluded.import_id,
         imported_at=excluded.imported_at, updated_at=excluded.updated_at`);
     const dimUpsert = db.prepare(`INSERT INTO m_rakuten_items
-      (item_manage_number, raw_sku_code, item_id, catalog_id, item_name, genre_path, updated_at)
-      VALUES (@item_manage_number, @raw_sku_code, @item_id, @catalog_id, @item_name, @genre_path, @updated_at)
+      (item_manage_number, raw_sku_code, item_id, catalog_id, item_number, item_name, genre_path, updated_at)
+      VALUES (@item_manage_number, @raw_sku_code, @item_id, @catalog_id, @item_number, @item_name, @genre_path, @updated_at)
       ON CONFLICT (item_manage_number) DO UPDATE SET
         raw_sku_code=excluded.raw_sku_code, item_id=excluded.item_id, catalog_id=excluded.catalog_id,
-        item_name=excluded.item_name, genre_path=excluded.genre_path, updated_at=excluded.updated_at`);
+        item_number=excluded.item_number, item_name=excluded.item_name, genre_path=excluded.genre_path,
+        updated_at=excluded.updated_at`);
     for (const r of p.records) {
       const exists = existsStmt.get(r.date_jst, r.item_manage_number);
       upsert.run({ ...r, ...meta });

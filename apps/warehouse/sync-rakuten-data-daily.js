@@ -48,7 +48,10 @@ function isRealDate(s) {
 let dateRange;
 if (monthStr) {
   if (!/^\d{4}-\d{2}$/.test(monthStr)) { console.error('FATAL: --month must be YYYY-MM'); process.exit(2); }
-  dateRange = { from: `${monthStr}-01`, to: `${monthStr}-31` };
+  // 月末は実在日で計算 (固定 -31 だと 2月等で不正日付が ledger/payload に流れる — Codex R1 medium)
+  const [y, m] = monthStr.split('-').map(Number);
+  const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  dateRange = { from: `${monthStr}-01`, to: `${monthStr}-${String(lastDay).padStart(2, '0')}` };
 } else if (fromStr && toStr) {
   if (!isRealDate(fromStr) || !isRealDate(toStr)) {
     console.error('FATAL: --from/--to must be real YYYY-MM-DD date'); process.exit(2);
@@ -124,7 +127,7 @@ const ENTITIES = [
         f.stay_seconds, f.bounce_count, f.exit_count, f.exit_rate_pct,
         f.favorites_added, f.favorites_total, f.stock_qty,
         f.is_tax_included, f.imported_at,
-        m.item_name, m.genre_path, m.item_id, m.catalog_id
+        m.item_name, m.genre_path, m.item_id, m.catalog_id, m.item_number
       FROM fact_rakuten_item_daily f
       LEFT JOIN m_rakuten_items m ON m.item_manage_number = f.item_manage_number
       WHERE f.date_jst >= ? AND f.date_jst <= ?
@@ -195,12 +198,13 @@ async function syncEntity(entity) {
     console.log(`  scope: ${dateRange.from} 〜 ${dateRange.to}`);
     console.log(`  dry-run: ${isDryRun}`);
 
-    // fact 未作成 (取込が一度も走っていない) 場合は 0 行扱いにせず明示スキップ
+    // fact 未作成は失敗扱い (daily-sync では import が先に走り必ず作成するため、欠落=異常。
+    // ok 扱いにすると mirror 側の stale データが scope clear されず残る — Codex R1 medium)
     const tableName = contract.source_object;
     const exists = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`).get(tableName);
     if (!exists) {
-      console.log(`  ⏭️ source table ${tableName} が未作成 (取込前) のためスキップ`);
-      return { entity: entity.name, ok: true, skipped: true, rows: 0 };
+      console.error(`  ✗ source table ${tableName} が未作成。先に import-rakuten-data.js を実行してください`);
+      return { entity: entity.name, ok: false, error: 'source_table_missing' };
     }
     rows = db.prepare(entity.selectSql).all(...entity.selectParams(dateRange));
   } finally {
