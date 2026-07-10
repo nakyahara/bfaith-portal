@@ -45,19 +45,19 @@ function isRealDate(s) {
   return !isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
 }
 
-let dateRange;
+let globalDateRange;
 if (monthStr) {
   if (!/^\d{4}-\d{2}$/.test(monthStr)) { console.error('FATAL: --month must be YYYY-MM'); process.exit(2); }
   // 月末は実在日で計算 (固定 -31 だと 2月等で不正日付が ledger/payload に流れる — Codex R1 medium)
   const [y, m] = monthStr.split('-').map(Number);
   const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
-  dateRange = { from: `${monthStr}-01`, to: `${monthStr}-${String(lastDay).padStart(2, '0')}` };
+  globalDateRange = { from: `${monthStr}-01`, to: `${monthStr}-${String(lastDay).padStart(2, '0')}` };
 } else if (fromStr && toStr) {
   if (!isRealDate(fromStr) || !isRealDate(toStr)) {
     console.error('FATAL: --from/--to must be real YYYY-MM-DD date'); process.exit(2);
   }
   if (fromStr > toStr) { console.error('FATAL: --from must be <= --to'); process.exit(2); }
-  dateRange = { from: fromStr, to: toStr };
+  globalDateRange = { from: fromStr, to: toStr };
 } else if (daysStr) {
   const days = parseInt(daysStr, 10);
   if (!Number.isInteger(days) || days <= 0 || days > 400) {
@@ -69,7 +69,7 @@ if (monthStr) {
   const yesterdayJst = new Date(nowJst.getTime() - 86400000);
   const toDate = yesterdayJst.toISOString().slice(0, 10);
   const fromDate = new Date(yesterdayJst.getTime() - (days - 1) * 86400000).toISOString().slice(0, 10);
-  dateRange = { from: fromDate, to: toDate };
+  globalDateRange = { from: fromDate, to: toDate };
 } else {
   console.error('FATAL: --days N or --month YYYY-MM or --from/--to YYYY-MM-DD required'); process.exit(2);
 }
@@ -241,6 +241,9 @@ const ENTITIES = [
     name: 'rakuten_item_purchaser_snapshot',
     contractVersion: 1,
     clearMetaKey: 'clear_rakuten_item_purchaser_dates',
+    // date_jst=取込日 (当日) のため scope 終端を当日まで広げる (通常終端=昨日だと mirror 反映が
+    // 1日遅れる — Codex R4 Medium)。取込が sync より先に走るので当日 clear しても欠落しない
+    extendToToday: true,
     scopeDates: (range) => enumerateScopeDates(range.from, range.to),
     selectSql: `SELECT * FROM fact_rakuten_item_purchaser_snapshot WHERE date_jst >= ? AND date_jst <= ? ORDER BY date_jst, item_manage_number`,
     selectParams: (range) => [range.from, range.to],
@@ -252,6 +255,7 @@ const ENTITIES = [
     name: 'rakuten_genre_purchaser_snapshot',
     contractVersion: 1,
     clearMetaKey: 'clear_rakuten_genre_purchaser_dates',
+    extendToToday: true, // 同上 (date_jst=取込日)
     scopeDates: (range) => enumerateScopeDates(range.from, range.to),
     selectSql: `SELECT * FROM fact_rakuten_genre_purchaser_snapshot WHERE date_jst >= ? AND date_jst <= ? ORDER BY date_jst, genre_name`,
     selectParams: (range) => [range.from, range.to],
@@ -270,6 +274,12 @@ if (targetEntities.length === 0) {
 }
 
 async function syncEntity(entity) {
+  // スナップショット系 (date_jst=取込日) は scope 終端を当日JSTまで広げる
+  let dateRange = globalDateRange;
+  if (entity.extendToToday) {
+    const todayJst = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+    if (todayJst > dateRange.to) dateRange = { ...dateRange, to: todayJst };
+  }
   const db = new Database(dbPath, { readonly: true });
   let rows;
   try {

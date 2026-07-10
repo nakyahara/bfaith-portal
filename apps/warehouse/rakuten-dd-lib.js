@@ -565,10 +565,18 @@ export const DD_TYPES = new Set(Object.keys(DD_UPSERT_SPECS));
 
 // キャンペーン・スナップショット系に is_tax_included は無い (金額の性質が snapshot/参照)。
 // fact_rakuten_store_device_daily 等は DDL 側 DEFAULT 1 に任せる (INSERT 列に含めない)
+// 通算スナップショット型は「CSV全体がその日の正本」→ 同日再取込は集合置換
+// (UPSERTだけだと上位100件から脱落した行が残る — Codex R4 Medium)
+const DD_SET_REPLACE_TYPES = new Set(['rakuten_item_purchaser_snapshot', 'rakuten_genre_purchaser_snapshot']);
+
 export function commitDdOne(db, p, meta) {
   const spec = DD_UPSERT_SPECS[p.type];
   if (!spec) throw new Error(`unknown dd type: ${p.type}`);
   let inserted = 0, updated = 0;
+  if (DD_SET_REPLACE_TYPES.has(p.type)) {
+    const dates = [...new Set(p.records.map(r => r.date_jst))];
+    for (const d of dates) db.prepare(`DELETE FROM ${spec.table} WHERE date_jst = ?`).run(d);
+  }
   const existsStmt = db.prepare(`SELECT 1 FROM ${spec.table} WHERE ${spec.pk.map(k => `${k}=@${k}`).join(' AND ')}`);
   const upsert = db.prepare(`INSERT INTO ${spec.table}
     (${spec.cols.join(', ')}, source_file, import_id, imported_at, updated_at)

@@ -316,6 +316,15 @@ console.log('=== 12. 新規リピート月次 + キャンペーン + ジャン�
   check('ジャンル別snapshot 取込ok', r3.status === 'ok', JSON.stringify(r3.results));
   const gp = db.prepare(`SELECT * FROM fact_rakuten_genre_purchaser_snapshot`).get();
   check('snapshot=取込日+window保持', gp?.window_from === '2025-07' && gp?.avg_purchase_count === 1.16, JSON.stringify(gp));
+
+  // 同日再取込は集合置換 (構成が変わったら脱落行が消える — Codex R4 Medium)
+  const gpCsv2 = sjis(['"※"', '"データ対象期間,2025/07 ～ 2026/06"',
+    '"ジャンル名","新規購入者数","リピート購入者数","リピート購入率","新規購入者の平均購入金額","リピート購入者の平均購入金額","平均購入回数","1回あたりの平均購入金額"',
+    '"日用品 > 補修材"," 30","1","3.2","2000","1500","1.2","1900"'].join('\r\n'));
+  const r4 = importDataFile(db, { name: 'gp2.csv', buffer: gpCsv2, sha256: sha(gpCsv2), source: 'test' });
+  check('同日再取込ok', r4.status === 'ok');
+  const gpAll = db.prepare(`SELECT genre_name FROM fact_rakuten_genre_purchaser_snapshot`).all();
+  check('集合置換 (旧ジャンル行が消える)', gpAll.length === 1 && gpAll[0].genre_name === '日用品 > 補修材', JSON.stringify(gpAll));
 }
 
 db.close();
