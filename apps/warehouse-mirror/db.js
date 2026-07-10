@@ -570,6 +570,102 @@ function createTables() {
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_mrard_month ON mirror_rakuten_ads_rpp_daily(substr(date_jst, 1, 7))');
 
+  // mirror_rakuten_item_daily — RMSデータ分析「商品分析」SKU×日次 (mall-csv-fetcher P1-R2、2026-07-10)
+  // アクセス/UU/CVR/新規・リピート/レビュー/滞在・直帰/お気に入り/在庫snapshot。
+  // item_name/genre_path は miniPC m_rakuten_items の最新値を sync 時に JOIN で同梱 (表示用)
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_rakuten_item_daily (
+    date_jst            TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+    item_manage_number  TEXT NOT NULL CHECK(trim(item_manage_number) <> ''),
+    raw_sku_code        TEXT NOT NULL DEFAULT '',
+    sales_yen           INTEGER NOT NULL DEFAULT 0,
+    orders              INTEGER NOT NULL DEFAULT 0,
+    units               INTEGER NOT NULL DEFAULT 0,
+    access_users        INTEGER NOT NULL DEFAULT 0,
+    unique_users        INTEGER,
+    cvr_pct             REAL,
+    aov_yen             INTEGER,
+    buyers_total        INTEGER,
+    buyers_new          INTEGER,
+    buyers_repeat       INTEGER,
+    nonbuyer_access     INTEGER,
+    review_posts        INTEGER,
+    review_avg          REAL,
+    review_total        INTEGER,
+    stay_seconds        INTEGER,
+    bounce_count        INTEGER,
+    exit_count          INTEGER,
+    exit_rate_pct       REAL,
+    favorites_added     INTEGER,
+    favorites_total     INTEGER,
+    stock_qty           INTEGER,
+    item_name           TEXT,
+    genre_path          TEXT,
+    item_id             INTEGER,
+    catalog_id          TEXT,
+    item_number         TEXT,
+    is_tax_included     INTEGER NOT NULL DEFAULT 1,
+    imported_at         TEXT,
+    source_run_id       TEXT NOT NULL,
+    source_row_hash     TEXT NOT NULL,
+    synced_at           TEXT NOT NULL,
+    PRIMARY KEY (date_jst, item_manage_number)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mrid_item ON mirror_rakuten_item_daily(item_manage_number, date_jst)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mrid_month ON mirror_rakuten_item_daily(substr(date_jst, 1, 7))');
+  // item_number は後付け列 (Codex R2 high: 旧スキーマで作成済みの環境向け冪等 migration)
+  addColumnIfMissing('mirror_rakuten_item_daily', 'item_number', 'TEXT');
+
+  // mirror_rakuten_store_daily — RMSデータ分析「日次_分析用レポート」店舗×日次 (mall-csv-fetcher P1-R2)
+  // 端末別KPI + 商圏ベンチマーク (サブジャンルTOP10平均/月商クラス平均) + 費用内訳
+  // (クーポン店舗/楽天負担・送料・決済手数料・のしラッピング)。金額=税込円INTEGER / 率・平均=REAL
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_rakuten_store_daily (
+    date_jst              TEXT PRIMARY KEY CHECK(date_jst GLOB '????-??-??'),
+    sales_all_yen         INTEGER NOT NULL DEFAULT 0,
+    sales_pc_yen          INTEGER,
+    sales_app_yen         INTEGER,
+    sales_sp_yen          INTEGER,
+    orders_all            INTEGER NOT NULL DEFAULT 0,
+    orders_pc             INTEGER,
+    orders_app            INTEGER,
+    orders_sp             INTEGER,
+    access_all            INTEGER NOT NULL DEFAULT 0,
+    access_pc             INTEGER,
+    access_app            INTEGER,
+    access_sp             INTEGER,
+    cvr_all_pct           REAL,
+    cvr_pc_pct            REAL,
+    cvr_app_pct           REAL,
+    cvr_sp_pct            REAL,
+    aov_all_yen           INTEGER,
+    aov_pc_yen            INTEGER,
+    aov_app_yen           INTEGER,
+    aov_sp_yen            INTEGER,
+    bench_top10_sales_yen REAL,
+    bench_top10_orders    REAL,
+    bench_top10_access    REAL,
+    bench_top10_cvr_pct   REAL,
+    bench_top10_aov_yen   REAL,
+    bench_class_label     TEXT,
+    bench_class_sales_yen REAL,
+    bench_class_orders    REAL,
+    bench_class_access    REAL,
+    bench_class_cvr_pct   REAL,
+    bench_class_aov_yen   REAL,
+    tax_out_yen           INTEGER,
+    shipping_yen          INTEGER,
+    coupon_store_yen      INTEGER,
+    coupon_rakuten_yen    INTEGER,
+    free_ship_coupon_yen  INTEGER,
+    wrapping_yen          INTEGER,
+    settlement_fee_yen    INTEGER,
+    is_tax_included       INTEGER NOT NULL DEFAULT 1,
+    imported_at           TEXT,
+    source_run_id         TEXT NOT NULL,
+    source_row_hash       TEXT NOT NULL,
+    synced_at             TEXT NOT NULL
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mrsd_month ON mirror_rakuten_store_daily(substr(date_jst, 1, 7))');
+
   // mirror_rakuten_finance_sku_daily — 楽天 Phase 1a #R-3b (Render 側 daily fact mirror)
   // miniPC の f_rakuten_finance_sku_daily_v1 の payload を受信。
   // contract_version は sync_contracts.contract_version と整合。

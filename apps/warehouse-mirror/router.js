@@ -701,6 +701,74 @@ function getRakutenAdsRppDailyInsert(db) {
   return b.rakutenAdsRppDailyInsert;
 }
 
+// 楽天データ分析 SKU×日次 (mall-csv-fetcher P1-R2)
+function getRakutenItemDailyInsert(db) {
+  const b = getStmtBundle(db);
+  if (!b.rakutenItemDailyInsert) {
+    b.rakutenItemDailyInsert = db.prepare(`
+      INSERT OR REPLACE INTO mirror_rakuten_item_daily (
+        date_jst, item_manage_number, raw_sku_code,
+        sales_yen, orders, units, access_users, unique_users, cvr_pct, aov_yen,
+        buyers_total, buyers_new, buyers_repeat, nonbuyer_access,
+        review_posts, review_avg, review_total,
+        stay_seconds, bounce_count, exit_count, exit_rate_pct,
+        favorites_added, favorites_total, stock_qty,
+        item_name, genre_path, item_id, catalog_id, item_number,
+        is_tax_included, imported_at,
+        source_run_id, source_row_hash, synced_at
+      ) VALUES (
+        @date_jst, @item_manage_number, @raw_sku_code,
+        @sales_yen, @orders, @units, @access_users, @unique_users, @cvr_pct, @aov_yen,
+        @buyers_total, @buyers_new, @buyers_repeat, @nonbuyer_access,
+        @review_posts, @review_avg, @review_total,
+        @stay_seconds, @bounce_count, @exit_count, @exit_rate_pct,
+        @favorites_added, @favorites_total, @stock_qty,
+        @item_name, @genre_path, @item_id, @catalog_id, @item_number,
+        @is_tax_included, @imported_at,
+        @source_run_id, @source_row_hash, @synced_at
+      )
+    `);
+  }
+  return b.rakutenItemDailyInsert;
+}
+
+// 楽天データ分析 店舗×日次 (mall-csv-fetcher P1-R2)
+function getRakutenStoreDailyInsert(db) {
+  const b = getStmtBundle(db);
+  if (!b.rakutenStoreDailyInsert) {
+    b.rakutenStoreDailyInsert = db.prepare(`
+      INSERT OR REPLACE INTO mirror_rakuten_store_daily (
+        date_jst,
+        sales_all_yen, sales_pc_yen, sales_app_yen, sales_sp_yen,
+        orders_all, orders_pc, orders_app, orders_sp,
+        access_all, access_pc, access_app, access_sp,
+        cvr_all_pct, cvr_pc_pct, cvr_app_pct, cvr_sp_pct,
+        aov_all_yen, aov_pc_yen, aov_app_yen, aov_sp_yen,
+        bench_top10_sales_yen, bench_top10_orders, bench_top10_access, bench_top10_cvr_pct, bench_top10_aov_yen,
+        bench_class_label, bench_class_sales_yen, bench_class_orders, bench_class_access, bench_class_cvr_pct, bench_class_aov_yen,
+        tax_out_yen, shipping_yen, coupon_store_yen, coupon_rakuten_yen,
+        free_ship_coupon_yen, wrapping_yen, settlement_fee_yen,
+        is_tax_included, imported_at,
+        source_run_id, source_row_hash, synced_at
+      ) VALUES (
+        @date_jst,
+        @sales_all_yen, @sales_pc_yen, @sales_app_yen, @sales_sp_yen,
+        @orders_all, @orders_pc, @orders_app, @orders_sp,
+        @access_all, @access_pc, @access_app, @access_sp,
+        @cvr_all_pct, @cvr_pc_pct, @cvr_app_pct, @cvr_sp_pct,
+        @aov_all_yen, @aov_pc_yen, @aov_app_yen, @aov_sp_yen,
+        @bench_top10_sales_yen, @bench_top10_orders, @bench_top10_access, @bench_top10_cvr_pct, @bench_top10_aov_yen,
+        @bench_class_label, @bench_class_sales_yen, @bench_class_orders, @bench_class_access, @bench_class_cvr_pct, @bench_class_aov_yen,
+        @tax_out_yen, @shipping_yen, @coupon_store_yen, @coupon_rakuten_yen,
+        @free_ship_coupon_yen, @wrapping_yen, @settlement_fee_yen,
+        @is_tax_included, @imported_at,
+        @source_run_id, @source_row_hash, @synced_at
+      )
+    `);
+  }
+  return b.rakutenStoreDailyInsert;
+}
+
 // アカウント単位フィー月次 (amazon-dashboard PR-C)
 function getAmazonAccountFeesInsert(db) {
   const b = getStmtBundle(db);
@@ -1207,6 +1275,23 @@ const ENTITY_REGISTRY = {
     clear_meta_key: 'clear_rakuten_ads_rpp_daily_dates',
     getInsertStmt: getRakutenAdsRppDailyInsert,
     normalizeRow: (r) => normalizeRakutenAdsRppDailyRow(r),
+  },
+  // 楽天RMSデータ分析 2 entity (mall-csv-fetcher P1-R2、2026-07-10)
+  rakuten_item_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_rakuten_item_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_rakuten_item_daily_dates',
+    getInsertStmt: getRakutenItemDailyInsert,
+    normalizeRow: (r) => normalizeRakutenItemDailyRow(r),
+  },
+  rakuten_store_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_rakuten_store_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_rakuten_store_daily_dates',
+    getInsertStmt: getRakutenStoreDailyInsert,
+    normalizeRow: (r) => normalizeRakutenStoreDailyRow(r),
   },
   rakuten_finance_sku_daily: {
     contract_version: 1,
@@ -2088,6 +2173,74 @@ function normalizeRakutenAdsRppDailyRow(r) {
     sales_720h_new_yen: r.sales_720h_new_yen ?? null, sales_720h_repeat_yen: r.sales_720h_repeat_yen ?? null,
     source_report_type: r.source_report_type || 'rpp_all_daily',
     attribution_window_hours: r.attribution_window_hours ?? 720,
+    is_tax_included: r.is_tax_included ?? 1,
+    imported_at: r.imported_at ?? null,
+    source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,
+    synced_at: r.synced_at,
+  };
+}
+
+// row 列正規化 (mirror_rakuten_item_daily 用、mall-csv-fetcher P1-R2)
+function normalizeRakutenItemDailyRow(r) {
+  const dateJst = requireAdKey(r, 'date_jst');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateJst)) {
+    throw new HttpError(400, { error: 'bad_row', message: `bad date_jst: ${dateJst}` });
+  }
+  return {
+    date_jst: dateJst,
+    // 送信元の正規化漏れによる PK 重複防止 (feedback_sku_case_normalization)
+    item_manage_number: requireAdKey(r, 'item_manage_number').toLowerCase(),
+    raw_sku_code: r.raw_sku_code || '',
+    sales_yen: r.sales_yen ?? 0, orders: r.orders ?? 0, units: r.units ?? 0,
+    access_users: r.access_users ?? 0, unique_users: r.unique_users ?? null,
+    cvr_pct: r.cvr_pct ?? null, aov_yen: r.aov_yen ?? null,
+    buyers_total: r.buyers_total ?? null, buyers_new: r.buyers_new ?? null,
+    buyers_repeat: r.buyers_repeat ?? null, nonbuyer_access: r.nonbuyer_access ?? null,
+    review_posts: r.review_posts ?? null, review_avg: r.review_avg ?? null, review_total: r.review_total ?? null,
+    stay_seconds: r.stay_seconds ?? null, bounce_count: r.bounce_count ?? null,
+    exit_count: r.exit_count ?? null, exit_rate_pct: r.exit_rate_pct ?? null,
+    favorites_added: r.favorites_added ?? null, favorites_total: r.favorites_total ?? null,
+    stock_qty: r.stock_qty ?? null,
+    item_name: r.item_name ?? null, genre_path: r.genre_path ?? null,
+    item_id: r.item_id ?? null, catalog_id: r.catalog_id ?? null,
+    item_number: r.item_number ?? null,
+    is_tax_included: r.is_tax_included ?? 1,
+    imported_at: r.imported_at ?? null,
+    source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,
+    synced_at: r.synced_at,
+  };
+}
+
+// row 列正規化 (mirror_rakuten_store_daily 用、mall-csv-fetcher P1-R2)
+// ベンチマーク列 (bench_*) は RMS 側が非公開日は空 → null が正
+function normalizeRakutenStoreDailyRow(r) {
+  const dateJst = requireAdKey(r, 'date_jst');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateJst)) {
+    throw new HttpError(400, { error: 'bad_row', message: `bad date_jst: ${dateJst}` });
+  }
+  return {
+    date_jst: dateJst,
+    sales_all_yen: r.sales_all_yen ?? 0, sales_pc_yen: r.sales_pc_yen ?? null,
+    sales_app_yen: r.sales_app_yen ?? null, sales_sp_yen: r.sales_sp_yen ?? null,
+    orders_all: r.orders_all ?? 0, orders_pc: r.orders_pc ?? null,
+    orders_app: r.orders_app ?? null, orders_sp: r.orders_sp ?? null,
+    access_all: r.access_all ?? 0, access_pc: r.access_pc ?? null,
+    access_app: r.access_app ?? null, access_sp: r.access_sp ?? null,
+    cvr_all_pct: r.cvr_all_pct ?? null, cvr_pc_pct: r.cvr_pc_pct ?? null,
+    cvr_app_pct: r.cvr_app_pct ?? null, cvr_sp_pct: r.cvr_sp_pct ?? null,
+    aov_all_yen: r.aov_all_yen ?? null, aov_pc_yen: r.aov_pc_yen ?? null,
+    aov_app_yen: r.aov_app_yen ?? null, aov_sp_yen: r.aov_sp_yen ?? null,
+    bench_top10_sales_yen: r.bench_top10_sales_yen ?? null, bench_top10_orders: r.bench_top10_orders ?? null,
+    bench_top10_access: r.bench_top10_access ?? null, bench_top10_cvr_pct: r.bench_top10_cvr_pct ?? null,
+    bench_top10_aov_yen: r.bench_top10_aov_yen ?? null,
+    bench_class_label: r.bench_class_label ?? null,
+    bench_class_sales_yen: r.bench_class_sales_yen ?? null, bench_class_orders: r.bench_class_orders ?? null,
+    bench_class_access: r.bench_class_access ?? null, bench_class_cvr_pct: r.bench_class_cvr_pct ?? null,
+    bench_class_aov_yen: r.bench_class_aov_yen ?? null,
+    tax_out_yen: r.tax_out_yen ?? null, shipping_yen: r.shipping_yen ?? null,
+    coupon_store_yen: r.coupon_store_yen ?? null, coupon_rakuten_yen: r.coupon_rakuten_yen ?? null,
+    free_ship_coupon_yen: r.free_ship_coupon_yen ?? null, wrapping_yen: r.wrapping_yen ?? null,
+    settlement_fee_yen: r.settlement_fee_yen ?? null,
     is_tax_included: r.is_tax_included ?? 1,
     imported_at: r.imported_at ?? null,
     source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,

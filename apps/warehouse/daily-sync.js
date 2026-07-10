@@ -574,6 +574,24 @@ async function main() {
       console.log('[DailySync] 楽天RPP広告 sync は取込失敗のためスキップ (failed/ を確認、修正後に再投入)');
     }
 
+    // === 楽天RMSデータ分析 (商品分析SKU日次/店舗日次) 取込 + mirror sync (mall-csv-fetcher P1-R2) ===
+    // 手動DL (将来は自動DL) が incoming/rakuten-data/ に置いた CSV/zip を取り込む。
+    // 対象0件は正常 (exit 0)。取込成功時のみ sync (--days 70、RPP と同 scope)
+    const rakutenDataImportResult = runScript(
+      `apps/warehouse/import-rakuten-data.js --data-dir ${DATA_DIR_ARG}`,
+      '楽天データ分析 取込', 600000
+    );
+    results.push({ name: '楽天データ分析 取込', ...rakutenDataImportResult });
+    if (rakutenDataImportResult.success) {
+      const rakutenDataSyncResult = runScript(
+        `apps/warehouse/sync-rakuten-data-daily.js --data-dir ${DATA_DIR_ARG} --days 70`,
+        '楽天データ分析 sync', 600000
+      );
+      results.push({ name: '楽天データ分析 sync', ...rakutenDataSyncResult });
+    } else {
+      console.log('[DailySync] 楽天データ分析 sync は取込失敗のためスキップ (failed/ を確認、修正後に再投入)');
+    }
+
     // === Yahoo finance daily fact (Yahoo Phase 1 Y-3c、Y-1 + Y-2 + Y-3a 統合) ===
     // 1. f_yahoo_finance_sku_daily_v1 build (whitelist order=5/pay=1/ship=3、partial margin)
     // 2. DQ gate (6 check、severity error で exit 1)
