@@ -103,6 +103,37 @@ apps/warehouse/sync-rakuten-ads-daily.js (daily-sync 内、取込成功時のみ
   node apps/warehouse/sync-rakuten-ads-daily.js --data-dir <DATA_DIR> --days 70 [--dry-run]
   ```
 
+## P1-R2: 楽天RMSデータ分析 (商品分析SKU日次+店舗日次) 自動DL (2026-07-10 実装)
+
+RPPと同じB案構成。取得は `rakuten-data-download.mjs` (fetch-all に組込済み)、取込は
+`apps/warehouse/import-rakuten-data.js` → `sync-rakuten-data-daily.js` (daily-sync 配線済み)。
+
+```
+rakuten-data-download.mjs
+  → 商品分析 (SKU×日次): datatool.rms.rakuten.co.jp/access/item → 全商品CSV → 全件DL
+     対象日 = 昨日+一昨日 (RDATA_ITEM_DAYS)。1日単位制約のため日ごとにループ
+  → 店舗日次 (分析用レポート): datatool.rms.rakuten.co.jp/datatool/data/ → CSVダウンロード
+     対象月 = 今月 (月初3日は先月も)。ベンチマーク遡及埋めのため毎晩月全体を再DL→UPSERT
+  → <WAREHOUSE_DATA_DIR>/incoming/rakuten-data/ へ投入 + report_fetch_log (rdata_*)
+```
+
+- **手動フォールバック**: RMSから手でDLしたCSVを `incoming/rakuten-data/` に置くだけ。
+- ⭐実測ポイント (2026-07-10): 期間入力は daterangepicker で fill 不可 → **JSネイティブsetter+
+  input/changeイベント**で書き換え+「対象期間:」表示の追従を検証 / 全商品CSVモーダルは
+  デフォルト「件数を指定(1,000)」→ **「全件」明示選択必須** (radio読み戻し+1,000行ちょうど検知の
+  二重ガード) / 「データ更新日」より新しい日は未集計→スキップ (翌朝再取得で自己修復) /
+  どちらも同期DL (履歴ページなし) / DL後に取込レシピ (prepareDataFile) でパース検証してから
+  incoming に置く (画面仕様変更を即検知)。
+- 店舗日次のレポート選択は前回選択を引き継ぐ (実測: "ec vision 目標管理用" = 70列構成)。
+  列構成が変わっても prepareDataFile 検証で検知。明示指定は `RDATA_STORE_REPORT=<レポート名>`。
+- 単体実行:
+  ```powershell
+  node scripts/mall-csv-fetcher/rakuten-data-download.mjs   # RDATA_REPORTS=item,store で絞り込み
+  node apps/warehouse/import-rakuten-data.js --data-dir <DATA_DIR> [--dry-run]
+  node apps/warehouse/sync-rakuten-data-daily.js --data-dir <DATA_DIR> --days 70 [--dry-run]
+  ```
+- 画面調査は `rakuten-data-spike.mjs` (SPIKE_URL / SPIKE_DL / SPIKE_SETDATE / SPIKE_CLICK)。
+
 ### エラー通知 (無音停止禁止) と多モール続行
 
 - **Task Scheduler は `fetch-all.mjs` を登録**。モールごとに子プロセスで実行し、失敗しても次のモールへ続行
