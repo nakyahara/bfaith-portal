@@ -131,6 +131,9 @@ console.log('=== 4. 商品分析ガード (複数日/キーワード/端末絞�
   check('ファイル内SKU重複 (case違い含む) → error', !p4.ok && /重複/.test(p4.error), p4.error);
   const p5 = prepareDataFile('x.csv', itemCsv({ rows: [itemRow(1, 'a-1', 'A', '0', 1, 1), '2,壊れた行'] }));
   check('列数不足の非空行 → error', !p5.ok && /列数不足/.test(p5.error), p5.error);
+  const oneShort = itemRow(1, 'a-1', 'A', '0', 1, 1).replace(/,[^,]*$/, ''); // 末尾1列 (在庫数) 欠け
+  const p5b = prepareDataFile('x.csv', itemCsv({ rows: [oneShort] }));
+  check('末尾1列欠けも → error', !p5b.ok && /列数不足/.test(p5b.error), p5b.error);
   const p6 = prepareDataFile('x.csv', itemCsv({ rows: [itemRow(1, 'a-1', 'A', '0', 1, 1), ',,,'] }));
   check('全セル空行はスキップして正常取込', p6.ok && p6.records.length === 1, p6.error);
 }
@@ -172,6 +175,23 @@ console.log('=== 6. 店舗日次 再DL上書き + 全行未来日はエラー ==
   check('未集計スキップ日数をlabelで可視化', p2.ok && /未集計1日スキップ/.test(p2.label), p2.label);
   const p3 = prepareDataFile('short.csv', storeCsv([`"2026年07月03日","水","1,000"`]));
   check('店舗日次の列数不足行 → error', !p3.ok && /列数不足/.test(p3.error), p3.error);
+  const oneShort = storeRow('2026年07月03日', '1,000', '10').replace(/,"4,500"$/, ''); // 末尾1列 (決済手数料) 欠け
+  const p4 = prepareDataFile('short1.csv', storeCsv([oneShort]));
+  check('店舗日次の末尾1列欠けも → error', !p4.ok && /列数不足/.test(p4.error), p4.error);
+}
+
+console.log('=== 6b. 旧スキーマからの item_number 冪等 migration ===');
+{
+  const db2 = new Database(path.join(tmp, 'old-schema.db'));
+  db2.exec(`CREATE TABLE m_rakuten_items (
+    item_manage_number TEXT PRIMARY KEY, raw_sku_code TEXT, item_id INTEGER,
+    catalog_id TEXT, item_name TEXT, genre_path TEXT, updated_at TEXT NOT NULL)`);
+  ensureRakutenDataTables(db2);
+  const cols = db2.prepare(`PRAGMA table_info(m_rakuten_items)`).all().map(x => x.name);
+  check('item_number 列が追加される', cols.includes('item_number'), cols.join(','));
+  ensureRakutenDataTables(db2); // 2回目も落ちない
+  check('migration は冪等', true);
+  db2.close();
 }
 
 console.log('=== 7. zip内1ファイル不正 = 全体rollback (1tx原子性) ===');

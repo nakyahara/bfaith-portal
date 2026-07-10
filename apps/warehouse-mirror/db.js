@@ -612,6 +612,8 @@ function createTables() {
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_mrid_item ON mirror_rakuten_item_daily(item_manage_number, date_jst)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mrid_month ON mirror_rakuten_item_daily(substr(date_jst, 1, 7))');
+  // item_number は後付け列 (Codex R2 high: 旧スキーマで作成済みの環境向け冪等 migration)
+  addColumnIfMissing('mirror_rakuten_item_daily', 'item_number', 'TEXT');
 
   // mirror_rakuten_store_daily — RMSデータ分析「日次_分析用レポート」店舗×日次 (mall-csv-fetcher P1-R2)
   // 端末別KPI + 商圏ベンチマーク (サブジャンルTOP10平均/月商クラス平均) + 費用内訳

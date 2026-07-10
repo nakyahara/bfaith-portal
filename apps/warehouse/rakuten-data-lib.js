@@ -76,6 +76,9 @@ export function ensureRakutenDataTables(db) {
     genre_path          TEXT,
     updated_at          TEXT NOT NULL
   )`);
+  // item_number は後付け列 (Codex R2 high: 旧スキーマで作成済みの環境向け冪等 migration)
+  const miCols = db.prepare(`PRAGMA table_info(m_rakuten_items)`).all().map(x => x.name);
+  if (!miCols.includes('item_number')) db.exec(`ALTER TABLE m_rakuten_items ADD COLUMN item_number TEXT`);
 
   db.exec(`CREATE TABLE IF NOT EXISTS fact_rakuten_store_daily (
     date_jst              TEXT PRIMARY KEY CHECK (date_jst GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
@@ -211,9 +214,10 @@ function prepareItemDaily(name, rows, headerIdx) {
   const dims = [];
   for (let i = headerIdx + 1; i < rows.length; i++) {
     const r = rows[i];
-    // 全セル空行はスキップ、非空の短い行は列ズレ/破損CSVの兆候 → ファイル単位でエラー (Codex R1 low)
+    // 全セル空行はスキップ、非空の短い行は列ズレ/破損CSVの兆候 → ファイル単位でエラー (Codex R1 low / R2 low)
+    // 実CSV検証 2026-07-10: 商品分析1,372行・店舗日次32行とも全行 header と同列数 → 完全一致を要求
     if (r.every(v => trimS(v) === '')) continue;
-    if (r.length < header.length - 2) {
+    if (r.length < header.length) {
       return { name, ok: false, type: 'rakuten_item_daily', error: `列数不足の行 (row ${i + 1}: ${r.length}列/${header.length}列)。CSVが破損している可能性` };
     }
     const rawManage = trimS(r[c.manage]);
@@ -298,8 +302,8 @@ function prepareStoreDaily(name, rows, headerIdx) {
       if (/実績|合計/.test(rawDate)) continue; // 「通算実績」等の集計行はスキップ
       return { name, ok: false, type: 'rakuten_store_daily', error: `日付を解釈できない行: 「${rawDate}」` };
     }
-    // 非空の短い行は列ズレ/破損CSVの兆候 → ファイル単位でエラー (Codex R1 low)
-    if (r.length < header.length - 2) {
+    // 非空の短い行は列ズレ/破損CSVの兆候 → ファイル単位でエラー (Codex R1 low / R2 low、実CSVは全行 header と同列数)
+    if (r.length < header.length) {
       return { name, ok: false, type: 'rakuten_store_daily', error: `列数不足の行 (${date}: ${r.length}列/${header.length}列)。CSVが破損している可能性` };
     }
     // 未集計行 (未来日、早朝DL時の当日等): 自店指標=0 かつ ベンチマーク空 → スキップ。
