@@ -217,8 +217,8 @@ function prepareItemDaily(name, rows, headerIdx) {
     // 全セル空行はスキップ、非空の短い行は列ズレ/破損CSVの兆候 → ファイル単位でエラー (Codex R1 low / R2 low)
     // 実CSV検証 2026-07-10: 商品分析1,372行・店舗日次32行とも全行 header と同列数 → 完全一致を要求
     if (r.every(v => trimS(v) === '')) continue;
-    if (r.length < header.length) {
-      return { name, ok: false, type: 'rakuten_item_daily', error: `列数不足の行 (row ${i + 1}: ${r.length}列/${header.length}列)。CSVが破損している可能性` };
+    if (r.length !== header.length) {
+      return { name, ok: false, type: 'rakuten_item_daily', error: `列数不一致の行 (row ${i + 1}: ${r.length}列/${header.length}列)。CSVが破損している可能性` };
     }
     const rawManage = trimS(r[c.manage]);
     if (!rawManage) continue;
@@ -303,8 +303,8 @@ function prepareStoreDaily(name, rows, headerIdx) {
       return { name, ok: false, type: 'rakuten_store_daily', error: `日付を解釈できない行: 「${rawDate}」` };
     }
     // 非空の短い行は列ズレ/破損CSVの兆候 → ファイル単位でエラー (Codex R1 low / R2 low、実CSVは全行 header と同列数)
-    if (r.length < header.length) {
-      return { name, ok: false, type: 'rakuten_store_daily', error: `列数不足の行 (${date}: ${r.length}列/${header.length}列)。CSVが破損している可能性` };
+    if (r.length !== header.length) {
+      return { name, ok: false, type: 'rakuten_store_daily', error: `列数不一致の行 (${date}: ${r.length}列/${header.length}列)。CSVが破損している可能性` };
     }
     // 未集計行 (未来日、早朝DL時の当日等): 自店指標=0 かつ ベンチマーク空 → スキップ。
     // 0で埋めると実績と区別がつかない。稼働店舗で真のゼロ日は access=0 になり得ず、
