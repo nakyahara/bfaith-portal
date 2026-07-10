@@ -182,8 +182,13 @@ async function persistDownload(download, reportType, range, expect) {
   if (expect.type === 'rakuten_item_daily' && p.records.length === 1000) {
     throw new Error('DL_VERIFY: ちょうど1,000行 = 「全件」選択が効いていない疑い (上位1,000件カット)。画面のモーダル仕様変更を確認');
   }
+  // 実CSVの対象期間検証 (Codex R1 High): UI表示が追従して見えてもDLが別期間を返したら
+  // 意図しないデータを黙って投入することになる → 不一致は error (incoming に置かない)
   if (expect.dateFrom && p.dateFrom !== expect.dateFrom) {
-    console.warn(`  ⚠ [verify] 期待日 ${expect.dateFrom} と実CSV ${p.dateFrom} が不一致 (RMS側クランプ想定。実データで続行)`);
+    throw new Error(`DL_VERIFY: 期待日 ${expect.dateFrom} と実CSV ${p.dateFrom} が不一致 (前回期間/クランプ後のCSVを掴んだ疑い)`);
+  }
+  if (expect.month && !(p.dateFrom.slice(0, 7) === expect.month.ym && p.dateFrom >= expect.month.from && p.dateTo <= expect.month.to)) {
+    throw new Error(`DL_VERIFY: 期待月 ${expect.month.ym} と実CSV ${p.dateFrom}〜${p.dateTo} が不一致`);
   }
   console.log(`  [verify] ${p.label} ${p.records.length}件 (${p.dateFrom}〜${p.dateTo})`);
 
@@ -273,7 +278,9 @@ async function fetchItemDaily(page, dateIso) {
   }
   await page.waitForTimeout(500);
   const zenkenOk = await page.evaluate(() => {
-    const labels = [...document.querySelectorAll('label')].filter((l) => /全件/.test(l.textContent || ''));
+    // 可視ラベルに限定 (モーダル外の同名要素への誤マッチ防止 — Codex R1 Low)
+    const vis = (el) => !!(el.offsetParent || el.getClientRects().length);
+    const labels = [...document.querySelectorAll('label')].filter((l) => vis(l) && /全件/.test(l.textContent || ''));
     return labels.some((l) => {
       const input = l.querySelector('input[type=radio]')
         || (l.htmlFor ? document.getElementById(l.htmlFor) : null)
@@ -338,7 +345,7 @@ async function fetchStoreDaily(page, month) {
   }
   const download = await dlPromise;
   await persistDownload(download, 'rdata_store_daily', { from: month.from, to: month.to },
-    { type: 'rakuten_store_daily' });
+    { type: 'rakuten_store_daily', month });
   return 'ok';
 }
 
@@ -357,11 +364,32 @@ async function main() {
   await mkdir(DL_DIR, { recursive: true });
   await mkdir(OUT_DIR, { recursive: true });
 
-  const targets = (process.env.RDATA_REPORTS || 'item,store').split(',').map((s) => s.trim());
+  const targets = (process.env.RDATA_REPORTS || 'item,store').split(',').map((s) => s.trim()).filter(Boolean);
+  const unknown = targets.filter((t) => !['item', 'store'].includes(t));
+  if (targets.length === 0 || unknown.length > 0) {
+    // typo で対象0件のまま exit 0 になるのを防ぐ (Codex R1 Low、RPP側の exit 2 規約に合わせる)
+    console.error(`FATAL: RDATA_REPORTS には item / store を指定してください (不明: ${unknown.join(',') || '(空)'})`);
+    process.exitCode = 2;
+    return;
+  }
   const itemDates = targets.includes('item') ? computeItemTargetDates() : [];
   const storeMonths = targets.includes('store') ? computeStoreTargetMonths() : [];
 
-  const context = await openContext();
+  // openContext 失敗 (プロファイルロック等) は fetch-all が「子が通知済み」とみなす exit 1 に
+  // なるため、ここで自力通知してから落ちる (Codex R1 Medium: 通知漏れ防止)
+  let context;
+  try {
+    context = await openContext();
+  } catch (e) {
+    console.error(`⚠️ ブラウザ起動失敗: ${e.message}`);
+    await sendGChat(buildErrorReport({
+      mall: 'rakuten-data', logPath: runLog.logPath,
+      failures: [{ reportType: 'rdata(ブラウザ起動)', error: e.message }],
+      repro: '多重起動 (プロファイルロック) や Playwright 破損を確認: node scripts/mall-csv-fetcher/rakuten-data-download.mjs',
+    }), 'rakuten-data');
+    process.exitCode = 1;
+    return;
+  }
   const page = context.pages()[0] || await context.newPage();
   page.on('dialog', (d) => { console.log(`  [dialog] ${d.message()}`); d.accept().catch(() => {}); });
 
