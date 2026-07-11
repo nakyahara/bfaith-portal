@@ -250,25 +250,37 @@ export async function processEmailJob(jobId) {
   if (leased.done === 'scheduled') return { status: 'scheduled', scheduledAt: leased.job.scheduled_at };
 
   const job = leased.job;
+  // 完了の書き戻しも lease時の generation を条件にする (Codex P15-R7 High-2:
+  // 長時間停止した旧世代の送信処理が復帰しても、reconcile→markUnsent→retryで進んだ新世代の状態を上書きしない)
+  const gen = job.generation;
+  const finalize = (setSql, params, action, detail) => {
+    const changed = db.prepare(`UPDATE po_email_jobs ${setSql} WHERE id=? AND status='sending' AND generation=?`)
+      .run(...params, jobId, gen).changes;
+    if (changed === 0) {
+      audit(db, { actorType: 'system', actor: null, action: 'email_stale_attempt_discarded', resource: `order:${job.order_id}`,
+        detail: { jobId, gen, deliveryKey: job.delivery_key, attempted: action } });
+      return false;
+    }
+    if (action) audit(db, { actorType: 'system', actor: null, action, resource: `order:${job.order_id}`, detail });
+    return true;
+  };
   let phase = 'pre';
   try {
     const messageId = await sendViaGmail(job, p => { phase = p; });
-    db.prepare("UPDATE po_email_jobs SET status='sent', sent_at=?, gmail_message_id=? WHERE id=?").run(nowIso(), messageId, jobId);
-    audit(db, { actorType: 'system', actor: null, action: 'email_sent', resource: `order:${job.order_id}`,
-      detail: { jobId, gmailMessageId: messageId, dryRun: !!job.is_dry_run, deliveryKey: job.delivery_key } });
+    const applied = finalize("SET status='sent', sent_at=?, gmail_message_id=?", [nowIso(), messageId],
+      'email_sent', { jobId, gmailMessageId: messageId, dryRun: !!job.is_dry_run, deliveryKey: job.delivery_key });
+    if (!applied) return { status: 'stale', error: '古い送信試行のため結果を破棄しました。「照合」で状態を確認してください' };
     return { status: 'sent', gmailMessageId: messageId };
   } catch (e) {
     const msg = String(e.message).slice(0, 500);
     if (phase === 'post') {
       // 送信要求は飛んだ後の失敗 = 届いている可能性がある
-      db.prepare("UPDATE po_email_jobs SET status='unknown', error=? WHERE id=?")
-        .run(`送信結果不明: ${msg} — 「照合」で確認してください (自動再送はしません)`, jobId);
-      audit(db, { actorType: 'system', actor: null, action: 'email_unknown', resource: `order:${job.order_id}`,
-        detail: { jobId, error: msg, deliveryKey: job.delivery_key } });
-      return { status: 'unknown', error: msg };
+      const applied = finalize("SET status='unknown', error=?", [`送信結果不明: ${msg} — 「照合」で確認してください (自動再送はしません)`],
+        'email_unknown', { jobId, error: msg, deliveryKey: job.delivery_key });
+      return applied ? { status: 'unknown', error: msg } : { status: 'stale', error: '古い送信試行のため結果を破棄しました' };
     }
-    db.prepare("UPDATE po_email_jobs SET status='failed', error=? WHERE id=?").run(msg, jobId);
-    return { status: 'failed', error: msg };
+    const applied = finalize("SET status='failed', error=?", [msg], null, null);
+    return applied ? { status: 'failed', error: msg } : { status: 'stale', error: '古い送信試行のため結果を破棄しました' };
   }
 }
 
@@ -290,8 +302,11 @@ export async function reconcileEmailJobs() {
     const cur = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(jobId);
     if (cur.status === 'sent') return 'sent (確定済み)';
     if (cur.generation !== gen || (cur.status !== 'sending' && cur.status !== 'unknown')) {
-      db.prepare('UPDATE po_email_jobs SET error=? WHERE id=?')
+      // 終端状態 (sent/cancelled) には矛盾する再照合noteを書かない (監査ログには残す)
+      db.prepare("UPDATE po_email_jobs SET error=? WHERE id=? AND status NOT IN ('sent','cancelled')")
         .run(`⚠️ 照合で送信済みメール (整理番号 ${cur.delivery_key}) を検出しましたが、状態が変化していたため未適用。再照合してください`, jobId);
+      audit(db, { actorType: 'system', actor: null, action: 'email_reconcile_discarded', resource: `order:${cur.order_id}`,
+        detail: { jobId, snapshotGen: gen, currentGen: cur.generation, currentStatus: cur.status, foundMessageId: found } });
       return `${cur.status} (照合中に状態変化 → 結果破棄。再照合してください)`;
     }
     if (cur.status === 'sending') db.prepare("UPDATE po_email_jobs SET status='unknown' WHERE id=?").run(jobId);
@@ -392,7 +407,7 @@ export function startEmailDispatcher() {
 /** PO単位のジョブ履歴 */
 export function listEmailJobs(orderId) {
   return getDB().prepare(`SELECT id, status, is_dry_run, scheduled_at, delivery_key, to_addr, cc_addr, subject, attempt_count,
-      sending_started_at, gmail_message_id, error, created_at, sent_at, is_resend, resend_of
+      generation, sending_started_at, gmail_message_id, error, created_at, sent_at, is_resend, resend_of
     FROM po_email_jobs WHERE order_id=? ORDER BY id DESC`).all(orderId);
 }
 

@@ -563,6 +563,9 @@ function initLedgerSchema(db) {
     actor         TEXT,
     CHECK ((is_resend = 1) = (resend_of IS NOT NULL))
   )`);
+  // 既存DB (本ブランチの旧世代スキーマ) への後付け移行 (新規DBはCREATEに含まれる)
+  addCol(db, 'po_email_jobs', 'generation', 'INTEGER NOT NULL DEFAULT 0');
+  addCol(db, 'po_email_jobs', 'scheduled_at', 'TEXT');
   // 同一PO+同一内容の二重送信を禁止 (再送は is_resend=1 で明示。dry-runは本送信のdedupを妨げない)。
   // unknown (結果不明) も対象 — 不明のまま新規の通常送信で状態機械を迂回させない (Codex P15-R3 High)
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS uq_po_email_dedup ON po_email_jobs(order_id, content_hash)
