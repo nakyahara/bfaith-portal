@@ -70,7 +70,8 @@ const REQUIRED_COLS = ['伝票NO', '型番', '取引先ID', '仕入単価', '良
 const DATE_COL_CANDIDATES = ['入庫日', '入庫日付', '入荷日'];
 
 function lineContentHash(r) {
-  return createHash('sha1').update([r.productCode, r.goodQty, r.defectiveQty, r.unitCost == null ? '' : r.unitCost].join('|')).digest('hex').slice(0, 16);
+  // 監査原本の識別子のため完全なSHA-256を使う (切詰めによる衝突で別内容が同一行扱いになるのを避ける)
+  return createHash('sha256').update([r.productCode, r.goodQty, r.defectiveQty, r.unitCost == null ? '' : r.unitCost].join('|')).digest('hex');
 }
 
 /**
@@ -92,6 +93,7 @@ export function importInboundCsv({ buffer, filename, actor = null }) {
   const iSlip = col('伝票NO'), iCode = col('型番'), iSup = col('取引先ID'), iCost = col('仕入単価');
   const iGood = col('良品数'), iBad = col('不良品数');
   const iDate = DATE_COL_CANDIDATES.map(col).find(x => x !== -1);
+  const hasDateCol = iDate != null && iDate !== -1;
   const warnings = [];
 
   // 伝票NOごとに行をグルーピング (line_key = 内容ハッシュ + 同一内容の出現順)。
@@ -158,15 +160,21 @@ export function importInboundCsv({ buffer, filename, actor = null }) {
         seen.set(h, n);
         l.lineKey = `${h}#${n}`;
       }
-      const slipDate = lines.find(l => l.date)?.date || null;
+      // 入庫日は伝票単位。同一伝票に異なる日付が混在するCSVは黙って先頭を採用せず拒否する
+      const dates = [...new Set(lines.map(l => l.date).filter(Boolean))];
+      if (dates.length > 1) throw new Error(`伝票 ${slip}: 入庫日が複数あります (${dates.join(', ')})。CSVを確認してください`);
+      const slipDate = dates[0] || null;
       let receipt = db.prepare("SELECT * FROM po_inbound_receipts WHERE source='logizard' AND source_key=?").get(slip);
       if (!receipt) {
         const ri = db.prepare("INSERT INTO po_inbound_receipts (source, source_key, receipt_date, first_batch_id, last_batch_id, imported_at) VALUES ('logizard',?,?,?,?,?)")
           .run(slip, slipDate, batchId, batchId, now);
         receipt = { id: Number(ri.lastInsertRowid) };
-      } else {
-        db.prepare('UPDATE po_inbound_receipts SET last_batch_id=?, receipt_date=COALESCE(?, receipt_date) WHERE id=?')
+      } else if (hasDateCol) {
+        // 入庫日列があるファイルは原本として日付を上書き (NULL=クリアも反映)。列自体が無いファイルでは触らない
+        db.prepare('UPDATE po_inbound_receipts SET last_batch_id=?, receipt_date=? WHERE id=?')
           .run(batchId, slipDate, receipt.id);
+      } else {
+        db.prepare('UPDATE po_inbound_receipts SET last_batch_id=? WHERE id=?').run(batchId, receipt.id);
       }
       const existing = db.prepare('SELECT * FROM po_inbound_items WHERE receipt_id=? AND superseded=0').all(receipt.id);
       const existingByKey = new Map(existing.map(x => [x.line_key, x]));
@@ -179,7 +187,15 @@ export function importInboundCsv({ buffer, filename, actor = null }) {
         const same = existingByKey.get(l.lineKey);
         if (same) {
           // 行キー (商品・数量・単価) が同じでも、仕入先や原本は訂正されている可能性がある → 今回値で更新
-          // (仕入先だけの訂正が反映されないと候補抽出が誤る、Codex P14-R2 Medium-2)
+          // (仕入先だけの訂正が反映されないと候補抽出が誤る、Codex P14-R2 Medium-2)。
+          // ただし割当が残る行の仕入先変更は「入庫=B・割当先PO=A」の不整合を作るため取込ごと拒否
+          // (Codex P14-R3 High: 先に逆仕訳してから再取込してもらう)
+          if (same.supplier_code !== (l.supplierCode || null)) {
+            const alloc = allocOf.get(same.id).n;
+            if (alloc > 0) {
+              throw new Error(`伝票 ${slip} / ${l.productCode}: 仕入先が訂正されましたが割当 (${alloc}) が残っています。先に発注残ページから逆仕訳してから再取込してください`);
+            }
+          }
           if (same.supplier_code !== (l.supplierCode || null) || same.product_code !== l.productCode || same.payload_json !== l.payload) {
             db.prepare('UPDATE po_inbound_items SET supplier_code=?, product_code=?, payload_json=?, batch_id=? WHERE id=?')
               .run(l.supplierCode || null, l.productCode, l.payload, batchId, same.id);
