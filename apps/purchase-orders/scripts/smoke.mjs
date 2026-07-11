@@ -494,6 +494,248 @@ r = await j('/api/attrs/unlinked?days=0');
 ok(r.body.ok && r.body.rows.every(x => x.code.toLowerCase() !== 'diyorangeoil100'), 'unlinked: 紐付け済みは出ない');
 ok(r.body.rows.some(x => x.code === '0726-001060'), 'unlinked: 未紐付け取扱中は出る (全件)');
 
+// ═══ P13a 発注ライフサイクル台帳 ═══
+console.log('── P13a: 台帳 (イベント/逆仕訳/クローズ/整合性) ──');
+{
+  const L = await imp('apps/purchase-orders/ledger.js');
+  const boundary = L.getSetting('tracking_started_at');
+  ok(!!boundary, '移行境界 tracking_started_at が初回issueで確定');
+
+  // 発注確定: PO番号+tracked+希望納期スナップショット
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 50 }], note: '台帳テスト', requestedDate: '2026-07-20' }) });
+  ok(r.status === 200 && r.body.ok && /^PO-\d{4}-\d{4}$/.test(r.body.poNumber), 'issue: PO番号採番 (PO-YYYY-NNNN)', r.body.poNumber);
+  const ledgerOrderId = r.body.id;
+  const ord0 = db.prepare('SELECT * FROM po_orders WHERE id=?').get(ledgerOrderId);
+  ok(ord0.tracking_mode === 'tracked' && ord0.requested_date === '2026-07-20' && ord0.closed_at == null, 'issue: tracked+希望納期+オープン');
+  const item = db.prepare('SELECT * FROM po_order_items WHERE order_id=?').get(ledgerOrderId);
+  ok(item.requested_date === '2026-07-20', 'issue: 希望納期を明細へスナップショット');
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 1 }], requestedDate: '2026/07/20' }) });
+  ok(r.status === 400, 'issue: 希望納期の形式不正は 400');
+
+  // 部分入荷 40/50 → 残10
+  const rc = L.appendPoItemEvent({ orderItemId: item.id, eventType: 'receipt', qty: 40, source: 'manual', actor: 'smoke' });
+  ok(rc.remaining === 10 && !rc.orderClosed, '入荷40: 残10・オープン維持', rc);
+  // 残数超過は拒否
+  let threw = null;
+  try { L.appendPoItemEvent({ orderItemId: item.id, eventType: 'receipt', qty: 11, source: 'manual' }); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('残数超過'), '残数超過の入荷は拒否', threw);
+  // 減数10 (50個発注→40個しか作れない) → 残0で自動クローズ、close_reason=completed (cutoffなし)
+  const sh = L.appendPoItemEvent({ orderItemId: item.id, eventType: 'shortage', qty: 10, reasonCode: 'supplier_shortage', note: '原料不足', actor: 'smoke' });
+  ok(sh.remaining === 0 && sh.orderClosed, '減数10: 残0→自動クローズ', sh);
+  ok(L.deriveCloseReason(ledgerOrderId) === 'completed', 'close_reason導出=completed (通常消込)');
+  // クローズ後の通常イベントは拒否、逆仕訳のみ可
+  threw = null;
+  try { L.appendPoItemEvent({ orderItemId: item.id, eventType: 'receipt', qty: 1, source: 'manual' }); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('完了済み'), 'クローズ後の通常イベントは拒否');
+  // 入荷40を逆仕訳 → 残40で自動再オープン
+  const rv = L.reverseEvent(rc.eventId, { note: '数量誤登録の訂正', actor: 'smoke' });
+  ok(rv.remaining === 40 && !rv.orderClosed, '逆仕訳: 残40で自動再オープン', rv);
+  ok(db.prepare('SELECT closed_at FROM po_orders WHERE id=?').get(ledgerOrderId).closed_at == null, '再オープンで closed_at クリア');
+  // 二重逆仕訳は拒否 (UNIQUE + txn検証)
+  threw = null;
+  try { L.reverseEvent(rc.eventId, { note: '二重' }); } catch (e) { threw = e.message; }
+  ok(!!threw, '同一イベントの二重逆仕訳は拒否', threw);
+  // 正しい入荷35を再登録 → 残5 (減数10は有効のまま)
+  const rc2 = L.appendPoItemEvent({ orderItemId: item.id, eventType: 'receipt', qty: 35, source: 'manual', effectiveDate: '2026-07-11' });
+  ok(rc2.remaining === 5, '再入荷35: 残5 (減数10は維持)', rc2);
+  const bal = L.balanceOf(item.id);
+  ok(bal.received_qty === 35 && bal.shortage_qty === 10 && bal.ordered_qty === 50, '残数内訳 (受入35/減数10/発注50)', bal);
+
+  // disposition三択: 分納待ち (次回予定)
+  L.setItemPlan(item.id, { remainder_disposition: 'awaiting_delivery', next_expected_date: '2026-07-25', next_expected_qty: 5 }, { actor: 'smoke' });
+  let it2 = db.prepare('SELECT * FROM po_order_items WHERE id=?').get(item.id);
+  ok(it2.remainder_disposition === 'awaiting_delivery' && it2.next_expected_qty === 5, '分納待ち: 次回予定を保存');
+  threw = null;
+  try { L.setItemPlan(item.id, { remainder_disposition: 'awaiting_delivery', next_expected_date: '2026-07-25', next_expected_qty: 6 }); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('残数'), '次回予定数量>残数は拒否');
+  // 確認中へ変更 → next_expected_* は自動クリア、履歴が change_id で束なる
+  L.setItemPlan(item.id, { remainder_disposition: 'awaiting_confirmation', next_action_date: '2026-07-18' }, { actor: 'smoke' });
+  it2 = db.prepare('SELECT * FROM po_order_items WHERE id=?').get(item.id);
+  ok(it2.remainder_disposition === 'awaiting_confirmation' && it2.next_expected_date == null && it2.next_expected_qty == null, '確認中: next_expected_*クリア');
+  const histChanges = db.prepare('SELECT COUNT(DISTINCT change_id) AS c, COUNT(*) AS n FROM po_item_history WHERE order_item_id=?').get(item.id);
+  ok(histChanges.n >= 4 && histChanges.c >= 2, '納期/disposition変更は履歴に記録 (change_id束ね)', histChanges);
+  // 最後の入荷5 → 残0 → disposition自動クリア+クローズ
+  const rc3 = L.appendPoItemEvent({ orderItemId: item.id, eventType: 'receipt', qty: 5, source: 'manual' });
+  it2 = db.prepare('SELECT * FROM po_order_items WHERE id=?').get(item.id);
+  ok(rc3.orderClosed && it2.remainder_disposition == null && it2.next_action_date == null, '残0: disposition自動クリア+クローズ', rc3);
+
+  // 手動クローズ: 入荷30→打切 → close_reason=manual、cutoffは逆仕訳後も維持
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'cardstand-silver-r', qty: 100 }] }) });
+  const mcOrderId = r.body.id;
+  const mcItem = db.prepare('SELECT * FROM po_order_items WHERE order_id=?').get(mcOrderId);
+  const mcRc = L.appendPoItemEvent({ orderItemId: mcItem.id, eventType: 'receipt', qty: 30, source: 'manual' });
+  threw = null;
+  try { L.manualCloseOrder(mcOrderId, {}); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('note'), '手動クローズは理由必須');
+  const mc = L.manualCloseOrder(mcOrderId, { note: '仕入先廃番のため打切', actor: 'smoke' });
+  ok(mc.closed && L.deriveCloseReason(mcOrderId) === 'manual', '手動クローズ: cutoff登録→close_reason=manual', mc);
+  const mcRv = L.reverseEvent(mcRc.eventId, { note: '入荷誤登録' });
+  const mcBal = L.balanceOf(mcItem.id);
+  ok(mcRv.remaining === 30 && mcBal.cutoff_qty === 70, '手動クローズ後の入荷逆仕訳: 再オープン+cutoff70維持', mcBal);
+
+  // draft へのイベントは拒否
+  r = await j('/api/supplier/1/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 10 }] }) });
+  const dItem = db.prepare('SELECT i.* FROM po_order_items i JOIN po_orders o ON o.id=i.order_id WHERE o.status=?').get('draft');
+  threw = null;
+  try { L.appendPoItemEvent({ orderItemId: dItem.id, eventType: 'receipt', qty: 1, source: 'manual' }); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('draft'), 'draft明細へのイベントは拒否');
+
+  // legacy (境界以前のissued) へのイベントは拒否。fixture は draft で明細を作ってから issued へ (発行済み明細追加はトリガが拒否するため)
+  db.prepare(`INSERT INTO po_orders (supplier_code, supplier_name, status, created_at, updated_at)
+              VALUES ('999','旧発注','draft','2020-01-01T00:00:00.000Z','2020-01-01T00:00:00.000Z')`).run();
+  const legacyId = db.prepare("SELECT id FROM po_orders WHERE supplier_code='999'").get().id;
+  db.prepare("INSERT INTO po_order_items (order_id, product_code, product_key, product_name, qty) VALUES (?,?,?,?,?)")
+    .run(legacyId, 'noflyersticker', 'noflyersticker', '旧明細', 10);
+  db.prepare("UPDATE po_orders SET status='issued', issued_at='2020-01-01T00:00:00.000Z', po_number='PO-2020-9999', tracking_mode='tracked' WHERE id=?").run(legacyId);
+  const legacyItem = db.prepare('SELECT id FROM po_order_items WHERE order_id=?').get(legacyId);
+  threw = null;
+  try { L.appendPoItemEvent({ orderItemId: legacyItem.id, eventType: 'receipt', qty: 1, source: 'manual' }); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('legacy'), 'legacy発注へのイベントは拒否 (境界時刻が正)');
+
+  // 発行の世代ゲート: 境界後は po_number 等の無い issued を物理拒否 (旧コード相当のINSERT)
+  threw = null;
+  try {
+    db.prepare(`INSERT INTO po_orders (supplier_code, supplier_name, status, created_at, updated_at, issued_at)
+                VALUES ('1','旧経路','issued',?,?,?)`).run(nowIsoStr(), nowIsoStr(), nowIsoStr());
+  } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('issue gate'), '発行ゲート: 旧経路の不完全発行をトリガが拒否');
+
+  // append-only 強制
+  threw = null;
+  try { db.prepare('UPDATE po_item_events SET qty=999 WHERE id=?').run(rc.eventId); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('append-only'), 'イベント台帳のUPDATEはトリガが拒否');
+  threw = null;
+  try { db.prepare('DELETE FROM po_item_events WHERE id=?').run(rc.eventId); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('append-only'), 'イベント台帳のDELETEはトリガが拒否');
+
+  // 発行済みPO/明細の不変性トリガ (直接SQLからも守る)
+  threw = null;
+  try { db.prepare('UPDATE po_order_items SET qty=999 WHERE id=?').run(mcItem.id); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('immutable'), '発行済み明細の数量UPDATEはトリガが拒否', threw);
+  threw = null;
+  try { db.prepare("UPDATE po_orders SET issued_at='2020-01-01T00:00:00.000Z' WHERE id=?").run(mcOrderId); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('immutable'), '発行済みPOの issued_at 変更はトリガが拒否 (tracked判定の改変防止)');
+  threw = null;
+  try { db.prepare('DELETE FROM po_order_items WHERE id=?').run(mcItem.id); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('immutable'), '発行済み明細のDELETEはトリガが拒否');
+
+  // 移行境界の不変性 (DBトリガ+setSettingホワイトリスト)
+  threw = null;
+  try { db.prepare("UPDATE po_settings SET value='2030-01-01T00:00:00.000Z' WHERE key='tracking_started_at'").run(); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('immutable'), '移行境界のUPDATEはトリガが拒否');
+  threw = null;
+  try { L.setSetting('tracking_started_at', 'x'); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('設定キー'), 'setSetting は許可キーのみ (境界は変更不可)');
+
+  // 直接SQLのイベント登録もトリガが検証 (legacy/残数超過)
+  threw = null;
+  try {
+    db.prepare(`INSERT INTO po_item_events (order_item_id, event_type, qty, source, effective_date, recorded_at, actor_type)
+                VALUES (?,?,?,?,?,?,?)`).run(legacyItem.id, 'receipt', 1, 'manual', '2026-07-11', nowIsoStr(), 'user');
+  } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('event scope'), '直接SQLでもlegacyへのイベントはトリガが拒否');
+  threw = null;
+  try {
+    db.prepare(`INSERT INTO po_item_events (order_item_id, event_type, qty, source, effective_date, recorded_at, actor_type)
+                VALUES (?,?,?,?,?,?,?)`).run(mcItem.id, 'receipt', 9999, 'manual', '2026-07-11', nowIsoStr(), 'user');
+  } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('残数超過'), '直接SQLでも残数超過はトリガが拒否');
+
+  // 冪等キー: 同一キー再送は同じ結果、異なる内容は409、キー順・明細順の違いは同一視
+  const idemBody = { items: [{ code: 'noflyersticker', qty: 3 }], note: '冪等テスト' };
+  const idemOpts = key => ({ method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': key }, body: JSON.stringify(idemBody) });
+  r = await j('/api/supplier/1/issue', idemOpts('smoke-idem-1'));
+  const idemFirst = r.body;
+  r = await j('/api/supplier/1/issue', idemOpts('smoke-idem-1'));
+  ok(r.status === 200 && r.body.id === idemFirst.id && r.body.replay === true, '冪等キー: 再送は同じ発注を返す (二重作成なし)', r.body);
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'smoke-idem-1' },
+    body: JSON.stringify({ note: '冪等テスト', items: [{ qty: 3, code: 'noflyersticker' }] }) });
+  ok(r.status === 200 && r.body.id === idemFirst.id && r.body.replay === true, '冪等キー: JSONキー順が違っても同一内容はreplay', r.body);
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'smoke-idem-1' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 4 }] }) });
+  ok(r.status === 409, '冪等キー: 同一キー+異なる内容は409', r.status);
+
+  // 発行直後 (イベント登録前) の明細追加も無条件拒否 / unit_cost も不変
+  const idemItem = db.prepare('SELECT * FROM po_order_items WHERE order_id=?').get(idemFirst.id);
+  threw = null;
+  try {
+    db.prepare("INSERT INTO po_order_items (order_id, product_code, product_key, product_name, qty) VALUES (?,?,?,?,?)")
+      .run(idemFirst.id, 'cardstand-silver-r', 'cardstand-silver-r', '後付け', 1);
+  } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('immutable'), '発行済みPOへの明細追加は無条件拒否 (イベント前でも)', threw);
+  threw = null;
+  try { db.prepare('UPDATE po_order_items SET unit_cost=1 WHERE id=?').run(idemItem.id); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('immutable'), '発行済み明細の unit_cost 変更も拒否');
+
+  // 直接SQLの消込でも closed_at がDBトリガで再計算される (正本の乖離なし)
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 2 }] }) });
+  const sqlOrderId = r.body.id;
+  const sqlItem = db.prepare('SELECT * FROM po_order_items WHERE order_id=?').get(sqlOrderId);
+  db.prepare(`INSERT INTO po_item_events (order_item_id, event_type, qty, source, effective_date, recorded_at, actor_type)
+              VALUES (?,?,?,?,?,?,?)`).run(sqlItem.id, 'receipt', 2, 'manual', '2026-07-11', nowIsoStr(), 'user');
+  ok(db.prepare('SELECT closed_at FROM po_orders WHERE id=?').get(sqlOrderId).closed_at != null, '直接SQL消込でも closed_at をトリガが再計算');
+  // closed_at の直接操作ガード
+  threw = null;
+  try { db.prepare('UPDATE po_orders SET closed_at=NULL WHERE id=?').run(sqlOrderId); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('closed_at guard'), '全消込済みPOの closed_at 直接クリアは拒否');
+  threw = null;
+  try { db.prepare('UPDATE po_orders SET closed_at=? WHERE id=?').run(nowIsoStr(), mcOrderId); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('closed_at guard'), '残数があるPOの closed_at 直接セットは拒否');
+
+  // 発行ゲートの値形式検査 (PO-2026-abc 等を弾く)
+  threw = null;
+  try {
+    db.prepare(`INSERT INTO po_orders (supplier_code, supplier_name, status, created_at, updated_at, issued_at, po_number, tracking_mode)
+                VALUES ('1','形式不正','issued',?,?,?,'PO-2026-abc','tracked')`).run(nowIsoStr(), nowIsoStr(), nowIsoStr());
+  } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('issue gate'), '発行ゲート: PO番号の形式不正 (PO-2026-abc) を拒否');
+
+  // disposition列間規則のDBトリガ (直接SQLでも規則違反を保存できない。UPDATE/INSERT両方)
+  threw = null;
+  try { db.prepare('UPDATE po_order_items SET next_expected_qty=5 WHERE id=?').run(mcItem.id); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('plan rules'), '直接SQLでも disposition列間規則をトリガが拒否');
+  db.prepare("INSERT INTO po_orders (supplier_code, supplier_name, status, created_at, updated_at) VALUES ('998','plan試験','draft',?,?)")
+    .run(nowIsoStr(), nowIsoStr());
+  const planOrderId = db.prepare("SELECT id FROM po_orders WHERE supplier_code='998'").get().id;
+  threw = null;
+  try {
+    db.prepare("INSERT INTO po_order_items (order_id, product_code, product_key, product_name, qty, next_expected_qty) VALUES (?,?,?,?,?,?)")
+      .run(planOrderId, 'dummy-plan', 'dummy-plan', 'plan違反', 1, 5);
+  } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('plan rules'), 'INSERT時も disposition列間規則をトリガが拒否', threw);
+
+  // NULLを素通しするCHECKの封鎖 (shortage理由NULL / reversal理由NULL)
+  threw = null;
+  try {
+    db.prepare(`INSERT INTO po_item_events (order_item_id, event_type, qty, effective_date, recorded_at, actor_type)
+                VALUES (?,?,?,?,?,?)`).run(mcItem.id, 'shortage', 1, '2026-07-11', nowIsoStr(), 'user');
+  } catch (e) { threw = e.message; }
+  ok(!!threw, '理由コードNULLの減数は直接SQLでも拒否 (NULL素通しCHECK対策)', threw);
+
+  // closed_at の閉鎖時刻改変 (非NULL→別の非NULL) は拒否
+  threw = null;
+  try { db.prepare("UPDATE po_orders SET closed_at='2026-01-01T00:00:00.000Z' WHERE id=?").run(sqlOrderId); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('closed_at guard'), '閉鎖時刻の改変 (非NULL→非NULL) は拒否');
+
+  // 整合性検査: 違反なし。部分消込済み残の「扱い未選択」はwarning (mcItem=残30が該当)
+  r = await j('/api/ledger/integrity');
+  ok(r.body.ok && r.body.healthy === true, '整合性検査: 違反なし', r.body.issues);
+  ok(r.body.warnings.some(w => w.kind === 'remainder_without_disposition' && w.itemId === mcItem.id), '整合性検査: 再オープン残の扱い未選択をwarning表示', r.body.warnings);
+  r = await j('/api/ledger/integrity?orderId=abc');
+  ok(r.status === 400, '整合性検査: orderId不正は400');
+
+  // 監査ログが要点操作を記録している
+  const auditActions = db.prepare('SELECT DISTINCT action FROM po_audit_log').all().map(x => x.action);
+  ok(auditActions.includes('tracking_boundary_set') && auditActions.includes('order_closed')
+     && auditActions.includes('order_reopened') && auditActions.includes('manual_close'), '監査ログ: 境界確定/クローズ/再オープン/手動クローズ', auditActions);
+}
+function nowIsoStr() { return new Date().toISOString(); }
+
 server.close();
 console.log(`\n=== RESULT: pass=${pass} fail=${fail} ===`);
 process.exit(fail ? 1 : 0);

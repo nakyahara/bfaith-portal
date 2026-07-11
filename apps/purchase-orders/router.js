@@ -20,6 +20,7 @@ import multer from 'multer';
 import iconv from 'iconv-lite';
 import { getDB, normSupplierCode, normProductCode } from './db.js';
 import { computeAll, loadPml, loadPmlMerged, loadMasters, evaluateCondition } from './logic.js';
+import { ensureTrackingStarted, nextPoNumber, isYmd, checkLedgerIntegrity, withCommand } from './ledger.js';
 
 // ─── miniPC (WarehouseServer) service-api 呼び出し (オンデマンドFBA更新、product-management-list と同一エンドポイント) ───
 const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
@@ -148,13 +149,14 @@ function resolveSupplierName(supplierCode) {
   return (s && s.name) || `仕入先 ${supplierCode}`;
 }
 
-function insertItems(db, orderId, items) {
+function insertItems(db, orderId, items, requestedDate = null) {
   // condition_id は発注時点のスナップショット。後で紐付けを変えても過去発注の月次上限カウントが動かない (Codex P8-2)
+  // requested_date もINSERT時に確定する (発行済み明細はDBトリガで不変のため後からUPDATEできない)
   const condOf = db.prepare('SELECT condition_id FROM po_product_attrs WHERE product_key=?');
-  const ins = db.prepare('INSERT INTO po_order_items (order_id, product_code, product_key, product_name, qty, unit_cost, condition_id) VALUES (?,?,?,?,?,?,?)');
+  const ins = db.prepare('INSERT INTO po_order_items (order_id, product_code, product_key, product_name, qty, unit_cost, condition_id, requested_date) VALUES (?,?,?,?,?,?,?,?)');
   for (const it of items) {
     const a = condOf.get(it.key);
-    ins.run(orderId, it.code, it.key, it.name, it.qty, it.cost, (a && a.condition_id) || null);
+    ins.run(orderId, it.code, it.key, it.name, it.qty, it.cost, (a && a.condition_id) || null, requestedDate);
   }
 }
 
@@ -182,20 +184,38 @@ function upsertDraft(supplierCode, supplierName, rawItems, note) {
 /**
  * 発注確定 (Codex R2 High): draft を mutate せず issued order を新規 insert し、
  * 既存 draft の削除まで1トランザクションで行う。並行する draft 更新と混ざらない。
+ *
+ * P13a: issue と同時に PO番号採番 + tracking_mode='tracked' + 希望納期の明細スナップショットを行う
+ * (移行境界 tracking_started_at 以後の発注=残数管理対象。db.js の issue gate トリガが不完全発行を拒否する)。
  */
-function issueOrder(supplierCode, supplierName, rawItems, note) {
+function issueOrder(supplierCode, supplierName, rawItems, note, requestedDate) {
   const db = getDB();
   const { items, pmlAsOf } = enrichItems(rawItems, supplierCode);
-  const now = nowIso();
-  return db.transaction(() => {
-    const info = db.prepare(
-      "INSERT INTO po_orders (supplier_code, supplier_name, status, note, pml_as_of_date, created_at, updated_at, issued_at) VALUES (?,?,'issued',?,?,?,?,?)"
-    ).run(supplierCode, supplierName, note || null, pmlAsOf, now, now, now);
-    const id = Number(info.lastInsertRowid);
-    insertItems(db, id, items);
+  if (requestedDate != null && requestedDate !== '' && !isYmd(String(requestedDate))) {
+    throw new Error(`希望納期が日付 (YYYY-MM-DD) ではありません: ${requestedDate}`);
+  }
+  const reqDate = requestedDate ? String(requestedDate) : null;
+  const tx = db.transaction(() => {
+    const now = nowIso();
+    // 移行境界の確定は発行と同一コミット (最初の発行が失敗すれば境界もロールバック)。発行時刻を共有する
+    ensureTrackingStarted(now);
+    const poNumber = nextPoNumber(db);
+    // 発行済みPOへの明細INSERTはDBトリガが無条件拒否するため、draftでヘッダ+明細を作ってから issued へ遷移する
+    // (既存draftはtxn冒頭で削除=仕入先ごとdraft1件のUNIQUEとも整合。失敗すればロールバックで復元)
     db.prepare("DELETE FROM po_orders WHERE supplier_code=? AND status='draft'").run(supplierCode);
-    return id;
-  })();
+    const info = db.prepare(
+      `INSERT INTO po_orders (supplier_code, supplier_name, status, note, pml_as_of_date, created_at, updated_at)
+       VALUES (?,?,'draft',?,?,?,?)`
+    ).run(supplierCode, supplierName, note || null, pmlAsOf, now, now);
+    const id = Number(info.lastInsertRowid);
+    // 希望納期はヘッダ入力値を明細へINSERT時にスナップショット (以後ヘッダ値を継承しない、issued後は不変)
+    insertItems(db, id, items, reqDate);
+    db.prepare(
+      `UPDATE po_orders SET status='issued', issued_at=?, po_number=?, tracking_mode='tracked', requested_date=?, updated_at=? WHERE id=?`
+    ).run(now, poNumber, reqDate, now, id);
+    return { id, poNumber };
+  });
+  return tx.immediate();
 }
 
 function getOrderWithItems(id) {
@@ -363,11 +383,18 @@ router.post('/api/supplier/:code/draft', (req, res) => {
 router.post('/api/supplier/:code/issue', (req, res) => {
   try {
     const code = normSupplierCode(req.params.code);
-    const { items, note } = req.body || {};
+    const { items, note, requestedDate } = req.body || {};
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ ok: false, error: '発注明細が空です' });
-    const id = issueOrder(code, resolveSupplierName(code), items, trimS(note));
-    res.json({ ok: true, id });
-  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+    // Idempotency-Key があれば再送しても同じ発注を二重作成しない (レスポンス消失・リトライ対策)。
+    // payload は明細を発行処理と同じ正規化 (normProductCode) + コード/数量順の最小形に (並び順・表記差で409にしない)
+    const canonicalItems = items.map(i => ({ code: normProductCode(i && i.code), qty: Number(i && i.qty) }))
+      .sort((a, b) => a.code.localeCompare(b.code) || a.qty - b.qty);
+    const { replay, result } = withCommand(
+      { idempotencyKey: trimS(req.get('Idempotency-Key')) || null, payload: { op: 'issue', code, items: canonicalItems, note: trimS(note), requestedDate: requestedDate || null } },
+      () => issueOrder(code, resolveSupplierName(code), items, trimS(note), requestedDate)
+    );
+    res.json({ ok: true, id: result.id, poNumber: result.poNumber, replay });
+  } catch (e) { res.status(e.status === 409 ? 409 : 400).json({ ok: false, error: e.message }); }
 });
 
 router.get('/api/orders', (req, res) => {
@@ -391,6 +418,19 @@ router.get('/api/orders/:id', (req, res) => {
     const order = getOrderWithItems(Number(req.params.id));
     if (!order) return res.status(404).json({ ok: false, error: 'not found' });
     res.json({ ok: true, order });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// P13a: 台帳の整合性検査 (負残/closed不整合/発行取りこぼし/disposition規則)。P13bで管理画面に表示する
+router.get('/api/ledger/integrity', (req, res) => {
+  try {
+    let orderId = null;
+    if (req.query.orderId != null && req.query.orderId !== '') {
+      orderId = Number(req.query.orderId);
+      if (!Number.isSafeInteger(orderId) || orderId <= 0) return res.status(400).json({ ok: false, error: 'orderIdが不正です' });
+    }
+    const { issues, warnings } = checkLedgerIntegrity({ orderId });
+    res.json({ ok: true, healthy: issues.length === 0, issues, warnings });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
