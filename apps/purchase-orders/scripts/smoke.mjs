@@ -1027,7 +1027,7 @@ console.log('── P15: メール送信 (fake transport) ──');
   }
 
   // dry-run宛先未設定 → send はエラー / 設定APIで dry-run 宛先を登録
-  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', {});
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', {}, 'em-key-0');
   ok(r.status === 400 && r.body.error.includes('dry-run'), 'send: dry-run宛先未設定はエラー');
   r = await jsonPost('/api/email/settings', { dryrunTo: 'me@b-faith.biz' });
   ok(r.body.ok && r.body.dryrunTo === 'me@b-faith.biz' && r.body.mode === 'dry_run', 'メール設定保存 (既定dry_run)');
@@ -1037,6 +1037,10 @@ console.log('── P15: メール送信 (fake transport) ──');
   ok(r.body.ok && r.body.subject.includes('【発注書】') && r.body.subject.includes('アメージングクラフト'), 'preview: 件名テンプレ (GAS互換)', r.body.subject);
   ok(r.body.body.startsWith('田中様'), 'preview: 担当者に様を自動付与');
   ok(r.body.vendorColUsed && r.body.csvText.includes('先方管理番号') && r.body.csvText.includes('AMC-001'), 'preview: 添付CSVに先方管理番号列', r.body.csvText.split('\r\n')[0]);
+
+  // 冪等キーなしの送信は拒否 (再送はdedup対象外のためキーが唯一の再実行ガード)
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', {});
+  ok(r.status === 400 && r.body.error.includes('Idempotency-Key'), '送信APIは冪等キー必須 (Codex P15 R4)');
 
   // dry-run送信 (fake): 宛先差し替え+【DRYRUN】+整理番号+送信済み
   r = await jsonPost('/api/orders/' + emOrderId + '/email/send', {}, 'em-key-1');

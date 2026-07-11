@@ -282,25 +282,30 @@ export async function reconcileEmailJobs() {
   const targets = db.prepare(`SELECT * FROM po_email_jobs
     WHERE status='unknown' OR (status='sending' AND sending_started_at < ?)`).all(staleBefore);
   const results = [];
+  // 更新は現在状態を条件にする (照合の並行実行で重複監査・sent_at上書きをしない、Codex P15-R4 Low)
+  const toUnknown = db.prepare("UPDATE po_email_jobs SET status='unknown' WHERE id=? AND status='sending'");
+  const toSent = db.prepare(`UPDATE po_email_jobs SET status='sent', sent_at=?, gmail_message_id=?, error=NULL
+                             WHERE id=? AND status IN ('sending','unknown')`);
+  const setErr = db.prepare("UPDATE po_email_jobs SET error=? WHERE id=? AND status IN ('sending','unknown')");
   for (const job of targets) {
     try {
       const found = await searchGmailByMessageId(messageIdOf(job));
       if (found) {
-        if (job.status === 'sending') db.prepare("UPDATE po_email_jobs SET status='unknown' WHERE id=?").run(job.id);
-        db.prepare("UPDATE po_email_jobs SET status='sent', sent_at=?, gmail_message_id=?, error=NULL WHERE id=?").run(nowIso(), found, job.id);
-        audit(db, { actorType: 'system', actor: null, action: 'email_reconciled_sent', resource: `order:${job.order_id}`,
-          detail: { jobId: job.id, gmailMessageId: found, deliveryKey: job.delivery_key } });
+        toUnknown.run(job.id);
+        const changed = toSent.run(nowIso(), found, job.id).changes;
+        if (changed > 0) {
+          audit(db, { actorType: 'system', actor: null, action: 'email_reconciled_sent', resource: `order:${job.order_id}`,
+            detail: { jobId: job.id, gmailMessageId: found, deliveryKey: job.delivery_key } });
+        }
         results.push({ jobId: job.id, result: 'sent (照合で送信済みを確認)' });
       } else {
-        if (job.status === 'sending') db.prepare("UPDATE po_email_jobs SET status='unknown' WHERE id=?").run(job.id);
-        db.prepare('UPDATE po_email_jobs SET error=? WHERE id=?')
-          .run(`照合0件 (未送信の証明にはなりません)。Gmailの送信済みで整理番号 ${job.delivery_key} を確認し、無ければ「未送信を確認した」→再試行してください`, job.id);
+        toUnknown.run(job.id);
+        setErr.run(`照合0件 (未送信の証明にはなりません)。Gmailの送信済みで整理番号 ${job.delivery_key} を確認し、無ければ「未送信を確認した」→再試行してください`, job.id);
         results.push({ jobId: job.id, result: 'unknown (0件。手動確認要)' });
       }
     } catch (e) {
-      if (job.status === 'sending') db.prepare("UPDATE po_email_jobs SET status='unknown' WHERE id=?").run(job.id);
-      db.prepare('UPDATE po_email_jobs SET error=? WHERE id=?')
-        .run(`照合不能: ${String(e.message).slice(0, 200)} — Gmailで整理番号 ${job.delivery_key} を検索して手動確認してください`, job.id);
+      toUnknown.run(job.id);
+      setErr.run(`照合不能: ${String(e.message).slice(0, 200)} — Gmailで整理番号 ${job.delivery_key} を検索して手動確認してください`, job.id);
       results.push({ jobId: job.id, result: 'unknown (照合不能。手動確認要)' });
     }
   }

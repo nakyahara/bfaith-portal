@@ -639,9 +639,11 @@ router.post('/api/orders/:id/email/send', async (req, res) => {
     const resend = !!b.resend;
     const resendOfJobId = b.resendOfJobId != null ? Number(b.resendOfJobId) : null;
     const scheduledAt = trimS(b.scheduledAt) || null;
-    // ジョブ作成は冪等 (再送クリックの通信断→再クリックで二重ジョブを作らない)。送信処理はlease側が多重実行を防ぐ
+    // 冪等キーは必須 (再送ジョブはdedup対象外のため、通信断後の再実行・自動リトライでの複数通送信をキーで防ぐ、Codex P15-R4 High)
+    const idemKey = trimS(req.get('Idempotency-Key'));
+    if (!idemKey) return res.status(400).json({ ok: false, error: 'Idempotency-Key ヘッダが必要です (画面からの送信では自動付与されます)' });
     const { replay, result: jobId } = withCommand(
-      { idempotencyKey: trimS(req.get('Idempotency-Key')) || null, payload: { op: 'email_send', orderId, resend, resendOfJobId, scheduledAt } },
+      { idempotencyKey: idemKey, payload: { op: 'email_send', orderId, resend, resendOfJobId, scheduledAt } },
       () => createEmailJob(orderId, { resend, resendOfJobId, scheduledAt, actor: actorOf(req) })
     );
     const outcome = await processEmailJob(jobId);
@@ -797,12 +799,17 @@ router.post('/api/vendor-map/csv', upload.single('file'), (req, res) => {
     const oldCount = db.prepare('SELECT COUNT(*) AS n FROM po_vendor_code_map WHERE supplier_code=?').get(supplierCode).n;
     db.transaction(() => {
       db.prepare('DELETE FROM po_vendor_code_map WHERE supplier_code=?').run(supplierCode);
-      const ins = db.prepare('INSERT OR REPLACE INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, updated_at) VALUES (?,?,?,?,?)');
+      const ins = db.prepare('INSERT INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, updated_at) VALUES (?,?,?,?,?)');
+      const seen = new Set();
       for (let n = 1; n < rows.length; n++) {
         const vendor = trimS(rows[n][iVendor]);
         const our = trimS(rows[n][iOur]);
         if (!vendor || !our) { skipped++; continue; }
-        ins.run(supplierCode, normProductCode(our), our, vendor, nowIso());
+        const key = normProductCode(our);
+        // 同一商品の重複を後勝ちで黙って上書きしない (誤った先方番号の混入防止、Codex P15-R4 Medium)
+        if (seen.has(key)) throw new Error(`行${n + 1}: 商品コード ${our} が重複しています (大文字小文字・空白違い含む)。CSVを修正してください`);
+        seen.add(key);
+        ins.run(supplierCode, key, our, vendor, nowIso());
         count++;
       }
       // 誤CSV・空データで正常な対応表を消さない (0件はロールバック)
