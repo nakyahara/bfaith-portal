@@ -507,14 +507,19 @@ router.post('/api/events/:eventId/reverse', (req, res) => {
     const eventId = Number(req.params.eventId);
     if (!Number.isSafeInteger(eventId) || eventId <= 0) return res.status(400).json({ ok: false, error: 'eventIdが不正です' });
     const note = trimS((req.body || {}).note);
-    const result = reverseEvent(eventId, { note, actorType: 'user', actor: actorOf(req) });
-    // 逆仕訳で残数が復活した場合、扱い (三択) は未選択になる → UIに要選択を伝える (要対応リストにも載る)
-    const db = getDB();
-    const ev = db.prepare('SELECT order_item_id FROM po_item_events WHERE id=?').get(eventId);
-    const item = db.prepare('SELECT remainder_disposition FROM po_order_items WHERE id=?').get(ev.order_item_id);
-    const needsDisposition = result.remaining > 0 && item.remainder_disposition == null;
-    res.json({ ok: true, ...result, needsDisposition });
-  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+    const { replay, result } = withCommand(
+      { idempotencyKey: trimS(req.get('Idempotency-Key')) || null, payload: { op: 'reverse', eventId, note } },
+      () => {
+        const r = reverseEvent(eventId, { note, actorType: 'user', actor: actorOf(req) });
+        // 逆仕訳で残数が復活した場合、扱い (三択) は未選択になる → UIに要選択を伝える (要対応リストにも載る)
+        const db = getDB();
+        const ev = db.prepare('SELECT order_item_id FROM po_item_events WHERE id=?').get(eventId);
+        const item = db.prepare('SELECT remainder_disposition FROM po_order_items WHERE id=?').get(ev.order_item_id);
+        return { ...r, needsDisposition: r.remaining > 0 && item.remainder_disposition == null };
+      }
+    );
+    res.json({ ok: true, ...result, replay });
+  } catch (e) { res.status(e.status === 409 ? 409 : 400).json({ ok: false, error: e.message }); }
 });
 
 router.post('/api/orders/:id/close', (req, res) => {
@@ -522,9 +527,12 @@ router.post('/api/orders/:id/close', (req, res) => {
     const orderId = Number(req.params.id);
     if (!Number.isSafeInteger(orderId) || orderId <= 0) return res.status(400).json({ ok: false, error: 'idが不正です' });
     const note = trimS((req.body || {}).note);
-    const result = manualCloseOrder(orderId, { note, actorType: 'user', actor: actorOf(req) });
-    res.json({ ok: true, ...result });
-  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+    const { replay, result } = withCommand(
+      { idempotencyKey: trimS(req.get('Idempotency-Key')) || null, payload: { op: 'close', orderId, note } },
+      () => manualCloseOrder(orderId, { note, actorType: 'user', actor: actorOf(req) })
+    );
+    res.json({ ok: true, ...result, replay });
+  } catch (e) { res.status(e.status === 409 ? 409 : 400).json({ ok: false, error: e.message }); }
 });
 
 /** 納期・分納予定・disposition の更新 (現在値+履歴を同一txn) */
@@ -2668,19 +2676,25 @@ function post(url, body, idemKey) {
 function patch(url, body) {
   return fetch(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(jsonOrErr);
 }
+function getJson(url) { return fetch(url).then(jsonOrErr); }
 
 function load() {
-  fetch(API + '/backorders').then(function(r){ return r.json(); }).then(function(j) {
-    if (!j.ok) { document.getElementById('boList').textContent = 'エラー: ' + j.error; return; }
+  getJson(API + '/backorders').then(function(j) {
+    if (!j.ok) {
+      document.getElementById('boList').innerHTML = '<div class="warn">エラー: ' + esc(j.error) + ' <button class="ghost" onclick="load()">再読込</button></div>';
+      return;
+    }
     DATA = j; render();
+  }).catch(function(e) {
+    document.getElementById('boList').innerHTML = '<div class="warn">通信エラー: ' + esc(e.message) + ' <button class="ghost" onclick="load()">再読込</button></div>';
   });
-  fetch(API + '/ledger/integrity').then(function(r){ return r.json(); }).then(function(j) {
+  getJson(API + '/ledger/integrity').then(function(j) {
     if (!j.ok) return;
     var el = document.getElementById('integrity');
     var h = '';
     if (j.issues.length) h += '<div class="warn">🚨 台帳の整合性違反 ' + j.issues.length + '件: ' + esc(j.issues.slice(0,5).map(function(x){ return x.kind + (x.orderId ? ' order:' + x.orderId : x.itemId ? ' item:' + x.itemId : ''); }).join(' / ')) + (j.issues.length > 5 ? ' …' : '') + '</div>';
     el.innerHTML = h;
-  });
+  }).catch(function(){ /* 整合性表示は補助情報。失敗しても一覧は出す */ });
 }
 
 function orderMatchesView(o) {
@@ -2761,7 +2775,8 @@ function orderHtml(o) {
         (o.open && i.remaining_qty > 0
           ? '<button class="ghost" data-act="receipt" data-item2="' + i.id + '">📥入荷</button> ' +
             '<button class="ghost" data-act="shortage" data-item2="' + i.id + '">➖減数</button> ' +
-            '<button class="ghost" data-act="cancel" data-item2="' + i.id + '">🚫取消</button> '
+            '<button class="ghost" data-act="cancel" data-item2="' + i.id + '">🚫取消</button> ' +
+            '<button class="ghost" data-disp="' + i.id + '" title="分納待ち/減数で完了/確認中 を設定">📋扱い</button> '
           : '') +
         (i.event_count > 0 ? '<button class="ghost" data-hist="' + i.id + '">履歴</button>' : '') +
       '</td></tr>' +
@@ -2843,9 +2858,64 @@ function actPanel(itemId, act) {
   });
 }
 
+// ── 残数の扱い (三択) の単独設定パネル (逆仕訳後・後から変更する場合) ──
+function dispPanel(itemId) {
+  var item = findItem(itemId);
+  if (!item) return;
+  var cur = item.remainder_disposition;
+  var h = '<div class="import-zone" style="margin:6px 0"><b>📋 残 ' + item.remaining_qty + ' の扱い</b>' +
+    '<div style="margin-top:6px">' +
+    '<label><input type="radio" name="dsp" value="await_delivery"' + (cur === 'awaiting_delivery' || !cur ? ' checked' : '') + '> 🚚 分納待ち</label> ' +
+    '<label><input type="radio" name="dsp" value="shortage"> ➖ 減数で完了 (もう来ない)</label> ' +
+    '<label><input type="radio" name="dsp" value="await_confirmation"' + (cur === 'awaiting_confirmation' ? ' checked' : '') + '> 📞 確認中</label>' +
+    '<span id="dspFields" style="margin-left:8px"></span></div>' +
+    '<div style="margin-top:8px"><button class="pri" id="dspGo">保存</button> <button class="ghost" id="dspCancel">やめる</button></div></div>';
+  showPanel(itemId, h);
+  var idemKey = newIdemKey();
+  document.getElementById('panelBody-' + itemId).addEventListener('input', function(){ idemKey = newIdemKey(); });
+  function fields() {
+    var v = (document.querySelector('input[name=dsp]:checked') || {}).value;
+    var el = document.getElementById('dspFields');
+    if (v === 'await_delivery') el.innerHTML = '次回予定日 <input type="date" id="dspDate" value="' + (item.next_expected_date || '') + '"> 数量 <input type="number" id="dspQty" min="1" max="' + item.remaining_qty + '" value="' + (item.next_expected_qty || item.remaining_qty) + '" style="width:80px">';
+    else if (v === 'shortage') el.innerHTML = '理由 <select id="dspReason"><option value="supplier_shortage">仕入先都合</option><option value="own_decision">自社判断</option><option value="other">その他</option></select> <input type="text" id="dspNote" placeholder="メモ (その他は必須)" style="width:160px">';
+    else el.innerHTML = '確認期限 <input type="date" id="dspActDate" value="' + (item.next_action_date || '') + '">';
+  }
+  document.querySelectorAll('input[name=dsp]').forEach(function(x){ x.addEventListener('change', fields); });
+  fields();
+  document.getElementById('dspCancel').addEventListener('click', function(){ hidePanel(itemId); });
+  document.getElementById('dspGo').addEventListener('click', function() {
+    var v = (document.querySelector('input[name=dsp]:checked') || {}).value;
+    var btn = document.getElementById('dspGo');
+    btn.disabled = true;
+    var done = function(j, msg) {
+      btn.disabled = false;
+      if (!j.ok) { toast('エラー: ' + j.error); return; }
+      toast(msg); load();
+    };
+    if (v === 'shortage') {
+      post(API + '/items/' + itemId + '/events', {
+        type: 'shortage', qty: item.remaining_qty,
+        reasonCode: (document.getElementById('dspReason') || {}).value,
+        note: (document.getElementById('dspNote') || {}).value,
+      }, idemKey).then(function(j){ done(j, '残数を減数で消し込みました'); });
+    } else if (v === 'await_delivery') {
+      patch(API + '/items/' + itemId + '/plan', {
+        disposition: 'awaiting_delivery',
+        nextExpectedDate: (document.getElementById('dspDate') || {}).value,
+        nextExpectedQty: (document.getElementById('dspQty') || {}).value,
+      }).then(function(j){ done(j, '分納待ちに設定しました'); });
+    } else {
+      patch(API + '/items/' + itemId + '/plan', {
+        disposition: 'awaiting_confirmation',
+        nextActionDate: (document.getElementById('dspActDate') || {}).value,
+      }).then(function(j){ done(j, '確認中に設定しました'); });
+    }
+  });
+}
+
 // ── 明細イベント履歴 (+逆仕訳) ──
 function histPanel(itemId) {
-  fetch(API + '/items/' + itemId + '/events').then(function(r){ return r.json(); }).then(function(j) {
+  getJson(API + '/items/' + itemId + '/events').then(function(j) {
     if (!j.ok) { toast(j.error); return; }
     var h = '<table class="t"><tr><th>#</th><th>種別</th><th class="r">数量</th><th>業務日付</th><th>理由/メモ</th><th>登録</th><th></th></tr>';
     j.events.forEach(function(e) {
@@ -2860,7 +2930,7 @@ function histPanel(itemId) {
     });
     h += '</table><div id="revBox-' + itemId + '" style="margin-top:6px"></div><button class="ghost" data-histclose="' + itemId + '">閉じる</button>';
     showPanel(itemId, h);
-  });
+  }).catch(function(e){ toast('通信エラー: ' + e.message); });
 }
 
 function findItem(itemId) {
@@ -2889,6 +2959,7 @@ document.addEventListener('click', function(ev) {
     return;
   }
   if ((v = g('data-act'))) { actPanel(g('data-item2'), v); return; }
+  if ((v = g('data-disp'))) { dispPanel(v); return; }
   if ((v = g('data-hist'))) { histPanel(v); return; }
   if ((v = g('data-histclose'))) { hidePanel(v); return; }
   // 逆仕訳: 理由入力 → 確定 (promptは使わない)
@@ -2898,10 +2969,11 @@ document.addEventListener('click', function(ev) {
     box.innerHTML = '<b>↩ イベント#' + v + ' を逆仕訳</b> (全量が打ち消され、残数が戻ります) ' +
       '理由 <input type="text" id="revNote" placeholder="例: 数量の入力ミス" style="width:220px"> ' +
       '<button class="pri" id="revGo">逆仕訳を実行</button>';
+    var revKey = newIdemKey();
     document.getElementById('revGo').addEventListener('click', function() {
       var note = document.getElementById('revNote').value;
       if (!note.trim()) { toast('訂正理由を入力してください'); return; }
-      post(API + '/events/' + v + '/reverse', { note: note }).then(function(j) {
+      post(API + '/events/' + v + '/reverse', { note: note }, revKey).then(function(j) {
         if (!j.ok) { toast('エラー: ' + j.error); return; }
         toast('逆仕訳しました (残 ' + j.remaining + ')' + (j.needsDisposition ? ' — ⚠️ 残数の扱い (分納待ち/減数/確認中) を選択してください' : ''));
         load();
@@ -2915,11 +2987,12 @@ document.addEventListener('click', function(ev) {
     area.innerHTML = '<div class="import-zone"><b>✅ 手動クローズ</b> — 残数すべてを「打切」の減数として消し込み、この発注を完了にします。' +
       '<div style="margin-top:6px">理由 <input type="text" id="clNote" placeholder="例: 仕入先廃番のため" style="width:260px"> ' +
       '<button class="pri" id="clGo">クローズ実行</button> <button class="ghost" id="clCancel">やめる</button></div></div>';
+    var clKey = newIdemKey();
     document.getElementById('clCancel').addEventListener('click', load);
     document.getElementById('clGo').addEventListener('click', function() {
       var note = document.getElementById('clNote').value;
       if (!note.trim()) { toast('理由を入力してください'); return; }
-      post(API + '/orders/' + v + '/close', { note: note }).then(function(j) {
+      post(API + '/orders/' + v + '/close', { note: note }, clKey).then(function(j) {
         if (!j.ok) { toast('エラー: ' + j.error); return; }
         toast('クローズしました (打切 ' + j.cutoffItems + '明細)');
         load();

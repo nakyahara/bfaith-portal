@@ -370,10 +370,16 @@ export function setItemPlan(orderItemId, patch, { note = null, actorType = 'user
     for (const f of ['promised_date', 'next_expected_date', 'next_action_date']) {
       if (next[f] != null && !isYmd(String(next[f]))) throw new Error(`${f} が日付 (YYYY-MM-DD) ではありません: ${next[f]}`);
     }
+    // 残数0の明細に扱い/予定は設定できない (公開APIから stale_disposition を作らせない、Codex P13b-R2 High-2)。
+    // 回答納期 (promised_date) だけの更新は残数0でも許可する (履歴訂正用途)
+    const bal = balanceOf(orderItemId, db);
+    if (bal.remaining_qty === 0 && (next.remainder_disposition != null || next.next_expected_date != null
+        || next.next_expected_qty != null || next.next_action_date != null)) {
+      throw new Error('残数0の明細には残数の扱い・次回予定を設定できません');
+    }
     if (next.next_expected_qty != null) {
       const q = Number(next.next_expected_qty);
       if (!Number.isInteger(q) || q <= 0) throw new Error(`next_expected_qty が不正です: ${next.next_expected_qty}`);
-      const bal = balanceOf(orderItemId, db);
       if (q > bal.remaining_qty) throw new Error(`次回予定数量が残数 (${bal.remaining_qty}) を超えています`);
       next.next_expected_qty = q;
     }

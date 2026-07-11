@@ -807,6 +807,18 @@ console.log('── P13b: 発注残ページ+消込API ──');
   ok(r.body.ok && r.body.replay === true && r.body.remaining === 0, '消込API: 同一キー再送はreplay (二重消込なし)', r.body);
   ok(db.prepare('SELECT COUNT(*) AS n FROM po_item_events WHERE order_item_id=?').get(idemEvItem.id).n === 1, '消込API: イベントは1件のみ');
 
+  // 残数0の明細に扱い/予定は設定できない (stale_disposition を公開APIから作らせない)。
+  // オープンな複数明細POで、片方だけ全量入荷→その明細に扱いを設定しようとするケース
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 5 }, { code: 'cardstand-silver-r', qty: 5 }] }) });
+  const twoItems = db.prepare('SELECT * FROM po_order_items WHERE order_id=? ORDER BY id').all(r.body.id);
+  r = await j('/api/items/' + twoItems[0].id + '/events', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: 'receipt', qty: 5 }) });
+  ok(r.body.ok && r.body.remaining === 0 && !r.body.orderClosed, '複数明細PO: 片方全量入荷でもオープン維持');
+  r = await j('/api/items/' + twoItems[0].id + '/plan', { method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ disposition: 'awaiting_confirmation', nextActionDate: '2026-07-20' }) });
+  ok(r.status === 400 && r.body.error.includes('残数0'), '残数0明細への扱い設定は400 (Codex P13b R2)', r.body.error);
+
   // ページ配信 (発注残ページ・ダッシュボードのサマリ・履歴のPO番号列)
   {
     const html = await (await fetch(base + '/backorders')).text();
@@ -814,6 +826,8 @@ console.log('── P13b: 発注残ページ+消込API ──');
     ok(html.includes('remBox') && html.includes('await_delivery'), '/backorders 部分入荷の三択UI');
     ok(html.includes('data-rev') && html.includes('data-closeui'), '/backorders 逆仕訳+手動クローズUI (promptなし)');
     ok(html.includes("td.innerHTML = ''") && html.includes('Idempotency-Key'), '/backorders パネルDOM破棄+冪等キー送信 (Codex P13b R1)');
+    ok(html.includes('data-disp') && html.includes('dspGo'), '/backorders 残数の扱い設定パネル (逆仕訳後の再設定用)');
+    ok(html.includes('getJson') && html.includes('再読込'), '/backorders GET失敗時の再読込UI');
     const dash = await (await fetch(base + '/')).text();
     ok(dash.includes('発注残') && dash.includes('/apps/purchase-orders/backorders'), '/ ダッシュボードに発注残サマリ');
     const orders = await (await fetch(base + '/orders')).text();
