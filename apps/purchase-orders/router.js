@@ -20,7 +20,10 @@ import multer from 'multer';
 import iconv from 'iconv-lite';
 import { getDB, normSupplierCode, normProductCode } from './db.js';
 import { computeAll, loadPml, loadPmlMerged, loadMasters, evaluateCondition } from './logic.js';
-import { ensureTrackingStarted, nextPoNumber, isYmd, checkLedgerIntegrity, withCommand } from './ledger.js';
+import {
+  ensureTrackingStarted, nextPoNumber, isYmd, checkLedgerIntegrity, withCommand,
+  appendPoItemEvent, reverseEvent, manualCloseOrder, setItemPlan, listBackorders, listItemEvents, balanceOf,
+} from './ledger.js';
 
 // ─── miniPC (WarehouseServer) service-api 呼び出し (オンデマンドFBA更新、product-management-list と同一エンドポイント) ───
 const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
@@ -402,9 +405,13 @@ router.get('/api/orders', (req, res) => {
     const db = getDB();
     const rows = db.prepare(`
       SELECT o.id, o.supplier_code, o.supplier_name, o.status, o.note, o.created_at, o.issued_at,
+             o.po_number, o.closed_at, o.tracking_mode,
              COUNT(i.id) AS sku_count, COALESCE(SUM(i.qty),0) AS total_qty,
-             COALESCE(SUM(i.qty * COALESCE(i.unit_cost,0)),0) AS total_amount
-      FROM po_orders o LEFT JOIN po_order_items i ON i.order_id = o.id
+             COALESCE(SUM(i.qty * COALESCE(i.unit_cost,0)),0) AS total_amount,
+             COALESCE(SUM(b.remaining_qty),0) AS remaining_qty
+      FROM po_orders o
+      LEFT JOIN po_order_items i ON i.order_id = o.id
+      LEFT JOIN v_po_item_balance b ON b.order_item_id = i.id
       GROUP BY o.id
       ORDER BY COALESCE(o.issued_at, o.updated_at) DESC
       LIMIT 300
@@ -419,6 +426,117 @@ router.get('/api/orders/:id', (req, res) => {
     if (!order) return res.status(404).json({ ok: false, error: 'not found' });
     res.json({ ok: true, order });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ─── P13b: 発注残・消込 API ───
+const actorOf = req => (req.session && (req.session.email || req.session.displayName)) || 'portal';
+
+router.get('/api/backorders', (req, res) => {
+  try { res.json({ ok: true, ...listBackorders() }); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+router.get('/api/items/:itemId/events', (req, res) => {
+  try {
+    const itemId = Number(req.params.itemId);
+    if (!Number.isSafeInteger(itemId) || itemId <= 0) return res.status(400).json({ ok: false, error: 'itemIdが不正です' });
+    res.json({ ok: true, events: listItemEvents(itemId), balance: balanceOf(itemId) });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+/**
+ * 消込イベント登録 (入荷/減数/取消)。部分入荷時は remainder (三択) を同一トランザクションで適用する。
+ * body: { type, qty, reasonCode?, note?, effectiveDate?,
+ *         remainder?: { action: 'await_delivery'|'shortage'|'await_confirmation',
+ *                       nextExpectedDate?, nextExpectedQty?, nextActionDate?, reasonCode?, note? } }
+ */
+router.post('/api/items/:itemId/events', (req, res) => {
+  try {
+    const itemId = Number(req.params.itemId);
+    if (!Number.isSafeInteger(itemId) || itemId <= 0) return res.status(400).json({ ok: false, error: 'itemIdが不正です' });
+    const { type, qty, reasonCode, note, effectiveDate, remainder } = req.body || {};
+    if (!['receipt', 'shortage', 'cancel'].includes(type)) return res.status(400).json({ ok: false, error: 'typeが不正です' });
+    const actor = actorOf(req);
+    const db = getDB();
+    const run = () => db.transaction(() => {
+      const ev = appendPoItemEvent({
+        orderItemId: itemId, eventType: type, qty: Number(qty),
+        source: type === 'receipt' ? 'manual' : null,
+        reasonCode: type === 'shortage' ? (reasonCode || null) : null,
+        note: trimS(note) || null, effectiveDate: trimS(effectiveDate) || null,
+        actorType: 'user', actor,
+      });
+      // 残数が残る場合の三択 (要件F-2: 同一txnで必須。UI側も必須にするがサーバでも検証)
+      let plan = null;
+      if (ev.remaining > 0) {
+        const r = remainder || {};
+        if (r.action === 'await_delivery') {
+          plan = setItemPlan(itemId, {
+            remainder_disposition: 'awaiting_delivery',
+            next_expected_date: trimS(r.nextExpectedDate) || null,
+            next_expected_qty: r.nextExpectedQty != null && r.nextExpectedQty !== '' ? Number(r.nextExpectedQty) : ev.remaining,
+          }, { actorType: 'user', actor });
+        } else if (r.action === 'shortage') {
+          const sh = appendPoItemEvent({
+            orderItemId: itemId, eventType: 'shortage', qty: ev.remaining,
+            reasonCode: r.reasonCode || 'supplier_shortage', note: trimS(r.note) || null,
+            effectiveDate: trimS(effectiveDate) || null, actorType: 'user', actor,
+          });
+          ev.remaining = sh.remaining; ev.orderClosed = sh.orderClosed;
+        } else if (r.action === 'await_confirmation') {
+          plan = setItemPlan(itemId, {
+            remainder_disposition: 'awaiting_confirmation',
+            next_action_date: trimS(r.nextActionDate) || null,
+          }, { actorType: 'user', actor });
+        } else {
+          throw new Error('残数の扱い (分納待ち/減数で完了/確認中) を選択してください');
+        }
+      }
+      return { ...ev, plan };
+    }).immediate();
+    const { replay, result } = withCommand(
+      { idempotencyKey: trimS(req.get('Idempotency-Key')) || null, payload: { op: 'item_event', itemId, type, qty, reasonCode, note, effectiveDate, remainder } },
+      run
+    );
+    res.json({ ok: true, ...result, replay });
+  } catch (e) { res.status(e.status === 409 ? 409 : 400).json({ ok: false, error: e.message }); }
+});
+
+router.post('/api/events/:eventId/reverse', (req, res) => {
+  try {
+    const eventId = Number(req.params.eventId);
+    if (!Number.isSafeInteger(eventId) || eventId <= 0) return res.status(400).json({ ok: false, error: 'eventIdが不正です' });
+    const note = trimS((req.body || {}).note);
+    const result = reverseEvent(eventId, { note, actorType: 'user', actor: actorOf(req) });
+    res.json({ ok: true, ...result });
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+
+router.post('/api/orders/:id/close', (req, res) => {
+  try {
+    const orderId = Number(req.params.id);
+    if (!Number.isSafeInteger(orderId) || orderId <= 0) return res.status(400).json({ ok: false, error: 'idが不正です' });
+    const note = trimS((req.body || {}).note);
+    const result = manualCloseOrder(orderId, { note, actorType: 'user', actor: actorOf(req) });
+    res.json({ ok: true, ...result });
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+
+/** 納期・分納予定・disposition の更新 (現在値+履歴を同一txn) */
+router.patch('/api/items/:itemId/plan', (req, res) => {
+  try {
+    const itemId = Number(req.params.itemId);
+    if (!Number.isSafeInteger(itemId) || itemId <= 0) return res.status(400).json({ ok: false, error: 'itemIdが不正です' });
+    const b = req.body || {};
+    const patch = {};
+    for (const [k, col] of [['promisedDate', 'promised_date'], ['nextExpectedDate', 'next_expected_date'],
+      ['nextExpectedQty', 'next_expected_qty'], ['nextActionDate', 'next_action_date'], ['disposition', 'remainder_disposition']]) {
+      if (k in b) patch[col] = b[k] === '' ? null : b[k];
+    }
+    if (!Object.keys(patch).length) return res.status(400).json({ ok: false, error: '更新項目がありません' });
+    const result = setItemPlan(itemId, patch, { note: trimS(b.note) || null, actorType: 'user', actor: actorOf(req) });
+    res.json({ ok: true, ...result });
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
 // P13a: 台帳の整合性検査 (負残/closed不整合/発行取りこぼし/disposition規則)。P13bで管理画面に表示する
@@ -1252,6 +1370,7 @@ function pageShell(title, active, body, script) {
   <h1>📦 発注補助</h1>
   <nav class="tabs">
     ${tab('/apps/purchase-orders', 'ダッシュボード', 'dash')}
+    ${tab('/apps/purchase-orders/backorders', '発注残', 'backorders')}
     ${tab('/apps/purchase-orders/products', '全商品情報', 'products')}
     ${tab('/apps/purchase-orders/orders', '発注履歴', 'orders')}
     ${tab('/apps/purchase-orders/admin', 'マスタ管理', 'admin')}
@@ -1322,10 +1441,11 @@ router.get('/', (req, res) => {
     cards.sort((a, b) => b.targetCount - a.targetCount || b.estAmount - a.estAmount);
     others.sort((a, b) => b.productCount - a.productCount);
     const searchIndex = products.filter(p => p.active).map(p => ({ c: p.code, n: p.name, s: p.supplierCode }));
-    data = { pub, overlay, cards, others, searchIndex };
+    const boSummary = listBackorders().summary;
+    data = { pub, overlay, cards, others, searchIndex, boSummary };
   } catch (e) { return res.status(500).send('error: ' + he(e.message)); }
 
-  const { pub, overlay, cards, others, searchIndex } = data;
+  const { pub, overlay, cards, others, searchIndex, boSummary } = data;
   const stale = pub && pub.as_of_date ? (Date.now() - Date.parse(pub.as_of_date + 'T00:00:00+09:00')) > 3 * 86400000 : true;
   const freshNote = pub ? freshnessText(pub, overlay) : 'PML未同期';
   const cardHtml = c => `
@@ -1354,6 +1474,14 @@ router.get('/', (req, res) => {
       <span id="opStatus" class="muted"></span>
     </div>
     <div id="searchResult"></div>
+    ${boSummary.openOrders > 0 ? `
+    <a href="/apps/purchase-orders/backorders" class="sec" style="display:block;text-decoration:none;padding:10px 14px;margin-bottom:4px">
+      📦 <b>発注残 ${boSummary.openOrders}件</b>
+      <span class="muted">残数量 ${boSummary.remainingQty.toLocaleString('ja-JP')} / 既知単価分 ¥${boSummary.knownAmount.toLocaleString('ja-JP')}${boSummary.unknownCostItems ? ` (単価未設定 ${boSummary.unknownCostItems}明細)` : ''}</span>
+      ${boSummary.overdueItems ? `<span class="badge b-issued">🔴 納期超過 ${boSummary.overdueItems}明細</span>` : ''}
+      ${boSummary.attentionItems ? `<span class="badge b-draft">⚠️ 要対応 ${boSummary.attentionItems}明細</span>` : ''}
+      →
+    </a>` : ''}
     <h2 class="page" style="font-size:16px">発注が必要な仕入先 <span class="muted">(<span id="cntSup">${cards.length}</span>)</span></h2>
     <div class="cards" id="mainCards">${cards.map(cardHtml).join('')}</div>
     <div id="dashDis" style="margin-top:12px"></div>
@@ -1517,6 +1645,7 @@ router.get('/supplier/:code', (req, res) => {
         <span class="ftot" id="fTot">—</span>
         <button id="btnConds" class="fghost">📏 条件 <span id="fCond"></span></button>
         <input type="text" id="orderNote" placeholder="メモ (任意)">
+        <label class="muted" style="display:flex;align-items:center;gap:4px" title="仕入先への希望納期。確定後は発注残ページで回答納期・入荷を管理">納期 <input type="date" id="orderReqDate"></label>
         <button id="btnSave">💾 下書き保存</button>
         <button class="pri" id="btnIssue">✅ 発注確定</button>
       </div>
@@ -2222,6 +2351,8 @@ function save(issue) {
       msg = '⚠️ 未達の発注条件があります:\\n・' + cc.unmet.join('\\n・') + '\\n\\nこのまま確定しますか?';
     }
     if (cc.manual.length) msg += '\\n\\n※手動確認が必要な条件: ' + cc.manual.join(' / ');
+    var reqDate = document.getElementById('orderReqDate').value;
+    msg += '\\n\\n🗓 希望納期: ' + (reqDate || '指定なし');
     if (D.supplier.memo) msg += '\\n\\n📌 発注メモ: ' + D.supplier.memo;
     if (!confirm(msg)) return;
   }
@@ -2232,16 +2363,17 @@ function save(issue) {
   var url = '/apps/purchase-orders/api/supplier/' + encodeURIComponent(D.supplier.code) + (issue ? '/issue' : '/draft');
   fetch(url, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ items: items, note: document.getElementById('orderNote').value }),
+    body: JSON.stringify({ items: items, note: document.getElementById('orderNote').value,
+      requestedDate: issue ? (document.getElementById('orderReqDate').value || null) : null }),
   }).then(function(r){ return r.json(); }).then(function(j) {
     unlock();
     if (!j.ok) { toast('エラー: ' + j.error); return; }
     if (issue) {
-      showDone(j.id); // CART を読むのでクリア前に
+      showDone(j.id, j.poNumber); // CART を読むのでクリア前に
       CART = {};
       document.querySelectorAll('input[data-code]').forEach(function(inp){ inp.value = ''; });
       renderAll();
-      toast('発注確定しました');
+      toast('発注確定しました (' + (j.poNumber || '#' + j.id) + ')');
     }
     else toast(j.deleted ? '下書きを削除しました' : '下書きを保存しました');
   }).catch(function(e){ unlock(); toast('通信エラー: ' + e.message); });
@@ -2250,7 +2382,7 @@ function copyText(text, btn) {
   navigator.clipboard.writeText(text).then(function(){ toast('コピーしました'); },
     function(){ toast('コピーに失敗しました。手動で選択してください'); });
 }
-function showDone(orderId) {
+function showDone(orderId, poNumber) {
   var items = cartItems();
   var lines = items.map(function(i){ return i.code + '\\t' + (byCode[i.code] ? byCode[i.code].name : '') + '\\t' + i.qty; });
   var text = lines.join('\\n');
@@ -2258,8 +2390,9 @@ function showDone(orderId) {
   var totA = 0;
   items.forEach(function(i){ totA += i.qty * (byCode[i.code].cost || 0); });
   document.getElementById('doneBody').innerHTML =
-    '<div class="tot">発注 #' + orderId + ' — ' + items.length + ' SKU / 合計 ' + yen(totA) +
-    ' <button class="pri" id="btnCopy">📋 リストをコピー</button> <button id="btnCsv">⬇ CSVダウンロード</button> <a href="/apps/purchase-orders/orders">履歴を見る →</a></div>' +
+    '<div class="tot">発注 ' + esc(poNumber || ('#' + orderId)) + ' — ' + items.length + ' SKU / 合計 ' + yen(totA) +
+    ' <button class="pri" id="btnCopy">📋 リストをコピー</button> <button id="btnCsv">⬇ CSVダウンロード</button>' +
+    ' <a href="/apps/purchase-orders/backorders">発注残で管理 →</a> <a href="/apps/purchase-orders/orders">履歴を見る →</a></div>' +
     '<pre class="copy">' + esc('商品コード\\t商品名\\t数量\\n' + text) + '</pre>';
   area.style.display = '';
   document.getElementById('btnCopy').addEventListener('click', function(){ copyText(text); });
@@ -2498,6 +2631,308 @@ render();`;
 });
 
 // ─── 画面3: 発注履歴 ───
+// ─── 画面: 発注残 (P13b) ───
+router.get('/backorders', (req, res) => {
+  const body = `
+    <h2 class="page">発注残 <span class="muted" style="font-size:12px">発注→入荷・減数・取消の消込を管理 (アプリ発注分のみ。切替までNE登録は継続)</span></h2>
+    <div id="integrity"></div>
+    <div class="tabbar" id="boTabs">
+      <button data-view="attention" class="on">⚠️ 要対応</button>
+      <button data-view="open">オープン</button>
+      <button data-view="closed">完了</button>
+      <span class="muted" id="boCount" style="margin-left:8px"></span>
+    </div>
+    <div id="boList">読み込み中…</div>`;
+  const script = `
+var API = '/apps/purchase-orders/api';
+var DATA = null, VIEW = 'attention', OPENED = {};
+var REASONS = { supplier_shortage: '仕入先都合 (作れない)', own_decision: '自社判断', cutoff: '打切', other: 'その他', correction: '訂正' };
+var EVLABEL = { receipt: '📥入荷', shortage: '➖減数', cancel: '🚫取消', reversal: '↩逆仕訳' };
+
+function fmtD(s) { return s ? String(s).slice(0, 10) : '—'; }
+function post(url, body) {
+  return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    .then(function(r){ return r.json(); });
+}
+function patch(url, body) {
+  return fetch(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    .then(function(r){ return r.json(); });
+}
+
+function load() {
+  fetch(API + '/backorders').then(function(r){ return r.json(); }).then(function(j) {
+    if (!j.ok) { document.getElementById('boList').textContent = 'エラー: ' + j.error; return; }
+    DATA = j; render();
+  });
+  fetch(API + '/ledger/integrity').then(function(r){ return r.json(); }).then(function(j) {
+    if (!j.ok) return;
+    var el = document.getElementById('integrity');
+    var h = '';
+    if (j.issues.length) h += '<div class="warn">🚨 台帳の整合性違反 ' + j.issues.length + '件: ' + esc(j.issues.slice(0,5).map(function(x){ return x.kind + (x.orderId ? ' order:' + x.orderId : x.itemId ? ' item:' + x.itemId : ''); }).join(' / ')) + (j.issues.length > 5 ? ' …' : '') + '</div>';
+    el.innerHTML = h;
+  });
+}
+
+function orderMatchesView(o) {
+  if (VIEW === 'closed') return !o.open;
+  if (VIEW === 'open') return o.open;
+  return o.open && o.attentionItems > 0; // 要対応
+}
+
+function badge(cls, text, title) { return '<span class="badge ' + cls + '"' + (title ? ' title="' + esc(title) + '"' : '') + '>' + esc(text) + '</span>'; }
+
+function itemFlagBadges(i) {
+  var h = '';
+  if (i.flags.overdue) h += badge('b-issued', '🔴 納期超過', '納期 ' + fmtD(i.due) + ' を過ぎて残数あり');
+  if (i.remaining_qty > 0 && i.flags.unanswered) h += badge('b-draft', '納期未回答');
+  if (i.flags.needsDisposition) h += badge('b-draft', '⚠️ 残数の扱い未選択');
+  if (i.flags.confirmOverdue) h += badge('b-issued', '⏰ 確認期限超過');
+  return h;
+}
+
+function dispText(i) {
+  if (i.remainder_disposition === 'awaiting_delivery') return '🚚 分納待ち ' + fmtD(i.next_expected_date) + ' ×' + (i.next_expected_qty || '?');
+  if (i.remainder_disposition === 'awaiting_confirmation') return '📞 確認中 (期限 ' + fmtD(i.next_action_date) + ')';
+  return '';
+}
+
+function render() {
+  var list = DATA.orders.filter(orderMatchesView);
+  var counts = { attention: 0, open: 0, closed: 0 };
+  DATA.orders.forEach(function(o) {
+    if (o.open) { counts.open++; if (o.attentionItems > 0) counts.attention++; } else counts.closed++;
+  });
+  document.querySelectorAll('#boTabs button').forEach(function(b) {
+    var v = b.getAttribute('data-view');
+    b.classList.toggle('on', v === VIEW);
+    b.textContent = (v === 'attention' ? '⚠️ 要対応' : v === 'open' ? 'オープン' : '完了') + ' (' + counts[v] + ')';
+  });
+  var s = DATA.summary;
+  document.getElementById('boCount').textContent =
+    'オープン' + s.openOrders + '件 / 残数量 ' + s.remainingQty.toLocaleString('ja-JP') +
+    ' / 既知単価分 ' + yen(s.knownAmount) + (s.unknownCostItems ? ' (単価未設定 ' + s.unknownCostItems + '明細)' : '');
+  if (!DATA.boundary) {
+    document.getElementById('boList').innerHTML = '<div class="muted">まだ発注残管理の対象がありません。次にアプリで発注確定した分から管理が始まります。</div>';
+    return;
+  }
+  if (!list.length) {
+    document.getElementById('boList').innerHTML = '<div class="muted">' + (VIEW === 'attention' ? '要対応の発注はありません 🎉' : '該当する発注はありません') + '</div>';
+    return;
+  }
+  var h = '';
+  list.forEach(function(o) { h += orderHtml(o); });
+  document.getElementById('boList').innerHTML = h;
+  // 展開状態を復元
+  Object.keys(OPENED).forEach(function(id) { if (OPENED[id]) { var el = document.getElementById('items-' + id); if (el) el.style.display = ''; } });
+}
+
+function orderHtml(o) {
+  var st = o.open
+    ? (o.remainingQty > 0 && o.items.some(function(i){ return i.received_qty > 0; }) ? badge('b-draft', '一部入荷') : badge('b-issued', 'オープン'))
+    : badge('b-issued', o.closeReason === 'manual' ? '完了 (打切あり)' : '完了');
+  var flags = '';
+  if (o.overdueItems) flags += badge('b-issued', '🔴 遅延 ' + o.overdueItems + '明細');
+  else if (o.attentionItems) flags += badge('b-draft', '⚠️ 要対応 ' + o.attentionItems + '明細');
+  var h = '<div class="sec"><h2 style="cursor:pointer" data-toggle="' + o.id + '">' +
+    esc(o.poNumber || ('#' + o.id)) + ' — <a href="/apps/purchase-orders/supplier/' + encodeURIComponent(o.supplierCode) + '">' + esc(o.supplierName) + '</a> ' +
+    st + ' ' + flags +
+    '<span class="muted" style="font-weight:normal;font-size:12px;margin-left:8px">発注 ' + fmtD(o.issuedAt) + ' / 希望納期 ' + fmtD(o.requestedDate) +
+    ' / 残 ' + o.remainingQty.toLocaleString('ja-JP') + ' (' + yen(o.knownAmount) + ')' + (o.note ? ' / 📝' + esc(o.note) : '') + '</span></h2>' +
+    '<div class="bd" id="items-' + o.id + '" style="display:none;max-height:none">';
+  h += '<table class="t"><tr><th>商品</th><th class="r">発注</th><th class="r">入荷済</th><th class="r">減数</th><th class="r">取消</th><th class="r">残</th><th>納期 (希望→回答)</th><th>残数の扱い</th><th></th></tr>';
+  o.items.forEach(function(i) {
+    h += '<tr data-item="' + i.id + '">' +
+      '<td><b>' + esc(i.product_code) + '</b><div class="muted" style="font-size:11px">' + esc(i.product_name || '') + '</div>' + itemFlagBadges(i) + '</td>' +
+      '<td class="r">' + i.qty + '</td><td class="r">' + i.received_qty + '</td><td class="r">' + i.shortage_qty + '</td><td class="r">' + i.cancelled_qty + '</td>' +
+      '<td class="r"><b>' + i.remaining_qty + '</b></td>' +
+      '<td>' + fmtD(i.requested_date) + ' → <span data-pedit="' + i.id + '" style="cursor:pointer;text-decoration:underline dotted" title="クリックで回答納期を入力">' + fmtD(i.promised_date) + '</span></td>' +
+      '<td>' + dispText(i) + '</td>' +
+      '<td class="r" style="white-space:nowrap">' +
+        (o.open && i.remaining_qty > 0
+          ? '<button class="ghost" data-act="receipt" data-item2="' + i.id + '">📥入荷</button> ' +
+            '<button class="ghost" data-act="shortage" data-item2="' + i.id + '">➖減数</button> ' +
+            '<button class="ghost" data-act="cancel" data-item2="' + i.id + '">🚫取消</button> '
+          : '') +
+        (i.event_count > 0 ? '<button class="ghost" data-hist="' + i.id + '">履歴</button>' : '') +
+      '</td></tr>' +
+      '<tr id="panel-' + i.id + '" style="display:none"><td colspan="9" id="panelBody-' + i.id + '"></td></tr>';
+  });
+  h += '</table>';
+  if (o.open) {
+    h += '<div style="margin-top:8px" id="closeArea-' + o.id + '">' +
+      '<button class="ghost" data-closeui="' + o.id + '">✅ 残数を打切って完了にする (手動クローズ)</button></div>';
+  }
+  h += '</div></div>';
+  return h;
+}
+
+// ── 消込入力パネル ──
+function actPanel(itemId, act) {
+  var item = findItem(itemId);
+  if (!item) return;
+  var today = new Date(Date.now() + 9 * 3600000).toISOString().slice(0, 10);
+  var isShort = act === 'shortage';
+  var label = act === 'receipt' ? '入荷' : isShort ? '減数 (作れなかった分の消込)' : '取消';
+  var h = '<div class="import-zone" style="margin:6px 0"><b>' + EVLABEL[act] + ' — 残 ' + item.remaining_qty + '</b><div class="row" style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">' +
+    '数量 <input type="number" id="evQty" min="1" max="' + item.remaining_qty + '" value="' + item.remaining_qty + '" style="width:90px">' +
+    ' 日付 <input type="date" id="evDate" value="' + today + '">' +
+    (isShort ? ' 理由 <select id="evReason"><option value="supplier_shortage">仕入先都合 (作れない)</option><option value="own_decision">自社判断</option><option value="other">その他</option></select>' : '') +
+    ' メモ <input type="text" id="evNote" placeholder="' + (isShort ? '理由=その他は必須' : '任意') + '" style="width:180px">' +
+    '</div>' +
+    '<div id="remBox" style="margin-top:8px;display:none"><b>残りの扱い (必須)</b>: ' +
+      '<label><input type="radio" name="rem" value="await_delivery" checked> 🚚 分納待ち</label> ' +
+      '<label><input type="radio" name="rem" value="shortage"> ➖ 残りは減数で完了</label> ' +
+      '<label><input type="radio" name="rem" value="await_confirmation"> 📞 確認中</label>' +
+      '<span id="remFields" style="margin-left:8px"></span></div>' +
+    '<div style="margin-top:8px"><button class="pri" id="evGo">登録する</button> <button class="ghost" id="evCancel">やめる</button> <span id="evPrev" class="muted"></span></div></div>';
+  showPanel(itemId, h);
+  var qtyEl = document.getElementById('evQty');
+  function refresh() {
+    var q = Number(qtyEl.value) || 0;
+    var remain = item.remaining_qty - q;
+    document.getElementById('evPrev').textContent = q > 0 && q <= item.remaining_qty ? ('→ 登録後の残数 ' + remain) : '';
+    document.getElementById('remBox').style.display = (remain > 0 && q > 0) ? '' : 'none';
+    remFields();
+  }
+  function remFields() {
+    var v = (document.querySelector('input[name=rem]:checked') || {}).value;
+    var q = Number(qtyEl.value) || 0;
+    var remain = item.remaining_qty - q;
+    var el = document.getElementById('remFields');
+    if (v === 'await_delivery') el.innerHTML = '次回予定日 <input type="date" id="remDate"> 数量 <input type="number" id="remQty" min="1" max="' + remain + '" value="' + remain + '" style="width:80px">';
+    else if (v === 'shortage') el.innerHTML = '理由 <select id="remReason"><option value="supplier_shortage">仕入先都合</option><option value="own_decision">自社判断</option><option value="other">その他</option></select> <input type="text" id="remNote" placeholder="メモ (その他は必須)" style="width:160px">';
+    else el.innerHTML = '確認期限 <input type="date" id="remActDate">';
+  }
+  qtyEl.addEventListener('input', refresh);
+  document.querySelectorAll('input[name=rem]').forEach(function(x){ x.addEventListener('change', remFields); });
+  refresh();
+  document.getElementById('evCancel').addEventListener('click', function(){ hidePanel(itemId); });
+  document.getElementById('evGo').addEventListener('click', function() {
+    var q = Number(qtyEl.value);
+    var body = { type: act, qty: q, effectiveDate: document.getElementById('evDate').value,
+      note: document.getElementById('evNote').value,
+      reasonCode: isShort ? document.getElementById('evReason').value : null };
+    if (item.remaining_qty - q > 0) {
+      var v = (document.querySelector('input[name=rem]:checked') || {}).value;
+      if (v === 'await_delivery') body.remainder = { action: 'await_delivery', nextExpectedDate: (document.getElementById('remDate') || {}).value, nextExpectedQty: (document.getElementById('remQty') || {}).value };
+      else if (v === 'shortage') body.remainder = { action: 'shortage', reasonCode: (document.getElementById('remReason') || {}).value, note: (document.getElementById('remNote') || {}).value };
+      else body.remainder = { action: 'await_confirmation', nextActionDate: (document.getElementById('remActDate') || {}).value };
+    }
+    var btn = document.getElementById('evGo');
+    btn.disabled = true;
+    post(API + '/items/' + itemId + '/events', body).then(function(j) {
+      btn.disabled = false;
+      if (!j.ok) { toast('エラー: ' + j.error); return; }
+      toast(label + 'を登録しました (残 ' + j.remaining + (j.orderClosed ? '、発注完了' : '') + ')');
+      load();
+    }).catch(function(e){ btn.disabled = false; toast('通信エラー: ' + e.message); });
+  });
+}
+
+// ── 明細イベント履歴 (+逆仕訳) ──
+function histPanel(itemId) {
+  fetch(API + '/items/' + itemId + '/events').then(function(r){ return r.json(); }).then(function(j) {
+    if (!j.ok) { toast(j.error); return; }
+    var h = '<table class="t"><tr><th>#</th><th>種別</th><th class="r">数量</th><th>業務日付</th><th>理由/メモ</th><th>登録</th><th></th></tr>';
+    j.events.forEach(function(e) {
+      var dead = e.reversed_by != null;
+      var canRev = !dead && e.event_type !== 'reversal';
+      h += '<tr' + (dead ? ' style="opacity:.5;text-decoration:line-through"' : '') + '><td>' + e.id + '</td>' +
+        '<td>' + EVLABEL[e.event_type] + (e.event_type === 'reversal' ? ' → #' + e.reverses_id : '') + (dead ? ' (逆仕訳済)' : '') + '</td>' +
+        '<td class="r">' + e.qty + '</td><td>' + esc(e.effective_date) + '</td>' +
+        '<td>' + esc((REASONS[e.reason_code] || e.reason_code || '') + (e.note ? ' / ' + e.note : '')) + '</td>' +
+        '<td class="muted" style="font-size:11px">' + esc(String(e.recorded_at).slice(0, 16).replace('T', ' ')) + ' ' + esc(e.actor || '') + '</td>' +
+        '<td>' + (canRev ? '<button class="ghost" data-rev="' + e.id + '" data-revitem="' + itemId + '">↩逆仕訳</button>' : '') + '</td></tr>';
+    });
+    h += '</table><div id="revBox-' + itemId + '" style="margin-top:6px"></div><button class="ghost" data-histclose="' + itemId + '">閉じる</button>';
+    showPanel(itemId, h);
+  });
+}
+
+function findItem(itemId) {
+  var found = null;
+  DATA.orders.forEach(function(o){ o.items.forEach(function(i){ if (i.id === Number(itemId)) found = i; }); });
+  return found;
+}
+function showPanel(itemId, html) {
+  document.querySelectorAll('tr[id^=panel-]').forEach(function(tr){ tr.style.display = 'none'; });
+  document.getElementById('panelBody-' + itemId).innerHTML = html;
+  document.getElementById('panel-' + itemId).style.display = '';
+}
+function hidePanel(itemId) { document.getElementById('panel-' + itemId).style.display = 'none'; }
+
+document.addEventListener('click', function(ev) {
+  var t = ev.target;
+  var g = function(a){ return t.getAttribute && t.getAttribute(a); };
+  var v;
+  if ((v = g('data-view'))) { VIEW = v; render(); return; }
+  if ((v = g('data-toggle'))) {
+    var el = document.getElementById('items-' + v);
+    OPENED[v] = el.style.display === 'none';
+    el.style.display = OPENED[v] ? '' : 'none';
+    return;
+  }
+  if ((v = g('data-act'))) { actPanel(g('data-item2'), v); return; }
+  if ((v = g('data-hist'))) { histPanel(v); return; }
+  if ((v = g('data-histclose'))) { hidePanel(v); return; }
+  // 逆仕訳: 理由入力 → 確定 (promptは使わない)
+  if ((v = g('data-rev'))) {
+    var itemId = g('data-revitem');
+    var box = document.getElementById('revBox-' + itemId);
+    box.innerHTML = '<b>↩ イベント#' + v + ' を逆仕訳</b> (全量が打ち消され、残数が戻ります) ' +
+      '理由 <input type="text" id="revNote" placeholder="例: 数量の入力ミス" style="width:220px"> ' +
+      '<button class="pri" id="revGo">逆仕訳を実行</button>';
+    document.getElementById('revGo').addEventListener('click', function() {
+      var note = document.getElementById('revNote').value;
+      if (!note.trim()) { toast('訂正理由を入力してください'); return; }
+      post(API + '/events/' + v + '/reverse', { note: note }).then(function(j) {
+        if (!j.ok) { toast('エラー: ' + j.error); return; }
+        toast('逆仕訳しました (残 ' + j.remaining + ')');
+        load();
+      });
+    });
+    return;
+  }
+  // 手動クローズ: 理由入力 → 確定
+  if ((v = g('data-closeui'))) {
+    var area = document.getElementById('closeArea-' + v);
+    area.innerHTML = '<div class="import-zone"><b>✅ 手動クローズ</b> — 残数すべてを「打切」の減数として消し込み、この発注を完了にします。' +
+      '<div style="margin-top:6px">理由 <input type="text" id="clNote" placeholder="例: 仕入先廃番のため" style="width:260px"> ' +
+      '<button class="pri" id="clGo">クローズ実行</button> <button class="ghost" id="clCancel">やめる</button></div></div>';
+    document.getElementById('clCancel').addEventListener('click', load);
+    document.getElementById('clGo').addEventListener('click', function() {
+      var note = document.getElementById('clNote').value;
+      if (!note.trim()) { toast('理由を入力してください'); return; }
+      post(API + '/orders/' + v + '/close', { note: note }).then(function(j) {
+        if (!j.ok) { toast('エラー: ' + j.error); return; }
+        toast('クローズしました (打切 ' + j.cutoffItems + '明細)');
+        load();
+      });
+    });
+    return;
+  }
+  // 回答納期の編集
+  if ((v = g('data-pedit'))) {
+    var item = findItem(v);
+    var cell = t.parentNode;
+    cell.innerHTML = fmtD(item.requested_date) + ' → <input type="date" id="pd-' + v + '" value="' + (item.promised_date || '') + '" style="width:130px"> ' +
+      '<button class="pri" data-pdsave="' + v + '">保存</button>';
+    return;
+  }
+  if ((v = g('data-pdsave'))) {
+    var val = document.getElementById('pd-' + v).value;
+    patch(API + '/items/' + v + '/plan', { promisedDate: val || '' }).then(function(j) {
+      if (!j.ok) { toast('エラー: ' + j.error); return; }
+      toast('回答納期を保存しました');
+      load();
+    });
+    return;
+  }
+});
+load();`;
+  res.send(pageShell('発注補助 — 発注残', 'backorders', body, script));
+});
+
 router.get('/orders', (req, res) => {
   const body = `
     <h2 class="page">発注履歴</h2>
@@ -2508,13 +2943,19 @@ function load() {
   fetch('/apps/purchase-orders/api/orders').then(function(r){ return r.json(); }).then(function(j) {
     if (!j.ok) { document.getElementById('list').textContent = 'エラー: ' + j.error; return; }
     if (!j.orders.length) { document.getElementById('list').innerHTML = '<div class="muted">履歴はまだありません</div>'; return; }
-    var h = '<table class="t"><tr><th>#</th><th>状態</th><th>仕入先</th><th class="r">SKU</th><th class="r">数量</th><th class="r">金額(原価)</th><th>確定日時</th><th>メモ</th><th></th></tr>';
+    var h = '<table class="t"><tr><th>PO番号</th><th>状態</th><th>仕入先</th><th class="r">SKU</th><th class="r">数量</th><th class="r">発注残</th><th class="r">金額(原価)</th><th>確定日時</th><th>メモ</th><th></th></tr>';
     j.orders.forEach(function(o) {
-      var st = o.status === 'issued' ? '<span class="badge b-issued">確定</span>' : '<span class="badge b-draft">下書き</span>';
+      var st;
+      if (o.status !== 'issued') st = '<span class="badge b-draft">下書き</span>';
+      else if (o.tracking_mode !== 'tracked') st = '<span class="badge b-issued">確定</span>';
+      else if (o.closed_at) st = '<span class="badge b-issued">完了</span>';
+      else st = '<span class="badge b-draft">発注残 ' + o.remaining_qty + '</span>';
       var when = o.issued_at ? new Date(o.issued_at).toLocaleString('ja-JP') : '—';
-      h += '<tr><td>' + o.id + '</td><td>' + st + '</td>' +
+      h += '<tr><td>' + esc(o.po_number || ('#' + o.id)) + '</td><td>' + st + '</td>' +
         '<td><a href="/apps/purchase-orders/supplier/' + encodeURIComponent(o.supplier_code) + '">' + esc(o.supplier_name) + '</a></td>' +
-        '<td class="r">' + o.sku_count + '</td><td class="r">' + o.total_qty.toLocaleString('ja-JP') + '</td><td class="r">' + yen(o.total_amount) + '</td>' +
+        '<td class="r">' + o.sku_count + '</td><td class="r">' + o.total_qty.toLocaleString('ja-JP') + '</td>' +
+        '<td class="r">' + (o.tracking_mode === 'tracked' ? o.remaining_qty.toLocaleString('ja-JP') : '—') + '</td>' +
+        '<td class="r">' + yen(o.total_amount) + '</td>' +
         '<td>' + when + '</td><td>' + esc(o.note || '') + '</td>' +
         '<td><button class="ghost" data-id="' + o.id + '">明細</button></td></tr>';
     });

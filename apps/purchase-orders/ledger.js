@@ -353,18 +353,8 @@ export function setItemPlan(orderItemId, patch, { note = null, actorType = 'user
     const next = { ...item };
     for (const f of PLAN_FIELDS) if (f in patch) next[f] = patch[f] == null ? null : patch[f];
 
-    // 型・形式
-    for (const f of ['promised_date', 'next_expected_date', 'next_action_date']) {
-      if (next[f] != null && !isYmd(String(next[f]))) throw new Error(`${f} が日付 (YYYY-MM-DD) ではありません: ${next[f]}`);
-    }
-    if (next.next_expected_qty != null) {
-      const q = Number(next.next_expected_qty);
-      if (!Number.isInteger(q) || q <= 0) throw new Error(`next_expected_qty が不正です: ${next.next_expected_qty}`);
-      const bal = balanceOf(orderItemId, db);
-      if (q > bal.remaining_qty) throw new Error(`次回予定数量が残数 (${bal.remaining_qty}) を超えています`);
-      next.next_expected_qty = q;
-    }
-    // 列間規則
+    // 列間規則の正規化を先に行う (確認中へ切替時は next_expected_* を落としてから検証する。
+    // 逆順だと切替前の古い next_expected_qty が残数チェックに引っかかる)
     const d = next.remainder_disposition;
     if (d != null && d !== 'awaiting_delivery' && d !== 'awaiting_confirmation') throw new Error(`disposition が不正です: ${d}`);
     if (d === 'awaiting_delivery') {
@@ -375,6 +365,17 @@ export function setItemPlan(orderItemId, patch, { note = null, actorType = 'user
       next.next_expected_date = null; next.next_expected_qty = null;
     } else {
       next.next_expected_date = null; next.next_expected_qty = null; next.next_action_date = null;
+    }
+    // 型・形式 (正規化後の最終値に対して検証)
+    for (const f of ['promised_date', 'next_expected_date', 'next_action_date']) {
+      if (next[f] != null && !isYmd(String(next[f]))) throw new Error(`${f} が日付 (YYYY-MM-DD) ではありません: ${next[f]}`);
+    }
+    if (next.next_expected_qty != null) {
+      const q = Number(next.next_expected_qty);
+      if (!Number.isInteger(q) || q <= 0) throw new Error(`next_expected_qty が不正です: ${next.next_expected_qty}`);
+      const bal = balanceOf(orderItemId, db);
+      if (q > bal.remaining_qty) throw new Error(`次回予定数量が残数 (${bal.remaining_qty}) を超えています`);
+      next.next_expected_qty = q;
     }
 
     // 変更履歴 (change_id で束ねる) → 現在値更新
@@ -389,6 +390,77 @@ export function setItemPlan(orderItemId, patch, { note = null, actorType = 'user
     return { changed: changed.length, changeId };
   });
   return tx.immediate();
+}
+
+// ─── 発注残一覧 (P13b) ───
+
+/**
+ * tracked な発注の一覧+明細残数+要対応フラグ+サマリを返す (発注残ページ・ダッシュボード用)。
+ * 遅延判定の基準日 = 回答納期 (promised) → 希望納期 (requested) の優先順。
+ */
+export function listBackorders() {
+  const db = getDB();
+  const boundary = getSetting('tracking_started_at');
+  const summary = { openOrders: 0, remainingQty: 0, knownAmount: 0, unknownCostItems: 0, overdueItems: 0, attentionItems: 0 };
+  if (!boundary) return { boundary: null, orders: [], summary };
+  const today = jstToday();
+  const orders = db.prepare(`
+    SELECT id, supplier_code, supplier_name, po_number, note, requested_date, issued_at, closed_at, origin, send_blocked
+    FROM po_orders WHERE status='issued' AND issued_at >= ? ORDER BY (closed_at IS NULL) DESC, issued_at DESC`).all(boundary);
+  const itemsStmt = db.prepare(`
+    SELECT i.id, i.product_code, i.product_name, i.qty, i.unit_cost,
+           i.requested_date, i.promised_date, i.next_expected_date, i.next_expected_qty, i.next_action_date, i.remainder_disposition,
+           b.received_qty, b.shortage_qty, b.cancelled_qty, b.cutoff_qty, b.remaining_qty,
+           (SELECT COUNT(*) FROM po_item_events e WHERE e.order_item_id = i.id) AS event_count
+    FROM po_order_items i JOIN v_po_item_balance b ON b.order_item_id = i.id
+    WHERE i.order_id = ? ORDER BY i.id`);
+  const out = [];
+  for (const o of orders) {
+    const items = itemsStmt.all(o.id).map(i => {
+      const due = i.promised_date || i.requested_date || null;
+      return {
+        ...i,
+        due,
+        flags: {
+          overdue: i.remaining_qty > 0 && !!due && due < today,
+          unanswered: i.remaining_qty > 0 && !i.promised_date,
+          needsDisposition: i.remaining_qty > 0 && i.event_count > 0 && !i.remainder_disposition,
+          confirmOverdue: i.remainder_disposition === 'awaiting_confirmation' && !!i.next_action_date && i.next_action_date < today,
+        },
+      };
+    });
+    const open = !o.closed_at;
+    const remainingQty = items.reduce((s, i) => s + i.remaining_qty, 0);
+    const knownAmount = items.reduce((s, i) => s + (i.unit_cost != null ? Math.round(i.unit_cost * i.remaining_qty) : 0), 0);
+    const unknownCostItems = items.filter(i => i.unit_cost == null && i.remaining_qty > 0).length;
+    const overdueItems = items.filter(i => i.flags.overdue).length;
+    const attentionItems = items.filter(i => i.flags.overdue || i.flags.needsDisposition || i.flags.confirmOverdue).length;
+    if (open) {
+      summary.openOrders++;
+      summary.remainingQty += remainingQty;
+      summary.knownAmount += knownAmount;
+      summary.unknownCostItems += unknownCostItems;
+      summary.overdueItems += overdueItems;
+      summary.attentionItems += attentionItems;
+    }
+    out.push({
+      id: o.id, poNumber: o.po_number, supplierCode: o.supplier_code, supplierName: o.supplier_name,
+      note: o.note, requestedDate: o.requested_date, issuedAt: o.issued_at, closedAt: o.closed_at,
+      origin: o.origin, open,
+      closeReason: o.closed_at ? (items.some(i => i.cutoff_qty > 0) ? 'manual' : 'completed') : null,
+      remainingQty, knownAmount, unknownCostItems, overdueItems, attentionItems,
+      items,
+    });
+  }
+  return { boundary, orders: out, summary };
+}
+
+/** 明細1件のイベント系列 (表示用。逆仕訳済み・逆仕訳自体も含めて時系列で返す) */
+export function listItemEvents(orderItemId) {
+  const db = getDB();
+  return db.prepare(`
+    SELECT e.*, (SELECT r.id FROM po_item_events r WHERE r.reverses_id = e.id) AS reversed_by
+    FROM po_item_events e WHERE e.order_item_id = ? ORDER BY e.id`).all(orderItemId);
 }
 
 // ─── 整合性検査 (3層のうちの全件検査。対象PO限定は orderId 指定) ───
