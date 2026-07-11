@@ -476,16 +476,29 @@ export function checkLedgerIntegrity({ orderId = null } = {}) {
       issues.push({ kind: 'events_on_untracked', orderId: r.id });
     }
   }
-  // 4b. イベント意味論の検算 (CHECK/トリガの防波堤。メンテモード・移行後検査用)
+  // 4b. イベント意味論の検算 (テーブルCHECKと同値になるよう網羅。メンテモード・移行後検査用)
   for (const r of db.prepare(`
-    SELECT e.id, e.event_type, e.source, e.reason_code, e.note, e.inbound_item_id FROM po_item_events e
+    SELECT e.id, e.event_type, e.source, e.reason_code, e.note, e.inbound_item_id, e.qty FROM po_item_events e
     JOIN po_order_items i ON i.id = e.order_item_id JOIN po_orders o ON o.id = i.order_id WHERE 1=1 ${scope}`).all(...args)) {
+    const noteOk = !!(r.note && String(r.note).trim());
     const bad =
+      !['receipt', 'shortage', 'cancel', 'reversal'].includes(r.event_type) ||
+      !(Number.isInteger(r.qty) && r.qty > 0) ||
+      (r.source != null && !['manual', 'logizard', 'migration'].includes(r.source)) ||
       (r.event_type === 'receipt' && (!r.source || r.reason_code != null || ((r.source === 'logizard') !== (r.inbound_item_id != null)))) ||
-      (r.event_type === 'shortage' && (!['supplier_shortage', 'own_decision', 'cutoff', 'other'].includes(r.reason_code) || r.source != null || r.inbound_item_id != null)) ||
+      (r.event_type === 'shortage' && (!['supplier_shortage', 'own_decision', 'cutoff', 'other'].includes(r.reason_code) || r.source != null || r.inbound_item_id != null || (r.reason_code === 'other' && !noteOk))) ||
       (r.event_type === 'cancel' && (r.reason_code != null || r.source != null || r.inbound_item_id != null)) ||
-      (r.event_type === 'reversal' && (r.reason_code !== 'correction' || !(r.note && String(r.note).trim())));
+      (r.event_type === 'reversal' && (r.reason_code !== 'correction' || !noteOk || r.source != null || r.inbound_item_id != null));
     if (bad) issues.push({ kind: 'invalid_event_semantics', eventId: r.id, detail: r.event_type });
+  }
+  // 4c. tracked issued なのに明細ゼロ (直接INSERT等の異常系。JOIN v_po_item_balance では拾えない)
+  if (boundary) {
+    for (const r of db.prepare(`
+      SELECT o.id FROM po_orders o
+      WHERE o.status='issued' AND o.issued_at >= ?
+        AND NOT EXISTS (SELECT 1 FROM po_order_items i WHERE i.order_id = o.id) ${scope}`).all(boundary, ...args)) {
+      issues.push({ kind: 'issued_without_items', orderId: r.id });
+    }
   }
   // 5. disposition/next_* の列間規則 (next_expected_qty 単独残骸も対象に含める)
   for (const r of db.prepare(`
@@ -507,6 +520,15 @@ export function checkLedgerIntegrity({ orderId = null } = {}) {
       issues.push({ kind: 'disposition_rule', itemId: r.id, detail: 'dispositionなしでnext_*あり' });
     } else if (r.neq != null && r.neq > r.rem) {
       issues.push({ kind: 'disposition_rule', itemId: r.id, detail: `次回予定数量${r.neq} > 残数${r.rem}` });
+    }
+  }
+  // 5b. 納期系日付の実在検査 (GLOB/トリガは字面のみのため)
+  for (const r of db.prepare(`
+    SELECT i.id, i.promised_date AS pd, i.next_expected_date AS ned, i.next_action_date AS nad
+    FROM po_order_items i JOIN po_orders o ON o.id = i.order_id
+    WHERE (i.promised_date IS NOT NULL OR i.next_expected_date IS NOT NULL OR i.next_action_date IS NOT NULL) ${scope}`).all(...args)) {
+    for (const [f, v] of [['promised_date', r.pd], ['next_expected_date', r.ned], ['next_action_date', r.nad]]) {
+      if (v != null && !isYmd(String(v))) issues.push({ kind: 'invalid_date', itemId: r.id, detail: `${f}=${v}` });
     }
   }
   // 6. 実在しない業務日付 (GLOBは形式のみのため)

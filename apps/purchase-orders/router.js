@@ -386,9 +386,9 @@ router.post('/api/supplier/:code/issue', (req, res) => {
     const { items, note, requestedDate } = req.body || {};
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ ok: false, error: '発注明細が空です' });
     // Idempotency-Key があれば再送しても同じ発注を二重作成しない (レスポンス消失・リトライ対策)。
-    // payload は明細を商品コード順の最小形に正規化 (並び順・余計なフィールドの違いで409にしない)
-    const canonicalItems = items.map(i => ({ code: trimS(i && i.code), qty: Number(i && i.qty) }))
-      .sort((a, b) => a.code.localeCompare(b.code));
+    // payload は明細を発行処理と同じ正規化 (normProductCode) + コード/数量順の最小形に (並び順・表記差で409にしない)
+    const canonicalItems = items.map(i => ({ code: normProductCode(i && i.code), qty: Number(i && i.qty) }))
+      .sort((a, b) => a.code.localeCompare(b.code) || a.qty - b.qty);
     const { replay, result } = withCommand(
       { idempotencyKey: trimS(req.get('Idempotency-Key')) || null, payload: { op: 'issue', code, items: canonicalItems, note: trimS(note), requestedDate: requestedDate || null } },
       () => issueOrder(code, resolveSupplierName(code), items, trimS(note), requestedDate)

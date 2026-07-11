@@ -370,6 +370,9 @@ function initLedgerSchema(db) {
              SELECT CASE WHEN OLD.closed_at IS NOT NULL AND NEW.closed_at IS NOT NULL
                THEN RAISE(ABORT, 'closed_at guard: 閉鎖時刻の改変は不可') END;
              SELECT CASE WHEN NEW.closed_at IS NOT NULL
+               AND (OLD.status <> 'issued' OR NOT EXISTS (SELECT 1 FROM po_order_items i WHERE i.order_id = OLD.id))
+               THEN RAISE(ABORT, 'closed_at guard: draft/明細のないPOはクローズできません') END;
+             SELECT CASE WHEN NEW.closed_at IS NOT NULL
                AND NEW.closed_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*Z'
                THEN RAISE(ABORT, 'closed_at guard: 時刻形式が不正') END;
              SELECT CASE WHEN NEW.closed_at IS NOT NULL AND (
@@ -472,12 +475,16 @@ function initLedgerSchema(db) {
                   OR substr(NEW.po_number, 9) GLOB '*[^0-9]*'
                   OR NEW.issued_at IS NULL OR length(NEW.issued_at) <> 24
                   OR NEW.issued_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z')`;
+  // 境界確定後、issued の直接INSERTは全面拒否 (Codex P13a-R4 Medium-2: 属性を揃えた明細ゼロissuedの直接作成を防ぐ)。
+  // 正規経路は draft でヘッダ+明細を作って issued へ UPDATE (issueOrder) のみ
   db.exec(`CREATE TRIGGER trg_po_orders_issue_gate_ins BEFORE INSERT ON po_orders
-           WHEN NEW.status = 'issued' AND ${GATE_COND}
-           BEGIN SELECT RAISE(ABORT, 'issue gate: po_number/issued_at/tracking_mode が不正です (旧経路からの発行は禁止)'); END`);
+           WHEN NEW.status = 'issued'
+             AND EXISTS (SELECT 1 FROM po_settings WHERE key = 'tracking_started_at')
+           BEGIN SELECT RAISE(ABORT, 'issue gate: 発行は draft→issued 経由のみ (直接INSERT禁止)'); END`);
   db.exec(`CREATE TRIGGER trg_po_orders_issue_gate_upd BEFORE UPDATE OF status ON po_orders
-           WHEN NEW.status = 'issued' AND OLD.status <> 'issued' AND ${GATE_COND}
-           BEGIN SELECT RAISE(ABORT, 'issue gate: po_number/issued_at/tracking_mode が不正です (旧経路からの発行は禁止)'); END`);
+           WHEN NEW.status = 'issued' AND OLD.status <> 'issued' AND (${GATE_COND}
+                OR NOT EXISTS (SELECT 1 FROM po_order_items WHERE order_id = NEW.id))
+           BEGIN SELECT RAISE(ABORT, 'issue gate: po_number/issued_at/tracking_mode が不正か明細がありません'); END`);
 
   // ── 残数の集約ビュー (唯一の導出定義。有効イベント = 非reversal かつ 未逆仕訳) ──
   // ⚠️ 全明細が対象になる。tracked 判定 (issued_at>=境界) は呼び出し側で po_orders と JOIN して絞ること
