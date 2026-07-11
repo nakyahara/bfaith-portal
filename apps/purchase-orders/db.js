@@ -482,6 +482,16 @@ function initLedgerSchema(db) {
     revoked_by      TEXT
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_po_inb_ign ON po_inbound_ignores(inbound_item_id, revoked_at)');
+  // 割当が残る入庫の「対象外」化を物理拒否 (アプリ検証の最終防衛、Codex P14-R1 High-1)
+  db.exec(`CREATE TRIGGER trg_po_inbound_ignore_guard BEFORE INSERT ON po_inbound_ignores
+           WHEN NEW.revoked_at IS NULL
+           BEGIN
+             SELECT CASE WHEN (
+               SELECT COALESCE(SUM(e.qty), 0) FROM po_item_events e
+               WHERE e.inbound_item_id = NEW.inbound_item_id AND e.event_type = 'receipt'
+                 AND NOT EXISTS (SELECT 1 FROM po_item_events r WHERE r.reverses_id = e.id)
+             ) > 0 THEN RAISE(ABORT, 'inbound ignore: 割当が残る入庫は対象外にできません (先に逆仕訳を)') END;
+           END`);
   // logizard入荷の割当ガード: 参照先の実在・非supersede・非ignore・割当合計≤入庫良品数 (要件v8 F-5)。
   // ※入庫テーブル作成後に定義する (トリガ本文のテーブル参照はCREATE時に解決される)
   db.exec(`CREATE TRIGGER trg_po_events_inbound_capacity BEFORE INSERT ON po_item_events

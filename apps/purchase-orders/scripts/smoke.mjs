@@ -932,6 +932,20 @@ console.log('── P14: 入庫CSV取込+突合+割当 ──');
   r = await j('/api/inbound/' + inb3.id + '/candidates');
   ok(r.body.ok && r.body.candidates.length === 0, '仕入先不一致 (0113) は候補から除外');
 
+  // 不正行を含むファイルは全体拒否 (部分取込で正常な旧行をsupersedeさせない)
+  r = await upload('lz-bad.csv', [HDR, ['AR001', 'noflyersticker', '商品', '0001', '70', 'abc', '0', '2026/07/11']]);
+  ok(r.status === 400 && r.body.error.includes('取込を中止'), '不正行を含むCSVは全体拒否 (Codex P14 R1)', r.body.error);
+  r = await j('/api/inbound');
+  ok(r.body.conflicts.length === 1, '拒否されたファイルで競合が増えない');
+
+  // 割当が残る入庫は対象外にできない (inb1は競合中=superseded、inb2の割当ありケースを作る)
+  r = await j('/api/items/' + inbPoItem.id + '/events', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: 'receipt', qty: 2, inboundItemId: inb2.id, remainder: { action: 'await_confirmation', nextActionDate: '2026-07-20' } }) });
+  ok(r.body.ok, '容量内の割当は成功 (inb2に2)');
+  r = await j('/api/inbound/' + inb2.id + '/ignore', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ignore: true, reason: 'x' }) });
+  ok(r.status === 400 && r.body.error.includes('逆仕訳'), '割当が残る入庫の対象外化は拒否 (Codex P14 R1)', r.body.error);
+
   // ページ配信
   const html = await (await fetch(base + '/inbound')).text();
   ok(html.includes('inbForm') && html.includes('data-match') && html.includes('訂正競合'), '/inbound ページ配信 (取込+割当+競合)');

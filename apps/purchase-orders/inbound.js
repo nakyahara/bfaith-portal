@@ -38,6 +38,7 @@ export function parseCsv(text) {
   }
   row.push(field);
   if (row.some(v => v !== '')) rows.push(row);
+  if (q) throw new Error('CSVの引用符が閉じていません (ファイル破損の可能性)');
   return rows;
 }
 
@@ -49,12 +50,13 @@ const intOrNull = v => {
   return Number.isInteger(n) ? n : null;
 };
 
-/** Shift-JIS/UTF-8 自動判別デコード (既存P4の方式: 厳密UTF-8検証→失敗時のみSJIS) */
+/** Shift-JIS/UTF-8 自動判別デコード (既存P4の方式: 厳密UTF-8検証→失敗時のみSJIS)。
+ *  実データはWindows由来のためCP932を明示 (丸数字・髙・﨑等のNEC/IBM拡張を正しく読む) */
 export function decodeCsvBuffer(buf) {
   try {
     return new TextDecoder('utf-8', { fatal: true }).decode(buf);
   } catch {
-    return iconv.decode(buf, 'Shift_JIS');
+    return iconv.decode(buf, 'cp932');
   }
 }
 
@@ -87,18 +89,31 @@ export function importInboundCsv({ buffer, filename, actor = null }) {
   const iDate = DATE_COL_CANDIDATES.map(col).find(x => x !== -1);
   const warnings = [];
 
-  // 伝票NOごとに行をグルーピング (line_key = 内容ハッシュ + 同一内容の出現順)
+  // 伝票NOごとに行をグルーピング (line_key = 内容ハッシュ + 同一内容の出現順)。
+  // 識別・数量・単価の不正は「ファイル全体を拒否」する (Codex P14-R1 High-2:
+  // 不正行だけスキップして訂正版を適用すると、正常な旧行を「消えた」と誤認してsupersede+偽競合を作るため)
+  const errors = [];
   const bySlip = new Map();
   for (let n = 1; n < rows.length; n++) {
     const r = rows[n];
+    const maxIdx = Math.max(iSlip, iCode, iSup, iCost, iGood, iBad === -1 ? 0 : iBad);
+    if (r.length <= maxIdx) { errors.push(`行${n + 1}: 列数が不足しています (引用符ずれ?)`); continue; }
     const slip = trimS(r[iSlip]);
     const code = trimS(r[iCode]);
-    if (!slip || !code) { warnings.push(`行${n + 1}: 伝票NOまたは型番が空のためスキップ`); continue; }
+    if (!slip || !code) { errors.push(`行${n + 1}: 伝票NOまたは型番が空です`); continue; }
     const good = intOrNull(r[iGood]);
-    if (good == null || good < 0) { warnings.push(`行${n + 1}: 良品数が数値ではありません (${trimS(r[iGood])}) — スキップ`); continue; }
-    const bad = iBad === -1 ? 0 : (intOrNull(r[iBad]) ?? 0);
+    if (good == null || good < 0) { errors.push(`行${n + 1}: 良品数が0以上の整数ではありません (${trimS(r[iGood])})`); continue; }
+    let bad = 0;
+    if (iBad !== -1 && trimS(r[iBad]) !== '') {
+      bad = intOrNull(r[iBad]);
+      if (bad == null || bad < 0) { errors.push(`行${n + 1}: 不良品数が0以上の整数ではありません (${trimS(r[iBad])})`); continue; }
+    }
     const costN = trimS(r[iCost]).replace(/,/g, '');
-    const cost = costN === '' ? null : (Number.isFinite(Number(costN)) ? Number(costN) : null);
+    let cost = null;
+    if (costN !== '') {
+      cost = Number(costN);
+      if (!Number.isFinite(cost) || cost < 0) { errors.push(`行${n + 1}: 仕入単価が不正です (${trimS(r[iCost])})`); continue; }
+    }
     let date = iDate != null && iDate !== -1 ? trimS(r[iDate]).replace(/\//g, '-') : '';
     if (date && !isYmd(date)) { warnings.push(`行${n + 1}: 入庫日の形式が不正 (${date}) — 日付なし扱い`); date = ''; }
     const line = {
@@ -109,7 +124,10 @@ export function importInboundCsv({ buffer, filename, actor = null }) {
     if (!bySlip.has(slip)) bySlip.set(slip, []);
     bySlip.get(slip).push(line);
   }
-  if (!bySlip.size) throw new Error('取り込める行がありません' + (warnings.length ? ` (${warnings[0]} 等)` : ''));
+  if (errors.length) {
+    throw new Error(`取込を中止しました (不正な行が${errors.length}件): ` + errors.slice(0, 5).join(' / ') + (errors.length > 5 ? ' …' : ''));
+  }
+  if (!bySlip.size) throw new Error('取り込める行がありません');
 
   const tx = db.transaction(() => {
     const dup = db.prepare('SELECT id FROM po_inbound_batches WHERE file_hash=?').get(fileHash);
@@ -154,10 +172,13 @@ export function importInboundCsv({ buffer, filename, actor = null }) {
         VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
       for (const l of lines) {
         if (existingByKey.has(l.lineKey)) { unchangedItems++; continue; }
-        // 過去にsupersededになった同一内容行が復活するケース: UNIQUE(receipt,line_key) に当たるため復活させる
+        // 過去にsupersededになった同一内容行が復活するケース: UNIQUE(receipt,line_key) に当たるため復活させる。
+        // 監査が誤らないよう、原本・バッチ情報も今回の値へ更新する (Codex P14-R1 Medium-1)
         const dead = db.prepare('SELECT id FROM po_inbound_items WHERE receipt_id=? AND line_key=? AND superseded=1').get(receipt.id, l.lineKey);
         if (dead) {
-          db.prepare('UPDATE po_inbound_items SET superseded=0, superseded_batch_id=NULL WHERE id=?').run(dead.id);
+          db.prepare(`UPDATE po_inbound_items SET superseded=0, superseded_batch_id=NULL,
+                        batch_id=?, supplier_code=?, product_code=?, payload_json=?, created_at=? WHERE id=?`)
+            .run(batchId, l.supplierCode || null, l.productCode, l.payload, now, dead.id);
           newItems++;
           continue;
         }
@@ -275,13 +296,19 @@ export function candidatesFor(inboundItemId) {
 export function setInboundIgnore(inboundItemId, { ignore, reason = null, actor = null }) {
   const db = getDB();
   const tx = db.transaction(() => {
-    const item = db.prepare('SELECT id FROM po_inbound_items WHERE id=?').get(inboundItemId);
+    const item = db.prepare('SELECT id, superseded FROM po_inbound_items WHERE id=?').get(inboundItemId);
     if (!item) throw new Error(`入庫明細が存在しません: ${inboundItemId}`);
     const active = db.prepare('SELECT id FROM po_inbound_ignores WHERE inbound_item_id=? AND revoked_at IS NULL').get(inboundItemId);
     const now = nowIso();
     if (ignore) {
       if (active) return { changed: false };
       if (!reason || !String(reason).trim()) throw new Error('対象外には理由が必要です');
+      // 割当が残る入庫を対象外にすると台帳と矛盾したまま画面から隠れる (Codex P14-R1 High-1)
+      if (item.superseded) throw new Error('訂正で無効化された行は対象外にできません (競合の解消を先に)');
+      const alloc = db.prepare(`SELECT COALESCE(SUM(e.qty),0) AS n FROM po_item_events e
+        WHERE e.inbound_item_id=? AND e.event_type='receipt'
+          AND NOT EXISTS (SELECT 1 FROM po_item_events r WHERE r.reverses_id=e.id)`).get(inboundItemId).n;
+      if (alloc > 0) throw new Error(`割当 (${alloc}) が残っています。先に発注残ページから逆仕訳してください`);
       db.prepare('INSERT INTO po_inbound_ignores (inbound_item_id, reason, created_at, actor) VALUES (?,?,?,?)')
         .run(inboundItemId, String(reason).trim(), now, actor);
     } else {

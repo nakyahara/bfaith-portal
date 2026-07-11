@@ -471,6 +471,8 @@ router.post('/api/items/:itemId/events', (req, res) => {
       inbound = db.prepare('SELECT i.id, r.receipt_date FROM po_inbound_items i JOIN po_inbound_receipts r ON r.id=i.receipt_id WHERE i.id=?').get(iid);
       if (!inbound) return res.status(400).json({ ok: false, error: '入庫明細が存在しません' });
     }
+    // 同一操作で登録する receipt と減数は業務日付を揃える (入庫日既定、Codex P14-R1 Medium-2)
+    const eventDate = trimS(effectiveDate) || (inbound && inbound.receipt_date) || null;
     const run = () => db.transaction(() => {
       const ev = appendPoItemEvent({
         orderItemId: itemId, eventType: type, qty: Number(qty),
@@ -478,7 +480,7 @@ router.post('/api/items/:itemId/events', (req, res) => {
         inboundItemId: inbound ? inbound.id : null,
         reasonCode: type === 'shortage' ? (reasonCode || null) : null,
         note: trimS(note) || null,
-        effectiveDate: trimS(effectiveDate) || (inbound && inbound.receipt_date) || null,
+        effectiveDate: eventDate,
         actorType: 'user', actor,
       });
       // 残数が残る場合の三択 (要件F-2: 同一txnで必須。UI側も必須にするがサーバでも検証)
@@ -495,7 +497,7 @@ router.post('/api/items/:itemId/events', (req, res) => {
           const sh = appendPoItemEvent({
             orderItemId: itemId, eventType: 'shortage', qty: ev.remaining,
             reasonCode: r.reasonCode || 'supplier_shortage', note: trimS(r.note) || null,
-            effectiveDate: trimS(effectiveDate) || null, actorType: 'user', actor,
+            effectiveDate: eventDate, actorType: 'user', actor,
           });
           ev.remaining = sh.remaining; ev.orderClosed = sh.orderClosed;
         } else if (r.action === 'await_confirmation') {
