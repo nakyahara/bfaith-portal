@@ -1089,10 +1089,14 @@ console.log('── P15: メール送信 (fake transport) ──');
   process.env.PO_EMAIL_FAKE = '1';
   r = await jsonPost('/api/email-jobs/' + unknownJobId + '/retry', {});
   ok(r.status === 400 && r.body.error.includes('二重送信防止'), 'unknownは通常再試行できない');
+  // unknown中は同一内容の新規通常送信もdedupが拒否 (状態機械の迂回不可、Codex P15 R3 High)
+  // ※このジョブはresendなのでdedup対象外 → 通常送信ジョブのunknownで検証する
   r = await jsonPost('/api/email-jobs/' + unknownJobId + '/mark-unsent', {});
   ok(r.status === 400, 'mark-unsentは確認文字列必須');
   r = await jsonPost('/api/email-jobs/' + unknownJobId + '/mark-unsent', { confirm: '未送信' });
   ok(r.body.ok && r.body.status === 'queued', '人間確認後にqueuedへ');
+  ok(db.prepare('SELECT attempt_count FROM po_email_jobs WHERE id=?').get(unknownJobId).attempt_count === 0,
+    'mark-unsentで再試行カウントもリセット (上限で復旧不能にならない)');
   r = await jsonPost('/api/email-jobs/' + unknownJobId + '/retry', {});
   ok(r.body.ok && r.body.status === 'sent', '確認後の再試行→送信');
 
@@ -1114,6 +1118,19 @@ console.log('── P15: メール送信 (fake transport) ──');
   const schedOrderId = r.body.id;
   r = await jsonPost('/api/orders/' + schedOrderId + '/email/send', {}, 'em-key-vm');
   ok(r.status === 400 && r.body.error.includes('先方管理番号'), 'live: 先方管理番号の欠落は送信ブロック', r.body.error);
+
+  // unknown中は同一内容の新規通常送信もdedupが拒否 (状態機械の迂回不可、Codex P15 R3 High)
+  {
+    r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 9 }] }) });
+    const unkOrderId = r.body.id;
+    process.env.PO_EMAIL_FAKE = 'fail_unknown';
+    r = await jsonPost('/api/orders/' + unkOrderId + '/email/send', {}, 'em-key-unk1');
+    ok(r.body.ok && r.body.status === 'unknown', '通常送信がunknownに', r.body);
+    process.env.PO_EMAIL_FAKE = '1';
+    r = await jsonPost('/api/orders/' + unkOrderId + '/email/send', {}, 'em-key-unk2');
+    ok(r.status === 400 && r.body.error.includes('送信済み'), 'unknown中の新規通常送信はdedup拒否 (迂回不可)', r.body.error);
+  }
 
   // 予約送信: 未来時刻はqueuedのまま (scheduled)→時刻到来で送信。過去時刻は拒否。取消可能 (dry-runで実施)
   {

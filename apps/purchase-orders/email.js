@@ -307,16 +307,17 @@ export async function reconcileEmailJobs() {
   return { checked: targets.length, results };
 }
 
-/** 人間がGmail送信済みを確認して「未送信」を宣言した場合のみ、unknown → queued (再試行可能) に戻す */
+/** 人間がGmail送信済みを確認して「未送信」を宣言した場合のみ、unknown → queued (再試行可能) に戻す。
+ *  人間確認済みのため再試行カウントもリセットする (5回上限で復旧不能にならない、Codex P15-R3 Medium) */
 export function markUnsent(jobId, { actor = null } = {}) {
   const db = getDB();
   const tx = db.transaction(() => {
     const job = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(jobId);
     if (!job) throw new Error(`ジョブが存在しません: ${jobId}`);
     if (job.status !== 'unknown') throw new Error('「未送信を確認した」は結果不明 (unknown) のジョブにのみ使えます');
-    db.prepare("UPDATE po_email_jobs SET status='queued', error='人間確認: Gmail送信済みに存在しない → 再試行可' WHERE id=?").run(jobId);
+    db.prepare("UPDATE po_email_jobs SET status='queued', attempt_count=0, error='人間確認: Gmail送信済みに存在しない → 再試行可' WHERE id=?").run(jobId);
     audit(db, { actorType: 'user', actor, action: 'email_marked_unsent', resource: `order:${job.order_id}`,
-      detail: { jobId, deliveryKey: job.delivery_key } });
+      detail: { jobId, deliveryKey: job.delivery_key, attemptReset: job.attempt_count } });
     return { status: 'queued' };
   });
   return tx.immediate();
