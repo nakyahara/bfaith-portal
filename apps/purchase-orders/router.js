@@ -25,8 +25,13 @@ import {
   appendPoItemEvent, reverseEvent, manualCloseOrder, setItemPlan, listBackorders, listItemEvents, balanceOf,
 } from './ledger.js';
 import { importInboundCsv, listInbound, candidatesFor, setInboundIgnore, parseCsv as parseCsvStrict } from './inbound.js';
-import { buildOrderEmail, createEmailJob, processEmailJob, reconcileEmailJobs, listEmailJobs, emailSettings, parseAddresses } from './email.js';
-import { getSetting, setSetting } from './ledger.js';
+import {
+  buildOrderEmail, createEmailJob, processEmailJob, reconcileEmailJobs, listEmailJobs, emailSettings, parseAddresses,
+  markUnsent, cancelEmailJob, startEmailDispatcher,
+} from './email.js';
+import { getSetting, setSetting, audit } from './ledger.js';
+
+startEmailDispatcher(); // 予約送信 (毎分、時刻が来たqueuedジョブを送信。unrefでプロセス終了は妨げない)
 
 // ─── miniPC (WarehouseServer) service-api 呼び出し (オンデマンドFBA更新、product-management-list と同一エンドポイント) ───
 const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
@@ -630,11 +635,14 @@ router.post('/api/orders/:id/email/send', async (req, res) => {
   try {
     const orderId = Number(req.params.id);
     if (!Number.isSafeInteger(orderId) || orderId <= 0) return res.status(400).json({ ok: false, error: 'idが不正です' });
-    const resend = !!(req.body || {}).resend;
+    const b = req.body || {};
+    const resend = !!b.resend;
+    const resendOfJobId = b.resendOfJobId != null ? Number(b.resendOfJobId) : null;
+    const scheduledAt = trimS(b.scheduledAt) || null;
     // ジョブ作成は冪等 (再送クリックの通信断→再クリックで二重ジョブを作らない)。送信処理はlease側が多重実行を防ぐ
     const { replay, result: jobId } = withCommand(
-      { idempotencyKey: trimS(req.get('Idempotency-Key')) || null, payload: { op: 'email_send', orderId, resend } },
-      () => createEmailJob(orderId, { resend, actor: actorOf(req) })
+      { idempotencyKey: trimS(req.get('Idempotency-Key')) || null, payload: { op: 'email_send', orderId, resend, resendOfJobId, scheduledAt } },
+      () => createEmailJob(orderId, { resend, resendOfJobId, scheduledAt, actor: actorOf(req) })
     );
     const outcome = await processEmailJob(jobId);
     const jb = getDB().prepare('SELECT is_dry_run FROM po_email_jobs WHERE id=?').get(jobId);
@@ -648,6 +656,24 @@ router.post('/api/email-jobs/:id/retry', async (req, res) => {
     if (!Number.isSafeInteger(jobId) || jobId <= 0) return res.status(400).json({ ok: false, error: 'idが不正です' });
     const outcome = await processEmailJob(jobId);
     res.json({ ok: true, jobId, ...outcome });
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+
+// unknown (結果不明) → 人間がGmail送信済みを確認して「未送信」を宣言した場合のみ再試行可能に戻す
+router.post('/api/email-jobs/:id/mark-unsent', (req, res) => {
+  try {
+    const jobId = Number(req.params.id);
+    if (!Number.isSafeInteger(jobId) || jobId <= 0) return res.status(400).json({ ok: false, error: 'idが不正です' });
+    if (trimS((req.body || {}).confirm) !== '未送信') return res.status(400).json({ ok: false, error: '確認のため confirm に「未送信」と入力してください' });
+    res.json({ ok: true, ...markUnsent(jobId, { actor: actorOf(req) }) });
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+
+router.post('/api/email-jobs/:id/cancel', (req, res) => {
+  try {
+    const jobId = Number(req.params.id);
+    if (!Number.isSafeInteger(jobId) || jobId <= 0) return res.status(400).json({ ok: false, error: 'idが不正です' });
+    res.json({ ok: true, ...cancelEmailJob(jobId, { actor: actorOf(req) }) });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
@@ -666,13 +692,27 @@ router.post('/api/email/settings', (req, res) => {
     const b = req.body || {};
     const actor = actorOf(req);
     const changed = [];
-    for (const [key, val] of [['email_mode', b.mode], ['email_dryrun_to', b.dryrunTo],
+    // mode (dry_run/live) は専用API /api/email/mode でのみ変更 (誤操作でliveにしない、Codex P15-R1 M9)
+    for (const [key, val] of [['email_dryrun_to', b.dryrunTo],
       ['email_subject_template', b.subjectTpl], ['email_body_template', b.bodyTpl]]) {
       if (val == null) continue;
       setSetting(key, String(val), { actor, reason: 'メール設定画面から変更' });
       changed.push(key);
     }
     res.json({ ok: true, changed, ...emailSettings() });
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+
+// live切替は専用API+確認文字列必須。監査ログでも通常設定と区別される
+router.post('/api/email/mode', (req, res) => {
+  try {
+    const b = req.body || {};
+    const mode = trimS(b.mode);
+    if (mode === 'live' && trimS(b.confirm) !== 'LIVE') {
+      return res.status(400).json({ ok: false, error: '本番送信への切替は confirm に「LIVE」と入力してください' });
+    }
+    setSetting('email_mode', mode, { actor: actorOf(req), reason: mode === 'live' ? '⚠️本番送信へ切替' : 'dry-runへ切替' });
+    res.json({ ok: true, ...emailSettings() });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
@@ -692,24 +732,37 @@ router.post('/api/email/recipients/csv', upload.single('file'), (req, res) => {
     if (iName === -1 || iMail === -1) return res.status(400).json({ ok: false, error: '「仕入先名称」「メールアドレス」列が必要です (宛先マスタのCSVを入れてください)' });
     const db = getDB();
     const norm = s => trimS(s).replace(/様$/, '');
-    const byName = new Map(db.prepare('SELECT supplier_code, name FROM po_suppliers').all().map(r => [norm(r.name), r.supplier_code]));
+    // 同名仕入先が複数ある場合は「どれか1つに黙って登録」せず曖昧エラーにする (誤送信防止、Codex P15-R1 High-4)
+    const byName = new Map();
+    for (const r of db.prepare('SELECT supplier_code, name FROM po_suppliers').all()) {
+      const k = norm(r.name);
+      if (!byName.has(k)) byName.set(k, []);
+      byName.get(k).push(r.supplier_code);
+    }
     const updated = [], unmatched = [], invalid = [];
+    const seenInCsv = new Set();
     db.transaction(() => {
       const upd = db.prepare("UPDATE po_suppliers SET email_to=?, email_cc=?, contact_name=?, send_method=COALESCE(send_method,'email'), updated_at=? WHERE supplier_code=?");
       for (let n = 1; n < rows.length; n++) {
         const r = rows[n];
         const name = trimS(r[iName]);
         if (!name) continue;
-        const code = byName.get(norm(name));
-        if (!code) { unmatched.push(name); continue; }
+        const k = norm(name);
+        if (seenInCsv.has(k)) { invalid.push(`${name}: CSV内で重複しています (2回目以降は無視)`); continue; }
+        seenInCsv.add(k);
+        const codes = byName.get(k) || [];
+        if (codes.length === 0) { unmatched.push(name); continue; }
+        if (codes.length > 1) { invalid.push(`${name}: 同名の仕入先が${codes.length}件あり特定できません (コード: ${codes.join(', ')}) — マスタで個別に登録してください`); continue; }
         try {
           const to = parseAddresses(r[iMail]);
           if (!to.length) { invalid.push(`${name}: メールアドレスが空`); continue; }
           const cc = iCc === -1 ? [] : parseAddresses(r[iCc]);
-          upd.run(to.join(','), cc.join(',') || null, iContact === -1 ? null : trimS(r[iContact]) || null, nowIso(), code);
-          updated.push(name);
+          upd.run(to.join(','), cc.join(',') || null, iContact === -1 ? null : trimS(r[iContact]) || null, nowIso(), codes[0]);
+          updated.push({ name, code: codes[0] });
         } catch (e) { invalid.push(`${name}: ${e.message}`); }
       }
+      audit(db, { actorType: 'user', actor: actorOf(req), action: 'email_recipients_import', resource: 'master:suppliers',
+        detail: { updated, unmatched, invalidCount: invalid.length } });
     })();
     res.json({ ok: true, updated: updated.length, unmatched, invalid });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
@@ -733,11 +786,15 @@ router.post('/api/vendor-map/csv', upload.single('file'), (req, res) => {
     let iOur = header.indexOf('弊社管理番号');
     const warnings = [];
     if (iVendor === -1 || iOur === -1) {
-      // GAS実装と同じ位置 (A列=仕入先管理番号, C列=弊社管理番号) にフォールバック
+      // 別形式CSVの誤取込防止: 自動フォールバックせず、明示チェック時のみ位置 (A列/C列=GAS対応表と同じ) で読む
+      if (String((req.body || {}).positional) !== '1') {
+        return res.status(400).json({ ok: false, error: '見出し「仕入先管理番号」「弊社管理番号」が見つかりません。対応表のCSVか確認し、見出しなしのCSVなら「A列/C列で取り込む」にチェックしてください' });
+      }
       iVendor = 0; iOur = 2;
-      warnings.push('見出し「仕入先管理番号」「弊社管理番号」が見つからないため、A列=先方番号 / C列=弊社コード として取り込みました');
+      warnings.push('見出しなしのため A列=先方番号 / C列=弊社コード として取り込みました');
     }
     let count = 0, skipped = 0;
+    const oldCount = db.prepare('SELECT COUNT(*) AS n FROM po_vendor_code_map WHERE supplier_code=?').get(supplierCode).n;
     db.transaction(() => {
       db.prepare('DELETE FROM po_vendor_code_map WHERE supplier_code=?').run(supplierCode);
       const ins = db.prepare('INSERT OR REPLACE INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, updated_at) VALUES (?,?,?,?,?)');
@@ -748,8 +805,12 @@ router.post('/api/vendor-map/csv', upload.single('file'), (req, res) => {
         ins.run(supplierCode, normProductCode(our), our, vendor, nowIso());
         count++;
       }
+      // 誤CSV・空データで正常な対応表を消さない (0件はロールバック)
+      if (count === 0) throw new Error('有効な行が0件のため取込を中止しました (既存の対応表は変更していません)');
+      audit(db, { actorType: 'user', actor: actorOf(req), action: 'vendor_map_import', resource: `supplier:${supplierCode}`,
+        detail: { oldCount, newCount: count, skipped } });
     })();
-    res.json({ ok: true, supplier: sup.name, count, skipped, warnings });
+    res.json({ ok: true, supplier: sup.name, count, skipped, oldCount, warnings });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
@@ -3293,44 +3354,69 @@ function emailPanel(orderId) {
       '<details style="margin-top:6px"><summary>本文と添付の内容を確認</summary>' +
       '<pre class="copy" style="max-height:200px;overflow:auto">' + esc(j.body) + '</pre>' +
       '<pre class="copy" style="max-height:160px;overflow:auto">' + esc(j.csvText) + '</pre></details>' +
-      '<div style="margin-top:8px;display:flex;gap:8px;align-items:center">' +
-      '<button class="pri" id="emGo-' + orderId + '">' + (dry ? '📧 dry-run送信 (自分宛)' : '📧 送信する') + '</button>' +
+      '<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +
+      '<button class="pri" id="emGo-' + orderId + '">' + (dry ? '📧 dry-run送信 (自分宛)' : '📧 今すぐ送信') + '</button>' +
+      '<label class="muted">⏰ 日時指定 <input type="datetime-local" id="emWhen-' + orderId + '"></label>' +
+      '<button class="ghost" id="emSched-' + orderId + '">⏰ 予約する</button>' +
       (j.jobs.some(function(x){ return x.status === 'sent' && !x.is_dry_run; }) ? '<button class="ghost" id="emResend-' + orderId + '">↪ 再送として送る</button>' : '') +
       '<button class="ghost" data-emclose="' + orderId + '">閉じる</button></div>';
     if (j.jobs.length) {
       h += '<table class="t" style="margin-top:8px"><tr><th>#</th><th>状態</th><th>宛先</th><th>日時</th><th>結果/エラー</th><th></th></tr>';
       j.jobs.forEach(function(x) {
         var st = x.status === 'sent' ? '✅ 送信済' + (x.is_dry_run ? ' (dry-run)' : '') :
-          x.status === 'failed' ? '❌ 失敗' : x.status === 'sending' ? '⏳ 送信中' : x.status;
-        h += '<tr><td>' + x.id + (x.is_resend ? ' ↪' : '') + '</td><td>' + st + '</td><td>' + esc(x.to_addr) + '</td>' +
+          x.status === 'failed' ? '❌ 失敗' :
+          x.status === 'unknown' ? '❓ 結果不明' :
+          x.status === 'sending' ? '⏳ 送信中' :
+          x.status === 'cancelled' ? '🚫 取消' :
+          (x.scheduled_at ? '⏰ 予約 ' + esc(String(new Date(new Date(x.scheduled_at).getTime() + 9 * 3600000).toISOString()).slice(0, 16).replace('T', ' ')) + ' (JST)' : x.status);
+        h += '<tr><td>' + x.id + (x.is_resend ? ' ↪' + (x.resend_of || '') : '') + '</td><td>' + st + '</td><td>' + esc(x.to_addr) + '</td>' +
           '<td class="muted" style="font-size:11px">' + esc(String(x.sent_at || x.created_at).slice(0, 16).replace('T', ' ')) + '</td>' +
           '<td style="font-size:11px">' + esc(x.gmail_message_id || x.error || '') + '</td>' +
-          '<td>' + (x.status === 'failed' ? '<button class="ghost" data-emretry="' + x.id + '" data-emorder="' + orderId + '">再試行</button>' : '') +
-                   (x.status === 'sending' ? '<button class="ghost" data-emrec="' + orderId + '">照合</button>' : '') + '</td></tr>';
+          '<td style="white-space:nowrap">' +
+            (x.status === 'failed' ? '<button class="ghost" data-emretry="' + x.id + '" data-emorder="' + orderId + '">再試行</button> ' : '') +
+            ((x.status === 'queued' || x.status === 'failed') ? '<button class="ghost" data-emcancel="' + x.id + '" data-emorder="' + orderId + '">取消</button> ' : '') +
+            ((x.status === 'sending' || x.status === 'unknown') ? '<button class="ghost" data-emrec="' + orderId + '">照合</button> ' : '') +
+            (x.status === 'unknown' ? '<button class="ghost" data-emunsent="' + x.id + '" data-emorder="' + orderId + '" title="Gmailの送信済みに無いことを確認してから">未送信を確認した</button>' : '') +
+          '</td></tr>';
       });
       h += '</table>';
     }
     h += '</div>';
     area.innerHTML = h;
     var idemKey = newIdemKey();
-    function doSend(resend) {
+    var whenEl = document.getElementById('emWhen-' + orderId);
+    if (whenEl) whenEl.addEventListener('input', function(){ idemKey = newIdemKey(); });
+    var lastSent = j.jobs.filter(function(x){ return x.status === 'sent' && !x.is_dry_run; })[0] || null;
+    function doSend(resend, scheduledAt) {
+      var when = scheduledAt ? ' (予約: ' + scheduledAt.replace('T', ' ') + ' JST)' : '';
       var msg = dry
-        ? 'dry-run送信します (宛先は ' + (j.dryrunTo || '未設定') + ' に差し替え)。よろしいですか?'
-        : '⚠️ 本番送信です。仕入先 ' + j.to.join(', ') + ' に発注書が届きます。送信しますか?';
+        ? 'dry-run送信します (宛先は ' + (j.dryrunTo || '未設定') + ' に差し替え)' + when + '。よろしいですか?'
+        : '⚠️ 本番送信です。仕入先 ' + j.to.join(', ') + ' に発注書が届きます' + when + '。送信しますか?';
       if (!confirm(msg)) return;
       var btn = document.getElementById('emGo-' + orderId);
       if (btn) btn.disabled = true;
-      post(API + '/orders/' + orderId + '/email/send', { resend: !!resend }, idemKey).then(function(r2) {
-        if (btn) btn.disabled = false;
-        if (!r2.ok) { toast('エラー: ' + r2.error); emailPanel(orderId); return; }
-        toast(r2.status === 'sent' ? '送信しました' + (r2.replay ? ' (前回分を再表示・二重送信なし)' : '') : '送信失敗: ' + (r2.error || ''));
-        emailPanel(orderId);
-      }).catch(onWriteErr(btn));
+      post(API + '/orders/' + orderId + '/email/send',
+        { resend: !!resend, resendOfJobId: resend && lastSent ? lastSent.id : null, scheduledAt: scheduledAt || null }, idemKey)
+        .then(function(r2) {
+          if (btn) btn.disabled = false;
+          if (!r2.ok) { toast('エラー: ' + r2.error); emailPanel(orderId); return; }
+          toast(r2.status === 'sent' ? '送信しました' + (r2.replay ? ' (前回分を再表示・二重送信なし)' : '') :
+            r2.status === 'scheduled' ? '予約しました (' + String(r2.scheduledAt || '').slice(0, 16).replace('T', ' ') + ' UTC)' :
+            r2.status === 'unknown' ? '⚠️ 送信結果が不明です。「照合」で確認してください' :
+            '送信失敗: ' + (r2.error || ''));
+          emailPanel(orderId);
+        }).catch(onWriteErr(btn));
     }
     var go = document.getElementById('emGo-' + orderId);
-    if (go) go.addEventListener('click', function(){ doSend(false); });
+    if (go) go.addEventListener('click', function(){ doSend(false, null); });
+    var sc = document.getElementById('emSched-' + orderId);
+    if (sc) sc.addEventListener('click', function() {
+      var v = whenEl && whenEl.value;
+      if (!v) { toast('予約日時を入力してください'); return; }
+      doSend(false, v);
+    });
     var rs = document.getElementById('emResend-' + orderId);
-    if (rs) rs.addEventListener('click', function(){ doSend(true); });
+    if (rs) rs.addEventListener('click', function(){ doSend(true, whenEl && whenEl.value ? whenEl.value : null); });
   }).catch(function(e){ area.innerHTML = '<div class="warn">通信エラー: ' + esc(e.message) + '</div>'; });
 }
 
@@ -3527,6 +3613,24 @@ document.addEventListener('click', function(ev) {
     }).catch(onWriteErr(t));
     return;
   }
+  if ((v = g('data-emcancel'))) {
+    if (!confirm('この送信ジョブを取り消しますか?')) return;
+    t.disabled = true;
+    post(API + '/email-jobs/' + v + '/cancel', {}).then(function(j) {
+      toast(j.ok ? '取り消しました' : 'エラー: ' + j.error);
+      emailPanel(g('data-emorder'));
+    }).catch(onWriteErr(t));
+    return;
+  }
+  if ((v = g('data-emunsent'))) {
+    if (!confirm('Gmailの「送信済み」を確認し、このメールが存在しないことを確認しましたか?\\n(存在するのに再試行すると二重送信になります)')) return;
+    t.disabled = true;
+    post(API + '/email-jobs/' + v + '/mark-unsent', { confirm: '未送信' }).then(function(j) {
+      toast(j.ok ? '再試行できるようになりました (queued)' : 'エラー: ' + j.error);
+      emailPanel(g('data-emorder'));
+    }).catch(onWriteErr(t));
+    return;
+  }
   if ((v = g('data-histclose'))) { hidePanel(v); return; }
   // 逆仕訳: 理由入力 → 確定 (promptは使わない)
   if ((v = g('data-rev'))) {
@@ -3675,10 +3779,12 @@ router.get('/admin', (req, res) => {
       </div>
       <div class="row" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:6px">
         <label>モード <select id="emMode"><option value="dry_run">dry_run (社内宛て)</option><option value="live">live (本番送信)</option></select></label>
+        <span id="emLiveWrap" style="display:none">確認 <input id="emLiveConfirm" placeholder="LIVE と入力" style="width:100px"></span>
+        <button class="ghost" id="emModeApply">モード切替を適用</button>
         <label>dry-run宛先 <input type="text" id="emDryTo" placeholder="自分のメールアドレス" style="width:220px"></label>
         <span id="emEnv" class="muted"></span>
         <button class="ghost" id="emTplToggle">テンプレ編集</button>
-        <button class="pri" id="emSave">設定を保存</button>
+        <button class="pri" id="emSave">宛先/テンプレを保存</button>
         <span id="emStatus" class="muted"></span>
       </div>
       <div id="emTpl" style="display:none;margin-top:6px">
@@ -3693,9 +3799,10 @@ router.get('/admin', (req, res) => {
           <button type="submit">📥 宛先マスタ取込</button>
         </form>
         <form id="vmapForm">
-          <div class="hint">先方管理番号 対応表CSV (A列=仕入先管理番号 / C列=弊社管理番号)</div>
+          <div class="hint">先方管理番号 対応表CSV (見出し「仕入先管理番号」「弊社管理番号」)</div>
           仕入先コード <input type="text" name="supplier_code" style="width:80px" required>
           <input type="file" name="file" accept=".csv" required>
+          <label class="muted"><input type="checkbox" name="positional" value="1"> 見出しなし (A列/C列)</label>
           <button type="submit">📥 対応表取込</button>
         </form>
         <span id="vmapNow" class="muted"></span>
@@ -3957,15 +4064,31 @@ document.getElementById('emTplToggle').addEventListener('click', function() {
   var el = document.getElementById('emTpl');
   el.style.display = el.style.display === 'none' ? '' : 'none';
 });
+document.getElementById('emMode').addEventListener('change', function() {
+  document.getElementById('emLiveWrap').style.display = this.value === 'live' ? '' : 'none';
+});
+document.getElementById('emModeApply').addEventListener('click', function() {
+  var mode = document.getElementById('emMode').value;
+  var btn = this; btn.disabled = true;
+  fetch(API_EM + '/email/mode', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode: mode, confirm: document.getElementById('emLiveConfirm').value }) })
+    .then(function(r){ return r.json(); }).then(function(j) {
+      btn.disabled = false;
+      if (!j.ok) { toast('エラー: ' + j.error); return; }
+      toast(j.mode === 'live' ? '⚠️ 本番送信モードに切り替えました' : 'dry-runモードに切り替えました');
+      document.getElementById('emLiveConfirm').value = '';
+      emLoad();
+    }).catch(function(e){ btn.disabled = false; toast('通信エラー: ' + e.message); });
+});
 document.getElementById('emSave').addEventListener('click', function() {
   var btn = this; btn.disabled = true;
   fetch(API_EM + '/email/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ mode: document.getElementById('emMode').value, dryrunTo: document.getElementById('emDryTo').value,
+    body: JSON.stringify({ dryrunTo: document.getElementById('emDryTo').value,
       subjectTpl: document.getElementById('emSubject').value, bodyTpl: document.getElementById('emBody').value }) })
     .then(function(r){ return r.json(); }).then(function(j) {
       btn.disabled = false;
       if (!j.ok) { toast('エラー: ' + j.error); return; }
-      toast('メール設定を保存しました' + (j.mode === 'live' ? ' — ⚠️ 本番送信モードです' : ''));
+      toast('メール設定を保存しました');
       emLoad();
     }).catch(function(e){ btn.disabled = false; toast('通信エラー: ' + e.message); });
 });

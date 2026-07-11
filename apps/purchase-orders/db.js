@@ -540,8 +540,9 @@ function initLedgerSchema(db) {
   db.exec(`CREATE TABLE IF NOT EXISTS po_email_jobs (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     order_id      INTEGER NOT NULL REFERENCES po_orders(id),
-    status        TEXT NOT NULL CHECK(status IN ('queued','sending','sent','failed','cancelled')),
+    status        TEXT NOT NULL CHECK(status IN ('queued','sending','sent','failed','unknown','cancelled')),
     is_dry_run    INTEGER NOT NULL DEFAULT 0 CHECK(is_dry_run IN (0,1)),
+    scheduled_at  TEXT,
     delivery_key  TEXT NOT NULL UNIQUE,
     to_addr       TEXT NOT NULL,
     cc_addr       TEXT,
@@ -565,7 +566,10 @@ function initLedgerSchema(db) {
            WHERE is_resend = 0 AND is_dry_run = 0 AND status IN ('queued','sending','sent')`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_po_email_status ON po_email_jobs(status, created_at)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_po_email_order ON po_email_jobs(order_id, created_at)');
-  // 不正な状態遷移をDB側でも拒否 (sent/cancelled は終端。queued→sending→sent/failed、failed→cancelledのみ)
+  // 不正な状態遷移をDB側でも拒否 (sent/cancelled は終端)。
+  //  - failed  = Gmail送信要求「前」の失敗 (トークン取得等) → 再試行可 (queued)
+  //  - unknown = Gmail送信要求「後」の失敗 = 実際は届いている可能性 → 自動・通常再試行は不可。
+  //              照合で1件確認→sent。人間がGmail送信済みを確認して「未送信」を宣言した場合のみ queued へ
   db.exec(`CREATE TRIGGER trg_po_email_transition BEFORE UPDATE OF status ON po_email_jobs
            WHEN NEW.status IS NOT OLD.status
            BEGIN
@@ -574,10 +578,12 @@ function initLedgerSchema(db) {
                  THEN RAISE(ABORT, 'email job: 終端状態からの遷移は不可')
                WHEN OLD.status = 'queued' AND NEW.status NOT IN ('sending','cancelled')
                  THEN RAISE(ABORT, 'email job: queued からは sending/cancelled のみ')
-               WHEN OLD.status = 'sending' AND NEW.status NOT IN ('sent','failed','queued')
-                 THEN RAISE(ABORT, 'email job: sending からは sent/failed/queued(照合後の再キュー)のみ')
+               WHEN OLD.status = 'sending' AND NEW.status NOT IN ('sent','failed','unknown')
+                 THEN RAISE(ABORT, 'email job: sending からは sent/failed/unknown のみ')
                WHEN OLD.status = 'failed' AND NEW.status NOT IN ('queued','cancelled')
                  THEN RAISE(ABORT, 'email job: failed からは queued(再試行)/cancelled のみ')
+               WHEN OLD.status = 'unknown' AND NEW.status NOT IN ('sent','queued','cancelled')
+                 THEN RAISE(ABORT, 'email job: unknown からは sent(照合)/queued(人間確認後)/cancelled のみ')
                WHEN NEW.status = 'sent' AND NEW.sent_at IS NULL
                  THEN RAISE(ABORT, 'email job: sent には sent_at が必要')
              END;

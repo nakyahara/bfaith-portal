@@ -67,6 +67,9 @@ export function setSetting(key, value, { actor = null, actorType = 'user', reaso
   if (key === 'email_dryrun_to' && String(value).trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value).trim())) {
     throw new Error(`email_dryrun_to がメールアドレスではありません: ${value}`);
   }
+  if (key === 'email_subject_template' && /[\r\n\0]/.test(String(value))) {
+    throw new Error('件名テンプレに改行は使えません (ヘッダインジェクション対策)');
+  }
   const db = getDB();
   db.transaction(() => {
     const old = db.prepare('SELECT value FROM po_settings WHERE key=?').get(key);

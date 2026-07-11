@@ -1051,25 +1051,84 @@ console.log('── P15: メール送信 (fake transport) ──');
   ok(r.body.ok && r.body.jobId === job1.id && r.body.replay === true, 'send: 同一キー再送はreplay');
   ok(db.prepare('SELECT COUNT(*) AS n FROM po_email_jobs WHERE order_id=?').get(emOrderId).n === 1, 'ジョブは1件のみ');
 
-  // live切替 → 本番送信 → 同一内容の二重送信はdedup拒否 → 再送は可
-  await jsonPost('/api/email/settings', { mode: 'live' });
+  // live切替は専用API+確認文字列 (通常設定APIでは変更不可)
+  r = await jsonPost('/api/email/settings', { mode: 'live' });
+  ok(r.body.ok && r.body.mode === 'dry_run', '通常設定APIではmodeを変更できない');
+  r = await jsonPost('/api/email/mode', { mode: 'live' });
+  ok(r.status === 400 && r.body.error.includes('LIVE'), 'live切替は確認文字列なしでは拒否');
+  r = await jsonPost('/api/email/mode', { mode: 'live', confirm: 'LIVE' });
+  ok(r.body.ok && r.body.mode === 'live', 'live切替 (confirm=LIVE)');
+
+  // 本番送信 → 同一内容の二重送信はdedup拒否 → 再送は元ジョブ指定必須
   r = await jsonPost('/api/orders/' + emOrderId + '/email/send', {}, 'em-key-2');
   ok(r.body.ok && r.body.status === 'sent' && r.body.dryRun === false, 'live送信 (fake)', r.body);
   const job2 = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(r.body.jobId);
   ok(job2.to_addr === 'tanaka@example.com' && job2.cc_addr === 'cc@example.com' && !job2.subject.includes('DRYRUN'), 'live: 本来の宛先+CC');
   r = await jsonPost('/api/orders/' + emOrderId + '/email/send', {}, 'em-key-3');
   ok(r.status === 400 && r.body.error.includes('送信済み'), '同一内容の二重送信はdedup拒否', r.body.error);
-  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', { resend: true }, 'em-key-4');
-  ok(r.body.ok && r.body.status === 'sent', '再送 (is_resend) は送信できる');
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', { resend: true }, 'em-key-4a');
+  ok(r.status === 400 && r.body.error.includes('resendOfJobId'), '再送は元ジョブ指定が必須 (Codex P15 R1)');
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', { resend: true, resendOfJobId: job2.id }, 'em-key-4');
+  ok(r.body.ok && r.body.status === 'sent', '再送 (元ジョブ=sent済み本送信を検証してresend_of保存)');
+  ok(db.prepare('SELECT resend_of FROM po_email_jobs WHERE id=?').get(r.body.jobId).resend_of === job2.id, 'resend_of が保存される');
 
-  // 失敗→再試行 (PO_EMAIL_FAKE=fail)
+  // 失敗分類: 要求前の失敗=failed (再試行可)
   process.env.PO_EMAIL_FAKE = 'fail';
-  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', { resend: true }, 'em-key-5');
-  ok(r.body.ok && r.body.status === 'failed' && r.body.error.includes('偽送信エラー'), '送信失敗はfailed+エラー保存', r.body);
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', { resend: true, resendOfJobId: job2.id }, 'em-key-5');
+  ok(r.body.ok && r.body.status === 'failed' && r.body.error.includes('要求前'), '要求前の失敗はfailed (再試行可)', r.body);
   const failedJobId = r.body.jobId;
   process.env.PO_EMAIL_FAKE = '1';
   r = await jsonPost('/api/email-jobs/' + failedJobId + '/retry', {});
   ok(r.body.ok && r.body.status === 'sent', 'failedジョブの再試行→送信');
+
+  // 失敗分類: 要求後の失敗=unknown (自動・通常再試行は不可。人間確認→queued→送信、Codex P15 R1 High-1)
+  process.env.PO_EMAIL_FAKE = 'fail_unknown';
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', { resend: true, resendOfJobId: job2.id }, 'em-key-6');
+  ok(r.body.ok && r.body.status === 'unknown', '要求後の失敗はunknown (結果不明)', r.body);
+  const unknownJobId = r.body.jobId;
+  process.env.PO_EMAIL_FAKE = '1';
+  r = await jsonPost('/api/email-jobs/' + unknownJobId + '/retry', {});
+  ok(r.status === 400 && r.body.error.includes('二重送信防止'), 'unknownは通常再試行できない');
+  r = await jsonPost('/api/email-jobs/' + unknownJobId + '/mark-unsent', {});
+  ok(r.status === 400, 'mark-unsentは確認文字列必須');
+  r = await jsonPost('/api/email-jobs/' + unknownJobId + '/mark-unsent', { confirm: '未送信' });
+  ok(r.body.ok && r.body.status === 'queued', '人間確認後にqueuedへ');
+  r = await jsonPost('/api/email-jobs/' + unknownJobId + '/retry', {});
+  ok(r.body.ok && r.body.status === 'sent', '確認後の再試行→送信');
+
+  // 再送回数の上限 (同一元ジョブへ3回まで。em-key-4/5/6で3回済み)
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', { resend: true, resendOfJobId: job2.id }, 'em-key-7');
+  ok(r.status === 400 && r.body.error.includes('3回まで'), '再送回数の上限 (3回)');
+
+  // live時、対応表があるのに先方管理番号が無い商品は送信ブロック (Codex P15 R1 M5)
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'cardstand-silver-r', qty: 2 }] }) });
+  const schedOrderId = r.body.id;
+  r = await jsonPost('/api/orders/' + schedOrderId + '/email/send', {}, 'em-key-vm');
+  ok(r.status === 400 && r.body.error.includes('先方管理番号'), 'live: 先方管理番号の欠落は送信ブロック', r.body.error);
+
+  // 予約送信: 未来時刻はqueuedのまま (scheduled)→時刻到来で送信。過去時刻は拒否。取消可能 (dry-runで実施)
+  {
+    await jsonPost('/api/email/mode', { mode: 'dry_run' });
+    r = await jsonPost('/api/orders/' + schedOrderId + '/email/send', { scheduledAt: '2020-01-01T00:00' }, 'em-key-8');
+    ok(r.status === 400 && r.body.error.includes('過去'), '過去日時の予約は拒否');
+    const jst = new Date(Date.now() + 9 * 3600000 + 3600000).toISOString().slice(0, 16); // 1時間後 (JST表記)
+    r = await jsonPost('/api/orders/' + schedOrderId + '/email/send', { scheduledAt: jst }, 'em-key-9');
+    ok(r.body.ok && r.body.status === 'scheduled', '予約送信: 時刻までqueued (scheduled)', r.body);
+    const schedJob = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(r.body.jobId);
+    ok(schedJob.status === 'queued' && schedJob.scheduled_at != null, '予約ジョブ: queued+scheduled_at保存');
+    r = await jsonPost('/api/email-jobs/' + schedJob.id + '/retry', {});
+    ok(r.body.ok && r.body.status === 'scheduled', '予約時刻前のretryは送信しない');
+    // 予約の取消
+    r = await jsonPost('/api/email-jobs/' + schedJob.id + '/cancel', {});
+    ok(r.body.ok && r.body.status === 'cancelled', '予約の取消');
+    // 新しい予約→時刻到来をシミュレート→送信 (ディスパッチャはretryと同じ経路)
+    r = await jsonPost('/api/orders/' + schedOrderId + '/email/send', { scheduledAt: jst }, 'em-key-10');
+    const schedJob2Id = r.body.jobId;
+    db.prepare("UPDATE po_email_jobs SET scheduled_at='2020-01-01T00:00:00.000Z' WHERE id=?").run(schedJob2Id);
+    r = await jsonPost('/api/email-jobs/' + schedJob2Id + '/retry', {});
+    ok(r.body.ok && r.body.status === 'sent', '予約時刻到来→送信');
+  }
 
   // MIME 生成 (Message-ID=delivery_key、添付CP932)
   {
@@ -1085,18 +1144,22 @@ console.log('── P15: メール送信 (fake transport) ──');
   try { db.prepare("UPDATE po_email_jobs SET status='queued' WHERE id=?").run(failedJobId); } catch (e) { threw = e.message; }
   ok(threw && threw.includes('終端状態'), '送信済みジョブの状態巻き戻しはトリガが拒否');
 
-  // 照合 (stale sending → Gmail検索で回復)。fake: found=送信済みと判明
+  // 照合: stale sending → Gmail検索1件=sent / 0件=unknownのまま (queuedに自動で戻さない)
   {
     process.env.PO_EMAIL_FAKE = 'fail';
-    r = await jsonPost('/api/orders/' + emOrderId + '/email/send', { resend: true }, 'em-key-6');
-    const staleId = r.body.jobId;
+    r = await jsonPost('/api/orders/' + schedOrderId + '/email/send', {}, 'em-key-11');
+    const staleId = r.body.jobId; // failed (dry-run。dedupはdry-run対象外なので作れる)
     process.env.PO_EMAIL_FAKE = '1';
     db.prepare("UPDATE po_email_jobs SET status='queued', error=NULL WHERE id=?").run(staleId);
     db.prepare("UPDATE po_email_jobs SET status='sending', sending_started_at='2020-01-01T00:00:00.000Z' WHERE id=?").run(staleId);
-    process.env.PO_EMAIL_FAKE_SEARCH = 'found';
+    process.env.PO_EMAIL_FAKE_SEARCH = 'error';
     r = await jsonPost('/api/email/reconcile', {});
     ok(r.body.ok && r.body.checked >= 1, '照合: staleなsendingを検査', r.body);
-    const st1 = db.prepare('SELECT status FROM po_email_jobs WHERE id=?').get(staleId);
+    let st1 = db.prepare('SELECT status FROM po_email_jobs WHERE id=?').get(staleId);
+    ok(st1.status === 'unknown', '照合不能→unknownに落とす (queuedに戻さない)');
+    process.env.PO_EMAIL_FAKE_SEARCH = 'found';
+    r = await jsonPost('/api/email/reconcile', {});
+    st1 = db.prepare('SELECT status FROM po_email_jobs WHERE id=?').get(staleId);
     ok(st1.status === 'sent', '照合: Gmailに存在→sentに回復');
     delete process.env.PO_EMAIL_FAKE_SEARCH;
   }

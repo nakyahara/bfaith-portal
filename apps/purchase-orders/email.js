@@ -92,9 +92,10 @@ export function buildOrderEmail(orderId) {
   if (!boundary || !order.issued_at || order.issued_at < boundary) throw new Error('アプリ管理外 (legacy) のPOは送信できません');
   const sup = db.prepare('SELECT * FROM po_suppliers WHERE supplier_code=?').get(order.supplier_code);
   if (!sup) throw new Error(`仕入先マスタが未登録です: ${order.supplier_code}`);
-  if (sup.send_method && sup.send_method !== 'email') throw new Error(`この仕入先の送信方法は ${sup.send_method} です (メール送信対象外)`);
   const to = parseAddresses(sup.email_to || '');
   if (!to.length) throw new Error(`仕入先にメールアドレスが未登録です: ${sup.name} (マスタ管理→宛先マスタ取込で登録してください)`);
+  // NULL(未設定) も送信不可 (安全側)。宛先マスタ取込が send_method='email' を設定する
+  if (sup.send_method !== 'email') throw new Error(`この仕入先の送信方法が email に設定されていません (現在: ${sup.send_method || '未設定'})。仕入先マスタで設定してください`);
   const cc = parseAddresses(sup.email_cc || '');
 
   const items = db.prepare('SELECT product_code, product_key, product_name, qty, unit_cost FROM po_order_items WHERE order_id=? ORDER BY id').all(orderId);
@@ -118,6 +119,11 @@ export function buildOrderEmail(orderId) {
     }
   }
   const csvText = lines.join('\r\n');
+  // CP932変換不能文字の検出 (黙って ? に化けるとプレビューと実添付が食い違う、Codex P15-R1 M10)
+  if (iconv.decode(iconv.encode(csvText, 'cp932'), 'cp932') !== csvText) {
+    const bad = [...new Set([...csvText].filter(ch => iconv.decode(iconv.encode(ch, 'cp932'), 'cp932') !== ch))].slice(0, 10);
+    throw new Error(`添付CSVにShift-JISへ変換できない文字があります: ${bad.join(' ')} — 商品名等を確認してください`);
+  }
   const st = emailSettings();
   const data = { date: jstToday(), name: sup.name, contact: ensureSama(sup.contact_name), po_number: order.po_number || `#${order.id}` };
   return {
@@ -131,17 +137,36 @@ export function buildOrderEmail(orderId) {
   };
 }
 
+/** 'YYYY-MM-DDTHH:mm' (JST入力) → UTC ISO。過去・60日超は拒否 */
+export function parseScheduleAt(s) {
+  const t = trimS(s);
+  if (!t) return null;
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(t)) throw new Error(`予約日時の形式が不正です: ${t}`);
+  const ms = Date.parse(t + ':00+09:00');
+  if (!Number.isFinite(ms)) throw new Error(`予約日時が不正です: ${t}`);
+  if (ms < Date.now() - 60000) throw new Error('予約日時が過去です。今すぐ送る場合は日時を空にしてください');
+  if (ms > Date.now() + 60 * 86400000) throw new Error('予約は60日以内にしてください');
+  return new Date(ms).toISOString();
+}
+
 /**
  * 送信ジョブの作成 (同期。Idempotency-Keyは呼び出し側=withCommandで包む)。
  * dedup: 同一PO+同一内容 (is_resend=0, 非dry-run) はUNIQUEで拒否。
+ * 再送は resendOfJobId 必須 (同一POの sent 済み本送信ジョブのみ、上限3回、Codex P15-R1 High-3)。
+ * scheduledAt (JST 'YYYY-MM-DDTHH:mm') を渡すと予約送信 (ディスパッチャが時刻到来で送信)。
  * @returns jobId
  */
-export function createEmailJob(orderId, { resend = false, actor = null } = {}) {
+export function createEmailJob(orderId, { resend = false, resendOfJobId = null, scheduledAt = null, actor = null } = {}) {
   const db = getDB();
   const st = emailSettings();
   if (!st.envReady) throw new Error('Gmail API のenv (PO_GMAIL_CLIENT_ID/SECRET/REFRESH_TOKEN) が未設定です。Renderの環境変数を設定してください');
   const p = buildOrderEmail(orderId);
   const dryRun = st.mode !== 'live';
+  // live送信で先方管理番号の欠落があれば止める (仕入先側の誤処理防止、Codex P15-R1 M5)
+  if (!dryRun && p.vendorColUsed && p.missingVendorCodes.length) {
+    throw new Error(`先方管理番号が未登録の商品があります (${p.missingVendorCodes.slice(0, 5).join(', ')}${p.missingVendorCodes.length > 5 ? ' …' : ''})。対応表を更新してから送信してください`);
+  }
+  const scheduleIso = parseScheduleAt(scheduledAt);
   let to = p.to, cc = p.cc, subject = p.subject, body = p.body;
   if (dryRun) {
     if (!st.dryrunTo) throw new Error('dry-runの送信先 (email_dryrun_to) が未設定です。メール設定で社内アドレスを登録してください');
@@ -155,23 +180,34 @@ export function createEmailJob(orderId, { resend = false, actor = null } = {}) {
   const contentHash = createHash('sha256').update([p.to.join(','), p.cc.join(','), p.subject, p.body, p.csvText].join('\x1f')).digest('hex');
 
   const tx = db.transaction(() => {
+    let resendOf = null;
+    if (resend) {
+      const orig = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(Number(resendOfJobId));
+      if (!orig) throw new Error('再送には元ジョブ (resendOfJobId) の指定が必要です');
+      if (orig.order_id !== orderId) throw new Error('元ジョブが別の発注です');
+      if (orig.status !== 'sent' || orig.is_dry_run) throw new Error('再送できるのは送信済み (本送信) のジョブだけです');
+      const n = db.prepare('SELECT COUNT(*) AS n FROM po_email_jobs WHERE resend_of=?').get(orig.id).n;
+      if (n >= 3) throw new Error('同じ送信への再送は3回までです');
+      resendOf = orig.id;
+    }
     let info;
     try {
       info = db.prepare(`INSERT INTO po_email_jobs
-        (order_id, status, is_dry_run, delivery_key, to_addr, cc_addr, subject, body, attachment_name, attachment_csv,
-         content_hash, is_resend, created_at, actor)
-        VALUES (?,'queued',?,?,?,?,?,?,?,?,?,?,?,?)`)
-        .run(orderId, dryRun ? 1 : 0, deliveryKey, to.join(','), cc.join(',') || null, subject, bodyWithKey,
-          p.attachmentName, p.csvText, contentHash, resend ? 1 : 0, nowIso(), actor);
+        (order_id, status, is_dry_run, scheduled_at, delivery_key, to_addr, cc_addr, subject, body, attachment_name, attachment_csv,
+         content_hash, is_resend, resend_of, created_at, actor)
+        VALUES (?,'queued',?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(orderId, dryRun ? 1 : 0, scheduleIso, deliveryKey, to.join(','), cc.join(',') || null, subject, bodyWithKey,
+          p.attachmentName, p.csvText, contentHash, resend ? 1 : 0, resendOf, nowIso(), actor);
     } catch (e) {
       if (String(e.code || '').startsWith('SQLITE_CONSTRAINT')) {
-        throw new Error('同じ内容の発注書は送信済み (または送信中) です。内容を変えたか再送したい場合は「再送」を使ってください');
+        throw new Error('同じ内容の発注書は送信済み (または送信待ち) です。もう一度送る場合は「再送」を使ってください');
       }
       throw e;
     }
     const jobId = Number(info.lastInsertRowid);
     audit(db, { actorType: 'user', actor, action: dryRun ? 'email_dryrun_queued' : 'email_queued',
-      resource: `order:${orderId}`, detail: { jobId, to, resend } });
+      resource: `order:${orderId}`,
+      detail: { jobId, to, resendOf, scheduledAt: scheduleIso, deliveryKey, contentHash: contentHash.slice(0, 16) } });
     return jobId;
   });
   return tx.immediate();
@@ -179,70 +215,142 @@ export function createEmailJob(orderId, { resend = false, actor = null } = {}) {
 
 /**
  * ジョブ1件の送信処理 (async)。lease (queued/failed→sending) をcommitしてからGmail APIを呼ぶ。
- * 送信要求後の失敗は「実際は届いている」可能性がある → failed にし、自動再送はしない (照合で回復)。
+ * エラーの分類が二重送信防止の要 (Codex P15-R1 High-1):
+ *  - Gmail送信要求「前」の失敗 (トークン取得等) → failed (再試行可)
+ *  - Gmail送信要求「後」の失敗 → unknown (実際は届いている可能性。自動・通常再試行は不可、照合で回復)
  */
 export async function processEmailJob(jobId) {
   const db = getDB();
   const leased = db.transaction(() => {
     const job = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(jobId);
     if (!job) throw new Error(`ジョブが存在しません: ${jobId}`);
-    if (job.status === 'sent') return { done: true, job };
+    if (job.status === 'sent') return { done: 'sent', job };
     if (job.status === 'sending') throw new Error('送信処理中です。時間を置いて「送信状態を照合」を実行してください');
+    if (job.status === 'unknown') throw new Error('送信結果が不明なジョブです。「送信状態を照合」またはGmailの送信済みを確認してください (二重送信防止のため再試行できません)');
     if (job.status === 'cancelled') throw new Error('取消済みのジョブです');
+    if (job.scheduled_at && job.scheduled_at > nowIso()) return { done: 'scheduled', job };
     if (job.attempt_count >= 5) throw new Error('再試行上限 (5回) に達しています。「再送」で新しいジョブを作成してください');
     if (job.status === 'failed') db.prepare("UPDATE po_email_jobs SET status='queued' WHERE id=?").run(jobId);
     db.prepare("UPDATE po_email_jobs SET status='sending', sending_started_at=?, attempt_count=attempt_count+1, error=NULL WHERE id=?")
       .run(nowIso(), jobId);
     return { done: false, job: db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(jobId) };
   }).immediate();
-  if (leased.done) return { status: 'sent', gmailMessageId: leased.job.gmail_message_id };
+  if (leased.done === 'sent') return { status: 'sent', gmailMessageId: leased.job.gmail_message_id };
+  if (leased.done === 'scheduled') return { status: 'scheduled', scheduledAt: leased.job.scheduled_at };
 
   const job = leased.job;
+  let phase = 'pre';
   try {
-    const messageId = await sendViaGmail(job);
+    const messageId = await sendViaGmail(job, p => { phase = p; });
     db.prepare("UPDATE po_email_jobs SET status='sent', sent_at=?, gmail_message_id=? WHERE id=?").run(nowIso(), messageId, jobId);
     audit(db, { actorType: 'system', actor: null, action: 'email_sent', resource: `order:${job.order_id}`,
-      detail: { jobId, gmailMessageId: messageId, dryRun: !!job.is_dry_run } });
+      detail: { jobId, gmailMessageId: messageId, dryRun: !!job.is_dry_run, deliveryKey: job.delivery_key } });
     return { status: 'sent', gmailMessageId: messageId };
   } catch (e) {
-    db.prepare("UPDATE po_email_jobs SET status='failed', error=? WHERE id=?").run(String(e.message).slice(0, 500), jobId);
-    return { status: 'failed', error: String(e.message) };
+    const msg = String(e.message).slice(0, 500);
+    if (phase === 'post') {
+      // 送信要求は飛んだ後の失敗 = 届いている可能性がある
+      db.prepare("UPDATE po_email_jobs SET status='unknown', error=? WHERE id=?")
+        .run(`送信結果不明: ${msg} — 「照合」で確認してください (自動再送はしません)`, jobId);
+      audit(db, { actorType: 'system', actor: null, action: 'email_unknown', resource: `order:${job.order_id}`,
+        detail: { jobId, error: msg, deliveryKey: job.delivery_key } });
+      return { status: 'unknown', error: msg };
+    }
+    db.prepare("UPDATE po_email_jobs SET status='failed', error=? WHERE id=?").run(msg, jobId);
+    return { status: 'failed', error: msg };
   }
 }
 
 /**
- * lease切れ (10分) の sending ジョブをGmail照合で回復する (async):
- *  - rfc822msgid で1通見つかった → sent / 0通 → queued に戻す (自動送信はしない) /
- *  - 照合不能 (scope不足等) → sending のまま error に手動確認の案内を残す
+ * 照合 (async): lease切れ (10分) の sending と unknown をGmail検索 (rfc822msgid) で確認する。
+ *  - 1通見つかった → sent / それ以外 (0件・照合不能) → unknown のまま (0件は未送信の証明にならない、
+ *    Codex P15-R1 High-2)。再送したい場合は人間がGmail送信済みを確認して「未送信を確認した」を実行する
  */
 export async function reconcileEmailJobs() {
   const db = getDB();
   const staleBefore = new Date(Date.now() - 10 * 60000).toISOString();
-  const stale = db.prepare("SELECT * FROM po_email_jobs WHERE status='sending' AND sending_started_at < ?").all(staleBefore);
+  const targets = db.prepare(`SELECT * FROM po_email_jobs
+    WHERE status='unknown' OR (status='sending' AND sending_started_at < ?)`).all(staleBefore);
   const results = [];
-  for (const job of stale) {
+  for (const job of targets) {
     try {
       const found = await searchGmailByMessageId(messageIdOf(job));
       if (found) {
-        db.prepare("UPDATE po_email_jobs SET status='sent', sent_at=?, gmail_message_id=? WHERE id=?").run(nowIso(), found, job.id);
+        if (job.status === 'sending') db.prepare("UPDATE po_email_jobs SET status='unknown' WHERE id=?").run(job.id);
+        db.prepare("UPDATE po_email_jobs SET status='sent', sent_at=?, gmail_message_id=?, error=NULL WHERE id=?").run(nowIso(), found, job.id);
+        audit(db, { actorType: 'system', actor: null, action: 'email_reconciled_sent', resource: `order:${job.order_id}`,
+          detail: { jobId: job.id, gmailMessageId: found, deliveryKey: job.delivery_key } });
         results.push({ jobId: job.id, result: 'sent (照合で送信済みを確認)' });
       } else {
-        db.prepare("UPDATE po_email_jobs SET status='queued', error='照合の結果、未送信を確認。再試行できます' WHERE id=?").run(job.id);
-        results.push({ jobId: job.id, result: 'queued (未送信を確認)' });
+        if (job.status === 'sending') db.prepare("UPDATE po_email_jobs SET status='unknown' WHERE id=?").run(job.id);
+        db.prepare('UPDATE po_email_jobs SET error=? WHERE id=?')
+          .run(`照合0件 (未送信の証明にはなりません)。Gmailの送信済みで整理番号 ${job.delivery_key} を確認し、無ければ「未送信を確認した」→再試行してください`, job.id);
+        results.push({ jobId: job.id, result: 'unknown (0件。手動確認要)' });
       }
     } catch (e) {
+      if (job.status === 'sending') db.prepare("UPDATE po_email_jobs SET status='unknown' WHERE id=?").run(job.id);
       db.prepare('UPDATE po_email_jobs SET error=? WHERE id=?')
         .run(`照合不能: ${String(e.message).slice(0, 200)} — Gmailで整理番号 ${job.delivery_key} を検索して手動確認してください`, job.id);
-      results.push({ jobId: job.id, result: 'unknown (手動確認要)' });
+      results.push({ jobId: job.id, result: 'unknown (照合不能。手動確認要)' });
     }
   }
-  return { checked: stale.length, results };
+  return { checked: targets.length, results };
+}
+
+/** 人間がGmail送信済みを確認して「未送信」を宣言した場合のみ、unknown → queued (再試行可能) に戻す */
+export function markUnsent(jobId, { actor = null } = {}) {
+  const db = getDB();
+  const tx = db.transaction(() => {
+    const job = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(jobId);
+    if (!job) throw new Error(`ジョブが存在しません: ${jobId}`);
+    if (job.status !== 'unknown') throw new Error('「未送信を確認した」は結果不明 (unknown) のジョブにのみ使えます');
+    db.prepare("UPDATE po_email_jobs SET status='queued', error='人間確認: Gmail送信済みに存在しない → 再試行可' WHERE id=?").run(jobId);
+    audit(db, { actorType: 'user', actor, action: 'email_marked_unsent', resource: `order:${job.order_id}`,
+      detail: { jobId, deliveryKey: job.delivery_key } });
+    return { status: 'queued' };
+  });
+  return tx.immediate();
+}
+
+/** 予約中 (queued) のジョブを取り消す */
+export function cancelEmailJob(jobId, { actor = null } = {}) {
+  const db = getDB();
+  const tx = db.transaction(() => {
+    const job = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(jobId);
+    if (!job) throw new Error(`ジョブが存在しません: ${jobId}`);
+    if (job.status !== 'queued' && job.status !== 'failed') throw new Error('取消できるのは送信前 (queued/failed) のジョブだけです');
+    db.prepare("UPDATE po_email_jobs SET status='cancelled' WHERE id=?").run(jobId);
+    audit(db, { actorType: 'user', actor, action: 'email_cancelled', resource: `order:${job.order_id}`,
+      detail: { jobId, scheduledAt: job.scheduled_at } });
+    return { status: 'cancelled' };
+  });
+  return tx.immediate();
+}
+
+/**
+ * 予約送信ディスパッチャ: 毎分、時刻が来た予約ジョブ (queued + scheduled_at <= now) を送信する。
+ * unref() するのでプロセス終了を妨げない。多重起動しても lease が二重送信を防ぐ
+ */
+let dispatcherStarted = false;
+export function startEmailDispatcher() {
+  if (dispatcherStarted) return;
+  dispatcherStarted = true;
+  const timer = setInterval(async () => {
+    try {
+      const due = getDB().prepare("SELECT id FROM po_email_jobs WHERE status='queued' AND scheduled_at IS NOT NULL AND scheduled_at <= ?")
+        .all(nowIso());
+      for (const j of due) {
+        try { await processEmailJob(j.id); } catch { /* leaseや検証エラーは次周期に任せる */ }
+      }
+    } catch { /* DB未初期化等。次周期に再試行 */ }
+  }, 60000);
+  timer.unref();
 }
 
 /** PO単位のジョブ履歴 */
 export function listEmailJobs(orderId) {
-  return getDB().prepare(`SELECT id, status, is_dry_run, delivery_key, to_addr, cc_addr, subject, attempt_count,
-      sending_started_at, gmail_message_id, error, created_at, sent_at, is_resend
+  return getDB().prepare(`SELECT id, status, is_dry_run, scheduled_at, delivery_key, to_addr, cc_addr, subject, attempt_count,
+      sending_started_at, gmail_message_id, error, created_at, sent_at, is_resend, resend_of
     FROM po_email_jobs WHERE order_id=? ORDER BY id DESC`).all(orderId);
 }
 
@@ -268,13 +376,20 @@ async function gmailAccessToken() {
   return tokenCache.token;
 }
 
-async function sendViaGmail(job) {
+/**
+ * Gmail送信。onPhase('post') を「送信要求を発した直後」に呼ぶ (以降の失敗=結果不明、二重送信防止の分類に使う)
+ */
+async function sendViaGmail(job, onPhase = () => {}) {
   if (process.env.PO_EMAIL_FAKE) {
-    if (process.env.PO_EMAIL_FAKE === 'fail') throw new Error('偽送信エラー (テスト)');
+    if (process.env.PO_EMAIL_FAKE === 'fail') throw new Error('偽送信エラー (テスト、要求前)');
+    if (process.env.PO_EMAIL_FAKE === 'fail_unknown') { onPhase('post'); throw new Error('偽送信エラー (テスト、要求後)'); }
+    onPhase('post');
     return 'fake-' + job.delivery_key;
   }
-  const token = await gmailAccessToken();
-  const raw = Buffer.from(buildMime(job)).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const token = await gmailAccessToken();          // ここまでの失敗 = pre (再試行可)
+  const mime = buildMime(job);                     // ヘッダ検証もここ (pre)
+  const raw = Buffer.from(mime).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  onPhase('post');                                 // 以降のネットワーク断・タイムアウト = 結果不明
   const res = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -282,7 +397,11 @@ async function sendViaGmail(job) {
     signal: AbortSignal.timeout(30000),
   });
   const j = await res.json().catch(() => ({}));
-  if (!res.ok || !j.id) throw new Error(`Gmail送信失敗 (HTTP ${res.status}): ${(j.error && j.error.message) || '不明'}`);
+  if (!res.ok || !j.id) {
+    // 4xxの明示拒否 = 「送信されていない」確定 → failed (再試行可)。5xxは送信済みの可能性が残る → unknown
+    if (res.status < 500) onPhase('pre');
+    throw new Error(`Gmail送信失敗 (HTTP ${res.status}): ${(j.error && j.error.message) || '不明'}`);
+  }
   return j.id;
 }
 
@@ -302,20 +421,42 @@ async function searchGmailByMessageId(rfcMessageId) {
   return list.length === 1 ? list[0].id : null;
 }
 
-/** 件名等の非ASCIIヘッダを RFC2047 (UTF-8/Base64) でエンコード */
+/** ヘッダ値の改行・NUL拒否 (CR/LFヘッダインジェクション対策。テンプレ保存時にも検証するが最終防衛はここ) */
+function assertHeaderSafe(name, v) {
+  if (/[\r\n\0]/.test(String(v || ''))) throw new Error(`${name} に改行を含めることはできません`);
+  return String(v || '');
+}
+
+/** 件名等の非ASCIIヘッダを RFC2047 (UTF-8/Base64) でエンコード。encoded-wordは75文字制限があるため分割してfold */
 function encodeWord(s) {
-  return /^[\x20-\x7e]*$/.test(s) ? s : `=?UTF-8?B?${Buffer.from(s, 'utf8').toString('base64')}?=`;
+  if (/^[\x20-\x7e]*$/.test(s)) return s;
+  const words = [];
+  let buf = '';
+  for (const ch of s) {
+    if (Buffer.byteLength(buf + ch, 'utf8') > 42) { words.push(buf); buf = ''; } // b64後~56文字+装飾<75
+    buf += ch;
+  }
+  if (buf) words.push(buf);
+  return words.map(w => `=?UTF-8?B?${Buffer.from(w, 'utf8').toString('base64')}?=`).join('\r\n '); // folding (継続行)
 }
 
 /** multipart/mixed MIME (本文UTF-8 + 添付CSV=CP932/Base64、ファイル名はASCII=PO番号.csv) */
 export function buildMime(job) {
   const boundary = 'b_' + job.delivery_key;
+  assertHeaderSafe('宛先', job.to_addr);
+  assertHeaderSafe('CC', job.cc_addr);
+  assertHeaderSafe('件名', job.subject);
+  assertHeaderSafe('添付ファイル名', job.attachment_name);
+  if (!/^[\x21-\x7e]+\.csv$/.test(job.attachment_name)) throw new Error(`添付ファイル名はASCIIの.csvのみ: ${job.attachment_name}`);
+  const from = process.env.PO_MAIL_FROM && EMAIL_RE.test(process.env.PO_MAIL_FROM) ? process.env.PO_MAIL_FROM : null;
   const csvB64 = iconv.encode(job.attachment_csv, 'cp932').toString('base64').replace(/(.{76})/g, '$1\r\n');
   const bodyB64 = Buffer.from(job.body, 'utf8').toString('base64').replace(/(.{76})/g, '$1\r\n');
   const headers = [
+    from ? `From: ${from}` : null,
     `To: ${job.to_addr}`,
     job.cc_addr ? `Cc: ${job.cc_addr}` : null,
     `Subject: ${encodeWord(job.subject)}`,
+    `Date: ${new Date().toUTCString()}`,
     `Message-ID: ${messageIdOf(job)}`,
     'MIME-Version: 1.0',
     `Content-Type: multipart/mixed; boundary="${boundary}"`,
