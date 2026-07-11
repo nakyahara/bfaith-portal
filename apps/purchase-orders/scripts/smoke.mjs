@@ -734,6 +734,124 @@ console.log('── P13a: 台帳 (イベント/逆仕訳/クローズ/整合性)
   ok(auditActions.includes('tracking_boundary_set') && auditActions.includes('order_closed')
      && auditActions.includes('order_reopened') && auditActions.includes('manual_close'), '監査ログ: 境界確定/クローズ/再オープン/手動クローズ', auditActions);
 }
+
+// ═══ P13b 発注残UI/API ═══
+console.log('── P13b: 発注残ページ+消込API ──');
+{
+  // 発注確定 → 部分入荷 (三択つき) → 納期回答 → 消込完走
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 30 }], note: 'P13bテスト', requestedDate: '2026-07-20' }) });
+  const boId = r.body.id;
+  const boItem = db.prepare('SELECT * FROM po_order_items WHERE order_id=?').get(boId);
+
+  // 部分入荷で残数の扱い未指定は 400
+  r = await j('/api/items/' + boItem.id + '/events', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: 'receipt', qty: 10 }) });
+  ok(r.status === 400 && r.body.error.includes('残数の扱い'), '部分入荷: 三択未指定は400', r.body.error);
+
+  // 分納待ちを選んで部分入荷
+  r = await j('/api/items/' + boItem.id + '/events', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: 'receipt', qty: 10, effectiveDate: '2026-07-11',
+      remainder: { action: 'await_delivery', nextExpectedDate: '2026-07-30', nextExpectedQty: 20 } }) });
+  ok(r.status === 200 && r.body.ok && r.body.remaining === 20, '部分入荷10+分納待ち: 残20', r.body);
+  let it3 = db.prepare('SELECT * FROM po_order_items WHERE id=?').get(boItem.id);
+  ok(it3.remainder_disposition === 'awaiting_delivery' && it3.next_expected_date === '2026-07-30', '三択が同一txnで保存');
+
+  // 回答納期の入力 (PATCH plan)
+  r = await j('/api/items/' + boItem.id + '/plan', { method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ promisedDate: '2026-07-25' }) });
+  ok(r.status === 200 && r.body.ok, '回答納期の保存 (PATCH plan)');
+
+  // /api/backorders に反映されている (フラグ・サマリ)
+  r = await j('/api/backorders');
+  ok(r.body.ok && r.body.boundary, '発注残API: boundary/サマリ');
+  const boOrder = r.body.orders.find(o => o.id === boId);
+  ok(boOrder && boOrder.open && boOrder.remainingQty === 20 && /^PO-\d{4}-/.test(boOrder.poNumber), '発注残API: 対象POが残20でオープン', boOrder && boOrder.remainingQty);
+  const boIt = boOrder.items[0];
+  ok(boIt.promised_date === '2026-07-25' && boIt.due === '2026-07-25' && boIt.flags.unanswered === false, '発注残API: 回答納期が遅延判定の基準になる');
+  ok(r.body.summary.openOrders >= 1 && r.body.summary.remainingQty >= 20, '発注残API: サマリ集計', r.body.summary);
+
+  // 確認中へ変更しつつさらに部分入荷 → 残りを減数で完了
+  r = await j('/api/items/' + boItem.id + '/events', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: 'receipt', qty: 5, remainder: { action: 'await_confirmation', nextActionDate: '2026-07-15' } }) });
+  ok(r.body.ok && r.body.remaining === 15, '部分入荷5+確認中: 残15');
+  r = await j('/api/items/' + boItem.id + '/events', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: 'receipt', qty: 10, remainder: { action: 'shortage', reasonCode: 'supplier_shortage', note: '原料不足' } }) });
+  ok(r.body.ok && r.body.remaining === 0 && r.body.orderClosed, '入荷10+残り5を減数で完了→自動クローズ', r.body);
+
+  // イベント履歴API + 逆仕訳API
+  r = await j('/api/items/' + boItem.id + '/events');
+  ok(r.body.ok && r.body.events.length === 4, 'イベント履歴API: 4イベント (入荷3+減数1)', r.body.events.length);
+  const firstReceipt = r.body.events.find(e => e.event_type === 'receipt');
+  r = await j('/api/events/' + firstReceipt.id + '/reverse', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ note: '入力ミス訂正' }) });
+  ok(r.body.ok && r.body.remaining === 10 && !r.body.orderClosed, '逆仕訳API: 残10で再オープン', r.body);
+
+  // 手動クローズAPI
+  r = await j('/api/orders/' + boId + '/close', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ note: '仕入先と合意の上打切' }) });
+  ok(r.body.ok && r.body.closed, '手動クローズAPI');
+  r = await j('/api/backorders');
+  const boOrder2 = r.body.orders.find(o => o.id === boId);
+  ok(boOrder2 && !boOrder2.open && boOrder2.closeReason === 'manual', '発注残API: 手動クローズ後は完了(打切)', boOrder2 && boOrder2.closeReason);
+
+  // 消込APIの冪等再送 (通信断→再クリックで二重登録しない)
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 8 }] }) });
+  const idemEvItem = db.prepare('SELECT * FROM po_order_items WHERE order_id=?').get(r.body.id);
+  const evBody = JSON.stringify({ type: 'receipt', qty: 8 });
+  const evOpts = { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'smoke-ev-1' }, body: evBody };
+  r = await j('/api/items/' + idemEvItem.id + '/events', evOpts);
+  ok(r.body.ok && r.body.remaining === 0, '消込API: 冪等キーつき入荷');
+  r = await j('/api/items/' + idemEvItem.id + '/events', evOpts);
+  ok(r.body.ok && r.body.replay === true && r.body.remaining === 0, '消込API: 同一キー再送はreplay (二重消込なし)', r.body);
+  ok(db.prepare('SELECT COUNT(*) AS n FROM po_item_events WHERE order_item_id=?').get(idemEvItem.id).n === 1, '消込API: イベントは1件のみ');
+
+  // 残数0の明細に扱い/予定は設定できない (stale_disposition を公開APIから作らせない)。
+  // オープンな複数明細POで、片方だけ全量入荷→その明細に扱いを設定しようとするケース
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 5 }, { code: 'cardstand-silver-r', qty: 5 }] }) });
+  const twoItems = db.prepare('SELECT * FROM po_order_items WHERE order_id=? ORDER BY id').all(r.body.id);
+  r = await j('/api/items/' + twoItems[0].id + '/events', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: 'receipt', qty: 5 }) });
+  ok(r.body.ok && r.body.remaining === 0 && !r.body.orderClosed, '複数明細PO: 片方全量入荷でもオープン維持');
+  r = await j('/api/items/' + twoItems[0].id + '/plan', { method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ disposition: 'awaiting_confirmation', nextActionDate: '2026-07-20' }) });
+  ok(r.status === 400 && r.body.error.includes('残数0'), '残数0明細への扱い設定は400 (Codex P13b R2)', r.body.error);
+
+  // 発注確定の冪等再送 (issue APIにキー: 再送は同じPO)
+  const issueOpts = key => ({ method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': key },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 2 }], requestedDate: '2026-08-01' }) });
+  r = await j('/api/supplier/1/issue', issueOpts('smoke-issue-idem'));
+  const issFirst = r.body;
+  r = await j('/api/supplier/1/issue', issueOpts('smoke-issue-idem'));
+  ok(r.body.ok && r.body.id === issFirst.id && r.body.replay === true, 'issue API: 同一キー再送は同じPO (二重発注なし)');
+
+  // 下書きにも希望納期が保存される
+  r = await j('/api/supplier/1/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 1 }], note: 'd', requestedDate: '2026-08-15' }) });
+  const draftRow = db.prepare("SELECT requested_date FROM po_orders WHERE status='draft' AND supplier_code='1'").get();
+  ok(r.body.ok && draftRow && draftRow.requested_date === '2026-08-15', '下書き保存で希望納期も保持 (Codex P13b R3)');
+
+  // ページ配信 (発注残ページ・ダッシュボードのサマリ・履歴のPO番号列)
+  {
+    const html = await (await fetch(base + '/backorders')).text();
+    ok(html.includes('boTabs') && html.includes('data-act') && html.includes('要対応'), '/backorders ページ配信 (タブ+消込ボタン)');
+    ok(html.includes('remBox') && html.includes('await_delivery'), '/backorders 部分入荷の三択UI');
+    ok(html.includes('data-rev') && html.includes('data-closeui'), '/backorders 逆仕訳+手動クローズUI (promptなし)');
+    ok(html.includes("td.innerHTML = ''") && html.includes('Idempotency-Key'), '/backorders パネルDOM破棄+冪等キー送信 (Codex P13b R1)');
+    ok(html.includes('data-disp') && html.includes('dspGo'), '/backorders 残数の扱い設定パネル (逆仕訳後の再設定用)');
+    ok(html.includes('getJson') && html.includes('再読込'), '/backorders GET失敗時の再読込UI');
+    // 発注確定の冪等キー (供給ページ): ノンス+内容ハッシュ
+    const sup = await (await fetch(base + '/supplier/1')).text();
+    ok(sup.includes('ISSUE_NONCE') && sup.includes('contentHash') && sup.includes('Idempotency-Key'), '/supplier 発注確定に冪等キー (ノンス+内容ハッシュ)');
+    ok(sup.includes('orderReqDate'), '/supplier 希望納期入力');
+    const dash = await (await fetch(base + '/')).text();
+    ok(dash.includes('発注残') && dash.includes('/apps/purchase-orders/backorders'), '/ ダッシュボードに発注残サマリ');
+    const orders = await (await fetch(base + '/orders')).text();
+    ok(orders.includes('PO番号') && orders.includes('発注残'), '/orders にPO番号・発注残列');
+  }
+}
 function nowIsoStr() { return new Date().toISOString(); }
 
 server.close();
