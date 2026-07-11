@@ -2365,9 +2365,15 @@ document.addEventListener('click', function(ev) {
 // 通信断後に同じ内容で再確定→同じキー (二重発注しない)。成功後に同内容を意図的に再発注→新ノンスで別キー
 var ISSUE_NONCE = 'n' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 function contentHash(s) {
-  var h = 5381;
-  for (var i = 0; i < s.length; i++) { h = ((h << 5) + h + s.charCodeAt(i)) >>> 0; }
-  return h.toString(36) + '-' + s.length;
+  // 32bit×2 (djb2 + FNV-1a) + 長さ。衝突してもサーバ側SHA-256の突合で409になるだけだが、
+  // 正当な再試行が誤って拒否されないよう衝突耐性を上げておく
+  var h1 = 5381, h2 = 0x811c9dc5;
+  for (var i = 0; i < s.length; i++) {
+    var c = s.charCodeAt(i);
+    h1 = ((h1 << 5) + h1 + c) >>> 0;
+    h2 = ((h2 ^ c) * 0x01000193) >>> 0;
+  }
+  return h1.toString(36) + h2.toString(36) + '-' + s.length;
 }
 function save(issue) {
   var items = cartItems().map(function(i){ return { code: i.code, qty: i.qty }; });
@@ -2702,6 +2708,13 @@ function patch(url, body, idemKey) {
   return fetch(url, { method: 'PATCH', headers: h, body: JSON.stringify(body) }).then(function(r){ return jsonOrErr(r, true); });
 }
 function getJson(url) { return fetch(url).then(function(r){ return jsonOrErr(r, false); }); }
+// 書込フロー共通の通信例外ハンドラ: ボタンを復帰させ「成否不明・同じ操作で安全に再試行可 (冪等キー保持)」を案内
+function onWriteErr(btn) {
+  return function(e) {
+    if (btn) btn.disabled = false;
+    toast('通信エラー: ' + e.message + ' — 登録されたか不明です。同じ内容のまま再実行すれば二重登録なしで確認できます');
+  };
+}
 
 function load() {
   getJson(API + '/backorders').then(function(j) {
@@ -2922,25 +2935,28 @@ function dispPanel(itemId) {
         type: 'shortage', qty: item.remaining_qty,
         reasonCode: (document.getElementById('dspReason') || {}).value,
         note: (document.getElementById('dspNote') || {}).value,
-      }, idemKey).then(function(j){ done(j, '残数を減数で消し込みました'); });
+      }, idemKey).then(function(j){ done(j, '残数を減数で消し込みました'); }).catch(onWriteErr(btn));
     } else if (v === 'await_delivery') {
       patch(API + '/items/' + itemId + '/plan', {
         disposition: 'awaiting_delivery',
         nextExpectedDate: (document.getElementById('dspDate') || {}).value,
         nextExpectedQty: (document.getElementById('dspQty') || {}).value,
-      }, idemKey).then(function(j){ done(j, '分納待ちに設定しました'); });
+      }, idemKey).then(function(j){ done(j, '分納待ちに設定しました'); }).catch(onWriteErr(btn));
     } else {
       patch(API + '/items/' + itemId + '/plan', {
         disposition: 'awaiting_confirmation',
         nextActionDate: (document.getElementById('dspActDate') || {}).value,
-      }, idemKey).then(function(j){ done(j, '確認中に設定しました'); });
+      }, idemKey).then(function(j){ done(j, '確認中に設定しました'); }).catch(onWriteErr(btn));
     }
   });
 }
 
 // ── 明細イベント履歴 (+逆仕訳) ──
+var HIST_SEQ = 0;
 function histPanel(itemId) {
+  var seq = ++HIST_SEQ; // 古い応答が後から届いて別明細のパネルを上書きしないようにする
   getJson(API + '/items/' + itemId + '/events').then(function(j) {
+    if (seq !== HIST_SEQ) return;
     if (!j.ok) { toast(j.error); return; }
     var h = '<table class="t"><tr><th>#</th><th>種別</th><th class="r">数量</th><th>業務日付</th><th>理由/メモ</th><th>登録</th><th></th></tr>';
     j.events.forEach(function(e) {
@@ -3002,7 +3018,7 @@ document.addEventListener('click', function(ev) {
         if (!j.ok) { toast('エラー: ' + j.error); return; }
         toast('逆仕訳しました (残 ' + j.remaining + ')' + (j.needsDisposition ? ' — ⚠️ 残数の扱い (分納待ち/減数/確認中) を選択してください' : ''));
         load();
-      });
+      }).catch(onWriteErr(document.getElementById('revGo')));
     });
     return;
   }
@@ -3021,7 +3037,7 @@ document.addEventListener('click', function(ev) {
         if (!j.ok) { toast('エラー: ' + j.error); return; }
         toast('クローズしました (打切 ' + j.cutoffItems + '明細)');
         load();
-      });
+      }).catch(onWriteErr(document.getElementById('clGo')));
     });
     return;
   }
@@ -3039,7 +3055,7 @@ document.addEventListener('click', function(ev) {
       if (!j.ok) { toast('エラー: ' + j.error); return; }
       toast('回答納期を保存しました');
       load();
-    });
+    }).catch(onWriteErr(t));
     return;
   }
 });
