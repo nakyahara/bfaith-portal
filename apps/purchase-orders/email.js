@@ -159,9 +159,14 @@ export function parseScheduleAt(s) {
  * scheduledAt (JST 'YYYY-MM-DDTHH:mm') を渡すと予約送信 (ディスパッチャが時刻到来で送信)。
  * @returns jobId
  */
-export function createEmailJob(orderId, { resend = false, resendOfJobId = null, scheduledAt = null, actor = null } = {}) {
+export function createEmailJob(orderId, { resend = false, resendOfJobId = null, scheduledAt = null, expectedMode = null, actor = null } = {}) {
   const db = getDB();
   const st = emailSettings();
+  // プレビュー時のモードと現在モードの一致を必須にする (プレビュー後に他所でliveへ切り替わっていても、
+  // 「dry-runのつもり」の承認で本送信しない、Codex P15-R9 High)
+  if (expectedMode !== st.mode) {
+    throw new Error(`送信モードが変わっています (画面: ${expectedMode || '未指定'} / 現在: ${st.mode})。プレビューを開き直して内容を確認してください`);
+  }
   if (!st.envReady) throw new Error('Gmail API のenv (PO_GMAIL_CLIENT_ID/SECRET/REFRESH_TOKEN) が未設定です。Renderの環境変数を設定してください');
   const p = buildOrderEmail(orderId);
   const dryRun = st.mode !== 'live';
@@ -239,7 +244,7 @@ export async function processEmailJob(jobId) {
     if (job.status === 'unknown') throw new Error('送信結果が不明なジョブです。「送信状態を照合」またはGmailの送信済みを確認してください (二重送信防止のため再試行できません)');
     if (job.status === 'cancelled') throw new Error('取消済みのジョブです');
     if (job.scheduled_at && job.scheduled_at > nowIso()) return { done: 'scheduled', job };
-    if (job.attempt_count >= 5) throw new Error('再試行上限 (5回) に達しています。「再送」で新しいジョブを作成してください');
+    if (job.attempt_count >= 5) throw new Error('再試行上限 (5回) に達しています。このジョブを「取消」し、新しく送信し直してください');
     if (job.status === 'failed') db.prepare("UPDATE po_email_jobs SET status='queued' WHERE id=?").run(jobId);
     // generation = 送信試行の世代。照合はスナップショット時の世代と一致する場合のみ結果を適用する (競合検知)
     db.prepare("UPDATE po_email_jobs SET status='sending', sending_started_at=?, attempt_count=attempt_count+1, generation=generation+1, error=NULL WHERE id=?")
@@ -253,7 +258,8 @@ export async function processEmailJob(jobId) {
   // 完了の書き戻しも lease時の generation を条件にする (Codex P15-R7 High-2:
   // 長時間停止した旧世代の送信処理が復帰しても、reconcile→markUnsent→retryで進んだ新世代の状態を上書きしない)
   const gen = job.generation;
-  const finalize = (setSql, params, action, detail) => {
+  // 状態確定と監査は同一txn (sent確定直後のクラッシュで監査だけ欠けない、Codex P15-R9 Medium)
+  const finalize = db.transaction((setSql, params, action, detail) => {
     const changed = db.prepare(`UPDATE po_email_jobs ${setSql} WHERE id=? AND status='sending' AND generation=?`)
       .run(...params, jobId, gen).changes;
     if (changed === 0) {
@@ -263,7 +269,7 @@ export async function processEmailJob(jobId) {
     }
     if (action) audit(db, { actorType: 'system', actor: null, action, resource: `order:${job.order_id}`, detail });
     return true;
-  };
+  });
   // Gmail要求の直前にも世代を再検証 (Codex P15-R8 High: lease後に長時間停止した旧プロセスが復帰しても
   // 新世代へ進んでいたら外部送信自体を中止する。書き戻し条件と合わせた二段ガード)
   const verifyFresh = () => {

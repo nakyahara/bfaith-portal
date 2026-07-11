@@ -994,7 +994,12 @@ console.log('── P14: 入庫CSV取込+突合+割当 ──');
 console.log('── P15: メール送信 (fake transport) ──');
 {
   process.env.PO_EMAIL_FAKE = '1';
-  const jsonPost = (p, body, key) => j(p, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(key ? { 'Idempotency-Key': key } : {}) }, body: JSON.stringify(body) });
+  // /email/send は expectedMode 必須 (プレビュー時モードの一致検証)。テストでは現在モードを自動注入
+  let CUR_MODE = 'dry_run';
+  const jsonPost = (p, body, key) => {
+    if (p.includes('/email/send') && body && body.expectedMode === undefined) body = { expectedMode: CUR_MODE, ...body };
+    return j(p, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(key ? { 'Idempotency-Key': key } : {}) }, body: JSON.stringify(body) });
+  };
 
   // 送信対象PO (tracked)
   r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1062,6 +1067,10 @@ console.log('── P15: メール送信 (fake transport) ──');
   ok(r.status === 400 && r.body.error.includes('LIVE'), 'live切替は確認文字列なしでは拒否');
   r = await jsonPost('/api/email/mode', { mode: 'live', confirm: 'LIVE' });
   ok(r.body.ok && r.body.mode === 'live', 'live切替 (confirm=LIVE)');
+  // プレビュー時モードと現在モードの不一致は拒否 (プレビュー後にliveへ変わっていたら送らない)
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', { expectedMode: 'dry_run' }, 'em-key-mode');
+  ok(r.status === 400 && r.body.error.includes('モードが変わって'), 'expectedMode不一致は拒否 (Codex P15 R9)', r.body.error);
+  CUR_MODE = 'live';
 
   // 本番送信 → 同一内容の二重送信はdedup拒否 → 再送は元ジョブ指定必須
   r = await jsonPost('/api/orders/' + emOrderId + '/email/send', {}, 'em-key-2');
@@ -1144,6 +1153,7 @@ console.log('── P15: メール送信 (fake transport) ──');
   // 予約送信: 未来時刻はqueuedのまま (scheduled)→時刻到来で送信。過去時刻は拒否。取消可能 (dry-runで実施)
   {
     await jsonPost('/api/email/mode', { mode: 'dry_run' });
+    CUR_MODE = 'dry_run';
     r = await jsonPost('/api/orders/' + schedOrderId + '/email/send', { scheduledAt: '2020-01-01T00:00' }, 'em-key-8');
     ok(r.status === 400 && r.body.error.includes('過去'), '過去日時の予約は拒否');
     const jst = new Date(Date.now() + 9 * 3600000 + 3600000).toISOString().slice(0, 16); // 1時間後 (JST表記)

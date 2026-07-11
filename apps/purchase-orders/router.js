@@ -639,12 +639,13 @@ router.post('/api/orders/:id/email/send', async (req, res) => {
     const resend = !!b.resend;
     const resendOfJobId = b.resendOfJobId != null ? Number(b.resendOfJobId) : null;
     const scheduledAt = trimS(b.scheduledAt) || null;
+    const expectedMode = trimS(b.expectedMode) || null; // プレビュー時のモード (現在モードと不一致なら拒否)
     // 冪等キーは必須 (再送ジョブはdedup対象外のため、通信断後の再実行・自動リトライでの複数通送信をキーで防ぐ、Codex P15-R4 High)
     const idemKey = trimS(req.get('Idempotency-Key'));
     if (!idemKey) return res.status(400).json({ ok: false, error: 'Idempotency-Key ヘッダが必要です (画面からの送信では自動付与されます)' });
     const { replay, result: jobId } = withCommand(
-      { idempotencyKey: idemKey, payload: { op: 'email_send', orderId, resend, resendOfJobId, scheduledAt } },
-      () => createEmailJob(orderId, { resend, resendOfJobId, scheduledAt, actor: actorOf(req) })
+      { idempotencyKey: idemKey, payload: { op: 'email_send', orderId, resend, resendOfJobId, scheduledAt, expectedMode } },
+      () => createEmailJob(orderId, { resend, resendOfJobId, scheduledAt, expectedMode, actor: actorOf(req) })
     );
     const outcome = await processEmailJob(jobId);
     const jb = getDB().prepare('SELECT is_dry_run FROM po_email_jobs WHERE id=?').get(jobId);
@@ -3404,7 +3405,8 @@ function emailPanel(orderId) {
       var btn = document.getElementById('emGo-' + orderId);
       if (btn) btn.disabled = true;
       post(API + '/orders/' + orderId + '/email/send',
-        { resend: !!resend, resendOfJobId: resend && lastSent ? lastSent.id : null, scheduledAt: scheduledAt || null }, idemKey)
+        { resend: !!resend, resendOfJobId: resend && lastSent ? lastSent.id : null, scheduledAt: scheduledAt || null,
+          expectedMode: j.mode }, idemKey)
         .then(function(r2) {
           if (btn) btn.disabled = false;
           if (!r2.ok) { toast('エラー: ' + r2.error); emailPanel(orderId); return; }
