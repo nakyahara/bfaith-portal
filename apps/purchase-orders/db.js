@@ -428,6 +428,95 @@ function initLedgerSchema(db) {
     last_number INTEGER NOT NULL CHECK(last_number >= 0)
   )`);
 
+  // ── ロジザード入庫実績 (P14。原本=append志向、訂正は supersede+競合キュー) ──
+  // 「NE仕入れ取込用データ」CSVには安定した明細番号が無いため、行ID = 内容ハッシュ+同一内容の出現順。
+  // 訂正版CSV (同一伝票NOの再出力で行が変わる) は、消えた/変わった行を superseded=1 にし新行を追加する。
+  // superseded行に有効な割当 (receiptイベント) が残っていれば「訂正競合」として整合性検査が報告し、
+  // 人間が逆仕訳→再割当で解消する (要件v8 F-5 / Codex R5 C-3)。明細番号列が将来来たら安定IDへ移行可能
+  db.exec(`CREATE TABLE IF NOT EXISTS po_inbound_batches (
+    id            INTEGER PRIMARY KEY,
+    file_name     TEXT,
+    file_hash     TEXT NOT NULL UNIQUE,
+    row_count     INTEGER NOT NULL CHECK(row_count >= 0),
+    receipt_count INTEGER NOT NULL DEFAULT 0,
+    imported_at   TEXT NOT NULL,
+    actor         TEXT
+  )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS po_inbound_receipts (
+    id            INTEGER PRIMARY KEY,
+    source        TEXT NOT NULL DEFAULT 'logizard',
+    source_key    TEXT NOT NULL,
+    receipt_date  TEXT,
+    first_batch_id INTEGER REFERENCES po_inbound_batches(id),
+    last_batch_id  INTEGER REFERENCES po_inbound_batches(id),
+    imported_at   TEXT NOT NULL,
+    UNIQUE(source, source_key)
+  )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS po_inbound_items (
+    id            INTEGER PRIMARY KEY,
+    receipt_id    INTEGER NOT NULL REFERENCES po_inbound_receipts(id),
+    line_key      TEXT NOT NULL,
+    batch_id      INTEGER NOT NULL REFERENCES po_inbound_batches(id),
+    supplier_code TEXT,
+    product_code  TEXT NOT NULL,
+    product_key   TEXT NOT NULL,
+    good_qty      INTEGER NOT NULL CHECK(good_qty >= 0),
+    defective_qty INTEGER NOT NULL DEFAULT 0 CHECK(defective_qty >= 0),
+    unit_cost     REAL,
+    payload_json  TEXT CHECK(payload_json IS NULL OR json_valid(payload_json)),
+    superseded    INTEGER NOT NULL DEFAULT 0 CHECK(superseded IN (0,1)),
+    superseded_batch_id INTEGER REFERENCES po_inbound_batches(id),
+    created_at    TEXT NOT NULL,
+    UNIQUE(receipt_id, line_key)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_po_inb_match ON po_inbound_items(product_key, superseded)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_po_inb_receipt ON po_inbound_items(receipt_id)');
+  // 「対象外」は履歴型 (誰がいつなぜ・解除も記録)。対象外の判定は revoked_at IS NULL の行が存在するか
+  db.exec(`CREATE TABLE IF NOT EXISTS po_inbound_ignores (
+    id              INTEGER PRIMARY KEY,
+    inbound_item_id INTEGER NOT NULL REFERENCES po_inbound_items(id),
+    reason          TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    actor           TEXT,
+    revoked_at      TEXT,
+    revoked_by      TEXT
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_po_inb_ign ON po_inbound_ignores(inbound_item_id, revoked_at)');
+  // 割当が残る入庫の「対象外」化を物理拒否 (アプリ検証の最終防衛、Codex P14-R1 High-1)
+  db.exec(`CREATE TRIGGER trg_po_inbound_ignore_guard BEFORE INSERT ON po_inbound_ignores
+           WHEN NEW.revoked_at IS NULL
+           BEGIN
+             SELECT CASE WHEN (
+               SELECT COALESCE(SUM(e.qty), 0) FROM po_item_events e
+               WHERE e.inbound_item_id = NEW.inbound_item_id AND e.event_type = 'receipt'
+                 AND NOT EXISTS (SELECT 1 FROM po_item_events r WHERE r.reverses_id = e.id)
+             ) > 0 THEN RAISE(ABORT, 'inbound ignore: 割当が残る入庫は対象外にできません (先に逆仕訳を)') END;
+           END`);
+  // logizard入荷の割当ガード: 参照先の実在・非supersede・非ignore・割当合計≤入庫良品数 (要件v8 F-5)。
+  // ※入庫テーブル作成後に定義する (トリガ本文のテーブル参照はCREATE時に解決される)
+  db.exec(`CREATE TRIGGER trg_po_events_inbound_capacity BEFORE INSERT ON po_item_events
+           WHEN NEW.event_type = 'receipt' AND NEW.inbound_item_id IS NOT NULL
+           BEGIN
+             SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM po_inbound_items x WHERE x.id = NEW.inbound_item_id AND x.superseded = 0)
+               THEN RAISE(ABORT, 'inbound: 入庫明細が存在しないか、訂正版で無効化されています') END;
+             SELECT CASE WHEN EXISTS (SELECT 1 FROM po_inbound_ignores g WHERE g.inbound_item_id = NEW.inbound_item_id AND g.revoked_at IS NULL)
+               THEN RAISE(ABORT, 'inbound: 対象外に指定された入庫明細です') END;
+             -- 商品・仕入先の一致を書込時にも強制 (候補UIのフィルタは整合性境界ではない、Codex P14-R2 High-1)
+             SELECT CASE WHEN (SELECT x.product_key FROM po_inbound_items x WHERE x.id = NEW.inbound_item_id)
+               <> (SELECT i.product_key FROM po_order_items i WHERE i.id = NEW.order_item_id)
+               THEN RAISE(ABORT, 'inbound: 入庫と発注の商品が一致しません') END;
+             SELECT CASE WHEN (SELECT x.supplier_code FROM po_inbound_items x WHERE x.id = NEW.inbound_item_id) IS NOT NULL
+               AND (SELECT x.supplier_code FROM po_inbound_items x WHERE x.id = NEW.inbound_item_id)
+                 <> (SELECT o.supplier_code FROM po_orders o JOIN po_order_items i ON i.order_id = o.id WHERE i.id = NEW.order_item_id)
+               THEN RAISE(ABORT, 'inbound: 入庫と発注の仕入先が一致しません') END;
+             SELECT CASE WHEN (
+               SELECT COALESCE(SUM(e.qty), 0) FROM po_item_events e
+               WHERE e.inbound_item_id = NEW.inbound_item_id AND e.event_type = 'receipt'
+                 AND NOT EXISTS (SELECT 1 FROM po_item_events r WHERE r.reverses_id = e.id)
+             ) + NEW.qty > (SELECT good_qty FROM po_inbound_items WHERE id = NEW.inbound_item_id)
+               THEN RAISE(ABORT, 'inbound: 割当合計が入庫の良品数を超えます') END;
+           END`);
+
   // ── 設定 (現在値テーブル。変更は前後値を po_audit_log に同一txn記録) ──
   db.exec(`CREATE TABLE IF NOT EXISTS po_settings (
     key          TEXT PRIMARY KEY,
