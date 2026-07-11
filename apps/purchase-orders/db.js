@@ -559,7 +559,8 @@ function initLedgerSchema(db) {
     error         TEXT,
     created_at    TEXT NOT NULL,
     sent_at       TEXT,
-    actor         TEXT
+    actor         TEXT,
+    CHECK ((is_resend = 1) = (resend_of IS NOT NULL))
   )`);
   // 同一PO+同一内容の二重送信を禁止 (再送は is_resend=1 で明示。dry-runは本送信のdedupを妨げない)
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS uq_po_email_dedup ON po_email_jobs(order_id, content_hash)

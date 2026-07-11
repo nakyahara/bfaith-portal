@@ -137,13 +137,16 @@ export function buildOrderEmail(orderId) {
   };
 }
 
-/** 'YYYY-MM-DDTHH:mm' (JST入力) → UTC ISO。過去・60日超は拒否 */
+/** 'YYYY-MM-DDTHH:mm' (JST入力) → UTC ISO。過去・60日超・実在しない日時 (2/30等) は拒否 */
 export function parseScheduleAt(s) {
   const t = trimS(s);
   if (!t) return null;
   if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(t)) throw new Error(`予約日時の形式が不正です: ${t}`);
   const ms = Date.parse(t + ':00+09:00');
   if (!Number.isFinite(ms)) throw new Error(`予約日時が不正です: ${t}`);
+  // 実在検証: JSTへ戻して入力と往復比較 (2026-02-30 が3/2に正規化されて別時刻に送られるのを防ぐ)
+  const back = new Date(ms + 9 * 3600000).toISOString().slice(0, 16);
+  if (back !== t) throw new Error(`実在しない日時です: ${t}`);
   if (ms < Date.now() - 60000) throw new Error('予約日時が過去です。今すぐ送る場合は日時を空にしてください');
   if (ms > Date.now() + 60 * 86400000) throw new Error('予約は60日以内にしてください');
   return new Date(ms).toISOString();
@@ -182,10 +185,17 @@ export function createEmailJob(orderId, { resend = false, resendOfJobId = null, 
   const tx = db.transaction(() => {
     let resendOf = null;
     if (resend) {
-      const orig = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(Number(resendOfJobId));
+      let orig = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(Number(resendOfJobId));
       if (!orig) throw new Error('再送には元ジョブ (resendOfJobId) の指定が必要です');
       if (orig.order_id !== orderId) throw new Error('元ジョブが別の発注です');
       if (orig.status !== 'sent' || orig.is_dry_run) throw new Error('再送できるのは送信済み (本送信) のジョブだけです');
+      // 再送の再送でも常にルート (最初の本送信) に正規化して数える (チェーンで3回上限を回避させない、Codex P15-R2 High)
+      let hops = 0;
+      while (orig.is_resend && orig.resend_of != null) {
+        const parent = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(orig.resend_of);
+        if (!parent || ++hops > 10) break;
+        orig = parent;
+      }
       const n = db.prepare('SELECT COUNT(*) AS n FROM po_email_jobs WHERE resend_of=?').get(orig.id).n;
       if (n >= 3) throw new Error('同じ送信への再送は3回までです');
       resendOf = orig.id;
@@ -335,16 +345,28 @@ let dispatcherStarted = false;
 export function startEmailDispatcher() {
   if (dispatcherStarted) return;
   dispatcherStarted = true;
-  const timer = setInterval(async () => {
+  let consecutiveErrors = 0;
+  const tick = async () => {
     try {
       const due = getDB().prepare("SELECT id FROM po_email_jobs WHERE status='queued' AND scheduled_at IS NOT NULL AND scheduled_at <= ?")
         .all(nowIso());
       for (const j of due) {
-        try { await processEmailJob(j.id); } catch { /* leaseや検証エラーは次周期に任せる */ }
+        try { await processEmailJob(j.id); }
+        catch (e) { console.error(`[po-email] 予約ジョブ #${j.id} の処理に失敗:`, e.message); }
       }
-    } catch { /* DB未初期化等。次周期に再試行 */ }
-  }, 60000);
-  timer.unref();
+      consecutiveErrors = 0;
+    } catch (e) {
+      // 失敗の握り潰しは運用検知を殺す: ログを残し、連続失敗は目立たせる
+      consecutiveErrors++;
+      console.error(`[po-email] ディスパッチャ失敗 (${consecutiveErrors}回連続):`, e.message);
+    } finally {
+      // setIntervalではなく完了後に再スケジュール (前周期の完了を待たず重複実行しない)
+      const t = setTimeout(tick, 60000);
+      t.unref();
+    }
+  };
+  const t0 = setTimeout(tick, 60000);
+  t0.unref();
 }
 
 /** PO単位のジョブ履歴 */

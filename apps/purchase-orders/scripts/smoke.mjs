@@ -1099,6 +1099,14 @@ console.log('── P15: メール送信 (fake transport) ──');
   // 再送回数の上限 (同一元ジョブへ3回まで。em-key-4/5/6で3回済み)
   r = await jsonPost('/api/orders/' + emOrderId + '/email/send', { resend: true, resendOfJobId: job2.id }, 'em-key-7');
   ok(r.status === 400 && r.body.error.includes('3回まで'), '再送回数の上限 (3回)');
+  // 再送ジョブを起点にしても上限は回避できない (ルートに正規化、Codex P15 R2 High)
+  const resendChild = db.prepare("SELECT id FROM po_email_jobs WHERE resend_of=? AND status='sent' LIMIT 1").get(job2.id);
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', { resend: true, resendOfJobId: resendChild.id }, 'em-key-7b');
+  ok(r.status === 400 && r.body.error.includes('3回まで'), '再送チェーンでも上限回避不可 (ルート正規化)', r.body.error);
+
+  // 実在しない予約日時は拒否
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', { scheduledAt: '2026-02-30T10:00' }, 'em-key-7c');
+  ok(r.status === 400 && r.body.error.includes('実在しない'), '実在しない予約日時 (2/30) は拒否');
 
   // live時、対応表があるのに先方管理番号が無い商品は送信ブロック (Codex P15 R1 M5)
   r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
