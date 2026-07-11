@@ -12,6 +12,7 @@
  *  - closed : po_orders.closed_at IS NOT NULL。close_reason は保存せず導出
  *             (残0かつ有効cutoffあり→manual / なし→completed)
  */
+import { createHash } from 'crypto';
 import { getDB } from './db.js';
 
 const nowIso = () => new Date().toISOString();
@@ -36,12 +37,18 @@ const SHORTAGE_REASONS = new Set(['supplier_shortage', 'own_decision', 'cutoff',
 
 // ─── 設定 (現在値テーブル。変更は監査ログと同一txn) ───
 
+// setSetting で変更できるキーのホワイトリスト (tracking_started_at は含めない=初回確定後は不変。
+// DB側にも UPDATE/DELETE 拒否トリガあり)
+const SETTABLE_KEYS = new Set(['backorder_source']);
+
 export function getSetting(key) {
   const r = getDB().prepare('SELECT value FROM po_settings WHERE key=?').get(key);
   return r ? r.value : null;
 }
 
 export function setSetting(key, value, { actor = null, actorType = 'user', reason = null } = {}) {
+  if (!SETTABLE_KEYS.has(key)) throw new Error(`設定キーが不正です (変更可能: ${[...SETTABLE_KEYS].join(', ')}): ${key}`);
+  if (key === 'backorder_source' && value !== 'ne' && value !== 'app') throw new Error(`backorder_source は ne/app のみ: ${value}`);
   const db = getDB();
   db.transaction(() => {
     const old = db.prepare('SELECT value FROM po_settings WHERE key=?').get(key);
@@ -56,20 +63,49 @@ export function setSetting(key, value, { actor = null, actorType = 'user', reaso
 }
 
 /**
- * 移行境界の初期化。新コードの初回起動時に一度だけ現在時刻で確定する (要件v8: issueゲート内で記録したDB時刻)。
- * 以後この時刻以降に issued されたPOが tracked。設定済みなら何もしない。
+ * 移行境界の初期化。最初の発注確定トランザクションの中で一度だけ確定する (issueOrderのtxn内から呼ぶ。
+ * 発行が失敗すれば境界もロールバックされ、成功した最初の発行と境界が同一コミットになる)。
+ * 以後この時刻以降に issued されたPOが tracked。確定後は不変 (DBトリガでUPDATE/DELETE拒否)。
+ * @param {string} at - 境界とする時刻 (発行時刻と同じ値を共有する)
  */
-export function ensureTrackingStarted() {
+export function ensureTrackingStarted(at = nowIso()) {
   const db = getDB();
   db.transaction(() => {
     const cur = db.prepare("SELECT value FROM po_settings WHERE key='tracking_started_at'").get();
     if (cur) return;
-    const now = nowIso();
-    db.prepare("INSERT INTO po_settings (key, value, effective_at, changed_by, reason) VALUES ('tracking_started_at', ?, ?, 'system', 'P13a初回起動で境界確定')")
-      .run(now, now);
-    audit(db, { actorType: 'system', actor: null, action: 'tracking_boundary_set', resource: 'setting:tracking_started_at', detail: { value: now } });
+    db.prepare("INSERT INTO po_settings (key, value, effective_at, changed_by, reason) VALUES ('tracking_started_at', ?, ?, 'system', 'P13a初回発行で境界確定')")
+      .run(at, at);
+    audit(db, { actorType: 'system', actor: null, action: 'tracking_boundary_set', resource: 'setting:tracking_started_at', detail: { value: at } });
   })();
   return getSetting('tracking_started_at');
+}
+
+// ─── write API の冪等化 (Codex P13a-R1 High-4) ───
+
+/**
+ * Idempotency-Key つきでコマンドを実行する。キー登録・業務処理・結果保存を同一トランザクションで行うため、
+ * コミット前に落ちれば痕跡が残らず、コミット後の再送は保存済み結果をそのまま返す。
+ *  - 同一キー+同一payload → 保存済み結果を返す (replay=true)
+ *  - 同一キー+異なるpayload → 409 (err.status)
+ * キー無しなら fn() をそのまま実行。
+ */
+export function withCommand({ idempotencyKey = null, payload = null }, fn) {
+  if (!idempotencyKey) return { replay: false, result: fn() };
+  const db = getDB();
+  const hash = createHash('sha256').update(JSON.stringify(payload ?? null)).digest('hex');
+  const tx = db.transaction(() => {
+    const existing = db.prepare('SELECT * FROM po_commands WHERE idempotency_key=?').get(idempotencyKey);
+    if (existing) {
+      if (existing.request_hash !== hash) { const e = new Error('Idempotency-Key が異なる内容で再利用されています'); e.status = 409; throw e; }
+      if (existing.result_json == null) { const e = new Error('同一キーの処理結果がありません (前回失敗)。新しいキーで再実行してください'); e.status = 409; throw e; }
+      return { replay: true, result: JSON.parse(existing.result_json) };
+    }
+    db.prepare('INSERT INTO po_commands (idempotency_key, request_hash, created_at) VALUES (?,?,?)').run(idempotencyKey, hash, nowIso());
+    const result = fn();
+    db.prepare('UPDATE po_commands SET result_json=? WHERE idempotency_key=?').run(JSON.stringify(result ?? null), idempotencyKey);
+    return { replay: false, result };
+  });
+  return tx.immediate();
 }
 
 /** POが残数管理対象 (tracked) か。正は境界時刻、tracking_mode列は発行時に固定される表示属性 */
@@ -349,12 +385,16 @@ export function setItemPlan(orderItemId, patch, { note = null, actorType = 'user
 // ─── 整合性検査 (3層のうちの全件検査。対象PO限定は orderId 指定) ───
 
 /**
- * 台帳の不変条件を検査し、違反リストを返す (空配列=健全)。
+ * 台帳の不変条件を検査する。
+ * @returns {issues, warnings}
+ *   issues   = 不変条件違反 (あってはならない状態。healthy判定に使う)
+ *   warnings = 運用上の要対応 (違反ではない。例: 部分消込後に残数の扱い未選択)
  * 検出時、対象商品の発注提案からの隔離は呼び出し側 (P13b以降) が行う。
  */
 export function checkLedgerIntegrity({ orderId = null } = {}) {
   const db = getDB();
   const issues = [];
+  const warnings = [];
   const boundary = getSetting('tracking_started_at');
   const scope = orderId ? 'AND o.id = ?' : '';
   const args = orderId ? [orderId] : [];
@@ -365,34 +405,74 @@ export function checkLedgerIntegrity({ orderId = null } = {}) {
     JOIN po_orders o ON o.id = b.order_id WHERE b.remaining_qty < 0 ${scope}`).all(...args)) {
     issues.push({ kind: 'negative_remaining', itemId: r.order_item_id, detail: r.remaining_qty });
   }
-  // 2. closed なのに残>0 / 全明細残0なのにオープン (tracked のみ)
+  // 2. draft なのに closed_at / issued なのに発行属性の欠落・形式不正
+  for (const r of db.prepare(`
+    SELECT o.id, o.status, o.closed_at, o.po_number, o.issued_at, o.tracking_mode FROM po_orders o
+    WHERE 1=1 ${scope}`).all(...args)) {
+    if (r.status === 'draft' && r.closed_at != null) issues.push({ kind: 'draft_with_closed_at', orderId: r.id });
+    if (r.status === 'issued' && boundary && r.issued_at >= boundary) {
+      if (r.tracking_mode !== 'tracked' || !r.po_number || !/^PO-\d{4}-/.test(r.po_number) || !isYmd(String(r.issued_at).slice(0, 10))) {
+        issues.push({ kind: 'tracked_missing_attrs', orderId: r.id });
+      }
+    }
+  }
   if (boundary) {
+    // 3. closed なのに残>0 / 全明細残0なのにオープン (tracked のみ)
     for (const r of db.prepare(`
-      SELECT o.id, o.closed_at, MIN(b.remaining_qty) AS minr, MAX(b.remaining_qty) AS maxr
+      SELECT o.id, o.closed_at, MAX(b.remaining_qty) AS maxr
       FROM po_orders o JOIN v_po_item_balance b ON b.order_id = o.id
       WHERE o.status='issued' AND o.issued_at >= ? ${scope}
       GROUP BY o.id`).all(boundary, ...args)) {
       if (r.closed_at && r.maxr > 0) issues.push({ kind: 'closed_but_remaining', orderId: r.id });
       if (!r.closed_at && r.maxr === 0) issues.push({ kind: 'done_but_open', orderId: r.id });
     }
-    // 3. 境界後 issued なのに tracking_mode 未設定 (発行経路の取りこぼし検知)
+    // 4. legacy/draft にイベントが存在 (トリガの防波堤の検算)
     for (const r of db.prepare(`
-      SELECT o.id FROM po_orders o
-      WHERE o.status='issued' AND o.issued_at >= ? AND (o.tracking_mode IS NULL OR o.po_number IS NULL) ${scope}`).all(boundary, ...args)) {
-      issues.push({ kind: 'tracked_missing_attrs', orderId: r.id });
+      SELECT DISTINCT o.id FROM po_item_events e
+      JOIN po_order_items i ON i.id = e.order_item_id JOIN po_orders o ON o.id = i.order_id
+      WHERE (o.status <> 'issued' OR o.issued_at < ?) ${scope}`).all(boundary, ...args)) {
+      issues.push({ kind: 'events_on_untracked', orderId: r.id });
     }
   }
-  // 4. disposition 残骸 (残0なのに awaiting_*) / 列間規則違反
+  // 5. disposition/next_* の列間規則 (next_expected_qty 単独残骸も対象に含める)
   for (const r of db.prepare(`
     SELECT i.id, i.remainder_disposition AS d, i.next_expected_date AS ned, i.next_expected_qty AS neq, i.next_action_date AS nad,
            b.remaining_qty AS rem
     FROM po_order_items i JOIN v_po_item_balance b ON b.order_item_id = i.id
     JOIN po_orders o ON o.id = i.order_id
-    WHERE (i.remainder_disposition IS NOT NULL OR i.next_expected_date IS NOT NULL OR i.next_action_date IS NOT NULL) ${scope}`).all(...args)) {
-    if (r.rem === 0) issues.push({ kind: 'stale_disposition', itemId: r.id });
-    else if (r.d === 'awaiting_delivery' && (r.ned == null || r.neq == null)) issues.push({ kind: 'disposition_rule', itemId: r.id, detail: 'awaiting_deliveryで次回予定なし' });
-    else if (r.d === 'awaiting_confirmation' && r.nad == null) issues.push({ kind: 'disposition_rule', itemId: r.id, detail: 'awaiting_confirmation 期限なし' });
-    else if (r.d == null && (r.ned != null || r.nad != null)) issues.push({ kind: 'disposition_rule', itemId: r.id, detail: 'dispositionなしでnext_*あり' });
+    WHERE (i.remainder_disposition IS NOT NULL OR i.next_expected_date IS NOT NULL
+           OR i.next_expected_qty IS NOT NULL OR i.next_action_date IS NOT NULL) ${scope}`).all(...args)) {
+    if (r.d != null && r.d !== 'awaiting_delivery' && r.d !== 'awaiting_confirmation') {
+      issues.push({ kind: 'disposition_rule', itemId: r.id, detail: `不正なdisposition: ${r.d}` });
+    } else if (r.rem === 0) {
+      issues.push({ kind: 'stale_disposition', itemId: r.id });
+    } else if (r.d === 'awaiting_delivery' && (r.ned == null || r.neq == null || r.nad != null)) {
+      issues.push({ kind: 'disposition_rule', itemId: r.id, detail: 'awaiting_delivery: 次回予定なし or 期限が残存' });
+    } else if (r.d === 'awaiting_confirmation' && (r.nad == null || r.ned != null || r.neq != null)) {
+      issues.push({ kind: 'disposition_rule', itemId: r.id, detail: 'awaiting_confirmation: 期限なし or 次回予定が残存' });
+    } else if (r.d == null) {
+      issues.push({ kind: 'disposition_rule', itemId: r.id, detail: 'dispositionなしでnext_*あり' });
+    } else if (r.neq != null && r.neq > r.rem) {
+      issues.push({ kind: 'disposition_rule', itemId: r.id, detail: `次回予定数量${r.neq} > 残数${r.rem}` });
+    }
   }
-  return issues;
+  // 6. 実在しない業務日付 (GLOBは形式のみのため)
+  for (const r of db.prepare(`
+    SELECT e.id, e.effective_date FROM po_item_events e
+    JOIN po_order_items i ON i.id = e.order_item_id JOIN po_orders o ON o.id = i.order_id WHERE 1=1 ${scope}`).all(...args)) {
+    if (!isYmd(r.effective_date)) issues.push({ kind: 'invalid_effective_date', eventId: r.id, detail: r.effective_date });
+  }
+  // 7. [警告] 部分消込が始まった残数の扱いが未選択 (逆仕訳で再オープンした場合も含む要対応リスト)
+  if (boundary) {
+    for (const r of db.prepare(`
+      SELECT i.id, b.remaining_qty AS rem FROM po_order_items i
+      JOIN v_po_item_balance b ON b.order_item_id = i.id
+      JOIN po_orders o ON o.id = i.order_id
+      WHERE o.status='issued' AND o.closed_at IS NULL AND o.issued_at >= ?
+        AND b.remaining_qty > 0 AND i.remainder_disposition IS NULL
+        AND EXISTS (SELECT 1 FROM po_item_events e WHERE e.order_item_id = i.id) ${scope}`).all(boundary, ...args)) {
+      warnings.push({ kind: 'remainder_without_disposition', itemId: r.id, detail: `残${r.rem}の扱い (分納待ち/減数/確認中) が未選択` });
+    }
+  }
+  return { issues, warnings };
 }

@@ -146,15 +146,18 @@ export function initPurchaseOrders() {
   // 発注時点の発注条件グループのスナップショット (月次上限=出荷制限の累計判定用)。既存DBには後付け
   try { db.exec('ALTER TABLE po_order_items ADD COLUMN condition_id TEXT'); } catch (e) { /* 既に存在 */ }
 
-  initLedgerSchema(db);
+  // スキーマ移行は原子的に (途中失敗で半端な世代を残さない。ビューのDROP/CREATE含む)
+  db.transaction(() => initLedgerSchema(db))();
 
   initialized = true;
   return db;
 }
 
-/** 既存テーブルへの後付け列 (冪等)。ALTERはCHECKを追加できないため列間整合はアプリ層+整合性検査で担保する */
-function addCol(db, table, colDef) {
-  try { db.exec(`ALTER TABLE ${table} ADD COLUMN ${colDef}`); } catch (e) { /* 既に存在 */ }
+/** 既存テーブルへの後付け列 (冪等)。列存在はメタデータ照会で確認する (例外握り潰しでエラー種別を誤認しない)。
+ *  ALTERはCHECKを追加できないため、列間整合はトリガ+アプリ層+整合性検査で担保する */
+function addCol(db, table, colName, colDef) {
+  const has = db.prepare(`PRAGMA table_info(${table})`).all().some(c => c.name === colName);
+  if (!has) db.exec(`ALTER TABLE ${table} ADD COLUMN ${colName} ${colDef}`);
 }
 
 /**
@@ -172,20 +175,44 @@ function addCol(db, table, colDef) {
  */
 function initLedgerSchema(db) {
   // ── 既存テーブル拡張 (nullable のみ) ──
-  addCol(db, 'po_orders', 'requested_date TEXT');   // 希望納期 (確定時に明細へスナップショット)
-  addCol(db, 'po_orders', 'closed_at TEXT');        // NULL=オープン。閉鎖遷移時のUTC時刻 (再オープンでNULL)
-  addCol(db, 'po_orders', 'po_number TEXT');        // issue時に採番 (PO-YYYY-NNNN)
-  addCol(db, 'po_orders', 'tracking_mode TEXT');    // 'tracked' = 発行時に固定される業務属性。正は issued_at>=境界
-  addCol(db, 'po_orders', 'origin TEXT');           // NULL / 'migration' (移行専用PO)
-  addCol(db, 'po_orders', 'send_blocked INTEGER');  // 1=メール/発注書出力の対象外 (移行PO誤発注防止)
+  addCol(db, 'po_orders', 'requested_date', 'TEXT');   // 希望納期 (確定時に明細へスナップショット)
+  addCol(db, 'po_orders', 'closed_at', 'TEXT');        // NULL=オープン。閉鎖遷移時のUTC時刻 (再オープンでNULL)
+  addCol(db, 'po_orders', 'po_number', 'TEXT');        // issue時に採番 (PO-YYYY-NNNN)
+  addCol(db, 'po_orders', 'tracking_mode', 'TEXT');    // 'tracked' = 発行時に固定される業務属性。正は issued_at>=境界
+  addCol(db, 'po_orders', 'origin', 'TEXT');           // NULL / 'migration' (移行専用PO)
+  addCol(db, 'po_orders', 'send_blocked', 'INTEGER');  // 1=メール/発注書出力の対象外 (移行PO誤発注防止)
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS uq_po_orders_number ON po_orders(po_number) WHERE po_number IS NOT NULL`);
 
-  addCol(db, 'po_order_items', 'requested_date TEXT');        // 明細単位希望納期 (確定時スナップショット、issued後不変)
-  addCol(db, 'po_order_items', 'promised_date TEXT');         // 仕入先回答納期 (最新値。履歴=po_item_history)
-  addCol(db, 'po_order_items', 'next_expected_date TEXT');    // 次回入荷予定日 (分納)
-  addCol(db, 'po_order_items', 'next_expected_qty INTEGER');
-  addCol(db, 'po_order_items', 'next_action_date TEXT');      // 確認中の期限
-  addCol(db, 'po_order_items', 'remainder_disposition TEXT'); // awaiting_delivery / awaiting_confirmation / NULL
+  addCol(db, 'po_order_items', 'requested_date', 'TEXT');        // 明細単位希望納期 (確定時スナップショット、issued後不変)
+  addCol(db, 'po_order_items', 'promised_date', 'TEXT');         // 仕入先回答納期 (最新値。履歴=po_item_history)
+  addCol(db, 'po_order_items', 'next_expected_date', 'TEXT');    // 次回入荷予定日 (分納)
+  addCol(db, 'po_order_items', 'next_expected_qty', 'INTEGER');
+  addCol(db, 'po_order_items', 'next_action_date', 'TEXT');      // 確認中の期限
+  addCol(db, 'po_order_items', 'remainder_disposition', 'TEXT'); // awaiting_delivery / awaiting_confirmation / NULL
+
+  // 発行済みPO・明細の不変性 (Codex P13a-R1 High-1): 台帳の基準値 (発注数・商品・発行属性) を
+  // 直接SQL・保守スクリプトからも守る。数量減=取消イベント、数量増=新規発注が唯一の経路
+  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_orders_issued_immutable
+           BEFORE UPDATE OF status, issued_at, po_number, tracking_mode, requested_date, supplier_code, origin ON po_orders
+           WHEN OLD.status = 'issued' AND (
+             NEW.status IS NOT OLD.status OR NEW.issued_at IS NOT OLD.issued_at OR
+             NEW.po_number IS NOT OLD.po_number OR NEW.tracking_mode IS NOT OLD.tracking_mode OR
+             NEW.requested_date IS NOT OLD.requested_date OR NEW.supplier_code IS NOT OLD.supplier_code OR
+             NEW.origin IS NOT OLD.origin
+           )
+           BEGIN SELECT RAISE(ABORT, 'issued order is immutable (発行済みPOの発行属性は変更不可)'); END`);
+  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_items_issued_immutable
+           BEFORE UPDATE OF qty, order_id, product_code, product_key, requested_date, condition_id ON po_order_items
+           WHEN (SELECT status FROM po_orders WHERE id = OLD.order_id) = 'issued' AND (
+             NEW.qty IS NOT OLD.qty OR NEW.order_id IS NOT OLD.order_id OR
+             NEW.product_code IS NOT OLD.product_code OR NEW.product_key IS NOT OLD.product_key OR
+             NEW.requested_date IS NOT OLD.requested_date OR NEW.condition_id IS NOT OLD.condition_id
+           )
+           BEGIN SELECT RAISE(ABORT, 'issued item is immutable (発行済み明細の数量/商品は変更不可。数量減=取消イベント)'); END`);
+  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_items_issued_no_delete
+           BEFORE DELETE ON po_order_items
+           WHEN (SELECT status FROM po_orders WHERE id = OLD.order_id) = 'issued'
+           BEGIN SELECT RAISE(ABORT, 'issued item is immutable (発行済み明細は削除不可)'); END`);
 
   // ── 数量イベント台帳 (append-only) ──
   db.exec(`CREATE TABLE IF NOT EXISTS po_item_events (
@@ -199,7 +226,7 @@ function initLedgerSchema(db) {
     inbound_item_id INTEGER,
     reverses_id     INTEGER REFERENCES po_item_events(id),
     effective_date  TEXT NOT NULL CHECK(effective_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
-    recorded_at     TEXT NOT NULL,
+    recorded_at     TEXT NOT NULL CHECK(recorded_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*Z'),
     actor_type      TEXT NOT NULL CHECK(actor_type IN ('user','system','ai_agent','migration')),
     actor           TEXT,
     CHECK ((event_type = 'reversal') = (reverses_id IS NOT NULL)),
@@ -231,6 +258,36 @@ function initLedgerSchema(db) {
                  AND o.event_type <> 'reversal' AND o.qty = NEW.qty AND o.effective_date = NEW.effective_date
              ) THEN RAISE(ABORT, 'invalid reversal: 元イベント不一致 (明細/数量/業務日付/種別)') END;
            END`);
+  // 全イベント共通の対象スコープ (Codex P13a-R1 High-2): 親POが issued かつ tracked (境界以後)。
+  // アプリ層 (appendPoItemEvent) と同じ不変条件をDB側でも強制し、直接SQL・旧コードの書込を拒否する
+  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_events_scope BEFORE INSERT ON po_item_events
+           BEGIN
+             SELECT CASE WHEN NOT EXISTS (
+               SELECT 1 FROM po_order_items i JOIN po_orders o ON o.id = i.order_id
+               WHERE i.id = NEW.order_item_id AND o.status = 'issued'
+                 AND o.issued_at >= (SELECT value FROM po_settings WHERE key = 'tracking_started_at')
+             ) THEN RAISE(ABORT, 'event scope: tracked な issued 明細のみイベント登録できます') END;
+           END`);
+  // 通常イベント (非reversal): クローズ済みへは不可、残数超過 (負残) を物理拒否
+  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_events_normal_check BEFORE INSERT ON po_item_events
+           WHEN NEW.event_type <> 'reversal'
+           BEGIN
+             SELECT CASE WHEN (SELECT o.closed_at FROM po_orders o JOIN po_order_items i ON i.order_id = o.id WHERE i.id = NEW.order_item_id) IS NOT NULL
+               THEN RAISE(ABORT, 'event scope: クローズ済みPOへの通常イベントは不可 (訂正は逆仕訳で)') END;
+             SELECT CASE WHEN NEW.qty > (
+               SELECT i.qty - COALESCE(SUM(CASE WHEN e.event_type IN ('receipt','shortage','cancel') THEN e.qty END), 0)
+               FROM po_order_items i
+               LEFT JOIN po_item_events e ON e.order_item_id = i.id AND e.event_type <> 'reversal'
+                 AND NOT EXISTS (SELECT 1 FROM po_item_events r WHERE r.reverses_id = e.id)
+               WHERE i.id = NEW.order_item_id
+             ) THEN RAISE(ABORT, 'event insert: 残数超過') END;
+           END`);
+  // 発行済みPOへの明細後付けは、消込が始まった後 (=イベントあり) は拒否 (issueOrder内のinsertItemsはイベント前なので通る)
+  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_items_issued_no_insert
+           BEFORE INSERT ON po_order_items
+           WHEN (SELECT status FROM po_orders WHERE id = NEW.order_id) = 'issued'
+             AND EXISTS (SELECT 1 FROM po_item_events e JOIN po_order_items i ON i.id = e.order_item_id WHERE i.order_id = NEW.order_id)
+           BEGIN SELECT RAISE(ABORT, 'issued order: 消込開始後の明細追加は不可 (追加発注は新規POで)'); END`);
 
   // ── 明細変更履歴 (append-only。change_id で同一操作の複数フィールド変更を束ねる) ──
   db.exec(`CREATE TABLE IF NOT EXISTS po_item_history (
@@ -245,6 +302,7 @@ function initLedgerSchema(db) {
     actor         TEXT
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_po_ih_item ON po_item_history(order_item_id, created_at)');
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS uq_po_ih_change ON po_item_history(order_item_id, change_id, field)');
   db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_ih_no_update BEFORE UPDATE ON po_item_history
            BEGIN SELECT RAISE(ABORT, 'po_item_history is append-only'); END`);
   db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_ih_no_delete BEFORE DELETE ON po_item_history
@@ -272,32 +330,40 @@ function initLedgerSchema(db) {
     changed_by   TEXT,
     reason       TEXT
   )`);
+  // 移行境界は初回確定後は不変 (Codex P13a-R1 High-3): 変更すると既存POのtracked/legacy判定が遡って変わるため。
+  // 万一の修正はメンテモード (トリガを一時DROP) + 全件整合性検査を伴う専用手順でのみ行う
+  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_settings_boundary_lock_upd BEFORE UPDATE ON po_settings
+           WHEN OLD.key = 'tracking_started_at'
+           BEGIN SELECT RAISE(ABORT, 'tracking_started_at is immutable (移行境界は変更不可)'); END`);
+  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_settings_boundary_lock_del BEFORE DELETE ON po_settings
+           WHEN OLD.key = 'tracking_started_at'
+           BEGIN SELECT RAISE(ABORT, 'tracking_started_at is immutable (移行境界は削除不可)'); END`);
 
   // ── 監査ログ (専用履歴のない操作に限定: 設定変更・手動クローズ・再オープン・移行操作) ──
   db.exec(`CREATE TABLE IF NOT EXISTS po_audit_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    occurred_at TEXT NOT NULL,
+    occurred_at TEXT NOT NULL CHECK(occurred_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*Z'),
     actor_type  TEXT NOT NULL CHECK(actor_type IN ('user','system','ai_agent','migration')),
     actor       TEXT,
     action      TEXT NOT NULL,
     resource    TEXT NOT NULL,
-    detail_json TEXT,
+    detail_json TEXT CHECK(detail_json IS NULL OR json_valid(detail_json)),
     request_id  TEXT
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_po_audit ON po_audit_log(resource, occurred_at)');
 
-  // ── 発行の世代ゲート (要件C-1): 境界設定後は必要列 (po_number/issued_at/tracking_mode) の無い issued を物理拒否。
-  //    旧コード・保守SQLによる不完全発行を防ぐ。境界前 (未設定) は既存挙動のまま ──
+  // ── 発行の世代ゲート (要件C-1): 境界設定後は必要列の無い/形式不正な issued を物理拒否。
+  //    値の形式まで検査する (非NULLだけでは 'x' 等が通る、Codex P13a-R1 High-8)。境界前 (未設定) は既存挙動のまま ──
+  const GATE_COND = `EXISTS (SELECT 1 FROM po_settings WHERE key = 'tracking_started_at')
+             AND (NEW.tracking_mode IS NOT 'tracked'
+                  OR NEW.po_number IS NULL OR NEW.po_number NOT GLOB 'PO-[0-9][0-9][0-9][0-9]-*'
+                  OR NEW.issued_at IS NULL OR NEW.issued_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*Z')`;
   db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_orders_issue_gate_ins BEFORE INSERT ON po_orders
-           WHEN NEW.status = 'issued'
-             AND EXISTS (SELECT 1 FROM po_settings WHERE key = 'tracking_started_at')
-             AND (NEW.po_number IS NULL OR NEW.issued_at IS NULL OR NEW.tracking_mode IS NULL)
-           BEGIN SELECT RAISE(ABORT, 'issue gate: po_number/issued_at/tracking_mode が必要です (旧経路からの発行は禁止)'); END`);
+           WHEN NEW.status = 'issued' AND ${GATE_COND}
+           BEGIN SELECT RAISE(ABORT, 'issue gate: po_number/issued_at/tracking_mode が不正です (旧経路からの発行は禁止)'); END`);
   db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_orders_issue_gate_upd BEFORE UPDATE OF status ON po_orders
-           WHEN NEW.status = 'issued' AND OLD.status <> 'issued'
-             AND EXISTS (SELECT 1 FROM po_settings WHERE key = 'tracking_started_at')
-             AND (NEW.po_number IS NULL OR NEW.issued_at IS NULL OR NEW.tracking_mode IS NULL)
-           BEGIN SELECT RAISE(ABORT, 'issue gate: po_number/issued_at/tracking_mode が必要です (旧経路からの発行は禁止)'); END`);
+           WHEN NEW.status = 'issued' AND OLD.status <> 'issued' AND ${GATE_COND}
+           BEGIN SELECT RAISE(ABORT, 'issue gate: po_number/issued_at/tracking_mode が不正です (旧経路からの発行は禁止)'); END`);
 
   // ── 残数の集約ビュー (唯一の導出定義。有効イベント = 非reversal かつ 未逆仕訳) ──
   // ⚠️ 全明細が対象になる。tracked 判定 (issued_at>=境界) は呼び出し側で po_orders と JOIN して絞ること

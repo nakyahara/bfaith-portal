@@ -586,8 +586,8 @@ console.log('── P13a: 台帳 (イベント/逆仕訳/クローズ/整合性)
 
   // legacy (境界以前のissued) へのイベントは拒否
   db.prepare(`INSERT INTO po_orders (supplier_code, supplier_name, status, created_at, updated_at, issued_at, po_number, tracking_mode)
-              VALUES ('1','旧発注','issued','2020-01-01T00:00:00.000Z','2020-01-01T00:00:00.000Z','2020-01-01T00:00:00.000Z','PO-LEGACY-1','tracked')`).run();
-  const legacyId = db.prepare('SELECT id FROM po_orders WHERE po_number=?').get('PO-LEGACY-1').id;
+              VALUES ('1','旧発注','issued','2020-01-01T00:00:00.000Z','2020-01-01T00:00:00.000Z','2020-01-01T00:00:00.000Z','PO-2020-9999','tracked')`).run();
+  const legacyId = db.prepare('SELECT id FROM po_orders WHERE po_number=?').get('PO-2020-9999').id;
   db.prepare("INSERT INTO po_order_items (order_id, product_code, product_key, product_name, qty) VALUES (?,?,?,?,?)")
     .run(legacyId, 'noflyersticker', 'noflyersticker', '旧明細', 10);
   const legacyItem = db.prepare('SELECT id FROM po_order_items WHERE order_id=?').get(legacyId);
@@ -611,9 +611,56 @@ console.log('── P13a: 台帳 (イベント/逆仕訳/クローズ/整合性)
   try { db.prepare('DELETE FROM po_item_events WHERE id=?').run(rc.eventId); } catch (e) { threw = e.message; }
   ok(threw && threw.includes('append-only'), 'イベント台帳のDELETEはトリガが拒否');
 
-  // 整合性検査: 全件健全 (legacy行は対象外)
+  // 発行済みPO/明細の不変性トリガ (直接SQLからも守る)
+  threw = null;
+  try { db.prepare('UPDATE po_order_items SET qty=999 WHERE id=?').run(mcItem.id); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('immutable'), '発行済み明細の数量UPDATEはトリガが拒否', threw);
+  threw = null;
+  try { db.prepare("UPDATE po_orders SET issued_at='2020-01-01T00:00:00.000Z' WHERE id=?").run(mcOrderId); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('immutable'), '発行済みPOの issued_at 変更はトリガが拒否 (tracked判定の改変防止)');
+  threw = null;
+  try { db.prepare('DELETE FROM po_order_items WHERE id=?').run(mcItem.id); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('immutable'), '発行済み明細のDELETEはトリガが拒否');
+
+  // 移行境界の不変性 (DBトリガ+setSettingホワイトリスト)
+  threw = null;
+  try { db.prepare("UPDATE po_settings SET value='2030-01-01T00:00:00.000Z' WHERE key='tracking_started_at'").run(); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('immutable'), '移行境界のUPDATEはトリガが拒否');
+  threw = null;
+  try { L.setSetting('tracking_started_at', 'x'); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('設定キー'), 'setSetting は許可キーのみ (境界は変更不可)');
+
+  // 直接SQLのイベント登録もトリガが検証 (legacy/残数超過)
+  threw = null;
+  try {
+    db.prepare(`INSERT INTO po_item_events (order_item_id, event_type, qty, source, effective_date, recorded_at, actor_type)
+                VALUES (?,?,?,?,?,?,?)`).run(legacyItem.id, 'receipt', 1, 'manual', '2026-07-11', nowIsoStr(), 'user');
+  } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('event scope'), '直接SQLでもlegacyへのイベントはトリガが拒否');
+  threw = null;
+  try {
+    db.prepare(`INSERT INTO po_item_events (order_item_id, event_type, qty, source, effective_date, recorded_at, actor_type)
+                VALUES (?,?,?,?,?,?,?)`).run(mcItem.id, 'receipt', 9999, 'manual', '2026-07-11', nowIsoStr(), 'user');
+  } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('残数超過'), '直接SQLでも残数超過はトリガが拒否');
+
+  // 冪等キー: 同一キー再送は同じ結果、異なる内容は409
+  const idemBody = { items: [{ code: 'noflyersticker', qty: 3 }], note: '冪等テスト' };
+  const idemOpts = key => ({ method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': key }, body: JSON.stringify(idemBody) });
+  r = await j('/api/supplier/1/issue', idemOpts('smoke-idem-1'));
+  const idemFirst = r.body;
+  r = await j('/api/supplier/1/issue', idemOpts('smoke-idem-1'));
+  ok(r.status === 200 && r.body.id === idemFirst.id && r.body.replay === true, '冪等キー: 再送は同じ発注を返す (二重作成なし)', r.body);
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'smoke-idem-1' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 4 }] }) });
+  ok(r.status === 409, '冪等キー: 同一キー+異なる内容は409', r.status);
+
+  // 整合性検査: 違反なし。部分消込済み残の「扱い未選択」はwarning (mcItem=残30が該当)
   r = await j('/api/ledger/integrity');
   ok(r.body.ok && r.body.healthy === true, '整合性検査: 違反なし', r.body.issues);
+  ok(r.body.warnings.some(w => w.kind === 'remainder_without_disposition' && w.itemId === mcItem.id), '整合性検査: 再オープン残の扱い未選択をwarning表示', r.body.warnings);
+  r = await j('/api/ledger/integrity?orderId=abc');
+  ok(r.status === 400, '整合性検査: orderId不正は400');
 
   // 監査ログが要点操作を記録している
   const auditActions = db.prepare('SELECT DISTINCT action FROM po_audit_log').all().map(x => x.action);
