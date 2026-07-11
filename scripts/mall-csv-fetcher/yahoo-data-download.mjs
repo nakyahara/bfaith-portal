@@ -192,13 +192,22 @@ const SPECS = [
     csvFileName: 'b-faith01-store_keyword.csv' },
 ];
 
-async function fetchOne(page, spec, range) {
+async function fetchOne(page, spec, range, seenHashes) {
   const rangeLabel = range ? range.from : 'default';
   console.log(`\n--- ${spec.label} ${rangeLabel} ---`);
   if (spec.daily) {
     // 画面を開いてセッション/権限を確認してから CSV を POST (画面操作は不要)
     await gotoStorePage(page, `${STORE_TOP_URL}/${spec.path}`, spec.label);
     const buf = await postDailyCsv(page, spec, range.from);
+    // 日付パラメータ無視の検出 (Codex R1 Medium): 別日で本文が完全一致 = 同じデータが返っている
+    if (seenHashes) {
+      const h = createHash('sha256').update(buf).digest('hex');
+      const prev = seenHashes.get(h);
+      if (prev && prev !== range.from) {
+        throw new Error(`DL_VERIFY: ${prev} と ${range.from} のレスポンスが完全一致。日付パラメータ (${spec.csvDateKeys.join('/')}) が無視されている疑い — 画面仕様変更の可能性`);
+      }
+      seenHashes.set(h, range.from);
+    }
     return persistCsv(buf, spec.csvFileName, spec, range);
   }
   await gotoStorePage(page, `${STORE_TOP_URL}/${spec.path}`, spec.label);
@@ -249,10 +258,13 @@ async function main() {
 
     for (const spec of specs) {
       const ranges = spec.daily ? computeDailyTargetDates().map((d) => ({ from: d, to: d })) : [null];
+      // 同一レポートの連続対象日で本文が完全一致したら「日付パラメータが無視された」疑い
+      // (検索流入JSONは本文に日付を持たず自己検証できないため — Codex R1 Medium)
+      const seenHashes = new Map();
       for (const range of ranges) {
         const ymLabel = range ? range.from : 'default';
         try {
-          const status = await fetchOne(page, spec, range);
+          const status = await fetchOne(page, spec, range, seenHashes);
           outcomes.push({ spec: spec.key, ym: ymLabel, status });
         } catch (e) {
           console.error(`✗ ${spec.label} ${ymLabel}: ${e.message}`);

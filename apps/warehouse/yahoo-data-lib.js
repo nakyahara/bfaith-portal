@@ -145,8 +145,9 @@ function dupGuard(name, type, records, keyFn, keyLabel) {
 /** 期間集計型CSVの対象日はファイル名から取る (yahoo_item_2026-07-10_... / *_20260710_*)。
  *  DL側が命名する契約。取れなければエラー (黙って当日扱いしない) */
 function dateFromFileName(name) {
+  // 実在日検証を通す (2026-99-99 のような不正日付を弾く — Codex Low)
   let m = name.match(/(\d{4})-(\d{2})-(\d{2})/);
-  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  if (m) return normalizeDate(`${m[1]}-${m[2]}-${m[3]}`);
   m = name.match(/(\d{4})(\d{2})(\d{2})/);
   if (m) return normalizeDate(`${m[1]}${m[2]}${m[3]}`);
   return null;
@@ -542,9 +543,16 @@ export function importYahooFile(db, { name, buffer, sha256, source = 'incoming' 
     } catch (e) { console.error(`[yahoo-data-import] ログ記録失敗: ${e.message}`); }
   };
 
-  const dup = db.prepare(`SELECT id FROM raw_yahoo_data_import_log WHERE file_sha256 = ? AND status = 'ok' LIMIT 1`).get(sha256);
+  // 冪等キー: 本文sha256 + 論理日付 (ファイル名由来)。
+  // ⭐検索流入JSONは本文に日付を持たないため、内容が同じ別日 (流入が動かない日等) を
+  // sha256だけで duplicate 判定すると2日目が欠損する (Codex R1 High)。
+  // ファイル名から日付が取れる場合は (sha256, date_from) の複合で判定する
+  const logicalDate = dateFromFileName(name);
+  const dup = logicalDate
+    ? db.prepare(`SELECT id FROM raw_yahoo_data_import_log WHERE file_sha256 = ? AND status = 'ok' AND date_from = ? LIMIT 1`).get(sha256, logicalDate)
+    : db.prepare(`SELECT id FROM raw_yahoo_data_import_log WHERE file_sha256 = ? AND status = 'ok' LIMIT 1`).get(sha256);
   if (dup) {
-    logOutcome(name, 'unknown', 'duplicate', `同一内容のファイルを取込済み (import log id=${dup.id})`);
+    logOutcome(name, 'unknown', 'duplicate', `同一内容のファイルを取込済み (import log id=${dup.id}${logicalDate ? `, date=${logicalDate}` : ''})`);
     return { status: 'duplicate', results: [{ file: name, ok: false, duplicate: true, type: 'unknown', error: '取込済み (同一sha256)' }] };
   }
 

@@ -174,6 +174,28 @@ console.log('=== 8. 再取込 (値変動) = UPSERT 上書き ===');
   check('他行は残る (UPSERTなので集合置換でない)', !!other);
 }
 
+console.log('=== 8b. 同一内容・別日のJSONは両方取り込める (Codex R1 High) ===');
+{
+  const arr = [{ keyword: '同一内容KW', pv: '5', pvRank: '1', gmv: '0', orderCount: '0', orderQuantity: '0',
+    orderRate: '0.0', orderUnitPrice: '-', orderProductPrice: '-' }];
+  const buf = jsonBuf(arr);
+  const r1 = importYahooFile(db, { name: 'yahoo_keyword_2026-06-01_x.json', buffer: buf, sha256: sha(buf), source: 'test' });
+  const r2 = importYahooFile(db, { name: 'yahoo_keyword_2026-06-02_x.json', buffer: buf, sha256: sha(buf), source: 'test' });
+  check('6/1 取込ok', r1.status === 'ok', r1.status);
+  check('同一sha256でも別日なら取込ok (duplicate扱いしない)', r2.status === 'ok', r2.status);
+  const days = db.prepare(`SELECT DISTINCT date_jst FROM fact_yahoo_keyword_daily WHERE keyword='同一内容KW' ORDER BY date_jst`).all().map(x => x.date_jst);
+  check('2日分が保存される', JSON.stringify(days) === JSON.stringify(['2026-06-01', '2026-06-02']), JSON.stringify(days));
+  const r3 = importYahooFile(db, { name: 'yahoo_keyword_2026-06-01_again.json', buffer: buf, sha256: sha(buf), source: 'test' });
+  check('同一sha256+同一日は duplicate', r3.status === 'duplicate', r3.status);
+}
+
+console.log('=== 8c. ファイル名の不正日付は拒否 (Codex R1 Low) ===');
+{
+  const buf = jsonBuf([{ keyword: 'x', pv: '1', pvRank: '1', gmv: '0', orderCount: '0', orderQuantity: '0', orderRate: '0', orderUnitPrice: '-', orderProductPrice: '-' }]);
+  const p = prepareYahooFile('yahoo_keyword_2026-99-99_x.json', buf);
+  check('存在しない日付 → error', !p.ok && /ファイル名から対象日/.test(p.error), p.error);
+}
+
 console.log('=== 9. 取込ログ ===');
 {
   const logs = db.prepare(`SELECT status, COUNT(*) n FROM raw_yahoo_data_import_log GROUP BY status`).all();
