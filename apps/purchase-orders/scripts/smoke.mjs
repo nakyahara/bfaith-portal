@@ -795,12 +795,25 @@ console.log('── P13b: 発注残ページ+消込API ──');
   const boOrder2 = r.body.orders.find(o => o.id === boId);
   ok(boOrder2 && !boOrder2.open && boOrder2.closeReason === 'manual', '発注残API: 手動クローズ後は完了(打切)', boOrder2 && boOrder2.closeReason);
 
+  // 消込APIの冪等再送 (通信断→再クリックで二重登録しない)
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 8 }] }) });
+  const idemEvItem = db.prepare('SELECT * FROM po_order_items WHERE order_id=?').get(r.body.id);
+  const evBody = JSON.stringify({ type: 'receipt', qty: 8 });
+  const evOpts = { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'smoke-ev-1' }, body: evBody };
+  r = await j('/api/items/' + idemEvItem.id + '/events', evOpts);
+  ok(r.body.ok && r.body.remaining === 0, '消込API: 冪等キーつき入荷');
+  r = await j('/api/items/' + idemEvItem.id + '/events', evOpts);
+  ok(r.body.ok && r.body.replay === true && r.body.remaining === 0, '消込API: 同一キー再送はreplay (二重消込なし)', r.body);
+  ok(db.prepare('SELECT COUNT(*) AS n FROM po_item_events WHERE order_item_id=?').get(idemEvItem.id).n === 1, '消込API: イベントは1件のみ');
+
   // ページ配信 (発注残ページ・ダッシュボードのサマリ・履歴のPO番号列)
   {
     const html = await (await fetch(base + '/backorders')).text();
     ok(html.includes('boTabs') && html.includes('data-act') && html.includes('要対応'), '/backorders ページ配信 (タブ+消込ボタン)');
     ok(html.includes('remBox') && html.includes('await_delivery'), '/backorders 部分入荷の三択UI');
     ok(html.includes('data-rev') && html.includes('data-closeui'), '/backorders 逆仕訳+手動クローズUI (promptなし)');
+    ok(html.includes("td.innerHTML = ''") && html.includes('Idempotency-Key'), '/backorders パネルDOM破棄+冪等キー送信 (Codex P13b R1)');
     const dash = await (await fetch(base + '/')).text();
     ok(dash.includes('発注残') && dash.includes('/apps/purchase-orders/backorders'), '/ ダッシュボードに発注残サマリ');
     const orders = await (await fetch(base + '/orders')).text();

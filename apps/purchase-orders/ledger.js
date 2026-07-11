@@ -431,10 +431,12 @@ export function listBackorders() {
     });
     const open = !o.closed_at;
     const remainingQty = items.reduce((s, i) => s + i.remaining_qty, 0);
+    // 発注残金額 = 明細ごとに ROUND(単価×残数) してから合計 (要件v8 F-1。単価は整数円運用のため実質差は出ない)
     const knownAmount = items.reduce((s, i) => s + (i.unit_cost != null ? Math.round(i.unit_cost * i.remaining_qty) : 0), 0);
     const unknownCostItems = items.filter(i => i.unit_cost == null && i.remaining_qty > 0).length;
     const overdueItems = items.filter(i => i.flags.overdue).length;
-    const attentionItems = items.filter(i => i.flags.overdue || i.flags.needsDisposition || i.flags.confirmOverdue).length;
+    // 要対応 = 遅延 / 納期未回答 / 残数の扱い未選択 / 確認期限超過 (バッジ表示と同じ集合、要件F-3/F-4)
+    const attentionItems = items.filter(i => i.flags.overdue || i.flags.unanswered || i.flags.needsDisposition || i.flags.confirmOverdue).length;
     if (open) {
       summary.openOrders++;
       summary.remainingQty += remainingQty;

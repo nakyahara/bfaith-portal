@@ -508,7 +508,12 @@ router.post('/api/events/:eventId/reverse', (req, res) => {
     if (!Number.isSafeInteger(eventId) || eventId <= 0) return res.status(400).json({ ok: false, error: 'eventIdが不正です' });
     const note = trimS((req.body || {}).note);
     const result = reverseEvent(eventId, { note, actorType: 'user', actor: actorOf(req) });
-    res.json({ ok: true, ...result });
+    // 逆仕訳で残数が復活した場合、扱い (三択) は未選択になる → UIに要選択を伝える (要対応リストにも載る)
+    const db = getDB();
+    const ev = db.prepare('SELECT order_item_id FROM po_item_events WHERE id=?').get(eventId);
+    const item = db.prepare('SELECT remainder_disposition FROM po_order_items WHERE id=?').get(ev.order_item_id);
+    const needsDisposition = result.remaining > 0 && item.remainder_disposition == null;
+    res.json({ ok: true, ...result, needsDisposition });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
@@ -2650,13 +2655,18 @@ var REASONS = { supplier_shortage: '仕入先都合 (作れない)', own_decisio
 var EVLABEL = { receipt: '📥入荷', shortage: '➖減数', cancel: '🚫取消', reversal: '↩逆仕訳' };
 
 function fmtD(s) { return s ? String(s).slice(0, 10) : '—'; }
-function post(url, body) {
-  return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
-    .then(function(r){ return r.json(); });
+function newIdemKey() { return (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : 'k' + Date.now() + '-' + Math.random().toString(36).slice(2); }
+function jsonOrErr(r) {
+  // 非JSON応答 (proxy 502等) でも「成否不明」を利用者に正しく伝える
+  return r.json().catch(function(){ return { ok: false, error: 'HTTP ' + r.status + ' — 登録されたか不明です。画面を更新して確認してください' }; });
+}
+function post(url, body, idemKey) {
+  var h = { 'Content-Type': 'application/json' };
+  if (idemKey) h['Idempotency-Key'] = idemKey;
+  return fetch(url, { method: 'POST', headers: h, body: JSON.stringify(body) }).then(jsonOrErr);
 }
 function patch(url, body) {
-  return fetch(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
-    .then(function(r){ return r.json(); });
+  return fetch(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(jsonOrErr);
 }
 
 function load() {
@@ -2803,6 +2813,10 @@ function actPanel(itemId, act) {
     else if (v === 'shortage') el.innerHTML = '理由 <select id="remReason"><option value="supplier_shortage">仕入先都合</option><option value="own_decision">自社判断</option><option value="other">その他</option></select> <input type="text" id="remNote" placeholder="メモ (その他は必須)" style="width:160px">';
     else el.innerHTML = '確認期限 <input type="date" id="remActDate">';
   }
+  // 冪等キー: パネルを開いた時点で発行し、同じ内容の再試行 (通信断後の再クリック) では同一キーを使う。
+  // 入力を変えたらキーを更新する (同一キー+異内容は409になるため)
+  var idemKey = newIdemKey();
+  document.getElementById('panelBody-' + itemId).addEventListener('input', function(){ idemKey = newIdemKey(); });
   qtyEl.addEventListener('input', refresh);
   document.querySelectorAll('input[name=rem]').forEach(function(x){ x.addEventListener('change', remFields); });
   refresh();
@@ -2820,12 +2834,12 @@ function actPanel(itemId, act) {
     }
     var btn = document.getElementById('evGo');
     btn.disabled = true;
-    post(API + '/items/' + itemId + '/events', body).then(function(j) {
+    post(API + '/items/' + itemId + '/events', body, idemKey).then(function(j) {
       btn.disabled = false;
       if (!j.ok) { toast('エラー: ' + j.error); return; }
-      toast(label + 'を登録しました (残 ' + j.remaining + (j.orderClosed ? '、発注完了' : '') + ')');
+      toast(label + 'を登録しました (残 ' + j.remaining + (j.orderClosed ? '、発注完了' : '') + (j.replay ? ' ※前回の登録を再表示 (二重登録なし)' : '') + ')');
       load();
-    }).catch(function(e){ btn.disabled = false; toast('通信エラー: ' + e.message); });
+    }).catch(function(e){ btn.disabled = false; toast('通信エラー: ' + e.message + ' — 再クリックで安全に再試行できます'); });
   });
 }
 
@@ -2855,7 +2869,9 @@ function findItem(itemId) {
   return found;
 }
 function showPanel(itemId, html) {
+  // 他明細のパネルDOMは中身ごと破棄する (evQty等のIDとradio name=rem が重複して誤送信するのを防ぐ)
   document.querySelectorAll('tr[id^=panel-]').forEach(function(tr){ tr.style.display = 'none'; });
+  document.querySelectorAll('td[id^=panelBody-]').forEach(function(td){ if (td.id !== 'panelBody-' + itemId) td.innerHTML = ''; });
   document.getElementById('panelBody-' + itemId).innerHTML = html;
   document.getElementById('panel-' + itemId).style.display = '';
 }
@@ -2887,7 +2903,7 @@ document.addEventListener('click', function(ev) {
       if (!note.trim()) { toast('訂正理由を入力してください'); return; }
       post(API + '/events/' + v + '/reverse', { note: note }).then(function(j) {
         if (!j.ok) { toast('エラー: ' + j.error); return; }
-        toast('逆仕訳しました (残 ' + j.remaining + ')');
+        toast('逆仕訳しました (残 ' + j.remaining + ')' + (j.needsDisposition ? ' — ⚠️ 残数の扱い (分納待ち/減数/確認中) を選択してください' : ''));
         load();
       });
     });
