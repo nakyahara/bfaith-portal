@@ -990,6 +990,125 @@ console.log('── P14: 入庫CSV取込+突合+割当 ──');
   ok(html.includes('mRemBox') && html.includes('Idempotency-Key'), '/inbound 割当も三択+冪等キー');
 }
 
+// ═══ P15 発注書メール送信 ═══
+console.log('── P15: メール送信 (fake transport) ──');
+{
+  process.env.PO_EMAIL_FAKE = '1';
+  const jsonPost = (p, body, key) => j(p, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(key ? { 'Idempotency-Key': key } : {}) }, body: JSON.stringify(body) });
+
+  // 送信対象PO (tracked)
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 7 }], requestedDate: '2026-07-30' }) });
+  const emOrderId = r.body.id;
+
+  // 宛先未登録 → preview はエラー
+  r = await j('/api/orders/' + emOrderId + '/email/preview');
+  ok(r.status === 400 && r.body.error.includes('メールアドレスが未登録'), 'preview: 宛先未登録はエラー案内', r.body.error);
+
+  // 宛先マスタCSV取込 (仕入先名称で突合、様の有無も吸収)
+  {
+    const csv = iconv.encode('"仕入先名称","担当者名（メールに使う項目なので必ず「様」をつける）","メールアドレス","CCメールアドレス"\r\n"アメージングクラフト","田中","tanaka@example.com","cc@example.com"\r\n"存在しない仕入先","x","x@example.com",""', 'Shift_JIS');
+    const fd = new FormData();
+    fd.append('file', new Blob([csv]), 'recipients.csv');
+    r = await j('/api/email/recipients/csv', { method: 'POST', body: fd });
+    ok(r.body.ok && r.body.updated === 1 && r.body.unmatched.length === 1, '宛先マスタCSV取込 (突合1件+不一致1件)', r.body);
+    const sup = db.prepare("SELECT * FROM po_suppliers WHERE supplier_code='1'").get();
+    ok(sup.email_to === 'tanaka@example.com' && sup.email_cc === 'cc@example.com' && sup.send_method === 'email', '仕入先マスタに宛先が入る');
+  }
+
+  // 対応表CSV取込 (ヘッダなし→A/C列フォールバック)
+  {
+    const csv = iconv.encode('"仕入先管理番号","x","弊社管理番号"\r\n"AMC-001","","noflyersticker"', 'Shift_JIS');
+    const fd = new FormData();
+    fd.append('supplier_code', '0001');
+    fd.append('file', new Blob([csv]), 'taiouhyou.csv');
+    r = await j('/api/vendor-map/csv', { method: 'POST', body: fd });
+    ok(r.body.ok && r.body.count === 1, '対応表CSV取込 (0001→1正規化)', r.body);
+  }
+
+  // dry-run宛先未設定 → send はエラー / 設定APIで dry-run 宛先を登録
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', {});
+  ok(r.status === 400 && r.body.error.includes('dry-run'), 'send: dry-run宛先未設定はエラー');
+  r = await jsonPost('/api/email/settings', { dryrunTo: 'me@b-faith.biz' });
+  ok(r.body.ok && r.body.dryrunTo === 'me@b-faith.biz' && r.body.mode === 'dry_run', 'メール設定保存 (既定dry_run)');
+
+  // preview: テンプレ変数・担当者様・先方管理番号列
+  r = await j('/api/orders/' + emOrderId + '/email/preview');
+  ok(r.body.ok && r.body.subject.includes('【発注書】') && r.body.subject.includes('アメージングクラフト'), 'preview: 件名テンプレ (GAS互換)', r.body.subject);
+  ok(r.body.body.startsWith('田中様'), 'preview: 担当者に様を自動付与');
+  ok(r.body.vendorColUsed && r.body.csvText.includes('先方管理番号') && r.body.csvText.includes('AMC-001'), 'preview: 添付CSVに先方管理番号列', r.body.csvText.split('\r\n')[0]);
+
+  // dry-run送信 (fake): 宛先差し替え+【DRYRUN】+整理番号+送信済み
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', {}, 'em-key-1');
+  ok(r.body.ok && r.body.status === 'sent' && r.body.dryRun !== false, 'dry-run送信 (fake Gmail)', r.body);
+  const job1 = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(r.body.jobId);
+  ok(job1.to_addr === 'me@b-faith.biz' && job1.subject.startsWith('【DRYRUN】') && job1.body.includes('整理番号: DK') && job1.is_dry_run === 1,
+    'dry-run: 宛先差替+件名+整理番号', job1.to_addr);
+  ok(job1.body.includes('本来の宛先: TO=tanaka@example.com'), 'dry-run: 本来の宛先を本文に明記');
+
+  // 冪等: 同一キー再送は同じジョブ (二重送信なし)
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', {}, 'em-key-1');
+  ok(r.body.ok && r.body.jobId === job1.id && r.body.replay === true, 'send: 同一キー再送はreplay');
+  ok(db.prepare('SELECT COUNT(*) AS n FROM po_email_jobs WHERE order_id=?').get(emOrderId).n === 1, 'ジョブは1件のみ');
+
+  // live切替 → 本番送信 → 同一内容の二重送信はdedup拒否 → 再送は可
+  await jsonPost('/api/email/settings', { mode: 'live' });
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', {}, 'em-key-2');
+  ok(r.body.ok && r.body.status === 'sent' && r.body.dryRun === false, 'live送信 (fake)', r.body);
+  const job2 = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(r.body.jobId);
+  ok(job2.to_addr === 'tanaka@example.com' && job2.cc_addr === 'cc@example.com' && !job2.subject.includes('DRYRUN'), 'live: 本来の宛先+CC');
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', {}, 'em-key-3');
+  ok(r.status === 400 && r.body.error.includes('送信済み'), '同一内容の二重送信はdedup拒否', r.body.error);
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', { resend: true }, 'em-key-4');
+  ok(r.body.ok && r.body.status === 'sent', '再送 (is_resend) は送信できる');
+
+  // 失敗→再試行 (PO_EMAIL_FAKE=fail)
+  process.env.PO_EMAIL_FAKE = 'fail';
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', { resend: true }, 'em-key-5');
+  ok(r.body.ok && r.body.status === 'failed' && r.body.error.includes('偽送信エラー'), '送信失敗はfailed+エラー保存', r.body);
+  const failedJobId = r.body.jobId;
+  process.env.PO_EMAIL_FAKE = '1';
+  r = await jsonPost('/api/email-jobs/' + failedJobId + '/retry', {});
+  ok(r.body.ok && r.body.status === 'sent', 'failedジョブの再試行→送信');
+
+  // MIME 生成 (Message-ID=delivery_key、添付CP932)
+  {
+    const em = await imp('apps/purchase-orders/email.js');
+    const mime = em.buildMime(job2);
+    ok(mime.includes('Message-ID: <' + job2.delivery_key + '@') && mime.includes('Content-Disposition: attachment; filename="' + job2.attachment_name + '"'),
+      'MIME: Message-ID (照合キー)+添付ファイル名 (PO番号.csv)');
+    ok(/Subject: =\?UTF-8\?B\?/.test(mime), 'MIME: 件名RFC2047エンコード');
+  }
+
+  // 状態遷移トリガ: sent は終端 (直接SQLでも戻せない)
+  let threw = null;
+  try { db.prepare("UPDATE po_email_jobs SET status='queued' WHERE id=?").run(failedJobId); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('終端状態'), '送信済みジョブの状態巻き戻しはトリガが拒否');
+
+  // 照合 (stale sending → Gmail検索で回復)。fake: found=送信済みと判明
+  {
+    process.env.PO_EMAIL_FAKE = 'fail';
+    r = await jsonPost('/api/orders/' + emOrderId + '/email/send', { resend: true }, 'em-key-6');
+    const staleId = r.body.jobId;
+    process.env.PO_EMAIL_FAKE = '1';
+    db.prepare("UPDATE po_email_jobs SET status='queued', error=NULL WHERE id=?").run(staleId);
+    db.prepare("UPDATE po_email_jobs SET status='sending', sending_started_at='2020-01-01T00:00:00.000Z' WHERE id=?").run(staleId);
+    process.env.PO_EMAIL_FAKE_SEARCH = 'found';
+    r = await jsonPost('/api/email/reconcile', {});
+    ok(r.body.ok && r.body.checked >= 1, '照合: staleなsendingを検査', r.body);
+    const st1 = db.prepare('SELECT status FROM po_email_jobs WHERE id=?').get(staleId);
+    ok(st1.status === 'sent', '照合: Gmailに存在→sentに回復');
+    delete process.env.PO_EMAIL_FAKE_SEARCH;
+  }
+
+  // /admin にメール設定セクション、/backorders に📧ボタン
+  {
+    const adminHtml = await (await fetch(base + '/admin')).text();
+    ok(adminHtml.includes('発注書メール設定') && adminHtml.includes('recipForm') && adminHtml.includes('vmapForm'), '/admin メール設定+宛先/対応表取込');
+    const boHtml = await (await fetch(base + '/backorders')).text();
+    ok(boHtml.includes('data-emailui') && boHtml.includes('DRYRUN') === false && boHtml.includes('emailPanel'), '/backorders 発注書メールパネル');
+  }
+}
 function nowIsoStr() { return new Date().toISOString(); }
 
 server.close();

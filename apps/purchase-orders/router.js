@@ -24,7 +24,9 @@ import {
   ensureTrackingStarted, nextPoNumber, isYmd, checkLedgerIntegrity, withCommand,
   appendPoItemEvent, reverseEvent, manualCloseOrder, setItemPlan, listBackorders, listItemEvents, balanceOf,
 } from './ledger.js';
-import { importInboundCsv, listInbound, candidatesFor, setInboundIgnore } from './inbound.js';
+import { importInboundCsv, listInbound, candidatesFor, setInboundIgnore, parseCsv as parseCsvStrict } from './inbound.js';
+import { buildOrderEmail, createEmailJob, processEmailJob, reconcileEmailJobs, listEmailJobs, emailSettings, parseAddresses } from './email.js';
+import { getSetting, setSetting } from './ledger.js';
 
 // ─── miniPC (WarehouseServer) service-api 呼び出し (オンデマンドFBA更新、product-management-list と同一エンドポイント) ───
 const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
@@ -606,6 +608,160 @@ router.post('/api/inbound/:id/ignore', (req, res) => {
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
+// ─── P15: 発注書メール送信 ───
+router.get('/api/orders/:id/email/preview', (req, res) => {
+  try {
+    const orderId = Number(req.params.id);
+    if (!Number.isSafeInteger(orderId) || orderId <= 0) return res.status(400).json({ ok: false, error: 'idが不正です' });
+    const p = buildOrderEmail(orderId);
+    res.json({
+      ok: true,
+      to: p.to, cc: p.cc, subject: p.subject, body: p.body,
+      rows: p.rows, totalQty: p.totalQty, totalAmount: p.totalAmount,
+      attachmentName: p.attachmentName, csvText: p.csvText,
+      vendorColUsed: p.vendorColUsed, missingVendorCodes: p.missingVendorCodes,
+      mode: p.mode, dryrunTo: p.dryrunTo, envReady: p.envReady,
+      jobs: listEmailJobs(orderId),
+    });
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+
+router.post('/api/orders/:id/email/send', async (req, res) => {
+  try {
+    const orderId = Number(req.params.id);
+    if (!Number.isSafeInteger(orderId) || orderId <= 0) return res.status(400).json({ ok: false, error: 'idが不正です' });
+    const resend = !!(req.body || {}).resend;
+    // ジョブ作成は冪等 (再送クリックの通信断→再クリックで二重ジョブを作らない)。送信処理はlease側が多重実行を防ぐ
+    const { replay, result: jobId } = withCommand(
+      { idempotencyKey: trimS(req.get('Idempotency-Key')) || null, payload: { op: 'email_send', orderId, resend } },
+      () => createEmailJob(orderId, { resend, actor: actorOf(req) })
+    );
+    const outcome = await processEmailJob(jobId);
+    const jb = getDB().prepare('SELECT is_dry_run FROM po_email_jobs WHERE id=?').get(jobId);
+    res.json({ ok: true, jobId, replay, dryRun: !!(jb && jb.is_dry_run), ...outcome, jobs: listEmailJobs(orderId) });
+  } catch (e) { res.status(e.status === 409 ? 409 : 400).json({ ok: false, error: e.message }); }
+});
+
+router.post('/api/email-jobs/:id/retry', async (req, res) => {
+  try {
+    const jobId = Number(req.params.id);
+    if (!Number.isSafeInteger(jobId) || jobId <= 0) return res.status(400).json({ ok: false, error: 'idが不正です' });
+    const outcome = await processEmailJob(jobId);
+    res.json({ ok: true, jobId, ...outcome });
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+
+router.post('/api/email/reconcile', async (req, res) => {
+  try { res.json({ ok: true, ...(await reconcileEmailJobs()) }); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+router.get('/api/email/settings', (req, res) => {
+  try { res.json({ ok: true, ...emailSettings() }); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+router.post('/api/email/settings', (req, res) => {
+  try {
+    const b = req.body || {};
+    const actor = actorOf(req);
+    const changed = [];
+    for (const [key, val] of [['email_mode', b.mode], ['email_dryrun_to', b.dryrunTo],
+      ['email_subject_template', b.subjectTpl], ['email_body_template', b.bodyTpl]]) {
+      if (val == null) continue;
+      setSetting(key, String(val), { actor, reason: 'メール設定画面から変更' });
+      changed.push(key);
+    }
+    res.json({ ok: true, changed, ...emailSettings() });
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+
+// 宛先マスタCSV取込 (既存GASスプシ「仕入先ごとの発注メール送信先一覧」の生DL。仕入先名称で突合)
+router.post('/api/email/recipients/csv', upload.single('file'), (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ ok: false, error: 'ファイルがありません' });
+    let buf;
+    try { buf = fs.readFileSync(req.file.path); } finally { try { fs.unlinkSync(req.file.path); } catch {} }
+    const rows = parseCsvStrict(decodeCsvBuffer(buf));
+    if (rows.length < 2) return res.status(400).json({ ok: false, error: 'データ行がありません' });
+    const header = rows[0].map(s => String(s).trim());
+    const iName = header.indexOf('仕入先名称');
+    const iMail = header.indexOf('メールアドレス');
+    const iContact = header.findIndex(h => h.startsWith('担当者名'));
+    const iCc = header.indexOf('CCメールアドレス');
+    if (iName === -1 || iMail === -1) return res.status(400).json({ ok: false, error: '「仕入先名称」「メールアドレス」列が必要です (宛先マスタのCSVを入れてください)' });
+    const db = getDB();
+    const norm = s => trimS(s).replace(/様$/, '');
+    const byName = new Map(db.prepare('SELECT supplier_code, name FROM po_suppliers').all().map(r => [norm(r.name), r.supplier_code]));
+    const updated = [], unmatched = [], invalid = [];
+    db.transaction(() => {
+      const upd = db.prepare("UPDATE po_suppliers SET email_to=?, email_cc=?, contact_name=?, send_method=COALESCE(send_method,'email'), updated_at=? WHERE supplier_code=?");
+      for (let n = 1; n < rows.length; n++) {
+        const r = rows[n];
+        const name = trimS(r[iName]);
+        if (!name) continue;
+        const code = byName.get(norm(name));
+        if (!code) { unmatched.push(name); continue; }
+        try {
+          const to = parseAddresses(r[iMail]);
+          if (!to.length) { invalid.push(`${name}: メールアドレスが空`); continue; }
+          const cc = iCc === -1 ? [] : parseAddresses(r[iCc]);
+          upd.run(to.join(','), cc.join(',') || null, iContact === -1 ? null : trimS(r[iContact]) || null, nowIso(), code);
+          updated.push(name);
+        } catch (e) { invalid.push(`${name}: ${e.message}`); }
+      }
+    })();
+    res.json({ ok: true, updated: updated.length, unmatched, invalid });
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+
+// 先方管理番号対応表CSV取込 (アメージング/ビーフリー等。仕入先ごとに全置換)
+router.post('/api/vendor-map/csv', upload.single('file'), (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ ok: false, error: 'ファイルがありません' });
+    const supplierCode = normSupplierCode((req.body || {}).supplier_code);
+    if (!supplierCode) return res.status(400).json({ ok: false, error: '仕入先コードが必要です' });
+    const db = getDB();
+    const sup = db.prepare('SELECT name FROM po_suppliers WHERE supplier_code=?').get(supplierCode);
+    if (!sup) return res.status(400).json({ ok: false, error: `仕入先が未登録です: ${supplierCode}` });
+    let buf;
+    try { buf = fs.readFileSync(req.file.path); } finally { try { fs.unlinkSync(req.file.path); } catch {} }
+    const rows = parseCsvStrict(decodeCsvBuffer(buf));
+    if (rows.length < 2) return res.status(400).json({ ok: false, error: 'データ行がありません' });
+    const header = rows[0].map(s => String(s).trim());
+    let iVendor = header.indexOf('仕入先管理番号');
+    let iOur = header.indexOf('弊社管理番号');
+    const warnings = [];
+    if (iVendor === -1 || iOur === -1) {
+      // GAS実装と同じ位置 (A列=仕入先管理番号, C列=弊社管理番号) にフォールバック
+      iVendor = 0; iOur = 2;
+      warnings.push('見出し「仕入先管理番号」「弊社管理番号」が見つからないため、A列=先方番号 / C列=弊社コード として取り込みました');
+    }
+    let count = 0, skipped = 0;
+    db.transaction(() => {
+      db.prepare('DELETE FROM po_vendor_code_map WHERE supplier_code=?').run(supplierCode);
+      const ins = db.prepare('INSERT OR REPLACE INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, updated_at) VALUES (?,?,?,?,?)');
+      for (let n = 1; n < rows.length; n++) {
+        const vendor = trimS(rows[n][iVendor]);
+        const our = trimS(rows[n][iOur]);
+        if (!vendor || !our) { skipped++; continue; }
+        ins.run(supplierCode, normProductCode(our), our, vendor, nowIso());
+        count++;
+      }
+    })();
+    res.json({ ok: true, supplier: sup.name, count, skipped, warnings });
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+
+router.get('/api/vendor-map', (req, res) => {
+  try {
+    const db = getDB();
+    const rows = db.prepare(`SELECT m.supplier_code, s.name, COUNT(*) AS n FROM po_vendor_code_map m
+      LEFT JOIN po_suppliers s ON s.supplier_code = m.supplier_code GROUP BY m.supplier_code`).all();
+    res.json({ ok: true, maps: rows });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
 // P13a: 台帳の整合性検査 (負残/closed不整合/発行取りこぼし/disposition規則)。P13bで管理画面に表示する
 router.get('/api/ledger/integrity', (req, res) => {
   try {
@@ -623,8 +779,21 @@ router.get('/api/ledger/integrity', (req, res) => {
 const MASTER_DEFS = {
   suppliers: {
     table: 'po_suppliers', pk: 'supplier_code',
-    fromBody: b => ({ supplier_code: normSupplierCode(b.supplier_code), name: trimS(b.name), order_memo: trimS(b.order_memo) || null }),
-    validate: r => { if (!r.supplier_code) return '仕入先コード必須'; if (!r.name) return '仕入先名必須'; return null; },
+    fromBody: b => ({
+      supplier_code: normSupplierCode(b.supplier_code), name: trimS(b.name), order_memo: trimS(b.order_memo) || null,
+      email_to: parseAddresses(b.email_to || '').join(',') || null,
+      email_cc: parseAddresses(b.email_cc || '').join(',') || null,
+      contact_name: trimS(b.contact_name) || null,
+      send_method: trimS(b.send_method) || null,
+      lead_days: numOrNull(b.lead_days),
+    }),
+    validate: r => {
+      if (!r.supplier_code) return '仕入先コード必須';
+      if (!r.name) return '仕入先名必須';
+      if (r.send_method && !['email', 'fax', 'web', 'none'].includes(r.send_method)) return '送信方法は email/fax/web/none';
+      if (r.lead_days != null && (!Number.isInteger(r.lead_days) || r.lead_days < 0)) return 'リードタイムは0以上の整数';
+      return null;
+    },
     csvHeader: ['仕入先コード', '仕入先名', '発注メモ'],
     fromCsv: c => ({ supplier_code: normSupplierCode(c[0]), name: trimS(c[1]), order_memo: trimS(c[2]) || null }),
   },
@@ -3095,12 +3264,74 @@ function orderHtml(o) {
       '<tr id="panel-' + i.id + '" style="display:none"><td colspan="9" id="panelBody-' + i.id + '"></td></tr>';
   });
   h += '</table>';
-  if (o.open) {
-    h += '<div style="margin-top:8px" id="closeArea-' + o.id + '">' +
-      '<button class="ghost" data-closeui="' + o.id + '">✅ 残数を打切って完了にする (手動クローズ)</button></div>';
-  }
+  h += '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap" id="closeArea-' + o.id + '">' +
+    (!o.sendBlocked ? '<button class="ghost" data-emailui="' + o.id + '">📧 発注書メール</button>' : '') +
+    (o.open ? '<button class="ghost" data-closeui="' + o.id + '">✅ 残数を打切って完了にする (手動クローズ)</button>' : '') +
+    '</div><div id="emailArea-' + o.id + '"></div>';
   h += '</div></div>';
   return h;
+}
+
+// ── 発注書メールパネル (プレビュー→送信確認→送信。dry-run/再送/再試行/照合) ──
+function emailPanel(orderId) {
+  var area = document.getElementById('emailArea-' + orderId);
+  area.innerHTML = '<div class="muted">読み込み中…</div>';
+  getJson(API + '/orders/' + orderId + '/email/preview').then(function(j) {
+    if (!j.ok) { area.innerHTML = '<div class="warn">📧 送信できません: ' + esc(j.error) + '</div>'; return; }
+    var dry = j.mode !== 'live';
+    var h = '<div class="import-zone" style="margin-top:6px"><b>📧 発注書メール</b> ' +
+      (dry ? '<span class="badge b-draft" title="宛先を社内アドレスに差し替えて送ります。本番切替はマスタ管理→メール設定">🔒 dry-run中 → ' + esc(j.dryrunTo || '未設定') + '</span>'
+           : '<span class="badge b-issued">本番送信 (live)</span>') +
+      (!j.envReady ? ' <span class="warn" style="display:inline-block;padding:2px 6px">⚠️ Gmail env未設定 (送信不可)</span>' : '') +
+      '<table class="t" style="margin-top:6px">' +
+      '<tr><th>宛先</th><td>' + esc(j.to.join(', ')) + (j.cc.length ? ' / CC: ' + esc(j.cc.join(', ')) : '') + '</td></tr>' +
+      '<tr><th>件名</th><td>' + esc(j.subject) + '</td></tr>' +
+      '<tr><th>添付</th><td>' + esc(j.attachmentName) + ' — ' + j.rows + '行 / 合計 ' + j.totalQty.toLocaleString('ja-JP') + '個 / ' + yen(j.totalAmount) +
+        (j.vendorColUsed ? ' / 先方管理番号列つき' : '') +
+        (j.missingVendorCodes.length ? ' <span class="badge b-issued" title="' + esc(j.missingVendorCodes.join(', ')) + '">⚠️ 先方番号なし ' + j.missingVendorCodes.length + '件</span>' : '') + '</td></tr>' +
+      '</table>' +
+      '<details style="margin-top:6px"><summary>本文と添付の内容を確認</summary>' +
+      '<pre class="copy" style="max-height:200px;overflow:auto">' + esc(j.body) + '</pre>' +
+      '<pre class="copy" style="max-height:160px;overflow:auto">' + esc(j.csvText) + '</pre></details>' +
+      '<div style="margin-top:8px;display:flex;gap:8px;align-items:center">' +
+      '<button class="pri" id="emGo-' + orderId + '">' + (dry ? '📧 dry-run送信 (自分宛)' : '📧 送信する') + '</button>' +
+      (j.jobs.some(function(x){ return x.status === 'sent' && !x.is_dry_run; }) ? '<button class="ghost" id="emResend-' + orderId + '">↪ 再送として送る</button>' : '') +
+      '<button class="ghost" data-emclose="' + orderId + '">閉じる</button></div>';
+    if (j.jobs.length) {
+      h += '<table class="t" style="margin-top:8px"><tr><th>#</th><th>状態</th><th>宛先</th><th>日時</th><th>結果/エラー</th><th></th></tr>';
+      j.jobs.forEach(function(x) {
+        var st = x.status === 'sent' ? '✅ 送信済' + (x.is_dry_run ? ' (dry-run)' : '') :
+          x.status === 'failed' ? '❌ 失敗' : x.status === 'sending' ? '⏳ 送信中' : x.status;
+        h += '<tr><td>' + x.id + (x.is_resend ? ' ↪' : '') + '</td><td>' + st + '</td><td>' + esc(x.to_addr) + '</td>' +
+          '<td class="muted" style="font-size:11px">' + esc(String(x.sent_at || x.created_at).slice(0, 16).replace('T', ' ')) + '</td>' +
+          '<td style="font-size:11px">' + esc(x.gmail_message_id || x.error || '') + '</td>' +
+          '<td>' + (x.status === 'failed' ? '<button class="ghost" data-emretry="' + x.id + '" data-emorder="' + orderId + '">再試行</button>' : '') +
+                   (x.status === 'sending' ? '<button class="ghost" data-emrec="' + orderId + '">照合</button>' : '') + '</td></tr>';
+      });
+      h += '</table>';
+    }
+    h += '</div>';
+    area.innerHTML = h;
+    var idemKey = newIdemKey();
+    function doSend(resend) {
+      var msg = dry
+        ? 'dry-run送信します (宛先は ' + (j.dryrunTo || '未設定') + ' に差し替え)。よろしいですか?'
+        : '⚠️ 本番送信です。仕入先 ' + j.to.join(', ') + ' に発注書が届きます。送信しますか?';
+      if (!confirm(msg)) return;
+      var btn = document.getElementById('emGo-' + orderId);
+      if (btn) btn.disabled = true;
+      post(API + '/orders/' + orderId + '/email/send', { resend: !!resend }, idemKey).then(function(r2) {
+        if (btn) btn.disabled = false;
+        if (!r2.ok) { toast('エラー: ' + r2.error); emailPanel(orderId); return; }
+        toast(r2.status === 'sent' ? '送信しました' + (r2.replay ? ' (前回分を再表示・二重送信なし)' : '') : '送信失敗: ' + (r2.error || ''));
+        emailPanel(orderId);
+      }).catch(onWriteErr(btn));
+    }
+    var go = document.getElementById('emGo-' + orderId);
+    if (go) go.addEventListener('click', function(){ doSend(false); });
+    var rs = document.getElementById('emResend-' + orderId);
+    if (rs) rs.addEventListener('click', function(){ doSend(true); });
+  }).catch(function(e){ area.innerHTML = '<div class="warn">通信エラー: ' + esc(e.message) + '</div>'; });
 }
 
 // ── 消込入力パネル ──
@@ -3277,6 +3508,25 @@ document.addEventListener('click', function(ev) {
   if ((v = g('data-act'))) { actPanel(g('data-item2'), v); return; }
   if ((v = g('data-disp'))) { dispPanel(v); return; }
   if ((v = g('data-hist'))) { histPanel(v); return; }
+  if ((v = g('data-emailui'))) { emailPanel(v); return; }
+  if ((v = g('data-emclose'))) { document.getElementById('emailArea-' + v).innerHTML = ''; return; }
+  if ((v = g('data-emretry'))) {
+    t.disabled = true;
+    var emOrder = g('data-emorder');
+    post(API + '/email-jobs/' + v + '/retry', {}).then(function(j) {
+      toast(j.ok ? (j.status === 'sent' ? '送信しました' : '送信失敗: ' + (j.error || '')) : 'エラー: ' + j.error);
+      emailPanel(emOrder);
+    }).catch(onWriteErr(t));
+    return;
+  }
+  if ((v = g('data-emrec'))) {
+    t.disabled = true;
+    post(API + '/email/reconcile', {}).then(function(j) {
+      toast(j.ok ? '照合しました (' + j.checked + '件)' : 'エラー: ' + j.error);
+      emailPanel(v);
+    }).catch(onWriteErr(t));
+    return;
+  }
   if ((v = g('data-histclose'))) { hidePanel(v); return; }
   // 逆仕訳: 理由入力 → 確定 (promptは使わない)
   if ((v = g('data-rev'))) {
@@ -3417,6 +3667,42 @@ router.get('/admin', (req, res) => {
       <div id="importResult" class="pill-row"></div>
     </div>
 
+    <div class="import-zone">
+      <h3>📧 発注書メール設定</h3>
+      <div class="hint">
+        発注残ページの「📧発注書メール」から送信します。<b>既定は dry-run</b> (宛先を下の社内アドレスに差し替えて送信) — 内容を数回確認してから live に切り替えてください。<br>
+        宛先は仕入先マスタの「発注書メール宛先」列 (下の宛先マスタCSVで一括登録可)。アメージングクラフト/ビーフリーは対応表を取り込むと添付CSVに先方管理番号列が付きます。
+      </div>
+      <div class="row" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:6px">
+        <label>モード <select id="emMode"><option value="dry_run">dry_run (社内宛て)</option><option value="live">live (本番送信)</option></select></label>
+        <label>dry-run宛先 <input type="text" id="emDryTo" placeholder="自分のメールアドレス" style="width:220px"></label>
+        <span id="emEnv" class="muted"></span>
+        <button class="ghost" id="emTplToggle">テンプレ編集</button>
+        <button class="pri" id="emSave">設定を保存</button>
+        <span id="emStatus" class="muted"></span>
+      </div>
+      <div id="emTpl" style="display:none;margin-top:6px">
+        <div>件名テンプレ <input type="text" id="emSubject" style="width:420px"></div>
+        <div style="margin-top:4px">本文テンプレ (変数: {{date}} {{name}} {{contact}} {{po_number}})<br>
+        <textarea id="emBody" rows="10" style="width:100%;max-width:640px"></textarea></div>
+      </div>
+      <div class="row" style="display:flex;gap:16px;flex-wrap:wrap;margin-top:10px;align-items:flex-end">
+        <form id="recipForm">
+          <div class="hint">宛先マスタCSV (スプシ「仕入先ごとの発注メール送信先一覧」の生DL。仕入先名称で突合)</div>
+          <input type="file" name="file" accept=".csv" required>
+          <button type="submit">📥 宛先マスタ取込</button>
+        </form>
+        <form id="vmapForm">
+          <div class="hint">先方管理番号 対応表CSV (A列=仕入先管理番号 / C列=弊社管理番号)</div>
+          仕入先コード <input type="text" name="supplier_code" style="width:80px" required>
+          <input type="file" name="file" accept=".csv" required>
+          <button type="submit">📥 対応表取込</button>
+        </form>
+        <span id="vmapNow" class="muted"></span>
+      </div>
+      <div id="emResult" class="pill-row"></div>
+    </div>
+
     <div class="tabbar">
       <button data-tab="suppliers" class="on">仕入先</button>
       <button data-tab="conditions">発注条件グループ</button>
@@ -3431,7 +3717,10 @@ var TAB = 'suppliers';
 // ro=読み取り専用の表示列 (サーバが名前解決)。dl=グループをID/名前どちらでも入力できるオートコンプリート
 var DEFS = {
   suppliers: { title: '仕入先', cols: [
-    { k: 'supplier_code', l: '仕入先コード', pk: 1 }, { k: 'name', l: '仕入先名' }, { k: 'order_memo', l: '発注メモ (FAX/WEB/送料条件等)' } ] },
+    { k: 'supplier_code', l: '仕入先コード', pk: 1 }, { k: 'name', l: '仕入先名' }, { k: 'order_memo', l: '発注メモ (FAX/WEB/送料条件等)' },
+    { k: 'email_to', l: '発注書メール宛先 (カンマ区切り可)' }, { k: 'email_cc', l: 'CC' },
+    { k: 'contact_name', l: '担当者名 (様は自動付与)' }, { k: 'send_method', l: '送信方法 (email/fax/web/none)' },
+    { k: 'lead_days', l: '標準リードタイム日数', num: 1 } ] },
   conditions: { title: '発注条件グループ', cols: [
     { k: 'condition_id', l: '条件ID', pk: 1 }, { k: 'supplier_code', l: '仕入先コード' }, { k: '仕入先名', l: '仕入先名', ro: 1 }, { k: 'maker_name', l: 'メーカー名' },
     { k: 'display_name', l: '管理名' }, { k: 'condition_type', l: '条件タイプ (数量/金額/上限 他)' }, { k: 'condition_value', l: '条件値', num: 1 }, { k: 'unit', l: '単位' } ] },
@@ -3644,7 +3933,65 @@ function post(b) {
     } else toast('エラー: ' + j.error);
   });
 }
-load();`;
+load();
+
+// ── 発注書メール設定 (P15) ──
+var API_EM = '/apps/purchase-orders/api';
+function emLoad() {
+  fetch(API_EM + '/email/settings').then(function(r){ return r.json(); }).then(function(j) {
+    if (!j.ok) return;
+    document.getElementById('emMode').value = j.mode;
+    document.getElementById('emDryTo').value = j.dryrunTo;
+    document.getElementById('emSubject').value = j.subjectTpl;
+    document.getElementById('emBody').value = j.bodyTpl;
+    document.getElementById('emEnv').textContent = j.envReady ? 'Gmail env: 🟢設定済' : 'Gmail env: ⚠️未設定 (Renderに PO_GMAIL_CLIENT_ID/SECRET/REFRESH_TOKEN)';
+  });
+  fetch(API_EM + '/vendor-map').then(function(r){ return r.json(); }).then(function(j) {
+    if (!j.ok) return;
+    document.getElementById('vmapNow').textContent = j.maps.length
+      ? '対応表: ' + j.maps.map(function(m){ return (m.name || m.supplier_code) + ' ' + m.n + '件'; }).join(' / ')
+      : '対応表: 未登録';
+  });
+}
+document.getElementById('emTplToggle').addEventListener('click', function() {
+  var el = document.getElementById('emTpl');
+  el.style.display = el.style.display === 'none' ? '' : 'none';
+});
+document.getElementById('emSave').addEventListener('click', function() {
+  var btn = this; btn.disabled = true;
+  fetch(API_EM + '/email/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode: document.getElementById('emMode').value, dryrunTo: document.getElementById('emDryTo').value,
+      subjectTpl: document.getElementById('emSubject').value, bodyTpl: document.getElementById('emBody').value }) })
+    .then(function(r){ return r.json(); }).then(function(j) {
+      btn.disabled = false;
+      if (!j.ok) { toast('エラー: ' + j.error); return; }
+      toast('メール設定を保存しました' + (j.mode === 'live' ? ' — ⚠️ 本番送信モードです' : ''));
+      emLoad();
+    }).catch(function(e){ btn.disabled = false; toast('通信エラー: ' + e.message); });
+});
+document.getElementById('recipForm').addEventListener('submit', function(ev) {
+  ev.preventDefault();
+  var fd = new FormData(ev.target);
+  fetch(API_EM + '/email/recipients/csv', { method: 'POST', body: fd }).then(function(r){ return r.json(); }).then(function(j) {
+    if (!j.ok) { toast('エラー: ' + j.error); return; }
+    var pills = ['✅ 宛先更新 ' + j.updated + '件'];
+    if (j.unmatched.length) pills.push('⚠️ 名称不一致 ' + j.unmatched.length + '件: ' + j.unmatched.slice(0, 5).join('、') + (j.unmatched.length > 5 ? '…' : ''));
+    (j.invalid || []).forEach(function(x){ pills.push('⚠️ ' + x); });
+    document.getElementById('emResult').innerHTML = pills.map(function(p){ return '<span class="badge b-draft" style="margin:2px">' + esc(p) + '</span>'; }).join(' ');
+    toast('宛先マスタを取り込みました');
+  }).catch(function(e){ toast('通信エラー: ' + e.message); });
+});
+document.getElementById('vmapForm').addEventListener('submit', function(ev) {
+  ev.preventDefault();
+  var fd = new FormData(ev.target);
+  fetch(API_EM + '/vendor-map/csv', { method: 'POST', body: fd }).then(function(r){ return r.json(); }).then(function(j) {
+    if (!j.ok) { toast('エラー: ' + j.error); return; }
+    toast('対応表を取り込みました (' + j.supplier + ' ' + j.count + '件' + (j.skipped ? ', スキップ' + j.skipped : '') + ')');
+    (j.warnings || []).forEach(function(w){ toast('⚠️ ' + w); });
+    emLoad();
+  }).catch(function(e){ toast('通信エラー: ' + e.message); });
+});
+emLoad();`;
   res.send(pageShell('発注補助 — マスタ管理', 'admin', body, script));
 });
 

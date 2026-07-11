@@ -517,6 +517,72 @@ function initLedgerSchema(db) {
                THEN RAISE(ABORT, 'inbound: 割当合計が入庫の良品数を超えます') END;
            END`);
 
+  // ── 発注書メール送信 (P15) ──
+  // 仕入先マスタ拡張 (宛先・担当者・送信方法。既存GAS「仕入先ごとの発注メール送信先一覧」の移植先)
+  addCol(db, 'po_suppliers', 'email_to', 'TEXT');       // カンマ区切り複数可 (保存時に正規化・検証)
+  addCol(db, 'po_suppliers', 'email_cc', 'TEXT');
+  addCol(db, 'po_suppliers', 'contact_name', 'TEXT');   // 「様」は送信時に自動補完
+  addCol(db, 'po_suppliers', 'send_method', 'TEXT');    // email / fax / web / none (NULL=未設定)
+  addCol(db, 'po_suppliers', 'lead_days', 'INTEGER');   // 標準リードタイム (欠品リスクP17で使用)
+
+  // 先方管理番号対応表 (アメージングクラフト/ビーフリー等。添付CSVに先方番号列を付与する)
+  db.exec(`CREATE TABLE IF NOT EXISTS po_vendor_code_map (
+    supplier_code TEXT NOT NULL,
+    product_key   TEXT NOT NULL,
+    product_code  TEXT NOT NULL,
+    vendor_code   TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (supplier_code, product_key)
+  )`);
+
+  // メール送信ジョブ (outbox方式。txn内でGmail APIを呼ばない。delivery_key で二重送信の確率を構造的に低減:
+  // 送信前に sending をcommit → Message-IDヘッダ+本文に埋込 → lease切れ再送前にGmail照合、不明時は自動再送しない)
+  db.exec(`CREATE TABLE IF NOT EXISTS po_email_jobs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id      INTEGER NOT NULL REFERENCES po_orders(id),
+    status        TEXT NOT NULL CHECK(status IN ('queued','sending','sent','failed','cancelled')),
+    is_dry_run    INTEGER NOT NULL DEFAULT 0 CHECK(is_dry_run IN (0,1)),
+    delivery_key  TEXT NOT NULL UNIQUE,
+    to_addr       TEXT NOT NULL,
+    cc_addr       TEXT,
+    subject       TEXT NOT NULL,
+    body          TEXT NOT NULL,
+    attachment_name TEXT NOT NULL,
+    attachment_csv  TEXT NOT NULL,
+    content_hash  TEXT NOT NULL,
+    is_resend     INTEGER NOT NULL DEFAULT 0 CHECK(is_resend IN (0,1)),
+    resend_of     INTEGER REFERENCES po_email_jobs(id),
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+    sending_started_at TEXT,
+    gmail_message_id   TEXT,
+    error         TEXT,
+    created_at    TEXT NOT NULL,
+    sent_at       TEXT,
+    actor         TEXT
+  )`);
+  // 同一PO+同一内容の二重送信を禁止 (再送は is_resend=1 で明示。dry-runは本送信のdedupを妨げない)
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS uq_po_email_dedup ON po_email_jobs(order_id, content_hash)
+           WHERE is_resend = 0 AND is_dry_run = 0 AND status IN ('queued','sending','sent')`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_po_email_status ON po_email_jobs(status, created_at)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_po_email_order ON po_email_jobs(order_id, created_at)');
+  // 不正な状態遷移をDB側でも拒否 (sent/cancelled は終端。queued→sending→sent/failed、failed→cancelledのみ)
+  db.exec(`CREATE TRIGGER trg_po_email_transition BEFORE UPDATE OF status ON po_email_jobs
+           WHEN NEW.status IS NOT OLD.status
+           BEGIN
+             SELECT CASE
+               WHEN OLD.status = 'sent' OR OLD.status = 'cancelled'
+                 THEN RAISE(ABORT, 'email job: 終端状態からの遷移は不可')
+               WHEN OLD.status = 'queued' AND NEW.status NOT IN ('sending','cancelled')
+                 THEN RAISE(ABORT, 'email job: queued からは sending/cancelled のみ')
+               WHEN OLD.status = 'sending' AND NEW.status NOT IN ('sent','failed','queued')
+                 THEN RAISE(ABORT, 'email job: sending からは sent/failed/queued(照合後の再キュー)のみ')
+               WHEN OLD.status = 'failed' AND NEW.status NOT IN ('queued','cancelled')
+                 THEN RAISE(ABORT, 'email job: failed からは queued(再試行)/cancelled のみ')
+               WHEN NEW.status = 'sent' AND NEW.sent_at IS NULL
+                 THEN RAISE(ABORT, 'email job: sent には sent_at が必要')
+             END;
+           END`);
+
   // ── 設定 (現在値テーブル。変更は前後値を po_audit_log に同一txn記録) ──
   db.exec(`CREATE TABLE IF NOT EXISTS po_settings (
     key          TEXT PRIMARY KEY,
