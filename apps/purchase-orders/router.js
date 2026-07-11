@@ -2716,14 +2716,18 @@ function onWriteErr(btn) {
   };
 }
 
+var LOAD_SEQ = 0;
 function load() {
+  var seq = ++LOAD_SEQ; // 連続操作でGETが重なっても、最新要求以外の応答は破棄 (古い状態への巻き戻り防止)
   getJson(API + '/backorders').then(function(j) {
+    if (seq !== LOAD_SEQ) return;
     if (!j.ok) {
       document.getElementById('boList').innerHTML = '<div class="warn">エラー: ' + esc(j.error) + ' <button class="ghost" onclick="load()">再読込</button></div>';
       return;
     }
     DATA = j; render();
   }).catch(function(e) {
+    if (seq !== LOAD_SEQ) return;
     document.getElementById('boList').innerHTML = '<div class="warn">通信エラー: ' + esc(e.message) + ' <button class="ghost" onclick="load()">再読込</button></div>';
   });
   getJson(API + '/ledger/integrity').then(function(j) {
@@ -2980,13 +2984,14 @@ function findItem(itemId) {
   return found;
 }
 function showPanel(itemId, html) {
+  HIST_SEQ++; // 取得中の履歴応答が新しいパネルを上書きしないよう、パネル切替でも世代を進める
   // 他明細のパネルDOMは中身ごと破棄する (evQty等のIDとradio name=rem が重複して誤送信するのを防ぐ)
   document.querySelectorAll('tr[id^=panel-]').forEach(function(tr){ tr.style.display = 'none'; });
   document.querySelectorAll('td[id^=panelBody-]').forEach(function(td){ if (td.id !== 'panelBody-' + itemId) td.innerHTML = ''; });
   document.getElementById('panelBody-' + itemId).innerHTML = html;
   document.getElementById('panel-' + itemId).style.display = '';
 }
-function hidePanel(itemId) { document.getElementById('panel-' + itemId).style.display = 'none'; }
+function hidePanel(itemId) { HIST_SEQ++; document.getElementById('panel-' + itemId).style.display = 'none'; }
 
 document.addEventListener('click', function(ev) {
   var t = ev.target;
@@ -3014,11 +3019,12 @@ document.addEventListener('click', function(ev) {
     document.getElementById('revGo').addEventListener('click', function() {
       var note = document.getElementById('revNote').value;
       if (!note.trim()) { toast('訂正理由を入力してください'); return; }
+      var btn = this; btn.disabled = true;
       post(API + '/events/' + v + '/reverse', { note: note }, revKey).then(function(j) {
-        if (!j.ok) { toast('エラー: ' + j.error); return; }
+        if (!j.ok) { btn.disabled = false; toast('エラー: ' + j.error); return; }
         toast('逆仕訳しました (残 ' + j.remaining + ')' + (j.needsDisposition ? ' — ⚠️ 残数の扱い (分納待ち/減数/確認中) を選択してください' : ''));
         load();
-      }).catch(onWriteErr(document.getElementById('revGo')));
+      }).catch(onWriteErr(btn));
     });
     return;
   }
@@ -3033,11 +3039,12 @@ document.addEventListener('click', function(ev) {
     document.getElementById('clGo').addEventListener('click', function() {
       var note = document.getElementById('clNote').value;
       if (!note.trim()) { toast('理由を入力してください'); return; }
+      var btn = this; btn.disabled = true;
       post(API + '/orders/' + v + '/close', { note: note }, clKey).then(function(j) {
-        if (!j.ok) { toast('エラー: ' + j.error); return; }
+        if (!j.ok) { btn.disabled = false; toast('エラー: ' + j.error); return; }
         toast('クローズしました (打切 ' + j.cutoffItems + '明細)');
         load();
-      }).catch(onWriteErr(document.getElementById('clGo')));
+      }).catch(onWriteErr(btn));
     });
     return;
   }
@@ -3051,8 +3058,9 @@ document.addEventListener('click', function(ev) {
   }
   if ((v = g('data-pdsave'))) {
     var val = document.getElementById('pd-' + v).value;
+    t.disabled = true;
     patch(API + '/items/' + v + '/plan', { promisedDate: val || '' }, g('data-pdkey')).then(function(j) {
-      if (!j.ok) { toast('エラー: ' + j.error); return; }
+      if (!j.ok) { t.disabled = false; toast('エラー: ' + j.error); return; }
       toast('回答納期を保存しました');
       load();
     }).catch(onWriteErr(t));
