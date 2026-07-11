@@ -501,6 +501,14 @@ function initLedgerSchema(db) {
                THEN RAISE(ABORT, 'inbound: 入庫明細が存在しないか、訂正版で無効化されています') END;
              SELECT CASE WHEN EXISTS (SELECT 1 FROM po_inbound_ignores g WHERE g.inbound_item_id = NEW.inbound_item_id AND g.revoked_at IS NULL)
                THEN RAISE(ABORT, 'inbound: 対象外に指定された入庫明細です') END;
+             -- 商品・仕入先の一致を書込時にも強制 (候補UIのフィルタは整合性境界ではない、Codex P14-R2 High-1)
+             SELECT CASE WHEN (SELECT x.product_key FROM po_inbound_items x WHERE x.id = NEW.inbound_item_id)
+               <> (SELECT i.product_key FROM po_order_items i WHERE i.id = NEW.order_item_id)
+               THEN RAISE(ABORT, 'inbound: 入庫と発注の商品が一致しません') END;
+             SELECT CASE WHEN (SELECT x.supplier_code FROM po_inbound_items x WHERE x.id = NEW.inbound_item_id) IS NOT NULL
+               AND (SELECT x.supplier_code FROM po_inbound_items x WHERE x.id = NEW.inbound_item_id)
+                 <> (SELECT o.supplier_code FROM po_orders o JOIN po_order_items i ON i.order_id = o.id WHERE i.id = NEW.order_item_id)
+               THEN RAISE(ABORT, 'inbound: 入庫と発注の仕入先が一致しません') END;
              SELECT CASE WHEN (
                SELECT COALESCE(SUM(e.qty), 0) FROM po_item_events e
                WHERE e.inbound_item_id = NEW.inbound_item_id AND e.event_type = 'receipt'

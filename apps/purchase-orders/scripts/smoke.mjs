@@ -946,6 +946,30 @@ console.log('── P14: 入庫CSV取込+突合+割当 ──');
     body: JSON.stringify({ ignore: true, reason: 'x' }) });
   ok(r.status === 400 && r.body.error.includes('逆仕訳'), '割当が残る入庫の対象外化は拒否 (Codex P14 R1)', r.body.error);
 
+  // 商品・仕入先不一致の割当はDBトリガも拒否 (APIを直接叩いても通らない)
+  const otherPo = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'cardstand-silver-r', qty: 3 }] }) });
+  const otherItem = db.prepare('SELECT * FROM po_order_items WHERE order_id=?').get(otherPo.body.id);
+  r = await j('/api/items/' + otherItem.id + '/events', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: 'receipt', qty: 1, inboundItemId: inb2.id, remainder: { action: 'await_confirmation', nextActionDate: '2026-07-20' } }) });
+  ok(r.status === 400 && r.body.error.includes('商品が一致しません'), '商品不一致の割当はトリガが拒否 (Codex P14 R2)', r.body.error);
+
+  // 訂正版で仕入先だけ変わった行は supplier_code が更新される
+  await upload('lz3-fix.csv', [HDR, ['AR003', 'noflyersticker', '商品', '0001', '70', '3', '0', '2026/07/11']]);
+  r = await j('/api/inbound');
+  const inb3b = r.body.open.find(x => x.slip === 'AR003');
+  ok(inb3b && inb3b.supplierCode === '1', '訂正版: 仕入先のみの訂正も反映', inb3b && inb3b.supplierCode);
+  r = await j('/api/inbound/' + inb3b.id + '/candidates');
+  ok(r.body.candidates.length >= 1, '仕入先訂正後は候補に出る');
+
+  // 壊れた引用符のCSVはパースエラー
+  {
+    const fdq = new FormData();
+    fdq.append('file', new Blob([iconv.encode('"伝票NO","型番","取引先ID","仕入単価","良品数"\r\nAR"9",x,0001,70,1', 'Shift_JIS')]), 'broken.csv');
+    r = await j('/api/inbound/import', { method: 'POST', body: fdq });
+    ok(r.status === 400 && r.body.error.includes('引用符'), '引用符が壊れたCSVは拒否', r.body.error);
+  }
+
   // ページ配信
   const html = await (await fetch(base + '/inbound')).text();
   ok(html.includes('inbForm') && html.includes('data-match') && html.includes('訂正競合'), '/inbound ページ配信 (取込+割当+競合)');

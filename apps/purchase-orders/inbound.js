@@ -17,28 +17,33 @@ import { getSetting, jstToday, isYmd, audit } from './ledger.js';
 
 const nowIso = () => new Date().toISOString();
 
-/** CSV 1ファイルのパース (router.js の parseCsv と同等の引用符対応ミニ実装) */
+/** CSV 1ファイルのパース。構文が壊れた行を「正常データ」として取り込まないよう厳格 (Codex P14-R2 Medium-3):
+ *  引用符はフィールド先頭のみ・閉じ引用符の後は区切り/改行/EOFのみ許可。未クローズはエラー */
 export function parseCsv(text) {
   const rows = [];
-  let row = [], field = '', q = false;
+  let row = [], field = '', q = false, closed = false;
+  const pushField = () => { row.push(field); field = ''; closed = false; };
+  const pushRow = () => { pushField(); if (row.some(v => v !== '')) rows.push(row); row = []; };
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
     if (q) {
       if (c === '"') {
-        if (text[i + 1] === '"') { field += '"'; i++; } else q = false;
+        if (text[i + 1] === '"') { field += '"'; i++; } else { q = false; closed = true; }
       } else field += c;
-    } else if (c === '"') q = true;
-    else if (c === ',') { row.push(field); field = ''; }
+    } else if (c === '"') {
+      if (field !== '' || closed) throw new Error(`CSVの引用符の位置が不正です (行${rows.length + 2}付近)`);
+      q = true;
+    } else if (c === ',') pushField();
     else if (c === '\n' || c === '\r') {
       if (c === '\r' && text[i + 1] === '\n') i++;
-      row.push(field); field = '';
-      if (row.some(v => v !== '')) rows.push(row);
-      row = [];
-    } else field += c;
+      pushRow();
+    } else {
+      if (closed) throw new Error(`CSVの閉じ引用符の後に文字があります (行${rows.length + 2}付近)`);
+      field += c;
+    }
   }
-  row.push(field);
-  if (row.some(v => v !== '')) rows.push(row);
   if (q) throw new Error('CSVの引用符が閉じていません (ファイル破損の可能性)');
+  pushRow();
   return rows;
 }
 
@@ -171,7 +176,17 @@ export function importInboundCsv({ buffer, filename, actor = null }) {
         (receipt_id, line_key, batch_id, supplier_code, product_code, product_key, good_qty, defective_qty, unit_cost, payload_json, created_at)
         VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
       for (const l of lines) {
-        if (existingByKey.has(l.lineKey)) { unchangedItems++; continue; }
+        const same = existingByKey.get(l.lineKey);
+        if (same) {
+          // 行キー (商品・数量・単価) が同じでも、仕入先や原本は訂正されている可能性がある → 今回値で更新
+          // (仕入先だけの訂正が反映されないと候補抽出が誤る、Codex P14-R2 Medium-2)
+          if (same.supplier_code !== (l.supplierCode || null) || same.product_code !== l.productCode || same.payload_json !== l.payload) {
+            db.prepare('UPDATE po_inbound_items SET supplier_code=?, product_code=?, payload_json=?, batch_id=? WHERE id=?')
+              .run(l.supplierCode || null, l.productCode, l.payload, batchId, same.id);
+          }
+          unchangedItems++;
+          continue;
+        }
         // 過去にsupersededになった同一内容行が復活するケース: UNIQUE(receipt,line_key) に当たるため復活させる。
         // 監査が誤らないよう、原本・バッチ情報も今回の値へ更新する (Codex P14-R1 Medium-1)
         const dead = db.prepare('SELECT id FROM po_inbound_items WHERE receipt_id=? AND line_key=? AND superseded=1').get(receipt.id, l.lineKey);
