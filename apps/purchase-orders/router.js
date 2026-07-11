@@ -774,13 +774,14 @@ router.post('/api/email/recipients/csv', upload.single('file'), (req, res) => {
 router.post('/api/vendor-map/csv', upload.single('file'), (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ ok: false, error: 'ファイルがありません' });
+    // 一時ファイルはどの終了経路でも削除する (検証エラーの繰り返しでアップロード領域を消費させない、Codex P15-R5 Medium)
+    let buf;
+    try { buf = fs.readFileSync(req.file.path); } finally { try { fs.unlinkSync(req.file.path); } catch {} }
     const supplierCode = normSupplierCode((req.body || {}).supplier_code);
     if (!supplierCode) return res.status(400).json({ ok: false, error: '仕入先コードが必要です' });
     const db = getDB();
     const sup = db.prepare('SELECT name FROM po_suppliers WHERE supplier_code=?').get(supplierCode);
     if (!sup) return res.status(400).json({ ok: false, error: `仕入先が未登録です: ${supplierCode}` });
-    let buf;
-    try { buf = fs.readFileSync(req.file.path); } finally { try { fs.unlinkSync(req.file.path); } catch {} }
     const rows = parseCsvStrict(decodeCsvBuffer(buf));
     if (rows.length < 2) return res.status(400).json({ ok: false, error: 'データ行がありません' });
     const header = rows[0].map(s => String(s).trim());

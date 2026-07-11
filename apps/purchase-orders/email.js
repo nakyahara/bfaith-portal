@@ -282,31 +282,43 @@ export async function reconcileEmailJobs() {
   const targets = db.prepare(`SELECT * FROM po_email_jobs
     WHERE status='unknown' OR (status='sending' AND sending_started_at < ?)`).all(staleBefore);
   const results = [];
-  // 更新は現在状態を条件にする (照合の並行実行で重複監査・sent_at上書きをしない、Codex P15-R4 Low)
-  const toUnknown = db.prepare("UPDATE po_email_jobs SET status='unknown' WHERE id=? AND status='sending'");
-  const toSent = db.prepare(`UPDATE po_email_jobs SET status='sent', sent_at=?, gmail_message_id=?, error=NULL
-                             WHERE id=? AND status IN ('sending','unknown')`);
-  const setErr = db.prepare("UPDATE po_email_jobs SET error=? WHERE id=? AND status IN ('sending','unknown')");
+  // Gmail検索 (async) の後、状態の確定は単一の BEGIN IMMEDIATE txn 内で現在状態を再読して行う (CAS)。
+  // markUnsent() も immediate txn のため直列化され、「照合中に未送信宣言→送信済みメールを再送可能にする」
+  // 競合が起きない (Codex P15-R5 High)。検索で見つかった事実は最優先 (queuedに戻っていても sent に確定する)
+  const applyFound = db.transaction((jobId, found) => {
+    const cur = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(jobId);
+    if (cur.status === 'sent') return 'sent (確定済み)';
+    if (cur.status === 'cancelled') {
+      db.prepare('UPDATE po_email_jobs SET error=? WHERE id=?')
+        .run('⚠️ 取消済みだがGmailに送信済みメールを検出。内容を確認してください', jobId);
+      return 'cancelled だが送信済みメールあり (要確認)';
+    }
+    // queued は一旦 sending へ (遷移トリガの許す経路で sent に確定する)。sending/unknown → sent は直接可
+    if (cur.status === 'queued') db.prepare("UPDATE po_email_jobs SET status='sending', sending_started_at=? WHERE id=?").run(nowIso(), jobId);
+    db.prepare("UPDATE po_email_jobs SET status='sent', sent_at=?, gmail_message_id=?, error=NULL WHERE id=?").run(nowIso(), found, jobId);
+    audit(db, { actorType: 'system', actor: null, action: 'email_reconciled_sent', resource: `order:${cur.order_id}`,
+      detail: { jobId, gmailMessageId: found, deliveryKey: cur.delivery_key, wasStatus: cur.status } });
+    return 'sent (照合で送信済みを確認)';
+  });
+  const applyNotFound = db.transaction((jobId, msg) => {
+    const cur = db.prepare('SELECT status FROM po_email_jobs WHERE id=?').get(jobId);
+    if (cur.status === 'queued' || cur.status === 'sent' || cur.status === 'cancelled') return cur.status + ' (照合中に状態変化。そのまま)';
+    if (cur.status === 'sending') db.prepare("UPDATE po_email_jobs SET status='unknown' WHERE id=?").run(jobId);
+    db.prepare("UPDATE po_email_jobs SET error=? WHERE id=? AND status='unknown'").run(msg, jobId);
+    return 'unknown (手動確認要)';
+  });
   for (const job of targets) {
     try {
       const found = await searchGmailByMessageId(messageIdOf(job));
       if (found) {
-        toUnknown.run(job.id);
-        const changed = toSent.run(nowIso(), found, job.id).changes;
-        if (changed > 0) {
-          audit(db, { actorType: 'system', actor: null, action: 'email_reconciled_sent', resource: `order:${job.order_id}`,
-            detail: { jobId: job.id, gmailMessageId: found, deliveryKey: job.delivery_key } });
-        }
-        results.push({ jobId: job.id, result: 'sent (照合で送信済みを確認)' });
+        results.push({ jobId: job.id, result: applyFound.immediate(job.id, found) });
       } else {
-        toUnknown.run(job.id);
-        setErr.run(`照合0件 (未送信の証明にはなりません)。Gmailの送信済みで整理番号 ${job.delivery_key} を確認し、無ければ「未送信を確認した」→再試行してください`, job.id);
-        results.push({ jobId: job.id, result: 'unknown (0件。手動確認要)' });
+        results.push({ jobId: job.id, result: applyNotFound.immediate(job.id,
+          `照合0件 (未送信の証明にはなりません)。Gmailの送信済みで整理番号 ${job.delivery_key} を確認し、無ければ「未送信を確認した」→再試行してください`) });
       }
     } catch (e) {
-      toUnknown.run(job.id);
-      setErr.run(`照合不能: ${String(e.message).slice(0, 200)} — Gmailで整理番号 ${job.delivery_key} を検索して手動確認してください`, job.id);
-      results.push({ jobId: job.id, result: 'unknown (照合不能。手動確認要)' });
+      results.push({ jobId: job.id, result: applyNotFound.immediate(job.id,
+        `照合不能: ${String(e.message).slice(0, 200)} — Gmailで整理番号 ${job.delivery_key} を検索して手動確認してください`) });
     }
   }
   return { checked: targets.length, results };
