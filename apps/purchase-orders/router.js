@@ -3409,7 +3409,7 @@ function emailPanel(orderId) {
           if (btn) btn.disabled = false;
           if (!r2.ok) { toast('エラー: ' + r2.error); emailPanel(orderId); return; }
           toast(r2.status === 'sent' ? '送信しました' + (r2.replay ? ' (前回分を再表示・二重送信なし)' : '') :
-            r2.status === 'scheduled' ? '予約しました (' + String(r2.scheduledAt || '').slice(0, 16).replace('T', ' ') + ' UTC)' :
+            r2.status === 'scheduled' ? '予約しました (' + (r2.scheduledAt ? new Date(new Date(r2.scheduledAt).getTime() + 9 * 3600000).toISOString().slice(0, 16).replace('T', ' ') + ' JST' : '') + ')' :
             r2.status === 'unknown' ? '⚠️ 送信結果が不明です。「照合」で確認してください' :
             '送信失敗: ' + (r2.error || ''));
           emailPanel(orderId);

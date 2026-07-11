@@ -554,6 +554,7 @@ function initLedgerSchema(db) {
     is_resend     INTEGER NOT NULL DEFAULT 0 CHECK(is_resend IN (0,1)),
     resend_of     INTEGER REFERENCES po_email_jobs(id),
     attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+    generation    INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0),
     sending_started_at TEXT,
     gmail_message_id   TEXT,
     error         TEXT,

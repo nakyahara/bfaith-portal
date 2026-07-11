@@ -241,7 +241,8 @@ export async function processEmailJob(jobId) {
     if (job.scheduled_at && job.scheduled_at > nowIso()) return { done: 'scheduled', job };
     if (job.attempt_count >= 5) throw new Error('再試行上限 (5回) に達しています。「再送」で新しいジョブを作成してください');
     if (job.status === 'failed') db.prepare("UPDATE po_email_jobs SET status='queued' WHERE id=?").run(jobId);
-    db.prepare("UPDATE po_email_jobs SET status='sending', sending_started_at=?, attempt_count=attempt_count+1, error=NULL WHERE id=?")
+    // generation = 送信試行の世代。照合はスナップショット時の世代と一致する場合のみ結果を適用する (競合検知)
+    db.prepare("UPDATE po_email_jobs SET status='sending', sending_started_at=?, attempt_count=attempt_count+1, generation=generation+1, error=NULL WHERE id=?")
       .run(nowIso(), jobId);
     return { done: false, job: db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(jobId) };
   }).immediate();
@@ -282,42 +283,43 @@ export async function reconcileEmailJobs() {
   const targets = db.prepare(`SELECT * FROM po_email_jobs
     WHERE status='unknown' OR (status='sending' AND sending_started_at < ?)`).all(staleBefore);
   const results = [];
-  // Gmail検索 (async) の後、状態の確定は単一の BEGIN IMMEDIATE txn 内で現在状態を再読して行う (CAS)。
-  // markUnsent() も immediate txn のため直列化され、「照合中に未送信宣言→送信済みメールを再送可能にする」
-  // 競合が起きない (Codex P15-R5 High)。検索で見つかった事実は最優先 (queuedに戻っていても sent に確定する)
-  const applyFound = db.transaction((jobId, found) => {
+  // Gmail検索 (async) はtxn外のため、結果の適用は「スナップショット時の generation と一致する場合のみ」
+  // BEGIN IMMEDIATE txn 内で行う (Codex P15-R6 High)。markUnsent / 再lease は generation を進めるので、
+  // 検索中に未送信宣言→再試行が始まっていたら古い照合結果は破棄される (新しい送信をsent扱いにしない)
+  const applyFound = db.transaction((jobId, gen, found) => {
     const cur = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(jobId);
     if (cur.status === 'sent') return 'sent (確定済み)';
-    if (cur.status === 'cancelled') {
+    if (cur.generation !== gen || (cur.status !== 'sending' && cur.status !== 'unknown')) {
       db.prepare('UPDATE po_email_jobs SET error=? WHERE id=?')
-        .run('⚠️ 取消済みだがGmailに送信済みメールを検出。内容を確認してください', jobId);
-      return 'cancelled だが送信済みメールあり (要確認)';
+        .run(`⚠️ 照合で送信済みメール (整理番号 ${cur.delivery_key}) を検出しましたが、状態が変化していたため未適用。再照合してください`, jobId);
+      return `${cur.status} (照合中に状態変化 → 結果破棄。再照合してください)`;
     }
-    // queued は一旦 sending へ (遷移トリガの許す経路で sent に確定する)。sending/unknown → sent は直接可
-    if (cur.status === 'queued') db.prepare("UPDATE po_email_jobs SET status='sending', sending_started_at=? WHERE id=?").run(nowIso(), jobId);
+    if (cur.status === 'sending') db.prepare("UPDATE po_email_jobs SET status='unknown' WHERE id=?").run(jobId);
     db.prepare("UPDATE po_email_jobs SET status='sent', sent_at=?, gmail_message_id=?, error=NULL WHERE id=?").run(nowIso(), found, jobId);
     audit(db, { actorType: 'system', actor: null, action: 'email_reconciled_sent', resource: `order:${cur.order_id}`,
       detail: { jobId, gmailMessageId: found, deliveryKey: cur.delivery_key, wasStatus: cur.status } });
     return 'sent (照合で送信済みを確認)';
   });
-  const applyNotFound = db.transaction((jobId, msg) => {
-    const cur = db.prepare('SELECT status FROM po_email_jobs WHERE id=?').get(jobId);
-    if (cur.status === 'queued' || cur.status === 'sent' || cur.status === 'cancelled') return cur.status + ' (照合中に状態変化。そのまま)';
+  const applyNotFound = db.transaction((jobId, gen, msg) => {
+    const cur = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(jobId);
+    if (cur.generation !== gen || (cur.status !== 'sending' && cur.status !== 'unknown')) {
+      return `${cur.status} (照合中に状態変化。そのまま)`;
+    }
     if (cur.status === 'sending') db.prepare("UPDATE po_email_jobs SET status='unknown' WHERE id=?").run(jobId);
-    db.prepare("UPDATE po_email_jobs SET error=? WHERE id=? AND status='unknown'").run(msg, jobId);
+    db.prepare('UPDATE po_email_jobs SET error=? WHERE id=?').run(msg, jobId);
     return 'unknown (手動確認要)';
   });
   for (const job of targets) {
     try {
       const found = await searchGmailByMessageId(messageIdOf(job));
       if (found) {
-        results.push({ jobId: job.id, result: applyFound.immediate(job.id, found) });
+        results.push({ jobId: job.id, result: applyFound.immediate(job.id, job.generation, found) });
       } else {
-        results.push({ jobId: job.id, result: applyNotFound.immediate(job.id,
+        results.push({ jobId: job.id, result: applyNotFound.immediate(job.id, job.generation,
           `照合0件 (未送信の証明にはなりません)。Gmailの送信済みで整理番号 ${job.delivery_key} を確認し、無ければ「未送信を確認した」→再試行してください`) });
       }
     } catch (e) {
-      results.push({ jobId: job.id, result: applyNotFound.immediate(job.id,
+      results.push({ jobId: job.id, result: applyNotFound.immediate(job.id, job.generation,
         `照合不能: ${String(e.message).slice(0, 200)} — Gmailで整理番号 ${job.delivery_key} を検索して手動確認してください`) });
     }
   }
@@ -332,7 +334,7 @@ export function markUnsent(jobId, { actor = null } = {}) {
     const job = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(jobId);
     if (!job) throw new Error(`ジョブが存在しません: ${jobId}`);
     if (job.status !== 'unknown') throw new Error('「未送信を確認した」は結果不明 (unknown) のジョブにのみ使えます');
-    db.prepare("UPDATE po_email_jobs SET status='queued', attempt_count=0, error='人間確認: Gmail送信済みに存在しない → 再試行可' WHERE id=?").run(jobId);
+    db.prepare("UPDATE po_email_jobs SET status='queued', attempt_count=0, generation=generation+1, error='人間確認: Gmail送信済みに存在しない → 再試行可' WHERE id=?").run(jobId);
     audit(db, { actorType: 'user', actor, action: 'email_marked_unsent', resource: `order:${job.order_id}`,
       detail: { jobId, deliveryKey: job.delivery_key, attemptReset: job.attempt_count } });
     return { status: 'queued' };

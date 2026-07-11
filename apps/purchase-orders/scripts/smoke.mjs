@@ -1101,6 +1101,11 @@ console.log('── P15: メール送信 (fake transport) ──');
   ok(r.body.ok && r.body.status === 'queued', '人間確認後にqueuedへ');
   ok(db.prepare('SELECT attempt_count FROM po_email_jobs WHERE id=?').get(unknownJobId).attempt_count === 0,
     'mark-unsentで再試行カウントもリセット (上限で復旧不能にならない)');
+  // generation: markUnsent と lease で世代が進む (照合の競合検知に使う)
+  {
+    const g = db.prepare('SELECT generation FROM po_email_jobs WHERE id=?').get(unknownJobId).generation;
+    ok(g >= 2, 'markUnsent/leaseで世代 (generation) が進む', g);
+  }
   r = await jsonPost('/api/email-jobs/' + unknownJobId + '/retry', {});
   ok(r.body.ok && r.body.status === 'sent', '確認後の再試行→送信');
 
