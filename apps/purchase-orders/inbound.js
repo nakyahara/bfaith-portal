@@ -161,9 +161,12 @@ export function importInboundCsv({ buffer, filename, actor = null }) {
         seen.set(h, n);
         l.lineKey = `${h}#${n}`;
       }
-      // 入庫日は伝票単位。同一伝票に異なる日付が混在するCSVは黙って先頭を採用せず拒否する
+      // 入庫日は伝票単位。同一伝票に異なる日付や「日付あり/空欄」の混在があるCSVは黙って採用せず拒否する
       const dates = [...new Set(lines.map(l => l.date).filter(Boolean))];
       if (dates.length > 1) throw new Error(`伝票 ${slip}: 入庫日が複数あります (${dates.join(', ')})。CSVを確認してください`);
+      if (dates.length === 1 && lines.some(l => !l.date)) {
+        throw new Error(`伝票 ${slip}: 入庫日あり/空欄の行が混在しています。CSVを確認してください`);
+      }
       const slipDate = dates[0] || null;
       let receipt = db.prepare("SELECT * FROM po_inbound_receipts WHERE source='logizard' AND source_key=?").get(slip);
       if (!receipt) {

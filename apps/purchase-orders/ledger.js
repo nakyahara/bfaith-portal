@@ -617,6 +617,17 @@ export function checkLedgerIntegrity({ orderId = null } = {}) {
     JOIN po_order_items i ON i.id = e.order_item_id JOIN po_orders o ON o.id = i.order_id WHERE 1=1 ${scope}`).all(...args)) {
     if (!isYmd(r.effective_date)) issues.push({ kind: 'invalid_effective_date', eventId: r.id, detail: r.effective_date });
   }
+  // 6b. 訂正競合: 訂正版で無効化された入庫行に有効な割当が残っている (逆仕訳→再割当で解消するまで違反扱い)
+  for (const r of db.prepare(`
+    SELECT x.id, COALESCE(SUM(e.qty), 0) AS alloc
+    FROM po_inbound_items x
+    JOIN po_item_events e ON e.inbound_item_id = x.id AND e.event_type = 'receipt'
+      AND NOT EXISTS (SELECT 1 FROM po_item_events rv WHERE rv.reverses_id = e.id)
+    JOIN po_order_items i ON i.id = e.order_item_id JOIN po_orders o ON o.id = i.order_id
+    WHERE x.superseded = 1 ${scope}
+    GROUP BY x.id HAVING alloc > 0`).all(...args)) {
+    issues.push({ kind: 'superseded_with_alloc', inboundItemId: r.id, detail: `割当${r.alloc}が無効化行に残存` });
+  }
   // 7. [警告] 部分消込が始まった残数の扱いが未選択 (逆仕訳で再オープンした場合も含む要対応リスト)
   if (boundary) {
     for (const r of db.prepare(`

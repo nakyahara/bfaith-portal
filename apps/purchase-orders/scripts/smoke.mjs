@@ -979,6 +979,11 @@ console.log('── P14: 入庫CSV取込+突合+割当 ──');
     ok(r.status === 400 && r.body.error.includes('引用符'), '引用符が壊れたCSVは拒否', r.body.error);
   }
 
+  // 訂正競合は台帳整合性検査でも違反として検出される (自動監視で見逃さない)
+  r = await j('/api/ledger/integrity');
+  ok(r.body.healthy === false && r.body.issues.some(x => x.kind === 'superseded_with_alloc' && x.inboundItemId === inb1.id),
+    '整合性検査: 訂正競合 (superseded_with_alloc) を検出', r.body.issues);
+
   // ページ配信
   const html = await (await fetch(base + '/inbound')).text();
   ok(html.includes('inbForm') && html.includes('data-match') && html.includes('訂正競合'), '/inbound ページ配信 (取込+割当+競合)');
