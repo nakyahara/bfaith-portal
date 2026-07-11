@@ -75,12 +75,21 @@ async function dumpControls(page, label) {
 }
 
 async function dumpLinks(page, keywords, label) {
-  const links = await page.evaluate((kws) => {
-    return [...document.querySelectorAll('a')]
-      .map((a) => ({ text: (a.innerText || a.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 40), href: a.href || '' }))
-      .filter((l) => l.text && kws.some((k) => l.text.includes(k)));
-  }, keywords).catch(() => []);
-  console.log(`  [LINKS:${label}] ${JSON.stringify(links, null, 1)}`);
+  // ホバーメニュー等の非表示リンクも含めて全frameから収集 (楽天datatool調査と同じ手法)
+  const all = [];
+  for (const frame of page.frames()) {
+    const links = await frame.evaluate((kws) => {
+      const vis = (el) => !!(el.offsetParent || el.getClientRects().length);
+      return [...document.querySelectorAll('a')]
+        .map((a) => ({
+          text: (a.innerText || a.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 40),
+          href: a.href || '', hidden: !vis(a),
+        }))
+        .filter((l) => l.text && l.href && kws.some((k) => l.text.includes(k)));
+    }, keywords).catch(() => []);
+    all.push(...links);
+  }
+  console.log(`  [LINKS:${label}] ${JSON.stringify(all, null, 1)}`);
 }
 
 async function tryFill(page, cands, value, label, timeoutMs = 15000) {
