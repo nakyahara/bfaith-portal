@@ -35,6 +35,19 @@ export function isYmd(s) {
 const ACTOR_TYPES = new Set(['user', 'system', 'ai_agent', 'migration']);
 const SHORTAGE_REASONS = new Set(['supplier_shortage', 'own_decision', 'cutoff', 'other']);
 
+/** actor_type の入口検証 (全書込関数で共通。SQLite CHECK由来の不親切なエラーにしない) */
+function validateActor(actorType) {
+  if (!ACTOR_TYPES.has(actorType)) throw new Error(`actor_type不正: ${actorType}`);
+}
+
+/** キー順に依存しない正規化JSON (冪等ハッシュ用。同内容ならキー順が違っても同一ハッシュ) */
+export function stableStringify(v) {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) return `[${v.map(stableStringify).join(',')}]`;
+  const keys = Object.keys(v).sort();
+  return `{${keys.map(k => `${JSON.stringify(k)}:${stableStringify(v[k])}`).join(',')}}`;
+}
+
 // ─── 設定 (現在値テーブル。変更は監査ログと同一txn) ───
 
 // setSetting で変更できるキーのホワイトリスト (tracking_started_at は含めない=初回確定後は不変。
@@ -47,6 +60,7 @@ export function getSetting(key) {
 }
 
 export function setSetting(key, value, { actor = null, actorType = 'user', reason = null } = {}) {
+  validateActor(actorType);
   if (!SETTABLE_KEYS.has(key)) throw new Error(`設定キーが不正です (変更可能: ${[...SETTABLE_KEYS].join(', ')}): ${key}`);
   if (key === 'backorder_source' && value !== 'ne' && value !== 'app') throw new Error(`backorder_source は ne/app のみ: ${value}`);
   const db = getDB();
@@ -91,8 +105,10 @@ export function ensureTrackingStarted(at = nowIso()) {
  */
 export function withCommand({ idempotencyKey = null, payload = null }, fn) {
   if (!idempotencyKey) return { replay: false, result: fn() };
+  if (String(idempotencyKey).length > 200) { const e = new Error('Idempotency-Key が長すぎます (200文字以内)'); e.status = 400; throw e; }
   const db = getDB();
-  const hash = createHash('sha256').update(JSON.stringify(payload ?? null)).digest('hex');
+  // キー順に依存しない正規化JSONでハッシュ (同内容の再送をキー順違いで409にしない)
+  const hash = createHash('sha256').update(stableStringify(payload ?? null)).digest('hex');
   const tx = db.transaction(() => {
     const existing = db.prepare('SELECT * FROM po_commands WHERE idempotency_key=?').get(idempotencyKey);
     if (existing) {
@@ -153,30 +169,21 @@ export function deriveCloseReason(orderId, db = getDB()) {
 }
 
 /**
- * ヘッダ閉鎖状態の共通再計算 (イベント書込と同一txn内で必ず呼ぶ。手動クローズも例外にしない):
- *  - 全明細残0 & closed_at NULL → closed_at セット (auto_close)
- *  - 残>0 & closed_at NOT NULL → closed_at クリア (auto_reopen、逆仕訳による復帰)
+ * ヘッダ閉鎖状態の遷移監査。closed_at 自体はイベントINSERTのAFTERトリガ (trg_po_events_closure) が
+ * DB側で再計算する (直接SQLでも乖離しない)。ここでは遷移を検知して監査ログに残すだけ。
  */
-function recomputeClosure(db, orderId, ctx) {
-  const order = db.prepare('SELECT id, closed_at, status FROM po_orders WHERE id=?').get(orderId);
-  if (!order) return { closed: false };
-  const rows = orderBalances(orderId, db);
-  const allZero = rows.length > 0 && rows.every(r => r.remaining_qty === 0);
-  if (allZero && !order.closed_at) {
-    const now = nowIso();
-    db.prepare('UPDATE po_orders SET closed_at=?, updated_at=? WHERE id=?').run(now, now, orderId);
+function auditClosureChange(db, orderId, prevClosedAt, ctx) {
+  const order = db.prepare('SELECT closed_at FROM po_orders WHERE id=?').get(orderId);
+  const nowClosed = order.closed_at != null;
+  if (!prevClosedAt && nowClosed) {
+    const rows = orderBalances(orderId, db);
     audit(db, { actorType: ctx.actorType, actor: ctx.actor, action: 'order_closed', resource: `order:${orderId}`,
       detail: { reason: rows.some(r => r.cutoff_qty > 0) ? 'manual' : 'completed' } });
-    return { closed: true };
-  }
-  if (!allZero && order.closed_at) {
-    const now = nowIso();
-    db.prepare('UPDATE po_orders SET closed_at=NULL, updated_at=? WHERE id=?').run(now, orderId);
+  } else if (prevClosedAt && !nowClosed) {
     audit(db, { actorType: ctx.actorType, actor: ctx.actor, action: 'order_reopened', resource: `order:${orderId}`,
       detail: { by: ctx.action || 'reversal' } });
-    return { closed: false, reopened: true };
   }
-  return { closed: allZero };
+  return { closed: nowClosed };
 }
 
 /** 残0になった明細の disposition/next_* を履歴記録→クリア (要件F-2: 記録が先) */
@@ -271,7 +278,7 @@ export function appendPoItemEvent({
     if (after.remaining_qty < 0) throw new Error('内部整合性エラー: 残数が負になります');
 
     clearDispositionIfDone(db, orderItemId, { eventId, actor });
-    const closure = recomputeClosure(db, item.order_id, { actorType, actor, action: eventType });
+    const closure = auditClosureChange(db, item.order_id, order.closed_at, { actorType, actor, action: eventType });
     return { eventId, remaining: after.remaining_qty, orderClosed: !!closure.closed };
   });
   return tx.immediate();
@@ -293,6 +300,7 @@ export function reverseEvent(eventId, { note, actorType = 'user', actor = null }
  * note 必須。close_reason は cutoff の存在から 'manual' と導出される。
  */
 export function manualCloseOrder(orderId, { note, actorType = 'user', actor = null } = {}) {
+  validateActor(actorType);
   if (!note || !String(note).trim()) throw new Error('手動クローズには理由 (note) が必要です');
   const db = getDB();
   const tx = db.transaction(() => {
@@ -314,7 +322,7 @@ export function manualCloseOrder(orderId, { note, actorType = 'user', actor = nu
     }
     audit(db, { actorType, actor, action: 'manual_close', resource: `order:${orderId}`,
       detail: { note: String(note).trim(), items: rows.map(r => ({ id: r.order_item_id, cutoff: r.remaining_qty })) } });
-    const closure = recomputeClosure(db, orderId, { actorType, actor, action: 'manual_close' });
+    const closure = auditClosureChange(db, orderId, order.closed_at, { actorType, actor, action: 'manual_close' });
     if (!closure.closed) throw new Error('内部整合性エラー: クローズに失敗しました');
     return { closed: true, cutoffItems: rows.length };
   });
@@ -333,6 +341,7 @@ const PLAN_FIELDS = ['promised_date', 'next_expected_date', 'next_expected_qty',
  *  - next_expected_qty ≤ 現在残数
  */
 export function setItemPlan(orderItemId, patch, { note = null, actorType = 'user', actor = null } = {}) {
+  validateActor(actorType);
   const db = getDB();
   const tx = db.transaction(() => {
     const item = db.prepare('SELECT * FROM po_order_items WHERE id=?').get(orderItemId);
@@ -405,16 +414,42 @@ export function checkLedgerIntegrity({ orderId = null } = {}) {
     JOIN po_orders o ON o.id = b.order_id WHERE b.remaining_qty < 0 ${scope}`).all(...args)) {
     issues.push({ kind: 'negative_remaining', itemId: r.order_item_id, detail: r.remaining_qty });
   }
+  // 1b. 境界値そのものの形式検証 (不正値が入ると全PO判定が壊れるため最優先で報告)
+  if (boundary && !(boundary.length === 24 && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(boundary))) {
+    issues.push({ kind: 'invalid_boundary', detail: boundary });
+  }
   // 2. draft なのに closed_at / issued なのに発行属性の欠落・形式不正
+  const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
   for (const r of db.prepare(`
     SELECT o.id, o.status, o.closed_at, o.po_number, o.issued_at, o.tracking_mode FROM po_orders o
     WHERE 1=1 ${scope}`).all(...args)) {
     if (r.status === 'draft' && r.closed_at != null) issues.push({ kind: 'draft_with_closed_at', orderId: r.id });
     if (r.status === 'issued' && boundary && r.issued_at >= boundary) {
-      if (r.tracking_mode !== 'tracked' || !r.po_number || !/^PO-\d{4}-/.test(r.po_number) || !isYmd(String(r.issued_at).slice(0, 10))) {
+      if (r.tracking_mode !== 'tracked' || !r.po_number || !/^PO-\d{4}-\d{4,}$/.test(r.po_number)
+          || !ISO_RE.test(String(r.issued_at)) || !isYmd(String(r.issued_at).slice(0, 10))) {
         issues.push({ kind: 'tracked_missing_attrs', orderId: r.id });
       }
     }
+  }
+  // 2b. 逆仕訳の不変条件の検算 (通常はトリガ+UNIQUEが守る。メンテモード・移行後の検査用)
+  for (const r of db.prepare(`
+    SELECT v.id, v.reverses_id, v.order_item_id, v.qty, v.effective_date,
+           o2.id AS orig_id, o2.event_type AS orig_type, o2.order_item_id AS orig_item, o2.qty AS orig_qty, o2.effective_date AS orig_eff
+    FROM po_item_events v
+    LEFT JOIN po_item_events o2 ON o2.id = v.reverses_id
+    JOIN po_order_items i ON i.id = v.order_item_id JOIN po_orders o ON o.id = i.order_id
+    WHERE v.event_type = 'reversal' ${scope}`).all(...args)) {
+    if (!r.orig_id || r.orig_type === 'reversal' || r.orig_item !== r.order_item_id
+        || r.orig_qty !== r.qty || r.orig_eff !== r.effective_date) {
+      issues.push({ kind: 'invalid_reversal', eventId: r.id });
+    }
+  }
+  for (const r of db.prepare(`
+    SELECT v.reverses_id, COUNT(*) AS n FROM po_item_events v
+    JOIN po_order_items i ON i.id = v.order_item_id JOIN po_orders o ON o.id = i.order_id
+    WHERE v.event_type = 'reversal' ${scope}
+    GROUP BY v.reverses_id HAVING COUNT(*) > 1`).all(...args)) {
+    issues.push({ kind: 'duplicate_reversal', detail: { reversesId: r.reverses_id, count: r.n } });
   }
   if (boundary) {
     // 3. closed なのに残>0 / 全明細残0なのにオープン (tracked のみ)

@@ -200,15 +200,19 @@ function issueOrder(supplierCode, supplierName, rawItems, note, requestedDate) {
     // 移行境界の確定は発行と同一コミット (最初の発行が失敗すれば境界もロールバック)。発行時刻を共有する
     ensureTrackingStarted(now);
     const poNumber = nextPoNumber(db);
+    // 発行済みPOへの明細INSERTはDBトリガが無条件拒否するため、draftでヘッダ+明細を作ってから issued へ遷移する
+    // (既存draftはtxn冒頭で削除=仕入先ごとdraft1件のUNIQUEとも整合。失敗すればロールバックで復元)
+    db.prepare("DELETE FROM po_orders WHERE supplier_code=? AND status='draft'").run(supplierCode);
     const info = db.prepare(
-      `INSERT INTO po_orders (supplier_code, supplier_name, status, note, pml_as_of_date, created_at, updated_at, issued_at,
-                              po_number, tracking_mode, requested_date)
-       VALUES (?,?,'issued',?,?,?,?,?,?,'tracked',?)`
-    ).run(supplierCode, supplierName, note || null, pmlAsOf, now, now, now, poNumber, reqDate);
+      `INSERT INTO po_orders (supplier_code, supplier_name, status, note, pml_as_of_date, created_at, updated_at)
+       VALUES (?,?,'draft',?,?,?,?)`
+    ).run(supplierCode, supplierName, note || null, pmlAsOf, now, now);
     const id = Number(info.lastInsertRowid);
     // 希望納期はヘッダ入力値を明細へINSERT時にスナップショット (以後ヘッダ値を継承しない、issued後は不変)
     insertItems(db, id, items, reqDate);
-    db.prepare("DELETE FROM po_orders WHERE supplier_code=? AND status='draft'").run(supplierCode);
+    db.prepare(
+      `UPDATE po_orders SET status='issued', issued_at=?, po_number=?, tracking_mode='tracked', requested_date=?, updated_at=? WHERE id=?`
+    ).run(now, poNumber, reqDate, now, id);
     return { id, poNumber };
   });
   return tx.immediate();
@@ -381,9 +385,12 @@ router.post('/api/supplier/:code/issue', (req, res) => {
     const code = normSupplierCode(req.params.code);
     const { items, note, requestedDate } = req.body || {};
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ ok: false, error: '発注明細が空です' });
-    // Idempotency-Key があれば再送しても同じ発注を二重作成しない (レスポンス消失・リトライ対策)
+    // Idempotency-Key があれば再送しても同じ発注を二重作成しない (レスポンス消失・リトライ対策)。
+    // payload は明細を商品コード順の最小形に正規化 (並び順・余計なフィールドの違いで409にしない)
+    const canonicalItems = items.map(i => ({ code: trimS(i && i.code), qty: Number(i && i.qty) }))
+      .sort((a, b) => a.code.localeCompare(b.code));
     const { replay, result } = withCommand(
-      { idempotencyKey: trimS(req.get('Idempotency-Key')) || null, payload: { op: 'issue', code, items, note: trimS(note), requestedDate: requestedDate || null } },
+      { idempotencyKey: trimS(req.get('Idempotency-Key')) || null, payload: { op: 'issue', code, items: canonicalItems, note: trimS(note), requestedDate: requestedDate || null } },
       () => issueOrder(code, resolveSupplierName(code), items, trimS(note), requestedDate)
     );
     res.json({ ok: true, id: result.id, poNumber: result.poNumber, replay });

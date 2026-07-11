@@ -584,12 +584,13 @@ console.log('── P13a: 台帳 (イベント/逆仕訳/クローズ/整合性)
   try { L.appendPoItemEvent({ orderItemId: dItem.id, eventType: 'receipt', qty: 1, source: 'manual' }); } catch (e) { threw = e.message; }
   ok(threw && threw.includes('draft'), 'draft明細へのイベントは拒否');
 
-  // legacy (境界以前のissued) へのイベントは拒否
-  db.prepare(`INSERT INTO po_orders (supplier_code, supplier_name, status, created_at, updated_at, issued_at, po_number, tracking_mode)
-              VALUES ('1','旧発注','issued','2020-01-01T00:00:00.000Z','2020-01-01T00:00:00.000Z','2020-01-01T00:00:00.000Z','PO-2020-9999','tracked')`).run();
-  const legacyId = db.prepare('SELECT id FROM po_orders WHERE po_number=?').get('PO-2020-9999').id;
+  // legacy (境界以前のissued) へのイベントは拒否。fixture は draft で明細を作ってから issued へ (発行済み明細追加はトリガが拒否するため)
+  db.prepare(`INSERT INTO po_orders (supplier_code, supplier_name, status, created_at, updated_at)
+              VALUES ('999','旧発注','draft','2020-01-01T00:00:00.000Z','2020-01-01T00:00:00.000Z')`).run();
+  const legacyId = db.prepare("SELECT id FROM po_orders WHERE supplier_code='999'").get().id;
   db.prepare("INSERT INTO po_order_items (order_id, product_code, product_key, product_name, qty) VALUES (?,?,?,?,?)")
     .run(legacyId, 'noflyersticker', 'noflyersticker', '旧明細', 10);
+  db.prepare("UPDATE po_orders SET status='issued', issued_at='2020-01-01T00:00:00.000Z', po_number='PO-2020-9999', tracking_mode='tracked' WHERE id=?").run(legacyId);
   const legacyItem = db.prepare('SELECT id FROM po_order_items WHERE order_id=?').get(legacyId);
   threw = null;
   try { L.appendPoItemEvent({ orderItemId: legacyItem.id, eventType: 'receipt', qty: 1, source: 'manual' }); } catch (e) { threw = e.message; }
@@ -644,7 +645,7 @@ console.log('── P13a: 台帳 (イベント/逆仕訳/クローズ/整合性)
   } catch (e) { threw = e.message; }
   ok(threw && threw.includes('残数超過'), '直接SQLでも残数超過はトリガが拒否');
 
-  // 冪等キー: 同一キー再送は同じ結果、異なる内容は409
+  // 冪等キー: 同一キー再送は同じ結果、異なる内容は409、キー順・明細順の違いは同一視
   const idemBody = { items: [{ code: 'noflyersticker', qty: 3 }], note: '冪等テスト' };
   const idemOpts = key => ({ method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': key }, body: JSON.stringify(idemBody) });
   r = await j('/api/supplier/1/issue', idemOpts('smoke-idem-1'));
@@ -652,8 +653,52 @@ console.log('── P13a: 台帳 (イベント/逆仕訳/クローズ/整合性)
   r = await j('/api/supplier/1/issue', idemOpts('smoke-idem-1'));
   ok(r.status === 200 && r.body.id === idemFirst.id && r.body.replay === true, '冪等キー: 再送は同じ発注を返す (二重作成なし)', r.body);
   r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'smoke-idem-1' },
+    body: JSON.stringify({ note: '冪等テスト', items: [{ qty: 3, code: 'noflyersticker' }] }) });
+  ok(r.status === 200 && r.body.id === idemFirst.id && r.body.replay === true, '冪等キー: JSONキー順が違っても同一内容はreplay', r.body);
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'smoke-idem-1' },
     body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 4 }] }) });
   ok(r.status === 409, '冪等キー: 同一キー+異なる内容は409', r.status);
+
+  // 発行直後 (イベント登録前) の明細追加も無条件拒否 / unit_cost も不変
+  const idemItem = db.prepare('SELECT * FROM po_order_items WHERE order_id=?').get(idemFirst.id);
+  threw = null;
+  try {
+    db.prepare("INSERT INTO po_order_items (order_id, product_code, product_key, product_name, qty) VALUES (?,?,?,?,?)")
+      .run(idemFirst.id, 'cardstand-silver-r', 'cardstand-silver-r', '後付け', 1);
+  } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('immutable'), '発行済みPOへの明細追加は無条件拒否 (イベント前でも)', threw);
+  threw = null;
+  try { db.prepare('UPDATE po_order_items SET unit_cost=1 WHERE id=?').run(idemItem.id); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('immutable'), '発行済み明細の unit_cost 変更も拒否');
+
+  // 直接SQLの消込でも closed_at がDBトリガで再計算される (正本の乖離なし)
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 2 }] }) });
+  const sqlOrderId = r.body.id;
+  const sqlItem = db.prepare('SELECT * FROM po_order_items WHERE order_id=?').get(sqlOrderId);
+  db.prepare(`INSERT INTO po_item_events (order_item_id, event_type, qty, source, effective_date, recorded_at, actor_type)
+              VALUES (?,?,?,?,?,?,?)`).run(sqlItem.id, 'receipt', 2, 'manual', '2026-07-11', nowIsoStr(), 'user');
+  ok(db.prepare('SELECT closed_at FROM po_orders WHERE id=?').get(sqlOrderId).closed_at != null, '直接SQL消込でも closed_at をトリガが再計算');
+  // closed_at の直接操作ガード
+  threw = null;
+  try { db.prepare('UPDATE po_orders SET closed_at=NULL WHERE id=?').run(sqlOrderId); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('closed_at guard'), '全消込済みPOの closed_at 直接クリアは拒否');
+  threw = null;
+  try { db.prepare('UPDATE po_orders SET closed_at=? WHERE id=?').run(nowIsoStr(), mcOrderId); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('closed_at guard'), '残数があるPOの closed_at 直接セットは拒否');
+
+  // 発行ゲートの値形式検査 (PO-2026-abc 等を弾く)
+  threw = null;
+  try {
+    db.prepare(`INSERT INTO po_orders (supplier_code, supplier_name, status, created_at, updated_at, issued_at, po_number, tracking_mode)
+                VALUES ('1','形式不正','issued',?,?,?,'PO-2026-abc','tracked')`).run(nowIsoStr(), nowIsoStr(), nowIsoStr());
+  } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('issue gate'), '発行ゲート: PO番号の形式不正 (PO-2026-abc) を拒否');
+
+  // disposition列間規則のDBトリガ (直接SQLでも規則違反を保存できない)
+  threw = null;
+  try { db.prepare('UPDATE po_order_items SET next_expected_qty=5 WHERE id=?').run(mcItem.id); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('plan rules'), '直接SQLでも disposition列間規則をトリガが拒否');
 
   // 整合性検査: 違反なし。部分消込済み残の「扱い未選択」はwarning (mcItem=残30が該当)
   r = await j('/api/ledger/integrity');
