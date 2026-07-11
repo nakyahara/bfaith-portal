@@ -190,9 +190,15 @@ function initLedgerSchema(db) {
   addCol(db, 'po_order_items', 'next_action_date', 'TEXT');      // 確認中の期限
   addCol(db, 'po_order_items', 'remainder_disposition', 'TEXT'); // awaiting_delivery / awaiting_confirmation / NULL
 
+  // 台帳トリガは毎起動でDROP→CREATEし常に最新定義にする (Codex P13a-R3 High-1:
+  // IF NOT EXISTSでは初期化済みDBに定義修正が反映されず、旧名の残骸も残る)。init全体が1txnなので原子的
+  for (const t of db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'trg_po_%'").all()) {
+    db.exec(`DROP TRIGGER IF EXISTS ${t.name}`);
+  }
+
   // 発行済みPO・明細の不変性 (Codex P13a-R1 High-1): 台帳の基準値 (発注数・商品・発行属性) を
   // 直接SQL・保守スクリプトからも守る。数量減=取消イベント、数量増=新規発注が唯一の経路
-  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_orders_issued_immutable
+  db.exec(`CREATE TRIGGER trg_po_orders_issued_immutable
            BEFORE UPDATE OF status, issued_at, po_number, tracking_mode, requested_date, supplier_code, origin ON po_orders
            WHEN OLD.status = 'issued' AND (
              NEW.status IS NOT OLD.status OR NEW.issued_at IS NOT OLD.issued_at OR
@@ -201,7 +207,7 @@ function initLedgerSchema(db) {
              NEW.origin IS NOT OLD.origin
            )
            BEGIN SELECT RAISE(ABORT, 'issued order is immutable (発行済みPOの発行属性は変更不可)'); END`);
-  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_items_issued_immutable
+  db.exec(`CREATE TRIGGER trg_po_items_issued_immutable
            BEFORE UPDATE OF qty, order_id, product_code, product_key, product_name, unit_cost, requested_date, condition_id ON po_order_items
            WHEN (SELECT status FROM po_orders WHERE id = OLD.order_id) = 'issued' AND (
              NEW.qty IS NOT OLD.qty OR NEW.order_id IS NOT OLD.order_id OR
@@ -210,22 +216,43 @@ function initLedgerSchema(db) {
              NEW.requested_date IS NOT OLD.requested_date OR NEW.condition_id IS NOT OLD.condition_id
            )
            BEGIN SELECT RAISE(ABORT, 'issued item is immutable (発行済み明細の数量/商品/単価は変更不可。数量減=取消イベント)'); END`);
-  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_items_issued_no_delete
+  db.exec(`CREATE TRIGGER trg_po_items_issued_no_delete
            BEFORE DELETE ON po_order_items
            WHEN (SELECT status FROM po_orders WHERE id = OLD.order_id) = 'issued'
            BEGIN SELECT RAISE(ABORT, 'issued item is immutable (発行済み明細は削除不可)'); END`);
-  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_orders_issued_no_delete
+  db.exec(`CREATE TRIGGER trg_po_orders_issued_no_delete
            BEFORE DELETE ON po_orders
            WHEN OLD.status = 'issued'
            BEGIN SELECT RAISE(ABORT, 'issued order is immutable (発行済みPOは削除不可)'); END`);
   // 発行済みPOへの明細追加は無条件拒否 (issueOrderは draft で明細を作ってから issued へ遷移する)
-  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_items_issued_no_insert2
+  db.exec(`CREATE TRIGGER trg_po_items_issued_no_insert2
            BEFORE INSERT ON po_order_items
            WHEN (SELECT status FROM po_orders WHERE id = NEW.order_id) = 'issued'
            BEGIN SELECT RAISE(ABORT, 'issued order is immutable (発行済みPOへの明細追加は不可。追加発注は新規POで)'); END`);
   // disposition/next_* の列間規則 (Codex P13a-R2 Medium-1): 直接SQLでも規則違反を保存できない。
+  // INSERT側も同じ規則で保護 (draft明細に不正状態を仕込んでissueで固定させない、R3 Medium-1)。
   // next_expected_qty ≤ 残数 は集計を要するためアプリ層+整合性検査で担保
-  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_items_plan_rules
+  db.exec(`CREATE TRIGGER trg_po_items_plan_rules_ins
+           BEFORE INSERT ON po_order_items
+           BEGIN
+             SELECT CASE
+               WHEN NEW.remainder_disposition IS NOT NULL
+                    AND NEW.remainder_disposition NOT IN ('awaiting_delivery','awaiting_confirmation')
+                 THEN RAISE(ABORT, 'plan rules: disposition不正')
+               WHEN NEW.remainder_disposition = 'awaiting_delivery'
+                    AND (NEW.next_expected_date IS NULL OR NEW.next_expected_qty IS NULL OR NEW.next_action_date IS NOT NULL)
+                 THEN RAISE(ABORT, 'plan rules: 分納待ちは次回予定日+数量が必須 (期限はNULL)')
+               WHEN NEW.remainder_disposition = 'awaiting_confirmation'
+                    AND (NEW.next_action_date IS NULL OR NEW.next_expected_date IS NOT NULL OR NEW.next_expected_qty IS NOT NULL)
+                 THEN RAISE(ABORT, 'plan rules: 確認中は期限が必須 (次回予定はNULL)')
+               WHEN NEW.remainder_disposition IS NULL
+                    AND (NEW.next_expected_date IS NOT NULL OR NEW.next_expected_qty IS NOT NULL OR NEW.next_action_date IS NOT NULL)
+                 THEN RAISE(ABORT, 'plan rules: dispositionなしでnext_*は保存不可')
+               WHEN NEW.next_expected_qty IS NOT NULL AND NEW.next_expected_qty <= 0
+                 THEN RAISE(ABORT, 'plan rules: 次回予定数量は正の整数')
+             END;
+           END`);
+  db.exec(`CREATE TRIGGER trg_po_items_plan_rules
            BEFORE UPDATE OF remainder_disposition, next_expected_date, next_expected_qty, next_action_date ON po_order_items
            BEGIN
              SELECT CASE
@@ -261,15 +288,16 @@ function initLedgerSchema(db) {
     recorded_at     TEXT NOT NULL CHECK(recorded_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*Z'),
     actor_type      TEXT NOT NULL CHECK(actor_type IN ('user','system','ai_agent','migration')),
     actor           TEXT,
+    -- ⚠️ SQLiteのCHECKは式がNULLだと通る。NULLになり得る列の比較は IS / IS NOT NULL で明示する (Codex P13a-R3 High-2)
     CHECK ((event_type = 'reversal') = (reverses_id IS NOT NULL)),
     CHECK (event_type <> 'receipt' OR source IS NOT NULL),
     CHECK (event_type <> 'receipt' OR (source = 'logizard') = (inbound_item_id IS NOT NULL)),
     CHECK (event_type = 'receipt' OR (inbound_item_id IS NULL AND source IS NULL)),
     CHECK (event_type <> 'receipt' OR reason_code IS NULL),
-    CHECK (event_type <> 'shortage' OR reason_code IN ('supplier_shortage','own_decision','cutoff','other')),
+    CHECK (event_type <> 'shortage' OR (reason_code IS NOT NULL AND reason_code IN ('supplier_shortage','own_decision','cutoff','other'))),
     CHECK (event_type <> 'cancel' OR reason_code IS NULL),
-    CHECK (event_type <> 'reversal' OR (reason_code = 'correction' AND NULLIF(TRIM(note),'') IS NOT NULL)),
-    CHECK (event_type <> 'shortage' OR reason_code <> 'other' OR NULLIF(TRIM(note),'') IS NOT NULL)
+    CHECK (event_type <> 'reversal' OR (reason_code IS 'correction' AND NULLIF(TRIM(note),'') IS NOT NULL)),
+    CHECK (event_type <> 'shortage' OR reason_code IS NOT 'other' OR NULLIF(TRIM(note),'') IS NOT NULL)
   )`);
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS uq_po_events_reversal ON po_item_events(reverses_id) WHERE reverses_id IS NOT NULL`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_po_events_item ON po_item_events(order_item_id, event_type)');
@@ -278,12 +306,12 @@ function initLedgerSchema(db) {
   db.exec('CREATE INDEX IF NOT EXISTS idx_po_events_inbound ON po_item_events(inbound_item_id)');
 
   // append-only 強制 (保守はメンテモード=トリガ一時DROPでのみ解除)
-  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_events_no_update BEFORE UPDATE ON po_item_events
+  db.exec(`CREATE TRIGGER trg_po_events_no_update BEFORE UPDATE ON po_item_events
            BEGIN SELECT RAISE(ABORT, 'po_item_events is append-only'); END`);
-  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_events_no_delete BEFORE DELETE ON po_item_events
+  db.exec(`CREATE TRIGGER trg_po_events_no_delete BEFORE DELETE ON po_item_events
            BEGIN SELECT RAISE(ABORT, 'po_item_events is append-only'); END`);
   // 逆仕訳の不変条件 (要件H-2): 元イベントが同一明細・非reversal・同数量・同業務日付。多重逆仕訳はUNIQUEが防ぐ
-  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_events_reversal_check BEFORE INSERT ON po_item_events
+  db.exec(`CREATE TRIGGER trg_po_events_reversal_check BEFORE INSERT ON po_item_events
            WHEN NEW.event_type = 'reversal'
            BEGIN
              SELECT CASE WHEN NOT EXISTS (
@@ -294,7 +322,7 @@ function initLedgerSchema(db) {
            END`);
   // 全イベント共通の対象スコープ (Codex P13a-R1 High-2): 親POが issued かつ tracked (境界以後)。
   // アプリ層 (appendPoItemEvent) と同じ不変条件をDB側でも強制し、直接SQL・旧コードの書込を拒否する
-  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_events_scope BEFORE INSERT ON po_item_events
+  db.exec(`CREATE TRIGGER trg_po_events_scope BEFORE INSERT ON po_item_events
            BEGIN
              SELECT CASE WHEN NOT EXISTS (
                SELECT 1 FROM po_order_items i JOIN po_orders o ON o.id = i.order_id
@@ -303,7 +331,7 @@ function initLedgerSchema(db) {
              ) THEN RAISE(ABORT, 'event scope: tracked な issued 明細のみイベント登録できます') END;
            END`);
   // 通常イベント (非reversal): クローズ済みへは不可、残数超過 (負残) を物理拒否
-  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_events_normal_check BEFORE INSERT ON po_item_events
+  db.exec(`CREATE TRIGGER trg_po_events_normal_check BEFORE INSERT ON po_item_events
            WHEN NEW.event_type <> 'reversal'
            BEGIN
              SELECT CASE WHEN (SELECT o.closed_at FROM po_orders o JOIN po_order_items i ON i.order_id = o.id WHERE i.id = NEW.order_item_id) IS NOT NULL
@@ -319,7 +347,7 @@ function initLedgerSchema(db) {
   // イベント登録後にヘッダの closed_at をDB側で再計算 (Codex P13a-R2 High-2):
   // 直接SQLのイベント登録でも「closedはイベントから導出」の不変条件が崩れない。
   // recursive_triggers=ON のため下の closed_at ガードも発火するが、本トリガは常に整合値を書くので通過する
-  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_events_closure AFTER INSERT ON po_item_events
+  db.exec(`CREATE TRIGGER trg_po_events_closure AFTER INSERT ON po_item_events
            BEGIN
              UPDATE po_orders SET
                closed_at = CASE WHEN (
@@ -335,10 +363,12 @@ function initLedgerSchema(db) {
              WHERE id = (SELECT order_id FROM po_order_items WHERE id = NEW.order_item_id);
            END`);
   // closed_at の直接UPDATEガード: 残数と矛盾する開閉・形式不正を拒否 (イベントと無関係な開閉を防ぐ)
-  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_orders_closed_guard
+  db.exec(`CREATE TRIGGER trg_po_orders_closed_guard
            BEFORE UPDATE OF closed_at ON po_orders
            WHEN NEW.closed_at IS NOT OLD.closed_at
            BEGIN
+             SELECT CASE WHEN OLD.closed_at IS NOT NULL AND NEW.closed_at IS NOT NULL
+               THEN RAISE(ABORT, 'closed_at guard: 閉鎖時刻の改変は不可') END;
              SELECT CASE WHEN NEW.closed_at IS NOT NULL
                AND NEW.closed_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*Z'
                THEN RAISE(ABORT, 'closed_at guard: 時刻形式が不正') END;
@@ -376,9 +406,9 @@ function initLedgerSchema(db) {
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_po_ih_item ON po_item_history(order_item_id, created_at)');
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS uq_po_ih_change ON po_item_history(order_item_id, change_id, field)');
-  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_ih_no_update BEFORE UPDATE ON po_item_history
+  db.exec(`CREATE TRIGGER trg_po_ih_no_update BEFORE UPDATE ON po_item_history
            BEGIN SELECT RAISE(ABORT, 'po_item_history is append-only'); END`);
-  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_ih_no_delete BEFORE DELETE ON po_item_history
+  db.exec(`CREATE TRIGGER trg_po_ih_no_delete BEFORE DELETE ON po_item_history
            BEGIN SELECT RAISE(ABORT, 'po_item_history is append-only'); END`);
 
   // ── write API の冪等化 (Idempotency-Key はコマンド単位・全体UNIQUE) ──
@@ -405,14 +435,14 @@ function initLedgerSchema(db) {
   )`);
   // 移行境界は初回確定後は不変 (Codex P13a-R1 High-3): 変更すると既存POのtracked/legacy判定が遡って変わるため。
   // 万一の修正はメンテモード (トリガを一時DROP) + 全件整合性検査を伴う専用手順でのみ行う
-  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_settings_boundary_lock_upd BEFORE UPDATE ON po_settings
+  db.exec(`CREATE TRIGGER trg_po_settings_boundary_lock_upd BEFORE UPDATE ON po_settings
            WHEN OLD.key = 'tracking_started_at'
            BEGIN SELECT RAISE(ABORT, 'tracking_started_at is immutable (移行境界は変更不可)'); END`);
-  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_settings_boundary_lock_del BEFORE DELETE ON po_settings
+  db.exec(`CREATE TRIGGER trg_po_settings_boundary_lock_del BEFORE DELETE ON po_settings
            WHEN OLD.key = 'tracking_started_at'
            BEGIN SELECT RAISE(ABORT, 'tracking_started_at is immutable (移行境界は削除不可)'); END`);
   // 初回INSERTも形式検証 (不正な境界値が一度入ると不変トリガで直せず全PO判定が壊れる、Codex P13a-R2 High-4)
-  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_settings_boundary_lock_ins BEFORE INSERT ON po_settings
+  db.exec(`CREATE TRIGGER trg_po_settings_boundary_lock_ins BEFORE INSERT ON po_settings
            WHEN NEW.key = 'tracking_started_at'
              AND (length(NEW.value) <> 24
                   OR NEW.value NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z')
@@ -442,10 +472,10 @@ function initLedgerSchema(db) {
                   OR substr(NEW.po_number, 9) GLOB '*[^0-9]*'
                   OR NEW.issued_at IS NULL OR length(NEW.issued_at) <> 24
                   OR NEW.issued_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z')`;
-  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_orders_issue_gate_ins BEFORE INSERT ON po_orders
+  db.exec(`CREATE TRIGGER trg_po_orders_issue_gate_ins BEFORE INSERT ON po_orders
            WHEN NEW.status = 'issued' AND ${GATE_COND}
            BEGIN SELECT RAISE(ABORT, 'issue gate: po_number/issued_at/tracking_mode が不正です (旧経路からの発行は禁止)'); END`);
-  db.exec(`CREATE TRIGGER IF NOT EXISTS trg_po_orders_issue_gate_upd BEFORE UPDATE OF status ON po_orders
+  db.exec(`CREATE TRIGGER trg_po_orders_issue_gate_upd BEFORE UPDATE OF status ON po_orders
            WHEN NEW.status = 'issued' AND OLD.status <> 'issued' AND ${GATE_COND}
            BEGIN SELECT RAISE(ABORT, 'issue gate: po_number/issued_at/tracking_mode が不正です (旧経路からの発行は禁止)'); END`);
 

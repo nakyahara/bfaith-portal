@@ -695,10 +695,32 @@ console.log('── P13a: 台帳 (イベント/逆仕訳/クローズ/整合性)
   } catch (e) { threw = e.message; }
   ok(threw && threw.includes('issue gate'), '発行ゲート: PO番号の形式不正 (PO-2026-abc) を拒否');
 
-  // disposition列間規則のDBトリガ (直接SQLでも規則違反を保存できない)
+  // disposition列間規則のDBトリガ (直接SQLでも規則違反を保存できない。UPDATE/INSERT両方)
   threw = null;
   try { db.prepare('UPDATE po_order_items SET next_expected_qty=5 WHERE id=?').run(mcItem.id); } catch (e) { threw = e.message; }
   ok(threw && threw.includes('plan rules'), '直接SQLでも disposition列間規則をトリガが拒否');
+  db.prepare("INSERT INTO po_orders (supplier_code, supplier_name, status, created_at, updated_at) VALUES ('998','plan試験','draft',?,?)")
+    .run(nowIsoStr(), nowIsoStr());
+  const planOrderId = db.prepare("SELECT id FROM po_orders WHERE supplier_code='998'").get().id;
+  threw = null;
+  try {
+    db.prepare("INSERT INTO po_order_items (order_id, product_code, product_key, product_name, qty, next_expected_qty) VALUES (?,?,?,?,?,?)")
+      .run(planOrderId, 'dummy-plan', 'dummy-plan', 'plan違反', 1, 5);
+  } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('plan rules'), 'INSERT時も disposition列間規則をトリガが拒否', threw);
+
+  // NULLを素通しするCHECKの封鎖 (shortage理由NULL / reversal理由NULL)
+  threw = null;
+  try {
+    db.prepare(`INSERT INTO po_item_events (order_item_id, event_type, qty, effective_date, recorded_at, actor_type)
+                VALUES (?,?,?,?,?,?)`).run(mcItem.id, 'shortage', 1, '2026-07-11', nowIsoStr(), 'user');
+  } catch (e) { threw = e.message; }
+  ok(!!threw, '理由コードNULLの減数は直接SQLでも拒否 (NULL素通しCHECK対策)', threw);
+
+  // closed_at の閉鎖時刻改変 (非NULL→別の非NULL) は拒否
+  threw = null;
+  try { db.prepare("UPDATE po_orders SET closed_at='2026-01-01T00:00:00.000Z' WHERE id=?").run(sqlOrderId); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('closed_at guard'), '閉鎖時刻の改変 (非NULL→非NULL) は拒否');
 
   // 整合性検査: 違反なし。部分消込済み残の「扱い未選択」はwarning (mcItem=残30が該当)
   r = await j('/api/ledger/integrity');

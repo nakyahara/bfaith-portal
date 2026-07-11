@@ -424,11 +424,18 @@ export function checkLedgerIntegrity({ orderId = null } = {}) {
     SELECT o.id, o.status, o.closed_at, o.po_number, o.issued_at, o.tracking_mode FROM po_orders o
     WHERE 1=1 ${scope}`).all(...args)) {
     if (r.status === 'draft' && r.closed_at != null) issues.push({ kind: 'draft_with_closed_at', orderId: r.id });
-    if (r.status === 'issued' && boundary && r.issued_at >= boundary) {
+    if (r.status === 'issued' && boundary && r.issued_at != null && r.issued_at >= boundary) {
       if (r.tracking_mode !== 'tracked' || !r.po_number || !/^PO-\d{4}-\d{4,}$/.test(r.po_number)
           || !ISO_RE.test(String(r.issued_at)) || !isYmd(String(r.issued_at).slice(0, 10))) {
         issues.push({ kind: 'tracked_missing_attrs', orderId: r.id });
       }
+    }
+    // GLOBは字面のみのため、実在時刻もここで検査 (2026-99-99 等)
+    if (r.closed_at != null && !(ISO_RE.test(String(r.closed_at)) && isYmd(String(r.closed_at).slice(0, 10)))) {
+      issues.push({ kind: 'invalid_timestamp', orderId: r.id, detail: `closed_at=${r.closed_at}` });
+    }
+    if (r.status === 'issued' && r.issued_at != null && !isYmd(String(r.issued_at).slice(0, 10))) {
+      issues.push({ kind: 'invalid_timestamp', orderId: r.id, detail: `issued_at=${r.issued_at}` });
     }
   }
   // 2b. 逆仕訳の不変条件の検算 (通常はトリガ+UNIQUEが守る。メンテモード・移行後の検査用)
@@ -461,13 +468,24 @@ export function checkLedgerIntegrity({ orderId = null } = {}) {
       if (r.closed_at && r.maxr > 0) issues.push({ kind: 'closed_but_remaining', orderId: r.id });
       if (!r.closed_at && r.maxr === 0) issues.push({ kind: 'done_but_open', orderId: r.id });
     }
-    // 4. legacy/draft にイベントが存在 (トリガの防波堤の検算)
+    // 4. legacy/draft にイベントが存在 (トリガの防波堤の検算)。issued_at IS NULL も未追跡として検出
     for (const r of db.prepare(`
       SELECT DISTINCT o.id FROM po_item_events e
       JOIN po_order_items i ON i.id = e.order_item_id JOIN po_orders o ON o.id = i.order_id
-      WHERE (o.status <> 'issued' OR o.issued_at < ?) ${scope}`).all(boundary, ...args)) {
+      WHERE (o.status <> 'issued' OR o.issued_at IS NULL OR o.issued_at < ?) ${scope}`).all(boundary, ...args)) {
       issues.push({ kind: 'events_on_untracked', orderId: r.id });
     }
+  }
+  // 4b. イベント意味論の検算 (CHECK/トリガの防波堤。メンテモード・移行後検査用)
+  for (const r of db.prepare(`
+    SELECT e.id, e.event_type, e.source, e.reason_code, e.note, e.inbound_item_id FROM po_item_events e
+    JOIN po_order_items i ON i.id = e.order_item_id JOIN po_orders o ON o.id = i.order_id WHERE 1=1 ${scope}`).all(...args)) {
+    const bad =
+      (r.event_type === 'receipt' && (!r.source || r.reason_code != null || ((r.source === 'logizard') !== (r.inbound_item_id != null)))) ||
+      (r.event_type === 'shortage' && (!['supplier_shortage', 'own_decision', 'cutoff', 'other'].includes(r.reason_code) || r.source != null || r.inbound_item_id != null)) ||
+      (r.event_type === 'cancel' && (r.reason_code != null || r.source != null || r.inbound_item_id != null)) ||
+      (r.event_type === 'reversal' && (r.reason_code !== 'correction' || !(r.note && String(r.note).trim())));
+    if (bad) issues.push({ kind: 'invalid_event_semantics', eventId: r.id, detail: r.event_type });
   }
   // 5. disposition/next_* の列間規則 (next_expected_qty 単独残骸も対象に含める)
   for (const r of db.prepare(`
