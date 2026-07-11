@@ -264,9 +264,17 @@ export async function processEmailJob(jobId) {
     if (action) audit(db, { actorType: 'system', actor: null, action, resource: `order:${job.order_id}`, detail });
     return true;
   };
+  // Gmail要求の直前にも世代を再検証 (Codex P15-R8 High: lease後に長時間停止した旧プロセスが復帰しても
+  // 新世代へ進んでいたら外部送信自体を中止する。書き戻し条件と合わせた二段ガード)
+  const verifyFresh = () => {
+    const cur = db.prepare('SELECT status, generation FROM po_email_jobs WHERE id=?').get(jobId);
+    if (!cur || cur.status !== 'sending' || cur.generation !== gen) {
+      throw new Error('世代交代を検知したため送信を中止しました (別の試行が進行中)');
+    }
+  };
   let phase = 'pre';
   try {
-    const messageId = await sendViaGmail(job, p => { phase = p; });
+    const messageId = await sendViaGmail(job, p => { phase = p; }, verifyFresh);
     const applied = finalize("SET status='sent', sent_at=?, gmail_message_id=?", [nowIso(), messageId],
       'email_sent', { jobId, gmailMessageId: messageId, dryRun: !!job.is_dry_run, deliveryKey: job.delivery_key });
     if (!applied) return { status: 'stale', error: '古い送信試行のため結果を破棄しました。「照合」で状態を確認してください' };
@@ -436,8 +444,9 @@ async function gmailAccessToken() {
 /**
  * Gmail送信。onPhase('post') を「送信要求を発した直後」に呼ぶ (以降の失敗=結果不明、二重送信防止の分類に使う)
  */
-async function sendViaGmail(job, onPhase = () => {}) {
+async function sendViaGmail(job, onPhase = () => {}, verifyFresh = () => {}) {
   if (process.env.PO_EMAIL_FAKE) {
+    verifyFresh();
     if (process.env.PO_EMAIL_FAKE === 'fail') throw new Error('偽送信エラー (テスト、要求前)');
     if (process.env.PO_EMAIL_FAKE === 'fail_unknown') { onPhase('post'); throw new Error('偽送信エラー (テスト、要求後)'); }
     onPhase('post');
@@ -446,6 +455,7 @@ async function sendViaGmail(job, onPhase = () => {}) {
   const token = await gmailAccessToken();          // ここまでの失敗 = pre (再試行可)
   const mime = buildMime(job);                     // ヘッダ検証もここ (pre)
   const raw = Buffer.from(mime).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  verifyFresh();                                   // 外部送信の直前に世代を再検証 (旧世代なら送らない)
   onPhase('post');                                 // 以降のネットワーク断・タイムアウト = 結果不明
   const res = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
     method: 'POST',

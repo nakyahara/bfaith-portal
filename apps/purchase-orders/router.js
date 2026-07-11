@@ -3377,7 +3377,7 @@ function emailPanel(orderId) {
           x.status === 'sending' ? '⏳ 送信中' :
           x.status === 'cancelled' ? '🚫 取消' :
           (x.scheduled_at ? '⏰ 予約 ' + esc(String(new Date(new Date(x.scheduled_at).getTime() + 9 * 3600000).toISOString()).slice(0, 16).replace('T', ' ')) + ' (JST)' : x.status);
-        h += '<tr><td>' + x.id + (x.is_resend ? ' ↪' + (x.resend_of || '') : '') + '</td><td>' + st + '</td><td>' + esc(x.to_addr) + '</td>' +
+        h += '<tr><td>' + x.id + (x.is_resend ? ' ↪' + (x.resend_of || '') : '') + (x.generation > 1 ? ' <span class="muted" title="送信試行の世代 (照合の競合検知に使用)">g' + x.generation + '</span>' : '') + '</td><td>' + st + '</td><td>' + esc(x.to_addr) + '</td>' +
           '<td class="muted" style="font-size:11px">' + esc(String(x.sent_at || x.created_at).slice(0, 16).replace('T', ' ')) + '</td>' +
           '<td style="font-size:11px">' + esc(x.gmail_message_id || x.error || '') + '</td>' +
           '<td style="white-space:nowrap">' +
