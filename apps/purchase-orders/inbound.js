@@ -121,8 +121,9 @@ export function importInboundCsv({ buffer, filename, actor = null }) {
       cost = Number(costN);
       if (!Number.isFinite(cost) || cost < 0) { errors.push(`行${n + 1}: 仕入単価が不正です (${trimS(r[iCost])})`); continue; }
     }
-    let date = iDate != null && iDate !== -1 ? trimS(r[iDate]).replace(/\//g, '-') : '';
-    if (date && !isYmd(date)) { warnings.push(`行${n + 1}: 入庫日の形式が不正 (${date}) — 日付なし扱い`); date = ''; }
+    let date = hasDateCol ? trimS(r[iDate]).replace(/\//g, '-') : '';
+    // 入庫日も原本。破損値を「日付なし」に変換すると訂正版で正しい原本日付を消すため、不正はファイル全体拒否
+    if (date && !isYmd(date)) { errors.push(`行${n + 1}: 入庫日の形式が不正です (${date})`); continue; }
     const line = {
       supplierCode: normSupplierCode(r[iSup]), productCode: code, productKey: normProductCode(code),
       goodQty: good, defectiveQty: Math.max(0, bad ?? 0), unitCost: cost, date: date || null,
@@ -204,9 +205,13 @@ export function importInboundCsv({ buffer, filename, actor = null }) {
           continue;
         }
         // 過去にsupersededになった同一内容行が復活するケース: UNIQUE(receipt,line_key) に当たるため復活させる。
-        // 監査が誤らないよう、原本・バッチ情報も今回の値へ更新する (Codex P14-R1 Medium-1)
-        const dead = db.prepare('SELECT id FROM po_inbound_items WHERE receipt_id=? AND line_key=? AND superseded=1').get(receipt.id, l.lineKey);
+        // 監査が誤らないよう、原本・バッチ情報も今回の値へ更新する (Codex P14-R1 Medium-1)。
+        // ただし割当が残る行の仕入先変更は、通常行と同じく取込ごと拒否 (復活経路での迂回を塞ぐ、Codex P14-R4 High)
+        const dead = db.prepare('SELECT * FROM po_inbound_items WHERE receipt_id=? AND line_key=? AND superseded=1').get(receipt.id, l.lineKey);
         if (dead) {
+          if (dead.supplier_code !== (l.supplierCode || null) && allocOf.get(dead.id).n > 0) {
+            throw new Error(`伝票 ${slip} / ${l.productCode}: 仕入先が訂正されましたが割当 (${allocOf.get(dead.id).n}) が残っています。先に発注残ページから逆仕訳してから再取込してください`);
+          }
           db.prepare(`UPDATE po_inbound_items SET superseded=0, superseded_batch_id=NULL,
                         batch_id=?, supplier_code=?, product_code=?, payload_json=?, created_at=? WHERE id=?`)
             .run(batchId, l.supplierCode || null, l.productCode, l.payload, now, dead.id);

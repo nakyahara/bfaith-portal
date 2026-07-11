@@ -962,6 +962,15 @@ console.log('── P14: 入庫CSV取込+突合+割当 ──');
   r = await j('/api/inbound/' + inb3b.id + '/candidates');
   ok(r.body.candidates.length >= 1, '仕入先訂正後は候補に出る');
 
+  // 復活経路での仕入先変更ガード迂回 (割当→supersede→別仕入先で同一内容が復活)
+  // inb1 (AR001 良品12、割当12、現在superseded) と同一内容を仕入先0113で復活させようとする
+  r = await upload('lz1-revive.csv', [HDR, ['AR001', 'noflyersticker', '商品', '0113', '70', '12', '0', '2026/07/11'], ['AR001', 'noflyersticker', '商品', '0113', '70', '10', '0', '2026/07/11']]);
+  ok(r.status === 400 && r.body.error.includes('逆仕訳'), '復活経路でも割当残り行の仕入先変更は拒否 (Codex P14 R4)', r.body.error);
+
+  // 不正な入庫日はファイル全体拒否 (原本の日付を壊さない)
+  r = await upload('lz-baddate.csv', [HDR, ['AR009', 'noflyersticker', '商品', '0001', '70', '1', '0', '2026/99/99']]);
+  ok(r.status === 400 && r.body.error.includes('入庫日'), '不正な入庫日はファイル全体拒否', r.body.error);
+
   // 壊れた引用符のCSVはパースエラー
   {
     const fdq = new FormData();
