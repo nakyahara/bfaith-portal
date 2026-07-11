@@ -819,6 +819,20 @@ console.log('── P13b: 発注残ページ+消込API ──');
     body: JSON.stringify({ disposition: 'awaiting_confirmation', nextActionDate: '2026-07-20' }) });
   ok(r.status === 400 && r.body.error.includes('残数0'), '残数0明細への扱い設定は400 (Codex P13b R2)', r.body.error);
 
+  // 発注確定の冪等再送 (issue APIにキー: 再送は同じPO)
+  const issueOpts = key => ({ method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': key },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 2 }], requestedDate: '2026-08-01' }) });
+  r = await j('/api/supplier/1/issue', issueOpts('smoke-issue-idem'));
+  const issFirst = r.body;
+  r = await j('/api/supplier/1/issue', issueOpts('smoke-issue-idem'));
+  ok(r.body.ok && r.body.id === issFirst.id && r.body.replay === true, 'issue API: 同一キー再送は同じPO (二重発注なし)');
+
+  // 下書きにも希望納期が保存される
+  r = await j('/api/supplier/1/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 1 }], note: 'd', requestedDate: '2026-08-15' }) });
+  const draftRow = db.prepare("SELECT requested_date FROM po_orders WHERE status='draft' AND supplier_code='1'").get();
+  ok(r.body.ok && draftRow && draftRow.requested_date === '2026-08-15', '下書き保存で希望納期も保持 (Codex P13b R3)');
+
   // ページ配信 (発注残ページ・ダッシュボードのサマリ・履歴のPO番号列)
   {
     const html = await (await fetch(base + '/backorders')).text();
@@ -828,6 +842,10 @@ console.log('── P13b: 発注残ページ+消込API ──');
     ok(html.includes("td.innerHTML = ''") && html.includes('Idempotency-Key'), '/backorders パネルDOM破棄+冪等キー送信 (Codex P13b R1)');
     ok(html.includes('data-disp') && html.includes('dspGo'), '/backorders 残数の扱い設定パネル (逆仕訳後の再設定用)');
     ok(html.includes('getJson') && html.includes('再読込'), '/backorders GET失敗時の再読込UI');
+    // 発注確定の冪等キー (供給ページ): ノンス+内容ハッシュ
+    const sup = await (await fetch(base + '/supplier/1')).text();
+    ok(sup.includes('ISSUE_NONCE') && sup.includes('contentHash') && sup.includes('Idempotency-Key'), '/supplier 発注確定に冪等キー (ノンス+内容ハッシュ)');
+    ok(sup.includes('orderReqDate'), '/supplier 希望納期入力');
     const dash = await (await fetch(base + '/')).text();
     ok(dash.includes('発注残') && dash.includes('/apps/purchase-orders/backorders'), '/ ダッシュボードに発注残サマリ');
     const orders = await (await fetch(base + '/orders')).text();

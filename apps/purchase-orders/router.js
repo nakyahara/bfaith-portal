@@ -163,20 +163,24 @@ function insertItems(db, orderId, items, requestedDate = null) {
   }
 }
 
-function upsertDraft(supplierCode, supplierName, rawItems, note) {
+function upsertDraft(supplierCode, supplierName, rawItems, note, requestedDate) {
   const db = getDB();
   const { items, pmlAsOf } = enrichItems(rawItems, supplierCode);
+  if (requestedDate != null && requestedDate !== '' && !isYmd(String(requestedDate))) {
+    throw new Error(`希望納期が日付 (YYYY-MM-DD) ではありません: ${requestedDate}`);
+  }
+  const reqDate = requestedDate ? String(requestedDate) : null;
   const now = nowIso();
   return db.transaction(() => {
     let order = db.prepare("SELECT id FROM po_orders WHERE supplier_code=? AND status='draft'").get(supplierCode);
     if (!order) {
       const info = db.prepare(
-        'INSERT INTO po_orders (supplier_code, supplier_name, status, note, pml_as_of_date, created_at, updated_at) VALUES (?,?,?,?,?,?,?)'
-      ).run(supplierCode, supplierName, 'draft', note || null, pmlAsOf, now, now);
+        'INSERT INTO po_orders (supplier_code, supplier_name, status, note, pml_as_of_date, created_at, updated_at, requested_date) VALUES (?,?,?,?,?,?,?,?)'
+      ).run(supplierCode, supplierName, 'draft', note || null, pmlAsOf, now, now, reqDate);
       order = { id: Number(info.lastInsertRowid) };
     } else {
-      db.prepare('UPDATE po_orders SET note=?, pml_as_of_date=?, updated_at=?, supplier_name=? WHERE id=?')
-        .run(note || null, pmlAsOf, now, supplierName, order.id);
+      db.prepare('UPDATE po_orders SET note=?, pml_as_of_date=?, updated_at=?, supplier_name=?, requested_date=? WHERE id=?')
+        .run(note || null, pmlAsOf, now, supplierName, reqDate, order.id);
     }
     db.prepare('DELETE FROM po_order_items WHERE order_id=?').run(order.id);
     insertItems(db, order.id, items);
@@ -248,9 +252,9 @@ function supplierWorkspaceData(code) {
   const sm = masters.suppliers.get(code);
   if (!g && !sm) return null;
   const db = getDB();
-  const draftRow = db.prepare("SELECT id, note FROM po_orders WHERE supplier_code=? AND status='draft'").get(code);
+  const draftRow = db.prepare("SELECT id, note, requested_date FROM po_orders WHERE supplier_code=? AND status='draft'").get(code);
   const draft = draftRow ? {
-    id: draftRow.id, note: draftRow.note || '',
+    id: draftRow.id, note: draftRow.note || '', requestedDate: draftRow.requested_date || '',
     items: db.prepare('SELECT product_code AS code, product_key AS key, product_name AS name, qty, unit_cost AS cost FROM po_order_items WHERE order_id=? ORDER BY id').all(draftRow.id),
   } : null;
   const all = g ? [...g.targets, ...g.candidates, ...g.horikoshi] : [];
@@ -371,14 +375,14 @@ router.get('/api/supplier/:code', (req, res) => {
 router.post('/api/supplier/:code/draft', (req, res) => {
   try {
     const code = normSupplierCode(req.params.code);
-    const { items, note } = req.body || {};
+    const { items, note, requestedDate } = req.body || {};
     if (!Array.isArray(items)) return res.status(400).json({ ok: false, error: 'items が必要です' });
     if (items.length === 0) {
       const db = getDB();
       db.prepare("DELETE FROM po_orders WHERE supplier_code=? AND status='draft'").run(code);
       return res.json({ ok: true, deleted: true });
     }
-    const id = upsertDraft(code, resolveSupplierName(code), items, trimS(note));
+    const id = upsertDraft(code, resolveSupplierName(code), items, trimS(note), requestedDate);
     res.json({ ok: true, id });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
@@ -547,9 +551,12 @@ router.patch('/api/items/:itemId/plan', (req, res) => {
       if (k in b) patch[col] = b[k] === '' ? null : b[k];
     }
     if (!Object.keys(patch).length) return res.status(400).json({ ok: false, error: '更新項目がありません' });
-    const result = setItemPlan(itemId, patch, { note: trimS(b.note) || null, actorType: 'user', actor: actorOf(req) });
-    res.json({ ok: true, ...result });
-  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+    const { replay, result } = withCommand(
+      { idempotencyKey: trimS(req.get('Idempotency-Key')) || null, payload: { op: 'plan', itemId, patch, note: trimS(b.note) || null } },
+      () => setItemPlan(itemId, patch, { note: trimS(b.note) || null, actorType: 'user', actor: actorOf(req) })
+    );
+    res.json({ ok: true, ...result, replay });
+  } catch (e) { res.status(e.status === 409 ? 409 : 400).json({ ok: false, error: e.message }); }
 });
 
 // P13a: 台帳の整合性検査 (負残/closed不整合/発行取りこぼし/disposition規則)。P13bで管理画面に表示する
@@ -2354,6 +2361,14 @@ document.addEventListener('click', function(ev) {
   if (idc === 'btnIssue') save(true);
 });
 
+// 発注確定の冪等キー: ノンス (成功時に更新) + 内容ハッシュ。
+// 通信断後に同じ内容で再確定→同じキー (二重発注しない)。成功後に同内容を意図的に再発注→新ノンスで別キー
+var ISSUE_NONCE = 'n' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+function contentHash(s) {
+  var h = 5381;
+  for (var i = 0; i < s.length; i++) { h = ((h << 5) + h + s.charCodeAt(i)) >>> 0; }
+  return h.toString(36) + '-' + s.length;
+}
 function save(issue) {
   var items = cartItems().map(function(i){ return { code: i.code, qty: i.qty }; });
   if (issue && !items.length) { toast('発注する商品がありません'); return; }
@@ -2374,19 +2389,24 @@ function save(issue) {
   btnI.disabled = btnS.disabled = true;
   var unlock = function(){ btnI.disabled = btnS.disabled = false; };
   var url = '/apps/purchase-orders/api/supplier/' + encodeURIComponent(D.supplier.code) + (issue ? '/issue' : '/draft');
+  var payload = { items: items, note: document.getElementById('orderNote').value,
+    requestedDate: document.getElementById('orderReqDate').value || null };
+  // 冪等キー: 内容から決定的に導出 (通信断後に同じ内容で再確定→同じキー=二重発注しない。内容を変えれば別キー)
+  var headers = { 'Content-Type': 'application/json' };
+  if (issue) headers['Idempotency-Key'] = 'issue-' + D.supplier.code + '-' + ISSUE_NONCE + '-' + contentHash(JSON.stringify(payload));
   fetch(url, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ items: items, note: document.getElementById('orderNote').value,
-      requestedDate: issue ? (document.getElementById('orderReqDate').value || null) : null }),
-  }).then(function(r){ return r.json(); }).then(function(j) {
+    method: 'POST', headers: headers,
+    body: JSON.stringify(payload),
+  }).then(function(r){ return r.json().catch(function(){ return { ok: false, error: 'HTTP ' + r.status + ' — 確定されたか不明です。発注履歴を確認してください' }; }); }).then(function(j) {
     unlock();
     if (!j.ok) { toast('エラー: ' + j.error); return; }
     if (issue) {
+      ISSUE_NONCE = 'n' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); // 次回の意図的な同内容発注は別キーに
       showDone(j.id, j.poNumber); // CART を読むのでクリア前に
       CART = {};
       document.querySelectorAll('input[data-code]').forEach(function(inp){ inp.value = ''; });
       renderAll();
-      toast('発注確定しました (' + (j.poNumber || '#' + j.id) + ')');
+      toast('発注確定しました (' + (j.poNumber || '#' + j.id) + ')' + (j.replay ? ' ※前回確定分を再表示 (二重発注なし)' : ''));
     }
     else toast(j.deleted ? '下書きを削除しました' : '下書きを保存しました');
   }).catch(function(e){ unlock(); toast('通信エラー: ' + e.message); });
@@ -2439,6 +2459,7 @@ document.addEventListener('input', function(ev) {
 });
 
 document.getElementById('orderNote').value = D.draft ? D.draft.note : '';
+document.getElementById('orderReqDate').value = D.draft && D.draft.requestedDate ? D.draft.requestedDate : '';
 renderLists();
 renderAll();`;
   res.send(pageShell(`発注 — ${data.supplier.name}`, '', body, script));
@@ -2664,19 +2685,23 @@ var EVLABEL = { receipt: '📥入荷', shortage: '➖減数', cancel: '🚫取�
 
 function fmtD(s) { return s ? String(s).slice(0, 10) : '—'; }
 function newIdemKey() { return (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : 'k' + Date.now() + '-' + Math.random().toString(36).slice(2); }
-function jsonOrErr(r) {
-  // 非JSON応答 (proxy 502等) でも「成否不明」を利用者に正しく伝える
-  return r.json().catch(function(){ return { ok: false, error: 'HTTP ' + r.status + ' — 登録されたか不明です。画面を更新して確認してください' }; });
+function jsonOrErr(r, isWrite) {
+  // 非JSON応答 (proxy 502等) でも状況を正しく伝える (書込=成否不明 / 取得=単なる失敗)
+  return r.json().catch(function(){
+    return { ok: false, error: 'HTTP ' + r.status + (isWrite ? ' — 登録されたか不明です。画面を更新して確認してください' : ' — 取得に失敗しました') };
+  });
 }
 function post(url, body, idemKey) {
   var h = { 'Content-Type': 'application/json' };
   if (idemKey) h['Idempotency-Key'] = idemKey;
-  return fetch(url, { method: 'POST', headers: h, body: JSON.stringify(body) }).then(jsonOrErr);
+  return fetch(url, { method: 'POST', headers: h, body: JSON.stringify(body) }).then(function(r){ return jsonOrErr(r, true); });
 }
-function patch(url, body) {
-  return fetch(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(jsonOrErr);
+function patch(url, body, idemKey) {
+  var h = { 'Content-Type': 'application/json' };
+  if (idemKey) h['Idempotency-Key'] = idemKey;
+  return fetch(url, { method: 'PATCH', headers: h, body: JSON.stringify(body) }).then(function(r){ return jsonOrErr(r, true); });
 }
-function getJson(url) { return fetch(url).then(jsonOrErr); }
+function getJson(url) { return fetch(url).then(function(r){ return jsonOrErr(r, false); }); }
 
 function load() {
   getJson(API + '/backorders').then(function(j) {
@@ -2903,12 +2928,12 @@ function dispPanel(itemId) {
         disposition: 'awaiting_delivery',
         nextExpectedDate: (document.getElementById('dspDate') || {}).value,
         nextExpectedQty: (document.getElementById('dspQty') || {}).value,
-      }).then(function(j){ done(j, '分納待ちに設定しました'); });
+      }, idemKey).then(function(j){ done(j, '分納待ちに設定しました'); });
     } else {
       patch(API + '/items/' + itemId + '/plan', {
         disposition: 'awaiting_confirmation',
         nextActionDate: (document.getElementById('dspActDate') || {}).value,
-      }).then(function(j){ done(j, '確認中に設定しました'); });
+      }, idemKey).then(function(j){ done(j, '確認中に設定しました'); });
     }
   });
 }
@@ -3005,12 +3030,12 @@ document.addEventListener('click', function(ev) {
     var item = findItem(v);
     var cell = t.parentNode;
     cell.innerHTML = fmtD(item.requested_date) + ' → <input type="date" id="pd-' + v + '" value="' + (item.promised_date || '') + '" style="width:130px"> ' +
-      '<button class="pri" data-pdsave="' + v + '">保存</button>';
+      '<button class="pri" data-pdsave="' + v + '" data-pdkey="' + newIdemKey() + '">保存</button>';
     return;
   }
   if ((v = g('data-pdsave'))) {
     var val = document.getElementById('pd-' + v).value;
-    patch(API + '/items/' + v + '/plan', { promisedDate: val || '' }).then(function(j) {
+    patch(API + '/items/' + v + '/plan', { promisedDate: val || '' }, g('data-pdkey')).then(function(j) {
       if (!j.ok) { toast('エラー: ' + j.error); return; }
       toast('回答納期を保存しました');
       load();
