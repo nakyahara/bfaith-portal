@@ -592,6 +592,24 @@ async function main() {
       console.log('[DailySync] 楽天データ分析 sync は取込失敗のためスキップ (failed/ を確認、修正後に再投入)');
     }
 
+    // === Yahoo!ストクリ統計CSV 取込 + mirror sync (mall-csv-fetcher P1-Y) ===
+    // 自動DL (yahoo-data-download.mjs、fetch-all 05:30) が incoming/yahoo-data/ に置いた
+    // CSVを取り込む。対象0件は正常。--days 110 = 全体分析の一括100日レンジをカバー
+    const yahooDataImportResult = runScript(
+      `apps/warehouse/import-yahoo-data.js --data-dir ${DATA_DIR_ARG}`,
+      'Yahoo統計 取込', 600000
+    );
+    results.push({ name: 'Yahoo統計 取込', ...yahooDataImportResult });
+    if (yahooDataImportResult.success) {
+      const yahooDataSyncResult = runScript(
+        `apps/warehouse/sync-yahoo-data-daily.js --data-dir ${DATA_DIR_ARG} --days 110`,
+        'Yahoo統計 sync', 600000
+      );
+      results.push({ name: 'Yahoo統計 sync', ...yahooDataSyncResult });
+    } else {
+      console.log('[DailySync] Yahoo統計 sync は取込失敗のためスキップ (failed/ を確認、修正後に再投入)');
+    }
+
     // === Yahoo finance daily fact (Yahoo Phase 1 Y-3c、Y-1 + Y-2 + Y-3a 統合) ===
     // 1. f_yahoo_finance_sku_daily_v1 build (whitelist order=5/pay=1/ship=3、partial margin)
     // 2. DQ gate (6 check、severity error で exit 1)
