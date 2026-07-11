@@ -24,6 +24,7 @@ import {
   ensureTrackingStarted, nextPoNumber, isYmd, checkLedgerIntegrity, withCommand,
   appendPoItemEvent, reverseEvent, manualCloseOrder, setItemPlan, listBackorders, listItemEvents, balanceOf,
 } from './ledger.js';
+import { importInboundCsv, listInbound, candidatesFor, setInboundIgnore } from './inbound.js';
 
 // ─── miniPC (WarehouseServer) service-api 呼び出し (オンデマンドFBA更新、product-management-list と同一エンドポイント) ───
 const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
@@ -458,16 +459,26 @@ router.post('/api/items/:itemId/events', (req, res) => {
   try {
     const itemId = Number(req.params.itemId);
     if (!Number.isSafeInteger(itemId) || itemId <= 0) return res.status(400).json({ ok: false, error: 'itemIdが不正です' });
-    const { type, qty, reasonCode, note, effectiveDate, remainder } = req.body || {};
+    const { type, qty, reasonCode, note, effectiveDate, remainder, inboundItemId } = req.body || {};
     if (!['receipt', 'shortage', 'cancel'].includes(type)) return res.status(400).json({ ok: false, error: 'typeが不正です' });
     const actor = actorOf(req);
     const db = getDB();
+    // ロジザード入庫からの割当: source=logizard+入庫明細参照。業務日付の既定は入庫日
+    let inbound = null;
+    if (type === 'receipt' && inboundItemId != null) {
+      const iid = Number(inboundItemId);
+      if (!Number.isSafeInteger(iid) || iid <= 0) return res.status(400).json({ ok: false, error: 'inboundItemIdが不正です' });
+      inbound = db.prepare('SELECT i.id, r.receipt_date FROM po_inbound_items i JOIN po_inbound_receipts r ON r.id=i.receipt_id WHERE i.id=?').get(iid);
+      if (!inbound) return res.status(400).json({ ok: false, error: '入庫明細が存在しません' });
+    }
     const run = () => db.transaction(() => {
       const ev = appendPoItemEvent({
         orderItemId: itemId, eventType: type, qty: Number(qty),
-        source: type === 'receipt' ? 'manual' : null,
+        source: type === 'receipt' ? (inbound ? 'logizard' : 'manual') : null,
+        inboundItemId: inbound ? inbound.id : null,
         reasonCode: type === 'shortage' ? (reasonCode || null) : null,
-        note: trimS(note) || null, effectiveDate: trimS(effectiveDate) || null,
+        note: trimS(note) || null,
+        effectiveDate: trimS(effectiveDate) || (inbound && inbound.receipt_date) || null,
         actorType: 'user', actor,
       });
       // 残数が残る場合の三択 (要件F-2: 同一txnで必須。UI側も必須にするがサーバでも検証)
@@ -499,7 +510,7 @@ router.post('/api/items/:itemId/events', (req, res) => {
       return { ...ev, plan };
     }).immediate();
     const { replay, result } = withCommand(
-      { idempotencyKey: trimS(req.get('Idempotency-Key')) || null, payload: { op: 'item_event', itemId, type, qty, reasonCode, note, effectiveDate, remainder } },
+      { idempotencyKey: trimS(req.get('Idempotency-Key')) || null, payload: { op: 'item_event', itemId, type, qty, reasonCode, note, effectiveDate, remainder, inboundItemId: inboundItemId ?? null } },
       run
     );
     res.json({ ok: true, ...result, replay });
@@ -557,6 +568,40 @@ router.patch('/api/items/:itemId/plan', (req, res) => {
     );
     res.json({ ok: true, ...result, replay });
   } catch (e) { res.status(e.status === 409 ? 409 : 400).json({ ok: false, error: e.message }); }
+});
+
+// ─── P14: ロジザード入庫実績の取込・突合 ───
+router.post('/api/inbound/import', upload.single('file'), (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ ok: false, error: 'ファイルがありません' });
+    let buf;
+    try { buf = fs.readFileSync(req.file.path); } finally { try { fs.unlinkSync(req.file.path); } catch {} }
+    const result = importInboundCsv({ buffer: buf, filename: req.file.originalname, actor: actorOf(req) });
+    res.json({ ok: true, ...result });
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+
+router.get('/api/inbound', (req, res) => {
+  try { res.json({ ok: true, ...listInbound() }); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+router.get('/api/inbound/:id/candidates', (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isSafeInteger(id) || id <= 0) return res.status(400).json({ ok: false, error: 'idが不正です' });
+    res.json({ ok: true, ...candidatesFor(id) });
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+
+router.post('/api/inbound/:id/ignore', (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isSafeInteger(id) || id <= 0) return res.status(400).json({ ok: false, error: 'idが不正です' });
+    const b = req.body || {};
+    const result = setInboundIgnore(id, { ignore: !!b.ignore, reason: trimS(b.reason) || null, actor: actorOf(req) });
+    res.json({ ok: true, ...result });
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
 // P13a: 台帳の整合性検査 (負残/closed不整合/発行取りこぼし/disposition規則)。P13bで管理画面に表示する
@@ -1391,6 +1436,7 @@ function pageShell(title, active, body, script) {
   <nav class="tabs">
     ${tab('/apps/purchase-orders', 'ダッシュボード', 'dash')}
     ${tab('/apps/purchase-orders/backorders', '発注残', 'backorders')}
+    ${tab('/apps/purchase-orders/inbound', '入庫消込', 'inbound')}
     ${tab('/apps/purchase-orders/products', '全商品情報', 'products')}
     ${tab('/apps/purchase-orders/orders', '発注履歴', 'orders')}
     ${tab('/apps/purchase-orders/admin', 'マスタ管理', 'admin')}
@@ -2671,6 +2717,228 @@ render();`;
 });
 
 // ─── 画面3: 発注履歴 ───
+// ─── 画面: 入庫消込 (P14) ───
+router.get('/inbound', (req, res) => {
+  const body = `
+    <h2 class="page">入庫消込 <span class="muted" style="font-size:12px">ロジザードの「NE仕入れ取込用データ」CSVを取り込み、発注残と突合して消し込みます (NE仕入取込と同じファイルでOK)</span></h2>
+    <div class="import-zone">
+      <form id="inbForm" class="row" style="display:flex;gap:8px;align-items:center">
+        <input type="file" name="file" accept=".csv" required>
+        <button type="submit" class="pri">📥 入庫CSVを取り込む</button>
+        <span id="inbStatus" class="muted"></span>
+      </form>
+      <div id="inbResult" class="pill-row"></div>
+    </div>
+    <div id="conflictArea"></div>
+    <h2 class="page" style="font-size:15px">未割当の入庫 <span class="muted" id="openCount"></span></h2>
+    <div class="sec"><div class="bd" id="openList" style="max-height:none">読み込み中…</div></div>
+    <div id="ignoredArea"></div>`;
+  const script = `
+var API = '/apps/purchase-orders/api';
+var INB = null;
+function newIdemKey() { return (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : 'k' + Date.now() + '-' + Math.random().toString(36).slice(2); }
+function jsonOrErr(r, isWrite) {
+  return r.json().catch(function(){ return { ok: false, error: 'HTTP ' + r.status + (isWrite ? ' — 登録されたか不明です。画面を更新して確認してください' : ' — 取得に失敗しました') }; });
+}
+function post(url, body, idemKey) {
+  var h = { 'Content-Type': 'application/json' };
+  if (idemKey) h['Idempotency-Key'] = idemKey;
+  return fetch(url, { method: 'POST', headers: h, body: JSON.stringify(body) }).then(function(r){ return jsonOrErr(r, true); });
+}
+function getJson(url) { return fetch(url).then(function(r){ return jsonOrErr(r, false); }); }
+function fmtD(s) { return s ? String(s).slice(0, 10) : '—'; }
+
+var LOAD_SEQ = 0;
+function load() {
+  var seq = ++LOAD_SEQ;
+  getJson(API + '/inbound').then(function(j) {
+    if (seq !== LOAD_SEQ) return;
+    if (!j.ok) { document.getElementById('openList').innerHTML = '<div class="warn">エラー: ' + esc(j.error) + ' <button class="ghost" onclick="load()">再読込</button></div>'; return; }
+    INB = j; render();
+  }).catch(function(e) {
+    if (seq !== LOAD_SEQ) return;
+    document.getElementById('openList').innerHTML = '<div class="warn">通信エラー: ' + esc(e.message) + ' <button class="ghost" onclick="load()">再読込</button></div>';
+  });
+}
+
+function render() {
+  // 訂正競合 (最優先で目立たせる)
+  var ca = document.getElementById('conflictArea');
+  if (INB.conflicts.length) {
+    var ch = '<div class="warn">🚨 <b>訂正競合 ' + INB.conflicts.length + '件</b> — 訂正版CSVで消えた入庫行に消込が残っています。発注残ページの該当明細の履歴から逆仕訳し、正しい行に再割当してください<table class="t">' +
+      '<tr><th>伝票NO</th><th>商品</th><th class="r">割当済</th></tr>';
+    INB.conflicts.forEach(function(c) {
+      ch += '<tr><td>' + esc(c.slip) + '</td><td>' + esc(c.productCode) + '</td><td class="r">' + c.allocated + '</td></tr>';
+    });
+    ca.innerHTML = ch + '</table></div>';
+  } else ca.innerHTML = '';
+
+  document.getElementById('openCount').textContent = '(' + INB.open.length + '件)';
+  if (!INB.open.length) {
+    document.getElementById('openList').innerHTML = '<div class="muted">未割当の入庫はありません 🎉 (CSVを取り込むとここに出ます)</div>';
+  } else {
+    var h = '<table class="t"><tr><th>伝票NO</th><th>入庫日</th><th>仕入先</th><th>商品</th><th class="r">良品数</th><th class="r">不良</th><th class="r">割当済</th><th class="r">未割当</th><th class="r">単価</th><th></th></tr>';
+    INB.open.forEach(function(i) {
+      h += '<tr data-inb="' + i.id + '"><td>' + esc(i.slip) + '</td><td>' + fmtD(i.receiptDate) + '</td><td>' + esc(i.supplierCode || '—') + '</td>' +
+        '<td><b>' + esc(i.productCode) + '</b></td>' +
+        '<td class="r">' + i.goodQty + '</td><td class="r">' + (i.defectiveQty || '') + '</td>' +
+        '<td class="r">' + i.allocated + '</td><td class="r"><b>' + i.remainingCapacity + '</b></td>' +
+        '<td class="r">' + (i.unitCost != null ? i.unitCost : '—') + '</td>' +
+        '<td style="white-space:nowrap"><button class="pri" data-match="' + i.id + '">🔗 発注残に割当</button> <button class="ghost" data-ign="' + i.id + '">🚫対象外</button></td></tr>' +
+        '<tr id="mpanel-' + i.id + '" style="display:none"><td colspan="10" id="mpanelBody-' + i.id + '"></td></tr>';
+    });
+    document.getElementById('openList').innerHTML = h + '</table>';
+  }
+  var ia = document.getElementById('ignoredArea');
+  if (INB.ignored.length) {
+    var ih = '<h2 class="page" style="font-size:14px">対象外にした入庫 (' + INB.ignored.length + ')</h2><div class="sec"><div class="bd" style="max-height:none"><table class="t"><tr><th>伝票NO</th><th>商品</th><th class="r">良品数</th><th></th></tr>';
+    INB.ignored.forEach(function(i) {
+      ih += '<tr><td>' + esc(i.slip) + '</td><td>' + esc(i.productCode) + '</td><td class="r">' + i.goodQty + '</td>' +
+        '<td><button class="ghost" data-unign="' + i.id + '">↩ 対象外を解除</button></td></tr>';
+    });
+    ia.innerHTML = ih + '</table></div></div>';
+  } else ia.innerHTML = '';
+}
+
+function showMPanel(id, html) {
+  document.querySelectorAll('tr[id^=mpanel-]').forEach(function(tr){ tr.style.display = 'none'; });
+  document.querySelectorAll('td[id^=mpanelBody-]').forEach(function(td){ if (td.id !== 'mpanelBody-' + id) td.innerHTML = ''; });
+  document.getElementById('mpanelBody-' + id).innerHTML = html;
+  document.getElementById('mpanel-' + id).style.display = '';
+}
+
+// ── 突合候補パネル ──
+function matchPanel(inbId) {
+  getJson(API + '/inbound/' + inbId + '/candidates').then(function(j) {
+    if (!j.ok) { toast(j.error); return; }
+    if (!j.candidates.length) {
+      showMPanel(inbId, '<div class="muted">この商品の発注残が見つかりません (仕入先不一致は除外)。手動発注や対象外を検討してください <button class="ghost" data-mclose="' + inbId + '">閉じる</button></div>');
+      return;
+    }
+    var cap = j.item.capacity;
+    var h = '<div class="import-zone" style="margin:6px 0"><b>🔗 割当先の発注を選択</b> (未割当 ' + cap + ')' +
+      '<table class="t" style="margin-top:6px"><tr><th></th><th>PO番号</th><th>仕入先</th><th>発注日</th><th>納期</th><th class="r">発注残</th><th class="r">PO単価</th><th>備考</th></tr>';
+    j.candidates.forEach(function(c, k) {
+      h += '<tr><td><input type="radio" name="cand" value="' + c.orderItemId + '" data-remaining="' + c.remaining + '" data-sug="' + c.suggestedQty + '"' + (k === 0 ? ' checked' : '') + '></td>' +
+        '<td>' + esc(c.poNumber || ('#' + c.orderId)) + '</td><td>' + esc(c.supplierName) + '</td><td>' + fmtD(c.issuedAt) + '</td><td>' + fmtD(c.due) + '</td>' +
+        '<td class="r">' + c.remaining + '</td><td class="r">' + (c.poUnitCost != null ? c.poUnitCost : '—') + '</td>' +
+        '<td>' + (c.costDiff ? '<span class="badge b-issued" title="入庫単価とPO単価が異なります (価格改定?)">⚠️単価差異</span>' : '') + (c.score >= 100 ? '' : '') + '</td></tr>';
+    });
+    h += '</table><div class="row" style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +
+      '割当数量 <input type="number" id="mQty" min="1" max="' + cap + '" value="' + (j.candidates[0] ? j.candidates[0].suggestedQty : cap) + '" style="width:90px">' +
+      ' <span id="mPrev" class="muted"></span></div>' +
+      '<div id="mRemBox" style="margin-top:8px;display:none"><b>発注側の残りの扱い (必須)</b>: ' +
+      '<label><input type="radio" name="mrem" value="await_delivery" checked> 🚚 分納待ち</label> ' +
+      '<label><input type="radio" name="mrem" value="shortage"> ➖ 残りは減数で完了</label> ' +
+      '<label><input type="radio" name="mrem" value="await_confirmation"> 📞 確認中</label>' +
+      '<span id="mRemFields" style="margin-left:8px"></span></div>' +
+      '<div style="margin-top:8px"><button class="pri" id="mGo">この発注に割り当てて消込</button> <button class="ghost" data-mclose="' + inbId + '">やめる</button></div></div>';
+    showMPanel(inbId, h);
+    var idemKey = newIdemKey();
+    document.getElementById('mpanelBody-' + inbId).addEventListener('input', function(){ idemKey = newIdemKey(); });
+    function sel() { return document.querySelector('input[name=cand]:checked'); }
+    function refresh() {
+      var c = sel();
+      var q = Number(document.getElementById('mQty').value) || 0;
+      var rem = Number(c.getAttribute('data-remaining'));
+      var after = rem - q;
+      document.getElementById('mPrev').textContent = (q > 0 ? '→ 発注残 ' + rem + ' → ' + after + ' / 入庫未割当 ' + cap + ' → ' + (cap - q) : '');
+      document.getElementById('mRemBox').style.display = (q > 0 && q <= rem && q <= cap && after > 0) ? '' : 'none';
+      mRemFields(after);
+    }
+    function mRemFields(after) {
+      var v = (document.querySelector('input[name=mrem]:checked') || {}).value;
+      var el = document.getElementById('mRemFields');
+      if (v === 'await_delivery') el.innerHTML = '次回予定日 <input type="date" id="mRemDate"> 数量 <input type="number" id="mRemQty" min="1" value="' + Math.max(1, after) + '" style="width:80px">';
+      else if (v === 'shortage') el.innerHTML = '理由 <select id="mRemReason"><option value="supplier_shortage">仕入先都合</option><option value="own_decision">自社判断</option><option value="other">その他</option></select> <input type="text" id="mRemNote" placeholder="メモ (その他は必須)" style="width:160px">';
+      else el.innerHTML = '確認期限 <input type="date" id="mRemActDate">';
+    }
+    document.getElementById('mQty').addEventListener('input', refresh);
+    document.querySelectorAll('input[name=cand]').forEach(function(x){ x.addEventListener('change', function() {
+      document.getElementById('mQty').value = Math.min(cap, Number(sel().getAttribute('data-sug')) || cap);
+      refresh();
+    }); });
+    document.querySelectorAll('input[name=mrem]').forEach(function(x){ x.addEventListener('change', refresh); });
+    refresh();
+    document.getElementById('mGo').addEventListener('click', function() {
+      var c = sel();
+      var q = Number(document.getElementById('mQty').value);
+      var rem = Number(c.getAttribute('data-remaining'));
+      var body = { type: 'receipt', qty: q, inboundItemId: Number(inbId) };
+      if (q < rem) {
+        var v = (document.querySelector('input[name=mrem]:checked') || {}).value;
+        if (v === 'await_delivery') body.remainder = { action: 'await_delivery', nextExpectedDate: (document.getElementById('mRemDate') || {}).value, nextExpectedQty: (document.getElementById('mRemQty') || {}).value };
+        else if (v === 'shortage') body.remainder = { action: 'shortage', reasonCode: (document.getElementById('mRemReason') || {}).value, note: (document.getElementById('mRemNote') || {}).value };
+        else body.remainder = { action: 'await_confirmation', nextActionDate: (document.getElementById('mRemActDate') || {}).value };
+      }
+      var btn = this; btn.disabled = true;
+      post(API + '/items/' + c.value + '/events', body, idemKey).then(function(j2) {
+        btn.disabled = false;
+        if (!j2.ok) { toast('エラー: ' + j2.error); return; }
+        toast('割り当てました (発注残 ' + j2.remaining + (j2.orderClosed ? '、発注完了' : '') + ')');
+        load();
+      }).catch(function(e){ btn.disabled = false; toast('通信エラー: ' + e.message + ' — 同じ内容のまま再実行すれば二重登録なしで確認できます'); });
+    });
+  }).catch(function(e){ toast('通信エラー: ' + e.message); });
+}
+
+document.getElementById('inbForm').addEventListener('submit', function(ev) {
+  ev.preventDefault();
+  var fd = new FormData(ev.target);
+  document.getElementById('inbStatus').textContent = '取込中…';
+  fetch(API + '/inbound/import', { method: 'POST', body: fd }).then(function(r){ return jsonOrErr(r, true); }).then(function(j) {
+    document.getElementById('inbStatus').textContent = '';
+    if (!j.ok) { toast('エラー: ' + j.error); return; }
+    var pills = [];
+    if (j.alreadyImported) pills.push('⏭ このファイルは取込済みです (変更なし)');
+    else {
+      pills.push('✅ 伝票 ' + j.receipts + '件');
+      pills.push('新規明細 ' + j.newItems);
+      if (j.unchangedItems) pills.push('変更なし ' + j.unchangedItems);
+      if (j.supersededItems) pills.push('訂正で無効化 ' + j.supersededItems);
+      if (j.conflicts && j.conflicts.length) pills.push('🚨 訂正競合 ' + j.conflicts.length);
+    }
+    (j.warnings || []).forEach(function(w){ pills.push('⚠️ ' + w); });
+    document.getElementById('inbResult').innerHTML = pills.map(function(p){ return '<span class="badge b-draft" style="margin:2px">' + esc(p) + '</span>'; }).join(' ');
+    load();
+  }).catch(function(e){ document.getElementById('inbStatus').textContent = ''; toast('通信エラー: ' + e.message); });
+});
+
+document.addEventListener('click', function(ev) {
+  var t = ev.target;
+  var g = function(a){ return t.getAttribute && t.getAttribute(a); };
+  var v;
+  if ((v = g('data-match'))) { matchPanel(v); return; }
+  if ((v = g('data-mclose'))) { document.getElementById('mpanel-' + v).style.display = 'none'; return; }
+  if ((v = g('data-ign'))) {
+    showMPanel(v, '<b>🚫 この入庫を消込の対象外にする</b> (発注に紐づかない入庫: 返品・サンプル等) ' +
+      '理由 <input type="text" id="ignReason" placeholder="例: 返品の再入庫" style="width:220px"> ' +
+      '<button class="pri" id="ignGo">対象外にする</button> <button class="ghost" data-mclose="' + v + '">やめる</button>');
+    document.getElementById('ignGo').addEventListener('click', function() {
+      var reason = document.getElementById('ignReason').value;
+      if (!reason.trim()) { toast('理由を入力してください'); return; }
+      var btn = this; btn.disabled = true;
+      post(API + '/inbound/' + v + '/ignore', { ignore: true, reason: reason }).then(function(j) {
+        btn.disabled = false;
+        if (!j.ok) { toast('エラー: ' + j.error); return; }
+        toast('対象外にしました'); load();
+      }).catch(function(e){ btn.disabled = false; toast('通信エラー: ' + e.message); });
+    });
+    return;
+  }
+  if ((v = g('data-unign'))) {
+    t.disabled = true;
+    post(API + '/inbound/' + v + '/ignore', { ignore: false }).then(function(j) {
+      if (!j.ok) { t.disabled = false; toast('エラー: ' + j.error); return; }
+      toast('対象外を解除しました'); load();
+    }).catch(function(e){ t.disabled = false; toast('通信エラー: ' + e.message); });
+    return;
+  }
+});
+load();`;
+  res.send(pageShell('発注補助 — 入庫消込', 'inbound', body, script));
+});
+
 // ─── 画面: 発注残 (P13b) ───
 router.get('/backorders', (req, res) => {
   const body = `
