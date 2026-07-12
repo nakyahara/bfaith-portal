@@ -390,8 +390,9 @@ router.post('/api/supplier/:code/draft', (req, res) => {
     if (!Array.isArray(items)) return res.status(400).json({ ok: false, error: 'items が必要です' });
     if (items.length === 0) {
       const db = getDB();
-      db.prepare("DELETE FROM po_orders WHERE supplier_code=? AND status='draft'").run(code);
-      return res.json({ ok: true, deleted: true });
+      // 実際に削除された場合のみ deleted=true (下書きが無いときのクライアント側入力クリアを防ぐ、Codex R2 Medium)
+      const info = db.prepare("DELETE FROM po_orders WHERE supplier_code=? AND status='draft'").run(code);
+      return res.json({ ok: true, deleted: info.changes > 0 });
     }
     const id = upsertDraft(code, resolveSupplierName(code), items, trimS(note), requestedDate);
     res.json({ ok: true, id });
@@ -2105,6 +2106,7 @@ router.get('/supplier/:code', (req, res) => {
         <label class="muted" style="display:flex;align-items:center;gap:4px" title="仕入先への希望納期。確定後は発注残ページで回答納期・入荷を管理">納期 <input type="date" id="orderReqDate"></label>
         <button id="btnSave">💾 下書き保存</button>
         <button class="pri" id="btnIssue">✅ 発注確定</button>
+        <span id="fSaved" class="muted"></span>
       </div>
     </div>`;
 
@@ -2534,6 +2536,7 @@ function renderBar() {
       : (items.length ? '<span class="badge b-issued">✅</span>' : ''));
   if (openPanel === 'items') renderPanelItems(items);
   if (openPanel === 'conds') renderPanelConds(items);
+  updateSavedInd();
 }
 function renderAll(){ renderBar(); renderGauges(); }
 function togglePanel(name) {
@@ -2812,9 +2815,39 @@ function contentHash(s) {
   }
   return h1.toString(36) + h2.toString(36) + '-' + s.length;
 }
+// ── 保存済みインジケータ (下書き保存後に「◯SKU / 発注金額合計◯円」を常時表示、変更で未保存表示に) ──
+var savedState = null, savedInfo = '';
+var hasDraft = !!(D.draft && D.draft.items.length); // 空カート保存 (=削除) の確認ダイアログ用
+function payloadNow() {
+  return { items: cartItems().map(function(i){ return { code: i.code, qty: i.qty }; }),
+    note: document.getElementById('orderNote').value,
+    requestedDate: document.getElementById('orderReqDate').value || null };
+}
+function cartSummary(items) {
+  var totA = 0;
+  items.forEach(function(i){ var p = byCode[i.code]; totA += i.qty * ((p && p.cost) || 0); });
+  return items.length + ' SKU / 発注金額合計 ' + yen(totA);
+}
+function updateSavedInd() {
+  var el = document.getElementById('fSaved');
+  if (!el) return;
+  if (!savedState) { el.innerHTML = ''; return; }
+  el.innerHTML = JSON.stringify(payloadNow()) === savedState
+    ? savedInfo
+    : '<span class="badge b-warn">未保存の変更あり</span>';
+}
+document.addEventListener('input', function(ev) {
+  if (ev.target.id === 'orderNote' || ev.target.id === 'orderReqDate') updateSavedInd();
+});
 function save(issue) {
-  var items = cartItems().map(function(i){ return { code: i.code, qty: i.qty }; });
+  var payload = payloadNow();
+  var items = payload.items;
   if (issue && !items.length) { toast('発注する商品がありません'); return; }
+  if (!issue && !items.length) {
+    // 空カート保存 = 下書き削除。未保存のメモ/納期を黙って消さない (Codex R2 Medium)
+    if (!hasDraft && !payload.note && !payload.requestedDate) { toast('保存する内容がありません'); return; }
+    if (!confirm('カートが空です。保存すると下書きを削除し、メモ・希望納期の入力もクリアします。よろしいですか?')) return;
+  }
   if (issue) {
     var cc = condCheck();
     var msg = 'この内容で発注確定しますか? (確定後は履歴に記録されます。NEへの発注登録は別途手動)';
@@ -2832,8 +2865,7 @@ function save(issue) {
   btnI.disabled = btnS.disabled = true;
   var unlock = function(){ btnI.disabled = btnS.disabled = false; };
   var url = '/apps/purchase-orders/api/supplier/' + encodeURIComponent(D.supplier.code) + (issue ? '/issue' : '/draft');
-  var payload = { items: items, note: document.getElementById('orderNote').value,
-    requestedDate: document.getElementById('orderReqDate').value || null };
+  var summary = cartSummary(items);
   // 冪等キー: 内容から決定的に導出 (通信断後に同じ内容で再確定→同じキー=二重発注しない。内容を変えれば別キー)
   var headers = { 'Content-Type': 'application/json' };
   if (issue) headers['Idempotency-Key'] = 'issue-' + D.supplier.code + '-' + ISSUE_NONCE + '-' + contentHash(JSON.stringify(payload));
@@ -2848,10 +2880,30 @@ function save(issue) {
       showDone(j.id, j.poNumber); // CART を読むのでクリア前に
       CART = {};
       document.querySelectorAll('input[data-code]').forEach(function(inp){ inp.value = ''; });
+      document.getElementById('orderNote').value = '';
+      document.getElementById('orderReqDate').value = '';
+      hasDraft = false; // draft は確定で消費済み
+      // 確定サマリをバーに常時表示。クリア後の空状態を基準に、以後の編集は「未保存の変更あり」(Codex R2 Medium)
+      savedState = JSON.stringify(payloadNow());
+      savedInfo = '✅ ' + new Date().toTimeString().slice(0, 5) + ' 発注確定 ' + esc(j.poNumber || ('#' + j.id)) + ' — ' + summary;
       renderAll();
-      toast('発注確定しました (' + (j.poNumber || '#' + j.id) + ')' + (j.replay ? ' ※前回確定分を再表示 (二重発注なし)' : ''));
+      toast('発注確定しました (' + (j.poNumber || '#' + j.id) + ' — ' + summary + ')' + (j.replay ? ' ※前回確定分を再表示 (二重発注なし)' : ''));
     }
-    else toast(j.deleted ? '下書きを削除しました' : '下書きを保存しました');
+    else if (!items.length) {
+      // draft削除APIは items 空のとき note/納期も保存しない。画面の残留入力をDBと揃えてクリア (Codex R1 Medium)
+      document.getElementById('orderNote').value = '';
+      document.getElementById('orderReqDate').value = '';
+      hasDraft = false;
+      savedState = null; updateSavedInd();
+      toast(j.deleted ? '下書きを削除しました' : '下書きはありません (入力をクリアしました)');
+    }
+    else {
+      hasDraft = true;
+      savedState = JSON.stringify(payload);
+      savedInfo = '💾 ' + new Date().toTimeString().slice(0, 5) + ' 保存済み — ' + summary;
+      updateSavedInd();
+      toast('下書きを保存しました (' + summary + ')');
+    }
   }).catch(function(e){ unlock(); toast('通信エラー: ' + e.message); });
 }
 function copyText(text, btn) {
@@ -2903,6 +2955,12 @@ document.addEventListener('input', function(ev) {
 
 document.getElementById('orderNote').value = D.draft ? D.draft.note : '';
 document.getElementById('orderReqDate').value = D.draft && D.draft.requestedDate ? D.draft.requestedDate : '';
+if (D.draft) {
+  // 復元した下書き = 保存済み状態として表示 (以後の変更で「未保存の変更あり」に切り替わる)
+  var p0 = payloadNow();
+  savedState = JSON.stringify(p0);
+  savedInfo = '💾 下書き保存済み — ' + cartSummary(p0.items);
+}
 renderLists();
 renderAll();`;
   res.send(pageShell(`発注 — ${data.supplier.name}`, '', body, script));
@@ -4016,7 +4074,7 @@ router.get('/admin', (req, res) => {
       </div>
       <div id="emTpl" style="display:none;margin-top:6px">
         <div>件名テンプレ <input type="text" id="emSubject" style="width:420px"></div>
-        <div style="margin-top:4px">本文テンプレ (変数: {{date}} {{name}} {{contact}} {{po_number}})<br>
+        <div style="margin-top:4px">本文テンプレ (変数: {{date}} {{name}} {{contact}} {{po_number}} {{nouki}}=希望納期)<br>
         <textarea id="emBody" rows="10" style="width:100%;max-width:640px"></textarea></div>
       </div>
       <div class="row" style="display:flex;gap:16px;flex-wrap:wrap;margin-top:10px;align-items:flex-end">

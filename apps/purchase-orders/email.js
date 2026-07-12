@@ -17,7 +17,7 @@
 import { createHash, randomUUID } from 'crypto';
 import iconv from 'iconv-lite';
 import { getDB } from './db.js';
-import { getSetting, audit, jstToday } from './ledger.js';
+import { getSetting, audit, jstToday, isYmd } from './ledger.js';
 
 const nowIso = () => new Date().toISOString();
 const trimS = v => String(v == null ? '' : v).trim();
@@ -30,6 +30,8 @@ export const DEFAULT_BODY_TPL = `{{contact}}
 B-Faith株式会社の発注担当の中原です。
 
 添付の注文よろしくお願いいたします。
+
+希望納期：{{nouki}}
 
 ご確認のほどよろしくお願いいたします。
 
@@ -70,6 +72,13 @@ function ensureSama(s) {
 
 function render(tpl, data) {
   return String(tpl).replace(/\{\{\s*(\w+)\s*\}\}/g, (_, k) => (k in data ? String(data[k]) : ''));
+}
+
+/** 希望納期 'YYYY-MM-DD' → 'YYYY年M月D日' (メール本文用。実在日以外は呼び出し側で「指定なし」扱い) */
+function fmtNouki(ymd) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(trimS(ymd));
+  if (!m) return trimS(ymd);
+  return `${m[1]}年${Number(m[2])}月${Number(m[3])}日`;
 }
 
 /** CSVセル (Excel互換、injection対策: 数式に化ける先頭文字は ' 前置) */
@@ -125,11 +134,21 @@ export function buildOrderEmail(orderId) {
     throw new Error(`添付CSVにShift-JISへ変換できない文字があります: ${bad.join(' ')} — 商品名等を確認してください`);
   }
   const st = emailSettings();
-  const data = { date: jstToday(), name: sup.name, contact: ensureSama(sup.contact_name), po_number: order.po_number || `#${order.id}` };
+  // 実在日のみ整形して記載。不正値 (issue時のisYmd検証以前の古いデータ等) は「指定なし」に落とし、そのまま先方に出さない (Codex R1 Low)
+  const reqDateOk = isYmd(String(order.requested_date || ''));
+  const data = {
+    date: jstToday(), name: sup.name, contact: ensureSama(sup.contact_name), po_number: order.po_number || `#${order.id}`,
+    nouki: reqDateOk ? fmtNouki(order.requested_date) : '指定なし',
+  };
+  let body = render(st.bodyTpl, data);
+  // カスタム保存済みテンプレに {{nouki}} が無くても、希望納期の指定があれば必ず先方に伝わるよう末尾に追記
+  if (reqDateOk && !/\{\{\s*nouki\s*\}\}/.test(String(st.bodyTpl))) {
+    body += `\n\n希望納期: ${fmtNouki(order.requested_date)}`;
+  }
   return {
     order, supplier: sup, to, cc,
     subject: render(st.subjectTpl, data),
-    body: render(st.bodyTpl, data),
+    body,
     rows: items.length, totalQty, totalAmount,
     csvText, attachmentName: `${(order.po_number || 'PO-' + order.id)}.csv`,
     vendorColUsed, missingVendorCodes,
