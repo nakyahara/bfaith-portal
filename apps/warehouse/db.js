@@ -1848,6 +1848,46 @@ function createTables() {
     }
   }
 
+  // ---- Yahoo!ストクリ統計CSV 6種: contract auto-seed (mall-csv-fetcher P1-Y、2026-07-11)
+  {
+    const yahooContracts = [
+      ['yahoo_store_device_daily', 'fact_yahoo_store_device_daily',
+        'one row = one (date_jst, device) — 全体分析の日次×デバイス売上+PV (縦持ち)', '["date_jst","device"]'],
+      ['yahoo_inflow_daily', 'fact_yahoo_inflow_daily',
+        'one row = one date_jst — 流入・離脱分析 (訪問者/購入/離脱、合算値)', '["date_jst"]'],
+      ['yahoo_user_attr_daily', 'fact_yahoo_user_attr_daily',
+        'one row = one (date_jst, gender, age_band, buyer_class) — お客様分析マトリクスの縦持ち (visitors)', '["date_jst","gender","age_band","buyer_class"]'],
+      ['yahoo_flash_hourly', 'fact_yahoo_flash_hourly',
+        'one row = one (date_jst, hour_slot, device) — 速報の時間帯×デバイス9指標 (当日スナップ)', '["date_jst","hour_slot","device"]'],
+      ['yahoo_item_daily', 'fact_yahoo_item_daily',
+        'one row = one (date_jst, item_code, sub_code) — 商品分析14指標 (期間集計型→1日単位DL、「2未満」マスクはNULL)', '["date_jst","item_code","sub_code"]'],
+      ['yahoo_keyword_daily', 'fact_yahoo_keyword_daily',
+        'one row = one (date_jst, keyword) — 検索流入 (KW×流入/売上、上位600語、期間集計型→1日単位DL)', '["date_jst","keyword"]'],
+    ];
+    const seedStmt = db.prepare(`
+      INSERT INTO sync_contracts (
+        entity, contract_version, source_system, source_object, target_table,
+        grain_definition, key_columns_json, payload_schema_json,
+        clear_strategy, apply_mode, enabled, owner, created_at, updated_at
+      ) VALUES (
+        ?, 1, 'minipc-warehouse', ?, ?, ?, ?,
+        '{"required":["date_jst"],"date_jst_pattern":"^\\d{4}-\\d{2}-\\d{2}$","amount_unit":"JPY_tax_included_integer"}',
+        'scope_clear_per_run', 'insert_or_replace', 1, 'mall-csv-fetcher',
+        strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      )
+      ON CONFLICT(entity) DO UPDATE SET
+        contract_version = excluded.contract_version, source_system = excluded.source_system,
+        source_object = excluded.source_object, target_table = excluded.target_table,
+        grain_definition = excluded.grain_definition, key_columns_json = excluded.key_columns_json,
+        payload_schema_json = excluded.payload_schema_json, clear_strategy = excluded.clear_strategy,
+        apply_mode = excluded.apply_mode, enabled = excluded.enabled, owner = excluded.owner,
+        updated_at = excluded.updated_at
+    `);
+    for (const [entity, srcTable, grain, keys] of yahooContracts) {
+      seedStmt.run(entity, srcTable, `mirror_${entity}`, grain, keys);
+    }
+  }
+
   // ---- Phase 1 #1-4a: sync_runs (run ledger、miniPC 側で sync 開始記録)
   // status 遷移: started → applied (全 chunk Render から 2xx)
   //              | → failed (途中失敗、error_message に記録)

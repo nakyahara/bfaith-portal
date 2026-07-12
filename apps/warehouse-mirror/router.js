@@ -13,7 +13,7 @@
  */
 import { Router } from 'express';
 import crypto from 'crypto';
-import { initMirrorDB, getMirrorDB } from './db.js';
+import { initMirrorDB, getMirrorDB, yahooInitError } from './db.js';
 import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
 import {
   STORE_BENCH_COLS, STORE_DEVICE_BASE_COLS, STORE_DEVICE_OPT_COLS, CATEGORY_DEMO_COLS,
@@ -856,11 +856,66 @@ const RAKUTEN_DD_TABLE_SPECS = {
   },
 };
 
+// Yahoo!ストクリ統計 6種 (mall-csv-fetcher P1-Y)。楽天dd と同じ宣言生成機構を使う
+const YAHOO_DATA_TABLE_SPECS = {
+  yahoo_store_device_daily: {
+    table: 'mirror_yahoo_store_device_daily',
+    required: ['date_jst', 'device'],
+    cols: ['date_jst', 'device', 'sales_yen', 'pageviews', 'is_tax_included', 'imported_at'],
+    defaults: { is_tax_included: 1 },
+    validate: (r, HttpErrorCls) => {
+      if (!['all', 'pc', 'sp', 'app'].includes(r.device)) {
+        throw new HttpErrorCls(400, { error: 'bad_row', message: `unknown device: ${r.device}` });
+      }
+    },
+  },
+  yahoo_inflow_daily: {
+    table: 'mirror_yahoo_inflow_daily',
+    required: ['date_jst'],
+    cols: ['date_jst', 'inflow_visitors', 'purchase_visitors', 'purchase_ratio_pct',
+      'exit_visitors', 'exit_ratio_pct', 'imported_at'],
+  },
+  yahoo_user_attr_daily: {
+    table: 'mirror_yahoo_user_attr_daily',
+    required: ['date_jst', 'gender', 'age_band', 'buyer_class'],
+    cols: ['date_jst', 'gender', 'age_band', 'buyer_class', 'visitors', 'imported_at'],
+  },
+  yahoo_flash_hourly: {
+    table: 'mirror_yahoo_flash_hourly',
+    required: ['date_jst', 'hour_slot', 'device'],
+    cols: ['date_jst', 'hour_slot', 'device', 'sales_yen', 'orders', 'units', 'buyers',
+      'purchase_rate_pct', 'aov_yen', 'pageviews', 'visitors', 'avg_pages', 'is_tax_included', 'imported_at'],
+    defaults: { is_tax_included: 1 },
+    validate: (r, HttpErrorCls) => {
+      if (!['all', 'pc', 'sp', 'app'].includes(r.device)) {
+        throw new HttpErrorCls(400, { error: 'bad_row', message: `unknown device: ${r.device}` });
+      }
+    },
+  },
+  yahoo_item_daily: {
+    table: 'mirror_yahoo_item_daily',
+    required: ['date_jst', 'item_code'],
+    cols: ['date_jst', 'item_code', 'sub_code', 'raw_item_code', 'item_name',
+      'sales_yen', 'orders', 'units', 'buyers', 'avg_purchase_rate_pct', 'favorites', 'cart_adds',
+      'pv_premium_ship', 'pv_normal', 'visitors', 'category_contribution', 'is_tax_included', 'imported_at'],
+    defaults: { sub_code: '', is_tax_included: 1 },
+  },
+  yahoo_keyword_daily: {
+    table: 'mirror_yahoo_keyword_daily',
+    required: ['date_jst', 'keyword'],
+    cols: ['date_jst', 'keyword', 'rank', 'inflow', 'sales_yen', 'orders', 'units',
+      'avg_order_rate_pct', 'avg_order_aov_yen', 'avg_units_aov_yen', 'is_tax_included', 'imported_at'],
+    defaults: { is_tax_included: 1 },
+  },
+};
+// 楽天dd + Yahoo を1つのレジストリに統合 (getRakutenDdInsert/normalizeRakutenDdRow が参照)
+const DD_ALL_TABLE_SPECS = { ...RAKUTEN_DD_TABLE_SPECS, ...YAHOO_DATA_TABLE_SPECS };
+
 function getRakutenDdInsert(db, entityKey) {
   const b = getStmtBundle(db);
   const cacheKey = `ddInsert_${entityKey}`;
   if (!b[cacheKey]) {
-    const spec = RAKUTEN_DD_TABLE_SPECS[entityKey];
+    const spec = DD_ALL_TABLE_SPECS[entityKey];
     const cols = [...spec.cols, 'source_run_id', 'source_row_hash', 'synced_at'];
     b[cacheKey] = db.prepare(`INSERT OR REPLACE INTO ${spec.table}
       (${cols.join(', ')}) VALUES (${cols.map((c) => '@' + c).join(', ')})`);
@@ -869,7 +924,7 @@ function getRakutenDdInsert(db, entityKey) {
 }
 
 function normalizeRakutenDdRow(entityKey, r) {
-  const spec = RAKUTEN_DD_TABLE_SPECS[entityKey];
+  const spec = DD_ALL_TABLE_SPECS[entityKey];
   const out = {};
   for (const k of spec.required) {
     const v = r[k];
@@ -1471,6 +1526,55 @@ const ENTITY_REGISTRY = {
     getInsertStmt: (db) => getRakutenDdInsert(db, 'rakuten_genre_purchaser_snapshot'),
     normalizeRow: (r) => normalizeRakutenDdRow('rakuten_genre_purchaser_snapshot', r),
   },
+  // Yahoo!ストクリ統計 6 entity (mall-csv-fetcher P1-Y、2026-07-11)
+  yahoo_store_device_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_yahoo_store_device_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_yahoo_store_device_dates',
+    getInsertStmt: (db) => getRakutenDdInsert(db, 'yahoo_store_device_daily'),
+    normalizeRow: (r) => normalizeRakutenDdRow('yahoo_store_device_daily', r),
+  },
+  yahoo_inflow_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_yahoo_inflow_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_yahoo_inflow_dates',
+    getInsertStmt: (db) => getRakutenDdInsert(db, 'yahoo_inflow_daily'),
+    normalizeRow: (r) => normalizeRakutenDdRow('yahoo_inflow_daily', r),
+  },
+  yahoo_user_attr_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_yahoo_user_attr_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_yahoo_user_attr_dates',
+    getInsertStmt: (db) => getRakutenDdInsert(db, 'yahoo_user_attr_daily'),
+    normalizeRow: (r) => normalizeRakutenDdRow('yahoo_user_attr_daily', r),
+  },
+  yahoo_flash_hourly: {
+    contract_version: 1,
+    mirror_table: 'mirror_yahoo_flash_hourly',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_yahoo_flash_dates',
+    getInsertStmt: (db) => getRakutenDdInsert(db, 'yahoo_flash_hourly'),
+    normalizeRow: (r) => normalizeRakutenDdRow('yahoo_flash_hourly', r),
+  },
+  yahoo_item_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_yahoo_item_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_yahoo_item_dates',
+    getInsertStmt: (db) => getRakutenDdInsert(db, 'yahoo_item_daily'),
+    normalizeRow: (r) => normalizeRakutenDdRow('yahoo_item_daily', r),
+  },
+  yahoo_keyword_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_yahoo_keyword_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_yahoo_keyword_dates',
+    getInsertStmt: (db) => getRakutenDdInsert(db, 'yahoo_keyword_daily'),
+    normalizeRow: (r) => normalizeRakutenDdRow('yahoo_keyword_daily', r),
+  },
   rakuten_finance_sku_daily: {
     contract_version: 1,
     mirror_table: 'mirror_rakuten_finance_sku_daily',
@@ -1680,6 +1784,11 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
   const entityCfg = ENTITY_REGISTRY[entity];
   if (!entityCfg) {
     return res.status(400).json({ error: `unsupported entity: ${entity}` });
+  }
+  // Yahoo!表の初期化が fail-soft で失敗している場合、Yahoo entity だけ503 (原因つき)。
+  // 他モールは通常どおり動く (2026-07-12 の全停止障害の再発防御)
+  if (entity.startsWith('yahoo_') && yahooInitError) {
+    return res.status(503).json({ error: 'yahoo tables init failed', init_error: yahooInitError });
   }
   if (contract_version !== entityCfg.contract_version) {
     return res.status(400).json({
