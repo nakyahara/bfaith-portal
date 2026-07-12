@@ -1263,11 +1263,11 @@ console.log('── 対応表 1件管理 (entries/products/entry upsert/delete) 
   r = await j('/api/vendor-map/entries?supplier=9999');
   ok(r.status === 400 && r.body.error.includes('未登録'), 'entries: 未登録仕入先は400');
 
-  // 商品検索: 部分一致 (商品名/コード)、選択仕入先の商品を先頭に
+  // 商品検索: 部分一致 (商品名/コード)、選択仕入先の商品だけ返す (Codex R1 High-2)
   r = await j('/api/vendor-map/products?supplier=2&q=' + encodeURIComponent('ハンドクリーム'));
   ok(r.body.ok && r.body.rows.length === 1 && r.body.rows[0].code === 'gyoumuhandcream60-BI', 'products: 商品名の部分一致', r.body.rows);
   r = await j('/api/vendor-map/products?supplier=0002&q=0');
-  ok(r.body.ok && r.body.rows.length >= 3 && r.body.rows[0].code === 'gyoumuhandcream60-BI', 'products: 選択仕入先の商品が先頭', r.body.rows.map(x => x.code));
+  ok(r.body.ok && r.body.rows.length === 1 && r.body.rows[0].code === 'gyoumuhandcream60-BI', 'products: 他仕入先の商品は候補に出ない', r.body.rows.map(x => x.code));
   r = await j('/api/vendor-map/products?q=');
   ok(r.body.ok && r.body.rows.length === 0, 'products: 空クエリは空配列');
 
@@ -1288,6 +1288,25 @@ console.log('── 対応表 1件管理 (entries/products/entry upsert/delete) 
   ok(r.status === 400 && r.body.error.includes('未登録'), 'entry: 未登録仕入先は拒否');
   r = await jsonPost2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'cardstand-silver-r', vendor_code: 'A\nB' });
   ok(r.status === 400 && r.body.error.includes('改行'), 'entry: 先方番号の改行は拒否');
+  r = await jsonPost2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'cardstand-silver-r', vendor_code: 'x'.repeat(101) });
+  ok(r.status === 400 && r.body.error.includes('長すぎ'), 'entry: 先方番号の長さ上限 (Codex R1 Med)');
+  // 他仕入先の商品は登録拒否 (仕入先2の商品を仕入先1の対応表へ)
+  r = await jsonPost2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'gyoumuhandcream60-BI', vendor_code: 'X-1' });
+  ok(r.status === 400 && r.body.error.includes('この商品の仕入先は 2'), 'entry: 他仕入先の商品は登録拒否 (Codex R1 High)', r.body.error);
+
+  // 楽観ロック (baseUpdatedAt): 追加フォーム=null → 既存があれば409 / 古い版での保存・削除は409
+  r = await jsonPost2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'cardstand-silver-r', vendor_code: 'ZZ-DUP', baseUpdatedAt: null });
+  ok(r.status === 409 && r.body.conflict && r.body.current.vendor_code === 'ZZ-CS-2', 'entry: 追加フォームで既存商品は409+現在値', r.body);
+  const curBase = db.prepare("SELECT updated_at FROM po_vendor_code_map WHERE supplier_code='1' AND product_key='cardstand-silver-r'").get().updated_at;
+  r = await jsonPost2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'cardstand-silver-r', vendor_code: 'ZZ-CS-3', baseUpdatedAt: '2020-01-01T00:00:00.000Z' });
+  ok(r.status === 409 && r.body.conflict, 'entry: 古い版での保存は409 (他画面の変更を握り潰さない)', r.body);
+  r = await jsonPost2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'cardstand-silver-r', vendor_code: 'ZZ-CS-3', baseUpdatedAt: curBase });
+  ok(r.body.ok && r.body.updated === true, 'entry: 一致する版での保存は成功');
+  r = await j('/api/vendor-map/entry?supplier=1&product=cardstand-silver-r&base=' + encodeURIComponent(curBase), { method: 'DELETE' });
+  ok(r.status === 409 && r.body.conflict, 'entry: 古い版での削除は409', r.body);
+  // 上の保存でZZ-CS-3になった分をZZ-CS-2へ戻す (以降のプレビュー反映テストの前提を単純に保つ)
+  r = await jsonPost2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'cardstand-silver-r', vendor_code: 'ZZ-CS-2' });
+  ok(r.body.ok, 'entry: base未指定は無条件upsert (スクリプト/AI連携用)');
 
   // 編集が発注書プレビューの添付CSVへ即反映される
   r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
