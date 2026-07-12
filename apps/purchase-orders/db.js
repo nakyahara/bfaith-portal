@@ -569,7 +569,20 @@ function initLedgerSchema(db) {
   // 同一PO+同一内容の二重送信を禁止 (再送は is_resend=1 で明示。dry-runは本送信のdedupを妨げない)。
   // unknown (結果不明) も対象 — 不明のまま新規の通常送信で状態機械を迂回させない (Codex P15-R3 High)。
   // 部分インデックスの条件は定義変更があり得るため、トリガ同様に毎起動DROP→CREATEで最新定義を保証 (Codex P15-R11 High)
-  // failed も対象 (failedの再試行と新規通常送信の併存で二重送信させない。別内容で送り直す場合は failed を取消してから、Codex P15-R12 High)
+  // failed も対象 (failedの再試行と新規通常送信の併存で二重送信させない。別内容で送り直す場合は failed を取消してから、Codex P15-R12 High)。
+  // 旧定義のDBに重複グループが残っているとCREATE UNIQUEが失敗しアプリが起動不能になるため、
+  // 先に検出して対象ジョブを明示した診断エラーで止める (安全側 fail-closed、Codex P15-R13 High)
+  {
+    const dups = db.prepare(`SELECT order_id, content_hash, GROUP_CONCAT(id || ':' || status) AS jobs
+      FROM po_email_jobs
+      WHERE is_resend = 0 AND is_dry_run = 0 AND status IN ('queued','sending','sent','unknown','failed')
+      GROUP BY order_id, content_hash HAVING COUNT(*) > 1`).all();
+    if (dups.length) {
+      throw new Error(`po_email_jobs に同一内容の重複ジョブがあります (dedup強化前の残骸)。` +
+        `該当を確認し、重複側を cancelled にしてから再起動してください: ` +
+        dups.map(d => `order=${d.order_id} jobs=[${d.jobs}]`).join(' / '));
+    }
+  }
   db.exec('DROP INDEX IF EXISTS uq_po_email_dedup');
   db.exec(`CREATE UNIQUE INDEX uq_po_email_dedup ON po_email_jobs(order_id, content_hash)
            WHERE is_resend = 0 AND is_dry_run = 0 AND status IN ('queued','sending','sent','unknown','failed')`);
