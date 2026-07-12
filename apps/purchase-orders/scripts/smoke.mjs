@@ -1415,6 +1415,20 @@ console.log('── NE発注残 初期取込 (移行PO) ──');
   r = await upNe('ne1.csv', NE1, { commit: true, hash: r.body.fileHash, plan: r.body.planHash });
   ok(r.body.ok && r.body.orders === 0 && r.body.created.length === 0 && r.body.skipped.length === 2 && r.body.skipped.every(s => /^PO-/.test(s.poNumber)), '再取込: 全伝票スキップ (冪等)', r.body.skipped);
 
+  // planHashがDB由来フィールドを束縛していることの回帰テスト (プレビュー後のPML原価変更で拒否、Codex R3 Low)
+  {
+    const NE3 = [NEHDR, neRow('9200', 'deaditem', '休眠', 10, 10, '2026/7/1', '0001')];
+    r = await upNe('ne3.csv', NE3);
+    const h3 = r.body.fileHash, p3 = r.body.planHash;
+    db.prepare("UPDATE mirror_pml_snapshot_rows SET 原価=999 WHERE 商品コード='deaditem'").run();
+    r = await upNe('ne3.csv', NE3, { commit: true, hash: h3, plan: p3 });
+    ok(r.status === 400 && r.body.error.includes('変わっています'), 'プレビュー後のPML原価変更は確定拒否 (planHash束縛)', r.body.error);
+    db.prepare("UPDATE mirror_pml_snapshot_rows SET 原価=200 WHERE 商品コード='deaditem'").run();
+    r = await upNe('ne3.csv', NE3);
+    r = await upNe('ne3.csv', NE3, { commit: true, hash: r.body.fileHash, plan: r.body.planHash });
+    ok(r.body.ok && r.body.created.length === 1, '原価復元後の再プレビュー→確定は成功');
+  }
+
   // 移行POは発注提案の「発注済み」バッジ・月次上限集計を汚染しない (数量はNE注残としてPML反映済みのため)
   r = await j('/api/supplier/1');
   const afterDead = (r.body.horikoshi.find(p => p.code === 'deaditem') || {}).recentIssued || null;
