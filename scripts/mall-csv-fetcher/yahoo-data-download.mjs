@@ -148,10 +148,10 @@ async function persistCsv(buf, suggested, spec, range) {
   const p = prepareYahooFile(basename(dest), buf);
   if (!p.ok) throw new Error(`DL_VERIFY: 取込レシピを通らないCSV (${p.error})。画面仕様変更の疑い`);
   if (p.type !== spec.expectType) throw new Error(`DL_VERIFY: 期待種別 ${spec.expectType} と不一致 (${p.type})`);
-  // 商品分析JSONは meta.since を持つ = レスポンス自身の日付で検証できる
-  // (ファイル名由来の検索流入は sha 一致判定で担保。fetchOne 参照)
-  if (spec.daily && spec.hasMetaDate && p.dateFrom !== range.from) {
-    throw new Error(`DL_VERIFY: 期待日 ${range.from} と実レスポンス ${p.dateFrom} が不一致 (meta.since)`);
+  // 1日単位型の日付検証は fetchOne で済ませている (meta.since / 基準日プローブ)。
+  // ここは最終防御 — 保存直前に日付が要求と食い違っていれば取込に回さない
+  if (spec.daily && p.dateFrom !== range.from) {
+    throw new Error(`DL_VERIFY: 期待日 ${range.from} と実レスポンス ${p.dateFrom} が不一致`);
   }
   console.log(`  [verify] ${p.label} ${p.records.length}件 (${p.dateFrom}〜${p.dateTo})`);
 
@@ -196,30 +196,77 @@ const SPECS = [
     csvFileName: 'b-faith01-store_keyword.csv' },
 ];
 
-async function fetchOne(page, spec, range, seenHashes) {
+/**
+ * 1日単位型の日付検証。⭐実測 (2026-07-12): Yahoo!は未集計日を要求すると最新集計日の
+ * データを返す (クランプ)。これを「未集計 (empty、翌朝再取得で自己修復)」と
+ * 「日付パラメータが効いていない (仕様変更 = error)」に切り分ける:
+ *
+ *  - 商品分析: JSONに meta.since があり、返ってきた日が自明 → 自己検証で完結
+ *      meta.since === 要求日 → ok / < 要求日 → 未集計 (empty) / > 要求日 → error
+ *  - 検索流入: metaが無い → **基準日プローブ**: 確実に集計済みの過去日 (既定4日前) を
+ *      先に1回取得して baseline hash を作る。対象日のレスポンスが baseline と一致したら
+ *      「日付が効いていない」= error。対象日どうしの一致は「後の日が未集計」= empty。
+ *      (Codex R3 High: 1日目を無条件okにすると日付無視を検出できず、クランプ結果を
+ *       誤った日付で保存してしまう)
+ */
+const PROBE_BACK_DAYS = 4;
+function probeDate() {
+  const now = jstNow();
+  return isoDate(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - PROBE_BACK_DAYS)));
+}
+
+async function fetchOne(page, spec, range, state) {
   const rangeLabel = range ? range.from : 'default';
   console.log(`\n--- ${spec.label} ${rangeLabel} ---`);
   if (spec.daily) {
     // 画面を開いてセッション/権限を確認してから CSV を POST (画面操作は不要)
     await gotoStorePage(page, `${STORE_TOP_URL}/${spec.path}`, spec.label);
+
+    // 検索流入 (meta無し) は基準日プローブを1回だけ実行して baseline を作る
+    if (!spec.hasMetaDate && state && !state.baseline) {
+      const pd = probeDate();
+      const probeBuf = await postDailyCsv(page, spec, pd);
+      state.baseline = { date: pd, hash: createHash('sha256').update(probeBuf).digest('hex') };
+      console.log(`  [probe] 基準日 ${pd} を取得 (日付パラメータが効いているかの照合用)`);
+    }
+
     const buf = await postDailyCsv(page, spec, range.from);
-    // ⭐実測 (2026-07-12): 未集計日を要求すると Yahoo! は最新集計日のデータを返す (クランプ)。
-    // 別日で本文が完全一致 = その日はまだ未集計 → empty で正常スキップ (翌朝の再取得で埋まる)。
-    // 「日付パラメータが無視されている (仕様変更)」なら全対象日が empty になるので、
-    // main 側で「全日 empty」を異常として検出する (Codex R1 Medium の意図はそこで担保)
-    if (seenHashes) {
-      const h = createHash('sha256').update(buf).digest('hex');
-      const prev = seenHashes.get(h);
+    const h = createHash('sha256').update(buf).digest('hex');
+
+    if (!spec.hasMetaDate && state) {
+      if (state.baseline && h === state.baseline.hash && range.from !== state.baseline.date) {
+        throw new Error(`DL_VERIFY: 基準日 ${state.baseline.date} と ${range.from} のレスポンスが完全一致。日付パラメータ (${spec.csvDateKeys.join('/')}) が効いていない — 画面仕様変更の疑い`);
+      }
+      const prev = state.seen.get(h);
       if (prev && prev !== range.from) {
-        console.log(`  [skip] ${range.from} は未集計 (${prev} と同一レスポンス)。翌朝の再取得で埋まる — 正常スキップ`);
+        console.log(`  [skip] ${range.from} は未集計 (${prev} と同一レスポンス = 最新集計日にクランプ)。翌朝の再取得で埋まる — 正常スキップ`);
         await logFetch({
           report_type: spec.reportType, period_from: range.from, period_to: range.from,
-          status: 'empty', message: `未集計 (${prev} と同一レスポンス = 最新集計日にクランプ)`,
+          status: 'empty', message: `未集計 (${prev} と同一レスポンス)`,
         });
         return 'empty';
       }
-      seenHashes.set(h, range.from);
+      state.seen.set(h, range.from);
     }
+
+    // 商品分析: meta.since で自己検証 (クランプ=未集計は empty、未来日が返るのは異常)
+    if (spec.hasMetaDate) {
+      const { prepareYahooFile } = await import('../../apps/warehouse/yahoo-data-lib.js');
+      const probe = prepareYahooFile(`yahoo_${spec.key}_d${range.from}_probe.json`, buf);
+      if (!probe.ok) throw new Error(`DL_VERIFY: 取込レシピを通らないレスポンス (${probe.error})`);
+      if (probe.dateFrom < range.from) {
+        console.log(`  [skip] ${range.from} は未集計 (レスポンスの meta.since=${probe.dateFrom} にクランプ)。翌朝の再取得で埋まる — 正常スキップ`);
+        await logFetch({
+          report_type: spec.reportType, period_from: range.from, period_to: range.from,
+          status: 'empty', message: `未集計 (meta.since=${probe.dateFrom})`,
+        });
+        return 'empty';
+      }
+      if (probe.dateFrom > range.from) {
+        throw new Error(`DL_VERIFY: 要求日 ${range.from} より新しい日 (${probe.dateFrom}) が返った — 画面仕様変更の疑い`);
+      }
+    }
+
     return persistCsv(buf, spec.csvFileName, spec, range);
   }
   await gotoStorePage(page, `${STORE_TOP_URL}/${spec.path}`, spec.label);
@@ -270,13 +317,12 @@ async function main() {
 
     for (const spec of specs) {
       const ranges = spec.daily ? computeDailyTargetDates().map((d) => ({ from: d, to: d })) : [null];
-      // 同一レポートの連続対象日で本文が完全一致したら「日付パラメータが無視された」疑い
-      // (検索流入JSONは本文に日付を持たず自己検証できないため — Codex R1 Medium)
-      const seenHashes = new Map();
+      // 1日単位型の日付検証state (基準日プローブ + 対象日ハッシュ。fetchOne 参照)
+      const state = { baseline: null, seen: new Map() };
       for (const range of ranges) {
         const ymLabel = range ? range.from : 'default';
         try {
-          const status = await fetchOne(page, spec, range, seenHashes);
+          const status = await fetchOne(page, spec, range, state);
           outcomes.push({ spec: spec.key, ym: ymLabel, status });
         } catch (e) {
           console.error(`✗ ${spec.label} ${ymLabel}: ${e.message}`);
@@ -291,13 +337,13 @@ async function main() {
           break; // 同レポートの残り日はスキップ (他レポートは続行)
         }
       }
-      // 1日単位型で全対象日が empty = 日付パラメータが無視されている疑い (Codex R1 Medium)。
-      // 通常は少なくとも1日 (一昨日) は集計済みで ok になるはず
+      // 1日単位型で全対象日が empty = 一昨日すら未集計 (集計遅延) の可能性。
+      // 「日付パラメータ無視」自体は基準日プローブ/meta.since 検証が error で捕まえる
       if (spec.daily && ranges.length > 1) {
         const mine = outcomes.filter((o) => o.spec === spec.key);
         if (mine.length === ranges.length && mine.every((o) => o.status === 'empty')) {
-          const msg = `全対象日 (${ranges.map((r) => r.from).join(', ')}) が未集計扱い。日付パラメータ (${spec.csvDateKeys.join('/')}) が無視されている疑い — 画面仕様変更の可能性`;
-          console.error(`✗ ${spec.label}: ${msg}`);
+          const msg = `全対象日 (${ranges.map((r) => r.from).join(', ')}) が未集計。Yahoo!側の集計遅延の疑い (翌朝も続くなら要確認)`;
+          console.error(`⚠ ${spec.label}: ${msg}`);
           failures.push({ reportType: spec.reportType, ym: 'all', error: msg, url: page.url() });
         }
       }
