@@ -231,6 +231,21 @@ function initLedgerSchema(db) {
            BEFORE INSERT ON po_order_items
            WHEN (SELECT status FROM po_orders WHERE id = NEW.order_id) = 'issued'
            BEGIN SELECT RAISE(ABORT, 'issued order is immutable (発行済みPOへの明細追加は不可。追加発注は新規POで)'); END`);
+  // 移行PO属性の列間規則 (Codex NE取込R1 Medium-5): origin='migration' ⇔ ne_slip_number 必須 + send_blocked=1。
+  // 直接SQL・別コード経路からメール送信可能な移行POや二重カウント除外されないNE伝票POを作らせない
+  const MIG_RULES = `
+             SELECT CASE
+               WHEN NEW.origin IS NOT NULL AND NEW.origin <> 'migration'
+                 THEN RAISE(ABORT, 'migration rules: origin は NULL/migration のみ')
+               WHEN NEW.origin = 'migration' AND (NEW.ne_slip_number IS NULL OR trim(NEW.ne_slip_number) = '' OR NEW.send_blocked IS NOT 1)
+                 THEN RAISE(ABORT, 'migration rules: 移行POは ne_slip_number と send_blocked=1 が必須')
+               WHEN NEW.ne_slip_number IS NOT NULL AND NEW.origin IS NOT 'migration'
+                 THEN RAISE(ABORT, 'migration rules: ne_slip_number は移行POのみ')
+             END;`;
+  db.exec(`CREATE TRIGGER trg_po_orders_migration_attrs_ins BEFORE INSERT ON po_orders
+           BEGIN ${MIG_RULES} END`);
+  db.exec(`CREATE TRIGGER trg_po_orders_migration_attrs_upd BEFORE UPDATE OF origin, ne_slip_number, send_blocked ON po_orders
+           BEGIN ${MIG_RULES} END`);
   // disposition/next_* の列間規則 (Codex P13a-R2 Medium-1): 直接SQLでも規則違反を保存できない。
   // INSERT側も同じ規則で保護 (draft明細に不正状態を仕込んでissueで固定させない、R3 Medium-1)。
   // next_expected_qty ≤ 残数 は集計を要するためアプリ層+整合性検査で担保

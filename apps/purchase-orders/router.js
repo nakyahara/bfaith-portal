@@ -452,13 +452,19 @@ router.get('/api/backorders', (req, res) => {
 });
 
 // NE発注残CSVの初期取込 (移行PO作成)。commit='1' 以外はプレビューのみ (書込なし)。
-// 冪等性は ne_slip_number のUNIQUEで担保 (取込済み伝票はスキップ) のため Idempotency-Key は不要
+// commit時はプレビュー応答の fileHash を要求し、プレビューしたCSVと同一内容であることを検証する (別ファイル誤取込防止)。
+// 冪等性は ne_slip_number のUNIQUE+txn内スキップで担保 (取込済み伝票はスキップ) のため Idempotency-Key は不要
 router.post('/api/backorders/ne-import', upload.single('file'), (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ ok: false, error: 'ファイルがありません' });
     let buf;
     try { buf = fs.readFileSync(req.file.path); } finally { try { fs.unlinkSync(req.file.path); } catch {} }
-    const result = importNeBackorderCsv({ buffer: buf, commit: !!(req.body && req.body.commit === '1'), actor: actorOf(req) });
+    const result = importNeBackorderCsv({
+      buffer: buf,
+      commit: !!(req.body && req.body.commit === '1'),
+      expectedHash: (req.body && trimS(req.body.fileHash)) || null,
+      actor: actorOf(req),
+    });
     res.json({ ok: true, ...result });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
@@ -3858,20 +3864,30 @@ document.addEventListener('click', function(ev) {
 });
 
 // ── NE発注残の初期取込 (プレビュー → 取込実行の2段階) ──
+// プレビュー応答の fileHash を保持して確定時にサーバへ渡す (プレビュー後のファイル差し替えを検出)。
+// ファイル選択が変わったらプレビュー結果を無効化する
+var NE_IMP_HASH = null;
 function neImpPost(commit) {
   var f = document.getElementById('neImpFile').files[0];
   if (!f) { toast('CSVファイルを選んでください'); return; }
+  if (commit && !NE_IMP_HASH) { toast('先にプレビューで内容を確認してください'); return; }
   var fd = new FormData();
   fd.append('file', f);
-  if (commit) fd.append('commit', '1');
+  if (commit) { fd.append('commit', '1'); fd.append('fileHash', NE_IMP_HASH); }
   var out = document.getElementById('neImpOut');
   out.innerHTML = '<div class="muted">' + (commit ? '取込中…' : '確認中…') + '</div>';
   fetch(API + '/backorders/ne-import', { method: 'POST', body: fd }).then(function(r){ return jsonOrErr(r, commit); }).then(function(j) {
-    if (!j.ok) { out.innerHTML = '<div class="warn" style="white-space:pre-wrap">' + esc(j.error) + '</div>'; return; }
+    if (!j.ok) { NE_IMP_HASH = null; out.innerHTML = '<div class="warn" style="white-space:pre-wrap">' + esc(j.error) + '</div>'; return; }
+    if (!j.commit) NE_IMP_HASH = j.fileHash;
     var h = '';
-    if (j.commit) h += '<div><b>✅ 取り込みました</b>: 移行PO ' + j.orders + '件 / 明細 ' + j.items + ' / 残数計 ' + j.totalRemaining.toLocaleString('ja-JP') + '</div>';
-    else h += '<div><b>プレビュー</b> (まだ登録されていません): 伝票 ' + j.orders + '件 / 明細 ' + j.items + ' / 残数計 ' + j.totalRemaining.toLocaleString('ja-JP') + '</div>';
-    if (j.skipped.length) h += '<div class="muted">取込済みスキップ ' + j.skipped.length + '件: ' + esc(j.skipped.map(function(s){ return s.slip + '→' + (s.poNumber || ''); }).join(', ')) + '</div>';
+    if (j.commit) {
+      h += j.created.length
+        ? '<div><b>✅ 取り込みました</b>: 新規 ' + j.created.length + '伝票 / 明細 ' + j.items + ' / 残数計 ' + j.totalRemaining.toLocaleString('ja-JP') + (j.skipped.length ? ' / 取込済みスキップ ' + j.skipped.length + '件' : '') + '</div>'
+        : '<div><b>新規取込なし</b> (全 ' + j.skipped.length + '伝票が取込済みでした)</div>';
+    } else {
+      h += '<div><b>プレビュー</b> (まだ登録されていません): 伝票 ' + j.orders + '件 / 明細 ' + j.items + ' / 残数計 ' + j.totalRemaining.toLocaleString('ja-JP') + '</div>';
+    }
+    if (j.skipped.length) h += '<div class="muted">取込済みスキップ: ' + esc(j.skipped.map(function(s){ return s.slip + '→' + (s.poNumber || ''); }).join(', ')) + '</div>';
     if (j.slips.length) {
       h += '<table class="t" style="margin-top:6px"><tr><th>NE伝票</th><th>仕入先</th><th>NE発行日</th><th class="r">明細</th><th class="r">残数</th><th class="r">金額 (既知単価分)</th></tr>';
       j.slips.forEach(function(s) {
@@ -3885,9 +3901,13 @@ function neImpPost(commit) {
     var go = document.getElementById('neImpGo');
     if (go) go.addEventListener('click', function(){ go.disabled = true; neImpPost(true); });
     if (j.commit) load();
-  }).catch(function(e){ out.innerHTML = '<div class="warn">通信エラー: ' + esc(e.message) + (commit ? ' — 取込済み伝票は自動スキップされるため、同じCSVのまま安全に再実行できます' : '') + '</div>'; });
+  }).catch(function(e){ out.innerHTML = '<div class="warn">通信エラー: ' + esc(e.message) + (commit ? ' — 取込済み伝票は自動スキップされるため、もう一度プレビュー→取込実行しても二重登録になりません' : '') + '</div>'; });
 }
 document.getElementById('neImpPrev').addEventListener('click', function(){ neImpPost(false); });
+document.getElementById('neImpFile').addEventListener('change', function(){
+  NE_IMP_HASH = null;
+  document.getElementById('neImpOut').innerHTML = '';
+});
 load();`;
   res.send(pageShell('発注補助 — 発注残', 'backorders', body, script));
 });
