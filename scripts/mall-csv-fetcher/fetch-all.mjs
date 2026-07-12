@@ -54,7 +54,7 @@ function cleanupOldFiles() {
   const KEEP_MS = 30 * 24 * 3600 * 1000;
   const targets = [
     { dir: LOG_DIR, pattern: /\.log$/ },
-    { dir: join(__dirname, 'downloads'), pattern: /^(rpp|rdata)_/ },
+    { dir: join(__dirname, 'downloads'), pattern: /^(rpp|rdata|yahoo)_/ },
   ];
   for (const t of targets) {
     let removed = 0;
@@ -83,7 +83,11 @@ const DEFAULT_FETCHERS = [
     script: join(__dirname, 'rakuten-data-download.mjs'),
     timeoutMs: 20 * 60 * 1000,
   },
-  // { mall: 'yahoo', script: join(__dirname, 'yahoo-ads-download.mjs'), timeoutMs: 30*60*1000 }, // P1-Y (2FA検証後)
+  {
+    mall: 'yahoo', // ストクリ統計6種 (mall-csv-fetcher P1-Y)。全て同期DLなので短め
+    script: join(__dirname, 'yahoo-data-download.mjs'),
+    timeoutMs: 20 * 60 * 1000,
+  },
 ];
 // テスト用オーバーライド: MALL_FETCHERS_JSON='[{"mall":"x","script":"...","timeoutMs":1000}]'
 const FETCHERS = process.env.MALL_FETCHERS_JSON

@@ -8,16 +8,15 @@
  * 実行: HEADLESS=1 node scripts/mall-csv-fetcher/yahoo-survey.mjs
  *   env: YAHOO_STORE_ACCOUNT=b-faith01 (デフォルト)
  */
-import { chromium } from 'playwright';
 import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { openYahooContext, gotoStorePage, STORE_ACCOUNT, STORE_TOP_URL } from './lib-yahoo-login.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const OUT_DIR = join(__dirname, 'spike-output');
-const PROFILE_DIR = join(__dirname, '.profile-yahoo');
-const ACCOUNT = process.env.YAHOO_STORE_ACCOUNT || 'b-faith01';
-const TOP = `https://pro.store.yahoo.co.jp/pro.${ACCOUNT}`;
+const ACCOUNT = STORE_ACCOUNT;
+const TOP = STORE_TOP_URL;
 
 const SECTIONS = (process.env.SURVEY_SECTIONS || '販売管理,集客・販促,利用明細,評価,注文管理').split(',');
 
@@ -30,8 +29,12 @@ async function dumpPage(page, label) {
       .filter((l) => l.t && l.h && !/javascript:void/.test(l.h));
     const buttons = [...document.querySelectorAll('button, input[type=submit], input[type=button]')]
       .filter(vis).map((el) => (el.innerText || el.value || '').trim().replace(/\s+/g, ' ').slice(0, 30)).filter(Boolean);
-    return { links, buttons };
-  }).catch(() => ({ links: [], buttons: [] }));
+    const inputs = [...document.querySelectorAll('input, select')].filter(vis).map((el) => ({
+      tag: el.tagName.toLowerCase(), name: el.name || '', id: el.id || '', type: el.type || '', value: (el.value || '').slice(0, 30),
+    }));
+    return { links, buttons, inputs };
+  }).catch(() => ({ links: [], buttons: [], inputs: [] }));
+  if (info.inputs?.length) console.log(`  [inputs] ${JSON.stringify(info.inputs.slice(0, 20))}`);
   const seen = new Set();
   for (const l of info.links) {
     if (/store-info|topics|campaign\/detail|help|faq|manual|yahoo\.co\.jp\/$|business\.yahoo/.test(l.h)) continue;
@@ -48,19 +51,47 @@ async function dumpPage(page, label) {
 
 async function main() {
   await mkdir(OUT_DIR, { recursive: true });
-  const context = await chromium.launchPersistentContext(PROFILE_DIR, {
-    headless: process.env.HEADLESS !== '0',
-    locale: 'ja-JP', viewport: { width: 1400, height: 1000 }, acceptDownloads: true,
-  });
+  const context = await openYahooContext();
   const page = context.pages()[0] || await context.newPage();
   try {
-    await page.goto(TOP, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
-    await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
-    await page.waitForTimeout(2000);
-    if (!page.url().startsWith('https://pro.store.yahoo.co.jp')) {
-      console.error(`✗ ツールに到達できず: ${page.url()} (セッション切れ?)`);
+    // SURVEY_URLS=カンマ区切りの相対/絶対URL → 各ページを gotoStorePage (認証検証つき) で巡回
+    const urlList = (process.env.SURVEY_URLS || '').split(',').map((s) => s.trim()).filter(Boolean);
+    if (urlList.length) {
+      for (const u of urlList) {
+        const full = u.startsWith('http') ? u : `${TOP}/${u.replace(/^\//, '')}`;
+        try {
+          await gotoStorePage(page, full, u);
+          await page.waitForTimeout(2500);
+          const label = u.replace(/[^\w]/g, '_').slice(0, 40);
+          await dumpPage(page, label);
+          // SURVEY_DL=1: 「CSVファイルをダウンロード」リンクをクリックしてDL、保存名とヘッダを出力
+          if (process.env.SURVEY_DL === '1') {
+            const dlPromise = page.waitForEvent('download', { timeout: 60000 });
+            dlPromise.catch(() => {});
+            const link = page.locator('a', { hasText: /CSVファイルをダウンロード|全てのCSVファイルをダウンロード/ }).first();
+            if (await link.isVisible().catch(() => false)) {
+              await link.click({ timeout: 10000 }).catch((e) => console.log(`  [dl] click失敗: ${e.message.split('\n')[0]}`));
+              try {
+                const dl = await dlPromise;
+                const dest = join(OUT_DIR, `ycsv_${label}_${dl.suggestedFilename() || 'file.csv'}`);
+                await dl.saveAs(dest);
+                console.log(`  ⭐[dl] 保存: ${dest} (元名: ${dl.suggestedFilename()})`);
+              } catch {
+                console.log('  [dl] downloadイベントが来ず (非同期生成/確認ダイアログ/0件の可能性)');
+                await page.screenshot({ path: join(OUT_DIR, `ycsv_${label}_nodl.png`) }).catch(() => {});
+              }
+            } else {
+              console.log('  [dl] CSVリンクが見つからず');
+            }
+          }
+        } catch (e) {
+          console.log(`\n===== [${u}] ✗ ${e.message.split('\n')[0]}`);
+        }
+      }
       return;
     }
+
+    await gotoStorePage(page, TOP, 'top');
     await dumpPage(page, 'top');
 
     for (const section of SECTIONS) {
