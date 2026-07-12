@@ -144,12 +144,15 @@ function enrichItems(rawItems, supplierCode) {
     if (seen.has(key)) throw new Error(`商品コード重複: ${code}`);
     seen.add(key);
     if (!Number.isInteger(qty) || qty <= 0) throw new Error(`数量が不正です (${code}: ${it.qty})`);
+    // 明細単位の希望納期 (任意。空=指定なし)
+    const rd = it.requestedDate == null ? '' : trimS(it.requestedDate);
+    if (rd && !isYmd(rd)) throw new Error(`希望納期が日付 (YYYY-MM-DD) ではありません (${code}: ${it.requestedDate})`);
     const r = byKey.get(key);
     if (!r) throw new Error(`PMLに存在しない商品コード: ${code}`);
     if (normSupplierCode(r['仕入先']) !== supplierCode) {
       throw new Error(`仕入先が一致しない商品コード: ${code} (この商品の仕入先: ${r['仕入先'] || '未設定'})`);
     }
-    items.push({ code: r['商品コード'], key, name: r['商品名'] || '', qty, cost: r['原価'] == null ? null : Number(r['原価']) });
+    items.push({ code: r['商品コード'], key, name: r['商品名'] || '', qty, cost: r['原価'] == null ? null : Number(r['原価']), requestedDate: rd || null });
   }
   return { items, pmlAsOf: pub.as_of_date || null };
 }
@@ -163,13 +166,21 @@ function resolveSupplierName(supplierCode) {
 
 function insertItems(db, orderId, items, requestedDate = null) {
   // condition_id は発注時点のスナップショット。後で紐付けを変えても過去発注の月次上限カウントが動かない (Codex P8-2)
-  // requested_date もINSERT時に確定する (発行済み明細はDBトリガで不変のため後からUPDATEできない)
+  // requested_date もINSERT時に確定する (発行済み明細はDBトリガで不変のため後からUPDATEできない)。
+  // 明細単位の希望納期を優先し、無い明細のみヘッダ既定値 (旧API互換) を使う
   const condOf = db.prepare('SELECT condition_id FROM po_product_attrs WHERE product_key=?');
   const ins = db.prepare('INSERT INTO po_order_items (order_id, product_code, product_key, product_name, qty, unit_cost, condition_id, requested_date) VALUES (?,?,?,?,?,?,?,?)');
   for (const it of items) {
     const a = condOf.get(it.key);
-    ins.run(orderId, it.code, it.key, it.name, it.qty, it.cost, (a && a.condition_id) || null, requestedDate);
+    ins.run(orderId, it.code, it.key, it.name, it.qty, it.cost, (a && a.condition_id) || null, it.requestedDate || requestedDate);
   }
+}
+
+/** ヘッダに記録する希望納期: 全明細が同じ日付ならその値、混在/一部指定/全て未指定なら NULL (表示用) */
+function headerReqDate(items, defaultDate) {
+  const eff = items.map(it => it.requestedDate || defaultDate || null);
+  const first = eff[0] || null;
+  return first && eff.every(d => d === first) ? first : null;
 }
 
 function upsertDraft(supplierCode, supplierName, rawItems, note, requestedDate) {
@@ -179,20 +190,21 @@ function upsertDraft(supplierCode, supplierName, rawItems, note, requestedDate) 
     throw new Error(`希望納期が日付 (YYYY-MM-DD) ではありません: ${requestedDate}`);
   }
   const reqDate = requestedDate ? String(requestedDate) : null;
+  const hdrDate = headerReqDate(items, reqDate);
   const now = nowIso();
   return db.transaction(() => {
     let order = db.prepare("SELECT id FROM po_orders WHERE supplier_code=? AND status='draft'").get(supplierCode);
     if (!order) {
       const info = db.prepare(
         'INSERT INTO po_orders (supplier_code, supplier_name, status, note, pml_as_of_date, created_at, updated_at, requested_date) VALUES (?,?,?,?,?,?,?,?)'
-      ).run(supplierCode, supplierName, 'draft', note || null, pmlAsOf, now, now, reqDate);
+      ).run(supplierCode, supplierName, 'draft', note || null, pmlAsOf, now, now, hdrDate);
       order = { id: Number(info.lastInsertRowid) };
     } else {
       db.prepare('UPDATE po_orders SET note=?, pml_as_of_date=?, updated_at=?, supplier_name=?, requested_date=? WHERE id=?')
-        .run(note || null, pmlAsOf, now, supplierName, reqDate, order.id);
+        .run(note || null, pmlAsOf, now, supplierName, hdrDate, order.id);
     }
     db.prepare('DELETE FROM po_order_items WHERE order_id=?').run(order.id);
-    insertItems(db, order.id, items);
+    insertItems(db, order.id, items, reqDate);
     return order.id;
   })();
 }
@@ -211,6 +223,7 @@ function issueOrder(supplierCode, supplierName, rawItems, note, requestedDate) {
     throw new Error(`希望納期が日付 (YYYY-MM-DD) ではありません: ${requestedDate}`);
   }
   const reqDate = requestedDate ? String(requestedDate) : null;
+  const hdrDate = headerReqDate(items, reqDate);
   const tx = db.transaction(() => {
     const now = nowIso();
     // 移行境界の確定は発行と同一コミット (最初の発行が失敗すれば境界もロールバック)。発行時刻を共有する
@@ -224,11 +237,11 @@ function issueOrder(supplierCode, supplierName, rawItems, note, requestedDate) {
        VALUES (?,?,'draft',?,?,?,?)`
     ).run(supplierCode, supplierName, note || null, pmlAsOf, now, now);
     const id = Number(info.lastInsertRowid);
-    // 希望納期はヘッダ入力値を明細へINSERT時にスナップショット (以後ヘッダ値を継承しない、issued後は不変)
+    // 希望納期は明細単位でINSERT時にスナップショット (issued後は不変)。ヘッダは全明細同一のときのみ表示用に保持
     insertItems(db, id, items, reqDate);
     db.prepare(
       `UPDATE po_orders SET status='issued', issued_at=?, po_number=?, tracking_mode='tracked', requested_date=?, updated_at=? WHERE id=?`
-    ).run(now, poNumber, reqDate, now, id);
+    ).run(now, poNumber, hdrDate, now, id);
     return { id, poNumber };
   });
   return tx.immediate();
@@ -264,7 +277,9 @@ function supplierWorkspaceData(code) {
   const draftRow = db.prepare("SELECT id, note, requested_date FROM po_orders WHERE supplier_code=? AND status='draft'").get(code);
   const draft = draftRow ? {
     id: draftRow.id, note: draftRow.note || '', requestedDate: draftRow.requested_date || '',
-    items: db.prepare('SELECT product_code AS code, product_key AS key, product_name AS name, qty, unit_cost AS cost FROM po_order_items WHERE order_id=? ORDER BY id').all(draftRow.id),
+    // 旧形式draft (ヘッダに希望納期・明細はNULL) の互換: 明細値が無ければヘッダ値を実効値として返す (Codex 明細納期R1 High)
+    items: db.prepare('SELECT product_code AS code, product_key AS key, product_name AS name, qty, unit_cost AS cost, requested_date AS requestedDate FROM po_order_items WHERE order_id=? ORDER BY id')
+      .all(draftRow.id).map(it => ({ ...it, requestedDate: it.requestedDate || draftRow.requested_date || null })),
   } : null;
   const all = g ? [...g.targets, ...g.candidates, ...g.horikoshi] : [];
   // draft 明細のうち現在の表示リスト外の商品 (PML更新で対象外化・取扱中止化した等) も
@@ -406,8 +421,13 @@ router.post('/api/supplier/:code/issue', (req, res) => {
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ ok: false, error: '発注明細が空です' });
     // Idempotency-Key があれば再送しても同じ発注を二重作成しない (レスポンス消失・リトライ対策)。
     // payload は明細を発行処理と同じ正規化 (normProductCode) + コード/数量順の最小形に (並び順・表記差で409にしない)
-    const canonicalItems = items.map(i => ({ code: normProductCode(i && i.code), qty: Number(i && i.qty) }))
-      .sort((a, b) => a.code.localeCompare(b.code) || a.qty - b.qty);
+    // requestedDate は指定があるときだけキーを含める (未指定の発注は旧形式とハッシュ一致 = デプロイ跨ぎの再送でも409にしない)
+    const canonicalItems = items.map(i => {
+      const o = { code: normProductCode(i && i.code), qty: Number(i && i.qty) };
+      const rd = trimS(i && i.requestedDate);
+      if (rd) o.requestedDate = rd;
+      return o;
+    }).sort((a, b) => a.code.localeCompare(b.code) || a.qty - b.qty);
     const { replay, result } = withCommand(
       { idempotencyKey: trimS(req.get('Idempotency-Key')) || null, payload: { op: 'issue', code, items: canonicalItems, note: trimS(note), requestedDate: requestedDate || null } },
       () => issueOrder(code, resolveSupplierName(code), items, trimS(note), requestedDate)
@@ -2091,6 +2111,11 @@ router.get('/supplier/:code', (req, res) => {
       <span class="muted">${data.pub ? freshnessText(data.pub, data.overlay) : 'PML未同期'}</span>
       <input type="text" id="pageQ" placeholder="🔍 商品コード / 商品名で絞り込み" style="margin-left:auto;min-width:240px">
     </div>
+    <div class="toolbar" style="margin-top:6px">
+      <button data-act="save">💾 下書き保存</button>
+      <button class="pri" data-act="issue">✅ 発注確定</button>
+      <span class="fsavedInd muted"></span>
+    </div>
     <div class="sec"><h2 data-sec="targets">🔴 要発注 (<span id="cntTargets"></span>) — 発注金額の大きいグループ順。<span class="muted" style="font-weight:400">商品名クリックで詳細・◯ヶ月分計算・同グループ商品</span></h2><div class="bd" id="secTargets"></div></div>
     <div class="sec"><h2 data-sec="cands">🟡 追加発注候補 (<span id="cntCands"></span>) — 条件充足・同梱用、在庫月数が少ない順</h2><div class="bd" id="secCands"></div></div>
     <div class="sec"><h2 data-sec="hori">⚪ 掘り起こし (<span id="cntHori"></span>) — 在庫ゼロ / 販売実績なし</h2><div class="bd" id="secHori" style="display:none"></div></div>
@@ -2103,16 +2128,16 @@ router.get('/supplier/:code', (req, res) => {
         <span class="ftot" id="fTot">—</span>
         <button id="btnConds" class="fghost">📏 条件 <span id="fCond"></span></button>
         <input type="text" id="orderNote" placeholder="メモ (任意)">
-        <label class="muted" style="display:flex;align-items:center;gap:4px" title="仕入先への希望納期。確定後は発注残ページで回答納期・入荷を管理">納期 <input type="date" id="orderReqDate"></label>
-        <button id="btnSave">💾 下書き保存</button>
-        <button class="pri" id="btnIssue">✅ 発注確定</button>
-        <span id="fSaved" class="muted"></span>
+        <button data-act="save" id="btnSave">💾 下書き保存</button>
+        <button class="pri" data-act="issue" id="btnIssue">✅ 発注確定</button>
+        <span class="fsavedInd muted" id="fSaved"></span>
       </div>
     </div>`;
 
   const script = `
 var D = ${jsonEmbed(data)};
 var CART = {}; // code -> qty
+var DATES = {}; // code -> 希望納期 'YYYY-MM-DD' (未指定はキーなし=納期なし)
 var byCode = {};
 [].concat(D.targets, D.candidates, D.horikoshi, D.draftExtras || []).forEach(function(p){ byCode[p.code] = p; });
 var condById = {}; D.conditions.forEach(function(c){ condById[c.conditionId] = c; });
@@ -2139,7 +2164,10 @@ function saveDis() {
 if (D.draft && D.draft.items.length) {
   var disChanged = false;
   D.draft.items.forEach(function(it) {
-    if (byCode[it.code]) CART[it.code] = it.qty;
+    if (byCode[it.code]) {
+      CART[it.code] = it.qty;
+      if (it.requestedDate) DATES[it.code] = it.requestedDate;
+    }
     if (DIS.has(it.code)) { DIS.delete(it.code); disChanged = true; }
   });
   if (disChanged) saveDis();
@@ -2156,6 +2184,9 @@ function qtyCell(p) {
   var v = CART[p.code] || '';
   var step = p.lot > 0 ? p.lot : 1;
   return '<input type="number" min="0" step="' + step + '" data-code="' + esc(p.code) + '" value="' + v + '">';
+}
+function dateCell(p) {
+  return '<input type="date" data-date="' + esc(p.code) + '" value="' + esc(DATES[p.code] || '') + '" style="width:135px" title="この商品の希望納期 (空=指定なし)。仕入先への発注メールに載ります">';
 }
 function selBadge(p) {
   if (!p.selectableLow) return '';
@@ -2179,6 +2210,7 @@ function rowHtml(p, kind) {
     '<td class="r">' + (kind === 'hori' ? esc(p.lastPurchase || '—') : rec) + '</td>' +
     '<td class="r">' + (p.cost ? yen(p.cost) : '—') + '</td>' +
     '<td style="white-space:nowrap">' + qtyCell(p) + '<a class="copyq" data-copyq="' + esc(p.code) + '" title="クリックで発注数をコピー">📋</a></td>' +
+    '<td>' + dateCell(p) + '</td>' +
     (kind === 'tgt' ? '<td><button class="ghost" data-dis="' + esc(p.code) + '" title="このリストから非表示 (下の「非表示」から戻せます)">✕</button></td>' : '') +
     '</tr>';
 }
@@ -2193,7 +2225,7 @@ function tableHtml(list, kind) {
   var capped = !Q && data.length > LIST_CAP;
   var rows = capped ? data.slice(0, LIST_CAP) : data;
   var h7 = kind === 'hori' ? '最終仕入日' : '推奨発注';
-  var h = '<table class="t"><tr><th>商品コード</th><th>商品名</th><th class="r">在庫月数</th><th class="r">30日販売</th><th class="r">在庫+注残</th><th class="r">ロット</th><th class="r">' + h7 + '</th><th class="r">原価</th><th>発注数</th></tr>';
+  var h = '<table class="t"><tr><th>商品コード</th><th>商品名</th><th class="r">在庫月数</th><th class="r">30日販売</th><th class="r">在庫+注残</th><th class="r">ロット</th><th class="r">' + h7 + '</th><th class="r">原価</th><th>発注数</th><th>希望納期</th></tr>';
   rows.forEach(function(p){ h += rowHtml(p, kind); });
   h += '</table>';
   if (capped) h += '<div class="muted" style="padding:8px 12px">先頭 ' + LIST_CAP + ' 件を表示 (全 ' + data.length + ' 件)。上の🔍検索で全件から絞り込めます</div>';
@@ -2239,11 +2271,11 @@ function renderTargets() {
     });
     var list = order.map(function(k){ return buckets[k]; });
     list.sort(function(a, b){ return b.amt - a.amt; });
-    h = '<table class="t"><tr><th>商品コード</th><th>商品名</th><th class="r">在庫月数</th><th class="r">30日販売</th><th class="r">在庫+注残</th><th class="r">ロット</th><th class="r">推奨発注</th><th class="r">原価</th><th>発注数</th><th></th></tr>';
+    h = '<table class="t"><tr><th>商品コード</th><th>商品名</th><th class="r">在庫月数</th><th class="r">30日販売</th><th class="r">在庫+注残</th><th class="r">ロット</th><th class="r">推奨発注</th><th class="r">原価</th><th>発注数</th><th>希望納期</th><th></th></tr>';
     list.forEach(function(b) {
       b.items.sort(function(x, y){ return ((y.recQty || 0) * (y.cost || 0)) - ((x.recQty || 0) * (x.cost || 0)); });
       if (b.key.slice(0, 5) !== 'solo:') {
-        h += '<tr class="ghead"><td colspan="10"><span class="gname">' + (b.key[0] === 'm' ? '🧪 原料: ' : '📦 ') + esc(groupName(b.key)) + '</span>' +
+        h += '<tr class="ghead"><td colspan="11"><span class="gname">' + (b.key[0] === 'm' ? '🧪 原料: ' : '📦 ') + esc(groupName(b.key)) + '</span>' +
           ' <span class="muted">' + b.items.length + '商品 / 推奨計 ' + yen(b.amt) + '</span>' +
           ' <button class="ghost" data-gdis="' + esc(b.key) + '" title="このグループの商品をまとめて非表示 (下の「非表示」から戻せます)">✕ グループごと非表示</button>' +
           '<span class="ggwrap" data-gauge="' + esc(b.key) + '"></span></td></tr>';
@@ -2275,7 +2307,7 @@ function cartItems() {
   var items = [];
   Object.keys(CART).forEach(function(code){
     var q = CART[code];
-    if (q > 0 && byCode[code]) items.push({ code: code, qty: q, cost: byCode[code].cost, key: code.toLowerCase() });
+    if (q > 0 && byCode[code]) items.push({ code: code, qty: q, cost: byCode[code].cost, key: code.toLowerCase(), requestedDate: DATES[code] || null });
   });
   return items;
 }
@@ -2451,12 +2483,13 @@ function renderPanelItems(items) {
   var h;
   if (!items.length) h = '<div class="muted">発注する商品がありません。各リストの「発注数」に数量を入れてください。</div>';
   else {
-    h = '<table class="t"><tr><th>商品コード</th><th>商品名</th><th class="r">発注数</th><th class="r">金額(原価)</th><th></th></tr>';
+    h = '<table class="t"><tr><th>商品コード</th><th>商品名</th><th class="r">発注数</th><th class="r">金額(原価)</th><th>希望納期</th><th></th></tr>';
     items.forEach(function(i) {
       var p = byCode[i.code];
       var extraBadge = p.extra ? ' <span class="badge b-warn" title="現在の要発注/候補リストに出てこない商品 (下書き保存後にPMLが更新された等)。確定エラーになる場合は ✕ で外してください">リスト外</span>' : '';
       h += '<tr><td>' + esc(i.code) + '</td><td>' + esc(String(p.name || '').slice(0, 60)) + extraBadge + '</td>' +
         '<td class="r">' + i.qty.toLocaleString('ja-JP') + '</td><td class="r">' + (p.cost ? yen(i.qty * p.cost) : '—') + '</td>' +
+        '<td>' + dateCell(p) + '</td>' +
         '<td><button class="ghost" data-del="' + esc(i.code) + '">✕</button></td></tr>';
     });
     h += '</table>';
@@ -2550,12 +2583,30 @@ document.addEventListener('input', function(ev) {
   var code = ev.target.getAttribute && ev.target.getAttribute('data-code');
   if (!code) return;
   var v = parseInt(ev.target.value, 10);
-  if (!v || v <= 0) delete CART[code]; else CART[code] = v;
+  if (!v || v <= 0) { delete CART[code]; clearDate(code); } else CART[code] = v;
   // 同じ商品の入力欄がリストとアコーディオンに複数出るので、他方も同期
   document.querySelectorAll('input[data-code]').forEach(function(inp) {
     if (inp !== ev.target && inp.getAttribute('data-code') === code) inp.value = ev.target.value;
   });
   renderAll();
+});
+// カートから外れた商品の希望納期も消す (数量を入れ直したときに古い日付が黙って復活しない、Codex 明細納期R1 Medium)
+function clearDate(code) {
+  delete DATES[code];
+  document.querySelectorAll('input[data-date]').forEach(function(inp) {
+    if (inp.getAttribute('data-date') === code) inp.value = '';
+  });
+}
+// 商品ごとの希望納期 (空=指定なし)
+document.addEventListener('input', function(ev) {
+  var code = ev.target.getAttribute && ev.target.getAttribute('data-date');
+  if (!code) return;
+  var v = ev.target.value;
+  if (v) DATES[code] = v; else delete DATES[code];
+  document.querySelectorAll('input[data-date]').forEach(function(inp) {
+    if (inp !== ev.target && inp.getAttribute('data-date') === code) inp.value = v;
+  });
+  updateSavedInd();
 });
 // ◯ヶ月分シミュレーションの月数変更
 document.addEventListener('input', function(ev) {
@@ -2698,6 +2749,7 @@ document.addEventListener('click', function(ev) {
   var del = ev.target.getAttribute && ev.target.getAttribute('data-del');
   if (del) {
     delete CART[del];
+    clearDate(del);
     // querySelector の attribute selector は商品コード中の記号でこわれるので全走査で消す
     document.querySelectorAll('input[data-code]').forEach(function(inp) {
       if (inp.getAttribute('data-code') === del) inp.value = '';
@@ -2722,6 +2774,7 @@ document.addEventListener('click', function(ev) {
   if (dis) {
     DIS.set(dis, CART[dis] || 0);
     delete CART[dis];
+    clearDate(dis);
     saveDis();
     renderLists(); renderAll();
     toast(dis + ' を非表示にしました (リスト下の「非表示」から戻せます)');
@@ -2741,6 +2794,7 @@ document.addEventListener('click', function(ev) {
     members3.forEach(function(code) {
       DIS.set(code, CART[code] || 0);
       delete CART[code];
+      clearDate(code);
     });
     saveDis();
     renderLists(); renderAll();
@@ -2797,8 +2851,9 @@ document.addEventListener('click', function(ev) {
   var idc = ev.target.id || (ev.target.closest && ev.target.closest('button') && ev.target.closest('button').id);
   if (idc === 'btnItems') togglePanel('items');
   if (idc === 'btnConds') togglePanel('conds');
-  if (idc === 'btnSave') save(false);
-  if (idc === 'btnIssue') save(true);
+  var act = ev.target.getAttribute && ev.target.getAttribute('data-act');
+  if (act === 'save') save(false);
+  if (act === 'issue') save(true);
 });
 
 // 発注確定の冪等キー: ノンス (成功時に更新) + 内容ハッシュ。
@@ -2819,9 +2874,8 @@ function contentHash(s) {
 var savedState = null, savedInfo = '';
 var hasDraft = !!(D.draft && D.draft.items.length); // 空カート保存 (=削除) の確認ダイアログ用
 function payloadNow() {
-  return { items: cartItems().map(function(i){ return { code: i.code, qty: i.qty }; }),
-    note: document.getElementById('orderNote').value,
-    requestedDate: document.getElementById('orderReqDate').value || null };
+  return { items: cartItems().map(function(i){ return { code: i.code, qty: i.qty, requestedDate: i.requestedDate }; }),
+    note: document.getElementById('orderNote').value };
 }
 function cartSummary(items) {
   var totA = 0;
@@ -2829,24 +2883,25 @@ function cartSummary(items) {
   return items.length + ' SKU / 発注金額合計 ' + yen(totA);
 }
 function updateSavedInd() {
-  var el = document.getElementById('fSaved');
-  if (!el) return;
-  if (!savedState) { el.innerHTML = ''; return; }
-  el.innerHTML = JSON.stringify(payloadNow()) === savedState
-    ? savedInfo
-    : '<span class="badge b-warn">未保存の変更あり</span>';
+  var h = '';
+  if (savedState) {
+    h = JSON.stringify(payloadNow()) === savedState
+      ? savedInfo
+      : '<span class="badge b-warn">未保存の変更あり</span>';
+  }
+  document.querySelectorAll('.fsavedInd').forEach(function(el){ el.innerHTML = h; });
 }
 document.addEventListener('input', function(ev) {
-  if (ev.target.id === 'orderNote' || ev.target.id === 'orderReqDate') updateSavedInd();
+  if (ev.target.id === 'orderNote') updateSavedInd();
 });
 function save(issue) {
   var payload = payloadNow();
   var items = payload.items;
   if (issue && !items.length) { toast('発注する商品がありません'); return; }
   if (!issue && !items.length) {
-    // 空カート保存 = 下書き削除。未保存のメモ/納期を黙って消さない (Codex R2 Medium)
-    if (!hasDraft && !payload.note && !payload.requestedDate) { toast('保存する内容がありません'); return; }
-    if (!confirm('カートが空です。保存すると下書きを削除し、メモ・希望納期の入力もクリアします。よろしいですか?')) return;
+    // 空カート保存 = 下書き削除。未保存のメモを黙って消さない (Codex R2 Medium)
+    if (!hasDraft && !payload.note) { toast('保存する内容がありません'); return; }
+    if (!confirm('カートが空です。保存すると下書きを削除し、メモの入力もクリアします。よろしいですか?')) return;
   }
   if (issue) {
     var cc = condCheck();
@@ -2855,15 +2910,15 @@ function save(issue) {
       msg = '⚠️ 未達の発注条件があります:\\n・' + cc.unmet.join('\\n・') + '\\n\\nこのまま確定しますか?';
     }
     if (cc.manual.length) msg += '\\n\\n※手動確認が必要な条件: ' + cc.manual.join(' / ');
-    var reqDate = document.getElementById('orderReqDate').value;
-    msg += '\\n\\n🗓 希望納期: ' + (reqDate || '指定なし');
+    var nd = items.filter(function(i){ return i.requestedDate; }).length;
+    msg += '\\n\\n🗓 希望納期: ' + (nd ? nd + '\/' + items.length + '品目に指定あり (メールに記載されます)' : '指定なし');
     if (D.supplier.memo) msg += '\\n\\n📌 発注メモ: ' + D.supplier.memo;
     if (!confirm(msg)) return;
   }
   // 二重送信ガード (確定連打で同内容の発注が複数作られるのを防ぐ)
-  var btnI = document.getElementById('btnIssue'), btnS = document.getElementById('btnSave');
-  btnI.disabled = btnS.disabled = true;
-  var unlock = function(){ btnI.disabled = btnS.disabled = false; };
+  var actBtns = document.querySelectorAll('button[data-act]');
+  actBtns.forEach(function(b){ b.disabled = true; });
+  var unlock = function(){ actBtns.forEach(function(b){ b.disabled = false; }); };
   var url = '/apps/purchase-orders/api/supplier/' + encodeURIComponent(D.supplier.code) + (issue ? '/issue' : '/draft');
   var summary = cartSummary(items);
   // 冪等キー: 内容から決定的に導出 (通信断後に同じ内容で再確定→同じキー=二重発注しない。内容を変えれば別キー)
@@ -2878,10 +2933,10 @@ function save(issue) {
     if (issue) {
       ISSUE_NONCE = 'n' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); // 次回の意図的な同内容発注は別キーに
       showDone(j.id, j.poNumber); // CART を読むのでクリア前に
-      CART = {};
+      CART = {}; DATES = {};
       document.querySelectorAll('input[data-code]').forEach(function(inp){ inp.value = ''; });
+      document.querySelectorAll('input[data-date]').forEach(function(inp){ inp.value = ''; });
       document.getElementById('orderNote').value = '';
-      document.getElementById('orderReqDate').value = '';
       hasDraft = false; // draft は確定で消費済み
       // 確定サマリをバーに常時表示。クリア後の空状態を基準に、以後の編集は「未保存の変更あり」(Codex R2 Medium)
       savedState = JSON.stringify(payloadNow());
@@ -2890,9 +2945,8 @@ function save(issue) {
       toast('発注確定しました (' + (j.poNumber || '#' + j.id) + ' — ' + summary + ')' + (j.replay ? ' ※前回確定分を再表示 (二重発注なし)' : ''));
     }
     else if (!items.length) {
-      // draft削除APIは items 空のとき note/納期も保存しない。画面の残留入力をDBと揃えてクリア (Codex R1 Medium)
+      // draft削除APIは items 空のとき note を保存しない。画面の残留入力をDBと揃えてクリア (Codex R1 Medium)
       document.getElementById('orderNote').value = '';
-      document.getElementById('orderReqDate').value = '';
       hasDraft = false;
       savedState = null; updateSavedInd();
       toast(j.deleted ? '下書きを削除しました' : '下書きはありません (入力をクリアしました)');
@@ -2912,7 +2966,7 @@ function copyText(text, btn) {
 }
 function showDone(orderId, poNumber) {
   var items = cartItems();
-  var lines = items.map(function(i){ return i.code + '\\t' + (byCode[i.code] ? byCode[i.code].name : '') + '\\t' + i.qty; });
+  var lines = items.map(function(i){ return i.code + '\\t' + (byCode[i.code] ? byCode[i.code].name : '') + '\\t' + i.qty + '\\t' + (i.requestedDate || ''); });
   var text = lines.join('\\n');
   var area = document.getElementById('doneArea');
   var totA = 0;
@@ -2921,14 +2975,14 @@ function showDone(orderId, poNumber) {
     '<div class="tot">発注 ' + esc(poNumber || ('#' + orderId)) + ' — ' + items.length + ' SKU / 合計 ' + yen(totA) +
     ' <button class="pri" id="btnCopy">📋 リストをコピー</button> <button id="btnCsv">⬇ CSVダウンロード</button>' +
     ' <a href="/apps/purchase-orders/backorders">発注残で管理 →</a> <a href="/apps/purchase-orders/orders">履歴を見る →</a></div>' +
-    '<pre class="copy">' + esc('商品コード\\t商品名\\t数量\\n' + text) + '</pre>';
+    '<pre class="copy">' + esc('商品コード\\t商品名\\t数量\\t希望納期\\n' + text) + '</pre>';
   area.style.display = '';
   document.getElementById('btnCopy').addEventListener('click', function(){ copyText(text); });
   document.getElementById('btnCsv').addEventListener('click', function() {
-    var rows = [['商品コード', '商品名', '数量', '原価', '金額']];
+    var rows = [['商品コード', '商品名', '数量', '希望納期', '原価', '金額']];
     items.forEach(function(i) {
       var p = byCode[i.code];
-      rows.push([i.code, p ? p.name : '', i.qty, p && p.cost ? p.cost : '', p && p.cost ? Math.round(i.qty * p.cost) : '']);
+      rows.push([i.code, p ? p.name : '', i.qty, i.requestedDate || '', p && p.cost ? p.cost : '', p && p.cost ? Math.round(i.qty * p.cost) : '']);
     });
     dlCsv('発注_' + D.supplier.name + '_#' + orderId + '.csv', rows);
   });
@@ -2954,7 +3008,6 @@ document.addEventListener('input', function(ev) {
 });
 
 document.getElementById('orderNote').value = D.draft ? D.draft.note : '';
-document.getElementById('orderReqDate').value = D.draft && D.draft.requestedDate ? D.draft.requestedDate : '';
 if (D.draft) {
   // 復元した下書き = 保存済み状態として表示 (以後の変更で「未保存の変更あり」に切り替わる)
   var p0 = payloadNow();
