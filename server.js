@@ -15,6 +15,7 @@ import rankingRouter from './apps/ranking-checker/router.js';
 import { startScheduler } from './apps/ranking-checker/scheduler.js';
 import { startWarehouseHealthcheck } from './apps/warehouse/healthcheck.js';
 import { startMetrics } from './apps/observability/metrics.js';
+import { startDiskWatch } from './apps/observability/disk-watch.js';
 import { bootStart, bootEnd, bootNote, bootFail, getBootId } from './apps/observability/boot-log.js';
 import profitRouter from './apps/profit-calculator/router.js';
 import { startPriceWorker, startMaintenanceJobs } from './apps/profit-calculator/price-scheduler.js';
@@ -1299,6 +1300,9 @@ app.listen(PORT, () => {
 
   // event loop lag + heap/rss 観測
   startMetrics();
+
+  // DATA_DIR (Persistent Disk) 使用率観測 — 2026-07-12 disk full 障害の再発防止
+  startDiskWatch(DATA_DIR);
 
   // 価格改定ワーカー — 安全装置未実装のため無効化 (2026-03-30)
   // startPriceWorker();
