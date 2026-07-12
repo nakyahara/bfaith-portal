@@ -1271,6 +1271,13 @@ console.log('── 対応表 1件管理 (entries/products/entry upsert/delete) 
   r = await j('/api/vendor-map/products?q=');
   ok(r.body.ok && r.body.rows.length === 0, 'products: 空クエリは空配列');
 
+  // 仕入先未設定 (空欄) の商品は候補にも出ず登録も拒否 (Codex R2 High)
+  insRow.run('nosupplier-item', '仕入先未設定商品', '', '取扱中', 2, 10, 0, 0, 0, 100, 1.5, 500, 200, '2026-01-01', '2020-01-01');
+  r = await j('/api/vendor-map/products?supplier=1&q=nosupplier');
+  ok(r.body.ok && r.body.rows.length === 0, 'products: 仕入先未設定の商品は候補に出ない');
+  r = await jsonPost2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'nosupplier-item', vendor_code: 'X' });
+  ok(r.status === 400 && r.body.error.includes('仕入先が未設定'), 'entry: 仕入先未設定の商品は登録拒否', r.body.error);
+
   // upsert: 新規追加 (大文字入力でも product_key は正規化キーで同一商品扱い)
   r = await jsonPost2('/api/vendor-map/entry', { supplier_code: '0001', product_code: 'CARDSTAND-SILVER-R', vendor_code: 'ZZ-CS-1' });
   ok(r.body.ok && r.body.updated === false, 'entry: 新規追加', r.body);

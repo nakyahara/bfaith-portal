@@ -869,7 +869,7 @@ router.get('/api/vendor-map/products', (req, res) => {
       const code = trimS(r['商品コード']);
       if (!code) continue;
       const prodSup = normSupplierCode(r['仕入先']);
-      if (supplier && prodSup && prodSup !== supplier) continue;
+      if (supplier && prodSup !== supplier) continue; // 仕入先未設定 (空欄) の商品も候補に出さない (Codex R2 High)
       const name = r['商品名'] || '';
       if (code.toLowerCase().includes(q) || name.toLowerCase().includes(q)) hits.push({ code, name, supplier: prodSup });
     }
@@ -901,7 +901,8 @@ router.post('/api/vendor-map/entry', (req, res) => {
     const pmlRow = loadPml().rows.find(r => normProductCode(r['商品コード']) === key);
     if (!pmlRow) return res.status(400).json({ ok: false, error: `商品マスタに無い商品コードです: ${productCode} (廃番等を登録する場合はCSV取込で)` });
     const prodSup = normSupplierCode(pmlRow['仕入先']);
-    if (prodSup && prodSup !== supplier) {
+    if (!prodSup) return res.status(400).json({ ok: false, error: `この商品は商品マスタで仕入先が未設定です: ${productCode} (先に商品マスタ側を直してください)` });
+    if (prodSup !== supplier) {
       return res.status(400).json({ ok: false, error: `この商品の仕入先は ${prodSup} です (${sup.name} の対応表には登録できません)` });
     }
     let out = null;
@@ -4194,9 +4195,9 @@ function renderVmap(sups, counts, rows) {
   document.getElementById('vmNewProd').addEventListener('input', function(ev) {
     var v = ev.target.value.trim();
     if (vmDeb) clearTimeout(vmDeb);
+    var g = ++vmQGen; // 早期return (入力消去・候補選択) でも世代を進め、送信済み要求の遅延応答を無効化する (Codex R2 Low)
     if (v.length < 2 || v.indexOf(' — ') >= 0) return; // 候補選択後は再検索しない
     vmDeb = setTimeout(function() {
-      var g = ++vmQGen;
       fetch(API_EM + '/vendor-map/products?supplier=' + encodeURIComponent(VM_SUP) + '&q=' + encodeURIComponent(v))
         .then(function(r){ return r.json(); }).then(function(j) {
           if (!j.ok || g !== vmQGen) return;
