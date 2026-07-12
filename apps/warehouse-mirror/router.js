@@ -27,6 +27,10 @@ const router = Router();
 
 // DB初期化
 let dbReady = false;
+// 初期化失敗の理由。⚠️ここが落ちると mirror 全体が 503 になり、全モールの sync と
+// 分析アプリが停止する (2026-07-12 に実際に発生)。当時は理由が応答に出ず、Render の
+// ログを見ないと切り分けできなかった → 503 応答に原因を載せて自己診断できるようにする
+let initError = null;
 bootStart('mirror-db', 'warehouse-mirror.db');
 (async () => {
   try {
@@ -34,13 +38,18 @@ bootStart('mirror-db', 'warehouse-mirror.db');
     dbReady = true;
     bootEnd('mirror-db', 'warehouse-mirror.db');
   } catch (e) {
+    initError = {
+      message: String(e.message || e),
+      code: e.code || null,
+      at: String(e.stack || '').split('\n').slice(0, 3).join(' | '),
+    };
     bootFail('mirror-db', 'warehouse-mirror.db', e);
     console.error('[Mirror] DB初期化失敗:', e.message);
   }
 })();
 
 function ensureDB(req, res, next) {
-  if (!dbReady) return res.status(503).json({ error: 'mirror DB 未初期化' });
+  if (!dbReady) return res.status(503).json({ error: 'mirror DB 未初期化', init_error: initError });
   next();
 }
 
