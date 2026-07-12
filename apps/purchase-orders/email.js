@@ -287,15 +287,19 @@ export async function processEmailJob(jobId) {
   // 「reconcileが sending を stale (10分) と判定 → unknown → markUnsent」なので、
   // SEND_FENCE_MS(5分) < STALE(10分) の不変条件により、旧プロセスが長時間停止から復帰しても
   // 新世代の開始後に旧世代が実送信することはない (check-then-act の隙を時間軸で閉じる)
+  // フェンス時刻は永続化済みの sending_started_at を使う (プロセスローカル時刻はVM停止に弱い)。
+  // ⚠️ 残余リスク (Codex P15-R16 で「クライアント側では厳密閉鎖不可」と確認済み):
+  //   verifyFresh成功〜fetch開始の命令間でプロセスが15分以上停止し、復帰直後にfetchが飛ぶケースは
+  //   原理的に閉じられない (Gmail APIに条件付き送信がないため)。markUnsent側の15分フェンスと合わせ、
+  //   実務上の窓は命令レベルまで縮小済み。運用: デプロイ直後は「照合」で状態確認してから操作する
   const SEND_FENCE_MS = 5 * 60000;
-  const leaseStart = Date.now();
   const verifyFresh = () => {
-    if (Date.now() - leaseStart > SEND_FENCE_MS) {
-      throw new Error('lease期限 (5分) を超えたため送信を中止しました。「照合」で状態を確認してください');
-    }
-    const cur = db.prepare('SELECT status, generation FROM po_email_jobs WHERE id=?').get(jobId);
+    const cur = db.prepare('SELECT status, generation, sending_started_at FROM po_email_jobs WHERE id=?').get(jobId);
     if (!cur || cur.status !== 'sending' || cur.generation !== gen) {
       throw new Error('世代交代を検知したため送信を中止しました (別の試行が進行中)');
+    }
+    if (!cur.sending_started_at || Date.now() - Date.parse(cur.sending_started_at) > SEND_FENCE_MS) {
+      throw new Error('lease期限 (5分) を超えたため送信を中止しました。「照合」で状態を確認してください');
     }
   };
   let phase = 'pre';
@@ -389,6 +393,11 @@ export function markUnsent(jobId, { actor = null } = {}) {
     const job = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(jobId);
     if (!job) throw new Error(`ジョブが存在しません: ${jobId}`);
     if (job.status !== 'unknown') throw new Error('「未送信を確認した」は結果不明 (unknown) のジョブにのみ使えます');
+    // 15分フェンス: 送信フェンス(5分)+fetchタイムアウト(30秒)より十分後まで待たせる
+    // (停止中の旧送信プロセスが残っている間に新世代を作らせない。SEND_FENCE < STALE(10分) < ここ(15分) の順序が不変条件)
+    if (job.sending_started_at && Date.now() - Date.parse(job.sending_started_at) < 15 * 60000) {
+      throw new Error('送信試行から15分経過するまで「未送信を確認した」は実行できません (停止中の旧送信が残っている可能性があるため)。時間を置いて再度「照合」してください');
+    }
     db.prepare("UPDATE po_email_jobs SET status='queued', attempt_count=0, generation=generation+1, error='人間確認: Gmail送信済みに存在しない → 再試行可' WHERE id=?").run(jobId);
     audit(db, { actorType: 'user', actor, action: 'email_marked_unsent', resource: `order:${job.order_id}`,
       detail: { jobId, deliveryKey: job.delivery_key, attemptReset: job.attempt_count } });

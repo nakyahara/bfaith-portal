@@ -1106,6 +1106,10 @@ console.log('── P15: メール送信 (fake transport) ──');
   // ※このジョブはresendなのでdedup対象外 → 通常送信ジョブのunknownで検証する
   r = await jsonPost('/api/email-jobs/' + unknownJobId + '/mark-unsent', {});
   ok(r.status === 400, 'mark-unsentは確認文字列必須');
+  // 15分フェンス: 送信試行直後は未送信宣言できない (停止中の旧送信の可能性)
+  r = await jsonPost('/api/email-jobs/' + unknownJobId + '/mark-unsent', { confirm: '未送信' });
+  ok(r.status === 400 && r.body.error.includes('15分'), 'mark-unsent: 送信試行15分以内は拒否 (Codex P15 R16)', r.body.error);
+  db.prepare("UPDATE po_email_jobs SET sending_started_at='2020-01-01T00:00:00.000Z' WHERE id=?").run(unknownJobId);
   r = await jsonPost('/api/email-jobs/' + unknownJobId + '/mark-unsent', { confirm: '未送信' });
   ok(r.body.ok && r.body.status === 'queued', '人間確認後にqueuedへ');
   ok(db.prepare('SELECT attempt_count FROM po_email_jobs WHERE id=?').get(unknownJobId).attempt_count === 0,
