@@ -27,6 +27,11 @@ export let yahooInitError = null;
 
 export function initMirrorDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  // リトライ再入時 (2026-07-12 障害対応: 一過性失敗の自己回復) に前のハンドルを
+  // リーク・ロック残置しないよう閉じてから開き直す
+  if (db) { try { db.close(); } catch { /* close済み等は無視 */ } db = null; }
+  // fail-soft系のエラーもリトライごとにリセット (成功すれば null のまま)
+  yahooInitError = null;
   db = new Database(DB_FILE);
   // PRAGMA は接続単位の設定。SQLite のデフォルトは foreign_keys=OFF / recursive_triggers=OFF なので、
   // f_mis_shipments の FK 制約 と append-only trigger を機能させるために毎接続で明示する必要がある。
