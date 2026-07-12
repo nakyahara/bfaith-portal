@@ -132,10 +132,11 @@ async function clickCsvDownload(page) {
 
 /** DL結果 (Buffer) を downloads/ 保存 → レシピ検証 → incoming 投入 */
 async function persistCsv(buf, suggested, spec, range) {
-  const ts = new Date().toISOString().replace(/[:.]/g, '').replace('Z', '');
-  // 1日単位型はJSON + ファイル名に対象日を埋める (取込側 dateFromFileName との契約。
-  // 商品分析は meta.since を持つが、検索流入JSONは meta が無いためファイル名が唯一の日付源)
-  const dateTag = spec.daily ? `${range.from}_` : '';
+  // 実行タイムスタンプは日付マーカーと混同されないよう区切り無しの compact 形式にする
+  const ts = new Date().toISOString().replace(/[-:.]/g, '').replace('Z', '');
+  // 1日単位型はJSON + ファイル名に対象日を `_d<YYYY-MM-DD>_` で埋める (取込側 dateFromFileName
+  // との契約。商品分析は meta.since を持つが、検索流入JSONは meta が無くファイル名が唯一の日付源)
+  const dateTag = spec.daily ? `d${range.from}_` : '';
   const ext = spec.daily ? 'json' : 'csv';
   const dest = join(DL_DIR, `yahoo_${spec.key}_${dateTag}${ts}.${ext}`);
   await writeFile(dest, buf);
@@ -147,8 +148,10 @@ async function persistCsv(buf, suggested, spec, range) {
   const p = prepareYahooFile(basename(dest), buf);
   if (!p.ok) throw new Error(`DL_VERIFY: 取込レシピを通らないCSV (${p.error})。画面仕様変更の疑い`);
   if (p.type !== spec.expectType) throw new Error(`DL_VERIFY: 期待種別 ${spec.expectType} と不一致 (${p.type})`);
-  if (spec.daily && p.dateFrom !== range.from) {
-    throw new Error(`DL_VERIFY: 期待日 ${range.from} と実CSV ${p.dateFrom} が不一致`);
+  // 商品分析JSONは meta.since を持つ = レスポンス自身の日付で検証できる
+  // (ファイル名由来の検索流入は sha 一致判定で担保。fetchOne 参照)
+  if (spec.daily && spec.hasMetaDate && p.dateFrom !== range.from) {
+    throw new Error(`DL_VERIFY: 期待日 ${range.from} と実レスポンス ${p.dateFrom} が不一致 (meta.since)`);
   }
   console.log(`  [verify] ${p.label} ${p.records.length}件 (${p.dateFrom}〜${p.dateTo})`);
 
@@ -184,7 +187,8 @@ const SPECS = [
     reportType: 'ydata_item_daily', expectType: 'yahoo_item_daily', daily: true,
     csvQuery: 'itemReportCsv', csvDateKeys: ['dateFrom', 'dateTo'],
     csvBody: { category: '1', span: 'daily', selectedWeeklyDateTo: '', selectedMonthlyDateTo: '' },
-    csvFileName: 'b-faith01-item_report.csv' },
+    csvFileName: 'b-faith01-item_report.csv',
+    hasMetaDate: true }, // JSONに meta.since がある = レスポンス自身で日付検証できる
   { key: 'keyword', label: '検索流入 (KW×日次)', path: 'sales_manage/keyword_report',
     reportType: 'ydata_keyword_daily', expectType: 'yahoo_keyword_daily', daily: true,
     csvQuery: 'keywordReportCsv', csvDateKeys: ['since', 'until'],
@@ -199,12 +203,20 @@ async function fetchOne(page, spec, range, seenHashes) {
     // 画面を開いてセッション/権限を確認してから CSV を POST (画面操作は不要)
     await gotoStorePage(page, `${STORE_TOP_URL}/${spec.path}`, spec.label);
     const buf = await postDailyCsv(page, spec, range.from);
-    // 日付パラメータ無視の検出 (Codex R1 Medium): 別日で本文が完全一致 = 同じデータが返っている
+    // ⭐実測 (2026-07-12): 未集計日を要求すると Yahoo! は最新集計日のデータを返す (クランプ)。
+    // 別日で本文が完全一致 = その日はまだ未集計 → empty で正常スキップ (翌朝の再取得で埋まる)。
+    // 「日付パラメータが無視されている (仕様変更)」なら全対象日が empty になるので、
+    // main 側で「全日 empty」を異常として検出する (Codex R1 Medium の意図はそこで担保)
     if (seenHashes) {
       const h = createHash('sha256').update(buf).digest('hex');
       const prev = seenHashes.get(h);
       if (prev && prev !== range.from) {
-        throw new Error(`DL_VERIFY: ${prev} と ${range.from} のレスポンスが完全一致。日付パラメータ (${spec.csvDateKeys.join('/')}) が無視されている疑い — 画面仕様変更の可能性`);
+        console.log(`  [skip] ${range.from} は未集計 (${prev} と同一レスポンス)。翌朝の再取得で埋まる — 正常スキップ`);
+        await logFetch({
+          report_type: spec.reportType, period_from: range.from, period_to: range.from,
+          status: 'empty', message: `未集計 (${prev} と同一レスポンス = 最新集計日にクランプ)`,
+        });
+        return 'empty';
       }
       seenHashes.set(h, range.from);
     }
@@ -277,6 +289,16 @@ async function main() {
           failures.push({ reportType: spec.reportType, ym: ymLabel, error: e.message, url: page.url(), screenshot: join(OUT_DIR, `ydata_${spec.key}_${ymLabel}_error.png`) });
           if (String(e.message).startsWith('2FA_REQUIRED')) throw e;
           break; // 同レポートの残り日はスキップ (他レポートは続行)
+        }
+      }
+      // 1日単位型で全対象日が empty = 日付パラメータが無視されている疑い (Codex R1 Medium)。
+      // 通常は少なくとも1日 (一昨日) は集計済みで ok になるはず
+      if (spec.daily && ranges.length > 1) {
+        const mine = outcomes.filter((o) => o.spec === spec.key);
+        if (mine.length === ranges.length && mine.every((o) => o.status === 'empty')) {
+          const msg = `全対象日 (${ranges.map((r) => r.from).join(', ')}) が未集計扱い。日付パラメータ (${spec.csvDateKeys.join('/')}) が無視されている疑い — 画面仕様変更の可能性`;
+          console.error(`✗ ${spec.label}: ${msg}`);
+          failures.push({ reportType: spec.reportType, ym: 'all', error: msg, url: page.url() });
         }
       }
     }

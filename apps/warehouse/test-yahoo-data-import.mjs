@@ -29,6 +29,7 @@ ensureYahooDataTables(db);
 const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
 const sjis = (s) => iconv.encode(s, 'Shift_JIS');
 const jsonBuf = (o) => Buffer.from(JSON.stringify(o), 'utf8');
+const CRLF = String.fromCharCode(13, 10);
 
 console.log('=== 1. 全体分析 (日次×デバイス → 縦持ち) ===');
 {
@@ -113,7 +114,7 @@ console.log('=== 5. 商品分析JSON (meta.since=日付、sub=code=total正規�
     ],
   };
   const buf = jsonBuf(j);
-  const r = importYahooFile(db, { name: 'yahoo_item_2026-07-09_x.json', buffer: buf, sha256: sha(buf), source: 'test' });
+  const r = importYahooFile(db, { name: 'yahoo_item_d2026-07-09_x.json', buffer: buf, sha256: sha(buf), source: 'test' });
   check('JSON取込ok', r.status === 'ok', JSON.stringify(r.results));
   const rows = db.prepare(`SELECT * FROM fact_yahoo_item_daily ORDER BY item_code`).all();
   check('2行', rows.length === 2, `got ${rows.length}`);
@@ -138,7 +139,7 @@ console.log('=== 6. 検索流入JSON (配列、日付はファイル名) ===');
       orderRate: '0.0', orderUnitPrice: '-', orderProductPrice: '-' },
   ];
   const buf = jsonBuf(arr);
-  const r = importYahooFile(db, { name: 'yahoo_keyword_2026-07-09_x.json', buffer: buf, sha256: sha(buf), source: 'test' });
+  const r = importYahooFile(db, { name: 'yahoo_keyword_d2026-07-09_x.json', buffer: buf, sha256: sha(buf), source: 'test' });
   check('JSON取込ok', r.status === 'ok', JSON.stringify(r.results));
   const rows = db.prepare(`SELECT * FROM fact_yahoo_keyword_daily ORDER BY rank`).all();
   check('2語', rows.length === 2, `got ${rows.length}`);
@@ -165,7 +166,7 @@ console.log('=== 8. 再取込 (値変動) = UPSERT 上書き ===');
   const arr = [{ keyword: 'ハッカ油', pv: '99', pvRank: '1', gmv: '9999', orderCount: '3', orderQuantity: '3',
     orderRate: '9.9', orderUnitPrice: '3333', orderProductPrice: '3333' }];
   const buf = jsonBuf(arr);
-  const r = importYahooFile(db, { name: 'yahoo_keyword_2026-07-09_v2.json', buffer: buf, sha256: sha(buf), source: 'test' });
+  const r = importYahooFile(db, { name: 'yahoo_keyword_d2026-07-09_v2.json', buffer: buf, sha256: sha(buf), source: 'test' });
   check('再取込ok', r.status === 'ok');
   check('updatedカウント', r.results[0].updated === 1 && r.results[0].inserted === 0, JSON.stringify(r.results[0]));
   const row = db.prepare(`SELECT * FROM fact_yahoo_keyword_daily WHERE date_jst='2026-07-09' AND keyword='ハッカ油'`).get();
@@ -179,21 +180,32 @@ console.log('=== 8b. 同一内容・別日のJSONは両方取り込める (Codex
   const arr = [{ keyword: '同一内容KW', pv: '5', pvRank: '1', gmv: '0', orderCount: '0', orderQuantity: '0',
     orderRate: '0.0', orderUnitPrice: '-', orderProductPrice: '-' }];
   const buf = jsonBuf(arr);
-  const r1 = importYahooFile(db, { name: 'yahoo_keyword_2026-06-01_x.json', buffer: buf, sha256: sha(buf), source: 'test' });
-  const r2 = importYahooFile(db, { name: 'yahoo_keyword_2026-06-02_x.json', buffer: buf, sha256: sha(buf), source: 'test' });
+  const r1 = importYahooFile(db, { name: 'yahoo_keyword_d2026-06-01_x.json', buffer: buf, sha256: sha(buf), source: 'test' });
+  const r2 = importYahooFile(db, { name: 'yahoo_keyword_d2026-06-02_x.json', buffer: buf, sha256: sha(buf), source: 'test' });
   check('6/1 取込ok', r1.status === 'ok', r1.status);
   check('同一sha256でも別日なら取込ok (duplicate扱いしない)', r2.status === 'ok', r2.status);
   const days = db.prepare(`SELECT DISTINCT date_jst FROM fact_yahoo_keyword_daily WHERE keyword='同一内容KW' ORDER BY date_jst`).all().map(x => x.date_jst);
   check('2日分が保存される', JSON.stringify(days) === JSON.stringify(['2026-06-01', '2026-06-02']), JSON.stringify(days));
-  const r3 = importYahooFile(db, { name: 'yahoo_keyword_2026-06-01_again.json', buffer: buf, sha256: sha(buf), source: 'test' });
+  const r3 = importYahooFile(db, { name: 'yahoo_keyword_d2026-06-01_again.json', buffer: buf, sha256: sha(buf), source: 'test' });
   check('同一sha256+同一日は duplicate', r3.status === 'duplicate', r3.status);
 }
 
 console.log('=== 8c. ファイル名の不正日付は拒否 (Codex R1 Low) ===');
 {
   const buf = jsonBuf([{ keyword: 'x', pv: '1', pvRank: '1', gmv: '0', orderCount: '0', orderQuantity: '0', orderRate: '0', orderUnitPrice: '-', orderProductPrice: '-' }]);
-  const p = prepareYahooFile('yahoo_keyword_2026-99-99_x.json', buf);
+  const p = prepareYahooFile('yahoo_keyword_d2026-99-99_x.json', buf);
   check('存在しない日付 → error', !p.ok && /ファイル名から対象日/.test(p.error), p.error);
+}
+
+console.log('=== 8d. 一括型は実行日が変わっても sha256 のみで冪等 (Codex R2 High) ===');
+{
+  const header = '日付,流入全体（訪問者数）_合算値,自ストア購入（訪問者数）_合算値,自ストア購入（構成比）_合算値,離脱全体（訪問者数）_合算値,離脱全体（構成比）_合算値';
+  const csv = sjis(header + CRLF + '2026/05/01,100,10,10.0,90,90.0');
+  const r1 = importYahooFile(db, { name: 'yahoo_inflow_20260711T010101.csv', buffer: csv, sha256: sha(csv), source: 'test' });
+  check('1回目ok', r1.status === 'ok', r1.status);
+  // 翌日の実行 (ファイル名のタイムスタンプだけ違う) は同一内容なので duplicate であるべき
+  const r2 = importYahooFile(db, { name: 'yahoo_inflow_20260712T020202.csv', buffer: csv, sha256: sha(csv), source: 'test' });
+  check('翌日実行でも duplicate (タイムスタンプを日付と誤認しない)', r2.status === 'duplicate', r2.status);
 }
 
 console.log('=== 9. 取込ログ ===');

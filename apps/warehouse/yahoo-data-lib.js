@@ -144,13 +144,14 @@ function dupGuard(name, type, records, keyFn, keyLabel) {
 }
 /** 期間集計型CSVの対象日はファイル名から取る (yahoo_item_2026-07-10_... / *_20260710_*)。
  *  DL側が命名する契約。取れなければエラー (黙って当日扱いしない) */
+/** 1日単位型 (商品分析/検索流入) の対象日をファイル名から取る。
+ *  DL側の命名契約: yahoo_<key>_d<YYYY-MM-DD>_<timestamp>.json — 日付は `d` プレフィクス付き。
+ *  ⭐マーカーなしで最初の日付らしき文字列を拾うと、ファイル名末尾の実行タイムスタンプ
+ *  (2026-07-11T...) を対象日と誤認し、一括型の冪等キーまで壊れる (Codex R2 High)。 */
 function dateFromFileName(name) {
-  // 実在日検証を通す (2026-99-99 のような不正日付を弾く — Codex Low)
-  let m = name.match(/(\d{4})-(\d{2})-(\d{2})/);
-  if (m) return normalizeDate(`${m[1]}-${m[2]}-${m[3]}`);
-  m = name.match(/(\d{4})(\d{2})(\d{2})/);
-  if (m) return normalizeDate(`${m[1]}${m[2]}${m[3]}`);
-  return null;
+  const m = name.match(/_d(\d{4}-\d{2}-\d{2})_/);
+  if (!m) return null;
+  return normalizeDate(m[1]); // 実在日検証 (2026-99-99 等を弾く — Codex R1 Low)
 }
 
 // ─── レシピ1: 全体分析 (日次×デバイス → 縦持ち) ───
