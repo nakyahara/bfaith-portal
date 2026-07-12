@@ -833,6 +833,34 @@ console.log('── P13b: 発注残ページ+消込API ──');
   const draftRow = db.prepare("SELECT requested_date FROM po_orders WHERE status='draft' AND supplier_code='1'").get();
   ok(r.body.ok && draftRow && draftRow.requested_date === '2026-08-15', '下書き保存で希望納期も保持 (Codex P13b R3)');
 
+  // 明細単位の希望納期 (下書き): item.requestedDate が明細に保存され、混在ならヘッダはNULL
+  r = await j('/api/supplier/1/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 1, requestedDate: '2026-09-01' }, { code: 'cardstand-silver-r', qty: 2 }], note: 'd2' }) });
+  {
+    const dHdr = db.prepare("SELECT id, requested_date FROM po_orders WHERE status='draft' AND supplier_code='1'").get();
+    const dIts = db.prepare('SELECT product_code, requested_date FROM po_order_items WHERE order_id=? ORDER BY id').all(dHdr.id);
+    ok(r.body.ok && dIts[0].requested_date === '2026-09-01' && dIts[1].requested_date == null, '下書きに明細単位の希望納期を保存 (未指定はNULL)');
+    ok(dHdr.requested_date == null, '明細納期が混在/一部指定ならヘッダはNULL');
+  }
+  r = await j('/api/supplier/1/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 1, requestedDate: '2026-09-31' }] }) });
+  ok(r.status === 400, '明細希望納期の実在しない日付は400');
+  // ヘッダ既定値互換のdraftへ戻す
+  await j('/api/supplier/1/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 1 }], note: 'd', requestedDate: '2026-08-15' }) });
+  {
+    const dIt = db.prepare("SELECT i.requested_date FROM po_order_items i JOIN po_orders o ON o.id=i.order_id WHERE o.status='draft' AND o.supplier_code='1'").get();
+    ok(dIt && dIt.requested_date === '2026-08-15', 'ヘッダ希望納期は明細の既定値として保存 (旧API互換)');
+  }
+
+  // 旧形式draft互換 (ヘッダ日付あり+明細NULL): 復元時の実効希望納期はヘッダ値 (Codex 明細納期R1 High)
+  {
+    const dHdr = db.prepare("SELECT id FROM po_orders WHERE status='draft' AND supplier_code='1'").get();
+    db.prepare('UPDATE po_order_items SET requested_date=NULL WHERE order_id=?').run(dHdr.id);
+    const supHtml = await (await fetch(base + '/supplier/1')).text();
+    ok(supHtml.includes('2026-08-15'), '旧形式draft (明細NULL) はヘッダ希望納期を実効値として復元', supHtml.includes('requestedDate'));
+  }
+
   // 空カート保存 = draft削除。deleted は実削除時のみ true (draftなしでの入力クリア誤発火防止)
   const emptyPost = () => j('/api/supplier/1/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ items: [] }) });
@@ -856,7 +884,9 @@ console.log('── P13b: 発注残ページ+消込API ──');
     // 発注確定の冪等キー (供給ページ): ノンス+内容ハッシュ
     const sup = await (await fetch(base + '/supplier/1')).text();
     ok(sup.includes('ISSUE_NONCE') && sup.includes('contentHash') && sup.includes('Idempotency-Key'), '/supplier 発注確定に冪等キー (ノンス+内容ハッシュ)');
-    ok(sup.includes('orderReqDate'), '/supplier 希望納期入力');
+    ok(sup.includes('data-date=') && sup.includes('希望納期'), '/supplier 商品ごとの希望納期入力');
+    ok(!sup.includes('orderReqDate'), '/supplier ヘッダ一括納期入力は廃止');
+    ok(sup.includes('data-act="save"') && sup.includes('data-act="issue"'), '/supplier 保存/確定ボタン (上下2箇所)');
     ok(sup.includes('fSaved') && sup.includes('未保存の変更あり') && sup.includes('発注金額合計'), '/supplier 保存済みインジケータ (SKU数+発注金額合計)');
     const dash = await (await fetch(base + '/')).text();
     ok(dash.includes('発注残') && dash.includes('/apps/purchase-orders/backorders'), '/ ダッシュボードに発注残サマリ');
@@ -1071,6 +1101,29 @@ console.log('── P15: メール送信 (fake transport) ──');
     ok(!r.body.body.includes('希望納期'), 'preview: {{nouki}}なしテンプレ+納期未指定なら追記しない');
     r = await jsonPost('/api/email/settings', { bodyTpl: '' }); // 既定テンプレに戻す
     ok(r.body.ok, '本文テンプレを既定に戻す');
+  }
+
+  // 商品ごとに異なる希望納期 → ヘッダNULL・本文は個別案内・添付CSVに希望納期列
+  {
+    r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: [
+        { code: 'noflyersticker', qty: 2, requestedDate: '2026-08-10' },
+        { code: 'cardstand-silver-r', qty: 3, requestedDate: '2026-08-20' },
+      ] }) });
+    const mixedId = r.body.id;
+    ok(r.body.ok && db.prepare('SELECT requested_date FROM po_orders WHERE id=?').get(mixedId).requested_date == null, 'issue: 明細納期が混在ならヘッダNULL');
+    const its = db.prepare('SELECT requested_date FROM po_order_items WHERE order_id=? ORDER BY id').all(mixedId);
+    ok(its[0].requested_date === '2026-08-10' && its[1].requested_date === '2026-08-20', 'issue: 明細単位の希望納期を保存');
+    r = await j('/api/orders/' + mixedId + '/email/preview');
+    ok(r.body.ok && r.body.body.includes('商品ごとに指定'), 'preview: 混在納期は個別案内', r.body.body.split('\n').find(l => l.includes('希望納期')));
+    ok(r.body.csvText.includes('希望納期') && r.body.csvText.includes('2026/08/10') && r.body.csvText.includes('2026/08/20'), 'preview: 添付CSVに希望納期列', r.body.csvText.split('\r\n')[0]);
+    // 納期なしの発注 (noDateId 相当) のCSVには希望納期列を追加しない
+    r = await j('/api/orders/' + emOrderId + '/email/preview');
+    ok(r.body.ok && r.body.csvText.includes('希望納期') && r.body.csvText.includes('2026/07/30'), 'preview: 全明細同一納期でもCSVに列あり+本文は日付', r.body.csvText.split('\r\n')[1]);
+    // 明細納期が不正なら400
+    r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 1, requestedDate: '2026/08/10' }] }) });
+    ok(r.status === 400, 'issue: 明細希望納期の形式不正は400');
   }
 
   // 冪等キーなしの送信は拒否 (再送はdedup対象外のためキーが唯一の再実行ガード)
