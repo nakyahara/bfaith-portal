@@ -839,6 +839,127 @@ router.get('/api/vendor-map', (req, res) => {
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
+// ─── 対応表の1件管理 (マスタ管理「先方番号対応表」タブ。CSV全置換と違い1商品ずつ追加・修正できる) ───
+
+// 一覧 (商品名はPMLから解決。廃番等でPMLに無い商品は名前空欄のまま表示)
+router.get('/api/vendor-map/entries', (req, res) => {
+  try {
+    const db = getDB();
+    const supplier = normSupplierCode(req.query.supplier);
+    if (!supplier) return res.status(400).json({ ok: false, error: '仕入先コードが必要です' });
+    const sup = db.prepare('SELECT name FROM po_suppliers WHERE supplier_code=?').get(supplier);
+    if (!sup) return res.status(400).json({ ok: false, error: `仕入先が未登録です: ${supplier}` });
+    const nameByKey = new Map();
+    for (const r of loadPml().rows) nameByKey.set(normProductCode(r['商品コード']), r['商品名'] || '');
+    const rows = db.prepare('SELECT product_code, product_key, vendor_code, updated_at FROM po_vendor_code_map WHERE supplier_code=? ORDER BY product_code')
+      .all(supplier).map(r => ({ ...r, name: nameByKey.get(r.product_key) || '' }));
+    res.json({ ok: true, supplierName: sup.name, rows });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// 追加フォームの商品検索 (コード/商品名の部分一致、上限30件)。
+// 仕入先指定時はその仕入先の商品のみ返す (他仕入先の商品はupsertでも拒否されるため候補に出さない)
+router.get('/api/vendor-map/products', (req, res) => {
+  try {
+    const q = trimS(req.query.q).toLowerCase();
+    if (!q) return res.json({ ok: true, rows: [] });
+    const supplier = normSupplierCode(req.query.supplier);
+    const hits = [];
+    for (const r of loadPml().rows) {
+      const code = trimS(r['商品コード']);
+      if (!code) continue;
+      const prodSup = normSupplierCode(r['仕入先']);
+      if (supplier && prodSup !== supplier) continue; // 仕入先未設定 (空欄) の商品も候補に出さない (Codex R2 High)
+      const name = r['商品名'] || '';
+      if (code.toLowerCase().includes(q) || name.toLowerCase().includes(q)) hits.push({ code, name, supplier: prodSup });
+    }
+    hits.sort((a, b) => a.code.localeCompare(b.code));
+    res.json({ ok: true, rows: hits.slice(0, 30), total: hits.length });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+const VENDOR_CODE_MAX = 100; // 先方管理番号の実仕様は十数文字。誤貼り付けの肥大化 (監査ログ・添付CSVに複製される) を防ぐ
+
+// 1件追加・更新 (upsert)。商品コードはPML実在+仕入先一致チェックでタイポ・誤仕入先登録を防ぐ (廃番をあえて残す用途はCSV取込で)。
+// baseUpdatedAt: 楽観ロック (UIは常に送る。表示後に他者が変更/CSV全置換していたら409)。未指定なら無条件upsert (スクリプト/AI連携用)
+router.post('/api/vendor-map/entry', (req, res) => {
+  try {
+    const db = getDB();
+    const b = req.body || {};
+    const supplier = normSupplierCode(b.supplier_code);
+    const productCode = trimS(b.product_code);
+    const vendorCode = trimS(b.vendor_code);
+    if (!supplier) return res.status(400).json({ ok: false, error: '仕入先コードが必要です' });
+    const sup = db.prepare('SELECT name FROM po_suppliers WHERE supplier_code=?').get(supplier);
+    if (!sup) return res.status(400).json({ ok: false, error: `仕入先が未登録です: ${supplier}` });
+    if (!productCode) return res.status(400).json({ ok: false, error: '商品コードが必要です' });
+    if (productCode.length > 200) return res.status(400).json({ ok: false, error: '商品コードが長すぎます' });
+    if (!vendorCode) return res.status(400).json({ ok: false, error: '先方管理番号が必要です' });
+    if (/[\r\n]/.test(vendorCode)) return res.status(400).json({ ok: false, error: '先方管理番号に改行は使えません' });
+    if (vendorCode.length > VENDOR_CODE_MAX) return res.status(400).json({ ok: false, error: `先方管理番号が長すぎます (${VENDOR_CODE_MAX}文字まで)` });
+    const key = normProductCode(productCode);
+    const pmlRow = loadPml().rows.find(r => normProductCode(r['商品コード']) === key);
+    if (!pmlRow) return res.status(400).json({ ok: false, error: `商品マスタに無い商品コードです: ${productCode} (廃番等を登録する場合はCSV取込で)` });
+    const prodSup = normSupplierCode(pmlRow['仕入先']);
+    if (!prodSup) return res.status(400).json({ ok: false, error: `この商品は商品マスタで仕入先が未設定です: ${productCode} (先に商品マスタ側を直してください)` });
+    if (prodSup !== supplier) {
+      return res.status(400).json({ ok: false, error: `この商品の仕入先は ${prodSup} です (${sup.name} の対応表には登録できません)` });
+    }
+    let out = null;
+    db.transaction(() => {
+      const old = db.prepare('SELECT vendor_code, updated_at FROM po_vendor_code_map WHERE supplier_code=? AND product_key=?').get(supplier, key);
+      if (b.baseUpdatedAt !== undefined) {
+        // 楽観ロック: null=「新規のつもり」、文字列=「この版を見て編集した」
+        if (b.baseUpdatedAt == null && old) {
+          out = { status: 409, body: { ok: false, conflict: true, error: `この商品は既に登録されています (現在: ${old.vendor_code})。一覧のセルを編集してください`, current: old } };
+          return;
+        }
+        if (b.baseUpdatedAt != null && (!old || old.updated_at !== b.baseUpdatedAt)) {
+          out = { status: 409, body: { ok: false, conflict: true, error: old ? `他の画面で変更されています (現在: ${old.vendor_code})。最新を確認してください` : '他の画面で削除されています。最新を確認してください', current: old || null } };
+          return;
+        }
+      }
+      db.prepare(`INSERT INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, updated_at) VALUES (?,?,?,?,?)
+        ON CONFLICT(supplier_code, product_key) DO UPDATE SET product_code=excluded.product_code, vendor_code=excluded.vendor_code, updated_at=excluded.updated_at`)
+        .run(supplier, key, productCode, vendorCode, nowIso());
+      audit(db, { actorType: 'user', actor: actorOf(req), action: 'vendor_map_entry_upsert', resource: `supplier:${supplier}`,
+        detail: { productCode, vendorCode, oldVendorCode: old ? old.vendor_code : null } });
+      out = { status: 200, body: { ok: true, updated: !!old, oldVendorCode: old ? old.vendor_code : null } };
+    })();
+    res.status(out.status).json(out.body);
+  } catch (e) {
+    console.error('[purchase-orders] vendor-map entry upsert failed:', e);
+    res.status(500).json({ ok: false, error: '内部エラーが発生しました' });
+  }
+});
+
+// 1件削除。base=表示時のupdated_at (楽観ロック、未指定なら無条件)
+router.delete('/api/vendor-map/entry', (req, res) => {
+  try {
+    const db = getDB();
+    const supplier = normSupplierCode(req.query.supplier);
+    const key = normProductCode(req.query.product);
+    if (!supplier || !key) return res.status(400).json({ ok: false, error: '仕入先コードと商品コードが必要です' });
+    let out = null;
+    db.transaction(() => {
+      const old = db.prepare('SELECT product_code, vendor_code, updated_at FROM po_vendor_code_map WHERE supplier_code=? AND product_key=?').get(supplier, key);
+      if (!old) { out = { status: 404, body: { ok: false, error: '対象の対応がありません (既に削除済みかもしれません)' } }; return; }
+      if (req.query.base != null && req.query.base !== '' && old.updated_at !== req.query.base) {
+        out = { status: 409, body: { ok: false, conflict: true, error: `他の画面で変更されています (現在: ${old.vendor_code})。最新を確認してください`, current: old } };
+        return;
+      }
+      db.prepare('DELETE FROM po_vendor_code_map WHERE supplier_code=? AND product_key=?').run(supplier, key);
+      audit(db, { actorType: 'user', actor: actorOf(req), action: 'vendor_map_entry_delete', resource: `supplier:${supplier}`,
+        detail: { productCode: old.product_code, vendorCode: old.vendor_code } });
+      out = { status: 200, body: { ok: true } };
+    })();
+    res.status(out.status).json(out.body);
+  } catch (e) {
+    console.error('[purchase-orders] vendor-map entry delete failed:', e);
+    res.status(500).json({ ok: false, error: '内部エラーが発生しました' });
+  }
+});
+
 // P13a: 台帳の整合性検査 (負残/closed不整合/発行取りこぼし/disposition規則)。P13bで管理画面に表示する
 router.get('/api/ledger/integrity', (req, res) => {
   try {
@@ -3792,7 +3913,8 @@ router.get('/admin', (req, res) => {
       <h3>📧 発注書メール設定</h3>
       <div class="hint">
         発注残ページの「📧発注書メール」から送信します。<b>既定は dry-run</b> (宛先を下の社内アドレスに差し替えて送信) — 内容を数回確認してから live に切り替えてください。<br>
-        宛先は仕入先マスタの「発注書メール宛先」列 (下の宛先マスタCSVで一括登録可)。アメージングクラフト/ビーフリーは対応表を取り込むと添付CSVに先方管理番号列が付きます。
+        宛先は仕入先マスタの「発注書メール宛先」列 (下の宛先マスタCSVで一括登録可)。アメージングクラフト/ビーフリーは対応表を取り込むと添付CSVに先方管理番号列が付きます。<br>
+        対応表の1件ずつの追加・修正・削除は下のタブ「📇 先方番号対応表」でできます (CSV取込は<b>仕入先ごと全置換</b>なので注意)。
       </div>
       <div class="row" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:6px">
         <label>モード <select id="emMode"><option value="dry_run">dry_run (社内宛て)</option><option value="live">live (本番送信)</option></select></label>
@@ -3833,6 +3955,7 @@ router.get('/admin', (req, res) => {
       <button data-tab="materials">原料グループ</button>
       <button data-tab="attrs">商品紐付け</button>
       <button data-tab="selectable">🧩 選べるセット構成</button>
+      <button data-tab="vendormap">📇 先方番号対応表</button>
       <button data-tab="unlinked">🆕 未紐付けの新商品</button>
     </div>
     <div class="sec"><div class="bd" id="tabBody">読み込み中…</div></div>`;
@@ -3997,11 +4120,105 @@ function loadUnlinked(days) {
 }
 function load() {
   if (TAB === 'unlinked') { loadUnlinked(60); return; }
+  if (TAB === 'vendormap') { loadVmap(); return; }
   document.getElementById('tabBody').textContent = '読み込み中…';
   ensureGroups(function() {
     fetch('/apps/purchase-orders/api/masters/' + TAB).then(function(r){ return r.json(); })
       .then(function(j){ if (j.ok) render(j.rows); else document.getElementById('tabBody').textContent = j.error; });
   });
+}
+
+// ── 先方番号対応表タブ (仕入先ごとの一覧 + 1件ずつ追加/修正/削除。CSV取込は全置換なのでこちらが日常運用) ──
+var VM_SUP = null;   // 選択中の仕入先コード (タブ再訪でも維持)
+var VM_GEN = 0;      // 応答の巻き戻り防止 (仕入先を素早く切り替えた時に古い応答で描画しない)
+function loadVmap() {
+  var gen = ++VM_GEN;
+  document.getElementById('tabBody').textContent = '読み込み中…';
+  Promise.all([
+    fetch('/apps/purchase-orders/api/masters/suppliers').then(function(r){ return r.json(); }),
+    fetch(API_EM + '/vendor-map').then(function(r){ return r.json(); }),
+  ]).then(function(res) {
+    if (gen !== VM_GEN) return;
+    if (!res[0].ok) { document.getElementById('tabBody').textContent = res[0].error || '仕入先の取得に失敗しました'; return; }
+    var sups = res[0].rows || [];
+    var counts = {};
+    ((res[1].ok && res[1].maps) || []).forEach(function(m){ counts[m.supplier_code] = m.n; });
+    if (!VM_SUP || !sups.some(function(s){ return String(s.supplier_code) === String(VM_SUP); })) {
+      // 既定 = 対応表の件数が最多の仕入先 (通常アメージングクラフト)。対応表が空なら先頭の仕入先
+      var best = null;
+      sups.forEach(function(s){ if (counts[s.supplier_code] && (!best || counts[s.supplier_code] > counts[best])) best = s.supplier_code; });
+      VM_SUP = best != null ? best : (sups[0] ? sups[0].supplier_code : null);
+    }
+    if (VM_SUP == null) { document.getElementById('tabBody').innerHTML = '<span class="muted">仕入先マスタが空です</span>'; return; }
+    fetch(API_EM + '/vendor-map/entries?supplier=' + encodeURIComponent(VM_SUP))
+      .then(function(r){ return r.json(); })
+      .then(function(j) {
+        if (gen !== VM_GEN) return;
+        if (!j.ok) { document.getElementById('tabBody').textContent = j.error; return; }
+        renderVmap(sups, counts, j.rows);
+      })
+      .catch(function(e){ if (gen === VM_GEN) document.getElementById('tabBody').textContent = '通信エラー: ' + e.message; });
+  }).catch(function(e){ if (gen === VM_GEN) document.getElementById('tabBody').textContent = '通信エラー: ' + e.message; });
+}
+function renderVmap(sups, counts, rows) {
+  var opts = sups.map(function(s) {
+    var n = counts[s.supplier_code];
+    return '<option value="' + esc(s.supplier_code) + '"' + (String(s.supplier_code) === String(VM_SUP) ? ' selected' : '') + '>' +
+      esc(s.supplier_code + ' — ' + (s.name || '') + (n ? ' (' + n + '件)' : '')) + '</option>';
+  }).join('');
+  var h = '<div class="toolbar">仕入先 <select id="vmSup">' + opts + '</select>' +
+    '<span class="muted" style="margin-left:10px">' + rows.length + ' 件 — 発注書メールの添付CSVに付く先方管理番号。セルを編集して「保存」</span>' +
+    '<input type="text" id="vmFilter" placeholder="🔍 商品コード / 商品名 / 先方番号で絞り込み" style="margin-left:auto;min-width:280px"></div>';
+  h += '<table class="t" id="vmTable"><thead><tr><th>商品コード</th><th>商品名</th><th>先方管理番号</th><th>更新日</th><th></th></tr></thead><tbody>';
+  h += '<tr><td colspan="2"><input type="text" id="vmNewProd" list="vmProdDl" placeholder="🔍 商品コード / 商品名で検索して選択" style="width:98%"><datalist id="vmProdDl"></datalist></td>' +
+    '<td><input type="text" id="vmNewVendor" placeholder="先方管理番号" style="width:98%"></td><td class="muted">—</td>' +
+    '<td><button class="pri sm" id="vmAdd">追加</button></td></tr>';
+  if (!rows.length) h += '<tr><td colspan="5" class="muted">この仕入先の対応表はまだ空です (上の行から追加、またはメール設定のCSV取込)</td></tr>';
+  rows.forEach(function(r) {
+    h += '<tr data-vmrow="1" data-vmbase="' + esc(r.updated_at || '') + '"><td>' + esc(r.product_code) + '</td><td class="muted">' + esc(r.name || '') + '</td>' +
+      '<td contenteditable data-vmvendor>' + esc(r.vendor_code) + '</td>' +
+      '<td class="muted">' + esc((r.updated_at || '').slice(0, 10)) + '</td>' +
+      '<td style="white-space:nowrap"><button class="ghost" data-vmsave="' + esc(r.product_code) + '">保存</button>' +
+      '<button class="ghost" data-vmrm="' + esc(r.product_code) + '">削除</button></td></tr>';
+  });
+  h += '</tbody></table>';
+  document.getElementById('tabBody').innerHTML = h;
+  document.getElementById('vmSup').addEventListener('change', function(ev){ VM_SUP = ev.target.value; loadVmap(); });
+  document.getElementById('vmFilter').addEventListener('input', function(ev) {
+    var q = ev.target.value.trim().toLowerCase();
+    document.querySelectorAll('#vmTable tr[data-vmrow]').forEach(function(tr) {
+      tr.style.display = !q || tr.textContent.toLowerCase().indexOf(q) >= 0 ? '' : 'none';
+    });
+  });
+  // 商品検索オートコンプリート (選択中の仕入先の商品のみ)。世代番号で遅延応答の上書きを防ぐ
+  var vmDeb = null, vmQGen = 0;
+  document.getElementById('vmNewProd').addEventListener('input', function(ev) {
+    var v = ev.target.value.trim();
+    if (vmDeb) clearTimeout(vmDeb);
+    var g = ++vmQGen; // 早期return (入力消去・候補選択) でも世代を進め、送信済み要求の遅延応答を無効化する (Codex R2 Low)
+    if (v.length < 2 || v.indexOf(' — ') >= 0) return; // 候補選択後は再検索しない
+    vmDeb = setTimeout(function() {
+      var pg = VM_GEN; // 仕入先切替・再描画をまたいだ旧応答も破棄する (Codex R3 Low)
+      fetch(API_EM + '/vendor-map/products?supplier=' + encodeURIComponent(VM_SUP) + '&q=' + encodeURIComponent(v))
+        .then(function(r){ return r.json(); }).then(function(j) {
+          if (!j.ok || g !== vmQGen || pg !== VM_GEN) return;
+          var dl = document.getElementById('vmProdDl');
+          if (dl) dl.innerHTML = j.rows.map(function(p) {
+            return '<option value="' + esc(p.code + ' — ' + p.name) + '"></option>';
+          }).join('');
+        }).catch(function(){});
+    }, 250);
+  });
+}
+// baseUpdatedAt: 表示時のupdated_at (新規はnull)。表示後に他画面/CSV取込で変わっていたらサーバが409を返す
+function vmPost(productCode, vendorCode, baseUpdatedAt) {
+  fetch(API_EM + '/vendor-map/entry', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ supplier_code: VM_SUP, product_code: productCode, vendor_code: vendorCode, baseUpdatedAt: baseUpdatedAt }),
+  }).then(function(r){ return r.json(); }).then(function(j) {
+    if (j.ok) { toast(j.updated ? '更新しました' + (j.oldVendorCode ? ' (旧: ' + j.oldVendorCode + ')' : '') : '追加しました'); loadVmap(); }
+    else { toast('エラー: ' + j.error); if (j.conflict) loadVmap(); }
+  }).catch(function(e){ toast('通信エラー: ' + e.message); });
 }
 document.addEventListener('click', function(ev) {
   var t = ev.target;
@@ -4010,6 +4227,33 @@ document.addEventListener('click', function(ev) {
     TAB = tab;
     document.querySelectorAll('.tabbar button').forEach(function(b){ b.classList.toggle('on', b === t); });
     load();
+    return;
+  }
+  if (t.id === 'vmAdd') {
+    var pv = document.getElementById('vmNewProd').value;
+    var dash = pv.indexOf(' — ');
+    var pcode = (dash >= 0 ? pv.slice(0, dash) : pv).trim(); // 「コード — 商品名」からコードを取り出す (手入力のコードだけでも可)
+    var vcode = document.getElementById('vmNewVendor').value.trim();
+    if (!pcode) { toast('商品を選択してください'); return; }
+    if (!vcode) { toast('先方管理番号を入力してください'); return; }
+    vmPost(pcode, vcode, null); // 新規のつもりで送る (既に登録済みならサーバが409で現在値を案内)
+    return;
+  }
+  var vmSave = t.getAttribute && t.getAttribute('data-vmsave');
+  if (vmSave != null) {
+    var vmTr = t.closest('tr');
+    vmPost(vmSave, vmTr.querySelector('[data-vmvendor]').textContent.trim(), vmTr.getAttribute('data-vmbase') || null);
+    return;
+  }
+  var vmRm = t.getAttribute && t.getAttribute('data-vmrm');
+  if (vmRm != null) {
+    if (!confirm('この商品の対応を削除しますか? ' + vmRm + '\\n(発注書メールの添付CSVで先方管理番号が空欄になります)')) return;
+    var vmRmBase = t.closest('tr').getAttribute('data-vmbase') || '';
+    fetch(API_EM + '/vendor-map/entry?supplier=' + encodeURIComponent(VM_SUP) + '&product=' + encodeURIComponent(vmRm) + '&base=' + encodeURIComponent(vmRmBase), { method: 'DELETE' })
+      .then(function(r){ return r.json(); }).then(function(j) {
+        if (j.ok) { toast('削除しました'); loadVmap(); }
+        else { toast('エラー: ' + j.error); if (j.conflict) loadVmap(); }
+      }).catch(function(e){ toast('通信エラー: ' + e.message); });
     return;
   }
   if (t.id === 'btnAdd') {
@@ -4129,6 +4373,7 @@ document.getElementById('vmapForm').addEventListener('submit', function(ev) {
     toast('対応表を取り込みました (' + j.supplier + ' ' + j.count + '件' + (j.skipped ? ', スキップ' + j.skipped : '') + ')');
     (j.warnings || []).forEach(function(w){ toast('⚠️ ' + w); });
     emLoad();
+    if (TAB === 'vendormap') load(); // 取込後にタブ表示中なら一覧を更新
   }).catch(function(e){ toast('通信エラー: ' + e.message); });
 });
 emLoad();`;
