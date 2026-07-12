@@ -201,7 +201,9 @@ export function createEmailJob(orderId, { resend = false, resendOfJobId = null, 
         if (!parent || ++hops > 10) break;
         orig = parent;
       }
-      const n = db.prepare('SELECT COUNT(*) AS n FROM po_email_jobs WHERE resend_of=?').get(orig.id).n;
+      // 上限は「実際に送った (可能性のある) 再送」で数える。取消と要求前失敗 (failed) は消費しない (Codex P15-R15 Medium)
+      const n = db.prepare(`SELECT COUNT(*) AS n FROM po_email_jobs WHERE resend_of=?
+        AND status IN ('queued','sending','sent','unknown')`).get(orig.id).n;
       if (n >= 3) throw new Error('同じ送信への再送は3回までです');
       resendOf = orig.id;
     }
@@ -280,9 +282,17 @@ export async function processEmailJob(jobId) {
     if (action) audit(db, { actorType: 'system', actor: null, action, resource: `order:${job.order_id}`, detail });
     return true;
   });
-  // Gmail要求の直前にも世代を再検証 (Codex P15-R8 High: lease後に長時間停止した旧プロセスが復帰しても
-  // 新世代へ進んでいたら外部送信自体を中止する。書き戻し条件と合わせた二段ガード)
+  // Gmail要求の直前にも世代を再検証 (Codex P15-R8 High) + 送信フェンス (Codex P15-R15 High):
+  // lease から SEND_FENCE_MS を超えた試行は外部送信自体を拒否する。新世代が生まれる最短経路は
+  // 「reconcileが sending を stale (10分) と判定 → unknown → markUnsent」なので、
+  // SEND_FENCE_MS(5分) < STALE(10分) の不変条件により、旧プロセスが長時間停止から復帰しても
+  // 新世代の開始後に旧世代が実送信することはない (check-then-act の隙を時間軸で閉じる)
+  const SEND_FENCE_MS = 5 * 60000;
+  const leaseStart = Date.now();
   const verifyFresh = () => {
+    if (Date.now() - leaseStart > SEND_FENCE_MS) {
+      throw new Error('lease期限 (5分) を超えたため送信を中止しました。「照合」で状態を確認してください');
+    }
     const cur = db.prepare('SELECT status, generation FROM po_email_jobs WHERE id=?').get(jobId);
     if (!cur || cur.status !== 'sending' || cur.generation !== gen) {
       throw new Error('世代交代を検知したため送信を中止しました (別の試行が進行中)');
