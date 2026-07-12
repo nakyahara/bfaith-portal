@@ -833,6 +833,17 @@ console.log('── P13b: 発注残ページ+消込API ──');
   const draftRow = db.prepare("SELECT requested_date FROM po_orders WHERE status='draft' AND supplier_code='1'").get();
   ok(r.body.ok && draftRow && draftRow.requested_date === '2026-08-15', '下書き保存で希望納期も保持 (Codex P13b R3)');
 
+  // 空カート保存 = draft削除。deleted は実削除時のみ true (draftなしでの入力クリア誤発火防止)
+  const emptyPost = () => j('/api/supplier/1/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [] }) });
+  r = await emptyPost();
+  ok(r.body.ok && r.body.deleted === true, '空カート保存: 既存draftあり → deleted=true');
+  r = await emptyPost();
+  ok(r.body.ok && r.body.deleted === false, '空カート保存: draftなし → deleted=false');
+  // 状態を元に戻す
+  await j('/api/supplier/1/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 1 }], note: 'd', requestedDate: '2026-08-15' }) });
+
   // ページ配信 (発注残ページ・ダッシュボードのサマリ・履歴のPO番号列)
   {
     const html = await (await fetch(base + '/backorders')).text();
@@ -846,6 +857,7 @@ console.log('── P13b: 発注残ページ+消込API ──');
     const sup = await (await fetch(base + '/supplier/1')).text();
     ok(sup.includes('ISSUE_NONCE') && sup.includes('contentHash') && sup.includes('Idempotency-Key'), '/supplier 発注確定に冪等キー (ノンス+内容ハッシュ)');
     ok(sup.includes('orderReqDate'), '/supplier 希望納期入力');
+    ok(sup.includes('fSaved') && sup.includes('未保存の変更あり') && sup.includes('発注金額合計'), '/supplier 保存済みインジケータ (SKU数+発注金額合計)');
     const dash = await (await fetch(base + '/')).text();
     ok(dash.includes('発注残') && dash.includes('/apps/purchase-orders/backorders'), '/ ダッシュボードに発注残サマリ');
     const orders = await (await fetch(base + '/orders')).text();
@@ -1042,6 +1054,24 @@ console.log('── P15: メール送信 (fake transport) ──');
   ok(r.body.ok && r.body.subject.includes('【発注書】') && r.body.subject.includes('アメージングクラフト'), 'preview: 件名テンプレ (GAS互換)', r.body.subject);
   ok(r.body.body.startsWith('田中様'), 'preview: 担当者に様を自動付与');
   ok(r.body.vendorColUsed && r.body.csvText.includes('先方管理番号') && r.body.csvText.includes('AMC-001'), 'preview: 添付CSVに先方管理番号列', r.body.csvText.split('\r\n')[0]);
+  ok(r.body.body.includes('希望納期：2026年7月30日'), 'preview: 本文に希望納期 ({{nouki}})', r.body.body.split('\n').find(l => l.includes('希望納期')));
+
+  // 希望納期なしの発注 → 「指定なし」。カスタムテンプレに {{nouki}} が無い場合は末尾に追記される
+  {
+    r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 1 }] }) });
+    const noDateId = r.body.id;
+    r = await j('/api/orders/' + noDateId + '/email/preview');
+    ok(r.body.ok && r.body.body.includes('希望納期：指定なし'), 'preview: 納期未指定は「指定なし」');
+    r = await jsonPost('/api/email/settings', { bodyTpl: '{{contact}}\nいつもの内容でお願いします。' });
+    ok(r.body.ok, 'カスタム本文テンプレ保存');
+    r = await j('/api/orders/' + emOrderId + '/email/preview');
+    ok(r.body.body.includes('希望納期: 2026年7月30日'), 'preview: {{nouki}}なしテンプレでも希望納期を末尾追記', r.body.body);
+    r = await j('/api/orders/' + noDateId + '/email/preview');
+    ok(!r.body.body.includes('希望納期'), 'preview: {{nouki}}なしテンプレ+納期未指定なら追記しない');
+    r = await jsonPost('/api/email/settings', { bodyTpl: '' }); // 既定テンプレに戻す
+    ok(r.body.ok, '本文テンプレを既定に戻す');
+  }
 
   // 冪等キーなしの送信は拒否 (再送はdedup対象外のためキーが唯一の再実行ガード)
   r = await jsonPost('/api/orders/' + emOrderId + '/email/send', {});
