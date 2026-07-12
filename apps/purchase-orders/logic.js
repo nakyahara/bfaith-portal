@@ -171,10 +171,12 @@ export const SELECTABLE_DEFAULT_MIN = 10;
 export function loadRecentIssued(issuedDays = 14) {
   const db = getDB();
   const since = new Date(Date.now() - issuedDays * 86400000).toISOString();
+  // 移行PO (NE発注残初期取込) は除外: その数量はNE由来でPMLの注残数に反映済みのため、
+  // 「発注済み (NE反映待ち)」バッジを付けると二重カウントになる
   const rows = db.prepare(`
     SELECT i.product_key, i.qty, o.id AS order_id, o.issued_at
     FROM po_order_items i JOIN po_orders o ON o.id = i.order_id
-    WHERE o.status = 'issued' AND o.issued_at >= ?
+    WHERE o.status = 'issued' AND o.issued_at >= ? AND (o.origin IS NULL OR o.origin <> 'migration')
     ORDER BY o.issued_at ASC
   `).all(since);
   const map = new Map();
