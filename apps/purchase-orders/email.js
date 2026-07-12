@@ -406,6 +406,26 @@ export function cancelEmailJob(jobId, { actor = null } = {}) {
  * 予約送信ディスパッチャ: 毎分、時刻が来た予約ジョブ (queued + scheduled_at <= now) を送信する。
  * unref() するのでプロセス終了を妨げない。多重起動しても lease が二重送信を防ぐ
  */
+/**
+ * 送信すべき queued ジョブを1周期分処理する:
+ *  - 予約 (scheduled_at) が時刻到来したもの
+ *  - 即時送信のつもりが送信前にプロセス再起動で取り残されたもの (scheduled_at NULL かつ作成から2分超。
+ *    2分の猶予は、作成直後にAPI側が同期処理する正常経路との二重取り合いを避けるため、Codex P15-R14 High)
+ */
+export async function dispatchDueEmailJobs() {
+  const now = nowIso();
+  const orphanBefore = new Date(Date.now() - 2 * 60000).toISOString();
+  const due = getDB().prepare(`SELECT id FROM po_email_jobs WHERE status='queued'
+      AND ((scheduled_at IS NOT NULL AND scheduled_at <= ?) OR (scheduled_at IS NULL AND created_at <= ?))`)
+    .all(now, orphanBefore);
+  let processed = 0;
+  for (const j of due) {
+    try { await processEmailJob(j.id); processed++; }
+    catch (e) { console.error(`[po-email] ジョブ #${j.id} の処理に失敗:`, e.message); }
+  }
+  return { due: due.length, processed };
+}
+
 let dispatcherStarted = false;
 export function startEmailDispatcher() {
   if (dispatcherStarted) return;
@@ -413,12 +433,7 @@ export function startEmailDispatcher() {
   let consecutiveErrors = 0;
   const tick = async () => {
     try {
-      const due = getDB().prepare("SELECT id FROM po_email_jobs WHERE status='queued' AND scheduled_at IS NOT NULL AND scheduled_at <= ?")
-        .all(nowIso());
-      for (const j of due) {
-        try { await processEmailJob(j.id); }
-        catch (e) { console.error(`[po-email] 予約ジョブ #${j.id} の処理に失敗:`, e.message); }
-      }
+      await dispatchDueEmailJobs();
       consecutiveErrors = 0;
     } catch (e) {
       // 失敗の握り潰しは運用検知を殺す: ログを残し、連続失敗は目立たせる
@@ -430,7 +445,8 @@ export function startEmailDispatcher() {
       t.unref();
     }
   };
-  const t0 = setTimeout(tick, 60000);
+  // 起動直後にも1回実行 (再起動で取り残された即時ジョブの回収。leaseが多重実行を防ぐ)
+  const t0 = setTimeout(tick, 5000);
   t0.unref();
 }
 

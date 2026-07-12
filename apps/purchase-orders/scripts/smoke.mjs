@@ -1190,6 +1190,15 @@ console.log('── P15: メール送信 (fake transport) ──');
     db.prepare("UPDATE po_email_jobs SET scheduled_at='2020-01-01T00:00:00.000Z' WHERE id=?").run(schedJob2Id);
     r = await jsonPost('/api/email-jobs/' + schedJob2Id + '/retry', {});
     ok(r.body.ok && r.body.status === 'sent', '予約時刻到来→送信');
+
+    // 取り残された即時ジョブ (コミット直後クラッシュ相当) をディスパッチャが回収する (Codex P15 R14)
+    const em = await imp('apps/purchase-orders/email.js');
+    r = await jsonPost('/api/orders/' + schedOrderId + '/email/send', { scheduledAt: jst }, 'em-key-orphan');
+    const orphanId = r.body.jobId;
+    db.prepare("UPDATE po_email_jobs SET scheduled_at=NULL, created_at='2020-01-01T00:00:00.000Z' WHERE id=?").run(orphanId);
+    const disp = await em.dispatchDueEmailJobs();
+    ok(disp.processed >= 1 && db.prepare('SELECT status FROM po_email_jobs WHERE id=?').get(orphanId).status === 'sent',
+      'ディスパッチャ: 孤児queued (即時・2分超) を回収して送信', disp);
   }
 
   // MIME 生成 (Message-ID=delivery_key、添付CP932)
