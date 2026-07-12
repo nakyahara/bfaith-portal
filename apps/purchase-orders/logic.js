@@ -14,6 +14,7 @@
  * データソース: mirror_pml_snapshot_rows (published run) + po_* マスタ。
  */
 import { getDB, normSupplierCode, normProductCode } from './db.js';
+import { getSetting } from './ledger.js';
 
 const PML_COLS = [
   '商品コード', '商品名', '仕入先', '取扱区分', '売上分類',
@@ -35,10 +36,10 @@ export function stockConstant(m) {
   return 3;
 }
 
-/** 1商品の発注判定。旧シートの1行分。 */
-export function computeProduct(r) {
+/** 1商品の発注判定。旧シートの1行分。backOrderOverride を渡すとNE CSVの注残数の代わりに使う (アプリ台帳の残数) */
+export function computeProduct(r, backOrderOverride) {
   const S = num(r['総在庫数_引当なし']);
-  const B = num(r['注残数']);
+  const B = backOrderOverride != null ? backOrderOverride : num(r['注残数']);
   const V = num(r['販売数30日_合計']);
   const M = num(r['推奨保有月数']);
   const N = num(r['発注ロット単位']);
@@ -185,19 +186,44 @@ export function loadRecentIssued(issuedDays = 14) {
 }
 
 /**
+ * アプリ台帳の商品別発注残 (残数>0のオープン発注のみ、移行PO含む) → Map(product_key → 残数計)。
+ * NE CSVの「発注残数」の代わりに要発注判定へ使う: 発注確定した瞬間に注残へ反映され、
+ * NE CSV/朝同期の取込を待たずに要発注から消える (二重発注防止)。
+ */
+export function loadLedgerBackorders() {
+  const db = getDB();
+  // tracked の正は issued_at >= tracking_started_at (境界以前=legacyの残数に意味はない、Codex サイクルR1 High)
+  const rows = db.prepare(`
+    SELECT i.product_key, SUM(b.remaining_qty) AS zan
+    FROM po_order_items i
+    JOIN po_orders o ON o.id = i.order_id
+    JOIN v_po_item_balance b ON b.order_item_id = i.id
+    WHERE o.status = 'issued' AND o.tracking_mode = 'tracked' AND o.closed_at IS NULL AND b.remaining_qty > 0
+      AND o.issued_at >= (SELECT value FROM po_settings WHERE key = 'tracking_started_at')
+    GROUP BY i.product_key
+  `).all();
+  const map = new Map();
+  for (const r of rows) map.set(r.product_key, r.zan);
+  return map;
+}
+
+/**
  * 全体計算。仕入先別に 要発注 / ついで買い候補 / 掘り起こし を仕分けする。
  * 戻り値の products は PML 全行の computeProduct 結果 (attrs 情報を付与済み)。
+ * 注残はアプリ台帳 (loadLedgerBackorders) を正とする — NE CSVの発注残数は使わない。
  */
 export function computeAll() {
   // PML(+NEオーバーレイ)・マスタ・直近発注を1つの read transaction で読む (途中の書き込みと混在させない、Codex R2 Low)
   const db = getDB();
-  const { pub, rows, overlay, masters, recentIssued } = db.transaction(() => ({
-    ...loadPmlMerged(), masters: loadMasters(), recentIssued: loadRecentIssued(),
+  const { pub, rows, overlay, masters, recentIssued, ledgerZan, useLedgerZan } = db.transaction(() => ({
+    ...loadPmlMerged(), masters: loadMasters(), recentIssued: loadRecentIssued(), ledgerZan: loadLedgerBackorders(),
+    // 既定 'app' = アプリ台帳。設定 backorder_source='ne' で旧挙動 (NE CSVの発注残数) へ戻せる
+    useLedgerZan: getSetting('backorder_source') !== 'ne',
   }))();
   const products = [];
   const bySupplier = new Map();
   for (const r of rows) {
-    const p = computeProduct(r);
+    const p = computeProduct(r, useLedgerZan ? (ledgerZan.get(normProductCode(r['商品コード'])) || 0) : undefined);
     const a = masters.attrs.get(p.key);
     p.conditionId = a ? (a.condition_id || '') : '';
     p.materialGroupId = a ? (a.material_group_id || '') : '';

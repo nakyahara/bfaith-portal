@@ -30,7 +30,7 @@ import {
   buildOrderEmail, createEmailJob, processEmailJob, reconcileEmailJobs, listEmailJobs, emailSettings, parseAddresses,
   markUnsent, cancelEmailJob, startEmailDispatcher,
 } from './email.js';
-import { getSetting, setSetting, audit } from './ledger.js';
+import { getSetting, setSetting, audit, markCycleFbaJobDone } from './ledger.js';
 
 startEmailDispatcher(); // 予約送信 (毎分、時刻が来たqueuedジョブを送信。unrefでプロセス終了は妨げない)
 
@@ -371,17 +371,70 @@ function supplierWorkspaceData(code) {
 
 // ═══════════════════════════ API ═══════════════════════════
 
+// ─── 発注サイクル (「✅発注確定済み」表示の基準) ───
+// データ更新 (NE手動CSV取込/解除・FBA在庫更新) で po_cycle_reset_at を進め、それ以降に
+// 発注確定した仕入先へダッシュボードで「✅発注確定済み」を表示する。営業日 (as_of) が変われば自動リセット
+function cycleStartIso(pub) {
+  const marker = getSetting('po_cycle_reset_at') || '';
+  let dayStart = '';
+  if (pub && pub.as_of_date) {
+    const ms = Date.parse(String(pub.as_of_date) + 'T00:00:00+09:00');
+    if (Number.isFinite(ms)) dayStart = new Date(ms).toISOString();
+  }
+  return marker > dayStart ? marker : dayStart;
+}
+/** 今サイクルに発注確定した仕入先 (移行PO除く)。unsent = 発注書メール未送信 (本送信) のPO数 (email運用の仕入先のみ) */
+function cycleIssuedSuppliers(cycleStart) {
+  const db = getDB();
+  return db.prepare(`
+    SELECT code, MAX(name) AS name, COUNT(*) AS orders,
+           SUM(is_unsent) AS unsent,
+           GROUP_CONCAT(po_label) AS pos,
+           GROUP_CONCAT(CASE WHEN is_unsent = 1 THEN po_label END) AS unsent_pos
+    FROM (
+      SELECT o.supplier_code AS code, o.supplier_name AS name, COALESCE(o.po_number, '#' || o.id) AS po_label,
+             CASE WHEN COALESCE(o.send_blocked, 0) = 0 AND s.send_method = 'email'
+                   AND NOT EXISTS (SELECT 1 FROM po_email_jobs e WHERE e.order_id = o.id AND e.status = 'sent' AND e.is_dry_run = 0)
+                  THEN 1 ELSE 0 END AS is_unsent
+      FROM po_orders o LEFT JOIN po_suppliers s ON s.supplier_code = o.supplier_code
+      WHERE o.status = 'issued' AND (o.origin IS NULL OR o.origin <> 'migration') AND o.issued_at >= ?
+    ) GROUP BY code`).all(cycleStart);
+}
+// at には「データ更新処理の開始時刻」を渡す (コミット後〜設定更新の間に確定した新規POを
+// 誤って旧サイクル扱いにしない、Codex サイクルR2 Medium)
+function bumpCycleReset(actor, reason, at = nowIso()) {
+  setSetting('po_cycle_reset_at', at, { actor, reason });
+}
+
+router.get('/api/cycle-issued', (req, res) => {
+  try {
+    const { pub } = loadPmlMerged();
+    const rows = cycleIssuedSuppliers(cycleStartIso(pub));
+    res.json({
+      ok: true,
+      suppliers: rows.map(r => ({
+        code: r.code, name: r.name, unsent: r.unsent,
+        poNumbers: String(r.pos || '').split(',').filter(Boolean),
+        unsentPoNumbers: String(r.unsent_pos || '').split(',').filter(Boolean),
+      })),
+    });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
 router.get('/api/overview', (req, res) => {
   try {
     const { pub, bySupplier } = computeAll();
     const db = getDB();
     const draftCodes = new Set(db.prepare("SELECT supplier_code FROM po_orders WHERE status='draft'").all().map(r => r.supplier_code));
+    const cycleIssued = new Map(cycleIssuedSuppliers(cycleStartIso(pub)).map(r => [r.code, r]));
     const cards = [];
     for (const g of bySupplier.values()) {
-      if (g.targets.length === 0 && !draftCodes.has(g.code)) continue;
+      const ci = cycleIssued.get(g.code);
+      if (g.targets.length === 0 && !draftCodes.has(g.code) && !ci) continue;
       cards.push({
         code: g.code, name: g.name || `仕入先 ${g.code}`, memo: g.memo,
         targetCount: g.targets.length, estAmount: g.estAmount, hasDraft: draftCodes.has(g.code),
+        issuedCount: ci ? ci.orders : 0, unsentCount: ci ? ci.unsent : 0,
       });
     }
     cards.sort((a, b) => b.targetCount - a.targetCount || b.estAmount - a.estAmount);
@@ -1551,6 +1604,7 @@ router.post('/api/ne-overlay/csv', upload.single('file'), (req, res) => {
       }
       throw e;
     }
+    bumpCycleReset(actorOf(req), 'NE手動CSV取込で発注サイクル更新', now);
     res.json({ ok: true, rowCount: count, uploadedAt: now });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
@@ -1558,10 +1612,12 @@ router.post('/api/ne-overlay/csv', upload.single('file'), (req, res) => {
 router.delete('/api/ne-overlay', (req, res) => {
   try {
     const db = getDB();
+    const startedAt = nowIso();
     db.transaction(() => {
       db.prepare('DELETE FROM po_ne_overlay_rows').run();
       db.prepare('DELETE FROM po_ne_overlay_meta').run();
     })();
+    bumpCycleReset(actorOf(req), 'NE手動CSV解除で発注サイクル更新', startedAt);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
@@ -1576,6 +1632,11 @@ router.post('/api/refresh-fba', async (req, res) => {
 router.get('/api/refresh-fba/jobs/:jobId', async (req, res) => {
   try {
     const r = await callWarehouse(`/service-api/jobs/${encodeURIComponent(req.params.jobId)}`, { timeout: 15000 });
+    // FBA更新完了 = データが変わった時点で発注サイクルを更新 (jobId単位で一度だけ。冪等はDBの一意制約+同一txn)
+    if (r && r.status === 'completed') {
+      try { markCycleFbaJobDone(req.params.jobId, actorOf(req)); }
+      catch (e) { console.error('[purchase-orders] FBAサイクル更新失敗:', e.message); } // ポーリング応答自体は返す
+    }
     res.json(r);
   } catch (e) { res.status(502).json({ error: 'ジョブ状態の取得に失敗: ' + e.message }); }
 });
@@ -1906,15 +1967,18 @@ router.get('/', (req, res) => {
     const { pub, overlay, bySupplier, products } = computeAll();
     const db = getDB();
     const draftCodes = new Set(db.prepare("SELECT supplier_code FROM po_orders WHERE status='draft'").all().map(r => r.supplier_code));
+    const cycleIssued = new Map(cycleIssuedSuppliers(cycleStartIso(pub)).map(r => [r.code, r]));
     const cards = [];
     const others = [];
     for (const g of bySupplier.values()) {
+      const ci = cycleIssued.get(g.code);
       const c = {
         code: g.code, name: g.name || ('仕入先 ' + g.code), memo: g.memo,
         targetCount: g.targets.length, estAmount: g.estAmount, hasDraft: draftCodes.has(g.code),
+        issuedCount: ci ? ci.orders : 0, unsentCount: ci ? ci.unsent : 0,
         productCount: g.targets.length + g.candidates.length + g.horikoshi.length,
       };
-      if (c.targetCount > 0 || c.hasDraft) cards.push(c); else others.push(c);
+      if (c.targetCount > 0 || c.hasDraft || c.issuedCount) cards.push(c); else others.push(c);
     }
     cards.sort((a, b) => b.targetCount - a.targetCount || b.estAmount - a.estAmount);
     others.sort((a, b) => b.productCount - a.productCount);
@@ -1929,7 +1993,7 @@ router.get('/', (req, res) => {
   const cardHtml = c => `
     <a class="card" data-sup="${he(c.code)}" data-supname="${he(c.name)}" href="/apps/purchase-orders/supplier/${encodeURIComponent(c.code)}">
       <button class="cdis" data-cdis="${he(c.code)}" title="この仕入先を非表示 (下の「非表示の仕入先」から戻せます)">✕</button>
-      <div class="nm">${he(c.name)} ${c.hasDraft ? '<span class="badge b-draft">下書きあり</span>' : ''}</div>
+      <div class="nm">${he(c.name)} ${c.hasDraft ? '<span class="badge b-draft">下書きあり</span>' : ''}${c.issuedCount ? ` <span class="badge b-issued" title="今サイクルで発注確定済み。FBA在庫更新やNE CSV取込 (データ更新) でこの表示はリセットされます">✅ 発注確定済み${c.issuedCount > 1 ? ' ×' + c.issuedCount : ''}</span>` : ''}${c.unsentCount ? ' <span class="badge b-warn" title="発注確定済みですが発注書メール (本送信) が未送信です">📧 メール未送信</span>' : ''}</div>
       ${c.memo ? `<div class="memo">📌 ${he(c.memo)}</div>` : ''}
       <div class="stats">
         <span><span class="n${c.targetCount ? ' acc' : ''}">${c.targetCount}</span>要発注 SKU</span>
@@ -2033,8 +2097,30 @@ box.addEventListener('input', function() {
 // ── FBA在庫 オンデマンド更新 (miniPCジョブ、数分かかる) ──
 var opStatus = document.getElementById('opStatus');
 function setStatus(msg) { opStatus.textContent = msg; }
+// データ更新前の二段確認: (1)「✅発注確定済み」表示のリセット確認 → (2) 発注メール未送信の仕入先があれば追加確認
+function confirmCycleReset(next) {
+  fetch('/apps/purchase-orders/api/cycle-issued')
+    .then(function(r){ return r.json(); })
+    .then(function(j) {
+      // fail-closed: 発注確定状況が確認できないときは更新を開始しない (Codex サイクルR1 Medium)
+      if (!j || !j.ok) { alert('発注確定状況を確認できませんでした (' + ((j && j.error) || '不明なエラー') + ')。データ更新を中止しました。再試行してください'); return; }
+      var sup = j.suppliers || [];
+      var msg = sup.length
+        ? 'データを更新すると、「✅発注確定済み」の表示がリセットされます。\\n対象: ' + sup.map(function(s){ return s.name; }).join('、') + '\\n※発注そのものは発注残・発注履歴に残ります。\\n\\n更新しますか?'
+        : 'データを更新しますか?';
+      if (!confirm(msg)) return;
+      var unsent = sup.filter(function(s){ return s.unsent > 0; });
+      if (unsent.length) {
+        var lines = unsent.map(function(s){ return '・' + s.name + ' (' + s.unsentPoNumbers.join(', ') + ')'; }).join('\\n');
+        if (!confirm('⚠️ 以下の仕入先は発注確定済みですが、発注書メールがまだ送信されていません:\\n\\n' + lines + '\\n\\nこのまま発注確定表示をリセットしてよろしいですか?')) return;
+      }
+      next();
+    })
+    .catch(function(e){ alert('通信エラー: ' + e.message + ' — 発注確定状況を確認できないため、データ更新を中止しました。再試行してください'); });
+}
 var btnFba = document.getElementById('btnFba');
 btnFba.addEventListener('click', function() {
+  confirmCycleReset(function() {
   btnFba.disabled = true;
   setStatus('FBA更新ジョブを起動中...');
   fetch('/apps/purchase-orders/api/refresh-fba', { method: 'POST' })
@@ -2049,6 +2135,7 @@ btnFba.addEventListener('click', function() {
       pollFba(j.jobId, Date.now());
     })
     .catch(function(e){ setStatus('通信エラー: ' + e.message); btnFba.disabled = false; });
+  });
 });
 function pollFba(jobId, startTs) {
   if (Date.now() - startTs > 5 * 60 * 1000) {
@@ -2076,22 +2163,26 @@ function pollFba(jobId, startTs) {
 document.getElementById('neForm').addEventListener('submit', function(ev) {
   ev.preventDefault();
   var fd = new FormData(ev.target);
-  setStatus('NE CSVを取込中...');
-  fetch('/apps/purchase-orders/api/ne-overlay/csv', { method: 'POST', body: fd })
-    .then(function(r){ return r.json(); })
-    .then(function(j) {
-      if (!j.ok) { setStatus(''); alert('取込エラー: ' + j.error); return; }
-      setStatus('取込完了 (' + j.rowCount + '件)。再読み込みします...');
-      location.reload();
-    })
-    .catch(function(e){ setStatus('通信エラー: ' + e.message); });
+  confirmCycleReset(function() {
+    setStatus('NE CSVを取込中...');
+    fetch('/apps/purchase-orders/api/ne-overlay/csv', { method: 'POST', body: fd })
+      .then(function(r){ return r.json(); })
+      .then(function(j) {
+        if (!j.ok) { setStatus(''); alert('取込エラー: ' + j.error); return; }
+        setStatus('取込完了 (' + j.rowCount + '件)。再読み込みします...');
+        location.reload();
+      })
+      .catch(function(e){ setStatus('通信エラー: ' + e.message); });
+  });
 });
 var btnNeClear = document.getElementById('btnNeClear');
 if (btnNeClear) btnNeClear.addEventListener('click', function() {
   if (!confirm('手動CSVの上書きを解除して、朝同期の値に戻しますか?')) return;
-  fetch('/apps/purchase-orders/api/ne-overlay', { method: 'DELETE' })
-    .then(function(r){ return r.json(); })
-    .then(function(j){ if (j.ok) location.reload(); else alert(j.error); });
+  confirmCycleReset(function() {
+    fetch('/apps/purchase-orders/api/ne-overlay', { method: 'DELETE' })
+      .then(function(r){ return r.json(); })
+      .then(function(j){ if (j.ok) location.reload(); else alert(j.error); });
+  });
 });`;
   res.send(pageShell('発注補助 — ダッシュボード', 'dash', body, script));
 });
@@ -2178,7 +2269,7 @@ if (D.draft && D.draft.items.length) {
 function months(p){ return p.stockMonths == null ? '—' : (Math.round(p.stockMonths * 100) / 100).toFixed(2); }
 function issuedBadge(p){
   if (!p.recentIssued) return '';
-  return ' <span class="badge b-issued" title="直近14日以内に発注確定済み (NE注残反映待ちの可能性)">発注済 ' + esc(String(p.recentIssued.issuedAt).slice(0,10)) + ' ×' + p.recentIssued.qty + '</span>';
+  return ' <span class="badge b-issued" title="直近14日以内に発注確定済み (数量は台帳注残として在庫+注残に反映済み)">発注済 ' + esc(String(p.recentIssued.issuedAt).slice(0,10)) + ' ×' + p.recentIssued.qty + '</span>';
 }
 function qtyCell(p) {
   var v = CART[p.code] || '';
@@ -4165,7 +4256,8 @@ var DEFS = {
   suppliers: { title: '仕入先', cols: [
     { k: 'supplier_code', l: '仕入先コード', pk: 1 }, { k: 'name', l: '仕入先名' }, { k: 'order_memo', l: '発注メモ (FAX/WEB/送料条件等)' },
     { k: 'email_to', l: '発注書メール宛先 (カンマ区切り可)' }, { k: 'email_cc', l: 'CC' },
-    { k: 'contact_name', l: '担当者名 (様は自動付与)' }, { k: 'send_method', l: '送信方法 (email/fax/web/none)' },
+    { k: 'contact_name', l: '担当者名 (様は自動付与)' },
+    { k: 'send_method', l: '発注方法', sel: [['', '未設定'], ['email', '📧 メール'], ['fax', '📠 FAX'], ['web', '🌐 WEBサイト'], ['none', '送信なし']] },
     { k: 'lead_days', l: '標準リードタイム日数', num: 1 } ] },
   conditions: { title: '発注条件グループ', cols: [
     { k: 'condition_id', l: '条件ID', pk: 1 }, { k: 'supplier_code', l: '仕入先コード' }, { k: '仕入先名', l: '仕入先名', ro: 1 }, { k: 'maker_name', l: 'メーカー名' },
@@ -4253,8 +4345,14 @@ document.getElementById('importForm').addEventListener('submit', function(ev) {
     .catch(function(e){ st.textContent = ''; alert('通信エラー: ' + e.message); });
 });
 
+function selHtml(c, val, id) {
+  return '<select' + (id ? ' id="' + id + '"' : ' data-k="' + c.k + '"') + '>' + c.sel.map(function(o) {
+    return '<option value="' + esc(o[0]) + '"' + (String(val == null ? '' : val) === o[0] ? ' selected' : '') + '>' + esc(o[1]) + '</option>';
+  }).join('') + '</select>';
+}
 function cellHtml(c, val) {
   if (c.ro) return '<td class="muted">' + esc(val == null ? '' : val) + '</td>'; // 表示専用 (商品名等)
+  if (c.sel) return '<td>' + selHtml(c, val) + '</td>'; // 選択式 (発注方法等)
   if (c.dl) return '<td><input type="text" list="dl_' + c.dl + '" data-k="' + c.k + '" style="width:98%" value="' + esc(groupLabelOf(c.dl, val)) + '" placeholder="名前でもIDでも"></td>';
   return '<td' + (' contenteditable data-k="' + c.k + '"') + (c.num ? ' class="r"' : '') + '>' + esc(val == null ? '' : val) + '</td>';
 }
@@ -4266,6 +4364,7 @@ function render(rows) {
   h += '<table class="t" id="mtable"><thead><tr>' + def.cols.map(function(c){ return '<th' + (c.num ? ' class="r"' : '') + '>' + c.l + '</th>'; }).join('') + '<th></th></tr></thead><tbody>';
   h += '<tr>' + def.cols.map(function(c) {
     if (c.ro) return '<td class="muted">(自動)</td>';
+    if (c.sel) return '<td>' + selHtml(c, '', 'new_' + c.k) + '</td>';
     return '<td><input type="text" style="width:98%" id="new_' + c.k + '"' + (c.dl ? ' list="dl_' + c.dl + '" placeholder="名前でもIDでも"' : '') + '></td>';
   }).join('') + '<td><button class="pri sm" id="btnAdd">追加</button></td></tr>';
   rows.forEach(function(r) {
@@ -4471,7 +4570,7 @@ document.addEventListener('click', function(ev) {
     b2[def2.cols[0].k] = saveKey;
     tr.querySelectorAll('[data-k]').forEach(function(el) {
       var k = el.getAttribute('data-k');
-      var raw = el.tagName === 'INPUT' ? el.value : el.textContent;
+      var raw = (el.tagName === 'INPUT' || el.tagName === 'SELECT') ? el.value : el.textContent;
       var col = null;
       def2.cols.forEach(function(c){ if (c.k === k) col = c; });
       b2[k] = (col && col.dl) ? normGroupVal(col.dl, raw) : raw;

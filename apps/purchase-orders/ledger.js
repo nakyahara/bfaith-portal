@@ -52,7 +52,8 @@ export function stableStringify(v) {
 
 // setSetting で変更できるキーのホワイトリスト (tracking_started_at は含めない=初回確定後は不変。
 // DB側にも UPDATE/DELETE 拒否トリガあり)
-const SETTABLE_KEYS = new Set(['backorder_source', 'email_mode', 'email_dryrun_to', 'email_subject_template', 'email_body_template']);
+const SETTABLE_KEYS = new Set(['backorder_source', 'email_mode', 'email_dryrun_to', 'email_subject_template', 'email_body_template',
+  'po_cycle_reset_at']); // データ更新 (NE取込/FBA更新) 時刻 =「✅発注確定済み」表示のリセット基準
 
 export function getSetting(key) {
   const r = getDB().prepare('SELECT value FROM po_settings WHERE key=?').get(key);
@@ -84,6 +85,22 @@ export function setSetting(key, value, { actor = null, actorType = 'user', reaso
     audit(db, { actorType, actor, action: 'setting_change', resource: `setting:${key}`,
       detail: { old: old ? old.value : null, new: String(value), reason } });
   })();
+}
+
+/**
+ * FBA更新ジョブの完了検知。同一jobIdは一度だけ true を返し、そのときだけ発注サイクル
+ * (po_cycle_reset_at =「✅発注確定済み」表示の基準) をリセットする。
+ * 挿入と設定更新を同一の即時txnで行う (複数タブの同時ポーリングでも二重リセットしない、Codex サイクルR1 High)
+ */
+export function markCycleFbaJobDone(jobId, actor) {
+  const db = getDB();
+  return db.transaction(() => {
+    const ins = db.prepare('INSERT OR IGNORE INTO po_cycle_fba_jobs (job_id, done_at) VALUES (?,?)')
+      .run(String(jobId), nowIso());
+    if (ins.changes === 0) return false; // 検知済みジョブ (再ポーリング/別タブ) は何もしない
+    setSetting('po_cycle_reset_at', nowIso(), { actor, reason: 'FBA在庫更新の完了で発注サイクル更新' });
+    return true;
+  }).immediate();
 }
 
 /**
