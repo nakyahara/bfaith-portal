@@ -695,13 +695,16 @@ router.post('/api/email/settings', (req, res) => {
     const b = req.body || {};
     const actor = actorOf(req);
     const changed = [];
-    // mode (dry_run/live) は専用API /api/email/mode でのみ変更 (誤操作でliveにしない、Codex P15-R1 M9)
-    for (const [key, val] of [['email_dryrun_to', b.dryrunTo],
-      ['email_subject_template', b.subjectTpl], ['email_body_template', b.bodyTpl]]) {
-      if (val == null) continue;
-      setSetting(key, String(val), { actor, reason: 'メール設定画面から変更' });
-      changed.push(key);
-    }
+    // mode (dry_run/live) は専用API /api/email/mode でのみ変更 (誤操作でliveにしない、Codex P15-R1 M9)。
+    // 全項目を1txnで適用 (途中の検証失敗で部分反映しない、Codex P15-R10 Medium)
+    getDB().transaction(() => {
+      for (const [key, val] of [['email_dryrun_to', b.dryrunTo],
+        ['email_subject_template', b.subjectTpl], ['email_body_template', b.bodyTpl]]) {
+        if (val == null) continue;
+        setSetting(key, String(val), { actor, reason: 'メール設定画面から変更' });
+        changed.push(key);
+      }
+    })();
     res.json({ ok: true, changed, ...emailSettings() });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
@@ -742,10 +745,11 @@ router.post('/api/email/recipients/csv', upload.single('file'), (req, res) => {
       if (!byName.has(k)) byName.set(k, []);
       byName.get(k).push(r.supplier_code);
     }
-    const updated = [], unmatched = [], invalid = [];
+    const updated = [], unmatched = [], invalid = [], nonEmailMethod = [];
     const seenInCsv = new Set();
     db.transaction(() => {
       const upd = db.prepare("UPDATE po_suppliers SET email_to=?, email_cc=?, contact_name=?, send_method=COALESCE(send_method,'email'), updated_at=? WHERE supplier_code=?");
+      const methodOf = db.prepare('SELECT send_method FROM po_suppliers WHERE supplier_code=?');
       for (let n = 1; n < rows.length; n++) {
         const r = rows[n];
         const name = trimS(r[iName]);
@@ -762,12 +766,15 @@ router.post('/api/email/recipients/csv', upload.single('file'), (req, res) => {
           const cc = iCc === -1 ? [] : parseAddresses(r[iCc]);
           upd.run(to.join(','), cc.join(',') || null, iContact === -1 ? null : trimS(r[iContact]) || null, nowIso(), codes[0]);
           updated.push({ name, code: codes[0] });
+          // 既存の送信方法 (fax/web/none) は保護して上書きしない。ただし黙っていると「取込したのに送れない」ため警告する
+          const m = methodOf.get(codes[0]).send_method;
+          if (m && m !== 'email') nonEmailMethod.push(`${name} (送信方法=${m}のまま。メール送信するにはマスタでemailに変更)`);
         } catch (e) { invalid.push(`${name}: ${e.message}`); }
       }
       audit(db, { actorType: 'user', actor: actorOf(req), action: 'email_recipients_import', resource: 'master:suppliers',
-        detail: { updated, unmatched, invalidCount: invalid.length } });
+        detail: { updated, unmatched, invalidCount: invalid.length, nonEmailMethod } });
     })();
-    res.json({ ok: true, updated: updated.length, unmatched, invalid });
+    res.json({ ok: true, updated: updated.length, unmatched, invalid: invalid.concat(nonEmailMethod) });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 

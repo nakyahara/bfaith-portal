@@ -293,7 +293,8 @@ export async function processEmailJob(jobId) {
         'email_unknown', { jobId, error: msg, deliveryKey: job.delivery_key });
       return applied ? { status: 'unknown', error: msg } : { status: 'stale', error: '古い送信試行のため結果を破棄しました' };
     }
-    const applied = finalize("SET status='failed', error=?", [msg], null, null);
+    const applied = finalize("SET status='failed', error=?", [msg],
+      'email_failed', { jobId, gen, error: msg.slice(0, 200), deliveryKey: job.delivery_key });
     return applied ? { status: 'failed', error: msg } : { status: 'stale', error: '古い送信試行のため結果を破棄しました' };
   }
 }
@@ -471,8 +472,9 @@ async function sendViaGmail(job, onPhase = () => {}, verifyFresh = () => {}) {
   });
   const j = await res.json().catch(() => ({}));
   if (!res.ok || !j.id) {
-    // 4xxの明示拒否 = 「送信されていない」確定 → failed (再試行可)。5xxは送信済みの可能性が残る → unknown
-    if (res.status < 500) onPhase('pre');
+    // 要求後の失敗は原則 unknown。「未送信が仕様上確定する」コード (400=raw不正/401/403=認証) のみ failed に戻す
+    // (408/429/5xx等は処理済みの可能性が残るため unknown、Codex P15-R10 High)
+    if (res.status === 400 || res.status === 401 || res.status === 403) onPhase('pre');
     throw new Error(`Gmail送信失敗 (HTTP ${res.status}): ${(j.error && j.error.message) || '不明'}`);
   }
   return j.id;

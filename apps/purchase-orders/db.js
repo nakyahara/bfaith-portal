@@ -588,8 +588,8 @@ function initLedgerSchema(db) {
                  THEN RAISE(ABORT, 'email job: sending からは sent/failed/unknown のみ')
                WHEN OLD.status = 'failed' AND NEW.status NOT IN ('queued','cancelled')
                  THEN RAISE(ABORT, 'email job: failed からは queued(再試行)/cancelled のみ')
-               WHEN OLD.status = 'unknown' AND NEW.status NOT IN ('sent','queued','cancelled')
-                 THEN RAISE(ABORT, 'email job: unknown からは sent(照合)/queued(人間確認後)/cancelled のみ')
+               WHEN OLD.status = 'unknown' AND NEW.status NOT IN ('sent','queued')
+                 THEN RAISE(ABORT, 'email job: unknown からは sent(照合)/queued(人間確認後) のみ (取消は不可=送信済みの可能性を隠さない)')
                WHEN NEW.status = 'sent' AND NEW.sent_at IS NULL
                  THEN RAISE(ABORT, 'email job: sent には sent_at が必要')
              END;
