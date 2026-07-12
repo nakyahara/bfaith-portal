@@ -1345,7 +1345,7 @@ console.log('── NE発注残 初期取込 (移行PO) ──');
   const upNe = async (name, rows, opts = {}) => {
     const fd = new FormData();
     fd.append('file', new Blob([neCsvOf(rows)]), name);
-    if (opts.commit) { fd.append('commit', '1'); fd.append('fileHash', opts.hash || ''); }
+    if (opts.commit) { fd.append('commit', '1'); fd.append('fileHash', opts.hash || ''); fd.append('planHash', opts.plan || ''); }
     return j('/api/backorders/ne-import', { method: 'POST', body: fd });
   };
 
@@ -1371,17 +1371,20 @@ console.log('── NE発注残 初期取込 (移行PO) ──');
   ok(r.body.warnings.some(w => w.includes('PMLに存在しない')), 'プレビュー: PML外商品は警告', r.body.warnings);
   ok(db.prepare('SELECT COUNT(*) n FROM po_orders').get().n === ordersBefore, 'プレビューは書込なし');
   const NE1_HASH = r.body.fileHash;
-  ok(typeof NE1_HASH === 'string' && NE1_HASH.length === 64, 'プレビュー: fileHash (SHA-256) を返す');
+  const NE1_PLAN = r.body.planHash;
+  ok(typeof NE1_HASH === 'string' && NE1_HASH.length === 64 && typeof NE1_PLAN === 'string' && NE1_PLAN.length === 64, 'プレビュー: fileHash/planHash (SHA-256) を返す');
 
-  // fileHash不一致 (プレビューと別ファイル・プレビューなし) の確定は拒否、書込なし
-  r = await upNe('ne1.csv', NE1, { commit: true, hash: 'deadbeef' });
+  // fileHash/planHash不一致 (プレビューと別ファイル・プレビューなし・DB変化) の確定は拒否、書込なし
+  r = await upNe('ne1.csv', NE1, { commit: true, hash: 'deadbeef', plan: NE1_PLAN });
   ok(r.status === 400 && r.body.error.includes('一致しません'), '確定: fileHash不一致は拒否', r.body.error);
   r = await upNe('ne1.csv', NE1, { commit: true });
-  ok(r.status === 400, '確定: fileHashなしは拒否');
+  ok(r.status === 400, '確定: ハッシュなしは拒否');
+  r = await upNe('ne1.csv', NE1, { commit: true, hash: NE1_HASH, plan: 'stale-plan' });
+  ok(r.status === 400 && r.body.error.includes('変わっています'), '確定: planHash不一致は拒否 (プレビュー後のDB変化)', r.body.error);
   ok(db.prepare('SELECT COUNT(*) n FROM po_orders').get().n === ordersBefore, 'ハッシュ不一致では書込なし');
 
   // 取込実行
-  r = await upNe('ne1.csv', NE1, { commit: true, hash: NE1_HASH });
+  r = await upNe('ne1.csv', NE1, { commit: true, hash: NE1_HASH, plan: NE1_PLAN });
   ok(r.status === 200 && r.body.ok && r.body.commit === true && r.body.created.length === 2, '取込実行: 移行PO 2件作成', r.body.created);
   const mig1 = db.prepare("SELECT * FROM po_orders WHERE ne_slip_number='6274'").get();
   ok(mig1 && mig1.status === 'issued' && mig1.origin === 'migration' && mig1.send_blocked === 1 && /^PO-\d{4}-\d{4,}$/.test(mig1.po_number),
@@ -1403,8 +1406,13 @@ console.log('── NE発注残 初期取込 (移行PO) ──');
     JOIN v_po_item_balance b ON b.order_item_id=i.id WHERE i.order_id=? AND i.product_key='not-in-pml-item'`).get(mig2.id);
   ok(npItem && npItem.unit_cost === null && npItem.remaining_qty === 3, 'PML外商品: 単価NULL + 残3', npItem && { c: npItem.unit_cost, rem: npItem.remaining_qty });
 
-  // 冪等: 同じCSVの再取込は全スキップ (二重登録なし。同内容ならfileHashは同一)
-  r = await upNe('ne1.csv', NE1, { commit: true, hash: NE1_HASH });
+  // 取込済み化でplanが変わるため、取込前の古いプレビューでの確定は拒否される
+  r = await upNe('ne1.csv', NE1, { commit: true, hash: NE1_HASH, plan: NE1_PLAN });
+  ok(r.status === 400 && r.body.error.includes('変わっています'), '取込済み化後、古いプレビューでの再確定は拒否');
+  // 冪等: 同じCSVを再度プレビュー→取込しても全スキップ (二重登録なし)
+  r = await upNe('ne1.csv', NE1);
+  ok(r.body.ok && r.body.orders === 0 && r.body.skipped.length === 2, '再プレビュー: 全伝票取込済み', r.body.skipped);
+  r = await upNe('ne1.csv', NE1, { commit: true, hash: r.body.fileHash, plan: r.body.planHash });
   ok(r.body.ok && r.body.orders === 0 && r.body.created.length === 0 && r.body.skipped.length === 2 && r.body.skipped.every(s => /^PO-/.test(s.poNumber)), '再取込: 全伝票スキップ (冪等)', r.body.skipped);
 
   // 移行POは発注提案の「発注済み」バッジ・月次上限集計を汚染しない (数量はNE注残としてPML反映済みのため)

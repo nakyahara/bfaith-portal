@@ -463,6 +463,7 @@ router.post('/api/backorders/ne-import', upload.single('file'), (req, res) => {
       buffer: buf,
       commit: !!(req.body && req.body.commit === '1'),
       expectedHash: (req.body && trimS(req.body.fileHash)) || null,
+      expectedPlanHash: (req.body && trimS(req.body.planHash)) || null,
       actor: actorOf(req),
     });
     res.json({ ok: true, ...result });
@@ -3864,21 +3865,24 @@ document.addEventListener('click', function(ev) {
 });
 
 // ── NE発注残の初期取込 (プレビュー → 取込実行の2段階) ──
-// プレビュー応答の fileHash を保持して確定時にサーバへ渡す (プレビュー後のファイル差し替えを検出)。
-// ファイル選択が変わったらプレビュー結果を無効化する
-var NE_IMP_HASH = null;
+// プレビュー応答の fileHash (CSV本体) と planHash (DB由来の確定内容) を保持して確定時にサーバへ渡す
+// (プレビュー後のファイル差し替え・DB変化を検出)。ファイル選択が変わったらプレビュー結果を無効化し、
+// 世代カウンタで遅延応答 (旧ファイルのプレビュー結果) を破棄する (Codex R2 Low)
+var NE_IMP_HASH = null, NE_IMP_PLAN = null, NE_IMP_GEN = 0;
 function neImpPost(commit) {
   var f = document.getElementById('neImpFile').files[0];
   if (!f) { toast('CSVファイルを選んでください'); return; }
-  if (commit && !NE_IMP_HASH) { toast('先にプレビューで内容を確認してください'); return; }
+  if (commit && (!NE_IMP_HASH || !NE_IMP_PLAN)) { toast('先にプレビューで内容を確認してください'); return; }
+  var gen = NE_IMP_GEN;
   var fd = new FormData();
   fd.append('file', f);
-  if (commit) { fd.append('commit', '1'); fd.append('fileHash', NE_IMP_HASH); }
+  if (commit) { fd.append('commit', '1'); fd.append('fileHash', NE_IMP_HASH); fd.append('planHash', NE_IMP_PLAN); }
   var out = document.getElementById('neImpOut');
   out.innerHTML = '<div class="muted">' + (commit ? '取込中…' : '確認中…') + '</div>';
   fetch(API + '/backorders/ne-import', { method: 'POST', body: fd }).then(function(r){ return jsonOrErr(r, commit); }).then(function(j) {
-    if (!j.ok) { NE_IMP_HASH = null; out.innerHTML = '<div class="warn" style="white-space:pre-wrap">' + esc(j.error) + '</div>'; return; }
-    if (!j.commit) NE_IMP_HASH = j.fileHash;
+    if (gen !== NE_IMP_GEN) return; // ファイルが変わった後に届いた旧応答は破棄
+    if (!j.ok) { NE_IMP_HASH = null; NE_IMP_PLAN = null; out.innerHTML = '<div class="warn" style="white-space:pre-wrap">' + esc(j.error) + '</div>'; return; }
+    if (!j.commit) { NE_IMP_HASH = j.fileHash; NE_IMP_PLAN = j.planHash; }
     var h = '';
     if (j.commit) {
       h += j.created.length
@@ -3901,11 +3905,16 @@ function neImpPost(commit) {
     var go = document.getElementById('neImpGo');
     if (go) go.addEventListener('click', function(){ go.disabled = true; neImpPost(true); });
     if (j.commit) load();
-  }).catch(function(e){ out.innerHTML = '<div class="warn">通信エラー: ' + esc(e.message) + (commit ? ' — 取込済み伝票は自動スキップされるため、もう一度プレビュー→取込実行しても二重登録になりません' : '') + '</div>'; });
+  }).catch(function(e){
+    if (gen !== NE_IMP_GEN) return;
+    NE_IMP_HASH = null; NE_IMP_PLAN = null;
+    out.innerHTML = '<div class="warn">通信エラー: ' + esc(e.message) + (commit ? ' — 取込済み伝票は自動スキップされるため、もう一度プレビュー→取込実行しても二重登録になりません' : '') + '</div>';
+  });
 }
 document.getElementById('neImpPrev').addEventListener('click', function(){ neImpPost(false); });
 document.getElementById('neImpFile').addEventListener('change', function(){
-  NE_IMP_HASH = null;
+  NE_IMP_GEN++;
+  NE_IMP_HASH = null; NE_IMP_PLAN = null;
   document.getElementById('neImpOut').innerHTML = '';
 });
 load();`;

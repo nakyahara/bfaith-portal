@@ -23,7 +23,7 @@ import { createHash } from 'crypto';
 import { getDB, normSupplierCode, normProductCode } from './db.js';
 import { decodeCsvBuffer, parseCsv } from './inbound.js';
 import { loadPmlMerged } from './logic.js';
-import { ensureTrackingStarted, nextPoNumber, appendPoItemEvent, audit, jstToday, isYmd } from './ledger.js';
+import { ensureTrackingStarted, nextPoNumber, appendPoItemEvent, audit, jstToday, isYmd, stableStringify } from './ledger.js';
 
 const nowIso = () => new Date().toISOString();
 const trimS = v => String(v == null ? '' : v).trim();
@@ -155,10 +155,27 @@ function buildPlan(db, slips, warnings) {
   return { plan, skipped };
 }
 
+/**
+ * 取込計画の決定論的ハッシュ (Codex R2 Medium)。fileHash がCSV本体を束縛するのに対し、
+ * planHash はDB由来の確定内容 (仕入先名・PML補完後の商品名/原価・スキップ状況) まで束縛する。
+ * プレビュー後にPML・マスタ・取込済み状況が変わっていたら確定時に不一致となり、再プレビューを要求する
+ */
+function planHashOf(plan, skipped) {
+  const proj = {
+    plan: plan.map(g => ({
+      slip: g.slip, supplier: g.supplier, supplierName: g.supplierName, neDate: g.neDate,
+      items: g.items.map(it => ({ code: it.code, name: it.name, qty: it.qty, rem: it.rem, due: it.due, cost: it.cost })),
+    })),
+    skipped: skipped.map(s => s.slip).sort(),
+  };
+  return createHash('sha256').update(stableStringify(proj)).digest('hex');
+}
+
 function summarize(commit, fileHash, plan, skipped, warnings) {
   return {
     commit: !!commit,
     fileHash,
+    planHash: planHashOf(plan, skipped),
     orders: plan.length,
     items: plan.reduce((s, g) => s + g.items.length, 0),
     totalRemaining: plan.reduce((s, g) => s + g.items.reduce((t, it) => t + it.rem, 0), 0),
@@ -179,10 +196,12 @@ function summarize(commit, fileHash, plan, skipped, warnings) {
  * @param {Buffer} buffer - アップロードされたCSV
  * @param {boolean} commit - false=プレビューのみ (書込なし)
  * @param {string|null} expectedHash - commit時必須。プレビュー応答の fileHash (プレビューしたCSVと同一かの検証)
- * @returns {commit, fileHash, orders, items, totalRemaining, receiptEvents, skipped, warnings, slips, created?}
+ * @param {string|null} expectedPlanHash - commit時必須。プレビュー応答の planHash (DB由来の確定内容が
+ *   プレビュー時から変わっていないかの検証。PML更新・別画面からの取込等で変わる)
+ * @returns {commit, fileHash, planHash, orders, items, totalRemaining, receiptEvents, skipped, warnings, slips, created?}
  * @throws 構造エラー (見出し不足・数値不正・伝票属性混在・仕入先未登録・draft競合・ハッシュ不一致 等) は全体拒否
  */
-export function importNeBackorderCsv({ buffer, commit = false, expectedHash = null, actor = null }) {
+export function importNeBackorderCsv({ buffer, commit = false, expectedHash = null, expectedPlanHash = null, actor = null }) {
   const fileHash = createHash('sha256').update(buffer).digest('hex');
   if (commit && expectedHash !== fileHash) {
     throw new Error('プレビューしたCSVと内容が一致しません。ファイルを選び直してもう一度プレビューしてください');
@@ -198,6 +217,11 @@ export function importNeBackorderCsv({ buffer, commit = false, expectedHash = nu
   // ── 書込 (全伝票を1つの BEGIN IMMEDIATE。取込済み判定・draft判定もロック取得後の状態で行う) ──
   return db.transaction(() => {
     const { plan, skipped } = buildPlan(db, slips, warnings);
+    // プレビューで画面に出した内容 (仕入先名・商品名・原価・スキップ状況) と、ロック取得後に
+    // 再構築した計画が一致することを確認 (プレビュー後のDB変化を無警告で確定させない、Codex R2 Medium)
+    if (expectedPlanHash !== planHashOf(plan, skipped)) {
+      throw new Error('プレビュー後にデータ (PML・マスタ・取込状況) が変わっています。もう一度プレビューして内容を確認してください');
+    }
     const now = nowIso();
     // 初回発行前の取込でも境界を確定させる (取込POは issued_at=now >= 境界 で tracked になる)
     ensureTrackingStarted(now);
