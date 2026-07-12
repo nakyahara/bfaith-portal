@@ -52,7 +52,7 @@ export function stableStringify(v) {
 
 // setSetting で変更できるキーのホワイトリスト (tracking_started_at は含めない=初回確定後は不変。
 // DB側にも UPDATE/DELETE 拒否トリガあり)
-const SETTABLE_KEYS = new Set(['backorder_source']);
+const SETTABLE_KEYS = new Set(['backorder_source', 'email_mode', 'email_dryrun_to', 'email_subject_template', 'email_body_template']);
 
 export function getSetting(key) {
   const r = getDB().prepare('SELECT value FROM po_settings WHERE key=?').get(key);
@@ -63,6 +63,16 @@ export function setSetting(key, value, { actor = null, actorType = 'user', reaso
   validateActor(actorType);
   if (!SETTABLE_KEYS.has(key)) throw new Error(`設定キーが不正です (変更可能: ${[...SETTABLE_KEYS].join(', ')}): ${key}`);
   if (key === 'backorder_source' && value !== 'ne' && value !== 'app') throw new Error(`backorder_source は ne/app のみ: ${value}`);
+  if (key === 'email_mode' && value !== 'dry_run' && value !== 'live') throw new Error(`email_mode は dry_run/live のみ: ${value}`);
+  if (key === 'email_dryrun_to') {
+    value = String(value).trim(); // 保存値もtrim (送信ヘッダに余分な空白を残さない)
+    if (value && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) {
+      throw new Error(`email_dryrun_to がメールアドレスではありません: ${value}`);
+    }
+  }
+  if (key === 'email_subject_template' && /[\r\n\0]/.test(String(value))) {
+    throw new Error('件名テンプレに改行は使えません (ヘッダインジェクション対策)');
+  }
   const db = getDB();
   db.transaction(() => {
     const old = db.prepare('SELECT value FROM po_settings WHERE key=?').get(key);
@@ -454,7 +464,7 @@ export function listBackorders() {
     out.push({
       id: o.id, poNumber: o.po_number, supplierCode: o.supplier_code, supplierName: o.supplier_name,
       note: o.note, requestedDate: o.requested_date, issuedAt: o.issued_at, closedAt: o.closed_at,
-      origin: o.origin, open,
+      origin: o.origin, open, sendBlocked: !!o.send_blocked,
       closeReason: o.closed_at ? (items.some(i => i.cutoff_qty > 0) ? 'manual' : 'completed') : null,
       remainingQty, knownAmount, unknownCostItems, overdueItems, attentionItems,
       items,

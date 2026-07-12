@@ -990,6 +990,263 @@ console.log('── P14: 入庫CSV取込+突合+割当 ──');
   ok(html.includes('mRemBox') && html.includes('Idempotency-Key'), '/inbound 割当も三択+冪等キー');
 }
 
+// ═══ P15 発注書メール送信 ═══
+console.log('── P15: メール送信 (fake transport) ──');
+{
+  process.env.PO_EMAIL_FAKE = '1';
+  // /email/send は expectedMode 必須 (プレビュー時モードの一致検証)。テストでは現在モードを自動注入
+  let CUR_MODE = 'dry_run';
+  const jsonPost = (p, body, key) => {
+    if (p.includes('/email/send') && body && body.expectedMode === undefined) body = { expectedMode: CUR_MODE, ...body };
+    return j(p, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(key ? { 'Idempotency-Key': key } : {}) }, body: JSON.stringify(body) });
+  };
+
+  // 送信対象PO (tracked)
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 7 }], requestedDate: '2026-07-30' }) });
+  const emOrderId = r.body.id;
+
+  // 宛先未登録 → preview はエラー
+  r = await j('/api/orders/' + emOrderId + '/email/preview');
+  ok(r.status === 400 && r.body.error.includes('メールアドレスが未登録'), 'preview: 宛先未登録はエラー案内', r.body.error);
+
+  // 宛先マスタCSV取込 (仕入先名称で突合、様の有無も吸収)
+  {
+    const csv = iconv.encode('"仕入先名称","担当者名（メールに使う項目なので必ず「様」をつける）","メールアドレス","CCメールアドレス"\r\n"アメージングクラフト","田中","tanaka@example.com","cc@example.com"\r\n"存在しない仕入先","x","x@example.com",""', 'Shift_JIS');
+    const fd = new FormData();
+    fd.append('file', new Blob([csv]), 'recipients.csv');
+    r = await j('/api/email/recipients/csv', { method: 'POST', body: fd });
+    ok(r.body.ok && r.body.updated === 1 && r.body.unmatched.length === 1, '宛先マスタCSV取込 (突合1件+不一致1件)', r.body);
+    const sup = db.prepare("SELECT * FROM po_suppliers WHERE supplier_code='1'").get();
+    ok(sup.email_to === 'tanaka@example.com' && sup.email_cc === 'cc@example.com' && sup.send_method === 'email', '仕入先マスタに宛先が入る');
+  }
+
+  // 対応表CSV取込 (ヘッダなし→A/C列フォールバック)
+  {
+    const csv = iconv.encode('"仕入先管理番号","x","弊社管理番号"\r\n"AMC-001","","noflyersticker"', 'Shift_JIS');
+    const fd = new FormData();
+    fd.append('supplier_code', '0001');
+    fd.append('file', new Blob([csv]), 'taiouhyou.csv');
+    r = await j('/api/vendor-map/csv', { method: 'POST', body: fd });
+    ok(r.body.ok && r.body.count === 1, '対応表CSV取込 (0001→1正規化)', r.body);
+  }
+
+  // dry-run宛先未設定 → send はエラー / 設定APIで dry-run 宛先を登録
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', {}, 'em-key-0');
+  ok(r.status === 400 && r.body.error.includes('dry-run'), 'send: dry-run宛先未設定はエラー');
+  r = await jsonPost('/api/email/settings', { dryrunTo: 'me@b-faith.biz' });
+  ok(r.body.ok && r.body.dryrunTo === 'me@b-faith.biz' && r.body.mode === 'dry_run', 'メール設定保存 (既定dry_run)');
+
+  // preview: テンプレ変数・担当者様・先方管理番号列
+  r = await j('/api/orders/' + emOrderId + '/email/preview');
+  ok(r.body.ok && r.body.subject.includes('【発注書】') && r.body.subject.includes('アメージングクラフト'), 'preview: 件名テンプレ (GAS互換)', r.body.subject);
+  ok(r.body.body.startsWith('田中様'), 'preview: 担当者に様を自動付与');
+  ok(r.body.vendorColUsed && r.body.csvText.includes('先方管理番号') && r.body.csvText.includes('AMC-001'), 'preview: 添付CSVに先方管理番号列', r.body.csvText.split('\r\n')[0]);
+
+  // 冪等キーなしの送信は拒否 (再送はdedup対象外のためキーが唯一の再実行ガード)
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', {});
+  ok(r.status === 400 && r.body.error.includes('Idempotency-Key'), '送信APIは冪等キー必須 (Codex P15 R4)');
+
+  // dry-run送信 (fake): 宛先差し替え+【DRYRUN】+整理番号+送信済み
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', {}, 'em-key-1');
+  ok(r.body.ok && r.body.status === 'sent' && r.body.dryRun !== false, 'dry-run送信 (fake Gmail)', r.body);
+  const job1 = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(r.body.jobId);
+  ok(job1.to_addr === 'me@b-faith.biz' && job1.subject.startsWith('【DRYRUN】') && job1.body.includes('整理番号: DK') && job1.is_dry_run === 1,
+    'dry-run: 宛先差替+件名+整理番号', job1.to_addr);
+  ok(job1.body.includes('本来の宛先: TO=tanaka@example.com'), 'dry-run: 本来の宛先を本文に明記');
+
+  // 冪等: 同一キー再送は同じジョブ (二重送信なし)
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', {}, 'em-key-1');
+  ok(r.body.ok && r.body.jobId === job1.id && r.body.replay === true, 'send: 同一キー再送はreplay');
+  ok(db.prepare('SELECT COUNT(*) AS n FROM po_email_jobs WHERE order_id=?').get(emOrderId).n === 1, 'ジョブは1件のみ');
+
+  // live切替は専用API+確認文字列 (通常設定APIでは変更不可)
+  r = await jsonPost('/api/email/settings', { mode: 'live' });
+  ok(r.body.ok && r.body.mode === 'dry_run', '通常設定APIではmodeを変更できない');
+  r = await jsonPost('/api/email/mode', { mode: 'live' });
+  ok(r.status === 400 && r.body.error.includes('LIVE'), 'live切替は確認文字列なしでは拒否');
+  r = await jsonPost('/api/email/mode', { mode: 'live', confirm: 'LIVE' });
+  ok(r.body.ok && r.body.mode === 'live', 'live切替 (confirm=LIVE)');
+  // プレビュー時モードと現在モードの不一致は拒否 (プレビュー後にliveへ変わっていたら送らない)
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', { expectedMode: 'dry_run' }, 'em-key-mode');
+  ok(r.status === 400 && r.body.error.includes('モードが変わって'), 'expectedMode不一致は拒否 (Codex P15 R9)', r.body.error);
+  CUR_MODE = 'live';
+
+  // 本番送信 → 同一内容の二重送信はdedup拒否 → 再送は元ジョブ指定必須
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', {}, 'em-key-2');
+  ok(r.body.ok && r.body.status === 'sent' && r.body.dryRun === false, 'live送信 (fake)', r.body);
+  const job2 = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(r.body.jobId);
+  ok(job2.to_addr === 'tanaka@example.com' && job2.cc_addr === 'cc@example.com' && !job2.subject.includes('DRYRUN'), 'live: 本来の宛先+CC');
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', {}, 'em-key-3');
+  ok(r.status === 400 && r.body.error.includes('送信済み'), '同一内容の二重送信はdedup拒否', r.body.error);
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', { resend: true }, 'em-key-4a');
+  ok(r.status === 400 && r.body.error.includes('resendOfJobId'), '再送は元ジョブ指定が必須 (Codex P15 R1)');
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', { resend: true, resendOfJobId: job2.id }, 'em-key-4');
+  ok(r.body.ok && r.body.status === 'sent', '再送 (元ジョブ=sent済み本送信を検証してresend_of保存)');
+  ok(db.prepare('SELECT resend_of FROM po_email_jobs WHERE id=?').get(r.body.jobId).resend_of === job2.id, 'resend_of が保存される');
+
+  // 失敗分類: 要求前の失敗=failed (再試行可)
+  process.env.PO_EMAIL_FAKE = 'fail';
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', { resend: true, resendOfJobId: job2.id }, 'em-key-5');
+  ok(r.body.ok && r.body.status === 'failed' && r.body.error.includes('要求前'), '要求前の失敗はfailed (再試行可)', r.body);
+  const failedJobId = r.body.jobId;
+  process.env.PO_EMAIL_FAKE = '1';
+  r = await jsonPost('/api/email-jobs/' + failedJobId + '/retry', {});
+  ok(r.body.ok && r.body.status === 'sent', 'failedジョブの再試行→送信');
+
+  // 失敗分類: 要求後の失敗=unknown (自動・通常再試行は不可。人間確認→queued→送信、Codex P15 R1 High-1)
+  process.env.PO_EMAIL_FAKE = 'fail_unknown';
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', { resend: true, resendOfJobId: job2.id }, 'em-key-6');
+  ok(r.body.ok && r.body.status === 'unknown', '要求後の失敗はunknown (結果不明)', r.body);
+  const unknownJobId = r.body.jobId;
+  process.env.PO_EMAIL_FAKE = '1';
+  r = await jsonPost('/api/email-jobs/' + unknownJobId + '/retry', {});
+  ok(r.status === 400 && r.body.error.includes('二重送信防止'), 'unknownは通常再試行できない');
+  // unknown中は同一内容の新規通常送信もdedupが拒否 (状態機械の迂回不可、Codex P15 R3 High)
+  // ※このジョブはresendなのでdedup対象外 → 通常送信ジョブのunknownで検証する
+  r = await jsonPost('/api/email-jobs/' + unknownJobId + '/mark-unsent', {});
+  ok(r.status === 400, 'mark-unsentは確認文字列必須');
+  // 15分フェンス: 送信試行直後は未送信宣言できない (停止中の旧送信の可能性)
+  r = await jsonPost('/api/email-jobs/' + unknownJobId + '/mark-unsent', { confirm: '未送信' });
+  ok(r.status === 400 && r.body.error.includes('15分'), 'mark-unsent: 送信試行15分以内は拒否 (Codex P15 R16)', r.body.error);
+  db.prepare("UPDATE po_email_jobs SET sending_started_at='2020-01-01T00:00:00.000Z' WHERE id=?").run(unknownJobId);
+  r = await jsonPost('/api/email-jobs/' + unknownJobId + '/mark-unsent', { confirm: '未送信' });
+  ok(r.body.ok && r.body.status === 'queued', '人間確認後にqueuedへ');
+  ok(db.prepare('SELECT attempt_count FROM po_email_jobs WHERE id=?').get(unknownJobId).attempt_count === 0,
+    'mark-unsentで再試行カウントもリセット (上限で復旧不能にならない)');
+  // generation: markUnsent と lease で世代が進む (照合の競合検知に使う)
+  {
+    const g = db.prepare('SELECT generation FROM po_email_jobs WHERE id=?').get(unknownJobId).generation;
+    ok(g >= 2, 'markUnsent/leaseで世代 (generation) が進む', g);
+  }
+  r = await jsonPost('/api/email-jobs/' + unknownJobId + '/retry', {});
+  ok(r.body.ok && r.body.status === 'sent', '確認後の再試行→送信');
+
+  // 再送回数の上限 (同一元ジョブへ3回まで。em-key-4/5/6で3回済み)
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', { resend: true, resendOfJobId: job2.id }, 'em-key-7');
+  ok(r.status === 400 && r.body.error.includes('3回まで'), '再送回数の上限 (3回)');
+  // 再送ジョブを起点にしても上限は回避できない (ルートに正規化、Codex P15 R2 High)
+  const resendChild = db.prepare("SELECT id FROM po_email_jobs WHERE resend_of=? AND status='sent' LIMIT 1").get(job2.id);
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', { resend: true, resendOfJobId: resendChild.id }, 'em-key-7b');
+  ok(r.status === 400 && r.body.error.includes('3回まで'), '再送チェーンでも上限回避不可 (ルート正規化)', r.body.error);
+
+  // 実在しない予約日時は拒否
+  r = await jsonPost('/api/orders/' + emOrderId + '/email/send', { scheduledAt: '2026-02-30T10:00' }, 'em-key-7c');
+  ok(r.status === 400 && r.body.error.includes('実在しない'), '実在しない予約日時 (2/30) は拒否');
+
+  // live時、対応表があるのに先方管理番号が無い商品は送信ブロック (Codex P15 R1 M5)
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'cardstand-silver-r', qty: 2 }] }) });
+  const schedOrderId = r.body.id;
+  r = await jsonPost('/api/orders/' + schedOrderId + '/email/send', {}, 'em-key-vm');
+  ok(r.status === 400 && r.body.error.includes('先方管理番号'), 'live: 先方管理番号の欠落は送信ブロック', r.body.error);
+
+  // unknown中は同一内容の新規通常送信もdedupが拒否 (状態機械の迂回不可、Codex P15 R3 High)
+  {
+    r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 9 }] }) });
+    const unkOrderId = r.body.id;
+    process.env.PO_EMAIL_FAKE = 'fail_unknown';
+    r = await jsonPost('/api/orders/' + unkOrderId + '/email/send', {}, 'em-key-unk1');
+    ok(r.body.ok && r.body.status === 'unknown', '通常送信がunknownに', r.body);
+    process.env.PO_EMAIL_FAKE = '1';
+    r = await jsonPost('/api/orders/' + unkOrderId + '/email/send', {}, 'em-key-unk2');
+    ok(r.status === 400 && r.body.error.includes('送信済み'), 'unknown中の新規通常送信はdedup拒否 (迂回不可)', r.body.error);
+  }
+
+  // failed もdedup対象 (failed再試行+新規送信の併存で二重送信しない、Codex P15 R12 High)
+  {
+    r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 4 }] }) });
+    const fOrderId = r.body.id;
+    process.env.PO_EMAIL_FAKE = 'fail';
+    r = await jsonPost('/api/orders/' + fOrderId + '/email/send', {}, 'em-key-f1');
+    ok(r.body.ok && r.body.status === 'failed', '通常送信がfailedに');
+    const fJobId = r.body.jobId;
+    process.env.PO_EMAIL_FAKE = '1';
+    r = await jsonPost('/api/orders/' + fOrderId + '/email/send', {}, 'em-key-f2');
+    ok(r.status === 400 && r.body.error.includes('送信済み'), 'failed併存中の新規通常送信はdedup拒否');
+    r = await jsonPost('/api/email-jobs/' + fJobId + '/cancel', {});
+    ok(r.body.ok, 'failedジョブの取消');
+    r = await jsonPost('/api/orders/' + fOrderId + '/email/send', {}, 'em-key-f3');
+    ok(r.body.ok && r.body.status === 'sent', '取消後は新規送信できる');
+  }
+
+  // 予約送信: 未来時刻はqueuedのまま (scheduled)→時刻到来で送信。過去時刻は拒否。取消可能 (dry-runで実施)
+  {
+    await jsonPost('/api/email/mode', { mode: 'dry_run' });
+    CUR_MODE = 'dry_run';
+    r = await jsonPost('/api/orders/' + schedOrderId + '/email/send', { scheduledAt: '2020-01-01T00:00' }, 'em-key-8');
+    ok(r.status === 400 && r.body.error.includes('過去'), '過去日時の予約は拒否');
+    const jst = new Date(Date.now() + 9 * 3600000 + 3600000).toISOString().slice(0, 16); // 1時間後 (JST表記)
+    r = await jsonPost('/api/orders/' + schedOrderId + '/email/send', { scheduledAt: jst }, 'em-key-9');
+    ok(r.body.ok && r.body.status === 'scheduled', '予約送信: 時刻までqueued (scheduled)', r.body);
+    const schedJob = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(r.body.jobId);
+    ok(schedJob.status === 'queued' && schedJob.scheduled_at != null, '予約ジョブ: queued+scheduled_at保存');
+    r = await jsonPost('/api/email-jobs/' + schedJob.id + '/retry', {});
+    ok(r.body.ok && r.body.status === 'scheduled', '予約時刻前のretryは送信しない');
+    // 予約の取消
+    r = await jsonPost('/api/email-jobs/' + schedJob.id + '/cancel', {});
+    ok(r.body.ok && r.body.status === 'cancelled', '予約の取消');
+    // 新しい予約→時刻到来をシミュレート→送信 (ディスパッチャはretryと同じ経路)
+    r = await jsonPost('/api/orders/' + schedOrderId + '/email/send', { scheduledAt: jst }, 'em-key-10');
+    const schedJob2Id = r.body.jobId;
+    db.prepare("UPDATE po_email_jobs SET scheduled_at='2020-01-01T00:00:00.000Z' WHERE id=?").run(schedJob2Id);
+    r = await jsonPost('/api/email-jobs/' + schedJob2Id + '/retry', {});
+    ok(r.body.ok && r.body.status === 'sent', '予約時刻到来→送信');
+
+    // 取り残された即時ジョブ (コミット直後クラッシュ相当) をディスパッチャが回収する (Codex P15 R14)
+    const em = await imp('apps/purchase-orders/email.js');
+    r = await jsonPost('/api/orders/' + schedOrderId + '/email/send', { scheduledAt: jst }, 'em-key-orphan');
+    const orphanId = r.body.jobId;
+    db.prepare("UPDATE po_email_jobs SET scheduled_at=NULL, created_at='2020-01-01T00:00:00.000Z' WHERE id=?").run(orphanId);
+    const disp = await em.dispatchDueEmailJobs();
+    ok(disp.processed >= 1 && db.prepare('SELECT status FROM po_email_jobs WHERE id=?').get(orphanId).status === 'sent',
+      'ディスパッチャ: 孤児queued (即時・2分超) を回収して送信', disp);
+  }
+
+  // MIME 生成 (Message-ID=delivery_key、添付CP932)
+  {
+    const em = await imp('apps/purchase-orders/email.js');
+    const mime = em.buildMime(job2);
+    ok(mime.includes('Message-ID: <' + job2.delivery_key + '@') && mime.includes('Content-Disposition: attachment; filename="' + job2.attachment_name + '"'),
+      'MIME: Message-ID (照合キー)+添付ファイル名 (PO番号.csv)');
+    ok(/Subject: =\?UTF-8\?B\?/.test(mime), 'MIME: 件名RFC2047エンコード');
+  }
+
+  // 状態遷移トリガ: sent は終端 (直接SQLでも戻せない)
+  let threw = null;
+  try { db.prepare("UPDATE po_email_jobs SET status='queued' WHERE id=?").run(failedJobId); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('終端状態'), '送信済みジョブの状態巻き戻しはトリガが拒否');
+
+  // 照合: stale sending → Gmail検索1件=sent / 0件=unknownのまま (queuedに自動で戻さない)
+  {
+    process.env.PO_EMAIL_FAKE = 'fail';
+    r = await jsonPost('/api/orders/' + schedOrderId + '/email/send', {}, 'em-key-11');
+    const staleId = r.body.jobId; // failed (dry-run。dedupはdry-run対象外なので作れる)
+    process.env.PO_EMAIL_FAKE = '1';
+    db.prepare("UPDATE po_email_jobs SET status='queued', error=NULL WHERE id=?").run(staleId);
+    db.prepare("UPDATE po_email_jobs SET status='sending', sending_started_at='2020-01-01T00:00:00.000Z' WHERE id=?").run(staleId);
+    process.env.PO_EMAIL_FAKE_SEARCH = 'error';
+    r = await jsonPost('/api/email/reconcile', {});
+    ok(r.body.ok && r.body.checked >= 1, '照合: staleなsendingを検査', r.body);
+    let st1 = db.prepare('SELECT status FROM po_email_jobs WHERE id=?').get(staleId);
+    ok(st1.status === 'unknown', '照合不能→unknownに落とす (queuedに戻さない)');
+    process.env.PO_EMAIL_FAKE_SEARCH = 'found';
+    r = await jsonPost('/api/email/reconcile', {});
+    st1 = db.prepare('SELECT status FROM po_email_jobs WHERE id=?').get(staleId);
+    ok(st1.status === 'sent', '照合: Gmailに存在→sentに回復');
+    delete process.env.PO_EMAIL_FAKE_SEARCH;
+  }
+
+  // /admin にメール設定セクション、/backorders に📧ボタン
+  {
+    const adminHtml = await (await fetch(base + '/admin')).text();
+    ok(adminHtml.includes('発注書メール設定') && adminHtml.includes('recipForm') && adminHtml.includes('vmapForm'), '/admin メール設定+宛先/対応表取込');
+    const boHtml = await (await fetch(base + '/backorders')).text();
+    ok(boHtml.includes('data-emailui') && boHtml.includes('DRYRUN') === false && boHtml.includes('emailPanel'), '/backorders 発注書メールパネル');
+  }
+}
 function nowIsoStr() { return new Date().toISOString(); }
 
 server.close();
