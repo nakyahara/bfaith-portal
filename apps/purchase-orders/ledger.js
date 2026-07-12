@@ -64,8 +64,11 @@ export function setSetting(key, value, { actor = null, actorType = 'user', reaso
   if (!SETTABLE_KEYS.has(key)) throw new Error(`設定キーが不正です (変更可能: ${[...SETTABLE_KEYS].join(', ')}): ${key}`);
   if (key === 'backorder_source' && value !== 'ne' && value !== 'app') throw new Error(`backorder_source は ne/app のみ: ${value}`);
   if (key === 'email_mode' && value !== 'dry_run' && value !== 'live') throw new Error(`email_mode は dry_run/live のみ: ${value}`);
-  if (key === 'email_dryrun_to' && String(value).trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value).trim())) {
-    throw new Error(`email_dryrun_to がメールアドレスではありません: ${value}`);
+  if (key === 'email_dryrun_to') {
+    value = String(value).trim(); // 保存値もtrim (送信ヘッダに余分な空白を残さない)
+    if (value && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) {
+      throw new Error(`email_dryrun_to がメールアドレスではありません: ${value}`);
+    }
   }
   if (key === 'email_subject_template' && /[\r\n\0]/.test(String(value))) {
     throw new Error('件名テンプレに改行は使えません (ヘッダインジェクション対策)');

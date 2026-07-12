@@ -315,6 +315,10 @@ export async function reconcileEmailJobs() {
   // 検索中に未送信宣言→再試行が始まっていたら古い照合結果は破棄される (新しい送信をsent扱いにしない)
   const applyFound = db.transaction((jobId, gen, found) => {
     const cur = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(jobId);
+    if (!cur) {
+      audit(db, { actorType: 'system', actor: null, action: 'email_reconcile_missing_job', resource: `email_job:${jobId}`, detail: { found } });
+      return '対象ジョブが存在しません (削除?)';
+    }
     if (cur.status === 'sent') return 'sent (確定済み)';
     if (cur.generation !== gen || (cur.status !== 'sending' && cur.status !== 'unknown')) {
       // 終端状態 (sent/cancelled) には矛盾する再照合noteを書かない (監査ログには残す)
@@ -332,6 +336,7 @@ export async function reconcileEmailJobs() {
   });
   const applyNotFound = db.transaction((jobId, gen, msg) => {
     const cur = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(jobId);
+    if (!cur) return '対象ジョブが存在しません (削除?)';
     if (cur.generation !== gen || (cur.status !== 'sending' && cur.status !== 'unknown')) {
       return `${cur.status} (照合中に状態変化。そのまま)`;
     }

@@ -567,8 +567,10 @@ function initLedgerSchema(db) {
   addCol(db, 'po_email_jobs', 'generation', 'INTEGER NOT NULL DEFAULT 0');
   addCol(db, 'po_email_jobs', 'scheduled_at', 'TEXT');
   // 同一PO+同一内容の二重送信を禁止 (再送は is_resend=1 で明示。dry-runは本送信のdedupを妨げない)。
-  // unknown (結果不明) も対象 — 不明のまま新規の通常送信で状態機械を迂回させない (Codex P15-R3 High)
-  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS uq_po_email_dedup ON po_email_jobs(order_id, content_hash)
+  // unknown (結果不明) も対象 — 不明のまま新規の通常送信で状態機械を迂回させない (Codex P15-R3 High)。
+  // 部分インデックスの条件は定義変更があり得るため、トリガ同様に毎起動DROP→CREATEで最新定義を保証 (Codex P15-R11 High)
+  db.exec('DROP INDEX IF EXISTS uq_po_email_dedup');
+  db.exec(`CREATE UNIQUE INDEX uq_po_email_dedup ON po_email_jobs(order_id, content_hash)
            WHERE is_resend = 0 AND is_dry_run = 0 AND status IN ('queued','sending','sent','unknown')`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_po_email_status ON po_email_jobs(status, created_at)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_po_email_order ON po_email_jobs(order_id, created_at)');
