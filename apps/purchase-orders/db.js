@@ -181,7 +181,9 @@ function initLedgerSchema(db) {
   addCol(db, 'po_orders', 'tracking_mode', 'TEXT');    // 'tracked' = 発行時に固定される業務属性。正は issued_at>=境界
   addCol(db, 'po_orders', 'origin', 'TEXT');           // NULL / 'migration' (移行専用PO)
   addCol(db, 'po_orders', 'send_blocked', 'INTEGER');  // 1=メール/発注書出力の対象外 (移行PO誤発注防止)
+  addCol(db, 'po_orders', 'ne_slip_number', 'TEXT');   // NE発注伝票番号 (NE発注残初期取込の冪等キー。移行PO以外はNULL)
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS uq_po_orders_number ON po_orders(po_number) WHERE po_number IS NOT NULL`);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS uq_po_orders_ne_slip ON po_orders(ne_slip_number) WHERE ne_slip_number IS NOT NULL`);
 
   addCol(db, 'po_order_items', 'requested_date', 'TEXT');        // 明細単位希望納期 (確定時スナップショット、issued後不変)
   addCol(db, 'po_order_items', 'promised_date', 'TEXT');         // 仕入先回答納期 (最新値。履歴=po_item_history)
@@ -199,12 +201,12 @@ function initLedgerSchema(db) {
   // 発行済みPO・明細の不変性 (Codex P13a-R1 High-1): 台帳の基準値 (発注数・商品・発行属性) を
   // 直接SQL・保守スクリプトからも守る。数量減=取消イベント、数量増=新規発注が唯一の経路
   db.exec(`CREATE TRIGGER trg_po_orders_issued_immutable
-           BEFORE UPDATE OF status, issued_at, po_number, tracking_mode, requested_date, supplier_code, origin ON po_orders
+           BEFORE UPDATE OF status, issued_at, po_number, tracking_mode, requested_date, supplier_code, origin, ne_slip_number ON po_orders
            WHEN OLD.status = 'issued' AND (
              NEW.status IS NOT OLD.status OR NEW.issued_at IS NOT OLD.issued_at OR
              NEW.po_number IS NOT OLD.po_number OR NEW.tracking_mode IS NOT OLD.tracking_mode OR
              NEW.requested_date IS NOT OLD.requested_date OR NEW.supplier_code IS NOT OLD.supplier_code OR
-             NEW.origin IS NOT OLD.origin
+             NEW.origin IS NOT OLD.origin OR NEW.ne_slip_number IS NOT OLD.ne_slip_number
            )
            BEGIN SELECT RAISE(ABORT, 'issued order is immutable (発行済みPOの発行属性は変更不可)'); END`);
   db.exec(`CREATE TRIGGER trg_po_items_issued_immutable
@@ -229,6 +231,21 @@ function initLedgerSchema(db) {
            BEFORE INSERT ON po_order_items
            WHEN (SELECT status FROM po_orders WHERE id = NEW.order_id) = 'issued'
            BEGIN SELECT RAISE(ABORT, 'issued order is immutable (発行済みPOへの明細追加は不可。追加発注は新規POで)'); END`);
+  // 移行PO属性の列間規則 (Codex NE取込R1 Medium-5): origin='migration' ⇔ ne_slip_number 必須 + send_blocked=1。
+  // 直接SQL・別コード経路からメール送信可能な移行POや二重カウント除外されないNE伝票POを作らせない
+  const MIG_RULES = `
+             SELECT CASE
+               WHEN NEW.origin IS NOT NULL AND NEW.origin <> 'migration'
+                 THEN RAISE(ABORT, 'migration rules: origin は NULL/migration のみ')
+               WHEN NEW.origin = 'migration' AND (NEW.ne_slip_number IS NULL OR trim(NEW.ne_slip_number) = '' OR NEW.send_blocked IS NOT 1)
+                 THEN RAISE(ABORT, 'migration rules: 移行POは ne_slip_number と send_blocked=1 が必須')
+               WHEN NEW.ne_slip_number IS NOT NULL AND NEW.origin IS NOT 'migration'
+                 THEN RAISE(ABORT, 'migration rules: ne_slip_number は移行POのみ')
+             END;`;
+  db.exec(`CREATE TRIGGER trg_po_orders_migration_attrs_ins BEFORE INSERT ON po_orders
+           BEGIN ${MIG_RULES} END`);
+  db.exec(`CREATE TRIGGER trg_po_orders_migration_attrs_upd BEFORE UPDATE OF origin, ne_slip_number, send_blocked ON po_orders
+           BEGIN ${MIG_RULES} END`);
   // disposition/next_* の列間規則 (Codex P13a-R2 Medium-1): 直接SQLでも規則違反を保存できない。
   // INSERT側も同じ規則で保護 (draft明細に不正状態を仕込んでissueで固定させない、R3 Medium-1)。
   // next_expected_qty ≤ 残数 は集計を要するためアプリ層+整合性検査で担保

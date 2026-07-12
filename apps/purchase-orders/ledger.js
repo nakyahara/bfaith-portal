@@ -528,6 +528,15 @@ export function checkLedgerIntegrity({ orderId = null } = {}) {
       issues.push({ kind: 'invalid_timestamp', orderId: r.id, detail: `issued_at=${r.issued_at}` });
     }
   }
+  // 2c. 移行PO属性の列間規則の検算 (トリガ trg_po_orders_migration_attrs_* の防波堤。
+  //     origin='migration' ⇔ ne_slip_number 必須 + send_blocked=1。違反POはメール誤送信・二重カウントの温床)
+  for (const r of db.prepare(`
+    SELECT o.id, o.origin, o.ne_slip_number, o.send_blocked FROM po_orders o
+    WHERE ((o.origin IS NOT NULL AND o.origin <> 'migration')
+       OR (o.origin = 'migration' AND (o.ne_slip_number IS NULL OR trim(o.ne_slip_number) = '' OR o.send_blocked IS NOT 1))
+       OR (o.ne_slip_number IS NOT NULL AND o.origin IS NOT 'migration')) ${scope}`).all(...args)) {
+    issues.push({ kind: 'migration_attrs', orderId: r.id, detail: `origin=${r.origin} ne_slip=${r.ne_slip_number} send_blocked=${r.send_blocked}` });
+  }
   // 2b. 逆仕訳の不変条件の検算 (通常はトリガ+UNIQUEが守る。メンテモード・移行後の検査用)
   for (const r of db.prepare(`
     SELECT v.id, v.reverses_id, v.order_item_id, v.qty, v.effective_date,

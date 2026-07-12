@@ -1337,6 +1337,179 @@ console.log('── 対応表 1件管理 (entries/products/entry upsert/delete) 
 }
 function nowIsoStr() { return new Date().toISOString(); }
 
+console.log('── NE発注残 初期取込 (移行PO) ──');
+{
+  const neCsvOf = rows => iconv.encode(rows.map(r => r.map(v => '"' + String(v) + '"').join(',')).join('\r\n'), 'Shift_JIS');
+  const NEHDR = ['発注伝票番号', '発注先名', '商品コード', '商品名', 'option', '発注数', '注残計', '予定納期', '備考', '商品区分', '受注伝票番号', '明細行', '発行日', '仕入先cd', '発注明細行', '商品区分値'];
+  const neRow = (slip, code, name, qty, rem, date, sup, due = '') => [slip, 'テスト様', code, name, '', qty, rem, due, '', '通常', '0', '0', date, sup, '1', '0'];
+  const upNe = async (name, rows, opts = {}) => {
+    const fd = new FormData();
+    fd.append('file', new Blob([neCsvOf(rows)]), name);
+    if (opts.commit) { fd.append('commit', '1'); fd.append('fileHash', opts.hash || ''); fd.append('planHash', opts.plan || ''); }
+    return j('/api/backorders/ne-import', { method: 'POST', body: fd });
+  };
+
+  // 事前状態 (発注済みバッジ・月次上限・PO件数)
+  r = await j('/api/supplier/1');
+  const beforeIssuedTotal = r.body.issuedTotal;
+  const beforeDead = (r.body.horikoshi.find(p => p.code === 'deaditem') || {}).recentIssued || null;
+  const ordersBefore = db.prepare('SELECT COUNT(*) n FROM po_orders').get().n;
+  // 整合性はP14が意図的に残した訂正競合が既に載っているため、取込で「増えない」ことを検証する
+  r = await j('/api/ledger/integrity');
+  const integrityBefore = r.body.issues.length;
+
+  // プレビュー (書込なし)。NE実CSVと同じ列構成 + YYYY/M/D 日付 + 部分入庫済 + PML外商品
+  const NE1 = [NEHDR,
+    neRow('6274', 'noflyersticker', 'チラシ', 500, 200, '2025/12/18', '0001'),
+    neRow('6274', 'deaditem', '休眠', 100, 100, '2025/12/18', '0001', '2026/8/1'),
+    neRow('7645', 'gyoumuhandcream60-BI', 'ハンドクリーム', 24, 24, '2026/6/8', '0002'),
+    neRow('7645', 'not-in-pml-item', 'PML外商品', 10, 3, '2026/6/8', '0002'),
+  ];
+  r = await upNe('ne1.csv', NE1);
+  ok(r.status === 200 && r.body.ok && r.body.commit === false && r.body.orders === 2 && r.body.items === 4, 'プレビュー: 2伝票4明細', r.body);
+  ok(r.body.totalRemaining === 327 && r.body.receiptEvents === 2, 'プレビュー: 残数計327 / 取込前入庫2明細', { rem: r.body.totalRemaining, ev: r.body.receiptEvents });
+  ok(r.body.warnings.some(w => w.includes('PMLに存在しない')), 'プレビュー: PML外商品は警告', r.body.warnings);
+  ok(db.prepare('SELECT COUNT(*) n FROM po_orders').get().n === ordersBefore, 'プレビューは書込なし');
+  const NE1_HASH = r.body.fileHash;
+  const NE1_PLAN = r.body.planHash;
+  ok(typeof NE1_HASH === 'string' && NE1_HASH.length === 64 && typeof NE1_PLAN === 'string' && NE1_PLAN.length === 64, 'プレビュー: fileHash/planHash (SHA-256) を返す');
+
+  // fileHash/planHash不一致 (プレビューと別ファイル・プレビューなし・DB変化) の確定は拒否、書込なし
+  r = await upNe('ne1.csv', NE1, { commit: true, hash: 'deadbeef', plan: NE1_PLAN });
+  ok(r.status === 400 && r.body.error.includes('一致しません'), '確定: fileHash不一致は拒否', r.body.error);
+  r = await upNe('ne1.csv', NE1, { commit: true });
+  ok(r.status === 400, '確定: ハッシュなしは拒否');
+  r = await upNe('ne1.csv', NE1, { commit: true, hash: NE1_HASH, plan: 'stale-plan' });
+  ok(r.status === 400 && r.body.error.includes('変わっています'), '確定: planHash不一致は拒否 (プレビュー後のDB変化)', r.body.error);
+  ok(db.prepare('SELECT COUNT(*) n FROM po_orders').get().n === ordersBefore, 'ハッシュ不一致では書込なし');
+
+  // 取込実行
+  r = await upNe('ne1.csv', NE1, { commit: true, hash: NE1_HASH, plan: NE1_PLAN });
+  ok(r.status === 200 && r.body.ok && r.body.commit === true && r.body.created.length === 2, '取込実行: 移行PO 2件作成', r.body.created);
+  const mig1 = db.prepare("SELECT * FROM po_orders WHERE ne_slip_number='6274'").get();
+  ok(mig1 && mig1.status === 'issued' && mig1.origin === 'migration' && mig1.send_blocked === 1 && /^PO-\d{4}-\d{4,}$/.test(mig1.po_number),
+    '移行PO: issued + origin=migration + send_blocked + PO番号採番', mig1 && { origin: mig1.origin, po: mig1.po_number });
+  ok(mig1.note.includes('伝票6274') && mig1.note.includes('2025-12-18'), '移行PO: noteにNE伝票番号+NE発行日', mig1.note);
+  // 残数 = NE注残計 (発注500 → migration入荷300 → 残200)
+  const migItem = db.prepare(`SELECT i.*, b.remaining_qty, b.received_qty FROM po_order_items i
+    JOIN v_po_item_balance b ON b.order_item_id=i.id WHERE i.order_id=? AND i.product_key='noflyersticker'`).get(mig1.id);
+  ok(migItem.qty === 500 && migItem.received_qty === 300 && migItem.remaining_qty === 200, '明細: qty=NE発注数500 / 取込前入庫300 / 残200',
+    { q: migItem.qty, rcv: migItem.received_qty, rem: migItem.remaining_qty });
+  const migEv = db.prepare('SELECT * FROM po_item_events WHERE order_item_id=?').get(migItem.id);
+  ok(migEv && migEv.source === 'migration' && migEv.actor_type === 'migration' && migEv.qty === 300, 'イベント: source/actor_type=migration ×300', migEv && migEv.source);
+  // 予定納期 → 明細の希望納期 + PML原価スナップショット
+  const deadItem = db.prepare("SELECT * FROM po_order_items WHERE order_id=? AND product_key='deaditem'").get(mig1.id);
+  ok(deadItem.requested_date === '2026-08-01' && deadItem.unit_cost === 200, '明細: 予定納期→希望納期 + PML原価200', { d: deadItem.requested_date, c: deadItem.unit_cost });
+  // PML外商品は単価未設定で取り込まれる
+  const mig2 = db.prepare("SELECT * FROM po_orders WHERE ne_slip_number='7645'").get();
+  const npItem = db.prepare(`SELECT i.*, b.remaining_qty FROM po_order_items i
+    JOIN v_po_item_balance b ON b.order_item_id=i.id WHERE i.order_id=? AND i.product_key='not-in-pml-item'`).get(mig2.id);
+  ok(npItem && npItem.unit_cost === null && npItem.remaining_qty === 3, 'PML外商品: 単価NULL + 残3', npItem && { c: npItem.unit_cost, rem: npItem.remaining_qty });
+
+  // 取込済み化でplanが変わるため、取込前の古いプレビューでの確定は拒否される
+  r = await upNe('ne1.csv', NE1, { commit: true, hash: NE1_HASH, plan: NE1_PLAN });
+  ok(r.status === 400 && r.body.error.includes('変わっています'), '取込済み化後、古いプレビューでの再確定は拒否');
+  // 冪等: 同じCSVを再度プレビュー→取込しても全スキップ (二重登録なし)
+  r = await upNe('ne1.csv', NE1);
+  ok(r.body.ok && r.body.orders === 0 && r.body.skipped.length === 2, '再プレビュー: 全伝票取込済み', r.body.skipped);
+  r = await upNe('ne1.csv', NE1, { commit: true, hash: r.body.fileHash, plan: r.body.planHash });
+  ok(r.body.ok && r.body.orders === 0 && r.body.created.length === 0 && r.body.skipped.length === 2 && r.body.skipped.every(s => /^PO-/.test(s.poNumber)), '再取込: 全伝票スキップ (冪等)', r.body.skipped);
+
+  // planHashがDB由来フィールドを束縛していることの回帰テスト (プレビュー後のPML原価変更で拒否、Codex R3 Low)
+  {
+    const NE3 = [NEHDR, neRow('9200', 'deaditem', '休眠', 10, 10, '2026/7/1', '0001')];
+    r = await upNe('ne3.csv', NE3);
+    const h3 = r.body.fileHash, p3 = r.body.planHash;
+    db.prepare("UPDATE mirror_pml_snapshot_rows SET 原価=999 WHERE 商品コード='deaditem'").run();
+    r = await upNe('ne3.csv', NE3, { commit: true, hash: h3, plan: p3 });
+    ok(r.status === 400 && r.body.error.includes('変わっています'), 'プレビュー後のPML原価変更は確定拒否 (planHash束縛)', r.body.error);
+    db.prepare("UPDATE mirror_pml_snapshot_rows SET 原価=200 WHERE 商品コード='deaditem'").run();
+    r = await upNe('ne3.csv', NE3);
+    r = await upNe('ne3.csv', NE3, { commit: true, hash: r.body.fileHash, plan: r.body.planHash });
+    ok(r.body.ok && r.body.created.length === 1, '原価復元後の再プレビュー→確定は成功');
+  }
+
+  // 移行POは発注提案の「発注済み」バッジ・月次上限集計を汚染しない (数量はNE注残としてPML反映済みのため)
+  r = await j('/api/supplier/1');
+  const afterDead = (r.body.horikoshi.find(p => p.code === 'deaditem') || {}).recentIssued || null;
+  ok(JSON.stringify(afterDead) === JSON.stringify(beforeDead), '移行POは「発注済み」バッジに出ない', afterDead);
+  ok(r.body.issuedTotal === beforeIssuedTotal, '移行POは月次上限集計に入らない', { before: beforeIssuedTotal, after: r.body.issuedTotal });
+
+  // 移行POへ発注書メールは送れない (send_blocked)
+  r = await j('/api/orders/' + mig1.id + '/email/preview');
+  ok(r.status === 400 && r.body.error.includes('送信対象外'), '移行POのメールプレビューは拒否', r.body.error);
+
+  // 発注残一覧に載る + 台帳整合性クリーン
+  r = await j('/api/backorders');
+  const boMig = r.body.orders.find(o => o.id === mig1.id);
+  ok(boMig && boMig.origin === 'migration' && boMig.sendBlocked === true && boMig.remainingQty === 300, '発注残一覧: 移行PO (残200+100)', boMig && boMig.remainingQty);
+  r = await j('/api/ledger/integrity');
+  ok(r.body.ok && r.body.issues.length === integrityBefore, '取込で整合性違反が増えない', r.body.issues);
+
+  // ロジザード入庫CSVの消込が移行POに効く (突合候補→割当)
+  {
+    const HDR2 = ['伝票NO', '型番', '品名', '取引先ID', '仕入単価', '良品数', '不良品数', '入庫日'];
+    const fd2 = new FormData();
+    fd2.append('file', new Blob([neCsvOf([HDR2, ['AR-MIG', 'deaditem', '休眠', '0001', '200', '40', '0', '2026/07/12']])]), 'lz-mig.csv');
+    r = await j('/api/inbound/import', { method: 'POST', body: fd2 });
+    ok(r.body.ok && r.body.newItems === 1, '入庫CSV取込 (移行PO消込用)', r.body);
+    r = await j('/api/inbound');
+    const inbM = r.body.open.find(x => x.slip === 'AR-MIG');
+    r = await j('/api/inbound/' + inbM.id + '/candidates');
+    const candM = r.body.candidates.find(c => c.orderItemId === deadItem.id);
+    ok(candM && candM.remaining === 100 && candM.suggestedQty === 40, '突合候補に移行POが出る', r.body.candidates && r.body.candidates.length);
+    r = await j('/api/items/' + deadItem.id + '/events', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'receipt', qty: 40, inboundItemId: inbM.id,
+        remainder: { action: 'await_delivery', nextExpectedDate: '2026-08-15', nextExpectedQty: 60 } }) });
+    ok(r.body.ok && r.body.remaining === 60, '割当: 移行PO残100→60', r.body);
+  }
+
+  // バリデーション
+  r = await upNe('bad1.csv', [NEHDR, neRow('9001', 'x-item', 'x', 10, 20, '2026/7/1', '0001')]);
+  ok(r.status === 400 && r.body.error.includes('注残計'), '注残計>発注数は拒否', r.body.error);
+  r = await upNe('bad2.csv', [['見出し', '違い'], ['a', 'b']]);
+  ok(r.status === 400 && r.body.error.includes('見出し'), '見出し不一致は拒否');
+  r = await upNe('bad3.csv', [NEHDR, neRow('9002', 'y-item', 'y', 5, 5, '2026/7/1', '0999')]);
+  ok(r.status === 400 && r.body.error.includes('マスタ未登録'), '未登録仕入先は拒否', r.body.error);
+  r = await upNe('bad4.csv', [NEHDR, neRow('9003', 'z-item', 'z', 5, 5, '2026/13/45', '0001')]);
+  ok(r.status === 400 && r.body.error.includes('発行日'), '不正な発行日は拒否');
+  // 同一伝票に別仕入先・別発行日が混在
+  r = await upNe('bad5.csv', [NEHDR, neRow('9004', 'a-item', 'a', 5, 5, '2026/7/1', '0001'), neRow('9004', 'b-item', 'b', 5, 5, '2026/7/1', '0002')]);
+  ok(r.status === 400 && r.body.error.includes('仕入先cdが混在'), '同一伝票の仕入先混在は拒否');
+  r = await upNe('bad6.csv', [NEHDR, neRow('9010', 'a-item', 'a', 5, 5, '2026/7/1', '0001'), neRow('9010', 'b-item', 'b', 5, 5, '2026/7/2', '0001')]);
+  ok(r.status === 400 && r.body.error.includes('発行日が混在'), '同一伝票の発行日混在は拒否 (伝票ヘッダ属性)');
+  // 注残0の行はスキップ (発注残エクスポートに通常含まれないが防御)。スキップ行も重複検証の対象
+  r = await upNe('warn1.csv', [NEHDR, neRow('9005', 'noflyersticker', 'x', 10, 0, '2026/7/1', '0001'), neRow('9006', 'deaditem', 'y', 5, 5, '2026/7/1', '0001')]);
+  ok(r.body.ok && r.body.orders === 1 && r.body.warnings.some(w => w.includes('注残0')), '注残0行はスキップ+警告', r.body.warnings);
+  r = await upNe('bad7.csv', [NEHDR, neRow('9011', 'c-item', 'c', 5, 0, '2026/7/1', '0001'), neRow('9011', 'c-item', 'c', 5, 5, '2026/7/1', '0001')]);
+  ok(r.status === 400 && r.body.error.includes('重複'), '注残0でスキップされる行も重複検証の対象');
+
+  // 移行PO属性の列間規則トリガ (直接SQLでも守られる)
+  {
+    let thr = null;
+    try { db.prepare("INSERT INTO po_orders (supplier_code, supplier_name, status, created_at, updated_at, origin, send_blocked) VALUES ('1','x','draft',?,?,'migration',1)").run(nowIsoStr(), nowIsoStr()); } catch (e) { thr = e.message; }
+    ok(thr && thr.includes('migration rules'), 'トリガ: ne_slip_numberなしの移行POは拒否', thr);
+    thr = null;
+    try { db.prepare("INSERT INTO po_orders (supplier_code, supplier_name, status, created_at, updated_at, ne_slip_number) VALUES ('1','x','draft',?,?,'99999')").run(nowIsoStr(), nowIsoStr()); } catch (e) { thr = e.message; }
+    ok(thr && thr.includes('migration rules'), 'トリガ: originなしのne_slip_numberは拒否', thr);
+    thr = null;
+    try { db.prepare("INSERT INTO po_orders (supplier_code, supplier_name, status, created_at, updated_at, origin, send_blocked, ne_slip_number) VALUES ('1','x','draft',?,?,'other',1,'99998')").run(nowIsoStr(), nowIsoStr()); } catch (e) { thr = e.message; }
+    ok(thr && thr.includes('migration rules'), 'トリガ: origin不正値は拒否', thr);
+  }
+
+  // 作業中draftがある仕入先の取込は拒否 (取込用一時draftとUNIQUE衝突するため)
+  r = await j('/api/supplier/1/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 1 }] }) });
+  ok(r.body.ok, 'draft作成 (競合テスト用)');
+  r = await upNe('ne2.csv', [NEHDR, neRow('9100', 'noflyersticker', 'x', 5, 5, '2026/7/1', '0001')]);
+  ok(r.status === 400 && r.body.error.includes('draft'), 'draftのある仕入先の取込は拒否 (プレビューでも検知)', r.body.error);
+  db.prepare("DELETE FROM po_orders WHERE status='draft' AND supplier_code='1'").run();
+
+  // 発注残ページに取込UIが配信される
+  const boHtml = await (await fetch(base + '/backorders')).text();
+  ok(boHtml.includes('NE発注残の初期取込') && boHtml.includes('neImpPrev') && boHtml.includes('NE移行分'), '/backorders 取込UI配信');
+}
+
 server.close();
 console.log(`\n=== RESULT: pass=${pass} fail=${fail} ===`);
 process.exit(fail ? 1 : 0);
