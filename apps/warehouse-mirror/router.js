@@ -28,24 +28,34 @@ const router = Router();
 // DB初期化
 let dbReady = false;
 // 初期化失敗の理由。⚠️ここが落ちると mirror 全体が 503 になり、全モールの sync と
-// 分析アプリが停止する (2026-07-12 に実際に発生)。当時は理由が応答に出ず、Render の
-// ログを見ないと切り分けできなかった → 503 応答に原因を載せて自己診断できるようにする
+// 分析アプリが停止する (2026-07-12 に実際に発生)。503 応答に原因を載せて自己診断できるようにする
 let initError = null;
 bootStart('mirror-db', 'warehouse-mirror.db');
 (async () => {
-  try {
-    initMirrorDB();
-    dbReady = true;
-    bootEnd('mirror-db', 'warehouse-mirror.db');
-  } catch (e) {
-    initError = {
-      message: String(e.message || e),
-      code: e.code || null,
-      at: String(e.stack || '').split('\n').slice(0, 3).join(' | '),
-    };
-    bootFail('mirror-db', 'warehouse-mirror.db', e);
-    console.error('[Mirror] DB初期化失敗:', e.message);
+  // ⭐2026-07-12 障害の真因: 初期化はboot時に1回きりで、デプロイ直後の一過性失敗
+  // (旧インスタンスとのpersistent disk同居でのlock等) でも dbReady=false のまま
+  // インスタンスの寿命いっぱい 503 を返し続けた (再デプロイまで復旧しない)。
+  // → リトライで一過性失敗を自己回復させる。恒久失敗なら最終エラーを保持して503+原因
+  const delaysMs = [0, 3000, 10000, 30000, 60000, 120000];
+  for (let attempt = 0; attempt < delaysMs.length; attempt++) {
+    if (delaysMs[attempt] > 0) await new Promise((r) => setTimeout(r, delaysMs[attempt]));
+    try {
+      initMirrorDB();
+      dbReady = true;
+      initError = null;
+      bootEnd('mirror-db', `warehouse-mirror.db (attempt ${attempt + 1})`);
+      return;
+    } catch (e) {
+      initError = {
+        message: String(e.message || e),
+        code: e.code || null,
+        attempt: attempt + 1,
+        at: String(e.stack || '').split('\n').slice(0, 3).join(' | '),
+      };
+      console.error(`[Mirror] DB初期化失敗 (attempt ${attempt + 1}/${delaysMs.length}):`, e.message);
+    }
   }
+  bootFail('mirror-db', 'warehouse-mirror.db', new Error(initError?.message || 'init failed'));
 })();
 
 function ensureDB(req, res, next) {
