@@ -4198,9 +4198,10 @@ function renderVmap(sups, counts, rows) {
     var g = ++vmQGen; // 早期return (入力消去・候補選択) でも世代を進め、送信済み要求の遅延応答を無効化する (Codex R2 Low)
     if (v.length < 2 || v.indexOf(' — ') >= 0) return; // 候補選択後は再検索しない
     vmDeb = setTimeout(function() {
+      var pg = VM_GEN; // 仕入先切替・再描画をまたいだ旧応答も破棄する (Codex R3 Low)
       fetch(API_EM + '/vendor-map/products?supplier=' + encodeURIComponent(VM_SUP) + '&q=' + encodeURIComponent(v))
         .then(function(r){ return r.json(); }).then(function(j) {
-          if (!j.ok || g !== vmQGen) return;
+          if (!j.ok || g !== vmQGen || pg !== VM_GEN) return;
           var dl = document.getElementById('vmProdDl');
           if (dl) dl.innerHTML = j.rows.map(function(p) {
             return '<option value="' + esc(p.code + ' — ' + p.name) + '"></option>';
