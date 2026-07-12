@@ -245,7 +245,14 @@ export async function processEmailJob(jobId) {
     if (job.status === 'cancelled') throw new Error('取消済みのジョブです');
     if (job.scheduled_at && job.scheduled_at > nowIso()) return { done: 'scheduled', job };
     if (job.attempt_count >= 5) throw new Error('再試行上限 (5回) に達しています。このジョブを「取消」し、新しく送信し直してください');
-    if (job.status === 'failed') db.prepare("UPDATE po_email_jobs SET status='queued' WHERE id=?").run(jobId);
+    if (job.status === 'failed') {
+      // 移行DB等でdedupに漏れた併存ジョブがあっても再試行で二重送信しない (通常はインデックスが防ぐ)
+      const rival = db.prepare(`SELECT id, status FROM po_email_jobs
+        WHERE order_id=? AND content_hash=? AND id<>? AND is_resend=0 AND is_dry_run=0
+          AND status IN ('queued','sending','sent','unknown')`).get(job.order_id, job.content_hash, jobId);
+      if (rival) throw new Error(`同じ内容の別ジョブ (#${rival.id}, ${rival.status}) が存在します。このジョブは取消してください`);
+      db.prepare("UPDATE po_email_jobs SET status='queued' WHERE id=?").run(jobId);
+    }
     // generation = 送信試行の世代。照合はスナップショット時の世代と一致する場合のみ結果を適用する (競合検知)
     db.prepare("UPDATE po_email_jobs SET status='sending', sending_started_at=?, attempt_count=attempt_count+1, generation=generation+1, error=NULL WHERE id=?")
       .run(nowIso(), jobId);

@@ -1150,6 +1150,24 @@ console.log('── P15: メール送信 (fake transport) ──');
     ok(r.status === 400 && r.body.error.includes('送信済み'), 'unknown中の新規通常送信はdedup拒否 (迂回不可)', r.body.error);
   }
 
+  // failed もdedup対象 (failed再試行+新規送信の併存で二重送信しない、Codex P15 R12 High)
+  {
+    r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 4 }] }) });
+    const fOrderId = r.body.id;
+    process.env.PO_EMAIL_FAKE = 'fail';
+    r = await jsonPost('/api/orders/' + fOrderId + '/email/send', {}, 'em-key-f1');
+    ok(r.body.ok && r.body.status === 'failed', '通常送信がfailedに');
+    const fJobId = r.body.jobId;
+    process.env.PO_EMAIL_FAKE = '1';
+    r = await jsonPost('/api/orders/' + fOrderId + '/email/send', {}, 'em-key-f2');
+    ok(r.status === 400 && r.body.error.includes('送信済み'), 'failed併存中の新規通常送信はdedup拒否');
+    r = await jsonPost('/api/email-jobs/' + fJobId + '/cancel', {});
+    ok(r.body.ok, 'failedジョブの取消');
+    r = await jsonPost('/api/orders/' + fOrderId + '/email/send', {}, 'em-key-f3');
+    ok(r.body.ok && r.body.status === 'sent', '取消後は新規送信できる');
+  }
+
   // 予約送信: 未来時刻はqueuedのまま (scheduled)→時刻到来で送信。過去時刻は拒否。取消可能 (dry-runで実施)
   {
     await jsonPost('/api/email/mode', { mode: 'dry_run' });
