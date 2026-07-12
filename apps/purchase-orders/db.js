@@ -185,6 +185,12 @@ function initLedgerSchema(db) {
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS uq_po_orders_number ON po_orders(po_number) WHERE po_number IS NOT NULL`);
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS uq_po_orders_ne_slip ON po_orders(ne_slip_number) WHERE ne_slip_number IS NOT NULL`);
 
+  // FBA更新ジョブの完了検知記録 (jobId単位で一度だけ発注サイクルをリセットする冪等キー)
+  db.exec(`CREATE TABLE IF NOT EXISTS po_cycle_fba_jobs (
+    job_id  TEXT PRIMARY KEY,
+    done_at TEXT NOT NULL
+  )`);
+
   addCol(db, 'po_order_items', 'requested_date', 'TEXT');        // 明細単位希望納期 (確定時スナップショット、issued後不変)
   addCol(db, 'po_order_items', 'promised_date', 'TEXT');         // 仕入先回答納期 (最新値。履歴=po_item_history)
   addCol(db, 'po_order_items', 'next_expected_date', 'TEXT');    // 次回入荷予定日 (分納)

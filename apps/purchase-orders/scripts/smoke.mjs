@@ -99,7 +99,9 @@ ok(r.status === 400, '見出し不一致CSVは 400');
 
 console.log('── overview / supplier ──');
 r = await j('/api/overview');
-ok(r.body.ok && r.body.cards.length === 1 && r.body.cards[0].code === '1', 'overview: 仕入先1のみ要発注', r.body.cards);
+// 注残はアプリ台帳が正 (NE CSVの発注残数は使わない)。台帳が空の初期状態では
+// NE注残で対象外だった gyoumuhandcream60-BI (仕入先2) も要発注に入る
+ok(r.body.ok && r.body.cards.length === 2 && r.body.cards[0].code === '1' && r.body.cards[1].code === '2', 'overview: 台帳注残ベースで仕入先1+2が要発注', r.body.cards);
 ok(r.body.cards[0].targetCount === 2, 'overview: 要発注2SKU', r.body.cards[0]);
 r = await j('/api/supplier/0001');
 ok(r.body.ok && r.body.supplier.name === 'アメージングクラフト様', 'supplier: 名前解決 (0001→1)');
@@ -146,7 +148,13 @@ r = await j('/api/orders/' + issuedId);
 ok(r.body.order.items.length === 2 && r.body.order.items[0].unit_cost === 70, '明細+原価スナップショット', r.body.order.items);
 r = await j('/api/supplier/1');
 ok(r.body.draft === null, 'issue 後 draft は消える');
-ok(r.body.targets.find(t => t.code === 'noflyersticker').recentIssued != null, '発注済みバッジ (recentIssued)');
+{
+  const noflyAfter = [...r.body.targets, ...r.body.candidates, ...r.body.horikoshi].find(t => t.code === 'noflyersticker');
+  ok(noflyAfter && noflyAfter.recentIssued != null, '発注済みバッジ (recentIssued)');
+  // 台帳注残: 確定した瞬間に注残へ反映され、NE CSVを待たずに要発注から消える
+  ok(noflyAfter && noflyAfter.backOrder === 400 && !r.body.targets.some(t => t.code === 'noflyersticker'),
+    '確定即時に台帳注残へ反映され要発注から消える', noflyAfter && noflyAfter.backOrder);
+}
 r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ items: [], note: '' }) });
 ok(r.status === 400, '空 issue は 400');
 
@@ -212,15 +220,28 @@ const neCsv = '"商品コード","商品名","仕入先コード","原価","売�
   '"unknown-in-ne","NEにしかない商品","0001","100.00","500.00","取扱中","","","","10","","","2026-01-01","5","0","2026-07-04","10","0"\r\n';
 const fdNe = new FormData();
 fdNe.append('file', new Blob([neCsv], { type: 'text/csv' }), 'nedldata.csv');
+// 取込前: 直近のissue (400+200) で仕入先1が「発注確定済み」サイクルに載っている
+r = await j('/api/cycle-issued');
+ok(r.body.ok && r.body.suppliers.some(s => s.code === '1'), 'cycle-issued: 発注確定済み仕入先が載る', r.body.suppliers);
+r = await j('/api/overview');
+{
+  const ovCard = r.body.cards.find(c => c.code === '1');
+  ok(ovCard && ovCard.issuedCount >= 1, 'overview: 発注確定済みカウント付き', ovCard);
+}
 r = await j('/api/ne-overlay/csv', { method: 'POST', body: fdNe });
 ok(r.status === 200 && r.body.rowCount === 2, 'NE CSV取込 2件', r.body);
+// データ更新 (NE取込) で発注確定サイクルがリセットされる
+r = await j('/api/cycle-issued');
+ok(r.body.ok && r.body.suppliers.length === 0, 'NE CSV取込で発注確定サイクルがリセット', r.body.suppliers);
 r = await j('/api/supplier/1');
 ok(r.body.overlay && r.body.overlay.applied === true, 'overlay 適用中フラグ');
 const noflyOv = [...r.body.targets, ...r.body.candidates, ...r.body.horikoshi].find(p => p.code === 'noflyersticker');
-ok(noflyOv && noflyOv.stock === 120 && noflyOv.backOrder === 50, 'overlay: 在庫=NE100+FBA20, 注残=50', noflyOv && { stock: noflyOv.stock, back: noflyOv.backOrder });
+// 注残はNEオーバーレイの発注残数(50)ではなくアプリ台帳 (issue 400 + issue2 200 = 600) が正
+ok(noflyOv && noflyOv.stock === 120 && noflyOv.backOrder === 600, 'overlay: 在庫=NE100+FBA20, 注残=台帳600 (NE値50は使わない)', noflyOv && { stock: noflyOv.stock, back: noflyOv.backOrder });
 ok(noflyOv && noflyOv.cost === 75, 'overlay: 原価も最新化 (70→75)', noflyOv && noflyOv.cost);
-// L=(120+50)/368=0.46 → 発注対象のまま、推奨量再計算 = ROUND((2.5-0.4620)*368/100)*100 = 800
-ok(noflyOv && noflyOv.recQty === 800, 'overlay: 推奨発注量が再計算される (800)', noflyOv && noflyOv.recQty);
+// overlay在庫+台帳注残で在庫月数が再計算される: (120+600)/368 = 1.9565 → M1.5超で対象外
+ok(noflyOv && Math.abs(noflyOv.stockMonths - 720 / 368) < 0.01 && noflyOv.recQty == null,
+  'overlay: 在庫月数再計算 (overlay在庫+台帳注残)', noflyOv && { m: noflyOv.stockMonths, rec: noflyOv.recQty });
 // 朝同期の方が新しい場合は自動で無視
 db.prepare(`UPDATE mirror_pml_published SET src_ne_products_synced_at=? WHERE id=1`).run(new Date(Date.now() + 3600000).toISOString());
 r = await j('/api/supplier/1');
@@ -232,7 +253,7 @@ ok(r.status === 200, 'overlay 解除');
 r = await j('/api/supplier/1');
 ok(r.body.overlay === null, '解除後 overlay なし');
 const noflyBack = [...r.body.targets, ...r.body.candidates, ...r.body.horikoshi].find(p => p.code === 'noflyersticker');
-ok(noflyBack && noflyBack.backOrder === 0, '解除後は PML の値に戻る', noflyBack && noflyBack.backOrder);
+ok(noflyBack && noflyBack.backOrder === 600, '解除後も注残は台帳値のまま (在庫はPMLに戻る)', noflyBack && noflyBack.backOrder);
 // 見出し不正CSV
 const badNe = new FormData();
 badNe.append('file', new Blob(['foo,bar\r\n1,2\r\n']), 'bad.csv');
@@ -596,6 +617,17 @@ console.log('── P13a: 台帳 (イベント/逆仕訳/クローズ/整合性)
   try { L.appendPoItemEvent({ orderItemId: legacyItem.id, eventType: 'receipt', qty: 1, source: 'manual' }); } catch (e) { threw = e.message; }
   ok(threw && threw.includes('legacy'), 'legacy発注へのイベントは拒否 (境界時刻が正)');
 
+  // 台帳注残 (要発注判定) に legacy PO の数量は入らない (tracking_mode='tracked' でも境界以前は除外)
+  {
+    r = await j('/api/supplier/1');
+    const noflyLZ = [...r.body.targets, ...r.body.candidates, ...r.body.horikoshi].find(p => p.code === 'noflyersticker');
+    const zanNoBoundary = db.prepare(`SELECT COALESCE(SUM(b.remaining_qty),0) AS z FROM po_order_items i
+      JOIN po_orders o ON o.id = i.order_id JOIN v_po_item_balance b ON b.order_item_id = i.id
+      WHERE i.product_key='noflyersticker' AND o.status='issued' AND o.tracking_mode='tracked'
+        AND o.closed_at IS NULL AND b.remaining_qty > 0`).get().z;
+    ok(noflyLZ && zanNoBoundary - noflyLZ.backOrder === 10, '台帳注残: 境界以前のlegacy PO (10個) を除外', { back: noflyLZ && noflyLZ.backOrder, all: zanNoBoundary });
+  }
+
   // 発行の世代ゲート: 境界後は po_number 等の無い issued を物理拒否 (旧コード相当のINSERT)
   threw = null;
   try {
@@ -890,6 +922,11 @@ console.log('── P13b: 発注残ページ+消込API ──');
     ok(sup.includes('fSaved') && sup.includes('未保存の変更あり') && sup.includes('発注金額合計'), '/supplier 保存済みインジケータ (SKU数+発注金額合計)');
     const dash = await (await fetch(base + '/')).text();
     ok(dash.includes('発注残') && dash.includes('/apps/purchase-orders/backorders'), '/ ダッシュボードに発注残サマリ');
+    ok(dash.includes('confirmCycleReset') && dash.includes('cycle-issued'), '/ データ更新前の二段確認 (確定リセット+メール未送信)');
+    ok(dash.includes('更新を中止しました'), '/ 確認情報の取得失敗時は更新しない (fail-closed)');
+    ok(dash.includes('発注確定済み'), '/ 仕入先カードに発注確定済みバッジ');
+    const adminHtml = await (await fetch(base + '/admin')).text();
+    ok(adminHtml.includes('発注方法') && adminHtml.includes('📠 FAX') && adminHtml.includes('🌐 WEBサイト'), '/admin 発注方法プルダウン (email/fax/web/none)');
     const orders = await (await fetch(base + '/orders')).text();
     ok(orders.includes('PO番号') && orders.includes('発注残'), '/orders にPO番号・発注残列');
   }
@@ -1137,6 +1174,15 @@ console.log('── P15: メール送信 (fake transport) ──');
   ok(job1.to_addr === 'me@b-faith.biz' && job1.subject.startsWith('【DRYRUN】') && job1.body.includes('整理番号: DK') && job1.is_dry_run === 1,
     'dry-run: 宛先差替+件名+整理番号', job1.to_addr);
   ok(job1.body.includes('本来の宛先: TO=tanaka@example.com'), 'dry-run: 本来の宛先を本文に明記');
+
+  // dry-run送信のみのPOは「発注書メール未送信」扱い (cycle-issuedのunsent)
+  r = await j('/api/cycle-issued');
+  {
+    const cyc1 = r.body.suppliers.find(s => s.code === '1');
+    ok(r.body.ok && cyc1 && cyc1.unsent >= 1, 'cycle-issued: dry-run送信のみは未送信扱い (unsent>=1)', cyc1);
+    ok(cyc1 && cyc1.unsentPoNumbers.length === cyc1.unsent && cyc1.poNumbers.length >= cyc1.unsentPoNumbers.length,
+      'cycle-issued: unsentPoNumbers は未送信POだけ列挙', cyc1);
+  }
 
   // 冪等: 同一キー再送は同じジョブ (二重送信なし)
   r = await jsonPost('/api/orders/' + emOrderId + '/email/send', {}, 'em-key-1');
@@ -1591,6 +1637,18 @@ console.log('── NE発注残 初期取込 (移行PO) ──');
   // 発注残ページに取込UIが配信される
   const boHtml = await (await fetch(base + '/backorders')).text();
   ok(boHtml.includes('NE発注残の初期取込') && boHtml.includes('neImpPrev') && boHtml.includes('NE移行分'), '/backorders 取込UI配信');
+}
+
+// ═══ FBAジョブ完了検知 (発注サイクルリセットの冪等性) ═══
+console.log('── FBAジョブ完了検知 (A→B→A) ──');
+{
+  const { markCycleFbaJobDone } = await imp('apps/purchase-orders/ledger.js');
+  ok(markCycleFbaJobDone('job-A', 'smoke') === true, 'ジョブA完了: 初回はサイクルリセット');
+  ok(markCycleFbaJobDone('job-B', 'smoke') === true, 'ジョブB完了: 別ジョブもリセット');
+  const afterB = db.prepare("SELECT value FROM po_settings WHERE key='po_cycle_reset_at'").get().value;
+  ok(markCycleFbaJobDone('job-A', 'smoke') === false, 'ジョブA再ポーリング: 検知済みはリセットしない (A→B→A)');
+  const afterA2 = db.prepare("SELECT value FROM po_settings WHERE key='po_cycle_reset_at'").get().value;
+  ok(afterB === afterA2, '再検知で po_cycle_reset_at は動かない');
 }
 
 server.close();
