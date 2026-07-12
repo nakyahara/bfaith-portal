@@ -1247,6 +1247,68 @@ console.log('── P15: メール送信 (fake transport) ──');
     ok(boHtml.includes('data-emailui') && boHtml.includes('DRYRUN') === false && boHtml.includes('emailPanel'), '/backorders 発注書メールパネル');
   }
 }
+
+// ═══ 対応表 1件管理 (先方番号対応表タブ) ═══
+console.log('── 対応表 1件管理 (entries/products/entry upsert/delete) ──');
+{
+  const jsonPost2 = (p, body) => j(p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+
+  // 一覧: PMLから商品名解決、仕入先コード正規化
+  r = await j('/api/vendor-map/entries?supplier=0001');
+  ok(r.body.ok && String(r.body.supplierName).includes('アメージングクラフト'), 'entries: 一覧+仕入先名 (0001→1正規化)', r.body);
+  const e1 = (r.body.rows || []).find(x => x.product_code === 'noflyersticker');
+  ok(e1 && e1.vendor_code === 'AMC-001' && e1.name === 'チラシ お断り ステッカー', 'entries: 既存対応にPML商品名が付く', e1);
+  r = await j('/api/vendor-map/entries');
+  ok(r.status === 400, 'entries: 仕入先なしは400');
+  r = await j('/api/vendor-map/entries?supplier=9999');
+  ok(r.status === 400 && r.body.error.includes('未登録'), 'entries: 未登録仕入先は400');
+
+  // 商品検索: 部分一致 (商品名/コード)、選択仕入先の商品を先頭に
+  r = await j('/api/vendor-map/products?supplier=2&q=' + encodeURIComponent('ハンドクリーム'));
+  ok(r.body.ok && r.body.rows.length === 1 && r.body.rows[0].code === 'gyoumuhandcream60-BI', 'products: 商品名の部分一致', r.body.rows);
+  r = await j('/api/vendor-map/products?supplier=0002&q=0');
+  ok(r.body.ok && r.body.rows.length >= 3 && r.body.rows[0].code === 'gyoumuhandcream60-BI', 'products: 選択仕入先の商品が先頭', r.body.rows.map(x => x.code));
+  r = await j('/api/vendor-map/products?q=');
+  ok(r.body.ok && r.body.rows.length === 0, 'products: 空クエリは空配列');
+
+  // upsert: 新規追加 (大文字入力でも product_key は正規化キーで同一商品扱い)
+  r = await jsonPost2('/api/vendor-map/entry', { supplier_code: '0001', product_code: 'CARDSTAND-SILVER-R', vendor_code: 'ZZ-CS-1' });
+  ok(r.body.ok && r.body.updated === false, 'entry: 新規追加', r.body);
+  let vmRow = db.prepare("SELECT * FROM po_vendor_code_map WHERE supplier_code='1' AND product_key='cardstand-silver-r'").get();
+  ok(vmRow && vmRow.vendor_code === 'ZZ-CS-1' && vmRow.product_code === 'CARDSTAND-SILVER-R', 'entry: key正規化+入力コード保存', vmRow);
+  // upsert: 上書きは旧値を返す (誤上書きに気づける)
+  r = await jsonPost2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'cardstand-silver-r', vendor_code: 'ZZ-CS-2' });
+  ok(r.body.ok && r.body.updated === true && r.body.oldVendorCode === 'ZZ-CS-1', 'entry: 上書きで旧値返却', r.body);
+  // バリデーション
+  r = await jsonPost2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'not-in-pml-xyz', vendor_code: 'X' });
+  ok(r.status === 400 && r.body.error.includes('商品マスタに無い'), 'entry: PMLに無い商品コードは拒否 (タイポ防止)', r.body.error);
+  r = await jsonPost2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'cardstand-silver-r', vendor_code: '  ' });
+  ok(r.status === 400 && r.body.error.includes('先方管理番号'), 'entry: 先方番号が空は拒否');
+  r = await jsonPost2('/api/vendor-map/entry', { supplier_code: '9999', product_code: 'cardstand-silver-r', vendor_code: 'X' });
+  ok(r.status === 400 && r.body.error.includes('未登録'), 'entry: 未登録仕入先は拒否');
+  r = await jsonPost2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'cardstand-silver-r', vendor_code: 'A\nB' });
+  ok(r.status === 400 && r.body.error.includes('改行'), 'entry: 先方番号の改行は拒否');
+
+  // 編集が発注書プレビューの添付CSVへ即反映される
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'cardstand-silver-r', qty: 3 }], requestedDate: '2026-08-01' }) });
+  const vmOrderId = r.body.id;
+  r = await j('/api/orders/' + vmOrderId + '/email/preview');
+  ok(r.body.ok && r.body.csvText.includes('ZZ-CS-2'), 'entry編集がプレビュー添付CSVに反映', r.body.ok ? r.body.csvText.split('\r\n').slice(0, 2) : r.body);
+
+  // 削除 → 二重削除は404。監査ログが残る
+  r = await j('/api/vendor-map/entry?supplier=1&product=CARDSTAND-SILVER-R', { method: 'DELETE' });
+  ok(r.body.ok === true, 'entry: 削除 (コードは正規化して照合)', r.body);
+  ok(!db.prepare("SELECT 1 FROM po_vendor_code_map WHERE supplier_code='1' AND product_key='cardstand-silver-r'").get(), 'entry: 削除でDBから消える');
+  r = await j('/api/vendor-map/entry?supplier=1&product=cardstand-silver-r', { method: 'DELETE' });
+  ok(r.status === 404, 'entry: 二重削除は404');
+  const auN = db.prepare("SELECT COUNT(*) AS n FROM po_audit_log WHERE action IN ('vendor_map_entry_upsert','vendor_map_entry_delete')").get().n;
+  ok(auN >= 3, 'entry: upsert/deleteが監査ログに残る', auN);
+
+  // /admin にタブとスクリプト
+  const adminHtml2 = await (await fetch(base + '/admin')).text();
+  ok(adminHtml2.includes('先方番号対応表') && adminHtml2.includes('loadVmap') && adminHtml2.includes('vmProdDl'), '/admin 対応表タブ配信');
+}
 function nowIsoStr() { return new Date().toISOString(); }
 
 server.close();
