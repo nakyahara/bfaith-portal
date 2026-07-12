@@ -13,7 +13,7 @@
  */
 import { Router } from 'express';
 import crypto from 'crypto';
-import { initMirrorDB, getMirrorDB } from './db.js';
+import { initMirrorDB, getMirrorDB, yahooInitError } from './db.js';
 import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
 import {
   STORE_BENCH_COLS, STORE_DEVICE_BASE_COLS, STORE_DEVICE_OPT_COLS, CATEGORY_DEMO_COLS,
@@ -1784,6 +1784,11 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
   const entityCfg = ENTITY_REGISTRY[entity];
   if (!entityCfg) {
     return res.status(400).json({ error: `unsupported entity: ${entity}` });
+  }
+  // Yahoo!表の初期化が fail-soft で失敗している場合、Yahoo entity だけ503 (原因つき)。
+  // 他モールは通常どおり動く (2026-07-12 の全停止障害の再発防御)
+  if (entity.startsWith('yahoo_') && yahooInitError) {
+    return res.status(503).json({ error: 'yahoo tables init failed', init_error: yahooInitError });
   }
   if (contract_version !== entityCfg.contract_version) {
     return res.status(400).json({

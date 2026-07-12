@@ -21,6 +21,10 @@ const DB_FILE = path.join(DATA_DIR, 'warehouse-mirror.db');
 
 let db = null;
 
+// Yahoo!表の初期化失敗を保持 (mirror本体は継続する fail-soft。router が sync 応答に載せる)。
+// 2026-07-12 の本番障害 (#476→#477 revert) の再発防御: 新規表のDDLで落ちても既存モールを道連れにしない
+export let yahooInitError = null;
+
 export function initMirrorDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   db = new Database(DB_FILE);
@@ -758,61 +762,74 @@ function createTables() {
   )`);
 
   // ─── Yahoo!ストクリ統計CSV 6種 (mall-csv-fetcher P1-Y、2026-07-11) ───
-  db.exec(`CREATE TABLE IF NOT EXISTS mirror_yahoo_store_device_daily (
-    date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
-    device   TEXT NOT NULL CHECK(device IN ('all','pc','sp','app')),
-    sales_yen INTEGER, pageviews INTEGER,
-    is_tax_included INTEGER NOT NULL DEFAULT 1, imported_at TEXT,
-    source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
-    PRIMARY KEY (date_jst, device)
-  )`);
-  db.exec(`CREATE TABLE IF NOT EXISTS mirror_yahoo_inflow_daily (
-    date_jst TEXT PRIMARY KEY CHECK(date_jst GLOB '????-??-??'),
-    inflow_visitors INTEGER, purchase_visitors INTEGER, purchase_ratio_pct REAL,
-    exit_visitors INTEGER, exit_ratio_pct REAL,
-    imported_at TEXT,
-    source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL
-  )`);
-  db.exec(`CREATE TABLE IF NOT EXISTS mirror_yahoo_user_attr_daily (
-    date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
-    gender TEXT NOT NULL, age_band TEXT NOT NULL, buyer_class TEXT NOT NULL,
-    visitors INTEGER,
-    imported_at TEXT,
-    source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
-    PRIMARY KEY (date_jst, gender, age_band, buyer_class)
-  )`);
-  db.exec(`CREATE TABLE IF NOT EXISTS mirror_yahoo_flash_hourly (
-    date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
-    hour_slot TEXT NOT NULL, device TEXT NOT NULL CHECK(device IN ('all','pc','sp','app')),
-    sales_yen INTEGER, orders INTEGER, units INTEGER, buyers INTEGER,
-    purchase_rate_pct REAL, aov_yen INTEGER, pageviews INTEGER, visitors INTEGER, avg_pages REAL,
-    is_tax_included INTEGER NOT NULL DEFAULT 1, imported_at TEXT,
-    source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
-    PRIMARY KEY (date_jst, hour_slot, device)
-  )`);
-  db.exec(`CREATE TABLE IF NOT EXISTS mirror_yahoo_item_daily (
-    date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
-    item_code TEXT NOT NULL CHECK(trim(item_code) <> ''),
-    sub_code TEXT NOT NULL DEFAULT '',
-    raw_item_code TEXT, item_name TEXT,
-    sales_yen INTEGER, orders INTEGER, units INTEGER, buyers INTEGER,
-    avg_purchase_rate_pct REAL, favorites INTEGER, cart_adds INTEGER,
-    pv_premium_ship INTEGER, pv_normal INTEGER, visitors INTEGER, category_contribution INTEGER,
-    is_tax_included INTEGER NOT NULL DEFAULT 1, imported_at TEXT,
-    source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
-    PRIMARY KEY (date_jst, item_code, sub_code)
-  )`);
-  db.exec('CREATE INDEX IF NOT EXISTS idx_myid_item ON mirror_yahoo_item_daily(item_code, date_jst)');
-  db.exec(`CREATE TABLE IF NOT EXISTS mirror_yahoo_keyword_daily (
-    date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
-    keyword TEXT NOT NULL CHECK(trim(keyword) <> ''),
-    rank INTEGER, inflow INTEGER, sales_yen INTEGER, orders INTEGER, units INTEGER,
-    avg_order_rate_pct REAL, avg_order_aov_yen INTEGER, avg_units_aov_yen INTEGER,
-    is_tax_included INTEGER NOT NULL DEFAULT 1, imported_at TEXT,
-    source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
-    PRIMARY KEY (date_jst, keyword)
-  )`);
-  db.exec('CREATE INDEX IF NOT EXISTS idx_mykd_kw ON mirror_yahoo_keyword_daily(keyword, date_jst)');
+  // ⚠️fail-soft: この新規ブロックが本番でのみ失敗する事象が発生 (2026-07-12、原因調査中)。
+  // 失敗しても throw せず記録に留め、既存モールの mirror を止めない。Yahoo entity への
+  // sync は router 側が yahooInitError を見て 503 (原因つき) を返す
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_yahoo_store_device_daily (
+      date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+      device   TEXT NOT NULL CHECK(device IN ('all','pc','sp','app')),
+      sales_yen INTEGER, pageviews INTEGER,
+      is_tax_included INTEGER NOT NULL DEFAULT 1, imported_at TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+      PRIMARY KEY (date_jst, device)
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_yahoo_inflow_daily (
+      date_jst TEXT PRIMARY KEY CHECK(date_jst GLOB '????-??-??'),
+      inflow_visitors INTEGER, purchase_visitors INTEGER, purchase_ratio_pct REAL,
+      exit_visitors INTEGER, exit_ratio_pct REAL,
+      imported_at TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_yahoo_user_attr_daily (
+      date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+      gender TEXT NOT NULL, age_band TEXT NOT NULL, buyer_class TEXT NOT NULL,
+      visitors INTEGER,
+      imported_at TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+      PRIMARY KEY (date_jst, gender, age_band, buyer_class)
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_yahoo_flash_hourly (
+      date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+      hour_slot TEXT NOT NULL, device TEXT NOT NULL CHECK(device IN ('all','pc','sp','app')),
+      sales_yen INTEGER, orders INTEGER, units INTEGER, buyers INTEGER,
+      purchase_rate_pct REAL, aov_yen INTEGER, pageviews INTEGER, visitors INTEGER, avg_pages REAL,
+      is_tax_included INTEGER NOT NULL DEFAULT 1, imported_at TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+      PRIMARY KEY (date_jst, hour_slot, device)
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_yahoo_item_daily (
+      date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+      item_code TEXT NOT NULL CHECK(trim(item_code) <> ''),
+      sub_code TEXT NOT NULL DEFAULT '',
+      raw_item_code TEXT, item_name TEXT,
+      sales_yen INTEGER, orders INTEGER, units INTEGER, buyers INTEGER,
+      avg_purchase_rate_pct REAL, favorites INTEGER, cart_adds INTEGER,
+      pv_premium_ship INTEGER, pv_normal INTEGER, visitors INTEGER, category_contribution INTEGER,
+      is_tax_included INTEGER NOT NULL DEFAULT 1, imported_at TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+      PRIMARY KEY (date_jst, item_code, sub_code)
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_myid_item ON mirror_yahoo_item_daily(item_code, date_jst)');
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_yahoo_keyword_daily (
+      date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+      keyword TEXT NOT NULL CHECK(trim(keyword) <> ''),
+      rank INTEGER, inflow INTEGER, sales_yen INTEGER, orders INTEGER, units INTEGER,
+      avg_order_rate_pct REAL, avg_order_aov_yen INTEGER, avg_units_aov_yen INTEGER,
+      is_tax_included INTEGER NOT NULL DEFAULT 1, imported_at TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+      PRIMARY KEY (date_jst, keyword)
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_mykd_kw ON mirror_yahoo_keyword_daily(keyword, date_jst)');
+
+  } catch (e) {
+    yahooInitError = {
+      message: String(e.message || e),
+      code: e.code || null,
+      at: String(e.stack || '').split(String.fromCharCode(10)).slice(0, 3).join(' | '),
+    };
+    console.error('[Mirror] Yahoo!表の初期化失敗 (mirror本体は継続):', e.message);
+  }
 
   // mirror_rakuten_finance_sku_daily — 楽天 Phase 1a #R-3b (Render 側 daily fact mirror)
   // miniPC の f_rakuten_finance_sku_daily_v1 の payload を受信。
