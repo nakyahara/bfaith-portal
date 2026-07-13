@@ -133,25 +133,28 @@ export function buildOrderEmail(orderId) {
   const money = v => Number(v).toFixed(2);
   const issuedJst = order.issued_at ? new Date(Date.parse(order.issued_at) + 9 * 3600000).toISOString().slice(0, 10) : jstToday();
   let totalQty = 0, totalAmount = 0, csvTotal = 0;
-  const detail = [];
+  const detailRows = [];
   for (const it of items) {
     totalQty += it.qty;
     if (it.unit_cost != null) { totalAmount += Math.round(it.unit_cost * it.qty); csvTotal += it.unit_cost * it.qty; }
     const vendor = vmap.get(it.product_key) || '';
     if (vendorColUsed && !vendor) missingVendorCodes.push(it.product_code);
-    detail.push(['通常', it.product_code, it.product_name || '',
+    detailRows.push(['通常', it.product_code, it.product_name || '',
       reqOf(it) ? String(reqOf(it)).replace(/-/g, '/') : '',
-      it.unit_cost == null ? '' : money(it.unit_cost), it.qty,
-      it.unit_cost == null ? '' : money(it.unit_cost * it.qty), vendor].map(csvCell).join(','));
+      it.unit_cost == null ? '' : money(it.unit_cost), String(it.qty),
+      it.unit_cost == null ? '' : money(it.unit_cost * it.qty), vendor]);
   }
-  const lines = [
-    ['Header', '発注伝票番号', '発注日', '仕入先名', '発行担当者', ' ', '合計金額', '備考'].map(csvCell).join(','),
-    [' ', order.po_number || `#${order.id}`, issuedJst, sup.name, st.issuerName, ' ', money(csvTotal), ''].map(csvCell).join(','),
-    '--,--,--,--,--,--,--,--', // 区切り行 (固定文字列。csvCellを通すと先頭 - が数式対策の ' 付きに化けるため直書き)
-    ['発注区分', '商品コード', '商品名', '希望納期', '発注単価', '発注数', '小計', '備考'].map(csvCell).join(','),
-    ...detail,
+  // csvRows = 生セル値の行列 (UIのポップアッププレビューで表として表示する用。CSV文字列と同一内容)
+  const csvRows = [
+    ['Header', '発注伝票番号', '発注日', '仕入先名', '発行担当者', ' ', '合計金額', '備考'],
+    [' ', order.po_number || `#${order.id}`, issuedJst, sup.name, st.issuerName, ' ', money(csvTotal), ''],
+    ['--', '--', '--', '--', '--', '--', '--', '--'],
+    ['発注区分', '商品コード', '商品名', '希望納期', '発注単価', '発注数', '小計', '備考'],
+    ...detailRows,
   ];
-  const csvText = lines.join('\r\n');
+  const csvText = csvRows.map((row, i) =>
+    i === 2 ? '--,--,--,--,--,--,--,--' // 区切り行 (固定文字列。csvCellを通すと先頭 - が数式対策の ' 付きに化けるため直書き)
+      : row.map(csvCell).join(',')).join('\r\n');
   // CP932変換不能文字の検出 (黙って ? に化けるとプレビューと実添付が食い違う、Codex P15-R1 M10)
   if (iconv.decode(iconv.encode(csvText, 'cp932'), 'cp932') !== csvText) {
     const bad = [...new Set([...csvText].filter(ch => iconv.decode(iconv.encode(ch, 'cp932'), 'cp932') !== ch))].slice(0, 10);
@@ -174,7 +177,7 @@ export function buildOrderEmail(orderId) {
     subject: render(st.subjectTpl, data),
     body,
     rows: items.length, totalQty, totalAmount,
-    csvText, attachmentName: `${(order.po_number || 'PO-' + order.id)}.csv`,
+    csvText, csvRows, attachmentName: `${(order.po_number || 'PO-' + order.id)}.csv`,
     vendorColUsed, missingVendorCodes,
     mode: st.mode, dryrunTo: st.dryrunTo, envReady: st.envReady,
   };
