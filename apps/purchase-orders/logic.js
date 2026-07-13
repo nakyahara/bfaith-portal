@@ -192,18 +192,12 @@ export function loadRecentIssued(issuedDays = 14) {
  */
 export function loadLedgerBackorders() {
   const db = getDB();
-  // tracked の正は issued_at >= tracking_started_at (境界以前=legacyの残数に意味はない、Codex サイクルR1 High)
-  const rows = db.prepare(`
-    SELECT i.product_key, SUM(b.remaining_qty) AS zan
-    FROM po_order_items i
-    JOIN po_orders o ON o.id = i.order_id
-    JOIN v_po_item_balance b ON b.order_item_id = i.id
-    WHERE o.status = 'issued' AND o.tracking_mode = 'tracked' AND o.closed_at IS NULL AND b.remaining_qty > 0
-      AND o.issued_at >= (SELECT value FROM po_settings WHERE key = 'tracking_started_at')
-    GROUP BY i.product_key
-  `).all();
+  // 集計ロジックは v_ledger_backorder_by_product に一本化 (PML正本ビュー v_pml_rows_authoritative・
+  // 整合性検査と同一定義。tracked の正は issued_at >= tracking_started_at、Codex サイクルR1 High / SSoT化 2026-07-13)
   const map = new Map();
-  for (const r of rows) map.set(r.product_key, r.zan);
+  for (const r of db.prepare('SELECT product_key, backorder_qty FROM v_ledger_backorder_by_product').all()) {
+    map.set(r.product_key, r.backorder_qty);
+  }
   return map;
 }
 

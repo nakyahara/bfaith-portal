@@ -703,5 +703,19 @@ export function checkLedgerIntegrity({ orderId = null } = {}) {
       warnings.push({ kind: 'remainder_without_disposition', itemId: r.id, detail: `残${r.rem}の扱い (分納待ち/減数/確認中) が未選択` });
     }
   }
+  // 台帳注残があるのに published PML の商品へJOINできない (正本ビュー v_pml_rows_authoritative で注残が
+  // 見えなくなる = 商品コード改廃・正規化キー不一致の検知。SSoT化 2026-07-13 Codex提言の完全性監視)
+  if (orderId == null) {
+    try {
+      for (const r of db.prepare(`
+        SELECT l.product_key, l.backorder_qty FROM v_ledger_backorder_by_product l
+        WHERE NOT EXISTS (
+          SELECT 1 FROM mirror_pml_snapshot_rows p
+          WHERE p.run_id = (SELECT run_id FROM mirror_pml_published WHERE id = 1)
+            AND lower(trim(p.商品コード)) = l.product_key)`).all()) {
+        warnings.push({ kind: 'backorder_not_in_pml', productKey: r.product_key, detail: `台帳注残${r.backorder_qty}がPML商品に見つからない (商品コード改廃?)` });
+      }
+    } catch { /* mirror未同期環境では検査しない */ }
+  }
   return { issues, warnings };
 }
