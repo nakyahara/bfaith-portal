@@ -3873,7 +3873,7 @@ function supPanel(orderId) {
     '<datalist id="supDl-' + orderId + '"></datalist>' +
     '<button class="ghost" id="supAddRow-' + orderId + '">＋ 行を追加</button>' +
     '<div style="margin-top:8px;display:flex;gap:12px;align-items:center;flex-wrap:wrap">' +
-    '<label class="muted"><input type="checkbox" id="supEmail-' + orderId + '"> 📧 この追加分の発注書メールも送る (既定: 送らない=電話で伝達済み)</label>' +
+    '<label class="muted"><input type="checkbox" id="supEmail-' + orderId + '"> 📧 この追加分を発注書メールの送信対象にする (確定後に📧パネルから送信。既定: 対象外=電話で伝達済み)</label>' +
     '<label class="muted">メモ <input type="text" id="supNote-' + orderId + '" placeholder="例: 7/13 電話 芦田様" style="width:200px"></label>' +
     '<button class="pri" id="supGo-' + orderId + '">➕ 追加発注を確定</button>' +
     '<button class="ghost" id="supClose-' + orderId + '">閉じる</button></div></div>';

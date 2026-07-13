@@ -1753,6 +1753,11 @@ console.log('── 追加発注 (supplement) ──');
   try { db.prepare("INSERT INTO po_orders (supplier_code, supplier_name, status, parent_order_id, created_at, updated_at) VALUES ('1','x','draft',1,?,?)").run(nowIsoStr(), nowIsoStr()); } catch (e) { thr = e.message; }
   ok(thr && thr.includes('追加発注POのみ'), 'trigger: originなしparent_order_idは拒否', thr);
 
+  // 整合性検査: 正常な supplement は origin規則違反として報告されない (Codex sup-R1 Medium)
+  r = await j('/api/ledger/integrity');
+  ok(r.body.ok && !(r.body.issues || []).some(x => x.kind === 'migration_attrs'),
+    'supplement: 整合性検査で正常なsupplementは違反にならない', (r.body.issues || []).filter(x => x.kind === 'migration_attrs'));
+
   // ページに➕UI
   const boSup = await (await fetch(base + '/backorders')).text();
   ok(boSup.includes('data-supplyui') && boSup.includes('supPanel') && boSup.includes('追加発注を確定'), '/backorders ➕追加発注UI配信');
