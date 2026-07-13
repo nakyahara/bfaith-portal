@@ -45,13 +45,35 @@ function ruleFor(fromHeader, subject) {
 
 /**
  * Gmailが付与する Authentication-Results で送信元の真正性を確認する (From詐称対策、Codex mail-R1 High)。
- * dmarc=pass、または spf=pass かつ dkim=pass を要求。ヘッダが無い/失敗なら false (自動変換させない)
+ * Fromドメインとの整合まで検証する (Codex mail-R2 High):
+ *  - dmarc=pass (dmarcは定義上From整合。header.from があればFromドメインと一致することも確認)
+ *  - または spf=pass の smtp.mailfrom と dkim=pass の header.d の両方がFromドメインに整合
+ * 節 (;区切り) 単位で解析し、dmarc=passive 等の部分一致誤認を防ぐ。検証不能は false (自動変換させない)
  */
-export function authPassed(authResultsHeader) {
+export function authPassed(authResultsHeader, fromDomain) {
   const h = String(authResultsHeader || '').toLowerCase();
-  if (!h) return false;
-  if (/dmarc=pass/.test(h)) return true;
-  return /spf=pass/.test(h) && /dkim=pass/.test(h);
+  const d = String(fromDomain || '').toLowerCase();
+  if (!h || !d) return false;
+  const align = v => !!v && (v === d || v.endsWith('.' + d) || d.endsWith('.' + v));
+  let dmarcFromDom = null, dmarcPassNoFrom = false, spfDom = null;
+  const dkimDoms = [];
+  for (const clause of h.split(';')) {
+    const c = clause.trim();
+    if (/(^|\s)dmarc=pass(\s|$)/.test(c)) {
+      const hf = c.match(/header\.from=([^\s]+)/);
+      if (hf) dmarcFromDom = hf[1]; else dmarcPassNoFrom = true;
+    }
+    if (/(^|\s)spf=pass(\s|$)/.test(c)) {
+      const mf = c.match(/smtp\.mailfrom=(?:[^@\s]*@)?([^\s]+)/);
+      if (mf) spfDom = mf[1];
+    }
+    if (/(^|\s)dkim=pass(\s|$)/.test(c)) {
+      const hd = c.match(/header\.d=([^\s]+)/);
+      if (hd) dkimDoms.push(hd[1]);
+    }
+  }
+  if (dmarcPassNoFrom || align(dmarcFromDom)) return true;
+  return align(spfDom) && dkimDoms.some(align);
 }
 
 /** xlsx添付 (AMC出荷明細表) → [{vendorCode, vendorName, qty}]。見出し行 (商品コード+出荷数量) を探して以降を読む */
@@ -64,13 +86,15 @@ export async function parseShipmentXlsx(buf) {
   let headerRow = 0, colCode = 0, colName = 0, colQty = 0;
   ws.eachRow((row, rowNo) => {
     if (!headerRow) {
+      // 見出しは「同一行」に商品コード系+出荷数系が揃った行だけ (行またぎで蓄積しない、Codex mail-R2 Medium)
+      let c = 0, n = 0, q = 0;
       row.eachCell((cell, colNo) => {
         const v = String(cell.value == null ? '' : cell.value).trim();
-        if (v === '商品コード' || v === '商品ID') colCode = colNo;
-        if (v === '商品名') colName = colNo;
-        if (v === '出荷数量' || v === '出荷数' || v === '数量') colQty = colNo;
+        if (v === '商品コード' || v === '商品ID') c = colNo;
+        if (v === '商品名') n = colNo;
+        if (v === '出荷数量' || v === '出荷数' || v === '数量') q = colNo;
       });
-      if (colCode && colQty) headerRow = rowNo;
+      if (c && q) { headerRow = rowNo; colCode = c; colName = n; colQty = q; }
       return;
     }
     const code = String(row.getCell(colCode).value == null ? '' : row.getCell(colCode).value).trim();
@@ -105,10 +129,16 @@ export function parseShipmentHtml(html) {
     }
     return rows;
   };
+  // 返信引用 (blockquote/gmail_quote) 内の過去の出荷明細を拾わない。さらに明細表が複数あれば
+  // 合算せずエラーにする (今回分と過去分の二重入荷防止、Codex mail-R2 Medium)
+  const src = String(html || '')
+    .replace(/<blockquote[\s\S]*?<\/blockquote>/gi, '')
+    .replace(/<div[^>]*class="[^"]*gmail_quote[^"]*"[\s\S]*$/gi, '');
+  let matchedTables = 0;
   const items = [];
   const tableRe = /<table[^>]*>([\s\S]*?)<\/table>/gi;
   let tb;
-  while ((tb = tableRe.exec(String(html || ''))) !== null) {
+  while ((tb = tableRe.exec(src)) !== null) {
     const rows = rowsOf(tb[1]);
     // 見出し行を探す (商品ID/商品コード + 出荷数系 が同じ行にある表だけが明細)
     let head = -1, colCode = -1, colName = -1, colQty = -1;
@@ -123,6 +153,8 @@ export function parseShipmentHtml(html) {
       }
     }
     if (head < 0) continue; // 見出しの無い表 (署名等) は無視
+    matchedTables++;
+    if (matchedTables > 1) throw new Error('明細の表が複数あります (返信引用に過去の明細が残っている可能性)。手動貼り付けで今回分だけ変換してください');
     for (let i = head + 1; i < rows.length; i++) {
       const cells = rows[i];
       const code = (cells[colCode] || '').trim();
@@ -227,8 +259,8 @@ export async function fetchShipmentMails(actor, { newerThanDays = 30 } = {}) {
     if (!rule) continue; // 対象外の差出人/件名 (請求書等) は登録しない
     let items = [], note = null, status = 'new', error = null;
     try {
-      // 送信元の真正性 (SPF/DKIM/DMARC)。検証できないメールは自動変換対象にしない (From詐称対策、Codex mail-R1 High)
-      if (!authPassed(c.authResults)) throw new Error('送信元の認証 (SPF/DKIM/DMARC) を確認できません — なりすましの可能性があるため自動変換しません。本物なら手動貼り付けを使ってください');
+      // 送信元の真正性 (SPF/DKIM/DMARC のFromドメイン整合)。検証できないメールは自動変換対象にしない (From詐称対策)
+      if (!authPassed(c.authResults, rule.domain)) throw new Error('送信元の認証 (SPF/DKIM/DMARC) を確認できません — なりすましの可能性があるため自動変換しません。本物なら手動貼り付けを使ってください');
       if (rule.kind === 'xlsx') {
         const files = await c.getXlsx();
         if (!files.length) throw new Error('xlsx添付がありません');

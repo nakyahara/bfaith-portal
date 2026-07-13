@@ -2112,13 +2112,27 @@ console.log('── 出荷明細メール自動取得 (fetch-mails) ──');
     // SPF/DKIM/DMARC不合格 → 自動変換しない (error)
     { id: 'gm-authfail', from: 'ashida@am-craft.jp', subject: '出荷明細', authResults: 'mx.google.com; spf=fail; dkim=fail; dmarc=fail',
       attachments: [{ filename: 'y.xlsx', dataBase64: xlsxB64 }] },
+    // 攻撃者ドメインのspf/dkim=passでFromだけ詐称 (dmarc=fail) → ドメイン整合検証で不合格 (Codex mail-R2 High)
+    { id: 'gm-attack', from: 'ashida@am-craft.jp', subject: '出荷明細',
+      authResults: 'mx.google.com; spf=pass smtp.mailfrom=attacker.example; dkim=pass header.d=attacker.example; dmarc=fail header.from=am-craft.jp',
+      attachments: [{ filename: 'z.xlsx', dataBase64: xlsxB64 }] },
+    // 返信引用で明細表が2つ → 合算せずエラー (二重入荷防止、Codex mail-R2 Medium)
+    { id: 'gm-multitable', from: 'wholesale@be-free.biz', subject: '出荷明細 (再送)',
+      bodyHtml: '<table><tr><th>商品ID</th><th>出荷数</th></tr><tr><td>GOFUN-01-N</td><td>10</td></tr></table>' +
+        '<table><tr><th>商品ID</th><th>出荷数</th></tr><tr><td>GOFUN-01-N</td><td>20</td></tr></table>' },
   ]);
   r = await jp3('/api/inbound-plan/fetch-mails');
-  ok(r.body.ok && r.body.added === 4 && r.body.errors.length === 2, 'fetch: 対象2+エラー2を登録 (対象外/偽装Fromは無視)', r.body);
-  ok(r.body.open.length === 4, 'fetch: 未処理一覧に4件 (new2+error2)', r.body.open.length);
+  ok(r.body.ok && r.body.added === 6 && r.body.errors.length === 4, 'fetch: 対象2+エラー4を登録 (対象外/偽装Fromは無視)', r.body);
+  ok(r.body.open.length === 6, 'fetch: 未処理一覧に6件 (new2+error4)', r.body.open.length);
   ok(!r.body.open.some(m => m.gmail_id === 'gm-spoof'), 'fetch: 表示名偽装 (実アドレス別ドメイン) は取り込まない (Codex mail-R1 High)');
   const authFail = r.body.open.find(m => m.gmail_id === 'gm-authfail');
   ok(authFail && authFail.status === 'error' && authFail.error.includes('なりすまし'), 'fetch: SPF/DKIM/DMARC不合格は自動変換しない', authFail && authFail.error);
+  const attackMail = r.body.open.find(m => m.gmail_id === 'gm-attack');
+  ok(attackMail && attackMail.status === 'error' && attackMail.error.includes('なりすまし'),
+    'fetch: 攻撃者ドメインspf/dkim=pass+From詐称もドメイン整合で拒否 (Codex mail-R2 High)', attackMail && attackMail.error);
+  const multiMail = r.body.open.find(m => m.gmail_id === 'gm-multitable');
+  ok(multiMail && multiMail.status === 'error' && multiMail.error.includes('複数'),
+    'fetch: 明細表が複数のメールは合算せずエラー (二重入荷防止)', multiMail && multiMail.error);
   const amcMail = r.body.open.find(m => m.gmail_id === 'gm-amc-1');
   const bfMail = r.body.open.find(m => m.gmail_id === 'gm-bf-1');
   const errMail = r.body.open.find(m => m.gmail_id === 'gm-amc-noatt');
@@ -2146,7 +2160,7 @@ console.log('── 出荷明細メール自動取得 (fetch-mails) ──');
   r = await jp3('/api/inbound-plan/mails/' + errMail.id + '/status', { status: 'ignored' });
   ok(r.body.ok, 'mail: 無視');
   r = await j('/api/inbound-plan/mails');
-  ok(r.body.ok && r.body.open.length === 2 && r.body.open.some(m => m.gmail_id === 'gm-bf-1') && r.body.recent.length === 2,
+  ok(r.body.ok && r.body.open.length === 4 && r.body.open.some(m => m.gmail_id === 'gm-bf-1') && r.body.recent.length === 2,
     'mail: 一覧はnew/errorのみ (処理済みはrecentへ)', r.body.open.length);
   delete process.env.PO_SHIPMENT_FAKE_DATA;
 
