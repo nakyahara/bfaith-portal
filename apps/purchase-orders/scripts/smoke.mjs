@@ -3,6 +3,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { createHash } from 'crypto';
 import { pathToFileURL, fileURLToPath } from 'url';
 import iconv from 'iconv-lite';
 
@@ -13,6 +14,11 @@ const WORK = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../.
 const imp = p => import(pathToFileURL(path.join(WORK, p)).href);
 const { initMirrorDB } = await imp('apps/warehouse-mirror/db.js');
 initMirrorDB(); // 本番では server.js (warehouse-mirror router import) が起動時に実行する
+// ⚠️ mirror router は import 時に initMirrorDB を再実行して接続を開き直すため、
+// getDB() でハンドルを掴む前 (=ここ) で読み込む (注残SSoTテストで mount する)
+process.env.PML_READ_TOKEN = 'smoke-pml-token';
+const mirrorRouter = (await imp('apps/warehouse-mirror/router.js')).default;
+const pmlListRouter = (await imp('apps/product-management-list/router.js')).default;
 const { getDB } = await imp('apps/purchase-orders/db.js');
 const { computeProduct, stockConstant, evaluateCondition } = await imp('apps/purchase-orders/logic.js');
 const routerMod = await imp('apps/purchase-orders/router.js');
@@ -62,8 +68,11 @@ ok(stockConstant(1) === 0.5 && stockConstant(1.5) === 1 && stockConstant(2.5) ==
 // ── 2. express 起動 (認証なしで直 mount) ──
 const app = express();
 app.use('/apps/purchase-orders', express.json({ limit: '1mb' }), routerMod.default);
+app.use('/apps/warehouse-mirror', express.json({ limit: '8mb' }), mirrorRouter);
+app.use('/apps/product-management-list', pmlListRouter);
 const server = app.listen(0);
 const base = `http://127.0.0.1:${server.address().port}/apps/purchase-orders`;
+const siteBase = `http://127.0.0.1:${server.address().port}`;
 const j = async (p, opt) => {
   const r = await fetch(base + p, opt);
   return { status: r.status, body: await r.json().catch(() => null) };
@@ -1828,6 +1837,115 @@ console.log('── ダッシュボード非表示 (サーバ保存/サイクル
   // 発注残ページ: 仕入先名はワークスペースへのリンクではなくなった (明細が消えたと誤解しない導線)
   const boHtml2 = await (await fetch(base + '/backorders')).text();
   ok(boHtml2.includes('新しい発注作業') && boHtml2.includes('クリックでこの発注の明細'), '/backorders: 明細展開が主導線+ワークスペースは明示リンク');
+}
+
+// ═══ 注残SSoT (正本=アプリ台帳。NE由来の注残数はlegacy) — 2026-07-13 データ契約 ═══
+console.log('── 注残SSoT (正本ビュー/GAS endpoint差替/商品管理リスト/契約テスト) ──');
+{
+  const { setSetting: setL2 } = await imp('apps/purchase-orders/ledger.js');
+  // NE由来の注残数にゾンビ値を入れても、正本ビューは台帳値を返す
+  db.prepare("UPDATE mirror_pml_snapshot_rows SET 注残数=999 WHERE 商品コード='noflyersticker'").run();
+  const ledgerZan = db.prepare("SELECT backorder_qty FROM v_ledger_backorder_by_product WHERE product_key='noflyersticker'").get();
+  ok(ledgerZan && ledgerZan.backorder_qty > 0, 'SSoT: v_ledger_backorder_by_product に台帳注残', ledgerZan);
+  const authRow = db.prepare("SELECT 注残数, ne_backorder_qty, backorder_source FROM v_pml_rows_authoritative WHERE 商品コード='noflyersticker'").get();
+  ok(authRow && authRow.注残数 === ledgerZan.backorder_qty && authRow.ne_backorder_qty === 999 && authRow.backorder_source === 'app',
+    'SSoT: v_pml_rows_authoritative の注残数=台帳値 (NEゾンビ値999は ne_backorder_qty に隔離)', authRow);
+  // loadLedgerBackorders もビュー経由 (集計一本化)
+  const { loadLedgerBackorders: llb } = await imp('apps/purchase-orders/logic.js');
+  ok(llb().get('noflyersticker') === ledgerZan.backorder_qty, 'SSoT: loadLedgerBackorders はビューと同値');
+
+  // GAS向け /api/pml/published: 注残数差替+checksum再計算+由来表示
+  const gasRes = await fetch(siteBase + '/apps/warehouse-mirror/api/pml/published', { headers: { 'x-read-token': 'smoke-pml-token' } });
+  const gas = await gasRes.json();
+  ok(gas.ok === true && gas.backorder_source === 'app_ledger', 'SSoT: GAS endpoint は backorder_source=app_ledger', gas.backorder_source);
+  const gasRow = gas.rows.find(r => r.商品コード === 'noflyersticker');
+  ok(gasRow && gasRow.注残数 === ledgerZan.backorder_qty && gasRow.注残数 !== 999, 'SSoT: GAS行の注残数=台帳値', gasRow && gasRow.注残数);
+  {
+    const canonical = gas.rows.map(r => gas.columns.map(c => r[c] == null ? '' : String(r[c])).join('\t')).join('\n');
+    const recomputed = createHash('sha256').update(canonical).digest('hex');
+    ok(recomputed === gas.payload_checksum, 'SSoT: GAS checksum は差替後の行と一致 (GAS側検証が通る)');
+  }
+  const noTok = await fetch(siteBase + '/apps/warehouse-mirror/api/pml/published');
+  ok(noTok.status === 401, 'SSoT: GAS endpoint はトークン必須のまま');
+
+  // 商品管理リスト: 画面に由来表示+CSVも台帳値
+  const pmlHtml = await (await fetch(siteBase + '/apps/product-management-list/')).text();
+  ok(pmlHtml.includes('発注アプリの台帳'), 'SSoT: 商品管理リスト画面に注残の由来表示');
+  const csvBuf = Buffer.from(await (await fetch(siteBase + '/apps/product-management-list/export.csv')).arrayBuffer());
+  const csvTxt = iconv.decode(csvBuf, 'Shift_JIS');
+  const csvLine = csvTxt.split('\r\n').find(l => l.startsWith('noflyersticker,'));
+  ok(csvLine && csvLine.split(',')[11] === String(ledgerZan.backorder_qty), 'SSoT: 商品管理リストCSVの注残数=台帳値', csvLine && csvLine.split(',')[11]);
+
+  // 緊急ロールバック: backorder_source='ne' でGAS/商品管理リストの両経路がNE由来値に戻る
+  setL2('backorder_source', 'ne', { actor: 'smoke', reason: 'テスト' });
+  const gasNe = await (await fetch(siteBase + '/apps/warehouse-mirror/api/pml/published', { headers: { 'x-read-token': 'smoke-pml-token' } })).json();
+  const gasNeRow = gasNe.rows.find(r => r.商品コード === 'noflyersticker');
+  ok(gasNe.backorder_source === 'ne_legacy' && gasNeRow.注残数 === 999, 'SSoT: ロールバック時GASはNE由来値 (999) に戻る');
+  {
+    const canonicalNe = gasNe.rows.map(r2 => gasNe.columns.map(c => r2[c] == null ? '' : String(r2[c])).join('\t')).join('\n');
+    ok(createHash('sha256').update(canonicalNe).digest('hex') === gasNe.payload_checksum, 'SSoT: ロールバック時もchecksum一致 (Codex SSoT-R1 Low)');
+  }
+  const pmlNeHtml = await (await fetch(siteBase + '/apps/product-management-list/')).text();
+  ok(pmlNeHtml.includes('緊急ロールバック中'), 'SSoT: ロールバック時はリスト画面にNE由来警告');
+  {
+    const csvNe = iconv.decode(Buffer.from(await (await fetch(siteBase + '/apps/product-management-list/export.csv')).arrayBuffer()), 'Shift_JIS');
+    const lineNe = csvNe.split('\r\n').find(l => l.startsWith('noflyersticker,'));
+    ok(lineNe && lineNe.split(',')[11] === '999', 'SSoT: ロールバック時はリストCSVもNE由来値 (999)', lineNe && lineNe.split(',')[11]);
+  }
+  setL2('backorder_source', 'app', { actor: 'smoke', reason: 'テスト戻し' });
+
+  // 整合性検査: 台帳注残がPML商品にJOINできないと警告
+  const savedRow = db.prepare("SELECT * FROM mirror_pml_snapshot_rows WHERE 商品コード='cardstand-silver-r'").get();
+  db.prepare("DELETE FROM mirror_pml_snapshot_rows WHERE 商品コード='cardstand-silver-r'").run();
+  r = await j('/api/ledger/integrity');
+  ok((r.body.warnings || []).some(w => w.kind === 'backorder_not_in_pml' && w.productKey === 'cardstand-silver-r'),
+    'SSoT: PMLに無い台帳注残は警告 (backorder_not_in_pml)', (r.body.warnings || []).filter(w => w.kind === 'backorder_not_in_pml'));
+  insRow.run(savedRow.商品コード, savedRow.商品名, savedRow.仕入先, savedRow.取扱区分, savedRow.売上分類, savedRow.総在庫数_引当なし,
+    savedRow.注残数, savedRow.販売数7日_合計, savedRow.販売数30日_合計, savedRow.発注ロット単位, savedRow.推奨保有月数,
+    savedRow.売価, savedRow.原価, savedRow.最終仕入日, savedRow.登録日);
+  db.prepare("UPDATE mirror_pml_snapshot_rows SET 注残数=0 WHERE 商品コード='noflyersticker'").run(); // ゾンビ値を戻す
+
+  // 静的契約テスト: 許可リスト外のコードが mirror_pml_snapshot_rows の注残数を直接参照していないこと
+  // (docs/contracts/pml_backorder_authority.contract.md。将来のアプリ/AIが誤って古いNE注残を読む事故の防波堤)
+  {
+    // 許可はできるだけファイル単位 (ディレクトリ丸ごと除外は miniPC側の apps/warehouse のみ、Codex SSoT-R1 Medium)
+    const ALLOW = [
+      'apps/warehouse/',                          // miniPC側 (raw/snapshot生成元。Render配信対象外)
+      'apps/warehouse-mirror/db.js',              // mirror DDL (契約コメントの置き場)
+      'apps/warehouse-mirror/router.js',          // ingest検証+GAS endpoint差替の実装そのもの
+      'apps/purchase-orders/db.js',               // 正本ビュー定義
+      'apps/purchase-orders/logic.js',            // NEオーバーレイ/override実装
+      'apps/product-management-list/router.js',   // ロールバックfallback
+      'apps/purchase-orders/scripts/',            // テスト自身
+    ];
+    const scanOne = p => {
+      // コメント行 (// や * 始まり) は除外して実コードだけを検査する
+      const src = fs.readFileSync(p, 'utf8').split('\n')
+        .filter(l => { const t = l.trim(); return !t.startsWith('//') && !t.startsWith('*') && !t.startsWith('/*'); })
+        .join('\n');
+      return src.includes('mirror_pml_snapshot_rows') && /注残数|発注残数/.test(src);
+    };
+    const offenders = [];
+    const walk = dir => {
+      for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+        const p = path.join(dir, ent.name);
+        if (ent.isDirectory()) { if (ent.name !== 'node_modules') walk(p); continue; }
+        if (!/\.(js|mjs|cjs)$/.test(ent.name)) continue;
+        const rel = path.relative(WORK, p).replace(/\\/g, '/');
+        // ディレクトリ項目 (末尾/) は前方一致、ファイル項目は完全一致 (xxx.js.backup.cjs 等のすり抜け防止、Codex SSoT-R2)
+        if (ALLOW.some(a => a.endsWith('/') ? rel.startsWith(a) : rel === a)) continue;
+        if (scanOne(p)) offenders.push(rel);
+      }
+    };
+    walk(path.join(WORK, 'apps'));
+    ok(offenders.length === 0, '契約: mirror_pml_snapshot_rows の注残数を直接参照するコードなし (許可リスト外)', offenders);
+    // 検出器の自己テスト: 違反fixtureを一時作成して確実にFAIL側へ倒れることを確認 (ガード自身の回帰防止)
+    const fixture = path.join(WORK, 'apps', '_smoke_contract_fixture.js');
+    try {
+      fs.writeFileSync(fixture, "const q = db.prepare('SELECT 注残数 FROM mirror_pml_snapshot_rows');\n");
+      ok(scanOne(fixture) === true, '契約: 検出器は違反コードを検出できる (自己テスト)');
+    } finally { try { fs.unlinkSync(fixture); } catch {} }
+  }
 }
 
 server.close();

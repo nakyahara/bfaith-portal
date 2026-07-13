@@ -2167,6 +2167,9 @@ function createTables() {
   // ---- 商品管理リスト スナップショット ミラー (⑤、商品管理リスト④の published run を受信) ----
   //   ミニPC build-product-management-snapshot.js → sync-to-render.js → ここ。
   //   受信時に checksum 検証 (recompute == 送信元 payload_checksum) してから atomic swap。
+  //   ⚠️ データ契約 (docs/contracts/pml_backorder_authority.contract.md、2026-07-13):
+  //   「注残数」列は NE 由来の legacy 値 (発注はアプリで行うため以後更新されない)。現在の注残として
+  //   直接参照禁止 — 正本は v_ledger_backorder_by_product / PML行は v_pml_rows_authoritative を使うこと。
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_pml_snapshot_rows (
     run_id                TEXT NOT NULL,
     商品コード            TEXT NOT NULL,

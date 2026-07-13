@@ -11,6 +11,9 @@
 import { Router } from 'express';
 import iconv from 'iconv-lite';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
+// 正本ビュー (v_pml_rows_authoritative) は purchase-orders の初期化で作られる。cold start直後の
+// アクセスでビュー未作成の500にならないよう、読み取り前に getDB() で初期化を保証する (Codex SSoT-R2 Low)
+import { getDB as ensurePoInit } from '../purchase-orders/db.js';
 
 const router = Router();
 
@@ -53,14 +56,22 @@ async function callWarehouse(fullPath, { method = 'GET', timeout = 30000 } = {})
 }
 
 function loadPublished() {
+  ensurePoInit(); // 正本ビュー作成の保証 (初回のみ実処理、以降はno-op)
   const db = getMirrorDB();
   // pub + rows を 1 read transaction で読む。sync 側 atomic swap (DELETE→INSERT→published upsert) と
   // 競合しても「旧 run_id の published metadata + 空/別 run の rows」を返さないようにする (Codex⑤b R1 High)。
+  // 注残数はアプリ発注台帳が正本 (SSoT化 2026-07-13): v_pml_rows_authoritative (=published run + 台帳注残差替。
+  // purchase-orders の初期化で作られる正本ビュー) を読む。NE由来の mirror_pml_snapshot_rows.注残数 は legacy
   return db.transaction(() => {
     const pub = db.prepare('SELECT * FROM mirror_pml_published WHERE id=1').get();
-    if (!pub) return { pub: null, rows: [] };
-    const rows = db.prepare(`SELECT ${COLS.join(', ')} FROM mirror_pml_snapshot_rows WHERE run_id=? ORDER BY 商品コード`).all(pub.run_id);
-    return { pub, rows };
+    if (!pub) return { pub: null, rows: [], backorderSource: null };
+    // 緊急ロールバック (po_settings backorder_source='ne') 時のみNE由来値に戻す
+    let src = 'app';
+    try { src = db.prepare("SELECT value FROM po_settings WHERE key='backorder_source'").get()?.value || 'app'; } catch { src = 'app'; }
+    const rows = src === 'ne'
+      ? db.prepare(`SELECT ${COLS.join(', ')} FROM mirror_pml_snapshot_rows WHERE run_id=? ORDER BY 商品コード`).all(pub.run_id)
+      : db.prepare(`SELECT ${COLS.join(', ')} FROM v_pml_rows_authoritative ORDER BY 商品コード`).all();
+    return { pub, rows, backorderSource: src === 'ne' ? 'ne_legacy' : 'app_ledger' };
   })();
 }
 
@@ -97,8 +108,8 @@ router.get('/export.csv', (req, res) => {
 
 // ─── HTML 表示 ───
 router.get('/', (req, res) => {
-  let pub, rows;
-  try { ({ pub, rows } = loadPublished()); }
+  let pub, rows, backorderSource;
+  try { ({ pub, rows, backorderSource } = loadPublished()); }
   catch (e) { return res.status(500).send('error: ' + e.message); }
 
   const statusBadge = !pub ? '<span class="b b-f">未生成</span>'
@@ -107,6 +118,10 @@ router.get('/', (req, res) => {
     : '<span class="b b-f">failed</span>';
 
   const wm = pub ? `NE: ${he(pub.src_ne_products_synced_at)} / 販売: ${he(pub.src_velocity_as_of)} / FBA在庫: ${he(pub.src_fba_business_date)} / 発注設定: ${he(pub.src_reorder_updated_at)}` : '';
+  const boNote = !pub ? ''
+    : (backorderSource === 'ne_legacy'
+      ? '⚠️ 注残数: NE由来 (緊急ロールバック中 backorder_source=ne)'
+      : '注残数: <b>発注アプリの台帳</b> (リアルタイム。NE由来の注残は2026-07-13で更新停止=legacy)');
   // FBA在庫の鮮度 (live=オンデマンド最新 / daily=朝の日次)。「総在庫数」は自社(朝)+FBAの混在である旨も明示。
   const fbaFresh = !pub ? ''
     : pub.fba_source_kind === 'live'
@@ -150,7 +165,7 @@ router.get('/', (req, res) => {
   <span class="meta" id="refreshStat"></span>
 </div>
 <div class="bar" style="padding-top:0;border-bottom:1px solid #ddd">
-  <span class="meta">${fbaFresh}</span>
+  <span class="meta">${fbaFresh}${boNote ? ' ・ ' + boNote : ''}</span>
 </div>
 <div class="wrap"><table><thead>${head}</thead><tbody id="tb">${body}</tbody></table></div>
 <script>

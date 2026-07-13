@@ -3364,20 +3364,47 @@ const PML_COLS_OUT = [
   '発注ロット単位','推奨保有月数','売価','原価','想定見込み利益','概算利益率',
   '代表商品コード','ロケーションコード','商品分類タグ','登録日',
 ];
-router.get('/api/pml/published', requirePmlReadToken, (req, res) => {
+// 注残数のアプリ台帳差替 (SSoT化 2026-07-13): 発注はNEに登録しなくなったため、NE由来の注残数は
+// legacy (更新されない古い値が残る)。正本 = purchase-orders 台帳 (v_ledger_backorder_by_product)。
+// 設定 backorder_source='ne' (緊急ロールバック) のときだけ差替しない。
+// po_* 未初期化などで差し替えられない場合は fail-closed (500) — 古いNE値を黙って配らない。
+function substituteLedgerBackorder(db, rows) {
+  const src = (() => {
+    try { return db.prepare("SELECT value FROM po_settings WHERE key='backorder_source'").get()?.value || 'app'; }
+    catch { return 'app'; } // po_settings 不在 (発注アプリ未初期化) は既定 'app' → 下のprepareで失敗して500
+  })();
+  if (src === 'ne') return { rows, source: 'ne_legacy' };
+  const zan = new Map(db.prepare('SELECT product_key, backorder_qty FROM v_ledger_backorder_by_product').all()
+    .map(r => [r.product_key, r.backorder_qty]));
+  return {
+    rows: rows.map(r => ({ ...r, 注残数: zan.get(String(r.商品コード == null ? '' : r.商品コード).trim().toLowerCase()) || 0 })),
+    source: 'app_ledger',
+  };
+}
+router.get('/api/pml/published', requirePmlReadToken, async (req, res) => {
   res.set('Cache-Control', 'no-store');
+  // 正本ビュー (v_ledger_backorder_by_product) は purchase-orders の初期化で作られる。
+  // cold start直後のGASアクセスでビュー未作成500にならないよう初期化を保証 (Codex SSoT-R2 Low)。
+  // ⚠️動的import: 静的importだと相互依存になる (purchase-orders/db.js は本モジュールの隣 db.js を import する)
+  try { (await import('../purchase-orders/db.js')).getDB(); }
+  catch (e) { console.error('[Mirror] purchase-orders 初期化失敗 (注残差替の前提):', e.message); }
   const db = getMirrorDB();
   try {
     const snap = db.transaction(() => {
       const pub = db.prepare('SELECT * FROM mirror_pml_published WHERE id=1').get();
       if (!pub) return { ok: false, reason: 'no_published' };
-      const rows = db.prepare(`SELECT ${PML_COLS_OUT.join(', ')} FROM mirror_pml_snapshot_rows WHERE run_id=? ORDER BY 商品コード`).all(pub.run_id);
-      return { pub, rows };
+      const raw = db.prepare(`SELECT ${PML_COLS_OUT.join(', ')} FROM mirror_pml_snapshot_rows WHERE run_id=? ORDER BY 商品コード`).all(pub.run_id);
+      const { rows, source } = substituteLedgerBackorder(db, raw);
+      return { pub, rows, backorderSource: source };
     })();
     if (snap.ok === false) {
       return res.json({ ok: false, reason: snap.reason, columns: PML_COLS_OUT });
     }
-    const { pub, rows } = snap;
+    const { pub, rows, backorderSource } = snap;
+    // 注残数を差し替えたので checksum も差替後の行で再計算する (GAS は受信行から再計算して一致検証するため。
+    // 算出規約は ingest 側の検証・build-product-management-snapshot.js と同一: 列順固定・null=''・tab/改行)
+    const canonical = rows.map(r => PML_COLS_OUT.map(c => r[c] == null ? '' : String(r[c])).join('\t')).join('\n');
+    const checksum = crypto.createHash('sha256').update(canonical).digest('hex');
     res.json({
       ok: true,
       run_id: pub.run_id,
@@ -3386,7 +3413,9 @@ router.get('/api/pml/published', requirePmlReadToken, (req, res) => {
       generated_at: pub.generated_at,
       published_at: pub.published_at,
       synced_at: pub.synced_at,
-      payload_checksum: pub.payload_checksum,   // GAS は受信行から再計算し一致検証
+      payload_checksum: checksum,               // GAS は受信行から再計算し一致検証 (注残数差替後の値)
+      backorder_source: backorderSource,        // 'app_ledger' = 注残数はアプリ発注台帳 / 'ne_legacy' = ロールバック中
+      ne_payload_checksum: pub.payload_checksum, // 参考: miniPC生成時 (NE注残数) のchecksum
       row_count: pub.row_count,
       actual_row_count: rows.length,
       ne_fba_overlap: pub.ne_fba_overlap,

@@ -703,5 +703,27 @@ export function checkLedgerIntegrity({ orderId = null } = {}) {
       warnings.push({ kind: 'remainder_without_disposition', itemId: r.id, detail: `残${r.rem}の扱い (分納待ち/減数/確認中) が未選択` });
     }
   }
+  // 台帳注残があるのに published PML の商品へJOINできない (正本ビュー v_pml_rows_authoritative で注残が
+  // 見えなくなる = 商品コード改廃・正規化キー不一致の検知。SSoT化 2026-07-13 Codex提言の完全性監視)
+  if (orderId == null) {
+    try {
+      // published PML が無い環境 (初期セットアップ等) では全件が誤検知になるためスキップ (Codex SSoT-R3 Low)
+      const pub = db.prepare('SELECT run_id FROM mirror_pml_published WHERE id = 1').get();
+      if (!pub) return { issues, warnings };
+      for (const r of db.prepare(`
+        SELECT l.product_key, l.backorder_qty FROM v_ledger_backorder_by_product l
+        WHERE NOT EXISTS (
+          SELECT 1 FROM mirror_pml_snapshot_rows p
+          WHERE p.run_id = (SELECT run_id FROM mirror_pml_published WHERE id = 1)
+            AND lower(trim(p.商品コード)) = l.product_key)`).all()) {
+        warnings.push({ kind: 'backorder_not_in_pml', productKey: r.product_key, detail: `台帳注残${r.backorder_qty}がPML商品に見つからない (商品コード改廃?)` });
+      }
+    } catch (e) {
+      // 握り潰すのは「テーブル/ビュー未作成」(mirror未同期環境) だけ。それ以外 (列名変更・SQL破損等) は
+      // 監視クエリ自体の故障として issues に出す (静かに監視が消えるのを防ぐ、Codex SSoT-R1 Medium)
+      if (/no such (table|view)/i.test(String(e.message))) { /* mirror未同期環境では検査しない */ }
+      else issues.push({ kind: 'integrity_check_broken', detail: `backorder_not_in_pml 検査が実行できません: ${e.message}` });
+    }
+  }
   return { issues, warnings };
 }

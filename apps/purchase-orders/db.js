@@ -723,6 +723,45 @@ function initLedgerSchema(db) {
      AND e.event_type <> 'reversal'
      AND NOT EXISTS (SELECT 1 FROM po_item_events r WHERE r.reverses_id = e.id)
     GROUP BY i.id`);
+
+  // ── 注残の正本 (データ契約) ──
+  // 2026-07-13 以降、発注はこのアプリで行い NE には登録しない。そのため NE 由来の
+  // mirror_pml_snapshot_rows.注残数 は今後更新されない legacy 値 (ゼロ化ではなく古い値が残る)。
+  // 【契約】業務上の注残の正本 = po_* 台帳 (集計は v_ledger_backorder_by_product が唯一のロジック)。
+  //         PML 行を読むアプリは v_pml_rows_authoritative を使う。
+  //         mirror_pml_snapshot_rows.注残数 の直接参照は禁止 (smoke の静的契約テストが検出する)。
+
+  // 商品別のアプリ台帳注残 (残>0のオープン tracked 発注のみ、移行PO含む)。
+  // logic.js loadLedgerBackorders / 要発注判定 / PML出力の全消費者がこのビューを使う (集計ロジックの一本化)
+  db.exec('DROP VIEW IF EXISTS v_ledger_backorder_by_product');
+  db.exec(`CREATE VIEW v_ledger_backorder_by_product AS
+    SELECT i.product_key AS product_key, SUM(b.remaining_qty) AS backorder_qty
+    FROM po_order_items i
+    JOIN po_orders o ON o.id = i.order_id
+    JOIN v_po_item_balance b ON b.order_item_id = i.id
+    WHERE o.status = 'issued' AND o.tracking_mode = 'tracked' AND o.closed_at IS NULL AND b.remaining_qty > 0
+      AND o.issued_at >= (SELECT value FROM po_settings WHERE key = 'tracking_started_at')
+    GROUP BY i.product_key`);
+
+  // published PML + アプリ台帳注残 の正本ビュー。注残数はアプリ台帳値 (PMLに載るNE由来値は使わない)。
+  // 由来がわかるよう backorder_source / 参考として ne_backorder_qty (legacy) も持つ
+  db.exec('DROP VIEW IF EXISTS v_pml_rows_authoritative');
+  db.exec(`CREATE VIEW v_pml_rows_authoritative AS
+    SELECT
+      r.商品コード, r.商品名, r.仕入先, r.取扱区分, r.商品区分, r.売上分類, r.最終仕入日, r.在庫保管日数,
+      r.総在庫数, r.FBA在庫数, r.フリー在庫,
+      COALESCE(l.backorder_qty, 0) AS 注残数,
+      r.引当数, r.総在庫数_引当なし,
+      r.販売数7日_FBA, r.販売数7日_FBA以外, r.販売数7日_合計,
+      r.販売数30日_FBA, r.販売数30日_FBA以外, r.販売数30日_合計,
+      r.発注ロット単位, r.推奨保有月数, r.売価, r.原価, r.想定見込み利益, r.概算利益率,
+      r.代表商品コード, r.ロケーションコード, r.商品分類タグ, r.登録日,
+      'app' AS backorder_source,
+      r.注残数 AS ne_backorder_qty,
+      r.run_id AS run_id
+    FROM mirror_pml_snapshot_rows r
+    LEFT JOIN v_ledger_backorder_by_product l ON l.product_key = lower(trim(r.商品コード))
+    WHERE r.run_id = (SELECT run_id FROM mirror_pml_published WHERE id = 1)`);
 }
 
 export function getDB() {
