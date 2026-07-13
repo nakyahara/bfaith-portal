@@ -1015,11 +1015,15 @@ router.post('/api/vendor-map/csv', upload.single('file'), (req, res) => {
       iVendor = 0; iOur = 2;
       warnings.push('見出しなしのため A列=先方番号 / C列=弊社コード として取り込みました');
     }
+    const iQpu = header.indexOf('入数'); // 任意列。無ければ既存の入数を保持する
     let count = 0, skipped = 0;
     const oldCount = db.prepare('SELECT COUNT(*) AS n FROM po_vendor_code_map WHERE supplier_code=?').get(supplierCode).n;
     db.transaction(() => {
+      // 全置換で入数 (単位換算) を消さない: 既存値を控えて同一商品に引き継ぐ (CSVに入数列があればそちら優先)
+      const oldQpu = new Map(db.prepare('SELECT product_key, qty_per_unit FROM po_vendor_code_map WHERE supplier_code=? AND qty_per_unit IS NOT NULL')
+        .all(supplierCode).map(r => [r.product_key, r.qty_per_unit]));
       db.prepare('DELETE FROM po_vendor_code_map WHERE supplier_code=?').run(supplierCode);
-      const ins = db.prepare('INSERT INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, updated_at) VALUES (?,?,?,?,?)');
+      const ins = db.prepare('INSERT INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, qty_per_unit, updated_at) VALUES (?,?,?,?,?,?)');
       const seen = new Set();
       for (let n = 1; n < rows.length; n++) {
         const vendor = trimS(rows[n][iVendor]);
@@ -1029,7 +1033,13 @@ router.post('/api/vendor-map/csv', upload.single('file'), (req, res) => {
         // 同一商品の重複を後勝ちで黙って上書きしない (誤った先方番号の混入防止、Codex P15-R4 Medium)
         if (seen.has(key)) throw new Error(`行${n + 1}: 商品コード ${our} が重複しています (大文字小文字・空白違い含む)。CSVを修正してください`);
         seen.add(key);
-        ins.run(supplierCode, key, our, vendor, nowIso());
+        let qpu = oldQpu.has(key) ? oldQpu.get(key) : null;
+        if (iQpu !== -1 && trimS(rows[n][iQpu]) !== '') {
+          const v = Number(trimS(rows[n][iQpu]).replace(/,/g, ''));
+          if (Number.isFinite(v) && v > 0 && v <= QPU_MAX) qpu = v;
+          else warnings.push(`行${n + 1} (${our}): 入数「${rows[n][iQpu]}」が不正 (${QPU_ERR}) のため${oldQpu.has(key) ? '既存値を保持' : '未設定 (=1)'}にしました`);
+        }
+        ins.run(supplierCode, key, our, vendor, qpu, nowIso());
         count++;
       }
       // 誤CSV・空データで正常な対応表を消さない (0件はロールバック)
@@ -1061,6 +1071,33 @@ router.get('/api/vendor-map', (req, res) => {
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
+// 入数 (単位換算) だけを更新する。入荷予定タブの変換結果からその場で登録する用
+router.post('/api/vendor-map/qty-per-unit', (req, res) => {
+  try {
+    const db = getDB();
+    const b = req.body || {};
+    const supplier = normSupplierCode(b.supplier_code);
+    const key = normProductCode(trimS(b.product_code));
+    if (!supplier || !key) return res.status(400).json({ ok: false, error: '仕入先コードと商品コードが必要です' });
+    // 空欄 = 換算なし (NULL=1扱い)。それ以外は正の数のみ
+    let qpu = null;
+    if (b.qty_per_unit != null && trimS(b.qty_per_unit) !== '') {
+      qpu = Number(String(b.qty_per_unit).replace(/,/g, ''));
+      if (!Number.isFinite(qpu) || qpu <= 0 || qpu > QPU_MAX) return res.status(400).json({ ok: false, error: `${QPU_ERR}: ${b.qty_per_unit}` });
+    }
+    let out = null;
+    db.transaction(() => {
+      const old = db.prepare('SELECT vendor_code, qty_per_unit FROM po_vendor_code_map WHERE supplier_code=? AND product_key=?').get(supplier, key);
+      if (!old) { out = { status: 404, body: { ok: false, error: 'この商品は対応表に未登録です (先に先方番号を登録してください)' } }; return; }
+      db.prepare('UPDATE po_vendor_code_map SET qty_per_unit=?, updated_at=? WHERE supplier_code=? AND product_key=?').run(qpu, nowIso(), supplier, key);
+      audit(db, { actorType: 'user', actor: actorOf(req), action: 'vendor_map_qty_per_unit', resource: `supplier:${supplier}`,
+        detail: { productKey: key, old: old.qty_per_unit, new: qpu } });
+      out = { status: 200, body: { ok: true, qtyPerUnit: qpu == null ? 1 : qpu } };
+    })();
+    res.status(out.status).json(out.body);
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+
 // ─── 対応表の1件管理 (マスタ管理「先方番号対応表」タブ。CSV全置換と違い1商品ずつ追加・修正できる) ───
 
 // 一覧 (商品名はPMLから解決。廃番等でPMLに無い商品は名前空欄のまま表示)
@@ -1073,7 +1110,7 @@ router.get('/api/vendor-map/entries', (req, res) => {
     if (!sup) return res.status(400).json({ ok: false, error: `仕入先が未登録です: ${supplier}` });
     const nameByKey = new Map();
     for (const r of loadPml().rows) nameByKey.set(normProductCode(r['商品コード']), r['商品名'] || '');
-    const rows = db.prepare('SELECT product_code, product_key, vendor_code, updated_at FROM po_vendor_code_map WHERE supplier_code=? ORDER BY product_code')
+    const rows = db.prepare('SELECT product_code, product_key, vendor_code, qty_per_unit, updated_at FROM po_vendor_code_map WHERE supplier_code=? ORDER BY product_code')
       .all(supplier).map(r => ({ ...r, name: nameByKey.get(r.product_key) || '' }));
     res.json({ ok: true, supplierName: sup.name, rows });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
@@ -1127,6 +1164,15 @@ router.post('/api/vendor-map/entry', (req, res) => {
     if (prodSup !== supplier) {
       return res.status(400).json({ ok: false, error: `この商品の仕入先は ${prodSup} です (${sup.name} の対応表には登録できません)` });
     }
+    // 入数 (任意): undefined=変更しない / 空欄=クリア (換算なし=1扱い) / 正の数=設定
+    let qpu;
+    if (b.qty_per_unit !== undefined) {
+      if (b.qty_per_unit == null || trimS(b.qty_per_unit) === '') qpu = null;
+      else {
+        qpu = Number(String(b.qty_per_unit).replace(/,/g, ''));
+        if (!Number.isFinite(qpu) || qpu <= 0 || qpu > QPU_MAX) return res.status(400).json({ ok: false, error: `${QPU_ERR}: ${b.qty_per_unit}` });
+      }
+    }
     let out = null;
     db.transaction(() => {
       const old = db.prepare('SELECT vendor_code, updated_at FROM po_vendor_code_map WHERE supplier_code=? AND product_key=?').get(supplier, key);
@@ -1144,8 +1190,10 @@ router.post('/api/vendor-map/entry', (req, res) => {
       db.prepare(`INSERT INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, updated_at) VALUES (?,?,?,?,?)
         ON CONFLICT(supplier_code, product_key) DO UPDATE SET product_code=excluded.product_code, vendor_code=excluded.vendor_code, updated_at=excluded.updated_at`)
         .run(supplier, key, productCode, vendorCode, nowIso());
+      // 入数は指定されたときだけ更新 (未指定なら既存値を保持)
+      if (qpu !== undefined) db.prepare('UPDATE po_vendor_code_map SET qty_per_unit=? WHERE supplier_code=? AND product_key=?').run(qpu, supplier, key);
       audit(db, { actorType: 'user', actor: actorOf(req), action: 'vendor_map_entry_upsert', resource: `supplier:${supplier}`,
-        detail: { productCode, vendorCode, oldVendorCode: old ? old.vendor_code : null } });
+        detail: { productCode, vendorCode, oldVendorCode: old ? old.vendor_code : null, qtyPerUnit: qpu === undefined ? '(変更なし)' : qpu } });
       // 同じ先方番号が別商品にも付いていたら警告 (入荷予定変換の逆引きが ambiguous になる。ブロックはしない —
       // 実データに単位違い等の正当な重複がありうるため。Codex plan-R2 Medium)
       const dupOf = db.prepare('SELECT product_code, vendor_code FROM po_vendor_code_map WHERE supplier_code=?').all(supplier)
@@ -1190,39 +1238,72 @@ function parseShipmentLines(text) {
 }
 
 const normVendorCode = v => trimS(v).toUpperCase();
+const QPU_MAX = 1000000; // 入数の上限 (極端な値による換算結果の桁あふれ防止)
+const QPU_ERR = `入数は0より大きく${QPU_MAX.toLocaleString('ja-JP')}以下の数で入力してください`;
 
-// 変換コア: 明細 [{vendorCode, vendorName, qty}] → ロジザード貼り付けデータ (手動貼り付け/メール自動取得の共通処理)
+// 変換コア: 明細 [{vendorCode, vendorName, qty}] → ロジザード貼り付けデータ (手動貼り付け/メール自動取得の共通処理)。
+// lines = 明細を元の順序のまま「左=仕入先 (番号/商品名/数量)・右=弊社 (コード/商品名/入数換算後の入荷予定数/単価)」で返す
 function convertShipmentItems(db, supplier, supplierName, items, skipped = []) {
   // 対応表の逆引き: 先方番号 → 弊社商品コード (同じ先方番号が複数商品に付いている場合は ambiguous)
   const rev = new Map();
-  for (const m of db.prepare('SELECT product_code, product_key, vendor_code FROM po_vendor_code_map WHERE supplier_code=?').all(supplier)) {
+  for (const m of db.prepare('SELECT product_code, product_key, vendor_code, qty_per_unit FROM po_vendor_code_map WHERE supplier_code=?').all(supplier)) {
     const k = normVendorCode(m.vendor_code);
     if (!rev.has(k)) rev.set(k, []);
     rev.get(k).push(m);
   }
   const costByKey = new Map();
+  const nameByKey = new Map();
   for (const r of loadPml().rows) {
     // 非数値の原価は null (=仕入単価空欄+costMissing)。Number()のNaNを貼り付けデータに漏らさない (Codex plan-R3 Medium)
     const c = r['原価'] == null || r['原価'] === '' ? null : Number(r['原価']);
-    costByKey.set(normProductCode(r['商品コード']), Number.isFinite(c) ? c : null);
+    const key = normProductCode(r['商品コード']);
+    costByKey.set(key, Number.isFinite(c) ? c : null);
+    nameByKey.set(key, r['商品名'] || '');
   }
-  const okRows = [], unmatched = [], ambiguous = [];
-  let totalQty = 0;
+  const okRows = [], unmatched = [], ambiguous = [], lines = [], qtyInvalid = [];
+  let totalQty = 0, totalVendorQty = 0;
   for (const it of items) {
+    totalVendorQty += it.qty;
     const hits = rev.get(normVendorCode(it.vendorCode)) || [];
-    if (hits.length === 0) { unmatched.push(it); continue; }
-    if (hits.length > 1) { ambiguous.push({ ...it, candidates: hits.map(h => h.product_code) }); continue; }
-    const cost = costByKey.get(hits[0].product_key);
-    okRows.push({ vendorCode: it.vendorCode, productCode: hits[0].product_code, qty: it.qty, cost: cost == null ? null : cost });
-    totalQty += it.qty;
+    if (hits.length === 0) {
+      unmatched.push(it);
+      lines.push({ type: 'unmatched', vendorCode: it.vendorCode, vendorName: it.vendorName || null, vendorQty: it.qty });
+      continue;
+    }
+    if (hits.length > 1) {
+      ambiguous.push({ ...it, candidates: hits.map(h => h.product_code) });
+      lines.push({ type: 'ambiguous', vendorCode: it.vendorCode, vendorName: it.vendorName || null, vendorQty: it.qty, candidates: hits.map(h => h.product_code) });
+      continue;
+    }
+    const hit = hits[0];
+    const qpu = hit.qty_per_unit != null && Number.isFinite(Number(hit.qty_per_unit)) && Number(hit.qty_per_unit) > 0 ? Number(hit.qty_per_unit) : 1;
+    // 入数換算 (先方数量 × 入数 = 弊社の入荷予定数)。結果が「正の整数」になる行だけ貼り付けに含める
+    // (1×1.5=1.5 のような端数を黙って丸めない、Codex 入数R2 High)。浮動小数の計算誤差 (1.2×5=6.000…001) だけは許容
+    const raw = it.qty * qpu;
+    const qty = Math.round(raw);
+    if (!Number.isSafeInteger(qty) || qty <= 0 || Math.abs(raw - qty) > 1e-6) {
+      qtyInvalid.push({ vendorCode: it.vendorCode, vendorQty: it.qty, productCode: hit.product_code, qtyPerUnit: qpu });
+      lines.push({ type: 'badqty', vendorCode: it.vendorCode, vendorName: it.vendorName || null, vendorQty: it.qty,
+        productCode: hit.product_code, productName: nameByKey.get(hit.product_key) || '', qtyPerUnit: qpu });
+      continue;
+    }
+    const cost = costByKey.get(hit.product_key);
+    const row = {
+      vendorCode: it.vendorCode, vendorName: it.vendorName || null, vendorQty: it.qty,
+      productCode: hit.product_code, productName: nameByKey.get(hit.product_key) || '',
+      qtyPerUnit: qpu, qty, cost: cost == null ? null : cost,
+    };
+    okRows.push(row);
+    lines.push({ type: 'ok', ...row });
+    totalQty += qty;
   }
   // ロジザード「入荷予定登録(Excel貼り付け)」の列: 商品ID / 入荷予定数 / 仕入単価 (原価不明は空欄=手作業時のiferror("")と同じ)
   const pasteText = okRows.map(r2 => `${r2.productCode}\t${r2.qty}\t${r2.cost == null ? '' : r2.cost}`).join('\n');
   return {
     ok: true, supplierName, supplierCode: supplier, // 仮登録は変換時の仕入先に固定する (Codex plan-R1 High)
-    rows: okRows, pasteText, totalQty, rowCount: okRows.length,
+    rows: okRows, lines, pasteText, totalQty, totalVendorQty, rowCount: okRows.length,
     costMissing: okRows.filter(r2 => r2.cost == null).map(r2 => r2.productCode),
-    unmatched, ambiguous, skipped,
+    unmatched, ambiguous, skipped, qtyInvalid,
   };
 }
 
@@ -3956,8 +4037,10 @@ router.get('/inbound-plan', (req, res) => {
       <div class="row" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:6px">
         <button class="pri" id="ipFetch">📬 メールから取得 (AMC/ビーフリー)</button>
         <button id="ipReparseAll" style="display:none">🔄 解析エラーを再解析</button>
+        <button id="ipLogizard" title="ロジザードの入荷予定登録 (Excel貼り付け) を新しいタブで開きます">🚚 ロジザード入荷予定を開く</button>
         <span id="ipFetchStat" class="muted"></span>
       </div>
+      <div id="ipResult" style="margin-top:8px"></div>
       <div id="ipMails" style="margin-top:8px"></div>
       <details style="margin-top:10px"><summary class="muted" style="cursor:pointer">✍️ 手動貼り付け (メール以外から / 自動解析に失敗したとき)</summary>
         <div class="row" style="display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap;margin-top:6px">
@@ -3966,7 +4049,6 @@ router.get('/inbound-plan', (req, res) => {
           <button class="pri" id="ipConvert">🔁 変換</button>
         </div>
       </details>
-      <div id="ipResult" style="margin-top:8px"></div>
     </div>`;
   const script = `
 var API = '/apps/purchase-orders/api';
@@ -3979,6 +4061,8 @@ function post(url, body) {
 function getJson(url) { return fetch(url).then(function(r){ return jsonOrErr(r, false); }); }
 
 var IP_LAST = null; // 直近の変換結果 (仮登録ボタン用)
+var LOGIZARD_URL = 'https://ap003.logizard.net/LPSTD405/PA01/Index'; // ロジザード 入荷予定登録
+document.getElementById('ipLogizard').addEventListener('click', function(){ window.open(LOGIZARD_URL, '_blank', 'noopener'); });
 getJson(API + '/masters/suppliers').then(function(j) {
   if (!j.ok) return;
   // 対応表がある仕入先 (AMC/ビーフリー) を先頭に
@@ -4068,12 +4152,22 @@ document.addEventListener('click', function(ev) {
   var v2;
   if ((v2 = g2('data-ipmconv'))) {
     t2.disabled = true;
-    post(API + '/inbound-plan/mails/' + v2 + '/convert', {}).then(function(j) {
-      t2.disabled = false;
-      if (!j.ok) { toast('エラー: ' + j.error); return; }
-      renderIpResult(j);
-      document.getElementById('ipResult').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-    }).catch(function(e){ t2.disabled = false; toast('通信エラー: ' + e.message); });
+    runIpConvert({ mailId: v2 }, function(){ t2.disabled = false; });
+    return;
+  }
+  // 入数 (単位換算) の保存 → 対応表に反映して同じ変換をやり直す (コピー内容にも反映される)
+  if ((v2 = g2('data-ipqpusave'))) {
+    // 押したボタンと同じ行の入力欄を使う (同一商品が複数行に出ても別行の値を拾わない、Codex 入数R1 High)
+    var qpuInp = t2.closest('tr') && t2.closest('tr').querySelector('input[data-ipqpu]');
+    if (!qpuInp || !IP_LAST) return;
+    t2.disabled = true;
+    post(API + '/vendor-map/qty-per-unit', { supplier_code: IP_LAST.supplierCode, product_code: v2, qty_per_unit: qpuInp.value })
+      .then(function(j) {
+        t2.disabled = false;
+        if (!j.ok) { toast('エラー: ' + j.error); return; }
+        toast('入数を対応表に保存しました (' + v2 + ' = ' + j.qtyPerUnit + ') — 変換し直します');
+        reconvertIp();
+      }).catch(function(e){ t2.disabled = false; toast('通信エラー: ' + e.message); });
     return;
   }
   if ((v2 = g2('data-ipmrep'))) {
@@ -4114,35 +4208,92 @@ document.addEventListener('click', function(ev) {
 });
 loadIpMails();
 
-// 変換結果の表示 (メール変換/手動貼り付け 共通)
-function renderIpResult(j) {
+// 変換の実行 (メール/手動/入数保存後の再変換の共通経路)。
+// 世代番号で「最後に開始した変換」だけを描画する — 先に開始した変換の遅い応答が後の結果を上書きしない (Codex 入数R1 High)
+var IP_REQ = null;
+var IP_CONV_GEN = 0;
+function runIpConvert(req, after) {
+  var gen = ++IP_CONV_GEN;
+  IP_REQ = req; // 開始時点で更新: 入数保存後の再変換は常に「最後に開始した変換」を対象にする (Codex 入数R2 High)
+  var p = req.mailId
+    ? post(API + '/inbound-plan/mails/' + req.mailId + '/convert', {})
+    : post(API + '/inbound-plan/convert', { supplier_code: req.supplier, text: req.text });
+  p.then(function(j) {
+    if (after) after();
+    if (gen !== IP_CONV_GEN) return; // 古い応答は破棄 (最後に開始した変換が勝つ)
+    if (!j.ok) { document.getElementById('ipResult').innerHTML = '<div class="warn">' + esc(j.error) + '</div>'; return; }
+    renderIpResult(j, req);
+    document.getElementById('ipResult').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }).catch(function(e){ if (after) after(); toast('通信エラー: ' + e.message); });
+}
+function reconvertIp() {
+  if (IP_REQ) runIpConvert(IP_REQ);
+}
+function renderIpResult(j, req) {
       var area = document.getElementById('ipResult');
       IP_LAST = j;
-      var h = '<div><b>✅ 変換 ' + j.rowCount + '行 / 合計 ' + j.totalQty.toLocaleString('ja-JP') + '個</b>' +
-        (j.mailId ? ' <span class="muted">(メール#' + j.mailId + ' — 貼り付けが済んだら一覧の ✅登録済み を押してください)</span>' : '') +
-        ' <span class="muted">(ロジザード側の「入荷予定数合計」とこの数が一致するか確認してください)</span></div>' +
-        '<div style="display:flex;gap:8px;align-items:flex-start;margin-top:6px">' +
-        '<textarea id="ipPaste" rows="6" style="flex:1;min-width:300px" readonly>' + esc(j.pasteText) + '</textarea>' +
-        '<button class="pri" id="ipCopy">📋 コピー<br><span style="font-size:10px;font-weight:400">(商品ID/入荷予定数/仕入単価)</span></button></div>';
+      // IP_REQ は runIpConvert の開始時に更新済み (描画時に上書きしない — 古い応答でreqを巻き戻さない)
+      var newCount = (j.lines || []).filter(function(l){ return l.type === 'unmatched'; }).length;
+      var h = '<div class="sec" style="padding:10px 12px">' +
+        '<div><b>✅ 変換結果: ' + esc(j.supplierName || j.supplierCode) + '</b> — 貼り付け ' + j.rowCount + '行 / 入荷予定数合計 <b>' + j.totalQty.toLocaleString('ja-JP') + '個</b>' +
+        (newCount ? ' / <span style="color:#b45309">❓対応表になし ' + newCount + '行</span>' : '') +
+        (j.mailId ? ' <span class="muted">(メール#' + j.mailId + ' — 貼り付けが済んだら下の一覧の ✅登録済み)</span>' : '') +
+        ' <span class="muted">(ロジザード側の「入荷予定数合計」と一致するか確認)</span></div>';
+      // 左=仕入先の出荷明細 / 右=対応する弊社の商品。対応表に無い行=新商品が一目で分かる
+      h += '<table class="t" style="margin-top:6px"><tr>' +
+        '<th colspan="3" style="border-right:2px solid #cbd5e1;background:#f1f5f9">🏭 仕入先の出荷明細</th>' +
+        '<th colspan="5" style="background:#eef4ff">🏠 うち (弊社)</th></tr>' +
+        '<tr><th>先方番号</th><th>先方商品名</th><th class="r" style="border-right:2px solid #cbd5e1">数量</th>' +
+        '<th>商品コード</th><th>商品名</th><th class="r">入数<br><span class="muted" style="font-weight:400;font-size:10px">1あたり個数</span></th><th class="r">入荷予定数</th><th class="r">単価</th></tr>';
+      (j.lines || []).forEach(function(l) {
+        var left = '<td>' + esc(l.vendorCode) + '</td><td class="muted">' + esc(l.vendorName || '') + '</td>' +
+          '<td class="r" style="border-right:2px solid #cbd5e1">' + l.vendorQty.toLocaleString('ja-JP') + '</td>';
+        if (l.type === 'unmatched') {
+          h += '<tr style="background:#fff7e6">' + left +
+            '<td colspan="5"><span class="badge b-warn">❓ 対応表になし — 新商品?</span> <span class="muted">下の🕗仮登録で控えて、NE登録の翌朝以降にマスタ管理→📇対応表で紐づけ。番号変更なら📇対応表で既存行を修正</span></td></tr>';
+          return;
+        }
+        if (l.type === 'ambiguous') {
+          h += '<tr style="background:#fff7e6">' + left +
+            '<td colspan="5"><span class="badge b-warn">⚠ 複数候補</span> ' + esc(l.candidates.join(' / ')) + ' <span class="muted">(📇対応表を確認してください — この行は貼り付けに含まれません)</span></td></tr>';
+          return;
+        }
+        if (l.type === 'badqty') {
+          h += '<tr style="background:#fff7e6">' + left +
+            '<td>' + esc(l.productCode) + '</td><td class="muted">' + esc(String(l.productName || '').slice(0, 40)) + '</td>' +
+            '<td class="r" style="white-space:nowrap"><input type="number" min="0" step="any" value="' + l.qtyPerUnit + '" style="width:64px" data-ipqpu="' + esc(l.productCode) + '">' +
+              '<button class="ghost sm" data-ipqpusave="' + esc(l.productCode) + '">💾</button></td>' +
+            '<td colspan="2"><span class="badge b-warn">⚠ 換算結果が不正</span> <span class="muted">' + l.vendorQty.toLocaleString('ja-JP') + '×' + l.qtyPerUnit + ' が正の整数にならないため貼り付けに含めていません。入数を直して💾</span></td></tr>';
+          return;
+        }
+        h += '<tr>' + left +
+          '<td>' + esc(l.productCode) + '</td><td class="muted">' + esc(String(l.productName || '').slice(0, 40)) + '</td>' +
+          '<td class="r" style="white-space:nowrap"><input type="number" min="0" step="any" value="' + (l.qtyPerUnit === 1 ? '' : l.qtyPerUnit) + '" placeholder="1" style="width:64px" data-ipqpu="' + esc(l.productCode) + '" title="先方数量1あたりの弊社個数 (例: 1ケース=240個なら240)。空欄=換算なし">' +
+            '<button class="ghost sm" data-ipqpusave="' + esc(l.productCode) + '" title="入数を対応表に保存して変換し直す">💾</button></td>' +
+          '<td class="r"><b>' + l.qty.toLocaleString('ja-JP') + '</b>' + (l.qtyPerUnit !== 1 ? ' <span class="muted" style="font-size:10px">(' + l.vendorQty.toLocaleString('ja-JP') + '×' + l.qtyPerUnit + ')</span>' : '') + '</td>' +
+          '<td class="r">' + (l.cost == null ? '—' : yen(l.cost)) + '</td></tr>';
+      });
+      h += '</table>';
+      h += '<div style="display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap">' +
+        '<button class="pri" id="ipCopy">📋 貼り付けデータをコピー (商品ID/入荷予定数/仕入単価 ' + j.rowCount + '行)</button>' +
+        '<button id="ipLogizard2">🚚 ロジザード入荷予定を開く</button>' +
+        '<details style="flex-basis:100%"><summary class="muted" style="cursor:pointer;font-size:11px">コピーされる内容を表示</summary>' +
+        '<textarea id="ipPaste" rows="5" style="width:100%;margin-top:4px" readonly>' + esc(j.pasteText) + '</textarea></details></div>';
       if (j.costMissing.length) h += '<div class="warn" style="margin-top:6px">⚠️ 原価不明で仕入単価が空欄: ' + esc(j.costMissing.join(', ')) + '</div>';
-      if (j.ambiguous.length) {
-        h += '<div class="warn" style="margin-top:6px">⚠️ 同じ先方番号が複数商品に対応 (対応表を確認してください): ' +
-          j.ambiguous.map(function(a){ return esc(a.vendorCode) + ' → ' + esc(a.candidates.join('/')); }).join('、') + '</div>';
-      }
+      if (j.qtyInvalid && j.qtyInvalid.length) h += '<div class="warn" style="margin-top:6px">⚠️ 入数換算が不正のため貼り付けから除外 ' + j.qtyInvalid.length + '行 — 表の橙色の行の入数を直して💾してください</div>';
       if (j.unmatched.length) {
-        h += '<div class="warn" style="margin-top:8px"><b>❓ 対応表に無い先方番号 ' + j.unmatched.length + '件</b> (この行は上の貼り付けデータに含まれていません)' +
-          '<table class="t" style="margin-top:4px"><tr><th>先方番号</th><th>先方の商品名</th><th class="r">数量</th></tr>' +
-          j.unmatched.map(function(u){ return '<tr><td>' + esc(u.vendorCode) + '</td><td>' + esc(u.vendorName || '') + '</td><td class="r">' + u.qty + '</td></tr>'; }).join('') +
-          '</table>' +
-          '<button class="pri" id="ipPend" style="margin-top:4px">🕗 この' + j.unmatched.length + '件を仮登録 (後日NE登録後に紐づけ)</button>' +
-          ' <span class="muted">番号変更の場合はマスタ管理→📇対応表で既存商品の番号を修正してください</span></div>';
+        h += '<div class="warn" style="margin-top:8px"><b>❓ 対応表に無い先方番号 ' + j.unmatched.length + '件</b> (上の表の橙色の行。貼り付けデータには含まれていません) ' +
+          '<button class="pri" id="ipPend" style="margin-top:4px">🕗 この' + j.unmatched.length + '件を仮登録 (後日NE登録後に紐づけ)</button></div>';
       }
       if (j.skipped.length) h += '<div class="muted" style="margin-top:4px">解析スキップ ' + j.skipped.length + '行 (番号や数量が読めない行)</div>';
+      h += '</div>';
       area.innerHTML = h;
       var cp = document.getElementById('ipCopy');
       if (cp) cp.addEventListener('click', function() {
         navigator.clipboard.writeText(j.pasteText).then(function(){ toast('コピーしました — ロジザードの「入荷予定登録(Excel貼り付け)」の入力フィールドへ貼り付けてください'); });
       });
+      var lg2 = document.getElementById('ipLogizard2');
+      if (lg2) lg2.addEventListener('click', function(){ window.open(LOGIZARD_URL, '_blank', 'noopener'); });
       var pd = document.getElementById('ipPend');
       if (pd) pd.addEventListener('click', function() {
         pd.disabled = true;
@@ -4160,12 +4311,8 @@ function renderIpResult(j) {
 // 手動貼り付けの変換 (メール以外/自動解析に失敗したとき)
 document.getElementById('ipConvert').addEventListener('click', function() {
   var btn = this; btn.disabled = true;
-  post(API + '/inbound-plan/convert', { supplier_code: document.getElementById('ipSup').value, text: document.getElementById('ipText').value })
-    .then(function(j) {
-      btn.disabled = false;
-      if (!j.ok) { document.getElementById('ipResult').innerHTML = '<div class="warn">' + esc(j.error) + '</div>'; return; }
-      renderIpResult(j);
-    }).catch(function(e){ btn.disabled = false; toast('通信エラー: ' + e.message); });
+  runIpConvert({ supplier: document.getElementById('ipSup').value, text: document.getElementById('ipText').value },
+    function(){ btn.disabled = false; });
 });`;
   res.send(pageShell('発注補助 — 入荷予定', 'inbound-plan', body, script));
 });
@@ -5423,14 +5570,16 @@ function renderVmap(sups, counts, rows) {
   var h = '<div class="toolbar">仕入先 <select id="vmSup">' + opts + '</select>' +
     '<span class="muted" style="margin-left:10px">' + rows.length + ' 件 — 発注書メールの添付CSVに付く先方管理番号。セルを編集して「保存」</span>' +
     '<input type="text" id="vmFilter" placeholder="🔍 商品コード / 商品名 / 先方番号で絞り込み" style="margin-left:auto;min-width:280px"></div>';
-  h += '<table class="t" id="vmTable"><thead><tr><th>商品コード</th><th>商品名</th><th>先方管理番号</th><th>更新日</th><th></th></tr></thead><tbody>';
+  h += '<table class="t" id="vmTable"><thead><tr><th>商品コード</th><th>商品名</th><th>先方管理番号</th><th class="r">入数<br><span class="muted" style="font-weight:400;font-size:10px">先方数量1あたりの個数 (空欄=1)</span></th><th>更新日</th><th></th></tr></thead><tbody>';
   h += '<tr><td colspan="2"><input type="text" id="vmNewProd" list="vmProdDl" placeholder="🔍 商品コード / 商品名で検索して選択" style="width:98%"><datalist id="vmProdDl"></datalist></td>' +
-    '<td><input type="text" id="vmNewVendor" placeholder="先方管理番号" style="width:98%"></td><td class="muted">—</td>' +
+    '<td><input type="text" id="vmNewVendor" placeholder="先方管理番号" style="width:98%"></td>' +
+    '<td><input type="number" id="vmNewQpu" min="0" step="any" placeholder="1" style="width:70px"></td><td class="muted">—</td>' +
     '<td><button class="pri sm" id="vmAdd">追加</button></td></tr>';
-  if (!rows.length) h += '<tr><td colspan="5" class="muted">この仕入先の対応表はまだ空です (上の行から1件ずつ追加、または上の「📥 対応表CSVの一括取込」)</td></tr>';
+  if (!rows.length) h += '<tr><td colspan="6" class="muted">この仕入先の対応表はまだ空です (上の行から1件ずつ追加、または上の「📥 対応表CSVの一括取込」)</td></tr>';
   rows.forEach(function(r) {
     h += '<tr data-vmrow="1" data-vmbase="' + esc(r.updated_at || '') + '"><td>' + esc(r.product_code) + '</td><td class="muted">' + esc(r.name || '') + '</td>' +
       '<td contenteditable data-vmvendor>' + esc(r.vendor_code) + '</td>' +
+      '<td class="r" contenteditable data-vmqpu title="単位換算 (例: 先方1ケース=弊社240個なら240)。空欄=換算なし">' + (r.qty_per_unit == null ? '' : esc(String(r.qty_per_unit))) + '</td>' +
       '<td class="muted">' + esc((r.updated_at || '').slice(0, 10)) + '</td>' +
       '<td style="white-space:nowrap"><button class="ghost" data-vmsave="' + esc(r.product_code) + '">保存</button>' +
       '<button class="ghost" data-vmrm="' + esc(r.product_code) + '">削除</button></td></tr>';
@@ -5511,10 +5660,12 @@ function loadVmapPending() {
 }
 
 // baseUpdatedAt: 表示時のupdated_at (新規はnull)。表示後に他画面/CSV取込で変わっていたらサーバが409を返す
-function vmPost(productCode, vendorCode, baseUpdatedAt) {
+function vmPost(productCode, vendorCode, baseUpdatedAt, qtyPerUnit) {
+  // qty_per_unit は常に送る (画面のセルが正。空欄=換算なしにクリア)
+  var body = { supplier_code: VM_SUP, product_code: productCode, vendor_code: vendorCode, baseUpdatedAt: baseUpdatedAt, qty_per_unit: qtyPerUnit == null ? '' : qtyPerUnit };
   fetch(API_EM + '/vendor-map/entry', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ supplier_code: VM_SUP, product_code: productCode, vendor_code: vendorCode, baseUpdatedAt: baseUpdatedAt }),
+    body: JSON.stringify(body),
   }).then(function(r){ return r.json(); }).then(function(j) {
     if (j.ok) {
       toast(j.updated ? '更新しました' + (j.oldVendorCode ? ' (旧: ' + j.oldVendorCode + ')' : '') : '追加しました');
@@ -5548,13 +5699,14 @@ document.addEventListener('click', function(ev) {
     var vcode = document.getElementById('vmNewVendor').value.trim();
     if (!pcode) { toast('商品を選択してください'); return; }
     if (!vcode) { toast('先方管理番号を入力してください'); return; }
-    vmPost(pcode, vcode, null); // 新規のつもりで送る (既に登録済みならサーバが409で現在値を案内)
+    vmPost(pcode, vcode, null, document.getElementById('vmNewQpu').value.trim()); // 新規のつもりで送る (既に登録済みならサーバが409で現在値を案内)
     return;
   }
   var vmSave = t.getAttribute && t.getAttribute('data-vmsave');
   if (vmSave != null) {
     var vmTr = t.closest('tr');
-    vmPost(vmSave, vmTr.querySelector('[data-vmvendor]').textContent.trim(), vmTr.getAttribute('data-vmbase') || null);
+    vmPost(vmSave, vmTr.querySelector('[data-vmvendor]').textContent.trim(), vmTr.getAttribute('data-vmbase') || null,
+      vmTr.querySelector('[data-vmqpu]').textContent.trim());
     return;
   }
   var vmpL = t.getAttribute && t.getAttribute('data-vmplink');
