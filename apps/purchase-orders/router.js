@@ -4929,7 +4929,7 @@ function renderVmap(sups, counts, rows) {
   h += '<tr><td colspan="2"><input type="text" id="vmNewProd" list="vmProdDl" placeholder="🔍 商品コード / 商品名で検索して選択" style="width:98%"><datalist id="vmProdDl"></datalist></td>' +
     '<td><input type="text" id="vmNewVendor" placeholder="先方管理番号" style="width:98%"></td><td class="muted">—</td>' +
     '<td><button class="pri sm" id="vmAdd">追加</button></td></tr>';
-  if (!rows.length) h += '<tr><td colspan="5" class="muted">この仕入先の対応表はまだ空です (上の行から追加、またはメール設定のCSV取込)</td></tr>';
+  if (!rows.length) h += '<tr><td colspan="5" class="muted">この仕入先の対応表はまだ空です (上の行から1件ずつ追加、または上の「📥 対応表CSVの一括取込」)</td></tr>';
   rows.forEach(function(r) {
     h += '<tr data-vmrow="1" data-vmbase="' + esc(r.updated_at || '') + '"><td>' + esc(r.product_code) + '</td><td class="muted">' + esc(r.name || '') + '</td>' +
       '<td contenteditable data-vmvendor>' + esc(r.vendor_code) + '</td>' +
@@ -4978,10 +4978,13 @@ function vmPost(productCode, vendorCode, baseUpdatedAt) {
 }
 document.addEventListener('click', function(ev) {
   var t = ev.target;
-  var grp = t.getAttribute && t.getAttribute('data-grp');
-  if (grp) { setGroup(grp); return; }
-  var tab = t.getAttribute && t.getAttribute('data-tab');
+  // バッジ (button内のspan) をクリックしても効くよう closest でボタンを解決する (Codex IA-R1 Medium)
+  var grpBtn = t.closest && t.closest('button[data-grp]');
+  if (grpBtn) { setGroup(grpBtn.getAttribute('data-grp')); return; }
+  var tabBtn = t.closest && t.closest('button[data-tab]');
+  var tab = tabBtn && tabBtn.getAttribute('data-tab');
   if (tab) {
+    t = tabBtn; // 以降の .on 切替はボタン基準
     TAB = tab;
     if (GRP === 'conditions') SUBTAB = tab; // 発注条件グループ内の選択を記憶
     // 自分の属するタブバー内だけ選択状態を切り替える (グループバーとサブタブバーの独立、IA整理 2026-07-13)
