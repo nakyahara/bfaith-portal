@@ -255,6 +255,45 @@ function getOrderWithItems(id) {
   return order;
 }
 
+// ─── 追加発注 (確定後に電話等で口頭追加・増量した分を元POに紐づけて発行する) ───
+// 発行済みPOの明細は台帳の基準値で不変 (数量増・商品追加はできない) ため、追加分は origin='supplement' の
+// 新規POとして発行し parent_order_id で元POに紐づける。数量減は既存の減数/取消イベントが担当。
+// 口頭発注済みが前提のため発注書メールは任意 (sendEmail=false なら send_blocked=1 で未送信バッジにも出ない)
+function supplementOrder(parentId, rawItems, extraNote, sendEmail, actor) {
+  const db = getDB();
+  const parent = db.prepare('SELECT * FROM po_orders WHERE id=?').get(parentId);
+  if (!parent) throw new Error(`元の発注が見つかりません: ${parentId}`);
+  if (parent.status !== 'issued') throw new Error('発注確定済みのPOにのみ追加できます (下書きはワークスペースで直接編集してください)');
+  if (parent.tracking_mode !== 'tracked') throw new Error('残数管理対象外 (legacy) のPOには追加できません');
+  if (parent.closed_at) throw new Error('完了済みのPOには追加できません (新規発注として作成してください)');
+  const { items, pmlAsOf } = enrichItems(rawItems, parent.supplier_code);
+  const parentLabel = parent.po_number || `#${parent.id}`;
+  const note = `${parentLabel} への追加発注 (電話等の口頭分)` + (trimS(extraNote) ? ` — ${trimS(extraNote)}` : '');
+  const tx = db.transaction(() => {
+    const now = nowIso();
+    // draft経由で発行するため、この仕入先の未確定カートがあると UNIQUE(draft1件) に衝突する。
+    // 黙って消さない (作業中のカート破壊防止) — NE初期取込と同じく明示エラーで案内する
+    if (db.prepare("SELECT 1 FROM po_orders WHERE supplier_code=? AND status='draft'").get(parent.supplier_code)) {
+      throw new Error('この仕入先に未確定の下書きカートがあります。先にワークスペースで確定するか空にしてから追加発注してください');
+    }
+    ensureTrackingStarted(now);
+    const poNumber = nextPoNumber(db);
+    const info = db.prepare(
+      `INSERT INTO po_orders (supplier_code, supplier_name, status, note, origin, parent_order_id, send_blocked, pml_as_of_date, created_at, updated_at)
+       VALUES (?,?,'draft',?,?,?,?,?,?,?)`
+    ).run(parent.supplier_code, parent.supplier_name, note, 'supplement', parentId, sendEmail ? 0 : 1, pmlAsOf, now, now);
+    const id = Number(info.lastInsertRowid);
+    insertItems(db, id, items, null);
+    db.prepare(
+      `UPDATE po_orders SET status='issued', issued_at=?, po_number=?, tracking_mode='tracked', requested_date=?, updated_at=? WHERE id=?`
+    ).run(now, poNumber, headerReqDate(items, null), now, id);
+    audit(db, { actorType: 'user', actor, action: 'order_supplement', resource: `order:${parentId}`,
+      detail: { childId: id, poNumber, sendEmail: !!sendEmail, items: items.map(i => ({ code: i.code, qty: i.qty })) } });
+    return { id, poNumber };
+  });
+  return tx.immediate();
+}
+
 // ─── 商品データの API 送信形 ───
 function productDto(p) {
   return {
@@ -567,6 +606,28 @@ router.get('/api/orders/:id', (req, res) => {
     if (!order) return res.status(404).json({ ok: false, error: 'not found' });
     res.json({ ok: true, order });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// 追加発注 (電話等の口頭追加・増量分)。冪等キーで再送しても二重発行しない
+router.post('/api/orders/:id/supplement', (req, res) => {
+  try {
+    const parentId = Number(req.params.id);
+    if (!Number.isSafeInteger(parentId) || parentId <= 0) return res.status(400).json({ ok: false, error: 'idが不正です' });
+    const { items, note, sendEmail } = req.body || {};
+    if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ ok: false, error: '追加する明細が空です' });
+    const canonicalItems = items.map(i => {
+      const o = { code: normProductCode(i && i.code), qty: Number(i && i.qty) };
+      const rd = trimS(i && i.requestedDate);
+      if (rd) o.requestedDate = rd;
+      return o;
+    }).sort((a, b) => a.code.localeCompare(b.code) || a.qty - b.qty);
+    const { replay, result } = withCommand(
+      { idempotencyKey: trimS(req.get('Idempotency-Key')) || null,
+        payload: { op: 'supplement', parentId, items: canonicalItems, note: trimS(note), sendEmail: !!sendEmail } },
+      () => supplementOrder(parentId, items, note, !!sendEmail, actorOf(req))
+    );
+    res.json({ ok: true, id: result.id, poNumber: result.poNumber, replay });
+  } catch (e) { res.status(e.status === 409 ? 409 : 400).json({ ok: false, error: e.message }); }
 });
 
 // ─── P13b: 発注残・消込 API ───
@@ -3761,7 +3822,9 @@ function orderHtml(o) {
   // 見える誤解を生んだ、中原さん報告 2026-07-13)。行クリック=このPOの確定明細を展開。ワークスペースへは展開部の🛒から
   var h = '<div class="sec"><h2 style="cursor:pointer" data-toggle="' + o.id + '" tabindex="0" role="button" aria-expanded="false" title="クリックでこの発注の明細 (確定時の内容) を開閉">' +
     esc(o.poNumber || ('#' + o.id)) + ' — ' + esc(o.supplierName) + ' ' +
-    st + (o.origin === 'migration' ? ' ' + badge('b-draft', '🔁 NE移行分', 'NE発注残の初期取込で作成 (発注書メール対象外)') : '') + ' ' + flags +
+    st + (o.origin === 'migration' ? ' ' + badge('b-draft', '🔁 NE移行分', 'NE発注残の初期取込で作成 (発注書メール対象外)') : '') +
+    (o.origin === 'supplement' ? ' ' + badge('b-draft', '➕ ' + (o.parentPoNumber || '') + ' への追加分', '発注確定後に電話等で口頭追加した分 (元POに紐づく別PO)') : '') +
+    (o.supplementPoNumbers && o.supplementPoNumbers.length ? ' ' + badge('b-issued', '➕ 追加あり: ' + o.supplementPoNumbers.join(', '), 'このPOの確定後に追加発注した分 (別POとして下に表示)') : '') + ' ' + flags +
     '<span class="muted" style="font-weight:normal;font-size:12px;margin-left:8px">発注 ' + fmtD(o.issuedAt) + ' / 希望納期 ' + fmtD(o.requestedDate) +
     ' / 残 ' + o.remainingQty.toLocaleString('ja-JP') + ' (' + yen(o.knownAmount) + ')' + (o.note ? ' / 📝' + esc(o.note) : '') + '</span></h2>' +
     '<div class="bd" id="items-' + o.id + '" style="display:none;max-height:none">';
@@ -3787,14 +3850,98 @@ function orderHtml(o) {
   h += '</table>';
   h += '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap" id="closeArea-' + o.id + '">' +
     (!o.sendBlocked ? '<button class="ghost" data-emailui="' + o.id + '">📧 発注書メール</button>' : '') +
+    (o.open ? '<button class="ghost" data-supplyui="' + o.id + '" title="電話等で口頭追加・増量した分を、このPOに紐づく追加POとして登録します">➕ 追加発注 (電話等の追加・増量)</button>' : '') +
     (o.open ? '<button class="ghost" data-closeui="' + o.id + '">✅ 残数を打切って完了にする (手動クローズ)</button>' : '') +
     '<a class="ghost" href="/apps/purchase-orders/supplier/' + encodeURIComponent(o.supplierCode) + '" title="この発注とは別に、新しい発注を作る画面へ移動します">🛒 ' + esc(o.supplierName) + ' の発注画面へ (新しい発注作業)</a>' +
-    '</div><div id="emailArea-' + o.id + '"></div>';
+    '</div><div id="supArea-' + o.id + '"></div><div id="emailArea-' + o.id + '"></div>';
   h += '</div></div>';
   return h;
 }
 
 // ── 発注書メールパネル (プレビュー→送信確認→送信。dry-run/再送/再試行/照合) ──
+// ── ➕追加発注パネル (確定後に電話等で口頭追加・増量した分。元POに紐づく別POとして発行) ──
+function supPanel(orderId) {
+  var o = null;
+  DATA.orders.forEach(function(x){ if (x.id === Number(orderId)) o = x; });
+  if (!o) return;
+  var area = document.getElementById('supArea-' + orderId);
+  // 他POの追加発注パネルは閉じる (入力IDの重複防止)
+  document.querySelectorAll('[id^=supArea-]').forEach(function(el){ if (el !== area) el.innerHTML = ''; });
+  var h = '<div class="import-zone" style="margin-top:6px"><b>➕ 追加発注</b> <span class="muted">' + esc(o.poNumber || ('#' + o.id)) + ' (' + esc(o.supplierName) + ') の確定後に電話等で追加・増量した分。別PO (' + esc(o.poNumber || '') + ' への追加分) として発行され、発注残に載ります。<br>' +
+    '数量を<b>減らす</b>場合はこのパネルではなく、明細の ➖減数 / 🚫取消 を使ってください。</span>' +
+    '<table class="t" style="margin-top:6px" id="supRows-' + orderId + '"><tr><th>商品 (コード / 商品名で検索して選択)</th><th style="width:90px">数量</th><th style="width:150px">希望納期 (任意)</th><th></th></tr></table>' +
+    '<datalist id="supDl-' + orderId + '"></datalist>' +
+    '<button class="ghost" id="supAddRow-' + orderId + '">＋ 行を追加</button>' +
+    '<div style="margin-top:8px;display:flex;gap:12px;align-items:center;flex-wrap:wrap">' +
+    '<label class="muted"><input type="checkbox" id="supEmail-' + orderId + '"> 📧 この追加分を発注書メールの送信対象にする (確定後に📧パネルから送信。既定: 対象外=電話で伝達済み)</label>' +
+    '<label class="muted">メモ <input type="text" id="supNote-' + orderId + '" placeholder="例: 7/13 電話 芦田様" style="width:200px"></label>' +
+    '<button class="pri" id="supGo-' + orderId + '">➕ 追加発注を確定</button>' +
+    '<button class="ghost" id="supClose-' + orderId + '">閉じる</button></div></div>';
+  area.innerHTML = h;
+  var idemKey = newIdemKey();
+  function addRow() {
+    var tbl = document.getElementById('supRows-' + orderId);
+    var tr = tbl.insertRow(-1);
+    tr.innerHTML = '<td><input type="text" list="supDl-' + orderId + '" class="supProd" style="width:98%" placeholder="🔍 2文字以上で検索"></td>' +
+      '<td><input type="number" class="supQty" min="1" step="1" style="width:80px"></td>' +
+      '<td><input type="date" class="supDate"></td>' +
+      '<td><button class="ghost supRm" title="この行を削除">✕</button></td>';
+    tr.querySelector('.supRm').addEventListener('click', function(){ tr.remove(); idemKey = newIdemKey(); });
+    var deb = null;
+    tr.querySelector('.supProd').addEventListener('input', function(ev) {
+      idemKey = newIdemKey();
+      var v = ev.target.value.trim();
+      if (deb) clearTimeout(deb);
+      if (v.length < 2 || v.indexOf(' — ') >= 0) return;
+      deb = setTimeout(function() {
+        fetch(API + '/vendor-map/products?supplier=' + encodeURIComponent(o.supplierCode) + '&q=' + encodeURIComponent(v))
+          .then(function(r){ return r.json(); }).then(function(j) {
+            if (!j.ok) return;
+            var dl = document.getElementById('supDl-' + orderId);
+            if (dl) dl.innerHTML = j.rows.map(function(p){ return '<option value="' + esc(p.code + ' — ' + p.name) + '"></option>'; }).join('');
+          }).catch(function(){});
+      }, 250);
+    });
+    tr.querySelector('.supQty').addEventListener('input', function(){ idemKey = newIdemKey(); });
+    tr.querySelector('.supDate').addEventListener('input', function(){ idemKey = newIdemKey(); });
+  }
+  addRow();
+  document.getElementById('supAddRow-' + orderId).addEventListener('click', addRow);
+  document.getElementById('supClose-' + orderId).addEventListener('click', function(){ area.innerHTML = ''; });
+  document.getElementById('supGo-' + orderId).addEventListener('click', function() {
+    var items = [];
+    var bad = null;
+    document.querySelectorAll('#supRows-' + orderId + ' tr').forEach(function(tr, i) {
+      if (i === 0) return; // ヘッダ行
+      var pv = tr.querySelector('.supProd').value.trim();
+      var qv = tr.querySelector('.supQty').value.trim();
+      var dv = tr.querySelector('.supDate').value;
+      if (!pv && !qv) return; // 空行は無視
+      var dash = pv.indexOf(' — ');
+      var code = (dash >= 0 ? pv.slice(0, dash) : pv).trim();
+      var qty = Number(qv);
+      if (!code) { bad = '商品が未選択の行があります'; return; }
+      if (!Number.isInteger(qty) || qty <= 0) { bad = '数量が正の整数でない行があります (' + code + ')'; return; }
+      items.push({ code: code, qty: qty, requestedDate: dv || null });
+    });
+    if (bad) { toast(bad); return; }
+    if (!items.length) { toast('追加する商品を入力してください'); return; }
+    var sendEmail = document.getElementById('supEmail-' + orderId).checked;
+    var lines = items.map(function(it){ return '・' + it.code + ' × ' + it.qty + (it.requestedDate ? ' (納期 ' + it.requestedDate + ')' : ''); }).join('\\n');
+    if (!confirm('追加発注を確定します (' + o.supplierName + ')\\n\\n' + lines + '\\n\\n発注書メール: ' + (sendEmail ? '送る (📧パネルから送信)' : '送らない (電話で伝達済み)') + '\\nよろしいですか?')) return;
+    var btn = document.getElementById('supGo-' + orderId);
+    btn.disabled = true;
+    post(API + '/orders/' + orderId + '/supplement',
+      { items: items, note: document.getElementById('supNote-' + orderId).value, sendEmail: sendEmail }, idemKey)
+      .then(function(r) {
+        btn.disabled = false;
+        if (!r.ok) { alert('❌ 追加発注は登録されていません\\n\\n理由: ' + (r.error || '不明なエラー')); return; }
+        toast('追加発注 ' + (r.poNumber || '') + ' を確定しました' + (r.replay ? ' (再送・二重登録なし)' : ''));
+        load(); // 一覧を再読込 (追加POが発注残に載る)
+      }).catch(onWriteErr(btn));
+  });
+}
+
 // 送信内容のポップアッププレビュー: 宛先・件名・本文と、添付CSVを発注書の表として表示 (中原さん要望 2026-07-13)
 function emPreviewModal(j) {
   var old = document.getElementById('emModalBg');
@@ -4150,6 +4297,7 @@ document.addEventListener('click', function(ev) {
   if ((v = g('data-disp'))) { dispPanel(v); return; }
   if ((v = g('data-hist'))) { histPanel(v); return; }
   if ((v = g('data-emailui'))) { emailPanel(v); return; }
+  if ((v = g('data-supplyui'))) { supPanel(v); return; }
   if ((v = g('data-emclose'))) { document.getElementById('emailArea-' + v).innerHTML = ''; return; }
   if ((v = g('data-emretry'))) {
     t.disabled = true;
