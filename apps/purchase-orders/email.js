@@ -123,14 +123,13 @@ export function buildOrderEmail(orderId) {
   const noukiColUsed = items.some(it => reqOf(it));
   const distinctDates = [...new Set(items.map(reqOf))];
   const commonNouki = noukiColUsed && distinctDates.length === 1 ? distinctDates[0] : null;
-  // 商品ごとに納期が異なる (一部のみ指定含む) ときだけ9列目「希望納期」を追加。全明細同一ならヘッダ備考に記載
-  const perItemNouki = noukiColUsed && !commonNouki;
 
   // ── 添付CSV: 「いつもの発注書」フォーマット (既存GAS/NE発注書CSVと同一列構成。中原さん指定 2026-07-13) ──
   //   Header,発注伝票番号,発注日,仕入先名,発行担当者, ,合計金額,備考
-  //    ,PO-2026-0044,2026-07-13,アメージングクラフト様,中原　大輔, ,1341960.00,(全明細同一の希望納期)
+  //    ,PO-2026-0044,2026-07-13,アメージングクラフト様,中原　大輔, ,1341960.00,
   //   --,--,--,--,--,--,--,--
-  //   発注区分,商品コード,商品名,商品option,発注単価,発注数,小計,備考(=先方管理番号。旧GASのH列追記と同じ)
+  //   発注区分,商品コード,商品名,希望納期,発注単価,発注数,小計,備考(=先方管理番号。旧GASのH列追記と同じ)
+  //   4列目=旧「商品option」(常に空欄だった) を希望納期に置換 (中原さん指定 2026-07-13)。未指定は空欄
   const money = v => Number(v).toFixed(2);
   const issuedJst = order.issued_at ? new Date(Date.parse(order.issued_at) + 9 * 3600000).toISOString().slice(0, 10) : jstToday();
   let totalQty = 0, totalAmount = 0, csvTotal = 0;
@@ -140,20 +139,16 @@ export function buildOrderEmail(orderId) {
     if (it.unit_cost != null) { totalAmount += Math.round(it.unit_cost * it.qty); csvTotal += it.unit_cost * it.qty; }
     const vendor = vmap.get(it.product_key) || '';
     if (vendorColUsed && !vendor) missingVendorCodes.push(it.product_code);
-    const cells = ['通常', it.product_code, it.product_name || '', '',
+    detail.push(['通常', it.product_code, it.product_name || '',
+      reqOf(it) ? String(reqOf(it)).replace(/-/g, '/') : '',
       it.unit_cost == null ? '' : money(it.unit_cost), it.qty,
-      it.unit_cost == null ? '' : money(it.unit_cost * it.qty), vendor];
-    if (perItemNouki) cells.push(reqOf(it) ? String(reqOf(it)).replace(/-/g, '/') : '');
-    detail.push(cells.map(csvCell).join(','));
+      it.unit_cost == null ? '' : money(it.unit_cost * it.qty), vendor].map(csvCell).join(','));
   }
-  const detailHead = ['発注区分', '商品コード', '商品名', '商品option', '発注単価', '発注数', '小計', '備考'];
-  if (perItemNouki) detailHead.push('希望納期');
   const lines = [
     ['Header', '発注伝票番号', '発注日', '仕入先名', '発行担当者', ' ', '合計金額', '備考'].map(csvCell).join(','),
-    [' ', order.po_number || `#${order.id}`, issuedJst, sup.name, st.issuerName, ' ', money(csvTotal),
-      commonNouki ? `希望納期: ${String(commonNouki).replace(/-/g, '/')}` : ''].map(csvCell).join(','),
+    [' ', order.po_number || `#${order.id}`, issuedJst, sup.name, st.issuerName, ' ', money(csvTotal), ''].map(csvCell).join(','),
     '--,--,--,--,--,--,--,--', // 区切り行 (固定文字列。csvCellを通すと先頭 - が数式対策の ' 付きに化けるため直書き)
-    detailHead.map(csvCell).join(','),
+    ['発注区分', '商品コード', '商品名', '希望納期', '発注単価', '発注数', '小計', '備考'].map(csvCell).join(','),
     ...detail,
   ];
   const csvText = lines.join('\r\n');
