@@ -245,7 +245,8 @@ function fakeMails() {
 export async function fetchShipmentMails(actor, { newerThanDays = 30 } = {}) {
   const db = getDB();
   const exists = db.prepare('SELECT 1 FROM po_shipment_mails WHERE gmail_id=?');
-  const ins = db.prepare(`INSERT INTO po_shipment_mails
+  // INSERT OR IGNORE: 同時実行で両方が未登録と判断してもUNIQUE違反で落ちない (後着は無視、Codex mail-R5 Low)
+  const ins = db.prepare(`INSERT OR IGNORE INTO po_shipment_mails
     (gmail_id, supplier_code, from_addr, subject, received_at, parsed_json, parse_note, status, error, created_at, updated_at)
     VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
   const result = { checked: 0, added: 0, errors: [] };
@@ -274,12 +275,16 @@ export async function fetchShipmentMails(actor, { newerThanDays = 30 } = {}) {
     // nextPageToken を最後まで辿る (1ページ50件で頭打ちにならないように、Codex mail-R1 Medium)。10ページ=500通で打ち切り
     const metas = [];
     let pageToken = null;
+    let capped = false;
     for (let page = 0; page < 10; page++) {
       const list = await gmailApiGet('messages?maxResults=50&q=' + encodeURIComponent(q) + (pageToken ? '&pageToken=' + encodeURIComponent(pageToken) : ''));
       metas.push(...(list.messages || []));
       pageToken = list.nextPageToken || null;
       if (!pageToken) break;
+      if (page === 9) capped = true;
     }
+    // 上限 (500通) 到達は黙って打ち切らず警告として返す (取り残しの可視化、Codex mail-R5 Medium)
+    if (capped) result.errors.push({ gmailId: null, error: `検索結果が${metas.length}通を超えたため打ち切りました。期間を分けて取得してください`, transient: true });
     candidates = [];
     for (const meta of metas) {
       if (exists.get(meta.id)) continue; // 取得済みは本文をダウンロードしない
