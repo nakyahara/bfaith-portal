@@ -51,24 +51,30 @@ function ruleFor(fromHeader, subject) {
  * 節 (;区切り) 単位で解析し、dmarc=passive 等の部分一致誤認を防ぐ。検証不能は false (自動変換させない)
  */
 export function authPassed(authResultsHeader, fromDomain) {
-  const h = String(authResultsHeader || '').toLowerCase();
+  let h = String(authResultsHeader || '').toLowerCase();
   const d = String(fromDomain || '').toLowerCase();
   if (!h || !d) return false;
+  // quoted-string と RFC2045コメント (入れ子含む) を除去してから解析する。
+  // reason="... dmarc=pass ..." のような自由記述文字列でpass判定を注入させない (Codex mail-R3 High、RFC 8601)
+  h = h.replace(/"[^"]*"/g, '""');
+  let prev;
+  do { prev = h; h = h.replace(/\([^()]*\)/g, ' '); } while (h !== prev);
   const align = v => !!v && (v === d || v.endsWith('.' + d) || d.endsWith('.' + v));
   let dmarcFromDom = null, dmarcPassNoFrom = false, spfDom = null;
   const dkimDoms = [];
   for (const clause of h.split(';')) {
     const c = clause.trim();
-    if (/(^|\s)dmarc=pass(\s|$)/.test(c)) {
+    // method=result は「節の先頭」のみ有効 (RFC 8601 resinfo)。節中の任意位置では判定しない
+    const m = c.match(/^(dmarc|spf|dkim)=([a-z0-9]+)/);
+    if (!m || m[2] !== 'pass') continue;
+    if (m[1] === 'dmarc') {
       const hf = c.match(/header\.from=([^\s]+)/);
       if (hf) dmarcFromDom = hf[1]; else dmarcPassNoFrom = true;
-    }
-    if (/(^|\s)spf=pass(\s|$)/.test(c)) {
+    } else if (m[1] === 'spf') {
       const mf = c.match(/smtp\.mailfrom=(?:[^@\s]*@)?([^\s]+)/);
       if (mf) spfDom = mf[1];
-    }
-    if (/(^|\s)dkim=pass(\s|$)/.test(c)) {
-      const hd = c.match(/header\.d=([^\s]+)/);
+    } else {
+      const hd = c.match(/header\.d=([^\s]+)/) || c.match(/header\.i=@?(?:[^@\s]*@)?([^\s]+)/);
       if (hd) dkimDoms.push(hd[1]);
     }
   }
@@ -130,10 +136,15 @@ export function parseShipmentHtml(html) {
     return rows;
   };
   // 返信引用 (blockquote/gmail_quote) 内の過去の出荷明細を拾わない。さらに明細表が複数あれば
-  // 合算せずエラーにする (今回分と過去分の二重入荷防止、Codex mail-R2 Medium)
-  const src = String(html || '')
-    .replace(/<blockquote[\s\S]*?<\/blockquote>/gi, '')
-    .replace(/<div[^>]*class="[^"]*gmail_quote[^"]*"[\s\S]*$/gi, '');
+  // 合算せずエラーにする (今回分と過去分の二重入荷防止、Codex mail-R2 Medium)。
+  // blockquoteの入れ子は「最内側から繰り返し除去」で対応 (非貪欲1回では外側が残る、Codex mail-R3 Medium)
+  let src = String(html || '');
+  let prevSrc;
+  do {
+    prevSrc = src;
+    src = src.replace(/<blockquote[^>]*>(?:(?!<blockquote)[\s\S])*?<\/blockquote>/gi, '');
+  } while (src !== prevSrc);
+  src = src.replace(/<div[^>]*class=["']?[^"'>]*gmail_quote[^"'>]*["']?[\s\S]*$/gi, '');
   let matchedTables = 0;
   const items = [];
   const tableRe = /<table[^>]*>([\s\S]*?)<\/table>/gi;

@@ -2121,6 +2121,30 @@ console.log('── 出荷明細メール自動取得 (fetch-mails) ──');
       bodyHtml: '<table><tr><th>商品ID</th><th>出荷数</th></tr><tr><td>GOFUN-01-N</td><td>10</td></tr></table>' +
         '<table><tr><th>商品ID</th><th>出荷数</th></tr><tr><td>GOFUN-01-N</td><td>20</td></tr></table>' },
   ]);
+  // authPassed / parseShipmentHtml / parseShipmentXlsx の単体回帰 (Codex mail-R3)
+  {
+    const sm = await imp('apps/purchase-orders/shipment-mail.js');
+    ok(sm.authPassed('mx.google.com; dkim=pass header.d=am-craft.jp; spf=pass smtp.mailfrom=am-craft.jp; dmarc=pass header.from=am-craft.jp', 'am-craft.jp') === true, 'auth: 実Gmail形式のpass');
+    ok(sm.authPassed('mx.google.com; spf=fail reason="note dmarc=pass injected"; dmarc=fail header.from=am-craft.jp', 'am-craft.jp') === false,
+      'auth: quoted-string内のdmarc=pass注入は無効 (RFC8601)');
+    ok(sm.authPassed('mx.google.com; dmarc=passive header.from=am-craft.jp', 'am-craft.jp') === false, 'auth: dmarc=passiveは不合格 (部分一致誤認なし)');
+    ok(sm.authPassed('mx.google.com; spf=pass smtp.mailfrom=attacker.example; dkim=pass header.d=attacker.example', 'am-craft.jp') === false, 'auth: 他ドメインのspf/dkim passは不整合');
+    const nested = '<blockquote>古い<blockquote>もっと古い</blockquote><table><tr><th>商品ID</th><th>出荷数</th></tr><tr><td>OLD-1</td><td>99</td></tr></table></blockquote>' +
+      '<table><tr><th>商品ID</th><th>出荷数</th></tr><tr><td>NEW-1</td><td>5</td></tr></table>';
+    const nestedItems = sm.parseShipmentHtml(nested);
+    ok(nestedItems.length === 1 && nestedItems[0].vendorCode === 'NEW-1', 'html: 入れ子blockquote内の過去明細を除去 (今回分のみ)', nestedItems);
+    // xlsx: 見出しが行をまたぐ (商品コードと出荷数量が別行) 場合は見出し不成立
+    const ExcelJS2 = (await import('exceljs')).default;
+    const wbBad = new ExcelJS2.Workbook();
+    const wsBad = wbBad.addWorksheet('x');
+    wsBad.addRow(['商品コード']);
+    wsBad.addRow(['出荷数量']);
+    wsBad.addRow(['AMC-001', '', 10]);
+    let xlsxErr = null;
+    try { await sm.parseShipmentXlsx(Buffer.from(await wbBad.xlsx.writeBuffer())); } catch (e) { xlsxErr = e.message; }
+    ok(xlsxErr && xlsxErr.includes('見出し行'), 'xlsx: 見出しの行またぎは不成立 (同一行のみ)', xlsxErr);
+  }
+
   r = await jp3('/api/inbound-plan/fetch-mails');
   ok(r.body.ok && r.body.added === 6 && r.body.errors.length === 4, 'fetch: 対象2+エラー4を登録 (対象外/偽装Fromは無視)', r.body);
   ok(r.body.open.length === 6, 'fetch: 未処理一覧に6件 (new2+error4)', r.body.open.length);
