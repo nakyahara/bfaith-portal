@@ -2038,6 +2038,26 @@ console.log('── 入荷予定変換 (inbound-plan) + 仮登録 (pending) ─�
   r = await jp2('/api/vendor-map/pending/' + pendUml.id + '/dismiss', {});
   db.prepare("DELETE FROM po_vendor_code_map WHERE supplier_code='1' AND product_key='0726-001060'").run();
 
+  // ビーフリーのメール本文形式 (見出し行/送り状No行/同一商品の複数行=そのまま複数行出力) — 実メール 2026-07-13 の形
+  {
+    const csvBf = iconv.encode('"仕入先管理番号","x","弊社管理番号"\r\n"GOFUN-01-N","","gyoumuhandcream60-BI"', 'Shift_JIS');
+    const fdBf = new FormData();
+    fdBf.append('supplier_code', '2');
+    fdBf.append('file', new Blob([csvBf]), 'bf.csv');
+    r = await j('/api/vendor-map/csv', { method: 'POST', body: fdBf });
+    ok(r.body.ok, 'BEFREE: 対応表準備');
+    const mailText = '【弊社委託倉庫出荷分】\n■ 福通送り状Ｎｏ：66327560902\n' +
+      '商品ID\t商品名\t出荷数\n' +
+      'GOFUN-01-N\t胡粉ネイル スーパーコート N0033\t48\n' +
+      'GOFUN-01-N\t胡粉ネイル スーパーコート N0033\t30\n' +
+      'AUKATZ-06-N2\tヘルスウォーター にゃんマグ 白系\t30\n';
+    r = await jp2('/api/inbound-plan/convert', { supplier_code: '2', text: mailText });
+    ok(r.body.ok && r.body.rowCount === 2 && r.body.totalQty === 78, 'BEFREE: メール表の貼り付けを変換 (同一商品の複数行は複数行のまま=手作業と同じ)', r.body);
+    ok(r.body.pasteText.split('\n').every(l => l.startsWith('gyoumuhandcream60-BI\t')), 'BEFREE: 貼り付けデータ2行', r.body.pasteText);
+    ok(r.body.unmatched.length === 1 && r.body.unmatched[0].vendorCode === 'AUKATZ-06-N2', 'BEFREE: 未知の番号はunmatched');
+    ok(r.body.skipped.length === 2, 'BEFREE: 見出し外の行 (【…】/送り状No) はスキップ', r.body.skipped);
+  }
+
   // CSV取込の重複警告 (同じ先方番号を複数商品に。ブロックせず警告列挙)
   {
     const csvDup = iconv.encode('"仕入先管理番号","x","弊社管理番号"\r\n"BF-X","","prod-a"\r\n"bf-x","","prod-b"', 'Shift_JIS');
