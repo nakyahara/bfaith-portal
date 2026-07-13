@@ -24,7 +24,7 @@
  */
 import 'dotenv/config';
 import fs from 'fs';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -38,16 +38,26 @@ const MAX_RETRY_COUNT = 3;
 
 // ジョブ定義 (daily-sync.js と一致させる)
 //   f_sales のみ retry 時は 30分 (初回 10分でタイムアウトした場合の余裕)
+//   args 省略時は '7' (rebuild系の日数引数の既存挙動を維持)
 const JOB_DEFINITIONS = {
   'f_sales':        { script: 'apps/warehouse/rebuild-f-sales.js',                timeoutMs: 1800000 },
   'sales_velocity': { script: 'apps/warehouse/rebuild-sales-velocity.js',         timeoutMs: 900000  },
   'pml_snapshot':   { script: 'apps/warehouse/build-product-management-snapshot.js', timeoutMs: 600000 },
   '楽天sku_map':    { script: 'apps/warehouse/rebuild-rakuten-sku-map.js',        timeoutMs: 600000  },
   'Render同期':     { script: 'apps/warehouse/sync-to-render.js',                 timeoutMs: 600000  },
+  // Amazon Settlement/Ads: 一過性の SP-API fetch failed で落ちた際の自動復旧 (2026-07-13 に
+  // Settlement が「JOB_DEFINITIONS 未登録のため未実行」→手動対応になった実績)。いずれも冪等で再実行安全。
+  // Settlement の下流 (アカウントフィー build/sync) は翌朝 daily-sync が再集計する冪等設計のため
+  // ここでは fetch 本体のみ再試行すれば十分。
+  // ⚠️'Amazon finance build' は --month 引数が動的 (当月) なため未登録のまま (unhandled 通知で顕在化)
+  'Amazon Settlement':     { script: 'apps/warehouse/fetch-amazon-settlements.js', args: ['--days', '14'], timeoutMs: 3600000 },
+  'Amazon Ads (campaign)': { script: 'apps/warehouse/fetch-amazon-ads-campaign.js', args: [], timeoutMs: 1800000 },
+  'Amazon Ads (SKU)':      { script: 'apps/warehouse/fetch-amazon-ads.js',          args: [], timeoutMs: 1800000 },
 };
 
 // 実行順序 (依存関係順)。sales_velocity → pml_snapshot は f_sales と同じ raw + マスタ依存なので直後。
-const RETRY_ORDER = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期'];
+// Amazon系は他ジョブと独立なので先頭 (長時間ジョブを先に開始)
+const RETRY_ORDER = ['Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期'];
 
 async function notify(text) {
   if (!GCHAT_WEBHOOK) {
@@ -70,11 +80,13 @@ async function notify(text) {
   }
 }
 
-function runScript(scriptPath, label, timeoutMs) {
+// execFileSync(shell:false): timeout時のWAL lock残留と引数のshell解釈を避ける
+// (feedback_execfile_vs_execsync — daily-sync.js と同方針)
+function runScript(scriptPath, label, timeoutMs, args = ['7']) {
   const filePath = path.join(PROJECT_DIR, scriptPath);
   console.log(`\n=== ${label} ===`);
   try {
-    const output = execSync(`node "${filePath}" 7`, {
+    const output = execFileSync(process.execPath, [filePath, ...args], {
       cwd: PROJECT_DIR,
       timeout: timeoutMs,
       encoding: 'utf-8',
@@ -221,7 +233,7 @@ async function main() {
     }
 
     const def = JOB_DEFINITIONS[jobName];
-    const result = runScript(def.script, jobName, def.timeoutMs);
+    const result = runScript(def.script, jobName, def.timeoutMs, def.args);
     results.push({ name: jobName, ...result });
   }
 
