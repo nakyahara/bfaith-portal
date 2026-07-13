@@ -4158,10 +4158,16 @@ document.addEventListener('click', function(ev) {
         emailPanel(emOrder); // unknownバナーは最新ジョブ状態から導出される
         return;
       }
-      var failMsg = !j.ok ? j.error : (j.status === 'sent' ? null : '送信失敗: ' + (j.error || ''));
-      if (failMsg) alert('❌ メールは送信されていません\\n\\n理由: ' + failMsg);
-      else toast('送信しました');
-      emailPanel(emOrder, failMsg || undefined);
+      if (j.ok && j.status === 'sent') { toast('送信しました'); emailPanel(emOrder); return; }
+      if (j.ok) {
+        // failed = サーバが確定拒否 (4xx) と判定した場合のみ = 未送信確定
+        alert('❌ メールは送信されていません\\n\\n理由: ' + (j.error || '送信失敗'));
+        emailPanel(emOrder);
+        return;
+      }
+      // 受付自体の拒否 (別画面での操作との競合等)。実際の送信状態は不明なので未送信と断定しない (Codex vendor-R3)
+      alert('⚠️ 再試行できませんでした\\n\\n理由: ' + (j.error || '不明') + '\\n\\n最新の送信状態は下の履歴で確認してください');
+      emailPanel(emOrder);
     }).catch(function(e) {
       t.disabled = false;
       alert('⚠️ 送信結果を確認できません (通信エラー: ' + e.message + ')\\n\\n実際には送信されている可能性があります。「照合」で確認してください');
