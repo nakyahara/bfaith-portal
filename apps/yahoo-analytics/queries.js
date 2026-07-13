@@ -569,6 +569,19 @@ export function getSkuDetail(sku, from, to) {
     ORDER BY date_jst DESC LIMIT 1
   `).get(sku) || null;
 
+  // 統計 (PV/訪問者/購買率/カート) の日次 — mall-csv-fetcher 由来、fact とは別ソース
+  let trafficDaily = [];
+  try {
+    trafficDaily = db.prepare(`
+      SELECT date_jst, SUM(COALESCE(pv_premium_ship,0) + COALESCE(pv_normal,0)) AS pv,
+        SUM(COALESCE(visitors,0)) AS visitors, SUM(COALESCE(buyers,0)) AS buyers,
+        SUM(COALESCE(cart_adds,0)) AS cart_adds
+      FROM mirror_yahoo_item_daily
+      WHERE ${TRAFFIC_KEY} = ? AND date_jst >= ? AND date_jst <= ?
+      GROUP BY date_jst ORDER BY date_jst
+    `).all(sku, from, to);
+  } catch { /* mirror表未作成 */ }
+
   let master = null;
   if (latest?.ne_code) {
     master = db.prepare(`
@@ -576,7 +589,7 @@ export function getSkuDetail(sku, from, to) {
       FROM mirror_products WHERE 商品コード = ?
     `).get(latest.ne_code) || null;
   }
-  return { sku, from, to, latest, master, daily };
+  return { sku, from, to, latest, master, daily, traffic_daily: trafficDaily };
 }
 
 // ─── 売れ筋分析タブ (F-4b) ───
@@ -623,10 +636,15 @@ export function getBestsellers(from, to, axis) {
   `).all(from, to).map(r => [r.yahoo_sku_key, r.first_date]));
   const newCutoff = addDays(jstToday(), -settings.new_product_days);
 
+  const traffic = trafficBySku(from, to);
   let rows = cur.map(r => {
     const parts = (r.latest_key || '||').split('|');
     const prev = prevMap.get(r.yahoo_sku_key);
+    const t = traffic.get(r.yahoo_sku_key);
     return {
+      pv: t ? t.pv : null,
+      cvr_pct: t ? t.cvr_pct : null,
+      cart_adds: t ? t.cart_adds : null,
       yahoo_sku_key: r.yahoo_sku_key,
       ne_code: parts[1] || null,
       product_name: r.product_name || '',
@@ -729,6 +747,94 @@ export function getBestsellers(from, to, axis) {
     ranking: rows.slice(0, 100),
     risers, fallers, weekday, goen: goenSummary,
   };
+}
+
+// ─── 統計 (mall-csv-fetcher 自動取得 → mirror同期済み) の統合 ───
+// SKUキー: item_daily の sub_code!='' → sub_code else item_code = finance の yahoo_sku_key と同一規則
+const TRAFFIC_KEY = `CASE WHEN sub_code <> '' THEN sub_code ELSE item_code END`;
+
+// 期間×SKU の PV/CVR 集計 map (利益・売れ筋への JOIN 用)
+export function trafficBySku(from, to) {
+  const db = getMirrorDB();
+  try {
+    return new Map(db.prepare(`
+      SELECT ${TRAFFIC_KEY} AS sku,
+        SUM(COALESCE(pv_premium_ship,0) + COALESCE(pv_normal,0)) AS pv,
+        SUM(COALESCE(visitors,0)) AS visitors, SUM(COALESCE(buyers,0)) AS buyers,
+        SUM(COALESCE(cart_adds,0)) AS cart_adds, SUM(COALESCE(favorites,0)) AS favorites
+      FROM mirror_yahoo_item_daily WHERE date_jst >= ? AND date_jst <= ?
+      GROUP BY sku
+    `).all(from, to).map(r => [r.sku, {
+      pv: r.pv, visitors: r.visitors, buyers: r.buyers, cart_adds: r.cart_adds, favorites: r.favorites,
+      cvr_pct: r.visitors > 0 ? Math.round(r.buyers / r.visitors * 1000) / 10 : null,
+    }]));
+  } catch { return new Map(); /* mirror表未作成でも既存機能は動かす */ }
+}
+
+// 検索KWタブ: KW別ランキング + 前期比 (伸び/落ち)
+export function getSearchKeywords(from, to) {
+  const db = getMirrorDB();
+  const days = Math.round((new Date(to + 'T00:00:00Z') - new Date(from + 'T00:00:00Z')) / 86400000) + 1;
+  const pTo = addDays(from, -1), pFrom = addDays(pTo, -(days - 1));
+  const agg = (f, t) => db.prepare(`
+    SELECT keyword, SUM(COALESCE(inflow,0)) AS inflow, SUM(COALESCE(sales_yen,0)) AS sales,
+      SUM(COALESCE(orders,0)) AS orders, MIN(rank) AS best_rank
+    FROM mirror_yahoo_keyword_daily WHERE date_jst >= ? AND date_jst <= ? GROUP BY keyword
+  `).all(f, t);
+  let cur = [], prevMap = new Map();
+  try {
+    cur = agg(from, to);
+    prevMap = new Map(agg(pFrom, pTo).map(r => [r.keyword, r]));
+  } catch { /* mirror表未作成 */ }
+  const rows = cur.map(r => {
+    const p = prevMap.get(r.keyword);
+    return {
+      keyword: r.keyword, inflow: r.inflow, sales: Math.round(r.sales), orders: r.orders,
+      best_rank: r.best_rank,
+      cvr_pct: r.inflow > 0 ? Math.round(r.orders / r.inflow * 1000) / 10 : null,
+      prev_inflow: p ? p.inflow : 0,
+      inflow_growth_pct: p && p.inflow > 0 ? Math.round((r.inflow - p.inflow) / p.inflow * 1000) / 10 : null,
+    };
+  }).sort((a, b) => b.inflow - a.inflow);
+  const freshness = (() => {
+    try { return db.prepare(`SELECT MAX(date_jst) AS d FROM mirror_yahoo_keyword_daily`).get().d; } catch { return null; }
+  })();
+  return { from, to, prev_from: pFrom, prev_to: pTo, data_to: freshness, rows: rows.slice(0, 300) };
+}
+
+// 集客タブ: デバイス別 / 流入・離脱 / 客層
+export function getAcquisition(from, to) {
+  const db = getMirrorDB();
+  const safe = (fn) => { try { return fn(); } catch { return []; } };
+  const device = safe(() => db.prepare(`
+    SELECT date_jst, device, sales_yen, pageviews FROM mirror_yahoo_store_device_daily
+    WHERE date_jst >= ? AND date_jst <= ? AND device <> 'all' ORDER BY date_jst
+  `).all(from, to));
+  const inflow = safe(() => db.prepare(`
+    SELECT date_jst, inflow_visitors, purchase_visitors, purchase_ratio_pct, exit_ratio_pct
+    FROM mirror_yahoo_inflow_daily WHERE date_jst >= ? AND date_jst <= ? ORDER BY date_jst
+  `).all(from, to));
+  const userAttr = safe(() => db.prepare(`
+    SELECT gender, age_band, buyer_class, SUM(COALESCE(visitors,0)) AS visitors
+    FROM mirror_yahoo_user_attr_daily WHERE date_jst >= ? AND date_jst <= ?
+    GROUP BY gender, age_band, buyer_class ORDER BY visitors DESC
+  `).all(from, to));
+  return { from, to, device, inflow, user_attr: userAttr };
+}
+
+// 本日速報バンド (flash_hourly の最新日。今日タイル (finance fact) とは独立表示 — 精度混在防止)
+export function getFlashLatest() {
+  const db = getMirrorDB();
+  try {
+    const latest = db.prepare(`SELECT MAX(date_jst) AS d FROM mirror_yahoo_flash_hourly`).get().d;
+    if (!latest) return { date: null, rows: [] };
+    const rows = db.prepare(`
+      SELECT hour_slot, sales_yen, orders, units, pageviews, visitors
+      FROM mirror_yahoo_flash_hourly WHERE date_jst = ? AND device = 'all' ORDER BY hour_slot
+    `).all(latest);
+    const total = rows.reduce((s, r) => s + (r.sales_yen || 0), 0);
+    return { date: latest, total_sales: total, rows };
+  } catch { return { date: null, rows: [] }; }
 }
 
 // ─── SKU 未解決一覧 (F-4: f_yahoo_sku_map 登録の解消導線) ───

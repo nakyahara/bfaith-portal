@@ -19,7 +19,9 @@ import {
   resolvePeriod, getOverview, getTrend,
   getWaterfall, getSkuProfit, getSkuDetail, getUnresolved,
   getBestsellers, getSettings, saveSettings, getRates, addRate, deleteRate,
+  getSearchKeywords, getAcquisition, getFlashLatest,
 } from './queries.js';
+import { runInsights, listInsights, setInsightStatus } from './insights.js';
 
 const router = Router();
 
@@ -91,6 +93,22 @@ router.get('/api/v1/bestsellers', api((req) => {
 // ─── 設定 (P3: 分析閾値 + 料率マスタ) ───
 router.get('/api/v1/settings', api(() => getSettings()));
 router.put('/api/v1/settings', api((req) => saveSettings(req.body || {})));
+
+// ─── 統計統合 (P6: mall-csv-fetcher 自動取得データ) ───
+router.get('/api/v1/search-keywords', api((req) => {
+  const { from, to } = resolvePeriod(req.query.preset, req.query.from, req.query.to);
+  return getSearchKeywords(from, to);
+}));
+router.get('/api/v1/acquisition', api((req) => {
+  const { from, to } = resolvePeriod(req.query.preset, req.query.from, req.query.to);
+  return getAcquisition(from, to);
+}));
+router.get('/api/v1/flash-latest', api(() => getFlashLatest()));
+
+// ─── 診断 = インサイト基盤 (P6)。GET /insights が AI エージェント向け契約 ───
+router.get('/api/v1/insights', api((req) => listInsights({ status: req.query.status, include_resolved: req.query.include_resolved === '1' })));
+router.post('/api/v1/insights/run', api(() => runInsights('manual')));
+router.put('/api/v1/insights/:id/status', api((req) => setInsightStatus(req.params.id, req.body?.status, req.body?.memo)));
 
 router.get('/api/v1/rates', api(() => getRates()));
 router.post('/api/v1/rates', api((req) => addRate(req.body || {})));
