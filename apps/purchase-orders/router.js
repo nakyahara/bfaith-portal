@@ -4274,9 +4274,10 @@ function rowHtml(o) {
   else if (o.closed_at) st = '<span class="badge b-issued">完了</span>';
   else st = '<span class="badge b-draft">発注残 ' + o.remaining_qty + '</span>';
   var when = o.issued_at ? new Date(o.issued_at).toLocaleString('ja-JP') : '—';
-  // 仕入先名クリック=このPOの確定明細 (以前はワークスペース行きで「確定した内容と違う」誤解を生んだ)
+  // 仕入先名クリック=このPOの明細 (以前はワークスペース行きで「確定した内容と違う」誤解を生んだ)
+  var dtitle = o.status === 'issued' ? 'この発注の明細 (確定時の内容) を表示' : 'この下書きの明細 (未確定・保存で変わる) を表示';
   return '<tr><td>' + esc(o.po_number || ('#' + o.id)) + '</td><td>' + st + '</td>' +
-    '<td><a data-id="' + o.id + '" style="cursor:pointer" title="この発注の明細 (確定時の内容) を表示">' + esc(o.supplier_name) + '</a></td>' +
+    '<td><a data-id="' + o.id + '" tabindex="0" role="button" style="cursor:pointer" title="' + dtitle + '">' + esc(o.supplier_name) + '</a></td>' +
     '<td class="r">' + o.sku_count + '</td><td class="r">' + o.total_qty.toLocaleString('ja-JP') + '</td>' +
     '<td class="r">' + (o.tracking_mode === 'tracked' ? o.remaining_qty.toLocaleString('ja-JP') : '—') + '</td>' +
     '<td class="r">' + yen(o.total_amount) + '</td>' +
@@ -4303,15 +4304,26 @@ function load() {
 }
 document.getElementById('ordSort').addEventListener('change', render);
 document.getElementById('ordSup').addEventListener('change', render);
+// 仕入先名の疑似リンクはEnter/Spaceでも開ける (Codex R1 Low)
+document.addEventListener('keydown', function(ev) {
+  if (ev.key !== 'Enter' && ev.key !== ' ') return;
+  var id = ev.target.getAttribute && ev.target.getAttribute('data-id');
+  if (id) { ev.preventDefault(); openDetail(id); }
+});
 document.addEventListener('click', function(ev) {
   var id = ev.target.getAttribute && ev.target.getAttribute('data-id');
   if (!id) return;
+  openDetail(id);
+});
+function openDetail(id) {
   fetch('/apps/purchase-orders/api/orders/' + id).then(function(r){ return r.json(); }).then(function(j) {
     if (!j.ok) { toast(j.error); return; }
     var o = j.order;
     var lines = o.items.map(function(i){ return i.product_code + '\\t' + (i.product_name || '') + '\\t' + i.qty; });
     var text = lines.join('\\n');
-    document.getElementById('detailTitle').textContent = (o.po_number || ('発注 #' + o.id)) + ' — ' + o.supplier_name + ' (確定時の明細)';
+    // 下書きは未確定 =「確定時の明細」と表示しない (保存のたびに変わる内容、Codex R1 Medium)
+    document.getElementById('detailTitle').textContent = (o.po_number || ('発注 #' + o.id)) + ' — ' + o.supplier_name +
+      (o.status === 'issued' ? ' (確定時の明細)' : ' (下書き明細 — 未確定)');
     document.getElementById('detailBody').innerHTML =
       '<button class="pri" id="btnCopyDetail">📋 リストをコピー</button> <button id="btnCsvDetail">⬇ CSVダウンロード</button>' +
       '<a class="ghost" href="/apps/purchase-orders/supplier/' + encodeURIComponent(o.supplier_code) + '" title="この発注とは別に、新しい発注を作る画面へ移動します">🛒 ' + esc(o.supplier_name) + ' の発注画面へ (新しい発注作業)</a>' +
@@ -4329,7 +4341,7 @@ document.addEventListener('click', function(ev) {
       dlCsv('発注_' + o.supplier_name + '_#' + o.id + '.csv', rows);
     });
   });
-});
+}
 load();`;
   res.send(pageShell('発注補助 — 発注履歴', 'orders', body, script));
 });
