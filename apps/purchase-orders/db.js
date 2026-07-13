@@ -575,7 +575,8 @@ function initLedgerSchema(db) {
   db.exec(`CREATE TABLE IF NOT EXISTS po_vendor_code_pending (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     supplier_code TEXT NOT NULL,
-    vendor_code   TEXT NOT NULL,
+    vendor_code   TEXT NOT NULL,      -- 出荷明細の原文 (表示用)
+    vendor_code_norm TEXT NOT NULL,   -- trim+大文字化 (照合キー。変換の逆引きと同じ正規化。大小文字違いの重複防止)
     vendor_name   TEXT,               -- 出荷明細に載っていた先方の商品名 (紐づけ時のヒント)
     last_qty      INTEGER,            -- 直近に出荷明細で見た数量 (参考)
     memo          TEXT,
@@ -583,7 +584,7 @@ function initLedgerSchema(db) {
     linked_product_code TEXT,         -- linked時の弊社商品コード
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL,
-    UNIQUE (supplier_code, vendor_code)
+    UNIQUE (supplier_code, vendor_code_norm)
   )`);
 
   // メール送信ジョブ (outbox方式。txn内でGmail APIを呼ばない。delivery_key で二重送信の確率を構造的に低減:

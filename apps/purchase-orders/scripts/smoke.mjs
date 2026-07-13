@@ -2001,6 +2001,21 @@ console.log('── 入荷予定変換 (inbound-plan) + 仮登録 (pending) ─�
   ok(r.body.ok, 'pending: 破棄');
   r = await j('/api/vendor-map/pending?supplier=1');
   ok(!r.body.rows.some(x => x.vendor_code === 'ZZZ-MISTAKE'), 'pending: 破棄後は一覧に出ない');
+  // 破棄済みは再登録で復活しない (Codex plan-R1 Medium)
+  r = await jp2('/api/vendor-map/pending', { supplier_code: '1', items: [{ vendorCode: 'ZZZ-MISTAKE', qty: 2 }] });
+  ok(r.body.ok && r.body.skippedProcessed === 1 && r.body.added === 0, 'pending: 破棄済みの再登録はスキップ (復活しない)', r.body);
+  r = await j('/api/vendor-map/pending?supplier=1');
+  ok(!r.body.rows.some(x => x.vendor_code === 'ZZZ-MISTAKE'), 'pending: スキップ後も一覧に出ない');
+  // 大小文字違いはバッチ内でも既存とも1件に正規化 (Codex plan-R1 Medium)
+  r = await jp2('/api/vendor-map/pending', { supplier_code: '1', items: [{ vendorCode: 'zzz-case', qty: 1 }, { vendorCode: 'ZZZ-CASE', qty: 2 }] });
+  ok(r.body.ok && r.body.added === 1, 'pending: 大小文字違いは1件 (norm一意)', r.body);
+  // 既に別商品へ登録済みの番号 (大小文字違い) への紐づけは拒否 (逆引き曖昧の発生防止)
+  r = await jp2('/api/vendor-map/pending', { supplier_code: '1', items: [{ vendorCode: 'amc-001', qty: 1 }] });
+  r = await j('/api/vendor-map/pending?supplier=1');
+  const pendDup = r.body.rows.find(x => x.vendor_code === 'amc-001');
+  r = await jp2('/api/vendor-map/pending/' + pendDup.id + '/link', { product_code: '0726-001060' });
+  ok(r.status === 400 && r.body.error.includes('既に商品'), 'pending link: 同じ番号が別商品に登録済みなら拒否 (ambiguous防止)', r.body.error);
+  r = await jp2('/api/vendor-map/pending/' + pendDup.id + '/dismiss', {});
 
   // 同じ先方番号が複数商品に対応 → ambiguous (黙ってどちらかに変換しない)
   db.prepare("INSERT INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, updated_at) VALUES ('1','0726-001060','0726-001060','ZZZ-NEW-1',?)").run(nowIsoStr());

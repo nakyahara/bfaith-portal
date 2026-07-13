@@ -1206,7 +1206,7 @@ router.post('/api/inbound-plan/convert', (req, res) => {
     // ロジザード「入荷予定登録(Excel貼り付け)」の列: 商品ID / 入荷予定数 / 仕入単価 (原価不明は空欄=手作業時のiferror("")と同じ)
     const pasteText = okRows.map(r2 => `${r2.productCode}\t${r2.qty}\t${r2.cost == null ? '' : r2.cost}`).join('\n');
     res.json({
-      ok: true, supplierName: sup.name,
+      ok: true, supplierName: sup.name, supplierCode: supplier, // 仮登録は変換時の仕入先に固定する (Codex plan-R1 High)
       rows: okRows, pasteText, totalQty, rowCount: okRows.length,
       costMissing: okRows.filter(r2 => r2.cost == null).map(r2 => r2.productCode),
       unmatched, ambiguous, skipped,
@@ -1223,26 +1223,31 @@ router.post('/api/vendor-map/pending', (req, res) => {
     if (!supplier) return res.status(400).json({ ok: false, error: '仕入先コードが必要です' });
     if (!db.prepare('SELECT 1 FROM po_suppliers WHERE supplier_code=?').get(supplier)) return res.status(400).json({ ok: false, error: `仕入先が未登録です: ${supplier}` });
     if (!items.length) return res.status(400).json({ ok: false, error: '仮登録する番号がありません' });
-    let added = 0, refreshed = 0;
+    let added = 0, refreshed = 0, skippedProcessed = 0;
     db.transaction(() => {
-      const exists = db.prepare('SELECT 1 FROM po_vendor_code_pending WHERE supplier_code=? AND vendor_code=?');
-      const up = db.prepare(`INSERT INTO po_vendor_code_pending (supplier_code, vendor_code, vendor_name, last_qty, status, created_at, updated_at)
-        VALUES (?,?,?,?,'pending',?,?)
-        ON CONFLICT(supplier_code, vendor_code) DO UPDATE SET
-          vendor_name = COALESCE(excluded.vendor_name, vendor_name), last_qty = excluded.last_qty,
-          status = CASE WHEN status = 'linked' THEN status ELSE 'pending' END, updated_at = excluded.updated_at`);
+      const exists = db.prepare('SELECT status FROM po_vendor_code_pending WHERE supplier_code=? AND vendor_code_norm=?');
+      const up = db.prepare(`INSERT INTO po_vendor_code_pending (supplier_code, vendor_code, vendor_code_norm, vendor_name, last_qty, status, created_at, updated_at)
+        VALUES (?,?,?,?,?,'pending',?,?)
+        ON CONFLICT(supplier_code, vendor_code_norm) DO UPDATE SET
+          vendor_name = COALESCE(excluded.vendor_name, vendor_name), last_qty = excluded.last_qty, updated_at = excluded.updated_at`);
+      const seenNorm = new Set(); // バッチ内の大小文字違い重複も1件に
       for (const it of items) {
         const code = trimS(it && it.vendorCode);
         if (!code || code.length > 100) continue;
-        const had = !!exists.get(supplier, code);
-        up.run(supplier, code, trimS(it && it.vendorName).slice(0, 200) || null,
+        const norm = normVendorCode(code);
+        if (seenNorm.has(norm)) continue;
+        seenNorm.add(norm);
+        const cur = exists.get(supplier, norm);
+        // 処理済み (linked/dismissed) は復活させない (破棄の取り消しは明示操作にしない、Codex plan-R1 Medium)
+        if (cur && cur.status !== 'pending') { skippedProcessed++; continue; }
+        up.run(supplier, code, norm, trimS(it && it.vendorName).slice(0, 200) || null,
           Number.isInteger(Number(it && it.qty)) ? Number(it.qty) : null, nowIso(), nowIso());
-        if (had) refreshed++; else added++;
+        if (cur) refreshed++; else added++;
       }
       audit(db, { actorType: 'user', actor: actorOf(req), action: 'vendor_pending_add', resource: `supplier:${supplier}`,
-        detail: { count: items.length } });
+        detail: { count: items.length, added, refreshed, skippedProcessed } });
     })();
-    res.json({ ok: true, added, refreshed });
+    res.json({ ok: true, added, refreshed, skippedProcessed });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
@@ -1274,6 +1279,10 @@ router.post('/api/vendor-map/pending/:id/link', (req, res) => {
     const prodSup = normSupplierCode(pmlRow['仕入先']);
     if (!prodSup) return res.status(400).json({ ok: false, error: `この商品は商品マスタで仕入先が未設定です: ${productCode}` });
     if (prodSup !== pend.supplier_code) return res.status(400).json({ ok: false, error: `この商品の仕入先は ${prodSup} です (仮登録の仕入先 ${pend.supplier_code} と一致しません)` });
+    // 同じ先方番号が別商品に既に登録済みなら拒否 (逆引きが曖昧になり変換が止まる、Codex plan-R1 Medium)
+    const dup = db.prepare(`SELECT product_code FROM po_vendor_code_map
+      WHERE supplier_code=? AND upper(trim(vendor_code)) = ? AND product_key <> ?`).get(pend.supplier_code, normVendorCode(pend.vendor_code), key);
+    if (dup) return res.status(400).json({ ok: false, error: `この先方番号は既に商品 ${dup.product_code} に登録されています。番号変更なら📇対応表で既存の行を修正してください` });
     let out = null;
     db.transaction(() => {
       const old = db.prepare('SELECT vendor_code FROM po_vendor_code_map WHERE supplier_code=? AND product_key=?').get(pend.supplier_code, key);
@@ -3898,11 +3907,13 @@ document.getElementById('ipConvert').addEventListener('click', function() {
       var pd = document.getElementById('ipPend');
       if (pd) pd.addEventListener('click', function() {
         pd.disabled = true;
-        post(API + '/vendor-map/pending', { supplier_code: document.getElementById('ipSup').value, items: j.unmatched })
+        // 仕入先は「変換した時点」のもの (j.supplierCode) に固定。ボタン押下時にselectを変えていても誤登録しない (Codex plan-R1 High)
+        post(API + '/vendor-map/pending', { supplier_code: j.supplierCode, items: j.unmatched })
           .then(function(r2) {
             pd.disabled = false;
             if (!r2.ok) { toast('エラー: ' + r2.error); return; }
-            toast('仮登録しました (新規' + r2.added + '件/更新' + r2.refreshed + '件)。NE登録の翌朝以降にマスタ管理→📇対応表で紐づけてください');
+            toast('仮登録しました (新規' + r2.added + '件/更新' + r2.refreshed + '件' +
+              (r2.skippedProcessed ? '/処理済みのためスキップ' + r2.skippedProcessed + '件' : '') + ')。NE登録の翌朝以降にマスタ管理→📇対応表で紐づけてください');
           }).catch(function(e){ pd.disabled = false; toast('通信エラー: ' + e.message); });
       });
     }).catch(function(e){ btn.disabled = false; toast('通信エラー: ' + e.message); });
