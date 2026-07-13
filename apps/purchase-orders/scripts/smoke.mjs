@@ -2170,9 +2170,18 @@ console.log('── 出荷明細メール自動取得 (fetch-mails) ──');
   ws.addRow(['AMC-001', 'ﾁﾗｼ ｽﾃｯｶｰ', 25, '', '0000', '']);
   ws.addRow(['ZZZ-MAIL-NEW', '新商品Y', 5, '', '0000', '']);
   const xlsxB64 = Buffer.from(await wb.xlsx.writeBuffer()).toString('base64');
+  // 請求書xlsx (出荷明細の見出しなし) — 複数添付メールの優先解析テスト用
+  const wbSeikyu = new ExcelJS.Workbook();
+  const wsSeikyu = wbSeikyu.addWorksheet('請求書');
+  wsSeikyu.addRow(['請求書']);
+  wsSeikyu.addRow(['合計', 12345]);
+  const seikyuB64 = Buffer.from(await wbSeikyu.xlsx.writeBuffer()).toString('base64');
   process.env.PO_SHIPMENT_FAKE_DATA = JSON.stringify([
     { id: 'gm-amc-1', from: '芦田 <ashida@am-craft.jp>', subject: '出荷明細のご連絡', internalDate: '2026-07-13T06:00:00.000Z',
       attachments: [{ filename: 'ビーフェイス様用出荷明細.xlsx', dataBase64: xlsxB64 }] },
+    // 実例 (2026-07-13 AMC): 件名「請求書」に 請求書.xlsx+出荷明細.xlsx の2添付。先頭が請求書でも出荷明細を優先解析する
+    { id: 'gm-amc-multi', from: 's.ashida@am-craft.jp', subject: '請求書', internalDate: '2026-07-13T08:59:00.000Z',
+      attachments: [{ filename: '請求書.xlsx', dataBase64: seikyuB64 }, { filename: 'ビーフェイス様用出荷明細.xlsx', dataBase64: xlsxB64 }] },
     { id: 'gm-bf-1', from: 'wholesale@be-free.biz', subject: '7/13　出荷明細です。', internalDate: '2026-07-13T06:25:00.000Z',
       bodyHtml: '<table><tr><th>商品ID</th><th>商品名</th><th>出荷数</th></tr>' +
         '<tr><td>GOFUN-01-N</td><td>胡粉ネイル スーパーコート N0033</td><td>48</td></tr>' +
@@ -2195,6 +2204,39 @@ console.log('── 出荷明細メール自動取得 (fetch-mails) ──');
       bodyHtml: '<table><tr><th>商品ID</th><th>出荷数</th></tr><tr><td>GOFUN-01-N</td><td>10</td></tr></table>' +
         '<table><tr><th>商品ID</th><th>出荷数</th></tr><tr><td>GOFUN-01-N</td><td>20</td></tr></table>' },
   ]);
+  // parseByRule の複数添付分岐 (優先→フォールバック→打ち切り、transient伝播)
+  {
+    const sm = await imp('apps/purchase-orders/shipment-mail.js');
+    const RULE = { supplierCode: '1', domain: 'am-craft.jp', kind: 'xlsx', extraAuthDomains: [] };
+    const AUTH = 'mx.google.com; spf=pass smtp.mailfrom=am-craft.jp';
+    const goodBuf = Buffer.from(xlsxB64, 'base64');
+    const badBuf = Buffer.from(seikyuB64, 'base64');
+    // 先頭添付が解析不能 → 次の添付にフォールバック
+    let pr = await sm.parseByRule({
+      xlsxNames: ['a.xlsx', 'b.xlsx'], authResults: AUTH,
+      getXlsxAt: async i => ({ filename: ['a.xlsx', 'b.xlsx'][i], buf: i === 0 ? badBuf : goodBuf }),
+    }, RULE);
+    ok(pr.items.length === 2 && pr.note.includes('b.xlsx'), 'parseByRule: 先頭添付が解析不能なら次を試す', pr.note);
+    // 全滅 → 最後のエラーにファイル名、DLは最大3件で打ち切り
+    let calls = 0, thr = null;
+    try {
+      await sm.parseByRule({
+        xlsxNames: ['a.xlsx', 'b.xlsx', 'c.xlsx', 'd.xlsx'], authResults: AUTH,
+        getXlsxAt: async i => { calls++; return { filename: 'abcd'[i] + '.xlsx', buf: badBuf }; },
+      }, RULE);
+    } catch (e) { thr = e; }
+    ok(calls === 3 && thr && /\.xlsx\)/.test(thr.message), 'parseByRule: 全滅時は3添付で打ち切り+エラーにファイル名', { calls, msg: thr && thr.message });
+    // transient (添付DL失敗) は即伝播 (次回取得でやり直し)
+    thr = null;
+    try {
+      await sm.parseByRule({
+        xlsxNames: ['a.xlsx'], authResults: AUTH,
+        getXlsxAt: async () => { const e = new Error('net'); e.transient = true; throw e; },
+      }, RULE);
+    } catch (e) { thr = e; }
+    ok(thr && thr.transient === true, 'parseByRule: transientは即伝播');
+  }
+
   // authPassed / parseShipmentHtml / parseShipmentXlsx の単体回帰 (Codex mail-R3)
   {
     const sm = await imp('apps/purchase-orders/shipment-mail.js');
@@ -2238,8 +2280,13 @@ console.log('── 出荷明細メール自動取得 (fetch-mails) ──');
   }
 
   r = await jp3('/api/inbound-plan/fetch-mails');
-  ok(r.body.ok && r.body.added === 5 && r.body.errors.length === 3, 'fetch: 対象2+エラー3を登録 (対象外/偽装From/xlsxなしAMCは登録しない)', r.body);
-  ok(r.body.open.length === 5, 'fetch: 未処理一覧に5件 (new2+error3)', r.body.open.length);
+  ok(r.body.ok && r.body.added === 6 && r.body.errors.length === 3, 'fetch: 対象3+エラー3を登録 (対象外/偽装From/xlsxなしAMCは登録しない)', r.body);
+  ok(r.body.open.length === 6, 'fetch: 未処理一覧に6件 (new3+error3)', r.body.open.length);
+  {
+    const multiAtt = r.body.open.find(m => m.gmail_id === 'gm-amc-multi');
+    ok(multiAtt && JSON.parse(multiAtt.parsed_json).length === 2 && (multiAtt.parse_note || '').includes('ビーフェイス様用出荷明細'),
+      'fetch: 複数添付は「出荷明細」ファイルを優先解析 (請求書.xlsxが先頭でもOK)', multiAtt && multiAtt.parse_note);
+  }
   ok(!r.body.open.some(m => m.gmail_id === 'gm-spoof'), 'fetch: 表示名偽装 (実アドレス別ドメイン) は取り込まない (Codex mail-R1 High)');
   ok(!r.body.open.some(m => m.gmail_id === 'gm-amc-noatt'), 'fetch: xlsx添付のないAMCメール (請求書等) は一覧に載せない');
   ok(r.body.nonCandidates === 1 &&
@@ -2279,7 +2326,7 @@ console.log('── 出荷明細メール自動取得 (fetch-mails) ──');
   r = await jp3('/api/inbound-plan/mails/' + errMail.id + '/status', { status: 'ignored' });
   ok(r.body.ok, 'mail: 無視');
   r = await j('/api/inbound-plan/mails');
-  ok(r.body.ok && r.body.open.length === 3 && r.body.open.some(m => m.gmail_id === 'gm-bf-1') && r.body.recent.length === 2,
+  ok(r.body.ok && r.body.open.length === 4 && r.body.open.some(m => m.gmail_id === 'gm-bf-1') && r.body.recent.length === 2,
     'mail: 一覧はnew/errorのみ (処理済みはrecentへ)', r.body.open.length);
 
   // ↩ 戻す (誤クリックした登録済み/無視を未処理に戻せる)
@@ -2287,6 +2334,11 @@ console.log('── 出荷明細メール自動取得 (fetch-mails) ──');
   ok(r.body.ok, 'mail: 登録済みを未処理に戻す (↩)');
   r = await j('/api/inbound-plan/mails');
   ok(r.body.open.some(m => m.gmail_id === 'gm-amc-1') && r.body.recent.length === 1, 'mail: 戻した行が未処理一覧に復帰', r.body.open.length);
+
+  // 誤操作で「空データのままnew」になった行 (全件エラー時代のデータ+↩戻す) は再解析で復元できる
+  db.prepare("UPDATE po_shipment_mails SET parsed_json='[]' WHERE id=?").run(amcMail.id);
+  r = await jp3('/api/inbound-plan/mails/' + amcMail.id + '/reparse');
+  ok(r.body.ok && r.body.status === 'new' && r.body.itemCount === 2, 'reparse: 明細0行のnew行をGmailから復元');
 
   // 再解析: 解析コード修正後にerror行をやり直す (Gmail取り直し)。fake dataを差し替えて「直った」状況を再現
   {
@@ -2313,6 +2365,18 @@ console.log('── 出荷明細メール自動取得 (fetch-mails) ──');
     await jp3('/api/inbound-plan/mails/' + attackRow.id + '/status', { status: 'done' });
     r = await jp3('/api/inbound-plan/mails/' + attackRow.id + '/reparse');
     ok(r.status === 400 && r.body.error.includes('登録済み'), 'reparse: 登録済み行は拒否 (↩で戻してから)');
+
+    // 対象外 (tombstone) は一覧APIの notCandidates で確認でき、誤判定なら再解析で救出できる
+    r = await j('/api/inbound-plan/mails');
+    const nc = (r.body.notCandidates || []).find(m => m.gmail_id === 'gm-amc-noatt');
+    ok(r.body.ok && nc, 'list: 対象外メールを notCandidates で確認できる', (r.body.notCandidates || []).length);
+    {
+      const fake3 = JSON.parse(process.env.PO_SHIPMENT_FAKE_DATA);
+      fake3.find(m => m.id === 'gm-amc-noatt').attachments = [{ filename: 'ビーフェイス様用出荷明細.xlsx', dataBase64: xlsxB64 }];
+      process.env.PO_SHIPMENT_FAKE_DATA = JSON.stringify(fake3);
+    }
+    r = await jp3('/api/inbound-plan/mails/' + nc.id + '/reparse');
+    ok(r.body.ok && r.body.status === 'new' && r.body.itemCount === 2, 'reparse: 対象外メールを救出 (not_candidate→new)');
   }
   delete process.env.PO_SHIPMENT_FAKE_DATA;
 
@@ -2323,6 +2387,8 @@ console.log('── 出荷明細メール自動取得 (fetch-mails) ──');
   ok(planHtml.includes('ipFetch') && planHtml.includes('メールから取得') && planHtml.includes('renderIpResult'), '/inbound-plan 📬メール取得UI');
   ok(planHtml.includes('ipReparseAll') && planHtml.includes('data-ipmrep') && planHtml.includes('data-ipmback'), '/inbound-plan 再解析+↩戻すUI');
   ok(planHtml.includes('解析エラー'), '/inbound-plan エラー理由の表示');
+  ok(planHtml.includes('jstStamp') && planHtml.includes('日本時間'), '/inbound-plan 受信日時をJST表示');
+  ok(planHtml.includes('出荷明細ではないと判定した'), '/inbound-plan 対象外メールの確認セクション');
   const dashNav = await (await fetch(base + '/')).text();
   ok(dashNav.includes('入荷予定') && dashNav.includes('/apps/purchase-orders/inbound-plan'), 'ナビに入荷予定タブ');
 }

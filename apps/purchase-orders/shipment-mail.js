@@ -284,7 +284,7 @@ function fakeCandidates() {
       internalDateIso: m.internalDate || nowIso(),
       xlsxNames: xlsx.map(a => a.filename), // 添付メタデータ (中身のDLなしで判定できる)
       getHtml: async () => m.bodyHtml || '',
-      getFirstXlsx: async () => ({ filename: xlsx[0].filename, buf: Buffer.from(xlsx[0].dataBase64, 'base64') }),
+      getXlsxAt: async i => ({ filename: xlsx[i].filename, buf: Buffer.from(xlsx[i].dataBase64, 'base64') }),
     };
   });
 }
@@ -301,10 +301,10 @@ function candidateFromGmailMsg(msg) {
     internalDateIso: msg.internalDate ? new Date(Number(msg.internalDate)).toISOString() : nowIso(),
     xlsxNames: collected.attachments.map(a => a.filename),
     getHtml: async () => collected.html,
-    // 解析するのは先頭のxlsxだけ — 認証を通ったメールについて必要な1件だけDLする
+    // 添付は必要になった1件ずつDLする — 認証を通ったメールについてのみ呼ばれる
     // (未認証メールの大量添付でAPI/メモリを浪費させない、Codex 入荷予定R1 High)
-    getFirstXlsx: async () => {
-      const a = collected.attachments[0];
+    getXlsxAt: async i => {
+      const a = collected.attachments[i];
       let att;
       try { att = await gmailApiGet(`messages/${encodeURIComponent(msg.id)}/attachments/${encodeURIComponent(a.attachmentId)}`, 60000); }
       catch (e) { throw transientErr(e); } // 添付DL失敗=一時障害扱い (次回取得でやり直し)
@@ -314,22 +314,36 @@ function candidateFromGmailMsg(msg) {
 }
 
 /**
- * ルールに従って1通を解析する (取得/再解析の共通コア)。
+ * ルールに従って1通を解析する (取得/再解析の共通コア。exportはテスト用)。
  * @throws e.notCandidate=true: 出荷明細ではない (AMCのxlsx添付なし=請求書等) — 一覧に登録しない
  * @throws e.transient=true: 一時的な取得障害 — 保存せず次回やり直し
  */
-async function parseByRule(c, rule) {
+export async function parseByRule(c, rule) {
   const authError = () => new Error('送信元の認証を確認できません — なりすましの可能性があるため自動変換しません。' +
     `本物なら手動貼り付けを使ってください [判定: ${summarizeAuth(c.authResults)}]`);
   if (rule.kind === 'xlsx') {
-    // 判定順: 添付メタデータなし=対象外 → 認証 → 認証済みだけ先頭xlsxをDL (Codex 入荷予定R1 High)
+    // 判定順: 添付メタデータなし=対象外 → 認証 → 認証済みだけ添付をDL (Codex 入荷予定R1 High)
     const names = c.xlsxNames || [];
     if (!names.length) { const e = new Error('xlsx添付がありません'); e.notCandidate = true; throw e; }
     if (!authPassed(c.authResults, rule.domain, rule.extraAuthDomains)) throw authError();
-    const file = await c.getFirstXlsx();
-    const items = await parseShipmentXlsx(file.buf);
-    if (!items.length) throw new Error('明細が0行です');
-    return { items, note: file.filename + (names.length > 1 ? ` (他${names.length - 1}添付は未解析)` : '') };
+    // 添付が複数のメール (請求書.xlsx+出荷明細.xlsx 等) 対策: ファイル名に「出荷明細」を含む添付を優先し、
+    // 解析できるまで順に試す (最大3添付。認証済みメールのみ)
+    const order = names.map((n, i) => ({ n, i }))
+      .sort((a, b) => (a.n.includes('出荷明細') ? 0 : 1) - (b.n.includes('出荷明細') ? 0 : 1) || a.i - b.i)
+      .slice(0, 3);
+    let lastErr = null;
+    for (const { i } of order) {
+      const file = await c.getXlsxAt(i);
+      try {
+        const items = await parseShipmentXlsx(file.buf);
+        if (items.length) return { items, note: file.filename + (names.length > 1 ? ` (全${names.length}添付中これを解析)` : '') };
+        lastErr = new Error(`明細が0行です (${file.filename})`);
+      } catch (e) {
+        if (e.transient) throw e;
+        lastErr = new Error(`${String(e.message || e)} (${file.filename})`);
+      }
+    }
+    throw lastErr || new Error('明細が0行です');
   }
   if (!authPassed(c.authResults, rule.domain, rule.extraAuthDomains)) throw authError();
   const items = parseShipmentHtml(await c.getHtml());
@@ -413,7 +427,10 @@ export function listShipmentMails() {
   // new と error を表示 (done/ignored は直近10件を「↩ 戻す」付きで参考表示)
   const open = db.prepare("SELECT * FROM po_shipment_mails WHERE status IN ('new','error') ORDER BY received_at DESC").all();
   const recent = db.prepare("SELECT * FROM po_shipment_mails WHERE status IN ('done','ignored') ORDER BY updated_at DESC LIMIT 10").all();
-  return { open, recent };
+  // 「出荷明細ではない」と判定して一覧に出していないメール (tombstone)。誤判定の確認・救出用に直近20件+総件数を返す
+  const notCandidates = db.prepare("SELECT * FROM po_shipment_mails WHERE status='not_candidate' ORDER BY received_at DESC LIMIT 20").all();
+  const notCandidateTotal = db.prepare("SELECT COUNT(*) AS n FROM po_shipment_mails WHERE status='not_candidate'").get().n;
+  return { open, recent, notCandidates, notCandidateTotal };
 }
 
 /**
@@ -426,7 +443,8 @@ export async function reparseShipmentMail(id, actor) {
   const row = db.prepare('SELECT * FROM po_shipment_mails WHERE id=?').get(id);
   if (!row) throw new Error('メールが見つかりません');
   if (row.status === 'done') throw new Error('登録済みのメールは再解析できません (必要なら「↩ 戻す」で未処理に戻してから)');
-  if (row.status !== 'new' && row.status !== 'error') throw new Error(`未処理 (new/error) のメールだけ再解析できます (現在: ${row.status})`);
+  // new/error に加えて not_candidate も再解析可 (「出荷明細ではない」の誤判定をユーザーが救出できるように)
+  if (!['new', 'error', 'not_candidate'].includes(row.status)) throw new Error(`未処理 (new/error/対象外) のメールだけ再解析できます (現在: ${row.status})`);
   let c;
   if (process.env.PO_SHIPMENT_FAKE_DATA) {
     c = fakeCandidates().find(x => x.id === row.gmail_id) || null;
@@ -437,11 +455,11 @@ export async function reparseShipmentMail(id, actor) {
     c = candidateFromGmailMsg(msg);
   }
   if (!c) throw new Error('Gmailからメールを再取得できません');
-  // 状態遷移は「再解析対象のままの行」だけに適用する楽観ロック (解析中に別タブで登録済み/無視に
-  // されたものを上書きして未処理へ復活させない、Codex 入荷予定R1 High)
+  // 状態遷移は「開始時に読んだ版のままの行」だけに適用するCAS (解析中に別タブで状態が変わった行を
+  // 上書きしない。status IN だけでは ignored→new 等の変更をすり抜ける、Codex 入荷予定R1 High/JST-R1 Medium)
   const applyIfStillOpen = (fields, params, detail) => db.transaction(() => {
-    const upd = db.prepare(`UPDATE po_shipment_mails SET ${fields}, updated_at=? WHERE id=? AND status IN ('new','error')`)
-      .run(...params, nowIso(), id);
+    const upd = db.prepare(`UPDATE po_shipment_mails SET ${fields}, updated_at=? WHERE id=? AND status=? AND updated_at=?`)
+      .run(...params, nowIso(), id, row.status, row.updated_at);
     if (upd.changes === 0) throw new Error('再解析中にこのメールの状態が変わりました (登録済み/無視など)。一覧を更新して確認してください');
     audit(db, { actorType: 'user', actor, action: 'shipment_mail_reparse', resource: `shipment_mail:${id}`,
       detail: { gmailId: row.gmail_id, ...detail } });
