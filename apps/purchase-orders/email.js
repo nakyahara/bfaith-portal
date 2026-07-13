@@ -579,6 +579,17 @@ async function sendViaGmail(job, onPhase = () => {}, verifyFresh = () => {}) {
   return j.id;
 }
 
+/** Gmail API GET (readonly系。出荷明細メール取得 shipment-mail.js が使う)。パスは 'users/me/...' 以降 */
+export async function gmailApiGet(pathAndQuery, timeoutMs = 20000) {
+  const token = await gmailAccessToken();
+  const res = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/${pathAndQuery}`, {
+    headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(timeoutMs),
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`Gmail取得失敗 (HTTP ${res.status}): ${(j.error && j.error.message) || '不明'} (scope gmail.readonly が必要)`);
+  return j;
+}
+
 async function searchGmailByMessageId(rfcMessageId) {
   if (process.env.PO_EMAIL_FAKE) {
     if (process.env.PO_EMAIL_FAKE_SEARCH === 'error') throw new Error('偽照合エラー (テスト)');

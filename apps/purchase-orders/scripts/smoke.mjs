@@ -1951,6 +1951,270 @@ console.log('── 注残SSoT (正本ビュー/GAS endpoint差替/商品管理�
   }
 }
 
+// ═══ ロジザード入荷予定の作成 (出荷明細変換) + 未紐付け先方番号の仮登録 ═══
+console.log('── 入荷予定変換 (inbound-plan) + 仮登録 (pending) ──');
+{
+  const jp2 = (p, body) => j(p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  // AMC出荷明細フォーマット (見出し行+備考/倉庫コード0000列あり) をそのまま貼り付け
+  const shipText = '商品コード\t商品名\t出荷数量\t備考\t倉庫コード\t摘要\n' +
+    'AMC-001\tﾁﾗｼ ｽﾃｯｶｰ\t1,600\t\t0000\t\n' +
+    'ZZZ-NEW-1\t新商品X\t50\t\t0000\t\n' +
+    'BADLINE-NO-QTY\t数量なし行\t\t\t\t\n';
+  r = await jp2('/api/inbound-plan/convert', { supplier_code: '0001', text: shipText });
+  ok(r.body.ok && r.body.rowCount === 1 && r.body.totalQty === 1600, 'convert: 対応表逆引きで変換 (カンマ数量/見出し行/0000列を処理)', r.body);
+  ok(r.body.pasteText === 'noflyersticker\t1600\t70', 'convert: 貼り付けデータ=商品ID/入荷予定数/仕入単価(PML原価)', r.body.pasteText);
+  ok(r.body.unmatched.length === 1 && r.body.unmatched[0].vendorCode === 'ZZZ-NEW-1' && r.body.unmatched[0].vendorName === '新商品X',
+    'convert: 対応表に無い番号はunmatched (先方商品名付き)', r.body.unmatched);
+  ok(r.body.skipped.length === 1, 'convert: 数量が読めない行はskipped');
+
+  // 仮登録 (再実行は refreshed)
+  r = await jp2('/api/vendor-map/pending', { supplier_code: '1', items: r.body.unmatched });
+  ok(r.body.ok && r.body.added === 1, 'pending: 仮登録', r.body);
+  r = await jp2('/api/vendor-map/pending', { supplier_code: '1', items: [{ vendorCode: 'ZZZ-NEW-1', vendorName: '新商品X', qty: 60 }] });
+  ok(r.body.ok && r.body.refreshed === 1 && r.body.added === 0, 'pending: 再登録はrefreshed (UNIQUE upsert)');
+  r = await j('/api/vendor-map/pending?supplier=0001');
+  const pend1 = r.body.rows.find(x => x.vendor_code === 'ZZZ-NEW-1');
+  ok(pend1 && pend1.vendor_name === '新商品X' && pend1.last_qty === 60, 'pending: 一覧に載る (直近数量更新)', pend1);
+
+  // 紐づけ: PMLに無い商品/他仕入先はエラー、正しい商品で対応表へ昇格
+  r = await jp2('/api/vendor-map/pending/' + pend1.id + '/link', { product_code: 'not-in-pml-zzz' });
+  ok(r.status === 400 && r.body.error.includes('商品マスタに無い'), 'pending link: PMLに無い商品は拒否 (NE登録翌朝を案内)', r.body.error);
+  r = await jp2('/api/vendor-map/pending/' + pend1.id + '/link', { product_code: 'gyoumuhandcream60-BI' });
+  ok(r.status === 400 && r.body.error.includes('仕入先'), 'pending link: 他仕入先の商品は拒否');
+  r = await jp2('/api/vendor-map/pending/' + pend1.id + '/link', { product_code: 'cardstand-silver-r' });
+  ok(r.body.ok === true, 'pending link: 紐づけ成功');
+  const mapRow = db.prepare("SELECT * FROM po_vendor_code_map WHERE supplier_code='1' AND product_key='cardstand-silver-r'").get();
+  ok(mapRow && mapRow.vendor_code === 'ZZZ-NEW-1', 'pending link: 対応表へ昇格', mapRow && mapRow.vendor_code);
+  ok(db.prepare('SELECT status, linked_product_code FROM po_vendor_code_pending WHERE id=?').get(pend1.id).status === 'linked', 'pending link: status=linked');
+  r = await jp2('/api/vendor-map/pending/' + pend1.id + '/link', { product_code: 'cardstand-silver-r' });
+  ok(r.status === 400 && r.body.error.includes('処理済み'), 'pending link: 二重処理は拒否');
+
+  // 紐づけ後の再変換: 同じ出荷明細が全行マッチ
+  r = await jp2('/api/inbound-plan/convert', { supplier_code: '1', text: shipText });
+  ok(r.body.ok && r.body.rowCount === 2 && r.body.unmatched.length === 0, 'convert: 紐づけ後は全行マッチ (E2E)', r.body.rowCount);
+
+  // 破棄
+  r = await jp2('/api/vendor-map/pending', { supplier_code: '1', items: [{ vendorCode: 'ZZZ-MISTAKE', qty: 1 }] });
+  r = await j('/api/vendor-map/pending?supplier=1');
+  const pend2 = r.body.rows.find(x => x.vendor_code === 'ZZZ-MISTAKE');
+  r = await jp2('/api/vendor-map/pending/' + pend2.id + '/dismiss', {});
+  ok(r.body.ok, 'pending: 破棄');
+  r = await j('/api/vendor-map/pending?supplier=1');
+  ok(!r.body.rows.some(x => x.vendor_code === 'ZZZ-MISTAKE'), 'pending: 破棄後は一覧に出ない');
+  // 破棄済みは再登録で復活しない (Codex plan-R1 Medium)
+  r = await jp2('/api/vendor-map/pending', { supplier_code: '1', items: [{ vendorCode: 'ZZZ-MISTAKE', qty: 2 }] });
+  ok(r.body.ok && r.body.skippedProcessed === 1 && r.body.added === 0, 'pending: 破棄済みの再登録はスキップ (復活しない)', r.body);
+  r = await j('/api/vendor-map/pending?supplier=1');
+  ok(!r.body.rows.some(x => x.vendor_code === 'ZZZ-MISTAKE'), 'pending: スキップ後も一覧に出ない');
+  // 大小文字違いはバッチ内でも既存とも1件に正規化 (Codex plan-R1 Medium)
+  r = await jp2('/api/vendor-map/pending', { supplier_code: '1', items: [{ vendorCode: 'zzz-case', qty: 1 }, { vendorCode: 'ZZZ-CASE', qty: 2 }] });
+  ok(r.body.ok && r.body.added === 1, 'pending: 大小文字違いは1件 (norm一意)', r.body);
+  // 既に別商品へ登録済みの番号 (大小文字違い) への紐づけは拒否 (逆引き曖昧の発生防止)
+  r = await jp2('/api/vendor-map/pending', { supplier_code: '1', items: [{ vendorCode: 'amc-001', qty: 1 }] });
+  r = await j('/api/vendor-map/pending?supplier=1');
+  const pendDup = r.body.rows.find(x => x.vendor_code === 'amc-001');
+  r = await jp2('/api/vendor-map/pending/' + pendDup.id + '/link', { product_code: '0726-001060' });
+  ok(r.status === 400 && r.body.error.includes('既に商品'), 'pending link: 同じ番号が別商品に登録済みなら拒否 (ambiguous防止)', r.body.error);
+  r = await jp2('/api/vendor-map/pending/' + pendDup.id + '/dismiss', {});
+
+  // 同じ先方番号が複数商品に対応 → ambiguous (黙ってどちらかに変換しない)
+  db.prepare("INSERT INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, updated_at) VALUES ('1','0726-001060','0726-001060','ZZZ-NEW-1',?)").run(nowIsoStr());
+  r = await jp2('/api/inbound-plan/convert', { supplier_code: '1', text: 'ZZZ-NEW-1\t新商品X\t10\n' });
+  ok(r.body.ok && r.body.ambiguous.length === 1 && r.body.rowCount === 0, 'convert: 逆引き曖昧はambiguous (変換しない)', r.body.ambiguous);
+  // 手動upsertで同番号を別商品に付けると警告 (ブロックはしない、Codex plan-R2)
+  r = await jp2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'noflyersticker', vendor_code: 'zzz-new-1' });
+  ok(r.body.ok && r.body.warning && r.body.warning.includes('曖昧'), 'entry: 同番号の別商品登録は警告 (大小文字違いも検知)', r.body.warning);
+  r = await jp2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'noflyersticker', vendor_code: 'AMC-001' }); // 戻す
+  ok(r.body.ok && !r.body.warning, 'entry: 重複解消後は警告なし');
+  db.prepare("DELETE FROM po_vendor_code_map WHERE supplier_code='1' AND product_key='0726-001060'").run();
+
+  // 非ASCIIの大小文字違いも同一番号として拒否 (JS正規化統一の検証、Codex plan-R3 Low)
+  db.prepare("INSERT INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, updated_at) VALUES ('1','0726-001060','0726-001060','ÄBC-1',?)").run(nowIsoStr());
+  r = await jp2('/api/vendor-map/pending', { supplier_code: '1', items: [{ vendorCode: 'äbc-1', qty: 1 }] });
+  r = await j('/api/vendor-map/pending?supplier=1');
+  const pendUml = r.body.rows.find(x => x.vendor_code === 'äbc-1');
+  r = await jp2('/api/vendor-map/pending/' + pendUml.id + '/link', { product_code: 'noflyersticker' });
+  ok(r.status === 400 && r.body.error.includes('既に商品'), 'pending link: 非ASCII大小文字違いも同一番号として拒否', r.body.error);
+  r = await jp2('/api/vendor-map/pending/' + pendUml.id + '/dismiss', {});
+  db.prepare("DELETE FROM po_vendor_code_map WHERE supplier_code='1' AND product_key='0726-001060'").run();
+
+  // ビーフリーのメール本文形式 (見出し行/送り状No行/同一商品の複数行=そのまま複数行出力) — 実メール 2026-07-13 の形
+  {
+    const csvBf = iconv.encode('"仕入先管理番号","x","弊社管理番号"\r\n"GOFUN-01-N","","gyoumuhandcream60-BI"', 'Shift_JIS');
+    const fdBf = new FormData();
+    fdBf.append('supplier_code', '2');
+    fdBf.append('file', new Blob([csvBf]), 'bf.csv');
+    r = await j('/api/vendor-map/csv', { method: 'POST', body: fdBf });
+    ok(r.body.ok, 'BEFREE: 対応表準備');
+    const mailText = '【弊社委託倉庫出荷分】\n■ 福通送り状Ｎｏ：66327560902\n' +
+      '商品ID\t商品名\t出荷数\n' +
+      'GOFUN-01-N\t胡粉ネイル スーパーコート N0033\t48\n' +
+      'GOFUN-01-N\t胡粉ネイル スーパーコート N0033\t30\n' +
+      'AUKATZ-06-N2\tヘルスウォーター にゃんマグ 白系\t30\n';
+    r = await jp2('/api/inbound-plan/convert', { supplier_code: '2', text: mailText });
+    ok(r.body.ok && r.body.rowCount === 2 && r.body.totalQty === 78, 'BEFREE: メール表の貼り付けを変換 (同一商品の複数行は複数行のまま=手作業と同じ)', r.body);
+    ok(r.body.pasteText.split('\n').every(l => l.startsWith('gyoumuhandcream60-BI\t')), 'BEFREE: 貼り付けデータ2行', r.body.pasteText);
+    ok(r.body.unmatched.length === 1 && r.body.unmatched[0].vendorCode === 'AUKATZ-06-N2', 'BEFREE: 未知の番号はunmatched');
+    ok(r.body.skipped.length === 2, 'BEFREE: 見出し外の行 (【…】/送り状No) はスキップ', r.body.skipped);
+  }
+
+  // CSV取込の重複警告 (同じ先方番号を複数商品に。ブロックせず警告列挙)
+  {
+    const csvDup = iconv.encode('"仕入先管理番号","x","弊社管理番号"\r\n"BF-X","","prod-a"\r\n"bf-x","","prod-b"', 'Shift_JIS');
+    const fd2 = new FormData();
+    fd2.append('supplier_code', '2');
+    fd2.append('file', new Blob([csvDup]), 'dup.csv');
+    r = await j('/api/vendor-map/csv', { method: 'POST', body: fd2 });
+    ok(r.body.ok && (r.body.warnings || []).some(w => w.includes('複数商品')), 'vendor-map CSV: 同番号の複数商品は警告列挙', r.body.warnings);
+  }
+
+  // 画面配信
+  const inbHtml2 = await (await fetch(base + '/inbound')).text();
+  ok(inbHtml2.includes('ロジザード入荷予定の作成') && inbHtml2.includes('ipConvert'), '/inbound 入荷予定作成セクション');
+  const adminHtml3 = await (await fetch(base + '/admin')).text();
+  ok(adminHtml3.includes('loadVmapPending') && adminHtml3.includes('未紐付けの先方番号'), '/admin 対応表タブに仮登録リスト');
+}
+
+// ═══ 出荷明細メールの自動取得 (Gmail偽装) ═══
+console.log('── 出荷明細メール自動取得 (fetch-mails) ──');
+{
+  const jp3 = (p, body) => j(p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+  // 供給2の対応表を戻す (前のCSV重複テストで全置換されたため)
+  {
+    const csvBf2 = iconv.encode('"仕入先管理番号","x","弊社管理番号"\r\n"GOFUN-01-N","","gyoumuhandcream60-BI"', 'Shift_JIS');
+    const fdBf2 = new FormData();
+    fdBf2.append('supplier_code', '2');
+    fdBf2.append('file', new Blob([csvBf2]), 'bf2.csv');
+    await j('/api/vendor-map/csv', { method: 'POST', body: fdBf2 });
+  }
+  // AMC出荷明細のxlsxを実物どおりに生成 (先頭7行空+8行目見出し)
+  const ExcelJS = (await import('exceljs')).default;
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet('出荷明細表');
+  for (let i = 0; i < 7; i++) ws.addRow([]);
+  ws.addRow(['商品コード', '商品名', '出荷数量', '備考', '倉庫コード', '摘要']);
+  ws.addRow(['AMC-001', 'ﾁﾗｼ ｽﾃｯｶｰ', 25, '', '0000', '']);
+  ws.addRow(['ZZZ-MAIL-NEW', '新商品Y', 5, '', '0000', '']);
+  const xlsxB64 = Buffer.from(await wb.xlsx.writeBuffer()).toString('base64');
+  process.env.PO_SHIPMENT_FAKE_DATA = JSON.stringify([
+    { id: 'gm-amc-1', from: '芦田 <ashida@am-craft.jp>', subject: '出荷明細のご連絡', internalDate: '2026-07-13T06:00:00.000Z',
+      attachments: [{ filename: 'ビーフェイス様用出荷明細.xlsx', dataBase64: xlsxB64 }] },
+    { id: 'gm-bf-1', from: 'wholesale@be-free.biz', subject: '7/13　出荷明細です。', internalDate: '2026-07-13T06:25:00.000Z',
+      bodyHtml: '<table><tr><th>商品ID</th><th>商品名</th><th>出荷数</th></tr>' +
+        '<tr><td>GOFUN-01-N</td><td>胡粉ネイル スーパーコート N0033</td><td>48</td></tr>' +
+        '<tr><td>GOFUN-01-N</td><td>胡粉ネイル スーパーコート N0033</td><td>30</td></tr></table>' +
+        // 署名などの見出しの無い表は明細として解釈しない (数字セルがあっても無視されること)
+        '<table><tr><td>株式会社ビー・フリー</td></tr><tr><td>TEL</td><td>06</td></tr></table>' },
+    { id: 'gm-other', from: 'noreply@example.com', subject: '出荷明細', bodyHtml: '<table><tr><td>X</td><td>1</td></tr></table>' },
+    { id: 'gm-amc-noatt', from: 'ashida@am-craft.jp', subject: '出荷明細 (添付忘れ)', bodyHtml: '<p>添付なし</p>' },
+    // 表示名にドメインを入れた偽装 → 実メールボックスのドメイン不一致で対象外
+    { id: 'gm-spoof', from: '"billing@am-craft.jp" <attacker@example.com>', subject: '出荷明細', attachments: [{ filename: 'x.xlsx', dataBase64: xlsxB64 }] },
+    // SPF/DKIM/DMARC不合格 → 自動変換しない (error)
+    { id: 'gm-authfail', from: 'ashida@am-craft.jp', subject: '出荷明細', authResults: 'mx.google.com; spf=fail; dkim=fail; dmarc=fail',
+      attachments: [{ filename: 'y.xlsx', dataBase64: xlsxB64 }] },
+    // 攻撃者ドメインのspf/dkim=passでFromだけ詐称 (dmarc=fail) → ドメイン整合検証で不合格 (Codex mail-R2 High)
+    { id: 'gm-attack', from: 'ashida@am-craft.jp', subject: '出荷明細',
+      authResults: 'mx.google.com; spf=pass smtp.mailfrom=attacker.example; dkim=pass header.d=attacker.example; dmarc=fail header.from=am-craft.jp',
+      attachments: [{ filename: 'z.xlsx', dataBase64: xlsxB64 }] },
+    // 返信引用で明細表が2つ → 合算せずエラー (二重入荷防止、Codex mail-R2 Medium)
+    { id: 'gm-multitable', from: 'wholesale@be-free.biz', subject: '出荷明細 (再送)',
+      bodyHtml: '<table><tr><th>商品ID</th><th>出荷数</th></tr><tr><td>GOFUN-01-N</td><td>10</td></tr></table>' +
+        '<table><tr><th>商品ID</th><th>出荷数</th></tr><tr><td>GOFUN-01-N</td><td>20</td></tr></table>' },
+  ]);
+  // authPassed / parseShipmentHtml / parseShipmentXlsx の単体回帰 (Codex mail-R3)
+  {
+    const sm = await imp('apps/purchase-orders/shipment-mail.js');
+    ok(sm.authPassed('mx.google.com; dkim=pass header.d=am-craft.jp; spf=pass smtp.mailfrom=am-craft.jp; dmarc=pass header.from=am-craft.jp', 'am-craft.jp') === true, 'auth: 実Gmail形式のpass');
+    ok(sm.authPassed('mx.google.com; spf=fail reason="note dmarc=pass injected"; dmarc=fail header.from=am-craft.jp', 'am-craft.jp') === false,
+      'auth: quoted-string内のdmarc=pass注入は無効 (RFC8601)');
+    ok(sm.authPassed('mx.google.com; dmarc=passive header.from=am-craft.jp', 'am-craft.jp') === false, 'auth: dmarc=passiveは不合格 (部分一致誤認なし)');
+    ok(sm.authPassed('mx.google.com; spf=pass smtp.mailfrom=attacker.example; dkim=pass header.d=attacker.example', 'am-craft.jp') === false, 'auth: 他ドメインのspf/dkim passは不整合');
+    ok(sm.authPassed('mx.google.com; spf=fail reason="x\\"; dmarc=pass header.from=am-craft.jp"', 'am-craft.jp') === false,
+      'auth: quoted-pairエスケープでの注入も無効 (状態機械、Codex mail-R4 High)');
+    ok(sm.authPassed('attacker.example; dmarc=pass header.from=am-craft.jp', 'am-craft.jp') === false,
+      'auth: authserv-idがmx.google.com以外のヘッダは信頼しない (Codex mail-R4 High)');
+    ok(sm.authPassed(['attacker.example; dmarc=pass header.from=am-craft.jp', 'mx.google.com; dmarc=pass header.from=am-craft.jp'], 'am-craft.jp') === true,
+      'auth: 複数ヘッダはGmail発行分だけで判定');
+    const nested = '<blockquote>古い<blockquote>もっと古い</blockquote><table><tr><th>商品ID</th><th>出荷数</th></tr><tr><td>OLD-1</td><td>99</td></tr></table></blockquote>' +
+      '<table><tr><th>商品ID</th><th>出荷数</th></tr><tr><td>NEW-1</td><td>5</td></tr></table>';
+    const nestedItems = sm.parseShipmentHtml(nested);
+    ok(nestedItems.length === 1 && nestedItems[0].vendorCode === 'NEW-1', 'html: 入れ子blockquote内の過去明細を除去 (今回分のみ)', nestedItems);
+    // xlsx: 見出しが行をまたぐ (商品コードと出荷数量が別行) 場合は見出し不成立
+    const ExcelJS2 = (await import('exceljs')).default;
+    const wbBad = new ExcelJS2.Workbook();
+    const wsBad = wbBad.addWorksheet('x');
+    wsBad.addRow(['商品コード']);
+    wsBad.addRow(['出荷数量']);
+    wsBad.addRow(['AMC-001', '', 10]);
+    let xlsxErr = null;
+    try { await sm.parseShipmentXlsx(Buffer.from(await wbBad.xlsx.writeBuffer())); } catch (e) { xlsxErr = e.message; }
+    ok(xlsxErr && xlsxErr.includes('見出し行'), 'xlsx: 見出しの行またぎは不成立 (同一行のみ)', xlsxErr);
+  }
+
+  r = await jp3('/api/inbound-plan/fetch-mails');
+  ok(r.body.ok && r.body.added === 6 && r.body.errors.length === 4, 'fetch: 対象2+エラー4を登録 (対象外/偽装Fromは無視)', r.body);
+  ok(r.body.open.length === 6, 'fetch: 未処理一覧に6件 (new2+error4)', r.body.open.length);
+  ok(!r.body.open.some(m => m.gmail_id === 'gm-spoof'), 'fetch: 表示名偽装 (実アドレス別ドメイン) は取り込まない (Codex mail-R1 High)');
+  const authFail = r.body.open.find(m => m.gmail_id === 'gm-authfail');
+  ok(authFail && authFail.status === 'error' && authFail.error.includes('なりすまし'), 'fetch: SPF/DKIM/DMARC不合格は自動変換しない', authFail && authFail.error);
+  const attackMail = r.body.open.find(m => m.gmail_id === 'gm-attack');
+  ok(attackMail && attackMail.status === 'error' && attackMail.error.includes('なりすまし'),
+    'fetch: 攻撃者ドメインspf/dkim=pass+From詐称もドメイン整合で拒否 (Codex mail-R2 High)', attackMail && attackMail.error);
+  const multiMail = r.body.open.find(m => m.gmail_id === 'gm-multitable');
+  ok(multiMail && multiMail.status === 'error' && multiMail.error.includes('複数'),
+    'fetch: 明細表が複数のメールは合算せずエラー (二重入荷防止)', multiMail && multiMail.error);
+  const amcMail = r.body.open.find(m => m.gmail_id === 'gm-amc-1');
+  const bfMail = r.body.open.find(m => m.gmail_id === 'gm-bf-1');
+  const errMail = r.body.open.find(m => m.gmail_id === 'gm-amc-noatt');
+  ok(amcMail && amcMail.supplier_code === '1' && JSON.parse(amcMail.parsed_json).length === 2, 'fetch: AMC xlsx添付を解析 (2明細)', amcMail && amcMail.parse_note);
+  ok(bfMail && bfMail.supplier_code === '2' && JSON.parse(bfMail.parsed_json).length === 2, 'fetch: ビーフリー本文の表を解析 (同一商品2行+署名表は無視)');
+  ok(errMail && errMail.status === 'error' && errMail.error.includes('xlsx添付'), 'fetch: 添付なしAMCメールはerror');
+
+  // 再取得は冪等 (同じgmail_idは再登録しない)
+  r = await jp3('/api/inbound-plan/fetch-mails');
+  ok(r.body.ok && r.body.added === 0, 'fetch: 再取得は冪等 (added=0)');
+
+  // メール変換 = 手動貼り付けと同じ応答 (AMC-001→noflyersticker、未知番号はunmatched)
+  r = await jp3('/api/inbound-plan/mails/' + amcMail.id + '/convert');
+  ok(r.body.ok && r.body.mailId === amcMail.id && r.body.rowCount === 1 && r.body.totalQty === 25 &&
+    r.body.pasteText.startsWith('noflyersticker\t25\t') && r.body.unmatched.length === 1 && r.body.unmatched[0].vendorCode === 'ZZZ-MAIL-NEW',
+    'mail convert: AMCメールを変換 (マッチ1+unmatched1)', r.body.pasteText);
+  r = await jp3('/api/inbound-plan/mails/' + bfMail.id + '/convert');
+  ok(r.body.ok && r.body.rowCount === 2 && r.body.totalQty === 78, 'mail convert: ビーフリーメールを変換 (複数行のまま)', r.body.rowCount);
+  r = await jp3('/api/inbound-plan/mails/' + errMail.id + '/convert');
+  ok(r.status === 400 && r.body.error.includes('解析エラー'), 'mail convert: errorメールは手動貼り付けを案内');
+
+  // 処理済み/無視
+  r = await jp3('/api/inbound-plan/mails/' + amcMail.id + '/status', { status: 'done' });
+  ok(r.body.ok, 'mail: 登録済みにする');
+  r = await jp3('/api/inbound-plan/mails/' + errMail.id + '/status', { status: 'ignored' });
+  ok(r.body.ok, 'mail: 無視');
+  r = await j('/api/inbound-plan/mails');
+  ok(r.body.ok && r.body.open.length === 4 && r.body.open.some(m => m.gmail_id === 'gm-bf-1') && r.body.recent.length === 2,
+    'mail: 一覧はnew/errorのみ (処理済みはrecentへ)', r.body.open.length);
+  delete process.env.PO_SHIPMENT_FAKE_DATA;
+
+  // 画面: メール取得UI配信
+  const inbHtml3 = await (await fetch(base + '/inbound')).text();
+  ok(inbHtml3.includes('ipFetch') && inbHtml3.includes('メールから取得') && inbHtml3.includes('renderIpResult'), '/inbound 📬メール取得UI');
+}
+
+// ═══ 全ページのインラインJS構文チェック (サーバtemplate literal内クライアントJSの括弧崩れ等を機械検出) ═══
+console.log('── ページ内スクリプトの構文チェック ──');
+{
+  for (const p of ['/', '/supplier/1', '/products', '/orders', '/admin', '/inbound', '/backorders']) {
+    const html = await (await fetch(base + p)).text();
+    const scripts = [...html.matchAll(/<script(?![^>]*src=)[^>]*>([\s\S]*?)<\/script>/gi)].map(m => m[1]);
+    let err = null;
+    for (const s of scripts) {
+      // new Function はテスト内での「構文コンパイルのみ」(呼び出さない)。対象は自サーバが生成したページで
+      // 外部入力は含まれない。実行はしないため副作用なし (構文エラー検出が目的)
+      try { new Function(s); } catch (e) { err = e.message + ' | ' + s.slice(0, 120); break; }
+    }
+    ok(!err && scripts.length > 0, `script構文OK: ${p} (${scripts.length}本)`, err);
+  }
+}
+
 server.close();
 console.log(`\n=== RESULT: pass=${pass} fail=${fail} ===`);
 process.exit(fail ? 1 : 0);

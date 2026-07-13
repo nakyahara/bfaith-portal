@@ -570,6 +570,40 @@ function initLedgerSchema(db) {
     PRIMARY KEY (supplier_code, product_key)
   )`);
 
+  // 未紐付けの先方管理番号 (仮登録)。出荷明細→ロジザード入荷予定変換で対応表に無い番号が出たとき
+  // ここに置いておき、後日 (NE登録→翌朝PML反映後) 商品と紐づけて対応表へ昇格する (中原さん要望 2026-07-13)
+  db.exec(`CREATE TABLE IF NOT EXISTS po_vendor_code_pending (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    supplier_code TEXT NOT NULL,
+    vendor_code   TEXT NOT NULL,      -- 出荷明細の原文 (表示用)
+    vendor_code_norm TEXT NOT NULL,   -- trim+大文字化 (照合キー。変換の逆引きと同じ正規化。大小文字違いの重複防止)
+    vendor_name   TEXT,               -- 出荷明細に載っていた先方の商品名 (紐づけ時のヒント)
+    last_qty      INTEGER,            -- 直近に出荷明細で見た数量 (参考)
+    memo          TEXT,
+    status        TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','linked','dismissed')),
+    linked_product_code TEXT,         -- linked時の弊社商品コード
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    UNIQUE (supplier_code, vendor_code_norm)
+  )`);
+
+  // 出荷明細メール (AMC/ビーフリーからの入荷予定の元データ。Gmail readonly で自動取得し解析結果を保持。
+  // gmail_id UNIQUE = 同じメールを二重処理しない冪等キー)
+  db.exec(`CREATE TABLE IF NOT EXISTS po_shipment_mails (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    gmail_id      TEXT NOT NULL UNIQUE,
+    supplier_code TEXT NOT NULL,
+    from_addr     TEXT,
+    subject       TEXT,
+    received_at   TEXT,               -- Gmail internalDate (UTC ISO)
+    parsed_json   TEXT NOT NULL,      -- [{vendorCode, vendorName, qty}] (解析済み明細)
+    parse_note    TEXT,               -- 添付ファイル名等
+    status        TEXT NOT NULL DEFAULT 'new' CHECK(status IN ('new','done','error','ignored')),
+    error         TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+  )`);
+
   // メール送信ジョブ (outbox方式。txn内でGmail APIを呼ばない。delivery_key で二重送信の確率を構造的に低減:
   // 送信前に sending をcommit → Message-IDヘッダ+本文に埋込 → lease切れ再送前にGmail照合、不明時は自動再送しない)
   db.exec(`CREATE TABLE IF NOT EXISTS po_email_jobs (
