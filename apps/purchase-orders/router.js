@@ -4076,6 +4076,14 @@ getJson(API + '/masters/suppliers').then(function(j) {
   });
 });
 
+// 受信日時を日本時間で表示 (Gmail internalDate はUTC ISO保存のため、そのまま切り出すと朝のメールが前日に見える)。
+// 入力はUTC ISOのみ受理 (Date.parseの寛容な解釈で不正値を日付に化けさせない)
+function jstStamp(iso) {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/.test(String(iso || ''))) return '—';
+  var t = Date.parse(iso);
+  if (!isFinite(t)) return '—';
+  return new Date(t + 32400000).toISOString().slice(0, 16).replace('T', ' ');
+}
 // 未処理の出荷明細メール一覧
 function renderIpMails(j) {
   var area = document.getElementById('ipMails');
@@ -4088,16 +4096,19 @@ function renderIpMails(j) {
   if (!open.length) {
     h = '<div class="muted">未処理の出荷明細メールはありません (「📬 メールから取得」で直近30日分を確認できます)</div>';
   } else {
-    h = '<table class="t"><tr><th>受信</th><th>仕入先</th><th>件名</th><th class="r">明細</th><th></th></tr>';
+    h = '<table class="t"><tr><th>受信 <span class="muted" style="font-weight:400">(日本時間)</span></th><th>仕入先</th><th>件名</th><th class="r">明細</th><th></th></tr>';
     open.forEach(function(m) {
       var items = [];
       try { items = JSON.parse(m.parsed_json || '[]'); } catch (e) {}
-      h += '<tr><td class="muted">' + esc(String(m.received_at || '').slice(0, 10)) + '</td>' +
+      // 明細0行 (取込データが不完全) の行にも再解析を出す — Gmailから取り直して直せる
+      var needsReparse = m.status === 'error' || items.length === 0;
+      h += '<tr><td class="muted" style="white-space:nowrap">' + esc(jstStamp(m.received_at)) + '</td>' +
         '<td>' + esc(m.supplier_code) + '</td><td>' + esc(m.subject || '') + (m.parse_note ? ' <span class="muted">📎' + esc(m.parse_note) + '</span>' : '') +
         (m.status === 'error' ? '<div class="muted" style="color:#b45309;font-size:11px;max-width:520px">⚠ ' + esc(m.error || '') + '</div>' : '') + '</td>' +
         '<td class="r">' + (m.status === 'error' ? '<span class="badge b-warn">⚠️ 解析エラー</span>' : items.length + '行') + '</td>' +
         '<td style="white-space:nowrap">' +
-          (m.status !== 'error' ? '<button class="pri sm" data-ipmconv="' + m.id + '">🔁 変換</button> ' : '<button class="sm" data-ipmrep="' + m.id + '">🔄 再解析</button> ') +
+          (m.status !== 'error' && items.length > 0 ? '<button class="pri sm" data-ipmconv="' + m.id + '">🔁 変換</button> ' : '') +
+          (needsReparse ? '<button class="sm" data-ipmrep="' + m.id + '">🔄 再解析</button> ' : '') +
           '<button class="ghost" data-ipmdone="' + m.id + '" title="ロジザードへの貼り付けが済んだら">✅ 登録済み</button>' +
           '<button class="ghost" data-ipmign="' + m.id + '">🚫 無視</button></td></tr>';
     });
@@ -4107,11 +4118,23 @@ function renderIpMails(j) {
     h += '<div class="muted" style="margin-top:8px;font-size:12px"><b>処理済み (直近' + j.recent.length + '件)</b> — 間違えて押したときは ↩ 戻す で未処理に戻せます</div>' +
       '<table class="t" style="margin-top:2px">' +
       j.recent.map(function(m) {
-        return '<tr><td class="muted">' + esc(String(m.received_at || '').slice(0, 10)) + '</td>' +
+        return '<tr><td class="muted" style="white-space:nowrap">' + esc(jstStamp(m.received_at)) + '</td>' +
           '<td>' + esc(m.supplier_code) + '</td><td>' + esc(m.subject || '') + '</td>' +
           '<td>' + (m.status === 'ignored' ? '🚫 無視' : '✅ 登録済み') + '</td>' +
           '<td><button class="ghost" data-ipmback="' + m.id + '">↩ 戻す</button></td></tr>';
       }).join('') + '</table>';
+  }
+  if ((j.notCandidates || []).length) {
+    var ncTotal = j.notCandidateTotal || j.notCandidates.length;
+    h += '<details style="margin-top:8px"><summary class="muted" style="cursor:pointer;font-size:12px">🚫 出荷明細ではないと判定したメール (直近' + j.notCandidates.length + '件 / 全' + ncTotal + '件' +
+      (ncTotal > j.notCandidates.length ? ' — 古い分はここに出ません。救出が必要なら教えてください' : '') + ') — 誤判定なら🔄再解析で救出</summary>' +
+      '<table class="t" style="margin-top:2px">' +
+      j.notCandidates.map(function(m) {
+        return '<tr><td class="muted" style="white-space:nowrap">' + esc(jstStamp(m.received_at)) + '</td>' +
+          '<td>' + esc(m.supplier_code) + '</td><td>' + esc(m.subject || '') +
+          '<div class="muted" style="font-size:11px;max-width:520px">' + esc(m.error || '') + '</div></td>' +
+          '<td><button class="sm" data-ipmrep="' + m.id + '">🔄 再解析</button></td></tr>';
+      }).join('') + '</table></details>';
   }
   area.innerHTML = h;
 }
