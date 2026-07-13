@@ -2058,6 +2058,77 @@ console.log('── 入荷予定変換 (inbound-plan) + 仮登録 (pending) ─�
     ok(r.body.skipped.length === 2, 'BEFREE: 見出し外の行 (【…】/送り状No) はスキップ', r.body.skipped);
   }
 
+  // ── 入数 (単位換算) と左右対応表示 (lines) ──
+  {
+    r = await jp2('/api/vendor-map/qty-per-unit', { supplier_code: '1', product_code: 'noflyersticker', qty_per_unit: 24 });
+    ok(r.body.ok && r.body.qtyPerUnit === 24, '入数の登録 (noflyersticker=24)');
+    r = await jp2('/api/inbound-plan/convert', { supplier_code: '1', text: 'AMC-001\tﾁﾗｼ\t2\n' });
+    ok(r.body.ok && r.body.rows[0].vendorQty === 2 && r.body.rows[0].qtyPerUnit === 24 && r.body.rows[0].qty === 48 &&
+      r.body.pasteText.startsWith('noflyersticker\t48\t') && r.body.totalQty === 48, '入数換算: 先方2×24=48が貼り付けに反映', r.body.pasteText);
+    ok(r.body.lines && r.body.lines[0].type === 'ok' && r.body.lines[0].productName !== undefined && r.body.totalVendorQty === 2,
+      'lines: 左=仕入先/右=弊社の表示用データ');
+    r = await jp2('/api/inbound-plan/convert', { supplier_code: '1', text: 'ZZZ-UNKNOWN-9\t新しいやつ\t5\n' });
+    ok(r.body.lines[0].type === 'unmatched' && r.body.lines[0].vendorQty === 5, 'lines: 対応表になし=新商品行として返る');
+    // バリデーション
+    r = await jp2('/api/vendor-map/qty-per-unit', { supplier_code: '1', product_code: 'noflyersticker', qty_per_unit: -3 });
+    ok(r.status === 400, '入数の負数は400');
+    r = await jp2('/api/vendor-map/qty-per-unit', { supplier_code: '1', product_code: 'zzz-no-such', qty_per_unit: 2 });
+    ok(r.status === 404, '対応表に無い商品の入数登録は404');
+    // entry更新 (番号変更等) では入数を保持
+    r = await jp2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'noflyersticker', vendor_code: 'AMC-001' });
+    ok(r.body.ok && db.prepare("SELECT qty_per_unit FROM po_vendor_code_map WHERE supplier_code='1' AND product_key='noflyersticker'").get().qty_per_unit === 24,
+      'entry更新で入数を保持');
+    // CSV全置換でも入数を保持 (入数列なしCSV)
+    const fdKeep = new FormData();
+    fdKeep.append('supplier_code', '1');
+    fdKeep.append('file', new Blob([iconv.encode('"仕入先管理番号","x","弊社管理番号"\r\n"AMC-001","","noflyersticker"', 'Shift_JIS')]), 'keep.csv');
+    r = await j('/api/vendor-map/csv', { method: 'POST', body: fdKeep });
+    ok(r.body.ok && db.prepare("SELECT qty_per_unit FROM po_vendor_code_map WHERE supplier_code='1' AND product_key='noflyersticker'").get().qty_per_unit === 24,
+      'CSV全置換でも入数を保持');
+    // CSVに入数列があればそちらを採用
+    const fdQpu = new FormData();
+    fdQpu.append('supplier_code', '1');
+    fdQpu.append('file', new Blob([iconv.encode('"仕入先管理番号","x","弊社管理番号","入数"\r\n"AMC-001","","noflyersticker","12"', 'Shift_JIS')]), 'qpu.csv');
+    r = await j('/api/vendor-map/csv', { method: 'POST', body: fdQpu });
+    ok(r.body.ok && db.prepare("SELECT qty_per_unit FROM po_vendor_code_map WHERE supplier_code='1' AND product_key='noflyersticker'").get().qty_per_unit === 12,
+      'CSVの入数列を取込');
+    // CSVの不正な入数は警告して既存値を保持
+    const fdBadQ = new FormData();
+    fdBadQ.append('supplier_code', '1');
+    fdBadQ.append('file', new Blob([iconv.encode('"仕入先管理番号","x","弊社管理番号","入数"\r\n"AMC-001","","noflyersticker","abc"', 'Shift_JIS')]), 'badq.csv');
+    r = await j('/api/vendor-map/csv', { method: 'POST', body: fdBadQ });
+    ok(r.body.ok && (r.body.warnings || []).some(w => w.includes('入数')) &&
+      db.prepare("SELECT qty_per_unit FROM po_vendor_code_map WHERE supplier_code='1' AND product_key='noflyersticker'").get().qty_per_unit === 12,
+      'CSVの不正な入数は警告+既存値を保持');
+    // 上限・0の拒否 (Codex 入数R1 Medium)
+    r = await jp2('/api/vendor-map/qty-per-unit', { supplier_code: '1', product_code: 'noflyersticker', qty_per_unit: 10000000 });
+    ok(r.status === 400, '入数の上限 (1,000,000) 超えは400');
+    r = await jp2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'noflyersticker', vendor_code: 'AMC-001', qty_per_unit: 0 });
+    ok(r.status === 400, 'entry経由の入数0は400');
+    // 換算結果が正の整数にならない行 (0.1×1→0) は貼り付けから除外
+    r = await jp2('/api/vendor-map/qty-per-unit', { supplier_code: '1', product_code: 'noflyersticker', qty_per_unit: 0.1 });
+    ok(r.body.ok, '小数の入数は登録可能 (換算時に検証)');
+    r = await jp2('/api/inbound-plan/convert', { supplier_code: '1', text: 'AMC-001\tﾁﾗｼ\t1\n' });
+    ok(r.body.ok && r.body.rowCount === 0 && r.body.qtyInvalid.length === 1 && r.body.lines[0].type === 'badqty' && r.body.pasteText === '',
+      '換算結果が不正な行は貼り付けから除外 (badqty)', r.body.qtyInvalid);
+    // 端数を黙って丸めない: 1×1.5=1.5 は badqty、2×0.5=1 は正常 (Codex 入数R2 High)
+    r = await jp2('/api/vendor-map/qty-per-unit', { supplier_code: '1', product_code: 'noflyersticker', qty_per_unit: 1.5 });
+    r = await jp2('/api/inbound-plan/convert', { supplier_code: '1', text: 'AMC-001\tﾁﾗｼ\t1\n' });
+    ok(r.body.ok && r.body.rowCount === 0 && r.body.lines[0].type === 'badqty', '1×1.5=1.5 は丸めずbadqty');
+    r = await jp2('/api/inbound-plan/convert', { supplier_code: '1', text: 'AMC-001\tﾁﾗｼ\t2\n' });
+    ok(r.body.ok && r.body.rowCount === 1 && r.body.rows[0].qty === 3, '2×1.5=3 は整数なので正常', r.body.rows[0] && r.body.rows[0].qty);
+    // 楽観ロック: 入数変更で updated_at が進む → 古いbaseのentry更新は409
+    const baseOld = db.prepare("SELECT updated_at FROM po_vendor_code_map WHERE supplier_code='1' AND product_key='noflyersticker'").get().updated_at;
+    await new Promise(rs => setTimeout(rs, 5)); // updated_at (ISO ms) が確実に進むように
+    r = await jp2('/api/vendor-map/qty-per-unit', { supplier_code: '1', product_code: 'noflyersticker', qty_per_unit: 24 });
+    ok(r.body.ok, '入数を更新');
+    r = await jp2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'noflyersticker', vendor_code: 'AMC-999', baseUpdatedAt: baseOld });
+    ok(r.status === 409, '入数変更後、古いbaseのentry更新は409 (競合検出)');
+    // 後片付け: 入数クリア (空欄=換算なし)。以降のメール変換テスト (25個のまま) に影響させない
+    r = await jp2('/api/vendor-map/qty-per-unit', { supplier_code: '1', product_code: 'noflyersticker', qty_per_unit: '' });
+    ok(r.body.ok && r.body.qtyPerUnit === 1, '入数クリア (空欄=1扱い)');
+  }
+
   // CSV取込の重複警告 (同じ先方番号を複数商品に。ブロックせず警告列挙)
   {
     const csvDup = iconv.encode('"仕入先管理番号","x","弊社管理番号"\r\n"BF-X","","prod-a"\r\n"bf-x","","prod-b"', 'Shift_JIS');
@@ -2071,8 +2142,11 @@ console.log('── 入荷予定変換 (inbound-plan) + 仮登録 (pending) ─�
   // 画面配信
   const inbHtml2 = await (await fetch(base + '/inbound-plan')).text();
   ok(inbHtml2.includes('入荷予定') && inbHtml2.includes('ipConvert'), '/inbound-plan 入荷予定作成ページ');
+  ok(inbHtml2.includes('仕入先の出荷明細') && inbHtml2.includes('data-ipqpu') && inbHtml2.includes('新商品'), '/inbound-plan 左右対応表+入数編集UI');
+  ok(inbHtml2.includes('ロジザード入荷予定を開く') && inbHtml2.includes('ap003.logizard.net/LPSTD405/PA01/Index'), '/inbound-plan ロジザードを開くボタン');
   const adminHtml3 = await (await fetch(base + '/admin')).text();
   ok(adminHtml3.includes('loadVmapPending') && adminHtml3.includes('未紐付けの先方番号'), '/admin 対応表タブに仮登録リスト');
+  ok(adminHtml3.includes('data-vmqpu') && adminHtml3.includes('vmNewQpu'), '/admin 対応表に入数列');
 }
 
 // ═══ 出荷明細メールの自動取得 (Gmail偽装) ═══

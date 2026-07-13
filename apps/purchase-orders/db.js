@@ -569,6 +569,8 @@ function initLedgerSchema(db) {
     updated_at    TEXT NOT NULL,
     PRIMARY KEY (supplier_code, product_key)
   )`);
+  // 入数: 仕入先の出荷明細の数量1あたりの弊社数量 (単位違いの換算。例: 先方1ケース=弊社240個 → 240)。NULL=1
+  addCol(db, 'po_vendor_code_map', 'qty_per_unit', 'REAL');
 
   // 未紐付けの先方管理番号 (仮登録)。出荷明細→ロジザード入荷予定変換で対応表に無い番号が出たとき
   // ここに置いておき、後日 (NE登録→翌朝PML反映後) 商品と紐づけて対応表へ昇格する (中原さん要望 2026-07-13)
