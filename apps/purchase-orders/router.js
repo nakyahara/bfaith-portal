@@ -30,6 +30,7 @@ import {
   buildOrderEmail, createEmailJob, processEmailJob, reconcileEmailJobs, listEmailJobs, emailSettings, parseAddresses,
   markUnsent, cancelEmailJob, startEmailDispatcher,
 } from './email.js';
+import { fetchShipmentMails, listShipmentMails, setShipmentMailStatus } from './shipment-mail.js';
 import { getSetting, setSetting, audit, markCycleFbaJobDone } from './ledger.js';
 
 startEmailDispatcher(); // 予約送信 (毎分、時刻が来たqueuedジョブを送信。unrefでプロセス終了は妨げない)
@@ -1190,6 +1191,41 @@ function parseShipmentLines(text) {
 
 const normVendorCode = v => trimS(v).toUpperCase();
 
+// 変換コア: 明細 [{vendorCode, vendorName, qty}] → ロジザード貼り付けデータ (手動貼り付け/メール自動取得の共通処理)
+function convertShipmentItems(db, supplier, supplierName, items, skipped = []) {
+  // 対応表の逆引き: 先方番号 → 弊社商品コード (同じ先方番号が複数商品に付いている場合は ambiguous)
+  const rev = new Map();
+  for (const m of db.prepare('SELECT product_code, product_key, vendor_code FROM po_vendor_code_map WHERE supplier_code=?').all(supplier)) {
+    const k = normVendorCode(m.vendor_code);
+    if (!rev.has(k)) rev.set(k, []);
+    rev.get(k).push(m);
+  }
+  const costByKey = new Map();
+  for (const r of loadPml().rows) {
+    // 非数値の原価は null (=仕入単価空欄+costMissing)。Number()のNaNを貼り付けデータに漏らさない (Codex plan-R3 Medium)
+    const c = r['原価'] == null || r['原価'] === '' ? null : Number(r['原価']);
+    costByKey.set(normProductCode(r['商品コード']), Number.isFinite(c) ? c : null);
+  }
+  const okRows = [], unmatched = [], ambiguous = [];
+  let totalQty = 0;
+  for (const it of items) {
+    const hits = rev.get(normVendorCode(it.vendorCode)) || [];
+    if (hits.length === 0) { unmatched.push(it); continue; }
+    if (hits.length > 1) { ambiguous.push({ ...it, candidates: hits.map(h => h.product_code) }); continue; }
+    const cost = costByKey.get(hits[0].product_key);
+    okRows.push({ vendorCode: it.vendorCode, productCode: hits[0].product_code, qty: it.qty, cost: cost == null ? null : cost });
+    totalQty += it.qty;
+  }
+  // ロジザード「入荷予定登録(Excel貼り付け)」の列: 商品ID / 入荷予定数 / 仕入単価 (原価不明は空欄=手作業時のiferror("")と同じ)
+  const pasteText = okRows.map(r2 => `${r2.productCode}\t${r2.qty}\t${r2.cost == null ? '' : r2.cost}`).join('\n');
+  return {
+    ok: true, supplierName, supplierCode: supplier, // 仮登録は変換時の仕入先に固定する (Codex plan-R1 High)
+    rows: okRows, pasteText, totalQty, rowCount: okRows.length,
+    costMissing: okRows.filter(r2 => r2.cost == null).map(r2 => r2.productCode),
+    unmatched, ambiguous, skipped,
+  };
+}
+
 router.post('/api/inbound-plan/convert', (req, res) => {
   try {
     const db = getDB();
@@ -1199,38 +1235,43 @@ router.post('/api/inbound-plan/convert', (req, res) => {
     if (!sup) return res.status(400).json({ ok: false, error: `仕入先が未登録です: ${supplier}` });
     const { items, skipped } = parseShipmentLines((req.body || {}).text);
     if (!items.length) return res.status(400).json({ ok: false, error: '解析できる行がありません (出荷明細の「商品コード〜出荷数量」の行を貼り付けてください)', skipped });
-    // 対応表の逆引き: 先方番号 → 弊社商品コード (同じ先方番号が複数商品に付いている場合は ambiguous)
-    const rev = new Map();
-    for (const m of db.prepare('SELECT product_code, product_key, vendor_code FROM po_vendor_code_map WHERE supplier_code=?').all(supplier)) {
-      const k = normVendorCode(m.vendor_code);
-      if (!rev.has(k)) rev.set(k, []);
-      rev.get(k).push(m);
-    }
-    const costByKey = new Map();
-    for (const r of loadPml().rows) {
-      // 非数値の原価は null (=仕入単価空欄+costMissing)。Number()のNaNを貼り付けデータに漏らさない (Codex plan-R3 Medium)
-      const c = r['原価'] == null || r['原価'] === '' ? null : Number(r['原価']);
-      costByKey.set(normProductCode(r['商品コード']), Number.isFinite(c) ? c : null);
-    }
-    const okRows = [], unmatched = [], ambiguous = [];
-    let totalQty = 0;
-    for (const it of items) {
-      const hits = rev.get(normVendorCode(it.vendorCode)) || [];
-      if (hits.length === 0) { unmatched.push(it); continue; }
-      if (hits.length > 1) { ambiguous.push({ ...it, candidates: hits.map(h => h.product_code) }); continue; }
-      const cost = costByKey.get(hits[0].product_key);
-      okRows.push({ vendorCode: it.vendorCode, productCode: hits[0].product_code, qty: it.qty, cost: cost == null ? null : cost });
-      totalQty += it.qty;
-    }
-    // ロジザード「入荷予定登録(Excel貼り付け)」の列: 商品ID / 入荷予定数 / 仕入単価 (原価不明は空欄=手作業時のiferror("")と同じ)
-    const pasteText = okRows.map(r2 => `${r2.productCode}\t${r2.qty}\t${r2.cost == null ? '' : r2.cost}`).join('\n');
-    res.json({
-      ok: true, supplierName: sup.name, supplierCode: supplier, // 仮登録は変換時の仕入先に固定する (Codex plan-R1 High)
-      rows: okRows, pasteText, totalQty, rowCount: okRows.length,
-      costMissing: okRows.filter(r2 => r2.cost == null).map(r2 => r2.productCode),
-      unmatched, ambiguous, skipped,
-    });
+    res.json(convertShipmentItems(db, supplier, sup.name, items, skipped));
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ─── 出荷明細メールの自動取得 (Gmail readonly。AMC=xlsx添付 / ビーフリー=本文の表) ───
+router.post('/api/inbound-plan/fetch-mails', async (req, res) => {
+  try {
+    const result = await fetchShipmentMails(actorOf(req));
+    res.json({ ok: true, ...result, ...listShipmentMails() });
+  } catch (e) { res.status(502).json({ ok: false, error: e.message }); }
+});
+
+router.get('/api/inbound-plan/mails', (req, res) => {
+  try { res.json({ ok: true, ...listShipmentMails() }); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// メールの解析済み明細を変換 (手動貼り付けと同じ応答形+mailId)
+router.post('/api/inbound-plan/mails/:id/convert', (req, res) => {
+  try {
+    const db = getDB();
+    const id = Number(req.params.id);
+    const mail = db.prepare('SELECT * FROM po_shipment_mails WHERE id=?').get(id);
+    if (!mail) return res.status(404).json({ ok: false, error: 'メールが見つかりません' });
+    if (mail.status === 'error') return res.status(400).json({ ok: false, error: `このメールは解析エラーです: ${mail.error || ''} — 本文/添付を確認して手動貼り付けを使ってください` });
+    const items = JSON.parse(mail.parsed_json || '[]');
+    if (!items.length) return res.status(400).json({ ok: false, error: '解析済みの明細がありません' });
+    const sup = db.prepare('SELECT name FROM po_suppliers WHERE supplier_code=?').get(mail.supplier_code);
+    res.json({ ...convertShipmentItems(db, mail.supplier_code, (sup && sup.name) || mail.supplier_code, items), mailId: id });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+router.post('/api/inbound-plan/mails/:id/status', (req, res) => {
+  try {
+    setShipmentMailStatus(Number(req.params.id), trimS((req.body || {}).status), actorOf(req));
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
 // 未紐付け番号を仮登録リストへ (UNIQUE upsert=再変換で重複しない)
@@ -3661,15 +3702,22 @@ router.get('/inbound', (req, res) => {
     <div class="import-zone">
       <h3>📅 ロジザード入荷予定の作成 <span class="muted" style="font-weight:400;font-size:12px">(アメージングクラフト/ビーフリーの出荷明細 → 入荷予定登録(Excel貼り付け)用データ)</span></h3>
       <div class="hint">
-        出荷明細 (Excel/メール) の「先方の商品コード〜数量」の行をそのままコピーして下に貼り付け → 変換。
-        結果 (商品ID / 入荷予定数 / 仕入単価) をコピーして、ロジザードの「入荷予定登録 (Excel貼り付け)」へ貼り付けてください。<br>
-        対応表に無い先方番号は下に一覧されます — <b>新商品/番号変更</b>は「仮登録」しておき、NE登録の翌朝以降にマスタ管理→📇対応表の「未紐付けの先方番号」から紐づけます。
+        「📬 メールから取得」を押すと、AMC (@am-craft.jp のxlsx添付) / ビーフリー (@be-free.biz の本文の表) の出荷明細を自動で取り込んで変換できます。
+        結果 (商品ID / 入荷予定数 / 仕入単価) を📋コピーして、ロジザードの「入荷予定登録 (Excel貼り付け)」へ貼り付け → 済んだら ✅ ロジザード登録済み。<br>
+        対応表に無い先方番号は一覧されます — <b>新商品/番号変更</b>は「仮登録」しておき、NE登録の翌朝以降にマスタ管理→📇対応表の「未紐付けの先方番号」から紐づけます。
       </div>
-      <div class="row" style="display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap;margin-top:6px">
-        <label>仕入先 <select id="ipSup"></select></label>
-        <textarea id="ipText" rows="6" style="flex:1;min-width:340px" placeholder="ZZ1317-0002	ﾌﾙﾌﾟﾛﾃｸﾄｽﾘｰﾌﾞ	1600&#10;ZZ1317-0072	ﾊﾟｯｸｹｰｽS	240  ← のように出荷明細の行を貼り付け (見出し行が混ざってもOK)"></textarea>
-        <button class="pri" id="ipConvert">🔁 変換</button>
+      <div class="row" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:6px">
+        <button class="pri" id="ipFetch">📬 メールから取得 (AMC/ビーフリー)</button>
+        <span id="ipFetchStat" class="muted"></span>
       </div>
+      <div id="ipMails" style="margin-top:8px"></div>
+      <details style="margin-top:10px"><summary class="muted" style="cursor:pointer">✍️ 手動貼り付け (メール以外から / 自動解析に失敗したとき)</summary>
+        <div class="row" style="display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap;margin-top:6px">
+          <label>仕入先 <select id="ipSup"></select></label>
+          <textarea id="ipText" rows="6" style="flex:1;min-width:340px" placeholder="ZZ1317-0002	ﾌﾙﾌﾟﾛﾃｸﾄｽﾘｰﾌﾞ	1600&#10;ZZ1317-0072	ﾊﾟｯｸｹｰｽS	240  ← のように出荷明細の行を貼り付け (見出し行が混ざってもOK)"></textarea>
+          <button class="pri" id="ipConvert">🔁 変換</button>
+        </div>
+      </details>
       <div id="ipResult" style="margin-top:8px"></div>
     </div>
 
@@ -3879,7 +3927,7 @@ document.addEventListener('click', function(ev) {
   }
 });
 
-// ── 📅 ロジザード入荷予定の作成 (出荷明細→貼り付けデータ) ──
+// ── 📅 ロジザード入荷予定の作成 (メール自動取得 + 手動貼り付け) ──
 var IP_LAST = null; // 直近の変換結果 (仮登録ボタン用)
 getJson(API + '/masters/suppliers').then(function(j) {
   if (!j.ok) return;
@@ -3893,15 +3941,82 @@ getJson(API + '/masters/suppliers').then(function(j) {
     }).join('');
   });
 });
-document.getElementById('ipConvert').addEventListener('click', function() {
+
+// 未処理の出荷明細メール一覧
+function renderIpMails(j) {
+  var area = document.getElementById('ipMails');
+  var open = j.open || [];
+  if (!open.length) {
+    area.innerHTML = '<div class="muted">未処理の出荷明細メールはありません (「📬 メールから取得」で直近30日分を確認できます)</div>';
+    return;
+  }
+  var h = '<table class="t"><tr><th>受信</th><th>仕入先</th><th>件名</th><th class="r">明細</th><th></th></tr>';
+  open.forEach(function(m) {
+    var items = [];
+    try { items = JSON.parse(m.parsed_json || '[]'); } catch (e) {}
+    h += '<tr><td class="muted">' + esc(String(m.received_at || '').slice(0, 10)) + '</td>' +
+      '<td>' + esc(m.supplier_code) + '</td><td>' + esc(m.subject || '') + (m.parse_note ? ' <span class="muted">📎' + esc(m.parse_note) + '</span>' : '') + '</td>' +
+      '<td class="r">' + (m.status === 'error' ? '<span class="badge b-draft" title="' + esc(m.error || '') + '">⚠️ 解析エラー</span>' : items.length + '行') + '</td>' +
+      '<td style="white-space:nowrap">' +
+        (m.status !== 'error' ? '<button class="pri sm" data-ipmconv="' + m.id + '">🔁 変換</button> ' : '') +
+        '<button class="ghost" data-ipmdone="' + m.id + '" title="ロジザードへの貼り付けが済んだら">✅ 登録済み</button>' +
+        '<button class="ghost" data-ipmign="' + m.id + '">🚫 無視</button></td></tr>';
+  });
+  h += '</table>';
+  if ((j.recent || []).length) {
+    h += '<div class="muted" style="margin-top:4px;font-size:11px">処理済み: ' +
+      j.recent.map(function(m){ return esc(String(m.received_at || '').slice(5, 10) + ' ' + (m.subject || '').slice(0, 20)) + (m.status === 'ignored' ? ' (無視)' : ''); }).join(' / ') + '</div>';
+  }
+  area.innerHTML = h;
+}
+function loadIpMails() {
+  getJson(API + '/inbound-plan/mails').then(function(j){ if (j.ok) renderIpMails(j); });
+}
+document.getElementById('ipFetch').addEventListener('click', function() {
   var btn = this; btn.disabled = true;
-  post(API + '/inbound-plan/convert', { supplier_code: document.getElementById('ipSup').value, text: document.getElementById('ipText').value })
-    .then(function(j) {
-      btn.disabled = false;
+  document.getElementById('ipFetchStat').textContent = 'Gmailを確認中…';
+  post(API + '/inbound-plan/fetch-mails', {}).then(function(j) {
+    btn.disabled = false;
+    if (!j.ok) { document.getElementById('ipFetchStat').textContent = ''; toast('エラー: ' + j.error); return; }
+    document.getElementById('ipFetchStat').textContent = '新着 ' + (j.added || 0) + '件' + (j.errors && j.errors.length ? ' (解析エラー' + j.errors.length + '件)' : '');
+    renderIpMails(j);
+  }).catch(function(e){ btn.disabled = false; document.getElementById('ipFetchStat').textContent = ''; toast('通信エラー: ' + e.message); });
+});
+document.addEventListener('click', function(ev) {
+  var t2 = ev.target;
+  var g2 = function(a){ return t2.getAttribute && t2.getAttribute(a); };
+  var v2;
+  if ((v2 = g2('data-ipmconv'))) {
+    t2.disabled = true;
+    post(API + '/inbound-plan/mails/' + v2 + '/convert', {}).then(function(j) {
+      t2.disabled = false;
+      if (!j.ok) { toast('エラー: ' + j.error); return; }
+      renderIpResult(j);
+      document.getElementById('ipResult').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }).catch(function(e){ t2.disabled = false; toast('通信エラー: ' + e.message); });
+    return;
+  }
+  if ((v2 = g2('data-ipmdone')) || (v2 = g2('data-ipmign'))) {
+    var st2 = g2('data-ipmdone') ? 'done' : 'ignored';
+    if (st2 === 'ignored' && !confirm('このメールを無視しますか? (入荷予定を作らない)')) return;
+    t2.disabled = true;
+    post(API + '/inbound-plan/mails/' + v2 + '/status', { status: st2 }).then(function(j) {
+      t2.disabled = false;
+      if (!j.ok) { toast('エラー: ' + j.error); return; }
+      toast(st2 === 'done' ? '登録済みにしました' : '無視しました');
+      loadIpMails();
+    }).catch(function(e){ t2.disabled = false; toast('通信エラー: ' + e.message); });
+    return;
+  }
+});
+loadIpMails();
+
+// 変換結果の表示 (メール変換/手動貼り付け 共通)
+function renderIpResult(j) {
       var area = document.getElementById('ipResult');
-      if (!j.ok) { area.innerHTML = '<div class="warn">' + esc(j.error) + '</div>'; return; }
       IP_LAST = j;
       var h = '<div><b>✅ 変換 ' + j.rowCount + '行 / 合計 ' + j.totalQty.toLocaleString('ja-JP') + '個</b>' +
+        (j.mailId ? ' <span class="muted">(メール#' + j.mailId + ' — 貼り付けが済んだら一覧の ✅登録済み を押してください)</span>' : '') +
         ' <span class="muted">(ロジザード側の「入荷予定数合計」とこの数が一致するか確認してください)</span></div>' +
         '<div style="display:flex;gap:8px;align-items:flex-start;margin-top:6px">' +
         '<textarea id="ipPaste" rows="6" style="flex:1;min-width:300px" readonly>' + esc(j.pasteText) + '</textarea>' +
@@ -3937,6 +4052,16 @@ document.getElementById('ipConvert').addEventListener('click', function() {
               (r2.skippedProcessed ? '/処理済みのためスキップ' + r2.skippedProcessed + '件' : '') + ')。NE登録の翌朝以降にマスタ管理→📇対応表で紐づけてください');
           }).catch(function(e){ pd.disabled = false; toast('通信エラー: ' + e.message); });
       });
+}
+
+// 手動貼り付けの変換 (メール以外/自動解析に失敗したとき)
+document.getElementById('ipConvert').addEventListener('click', function() {
+  var btn = this; btn.disabled = true;
+  post(API + '/inbound-plan/convert', { supplier_code: document.getElementById('ipSup').value, text: document.getElementById('ipText').value })
+    .then(function(j) {
+      btn.disabled = false;
+      if (!j.ok) { document.getElementById('ipResult').innerHTML = '<div class="warn">' + esc(j.error) + '</div>'; return; }
+      renderIpResult(j);
     }).catch(function(e){ btn.disabled = false; toast('通信エラー: ' + e.message); });
 });
 load();`;

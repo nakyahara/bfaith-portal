@@ -587,6 +587,23 @@ function initLedgerSchema(db) {
     UNIQUE (supplier_code, vendor_code_norm)
   )`);
 
+  // 出荷明細メール (AMC/ビーフリーからの入荷予定の元データ。Gmail readonly で自動取得し解析結果を保持。
+  // gmail_id UNIQUE = 同じメールを二重処理しない冪等キー)
+  db.exec(`CREATE TABLE IF NOT EXISTS po_shipment_mails (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    gmail_id      TEXT NOT NULL UNIQUE,
+    supplier_code TEXT NOT NULL,
+    from_addr     TEXT,
+    subject       TEXT,
+    received_at   TEXT,               -- Gmail internalDate (UTC ISO)
+    parsed_json   TEXT NOT NULL,      -- [{vendorCode, vendorName, qty}] (解析済み明細)
+    parse_note    TEXT,               -- 添付ファイル名等
+    status        TEXT NOT NULL DEFAULT 'new' CHECK(status IN ('new','done','error','ignored')),
+    error         TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+  )`);
+
   // メール送信ジョブ (outbox方式。txn内でGmail APIを呼ばない。delivery_key で二重送信の確率を構造的に低減:
   // 送信前に sending をcommit → Message-IDヘッダ+本文に埋込 → lease切れ再送前にGmail照合、不明時は自動再送しない)
   db.exec(`CREATE TABLE IF NOT EXISTS po_email_jobs (

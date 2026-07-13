@@ -2075,6 +2075,92 @@ console.log('── 入荷予定変換 (inbound-plan) + 仮登録 (pending) ─�
   ok(adminHtml3.includes('loadVmapPending') && adminHtml3.includes('未紐付けの先方番号'), '/admin 対応表タブに仮登録リスト');
 }
 
+// ═══ 出荷明細メールの自動取得 (Gmail偽装) ═══
+console.log('── 出荷明細メール自動取得 (fetch-mails) ──');
+{
+  const jp3 = (p, body) => j(p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+  // 供給2の対応表を戻す (前のCSV重複テストで全置換されたため)
+  {
+    const csvBf2 = iconv.encode('"仕入先管理番号","x","弊社管理番号"\r\n"GOFUN-01-N","","gyoumuhandcream60-BI"', 'Shift_JIS');
+    const fdBf2 = new FormData();
+    fdBf2.append('supplier_code', '2');
+    fdBf2.append('file', new Blob([csvBf2]), 'bf2.csv');
+    await j('/api/vendor-map/csv', { method: 'POST', body: fdBf2 });
+  }
+  // AMC出荷明細のxlsxを実物どおりに生成 (先頭7行空+8行目見出し)
+  const ExcelJS = (await import('exceljs')).default;
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet('出荷明細表');
+  for (let i = 0; i < 7; i++) ws.addRow([]);
+  ws.addRow(['商品コード', '商品名', '出荷数量', '備考', '倉庫コード', '摘要']);
+  ws.addRow(['AMC-001', 'ﾁﾗｼ ｽﾃｯｶｰ', 25, '', '0000', '']);
+  ws.addRow(['ZZZ-MAIL-NEW', '新商品Y', 5, '', '0000', '']);
+  const xlsxB64 = Buffer.from(await wb.xlsx.writeBuffer()).toString('base64');
+  process.env.PO_SHIPMENT_FAKE_DATA = JSON.stringify([
+    { id: 'gm-amc-1', from: '芦田 <ashida@am-craft.jp>', subject: '出荷明細のご連絡', internalDate: '2026-07-13T06:00:00.000Z',
+      attachments: [{ filename: 'ビーフェイス様用出荷明細.xlsx', dataBase64: xlsxB64 }] },
+    { id: 'gm-bf-1', from: 'wholesale@be-free.biz', subject: '7/13　出荷明細です。', internalDate: '2026-07-13T06:25:00.000Z',
+      bodyHtml: '<table><tr><th>商品ID</th><th>商品名</th><th>出荷数</th></tr>' +
+        '<tr><td>GOFUN-01-N</td><td>胡粉ネイル スーパーコート N0033</td><td>48</td></tr>' +
+        '<tr><td>GOFUN-01-N</td><td>胡粉ネイル スーパーコート N0033</td><td>30</td></tr></table>' },
+    { id: 'gm-other', from: 'noreply@example.com', subject: '出荷明細', bodyHtml: '<table><tr><td>X</td><td>1</td></tr></table>' },
+    { id: 'gm-amc-noatt', from: 'ashida@am-craft.jp', subject: '出荷明細 (添付忘れ)', bodyHtml: '<p>添付なし</p>' },
+  ]);
+  r = await jp3('/api/inbound-plan/fetch-mails');
+  ok(r.body.ok && r.body.added === 3 && r.body.errors.length === 1, 'fetch: 対象2+解析エラー1を登録 (対象外ドメインは無視)', r.body);
+  ok(r.body.open.length === 3, 'fetch: 未処理一覧に3件 (new2+error1)', r.body.open.length);
+  const amcMail = r.body.open.find(m => m.gmail_id === 'gm-amc-1');
+  const bfMail = r.body.open.find(m => m.gmail_id === 'gm-bf-1');
+  const errMail = r.body.open.find(m => m.gmail_id === 'gm-amc-noatt');
+  ok(amcMail && amcMail.supplier_code === '1' && JSON.parse(amcMail.parsed_json).length === 2, 'fetch: AMC xlsx添付を解析 (2明細)', amcMail && amcMail.parse_note);
+  ok(bfMail && bfMail.supplier_code === '2' && JSON.parse(bfMail.parsed_json).length === 2, 'fetch: ビーフリー本文の表を解析 (同一商品2行)');
+  ok(errMail && errMail.status === 'error' && errMail.error.includes('xlsx添付'), 'fetch: 添付なしAMCメールはerror');
+
+  // 再取得は冪等 (同じgmail_idは再登録しない)
+  r = await jp3('/api/inbound-plan/fetch-mails');
+  ok(r.body.ok && r.body.added === 0, 'fetch: 再取得は冪等 (added=0)');
+
+  // メール変換 = 手動貼り付けと同じ応答 (AMC-001→noflyersticker、未知番号はunmatched)
+  r = await jp3('/api/inbound-plan/mails/' + amcMail.id + '/convert');
+  ok(r.body.ok && r.body.mailId === amcMail.id && r.body.rowCount === 1 && r.body.totalQty === 25 &&
+    r.body.pasteText.startsWith('noflyersticker\t25\t') && r.body.unmatched.length === 1 && r.body.unmatched[0].vendorCode === 'ZZZ-MAIL-NEW',
+    'mail convert: AMCメールを変換 (マッチ1+unmatched1)', r.body.pasteText);
+  r = await jp3('/api/inbound-plan/mails/' + bfMail.id + '/convert');
+  ok(r.body.ok && r.body.rowCount === 2 && r.body.totalQty === 78, 'mail convert: ビーフリーメールを変換 (複数行のまま)', r.body.rowCount);
+  r = await jp3('/api/inbound-plan/mails/' + errMail.id + '/convert');
+  ok(r.status === 400 && r.body.error.includes('解析エラー'), 'mail convert: errorメールは手動貼り付けを案内');
+
+  // 処理済み/無視
+  r = await jp3('/api/inbound-plan/mails/' + amcMail.id + '/status', { status: 'done' });
+  ok(r.body.ok, 'mail: 登録済みにする');
+  r = await jp3('/api/inbound-plan/mails/' + errMail.id + '/status', { status: 'ignored' });
+  ok(r.body.ok, 'mail: 無視');
+  r = await j('/api/inbound-plan/mails');
+  ok(r.body.ok && r.body.open.length === 1 && r.body.open[0].gmail_id === 'gm-bf-1' && r.body.recent.length === 2,
+    'mail: 一覧はnew/errorのみ (処理済みはrecentへ)', r.body.open.length);
+  delete process.env.PO_SHIPMENT_FAKE_DATA;
+
+  // 画面: メール取得UI配信
+  const inbHtml3 = await (await fetch(base + '/inbound')).text();
+  ok(inbHtml3.includes('ipFetch') && inbHtml3.includes('メールから取得') && inbHtml3.includes('renderIpResult'), '/inbound 📬メール取得UI');
+}
+
+// ═══ 全ページのインラインJS構文チェック (サーバtemplate literal内クライアントJSの括弧崩れ等を機械検出) ═══
+console.log('── ページ内スクリプトの構文チェック ──');
+{
+  for (const p of ['/', '/supplier/1', '/products', '/orders', '/admin', '/inbound', '/backorders']) {
+    const html = await (await fetch(base + p)).text();
+    const scripts = [...html.matchAll(/<script(?![^>]*src=)[^>]*>([\s\S]*?)<\/script>/gi)].map(m => m[1]);
+    let err = null;
+    for (const s of scripts) {
+      // new Function はテスト内での「構文コンパイルのみ」(呼び出さない)。対象は自サーバが生成したページで
+      // 外部入力は含まれない。実行はしないため副作用なし (構文エラー検出が目的)
+      try { new Function(s); } catch (e) { err = e.message + ' | ' + s.slice(0, 120); break; }
+    }
+    ok(!err && scripts.length > 0, `script構文OK: ${p} (${scripts.length}本)`, err);
+  }
+}
+
 server.close();
 console.log(`\n=== RESULT: pass=${pass} fail=${fail} ===`);
 process.exit(fail ? 1 : 0);
