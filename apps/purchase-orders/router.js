@@ -1253,13 +1253,18 @@ function convertShipmentItems(db, supplier, supplierName, items, skipped = []) {
   }
   const costByKey = new Map();
   const nameByKey = new Map();
+  const codeByKey = new Map(); // PML上の表記 (DWH投入時に小文字統一済み — 原表記は失われている)
   for (const r of loadPml().rows) {
     // 非数値の原価は null (=仕入単価空欄+costMissing)。Number()のNaNを貼り付けデータに漏らさない (Codex plan-R3 Medium)
     const c = r['原価'] == null || r['原価'] === '' ? null : Number(r['原価']);
     const key = normProductCode(r['商品コード']);
     costByKey.set(key, Number.isFinite(c) ? c : null);
     nameByKey.set(key, r['商品名'] || '');
+    codeByKey.set(key, String(r['商品コード']).trim());
   }
+  // NE本来の大小表記 (NE手動CSV取込で蓄積)。ロジザードはNE登録表記と大小まで一致しないと登録エラーのため最優先
+  const canonicalByKey = new Map(db.prepare('SELECT product_key, product_code FROM po_product_code_canonical').all()
+    .map(r => [r.product_key, r.product_code]));
   const okRows = [], unmatched = [], ambiguous = [], lines = [], qtyInvalid = [];
   let totalQty = 0, totalVendorQty = 0;
   for (const it of items) {
@@ -1290,7 +1295,10 @@ function convertShipmentItems(db, supplier, supplierName, items, skipped = []) {
     const cost = costByKey.get(hit.product_key);
     const row = {
       vendorCode: it.vendorCode, vendorName: it.vendorName || null, vendorQty: it.qty,
-      productCode: hit.product_code, productName: nameByKey.get(hit.product_key) || '',
+      // 商品コードの優先順: NE本来表記 (canonical) → PML表記 (小文字化済み) → 対応表の表記
+      productCode: canonicalByKey.get(hit.product_key) || codeByKey.get(hit.product_key) || hit.product_code,
+      productName: nameByKey.get(hit.product_key) || '',
+      caseVerified: canonicalByKey.has(hit.product_key), // NE本来表記で出力できたか
       qtyPerUnit: qpu, qty, cost: cost == null ? null : cost,
     };
     okRows.push(row);
@@ -1298,12 +1306,13 @@ function convertShipmentItems(db, supplier, supplierName, items, skipped = []) {
     totalQty += qty;
   }
   // ロジザード「入荷予定登録(Excel貼り付け)」の列: 商品ID / 入荷予定数 / 仕入単価 (原価不明は空欄=手作業時のiferror("")と同じ)。
-  // 商品IDは大文字で出力 — ロジザードは大文字小文字を区別し、小文字だと登録エラーになる (中原さん実測 2026-07-14)
-  const pasteText = okRows.map(r2 => `${r2.productCode.toUpperCase()}\t${r2.qty}\t${r2.cost == null ? '' : r2.cost}`).join('\n');
+  // 商品IDはNE商品マスタの表記どおり (ロジザードは大文字小文字を区別するため、NE登録の大小表記に一致させる。中原さん実測 2026-07-14)
+  const pasteText = okRows.map(r2 => `${r2.productCode}\t${r2.qty}\t${r2.cost == null ? '' : r2.cost}`).join('\n');
   return {
     ok: true, supplierName, supplierCode: supplier, // 仮登録は変換時の仕入先に固定する (Codex plan-R1 High)
     rows: okRows, lines, pasteText, totalQty, totalVendorQty, rowCount: okRows.length,
     costMissing: okRows.filter(r2 => r2.cost == null).map(r2 => r2.productCode),
+    caseUnverified: okRows.filter(r2 => !r2.caseVerified).map(r2 => r2.productCode), // NE本来表記が未蓄積 (小文字のまま出力)
     unmatched, ambiguous, skipped, qtyInvalid,
   };
 }
@@ -2028,6 +2037,9 @@ router.post('/api/ne-overlay/csv', upload.single('file'), (req, res) => {
         const ins = db.prepare(`INSERT OR REPLACE INTO po_ne_overlay_rows
           (product_key, product_code, 仕入先コード, 原価, 売価, 取扱区分, 発注ロット単位, 最終仕入日, 在庫数, 引当数, 発注残数)
           VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
+        // NE本来の大小表記を蓄積 (取込解除やoverlay置換では消えない)。ロジザード貼り付けの商品IDに使う
+        const insCanon = db.prepare(`INSERT INTO po_product_code_canonical (product_key, product_code, updated_at) VALUES (?,?,?)
+          ON CONFLICT(product_key) DO UPDATE SET product_code=excluded.product_code, updated_at=excluded.updated_at`);
         for (let i = 1; i < rows.length; i++) {
           const c = rows[i];
           const code = trimS(c[idx.product_code]);
@@ -2037,6 +2049,7 @@ router.post('/api/ne-overlay/csv', upload.single('file'), (req, res) => {
           const chuzan = numLoose(c[idx.発注残数]);
           if (zaiko == null) { errors.push(`行${i + 1} (${code}): 在庫数が数値ではありません`); continue; }
           if (chuzan == null) { errors.push(`行${i + 1} (${code}): 発注残数が数値ではありません`); continue; }
+          insCanon.run(normProductCode(code), code, now);
           ins.run(
             normProductCode(code), code,
             idx.仕入先コード != null ? (trimS(c[idx.仕入先コード]) || null) : null,
@@ -4302,10 +4315,15 @@ function renderIpResult(j, req) {
       h += '<div style="display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap">' +
         '<button class="pri" id="ipCopy">📋 貼り付けデータをコピー (商品ID/入荷予定数/仕入単価 ' + j.rowCount + '行)</button>' +
         '<button id="ipLogizard2">🚚 ロジザード入荷予定を開く</button>' +
-        '<span class="muted" style="font-size:11px">商品IDは大文字で出力 (ロジザードは大文字小文字を区別)</span>' +
+        '<span class="muted" style="font-size:11px">商品IDはNE商品マスタの表記どおりに出力 (ロジザードは大文字小文字を区別)</span>' +
         '<details style="flex-basis:100%"><summary class="muted" style="cursor:pointer;font-size:11px">コピーされる内容を表示</summary>' +
         '<textarea id="ipPaste" rows="5" style="width:100%;margin-top:4px" readonly>' + esc(j.pasteText) + '</textarea></details></div>';
       if (j.costMissing.length) h += '<div class="warn" style="margin-top:6px">⚠️ 原価不明で仕入単価が空欄: ' + esc(j.costMissing.join(', ')) + '</div>';
+      if ((j.caseUnverified || []).length) {
+        h += '<div class="warn" style="margin-top:6px">⚠️ ' + j.caseUnverified.length + '行はNE本来の大文字/小文字表記が未確認のため暫定表記で出力しています' +
+          ' (ロジザードで登録エラーになる場合があります)。<b>ダッシュボードの「📥 NE最新CSVを取込」を一度実行</b>すると全商品の表記が揃います: ' +
+          esc(j.caseUnverified.slice(0, 10).join(', ')) + (j.caseUnverified.length > 10 ? ' …' : '') + '</div>';
+      }
       if (j.qtyInvalid && j.qtyInvalid.length) h += '<div class="warn" style="margin-top:6px">⚠️ 入数換算が不正のため貼り付けから除外 ' + j.qtyInvalid.length + '行 — 表の橙色の行の入数を直して💾してください</div>';
       if (j.unmatched.length) {
         h += '<div class="warn" style="margin-top:8px"><b>❓ 対応表に無い先方番号 ' + j.unmatched.length + '件</b> (上の表の橙色の行。貼り付けデータには含まれていません) ' +
