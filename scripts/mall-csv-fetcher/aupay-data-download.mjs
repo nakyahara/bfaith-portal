@@ -247,7 +247,9 @@ async function fetchShopAnalytics(page, outcomes, failures) {
 
   // ジョブ計画
   const jobs = [];
-  const days = Math.min(Math.max(parseInt(process.env.ADATA_DAYS, 10) || 3, 1), 14);
+  // ADATA_DAYS=0 で日次をスキップ (月次バックフィルを回すとき、毎回の冗長な日次insertを避ける)
+  const daysRaw = parseInt(process.env.ADATA_DAYS, 10);
+  const days = Number.isInteger(daysRaw) ? Math.min(Math.max(daysRaw, 0), 14) : 3;
   for (let back = days; back >= 1; back--) {
     const d = daysAgoIso(back);
     jobs.push({ dm: 'D', label: `日次 ${d}`, from: d, to: d, types: DAILY_TYPES, prefixes: DAILY_PREFIXES,
@@ -273,6 +275,10 @@ async function fetchShopAnalytics(page, outcomes, failures) {
       expectMonths: monthsBetween(monthlyRange.from, monthlyRange.to),
       types: MONTHLY_TYPES, prefixes: MONTHLY_PREFIXES,
       params: { period: 'monthly', ymFrom: slashDate(monthlyRange.from), ymTo: slashDate(monthlyRange.to) } });
+  }
+  if (jobs.length === 0) {
+    console.log('  ジョブ計画: なし (ADATA_DAYS=0 かつ月次対象なし) — スキップ');
+    return;
   }
   console.log(`  ジョブ計画: ${jobs.map((j) => j.label).join(' / ')}`);
 
