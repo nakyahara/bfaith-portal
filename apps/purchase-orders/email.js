@@ -45,12 +45,16 @@ Email: info＠b-faith.biz
 URL: http://b-faith.biz
 。.。・.。゜+。。.。・.。゜+。。.。・.。゜+。。.。・.。゜+。。.。・.。*゜`;
 
+// 添付CSVの「発行担当者」列の既定 (既存GAS発注書の値。メール設定で変更可)
+export const DEFAULT_ISSUER = '中原　大輔';
+
 export function emailSettings() {
   return {
     mode: getSetting('email_mode') || 'dry_run',
     dryrunTo: getSetting('email_dryrun_to') || '',
     subjectTpl: getSetting('email_subject_template') || DEFAULT_SUBJECT_TPL,
     bodyTpl: getSetting('email_body_template') || DEFAULT_BODY_TPL,
+    issuerName: getSetting('email_issuer_name') || DEFAULT_ISSUER,
     envReady: !!(process.env.PO_EMAIL_FAKE || (process.env.PO_GMAIL_CLIENT_ID && process.env.PO_GMAIL_CLIENT_SECRET && process.env.PO_GMAIL_REFRESH_TOKEN)),
   };
 }
@@ -113,34 +117,54 @@ export function buildOrderEmail(orderId) {
     .all(order.supplier_code).map(r => [r.product_key, r.vendor_code]));
   const vendorColUsed = vmap.size > 0;
   const missingVendorCodes = [];
+  const st = emailSettings();
   // 明細単位の希望納期 (実在日のみ採用。不正値はメールに出さない、Codex R1 Low)
   const reqOf = it => (isYmd(String(it.requested_date || '')) ? it.requested_date : null);
   const noukiColUsed = items.some(it => reqOf(it));
-  const header = vendorColUsed ? ['商品コード', '先方管理番号', '商品名', '数量'] : ['商品コード', '商品名', '数量'];
-  if (noukiColUsed) header.push('希望納期');
-  const lines = [header.map(csvCell).join(',')];
-  let totalQty = 0, totalAmount = 0;
+  const distinctDates = [...new Set(items.map(reqOf))];
+  const commonNouki = noukiColUsed && distinctDates.length === 1 ? distinctDates[0] : null;
+  // 商品ごとに納期が異なる (一部のみ指定含む) ときだけ9列目「希望納期」を追加。全明細同一ならヘッダ備考に記載
+  const perItemNouki = noukiColUsed && !commonNouki;
+
+  // ── 添付CSV: 「いつもの発注書」フォーマット (既存GAS/NE発注書CSVと同一列構成。中原さん指定 2026-07-13) ──
+  //   Header,発注伝票番号,発注日,仕入先名,発行担当者, ,合計金額,備考
+  //    ,PO-2026-0044,2026-07-13,アメージングクラフト様,中原　大輔, ,1341960.00,(全明細同一の希望納期)
+  //   --,--,--,--,--,--,--,--
+  //   発注区分,商品コード,商品名,商品option,発注単価,発注数,小計,備考(=先方管理番号。旧GASのH列追記と同じ)
+  const money = v => Number(v).toFixed(2);
+  const issuedJst = order.issued_at ? new Date(Date.parse(order.issued_at) + 9 * 3600000).toISOString().slice(0, 10) : jstToday();
+  let totalQty = 0, totalAmount = 0, csvTotal = 0;
+  const detail = [];
   for (const it of items) {
     totalQty += it.qty;
-    totalAmount += it.unit_cost != null ? Math.round(it.unit_cost * it.qty) : 0;
-    const cells = vendorColUsed
-      ? [it.product_code, (vmap.get(it.product_key) || ''), it.product_name || '', it.qty]
-      : [it.product_code, it.product_name || '', it.qty];
-    if (vendorColUsed && !vmap.get(it.product_key)) missingVendorCodes.push(it.product_code);
-    if (noukiColUsed) cells.push(reqOf(it) ? String(reqOf(it)).replace(/-/g, '/') : '');
-    lines.push(cells.map(csvCell).join(','));
+    if (it.unit_cost != null) { totalAmount += Math.round(it.unit_cost * it.qty); csvTotal += it.unit_cost * it.qty; }
+    const vendor = vmap.get(it.product_key) || '';
+    if (vendorColUsed && !vendor) missingVendorCodes.push(it.product_code);
+    const cells = ['通常', it.product_code, it.product_name || '', '',
+      it.unit_cost == null ? '' : money(it.unit_cost), it.qty,
+      it.unit_cost == null ? '' : money(it.unit_cost * it.qty), vendor];
+    if (perItemNouki) cells.push(reqOf(it) ? String(reqOf(it)).replace(/-/g, '/') : '');
+    detail.push(cells.map(csvCell).join(','));
   }
+  const detailHead = ['発注区分', '商品コード', '商品名', '商品option', '発注単価', '発注数', '小計', '備考'];
+  if (perItemNouki) detailHead.push('希望納期');
+  const lines = [
+    ['Header', '発注伝票番号', '発注日', '仕入先名', '発行担当者', ' ', '合計金額', '備考'].map(csvCell).join(','),
+    [' ', order.po_number || `#${order.id}`, issuedJst, sup.name, st.issuerName, ' ', money(csvTotal),
+      commonNouki ? `希望納期: ${String(commonNouki).replace(/-/g, '/')}` : ''].map(csvCell).join(','),
+    '--,--,--,--,--,--,--,--', // 区切り行 (固定文字列。csvCellを通すと先頭 - が数式対策の ' 付きに化けるため直書き)
+    detailHead.map(csvCell).join(','),
+    ...detail,
+  ];
   const csvText = lines.join('\r\n');
   // CP932変換不能文字の検出 (黙って ? に化けるとプレビューと実添付が食い違う、Codex P15-R1 M10)
   if (iconv.decode(iconv.encode(csvText, 'cp932'), 'cp932') !== csvText) {
     const bad = [...new Set([...csvText].filter(ch => iconv.decode(iconv.encode(ch, 'cp932'), 'cp932') !== ch))].slice(0, 10);
     throw new Error(`添付CSVにShift-JISへ変換できない文字があります: ${bad.join(' ')} — 商品名等を確認してください`);
   }
-  const st = emailSettings();
   // 本文の希望納期: 全明細が同じ日付ならその日付、商品ごとに異なる/一部のみ指定なら添付CSVの列を案内、全て未指定なら「指定なし」
-  const distinctDates = [...new Set(items.map(reqOf))];
   const noukiText = !noukiColUsed ? '指定なし'
-    : (distinctDates.length === 1 && distinctDates[0] ? fmtNouki(distinctDates[0]) : '商品ごとに指定しています (添付ファイルの「希望納期」列をご確認ください)');
+    : (commonNouki ? fmtNouki(commonNouki) : '商品ごとに指定しています (添付ファイルの「希望納期」列をご確認ください)');
   const data = {
     date: jstToday(), name: sup.name, contact: ensureSama(sup.contact_name), po_number: order.po_number || `#${order.id}`,
     nouki: noukiText,

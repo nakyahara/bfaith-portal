@@ -847,7 +847,8 @@ router.post('/api/email/settings', (req, res) => {
     // 全項目を1txnで適用 (途中の検証失敗で部分反映しない、Codex P15-R10 Medium)
     getDB().transaction(() => {
       for (const [key, val] of [['email_dryrun_to', b.dryrunTo],
-        ['email_subject_template', b.subjectTpl], ['email_body_template', b.bodyTpl]]) {
+        ['email_subject_template', b.subjectTpl], ['email_body_template', b.bodyTpl],
+        ['email_issuer_name', b.issuerName]]) {
         if (val == null) continue;
         setSetting(key, String(val), { actor, reason: 'メール設定画面から変更' });
         changed.push(key);
@@ -4378,6 +4379,7 @@ router.get('/admin', (req, res) => {
         <span id="emLiveWrap" style="display:none">確認 <input id="emLiveConfirm" placeholder="LIVE と入力" style="width:100px"></span>
         <button class="ghost" id="emModeApply">モード切替を適用</button>
         <label>dry-run宛先 <input type="text" id="emDryTo" placeholder="自分のメールアドレス" style="width:220px"></label>
+        <label>発行担当者 <input type="text" id="emIssuer" placeholder="発注書CSVに載る名前" style="width:140px"></label>
         <span id="emEnv" class="muted"></span>
         <button class="ghost" id="emTplToggle">テンプレ編集</button>
         <button class="pri" id="emSave">宛先/テンプレを保存</button>
@@ -4775,6 +4777,7 @@ function emLoad() {
     if (!j.ok) return;
     document.getElementById('emMode').value = j.mode;
     document.getElementById('emDryTo').value = j.dryrunTo;
+    document.getElementById('emIssuer').value = j.issuerName || '';
     document.getElementById('emSubject').value = j.subjectTpl;
     document.getElementById('emBody').value = j.bodyTpl;
     document.getElementById('emEnv').textContent = j.envReady ? 'Gmail env: 🟢設定済' : 'Gmail env: ⚠️未設定 (Renderに PO_GMAIL_CLIENT_ID/SECRET/REFRESH_TOKEN)';
@@ -4810,6 +4813,7 @@ document.getElementById('emSave').addEventListener('click', function() {
   var btn = this; btn.disabled = true;
   fetch(API_EM + '/email/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ dryrunTo: document.getElementById('emDryTo').value,
+      issuerName: document.getElementById('emIssuer').value,
       subjectTpl: document.getElementById('emSubject').value, bodyTpl: document.getElementById('emBody').value }) })
     .then(function(r){ return r.json(); }).then(function(j) {
       btn.disabled = false;

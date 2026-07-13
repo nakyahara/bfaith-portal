@@ -1120,12 +1120,34 @@ console.log('── P15: メール送信 (fake transport) ──');
   r = await jsonPost('/api/email/settings', { dryrunTo: 'me@b-faith.biz' });
   ok(r.body.ok && r.body.dryrunTo === 'me@b-faith.biz' && r.body.mode === 'dry_run', 'メール設定保存 (既定dry_run)');
 
-  // preview: テンプレ変数・担当者様・先方管理番号列
+  // preview: テンプレ変数・担当者様・添付CSVは「いつもの発注書」フォーマット (GAS/NE発注書互換、中原さん指定 2026-07-13)
   r = await j('/api/orders/' + emOrderId + '/email/preview');
   ok(r.body.ok && r.body.subject.includes('【発注書】') && r.body.subject.includes('アメージングクラフト'), 'preview: 件名テンプレ (GAS互換)', r.body.subject);
   ok(r.body.body.startsWith('田中様'), 'preview: 担当者に様を自動付与');
-  ok(r.body.vendorColUsed && r.body.csvText.includes('先方管理番号') && r.body.csvText.includes('AMC-001'), 'preview: 添付CSVに先方管理番号列', r.body.csvText.split('\r\n')[0]);
+  {
+    const cl = r.body.csvText.split('\r\n');
+    ok(cl[0] === 'Header,発注伝票番号,発注日,仕入先名,発行担当者, ,合計金額,備考', 'preview: CSV Header行 (発注書フォーマット)', cl[0]);
+    const h1 = cl[1].split(',');
+    ok(/^PO-\d{4}-\d{4}$/.test(h1[1]) && /^\d{4}-\d{2}-\d{2}$/.test(h1[2]) && h1[3].includes('アメージングクラフト') && h1[4] === '中原　大輔',
+      'preview: 伝票情報行 (PO番号/発注日/仕入先/発行担当者)', cl[1]);
+    ok(/^\d+\.\d{2}$/.test(h1[6]), 'preview: 合計金額は小数2桁', h1[6]);
+    ok(cl[2] === '--,--,--,--,--,--,--,--', 'preview: 区切り行 (--×8)');
+    ok(cl[3] === '発注区分,商品コード,商品名,商品option,発注単価,発注数,小計,備考', 'preview: 明細ヘッダ8列', cl[3]);
+    const d1 = cl[4].split(',');
+    ok(d1[0] === '通常' && d1[1] === 'noflyersticker' && /^\d+\.\d{2}$/.test(d1[4]) && /^\d+\.\d{2}$/.test(d1[6]),
+      'preview: 明細行 (通常/コード/単価・小計2桁)', cl[4]);
+    ok(r.body.vendorColUsed && d1[7] === 'AMC-001', 'preview: 先方管理番号は備考列 (旧GASのH列追記と同じ)', d1[7]);
+    ok(cl[1].includes('希望納期: 2026/07/30'), 'preview: 全明細同一納期はヘッダ備考に記載', cl[1]);
+  }
   ok(r.body.body.includes('希望納期：2026年7月30日'), 'preview: 本文に希望納期 ({{nouki}})', r.body.body.split('\n').find(l => l.includes('希望納期')));
+
+  // 発行担当者はメール設定で変更できる (既定=中原　大輔)
+  r = await jsonPost('/api/email/settings', { issuerName: 'テスト担当' });
+  ok(r.body.ok && r.body.issuerName === 'テスト担当', 'メール設定: 発行担当者を変更');
+  r = await j('/api/orders/' + emOrderId + '/email/preview');
+  ok(r.body.csvText.split('\r\n')[1].split(',')[4] === 'テスト担当', 'preview: 発行担当者がCSVに反映');
+  r = await jsonPost('/api/email/settings', { issuerName: '' });
+  ok(r.body.ok && r.body.issuerName === '中原　大輔', 'メール設定: 空にすると既定に戻る');
 
   // 希望納期なしの発注 → 「指定なし」。カスタムテンプレに {{nouki}} が無い場合は末尾に追記される
   {
@@ -1157,10 +1179,12 @@ console.log('── P15: メール送信 (fake transport) ──');
     ok(its[0].requested_date === '2026-08-10' && its[1].requested_date === '2026-08-20', 'issue: 明細単位の希望納期を保存');
     r = await j('/api/orders/' + mixedId + '/email/preview');
     ok(r.body.ok && r.body.body.includes('商品ごとに指定'), 'preview: 混在納期は個別案内', r.body.body.split('\n').find(l => l.includes('希望納期')));
-    ok(r.body.csvText.includes('希望納期') && r.body.csvText.includes('2026/08/10') && r.body.csvText.includes('2026/08/20'), 'preview: 添付CSVに希望納期列', r.body.csvText.split('\r\n')[0]);
-    // 納期なしの発注 (noDateId 相当) のCSVには希望納期列を追加しない
+    ok(r.body.csvText.includes('備考,希望納期') && r.body.csvText.includes('2026/08/10') && r.body.csvText.includes('2026/08/20'),
+      'preview: 納期混在は9列目「希望納期」を追加', r.body.csvText.split('\r\n')[3]);
+    // 全明細同一納期 → 9列目は追加せずヘッダ備考に記載 (いつもの8列を保つ)
     r = await j('/api/orders/' + emOrderId + '/email/preview');
-    ok(r.body.ok && r.body.csvText.includes('希望納期') && r.body.csvText.includes('2026/07/30'), 'preview: 全明細同一納期でもCSVに列あり+本文は日付', r.body.csvText.split('\r\n')[1]);
+    ok(r.body.ok && !r.body.csvText.includes('備考,希望納期') && r.body.csvText.includes('希望納期: 2026/07/30'),
+      'preview: 全明細同一納期は8列のままヘッダ備考へ', r.body.csvText.split('\r\n')[1]);
     // 明細納期が不正なら400
     r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 1, requestedDate: '2026/08/10' }] }) });
