@@ -1297,8 +1297,9 @@ function convertShipmentItems(db, supplier, supplierName, items, skipped = []) {
     lines.push({ type: 'ok', ...row });
     totalQty += qty;
   }
-  // ロジザード「入荷予定登録(Excel貼り付け)」の列: 商品ID / 入荷予定数 / 仕入単価 (原価不明は空欄=手作業時のiferror("")と同じ)
-  const pasteText = okRows.map(r2 => `${r2.productCode}\t${r2.qty}\t${r2.cost == null ? '' : r2.cost}`).join('\n');
+  // ロジザード「入荷予定登録(Excel貼り付け)」の列: 商品ID / 入荷予定数 / 仕入単価 (原価不明は空欄=手作業時のiferror("")と同じ)。
+  // 商品IDは大文字で出力 — ロジザードは大文字小文字を区別し、小文字だと登録エラーになる (中原さん実測 2026-07-14)
+  const pasteText = okRows.map(r2 => `${r2.productCode.toUpperCase()}\t${r2.qty}\t${r2.cost == null ? '' : r2.cost}`).join('\n');
   return {
     ok: true, supplierName, supplierCode: supplier, // 仮登録は変換時の仕入先に固定する (Codex plan-R1 High)
     rows: okRows, lines, pasteText, totalQty, totalVendorQty, rowCount: okRows.length,
@@ -4079,7 +4080,8 @@ getJson(API + '/masters/suppliers').then(function(j) {
 // 受信日時を日本時間で表示 (Gmail internalDate はUTC ISO保存のため、そのまま切り出すと朝のメールが前日に見える)。
 // 入力はUTC ISOのみ受理 (Date.parseの寛容な解釈で不正値を日付に化けさせない)
 function jstStamp(iso) {
-  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/.test(String(iso || ''))) return '—';
+  // 注意: このスクリプトはサーバのtemplate literal内 — 正規表現のバックスラッシュは \\ でエスケープ必須 (\d と書くと d に化ける)
+  if (!/^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,3})?Z$/.test(String(iso || ''))) return '—';
   var t = Date.parse(iso);
   if (!isFinite(t)) return '—';
   return new Date(t + 32400000).toISOString().slice(0, 16).replace('T', ' ');
@@ -4300,6 +4302,7 @@ function renderIpResult(j, req) {
       h += '<div style="display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap">' +
         '<button class="pri" id="ipCopy">📋 貼り付けデータをコピー (商品ID/入荷予定数/仕入単価 ' + j.rowCount + '行)</button>' +
         '<button id="ipLogizard2">🚚 ロジザード入荷予定を開く</button>' +
+        '<span class="muted" style="font-size:11px">商品IDは大文字で出力 (ロジザードは大文字小文字を区別)</span>' +
         '<details style="flex-basis:100%"><summary class="muted" style="cursor:pointer;font-size:11px">コピーされる内容を表示</summary>' +
         '<textarea id="ipPaste" rows="5" style="width:100%;margin-top:4px" readonly>' + esc(j.pasteText) + '</textarea></details></div>';
       if (j.costMissing.length) h += '<div class="warn" style="margin-top:6px">⚠️ 原価不明で仕入単価が空欄: ' + esc(j.costMissing.join(', ')) + '</div>';

@@ -1962,7 +1962,7 @@ console.log('── 入荷予定変換 (inbound-plan) + 仮登録 (pending) ─�
     'BADLINE-NO-QTY\t数量なし行\t\t\t\t\n';
   r = await jp2('/api/inbound-plan/convert', { supplier_code: '0001', text: shipText });
   ok(r.body.ok && r.body.rowCount === 1 && r.body.totalQty === 1600, 'convert: 対応表逆引きで変換 (カンマ数量/見出し行/0000列を処理)', r.body);
-  ok(r.body.pasteText === 'noflyersticker\t1600\t70', 'convert: 貼り付けデータ=商品ID/入荷予定数/仕入単価(PML原価)', r.body.pasteText);
+  ok(r.body.pasteText === 'NOFLYERSTICKER\t1600\t70', 'convert: 貼り付けデータ=商品ID(大文字)/入荷予定数/仕入単価(PML原価)', r.body.pasteText);
   ok(r.body.unmatched.length === 1 && r.body.unmatched[0].vendorCode === 'ZZZ-NEW-1' && r.body.unmatched[0].vendorName === '新商品X',
     'convert: 対応表に無い番号はunmatched (先方商品名付き)', r.body.unmatched);
   ok(r.body.skipped.length === 1, 'convert: 数量が読めない行はskipped');
@@ -2053,7 +2053,7 @@ console.log('── 入荷予定変換 (inbound-plan) + 仮登録 (pending) ─�
       'AUKATZ-06-N2\tヘルスウォーター にゃんマグ 白系\t30\n';
     r = await jp2('/api/inbound-plan/convert', { supplier_code: '2', text: mailText });
     ok(r.body.ok && r.body.rowCount === 2 && r.body.totalQty === 78, 'BEFREE: メール表の貼り付けを変換 (同一商品の複数行は複数行のまま=手作業と同じ)', r.body);
-    ok(r.body.pasteText.split('\n').every(l => l.startsWith('gyoumuhandcream60-BI\t')), 'BEFREE: 貼り付けデータ2行', r.body.pasteText);
+    ok(r.body.pasteText.split('\n').every(l => l.startsWith('GYOUMUHANDCREAM60-BI\t')), 'BEFREE: 貼り付けデータ2行 (商品ID大文字)', r.body.pasteText);
     ok(r.body.unmatched.length === 1 && r.body.unmatched[0].vendorCode === 'AUKATZ-06-N2', 'BEFREE: 未知の番号はunmatched');
     ok(r.body.skipped.length === 2, 'BEFREE: 見出し外の行 (【…】/送り状No) はスキップ', r.body.skipped);
   }
@@ -2064,7 +2064,7 @@ console.log('── 入荷予定変換 (inbound-plan) + 仮登録 (pending) ─�
     ok(r.body.ok && r.body.qtyPerUnit === 24, '入数の登録 (noflyersticker=24)');
     r = await jp2('/api/inbound-plan/convert', { supplier_code: '1', text: 'AMC-001\tﾁﾗｼ\t2\n' });
     ok(r.body.ok && r.body.rows[0].vendorQty === 2 && r.body.rows[0].qtyPerUnit === 24 && r.body.rows[0].qty === 48 &&
-      r.body.pasteText.startsWith('noflyersticker\t48\t') && r.body.totalQty === 48, '入数換算: 先方2×24=48が貼り付けに反映', r.body.pasteText);
+      r.body.pasteText.startsWith('NOFLYERSTICKER\t48\t') && r.body.totalQty === 48, '入数換算: 先方2×24=48が貼り付けに反映', r.body.pasteText);
     ok(r.body.lines && r.body.lines[0].type === 'ok' && r.body.lines[0].productName !== undefined && r.body.totalVendorQty === 2,
       'lines: 左=仕入先/右=弊社の表示用データ');
     r = await jp2('/api/inbound-plan/convert', { supplier_code: '1', text: 'ZZZ-UNKNOWN-9\t新しいやつ\t5\n' });
@@ -2313,7 +2313,7 @@ console.log('── 出荷明細メール自動取得 (fetch-mails) ──');
   // メール変換 = 手動貼り付けと同じ応答 (AMC-001→noflyersticker、未知番号はunmatched)
   r = await jp3('/api/inbound-plan/mails/' + amcMail.id + '/convert');
   ok(r.body.ok && r.body.mailId === amcMail.id && r.body.rowCount === 1 && r.body.totalQty === 25 &&
-    r.body.pasteText.startsWith('noflyersticker\t25\t') && r.body.unmatched.length === 1 && r.body.unmatched[0].vendorCode === 'ZZZ-MAIL-NEW',
+    r.body.pasteText.startsWith('NOFLYERSTICKER\t25\t') && r.body.unmatched.length === 1 && r.body.unmatched[0].vendorCode === 'ZZZ-MAIL-NEW',
     'mail convert: AMCメールを変換 (マッチ1+unmatched1)', r.body.pasteText);
   r = await jp3('/api/inbound-plan/mails/' + bfMail.id + '/convert');
   ok(r.body.ok && r.body.rowCount === 2 && r.body.totalQty === 78, 'mail convert: ビーフリーメールを変換 (複数行のまま)', r.body.rowCount);
@@ -2389,6 +2389,15 @@ console.log('── 出荷明細メール自動取得 (fetch-mails) ──');
   ok(planHtml.includes('解析エラー'), '/inbound-plan エラー理由の表示');
   ok(planHtml.includes('jstStamp') && planHtml.includes('日本時間'), '/inbound-plan 受信日時をJST表示');
   ok(planHtml.includes('出荷明細ではないと判定した'), '/inbound-plan 対象外メールの確認セクション');
+  // 配信されたクライアントコードの jstStamp を実行検証 (template literal内の \d が d に化ける事故の検出。本番で全行「—」になった実障害)
+  {
+    const mFn = planHtml.match(/function jstStamp\(iso\) \{[\s\S]*?\n\}/);
+    ok(!!mFn, '/inbound-plan jstStamp関数を配信');
+    const jstFn = new Function(mFn[0] + '; return jstStamp;')();
+    ok(jstFn('2026-07-13T08:59:00.000Z') === '2026-07-13 17:59', 'jstStamp: UTC→JST変換 (08:59 UTC=17:59 JST)', jstFn('2026-07-13T08:59:00.000Z'));
+    ok(jstFn('2026-07-13T16:00:00.000Z') === '2026-07-14 01:00', 'jstStamp: 日跨ぎ (UTC 16時→JST 翌1時)');
+    ok(jstFn(null) === '—' && jstFn('0') === '—' && jstFn('2026-07-13') === '—', 'jstStamp: null/不正値は—');
+  }
   const dashNav = await (await fetch(base + '/')).text();
   ok(dashNav.includes('入荷予定') && dashNav.includes('/apps/purchase-orders/inbound-plan'), 'ナビに入荷予定タブ');
 }
