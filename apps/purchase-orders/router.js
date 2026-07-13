@@ -3843,7 +3843,8 @@ function emailPanel(orderId, errBanner) {
   getJson(API + '/orders/' + orderId + '/email/preview').then(function(j) {
     if (!j.ok) { area.innerHTML = '<div class="warn">📧 送信できません: ' + esc(j.error) + '</div>'; return; }
     var dry = j.mode !== 'live';
-    var eb = typeof errBanner === 'string' ? { head: '❌ メールは送信されていません', detail: errBanner } : errBanner;
+    // 文字列引数は受け付けない ({head, detail}のみ)。「未送信」断定文言は failed 確定経路だけが使う不変条件を守る (Codex vendor-R5 Low)
+    var eb = (errBanner && errBanner.head) ? errBanner : null;
     if (!eb) {
       var latestJob = (j.jobs || [])[0];
       if (latestJob && latestJob.status === 'failed') {
