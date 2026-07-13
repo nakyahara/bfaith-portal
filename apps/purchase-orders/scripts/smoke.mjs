@@ -1876,11 +1876,22 @@ console.log('── 注残SSoT (正本ビュー/GAS endpoint差替/商品管理�
   const csvLine = csvTxt.split('\r\n').find(l => l.startsWith('noflyersticker,'));
   ok(csvLine && csvLine.split(',')[11] === String(ledgerZan.backorder_qty), 'SSoT: 商品管理リストCSVの注残数=台帳値', csvLine && csvLine.split(',')[11]);
 
-  // 緊急ロールバック: backorder_source='ne' でGAS/リストはNE由来値に戻る
+  // 緊急ロールバック: backorder_source='ne' でGAS/商品管理リストの両経路がNE由来値に戻る
   setL2('backorder_source', 'ne', { actor: 'smoke', reason: 'テスト' });
   const gasNe = await (await fetch(siteBase + '/apps/warehouse-mirror/api/pml/published', { headers: { 'x-read-token': 'smoke-pml-token' } })).json();
   const gasNeRow = gasNe.rows.find(r => r.商品コード === 'noflyersticker');
-  ok(gasNe.backorder_source === 'ne_legacy' && gasNeRow.注残数 === 999, 'SSoT: ロールバック時はNE由来値 (999) に戻る');
+  ok(gasNe.backorder_source === 'ne_legacy' && gasNeRow.注残数 === 999, 'SSoT: ロールバック時GASはNE由来値 (999) に戻る');
+  {
+    const canonicalNe = gasNe.rows.map(r2 => gasNe.columns.map(c => r2[c] == null ? '' : String(r2[c])).join('\t')).join('\n');
+    ok(createHash('sha256').update(canonicalNe).digest('hex') === gasNe.payload_checksum, 'SSoT: ロールバック時もchecksum一致 (Codex SSoT-R1 Low)');
+  }
+  const pmlNeHtml = await (await fetch(siteBase + '/apps/product-management-list/')).text();
+  ok(pmlNeHtml.includes('緊急ロールバック中'), 'SSoT: ロールバック時はリスト画面にNE由来警告');
+  {
+    const csvNe = iconv.decode(Buffer.from(await (await fetch(siteBase + '/apps/product-management-list/export.csv')).arrayBuffer()), 'Shift_JIS');
+    const lineNe = csvNe.split('\r\n').find(l => l.startsWith('noflyersticker,'));
+    ok(lineNe && lineNe.split(',')[11] === '999', 'SSoT: ロールバック時はリストCSVもNE由来値 (999)', lineNe && lineNe.split(',')[11]);
+  }
   setL2('backorder_source', 'app', { actor: 'smoke', reason: 'テスト戻し' });
 
   // 整合性検査: 台帳注残がPML商品にJOINできないと警告
@@ -1897,31 +1908,42 @@ console.log('── 注残SSoT (正本ビュー/GAS endpoint差替/商品管理�
   // 静的契約テスト: 許可リスト外のコードが mirror_pml_snapshot_rows の注残数を直接参照していないこと
   // (docs/contracts/pml_backorder_authority.contract.md。将来のアプリ/AIが誤って古いNE注残を読む事故の防波堤)
   {
+    // 許可はできるだけファイル単位 (ディレクトリ丸ごと除外は miniPC側の apps/warehouse のみ、Codex SSoT-R1 Medium)
     const ALLOW = [
-      'apps/warehouse/',              // miniPC側 (raw/snapshot生成元)
-      'apps/warehouse-mirror/',       // ingest検証+GAS endpoint差替の実装そのもの
-      'apps/purchase-orders/db.js',   // 正本ビュー定義
-      'apps/purchase-orders/logic.js',// NEオーバーレイ/override実装
-      'apps/product-management-list/router.js', // ロールバックfallback
-      'apps/purchase-orders/scripts/', // テスト自身
+      'apps/warehouse/',                          // miniPC側 (raw/snapshot生成元。Render配信対象外)
+      'apps/warehouse-mirror/db.js',              // mirror DDL (契約コメントの置き場)
+      'apps/warehouse-mirror/router.js',          // ingest検証+GAS endpoint差替の実装そのもの
+      'apps/purchase-orders/db.js',               // 正本ビュー定義
+      'apps/purchase-orders/logic.js',            // NEオーバーレイ/override実装
+      'apps/product-management-list/router.js',   // ロールバックfallback
+      'apps/purchase-orders/scripts/',            // テスト自身
     ];
+    const scanOne = p => {
+      // コメント行 (// や * 始まり) は除外して実コードだけを検査する
+      const src = fs.readFileSync(p, 'utf8').split('\n')
+        .filter(l => { const t = l.trim(); return !t.startsWith('//') && !t.startsWith('*') && !t.startsWith('/*'); })
+        .join('\n');
+      return src.includes('mirror_pml_snapshot_rows') && /注残数|発注残数/.test(src);
+    };
     const offenders = [];
     const walk = dir => {
       for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
         const p = path.join(dir, ent.name);
         if (ent.isDirectory()) { if (ent.name !== 'node_modules') walk(p); continue; }
-        if (!ent.name.endsWith('.js') && !ent.name.endsWith('.mjs')) continue;
+        if (!/\.(js|mjs|cjs)$/.test(ent.name)) continue;
         const rel = path.relative(WORK, p).replace(/\\/g, '/');
         if (ALLOW.some(a => rel.startsWith(a))) continue;
-        // コメント行 (// や * 始まり) は除外して実コードだけを検査する
-        const src = fs.readFileSync(p, 'utf8').split('\n')
-          .filter(l => { const t = l.trim(); return !t.startsWith('//') && !t.startsWith('*') && !t.startsWith('/*'); })
-          .join('\n');
-        if (src.includes('mirror_pml_snapshot_rows') && /注残数|発注残数/.test(src)) offenders.push(rel);
+        if (scanOne(p)) offenders.push(rel);
       }
     };
     walk(path.join(WORK, 'apps'));
     ok(offenders.length === 0, '契約: mirror_pml_snapshot_rows の注残数を直接参照するコードなし (許可リスト外)', offenders);
+    // 検出器の自己テスト: 違反fixtureを一時作成して確実にFAIL側へ倒れることを確認 (ガード自身の回帰防止)
+    const fixture = path.join(WORK, 'apps', '_smoke_contract_fixture.js');
+    try {
+      fs.writeFileSync(fixture, "const q = db.prepare('SELECT 注残数 FROM mirror_pml_snapshot_rows');\n");
+      ok(scanOne(fixture) === true, '契約: 検出器は違反コードを検出できる (自己テスト)');
+    } finally { try { fs.unlinkSync(fixture); } catch {} }
   }
 }
 

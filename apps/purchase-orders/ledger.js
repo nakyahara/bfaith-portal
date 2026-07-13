@@ -715,7 +715,12 @@ export function checkLedgerIntegrity({ orderId = null } = {}) {
             AND lower(trim(p.商品コード)) = l.product_key)`).all()) {
         warnings.push({ kind: 'backorder_not_in_pml', productKey: r.product_key, detail: `台帳注残${r.backorder_qty}がPML商品に見つからない (商品コード改廃?)` });
       }
-    } catch { /* mirror未同期環境では検査しない */ }
+    } catch (e) {
+      // 握り潰すのは「テーブル/ビュー未作成」(mirror未同期環境) だけ。それ以外 (列名変更・SQL破損等) は
+      // 監視クエリ自体の故障として issues に出す (静かに監視が消えるのを防ぐ、Codex SSoT-R1 Medium)
+      if (/no such (table|view)/i.test(String(e.message))) { /* mirror未同期環境では検査しない */ }
+      else issues.push({ kind: 'integrity_check_broken', detail: `backorder_not_in_pml 検査が実行できません: ${e.message}` });
+    }
   }
   return { issues, warnings };
 }
