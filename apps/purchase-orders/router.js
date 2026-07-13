@@ -3835,13 +3835,17 @@ function emPreviewModal(j) {
   document.addEventListener('keydown', esck);
 }
 
-function emailPanel(orderId) {
+function emailPanel(orderId, errBanner) {
   var area = document.getElementById('emailArea-' + orderId);
   area.innerHTML = '<div class="muted">読み込み中…</div>';
   getJson(API + '/orders/' + orderId + '/email/preview').then(function(j) {
     if (!j.ok) { area.innerHTML = '<div class="warn">📧 送信できません: ' + esc(j.error) + '</div>'; return; }
     var dry = j.mode !== 'live';
-    var h = '<div class="import-zone" style="margin-top:6px"><b>📧 発注書メール</b> ' +
+    var h = '<div class="import-zone" style="margin-top:6px">' +
+      (errBanner
+        ? '<div style="background:#fef2f2;border:2px solid #dc2626;color:#991b1b;border-radius:10px;padding:10px 14px;margin-bottom:8px;font-weight:600;font-size:14px">❌ メールは送信されていません<div style="font-weight:400;font-size:12px;margin-top:4px">' + esc(errBanner) + '</div></div>'
+        : '') +
+      '<b>📧 発注書メール</b> ' +
       (dry ? '<span class="badge b-draft" title="宛先を社内アドレスに差し替えて送ります。本番切替はマスタ管理→メール設定">🔒 dry-run中 → ' + esc(j.dryrunTo || '未設定') + '</span>'
            : '<span class="badge b-issued">本番送信 (live)</span>') +
       (!j.envReady ? ' <span class="warn" style="display:inline-block;padding:2px 6px">⚠️ Gmail env未設定 (送信不可)</span>' : '') +
@@ -3892,6 +3896,11 @@ function emailPanel(orderId) {
       var msg = dry
         ? 'dry-run送信します (宛先は ' + (j.dryrunTo || '未設定') + ' に差し替え)' + when + '。よろしいですか?'
         : '⚠️ 本番送信です。仕入先 ' + j.to.join(', ') + ' に発注書が届きます' + when + '。送信しますか?';
+      // 先方管理番号の未登録は送信を止めない (中原さん決定 2026-07-13)。確認ダイアログで気づけるようにだけする
+      if (j.missingVendorCodes.length) {
+        msg += '\\n\\n⚠️ 先方管理番号が未登録の商品が ' + j.missingVendorCodes.length + '件あります (' +
+          j.missingVendorCodes.slice(0, 5).join(', ') + (j.missingVendorCodes.length > 5 ? ' …' : '') + ')。\\n添付の備考欄は空欄のまま送られます (あとで対応表タブから登録できます)。';
+      }
       if (!confirm(msg)) return;
       var btn = document.getElementById('emGo-' + orderId);
       if (btn) btn.disabled = true;
@@ -3900,11 +3909,22 @@ function emailPanel(orderId) {
           expectedMode: j.mode }, idemKey)
         .then(function(r2) {
           if (btn) btn.disabled = false;
-          if (!r2.ok) { toast('エラー: ' + r2.error); emailPanel(orderId); return; }
+          if (!r2.ok) {
+            // 送信できなかったことを見逃させない (トーストだけでは気づけなかった、中原さん報告 2026-07-13)
+            alert('❌ メールは送信されていません\\n\\n理由: ' + (r2.error || '不明なエラー'));
+            emailPanel(orderId, r2.error || '不明なエラー');
+            return;
+          }
           toast(r2.status === 'sent' ? '送信しました' + (r2.replay ? ' (前回分を再表示・二重送信なし)' : '') :
             r2.status === 'scheduled' ? '予約しました (' + (r2.scheduledAt ? new Date(new Date(r2.scheduledAt).getTime() + 9 * 3600000).toISOString().slice(0, 16).replace('T', ' ') + ' JST' : '') + ')' :
             r2.status === 'unknown' ? '⚠️ 送信結果が不明です。「照合」で確認してください' :
             '送信失敗: ' + (r2.error || ''));
+          if (r2.status === 'failed' || r2.status === 'unknown') {
+            emailPanel(orderId, r2.status === 'unknown'
+              ? '送信結果が不明です (Gmailへの到達が確認できません)。下の履歴の「照合」ボタンで確認してください'
+              : '送信に失敗しました: ' + (r2.error || ''));
+            return;
+          }
           emailPanel(orderId);
         }).catch(onWriteErr(btn));
     }
@@ -4118,8 +4138,10 @@ document.addEventListener('click', function(ev) {
     t.disabled = true;
     var emOrder = g('data-emorder');
     post(API + '/email-jobs/' + v + '/retry', {}).then(function(j) {
-      toast(j.ok ? (j.status === 'sent' ? '送信しました' : '送信失敗: ' + (j.error || '')) : 'エラー: ' + j.error);
-      emailPanel(emOrder);
+      var failMsg = !j.ok ? j.error : (j.status === 'sent' ? null : '送信失敗: ' + (j.error || ''));
+      if (failMsg) alert('❌ メールは送信されていません\\n\\n理由: ' + failMsg);
+      else toast('送信しました');
+      emailPanel(emOrder, failMsg || undefined);
     }).catch(onWriteErr(t));
     return;
   }
