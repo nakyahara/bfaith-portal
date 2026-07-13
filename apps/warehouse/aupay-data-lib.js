@@ -240,9 +240,13 @@ function parsePreambleRange(rows, headerIdx) {
 /**
  * セグメント×年月日型の共通パーサ。metricsMap = [{col, key, fn}]
  * keyExtra: 行から追加キー列 (channel/keyword/lot_number等) を取る関数 (null=行スキップ)
+ * pkExtra: PKの追加キー列名 (dupGuard/mergeDupes 用)
+ * mergeDupes: trim正規化でキーが衝突した行を指標合算でマージ (検索KWの末尾全角スペース等。
+ *   実機で発覚 2026-07-13: 「ハッカ油」と「ハッカ油　」が別行で来る)。指標が加算可能な型のみtrue
  */
 function prepareSegmentDated(name, rows, headerIdx, {
   baseType, label, hasSegment = true, metrics, keyExtra = null, extraCols = null,
+  pkExtra = [], mergeDupes = false,
 }) {
   const header = rows[headerIdx].map(trimS);
   const c = { date: colIndex(header, '年月日') };
@@ -293,6 +297,31 @@ function prepareSegmentDated(name, rows, headerIdx, {
   if (records.length === 0) return { name, ok: false, type: baseType, error: 'データ行が0件' };
   const type = `${baseType}_${grain}`;
 
+  // PK重複の扱い: mergeDupes=指標合算 (加算可能な型のみ) / それ以外=明示エラー
+  const pkCols = ['date_jst', ...(hasSegment ? ['segment_code'] : []), ...pkExtra];
+  const keyOf = (r) => pkCols.map(k => r[k]).join('|');
+  {
+    const byKey = new Map();
+    let merged = 0;
+    for (const r of records) {
+      const k = keyOf(r);
+      const prev = byKey.get(k);
+      if (!prev) { byKey.set(k, r); continue; }
+      if (!mergeDupes) {
+        return { name, ok: false, type, error: `ファイル内で${pkCols.join('×')}が重複: ${k}` };
+      }
+      for (const [, mk] of metrics.map(([, key]) => [null, key])) {
+        if (typeof r[mk] === 'number') prev[mk] = (prev[mk] ?? 0) + r[mk];
+      }
+      merged++;
+    }
+    if (merged > 0) {
+      warnings.push(`trim正規化でキーが衝突した ${merged}行を指標合算でマージ (例: 末尾全角スペース違いのKW)`);
+      records.length = 0;
+      records.push(...byKey.values());
+    }
+  }
+
   const dates = [...new Set(records.map(r => r.date_jst))].sort();
   // 前文range と実データの突合 (範囲逸脱 = サーバ側クランプ/仕様変更の検知)
   if (preamble) {
@@ -314,7 +343,7 @@ function prepareSegmentDated(name, rows, headerIdx, {
 // ─── 各レシピ ───
 function prepareSales(name, rows, headerIdx) {
   return prepareSegmentDated(name, rows, headerIdx, {
-    baseType: 'aupay_sales', label: '売上分析',
+    baseType: 'aupay_sales', label: '売上分析', pkExtra: [],
     metrics: [
       ['売上高', 'sales_yen', yenOrNull],
       ['利用店舗原資クーポン', 'coupon_store_yen', yenOrNull],
@@ -341,7 +370,7 @@ function prepareSales(name, rows, headerIdx) {
 
 function prepareReferer(name, rows, headerIdx) {
   return prepareSegmentDated(name, rows, headerIdx, {
-    baseType: 'aupay_referer', label: '参照元分析',
+    baseType: 'aupay_referer', label: '参照元分析', pkExtra: ['channel'],
     extraCols: { channel: '参照元チャネル' },
     keyExtra: (r, e) => {
       const ch = trimS(r[e.channel]);
@@ -362,7 +391,7 @@ function prepareReferer(name, rows, headerIdx) {
 
 function prepareSearch(name, rows, headerIdx) {
   return prepareSegmentDated(name, rows, headerIdx, {
-    baseType: 'aupay_search', label: '検索分析 (流入KW)',
+    baseType: 'aupay_search', label: '検索分析 (流入KW)', pkExtra: ['keyword'], mergeDupes: true,
     extraCols: { kw: '流入キーワード名' },
     keyExtra: (r, e) => {
       const kw = trimS(r[e.kw]);
@@ -377,7 +406,7 @@ function prepareSearch(name, rows, headerIdx) {
 
 function preparePage(name, rows, headerIdx) {
   return prepareSegmentDated(name, rows, headerIdx, {
-    baseType: 'aupay_page', label: 'ページ分析', hasSegment: false,
+    baseType: 'aupay_page', label: 'ページ分析', hasSegment: false, pkExtra: ['page_url'],
     extraCols: { url: 'ページURL' },
     keyExtra: (r, e) => {
       const u = trimS(r[e.url]);
@@ -395,7 +424,7 @@ function preparePage(name, rows, headerIdx) {
 
 function prepareProduct(name, rows, headerIdx) {
   return prepareSegmentDated(name, rows, headerIdx, {
-    baseType: 'aupay_product', label: '商品分析',
+    baseType: 'aupay_product', label: '商品分析', pkExtra: ['lot_number'],
     extraCols: { lot: 'ロットナンバー', pname: '商品名', cat: '商品カテゴリ' },
     keyExtra: (r, e) => {
       const lot = trimS(r[e.lot]);

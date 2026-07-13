@@ -148,6 +148,38 @@ console.log('=== 5. 検索分析 (流入KW) ===');
   check('KW2行', n === 2, `got ${n}`);
 }
 
+console.log('=== 5b. 検索分析のtrim衝突キーは指標合算マージ (実機2020/06のハッカ油) ===');
+{
+  const header = ['顧客セグメント名', '年月日', '流入キーワード名', '来訪回数', '訪問者(UU)'];
+  const csv = sjis([
+    '"抽出年月：2020/06～2020/06"', '"抽出条件："', '""',
+    q(header),
+    q(['全顧客', '2020/06', 'ハッカ油', '42', '36']),
+    q(['全顧客', '2020/06', 'ハッカ油　', '1', '1']), // 末尾全角スペース → trimで同一キーに
+    q(['全顧客', '2020/06', 'アロマ', '5', '5']),
+  ].join(CRLF));
+  const r = importAupayFile(db, { name: 'aupay_search_M_d2020-06-01_x.csv', buffer: csv, sha256: sha(csv), source: 'test' });
+  check('取込ok', r.status === 'ok', JSON.stringify(r.results).slice(0, 200));
+  check('マージwarning付与', (r.results[0].warnings || []).some((w) => /マージ/.test(w)), JSON.stringify(r.results[0].warnings));
+  const row = db.prepare(`SELECT * FROM fact_aupay_search_monthly WHERE date_jst='2020-06-01' AND keyword='ハッカ油'`).get();
+  check('指標が合算される (42+1)', row?.visits === 43 && row?.visitor_uu === 37, JSON.stringify(row));
+  const n = db.prepare(`SELECT COUNT(*) n FROM fact_aupay_search_monthly WHERE date_jst='2020-06-01'`).get().n;
+  check('2キーワードに集約', n === 2, `got ${n}`);
+}
+
+console.log('=== 5c. マージ対象外の型はPK重複=明示エラー ===');
+{
+  const header = ['年月日', 'ページURL', 'PV数', '購入回数', '経由購入回数(経由CV)', '直帰率', '離脱率'];
+  const csv = sjis([
+    '"抽出年月日：2026/07/09～2026/07/09"', '""',
+    q(header),
+    q(['2026/07/09', 'https://wowma.jp/x', '7', '0', '2', '0', '0']),
+    q(['2026/07/09', 'https://wowma.jp/x ', '1', '0', '0', '0', '0']),
+  ].join(CRLF));
+  const p = prepareAupayFile('aupay_page_D_d2026-07-09_dup.csv', csv);
+  check('page重複は明示エラー (UNIQUE制約より前に検出)', !p.ok && /重複/.test(p.error), p.ok ? 'ok?' : p.error);
+}
+
 console.log('=== 6. ページ分析 (セグメントなし) ===');
 {
   const header = ['年月日', 'ページURL', 'PV数', '購入回数', '経由購入回数(経由CV)', '直帰率', '離脱率'];
