@@ -1951,6 +1951,70 @@ console.log('── 注残SSoT (正本ビュー/GAS endpoint差替/商品管理�
   }
 }
 
+// ═══ ロジザード入荷予定の作成 (出荷明細変換) + 未紐付け先方番号の仮登録 ═══
+console.log('── 入荷予定変換 (inbound-plan) + 仮登録 (pending) ──');
+{
+  const jp2 = (p, body) => j(p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  // AMC出荷明細フォーマット (見出し行+備考/倉庫コード0000列あり) をそのまま貼り付け
+  const shipText = '商品コード\t商品名\t出荷数量\t備考\t倉庫コード\t摘要\n' +
+    'AMC-001\tﾁﾗｼ ｽﾃｯｶｰ\t1,600\t\t0000\t\n' +
+    'ZZZ-NEW-1\t新商品X\t50\t\t0000\t\n' +
+    'BADLINE-NO-QTY\t数量なし行\t\t\t\t\n';
+  r = await jp2('/api/inbound-plan/convert', { supplier_code: '0001', text: shipText });
+  ok(r.body.ok && r.body.rowCount === 1 && r.body.totalQty === 1600, 'convert: 対応表逆引きで変換 (カンマ数量/見出し行/0000列を処理)', r.body);
+  ok(r.body.pasteText === 'noflyersticker\t1600\t70', 'convert: 貼り付けデータ=商品ID/入荷予定数/仕入単価(PML原価)', r.body.pasteText);
+  ok(r.body.unmatched.length === 1 && r.body.unmatched[0].vendorCode === 'ZZZ-NEW-1' && r.body.unmatched[0].vendorName === '新商品X',
+    'convert: 対応表に無い番号はunmatched (先方商品名付き)', r.body.unmatched);
+  ok(r.body.skipped.length === 1, 'convert: 数量が読めない行はskipped');
+
+  // 仮登録 (再実行は refreshed)
+  r = await jp2('/api/vendor-map/pending', { supplier_code: '1', items: r.body.unmatched });
+  ok(r.body.ok && r.body.added === 1, 'pending: 仮登録', r.body);
+  r = await jp2('/api/vendor-map/pending', { supplier_code: '1', items: [{ vendorCode: 'ZZZ-NEW-1', vendorName: '新商品X', qty: 60 }] });
+  ok(r.body.ok && r.body.refreshed === 1 && r.body.added === 0, 'pending: 再登録はrefreshed (UNIQUE upsert)');
+  r = await j('/api/vendor-map/pending?supplier=0001');
+  const pend1 = r.body.rows.find(x => x.vendor_code === 'ZZZ-NEW-1');
+  ok(pend1 && pend1.vendor_name === '新商品X' && pend1.last_qty === 60, 'pending: 一覧に載る (直近数量更新)', pend1);
+
+  // 紐づけ: PMLに無い商品/他仕入先はエラー、正しい商品で対応表へ昇格
+  r = await jp2('/api/vendor-map/pending/' + pend1.id + '/link', { product_code: 'not-in-pml-zzz' });
+  ok(r.status === 400 && r.body.error.includes('商品マスタに無い'), 'pending link: PMLに無い商品は拒否 (NE登録翌朝を案内)', r.body.error);
+  r = await jp2('/api/vendor-map/pending/' + pend1.id + '/link', { product_code: 'gyoumuhandcream60-BI' });
+  ok(r.status === 400 && r.body.error.includes('仕入先'), 'pending link: 他仕入先の商品は拒否');
+  r = await jp2('/api/vendor-map/pending/' + pend1.id + '/link', { product_code: 'cardstand-silver-r' });
+  ok(r.body.ok === true, 'pending link: 紐づけ成功');
+  const mapRow = db.prepare("SELECT * FROM po_vendor_code_map WHERE supplier_code='1' AND product_key='cardstand-silver-r'").get();
+  ok(mapRow && mapRow.vendor_code === 'ZZZ-NEW-1', 'pending link: 対応表へ昇格', mapRow && mapRow.vendor_code);
+  ok(db.prepare('SELECT status, linked_product_code FROM po_vendor_code_pending WHERE id=?').get(pend1.id).status === 'linked', 'pending link: status=linked');
+  r = await jp2('/api/vendor-map/pending/' + pend1.id + '/link', { product_code: 'cardstand-silver-r' });
+  ok(r.status === 400 && r.body.error.includes('処理済み'), 'pending link: 二重処理は拒否');
+
+  // 紐づけ後の再変換: 同じ出荷明細が全行マッチ
+  r = await jp2('/api/inbound-plan/convert', { supplier_code: '1', text: shipText });
+  ok(r.body.ok && r.body.rowCount === 2 && r.body.unmatched.length === 0, 'convert: 紐づけ後は全行マッチ (E2E)', r.body.rowCount);
+
+  // 破棄
+  r = await jp2('/api/vendor-map/pending', { supplier_code: '1', items: [{ vendorCode: 'ZZZ-MISTAKE', qty: 1 }] });
+  r = await j('/api/vendor-map/pending?supplier=1');
+  const pend2 = r.body.rows.find(x => x.vendor_code === 'ZZZ-MISTAKE');
+  r = await jp2('/api/vendor-map/pending/' + pend2.id + '/dismiss', {});
+  ok(r.body.ok, 'pending: 破棄');
+  r = await j('/api/vendor-map/pending?supplier=1');
+  ok(!r.body.rows.some(x => x.vendor_code === 'ZZZ-MISTAKE'), 'pending: 破棄後は一覧に出ない');
+
+  // 同じ先方番号が複数商品に対応 → ambiguous (黙ってどちらかに変換しない)
+  db.prepare("INSERT INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, updated_at) VALUES ('1','0726-001060','0726-001060','ZZZ-NEW-1',?)").run(nowIsoStr());
+  r = await jp2('/api/inbound-plan/convert', { supplier_code: '1', text: 'ZZZ-NEW-1\t新商品X\t10\n' });
+  ok(r.body.ok && r.body.ambiguous.length === 1 && r.body.rowCount === 0, 'convert: 逆引き曖昧はambiguous (変換しない)', r.body.ambiguous);
+  db.prepare("DELETE FROM po_vendor_code_map WHERE supplier_code='1' AND product_key='0726-001060'").run();
+
+  // 画面配信
+  const inbHtml2 = await (await fetch(base + '/inbound')).text();
+  ok(inbHtml2.includes('ロジザード入荷予定の作成') && inbHtml2.includes('ipConvert'), '/inbound 入荷予定作成セクション');
+  const adminHtml3 = await (await fetch(base + '/admin')).text();
+  ok(adminHtml3.includes('loadVmapPending') && adminHtml3.includes('未紐付けの先方番号'), '/admin 対応表タブに仮登録リスト');
+}
+
 server.close();
 console.log(`\n=== RESULT: pass=${pass} fail=${fail} ===`);
 process.exit(fail ? 1 : 0);

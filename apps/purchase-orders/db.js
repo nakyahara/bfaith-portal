@@ -570,6 +570,22 @@ function initLedgerSchema(db) {
     PRIMARY KEY (supplier_code, product_key)
   )`);
 
+  // 未紐付けの先方管理番号 (仮登録)。出荷明細→ロジザード入荷予定変換で対応表に無い番号が出たとき
+  // ここに置いておき、後日 (NE登録→翌朝PML反映後) 商品と紐づけて対応表へ昇格する (中原さん要望 2026-07-13)
+  db.exec(`CREATE TABLE IF NOT EXISTS po_vendor_code_pending (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    supplier_code TEXT NOT NULL,
+    vendor_code   TEXT NOT NULL,
+    vendor_name   TEXT,               -- 出荷明細に載っていた先方の商品名 (紐づけ時のヒント)
+    last_qty      INTEGER,            -- 直近に出荷明細で見た数量 (参考)
+    memo          TEXT,
+    status        TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','linked','dismissed')),
+    linked_product_code TEXT,         -- linked時の弊社商品コード
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    UNIQUE (supplier_code, vendor_code)
+  )`);
+
   // メール送信ジョブ (outbox方式。txn内でGmail APIを呼ばない。delivery_key で二重送信の確率を構造的に低減:
   // 送信前に sending をcommit → Message-IDヘッダ+本文に埋込 → lease切れ再送前にGmail照合、不明時は自動再送しない)
   db.exec(`CREATE TABLE IF NOT EXISTS po_email_jobs (
