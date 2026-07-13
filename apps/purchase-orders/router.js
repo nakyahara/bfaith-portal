@@ -1208,7 +1208,9 @@ router.post('/api/inbound-plan/convert', (req, res) => {
     }
     const costByKey = new Map();
     for (const r of loadPml().rows) {
-      costByKey.set(normProductCode(r['商品コード']), r['原価'] == null || r['原価'] === '' ? null : Number(r['原価']));
+      // 非数値の原価は null (=仕入単価空欄+costMissing)。Number()のNaNを貼り付けデータに漏らさない (Codex plan-R3 Medium)
+      const c = r['原価'] == null || r['原価'] === '' ? null : Number(r['原価']);
+      costByKey.set(normProductCode(r['商品コード']), Number.isFinite(c) ? c : null);
     }
     const okRows = [], unmatched = [], ambiguous = [];
     let totalQty = 0;

@@ -2028,6 +2028,26 @@ console.log('── 入荷予定変換 (inbound-plan) + 仮登録 (pending) ─�
   ok(r.body.ok && !r.body.warning, 'entry: 重複解消後は警告なし');
   db.prepare("DELETE FROM po_vendor_code_map WHERE supplier_code='1' AND product_key='0726-001060'").run();
 
+  // 非ASCIIの大小文字違いも同一番号として拒否 (JS正規化統一の検証、Codex plan-R3 Low)
+  db.prepare("INSERT INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, updated_at) VALUES ('1','0726-001060','0726-001060','ÄBC-1',?)").run(nowIsoStr());
+  r = await jp2('/api/vendor-map/pending', { supplier_code: '1', items: [{ vendorCode: 'äbc-1', qty: 1 }] });
+  r = await j('/api/vendor-map/pending?supplier=1');
+  const pendUml = r.body.rows.find(x => x.vendor_code === 'äbc-1');
+  r = await jp2('/api/vendor-map/pending/' + pendUml.id + '/link', { product_code: 'noflyersticker' });
+  ok(r.status === 400 && r.body.error.includes('既に商品'), 'pending link: 非ASCII大小文字違いも同一番号として拒否', r.body.error);
+  r = await jp2('/api/vendor-map/pending/' + pendUml.id + '/dismiss', {});
+  db.prepare("DELETE FROM po_vendor_code_map WHERE supplier_code='1' AND product_key='0726-001060'").run();
+
+  // CSV取込の重複警告 (同じ先方番号を複数商品に。ブロックせず警告列挙)
+  {
+    const csvDup = iconv.encode('"仕入先管理番号","x","弊社管理番号"\r\n"BF-X","","prod-a"\r\n"bf-x","","prod-b"', 'Shift_JIS');
+    const fd2 = new FormData();
+    fd2.append('supplier_code', '2');
+    fd2.append('file', new Blob([csvDup]), 'dup.csv');
+    r = await j('/api/vendor-map/csv', { method: 'POST', body: fd2 });
+    ok(r.body.ok && (r.body.warnings || []).some(w => w.includes('複数商品')), 'vendor-map CSV: 同番号の複数商品は警告列挙', r.body.warnings);
+  }
+
   // 画面配信
   const inbHtml2 = await (await fetch(base + '/inbound')).text();
   ok(inbHtml2.includes('ロジザード入荷予定の作成') && inbHtml2.includes('ipConvert'), '/inbound 入荷予定作成セクション');
