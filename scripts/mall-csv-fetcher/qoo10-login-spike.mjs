@@ -97,9 +97,37 @@ async function looksLoggedIn(page) {
 async function runManualSetup(context) {
   const page = context.pages()[0] || await context.newPage();
   console.log('=== 手動セットアップモード (QSM) ===');
-  console.log('開いたブラウザでログインし、QSM管理画面トップまで入れたら閉じてください。\n');
+  console.log('開いたブラウザで 本ID/PW → reCAPTCHA → サブID を通し、QSM管理画面トップまで入ってください。');
+  console.log('ログイン完了を自動検知して storageState を保存します (session cookie込み)。保存後は閉じてOK。\n');
   await page.goto(QSM_TOP_URL, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
-  await page.waitForTimeout(15 * 60 * 1000).catch(() => {});
+  // ログイン完了 (login.aspx を抜ける) をポーリング検知 → storageState保存。最大15分待つ
+  const statePath = join(__dirname, '.qoo10-state.json');
+  let saved = false;
+  for (let i = 0; i < 180; i++) {
+    await page.waitForTimeout(5000).catch(() => {});
+    const url = page.url();
+    if (!/login\.aspx/i.test(url) && /qsm\.qoo10\.jp/.test(host(url))) {
+      // 認証 session cookie が乗ったか確認してから保存
+      const cookies = await context.cookies('https://qsm.qoo10.jp').catch(() => []);
+      const hasAuth = cookies.some((c) => c.name === 'ASP.NET_SessionId');
+      if (hasAuth) {
+        // indexedDB込みで保存 (認証主体がcookieだけとは限らない — Codex R2案2)。
+        // 古いPlaywrightで indexedDB オプション非対応なら通常保存にフォールバック
+        try {
+          await context.storageState({ path: statePath, indexedDB: true });
+        } catch {
+          await context.storageState({ path: statePath });
+        }
+        console.log(`\n  ✅ ログイン完了を検知。storageState を保存しました: ${statePath}`);
+        console.log('  session cookie (ASP.NET_SessionId) を含みます。ブラウザを閉じてください。');
+        saved = true;
+        // 保存後も数分開けておく (中原さんが目視で確認して閉じる)
+        await page.waitForTimeout(3 * 60 * 1000).catch(() => {});
+        break;
+      }
+    }
+  }
+  if (!saved) console.log('\n  ⚠️ 15分以内にログイン完了を検知できませんでした (storageState未保存)。もう一度お試しください。');
 }
 
 async function main() {
