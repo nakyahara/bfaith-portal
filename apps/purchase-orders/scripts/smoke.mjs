@@ -1296,12 +1296,20 @@ console.log('── P15: メール送信 (fake transport) ──');
   r = await jsonPost('/api/orders/' + emOrderId + '/email/send', { scheduledAt: '2026-02-30T10:00' }, 'em-key-7c');
   ok(r.status === 400 && r.body.error.includes('実在しない'), '実在しない予約日時 (2/30) は拒否');
 
-  // live時、対応表があるのに先方管理番号が無い商品は送信ブロック (Codex P15 R1 M5)
+  // live時、先方管理番号が未登録でも送信できる (中原さん決定 2026-07-13: ブロックせず警告のみ。旧Codex P15 R1 M5のブロックは撤回)
   r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ items: [{ code: 'cardstand-silver-r', qty: 2 }] }) });
-  const schedOrderId = r.body.id;
-  r = await jsonPost('/api/orders/' + schedOrderId + '/email/send', {}, 'em-key-vm');
-  ok(r.status === 400 && r.body.error.includes('先方管理番号'), 'live: 先方管理番号の欠落は送信ブロック', r.body.error);
+  const schedOrderId = r.body.id; // こちらは未送信のまま後続の予約テストで使う
+  {
+    r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: [{ code: 'cardstand-silver-r', qty: 3 }] }) });
+    const vmOpenId = r.body.id;
+    r = await j('/api/orders/' + vmOpenId + '/email/preview');
+    ok(r.body.ok && r.body.missingVendorCodes.includes('cardstand-silver-r'), 'preview: 先方番号未登録は警告情報として返す (ブロックしない)', r.body.missingVendorCodes);
+    ok(r.body.csvText.split('\r\n')[4].split(',')[7] === '', 'preview: 未登録商品の備考列は空欄');
+    r = await jsonPost('/api/orders/' + vmOpenId + '/email/send', {}, 'em-key-vm');
+    ok(r.body.ok && r.body.status === 'sent', 'live: 先方管理番号未登録でも送信できる (中原さん決定)', r.body);
+  }
 
   // unknown中は同一内容の新規通常送信もdedupが拒否 (状態機械の迂回不可、Codex P15 R3 High)
   {
@@ -1408,6 +1416,8 @@ console.log('── P15: メール送信 (fake transport) ──');
     const boHtml = await (await fetch(base + '/backorders')).text();
     ok(boHtml.includes('data-emailui') && boHtml.includes('DRYRUN') === false && boHtml.includes('emailPanel'), '/backorders 発注書メールパネル');
     ok(boHtml.includes('emPreviewModal') && boHtml.includes('送信内容をプレビュー') && boHtml.includes('pomodal'), '/backorders 送信内容ポップアッププレビュー');
+    ok(boHtml.includes('メールは送信されていません') && boHtml.includes('備考欄は空欄のまま送られます'),
+      '/backorders 送信失敗はalert+赤バナー / 先方番号未登録は確認ダイアログで警告');
   }
 }
 

@@ -3835,13 +3835,29 @@ function emPreviewModal(j) {
   document.addEventListener('keydown', esck);
 }
 
-function emailPanel(orderId) {
+// errBanner: {head, detail} または文字列 (文字列=未送信確定)。省略時は最新ジョブの failed/unknown から導出
+// (一時引数だけだと再読込で消えるため、失敗状態が解消するまでバナーが残る、Codex vendor-R1 補足)
+function emailPanel(orderId, errBanner) {
   var area = document.getElementById('emailArea-' + orderId);
   area.innerHTML = '<div class="muted">読み込み中…</div>';
   getJson(API + '/orders/' + orderId + '/email/preview').then(function(j) {
     if (!j.ok) { area.innerHTML = '<div class="warn">📧 送信できません: ' + esc(j.error) + '</div>'; return; }
     var dry = j.mode !== 'live';
-    var h = '<div class="import-zone" style="margin-top:6px"><b>📧 発注書メール</b> ' +
+    // 文字列引数は受け付けない ({head, detail}のみ)。「未送信」断定文言は failed 確定経路だけが使う不変条件を守る (Codex vendor-R5 Low)
+    var eb = (errBanner && errBanner.head) ? errBanner : null;
+    if (!eb) {
+      var latestJob = (j.jobs || [])[0];
+      if (latestJob && latestJob.status === 'failed') {
+        eb = { head: '❌ 直近の送信は失敗しています (メールは届いていません)', detail: (latestJob.error || '') + ' — 下の履歴から「再試行」できます' };
+      } else if (latestJob && latestJob.status === 'unknown') {
+        eb = { head: '⚠️ 直近の送信結果が不明です', detail: 'Gmailへ届いたか未確認です。下の履歴の「照合」ボタンで確認してください (二重送信防止のため、確認せずに送り直さないでください)' };
+      }
+    }
+    var h = '<div class="import-zone" style="margin-top:6px">' +
+      (eb
+        ? '<div style="background:#fef2f2;border:2px solid #dc2626;color:#991b1b;border-radius:10px;padding:10px 14px;margin-bottom:8px;font-weight:600;font-size:14px">' + esc(eb.head) + '<div style="font-weight:400;font-size:12px;margin-top:4px">' + esc(eb.detail || '') + '</div></div>'
+        : '') +
+      '<b>📧 発注書メール</b> ' +
       (dry ? '<span class="badge b-draft" title="宛先を社内アドレスに差し替えて送ります。本番切替はマスタ管理→メール設定">🔒 dry-run中 → ' + esc(j.dryrunTo || '未設定') + '</span>'
            : '<span class="badge b-issued">本番送信 (live)</span>') +
       (!j.envReady ? ' <span class="warn" style="display:inline-block;padding:2px 6px">⚠️ Gmail env未設定 (送信不可)</span>' : '') +
@@ -3892,6 +3908,11 @@ function emailPanel(orderId) {
       var msg = dry
         ? 'dry-run送信します (宛先は ' + (j.dryrunTo || '未設定') + ' に差し替え)' + when + '。よろしいですか?'
         : '⚠️ 本番送信です。仕入先 ' + j.to.join(', ') + ' に発注書が届きます' + when + '。送信しますか?';
+      // 先方管理番号の未登録は送信を止めない (中原さん決定 2026-07-13)。確認ダイアログで気づけるようにだけする
+      if (j.missingVendorCodes.length) {
+        msg += '\\n\\n⚠️ 先方管理番号が未登録の商品が ' + j.missingVendorCodes.length + '件あります (' +
+          j.missingVendorCodes.slice(0, 5).join(', ') + (j.missingVendorCodes.length > 5 ? ' …' : '') + ')。\\n添付の備考欄は空欄のまま送られます (あとで対応表タブから登録できます)。';
+      }
       if (!confirm(msg)) return;
       var btn = document.getElementById('emGo-' + orderId);
       if (btn) btn.disabled = true;
@@ -3900,13 +3921,29 @@ function emailPanel(orderId) {
           expectedMode: j.mode }, idemKey)
         .then(function(r2) {
           if (btn) btn.disabled = false;
-          if (!r2.ok) { toast('エラー: ' + r2.error); emailPanel(orderId); return; }
-          toast(r2.status === 'sent' ? '送信しました' + (r2.replay ? ' (前回分を再表示・二重送信なし)' : '') :
-            r2.status === 'scheduled' ? '予約しました (' + (r2.scheduledAt ? new Date(new Date(r2.scheduledAt).getTime() + 9 * 3600000).toISOString().slice(0, 16).replace('T', ' ') + ' JST' : '') + ')' :
-            r2.status === 'unknown' ? '⚠️ 送信結果が不明です。「照合」で確認してください' :
-            '送信失敗: ' + (r2.error || ''));
-          emailPanel(orderId);
-        }).catch(onWriteErr(btn));
+          if (!r2.ok) {
+            // 送信できなかったことを見逃させない (トーストだけでは気づけなかった、中原さん報告 2026-07-13)。
+            // ただし !ok は「今回の要求が受け付けられなかった」だけで、既存ジョブが送信済み/送信中の場合もある
+            // (dedup拒否等) ため「未送信」とは断定しない (Codex vendor-R4 High)
+            alert('⚠️ 送信は受け付けられませんでした\\n\\n理由: ' + (r2.error || '不明なエラー') + '\\n\\n最新の送信状態は📧パネルの履歴で確認してください');
+            emailPanel(orderId, { head: '⚠️ 送信は受け付けられませんでした', detail: (r2.error || '不明なエラー') + ' — 最新の状態は下の履歴を確認してください' });
+            return;
+          }
+          if (r2.status === 'failed') {
+            alert('❌ メールは送信されていません\\n\\n理由: ' + (r2.error || '不明なエラー'));
+          } else if (r2.status === 'unknown') {
+            alert('⚠️ 送信結果が不明です\\n\\nGmailへ届いたか確認できませんでした。パネルの「照合」ボタンで確認してください (確認せずに送り直さないでください)');
+          } else {
+            toast(r2.status === 'sent' ? '送信しました' + (r2.replay ? ' (前回分を再表示・二重送信なし)' : '') :
+              r2.status === 'scheduled' ? '予約しました (' + (r2.scheduledAt ? new Date(new Date(r2.scheduledAt).getTime() + 9 * 3600000).toISOString().slice(0, 16).replace('T', ' ') + ' JST' : '') + ')' : '完了');
+          }
+          emailPanel(orderId); // failed/unknown のバナーは最新ジョブ状態から自動表示される
+        }).catch(function(e) {
+          // 通信断は「未送信」と断定できない (実際には送信済みの可能性あり、Codex vendor-R1 High-2)
+          if (btn) btn.disabled = false;
+          alert('⚠️ 送信結果を確認できません (通信エラー: ' + e.message + ')\\n\\n実際には送信されている可能性があります。パネルの「照合」で確認してください');
+          emailPanel(orderId, { head: '⚠️ 送信結果を確認できません (通信エラー)', detail: '実際には送信されている可能性があります。下の「照合」で確認してください。同じ内容の再送信は二重送信防止 (dedup) が守ります' });
+        });
     }
     var go = document.getElementById('emGo-' + orderId);
     if (go) go.addEventListener('click', function(){ doSend(false, null); });
@@ -4118,9 +4155,33 @@ document.addEventListener('click', function(ev) {
     t.disabled = true;
     var emOrder = g('data-emorder');
     post(API + '/email-jobs/' + v + '/retry', {}).then(function(j) {
-      toast(j.ok ? (j.status === 'sent' ? '送信しました' : '送信失敗: ' + (j.error || '')) : 'エラー: ' + j.error);
+      // unknown は「未送信」と断定しない (送信済みの可能性あり。誤案内は二重送信の元、Codex vendor-R2 High)
+      if (j.ok && j.status === 'unknown') {
+        alert('⚠️ 送信結果が不明です\\n\\nGmailへ届いたか確認できませんでした。パネルの「照合」ボタンで確認してください (確認せずに送り直さないでください)');
+        emailPanel(emOrder); // unknownバナーは最新ジョブ状態から導出される
+        return;
+      }
+      if (j.ok && j.status === 'sent') { toast('送信しました'); emailPanel(emOrder); return; }
+      if (j.ok && j.status === 'failed') {
+        // failed = サーバが確定拒否 (4xx) と判定した場合のみ = 未送信確定 (stale等はこの分岐に入れない、Codex vendor-R4 High)
+        alert('❌ メールは送信されていません\\n\\n理由: ' + (j.error || '送信失敗'));
+        emailPanel(emOrder);
+        return;
+      }
+      if (j.ok) {
+        // stale (世代競合=別画面が処理中/処理済み) 等の未認識状態。送信済みの可能性があるため断定しない
+        alert('⚠️ 送信結果を確認してください\\n\\n別の画面での操作と競合した可能性があります。最新の送信状態は履歴と「照合」で確認してください');
+        emailPanel(emOrder);
+        return;
+      }
+      // 受付自体の拒否 (別画面での操作との競合等)。実際の送信状態は不明なので未送信と断定しない (Codex vendor-R3)
+      alert('⚠️ 再試行できませんでした\\n\\n理由: ' + (j.error || '不明') + '\\n\\n最新の送信状態は下の履歴で確認してください');
       emailPanel(emOrder);
-    }).catch(onWriteErr(t));
+    }).catch(function(e) {
+      t.disabled = false;
+      alert('⚠️ 送信結果を確認できません (通信エラー: ' + e.message + ')\\n\\n実際には送信されている可能性があります。「照合」で確認してください');
+      emailPanel(emOrder, { head: '⚠️ 送信結果を確認できません (通信エラー)', detail: '実際には送信されている可能性があります。下の「照合」で確認してください' });
+    });
     return;
   }
   if ((v = g('data-emrec'))) {

@@ -221,10 +221,8 @@ export function createEmailJob(orderId, { resend = false, resendOfJobId = null, 
   if (!st.envReady) throw new Error('Gmail API のenv (PO_GMAIL_CLIENT_ID/SECRET/REFRESH_TOKEN) が未設定です。Renderの環境変数を設定してください');
   const p = buildOrderEmail(orderId);
   const dryRun = st.mode !== 'live';
-  // live送信で先方管理番号の欠落があれば止める (仕入先側の誤処理防止、Codex P15-R1 M5)
-  if (!dryRun && p.vendorColUsed && p.missingVendorCodes.length) {
-    throw new Error(`先方管理番号が未登録の商品があります (${p.missingVendorCodes.slice(0, 5).join(', ')}${p.missingVendorCodes.length > 5 ? ' …' : ''})。対応表を更新してから送信してください`);
-  }
+  // 先方管理番号の未登録はブロックしない (中原さん決定 2026-07-13: 未登録でも送ってよい。備考欄空欄のまま送る)。
+  // 送信前の確認ダイアログとプレビューの⚠️バッジで警告するのみ (旧仕様のliveブロックはP15 Codex R1 M5だったが実運用で撤回)
   const scheduleIso = parseScheduleAt(scheduledAt);
   let to = p.to, cc = p.cc, subject = p.subject, body = p.body;
   if (dryRun) {
