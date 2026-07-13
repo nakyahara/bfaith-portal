@@ -240,7 +240,7 @@ console.log('=== 11. 冪等 (sha256+論理日付の複合) ===');
   check('duplicateログ記録', before >= 1);
 }
 
-console.log('=== 12. UPSERT (再取込で置換・二重計上なし) ===');
+console.log('=== 12. scope置換 (再取込で入れ替え・二重計上なし・消えた行の残留なし) ===');
 {
   const v1 = salesCsv(['2026/07/12']);
   importAupayFile(db, { name: 'aupay_sales_D_d2026-07-12_v1.csv', buffer: v1, sha256: sha(v1), source: 'test' });
@@ -249,11 +249,30 @@ console.log('=== 12. UPSERT (再取込で置換・二重計上なし) ===');
   const v2 = sjis(v2raw);
   const r = importAupayFile(db, { name: 'aupay_sales_D_d2026-07-12_v2.csv', buffer: v2, sha256: sha(v2), source: 'test' });
   check('再取込ok', r.status === 'ok', JSON.stringify(r.results));
-  check('update計上', r.results[0].updated === 3 && r.results[0].inserted === 0, JSON.stringify(r.results[0]));
+  check('置換計上 (旧3行削除+3行insert)', r.results[0].updated === 3 && r.results[0].inserted === 3, JSON.stringify(r.results[0]));
   const row = db.prepare(`SELECT sales_yen FROM fact_aupay_sales_daily WHERE date_jst='2026-07-12' AND segment_code='all'`).get();
   check('値が置換される', row?.sales_yen === 30000, JSON.stringify(row));
   const n = db.prepare(`SELECT COUNT(*) n FROM fact_aupay_sales_daily WHERE date_jst='2026-07-12'`).get().n;
   check('行は増えない', n === 3, `got ${n}`);
+
+  // 補正版でディメンション行が消えた場合、残留しない (Codex 実装レビュー R1 High)
+  const PRH = ['顧客セグメント名', '年月日', '商品名', '商品カテゴリ', 'ロットナンバー', '売上高', '購入回数', '購入個数',
+    '平均購入個数', '平均購入単価', '利用店舗原資クーポン', '利用モール原資クーポン', '購入UU数', '来訪回数',
+    '来訪者数(UU)', 'PV数', 'CVR(訪問回数ベース)', 'CVR(UUベース)'];
+  const pv1 = sjis([
+    '"抽出年月日：2026/07/12～2026/07/12"', '""', q(PRH),
+    q(['全顧客', '2026/07/12', '商品A', 'カテゴリ', 'lotA', ...Array(13).fill('1')]),
+    q(['全顧客', '2026/07/12', '商品B', 'カテゴリ', 'lotB', ...Array(13).fill('1')]),
+  ].join(CRLF));
+  importAupayFile(db, { name: 'aupay_product_D_d2026-07-12_v1.csv', buffer: pv1, sha256: sha(pv1), source: 'test' });
+  const pv2 = sjis([
+    '"抽出年月日：2026/07/12～2026/07/12"', '""', q(PRH),
+    q(['全顧客', '2026/07/12', '商品A', 'カテゴリ', 'lotA', ...Array(13).fill('2')]),
+  ].join(CRLF));
+  const r2 = importAupayFile(db, { name: 'aupay_product_D_d2026-07-12_v2.csv', buffer: pv2, sha256: sha(pv2), source: 'test' });
+  check('補正版取込ok', r2.status === 'ok', JSON.stringify(r2.results));
+  const lots = db.prepare(`SELECT lot_number FROM fact_aupay_product_daily WHERE date_jst='2026-07-12'`).all().map((x) => x.lot_number);
+  check('消えたlotBが残留しない', lots.length === 1 && lots[0] === 'lotA', JSON.stringify(lots));
 }
 
 console.log('=== 13. ガード類 ===');

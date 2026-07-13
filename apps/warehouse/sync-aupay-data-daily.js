@@ -155,7 +155,9 @@ const ENTITIES = [
 ].map((e) => ({
   contractVersion: 1,
   scopeDates: (range) => (e.monthly ? enumerateScopeMonthStarts(range.from, range.to) : enumerateScopeDates(range.from, range.to)),
-  selectParams: (range) => [range.from, range.to],
+  // ⚠️月次entityのSELECTはscopeと同じ月初境界へ丸める。--days で from が月途中だと、
+  // clear対象 (from属する月の月初) の行を送らず mirror 側だけ削除してしまう (Codex R1 High)
+  selectParams: (range) => [e.monthly ? `${range.from.slice(0, 7)}-01` : range.from, range.to],
   dropCols: AUPAY_DROP_COLS,
   ...e,
 }));

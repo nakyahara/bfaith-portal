@@ -300,7 +300,11 @@ function prepareSegmentDated(name, rows, headerIdx, {
       return { name, ok: false, type, error: `抽出範囲 ${preamble.from}〜${preamble.to} 外の日付がデータに含まれる: ${out.slice(0, 3).join(', ')}` };
     }
   }
-  return { name, ok: true, type, label: `${label} (${grain === 'daily' ? '日次' : '月次'})`, records, warnings, dateFrom: dates[0], dateTo: dates[dates.length - 1] };
+  // scope置換範囲: 前文の抽出範囲が正 (補正版で消えたディメンション行を残さないため、
+  // 取込時に scope 内を DELETE→INSERT する — Codex 実装レビュー R1 High)
+  const scopeFrom = preamble ? preamble.from : dates[0];
+  const scopeTo = preamble ? preamble.to : dates[dates.length - 1];
+  return { name, ok: true, type, label: `${label} (${grain === 'daily' ? '日次' : '月次'})`, records, warnings, dateFrom: dates[0], dateTo: dates[dates.length - 1], scopeFrom, scopeTo };
 }
 
 // ─── 各レシピ ───
@@ -423,6 +427,16 @@ function prepareProduct(name, rows, headerIdx) {
  *   「リピート受注数合計」は格納せず検算に使う (合計不一致=パース欠落の検知)。
  */
 function prepareRepeatCohort(name, rows) {
+  // 前文の抽出年月 (scope置換範囲=起点月レンジ)。最初のマーカー行より前を走査
+  let preamble = null;
+  for (let pi = 0; pi < rows.length; pi++) {
+    if (/^\d{4}\/\d{1,2}起点$/.test(trimS(rows[pi][0]))) break;
+    const m = trimS(rows[pi][0]).match(/^抽出年月[:：]\s*(.+?)\s*[～〜]\s*(.+)$/);
+    if (m) {
+      const a = normalizeMonth(m[1]); const b = normalizeMonth(m[2]);
+      if (a && b) preamble = { from: `${a}-01`, to: `${b}-01` };
+    }
+  }
   const records = [];
   const warnings = [];
   const warned = new Set();
@@ -482,7 +496,14 @@ function prepareRepeatCohort(name, rows) {
   if (records.length === 0) return { name, ok: false, type: 'aupay_repeat_cohort_monthly', error: 'データ行が0件' };
   const d = dupGuard(name, 'aupay_repeat_cohort_monthly', records, (r) => `${r.date_jst}|${r.segment_code}|${r.target_month_jst}`, '起点×セグメント×対象月'); if (d) return d;
   const dates = [...new Set(records.map(r => r.date_jst))].sort();
-  return { name, ok: true, type: 'aupay_repeat_cohort_monthly', label: `リピート分析 (コホート、起点${blocks}ヶ月)`, records, warnings, dateFrom: dates[0], dateTo: dates[dates.length - 1] };
+  if (preamble) {
+    const out = dates.filter(dd => dd < preamble.from || dd > preamble.to);
+    if (out.length > 0) {
+      return { name, ok: false, type: 'aupay_repeat_cohort_monthly', error: `抽出範囲 ${preamble.from}〜${preamble.to} 外の起点月: ${out.slice(0, 3).join(', ')}` };
+    }
+  }
+  return { name, ok: true, type: 'aupay_repeat_cohort_monthly', label: `リピート分析 (コホート、起点${blocks}ヶ月)`, records, warnings, dateFrom: dates[0], dateTo: dates[dates.length - 1],
+    scopeFrom: preamble ? preamble.from : dates[0], scopeTo: preamble ? preamble.to : dates[dates.length - 1] };
 }
 
 /** PM日次レポート (UTF-8 BOM、GET ?format=csv&aggregate=daily)。日付=YYYY-MM-DD 固定 */
@@ -514,7 +535,9 @@ function preparePmAdDaily(name, rows, headerIdx) {
   if (records.length === 0) return { name, ok: false, type: 'aupay_pm_ad_daily', error: 'データ行が0件' };
   const d = dupGuard(name, 'aupay_pm_ad_daily', records, (r) => r.date_jst, '日付'); if (d) return d;
   const dates = records.map(r => r.date_jst).sort();
-  return { name, ok: true, type: 'aupay_pm_ad_daily', label: 'PM広告 日次レポート', records, dateFrom: dates[0], dateTo: dates[dates.length - 1] };
+  // PMレポートは前文なし+全日行が返る (0埋め) → scope=実データのmin/max
+  return { name, ok: true, type: 'aupay_pm_ad_daily', label: 'PM広告 日次レポート', records, dateFrom: dates[0], dateTo: dates[dates.length - 1],
+    scopeFrom: dates[0], scopeTo: dates[dates.length - 1] };
 }
 
 /** PM検索クエリ (fetcher が画面テーブルをスクレイプしたJSON):
@@ -540,7 +563,8 @@ function preparePmQueryJson(name, json) {
   }
   if (records.length === 0) return { name, ok: false, type: 'aupay_pm_query_weekly', error: 'データ行が0件' };
   const d = dupGuard(name, 'aupay_pm_query_weekly', records, (r) => r.keyword, 'キーワード'); if (d) return d;
-  return { name, ok: true, type: 'aupay_pm_query_weekly', label: `PM検索クエリ (週次、${records.length}語)`, records, dateFrom: weekStart, dateTo: weekStart };
+  return { name, ok: true, type: 'aupay_pm_query_weekly', label: `PM検索クエリ (週次、${records.length}語)`, records, dateFrom: weekStart, dateTo: weekStart,
+    scopeFrom: weekStart, scopeTo: weekStart };
 }
 
 // ─── 種別判別 + パース ───
@@ -611,29 +635,27 @@ export const AUPAY_DATA_TYPES = new Set(Object.keys(A_UPSERT_SPECS));
 function commitOne(db, logStmt, p, ctx) {
   const { importedAt, source, fileSha256 } = ctx;
   const spec = A_UPSERT_SPECS[p.type];
+  // ⭐scope置換 (DELETE→INSERT): ファイルが表す抽出範囲内を丸ごと入れ替える。
+  // UPSERTだけだと補正版で消えたディメンション行 (商品/KW/チャネル等) が永久残留する
+  // (Codex 実装レビュー R1 High)。scopeFrom/To は前文の抽出範囲が正
+  const warnings = [...(p.warnings || [])];
+  const del = db.prepare(`DELETE FROM ${spec.table} WHERE date_jst >= ? AND date_jst <= ?`)
+    .run(p.scopeFrom, p.scopeTo);
+  const scopeMsg = `scope置換 ${p.scopeFrom}〜${p.scopeTo} (旧${del.changes}行削除)`;
   const logInfo = logStmt.run(importedAt, source, p.name, fileSha256, p.type, p.dateFrom, p.dateTo, p.records.length, 0, 0, 'ok',
-    (p.warnings && p.warnings.length) ? p.warnings.join(' / ').slice(0, 500) : '');
+    [scopeMsg, ...warnings].join(' / ').slice(0, 500));
   const importId = logInfo.lastInsertRowid;
   const meta = { source_file: p.name.slice(0, 200), import_id: importId, imported_at: importedAt, updated_at: importedAt };
-  let inserted = 0, updated = 0;
-  const existsStmt = db.prepare(`SELECT 1 FROM ${spec.table} WHERE ${spec.pk.map(k => `${k}=@${k}`).join(' AND ')}`);
-  const upsert = db.prepare(`INSERT INTO ${spec.table}
+  const insert = db.prepare(`INSERT INTO ${spec.table}
     (${spec.cols.join(', ')}, source_file, import_id, imported_at, updated_at)
-    VALUES (${spec.cols.map(k => '@' + k).join(', ')}, @source_file, @import_id, @imported_at, @updated_at)
-    ON CONFLICT (${spec.pk.join(', ')}) DO UPDATE SET
-      ${spec.cols.filter(k => !spec.pk.includes(k)).map(k => `${k}=excluded.${k}`).join(', ')},
-      source_file=excluded.source_file, import_id=excluded.import_id,
-      imported_at=excluded.imported_at, updated_at=excluded.updated_at`);
-  for (const r of p.records) {
-    const pkVals = Object.fromEntries(spec.pk.map(k => [k, r[k]]));
-    const exists = existsStmt.get(pkVals);
-    upsert.run({ ...r, ...meta });
-    if (exists) updated++; else inserted++;
-  }
-  db.prepare(`UPDATE raw_aupay_data_import_log SET inserted=?, updated=? WHERE id=?`).run(inserted, updated, importId);
+    VALUES (${spec.cols.map(k => '@' + k).join(', ')}, @source_file, @import_id, @imported_at, @updated_at)`);
+  for (const r of p.records) insert.run({ ...r, ...meta });
+  const inserted = p.records.length;
+  const replaced = del.changes;
+  db.prepare(`UPDATE raw_aupay_data_import_log SET inserted=?, updated=? WHERE id=?`).run(inserted, replaced, importId);
   return {
-    file: p.name, ok: true, type: p.type, label: p.label, warnings: p.warnings || [],
-    date_from: p.dateFrom, date_to: p.dateTo, rows: p.records.length, inserted, updated,
+    file: p.name, ok: true, type: p.type, label: p.label, warnings,
+    date_from: p.dateFrom, date_to: p.dateTo, rows: p.records.length, inserted, updated: replaced, scope: scopeMsg,
   };
 }
 

@@ -82,7 +82,7 @@ async function logFetch(entry) {
 }
 
 /** DL結果 (Buffer) を downloads/ 保存 → 取込レシピ検証 → incoming 投入 */
-async function persistFile(buf, destName, { reportType, expectType, periodCheck }) {
+async function persistFile(buf, destName, { reportType, expectType, periodCheck, okMessage }) {
   const dest = join(DL_DIR, destName);
   await writeFile(dest, buf);
   console.log(`  ✅ 取得成功: ${destName} (${buf.length} bytes)`);
@@ -108,7 +108,7 @@ async function persistFile(buf, destName, { reportType, expectType, periodCheck 
   await logFetch({
     report_type: reportType, period_from: p.dateFrom, period_to: p.dateTo,
     file_name: destName, file_sha256: createHash('sha256').update(buf).digest('hex'),
-    file_bytes: buf.length, status: 'ok', message: '',
+    file_bytes: buf.length, status: 'ok', message: okMessage || '',
   });
   return p;
 }
@@ -223,14 +223,19 @@ async function downloadStatusFile(page, fileName) {
   return readFile(await dl.path());
 }
 
-/** 月次レンジ (YYYY-MM 〜 YYYY-MM) の月初日リスト */
+/** 月次レンジ (YYYY-MM 〜 YYYY-MM) の月リスト。
+ *  ⚠️文字列インクリメントは不正月 (2026-13等) で無限ループする → 年月indexの整数で列挙 (Codex Medium) */
 function monthsBetween(fromYm, toYm) {
+  const idx = (ym) => {
+    const m = ym.match(/^(\d{4})-(0[1-9]|1[0-2])$/);
+    if (!m) throw new Error(`ENV: 不正な年月 ${ym} (YYYY-MM、月は01-12)`);
+    return Number(m[1]) * 12 + Number(m[2]) - 1;
+  };
+  const a = idx(fromYm); const b = idx(toYm);
+  if (a > b) throw new Error(`ENV: 月次レンジの from > to (${fromYm} > ${toYm})`);
   const out = [];
-  let ym = fromYm;
-  while (ym <= toYm) {
-    out.push(ym);
-    const [y, m] = ym.split('-').map(Number);
-    ym = m === 12 ? `${y + 1}-01` : `${y}-${String(m + 1).padStart(2, '0')}`;
+  for (let i = a; i <= b; i++) {
+    out.push(`${Math.floor(i / 12)}-${String((i % 12) + 1).padStart(2, '0')}`);
   }
   return out;
 }
@@ -249,8 +254,8 @@ async function fetchShopAnalytics(page, outcomes, failures) {
   const monthlyEnv = (process.env.ADATA_MONTHLY || '').trim();
   let monthlyRange = null;
   if (monthlyEnv) {
-    const m = monthlyEnv.match(/^(\d{4}-\d{2})(?::(\d{4}-\d{2}))?$/);
-    if (!m) throw new Error(`ENV: ADATA_MONTHLY は YYYY-MM または YYYY-MM:YYYY-MM (got: ${monthlyEnv})`);
+    const m = monthlyEnv.match(/^(\d{4}-(?:0[1-9]|1[0-2]))(?::(\d{4}-(?:0[1-9]|1[0-2])))?$/);
+    if (!m) throw new Error(`ENV: ADATA_MONTHLY は YYYY-MM または YYYY-MM:YYYY-MM (月は01-12。got: ${monthlyEnv})`);
     monthlyRange = { from: m[1], to: m[2] || m[1] };
   } else if (jstNow().getUTCDate() <= 3) {
     // 月初3日は前月の月次を確定取得
@@ -441,6 +446,30 @@ async function fetchPmQuery(page, outcomes, failures) {
     outcomes.push({ spec: 'pm_query', ym: weekStart, status: 'empty' });
     return;
   }
+  // 画面に対象週の日付表示が無い → 前週として保存する前に、既取得週と内容が完全一致なら
+  // 「画面が未更新 (前々週のまま)」とみなしてスキップ (日付誤ラベル防止 — Codex Medium)。
+  // rows_sha256 は report_fetch_log.message に残し、次回照合に使う
+  const rowsHash = createHash('sha256').update(JSON.stringify(rows)).digest('hex');
+  if (WAREHOUSE_DATA_DIR) {
+    try {
+      const { default: Database } = await import('better-sqlite3');
+      const db = new Database(join(WAREHOUSE_DATA_DIR, 'warehouse.db'), { readonly: true });
+      try {
+        const prev = db.prepare(`SELECT period_from, message FROM report_fetch_log
+          WHERE mall='aupay' AND report_type='adata_pm_query' AND status='ok'
+          ORDER BY fetched_at DESC LIMIT 1`).get();
+        if (prev && prev.period_from !== weekStart && String(prev.message || '').includes(`rows_sha256=${rowsHash}`)) {
+          console.log(`  [skip] 内容が既取得週 (${prev.period_from}) と完全一致 — 画面未更新の疑い。翌日再取得で自己修復`);
+          await logFetch({ report_type: 'adata_pm_query', period_from: weekStart, period_to: weekEnd,
+            status: 'empty', message: `画面未更新の疑い (${prev.period_from} と同一内容)` });
+          outcomes.push({ spec: 'pm_query', ym: weekStart, status: 'empty' });
+          return;
+        }
+      } finally { db.close(); }
+    } catch (e) {
+      console.warn(`  ⚠ 既取得週との照合スキップ (${e.message})`);
+    }
+  }
   const json = {
     kind: 'aupay_pm_query_weekly', week_start: weekStart, week_end: weekEnd,
     fetched_at: new Date().toISOString(), source: 'admin.ads.wowma.s4p.jp/shop/inflow_words', rows,
@@ -450,6 +479,7 @@ async function fetchPmQuery(page, outcomes, failures) {
     reportType: 'adata_pm_query',
     expectType: 'aupay_pm_query_weekly',
     periodCheck: (p) => (p.dateFrom !== weekStart ? `week_start不一致 (${p.dateFrom} != ${weekStart})` : null),
+    okMessage: `rows_sha256=${rowsHash}`,
   });
   outcomes.push({ spec: 'pm_query', ym: weekStart, status: 'ok' });
 }
