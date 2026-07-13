@@ -4152,6 +4152,12 @@ document.addEventListener('click', function(ev) {
     t.disabled = true;
     var emOrder = g('data-emorder');
     post(API + '/email-jobs/' + v + '/retry', {}).then(function(j) {
+      // unknown は「未送信」と断定しない (送信済みの可能性あり。誤案内は二重送信の元、Codex vendor-R2 High)
+      if (j.ok && j.status === 'unknown') {
+        alert('⚠️ 送信結果が不明です\\n\\nGmailへ届いたか確認できませんでした。パネルの「照合」ボタンで確認してください (確認せずに送り直さないでください)');
+        emailPanel(emOrder); // unknownバナーは最新ジョブ状態から導出される
+        return;
+      }
       var failMsg = !j.ok ? j.error : (j.status === 'sent' ? null : '送信失敗: ' + (j.error || ''));
       if (failMsg) alert('❌ メールは送信されていません\\n\\n理由: ' + failMsg);
       else toast('送信しました');
