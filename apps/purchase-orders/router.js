@@ -30,7 +30,7 @@ import {
   buildOrderEmail, createEmailJob, processEmailJob, reconcileEmailJobs, listEmailJobs, emailSettings, parseAddresses,
   markUnsent, cancelEmailJob, startEmailDispatcher,
 } from './email.js';
-import { fetchShipmentMails, listShipmentMails, setShipmentMailStatus } from './shipment-mail.js';
+import { fetchShipmentMails, listShipmentMails, setShipmentMailStatus, reparseShipmentMail } from './shipment-mail.js';
 import { getSetting, setSetting, audit, markCycleFbaJobDone } from './ledger.js';
 
 startEmailDispatcher(); // 予約送信 (毎分、時刻が来たqueuedジョブを送信。unrefでプロセス終了は妨げない)
@@ -1274,6 +1274,38 @@ router.post('/api/inbound-plan/mails/:id/status', (req, res) => {
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
+// 1通の再解析 (Gmailから取り直して現行ロジックでやり直す。解析コード改善後のリトライ用)
+router.post('/api/inbound-plan/mails/:id/reparse', async (req, res) => {
+  try {
+    const r = await reparseShipmentMail(Number(req.params.id), actorOf(req));
+    res.json({ ok: true, ...r, ...listShipmentMails() });
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+
+// 解析エラーの一括再解析。1リクエスト20件まで (Gmail API負荷とHTTPタイムアウト対策、Codex 入荷予定R1 Medium)。
+// IDカーソル方式: body.afterId より大きいID順に処理し、cursor を返す。stillError/failed の行を
+// 次バッチで再選択して無限ループしない (Codex 入荷予定R2 High)。remaining>0 ならクライアントが cursor 付きで続きを呼ぶ
+router.post('/api/inbound-plan/mails/reparse-errors', async (req, res) => {
+  try {
+    const BATCH = 20;
+    const db = getDB();
+    const afterId = Number((req.body || {}).afterId) || 0;
+    const batch = db.prepare("SELECT id FROM po_shipment_mails WHERE status='error' AND id > ? ORDER BY id LIMIT ?").all(afterId, BATCH);
+    const summary = { total: batch.length, fixed: 0, stillError: 0, removed: 0, failed: [], cursor: afterId, remaining: 0 };
+    for (const t of batch) {
+      summary.cursor = t.id; // 結果にかかわらず処理済みとして前進 (stillError/failedも再選択しない)
+      try {
+        const r = await reparseShipmentMail(t.id, actorOf(req));
+        if (r.removed) summary.removed++;
+        else if (r.status === 'new') summary.fixed++;
+        else summary.stillError++;
+      } catch (e) { summary.failed.push({ id: t.id, error: String(e.message || e) }); }
+    }
+    summary.remaining = db.prepare("SELECT COUNT(*) AS n FROM po_shipment_mails WHERE status='error' AND id > ?").get(summary.cursor).n;
+    res.json({ ok: true, ...summary, ...listShipmentMails() });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
 // 未紐付け番号を仮登録リストへ (UNIQUE upsert=再変換で重複しない)
 router.post('/api/vendor-map/pending', (req, res) => {
   try {
@@ -2260,6 +2292,7 @@ function pageShell(title, active, body, script) {
   <nav class="tabs">
     ${tab('/apps/purchase-orders', 'ダッシュボード', 'dash')}
     ${tab('/apps/purchase-orders/backorders', '発注残', 'backorders')}
+    ${tab('/apps/purchase-orders/inbound-plan', '入荷予定', 'inbound-plan')}
     ${tab('/apps/purchase-orders/inbound', '入庫消込', 'inbound')}
     ${tab('/apps/purchase-orders/products', '全商品情報', 'products')}
     ${tab('/apps/purchase-orders/orders', '発注履歴', 'orders')}
@@ -3698,28 +3731,7 @@ router.get('/inbound', (req, res) => {
       <div id="inbResult" class="pill-row"></div>
     </div>
     <div id="conflictArea"></div>
-
-    <div class="import-zone">
-      <h3>📅 ロジザード入荷予定の作成 <span class="muted" style="font-weight:400;font-size:12px">(アメージングクラフト/ビーフリーの出荷明細 → 入荷予定登録(Excel貼り付け)用データ)</span></h3>
-      <div class="hint">
-        「📬 メールから取得」を押すと、AMC (@am-craft.jp のxlsx添付) / ビーフリー (@be-free.biz の本文の表) の出荷明細を自動で取り込んで変換できます。
-        結果 (商品ID / 入荷予定数 / 仕入単価) を📋コピーして、ロジザードの「入荷予定登録 (Excel貼り付け)」へ貼り付け → 済んだら ✅ ロジザード登録済み。<br>
-        対応表に無い先方番号は一覧されます — <b>新商品/番号変更</b>は「仮登録」しておき、NE登録の翌朝以降にマスタ管理→📇対応表の「未紐付けの先方番号」から紐づけます。
-      </div>
-      <div class="row" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:6px">
-        <button class="pri" id="ipFetch">📬 メールから取得 (AMC/ビーフリー)</button>
-        <span id="ipFetchStat" class="muted"></span>
-      </div>
-      <div id="ipMails" style="margin-top:8px"></div>
-      <details style="margin-top:10px"><summary class="muted" style="cursor:pointer">✍️ 手動貼り付け (メール以外から / 自動解析に失敗したとき)</summary>
-        <div class="row" style="display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap;margin-top:6px">
-          <label>仕入先 <select id="ipSup"></select></label>
-          <textarea id="ipText" rows="6" style="flex:1;min-width:340px" placeholder="ZZ1317-0002	ﾌﾙﾌﾟﾛﾃｸﾄｽﾘｰﾌﾞ	1600&#10;ZZ1317-0072	ﾊﾟｯｸｹｰｽS	240  ← のように出荷明細の行を貼り付け (見出し行が混ざってもOK)"></textarea>
-          <button class="pri" id="ipConvert">🔁 変換</button>
-        </div>
-      </details>
-      <div id="ipResult" style="margin-top:8px"></div>
-    </div>
+    <div class="hint" style="margin:6px 0 10px">📅 入荷予定の作成 (出荷明細メール→ロジザード貼り付け) は <a href="/apps/purchase-orders/inbound-plan">「入荷予定」タブ</a> に移動しました</div>
 
     <h2 class="page" style="font-size:15px">未割当の入庫 <span class="muted" id="openCount"></span></h2>
     <div class="sec"><div class="bd" id="openList" style="max-height:none">読み込み中…</div></div>
@@ -3927,7 +3939,45 @@ document.addEventListener('click', function(ev) {
   }
 });
 
-// ── 📅 ロジザード入荷予定の作成 (メール自動取得 + 手動貼り付け) ──
+load();`;
+  res.send(pageShell('発注補助 — 入庫消込', 'inbound', body, script));
+});
+
+// ─── 画面: 入荷予定 (出荷明細メール→ロジザード入荷予定の作成。入庫消込ページから独立) ───
+router.get('/inbound-plan', (req, res) => {
+  const body = `
+    <h2 class="page">入荷予定 <span class="muted" style="font-size:12px">アメージングクラフト/ビーフリーの出荷明細 → ロジザード「入荷予定登録 (Excel貼り付け)」用データ</span></h2>
+    <div class="import-zone">
+      <div class="hint">
+        「📬 メールから取得」を押すと、AMC (@am-craft.jp のxlsx添付) / ビーフリー (@be-free.biz の本文の表) の出荷明細を自動で取り込んで変換できます。
+        結果 (商品ID / 入荷予定数 / 仕入単価) を📋コピーして、ロジザードの「入荷予定登録 (Excel貼り付け)」へ貼り付け → 済んだら ✅ ロジザード登録済み。<br>
+        対応表に無い先方番号は一覧されます — <b>新商品/番号変更</b>は「仮登録」しておき、NE登録の翌朝以降にマスタ管理→📇対応表の「未紐付けの先方番号」から紐づけます。
+      </div>
+      <div class="row" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:6px">
+        <button class="pri" id="ipFetch">📬 メールから取得 (AMC/ビーフリー)</button>
+        <button id="ipReparseAll" style="display:none">🔄 解析エラーを再解析</button>
+        <span id="ipFetchStat" class="muted"></span>
+      </div>
+      <div id="ipMails" style="margin-top:8px"></div>
+      <details style="margin-top:10px"><summary class="muted" style="cursor:pointer">✍️ 手動貼り付け (メール以外から / 自動解析に失敗したとき)</summary>
+        <div class="row" style="display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap;margin-top:6px">
+          <label>仕入先 <select id="ipSup"></select></label>
+          <textarea id="ipText" rows="6" style="flex:1;min-width:340px" placeholder="ZZ1317-0002	ﾌﾙﾌﾟﾛﾃｸﾄｽﾘｰﾌﾞ	1600&#10;ZZ1317-0072	ﾊﾟｯｸｹｰｽS	240  ← のように出荷明細の行を貼り付け (見出し行が混ざってもOK)"></textarea>
+          <button class="pri" id="ipConvert">🔁 変換</button>
+        </div>
+      </details>
+      <div id="ipResult" style="margin-top:8px"></div>
+    </div>`;
+  const script = `
+var API = '/apps/purchase-orders/api';
+function jsonOrErr(r, isWrite) {
+  return r.json().catch(function(){ return { ok: false, error: 'HTTP ' + r.status + (isWrite ? ' — 登録されたか不明です。画面を更新して確認してください' : ' — 取得に失敗しました') }; });
+}
+function post(url, body) {
+  return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(function(r){ return jsonOrErr(r, true); });
+}
+function getJson(url) { return fetch(url).then(function(r){ return jsonOrErr(r, false); }); }
+
 var IP_LAST = null; // 直近の変換結果 (仮登録ボタン用)
 getJson(API + '/masters/suppliers').then(function(j) {
   if (!j.ok) return;
@@ -3946,26 +3996,38 @@ getJson(API + '/masters/suppliers').then(function(j) {
 function renderIpMails(j) {
   var area = document.getElementById('ipMails');
   var open = j.open || [];
+  var errCount = open.filter(function(m){ return m.status === 'error'; }).length;
+  var rp = document.getElementById('ipReparseAll');
+  rp.style.display = errCount ? '' : 'none';
+  rp.textContent = '🔄 解析エラーを再解析 (' + errCount + '件)';
+  var h = '';
   if (!open.length) {
-    area.innerHTML = '<div class="muted">未処理の出荷明細メールはありません (「📬 メールから取得」で直近30日分を確認できます)</div>';
-    return;
+    h = '<div class="muted">未処理の出荷明細メールはありません (「📬 メールから取得」で直近30日分を確認できます)</div>';
+  } else {
+    h = '<table class="t"><tr><th>受信</th><th>仕入先</th><th>件名</th><th class="r">明細</th><th></th></tr>';
+    open.forEach(function(m) {
+      var items = [];
+      try { items = JSON.parse(m.parsed_json || '[]'); } catch (e) {}
+      h += '<tr><td class="muted">' + esc(String(m.received_at || '').slice(0, 10)) + '</td>' +
+        '<td>' + esc(m.supplier_code) + '</td><td>' + esc(m.subject || '') + (m.parse_note ? ' <span class="muted">📎' + esc(m.parse_note) + '</span>' : '') +
+        (m.status === 'error' ? '<div class="muted" style="color:#b45309;font-size:11px;max-width:520px">⚠ ' + esc(m.error || '') + '</div>' : '') + '</td>' +
+        '<td class="r">' + (m.status === 'error' ? '<span class="badge b-warn">⚠️ 解析エラー</span>' : items.length + '行') + '</td>' +
+        '<td style="white-space:nowrap">' +
+          (m.status !== 'error' ? '<button class="pri sm" data-ipmconv="' + m.id + '">🔁 変換</button> ' : '<button class="sm" data-ipmrep="' + m.id + '">🔄 再解析</button> ') +
+          '<button class="ghost" data-ipmdone="' + m.id + '" title="ロジザードへの貼り付けが済んだら">✅ 登録済み</button>' +
+          '<button class="ghost" data-ipmign="' + m.id + '">🚫 無視</button></td></tr>';
+    });
+    h += '</table>';
   }
-  var h = '<table class="t"><tr><th>受信</th><th>仕入先</th><th>件名</th><th class="r">明細</th><th></th></tr>';
-  open.forEach(function(m) {
-    var items = [];
-    try { items = JSON.parse(m.parsed_json || '[]'); } catch (e) {}
-    h += '<tr><td class="muted">' + esc(String(m.received_at || '').slice(0, 10)) + '</td>' +
-      '<td>' + esc(m.supplier_code) + '</td><td>' + esc(m.subject || '') + (m.parse_note ? ' <span class="muted">📎' + esc(m.parse_note) + '</span>' : '') + '</td>' +
-      '<td class="r">' + (m.status === 'error' ? '<span class="badge b-draft" title="' + esc(m.error || '') + '">⚠️ 解析エラー</span>' : items.length + '行') + '</td>' +
-      '<td style="white-space:nowrap">' +
-        (m.status !== 'error' ? '<button class="pri sm" data-ipmconv="' + m.id + '">🔁 変換</button> ' : '') +
-        '<button class="ghost" data-ipmdone="' + m.id + '" title="ロジザードへの貼り付けが済んだら">✅ 登録済み</button>' +
-        '<button class="ghost" data-ipmign="' + m.id + '">🚫 無視</button></td></tr>';
-  });
-  h += '</table>';
   if ((j.recent || []).length) {
-    h += '<div class="muted" style="margin-top:4px;font-size:11px">処理済み: ' +
-      j.recent.map(function(m){ return esc(String(m.received_at || '').slice(5, 10) + ' ' + (m.subject || '').slice(0, 20)) + (m.status === 'ignored' ? ' (無視)' : ''); }).join(' / ') + '</div>';
+    h += '<div class="muted" style="margin-top:8px;font-size:12px"><b>処理済み (直近' + j.recent.length + '件)</b> — 間違えて押したときは ↩ 戻す で未処理に戻せます</div>' +
+      '<table class="t" style="margin-top:2px">' +
+      j.recent.map(function(m) {
+        return '<tr><td class="muted">' + esc(String(m.received_at || '').slice(0, 10)) + '</td>' +
+          '<td>' + esc(m.supplier_code) + '</td><td>' + esc(m.subject || '') + '</td>' +
+          '<td>' + (m.status === 'ignored' ? '🚫 無視' : '✅ 登録済み') + '</td>' +
+          '<td><button class="ghost" data-ipmback="' + m.id + '">↩ 戻す</button></td></tr>';
+      }).join('') + '</table>';
   }
   area.innerHTML = h;
 }
@@ -3982,6 +4044,24 @@ document.getElementById('ipFetch').addEventListener('click', function() {
     renderIpMails(j);
   }).catch(function(e){ btn.disabled = false; document.getElementById('ipFetchStat').textContent = ''; toast('通信エラー: ' + e.message); });
 });
+document.getElementById('ipReparseAll').addEventListener('click', function() {
+  var btn = this; btn.disabled = true;
+  var acc = { done: 0, fixed: 0, removed: 0, stillError: 0, failed: 0, cursor: 0 };
+  function step() {
+    document.getElementById('ipFetchStat').textContent = '解析エラーのメールをGmailから取り直して再解析中…' + (acc.done ? ' (処理済み ' + acc.done + '件)' : '');
+    post(API + '/inbound-plan/mails/reparse-errors', { afterId: acc.cursor }).then(function(j) {
+      if (!j.ok) { btn.disabled = false; document.getElementById('ipFetchStat').textContent = ''; toast('エラー: ' + j.error); return; }
+      acc.done += j.total; acc.fixed += j.fixed; acc.removed += j.removed; acc.stillError += j.stillError; acc.failed += j.failed.length;
+      acc.cursor = j.cursor;
+      renderIpMails(j);
+      if (j.remaining > 0 && j.total > 0) { step(); return; } // 20件ずつ続きを自動処理 (IDカーソルで前進)
+      btn.disabled = false;
+      document.getElementById('ipFetchStat').textContent = '再解析 ' + acc.done + '件: 解析OK ' + acc.fixed + ' / 対象外 ' + acc.removed + ' / まだエラー ' + acc.stillError +
+        (acc.failed ? ' / 再取得失敗 ' + acc.failed : '');
+    }).catch(function(e){ btn.disabled = false; document.getElementById('ipFetchStat').textContent = ''; toast('通信エラー: ' + e.message); });
+  }
+  step();
+});
 document.addEventListener('click', function(ev) {
   var t2 = ev.target;
   var g2 = function(a){ return t2.getAttribute && t2.getAttribute(a); };
@@ -3996,9 +4076,32 @@ document.addEventListener('click', function(ev) {
     }).catch(function(e){ t2.disabled = false; toast('通信エラー: ' + e.message); });
     return;
   }
+  if ((v2 = g2('data-ipmrep'))) {
+    t2.disabled = true;
+    post(API + '/inbound-plan/mails/' + v2 + '/reparse', {}).then(function(j) {
+      t2.disabled = false;
+      if (!j.ok) { toast('エラー: ' + j.error); return; }
+      toast(j.removed ? '出荷明細の対象外のため一覧から外しました (' + j.reason + ')'
+        : (j.status === 'new' ? '再解析OK (' + j.itemCount + '明細)。🔁変換できます' : 'まだ解析エラーです: ' + j.error));
+      renderIpMails(j);
+    }).catch(function(e){ t2.disabled = false; toast('通信エラー: ' + e.message); });
+    return;
+  }
+  if ((v2 = g2('data-ipmback'))) {
+    t2.disabled = true;
+    post(API + '/inbound-plan/mails/' + v2 + '/status', { status: 'new' }).then(function(j) {
+      t2.disabled = false;
+      if (!j.ok) { toast('エラー: ' + j.error); return; }
+      toast('未処理に戻しました');
+      loadIpMails();
+    }).catch(function(e){ t2.disabled = false; toast('通信エラー: ' + e.message); });
+    return;
+  }
   if ((v2 = g2('data-ipmdone')) || (v2 = g2('data-ipmign'))) {
     var st2 = g2('data-ipmdone') ? 'done' : 'ignored';
-    if (st2 === 'ignored' && !confirm('このメールを無視しますか? (入荷予定を作らない)')) return;
+    if (!confirm(st2 === 'done'
+      ? 'このメールを「ロジザード登録済み」にしますか? (一覧から下の処理済みへ移動します。間違えたら ↩ 戻す で戻せます)'
+      : 'このメールを無視しますか? (入荷予定を作らない。間違えたら ↩ 戻す で戻せます)')) return;
     t2.disabled = true;
     post(API + '/inbound-plan/mails/' + v2 + '/status', { status: st2 }).then(function(j) {
       t2.disabled = false;
@@ -4063,9 +4166,8 @@ document.getElementById('ipConvert').addEventListener('click', function() {
       if (!j.ok) { document.getElementById('ipResult').innerHTML = '<div class="warn">' + esc(j.error) + '</div>'; return; }
       renderIpResult(j);
     }).catch(function(e){ btn.disabled = false; toast('通信エラー: ' + e.message); });
-});
-load();`;
-  res.send(pageShell('発注補助 — 入庫消込', 'inbound', body, script));
+});`;
+  res.send(pageShell('発注補助 — 入荷予定', 'inbound-plan', body, script));
 });
 
 // ─── 画面: 発注残 (P13b) ───

@@ -2069,8 +2069,8 @@ console.log('── 入荷予定変換 (inbound-plan) + 仮登録 (pending) ─�
   }
 
   // 画面配信
-  const inbHtml2 = await (await fetch(base + '/inbound')).text();
-  ok(inbHtml2.includes('ロジザード入荷予定の作成') && inbHtml2.includes('ipConvert'), '/inbound 入荷予定作成セクション');
+  const inbHtml2 = await (await fetch(base + '/inbound-plan')).text();
+  ok(inbHtml2.includes('入荷予定') && inbHtml2.includes('ipConvert'), '/inbound-plan 入荷予定作成ページ');
   const adminHtml3 = await (await fetch(base + '/admin')).text();
   ok(adminHtml3.includes('loadVmapPending') && adminHtml3.includes('未紐付けの先方番号'), '/admin 対応表タブに仮登録リスト');
 }
@@ -2129,6 +2129,18 @@ console.log('── 出荷明細メール自動取得 (fetch-mails) ──');
       'auth: quoted-string内のdmarc=pass注入は無効 (RFC8601)');
     ok(sm.authPassed('mx.google.com; dmarc=passive header.from=am-craft.jp', 'am-craft.jp') === false, 'auth: dmarc=passiveは不合格 (部分一致誤認なし)');
     ok(sm.authPassed('mx.google.com; spf=pass smtp.mailfrom=attacker.example; dkim=pass header.d=attacker.example', 'am-craft.jp') === false, 'auth: 他ドメインのspf/dkim passは不整合');
+    // 中小事業者はDMARC/DKIM未導入が普通 — Fromドメイン完全一致のSPF単独/DKIM単独passは許可 (本番72件全エラー対応)
+    ok(sm.authPassed('mx.google.com; spf=pass smtp.mailfrom=am-craft.jp; dkim=none; dmarc=none', 'am-craft.jp') === true, 'auth: SPF単独の整合passは許可');
+    ok(sm.authPassed('mx.google.com; spf=none; dkim=pass header.d=be-free.biz; dmarc=none', 'be-free.biz') === true, 'auth: DKIM単独の整合passは許可');
+    ok(sm.authPassed('mx.google.com; spf=pass smtp.mailfrom=am-craft.jp; dmarc=fail header.from=am-craft.jp', 'am-craft.jp') === false,
+      'auth: 明示的なdmarc=failはSPF単独で上書きしない (Codex 入荷予定R1 Medium)');
+    ok(sm.authPassed('mx.google.com; spf=pass smtp.mailfrom=bounce.am-craft.jp; dmarc=none', 'am-craft.jp') === false,
+      'auth: 単独fallbackはサブドメイン整合を許さない (完全一致のみ)');
+    ok(sm.authPassed('mx.google.com; spf=pass smtp.mailfrom=bounce.am-craft.jp; dmarc=none', 'am-craft.jp', ['bounce.am-craft.jp']) === true,
+      'auth: extraAuthDomains で配送用サブドメインを明示許可できる');
+    ok(sm.authPassed(['mx.google.com; dmarc=fail header.from=am-craft.jp', 'mx.google.com; spf=pass smtp.mailfrom=am-craft.jp'], 'am-craft.jp') === false,
+      'auth: 別ヘッダのdmarc=failもfallbackを止める (全ヘッダ集約判定、Codex 入荷予定R2 Medium)');
+    ok(sm.summarizeAuth('mx.google.com; spf=pass smtp.mailfrom=x.example; dkim=none; dmarc=none').includes('spf=pass (x.example)'), 'auth: 判定内訳の要約 (エラー原因調査用)');
     ok(sm.authPassed('mx.google.com; spf=fail reason="x\\"; dmarc=pass header.from=am-craft.jp"', 'am-craft.jp') === false,
       'auth: quoted-pairエスケープでの注入も無効 (状態機械、Codex mail-R4 High)');
     ok(sm.authPassed('attacker.example; dmarc=pass header.from=am-craft.jp', 'am-craft.jp') === false,
@@ -2152,9 +2164,13 @@ console.log('── 出荷明細メール自動取得 (fetch-mails) ──');
   }
 
   r = await jp3('/api/inbound-plan/fetch-mails');
-  ok(r.body.ok && r.body.added === 6 && r.body.errors.length === 4, 'fetch: 対象2+エラー4を登録 (対象外/偽装Fromは無視)', r.body);
-  ok(r.body.open.length === 6, 'fetch: 未処理一覧に6件 (new2+error4)', r.body.open.length);
+  ok(r.body.ok && r.body.added === 5 && r.body.errors.length === 3, 'fetch: 対象2+エラー3を登録 (対象外/偽装From/xlsxなしAMCは登録しない)', r.body);
+  ok(r.body.open.length === 5, 'fetch: 未処理一覧に5件 (new2+error3)', r.body.open.length);
   ok(!r.body.open.some(m => m.gmail_id === 'gm-spoof'), 'fetch: 表示名偽装 (実アドレス別ドメイン) は取り込まない (Codex mail-R1 High)');
+  ok(!r.body.open.some(m => m.gmail_id === 'gm-amc-noatt'), 'fetch: xlsx添付のないAMCメール (請求書等) は一覧に載せない');
+  ok(r.body.nonCandidates === 1 &&
+    db.prepare("SELECT status FROM po_shipment_mails WHERE gmail_id='gm-amc-noatt'").get().status === 'not_candidate',
+    'fetch: 対象外はtombstone (not_candidate) 保存 — 次回の再取得・再DLを防ぐ', r.body.nonCandidates);
   const authFail = r.body.open.find(m => m.gmail_id === 'gm-authfail');
   ok(authFail && authFail.status === 'error' && authFail.error.includes('なりすまし'), 'fetch: SPF/DKIM/DMARC不合格は自動変換しない', authFail && authFail.error);
   const attackMail = r.body.open.find(m => m.gmail_id === 'gm-attack');
@@ -2165,10 +2181,9 @@ console.log('── 出荷明細メール自動取得 (fetch-mails) ──');
     'fetch: 明細表が複数のメールは合算せずエラー (二重入荷防止)', multiMail && multiMail.error);
   const amcMail = r.body.open.find(m => m.gmail_id === 'gm-amc-1');
   const bfMail = r.body.open.find(m => m.gmail_id === 'gm-bf-1');
-  const errMail = r.body.open.find(m => m.gmail_id === 'gm-amc-noatt');
+  const errMail = r.body.open.find(m => m.gmail_id === 'gm-multitable'); // 明細表2つ=エラー行の代表として使う
   ok(amcMail && amcMail.supplier_code === '1' && JSON.parse(amcMail.parsed_json).length === 2, 'fetch: AMC xlsx添付を解析 (2明細)', amcMail && amcMail.parse_note);
   ok(bfMail && bfMail.supplier_code === '2' && JSON.parse(bfMail.parsed_json).length === 2, 'fetch: ビーフリー本文の表を解析 (同一商品2行+署名表は無視)');
-  ok(errMail && errMail.status === 'error' && errMail.error.includes('xlsx添付'), 'fetch: 添付なしAMCメールはerror');
 
   // 再取得は冪等 (同じgmail_idは再登録しない)
   r = await jp3('/api/inbound-plan/fetch-mails');
@@ -2190,19 +2205,58 @@ console.log('── 出荷明細メール自動取得 (fetch-mails) ──');
   r = await jp3('/api/inbound-plan/mails/' + errMail.id + '/status', { status: 'ignored' });
   ok(r.body.ok, 'mail: 無視');
   r = await j('/api/inbound-plan/mails');
-  ok(r.body.ok && r.body.open.length === 4 && r.body.open.some(m => m.gmail_id === 'gm-bf-1') && r.body.recent.length === 2,
+  ok(r.body.ok && r.body.open.length === 3 && r.body.open.some(m => m.gmail_id === 'gm-bf-1') && r.body.recent.length === 2,
     'mail: 一覧はnew/errorのみ (処理済みはrecentへ)', r.body.open.length);
+
+  // ↩ 戻す (誤クリックした登録済み/無視を未処理に戻せる)
+  r = await jp3('/api/inbound-plan/mails/' + amcMail.id + '/status', { status: 'new' });
+  ok(r.body.ok, 'mail: 登録済みを未処理に戻す (↩)');
+  r = await j('/api/inbound-plan/mails');
+  ok(r.body.open.some(m => m.gmail_id === 'gm-amc-1') && r.body.recent.length === 1, 'mail: 戻した行が未処理一覧に復帰', r.body.open.length);
+
+  // 再解析: 解析コード修正後にerror行をやり直す (Gmail取り直し)。fake dataを差し替えて「直った」状況を再現
+  {
+    const fake = JSON.parse(process.env.PO_SHIPMENT_FAKE_DATA);
+    // gm-attack: SPF単独の整合pass (認証緩和で通るようになったケース)
+    fake.find(m => m.id === 'gm-attack').authResults = 'mx.google.com; spf=pass smtp.mailfrom=am-craft.jp; dkim=none; dmarc=none';
+    // gm-authfail: xlsx添付が実は無かった (請求書等) → 対象外として一覧から削除されるケース
+    const af = fake.find(m => m.id === 'gm-authfail');
+    af.attachments = [];
+    af.bodyHtml = '<p>本文のみ</p>';
+    process.env.PO_SHIPMENT_FAKE_DATA = JSON.stringify(fake);
+    r = await jp3('/api/inbound-plan/mails/reparse-errors');
+    ok(r.body.ok && r.body.total === 2 && r.body.fixed === 1 && r.body.removed === 1 && r.body.stillError === 0 && r.body.remaining === 0,
+      'reparse一括: 解析OK1+対象外1 (20件バッチ+remaining)', r.body);
+    const attackRow = r.body.open.find(m => m.gmail_id === 'gm-attack');
+    ok(attackRow && attackRow.status === 'new' && JSON.parse(attackRow.parsed_json).length === 2, 'reparse: SPF単独整合passで解析OKに', attackRow && attackRow.status);
+    ok(!r.body.open.some(m => m.gmail_id === 'gm-authfail') &&
+      db.prepare("SELECT status FROM po_shipment_mails WHERE gmail_id='gm-authfail'").get().status === 'not_candidate',
+      'reparse: 出荷明細でない行はtombstone化して一覧から除外 (物理削除しない)');
+    // 個別再解析エンドポイント (new行でも同じ結果に収束)
+    r = await jp3('/api/inbound-plan/mails/' + attackRow.id + '/reparse');
+    ok(r.body.ok && r.body.status === 'new' && r.body.itemCount === 2, 'reparse個別: 再実行でも同じ解析結果');
+    // 登録済み行の再解析は拒否 (誤操作ガード)
+    await jp3('/api/inbound-plan/mails/' + attackRow.id + '/status', { status: 'done' });
+    r = await jp3('/api/inbound-plan/mails/' + attackRow.id + '/reparse');
+    ok(r.status === 400 && r.body.error.includes('登録済み'), 'reparse: 登録済み行は拒否 (↩で戻してから)');
+  }
   delete process.env.PO_SHIPMENT_FAKE_DATA;
 
-  // 画面: メール取得UI配信
+  // 画面: 入荷予定は独立タブへ (入庫消込には導線リンクのみ)
   const inbHtml3 = await (await fetch(base + '/inbound')).text();
-  ok(inbHtml3.includes('ipFetch') && inbHtml3.includes('メールから取得') && inbHtml3.includes('renderIpResult'), '/inbound 📬メール取得UI');
+  ok(!inbHtml3.includes('ipFetch') && inbHtml3.includes('/apps/purchase-orders/inbound-plan'), '/inbound 入荷予定はタブへ移動 (導線リンクあり)');
+  const planHtml = await (await fetch(base + '/inbound-plan')).text();
+  ok(planHtml.includes('ipFetch') && planHtml.includes('メールから取得') && planHtml.includes('renderIpResult'), '/inbound-plan 📬メール取得UI');
+  ok(planHtml.includes('ipReparseAll') && planHtml.includes('data-ipmrep') && planHtml.includes('data-ipmback'), '/inbound-plan 再解析+↩戻すUI');
+  ok(planHtml.includes('解析エラー'), '/inbound-plan エラー理由の表示');
+  const dashNav = await (await fetch(base + '/')).text();
+  ok(dashNav.includes('入荷予定') && dashNav.includes('/apps/purchase-orders/inbound-plan'), 'ナビに入荷予定タブ');
 }
 
 // ═══ 全ページのインラインJS構文チェック (サーバtemplate literal内クライアントJSの括弧崩れ等を機械検出) ═══
 console.log('── ページ内スクリプトの構文チェック ──');
 {
-  for (const p of ['/', '/supplier/1', '/products', '/orders', '/admin', '/inbound', '/backorders']) {
+  for (const p of ['/', '/supplier/1', '/products', '/orders', '/admin', '/inbound', '/inbound-plan', '/backorders']) {
     const html = await (await fetch(base + p)).text();
     const scripts = [...html.matchAll(/<script(?![^>]*src=)[^>]*>([\s\S]*?)<\/script>/gi)].map(m => m[1]);
     let err = null;

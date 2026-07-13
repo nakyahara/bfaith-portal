@@ -15,10 +15,12 @@ import { audit } from './ledger.js';
 
 const nowIso = () => new Date().toISOString();
 
-// 仕入先とメールの対応 (増えたら設定へ昇格を検討。domain は From アドレスのドメイン一致)
+// 仕入先とメールの対応 (増えたら設定へ昇格を検討。domain は From アドレスのドメイン一致)。
+// extraAuthDomains: SPF/DKIM単独fallbackで追加許可する完全一致ドメイン (配送用サブドメイン等。
+// 解析エラーの [判定: ...] に出た実ドメインを確認して足す)
 export const SHIPMENT_MAIL_RULES = [
-  { supplierCode: '1', domain: 'am-craft.jp', kind: 'xlsx' },
-  { supplierCode: '2', domain: 'be-free.biz', kind: 'body', subjectFilter: '出荷明細' },
+  { supplierCode: '1', domain: 'am-craft.jp', kind: 'xlsx', extraAuthDomains: [] },
+  { supplierCode: '2', domain: 'be-free.biz', kind: 'body', subjectFilter: '出荷明細', extraAuthDomains: [] },
 ];
 
 const b64urlToBuf = s => Buffer.from(String(s || '').replace(/-/g, '+').replace(/_/g, '/'), 'base64');
@@ -82,38 +84,71 @@ export function splitAuthClauses(header) {
   return clauses;
 }
 
-export function authPassed(authResultsHeaders, fromDomain) {
+export function authPassed(authResultsHeaders, fromDomain, extraExactDomains = []) {
   const headers = Array.isArray(authResultsHeaders) ? authResultsHeaders : [authResultsHeaders];
   const d = String(fromDomain || '').toLowerCase();
   if (!d) return false;
   const align = v => !!v && (v === d || v.endsWith('.' + d) || d.endsWith('.' + v));
+  const exactSet = new Set([d, ...extraExactDomains.map(x => String(x || '').toLowerCase()).filter(Boolean)]);
+  const exact = v => !!v && exactSet.has(v);
+  // 信頼対象 (mx.google.com) の全ヘッダをまず集約してから一度だけ判定する
+  // (別ヘッダの dmarc=fail をSPF単独passで迂回させない、Codex 入荷予定R2 Medium)
+  let dmarcFail = false;
+  let dmarcPassAligned = false;
+  const spfDoms = [], dkimDoms = [];
   for (const raw of headers) {
     const clauses = splitAuthClauses(String(raw || '').toLowerCase());
     // 先頭節 = authserv-id。Gmail自身 (mx.google.com) が付与したヘッダだけを信頼する
     // (外部から持ち込まれた同名ヘッダを判定に使わない、Codex mail-R4 High)
     const authserv = (clauses[0] || '').split(/\s+/)[0];
     if (authserv !== 'mx.google.com') continue;
-    let dmarcFromDom = null, spfDom = null;
-    const dkimDoms = [];
     for (const c of clauses.slice(1)) {
       // method=result は「節の先頭」のみ有効 (RFC 8601 resinfo)
       const m = c.match(/^(dmarc|spf|dkim)=([a-z0-9]+)/);
-      if (!m || m[2] !== 'pass') continue;
+      if (!m) continue;
+      if (m[1] === 'dmarc' && m[2] === 'fail') { dmarcFail = true; continue; }
+      if (m[2] !== 'pass') continue;
       if (m[1] === 'dmarc') {
         const hf = c.match(/header\.from=([^\s]+)/);
-        if (hf) dmarcFromDom = hf[1]; // header.from の明示整合のみ許可 (無記載passは採用しない)
+        if (hf && align(hf[1])) dmarcPassAligned = true; // header.from の明示整合のみ許可 (無記載passは採用しない)
       } else if (m[1] === 'spf') {
         const mf = c.match(/smtp\.mailfrom=(?:[^@\s]*@)?([^\s]+)/);
-        if (mf) spfDom = mf[1];
+        if (mf) spfDoms.push(mf[1]);
       } else {
         const hd = c.match(/header\.d=([^\s]+)/) || c.match(/header\.i=@?(?:[^@\s]*@)?([^\s]+)/);
         if (hd) dkimDoms.push(hd[1]);
       }
     }
-    if (align(dmarcFromDom)) return true;
-    if (align(spfDom) && dkimDoms.some(align)) return true;
   }
+  if (dmarcPassAligned) return true;
+  // SPF単独 / DKIM単独でも「完全一致ドメインのpass」なら許可する。
+  // 仕入先 (中小事業者) はDMARC未導入・DKIM未設定が普通で、両方要求だと実メールが全滅した (2026-07-13 本番72件全エラー)。
+  // 単独fallbackの制限 (Codex 入荷予定R1/R2 Medium):
+  //  - どこかのヘッダに明示的な dmarc=fail があればfallbackしない (DMARCポリシー違反をSPF/DKIM単独で上書きしない。none/無記載のみ許容)
+  //  - 整合は完全一致のみ (サブドメイン委譲先のESP等による親ドメインFrom詐称を通さない)。
+  //    配送用サブドメイン (bounce.〜等) が必要な仕入先は SHIPMENT_MAIL_RULES.extraAuthDomains に明示追加する
+  if (dmarcFail) return false;
+  if (spfDoms.some(exact)) return true;
+  if (dkimDoms.some(exact)) return true;
   return false;
+}
+
+/** Authentication-Results の判定内訳を人間向けに要約 (解析エラーの原因調査用) */
+export function summarizeAuth(authResultsHeaders) {
+  const headers = Array.isArray(authResultsHeaders) ? authResultsHeaders : [authResultsHeaders];
+  const out = [];
+  for (const raw of headers) {
+    const clauses = splitAuthClauses(String(raw || '').toLowerCase());
+    const authserv = (clauses[0] || '').split(/\s+/)[0];
+    if (authserv !== 'mx.google.com') continue;
+    for (const c of clauses.slice(1)) {
+      const m = c.match(/^(dmarc|spf|dkim)=([a-z0-9]+)/);
+      if (!m) continue;
+      const dom = c.match(/(?:header\.from|smtp\.mailfrom|header\.d|header\.i)=(?:[^@\s]*@)?([^\s]+)/);
+      out.push(`${m[1]}=${m[2]}${dom ? ` (${dom[1]})` : ''}`);
+    }
+  }
+  return out.length ? out.join(' / ') : 'Gmail付与のAuthentication-Resultsなし';
 }
 
 /** xlsx添付 (AMC出荷明細表) → [{vendorCode, vendorName, qty}]。見出し行 (商品コード+出荷数量) を探して以降を読む */
@@ -238,6 +273,70 @@ function fakeMails() {
   try { return JSON.parse(process.env.PO_SHIPMENT_FAKE_DATA || '[]'); } catch { return []; }
 }
 
+function fakeCandidates() {
+  return fakeMails().map(m => {
+    const dom = (mailboxOf(m.from) || 'x@invalid').split('@')[1];
+    const xlsx = (m.attachments || []).filter(a => /\.xlsx$/i.test(a.filename));
+    return {
+      id: m.id, from: m.from, subject: m.subject,
+      authResults: m.authResults !== undefined ? m.authResults
+        : `mx.google.com; spf=pass smtp.mailfrom=${dom}; dkim=pass header.d=${dom}; dmarc=pass header.from=${dom}`,
+      internalDateIso: m.internalDate || nowIso(),
+      xlsxNames: xlsx.map(a => a.filename), // 添付メタデータ (中身のDLなしで判定できる)
+      getHtml: async () => m.bodyHtml || '',
+      getFirstXlsx: async () => ({ filename: xlsx[0].filename, buf: Buffer.from(xlsx[0].dataBase64, 'base64') }),
+    };
+  });
+}
+
+const transientErr = e => { e.transient = true; return e; };
+
+/** Gmailのメッセージ (format=full) → 解析候補。添付は「メタデータのみ」保持し、中身のDLは getFirstXlsx まで遅延 */
+function candidateFromGmailMsg(msg) {
+  const collected = walkParts(msg.payload, { html: '', attachments: [] });
+  return {
+    id: msg.id,
+    from: headerOf(msg.payload, 'From'), subject: headerOf(msg.payload, 'Subject'),
+    authResults: headersOf(msg.payload, 'Authentication-Results'), // 全ヘッダを渡し、authserv-id=mx.google.comのみ採用
+    internalDateIso: msg.internalDate ? new Date(Number(msg.internalDate)).toISOString() : nowIso(),
+    xlsxNames: collected.attachments.map(a => a.filename),
+    getHtml: async () => collected.html,
+    // 解析するのは先頭のxlsxだけ — 認証を通ったメールについて必要な1件だけDLする
+    // (未認証メールの大量添付でAPI/メモリを浪費させない、Codex 入荷予定R1 High)
+    getFirstXlsx: async () => {
+      const a = collected.attachments[0];
+      let att;
+      try { att = await gmailApiGet(`messages/${encodeURIComponent(msg.id)}/attachments/${encodeURIComponent(a.attachmentId)}`, 60000); }
+      catch (e) { throw transientErr(e); } // 添付DL失敗=一時障害扱い (次回取得でやり直し)
+      return { filename: a.filename, buf: b64urlToBuf(att.data) };
+    },
+  };
+}
+
+/**
+ * ルールに従って1通を解析する (取得/再解析の共通コア)。
+ * @throws e.notCandidate=true: 出荷明細ではない (AMCのxlsx添付なし=請求書等) — 一覧に登録しない
+ * @throws e.transient=true: 一時的な取得障害 — 保存せず次回やり直し
+ */
+async function parseByRule(c, rule) {
+  const authError = () => new Error('送信元の認証を確認できません — なりすましの可能性があるため自動変換しません。' +
+    `本物なら手動貼り付けを使ってください [判定: ${summarizeAuth(c.authResults)}]`);
+  if (rule.kind === 'xlsx') {
+    // 判定順: 添付メタデータなし=対象外 → 認証 → 認証済みだけ先頭xlsxをDL (Codex 入荷予定R1 High)
+    const names = c.xlsxNames || [];
+    if (!names.length) { const e = new Error('xlsx添付がありません'); e.notCandidate = true; throw e; }
+    if (!authPassed(c.authResults, rule.domain, rule.extraAuthDomains)) throw authError();
+    const file = await c.getFirstXlsx();
+    const items = await parseShipmentXlsx(file.buf);
+    if (!items.length) throw new Error('明細が0行です');
+    return { items, note: file.filename + (names.length > 1 ? ` (他${names.length - 1}添付は未解析)` : '') };
+  }
+  if (!authPassed(c.authResults, rule.domain, rule.extraAuthDomains)) throw authError();
+  const items = parseShipmentHtml(await c.getHtml());
+  if (!items.length) throw new Error('本文から明細の表 (商品ID/出荷数の見出し) を読み取れません');
+  return { items, note: null };
+}
+
 /**
  * 出荷明細メールを取得して po_shipment_mails に登録する (既存gmail_idはスキップ=冪等)。
  * @returns {checked, added, errors: [{gmailId, error}]}
@@ -253,22 +352,10 @@ export async function fetchShipmentMails(actor, { newerThanDays = 30 } = {}) {
 
   const useFake = !!process.env.PO_SHIPMENT_FAKE_DATA;
   // 一時的な通信障害 (添付ダウンロード等) は行を確定保存せず次回の取得でやり直す。
-  // 恒久的な内容エラー (添付なし/形式不正) だけ status='error' で保存する (Codex mail-R1 Medium)
-  const transientErr = e => { e.transient = true; return e; };
+  // 恒久的な内容エラー (形式不正等) だけ status='error' で保存する (Codex mail-R1 Medium)
   let candidates; // [{id, from, subject, authResults, internalDateIso, getHtml(), getXlsx()}]
   if (useFake) {
-    candidates = fakeMails().map(m => {
-      const dom = (mailboxOf(m.from) || 'x@invalid').split('@')[1];
-      return {
-      id: m.id, from: m.from, subject: m.subject,
-      authResults: m.authResults !== undefined ? m.authResults
-        : `mx.google.com; spf=pass smtp.mailfrom=${dom}; dkim=pass header.d=${dom}; dmarc=pass header.from=${dom}`,
-      internalDateIso: m.internalDate || nowIso(),
-      getHtml: async () => m.bodyHtml || '',
-      getXlsx: async () => (m.attachments || []).filter(a => /\.xlsx$/i.test(a.filename))
-        .map(a => ({ filename: a.filename, buf: Buffer.from(a.dataBase64, 'base64') })),
-      };
-    });
+    candidates = fakeCandidates();
   } else {
     const domains = SHIPMENT_MAIL_RULES.map(r => `from:${r.domain}`).join(' OR ');
     const q = `(${domains}) newer_than:${newerThanDays}d`;
@@ -289,25 +376,7 @@ export async function fetchShipmentMails(actor, { newerThanDays = 30 } = {}) {
     for (const meta of metas) {
       if (exists.get(meta.id)) continue; // 取得済みは本文をダウンロードしない
       const msg = await gmailApiGet(`messages/${encodeURIComponent(meta.id)}?format=full`);
-      const collected = walkParts(msg.payload, { html: '', attachments: [] });
-      candidates.push({
-        id: msg.id,
-        from: headerOf(msg.payload, 'From'), subject: headerOf(msg.payload, 'Subject'),
-        authResults: headersOf(msg.payload, 'Authentication-Results'), // 全ヘッダを渡し、authserv-id=mx.google.comのみ採用
-
-        internalDateIso: msg.internalDate ? new Date(Number(msg.internalDate)).toISOString() : nowIso(),
-        getHtml: async () => collected.html,
-        getXlsx: async () => {
-          const out = [];
-          for (const a of collected.attachments) {
-            let att;
-            try { att = await gmailApiGet(`messages/${encodeURIComponent(msg.id)}/attachments/${encodeURIComponent(a.attachmentId)}`, 60000); }
-            catch (e) { throw transientErr(e); } // 添付DL失敗=一時障害扱い (次回取得でやり直し)
-            out.push({ filename: a.filename, buf: b64urlToBuf(att.data) });
-          }
-          return out;
-        },
-      });
+      candidates.push(candidateFromGmailMsg(msg));
     }
   }
 
@@ -318,25 +387,17 @@ export async function fetchShipmentMails(actor, { newerThanDays = 30 } = {}) {
     if (!rule) continue; // 対象外の差出人/件名 (請求書等) は登録しない
     let items = [], note = null, status = 'new', error = null;
     try {
-      // 送信元の真正性 (SPF/DKIM/DMARC のFromドメイン整合)。検証できないメールは自動変換対象にしない (From詐称対策)
-      if (!authPassed(c.authResults, rule.domain)) throw new Error('送信元の認証 (SPF/DKIM/DMARC) を確認できません — なりすましの可能性があるため自動変換しません。本物なら手動貼り付けを使ってください');
-      if (rule.kind === 'xlsx') {
-        const files = await c.getXlsx();
-        if (!files.length) throw new Error('xlsx添付がありません');
-        items = await parseShipmentXlsx(files[0].buf);
-        note = files[0].filename + (files.length > 1 ? ` (他${files.length - 1}添付は未解析)` : '');
-      } else {
-        items = parseShipmentHtml(await c.getHtml());
-        if (!items.length) throw new Error('本文から明細の表 (商品ID/出荷数の見出し) を読み取れません');
-      }
-      if (!items.length) throw new Error('明細が0行です');
+      ({ items, note } = await parseByRule(c, rule));
     } catch (e) {
       if (e.transient) { result.errors.push({ gmailId: c.id, error: String(e.message || e), transient: true }); continue; }
-      status = 'error';
+      // 出荷明細ではないメール (AMCのxlsx添付なし=請求書等) は一覧に載せないが、
+      // tombstone (not_candidate) として保存し、次回以降の再取得・再DLを防ぐ (Codex 入荷予定R1 Medium)
+      status = e.notCandidate ? 'not_candidate' : 'error';
       error = String(e.message || e);
     }
     ins.run(c.id, rule.supplierCode, String(c.from || '').slice(0, 200), String(c.subject || '').slice(0, 200),
       c.internalDateIso, JSON.stringify(items), note, status, error, nowIso(), nowIso());
+    if (status === 'not_candidate') { result.nonCandidates = (result.nonCandidates || 0) + 1; continue; }
     result.added++;
     if (error) result.errors.push({ gmailId: c.id, error });
   }
@@ -349,10 +410,60 @@ export async function fetchShipmentMails(actor, { newerThanDays = 30 } = {}) {
 
 export function listShipmentMails() {
   const db = getDB();
-  // new と error を表示 (done/ignored は直近5件だけ参考表示)
+  // new と error を表示 (done/ignored は直近10件を「↩ 戻す」付きで参考表示)
   const open = db.prepare("SELECT * FROM po_shipment_mails WHERE status IN ('new','error') ORDER BY received_at DESC").all();
-  const recent = db.prepare("SELECT * FROM po_shipment_mails WHERE status IN ('done','ignored') ORDER BY updated_at DESC LIMIT 5").all();
+  const recent = db.prepare("SELECT * FROM po_shipment_mails WHERE status IN ('done','ignored') ORDER BY updated_at DESC LIMIT 10").all();
   return { open, recent };
+}
+
+/**
+ * 1通を再解析する (Gmailから取り直して現行の解析ロジックにかけ直す)。
+ * 解析コード修正後に、既存のerror行をボタン一つでやり直すため。
+ * @returns {status:'new'|'error', itemCount?, error?} または {removed:true, reason} (出荷明細の対象外だった行は削除)
+ */
+export async function reparseShipmentMail(id, actor) {
+  const db = getDB();
+  const row = db.prepare('SELECT * FROM po_shipment_mails WHERE id=?').get(id);
+  if (!row) throw new Error('メールが見つかりません');
+  if (row.status === 'done') throw new Error('登録済みのメールは再解析できません (必要なら「↩ 戻す」で未処理に戻してから)');
+  if (row.status !== 'new' && row.status !== 'error') throw new Error(`未処理 (new/error) のメールだけ再解析できます (現在: ${row.status})`);
+  let c;
+  if (process.env.PO_SHIPMENT_FAKE_DATA) {
+    c = fakeCandidates().find(x => x.id === row.gmail_id) || null;
+  } else {
+    let msg;
+    try { msg = await gmailApiGet(`messages/${encodeURIComponent(row.gmail_id)}?format=full`); }
+    catch (e) { throw new Error(`Gmailからメールを再取得できません: ${String(e.message || e)}`); }
+    c = candidateFromGmailMsg(msg);
+  }
+  if (!c) throw new Error('Gmailからメールを再取得できません');
+  // 状態遷移は「再解析対象のままの行」だけに適用する楽観ロック (解析中に別タブで登録済み/無視に
+  // されたものを上書きして未処理へ復活させない、Codex 入荷予定R1 High)
+  const applyIfStillOpen = (fields, params, detail) => db.transaction(() => {
+    const upd = db.prepare(`UPDATE po_shipment_mails SET ${fields}, updated_at=? WHERE id=? AND status IN ('new','error')`)
+      .run(...params, nowIso(), id);
+    if (upd.changes === 0) throw new Error('再解析中にこのメールの状態が変わりました (登録済み/無視など)。一覧を更新して確認してください');
+    audit(db, { actorType: 'user', actor, action: 'shipment_mail_reparse', resource: `shipment_mail:${id}`,
+      detail: { gmailId: row.gmail_id, ...detail } });
+  }).immediate();
+  const toNotCandidate = reason => {
+    // 物理削除しない: gmail_id を残して次回取得の再DLを防ぎ、監査で追える (Codex 入荷予定R1 Medium)
+    applyIfStillOpen("status='not_candidate', error=?", [reason], { removed: true, reason });
+    return { removed: true, reason };
+  };
+  const rule = ruleFor(c.from, c.subject);
+  if (!rule) return toNotCandidate('出荷明細の対象外です (差出人/件名がルールに一致しません)');
+  try {
+    const { items, note } = await parseByRule(c, rule);
+    applyIfStillOpen("status='new', parsed_json=?, parse_note=?, error=NULL", [JSON.stringify(items), note], { status: 'new', items: items.length });
+    return { status: 'new', itemCount: items.length };
+  } catch (e) {
+    if (e.transient) throw new Error(`一時的な取得エラー: ${String(e.message || e)} — もう一度試してください`);
+    if (e.notCandidate) return toNotCandidate(`${String(e.message || e)} — 出荷明細ではないため一覧から外しました`);
+    const error = String(e.message || e);
+    applyIfStillOpen("status='error', error=?", [error], { status: 'error', error });
+    return { status: 'error', error };
+  }
 }
 
 export function setShipmentMailStatus(id, status, actor) {
