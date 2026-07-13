@@ -936,6 +936,9 @@ console.log('── P13b: 発注残ページ+消込API ──');
     ok(dash.includes('発注確定済み'), '/ 仕入先カードに発注確定済みバッジ');
     const adminHtml = await (await fetch(base + '/admin')).text();
     ok(adminHtml.includes('発注方法') && adminHtml.includes('📠 FAX') && adminHtml.includes('🌐 WEBサイト'), '/admin 発注方法プルダウン (email/fax/web/none)');
+    // IA整理 (2026-07-13): 4グループナビ+行動ベース説明+対応表CSVは対応表グループ内+未紐付けバッジ
+    ok(adminHtml.includes('grpBar') && adminHtml.includes('setGroup') && adminHtml.includes('📦 発注条件・商品') && adminHtml.includes('ここで設定します'), '/admin 4グループナビ+行動ベース説明');
+    ok(adminHtml.includes('zoneVmapCsv') && adminHtml.includes('unlinkedBadge') && adminHtml.includes('subBar'), '/admin 対応表CSV内包+未紐付けバッジ+サブタブ');
     const orders = await (await fetch(base + '/orders')).text();
     ok(orders.includes('PO番号') && orders.includes('発注残'), '/orders にPO番号・発注残列');
     // 仕入先ごと並び替え+絞り込み。仕入先名クリック=確定明細 (ワークスペース行きリンクは廃止、中原さん報告 2026-07-13)
