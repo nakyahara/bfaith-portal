@@ -77,8 +77,9 @@ export function setSetting(key, value, { actor = null, actorType = 'user', reaso
     throw new Error('件名テンプレに改行は使えません (ヘッダインジェクション対策)');
   }
   if (key === 'email_issuer_name') {
+    // trim前に検査 (trimが改行を消して「拒否した体で受理」にならないように、Codex CSV-R1 Low)
+    if (/[\r\n\0]/.test(String(value))) throw new Error('発行担当者名に改行は使えません');
     value = String(value).trim();
-    if (/[\r\n\0]/.test(value)) throw new Error('発行担当者名に改行は使えません');
     if (value.length > 50) throw new Error('発行担当者名が長すぎます (50文字まで)');
   }
   const db = getDB();

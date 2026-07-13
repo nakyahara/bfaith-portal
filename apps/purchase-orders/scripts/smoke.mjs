@@ -1148,6 +1148,8 @@ console.log('── P15: メール送信 (fake transport) ──');
   ok(r.body.csvText.split('\r\n')[1].split(',')[4] === 'テスト担当', 'preview: 発行担当者がCSVに反映');
   r = await jsonPost('/api/email/settings', { issuerName: '' });
   ok(r.body.ok && r.body.issuerName === '中原　大輔', 'メール設定: 空にすると既定に戻る');
+  r = await jsonPost('/api/email/settings', { issuerName: '担当\n者' });
+  ok(r.status === 400 && r.body.error.includes('改行'), 'メール設定: 発行担当者の改行は拒否 (末尾改行も)');
 
   // 希望納期なしの発注 → 「指定なし」。カスタムテンプレに {{nouki}} が無い場合は末尾に追記される
   {
