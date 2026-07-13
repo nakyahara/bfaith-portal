@@ -18,27 +18,28 @@
     .back-link:hover { text-decoration: underline; }
     .meta-bar { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px 14px; margin-bottom: 12px; font-size: 12px; color: #555; display: flex; gap: 16px; flex-wrap: wrap; align-items: center; }
 
-    /* 精度バッジ (要件 §9-2: 速報/推定/確定を常時区別。税はすべて税込) */
+    /* 精度バッジ */
     .pbadge { display: inline-block; padding: 1px 7px; border-radius: 4px; font-size: 10px; font-weight: 700; vertical-align: middle; }
     .pbadge.flash { background: #dbeafe; color: #1e40af; }
     .pbadge.est { background: #fef3c7; color: #92400e; }
     .pbadge.settled { background: #d1fae5; color: #065f46; }
+    .pbadge.actual { background: #ede9fe; color: #5b21b6; }
 
     /* タブ (楽天クリムゾン) */
     .tabs { display: flex; gap: 4px; margin-bottom: -1px; flex-wrap: wrap; }
-    .tab-btn { background: #fff; border: 1px solid #e5e7eb; border-bottom: none; border-radius: 6px 6px 0 0; padding: 10px 16px; cursor: pointer; font-size: 13px; color: #555; }
+    .tab-btn { background: #fff; border: 1px solid #e5e7eb; border-bottom: none; border-radius: 6px 6px 0 0; padding: 10px 16px; cursor: pointer; font-size: 13px; color: #555; position: relative; }
     .tab-btn.active { background: #bf0000; color: white; border-color: #bf0000; }
+    .tab-btn .cnt { position: absolute; top: -6px; right: -4px; background: #dc2626; color: #fff; border-radius: 10px; font-size: 10px; font-weight: 700; padding: 1px 6px; }
     .tab-content { background: white; border: 1px solid #e5e7eb; border-radius: 0 8px 8px 8px; padding: 16px; min-height: 400px; }
     .tab-pane { display: none; }
     .tab-pane.active { display: block; }
 
-    /* 期間切替 */
     .period-switcher { display: inline-flex; gap: 4px; background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 6px; padding: 2px; flex-wrap: wrap; }
     .period-switcher button { background: transparent; border: none; padding: 6px 10px; font-size: 12px; cursor: pointer; border-radius: 4px; color: #555; }
     .period-switcher button.active { background: #bf0000; color: white; }
     .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+    .toolbar select { border: 1px solid #d1d5db; border-radius: 6px; padding: 6px 8px; font-size: 12px; }
 
-    /* タイル */
     .tile-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin-bottom: 16px; }
     .tile { background: white; border: 1px solid #e5e7eb; border-radius: 10px; padding: 14px 18px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
     .tile h3 { margin: 0 0 8px; font-size: 14px; color: #374151; }
@@ -57,7 +58,44 @@
 
     .note { font-size: 11.5px; color: #6b7280; margin: 6px 0; }
     .warn-note { background: #fffbeb; border-left: 4px solid #f59e0b; padding: 8px 12px; font-size: 12px; color: #92400e; border-radius: 4px; margin-bottom: 12px; }
+    .err-note { background: #fef2f2; border-left: 4px solid #dc2626; padding: 8px 12px; font-size: 12px; color: #991b1b; border-radius: 4px; margin-bottom: 8px; }
     .loading { color: #6b7280; font-size: 13px; padding: 30px; text-align: center; }
+    .section-h { font-size: 14px; font-weight: 700; color: #1f2937; margin: 18px 0 8px; }
+    table.data { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+    table.data th, table.data td { border: 1px solid #e5e7eb; padding: 5px 8px; }
+    table.data th { background: #f9fafb; font-weight: 600; color: #374151; text-align: left; white-space: nowrap; }
+    table.data td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .table-scroll { overflow-x: auto; }
+    .name-cell { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+    .pill.ok { background: #d1fae5; color: #065f46; }
+    .pill.warn { background: #fef3c7; color: #92400e; }
+    .pill.err { background: #fee2e2; color: #991b1b; }
+    .pill.info { background: #dbeafe; color: #1e40af; }
+    .pill.todo { background: #f3f4f6; color: #6b7280; }
+    .btn { background: #bf0000; color: #fff; border: none; border-radius: 6px; padding: 6px 14px; font-size: 12px; cursor: pointer; }
+    .btn.secondary { background: #6b7280; }
+    .btn.ghost { background: #fff; color: #374151; border: 1px solid #d1d5db; }
+    .btn.sm { padding: 3px 10px; font-size: 11px; }
+    dialog { border: 1px solid #e5e7eb; border-radius: 10px; max-width: 920px; width: 92%; padding: 18px; }
+    dialog::backdrop { background: rgba(0,0,0,0.35); }
+    .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; margin-bottom: 10px; }
+    .form-grid label { font-size: 11px; color: #6b7280; display: block; }
+    .form-grid input, .form-grid select { width: 100%; border: 1px solid #d1d5db; border-radius: 6px; padding: 6px 8px; font-size: 12px; box-sizing: border-box; }
+
+    /* アクションカード */
+    .action-card { border: 1px solid #e5e7eb; border-left: 4px solid #d1d5db; border-radius: 8px; padding: 10px 14px; margin-bottom: 10px; background: #fff; }
+    .action-card.critical { border-left-color: #dc2626; }
+    .action-card.warning { border-left-color: #f59e0b; }
+    .action-card.info { border-left-color: #3b82f6; }
+    .action-card .a-title { font-size: 13.5px; font-weight: 700; color: #111; }
+    .action-card .a-sub { font-size: 12px; color: #6b7280; margin: 3px 0; }
+    .action-card .a-suggest { font-size: 12.5px; color: #1f2937; background: #f9fafb; border-radius: 6px; padding: 6px 10px; margin: 6px 0; }
+    .action-card .a-btns { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+    .factor-pill { display: inline-block; padding: 1px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; }
+    .factor-access { background: #dbeafe; color: #1e40af; }
+    .factor-cvr { background: #fee2e2; color: #991b1b; }
+    .factor-aov { background: #fef3c7; color: #92400e; }
   </style>
 </head>
 <body>
@@ -70,18 +108,19 @@
       </div>
     </div>
     <div class="meta-bar">
-      <span>精度: <span class="pbadge flash">速報</span>=受注ベース(毎朝更新) <span class="pbadge est">推定</span>=手数料10%一律 <span class="pbadge settled">確定</span>=月次仕訳書実額 / 金額はすべて<b>税込</b></span>
+      <span>精度: <span class="pbadge flash">速報</span>=受注ベース <span class="pbadge actual">実績</span>=RMSレポート自動取得 <span class="pbadge est">推定</span>=手数料10%一律 <span class="pbadge settled">確定</span>=月次仕訳書 / 金額は<b>税込</b></span>
       <span id="meta-updated"></span>
     </div>
 
     <div class="tabs" id="tabs">
       <button class="tab-btn active" data-tab="overview">🏠 概要</button>
+      <button class="tab-btn" data-tab="actions">🎯 アクション<span class="cnt" id="action-count" style="display:none;"></span></button>
+      <button class="tab-btn" data-tab="ads">📣 広告</button>
+      <button class="tab-btn" data-tab="equation">📈 売上方程式</button>
       <button class="tab-btn" data-tab="bestsellers">🏆 売れ筋</button>
       <button class="tab-btn" data-tab="profit">💰 利益分析</button>
-      <button class="tab-btn" data-tab="ads">📣 広告</button>
       <button class="tab-btn" data-tab="ranking">🔍 検索順位</button>
-      <button class="tab-btn" data-tab="diagnosis">🩺 診断</button>
-      <button class="tab-btn" data-tab="import">📥 取込</button>
+      <button class="tab-btn" data-tab="data">📡 データ</button>
       <button class="tab-btn" data-tab="settings">⚙️ 設定</button>
     </div>
 
@@ -109,42 +148,109 @@
         </div>
       </div>
 
-      <!-- 🏆 売れ筋 (P5) -->
-      <div class="tab-pane" id="pane-bestsellers">
-        <div class="warn-note">準備中 (P5)。実装予定: 売れ筋ランキング (数量/売上/実質利益の3軸) / 急上昇・急落 / ABC分析 / 楽天genre別 / 曜日パターン+イベント期間フラグ。</div>
+      <!-- 🎯 アクション -->
+      <div class="tab-pane" id="pane-actions">
+        <div class="toolbar">
+          <div class="period-switcher" id="act-filter">
+            <button data-f="open,acked" class="active">対応待ち</button>
+            <button data-f="done">完了</button>
+            <button data-f="resolved">解消</button>
+            <button data-f="dismissed">却下</button>
+            <button data-f="open,acked,done,dismissed,resolved">全て</button>
+          </div>
+          <button class="btn ghost sm" id="act-rerun">🔄 診断を再実行</button>
+          <span class="note" id="act-runinfo"></span>
+        </div>
+        <div id="act-runerror"></div>
+        <div id="act-list"><div class="loading">読み込み中…</div></div>
+        <div class="note">診断は毎日1回、画面を開いたときに自動実行されます (ルールv1: データ鮮度 / 損益分岐ROAS割れ / CVR急落 / 在庫切れ間近×広告)。
+        「完了」にすると実施記録が残り、7日後に前後比較 (参考評価) が詳細に表示されます。将来ここに AI の提案 (source=ai) も合流します。</div>
       </div>
 
-      <!-- 💰 利益分析 (P4) -->
-      <div class="tab-pane" id="pane-profit">
-        <div class="warn-note">準備中 (P4)。実装予定: 楽天版利益ウォーターフォール (クーポン→返金→手数料→送料→原価→広告費→料率推定コスト) / SKU別実質利益テーブル (損益分岐ROAS付き) / 料率マスタ。</div>
-      </div>
-
-      <!-- 📣 広告 (P3) -->
+      <!-- 📣 広告 -->
       <div class="tab-pane" id="pane-ads">
-        <div class="warn-note">準備中 (P3)。実装予定: RPP商品別・キーワード別の広告効率 / 損益分岐ROAS判定 (🟢余裕/🟡限界/🔴広告赤字) / 広告費率×売上の4象限 / クーポンアドバンス。<br>データは 📥取込タブ (P2) からのRPPレポートCSVアップロードで入ります。</div>
+        <div class="toolbar">
+          <label class="note">対象月</label><select id="ads-month"></select>
+          <span class="note" id="ads-match"></span>
+        </div>
+        <div id="ads-summary" class="tile-grid"></div>
+        <div class="charts-grid">
+          <div class="chart-card" style="grid-column: 1 / -1;">
+            <h3>日次広告費 × ROAS (直近90日、店舗全体) <span class="pbadge actual">実績</span></h3>
+            <div class="chart-wrap"><canvas id="chart-ads-daily"></canvas></div>
+          </div>
+        </div>
+        <div class="section-h">SKU別 広告効率 (RPP月次 × 利益fact) — 判定: 実ROAS(720h) vs 損益分岐ROAS = 100÷変動利益率</div>
+        <div class="table-scroll"><table class="data" id="ads-table"></table></div>
       </div>
 
-      <!-- 🔍 検索順位 (P6) -->
+      <!-- 📈 売上方程式 -->
+      <div class="tab-pane" id="pane-equation">
+        <div class="toolbar">
+          <div class="period-switcher" id="eq-window">
+            <button data-w="7" class="active">7日</button>
+            <button data-w="14">14日</button>
+            <button data-w="28">28日</button>
+          </div>
+          <span class="note">売上 = アクセス × 転換率 × 客単価。変化を3因子に分解します (順序固定の会計的分解、厳密な因果ではありません)</span>
+        </div>
+        <div id="eq-note"></div>
+        <div class="charts-grid">
+          <div class="chart-card">
+            <h3>店舗全体: 売上変化の因子分解 <span class="pbadge actual">実績</span> <span id="eq-title" class="note"></span></h3>
+            <div class="chart-wrap"><canvas id="chart-eq"></canvas></div>
+          </div>
+          <div class="chart-card">
+            <h3>SKU: <span id="eq-sku-title">上下表から商品をクリック</span></h3>
+            <div class="chart-wrap"><canvas id="chart-eq-sku"></canvas></div>
+          </div>
+        </div>
+        <div class="section-h">急落SKU (直近7日 vs 直前7日) — 主因バッジ: <span class="factor-pill factor-access">アクセス</span> <span class="factor-pill factor-cvr">転換率</span> <span class="factor-pill factor-aov">客単価</span></div>
+        <div class="table-scroll"><table class="data" id="eq-fallers"></table></div>
+        <div class="section-h">急伸SKU</div>
+        <div class="table-scroll"><table class="data" id="eq-risers"></table></div>
+      </div>
+
+      <!-- 🏆 売れ筋 (準備中) -->
+      <div class="tab-pane" id="pane-bestsellers">
+        <div class="warn-note">準備中。実装予定: 売れ筋ランキング (数量/売上/実質利益) / 急上昇・急落 / ABC / genre別 / 曜日×イベント。</div>
+      </div>
+
+      <!-- 💰 利益分析 (準備中) -->
+      <div class="tab-pane" id="pane-profit">
+        <div class="warn-note">準備中。実装予定: 楽天版ウォーターフォール / SKU別実質利益テーブル / 料率マスタ (確定月から実効料率を自動逆算)。</div>
+      </div>
+
+      <!-- 🔍 検索順位 (準備中) -->
       <div class="tab-pane" id="pane-ranking">
-        <div class="warn-note">準備中 (P6)。実装予定: 順位×売上×広告の重ね合わせグラフ / 施策注釈 / 順位急落リスト / 1ページ目占有率。データは既存順位チェッカー (mirror_rank_history 同期) から。<br>それまでは <a href="/apps/ranking-checker" target="_blank">既存の順位チェッカー</a> をご利用ください。</div>
+        <div class="warn-note">準備中。実装予定: 順位×売上×広告の重ね合わせ / 順位急落 / 1ページ目占有率 (mirror_rank_history 同期後)。それまでは <a href="/apps/ranking-checker" target="_blank">順位チェッカー</a> へ。</div>
       </div>
 
-      <!-- 🩺 診断 (P7) -->
-      <div class="tab-pane" id="pane-diagnosis">
-        <div class="warn-note">準備中 (P7)。実装予定: 稼ぎ頭 / 広告赤字 (損益分岐ROAS割れ30日) / 広告伸ばし先 / CVR低下 / 順位急落 / 死に筋 / 価格ミス疑い の自動判定リスト。</div>
+      <!-- 📡 データ -->
+      <div class="tab-pane" id="pane-data">
+        <div class="note">楽天のデータは <b>mall-csv-fetcher (miniPC)</b> が毎朝RMSから自動取得し、warehouse.db → mirror に同期されます。
+        自動取得が壊れた日は GChat に通知が届き、手動DL→miniPCの incoming/ フォルダ投入で無停止運用できます (取込コードは共通)。</div>
+        <div class="table-scroll"><table class="data" id="fresh-table"><tbody><tr><td class="loading">読み込み中…</td></tr></tbody></table></div>
       </div>
 
-      <!-- 📥 取込 (P2) -->
-      <div class="tab-pane" id="pane-import">
-        <div class="warn-note">準備中 (P2 — 次のPRで最優先実装)。実装予定: RPP全商品/全キーワードレポート (zip対応) / クーポンアドバンス / データ分析CSV / 月次費用明細 のドラッグ&ドロップ取込 (ヘッダ自動判別・同期間UPSERT) + データ鮮度ボード。</div>
-      </div>
-
-      <!-- ⚙️ 設定 (P7) -->
+      <!-- ⚙️ 設定 -->
       <div class="tab-pane" id="pane-settings">
-        <div class="warn-note">準備中 (P7)。実装予定: 料率マスタ (システム利用料/決済/ポイント/アフィリエイト — 確定月から実効料率を自動逆算) / イベントカレンダー (マラソン/スーパーセール) / 診断閾値 / GChat通知。</div>
+        <div class="section-h">診断ルールの閾値</div>
+        <div class="form-grid" id="th-form"></div>
+        <button class="btn" id="th-save">保存</button>
+        <span class="note" id="th-status"></span>
       </div>
     </div>
   </div>
+
+  <!-- アクション詳細ダイアログ -->
+  <dialog id="act-dialog">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+      <h3 style="margin:0; font-size:15px;" id="act-dialog-title"></h3>
+      <button class="btn secondary sm" onclick="document.getElementById('act-dialog').close()">閉じる</button>
+    </div>
+    <div id="act-dialog-body" style="font-size:12.5px;"></div>
+  </dialog>
 
 <script>
 // ============================================================
@@ -154,8 +260,6 @@ const API = '/apps/rakuten-analytics/api/v1';
 const charts = {};
 function destroyChart(id) { if (charts[id]) { charts[id].destroy(); delete charts[id]; } }
 function mkChart(id, cfg) { destroyChart(id); charts[id] = new Chart(document.getElementById(id).getContext('2d'), cfg); return charts[id]; }
-
-// 金額: 経営向け日本語単位 (億/万) — feedback_japanese_currency_units
 function fmtJPY(n) {
   if (n === null || n === undefined) return '−';
   const neg = n < 0; const a = Math.abs(Math.round(n));
@@ -173,9 +277,14 @@ async function getJSON(url) {
   if (!res.ok) throw new Error('HTTP ' + res.status);
   return res.json();
 }
+async function postJSON(url, body) {
+  const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+  return data;
+}
 function signClass(n) { return n < 0 ? 'negv' : n > 0 ? 'pos' : ''; }
 
-// 期間プリセット
 const PRESETS = [
   ['7d', '7日'], ['14d', '14日'], ['30d', '30日'], ['90d', '90日'],
   ['this_month', '今月'], ['last_month', '先月'], ['12m', '12ヶ月'], ['this_year', '今年'],
@@ -207,7 +316,8 @@ document.getElementById('tabs').addEventListener('click', (e) => {
 function loadTab(tab) {
   if (loaded[tab]) return;
   loaded[tab] = true;
-  ({ overview: loadOverview }[tab] || (() => {}))();
+  ({ overview: loadOverview, actions: loadActions, ads: loadAds, equation: loadEquation,
+     data: loadFreshness, settings: loadSettings }[tab] || (() => {}))();
 }
 
 // ============================================================
@@ -220,13 +330,13 @@ async function loadOverview() {
     document.getElementById('meta-updated').textContent =
       `データ最終日: ${data.data_to || '−'} / 生成: ${new Date(data.generated_at).toLocaleString('ja-JP')}`;
     document.getElementById('ov-freshness').textContent =
-      'factは毎朝07:00更新 (受注7日窓)。「今日」タイルは翌朝の更新まで0のままです。';
+      '受注factは毎朝07:00更新。広告実績はRMS仕様で昨日分まで (「今日」タイルは翌朝に埋まります)。';
     const tiles = data.tiles.map(t => {
       const confirmedRows = t.confirmed !== undefined ? (t.confirmed ? `
         <div class="row"><span>広告費 <span class="pbadge settled">確定</span></span><span class="v">−${fmtYen(t.confirmed.ad_cost)}</span></div>
         <div class="row"><span>楽天手数料 <span class="pbadge settled">確定</span></span><span class="v">−${fmtYen(t.confirmed.pf_fee)}</span></div>
         <div class="row"><span>実質利益 <span class="pbadge settled">確定寄せ</span></span><span class="v ${signClass(t.confirmed.full_margin)}">${fmtJPY(t.confirmed.full_margin)}</span></div>`
-        : `<div class="row"><span class="note">月次仕訳書 未取込 (広告費・実質利益は取込後に確定)</span><span></span></div>`) : '';
+        : `<div class="row"><span class="note">月次仕訳書 未取込 (確定値は取込後)</span><span></span></div>`) : '';
       return `<div class="tile">
         <h3>${t.label} <span class="note">(${t.from}${t.from !== t.to ? '〜' + t.to : ''})</span></h3>
         <div class="row"><span>売上(税込) <span class="pbadge flash">速報</span></span><span class="v">${fmtJPY(t.sales_incl)}</span></div>
@@ -234,7 +344,9 @@ async function loadOverview() {
         <div class="row"><span>クーポン店負 / 返金</span><span class="v">−${fmtYen(t.coupon_shop)} / −${fmtYen(t.refunds)}</span></div>
         <div class="row"><span>手数料 <span class="pbadge est">推定10%</span> / 送料</span><span class="v">−${fmtYen(t.mall_fee_est)} / −${fmtYen(t.shipping)}</span></div>
         <div class="row"><span>原価 <span class="note">ｶﾊﾞｰ${fmtPct(t.cost_coverage_pct)}</span></span><span class="v">−${fmtYen(t.cogs)}</span></div>
-        <div class="row hero"><span>粗利 <span class="pbadge flash">速報</span> <span class="note">${fmtPct(t.margin_pct)}</span></span><span class="v ${signClass(t.variable_margin)}">${fmtJPY(t.variable_margin)}</span></div>
+        <div class="row"><span>広告費 (RPP) <span class="pbadge actual">実績</span></span><span class="v">−${fmtYen(t.ad_cost)}</span></div>
+        <div class="row"><span>粗利 <span class="pbadge flash">速報</span> <span class="note">${fmtPct(t.margin_pct)}</span></span><span class="v ${signClass(t.variable_margin)}">${fmtJPY(t.variable_margin)}</span></div>
+        <div class="row hero"><span>広告後利益 <span class="pbadge flash">速報</span></span><span class="v ${signClass(t.margin_after_ads)}">${fmtJPY(t.margin_after_ads)}</span></div>
         ${confirmedRows}
       </div>`;
     }).join('');
@@ -244,6 +356,7 @@ async function loadOverview() {
   }
   mountPeriodSwitcher('ov-period', ovPreset, (p) => { ovPreset = p; loadTrend(); });
   loadTrend();
+  refreshActionBadge();
 }
 
 async function loadTrend() {
@@ -291,6 +404,348 @@ async function loadTrend() {
         scales: { y: { ticks: { callback: v => fmtJPY(v) } } },
         plugins: { tooltip: { callbacks: { label: c => c.dataset.label + ': ' + fmtJPY(c.parsed.y) } } } },
     });
+  } catch (e) { console.error(e); }
+}
+
+// ============================================================
+// 🎯 アクション
+// ============================================================
+let actFilter = 'open,acked';
+async function loadActions() {
+  document.getElementById('act-filter').addEventListener('click', (e) => {
+    const btn = e.target.closest('button'); if (!btn) return;
+    document.querySelectorAll('#act-filter button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    actFilter = btn.dataset.f;
+    fetchActions(false);
+  });
+  document.getElementById('act-rerun').addEventListener('click', async () => {
+    document.getElementById('act-runinfo').textContent = '診断を実行中…';
+    try { await postJSON(API + '/actions/run'); } catch (e) { alert('再実行失敗: ' + e.message); }
+    fetchActions(false);
+  });
+  fetchActions(true);
+}
+async function fetchActions(ensureRun) {
+  try {
+    const data = await getJSON(`${API}/actions?status=${encodeURIComponent(actFilter)}&ensure_run=${ensureRun ? '1' : '0'}`);
+    const run = data.latest_run;
+    document.getElementById('act-runinfo').textContent = run
+      ? `最終診断: ${new Date(run.finished_at || run.started_at).toLocaleString('ja-JP')} (${run.status}) / ルール ${data.rule_set_version}`
+      : '診断未実行';
+    document.getElementById('act-runerror').innerHTML = data.run_error ? `<div class="err-note">${esc(data.run_error)}</div>` : '';
+    updateActionBadge(data.action_counts);
+    const items = data.items || [];
+    if (items.length === 0) {
+      document.getElementById('act-list').innerHTML = '<div class="note" style="padding:20px; text-align:center;">該当するアクションはありません 🎉</div>';
+      return;
+    }
+    const sevPill = { critical: '<span class="pill err">要対応</span>', warning: '<span class="pill warn">注意</span>', info: '<span class="pill info">情報</span>' };
+    const stPill = { open: '', acked: '<span class="pill info">対応中</span>', done: '<span class="pill ok">完了</span>', dismissed: '<span class="pill todo">却下</span>', expired: '<span class="pill todo">期限切れ</span>', resolved: '<span class="pill ok">解消 (自動)</span>' };
+    document.getElementById('act-list').innerHTML = items.map(a => `
+      <div class="action-card ${a.severity}">
+        <div class="a-title">${sevPill[a.severity] || ''} ${stPill[a.status] || ''} ${esc(a.title)}</div>
+        <div class="a-sub">${esc(a.entity_type)}: <b>${esc(a.entity_id)}</b> ${esc(a.entity_label || '')}
+          / 初検知 ${esc((a.first_seen_at || '').slice(0, 10))} / 検知 ${a.occurrence_count}回 / ソース: ${a.source === 'rule' ? 'ルール' : a.source === 'ai' ? '🤖AI' : '人'}</div>
+        <div class="a-suggest">💡 ${esc(a.suggested_action || '(提案なし)')}</div>
+        <div class="a-btns">
+          ${a.status === 'open' ? `<button class="btn sm ghost" data-act="ack" data-id="${a.id}">対応中にする</button>` : ''}
+          ${(a.status === 'open' || a.status === 'acked') ? `
+            <button class="btn sm" data-act="done" data-id="${a.id}">✓ 実施した</button>
+            <button class="btn sm secondary" data-act="dismiss" data-id="${a.id}">却下</button>` : ''}
+          ${(a.status === 'dismissed' || a.status === 'done' || a.status === 'resolved') ? `<button class="btn sm ghost" data-act="reopen" data-id="${a.id}">再オープン</button>` : ''}
+          <button class="btn sm ghost" data-act="detail" data-id="${a.id}">詳細・履歴</button>
+        </div>
+      </div>`).join('');
+  } catch (e) {
+    document.getElementById('act-list').innerHTML = `<div class="err-note">取得失敗: ${esc(e.message)}</div>`;
+  }
+}
+function updateActionBadge(counts) {
+  const n = (counts?.open || 0);
+  const el = document.getElementById('action-count');
+  el.style.display = n > 0 ? '' : 'none';
+  el.textContent = n;
+}
+async function refreshActionBadge() {
+  try {
+    const data = await getJSON(`${API}/actions?status=open&limit=1&ensure_run=0`);
+    updateActionBadge(data.action_counts);
+  } catch { /* バッジは飾り */ }
+}
+
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest('button[data-act]'); if (!btn) return;
+  const id = btn.dataset.id, act = btn.dataset.act;
+  try {
+    if (act === 'detail') return showActionDetail(id);
+    if (act === 'ack') await postJSON(`${API}/actions/${id}/act`, { event: 'ack' });
+    if (act === 'reopen') await postJSON(`${API}/actions/${id}/act`, { event: 'reopen' });
+    if (act === 'done') {
+      const note = prompt('何を実施しましたか? (効果測定の記録に残ります)\n例: RPPの商品CPCを20円→15円に変更');
+      if (note === null) return;
+      await postJSON(`${API}/actions/${id}/act`, { event: 'done', note });
+    }
+    if (act === 'dismiss') {
+      const reason = prompt('却下理由 (AIの学習材料になります)\n例: 意図的な広告投資 (新商品育成中)');
+      if (reason === null) return;
+      const scope = confirm('この案件を今後も表示しない場合は OK (恒久却下)。\nキャンセル = 7日間だけ非表示') ? 'permanent' : 'occurrence';
+      await postJSON(`${API}/actions/${id}/act`, { event: 'dismiss', note: reason, dismiss_scope: scope });
+    }
+    fetchActions(false);
+  } catch (err) { alert('操作失敗: ' + err.message); }
+});
+
+async function showActionDetail(id) {
+  const dlg = document.getElementById('act-dialog');
+  document.getElementById('act-dialog-title').textContent = '読み込み中…';
+  document.getElementById('act-dialog-body').innerHTML = '';
+  dlg.showModal();
+  try {
+    const d = await getJSON(`${API}/actions/${id}`);
+    document.getElementById('act-dialog-title').textContent = d.title;
+    const ev = d.evidence || {};
+    const evRows = Object.entries(ev).map(([k, v]) =>
+      `<tr><td>${esc(k)}</td><td class="num">${esc(Array.isArray(v) ? v.join(', ') : v)}</td></tr>`).join('');
+    const events = (d.events || []).map(x =>
+      `<tr><td>${esc(new Date(x.at).toLocaleString('ja-JP'))}</td><td>${esc(x.event)}</td><td>${esc(x.actor_kind)}${x.actor ? ' (' + esc(x.actor) + ')' : ''}</td><td>${esc(x.note || '')}</td></tr>`).join('');
+    let effectHtml = '';
+    if (d.effect) {
+      const ef = d.effect;
+      effectHtml = `<div class="section-h">効果測定 (実施 ${esc(d.intervention?.implemented_date || '')} の前後${ef.window_days}日、参考評価)</div>
+        <table class="data"><thead><tr><th></th><th>実施前</th><th>実施後</th><th>変化</th></tr></thead><tbody>
+          <tr><td>売上</td><td class="num">${fmtYen(ef.before.sales)}</td><td class="num">${fmtYen(ef.after.sales)}</td><td class="num ${signClass(ef.sales_change_pct)}">${fmtPct(ef.sales_change_pct)}</td></tr>
+          <tr><td>アクセス</td><td class="num">${ef.before.access.toLocaleString()}</td><td class="num">${ef.after.access.toLocaleString()}</td><td class="num ${signClass(ef.access_change_pct)}">${fmtPct(ef.access_change_pct)}</td></tr>
+          <tr><td>転換率</td><td class="num">${fmtPct(ef.before.cvr_pct)}</td><td class="num">${fmtPct(ef.after.cvr_pct)}</td><td class="num ${signClass(ef.cvr_change_pct)}">${fmtPct(ef.cvr_change_pct)}</td></tr>
+        </tbody></table>
+        <div class="note">信頼度: ${esc(ef.confidence)}。前期間イベント: ${esc(ef.before.events.join(', ') || 'なし')} / 後期間イベント: ${esc(ef.after.events.join(', ') || 'なし')}</div>`;
+    }
+    document.getElementById('act-dialog-body').innerHTML = `
+      <div class="a-sub">${esc(d.entity_type)}: <b>${esc(d.entity_id)}</b> ${esc(d.entity_label || '')} / 状態: ${esc(d.status)} / 検知 ${d.occurrence_count}回</div>
+      <div class="a-suggest">💡 ${esc(d.suggested_action || '')}</div>
+      <div class="section-h">根拠 (最新スナップショット)</div>
+      <table class="data"><tbody>${evRows || '<tr><td class="note">なし</td></tr>'}</tbody></table>
+      ${effectHtml}
+      <div class="section-h">履歴 (誰が・いつ・何をしたか)</div>
+      <table class="data"><thead><tr><th>日時</th><th>イベント</th><th>操作者</th><th>メモ</th></tr></thead><tbody>${events}</tbody></table>`;
+  } catch (e) {
+    document.getElementById('act-dialog-body').innerHTML = `<div class="err-note">${esc(e.message)}</div>`;
+  }
+}
+
+// ============================================================
+// 📣 広告
+// ============================================================
+async function loadAds() {
+  document.getElementById('ads-month').addEventListener('change', () => fetchAds(document.getElementById('ads-month').value));
+  fetchAds('');
+}
+async function fetchAds(month) {
+  try {
+    const data = await getJSON(`${API}/ads${month ? '?month=' + encodeURIComponent(month) : ''}`);
+    if (!data.month) {
+      document.getElementById('ads-summary').innerHTML = '<div class="warn-note">広告データがまだmirrorに届いていません。データタブで鮮度を確認してください。</div>';
+      return;
+    }
+    const sel = document.getElementById('ads-month');
+    sel.innerHTML = data.months.map(m => `<option value="${esc(m)}" ${m === data.month ? 'selected' : ''}>${esc(m)}</option>`).join('');
+    document.getElementById('ads-match').textContent =
+      data.match?.matched_ad_cost_pct !== null
+        ? `利益factとの突合: ${data.match.matched_ad_cost_pct}% / 損益分岐判定可能: ${data.match.breakeven_eligible_pct}% (広告費ベース)` : '';
+    const s = data.summary;
+    const vc = s.verdict_counts || {};
+    document.getElementById('ads-summary').innerHTML = `
+      <div class="tile"><h3>広告費 (${esc(s.month)}) <span class="pbadge actual">実績</span></h3><div class="row hero"><span></span><span class="v">${fmtJPY(s.total_ad_cost)}</span></div><div class="note">${s.sku_count} SKU</div></div>
+      <div class="tile"><h3>広告経由売上 (720h)</h3><div class="row hero"><span></span><span class="v">${fmtJPY(s.total_ad_sales)}</span></div><div class="note">店舗ROAS ${s.total_ad_cost > 0 ? Math.round(s.total_ad_sales / s.total_ad_cost * 100) + '%' : '−'}</div></div>
+      <div class="tile"><h3>推定広告損益 <span class="pbadge est">推定</span></h3><div class="row hero"><span></span><span class="v ${signClass(s.est_ad_profit_total)}">${fmtJPY(s.est_ad_profit_total)}</span></div><div class="note">広告経由売上×変動利益率 − 広告費</div></div>
+      <div class="tile"><h3>判定内訳</h3>
+        <div class="row"><span>🔴 広告赤字</span><span class="v">${(vc.bleed_hard || 0) + (vc.bleed || 0)}</span></div>
+        <div class="row"><span>🟢 増額候補</span><span class="v">${vc.expand || 0}</span></div>
+        <div class="row"><span>⚪ 適正 / 判定不能</span><span class="v">${(vc.ok || 0)} / ${(vc.no_baseline || 0)}</span></div>
+      </div>`;
+
+    mkChart('chart-ads-daily', {
+      type: 'bar',
+      data: { labels: data.daily.map(r => r.date_jst), datasets: [
+        { label: '広告費', data: data.daily.map(r => r.ad_cost), backgroundColor: '#fecaca', yAxisID: 'y' },
+        { label: 'ROAS%', data: data.daily.map(r => r.roas_pct), type: 'line', borderColor: '#bf0000', pointRadius: 0, yAxisID: 'y1' },
+      ]},
+      options: { responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false },
+        scales: { y: { ticks: { callback: v => fmtJPY(v) } }, y1: { position: 'right', grid: { drawOnChartArea: false }, ticks: { callback: v => v + '%' } } } },
+    });
+
+    const vPill = {
+      bleed_hard: '<span class="pill err">🔴 大幅赤字</span>', bleed: '<span class="pill err">🔴 赤字</span>',
+      ok: '<span class="pill ok">⚪ 適正</span>', expand: '<span class="pill ok">🟢 増額候補</span>',
+      no_baseline: '<span class="pill todo">判定不能</span>',
+    };
+    document.getElementById('ads-table').innerHTML = `<thead><tr>
+      <th>SKU</th><th>商品名</th><th>判定</th><th>広告費</th><th>ｸﾘｯｸ</th><th>CPC</th><th>広告経由売上</th>
+      <th>実ROAS</th><th>損益分岐</th><th>変動利益率</th><th>推定広告損益</th><th>広告依存度</th>
+    </tr></thead><tbody>` + data.skus.map(r => `<tr>
+      <td>${esc(r.sku)}</td>
+      <td class="name-cell">${esc(r.name)}</td>
+      <td>${vPill[r.verdict] || ''}</td>
+      <td class="num">${fmtYen(r.ad_cost)}</td>
+      <td class="num">${(r.clicks || 0).toLocaleString()}</td>
+      <td class="num">${r.cpc === null ? '−' : '¥' + r.cpc}</td>
+      <td class="num">${fmtYen(r.ad_sales)}</td>
+      <td class="num">${fmtPct(r.roas_pct)}</td>
+      <td class="num">${fmtPct(r.breakeven_roas_pct)}</td>
+      <td class="num">${fmtPct(r.vm_rate_pct)}</td>
+      <td class="num ${signClass(r.est_ad_profit)}">${r.est_ad_profit === null ? '−' : fmtYen(r.est_ad_profit)}</td>
+      <td class="num">${r.ad_share_pct === null ? '−' : (r.ad_share_pct > 100 ? '100%+' : r.ad_share_pct + '%')}</td>
+    </tr>`).join('') + '</tbody>';
+  } catch (e) {
+    document.getElementById('ads-summary').innerHTML = `<div class="err-note">取得失敗: ${esc(e.message)}</div>`;
+  }
+}
+
+// ============================================================
+// 📈 売上方程式
+// ============================================================
+let eqWindow = 7;
+async function loadEquation() {
+  document.getElementById('eq-window').addEventListener('click', (e) => {
+    const btn = e.target.closest('button'); if (!btn) return;
+    document.querySelectorAll('#eq-window button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    eqWindow = Number(btn.dataset.w);
+    fetchEquation();
+  });
+  fetchEquation();
+  fetchMovers();
+}
+function renderEqWaterfall(canvasId, eq) {
+  const f = eq.factors;
+  const steps = [
+    { label: `前期間 売上`, v: eq.previous.sales, kind: 'total' },
+    { label: `アクセス (${eq.previous.access.toLocaleString()}→${eq.current.access.toLocaleString()})`, v: f.access, kind: 'delta' },
+    { label: `転換率 (${eq.previous.cvr_pct}%→${eq.current.cvr_pct}%)`, v: f.cvr, kind: 'delta' },
+    { label: `客単価 (¥${eq.previous.aov.toLocaleString()}→¥${eq.current.aov.toLocaleString()})`, v: f.aov, kind: 'delta' },
+    ...(Math.abs(f.residual) > 0 ? [{ label: 'その他・データ差異', v: f.residual, kind: 'delta' }] : []),
+    { label: `今期間 売上`, v: eq.current.sales, kind: 'total' },
+  ];
+  let cum = 0;
+  const bars = [], colors = [];
+  for (const s of steps) {
+    if (s.kind === 'total') { bars.push([0, s.v]); cum = s.v; colors.push('#9ca3af'); }
+    else { bars.push([cum, cum + s.v]); cum += s.v; colors.push(s.v >= 0 ? '#047857' : '#dc2626'); }
+  }
+  mkChart(canvasId, {
+    type: 'bar',
+    data: { labels: steps.map(s => s.label), datasets: [{ data: bars, backgroundColor: colors, borderSkipped: false }] },
+    options: { indexAxis: 'y', responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: { callbacks: {
+        label: (c) => { const s = steps[c.dataIndex]; return `${s.kind === 'total' ? '' : (s.v >= 0 ? '+' : '')}${fmtJPY(s.v)}`; } } } },
+      scales: { x: { ticks: { callback: v => fmtJPY(v) } } } },
+  });
+}
+async function fetchEquation() {
+  try {
+    const eq = await getJSON(`${API}/equation?level=store&window=${eqWindow}`);
+    if (!eq.available) {
+      document.getElementById('eq-note').innerHTML = '<div class="warn-note">店舗日次データがまだmirrorに届いていません。</div>';
+      return;
+    }
+    document.getElementById('eq-title').textContent = `${eq.current.from}〜${eq.current.to} vs ${eq.previous.from}〜${eq.previous.to}`;
+    document.getElementById('eq-note').innerHTML = `<div class="${eq.confounded ? 'warn-note' : 'note'}">${esc(eq.note)}。
+      今期間イベント: ${esc(eq.current.events.join(', ') || 'なし')} / 前期間: ${esc(eq.previous.events.join(', ') || 'なし')}</div>`;
+    renderEqWaterfall('chart-eq', eq);
+  } catch (e) { document.getElementById('eq-note').innerHTML = `<div class="err-note">${esc(e.message)}</div>`; }
+}
+async function fetchMovers() {
+  try {
+    const data = await getJSON(`${API}/equation/movers`);
+    if (!data.available) return;
+    const fLabel = { access: 'アクセス', cvr: '転換率', aov: '客単価', residual: 'その他' };
+    const fClass = { access: 'factor-access', cvr: 'factor-cvr', aov: 'factor-aov' };
+    const row = (r) => `<tr>
+      <td><a href="#" class="eq-sku-link" data-sku="${esc(r.sku)}" data-name="${esc(r.name)}">${esc(r.sku)}</a></td>
+      <td class="name-cell">${esc(r.name)}</td>
+      <td class="num">${fmtYen(r.sales_prev)}</td>
+      <td class="num">${fmtYen(r.sales_cur)}</td>
+      <td class="num ${signClass(r.delta)}"><b>${r.delta >= 0 ? '+' : ''}${fmtJPY(r.delta)}</b></td>
+      <td>${r.main_factor ? `<span class="factor-pill ${fClass[r.main_factor] || ''}">${fLabel[r.main_factor] || r.main_factor}</span>` : '−'}</td>
+      <td class="num">${r.factors.access >= 0 ? '+' : ''}${fmtJPY(r.factors.access)}</td>
+      <td class="num">${r.factors.cvr >= 0 ? '+' : ''}${fmtJPY(r.factors.cvr)}</td>
+      <td class="num">${r.factors.aov >= 0 ? '+' : ''}${fmtJPY(r.factors.aov)}</td>
+    </tr>`;
+    const head = `<thead><tr><th>SKU</th><th>商品名</th><th>前7日</th><th>直近7日</th><th>変化</th><th>主因</th><th>アクセス因子</th><th>転換率因子</th><th>客単価因子</th></tr></thead>`;
+    document.getElementById('eq-fallers').innerHTML = head + '<tbody>' + data.fallers.filter(r => r.delta < 0).map(row).join('') + '</tbody>';
+    document.getElementById('eq-risers').innerHTML = head + '<tbody>' + data.risers.filter(r => r.delta > 0).map(row).join('') + '</tbody>';
+  } catch (e) { console.error(e); }
+}
+document.addEventListener('click', async (e) => {
+  const a = e.target.closest('a.eq-sku-link'); if (!a) return;
+  e.preventDefault();
+  try {
+    const eq = await getJSON(`${API}/equation?level=sku&sku=${encodeURIComponent(a.dataset.sku)}&window=${eqWindow}`);
+    if (!eq.available) return;
+    document.getElementById('eq-sku-title').textContent = `${a.dataset.sku} ${a.dataset.name || ''}`;
+    renderEqWaterfall('chart-eq-sku', eq);
+  } catch (err) { console.error(err); }
+});
+
+// ============================================================
+// 📡 データ鮮度
+// ============================================================
+async function loadFreshness() {
+  try {
+    const data = await getJSON(API + '/freshness');
+    document.getElementById('fresh-table').innerHTML = `<thead><tr>
+      <th>データ</th><th>状態</th><th>最新</th><th>行数</th><th>取得経路</th>
+    </tr></thead><tbody>` + data.datasets.map(d => `<tr>
+      <td>${esc(d.label)}</td>
+      <td>${d.stale ? '<span class="pill err">停滞</span>' : '<span class="pill ok">正常</span>'}</td>
+      <td>${esc(d.latest || '−')}${d.lag_days !== null && d.lag_days > 0 ? ` <span class="note">(${d.lag_days}日前)</span>` : ''}</td>
+      <td class="num">${(d.rows || 0).toLocaleString()}</td>
+      <td class="note">${esc(d.source)}</td>
+    </tr>`).join('') + '</tbody>';
+  } catch (e) {
+    document.getElementById('fresh-table').innerHTML = `<tbody><tr><td class="err-note">${esc(e.message)}</td></tr></tbody>`;
+  }
+}
+
+// ============================================================
+// ⚙️ 設定 (診断閾値)
+// ============================================================
+const TH_LABELS = {
+  freshness_lag_days: 'データ停滞とみなす日数',
+  ad_min_spend_yen: '広告判定の最低月広告費 (円)',
+  ad_expand_roas_ratio: '増額候補: 損益分岐×N 以上',
+  cvr_min_access_7d: 'CVR急落判定の最低アクセス (7日)',
+  cvr_drop_warn_ratio: 'CVR急落 警告閾値 (基準比)',
+  cvr_drop_crit_ratio: 'CVR急落 重大閾値 (基準比)',
+  stock_days_threshold: '在庫警告の残日数',
+  dismiss_occurrence_days: '却下(今回のみ)の非表示日数',
+};
+async function loadSettings() {
+  try {
+    const s = await getJSON(API + '/settings');
+    document.getElementById('th-form').innerHTML = Object.entries(TH_LABELS).map(([k, label]) =>
+      `<div><label>${label}</label><input type="text" data-th="${k}" value="${s[k]}"></div>`).join('');
+    document.getElementById('th-save').onclick = async () => {
+      const patch = {};
+      document.querySelectorAll('[data-th]').forEach(el => { patch[el.dataset.th] = el.value; });
+      const st = document.getElementById('th-status');
+      try {
+        const res = await fetch(API + '/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+        if (data.rejected && data.rejected.length) {
+          st.textContent = `⚠️ 一部保存されませんでした: ${data.rejected.join(' / ')}`;
+        } else {
+          st.textContent = '保存しました ✓ (次回の診断実行から反映)';
+          setTimeout(() => st.textContent = '', 4000);
+        }
+        // 保存後の実値を再表示 (拒否された項目は元の値に戻る)
+        const cur = await getJSON(API + '/settings');
+        document.querySelectorAll('[data-th]').forEach(el => { if (el.dataset.th in cur) el.value = cur[el.dataset.th]; });
+      } catch (e) {
+        st.textContent = '保存失敗: ' + e.message;
+      }
+    };
   } catch (e) { console.error(e); }
 }
 
