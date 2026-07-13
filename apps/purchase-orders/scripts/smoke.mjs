@@ -2021,6 +2021,11 @@ console.log('── 入荷予定変換 (inbound-plan) + 仮登録 (pending) ─�
   db.prepare("INSERT INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, updated_at) VALUES ('1','0726-001060','0726-001060','ZZZ-NEW-1',?)").run(nowIsoStr());
   r = await jp2('/api/inbound-plan/convert', { supplier_code: '1', text: 'ZZZ-NEW-1\t新商品X\t10\n' });
   ok(r.body.ok && r.body.ambiguous.length === 1 && r.body.rowCount === 0, 'convert: 逆引き曖昧はambiguous (変換しない)', r.body.ambiguous);
+  // 手動upsertで同番号を別商品に付けると警告 (ブロックはしない、Codex plan-R2)
+  r = await jp2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'noflyersticker', vendor_code: 'zzz-new-1' });
+  ok(r.body.ok && r.body.warning && r.body.warning.includes('曖昧'), 'entry: 同番号の別商品登録は警告 (大小文字違いも検知)', r.body.warning);
+  r = await jp2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'noflyersticker', vendor_code: 'AMC-001' }); // 戻す
+  ok(r.body.ok && !r.body.warning, 'entry: 重複解消後は警告なし');
   db.prepare("DELETE FROM po_vendor_code_map WHERE supplier_code='1' AND product_key='0726-001060'").run();
 
   // 画面配信

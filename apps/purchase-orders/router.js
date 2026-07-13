@@ -1033,6 +1033,17 @@ router.post('/api/vendor-map/csv', upload.single('file'), (req, res) => {
       }
       // 誤CSV・空データで正常な対応表を消さない (0件はロールバック)
       if (count === 0) throw new Error('有効な行が0件のため取込を中止しました (既存の対応表は変更していません)');
+      // 同じ先方番号 (trim+upper) が複数商品に付いている場合は警告 (入荷予定変換の逆引きが曖昧になる。
+      // 単位違い等の正当な重複がありうるためブロックはしない、Codex plan-R2 Medium)
+      const byVendor = new Map();
+      for (const m of db.prepare('SELECT product_code, vendor_code FROM po_vendor_code_map WHERE supplier_code=?').all(supplierCode)) {
+        const k = m.vendor_code.trim().toUpperCase();
+        if (!byVendor.has(k)) byVendor.set(k, []);
+        byVendor.get(k).push(m.product_code);
+      }
+      for (const [vk, codes] of byVendor) {
+        if (codes.length > 1) warnings.push(`先方番号 ${vk} が複数商品 (${codes.join(', ')}) に付いています — 入荷予定変換では曖昧扱いになります`);
+      }
       audit(db, { actorType: 'user', actor: actorOf(req), action: 'vendor_map_import', resource: `supplier:${supplierCode}`,
         detail: { oldCount, newCount: count, skipped } });
     })();
@@ -1134,7 +1145,13 @@ router.post('/api/vendor-map/entry', (req, res) => {
         .run(supplier, key, productCode, vendorCode, nowIso());
       audit(db, { actorType: 'user', actor: actorOf(req), action: 'vendor_map_entry_upsert', resource: `supplier:${supplier}`,
         detail: { productCode, vendorCode, oldVendorCode: old ? old.vendor_code : null } });
-      out = { status: 200, body: { ok: true, updated: !!old, oldVendorCode: old ? old.vendor_code : null } };
+      // 同じ先方番号が別商品にも付いていたら警告 (入荷予定変換の逆引きが ambiguous になる。ブロックはしない —
+      // 実データに単位違い等の正当な重複がありうるため。Codex plan-R2 Medium)
+      const dupOf = db.prepare('SELECT product_code, vendor_code FROM po_vendor_code_map WHERE supplier_code=?').all(supplier)
+        .filter(m => normVendorCode(m.vendor_code) === normVendorCode(vendorCode) && normProductCode(m.product_code) !== key)
+        .map(m => m.product_code);
+      out = { status: 200, body: { ok: true, updated: !!old, oldVendorCode: old ? old.vendor_code : null,
+        warning: dupOf.length ? `この先方番号は商品 ${dupOf.join(', ')} にも登録されています (入荷予定変換で曖昧扱いになります)` : null } };
     })();
     res.status(out.status).json(out.body);
   } catch (e) {
@@ -1279,9 +1296,11 @@ router.post('/api/vendor-map/pending/:id/link', (req, res) => {
     const prodSup = normSupplierCode(pmlRow['仕入先']);
     if (!prodSup) return res.status(400).json({ ok: false, error: `この商品は商品マスタで仕入先が未設定です: ${productCode}` });
     if (prodSup !== pend.supplier_code) return res.status(400).json({ ok: false, error: `この商品の仕入先は ${prodSup} です (仮登録の仕入先 ${pend.supplier_code} と一致しません)` });
-    // 同じ先方番号が別商品に既に登録済みなら拒否 (逆引きが曖昧になり変換が止まる、Codex plan-R1 Medium)
-    const dup = db.prepare(`SELECT product_code FROM po_vendor_code_map
-      WHERE supplier_code=? AND upper(trim(vendor_code)) = ? AND product_key <> ?`).get(pend.supplier_code, normVendorCode(pend.vendor_code), key);
+    // 同じ先方番号が別商品に既に登録済みなら拒否 (逆引きが曖昧になり変換が止まる、Codex plan-R1 Medium)。
+    // 正規化は登録側と同じ normVendorCode (JS) で行う — SQLiteのupper()はASCII限定で不一致になる (Codex plan-R2)
+    const dup = db.prepare('SELECT product_code, vendor_code, product_key FROM po_vendor_code_map WHERE supplier_code=?')
+      .all(pend.supplier_code)
+      .find(m => normVendorCode(m.vendor_code) === normVendorCode(pend.vendor_code) && m.product_key !== key);
     if (dup) return res.status(400).json({ ok: false, error: `この先方番号は既に商品 ${dup.product_code} に登録されています。番号変更なら📇対応表で既存の行を修正してください` });
     let out = null;
     db.transaction(() => {
@@ -5268,7 +5287,11 @@ function vmPost(productCode, vendorCode, baseUpdatedAt) {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ supplier_code: VM_SUP, product_code: productCode, vendor_code: vendorCode, baseUpdatedAt: baseUpdatedAt }),
   }).then(function(r){ return r.json(); }).then(function(j) {
-    if (j.ok) { toast(j.updated ? '更新しました' + (j.oldVendorCode ? ' (旧: ' + j.oldVendorCode + ')' : '') : '追加しました'); loadVmap(); }
+    if (j.ok) {
+      toast(j.updated ? '更新しました' + (j.oldVendorCode ? ' (旧: ' + j.oldVendorCode + ')' : '') : '追加しました');
+      if (j.warning) toast('⚠️ ' + j.warning);
+      loadVmap();
+    }
     else { toast('エラー: ' + j.error); if (j.conflict) loadVmap(); }
   }).catch(function(e){ toast('通信エラー: ' + e.message); });
 }
