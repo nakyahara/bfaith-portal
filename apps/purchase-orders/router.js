@@ -3826,11 +3826,12 @@ function emPreviewModal(j) {
     ' <span class="muted" style="font-weight:400">(' + j.rows + '商品 / 合計 ' + j.totalQty.toLocaleString('ja-JP') + '個 / ' + yen(j.totalAmount) + ')</span></h3>' +
     '<div style="overflow-x:auto">' + tbl + '</div></div>';
   document.body.appendChild(bg);
-  bg.addEventListener('click', function(ev){ if (ev.target === bg) bg.remove(); });
-  document.getElementById('emModalClose').addEventListener('click', function(){ bg.remove(); });
-  document.addEventListener('keydown', function esck(ev) {
-    if (ev.key === 'Escape') { bg.remove(); document.removeEventListener('keydown', esck); }
-  });
+  // どの閉じ方でもDOM削除とESCリスナー解除を必ず両方行う (リスナー蓄積防止、Codex modal-R1 Low)
+  function closeModal() { bg.remove(); document.removeEventListener('keydown', esck); }
+  function esck(ev) { if (ev.key === 'Escape') closeModal(); }
+  bg.addEventListener('click', function(ev){ if (ev.target === bg) closeModal(); });
+  document.getElementById('emModalClose').addEventListener('click', closeModal);
+  document.addEventListener('keydown', esck);
 }
 
 function emailPanel(orderId) {
