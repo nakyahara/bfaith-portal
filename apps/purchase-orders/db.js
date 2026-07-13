@@ -589,6 +589,16 @@ function initLedgerSchema(db) {
 
   // 出荷明細メール (AMC/ビーフリーからの入荷予定の元データ。Gmail readonly で自動取得し解析結果を保持。
   // gmail_id UNIQUE = 同じメールを二重処理しない冪等キー)
+  // status に not_candidate (出荷明細でないメールのtombstone。一覧に出さないが gmail_id を記録し
+  // 再取得・再ダウンロードを防ぐ) を追加。旧CHECK制約のテーブルは再作成で移行
+  {
+    const cur = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='po_shipment_mails'").get();
+    if (cur && !cur.sql.includes('not_candidate')) {
+      db.exec(`
+        ALTER TABLE po_shipment_mails RENAME TO po_shipment_mails_old;
+      `);
+    }
+  }
   db.exec(`CREATE TABLE IF NOT EXISTS po_shipment_mails (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     gmail_id      TEXT NOT NULL UNIQUE,
@@ -598,11 +608,18 @@ function initLedgerSchema(db) {
     received_at   TEXT,               -- Gmail internalDate (UTC ISO)
     parsed_json   TEXT NOT NULL,      -- [{vendorCode, vendorName, qty}] (解析済み明細)
     parse_note    TEXT,               -- 添付ファイル名等
-    status        TEXT NOT NULL DEFAULT 'new' CHECK(status IN ('new','done','error','ignored')),
+    status        TEXT NOT NULL DEFAULT 'new' CHECK(status IN ('new','done','error','ignored','not_candidate')),
     error         TEXT,
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL
   )`);
+  if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='po_shipment_mails_old'").get()) {
+    db.exec(`
+      INSERT INTO po_shipment_mails (id, gmail_id, supplier_code, from_addr, subject, received_at, parsed_json, parse_note, status, error, created_at, updated_at)
+        SELECT id, gmail_id, supplier_code, from_addr, subject, received_at, parsed_json, parse_note, status, error, created_at, updated_at FROM po_shipment_mails_old;
+      DROP TABLE po_shipment_mails_old;
+    `);
+  }
 
   // メール送信ジョブ (outbox方式。txn内でGmail APIを呼ばない。delivery_key で二重送信の確率を構造的に低減:
   // 送信前に sending をcommit → Message-IDヘッダ+本文に埋込 → lease切れ再送前にGmail照合、不明時は自動再送しない)
