@@ -3750,7 +3750,7 @@ function orderHtml(o) {
   else if (o.attentionItems) flags += badge('b-draft', '⚠️ 要対応 ' + o.attentionItems + '明細');
   // 仕入先名はリンクにしない (以前は発注ワークスペースへ飛んでいて「確定した明細が消えた」ように
   // 見える誤解を生んだ、中原さん報告 2026-07-13)。行クリック=このPOの確定明細を展開。ワークスペースへは展開部の🛒から
-  var h = '<div class="sec"><h2 style="cursor:pointer" data-toggle="' + o.id + '" title="クリックでこの発注の明細 (確定時の内容) を開閉">' +
+  var h = '<div class="sec"><h2 style="cursor:pointer" data-toggle="' + o.id + '" tabindex="0" role="button" aria-expanded="false" title="クリックでこの発注の明細 (確定時の内容) を開閉">' +
     esc(o.poNumber || ('#' + o.id)) + ' — ' + esc(o.supplierName) + ' ' +
     st + (o.origin === 'migration' ? ' ' + badge('b-draft', '🔁 NE移行分', 'NE発注残の初期取込で作成 (発注書メール対象外)') : '') + ' ' + flags +
     '<span class="muted" style="font-weight:normal;font-size:12px;margin-left:8px">発注 ' + fmtD(o.issuedAt) + ' / 希望納期 ' + fmtD(o.requestedDate) +
@@ -4033,15 +4033,32 @@ function showPanel(itemId, html) {
 }
 function hidePanel(itemId) { HIST_SEQ++; document.getElementById('panel-' + itemId).style.display = 'none'; }
 
+function toggleOrder(v) {
+  var el = document.getElementById('items-' + v);
+  OPENED[v] = el.style.display === 'none';
+  el.style.display = OPENED[v] ? '' : 'none';
+  var h2 = document.querySelector('[data-toggle="' + v + '"]');
+  if (h2) h2.setAttribute('aria-expanded', OPENED[v] ? 'true' : 'false');
+}
+// 見出しはEnter/Spaceでも開閉できるようにする (仕入先名<a>廃止でキーボード導線が残るように、Codex R1 Medium)
+document.addEventListener('keydown', function(ev) {
+  if (ev.key !== 'Enter' && ev.key !== ' ') return;
+  var tg = ev.target.closest && ev.target.closest('[data-toggle]');
+  if (tg) { ev.preventDefault(); toggleOrder(tg.getAttribute('data-toggle')); }
+});
 document.addEventListener('click', function(ev) {
   var t = ev.target;
   var g = function(a){ return t.getAttribute && t.getAttribute(a); };
   var v;
   if ((v = g('data-view'))) { VIEW = v; render(); return; }
+  // 見出し内の子要素 (badge/日付span等) クリックでも展開する (Codex R1 Medium)。
+  // 見出し内の操作要素 (回答納期編集span等の data-* 持ち) は除外して個別ハンドラに委ねる
+  if (!g('data-pedit') && !g('data-emailui') && !g('data-closeui') && t.tagName !== 'A' && t.tagName !== 'BUTTON') {
+    var tgl = t.closest && t.closest('[data-toggle]');
+    if (tgl) { toggleOrder(tgl.getAttribute('data-toggle')); return; }
+  }
   if ((v = g('data-toggle'))) {
-    var el = document.getElementById('items-' + v);
-    OPENED[v] = el.style.display === 'none';
-    el.style.display = OPENED[v] ? '' : 'none';
+    toggleOrder(v);
     return;
   }
   if ((v = g('data-act'))) { actPanel(g('data-item2'), v); return; }
