@@ -1138,6 +1138,9 @@ console.log('── P15: メール送信 (fake transport) ──');
       'preview: 明細行 (通常/コード/単価・小計2桁)', cl[4]);
     ok(r.body.vendorColUsed && d1[7] === 'AMC-001', 'preview: 先方管理番号は備考列 (旧GASのH列追記と同じ)', d1[7]);
     ok(d1[3] === '2026/07/30', 'preview: 希望納期は明細4列目', d1[3]);
+    // ポップアッププレビュー用の行列 (csvRows) はCSV文字列と同一内容
+    ok(Array.isArray(r.body.csvRows) && r.body.csvRows.length === cl.length && r.body.csvRows[3][3] === '希望納期' &&
+      r.body.csvRows[4][1] === 'noflyersticker', 'preview: csvRows (ポップアップ表表示用) がCSVと一致', r.body.csvRows && r.body.csvRows[3]);
   }
   ok(r.body.body.includes('希望納期：2026年7月30日'), 'preview: 本文に希望納期 ({{nouki}})', r.body.body.split('\n').find(l => l.includes('希望納期')));
 
@@ -1404,6 +1407,7 @@ console.log('── P15: メール送信 (fake transport) ──');
     ok(adminHtml.includes('発注書メール設定') && adminHtml.includes('recipForm') && adminHtml.includes('vmapForm'), '/admin メール設定+宛先/対応表取込');
     const boHtml = await (await fetch(base + '/backorders')).text();
     ok(boHtml.includes('data-emailui') && boHtml.includes('DRYRUN') === false && boHtml.includes('emailPanel'), '/backorders 発注書メールパネル');
+    ok(boHtml.includes('emPreviewModal') && boHtml.includes('送信内容をプレビュー') && boHtml.includes('pomodal'), '/backorders 送信内容ポップアッププレビュー');
   }
 }
 

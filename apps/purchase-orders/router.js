@@ -771,7 +771,7 @@ router.get('/api/orders/:id/email/preview', (req, res) => {
       ok: true,
       to: p.to, cc: p.cc, subject: p.subject, body: p.body,
       rows: p.rows, totalQty: p.totalQty, totalAmount: p.totalAmount,
-      attachmentName: p.attachmentName, csvText: p.csvText,
+      attachmentName: p.attachmentName, csvText: p.csvText, csvRows: p.csvRows,
       vendorColUsed: p.vendorColUsed, missingVendorCodes: p.missingVendorCodes,
       mode: p.mode, dryrunTo: p.dryrunTo, envReady: p.envReady,
       jobs: listEmailJobs(orderId),
@@ -1887,6 +1887,8 @@ const CSS = `
   button.ok:hover { filter: brightness(.94); }
   button.ghost, a.ghost { border: none; background: none; color: var(--accent); padding: 3px 6px; font-weight: 500; text-decoration: none; display: inline-block; }
   button.ghost:hover, a.ghost:hover { background: var(--accent-soft); }
+  .pomodal-bg { position: fixed; inset: 0; background: rgba(15,23,42,.55); z-index: 200; display: flex; align-items: center; justify-content: center; padding: 24px; }
+  .pomodal { background: #fff; border-radius: 14px; max-width: 1000px; width: 100%; max-height: 88vh; overflow: auto; padding: 18px 22px; box-shadow: 0 12px 40px rgba(0,0,0,.35); }
   button.sm { padding: 4px 10px; font-size: 12px; }
   button:disabled { opacity: .5; cursor: default; }
   input[type=text], input[type=number], select, textarea { font: inherit; font-size: 13px; border: 1px solid #cbd5e1; border-radius: 8px; padding: 7px 10px; background: #fff; color: var(--ink); }
@@ -3793,6 +3795,46 @@ function orderHtml(o) {
 }
 
 // ── 発注書メールパネル (プレビュー→送信確認→送信。dry-run/再送/再試行/照合) ──
+// 送信内容のポップアッププレビュー: 宛先・件名・本文と、添付CSVを発注書の表として表示 (中原さん要望 2026-07-13)
+function emPreviewModal(j) {
+  var old = document.getElementById('emModalBg');
+  if (old) { if (old._close) old._close(); else old.remove(); } // 差し替え時も旧ESCリスナーごと片付ける (Codex modal-R2 Low)
+  var rows = j.csvRows || [];
+  var tbl = '<table class="t" style="margin-top:6px">';
+  rows.forEach(function(row, i) {
+    var th = (i === 0 || i === 3); // Header行と明細ヘッダ行
+    tbl += '<tr>' + row.map(function(c, ci) {
+      var alignR = (i >= 4 && (ci === 4 || ci === 5 || ci === 6)); // 明細の単価/数量/小計は右寄せ
+      return (th ? '<th>' : '<td' + (alignR ? ' class="r"' : '') + '>') + esc(c) + (th ? '</th>' : '</td>');
+    }).join('') + '</tr>';
+  });
+  tbl += '</table>';
+  var bg = document.createElement('div');
+  bg.className = 'pomodal-bg'; bg.id = 'emModalBg';
+  bg.innerHTML = '<div class="pomodal">' +
+    '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><h2 style="margin:0">📧 送信内容のプレビュー</h2>' +
+    (j.mode !== 'live'
+      ? '<span class="badge b-draft">🔒 dry-run — 実際は ' + esc(j.dryrunTo || '未設定') + ' に届きます</span>'
+      : '<span class="badge b-issued">本番送信 (live)</span>') +
+    '<button class="ghost" id="emModalClose" style="margin-left:auto;font-size:15px">✕ 閉じる</button></div>' +
+    '<table class="t" style="margin-top:8px">' +
+    '<tr><th style="width:80px">宛先</th><td>' + esc(j.to.join(', ')) + (j.cc.length ? ' <span class="muted">/ CC: ' + esc(j.cc.join(', ')) + '</span>' : '') + '</td></tr>' +
+    '<tr><th>件名</th><td>' + esc(j.subject) + '</td></tr></table>' +
+    '<h3 style="margin:12px 0 4px">本文</h3>' +
+    '<pre class="copy" style="max-height:30vh;overflow:auto">' + esc(j.body) + '</pre>' +
+    '<h3 style="margin:12px 0 4px">📎 添付: ' + esc(j.attachmentName) +
+    ' <span class="muted" style="font-weight:400">(' + j.rows + '商品 / 合計 ' + j.totalQty.toLocaleString('ja-JP') + '個 / ' + yen(j.totalAmount) + ')</span></h3>' +
+    '<div style="overflow-x:auto">' + tbl + '</div></div>';
+  document.body.appendChild(bg);
+  // どの閉じ方でもDOM削除とESCリスナー解除を必ず両方行う (リスナー蓄積防止、Codex modal-R1 Low)
+  function closeModal() { bg.remove(); document.removeEventListener('keydown', esck); }
+  function esck(ev) { if (ev.key === 'Escape') closeModal(); }
+  bg._close = closeModal;
+  bg.addEventListener('click', function(ev){ if (ev.target === bg) closeModal(); });
+  document.getElementById('emModalClose').addEventListener('click', closeModal);
+  document.addEventListener('keydown', esck);
+}
+
 function emailPanel(orderId) {
   var area = document.getElementById('emailArea-' + orderId);
   area.innerHTML = '<div class="muted">読み込み中…</div>';
@@ -3810,10 +3852,8 @@ function emailPanel(orderId) {
         (j.vendorColUsed ? ' / 先方管理番号列つき' : '') +
         (j.missingVendorCodes.length ? ' <span class="badge b-issued" title="' + esc(j.missingVendorCodes.join(', ')) + '">⚠️ 先方番号なし ' + j.missingVendorCodes.length + '件</span>' : '') + '</td></tr>' +
       '</table>' +
-      '<details style="margin-top:6px"><summary>本文と添付の内容を確認</summary>' +
-      '<pre class="copy" style="max-height:200px;overflow:auto">' + esc(j.body) + '</pre>' +
-      '<pre class="copy" style="max-height:160px;overflow:auto">' + esc(j.csvText) + '</pre></details>' +
       '<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +
+      '<button class="ghost" id="emPrev-' + orderId + '" style="font-weight:600">👁 送信内容をプレビュー (本文+添付)</button>' +
       '<button class="pri" id="emGo-' + orderId + '">' + (dry ? '📧 dry-run送信 (自分宛)' : '📧 今すぐ送信') + '</button>' +
       '<label class="muted">⏰ 日時指定 <input type="datetime-local" id="emWhen-' + orderId + '"></label>' +
       '<button class="ghost" id="emSched-' + orderId + '">⏰ 予約する</button>' +
@@ -3842,6 +3882,7 @@ function emailPanel(orderId) {
     }
     h += '</div>';
     area.innerHTML = h;
+    document.getElementById('emPrev-' + orderId).addEventListener('click', function(){ emPreviewModal(j); });
     var idemKey = newIdemKey();
     var whenEl = document.getElementById('emWhen-' + orderId);
     if (whenEl) whenEl.addEventListener('input', function(){ idemKey = newIdemKey(); });
