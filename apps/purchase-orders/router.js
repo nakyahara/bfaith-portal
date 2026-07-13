@@ -3737,8 +3737,14 @@ function render() {
   var h = '';
   list.forEach(function(o) { h += orderHtml(o); });
   document.getElementById('boList').innerHTML = h;
-  // 展開状態を復元
-  Object.keys(OPENED).forEach(function(id) { if (OPENED[id]) { var el = document.getElementById('items-' + id); if (el) el.style.display = ''; } });
+  // 展開状態を復元 (aria-expanded も同期、Codex R2 Medium)
+  Object.keys(OPENED).forEach(function(id) {
+    if (!OPENED[id]) return;
+    var el = document.getElementById('items-' + id);
+    if (el) el.style.display = '';
+    var h2 = document.querySelector('[data-toggle="' + id + '"]');
+    if (h2) h2.setAttribute('aria-expanded', 'true');
+  });
 }
 
 function orderHtml(o) {
