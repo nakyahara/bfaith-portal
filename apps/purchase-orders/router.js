@@ -4228,32 +4228,81 @@ load();`;
 router.get('/orders', (req, res) => {
   const body = `
     <h2 class="page">発注履歴</h2>
+    <div class="toolbar">
+      <label>並び順 <select id="ordSort">
+        <option value="new">新しい順</option>
+        <option value="supplier">仕入先ごと (各仕入先内は新しい順)</option>
+      </select></label>
+      <label>仕入先 <select id="ordSup"><option value="">すべて</option></select></label>
+      <span class="muted" id="ordCount"></span>
+    </div>
     <div class="sec"><div class="bd" id="list">読み込み中…</div></div>
     <div class="sec" id="detail" style="display:none"><h2 id="detailTitle"></h2><div class="bd" id="detailBody"></div></div>`;
   const script = `
+var ORDERS = [];
+function render() {
+  var sort = document.getElementById('ordSort').value;
+  var fsup = document.getElementById('ordSup').value;
+  var list = ORDERS.filter(function(o){ return !fsup || String(o.supplier_code) === fsup; });
+  document.getElementById('ordCount').textContent = list.length + ' 件';
+  if (!list.length) { document.getElementById('list').innerHTML = '<div class="muted">該当する履歴はありません</div>'; return; }
+  if (sort === 'supplier') {
+    // グループの順序 = その仕入先の最新発注が新しい順 (サーバ応答が新しい順なので出現順を維持)
+    var groups = new Map();
+    list.forEach(function(o) {
+      var k = String(o.supplier_code);
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(o);
+    });
+    var h = '';
+    groups.forEach(function(arr) {
+      h += '<tr><td colspan="10" style="background:#f1f5f9;font-weight:600">🏭 ' + esc(arr[0].supplier_name) + ' <span class="muted" style="font-weight:400">(' + arr.length + '件)</span></td></tr>';
+      arr.forEach(function(o){ h += rowHtml(o); });
+    });
+    document.getElementById('list').innerHTML = tableHead() + h + '</table>';
+  } else {
+    document.getElementById('list').innerHTML = tableHead() + list.map(rowHtml).join('') + '</table>';
+  }
+}
+function tableHead() {
+  return '<table class="t"><tr><th>PO番号</th><th>状態</th><th>仕入先</th><th class="r">SKU</th><th class="r">数量</th><th class="r">発注残</th><th class="r">金額(原価)</th><th>確定日時</th><th>メモ</th><th></th></tr>';
+}
+function rowHtml(o) {
+  var st;
+  if (o.status !== 'issued') st = '<span class="badge b-draft">下書き</span>';
+  else if (o.tracking_mode !== 'tracked') st = '<span class="badge b-issued">確定</span>';
+  else if (o.closed_at) st = '<span class="badge b-issued">完了</span>';
+  else st = '<span class="badge b-draft">発注残 ' + o.remaining_qty + '</span>';
+  var when = o.issued_at ? new Date(o.issued_at).toLocaleString('ja-JP') : '—';
+  // 仕入先名クリック=このPOの確定明細 (以前はワークスペース行きで「確定した内容と違う」誤解を生んだ)
+  return '<tr><td>' + esc(o.po_number || ('#' + o.id)) + '</td><td>' + st + '</td>' +
+    '<td><a data-id="' + o.id + '" style="cursor:pointer" title="この発注の明細 (確定時の内容) を表示">' + esc(o.supplier_name) + '</a></td>' +
+    '<td class="r">' + o.sku_count + '</td><td class="r">' + o.total_qty.toLocaleString('ja-JP') + '</td>' +
+    '<td class="r">' + (o.tracking_mode === 'tracked' ? o.remaining_qty.toLocaleString('ja-JP') : '—') + '</td>' +
+    '<td class="r">' + yen(o.total_amount) + '</td>' +
+    '<td>' + when + '</td><td>' + esc(o.note || '') + '</td>' +
+    '<td><button class="ghost" data-id="' + o.id + '">明細</button></td></tr>';
+}
 function load() {
   fetch('/apps/purchase-orders/api/orders').then(function(r){ return r.json(); }).then(function(j) {
     if (!j.ok) { document.getElementById('list').textContent = 'エラー: ' + j.error; return; }
-    if (!j.orders.length) { document.getElementById('list').innerHTML = '<div class="muted">履歴はまだありません</div>'; return; }
-    var h = '<table class="t"><tr><th>PO番号</th><th>状態</th><th>仕入先</th><th class="r">SKU</th><th class="r">数量</th><th class="r">発注残</th><th class="r">金額(原価)</th><th>確定日時</th><th>メモ</th><th></th></tr>';
-    j.orders.forEach(function(o) {
-      var st;
-      if (o.status !== 'issued') st = '<span class="badge b-draft">下書き</span>';
-      else if (o.tracking_mode !== 'tracked') st = '<span class="badge b-issued">確定</span>';
-      else if (o.closed_at) st = '<span class="badge b-issued">完了</span>';
-      else st = '<span class="badge b-draft">発注残 ' + o.remaining_qty + '</span>';
-      var when = o.issued_at ? new Date(o.issued_at).toLocaleString('ja-JP') : '—';
-      h += '<tr><td>' + esc(o.po_number || ('#' + o.id)) + '</td><td>' + st + '</td>' +
-        '<td><a href="/apps/purchase-orders/supplier/' + encodeURIComponent(o.supplier_code) + '">' + esc(o.supplier_name) + '</a></td>' +
-        '<td class="r">' + o.sku_count + '</td><td class="r">' + o.total_qty.toLocaleString('ja-JP') + '</td>' +
-        '<td class="r">' + (o.tracking_mode === 'tracked' ? o.remaining_qty.toLocaleString('ja-JP') : '—') + '</td>' +
-        '<td class="r">' + yen(o.total_amount) + '</td>' +
-        '<td>' + when + '</td><td>' + esc(o.note || '') + '</td>' +
-        '<td><button class="ghost" data-id="' + o.id + '">明細</button></td></tr>';
-    });
-    document.getElementById('list').innerHTML = h + '</table>';
+    ORDERS = j.orders || [];
+    if (!ORDERS.length) { document.getElementById('list').innerHTML = '<div class="muted">履歴はまだありません</div>'; return; }
+    // 仕入先フィルタの選択肢 (履歴に登場する仕入先のみ、名前順)
+    var seen = new Map();
+    ORDERS.forEach(function(o){ if (!seen.has(String(o.supplier_code))) seen.set(String(o.supplier_code), o.supplier_name); });
+    var opts = [...seen.entries()].sort(function(a, b){ return String(a[1]).localeCompare(String(b[1]), 'ja'); });
+    var sel = document.getElementById('ordSup');
+    var cur = sel.value;
+    sel.innerHTML = '<option value="">すべて</option>' + opts.map(function(e) {
+      return '<option value="' + esc(e[0]) + '">' + esc(e[1]) + '</option>';
+    }).join('');
+    sel.value = cur || '';
+    render();
   });
 }
+document.getElementById('ordSort').addEventListener('change', render);
+document.getElementById('ordSup').addEventListener('change', render);
 document.addEventListener('click', function(ev) {
   var id = ev.target.getAttribute && ev.target.getAttribute('data-id');
   if (!id) return;
@@ -4262,11 +4311,13 @@ document.addEventListener('click', function(ev) {
     var o = j.order;
     var lines = o.items.map(function(i){ return i.product_code + '\\t' + (i.product_name || '') + '\\t' + i.qty; });
     var text = lines.join('\\n');
-    document.getElementById('detailTitle').textContent = '発注 #' + o.id + ' — ' + o.supplier_name;
+    document.getElementById('detailTitle').textContent = (o.po_number || ('発注 #' + o.id)) + ' — ' + o.supplier_name + ' (確定時の明細)';
     document.getElementById('detailBody').innerHTML =
       '<button class="pri" id="btnCopyDetail">📋 リストをコピー</button> <button id="btnCsvDetail">⬇ CSVダウンロード</button>' +
+      '<a class="ghost" href="/apps/purchase-orders/supplier/' + encodeURIComponent(o.supplier_code) + '" title="この発注とは別に、新しい発注を作る画面へ移動します">🛒 ' + esc(o.supplier_name) + ' の発注画面へ (新しい発注作業)</a>' +
       '<pre class="copy">' + esc('商品コード\\t商品名\\t数量\\n' + text) + '</pre>';
     document.getElementById('detail').style.display = '';
+    document.getElementById('detail').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     document.getElementById('btnCopyDetail').addEventListener('click', function() {
       navigator.clipboard.writeText(text).then(function(){ toast('コピーしました'); });
     });
