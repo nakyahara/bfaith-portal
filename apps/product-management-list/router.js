@@ -11,6 +11,9 @@
 import { Router } from 'express';
 import iconv from 'iconv-lite';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
+// 正本ビュー (v_pml_rows_authoritative) は purchase-orders の初期化で作られる。cold start直後の
+// アクセスでビュー未作成の500にならないよう、読み取り前に getDB() で初期化を保証する (Codex SSoT-R2 Low)
+import { getDB as ensurePoInit } from '../purchase-orders/db.js';
 
 const router = Router();
 
@@ -53,6 +56,7 @@ async function callWarehouse(fullPath, { method = 'GET', timeout = 30000 } = {})
 }
 
 function loadPublished() {
+  ensurePoInit(); // 正本ビュー作成の保証 (初回のみ実処理、以降はno-op)
   const db = getMirrorDB();
   // pub + rows を 1 read transaction で読む。sync 側 atomic swap (DELETE→INSERT→published upsert) と
   // 競合しても「旧 run_id の published metadata + 空/別 run の rows」を返さないようにする (Codex⑤b R1 High)。

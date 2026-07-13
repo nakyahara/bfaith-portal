@@ -1932,7 +1932,8 @@ console.log('── 注残SSoT (正本ビュー/GAS endpoint差替/商品管理�
         if (ent.isDirectory()) { if (ent.name !== 'node_modules') walk(p); continue; }
         if (!/\.(js|mjs|cjs)$/.test(ent.name)) continue;
         const rel = path.relative(WORK, p).replace(/\\/g, '/');
-        if (ALLOW.some(a => rel.startsWith(a))) continue;
+        // ディレクトリ項目 (末尾/) は前方一致、ファイル項目は完全一致 (xxx.js.backup.cjs 等のすり抜け防止、Codex SSoT-R2)
+        if (ALLOW.some(a => a.endsWith('/') ? rel.startsWith(a) : rel === a)) continue;
         if (scanOne(p)) offenders.push(rel);
       }
     };

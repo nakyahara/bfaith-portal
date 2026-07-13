@@ -20,9 +20,9 @@
 このリポジトリの静的契約テスト (`apps/purchase-orders/scripts/smoke.mjs` の「注残SSoT契約」) が、
 許可リスト外のコードによる `mirror_pml_snapshot_rows` + `注残数` の直接参照を検出して落とす。
 
-許可リスト (直接参照してよい場所):
+許可リスト (直接参照してよい場所。ディレクトリは miniPC 側のみ、他はファイル単位):
 - `apps/warehouse/**` (miniPC 側。raw/snapshot の生成元)
-- `apps/warehouse-mirror/**` (ingest 検証・GAS endpoint の差替実装そのもの)
+- `apps/warehouse-mirror/db.js` (mirror DDL) / `apps/warehouse-mirror/router.js` (ingest 検証・GAS endpoint の差替実装そのもの)
 - `apps/purchase-orders/db.js` (正本ビューの定義) / `apps/purchase-orders/logic.js` (NEオーバーレイの表示用)
 - `apps/product-management-list/router.js` (ロールバック fallback)
 

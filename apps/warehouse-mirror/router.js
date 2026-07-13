@@ -3381,8 +3381,13 @@ function substituteLedgerBackorder(db, rows) {
     source: 'app_ledger',
   };
 }
-router.get('/api/pml/published', requirePmlReadToken, (req, res) => {
+router.get('/api/pml/published', requirePmlReadToken, async (req, res) => {
   res.set('Cache-Control', 'no-store');
+  // 正本ビュー (v_ledger_backorder_by_product) は purchase-orders の初期化で作られる。
+  // cold start直後のGASアクセスでビュー未作成500にならないよう初期化を保証 (Codex SSoT-R2 Low)。
+  // ⚠️動的import: 静的importだと相互依存になる (purchase-orders/db.js は本モジュールの隣 db.js を import する)
+  try { (await import('../purchase-orders/db.js')).getDB(); }
+  catch (e) { console.error('[Mirror] purchase-orders 初期化失敗 (注残差替の前提):', e.message); }
   const db = getMirrorDB();
   try {
     const snap = db.transaction(() => {
