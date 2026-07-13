@@ -371,18 +371,70 @@ function supplierWorkspaceData(code) {
 
 // ═══════════════════════════ API ═══════════════════════════
 
-// ─── 発注サイクル (「✅発注確定済み」表示の基準) ───
+// ─── 発注サイクル (「✅発注確定済み」「×非表示」の基準) ───
 // データ更新 (NE手動CSV取込/解除・FBA在庫更新) で po_cycle_reset_at を進め、それ以降に
-// 発注確定した仕入先へダッシュボードで「✅発注確定済み」を表示する。営業日 (as_of) が変われば自動リセット
+// 発注確定した仕入先へダッシュボードで「✅発注確定済み」を表示する。
+// ⚠️ 営業日 (as_of) での自動リセットは廃止 (中原さん要望 2026-07-13): 発注確定→翌日以降にメール送信、
+// という日をまたぐ運用のため、リセットは「データ更新ボタンを押した時だけ」。朝のNE自動同期では消えない
 function cycleStartIso(pub) {
   const marker = getSetting('po_cycle_reset_at') || '';
-  let dayStart = '';
+  if (marker) return marker;
+  // markerが一度も無い場合のみ営業日0時にフォールバック (初回運用)
   if (pub && pub.as_of_date) {
     const ms = Date.parse(String(pub.as_of_date) + 'T00:00:00+09:00');
-    if (Number.isFinite(ms)) dayStart = new Date(ms).toISOString();
+    if (Number.isFinite(ms)) return new Date(ms).toISOString();
   }
-  return marker > dayStart ? marker : dayStart;
+  return '';
 }
+
+// ─── ダッシュボード仕入先カードの×非表示 (サーバ保存 = 会社PC/自宅PC間で共有) ───
+// 保存値: {"cycle": <保存時の po_cycle_reset_at>, "codes": [...]}
+// 現在のサイクルIDと一致する場合のみ有効 = データ更新でサイクルが進むと自動失効 (明示クリア処理を散らさない導出方式)
+const HIDDEN_SUPPLIERS_MAX = 500;
+function readHiddenSuppliers() {
+  try {
+    const raw = getSetting('dashboard_hidden_suppliers');
+    if (!raw) return [];
+    const v = JSON.parse(raw);
+    const curCycle = getSetting('po_cycle_reset_at') || '';
+    if (!v || v.cycle !== curCycle || !Array.isArray(v.codes)) return [];
+    return [...new Set(v.codes.map(c => normSupplierCode(c)).filter(Boolean))];
+  } catch { return []; }
+}
+
+router.post('/api/dashboard/hidden', (req, res) => {
+  try {
+    const b = req.body || {};
+    const db = getDB();
+    let out = null;
+    db.transaction(() => {
+      const cur = readHiddenSuppliers();
+      let codes;
+      if (b.clear === true) {
+        codes = [];
+      } else {
+        const code = normSupplierCode(b.code);
+        if (!code) { out = { status: 400, body: { ok: false, error: '仕入先コードが必要です' } }; return; }
+        if (b.hidden === true) {
+          if (!db.prepare('SELECT 1 FROM po_suppliers WHERE supplier_code=?').get(code)) {
+            out = { status: 400, body: { ok: false, error: `仕入先が未登録です: ${code}` } }; return;
+          }
+          codes = cur.includes(code) ? cur : cur.concat([code]);
+          if (codes.length > HIDDEN_SUPPLIERS_MAX) { out = { status: 400, body: { ok: false, error: '非表示の仕入先が多すぎます' } }; return; }
+        } else if (b.hidden === false) {
+          codes = cur.filter(c => c !== code);
+        } else {
+          out = { status: 400, body: { ok: false, error: 'hidden (true/false) か clear:true が必要です' } }; return;
+        }
+      }
+      const cycle = getSetting('po_cycle_reset_at') || '';
+      setSetting('dashboard_hidden_suppliers', JSON.stringify({ cycle, codes }),
+        { actor: actorOf(req), reason: 'ダッシュボード仕入先カードの非表示変更' });
+      out = { status: 200, body: { ok: true, codes } };
+    })();
+    res.status(out.status).json(out.body);
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
 /** 今サイクルに発注確定した仕入先 (移行PO除く)。unsent = 発注書メール未送信 (本送信) のPO数 (email運用の仕入先のみ) */
 function cycleIssuedSuppliers(cycleStart) {
   const db = getDB();
@@ -1832,8 +1884,8 @@ const CSS = `
   button.pri:hover { background: var(--accent-d); border-color: var(--accent-d); }
   button.ok { background: var(--ok); border-color: var(--ok); color: #fff; }
   button.ok:hover { filter: brightness(.94); }
-  button.ghost { border: none; background: none; color: var(--accent); padding: 3px 6px; font-weight: 500; }
-  button.ghost:hover { background: var(--accent-soft); }
+  button.ghost, a.ghost { border: none; background: none; color: var(--accent); padding: 3px 6px; font-weight: 500; text-decoration: none; display: inline-block; }
+  button.ghost:hover, a.ghost:hover { background: var(--accent-soft); }
   button.sm { padding: 4px 10px; font-size: 12px; }
   button:disabled { opacity: .5; cursor: default; }
   input[type=text], input[type=number], select, textarea { font: inherit; font-size: 13px; border: 1px solid #cbd5e1; border-radius: 8px; padding: 7px 10px; background: #fff; color: var(--ink); }
@@ -1984,10 +2036,22 @@ router.get('/', (req, res) => {
     others.sort((a, b) => b.productCount - a.productCount);
     const searchIndex = products.filter(p => p.active).map(p => ({ c: p.code, n: p.name, s: p.supplierCode }));
     const boSummary = listBackorders().summary;
-    data = { pub, overlay, cards, others, searchIndex, boSummary };
+    data = { pub, overlay, cards, others, searchIndex, boSummary, hiddenCodes: readHiddenSuppliers(), cycleMarker: getSetting('po_cycle_reset_at') || '' };
   } catch (e) { return res.status(500).send('error: ' + he(e.message)); }
 
-  const { pub, overlay, cards, others, searchIndex, boSummary } = data;
+  const { pub, overlay, cards, others, searchIndex, boSummary, hiddenCodes, cycleMarker } = data;
+  // 発注サイクルの経過表示: ✅発注確定済み・×非表示はデータ更新ボタンまで保持される。長く放置したら注意を出す
+  let cycleNote = '';
+  if (cycleMarker) {
+    const ms = Date.parse(cycleMarker);
+    if (Number.isFinite(ms)) {
+      const jst = new Date(ms + 9 * 3600000);
+      const label = `${jst.getUTCMonth() + 1}/${jst.getUTCDate()} ${String(jst.getUTCHours()).padStart(2, '0')}:${String(jst.getUTCMinutes()).padStart(2, '0')}`;
+      const days = Math.floor((Date.now() - ms) / 86400000);
+      cycleNote = `🗓 発注サイクル: ${label} 開始 (✅発注確定済み・×非表示はデータ更新まで保持)` +
+        (days >= 3 ? ` <span style="color:var(--danger)">⚠️ 前回のデータ更新から${days}日経過</span>` : '');
+    }
+  }
   const stale = pub && pub.as_of_date ? (Date.now() - Date.parse(pub.as_of_date + 'T00:00:00+09:00')) > 3 * 86400000 : true;
   const freshNote = pub ? freshnessText(pub, overlay) : 'PML未同期';
   const cardHtml = c => `
@@ -2005,6 +2069,7 @@ router.get('/', (req, res) => {
     <div class="toolbar">
       <input type="text" id="q" placeholder="商品コード / 商品名で検索 → 仕入先を探す" style="width:340px">
       <span class="muted">${freshNote}</span>
+      ${cycleNote ? `<span class="muted" style="margin-left:12px">${cycleNote}</span>` : ''}
     </div>
     <div class="toolbar">
       <button id="btnFba">🔄 FBA在庫を今すぐ更新</button>
@@ -2032,11 +2097,20 @@ router.get('/', (req, res) => {
     </details>`;
   const script = `
 var IDX = ${jsonEmbed(searchIndex)};
-// 仕入先カードの非表示 (当日データ単位で保持=翌朝リセット。「非表示の仕入先」から戻せる)
-var DASH_KEY = 'po_dash_dis:' + ${jsonEmbed(pub ? pub.as_of_date : '')};
+// 仕入先カードの非表示 (サーバ保存=会社PC/自宅PCで共有。データ更新ボタンでサイクルが進むまで保持。
+// 旧localStorage方式は営業日で勝手にリセット+PC間で共有されず廃止、中原さん要望 2026-07-13)
 var HID = {};
-try { (JSON.parse(localStorage.getItem(DASH_KEY) || '[]')).forEach(function(c){ HID[c] = 1; }); } catch (e) {}
-function saveHid(){ try { localStorage.setItem(DASH_KEY, JSON.stringify(Object.keys(HID))); } catch (e) {} }
+${jsonEmbed(hiddenCodes)}.forEach(function(c){ HID[c] = 1; });
+// サーバ保存に成功してから画面へ反映する (失敗時に見た目と保存状態がズレない)
+function postHid(body, apply) {
+  fetch('/apps/purchase-orders/api/dashboard/hidden', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  }).then(function(r){ return r.json(); }).then(function(j) {
+    if (!j.ok) { toast('エラー: ' + j.error); return; }
+    apply();
+    applyHid();
+  }).catch(function(e){ toast('通信エラー: ' + e.message); });
+}
 function applyHid() {
   var hidden = [], visMain = 0;
   document.querySelectorAll('a.card[data-sup]').forEach(function(card) {
@@ -2063,14 +2137,16 @@ document.addEventListener('click', function(ev) {
   var cd = ev.target.getAttribute && ev.target.getAttribute('data-cdis');
   if (cd) {
     ev.preventDefault(); ev.stopPropagation(); // カード(リンク)への遷移を止める
-    HID[cd] = 1; saveHid(); applyHid();
-    toast('非表示にしました (「非表示の仕入先」から戻せます)');
+    postHid({ code: cd, hidden: true }, function() {
+      HID[cd] = 1;
+      toast('非表示にしました (「非表示の仕入先」から戻せます。次のデータ更新まで保持)');
+    });
     return;
   }
   var ud = ev.target.getAttribute && ev.target.getAttribute('data-cundis');
   if (ud) {
-    if (ud === '*') HID = {}; else delete HID[ud];
-    saveHid(); applyHid();
+    if (ud === '*') postHid({ clear: true }, function(){ HID = {}; });
+    else postHid({ code: ud, hidden: false }, function(){ delete HID[ud]; });
     return;
   }
 });
@@ -3672,8 +3748,10 @@ function orderHtml(o) {
   var flags = '';
   if (o.overdueItems) flags += badge('b-issued', '🔴 遅延 ' + o.overdueItems + '明細');
   else if (o.attentionItems) flags += badge('b-draft', '⚠️ 要対応 ' + o.attentionItems + '明細');
-  var h = '<div class="sec"><h2 style="cursor:pointer" data-toggle="' + o.id + '">' +
-    esc(o.poNumber || ('#' + o.id)) + ' — <a href="/apps/purchase-orders/supplier/' + encodeURIComponent(o.supplierCode) + '">' + esc(o.supplierName) + '</a> ' +
+  // 仕入先名はリンクにしない (以前は発注ワークスペースへ飛んでいて「確定した明細が消えた」ように
+  // 見える誤解を生んだ、中原さん報告 2026-07-13)。行クリック=このPOの確定明細を展開。ワークスペースへは展開部の🛒から
+  var h = '<div class="sec"><h2 style="cursor:pointer" data-toggle="' + o.id + '" title="クリックでこの発注の明細 (確定時の内容) を開閉">' +
+    esc(o.poNumber || ('#' + o.id)) + ' — ' + esc(o.supplierName) + ' ' +
     st + (o.origin === 'migration' ? ' ' + badge('b-draft', '🔁 NE移行分', 'NE発注残の初期取込で作成 (発注書メール対象外)') : '') + ' ' + flags +
     '<span class="muted" style="font-weight:normal;font-size:12px;margin-left:8px">発注 ' + fmtD(o.issuedAt) + ' / 希望納期 ' + fmtD(o.requestedDate) +
     ' / 残 ' + o.remainingQty.toLocaleString('ja-JP') + ' (' + yen(o.knownAmount) + ')' + (o.note ? ' / 📝' + esc(o.note) : '') + '</span></h2>' +
@@ -3701,6 +3779,7 @@ function orderHtml(o) {
   h += '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap" id="closeArea-' + o.id + '">' +
     (!o.sendBlocked ? '<button class="ghost" data-emailui="' + o.id + '">📧 発注書メール</button>' : '') +
     (o.open ? '<button class="ghost" data-closeui="' + o.id + '">✅ 残数を打切って完了にする (手動クローズ)</button>' : '') +
+    '<a class="ghost" href="/apps/purchase-orders/supplier/' + encodeURIComponent(o.supplierCode) + '" title="この発注とは別に、新しい発注を作る画面へ移動します">🛒 ' + esc(o.supplierName) + ' の発注画面へ (新しい発注作業)</a>' +
     '</div><div id="emailArea-' + o.id + '"></div>';
   h += '</div></div>';
   return h;
