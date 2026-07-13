@@ -707,6 +707,9 @@ export function checkLedgerIntegrity({ orderId = null } = {}) {
   // 見えなくなる = 商品コード改廃・正規化キー不一致の検知。SSoT化 2026-07-13 Codex提言の完全性監視)
   if (orderId == null) {
     try {
+      // published PML が無い環境 (初期セットアップ等) では全件が誤検知になるためスキップ (Codex SSoT-R3 Low)
+      const pub = db.prepare('SELECT run_id FROM mirror_pml_published WHERE id = 1').get();
+      if (!pub) return { issues, warnings };
       for (const r of db.prepare(`
         SELECT l.product_key, l.backorder_qty FROM v_ledger_backorder_by_product l
         WHERE NOT EXISTS (
