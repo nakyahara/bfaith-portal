@@ -53,7 +53,8 @@ export function stableStringify(v) {
 // setSetting で変更できるキーのホワイトリスト (tracking_started_at は含めない=初回確定後は不変。
 // DB側にも UPDATE/DELETE 拒否トリガあり)
 const SETTABLE_KEYS = new Set(['backorder_source', 'email_mode', 'email_dryrun_to', 'email_subject_template', 'email_body_template',
-  'po_cycle_reset_at']); // データ更新 (NE取込/FBA更新) 時刻 =「✅発注確定済み」表示のリセット基準
+  'po_cycle_reset_at',   // データ更新 (NE取込/FBA更新) 時刻 =「✅発注確定済み」「×非表示」のリセット基準 (サイクルID)
+  'dashboard_hidden_suppliers']); // ダッシュボード×非表示 {"cycle":<保存時のpo_cycle_reset_at>,"codes":[...]} — サイクルIDが変わると自動失効
 
 export function getSetting(key) {
   const r = getDB().prepare('SELECT value FROM po_settings WHERE key=?').get(key);

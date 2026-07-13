@@ -1651,6 +1651,61 @@ console.log('── FBAジョブ完了検知 (A→B→A) ──');
   ok(afterB === afterA2, '再検知で po_cycle_reset_at は動かない');
 }
 
+// ═══ ダッシュボード×非表示のサーバ保存 + 営業日自動リセット廃止 (中原さん要望 2026-07-13) ═══
+console.log('── ダッシュボード非表示 (サーバ保存/サイクル失効) + サイクルの営業日非依存 ──');
+{
+  const { setSetting: setL } = await imp('apps/purchase-orders/ledger.js');
+  const jp = body => j('/api/dashboard/hidden', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+
+  // 非表示にする → サーバに保存され、ダッシュボードHTMLに埋め込まれる (PC間共有の実体)
+  r = await jp({ code: '0001', hidden: true });
+  ok(r.body.ok && r.body.codes.includes('1'), 'hidden: 非表示保存 (0001→1正規化)', r.body);
+  let dashHtml = await (await fetch(base + '/')).text();
+  ok(dashHtml.includes('["1"].forEach'), 'hidden: ダッシュボードに非表示リスト埋め込み');
+  ok(!dashHtml.includes('po_dash_dis'), 'hidden: 旧localStorage方式は廃止');
+  ok(dashHtml.includes('発注サイクル:'), 'hidden: サイクル開始表示あり');
+
+  // バリデーション
+  r = await jp({ code: '9999', hidden: true });
+  ok(r.status === 400 && r.body.error.includes('未登録'), 'hidden: 未登録仕入先は400');
+  r = await jp({ code: '1' });
+  ok(r.status === 400, 'hidden: hidden/clear指定なしは400');
+  r = await jp({});
+  ok(r.status === 400, 'hidden: コードなしは400');
+
+  // 戻す
+  r = await jp({ code: '1', hidden: false });
+  ok(r.body.ok && r.body.codes.length === 0, 'hidden: ↩戻す');
+
+  // サイクル失効: 非表示 → データ更新 (サイクルbump) → 自動で無効化 (明示クリア不要の導出方式)
+  r = await jp({ code: '1', hidden: true });
+  ok(r.body.ok && r.body.codes.includes('1'), 'hidden: 再度非表示');
+  setL('po_cycle_reset_at', nowIsoStr(), { actor: 'smoke', reason: 'テスト: データ更新相当' });
+  dashHtml = await (await fetch(base + '/')).text();
+  ok(dashHtml.includes('[].forEach'), 'hidden: サイクルが進むと自動失効 (データ更新でリセット)');
+  r = await jp({ code: '1', hidden: true });
+  r = await jp({ clear: true });
+  ok(r.body.ok && r.body.codes.length === 0, 'hidden: clear (全て戻す)');
+
+  // 営業日 (as_of) では発注確定サイクルはもうリセットされない: as_ofを未来日にしてもcycle-issuedが変わらない
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 2 }] }) });
+  ok(r.body.ok !== false && r.body.id, 'サイクル: テスト用発注確定', r.body);
+  r = await j('/api/cycle-issued');
+  ok(r.body.ok && r.body.suppliers.some(s => s.code === '1'), 'サイクル: 確定直後は載る', r.body.suppliers);
+  const asOfBefore = db.prepare('SELECT as_of_date FROM mirror_pml_published WHERE id=1').get().as_of_date;
+  const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
+  db.prepare('UPDATE mirror_pml_published SET as_of_date=? WHERE id=1').run(tomorrow);
+  r = await j('/api/cycle-issued');
+  ok(r.body.ok && r.body.suppliers.some(s => s.code === '1'),
+    'サイクル: 営業日が変わっても (朝の自動同期でも) ✅発注確定済みは消えない — リセットはデータ更新ボタンのみ', r.body.suppliers);
+  db.prepare('UPDATE mirror_pml_published SET as_of_date=? WHERE id=1').run(asOfBefore);
+
+  // 発注残ページ: 仕入先名はワークスペースへのリンクではなくなった (明細が消えたと誤解しない導線)
+  const boHtml2 = await (await fetch(base + '/backorders')).text();
+  ok(boHtml2.includes('新しい発注作業') && boHtml2.includes('クリックでこの発注の明細'), '/backorders: 明細展開が主導線+ワークスペースは明示リンク');
+}
+
 server.close();
 console.log(`\n=== RESULT: pass=${pass} fail=${fail} ===`);
 process.exit(fail ? 1 : 0);
