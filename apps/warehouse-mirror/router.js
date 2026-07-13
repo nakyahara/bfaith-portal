@@ -13,7 +13,7 @@
  */
 import { Router } from 'express';
 import crypto from 'crypto';
-import { initMirrorDB, getMirrorDB, yahooInitError } from './db.js';
+import { initMirrorDB, getMirrorDB, yahooInitError, aupayDataInitError } from './db.js';
 import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
 import {
   STORE_BENCH_COLS, STORE_DEVICE_BASE_COLS, STORE_DEVICE_OPT_COLS, CATEGORY_DEMO_COLS,
@@ -918,8 +918,65 @@ const YAHOO_DATA_TABLE_SPECS = {
     defaults: { is_tax_included: 1 },
   },
 };
-// 楽天dd + Yahoo を1つのレジストリに統合 (getRakutenDdInsert/normalizeRakutenDdRow が参照)
-const DD_ALL_TABLE_SPECS = { ...RAKUTEN_DD_TABLE_SPECS, ...YAHOO_DATA_TABLE_SPECS };
+// au PAYマーケット分析 13種 (mall-csv-fetcher P1-A)。楽天dd/Yahoo と同じ宣言生成機構を使う
+const AUPAY_SALES_COLS = ['date_jst', 'segment_code', 'segment_raw', 'sales_yen', 'coupon_store_yen', 'coupon_mall_yen',
+  'point_ponta_au_yen', 'point_used_yen', 'orders', 'units', 'visits', 'buyer_uu', 'visitor_uu', 'pageviews',
+  'cvr_pct', 'avg_units', 'avg_price_yen', 'avg_visits', 'avg_pv',
+  'coupon_store_rate_pct', 'coupon_mall_rate_pct', 'point_rate_pct', 'is_tax_included', 'imported_at'];
+const AUPAY_REFERER_COLS = ['date_jst', 'segment_code', 'segment_raw', 'channel', 'visits', 'visitor_uu',
+  'sales_yen', 'orders', 'units', 'cvr_pct', 'avg_units', 'avg_price_yen', 'is_tax_included', 'imported_at'];
+const AUPAY_SEARCH_COLS = ['date_jst', 'segment_code', 'segment_raw', 'keyword', 'visits', 'visitor_uu', 'imported_at'];
+const AUPAY_PAGE_COLS = ['date_jst', 'page_url', 'pageviews', 'orders', 'via_orders', 'bounce_rate_pct', 'exit_rate_pct', 'imported_at'];
+const AUPAY_PRODUCT_COLS = ['date_jst', 'segment_code', 'segment_raw', 'lot_number', 'product_name', 'category',
+  'sales_yen', 'orders', 'units', 'avg_units', 'avg_price_yen', 'coupon_store_yen', 'coupon_mall_yen',
+  'buyer_uu', 'visits', 'visitor_uu', 'pageviews', 'cvr_visit_pct', 'cvr_uu_pct', 'is_tax_included', 'imported_at'];
+const AUPAY_DATA_TABLE_SPECS = {};
+for (const grain of ['daily', 'monthly']) {
+  AUPAY_DATA_TABLE_SPECS[`aupay_sales_${grain}`] = {
+    table: `mirror_aupay_sales_${grain}`, required: ['date_jst', 'segment_code'],
+    cols: AUPAY_SALES_COLS, defaults: { is_tax_included: 1 },
+  };
+  AUPAY_DATA_TABLE_SPECS[`aupay_referer_${grain}`] = {
+    table: `mirror_aupay_referer_${grain}`, required: ['date_jst', 'segment_code', 'channel'],
+    cols: AUPAY_REFERER_COLS, defaults: { is_tax_included: 1 },
+  };
+  AUPAY_DATA_TABLE_SPECS[`aupay_search_${grain}`] = {
+    table: `mirror_aupay_search_${grain}`, required: ['date_jst', 'segment_code', 'keyword'],
+    cols: AUPAY_SEARCH_COLS,
+  };
+  AUPAY_DATA_TABLE_SPECS[`aupay_page_${grain}`] = {
+    table: `mirror_aupay_page_${grain}`, required: ['date_jst', 'page_url'],
+    cols: AUPAY_PAGE_COLS,
+  };
+  AUPAY_DATA_TABLE_SPECS[`aupay_product_${grain}`] = {
+    table: `mirror_aupay_product_${grain}`, required: ['date_jst', 'segment_code', 'lot_number'],
+    cols: AUPAY_PRODUCT_COLS, defaults: { is_tax_included: 1 },
+  };
+}
+AUPAY_DATA_TABLE_SPECS.aupay_repeat_cohort_monthly = {
+  table: 'mirror_aupay_repeat_cohort_monthly',
+  required: ['date_jst', 'segment_code', 'target_month_jst'],
+  cols: ['date_jst', 'segment_code', 'segment_raw', 'target_month_jst', 'orders', 'imported_at'],
+  validate: (r, HttpErrorCls) => {
+    if (!/^\d{4}-\d{2}-01$/.test(String(r.target_month_jst))) {
+      throw new HttpErrorCls(400, { error: 'bad_row', message: `bad target_month_jst: ${r.target_month_jst}` });
+    }
+  },
+};
+AUPAY_DATA_TABLE_SPECS.aupay_pm_ad_daily = {
+  table: 'mirror_aupay_pm_ad_daily', required: ['date_jst'],
+  cols: ['date_jst', 'impressions', 'clicks', 'ctr_pct', 'cpc_yen', 'gmv_via_ad_yen', 'roas', 'cost_yen',
+    'is_tax_included', 'imported_at'],
+  defaults: { is_tax_included: 1 },
+};
+AUPAY_DATA_TABLE_SPECS.aupay_pm_query_weekly = {
+  table: 'mirror_aupay_pm_query_weekly', required: ['date_jst', 'keyword'],
+  cols: ['date_jst', 'keyword', 'rank', 'impressions', 'clicks', 'ctr_pct', 'imported_at'],
+};
+const AUPAY_DATA_ENTITY_NAMES = new Set(Object.keys(AUPAY_DATA_TABLE_SPECS));
+
+// 楽天dd + Yahoo + au PAY分析 を1つのレジストリに統合 (getRakutenDdInsert/normalizeRakutenDdRow が参照)
+const DD_ALL_TABLE_SPECS = { ...RAKUTEN_DD_TABLE_SPECS, ...YAHOO_DATA_TABLE_SPECS, ...AUPAY_DATA_TABLE_SPECS };
 
 function getRakutenDdInsert(db, entityKey) {
   const b = getStmtBundle(db);
@@ -1585,6 +1642,16 @@ const ENTITY_REGISTRY = {
     getInsertStmt: (db) => getRakutenDdInsert(db, 'yahoo_keyword_daily'),
     normalizeRow: (r) => normalizeRakutenDdRow('yahoo_keyword_daily', r),
   },
+  // au PAYマーケット分析 13 entity (mall-csv-fetcher P1-A、2026-07-13)
+  // 月次 entity は date_jst=月初日を clear キーに使う (rakuten_purchaser_monthly と同方針)
+  ...Object.fromEntries(Object.keys(AUPAY_DATA_TABLE_SPECS).map((key) => [key, {
+    contract_version: 1,
+    mirror_table: AUPAY_DATA_TABLE_SPECS[key].table,
+    clear_strategy: 'date_range',
+    clear_meta_key: `clear_${key.replace(/_daily$/, '_dates').replace(/_monthly$/, '_months').replace(/_weekly$/, '_dates')}`,
+    getInsertStmt: (db) => getRakutenDdInsert(db, key),
+    normalizeRow: (r) => normalizeRakutenDdRow(key, r),
+  }])),
   rakuten_finance_sku_daily: {
     contract_version: 1,
     mirror_table: 'mirror_rakuten_finance_sku_daily',
@@ -1799,6 +1866,10 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
   // 他モールは通常どおり動く (2026-07-12 の全停止障害の再発防御)
   if (entity.startsWith('yahoo_') && yahooInitError) {
     return res.status(503).json({ error: 'yahoo tables init failed', init_error: yahooInitError });
+  }
+  // au PAY分析表も同様 (⚠️既存の aupay_finance_sku_daily は fail-soft 対象外なので巻き込まない)
+  if (AUPAY_DATA_ENTITY_NAMES.has(entity) && aupayDataInitError) {
+    return res.status(503).json({ error: 'aupay data tables init failed', init_error: aupayDataInitError });
   }
   if (contract_version !== entityCfg.contract_version) {
     return res.status(400).json({

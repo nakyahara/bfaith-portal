@@ -139,7 +139,8 @@ async function main() {
       await page.locator('#loginId').fill(WOWMA_LOGIN_ID, { timeout: 10000 });
       await page.locator('#password').fill(WOWMA_LOGIN_PW, { timeout: 10000 });
       await snap(page, '1a_filled');
-      await page.locator('#btnLogin').click({ timeout: 10000 });
+      // #btnLogin は div ラッパーと input の2要素にマッチする (実測) → input を明示
+      await page.locator('input#btnLogin').click({ timeout: 10000 });
       await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
       await page.waitForTimeout(3000);
       await snap(page, '1b_after_login');
