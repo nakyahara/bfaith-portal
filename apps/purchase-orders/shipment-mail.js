@@ -50,36 +50,70 @@ function ruleFor(fromHeader, subject) {
  *  - または spf=pass の smtp.mailfrom と dkim=pass の header.d の両方がFromドメインに整合
  * 節 (;区切り) 単位で解析し、dmarc=passive 等の部分一致誤認を防ぐ。検証不能は false (自動変換させない)
  */
-export function authPassed(authResultsHeader, fromDomain) {
-  let h = String(authResultsHeader || '').toLowerCase();
-  const d = String(fromDomain || '').toLowerCase();
-  if (!h || !d) return false;
-  // quoted-string と RFC2045コメント (入れ子含む) を除去してから解析する。
-  // reason="... dmarc=pass ..." のような自由記述文字列でpass判定を注入させない (Codex mail-R3 High、RFC 8601)
-  h = h.replace(/"[^"]*"/g, '""');
-  let prev;
-  do { prev = h; h = h.replace(/\([^()]*\)/g, ' '); } while (h !== prev);
-  const align = v => !!v && (v === d || v.endsWith('.' + d) || d.endsWith('.' + v));
-  let dmarcFromDom = null, dmarcPassNoFrom = false, spfDom = null;
-  const dkimDoms = [];
-  for (const clause of h.split(';')) {
-    const c = clause.trim();
-    // method=result は「節の先頭」のみ有効 (RFC 8601 resinfo)。節中の任意位置では判定しない
-    const m = c.match(/^(dmarc|spf|dkim)=([a-z0-9]+)/);
-    if (!m || m[2] !== 'pass') continue;
-    if (m[1] === 'dmarc') {
-      const hf = c.match(/header\.from=([^\s]+)/);
-      if (hf) dmarcFromDom = hf[1]; else dmarcPassNoFrom = true;
-    } else if (m[1] === 'spf') {
-      const mf = c.match(/smtp\.mailfrom=(?:[^@\s]*@)?([^\s]+)/);
-      if (mf) spfDom = mf[1];
-    } else {
-      const hd = c.match(/header\.d=([^\s]+)/) || c.match(/header\.i=@?(?:[^@\s]*@)?([^\s]+)/);
-      if (hd) dkimDoms.push(hd[1]);
+/**
+ * Authentication-Results を ';' 節に分割する状態機械。quoted-string (quoted-pair \x 対応) と
+ * 入れ子コメント () の中身を捨て、その内側の ';' を節区切りにしない (正規表現置換では
+ * `reason="x\"; dmarc=pass"` のようなエスケープで迂回できる、Codex mail-R4 High / RFC 8601・5322)
+ */
+export function splitAuthClauses(header) {
+  const s = String(header || '');
+  const clauses = [];
+  let cur = '', depth = 0, inQ = false, esc = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (esc) { esc = false; continue; }
+    if (inQ) {
+      if (ch === '\\') { esc = true; continue; }
+      if (ch === '"') inQ = false;
+      continue;
     }
+    if (depth > 0) {
+      if (ch === '\\') { esc = true; continue; }
+      if (ch === '(') depth++;
+      else if (ch === ')') depth--;
+      continue;
+    }
+    if (ch === '"') { inQ = true; continue; }
+    if (ch === '(') { depth = 1; continue; }
+    if (ch === ';') { clauses.push(cur.trim()); cur = ''; continue; }
+    cur += ch;
   }
-  if (dmarcPassNoFrom || align(dmarcFromDom)) return true;
-  return align(spfDom) && dkimDoms.some(align);
+  clauses.push(cur.trim());
+  return clauses;
+}
+
+export function authPassed(authResultsHeaders, fromDomain) {
+  const headers = Array.isArray(authResultsHeaders) ? authResultsHeaders : [authResultsHeaders];
+  const d = String(fromDomain || '').toLowerCase();
+  if (!d) return false;
+  const align = v => !!v && (v === d || v.endsWith('.' + d) || d.endsWith('.' + v));
+  for (const raw of headers) {
+    const clauses = splitAuthClauses(String(raw || '').toLowerCase());
+    // 先頭節 = authserv-id。Gmail自身 (mx.google.com) が付与したヘッダだけを信頼する
+    // (外部から持ち込まれた同名ヘッダを判定に使わない、Codex mail-R4 High)
+    const authserv = (clauses[0] || '').split(/\s+/)[0];
+    if (authserv !== 'mx.google.com') continue;
+    let dmarcFromDom = null, spfDom = null;
+    const dkimDoms = [];
+    for (const c of clauses.slice(1)) {
+      // method=result は「節の先頭」のみ有効 (RFC 8601 resinfo)
+      const m = c.match(/^(dmarc|spf|dkim)=([a-z0-9]+)/);
+      if (!m || m[2] !== 'pass') continue;
+      if (m[1] === 'dmarc') {
+        const hf = c.match(/header\.from=([^\s]+)/);
+        if (hf) dmarcFromDom = hf[1]; // header.from の明示整合のみ許可 (無記載passは採用しない)
+      } else if (m[1] === 'spf') {
+        const mf = c.match(/smtp\.mailfrom=(?:[^@\s]*@)?([^\s]+)/);
+        if (mf) spfDom = mf[1];
+      } else {
+        const hd = c.match(/header\.d=([^\s]+)/) || c.match(/header\.i=@?(?:[^@\s]*@)?([^\s]+)/);
+        if (hd) dkimDoms.push(hd[1]);
+      }
+    }
+    if (align(dmarcFromDom)) return true;
+    if (align(spfDom) && dkimDoms.some(align)) return true;
+  }
+  return false;
 }
 
 /** xlsx添付 (AMC出荷明細表) → [{vendorCode, vendorName, qty}]。見出し行 (商品コード+出荷数量) を探して以降を読む */
@@ -194,6 +228,10 @@ function headerOf(payload, name) {
   const h = (payload.headers || []).find(x => String(x.name).toLowerCase() === name.toLowerCase());
   return h ? h.value : '';
 }
+/** 同名ヘッダを全部返す (Authentication-Resultsは複数あり得る。先頭1つだけ見る順序依存を避ける) */
+function headersOf(payload, name) {
+  return (payload.headers || []).filter(x => String(x.name).toLowerCase() === name.toLowerCase()).map(x => x.value);
+}
 
 /** 偽装データ (テスト用): [{id, from, subject, internalDate, bodyHtml?, attachments?: [{filename, dataBase64}]}] */
 function fakeMails() {
@@ -218,14 +256,18 @@ export async function fetchShipmentMails(actor, { newerThanDays = 30 } = {}) {
   const transientErr = e => { e.transient = true; return e; };
   let candidates; // [{id, from, subject, authResults, internalDateIso, getHtml(), getXlsx()}]
   if (useFake) {
-    candidates = fakeMails().map(m => ({
+    candidates = fakeMails().map(m => {
+      const dom = (mailboxOf(m.from) || 'x@invalid').split('@')[1];
+      return {
       id: m.id, from: m.from, subject: m.subject,
-      authResults: m.authResults !== undefined ? m.authResults : 'mx.google.com; spf=pass; dkim=pass; dmarc=pass',
+      authResults: m.authResults !== undefined ? m.authResults
+        : `mx.google.com; spf=pass smtp.mailfrom=${dom}; dkim=pass header.d=${dom}; dmarc=pass header.from=${dom}`,
       internalDateIso: m.internalDate || nowIso(),
       getHtml: async () => m.bodyHtml || '',
       getXlsx: async () => (m.attachments || []).filter(a => /\.xlsx$/i.test(a.filename))
         .map(a => ({ filename: a.filename, buf: Buffer.from(a.dataBase64, 'base64') })),
-    }));
+      };
+    });
   } else {
     const domains = SHIPMENT_MAIL_RULES.map(r => `from:${r.domain}`).join(' OR ');
     const q = `(${domains}) newer_than:${newerThanDays}d`;
@@ -246,7 +288,8 @@ export async function fetchShipmentMails(actor, { newerThanDays = 30 } = {}) {
       candidates.push({
         id: msg.id,
         from: headerOf(msg.payload, 'From'), subject: headerOf(msg.payload, 'Subject'),
-        authResults: headerOf(msg.payload, 'Authentication-Results'),
+        authResults: headersOf(msg.payload, 'Authentication-Results'), // 全ヘッダを渡し、authserv-id=mx.google.comのみ採用
+
         internalDateIso: msg.internalDate ? new Date(Number(msg.internalDate)).toISOString() : nowIso(),
         getHtml: async () => collected.html,
         getXlsx: async () => {

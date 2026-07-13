@@ -2129,6 +2129,12 @@ console.log('── 出荷明細メール自動取得 (fetch-mails) ──');
       'auth: quoted-string内のdmarc=pass注入は無効 (RFC8601)');
     ok(sm.authPassed('mx.google.com; dmarc=passive header.from=am-craft.jp', 'am-craft.jp') === false, 'auth: dmarc=passiveは不合格 (部分一致誤認なし)');
     ok(sm.authPassed('mx.google.com; spf=pass smtp.mailfrom=attacker.example; dkim=pass header.d=attacker.example', 'am-craft.jp') === false, 'auth: 他ドメインのspf/dkim passは不整合');
+    ok(sm.authPassed('mx.google.com; spf=fail reason="x\\"; dmarc=pass header.from=am-craft.jp"', 'am-craft.jp') === false,
+      'auth: quoted-pairエスケープでの注入も無効 (状態機械、Codex mail-R4 High)');
+    ok(sm.authPassed('attacker.example; dmarc=pass header.from=am-craft.jp', 'am-craft.jp') === false,
+      'auth: authserv-idがmx.google.com以外のヘッダは信頼しない (Codex mail-R4 High)');
+    ok(sm.authPassed(['attacker.example; dmarc=pass header.from=am-craft.jp', 'mx.google.com; dmarc=pass header.from=am-craft.jp'], 'am-craft.jp') === true,
+      'auth: 複数ヘッダはGmail発行分だけで判定');
     const nested = '<blockquote>古い<blockquote>もっと古い</blockquote><table><tr><th>商品ID</th><th>出荷数</th></tr><tr><td>OLD-1</td><td>99</td></tr></table></blockquote>' +
       '<table><tr><th>商品ID</th><th>出荷数</th></tr><tr><td>NEW-1</td><td>5</td></tr></table>';
     const nestedItems = sm.parseShipmentHtml(nested);
