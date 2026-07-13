@@ -54,7 +54,8 @@ export function stableStringify(v) {
 // DB側にも UPDATE/DELETE 拒否トリガあり)
 const SETTABLE_KEYS = new Set(['backorder_source', 'email_mode', 'email_dryrun_to', 'email_subject_template', 'email_body_template',
   'po_cycle_reset_at',   // データ更新 (NE取込/FBA更新) 時刻 =「✅発注確定済み」「×非表示」のリセット基準 (サイクルID)
-  'dashboard_hidden_suppliers']); // ダッシュボード×非表示 {"cycle":<保存時のpo_cycle_reset_at>,"codes":[...]} — サイクルIDが変わると自動失効
+  'dashboard_hidden_suppliers', // ダッシュボード×非表示 {"cycle":<保存時のpo_cycle_reset_at>,"codes":[...]} — サイクルIDが変わると自動失効
+  'email_issuer_name']); // 発注書CSVの「発行担当者」列
 
 export function getSetting(key) {
   const r = getDB().prepare('SELECT value FROM po_settings WHERE key=?').get(key);
@@ -74,6 +75,12 @@ export function setSetting(key, value, { actor = null, actorType = 'user', reaso
   }
   if (key === 'email_subject_template' && /[\r\n\0]/.test(String(value))) {
     throw new Error('件名テンプレに改行は使えません (ヘッダインジェクション対策)');
+  }
+  if (key === 'email_issuer_name') {
+    // trim前に検査 (trimが改行を消して「拒否した体で受理」にならないように、Codex CSV-R1 Low)
+    if (/[\r\n\0]/.test(String(value))) throw new Error('発行担当者名に改行は使えません');
+    value = String(value).trim();
+    if (value.length > 50) throw new Error('発行担当者名が長すぎます (50文字まで)');
   }
   const db = getDB();
   db.transaction(() => {
