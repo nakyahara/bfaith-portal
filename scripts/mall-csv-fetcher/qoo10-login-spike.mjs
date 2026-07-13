@@ -27,7 +27,7 @@ loadEnv({ path: join(__dirname, '.env') });
 
 // miniPC では secret をリポジトリ直下 .env に集約する運用 → 無いキーだけ選択的フォールバック
 {
-  const missing = ['QSM_LOGIN_ID', 'QSM_LOGIN_PW'].filter((k) => !process.env[k]);
+  const missing = ['QSM_LOGIN_ID', 'QSM_LOGIN_PW', 'QSM_SUB_ID'].filter((k) => !process.env[k]);
   if (missing.length) {
     try {
       const txt = readFileSync(join(__dirname, '..', '..', '.env'), 'utf8');
@@ -39,7 +39,7 @@ loadEnv({ path: join(__dirname, '.env') });
   }
 }
 
-const { QSM_LOGIN_ID, QSM_LOGIN_PW, HEADLESS = '0', MANUAL = '0' } = process.env;
+const { QSM_LOGIN_ID, QSM_LOGIN_PW, QSM_SUB_ID, HEADLESS = '0', MANUAL = '0' } = process.env;
 
 // QSM入口 (実測でリダイレクト先を確認する。ログインURLは初回観測に任せる)
 const QSM_TOP_URL = 'https://qsm.qoo10.jp/';
@@ -169,6 +169,40 @@ async function main() {
       await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
       await page.waitForTimeout(3000);
       await snap(page, '1b_after_login');
+
+      // [Step 2] サブID入力段 (実運用で確認済み: 本ID/PWの直後にサブIDを求められる)
+      {
+        const bodyNow = (await page.locator('body').innerText().catch(() => '')).replace(/\s+/g, ' ');
+        if (/サブ\s*ID|SUB\s*ID/i.test(bodyNow)) {
+          console.log('[Step 2] サブID入力画面を検出');
+          await dumpControls(page, 'subid');
+          if (!QSM_SUB_ID) {
+            console.log('  ⚠️ QSM_SUB_ID 未設定。.env に記入してください (中原さん)');
+            await snap(page, '2_subid_missing');
+            return;
+          }
+          // 可視のテキスト入力にサブIDを入れる (パスワード欄が同時にあれば本PWを再入力)
+          const subInput = page.locator('input[type=text]:visible, input:not([type]):visible').first();
+          if (!(await subInput.isVisible().catch(() => false))) {
+            console.log('  ❓ サブID入力欄を特定できず (DOMダンプからセレクタ確定)');
+            await snap(page, '2_subid_unknown');
+            return;
+          }
+          await subInput.fill(QSM_SUB_ID, { timeout: 8000 });
+          const subPw = page.locator('input[type=password]:visible').first();
+          if (await subPw.isVisible().catch(() => false)) {
+            await subPw.fill(QSM_LOGIN_PW, { timeout: 8000 });
+            console.log('  [subid] パスワード欄も検出 → 本PWを入力 (違うPWなら次スパイクで env 分離)');
+          }
+          await snap(page, '2a_subid_filled');
+          const btn2 = page.locator('button:has-text("ログイン"), button:has-text("確認"), input[type=submit], a:has-text("ログイン"), a:has-text("確認")').first();
+          if (await btn2.isVisible().catch(() => false)) await btn2.click({ timeout: 8000 });
+          else await page.keyboard.press('Enter');
+          await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
+          await page.waitForTimeout(3000);
+          await snap(page, '2b_after_subid');
+        }
+      }
     }
 
     console.log('\n[判定]');
