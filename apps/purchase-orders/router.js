@@ -3798,7 +3798,7 @@ function orderHtml(o) {
 // 送信内容のポップアッププレビュー: 宛先・件名・本文と、添付CSVを発注書の表として表示 (中原さん要望 2026-07-13)
 function emPreviewModal(j) {
   var old = document.getElementById('emModalBg');
-  if (old) old.remove();
+  if (old) { if (old._close) old._close(); else old.remove(); } // 差し替え時も旧ESCリスナーごと片付ける (Codex modal-R2 Low)
   var rows = j.csvRows || [];
   var tbl = '<table class="t" style="margin-top:6px">';
   rows.forEach(function(row, i) {
@@ -3829,6 +3829,7 @@ function emPreviewModal(j) {
   // どの閉じ方でもDOM削除とESCリスナー解除を必ず両方行う (リスナー蓄積防止、Codex modal-R1 Low)
   function closeModal() { bg.remove(); document.removeEventListener('keydown', esck); }
   function esck(ev) { if (ev.key === 'Escape') closeModal(); }
+  bg._close = closeModal;
   bg.addEventListener('click', function(ev){ if (ev.target === bg) closeModal(); });
   document.getElementById('emModalClose').addEventListener('click', closeModal);
   document.addEventListener('keydown', esck);
