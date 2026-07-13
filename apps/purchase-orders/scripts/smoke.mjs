@@ -1661,13 +1661,13 @@ console.log('── NE発注残 初期取込 (移行PO) ──');
   {
     let thr = null;
     try { db.prepare("INSERT INTO po_orders (supplier_code, supplier_name, status, created_at, updated_at, origin, send_blocked) VALUES ('1','x','draft',?,?,'migration',1)").run(nowIsoStr(), nowIsoStr()); } catch (e) { thr = e.message; }
-    ok(thr && thr.includes('migration rules'), 'トリガ: ne_slip_numberなしの移行POは拒否', thr);
+    ok(thr && thr.includes('origin rules'), 'トリガ: ne_slip_numberなしの移行POは拒否', thr);
     thr = null;
     try { db.prepare("INSERT INTO po_orders (supplier_code, supplier_name, status, created_at, updated_at, ne_slip_number) VALUES ('1','x','draft',?,?,'99999')").run(nowIsoStr(), nowIsoStr()); } catch (e) { thr = e.message; }
-    ok(thr && thr.includes('migration rules'), 'トリガ: originなしのne_slip_numberは拒否', thr);
+    ok(thr && thr.includes('origin rules'), 'トリガ: originなしのne_slip_numberは拒否', thr);
     thr = null;
     try { db.prepare("INSERT INTO po_orders (supplier_code, supplier_name, status, created_at, updated_at, origin, send_blocked, ne_slip_number) VALUES ('1','x','draft',?,?,'other',1,'99998')").run(nowIsoStr(), nowIsoStr()); } catch (e) { thr = e.message; }
-    ok(thr && thr.includes('migration rules'), 'トリガ: origin不正値は拒否', thr);
+    ok(thr && thr.includes('origin rules'), 'トリガ: origin不正値は拒否', thr);
   }
 
   // 作業中draftがある仕入先の取込は拒否 (取込用一時draftとUNIQUE衝突するため)
@@ -1681,6 +1681,81 @@ console.log('── NE発注残 初期取込 (移行PO) ──');
   // 発注残ページに取込UIが配信される
   const boHtml = await (await fetch(base + '/backorders')).text();
   ok(boHtml.includes('NE発注残の初期取込') && boHtml.includes('neImpPrev') && boHtml.includes('NE移行分'), '/backorders 取込UI配信');
+}
+
+// ═══ 追加発注 (supplement: 確定後の電話等の口頭追加・増量分) ═══
+console.log('── 追加発注 (supplement) ──');
+{
+  const jp = (p, body, key) => j(p, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(key ? { 'Idempotency-Key': key } : {}) }, body: JSON.stringify(body) });
+  r = await jp('/api/supplier/1/issue', { items: [{ code: 'noflyersticker', qty: 5 }] });
+  const parentId = r.body.id, parentPo = r.body.poNumber;
+
+  // 追加発注 (メールなし=既定): 新商品+既存商品の増量を1つの追加POに
+  r = await jp('/api/orders/' + parentId + '/supplement',
+    { items: [{ code: 'cardstand-silver-r', qty: 4 }, { code: 'noflyersticker', qty: 3 }], note: '7/13 電話 芦田様', sendEmail: false }, 'sup-key-1');
+  ok(r.body.ok && r.body.poNumber, 'supplement: 追加発注を発行', r.body);
+  const supId = r.body.id;
+  const supRow = db.prepare('SELECT * FROM po_orders WHERE id=?').get(supId);
+  ok(supRow.origin === 'supplement' && supRow.parent_order_id === parentId && supRow.send_blocked === 1 &&
+    supRow.status === 'issued' && supRow.tracking_mode === 'tracked', 'supplement: origin/parent/send_blocked=1/issued', supRow.origin);
+  ok(supRow.note.includes(parentPo) && supRow.note.includes('7/13 電話 芦田様'), 'supplement: noteに親PO+メモ', supRow.note);
+
+  // 発注残に残数付きで載り、親子が相互に見える
+  r = await j('/api/backorders');
+  const supBo = r.body.orders.find(x => x.id === supId);
+  const parBo = r.body.orders.find(x => x.id === parentId);
+  ok(supBo && supBo.remainingQty === 7 && supBo.origin === 'supplement' && supBo.parentPoNumber === parentPo,
+    'supplement: 発注残に残7で載る+親PO参照', supBo && [supBo.remainingQty, supBo.parentPoNumber]);
+  ok(parBo && parBo.supplementPoNumbers.includes(supRow.po_number), 'supplement: 親側に追加PO一覧', parBo && parBo.supplementPoNumbers);
+
+  // 冪等: 同一キー再送は同じPO
+  r = await jp('/api/orders/' + parentId + '/supplement',
+    { items: [{ code: 'cardstand-silver-r', qty: 4 }, { code: 'noflyersticker', qty: 3 }], note: '7/13 電話 芦田様', sendEmail: false }, 'sup-key-1');
+  ok(r.body.ok && r.body.id === supId && r.body.replay === true, 'supplement: 同一キー再送はreplay (二重発行なし)');
+
+  // メールなし分は未送信バッジ対象外+preview拒否
+  r = await j('/api/cycle-issued');
+  const cyc1 = (r.body.suppliers || []).find(s => s.code === '1');
+  ok(!cyc1 || !(cyc1.unsentPoNumbers || []).includes(supRow.po_number), 'supplement: メールなし分は📧未送信バッジ対象外');
+  r = await j('/api/orders/' + supId + '/email/preview');
+  ok(r.status === 400 && r.body.error.includes('送信対象外'), 'supplement: メールなし分はpreview拒否 (send_blocked)');
+
+  // メールあり (sendEmail=true) → send_blocked=0 でpreview可
+  r = await jp('/api/orders/' + parentId + '/supplement', { items: [{ code: 'cardstand-silver-r', qty: 6 }], sendEmail: true }, 'sup-key-2');
+  ok(r.body.ok, 'supplement: メールあり追加発注');
+  const supId2 = r.body.id;
+  ok(db.prepare('SELECT send_blocked FROM po_orders WHERE id=?').get(supId2).send_blocked === 0, 'supplement: sendEmail=true は send_blocked=0');
+  r = await j('/api/orders/' + supId2 + '/email/preview');
+  ok(r.body.ok && r.body.csvText.includes('cardstand-silver-r'), 'supplement: メールあり分はpreview可');
+
+  // バリデーション
+  r = await jp('/api/orders/' + parentId + '/supplement', { items: [{ code: 'gyoumuhandcream60-BI', qty: 1 }] }, 'sup-key-3');
+  ok(r.status === 400 && r.body.error.includes('仕入先が一致しない'), 'supplement: 他仕入先の商品は拒否');
+  r = await jp('/api/orders/' + parentId + '/supplement', { items: [] }, 'sup-key-4');
+  ok(r.status === 400, 'supplement: 明細空は拒否');
+  r = await jp('/api/orders/999999/supplement', { items: [{ code: 'noflyersticker', qty: 1 }] }, 'sup-key-5');
+  ok(r.status === 400 && r.body.error.includes('見つかりません'), 'supplement: 親不存在は拒否');
+  // 下書きカートがあると拒否 (黙って消さない)
+  r = await jp('/api/supplier/1/draft', { items: [{ code: 'noflyersticker', qty: 1 }] });
+  ok(r.body.ok, 'supplement: 競合テスト用draft作成');
+  r = await jp('/api/orders/' + parentId + '/supplement', { items: [{ code: 'noflyersticker', qty: 1 }] }, 'sup-key-6');
+  ok(r.status === 400 && r.body.error.includes('下書き'), 'supplement: draft存在時は拒否 (カート破壊防止)', r.body.error);
+  db.prepare("DELETE FROM po_orders WHERE status='draft' AND supplier_code='1'").run();
+
+  // 直接SQLでもトリガが防御
+  let thr = null;
+  try { db.prepare("INSERT INTO po_orders (supplier_code, supplier_name, status, origin, created_at, updated_at) VALUES ('1','x','draft','foo',?,?)").run(nowIsoStr(), nowIsoStr()); } catch (e) { thr = e.message; }
+  ok(thr && thr.includes('origin rules'), 'trigger: 不正originは拒否', thr);
+  thr = null;
+  try { db.prepare("INSERT INTO po_orders (supplier_code, supplier_name, status, origin, created_at, updated_at) VALUES ('1','x','draft','supplement',?,?)").run(nowIsoStr(), nowIsoStr()); } catch (e) { thr = e.message; }
+  ok(thr && thr.includes('parent_order_id が必須'), 'trigger: 親なしsupplementは拒否', thr);
+  thr = null;
+  try { db.prepare("INSERT INTO po_orders (supplier_code, supplier_name, status, parent_order_id, created_at, updated_at) VALUES ('1','x','draft',1,?,?)").run(nowIsoStr(), nowIsoStr()); } catch (e) { thr = e.message; }
+  ok(thr && thr.includes('追加発注POのみ'), 'trigger: originなしparent_order_idは拒否', thr);
+
+  // ページに➕UI
+  const boSup = await (await fetch(base + '/backorders')).text();
+  ok(boSup.includes('data-supplyui') && boSup.includes('supPanel') && boSup.includes('追加発注を確定'), '/backorders ➕追加発注UI配信');
 }
 
 // ═══ FBAジョブ完了検知 (発注サイクルリセットの冪等性) ═══

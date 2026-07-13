@@ -446,8 +446,15 @@ export function listBackorders() {
   if (!boundary) return { boundary: null, orders: [], summary };
   const today = jstToday();
   const orders = db.prepare(`
-    SELECT id, supplier_code, supplier_name, po_number, note, requested_date, issued_at, closed_at, origin, send_blocked
+    SELECT id, supplier_code, supplier_name, po_number, note, requested_date, issued_at, closed_at, origin, send_blocked, parent_order_id
     FROM po_orders WHERE status='issued' AND issued_at >= ? ORDER BY (closed_at IS NULL) DESC, issued_at DESC`).all(boundary);
+  // 追加発注 (supplement) の親→子対応 (親POの行に「追加あり」を表示する用)
+  const supByParent = new Map();
+  for (const s of db.prepare("SELECT parent_order_id, po_number, id FROM po_orders WHERE parent_order_id IS NOT NULL AND status='issued'").all()) {
+    if (!supByParent.has(s.parent_order_id)) supByParent.set(s.parent_order_id, []);
+    supByParent.get(s.parent_order_id).push(s.po_number || `#${s.id}`);
+  }
+  const parentPoOf = new Map(orders.map(o => [o.id, o.po_number || `#${o.id}`]));
   const itemsStmt = db.prepare(`
     SELECT i.id, i.product_code, i.product_name, i.qty, i.unit_cost,
            i.requested_date, i.promised_date, i.next_expected_date, i.next_expected_qty, i.next_action_date, i.remainder_disposition,
@@ -490,6 +497,9 @@ export function listBackorders() {
       id: o.id, poNumber: o.po_number, supplierCode: o.supplier_code, supplierName: o.supplier_name,
       note: o.note, requestedDate: o.requested_date, issuedAt: o.issued_at, closedAt: o.closed_at,
       origin: o.origin, open, sendBlocked: !!o.send_blocked,
+      parentOrderId: o.parent_order_id || null,
+      parentPoNumber: o.parent_order_id ? (parentPoOf.get(o.parent_order_id) || `#${o.parent_order_id}`) : null,
+      supplementPoNumbers: supByParent.get(o.id) || [],
       closeReason: o.closed_at ? (items.some(i => i.cutoff_qty > 0) ? 'manual' : 'completed') : null,
       remainingQty, knownAmount, unknownCostItems, overdueItems, attentionItems,
       items,
