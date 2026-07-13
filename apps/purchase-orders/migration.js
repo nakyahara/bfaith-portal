@@ -60,8 +60,11 @@ function parseNeCsv(buffer) {
     const slip = trimS(r[idx['発注伝票番号']]);
     const code = trimS(r[idx['商品コード']]);
     const name = trimS(r[idx['商品名']]);
-    const qty = Number(trimS(r[idx['発注数']]).replace(/,/g, ''));
-    const rem = Number(trimS(r[idx['注残計']]).replace(/,/g, ''));
+    // 空文字は Number('')===0 で「注残0」に化けて黙って過少移行になるため明示拒否 (Codex R2 Medium)
+    const qtyRaw = trimS(r[idx['発注数']]).replace(/,/g, '');
+    const remRaw = trimS(r[idx['注残計']]).replace(/,/g, '');
+    const qty = qtyRaw === '' ? NaN : Number(qtyRaw);
+    const rem = remRaw === '' ? NaN : Number(remRaw);
     const neDate = toYmd(r[idx['発行日']]);
     const supplier = normSupplierCode(r[idx['仕入先cd']]);
     if (!slip) { errors.push(`${line}: 発注伝票番号が空です`); continue; }

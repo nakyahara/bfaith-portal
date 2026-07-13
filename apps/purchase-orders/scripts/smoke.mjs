@@ -929,6 +929,10 @@ console.log('── P13b: 発注残ページ+消込API ──');
     ok(adminHtml.includes('発注方法') && adminHtml.includes('📠 FAX') && adminHtml.includes('🌐 WEBサイト'), '/admin 発注方法プルダウン (email/fax/web/none)');
     const orders = await (await fetch(base + '/orders')).text();
     ok(orders.includes('PO番号') && orders.includes('発注残'), '/orders にPO番号・発注残列');
+    // 仕入先ごと並び替え+絞り込み。仕入先名クリック=確定明細 (ワークスペース行きリンクは廃止、中原さん報告 2026-07-13)
+    ok(orders.includes('ordSort') && orders.includes('仕入先ごと') && orders.includes('ordSup'), '/orders 並び順+仕入先絞り込みUI');
+    ok(!orders.includes("'<td><a href=\"/apps/purchase-orders/supplier/'"), '/orders 一覧の仕入先名はワークスペースリンクではない');
+    ok(orders.includes('新しい発注作業') && orders.includes('確定時の明細'), '/orders 明細=確定時の内容+ワークスペースは明示リンク');
   }
 }
 // ═══ P14 ロジザード入庫消込 ═══
