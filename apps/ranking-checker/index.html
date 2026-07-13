@@ -438,13 +438,15 @@ async function loadData() {
     const obj = await resp.json();
     products = obj.products || [];
   } catch(e) {
-    // サーバー未起動時はlocalStorageフォールバック
-    try { const raw = localStorage.getItem(STORAGE_KEY); if (raw) products = JSON.parse(raw); } catch(e2) { products = []; }
+    console.error('データ取得失敗:', e);
+    products = [];
   }
 }
 async function saveData() {
   // 商品マスタのみ送信。history はサーバー側 DB が真のソースで、UI から上書きしない。
   // ペイロードが巨大化して 10MB 制限に引っかかるのを防ぐ目的も兼ねる。
+  // ※ localStorage バックアップは廃止: 履歴込み約10MBで上限5MBを常に超え、
+  //    書き込みが一度も成功していなかった (silent fail)。
   const masterOnly = products.map(({ history, ...rest }) => rest);
   const obj = { products: masterOnly, confirmEmpty: masterOnly.length === 0 };
   try {
@@ -454,8 +456,6 @@ async function saveData() {
     console.error('サーバー保存失敗:', e);
     alert('データのサーバー保存に失敗しました。ネットワーク接続を確認してください。');
   }
-  // ローカルにもバックアップ
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(products)); } catch(e) {}
 }
 async function loadConfigAsync() {
   try {
@@ -551,12 +551,8 @@ const YAHOO_HITS = 50;
 const AMAZON_HITS = 10; // PA-API最大10件/ページ, 最大10ページ = 100位まで
 
 async function apiSearch(keyword, page, appId, shopCode) {
-  const cfg = loadConfig();
-  const accessKey = cfg.accessKey || '';
-
+  // applicationId / accessKey はサーバー側 (/api/rakuten) が env から注入する
   const params = new URLSearchParams({
-    applicationId: appId,
-    accessKey: accessKey,
     hits: HITS,
     page: page,
     format: 'json',
@@ -659,10 +655,8 @@ async function checkAmazonRank(keyword, targetAsin) {
 }
 
 async function apiSearchSort(keyword, page, appId, shopCode, sort) {
-  const cfg = loadConfig();
+  // applicationId / accessKey はサーバー側 (/api/rakuten) が env から注入する
   const params = new URLSearchParams({
-    applicationId: appId,
-    accessKey: cfg.accessKey || '',
     hits: HITS,
     page: page,
     format: 'json',
@@ -942,7 +936,11 @@ async function startCheck() {
 
 function startProgressPolling() {
   if (pollTimer) clearInterval(pollTimer);
-  let lastDone = -1;
+  // /data は履歴込みで約10MBあるため、進捗が進むたびに再取得すると
+  // 実行中ずっと数秒おきに10MB転送が走る (Render→miniPC の二重転送含む)。
+  // 再取得は60秒に1回まで + 完了時に必ず1回、に絞る。
+  let lastLoadAt = 0;
+  const RELOAD_INTERVAL_MS = 60000;
   pollTimer = setInterval(async () => {
     try {
       const resp = await fetch(BASE_PATH + '/check-progress');
@@ -954,9 +952,8 @@ function startProgressPolling() {
         document.getElementById('progress-text').textContent =
           p.running ? `${p.done} / ${p.total} 完了（処理中: ${p.current}）` : `${p.done} / ${p.total} ✔ 完了`;
 
-        // 進捗が進んだときだけデータ再取得＆画面更新
-        if (p.done !== lastDone) {
-          lastDone = p.done;
+        if (p.running && Date.now() - lastLoadAt >= RELOAD_INTERVAL_MS) {
+          lastLoadAt = Date.now();
           await loadData();
           renderList();
         }
@@ -969,6 +966,8 @@ function startProgressPolling() {
         document.getElementById('btn-check-start').disabled = false;
         document.getElementById('progress-text').textContent = `${p.done} / ${p.total} ✔ 完了`;
         debugLog('サーバー側チェック完了');
+        await loadData();
+        renderList();
       }
     } catch (e) {
       debugLog('進捗取得エラー: ' + e.message);
@@ -1345,7 +1344,7 @@ function exportDailyCSV() {
 async function startFetchShop() {
   if (fetchRunning) return;
   const cfg = loadConfig();
-  if (!cfg.applicationId || !cfg.accessKey) return alert('楽天APIのアプリケーションIDとアクセスキーが設定されていません。');
+  if (cfg.rakutenConfigured === false) return alert('楽天APIの資格情報がサーバーに設定されていません（RAKUTEN_APP_ID / RAKUTEN_ACCESS_KEY）。');
   if (!cfg.shopCode) return alert('ショップコードが設定されていません。\nAPI設定で入力してください。');
 
   fetchRunning = true; fetchAbort = false;
@@ -1354,7 +1353,7 @@ async function startFetchShop() {
   document.getElementById('unreg-progress').style.display = 'flex';
   document.getElementById('unreg-progress-text').textContent = '取得中...';
   unregProducts = [];
-  debugLog(`未登録取得開始: appId=${cfg.applicationId}, shopCode=${cfg.shopCode}, accessKey=${cfg.accessKey ? '設定済み' : '未設定'}`);
+  debugLog(`未登録取得開始: shopCode=${cfg.shopCode}, 楽天API=${cfg.rakutenConfigured === false ? '未設定' : 'サーバー設定済み'}`);
 
   const seenUrls = new Set();
   const regUrls = new Set(products.map(p => normalizeUrl(getRakutenUrl(p))));
@@ -1471,8 +1470,8 @@ function saveSettings() {
   const appId = document.getElementById('cfg-appid').value.trim();
   const accessKey = document.getElementById('cfg-accesskey').value.trim();
   const yahooAppId = document.getElementById('cfg-yahoo-appid').value.trim();
-  if (!appId) return alert('楽天アプリケーションIDは必須です。');
-  if (!accessKey) return alert('楽天アクセスキーは必須です。');
+  // 資格情報は Render の環境変数で管理 (POST /config はサーバー側で no-op)。
+  // アクセスキーは /config から返らなくなったため必須チェックはしない。
   saveConfig({
     applicationId: appId, accessKey: accessKey,
     shopCode: document.getElementById('cfg-shopcode').value.trim(),
