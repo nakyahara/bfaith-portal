@@ -572,6 +572,15 @@ function initLedgerSchema(db) {
   // 入数: 仕入先の出荷明細の数量1あたりの弊社数量 (単位違いの換算。例: 先方1ケース=弊社240個 → 240)。NULL=1
   addCol(db, 'po_vendor_code_map', 'qty_per_unit', 'REAL');
 
+  // NE商品マスタの本来表記 (大文字小文字)。DWH/PMLは投入時に小文字統一されるため原表記が失われる
+  // (EC統合DWH設計書 §投入規約「全商品コード/SKUを小文字統一」)。NE手動CSV取込のたびにここへ蓄積し、
+  // ロジザード貼り付けの商品IDに使う (ロジザードはNE登録表記と大小まで一致しないと登録エラー、中原さん実測 2026-07-14)
+  db.exec(`CREATE TABLE IF NOT EXISTS po_product_code_canonical (
+    product_key  TEXT PRIMARY KEY,
+    product_code TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+  )`);
+
   // 未紐付けの先方管理番号 (仮登録)。出荷明細→ロジザード入荷予定変換で対応表に無い番号が出たとき
   // ここに置いておき、後日 (NE登録→翌朝PML反映後) 商品と紐づけて対応表へ昇格する (中原さん要望 2026-07-13)
   db.exec(`CREATE TABLE IF NOT EXISTS po_vendor_code_pending (

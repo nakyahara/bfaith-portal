@@ -1962,7 +1962,24 @@ console.log('── 入荷予定変換 (inbound-plan) + 仮登録 (pending) ─�
     'BADLINE-NO-QTY\t数量なし行\t\t\t\t\n';
   r = await jp2('/api/inbound-plan/convert', { supplier_code: '0001', text: shipText });
   ok(r.body.ok && r.body.rowCount === 1 && r.body.totalQty === 1600, 'convert: 対応表逆引きで変換 (カンマ数量/見出し行/0000列を処理)', r.body);
-  ok(r.body.pasteText === 'noflyersticker\t1600\t70', 'convert: 貼り付けデータ=商品ID/入荷予定数/仕入単価(PML原価)', r.body.pasteText);
+  ok(r.body.pasteText === 'noflyersticker\t1600\t70', 'convert: 貼り付けデータ=商品ID(NE表記)/入荷予定数/仕入単価(PML原価)', r.body.pasteText);
+  // 商品IDの大小表記はNE商品マスタが正: 対応表に大文字で登録されていてもNE表記 (小文字) で出力する
+  // (ロジザードは大文字小文字を区別し、NE登録の表記と一致しないと登録エラー)
+  {
+    const fdUp = new FormData();
+    fdUp.append('supplier_code', '1');
+    fdUp.append('file', new Blob([iconv.encode('"仕入先管理番号","x","弊社管理番号"\r\n"AMC-001","","NOFLYERSTICKER"', 'Shift_JIS')]), 'up.csv');
+    r = await j('/api/vendor-map/csv', { method: 'POST', body: fdUp });
+    r = await jp2('/api/inbound-plan/convert', { supplier_code: '1', text: 'AMC-001\tx\t10\n' });
+    ok(r.body.ok && r.body.rows[0].productCode === 'noflyersticker' && r.body.pasteText.startsWith('noflyersticker\t10\t'),
+      'convert: 対応表が大文字でもNE表記 (小文字) で出力', r.body.pasteText);
+    const fdBack = new FormData();
+    fdBack.append('supplier_code', '1');
+    fdBack.append('file', new Blob([iconv.encode('"仕入先管理番号","x","弊社管理番号"\r\n"AMC-001","","noflyersticker"', 'Shift_JIS')]), 'back.csv');
+    await j('/api/vendor-map/csv', { method: 'POST', body: fdBack });
+    // 後続テストが参照する r (shipTextの変換結果) を復元
+    r = await jp2('/api/inbound-plan/convert', { supplier_code: '0001', text: shipText });
+  }
   ok(r.body.unmatched.length === 1 && r.body.unmatched[0].vendorCode === 'ZZZ-NEW-1' && r.body.unmatched[0].vendorName === '新商品X',
     'convert: 対応表に無い番号はunmatched (先方商品名付き)', r.body.unmatched);
   ok(r.body.skipped.length === 1, 'convert: 数量が読めない行はskipped');
@@ -2053,7 +2070,7 @@ console.log('── 入荷予定変換 (inbound-plan) + 仮登録 (pending) ─�
       'AUKATZ-06-N2\tヘルスウォーター にゃんマグ 白系\t30\n';
     r = await jp2('/api/inbound-plan/convert', { supplier_code: '2', text: mailText });
     ok(r.body.ok && r.body.rowCount === 2 && r.body.totalQty === 78, 'BEFREE: メール表の貼り付けを変換 (同一商品の複数行は複数行のまま=手作業と同じ)', r.body);
-    ok(r.body.pasteText.split('\n').every(l => l.startsWith('gyoumuhandcream60-BI\t')), 'BEFREE: 貼り付けデータ2行', r.body.pasteText);
+    ok(r.body.pasteText.split('\n').every(l => l.startsWith('gyoumuhandcream60-BI\t')), 'BEFREE: 貼り付けデータ2行 (商品IDはNEの大小表記のまま)', r.body.pasteText);
     ok(r.body.unmatched.length === 1 && r.body.unmatched[0].vendorCode === 'AUKATZ-06-N2', 'BEFREE: 未知の番号はunmatched');
     ok(r.body.skipped.length === 2, 'BEFREE: 見出し外の行 (【…】/送り状No) はスキップ', r.body.skipped);
   }
@@ -2389,8 +2406,58 @@ console.log('── 出荷明細メール自動取得 (fetch-mails) ──');
   ok(planHtml.includes('解析エラー'), '/inbound-plan エラー理由の表示');
   ok(planHtml.includes('jstStamp') && planHtml.includes('日本時間'), '/inbound-plan 受信日時をJST表示');
   ok(planHtml.includes('出荷明細ではないと判定した'), '/inbound-plan 対象外メールの確認セクション');
+  // 配信されたクライアントコードの jstStamp を実行検証 (template literal内の \d が d に化ける事故の検出。本番で全行「—」になった実障害)
+  {
+    const mFn = planHtml.match(/function jstStamp\(iso\) \{[\s\S]*?\n\}/);
+    ok(!!mFn, '/inbound-plan jstStamp関数を配信');
+    const jstFn = new Function(mFn[0] + '; return jstStamp;')();
+    ok(jstFn('2026-07-13T08:59:00.000Z') === '2026-07-13 17:59', 'jstStamp: UTC→JST変換 (08:59 UTC=17:59 JST)', jstFn('2026-07-13T08:59:00.000Z'));
+    ok(jstFn('2026-07-13T16:00:00.000Z') === '2026-07-14 01:00', 'jstStamp: 日跨ぎ (UTC 16時→JST 翌1時)');
+    ok(jstFn(null) === '—' && jstFn('0') === '—' && jstFn('2026-07-13') === '—', 'jstStamp: null/不正値は—');
+  }
   const dashNav = await (await fetch(base + '/')).text();
   ok(dashNav.includes('入荷予定') && dashNav.includes('/apps/purchase-orders/inbound-plan'), 'ナビに入荷予定タブ');
+}
+
+// ═══ NE本来表記 (po_product_code_canonical) — ロジザード貼り付けの商品ID大小表記 ═══
+console.log('── NE本来表記 (canonical) ──');
+{
+  const jp4 = (p, body) => j(p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+  // DWH/PMLは小文字統一のため、NE手動CSV取込からNE本来の大小表記を蓄積する
+  const neCsvC = '"商品コード","在庫数","発注残数"\r\n"NoFlyerSticker","10","0"\r\n';
+  const fdC = new FormData();
+  fdC.append('file', new Blob([iconv.encode(neCsvC, 'Shift_JIS')]), 'ne-case.csv');
+  r = await j('/api/ne-overlay/csv', { method: 'POST', body: fdC });
+  ok(r.status === 200, 'NE CSV取込 (混在表記 NoFlyerSticker)');
+  await j('/api/ne-overlay', { method: 'DELETE' }); // overlay解除してもcanonicalは残る
+  const canon = db.prepare("SELECT product_code FROM po_product_code_canonical WHERE product_key='noflyersticker'").get();
+  ok(canon && canon.product_code === 'NoFlyerSticker', 'canonical: NE本来表記を蓄積 (overlay解除後も保持)', canon);
+  r = await jp4('/api/inbound-plan/convert', { supplier_code: '1', text: 'AMC-001\tx\t3\n' });
+  ok(r.body.ok && r.body.rows[0].productCode === 'NoFlyerSticker' && r.body.pasteText.startsWith('NoFlyerSticker\t3\t') &&
+    r.body.rows[0].caseVerified === true && r.body.caseUnverified.length === 0,
+    '貼り付け商品ID=NE本来表記 (canonical優先、PMLの小文字より優先)', r.body.pasteText);
+  // NE側で表記が変わったら再取込で更新される
+  const fdC2 = new FormData();
+  fdC2.append('file', new Blob([iconv.encode('"商品コード","在庫数","発注残数"\r\n"NOFLYERSTICKER","10","0"\r\n', 'Shift_JIS')]), 'ne-case2.csv');
+  await j('/api/ne-overlay/csv', { method: 'POST', body: fdC2 });
+  ok(db.prepare("SELECT product_code FROM po_product_code_canonical WHERE product_key='noflyersticker'").get().product_code === 'NOFLYERSTICKER',
+    'canonical: 再取込で表記が更新される');
+  // 検証エラーのあるCSVは canonical もロールバック (取込全体と同一txn)
+  const fdC3 = new FormData();
+  fdC3.append('file', new Blob([iconv.encode('"商品コード","在庫数","発注残数"\r\n"noFLYERsticker","10","0"\r\n"x1","abc","0"\r\n', 'Shift_JIS')]), 'ne-case3.csv');
+  r = await j('/api/ne-overlay/csv', { method: 'POST', body: fdC3 });
+  ok(r.status === 400 &&
+    db.prepare("SELECT product_code FROM po_product_code_canonical WHERE product_key='noflyersticker'").get().product_code === 'NOFLYERSTICKER',
+    'canonical: 不正CSVでは更新されない (全件rollback)');
+  await j('/api/ne-overlay', { method: 'DELETE' });
+  // canonical未蓄積の商品は caseUnverified で警告対象
+  const fdBf3 = new FormData();
+  fdBf3.append('supplier_code', '2');
+  fdBf3.append('file', new Blob([iconv.encode('"仕入先管理番号","x","弊社管理番号"\r\n"GOFUN-01-N","","gyoumuhandcream60-BI"', 'Shift_JIS')]), 'bf3.csv');
+  await j('/api/vendor-map/csv', { method: 'POST', body: fdBf3 });
+  r = await jp4('/api/inbound-plan/convert', { supplier_code: '2', text: 'GOFUN-01-N\tx\t2\n' });
+  ok(r.body.ok && r.body.caseUnverified.length === 1 && r.body.rows[0].caseVerified === false,
+    'canonical未蓄積の商品は表記未確認として警告リストへ', r.body.caseUnverified);
 }
 
 // ═══ 全ページのインラインJS構文チェック (サーバtemplate literal内クライアントJSの括弧崩れ等を機械検出) ═══
