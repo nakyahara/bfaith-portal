@@ -25,6 +25,9 @@ let db = null;
 // 2026-07-12 の本番障害 (#476→#477 revert) の再発防御: 新規表のDDLで落ちても既存モールを道連れにしない
 export let yahooInitError = null;
 
+// au PAY分析表も同じ fail-soft 方針 (新mirror表のDDLは fail-soft 必須 — 2026-07-12 障害の教訓)
+export let aupayDataInitError = null;
+
 export function initMirrorDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   // リトライ再入時 (2026-07-12 障害対応: 一過性失敗の自己回復) に前のハンドルを
@@ -32,6 +35,7 @@ export function initMirrorDB() {
   if (db) { try { db.close(); } catch { /* close済み等は無視 */ } db = null; }
   // fail-soft系のエラーもリトライごとにリセット (成功すれば null のまま)
   yahooInitError = null;
+  aupayDataInitError = null;
   db = new Database(DB_FILE);
   // PRAGMA は接続単位の設定。SQLite のデフォルトは foreign_keys=OFF / recursive_triggers=OFF なので、
   // f_mis_shipments の FK 制約 と append-only trigger を機能させるために毎接続で明示する必要がある。
@@ -834,6 +838,115 @@ function createTables() {
       at: String(e.stack || '').split(String.fromCharCode(10)).slice(0, 3).join(' | '),
     };
     console.error('[Mirror] Yahoo!表の初期化失敗 (mirror本体は継続):', e.message);
+  }
+
+  // ─── au PAYマーケット分析CSV 13種 (mall-csv-fetcher P1-A、2026-07-13) ───
+  // fail-soft: 失敗しても throw せず記録に留め、既存モールの mirror を止めない。
+  // aupay データ entity への sync は router 側が aupayDataInitError を見て 503 (原因つき) を返す
+  try {
+    // 売上分析 (日次/月次同型。月次は date_jst=月初日)
+    for (const t of ['mirror_aupay_sales_daily', 'mirror_aupay_sales_monthly']) {
+      db.exec(`CREATE TABLE IF NOT EXISTS ${t} (
+        date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+        segment_code TEXT NOT NULL CHECK(trim(segment_code) <> ''),
+        segment_raw  TEXT NOT NULL,
+        sales_yen INTEGER, coupon_store_yen INTEGER, coupon_mall_yen INTEGER,
+        point_ponta_au_yen INTEGER, point_used_yen INTEGER,
+        orders INTEGER, units INTEGER, visits INTEGER, buyer_uu INTEGER, visitor_uu INTEGER, pageviews INTEGER,
+        cvr_pct REAL, avg_units REAL, avg_price_yen INTEGER, avg_visits REAL, avg_pv REAL,
+        coupon_store_rate_pct REAL, coupon_mall_rate_pct REAL, point_rate_pct REAL,
+        is_tax_included INTEGER NOT NULL DEFAULT 1, imported_at TEXT,
+        source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+        PRIMARY KEY (date_jst, segment_code)
+      )`);
+    }
+    for (const t of ['mirror_aupay_referer_daily', 'mirror_aupay_referer_monthly']) {
+      db.exec(`CREATE TABLE IF NOT EXISTS ${t} (
+        date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+        segment_code TEXT NOT NULL CHECK(trim(segment_code) <> ''),
+        segment_raw TEXT NOT NULL,
+        channel TEXT NOT NULL CHECK(trim(channel) <> ''),
+        visits INTEGER, visitor_uu INTEGER, sales_yen INTEGER, orders INTEGER, units INTEGER,
+        cvr_pct REAL, avg_units REAL, avg_price_yen INTEGER,
+        is_tax_included INTEGER NOT NULL DEFAULT 1, imported_at TEXT,
+        source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+        PRIMARY KEY (date_jst, segment_code, channel)
+      )`);
+    }
+    for (const t of ['mirror_aupay_search_daily', 'mirror_aupay_search_monthly']) {
+      db.exec(`CREATE TABLE IF NOT EXISTS ${t} (
+        date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+        segment_code TEXT NOT NULL CHECK(trim(segment_code) <> ''),
+        segment_raw TEXT NOT NULL,
+        keyword TEXT NOT NULL CHECK(trim(keyword) <> ''),
+        visits INTEGER, visitor_uu INTEGER,
+        imported_at TEXT,
+        source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+        PRIMARY KEY (date_jst, segment_code, keyword)
+      )`);
+    }
+    db.exec('CREATE INDEX IF NOT EXISTS idx_masd_kw ON mirror_aupay_search_daily(keyword, date_jst)');
+    for (const t of ['mirror_aupay_page_daily', 'mirror_aupay_page_monthly']) {
+      db.exec(`CREATE TABLE IF NOT EXISTS ${t} (
+        date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+        page_url TEXT NOT NULL CHECK(trim(page_url) <> ''),
+        pageviews INTEGER, orders INTEGER, via_orders INTEGER,
+        bounce_rate_pct REAL, exit_rate_pct REAL,
+        imported_at TEXT,
+        source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+        PRIMARY KEY (date_jst, page_url)
+      )`);
+    }
+    for (const t of ['mirror_aupay_product_daily', 'mirror_aupay_product_monthly']) {
+      db.exec(`CREATE TABLE IF NOT EXISTS ${t} (
+        date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+        segment_code TEXT NOT NULL CHECK(trim(segment_code) <> ''),
+        segment_raw TEXT NOT NULL,
+        lot_number TEXT NOT NULL CHECK(trim(lot_number) <> ''),
+        product_name TEXT, category TEXT,
+        sales_yen INTEGER, orders INTEGER, units INTEGER, avg_units REAL, avg_price_yen INTEGER,
+        coupon_store_yen INTEGER, coupon_mall_yen INTEGER,
+        buyer_uu INTEGER, visits INTEGER, visitor_uu INTEGER, pageviews INTEGER,
+        cvr_visit_pct REAL, cvr_uu_pct REAL,
+        is_tax_included INTEGER NOT NULL DEFAULT 1, imported_at TEXT,
+        source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+        PRIMARY KEY (date_jst, segment_code, lot_number)
+      )`);
+    }
+    db.exec('CREATE INDEX IF NOT EXISTS idx_mapd_lot ON mirror_aupay_product_daily(lot_number, date_jst)');
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_aupay_repeat_cohort_monthly (
+      date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-01'),
+      segment_code TEXT NOT NULL CHECK(trim(segment_code) <> ''),
+      segment_raw TEXT NOT NULL,
+      target_month_jst TEXT NOT NULL CHECK(target_month_jst GLOB '????-??-01'),
+      orders INTEGER,
+      imported_at TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+      PRIMARY KEY (date_jst, segment_code, target_month_jst)
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_aupay_pm_ad_daily (
+      date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+      impressions INTEGER, clicks INTEGER, ctr_pct REAL, cpc_yen REAL,
+      gmv_via_ad_yen INTEGER, roas REAL, cost_yen INTEGER,
+      is_tax_included INTEGER NOT NULL DEFAULT 1, imported_at TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+      PRIMARY KEY (date_jst)
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_aupay_pm_query_weekly (
+      date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+      keyword TEXT NOT NULL CHECK(trim(keyword) <> ''),
+      rank INTEGER, impressions INTEGER, clicks INTEGER, ctr_pct REAL,
+      imported_at TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+      PRIMARY KEY (date_jst, keyword)
+    )`);
+  } catch (e) {
+    aupayDataInitError = {
+      message: String(e.message || e),
+      code: e.code || null,
+      at: String(e.stack || '').split(String.fromCharCode(10)).slice(0, 3).join(' | '),
+    };
+    console.error('[Mirror] au PAY分析表の初期化失敗 (mirror本体は継続):', e.message);
   }
 
   // mirror_rakuten_finance_sku_daily — 楽天 Phase 1a #R-3b (Render 側 daily fact mirror)

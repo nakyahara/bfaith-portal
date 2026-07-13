@@ -54,7 +54,7 @@ function cleanupOldFiles() {
   const KEEP_MS = 30 * 24 * 3600 * 1000;
   const targets = [
     { dir: LOG_DIR, pattern: /\.log$/ },
-    { dir: join(__dirname, 'downloads'), pattern: /^(rpp|rdata|yahoo)_/ },
+    { dir: join(__dirname, 'downloads'), pattern: /^(rpp|rdata|yahoo|aupay)_/ },
   ];
   for (const t of targets) {
     let removed = 0;
@@ -87,6 +87,11 @@ const DEFAULT_FETCHERS = [
     mall: 'yahoo', // ストクリ統計6種 (mall-csv-fetcher P1-Y)。全て同期DLなので短め
     script: join(__dirname, 'yahoo-data-download.mjs'),
     timeoutMs: 20 * 60 * 1000,
+  },
+  {
+    mall: 'aupay', // WOW!マネージャー分析CSV (mall-csv-fetcher P1-A)。非同期ジョブのポーリング最大15分に余裕
+    script: join(__dirname, 'aupay-data-download.mjs'),
+    timeoutMs: 30 * 60 * 1000,
   },
 ];
 // テスト用オーバーライド: MALL_FETCHERS_JSON='[{"mall":"x","script":"...","timeoutMs":1000}]'

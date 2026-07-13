@@ -610,6 +610,24 @@ async function main() {
       console.log('[DailySync] Yahoo統計 sync は取込失敗のためスキップ (failed/ を確認、修正後に再投入)');
     }
 
+    // === au PAYマーケット分析CSV 取込 + mirror sync (mall-csv-fetcher P1-A) ===
+    // 自動DL (aupay-data-download.mjs、fetch-all 05:30) が incoming/aupay-data/ に置いた
+    // CSV/JSONを取り込む。対象0件は正常。--days 110 = 日次35日再取得+月次前月+PM35日をカバー
+    const aupayDataImportResult = runScript(
+      `apps/warehouse/import-aupay-data.js --data-dir ${DATA_DIR_ARG}`,
+      'auPAY分析 取込', 600000
+    );
+    results.push({ name: 'auPAY分析 取込', ...aupayDataImportResult });
+    if (aupayDataImportResult.success) {
+      const aupayDataSyncResult = runScript(
+        `apps/warehouse/sync-aupay-data-daily.js --data-dir ${DATA_DIR_ARG} --days 110`,
+        'auPAY分析 sync', 600000
+      );
+      results.push({ name: 'auPAY分析 sync', ...aupayDataSyncResult });
+    } else {
+      console.log('[DailySync] auPAY分析 sync は取込失敗のためスキップ (failed/ を確認、修正後に再投入)');
+    }
+
     // === Yahoo finance daily fact (Yahoo Phase 1 Y-3c、Y-1 + Y-2 + Y-3a 統合) ===
     // 1. f_yahoo_finance_sku_daily_v1 build (whitelist order=5/pay=1/ship=3、partial margin)
     // 2. DQ gate (6 check、severity error で exit 1)

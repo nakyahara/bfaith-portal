@@ -1888,6 +1888,57 @@ function createTables() {
     }
   }
 
+  // ---- au PAYマーケット分析CSV 13種: contract auto-seed (mall-csv-fetcher P1-A、2026-07-13)
+  // 店舗分析 (shopAnalyCsvDl) の日次/月次 + リピートコホート + プラチナマッチ広告。
+  // 月次 entity は date_jst=月初日 (rakuten_purchaser_monthly と同方針)
+  {
+    const aupayContracts = [];
+    const shopDefs = [
+      ['sales', '売上分析 (セグメント別売上/クーポン/ポイント/CVR/販促費率)', '["date_jst","segment_code"]'],
+      ['referer', '参照元分析 (セグメント×参照元チャネル)', '["date_jst","segment_code","channel"]'],
+      ['search', '検索分析 (セグメント×流入キーワード)', '["date_jst","segment_code","keyword"]'],
+      ['page', 'ページ分析 (URL別PV/経由CV/直帰率。セグメントなし)', '["date_jst","page_url"]'],
+      ['product', '商品分析 (セグメント×ロットナンバー)', '["date_jst","segment_code","lot_number"]'],
+    ];
+    for (const [base, desc, keys] of shopDefs) {
+      aupayContracts.push([`aupay_${base}_daily`, `fact_aupay_${base}_daily`,
+        `one row = one ${JSON.parse(keys).join('×')} — ${desc}、日次`, keys]);
+      aupayContracts.push([`aupay_${base}_monthly`, `fact_aupay_${base}_monthly`,
+        `one row = one ${JSON.parse(keys).join('×')} — ${desc}、月次 (date_jst=月初日)`, keys]);
+    }
+    aupayContracts.push(['aupay_repeat_cohort_monthly', 'fact_aupay_repeat_cohort_monthly',
+      'one row = one (date_jst=起点月初日, segment_code, target_month_jst=対象月初日) — リピート分析コホート (月次専用)',
+      '["date_jst","segment_code","target_month_jst"]']);
+    aupayContracts.push(['aupay_pm_ad_daily', 'fact_aupay_pm_ad_daily',
+      'one row = one date_jst — プラチナマッチ広告 日次レポート (表示/クリック/広告費/ROAS)',
+      '["date_jst"]']);
+    aupayContracts.push(['aupay_pm_query_weekly', 'fact_aupay_pm_query_weekly',
+      'one row = one (date_jst=対象週月曜, keyword) — プラチナマッチ検索クエリ 週次スナップショット (前週トップ100)',
+      '["date_jst","keyword"]']);
+    const seedStmt = db.prepare(`
+      INSERT INTO sync_contracts (
+        entity, contract_version, source_system, source_object, target_table,
+        grain_definition, key_columns_json, payload_schema_json,
+        clear_strategy, apply_mode, enabled, owner, created_at, updated_at
+      ) VALUES (
+        ?, 1, 'minipc-warehouse', ?, ?, ?, ?,
+        '{"required":["date_jst"],"date_jst_pattern":"^\\d{4}-\\d{2}-\\d{2}$","amount_unit":"JPY_tax_included_integer"}',
+        'scope_clear_per_run', 'insert_or_replace', 1, 'mall-csv-fetcher',
+        strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      )
+      ON CONFLICT(entity) DO UPDATE SET
+        contract_version = excluded.contract_version, source_system = excluded.source_system,
+        source_object = excluded.source_object, target_table = excluded.target_table,
+        grain_definition = excluded.grain_definition, key_columns_json = excluded.key_columns_json,
+        payload_schema_json = excluded.payload_schema_json, clear_strategy = excluded.clear_strategy,
+        apply_mode = excluded.apply_mode, enabled = excluded.enabled, owner = excluded.owner,
+        updated_at = excluded.updated_at
+    `);
+    for (const [entity, srcTable, grain, keys] of aupayContracts) {
+      seedStmt.run(entity, srcTable, `mirror_${entity}`, grain, keys);
+    }
+  }
+
   // ---- Phase 1 #1-4a: sync_runs (run ledger、miniPC 側で sync 開始記録)
   // status 遷移: started → applied (全 chunk Render から 2xx)
   //              | → failed (途中失敗、error_message に記録)
