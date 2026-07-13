@@ -4304,9 +4304,11 @@ function load() {
 }
 document.getElementById('ordSort').addEventListener('change', render);
 document.getElementById('ordSup').addEventListener('change', render);
-// 仕入先名の疑似リンクはEnter/Spaceでも開ける (Codex R1 Low)
+// 仕入先名の疑似リンクはEnter/Spaceでも開ける (Codex R1 Low)。
+// 「明細」ボタンはブラウザ標準のclick発火に任せる (keydownと二重実行しない、Codex R2 Low)
 document.addEventListener('keydown', function(ev) {
   if (ev.key !== 'Enter' && ev.key !== ' ') return;
+  if (ev.target.tagName === 'BUTTON') return;
   var id = ev.target.getAttribute && ev.target.getAttribute('data-id');
   if (id) { ev.preventDefault(); openDetail(id); }
 });
