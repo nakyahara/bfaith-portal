@@ -64,13 +64,35 @@ console.log('=== 0. セグメント正規化 ===');
   check('未知は unk_hash + warning', u.code.startsWith('unk_') && u.warning, JSON.stringify(u));
 }
 
+console.log('=== 1a. 売上分析 実機フル構造 (導出セクション付き) ===');
+{
+  // 実機CSV (2026-07-13) の3セクション構造を再現: メイン表→売上全体割合→来訪回数全体割合
+  const csv = sjis([
+    '"抽出年月日：2026/07/08～2026/07/08"', '"抽出条件："', '""',
+    q(SALES_HEADER),
+    q(['全顧客', '2026/07/08', '22971', '30', '100', '12576', '0', '22', '23', '202', '22', '197', '328', '10.89', '1.0', '1044', '1.0', '1.6', '0.13', '0.44', '54.75']),
+    q(['4回以上購入顧客（継続）', '2026/07/08', '2296', '0', '0', '2296', '0', '2', '2', '5', '2', '5', '6', '40.00', '1.0', '1148', '1.0', '1.2', '0.00', '0.00', '100.00']),
+    '""',
+    q(['売上全体割合', '年月日', '売上高合算', '初回購入顧客(新規)', '2回購入以上(既存合算)', '2回購入顧客', '3回購入顧客', '4回以上購入顧客（継続）']),
+    q(['売上全体割合', '2026/07/08', '22971', '80.60', '19.40', '9.40', '0.00', '10.00']),
+    '""',
+    q(['来訪回数全体割合', '年月日', '来訪回数合算', '初回購入顧客(新規)', '2回購入以上(既存合算)', '2回購入顧客', '3回購入顧客', '4回以上購入顧客（継続）']),
+    q(['来訪回数全体割合', '2026/07/08', '197', '93.91', '6.09', '2.03', '1.52', '2.54']),
+  ].join(CRLF));
+  const r = importAupayFile(db, { name: 'aupay_sales_D_d2026-07-08_x.csv', buffer: csv, sha256: sha(csv), source: 'test' });
+  check('導出セクション付きで取込ok', r.status === 'ok', JSON.stringify(r.results).slice(0, 200));
+  const rows = db.prepare(`SELECT * FROM fact_aupay_sales_daily WHERE date_jst='2026-07-08' ORDER BY segment_code`).all();
+  check('メイン表2行のみ (割合行は入らない)', rows.length === 2, `got ${rows.length}`);
+  check('repeat_4plus取込', rows.some((x) => x.segment_code === 'repeat_4plus'));
+}
+
 console.log('=== 1. 売上分析 (日次) ===');
 {
   const csv = salesCsv(['2026/07/10']);
   const r = importAupayFile(db, { name: 'aupay_sales_D_d2026-07-10_x.csv', buffer: csv, sha256: sha(csv), source: 'test' });
   check('取込ok', r.status === 'ok', JSON.stringify(r.results));
   check('type=aupay_sales_daily', r.results[0]?.type === 'aupay_sales_daily', r.results[0]?.type);
-  const rows = db.prepare(`SELECT * FROM fact_aupay_sales_daily ORDER BY segment_code`).all();
+  const rows = db.prepare(`SELECT * FROM fact_aupay_sales_daily WHERE date_jst='2026-07-10' ORDER BY segment_code`).all();
   check('3セグメント3行', rows.length === 3, `got ${rows.length}`);
   const all = rows.find((x) => x.segment_code === 'all');
   check('金額INTEGER/率REAL', all?.sales_yen === 22971 && all?.cvr_pct === 10.89 && all?.point_rate_pct === 54.75, JSON.stringify(all));

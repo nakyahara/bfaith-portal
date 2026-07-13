@@ -258,6 +258,10 @@ function prepareSegmentDated(name, rows, headerIdx, {
   for (let i = headerIdx + 1; i < rows.length; i++) {
     const r = rows[i];
     if (r.every(v => trimS(v) === '')) continue;
+    // ⭐売上分析CSVはメイン表の後に導出セクション (「売上全体割合」「来訪回数全体割合」=
+    // 別ヘッダ+割合行) が続く (実機で発覚 2026-07-13)。割合はメイン表から導出可能なので
+    // 取り込まず、導出セクションのヘッダを検出したらメイン表終了として打ち切る
+    if (/全体割合$/.test(trimS(r[0])) || trimS(r[c.date]) === '年月日') break;
     const dc = parseDateCell(r[c.date]);
     if (!dc) {
       if (/合計/.test(trimS(r[c.date]))) continue; // 合計行は明細と混ぜない (Codex R2)
