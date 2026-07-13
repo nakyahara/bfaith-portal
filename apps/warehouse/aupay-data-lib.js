@@ -696,11 +696,27 @@ export function importAupayFile(db, { name, buffer, sha256, source = 'incoming' 
   const collected = [];
   const ctx = { importedAt, source, fileSha256: sha256 };
   const tx = db.transaction(() => {
+    // 先に全ファイルをprepareし、同一種別×期間重複を検出してから書き込む。
+    // scope置換 (DELETE→INSERT) は同一グループ内に同種別・重複期間のファイルがあると
+    // 後のファイルが前のファイルの行を消す (Codex R2 High) → 黙って順序依存にせずエラー
+    const preps = [];
     for (const f of g.files) {
       const p = prepareAupayFile(f.name, f.buffer);
       if (!p.ok) throw new GroupAbortError(p);
-      collected.push(commitOne(db, logStmt, p, ctx));
+      preps.push(p);
     }
+    for (let i = 0; i < preps.length; i++) {
+      for (let j = i + 1; j < preps.length; j++) {
+        const a = preps[i], b = preps[j];
+        if (a.type === b.type && a.scopeFrom <= b.scopeTo && b.scopeFrom <= a.scopeTo) {
+          throw new GroupAbortError({
+            name: b.name, type: b.type,
+            error: `同一zip内に同種別 (${a.type}) の期間重複ファイルがあります (${a.name}: ${a.scopeFrom}〜${a.scopeTo} / ${b.name}: ${b.scopeFrom}〜${b.scopeTo})。scope置換が相殺されるため個別に投入してください`,
+          });
+        }
+      }
+    }
+    for (const p of preps) collected.push(commitOne(db, logStmt, p, ctx));
   });
   try {
     tx();

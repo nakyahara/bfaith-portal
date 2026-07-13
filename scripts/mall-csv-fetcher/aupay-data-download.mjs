@@ -242,6 +242,8 @@ function monthsBetween(fromYm, toYm) {
 
 async function fetchShopAnalytics(page, outcomes, failures) {
   await gotoWowmaPage(page, CSVDL_URL, '店舗分析CSVダウンロード');
+  // run開始時点の既存ファイル (並行操作検出の基準)
+  const initialFiles = new Set((await statusRows(page)).map((r) => r.file));
 
   // ジョブ計画
   const jobs = [];
@@ -303,6 +305,17 @@ async function fetchShopAnalytics(page, outcomes, failures) {
     await gotoWowmaPage(page, CSVDL_URL, '店舗分析CSVダウンロード');
   }
   console.log(`  [poll] 全${allNames.size}ジョブ完了`);
+
+  // 並行操作の検出 (Codex R2 Medium): このrun中に現れた「自分がbindしていない」新規ファイルが
+  // あれば、bindの取り違えの可能性があるため通知に載せる (取込自体は期間検証で守られている)
+  {
+    const unclaimed = rows.map((r) => r.file).filter((f) => !allNames.has(f) && !initialFiles.has(f));
+    if (unclaimed.length > 0) {
+      const msg = `並行操作の疑い: このrun中に自ジョブ以外の新規ファイルが出現 (${unclaimed.slice(0, 5).join(', ')})。bindの取り違えが無いか要確認`;
+      console.warn(`  ⚠ ${msg}`);
+      failures.push({ reportType: 'adata_shop(job-bind)', error: msg, url: page.url() });
+    }
+  }
 
   // DL → 検証 → incoming
   const rowByFile = new Map(rows.map((r) => [r.file, r]));

@@ -49,10 +49,17 @@ function moveTo(srcPath, destDir) {
   return dest;
 }
 
+// mtime昇順で処理: scope置換 (DELETE→INSERT) のため「後に置かれたファイル=最新」が勝つ。
+// ファイル名昇順だと手動DL等の任意名が新しい取得版の後に処理され巻き戻る (Codex R2 Medium)
 const entries = fs.readdirSync(incomingDir, { withFileTypes: true })
   .filter(e => e.isFile() && /\.(csv|json|zip)$/i.test(e.name))
-  .map(e => e.name)
-  .sort();
+  .map(e => {
+    let mtime = 0;
+    try { mtime = fs.statSync(path.join(incomingDir, e.name)).mtimeMs; } catch { /* 直後に読込で拾う */ }
+    return { name: e.name, mtime };
+  })
+  .sort((a, b) => (a.mtime - b.mtime) || a.name.localeCompare(b.name))
+  .map(e => e.name);
 
 console.log(`=== au PAY分析CSV取込 (incoming: ${incomingDir}) ===`);
 console.log(`対象: ${entries.length} ファイル${isDryRun ? ' [DRY RUN]' : ''}`);

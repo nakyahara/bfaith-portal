@@ -331,6 +331,21 @@ console.log('=== 14. 原子性 (zip内の1ファイル失敗で全ロールバ�
   check('良ファイル分もロールバック', after === before, `${before}→${after}`);
 }
 
+console.log('=== 14b. zip内の同種別×期間重複はエラー (scope置換の相殺防止) ===');
+{
+  const { default: AdmZip } = await import('adm-zip');
+  const zip = new AdmZip();
+  const a = salesCsv(['2026/07/14']);
+  const bRaw = iconv.decode(a, 'Shift_JIS').replace('"22971"', '"11111"');
+  zip.addFile('a.csv', a);
+  zip.addFile('b.csv', sjis(bRaw));
+  const buf = zip.toBuffer();
+  const r = importAupayFile(db, { name: 'aupay_dup_d2026-07-14_x.zip', buffer: buf, sha256: sha(buf), source: 'test' });
+  check('期間重複zipはerror', r.status === 'error' && r.results.some((x) => /期間重複/.test(x.error || '')), JSON.stringify(r.results).slice(0, 200));
+  const n = db.prepare(`SELECT COUNT(*) n FROM fact_aupay_sales_daily WHERE date_jst='2026-07-14'`).get().n;
+  check('何も書き込まれない', n === 0, `got ${n}`);
+}
+
 console.log('=== 15. 未知セグメント warning (取込は成功) ===');
 {
   const csv = sjis([
