@@ -4603,7 +4603,16 @@ load();`;
 router.get('/admin', (req, res) => {
   const body = `
     <h2 class="page">マスタ管理</h2>
-    <div class="import-zone">
+    <div class="tabbar" id="grpBar" style="margin-bottom:4px">
+      <button data-grp="suppliers" class="on">🏭 仕入先</button>
+      <button data-grp="conditions">📦 発注条件・商品</button>
+      <button data-grp="vendormap">📇 先方番号対応表</button>
+      <button data-grp="mail">📧 メール設定</button>
+    </div>
+    <div class="hint" id="grpHint" style="margin-bottom:10px"></div>
+
+    <!-- 📦 発注条件・商品: スプシCSV一括取込 (対象がこのグループのマスタ群のため、ここに内包) -->
+    <div class="import-zone" id="zoneImport" style="display:none">
       <h3>📥 スプレッドシートから取り込む</h3>
       <div class="hint">
         「発注条件マスタ」スプレッドシートから <b>ダウンロードしたCSVをそのまま</b>ここに入れてください（文字コード・列名は自動で判別します）。<br>
@@ -4617,12 +4626,12 @@ router.get('/admin', (req, res) => {
       <div id="importResult" class="pill-row"></div>
     </div>
 
-    <div class="import-zone">
+    <!-- 📧 メール設定 -->
+    <div class="import-zone" id="zoneMail" style="display:none">
       <h3>📧 発注書メール設定</h3>
       <div class="hint">
         発注残ページの「📧発注書メール」から送信します。<b>既定は dry-run</b> (宛先を下の社内アドレスに差し替えて送信) — 内容を数回確認してから live に切り替えてください。<br>
-        宛先は仕入先マスタの「発注書メール宛先」列 (下の宛先マスタCSVで一括登録可)。アメージングクラフト/ビーフリーは対応表を取り込むと添付CSVに先方管理番号列が付きます。<br>
-        対応表の1件ずつの追加・修正・削除は下のタブ「📇 先方番号対応表」でできます (CSV取込は<b>仕入先ごと全置換</b>なので注意)。
+        宛先は仕入先マスタ (🏭仕入先タブ) の「発注書メール宛先」列。下の宛先マスタCSVで一括登録もできます。
       </div>
       <div class="row" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:6px">
         <label>モード <select id="emMode"><option value="dry_run">dry_run (社内宛て)</option><option value="live">live (本番送信)</option></select></label>
@@ -4646,6 +4655,15 @@ router.get('/admin', (req, res) => {
           <input type="file" name="file" accept=".csv" required>
           <button type="submit">📥 宛先マスタ取込</button>
         </form>
+      </div>
+      <div id="emResult" class="pill-row"></div>
+    </div>
+
+    <!-- 📇 対応表: CSV一括取込 (全置換) は対応表グループに内包 -->
+    <div class="import-zone" id="zoneVmapCsv" style="display:none">
+      <h3>📥 対応表CSVの一括取込</h3>
+      <div class="hint">⚠️ CSV取込は<b>その仕入先の対応表を全置換</b>します。1件ずつの追加・修正・削除は下の一覧でできます。</div>
+      <div class="row" style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end">
         <form id="vmapForm">
           <div class="hint">先方管理番号 対応表CSV (見出し「仕入先管理番号」「弊社管理番号」)</div>
           仕入先コード <input type="text" name="supplier_code" style="width:80px" required>
@@ -4655,21 +4673,42 @@ router.get('/admin', (req, res) => {
         </form>
         <span id="vmapNow" class="muted"></span>
       </div>
-      <div id="emResult" class="pill-row"></div>
     </div>
 
-    <div class="tabbar">
-      <button data-tab="suppliers" class="on">仕入先</button>
+    <!-- 📦 発注条件・商品のサブタブ -->
+    <div class="tabbar" id="subBar" style="display:none">
       <button data-tab="conditions">発注条件グループ</button>
       <button data-tab="materials">原料グループ</button>
       <button data-tab="attrs">商品紐付け</button>
       <button data-tab="selectable">🧩 選べるセット構成</button>
-      <button data-tab="vendormap">📇 先方番号対応表</button>
-      <button data-tab="unlinked">🆕 未紐付けの新商品</button>
+      <button data-tab="unlinked">🆕 未紐付けの新商品<span id="unlinkedBadge"></span></button>
     </div>
-    <div class="sec"><div class="bd" id="tabBody">読み込み中…</div></div>`;
+    <div class="sec" id="tabSec"><div class="bd" id="tabBody">読み込み中…</div></div>`;
   const script = `
 var TAB = 'suppliers';
+// ── グループナビ (IA整理 2026-07-13: 仕入先/発注条件/対応表/メールの4分類。説明は「どんなときにここへ来るか」) ──
+var GRP = 'suppliers';
+var SUBTAB = 'conditions'; // 発注条件グループ内で最後に見ていたサブタブ
+var GRP_HINTS = {
+  suppliers: '🏭 新しい仕入先の登録、発注書メールの宛先 (To/CC/担当者名)、発注方法 (📧メール/📠FAX/🌐WEB) をここで設定します。',
+  conditions: '📦 商品をどの発注条件・原料グループで発注するかの設定と、スプレッドシートCSVの一括取込。新商品の紐付け漏れチェックもここ。',
+  vendormap: '📇 自社商品コードと先方管理番号 (アメージングクラフト/ビーフリーの発注書に載る番号) の対応をここで管理します。',
+  mail: '📧 発注書メールの送信モード (dry-run/本番)・差出情報・文面テンプレ・宛先マスタの一括取込。',
+};
+function setGroup(g) {
+  GRP = g;
+  document.querySelectorAll('#grpBar button').forEach(function(b){ b.classList.toggle('on', b.getAttribute('data-grp') === g); });
+  document.getElementById('grpHint').textContent = GRP_HINTS[g] || '';
+  document.getElementById('zoneImport').style.display = g === 'conditions' ? '' : 'none';
+  document.getElementById('zoneMail').style.display = g === 'mail' ? '' : 'none';
+  document.getElementById('zoneVmapCsv').style.display = g === 'vendormap' ? '' : 'none';
+  document.getElementById('subBar').style.display = g === 'conditions' ? '' : 'none';
+  document.getElementById('tabSec').style.display = g === 'mail' ? 'none' : '';
+  if (g === 'mail') return; // メール設定はゾーンのみ (テーブルなし)
+  TAB = g === 'suppliers' ? 'suppliers' : g === 'vendormap' ? 'vendormap' : SUBTAB;
+  document.querySelectorAll('#subBar button').forEach(function(b){ b.classList.toggle('on', b.getAttribute('data-tab') === TAB); });
+  load();
+}
 // ro=読み取り専用の表示列 (サーバが名前解決)。dl=グループをID/名前どちらでも入力できるオートコンプリート
 var DEFS = {
   suppliers: { title: '仕入先', cols: [
@@ -4939,10 +4978,15 @@ function vmPost(productCode, vendorCode, baseUpdatedAt) {
 }
 document.addEventListener('click', function(ev) {
   var t = ev.target;
+  var grp = t.getAttribute && t.getAttribute('data-grp');
+  if (grp) { setGroup(grp); return; }
   var tab = t.getAttribute && t.getAttribute('data-tab');
   if (tab) {
     TAB = tab;
-    document.querySelectorAll('.tabbar button').forEach(function(b){ b.classList.toggle('on', b === t); });
+    if (GRP === 'conditions') SUBTAB = tab; // 発注条件グループ内の選択を記憶
+    // 自分の属するタブバー内だけ選択状態を切り替える (グループバーとサブタブバーの独立、IA整理 2026-07-13)
+    var bar = t.closest('.tabbar');
+    (bar ? bar.querySelectorAll('button') : []).forEach(function(b){ b.classList.toggle('on', b === t); });
     load();
     return;
   }
@@ -5018,7 +5062,7 @@ function post(b) {
     } else toast('エラー: ' + j.error);
   });
 }
-load();
+// 初期表示は末尾の setGroup('suppliers') が行う (グループ状態と load を一体で初期化)
 
 // ── 発注書メール設定 (P15) ──
 var API_EM = '/apps/purchase-orders/api';
@@ -5092,10 +5136,15 @@ document.getElementById('vmapForm').addEventListener('submit', function(ev) {
     toast('対応表を取り込みました (' + j.supplier + ' ' + j.count + '件' + (j.skipped ? ', スキップ' + j.skipped : '') + ')');
     (j.warnings || []).forEach(function(w){ toast('⚠️ ' + w); });
     emLoad();
-    if (TAB === 'vendormap') load(); // 取込後にタブ表示中なら一覧を更新
+    if (TAB === 'vendormap') load(); // 取込後に一覧を更新 (対応表グループ表示中)
   }).catch(function(e){ toast('通信エラー: ' + e.message); });
 });
-emLoad();`;
+emLoad();
+setGroup('suppliers');
+// 未紐付けの新商品バッジ (作業キューなので件数を見せる、Codex IA提言)
+fetch('/apps/purchase-orders/api/attrs/unlinked?days=60').then(function(r){ return r.json(); }).then(function(j) {
+  if (j.ok && j.count > 0) document.getElementById('unlinkedBadge').innerHTML = ' <span class="badge b-draft">' + j.count + '</span>';
+}).catch(function(){});`;
   res.send(pageShell('発注補助 — マスタ管理', 'admin', body, script));
 });
 
