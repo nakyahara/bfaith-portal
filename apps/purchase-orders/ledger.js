@@ -52,7 +52,9 @@ export function stableStringify(v) {
 
 // setSetting で変更できるキーのホワイトリスト (tracking_started_at は含めない=初回確定後は不変。
 // DB側にも UPDATE/DELETE 拒否トリガあり)
-const SETTABLE_KEYS = new Set(['backorder_source', 'email_mode', 'email_dryrun_to', 'email_subject_template', 'email_body_template']);
+const SETTABLE_KEYS = new Set(['backorder_source', 'email_mode', 'email_dryrun_to', 'email_subject_template', 'email_body_template',
+  'po_cycle_reset_at',   // データ更新 (NE取込/FBA更新) 時刻 =「✅発注確定済み」「×非表示」のリセット基準 (サイクルID)
+  'dashboard_hidden_suppliers']); // ダッシュボード×非表示 {"cycle":<保存時のpo_cycle_reset_at>,"codes":[...]} — サイクルIDが変わると自動失効
 
 export function getSetting(key) {
   const r = getDB().prepare('SELECT value FROM po_settings WHERE key=?').get(key);
@@ -84,6 +86,22 @@ export function setSetting(key, value, { actor = null, actorType = 'user', reaso
     audit(db, { actorType, actor, action: 'setting_change', resource: `setting:${key}`,
       detail: { old: old ? old.value : null, new: String(value), reason } });
   })();
+}
+
+/**
+ * FBA更新ジョブの完了検知。同一jobIdは一度だけ true を返し、そのときだけ発注サイクル
+ * (po_cycle_reset_at =「✅発注確定済み」表示の基準) をリセットする。
+ * 挿入と設定更新を同一の即時txnで行う (複数タブの同時ポーリングでも二重リセットしない、Codex サイクルR1 High)
+ */
+export function markCycleFbaJobDone(jobId, actor) {
+  const db = getDB();
+  return db.transaction(() => {
+    const ins = db.prepare('INSERT OR IGNORE INTO po_cycle_fba_jobs (job_id, done_at) VALUES (?,?)')
+      .run(String(jobId), nowIso());
+    if (ins.changes === 0) return false; // 検知済みジョブ (再ポーリング/別タブ) は何もしない
+    setSetting('po_cycle_reset_at', nowIso(), { actor, reason: 'FBA在庫更新の完了で発注サイクル更新' });
+    return true;
+  }).immediate();
 }
 
 /**
@@ -527,6 +545,15 @@ export function checkLedgerIntegrity({ orderId = null } = {}) {
     if (r.status === 'issued' && r.issued_at != null && !isYmd(String(r.issued_at).slice(0, 10))) {
       issues.push({ kind: 'invalid_timestamp', orderId: r.id, detail: `issued_at=${r.issued_at}` });
     }
+  }
+  // 2c. 移行PO属性の列間規則の検算 (トリガ trg_po_orders_migration_attrs_* の防波堤。
+  //     origin='migration' ⇔ ne_slip_number 必須 + send_blocked=1。違反POはメール誤送信・二重カウントの温床)
+  for (const r of db.prepare(`
+    SELECT o.id, o.origin, o.ne_slip_number, o.send_blocked FROM po_orders o
+    WHERE ((o.origin IS NOT NULL AND o.origin <> 'migration')
+       OR (o.origin = 'migration' AND (o.ne_slip_number IS NULL OR trim(o.ne_slip_number) = '' OR o.send_blocked IS NOT 1))
+       OR (o.ne_slip_number IS NOT NULL AND o.origin IS NOT 'migration')) ${scope}`).all(...args)) {
+    issues.push({ kind: 'migration_attrs', orderId: r.id, detail: `origin=${r.origin} ne_slip=${r.ne_slip_number} send_blocked=${r.send_blocked}` });
   }
   // 2b. 逆仕訳の不変条件の検算 (通常はトリガ+UNIQUEが守る。メンテモード・移行後の検査用)
   for (const r of db.prepare(`

@@ -17,7 +17,7 @@
 import { createHash, randomUUID } from 'crypto';
 import iconv from 'iconv-lite';
 import { getDB } from './db.js';
-import { getSetting, audit, jstToday } from './ledger.js';
+import { getSetting, audit, jstToday, isYmd } from './ledger.js';
 
 const nowIso = () => new Date().toISOString();
 const trimS = v => String(v == null ? '' : v).trim();
@@ -30,6 +30,8 @@ export const DEFAULT_BODY_TPL = `{{contact}}
 B-Faith株式会社の発注担当の中原です。
 
 添付の注文よろしくお願いいたします。
+
+希望納期：{{nouki}}
 
 ご確認のほどよろしくお願いいたします。
 
@@ -72,6 +74,13 @@ function render(tpl, data) {
   return String(tpl).replace(/\{\{\s*(\w+)\s*\}\}/g, (_, k) => (k in data ? String(data[k]) : ''));
 }
 
+/** 希望納期 'YYYY-MM-DD' → 'YYYY年M月D日' (メール本文用。実在日以外は呼び出し側で「指定なし」扱い) */
+function fmtNouki(ymd) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(trimS(ymd));
+  if (!m) return trimS(ymd);
+  return `${m[1]}年${Number(m[2])}月${Number(m[3])}日`;
+}
+
 /** CSVセル (Excel互換、injection対策: 数式に化ける先頭文字は ' 前置) */
 function csvCell(v) {
   let s = String(v == null ? '' : v);
@@ -98,25 +107,28 @@ export function buildOrderEmail(orderId) {
   if (sup.send_method !== 'email') throw new Error(`この仕入先の送信方法が email に設定されていません (現在: ${sup.send_method || '未設定'})。仕入先マスタで設定してください`);
   const cc = parseAddresses(sup.email_cc || '');
 
-  const items = db.prepare('SELECT product_code, product_key, product_name, qty, unit_cost FROM po_order_items WHERE order_id=? ORDER BY id').all(orderId);
+  const items = db.prepare('SELECT product_code, product_key, product_name, qty, unit_cost, requested_date FROM po_order_items WHERE order_id=? ORDER BY id').all(orderId);
   if (!items.length) throw new Error('明細がありません');
   const vmap = new Map(db.prepare('SELECT product_key, vendor_code FROM po_vendor_code_map WHERE supplier_code=?')
     .all(order.supplier_code).map(r => [r.product_key, r.vendor_code]));
   const vendorColUsed = vmap.size > 0;
   const missingVendorCodes = [];
+  // 明細単位の希望納期 (実在日のみ採用。不正値はメールに出さない、Codex R1 Low)
+  const reqOf = it => (isYmd(String(it.requested_date || '')) ? it.requested_date : null);
+  const noukiColUsed = items.some(it => reqOf(it));
   const header = vendorColUsed ? ['商品コード', '先方管理番号', '商品名', '数量'] : ['商品コード', '商品名', '数量'];
+  if (noukiColUsed) header.push('希望納期');
   const lines = [header.map(csvCell).join(',')];
   let totalQty = 0, totalAmount = 0;
   for (const it of items) {
     totalQty += it.qty;
     totalAmount += it.unit_cost != null ? Math.round(it.unit_cost * it.qty) : 0;
-    if (vendorColUsed) {
-      const vc = vmap.get(it.product_key) || '';
-      if (!vc) missingVendorCodes.push(it.product_code);
-      lines.push([it.product_code, vc, it.product_name || '', it.qty].map(csvCell).join(','));
-    } else {
-      lines.push([it.product_code, it.product_name || '', it.qty].map(csvCell).join(','));
-    }
+    const cells = vendorColUsed
+      ? [it.product_code, (vmap.get(it.product_key) || ''), it.product_name || '', it.qty]
+      : [it.product_code, it.product_name || '', it.qty];
+    if (vendorColUsed && !vmap.get(it.product_key)) missingVendorCodes.push(it.product_code);
+    if (noukiColUsed) cells.push(reqOf(it) ? String(reqOf(it)).replace(/-/g, '/') : '');
+    lines.push(cells.map(csvCell).join(','));
   }
   const csvText = lines.join('\r\n');
   // CP932変換不能文字の検出 (黙って ? に化けるとプレビューと実添付が食い違う、Codex P15-R1 M10)
@@ -125,11 +137,23 @@ export function buildOrderEmail(orderId) {
     throw new Error(`添付CSVにShift-JISへ変換できない文字があります: ${bad.join(' ')} — 商品名等を確認してください`);
   }
   const st = emailSettings();
-  const data = { date: jstToday(), name: sup.name, contact: ensureSama(sup.contact_name), po_number: order.po_number || `#${order.id}` };
+  // 本文の希望納期: 全明細が同じ日付ならその日付、商品ごとに異なる/一部のみ指定なら添付CSVの列を案内、全て未指定なら「指定なし」
+  const distinctDates = [...new Set(items.map(reqOf))];
+  const noukiText = !noukiColUsed ? '指定なし'
+    : (distinctDates.length === 1 && distinctDates[0] ? fmtNouki(distinctDates[0]) : '商品ごとに指定しています (添付ファイルの「希望納期」列をご確認ください)');
+  const data = {
+    date: jstToday(), name: sup.name, contact: ensureSama(sup.contact_name), po_number: order.po_number || `#${order.id}`,
+    nouki: noukiText,
+  };
+  let body = render(st.bodyTpl, data);
+  // カスタム保存済みテンプレに {{nouki}} が無くても、希望納期の指定があれば必ず先方に伝わるよう末尾に追記
+  if (noukiColUsed && !/\{\{\s*nouki\s*\}\}/.test(String(st.bodyTpl))) {
+    body += `\n\n希望納期: ${noukiText}`;
+  }
   return {
     order, supplier: sup, to, cc,
     subject: render(st.subjectTpl, data),
-    body: render(st.bodyTpl, data),
+    body,
     rows: items.length, totalQty, totalAmount,
     csvText, attachmentName: `${(order.po_number || 'PO-' + order.id)}.csv`,
     vendorColUsed, missingVendorCodes,

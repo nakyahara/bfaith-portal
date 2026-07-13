@@ -99,7 +99,9 @@ ok(r.status === 400, '見出し不一致CSVは 400');
 
 console.log('── overview / supplier ──');
 r = await j('/api/overview');
-ok(r.body.ok && r.body.cards.length === 1 && r.body.cards[0].code === '1', 'overview: 仕入先1のみ要発注', r.body.cards);
+// 注残はアプリ台帳が正 (NE CSVの発注残数は使わない)。台帳が空の初期状態では
+// NE注残で対象外だった gyoumuhandcream60-BI (仕入先2) も要発注に入る
+ok(r.body.ok && r.body.cards.length === 2 && r.body.cards[0].code === '1' && r.body.cards[1].code === '2', 'overview: 台帳注残ベースで仕入先1+2が要発注', r.body.cards);
 ok(r.body.cards[0].targetCount === 2, 'overview: 要発注2SKU', r.body.cards[0]);
 r = await j('/api/supplier/0001');
 ok(r.body.ok && r.body.supplier.name === 'アメージングクラフト様', 'supplier: 名前解決 (0001→1)');
@@ -146,7 +148,13 @@ r = await j('/api/orders/' + issuedId);
 ok(r.body.order.items.length === 2 && r.body.order.items[0].unit_cost === 70, '明細+原価スナップショット', r.body.order.items);
 r = await j('/api/supplier/1');
 ok(r.body.draft === null, 'issue 後 draft は消える');
-ok(r.body.targets.find(t => t.code === 'noflyersticker').recentIssued != null, '発注済みバッジ (recentIssued)');
+{
+  const noflyAfter = [...r.body.targets, ...r.body.candidates, ...r.body.horikoshi].find(t => t.code === 'noflyersticker');
+  ok(noflyAfter && noflyAfter.recentIssued != null, '発注済みバッジ (recentIssued)');
+  // 台帳注残: 確定した瞬間に注残へ反映され、NE CSVを待たずに要発注から消える
+  ok(noflyAfter && noflyAfter.backOrder === 400 && !r.body.targets.some(t => t.code === 'noflyersticker'),
+    '確定即時に台帳注残へ反映され要発注から消える', noflyAfter && noflyAfter.backOrder);
+}
 r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ items: [], note: '' }) });
 ok(r.status === 400, '空 issue は 400');
 
@@ -212,15 +220,28 @@ const neCsv = '"商品コード","商品名","仕入先コード","原価","売�
   '"unknown-in-ne","NEにしかない商品","0001","100.00","500.00","取扱中","","","","10","","","2026-01-01","5","0","2026-07-04","10","0"\r\n';
 const fdNe = new FormData();
 fdNe.append('file', new Blob([neCsv], { type: 'text/csv' }), 'nedldata.csv');
+// 取込前: 直近のissue (400+200) で仕入先1が「発注確定済み」サイクルに載っている
+r = await j('/api/cycle-issued');
+ok(r.body.ok && r.body.suppliers.some(s => s.code === '1'), 'cycle-issued: 発注確定済み仕入先が載る', r.body.suppliers);
+r = await j('/api/overview');
+{
+  const ovCard = r.body.cards.find(c => c.code === '1');
+  ok(ovCard && ovCard.issuedCount >= 1, 'overview: 発注確定済みカウント付き', ovCard);
+}
 r = await j('/api/ne-overlay/csv', { method: 'POST', body: fdNe });
 ok(r.status === 200 && r.body.rowCount === 2, 'NE CSV取込 2件', r.body);
+// データ更新 (NE取込) で発注確定サイクルがリセットされる
+r = await j('/api/cycle-issued');
+ok(r.body.ok && r.body.suppliers.length === 0, 'NE CSV取込で発注確定サイクルがリセット', r.body.suppliers);
 r = await j('/api/supplier/1');
 ok(r.body.overlay && r.body.overlay.applied === true, 'overlay 適用中フラグ');
 const noflyOv = [...r.body.targets, ...r.body.candidates, ...r.body.horikoshi].find(p => p.code === 'noflyersticker');
-ok(noflyOv && noflyOv.stock === 120 && noflyOv.backOrder === 50, 'overlay: 在庫=NE100+FBA20, 注残=50', noflyOv && { stock: noflyOv.stock, back: noflyOv.backOrder });
+// 注残はNEオーバーレイの発注残数(50)ではなくアプリ台帳 (issue 400 + issue2 200 = 600) が正
+ok(noflyOv && noflyOv.stock === 120 && noflyOv.backOrder === 600, 'overlay: 在庫=NE100+FBA20, 注残=台帳600 (NE値50は使わない)', noflyOv && { stock: noflyOv.stock, back: noflyOv.backOrder });
 ok(noflyOv && noflyOv.cost === 75, 'overlay: 原価も最新化 (70→75)', noflyOv && noflyOv.cost);
-// L=(120+50)/368=0.46 → 発注対象のまま、推奨量再計算 = ROUND((2.5-0.4620)*368/100)*100 = 800
-ok(noflyOv && noflyOv.recQty === 800, 'overlay: 推奨発注量が再計算される (800)', noflyOv && noflyOv.recQty);
+// overlay在庫+台帳注残で在庫月数が再計算される: (120+600)/368 = 1.9565 → M1.5超で対象外
+ok(noflyOv && Math.abs(noflyOv.stockMonths - 720 / 368) < 0.01 && noflyOv.recQty == null,
+  'overlay: 在庫月数再計算 (overlay在庫+台帳注残)', noflyOv && { m: noflyOv.stockMonths, rec: noflyOv.recQty });
 // 朝同期の方が新しい場合は自動で無視
 db.prepare(`UPDATE mirror_pml_published SET src_ne_products_synced_at=? WHERE id=1`).run(new Date(Date.now() + 3600000).toISOString());
 r = await j('/api/supplier/1');
@@ -232,7 +253,7 @@ ok(r.status === 200, 'overlay 解除');
 r = await j('/api/supplier/1');
 ok(r.body.overlay === null, '解除後 overlay なし');
 const noflyBack = [...r.body.targets, ...r.body.candidates, ...r.body.horikoshi].find(p => p.code === 'noflyersticker');
-ok(noflyBack && noflyBack.backOrder === 0, '解除後は PML の値に戻る', noflyBack && noflyBack.backOrder);
+ok(noflyBack && noflyBack.backOrder === 600, '解除後も注残は台帳値のまま (在庫はPMLに戻る)', noflyBack && noflyBack.backOrder);
 // 見出し不正CSV
 const badNe = new FormData();
 badNe.append('file', new Blob(['foo,bar\r\n1,2\r\n']), 'bad.csv');
@@ -596,6 +617,17 @@ console.log('── P13a: 台帳 (イベント/逆仕訳/クローズ/整合性)
   try { L.appendPoItemEvent({ orderItemId: legacyItem.id, eventType: 'receipt', qty: 1, source: 'manual' }); } catch (e) { threw = e.message; }
   ok(threw && threw.includes('legacy'), 'legacy発注へのイベントは拒否 (境界時刻が正)');
 
+  // 台帳注残 (要発注判定) に legacy PO の数量は入らない (tracking_mode='tracked' でも境界以前は除外)
+  {
+    r = await j('/api/supplier/1');
+    const noflyLZ = [...r.body.targets, ...r.body.candidates, ...r.body.horikoshi].find(p => p.code === 'noflyersticker');
+    const zanNoBoundary = db.prepare(`SELECT COALESCE(SUM(b.remaining_qty),0) AS z FROM po_order_items i
+      JOIN po_orders o ON o.id = i.order_id JOIN v_po_item_balance b ON b.order_item_id = i.id
+      WHERE i.product_key='noflyersticker' AND o.status='issued' AND o.tracking_mode='tracked'
+        AND o.closed_at IS NULL AND b.remaining_qty > 0`).get().z;
+    ok(noflyLZ && zanNoBoundary - noflyLZ.backOrder === 10, '台帳注残: 境界以前のlegacy PO (10個) を除外', { back: noflyLZ && noflyLZ.backOrder, all: zanNoBoundary });
+  }
+
   // 発行の世代ゲート: 境界後は po_number 等の無い issued を物理拒否 (旧コード相当のINSERT)
   threw = null;
   try {
@@ -833,6 +865,45 @@ console.log('── P13b: 発注残ページ+消込API ──');
   const draftRow = db.prepare("SELECT requested_date FROM po_orders WHERE status='draft' AND supplier_code='1'").get();
   ok(r.body.ok && draftRow && draftRow.requested_date === '2026-08-15', '下書き保存で希望納期も保持 (Codex P13b R3)');
 
+  // 明細単位の希望納期 (下書き): item.requestedDate が明細に保存され、混在ならヘッダはNULL
+  r = await j('/api/supplier/1/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 1, requestedDate: '2026-09-01' }, { code: 'cardstand-silver-r', qty: 2 }], note: 'd2' }) });
+  {
+    const dHdr = db.prepare("SELECT id, requested_date FROM po_orders WHERE status='draft' AND supplier_code='1'").get();
+    const dIts = db.prepare('SELECT product_code, requested_date FROM po_order_items WHERE order_id=? ORDER BY id').all(dHdr.id);
+    ok(r.body.ok && dIts[0].requested_date === '2026-09-01' && dIts[1].requested_date == null, '下書きに明細単位の希望納期を保存 (未指定はNULL)');
+    ok(dHdr.requested_date == null, '明細納期が混在/一部指定ならヘッダはNULL');
+  }
+  r = await j('/api/supplier/1/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 1, requestedDate: '2026-09-31' }] }) });
+  ok(r.status === 400, '明細希望納期の実在しない日付は400');
+  // ヘッダ既定値互換のdraftへ戻す
+  await j('/api/supplier/1/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 1 }], note: 'd', requestedDate: '2026-08-15' }) });
+  {
+    const dIt = db.prepare("SELECT i.requested_date FROM po_order_items i JOIN po_orders o ON o.id=i.order_id WHERE o.status='draft' AND o.supplier_code='1'").get();
+    ok(dIt && dIt.requested_date === '2026-08-15', 'ヘッダ希望納期は明細の既定値として保存 (旧API互換)');
+  }
+
+  // 旧形式draft互換 (ヘッダ日付あり+明細NULL): 復元時の実効希望納期はヘッダ値 (Codex 明細納期R1 High)
+  {
+    const dHdr = db.prepare("SELECT id FROM po_orders WHERE status='draft' AND supplier_code='1'").get();
+    db.prepare('UPDATE po_order_items SET requested_date=NULL WHERE order_id=?').run(dHdr.id);
+    const supHtml = await (await fetch(base + '/supplier/1')).text();
+    ok(supHtml.includes('2026-08-15'), '旧形式draft (明細NULL) はヘッダ希望納期を実効値として復元', supHtml.includes('requestedDate'));
+  }
+
+  // 空カート保存 = draft削除。deleted は実削除時のみ true (draftなしでの入力クリア誤発火防止)
+  const emptyPost = () => j('/api/supplier/1/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [] }) });
+  r = await emptyPost();
+  ok(r.body.ok && r.body.deleted === true, '空カート保存: 既存draftあり → deleted=true');
+  r = await emptyPost();
+  ok(r.body.ok && r.body.deleted === false, '空カート保存: draftなし → deleted=false');
+  // 状態を元に戻す
+  await j('/api/supplier/1/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 1 }], note: 'd', requestedDate: '2026-08-15' }) });
+
   // ページ配信 (発注残ページ・ダッシュボードのサマリ・履歴のPO番号列)
   {
     const html = await (await fetch(base + '/backorders')).text();
@@ -845,11 +916,23 @@ console.log('── P13b: 発注残ページ+消込API ──');
     // 発注確定の冪等キー (供給ページ): ノンス+内容ハッシュ
     const sup = await (await fetch(base + '/supplier/1')).text();
     ok(sup.includes('ISSUE_NONCE') && sup.includes('contentHash') && sup.includes('Idempotency-Key'), '/supplier 発注確定に冪等キー (ノンス+内容ハッシュ)');
-    ok(sup.includes('orderReqDate'), '/supplier 希望納期入力');
+    ok(sup.includes('data-date=') && sup.includes('希望納期'), '/supplier 商品ごとの希望納期入力');
+    ok(!sup.includes('orderReqDate'), '/supplier ヘッダ一括納期入力は廃止');
+    ok(sup.includes('data-act="save"') && sup.includes('data-act="issue"'), '/supplier 保存/確定ボタン (上下2箇所)');
+    ok(sup.includes('fSaved') && sup.includes('未保存の変更あり') && sup.includes('発注金額合計'), '/supplier 保存済みインジケータ (SKU数+発注金額合計)');
     const dash = await (await fetch(base + '/')).text();
     ok(dash.includes('発注残') && dash.includes('/apps/purchase-orders/backorders'), '/ ダッシュボードに発注残サマリ');
+    ok(dash.includes('confirmCycleReset') && dash.includes('cycle-issued'), '/ データ更新前の二段確認 (確定リセット+メール未送信)');
+    ok(dash.includes('更新を中止しました'), '/ 確認情報の取得失敗時は更新しない (fail-closed)');
+    ok(dash.includes('発注確定済み'), '/ 仕入先カードに発注確定済みバッジ');
+    const adminHtml = await (await fetch(base + '/admin')).text();
+    ok(adminHtml.includes('発注方法') && adminHtml.includes('📠 FAX') && adminHtml.includes('🌐 WEBサイト'), '/admin 発注方法プルダウン (email/fax/web/none)');
     const orders = await (await fetch(base + '/orders')).text();
     ok(orders.includes('PO番号') && orders.includes('発注残'), '/orders にPO番号・発注残列');
+    // 仕入先ごと並び替え+絞り込み。仕入先名クリック=確定明細 (ワークスペース行きリンクは廃止、中原さん報告 2026-07-13)
+    ok(orders.includes('ordSort') && orders.includes('仕入先ごと') && orders.includes('ordSup'), '/orders 並び順+仕入先絞り込みUI');
+    ok(!orders.includes("'<td><a href=\"/apps/purchase-orders/supplier/'"), '/orders 一覧の仕入先名はワークスペースリンクではない');
+    ok(orders.includes('新しい発注作業') && orders.includes('確定時の明細'), '/orders 明細=確定時の内容+ワークスペースは明示リンク');
   }
 }
 // ═══ P14 ロジザード入庫消込 ═══
@@ -1042,6 +1125,47 @@ console.log('── P15: メール送信 (fake transport) ──');
   ok(r.body.ok && r.body.subject.includes('【発注書】') && r.body.subject.includes('アメージングクラフト'), 'preview: 件名テンプレ (GAS互換)', r.body.subject);
   ok(r.body.body.startsWith('田中様'), 'preview: 担当者に様を自動付与');
   ok(r.body.vendorColUsed && r.body.csvText.includes('先方管理番号') && r.body.csvText.includes('AMC-001'), 'preview: 添付CSVに先方管理番号列', r.body.csvText.split('\r\n')[0]);
+  ok(r.body.body.includes('希望納期：2026年7月30日'), 'preview: 本文に希望納期 ({{nouki}})', r.body.body.split('\n').find(l => l.includes('希望納期')));
+
+  // 希望納期なしの発注 → 「指定なし」。カスタムテンプレに {{nouki}} が無い場合は末尾に追記される
+  {
+    r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 1 }] }) });
+    const noDateId = r.body.id;
+    r = await j('/api/orders/' + noDateId + '/email/preview');
+    ok(r.body.ok && r.body.body.includes('希望納期：指定なし'), 'preview: 納期未指定は「指定なし」');
+    r = await jsonPost('/api/email/settings', { bodyTpl: '{{contact}}\nいつもの内容でお願いします。' });
+    ok(r.body.ok, 'カスタム本文テンプレ保存');
+    r = await j('/api/orders/' + emOrderId + '/email/preview');
+    ok(r.body.body.includes('希望納期: 2026年7月30日'), 'preview: {{nouki}}なしテンプレでも希望納期を末尾追記', r.body.body);
+    r = await j('/api/orders/' + noDateId + '/email/preview');
+    ok(!r.body.body.includes('希望納期'), 'preview: {{nouki}}なしテンプレ+納期未指定なら追記しない');
+    r = await jsonPost('/api/email/settings', { bodyTpl: '' }); // 既定テンプレに戻す
+    ok(r.body.ok, '本文テンプレを既定に戻す');
+  }
+
+  // 商品ごとに異なる希望納期 → ヘッダNULL・本文は個別案内・添付CSVに希望納期列
+  {
+    r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: [
+        { code: 'noflyersticker', qty: 2, requestedDate: '2026-08-10' },
+        { code: 'cardstand-silver-r', qty: 3, requestedDate: '2026-08-20' },
+      ] }) });
+    const mixedId = r.body.id;
+    ok(r.body.ok && db.prepare('SELECT requested_date FROM po_orders WHERE id=?').get(mixedId).requested_date == null, 'issue: 明細納期が混在ならヘッダNULL');
+    const its = db.prepare('SELECT requested_date FROM po_order_items WHERE order_id=? ORDER BY id').all(mixedId);
+    ok(its[0].requested_date === '2026-08-10' && its[1].requested_date === '2026-08-20', 'issue: 明細単位の希望納期を保存');
+    r = await j('/api/orders/' + mixedId + '/email/preview');
+    ok(r.body.ok && r.body.body.includes('商品ごとに指定'), 'preview: 混在納期は個別案内', r.body.body.split('\n').find(l => l.includes('希望納期')));
+    ok(r.body.csvText.includes('希望納期') && r.body.csvText.includes('2026/08/10') && r.body.csvText.includes('2026/08/20'), 'preview: 添付CSVに希望納期列', r.body.csvText.split('\r\n')[0]);
+    // 納期なしの発注 (noDateId 相当) のCSVには希望納期列を追加しない
+    r = await j('/api/orders/' + emOrderId + '/email/preview');
+    ok(r.body.ok && r.body.csvText.includes('希望納期') && r.body.csvText.includes('2026/07/30'), 'preview: 全明細同一納期でもCSVに列あり+本文は日付', r.body.csvText.split('\r\n')[1]);
+    // 明細納期が不正なら400
+    r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 1, requestedDate: '2026/08/10' }] }) });
+    ok(r.status === 400, 'issue: 明細希望納期の形式不正は400');
+  }
 
   // 冪等キーなしの送信は拒否 (再送はdedup対象外のためキーが唯一の再実行ガード)
   r = await jsonPost('/api/orders/' + emOrderId + '/email/send', {});
@@ -1054,6 +1178,15 @@ console.log('── P15: メール送信 (fake transport) ──');
   ok(job1.to_addr === 'me@b-faith.biz' && job1.subject.startsWith('【DRYRUN】') && job1.body.includes('整理番号: DK') && job1.is_dry_run === 1,
     'dry-run: 宛先差替+件名+整理番号', job1.to_addr);
   ok(job1.body.includes('本来の宛先: TO=tanaka@example.com'), 'dry-run: 本来の宛先を本文に明記');
+
+  // dry-run送信のみのPOは「発注書メール未送信」扱い (cycle-issuedのunsent)
+  r = await j('/api/cycle-issued');
+  {
+    const cyc1 = r.body.suppliers.find(s => s.code === '1');
+    ok(r.body.ok && cyc1 && cyc1.unsent >= 1, 'cycle-issued: dry-run送信のみは未送信扱い (unsent>=1)', cyc1);
+    ok(cyc1 && cyc1.unsentPoNumbers.length === cyc1.unsent && cyc1.poNumbers.length >= cyc1.unsentPoNumbers.length,
+      'cycle-issued: unsentPoNumbers は未送信POだけ列挙', cyc1);
+  }
 
   // 冪等: 同一キー再送は同じジョブ (二重送信なし)
   r = await jsonPost('/api/orders/' + emOrderId + '/email/send', {}, 'em-key-1');
@@ -1247,7 +1380,335 @@ console.log('── P15: メール送信 (fake transport) ──');
     ok(boHtml.includes('data-emailui') && boHtml.includes('DRYRUN') === false && boHtml.includes('emailPanel'), '/backorders 発注書メールパネル');
   }
 }
+
+// ═══ 対応表 1件管理 (先方番号対応表タブ) ═══
+console.log('── 対応表 1件管理 (entries/products/entry upsert/delete) ──');
+{
+  const jsonPost2 = (p, body) => j(p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+
+  // 一覧: PMLから商品名解決、仕入先コード正規化
+  r = await j('/api/vendor-map/entries?supplier=0001');
+  ok(r.body.ok && String(r.body.supplierName).includes('アメージングクラフト'), 'entries: 一覧+仕入先名 (0001→1正規化)', r.body);
+  const e1 = (r.body.rows || []).find(x => x.product_code === 'noflyersticker');
+  ok(e1 && e1.vendor_code === 'AMC-001' && e1.name === 'チラシ お断り ステッカー', 'entries: 既存対応にPML商品名が付く', e1);
+  r = await j('/api/vendor-map/entries');
+  ok(r.status === 400, 'entries: 仕入先なしは400');
+  r = await j('/api/vendor-map/entries?supplier=9999');
+  ok(r.status === 400 && r.body.error.includes('未登録'), 'entries: 未登録仕入先は400');
+
+  // 商品検索: 部分一致 (商品名/コード)、選択仕入先の商品だけ返す (Codex R1 High-2)
+  r = await j('/api/vendor-map/products?supplier=2&q=' + encodeURIComponent('ハンドクリーム'));
+  ok(r.body.ok && r.body.rows.length === 1 && r.body.rows[0].code === 'gyoumuhandcream60-BI', 'products: 商品名の部分一致', r.body.rows);
+  r = await j('/api/vendor-map/products?supplier=0002&q=0');
+  ok(r.body.ok && r.body.rows.length === 1 && r.body.rows[0].code === 'gyoumuhandcream60-BI', 'products: 他仕入先の商品は候補に出ない', r.body.rows.map(x => x.code));
+  r = await j('/api/vendor-map/products?q=');
+  ok(r.body.ok && r.body.rows.length === 0, 'products: 空クエリは空配列');
+
+  // 仕入先未設定 (空欄) の商品は候補にも出ず登録も拒否 (Codex R2 High)
+  insRow.run('nosupplier-item', '仕入先未設定商品', '', '取扱中', 2, 10, 0, 0, 0, 100, 1.5, 500, 200, '2026-01-01', '2020-01-01');
+  r = await j('/api/vendor-map/products?supplier=1&q=nosupplier');
+  ok(r.body.ok && r.body.rows.length === 0, 'products: 仕入先未設定の商品は候補に出ない');
+  r = await jsonPost2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'nosupplier-item', vendor_code: 'X' });
+  ok(r.status === 400 && r.body.error.includes('仕入先が未設定'), 'entry: 仕入先未設定の商品は登録拒否', r.body.error);
+
+  // upsert: 新規追加 (大文字入力でも product_key は正規化キーで同一商品扱い)
+  r = await jsonPost2('/api/vendor-map/entry', { supplier_code: '0001', product_code: 'CARDSTAND-SILVER-R', vendor_code: 'ZZ-CS-1' });
+  ok(r.body.ok && r.body.updated === false, 'entry: 新規追加', r.body);
+  let vmRow = db.prepare("SELECT * FROM po_vendor_code_map WHERE supplier_code='1' AND product_key='cardstand-silver-r'").get();
+  ok(vmRow && vmRow.vendor_code === 'ZZ-CS-1' && vmRow.product_code === 'CARDSTAND-SILVER-R', 'entry: key正規化+入力コード保存', vmRow);
+  // upsert: 上書きは旧値を返す (誤上書きに気づける)
+  r = await jsonPost2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'cardstand-silver-r', vendor_code: 'ZZ-CS-2' });
+  ok(r.body.ok && r.body.updated === true && r.body.oldVendorCode === 'ZZ-CS-1', 'entry: 上書きで旧値返却', r.body);
+  // バリデーション
+  r = await jsonPost2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'not-in-pml-xyz', vendor_code: 'X' });
+  ok(r.status === 400 && r.body.error.includes('商品マスタに無い'), 'entry: PMLに無い商品コードは拒否 (タイポ防止)', r.body.error);
+  r = await jsonPost2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'cardstand-silver-r', vendor_code: '  ' });
+  ok(r.status === 400 && r.body.error.includes('先方管理番号'), 'entry: 先方番号が空は拒否');
+  r = await jsonPost2('/api/vendor-map/entry', { supplier_code: '9999', product_code: 'cardstand-silver-r', vendor_code: 'X' });
+  ok(r.status === 400 && r.body.error.includes('未登録'), 'entry: 未登録仕入先は拒否');
+  r = await jsonPost2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'cardstand-silver-r', vendor_code: 'A\nB' });
+  ok(r.status === 400 && r.body.error.includes('改行'), 'entry: 先方番号の改行は拒否');
+  r = await jsonPost2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'cardstand-silver-r', vendor_code: 'x'.repeat(101) });
+  ok(r.status === 400 && r.body.error.includes('長すぎ'), 'entry: 先方番号の長さ上限 (Codex R1 Med)');
+  // 他仕入先の商品は登録拒否 (仕入先2の商品を仕入先1の対応表へ)
+  r = await jsonPost2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'gyoumuhandcream60-BI', vendor_code: 'X-1' });
+  ok(r.status === 400 && r.body.error.includes('この商品の仕入先は 2'), 'entry: 他仕入先の商品は登録拒否 (Codex R1 High)', r.body.error);
+
+  // 楽観ロック (baseUpdatedAt): 追加フォーム=null → 既存があれば409 / 古い版での保存・削除は409
+  r = await jsonPost2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'cardstand-silver-r', vendor_code: 'ZZ-DUP', baseUpdatedAt: null });
+  ok(r.status === 409 && r.body.conflict && r.body.current.vendor_code === 'ZZ-CS-2', 'entry: 追加フォームで既存商品は409+現在値', r.body);
+  const curBase = db.prepare("SELECT updated_at FROM po_vendor_code_map WHERE supplier_code='1' AND product_key='cardstand-silver-r'").get().updated_at;
+  r = await jsonPost2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'cardstand-silver-r', vendor_code: 'ZZ-CS-3', baseUpdatedAt: '2020-01-01T00:00:00.000Z' });
+  ok(r.status === 409 && r.body.conflict, 'entry: 古い版での保存は409 (他画面の変更を握り潰さない)', r.body);
+  r = await jsonPost2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'cardstand-silver-r', vendor_code: 'ZZ-CS-3', baseUpdatedAt: curBase });
+  ok(r.body.ok && r.body.updated === true, 'entry: 一致する版での保存は成功');
+  r = await j('/api/vendor-map/entry?supplier=1&product=cardstand-silver-r&base=' + encodeURIComponent(curBase), { method: 'DELETE' });
+  ok(r.status === 409 && r.body.conflict, 'entry: 古い版での削除は409', r.body);
+  // 上の保存でZZ-CS-3になった分をZZ-CS-2へ戻す (以降のプレビュー反映テストの前提を単純に保つ)
+  r = await jsonPost2('/api/vendor-map/entry', { supplier_code: '1', product_code: 'cardstand-silver-r', vendor_code: 'ZZ-CS-2' });
+  ok(r.body.ok, 'entry: base未指定は無条件upsert (スクリプト/AI連携用)');
+
+  // 編集が発注書プレビューの添付CSVへ即反映される
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'cardstand-silver-r', qty: 3 }], requestedDate: '2026-08-01' }) });
+  const vmOrderId = r.body.id;
+  r = await j('/api/orders/' + vmOrderId + '/email/preview');
+  ok(r.body.ok && r.body.csvText.includes('ZZ-CS-2'), 'entry編集がプレビュー添付CSVに反映', r.body.ok ? r.body.csvText.split('\r\n').slice(0, 2) : r.body);
+
+  // 削除 → 二重削除は404。監査ログが残る
+  r = await j('/api/vendor-map/entry?supplier=1&product=CARDSTAND-SILVER-R', { method: 'DELETE' });
+  ok(r.body.ok === true, 'entry: 削除 (コードは正規化して照合)', r.body);
+  ok(!db.prepare("SELECT 1 FROM po_vendor_code_map WHERE supplier_code='1' AND product_key='cardstand-silver-r'").get(), 'entry: 削除でDBから消える');
+  r = await j('/api/vendor-map/entry?supplier=1&product=cardstand-silver-r', { method: 'DELETE' });
+  ok(r.status === 404, 'entry: 二重削除は404');
+  const auN = db.prepare("SELECT COUNT(*) AS n FROM po_audit_log WHERE action IN ('vendor_map_entry_upsert','vendor_map_entry_delete')").get().n;
+  ok(auN >= 3, 'entry: upsert/deleteが監査ログに残る', auN);
+
+  // /admin にタブとスクリプト
+  const adminHtml2 = await (await fetch(base + '/admin')).text();
+  ok(adminHtml2.includes('先方番号対応表') && adminHtml2.includes('loadVmap') && adminHtml2.includes('vmProdDl'), '/admin 対応表タブ配信');
+}
 function nowIsoStr() { return new Date().toISOString(); }
+
+console.log('── NE発注残 初期取込 (移行PO) ──');
+{
+  const neCsvOf = rows => iconv.encode(rows.map(r => r.map(v => '"' + String(v) + '"').join(',')).join('\r\n'), 'Shift_JIS');
+  const NEHDR = ['発注伝票番号', '発注先名', '商品コード', '商品名', 'option', '発注数', '注残計', '予定納期', '備考', '商品区分', '受注伝票番号', '明細行', '発行日', '仕入先cd', '発注明細行', '商品区分値'];
+  const neRow = (slip, code, name, qty, rem, date, sup, due = '') => [slip, 'テスト様', code, name, '', qty, rem, due, '', '通常', '0', '0', date, sup, '1', '0'];
+  const upNe = async (name, rows, opts = {}) => {
+    const fd = new FormData();
+    fd.append('file', new Blob([neCsvOf(rows)]), name);
+    if (opts.commit) { fd.append('commit', '1'); fd.append('fileHash', opts.hash || ''); fd.append('planHash', opts.plan || ''); }
+    return j('/api/backorders/ne-import', { method: 'POST', body: fd });
+  };
+
+  // 事前状態 (発注済みバッジ・月次上限・PO件数)
+  r = await j('/api/supplier/1');
+  const beforeIssuedTotal = r.body.issuedTotal;
+  const beforeDead = (r.body.horikoshi.find(p => p.code === 'deaditem') || {}).recentIssued || null;
+  const ordersBefore = db.prepare('SELECT COUNT(*) n FROM po_orders').get().n;
+  // 整合性はP14が意図的に残した訂正競合が既に載っているため、取込で「増えない」ことを検証する
+  r = await j('/api/ledger/integrity');
+  const integrityBefore = r.body.issues.length;
+
+  // プレビュー (書込なし)。NE実CSVと同じ列構成 + YYYY/M/D 日付 + 部分入庫済 + PML外商品
+  const NE1 = [NEHDR,
+    neRow('6274', 'noflyersticker', 'チラシ', 500, 200, '2025/12/18', '0001'),
+    neRow('6274', 'deaditem', '休眠', 100, 100, '2025/12/18', '0001', '2026/8/1'),
+    neRow('7645', 'gyoumuhandcream60-BI', 'ハンドクリーム', 24, 24, '2026/6/8', '0002'),
+    neRow('7645', 'not-in-pml-item', 'PML外商品', 10, 3, '2026/6/8', '0002'),
+  ];
+  r = await upNe('ne1.csv', NE1);
+  ok(r.status === 200 && r.body.ok && r.body.commit === false && r.body.orders === 2 && r.body.items === 4, 'プレビュー: 2伝票4明細', r.body);
+  ok(r.body.totalRemaining === 327 && r.body.receiptEvents === 2, 'プレビュー: 残数計327 / 取込前入庫2明細', { rem: r.body.totalRemaining, ev: r.body.receiptEvents });
+  ok(r.body.warnings.some(w => w.includes('PMLに存在しない')), 'プレビュー: PML外商品は警告', r.body.warnings);
+  ok(db.prepare('SELECT COUNT(*) n FROM po_orders').get().n === ordersBefore, 'プレビューは書込なし');
+  const NE1_HASH = r.body.fileHash;
+  const NE1_PLAN = r.body.planHash;
+  ok(typeof NE1_HASH === 'string' && NE1_HASH.length === 64 && typeof NE1_PLAN === 'string' && NE1_PLAN.length === 64, 'プレビュー: fileHash/planHash (SHA-256) を返す');
+
+  // fileHash/planHash不一致 (プレビューと別ファイル・プレビューなし・DB変化) の確定は拒否、書込なし
+  r = await upNe('ne1.csv', NE1, { commit: true, hash: 'deadbeef', plan: NE1_PLAN });
+  ok(r.status === 400 && r.body.error.includes('一致しません'), '確定: fileHash不一致は拒否', r.body.error);
+  r = await upNe('ne1.csv', NE1, { commit: true });
+  ok(r.status === 400, '確定: ハッシュなしは拒否');
+  r = await upNe('ne1.csv', NE1, { commit: true, hash: NE1_HASH, plan: 'stale-plan' });
+  ok(r.status === 400 && r.body.error.includes('変わっています'), '確定: planHash不一致は拒否 (プレビュー後のDB変化)', r.body.error);
+  ok(db.prepare('SELECT COUNT(*) n FROM po_orders').get().n === ordersBefore, 'ハッシュ不一致では書込なし');
+
+  // 取込実行
+  r = await upNe('ne1.csv', NE1, { commit: true, hash: NE1_HASH, plan: NE1_PLAN });
+  ok(r.status === 200 && r.body.ok && r.body.commit === true && r.body.created.length === 2, '取込実行: 移行PO 2件作成', r.body.created);
+  const mig1 = db.prepare("SELECT * FROM po_orders WHERE ne_slip_number='6274'").get();
+  ok(mig1 && mig1.status === 'issued' && mig1.origin === 'migration' && mig1.send_blocked === 1 && /^PO-\d{4}-\d{4,}$/.test(mig1.po_number),
+    '移行PO: issued + origin=migration + send_blocked + PO番号採番', mig1 && { origin: mig1.origin, po: mig1.po_number });
+  ok(mig1.note.includes('伝票6274') && mig1.note.includes('2025-12-18'), '移行PO: noteにNE伝票番号+NE発行日', mig1.note);
+  // 残数 = NE注残計 (発注500 → migration入荷300 → 残200)
+  const migItem = db.prepare(`SELECT i.*, b.remaining_qty, b.received_qty FROM po_order_items i
+    JOIN v_po_item_balance b ON b.order_item_id=i.id WHERE i.order_id=? AND i.product_key='noflyersticker'`).get(mig1.id);
+  ok(migItem.qty === 500 && migItem.received_qty === 300 && migItem.remaining_qty === 200, '明細: qty=NE発注数500 / 取込前入庫300 / 残200',
+    { q: migItem.qty, rcv: migItem.received_qty, rem: migItem.remaining_qty });
+  const migEv = db.prepare('SELECT * FROM po_item_events WHERE order_item_id=?').get(migItem.id);
+  ok(migEv && migEv.source === 'migration' && migEv.actor_type === 'migration' && migEv.qty === 300, 'イベント: source/actor_type=migration ×300', migEv && migEv.source);
+  // 予定納期 → 明細の希望納期 + PML原価スナップショット
+  const deadItem = db.prepare("SELECT * FROM po_order_items WHERE order_id=? AND product_key='deaditem'").get(mig1.id);
+  ok(deadItem.requested_date === '2026-08-01' && deadItem.unit_cost === 200, '明細: 予定納期→希望納期 + PML原価200', { d: deadItem.requested_date, c: deadItem.unit_cost });
+  // PML外商品は単価未設定で取り込まれる
+  const mig2 = db.prepare("SELECT * FROM po_orders WHERE ne_slip_number='7645'").get();
+  const npItem = db.prepare(`SELECT i.*, b.remaining_qty FROM po_order_items i
+    JOIN v_po_item_balance b ON b.order_item_id=i.id WHERE i.order_id=? AND i.product_key='not-in-pml-item'`).get(mig2.id);
+  ok(npItem && npItem.unit_cost === null && npItem.remaining_qty === 3, 'PML外商品: 単価NULL + 残3', npItem && { c: npItem.unit_cost, rem: npItem.remaining_qty });
+
+  // 取込済み化でplanが変わるため、取込前の古いプレビューでの確定は拒否される
+  r = await upNe('ne1.csv', NE1, { commit: true, hash: NE1_HASH, plan: NE1_PLAN });
+  ok(r.status === 400 && r.body.error.includes('変わっています'), '取込済み化後、古いプレビューでの再確定は拒否');
+  // 冪等: 同じCSVを再度プレビュー→取込しても全スキップ (二重登録なし)
+  r = await upNe('ne1.csv', NE1);
+  ok(r.body.ok && r.body.orders === 0 && r.body.skipped.length === 2, '再プレビュー: 全伝票取込済み', r.body.skipped);
+  r = await upNe('ne1.csv', NE1, { commit: true, hash: r.body.fileHash, plan: r.body.planHash });
+  ok(r.body.ok && r.body.orders === 0 && r.body.created.length === 0 && r.body.skipped.length === 2 && r.body.skipped.every(s => /^PO-/.test(s.poNumber)), '再取込: 全伝票スキップ (冪等)', r.body.skipped);
+
+  // planHashがDB由来フィールドを束縛していることの回帰テスト (プレビュー後のPML原価変更で拒否、Codex R3 Low)
+  {
+    const NE3 = [NEHDR, neRow('9200', 'deaditem', '休眠', 10, 10, '2026/7/1', '0001')];
+    r = await upNe('ne3.csv', NE3);
+    const h3 = r.body.fileHash, p3 = r.body.planHash;
+    db.prepare("UPDATE mirror_pml_snapshot_rows SET 原価=999 WHERE 商品コード='deaditem'").run();
+    r = await upNe('ne3.csv', NE3, { commit: true, hash: h3, plan: p3 });
+    ok(r.status === 400 && r.body.error.includes('変わっています'), 'プレビュー後のPML原価変更は確定拒否 (planHash束縛)', r.body.error);
+    db.prepare("UPDATE mirror_pml_snapshot_rows SET 原価=200 WHERE 商品コード='deaditem'").run();
+    r = await upNe('ne3.csv', NE3);
+    r = await upNe('ne3.csv', NE3, { commit: true, hash: r.body.fileHash, plan: r.body.planHash });
+    ok(r.body.ok && r.body.created.length === 1, '原価復元後の再プレビュー→確定は成功');
+  }
+
+  // 移行POは発注提案の「発注済み」バッジ・月次上限集計を汚染しない (数量はNE注残としてPML反映済みのため)
+  r = await j('/api/supplier/1');
+  const afterDead = (r.body.horikoshi.find(p => p.code === 'deaditem') || {}).recentIssued || null;
+  ok(JSON.stringify(afterDead) === JSON.stringify(beforeDead), '移行POは「発注済み」バッジに出ない', afterDead);
+  ok(r.body.issuedTotal === beforeIssuedTotal, '移行POは月次上限集計に入らない', { before: beforeIssuedTotal, after: r.body.issuedTotal });
+
+  // 移行POへ発注書メールは送れない (send_blocked)
+  r = await j('/api/orders/' + mig1.id + '/email/preview');
+  ok(r.status === 400 && r.body.error.includes('送信対象外'), '移行POのメールプレビューは拒否', r.body.error);
+
+  // 発注残一覧に載る + 台帳整合性クリーン
+  r = await j('/api/backorders');
+  const boMig = r.body.orders.find(o => o.id === mig1.id);
+  ok(boMig && boMig.origin === 'migration' && boMig.sendBlocked === true && boMig.remainingQty === 300, '発注残一覧: 移行PO (残200+100)', boMig && boMig.remainingQty);
+  r = await j('/api/ledger/integrity');
+  ok(r.body.ok && r.body.issues.length === integrityBefore, '取込で整合性違反が増えない', r.body.issues);
+
+  // ロジザード入庫CSVの消込が移行POに効く (突合候補→割当)
+  {
+    const HDR2 = ['伝票NO', '型番', '品名', '取引先ID', '仕入単価', '良品数', '不良品数', '入庫日'];
+    const fd2 = new FormData();
+    fd2.append('file', new Blob([neCsvOf([HDR2, ['AR-MIG', 'deaditem', '休眠', '0001', '200', '40', '0', '2026/07/12']])]), 'lz-mig.csv');
+    r = await j('/api/inbound/import', { method: 'POST', body: fd2 });
+    ok(r.body.ok && r.body.newItems === 1, '入庫CSV取込 (移行PO消込用)', r.body);
+    r = await j('/api/inbound');
+    const inbM = r.body.open.find(x => x.slip === 'AR-MIG');
+    r = await j('/api/inbound/' + inbM.id + '/candidates');
+    const candM = r.body.candidates.find(c => c.orderItemId === deadItem.id);
+    ok(candM && candM.remaining === 100 && candM.suggestedQty === 40, '突合候補に移行POが出る', r.body.candidates && r.body.candidates.length);
+    r = await j('/api/items/' + deadItem.id + '/events', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'receipt', qty: 40, inboundItemId: inbM.id,
+        remainder: { action: 'await_delivery', nextExpectedDate: '2026-08-15', nextExpectedQty: 60 } }) });
+    ok(r.body.ok && r.body.remaining === 60, '割当: 移行PO残100→60', r.body);
+  }
+
+  // バリデーション
+  r = await upNe('bad1.csv', [NEHDR, neRow('9001', 'x-item', 'x', 10, 20, '2026/7/1', '0001')]);
+  ok(r.status === 400 && r.body.error.includes('注残計'), '注残計>発注数は拒否', r.body.error);
+  r = await upNe('bad2.csv', [['見出し', '違い'], ['a', 'b']]);
+  ok(r.status === 400 && r.body.error.includes('見出し'), '見出し不一致は拒否');
+  r = await upNe('bad3.csv', [NEHDR, neRow('9002', 'y-item', 'y', 5, 5, '2026/7/1', '0999')]);
+  ok(r.status === 400 && r.body.error.includes('マスタ未登録'), '未登録仕入先は拒否', r.body.error);
+  r = await upNe('bad4.csv', [NEHDR, neRow('9003', 'z-item', 'z', 5, 5, '2026/13/45', '0001')]);
+  ok(r.status === 400 && r.body.error.includes('発行日'), '不正な発行日は拒否');
+  // 同一伝票に別仕入先・別発行日が混在
+  r = await upNe('bad5.csv', [NEHDR, neRow('9004', 'a-item', 'a', 5, 5, '2026/7/1', '0001'), neRow('9004', 'b-item', 'b', 5, 5, '2026/7/1', '0002')]);
+  ok(r.status === 400 && r.body.error.includes('仕入先cdが混在'), '同一伝票の仕入先混在は拒否');
+  r = await upNe('bad6.csv', [NEHDR, neRow('9010', 'a-item', 'a', 5, 5, '2026/7/1', '0001'), neRow('9010', 'b-item', 'b', 5, 5, '2026/7/2', '0001')]);
+  ok(r.status === 400 && r.body.error.includes('発行日が混在'), '同一伝票の発行日混在は拒否 (伝票ヘッダ属性)');
+  // 注残0の行はスキップ (発注残エクスポートに通常含まれないが防御)。スキップ行も重複検証の対象
+  r = await upNe('warn1.csv', [NEHDR, neRow('9005', 'noflyersticker', 'x', 10, 0, '2026/7/1', '0001'), neRow('9006', 'deaditem', 'y', 5, 5, '2026/7/1', '0001')]);
+  ok(r.body.ok && r.body.orders === 1 && r.body.warnings.some(w => w.includes('注残0')), '注残0行はスキップ+警告', r.body.warnings);
+  r = await upNe('bad7.csv', [NEHDR, neRow('9011', 'c-item', 'c', 5, 0, '2026/7/1', '0001'), neRow('9011', 'c-item', 'c', 5, 5, '2026/7/1', '0001')]);
+  ok(r.status === 400 && r.body.error.includes('重複'), '注残0でスキップされる行も重複検証の対象');
+
+  // 移行PO属性の列間規則トリガ (直接SQLでも守られる)
+  {
+    let thr = null;
+    try { db.prepare("INSERT INTO po_orders (supplier_code, supplier_name, status, created_at, updated_at, origin, send_blocked) VALUES ('1','x','draft',?,?,'migration',1)").run(nowIsoStr(), nowIsoStr()); } catch (e) { thr = e.message; }
+    ok(thr && thr.includes('migration rules'), 'トリガ: ne_slip_numberなしの移行POは拒否', thr);
+    thr = null;
+    try { db.prepare("INSERT INTO po_orders (supplier_code, supplier_name, status, created_at, updated_at, ne_slip_number) VALUES ('1','x','draft',?,?,'99999')").run(nowIsoStr(), nowIsoStr()); } catch (e) { thr = e.message; }
+    ok(thr && thr.includes('migration rules'), 'トリガ: originなしのne_slip_numberは拒否', thr);
+    thr = null;
+    try { db.prepare("INSERT INTO po_orders (supplier_code, supplier_name, status, created_at, updated_at, origin, send_blocked, ne_slip_number) VALUES ('1','x','draft',?,?,'other',1,'99998')").run(nowIsoStr(), nowIsoStr()); } catch (e) { thr = e.message; }
+    ok(thr && thr.includes('migration rules'), 'トリガ: origin不正値は拒否', thr);
+  }
+
+  // 作業中draftがある仕入先の取込は拒否 (取込用一時draftとUNIQUE衝突するため)
+  r = await j('/api/supplier/1/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 1 }] }) });
+  ok(r.body.ok, 'draft作成 (競合テスト用)');
+  r = await upNe('ne2.csv', [NEHDR, neRow('9100', 'noflyersticker', 'x', 5, 5, '2026/7/1', '0001')]);
+  ok(r.status === 400 && r.body.error.includes('draft'), 'draftのある仕入先の取込は拒否 (プレビューでも検知)', r.body.error);
+  db.prepare("DELETE FROM po_orders WHERE status='draft' AND supplier_code='1'").run();
+
+  // 発注残ページに取込UIが配信される
+  const boHtml = await (await fetch(base + '/backorders')).text();
+  ok(boHtml.includes('NE発注残の初期取込') && boHtml.includes('neImpPrev') && boHtml.includes('NE移行分'), '/backorders 取込UI配信');
+}
+
+// ═══ FBAジョブ完了検知 (発注サイクルリセットの冪等性) ═══
+console.log('── FBAジョブ完了検知 (A→B→A) ──');
+{
+  const { markCycleFbaJobDone } = await imp('apps/purchase-orders/ledger.js');
+  ok(markCycleFbaJobDone('job-A', 'smoke') === true, 'ジョブA完了: 初回はサイクルリセット');
+  ok(markCycleFbaJobDone('job-B', 'smoke') === true, 'ジョブB完了: 別ジョブもリセット');
+  const afterB = db.prepare("SELECT value FROM po_settings WHERE key='po_cycle_reset_at'").get().value;
+  ok(markCycleFbaJobDone('job-A', 'smoke') === false, 'ジョブA再ポーリング: 検知済みはリセットしない (A→B→A)');
+  const afterA2 = db.prepare("SELECT value FROM po_settings WHERE key='po_cycle_reset_at'").get().value;
+  ok(afterB === afterA2, '再検知で po_cycle_reset_at は動かない');
+}
+
+// ═══ ダッシュボード×非表示のサーバ保存 + 営業日自動リセット廃止 (中原さん要望 2026-07-13) ═══
+console.log('── ダッシュボード非表示 (サーバ保存/サイクル失効) + サイクルの営業日非依存 ──');
+{
+  const { setSetting: setL } = await imp('apps/purchase-orders/ledger.js');
+  const jp = body => j('/api/dashboard/hidden', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+
+  // 非表示にする → サーバに保存され、ダッシュボードHTMLに埋め込まれる (PC間共有の実体)
+  r = await jp({ code: '0001', hidden: true });
+  ok(r.body.ok && r.body.codes.includes('1'), 'hidden: 非表示保存 (0001→1正規化)', r.body);
+  let dashHtml = await (await fetch(base + '/')).text();
+  ok(dashHtml.includes('["1"].forEach'), 'hidden: ダッシュボードに非表示リスト埋め込み');
+  ok(!dashHtml.includes('po_dash_dis'), 'hidden: 旧localStorage方式は廃止');
+  ok(dashHtml.includes('発注サイクル:'), 'hidden: サイクル開始表示あり');
+
+  // バリデーション
+  r = await jp({ code: '9999', hidden: true });
+  ok(r.status === 400 && r.body.error.includes('未登録'), 'hidden: 未登録仕入先は400');
+  r = await jp({ code: '1' });
+  ok(r.status === 400, 'hidden: hidden/clear指定なしは400');
+  r = await jp({});
+  ok(r.status === 400, 'hidden: コードなしは400');
+
+  // 戻す
+  r = await jp({ code: '1', hidden: false });
+  ok(r.body.ok && r.body.codes.length === 0, 'hidden: ↩戻す');
+
+  // サイクル失効: 非表示 → データ更新 (サイクルbump) → 自動で無効化 (明示クリア不要の導出方式)
+  r = await jp({ code: '1', hidden: true });
+  ok(r.body.ok && r.body.codes.includes('1'), 'hidden: 再度非表示');
+  setL('po_cycle_reset_at', nowIsoStr(), { actor: 'smoke', reason: 'テスト: データ更新相当' });
+  dashHtml = await (await fetch(base + '/')).text();
+  ok(dashHtml.includes('[].forEach'), 'hidden: サイクルが進むと自動失効 (データ更新でリセット)');
+  r = await jp({ code: '1', hidden: true });
+  r = await jp({ clear: true });
+  ok(r.body.ok && r.body.codes.length === 0, 'hidden: clear (全て戻す)');
+
+  // 営業日 (as_of) では発注確定サイクルはもうリセットされない: as_ofを未来日にしてもcycle-issuedが変わらない
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 2 }] }) });
+  ok(r.body.ok !== false && r.body.id, 'サイクル: テスト用発注確定', r.body);
+  r = await j('/api/cycle-issued');
+  ok(r.body.ok && r.body.suppliers.some(s => s.code === '1'), 'サイクル: 確定直後は載る', r.body.suppliers);
+  const asOfBefore = db.prepare('SELECT as_of_date FROM mirror_pml_published WHERE id=1').get().as_of_date;
+  const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
+  db.prepare('UPDATE mirror_pml_published SET as_of_date=? WHERE id=1').run(tomorrow);
+  r = await j('/api/cycle-issued');
+  ok(r.body.ok && r.body.suppliers.some(s => s.code === '1'),
+    'サイクル: 営業日が変わっても (朝の自動同期でも) ✅発注確定済みは消えない — リセットはデータ更新ボタンのみ', r.body.suppliers);
+  db.prepare('UPDATE mirror_pml_published SET as_of_date=? WHERE id=1').run(asOfBefore);
+
+  // 発注残ページ: 仕入先名はワークスペースへのリンクではなくなった (明細が消えたと誤解しない導線)
+  const boHtml2 = await (await fetch(base + '/backorders')).text();
+  ok(boHtml2.includes('新しい発注作業') && boHtml2.includes('クリックでこの発注の明細'), '/backorders: 明細展開が主導線+ワークスペースは明示リンク');
+}
 
 server.close();
 console.log(`\n=== RESULT: pass=${pass} fail=${fail} ===`);
