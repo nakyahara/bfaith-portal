@@ -2102,18 +2102,28 @@ console.log('── 出荷明細メール自動取得 (fetch-mails) ──');
     { id: 'gm-bf-1', from: 'wholesale@be-free.biz', subject: '7/13　出荷明細です。', internalDate: '2026-07-13T06:25:00.000Z',
       bodyHtml: '<table><tr><th>商品ID</th><th>商品名</th><th>出荷数</th></tr>' +
         '<tr><td>GOFUN-01-N</td><td>胡粉ネイル スーパーコート N0033</td><td>48</td></tr>' +
-        '<tr><td>GOFUN-01-N</td><td>胡粉ネイル スーパーコート N0033</td><td>30</td></tr></table>' },
+        '<tr><td>GOFUN-01-N</td><td>胡粉ネイル スーパーコート N0033</td><td>30</td></tr></table>' +
+        // 署名などの見出しの無い表は明細として解釈しない (数字セルがあっても無視されること)
+        '<table><tr><td>株式会社ビー・フリー</td></tr><tr><td>TEL</td><td>06</td></tr></table>' },
     { id: 'gm-other', from: 'noreply@example.com', subject: '出荷明細', bodyHtml: '<table><tr><td>X</td><td>1</td></tr></table>' },
     { id: 'gm-amc-noatt', from: 'ashida@am-craft.jp', subject: '出荷明細 (添付忘れ)', bodyHtml: '<p>添付なし</p>' },
+    // 表示名にドメインを入れた偽装 → 実メールボックスのドメイン不一致で対象外
+    { id: 'gm-spoof', from: '"billing@am-craft.jp" <attacker@example.com>', subject: '出荷明細', attachments: [{ filename: 'x.xlsx', dataBase64: xlsxB64 }] },
+    // SPF/DKIM/DMARC不合格 → 自動変換しない (error)
+    { id: 'gm-authfail', from: 'ashida@am-craft.jp', subject: '出荷明細', authResults: 'mx.google.com; spf=fail; dkim=fail; dmarc=fail',
+      attachments: [{ filename: 'y.xlsx', dataBase64: xlsxB64 }] },
   ]);
   r = await jp3('/api/inbound-plan/fetch-mails');
-  ok(r.body.ok && r.body.added === 3 && r.body.errors.length === 1, 'fetch: 対象2+解析エラー1を登録 (対象外ドメインは無視)', r.body);
-  ok(r.body.open.length === 3, 'fetch: 未処理一覧に3件 (new2+error1)', r.body.open.length);
+  ok(r.body.ok && r.body.added === 4 && r.body.errors.length === 2, 'fetch: 対象2+エラー2を登録 (対象外/偽装Fromは無視)', r.body);
+  ok(r.body.open.length === 4, 'fetch: 未処理一覧に4件 (new2+error2)', r.body.open.length);
+  ok(!r.body.open.some(m => m.gmail_id === 'gm-spoof'), 'fetch: 表示名偽装 (実アドレス別ドメイン) は取り込まない (Codex mail-R1 High)');
+  const authFail = r.body.open.find(m => m.gmail_id === 'gm-authfail');
+  ok(authFail && authFail.status === 'error' && authFail.error.includes('なりすまし'), 'fetch: SPF/DKIM/DMARC不合格は自動変換しない', authFail && authFail.error);
   const amcMail = r.body.open.find(m => m.gmail_id === 'gm-amc-1');
   const bfMail = r.body.open.find(m => m.gmail_id === 'gm-bf-1');
   const errMail = r.body.open.find(m => m.gmail_id === 'gm-amc-noatt');
   ok(amcMail && amcMail.supplier_code === '1' && JSON.parse(amcMail.parsed_json).length === 2, 'fetch: AMC xlsx添付を解析 (2明細)', amcMail && amcMail.parse_note);
-  ok(bfMail && bfMail.supplier_code === '2' && JSON.parse(bfMail.parsed_json).length === 2, 'fetch: ビーフリー本文の表を解析 (同一商品2行)');
+  ok(bfMail && bfMail.supplier_code === '2' && JSON.parse(bfMail.parsed_json).length === 2, 'fetch: ビーフリー本文の表を解析 (同一商品2行+署名表は無視)');
   ok(errMail && errMail.status === 'error' && errMail.error.includes('xlsx添付'), 'fetch: 添付なしAMCメールはerror');
 
   // 再取得は冪等 (同じgmail_idは再登録しない)
@@ -2136,7 +2146,7 @@ console.log('── 出荷明細メール自動取得 (fetch-mails) ──');
   r = await jp3('/api/inbound-plan/mails/' + errMail.id + '/status', { status: 'ignored' });
   ok(r.body.ok, 'mail: 無視');
   r = await j('/api/inbound-plan/mails');
-  ok(r.body.ok && r.body.open.length === 1 && r.body.open[0].gmail_id === 'gm-bf-1' && r.body.recent.length === 2,
+  ok(r.body.ok && r.body.open.length === 2 && r.body.open.some(m => m.gmail_id === 'gm-bf-1') && r.body.recent.length === 2,
     'mail: 一覧はnew/errorのみ (処理済みはrecentへ)', r.body.open.length);
   delete process.env.PO_SHIPMENT_FAKE_DATA;
 

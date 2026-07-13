@@ -23,14 +23,35 @@ export const SHIPMENT_MAIL_RULES = [
 
 const b64urlToBuf = s => Buffer.from(String(s || '').replace(/-/g, '+').replace(/_/g, '/'), 'base64');
 
-function ruleFor(fromAddr, subject) {
-  const from = String(fromAddr || '').toLowerCase();
+/** Fromヘッダから実メールボックスを抽出 ("表示名 <a@b>" → a@b。表示名にドメインを書く偽装を通さない、Codex mail-R1 High) */
+export function mailboxOf(fromHeader) {
+  const s = String(fromHeader || '').trim();
+  const m = s.match(/<([^<>]+)>\s*$/);
+  const box = (m ? m[1] : s).trim().toLowerCase();
+  return /^[^\s@]+@[^\s@]+$/.test(box) ? box : null;
+}
+
+function ruleFor(fromHeader, subject) {
+  const box = mailboxOf(fromHeader);
+  if (!box) return null;
+  const domain = box.slice(box.indexOf('@') + 1);
   for (const r of SHIPMENT_MAIL_RULES) {
-    if (!from.includes('@' + r.domain) && !from.endsWith(r.domain + '>')) continue;
+    if (domain !== r.domain) continue; // ドメイン完全一致のみ (部分一致・表示名は不可)
     if (r.subjectFilter && !String(subject || '').includes(r.subjectFilter)) continue;
     return r;
   }
   return null;
+}
+
+/**
+ * Gmailが付与する Authentication-Results で送信元の真正性を確認する (From詐称対策、Codex mail-R1 High)。
+ * dmarc=pass、または spf=pass かつ dkim=pass を要求。ヘッダが無い/失敗なら false (自動変換させない)
+ */
+export function authPassed(authResultsHeader) {
+  const h = String(authResultsHeader || '').toLowerCase();
+  if (!h) return false;
+  if (/dmarc=pass/.test(h)) return true;
+  return /spf=pass/.test(h) && /dkim=pass/.test(h);
 }
 
 /** xlsx添付 (AMC出荷明細表) → [{vendorCode, vendorName, qty}]。見出し行 (商品コード+出荷数量) を探して以降を読む */
@@ -63,29 +84,52 @@ export async function parseShipmentXlsx(buf) {
   return items;
 }
 
-/** 本文HTML (ビーフリーの表) → [{vendorCode, vendorName, qty}]。<tr>/<td> を素朴に読む */
+/**
+ * 本文HTML (ビーフリーの表) → [{vendorCode, vendorName, qty}]。
+ * 「商品ID/商品コード」と「出荷数/出荷数量/数量」の見出しを持つ表だけを対象にし、見出しの列位置で読む
+ * (署名・レイアウト・問い合わせ番号などの無関係な表を明細として誤解釈しない、Codex mail-R1 Medium)
+ */
 export function parseShipmentHtml(html) {
   const stripTags = s => s.replace(/<[^>]*>/g, '').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
     .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").trim();
-  const items = [];
-  const trRe = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
-  let tr;
-  while ((tr = trRe.exec(String(html || ''))) !== null) {
-    const cells = [];
-    const tdRe = /<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi;
-    let td;
-    while ((td = tdRe.exec(tr[1])) !== null) cells.push(stripTags(td[1]));
-    if (cells.length < 2) continue;
-    const code = cells[0];
-    if (!code || /商品ID|商品コード/.test(code)) continue; // 見出し行
-    // 末尾側から最初に正の整数になるセル = 数量 (商品名内の数字を拾わない)
-    let qty = null, qtyIdx = -1;
-    for (let i = cells.length - 1; i >= 1; i--) {
-      const n = Number(cells[i].replace(/,/g, ''));
-      if (cells[i] !== '' && Number.isInteger(n) && n > 0) { qty = n; qtyIdx = i; break; }
+  const rowsOf = tableHtml => {
+    const rows = [];
+    const trRe = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+    let tr;
+    while ((tr = trRe.exec(tableHtml)) !== null) {
+      const cells = [];
+      const tdRe = /<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi;
+      let td;
+      while ((td = tdRe.exec(tr[1])) !== null) cells.push(stripTags(td[1]));
+      rows.push(cells);
     }
-    if (qty == null) continue;
-    items.push({ vendorCode: code, vendorName: cells.slice(1, qtyIdx).filter(Boolean).join(' ') || null, qty });
+    return rows;
+  };
+  const items = [];
+  const tableRe = /<table[^>]*>([\s\S]*?)<\/table>/gi;
+  let tb;
+  while ((tb = tableRe.exec(String(html || ''))) !== null) {
+    const rows = rowsOf(tb[1]);
+    // 見出し行を探す (商品ID/商品コード + 出荷数系 が同じ行にある表だけが明細)
+    let head = -1, colCode = -1, colName = -1, colQty = -1;
+    for (let i = 0; i < rows.length; i++) {
+      const cells = rows[i];
+      const ci = cells.findIndex(c => c === '商品ID' || c === '商品コード');
+      const qi = cells.findIndex(c => c === '出荷数' || c === '出荷数量' || c === '数量');
+      if (ci >= 0 && qi >= 0) {
+        head = i; colCode = ci; colQty = qi;
+        colName = cells.findIndex(c => c === '商品名');
+        break;
+      }
+    }
+    if (head < 0) continue; // 見出しの無い表 (署名等) は無視
+    for (let i = head + 1; i < rows.length; i++) {
+      const cells = rows[i];
+      const code = (cells[colCode] || '').trim();
+      const qty = Number(String(cells[colQty] || '').replace(/,/g, ''));
+      if (!code || !Number.isInteger(qty) || qty <= 0) continue;
+      items.push({ vendorCode: code, vendorName: (colName >= 0 && cells[colName]) ? cells[colName].trim() : null, qty });
+    }
   }
   return items;
 }
@@ -126,10 +170,15 @@ export async function fetchShipmentMails(actor, { newerThanDays = 30 } = {}) {
   const result = { checked: 0, added: 0, errors: [] };
 
   const useFake = !!process.env.PO_SHIPMENT_FAKE_DATA;
-  let candidates; // [{id, from, subject, internalDateIso, getHtml(), getXlsxBuffers()}]
+  // 一時的な通信障害 (添付ダウンロード等) は行を確定保存せず次回の取得でやり直す。
+  // 恒久的な内容エラー (添付なし/形式不正) だけ status='error' で保存する (Codex mail-R1 Medium)
+  const transientErr = e => { e.transient = true; return e; };
+  let candidates; // [{id, from, subject, authResults, internalDateIso, getHtml(), getXlsx()}]
   if (useFake) {
     candidates = fakeMails().map(m => ({
-      id: m.id, from: m.from, subject: m.subject, internalDateIso: m.internalDate || nowIso(),
+      id: m.id, from: m.from, subject: m.subject,
+      authResults: m.authResults !== undefined ? m.authResults : 'mx.google.com; spf=pass; dkim=pass; dmarc=pass',
+      internalDateIso: m.internalDate || nowIso(),
       getHtml: async () => m.bodyHtml || '',
       getXlsx: async () => (m.attachments || []).filter(a => /\.xlsx$/i.test(a.filename))
         .map(a => ({ filename: a.filename, buf: Buffer.from(a.dataBase64, 'base64') })),
@@ -137,8 +186,15 @@ export async function fetchShipmentMails(actor, { newerThanDays = 30 } = {}) {
   } else {
     const domains = SHIPMENT_MAIL_RULES.map(r => `from:${r.domain}`).join(' OR ');
     const q = `(${domains}) newer_than:${newerThanDays}d`;
-    const list = await gmailApiGet('messages?maxResults=50&q=' + encodeURIComponent(q));
-    const metas = list.messages || [];
+    // nextPageToken を最後まで辿る (1ページ50件で頭打ちにならないように、Codex mail-R1 Medium)。10ページ=500通で打ち切り
+    const metas = [];
+    let pageToken = null;
+    for (let page = 0; page < 10; page++) {
+      const list = await gmailApiGet('messages?maxResults=50&q=' + encodeURIComponent(q) + (pageToken ? '&pageToken=' + encodeURIComponent(pageToken) : ''));
+      metas.push(...(list.messages || []));
+      pageToken = list.nextPageToken || null;
+      if (!pageToken) break;
+    }
     candidates = [];
     for (const meta of metas) {
       if (exists.get(meta.id)) continue; // 取得済みは本文をダウンロードしない
@@ -147,12 +203,15 @@ export async function fetchShipmentMails(actor, { newerThanDays = 30 } = {}) {
       candidates.push({
         id: msg.id,
         from: headerOf(msg.payload, 'From'), subject: headerOf(msg.payload, 'Subject'),
+        authResults: headerOf(msg.payload, 'Authentication-Results'),
         internalDateIso: msg.internalDate ? new Date(Number(msg.internalDate)).toISOString() : nowIso(),
         getHtml: async () => collected.html,
         getXlsx: async () => {
           const out = [];
           for (const a of collected.attachments) {
-            const att = await gmailApiGet(`messages/${encodeURIComponent(msg.id)}/attachments/${encodeURIComponent(a.attachmentId)}`, 60000);
+            let att;
+            try { att = await gmailApiGet(`messages/${encodeURIComponent(msg.id)}/attachments/${encodeURIComponent(a.attachmentId)}`, 60000); }
+            catch (e) { throw transientErr(e); } // 添付DL失敗=一時障害扱い (次回取得でやり直し)
             out.push({ filename: a.filename, buf: b64urlToBuf(att.data) });
           }
           return out;
@@ -168,6 +227,8 @@ export async function fetchShipmentMails(actor, { newerThanDays = 30 } = {}) {
     if (!rule) continue; // 対象外の差出人/件名 (請求書等) は登録しない
     let items = [], note = null, status = 'new', error = null;
     try {
+      // 送信元の真正性 (SPF/DKIM/DMARC)。検証できないメールは自動変換対象にしない (From詐称対策、Codex mail-R1 High)
+      if (!authPassed(c.authResults)) throw new Error('送信元の認証 (SPF/DKIM/DMARC) を確認できません — なりすましの可能性があるため自動変換しません。本物なら手動貼り付けを使ってください');
       if (rule.kind === 'xlsx') {
         const files = await c.getXlsx();
         if (!files.length) throw new Error('xlsx添付がありません');
@@ -175,10 +236,11 @@ export async function fetchShipmentMails(actor, { newerThanDays = 30 } = {}) {
         note = files[0].filename + (files.length > 1 ? ` (他${files.length - 1}添付は未解析)` : '');
       } else {
         items = parseShipmentHtml(await c.getHtml());
-        if (!items.length) throw new Error('本文から明細の表を読み取れません');
+        if (!items.length) throw new Error('本文から明細の表 (商品ID/出荷数の見出し) を読み取れません');
       }
       if (!items.length) throw new Error('明細が0行です');
     } catch (e) {
+      if (e.transient) { result.errors.push({ gmailId: c.id, error: String(e.message || e), transient: true }); continue; }
       status = 'error';
       error = String(e.message || e);
     }
