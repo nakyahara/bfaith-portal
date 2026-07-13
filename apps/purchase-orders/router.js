@@ -3921,9 +3921,11 @@ function emailPanel(orderId, errBanner) {
         .then(function(r2) {
           if (btn) btn.disabled = false;
           if (!r2.ok) {
-            // 送信できなかったことを見逃させない (トーストだけでは気づけなかった、中原さん報告 2026-07-13)
-            alert('❌ メールは送信されていません\\n\\n理由: ' + (r2.error || '不明なエラー'));
-            emailPanel(orderId, r2.error || '不明なエラー');
+            // 送信できなかったことを見逃させない (トーストだけでは気づけなかった、中原さん報告 2026-07-13)。
+            // ただし !ok は「今回の要求が受け付けられなかった」だけで、既存ジョブが送信済み/送信中の場合もある
+            // (dedup拒否等) ため「未送信」とは断定しない (Codex vendor-R4 High)
+            alert('⚠️ 送信は受け付けられませんでした\\n\\n理由: ' + (r2.error || '不明なエラー') + '\\n\\n最新の送信状態は📧パネルの履歴で確認してください');
+            emailPanel(orderId, { head: '⚠️ 送信は受け付けられませんでした', detail: (r2.error || '不明なエラー') + ' — 最新の状態は下の履歴を確認してください' });
             return;
           }
           if (r2.status === 'failed') {
@@ -4159,9 +4161,15 @@ document.addEventListener('click', function(ev) {
         return;
       }
       if (j.ok && j.status === 'sent') { toast('送信しました'); emailPanel(emOrder); return; }
-      if (j.ok) {
-        // failed = サーバが確定拒否 (4xx) と判定した場合のみ = 未送信確定
+      if (j.ok && j.status === 'failed') {
+        // failed = サーバが確定拒否 (4xx) と判定した場合のみ = 未送信確定 (stale等はこの分岐に入れない、Codex vendor-R4 High)
         alert('❌ メールは送信されていません\\n\\n理由: ' + (j.error || '送信失敗'));
+        emailPanel(emOrder);
+        return;
+      }
+      if (j.ok) {
+        // stale (世代競合=別画面が処理中/処理済み) 等の未認識状態。送信済みの可能性があるため断定しない
+        alert('⚠️ 送信結果を確認してください\\n\\n別の画面での操作と競合した可能性があります。最新の送信状態は履歴と「照合」で確認してください');
         emailPanel(emOrder);
         return;
       }
