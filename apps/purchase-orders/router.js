@@ -2857,6 +2857,12 @@ box.addEventListener('input', function() {
 // ── FBA在庫 オンデマンド更新 (miniPCジョブ、数分かかる) ──
 var opStatus = document.getElementById('opStatus');
 function setStatus(msg) { opStatus.textContent = msg; }
+// APIエラーの表示用 (session_expired はポータル認証切れ — 生のスラッグを出さず対処を案内)
+function impErr(e) {
+  return e === 'session_expired'
+    ? 'ログインセッションが切れました。ページを再読み込みしてログインし直してから、もう一度お試しください (取込はまだ実行されていません)'
+    : e;
+}
 // データ更新前の二段確認: (1)「✅発注確定済み」表示のリセット確認 → (2) 発注メール未送信の仕入先があれば追加確認
 function confirmCycleReset(next) {
   fetch('/apps/purchase-orders/api/cycle-issued')
@@ -2928,7 +2934,7 @@ document.getElementById('neForm').addEventListener('submit', function(ev) {
     fetch('/apps/purchase-orders/api/ne-overlay/csv', { method: 'POST', body: fd })
       .then(function(r){ return r.json(); })
       .then(function(j) {
-        if (!j.ok) { setStatus(''); alert('取込エラー: ' + j.error); return; }
+        if (!j.ok) { setStatus(''); alert('取込エラー: ' + impErr(j.error)); return; }
         setStatus('取込完了 (' + j.rowCount + '件)。再読み込みします...');
         location.reload();
       })
@@ -2945,7 +2951,7 @@ document.getElementById('lzForm').addEventListener('submit', function(ev) {
   fetch('/apps/purchase-orders/api/logizard-stock/csv', { method: 'POST', body: new FormData(form) })
     .then(function(r){ return r.json(); })
     .then(function(j) {
-      if (!j.ok) { setStatus(''); alert('取込エラー: ' + j.error + (j.errors ? '\\n' + j.errors.join('\\n') : '')); return; }
+      if (!j.ok) { setStatus(''); alert('取込エラー: ' + impErr(j.error) + (j.errors ? '\\n' + j.errors.join('\\n') : '')); return; }
       setStatus('');
       if (!confirm('ロジザード在庫CSVを取り込みます:\\n' +
         '・在庫を更新: ' + j.matched + '商品\\n' +
@@ -2961,7 +2967,7 @@ document.getElementById('lzForm').addEventListener('submit', function(ev) {
         fetch('/apps/purchase-orders/api/logizard-stock/csv', { method: 'POST', body: fd2 })
           .then(function(r){ return r.json(); })
           .then(function(j2) {
-            if (!j2.ok) { setStatus(''); alert('取込エラー: ' + j2.error); return; }
+            if (!j2.ok) { setStatus(''); alert('取込エラー: ' + impErr(j2.error)); return; }
             setStatus('取込完了 (在庫更新 ' + j2.matched + '商品 / 在庫0扱い ' + j2.zeroFill + '商品)。再読み込みします...');
             location.reload();
           })
