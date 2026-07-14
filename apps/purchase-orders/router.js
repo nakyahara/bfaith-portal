@@ -809,7 +809,10 @@ router.post('/api/inbound/import', upload.single('file'), (req, res) => {
     // preview=1: 書込なしでサマリ+同一ファイル再取込警告を返す (UIはプレビュー→確認→commit の二段。
     // フラグなしは従来どおり即取込=後方互換)。commit時は fileHash 照合でプレビューと同一ファイルを保証
     if (req.body && req.body.preview === '1') {
-      return res.json({ ok: true, preview: true, ...previewInboundCsv({ buffer: buf }) });
+      const pv = previewInboundCsv({ buffer: buf });
+      // 前回取込の表示はJSTで返す (UTC素通しは「アメリカ時間?」と誤解される、中原さん報告 2026-07-14)
+      if (pv.duplicateFile) pv.duplicateFile.importedAtJst = fmtJst(pv.duplicateFile.importedAt);
+      return res.json({ ok: true, preview: true, ...pv });
     }
     const result = importInboundCsv({ buffer: buf, filename: req.file.originalname, actor: actorOf(req),
       expectedHash: (req.body && trimS(req.body.fileHash)) || null });
@@ -4112,7 +4115,7 @@ document.getElementById('inbForm').addEventListener('submit', function(ev) {
     if (j.duplicateFile) {
       h += '<div style="background:#fef2f2;border:2px solid #dc2626;color:#991b1b;border-radius:10px;padding:10px 14px;margin:8px 0;font-weight:600">' +
         '⚠️ このファイルは取込済みです<div style="font-weight:400;font-size:12px;margin-top:4px">前回: ' +
-        esc(String(j.duplicateFile.importedAt || '').slice(0, 16).replace('T', ' ')) + ' UTC / ' + esc(j.duplicateFile.fileName || '') +
+        esc(j.duplicateFile.importedAtJst || '') + ' / ' + esc(j.duplicateFile.fileName || '') +
         ' — 取り込んでも変更はありません (同一内容)。別の日のCSVを選び間違えていないか確認してください</div></div>';
     }
     h += '<div style="margin:8px 0"><b>伝票 ' + j.slipCount + '件 / 明細 ' + j.lineCount + '行 / 良品数合計 ' + j.totalGood.toLocaleString('ja-JP') + '個</b>' +
