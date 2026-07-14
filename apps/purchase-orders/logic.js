@@ -8,8 +8,11 @@
  *   発注対象        = 取扱区分='取扱中' かつ 0 < L <= M
  *   推奨発注量      = lots = (P-L)*V/N を N(発注ロット単位)で丸め
  *                     lots > 1 → ROUND(lots)*N / lots <= 1 → ROUNDUP(lots)*N (最低1ロット)
- *   掘り起こし対象  = L = 0 (在庫+注残ゼロ、または30日販売ゼロ)
+ *   掘り起こし対象  = 取扱中 かつ 在庫0 かつ 注残0 (中原さん定義 2026-07-14:
+ *     他社の値下げで価格が合わず仕入を控えた商品を、一定期間後に再販できるか調べるためのステータス)
  *     ※旧シートは取扱中止も掘り起こしに含めていたが、本アプリは「取扱中」のみに絞る (ノイズ除去)
+ *     ※在庫があって販売0の商品は掘り起こしではない → ついで買い候補の末尾に回す
+ *   セット商品 (商品区分='セット') は対象外 = 一覧にも出さない (在庫・発注は構成品側で管理)
  *
  * データソース: mirror_pml_snapshot_rows (published run) + po_* マスタ。
  */
@@ -17,7 +20,7 @@ import { getDB, normSupplierCode, normProductCode } from './db.js';
 import { getSetting } from './ledger.js';
 
 const PML_COLS = [
-  '商品コード', '商品名', '仕入先', '取扱区分', '売上分類',
+  '商品コード', '商品名', '仕入先', '取扱区分', '商品区分', '売上分類',
   '総在庫数_引当なし', 'FBA在庫数', '注残数', '販売数7日_合計', '販売数30日_合計',
   '発注ロット単位', '推奨保有月数', '売価', '原価', '最終仕入日', '登録日',
 ];
@@ -71,7 +74,8 @@ export function computeProduct(r, backOrderOverride) {
     stockMonths,
     isTarget,
     recQty,
-    isHorikoshi: active && stockMonths === 0,
+    // 掘り起こし = 取扱中かつ在庫0・注残0 (仕入を控えた商品の再販調査。販売0でも在庫があれば対象外)
+    isHorikoshi: active && S === 0 && B === 0,
   };
 }
 
@@ -217,6 +221,8 @@ export function computeAll() {
   const products = [];
   const bySupplier = new Map();
   for (const r of rows) {
+    // セット商品は発注・在庫管理の対象外 (在庫は構成品側)。全商品情報にも出さない (中原さん 2026-07-14)
+    if (String(r['商品区分'] || '').trim() === 'セット') continue;
     const p = computeProduct(r, useLedgerZan ? (ledgerZan.get(normProductCode(r['商品コード'])) || 0) : undefined);
     const a = masters.attrs.get(p.key);
     p.conditionId = a ? (a.condition_id || '') : '';
@@ -251,11 +257,14 @@ export function computeAll() {
     }
     if (p.isTarget || p.selectableLow) g.targets.push(p);
     else if (p.isHorikoshi) g.horikoshi.push(p);
-    else if (p.active && p.stockMonths > 0) g.candidates.push(p);
+    // 在庫あり販売0 (stockMonths=0) もついで買い候補に含める (掘り起こしから外れた死に筋の受け皿。
+    // どのリストにも載らないとワークスペース検索・カート追加から消えてしまう)
+    else if (p.active) g.candidates.push(p);
   }
   for (const g of bySupplier.values()) {
     g.targets.sort((a, b) => a.stockMonths - b.stockMonths);
-    g.candidates.sort((a, b) => a.stockMonths - b.stockMonths);
+    // 販売0 (stockMonths=0) は末尾へ。それ以外は在庫月数の少ない順
+    g.candidates.sort((a, b) => ((a.stockMonths === 0) - (b.stockMonths === 0)) || a.stockMonths - b.stockMonths);
     g.horikoshi.sort((a, b) => (b.lastPurchase || '').localeCompare(a.lastPurchase || ''));
     g.estAmount = Math.round(g.targets.reduce((s, p) => s + (p.recQty || 0) * p.cost, 0));
   }

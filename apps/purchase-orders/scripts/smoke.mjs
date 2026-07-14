@@ -43,6 +43,10 @@ insRow.run('cardstand-silver-r', 'AMC カードスタンド シルバー', '0001
 insRow.run('0726-001060', '肉球クリーム 30g', '0001', '取扱中', 1, 3559, 0, 176, 888, 1000, 2.5, 698, 245, '2026-07-02', '2019-12-11');
 insRow.run('deaditem', '休眠商品', '0001', '取扱中', 2, 50, 0, 0, 0, 100, 1.5, 500, 200, '2025-01-01', '2020-01-01');
 insRow.run('teishi-item', '取扱中止商品', '0001', '取扱中止', 2, 0, 0, 0, 10, 100, 1.5, 500, 200, '2025-01-01', '2020-01-01');
+insRow.run('horikoshi-item', '掘り起こし対象商品', '0001', '取扱中', 2, 0, 0, 0, 0, 100, 1.5, 500, 200, '2025-01-01', '2020-01-01');
+// セット商品 (商品区分='セット') は全リスト対象外
+db.prepare(`INSERT INTO mirror_pml_snapshot_rows (run_id, 商品コード, 商品名, 仕入先, 取扱区分, 商品区分, 売上分類, 総在庫数_引当なし, 注残数, 販売数7日_合計, 販売数30日_合計)
+  VALUES ('run_test', 'set-2pack', '2個セット商品', '', '取扱中', 'セット', 2, 0, 0, 0, 0)`).run();
 insRow.run('gyoumuhandcream60-BI', 'プロ業務用ハンドクリーム 60g 微香', '0002', '取扱中', 3, 195, 178, 55, 258, 24, 1, 1236, 672, '2026-07-01', '2022-02-03');
 insRow.run('diyorangeoil100', '木工用オレンジオイル 100ml', '0001', '取扱中', 1, 1536, 900, 169, 808, 600, 1.5, 698, 270, '2026-06-30', '2021-05-23');
 
@@ -57,7 +61,9 @@ ok(card.recQty === 10000, 'cardstand-silver-r 発注量=10000 (最低1ロット)
 const niku = get('0726-001060');
 ok(niku.isTarget === false, '0726-001060 在庫4ヶ月分→対象外', niku.stockMonths);
 const dead = get('deaditem');
-ok(dead.isHorikoshi === true && dead.isTarget === false, 'deaditem 掘り起こし');
+ok(dead.isHorikoshi === false && dead.isTarget === false, 'deaditem 在庫あり販売0→掘り起こしではない (定義=在庫0かつ注残0)');
+const hori = get('horikoshi-item');
+ok(hori.isHorikoshi === true && hori.isTarget === false, 'horikoshi-item 在庫0・注残0→掘り起こし');
 const teishi = get('teishi-item');
 ok(teishi.isTarget === false && teishi.isHorikoshi === false, '取扱中止は対象外');
 const oil = get('diyorangeoil100');
@@ -115,7 +121,9 @@ ok(r.body.cards[0].targetCount === 2, 'overview: 要発注2SKU', r.body.cards[0]
 r = await j('/api/supplier/0001');
 ok(r.body.ok && r.body.supplier.name === 'アメージングクラフト様', 'supplier: 名前解決 (0001→1)');
 ok(r.body.targets.length === 2, 'supplier: targets=2', r.body.targets.map(t => t.code));
-ok(r.body.horikoshi.length === 1 && r.body.horikoshi[0].code === 'deaditem', 'supplier: 掘り起こし=deaditem');
+ok(r.body.horikoshi.length === 1 && r.body.horikoshi[0].code === 'horikoshi-item', 'supplier: 掘り起こし=在庫0・注残0のみ (horikoshi-item)', r.body.horikoshi.map(p => p.code));
+ok(r.body.candidates.length > 0 && r.body.candidates[r.body.candidates.length - 1].code === 'deaditem',
+  'supplier: 在庫あり販売0 (deaditem) はついで買い候補の末尾', r.body.candidates.map(p => p.code));
 ok(r.body.conditions.length === 1 && r.body.conditions[0].memberCodes.includes('noflyersticker'), 'supplier: 条件メンバー解決', r.body.conditions);
 ok(r.body.materialGroups.length === 1 && r.body.materialGroups[0].memberCodes.includes('diyorangeoil100'), 'supplier: 原料グループ解決');
 // 商品紐付けのない仕入先直付き条件は supplierWide=true でカート全体評価 (Codex P5 High)
@@ -487,6 +495,7 @@ for (const p of ['/', '/supplier/1', '/products', '/orders', '/admin']) {
   const html = await res.text();
   ok(html.includes('noflyersticker') && html.includes('全商品情報'), '/products にPML商品が埋め込まれる');
   ok(html.includes('"t":1') || html.includes('"h":1'), '/products に要発注/掘り起こしフラグ');
+  ok(!html.includes('set-2pack'), '/products セット商品 (商品区分=セット) は載せない');
   ok(html.includes('mall-sales') && html.includes('mallBoxHtml') && html.includes('msDays'), '/products 商品名クリック→モール別販売内訳のJSを配信');
 }
 // 仕入先ページ: グループ化アコーディオン+下部固定バー+シミュレーション+検索 (カート/独立条件セクション廃止)
@@ -1537,7 +1546,7 @@ console.log('── NE発注残 初期取込 (移行PO) ──');
   // 事前状態 (発注済みバッジ・月次上限・PO件数)
   r = await j('/api/supplier/1');
   const beforeIssuedTotal = r.body.issuedTotal;
-  const beforeDead = (r.body.horikoshi.find(p => p.code === 'deaditem') || {}).recentIssued || null;
+  const beforeDead = (([...r.body.targets, ...r.body.candidates, ...r.body.horikoshi].find(p => p.code === 'deaditem')) || {}).recentIssued || null;
   const ordersBefore = db.prepare('SELECT COUNT(*) n FROM po_orders').get().n;
   // 整合性はP14が意図的に残した訂正競合が既に載っているため、取込で「増えない」ことを検証する
   r = await j('/api/ledger/integrity');
@@ -1616,7 +1625,7 @@ console.log('── NE発注残 初期取込 (移行PO) ──');
 
   // 移行POは発注提案の「発注済み」バッジ・月次上限集計を汚染しない (数量はNE注残としてPML反映済みのため)
   r = await j('/api/supplier/1');
-  const afterDead = (r.body.horikoshi.find(p => p.code === 'deaditem') || {}).recentIssued || null;
+  const afterDead = (([...r.body.targets, ...r.body.candidates, ...r.body.horikoshi].find(p => p.code === 'deaditem')) || {}).recentIssued || null;
   ok(JSON.stringify(afterDead) === JSON.stringify(beforeDead), '移行POは「発注済み」バッジに出ない', afterDead);
   ok(r.body.issuedTotal === beforeIssuedTotal, '移行POは月次上限集計に入らない', { before: beforeIssuedTotal, after: r.body.issuedTotal });
 
