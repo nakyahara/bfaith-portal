@@ -4856,7 +4856,16 @@ router.get('/backorders', (req, res) => {
       <button data-view="open">オープン</button>
       <button data-view="closed">完了</button>
       <span class="muted" id="boCount" style="margin-left:8px"></span>
+      <input type="text" id="boQ" placeholder="🔎 商品コード / 商品名で注残検索" style="margin-left:auto;min-width:280px" title="商品ごとの注残合計と、含まれる発注書 (PO) を横断表示します。POを開いてその場で入荷・減数の消込ができます">
     </div>
+    <div class="toolbar" id="boBulkBar" style="display:none;background:#eef4ff;border-radius:8px;padding:8px 12px;margin:6px 0;gap:12px;align-items:center;flex-wrap:wrap">
+      <b id="boSelCount"></b>
+      <label class="muted">予約日時 <input type="datetime-local" id="boBulkAt"> <span style="font-size:11px">(空欄=今すぐ送信)</span></label>
+      <button class="pri" id="boBulkSend">📧 選択した発注書をまとめて送信</button>
+      <button class="ghost" id="boSelClear">選択解除</button>
+    </div>
+    <div id="boBulkResult"></div>
+    <div id="boProd" style="display:none"></div>
     <div id="boList">読み込み中…</div>
     <details class="sec" style="margin-top:16px"><summary style="cursor:pointer;padding:8px 12px">🔁 NE発注残の初期取込 (移行)</summary>
       <div class="bd">
@@ -4873,6 +4882,7 @@ router.get('/backorders', (req, res) => {
   const script = `
 var API = '/apps/purchase-orders/api';
 var DATA = null, VIEW = 'attention', OPENED = {};
+var SEL = {}; // 一括メール送信の選択状態 (orderId → true)
 var REASONS = { supplier_shortage: '仕入先都合 (作れない)', own_decision: '自社判断', cutoff: '打切', other: 'その他', correction: '訂正' };
 var EVLABEL = { receipt: '📥入荷', shortage: '➖減数', cancel: '🚫取消', reversal: '↩逆仕訳' };
 
@@ -4912,7 +4922,14 @@ function load() {
       document.getElementById('boList').innerHTML = '<div class="warn">エラー: ' + esc(j.error) + ' <button class="ghost" onclick="load()">再読込</button></div>';
       return;
     }
-    DATA = j; render();
+    DATA = j;
+    // 完了・送信対象外になったPOは一括送信の選択から外す (表示上チェックが消えたPOを送らない、Codex 一括R1 High)
+    var eligible = {};
+    DATA.orders.forEach(function(o){ if (o.open && !o.sendBlocked) eligible[o.id] = true; });
+    Object.keys(SEL).forEach(function(k){ if (!eligible[k]) delete SEL[k]; });
+    render();
+    // 商品検索の入力が残っていれば再評価 (DATA読込前に入力したケース)
+    if (document.getElementById('boQ').value.trim()) renderProd();
   }).catch(function(e) {
     if (seq !== LOAD_SEQ) return;
     document.getElementById('boList').innerHTML = '<div class="warn">通信エラー: ' + esc(e.message) + ' <button class="ghost" onclick="load()">再読込</button></div>';
@@ -4964,6 +4981,7 @@ function render() {
   document.getElementById('boCount').textContent =
     'オープン' + s.openOrders + '件 / 残数量 ' + s.remainingQty.toLocaleString('ja-JP') +
     ' / 既知単価分 ' + yen(s.knownAmount) + (s.unknownCostItems ? ' (単価未設定 ' + s.unknownCostItems + '明細)' : '');
+  updateBulkBar(); // 早期return経路でも選択バーの表示状態を最新化 (Codex 一括R1 High)
   if (!DATA.boundary) {
     document.getElementById('boList').innerHTML = '<div class="muted">まだ発注残管理の対象がありません。次にアプリで発注確定した分から管理が始まります (既存のNE発注残は下の初期取込で登録できます)。</div>';
     return;
@@ -4983,6 +5001,7 @@ function render() {
     var h2 = document.querySelector('[data-toggle="' + id + '"]');
     if (h2) h2.setAttribute('aria-expanded', 'true');
   });
+  updateBulkBar();
 }
 
 function orderHtml(o) {
@@ -4994,7 +5013,12 @@ function orderHtml(o) {
   else if (o.attentionItems) flags += badge('b-draft', '⚠️ 要対応 ' + o.attentionItems + '明細');
   // 仕入先名はリンクにしない (以前は発注ワークスペースへ飛んでいて「確定した明細が消えた」ように
   // 見える誤解を生んだ、中原さん報告 2026-07-13)。行クリック=このPOの確定明細を展開。ワークスペースへは展開部の🛒から
+  // 送信可能なPO (オープン+メール対象) は一括送信用チェックボックスを出す
+  var selBox = (o.open && !o.sendBlocked)
+    ? '<input type="checkbox" class="boSel" data-osel="' + o.id + '"' + (SEL[o.id] ? ' checked' : '') + ' title="チェックして上の「📧 まとめて送信」で一括送信予約" style="margin-right:6px;transform:scale(1.2)"> '
+    : '';
   var h = '<div class="sec"><h2 style="cursor:pointer" data-toggle="' + o.id + '" tabindex="0" role="button" aria-expanded="false" title="クリックでこの発注の明細 (確定時の内容) を開閉">' +
+    selBox +
     esc(o.poNumber || ('#' + o.id)) + ' — ' + esc(o.supplierName) + ' ' +
     st + (o.origin === 'migration' ? ' ' + badge('b-draft', '🔁 NE移行分', 'NE発注残の初期取込で作成 (発注書メール対象外)') : '') +
     (o.origin === 'supplement' ? ' ' + badge('b-draft', '➕ ' + (o.parentPoNumber || '') + ' への追加分', '発注確定後に電話等で口頭追加した分 (元POに紐づく別PO)') : '') +
@@ -5030,6 +5054,180 @@ function orderHtml(o) {
     '</div><div id="supArea-' + o.id + '"></div><div id="emailArea-' + o.id + '"></div>';
   h += '</div></div>';
   return h;
+}
+
+// ── 📧 一括メール送信 (チェックしたPOをまとめて送信/予約。既存の個別送信APIを1件ずつ冪等キー付きで呼ぶ) ──
+function updateBulkBar() {
+  var ids = Object.keys(SEL).filter(function(k){ return SEL[k]; });
+  var bar = document.getElementById('boBulkBar');
+  bar.style.display = ids.length ? 'flex' : 'none';
+  document.getElementById('boSelCount').textContent = '📧 ' + ids.length + '件を選択中';
+}
+document.addEventListener('change', function(ev) {
+  if (!(ev.target.classList && ev.target.classList.contains('boSel'))) return;
+  SEL[ev.target.getAttribute('data-osel')] = ev.target.checked;
+  updateBulkBar();
+});
+document.getElementById('boSelClear').addEventListener('click', function() {
+  SEL = {};
+  document.querySelectorAll('.boSel').forEach(function(cb){ cb.checked = false; });
+  updateBulkBar();
+});
+// 送信可能なPO (オープン+メール対象) か — 選択時だけでなく送信直前にも再検証する (Codex 一括R1 High)
+function bulkEligibleIds() {
+  var ok = {};
+  (DATA ? DATA.orders : []).forEach(function(o){ if (o.open && !o.sendBlocked) ok[o.id] = true; });
+  return Object.keys(SEL).filter(function(k){ return SEL[k] && ok[k]; });
+}
+// 送信結果の分類: ジョブ作成成功 (ok:true) でも送信自体は failed/unknown/stale があり得る (成功扱いにしない)
+function bulkOutcome(j, at) {
+  if (!j.ok) return { kind: 'fail', text: '❌ ' + (j.error || '不明なエラー') };
+  if (j.status === 'sent') return { kind: 'ok', text: j.dryRun ? '✅ dry-run送信 (社内宛)' : '✅ 送信しました' };
+  if (j.status === 'scheduled' || j.status === 'queued') return { kind: 'ok', text: '⏰ 予約しました' + (at ? ' (' + at.replace('T', ' ') + ')' : '') };
+  if (j.status === 'failed') return { kind: 'fail', text: '❌ 送信失敗: ' + (j.error || '') };
+  // unknown / stale — 未送信と断定できない。二重送信を避けるため自動再送せず照合を案内
+  return { kind: 'check', text: '⚠️ 送信されたか不明 (' + (j.status || '') + ')。POの📧パネルの「照合」で確認してください' };
+}
+var BULK_LAST = null; // { at, mode, entries: [{id, label, key}] } — 通信エラー時に同じ冪等キーで再確認するため保持
+document.getElementById('boBulkSend').addEventListener('click', function() {
+  var btn = this;
+  var ids = bulkEligibleIds();
+  var dropped = Object.keys(SEL).filter(function(k){ return SEL[k]; }).length - ids.length;
+  if (dropped > 0) toast(dropped + '件は完了/送信対象外になったため対象から外しました');
+  if (!ids.length) { toast('送信できるPOがありません (チェックを入れてください)'); updateBulkBar(); return; }
+  var at = document.getElementById('boBulkAt').value || null;
+  // 確定前にモード取得+発注残を再取得して資格を再検証 (別画面での消込・完了を反映。古いDATAで閉じたPOを送らない、Codex 一括R2 High)
+  Promise.all([getJson(API + '/email/settings'), getJson(API + '/backorders')]).then(function(res2) {
+    var st = res2[0], fresh = res2[1];
+    if (!st.ok) { toast('エラー: ' + st.error); return; }
+    if (!fresh.ok) { toast('エラー: ' + fresh.error); return; }
+    DATA = fresh;
+    var eligible = {};
+    DATA.orders.forEach(function(o){ if (o.open && !o.sendBlocked) eligible[o.id] = true; });
+    Object.keys(SEL).forEach(function(k){ if (!eligible[k]) delete SEL[k]; });
+    render();
+    var before = ids.length;
+    ids = bulkEligibleIds();
+    if (ids.length < before) toast((before - ids.length) + '件は完了/送信対象外になったため対象から外しました');
+    if (!ids.length) { toast('送信できるPOがありません'); updateBulkBar(); return; }
+    var labels = {};
+    ids.forEach(function(id) {
+      var o = null; DATA.orders.forEach(function(x){ if (String(x.id) === String(id)) o = x; });
+      labels[id] = o ? (o.poNumber || ('#' + o.id)) + ' (' + o.supplierName + ')' : '#' + id;
+    });
+    if (!confirm('選択した ' + ids.length + '件の発注書メールを' + (at ? '\\n⏰ ' + at.replace('T', ' ') + ' に予約' : '今すぐ') + '送信します。\\n' +
+      'モード: ' + (st.mode === 'live' ? '⚠️ 本番送信 (仕入先に届きます)' : '🔒 dry-run (社内 ' + (st.dryrunTo || '未設定') + ' に送信)') + '\\n\\n・' + ids.map(function(id){ return labels[id]; }).join('\\n・') + '\\n\\nよろしいですか?')) return;
+    // 冪等キーは確定時に一括生成して保持 — 通信エラー行は「同じキーで再確認」で安全に再実行できる (replayなら二重送信なし)
+    BULK_LAST = { at: at, mode: st.mode, entries: ids.map(function(id){ return { id: id, label: labels[id], key: 'bulk-' + id + '-' + newIdemKey() }; }) };
+    btn.disabled = true;
+    runBulk(BULK_LAST, function(){ btn.disabled = false; SEL = {}; load(); });
+  }).catch(function(e){ toast('通信エラー: ' + e.message); });
+});
+function runBulk(batch, done) {
+  var results = [];
+  var run = function(idx) {
+    if (idx >= batch.entries.length) {
+      renderBulkResult(batch, results);
+      if (done) done();
+      return;
+    }
+    var en = batch.entries[idx];
+    sendBulkOne(batch, en).then(function(r) {
+      results.push(r);
+      run(idx + 1);
+    });
+  };
+  document.getElementById('boBulkResult').innerHTML = '<div class="muted">送信中… (' + batch.entries.length + '件を順に処理)</div>';
+  run(0);
+}
+function sendBulkOne(batch, en) {
+  return fetch(API + '/orders/' + en.id + '/email/send', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': en.key },
+    body: JSON.stringify({ scheduledAt: batch.at, expectedMode: batch.mode }),
+  }).then(function(r){ return jsonOrErr(r, true); }).then(function(j) {
+    return { en: en, out: bulkOutcome(j, batch.at) };
+  }).catch(function(e) {
+    return { en: en, out: { kind: 'retry', text: '⚠️ 通信エラー: ' + e.message + ' — 「同じキーで再確認」を押すと二重送信なしで結果を確認できます' } };
+  });
+}
+function renderBulkResult(batch, results) {
+  var okN = results.filter(function(r){ return r.out.kind === 'ok'; }).length;
+  var ngN = results.filter(function(r){ return r.out.kind === 'fail'; }).length;
+  var ckN = results.length - okN - ngN;
+  document.getElementById('boBulkResult').innerHTML =
+    '<div class="sec" style="padding:10px 12px;margin:6px 0"><b>📧 一括送信結果: 成功 ' + okN + ' / 失敗 ' + ngN + (ckN ? ' / 要確認 ' + ckN : '') + '</b>' +
+    '<table class="t" style="margin-top:4px">' + results.map(function(r, i) {
+      return '<tr><td>' + esc(r.en.label) + '</td><td>' + (r.out.kind === 'fail' || r.out.kind === 'check'
+        ? '<span class="badge b-warn">' + esc(r.out.text) + '</span>' : esc(r.out.text)) +
+        (r.out.kind === 'retry' ? ' <button class="ghost sm" data-bulkretry="' + i + '">🔁 同じキーで再確認</button>' : '') + '</td></tr>';
+    }).join('') + '</table></div>';
+  var retryBtns = document.querySelectorAll('[data-bulkretry]');
+  retryBtns.forEach(function(b) {
+    b.addEventListener('click', function() {
+      var i = Number(b.getAttribute('data-bulkretry'));
+      b.disabled = true;
+      sendBulkOne(batch, results[i].en).then(function(r) {
+        results[i] = r;
+        renderBulkResult(batch, results);
+        load();
+      });
+    });
+  });
+}
+
+// ── 🔎 商品別注残 (商品コード/商品名で横断検索 → 商品ごとの残数と該当PO。POを開いてその場で消込) ──
+function renderProd() {
+  var q = document.getElementById('boQ').value.trim().toLowerCase();
+  var prod = document.getElementById('boProd');
+  var list = document.getElementById('boList');
+  if (!q) { prod.style.display = 'none'; list.style.display = ''; return; }
+  var groups = {}; // key → { code, name, totalRem, rows: [{o, i}] }
+  (DATA ? DATA.orders : []).forEach(function(o) {
+    if (!o.open) return;
+    o.items.forEach(function(i) {
+      if (i.remaining_qty <= 0) return;
+      if ((i.product_code + ' ' + (i.product_name || '')).toLowerCase().indexOf(q) < 0) return;
+      var k = i.product_code.toLowerCase();
+      if (!groups[k]) groups[k] = { code: i.product_code, name: i.product_name || '', totalRem: 0, rows: [] };
+      groups[k].totalRem += i.remaining_qty;
+      groups[k].rows.push({ o: o, i: i });
+    });
+  });
+  var keys = Object.keys(groups).sort();
+  var h = '<div class="sec" style="padding:10px 12px;margin:6px 0"><b>🔎 商品別注残: 「' + esc(q) + '」 ' + keys.length + '商品</b> <span class="muted">(オープン発注の残数のみ。「開く」でPOに移動してその場で📥入荷/➖減数の消込ができます)</span>';
+  if (!keys.length) h += '<div class="muted" style="margin-top:6px">該当する注残はありません</div>';
+  keys.forEach(function(k) {
+    var gp = groups[k];
+    h += '<div style="margin-top:10px"><b>' + esc(gp.code) + '</b> <span class="muted">' + esc(gp.name) + '</span> — 注残合計 <b>' + gp.totalRem.toLocaleString('ja-JP') + '</b></div>' +
+      '<table class="t" style="margin-top:2px"><tr><th>発注書</th><th>仕入先</th><th>発注日</th><th class="r">発注</th><th class="r">入荷済</th><th class="r">残</th><th>納期 (希望→回答)</th><th>残数の扱い</th><th></th></tr>' +
+      gp.rows.map(function(row) {
+        return '<tr><td>' + esc(row.o.poNumber || ('#' + row.o.id)) + '</td><td>' + esc(row.o.supplierName) + '</td>' +
+          '<td class="muted">' + fmtD(row.o.issuedAt) + '</td>' +
+          '<td class="r">' + row.i.qty + '</td><td class="r">' + row.i.received_qty + '</td><td class="r"><b>' + row.i.remaining_qty + '</b></td>' +
+          '<td>' + fmtD(row.i.requested_date) + ' → ' + fmtD(row.i.promised_date) + '</td>' +
+          '<td>' + dispText(row.i) + itemFlagBadges(row.i) + '</td>' +
+          '<td><button class="pri sm" data-jump="' + row.o.id + '">開く</button></td></tr>';
+      }).join('') + '</table>';
+  });
+  h += '</div>';
+  prod.innerHTML = h;
+  prod.style.display = '';
+  list.style.display = 'none';
+}
+var boQTimer = null;
+document.getElementById('boQ').addEventListener('input', function() {
+  clearTimeout(boQTimer);
+  boQTimer = setTimeout(renderProd, 250);
+});
+function jumpToOrder(id) {
+  document.getElementById('boQ').value = '';
+  renderProd(); // 検索を閉じて一覧に戻す
+  var o = null; DATA.orders.forEach(function(x){ if (String(x.id) === String(id)) o = x; });
+  VIEW = (o && !o.open) ? 'closed' : 'open';
+  OPENED[id] = true;
+  render();
+  var h2 = document.querySelector('[data-toggle="' + id + '"]');
+  if (h2) { h2.scrollIntoView({ behavior: 'smooth', block: 'start' }); h2.setAttribute('aria-expanded', 'true'); }
 }
 
 // ── 発注書メールパネル (プレビュー→送信確認→送信。dry-run/再送/再試行/照合) ──
@@ -5449,6 +5647,8 @@ function toggleOrder(v) {
 // 見出しはEnter/Spaceでも開閉できるようにする (仕入先名<a>廃止でキーボード導線が残るように、Codex R1 Medium)
 document.addEventListener('keydown', function(ev) {
   if (ev.key !== 'Enter' && ev.key !== ' ') return;
+  // 見出し内の操作要素 (一括送信チェックボックス等) のキー操作は開閉に流さない (Codex 一括R1 Medium)
+  if (['INPUT', 'BUTTON', 'A', 'SELECT', 'TEXTAREA'].indexOf(ev.target.tagName) >= 0) return;
   var tg = ev.target.closest && ev.target.closest('[data-toggle]');
   if (tg) { ev.preventDefault(); toggleOrder(tg.getAttribute('data-toggle')); }
 });
@@ -5456,7 +5656,9 @@ document.addEventListener('click', function(ev) {
   var t = ev.target;
   var g = function(a){ return t.getAttribute && t.getAttribute(a); };
   var v;
+  if (t.classList && t.classList.contains('boSel')) return; // 一括送信チェックボックスは開閉に流さない (changeハンドラが処理)
   if ((v = g('data-view'))) { VIEW = v; render(); return; }
+  if ((v = g('data-jump'))) { jumpToOrder(v); return; } // 商品別注残からPOへ
   // 見出し内の子要素 (badge/日付span等) クリックでも展開する (Codex R1 Medium)。
   // 見出し内の操作要素 (回答納期編集span等の data-* 持ち) は除外して個別ハンドラに委ねる
   if (!g('data-pedit') && !g('data-emailui') && !g('data-closeui') && t.tagName !== 'A' && t.tagName !== 'BUTTON') {

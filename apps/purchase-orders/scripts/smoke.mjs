@@ -1337,6 +1337,19 @@ console.log('── P15: メール送信 (fake transport) ──');
     'dry-run: 宛先差替+件名+整理番号', job1.to_addr);
   ok(job1.body.includes('本来の宛先: TO=tanaka@example.com'), 'dry-run: 本来の宛先を本文に明記');
 
+  // 完了済み (closed) POへの新規送信は拒否 (一括送信の失効選択に対するサーバ側最終防衛、Codex 一括R2 High)
+  {
+    r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 3 }] }) });
+    const closedId = r.body.id;
+    const closedItem = db.prepare('SELECT id FROM po_order_items WHERE order_id=?').get(closedId);
+    r = await jsonPost('/api/items/' + closedItem.id + '/events', { type: 'receipt', qty: 3 });
+    ok(r.body.ok, '全量入荷で自動クローズ (テスト用PO)');
+    ok(db.prepare('SELECT closed_at FROM po_orders WHERE id=?').get(closedId).closed_at != null, 'PO closed確認');
+    r = await jsonPost('/api/orders/' + closedId + '/email/send', {}, 'em-closed-guard');
+    ok(r.status === 400 && r.body.error.includes('完了済み'), '完了済みPOへの新規送信は400 (サーバ側防衛)', r.body.error);
+  }
+
   // dry-run送信のみのPOは「発注書メール未送信」扱い (cycle-issuedのunsent)
   r = await j('/api/cycle-issued');
   {
@@ -1810,6 +1823,11 @@ console.log('── NE発注残 初期取込 (移行PO) ──');
   // 発注残ページに取込UIが配信される
   const boHtml = await (await fetch(base + '/backorders')).text();
   ok(boHtml.includes('NE発注残の初期取込') && boHtml.includes('neImpPrev') && boHtml.includes('NE移行分'), '/backorders 取込UI配信');
+  // 一括メール送信 (チェックボックス+送信バー) と商品別注残検索のUI配信
+  ok(boHtml.includes('boSel') && boHtml.includes('boBulkSend') && boHtml.includes('まとめて送信') && boHtml.includes('boBulkAt'),
+    '/backorders 一括メール送信UI (チェックボックス+予約日時)');
+  ok(boHtml.includes('boQ') && boHtml.includes('renderProd') && boHtml.includes('商品別注残') && boHtml.includes('data-jump'),
+    '/backorders 商品別注残検索UI (横断表示+POへジャンプ)');
 }
 
 // ═══ 追加発注 (supplement: 確定後の電話等の口頭追加・増量分) ═══
