@@ -2496,6 +2496,12 @@ console.log('── 入庫取込プレビュー+一括割当 ──');
   // 同一ファイルの再プレビュー → 重複警告
   r = await up2('aa.csv', fileRows, { preview: '1' });
   ok(r.body.ok && r.body.duplicateFile && r.body.duplicateFile.fileName === 'aa.csv', 'preview: 取込済みファイルは警告情報', r.body.duplicateFile);
+  {
+    const d = new Date(Date.parse(r.body.duplicateFile.importedAt) + 9 * 3600000);
+    const p2 = n => String(n).padStart(2, '0');
+    const expJst = d.getUTCFullYear() + '-' + p2(d.getUTCMonth() + 1) + '-' + p2(d.getUTCDate()) + ' ' + p2(d.getUTCHours()) + ':' + p2(d.getUTCMinutes());
+    ok(r.body.duplicateFile.importedAtJst === expJst, 'preview: 前回取込日時はJST表示 (UTC素通しにしない)', r.body.duplicateFile.importedAtJst);
+  }
 
   // 一覧に商品名
   r = await j('/api/inbound');
