@@ -220,6 +220,11 @@ export function createEmailJob(orderId, { resend = false, resendOfJobId = null, 
   }
   if (!st.envReady) throw new Error('Gmail API のenv (PO_GMAIL_CLIENT_ID/SECRET/REFRESH_TOKEN) が未設定です。Renderの環境変数を設定してください');
   const p = buildOrderEmail(orderId);
+  // 完了済み (closed) POへの新規送信は拒否 — 一覧画面の選択が古いままでも送らない最終防衛 (Codex 一括R2 High)。
+  // 再送 (resend) は送信済みの実績があるPOの控え再送なので完了後も許可
+  if (!resend && p.order.closed_at) {
+    throw new Error(`このPOは完了済みのため送信できません (${p.order.po_number || '#' + orderId})。画面を再読み込みして最新の状態を確認してください`);
+  }
   const dryRun = st.mode !== 'live';
   // 先方管理番号の未登録はブロックしない (中原さん決定 2026-07-13: 未登録でも送ってよい。備考欄空欄のまま送る)。
   // 送信前の確認ダイアログとプレビューの⚠️バッジで警告するのみ (旧仕様のliveブロックはP15 Codex R1 M5だったが実運用で撤回)
