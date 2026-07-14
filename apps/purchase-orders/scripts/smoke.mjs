@@ -2460,6 +2460,160 @@ console.log('── NE本来表記 (canonical) ──');
     'canonical未蓄積の商品は表記未確認として警告リストへ', r.body.caseUnverified);
 }
 
+// ═══ 入庫取込プレビュー + ⚡一括割当 (中原さん要望 2026-07-14) ═══
+console.log('── 入庫取込プレビュー+一括割当 ──');
+{
+  const csvOf2 = rows => iconv.encode(rows.map(r2 => r2.map(v => '"' + String(v) + '"').join(',')).join('\r\n'), 'Shift_JIS');
+  const HDR2 = ['伝票NO', '型番', '品名', '取引先ID', '仕入単価', '良品数', '不良品数', '入庫日'];
+  const up2 = async (name, rows, extra) => {
+    const fd = new FormData();
+    fd.append('file', new Blob([csvOf2(rows)]), name);
+    for (const [k, v] of Object.entries(extra || {})) fd.append(k, v);
+    return j('/api/inbound/import', { method: 'POST', body: fd });
+  };
+  const jpA = (p, body, key) => j(p, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(key ? { 'Idempotency-Key': key } : {}) }, body: JSON.stringify(body) });
+
+  // プレビュー: 書込なし+商品名解決。一括割当の「候補1つ」条件を確定させるため専用のfixture商品を使う
+  insRow.run('aa-unique-item', '一括テスト商品', '0001', '取扱中', 2, 0, 0, 0, 0, 10, 1.5, 400, 200, '2026-07-01', '2026-01-01');
+  const fileRows = [HDR2,
+    ['AA100', 'aa-unique-item', '一括', '0001', '200', '10', '0', '2026/07/14'],
+    ['AA101', '0726-001060', '肉球', '0001', '245', '5', '0', '2026/07/14'],
+    ['AA102', 'noflyersticker', 'チラシ', '0001', '70', '3', '0', '2026/07/14']];
+  const batchesBefore = db.prepare('SELECT COUNT(*) AS n FROM po_inbound_batches').get().n;
+  r = await up2('aa.csv', fileRows, { preview: '1' });
+  ok(r.body.ok && r.body.preview === true && r.body.slipCount === 3 && r.body.totalGood === 18 && r.body.duplicateFile === null,
+    'preview: サマリ (伝票3/良品18/重複なし)', r.body);
+  ok(r.body.lines.find(l => l.productCode === 'aa-unique-item')?.productName === '一括テスト商品', 'preview: 商品名をPMLから解決');
+  ok(db.prepare('SELECT COUNT(*) AS n FROM po_inbound_batches').get().n === batchesBefore, 'preview: 書込なし');
+  const previewHash = r.body.fileHash;
+
+  // commit: ハッシュ不一致は拒否 / 一致で取込
+  r = await up2('aa.csv', fileRows, { fileHash: 'deadbeef' });
+  ok(r.status === 400 && r.body.error.includes('プレビューしたファイル'), 'commit: fileHash不一致は拒否');
+  r = await up2('aa.csv', fileRows, { fileHash: previewHash });
+  ok(r.body.ok && r.body.receipts === 3, 'commit: fileHash一致で取込');
+
+  // 同一ファイルの再プレビュー → 重複警告
+  r = await up2('aa.csv', fileRows, { preview: '1' });
+  ok(r.body.ok && r.body.duplicateFile && r.body.duplicateFile.fileName === 'aa.csv', 'preview: 取込済みファイルは警告情報', r.body.duplicateFile);
+
+  // 一覧に商品名
+  r = await j('/api/inbound');
+  const aaRow = r.body.open.find(x => x.slip === 'AA100');
+  ok(aaRow && aaRow.productName === '一括テスト商品', 'listInbound: 商品名付き', aaRow && aaRow.productName);
+
+  // ⚡一括割当プレビュー: deaditem=候補1(全量) / 0726=候補1(部分) / noflyersticker=候補複数→skip
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'aa-unique-item', qty: 10 }, { code: '0726-001060', qty: 20 }] }) });
+  ok(r.body.ok !== false, 'auto: テスト用PO作成');
+  r = await j('/api/inbound/auto-assign/preview');
+  ok(r.body.ok, 'auto preview: ok');
+  const pDead = r.body.proposals.find(p => p.slip === 'AA100');
+  const pNiku = r.body.proposals.find(p => p.slip === 'AA101');
+  const sNof = r.body.skipped.find(s => s.slip === 'AA102');
+  ok(pDead && pDead.qty === 10 && pDead.postRemaining === 0, 'auto preview: 全量一致の提案 (aa-unique-item)', pDead);
+  ok(pNiku && pNiku.qty === 5 && pNiku.poRemaining === 20 && pNiku.postRemaining === 15, 'auto preview: 部分入荷の提案 (残15)', pNiku);
+  ok(sNof && sNof.reason.includes('候補が'), 'auto preview: 候補複数はskip (手動)', sNof && sNof.reason);
+
+  // 原子性: 不正な数量を混ぜると全ロールバック
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: pDead.inboundItemId, orderItemId: pDead.orderItemId, qty: 999 },
+    { inboundItemId: pNiku.inboundItemId, orderItemId: pNiku.orderItemId, qty: 5, remainder: { action: 'await_delivery', nextExpectedDate: '2026-07-30' } },
+  ] }, 'aa-key-bad');
+  ok(r.status === 400, 'auto commit: 不正数量は400');
+  r = await j('/api/inbound');
+  ok(r.body.open.find(x => x.slip === 'AA101').allocated === 0, 'auto commit: 失敗時は全ロールバック (片方も未割当のまま)');
+
+  // 部分入荷で残数の扱い未指定はエラー (減数は選択肢に無い)
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: pNiku.inboundItemId, orderItemId: pNiku.orderItemId, qty: 5 },
+  ] }, 'aa-key-norem');
+  ok(r.status === 400 && r.body.error.includes('分納待ち/確認中'), 'auto commit: 部分入荷は残数の扱い必須');
+
+  // 正常実行: 全量+部分(分納待ち)
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: pDead.inboundItemId, orderItemId: pDead.orderItemId, qty: 10 },
+    { inboundItemId: pNiku.inboundItemId, orderItemId: pNiku.orderItemId, qty: 5, remainder: { action: 'await_delivery', nextExpectedDate: '2026-07-30' } },
+  ] }, 'aa-key-1');
+  ok(r.body.ok && r.body.assigned === 2, 'auto commit: 2件割当', r.body);
+  ok(db.prepare('SELECT remaining_qty FROM v_po_item_balance WHERE order_item_id=?').get(pDead.orderItemId).remaining_qty === 0, 'auto commit: 全量行はPO残0');
+  ok(db.prepare('SELECT remaining_qty FROM v_po_item_balance WHERE order_item_id=?').get(pNiku.orderItemId).remaining_qty === 15, 'auto commit: 部分行はPO残15');
+  ok(db.prepare('SELECT remainder_disposition FROM po_order_items WHERE id=?').get(pNiku.orderItemId).remainder_disposition === 'awaiting_delivery',
+    'auto commit: 部分行は分納待ちが設定される');
+  // 冪等: 同一キー再送はreplay (二重割当なし)
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: pDead.inboundItemId, orderItemId: pDead.orderItemId, qty: 10 },
+    { inboundItemId: pNiku.inboundItemId, orderItemId: pNiku.orderItemId, qty: 5, remainder: { action: 'await_delivery', nextExpectedDate: '2026-07-30' } },
+  ] }, 'aa-key-1');
+  ok(r.body.ok && r.body.replay === true, 'auto commit: 同一キー再送はreplay');
+  r = await j('/api/inbound');
+  ok(!r.body.open.some(x => x.slip === 'AA100' || x.slip === 'AA101'), 'auto commit: 割当済み行は未割当一覧から消える');
+
+  // ── Codex inb-R1 反映分: 割当先改変 / 同一キー内容違い / 同一PO明細への複数行 ──
+  insRow.run('aa-multi-item', '複数行テスト商品', '0001', '取扱中', 2, 0, 0, 0, 0, 10, 1.5, 400, 200, '2026-07-01', '2026-01-01');
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'aa-multi-item', qty: 20 }] }) });
+  r = await up2('ab.csv', [HDR2,
+    ['AB300', 'aa-multi-item', 'x', '0001', '200', '5', '0', '2026/07/14'],
+    ['AB301', 'aa-multi-item', 'x', '0001', '200', '7', '0', '2026/07/14']]);
+  ok(r.body.ok, 'multi: 同一商品2伝票を取込');
+  r = await j('/api/inbound/auto-assign/preview');
+  const m1 = r.body.proposals.find(p => p.slip === 'AB300');
+  const m2 = r.body.proposals.find(p => p.slip === 'AB301');
+  ok(m1 && m2 && m1.orderItemId === m2.orderItemId, 'multi: 同一PO明細への2提案');
+  // 一覧順=伝票NO降順のため AB301 (qty7) が先に処理される: 20→13→8
+  ok(m2.poRemaining === 20 && m2.postRemaining === 13 && m1.poRemaining === 13 && m1.postRemaining === 8,
+    'multi: 残数は累積表示 (20→13→8。両方20→…に見えない)', [m2.postRemaining, m1.postRemaining]);
+  ok(m2.needsRemainder === false && m1.needsRemainder === true, 'multi: 残数の扱いは最終行のみ選択 (途中行の設定は受けない)');
+
+  // 割当先改変: 無関係なPO明細を指定 → 候補再検証で拒否 (Codex inb-R1 High)
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: m1.inboundItemId, orderItemId: pDead.orderItemId, qty: 5 },
+  ] }, 'aa-key-tamper');
+  ok(r.status === 400 && r.body.error.includes('候補が変わって'), 'auto commit: 割当先の改変は候補再検証で拒否', r.body.error);
+
+  // 同一キーで内容 (日付) 違い → 409 (replayさせない、Codex inb-R1 Medium)
+  const multiAssign = dt => [
+    { inboundItemId: m2.inboundItemId, orderItemId: m2.orderItemId, qty: 7 },
+    { inboundItemId: m1.inboundItemId, orderItemId: m1.orderItemId, qty: 5, remainder: { action: 'await_delivery', nextExpectedDate: dt } },
+  ];
+  r = await jpA('/api/inbound/auto-assign', { assignments: multiAssign('2026-08-01') }, 'aa-key-2');
+  ok(r.body.ok && r.body.assigned === 2, 'multi commit: 2行→同一PO明細 (途中行は残数の扱いなしで通る)', r.body);
+  r = await jpA('/api/inbound/auto-assign', { assignments: multiAssign('2026-08-02') }, 'aa-key-2');
+  ok(r.status === 409, 'auto commit: 同一キーで日付違いは409 (黙ってreplayしない)', r.status);
+  // 順序だけ変えた同一キー再送も409 (順序は「最終行」判定に効く意味のある入力、Codex inb-R2 Medium)
+  r = await jpA('/api/inbound/auto-assign', { assignments: multiAssign('2026-08-01').slice().reverse() }, 'aa-key-2');
+  ok(r.status === 409, 'auto commit: 同一キーで順序違いも409', r.status);
+  ok(db.prepare('SELECT remaining_qty FROM v_po_item_balance WHERE order_item_id=?').get(m1.orderItemId).remaining_qty === 8,
+    'multi commit: 最終PO残8 (5+7消込)');
+  ok(db.prepare('SELECT next_expected_date FROM po_order_items WHERE id=?').get(m1.orderItemId).next_expected_date === '2026-08-01',
+    'multi commit: 残数の扱いは最終行の内容で1回だけ設定');
+
+  // 全量契約: 提案より少ない数量/同一入庫行の重複指定は拒否 (Codex inb-R3 Medium)
+  r = await up2('ac.csv', [HDR2, ['AC400', 'aa-multi-item', 'x', '0001', '200', '4', '0', '2026/07/14']]);
+  r = await j('/api/inbound/auto-assign/preview');
+  const m3 = r.body.proposals.find(p => p.slip === 'AC400');
+  ok(m3 && m3.qty === 4, 'partial-guard: 新提案 (4個全量)');
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: m3.inboundItemId, orderItemId: m3.orderItemId, qty: 2 },
+  ] }, 'aa-key-partial');
+  ok(r.status === 400 && r.body.error.includes('一致しません'), 'auto commit: 全量未満の数量は拒否 (契約=未割当の全量)', r.body.error);
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: m3.inboundItemId, orderItemId: m3.orderItemId, qty: 4, remainder: { action: 'await_confirmation', nextActionDate: '2026-08-05' } },
+    { inboundItemId: m3.inboundItemId, orderItemId: m3.orderItemId, qty: 4, remainder: { action: 'await_confirmation', nextActionDate: '2026-08-05' } },
+  ] }, 'aa-key-dupinb');
+  ok(r.status === 400 && r.body.error.includes('複数回'), 'auto commit: 同一入庫行の重複指定は拒否');
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: m3.inboundItemId, orderItemId: m3.orderItemId, qty: 4, remainder: { action: 'await_confirmation', nextActionDate: '2026-08-05' } },
+  ] }, 'aa-key-3');
+  ok(r.body.ok && r.body.assigned === 1, 'auto commit: 全量なら成功 (確認中+期限)');
+
+  // 画面: プレビュー/一括割当UI配信
+  const inbHtml4 = await (await fetch(base + '/inbound')).text();
+  ok(inbHtml4.includes('autoAssignBtn') && inbHtml4.includes('この内容で取り込む') && inbHtml4.includes('一括割当の確認'),
+    '/inbound プレビュー+一括割当UI配信');
+}
+
 // ═══ 全ページのインラインJS構文チェック (サーバtemplate literal内クライアントJSの括弧崩れ等を機械検出) ═══
 console.log('── ページ内スクリプトの構文チェック ──');
 {
