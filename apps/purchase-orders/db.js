@@ -100,6 +100,8 @@ export function initPurchaseOrders() {
     row_count     INTEGER NOT NULL,
     filename      TEXT
   )`);
+  // 取込元: NULL/'ne'=NE商品マスタCSV (全項目上書き) / 'logizard'=ロジザード在庫CSV (在庫数のみ上書き)
+  addCol(db, 'po_ne_overlay_meta', 'source', 'TEXT');
   db.exec(`CREATE TABLE IF NOT EXISTS po_ne_overlay_rows (
     product_key   TEXT PRIMARY KEY,
     product_code  TEXT NOT NULL,

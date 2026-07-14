@@ -2219,8 +2219,8 @@ router.post('/api/ne-overlay/csv', upload.single('file'), (req, res) => {
         }
         if (errors.length > 0) throw new Error('validation');
         if (count === 0) throw new Error('有効な行がありません');
-        db.prepare(`INSERT INTO po_ne_overlay_meta (id, uploaded_at, row_count, filename) VALUES (1,?,?,?)
-                    ON CONFLICT(id) DO UPDATE SET uploaded_at=excluded.uploaded_at, row_count=excluded.row_count, filename=excluded.filename`)
+        db.prepare(`INSERT INTO po_ne_overlay_meta (id, uploaded_at, row_count, filename, source) VALUES (1,?,?,?,'ne')
+                    ON CONFLICT(id) DO UPDATE SET uploaded_at=excluded.uploaded_at, row_count=excluded.row_count, filename=excluded.filename, source=excluded.source`)
           .run(now, count, req.file.originalname || null);
       })();
     } catch (e) {
@@ -2235,6 +2235,82 @@ router.post('/api/ne-overlay/csv', upload.single('file'), (req, res) => {
     }
     bumpCycleReset(actorOf(req), 'NE手動CSV取込で発注サイクル更新', now);
     res.json({ ok: true, rowCount: count, uploadedAt: now });
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+
+// ロジザードのロケ別在庫一覧CSV (CZ04003) を取り込み、「在庫数だけ」を最新化する。
+// NE商品マスタCSVの代替: 日中に鮮度が必要なのは在庫だけで、原価/取扱区分等は朝同期のPMLで足りる (中原さん発案 2026-07-14)。
+// - 同一商品がロケ別に複数行 → 商品IDごとに合算。品質区分列があれば「良品」のみ在庫に数える
+// - 商品IDはロジザード登録表記そのもの → canonical (貼り付け用の大小表記) をここからも蓄積
+// - 仕組みはNEオーバーレイを再利用 (在庫数以外のカラムはNULL=マージでPML値に自動フォールバック)
+router.post('/api/logizard-stock/csv', upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ ok: false, error: 'CSVファイルが必要です' });
+  let buf;
+  try { buf = fs.readFileSync(req.file.path); } finally { try { fs.unlinkSync(req.file.path); } catch {} }
+  try {
+    const rows = parseCsvBuffer(buf);
+    if (rows.length < 2) return res.status(400).json({ ok: false, error: 'データ行がありません' });
+    const header = rows[0].map(trimS);
+    const iCode = header.indexOf('商品ID');
+    let iStock = header.indexOf('在庫数(引当数を含む)');
+    if (iStock === -1) iStock = header.findIndex(h => h.startsWith('在庫数'));
+    const iQuality = header.indexOf('品質区分名');
+    const iAlloc = header.indexOf('引当数');
+    if (iCode === -1 || iStock === -1) {
+      return res.status(400).json({ ok: false, error: 'ロジザード在庫CSVの見出しが見つかりません (商品ID / 在庫数(引当数を含む) が必要)。ロジザードのロケ別在庫一覧CSVをそのままアップロードしてください' });
+    }
+    const errors = [];
+    const agg = new Map(); // key → { code, stock, alloc }
+    let dataRows = 0, skippedNonGood = 0, skippedBlank = 0;
+    for (let n = 1; n < rows.length; n++) {
+      const code = trimS(rows[n][iCode]);
+      if (!code) { skippedBlank++; continue; }
+      dataRows++;
+      // 在庫数の検証は品質区分の除外より先 (良品以外の行に混じった不正値も見逃さない)。
+      // 空欄は Number('')=0 に化けるので明示的に拒否 — 欠損データで実在庫を0上書きしない (Codex LZ-R1 High)
+      const rawStock = trimS(rows[n][iStock]).replace(/,/g, '');
+      const stock = Number(rawStock);
+      if (rawStock === '' || !Number.isFinite(stock) || stock < 0) {
+        errors.push(`行${n + 1} (${code}): 在庫数「${rows[n][iStock]}」が0以上の数値ではありません`);
+        continue;
+      }
+      // 品質区分列があれば良品のみ在庫に数える (不良品・検品中を発注計算の在庫に入れない)
+      if (iQuality !== -1 && trimS(rows[n][iQuality]) !== '良品') { skippedNonGood++; continue; }
+      const alloc = iAlloc !== -1 ? Number(trimS(rows[n][iAlloc]).replace(/,/g, '')) : NaN;
+      const key = normProductCode(code);
+      const cur = agg.get(key) || { code, stock: 0, alloc: 0 };
+      cur.stock += stock;
+      if (Number.isFinite(alloc)) cur.alloc += alloc;
+      agg.set(key, cur);
+    }
+    if (errors.length > 0) {
+      return res.status(400).json({ ok: false, error: `在庫数が数値でない行が ${errors.length} 件あるため全件取り込みを中止しました (1件も反映していません)`, errors: errors.slice(0, 10) });
+    }
+    if (agg.size === 0) return res.status(400).json({ ok: false, error: '有効な行がありません (良品の在庫行が0件)' });
+    // PMLに存在する商品数 (反映見込み)
+    const pmlKeys = new Set(loadPml().rows.map(r => normProductCode(r['商品コード'])));
+    let matched = 0;
+    for (const key of agg.keys()) if (pmlKeys.has(key)) matched++;
+    const now = nowIso();
+    const db = getDB();
+    db.transaction(() => {
+      db.prepare('DELETE FROM po_ne_overlay_rows').run();
+      const ins = db.prepare('INSERT INTO po_ne_overlay_rows (product_key, product_code, 在庫数, 引当数) VALUES (?,?,?,?)');
+      const insCanon = db.prepare(`INSERT INTO po_product_code_canonical (product_key, product_code, updated_at) VALUES (?,?,?)
+        ON CONFLICT(product_key) DO UPDATE SET product_code=excluded.product_code, updated_at=excluded.updated_at`);
+      for (const [key, v] of agg) {
+        ins.run(key, v.code, v.stock, v.alloc);
+        insCanon.run(key, v.code, now); // ロジザード登録表記=貼り付けに使う表記そのもの
+      }
+      db.prepare(`INSERT INTO po_ne_overlay_meta (id, uploaded_at, row_count, filename, source) VALUES (1,?,?,?,'logizard')
+                  ON CONFLICT(id) DO UPDATE SET uploaded_at=excluded.uploaded_at, row_count=excluded.row_count, filename=excluded.filename, source=excluded.source`)
+        .run(now, agg.size, req.file.originalname || null);
+      audit(db, { actorType: 'user', actor: actorOf(req), action: 'logizard_stock_import', resource: 'ne_overlay',
+        detail: { dataRows, products: agg.size, matched, skippedNonGood } });
+      // サイクルリセットも同一txn (在庫だけ更新されてバッジが残る片肺を防ぐ、Codex LZ-R1 Medium)
+      bumpCycleReset(actorOf(req), 'ロジザード在庫CSV取込で発注サイクル更新', now);
+    })();
+    res.json({ ok: true, products: agg.size, matched, dataRows, skippedNonGood, skippedBlank, uploadedAt: now });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
@@ -2581,10 +2657,12 @@ ${script || ''}
 
 /** データ鮮度の表示テキスト (NE=朝同期 or 手動CSV / FBA=朝同期 or live) */
 function freshnessText(pub, overlay) {
+  const ovLabel = overlay && overlay.source === 'logizard' ? 'ロジザード在庫CSV' : '手動CSV';
+  const ovNote = overlay && overlay.source === 'logizard' ? '・在庫のみ上書き' : '';
   const ne = overlay && overlay.applied
     ? (overlay.mergedCount === 0
-      ? `NE: ⚠️手動CSV ${fmtJst(overlay.uploaded_at)} — 1件も一致していません (${overlay.row_count}件中0件)。CSVを確認してください`
-      : `NE: 🟢手動CSV ${fmtJst(overlay.uploaded_at)} 取込済 (反映 ${overlay.mergedCount}/${overlay.row_count}件)`)
+      ? `NE: ⚠️${ovLabel} ${fmtJst(overlay.uploaded_at)} — 1件も一致していません (${overlay.row_count}件中0件)。CSVを確認してください`
+      : `NE: 🟢${ovLabel} ${fmtJst(overlay.uploaded_at)} 取込済 (反映 ${overlay.mergedCount}/${overlay.row_count}件${ovNote})`)
     : `NE: ${pub && pub.src_ne_products_synced_at ? fmtJst(pub.src_ne_products_synced_at) + ' (朝同期)' : '—'}`;
   const fba = pub && pub.fba_source_kind === 'live'
     ? `FBA: 🟢${fmtJst(pub.fba_fetched_at)} 取得(最新)`
@@ -2653,9 +2731,13 @@ router.get('/', (req, res) => {
     </div>
     <div class="toolbar">
       <button id="btnFba">🔄 FBA在庫を今すぐ更新</button>
-      <form id="neForm" style="display:flex;gap:6px;align-items:center">
+      <form id="neForm" style="display:flex;gap:6px;align-items:center" title="NE商品マスタDLのCSV。在庫・原価・取扱区分等を最新化">
         <input type="file" name="file" accept=".csv" required>
         <button type="submit">📥 NE最新CSVを取込</button>
+      </form>
+      <form id="lzForm" style="display:flex;gap:6px;align-items:center" title="ロジザードのロケ別在庫一覧CSV (CZ04003)。在庫数だけを最新化 (原価・取扱区分等は朝同期のまま)。商品IDの表記も蓄積されるのでロジザード貼り付けの表記が揃う">
+        <input type="file" name="file" accept=".csv" required>
+        <button type="submit">📥 ロジザード在庫CSVを取込</button>
       </form>
       ${overlay ? '<button id="btnNeClear" title="手動CSVの上書きをやめて朝同期の値に戻す">✕ CSV取込を解除</button>' : ''}
       <span id="opStatus" class="muted"></span>
@@ -2826,6 +2908,22 @@ document.getElementById('neForm').addEventListener('submit', function(ev) {
       .then(function(j) {
         if (!j.ok) { setStatus(''); alert('取込エラー: ' + j.error); return; }
         setStatus('取込完了 (' + j.rowCount + '件)。再読み込みします...');
+        location.reload();
+      })
+      .catch(function(e){ setStatus('通信エラー: ' + e.message); });
+  });
+});
+// ロジザード在庫CSV (在庫数のみ上書き。商品ID表記の蓄積も兼ねる)
+document.getElementById('lzForm').addEventListener('submit', function(ev) {
+  ev.preventDefault();
+  var fd = new FormData(ev.target);
+  confirmCycleReset(function() {
+    setStatus('ロジザード在庫CSVを取込中...');
+    fetch('/apps/purchase-orders/api/logizard-stock/csv', { method: 'POST', body: fd })
+      .then(function(r){ return r.json(); })
+      .then(function(j) {
+        if (!j.ok) { setStatus(''); alert('取込エラー: ' + j.error + (j.errors ? '\\n' + j.errors.join('\\n') : '')); return; }
+        setStatus('取込完了 (' + j.products + '商品/うちPML一致 ' + j.matched + (j.skippedNonGood ? '、良品以外' + j.skippedNonGood + '行除外' : '') + ')。再読み込みします...');
         location.reload();
       })
       .catch(function(e){ setStatus('通信エラー: ' + e.message); });

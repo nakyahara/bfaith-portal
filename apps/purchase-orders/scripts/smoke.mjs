@@ -295,6 +295,74 @@ ok(noflyComma && noflyComma.stock === 1254, 'カンマ除去して数値化 (1,2
 await j('/api/ne-overlay', { method: 'DELETE' });
 db.prepare(`UPDATE mirror_pml_snapshot_rows SET FBA在庫数=NULL WHERE 商品コード='noflyersticker'`).run();
 
+console.log('── ロジザード在庫CSV取込 (在庫数のみ上書き) ──');
+{
+  // ロケ別在庫一覧 (CZ04003) 形式: 同一商品が複数ロケ行→合算、良品のみ、PML外商品は反映されない
+  const lzHdr = '"在庫日","倉庫名","ロケ","商品ID","商品名","品質区分名","在庫数(引当数を含む)","引当数"';
+  const lzCsv = lzHdr + '\r\n' +
+    '"20260714","B-Faith","001-001-01","noflyersticker","チラシ","良品","100","5"\r\n' +
+    '"20260714","B-Faith","002-001-01","noflyersticker","チラシ","良品","60","0"\r\n' +
+    '"20260714","B-Faith","002-002-01","noflyersticker","チラシ","不良品","7","0"\r\n' +
+    '"20260714","B-Faith","003-001-01","unknown-lz-item","ロジザードだけの商品","良品","9","0"\r\n';
+  const fdLz = new FormData();
+  fdLz.append('file', new Blob([iconv.encode(lzCsv, 'Shift_JIS')]), 'CZ04003_test.csv');
+  r = await j('/api/logizard-stock/csv', { method: 'POST', body: fdLz });
+  ok(r.status === 200 && r.body.ok && r.body.products === 2 && r.body.matched === 1 && r.body.skippedNonGood === 1,
+    'ロジザード在庫CSV取込 (2商品/PML一致1/良品以外1行除外)', r.body);
+  r = await j('/api/supplier/1');
+  ok(r.body.overlay && r.body.overlay.applied === true && r.body.overlay.source === 'logizard', 'overlay: source=logizard');
+  const noflyLz = [...r.body.targets, ...r.body.candidates, ...r.body.horikoshi].find(p => p.code === 'noflyersticker');
+  ok(noflyLz && noflyLz.stock === 160, 'ロケ別在庫を商品IDごとに合算 (良品100+60=160、不良品7は除外)', noflyLz && noflyLz.stock);
+  ok(noflyLz && noflyLz.cost === 70, '在庫以外 (原価等) はPMLのまま (上書きしない)', noflyLz && noflyLz.cost);
+  ok(db.prepare("SELECT product_code FROM po_product_code_canonical WHERE product_key='unknown-lz-item'").get().product_code === 'unknown-lz-item',
+    'ロジザード商品ID表記を canonical に蓄積');
+  // ダッシュボードの鮮度表示
+  const dashLz = await (await fetch(base + '/')).text();
+  ok(dashLz.includes('ロジザード在庫CSV') && dashLz.includes('在庫のみ上書き'), '/ 鮮度表示にロジザード在庫CSVラベル');
+  ok(dashLz.includes('lzForm') && dashLz.includes('ロジザード在庫CSVを取込'), '/ ロジザード在庫CSV取込フォーム');
+  // 在庫数が数値でない行は全件rollback (既存overlayはlogizardのまま)
+  const fdLzBad = new FormData();
+  fdLzBad.append('file', new Blob([iconv.encode(lzHdr + '\r\n"20260714","B-Faith","001","a1","x","良品","abc","0"\r\n', 'Shift_JIS')]), 'bad.csv');
+  r = await j('/api/logizard-stock/csv', { method: 'POST', body: fdLzBad });
+  ok(r.status === 400 && r.body.errors && r.body.errors.length === 1, 'ロジザードCSV数値不正は全件rollback + errors');
+  // 空欄在庫は0扱いにせず拒否 (欠損データで実在庫を0上書きしない)。良品以外の行の不正値も検出
+  const fdLzEmpty = new FormData();
+  fdLzEmpty.append('file', new Blob([iconv.encode(lzHdr + '\r\n"20260714","B-Faith","001","a1","x","良品","",""\r\n', 'Shift_JIS')]), 'empty.csv');
+  r = await j('/api/logizard-stock/csv', { method: 'POST', body: fdLzEmpty });
+  ok(r.status === 400, 'ロジザードCSV空欄在庫は400 (0扱いしない)');
+  const fdLzNegBad = new FormData();
+  fdLzNegBad.append('file', new Blob([iconv.encode(lzHdr + '\r\n"20260714","B-Faith","001","a1","x","不良品","xyz","0"\r\n"20260714","B-Faith","002","a2","x","良品","3","0"\r\n', 'Shift_JIS')]), 'negbad.csv');
+  r = await j('/api/logizard-stock/csv', { method: 'POST', body: fdLzNegBad });
+  ok(r.status === 400, 'ロジザードCSV: 良品以外の行の不正在庫も検出 (検証が除外より先)');
+  // 全行が良品以外 → 有効0件で400
+  const fdLzAllBad = new FormData();
+  fdLzAllBad.append('file', new Blob([iconv.encode(lzHdr + '\r\n"20260714","B-Faith","001","a1","x","不良品","5","0"\r\n', 'Shift_JIS')]), 'allbad.csv');
+  r = await j('/api/logizard-stock/csv', { method: 'POST', body: fdLzAllBad });
+  ok(r.status === 400 && r.body.error.includes('有効な行'), 'ロジザードCSV: 全行良品以外は400');
+  // 品質区分名の列が無いCSVは全行を在庫に合算 (警告なしの簡易形式)
+  const fdLzNoQ = new FormData();
+  fdLzNoQ.append('file', new Blob([iconv.encode('"商品ID","在庫数(引当数を含む)"\r\n"noflyersticker","70"\r\n"noflyersticker","0"\r\n', 'Shift_JIS')]), 'noq.csv');
+  r = await j('/api/logizard-stock/csv', { method: 'POST', body: fdLzNoQ });
+  ok(r.body.ok && r.body.products === 1, 'ロジザードCSV: 品質区分列なしは全行合算 (0在庫行もOK)');
+  r = await j('/api/supplier/1');
+  {
+    const nfq = [...r.body.targets, ...r.body.candidates, ...r.body.horikoshi].find(p => p.code === 'noflyersticker');
+    ok(nfq && nfq.stock === 70, 'ロジザードCSV: 再取込で置換 (70+0=70)', nfq && nfq.stock);
+  }
+  // ロジザード取込→NE取込で source が ne に戻る (鮮度表示の出し分け)
+  const fdNeAfter = new FormData();
+  fdNeAfter.append('file', new Blob([iconv.encode('"商品コード","在庫数","発注残数"\r\n"noflyersticker","55","0"\r\n', 'Shift_JIS')]), 'ne-after.csv');
+  r = await j('/api/ne-overlay/csv', { method: 'POST', body: fdNeAfter });
+  r = await j('/api/supplier/1');
+  ok(r.body.overlay && r.body.overlay.source === 'ne' && r.body.overlay.applied === true, 'NE取込で source=ne に戻る (後勝ち)', r.body.overlay && r.body.overlay.source);
+  // 見出し不正
+  const fdLzHdr = new FormData();
+  fdLzHdr.append('file', new Blob(['foo,bar\r\n1,2\r\n']), 'x.csv');
+  r = await j('/api/logizard-stock/csv', { method: 'POST', body: fdLzHdr });
+  ok(r.status === 400 && r.body.error.includes('商品ID'), 'ロジザードCSV見出し不正は400');
+  await j('/api/ne-overlay', { method: 'DELETE' });
+}
+
 console.log('── 生スプシCSV 自動判別取込 + 文字コード ──');
 // 生の「発注条件マスタ」スプレッドシートDL形式 (列名が仕入先/商品グループID管理名 等)。商品名に壊れ文字 � を混ぜる
 const rawShohin = '商品コード,商品名,確認FLG,仕入先,仕入れ先名,商品グループID,商品グループID管理名,原料グループID,原料グループID管理名,容量/個,取扱区分,原価,発注ロット単位,ケースグループ,ケースロット\r\n' +

@@ -124,7 +124,7 @@ export function loadPmlMerged() {
         const b = Date.parse(pub.src_ne_products_synced_at);
         if (!Number.isNaN(a) && !Number.isNaN(b) && a < b) applied = false; // 朝同期の方が新しい
       }
-      overlay = { uploaded_at: ov.meta.uploaded_at, row_count: ov.meta.row_count, filename: ov.meta.filename, applied, mergedCount: 0 };
+      overlay = { uploaded_at: ov.meta.uploaded_at, row_count: ov.meta.row_count, filename: ov.meta.filename, source: ov.meta.source || 'ne', applied, mergedCount: 0 };
     }
     const merged = !applied ? rows : rows.map(r => {
       const o = ov.rows.get(normProductCode(r['商品コード']));
