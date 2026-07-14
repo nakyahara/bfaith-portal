@@ -2589,6 +2589,25 @@ console.log('── 入庫取込プレビュー+一括割当 ──');
   ok(db.prepare('SELECT next_expected_date FROM po_order_items WHERE id=?').get(m1.orderItemId).next_expected_date === '2026-08-01',
     'multi commit: 残数の扱いは最終行の内容で1回だけ設定');
 
+  // 全量契約: 提案より少ない数量/同一入庫行の重複指定は拒否 (Codex inb-R3 Medium)
+  r = await up2('ac.csv', [HDR2, ['AC400', 'aa-multi-item', 'x', '0001', '200', '4', '0', '2026/07/14']]);
+  r = await j('/api/inbound/auto-assign/preview');
+  const m3 = r.body.proposals.find(p => p.slip === 'AC400');
+  ok(m3 && m3.qty === 4, 'partial-guard: 新提案 (4個全量)');
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: m3.inboundItemId, orderItemId: m3.orderItemId, qty: 2 },
+  ] }, 'aa-key-partial');
+  ok(r.status === 400 && r.body.error.includes('一致しません'), 'auto commit: 全量未満の数量は拒否 (契約=未割当の全量)', r.body.error);
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: m3.inboundItemId, orderItemId: m3.orderItemId, qty: 4, remainder: { action: 'await_confirmation', nextActionDate: '2026-08-05' } },
+    { inboundItemId: m3.inboundItemId, orderItemId: m3.orderItemId, qty: 4, remainder: { action: 'await_confirmation', nextActionDate: '2026-08-05' } },
+  ] }, 'aa-key-dupinb');
+  ok(r.status === 400 && r.body.error.includes('複数回'), 'auto commit: 同一入庫行の重複指定は拒否');
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: m3.inboundItemId, orderItemId: m3.orderItemId, qty: 4, remainder: { action: 'await_confirmation', nextActionDate: '2026-08-05' } },
+  ] }, 'aa-key-3');
+  ok(r.body.ok && r.body.assigned === 1, 'auto commit: 全量なら成功 (確認中+期限)');
+
   // 画面: プレビュー/一括割当UI配信
   const inbHtml4 = await (await fetch(base + '/inbound')).text();
   ok(inbHtml4.includes('autoAssignBtn') && inbHtml4.includes('この内容で取り込む') && inbHtml4.includes('一括割当の確認'),

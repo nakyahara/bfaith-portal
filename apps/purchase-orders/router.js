@@ -852,11 +852,14 @@ router.post('/api/inbound/auto-assign', (req, res) => {
     assignments.forEach((a, idx) => lastIdxByItem.set(Number(a && a.orderItemId), idx));
     const run = () => db.transaction(() => {
       const results = [];
+      const seenInbound = new Set(); // 同一入庫行の重複指定 (分割割当の細工) は拒否 (Codex inb-R3 Medium)
       for (let idx = 0; idx < assignments.length; idx++) {
         const a = assignments[idx];
         const iid = Number(a && a.inboundItemId), oid = Number(a && a.orderItemId), qty = Number(a && a.qty);
         if (!Number.isSafeInteger(iid) || iid <= 0 || !Number.isSafeInteger(oid) || oid <= 0) throw new Error('割当の指定が不正です');
         if (!Number.isInteger(qty) || qty <= 0) throw new Error(`数量が不正です (入庫明細 ${iid})`);
+        if (seenInbound.has(iid)) throw new Error(`同じ入庫明細が複数回指定されています (${iid})`);
+        seenInbound.add(iid);
         const inbound = db.prepare(`
           SELECT i.id, i.good_qty, i.superseded, r.receipt_date, r.source_key AS slip, i.product_code,
                  (SELECT COUNT(*) FROM po_inbound_ignores g WHERE g.inbound_item_id=i.id AND g.revoked_at IS NULL) AS ignored
@@ -871,7 +874,8 @@ router.post('/api/inbound/auto-assign', (req, res) => {
         if (chk.candidates.length !== 1 || chk.candidates[0].orderItemId !== oid) {
           throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 割当先の候補が変わっています。画面を更新してやり直してください`);
         }
-        if (qty > chk.item.capacity) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 入庫の未割当(${chk.item.capacity})を超えています (画面を更新してやり直してください)`);
+        // ⚡一括割当の契約は「未割当入庫の全量割当」。部分量や過少の細工は拒否 (Codex inb-R3 Medium)
+        if (qty !== chk.item.capacity) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 数量(${qty})が入庫の未割当(${chk.item.capacity})と一致しません (画面を更新してやり直してください)`);
         if (qty > chk.candidates[0].remaining) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: PO残(${chk.candidates[0].remaining})を超えています (画面を更新してやり直してください)`);
         const ev = appendPoItemEvent({
           orderItemId: oid, eventType: 'receipt', qty,
