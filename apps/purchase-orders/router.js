@@ -896,10 +896,11 @@ router.post('/api/inbound/auto-assign', (req, res) => {
           //   0 < keepQty < 残数      → 差分を減数し、残す分は分納待ち/確認中
           // 減数は確認画面で人間が行ごとに選んだ結果のみ (自動判断はしない)
           let plan = null;
-          if (lastIdxByItem.get(oid) === idx && ev.remaining > 0) {
+          if (lastIdxByItem.get(oid) === idx && (ev.remaining > 0 || (a.remainder && a.remainder.keepQty != null))) {
             const r = a.remainder || {};
-            const keep = r.keepQty == null ? ev.remaining : Number(r.keepQty);
-            if (!Number.isInteger(keep) || keep < 0 || keep > ev.remaining) {
+            // keepQtyはJSON number型の整数のみ。残0でも指定があれば範囲検証する (契約=0〜残数、Codex keep-R1 Medium)
+            const keep = r.keepQty == null ? ev.remaining : r.keepQty;
+            if (typeof keep !== 'number' || !Number.isInteger(keep) || keep < 0 || keep > ev.remaining) {
               throw new Error(`残す数(${r.keepQty})が不正です (0〜${ev.remaining})`);
             }
             const cut = ev.remaining - keep;

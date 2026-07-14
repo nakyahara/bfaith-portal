@@ -2645,6 +2645,27 @@ console.log('── 入庫取込プレビュー+一括割当 ──');
   ok(k2bal.remaining_qty === 5 && k2bal.shortage_qty === 7, 'keepQty=5: 7減数+残5', k2bal);
   const k2item = db.prepare('SELECT remainder_disposition, next_expected_qty FROM po_order_items WHERE id=?').get(k2.orderItemId);
   ok(k2item.remainder_disposition === 'awaiting_delivery' && k2item.next_expected_qty === 5, 'keepQty=5: 分納待ち(次回5)が設定される', k2item);
+  // 全量入荷 (残0) でも keepQty 指定があれば範囲検証 (Codex keep-R1 Medium)
+  insRow.run('aa-keep3-item', '全量+keep指定テスト', '0001', '取扱中', 2, 0, 0, 0, 0, 10, 1.5, 400, 200, '2026-07-01', '2026-01-01');
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'aa-keep3-item', qty: 6 }] }) });
+  r = await up2('ae.csv', [HDR2, ['AE600', 'aa-keep3-item', 'x', '0001', '200', '6', '0', '2026/07/14']]);
+  r = await j('/api/inbound/auto-assign/preview');
+  const k3 = r.body.proposals.find(p2 => p2.slip === 'AE600');
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: k3.inboundItemId, orderItemId: k3.orderItemId, qty: 6, remainder: { keepQty: 99 } },
+  ] }, 'aa-keep3-bad');
+  ok(r.status === 400 && r.body.error.includes('残す数'), 'keepQty: 全量入荷 (残0) でも範囲外keepQtyは400', r.body.error);
+  ok(db.prepare('SELECT remaining_qty FROM v_po_item_balance WHERE order_item_id=?').get(k3.orderItemId).remaining_qty === 6,
+    'keepQty: 400時は全ロールバック (未割当のまま)');
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: k3.inboundItemId, orderItemId: k3.orderItemId, qty: 6, remainder: { keepQty: '0' } },
+  ] }, 'aa-keep3-str');
+  ok(r.status === 400, 'keepQty: 文字列は拒否 (JSON number型の整数のみ)');
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: k3.inboundItemId, orderItemId: k3.orderItemId, qty: 6, remainder: { keepQty: 0 } },
+  ] }, 'aa-keep3-ok');
+  ok(r.body.ok && r.body.assigned === 1, 'keepQty: 全量入荷+keepQty=0は成功 (残0=減数なし)');
 
   // 画面: プレビュー/一括割当UI配信
   const inbHtml4 = await (await fetch(base + '/inbound')).text();
