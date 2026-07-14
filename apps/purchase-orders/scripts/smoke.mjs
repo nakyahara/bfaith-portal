@@ -2530,11 +2530,13 @@ console.log('── 入庫取込プレビュー+一括割当 ──');
   r = await j('/api/inbound');
   ok(r.body.open.find(x => x.slip === 'AA101').allocated === 0, 'auto commit: 失敗時は全ロールバック (片方も未割当のまま)');
 
-  // 部分入荷で残数の扱い未指定はエラー (減数は選択肢に無い)
+  // 残数の扱いに不正なactionは400 (省略/deferは「📌あとで決める」で通る — 後段でテスト)
   r = await jpA('/api/inbound/auto-assign', { assignments: [
-    { inboundItemId: pNiku.inboundItemId, orderItemId: pNiku.orderItemId, qty: 5 },
+    { inboundItemId: pNiku.inboundItemId, orderItemId: pNiku.orderItemId, qty: 5, remainder: { action: 'shortage' } },
   ] }, 'aa-key-norem');
-  ok(r.status === 400 && r.body.error.includes('分納待ち/確認中'), 'auto commit: 部分入荷は残数の扱い必須');
+  ok(r.status === 400 && r.body.error.includes('分納待ち/確認中'), 'auto commit: 不正なaction (shortage等) は400', r.body.error);
+  r = await j('/api/inbound');
+  ok(r.body.open.find(x => x.slip === 'AA101').allocated === 0, 'auto commit: 不正action時も全ロールバック');
 
   // 正常実行: 全量+部分(分納待ち)
   r = await jpA('/api/inbound/auto-assign', { assignments: [
@@ -2667,10 +2669,59 @@ console.log('── 入庫取込プレビュー+一括割当 ──');
   ] }, 'aa-keep3-ok');
   ok(r.body.ok && r.body.assigned === 1, 'keepQty: 全量入荷+keepQty=0は成功 (残0=減数なし)');
 
+  // ── defer (📌あとで決める): 次回入荷予定日なしで割当できる (中原さん要望 2026-07-14) ──
+  insRow.run('aa-defer-item', '予定日未定テスト商品', '0001', '取扱中', 2, 0, 0, 0, 0, 10, 1.5, 400, 200, '2026-07-01', '2026-01-01');
+  insRow.run('aa-defer2-item', '予定日未定+一部残しテスト', '0001', '取扱中', 2, 0, 0, 0, 0, 10, 1.5, 400, 200, '2026-07-01', '2026-01-01');
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'aa-defer-item', qty: 30 }, { code: 'aa-defer2-item', qty: 20 }] }) });
+  ok(r.body.ok !== false, 'defer: テスト用PO作成');
+  r = await up2('af.csv', [HDR2,
+    ['AF700', 'aa-defer-item', 'x', '0001', '200', '18', '0', '2026/07/14'],
+    ['AF701', 'aa-defer2-item', 'x', '0001', '200', '8', '0', '2026/07/14']]);
+  r = await j('/api/inbound/auto-assign/preview');
+  const d1 = r.body.proposals.find(p2 => p2.slip === 'AF700');
+  const d2 = r.body.proposals.find(p2 => p2.slip === 'AF701');
+  ok(d1 && d1.postRemaining === 12 && d2 && d2.postRemaining === 12, 'defer: 提案 (18/30=残12, 8/20=残12)');
+  // remainder省略=defer / 明示defer+keepQty=5 (日付は一切不要)
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: d1.inboundItemId, orderItemId: d1.orderItemId, qty: 18 },
+    { inboundItemId: d2.inboundItemId, orderItemId: d2.orderItemId, qty: 8, remainder: { action: 'defer', keepQty: 5 } },
+  ] }, 'aa-defer-1');
+  ok(r.body.ok && r.body.assigned === 2, 'defer: 日付なしで割当できる (remainder省略/明示defer)', r.body);
+  const dBal1 = db.prepare('SELECT remaining_qty FROM v_po_item_balance WHERE order_item_id=?').get(d1.orderItemId);
+  const dIt1 = db.prepare('SELECT remainder_disposition FROM po_order_items WHERE id=?').get(d1.orderItemId);
+  ok(dBal1.remaining_qty === 12 && dIt1.remainder_disposition === null, 'defer: 注残12・扱い未選択のまま残る', [dBal1.remaining_qty, dIt1.remainder_disposition]);
+  const dBal2 = db.prepare('SELECT remaining_qty, shortage_qty FROM v_po_item_balance WHERE order_item_id=?').get(d2.orderItemId);
+  const dIt2 = db.prepare('SELECT remainder_disposition FROM po_order_items WHERE id=?').get(d2.orderItemId);
+  ok(dBal2.remaining_qty === 5 && dBal2.shortage_qty === 7 && dIt2.remainder_disposition === null,
+    'defer+keepQty=5: 7減数+残5・扱い未選択', dBal2);
+  // 発注残「要対応」に扱い未選択 (needsDisposition) で載る
+  r = await j('/api/backorders');
+  const dRow = (r.body.orders || []).flatMap(o => o.items || []).find(it => it.id === d1.orderItemId);
+  ok(dRow && dRow.flags && dRow.flags.needsDisposition === true, 'defer: 要対応「扱い未選択」に表示される', dRow && dRow.flags);
+  // 既存の分納待ち予定 (次回12) がある明細に defer で追加入荷 → 次回予定数量を残数に自動調整 (整合性検査を汚さない)
+  r = await j('/api/items/' + d1.orderItemId + '/plan', { method: 'PATCH', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': 'aa-defer-plan' },
+    body: JSON.stringify({ disposition: 'awaiting_delivery', nextExpectedDate: '2026-08-20', nextExpectedQty: 12 }) });
+  ok(r.body.ok, 'defer: 事前に分納待ち(次回12)を設定');
+  r = await up2('ag.csv', [HDR2, ['AG800', 'aa-defer-item', 'x', '0001', '200', '7', '0', '2026/07/15']]);
+  r = await j('/api/inbound/auto-assign/preview');
+  const d3 = r.body.proposals.find(p2 => p2.slip === 'AG800');
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: d3.inboundItemId, orderItemId: d3.orderItemId, qty: 7, remainder: { action: 'defer' } },
+  ] }, 'aa-defer-2');
+  ok(r.body.ok, 'defer: 既存分納待ちの明細にも割当できる', r.body);
+  const dIt3 = db.prepare('SELECT remainder_disposition, next_expected_date, next_expected_qty FROM po_order_items WHERE id=?').get(d1.orderItemId);
+  ok(dIt3.remainder_disposition === 'awaiting_delivery' && dIt3.next_expected_qty === 5 && dIt3.next_expected_date === '2026-08-20',
+    'defer: 既存の扱いは維持し次回予定数量だけ残数(5)に調整', dIt3);
+  r = await j('/api/ledger/integrity');
+  ok(r.body.ok && !r.body.issues.some(i2 => i2.kind === 'disposition_rule' && i2.itemId === d1.orderItemId),
+    'defer: 調整後は整合性検査にdisposition_ruleが出ない');
+
   // 画面: プレビュー/一括割当UI配信
   const inbHtml4 = await (await fetch(base + '/inbound')).text();
   ok(inbHtml4.includes('autoAssignBtn') && inbHtml4.includes('この内容で取り込む') && inbHtml4.includes('一括割当の確認'),
     '/inbound プレビュー+一括割当UI配信');
+  ok(inbHtml4.includes('あとで決める'), '/inbound 一括割当に📌あとで決める選択肢');
 }
 
 // ═══ 全ページのインラインJS構文チェック (サーバtemplate literal内クライアントJSの括弧崩れ等を機械検出) ═══

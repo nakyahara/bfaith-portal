@@ -913,9 +913,22 @@ router.post('/api/inbound/auto-assign', (req, res) => {
               ev.remaining = sh.remaining; ev.orderClosed = sh.orderClosed;
             }
             if (keep > 0) {
-              plan = applyRemainderChoice({ itemId: oid, ev,
-                remainder: { action: r.action, nextExpectedDate: r.nextExpectedDate, nextExpectedQty: keep, nextActionDate: r.nextActionDate },
-                eventDate: inbound.receipt_date || null, actor, allowedActions: ['await_delivery', 'await_confirmation'] });
+              // action省略/'defer'=📌あとで決める: 次回入荷予定日は発注側で把握できないことが多い (中原さん要望 2026-07-14)。
+              // dispositionは変更せず注残に残す → 未選択なら発注残「要対応」の扱い未選択に載り、後から選べる
+              const act = r.action == null ? 'defer' : r.action;
+              if (act === 'defer') {
+                // 既存の分納待ち予定数量が今回の入荷で残数を超えた場合だけ残数に合わせる
+                // (放置すると整合性検査 disposition_rule「次回予定数量>残数」になる)
+                const cur = db.prepare('SELECT remainder_disposition, next_expected_qty FROM po_order_items WHERE id=?').get(oid);
+                if (cur && cur.remainder_disposition === 'awaiting_delivery' && cur.next_expected_qty != null && cur.next_expected_qty > ev.remaining) {
+                  plan = setItemPlan(oid, { next_expected_qty: ev.remaining },
+                    { note: '一括割当: 入荷により次回予定数量を残数に調整', actorType: 'user', actor });
+                }
+              } else {
+                plan = applyRemainderChoice({ itemId: oid, ev,
+                  remainder: { action: act, nextExpectedDate: r.nextExpectedDate, nextExpectedQty: keep, nextActionDate: r.nextActionDate },
+                  eventDate: inbound.receipt_date || null, actor, allowedActions: ['await_delivery', 'await_confirmation'] });
+              }
             }
           }
           results.push({ inboundItemId: iid, orderItemId: oid, qty, remaining: ev.remaining, plan: plan ? plan.remainder_disposition || true : null });
@@ -4201,7 +4214,7 @@ document.getElementById('autoAssignBtn').addEventListener('click', function() {
     var h = '<div style="display:flex;align-items:center;gap:10px"><h2 style="margin:0">⚡ 一括割当の確認</h2>' +
       '<button class="ghost" id="inbModalClose" style="margin-left:auto">✕ 閉じる</button></div>' +
       '<div class="hint">候補が1つに確定した入庫だけを自動で割り当てます。割当後にPO残が残る行は「<b>残す数</b>」を確認してください:<br>' +
-      'そのまま=分納待ち/確認中で注残に残す ・ <b>0にする=残数を全て減数で消して完了</b> (原料不足で作れなかった等) ・ 途中の数=差分だけ減数して一部を残す。</div>';
+      'そのまま=注残に残す (📌あとで決める=日付入力なし。🚚分納待ち/❓確認中を選ぶと予定日を記録) ・ <b>0にする=残数を全て減数で消して完了</b> (原料不足で作れなかった等) ・ 途中の数=差分だけ減数して一部を残す。</div>';
     if (j.proposals.length) {
       h += '<div style="overflow-x:auto;max-height:45vh;overflow-y:auto"><table class="t"><tr><th>伝票NO</th><th>商品</th><th class="r">割当数</th><th>割当先PO</th><th class="r">PO残→割当後</th><th>残数の扱い</th></tr>' +
         j.proposals.map(function(p, i) {
@@ -4212,7 +4225,7 @@ document.getElementById('autoAssignBtn').addEventListener('click', function() {
             '<td>' + (p.needsRemainder
               ? '残す <input type="number" class="aaKeep" data-idx="' + i + '" value="' + p.postRemaining + '" min="0" max="' + p.postRemaining + '" step="1" style="width:70px"> / ' + p.postRemaining +
                 ' <span class="aaOpts" data-idx="' + i + '">' +
-                '<select class="aaRem" data-idx="' + i + '"><option value="await_delivery">🚚 分納待ち</option><option value="await_confirmation">❓ 確認中</option></select> ' +
+                '<select class="aaRem" data-idx="' + i + '"><option value="defer">📌 あとで決める</option><option value="await_delivery">🚚 分納待ち</option><option value="await_confirmation">❓ 確認中</option></select> ' +
                 '<input type="date" class="aaDate" data-idx="' + i + '" value="' + esc(p.due ? String(p.due).slice(0, 10) : '') + '" title="分納待ち=次回入荷予定日 / 確認中=確認期限"></span>' +
                 '<div class="muted aaHint" data-idx="' + i + '" style="font-size:11px"></div>'
               : '<span class="muted">' + (p.postRemaining > 0 ? '(同一POの最終行で選択)' : 'なし (全量)') + '</span>') + '</td></tr>';
@@ -4243,18 +4256,31 @@ document.getElementById('autoAssignBtn').addEventListener('click', function() {
       var keep = keepEl.value === '' ? NaN : Number(keepEl.value);
       var opts = document.querySelector('.aaOpts[data-idx="' + i + '"]');
       var hint = document.querySelector('.aaHint[data-idx="' + i + '"]');
+      var sel = document.querySelector('.aaRem[data-idx="' + i + '"]');
+      var dt = document.querySelector('.aaDate[data-idx="' + i + '"]');
       var valid = Number.isInteger(keep) && keep >= 0 && keep <= p.postRemaining;
       if (!valid) { if (hint) hint.textContent = '⚠️ 0〜' + p.postRemaining + ' で入力してください'; return; }
       if (opts) opts.style.display = keep > 0 ? '' : 'none';
-      if (hint) hint.textContent = keep === 0
-        ? '➖ 残数 ' + p.postRemaining + ' を全て減数で消して完了します (作れなかった分)'
-        : (keep < p.postRemaining ? '➖ 差分 ' + (p.postRemaining - keep) + ' を減数し、' + keep + ' を注残に残します' : '');
+      // 📌あとで決める=日付入力なし (次回入荷予定日が分からなくても割当できる、中原さん要望 2026-07-14)
+      if (dt) dt.style.display = (sel && sel.value !== 'defer') ? '' : 'none';
+      if (hint) {
+        if (keep === 0) {
+          hint.textContent = '➖ 残数 ' + p.postRemaining + ' を全て減数で消して完了します (作れなかった分)';
+        } else {
+          var parts = [];
+          if (keep < p.postRemaining) parts.push('➖ 差分 ' + (p.postRemaining - keep) + ' を減数し、' + keep + ' を注残に残します');
+          if (!sel || sel.value === 'defer') parts.push('📌 扱いは発注残ページで後から選べます (要対応に表示)');
+          hint.textContent = parts.join(' ');
+        }
+      }
     }
     j.proposals.forEach(function(p, i) {
       if (!p.needsRemainder) return;
       aaSync(i);
       var keepEl = document.querySelector('.aaKeep[data-idx="' + i + '"]');
       if (keepEl) keepEl.addEventListener('input', function(){ aaSync(i); });
+      var selEl = document.querySelector('.aaRem[data-idx="' + i + '"]');
+      if (selEl) selEl.addEventListener('change', function(){ aaSync(i); });
     });
     var go = document.getElementById('aaGo');
     if (go) go.addEventListener('click', function() {
@@ -4274,7 +4300,11 @@ document.getElementById('autoAssignBtn').addEventListener('click', function() {
         }
         var sel = document.querySelector('.aaRem[data-idx="' + i + '"]');
         var dt = document.querySelector('.aaDate[data-idx="' + i + '"]');
-        var action = sel ? sel.value : 'await_delivery';
+        var action = sel ? sel.value : 'defer';
+        if (action === 'defer') {
+          // 📌あとで決める: 日付なしで注残に残す (扱いは発注残ページで後から選択)
+          return { inboundItemId: p.inboundItemId, orderItemId: p.orderItemId, qty: p.qty, remainder: { keepQty: keep, action: 'defer' } };
+        }
         if (!dt || !dt.value) { bad = p.productCode + ': ' + (action === 'await_delivery' ? '次回入荷予定日' : '確認期限') + 'を入力してください'; }
         return { inboundItemId: p.inboundItemId, orderItemId: p.orderItemId, qty: p.qty,
           remainder: action === 'await_delivery'
