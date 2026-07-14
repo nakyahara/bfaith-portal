@@ -313,8 +313,14 @@ const sessionMiddleware = session({
   secret: SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
+  // rolling: 使っている間はセッションを延長 (maxAge=無操作24時間で失効)。
+  // 従来は「ログインから固定24時間」で、CSV取込の途中など作業の真ん中で session_expired になった
+  // (2026-07-14 発注補助のロジザード取込で実発生)。store.touch (期限UPDATE) は resave:false+touch実装
+  // ストアでは従来から毎リクエスト実行されており、rolling で新たに増えるのは毎応答の Set-Cookie
+  // (ブラウザ側Cookie期限の更新=ストア側期限との一致) のみ
+  rolling: true,
   cookie: {
-    maxAge: 1 * 24 * 60 * 60 * 1000, // 1日間
+    maxAge: 1 * 24 * 60 * 60 * 1000, // 無操作24時間
     httpOnly: true,
     secure: true,
     sameSite: 'lax',
