@@ -4239,7 +4239,8 @@ document.getElementById('autoAssignBtn').addEventListener('click', function() {
       var keepEl = document.querySelector('.aaKeep[data-idx="' + i + '"]');
       if (!keepEl) return;
       var p = j.proposals[i];
-      var keep = Number(keepEl.value);
+      // 空欄はNumber('')=0に化けて「全量減数」と誤解釈されるため不正扱い (Codex keep-R2 High)
+      var keep = keepEl.value === '' ? NaN : Number(keepEl.value);
       var opts = document.querySelector('.aaOpts[data-idx="' + i + '"]');
       var hint = document.querySelector('.aaHint[data-idx="' + i + '"]');
       var valid = Number.isInteger(keep) && keep >= 0 && keep <= p.postRemaining;
@@ -4261,7 +4262,8 @@ document.getElementById('autoAssignBtn').addEventListener('click', function() {
       var assignments = j.proposals.map(function(p, i) {
         if (!p.needsRemainder) return { inboundItemId: p.inboundItemId, orderItemId: p.orderItemId, qty: p.qty, remainder: null };
         var keepEl = document.querySelector('.aaKeep[data-idx="' + i + '"]');
-        var keep = Number(keepEl ? keepEl.value : p.postRemaining);
+        // 空欄はNumber('')=0=「全量減数」に化ける事故を防ぐ (Codex keep-R2 High)
+        var keep = (!keepEl || keepEl.value === '') ? NaN : Number(keepEl.value);
         if (!Number.isInteger(keep) || keep < 0 || keep > p.postRemaining) {
           bad = p.productCode + ': 残す数は 0〜' + p.postRemaining + ' で入力してください';
           return null;
