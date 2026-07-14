@@ -2716,6 +2716,27 @@ console.log('── 入庫取込プレビュー+一括割当 ──');
   r = await j('/api/ledger/integrity');
   ok(r.body.ok && !r.body.issues.some(i2 => i2.kind === 'disposition_rule' && i2.itemId === d1.orderItemId),
     'defer: 調整後は整合性検査にdisposition_ruleが出ない');
+  // 不正actionは適用条件の外 (keepQty=0/残0) でも400 (減数だけ実行される素通り防止、Codex defer-R1 Medium)
+  insRow.run('aa-act-item', '不正action検証テスト', '0001', '取扱中', 2, 0, 0, 0, 0, 10, 1.5, 400, 200, '2026-07-01', '2026-01-01');
+  insRow.run('aa-act2-item', '不正action検証テスト2', '0001', '取扱中', 2, 0, 0, 0, 0, 10, 1.5, 400, 200, '2026-07-01', '2026-01-01');
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'aa-act-item', qty: 10 }, { code: 'aa-act2-item', qty: 5 }] }) });
+  r = await up2('ah.csv', [HDR2,
+    ['AH900', 'aa-act-item', 'x', '0001', '200', '4', '0', '2026/07/15'],
+    ['AH901', 'aa-act2-item', 'x', '0001', '200', '5', '0', '2026/07/15']]);
+  r = await j('/api/inbound/auto-assign/preview');
+  const x1 = r.body.proposals.find(p2 => p2.slip === 'AH900');
+  const x2 = r.body.proposals.find(p2 => p2.slip === 'AH901');
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: x1.inboundItemId, orderItemId: x1.orderItemId, qty: 4, remainder: { keepQty: 0, action: 'nonsense' } },
+  ] }, 'aa-act-1');
+  ok(r.status === 400 && r.body.error.includes('残数の扱いが不正'), '不正action: keepQty=0でも400 (減数実行させない)', r.body.error);
+  ok(db.prepare('SELECT remaining_qty FROM v_po_item_balance WHERE order_item_id=?').get(x1.orderItemId).remaining_qty === 10,
+    '不正action: ロールバック (残10のまま)');
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: x2.inboundItemId, orderItemId: x2.orderItemId, qty: 5, remainder: { action: 'bogus' } },
+  ] }, 'aa-act-2');
+  ok(r.status === 400 && r.body.error.includes('残数の扱いが不正'), '不正action: 全量入荷 (残0) でも400', r.body.error);
 
   // 画面: プレビュー/一括割当UI配信
   const inbHtml4 = await (await fetch(base + '/inbound')).text();

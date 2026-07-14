@@ -881,6 +881,12 @@ router.post('/api/inbound/auto-assign', (req, res) => {
         // ⚡一括割当の契約は「未割当入庫の全量割当」。部分量や過少の細工は拒否 (Codex inb-R3 Medium)
         if (qty !== chk.item.capacity) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 数量(${qty})が入庫の未割当(${chk.item.capacity})と一致しません (画面を更新してやり直してください)`);
         if (qty > chk.candidates[0].remaining) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: PO残(${chk.candidates[0].remaining})を超えています (画面を更新してやり直してください)`);
+        // remainder.action は値の正当性だけ先に検証する。適用条件 (最終行・keep>0) の外でも不正値は400
+        // (keepQty=0 や残0では適用されず素通りし、減数だけ実行されてしまう、Codex defer-R1 Medium)
+        const rAct = a.remainder && a.remainder.action != null ? a.remainder.action : null;
+        if (rAct != null && rAct !== 'defer' && rAct !== 'await_delivery' && rAct !== 'await_confirmation') {
+          throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 残数の扱いが不正です: ${rAct} (分納待ち/確認中/あとで決めるのみ)`);
+        }
         // イベント/三択の内部エラーにも「どの行か」を必ず付ける (どこで失敗したか分からないと直せない、中原さん報告 2026-07-14)
         try {
           const ev = appendPoItemEvent({
