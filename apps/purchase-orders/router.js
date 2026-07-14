@@ -844,7 +844,8 @@ router.post('/api/inbound/auto-assign', (req, res) => {
     const canonical = assignments.map(a => ({
       inboundItemId: Number(a && a.inboundItemId), orderItemId: Number(a && a.orderItemId), qty: Number(a && a.qty),
       remainder: a && a.remainder ? {
-        action: a.remainder.action,
+        action: a.remainder.action ?? null,
+        keepQty: a.remainder.keepQty ?? null,
         nextExpectedDate: a.remainder.nextExpectedDate || null,
         nextExpectedQty: a.remainder.nextExpectedQty ?? null,
         nextActionDate: a.remainder.nextActionDate || null,
@@ -888,12 +889,34 @@ router.post('/api/inbound/auto-assign', (req, res) => {
             note: null, effectiveDate: inbound.receipt_date || null,
             actorType: 'user', actor,
           });
-          // 一括では「減数で完了」は選ばせない (数量を減らす判断は自動処理にさせない)。
-          // 残数の扱いは同一PO明細グループの最後の行でのみ適用
+          // 残数の扱いは同一PO明細グループの最後の行でのみ適用。
+          // keepQty=「注残に残す数」(中原さん要望 2026-07-14: 原料不足で作れなかった分を減数で消す/一部だけ残す):
+          //   keepQty = 残数全部 (既定) → 従来どおり分納待ち/確認中
+          //   keepQty = 0             → 残数を全て減数 (supplier_shortage) で消して完了
+          //   0 < keepQty < 残数      → 差分を減数し、残す分は分納待ち/確認中
+          // 減数は確認画面で人間が行ごとに選んだ結果のみ (自動判断はしない)
           let plan = null;
-          if (lastIdxByItem.get(oid) === idx) {
-            plan = applyRemainderChoice({ itemId: oid, ev, remainder: a.remainder, eventDate: inbound.receipt_date || null,
-              actor, allowedActions: ['await_delivery', 'await_confirmation'] });
+          if (lastIdxByItem.get(oid) === idx && (ev.remaining > 0 || (a.remainder && a.remainder.keepQty != null))) {
+            const r = a.remainder || {};
+            // keepQtyはJSON number型の整数のみ。残0でも指定があれば範囲検証する (契約=0〜残数、Codex keep-R1 Medium)
+            const keep = r.keepQty == null ? ev.remaining : r.keepQty;
+            if (typeof keep !== 'number' || !Number.isInteger(keep) || keep < 0 || keep > ev.remaining) {
+              throw new Error(`残す数(${r.keepQty})が不正です (0〜${ev.remaining})`);
+            }
+            const cut = ev.remaining - keep;
+            if (cut > 0) {
+              const sh = appendPoItemEvent({
+                orderItemId: oid, eventType: 'shortage', qty: cut,
+                reasonCode: 'supplier_shortage', note: '一括割当で減数 (作れなかった分)',
+                effectiveDate: inbound.receipt_date || null, actorType: 'user', actor,
+              });
+              ev.remaining = sh.remaining; ev.orderClosed = sh.orderClosed;
+            }
+            if (keep > 0) {
+              plan = applyRemainderChoice({ itemId: oid, ev,
+                remainder: { action: r.action, nextExpectedDate: r.nextExpectedDate, nextExpectedQty: keep, nextActionDate: r.nextActionDate },
+                eventDate: inbound.receipt_date || null, actor, allowedActions: ['await_delivery', 'await_confirmation'] });
+            }
           }
           results.push({ inboundItemId: iid, orderItemId: oid, qty, remaining: ev.remaining, plan: plan ? plan.remainder_disposition || true : null });
         } catch (e) {
@@ -4177,7 +4200,8 @@ document.getElementById('autoAssignBtn').addEventListener('click', function() {
     if (!j.proposals.length && !j.skipped.length) { toast('未割当の入庫はありません'); return; }
     var h = '<div style="display:flex;align-items:center;gap:10px"><h2 style="margin:0">⚡ 一括割当の確認</h2>' +
       '<button class="ghost" id="inbModalClose" style="margin-left:auto">✕ 閉じる</button></div>' +
-      '<div class="hint">候補が1つに確定した入庫だけを自動で割り当てます。割当後にPO残が残る行は「残数の扱い」を選んでください (数量を減らす判断は自動ではしません)。</div>';
+      '<div class="hint">候補が1つに確定した入庫だけを自動で割り当てます。割当後にPO残が残る行は「<b>残す数</b>」を確認してください:<br>' +
+      'そのまま=分納待ち/確認中で注残に残す ・ <b>0にする=残数を全て減数で消して完了</b> (原料不足で作れなかった等) ・ 途中の数=差分だけ減数して一部を残す。</div>';
     if (j.proposals.length) {
       h += '<div style="overflow-x:auto;max-height:45vh;overflow-y:auto"><table class="t"><tr><th>伝票NO</th><th>商品</th><th class="r">割当数</th><th>割当先PO</th><th class="r">PO残→割当後</th><th>残数の扱い</th></tr>' +
         j.proposals.map(function(p, i) {
@@ -4186,8 +4210,11 @@ document.getElementById('autoAssignBtn').addEventListener('click', function() {
             '<td>' + esc(p.poNumber || ('#' + p.orderId)) + (p.costDiff ? ' <span class="badge b-draft" title="入庫単価とPO単価が異なります">💴単価差</span>' : '') + '</td>' +
             '<td class="r">' + p.poRemaining + ' → ' + p.postRemaining + '</td>' +
             '<td>' + (p.needsRemainder
-              ? '<select class="aaRem" data-idx="' + i + '"><option value="await_delivery">🚚 分納待ち (残' + p.postRemaining + ')</option><option value="await_confirmation">❓ 確認中</option></select> ' +
-                '<input type="date" class="aaDate" data-idx="' + i + '" value="' + esc(p.due ? String(p.due).slice(0, 10) : '') + '" title="分納待ち=次回入荷予定日 / 確認中=確認期限">'
+              ? '残す <input type="number" class="aaKeep" data-idx="' + i + '" value="' + p.postRemaining + '" min="0" max="' + p.postRemaining + '" step="1" style="width:70px"> / ' + p.postRemaining +
+                ' <span class="aaOpts" data-idx="' + i + '">' +
+                '<select class="aaRem" data-idx="' + i + '"><option value="await_delivery">🚚 分納待ち</option><option value="await_confirmation">❓ 確認中</option></select> ' +
+                '<input type="date" class="aaDate" data-idx="' + i + '" value="' + esc(p.due ? String(p.due).slice(0, 10) : '') + '" title="分納待ち=次回入荷予定日 / 確認中=確認期限"></span>' +
+                '<div class="muted aaHint" data-idx="' + i + '" style="font-size:11px"></div>'
               : '<span class="muted">' + (p.postRemaining > 0 ? '(同一POの最終行で選択)' : 'なし (全量)') + '</span>') + '</td></tr>';
         }).join('') + '</table></div>';
     } else {
@@ -4207,19 +4234,52 @@ document.getElementById('autoAssignBtn').addEventListener('click', function() {
     }
     openInbModal(h);
     document.getElementById('inbModalClose').addEventListener('click', closeInbModal);
+    // 「残す数」の変化でヒント表示と分納待ち/確認中の要否を切り替え (0=全部減数なら日付不要)
+    function aaSync(i) {
+      var keepEl = document.querySelector('.aaKeep[data-idx="' + i + '"]');
+      if (!keepEl) return;
+      var p = j.proposals[i];
+      // 空欄はNumber('')=0に化けて「全量減数」と誤解釈されるため不正扱い (Codex keep-R2 High)
+      var keep = keepEl.value === '' ? NaN : Number(keepEl.value);
+      var opts = document.querySelector('.aaOpts[data-idx="' + i + '"]');
+      var hint = document.querySelector('.aaHint[data-idx="' + i + '"]');
+      var valid = Number.isInteger(keep) && keep >= 0 && keep <= p.postRemaining;
+      if (!valid) { if (hint) hint.textContent = '⚠️ 0〜' + p.postRemaining + ' で入力してください'; return; }
+      if (opts) opts.style.display = keep > 0 ? '' : 'none';
+      if (hint) hint.textContent = keep === 0
+        ? '➖ 残数 ' + p.postRemaining + ' を全て減数で消して完了します (作れなかった分)'
+        : (keep < p.postRemaining ? '➖ 差分 ' + (p.postRemaining - keep) + ' を減数し、' + keep + ' を注残に残します' : '');
+    }
+    j.proposals.forEach(function(p, i) {
+      if (!p.needsRemainder) return;
+      aaSync(i);
+      var keepEl = document.querySelector('.aaKeep[data-idx="' + i + '"]');
+      if (keepEl) keepEl.addEventListener('input', function(){ aaSync(i); });
+    });
     var go = document.getElementById('aaGo');
     if (go) go.addEventListener('click', function() {
       var bad = null;
       var assignments = j.proposals.map(function(p, i) {
         if (!p.needsRemainder) return { inboundItemId: p.inboundItemId, orderItemId: p.orderItemId, qty: p.qty, remainder: null };
+        var keepEl = document.querySelector('.aaKeep[data-idx="' + i + '"]');
+        // 空欄はNumber('')=0=「全量減数」に化ける事故を防ぐ (Codex keep-R2 High)
+        var keep = (!keepEl || keepEl.value === '') ? NaN : Number(keepEl.value);
+        if (!Number.isInteger(keep) || keep < 0 || keep > p.postRemaining) {
+          bad = p.productCode + ': 残す数は 0〜' + p.postRemaining + ' で入力してください';
+          return null;
+        }
+        if (keep === 0) {
+          // 残数を全て減数で消す (注残ゼロ) — 日付不要
+          return { inboundItemId: p.inboundItemId, orderItemId: p.orderItemId, qty: p.qty, remainder: { keepQty: 0 } };
+        }
         var sel = document.querySelector('.aaRem[data-idx="' + i + '"]');
         var dt = document.querySelector('.aaDate[data-idx="' + i + '"]');
         var action = sel ? sel.value : 'await_delivery';
         if (!dt || !dt.value) { bad = p.productCode + ': ' + (action === 'await_delivery' ? '次回入荷予定日' : '確認期限') + 'を入力してください'; }
         return { inboundItemId: p.inboundItemId, orderItemId: p.orderItemId, qty: p.qty,
           remainder: action === 'await_delivery'
-            ? { action: action, nextExpectedDate: dt ? dt.value : null }
-            : { action: action, nextActionDate: dt ? dt.value : null } };
+            ? { keepQty: keep, action: action, nextExpectedDate: dt ? dt.value : null }
+            : { keepQty: keep, action: action, nextActionDate: dt ? dt.value : null } };
       });
       if (bad) { toast(bad); return; }
       go.disabled = true;

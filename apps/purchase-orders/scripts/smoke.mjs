@@ -2614,6 +2614,59 @@ console.log('── 入庫取込プレビュー+一括割当 ──');
   ] }, 'aa-key-3');
   ok(r.body.ok && r.body.assigned === 1, 'auto commit: 全量なら成功 (確認中+期限)');
 
+  // ── keepQty (残す数): 中原さん要望 2026-07-14 — 作れなかった分を減数で消す/一部だけ残す ──
+  insRow.run('aa-keep-item', '減数テスト商品', '0001', '取扱中', 2, 0, 0, 0, 0, 10, 1.5, 400, 200, '2026-07-01', '2026-01-01');
+  insRow.run('aa-keep2-item', '一部残しテスト商品', '0001', '取扱中', 2, 0, 0, 0, 0, 10, 1.5, 400, 200, '2026-07-01', '2026-01-01');
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'aa-keep-item', qty: 200 }, { code: 'aa-keep2-item', qty: 20 }] }) });
+  r = await up2('ad.csv', [HDR2,
+    ['AD500', 'aa-keep-item', 'ミルワーム相当', '0001', '220', '188', '0', '2026/07/14'],
+    ['AD501', 'aa-keep2-item', 'x', '0001', '200', '8', '0', '2026/07/14']]);
+  r = await j('/api/inbound/auto-assign/preview');
+  const k1 = r.body.proposals.find(p2 => p2.slip === 'AD500');
+  const k2 = r.body.proposals.find(p2 => p2.slip === 'AD501');
+  ok(k1 && k1.postRemaining === 12 && k2 && k2.postRemaining === 12, 'keepQty: 提案 (188/200=残12, 8/20=残12)');
+  // keep>残 は拒否
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: k1.inboundItemId, orderItemId: k1.orderItemId, qty: 188, remainder: { keepQty: 99 } },
+  ] }, 'aa-keep-bad');
+  ok(r.status === 400 && r.body.error.includes('残す数'), 'keepQty: 残数超過は拒否', r.body.error);
+  // keepQty=0 (全部減数=注残ゼロ) + keepQty=5 (7減数+5分納待ち)
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: k1.inboundItemId, orderItemId: k1.orderItemId, qty: 188, remainder: { keepQty: 0 } },
+    { inboundItemId: k2.inboundItemId, orderItemId: k2.orderItemId, qty: 8, remainder: { keepQty: 5, action: 'await_delivery', nextExpectedDate: '2026-08-10' } },
+  ] }, 'aa-keep-1');
+  ok(r.body.ok && r.body.assigned === 2, 'keepQty: 実行', r.body);
+  ok(db.prepare('SELECT remaining_qty, shortage_qty FROM v_po_item_balance WHERE order_item_id=?').get(k1.orderItemId).remaining_qty === 0,
+    'keepQty=0: 注残ゼロ (188入荷+12減数)');
+  ok(db.prepare('SELECT shortage_qty FROM v_po_item_balance WHERE order_item_id=?').get(k1.orderItemId).shortage_qty === 12,
+    'keepQty=0: 減数イベント12');
+  const k2bal = db.prepare('SELECT remaining_qty, shortage_qty FROM v_po_item_balance WHERE order_item_id=?').get(k2.orderItemId);
+  ok(k2bal.remaining_qty === 5 && k2bal.shortage_qty === 7, 'keepQty=5: 7減数+残5', k2bal);
+  const k2item = db.prepare('SELECT remainder_disposition, next_expected_qty FROM po_order_items WHERE id=?').get(k2.orderItemId);
+  ok(k2item.remainder_disposition === 'awaiting_delivery' && k2item.next_expected_qty === 5, 'keepQty=5: 分納待ち(次回5)が設定される', k2item);
+  // 全量入荷 (残0) でも keepQty 指定があれば範囲検証 (Codex keep-R1 Medium)
+  insRow.run('aa-keep3-item', '全量+keep指定テスト', '0001', '取扱中', 2, 0, 0, 0, 0, 10, 1.5, 400, 200, '2026-07-01', '2026-01-01');
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'aa-keep3-item', qty: 6 }] }) });
+  r = await up2('ae.csv', [HDR2, ['AE600', 'aa-keep3-item', 'x', '0001', '200', '6', '0', '2026/07/14']]);
+  r = await j('/api/inbound/auto-assign/preview');
+  const k3 = r.body.proposals.find(p2 => p2.slip === 'AE600');
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: k3.inboundItemId, orderItemId: k3.orderItemId, qty: 6, remainder: { keepQty: 99 } },
+  ] }, 'aa-keep3-bad');
+  ok(r.status === 400 && r.body.error.includes('残す数'), 'keepQty: 全量入荷 (残0) でも範囲外keepQtyは400', r.body.error);
+  ok(db.prepare('SELECT remaining_qty FROM v_po_item_balance WHERE order_item_id=?').get(k3.orderItemId).remaining_qty === 6,
+    'keepQty: 400時は全ロールバック (未割当のまま)');
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: k3.inboundItemId, orderItemId: k3.orderItemId, qty: 6, remainder: { keepQty: '0' } },
+  ] }, 'aa-keep3-str');
+  ok(r.status === 400, 'keepQty: 文字列は拒否 (JSON number型の整数のみ)');
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: k3.inboundItemId, orderItemId: k3.orderItemId, qty: 6, remainder: { keepQty: 0 } },
+  ] }, 'aa-keep3-ok');
+  ok(r.body.ok && r.body.assigned === 1, 'keepQty: 全量入荷+keepQty=0は成功 (残0=減数なし)');
+
   // 画面: プレビュー/一括割当UI配信
   const inbHtml4 = await (await fetch(base + '/inbound')).text();
   ok(inbHtml4.includes('autoAssignBtn') && inbHtml4.includes('この内容で取り込む') && inbHtml4.includes('一括割当の確認'),
