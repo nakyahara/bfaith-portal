@@ -836,7 +836,8 @@ router.post('/api/inbound/auto-assign', (req, res) => {
     const assignments = Array.isArray((req.body || {}).assignments) ? req.body.assignments : [];
     if (!assignments.length) return res.status(400).json({ ok: false, error: '割当がありません' });
     if (assignments.length > 500) return res.status(400).json({ ok: false, error: '一度に割当できるのは500件までです' });
-    // 冪等payloadは残数の扱いの全フィールドを含める (同一キー+内容違いを409にする、Codex inb-R1 Medium)
+    // 冪等payloadは残数の扱いの全フィールドを含め、配列順もそのまま保持する
+    // (実処理と「最終行」判定はリクエスト順=順序は意味のある入力。順序違いをreplayさせない、Codex inb-R2 Medium)
     const canonical = assignments.map(a => ({
       inboundItemId: Number(a && a.inboundItemId), orderItemId: Number(a && a.orderItemId), qty: Number(a && a.qty),
       remainder: a && a.remainder ? {
@@ -845,7 +846,7 @@ router.post('/api/inbound/auto-assign', (req, res) => {
         nextExpectedQty: a.remainder.nextExpectedQty ?? null,
         nextActionDate: a.remainder.nextActionDate || null,
       } : null,
-    })).sort((x, y) => x.inboundItemId - y.inboundItemId);
+    }));
     // 同一PO明細への複数割当は「最後の行」だけが残数の扱いを設定する (途中行の設定は上書きされるだけなので受けない)
     const lastIdxByItem = new Map();
     assignments.forEach((a, idx) => lastIdxByItem.set(Number(a && a.orderItemId), idx));

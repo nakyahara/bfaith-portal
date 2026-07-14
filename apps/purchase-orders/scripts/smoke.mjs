@@ -2581,6 +2581,9 @@ console.log('── 入庫取込プレビュー+一括割当 ──');
   ok(r.body.ok && r.body.assigned === 2, 'multi commit: 2行→同一PO明細 (途中行は残数の扱いなしで通る)', r.body);
   r = await jpA('/api/inbound/auto-assign', { assignments: multiAssign('2026-08-02') }, 'aa-key-2');
   ok(r.status === 409, 'auto commit: 同一キーで日付違いは409 (黙ってreplayしない)', r.status);
+  // 順序だけ変えた同一キー再送も409 (順序は「最終行」判定に効く意味のある入力、Codex inb-R2 Medium)
+  r = await jpA('/api/inbound/auto-assign', { assignments: multiAssign('2026-08-01').slice().reverse() }, 'aa-key-2');
+  ok(r.status === 409, 'auto commit: 同一キーで順序違いも409', r.status);
   ok(db.prepare('SELECT remaining_qty FROM v_po_item_balance WHERE order_item_id=?').get(m1.orderItemId).remaining_qty === 8,
     'multi commit: 最終PO残8 (5+7消込)');
   ok(db.prepare('SELECT next_expected_date FROM po_order_items WHERE id=?').get(m1.orderItemId).next_expected_date === '2026-08-01',
