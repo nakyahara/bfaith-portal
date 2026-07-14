@@ -384,6 +384,9 @@ export function candidatesFor(inboundItemId) {
 export function autoAssignPreview() {
   const { open } = listInbound();
   const proposals = [], skipped = [];
+  // 同じPO明細へ複数の入庫行が向かう場合は数量を累積して残数を表示する
+  // (独立計算だと両方「20→15」に見えて実際は残10、Codex inb-R1 Medium)
+  const cumByItem = new Map();
   for (const row of open) {
     let cands;
     try { cands = candidatesFor(row.id).candidates; }
@@ -391,18 +394,25 @@ export function autoAssignPreview() {
     if (!cands.length) { skipped.push({ ...row, reason: '対応する発注残がありません (未発注/対象外?)' }); continue; }
     if (cands.length > 1) { skipped.push({ ...row, reason: `候補が${cands.length}件あります (手動で選択してください)` }); continue; }
     const c = cands[0];
-    if (row.remainingCapacity > c.remaining) {
-      skipped.push({ ...row, reason: `入庫数(${row.remainingCapacity})がPO残(${c.remaining})を超えています (手動で分割してください)` });
+    const prior = cumByItem.get(c.orderItemId) || 0;
+    const effRemaining = c.remaining - prior; // このバッチ内の先行提案分を差し引いた実効PO残
+    if (row.remainingCapacity > effRemaining) {
+      skipped.push({ ...row, reason: `入庫数(${row.remainingCapacity})がPO残(${effRemaining}${prior ? ` — 同一POへの先行提案${prior}を差引後` : ''})を超えています (手動で分割してください)` });
       continue;
     }
+    cumByItem.set(c.orderItemId, prior + row.remainingCapacity);
     proposals.push({
       inboundItemId: row.id, slip: row.slip, receiptDate: row.receiptDate, supplierCode: row.supplierCode,
       productCode: row.productCode, productName: row.productName, qty: row.remainingCapacity,
       orderItemId: c.orderItemId, orderId: c.orderId, poNumber: c.poNumber, supplierName: c.supplierName,
-      poRemaining: c.remaining, postRemaining: c.remaining - row.remainingCapacity, costDiff: c.costDiff,
+      poRemaining: effRemaining, postRemaining: effRemaining - row.remainingCapacity, costDiff: c.costDiff,
       due: c.due || null, // 残数の扱いの日付既定 (分納待ち=次回予定日 / 確認中=期限)
     });
   }
+  // 残数の扱いは「PO明細ごとに最後の提案行」でだけ選択させる (途中行の設定は最後の行で上書きされるため)
+  const lastIdxByItem = new Map();
+  proposals.forEach((p, i) => lastIdxByItem.set(p.orderItemId, i));
+  proposals.forEach((p, i) => { p.needsRemainder = lastIdxByItem.get(p.orderItemId) === i && p.postRemaining > 0; });
   return { proposals, skipped };
 }
 

@@ -2549,6 +2549,43 @@ console.log('── 入庫取込プレビュー+一括割当 ──');
   r = await j('/api/inbound');
   ok(!r.body.open.some(x => x.slip === 'AA100' || x.slip === 'AA101'), 'auto commit: 割当済み行は未割当一覧から消える');
 
+  // ── Codex inb-R1 反映分: 割当先改変 / 同一キー内容違い / 同一PO明細への複数行 ──
+  insRow.run('aa-multi-item', '複数行テスト商品', '0001', '取扱中', 2, 0, 0, 0, 0, 10, 1.5, 400, 200, '2026-07-01', '2026-01-01');
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'aa-multi-item', qty: 20 }] }) });
+  r = await up2('ab.csv', [HDR2,
+    ['AB300', 'aa-multi-item', 'x', '0001', '200', '5', '0', '2026/07/14'],
+    ['AB301', 'aa-multi-item', 'x', '0001', '200', '7', '0', '2026/07/14']]);
+  ok(r.body.ok, 'multi: 同一商品2伝票を取込');
+  r = await j('/api/inbound/auto-assign/preview');
+  const m1 = r.body.proposals.find(p => p.slip === 'AB300');
+  const m2 = r.body.proposals.find(p => p.slip === 'AB301');
+  ok(m1 && m2 && m1.orderItemId === m2.orderItemId, 'multi: 同一PO明細への2提案');
+  // 一覧順=伝票NO降順のため AB301 (qty7) が先に処理される: 20→13→8
+  ok(m2.poRemaining === 20 && m2.postRemaining === 13 && m1.poRemaining === 13 && m1.postRemaining === 8,
+    'multi: 残数は累積表示 (20→13→8。両方20→…に見えない)', [m2.postRemaining, m1.postRemaining]);
+  ok(m2.needsRemainder === false && m1.needsRemainder === true, 'multi: 残数の扱いは最終行のみ選択 (途中行の設定は受けない)');
+
+  // 割当先改変: 無関係なPO明細を指定 → 候補再検証で拒否 (Codex inb-R1 High)
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: m1.inboundItemId, orderItemId: pDead.orderItemId, qty: 5 },
+  ] }, 'aa-key-tamper');
+  ok(r.status === 400 && r.body.error.includes('候補が変わって'), 'auto commit: 割当先の改変は候補再検証で拒否', r.body.error);
+
+  // 同一キーで内容 (日付) 違い → 409 (replayさせない、Codex inb-R1 Medium)
+  const multiAssign = dt => [
+    { inboundItemId: m2.inboundItemId, orderItemId: m2.orderItemId, qty: 7 },
+    { inboundItemId: m1.inboundItemId, orderItemId: m1.orderItemId, qty: 5, remainder: { action: 'await_delivery', nextExpectedDate: dt } },
+  ];
+  r = await jpA('/api/inbound/auto-assign', { assignments: multiAssign('2026-08-01') }, 'aa-key-2');
+  ok(r.body.ok && r.body.assigned === 2, 'multi commit: 2行→同一PO明細 (途中行は残数の扱いなしで通る)', r.body);
+  r = await jpA('/api/inbound/auto-assign', { assignments: multiAssign('2026-08-02') }, 'aa-key-2');
+  ok(r.status === 409, 'auto commit: 同一キーで日付違いは409 (黙ってreplayしない)', r.status);
+  ok(db.prepare('SELECT remaining_qty FROM v_po_item_balance WHERE order_item_id=?').get(m1.orderItemId).remaining_qty === 8,
+    'multi commit: 最終PO残8 (5+7消込)');
+  ok(db.prepare('SELECT next_expected_date FROM po_order_items WHERE id=?').get(m1.orderItemId).next_expected_date === '2026-08-01',
+    'multi commit: 残数の扱いは最終行の内容で1回だけ設定');
+
   // 画面: プレビュー/一括割当UI配信
   const inbHtml4 = await (await fetch(base + '/inbound')).text();
   ok(inbHtml4.includes('autoAssignBtn') && inbHtml4.includes('この内容で取り込む') && inbHtml4.includes('一括割当の確認'),

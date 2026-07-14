@@ -836,13 +836,23 @@ router.post('/api/inbound/auto-assign', (req, res) => {
     const assignments = Array.isArray((req.body || {}).assignments) ? req.body.assignments : [];
     if (!assignments.length) return res.status(400).json({ ok: false, error: '割当がありません' });
     if (assignments.length > 500) return res.status(400).json({ ok: false, error: '一度に割当できるのは500件までです' });
+    // 冪等payloadは残数の扱いの全フィールドを含める (同一キー+内容違いを409にする、Codex inb-R1 Medium)
     const canonical = assignments.map(a => ({
       inboundItemId: Number(a && a.inboundItemId), orderItemId: Number(a && a.orderItemId), qty: Number(a && a.qty),
-      remainder: a && a.remainder ? { action: a.remainder.action } : null,
+      remainder: a && a.remainder ? {
+        action: a.remainder.action,
+        nextExpectedDate: a.remainder.nextExpectedDate || null,
+        nextExpectedQty: a.remainder.nextExpectedQty ?? null,
+        nextActionDate: a.remainder.nextActionDate || null,
+      } : null,
     })).sort((x, y) => x.inboundItemId - y.inboundItemId);
+    // 同一PO明細への複数割当は「最後の行」だけが残数の扱いを設定する (途中行の設定は上書きされるだけなので受けない)
+    const lastIdxByItem = new Map();
+    assignments.forEach((a, idx) => lastIdxByItem.set(Number(a && a.orderItemId), idx));
     const run = () => db.transaction(() => {
       const results = [];
-      for (const a of assignments) {
+      for (let idx = 0; idx < assignments.length; idx++) {
+        const a = assignments[idx];
         const iid = Number(a && a.inboundItemId), oid = Number(a && a.orderItemId), qty = Number(a && a.qty);
         if (!Number.isSafeInteger(iid) || iid <= 0 || !Number.isSafeInteger(oid) || oid <= 0) throw new Error('割当の指定が不正です');
         if (!Number.isInteger(qty) || qty <= 0) throw new Error(`数量が不正です (入庫明細 ${iid})`);
@@ -853,19 +863,28 @@ router.post('/api/inbound/auto-assign', (req, res) => {
         if (!inbound) throw new Error(`入庫明細が存在しません: ${iid}`);
         if (inbound.superseded) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 訂正で無効化された行です`);
         if (inbound.ignored) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 対象外の行です`);
-        const alloc = db.prepare(`SELECT COALESCE(SUM(e.qty),0) AS n FROM po_item_events e
-          WHERE e.inbound_item_id=? AND e.event_type='receipt'
-            AND NOT EXISTS (SELECT 1 FROM po_item_events r2 WHERE r2.reverses_id=e.id)`).get(iid).n;
-        if (qty > inbound.good_qty - alloc) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 入庫の未割当(${inbound.good_qty - alloc})を超えています (画面を更新してやり直してください)`);
+        // 割当先の再検証: txn内で候補を再計算し「候補が1件のまま・指定先と一致・数量≤最新PO残」を要求
+        // (リクエスト改変やプレビュー後の状態変化で無関係なPOへ消し込ませない、Codex inb-R1 High)。
+        // 同一txn内の先行割当はcandidatesForの残数計算に反映されるため、同一PO明細への累積も正しく検証される
+        const chk = candidatesFor(iid);
+        if (chk.candidates.length !== 1 || chk.candidates[0].orderItemId !== oid) {
+          throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 割当先の候補が変わっています。画面を更新してやり直してください`);
+        }
+        if (qty > chk.item.capacity) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 入庫の未割当(${chk.item.capacity})を超えています (画面を更新してやり直してください)`);
+        if (qty > chk.candidates[0].remaining) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: PO残(${chk.candidates[0].remaining})を超えています (画面を更新してやり直してください)`);
         const ev = appendPoItemEvent({
           orderItemId: oid, eventType: 'receipt', qty,
           source: 'logizard', inboundItemId: iid,
           note: null, effectiveDate: inbound.receipt_date || null,
           actorType: 'user', actor,
         });
-        // 一括では「減数で完了」は選ばせない (数量を減らす判断は自動処理にさせない)
-        const plan = applyRemainderChoice({ itemId: oid, ev, remainder: a.remainder, eventDate: inbound.receipt_date || null,
-          actor, allowedActions: ['await_delivery', 'await_confirmation'] });
+        // 一括では「減数で完了」は選ばせない (数量を減らす判断は自動処理にさせない)。
+        // 残数の扱いは同一PO明細グループの最後の行でのみ適用
+        let plan = null;
+        if (lastIdxByItem.get(oid) === idx) {
+          plan = applyRemainderChoice({ itemId: oid, ev, remainder: a.remainder, eventDate: inbound.receipt_date || null,
+            actor, allowedActions: ['await_delivery', 'await_confirmation'] });
+        }
         results.push({ inboundItemId: iid, orderItemId: oid, qty, remaining: ev.remaining, plan: plan ? plan.remainder_disposition || true : null });
       }
       audit(db, { actorType: 'user', actor, action: 'inbound_auto_assign', resource: 'inbound',
@@ -4149,10 +4168,10 @@ document.getElementById('autoAssignBtn').addEventListener('click', function() {
             '<td class="r"><b>' + p.qty + '</b></td>' +
             '<td>' + esc(p.poNumber || ('#' + p.orderId)) + (p.costDiff ? ' <span class="badge b-draft" title="入庫単価とPO単価が異なります">💴単価差</span>' : '') + '</td>' +
             '<td class="r">' + p.poRemaining + ' → ' + p.postRemaining + '</td>' +
-            '<td>' + (p.postRemaining > 0
+            '<td>' + (p.needsRemainder
               ? '<select class="aaRem" data-idx="' + i + '"><option value="await_delivery">🚚 分納待ち (残' + p.postRemaining + ')</option><option value="await_confirmation">❓ 確認中</option></select> ' +
                 '<input type="date" class="aaDate" data-idx="' + i + '" value="' + esc(p.due ? String(p.due).slice(0, 10) : '') + '" title="分納待ち=次回入荷予定日 / 確認中=確認期限">'
-              : '<span class="muted">なし (全量)</span>') + '</td></tr>';
+              : '<span class="muted">' + (p.postRemaining > 0 ? '(同一POの最終行で選択)' : 'なし (全量)') + '</span>') + '</td></tr>';
         }).join('') + '</table></div>';
     } else {
       h += '<div class="muted" style="margin:8px 0">自動で割当できる行はありません</div>';
@@ -4175,7 +4194,7 @@ document.getElementById('autoAssignBtn').addEventListener('click', function() {
     if (go) go.addEventListener('click', function() {
       var bad = null;
       var assignments = j.proposals.map(function(p, i) {
-        if (p.postRemaining <= 0) return { inboundItemId: p.inboundItemId, orderItemId: p.orderItemId, qty: p.qty, remainder: null };
+        if (!p.needsRemainder) return { inboundItemId: p.inboundItemId, orderItemId: p.orderItemId, qty: p.qty, remainder: null };
         var sel = document.querySelector('.aaRem[data-idx="' + i + '"]');
         var dt = document.querySelector('.aaDate[data-idx="' + i + '"]');
         var action = sel ? sel.value : 'await_delivery';
