@@ -186,13 +186,17 @@ async function submitShopInsert(page, { period, ymFrom, ymTo, start, end, types 
   }
 }
 
-/** insert 前後のファイル名差分で自ジョブを特定 (最大30秒待つ) */
+/** insert 前後のファイル名差分で自ジョブを特定 (最大30秒待つ)。
+ *  0件のまま = insert が黙って無視された (⭐実測 2026-07-14: 早朝はD-1が未集計で
+ *  ジョブ自体が生まれない。リピート日次と同じ「無言無視」挙動) → [] を返し呼び元で empty 扱い。
+ *  一部だけ現れた/多すぎる場合は取り違えの恐れがあるためエラー */
 async function waitNewFiles(page, beforeSet, expectedCount, label) {
+  let fresh = [];
   for (let i = 0; i < 6; i++) {
     await page.waitForTimeout(i === 0 ? 2500 : 5000);
     await gotoWowmaPage(page, CSVDL_URL, '店舗分析CSVダウンロード');
     const rows = await statusRows(page);
-    const fresh = rows.filter((r) => !beforeSet.has(r.file)).map((r) => r.file);
+    fresh = rows.filter((r) => !beforeSet.has(r.file)).map((r) => r.file);
     if (fresh.length >= expectedCount) {
       if (fresh.length > expectedCount) {
         throw new Error(`JOB_BIND: ${label} で新規ファイルが想定より多い (${fresh.length} > ${expectedCount})。並行操作の疑い — 中断`);
@@ -200,7 +204,8 @@ async function waitNewFiles(page, beforeSet, expectedCount, label) {
       return fresh;
     }
   }
-  throw new Error(`JOB_BIND: ${label} のジョブ行が処理状況に現れず (期待 ${expectedCount}件)`);
+  if (fresh.length === 0) return []; // 未集計 (呼び元で empty スキップ)
+  throw new Error(`JOB_BIND: ${label} のジョブ行が一部しか現れず (${fresh.length}/${expectedCount})。取り違えの恐れ — 中断`);
 }
 
 /** ファイル名で行を特定してダウンロード */
@@ -282,12 +287,42 @@ async function fetchShopAnalytics(page, outcomes, failures) {
   }
   console.log(`  ジョブ計画: ${jobs.map((j) => j.label).join(' / ')}`);
 
-  // insert (直前後のファイル名差分で自ジョブを bind)
+  // insert (直前後のファイル名差分で自ジョブを bind)。
+  // 1ジョブの失敗で他ジョブの回収を巻き添えにしない (⭐2026-07-14朝: D-1未集計bind失敗で
+  // 受理済みのD-3/D-2までDLされなかった) — ジョブ単位で empty/error を記録して続行
   for (const job of jobs) {
-    const before = new Set((await statusRows(page)).map((r) => r.file));
-    await submitShopInsert(page, { ...job.params, types: job.types });
-    job.names = await waitNewFiles(page, before, job.types.length, job.label);
-    console.log(`  [insert] ${job.label} → ${job.names.length}件受理 (${job.names.map((n) => n.split('_')[0]).join(',')})`);
+    try {
+      const before = new Set((await statusRows(page)).map((r) => r.file));
+      await submitShopInsert(page, { ...job.params, types: job.types });
+      job.names = await waitNewFiles(page, before, job.types.length, job.label);
+      if (job.names.length === 0) {
+        if (job.dm === 'D') {
+          // 早朝はD-1が未集計でinsertが無言無視される → 翌朝D-2として自己修復 (正常スキップ)
+          console.log(`  [empty] ${job.label}: insertがジョブを生まず (未集計)。翌朝の再取得で埋まる — 正常スキップ`);
+          for (const prefix of job.prefixes) {
+            await logFetch({ report_type: `adata_${prefix}_D`, period_from: job.from, period_to: job.to,
+              status: 'empty', message: '未集計 (insert無言無視)' });
+            outcomes.push({ spec: `shop_${prefix}_D`, ym: job.from, status: 'empty' });
+          }
+        } else {
+          throw new Error(`JOB_BIND: ${job.label} (月次) のinsertがジョブを生まない — 要確認`);
+        }
+      } else {
+        console.log(`  [insert] ${job.label} → ${job.names.length}件受理 (${job.names.map((n) => n.split('_')[0]).join(',')})`);
+      }
+    } catch (e) {
+      console.error(`✗ ${job.label}: ${e.message}`);
+      job.names = [];
+      job.failed = true;
+      await logFetch({ report_type: `adata_shop_${job.dm}`, period_from: job.from, period_to: job.to,
+        status: 'error', message: e.message });
+      for (const prefix of job.prefixes) outcomes.push({ spec: `shop_${prefix}_${job.dm}`, ym: job.from, status: 'error' });
+      failures.push({ reportType: `adata_shop_${job.dm}`, ym: job.from, error: e.message, url: page.url() });
+    }
+  }
+  if (jobs.every((j) => j.names.length === 0)) {
+    console.log('  [shop] 実行対象のジョブなし (全て未集計/失敗) — DLフェーズをスキップ');
+    return;
   }
 
   // ポーリング (全ジョブ完了まで、最大15分)
@@ -437,24 +472,25 @@ async function fetchPmQuery(page, outcomes, failures) {
   const body = (await page.locator('body').innerText().catch(() => '')).replace(/\s+/g, ' ');
   if (!/検索クエリ/.test(body)) throw new Error('AUTH_VERIFY: 検索クエリ画面の証拠を確認できず');
 
+  // ⭐実DOM (2026-07-14実測): ヘッダ=<th>空,キーワード,広告表示回数,クリック回数,CTR</th>、
+  // データ行=<td>除外操作メニュー(text空), キーワード, 表示回数, クリック回数, CTR%</td>。
+  // 画面の「1.」の連番はCSS由来でDOMにランク列は無い → rank=行順
   const rows = await page.evaluate(() => {
     const tables = [...document.querySelectorAll('table')];
     const t = tables.find((tb) => /キーワード/.test(tb.innerText) && /広告表示回数/.test(tb.innerText));
     if (!t) return null;
+    const num = (s) => { const n = Number(String(s).replace(/[,%\s]/g, '')); return Number.isFinite(n) ? n : null; };
     const out = [];
+    let rank = 0;
     for (const tr of t.querySelectorAll('tr')) {
       const tds = [...tr.querySelectorAll('td')].map((td) => (td.innerText || '').trim());
       if (tds.length < 4) continue;
-      let rank = null; let kw; let rest;
-      if (tds.length >= 5 && /^\d+\.?$/.test(tds[0])) {
-        rank = parseInt(tds[0], 10); kw = tds[1]; rest = tds.slice(2, 5);
-      } else {
-        const m = tds[0].match(/^(\d+)\.\s*(.+)$/s);
-        if (m) { rank = parseInt(m[1], 10); kw = m[2].trim(); } else { kw = tds[0]; }
-        rest = tds.slice(1, 4);
-      }
-      const num = (s) => { const n = Number(String(s).replace(/[,%\s]/g, '')); return Number.isFinite(n) ? n : null; };
-      out.push({ rank, keyword: kw, impressions: num(rest[0]), clicks: num(rest[1]), ctr_pct: num(rest[2]) });
+      // キーワード = 最初の「非空かつ非数値」セル。以降の数値3つ = 表示/クリック/CTR
+      const kwIdx = tds.findIndex((c) => c !== '' && num(c) === null);
+      if (kwIdx < 0 || kwIdx + 3 >= tds.length + 1) continue;
+      const nums = tds.slice(kwIdx + 1).map(num).filter((n) => n !== null);
+      if (nums.length < 3) continue;
+      out.push({ rank: ++rank, keyword: tds[kwIdx], impressions: nums[0], clicks: nums[1], ctr_pct: nums[2] });
     }
     return out;
   });
