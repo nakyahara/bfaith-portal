@@ -880,20 +880,26 @@ router.post('/api/inbound/auto-assign', (req, res) => {
         // ⚡一括割当の契約は「未割当入庫の全量割当」。部分量や過少の細工は拒否 (Codex inb-R3 Medium)
         if (qty !== chk.item.capacity) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 数量(${qty})が入庫の未割当(${chk.item.capacity})と一致しません (画面を更新してやり直してください)`);
         if (qty > chk.candidates[0].remaining) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: PO残(${chk.candidates[0].remaining})を超えています (画面を更新してやり直してください)`);
-        const ev = appendPoItemEvent({
-          orderItemId: oid, eventType: 'receipt', qty,
-          source: 'logizard', inboundItemId: iid,
-          note: null, effectiveDate: inbound.receipt_date || null,
-          actorType: 'user', actor,
-        });
-        // 一括では「減数で完了」は選ばせない (数量を減らす判断は自動処理にさせない)。
-        // 残数の扱いは同一PO明細グループの最後の行でのみ適用
-        let plan = null;
-        if (lastIdxByItem.get(oid) === idx) {
-          plan = applyRemainderChoice({ itemId: oid, ev, remainder: a.remainder, eventDate: inbound.receipt_date || null,
-            actor, allowedActions: ['await_delivery', 'await_confirmation'] });
+        // イベント/三択の内部エラーにも「どの行か」を必ず付ける (どこで失敗したか分からないと直せない、中原さん報告 2026-07-14)
+        try {
+          const ev = appendPoItemEvent({
+            orderItemId: oid, eventType: 'receipt', qty,
+            source: 'logizard', inboundItemId: iid,
+            note: null, effectiveDate: inbound.receipt_date || null,
+            actorType: 'user', actor,
+          });
+          // 一括では「減数で完了」は選ばせない (数量を減らす判断は自動処理にさせない)。
+          // 残数の扱いは同一PO明細グループの最後の行でのみ適用
+          let plan = null;
+          if (lastIdxByItem.get(oid) === idx) {
+            plan = applyRemainderChoice({ itemId: oid, ev, remainder: a.remainder, eventDate: inbound.receipt_date || null,
+              actor, allowedActions: ['await_delivery', 'await_confirmation'] });
+          }
+          results.push({ inboundItemId: iid, orderItemId: oid, qty, remaining: ev.remaining, plan: plan ? plan.remainder_disposition || true : null });
+        } catch (e) {
+          if (!String(e.message || '').startsWith('伝票 ')) e.message = `伝票 ${inbound.slip} / ${inbound.product_code}: ${e.message}`;
+          throw e;
         }
-        results.push({ inboundItemId: iid, orderItemId: oid, qty, remaining: ev.remaining, plan: plan ? plan.remainder_disposition || true : null });
       }
       audit(db, { actorType: 'user', actor, action: 'inbound_auto_assign', resource: 'inbound',
         detail: { count: results.length } });
@@ -904,7 +910,10 @@ router.post('/api/inbound/auto-assign', (req, res) => {
       run
     );
     res.json({ ok: true, assigned: result.length, results: result, replay });
-  } catch (e) { res.status(e.status === 409 ? 409 : 400).json({ ok: false, error: e.message }); }
+  } catch (e) {
+    console.error('[purchase-orders] 一括割当失敗 (全件ロールバック):', e.message); // Renderログにも残す
+    res.status(e.status === 409 ? 409 : 400).json({ ok: false, error: e.message });
+  }
 });
 
 router.get('/api/inbound/:id/candidates', (req, res) => {
@@ -4216,11 +4225,23 @@ document.getElementById('autoAssignBtn').addEventListener('click', function() {
       go.disabled = true;
       post(API + '/inbound/auto-assign', { assignments: assignments }, newIdemKey()).then(function(r2) {
         go.disabled = false;
-        if (!r2.ok) { toast('エラー: ' + r2.error + ' (全件ロールバックしました)'); return; }
+        if (!r2.ok) {
+          // 失敗を見逃させない: alert+モーダル内に赤バナー常設 (トーストは消えて原因が追えない、中原さん報告 2026-07-14)
+          alert('❌ 一括割当は実行されていません (全件ロールバック)\\n\\n理由: ' + (r2.error || '不明なエラー'));
+          var eb2 = document.getElementById('aaErrBanner');
+          if (!eb2) {
+            eb2 = document.createElement('div');
+            eb2.id = 'aaErrBanner';
+            eb2.setAttribute('style', 'background:#fef2f2;border:2px solid #dc2626;color:#991b1b;border-radius:10px;padding:10px 14px;margin:8px 0;font-weight:600');
+            go.parentNode.parentNode.insertBefore(eb2, go.parentNode);
+          }
+          eb2.innerHTML = '❌ 一括割当は実行されていません (全件ロールバック)<div style="font-weight:400;font-size:12px;margin-top:4px">' + esc(r2.error || '不明なエラー') + '</div>';
+          return;
+        }
         closeInbModal();
         toast('⚡ ' + r2.assigned + '件を割り当てました' + (r2.replay ? ' (再送・二重なし)' : ''));
         load();
-      }).catch(function(e){ go.disabled = false; toast('通信エラー: ' + e.message + ' — 画面を更新して割当状態を確認してください'); });
+      }).catch(function(e){ go.disabled = false; alert('⚠️ 通信エラー: ' + e.message + '\\n\\n画面を更新して割当状態を確認してください'); });
     });
   }).catch(function(e){ btn.disabled = false; toast('通信エラー: ' + e.message); });
 });
