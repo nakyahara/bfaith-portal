@@ -3000,6 +3000,15 @@ console.log('── 入庫取込プレビュー+一括割当 ──');
     JOIN po_inbound_items i ON i.id=g.inbound_item_id JOIN po_inbound_receipts rc ON rc.id=i.receipt_id
     WHERE rc.source_key='AK960' ORDER BY g.id DESC`).get();
   ok(revIg && revIg.revoked_by === 'system:reversal', 'excess-rev: 解除の主体=system:reversal を履歴に記録', revIg);
+  // scope の値域は直接SQLでもトリガが強制 (addCol追加の既存DBはCHECKが無い、Codex ig-R3 Medium)
+  {
+    let threw = '';
+    try {
+      db.prepare(`INSERT INTO po_inbound_ignores (inbound_item_id, reason, scope, created_at) VALUES (?,?,?,?)`)
+        .run(revRow.id, '不正scopeテスト', 'partial', new Date().toISOString());
+    } catch (e) { threw = e.message; }
+    ok(threw.includes('scopeが不正'), 'excess: 不正なscopeは直接SQLでもトリガが拒否', threw);
+  }
 
   // 候補が複数ある行は ignores に指定できない (割当で候補を消費してから対象外にする細工の遮断、Codex ig-R1 High-1)
   insRow.run('aa-multi2-item', '複数候補対象外細工テスト', '0001', '取扱中', 2, 0, 0, 0, 0, 10, 1.5, 400, 200, '2026-07-01', '2026-01-01');

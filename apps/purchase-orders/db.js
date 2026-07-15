@@ -527,6 +527,9 @@ function initLedgerSchema(db) {
   db.exec(`CREATE TRIGGER trg_po_inbound_ignore_guard BEFORE INSERT ON po_inbound_ignores
            WHEN NEW.revoked_at IS NULL
            BEGIN
+             -- addColで追加した既存DBの scope 列にはCHECKが付かないためトリガでも値域を強制 (Codex ig-R3 Medium)
+             SELECT CASE WHEN COALESCE(NEW.scope, 'row') NOT IN ('row', 'excess')
+               THEN RAISE(ABORT, 'inbound ignore: scopeが不正です (row/excessのみ)') END;
              SELECT CASE WHEN COALESCE(NEW.scope, 'row') = 'row' AND (
                SELECT COALESCE(SUM(e.qty), 0) FROM po_item_events e
                WHERE e.inbound_item_id = NEW.inbound_item_id AND e.event_type = 'receipt'
