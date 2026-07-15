@@ -6063,7 +6063,14 @@ document.addEventListener('click', function(ev) {
   var g = function(a){ return t.getAttribute && t.getAttribute(a); };
   var v;
   if (t.classList && t.classList.contains('boSel')) return; // 一括送信チェックボックスは開閉に流さない (changeハンドラが処理)
-  if ((v = g('data-view'))) { VIEW = v; render(); return; }
+  if ((v = g('data-view'))) {
+    VIEW = v;
+    // 商品検索の表示が残っているとタブを切り替えても内容が検索結果のままに見える → タブ選択で検索を閉じる (Codex R2 Low)
+    var boQEl = document.getElementById('boQ');
+    if (boQEl && boQEl.value) { boQEl.value = ''; renderProd(); }
+    render();
+    return;
+  }
   if ((v = g('data-jump'))) { jumpToOrder(v); return; } // 商品別注残・仕入先別ビューからPOへ
   if ((v = g('data-supsel'))) { SUP_SEL = v; render(); return; } // 🏭 仕入先別: 仕入先を選択
   if (g('data-supback')) { SUP_SEL = null; render(); return; } // 🏭 仕入先別: 一覧へ戻る

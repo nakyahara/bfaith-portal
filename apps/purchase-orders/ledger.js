@@ -449,11 +449,15 @@ export function listBackorders() {
     SELECT id, supplier_code, supplier_name, po_number, note, requested_date, issued_at, closed_at, origin, send_blocked, parent_order_id, ne_slip_number
     FROM po_orders WHERE status='issued' AND issued_at >= ? ORDER BY (closed_at IS NULL) DESC, issued_at DESC`).all(boundary);
   // 先方管理番号 (対応表)。仕入先別ビュー・注残確認CSVで表示する (仕入先は自社コードではなく自分の管理番号で突合するため)。
-  // tracked POに現れる仕入先分だけ読む (対応表全件prefetchの固定コストを避ける、Codex R1 Low)
-  const vendorCodeOf = new Map(db.prepare(`
+  // tracked POに現れる仕入先分だけ読む (対応表全件prefetchの固定コストを避ける、Codex R1 Low)。
+  // 仕入先→商品の入れ子Map (文字列連結キーはコードに区切り文字が含まれると別仕入先の番号が混入し得る、Codex R2 Medium)
+  const vendorCodeOf = new Map();
+  for (const r of db.prepare(`
     SELECT supplier_code, product_key, vendor_code FROM po_vendor_code_map
-    WHERE supplier_code IN (SELECT DISTINCT supplier_code FROM po_orders WHERE status='issued' AND issued_at >= ?)`).all(boundary)
-    .map(r => [`${r.supplier_code}|${r.product_key}`, r.vendor_code]));
+    WHERE supplier_code IN (SELECT DISTINCT supplier_code FROM po_orders WHERE status='issued' AND issued_at >= ?)`).all(boundary)) {
+    if (!vendorCodeOf.has(r.supplier_code)) vendorCodeOf.set(r.supplier_code, new Map());
+    vendorCodeOf.get(r.supplier_code).set(r.product_key, r.vendor_code);
+  }
   // 追加発注 (supplement) の親→子対応 (親POの行に「追加あり」を表示する用)
   const supByParent = new Map();
   for (const s of db.prepare("SELECT parent_order_id, po_number, id FROM po_orders WHERE parent_order_id IS NOT NULL AND status='issued'").all()) {
@@ -474,7 +478,7 @@ export function listBackorders() {
       const due = i.promised_date || i.requested_date || null;
       return {
         ...i,
-        vendor_code: vendorCodeOf.get(`${o.supplier_code}|${i.product_key}`) || null,
+        vendor_code: (vendorCodeOf.get(o.supplier_code) || new Map()).get(i.product_key) || null,
         due,
         flags: {
           overdue: i.remaining_qty > 0 && !!due && due < today,
