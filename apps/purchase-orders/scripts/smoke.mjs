@@ -1537,7 +1537,25 @@ console.log('── P15: メール送信 (fake transport) ──');
     ok(r.body.ok, '行の予約取消 (cancel API)');
     r = await j('/api/backorders');
     const sBo2 = r.body.orders.find(o => o.id === schedOrderId);
-    ok(sBo2 && (sBo2.email == null || sBo2.email.jobId !== rowJobId), '取消後: 予約中の表示が消える (cancelledは最新ジョブから除外)', sBo2 && sBo2.email);
+    ok(sBo2 && sBo2.email && sBo2.email.jobId !== rowJobId && sBo2.email.status === 'sent',
+      '取消後: cancelledを除いた直前ジョブ (sent) に戻る', sBo2 && sBo2.email);
+    // live送信済み+新規予約 → 「送信済み」と「予約中」が両立 (どちらの事実も消えない)
+    const jst3 = new Date(Date.now() + 9 * 3600000 + 7200000).toISOString().slice(0, 16);
+    r = await jsonPost('/api/orders/' + emOrderId + '/email/send', { scheduledAt: jst3 }, 'em-key-row2');
+    ok(r.body.ok && r.body.status === 'scheduled', '送信済みPOへの新規予約 (dry-run)');
+    const row2JobId = r.body.jobId;
+    r = await j('/api/backorders');
+    const emBo2 = r.body.orders.find(o => o.id === emOrderId);
+    ok(emBo2 && emBo2.emailSentLive === true && emBo2.email && emBo2.email.status === 'queued',
+      '発注残API: 送信済み (live) と予約中は両立表示', emBo2 && emBo2.email);
+    // 取消競合: 送信が始まった (sending) 後の取消は拒否 (送信前queued/failedのみ取消可)
+    db.prepare("UPDATE po_email_jobs SET status='sending' WHERE id=?").run(row2JobId);
+    r = await jsonPost('/api/email-jobs/' + row2JobId + '/cancel', {});
+    ok(r.status === 400 && r.body.error.includes('送信前'), '予約取消: sending中は拒否 (競合安全)', r.body.error);
+    // 後片付け: 状態機械トリガにより sending→queued は不可 (sent/failed/unknownのみ) → failed経由で取消
+    db.prepare("UPDATE po_email_jobs SET status='failed' WHERE id=?").run(row2JobId);
+    r = await jsonPost('/api/email-jobs/' + row2JobId + '/cancel', {});
+    ok(r.body.ok, '後片付け: failed→取消 (failedは取消可能)');
   }
 
   // MIME 生成 (Message-ID=delivery_key、添付CP932)
