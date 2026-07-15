@@ -636,7 +636,27 @@ router.post('/api/orders/:id/supplement', (req, res) => {
 const actorOf = req => (req.session && (req.session.email || req.session.displayName)) || 'portal';
 
 router.get('/api/backorders', (req, res) => {
-  try { res.json({ ok: true, ...listBackorders() }); }
+  try {
+    const data = listBackorders();
+    // PO行にメール状況を表示する (中原さん要望 2026-07-15): 最新の有効ジョブ (cancelled除く) と
+    // LIVE送信済みの事実を別々に持つ (最新が再送queued等でも「送信済み」の事実は消えない)
+    const db = getDB();
+    const latest = new Map();
+    for (const r of db.prepare(`
+      SELECT j.order_id, j.id AS jobId, j.status, j.is_dry_run AS dryRun, j.scheduled_at, j.sent_at
+      FROM po_email_jobs j
+      JOIN (SELECT order_id, MAX(id) AS mid FROM po_email_jobs WHERE status<>'cancelled' GROUP BY order_id) m ON m.mid = j.id`).all()) {
+      latest.set(r.order_id, { jobId: r.jobId, status: r.status, dryRun: !!r.dryRun,
+        scheduledAtJst: r.scheduled_at ? fmtJst(r.scheduled_at) : null,
+        sentAtJst: r.sent_at ? fmtJst(r.sent_at) : null });
+    }
+    const sentLive = new Set(db.prepare("SELECT DISTINCT order_id FROM po_email_jobs WHERE status='sent' AND is_dry_run=0").all().map(r => r.order_id));
+    for (const o of data.orders) {
+      o.email = latest.get(o.id) || null;
+      o.emailSentLive = sentLive.has(o.id);
+    }
+    res.json({ ok: true, ...data });
+  }
   catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
@@ -4853,7 +4873,7 @@ router.get('/backorders', (req, res) => {
     <div id="integrity"></div>
     <div class="tabbar" id="boTabs">
       <button data-view="attention" class="on">⚠️ 要対応</button>
-      <button data-view="open">オープン</button>
+      <button data-view="open" title="入荷待ち・一部入荷など、まだ残数がある発注">📦 未完了</button>
       <button data-view="closed">完了</button>
       <span class="muted" id="boCount" style="margin-left:8px"></span>
       <input type="text" id="boQ" placeholder="🔎 商品コード / 商品名で注残検索" style="margin-left:auto;min-width:280px" title="商品ごとの注残合計と、含まれる発注書 (PO) を横断表示します。POを開いてその場で入荷・減数の消込ができます">
@@ -4975,11 +4995,11 @@ function render() {
   document.querySelectorAll('#boTabs button').forEach(function(b) {
     var v = b.getAttribute('data-view');
     b.classList.toggle('on', v === VIEW);
-    b.textContent = (v === 'attention' ? '⚠️ 要対応' : v === 'open' ? 'オープン' : '完了') + ' (' + counts[v] + ')';
+    b.textContent = (v === 'attention' ? '⚠️ 要対応' : v === 'open' ? '📦 未完了' : '完了') + ' (' + counts[v] + ')';
   });
   var s = DATA.summary;
   document.getElementById('boCount').textContent =
-    'オープン' + s.openOrders + '件 / 残数量 ' + s.remainingQty.toLocaleString('ja-JP') +
+    '未完了 ' + s.openOrders + '件 / 残数量 ' + s.remainingQty.toLocaleString('ja-JP') +
     ' / 既知単価分 ' + yen(s.knownAmount) + (s.unknownCostItems ? ' (単価未設定 ' + s.unknownCostItems + '明細)' : '');
   updateBulkBar(); // 早期return経路でも選択バーの表示状態を最新化 (Codex 一括R1 High)
   if (!DATA.boundary) {
@@ -5004,26 +5024,47 @@ function render() {
   updateBulkBar();
 }
 
+// PO行のメール状況バッジ (中原さん要望 2026-07-15: 送信完了の表示+送信前の予約取消)
+function emailBadge(o) {
+  var e = o.email;
+  var h = '';
+  if (o.emailSentLive) h += ' ' + badge('b-issued', '📧 送信済み', '発注書メールを送信済み');
+  if (!e) return h;
+  if (e.status === 'queued') {
+    h += ' ' + badge('b-draft', '⏰ メール予約中' + (e.scheduledAtJst ? ' ' + e.scheduledAtJst : ''), '予約日時になったら自動送信されます') +
+      ' <button class="ghost" data-rowcancel="' + e.jobId + '" style="font-size:11px;padding:2px 8px" title="送信前の予約メールを取り消します (取消後は📧パネルやまとめて送信からやり直せます)">🚫 予約取消</button>';
+  } else if (e.status === 'sending') h += ' ' + badge('b-draft', '📨 メール送信中');
+  else if (e.status === 'failed') h += ' ' + badge('b-draft', '❌ メール失敗', '📧 発注書メールから再試行/取消できます');
+  else if (e.status === 'unknown') h += ' ' + badge('b-draft', '⚠️ メール送信不明', '📧 発注書メールの「照合」で確認してください');
+  else if (e.status === 'sent' && e.dryRun && !o.emailSentLive) h += ' ' + badge('b-draft', '📧 dry-run送信のみ', '社内宛のテスト送信のみ。本番送信はまだ');
+  return h;
+}
 function orderHtml(o) {
   var st = o.open
-    ? (o.remainingQty > 0 && o.items.some(function(i){ return i.received_qty > 0; }) ? badge('b-draft', '一部入荷') : badge('b-issued', 'オープン'))
+    ? (o.remainingQty > 0 && o.items.some(function(i){ return i.received_qty > 0; }) ? badge('b-draft', '一部入荷') : badge('b-issued', '入荷待ち'))
     : badge('b-issued', o.closeReason === 'manual' ? '完了 (打切あり)' : '完了');
   var flags = '';
   if (o.overdueItems) flags += badge('b-issued', '🔴 遅延 ' + o.overdueItems + '明細');
-  else if (o.attentionItems) flags += badge('b-draft', '⚠️ 要対応 ' + o.attentionItems + '明細');
+  // (「⚠️ 要対応 ◯明細」バッジは廃止 — 中原さん要望 2026-07-15。要対応タブ自体で絞れる)
   // 仕入先名はリンクにしない (以前は発注ワークスペースへ飛んでいて「確定した明細が消えた」ように
   // 見える誤解を生んだ、中原さん報告 2026-07-13)。行クリック=このPOの確定明細を展開。ワークスペースへは展開部の🛒から
   // 送信可能なPO (オープン+メール対象) は一括送信用チェックボックスを出す
   var selBox = (o.open && !o.sendBlocked)
     ? '<input type="checkbox" class="boSel" data-osel="' + o.id + '"' + (SEL[o.id] ? ' checked' : '') + ' title="チェックして上の「📧 まとめて送信」で一括送信予約" style="margin-right:6px;transform:scale(1.2)"> '
     : '';
+  // 発注金額 = 確定時明細の Σround(単価×発注数)。単価未設定明細 (NE移行の一部) があれば「+α」
+  var orderAmt = 0, amtUnknown = 0;
+  o.items.forEach(function(i){ if (i.unit_cost != null) orderAmt += Math.round(i.unit_cost * i.qty); else amtUnknown++; });
   var h = '<div class="sec"><h2 style="cursor:pointer" data-toggle="' + o.id + '" tabindex="0" role="button" aria-expanded="false" title="クリックでこの発注の明細 (確定時の内容) を開閉">' +
     selBox +
+    '<span style="margin-right:8px">' + fmtD(o.issuedAt) + '</span>' +
     esc(o.poNumber || ('#' + o.id)) + ' — ' + esc(o.supplierName) + ' ' +
+    '<span class="muted" style="font-weight:normal;font-size:12px">' + o.items.length + 'SKU 金額 ' + yen(orderAmt) + (amtUnknown ? '+α' : '') + '</span> ' +
     st + (o.origin === 'migration' ? ' ' + badge('b-draft', '🔁 NE移行分', 'NE発注残の初期取込で作成 (発注書メール対象外)') : '') +
     (o.origin === 'supplement' ? ' ' + badge('b-draft', '➕ ' + (o.parentPoNumber || '') + ' への追加分', '発注確定後に電話等で口頭追加した分 (元POに紐づく別PO)') : '') +
     (o.supplementPoNumbers && o.supplementPoNumbers.length ? ' ' + badge('b-issued', '➕ 追加あり: ' + o.supplementPoNumbers.join(', '), 'このPOの確定後に追加発注した分 (別POとして下に表示)') : '') + ' ' + flags +
-    '<span class="muted" style="font-weight:normal;font-size:12px;margin-left:8px">発注 ' + fmtD(o.issuedAt) + ' / 希望納期 ' + fmtD(o.requestedDate) +
+    emailBadge(o) +
+    '<span class="muted" style="font-weight:normal;font-size:12px;margin-left:8px">希望納期 ' + fmtD(o.requestedDate) +
     ' / 残 ' + o.remainingQty.toLocaleString('ja-JP') + ' (' + yen(o.knownAmount) + ')' + (o.note ? ' / 📝' + esc(o.note) : '') + '</span></h2>' +
     '<div class="bd" id="items-' + o.id + '" style="display:none;max-height:none">';
   h += '<table class="t"><tr><th>商品</th><th class="r">発注</th><th class="r">入荷済</th><th class="r">減数</th><th class="r">取消</th><th class="r">残</th><th>納期 (希望→回答)</th><th>残数の扱い</th><th></th></tr>';
@@ -5194,7 +5235,7 @@ function renderProd() {
     });
   });
   var keys = Object.keys(groups).sort();
-  var h = '<div class="sec" style="padding:10px 12px;margin:6px 0"><b>🔎 商品別注残: 「' + esc(q) + '」 ' + keys.length + '商品</b> <span class="muted">(オープン発注の残数のみ。「開く」でPOに移動してその場で📥入荷/➖減数の消込ができます)</span>';
+  var h = '<div class="sec" style="padding:10px 12px;margin:6px 0"><b>🔎 商品別注残: 「' + esc(q) + '」 ' + keys.length + '商品</b> <span class="muted">(未完了の発注の残数のみ。「開く」でPOに移動してその場で📥入荷/➖減数の消込ができます)</span>';
   if (!keys.length) h += '<div class="muted" style="margin-top:6px">該当する注残はありません</div>';
   keys.forEach(function(k) {
     var gp = groups[k];
@@ -5675,6 +5716,25 @@ document.addEventListener('click', function(ev) {
   if ((v = g('data-emailui'))) { emailPanel(v); return; }
   if ((v = g('data-supplyui'))) { supPanel(v); return; }
   if ((v = g('data-emclose'))) { document.getElementById('emailArea-' + v).innerHTML = ''; return; }
+  if ((v = g('data-rowcancel'))) {
+    // PO行の「🚫 予約取消」: 送信前 (queued) の予約メールを取り消す (中原さん要望 2026-07-15)
+    if (!confirm('この予約メールを取り消しますか?\\n(まだ送信されていません。取消後は📧発注書メールやまとめて送信からやり直せます)')) return;
+    t.disabled = true;
+    post(API + '/email-jobs/' + v + '/cancel', {}).then(function(j) {
+      if (!j.ok) {
+        // 取消できるのは送信前だけ。時刻到来で送信が始まっていた場合はここに来る → 最新状態を再表示
+        alert('⚠️ 取消できませんでした\\n\\n理由: ' + (j.error || '不明') + '\\n\\nすでに送信が始まっている可能性があります。最新の状態を確認してください');
+      } else {
+        toast('予約を取り消しました');
+      }
+      load();
+    }).catch(function(e) {
+      t.disabled = false;
+      alert('⚠️ 通信エラー: ' + e.message + '\\n\\n取り消せたか不明です。画面を更新して状態を確認してください');
+      load();
+    });
+    return;
+  }
   if ((v = g('data-emretry'))) {
     t.disabled = true;
     var emOrder = g('data-emorder');
