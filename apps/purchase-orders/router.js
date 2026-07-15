@@ -27,6 +27,7 @@ import {
 } from './ledger.js';
 import { importInboundCsv, previewInboundCsv, listInbound, candidatesFor, setInboundIgnore, autoAssignPreview, sortCandidatesFifo, listInboundBatches, inboundBatchLines, parseCsv as parseCsvStrict } from './inbound.js';
 import { importNeBackorderCsv } from './migration.js';
+import { listBarcodeOverview, upsertLabel, importBarcodeCsv, barcodeAttacher, barcodeTargetSupplier, loadLabelMap } from './barcode-labels.js';
 import {
   buildOrderEmail, createEmailJob, processEmailJob, reconcileEmailJobs, listEmailJobs, emailSettings, parseAddresses,
   markUnsent, cancelEmailJob, startEmailDispatcher, csvCell,
@@ -315,6 +316,16 @@ function supplierWorkspaceData(code) {
   const sm = masters.suppliers.get(code);
   if (!g && !sm) return null;
   const db = getDB();
+  // 🏷️ 自社商品バーコードラベル (AMCのワークスペースのみ)。computeAll の salesClass で対象判定するので
+  // PMLの再読込は不要 — ラベル表だけ読む。未登録=行なし (発注時に印字依頼漏れを防ぐ表示)
+  const bcLabels = code === barcodeTargetSupplier() ? loadLabelMap() : null;
+  const bcOf = p => {
+    if (!bcLabels || String(p.salesClass || '').trim() !== '1') return null;
+    const l = bcLabels.get(p.key);
+    return l
+      ? { status: l.status, value: l.barcodeValue || '', note: l.note || '', version: l.version }
+      : { status: 'unregistered', value: '', note: '', version: null };
+  };
   const draftRow = db.prepare("SELECT id, note, requested_date FROM po_orders WHERE supplier_code=? AND status='draft'").get(code);
   const draft = draftRow ? {
     id: draftRow.id, note: draftRow.note || '', requestedDate: draftRow.requested_date || '',
@@ -332,7 +343,7 @@ function supplierWorkspaceData(code) {
     const byKey = new Map(products.map(p => [p.key, p]));
     draftExtras = draft.items.filter(it => !listKeys.has(it.key)).map(it => {
       const p = byKey.get(it.key);
-      if (p) { extraProducts.push(p); return { ...productDto(p), extra: true }; }
+      if (p) { extraProducts.push(p); return { ...productDto(p), barcode: bcOf(p), extra: true }; }
       return { code: it.code, name: it.name || '', cost: it.cost, stock: null, backOrder: null, sales30: null, sales7: null, lot: null, stockMonths: null, recQty: null, extra: true, missing: true };
     });
   }
@@ -402,9 +413,9 @@ function supplierWorkspaceData(code) {
     } : null,
     overlay,
     supplier: { code, name: (sm && sm.name) || (g && g.name) || `仕入先 ${code}`, memo: (sm && sm.order_memo) || '' },
-    targets: g ? g.targets.map(productDto) : [],
-    candidates: g ? g.candidates.map(productDto) : [],
-    horikoshi: g ? g.horikoshi.map(productDto) : [],
+    targets: g ? g.targets.map(p => ({ ...productDto(p), barcode: bcOf(p) })) : [],
+    candidates: g ? g.candidates.map(p => ({ ...productDto(p), barcode: bcOf(p) })) : [],
+    horikoshi: g ? g.horikoshi.map(p => ({ ...productDto(p), barcode: bcOf(p) })) : [],
     conditions, materialGroups, draft, draftExtras, issuedMonth, issuedByCond, issuedTotal, allGroups,
     monthLabel: jstNow.toISOString().slice(0, 7),
   };
@@ -654,6 +665,14 @@ router.get('/api/backorders', (req, res) => {
     for (const o of data.orders) {
       o.email = latest.get(o.id) || null;
       o.emailSentLive = sentLive.has(o.id);
+    }
+    // 🏷️ 自社商品 (AMC×売上分類1) の明細にバーコードラベル状態を付与 (対象外商品には付けない)
+    const bc = barcodeAttacher();
+    for (const o of data.orders) {
+      for (const i of o.items) {
+        const b = bc.of(i.product_key);
+        if (b) i.barcode = b;
+      }
     }
     res.json({ ok: true, ...data });
   }
@@ -1848,6 +1867,50 @@ router.delete('/api/vendor-map/entry', (req, res) => {
 });
 
 // P13a: 台帳の整合性検査 (負残/closed不整合/発行取りこぼし/disposition規則)。P13bで管理画面に表示する
+// ─── 🏷️ 自社商品バーコードラベル管理 (対象=AMC×売上分類1。詳細は barcode-labels.js 冒頭コメント) ───
+router.get('/api/barcode-labels', (req, res) => {
+  try { res.json({ ok: true, ...listBarcodeOverview() }); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// 1件更新 (upsert)。version=null=新規登録 / version指定=楽観ロック更新 (不一致は409+current返却→画面で再読込)
+router.put('/api/barcode-labels/:key', (req, res) => {
+  try {
+    const b = req.body || {};
+    const { label } = upsertLabel({
+      productKey: req.params.key, productCode: trimS(b.productCode),
+      status: trimS(b.status), barcodeValue: b.barcodeValue, note: b.note,
+      version: b.version == null ? null : Number(b.version), actor: actorOf(req),
+    });
+    res.json({ ok: true, label });
+  } catch (e) {
+    res.status(e.status === 409 ? 409 : 400).json({ ok: false, error: e.message, current: e.current !== undefined ? e.current : null });
+  }
+});
+
+// CSV取込 (旧Excel移行用)。commit='1'以外はプレビューのみ。commit時はプレビュー応答の fileHash 一致を要求
+// (別ファイル誤取込防止。既存の取込画面と同じ二段方式)。CSVに無い行は消さない upsert 方式 (Codex設計相談)
+router.post('/api/barcode-labels/import-csv', upload.single('file'), (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ ok: false, error: 'ファイルがありません' });
+    let buf;
+    try { buf = fs.readFileSync(req.file.path); } finally { try { fs.unlinkSync(req.file.path); } catch {} }
+    const rows = parseCsvBuffer(buf);
+    const fileHash = createHash('sha256').update(buf).digest('hex');
+    const commit = String((req.body || {}).commit) === '1';
+    const result = importBarcodeCsv({
+      rows, fileHash, commit,
+      expectedHash: trimS((req.body || {}).fileHash) || null,
+      expectedStateHash: trimS((req.body || {}).stateHash) || null,
+      actor: actorOf(req),
+    });
+    if (result.committed) {
+      audit(getDB(), { actorType: 'user', actor: actorOf(req), action: 'barcode_labels_import', resource: 'barcode_labels', detail: { counts: result.counts } });
+    }
+    res.json({ ok: true, ...result });
+  } catch (e) { res.status(e.status === 409 ? 409 : 400).json({ ok: false, error: e.message }); }
+});
+
 router.get('/api/ledger/integrity', (req, res) => {
   try {
     let orderId = null;
@@ -2837,6 +2900,88 @@ function dlCsv(filename, rows) {
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
   URL.revokeObjectURL(a.href);
 }
+// ── 🏷️ 自社商品バーコードラベル (バッジ+ポップオーバー編集。発注残/発注ワークスペース/マスタ管理で共用) ──
+// 対象=アメージングクラフト×売上分類1 (自社商品)。AMCが商品ラベルを印刷するため、Amazon FNSKUバーコードを
+// ラベルに直接印字してもらう運用。どの商品が設定済みかをここで管理する (旧Excel「BFバーコード管理」の移行先)
+var BC_META = {
+  printed:      { l: '🏷️設定済み', s: 'background:#dcfce7;color:#166534', t: 'ラベルにバーコード設定済み' },
+  requested:    { l: '🏷️依頼中',   s: 'background:#fef9c3;color:#854d0e', t: 'AMCに印字依頼中 (ラベル反映待ち)' },
+  unset:        { l: '🏷️未設定',   s: 'background:#fee2e2;color:#b91c1c', t: 'バーコード未設定 — 発注時にAMCへ印字依頼が必要' },
+  unregistered: { l: '🏷️未登録',   s: 'background:#fff1f2;color:#b91c1c;border:1px solid #fda4af', t: 'バーコード管理に未登録 (旧Excelにも無かった商品)' },
+  not_needed:   { l: '🏷️印字不要', s: 'background:#f1f5f9;color:#64748b', t: 'ラベルにスペースなし等で印字しない商品' }
+};
+function bcBadge(code, b) {
+  if (!b || !BC_META[b.status]) return '';
+  var m = BC_META[b.status];
+  return ' <span class="badge" data-bcedit="' + esc(code) + '" style="cursor:pointer;' + m.s + '" title="' +
+    esc(m.t + (b.value ? ' / ' + b.value : '') + ' — クリックで状態を変更') + '">' + m.l + '</span>';
+}
+var BC_POP = null;
+function bcCloseEditor() {
+  if (!BC_POP) return;
+  BC_POP.remove(); BC_POP = null;
+  document.removeEventListener('mousedown', bcOutside, true);
+}
+function bcOutside(ev) { if (BC_POP && !BC_POP.contains(ev.target)) bcCloseEditor(); }
+// anchor=バッジ要素 / code=商品コード / b={status,value,note,version} / onSaved(label|null) — null=409等で要再読込
+function bcOpenEditor(anchor, code, b, onSaved) {
+  bcCloseEditor();
+  var d = document.createElement('div');
+  d.style.cssText = 'position:absolute;z-index:1000;background:#fff;border:1px solid #cbd5e1;border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.15);padding:12px;min-width:300px;max-width:360px;font-size:13px';
+  var isNew = b.status === 'unregistered';
+  var opts = [['printed', '設定済み (ラベルにバーコードあり)'], ['requested', '依頼中 (AMCに印字依頼済み)'], ['unset', '未設定 (これから依頼する)'], ['not_needed', '不要 (ラベルにスペースなし等)']];
+  d.innerHTML = '<div style="font-weight:bold;margin-bottom:6px">🏷️ ' + esc(code) + ' のバーコードラベル' + (isNew ? ' <span class="badge" style="background:#fff1f2;color:#b91c1c">新規登録</span>' : '') + '</div>' +
+    '<label style="display:block;margin-bottom:6px">状態<br><select id="bcSt" style="width:100%">' +
+      opts.map(function(o){ return '<option value="' + o[0] + '"' + (b.status === o[0] ? ' selected' : '') + '>' + o[1] + '</option>'; }).join('') + '</select></label>' +
+    '<label style="display:block;margin-bottom:6px">バーコード値 (FNSKU/JAN 任意)<br><input id="bcVal" type="text" value="' + esc(b.value || '') + '" style="width:100%" placeholder="例: X0019R42C5"></label>' +
+    '<label style="display:block;margin-bottom:6px">備考<br><input id="bcNote" type="text" value="' + esc(b.note || '') + '" style="width:100%"></label>' +
+    '<div id="bcWarn" style="color:#b45309;font-size:12px;margin-bottom:6px"></div>' +
+    '<div style="display:flex;gap:8px;justify-content:flex-end"><button class="ghost" id="bcCancel">キャンセル</button><button class="pri" id="bcSave">保存</button></div>';
+  document.body.appendChild(d);
+  var r = anchor.getBoundingClientRect();
+  d.style.left = Math.max(8, Math.min(window.scrollX + r.left, window.scrollX + document.documentElement.clientWidth - d.offsetWidth - 12)) + 'px';
+  d.style.top = (window.scrollY + r.bottom + 6) + 'px';
+  BC_POP = d;
+  document.addEventListener('mousedown', bcOutside, true);
+  function bcWarnUpd() {
+    var st = d.querySelector('#bcSt').value, v = d.querySelector('#bcVal').value.trim();
+    var w = '';
+    if ((st === 'printed' || st === 'requested') && !v) w = '⚠️ バーコード値が空です (分かるなら入れておくのがおすすめ)';
+    if (st === 'not_needed' && v) w = '⚠️ 「不要」なのにバーコード値が入っています';
+    d.querySelector('#bcWarn').textContent = w;
+  }
+  d.querySelector('#bcSt').addEventListener('change', bcWarnUpd);
+  d.querySelector('#bcVal').addEventListener('input', bcWarnUpd);
+  bcWarnUpd();
+  d.addEventListener('keydown', function(ev){ if (ev.key === 'Escape') bcCloseEditor(); });
+  d.querySelector('#bcCancel').addEventListener('click', bcCloseEditor);
+  d.querySelector('#bcSave').addEventListener('click', function() {
+    var btn = d.querySelector('#bcSave');
+    btn.disabled = true;
+    var payload = {
+      productCode: code, status: d.querySelector('#bcSt').value,
+      barcodeValue: d.querySelector('#bcVal').value, note: d.querySelector('#bcNote').value,
+      version: isNew ? null : b.version,
+    };
+    fetch('/apps/purchase-orders/api/barcode-labels/' + encodeURIComponent(String(code).trim().toLowerCase()), {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+    }).then(function(r2) {
+      return r2.json().then(function(j){ j._st = r2.status; return j; })
+        .catch(function(){ return { ok: false, error: 'HTTP ' + r2.status + ' — 保存されたか不明です。再読込して確認してください', _st: r2.status }; });
+    }).then(function(j) {
+      if (!j.ok) {
+        btn.disabled = false;
+        toast('エラー: ' + (j.error || '不明'));
+        if (j._st === 409) { bcCloseEditor(); if (onSaved) onSaved(null); } // 競合 → 最新を再読込
+        return;
+      }
+      bcCloseEditor();
+      var m2 = BC_META[j.label.status];
+      toast('🏷️ ' + code + ' を「' + (m2 ? m2.l.replace('🏷️', '') : j.label.status) + '」で保存しました');
+      if (onSaved) onSaved(j.label);
+    }).catch(function(e){ btn.disabled = false; toast('通信エラー: ' + e.message); });
+  });
+}
 ${script || ''}
 </script>
 </body></html>`;
@@ -3258,7 +3403,7 @@ function addedBadge(p) {
 function rowHtml(p, kind) {
   var rec = p.recQty ? p.recQty.toLocaleString('ja-JP') : '—';
   return '<tr>' +
-    '<td><a class="copyv" data-copy="' + esc(p.code) + '" title="クリックで商品コードをコピー">' + esc(p.code) + '</a>' + issuedBadge(p) + selBadge(p) + addedBadge(p) + '</td>' +
+    '<td><a class="copyv" data-copy="' + esc(p.code) + '" title="クリックで商品コードをコピー">' + esc(p.code) + '</a>' + issuedBadge(p) + selBadge(p) + addedBadge(p) + bcBadge(p.code, p.barcode) + '</td>' +
     '<td><a class="pname" data-acc="' + esc(p.code) + '" title="クリックで詳細・発注条件・同グループ商品">' + esc(p.name) + '</a></td>' +
     '<td class="r">' + months(p) + '</td>' +
     '<td class="r">' + p.sales30.toLocaleString('ja-JP') + '</td>' +
@@ -3738,6 +3883,22 @@ document.addEventListener('click', function(ev) {
     openAccFor(acc);
     return;
   }
+  // 🏷️ バーコードラベル状態の編集 (自社商品のみバッジが付く)
+  var bcCode = ev.target.getAttribute && ev.target.getAttribute('data-bcedit');
+  if (bcCode) {
+    var bcP = byCode[bcCode];
+    if (bcP && bcP.barcode) {
+      bcOpenEditor(ev.target, bcCode, bcP.barcode, function(label) {
+        if (label) {
+          bcP.barcode = { status: label.status, value: label.barcodeValue || '', note: label.note || '', version: label.version };
+          renderLists(); renderAll();
+        } else {
+          location.reload(); // 409競合 → 最新データで開き直す
+        }
+      });
+    }
+    return;
+  }
   // 必要数クリック → 発注数へ反映
   if (ev.target.classList && ev.target.classList.contains('need')) {
     var q = parseInt(ev.target.getAttribute('data-q'), 10);
@@ -3970,6 +4131,17 @@ function save(issue) {
     var nd = items.filter(function(i){ return i.requestedDate; }).length;
     msg += '\\n\\n🗓 希望納期: ' + (nd ? nd + '\/' + items.length + '品目に指定あり (メールに記載されます)' : '指定なし');
     if (D.supplier.memo) msg += '\\n\\n📌 発注メモ: ' + D.supplier.memo;
+    // 🏷️ バーコード未設定/未登録の自社商品が含まれる発注 → 印字依頼漏れの注意喚起 (ブロックはしない。
+    // 状態の自動変更もしない — 実際に依頼したらバッジから「依頼中」に手動変更、Codex設計相談 2026-07-15)
+    var bcMiss = items.filter(function(i) {
+      var p = byCode[i.code];
+      return p && p.barcode && (p.barcode.status === 'unset' || p.barcode.status === 'unregistered');
+    });
+    if (bcMiss.length) {
+      msg += '\\n\\n🏷️ バーコード未設定/未登録の自社商品が ' + bcMiss.length + '品目あります。AMCへのバーコード印字依頼を忘れずに:\\n・' +
+        bcMiss.slice(0, 10).map(function(i){ return i.code; }).join('\\n・') +
+        (bcMiss.length > 10 ? '\\n・…ほか' + (bcMiss.length - 10) + '品目' : '');
+    }
     if (!confirm(msg)) return;
   }
   // 二重送信ガード (確定連打で同内容の発注が複数作られるのを防ぐ)
@@ -5323,7 +5495,7 @@ function orderHtml(o) {
   h += '<table class="t"><tr><th>商品</th><th class="r">発注</th><th class="r">入荷済</th><th class="r">減数</th><th class="r">取消</th><th class="r">残</th><th>納期 (希望→回答)</th><th>残数の扱い</th><th></th></tr>';
   o.items.forEach(function(i) {
     h += '<tr data-item="' + i.id + '">' +
-      '<td><b>' + esc(i.product_code) + '</b><div class="muted" style="font-size:11px">' + esc(i.product_name || '') + '</div>' + itemFlagBadges(i) + '</td>' +
+      '<td><b>' + esc(i.product_code) + '</b><div class="muted" style="font-size:11px">' + esc(i.product_name || '') + '</div>' + itemFlagBadges(i) + bcBadge(i.product_code, i.barcode) + '</td>' +
       '<td class="r">' + i.qty + '</td><td class="r">' + i.received_qty + '</td><td class="r">' + i.shortage_qty + '</td><td class="r">' + i.cancelled_qty + '</td>' +
       '<td class="r"><b>' + i.remaining_qty + '</b></td>' +
       '<td>' + fmtD(i.requested_date) + ' → <span data-pedit="' + i.id + '" style="cursor:pointer;text-decoration:underline dotted" title="クリックで回答納期を入力">' + fmtD(i.promised_date) + '</span></td>' +
@@ -5542,7 +5714,7 @@ function renderSupplierView(arr) {
     h += '<tr><td class="muted">' + fmtD(o.issuedAt) + '</td>' +
       '<td>' + esc(supPoNo(o)) + (o.origin === 'migration' ? ' ' + badge('b-draft', '🔁 NE', 'NE移行分 (番号はNE伝票番号)') : '') + '</td>' +
       '<td>' + (i.vendor_code ? esc(i.vendor_code) : '<span class="muted" title="対応表 (マスタ管理→📇先方番号対応表) に未登録。CSVでは空欄になります">—</span>') + '</td>' +
-      '<td><b>' + esc(i.product_code) + '</b><div class="muted" style="font-size:11px">' + esc(i.product_name || '') + '</div></td>' +
+      '<td><b>' + esc(i.product_code) + '</b><div class="muted" style="font-size:11px">' + esc(i.product_name || '') + '</div>' + bcBadge(i.product_code, i.barcode) + '</td>' +
       '<td class="r">' + i.qty + '</td><td class="r">' + i.received_qty + '</td><td class="r">' + i.shortage_qty + '</td><td class="r">' + i.cancelled_qty + '</td>' +
       '<td class="r"><b>' + i.remaining_qty + '</b></td>' +
       '<td>' + fmtD(i.requested_date) + ' → ' + fmtD(i.promised_date) + (i.flags.overdue ? ' ' + badge('b-issued', '🔴 超過') : '') + '</td>' +
@@ -5604,7 +5776,7 @@ function renderProd() {
   if (!keys.length) h += '<div class="muted" style="margin-top:6px">該当する注残はありません</div>';
   keys.forEach(function(k) {
     var gp = groups[k];
-    h += '<div style="margin-top:10px"><b>' + esc(gp.code) + '</b> <span class="muted">' + esc(gp.name) + '</span> — 注残合計 <b>' + gp.totalRem.toLocaleString('ja-JP') + '</b></div>' +
+    h += '<div style="margin-top:10px"><b>' + esc(gp.code) + '</b> <span class="muted">' + esc(gp.name) + '</span> — 注残合計 <b>' + gp.totalRem.toLocaleString('ja-JP') + '</b>' + bcBadge(gp.code, gp.rows[0] && gp.rows[0].i.barcode) + '</div>' +
       '<table class="t" style="margin-top:2px"><tr><th>発注書</th><th>仕入先</th><th>発注日</th><th class="r">発注</th><th class="r">入荷済</th><th class="r">残</th><th>納期 (希望→回答)</th><th>残数の扱い</th><th></th></tr>' +
       gp.rows.map(function(row) {
         return '<tr><td>' + esc(row.o.poNumber || ('#' + row.o.id)) + '</td><td>' + esc(row.o.supplierName) + '</td>' +
@@ -5619,6 +5791,16 @@ function renderProd() {
   prod.innerHTML = h;
   prod.style.display = '';
   list.style.display = 'none';
+}
+// 🏷️ 商品コード → バーコードラベル状態 (DATAの明細から逆引き。同一商品はどのPO行でも同じ値が付いている)
+function bcFindBarcode(code) {
+  var k = String(code).toLowerCase(), found = null;
+  (DATA ? DATA.orders : []).forEach(function(o) {
+    o.items.forEach(function(i) {
+      if (!found && i.barcode && i.product_code.toLowerCase() === k) found = i.barcode;
+    });
+  });
+  return found;
 }
 var boQTimer = null;
 document.getElementById('boQ').addEventListener('input', function() {
@@ -6075,6 +6257,12 @@ document.addEventListener('click', function(ev) {
   if ((v = g('data-supsel'))) { SUP_SEL = v; render(); return; } // 🏭 仕入先別: 仕入先を選択
   if (g('data-supback')) { SUP_SEL = null; render(); return; } // 🏭 仕入先別: 一覧へ戻る
   if ((v = g('data-csvdl'))) { dlSupplierCsv(v, t); return; } // 📥 注残確認CSV
+  if ((v = g('data-bcedit'))) {
+    // 🏷️ バーコードラベル状態の編集 (保存/409競合後は一覧を再読込して全バッジを更新)
+    var bcb = bcFindBarcode(v);
+    if (bcb) bcOpenEditor(t, v, bcb, function(){ load(); });
+    return;
+  }
   // 見出し内の子要素 (badge/日付span等) クリックでも展開する (Codex R1 Medium)。
   // 見出し内の操作要素 (回答納期編集span等の data-* 持ち) は除外して個別ハンドラに委ねる
   if (!g('data-pedit') && !g('data-emailui') && !g('data-closeui') && t.tagName !== 'A' && t.tagName !== 'BUTTON') {
@@ -6418,9 +6606,25 @@ router.get('/admin', (req, res) => {
       <button data-grp="suppliers" class="on">🏭 仕入先</button>
       <button data-grp="conditions">📦 発注条件・商品</button>
       <button data-grp="vendormap">📇 先方番号対応表</button>
+      <button data-grp="barcode">🏷️ バーコード</button>
       <button data-grp="mail">📧 メール設定</button>
     </div>
     <div class="hint" id="grpHint" style="margin-bottom:10px"></div>
+
+    <!-- 🏷️ バーコードラベル: 旧Excel「BFバーコード管理」移行用CSV取込 -->
+    <div class="import-zone" id="zoneBarcode" style="display:none">
+      <h3>📥 バーコード管理CSVの取込 (旧Excel移行用)</h3>
+      <div class="hint">
+        見出し「<b>商品コード</b>」「<b>状態</b> (設定済み/依頼中/不要/未設定)」が必要。任意列: バーコード値 (FNSKU/JAN)・備考・AMC管理番号。<br>
+        <b>CSVにある商品だけ上書き</b>し、CSVに無い商品は消しません。画面で手動編集済みの行をCSVが上書きする場合はプレビューで確認できます。
+      </div>
+      <form id="bcImpForm" class="row">
+        <input type="file" name="file" accept=".csv" required>
+        <button type="submit" class="ghost">プレビュー</button>
+        <span id="bcImpStatus" class="muted"></span>
+      </form>
+      <div id="bcImpOut" style="margin-top:8px"></div>
+    </div>
 
     <!-- 📦 発注条件・商品: スプシCSV一括取込 (対象がこのグループのマスタ群のため、ここに内包) -->
     <div class="import-zone" id="zoneImport" style="display:none">
@@ -6504,6 +6708,7 @@ var GRP_HINTS = {
   suppliers: '🏭 新しい仕入先の登録、発注書メールの宛先 (To/CC/担当者名)、発注方法 (📧メール/📠FAX/🌐WEB) をここで設定します。',
   conditions: '📦 商品をどの発注条件・原料グループで発注するかの設定と、スプレッドシートCSVの一括取込。新商品の紐付け漏れチェックもここ。',
   vendormap: '📇 自社商品コードと先方管理番号 (アメージングクラフト/ビーフリーの発注書に載る番号) の対応をここで管理します。',
+  barcode: '🏷️ 自社商品 (AMC製造×売上分類1) のラベルにAmazonバーコード (FNSKU) が印字設定済みかをここで管理します。未登録/未設定の商品は発注時に印字依頼が必要。',
   mail: '📧 発注書メールの送信モード (dry-run/本番)・差出情報・文面テンプレ・宛先マスタの一括取込。',
 };
 function setGroup(g) {
@@ -6513,10 +6718,11 @@ function setGroup(g) {
   document.getElementById('zoneImport').style.display = g === 'conditions' ? '' : 'none';
   document.getElementById('zoneMail').style.display = g === 'mail' ? '' : 'none';
   document.getElementById('zoneVmapCsv').style.display = g === 'vendormap' ? '' : 'none';
+  document.getElementById('zoneBarcode').style.display = g === 'barcode' ? '' : 'none';
   document.getElementById('subBar').style.display = g === 'conditions' ? '' : 'none';
   document.getElementById('tabSec').style.display = g === 'mail' ? 'none' : '';
   if (g === 'mail') return; // メール設定はゾーンのみ (テーブルなし)
-  TAB = g === 'suppliers' ? 'suppliers' : g === 'vendormap' ? 'vendormap' : SUBTAB;
+  TAB = g === 'suppliers' ? 'suppliers' : g === 'vendormap' ? 'vendormap' : g === 'barcode' ? 'barcode' : SUBTAB;
   document.querySelectorAll('#subBar button').forEach(function(b){ b.classList.toggle('on', b.getAttribute('data-tab') === TAB); });
   load();
 }
@@ -6685,9 +6891,138 @@ function loadUnlinked(days) {
     .then(function(r){ return r.json(); })
     .then(function(j){ if (j.ok) renderUnlinked(j); else document.getElementById('tabBody').textContent = j.error; });
 }
+// ── 🏷️ バーコードラベルタブ (自社商品=AMC×売上分類1 の全対象商品を未登録含めて一覧管理。
+//     旧Excel「BFバーコード管理_既存商品.xlsx」の移行先。バッジクリックで状態変更) ──
+var BC_FILTER = 'all';
+var BC_DATA = null;
+var BC_GEN = 0;
+function loadBarcode() {
+  var gen = ++BC_GEN;
+  document.getElementById('tabBody').textContent = '読み込み中…';
+  fetch('/apps/purchase-orders/api/barcode-labels').then(function(r){ return r.json(); }).then(function(j) {
+    if (gen !== BC_GEN || TAB !== 'barcode') return;
+    if (!j.ok) { document.getElementById('tabBody').textContent = j.error || '取得に失敗しました'; return; }
+    BC_DATA = j;
+    renderBarcode();
+  }).catch(function(e){ if (gen === BC_GEN && TAB === 'barcode') document.getElementById('tabBody').textContent = '通信エラー: ' + e.message; });
+}
+function bcStatusOf(r) { return r.label ? r.label.status : 'unregistered'; }
+function renderBarcode() {
+  var j = BC_DATA;
+  if (!j) return;
+  if (!j.pmlSynced) { document.getElementById('tabBody').innerHTML = '<div class="warn">PMLスナップショット未同期のため対象商品を判定できません (朝の自動同期後に開き直してください)</div>'; return; }
+  var s = j.summary;
+  var chips = [
+    ['all', '全て ' + s.targets],
+    ['unregistered', BC_META.unregistered.l + ' ' + s.unregistered],
+    ['unset', BC_META.unset.l + ' ' + s.unset],
+    ['requested', BC_META.requested.l + ' ' + s.requested],
+    ['printed', BC_META.printed.l + ' ' + s.printed],
+    ['not_needed', BC_META.not_needed.l + ' ' + s.not_needed],
+  ];
+  var h = '<div class="toolbar" style="flex-wrap:wrap;gap:6px">' +
+    chips.map(function(c){ return '<button class="' + (BC_FILTER === c[0] ? 'pri' : 'ghost') + ' sm" data-bcfilter="' + c[0] + '">' + c[1] + '</button>'; }).join('') +
+    '<input type="text" id="bcQ" placeholder="🔍 商品コード / 商品名で絞り込み" style="margin-left:auto;min-width:260px"></div>' +
+    '<div class="hint">状態バッジをクリックすると変更できます。「未登録」= 旧Excelにも無かった管理漏れの自社商品 — 状態を付けてください。</div>';
+  var rows = j.targets.filter(function(r){ return BC_FILTER === 'all' || bcStatusOf(r) === BC_FILTER; });
+  h += '<table class="t" id="bcTable"><tr><th>商品コード</th><th>商品名</th><th>AMC管理番号</th><th>状態</th><th>バーコード値</th><th>備考</th><th>更新</th></tr>';
+  rows.forEach(function(r) {
+    var b = r.label
+      ? { status: r.label.status, value: r.label.barcodeValue, note: r.label.note, version: r.label.version }
+      : { status: 'unregistered', value: '', note: '', version: null };
+    h += '<tr data-bcrow="1"><td><b>' + esc(r.code) + '</b>' + (r.active ? '' : ' <span class="badge b-draft" title="取扱区分が取扱中でない商品 (ラベル情報は残しています)">取扱中止</span>') + '</td>' +
+      '<td class="muted">' + esc(r.name) + '</td>' +
+      '<td>' + (r.vendorCode ? esc(r.vendorCode) : (r.label && r.label.vendorCodeHint ? esc(r.label.vendorCodeHint) + ' <span class="muted" title="対応表に未登録。旧Excelに書かれていた番号です">(Excel由来)</span>' : '<span class="muted">—</span>')) + '</td>' +
+      '<td>' + bcBadge(r.code, b) + '</td>' +
+      '<td>' + esc(b.value || '') + '</td>' +
+      '<td class="muted" style="max-width:280px">' + esc(b.note || '') + '</td>' +
+      '<td class="muted">' + (r.label ? esc(String(r.label.updatedAt).slice(0, 10)) + (r.label.updatedBy ? '<br>' + esc(r.label.updatedBy) : '') : '') + '</td></tr>';
+  });
+  h += '</table>';
+  if (!rows.length) h += '<div class="muted">該当なし</div>';
+  if (j.orphans.length) {
+    var BC_REASONS = { missing_from_pml: '商品マスタにない', became_set: 'セット商品になった', supplier_changed: '仕入先が変わった', sales_class_changed: '売上分類が変わった' };
+    h += '<details style="margin-top:14px"><summary style="cursor:pointer">⚠️ 対象外になった登録済み商品 (' + j.orphans.length + '件) — 商品マスタ変更で「AMC×自社商品」の条件から外れた分 (登録は消していません)</summary>' +
+      '<table class="t"><tr><th>商品コード</th><th>状態</th><th>理由</th><th>バーコード値</th><th>備考</th></tr>' +
+      j.orphans.map(function(o) {
+        return '<tr><td>' + esc(o.code) + '</td><td>' + (BC_META[o.status] ? BC_META[o.status].l : esc(o.status)) + '</td>' +
+          '<td>' + (BC_REASONS[o.orphanReason] || esc(o.orphanReason)) + '</td><td>' + esc(o.barcodeValue || '') + '</td><td class="muted">' + esc(o.note || '') + '</td></tr>';
+      }).join('') + '</table></details>';
+  }
+  document.getElementById('tabBody').innerHTML = h;
+  document.getElementById('bcQ').addEventListener('input', function(ev) {
+    var q = ev.target.value.trim().toLowerCase();
+    document.querySelectorAll('#bcTable tr[data-bcrow]').forEach(function(tr) {
+      tr.style.display = !q || tr.textContent.toLowerCase().indexOf(q) >= 0 ? '' : 'none';
+    });
+  });
+}
+// バッジクリック編集 + 状態フィルタ (バーコードタブ)
+document.addEventListener('click', function(ev) {
+  var t = ev.target;
+  var f = t.getAttribute && t.getAttribute('data-bcfilter');
+  if (f) { BC_FILTER = f; renderBarcode(); return; }
+  var c = t.getAttribute && t.getAttribute('data-bcedit');
+  if (c && BC_DATA) {
+    var row = null;
+    BC_DATA.targets.forEach(function(r){ if (r.code === c) row = r; });
+    if (!row) return;
+    var b = row.label
+      ? { status: row.label.status, value: row.label.barcodeValue, note: row.label.note, version: row.label.version }
+      : { status: 'unregistered', value: '', note: '', version: null };
+    bcOpenEditor(t, c, b, function(){ loadBarcode(); });
+  }
+});
+// CSV取込 (プレビュー→取込の二段。fileHashでプレビューと同一ファイルであることを保証)
+var BC_IMP = null;
+document.getElementById('bcImpForm').addEventListener('submit', function(ev) {
+  ev.preventDefault();
+  var fileInput = ev.target.querySelector('input[type=file]');
+  var f = fileInput.files[0];
+  if (!f) return;
+  var fd = new FormData();
+  fd.append('file', f);
+  document.getElementById('bcImpStatus').textContent = 'プレビュー中…';
+  document.getElementById('bcImpOut').innerHTML = '';
+  fetch('/apps/purchase-orders/api/barcode-labels/import-csv', { method: 'POST', body: fd })
+    .then(function(r){ return r.json(); }).then(function(j) {
+      document.getElementById('bcImpStatus').textContent = '';
+      if (!j.ok) { alert('プレビューエラー: ' + j.error); return; }
+      BC_IMP = { fileHash: j.fileHash, stateHash: j.stateHash, file: f };
+      var c = j.counts;
+      var h = '<div class="sec" style="padding:10px 12px"><b>プレビュー</b>: 全 ' + c.total + '行 — 新規 ' + c['new'] + ' / 更新 ' + c.update + ' / 変更なし ' + c.same +
+        ' <span class="muted">(設定済み ' + j.statusCounts.printed + ' / 依頼中 ' + j.statusCounts.requested + ' / 不要 ' + j.statusCounts.not_needed + ' / 未設定 ' + j.statusCounts.unset + ')</span>';
+      if (c.manualOverwrite) {
+        h += '<div class="warn" style="margin-top:6px">⚠️ 画面で手動編集した ' + c.manualOverwrite + '件をCSVが上書きします:<br>' +
+          j.manualList.map(function(x){ return esc(x); }).join('<br>') + (c.manualOverwrite > j.manualList.length ? '<br>…' : '') + '</div>';
+      }
+      h += '<div style="margin-top:8px"><button class="pri" id="bcImpCommit"' + ((c['new'] + c.update) ? '' : ' disabled') + '>この内容で取り込む (' + (c['new'] + c.update) + '件)</button></div></div>';
+      document.getElementById('bcImpOut').innerHTML = h;
+      document.getElementById('bcImpCommit').addEventListener('click', function() {
+        var btn = document.getElementById('bcImpCommit');
+        btn.disabled = true;
+        var fd2 = new FormData();
+        fd2.append('file', BC_IMP.file);
+        fd2.append('commit', '1');
+        fd2.append('fileHash', BC_IMP.fileHash);
+        fd2.append('stateHash', BC_IMP.stateHash); // プレビュー後に他画面で更新されていたら409 (プレビューからやり直し)
+        fetch('/apps/purchase-orders/api/barcode-labels/import-csv', { method: 'POST', body: fd2 })
+          .then(function(r){ return r.json(); }).then(function(j2) {
+            if (!j2.ok) { btn.disabled = false; alert('取込エラー: ' + j2.error); return; }
+            document.getElementById('bcImpOut').innerHTML = '<span class="pill">✅ 取込完了: 新規 ' + j2.counts['new'] + ' / 更新 ' + j2.counts.update + '</span>';
+            toast('バーコード管理CSVを取り込みました');
+            fileInput.value = '';
+            BC_IMP = null;
+            if (TAB === 'barcode') loadBarcode();
+          }).catch(function(e){ btn.disabled = false; alert('通信エラー: ' + e.message + ' — 取り込まれたか不明です。プレビューからやり直すと安全です (同一内容は変更なし扱い)'); });
+      });
+    }).catch(function(e){ document.getElementById('bcImpStatus').textContent = ''; alert('通信エラー: ' + e.message); });
+});
+
 function load() {
   if (TAB === 'unlinked') { loadUnlinked(60); return; }
   if (TAB === 'vendormap') { loadVmap(); return; }
+  if (TAB === 'barcode') { loadBarcode(); return; }
   document.getElementById('tabBody').textContent = '読み込み中…';
   ensureGroups(function() {
     fetch('/apps/purchase-orders/api/masters/' + TAB).then(function(r){ return r.json(); })
