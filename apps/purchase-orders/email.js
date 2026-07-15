@@ -90,8 +90,8 @@ function cellValue(v) {
   const s = String(v == null ? '' : v);
   return /^[=+\-@\t\r]/.test(s) ? "'" + s : s;
 }
-/** CSVセル (Excel互換の引用符エスケープ込み) */
-function csvCell(v) {
+/** CSVセル (Excel互換の引用符エスケープ込み)。注残確認CSV (router) でも共用 */
+export function csvCell(v) {
   const s = cellValue(v);
   return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }

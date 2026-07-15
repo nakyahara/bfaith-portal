@@ -1871,6 +1871,82 @@ console.log('── NE発注残 初期取込 (移行PO) ──');
     '/backorders 商品別注残検索UI (横断表示+POへジャンプ)');
 }
 
+// ═══ 仕入先別注残ビュー + 注残確認CSV (中原さん要望 2026-07-15) ═══
+console.log('── 仕入先別注残 + 注残確認CSV ──');
+{
+  // 対応表に先方管理番号を登録 → /api/backorders の明細に vendor_code が載る
+  // (既存エントリは退避して最後に復元 — 後続の出荷明細変換テストが同じ商品の対応を使う)
+  const prevNofly = db.prepare("SELECT * FROM po_vendor_code_map WHERE supplier_code='1' AND product_key='noflyersticker'").get();
+  db.prepare(`INSERT OR REPLACE INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, updated_at)
+    VALUES ('1','noflyersticker','noflyersticker','ZZZ-NOFLY-01',?)`).run(nowIsoStr());
+  r = await j('/api/backorders');
+  const migO = r.body.orders.find(o => o.neSlipNumber === '6274');
+  ok(migO && migO.origin === 'migration', '発注残API: neSlipNumber を返す (移行PO)', migO && migO.neSlipNumber);
+  const vItem = migO.items.find(i => i.product_code === 'noflyersticker');
+  ok(vItem && vItem.vendor_code === 'ZZZ-NOFLY-01', '発注残API: 明細に先方管理番号 (対応表join)', vItem && vItem.vendor_code);
+  const noV = migO.items.find(i => i.product_code === 'deaditem');
+  ok(noV && noV.vendor_code === null, '発注残API: 対応表未登録は vendor_code=null');
+
+  // CSV: supplier必須 / 注残のない仕入先は404
+  let raw = await fetch(base + '/api/backorders/supplier-csv');
+  ok(raw.status === 400, '注残確認CSV: supplierなしは400');
+  raw = await fetch(base + '/api/backorders/supplier-csv?supplier=0777');
+  ok(raw.status === 404, '注残確認CSV: 注残のない仕入先は404');
+
+  // CSV本体 (supplier=0001 → 正規化'1'。Shift-JIS+日本語ファイル名)
+  raw = await fetch(base + '/api/backorders/supplier-csv?supplier=0001');
+  ok(raw.status === 200 && (raw.headers.get('content-type') || '').includes('Shift_JIS'), '注残確認CSV: 200 + Shift_JIS', raw.status);
+  const dispo = raw.headers.get('content-disposition') || '';
+  ok(dispo.includes('attachment') && dispo.includes("filename*=UTF-8''") && dispo.includes(encodeURIComponent('注残確認_')),
+    '注残確認CSV: Content-Disposition filename* (日本語名+ASCIIフォールバック)', dispo);
+  const csv = iconv.decode(Buffer.from(await raw.arrayBuffer()), 'cp932');
+  const lines = csv.split('\r\n');
+  ok(lines[0].startsWith('注残確認リスト') && lines[0].includes('基準日時'), 'CSV: 基準日時ヘッダ', lines[0]);
+  ok(lines[1].includes('様'), 'CSV: 仕入先名行', lines[1]);
+  const hdrIdx = lines.findIndex(l => l.startsWith('発注日,発注書番号,貴社管理番号'));
+  ok(hdrIdx > 0, 'CSV: 明細見出し (発注日/発注書番号/貴社管理番号/…)');
+  const totIdx = lines.findIndex(l => l.startsWith('合計,'));
+  ok(totIdx > hdrIdx, 'CSV: 合計行');
+  // 移行POは NE伝票番号が発注書番号列に出る (仕入先が知っている番号)
+  const l6274 = lines.slice(hdrIdx + 1, totIdx).find(l => l.split(',')[1] === '6274');
+  ok(l6274 && l6274.includes('ZZZ-NOFLY-01') && l6274.includes('noflyersticker') && !l6274.includes('PO-'),
+    'CSV: 移行PO行 = NE伝票番号 + 先方管理番号 (内部PO番号を出さない)', l6274);
+  // 算術検証: 全明細行と合計行で 発注数 − 入荷済 − 減数 − 取消 = 注残 (Codex設計相談の要点)
+  const detail = lines.slice(hdrIdx + 1, totIdx).map(l => l.split(','));
+  ok(detail.length > 0 && detail.every(c => Number(c[5]) - Number(c[6]) - Number(c[7]) - Number(c[8]) === Number(c[9])),
+    'CSV: 全明細行で 発注−入荷−減数−取消=注残', detail.length);
+  ok(detail.every(c => Number(c[9]) > 0), 'CSV: 注残0の明細は載らない');
+  const totC = lines[totIdx].split(',');
+  ok([5, 6, 7, 8, 9].every(k => Number(totC[k]) === detail.reduce((s, c) => s + Number(c[k]), 0)), 'CSV: 合計行 = 明細列の合計', lines[totIdx]);
+  // 発注日の古い順 (画面と同じ並び)
+  const dates = detail.map(c => c[0]);
+  ok(dates.every((d, i) => i === 0 || dates[i - 1] <= d), 'CSV: 発注日の古い順', dates.join('|'));
+
+  // CSV injection: 数式に化ける先頭文字は ' 前置 (発注書メール添付と同じ cellValue 共用)
+  db.prepare(`INSERT OR REPLACE INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, updated_at)
+    VALUES ('1','deaditem','deaditem','=SUM(A1)',?)`).run(nowIsoStr());
+  raw = await fetch(base + '/api/backorders/supplier-csv?supplier=1');
+  ok(raw.status === 200 && iconv.decode(Buffer.from(await raw.arrayBuffer()), 'cp932').includes("'=SUM(A1)"),
+    '注残確認CSV: 数式インジェクション対策 (先頭= はアポストロフィ前置)');
+  // CP932変換不能文字は黙って?に化けさせず400 (fail-closed)
+  db.prepare(`UPDATE po_vendor_code_map SET vendor_code='🐟emoji' WHERE supplier_code='1' AND product_key='deaditem'`).run();
+  raw = await fetch(base + '/api/backorders/supplier-csv?supplier=1');
+  const errBody = await raw.json().catch(() => null);
+  ok(raw.status === 400 && errBody && errBody.error.includes('Shift-JIS'), '注残確認CSV: CP932変換不能文字は400 (fail-closed)', errBody && errBody.error);
+  db.prepare(`DELETE FROM po_vendor_code_map WHERE supplier_code='1' AND product_key='deaditem'`).run();
+  // 退避した対応表エントリを復元
+  if (prevNofly) db.prepare(`INSERT OR REPLACE INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, qty_per_unit, updated_at)
+    VALUES (?,?,?,?,?,?)`).run(prevNofly.supplier_code, prevNofly.product_key, prevNofly.product_code, prevNofly.vendor_code, prevNofly.qty_per_unit, prevNofly.updated_at);
+  else db.prepare("DELETE FROM po_vendor_code_map WHERE supplier_code='1' AND product_key='noflyersticker'").run();
+
+  // 画面: 🏭 仕入先別ビューのUI配信
+  const boHtml3 = await (await fetch(base + '/backorders')).text();
+  ok(boHtml3.includes('仕入先別') && boHtml3.includes('data-supsel') && boHtml3.includes('renderSupplierView') && boHtml3.includes('supGroups'),
+    '/backorders 🏭仕入先別ビュー (タブ+一覧→明細)');
+  ok(boHtml3.includes('data-csvdl') && boHtml3.includes('注残確認CSV') && boHtml3.includes('supplier-csv'),
+    '/backorders 📥注残確認CSVダウンロードUI');
+}
+
 // ═══ 追加発注 (supplement: 確定後の電話等の口頭追加・増量分) ═══
 console.log('── 追加発注 (supplement) ──');
 {

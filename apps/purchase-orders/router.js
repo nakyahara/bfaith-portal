@@ -29,7 +29,7 @@ import { importInboundCsv, previewInboundCsv, listInbound, candidatesFor, setInb
 import { importNeBackorderCsv } from './migration.js';
 import {
   buildOrderEmail, createEmailJob, processEmailJob, reconcileEmailJobs, listEmailJobs, emailSettings, parseAddresses,
-  markUnsent, cancelEmailJob, startEmailDispatcher,
+  markUnsent, cancelEmailJob, startEmailDispatcher, csvCell,
 } from './email.js';
 import { fetchShipmentMails, listShipmentMails, setShipmentMailStatus, reparseShipmentMail } from './shipment-mail.js';
 import { getSetting, setSetting, audit, markCycleFbaJobDone } from './ledger.js';
@@ -656,6 +656,62 @@ router.get('/api/backorders', (req, res) => {
       o.emailSentLive = sentLive.has(o.id);
     }
     res.json({ ok: true, ...data });
+  }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// 注残確認CSV (仕入先別)。仕入先に「今の注残はこれで認識が合っていますか?」と確認してもらう用 (中原さん要望 2026-07-15)。
+// 画面の仕入先別ビューと同じ listBackorders から生成し、行ごとに 発注数−入荷済−減数−取消=注残 の算術が成立する列構成。
+// 発注書番号は仕入先が受け取った番号 (アプリPO番号 / NE移行分はNE伝票番号) を出す。Shift-JIS (発注書メール添付と同じExcel前提)
+router.get('/api/backorders/supplier-csv', (req, res) => {
+  try {
+    const code = normSupplierCode(String(req.query.supplier || ''));
+    if (!code || code.length > 32) return res.status(400).json({ ok: false, error: 'supplier (仕入先コード) を指定してください' });
+    // 実在確認を先に (任意文字列で全件集計を走らせない、Codex R1 Low)。発注はマスタ登録済み仕入先しか作れない
+    const supRow = getDB().prepare('SELECT name FROM po_suppliers WHERE supplier_code=?').get(code);
+    if (!supRow) return res.status(404).json({ ok: false, error: 'この仕入先はマスタに登録されていません' });
+    const orders = listBackorders().orders
+      .filter(o => o.open && o.supplierCode === code)
+      .sort((a, b) => String(a.issuedAt).localeCompare(String(b.issuedAt)) || a.id - b.id);
+    // 仕入先名はマスタの現在名 (POスナップショット名は改名をまたぐと新旧混在し得る、Codex R1 Low)
+    const supplierName = supRow.name || (orders.length ? orders[orders.length - 1].supplierName : code);
+    const tot = { qty: 0, received: 0, shortage: 0, cancelled: 0, remaining: 0 };
+    const lines = [];
+    for (const o of orders) {
+      const poNo = (o.origin === 'migration' ? o.neSlipNumber : null) || o.poNumber || `#${o.id}`;
+      const issuedDate = o.issuedAt ? fmtJst(o.issuedAt).slice(0, 10) : '';
+      for (const i of o.items) {
+        if (i.remaining_qty <= 0) continue;
+        lines.push([issuedDate, poNo, i.vendor_code || '', i.product_code, i.product_name || '',
+          i.qty, i.received_qty, i.shortage_qty, i.cancelled_qty, i.remaining_qty,
+          i.requested_date || '', i.promised_date || '']);
+        tot.qty += i.qty; tot.received += i.received_qty; tot.shortage += i.shortage_qty;
+        tot.cancelled += i.cancelled_qty; tot.remaining += i.remaining_qty;
+      }
+    }
+    if (!lines.length) return res.status(404).json({ ok: false, error: 'この仕入先に未完了の注残はありません' });
+    const asOf = fmtJst(nowIso());
+    const rawRows = [
+      ['注残確認リスト', `基準日時: ${asOf} (この時点の弊社台帳の値です)`],
+      ['仕入先', `${supplierName} 様`],
+      ['※ 注残 = 発注数 - 入荷済 - 減数 - 取消。数量の単位は発注書と同じです'],
+      [],
+      ['発注日', '発注書番号', '貴社管理番号', '商品コード', '商品名', '発注数', '入荷済', '減数', '取消', '注残', '希望納期', '回答納期'],
+      ...lines,
+      ['合計', '', '', '', '', tot.qty, tot.received, tot.shortage, tot.cancelled, tot.remaining, '', ''],
+    ];
+    const csvText = rawRows.map(row => row.map(csvCell).join(',')).join('\r\n');
+    // CP932変換不能文字は黙って ? に化けさせない (発注書メール添付と同じ fail-closed、Codex設計相談 2026-07-15)
+    if (iconv.decode(iconv.encode(csvText, 'cp932'), 'cp932') !== csvText) {
+      const bad = [...new Set([...csvText].filter(ch => iconv.decode(iconv.encode(ch, 'cp932'), 'cp932') !== ch))].slice(0, 10);
+      return res.status(400).json({ ok: false, error: `Shift-JISへ変換できない文字があります: ${bad.join(' ')} — 商品名等を確認してください` });
+    }
+    const ymd = asOf.slice(0, 10).replace(/-/g, '');
+    const jpName = `注残確認_${String(supplierName).replace(/[\\/:*?"<>|\s]/g, '')}_${ymd}.csv`;
+    res.setHeader('Content-Type', 'text/csv; charset=Shift_JIS');
+    res.setHeader('Content-Disposition',
+      `attachment; filename="backorder_confirm_${encodeURIComponent(code)}_${ymd}.csv"; filename*=UTF-8''${encodeURIComponent(jpName)}`);
+    res.send(iconv.encode(csvText, 'cp932'));
   }
   catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
@@ -5058,6 +5114,7 @@ router.get('/backorders', (req, res) => {
       <button data-view="attention" class="on">⚠️ 要対応</button>
       <button data-view="open" title="入荷待ち・一部入荷など、まだ残数がある発注">📦 未完了</button>
       <button data-view="closed">完了</button>
+      <button data-view="supplier" title="仕入先ごとの注残明細一覧。仕入先へ送る「注残確認CSV」もここから出せます">🏭 仕入先別</button>
       <span class="muted" id="boCount" style="margin-left:8px"></span>
       <input type="text" id="boQ" placeholder="🔎 商品コード / 商品名で注残検索" style="margin-left:auto;min-width:280px" title="商品ごとの注残合計と、含まれる発注書 (PO) を横断表示します。POを開いてその場で入荷・減数の消込ができます">
     </div>
@@ -5086,10 +5143,20 @@ router.get('/backorders', (req, res) => {
 var API = '/apps/purchase-orders/api';
 var DATA = null, VIEW = 'attention', OPENED = {};
 var SEL = {}; // 一括メール送信の選択状態 (orderId → true)
+var SUP_SEL = null; // 🏭 仕入先別ビューで選択中の仕入先コード (null=仕入先一覧)
 var REASONS = { supplier_shortage: '仕入先都合 (作れない)', own_decision: '自社判断', cutoff: '打切', other: 'その他', correction: '訂正' };
 var EVLABEL = { receipt: '📥入荷', shortage: '➖減数', cancel: '🚫取消', reversal: '↩逆仕訳' };
 
-function fmtD(s) { return s ? String(s).slice(0, 10) : '—'; }
+// 日付表示: 素の日付 (YYYY-MM-DD) はそのまま、ISO時刻つき (issuedAt等のUTC) はJSTの日付に変換
+// (UTC素通しslice(0,10)だとJST 0〜9時の発注が前日に見える。CSVのfmtJstと同じ日付になる、Codex R1 Medium)
+function fmtD(s) {
+  if (!s) return '—';
+  s = String(s);
+  if (s.length <= 10) return s;
+  var t = Date.parse(s);
+  if (isNaN(t)) return s.slice(0, 10);
+  return new Date(t + 9 * 3600 * 1000).toISOString().slice(0, 10);
+}
 function newIdemKey() { return (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : 'k' + Date.now() + '-' + Math.random().toString(36).slice(2); }
 function jsonOrErr(r, isWrite) {
   // 非JSON応答 (proxy 502等) でも状況を正しく伝える (書込=成否不明 / 取得=単なる失敗)
@@ -5175,10 +5242,12 @@ function render() {
   DATA.orders.forEach(function(o) {
     if (o.open) { counts.open++; if (o.attentionItems > 0) counts.attention++; } else counts.closed++;
   });
+  var supArr = supGroups();
   document.querySelectorAll('#boTabs button').forEach(function(b) {
     var v = b.getAttribute('data-view');
     b.classList.toggle('on', v === VIEW);
-    b.textContent = (v === 'attention' ? '⚠️ 要対応' : v === 'open' ? '📦 未完了' : '完了') + ' (' + counts[v] + ')';
+    b.textContent = (v === 'attention' ? '⚠️ 要対応' : v === 'open' ? '📦 未完了' : v === 'closed' ? '完了' : '🏭 仕入先別') +
+      ' (' + (v === 'supplier' ? supArr.length : counts[v]) + ')';
   });
   var s = DATA.summary;
   document.getElementById('boCount').textContent =
@@ -5189,6 +5258,7 @@ function render() {
     document.getElementById('boList').innerHTML = '<div class="muted">まだ発注残管理の対象がありません。次にアプリで発注確定した分から管理が始まります (既存のNE発注残は下の初期取込で登録できます)。</div>';
     return;
   }
+  if (VIEW === 'supplier') { renderSupplierView(supArr); return; }
   if (!list.length) {
     document.getElementById('boList').innerHTML = '<div class="muted">' + (VIEW === 'attention' ? '要対応の発注はありません 🎉' : '該当する発注はありません') + '</div>';
     return;
@@ -5284,7 +5354,8 @@ function orderHtml(o) {
 function updateBulkBar() {
   var ids = Object.keys(SEL).filter(function(k){ return SEL[k]; });
   var bar = document.getElementById('boBulkBar');
-  bar.style.display = ids.length ? 'flex' : 'none';
+  // 🏭 仕入先別ビューにはチェックボックスが無いので選択バーも出さない (選択状態は保持され、タブを戻すと再表示)
+  bar.style.display = (ids.length && VIEW !== 'supplier') ? 'flex' : 'none';
   document.getElementById('boSelCount').textContent = '📧 ' + ids.length + '件を選択中';
 }
 document.addEventListener('change', function(ev) {
@@ -5396,6 +5467,117 @@ function renderBulkResult(batch, results) {
         load();
       });
     });
+  });
+}
+
+// ── 🏭 仕入先別注残 (仕入先一覧 → 明細フラット一覧 (発注日の古い順) + 注残確認CSV。中原さん要望 2026-07-15) ──
+// NEの注残検索画面 (仕入先→伝票明細一覧) の代替。CSVは仕入先に「今の注残の認識が合っているか」を確認してもらう用
+function supGroups() {
+  // Object.create(null): 仕入先コードが __proto__ 等でも継承プロパティを拾わない (Codex R1 Medium)
+  var m = Object.create(null);
+  (DATA ? DATA.orders : []).forEach(function(o) {
+    if (!o.open) return;
+    o.items.forEach(function(i) {
+      if (i.remaining_qty <= 0) return;
+      var g = m[o.supplierCode];
+      if (!g) g = m[o.supplierCode] = { code: o.supplierCode, name: o.supplierName, poIds: Object.create(null), skus: Object.create(null), remaining: 0, amount: 0, unknownCost: 0, overdue: 0, rows: [] };
+      g.poIds[o.id] = true;
+      g.skus[i.product_code.toLowerCase()] = true;
+      g.remaining += i.remaining_qty;
+      if (i.unit_cost != null) g.amount += Math.round(i.unit_cost * i.remaining_qty); else g.unknownCost++;
+      if (i.flags.overdue) g.overdue++;
+      g.rows.push({ o: o, i: i });
+    });
+  });
+  var arr = Object.keys(m).map(function(k){ return m[k]; });
+  arr.forEach(function(g) {
+    g.poCount = Object.keys(g.poIds).length;
+    g.skuCount = Object.keys(g.skus).length;
+    // 明細は発注日の古い順 (FIFO消込・仕入先との突合と同じ順序。CSVも同じ並び)
+    g.rows.sort(function(a, b){ return String(a.o.issuedAt).localeCompare(String(b.o.issuedAt)) || (a.o.id - b.o.id) || (a.i.id - b.i.id); });
+  });
+  arr.sort(function(a, b){ return b.amount - a.amount || b.remaining - a.remaining; });
+  return arr;
+}
+// 発注書番号 = 仕入先が受け取った番号 (NE移行分はNE伝票番号)。CSVの「発注書番号」列と同じ規則
+function supPoNo(o) { return (o.origin === 'migration' ? o.neSlipNumber : null) || o.poNumber || ('#' + o.id); }
+function renderSupplierView(arr) {
+  var el = document.getElementById('boList');
+  if (!arr.length) { el.innerHTML = '<div class="muted">未完了の注残はありません 🎉</div>'; return; }
+  var cur = null;
+  arr.forEach(function(g){ if (g.code === SUP_SEL) cur = g; });
+  var h;
+  if (!cur) {
+    // 仕入先一覧 (どの仕入先にどれだけ注残があるか)
+    h = '<div class="sec" style="padding:10px 12px"><b>🏭 仕入先別の注残</b> <span class="muted" style="font-size:12px">仕入先を選ぶと注残明細の一覧と、仕入先へ送る「📥 注残確認CSV」が出せます</span>' +
+      '<table class="t" style="margin-top:6px"><tr><th>仕入先</th><th class="r">未完了PO</th><th class="r">注残SKU</th><th class="r">残数量</th><th class="r">金額 (既知単価分)</th><th class="r">🔴 遅延明細</th><th></th></tr>';
+    arr.forEach(function(g) {
+      h += '<tr><td><b>' + esc(g.name) + '</b></td><td class="r">' + g.poCount + '</td><td class="r">' + g.skuCount + '</td>' +
+        '<td class="r">' + g.remaining.toLocaleString('ja-JP') + '</td><td class="r">' + yen(g.amount) + (g.unknownCost ? '<span class="muted">+α</span>' : '') + '</td>' +
+        '<td class="r">' + (g.overdue || '—') + '</td>' +
+        '<td><button class="pri sm" data-supsel="' + esc(g.code) + '">明細を見る</button></td></tr>';
+    });
+    h += '</table></div>';
+    el.innerHTML = h;
+    return;
+  }
+  // 明細フラット一覧 (発注日の古い順)
+  var tot = { qty: 0, received: 0, shortage: 0, cancelled: 0, remaining: 0 };
+  cur.rows.forEach(function(r) {
+    tot.qty += r.i.qty; tot.received += r.i.received_qty; tot.shortage += r.i.shortage_qty;
+    tot.cancelled += r.i.cancelled_qty; tot.remaining += r.i.remaining_qty;
+  });
+  h = '<div class="sec" style="padding:10px 12px">' +
+    '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">' +
+    '<button class="ghost" data-supback="1">← 仕入先一覧</button>' +
+    '<b style="font-size:15px">🏭 ' + esc(cur.name) + '</b>' +
+    '<span class="muted" style="font-size:12px">未完了 ' + cur.poCount + 'PO / ' + cur.skuCount + 'SKU / 残 ' + cur.remaining.toLocaleString('ja-JP') +
+    ' / ' + yen(cur.amount) + (cur.unknownCost ? '+α (単価未設定 ' + cur.unknownCost + '明細)' : '') + '</span>' +
+    '<button class="pri" data-csvdl="' + esc(cur.code) + '" title="仕入先にそのまま送れる注残確認リスト (Shift-JIS CSV、Excelで開けます)。「今の注残はこれで認識が合っていますか?」の突合用。先方管理番号・発注書番号入り">📥 注残確認CSV</button>' +
+    '</div>' +
+    '<table class="t" style="margin-top:8px"><tr><th>発注日</th><th>発注書番号</th><th>先方管理番号</th><th>商品</th>' +
+    '<th class="r">発注</th><th class="r">入荷済</th><th class="r">減数</th><th class="r">取消</th><th class="r">残</th><th>納期 (希望→回答)</th><th>残数の扱い</th><th></th></tr>';
+  cur.rows.forEach(function(r) {
+    var o = r.o, i = r.i;
+    h += '<tr><td class="muted">' + fmtD(o.issuedAt) + '</td>' +
+      '<td>' + esc(supPoNo(o)) + (o.origin === 'migration' ? ' ' + badge('b-draft', '🔁 NE', 'NE移行分 (番号はNE伝票番号)') : '') + '</td>' +
+      '<td>' + (i.vendor_code ? esc(i.vendor_code) : '<span class="muted" title="対応表 (マスタ管理→📇先方番号対応表) に未登録。CSVでは空欄になります">—</span>') + '</td>' +
+      '<td><b>' + esc(i.product_code) + '</b><div class="muted" style="font-size:11px">' + esc(i.product_name || '') + '</div></td>' +
+      '<td class="r">' + i.qty + '</td><td class="r">' + i.received_qty + '</td><td class="r">' + i.shortage_qty + '</td><td class="r">' + i.cancelled_qty + '</td>' +
+      '<td class="r"><b>' + i.remaining_qty + '</b></td>' +
+      '<td>' + fmtD(i.requested_date) + ' → ' + fmtD(i.promised_date) + (i.flags.overdue ? ' ' + badge('b-issued', '🔴 超過') : '') + '</td>' +
+      '<td>' + dispText(i) + '</td>' +
+      '<td><button class="pri sm" data-jump="' + o.id + '" title="POを開いてその場で📥入荷/➖減数の消込">開く</button></td></tr>';
+  });
+  h += '<tr style="font-weight:bold;background:#f8fafc"><td colspan="4">合計 (' + cur.rows.length + '明細)</td>' +
+    '<td class="r">' + tot.qty.toLocaleString('ja-JP') + '</td><td class="r">' + tot.received.toLocaleString('ja-JP') + '</td>' +
+    '<td class="r">' + tot.shortage.toLocaleString('ja-JP') + '</td><td class="r">' + tot.cancelled.toLocaleString('ja-JP') + '</td>' +
+    '<td class="r">' + tot.remaining.toLocaleString('ja-JP') + '</td><td colspan="3"></td></tr></table>' +
+    '<div class="muted" style="font-size:11px;margin-top:4px">※ 残 = 発注 − 入荷済 − 減数 − 取消。CSVも同じ列構成・同じ並び (発注日の古い順) です</div></div>';
+  el.innerHTML = h;
+}
+function dlSupplierCsv(code, btn) {
+  var g0 = null;
+  supGroups().forEach(function(x){ if (x.code === code) g0 = x; });
+  if (btn) btn.disabled = true;
+  fetch(API + '/backorders/supplier-csv?supplier=' + encodeURIComponent(code)).then(function(r) {
+    if (!r.ok) return jsonOrErr(r, false).then(function(j){ throw new Error(j.error || ('HTTP ' + r.status)); });
+    return r.blob();
+  }).then(function(b) {
+    var d = new Date(Date.now() + 9 * 3600 * 1000);
+    var name = '注残確認_' + String(g0 ? g0.name : code).replace(/[\\\\/:*?"<>|\\s]+/g, '') + '_' + d.toISOString().slice(0, 10).replace(/-/g, '') + '.csv';
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(b);
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function(){ URL.revokeObjectURL(a.href); }, 10000);
+    if (btn) btn.disabled = false;
+    toast('注残確認CSVをダウンロードしました: ' + name);
+  }).catch(function(e) {
+    if (btn) btn.disabled = false;
+    toast('CSVダウンロード失敗: ' + e.message);
   });
 }
 
@@ -5881,8 +6063,18 @@ document.addEventListener('click', function(ev) {
   var g = function(a){ return t.getAttribute && t.getAttribute(a); };
   var v;
   if (t.classList && t.classList.contains('boSel')) return; // 一括送信チェックボックスは開閉に流さない (changeハンドラが処理)
-  if ((v = g('data-view'))) { VIEW = v; render(); return; }
-  if ((v = g('data-jump'))) { jumpToOrder(v); return; } // 商品別注残からPOへ
+  if ((v = g('data-view'))) {
+    VIEW = v;
+    // 商品検索の表示が残っているとタブを切り替えても内容が検索結果のままに見える → タブ選択で検索を閉じる (Codex R2 Low)
+    var boQEl = document.getElementById('boQ');
+    if (boQEl && boQEl.value) { boQEl.value = ''; renderProd(); }
+    render();
+    return;
+  }
+  if ((v = g('data-jump'))) { jumpToOrder(v); return; } // 商品別注残・仕入先別ビューからPOへ
+  if ((v = g('data-supsel'))) { SUP_SEL = v; render(); return; } // 🏭 仕入先別: 仕入先を選択
+  if (g('data-supback')) { SUP_SEL = null; render(); return; } // 🏭 仕入先別: 一覧へ戻る
+  if ((v = g('data-csvdl'))) { dlSupplierCsv(v, t); return; } // 📥 注残確認CSV
   // 見出し内の子要素 (badge/日付span等) クリックでも展開する (Codex R1 Medium)。
   // 見出し内の操作要素 (回答納期編集span等の data-* 持ち) は除外して個別ハンドラに委ねる
   if (!g('data-pedit') && !g('data-emailui') && !g('data-closeui') && t.tagName !== 'A' && t.tagName !== 'BUTTON') {
