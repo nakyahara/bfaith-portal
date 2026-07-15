@@ -2692,10 +2692,10 @@ console.log('── 入庫取込プレビュー+一括割当 ──');
   ok(r.body.ok, 'auto preview: ok');
   const pDead = r.body.proposals.find(p => p.slip === 'AA100');
   const pNiku = r.body.proposals.find(p => p.slip === 'AA101');
-  const sNof = r.body.skipped.find(s => s.slip === 'AA102');
+  const sNof = r.body.proposals.find(p => p.slip === 'AA102');
   ok(pDead && pDead.qty === 10 && pDead.postRemaining === 0, 'auto preview: 全量一致の提案 (aa-unique-item)', pDead);
   ok(pNiku && pNiku.qty === 5 && pNiku.poRemaining === 20 && pNiku.postRemaining === 15, 'auto preview: 部分入荷の提案 (残15)', pNiku);
-  ok(sNof && sNof.reason.includes('候補が'), 'auto preview: 候補複数はskip (手動)', sNof && sNof.reason);
+  ok(sNof && sNof.qty > 0, 'auto preview: 候補複数でも古い発注からFIFOで自動提案', sNof && sNof.poNumber);
 
   // 原子性: 不正な数量を混ぜると全ロールバック
   r = await jpA('/api/inbound/auto-assign', { assignments: [
@@ -2754,7 +2754,7 @@ console.log('── 入庫取込プレビュー+一括割当 ──');
   r = await jpA('/api/inbound/auto-assign', { assignments: [
     { inboundItemId: m1.inboundItemId, orderItemId: pDead.orderItemId, qty: 5 },
   ] }, 'aa-key-tamper');
-  ok(r.status === 400 && r.body.error.includes('候補が変わって'), 'auto commit: 割当先の改変は候補再検証で拒否', r.body.error);
+  ok(r.status === 400 && r.body.error.includes('一致しません'), 'auto commit: 割当先の改変はFIFO計画照合で拒否', r.body.error);
 
   // 同一キーで内容 (日付) 違い → 409 (replayさせない、Codex inb-R1 Medium)
   const multiAssign = dt => [
@@ -2786,7 +2786,7 @@ console.log('── 入庫取込プレビュー+一括割当 ──');
     { inboundItemId: m3.inboundItemId, orderItemId: m3.orderItemId, qty: 4, remainder: { action: 'await_confirmation', nextActionDate: '2026-08-05' } },
     { inboundItemId: m3.inboundItemId, orderItemId: m3.orderItemId, qty: 4, remainder: { action: 'await_confirmation', nextActionDate: '2026-08-05' } },
   ] }, 'aa-key-dupinb');
-  ok(r.status === 400 && r.body.error.includes('複数回'), 'auto commit: 同一入庫行の重複指定は拒否');
+  ok(r.status === 400 && r.body.error.includes('一致しません'), 'auto commit: 同一入庫行の重複指定はFIFO計画照合で拒否', r.body.error);
   r = await jpA('/api/inbound/auto-assign', { assignments: [
     { inboundItemId: m3.inboundItemId, orderItemId: m3.orderItemId, qty: 4, remainder: { action: 'await_confirmation', nextActionDate: '2026-08-05' } },
   ] }, 'aa-key-3');
@@ -3010,22 +3010,49 @@ console.log('── 入庫取込プレビュー+一括割当 ──');
     ok(threw.includes('scopeが不正'), 'excess: 不正なscopeは直接SQLでもトリガが拒否', threw);
   }
 
-  // 候補が複数ある行は ignores に指定できない (割当で候補を消費してから対象外にする細工の遮断、Codex ig-R1 High-1)
-  insRow.run('aa-multi2-item', '複数候補対象外細工テスト', '0001', '取扱中', 2, 0, 0, 0, 0, 10, 1.5, 400, 200, '2026-07-01', '2026-01-01');
+  // 複数POに累積した注残へのFIFO引き当て (中原さん 2026-07-15: 古い方から引き当て)
+  insRow.run('aa-multi2-item', '複数PO累積FIFOテスト', '0001', '取扱中', 2, 0, 0, 0, 0, 10, 1.5, 400, 200, '2026-07-01', '2026-01-01');
   r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ items: [{ code: 'aa-multi2-item', qty: 4 }] }) });
   r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ items: [{ code: 'aa-multi2-item', qty: 4 }] }) });
-  r = await up2('aj.csv', [HDR2, ['AJ950', 'aa-multi2-item', 'x', '0001', '200', '4', '0', '2026/07/15']]);
+  const m2Items = db.prepare(`SELECT i.id FROM po_order_items i WHERE i.product_key='aa-multi2-item' ORDER BY i.id`).all();
+  r = await up2('aj.csv', [HDR2, ['AJ950', 'aa-multi2-item', 'x', '0001', '200', '6', '0', '2026/07/15']]);
   r = await j('/api/inbound/auto-assign/preview');
-  const gMul = r.body.skipped.find(x => x.slip === 'AJ950');
-  ok(gMul && gMul.reason.includes('候補が2件'), 'preview: 候補複数は従来どおり手動', gMul && gMul.reason);
-  r = await jpA('/api/inbound/auto-assign', { ignores: [{ inboundItemId: gMul.id }] }, 'aa-ig-mul');
-  ok(r.status === 400 && r.body.error.includes('候補が複数'), 'auto-ignore: 候補複数行の対象外指定は事前検証で拒否', r.body.error);
+  const gMulProps = r.body.proposals.filter(x => x.slip === 'AJ950');
+  ok(gMulProps.length === 2 && gMulProps[0].orderItemId === m2Items[0].id && gMulProps[0].qty === 4
+    && gMulProps[1].orderItemId === m2Items[1].id && gMulProps[1].qty === 2 && gMulProps[1].postRemaining === 2,
+    'FIFO: 入庫6を古いPOから 4+2 に分割提案 (残2は新しいPO側)', gMulProps.map(x => [x.orderItemId, x.qty]));
+  ok(gMulProps[1].needsRemainder === true, 'FIFO: 部分入荷になる最後のPOにだけ残数の扱い', gMulProps[1]);
+  // 割当可能な行を対象外に細工 → 拒否
+  r = await jpA('/api/inbound/auto-assign', { ignores: [{ inboundItemId: gMulProps[0].inboundItemId }] }, 'aa-ig-mul');
+  ok(r.status === 400 && r.body.error.includes('割当できる可能性'), 'auto-ignore: FIFOで割当可能な行の対象外指定は拒否', r.body.error);
+  // FIFO計画の途中までしか送らない細工 → 拒否 (半端な消込を確定させない)
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: gMulProps[0].inboundItemId, orderItemId: gMulProps[0].orderItemId, qty: 4 },
+  ] }, 'aa-fifo-part');
+  ok(r.status === 400 && r.body.error.includes('途中までしか'), 'FIFO: 計画の途中までの指定は拒否', r.body.error);
+  // 順序違い (新しいPOから) も拒否
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: gMulProps[1].inboundItemId, orderItemId: gMulProps[1].orderItemId, qty: 2 },
+    { inboundItemId: gMulProps[0].inboundItemId, orderItemId: gMulProps[0].orderItemId, qty: 4 },
+  ] }, 'aa-fifo-rev');
+  ok(r.status === 400 && r.body.error.includes('一致しません'), 'FIFO: 古い順以外の割当は拒否', r.body.error);
+  // 正常実行: 4 (古いPO全消込) + 2 (新しいPO、残2はあとで決める)
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: gMulProps[0].inboundItemId, orderItemId: gMulProps[0].orderItemId, qty: 4 },
+    { inboundItemId: gMulProps[1].inboundItemId, orderItemId: gMulProps[1].orderItemId, qty: 2 },
+  ] }, 'aa-fifo-1');
+  ok(r.body.ok && r.body.assigned === 2, 'FIFO: 1入庫行→2POへ分割割当を実行', r.body);
+  ok(db.prepare('SELECT remaining_qty FROM v_po_item_balance WHERE order_item_id=?').get(m2Items[0].id).remaining_qty === 0
+    && db.prepare('SELECT remaining_qty FROM v_po_item_balance WHERE order_item_id=?').get(m2Items[1].id).remaining_qty === 2,
+    'FIFO: 古いPO全消込+新しいPOに残2');
+  ok(db.prepare('SELECT remainder_disposition FROM po_order_items WHERE id=?').get(m2Items[1].id).remainder_disposition === null,
+    'FIFO: 残2は扱い未選択 (あとで決める) で注残に残る');
   // 割当と対象外の重複指定は拒否
   r = await jpA('/api/inbound/auto-assign', { assignments: [
-    { inboundItemId: gMul.id, orderItemId: 1, qty: 4 },
-  ], ignores: [{ inboundItemId: gMul.id }] }, 'aa-ig-dup');
+    { inboundItemId: gMulProps[0].inboundItemId, orderItemId: m2Items[0].id, qty: 4 },
+  ], ignores: [{ inboundItemId: gMulProps[0].inboundItemId }] }, 'aa-ig-dup');
   ok(r.status === 400, 'auto-ignore: 割当と対象外の重複指定は拒否');
   r = await jpA('/api/inbound/auto-assign', { assignments: [], ignores: [] }, 'aa-ig-empty');
   ok(r.status === 400, 'auto-ignore: 空リクエストは400');

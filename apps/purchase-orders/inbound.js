@@ -377,11 +377,18 @@ export function candidatesFor(inboundItemId) {
   return { item: { ...item, capacity }, candidates };
 }
 
+/** 候補POを「古い発注から」順に並べる (FIFO引き当ての正本順序。preview/実行の両方がこれを使う) */
+export function sortCandidatesFifo(cands) {
+  return [...cands].sort((a, b) => String(a.issuedAt).localeCompare(String(b.issuedAt)) || (a.orderItemId - b.orderItemId));
+}
+
 /**
- * ⚡一括割当の提案 (書込なし)。自動で割当できるのは「候補が1つに確定し、入庫数がPO残以下」の行だけ。
- * 注残に対応しない入庫 (候補なし/PO残超過) は自動で「対象外」に分類する (中原さん 2026-07-15:
- * このアプリは注残しか管理していない=注残にない入庫・注残を上回る入庫は対象外として処理し、
- * 一括割当を実行したら全行が処理し切られるイメージ)。曖昧 (候補複数) だけは従来どおり手動へ。
+ * ⚡一括割当の提案 (書込なし)。考え方 (中原さん 2026-07-15: 注残管理はシンプルに):
+ *  - 古い注残 (発注) から順にFIFOで引き当てる。複数POに累積していても古い方から自動で消す
+ *  - 注残より多く入荷したら注残は全量消込し、超過分だけを対象外にする
+ *    (行ごと対象外にするとPO残が「未入荷」のまま残り、二重発注・不要な督促の元、Codex ig-R1 High-2)
+ *  - 注残がない商品の入庫はスルー (=対象外。↩で戻せる記録付き)
+ *  - 一括割当を実行したら全行が処理し切られる。手動に残るのは異常系 (候補計算エラー・一部割当済みの残余) のみ
  */
 export function autoAssignPreview() {
   const { open } = listInbound();
@@ -393,40 +400,36 @@ export function autoAssignPreview() {
     let cands;
     try { cands = candidatesFor(row.id).candidates; }
     catch (e) { skipped.push({ ...row, reason: `候補計算エラー: ${e.message}` }); continue; }
-    if (!cands.length) {
-      // 一部割当済みの行は対象外にできない (台帳と矛盾したまま隠れる、DBトリガも拒否) → 手動へ
+    // 古い発注から順にFIFOで引き当て (1入庫行を複数POへ分割することもある)
+    const rowProps = [];
+    let rest = row.remainingCapacity;
+    for (const c of sortCandidatesFifo(cands)) {
+      if (rest <= 0) break;
+      const prior = cumByItem.get(c.orderItemId) || 0;
+      const eff = c.remaining - prior; // このバッチ内の先行提案分を差し引いた実効PO残
+      if (eff <= 0) continue;
+      const q = Math.min(rest, eff);
+      rowProps.push({
+        inboundItemId: row.id, slip: row.slip, receiptDate: row.receiptDate, supplierCode: row.supplierCode,
+        productCode: row.productCode, productName: row.productName, qty: q,
+        excessQty: 0, // 行の最終割当にだけ超過分を載せる (下で設定)
+        orderItemId: c.orderItemId, orderId: c.orderId, poNumber: c.poNumber, supplierName: c.supplierName,
+        poRemaining: eff, postRemaining: eff - q, costDiff: c.costDiff,
+        due: c.due || null, // 残数の扱いの日付既定 (分納待ち=次回予定日 / 確認中=期限)
+      });
+      cumByItem.set(c.orderItemId, prior + q);
+      rest -= q;
+    }
+    if (!rowProps.length) {
+      // 引き当てられるPO残が1つもない: 未発注分の入庫 or 先行提案で全量超過 → 対象外 (スルー)
+      // 一部割当済みの行だけは対象外にできない (台帳と矛盾したまま隠れる、DBトリガも拒否) → 手動へ
       if (row.allocated > 0) skipped.push({ ...row, reason: '一部割当済みで残りに対応する発注残がありません (逆仕訳などで手動対応してください)' });
       else autoIgnores.push({ inboundItemId: row.id, slip: row.slip, productCode: row.productCode, productName: row.productName,
-        qty: row.remainingCapacity, reason: '対応する発注残なし (未発注分の入庫)' });
+        qty: row.remainingCapacity, reason: cands.length ? `入庫数(${row.remainingCapacity})が注残を超過 (先行分で注残は消込済み)` : '対応する発注残なし (未発注分の入庫)' });
       continue;
     }
-    if (cands.length > 1) { skipped.push({ ...row, reason: `候補が${cands.length}件あります (手動で選択してください)` }); continue; }
-    const c = cands[0];
-    const prior = cumByItem.get(c.orderItemId) || 0;
-    const effRemaining = c.remaining - prior; // このバッチ内の先行提案分を差し引いた実効PO残
-    // 注残超過: PO残までは割り当て (注残は事実どおり消える)、超過分だけを対象外にする
-    // (行ごと対象外にするとPO残が「未入荷」のまま残り、二重発注・不要な督促の元、Codex ig-R1 High-2)
-    const excessQty = row.remainingCapacity > effRemaining ? row.remainingCapacity - effRemaining : 0;
-    const assignQty = row.remainingCapacity - excessQty;
-    if (excessQty > 0 && row.allocated > 0) {
-      skipped.push({ ...row, reason: `一部割当済みで、残り(${row.remainingCapacity})がPO残(${effRemaining})を超えています (手動対応してください)` });
-      continue;
-    }
-    if (assignQty <= 0) {
-      // 同一POへの先行提案で実効PO残が0 → この行に割当できる分がない=全量が超過
-      autoIgnores.push({ inboundItemId: row.id, slip: row.slip, productCode: row.productCode, productName: row.productName,
-        qty: row.remainingCapacity, reason: `入庫数(${row.remainingCapacity})がPO残(0${prior ? ` — 同一POへの先行提案${prior}を差引後` : ''})を超過` });
-      continue;
-    }
-    cumByItem.set(c.orderItemId, prior + assignQty);
-    proposals.push({
-      inboundItemId: row.id, slip: row.slip, receiptDate: row.receiptDate, supplierCode: row.supplierCode,
-      productCode: row.productCode, productName: row.productName, qty: assignQty,
-      excessQty, // >0 なら「注残超過分」— 割当と同時に残余を対象外にする
-      orderItemId: c.orderItemId, orderId: c.orderId, poNumber: c.poNumber, supplierName: c.supplierName,
-      poRemaining: effRemaining, postRemaining: effRemaining - assignQty, costDiff: c.costDiff,
-      due: c.due || null, // 残数の扱いの日付既定 (分納待ち=次回予定日 / 確認中=期限)
-    });
+    if (rest > 0) rowProps[rowProps.length - 1].excessQty = rest; // 注残を超えた分は最終割当と同時に対象外へ
+    proposals.push(...rowProps);
   }
   // 残数の扱いは「PO明細ごとに最後の提案行」でだけ選択させる (途中行の設定は最後の行で上書きされるため)
   const lastIdxByItem = new Map();
