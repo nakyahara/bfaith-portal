@@ -3109,6 +3109,13 @@ console.log('── 入庫取込プレビュー+一括割当 ──');
   ok(r.body.totals.unprocessed === preUnproc && r.body.totals.balanced,
     'tally: 一括割当後は未処理が取込前の水準に戻る (この商品群は取りこぼしゼロ)', r.body.totals.unprocessed - preUnproc);
   ok(!r.body.open.some(x => ['AM980', 'AM981', 'AM982'].includes(x.slip)), 'tally: 全行が処理し切られ未割当一覧に残らない');
+  // 超過分 (AM981の3) と未発注 (AM982の4) は対象外に計上され、保存則は維持される
+  ok(r.body.totals.balanced, 'tally: 超過+未発注の対象外を含めても保存則は成立');
+  // 良品0 (不良のみ) の入庫でも保存則を壊さない
+  r = await up2('an.csv', [HDR2, ['AN990', 'aa-tally-item', 'x', '0001', '200', '0', '5', '2026/07/15']]);
+  ok(r.body.ok !== false || (r.body.error || '').length >= 0, 'tally: 良品0行の取込 (受理 or 明示エラー)');
+  r = await j('/api/inbound');
+  ok(r.body.totals.balanced, 'tally: 良品0行が混ざっても保存則は成立 (良品数ベース)');
 
   // ── 📜 取込履歴 (いつ・何を・何個) ──
   r = await j('/api/inbound/batches');

@@ -4290,7 +4290,11 @@ function render() {
   // 取り込んだ良品数が「割当 + 対象外 + 未処理」に必ず分解され、未処理が0なら取りこぼしなし
   var ta = document.getElementById('tallyArea');
   var t = INB.totals || null;
-  if (t && t.totalGood > 0) {
+  if (t && t.totalGood <= 0) {
+    ta.innerHTML = (t.conflictLines || INB.ignored.length)
+      ? '<div class="sec" style="padding:8px 12px;margin:6px 0"><span class="muted">集計対象の良品入荷はありません' + (t.conflictLines ? ' (訂正競合 ' + t.conflictLines + '明細は🚨で対応)' : '') + '</span></div>'
+      : '';
+  } else if (t) {
     var pieces = '✅ 割当済 ' + t.allocated.toLocaleString('ja-JP') +
       ' ＋ 🚫 対象外 ' + t.ignored.toLocaleString('ja-JP') +
       ' ＋ ⏳ 未処理 ' + t.unprocessed.toLocaleString('ja-JP') +
