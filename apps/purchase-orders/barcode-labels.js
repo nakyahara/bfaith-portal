@@ -209,55 +209,64 @@ export function importBarcodeCsv({ rows, fileHash, commit, expectedHash, expecte
   const iNote = header.indexOf('備考');
   const iVendor = header.findIndex(h => h === 'AMC管理番号' || h === 'AMC様商品コード' || h === '先方管理番号');
   const db = getDB();
-  const existing = new Map();
-  for (const r of db.prepare('SELECT * FROM po_barcode_labels').all()) existing.set(r.product_key, r);
-  const errors = [];
-  const seen = new Set();
-  const plan = []; // { key, code, status, value, note, vendorHint, action: 'new'|'update'|'same', manualOverwrite }
-  for (let n = 1; n < rows.length; n++) {
-    const code = trimS(rows[n][iCode]);
-    if (!code) continue;
-    const key = normProductCode(code);
-    if (seen.has(key)) { errors.push(`行${n + 1}: 商品コード ${code} がCSV内で重複しています`); continue; }
-    seen.add(key);
-    const stRaw = trimS(rows[n][iStatus]);
-    const status = STATUS_JA.get(stRaw);
-    if (!status) { errors.push(`行${n + 1} (${code}): 状態「${stRaw}」が不正です (設定済み/依頼中/不要/未設定)`); continue; }
-    const value = iValue === -1 ? '' : trimS(rows[n][iValue]);
-    if (value.length > 64) { errors.push(`行${n + 1} (${code}): バーコード値が長すぎます (64文字まで)`); continue; }
-    const note = iNote === -1 ? '' : trimS(rows[n][iNote]);
-    // 黙って切り捨てない (プレビュー集計だけ見てcommitすると末尾が失われる、Codex R1 Medium)
-    if (note.length > 500) { errors.push(`行${n + 1} (${code}): 備考が長すぎます (500文字まで)`); continue; }
-    const vendorHint = iVendor === -1 ? '' : trimS(rows[n][iVendor]);
-    const cur = existing.get(key);
-    let action = 'new';
-    if (cur) {
-      const sameCore = cur.status === status && trimS(cur.barcode_value) === value && trimS(cur.note) === note
-        && trimS(cur.vendor_code_hint) === vendorHint;
-      action = sameCore ? 'same' : 'update';
+
+  // 現在のDB状態を読み、CSVとの差分計画+stateHash (対象行のversion集合) を作る。
+  // commit時はこの関数をトランザクション内で再実行する — 読取り・照合・書込みが同一スナップショットになり、
+  // 「commit読取り直後に別接続が書く」隙間がない (same行スキップのすり抜け防止、Codex R2 High)
+  const buildPlan = () => {
+    const existing = new Map();
+    for (const r of db.prepare('SELECT * FROM po_barcode_labels').all()) existing.set(r.product_key, r);
+    const errors = [];
+    const seen = new Set();
+    const plan = []; // { key, code, status, value, note, vendorHint, action: 'new'|'update'|'same', manualOverwrite, baseVersion }
+    for (let n = 1; n < rows.length; n++) {
+      const code = trimS(rows[n][iCode]);
+      if (!code) continue;
+      const key = normProductCode(code);
+      if (seen.has(key)) { errors.push(`行${n + 1}: 商品コード ${code} がCSV内で重複しています`); continue; }
+      seen.add(key);
+      const stRaw = trimS(rows[n][iStatus]);
+      const status = STATUS_JA.get(stRaw);
+      if (!status) { errors.push(`行${n + 1} (${code}): 状態「${stRaw}」が不正です (設定済み/依頼中/不要/未設定)`); continue; }
+      const value = iValue === -1 ? '' : trimS(rows[n][iValue]);
+      if (value.length > 64) { errors.push(`行${n + 1} (${code}): バーコード値が長すぎます (64文字まで)`); continue; }
+      const note = iNote === -1 ? '' : trimS(rows[n][iNote]);
+      // 黙って切り捨てない (プレビュー集計だけ見てcommitすると末尾が失われる、Codex R1 Medium)
+      if (note.length > 500) { errors.push(`行${n + 1} (${code}): 備考が長すぎます (500文字まで)`); continue; }
+      const vendorHint = iVendor === -1 ? '' : trimS(rows[n][iVendor]);
+      const cur = existing.get(key);
+      let action = 'new';
+      if (cur) {
+        const sameCore = cur.status === status && trimS(cur.barcode_value) === value && trimS(cur.note) === note
+          && trimS(cur.vendor_code_hint) === vendorHint;
+        action = sameCore ? 'same' : 'update';
+      }
+      plan.push({
+        key, code, status, value, note, vendorHint, action,
+        // 手動編集済み行の上書きは目視確認対象 (CSVは移行時の一括投入用。画面編集が新しい可能性)
+        manualOverwrite: !!(cur && cur.source === 'manual' && action === 'update'),
+        fromStatus: cur ? cur.status : null,
+        baseVersion: cur ? cur.version : 0, // 0=未登録
+      });
     }
-    plan.push({
-      key, code, status, value, note, vendorHint, action,
-      // 手動編集済み行の上書きは目視確認対象 (CSVは移行時の一括投入用。画面編集が新しい可能性)
-      manualOverwrite: !!(cur && cur.source === 'manual' && action === 'update'),
-      fromStatus: cur ? cur.status : null,
-      baseVersion: cur ? cur.version : 0, // 0=未登録。stateHashと行単位の条件付きUPDATEに使う
-    });
-  }
-  if (errors.length) throw new Error(`CSVにエラーがあります (${errors.length}件):\n` + errors.slice(0, 10).join('\n') + (errors.length > 10 ? '\n…' : ''));
-  const counts = {
-    total: plan.length,
-    new: plan.filter(p => p.action === 'new').length,
-    update: plan.filter(p => p.action === 'update').length,
-    same: plan.filter(p => p.action === 'same').length,
-    manualOverwrite: plan.filter(p => p.manualOverwrite).length,
+    if (errors.length) throw new Error(`CSVにエラーがあります (${errors.length}件):\n` + errors.slice(0, 10).join('\n') + (errors.length > 10 ? '\n…' : ''));
+    const counts = {
+      total: plan.length,
+      new: plan.filter(p => p.action === 'new').length,
+      update: plan.filter(p => p.action === 'update').length,
+      same: plan.filter(p => p.action === 'same').length,
+      manualOverwrite: plan.filter(p => p.manualOverwrite).length,
+    };
+    const manualList = plan.filter(p => p.manualOverwrite).slice(0, 20)
+      .map(p => `${p.code}: ${BARCODE_STATUS_LABELS[p.fromStatus]}→${BARCODE_STATUS_LABELS[p.status]}`);
+    // stateHash = CSV対象行の現在version集合。プレビュー後にどれか1行でも手動更新されたら変わる
+    const stateHash = createHash('sha256')
+      .update(plan.map(p => `${p.key}:${p.baseVersion}`).sort().join('|')).digest('hex');
+    return { plan, counts, manualList, stateHash };
   };
-  const manualList = plan.filter(p => p.manualOverwrite).slice(0, 20)
-    .map(p => `${p.code}: ${BARCODE_STATUS_LABELS[p.fromStatus]}→${BARCODE_STATUS_LABELS[p.status]}`);
-  // stateHash = CSV対象行の現在version集合。プレビュー後にどれか1行でも手動更新されたら変わる
-  const stateHash = createHash('sha256')
-    .update(plan.map(p => `${p.key}:${p.baseVersion}`).sort().join('|')).digest('hex');
+
   if (!commit) {
+    const { plan, counts, manualList, stateHash } = buildPlan();
     return { committed: false, fileHash, stateHash, counts, manualList,
       statusCounts: { printed: plan.filter(p => p.status === 'printed').length, requested: plan.filter(p => p.status === 'requested').length,
         not_needed: plan.filter(p => p.status === 'not_needed').length, unset: plan.filter(p => p.status === 'unset').length } };
@@ -265,18 +274,21 @@ export function importBarcodeCsv({ rows, fileHash, commit, expectedHash, expecte
   if (!expectedHash || expectedHash !== fileHash) {
     throw new Error('プレビューしたCSVと内容が異なります。もう一度プレビューからやり直してください');
   }
-  if (!expectedStateHash || expectedStateHash !== stateHash) {
-    const e = new Error('プレビュー後に対象商品の登録が別の画面で更新されています。もう一度プレビューして内容を確認してからやり直してください');
-    e.status = 409;
-    throw e;
-  }
-  if (counts.new + counts.update === 0) throw new Error('取り込む変更が0件です (すべて登録済みと同一)');
-  const now = nowIso();
-  db.transaction(() => {
+  // 書込み前提の再読取り→stateHash照合→書込みを IMMEDIATE トランザクションで一体化
+  // (deferredだと読取り中は共有ロックのままで、照合と書込みの間に他接続の書込みが挟まり得る)
+  return db.transaction(() => {
+    const { plan, counts, manualList, stateHash } = buildPlan();
+    if (!expectedStateHash || expectedStateHash !== stateHash) {
+      const e = new Error('プレビュー後に対象商品の登録が別の画面で更新されています。もう一度プレビューして内容を確認してからやり直してください');
+      e.status = 409;
+      throw e;
+    }
+    if (counts.new + counts.update === 0) throw new Error('取り込む変更が0件です (すべて登録済みと同一)');
+    const now = nowIso();
     const ins = db.prepare(`INSERT INTO po_barcode_labels
       (product_key, product_code, product_name, status, barcode_value, barcode_type, vendor_code_hint, note, source, version, created_at, updated_at, updated_by)
       VALUES (?,?,?,?,?,?,?,?,'csv',1,?,?,?)`);
-    // UPDATEはプレビュー時versionを条件に (stateHash検証と同一リクエスト内なので通常は必ず一致。防御的二重化)
+    // UPDATEは読取り時versionを条件に (同一txn内なので必ず一致するはず。防御的二重化)
     const upd = db.prepare(`UPDATE po_barcode_labels
       SET product_code=?, status=?, barcode_value=?, barcode_type=?, vendor_code_hint=?, note=?, source='csv', version=version+1, updated_at=?, updated_by=?
       WHERE product_key=? AND version=?`);
@@ -296,8 +308,8 @@ export function importBarcodeCsv({ rows, fileHash, commit, expectedHash, expecte
       }
       ev.run(p.key, now, actor || null, p.fromStatus, p.status, p.value || null, p.note || null);
     }
-  })();
-  return { committed: true, fileHash, stateHash, counts, manualList };
+    return { committed: true, fileHash, stateHash, counts, manualList };
+  }).immediate();
 }
 
 /**
