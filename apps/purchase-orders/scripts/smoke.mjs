@@ -2976,6 +2976,31 @@ console.log('── 入庫取込プレビュー+一括割当 ──');
   ok(backRow && backRow.allocated === 5 && backRow.remainingCapacity === 4, 'excess: 解除後は残余4が未割当に戻る (割当5維持)', backRow);
   r = await jpA('/api/inbound/' + overRow.id + '/ignore', { ignore: true, reason: 'テスト後片付け (超過分)' });
   ok(r.status === 400 || r.body.ok === false, 'excess: 手動の行対象外は割当済み行を拒否 (rowスコープ維持)', r.body && r.body.error);
+  // 逆仕訳で excess 対象外は自動解除される (Codex ig-R2 High: 隠れたまま残ると再割当候補に出ない)
+  insRow.run('aa-rev-item', '超過逆仕訳テスト', '0001', '取扱中', 2, 0, 0, 0, 0, 10, 1.5, 400, 200, '2026-07-01', '2026-01-01');
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'aa-rev-item', qty: 3 }] }) });
+  r = await up2('ak.csv', [HDR2, ['AK960', 'aa-rev-item', 'x', '0001', '200', '5', '0', '2026/07/15']]);
+  r = await j('/api/inbound/auto-assign/preview');
+  const gRev = r.body.proposals.find(x => x.slip === 'AK960');
+  ok(gRev && gRev.qty === 3 && gRev.excessQty === 2, 'excess-rev: 提案 (3割当+2超過)', gRev);
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: gRev.inboundItemId, orderItemId: gRev.orderItemId, qty: 3, excess: true },
+  ] }, 'aa-rev-1');
+  ok(r.body.ok && r.body.assigned === 1, 'excess-rev: 実行 (3消込+2対象外)');
+  const revEv = db.prepare(`SELECT id FROM po_item_events WHERE inbound_item_id=? AND event_type='receipt'`).get(gRev.inboundItemId);
+  r = await j('/api/events/' + revEv.id + '/reverse', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ note: '割当誤りの訂正' }) });
+  ok(r.body.ok, 'excess-rev: 割当を逆仕訳');
+  r = await j('/api/inbound');
+  const revRow = r.body.open.find(x => x.slip === 'AK960');
+  ok(revRow && revRow.allocated === 0 && revRow.remainingCapacity === 5,
+    'excess-rev: 逆仕訳で excess 対象外が自動解除され全量5が未割当に戻る', revRow);
+  const revIg = db.prepare(`SELECT g.revoked_by FROM po_inbound_ignores g
+    JOIN po_inbound_items i ON i.id=g.inbound_item_id JOIN po_inbound_receipts rc ON rc.id=i.receipt_id
+    WHERE rc.source_key='AK960' ORDER BY g.id DESC`).get();
+  ok(revIg && revIg.revoked_by === 'system:reversal', 'excess-rev: 解除の主体=system:reversal を履歴に記録', revIg);
+
   // 候補が複数ある行は ignores に指定できない (割当で候補を消費してから対象外にする細工の遮断、Codex ig-R1 High-1)
   insRow.run('aa-multi2-item', '複数候補対象外細工テスト', '0001', '取扱中', 2, 0, 0, 0, 0, 10, 1.5, 400, 200, '2026-07-01', '2026-01-01');
   r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },

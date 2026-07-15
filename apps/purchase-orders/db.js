@@ -538,6 +538,15 @@ function initLedgerSchema(db) {
                  AND NOT EXISTS (SELECT 1 FROM po_item_events r WHERE r.reverses_id = e.id)
              ) = 0 THEN RAISE(ABORT, 'inbound ignore: 超過分の対象外は割当済みの行のみです') END;
            END`);
+  // 割当の逆仕訳で excess 対象外の前提 (割当済み) が崩れたら自動で解除する
+  // (解除しないと入庫行が対象外リストに隠れたまま再割当候補に出ない、Codex ig-R2 High)
+  db.exec(`CREATE TRIGGER trg_po_events_reversal_excess_revoke AFTER INSERT ON po_item_events
+           WHEN NEW.event_type = 'reversal'
+           BEGIN
+             UPDATE po_inbound_ignores SET revoked_at = NEW.recorded_at, revoked_by = 'system:reversal'
+             WHERE revoked_at IS NULL AND scope = 'excess'
+               AND inbound_item_id = (SELECT e.inbound_item_id FROM po_item_events e WHERE e.id = NEW.reverses_id);
+           END`);
   // logizard入荷の割当ガード: 参照先の実在・非supersede・非ignore・割当合計≤入庫良品数 (要件v8 F-5)。
   // ※入庫テーブル作成後に定義する (トリガ本文のテーブル参照はCREATE時に解決される)
   db.exec(`CREATE TRIGGER trg_po_events_inbound_capacity BEFORE INSERT ON po_item_events
