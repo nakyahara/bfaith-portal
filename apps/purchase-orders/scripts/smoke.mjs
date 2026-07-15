@@ -1034,6 +1034,8 @@ console.log('── P13b: 発注残ページ+消込API ──');
   {
     const html = await (await fetch(base + '/backorders')).text();
     ok(html.includes('boTabs') && html.includes('data-act') && html.includes('要対応'), '/backorders ページ配信 (タブ+消込ボタン)');
+    ok(html.includes('未完了') && html.includes('入荷待ち') && html.includes('data-rowcancel') && html.includes('SKU 金額'),
+      '/backorders 新表示 (未完了タブ/入荷待ちバッジ/予約取消/SKU・金額)');
     ok(html.includes('remBox') && html.includes('await_delivery'), '/backorders 部分入荷の三択UI');
     ok(html.includes('data-rev') && html.includes('data-closeui'), '/backorders 逆仕訳+手動クローズUI (promptなし)');
     ok(html.includes("td.innerHTML = ''") && html.includes('Idempotency-Key'), '/backorders パネルDOM破棄+冪等キー送信 (Codex P13b R1)');
@@ -1515,6 +1517,27 @@ console.log('── P15: メール送信 (fake transport) ──');
     const disp = await em.dispatchDueEmailJobs();
     ok(disp.processed >= 1 && db.prepare('SELECT status FROM po_email_jobs WHERE id=?').get(orphanId).status === 'sent',
       'ディスパッチャ: 孤児queued (即時・2分超) を回収して送信', disp);
+  }
+
+  // 発注残API: PO行のメール状況 (送信済み/予約中) と行からの予約取消 (中原さん要望 2026-07-15)
+  {
+    r = await j('/api/backorders');
+    const emBo = r.body.orders.find(o => o.id === emOrderId);
+    ok(emBo && emBo.emailSentLive === true && emBo.email != null, '発注残API: live送信済みPOは emailSentLive=true', emBo && emBo.email);
+    // 新しい予約 (dry-runモード中=dedup exempt) → email.status=queued+scheduledAtJst → 取消 → 有効ジョブなし
+    const jst2 = new Date(Date.now() + 9 * 3600000 + 7200000).toISOString().slice(0, 16);
+    r = await jsonPost('/api/orders/' + schedOrderId + '/email/send', { scheduledAt: jst2 }, 'em-key-row1');
+    ok(r.body.ok && r.body.status === 'scheduled', '行テスト用の予約作成', r.body);
+    const rowJobId = r.body.jobId;
+    r = await j('/api/backorders');
+    const sBo = r.body.orders.find(o => o.id === schedOrderId);
+    ok(sBo && sBo.email && sBo.email.status === 'queued' && sBo.email.jobId === rowJobId && !!sBo.email.scheduledAtJst,
+      '発注残API: 予約中 (queued+scheduledAtJst+jobId)', sBo && sBo.email);
+    r = await jsonPost('/api/email-jobs/' + rowJobId + '/cancel', {});
+    ok(r.body.ok, '行の予約取消 (cancel API)');
+    r = await j('/api/backorders');
+    const sBo2 = r.body.orders.find(o => o.id === schedOrderId);
+    ok(sBo2 && (sBo2.email == null || sBo2.email.jobId !== rowJobId), '取消後: 予約中の表示が消える (cancelledは最新ジョブから除外)', sBo2 && sBo2.email);
   }
 
   // MIME 生成 (Message-ID=delivery_key、添付CP932)
