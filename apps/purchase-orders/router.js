@@ -1898,12 +1898,17 @@ router.post('/api/barcode-labels/import-csv', upload.single('file'), (req, res) 
     const rows = parseCsvBuffer(buf);
     const fileHash = createHash('sha256').update(buf).digest('hex');
     const commit = String((req.body || {}).commit) === '1';
-    const result = importBarcodeCsv({ rows, fileHash, commit, expectedHash: trimS((req.body || {}).fileHash) || null, actor: actorOf(req) });
+    const result = importBarcodeCsv({
+      rows, fileHash, commit,
+      expectedHash: trimS((req.body || {}).fileHash) || null,
+      expectedStateHash: trimS((req.body || {}).stateHash) || null,
+      actor: actorOf(req),
+    });
     if (result.committed) {
       audit(getDB(), { actorType: 'user', actor: actorOf(req), action: 'barcode_labels_import', resource: 'barcode_labels', detail: { counts: result.counts } });
     }
     res.json({ ok: true, ...result });
-  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+  } catch (e) { res.status(e.status === 409 ? 409 : 400).json({ ok: false, error: e.message }); }
 });
 
 router.get('/api/ledger/integrity', (req, res) => {
@@ -6983,7 +6988,7 @@ document.getElementById('bcImpForm').addEventListener('submit', function(ev) {
     .then(function(r){ return r.json(); }).then(function(j) {
       document.getElementById('bcImpStatus').textContent = '';
       if (!j.ok) { alert('プレビューエラー: ' + j.error); return; }
-      BC_IMP = { fileHash: j.fileHash, file: f };
+      BC_IMP = { fileHash: j.fileHash, stateHash: j.stateHash, file: f };
       var c = j.counts;
       var h = '<div class="sec" style="padding:10px 12px"><b>プレビュー</b>: 全 ' + c.total + '行 — 新規 ' + c['new'] + ' / 更新 ' + c.update + ' / 変更なし ' + c.same +
         ' <span class="muted">(設定済み ' + j.statusCounts.printed + ' / 依頼中 ' + j.statusCounts.requested + ' / 不要 ' + j.statusCounts.not_needed + ' / 未設定 ' + j.statusCounts.unset + ')</span>';
@@ -7000,6 +7005,7 @@ document.getElementById('bcImpForm').addEventListener('submit', function(ev) {
         fd2.append('file', BC_IMP.file);
         fd2.append('commit', '1');
         fd2.append('fileHash', BC_IMP.fileHash);
+        fd2.append('stateHash', BC_IMP.stateHash); // プレビュー後に他画面で更新されていたら409 (プレビューからやり直し)
         fetch('/apps/purchase-orders/api/barcode-labels/import-csv', { method: 'POST', body: fd2 })
           .then(function(r){ return r.json(); }).then(function(j2) {
             if (!j2.ok) { btn.disabled = false; alert('取込エラー: ' + j2.error); return; }

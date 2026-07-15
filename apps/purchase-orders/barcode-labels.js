@@ -11,6 +11,7 @@
  *   po_barcode_labels に行が無い対象商品 = 「未登録」(旧Excel管理漏れ相当)。
  *   行はあるが対象から外れた商品 = orphan (理由付きで返す。取扱中止は対象のまま=ラベル情報は生きている)
  */
+import { createHash } from 'crypto';
 import { getDB, normSupplierCode, normProductCode } from './db.js';
 import { loadPmlMerged } from './logic.js';
 import { getSetting } from './ledger.js';
@@ -40,14 +41,14 @@ export function detectBarcodeType(value) {
 
 /**
  * バーコード管理対象の商品一覧を PML(+NEオーバーレイ) から取得。
- * 返値: { pub, targets: Map<product_key, {code, name, active, vendorCode}> }
+ * 返値: { pub, rows (PML全行=orphan理由の算出等で再利用可), targets: Map<product_key, {code, name, active, vendorCode}> }
  * PML未同期 (pub=null) のときは targets=空Map (呼び元で「未同期」と表示する)
  */
 export function loadBarcodeTargets() {
   const supplier = barcodeTargetSupplier();
   const { pub, rows } = loadPmlMerged();
   const targets = new Map();
-  if (!pub) return { pub: null, targets };
+  if (!pub) return { pub: null, rows: [], targets };
   for (const r of rows) {
     if (String(r['商品区分'] || '').trim() === 'セット') continue;
     if (normSupplierCode(r['仕入先']) !== supplier) continue;
@@ -66,7 +67,7 @@ export function loadBarcodeTargets() {
     const t = targets.get(m.product_key);
     if (t) t.vendorCode = m.vendor_code;
   }
-  return { pub, targets };
+  return { pub, rows, targets };
 }
 
 function rowToLabel(r) {
@@ -91,7 +92,7 @@ export function loadLabelMap() {
  * targets: 対象商品全件 (label=null なら未登録) / orphans: ラベル行はあるが対象外 (理由付き)
  */
 export function listBarcodeOverview() {
-  const { pub, targets } = loadBarcodeTargets();
+  const { pub, rows: pmlRows, targets } = loadBarcodeTargets();
   const labels = loadLabelMap();
   const supplier = barcodeTargetSupplier();
   const rows = [];
@@ -102,10 +103,10 @@ export function listBarcodeOverview() {
   const rank = { unregistered: 0, unset: 1, requested: 2, printed: 3, not_needed: 4 };
   rows.sort((a, b) => (rank[a.label ? a.label.status : 'unregistered'] - rank[b.label ? b.label.status : 'unregistered'])
     || a.code.localeCompare(b.code));
-  // orphan = ラベル行があるが今の対象定義から外れた商品 (理由を明示、Codex設計相談)
+  // orphan = ラベル行があるが今の対象定義から外れた商品 (理由を明示、Codex設計相談)。
+  // PML行は loadBarcodeTargets で読んだものを再利用 (二重読み回避、Codex R1 Low)
   const orphans = [];
   if (pub) {
-    const { rows: pmlRows } = loadPmlMerged();
     const pmlByKey = new Map();
     for (const r of pmlRows) pmlByKey.set(normProductCode(r['商品コード']), r);
     for (const [key, label] of labels) {
@@ -191,9 +192,12 @@ const STATUS_JA = new Map([
 /**
  * バーコード管理CSVの取込。列: 商品コード(必須), 状態(必須: 設定済み/依頼中/不要/未設定),
  * バーコード値(任意。FNSKU/JAN), 備考(任意), AMC管理番号(任意=vendor_code_hint)
- * commit=false: プレビュー (書込なし、fileHash返却) / commit=true: fileHash一致検証の上で upsert
+ * commit=false: プレビュー (書込なし、fileHash+stateHash返却)
+ * commit=true: fileHash (同一ファイル) と stateHash (プレビュー時のDB状態=対象行のversion集合) の
+ *   両方の一致を要求。プレビュー後に誰かがポップオーバーで手動更新していたら stateHash が変わり409
+ *   → プレビューからやり直し (CSV取込に楽観ロックを迂回させない、Codex R1 High)
  */
-export function importBarcodeCsv({ rows, fileHash, commit, expectedHash, actor }) {
+export function importBarcodeCsv({ rows, fileHash, commit, expectedHash, expectedStateHash, actor }) {
   if (rows.length < 2) throw new Error('データ行がありません');
   const header = rows[0].map(s => trimS(s));
   const iCode = header.indexOf('商品コード');
@@ -220,8 +224,10 @@ export function importBarcodeCsv({ rows, fileHash, commit, expectedHash, actor }
     const status = STATUS_JA.get(stRaw);
     if (!status) { errors.push(`行${n + 1} (${code}): 状態「${stRaw}」が不正です (設定済み/依頼中/不要/未設定)`); continue; }
     const value = iValue === -1 ? '' : trimS(rows[n][iValue]);
-    if (value.length > 64) { errors.push(`行${n + 1} (${code}): バーコード値が長すぎます`); continue; }
-    const note = iNote === -1 ? '' : trimS(rows[n][iNote]).slice(0, 500);
+    if (value.length > 64) { errors.push(`行${n + 1} (${code}): バーコード値が長すぎます (64文字まで)`); continue; }
+    const note = iNote === -1 ? '' : trimS(rows[n][iNote]);
+    // 黙って切り捨てない (プレビュー集計だけ見てcommitすると末尾が失われる、Codex R1 Medium)
+    if (note.length > 500) { errors.push(`行${n + 1} (${code}): 備考が長すぎます (500文字まで)`); continue; }
     const vendorHint = iVendor === -1 ? '' : trimS(rows[n][iVendor]);
     const cur = existing.get(key);
     let action = 'new';
@@ -235,6 +241,7 @@ export function importBarcodeCsv({ rows, fileHash, commit, expectedHash, actor }
       // 手動編集済み行の上書きは目視確認対象 (CSVは移行時の一括投入用。画面編集が新しい可能性)
       manualOverwrite: !!(cur && cur.source === 'manual' && action === 'update'),
       fromStatus: cur ? cur.status : null,
+      baseVersion: cur ? cur.version : 0, // 0=未登録。stateHashと行単位の条件付きUPDATEに使う
     });
   }
   if (errors.length) throw new Error(`CSVにエラーがあります (${errors.length}件):\n` + errors.slice(0, 10).join('\n') + (errors.length > 10 ? '\n…' : ''));
@@ -247,13 +254,21 @@ export function importBarcodeCsv({ rows, fileHash, commit, expectedHash, actor }
   };
   const manualList = plan.filter(p => p.manualOverwrite).slice(0, 20)
     .map(p => `${p.code}: ${BARCODE_STATUS_LABELS[p.fromStatus]}→${BARCODE_STATUS_LABELS[p.status]}`);
+  // stateHash = CSV対象行の現在version集合。プレビュー後にどれか1行でも手動更新されたら変わる
+  const stateHash = createHash('sha256')
+    .update(plan.map(p => `${p.key}:${p.baseVersion}`).sort().join('|')).digest('hex');
   if (!commit) {
-    return { committed: false, fileHash, counts, manualList,
+    return { committed: false, fileHash, stateHash, counts, manualList,
       statusCounts: { printed: plan.filter(p => p.status === 'printed').length, requested: plan.filter(p => p.status === 'requested').length,
         not_needed: plan.filter(p => p.status === 'not_needed').length, unset: plan.filter(p => p.status === 'unset').length } };
   }
   if (!expectedHash || expectedHash !== fileHash) {
     throw new Error('プレビューしたCSVと内容が異なります。もう一度プレビューからやり直してください');
+  }
+  if (!expectedStateHash || expectedStateHash !== stateHash) {
+    const e = new Error('プレビュー後に対象商品の登録が別の画面で更新されています。もう一度プレビューして内容を確認してからやり直してください');
+    e.status = 409;
+    throw e;
   }
   if (counts.new + counts.update === 0) throw new Error('取り込む変更が0件です (すべて登録済みと同一)');
   const now = nowIso();
@@ -261,19 +276,28 @@ export function importBarcodeCsv({ rows, fileHash, commit, expectedHash, actor }
     const ins = db.prepare(`INSERT INTO po_barcode_labels
       (product_key, product_code, product_name, status, barcode_value, barcode_type, vendor_code_hint, note, source, version, created_at, updated_at, updated_by)
       VALUES (?,?,?,?,?,?,?,?,'csv',1,?,?,?)`);
+    // UPDATEはプレビュー時versionを条件に (stateHash検証と同一リクエスト内なので通常は必ず一致。防御的二重化)
     const upd = db.prepare(`UPDATE po_barcode_labels
       SET product_code=?, status=?, barcode_value=?, barcode_type=?, vendor_code_hint=?, note=?, source='csv', version=version+1, updated_at=?, updated_by=?
-      WHERE product_key=?`);
+      WHERE product_key=? AND version=?`);
     const ev = db.prepare(`INSERT INTO po_barcode_label_events (product_key, at, actor, source, from_status, to_status, barcode_value, note)
       VALUES (?,?,?,'csv',?,?,?,?)`);
     for (const p of plan) {
       if (p.action === 'same') continue;
-      if (p.action === 'new') ins.run(p.key, p.code, null, p.status, p.value || null, detectBarcodeType(p.value), p.vendorHint || null, p.note || null, now, now, actor || null);
-      else upd.run(p.code, p.status, p.value || null, detectBarcodeType(p.value), p.vendorHint || null, p.note || null, now, actor || null, p.key);
+      if (p.action === 'new') {
+        ins.run(p.key, p.code, null, p.status, p.value || null, detectBarcodeType(p.value), p.vendorHint || null, p.note || null, now, now, actor || null);
+      } else {
+        const r = upd.run(p.code, p.status, p.value || null, detectBarcodeType(p.value), p.vendorHint || null, p.note || null, now, actor || null, p.key, p.baseVersion);
+        if (r.changes === 0) {
+          const e = new Error(`取込中に ${p.code} が別の画面で更新されました。全件取り消しました — プレビューからやり直してください`);
+          e.status = 409;
+          throw e; // txn全体をロールバック
+        }
+      }
       ev.run(p.key, now, actor || null, p.fromStatus, p.status, p.value || null, p.note || null);
     }
   })();
-  return { committed: true, fileHash, counts, manualList };
+  return { committed: true, fileHash, stateHash, counts, manualList };
 }
 
 /**

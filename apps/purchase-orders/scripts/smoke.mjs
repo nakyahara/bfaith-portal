@@ -3265,11 +3265,25 @@ console.log('── 🏷️ バーコードラベル管理 ──');
   ok(r.status === 200 && r.body.ok && !r.body.committed && r.body.counts.new === 1 && r.body.counts.update === 1,
     'barcode: CSVプレビュー new1/update1', r.body.counts);
   ok(r.body.counts.manualOverwrite === 1 && r.body.manualList.length === 1, 'barcode: 手動編集の上書き警告', r.body.manualList);
-  const bcHash = r.body.fileHash;
+  ok(typeof r.body.stateHash === 'string' && r.body.stateHash.length === 64, 'barcode: プレビューがstateHashを返す');
+  let bcHash = r.body.fileHash, bcState = r.body.stateHash;
   r = await j('/api/barcode-labels/import-csv', { method: 'POST', body: mkFd({ commit: '1' }) });
   ok(r.status === 400, 'barcode: fileHashなしのcommitは400');
   r = await j('/api/barcode-labels/import-csv', { method: 'POST', body: mkFd({ commit: '1', fileHash: bcHash }) });
-  ok(r.status === 200 && r.body.committed && r.body.counts.new === 1 && r.body.counts.update === 1, 'barcode: commit成功', r.body.counts);
+  ok(r.status === 409, 'barcode: stateHashなしのcommitは409');
+  // プレビュー後に手動編集が入ったら stateHash 不一致でcommit拒否 (CSVで楽観ロックを迂回させない、Codex R1 High)
+  r = await j('/api/barcode-labels/diyorangeoil100', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ productCode: 'diyorangeoil100', status: 'unset' }) });
+  ok(r.status === 200, 'barcode: プレビュー後の手動編集 (競合テスト用)');
+  r = await j('/api/barcode-labels/import-csv', { method: 'POST', body: mkFd({ commit: '1', fileHash: bcHash, stateHash: bcState }) });
+  ok(r.status === 409, 'barcode: プレビュー後に手動編集された commit は409 (stateHash不一致)');
+  // 再プレビュー → commit 成功
+  r = await j('/api/barcode-labels/import-csv', { method: 'POST', body: mkFd() });
+  ok(r.status === 200 && r.body.counts.new === 0 && r.body.counts.update === 2 && r.body.counts.manualOverwrite === 2,
+    'barcode: 再プレビュー (全行update+手動上書き2件)', r.body.counts);
+  bcHash = r.body.fileHash; bcState = r.body.stateHash;
+  r = await j('/api/barcode-labels/import-csv', { method: 'POST', body: mkFd({ commit: '1', fileHash: bcHash, stateHash: bcState }) });
+  ok(r.status === 200 && r.body.committed && r.body.counts.update === 2, 'barcode: 再プレビュー後のcommit成功', r.body.counts);
   r = await j('/api/barcode-labels');
   const oilT = r.body.targets.find(t => t.key === 'diyorangeoil100');
   const nikuT = r.body.targets.find(t => t.key === '0726-001060');
@@ -3277,6 +3291,11 @@ console.log('── 🏷️ バーコードラベル管理 ──');
     'barcode: CSV取込結果 (printed+FNSKU+AMC番号ヒント)', oilT.label);
   ok(nikuT.label.status === 'unset' && nikuT.label.source === 'csv', 'barcode: CSVが手動編集行を上書き (プレビューで警告済み)', nikuT.label);
   ok(r.body.orphans.some(o => o.key === 'noflyersticker'), 'barcode: CSVに無い既存行は消えない (upsert方式)');
+  // 備考500文字超は黙って切り捨てず行番号付きエラー (Codex R1 Medium)
+  const longFd = new FormData();
+  longFd.append('file', new Blob(['商品コード,状態,備考\r\ndiyorangeoil100,設定済み,' + 'あ'.repeat(501) + '\r\n'], { type: 'text/csv' }), 'long.csv');
+  r = await j('/api/barcode-labels/import-csv', { method: 'POST', body: longFd });
+  ok(r.status === 400 && r.body.error.includes('備考が長すぎます'), 'barcode: 備考500文字超のCSVは400 (黙って切り捨てない)');
   const badFd = new FormData();
   badFd.append('file', new Blob(['商品コード,状態\r\nxxx,ヘンな状態\r\n'], { type: 'text/csv' }), 'bad.csv');
   r = await j('/api/barcode-labels/import-csv', { method: 'POST', body: badFd });
