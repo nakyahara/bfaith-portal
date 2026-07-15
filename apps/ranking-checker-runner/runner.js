@@ -66,13 +66,14 @@ async function main() {
   }
 
   // 多重起動ガード (プロセス間): DB の run_state.status='running' があれば
-  //   - 3時間以内の "fresh" → 別プロセスが動いているので黙って退く (exit 73)
-  //   - 3時間以上の "stale" → そのまま進む (runAutoCheck 内で markStaleRunning が failed 化する)
+  //   - 6時間以内の "fresh" → 別プロセスが動いているので黙って退く (exit 73)
+  //   - 6時間以上の "stale" → そのまま進む (runAutoCheck 内で markStaleRunning が failed 化する)
+  // 閾値は db.js markStaleRunning の 6h と揃えること (実測 3h12m/run のため 3h から引き上げ)
   const running = getRunningRun();
   if (running) {
     const startedMs = Date.parse(running.started_at.replace(' ', 'T') + 'Z');
     const ageMs = Date.now() - startedMs;
-    const FRESH_MS = 3 * 60 * 60 * 1000;
+    const FRESH_MS = 6 * 60 * 60 * 1000;
     if (ageMs >= 0 && ageMs < FRESH_MS) {
       console.error(`[runner] 既存 running (${running.run_id}, age=${Math.round(ageMs / 60000)}分) を検知、今回は skip`);
       process.exit(73);

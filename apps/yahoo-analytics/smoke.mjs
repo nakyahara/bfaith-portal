@@ -5,6 +5,7 @@ import fs from 'fs';
 import path from 'path';
 import { initMirrorDB, getMirrorDB } from '../warehouse-mirror/db.js';
 import * as q from './queries.js';
+import * as ins from './insights.js';
 
 // 本番 DB 誤実行ガード 1: DATA_DIR 未指定 (= cwd の本番 DB に向く) なら即中断
 if (!process.env.DATA_DIR) {
@@ -40,8 +41,30 @@ const ymPrev = q.addMonths(ymNow, -1);
 
 // ─── fixture ───
 const tx = db.transaction(() => {
-  for (const t of ['mirror_yahoo_finance_sku_daily', 'mart_yahoo_monthly_summary', 'mirror_products']) {
+  for (const t of ['mirror_yahoo_finance_sku_daily', 'mart_yahoo_monthly_summary', 'mirror_products', 'yadash_settings', 'yadash_rate_master',
+    'mirror_yahoo_item_daily', 'mirror_yahoo_keyword_daily', 'mirror_yahoo_store_device_daily', 'mirror_yahoo_inflow_daily', 'mirror_yahoo_user_attr_daily', 'mirror_yahoo_flash_hourly',
+    'yadash_insight_occurrences', 'yadash_insight_events', 'yadash_insight_runs']) {
     try { db.exec(`DELETE FROM ${t}`); } catch {}
+  }
+
+  // 統計 fixture: alpha は PV も CVR も健全 / zeta は PV 大量なのに売れない
+  const insT = db.prepare(`INSERT INTO mirror_yahoo_item_daily
+    (date_jst, item_code, sub_code, item_name, sales_yen, orders, units, buyers, pv_premium_ship, pv_normal, visitors, cart_adds, favorites, source_run_id, source_row_hash, synced_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'smoke', ?, 't')`);
+  const insK = db.prepare(`INSERT INTO mirror_yahoo_keyword_daily
+    (date_jst, keyword, rank, inflow, sales_yen, orders, source_run_id, source_row_hash, synced_at)
+    VALUES (?, ?, ?, ?, ?, ?, 'smoke', ?, 't')`);
+  for (let i = 1; i <= 28; i++) {
+    const date = d(i);
+    insT.run(date, 'ya-alpha', 'ya-alpha-bk', 'アルファ精油BK', 10000, 10, 10, 9, 100, 100, 100, 20, 5, `a${i}`);
+    insT.run(date, 'ya-zeta', '', 'ゼータ棚ざらし', 0, 0, 0, 0, 300, 300, 400, 2, 1, `z${i}`);
+    // 健全SKU×3 (high_pv_low_cvr の中央値算出には5SKU以上必要)
+    insT.run(date, 'ya-eta1', '', 'イータ1', 3000, 3, 3, 3, 20, 20, 40, 5, 1, `e1${i}`);
+    insT.run(date, 'ya-eta2', '', 'イータ2', 2000, 2, 2, 2, 15, 15, 30, 4, 1, `e2${i}`);
+    insT.run(date, 'ya-eta3', '', 'イータ3', 1000, 1, 1, 1, 10, 10, 20, 3, 1, `e3${i}`);
+    // KW「アロマ」: 直近7日 (i<=7) は流入が激減
+    insK.run(date, 'アロマ', 1, i <= 7 ? 5 : 40, i <= 7 ? 1000 : 8000, i <= 7 ? 1 : 8, `k${i}`);
+    insK.run(date, '精油', 2, 30, 5000, 5, `k2${i}`);
   }
 
   // 商品マスタ (SKU詳細のマスタ表示 + 未解決候補サジェスト用)
@@ -331,6 +354,161 @@ check('getSkuProfit 期間内に未解決日があれば最新日が解決済み
   assert(e.flag === 'unresolved', `期間内未解決あり→警告flag (got ${e.flag})`);
   assert(e.cost_status !== 'complete', '原価状態も不完全表示');
   db.prepare(`DELETE FROM mirror_yahoo_finance_sku_daily WHERE yahoo_sku_key = 'ya-eps'`).run();
+});
+
+// ─── P3: 売れ筋 + 設定 ───
+
+check('getBestsellers ランキング/ABC/前期比', () => {
+  const r = q.getBestsellers(d(6), today, 'sales');
+  assert(r.total_skus === 3, `3 SKU (got ${r.total_skus})`);
+  assert(r.ranking[0].yahoo_sku_key === 'ya-alpha-bk', '売上軸の先頭=alpha');
+  // ABC は加算前累積比で判定 (Codex P3-R1 medium): 境界をまたぐSKUはA群に含める。
+  // alpha(累積0%開始)=A, beta(54%開始<80)=A, gamma(97%開始)=C。先頭SKUは構成比がどれだけ大きくても必ずA
+  assert(r.ranking[0].abc === 'A', `先頭SKUは必ずA群 (got ${r.ranking[0].abc})`);
+  const beta = r.ranking.find(x => x.yahoo_sku_key === 'ya-beta');
+  const gammaR = r.ranking.find(x => x.yahoo_sku_key === 'ya-gamma');
+  assert(beta.abc === 'A' && gammaR.abc === 'C', `beta=A/gamma=C (got ${beta.abc}/${gammaR.abc})`);
+  assert(r.abc.count.A + r.abc.count.B + r.abc.count.C === 3, 'ABC合計');
+  assert(r.abc.total_revenue === (10000 + 8000 + 500) * 7, `売上合計 (got ${r.abc.total_revenue})`);
+  // 前期 (同量) → 成長率0%
+  const alpha = r.ranking.find(x => x.yahoo_sku_key === 'ya-alpha-bk');
+  assert(alpha.units_growth_pct === 0, `前期同量→0% (got ${alpha.units_growth_pct})`);
+  assert(alpha.is_new === false, '90日前初売上→NEWでない');
+  assert(r.risers.length === 0 && r.fallers.length === 0, '同量なので急上昇/急落なし');
+  // 軸切替
+  const u = q.getBestsellers(d(6), today, 'units');
+  assert(u.axis === 'units_net' && u.ranking[0].yahoo_sku_key === 'ya-alpha-bk', '数量軸');
+  const m = q.getBestsellers(d(6), today, 'margin');
+  assert(m.axis === 'variable_margin', '粗利軸');
+});
+
+check('getBestsellers 曜日パターン + 5のつく日 + スパークライン', () => {
+  const r = q.getBestsellers(d(6), today, 'sales');
+  assert(r.weekday.length === 7, `曜日7種 (got ${r.weekday.length})`);
+  for (const w of r.weekday) assert(w.avg_units === 15, `全日15個/日 (got ${w.avg_units})`);
+  const spark = r.ranking[0].spark;
+  assert(Array.isArray(spark) && spark.length === 7, `スパークライン7日分 (got ${spark?.length})`);
+  // 30日窓なら 5/15/25 が必ず含まれ、全日同量なので lift=0%
+  const g30 = q.getBestsellers(d(29), today, 'sales').goen;
+  assert(g30.goen_days >= 2, `5のつく日 (got ${g30.goen_days})`);
+  assert(g30.lift_pct === 0, `同量→lift 0% (got ${g30.lift_pct})`);
+});
+
+check('settings 既定値 + 保存 + バリデーション (Codex P3-R1 medium)', () => {
+  const s0 = q.getSettings();
+  assert(s0.abc_a_pct === 80 && s0.movers_min_units === 5, '既定値');
+  const s1 = q.saveSettings({ abc_a_pct: 70, bogus_key: 1 });
+  assert(s1.abc_a_pct === 70, '保存反映');
+  assert(!('bogus_key' in s1), '不正キー無視');
+  // 範囲外・非数値・A>=B は 400 で reject (部分適用しない)
+  let threw = 0;
+  try { q.saveSettings({ new_product_days: 'abc' }); } catch (e) { if (e.status === 400) threw++; }
+  try { q.saveSettings({ abc_a_pct: 200 }); } catch (e) { if (e.status === 400) threw++; }
+  try { q.saveSettings({ movers_min_units: -5 }); } catch (e) { if (e.status === 400) threw++; }
+  try { q.saveSettings({ abc_a_pct: 96, abc_b_pct: 95 }); } catch (e) { if (e.status === 400) threw++; }
+  assert(threw === 4, `バリデーション4件 (got ${threw})`);
+  assert(q.getSettings().abc_a_pct === 70, 'reject時は部分適用なし');
+  q.saveSettings({ abc_a_pct: 80 });
+});
+
+check('料率マスタ CRUD + 改定日ロジック', () => {
+  const r0 = q.getRates();
+  assert(Object.keys(r0.current).length === 0 && r0.history.length === 0, '初期は空');
+  // 過去日から有効な料率
+  q.addRate({ rate_key: 'promo_package', rate_pct: 3, effective_from: '2025-01-01', memo: '加入時' });
+  // 未来日の改定予約 (2026-09改定)
+  const r1 = q.addRate({ rate_key: 'promo_package', rate_pct: 2, effective_from: '2099-09-01', memo: '改定予約' });
+  assert(r1.current.promo_package.rate_pct === 3, `現在有効=3% (got ${r1.current.promo_package?.rate_pct})`);
+  assert(r1.upcoming.length === 1 && r1.upcoming[0].rate_pct === 2, '未来日は改定予約');
+  // 後から追加した「より新しい過去日」が現在有効になる
+  const r2 = q.addRate({ rate_key: 'promo_package', rate_pct: 2.5, effective_from: '2025-06-01', memo: '' });
+  assert(r2.current.promo_package.rate_pct === 2.5, `改定日順で最新 (got ${r2.current.promo_package.rate_pct})`);
+  // 削除で1つ前に戻る
+  const r3 = q.deleteRate(r2.current.promo_package.id);
+  assert(r3.current.promo_package.rate_pct === 3, `削除で前の料率に (got ${r3.current.promo_package.rate_pct})`);
+  // バリデーション
+  let threw = 0;
+  try { q.addRate({ rate_key: 'bogus', rate_pct: 1, effective_from: '2025-01-01' }); } catch { threw++; }
+  try { q.addRate({ rate_key: 'point_base', rate_pct: 101, effective_from: '2025-01-01' }); } catch { threw++; }
+  try { q.addRate({ rate_key: 'point_base', rate_pct: 1, effective_from: '2025-13-01' }); } catch { threw++; }
+  try { q.deleteRate(999999); } catch { threw++; }
+  assert(threw === 4, `バリデーション4件 (got ${threw})`);
+});
+
+// ─── P6: 統計統合 + インサイト基盤 ───
+
+check('統計統合: trafficBySku / bestsellersのPV/CVR / SkuDetailのtraffic_daily / 検索KW / flash', () => {
+  const t = q.trafficBySku(d(6), today, );
+  const a = t.get('ya-alpha-bk');
+  assert(a && a.pv === 200 * 6 || a.pv === 200 * 7, `alpha PV (got ${a?.pv})`);   // d(1)〜d(6)=6日 or 7日分 (当日行なし)
+  assert(a.cvr_pct === 9, `alpha CVR 9% (got ${a.cvr_pct})`);
+  const bs = q.getBestsellers(d(6), today, 'sales');
+  const alpha = bs.ranking.find(x => x.yahoo_sku_key === 'ya-alpha-bk');
+  assert(alpha.pv > 0 && alpha.cvr_pct === 9, `売れ筋にPV/CVR (got ${alpha.pv}/${alpha.cvr_pct})`);
+  const det = q.getSkuDetail('ya-alpha-bk', d(6), today);
+  assert(det.traffic_daily.length === 6, `traffic_daily 6日 (got ${det.traffic_daily.length})`);
+  const kw = q.getSearchKeywords(d(6), d(1));
+  assert(kw.rows.length === 2 && kw.rows[0].keyword === '精油', `KW流入順 (got ${kw.rows[0]?.keyword})`);
+  const fl = q.getFlashLatest();
+  assert(fl.date === null || Array.isArray(fl.rows), 'flashは空でも壊れない');
+  const acq = q.getAcquisition(d(6), today);
+  assert(Array.isArray(acq.device) && Array.isArray(acq.user_attr), 'acquisition形');
+});
+
+check('insights: 検出 (赤字/未解決/PV空振り/KW急減) + evidence契約', () => {
+  // 赤字SKU fixture: 7日×売上900円 (計6,300>=5,000) × 粗利-2,000/日 (計-14,000 = high)
+  for (let i = 1; i <= 7; i++) insTemp(d(i), 'ya-loss', 'NE-B', '', 'parent_match', 0, -2000, 2000, 'complete', 1, `L1-${i}`);
+  const r = ins.runInsights('manual');
+  assert(r.run_id > 0 && r.found > 0, `検出あり (got ${r.found})`);
+  const list = r.insights;
+  const loss = list.find(x => x.rule_key === 'loss_sku' && x.target_key === 'ya-loss');
+  assert(loss && loss.severity === 'high', `赤字SKU high (got ${loss?.severity})`);
+  assert(loss.evidence.observed_at && loss.evidence.run_id === r.run_id && loss.evidence.period, 'evidence契約 (observed_at/run_id/period)');
+  assert(loss.suggested_action.action_type && loss.suggested_action.requires_approval === true, 'suggested_action構造化');
+  assert(list.find(x => x.rule_key === 'unresolved_sku' && x.target_key === 'ya-gamma'), '未解決SKU検出');
+  const zeta = list.find(x => x.rule_key === 'high_pv_low_cvr' && x.target_key === 'ya-zeta');
+  assert(zeta, 'PVあるのに売れない検出');
+  assert(list.find(x => x.rule_key === 'kw_inflow_drop' && x.target_key === 'アロマ'), 'KW流入急減検出');
+});
+
+check('insights: ライフサイクル (解消→再発reopen / dismissed永続 / severity昇格でreopen)', () => {
+  // 解消: ya-loss の赤字行を消して再実行 → resolved
+  db.prepare(`DELETE FROM mirror_yahoo_finance_sku_daily WHERE yahoo_sku_key = 'ya-loss'`).run();
+  ins.runInsights('manual');
+  const db2 = getMirrorDB();
+  const occ = db2.prepare(`SELECT * FROM yadash_insight_occurrences WHERE rule_key = 'loss_sku' AND target_key = 'ya-loss'`).get();
+  assert(occ.resolved_at !== null, '解消でresolved_at');
+  // 再発 (warn級: 計-5,600 > -10,000) → reopen (open のまま)
+  for (let i = 1; i <= 7; i++) insTemp(d(i), 'ya-loss', 'NE-B', '', 'parent_match', 0, -800, 800, 'complete', 1, `L2-${i}`);
+  ins.runInsights('manual');
+  const occ2 = db2.prepare(`SELECT * FROM yadash_insight_occurrences WHERE target_key = 'ya-loss'`).get();
+  assert(occ2.resolved_at === null && occ2.status === 'open' && occ2.severity === 'warn', `再発でreopen (got ${occ2.status}/${occ2.severity})`);
+  // dismissed → 再実行しても dismissed のまま (severity同じ)
+  ins.setInsightStatus(occ2.id, 'dismissed', 'ロスリーダー');
+  ins.runInsights('manual');
+  const occ3 = db2.prepare(`SELECT * FROM yadash_insight_occurrences WHERE id = ?`).get(occ2.id);
+  assert(occ3.status === 'dismissed', `dismissed永続 (got ${occ3.status})`);
+  // severity昇格 (high級: 計-14,000) → reopen
+  db2.prepare(`DELETE FROM mirror_yahoo_finance_sku_daily WHERE yahoo_sku_key = 'ya-loss'`).run();
+  for (let i = 1; i <= 7; i++) insTemp(d(i), 'ya-loss', 'NE-B', '', 'parent_match', 0, -2000, 2000, 'complete', 1, `L3-${i}`);
+  ins.runInsights('manual');
+  const occ4 = db2.prepare(`SELECT * FROM yadash_insight_occurrences WHERE id = ?`).get(occ2.id);
+  assert(occ4.status === 'open' && occ4.severity === 'high', `昇格でreopen (got ${occ4.status}/${occ4.severity})`);
+  // イベント履歴が遷移分だけ残る
+  const events = db2.prepare(`SELECT event_type FROM yadash_insight_events WHERE occurrence_id = ? ORDER BY id`).all(occ2.id).map(e => e.event_type);
+  assert(events.includes('detected') || events.includes('reopened'), 'イベント履歴');
+  assert(events.filter(e => e === 'resolved').length >= 1 && events.filter(e => e === 'status_changed').length >= 1, 'resolved/status_changedイベント');
+  db2.prepare(`DELETE FROM mirror_yahoo_finance_sku_daily WHERE yahoo_sku_key = 'ya-loss'`).run();
+});
+
+check('insights: status API バリデーション + listフィルタ', () => {
+  let threw = 0;
+  try { ins.setInsightStatus(999999, 'done', ''); } catch (e) { if (e.status === 400) threw++; }
+  try { ins.setInsightStatus(1, 'bogus', ''); } catch (e) { if (e.status === 400) threw++; }
+  assert(threw === 2, `バリデーション2件 (got ${threw})`);
+  const open = ins.listInsights({ status: 'open' });
+  assert(open.insights.every(x => x.status === 'open'), 'statusフィルタ');
+  assert(open.rules_version === ins.RULES_VERSION && open.rule_labels, 'AI契約メタ');
 });
 
 console.log(`\n=== smoke: ${pass} PASS / ${fail} FAIL ===`);

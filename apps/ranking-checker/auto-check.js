@@ -235,7 +235,48 @@ async function amazonApiSearch(keyword, itemPage, accessKey, secretKey, partnerT
 // 順位結果の表現: 数値(1..100) = 順位、null = 圏外/対象なし、-1 = APIエラー
 const RANK_ERROR = -1;
 
-async function checkRakuten(product, appId, accessKey) {
+/**
+ * 検索結果ページキャッシュ (1 run スコープ)。
+ *
+ * 登録商品 3,566 件に対しユニークキーワードは約 1,300 件で、セット違い等の
+ * 同一キーワード商品が同じ検索を毎回 API に投げ直していた。ページ単位で
+ * 結果を保持し、2 商品目以降はキャッシュ照合のみにする (API 呼び出し・
+ * 実行時間とも大幅減、429 リスクも減る)。
+ * 保持するのは itemUrl / reviewCount のみ (メモリ節約)。
+ */
+export function createSearchCache() {
+  return { pages: new Map(), calls: 0, hits: 0, lastCallAt: 0 };
+}
+
+async function getSearchPage(cache, keyword, page, appId, accessKey) {
+  const key = keyword + ' ' + page;
+  const cached = cache.pages.get(key);
+  if (cached) {
+    cache.hits++;
+    return cached;
+  }
+  // 実 API 呼び出しの間隔だけを API_DELAY で空ける (キャッシュヒット時は待たない)
+  const wait = cache.lastCallAt ? API_DELAY - (Date.now() - cache.lastCallAt) : 0;
+  if (wait > 0) await sleep(wait);
+  try {
+    const data = await rakutenApiSearch(keyword, page, appId, accessKey);
+    const slim = {
+      count: data.count || 0,
+      pageCount: data.pageCount || 0,
+      items: (data.Items || []).map(w => {
+        const it = w.Item || {};
+        return { itemUrl: it.itemUrl || '', reviewCount: it.reviewCount != null ? it.reviewCount : null };
+      }),
+    };
+    cache.pages.set(key, slim); // 成功時のみキャッシュ (失敗は次回再試行できるよう残さない)
+    return slim;
+  } finally {
+    cache.lastCallAt = Date.now();
+    cache.calls++;
+  }
+}
+
+async function checkRakuten(product, appId, accessKey, cache) {
   const keyword = product.keyword;
   const ownUrl = getRakutenUrl(product);
   const comp1Url = product.competitor1_url || '';
@@ -258,17 +299,16 @@ async function checkRakuten(product, appId, accessKey) {
 
   for (let page = 1; page <= maxPages; page++) {
     if (organicRank >= MAX_RANK) break;
-    if (page > 1) await sleep(API_DELAY);
     let data;
     try {
-      data = await rakutenApiSearch(keyword, page, appId, accessKey);
+      data = await getSearchPage(cache, keyword, page, appId, accessKey);
     } catch (e) {
       log(`  楽天API失敗 page=${page}: ${e.message}`);
       if (page === 1 && e.message && e.message.includes('429')) {
         log(`  ⚠ page=1失敗のため5秒待って再試行...`);
         await sleep(5000);
         try {
-          data = await rakutenApiSearch(keyword, page, appId, accessKey);
+          data = await getSearchPage(cache, keyword, page, appId, accessKey);
         } catch (e2) {
           log(`  楽天API再試行も失敗: ${e2.message}`);
           return { own_rank: RANK_ERROR, competitor1_rank: comp1Url ? RANK_ERROR : null, competitor2_rank: comp2Url ? RANK_ERROR : null, review_count: null };
@@ -278,22 +318,20 @@ async function checkRakuten(product, appId, accessKey) {
         break;
       }
     }
-    const items = data.Items || [];
+    const items = data.items;
     if (!items.length) break;
     if (page === 1) {
-      debugLog(`  楽天API応答: count=${data.count || 0}, pages=${data.pageCount || 0}`);
+      debugLog(`  楽天API応答: count=${data.count}, pages=${data.pageCount}`);
       if (DEBUG_LOG) {
         for (let i = 0; i < Math.min(3, items.length); i++) {
-          const u = (items[i].Item || {}).itemUrl || '';
-          debugLog(`  #${i + 1}: ${normalizeUrl(u)}`);
+          debugLog(`  #${i + 1}: ${normalizeUrl(items[i].itemUrl)}`);
         }
       }
     }
 
-    for (const wrapper of items) {
+    for (const item of items) {
       if (organicRank >= MAX_RANK) break;
-      const item = wrapper.Item || {};
-      const itemUrl = item.itemUrl || '';
+      const itemUrl = item.itemUrl;
       organicRank++;
       if (!itemUrl) continue;
       for (const [key, targetUrl] of Object.entries(targets)) {
@@ -307,7 +345,7 @@ async function checkRakuten(product, appId, accessKey) {
       if (Object.keys(found).length === Object.keys(targets).length) break;
     }
     if (Object.keys(found).length === Object.keys(targets).length) break;
-    if (page >= (data.pageCount || 0)) break;
+    if (page >= data.pageCount) break;
   }
 
   log(`  探索完了: ${organicRank}件チェック, 発見=${JSON.stringify(found)}`);
@@ -435,6 +473,8 @@ export async function runAutoCheck({ force = false } = {}) {
   let done = 0;
   let finishStatus = 'completed';
   let finishError = null;
+  // 同一キーワード商品の重複検索を避ける run スコープのキャッシュ
+  const searchCache = createSearchCache();
 
   try {
     // CONCURRENCY=1 前提の逐次処理。並列化するなら chunk で集めて Promise.all。
@@ -459,9 +499,10 @@ export async function runAutoCheck({ force = false } = {}) {
       checkProgress.current = product.keyword;
       log(`[${done + 1}/${totalTarget}] "${product.keyword}"`);
 
+      const callsBefore = searchCache.calls;
       let result;
       try {
-        result = await checkRakuten(product, appId, accessKey);
+        result = await checkRakuten(product, appId, accessKey, searchCache);
       } catch (e) {
         log(`  楽天エラー: ${e.message}`);
         rdb.logRun(runId, 'error', `楽天エラー: ${e.message}`, product.id);
@@ -521,10 +562,13 @@ export async function runAutoCheck({ force = false } = {}) {
         rdb.updateRunProgress(runId, done);
       }
 
-      if (done < totalTarget) await sleep(KW_DELAY);
+      // この商品が実 API を1回も呼ばなかった (全ページキャッシュヒット) 場合、
+      // レート制限上待つ理由がないので KW_DELAY をスキップする
+      if (done < totalTarget && searchCache.calls > callsBefore) await sleep(KW_DELAY);
     }
 
     log(`自動順位チェック完了: ${done} 件`);
+    log(`検索キャッシュ統計: API呼び出し ${searchCache.calls} 回 / キャッシュヒット ${searchCache.hits} 回 / キャッシュページ ${searchCache.pages.size}`);
     log('='.repeat(50));
   } catch (e) {
     finishStatus = 'failed';

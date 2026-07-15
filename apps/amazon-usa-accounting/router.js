@@ -15,6 +15,7 @@ import multer from 'multer';
 import fs from 'fs';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { requireImportKey, importJsonParser } from '../../lib/import-key-auth.js';
+import { normalizeYearMonth } from '../../lib/jst-date.js';
 
 const router = Router();
 const UPLOAD_DIR = process.env.DATA_DIR ? process.env.DATA_DIR + '/import' : 'data/import';
@@ -331,9 +332,13 @@ router.post('/upload', upload.single('file'), (req, res) => {
       return res.status(400).json({ error: 'データ行が見つかりません(CSVフォーマットを確認してください)' });
     }
 
-    // 対象年月(最初の日付から)
+    // 対象年月(最初の日付から)。監査M-1: parseUsDate失敗時はraw文字列が入るため
+    // slice(0,7)では汚れた月キーがmartに入る → regex抽出+失敗時400
     const firstDate = parsedRows[0].日付 || '';
-    const yearMonth = firstDate.slice(0, 7);  // YYYY-MM
+    const yearMonth = normalizeYearMonth(firstDate);
+    if (!yearMonth) {
+      return res.status(400).json({ error: `CSVの日付から年月を特定できません: "${firstDate}"` });
+    }
 
     const { resolved, unresolved, zeroGenka, conflicts } = resolveSkus(parsedRows, db);
     const { usd, jpy, mgmt, costTotalJpy } = aggregate(resolved, rate);

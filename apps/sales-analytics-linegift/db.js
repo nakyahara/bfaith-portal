@@ -72,7 +72,7 @@ export function getKpiSummaryByPeriod(from, to) {
       SELECT f.gross_sales_jpy_incl, f.variable_margin_jpy_incl, f.order_count, f.units_net_sold,
              COALESCE(p.送料, 0) * (1 + COALESCE(p.消費税率, 0.1)) AS unit_shipping_cost_jpy_incl
       FROM mirror_linegift_finance_sku_daily f
-      LEFT JOIN mirror_products p ON p.商品コード = f.ne_code
+      LEFT JOIN mirror_products p ON p.商品コード = LOWER(TRIM(f.ne_code))
       WHERE f.date_jst BETWEEN ? AND ?
     )
     SELECT
@@ -102,7 +102,7 @@ function computeKpiInRange(db, from, to) {
       SELECT f.gross_sales_jpy_incl, f.variable_margin_jpy_incl, f.order_count, f.units_net_sold,
              COALESCE(p.送料, 0) * (1 + COALESCE(p.消費税率, 0.1)) AS unit_shipping_cost_jpy_incl
       FROM mirror_linegift_finance_sku_daily f
-      LEFT JOIN mirror_products p ON p.商品コード = f.ne_code
+      LEFT JOIN mirror_products p ON p.商品コード = LOWER(TRIM(f.ne_code))
       WHERE f.date_jst BETWEEN ? AND ?
     )
     SELECT
@@ -277,7 +277,7 @@ export function getTrend(periodSpec) {
         f.gross_sales_jpy_incl, f.variable_margin_jpy_incl, f.order_count, f.units_net_sold,
         COALESCE(p.送料, 0) * (1 + COALESCE(p.消費税率, 0.1)) AS unit_shipping_cost_jpy_incl
       FROM mirror_linegift_finance_sku_daily f
-      LEFT JOIN mirror_products p ON p.商品コード = f.ne_code
+      LEFT JOIN mirror_products p ON p.商品コード = LOWER(TRIM(f.ne_code))
       WHERE f.date_jst BETWEEN ? AND ?
     )
     SELECT
@@ -337,7 +337,7 @@ export function getSkuTrend(skuCode, periodSpec) {
         f.gross_sales_jpy_incl, f.variable_margin_jpy_incl, f.order_count, f.units_net_sold,
         COALESCE(p.送料, 0) * (1 + COALESCE(p.消費税率, 0.1)) AS unit_shipping_cost_jpy_incl
       FROM mirror_linegift_finance_sku_daily f
-      LEFT JOIN mirror_products p ON p.商品コード = f.ne_code
+      LEFT JOIN mirror_products p ON p.商品コード = LOWER(TRIM(f.ne_code))
       WHERE f.date_jst BETWEEN ? AND ?
         AND f.sku_code = ?
     )
@@ -454,7 +454,7 @@ export function getWeekdaySummary(periodSpec) {
         f.gross_sales_jpy_incl, f.variable_margin_jpy_incl, f.order_count, f.units_net_sold,
         COALESCE(p.送料, 0) * (1 + COALESCE(p.消費税率, 0.1)) AS unit_shipping_cost_jpy_incl
       FROM mirror_linegift_finance_sku_daily f
-      LEFT JOIN mirror_products p ON p.商品コード = f.ne_code
+      LEFT JOIN mirror_products p ON p.商品コード = LOWER(TRIM(f.ne_code))
       WHERE f.date_jst BETWEEN ? AND ?
     )
     SELECT
@@ -509,7 +509,7 @@ export function getSkuRanking(filters = {}) {
         CASE WHEN COALESCE(SUM(f.gross_sales_jpy_incl), 0) = 0 THEN 0
              ELSE ROUND((COALESCE(SUM(f.variable_margin_jpy_incl), 0) - COALESCE(SUM(f.units_net_sold * COALESCE(p.送料, 0) * (1 + COALESCE(p.消費税率, 0.1))), 0)) * 1.0 / COALESCE(SUM(f.gross_sales_jpy_incl), 0), 4) END AS gross_margin_rate
       FROM mirror_linegift_finance_sku_daily f
-      LEFT JOIN mirror_products p ON p.商品コード = f.ne_code
+      LEFT JOIN mirror_products p ON p.商品コード = LOWER(TRIM(f.ne_code))
       WHERE f.date_jst BETWEEN ? AND ?
       GROUP BY f.ne_code, f.sku_code
       HAVING COALESCE(SUM(f.units_net_sold), 0) > 0
@@ -536,7 +536,7 @@ export function getSkuRanking(filters = {}) {
       FROM mart_gift_season_occurrences s
       JOIN mirror_linegift_finance_sku_daily f
         ON f.date_jst BETWEEN s.start_date_jst AND s.end_date_jst
-      LEFT JOIN mirror_products p ON p.商品コード = f.ne_code
+      LEFT JOIN mirror_products p ON p.商品コード = LOWER(TRIM(f.ne_code))
       WHERE s.is_active = 1
         AND s.season_code = ?
         AND s.season_year = COALESCE(?, (SELECT MAX(season_year) FROM mart_gift_season_occurrences WHERE season_code = ? AND is_active = 1))
@@ -608,7 +608,7 @@ export function getPriceBandSummaryByPeriod(from, to) {
       COALESCE(SUM(f.variable_margin_jpy_incl), 0) - COALESCE(SUM(f.units_net_sold * COALESCE(p.送料, 0) * (1 + COALESCE(p.消費税率, 0.1))), 0) AS gross_profit_jpy_incl,
       COALESCE(SUM(f.order_count), 0) AS orders
     FROM mirror_linegift_finance_sku_daily f
-    LEFT JOIN mirror_products p ON p.商品コード = f.ne_code
+    LEFT JOIN mirror_products p ON p.商品コード = LOWER(TRIM(f.ne_code))
     WHERE f.date_jst BETWEEN ? AND ?
     GROUP BY f.ne_code, f.sku_code
     HAVING units > 0
@@ -706,7 +706,7 @@ export function getDeadStockSkus(periodSpec) {
       CASE WHEN COALESCE(SUM(f.gross_sales_jpy_incl), 0) = 0 THEN 0
            ELSE ROUND((COALESCE(SUM(f.variable_margin_jpy_incl), 0) - COALESCE(SUM(f.units_net_sold * COALESCE(p.送料, 0) * (1 + COALESCE(p.消費税率, 0.1))), 0)) * 1.0 / COALESCE(SUM(f.gross_sales_jpy_incl), 0), 4) END AS gross_margin_rate
     FROM mirror_linegift_finance_sku_daily f
-    LEFT JOIN mirror_products p ON p.商品コード = f.ne_code
+    LEFT JOIN mirror_products p ON p.商品コード = LOWER(TRIM(f.ne_code))
     WHERE f.date_jst BETWEEN ? AND ?
     GROUP BY f.ne_code, f.sku_code
     HAVING sales_jpy_incl > 0
@@ -767,7 +767,7 @@ export function getNewItemRamps(opts = {}) {
       -- 粗利は送料引き後 (LINEギフトの送料無料分を弊社負担)
       r.profit - COALESCE(r.units * COALESCE(p.送料, 0) * (1 + COALESCE(p.消費税率, 0.1)), 0) AS profit_adj
     FROM v_linegift_new_item_ramp r
-    LEFT JOIN mirror_products p ON p.商品コード = r.ne_code
+    LEFT JOIN mirror_products p ON p.商品コード = LOWER(TRIM(r.ne_code))
     WHERE r.sku_code IN (${skus.map(() => '?').join(',')})
     -- 同 sku_code に複数 ne_code がある場合、ne_code を含めないと day 単位で混ざり累積が壊れる (PR-E Codex Round 1 High)
     ORDER BY r.sku_code, r.ne_code, r.day_from_launch
@@ -856,7 +856,7 @@ export function getSeasonComparison(seasonCode, seasonYear) {
         ROUND(COALESCE(SUM(f.variable_margin_jpy_incl), 0) - COALESCE(SUM(f.units_net_sold * COALESCE(p.送料, 0) * (1 + COALESCE(p.消費税率, 0.1))), 0)) AS profit,
         COALESCE(SUM(f.order_count), 0) AS orders
       FROM mirror_linegift_finance_sku_daily f
-      LEFT JOIN mirror_products p ON p.商品コード = f.ne_code
+      LEFT JOIN mirror_products p ON p.商品コード = LOWER(TRIM(f.ne_code))
       WHERE f.date_jst BETWEEN ? AND ?
       GROUP BY f.sku_code, f.ne_code
     ), prev AS (
@@ -866,7 +866,7 @@ export function getSeasonComparison(seasonCode, seasonYear) {
         ROUND(COALESCE(SUM(f.variable_margin_jpy_incl), 0) - COALESCE(SUM(f.units_net_sold * COALESCE(p.送料, 0) * (1 + COALESCE(p.消費税率, 0.1))), 0)) AS profit,
         COALESCE(SUM(f.order_count), 0) AS orders
       FROM mirror_linegift_finance_sku_daily f
-      LEFT JOIN mirror_products p ON p.商品コード = f.ne_code
+      LEFT JOIN mirror_products p ON p.商品コード = LOWER(TRIM(f.ne_code))
       WHERE f.date_jst BETWEEN ? AND ?
       GROUP BY f.sku_code, f.ne_code
     )
@@ -892,7 +892,7 @@ export function getSeasonComparison(seasonCode, seasonYear) {
         ROUND(COALESCE(SUM(f.variable_margin_jpy_incl), 0) - COALESCE(SUM(f.units_net_sold * COALESCE(p.送料, 0) * (1 + COALESCE(p.消費税率, 0.1))), 0)) AS profit,
         COALESCE(SUM(f.order_count), 0) AS orders
       FROM mirror_linegift_finance_sku_daily f
-      LEFT JOIN mirror_products p ON p.商品コード = f.ne_code
+      LEFT JOIN mirror_products p ON p.商品コード = LOWER(TRIM(f.ne_code))
       WHERE f.date_jst BETWEEN ? AND ?
       GROUP BY f.sku_code, f.ne_code
     ), prev AS (
@@ -902,7 +902,7 @@ export function getSeasonComparison(seasonCode, seasonYear) {
         ROUND(COALESCE(SUM(f.variable_margin_jpy_incl), 0) - COALESCE(SUM(f.units_net_sold * COALESCE(p.送料, 0) * (1 + COALESCE(p.消費税率, 0.1))), 0)) AS profit,
         COALESCE(SUM(f.order_count), 0) AS orders
       FROM mirror_linegift_finance_sku_daily f
-      LEFT JOIN mirror_products p ON p.商品コード = f.ne_code
+      LEFT JOIN mirror_products p ON p.商品コード = LOWER(TRIM(f.ne_code))
       WHERE f.date_jst BETWEEN ? AND ?
       GROUP BY f.sku_code, f.ne_code
     ), keys AS (

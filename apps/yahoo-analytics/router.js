@@ -18,17 +18,25 @@ import { Router } from 'express';
 import {
   resolvePeriod, getOverview, getTrend,
   getWaterfall, getSkuProfit, getSkuDetail, getUnresolved,
+  getBestsellers, getSettings, saveSettings, getRates, addRate, deleteRate,
+  getSearchKeywords, getAcquisition, getFlashLatest,
 } from './queries.js';
+import { runInsights, listInsights, setInsightStatus } from './insights.js';
 
 const router = Router();
 
 // 500 を JSON で返す共通 wrapper (API は画面から fetch されるため HTML error page を返さない)
-// エラー詳細 (SQL/テーブル名等) はログのみ。クライアントには固定文言
+// エラー詳細 (SQL/テーブル名等) はログのみ。クライアントには固定文言。
+// 例外: e.status=400 (validationError) はユーザー起因なのでメッセージをそのまま返す
 function api(handler) {
   return (req, res) => {
     try {
       res.json(handler(req));
     } catch (e) {
+      if (e.status === 400) {
+        res.status(400).json({ error: e.message });
+        return;
+      }
       console.error(`[yahoo-analytics] ${req.method} ${req.originalUrl}: ${e.stack || e.message}`);
       res.status(500).json({ error: 'サーバー内部エラー (詳細はサーバーログ参照)' });
     }
@@ -74,6 +82,37 @@ router.get('/api/v1/sku-detail', api((req) => {
 }));
 
 router.get('/api/v1/unresolved', api((req) => getUnresolved(req.query.days)));
+
+// ─── 売れ筋 (P3) ───
+router.get('/api/v1/bestsellers', api((req) => {
+  const { from, to } = resolvePeriod(req.query.preset, req.query.from, req.query.to);
+  const axis = ['units', 'sales', 'margin'].includes(req.query.axis) ? req.query.axis : 'sales';
+  return getBestsellers(from, to, axis);
+}));
+
+// ─── 設定 (P3: 分析閾値 + 料率マスタ) ───
+router.get('/api/v1/settings', api(() => getSettings()));
+router.put('/api/v1/settings', api((req) => saveSettings(req.body || {})));
+
+// ─── 統計統合 (P6: mall-csv-fetcher 自動取得データ) ───
+router.get('/api/v1/search-keywords', api((req) => {
+  const { from, to } = resolvePeriod(req.query.preset, req.query.from, req.query.to);
+  return getSearchKeywords(from, to);
+}));
+router.get('/api/v1/acquisition', api((req) => {
+  const { from, to } = resolvePeriod(req.query.preset, req.query.from, req.query.to);
+  return getAcquisition(from, to);
+}));
+router.get('/api/v1/flash-latest', api(() => getFlashLatest()));
+
+// ─── 診断 = インサイト基盤 (P6)。GET /insights が AI エージェント向け契約 ───
+router.get('/api/v1/insights', api((req) => listInsights({ status: req.query.status, include_resolved: req.query.include_resolved === '1' })));
+router.post('/api/v1/insights/run', api(() => runInsights('manual')));
+router.put('/api/v1/insights/:id/status', api((req) => setInsightStatus(req.params.id, req.body?.status, req.body?.memo)));
+
+router.get('/api/v1/rates', api(() => getRates()));
+router.post('/api/v1/rates', api((req) => addRate(req.body || {})));
+router.delete('/api/v1/rates/:id', api((req) => deleteRate(req.params.id)));
 
 // CSV セルの安全化: 全セル quote + 式実行の危険先頭文字 (=+-@, tab, CR, LF) は ' を前置 (CSV injection 対策)
 function csvCell(v) {

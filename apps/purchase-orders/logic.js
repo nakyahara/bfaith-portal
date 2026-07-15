@@ -8,15 +8,19 @@
  *   発注対象        = 取扱区分='取扱中' かつ 0 < L <= M
  *   推奨発注量      = lots = (P-L)*V/N を N(発注ロット単位)で丸め
  *                     lots > 1 → ROUND(lots)*N / lots <= 1 → ROUNDUP(lots)*N (最低1ロット)
- *   掘り起こし対象  = L = 0 (在庫+注残ゼロ、または30日販売ゼロ)
+ *   掘り起こし対象  = 取扱中 かつ 在庫0 かつ 注残0 (中原さん定義 2026-07-14:
+ *     他社の値下げで価格が合わず仕入を控えた商品を、一定期間後に再販できるか調べるためのステータス)
  *     ※旧シートは取扱中止も掘り起こしに含めていたが、本アプリは「取扱中」のみに絞る (ノイズ除去)
+ *     ※在庫があって販売0の商品は掘り起こしではない → ついで買い候補の末尾に回す
+ *   セット商品 (商品区分='セット') は対象外 = 一覧にも出さない (在庫・発注は構成品側で管理)
  *
  * データソース: mirror_pml_snapshot_rows (published run) + po_* マスタ。
  */
 import { getDB, normSupplierCode, normProductCode } from './db.js';
+import { getSetting } from './ledger.js';
 
 const PML_COLS = [
-  '商品コード', '商品名', '仕入先', '取扱区分', '売上分類',
+  '商品コード', '商品名', '仕入先', '取扱区分', '商品区分', '売上分類',
   '総在庫数_引当なし', 'FBA在庫数', '注残数', '販売数7日_合計', '販売数30日_合計',
   '発注ロット単位', '推奨保有月数', '売価', '原価', '最終仕入日', '登録日',
 ];
@@ -35,10 +39,10 @@ export function stockConstant(m) {
   return 3;
 }
 
-/** 1商品の発注判定。旧シートの1行分。 */
-export function computeProduct(r) {
+/** 1商品の発注判定。旧シートの1行分。backOrderOverride を渡すとNE CSVの注残数の代わりに使う (アプリ台帳の残数) */
+export function computeProduct(r, backOrderOverride) {
   const S = num(r['総在庫数_引当なし']);
-  const B = num(r['注残数']);
+  const B = backOrderOverride != null ? backOrderOverride : num(r['注残数']);
   const V = num(r['販売数30日_合計']);
   const M = num(r['推奨保有月数']);
   const N = num(r['発注ロット単位']);
@@ -70,7 +74,8 @@ export function computeProduct(r) {
     stockMonths,
     isTarget,
     recQty,
-    isHorikoshi: active && stockMonths === 0,
+    // 掘り起こし = 取扱中かつ在庫0・注残0 (仕入を控えた商品の再販調査。販売0でも在庫があれば対象外)
+    isHorikoshi: active && S === 0 && B === 0,
   };
 }
 
@@ -119,7 +124,7 @@ export function loadPmlMerged() {
         const b = Date.parse(pub.src_ne_products_synced_at);
         if (!Number.isNaN(a) && !Number.isNaN(b) && a < b) applied = false; // 朝同期の方が新しい
       }
-      overlay = { uploaded_at: ov.meta.uploaded_at, row_count: ov.meta.row_count, filename: ov.meta.filename, applied, mergedCount: 0 };
+      overlay = { uploaded_at: ov.meta.uploaded_at, row_count: ov.meta.row_count, filename: ov.meta.filename, source: ov.meta.source || 'ne', applied, mergedCount: 0 };
     }
     const merged = !applied ? rows : rows.map(r => {
       const o = ov.rows.get(normProductCode(r['商品コード']));
@@ -171,10 +176,12 @@ export const SELECTABLE_DEFAULT_MIN = 10;
 export function loadRecentIssued(issuedDays = 14) {
   const db = getDB();
   const since = new Date(Date.now() - issuedDays * 86400000).toISOString();
+  // 移行PO (NE発注残初期取込) は除外: その数量はNE由来でPMLの注残数に反映済みのため、
+  // 「発注済み (NE反映待ち)」バッジを付けると二重カウントになる
   const rows = db.prepare(`
     SELECT i.product_key, i.qty, o.id AS order_id, o.issued_at
     FROM po_order_items i JOIN po_orders o ON o.id = i.order_id
-    WHERE o.status = 'issued' AND o.issued_at >= ?
+    WHERE o.status = 'issued' AND o.issued_at >= ? AND (o.origin IS NULL OR o.origin <> 'migration')
     ORDER BY o.issued_at ASC
   `).all(since);
   const map = new Map();
@@ -183,19 +190,40 @@ export function loadRecentIssued(issuedDays = 14) {
 }
 
 /**
+ * アプリ台帳の商品別発注残 (残数>0のオープン発注のみ、移行PO含む) → Map(product_key → 残数計)。
+ * NE CSVの「発注残数」の代わりに要発注判定へ使う: 発注確定した瞬間に注残へ反映され、
+ * NE CSV/朝同期の取込を待たずに要発注から消える (二重発注防止)。
+ */
+export function loadLedgerBackorders() {
+  const db = getDB();
+  // 集計ロジックは v_ledger_backorder_by_product に一本化 (PML正本ビュー v_pml_rows_authoritative・
+  // 整合性検査と同一定義。tracked の正は issued_at >= tracking_started_at、Codex サイクルR1 High / SSoT化 2026-07-13)
+  const map = new Map();
+  for (const r of db.prepare('SELECT product_key, backorder_qty FROM v_ledger_backorder_by_product').all()) {
+    map.set(r.product_key, r.backorder_qty);
+  }
+  return map;
+}
+
+/**
  * 全体計算。仕入先別に 要発注 / ついで買い候補 / 掘り起こし を仕分けする。
  * 戻り値の products は PML 全行の computeProduct 結果 (attrs 情報を付与済み)。
+ * 注残はアプリ台帳 (loadLedgerBackorders) を正とする — NE CSVの発注残数は使わない。
  */
 export function computeAll() {
   // PML(+NEオーバーレイ)・マスタ・直近発注を1つの read transaction で読む (途中の書き込みと混在させない、Codex R2 Low)
   const db = getDB();
-  const { pub, rows, overlay, masters, recentIssued } = db.transaction(() => ({
-    ...loadPmlMerged(), masters: loadMasters(), recentIssued: loadRecentIssued(),
+  const { pub, rows, overlay, masters, recentIssued, ledgerZan, useLedgerZan } = db.transaction(() => ({
+    ...loadPmlMerged(), masters: loadMasters(), recentIssued: loadRecentIssued(), ledgerZan: loadLedgerBackorders(),
+    // 既定 'app' = アプリ台帳。設定 backorder_source='ne' で旧挙動 (NE CSVの発注残数) へ戻せる
+    useLedgerZan: getSetting('backorder_source') !== 'ne',
   }))();
   const products = [];
   const bySupplier = new Map();
   for (const r of rows) {
-    const p = computeProduct(r);
+    // セット商品は発注・在庫管理の対象外 (在庫は構成品側)。全商品情報にも出さない (中原さん 2026-07-14)
+    if (String(r['商品区分'] || '').trim() === 'セット') continue;
+    const p = computeProduct(r, useLedgerZan ? (ledgerZan.get(normProductCode(r['商品コード'])) || 0) : undefined);
     const a = masters.attrs.get(p.key);
     p.conditionId = a ? (a.condition_id || '') : '';
     p.materialGroupId = a ? (a.material_group_id || '') : '';
@@ -229,11 +257,14 @@ export function computeAll() {
     }
     if (p.isTarget || p.selectableLow) g.targets.push(p);
     else if (p.isHorikoshi) g.horikoshi.push(p);
-    else if (p.active && p.stockMonths > 0) g.candidates.push(p);
+    // 在庫あり販売0 (stockMonths=0) もついで買い候補に含める (掘り起こしから外れた死に筋の受け皿。
+    // どのリストにも載らないとワークスペース検索・カート追加から消えてしまう)
+    else if (p.active) g.candidates.push(p);
   }
   for (const g of bySupplier.values()) {
     g.targets.sort((a, b) => a.stockMonths - b.stockMonths);
-    g.candidates.sort((a, b) => a.stockMonths - b.stockMonths);
+    // 販売0 (stockMonths=0) は末尾へ。それ以外は在庫月数の少ない順
+    g.candidates.sort((a, b) => ((a.stockMonths === 0) - (b.stockMonths === 0)) || a.stockMonths - b.stockMonths);
     g.horikoshi.sort((a, b) => (b.lastPurchase || '').localeCompare(a.lastPurchase || ''));
     g.estAmount = Math.round(g.targets.reduce((s, p) => s + (p.recQty || 0) * p.cost, 0));
   }

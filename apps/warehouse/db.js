@@ -325,6 +325,27 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_yh_orders_date ON raw_yahoo_orders(order_time)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_yh_orders_item ON raw_yahoo_orders(item_id)');
 
+  // 12b. raw_mercari_orders (監査PR-12(c)/V-4 対応)
+  // 従来は mall-orders.js (廃止済み) が自前 CREATE していた UNIQUE 制約ゼロの表で、
+  // 「毎日直近7日再取得 → 同一注文が最大7回重複append → 集計した瞬間に売上約7倍」の地雷だった
+  // (現状は writer 停止済みで 0 行)。DDL を db.js に正本化し UNIQUE index で武装。
+  // option_info は NULL があり得るため COALESCE で NULL 同士の重複も防ぐ。
+  db.exec(`CREATE TABLE IF NOT EXISTS raw_mercari_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id            TEXT,
+    order_date          TEXT,
+    order_status        TEXT,
+    item_code           TEXT,
+    item_name           TEXT,
+    quantity            INTEGER,
+    unit_price          REAL,
+    total_price         REAL,
+    option_info         TEXT,
+    synced_at           TEXT
+  )`);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS uq_mercari_order_line
+    ON raw_mercari_orders(order_id, item_code, COALESCE(option_info, ''))`);
+
   // 13. 店舗マスタ
   db.exec(`CREATE TABLE IF NOT EXISTS shops (
     shop_code           TEXT PRIMARY KEY,
@@ -1278,7 +1299,9 @@ function createTables() {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_lines_posted_utc  ON raw_amazon_settlement_lines(posted_date_utc)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_lines_tx_price    ON raw_amazon_settlement_lines(transaction_type, price_type)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_lines_tx_fee      ON raw_amazon_settlement_lines(transaction_type, item_related_fee_type)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_lines_settlement  ON raw_amazon_settlement_lines(source_settlement_id)`);
+  // 監査PR-12(d): idx_settle_lines_settlement(source_settlement_id) は idx_settle_lines_dedup の
+  // 完全prefixで冗長(67MB+INSERTコスト、INV-22) → 作成を廃止。既存DBからの削除は
+  // migrate-audit-pr12-cleanup.js が行う (boot時DROPはしない=migration実行を明示化)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_settle_lines_order       ON raw_amazon_settlement_lines(amazon_order_id)`);
 
   // ---- dim: 自動 INSERT で蓄積 ----
@@ -1296,18 +1319,10 @@ function createTables() {
     observed_first_at TEXT, observed_last_at TEXT
   )`);
 
-  // ---- bridge: 販売月リステート用 ----
-  db.exec(`CREATE TABLE IF NOT EXISTS bridge_amazon_order_sale_month (
-    amazon_order_id        TEXT NOT NULL,
-    order_item_code        TEXT NOT NULL,
-    seller_sku_normalized  TEXT NOT NULL,
-    original_year_month    INTEGER NOT NULL,
-    original_economic_date TEXT NOT NULL,
-    original_settlement_id TEXT NOT NULL,
-    ingested_at            TEXT,
-    PRIMARY KEY (amazon_order_id, order_item_code, seller_sku_normalized)
-  ) WITHOUT ROWID`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_bridge_year_month ON bridge_amazon_order_sale_month(original_year_month)`);
+  // ---- bridge: 販売月リステート用 → 監査PR-14で廃止 ----
+  // bridge_amazon_order_sale_month は CREATE のみで書き手/読み手が実装されないまま
+  // 0行 (監査F-7 dead候補)。作成を廃止 (既存DBからの削除は migrate-audit-pr14-financial-orphan.js)。
+  // 販売月リステートが将来必要になれば、その時の設計 (全社DDL規約準拠) で作り直す。
 
   // ---- mart: long fact ----
   db.exec(`CREATE TABLE IF NOT EXISTS fact_amazon_settlement_monthly_long (
@@ -1655,6 +1670,313 @@ function createTables() {
       updated_at          = excluded.updated_at
   `);
 
+  // ---- 楽天RPP広告費 mirror sync: contract auto-seed (mall-csv-fetcher P1、2026-07-09)
+  // fact_rakuten_ads_rpp (月次×商品) / fact_rakuten_ads_rpp_daily (日次×キャンペーン合計) を
+  // Render mirror へ sync。RPPは過去分変動 (不正クリック控除、720h遡及) のため scope_clear_per_run。
+  // 月次 entity の clear キーは月初日 date_jst=YYYY-MM-01 (amazon_account_fees_monthly と同方針)。
+  db.exec(`
+    INSERT INTO sync_contracts (
+      entity, contract_version, source_system, source_object, target_table,
+      grain_definition, key_columns_json, payload_schema_json,
+      clear_strategy, apply_mode, enabled, owner, created_at, updated_at
+    ) VALUES (
+      'rakuten_ads_rpp_monthly', 1, 'minipc-warehouse',
+      'fact_rakuten_ads_rpp', 'mirror_rakuten_ads_rpp',
+      'one row = one (month_ym, item_manage_number) — RPP商品別レポート月次 (RMS仕様で商品別は月ごと/全期間のみ)。date_jst=月初日 YYYY-MM-01 は clear キー',
+      '["date_jst","item_manage_number"]',
+      '{"required":["date_jst","month_ym","item_manage_number"],"date_jst_pattern":"^\\d{4}-\\d{2}-01$","month_ym_pattern":"^\\d{4}-\\d{2}$","amount_unit":"JPY_tax_included_integer"}',
+      'scope_clear_per_run', 'insert_or_replace', 1, 'mall-csv-fetcher',
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    )
+    ON CONFLICT(entity) DO UPDATE SET
+      contract_version    = excluded.contract_version,
+      source_system       = excluded.source_system,
+      source_object       = excluded.source_object,
+      target_table        = excluded.target_table,
+      grain_definition    = excluded.grain_definition,
+      key_columns_json    = excluded.key_columns_json,
+      payload_schema_json = excluded.payload_schema_json,
+      clear_strategy      = excluded.clear_strategy,
+      apply_mode          = excluded.apply_mode,
+      enabled             = excluded.enabled,
+      owner               = excluded.owner,
+      updated_at          = excluded.updated_at
+  `);
+
+  db.exec(`
+    INSERT INTO sync_contracts (
+      entity, contract_version, source_system, source_object, target_table,
+      grain_definition, key_columns_json, payload_schema_json,
+      clear_strategy, apply_mode, enabled, owner, created_at, updated_at
+    ) VALUES (
+      'rakuten_ads_rpp_daily', 1, 'minipc-warehouse',
+      'fact_rakuten_ads_rpp_daily', 'mirror_rakuten_ads_rpp_daily',
+      'one row = one (date_jst, campaign_id) — RPP「すべての広告/キャンペーン」×日ごとの日次広告費合計 (SKU内訳なし)',
+      '["date_jst","campaign_id"]',
+      '{"required":["date_jst"],"date_jst_pattern":"^\\d{4}-\\d{2}-\\d{2}$","amount_unit":"JPY_tax_included_integer"}',
+      'scope_clear_per_run', 'insert_or_replace', 1, 'mall-csv-fetcher',
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    )
+    ON CONFLICT(entity) DO UPDATE SET
+      contract_version    = excluded.contract_version,
+      source_system       = excluded.source_system,
+      source_object       = excluded.source_object,
+      target_table        = excluded.target_table,
+      grain_definition    = excluded.grain_definition,
+      key_columns_json    = excluded.key_columns_json,
+      payload_schema_json = excluded.payload_schema_json,
+      clear_strategy      = excluded.clear_strategy,
+      apply_mode          = excluded.apply_mode,
+      enabled             = excluded.enabled,
+      owner               = excluded.owner,
+      updated_at          = excluded.updated_at
+  `);
+
+  // ---- 楽天データ分析 mirror sync: contract auto-seed (mall-csv-fetcher P1-R2、2026-07-10)
+  // fact_rakuten_item_daily (SKU×日次 アクセス/CVR/レビュー/在庫) /
+  // fact_rakuten_store_daily (店舗×日次 KPI+商圏ベンチ+費用内訳)。
+  // RMSデータ分析CSVは再DLで過去分が変動しうるため scope_clear_per_run。
+  db.exec(`
+    INSERT INTO sync_contracts (
+      entity, contract_version, source_system, source_object, target_table,
+      grain_definition, key_columns_json, payload_schema_json,
+      clear_strategy, apply_mode, enabled, owner, created_at, updated_at
+    ) VALUES (
+      'rakuten_item_daily', 1, 'minipc-warehouse',
+      'fact_rakuten_item_daily', 'mirror_rakuten_item_daily',
+      'one row = one (date_jst, item_manage_number) — RMSデータ分析「商品分析」SKU×日次 (売上/アクセス/CVR/レビュー/お気に入り/在庫snapshot)',
+      '["date_jst","item_manage_number"]',
+      '{"required":["date_jst","item_manage_number"],"date_jst_pattern":"^\\d{4}-\\d{2}-\\d{2}$","amount_unit":"JPY_tax_included_integer"}',
+      'scope_clear_per_run', 'insert_or_replace', 1, 'mall-csv-fetcher',
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    )
+    ON CONFLICT(entity) DO UPDATE SET
+      contract_version    = excluded.contract_version,
+      source_system       = excluded.source_system,
+      source_object       = excluded.source_object,
+      target_table        = excluded.target_table,
+      grain_definition    = excluded.grain_definition,
+      key_columns_json    = excluded.key_columns_json,
+      payload_schema_json = excluded.payload_schema_json,
+      clear_strategy      = excluded.clear_strategy,
+      apply_mode          = excluded.apply_mode,
+      enabled             = excluded.enabled,
+      owner               = excluded.owner,
+      updated_at          = excluded.updated_at
+  `);
+
+  db.exec(`
+    INSERT INTO sync_contracts (
+      entity, contract_version, source_system, source_object, target_table,
+      grain_definition, key_columns_json, payload_schema_json,
+      clear_strategy, apply_mode, enabled, owner, created_at, updated_at
+    ) VALUES (
+      'rakuten_store_daily', 1, 'minipc-warehouse',
+      'fact_rakuten_store_daily', 'mirror_rakuten_store_daily',
+      'one row = one date_jst — RMSデータ分析「日次_分析用レポート」店舗×日次 (端末別KPI+商圏ベンチマーク+クーポン/送料/決済手数料内訳)',
+      '["date_jst"]',
+      '{"required":["date_jst"],"date_jst_pattern":"^\\d{4}-\\d{2}-\\d{2}$","amount_unit":"JPY_tax_included_integer"}',
+      'scope_clear_per_run', 'insert_or_replace', 1, 'mall-csv-fetcher',
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    )
+    ON CONFLICT(entity) DO UPDATE SET
+      contract_version    = excluded.contract_version,
+      source_system       = excluded.source_system,
+      source_object       = excluded.source_object,
+      target_table        = excluded.target_table,
+      grain_definition    = excluded.grain_definition,
+      key_columns_json    = excluded.key_columns_json,
+      payload_schema_json = excluded.payload_schema_json,
+      clear_strategy      = excluded.clear_strategy,
+      apply_mode          = excluded.apply_mode,
+      enabled             = excluded.enabled,
+      owner               = excluded.owner,
+      updated_at          = excluded.updated_at
+  `);
+
+  // ---- 楽天データダウンロードハブ 7種: contract auto-seed (mall-csv-fetcher P1-R3、2026-07-10)
+  // datatool「データダウンロード」の公式固定フォーマットCSV。UPSERT idempotent (他 seed と同方針)
+  {
+    const ddContracts = [
+      ['rakuten_store_device_daily', 'fact_rakuten_store_device_daily',
+        'one row = one (date_jst, device) — 店舗データ日次×デバイス (売上/UU/会員別・新規リピート購入者/費用/全月商クラスベンチ/DEAL)',
+        '["date_jst","device"]'],
+      ['rakuten_sku_daily', 'fact_rakuten_sku_daily',
+        'one row = one (date_jst, sku_key) — SKU別売上日次。sku_key=商品管理番号|SKU管理番号 (SKU管理番号は商品跨ぎ重複のため複合)。システム連携用SKU番号=NE連携キー',
+        '["date_jst","sku_key"]'],
+      ['rakuten_category_daily', 'fact_rakuten_category_daily',
+        'one row = one (date_jst, category_key, device) — カテゴリページ日次 (アクセス/UU/滞在/離脱+属性・地域・会員ランク別)',
+        '["date_jst","category_key","device"]'],
+      ['rakuten_campaigns', 'm_rakuten_campaigns',
+        'one row = one (campaign_type, campaign_name, start_at) — 楽天開催キャンペーン一覧 (参照マスタ)。date_jst=開始日',
+        '["campaign_type","campaign_name","start_at"]'],
+      ['rakuten_purchaser_monthly', 'fact_rakuten_purchaser_monthly',
+        'one row = one month — 新規・リピート購入者数 (店舗別月次、DL時点の過去2年window)。date_jst=月初日',
+        '["date_jst"]'],
+      ['rakuten_item_purchaser_snapshot', 'fact_rakuten_item_purchaser_snapshot',
+        'one row = one (date_jst, item_manage_number) — 新規・リピート購入者 商品別2年通算スナップショット (RMS仕様で上位100件のみ)。date_jst=取込日',
+        '["date_jst","item_manage_number"]'],
+      ['rakuten_genre_purchaser_snapshot', 'fact_rakuten_genre_purchaser_snapshot',
+        'one row = one (date_jst, genre_name) — 新規・リピート購入者 ジャンル別1年通算スナップショット。date_jst=取込日',
+        '["date_jst","genre_name"]'],
+    ];
+    const seedStmt = db.prepare(`
+      INSERT INTO sync_contracts (
+        entity, contract_version, source_system, source_object, target_table,
+        grain_definition, key_columns_json, payload_schema_json,
+        clear_strategy, apply_mode, enabled, owner, created_at, updated_at
+      ) VALUES (
+        ?, 1, 'minipc-warehouse', ?, ?, ?, ?,
+        '{"required":["date_jst"],"date_jst_pattern":"^\\d{4}-\\d{2}-\\d{2}$","amount_unit":"JPY_tax_included_integer"}',
+        'scope_clear_per_run', 'insert_or_replace', 1, 'mall-csv-fetcher',
+        strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      )
+      ON CONFLICT(entity) DO UPDATE SET
+        contract_version = excluded.contract_version, source_system = excluded.source_system,
+        source_object = excluded.source_object, target_table = excluded.target_table,
+        grain_definition = excluded.grain_definition, key_columns_json = excluded.key_columns_json,
+        payload_schema_json = excluded.payload_schema_json, clear_strategy = excluded.clear_strategy,
+        apply_mode = excluded.apply_mode, enabled = excluded.enabled, owner = excluded.owner,
+        updated_at = excluded.updated_at
+    `);
+    for (const [entity, srcTable, grain, keys] of ddContracts) {
+      seedStmt.run(entity, srcTable, `mirror_${entity}`, grain, keys);
+    }
+  }
+
+  // ---- Yahoo!ストクリ統計CSV 6種: contract auto-seed (mall-csv-fetcher P1-Y、2026-07-11)
+  {
+    const yahooContracts = [
+      ['yahoo_store_device_daily', 'fact_yahoo_store_device_daily',
+        'one row = one (date_jst, device) — 全体分析の日次×デバイス売上+PV (縦持ち)', '["date_jst","device"]'],
+      ['yahoo_inflow_daily', 'fact_yahoo_inflow_daily',
+        'one row = one date_jst — 流入・離脱分析 (訪問者/購入/離脱、合算値)', '["date_jst"]'],
+      ['yahoo_user_attr_daily', 'fact_yahoo_user_attr_daily',
+        'one row = one (date_jst, gender, age_band, buyer_class) — お客様分析マトリクスの縦持ち (visitors)', '["date_jst","gender","age_band","buyer_class"]'],
+      ['yahoo_flash_hourly', 'fact_yahoo_flash_hourly',
+        'one row = one (date_jst, hour_slot, device) — 速報の時間帯×デバイス9指標 (当日スナップ)', '["date_jst","hour_slot","device"]'],
+      ['yahoo_item_daily', 'fact_yahoo_item_daily',
+        'one row = one (date_jst, item_code, sub_code) — 商品分析14指標 (期間集計型→1日単位DL、「2未満」マスクはNULL)', '["date_jst","item_code","sub_code"]'],
+      ['yahoo_keyword_daily', 'fact_yahoo_keyword_daily',
+        'one row = one (date_jst, keyword) — 検索流入 (KW×流入/売上、上位600語、期間集計型→1日単位DL)', '["date_jst","keyword"]'],
+    ];
+    const seedStmt = db.prepare(`
+      INSERT INTO sync_contracts (
+        entity, contract_version, source_system, source_object, target_table,
+        grain_definition, key_columns_json, payload_schema_json,
+        clear_strategy, apply_mode, enabled, owner, created_at, updated_at
+      ) VALUES (
+        ?, 1, 'minipc-warehouse', ?, ?, ?, ?,
+        '{"required":["date_jst"],"date_jst_pattern":"^\\d{4}-\\d{2}-\\d{2}$","amount_unit":"JPY_tax_included_integer"}',
+        'scope_clear_per_run', 'insert_or_replace', 1, 'mall-csv-fetcher',
+        strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      )
+      ON CONFLICT(entity) DO UPDATE SET
+        contract_version = excluded.contract_version, source_system = excluded.source_system,
+        source_object = excluded.source_object, target_table = excluded.target_table,
+        grain_definition = excluded.grain_definition, key_columns_json = excluded.key_columns_json,
+        payload_schema_json = excluded.payload_schema_json, clear_strategy = excluded.clear_strategy,
+        apply_mode = excluded.apply_mode, enabled = excluded.enabled, owner = excluded.owner,
+        updated_at = excluded.updated_at
+    `);
+    for (const [entity, srcTable, grain, keys] of yahooContracts) {
+      seedStmt.run(entity, srcTable, `mirror_${entity}`, grain, keys);
+    }
+  }
+
+  // ---- au PAYマーケット分析CSV 13種: contract auto-seed (mall-csv-fetcher P1-A、2026-07-13)
+  // 店舗分析 (shopAnalyCsvDl) の日次/月次 + リピートコホート + プラチナマッチ広告。
+  // 月次 entity は date_jst=月初日 (rakuten_purchaser_monthly と同方針)
+  {
+    const aupayContracts = [];
+    const shopDefs = [
+      ['sales', '売上分析 (セグメント別売上/クーポン/ポイント/CVR/販促費率)', '["date_jst","segment_code"]'],
+      ['referer', '参照元分析 (セグメント×参照元チャネル)', '["date_jst","segment_code","channel"]'],
+      ['search', '検索分析 (セグメント×流入キーワード)', '["date_jst","segment_code","keyword"]'],
+      ['page', 'ページ分析 (URL別PV/経由CV/直帰率。セグメントなし)', '["date_jst","page_url"]'],
+      ['product', '商品分析 (セグメント×ロットナンバー)', '["date_jst","segment_code","lot_number"]'],
+    ];
+    for (const [base, desc, keys] of shopDefs) {
+      aupayContracts.push([`aupay_${base}_daily`, `fact_aupay_${base}_daily`,
+        `one row = one ${JSON.parse(keys).join('×')} — ${desc}、日次`, keys]);
+      aupayContracts.push([`aupay_${base}_monthly`, `fact_aupay_${base}_monthly`,
+        `one row = one ${JSON.parse(keys).join('×')} — ${desc}、月次 (date_jst=月初日)`, keys]);
+    }
+    aupayContracts.push(['aupay_repeat_cohort_monthly', 'fact_aupay_repeat_cohort_monthly',
+      'one row = one (date_jst=起点月初日, segment_code, target_month_jst=対象月初日) — リピート分析コホート (月次専用)',
+      '["date_jst","segment_code","target_month_jst"]']);
+    aupayContracts.push(['aupay_pm_ad_daily', 'fact_aupay_pm_ad_daily',
+      'one row = one date_jst — プラチナマッチ広告 日次レポート (表示/クリック/広告費/ROAS)',
+      '["date_jst"]']);
+    aupayContracts.push(['aupay_pm_query_weekly', 'fact_aupay_pm_query_weekly',
+      'one row = one (date_jst=対象週月曜, keyword) — プラチナマッチ検索クエリ 週次スナップショット (前週トップ100)',
+      '["date_jst","keyword"]']);
+    const seedStmt = db.prepare(`
+      INSERT INTO sync_contracts (
+        entity, contract_version, source_system, source_object, target_table,
+        grain_definition, key_columns_json, payload_schema_json,
+        clear_strategy, apply_mode, enabled, owner, created_at, updated_at
+      ) VALUES (
+        ?, 1, 'minipc-warehouse', ?, ?, ?, ?,
+        '{"required":["date_jst"],"date_jst_pattern":"^\\d{4}-\\d{2}-\\d{2}$","amount_unit":"JPY_tax_included_integer"}',
+        'scope_clear_per_run', 'insert_or_replace', 1, 'mall-csv-fetcher',
+        strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      )
+      ON CONFLICT(entity) DO UPDATE SET
+        contract_version = excluded.contract_version, source_system = excluded.source_system,
+        source_object = excluded.source_object, target_table = excluded.target_table,
+        grain_definition = excluded.grain_definition, key_columns_json = excluded.key_columns_json,
+        payload_schema_json = excluded.payload_schema_json, clear_strategy = excluded.clear_strategy,
+        apply_mode = excluded.apply_mode, enabled = excluded.enabled, owner = excluded.owner,
+        updated_at = excluded.updated_at
+    `);
+    for (const [entity, srcTable, grain, keys] of aupayContracts) {
+      seedStmt.run(entity, srcTable, `mirror_${entity}`, grain, keys);
+    }
+  }
+
+  // ---- Qoo10 Analytics 4種: contract auto-seed (mall-csv-fetcher P1-Q R1、2026-07-14)
+  // seller.qoo10.jp のトラフィック/CV xlsx。qoo10_items はマスタ (no_clear upsert)
+  {
+    const qoo10Contracts = [
+      ['qoo10_traffic_channel_daily', 'fact_qoo10_traffic_channel_daily',
+        'one row = one (date_jst, channel) — Analytics流入チャネル別PV (縦持ち、チャネル=ヘッダ生ラベル)', '["date_jst","channel"]'],
+      ['qoo10_cvr_daily', 'fact_qoo10_cvr_daily',
+        'one row = one date_jst — Analytics店舗KPI (PV合計/訪問者/カート/注文/CVR%)', '["date_jst"]'],
+      ['qoo10_item_traffic_daily', 'fact_qoo10_item_traffic_daily',
+        'one row = one (date_jst, item_no, channel) — 商品別流入PV (sparse: pv>0 + (合計)行)', '["date_jst","item_no","channel"]'],
+      ['qoo10_items', 'm_qoo10_items',
+        'one row = one item_no — Qoo10商品マスタ (販売者商品コード=SKU/商品名/ブランド、最新値upsert・no_clear)', '["item_no"]'],
+    ];
+    const seedStmt = db.prepare(`
+      INSERT INTO sync_contracts (
+        entity, contract_version, source_system, source_object, target_table,
+        grain_definition, key_columns_json, payload_schema_json,
+        clear_strategy, apply_mode, enabled, owner, created_at, updated_at
+      ) VALUES (
+        ?, 1, 'minipc-warehouse', ?, ?, ?, ?,
+        '{"required":[],"amount_unit":"JPY_tax_included_integer"}',
+        ?, 'insert_or_replace', 1, 'mall-csv-fetcher',
+        strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      )
+      ON CONFLICT(entity) DO UPDATE SET
+        contract_version = excluded.contract_version, source_system = excluded.source_system,
+        source_object = excluded.source_object, target_table = excluded.target_table,
+        grain_definition = excluded.grain_definition, key_columns_json = excluded.key_columns_json,
+        payload_schema_json = excluded.payload_schema_json, clear_strategy = excluded.clear_strategy,
+        apply_mode = excluded.apply_mode, enabled = excluded.enabled, owner = excluded.owner,
+        updated_at = excluded.updated_at
+    `);
+    for (const [entity, srcTable, grain, keys] of qoo10Contracts) {
+      seedStmt.run(entity, srcTable, `mirror_${entity}`, grain, keys,
+        entity === 'qoo10_items' ? 'no_clear' : 'scope_clear_per_run');
+    }
+  }
+
   // ---- Phase 1 #1-4a: sync_runs (run ledger、miniPC 側で sync 開始記録)
   // status 遷移: started → applied (全 chunk Render から 2xx)
   //              | → failed (途中失敗、error_message に記録)
@@ -1940,40 +2262,13 @@ function createTables() {
     FROM sku_agg
   `);
 
-  // ---- 切替判定 view (v3 vs v4) ----
-  db.exec(`DROP VIEW IF EXISTS v_settlement_v3_v4_validation`);
-  db.exec(`CREATE VIEW v_settlement_v3_v4_validation AS
-    WITH v3_monthly AS (
-      SELECT LOWER(TRIM(モール商品コード)) AS seller_sku_normalized,
-             CAST(strftime('%Y%m', 日付) AS INTEGER) AS year_month_int,
-             SUM(数量) AS qty_v3,
-             SUM(原価_税込)/1.1 AS cost_excl_v3,
-             SUM(商品売上)/1.1 AS sales_excl_v3
-      FROM v_amazon_sku_profit_actual
-      GROUP BY LOWER(TRIM(モール商品コード)), year_month_int
-    ),
-    v4_monthly AS (
-      SELECT seller_sku_normalized, year_month_int,
-             qty_net_sold AS qty_v4,
-             (sales_principal_micro / 1000000.0) AS sales_v4
-      FROM fact_amazon_settlement_monthly_wide
-    )
-    SELECT
-      COALESCE(v4.year_month_int, v3.year_month_int) AS year_month_int,
-      COALESCE(v4.seller_sku_normalized, v3.seller_sku_normalized) AS seller_sku_normalized,
-      v3.qty_v3, v4.qty_v4,
-      COALESCE(v4.qty_v4, 0) - COALESCE(v3.qty_v3, 0) AS qty_delta,
-      v3.sales_excl_v3, v4.sales_v4,
-      COALESCE(v4.sales_v4, 0) - COALESCE(v3.sales_excl_v3, 0) AS sales_delta,
-      CASE
-        WHEN ABS(COALESCE(v4.qty_v4, 0) - COALESCE(v3.qty_v3, 0)) <= MAX(1, CAST(ABS(COALESCE(v3.qty_v3, 0)) * 0.001 AS INTEGER))
-        THEN 1 ELSE 0
-      END AS qty_validated_flag
-    FROM v4_monthly v4
-    LEFT JOIN v3_monthly v3
-      ON v4.seller_sku_normalized = v3.seller_sku_normalized
-      AND v4.year_month_int = v3.year_month_int
-  `);
+  // ---- 切替判定 view (v3 vs v4) → 監査PR-14で廃止 ----
+  // v_settlement_v3_v4_validation は 2026-05 の settlement V3→V4 切替時の突合用で、
+  // V4 が SSoT として安定稼働済みのため役目を終えた。v3 側チェーン
+  // (v_amazon_sku_profit_actual → fact_amazon_order_level_resolved →
+  //  raw_amazon_financial_lines 1.65M行 = 運用停止した旧実験系) ごと
+  // migrate-audit-pr14-financial-orphan.js で削除。
+  // ※ 現役の v_amazon_sku_profit_actual_v4 は settlement 系のみに依存し無関係 (要検証済)。
 
   // ---- m_products trigger 廃止 (差分バッチ record-m-products-history.js に置き換え)
   // 旧 trigger が残っていると rebuild-m-products.js の DELETE+INSERT 全件で

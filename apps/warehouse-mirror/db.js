@@ -11,14 +11,35 @@
 import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
+import {
+  STORE_BENCH_COLS, STORE_DEVICE_BASE_COLS, STORE_DEVICE_OPT_COLS, STORE_DEVICE_REAL_COLS,
+  CATEGORY_DEMO_COLS,
+} from '../../lib/rakuten-dd-columns.js';
 
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'warehouse-mirror.db');
 
 let db = null;
 
+// Yahoo!表の初期化失敗を保持 (mirror本体は継続する fail-soft。router が sync 応答に載せる)。
+// 2026-07-12 の本番障害 (#476→#477 revert) の再発防御: 新規表のDDLで落ちても既存モールを道連れにしない
+export let yahooInitError = null;
+
+// au PAY分析表も同じ fail-soft 方針 (新mirror表のDDLは fail-soft 必須 — 2026-07-12 障害の教訓)
+export let aupayDataInitError = null;
+
+// Qoo10 Analytics表も同様 (mall-csv-fetcher P1-Q R1)
+export let qoo10DataInitError = null;
+
 export function initMirrorDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  // リトライ再入時 (2026-07-12 障害対応: 一過性失敗の自己回復) に前のハンドルを
+  // リーク・ロック残置しないよう閉じてから開き直す
+  if (db) { try { db.close(); } catch { /* close済み等は無視 */ } db = null; }
+  // fail-soft系のエラーもリトライごとにリセット (成功すれば null のまま)
+  yahooInitError = null;
+  aupayDataInitError = null;
+  qoo10DataInitError = null;
   db = new Database(DB_FILE);
   // PRAGMA は接続単位の設定。SQLite のデフォルトは foreign_keys=OFF / recursive_triggers=OFF なので、
   // f_mis_shipments の FK 制約 と append-only trigger を機能させるために毎接続で明示する必要がある。
@@ -82,6 +103,50 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_sku ON mirror_products(商品コード)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_status ON mirror_products(取扱区分)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirp_type ON mirror_products(商品区分)');
+
+  // 監査PR-12(a): mirror_sku_map は sku_map(miniPC側、writer停止済み・Step7 DROP待ち)の
+  // dead受け皿でコード参照0件。miniPC側 sku_map から再同期可能なため mirror 側は先行DROP
+  // (冪等。sku_map 本体の DROP は SKU統合Step7 の判断に従う)
+  db.exec('DROP TABLE IF EXISTS mirror_sku_map');
+
+  // ─── dim_mall: モールマスタ (設計監査 2026-07-06 PR-11) ───
+  // MALL_ORDER/MALL_LABEL/TAX_INCLUDED_MALLS/MALL_FEE_RATES 等の散在ハードコードの正本。
+  // code-owned config なので boot 時に seed で全置換 (手編集しない。変更はこの配列を直す)。
+  // アプリからは lib/dim-mall.js の loadDimMall() 経由で参照。
+  db.exec(`CREATE TABLE IF NOT EXISTS dim_mall (
+    mall_key         TEXT PRIMARY KEY,   -- 正準キー (小文字)
+    label            TEXT NOT NULL,      -- 正準表示ラベル
+    display_order    INTEGER NOT NULL,
+    is_channel       INTEGER NOT NULL DEFAULT 0,  -- 1=チャネル粒度 (amazon_fba 等)
+    in_daily_summary INTEGER NOT NULL DEFAULT 0,  -- 1=biz-ops 日次サマリ対象
+    tax_included     INTEGER NOT NULL DEFAULT 0,  -- 1=mart の金額が税込 (mgmt の /1.1 対象)
+    fee_rate_approx  REAL,               -- profit-analysis の管理近似手数料率 (請求実額ではない)
+    notes            TEXT
+  )`);
+  const DIM_MALL_SEED = [
+    // [mall_key, label, order, is_channel, in_daily_summary, tax_included, fee_rate_approx, notes]
+    ['amazon',     'Amazon',       10, 0, 1, 0, 0.15, 'Amazon JP。金額は税抜(税は別カラム)'],
+    ['rakuten',    '楽天',         20, 0, 1, 1, 0.10, null],
+    ['yahoo',      'Yahoo!',       30, 0, 1, 1, 0.10, null],
+    ['aupay',      'au PAY',       40, 0, 1, 1, 0.13, null],
+    ['linegift',   'LINEギフト',   50, 0, 1, 1, 0.13, null],
+    ['qoo10',      'Qoo10',        60, 0, 1, 1, 0.10, null],
+    ['mercari',    'メルカリ',     70, 0, 1, 1, 0.10, null],
+    ['dshop',      'Dショッピング', 80, 0, 0, 1, null, 'finance fact 未整備'],
+    ['amazon_usa', '米国Amazon',   90, 0, 0, 0, null, '輸出(消費税なし)'],
+    ['amazon_fba', 'Amazon FBA',  110, 1, 0, 0, null, 'チャネル粒度 (velocity/速報系)'],
+    ['amazon_fbm', 'Amazon FBM',  120, 1, 0, 0, null, 'チャネル粒度 (velocity/速報系)'],
+    ['wholesale',  '卸',          130, 1, 0, 0, null, '仕入先共有では除外 (SOKUHO_EXCLUDE)'],
+    ['base',       'BASE',        140, 1, 0, 0, null, null],
+  ];
+  const seedDimMall = db.transaction(() => {
+    db.exec('DELETE FROM dim_mall');
+    const st = db.prepare(`INSERT INTO dim_mall
+      (mall_key, label, display_order, is_channel, in_daily_summary, tax_included, fee_rate_approx, notes)
+      VALUES (?,?,?,?,?,?,?,?)`);
+    for (const r of DIM_MALL_SEED) st.run(...r);
+  });
+  seedDimMall();
   // 既存テーブルへのカラム追加（マイグレーション）
   addColumnIfMissing('mirror_products', '売上分類', 'INTEGER');
   addColumnIfMissing('mirror_products', '代表商品コード', 'TEXT');
@@ -461,6 +526,479 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_mapsd_date ON mirror_amazon_price_snapshot_daily(date_jst)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mapsd_sku ON mirror_amazon_price_snapshot_daily(seller_sku)');
 
+  // mirror_rakuten_ads_rpp — 楽天RPP広告費 月次×商品 (mall-csv-fetcher P1、2026-07-09)
+  // miniPC fact_rakuten_ads_rpp の mirror。date_jst=月初日 (date_range clear 機構のキー、
+  // amazon_account_fees_monthly と同方針)。金額=税込円INTEGER / 率=REAL。
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_rakuten_ads_rpp (
+    date_jst              TEXT NOT NULL CHECK(date_jst GLOB '????-??-01'),
+    month_ym              TEXT NOT NULL CHECK(month_ym GLOB '????-??'),
+    item_manage_number    TEXT NOT NULL CHECK(trim(item_manage_number) <> ''),
+    raw_sku_code          TEXT NOT NULL DEFAULT '',
+    clicks                INTEGER NOT NULL DEFAULT 0,
+    ad_cost_yen           INTEGER NOT NULL DEFAULT 0,
+    cpc_actual            REAL,
+    ctr_pct               REAL,
+    bid_cpc_yen           INTEGER,
+    item_cpc_yen          INTEGER,
+    sales_720h_yen        INTEGER NOT NULL DEFAULT 0,
+    orders_720h           INTEGER NOT NULL DEFAULT 0,
+    cvr_720h_pct          REAL,
+    roas_720h_pct         REAL,
+    sales_12h_yen         INTEGER,
+    orders_12h            INTEGER,
+    sales_720h_new_yen    INTEGER,
+    sales_720h_repeat_yen INTEGER,
+    source_report_type    TEXT NOT NULL DEFAULT 'rpp_product_monthly',
+    report_start          TEXT,
+    report_end            TEXT,
+    attribution_window_hours INTEGER NOT NULL DEFAULT 720,
+    is_tax_included       INTEGER NOT NULL DEFAULT 1,
+    imported_at           TEXT,
+    source_run_id         TEXT NOT NULL,
+    source_row_hash       TEXT NOT NULL,
+    synced_at             TEXT NOT NULL,
+    PRIMARY KEY (date_jst, item_manage_number)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mrar_item ON mirror_rakuten_ads_rpp(item_manage_number, month_ym)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mrar_month ON mirror_rakuten_ads_rpp(month_ym)');
+
+  // mirror_rakuten_ads_rpp_daily — 楽天RPP広告費 日次×キャンペーン合計 (SKU内訳なし)
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_rakuten_ads_rpp_daily (
+    date_jst              TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+    campaign_id           TEXT NOT NULL DEFAULT '',
+    campaign_name         TEXT NOT NULL DEFAULT '',
+    clicks                INTEGER NOT NULL DEFAULT 0,
+    ad_cost_yen           INTEGER NOT NULL DEFAULT 0,
+    ad_cost_discounted_yen INTEGER,
+    cpc_actual            REAL,
+    ctr_pct               REAL,
+    sales_720h_yen        INTEGER NOT NULL DEFAULT 0,
+    orders_720h           INTEGER NOT NULL DEFAULT 0,
+    cvr_720h_pct          REAL,
+    roas_720h_pct         REAL,
+    sales_12h_yen         INTEGER,
+    orders_12h            INTEGER,
+    sales_720h_new_yen    INTEGER,
+    sales_720h_repeat_yen INTEGER,
+    source_report_type    TEXT NOT NULL DEFAULT 'rpp_all_daily',
+    attribution_window_hours INTEGER NOT NULL DEFAULT 720,
+    is_tax_included       INTEGER NOT NULL DEFAULT 1,
+    imported_at           TEXT,
+    source_run_id         TEXT NOT NULL,
+    source_row_hash       TEXT NOT NULL,
+    synced_at             TEXT NOT NULL,
+    PRIMARY KEY (date_jst, campaign_id)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mrard_month ON mirror_rakuten_ads_rpp_daily(substr(date_jst, 1, 7))');
+
+  // mirror_rakuten_item_daily — RMSデータ分析「商品分析」SKU×日次 (mall-csv-fetcher P1-R2、2026-07-10)
+  // アクセス/UU/CVR/新規・リピート/レビュー/滞在・直帰/お気に入り/在庫snapshot。
+  // item_name/genre_path は miniPC m_rakuten_items の最新値を sync 時に JOIN で同梱 (表示用)
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_rakuten_item_daily (
+    date_jst            TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+    item_manage_number  TEXT NOT NULL CHECK(trim(item_manage_number) <> ''),
+    raw_sku_code        TEXT NOT NULL DEFAULT '',
+    sales_yen           INTEGER NOT NULL DEFAULT 0,
+    orders              INTEGER NOT NULL DEFAULT 0,
+    units               INTEGER NOT NULL DEFAULT 0,
+    access_users        INTEGER NOT NULL DEFAULT 0,
+    unique_users        INTEGER,
+    cvr_pct             REAL,
+    aov_yen             INTEGER,
+    buyers_total        INTEGER,
+    buyers_new          INTEGER,
+    buyers_repeat       INTEGER,
+    nonbuyer_access     INTEGER,
+    review_posts        INTEGER,
+    review_avg          REAL,
+    review_total        INTEGER,
+    stay_seconds        INTEGER,
+    bounce_count        INTEGER,
+    exit_count          INTEGER,
+    exit_rate_pct       REAL,
+    favorites_added     INTEGER,
+    favorites_total     INTEGER,
+    stock_qty           INTEGER,
+    item_name           TEXT,
+    genre_path          TEXT,
+    item_id             INTEGER,
+    catalog_id          TEXT,
+    item_number         TEXT,
+    is_tax_included     INTEGER NOT NULL DEFAULT 1,
+    imported_at         TEXT,
+    source_run_id       TEXT NOT NULL,
+    source_row_hash     TEXT NOT NULL,
+    synced_at           TEXT NOT NULL,
+    PRIMARY KEY (date_jst, item_manage_number)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mrid_item ON mirror_rakuten_item_daily(item_manage_number, date_jst)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mrid_month ON mirror_rakuten_item_daily(substr(date_jst, 1, 7))');
+  // item_number は後付け列 (Codex R2 high: 旧スキーマで作成済みの環境向け冪等 migration)
+  addColumnIfMissing('mirror_rakuten_item_daily', 'item_number', 'TEXT');
+
+  // mirror_rakuten_store_daily — RMSデータ分析「日次_分析用レポート」店舗×日次 (mall-csv-fetcher P1-R2)
+  // 端末別KPI + 商圏ベンチマーク (サブジャンルTOP10平均/月商クラス平均) + 費用内訳
+  // (クーポン店舗/楽天負担・送料・決済手数料・のしラッピング)。金額=税込円INTEGER / 率・平均=REAL
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_rakuten_store_daily (
+    date_jst              TEXT PRIMARY KEY CHECK(date_jst GLOB '????-??-??'),
+    sales_all_yen         INTEGER NOT NULL DEFAULT 0,
+    sales_pc_yen          INTEGER,
+    sales_app_yen         INTEGER,
+    sales_sp_yen          INTEGER,
+    orders_all            INTEGER NOT NULL DEFAULT 0,
+    orders_pc             INTEGER,
+    orders_app            INTEGER,
+    orders_sp             INTEGER,
+    access_all            INTEGER NOT NULL DEFAULT 0,
+    access_pc             INTEGER,
+    access_app            INTEGER,
+    access_sp             INTEGER,
+    cvr_all_pct           REAL,
+    cvr_pc_pct            REAL,
+    cvr_app_pct           REAL,
+    cvr_sp_pct            REAL,
+    aov_all_yen           INTEGER,
+    aov_pc_yen            INTEGER,
+    aov_app_yen           INTEGER,
+    aov_sp_yen            INTEGER,
+    bench_top10_sales_yen REAL,
+    bench_top10_orders    REAL,
+    bench_top10_access    REAL,
+    bench_top10_cvr_pct   REAL,
+    bench_top10_aov_yen   REAL,
+    bench_class_label     TEXT,
+    bench_class_sales_yen REAL,
+    bench_class_orders    REAL,
+    bench_class_access    REAL,
+    bench_class_cvr_pct   REAL,
+    bench_class_aov_yen   REAL,
+    tax_out_yen           INTEGER,
+    shipping_yen          INTEGER,
+    coupon_store_yen      INTEGER,
+    coupon_rakuten_yen    INTEGER,
+    free_ship_coupon_yen  INTEGER,
+    wrapping_yen          INTEGER,
+    settlement_fee_yen    INTEGER,
+    is_tax_included       INTEGER NOT NULL DEFAULT 1,
+    imported_at           TEXT,
+    source_run_id         TEXT NOT NULL,
+    source_row_hash       TEXT NOT NULL,
+    synced_at             TEXT NOT NULL
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mrsd_month ON mirror_rakuten_store_daily(substr(date_jst, 1, 7))');
+
+  // ─── 楽天データダウンロードハブ 7種 (mall-csv-fetcher P1-R3、2026-07-10) ───
+  // 列定義は lib/rakuten-dd-columns.js を miniPC 側 (rakuten-dd-lib.js) と共有 (タイポ・ズレ防止)
+  const ddNum = (c) => `${c} ${STORE_DEVICE_REAL_COLS.has(c) ? 'REAL' : 'INTEGER'}`;
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_rakuten_store_device_daily (
+    date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+    device   TEXT NOT NULL CHECK(device IN ('all','pc','app','sp')),
+    ${[...STORE_DEVICE_BASE_COLS, ...STORE_BENCH_COLS, ...STORE_DEVICE_OPT_COLS].map(ddNum).join(', ')},
+    is_tax_included INTEGER NOT NULL DEFAULT 1,
+    imported_at TEXT,
+    source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+    PRIMARY KEY (date_jst, device)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mrsdd_month ON mirror_rakuten_store_device_daily(substr(date_jst, 1, 7))');
+
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_rakuten_sku_daily (
+    date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+    sku_key  TEXT NOT NULL CHECK(trim(sku_key) <> ''),
+    raw_sku_mgmt_number TEXT,
+    item_manage_number  TEXT,
+    sales_yen INTEGER NOT NULL DEFAULT 0, orders INTEGER NOT NULL DEFAULT 0, units INTEGER NOT NULL DEFAULT 0,
+    system_sku_number TEXT, item_number TEXT, catalog_id TEXT, item_name TEXT,
+    sku_attr1 TEXT, sku_attr2 TEXT, sku_attr3 TEXT,
+    is_tax_included INTEGER NOT NULL DEFAULT 1,
+    imported_at TEXT,
+    source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+    PRIMARY KEY (date_jst, sku_key)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mrskud_sku ON mirror_rakuten_sku_daily(sku_key, date_jst)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mrskud_item ON mirror_rakuten_sku_daily(item_manage_number, date_jst)');
+
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_rakuten_category_daily (
+    date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+    category_key TEXT NOT NULL CHECK(trim(category_key) <> ''),
+    device TEXT NOT NULL CHECK(device IN ('all','pc','app','sp')),
+    hierarchy TEXT, category_name TEXT, category_url TEXT,
+    access_users INTEGER NOT NULL DEFAULT 0, unique_users INTEGER, stay_seconds REAL,
+    bounce_count INTEGER, exit_count INTEGER, exit_rate_pct REAL,
+    ${CATEGORY_DEMO_COLS.map((c) => `${c} INTEGER`).join(', ')},
+    imported_at TEXT,
+    source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+    PRIMARY KEY (date_jst, category_key, device)
+  )`);
+
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_rakuten_campaigns (
+    campaign_type TEXT NOT NULL,
+    campaign_name TEXT NOT NULL,
+    start_at TEXT NOT NULL,
+    end_at TEXT,
+    date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+    imported_at TEXT,
+    source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+    PRIMARY KEY (campaign_type, campaign_name, start_at)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mrcamp_date ON mirror_rakuten_campaigns(date_jst)');
+
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_rakuten_purchaser_monthly (
+    date_jst TEXT PRIMARY KEY CHECK(date_jst GLOB '????-??-01'),
+    new_buyers INTEGER, new_aov_yen INTEGER, new_sales_yen INTEGER, new_orders INTEGER, new_units INTEGER,
+    repeat_buyers INTEGER, repeat_aov_yen INTEGER, repeat_sales_yen INTEGER, repeat_orders INTEGER, repeat_units INTEGER,
+    is_tax_included INTEGER NOT NULL DEFAULT 1,
+    imported_at TEXT,
+    source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL
+  )`);
+
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_rakuten_item_purchaser_snapshot (
+    date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+    item_manage_number TEXT NOT NULL CHECK(trim(item_manage_number) <> ''),
+    item_name TEXT, item_url TEXT, price_yen INTEGER, is_suspended INTEGER,
+    new_buyers INTEGER, repeat_buyers INTEGER, repeat_rate_pct REAL,
+    window_from TEXT, window_to TEXT,
+    imported_at TEXT,
+    source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+    PRIMARY KEY (date_jst, item_manage_number)
+  )`);
+
+  db.exec(`CREATE TABLE IF NOT EXISTS mirror_rakuten_genre_purchaser_snapshot (
+    date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+    genre_name TEXT NOT NULL CHECK(trim(genre_name) <> ''),
+    new_buyers INTEGER, repeat_buyers INTEGER, repeat_rate_pct REAL,
+    new_avg_purchase_yen INTEGER, repeat_avg_purchase_yen INTEGER,
+    avg_purchase_count REAL, avg_purchase_yen INTEGER,
+    window_from TEXT, window_to TEXT,
+    imported_at TEXT,
+    source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+    PRIMARY KEY (date_jst, genre_name)
+  )`);
+
+  // ─── Yahoo!ストクリ統計CSV 6種 (mall-csv-fetcher P1-Y、2026-07-11) ───
+  // ⚠️fail-soft: この新規ブロックが本番でのみ失敗する事象が発生 (2026-07-12、原因調査中)。
+  // 失敗しても throw せず記録に留め、既存モールの mirror を止めない。Yahoo entity への
+  // sync は router 側が yahooInitError を見て 503 (原因つき) を返す
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_yahoo_store_device_daily (
+      date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+      device   TEXT NOT NULL CHECK(device IN ('all','pc','sp','app')),
+      sales_yen INTEGER, pageviews INTEGER,
+      is_tax_included INTEGER NOT NULL DEFAULT 1, imported_at TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+      PRIMARY KEY (date_jst, device)
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_yahoo_inflow_daily (
+      date_jst TEXT PRIMARY KEY CHECK(date_jst GLOB '????-??-??'),
+      inflow_visitors INTEGER, purchase_visitors INTEGER, purchase_ratio_pct REAL,
+      exit_visitors INTEGER, exit_ratio_pct REAL,
+      imported_at TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_yahoo_user_attr_daily (
+      date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+      gender TEXT NOT NULL, age_band TEXT NOT NULL, buyer_class TEXT NOT NULL,
+      visitors INTEGER,
+      imported_at TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+      PRIMARY KEY (date_jst, gender, age_band, buyer_class)
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_yahoo_flash_hourly (
+      date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+      hour_slot TEXT NOT NULL, device TEXT NOT NULL CHECK(device IN ('all','pc','sp','app')),
+      sales_yen INTEGER, orders INTEGER, units INTEGER, buyers INTEGER,
+      purchase_rate_pct REAL, aov_yen INTEGER, pageviews INTEGER, visitors INTEGER, avg_pages REAL,
+      is_tax_included INTEGER NOT NULL DEFAULT 1, imported_at TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+      PRIMARY KEY (date_jst, hour_slot, device)
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_yahoo_item_daily (
+      date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+      item_code TEXT NOT NULL CHECK(trim(item_code) <> ''),
+      sub_code TEXT NOT NULL DEFAULT '',
+      raw_item_code TEXT, item_name TEXT,
+      sales_yen INTEGER, orders INTEGER, units INTEGER, buyers INTEGER,
+      avg_purchase_rate_pct REAL, favorites INTEGER, cart_adds INTEGER,
+      pv_premium_ship INTEGER, pv_normal INTEGER, visitors INTEGER, category_contribution INTEGER,
+      is_tax_included INTEGER NOT NULL DEFAULT 1, imported_at TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+      PRIMARY KEY (date_jst, item_code, sub_code)
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_myid_item ON mirror_yahoo_item_daily(item_code, date_jst)');
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_yahoo_keyword_daily (
+      date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+      keyword TEXT NOT NULL CHECK(trim(keyword) <> ''),
+      rank INTEGER, inflow INTEGER, sales_yen INTEGER, orders INTEGER, units INTEGER,
+      avg_order_rate_pct REAL, avg_order_aov_yen INTEGER, avg_units_aov_yen INTEGER,
+      is_tax_included INTEGER NOT NULL DEFAULT 1, imported_at TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+      PRIMARY KEY (date_jst, keyword)
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_mykd_kw ON mirror_yahoo_keyword_daily(keyword, date_jst)');
+
+  } catch (e) {
+    yahooInitError = {
+      message: String(e.message || e),
+      code: e.code || null,
+      at: String(e.stack || '').split(String.fromCharCode(10)).slice(0, 3).join(' | '),
+    };
+    console.error('[Mirror] Yahoo!表の初期化失敗 (mirror本体は継続):', e.message);
+  }
+
+  // ─── au PAYマーケット分析CSV 13種 (mall-csv-fetcher P1-A、2026-07-13) ───
+  // fail-soft: 失敗しても throw せず記録に留め、既存モールの mirror を止めない。
+  // aupay データ entity への sync は router 側が aupayDataInitError を見て 503 (原因つき) を返す
+  try {
+    // 売上分析 (日次/月次同型。月次は date_jst=月初日)
+    for (const t of ['mirror_aupay_sales_daily', 'mirror_aupay_sales_monthly']) {
+      db.exec(`CREATE TABLE IF NOT EXISTS ${t} (
+        date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+        segment_code TEXT NOT NULL CHECK(trim(segment_code) <> ''),
+        segment_raw  TEXT NOT NULL,
+        sales_yen INTEGER, coupon_store_yen INTEGER, coupon_mall_yen INTEGER,
+        point_ponta_au_yen INTEGER, point_used_yen INTEGER,
+        orders INTEGER, units INTEGER, visits INTEGER, buyer_uu INTEGER, visitor_uu INTEGER, pageviews INTEGER,
+        cvr_pct REAL, avg_units REAL, avg_price_yen INTEGER, avg_visits REAL, avg_pv REAL,
+        coupon_store_rate_pct REAL, coupon_mall_rate_pct REAL, point_rate_pct REAL,
+        is_tax_included INTEGER NOT NULL DEFAULT 1, imported_at TEXT,
+        source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+        PRIMARY KEY (date_jst, segment_code)
+      )`);
+    }
+    for (const t of ['mirror_aupay_referer_daily', 'mirror_aupay_referer_monthly']) {
+      db.exec(`CREATE TABLE IF NOT EXISTS ${t} (
+        date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+        segment_code TEXT NOT NULL CHECK(trim(segment_code) <> ''),
+        segment_raw TEXT NOT NULL,
+        channel TEXT NOT NULL CHECK(trim(channel) <> ''),
+        visits INTEGER, visitor_uu INTEGER, sales_yen INTEGER, orders INTEGER, units INTEGER,
+        cvr_pct REAL, avg_units REAL, avg_price_yen INTEGER,
+        is_tax_included INTEGER NOT NULL DEFAULT 1, imported_at TEXT,
+        source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+        PRIMARY KEY (date_jst, segment_code, channel)
+      )`);
+    }
+    for (const t of ['mirror_aupay_search_daily', 'mirror_aupay_search_monthly']) {
+      db.exec(`CREATE TABLE IF NOT EXISTS ${t} (
+        date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+        segment_code TEXT NOT NULL CHECK(trim(segment_code) <> ''),
+        segment_raw TEXT NOT NULL,
+        keyword TEXT NOT NULL CHECK(trim(keyword) <> ''),
+        visits INTEGER, visitor_uu INTEGER,
+        imported_at TEXT,
+        source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+        PRIMARY KEY (date_jst, segment_code, keyword)
+      )`);
+    }
+    db.exec('CREATE INDEX IF NOT EXISTS idx_masd_kw ON mirror_aupay_search_daily(keyword, date_jst)');
+    for (const t of ['mirror_aupay_page_daily', 'mirror_aupay_page_monthly']) {
+      db.exec(`CREATE TABLE IF NOT EXISTS ${t} (
+        date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+        page_url TEXT NOT NULL CHECK(trim(page_url) <> ''),
+        pageviews INTEGER, orders INTEGER, via_orders INTEGER,
+        bounce_rate_pct REAL, exit_rate_pct REAL,
+        imported_at TEXT,
+        source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+        PRIMARY KEY (date_jst, page_url)
+      )`);
+    }
+    for (const t of ['mirror_aupay_product_daily', 'mirror_aupay_product_monthly']) {
+      db.exec(`CREATE TABLE IF NOT EXISTS ${t} (
+        date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+        segment_code TEXT NOT NULL CHECK(trim(segment_code) <> ''),
+        segment_raw TEXT NOT NULL,
+        lot_number TEXT NOT NULL CHECK(trim(lot_number) <> ''),
+        product_name TEXT, category TEXT,
+        sales_yen INTEGER, orders INTEGER, units INTEGER, avg_units REAL, avg_price_yen INTEGER,
+        coupon_store_yen INTEGER, coupon_mall_yen INTEGER,
+        buyer_uu INTEGER, visits INTEGER, visitor_uu INTEGER, pageviews INTEGER,
+        cvr_visit_pct REAL, cvr_uu_pct REAL,
+        is_tax_included INTEGER NOT NULL DEFAULT 1, imported_at TEXT,
+        source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+        PRIMARY KEY (date_jst, segment_code, lot_number)
+      )`);
+    }
+    db.exec('CREATE INDEX IF NOT EXISTS idx_mapd_lot ON mirror_aupay_product_daily(lot_number, date_jst)');
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_aupay_repeat_cohort_monthly (
+      date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-01'),
+      segment_code TEXT NOT NULL CHECK(trim(segment_code) <> ''),
+      segment_raw TEXT NOT NULL,
+      target_month_jst TEXT NOT NULL CHECK(target_month_jst GLOB '????-??-01'),
+      orders INTEGER,
+      imported_at TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+      PRIMARY KEY (date_jst, segment_code, target_month_jst)
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_aupay_pm_ad_daily (
+      date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+      impressions INTEGER, clicks INTEGER, ctr_pct REAL, cpc_yen REAL,
+      gmv_via_ad_yen INTEGER, roas REAL, cost_yen INTEGER,
+      is_tax_included INTEGER NOT NULL DEFAULT 1, imported_at TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+      PRIMARY KEY (date_jst)
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_aupay_pm_query_weekly (
+      date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+      keyword TEXT NOT NULL CHECK(trim(keyword) <> ''),
+      rank INTEGER, impressions INTEGER, clicks INTEGER, ctr_pct REAL,
+      imported_at TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+      PRIMARY KEY (date_jst, keyword)
+    )`);
+  } catch (e) {
+    aupayDataInitError = {
+      message: String(e.message || e),
+      code: e.code || null,
+      at: String(e.stack || '').split(String.fromCharCode(10)).slice(0, 3).join(' | '),
+    };
+    console.error('[Mirror] au PAY分析表の初期化失敗 (mirror本体は継続):', e.message);
+  }
+
+  // ─── Qoo10 Analytics 4種 (mall-csv-fetcher P1-Q R1、2026-07-14) ───
+  // fail-soft: 失敗しても throw せず記録に留め、既存モールの mirror を止めない
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_qoo10_traffic_channel_daily (
+      date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+      channel  TEXT NOT NULL CHECK(trim(channel) <> ''),
+      pv INTEGER,
+      imported_at TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+      PRIMARY KEY (date_jst, channel)
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_qoo10_cvr_daily (
+      date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+      pv_total INTEGER, visitors INTEGER, cart_adds INTEGER, orders INTEGER, cvr_pct REAL,
+      channel_pv_diff INTEGER,
+      imported_at TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+      PRIMARY KEY (date_jst)
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_qoo10_item_traffic_daily (
+      date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+      item_no  TEXT NOT NULL CHECK(trim(item_no) <> ''),
+      channel  TEXT NOT NULL CHECK(trim(channel) <> ''),
+      pv INTEGER,
+      imported_at TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+      PRIMARY KEY (date_jst, item_no, channel)
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_mqitd_item ON mirror_qoo10_item_traffic_daily(item_no, date_jst)');
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_qoo10_items (
+      item_no TEXT PRIMARY KEY CHECK(trim(item_no) <> ''),
+      seller_code_raw TEXT, seller_code TEXT, item_name TEXT, brand TEXT,
+      attr_date_jst TEXT,
+      imported_at TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_mqi_seller ON mirror_qoo10_items(seller_code)');
+  } catch (e) {
+    qoo10DataInitError = {
+      message: String(e.message || e),
+      code: e.code || null,
+      at: String(e.stack || '').split(String.fromCharCode(10)).slice(0, 3).join(' | '),
+    };
+    console.error('[Mirror] Qoo10分析表の初期化失敗 (mirror本体は継続):', e.message);
+  }
+
   // mirror_rakuten_finance_sku_daily — 楽天 Phase 1a #R-3b (Render 側 daily fact mirror)
   // miniPC の f_rakuten_finance_sku_daily_v1 の payload を受信。
   // contract_version は sync_contracts.contract_version と整合。
@@ -613,6 +1151,8 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_myfsd_ne    ON mirror_yahoo_finance_sku_daily(ne_code)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_myfsd_month ON mirror_yahoo_finance_sku_daily(substr(date_jst, 1, 7))');
   db.exec('CREATE INDEX IF NOT EXISTS idx_myfsd_run   ON mirror_yahoo_finance_sku_daily(source_run_id)');
+  // SKU 軸の全期間集計用 (yahoo-analytics 売れ筋タブの初売上 MIN 等。PK は date_jst 先頭のため別途必要)
+  db.exec('CREATE INDEX IF NOT EXISTS idx_myfsd_sku   ON mirror_yahoo_finance_sku_daily(yahoo_sku_key, date_jst)');
 
   // Phase 1c-3 用 migration framework (Codex R5 #1 反映、PRAGMA table_info 方式)
   // 現状追加列なし、Phase 1c-3 着手時にここに ALTER TABLE 追加する形
@@ -1677,6 +2217,9 @@ function createTables() {
   // ---- 商品管理リスト スナップショット ミラー (⑤、商品管理リスト④の published run を受信) ----
   //   ミニPC build-product-management-snapshot.js → sync-to-render.js → ここ。
   //   受信時に checksum 検証 (recompute == 送信元 payload_checksum) してから atomic swap。
+  //   ⚠️ データ契約 (docs/contracts/pml_backorder_authority.contract.md、2026-07-13):
+  //   「注残数」列は NE 由来の legacy 値 (発注はアプリで行うため以後更新されない)。現在の注残として
+  //   直接参照禁止 — 正本は v_ledger_backorder_by_product / PML行は v_pml_rows_authoritative を使うこと。
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_pml_snapshot_rows (
     run_id                TEXT NOT NULL,
     商品コード            TEXT NOT NULL,
@@ -1748,6 +2291,96 @@ function createTables() {
       synced_at AS data_synced_at,
       'mirror_f_sales_by_listing' AS source_fact
     FROM mirror_f_sales_by_listing`);
+
+  // ---- 粗利込みモール横断 view (2026-07-07 設計監査PR-8/③「1本SQLテスト(b)」対応)
+  // 6 finance fact のモール差分 (SKU列名5種 / Amazon数量REAL / 税込基準差 / qoo10売上3候補 /
+  // margin列名・partial/full 2段構え) をこの view 1箇所に封じ込める。
+  // 下流はこの view を使い、finance fact の手書き UNION を新規に書かないこと。
+  // 列 contract:
+  //   sku_key   = モール native キーの LOWER(TRIM()) 正規化
+  //   ne_code   = 会社共通コード (amazon は fact に無いため NULL → mirror_sku_resolved で解決)
+  //   units_net_sold = INTEGER (amazon は REAL 格納だが値は整数なので CAST)
+  //   sales_gross_jpy_incl = 税込総売上。amazon は principal+shipping+giftwrap+実収税額
+  //     (×1.10 推定ではなく settlement 実額。軽減税率誤差なし)。
+  //     qoo10 は customer_paid_jpy_incl を採用 (顧客支払額=他モールの gross と同義。
+  //     vw_qoo10_finance_for_reporting の net_settlement alias とは別定義である点に注意)
+  //   margin_jpy_for_reporting = 各モールの vw_*_finance_for_reporting と同じ優先順位
+  //     (yahoo/aupay=COALESCE(full,partial)、qoo10=confidence次第、rakuten/linegift=単一列、
+  //      amazon=profit_amount)。amazon のみ税抜 → margin_basis で区別
+  //   is_fba / fba_fees_jpy / asin_norm / sales_principal_jpy = amazon 専用 (他モール NULL)
+  db.exec('DROP VIEW IF EXISTS v_mall_finance_daily_unified');
+  db.exec(`CREATE VIEW v_mall_finance_daily_unified AS
+    SELECT
+      date_jst, 'amazon' AS mall,
+      LOWER(TRIM(seller_sku)) AS sku_key,
+      NULL AS ne_code,
+      product_name,
+      CAST(units_net_sold AS INTEGER) AS units_net_sold,
+      COALESCE(sales_principal_jpy,0) + COALESCE(sales_shipping_jpy,0)
+        + COALESCE(sales_giftwrap_jpy,0) + COALESCE(sales_tax_jpy,0) AS sales_gross_jpy_incl,
+      profit_amount AS margin_jpy_for_reporting,
+      'excl_tax' AS margin_basis,
+      NULL AS margin_confidence,
+      cost_status,
+      asin_norm,
+      COALESCE(fba_fulfillment_jpy,0) + COALESCE(fba_storage_jpy,0) AS fba_fees_jpy,
+      CASE WHEN COALESCE(fba_fulfillment_jpy,0) + COALESCE(fba_storage_jpy,0) > 0 THEN 1 ELSE 0 END AS is_fba,
+      sales_principal_jpy,
+      synced_at
+    FROM mirror_amazon_finance_sku_daily
+    UNION ALL
+    SELECT
+      date_jst, 'rakuten',
+      LOWER(TRIM(rakuten_code)), LOWER(TRIM(ne_code)), product_name,
+      units_net_sold,
+      gross_sales_jpy_incl,
+      variable_margin_jpy_incl,
+      'incl_tax', NULL, cost_status,
+      NULL, NULL, NULL, NULL, synced_at
+    FROM mirror_rakuten_finance_sku_daily
+    UNION ALL
+    SELECT
+      date_jst, 'yahoo',
+      LOWER(TRIM(yahoo_sku_key)), LOWER(TRIM(ne_code)), product_name,
+      units_net_sold,
+      gross_sales_jpy_incl,
+      COALESCE(variable_margin_full_jpy_incl, variable_margin_partial_jpy_incl),
+      'incl_tax', margin_confidence, cost_status,
+      NULL, NULL, NULL, NULL, synced_at
+    FROM mirror_yahoo_finance_sku_daily
+    UNION ALL
+    SELECT
+      date_jst, 'aupay',
+      LOWER(TRIM(aupay_sku_key)), LOWER(TRIM(ne_code)), product_name,
+      units_net_sold,
+      gross_sales_jpy_incl,
+      COALESCE(variable_margin_full_jpy_incl, variable_margin_partial_jpy_incl),
+      'incl_tax', margin_confidence, cost_status,
+      NULL, NULL, NULL, NULL, synced_at
+    FROM mirror_aupay_finance_sku_daily
+    UNION ALL
+    SELECT
+      date_jst, 'qoo10',
+      LOWER(TRIM(sku_code)), LOWER(TRIM(ne_code)), product_name,
+      units_net_sold,
+      customer_paid_jpy_incl,
+      CASE
+        WHEN margin_confidence IN ('full', 'partial_minus_returns') THEN variable_margin_full_jpy_incl
+        ELSE variable_margin_jpy_incl
+      END,
+      'incl_tax', margin_confidence, cost_status,
+      NULL, NULL, NULL, NULL, synced_at
+    FROM mirror_qoo10_finance_sku_daily
+    UNION ALL
+    SELECT
+      date_jst, 'linegift',
+      LOWER(TRIM(sku_code)), LOWER(TRIM(ne_code)), product_name,
+      units_net_sold,
+      gross_sales_jpy_incl,
+      variable_margin_jpy_incl,
+      'incl_tax', margin_confidence, cost_status,
+      NULL, NULL, NULL, NULL, synced_at
+    FROM mirror_linegift_finance_sku_daily`);
 
   db.exec('DROP VIEW IF EXISTS v_mirror_mf_anomaly_signals_latest');
   db.exec(`CREATE VIEW v_mirror_mf_anomaly_signals_latest AS

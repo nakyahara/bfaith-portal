@@ -1,0 +1,509 @@
+/**
+ * purchase-orders ロジザード入庫実績の取込と突合 (P14)
+ *
+ * データソース: ロジザードからエクスポートしている「NE仕入れ取込用データ」CSV (Shift-JIS)。
+ * 現在NE仕入取込に使っているファイルと同一 = 新しい運用は増えない (要件v8 F-5)。
+ *
+ * 行ID: CSVに安定した明細番号が無いため、line_key = sha1(型番|良品数|不良品数|単価) + 同一内容の出現順。
+ * 訂正版: 同一伝票NOの再取込で「消えた/変わった行」は superseded=1 とし新行を追加する。
+ * superseded 行に有効割当が残っていれば「訂正競合」(人間が逆仕訳→再割当で解消、解消まで警告)。
+ * 割当 (消込) は appendPoItemEvent(source='logizard', inboundItemId) 経由のみ。
+ * 容量 (割当合計≤良品数) はDBトリガ trg_po_events_inbound_capacity が最終防衛する。
+ */
+import { createHash } from 'crypto';
+import iconv from 'iconv-lite';
+import { getDB, normSupplierCode, normProductCode } from './db.js';
+import { getSetting, jstToday, isYmd, audit } from './ledger.js';
+import { loadPml } from './logic.js';
+
+const nowIso = () => new Date().toISOString();
+
+/** CSV 1ファイルのパース。構文が壊れた行を「正常データ」として取り込まないよう厳格 (Codex P14-R2 Medium-3):
+ *  引用符はフィールド先頭のみ・閉じ引用符の後は区切り/改行/EOFのみ許可。未クローズはエラー */
+export function parseCsv(text) {
+  const rows = [];
+  let row = [], field = '', q = false, closed = false;
+  const pushField = () => { row.push(field); field = ''; closed = false; };
+  const pushRow = () => { pushField(); if (row.some(v => v !== '')) rows.push(row); row = []; };
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; } else { q = false; closed = true; }
+      } else field += c;
+    } else if (c === '"') {
+      if (field !== '' || closed) throw new Error(`CSVの引用符の位置が不正です (行${rows.length + 2}付近)`);
+      q = true;
+    } else if (c === ',') pushField();
+    else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i + 1] === '\n') i++;
+      pushRow();
+    } else {
+      if (closed) throw new Error(`CSVの閉じ引用符の後に文字があります (行${rows.length + 2}付近)`);
+      field += c;
+    }
+  }
+  if (q) throw new Error('CSVの引用符が閉じていません (ファイル破損の可能性)');
+  pushRow();
+  return rows;
+}
+
+const trimS = v => String(v == null ? '' : v).trim();
+const intOrNull = v => {
+  const s = trimS(v).replace(/,/g, '');
+  if (s === '') return null;
+  const n = Number(s);
+  return Number.isInteger(n) ? n : null;
+};
+
+/** Shift-JIS/UTF-8 自動判別デコード (既存P4の方式: 厳密UTF-8検証→失敗時のみSJIS)。
+ *  実データはWindows由来のためCP932を明示 (丸数字・髙・﨑等のNEC/IBM拡張を正しく読む) */
+export function decodeCsvBuffer(buf) {
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(buf);
+  } catch {
+    return iconv.decode(buf, 'cp932');
+  }
+}
+
+// 「NE仕入れ取込用データ」の見出し (2026-07-10 サンプル確認済)。入庫日はカスタム追加予定のため任意
+const REQUIRED_COLS = ['伝票NO', '型番', '取引先ID', '仕入単価', '良品数'];
+const DATE_COL_CANDIDATES = ['入庫日', '入庫日付', '入荷日'];
+
+function lineContentHash(r) {
+  // 監査原本の識別子のため完全なSHA-256を使う (切詰めによる衝突で別内容が同一行扱いになるのを避ける)
+  return createHash('sha256').update([r.productCode, r.goodQty, r.defectiveQty, r.unitCost == null ? '' : r.unitCost].join('|')).digest('hex');
+}
+
+/**
+ * 入庫CSVを取り込む。冪等: 同一ファイル(ハッシュ)は再取込しない。同一伝票NOの再出力は差分適用
+ * (不変行=そのまま / 新行=追加 / 消えた行=superseded。有効割当つきのsupersededは競合として返す)。
+ * @returns {batchId, receipts, newItems, unchangedItems, supersededItems, conflicts, warnings, alreadyImported}
+ */
+/** CSVバッファの解析+検証 (取込とプレビューの共通部)。不正行があれば throw */
+function parseInboundBuffer(buffer) {
+  const fileHash = createHash('sha256').update(buffer).digest('hex');
+  const text = decodeCsvBuffer(buffer);
+  const rows = parseCsv(text);
+  if (rows.length < 2) throw new Error('CSVにデータ行がありません');
+  const header = rows[0].map(trimS);
+  const col = name => header.indexOf(name);
+  for (const c of REQUIRED_COLS) {
+    if (col(c) === -1) throw new Error(`必要な列が見つかりません: ${c} (「NE仕入れ取込用データ」のCSVを入れてください)`);
+  }
+  const iSlip = col('伝票NO'), iCode = col('型番'), iSup = col('取引先ID'), iCost = col('仕入単価');
+  const iGood = col('良品数'), iBad = col('不良品数');
+  const iDate = DATE_COL_CANDIDATES.map(col).find(x => x !== -1);
+  const hasDateCol = iDate != null && iDate !== -1;
+
+  // 伝票NOごとに行をグルーピング (line_key = 内容ハッシュ + 同一内容の出現順)。
+  // 識別・数量・単価の不正は「ファイル全体を拒否」する (Codex P14-R1 High-2:
+  // 不正行だけスキップして訂正版を適用すると、正常な旧行を「消えた」と誤認してsupersede+偽競合を作るため)
+  const errors = [];
+  const bySlip = new Map();
+  for (let n = 1; n < rows.length; n++) {
+    const r = rows[n];
+    const maxIdx = Math.max(iSlip, iCode, iSup, iCost, iGood, iBad === -1 ? 0 : iBad);
+    if (r.length <= maxIdx) { errors.push(`行${n + 1}: 列数が不足しています (引用符ずれ?)`); continue; }
+    const slip = trimS(r[iSlip]);
+    const code = trimS(r[iCode]);
+    if (!slip || !code) { errors.push(`行${n + 1}: 伝票NOまたは型番が空です`); continue; }
+    const good = intOrNull(r[iGood]);
+    if (good == null || good < 0) { errors.push(`行${n + 1}: 良品数が0以上の整数ではありません (${trimS(r[iGood])})`); continue; }
+    let bad = 0;
+    if (iBad !== -1 && trimS(r[iBad]) !== '') {
+      bad = intOrNull(r[iBad]);
+      if (bad == null || bad < 0) { errors.push(`行${n + 1}: 不良品数が0以上の整数ではありません (${trimS(r[iBad])})`); continue; }
+    }
+    const costN = trimS(r[iCost]).replace(/,/g, '');
+    let cost = null;
+    if (costN !== '') {
+      cost = Number(costN);
+      if (!Number.isFinite(cost) || cost < 0) { errors.push(`行${n + 1}: 仕入単価が不正です (${trimS(r[iCost])})`); continue; }
+    }
+    let date = hasDateCol ? trimS(r[iDate]).replace(/\//g, '-') : '';
+    // 入庫日も原本。破損値を「日付なし」に変換すると訂正版で正しい原本日付を消すため、不正はファイル全体拒否
+    if (date && !isYmd(date)) { errors.push(`行${n + 1}: 入庫日の形式が不正です (${date})`); continue; }
+    const line = {
+      supplierCode: normSupplierCode(r[iSup]), productCode: code, productKey: normProductCode(code),
+      goodQty: good, defectiveQty: Math.max(0, bad ?? 0), unitCost: cost, date: date || null,
+      payload: JSON.stringify(Object.fromEntries(header.map((h, k) => [h, trimS(r[k])]).filter(([, v]) => v !== ''))),
+    };
+    if (!bySlip.has(slip)) bySlip.set(slip, []);
+    bySlip.get(slip).push(line);
+  }
+  if (errors.length) {
+    throw new Error(`取込を中止しました (不正な行が${errors.length}件): ` + errors.slice(0, 5).join(' / ') + (errors.length > 5 ? ' …' : ''));
+  }
+  if (!bySlip.size) throw new Error('取り込める行がありません');
+  return { fileHash, bySlip, hasDateCol, dataRowCount: rows.length - 1 };
+}
+
+/**
+ * 取込プレビュー (書込なし): 伝票/明細のサマリ+商品名+同一ファイルの再取込警告。
+ * commit時は fileHash を照合してプレビューしたファイルと同一であることを保証する
+ */
+export function previewInboundCsv({ buffer }) {
+  const db = getDB();
+  const { fileHash, bySlip, dataRowCount } = parseInboundBuffer(buffer);
+  const dup = db.prepare('SELECT file_name, imported_at FROM po_inbound_batches WHERE file_hash=? ORDER BY id DESC LIMIT 1').get(fileHash);
+  const nameByKey = new Map();
+  try { for (const r of loadPml().rows) nameByKey.set(normProductCode(r['商品コード']), r['商品名'] || ''); } catch { /* PML未同期でも取込は可能 */ }
+  const receipts = [];
+  const lines = [];
+  let totalGood = 0;
+  for (const [slip, ls] of bySlip) {
+    const exists = db.prepare("SELECT id FROM po_inbound_receipts WHERE source='logizard' AND source_key=?").get(slip);
+    receipts.push({ slip, isNew: !exists, lineCount: ls.length, goodQty: ls.reduce((s, l) => s + l.goodQty, 0), date: ls.find(l => l.date)?.date || null });
+    for (const l of ls) {
+      totalGood += l.goodQty;
+      lines.push({ slip, supplierCode: l.supplierCode, productCode: l.productCode,
+        productName: nameByKey.get(l.productKey) || '', goodQty: l.goodQty, defectiveQty: l.defectiveQty, unitCost: l.unitCost, date: l.date });
+    }
+  }
+  return {
+    fileHash, dataRowCount, totalGood,
+    slipCount: bySlip.size, lineCount: lines.length,
+    reimportSlips: receipts.filter(r => !r.isNew).map(r => r.slip), // 既存伝票=訂正反映になる
+    duplicateFile: dup ? { fileName: dup.file_name, importedAt: dup.imported_at } : null,
+    receipts, lines: lines.slice(0, 300), linesTruncated: Math.max(0, lines.length - 300),
+  };
+}
+
+export function importInboundCsv({ buffer, filename, actor = null, expectedHash = null }) {
+  const db = getDB();
+  const { fileHash, bySlip, hasDateCol, dataRowCount } = parseInboundBuffer(buffer);
+  // プレビュー→取込の二段構え時: プレビューしたファイルと同一かを検証 (別ファイル差し替え事故防止)
+  if (expectedHash && expectedHash !== fileHash) {
+    throw new Error('プレビューしたファイルと内容が異なります。もう一度ファイルを選び直してプレビューからやり直してください');
+  }
+  const warnings = [];
+
+  const tx = db.transaction(() => {
+    const dup = db.prepare('SELECT id FROM po_inbound_batches WHERE file_hash=?').get(fileHash);
+    if (dup) return { alreadyImported: true, batchId: dup.id };
+    const now = nowIso();
+    const info = db.prepare('INSERT INTO po_inbound_batches (file_name, file_hash, row_count, receipt_count, imported_at, actor) VALUES (?,?,?,?,?,?)')
+      .run(filename || null, fileHash, dataRowCount, bySlip.size, now, actor);
+    const batchId = Number(info.lastInsertRowid);
+
+    let newItems = 0, unchangedItems = 0, supersededItems = 0;
+    const conflicts = [];
+    const allocOf = db.prepare(`
+      SELECT COALESCE(SUM(e.qty),0) AS n FROM po_item_events e
+      WHERE e.inbound_item_id = ? AND e.event_type='receipt'
+        AND NOT EXISTS (SELECT 1 FROM po_item_events r WHERE r.reverses_id = e.id)`);
+
+    for (const [slip, lines] of bySlip) {
+      // 出現順つき line_key を確定
+      const seen = new Map();
+      for (const l of lines) {
+        const h = lineContentHash({ productCode: l.productKey, goodQty: l.goodQty, defectiveQty: l.defectiveQty, unitCost: l.unitCost });
+        const n = (seen.get(h) || 0) + 1;
+        seen.set(h, n);
+        l.lineKey = `${h}#${n}`;
+      }
+      // 入庫日は伝票単位。同一伝票に異なる日付や「日付あり/空欄」の混在があるCSVは黙って採用せず拒否する
+      const dates = [...new Set(lines.map(l => l.date).filter(Boolean))];
+      if (dates.length > 1) throw new Error(`伝票 ${slip}: 入庫日が複数あります (${dates.join(', ')})。CSVを確認してください`);
+      if (dates.length === 1 && lines.some(l => !l.date)) {
+        throw new Error(`伝票 ${slip}: 入庫日あり/空欄の行が混在しています。CSVを確認してください`);
+      }
+      const slipDate = dates[0] || null;
+      let receipt = db.prepare("SELECT * FROM po_inbound_receipts WHERE source='logizard' AND source_key=?").get(slip);
+      if (!receipt) {
+        const ri = db.prepare("INSERT INTO po_inbound_receipts (source, source_key, receipt_date, first_batch_id, last_batch_id, imported_at) VALUES ('logizard',?,?,?,?,?)")
+          .run(slip, slipDate, batchId, batchId, now);
+        receipt = { id: Number(ri.lastInsertRowid) };
+      } else if (hasDateCol) {
+        // 入庫日列があるファイルは原本として日付を上書き (NULL=クリアも反映)。列自体が無いファイルでは触らない
+        db.prepare('UPDATE po_inbound_receipts SET last_batch_id=?, receipt_date=? WHERE id=?')
+          .run(batchId, slipDate, receipt.id);
+      } else {
+        db.prepare('UPDATE po_inbound_receipts SET last_batch_id=? WHERE id=?').run(batchId, receipt.id);
+      }
+      const existing = db.prepare('SELECT * FROM po_inbound_items WHERE receipt_id=? AND superseded=0').all(receipt.id);
+      const existingByKey = new Map(existing.map(x => [x.line_key, x]));
+      const incomingKeys = new Set(lines.map(l => l.lineKey));
+      // 新行の追加 / 不変行の維持
+      const ins = db.prepare(`INSERT INTO po_inbound_items
+        (receipt_id, line_key, batch_id, supplier_code, product_code, product_key, good_qty, defective_qty, unit_cost, payload_json, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
+      for (const l of lines) {
+        const same = existingByKey.get(l.lineKey);
+        if (same) {
+          // 行キー (商品・数量・単価) が同じでも、仕入先や原本は訂正されている可能性がある → 今回値で更新
+          // (仕入先だけの訂正が反映されないと候補抽出が誤る、Codex P14-R2 Medium-2)。
+          // ただし割当が残る行の仕入先変更は「入庫=B・割当先PO=A」の不整合を作るため取込ごと拒否
+          // (Codex P14-R3 High: 先に逆仕訳してから再取込してもらう)
+          if (same.supplier_code !== (l.supplierCode || null)) {
+            const alloc = allocOf.get(same.id).n;
+            if (alloc > 0) {
+              throw new Error(`伝票 ${slip} / ${l.productCode}: 仕入先が訂正されましたが割当 (${alloc}) が残っています。先に発注残ページから逆仕訳してから再取込してください`);
+            }
+          }
+          if (same.supplier_code !== (l.supplierCode || null) || same.product_code !== l.productCode || same.payload_json !== l.payload) {
+            db.prepare('UPDATE po_inbound_items SET supplier_code=?, product_code=?, payload_json=?, batch_id=? WHERE id=?')
+              .run(l.supplierCode || null, l.productCode, l.payload, batchId, same.id);
+          }
+          unchangedItems++;
+          continue;
+        }
+        // 過去にsupersededになった同一内容行が復活するケース: UNIQUE(receipt,line_key) に当たるため復活させる。
+        // 監査が誤らないよう、原本・バッチ情報も今回の値へ更新する (Codex P14-R1 Medium-1)。
+        // ただし割当が残る行の仕入先変更は、通常行と同じく取込ごと拒否 (復活経路での迂回を塞ぐ、Codex P14-R4 High)
+        const dead = db.prepare('SELECT * FROM po_inbound_items WHERE receipt_id=? AND line_key=? AND superseded=1').get(receipt.id, l.lineKey);
+        if (dead) {
+          if (dead.supplier_code !== (l.supplierCode || null) && allocOf.get(dead.id).n > 0) {
+            throw new Error(`伝票 ${slip} / ${l.productCode}: 仕入先が訂正されましたが割当 (${allocOf.get(dead.id).n}) が残っています。先に発注残ページから逆仕訳してから再取込してください`);
+          }
+          db.prepare(`UPDATE po_inbound_items SET superseded=0, superseded_batch_id=NULL,
+                        batch_id=?, supplier_code=?, product_code=?, payload_json=?, created_at=? WHERE id=?`)
+            .run(batchId, l.supplierCode || null, l.productCode, l.payload, now, dead.id);
+          newItems++;
+          continue;
+        }
+        ins.run(receipt.id, l.lineKey, batchId, l.supplierCode || null, l.productCode, l.productKey, l.goodQty, l.defectiveQty, l.unitCost, l.payload, now);
+        newItems++;
+      }
+      // 消えた行 = superseded。割当が残っていれば競合
+      for (const x of existing) {
+        if (incomingKeys.has(x.line_key)) continue;
+        db.prepare('UPDATE po_inbound_items SET superseded=1, superseded_batch_id=? WHERE id=?').run(batchId, x.id);
+        supersededItems++;
+        const alloc = allocOf.get(x.id).n;
+        if (alloc > 0) conflicts.push({ inboundItemId: x.id, slip, productCode: x.product_code, allocated: alloc });
+      }
+    }
+    audit(db, { actorType: 'user', actor, action: 'inbound_import', resource: `inbound_batch:${batchId}`,
+      detail: { filename, receipts: bySlip.size, newItems, unchangedItems, supersededItems, conflicts: conflicts.length } });
+    return { alreadyImported: false, batchId, receipts: bySlip.size, newItems, unchangedItems, supersededItems, conflicts };
+  });
+  const result = tx.immediate();
+  return { ...result, warnings };
+}
+
+/** 入庫明細ごとの有効割当合計 */
+function allocSums(db) {
+  const map = new Map();
+  for (const r of db.prepare(`
+    SELECT e.inbound_item_id AS id, SUM(e.qty) AS n FROM po_item_events e
+    WHERE e.inbound_item_id IS NOT NULL AND e.event_type='receipt'
+      AND NOT EXISTS (SELECT 1 FROM po_item_events r2 WHERE r2.reverses_id = e.id)
+    GROUP BY e.inbound_item_id`).all()) map.set(r.id, r.n);
+  return map;
+}
+
+/**
+ * 入庫消込ページのデータ: 未割当・一部割当の入庫明細 (+突合候補数) / 訂正競合 / 対象外。
+ */
+export function listInbound() {
+  const db = getDB();
+  const alloc = allocSums(db);
+  // 商品名はPMLから解決 (人間が商品コードだけで判別しなくて済むように、中原さん要望 2026-07-14)
+  const nameByKey = new Map();
+  try { for (const r of loadPml().rows) nameByKey.set(normProductCode(r['商品コード']), r['商品名'] || ''); } catch { /* PML未同期環境 */ }
+  const items = db.prepare(`
+    SELECT i.*, r.source_key AS slip, r.receipt_date,
+           (SELECT COUNT(*) FROM po_inbound_ignores g WHERE g.inbound_item_id = i.id AND g.revoked_at IS NULL) AS ignored
+    FROM po_inbound_items i JOIN po_inbound_receipts r ON r.id = i.receipt_id
+    ORDER BY r.receipt_date IS NULL, r.receipt_date DESC, r.source_key DESC, i.id`).all();
+  const open = [], ignored = [], conflicts = [];
+  // 網羅性の保存則 (中原さん要望 2026-07-15: 割当漏れ・注残漏れを絶対に避けたい)。
+  // 非superseded入庫の良品数は必ず「割当済み + 対象外 + 未処理」に分解でき、合計は常に一致する:
+  //   goodQty = allocated + capacity。capacity は 対象外行→ignored / それ以外→unprocessed に計上。
+  // unprocessed>0 は「まだ消込も対象外もしていない入荷」= 一括割当で0にすべき残り。
+  const totals = { totalGood: 0, allocated: 0, ignored: 0, unprocessed: 0, unprocessedLines: 0,
+    conflictLines: 0, conflictAllocated: 0 };
+  for (const i of items) {
+    const allocated = alloc.get(i.id) || 0;
+    const capacity = Math.max(0, i.good_qty - allocated);
+    const row = {
+      id: i.id, slip: i.slip, receiptDate: i.receipt_date, supplierCode: i.supplier_code,
+      productCode: i.product_code, productKey: i.product_key,
+      productName: nameByKey.get(i.product_key) || '',
+      goodQty: i.good_qty, defectiveQty: i.defective_qty, unitCost: i.unit_cost,
+      allocated, remainingCapacity: capacity,
+    };
+    if (i.superseded) {
+      // 訂正で消えた行。割当が残っていれば競合 (別枠で警告)。網羅性の分母には入れない
+      if (allocated > 0) { conflicts.push({ ...row, kind: 'superseded_with_alloc' }); totals.conflictLines++; totals.conflictAllocated += allocated; }
+      continue;
+    }
+    totals.totalGood += i.good_qty;
+    totals.allocated += allocated;
+    if (i.ignored) { totals.ignored += capacity; ignored.push(row); continue; }
+    if (capacity > 0) { totals.unprocessed += capacity; totals.unprocessedLines++; open.push(row); }
+    // capacity===0 かつ 非対象外 = 完全割当済み (allocated に計上済み)
+  }
+  // 保存則が破れていたら壊れている (通常あり得ない)。UI/監視が気付けるようフラグ化
+  totals.balanced = (totals.allocated + totals.ignored + totals.unprocessed) === totals.totalGood;
+  return { open, ignored, conflicts, totals };
+}
+
+/**
+ * 突合候補 (要件v8 F-5): 仕入先不一致は除外。スコア = 仕入先+商品一致80 / 納期±3日+20 /
+ * 数量=残数ぴったり+10 / 過納(入庫残容量>PO残)-40。同点はFIFO (発行日昇順)。
+ */
+export function candidatesFor(inboundItemId) {
+  const db = getDB();
+  const boundary = getSetting('tracking_started_at');
+  const item = db.prepare(`
+    SELECT i.*, r.source_key AS slip, r.receipt_date FROM po_inbound_items i
+    JOIN po_inbound_receipts r ON r.id = i.receipt_id WHERE i.id=?`).get(inboundItemId);
+  if (!item) throw new Error(`入庫明細が存在しません: ${inboundItemId}`);
+  if (!boundary) return { item, candidates: [] };
+  const alloc = allocSums(db);
+  const capacity = Math.max(0, item.good_qty - (alloc.get(item.id) || 0));
+  const baseDate = item.receipt_date || jstToday();
+  const rows = db.prepare(`
+    SELECT oi.id AS order_item_id, oi.product_code, oi.unit_cost AS po_unit_cost,
+           oi.requested_date, oi.promised_date, b.remaining_qty,
+           o.id AS order_id, o.po_number, o.supplier_code, o.supplier_name, o.issued_at
+    FROM po_order_items oi
+    JOIN v_po_item_balance b ON b.order_item_id = oi.id
+    JOIN po_orders o ON o.id = oi.order_id
+    WHERE oi.product_key = ? AND o.status='issued' AND o.closed_at IS NULL AND o.issued_at >= ?
+      AND b.remaining_qty > 0
+    ORDER BY o.issued_at ASC`).all(item.product_key, boundary);
+  const candidates = [];
+  for (const r of rows) {
+    // 仕入先不一致は候補から除外 (入庫側の取引先ID欠落時は除外しない)
+    if (item.supplier_code && r.supplier_code && normSupplierCode(item.supplier_code) !== normSupplierCode(r.supplier_code)) continue;
+    let score = 80;
+    const due = r.promised_date || r.requested_date;
+    if (due) {
+      const d = Math.abs((Date.parse(baseDate) - Date.parse(due)) / 86400000);
+      if (d <= 3) score += 20;
+    }
+    if (capacity === r.remaining_qty) score += 10;
+    if (capacity > r.remaining_qty) score -= 40;
+    const costDiff = item.unit_cost != null && r.po_unit_cost != null && Number(item.unit_cost) !== Number(r.po_unit_cost);
+    candidates.push({
+      orderItemId: r.order_item_id, orderId: r.order_id, poNumber: r.po_number,
+      supplierCode: r.supplier_code, supplierName: r.supplier_name, issuedAt: r.issued_at,
+      remaining: r.remaining_qty, due: due || null, poUnitCost: r.po_unit_cost,
+      costDiff, score, suggestedQty: Math.min(capacity, r.remaining_qty),
+    });
+  }
+  candidates.sort((a, b) => b.score - a.score || String(a.issuedAt).localeCompare(String(b.issuedAt)));
+  return { item: { ...item, capacity }, candidates };
+}
+
+/** 候補POを「古い発注から」順に並べる (FIFO引き当ての正本順序。preview/実行の両方がこれを使う) */
+export function sortCandidatesFifo(cands) {
+  return [...cands].sort((a, b) => String(a.issuedAt).localeCompare(String(b.issuedAt)) || (a.orderItemId - b.orderItemId));
+}
+
+/**
+ * ⚡一括割当の提案 (書込なし)。考え方 (中原さん 2026-07-15: 注残管理はシンプルに):
+ *  - 古い注残 (発注) から順にFIFOで引き当てる。複数POに累積していても古い方から自動で消す
+ *  - 注残より多く入荷したら注残は全量消込し、超過分だけを対象外にする
+ *    (行ごと対象外にするとPO残が「未入荷」のまま残り、二重発注・不要な督促の元、Codex ig-R1 High-2)
+ *  - 注残がない商品の入庫はスルー (=対象外。↩で戻せる記録付き)
+ *  - 一括割当を実行したら全行が処理し切られる。手動に残るのは異常系 (候補計算エラー・一部割当済みの残余) のみ
+ */
+export function autoAssignPreview() {
+  const { open } = listInbound();
+  const proposals = [], skipped = [], autoIgnores = [];
+  // 同じPO明細へ複数の入庫行が向かう場合は数量を累積して残数を表示する
+  // (独立計算だと両方「20→15」に見えて実際は残10、Codex inb-R1 Medium)
+  const cumByItem = new Map();
+  for (const row of open) {
+    let cands;
+    try { cands = candidatesFor(row.id).candidates; }
+    catch (e) { skipped.push({ ...row, reason: `候補計算エラー: ${e.message}` }); continue; }
+    // 古い発注から順にFIFOで引き当て (1入庫行を複数POへ分割することもある)
+    const rowProps = [];
+    let rest = row.remainingCapacity;
+    for (const c of sortCandidatesFifo(cands)) {
+      if (rest <= 0) break;
+      const prior = cumByItem.get(c.orderItemId) || 0;
+      const eff = c.remaining - prior; // このバッチ内の先行提案分を差し引いた実効PO残
+      if (eff <= 0) continue;
+      const q = Math.min(rest, eff);
+      rowProps.push({
+        inboundItemId: row.id, slip: row.slip, receiptDate: row.receiptDate, supplierCode: row.supplierCode,
+        productCode: row.productCode, productName: row.productName, qty: q,
+        excessQty: 0, // 行の最終割当にだけ超過分を載せる (下で設定)
+        orderItemId: c.orderItemId, orderId: c.orderId, poNumber: c.poNumber, supplierName: c.supplierName,
+        poRemaining: eff, postRemaining: eff - q, costDiff: c.costDiff,
+        due: c.due || null, // 残数の扱いの日付既定 (分納待ち=次回予定日 / 確認中=期限)
+      });
+      cumByItem.set(c.orderItemId, prior + q);
+      rest -= q;
+    }
+    if (!rowProps.length) {
+      // 引き当てられるPO残が1つもない: 未発注分の入庫 or 先行提案で全量超過 → 対象外 (スルー)
+      // 一部割当済みの行だけは対象外にできない (台帳と矛盾したまま隠れる、DBトリガも拒否) → 手動へ
+      if (row.allocated > 0) skipped.push({ ...row, reason: '一部割当済みで残りに対応する発注残がありません (逆仕訳などで手動対応してください)' });
+      else autoIgnores.push({ inboundItemId: row.id, slip: row.slip, productCode: row.productCode, productName: row.productName,
+        qty: row.remainingCapacity, reason: cands.length ? `入庫数(${row.remainingCapacity})が注残を超過 (先行分で注残は消込済み)` : '対応する発注残なし (未発注分の入庫)' });
+      continue;
+    }
+    if (rest > 0) rowProps[rowProps.length - 1].excessQty = rest; // 注残を超えた分は最終割当と同時に対象外へ
+    proposals.push(...rowProps);
+  }
+  // 残数の扱いは「PO明細ごとに最後の提案行」でだけ選択させる (途中行の設定は最後の行で上書きされるため)
+  const lastIdxByItem = new Map();
+  proposals.forEach((p, i) => lastIdxByItem.set(p.orderItemId, i));
+  proposals.forEach((p, i) => { p.needsRemainder = lastIdxByItem.get(p.orderItemId) === i && p.postRemaining > 0; });
+  return { proposals, skipped, autoIgnores };
+}
+
+/** 取込履歴 (いつ・何を・何個入荷したか)。バッチ=1回のCSVアップロード */
+export function listInboundBatches(limit = 50) {
+  const db = getDB();
+  return db.prepare(`
+    SELECT b.id, b.file_name, b.imported_at, b.row_count, b.receipt_count, b.actor,
+           COALESCE((SELECT SUM(i.good_qty) FROM po_inbound_items i WHERE i.batch_id = b.id), 0) AS total_good,
+           (SELECT COUNT(*) FROM po_inbound_items i WHERE i.batch_id = b.id) AS line_count
+    FROM po_inbound_batches b ORDER BY b.id DESC LIMIT ?`).all(Math.max(1, Math.min(200, limit)));
+}
+
+/** 取込バッチの明細 (そのアップロードで追加された行) */
+export function inboundBatchLines(batchId) {
+  const db = getDB();
+  const batch = db.prepare('SELECT * FROM po_inbound_batches WHERE id=?').get(batchId);
+  if (!batch) throw new Error(`取込履歴が存在しません: ${batchId}`);
+  const nameByKey = new Map();
+  try { for (const r of loadPml().rows) nameByKey.set(normProductCode(r['商品コード']), r['商品名'] || ''); } catch { /* PML未同期環境 */ }
+  const lines = db.prepare(`
+    SELECT i.id, r.source_key AS slip, r.receipt_date, i.product_code, i.product_key, i.good_qty, i.defective_qty, i.unit_cost, i.superseded
+    FROM po_inbound_items i JOIN po_inbound_receipts r ON r.id = i.receipt_id
+    WHERE i.batch_id = ? ORDER BY r.source_key DESC, i.id`).all(batchId)
+    .map(l => ({ ...l, productName: nameByKey.get(l.product_key) || '' }));
+  return { batch, lines };
+}
+
+/** 対象外の指定/解除 (履歴型)。scope: 'row'=行全体 (割当ゼロのみ) / 'excess'=注残超過分の残余だけ (割当済みの行のみ、#525) */
+export function setInboundIgnore(inboundItemId, { ignore, reason = null, actor = null, scope = 'row' }) {
+  const db = getDB();
+  if (scope !== 'row' && scope !== 'excess') throw new Error(`scopeが不正です: ${scope}`);
+  const tx = db.transaction(() => {
+    const item = db.prepare('SELECT id, superseded FROM po_inbound_items WHERE id=?').get(inboundItemId);
+    if (!item) throw new Error(`入庫明細が存在しません: ${inboundItemId}`);
+    const active = db.prepare('SELECT id FROM po_inbound_ignores WHERE inbound_item_id=? AND revoked_at IS NULL').get(inboundItemId);
+    const now = nowIso();
+    if (ignore) {
+      if (active) return { changed: false };
+      if (!reason || !String(reason).trim()) throw new Error('対象外には理由が必要です');
+      if (item.superseded) throw new Error('訂正で無効化された行は対象外にできません (競合の解消を先に)');
+      const alloc = db.prepare(`SELECT COALESCE(SUM(e.qty),0) AS n FROM po_item_events e
+        WHERE e.inbound_item_id=? AND e.event_type='receipt'
+          AND NOT EXISTS (SELECT 1 FROM po_item_events r WHERE r.reverses_id=e.id)`).get(inboundItemId).n;
+      // row=割当が残る入庫を丸ごと対象外にすると台帳と矛盾したまま隠れる (Codex P14-R1 High-1)
+      // excess=割当済みの行の残余だけを対象外にする (注残超過分。割当ゼロならrowを使う)
+      if (scope === 'row' && alloc > 0) throw new Error(`割当 (${alloc}) が残っています。先に発注残ページから逆仕訳してください`);
+      if (scope === 'excess' && alloc === 0) throw new Error('超過分の対象外は割当済みの行にだけ使えます');
+      db.prepare('INSERT INTO po_inbound_ignores (inbound_item_id, reason, scope, created_at, actor) VALUES (?,?,?,?,?)')
+        .run(inboundItemId, String(reason).trim(), scope, now, actor);
+    } else {
+      if (!active) return { changed: false };
+      db.prepare('UPDATE po_inbound_ignores SET revoked_at=?, revoked_by=? WHERE id=?').run(now, actor, active.id);
+    }
+    audit(db, { actorType: 'user', actor, action: ignore ? 'inbound_ignore' : 'inbound_unignore', resource: `inbound_item:${inboundItemId}`, detail: { reason } });
+    return { changed: true };
+  });
+  return tx.immediate();
+}

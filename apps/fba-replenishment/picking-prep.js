@@ -29,16 +29,10 @@ export function buildPickingCardTitle(ymd) {
   return d ? `${d}納品予定FBA納品ピッキング` : null;
 }
 
-// 商品コード正規化 (GAS PL_normCode_ 相当: 全角→半角, ダッシュ統一, 空白除去, 小文字化)
-export function normCode(v) {
-  if (v == null) return '';
-  let t = String(v);
-  t = t.replace(/[！-～]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0)); // 全角英数記号→半角
-  t = t.replace(/　/g, ' ');                                                  // 全角SP→半角
-  t = t.replace(/[−‐-―﹘﹣－]/g, '-');                  // 各種ダッシュ→ハイフン
-  t = t.trim().replace(/\s+/g, '').toLowerCase();
-  return t;
-}
+// 商品コード正規化 (GAS PL_normCode_ 相当) — lib/sku-norm.js に全社共通化 (監査PR-10)。
+// 本ファイル内でも使用するため import + 既存の import { normCode } 互換の re-export
+import { normSku as normCode } from '../../lib/sku-norm.js';
+export { normCode };
 
 const safe = (v) => (v == null ? '' : String(v).replace(/[﻿]/g, '').trim());
 

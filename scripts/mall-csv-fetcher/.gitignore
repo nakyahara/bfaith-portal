@@ -1,0 +1,10 @@
+# 認証情報・セッション・出力はコミットしない
+.env
+.profile-rakuten
+.profile-yahoo
+.profile-aupay
+.profile-qoo10
+.qoo10-state.json
+spike-output
+downloads
+logs

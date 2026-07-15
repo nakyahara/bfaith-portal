@@ -252,6 +252,17 @@ async function main() {
   const vpsEnvResult = runScript('apps/warehouse/sync-vps-env.js', 'VPS env同期');
   results.push({ name: 'VPS env同期', ...vpsEnvResult });
 
+  // Settlement 冪等性 smoke テスト (監査PR-13/INV-27。一時DB相手に数秒で完了、本番DBに触れない)
+  // hash設計が崩れると PR #229 (31.8M行膨張) が再発するため、Settlement 取得より前に毎朝検証。
+  // 失敗しても以降のジョブは止めない (❌通知で気付く)。
+  const idemResult = runScript('apps/warehouse/test-settlement-idempotency.js', 'Settlement冪等性テスト', 120000);
+  results.push({ name: 'Settlement冪等性テスト', ...idemResult });
+
+  // raw_*_orders_log 3本のローテ (監査PR-12(b)。保持60日+月次gzアーカイブ。
+  // 実測2.3GB/4.5M行の純無限成長を停止。定常時は前日分のみで数秒)
+  const rotateResult = runScript('apps/warehouse/rotate-order-logs.js', 'ログローテ', 1800000);
+  results.push({ name: 'ログローテ', ...rotateResult });
+
   // NE API（商品マスタ + セット商品 + 受注7日分）
   const neResult = runScript('apps/warehouse/ne-api.js sync', 'NE API');
   results.push({ name: 'NE', ...neResult });
@@ -433,6 +444,35 @@ async function main() {
       console.log(`[DailySync] Amazon finance sync は build 失敗のため記録せず (build retry 後に翌 cron で sync 実行)`);
     }
 
+    // === Amazon finance 前月分 build+sync (月初の settlement 追い込み反映) ===
+    // settlement は約14日周期で確定するため、月初〜中旬は前月 economic_date の行が
+    // 新規 settlement で増え続ける。従来は当月のみ (「前月処理は将来」TODO) だったため、
+    // 月初に amazon_finance_sku_daily の sync が最大2週間止まって見えていた
+    // (2026-07-07 発覚: 6/29 を最後に 1 週間 no rows in range)。
+    // 毎月 20 日までは前月分も build+sync する (snapshot 原価は UPSERT 不変なので安全)。
+    const dayOfMonth = parseInt(businessDate.slice(8, 10), 10);
+    if (dayOfMonth <= 20) {
+      const prevMonthDate = new Date(Date.UTC(
+        parseInt(currentMonth.slice(0, 4), 10),
+        parseInt(currentMonth.slice(5, 7), 10) - 2, 1
+      ));
+      const prevMonth = `${prevMonthDate.getUTCFullYear()}-${String(prevMonthDate.getUTCMonth() + 1).padStart(2, '0')}`;
+      const prevBuildResult = runScript(
+        `scripts/amazon-finance/build-daily-fact.js --data-dir ${DATA_DIR_ARG} --month ${prevMonth}`,
+        'Amazon finance build (前月)', 600000
+      );
+      results.push({ name: 'Amazon finance build (前月)', ...prevBuildResult });
+      if (prevBuildResult.success) {
+        const prevSyncResult = runScript(
+          `apps/warehouse/sync-amazon-finance-daily.js --data-dir ${DATA_DIR_ARG} --month ${prevMonth}`,
+          'Amazon finance sync (前月)', 600000
+        );
+        results.push({ name: 'Amazon finance sync (前月)', ...prevSyncResult });
+      } else {
+        console.log(`[DailySync] Amazon finance sync (前月) は build 失敗のためスキップ`);
+      }
+    }
+
     // === Amazon Ads mirror sync (amazon-dashboard PR-A) ===
     // fact_ad_spend / fact_ad_spend_campaign を Render mirror へ sync。
     // 取得ジョブ (上の Amazon Ads (campaign)/(SKU)) は直近 30 日窓なので、
@@ -513,6 +553,97 @@ async function main() {
     } else {
       // build 失敗 → DQ/sync 記録しない (Amazon と同方針)
       console.log(`[DailySync] 楽天 finance DQ/sync は build 失敗のため記録せず (build retry 後に翌 cron で実行)`);
+    }
+
+    // === 楽天RPP広告費 取込 + mirror sync (mall-csv-fetcher P1) ===
+    // 自動DL (rakuten-rpp-download.mjs、別 Task Scheduler スロット) と手動バックアップが
+    // incoming/rakuten-ads/ に置いた CSV/zip を取り込む。対象0件は正常 (exit 0)。
+    // 取込成功時のみ sync (--days 70 = 今月+先月+月初の前々月をカバー、720h遡及)
+    const rakutenAdsImportResult = runScript(
+      `apps/warehouse/import-rakuten-ads-rpp.js --data-dir ${DATA_DIR_ARG}`,
+      '楽天RPP広告 取込', 600000
+    );
+    results.push({ name: '楽天RPP広告 取込', ...rakutenAdsImportResult });
+    if (rakutenAdsImportResult.success) {
+      const rakutenAdsSyncResult = runScript(
+        `apps/warehouse/sync-rakuten-ads-daily.js --data-dir ${DATA_DIR_ARG} --days 70`,
+        '楽天RPP広告 sync', 600000
+      );
+      results.push({ name: '楽天RPP広告 sync', ...rakutenAdsSyncResult });
+    } else {
+      console.log('[DailySync] 楽天RPP広告 sync は取込失敗のためスキップ (failed/ を確認、修正後に再投入)');
+    }
+
+    // === 楽天RMSデータ分析 (商品分析SKU日次/店舗日次) 取込 + mirror sync (mall-csv-fetcher P1-R2) ===
+    // 手動DL (将来は自動DL) が incoming/rakuten-data/ に置いた CSV/zip を取り込む。
+    // 対象0件は正常 (exit 0)。取込成功時のみ sync (--days 70、RPP と同 scope)
+    const rakutenDataImportResult = runScript(
+      `apps/warehouse/import-rakuten-data.js --data-dir ${DATA_DIR_ARG}`,
+      '楽天データ分析 取込', 600000
+    );
+    results.push({ name: '楽天データ分析 取込', ...rakutenDataImportResult });
+    if (rakutenDataImportResult.success) {
+      const rakutenDataSyncResult = runScript(
+        `apps/warehouse/sync-rakuten-data-daily.js --data-dir ${DATA_DIR_ARG} --days 70`,
+        '楽天データ分析 sync', 600000
+      );
+      results.push({ name: '楽天データ分析 sync', ...rakutenDataSyncResult });
+    } else {
+      console.log('[DailySync] 楽天データ分析 sync は取込失敗のためスキップ (failed/ を確認、修正後に再投入)');
+    }
+
+    // === Yahoo!ストクリ統計CSV 取込 + mirror sync (mall-csv-fetcher P1-Y) ===
+    // 自動DL (yahoo-data-download.mjs、fetch-all 05:30) が incoming/yahoo-data/ に置いた
+    // CSVを取り込む。対象0件は正常。--days 110 = 全体分析の一括100日レンジをカバー
+    const yahooDataImportResult = runScript(
+      `apps/warehouse/import-yahoo-data.js --data-dir ${DATA_DIR_ARG}`,
+      'Yahoo統計 取込', 600000
+    );
+    results.push({ name: 'Yahoo統計 取込', ...yahooDataImportResult });
+    if (yahooDataImportResult.success) {
+      const yahooDataSyncResult = runScript(
+        `apps/warehouse/sync-yahoo-data-daily.js --data-dir ${DATA_DIR_ARG} --days 110`,
+        'Yahoo統計 sync', 600000
+      );
+      results.push({ name: 'Yahoo統計 sync', ...yahooDataSyncResult });
+    } else {
+      console.log('[DailySync] Yahoo統計 sync は取込失敗のためスキップ (failed/ を確認、修正後に再投入)');
+    }
+
+    // === au PAYマーケット分析CSV 取込 + mirror sync (mall-csv-fetcher P1-A) ===
+    // 自動DL (aupay-data-download.mjs、fetch-all 05:30) が incoming/aupay-data/ に置いた
+    // CSV/JSONを取り込む。対象0件は正常。--days 110 = 日次35日再取得+月次前月+PM35日をカバー
+    const aupayDataImportResult = runScript(
+      `apps/warehouse/import-aupay-data.js --data-dir ${DATA_DIR_ARG}`,
+      'auPAY分析 取込', 600000
+    );
+    results.push({ name: 'auPAY分析 取込', ...aupayDataImportResult });
+    if (aupayDataImportResult.success) {
+      const aupayDataSyncResult = runScript(
+        `apps/warehouse/sync-aupay-data-daily.js --data-dir ${DATA_DIR_ARG} --days 110`,
+        'auPAY分析 sync', 600000
+      );
+      results.push({ name: 'auPAY分析 sync', ...aupayDataSyncResult });
+    } else {
+      console.log('[DailySync] auPAY分析 sync は取込失敗のためスキップ (failed/ を確認、修正後に再投入)');
+    }
+
+    // === Qoo10 Analytics取込 + mirror sync (mall-csv-fetcher P1-Q R1) ===
+    // 自動DL (qoo10-data-download.mjs、fetch-all 05:30) が incoming/qoo10-data/ に置いた
+    // xlsxを取り込む。対象0件は正常。--days 110 = 月1の90日再取得をカバー
+    const qoo10DataImportResult = runScript(
+      `apps/warehouse/import-qoo10-data.js --data-dir ${DATA_DIR_ARG}`,
+      'Qoo10分析 取込', 600000
+    );
+    results.push({ name: 'Qoo10分析 取込', ...qoo10DataImportResult });
+    if (qoo10DataImportResult.success) {
+      const qoo10DataSyncResult = runScript(
+        `apps/warehouse/sync-qoo10-data-daily.js --data-dir ${DATA_DIR_ARG} --days 110`,
+        'Qoo10分析 sync', 600000
+      );
+      results.push({ name: 'Qoo10分析 sync', ...qoo10DataSyncResult });
+    } else {
+      console.log('[DailySync] Qoo10分析 sync は取込失敗のためスキップ (failed/ を確認、修正後に再投入)');
     }
 
     // === Yahoo finance daily fact (Yahoo Phase 1 Y-3c、Y-1 + Y-2 + Y-3a 統合) ===

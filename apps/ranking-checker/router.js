@@ -303,7 +303,12 @@ router.get('/rakuten-logo.svg', (req, res) => {
 });
 
 router.get('/api/rakuten', async (req, res) => {
-  const query = new URL(req.url, 'http://localhost').search?.slice(1) || '';
+  const url = new URL(req.url, 'http://localhost');
+  // 資格情報はクライアントに渡さず、常にサーバー側で注入する (GET /config 参照)
+  const config = getConfig();
+  url.searchParams.set('applicationId', config.applicationId);
+  url.searchParams.set('accessKey', config.accessKey);
+  const query = url.search?.slice(1) || '';
   try {
     const result = await proxyRequest(RAKUTEN_API_BASE + '?' + query, {
       headers: {
@@ -317,7 +322,9 @@ router.get('/api/rakuten', async (req, res) => {
 });
 
 router.get('/api/yahoo', async (req, res) => {
-  const query = new URL(req.url, 'http://localhost').search?.slice(1) || '';
+  const url = new URL(req.url, 'http://localhost');
+  url.searchParams.set('appid', getConfig().yahooAppId);
+  const query = url.search?.slice(1) || '';
   try {
     const result = await proxyRequest(YAHOO_API_BASE + '?' + query, {
       headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
@@ -562,7 +569,18 @@ function encodeImportRank(v) {
   return -1;
 }
 
-router.get('/config', (req, res) => { res.json(getConfig()); });
+router.get('/config', (req, res) => {
+  // アクセスキー等のシークレットはサーバー内でのみ使用し、UI には返さない。
+  // 楽天の検索呼び出しは /api/rakuten がサーバー側で資格情報を注入する。
+  const c = getConfig();
+  res.json({
+    applicationId: c.applicationId,
+    shopCode: c.shopCode,
+    rakutenConfigured: !!(c.applicationId && c.accessKey),
+    yahooConfigured: !!c.yahooAppId,
+    amazonConfigured: !!(c.amazonAccessKey && c.amazonSecretKey && c.amazonAssociateTag),
+  });
+});
 router.post('/config', (req, res) => { res.json({ ok: true, note: 'Config is managed via environment variables on Render' }); });
 
 router.get('/logs', async (req, res) => {

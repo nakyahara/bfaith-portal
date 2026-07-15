@@ -15,6 +15,7 @@ import rankingRouter from './apps/ranking-checker/router.js';
 import { startScheduler } from './apps/ranking-checker/scheduler.js';
 import { startWarehouseHealthcheck } from './apps/warehouse/healthcheck.js';
 import { startMetrics } from './apps/observability/metrics.js';
+import { startDiskWatch } from './apps/observability/disk-watch.js';
 import { bootStart, bootEnd, bootNote, bootFail, getBootId } from './apps/observability/boot-log.js';
 import profitRouter from './apps/profit-calculator/router.js';
 import { startPriceWorker, startMaintenanceJobs } from './apps/profit-calculator/price-scheduler.js';
@@ -39,6 +40,7 @@ import profitAnalysisRouter from './apps/profit-analysis/router.js';
 import amazonDashboardRouter from './apps/amazon-dashboard/router.js';
 import rakutenAnalyticsRouter from './apps/rakuten-analytics/router.js';
 import yahooAnalyticsRouter from './apps/yahoo-analytics/router.js';
+import aupayAnalyticsRouter from './apps/aupay-analytics/router.js';
 import qoo10AnalyticsRouter from './apps/qoo10-analytics/router.js';
 import bizOpsOverviewRouter from './apps/biz-ops-overview/router.js';
 import productManagementListRouter from './apps/product-management-list/router.js';
@@ -311,8 +313,14 @@ const sessionMiddleware = session({
   secret: SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
+  // rolling: 使っている間はセッションを延長 (maxAge=無操作24時間で失効)。
+  // 従来は「ログインから固定24時間」で、CSV取込の途中など作業の真ん中で session_expired になった
+  // (2026-07-14 発注補助のロジザード取込で実発生)。store.touch (期限UPDATE) は resave:false+touch実装
+  // ストアでは従来から毎リクエスト実行されており、rolling で新たに増えるのは毎応答の Set-Cookie
+  // (ブラウザ側Cookie期限の更新=ストア側期限との一致) のみ
+  rolling: true,
   cookie: {
-    maxAge: 1 * 24 * 60 * 60 * 1000, // 1日間
+    maxAge: 1 * 24 * 60 * 60 * 1000, // 無操作24時間
     httpOnly: true,
     secure: true,
     sameSite: 'lax',
@@ -596,6 +604,15 @@ const apps = [
     description: 'Yahoo!ショッピングの売上・広告・利益・検索順位を統合管理 (タイル速報 + 実質利益 + 広告×利益 + キャンペーン損益)',
     icon: '🛍️',
     path: '/apps/yahoo-analytics',
+    status: 'active',
+    category: 'analysis',
+  },
+  {
+    id: 'aupay-analytics',
+    name: 'auPAY分析ツール',
+    description: 'au PAYマーケットの売上・利益・キャンペーンを統合管理 (タイル速報 + ポイント後利益L2 + 三太郎の日ハイライト + 送料負け診断)',
+    icon: '🧡',
+    path: '/apps/aupay-analytics',
     status: 'active',
     category: 'analysis',
   },
@@ -1004,11 +1021,21 @@ app.use('/apps/mirror/api/sync', mirrorParserErrorHandler);
 //   ・token 提示あり + MIRROR_READ_TOKEN 未設定は 503 (requireReadToken と同じ fail-closed シグナル)、
 //     不一致は 401。warehouse 権限なし session は 403、session も token も無ければ 401。
 //   ・token は header only (query 受理は URL/アクセスログ残留のため禁止。requireReadToken と同方針)。
+//   ・x-sync-key (MIRROR_SYNC_KEY) も許可: miniPC sync-to-render.js が同期後の件数検証で
+//     /api/status を読む (2026-07-07 朝、認証追加でこの読み取りが 401 → 全カウント0の
+//     誤「データ不一致」アラートが発生)。sync key 保持者は write 権限持ち = read は当然許可できる。
 function requireSessionOrReadToken(req, res, next) {
   const sessionAuthed = !!(req.session && req.session.authenticated);
   if (sessionAuthed) {
     const allowed = req.session.allowedApps;
     if (allowed === '*' || (Array.isArray(allowed) && allowed.includes('warehouse'))) return next();
+  }
+  const providedSync = req.headers['x-sync-key'];
+  if (providedSync) {
+    const syncKey = process.env.MIRROR_SYNC_KEY;
+    if (!syncKey) return res.status(503).json({ error: 'mirror_sync_key_unset' });
+    if (providedSync === syncKey) return next();
+    return res.status(401).json({ error: 'invalid_sync_key' });
   }
   const provided = req.headers['x-read-token'];
   if (provided) {
@@ -1093,7 +1120,8 @@ app.use('/apps/fba-profitability', requireAppAccess('fba-profitability'), fbaPro
 app.use('/apps/profit-analysis', requireAppAccess('profit-analysis'), profitAnalysisRouter);
 app.use('/apps/amazon-dashboard', requireAppAccess('amazon-dashboard'), express.json({ limit: '256kb' }), amazonDashboardRouter);
 app.use('/apps/rakuten-analytics', requireAppAccess('rakuten-analytics'), rakutenAnalyticsRouter);
-app.use('/apps/yahoo-analytics', requireAppAccess('yahoo-analytics'), yahooAnalyticsRouter);
+app.use('/apps/yahoo-analytics', requireAppAccess('yahoo-analytics'), express.json({ limit: '256kb' }), yahooAnalyticsRouter);
+app.use('/apps/aupay-analytics', requireAppAccess('aupay-analytics'), aupayAnalyticsRouter);
 app.use('/apps/qoo10-analytics', requireAppAccess('qoo10-analytics'), express.json({ limit: '64kb' }), qoo10AnalyticsRouter);
 // qoo10-analytics の parser error を JSON で返す (画面 fetch が { error } 形式を期待するため。
 // mirrorParserErrorHandler は /apps/mirror 専用なのでここで個別に受ける)
@@ -1287,6 +1315,9 @@ app.listen(PORT, () => {
 
   // event loop lag + heap/rss 観測
   startMetrics();
+
+  // DATA_DIR (Persistent Disk) 使用率観測 — 2026-07-12 disk full 障害の再発防止
+  startDiskWatch(DATA_DIR);
 
   // 価格改定ワーカー — 安全装置未実装のため無効化 (2026-03-30)
   // startPriceWorker();

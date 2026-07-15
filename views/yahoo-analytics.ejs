@@ -101,6 +101,7 @@
       <button class="tab-btn" data-tab="profit">💰 利益分析</button>
       <button class="tab-btn" data-tab="ads">📣 広告</button>
       <button class="tab-btn" data-tab="search">🔍 検索・順位</button>
+      <button class="tab-btn" data-tab="traffic">📈 集客</button>
       <button class="tab-btn" data-tab="campaign">🎪 キャンペーン</button>
       <button class="tab-btn" data-tab="diagnosis">🩺 診断</button>
       <button class="tab-btn" data-tab="import">📥 取込</button>
@@ -111,6 +112,10 @@
       <!-- 🏠 概要 -->
       <div class="tab-pane active" id="pane-overview">
         <div id="ov-unresolved"></div>
+        <div class="chart-card" style="margin-bottom:12px;">
+          <h3>⚡ 本日速報 (時間帯別・統計由来) <span class="pbadge est">統計速報</span> <span class="note" id="flash-note">利益factとは別ソース (朝5:30自動取得時点)。タイルの「今日」が0でもここで当日の動きが見えます</span></h3>
+          <div class="chart-wrap" style="height:180px;"><canvas id="chart-flash"></canvas></div>
+        </div>
         <div id="ov-tiles" class="tile-grid"><div class="loading">読み込み中…</div></div>
         <div class="toolbar">
           <div class="period-switcher" id="ov-period"></div>
@@ -134,7 +139,28 @@
 
       <!-- 🏆 売れ筋 (P3) -->
       <div class="tab-pane" id="pane-bestsellers">
-        <div class="warn-note">準備中 (P3)。実装予定: 売れ筋ランキング (数量/売上/粗利の3軸) / 急上昇・急落 / ABC分析 / カテゴリ別 / 曜日パターン (5のつく日・日曜を自動ハイライト) / 販売速度スパークライン。</div>
+        <div class="toolbar">
+          <div class="period-switcher" id="bs-period"></div>
+          <div class="period-switcher" id="bs-axis">
+            <button data-axis="sales" class="active">売上</button>
+            <button data-axis="units">販売数</button>
+            <button data-axis="margin">粗利</button>
+          </div>
+        </div>
+        <div class="note" id="bs-abc"></div>
+        <div class="charts-grid">
+          <div class="chart-card">
+            <h3>曜日パターン (平均販売数/日) <span class="pbadge flash">速報</span> <span class="note">赤=日曜 (LYPプレミアム系)</span></h3>
+            <div class="chart-wrap" style="height:200px;"><canvas id="chart-weekday"></canvas></div>
+            <div class="note" id="bs-goen"></div>
+          </div>
+          <div class="chart-card">
+            <h3>急上昇 ↗ / 急落 ↘ (前期間比・販売数)</h3>
+            <div id="bs-movers" style="max-height:230px; overflow-y:auto; font-size:12px;"></div>
+          </div>
+        </div>
+        <div class="section-h">売れ筋ランキング <span class="pbadge flash">速報</span> <span class="note" id="bs-note"></span></div>
+        <div class="table-scroll"><table class="data" id="bs-table"></table></div>
       </div>
 
       <!-- 💰 利益分析 (P2) -->
@@ -164,9 +190,21 @@
         <div class="warn-note">準備中 (P6)。実装予定: アイテムリーチ商品別・KW別の広告効率 / PRオプション料率の妥当性診断 / 実効広告率 (アイテムリーチ+PRオプション)÷売上 の損益分岐判定 (🟢余裕/🟡限界/🔴広告赤字) / 未カバー広告費の見える化。<br>データは 📥取込タブ (P5) からのコマースアドマネージャーCSV / PRオプションレポートCSVアップロードで入ります。</div>
       </div>
 
-      <!-- 🔍 検索・順位 (P7-P8) -->
+      <!-- 🔍 検索・順位 (P6: KW分析実装 / 順位トラッキングは別PR) -->
       <div class="tab-pane" id="pane-search">
-        <div class="warn-note">準備中 (P7-P8)。実装予定: 検索流入KW分析 (流入/売上/注文率、検索流入レポートCSV取込) / 自社商品の順位トラッキング (itemSearch API 日次スナップショット、miniPC実行→mirror同期) / 順位×売上×広告の重ね合わせ / 1ページ目占有率。</div>
+        <div class="toolbar"><div class="period-switcher" id="kw-period"></div><span class="note" id="kw-note"></span></div>
+        <div class="note">検索流入KW (ストアクリエイターPro統計、mall-csv-fetcherが毎朝自動取得)。順位トラッキング (itemSearch) は別PRで追加予定。</div>
+        <div class="table-scroll"><table class="data" id="kw-table"></table></div>
+      </div>
+
+      <!-- 📈 集客 (P6) -->
+      <div class="tab-pane" id="pane-traffic">
+        <div class="toolbar"><div class="period-switcher" id="tr-period"></div></div>
+        <div class="charts-grid">
+          <div class="chart-card"><h3>デバイス別売上 (PC/スマホ/アプリ)</h3><div class="chart-wrap"><canvas id="chart-device"></canvas></div></div>
+          <div class="chart-card"><h3>流入 × 購買率 × 離脱率</h3><div class="chart-wrap"><canvas id="chart-inflow"></canvas></div></div>
+          <div class="chart-card" style="grid-column: 1 / -1;"><h3>客層 (性別×年代×新規/リピート、訪問者数)</h3><div class="table-scroll"><table class="data" id="attr-table"></table></div></div>
+        </div>
       </div>
 
       <!-- 🎪 キャンペーン (P9) -->
@@ -174,9 +212,14 @@
         <div class="warn-note">準備中 (P9)。実装予定: キャンペーン損益カレンダー (5のつく日/日曜/ボーナスストア参加日) / 開催日別の売上×ポイント原資×利益のベースライン比較 =「参加して儲かったのか」判定 / 参加損益シミュレーション。</div>
       </div>
 
-      <!-- 🩺 診断 (P9) -->
+      <!-- 🩺 診断 (P6: インサイト基盤 = AI異常検知の土台) -->
       <div class="tab-pane" id="pane-diagnosis">
-        <div class="warn-note">準備中 (P9)。実装予定: 稼ぎ頭 / 赤字SKU / 広告垂れ流し / 順位急落 / 死に筋 / 価格ミス疑い / SKU未解決 / CVR異常 の自動判定リスト。</div>
+        <div class="toolbar">
+          <button class="btn" id="ins-run">🔄 診断を実行</button>
+          <span class="note" id="ins-meta"></span>
+        </div>
+        <div class="note">ルール: 赤字SKU / SKU未解決 / PVあるのに売れない / 販売急落(要因分解) / KW流入急減 / データ鮮度。検出→解消の履歴が自動で残ります (将来AIがこのAPIを読んで修正指示を出す土台)。「無視」は再発しても表示されません (重要度が上がった時のみ再表示)。</div>
+        <div id="ins-list"><div class="loading">「診断を実行」を押してください</div></div>
       </div>
 
       <!-- 📥 取込 (P5) -->
@@ -186,7 +229,22 @@
 
       <!-- ⚙️ 設定 (P3) -->
       <div class="tab-pane" id="pane-settings">
-        <div class="warn-note">準備中 (P3)。実装予定: 料率マスタ (PRオプション料率/ポイント原資%/決済手数料/プロモーションパッケージ料/売上ロイヤリティ — 2026年9月改定対応の改定日付き履歴) / 診断閾値 / GChat通知。</div>
+        <div class="section-h">料率マスタ (改定日付き履歴) <span class="note">実質利益の精緻化・2026年9月改定シミュレーション (将来Phase) の入力になります。未来日の改定予約も登録可</span></div>
+        <div class="table-scroll"><table class="data" id="rate-current"></table></div>
+        <div class="form-grid" style="display:flex; gap:10px; flex-wrap:wrap; align-items:end; margin:12px 0;">
+          <div><label class="note">料率種別</label><br><select id="rate-key"></select></div>
+          <div><label class="note">料率 (%)</label><br><input type="text" id="rate-pct" placeholder="例: 3" style="width:80px; border:1px solid #d1d5db; border-radius:6px; padding:6px 10px;"></div>
+          <div><label class="note">適用開始日</label><br><input type="date" id="rate-from" style="border:1px solid #d1d5db; border-radius:6px; padding:5px 10px;"></div>
+          <div style="flex:1;"><label class="note">メモ</label><br><input type="text" id="rate-memo" placeholder="例: 2026-09改定" style="width:100%; border:1px solid #d1d5db; border-radius:6px; padding:6px 10px;"></div>
+          <div><button class="btn" id="rate-add">追加</button></div>
+        </div>
+        <div class="note" id="rate-status"></div>
+        <div class="section-h">改定履歴</div>
+        <div class="table-scroll"><table class="data" id="rate-history"></table></div>
+
+        <div class="section-h">分析閾値</div>
+        <div style="display:flex; gap:14px; flex-wrap:wrap; align-items:end;" id="settings-form"></div>
+        <div style="margin-top:10px;"><button class="btn" id="settings-save">閾値を保存</button> <span class="note" id="settings-status"></span></div>
       </div>
     </div>
   </div>
@@ -263,7 +321,8 @@ document.getElementById('tabs').addEventListener('click', (e) => {
 function loadTab(tab) {
   if (loaded[tab]) return;
   loaded[tab] = true;
-  ({ overview: loadOverview, profit: loadProfit }[tab] || (() => {}))();
+  ({ overview: loadOverview, profit: loadProfit, bestsellers: loadBestsellers, settings: loadSettings,
+     search: loadSearch, traffic: loadTraffic, diagnosis: loadDiagnosis }[tab] || (() => {}))();
 }
 function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
 
@@ -517,8 +576,305 @@ async function openSkuDialog(sku, preset) {
   }
 }
 
+// ============================================================
+// 🏆 売れ筋 (P3)
+// ============================================================
+let bsPreset = '30d', bsAxis = 'sales';
+async function loadBestsellers() {
+  mountPeriodSwitcher('bs-period', bsPreset, (p) => { bsPreset = p; fetchBestsellers(); });
+  document.getElementById('bs-axis').addEventListener('click', (e) => {
+    const btn = e.target.closest('button'); if (!btn) return;
+    document.querySelectorAll('#bs-axis button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    bsAxis = btn.dataset.axis;
+    fetchBestsellers();
+  });
+  fetchBestsellers();
+}
+function sparkSvg(points) {
+  if (!points || points.length < 2) return '';
+  const max = Math.max(...points.map(p => p.u), 1);
+  const w = 80, h = 22;
+  const step = w / (points.length - 1);
+  const d = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${(i * step).toFixed(1)},${(h - p.u / max * (h - 2) - 1).toFixed(1)}`).join('');
+  return `<svg width="${w}" height="${h}" style="vertical-align:middle;"><path d="${d}" fill="none" stroke="#2563eb" stroke-width="1.5"/></svg>`;
+}
+async function fetchBestsellers() {
+  try {
+    const data = await getJSON(`${API}/bestsellers?preset=${bsPreset}&axis=${bsAxis}`);
+    document.getElementById('bs-note').textContent = `期間 ${data.from}〜${data.to} (前期: ${data.prev_from}〜${data.prev_to}) / 全${data.total_skus} SKU`;
+    const abc = data.abc;
+    document.getElementById('bs-abc').innerHTML =
+      `ABC分析: <span class="pill" style="background:#dbeafe;color:#1e40af;">A ${abc.count.A} SKU (${fmtJPY(abc.revenue.A)})</span> <span class="pill" style="background:#e0e7ff;color:#4338ca;">B ${abc.count.B} SKU (${fmtJPY(abc.revenue.B)})</span> <span class="pill" style="background:#f3f4f6;color:#6b7280;">C ${abc.count.C} SKU (${fmtJPY(abc.revenue.C)})</span> — A群の在庫切れが最優先リスク`;
+
+    const dows = ['日', '月', '火', '水', '木', '金', '土'];
+    mkChart('chart-weekday', {
+      type: 'bar',
+      data: { labels: data.weekday.map(r => dows[r.dow]), datasets: [{ label: '平均販売数/日', data: data.weekday.map(r => r.avg_units), backgroundColor: data.weekday.map(r => r.dow === 0 ? '#fca5a5' : '#93c5fd') }] },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false },
+        tooltip: { callbacks: { footer: (items) => { const r = data.weekday[items[0].dataIndex]; return `平均売上/日: ${fmtJPY(r.avg_sales)}`; } } } } },
+    });
+    const g = data.goen;
+    document.getElementById('bs-goen').innerHTML = g.goen_avg_sales !== null && g.normal_avg_sales !== null
+      ? `🎪 <b>5のつく日</b> (${g.goen_days}日): 平均売上 ${fmtJPY(g.goen_avg_sales)}/日 vs 通常日 ${fmtJPY(g.normal_avg_sales)}/日 → <b class="${g.lift_pct >= 0 ? 'pos' : 'negv'}">${g.lift_pct >= 0 ? '+' : ''}${g.lift_pct}%</b>`
+      : '5のつく日の比較は期間を広げると表示されます';
+
+    const mover = (r, up) => `<div style="display:flex; justify-content:space-between; padding:2px 0; border-bottom:1px dashed #eee;">
+      <span class="name-cell" style="max-width:60%;">${esc(r.yahoo_sku_key)} <span class="note">${esc((r.product_name || '').slice(0, 24))}</span></span>
+      <span class="${up ? 'pos' : 'negv'}" style="font-weight:600;">${up ? '↗' : '↘'} ${r.units_growth_pct}% (${r.prev_units}→${r.units_net})</span></div>`;
+    document.getElementById('bs-movers').innerHTML =
+      (data.risers.slice(0, 10).map(r => mover(r, true)).join('') +
+       data.fallers.slice(0, 10).map(r => mover(r, false)).join('')) || '<div class="note">対象なし</div>';
+
+    const rows = data.ranking.map((r, i) => `<tr>
+      <td class="num">${i + 1}</td>
+      <td><a class="sku-link" data-sku="${esc(r.yahoo_sku_key)}" data-preset="${bsPreset}">${esc(r.yahoo_sku_key)}</a> ${r.abc ? `<span class="pill" style="background:#f3f4f6;">${r.abc}</span>` : ''} ${r.is_new ? '<span class="pill" style="background:#fce7f3;color:#9d174d;">NEW</span>' : ''} ${r.unresolved ? '<span class="pill unres">未解決</span>' : ''}</td>
+      <td class="name-cell" title="${esc(r.product_name)}">${esc(r.product_name)}</td>
+      <td class="num">${r.units_net.toLocaleString()}</td>
+      <td class="num">${r.units_growth_pct === null ? '<span class="pill" style="background:#fce7f3;color:#9d174d;">新規</span>' : `<span class="${r.units_growth_pct >= 0 ? 'pos' : 'negv'}">${r.units_growth_pct}%</span>`}</td>
+      <td class="num">${fmtYen(r.sales_incl)}</td>
+      <td class="num ${signClass(r.variable_margin)}">${fmtYen(r.variable_margin)}</td>
+      <td class="num">${fmtPct(r.margin_pct)}</td>
+      <td class="num">${r.pv === null ? '−' : r.pv.toLocaleString()}</td>
+      <td class="num">${fmtPct(r.cvr_pct)}</td>
+      <td>${sparkSvg(r.spark)}</td>
+    </tr>`).join('');
+    document.getElementById('bs-table').innerHTML = `<thead><tr>
+      <th>#</th><th>Yahoo SKU</th><th>商品名</th><th>販売数</th><th>前期比</th>
+      <th>売上(税込)</th><th>粗利</th><th>粗利率</th><th>PV</th><th>CVR</th><th>推移</th>
+    </tr></thead><tbody>${rows}</tbody>`;
+  } catch (e) {
+    document.getElementById('bs-table').innerHTML = `<tr><td class="warn-note">取得失敗: ${esc(e.message)}</td></tr>`;
+  }
+}
+
+// ============================================================
+// ⚙️ 設定 (P3: 料率マスタ + 分析閾値)
+// ============================================================
+const SETTING_LABELS = {
+  abc_a_pct: 'ABC: A群の売上累積%上限',
+  abc_b_pct: 'ABC: B群の売上累積%上限',
+  new_product_days: '新商品バッジ: 初売上からの日数',
+  movers_min_units: '急上昇/急落の最低販売数 (ノイズ除去)',
+};
+async function loadSettings() {
+  document.getElementById('rate-add').addEventListener('click', addRateFromForm);
+  document.getElementById('settings-save').addEventListener('click', saveThresholds);
+  document.getElementById('rate-history').addEventListener('click', async (e) => {
+    const btn = e.target.closest('button[data-del]'); if (!btn) return;
+    if (!confirm('この料率行を削除しますか?')) return;
+    try {
+      const res = await fetch(`${API}/rates/${btn.dataset.del}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error((await res.json()).error || res.status);
+      renderRates(await res.json());
+    } catch (err) { document.getElementById('rate-status').textContent = '削除失敗: ' + err.message; }
+  });
+  try { renderRates(await getJSON(`${API}/rates`)); } catch (e) { document.getElementById('rate-status').textContent = '料率の取得に失敗: ' + e.message; }
+  try { renderThresholds(await getJSON(`${API}/settings`)); } catch (e) { console.error(e); }
+}
+function renderRates(data) {
+  const sel = document.getElementById('rate-key');
+  sel.innerHTML = Object.entries(data.keys).map(([k, label]) => `<option value="${k}">${esc(label)}</option>`).join('');
+  const upcomingByKey = {};
+  for (const u of data.upcoming) (upcomingByKey[u.rate_key] ||= []).push(u);
+  document.getElementById('rate-current').innerHTML = `<thead><tr><th>料率種別</th><th>現在有効</th><th>適用開始日</th><th>改定予約</th></tr></thead><tbody>` +
+    Object.entries(data.keys).map(([k, label]) => {
+      const c = data.current[k];
+      const up = (upcomingByKey[k] || []).map(u => `${u.effective_from}〜 ${u.rate_pct}%`).join(' / ');
+      return `<tr><td>${esc(label)}</td>
+        <td class="num">${c ? `<b>${c.rate_pct}%</b>` : '<span class="note">未登録</span>'}</td>
+        <td>${c ? esc(c.effective_from) : '−'}</td>
+        <td>${up ? '📅 ' + esc(up) : '−'}</td></tr>`;
+    }).join('') + '</tbody>';
+  document.getElementById('rate-history').innerHTML = `<thead><tr><th>料率種別</th><th>料率</th><th>適用開始日</th><th>メモ</th><th>登録日時</th><th></th></tr></thead><tbody>` +
+    (data.history.length ? data.history.map(r => `<tr>
+      <td>${esc(data.keys[r.rate_key] || r.rate_key)}</td>
+      <td class="num">${r.rate_pct}%</td>
+      <td>${esc(r.effective_from)}</td>
+      <td>${esc(r.memo)}</td>
+      <td class="note">${esc((r.created_at || '').slice(0, 10))}</td>
+      <td><button class="btn secondary" data-del="${r.id}" style="padding:2px 8px;">削除</button></td>
+    </tr>`).join('') : '<tr><td colspan="6" class="note">履歴なし。参考: ストアポイント原資1%必須〜/キャンペーン原資1.5%/プロモーションパッケージ3% (2026-09から2%)/売上ロイヤリティ2.5% (2026-09新設)</td></tr>') + '</tbody>';
+}
+async function addRateFromForm() {
+  const body = {
+    rate_key: document.getElementById('rate-key').value,
+    rate_pct: document.getElementById('rate-pct').value,
+    effective_from: document.getElementById('rate-from').value,
+    memo: document.getElementById('rate-memo').value,
+  };
+  const st = document.getElementById('rate-status');
+  try {
+    const res = await fetch(`${API}/rates`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || res.status);
+    renderRates(json);
+    st.textContent = '✅ 登録しました';
+    document.getElementById('rate-pct').value = ''; document.getElementById('rate-memo').value = '';
+  } catch (e) { st.textContent = '登録失敗: ' + e.message; }
+}
+function renderThresholds(s) {
+  document.getElementById('settings-form').innerHTML = Object.entries(SETTING_LABELS).map(([k, label]) =>
+    `<div><label class="note">${esc(label)}</label><br><input type="text" data-setting="${k}" value="${s[k]}" style="width:90px; border:1px solid #d1d5db; border-radius:6px; padding:6px 10px;"></div>`).join('');
+}
+async function saveThresholds() {
+  const patch = {};
+  document.querySelectorAll('[data-setting]').forEach(el => { patch[el.dataset.setting] = el.value; });
+  const st = document.getElementById('settings-status');
+  try {
+    const res = await fetch(`${API}/settings`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || res.status);
+    renderThresholds(json);
+    st.textContent = '✅ 保存しました';
+  } catch (e) { st.textContent = '保存失敗: ' + e.message; }
+}
+
+// ============================================================
+// ⚡ 本日速報 (flash) — loadOverview から呼ぶ
+// ============================================================
+async function loadFlash() {
+  try {
+    const f = await getJSON(`${API}/flash-latest`);
+    if (!f.date) { document.getElementById('flash-note').textContent = '速報データ未取得 (mall-csv-fetcherの初回取得後に表示されます)'; return; }
+    document.getElementById('flash-note').textContent = `${f.date} 時点 / 累計 ${fmtJPY(f.total_sales)} (利益factとは別ソース・朝5:30取得)`;
+    mkChart('chart-flash', {
+      type: 'bar',
+      data: { labels: f.rows.map(r => r.hour_slot), datasets: [
+        { label: '売上', data: f.rows.map(r => r.sales_yen), backgroundColor: '#fda4af', yAxisID: 'y' },
+        { label: '訪問者', data: f.rows.map(r => r.visitors), type: 'line', borderColor: '#2563eb', pointRadius: 0, yAxisID: 'y1' },
+      ]},
+      options: { responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false },
+        scales: { y: { ticks: { callback: v => fmtJPY(v) } }, y1: { position: 'right', grid: { drawOnChartArea: false } } } },
+    });
+  } catch (e) { console.error(e); }
+}
+
+// ============================================================
+// 🔍 検索KW (P6)
+// ============================================================
+let kwPreset = '7d';
+async function loadSearch() {
+  mountPeriodSwitcher('kw-period', kwPreset, (p) => { kwPreset = p; fetchKeywords(); });
+  fetchKeywords();
+}
+async function fetchKeywords() {
+  try {
+    const data = await getJSON(`${API}/search-keywords?preset=${kwPreset}`);
+    document.getElementById('kw-note').textContent = `${data.from}〜${data.to} (前期比較: ${data.prev_from}〜) / データ最終日: ${data.data_to || '−'}`;
+    const rows = data.rows.map((r, i) => `<tr>
+      <td class="num">${i + 1}</td>
+      <td>${esc(r.keyword)}</td>
+      <td class="num">${r.inflow.toLocaleString()}</td>
+      <td class="num">${r.inflow_growth_pct === null ? '<span class="pill" style="background:#fce7f3;color:#9d174d;">新規</span>' : `<span class="${r.inflow_growth_pct >= 0 ? 'pos' : 'negv'}">${r.inflow_growth_pct}%</span>`}</td>
+      <td class="num">${fmtYen(r.sales)}</td>
+      <td class="num">${r.orders.toLocaleString()}</td>
+      <td class="num">${fmtPct(r.cvr_pct)}</td>
+    </tr>`).join('');
+    document.getElementById('kw-table').innerHTML =
+      '<thead><tr><th>#</th><th>検索キーワード</th><th>流入</th><th>前期比</th><th>売上(税込)</th><th>注文</th><th>転換率</th></tr></thead>' +
+      `<tbody>${rows || '<tr><td colspan="7" class="note">データなし</td></tr>'}</tbody>`;
+  } catch (e) { document.getElementById('kw-table').innerHTML = `<tr><td class="warn-note">取得失敗: ${esc(e.message)}</td></tr>`; }
+}
+
+// ============================================================
+// 📈 集客 (P6)
+// ============================================================
+let trPreset = '30d';
+async function loadTraffic() {
+  mountPeriodSwitcher('tr-period', trPreset, (p) => { trPreset = p; fetchTraffic(); });
+  fetchTraffic();
+}
+async function fetchTraffic() {
+  try {
+    const data = await getJSON(`${API}/acquisition?preset=${trPreset}`);
+    const dates = [...new Set(data.device.map(r => r.date_jst))];
+    const devs = ['pc', 'sp', 'app'];
+    const colors = { pc: '#93c5fd', sp: '#fda4af', app: '#fcd34d' };
+    mkChart('chart-device', {
+      type: 'bar',
+      data: { labels: dates, datasets: devs.map(dv => ({
+        label: { pc: 'PC', sp: 'スマホ', app: 'アプリ' }[dv], stack: 's',
+        data: dates.map(d => data.device.find(r => r.date_jst === d && r.device === dv)?.sales_yen ?? 0),
+        backgroundColor: colors[dv],
+      })) },
+      options: { responsive: true, maintainAspectRatio: false, scales: { x: { stacked: true }, y: { stacked: true, ticks: { callback: v => fmtJPY(v) } } } },
+    });
+    mkChart('chart-inflow', {
+      type: 'bar',
+      data: { labels: data.inflow.map(r => r.date_jst), datasets: [
+        { label: '流入訪問者', data: data.inflow.map(r => r.inflow_visitors), backgroundColor: '#93c5fd', yAxisID: 'y' },
+        { label: '購買率%', data: data.inflow.map(r => r.purchase_ratio_pct), type: 'line', borderColor: '#047857', pointRadius: 0, yAxisID: 'y1' },
+        { label: '離脱率%', data: data.inflow.map(r => r.exit_ratio_pct), type: 'line', borderColor: '#dc2626', pointRadius: 0, yAxisID: 'y1' },
+      ]},
+      options: { responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false },
+        scales: { y: {}, y1: { position: 'right', grid: { drawOnChartArea: false }, ticks: { callback: v => v + '%' } } } },
+    });
+    const totalV = data.user_attr.reduce((s, r) => s + r.visitors, 0) || 1;
+    document.getElementById('attr-table').innerHTML =
+      '<thead><tr><th>性別</th><th>年代</th><th>区分</th><th>訪問者</th><th>構成比</th></tr></thead><tbody>' +
+      data.user_attr.slice(0, 30).map(r => `<tr><td>${esc(r.gender)}</td><td>${esc(r.age_band)}</td><td>${esc(r.buyer_class)}</td>
+        <td class="num">${r.visitors.toLocaleString()}</td><td class="num">${Math.round(r.visitors / totalV * 1000) / 10}%</td></tr>`).join('') + '</tbody>';
+  } catch (e) { console.error(e); }
+}
+
+// ============================================================
+// 🩺 診断 (P6: インサイト基盤)
+// ============================================================
+const SEV_BADGE = { high: '<span class="pill unres">高</span>', warn: '<span class="pill edge">中</span>', info: '<span class="pill" style="background:#f3f4f6;">低</span>' };
+async function loadDiagnosis() {
+  document.getElementById('ins-run').addEventListener('click', async () => {
+    const btn = document.getElementById('ins-run');
+    btn.disabled = true; btn.textContent = '実行中…';
+    try {
+      const res = await fetch(`${API}/insights/run`, { method: 'POST' });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || res.status);
+      renderInsights(json);
+    } catch (e) { document.getElementById('ins-meta').textContent = '実行失敗: ' + e.message; }
+    btn.disabled = false; btn.textContent = '🔄 診断を実行';
+  });
+  try { renderInsights(await getJSON(`${API}/insights`)); } catch (e) { console.error(e); }
+}
+function renderInsights(data) {
+  const lr = data.last_run;
+  document.getElementById('ins-meta').textContent = lr
+    ? `最終実行: ${new Date(lr.started_at).toLocaleString('ja-JP')} (${lr.status}${lr.found_count !== null ? ` / 検出${lr.found_count}・解消${lr.resolved_count}` : ''})`
+    : '未実行';
+  const items = data.insights;
+  if (!items.length) { document.getElementById('ins-list').innerHTML = '<div class="note">未対応のインサイトはありません 🎉</div>'; return; }
+  document.getElementById('ins-list').innerHTML = items.map(x => `
+    <div style="border:1px solid #e5e7eb; border-left:4px solid ${x.severity === 'high' ? '#dc2626' : x.severity === 'warn' ? '#f59e0b' : '#9ca3af'}; border-radius:6px; padding:10px 14px; margin-bottom:8px; ${x.status !== 'open' ? 'opacity:.55;' : ''}">
+      <div style="display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap;">
+        <div>${SEV_BADGE[x.severity] || ''} <b>${esc(x.title)}</b>
+          <div class="note">💡 ${esc(x.suggested_action.label || '')} | ${esc(data.rule_labels[x.rule_key] || x.rule_key)} | 初検出 ${esc((x.first_detected_at || '').slice(0, 10))}${x.status !== 'open' ? ` | 状態: ${esc(x.status)}${x.status_memo ? ' (' + esc(x.status_memo) + ')' : ''}` : ''}</div>
+        </div>
+        <div style="white-space:nowrap;">
+          ${x.status === 'open' ? `
+            <button class="btn secondary ins-act" data-id="${x.occurrence_id}" data-status="done" style="padding:3px 9px;">対応済み</button>
+            <button class="btn secondary ins-act" data-id="${x.occurrence_id}" data-status="dismissed" style="padding:3px 9px;">無視</button>`
+            : `<button class="btn secondary ins-act" data-id="${x.occurrence_id}" data-status="open" style="padding:3px 9px;">戻す</button>`}
+        </div>
+      </div>
+    </div>`).join('');
+}
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest('button.ins-act'); if (!btn) return;
+  const memo = btn.dataset.status === 'dismissed' ? (prompt('無視の理由 (任意、例: 意図的なロスリーダー)') || '') : '';
+  try {
+    const res = await fetch(`${API}/insights/${btn.dataset.id}/status`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: btn.dataset.status, memo }),
+    });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || res.status);
+    renderInsights(json);
+  } catch (err) { document.getElementById('ins-meta').textContent = '更新失敗: ' + err.message; }
+});
+
 // 初期ロード
 loadTab('overview');
+loadFlash();
 </script>
 </body>
 </html>

@@ -13,27 +13,53 @@
  */
 import { Router } from 'express';
 import crypto from 'crypto';
-import { initMirrorDB, getMirrorDB } from './db.js';
+import { initMirrorDB, getMirrorDB, yahooInitError, aupayDataInitError, qoo10DataInitError } from './db.js';
 import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
+import {
+  STORE_BENCH_COLS, STORE_DEVICE_BASE_COLS, STORE_DEVICE_OPT_COLS, CATEGORY_DEMO_COLS,
+} from '../../lib/rakuten-dd-columns.js';
+
+// 楽天データダウンロード7種の列合成 (mall-csv-fetcher P1-R3。miniPC側と共有定義)
+const DD_STORE_ALL_COLS = [...STORE_DEVICE_BASE_COLS, ...STORE_BENCH_COLS, ...STORE_DEVICE_OPT_COLS];
+const DD_CATEGORY_DEMO_COLS = CATEGORY_DEMO_COLS;
 
 const router = Router();
 
 // DB初期化
 let dbReady = false;
+// 初期化失敗の理由。⚠️ここが落ちると mirror 全体が 503 になり、全モールの sync と
+// 分析アプリが停止する (2026-07-12 に実際に発生)。503 応答に原因を載せて自己診断できるようにする
+let initError = null;
 bootStart('mirror-db', 'warehouse-mirror.db');
 (async () => {
-  try {
-    initMirrorDB();
-    dbReady = true;
-    bootEnd('mirror-db', 'warehouse-mirror.db');
-  } catch (e) {
-    bootFail('mirror-db', 'warehouse-mirror.db', e);
-    console.error('[Mirror] DB初期化失敗:', e.message);
+  // ⭐2026-07-12 障害の真因: 初期化はboot時に1回きりで、デプロイ直後の一過性失敗
+  // (旧インスタンスとのpersistent disk同居でのlock等) でも dbReady=false のまま
+  // インスタンスの寿命いっぱい 503 を返し続けた (再デプロイまで復旧しない)。
+  // → リトライで一過性失敗を自己回復させる。恒久失敗なら最終エラーを保持して503+原因
+  const delaysMs = [0, 3000, 10000, 30000, 60000, 120000];
+  for (let attempt = 0; attempt < delaysMs.length; attempt++) {
+    if (delaysMs[attempt] > 0) await new Promise((r) => setTimeout(r, delaysMs[attempt]));
+    try {
+      initMirrorDB();
+      dbReady = true;
+      initError = null;
+      bootEnd('mirror-db', `warehouse-mirror.db (attempt ${attempt + 1})`);
+      return;
+    } catch (e) {
+      initError = {
+        message: String(e.message || e),
+        code: e.code || null,
+        attempt: attempt + 1,
+        at: String(e.stack || '').split('\n').slice(0, 3).join(' | '),
+      };
+      console.error(`[Mirror] DB初期化失敗 (attempt ${attempt + 1}/${delaysMs.length}):`, e.message);
+    }
   }
+  bootFail('mirror-db', 'warehouse-mirror.db', new Error(initError?.message || 'init failed'));
 })();
 
 function ensureDB(req, res, next) {
-  if (!dbReady) return res.status(503).json({ error: 'mirror DB 未初期化' });
+  if (!dbReady) return res.status(503).json({ error: 'mirror DB 未初期化', init_error: initError });
   next();
 }
 
@@ -649,6 +675,368 @@ function getAmazonPriceSnapshotInsert(db) {
   return b.amazonPriceSnapshotInsert;
 }
 
+// 楽天RPP広告費 月次×商品 (mall-csv-fetcher P1)
+function getRakutenAdsRppInsert(db) {
+  const b = getStmtBundle(db);
+  if (!b.rakutenAdsRppInsert) {
+    b.rakutenAdsRppInsert = db.prepare(`
+      INSERT OR REPLACE INTO mirror_rakuten_ads_rpp (
+        date_jst, month_ym, item_manage_number, raw_sku_code,
+        clicks, ad_cost_yen, cpc_actual, ctr_pct, bid_cpc_yen, item_cpc_yen,
+        sales_720h_yen, orders_720h, cvr_720h_pct, roas_720h_pct,
+        sales_12h_yen, orders_12h, sales_720h_new_yen, sales_720h_repeat_yen,
+        source_report_type, report_start, report_end,
+        attribution_window_hours, is_tax_included, imported_at,
+        source_run_id, source_row_hash, synced_at
+      ) VALUES (
+        @date_jst, @month_ym, @item_manage_number, @raw_sku_code,
+        @clicks, @ad_cost_yen, @cpc_actual, @ctr_pct, @bid_cpc_yen, @item_cpc_yen,
+        @sales_720h_yen, @orders_720h, @cvr_720h_pct, @roas_720h_pct,
+        @sales_12h_yen, @orders_12h, @sales_720h_new_yen, @sales_720h_repeat_yen,
+        @source_report_type, @report_start, @report_end,
+        @attribution_window_hours, @is_tax_included, @imported_at,
+        @source_run_id, @source_row_hash, @synced_at
+      )
+    `);
+  }
+  return b.rakutenAdsRppInsert;
+}
+
+// 楽天RPP広告費 日次×キャンペーン合計 (mall-csv-fetcher P1)
+function getRakutenAdsRppDailyInsert(db) {
+  const b = getStmtBundle(db);
+  if (!b.rakutenAdsRppDailyInsert) {
+    b.rakutenAdsRppDailyInsert = db.prepare(`
+      INSERT OR REPLACE INTO mirror_rakuten_ads_rpp_daily (
+        date_jst, campaign_id, campaign_name,
+        clicks, ad_cost_yen, ad_cost_discounted_yen, cpc_actual, ctr_pct,
+        sales_720h_yen, orders_720h, cvr_720h_pct, roas_720h_pct,
+        sales_12h_yen, orders_12h, sales_720h_new_yen, sales_720h_repeat_yen,
+        source_report_type, attribution_window_hours, is_tax_included, imported_at,
+        source_run_id, source_row_hash, synced_at
+      ) VALUES (
+        @date_jst, @campaign_id, @campaign_name,
+        @clicks, @ad_cost_yen, @ad_cost_discounted_yen, @cpc_actual, @ctr_pct,
+        @sales_720h_yen, @orders_720h, @cvr_720h_pct, @roas_720h_pct,
+        @sales_12h_yen, @orders_12h, @sales_720h_new_yen, @sales_720h_repeat_yen,
+        @source_report_type, @attribution_window_hours, @is_tax_included, @imported_at,
+        @source_run_id, @source_row_hash, @synced_at
+      )
+    `);
+  }
+  return b.rakutenAdsRppDailyInsert;
+}
+
+// 楽天データ分析 SKU×日次 (mall-csv-fetcher P1-R2)
+function getRakutenItemDailyInsert(db) {
+  const b = getStmtBundle(db);
+  if (!b.rakutenItemDailyInsert) {
+    b.rakutenItemDailyInsert = db.prepare(`
+      INSERT OR REPLACE INTO mirror_rakuten_item_daily (
+        date_jst, item_manage_number, raw_sku_code,
+        sales_yen, orders, units, access_users, unique_users, cvr_pct, aov_yen,
+        buyers_total, buyers_new, buyers_repeat, nonbuyer_access,
+        review_posts, review_avg, review_total,
+        stay_seconds, bounce_count, exit_count, exit_rate_pct,
+        favorites_added, favorites_total, stock_qty,
+        item_name, genre_path, item_id, catalog_id, item_number,
+        is_tax_included, imported_at,
+        source_run_id, source_row_hash, synced_at
+      ) VALUES (
+        @date_jst, @item_manage_number, @raw_sku_code,
+        @sales_yen, @orders, @units, @access_users, @unique_users, @cvr_pct, @aov_yen,
+        @buyers_total, @buyers_new, @buyers_repeat, @nonbuyer_access,
+        @review_posts, @review_avg, @review_total,
+        @stay_seconds, @bounce_count, @exit_count, @exit_rate_pct,
+        @favorites_added, @favorites_total, @stock_qty,
+        @item_name, @genre_path, @item_id, @catalog_id, @item_number,
+        @is_tax_included, @imported_at,
+        @source_run_id, @source_row_hash, @synced_at
+      )
+    `);
+  }
+  return b.rakutenItemDailyInsert;
+}
+
+// 楽天データ分析 店舗×日次 (mall-csv-fetcher P1-R2)
+function getRakutenStoreDailyInsert(db) {
+  const b = getStmtBundle(db);
+  if (!b.rakutenStoreDailyInsert) {
+    b.rakutenStoreDailyInsert = db.prepare(`
+      INSERT OR REPLACE INTO mirror_rakuten_store_daily (
+        date_jst,
+        sales_all_yen, sales_pc_yen, sales_app_yen, sales_sp_yen,
+        orders_all, orders_pc, orders_app, orders_sp,
+        access_all, access_pc, access_app, access_sp,
+        cvr_all_pct, cvr_pc_pct, cvr_app_pct, cvr_sp_pct,
+        aov_all_yen, aov_pc_yen, aov_app_yen, aov_sp_yen,
+        bench_top10_sales_yen, bench_top10_orders, bench_top10_access, bench_top10_cvr_pct, bench_top10_aov_yen,
+        bench_class_label, bench_class_sales_yen, bench_class_orders, bench_class_access, bench_class_cvr_pct, bench_class_aov_yen,
+        tax_out_yen, shipping_yen, coupon_store_yen, coupon_rakuten_yen,
+        free_ship_coupon_yen, wrapping_yen, settlement_fee_yen,
+        is_tax_included, imported_at,
+        source_run_id, source_row_hash, synced_at
+      ) VALUES (
+        @date_jst,
+        @sales_all_yen, @sales_pc_yen, @sales_app_yen, @sales_sp_yen,
+        @orders_all, @orders_pc, @orders_app, @orders_sp,
+        @access_all, @access_pc, @access_app, @access_sp,
+        @cvr_all_pct, @cvr_pc_pct, @cvr_app_pct, @cvr_sp_pct,
+        @aov_all_yen, @aov_pc_yen, @aov_app_yen, @aov_sp_yen,
+        @bench_top10_sales_yen, @bench_top10_orders, @bench_top10_access, @bench_top10_cvr_pct, @bench_top10_aov_yen,
+        @bench_class_label, @bench_class_sales_yen, @bench_class_orders, @bench_class_access, @bench_class_cvr_pct, @bench_class_aov_yen,
+        @tax_out_yen, @shipping_yen, @coupon_store_yen, @coupon_rakuten_yen,
+        @free_ship_coupon_yen, @wrapping_yen, @settlement_fee_yen,
+        @is_tax_included, @imported_at,
+        @source_run_id, @source_row_hash, @synced_at
+      )
+    `);
+  }
+  return b.rakutenStoreDailyInsert;
+}
+
+// ─── 楽天データダウンロードハブ 7種 (mall-csv-fetcher P1-R3) ───
+// 列定義は lib/rakuten-dd-columns.js を miniPC 側と共有。insert/normalize は宣言から生成
+const RAKUTEN_DD_TABLE_SPECS = {
+  rakuten_store_device_daily: {
+    table: 'mirror_rakuten_store_device_daily',
+    required: ['date_jst', 'device'],
+    cols: ['date_jst', 'device',
+      ...DD_STORE_ALL_COLS,
+      'is_tax_included', 'imported_at'],
+    defaults: { is_tax_included: 1 },
+    validate: (r, HttpErrorCls) => {
+      if (!['all', 'pc', 'app', 'sp'].includes(r.device)) {
+        throw new HttpErrorCls(400, { error: 'bad_row', message: `unknown device: ${r.device}` });
+      }
+    },
+  },
+  rakuten_sku_daily: {
+    table: 'mirror_rakuten_sku_daily',
+    required: ['date_jst', 'sku_key'],
+    cols: ['date_jst', 'sku_key', 'raw_sku_mgmt_number', 'item_manage_number',
+      'sales_yen', 'orders', 'units',
+      'system_sku_number', 'item_number', 'catalog_id', 'item_name',
+      'sku_attr1', 'sku_attr2', 'sku_attr3', 'is_tax_included', 'imported_at'],
+    defaults: { sales_yen: 0, orders: 0, units: 0, is_tax_included: 1 },
+  },
+  rakuten_category_daily: {
+    table: 'mirror_rakuten_category_daily',
+    required: ['date_jst', 'category_key', 'device'],
+    cols: ['date_jst', 'category_key', 'device', 'hierarchy', 'category_name', 'category_url',
+      'access_users', 'unique_users', 'stay_seconds', 'bounce_count', 'exit_count', 'exit_rate_pct',
+      ...DD_CATEGORY_DEMO_COLS, 'imported_at'],
+    defaults: { access_users: 0 },
+    validate: (r, HttpErrorCls) => {
+      if (!['all', 'pc', 'app', 'sp'].includes(r.device)) {
+        throw new HttpErrorCls(400, { error: 'bad_row', message: `unknown device: ${r.device}` });
+      }
+    },
+  },
+  rakuten_campaigns: {
+    table: 'mirror_rakuten_campaigns',
+    required: ['campaign_type', 'campaign_name', 'start_at', 'date_jst'],
+    cols: ['campaign_type', 'campaign_name', 'start_at', 'end_at', 'date_jst', 'imported_at'],
+  },
+  rakuten_purchaser_monthly: {
+    table: 'mirror_rakuten_purchaser_monthly',
+    required: ['date_jst'],
+    cols: ['date_jst', 'new_buyers', 'new_aov_yen', 'new_sales_yen', 'new_orders', 'new_units',
+      'repeat_buyers', 'repeat_aov_yen', 'repeat_sales_yen', 'repeat_orders', 'repeat_units',
+      'is_tax_included', 'imported_at'],
+    defaults: { is_tax_included: 1 },
+    validate: (r, HttpErrorCls) => {
+      if (!/^\d{4}-\d{2}-01$/.test(r.date_jst)) {
+        throw new HttpErrorCls(400, { error: 'bad_row', message: `date_jst must be month start (got ${r.date_jst})` });
+      }
+    },
+  },
+  rakuten_item_purchaser_snapshot: {
+    table: 'mirror_rakuten_item_purchaser_snapshot',
+    required: ['date_jst', 'item_manage_number'],
+    cols: ['date_jst', 'item_manage_number', 'item_name', 'item_url', 'price_yen', 'is_suspended',
+      'new_buyers', 'repeat_buyers', 'repeat_rate_pct', 'window_from', 'window_to', 'imported_at'],
+  },
+  rakuten_genre_purchaser_snapshot: {
+    table: 'mirror_rakuten_genre_purchaser_snapshot',
+    required: ['date_jst', 'genre_name'],
+    cols: ['date_jst', 'genre_name', 'new_buyers', 'repeat_buyers', 'repeat_rate_pct',
+      'new_avg_purchase_yen', 'repeat_avg_purchase_yen', 'avg_purchase_count', 'avg_purchase_yen',
+      'window_from', 'window_to', 'imported_at'],
+  },
+};
+
+// Yahoo!ストクリ統計 6種 (mall-csv-fetcher P1-Y)。楽天dd と同じ宣言生成機構を使う
+const YAHOO_DATA_TABLE_SPECS = {
+  yahoo_store_device_daily: {
+    table: 'mirror_yahoo_store_device_daily',
+    required: ['date_jst', 'device'],
+    cols: ['date_jst', 'device', 'sales_yen', 'pageviews', 'is_tax_included', 'imported_at'],
+    defaults: { is_tax_included: 1 },
+    validate: (r, HttpErrorCls) => {
+      if (!['all', 'pc', 'sp', 'app'].includes(r.device)) {
+        throw new HttpErrorCls(400, { error: 'bad_row', message: `unknown device: ${r.device}` });
+      }
+    },
+  },
+  yahoo_inflow_daily: {
+    table: 'mirror_yahoo_inflow_daily',
+    required: ['date_jst'],
+    cols: ['date_jst', 'inflow_visitors', 'purchase_visitors', 'purchase_ratio_pct',
+      'exit_visitors', 'exit_ratio_pct', 'imported_at'],
+  },
+  yahoo_user_attr_daily: {
+    table: 'mirror_yahoo_user_attr_daily',
+    required: ['date_jst', 'gender', 'age_band', 'buyer_class'],
+    cols: ['date_jst', 'gender', 'age_band', 'buyer_class', 'visitors', 'imported_at'],
+  },
+  yahoo_flash_hourly: {
+    table: 'mirror_yahoo_flash_hourly',
+    required: ['date_jst', 'hour_slot', 'device'],
+    cols: ['date_jst', 'hour_slot', 'device', 'sales_yen', 'orders', 'units', 'buyers',
+      'purchase_rate_pct', 'aov_yen', 'pageviews', 'visitors', 'avg_pages', 'is_tax_included', 'imported_at'],
+    defaults: { is_tax_included: 1 },
+    validate: (r, HttpErrorCls) => {
+      if (!['all', 'pc', 'sp', 'app'].includes(r.device)) {
+        throw new HttpErrorCls(400, { error: 'bad_row', message: `unknown device: ${r.device}` });
+      }
+    },
+  },
+  yahoo_item_daily: {
+    table: 'mirror_yahoo_item_daily',
+    required: ['date_jst', 'item_code'],
+    cols: ['date_jst', 'item_code', 'sub_code', 'raw_item_code', 'item_name',
+      'sales_yen', 'orders', 'units', 'buyers', 'avg_purchase_rate_pct', 'favorites', 'cart_adds',
+      'pv_premium_ship', 'pv_normal', 'visitors', 'category_contribution', 'is_tax_included', 'imported_at'],
+    defaults: { sub_code: '', is_tax_included: 1 },
+  },
+  yahoo_keyword_daily: {
+    table: 'mirror_yahoo_keyword_daily',
+    required: ['date_jst', 'keyword'],
+    cols: ['date_jst', 'keyword', 'rank', 'inflow', 'sales_yen', 'orders', 'units',
+      'avg_order_rate_pct', 'avg_order_aov_yen', 'avg_units_aov_yen', 'is_tax_included', 'imported_at'],
+    defaults: { is_tax_included: 1 },
+  },
+};
+// au PAYマーケット分析 13種 (mall-csv-fetcher P1-A)。楽天dd/Yahoo と同じ宣言生成機構を使う
+const AUPAY_SALES_COLS = ['date_jst', 'segment_code', 'segment_raw', 'sales_yen', 'coupon_store_yen', 'coupon_mall_yen',
+  'point_ponta_au_yen', 'point_used_yen', 'orders', 'units', 'visits', 'buyer_uu', 'visitor_uu', 'pageviews',
+  'cvr_pct', 'avg_units', 'avg_price_yen', 'avg_visits', 'avg_pv',
+  'coupon_store_rate_pct', 'coupon_mall_rate_pct', 'point_rate_pct', 'is_tax_included', 'imported_at'];
+const AUPAY_REFERER_COLS = ['date_jst', 'segment_code', 'segment_raw', 'channel', 'visits', 'visitor_uu',
+  'sales_yen', 'orders', 'units', 'cvr_pct', 'avg_units', 'avg_price_yen', 'is_tax_included', 'imported_at'];
+const AUPAY_SEARCH_COLS = ['date_jst', 'segment_code', 'segment_raw', 'keyword', 'visits', 'visitor_uu', 'imported_at'];
+const AUPAY_PAGE_COLS = ['date_jst', 'page_url', 'pageviews', 'orders', 'via_orders', 'bounce_rate_pct', 'exit_rate_pct', 'imported_at'];
+const AUPAY_PRODUCT_COLS = ['date_jst', 'segment_code', 'segment_raw', 'lot_number', 'product_name', 'category',
+  'sales_yen', 'orders', 'units', 'avg_units', 'avg_price_yen', 'coupon_store_yen', 'coupon_mall_yen',
+  'buyer_uu', 'visits', 'visitor_uu', 'pageviews', 'cvr_visit_pct', 'cvr_uu_pct', 'is_tax_included', 'imported_at'];
+const AUPAY_DATA_TABLE_SPECS = {};
+for (const grain of ['daily', 'monthly']) {
+  AUPAY_DATA_TABLE_SPECS[`aupay_sales_${grain}`] = {
+    table: `mirror_aupay_sales_${grain}`, required: ['date_jst', 'segment_code'],
+    cols: AUPAY_SALES_COLS, defaults: { is_tax_included: 1 },
+  };
+  AUPAY_DATA_TABLE_SPECS[`aupay_referer_${grain}`] = {
+    table: `mirror_aupay_referer_${grain}`, required: ['date_jst', 'segment_code', 'channel'],
+    cols: AUPAY_REFERER_COLS, defaults: { is_tax_included: 1 },
+  };
+  AUPAY_DATA_TABLE_SPECS[`aupay_search_${grain}`] = {
+    table: `mirror_aupay_search_${grain}`, required: ['date_jst', 'segment_code', 'keyword'],
+    cols: AUPAY_SEARCH_COLS,
+  };
+  AUPAY_DATA_TABLE_SPECS[`aupay_page_${grain}`] = {
+    table: `mirror_aupay_page_${grain}`, required: ['date_jst', 'page_url'],
+    cols: AUPAY_PAGE_COLS,
+  };
+  AUPAY_DATA_TABLE_SPECS[`aupay_product_${grain}`] = {
+    table: `mirror_aupay_product_${grain}`, required: ['date_jst', 'segment_code', 'lot_number'],
+    cols: AUPAY_PRODUCT_COLS, defaults: { is_tax_included: 1 },
+  };
+}
+AUPAY_DATA_TABLE_SPECS.aupay_repeat_cohort_monthly = {
+  table: 'mirror_aupay_repeat_cohort_monthly',
+  required: ['date_jst', 'segment_code', 'target_month_jst'],
+  cols: ['date_jst', 'segment_code', 'segment_raw', 'target_month_jst', 'orders', 'imported_at'],
+  validate: (r, HttpErrorCls) => {
+    if (!/^\d{4}-\d{2}-01$/.test(String(r.target_month_jst))) {
+      throw new HttpErrorCls(400, { error: 'bad_row', message: `bad target_month_jst: ${r.target_month_jst}` });
+    }
+  },
+};
+AUPAY_DATA_TABLE_SPECS.aupay_pm_ad_daily = {
+  table: 'mirror_aupay_pm_ad_daily', required: ['date_jst'],
+  cols: ['date_jst', 'impressions', 'clicks', 'ctr_pct', 'cpc_yen', 'gmv_via_ad_yen', 'roas', 'cost_yen',
+    'is_tax_included', 'imported_at'],
+  defaults: { is_tax_included: 1 },
+};
+AUPAY_DATA_TABLE_SPECS.aupay_pm_query_weekly = {
+  table: 'mirror_aupay_pm_query_weekly', required: ['date_jst', 'keyword'],
+  cols: ['date_jst', 'keyword', 'rank', 'impressions', 'clicks', 'ctr_pct', 'imported_at'],
+};
+const AUPAY_DATA_ENTITY_NAMES = new Set(Object.keys(AUPAY_DATA_TABLE_SPECS));
+
+// Qoo10 Analytics 4種 (mall-csv-fetcher P1-Q R1)
+const QOO10_DATA_TABLE_SPECS = {
+  qoo10_traffic_channel_daily: {
+    table: 'mirror_qoo10_traffic_channel_daily',
+    required: ['date_jst', 'channel'],
+    cols: ['date_jst', 'channel', 'pv', 'imported_at'],
+  },
+  qoo10_cvr_daily: {
+    table: 'mirror_qoo10_cvr_daily',
+    required: ['date_jst'],
+    cols: ['date_jst', 'pv_total', 'visitors', 'cart_adds', 'orders', 'cvr_pct', 'channel_pv_diff', 'imported_at'],
+  },
+  qoo10_item_traffic_daily: {
+    table: 'mirror_qoo10_item_traffic_daily',
+    required: ['date_jst', 'item_no', 'channel'],
+    cols: ['date_jst', 'item_no', 'channel', 'pv', 'imported_at'],
+  },
+  qoo10_items: {
+    table: 'mirror_qoo10_items',
+    required: ['item_no'],
+    cols: ['item_no', 'seller_code_raw', 'seller_code', 'item_name', 'brand', 'attr_date_jst', 'imported_at'],
+  },
+};
+const QOO10_DATA_ENTITY_NAMES = new Set(Object.keys(QOO10_DATA_TABLE_SPECS));
+
+// 楽天dd + Yahoo + au PAY分析 + Qoo10 を1つのレジストリに統合 (getRakutenDdInsert/normalizeRakutenDdRow が参照)
+const DD_ALL_TABLE_SPECS = { ...RAKUTEN_DD_TABLE_SPECS, ...YAHOO_DATA_TABLE_SPECS, ...AUPAY_DATA_TABLE_SPECS, ...QOO10_DATA_TABLE_SPECS };
+
+function getRakutenDdInsert(db, entityKey) {
+  const b = getStmtBundle(db);
+  const cacheKey = `ddInsert_${entityKey}`;
+  if (!b[cacheKey]) {
+    const spec = DD_ALL_TABLE_SPECS[entityKey];
+    const cols = [...spec.cols, 'source_run_id', 'source_row_hash', 'synced_at'];
+    b[cacheKey] = db.prepare(`INSERT OR REPLACE INTO ${spec.table}
+      (${cols.join(', ')}) VALUES (${cols.map((c) => '@' + c).join(', ')})`);
+  }
+  return b[cacheKey];
+}
+
+function normalizeRakutenDdRow(entityKey, r) {
+  const spec = DD_ALL_TABLE_SPECS[entityKey];
+  const out = {};
+  for (const k of spec.required) {
+    const v = r[k];
+    if (v === null || v === undefined || String(v).trim() === '') {
+      throw new HttpError(400, { error: 'bad_row', message: `missing required key: ${k}` });
+    }
+  }
+  if (r.date_jst !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(r.date_jst)) {
+    throw new HttpError(400, { error: 'bad_row', message: `bad date_jst: ${r.date_jst}` });
+  }
+  if (spec.validate) spec.validate(r, HttpError);
+  for (const k of spec.cols) {
+    out[k] = r[k] ?? (spec.defaults && k in spec.defaults ? spec.defaults[k] : null);
+  }
+  out.source_run_id = r.source_run_id;
+  out.source_row_hash = r.source_row_hash;
+  out.synced_at = r.synced_at;
+  return out;
+}
+
 // アカウント単位フィー月次 (amazon-dashboard PR-C)
 function getAmazonAccountFeesInsert(db) {
   const b = getStmtBundle(db);
@@ -1138,6 +1526,166 @@ const ENTITY_REGISTRY = {
     getInsertStmt: getAmazonPriceSnapshotInsert,
     normalizeRow: (r) => normalizeAmazonPriceSnapshotRow(r),
   },
+  // 楽天RPP広告費 2 entity (mall-csv-fetcher P1、2026-07-09)
+  // monthly は date_jst=月初日 YYYY-MM-01 を clear キーに使う (account_fees 月次と同方針)
+  rakuten_ads_rpp_monthly: {
+    contract_version: 1,
+    mirror_table: 'mirror_rakuten_ads_rpp',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_rakuten_ads_rpp_months',
+    getInsertStmt: getRakutenAdsRppInsert,
+    normalizeRow: (r) => normalizeRakutenAdsRppRow(r),
+  },
+  rakuten_ads_rpp_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_rakuten_ads_rpp_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_rakuten_ads_rpp_daily_dates',
+    getInsertStmt: getRakutenAdsRppDailyInsert,
+    normalizeRow: (r) => normalizeRakutenAdsRppDailyRow(r),
+  },
+  // 楽天RMSデータ分析 2 entity (mall-csv-fetcher P1-R2、2026-07-10)
+  rakuten_item_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_rakuten_item_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_rakuten_item_daily_dates',
+    getInsertStmt: getRakutenItemDailyInsert,
+    normalizeRow: (r) => normalizeRakutenItemDailyRow(r),
+  },
+  rakuten_store_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_rakuten_store_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_rakuten_store_daily_dates',
+    getInsertStmt: getRakutenStoreDailyInsert,
+    normalizeRow: (r) => normalizeRakutenStoreDailyRow(r),
+  },
+  // 楽天データダウンロードハブ 7 entity (mall-csv-fetcher P1-R3、2026-07-10)
+  rakuten_store_device_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_rakuten_store_device_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_rakuten_store_device_dates',
+    getInsertStmt: (db) => getRakutenDdInsert(db, 'rakuten_store_device_daily'),
+    normalizeRow: (r) => normalizeRakutenDdRow('rakuten_store_device_daily', r),
+  },
+  rakuten_sku_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_rakuten_sku_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_rakuten_sku_daily_dates',
+    getInsertStmt: (db) => getRakutenDdInsert(db, 'rakuten_sku_daily'),
+    normalizeRow: (r) => normalizeRakutenDdRow('rakuten_sku_daily', r),
+  },
+  rakuten_category_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_rakuten_category_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_rakuten_category_dates',
+    getInsertStmt: (db) => getRakutenDdInsert(db, 'rakuten_category_daily'),
+    normalizeRow: (r) => normalizeRakutenDdRow('rakuten_category_daily', r),
+  },
+  rakuten_campaigns: {
+    contract_version: 1,
+    mirror_table: 'mirror_rakuten_campaigns',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_rakuten_campaign_dates',
+    getInsertStmt: (db) => getRakutenDdInsert(db, 'rakuten_campaigns'),
+    normalizeRow: (r) => normalizeRakutenDdRow('rakuten_campaigns', r),
+  },
+  rakuten_purchaser_monthly: {
+    contract_version: 1,
+    mirror_table: 'mirror_rakuten_purchaser_monthly',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_rakuten_purchaser_months',
+    getInsertStmt: (db) => getRakutenDdInsert(db, 'rakuten_purchaser_monthly'),
+    normalizeRow: (r) => normalizeRakutenDdRow('rakuten_purchaser_monthly', r),
+  },
+  rakuten_item_purchaser_snapshot: {
+    contract_version: 1,
+    mirror_table: 'mirror_rakuten_item_purchaser_snapshot',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_rakuten_item_purchaser_dates',
+    getInsertStmt: (db) => getRakutenDdInsert(db, 'rakuten_item_purchaser_snapshot'),
+    normalizeRow: (r) => normalizeRakutenDdRow('rakuten_item_purchaser_snapshot', r),
+  },
+  rakuten_genre_purchaser_snapshot: {
+    contract_version: 1,
+    mirror_table: 'mirror_rakuten_genre_purchaser_snapshot',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_rakuten_genre_purchaser_dates',
+    getInsertStmt: (db) => getRakutenDdInsert(db, 'rakuten_genre_purchaser_snapshot'),
+    normalizeRow: (r) => normalizeRakutenDdRow('rakuten_genre_purchaser_snapshot', r),
+  },
+  // Yahoo!ストクリ統計 6 entity (mall-csv-fetcher P1-Y、2026-07-11)
+  yahoo_store_device_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_yahoo_store_device_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_yahoo_store_device_dates',
+    getInsertStmt: (db) => getRakutenDdInsert(db, 'yahoo_store_device_daily'),
+    normalizeRow: (r) => normalizeRakutenDdRow('yahoo_store_device_daily', r),
+  },
+  yahoo_inflow_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_yahoo_inflow_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_yahoo_inflow_dates',
+    getInsertStmt: (db) => getRakutenDdInsert(db, 'yahoo_inflow_daily'),
+    normalizeRow: (r) => normalizeRakutenDdRow('yahoo_inflow_daily', r),
+  },
+  yahoo_user_attr_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_yahoo_user_attr_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_yahoo_user_attr_dates',
+    getInsertStmt: (db) => getRakutenDdInsert(db, 'yahoo_user_attr_daily'),
+    normalizeRow: (r) => normalizeRakutenDdRow('yahoo_user_attr_daily', r),
+  },
+  yahoo_flash_hourly: {
+    contract_version: 1,
+    mirror_table: 'mirror_yahoo_flash_hourly',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_yahoo_flash_dates',
+    getInsertStmt: (db) => getRakutenDdInsert(db, 'yahoo_flash_hourly'),
+    normalizeRow: (r) => normalizeRakutenDdRow('yahoo_flash_hourly', r),
+  },
+  yahoo_item_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_yahoo_item_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_yahoo_item_dates',
+    getInsertStmt: (db) => getRakutenDdInsert(db, 'yahoo_item_daily'),
+    normalizeRow: (r) => normalizeRakutenDdRow('yahoo_item_daily', r),
+  },
+  yahoo_keyword_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_yahoo_keyword_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_yahoo_keyword_dates',
+    getInsertStmt: (db) => getRakutenDdInsert(db, 'yahoo_keyword_daily'),
+    normalizeRow: (r) => normalizeRakutenDdRow('yahoo_keyword_daily', r),
+  },
+  // Qoo10 Analytics 4 entity (mall-csv-fetcher P1-Q R1、2026-07-14)。qoo10_items=マスタ (no_clear)
+  ...Object.fromEntries(Object.keys(QOO10_DATA_TABLE_SPECS).map((key) => [key, {
+    contract_version: 1,
+    mirror_table: QOO10_DATA_TABLE_SPECS[key].table,
+    clear_strategy: key === 'qoo10_items' ? 'no_clear' : 'date_range',
+    ...(key === 'qoo10_items' ? {} : { clear_meta_key: `clear_${key.replace(/_daily$/, '_dates')}` }),
+    getInsertStmt: (db) => getRakutenDdInsert(db, key),
+    normalizeRow: (r) => normalizeRakutenDdRow(key, r),
+  }])),
+  // au PAYマーケット分析 13 entity (mall-csv-fetcher P1-A、2026-07-13)
+  // 月次 entity は date_jst=月初日を clear キーに使う (rakuten_purchaser_monthly と同方針)
+  ...Object.fromEntries(Object.keys(AUPAY_DATA_TABLE_SPECS).map((key) => [key, {
+    contract_version: 1,
+    mirror_table: AUPAY_DATA_TABLE_SPECS[key].table,
+    clear_strategy: 'date_range',
+    clear_meta_key: `clear_${key.replace(/_daily$/, '_dates').replace(/_monthly$/, '_months').replace(/_weekly$/, '_dates')}`,
+    getInsertStmt: (db) => getRakutenDdInsert(db, key),
+    normalizeRow: (r) => normalizeRakutenDdRow(key, r),
+  }])),
   rakuten_finance_sku_daily: {
     contract_version: 1,
     mirror_table: 'mirror_rakuten_finance_sku_daily',
@@ -1348,6 +1896,18 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
   if (!entityCfg) {
     return res.status(400).json({ error: `unsupported entity: ${entity}` });
   }
+  // Yahoo!表の初期化が fail-soft で失敗している場合、Yahoo entity だけ503 (原因つき)。
+  // 他モールは通常どおり動く (2026-07-12 の全停止障害の再発防御)
+  if (entity.startsWith('yahoo_') && yahooInitError) {
+    return res.status(503).json({ error: 'yahoo tables init failed', init_error: yahooInitError });
+  }
+  // au PAY分析表も同様 (⚠️既存の aupay_finance_sku_daily は fail-soft 対象外なので巻き込まない)
+  if (AUPAY_DATA_ENTITY_NAMES.has(entity) && aupayDataInitError) {
+    return res.status(503).json({ error: 'aupay data tables init failed', init_error: aupayDataInitError });
+  }
+  if (QOO10_DATA_ENTITY_NAMES.has(entity) && qoo10DataInitError) {
+    return res.status(503).json({ error: 'qoo10 data tables init failed', init_error: qoo10DataInitError });
+  }
   if (contract_version !== entityCfg.contract_version) {
     return res.status(400).json({
       error: 'contract_version_mismatch',
@@ -1382,7 +1942,9 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
   //   - 全 MF entity (mf_publish_runs 親 + 6 mart 子) で meta.mf_source_run_id を要求 + ledger 保存
   //   - 子 entity は parent.status='pending_sync' を tx 内で再 check (race 防止)
   //   - finalize 時に ledger.mf_source_run_id == finalize_run_id を cross-check
-  const isMfEntity = clearStrategy === 'no_clear';
+  // ⚠️判定は entity 名 (mf_*) で行う。旧実装の「clear_strategy==='no_clear' ⇒ MF」は
+  // MF以外の no_clear マスタ (linegift_orders / qoo10_items) を誤って400にする (2026-07-14 発覚)
+  const isMfEntity = entity.startsWith('mf_');
   let mfSourceRunIdForLedger = null;
   if (isMfEntity) {
     const mfSourceRunId = meta.mf_source_run_id;
@@ -1967,6 +2529,127 @@ function normalizeAmazonPriceSnapshotRow(r) {
     buybox_price: r.buybox_price ?? null,
     buybox_is_mine: (isMine === 0 || isMine === 1) ? isMine : null,
     fetched_at: r.fetched_at ?? null,
+    source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,
+    synced_at: r.synced_at,
+  };
+}
+
+// row 列正規化 (mirror_rakuten_ads_rpp 用、mall-csv-fetcher P1)
+// 月次 grain: date_jst=月初日 と month_ym の整合を受信側でも保証 (ズレると clear と実 row が食い違う)
+function normalizeRakutenAdsRppRow(r) {
+  const dateJst = requireAdKey(r, 'date_jst');
+  const monthYm = requireAdKey(r, 'month_ym');
+  if (!/^\d{4}-\d{2}-01$/.test(dateJst) || dateJst.slice(0, 7) !== monthYm) {
+    throw new HttpError(400, { error: 'bad_row', message: `date_jst must be month start of month_ym (got date_jst=${dateJst}, month_ym=${monthYm})` });
+  }
+  return {
+    date_jst: dateJst, month_ym: monthYm,
+    // 送信元の正規化漏れによる PK 重複防止 (feedback_sku_case_normalization)
+    item_manage_number: requireAdKey(r, 'item_manage_number').toLowerCase(),
+    raw_sku_code: r.raw_sku_code || '',
+    clicks: r.clicks ?? 0, ad_cost_yen: r.ad_cost_yen ?? 0,
+    cpc_actual: r.cpc_actual ?? null, ctr_pct: r.ctr_pct ?? null,
+    bid_cpc_yen: r.bid_cpc_yen ?? null, item_cpc_yen: r.item_cpc_yen ?? null,
+    sales_720h_yen: r.sales_720h_yen ?? 0, orders_720h: r.orders_720h ?? 0,
+    cvr_720h_pct: r.cvr_720h_pct ?? null, roas_720h_pct: r.roas_720h_pct ?? null,
+    sales_12h_yen: r.sales_12h_yen ?? null, orders_12h: r.orders_12h ?? null,
+    sales_720h_new_yen: r.sales_720h_new_yen ?? null, sales_720h_repeat_yen: r.sales_720h_repeat_yen ?? null,
+    source_report_type: r.source_report_type || 'rpp_product_monthly',
+    report_start: r.report_start ?? null, report_end: r.report_end ?? null,
+    attribution_window_hours: r.attribution_window_hours ?? 720,
+    is_tax_included: r.is_tax_included ?? 1,
+    imported_at: r.imported_at ?? null,
+    source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,
+    synced_at: r.synced_at,
+  };
+}
+
+// row 列正規化 (mirror_rakuten_ads_rpp_daily 用、mall-csv-fetcher P1)
+// campaign_id は「すべての広告」集計だと空文字が正 (requireAdKey は使わない)
+function normalizeRakutenAdsRppDailyRow(r) {
+  return {
+    date_jst: r.date_jst,
+    campaign_id: (r.campaign_id === null || r.campaign_id === undefined) ? '' : String(r.campaign_id).trim(),
+    campaign_name: r.campaign_name || '',
+    clicks: r.clicks ?? 0, ad_cost_yen: r.ad_cost_yen ?? 0,
+    ad_cost_discounted_yen: r.ad_cost_discounted_yen ?? null,
+    cpc_actual: r.cpc_actual ?? null, ctr_pct: r.ctr_pct ?? null,
+    sales_720h_yen: r.sales_720h_yen ?? 0, orders_720h: r.orders_720h ?? 0,
+    cvr_720h_pct: r.cvr_720h_pct ?? null, roas_720h_pct: r.roas_720h_pct ?? null,
+    sales_12h_yen: r.sales_12h_yen ?? null, orders_12h: r.orders_12h ?? null,
+    sales_720h_new_yen: r.sales_720h_new_yen ?? null, sales_720h_repeat_yen: r.sales_720h_repeat_yen ?? null,
+    source_report_type: r.source_report_type || 'rpp_all_daily',
+    attribution_window_hours: r.attribution_window_hours ?? 720,
+    is_tax_included: r.is_tax_included ?? 1,
+    imported_at: r.imported_at ?? null,
+    source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,
+    synced_at: r.synced_at,
+  };
+}
+
+// row 列正規化 (mirror_rakuten_item_daily 用、mall-csv-fetcher P1-R2)
+function normalizeRakutenItemDailyRow(r) {
+  const dateJst = requireAdKey(r, 'date_jst');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateJst)) {
+    throw new HttpError(400, { error: 'bad_row', message: `bad date_jst: ${dateJst}` });
+  }
+  return {
+    date_jst: dateJst,
+    // 送信元の正規化漏れによる PK 重複防止 (feedback_sku_case_normalization)
+    item_manage_number: requireAdKey(r, 'item_manage_number').toLowerCase(),
+    raw_sku_code: r.raw_sku_code || '',
+    sales_yen: r.sales_yen ?? 0, orders: r.orders ?? 0, units: r.units ?? 0,
+    access_users: r.access_users ?? 0, unique_users: r.unique_users ?? null,
+    cvr_pct: r.cvr_pct ?? null, aov_yen: r.aov_yen ?? null,
+    buyers_total: r.buyers_total ?? null, buyers_new: r.buyers_new ?? null,
+    buyers_repeat: r.buyers_repeat ?? null, nonbuyer_access: r.nonbuyer_access ?? null,
+    review_posts: r.review_posts ?? null, review_avg: r.review_avg ?? null, review_total: r.review_total ?? null,
+    stay_seconds: r.stay_seconds ?? null, bounce_count: r.bounce_count ?? null,
+    exit_count: r.exit_count ?? null, exit_rate_pct: r.exit_rate_pct ?? null,
+    favorites_added: r.favorites_added ?? null, favorites_total: r.favorites_total ?? null,
+    stock_qty: r.stock_qty ?? null,
+    item_name: r.item_name ?? null, genre_path: r.genre_path ?? null,
+    item_id: r.item_id ?? null, catalog_id: r.catalog_id ?? null,
+    item_number: r.item_number ?? null,
+    is_tax_included: r.is_tax_included ?? 1,
+    imported_at: r.imported_at ?? null,
+    source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,
+    synced_at: r.synced_at,
+  };
+}
+
+// row 列正規化 (mirror_rakuten_store_daily 用、mall-csv-fetcher P1-R2)
+// ベンチマーク列 (bench_*) は RMS 側が非公開日は空 → null が正
+function normalizeRakutenStoreDailyRow(r) {
+  const dateJst = requireAdKey(r, 'date_jst');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateJst)) {
+    throw new HttpError(400, { error: 'bad_row', message: `bad date_jst: ${dateJst}` });
+  }
+  return {
+    date_jst: dateJst,
+    sales_all_yen: r.sales_all_yen ?? 0, sales_pc_yen: r.sales_pc_yen ?? null,
+    sales_app_yen: r.sales_app_yen ?? null, sales_sp_yen: r.sales_sp_yen ?? null,
+    orders_all: r.orders_all ?? 0, orders_pc: r.orders_pc ?? null,
+    orders_app: r.orders_app ?? null, orders_sp: r.orders_sp ?? null,
+    access_all: r.access_all ?? 0, access_pc: r.access_pc ?? null,
+    access_app: r.access_app ?? null, access_sp: r.access_sp ?? null,
+    cvr_all_pct: r.cvr_all_pct ?? null, cvr_pc_pct: r.cvr_pc_pct ?? null,
+    cvr_app_pct: r.cvr_app_pct ?? null, cvr_sp_pct: r.cvr_sp_pct ?? null,
+    aov_all_yen: r.aov_all_yen ?? null, aov_pc_yen: r.aov_pc_yen ?? null,
+    aov_app_yen: r.aov_app_yen ?? null, aov_sp_yen: r.aov_sp_yen ?? null,
+    bench_top10_sales_yen: r.bench_top10_sales_yen ?? null, bench_top10_orders: r.bench_top10_orders ?? null,
+    bench_top10_access: r.bench_top10_access ?? null, bench_top10_cvr_pct: r.bench_top10_cvr_pct ?? null,
+    bench_top10_aov_yen: r.bench_top10_aov_yen ?? null,
+    bench_class_label: r.bench_class_label ?? null,
+    bench_class_sales_yen: r.bench_class_sales_yen ?? null, bench_class_orders: r.bench_class_orders ?? null,
+    bench_class_access: r.bench_class_access ?? null, bench_class_cvr_pct: r.bench_class_cvr_pct ?? null,
+    bench_class_aov_yen: r.bench_class_aov_yen ?? null,
+    tax_out_yen: r.tax_out_yen ?? null, shipping_yen: r.shipping_yen ?? null,
+    coupon_store_yen: r.coupon_store_yen ?? null, coupon_rakuten_yen: r.coupon_rakuten_yen ?? null,
+    free_ship_coupon_yen: r.free_ship_coupon_yen ?? null, wrapping_yen: r.wrapping_yen ?? null,
+    settlement_fee_yen: r.settlement_fee_yen ?? null,
+    is_tax_included: r.is_tax_included ?? 1,
+    imported_at: r.imported_at ?? null,
     source_run_id: r.source_run_id, source_row_hash: r.source_row_hash,
     synced_at: r.synced_at,
   };
@@ -2720,20 +3403,47 @@ const PML_COLS_OUT = [
   '発注ロット単位','推奨保有月数','売価','原価','想定見込み利益','概算利益率',
   '代表商品コード','ロケーションコード','商品分類タグ','登録日',
 ];
-router.get('/api/pml/published', requirePmlReadToken, (req, res) => {
+// 注残数のアプリ台帳差替 (SSoT化 2026-07-13): 発注はNEに登録しなくなったため、NE由来の注残数は
+// legacy (更新されない古い値が残る)。正本 = purchase-orders 台帳 (v_ledger_backorder_by_product)。
+// 設定 backorder_source='ne' (緊急ロールバック) のときだけ差替しない。
+// po_* 未初期化などで差し替えられない場合は fail-closed (500) — 古いNE値を黙って配らない。
+function substituteLedgerBackorder(db, rows) {
+  const src = (() => {
+    try { return db.prepare("SELECT value FROM po_settings WHERE key='backorder_source'").get()?.value || 'app'; }
+    catch { return 'app'; } // po_settings 不在 (発注アプリ未初期化) は既定 'app' → 下のprepareで失敗して500
+  })();
+  if (src === 'ne') return { rows, source: 'ne_legacy' };
+  const zan = new Map(db.prepare('SELECT product_key, backorder_qty FROM v_ledger_backorder_by_product').all()
+    .map(r => [r.product_key, r.backorder_qty]));
+  return {
+    rows: rows.map(r => ({ ...r, 注残数: zan.get(String(r.商品コード == null ? '' : r.商品コード).trim().toLowerCase()) || 0 })),
+    source: 'app_ledger',
+  };
+}
+router.get('/api/pml/published', requirePmlReadToken, async (req, res) => {
   res.set('Cache-Control', 'no-store');
+  // 正本ビュー (v_ledger_backorder_by_product) は purchase-orders の初期化で作られる。
+  // cold start直後のGASアクセスでビュー未作成500にならないよう初期化を保証 (Codex SSoT-R2 Low)。
+  // ⚠️動的import: 静的importだと相互依存になる (purchase-orders/db.js は本モジュールの隣 db.js を import する)
+  try { (await import('../purchase-orders/db.js')).getDB(); }
+  catch (e) { console.error('[Mirror] purchase-orders 初期化失敗 (注残差替の前提):', e.message); }
   const db = getMirrorDB();
   try {
     const snap = db.transaction(() => {
       const pub = db.prepare('SELECT * FROM mirror_pml_published WHERE id=1').get();
       if (!pub) return { ok: false, reason: 'no_published' };
-      const rows = db.prepare(`SELECT ${PML_COLS_OUT.join(', ')} FROM mirror_pml_snapshot_rows WHERE run_id=? ORDER BY 商品コード`).all(pub.run_id);
-      return { pub, rows };
+      const raw = db.prepare(`SELECT ${PML_COLS_OUT.join(', ')} FROM mirror_pml_snapshot_rows WHERE run_id=? ORDER BY 商品コード`).all(pub.run_id);
+      const { rows, source } = substituteLedgerBackorder(db, raw);
+      return { pub, rows, backorderSource: source };
     })();
     if (snap.ok === false) {
       return res.json({ ok: false, reason: snap.reason, columns: PML_COLS_OUT });
     }
-    const { pub, rows } = snap;
+    const { pub, rows, backorderSource } = snap;
+    // 注残数を差し替えたので checksum も差替後の行で再計算する (GAS は受信行から再計算して一致検証するため。
+    // 算出規約は ingest 側の検証・build-product-management-snapshot.js と同一: 列順固定・null=''・tab/改行)
+    const canonical = rows.map(r => PML_COLS_OUT.map(c => r[c] == null ? '' : String(r[c])).join('\t')).join('\n');
+    const checksum = crypto.createHash('sha256').update(canonical).digest('hex');
     res.json({
       ok: true,
       run_id: pub.run_id,
@@ -2742,7 +3452,9 @@ router.get('/api/pml/published', requirePmlReadToken, (req, res) => {
       generated_at: pub.generated_at,
       published_at: pub.published_at,
       synced_at: pub.synced_at,
-      payload_checksum: pub.payload_checksum,   // GAS は受信行から再計算し一致検証
+      payload_checksum: checksum,               // GAS は受信行から再計算し一致検証 (注残数差替後の値)
+      backorder_source: backorderSource,        // 'app_ledger' = 注残数はアプリ発注台帳 / 'ne_legacy' = ロールバック中
+      ne_payload_checksum: pub.payload_checksum, // 参考: miniPC生成時 (NE注残数) のchecksum
       row_count: pub.row_count,
       actual_row_count: rows.length,
       ne_fba_overlap: pub.ne_fba_overlap,
