@@ -62,6 +62,7 @@ export function ensureQoo10DataTables(db) {
     item_no TEXT PRIMARY KEY,
     seller_code_raw TEXT, seller_code TEXT,
     item_name TEXT, brand TEXT,
+    attr_date_jst TEXT,
     first_seen_at TEXT NOT NULL,
     ${metaCols}
   )`);
@@ -355,14 +356,21 @@ function parseItemSheet(name, ws, hdr) {
       });
     }
     let anyPv = false;
+    let chSum = 0;
     for (const { i, channel } of cols) {
       const pv = pvVal(row.getCell(i), `r${r} ${channel}`) ?? 0;
+      if (!/_全体$/.test(channel)) chSum += pv;
       if (pv > 0) { records.push({ date_jst: d, item_no: itemNo, channel, pv }); anyPv = true; }
     }
     const total = pvVal(row.getCell(totalIdx), `r${r} PV合計`) ?? 0;
     // 合計行は常に格納 (0でも「その日その商品が出現した」ことの記録。sparse検証の基準)
     records.push({ date_jst: d, item_no: itemNo, channel: '(合計)', pv: total });
     if (total === 0 && anyPv) throw new Error(`PV合計0なのにチャネルPVあり (r${r}: ${key})`);
+    // 行検算: チャネル欠落/列誤認の検出 (店舗版と同じ許容 — Codex R2 Medium)
+    const diff = total - chSum;
+    if (diff !== 0 && Math.abs(diff) > Math.max(10, Math.round(total * 0.1))) {
+      throw new Error(`商品行のPV合計とチャネル計の大差 (${key}: 合計${total} vs 計${chSum})。チャネル列欠落の疑い`);
+    }
   }
   if (records.length === 0) return { name, ok: false, type: 'qoo10_item_traffic_daily', error: 'データ行が0件' };
   const ds = [...dates].sort();
@@ -375,7 +383,7 @@ function parseItemSheet(name, ws, hdr) {
   const scope = range
     ? { scopeFrom: range.from, scopeTo: range.to }
     : { scopeFrom: ds[0], scopeTo: ds[ds.length - 1], scopeDatesOnly: ds };
-  const masterRecords = [...items.values()].map(({ _d, ...rest }) => rest);
+  const masterRecords = [...items.values()].map(({ _d, ...rest }) => ({ ...rest, attr_date_jst: _d }));
   return {
     name, ok: true,
     label: `Analytics商品別トラフィック (${ds.length}日×${items.size}商品, sparse ${records.length}行)`,
@@ -404,7 +412,7 @@ const Q_SPECS = {
   },
   qoo10_items: {
     table: 'm_qoo10_items', scopeReplace: false, pk: ['item_no'],
-    cols: ['item_no', 'seller_code_raw', 'seller_code', 'item_name', 'brand'],
+    cols: ['item_no', 'seller_code_raw', 'seller_code', 'item_name', 'brand', 'attr_date_jst'],
   },
 };
 export const QOO10_DATA_TYPES = new Set(Object.keys(Q_SPECS));
@@ -442,7 +450,8 @@ function commitPrep(db, logStmt, p, ctx, extraMsg) {
       ON CONFLICT (item_no) DO UPDATE SET
         ${spec.cols.filter(k => !spec.pk.includes(k)).map(k => `${k}=excluded.${k}`).join(', ')},
         source_file=excluded.source_file, import_id=excluded.import_id,
-        imported_at=excluded.imported_at, updated_at=excluded.updated_at`);
+        imported_at=excluded.imported_at, updated_at=excluded.updated_at
+      WHERE excluded.attr_date_jst >= COALESCE(${spec.table}.attr_date_jst, '')`);
     for (const r of p.records) up.run({ ...r, ...meta });
   }
   const msg = [`scope置換 ${p.scopeFrom}〜${p.scopeTo}${spec.scopeReplace ? ` (旧${replaced}行削除)` : ' (master upsert)'}`, ...(extraMsg || [])]
@@ -462,9 +471,12 @@ export async function importQoo10File(db, { name, buffer, sha256, source = 'inco
     } catch (e) { console.error(`[qoo10-data-import] ログ記録失敗: ${e.message}`); }
   };
 
-  const logicalDate = dateFromFileName(name);
-  const dup = logicalDate
-    ? db.prepare(`SELECT id FROM raw_qoo10_data_import_log WHERE file_sha256 = ? AND status = 'ok' AND date_from = ? LIMIT 1`).get(sha256, logicalDate)
+  // 冪等キー: sha256 + 要求期間 (from AND to)。sparse商品版は「同一内容で期間だけ広い」再取得が
+  // あり得る (7/1-14 と 7/1-31 が同一SHA) ため、date_from だけだと後者が duplicate 扱いになり
+  // 広がった期間の scope 置換がスキップされる (Codex R2 High)
+  const range = rangeFromFileName(name);
+  const dup = range
+    ? db.prepare(`SELECT id FROM raw_qoo10_data_import_log WHERE file_sha256 = ? AND status = 'ok' AND date_from = ? AND date_to = ? LIMIT 1`).get(sha256, range.from, range.to)
     : db.prepare(`SELECT id FROM raw_qoo10_data_import_log WHERE file_sha256 = ? AND status = 'ok' LIMIT 1`).get(sha256);
   if (dup) {
     logOutcome('duplicate', `同一内容のファイルを取込済み (import log id=${dup.id})`);
