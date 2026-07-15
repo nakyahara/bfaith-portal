@@ -4233,6 +4233,7 @@ router.get('/inbound', (req, res) => {
       <div id="inbResult" class="pill-row"></div>
     </div>
     <div id="conflictArea"></div>
+    <div id="tallyArea"></div>
     <div class="hint" style="margin:6px 0 10px">📅 入荷予定の作成 (出荷明細メール→ロジザード貼り付け) は <a href="/apps/purchase-orders/inbound-plan">「入荷予定」タブ</a> に移動しました</div>
 
     <h2 class="page" style="font-size:15px;display:flex;align-items:center;gap:12px">未割当の入庫 <span class="muted" id="openCount"></span>
@@ -4284,6 +4285,30 @@ function render() {
     });
     ca.innerHTML = ch + '</table></div>';
   } else ca.innerHTML = '';
+
+  // 網羅性サマリ (中原さん 2026-07-15: 割当漏れ・注残漏れを絶対に避けたい)。
+  // 取り込んだ良品数が「割当 + 対象外 + 未処理」に必ず分解され、未処理が0なら取りこぼしなし
+  var ta = document.getElementById('tallyArea');
+  var t = INB.totals || null;
+  if (t && t.totalGood > 0) {
+    var pieces = '✅ 割当済 ' + t.allocated.toLocaleString('ja-JP') +
+      ' ＋ 🚫 対象外 ' + t.ignored.toLocaleString('ja-JP') +
+      ' ＋ ⏳ 未処理 ' + t.unprocessed.toLocaleString('ja-JP') +
+      ' ＝ 入荷 ' + t.totalGood.toLocaleString('ja-JP') + ' 個';
+    if (!t.balanced) {
+      ta.innerHTML = '<div class="warn">🛑 <b>入荷数の内訳が合いません</b> (' + pieces + ')。データ不整合の可能性があります。開発に連絡してください</div>';
+    } else if (t.unprocessed > 0) {
+      ta.innerHTML = '<div class="warn" style="background:#fffbeb;border-color:#f59e0b;color:#92400e">' +
+        '⏳ <b>未処理の入荷が ' + t.unprocessedLines + '明細 / ' + t.unprocessed.toLocaleString('ja-JP') + '個</b> あります。' +
+        '「⚡ 一括割当」で古い発注から自動で消し込めます (注残に無い/超過分は対象外に回ります)。<br>' +
+        '<span style="font-weight:400;font-size:12px">内訳: ' + pieces + '</span>' +
+        (t.conflictLines ? '<br><span style="font-weight:400;font-size:12px">※ ほかに訂正競合 ' + t.conflictLines + '明細 (上の🚨で対応)</span>' : '') + '</div>';
+    } else {
+      ta.innerHTML = '<div class="sec" style="padding:8px 12px;margin:6px 0;background:#f0fdf4;border-color:#86ef4c">' +
+        '✅ <b>取りこぼしなし</b> — 入荷 ' + t.totalGood.toLocaleString('ja-JP') + '個はすべて処理済み (' + pieces + ')' +
+        (t.conflictLines ? ' <span class="muted">※訂正競合 ' + t.conflictLines + '明細は別途対応</span>' : '') + '</div>';
+    }
+  } else ta.innerHTML = '';
 
   document.getElementById('openCount').textContent = '(' + INB.open.length + '件)';
   if (!INB.open.length) {

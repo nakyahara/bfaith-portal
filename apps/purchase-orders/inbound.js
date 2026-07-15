@@ -309,23 +309,36 @@ export function listInbound() {
     FROM po_inbound_items i JOIN po_inbound_receipts r ON r.id = i.receipt_id
     ORDER BY r.receipt_date IS NULL, r.receipt_date DESC, r.source_key DESC, i.id`).all();
   const open = [], ignored = [], conflicts = [];
+  // 網羅性の保存則 (中原さん要望 2026-07-15: 割当漏れ・注残漏れを絶対に避けたい)。
+  // 非superseded入庫の良品数は必ず「割当済み + 対象外 + 未処理」に分解でき、合計は常に一致する:
+  //   goodQty = allocated + capacity。capacity は 対象外行→ignored / それ以外→unprocessed に計上。
+  // unprocessed>0 は「まだ消込も対象外もしていない入荷」= 一括割当で0にすべき残り。
+  const totals = { totalGood: 0, allocated: 0, ignored: 0, unprocessed: 0, unprocessedLines: 0,
+    conflictLines: 0, conflictAllocated: 0 };
   for (const i of items) {
     const allocated = alloc.get(i.id) || 0;
+    const capacity = Math.max(0, i.good_qty - allocated);
     const row = {
       id: i.id, slip: i.slip, receiptDate: i.receipt_date, supplierCode: i.supplier_code,
       productCode: i.product_code, productKey: i.product_key,
       productName: nameByKey.get(i.product_key) || '',
       goodQty: i.good_qty, defectiveQty: i.defective_qty, unitCost: i.unit_cost,
-      allocated, remainingCapacity: Math.max(0, i.good_qty - allocated),
+      allocated, remainingCapacity: capacity,
     };
     if (i.superseded) {
-      if (allocated > 0) conflicts.push({ ...row, kind: 'superseded_with_alloc' });
-      continue; // 割当なしのsupersededは表示しない (訂正で消えた行)
+      // 訂正で消えた行。割当が残っていれば競合 (別枠で警告)。網羅性の分母には入れない
+      if (allocated > 0) { conflicts.push({ ...row, kind: 'superseded_with_alloc' }); totals.conflictLines++; totals.conflictAllocated += allocated; }
+      continue;
     }
-    if (i.ignored) { ignored.push(row); continue; }
-    if (row.remainingCapacity > 0) open.push(row);
+    totals.totalGood += i.good_qty;
+    totals.allocated += allocated;
+    if (i.ignored) { totals.ignored += capacity; ignored.push(row); continue; }
+    if (capacity > 0) { totals.unprocessed += capacity; totals.unprocessedLines++; open.push(row); }
+    // capacity===0 かつ 非対象外 = 完全割当済み (allocated に計上済み)
   }
-  return { open, ignored, conflicts };
+  // 保存則が破れていたら壊れている (通常あり得ない)。UI/監視が気付けるようフラグ化
+  totals.balanced = (totals.allocated + totals.ignored + totals.unprocessed) === totals.totalGood;
+  return { open, ignored, conflicts, totals };
 }
 
 /**

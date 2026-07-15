@@ -3075,6 +3075,41 @@ console.log('── 入庫取込プレビュー+一括割当 ──');
   ok(db.prepare(`SELECT remaining_qty FROM v_po_item_balance b JOIN po_order_items i ON i.id=b.order_item_id WHERE i.product_key='aa-batch-item'`).get().remaining_qty === 8,
     'バッチ細工: 拒否時は減数もロールバック (PO残8のまま)');
 
+  // ── 網羅性の保存則 (中原さん 2026-07-15: 割当漏れ・注残漏れを絶対に避けたい) ──
+  // 入荷良品数 = 割当済み + 対象外 + 未処理 が常に一致し、一括割当後は未処理0
+  r = await j('/api/inbound');
+  ok(r.body.totals && r.body.totals.balanced === true, 'tally: 保存則が常に成立 (割当+対象外+未処理=入荷)', r.body.totals);
+  ok(r.body.totals.allocated + r.body.totals.ignored + r.body.totals.unprocessed === r.body.totals.totalGood,
+    'tally: 数式が実際に一致', r.body.totals);
+  ok(r.body.totals.unprocessed === r.body.open.reduce((s, x) => s + x.remainingCapacity, 0),
+    'tally: 未処理数量=未割当一覧の残容量合計', r.body.totals.unprocessed);
+  // クリーンな1商品で「取込→未処理→一括割当→未処理0」を検証
+  insRow.run('aa-tally-item', '網羅性テスト商品', '0001', '取扱中', 2, 0, 0, 0, 0, 10, 1.5, 400, 200, '2026-07-01', '2026-01-01');
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'aa-tally-item', qty: 6 }] }) });
+  r = await j('/api/inbound');
+  const preUnproc = r.body.totals.unprocessed;
+  r = await up2('am.csv', [HDR2,
+    ['AM980', 'aa-tally-item', 'x', '0001', '200', '6', '0', '2026/07/15'],   // 注残6ぴったり
+    ['AM981', 'aa-tally-item', 'x', '0001', '200', '3', '0', '2026/07/15'],   // 超過3 (先行6で注残消込済み)
+    ['AM982', 'aa-nopo-tally', 'x', '0001', '200', '4', '0', '2026/07/15']]); // 未発注 (注残なし)
+  db.prepare("UPDATE mirror_pml_snapshot_rows SET 商品名='未発注網羅性' WHERE 商品コード='aa-nopo-tally'").run();
+  r = await j('/api/inbound');
+  ok(r.body.totals.unprocessed === preUnproc + 13 && r.body.totals.balanced,
+    'tally: 取込直後は入荷13が全て未処理に積まれる', r.body.totals.unprocessed - preUnproc);
+  r = await j('/api/inbound/auto-assign/preview');
+  const tProps = r.body.proposals.filter(p => ['AM980', 'AM981'].includes(p.slip));
+  const tIgn = (r.body.autoIgnores || []).filter(x => ['AM981', 'AM982'].includes(x.slip));
+  r = await jpA('/api/inbound/auto-assign', {
+    assignments: tProps.map(p => ({ inboundItemId: p.inboundItemId, orderItemId: p.orderItemId, qty: p.qty, excess: p.excessQty > 0 ? true : undefined })),
+    ignores: tIgn.map(x => ({ inboundItemId: x.inboundItemId })),
+  }, 'aa-tally-1');
+  ok(r.body.ok, 'tally: 一括割当を実行', r.body);
+  r = await j('/api/inbound');
+  ok(r.body.totals.unprocessed === preUnproc && r.body.totals.balanced,
+    'tally: 一括割当後は未処理が取込前の水準に戻る (この商品群は取りこぼしゼロ)', r.body.totals.unprocessed - preUnproc);
+  ok(!r.body.open.some(x => ['AM980', 'AM981', 'AM982'].includes(x.slip)), 'tally: 全行が処理し切られ未割当一覧に残らない');
+
   // ── 📜 取込履歴 (いつ・何を・何個) ──
   r = await j('/api/inbound/batches');
   ok(r.body.ok && r.body.batches.length >= 1, 'batches: 一覧が返る', r.body.batches && r.body.batches.length);
@@ -3093,6 +3128,7 @@ console.log('── 入庫取込プレビュー+一括割当 ──');
     '/inbound プレビュー+一括割当UI配信');
   ok(inbHtml4.includes('あとで決める'), '/inbound 一括割当に📌あとで決める選択肢');
   ok(inbHtml4.includes('取込履歴') && inbHtml4.includes('data-histbatch'), '/inbound 📜取込履歴UI配信');
+  ok(inbHtml4.includes('tallyArea') && inbHtml4.includes('取りこぼし'), '/inbound 網羅性サマリUI配信');
 }
 
 // ═══ 全ページのインラインJS構文チェック (サーバtemplate literal内クライアントJSの括弧崩れ等を機械検出) ═══
