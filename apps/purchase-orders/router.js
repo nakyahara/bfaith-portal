@@ -666,11 +666,15 @@ router.get('/api/backorders', (req, res) => {
 router.get('/api/backorders/supplier-csv', (req, res) => {
   try {
     const code = normSupplierCode(String(req.query.supplier || ''));
-    if (!code) return res.status(400).json({ ok: false, error: 'supplier (仕入先コード) を指定してください' });
+    if (!code || code.length > 32) return res.status(400).json({ ok: false, error: 'supplier (仕入先コード) を指定してください' });
+    // 実在確認を先に (任意文字列で全件集計を走らせない、Codex R1 Low)。発注はマスタ登録済み仕入先しか作れない
+    const supRow = getDB().prepare('SELECT name FROM po_suppliers WHERE supplier_code=?').get(code);
+    if (!supRow) return res.status(404).json({ ok: false, error: 'この仕入先はマスタに登録されていません' });
     const orders = listBackorders().orders
       .filter(o => o.open && o.supplierCode === code)
       .sort((a, b) => String(a.issuedAt).localeCompare(String(b.issuedAt)) || a.id - b.id);
-    const supplierName = orders.length ? orders[0].supplierName : '';
+    // 仕入先名はマスタの現在名 (POスナップショット名は改名をまたぐと新旧混在し得る、Codex R1 Low)
+    const supplierName = supRow.name || (orders.length ? orders[orders.length - 1].supplierName : code);
     const tot = { qty: 0, received: 0, shortage: 0, cancelled: 0, remaining: 0 };
     const lines = [];
     for (const o of orders) {
@@ -5143,7 +5147,16 @@ var SUP_SEL = null; // 🏭 仕入先別ビューで選択中の仕入先コー�
 var REASONS = { supplier_shortage: '仕入先都合 (作れない)', own_decision: '自社判断', cutoff: '打切', other: 'その他', correction: '訂正' };
 var EVLABEL = { receipt: '📥入荷', shortage: '➖減数', cancel: '🚫取消', reversal: '↩逆仕訳' };
 
-function fmtD(s) { return s ? String(s).slice(0, 10) : '—'; }
+// 日付表示: 素の日付 (YYYY-MM-DD) はそのまま、ISO時刻つき (issuedAt等のUTC) はJSTの日付に変換
+// (UTC素通しslice(0,10)だとJST 0〜9時の発注が前日に見える。CSVのfmtJstと同じ日付になる、Codex R1 Medium)
+function fmtD(s) {
+  if (!s) return '—';
+  s = String(s);
+  if (s.length <= 10) return s;
+  var t = Date.parse(s);
+  if (isNaN(t)) return s.slice(0, 10);
+  return new Date(t + 9 * 3600 * 1000).toISOString().slice(0, 10);
+}
 function newIdemKey() { return (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : 'k' + Date.now() + '-' + Math.random().toString(36).slice(2); }
 function jsonOrErr(r, isWrite) {
   // 非JSON応答 (proxy 502等) でも状況を正しく伝える (書込=成否不明 / 取得=単なる失敗)
@@ -5460,13 +5473,14 @@ function renderBulkResult(batch, results) {
 // ── 🏭 仕入先別注残 (仕入先一覧 → 明細フラット一覧 (発注日の古い順) + 注残確認CSV。中原さん要望 2026-07-15) ──
 // NEの注残検索画面 (仕入先→伝票明細一覧) の代替。CSVは仕入先に「今の注残の認識が合っているか」を確認してもらう用
 function supGroups() {
-  var m = {};
+  // Object.create(null): 仕入先コードが __proto__ 等でも継承プロパティを拾わない (Codex R1 Medium)
+  var m = Object.create(null);
   (DATA ? DATA.orders : []).forEach(function(o) {
     if (!o.open) return;
     o.items.forEach(function(i) {
       if (i.remaining_qty <= 0) return;
       var g = m[o.supplierCode];
-      if (!g) g = m[o.supplierCode] = { code: o.supplierCode, name: o.supplierName, poIds: {}, skus: {}, remaining: 0, amount: 0, unknownCost: 0, overdue: 0, rows: [] };
+      if (!g) g = m[o.supplierCode] = { code: o.supplierCode, name: o.supplierName, poIds: Object.create(null), skus: Object.create(null), remaining: 0, amount: 0, unknownCost: 0, overdue: 0, rows: [] };
       g.poIds[o.id] = true;
       g.skus[i.product_code.toLowerCase()] = true;
       g.remaining += i.remaining_qty;

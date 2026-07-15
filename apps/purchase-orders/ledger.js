@@ -448,8 +448,11 @@ export function listBackorders() {
   const orders = db.prepare(`
     SELECT id, supplier_code, supplier_name, po_number, note, requested_date, issued_at, closed_at, origin, send_blocked, parent_order_id, ne_slip_number
     FROM po_orders WHERE status='issued' AND issued_at >= ? ORDER BY (closed_at IS NULL) DESC, issued_at DESC`).all(boundary);
-  // 先方管理番号 (対応表)。仕入先別ビュー・注残確認CSVで表示する (仕入先は自社コードではなく自分の管理番号で突合するため)
-  const vendorCodeOf = new Map(db.prepare('SELECT supplier_code, product_key, vendor_code FROM po_vendor_code_map').all()
+  // 先方管理番号 (対応表)。仕入先別ビュー・注残確認CSVで表示する (仕入先は自社コードではなく自分の管理番号で突合するため)。
+  // tracked POに現れる仕入先分だけ読む (対応表全件prefetchの固定コストを避ける、Codex R1 Low)
+  const vendorCodeOf = new Map(db.prepare(`
+    SELECT supplier_code, product_key, vendor_code FROM po_vendor_code_map
+    WHERE supplier_code IN (SELECT DISTINCT supplier_code FROM po_orders WHERE status='issued' AND issued_at >= ?)`).all(boundary)
     .map(r => [`${r.supplier_code}|${r.product_key}`, r.vendor_code]));
   // 追加発注 (supplement) の親→子対応 (親POの行に「追加あり」を表示する用)
   const supByParent = new Map();
