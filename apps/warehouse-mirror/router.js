@@ -995,7 +995,7 @@ const QOO10_DATA_TABLE_SPECS = {
   qoo10_items: {
     table: 'mirror_qoo10_items',
     required: ['item_no'],
-    cols: ['item_no', 'seller_code_raw', 'seller_code', 'item_name', 'brand', 'imported_at'],
+    cols: ['item_no', 'seller_code_raw', 'seller_code', 'item_name', 'brand', 'attr_date_jst', 'imported_at'],
   },
 };
 const QOO10_DATA_ENTITY_NAMES = new Set(Object.keys(QOO10_DATA_TABLE_SPECS));

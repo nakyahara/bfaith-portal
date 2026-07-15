@@ -985,6 +985,7 @@ function createTables() {
     db.exec(`CREATE TABLE IF NOT EXISTS mirror_qoo10_items (
       item_no TEXT PRIMARY KEY CHECK(trim(item_no) <> ''),
       seller_code_raw TEXT, seller_code TEXT, item_name TEXT, brand TEXT,
+      attr_date_jst TEXT,
       imported_at TEXT,
       source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL
     )`);
