@@ -3056,6 +3056,24 @@ console.log('── 入庫取込プレビュー+一括割当 ──');
   ok(r.status === 400, 'auto-ignore: 割当と対象外の重複指定は拒否');
   r = await jpA('/api/inbound/auto-assign', { assignments: [], ignores: [] }, 'aa-ig-empty');
   ok(r.status === 400, 'auto-ignore: 空リクエストは400');
+  // バッチ全体の細工遮断 (Codex ig-R4 High): 一部の行だけ割当+keepQty減数でPO残を消し、
+  // 残りの行を「候補なし」に見せて対象外化する攻撃 → 対象外はtxn開始時の正直な計画で分類された行のみ
+  insRow.run('aa-batch-item', 'バッチ細工テスト', '0001', '取扱中', 2, 0, 0, 0, 0, 10, 1.5, 400, 200, '2026-07-01', '2026-01-01');
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'aa-batch-item', qty: 8 }] }) });
+  r = await up2('al.csv', [HDR2,
+    ['AL970', 'aa-batch-item', 'x', '0001', '200', '4', '0', '2026/07/15'],
+    ['AL971', 'aa-batch-item', 'x', '0001', '200', '4', '0', '2026/07/15']]);
+  r = await j('/api/inbound/auto-assign/preview');
+  const bAtk = r.body.proposals.filter(x => ['AL970', 'AL971'].includes(x.slip));
+  ok(bAtk.length === 2, 'バッチ細工: 正直な計画では2行とも割当 (対象外候補なし)');
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: bAtk[0].inboundItemId, orderItemId: bAtk[0].orderItemId, qty: 4, remainder: { keepQty: 0 } },
+  ], ignores: [{ inboundItemId: bAtk[1].inboundItemId }] }, 'aa-batch-atk');
+  ok(r.status === 400 && r.body.error.includes('対象外になりません'),
+    'バッチ細工: keepQty減数で候補を消してからの対象外化は拒否 (全ロールバック)', r.body.error);
+  ok(db.prepare(`SELECT remaining_qty FROM v_po_item_balance b JOIN po_order_items i ON i.id=b.order_item_id WHERE i.product_key='aa-batch-item'`).get().remaining_qty === 8,
+    'バッチ細工: 拒否時は減数もロールバック (PO残8のまま)');
 
   // ── 📜 取込履歴 (いつ・何を・何個) ──
   r = await j('/api/inbound/batches');

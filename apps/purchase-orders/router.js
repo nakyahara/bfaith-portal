@@ -878,11 +878,16 @@ router.post('/api/inbound/auto-assign', (req, res) => {
         nextActionDate: a.remainder.nextActionDate || null,
       } : null,
     }));
-    // 同一PO明細への複数割当は「最後の行」だけが残数の扱いを設定する (途中行の設定は上書きされるだけなので受けない)
+    // 同一PO明細への複数割当は「最後の割当」だけが残数の扱いを設定する (途中の設定は上書きされるだけなので受けない)
     const lastIdxByItem = new Map();
     assignments.forEach((a, idx) => lastIdxByItem.set(Number(a && a.orderItemId), idx));
     const ignoreSet = new Set(ignoreIds);
     const run = () => db.transaction(() => {
+      // 対象外にできる行を「書込み前の状態」でサーバが導出して固定する (Codex ig-R4 High:
+      // 別行の割当や keepQty 減数で候補を消してから対象外にする細工は、txn開始時点の正直な
+      // FIFO計画で対象外に分類される行 (未発注分の入庫/計画上の全量超過) 以外を弾くことで遮断)。
+      // 割当側は行単位のFIFO計画照合 (下) が守る — 割当されなかった行は未処理のまま画面に残るだけで隠れない
+      const ignorableAtStart = new Set(autoAssignPreview().autoIgnores.map(x => x.inboundItemId));
       const results = [];
       // 行ごとのFIFO割当計画: 行の初回エントリで candidatesFor から再導出し、クライアントの指定が
       // 「古い発注から順・数量も一致」で計画どおりかを1エントリずつ照合する (クライアント提案は信用しない)。
@@ -896,13 +901,13 @@ router.post('/api/inbound/auto-assign', (req, res) => {
         let rp = rowPlans.get(iid);
         if (!rp) {
           if (ignoreSet.has(iid)) throw new Error(`同じ入庫明細が割当と対象外の両方に指定されています (${iid})`);
-          const inbound = db.prepare(`
+          const inboundRow = db.prepare(`
             SELECT i.id, i.good_qty, i.superseded, r.receipt_date, r.source_key AS slip, i.product_code,
                    (SELECT COUNT(*) FROM po_inbound_ignores g WHERE g.inbound_item_id=i.id AND g.revoked_at IS NULL) AS ignored
             FROM po_inbound_items i JOIN po_inbound_receipts r ON r.id=i.receipt_id WHERE i.id=?`).get(iid);
-          if (!inbound) throw new Error(`入庫明細が存在しません: ${iid}`);
-          if (inbound.superseded) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 訂正で無効化された行です`);
-          if (inbound.ignored) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 対象外の行です`);
+          if (!inboundRow) throw new Error(`入庫明細が存在しません: ${iid}`);
+          if (inboundRow.superseded) throw new Error(`伝票 ${inboundRow.slip} / ${inboundRow.product_code}: 訂正で無効化された行です`);
+          if (inboundRow.ignored) throw new Error(`伝票 ${inboundRow.slip} / ${inboundRow.product_code}: 対象外の行です`);
           // FIFO計画の再導出 (同一txn内の先行割当は candidatesFor の残数に反映済み → 累積も正しく検証される)
           const chk = candidatesFor(iid);
           const allocs = [];
@@ -914,9 +919,9 @@ router.post('/api/inbound/auto-assign', (req, res) => {
             allocs.push({ orderItemId: c.orderItemId, qty: q });
             rest -= q;
           }
-          if (!allocs.length) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 引き当てられる発注残がありません。画面を更新してやり直してください`);
+          if (!allocs.length) throw new Error(`伝票 ${inboundRow.slip} / ${inboundRow.product_code}: 引き当てられる発注残がありません。画面を更新してやり直してください`);
           rp = { allocs, excessQty: rest, capacity: chk.item.capacity, cursor: 0,
-            slip: inbound.slip, product: inbound.product_code, receiptDate: inbound.receipt_date };
+            slip: inboundRow.slip, product: inboundRow.product_code, receiptDate: inboundRow.receipt_date };
           rowPlans.set(iid, rp);
         }
         const inbound = { slip: rp.slip, product_code: rp.product, receipt_date: rp.receiptDate };
@@ -1002,11 +1007,8 @@ router.post('/api/inbound/auto-assign', (req, res) => {
           throw new Error(`伝票 ${rp.slip} / ${rp.product}: 割当がFIFO計画の途中までしか指定されていません (画面を更新してやり直してください)`);
         }
       }
-      // 対象外処理 (割当の後 = 同一txn内の割当消費を反映した状態で再検証):
-      // 「引き当てられる発注残が1つも無い」未割当行だけを対象外にする (未発注分の入庫 or 先行割当で注残消込済み)。
-      // 割当計画はサーバがFIFOで再導出して照合するため、細工した割当で候補を意図的に消し尽くすことはできない
-      // (Codex ig-R1 High-1 の対策は「割当自体の計画照合」に置き換え)。
-      // プレビュー後の状態変化で割当可能になっていた行は黙って対象外にせず全ロールバック
+      // 対象外処理: txn開始時の正直な計画で対象外に分類された行のみ許可 (ignorableAtStart)。
+      // さらに実行後の状態でも「引き当てられる発注残が1つも無い」ことを最終確認する
       let ignoredCount = 0;
       for (const iid of ignoreIds) {
         const inbound = db.prepare(`
@@ -1016,11 +1018,14 @@ router.post('/api/inbound/auto-assign', (req, res) => {
         if (!inbound) throw new Error(`入庫明細が存在しません: ${iid}`);
         if (inbound.superseded) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 訂正で無効化された行は対象外にできません`);
         if (inbound.ignored) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: すでに対象外です。画面を更新してやり直してください`);
+        if (!ignorableAtStart.has(iid)) {
+          throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 最新の計画では対象外になりません (割当できる可能性があります)。画面を更新してやり直してください`);
+        }
         const chk = candidatesFor(iid);
         if (chk.candidates.some(c => c.remaining > 0)) {
           throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 状況が変わり割当できる可能性があります。画面を更新してやり直してください`);
         }
-        const reason = '一括割当で対象外: 対応する発注残なし (未発注分の入庫、または先行割当で注残消込済み)';
+        const reason = '一括割当で対象外: 対応する発注残なし (未発注分の入庫、または計画上の全量超過)';
         try {
           setInboundIgnore(iid, { ignore: true, reason, actor }); // 一部割当済み等はここ (アプリ検証+DBトリガ) が拒否
         } catch (e) {
