@@ -508,26 +508,47 @@ function initLedgerSchema(db) {
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_po_inb_match ON po_inbound_items(product_key, superseded)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_po_inb_receipt ON po_inbound_items(receipt_id)');
-  // 「対象外」は履歴型 (誰がいつなぜ・解除も記録)。対象外の判定は revoked_at IS NULL の行が存在するか
+  // 「対象外」は履歴型 (誰がいつなぜ・解除も記録)。対象外の判定は revoked_at IS NULL の行が存在するか。
+  // scope: 'row'=行全体が対象外 (割当ゼロのみ) / 'excess'=注残超過分の残余だけ対象外 (PO残まで割当済みの行、#525)
   db.exec(`CREATE TABLE IF NOT EXISTS po_inbound_ignores (
     id              INTEGER PRIMARY KEY,
     inbound_item_id INTEGER NOT NULL REFERENCES po_inbound_items(id),
     reason          TEXT NOT NULL,
+    scope           TEXT NOT NULL DEFAULT 'row' CHECK(scope IN ('row','excess')),
     created_at      TEXT NOT NULL,
     actor           TEXT,
     revoked_at      TEXT,
     revoked_by      TEXT
   )`);
+  addCol(db, 'po_inbound_ignores', 'scope', "TEXT NOT NULL DEFAULT 'row'");
   db.exec('CREATE INDEX IF NOT EXISTS idx_po_inb_ign ON po_inbound_ignores(inbound_item_id, revoked_at)');
-  // 割当が残る入庫の「対象外」化を物理拒否 (アプリ検証の最終防衛、Codex P14-R1 High-1)
+  // 割当が残る入庫の「対象外」化を物理拒否 (アプリ検証の最終防衛、Codex P14-R1 High-1)。
+  // scope='excess' は逆に「割当済みの残余を対象外」が目的のため、割当ゼロでの excess を拒否する
   db.exec(`CREATE TRIGGER trg_po_inbound_ignore_guard BEFORE INSERT ON po_inbound_ignores
            WHEN NEW.revoked_at IS NULL
            BEGIN
-             SELECT CASE WHEN (
+             -- addColで追加した既存DBの scope 列にはCHECKが付かないためトリガでも値域を強制 (Codex ig-R3 Medium)
+             SELECT CASE WHEN COALESCE(NEW.scope, 'row') NOT IN ('row', 'excess')
+               THEN RAISE(ABORT, 'inbound ignore: scopeが不正です (row/excessのみ)') END;
+             SELECT CASE WHEN COALESCE(NEW.scope, 'row') = 'row' AND (
                SELECT COALESCE(SUM(e.qty), 0) FROM po_item_events e
                WHERE e.inbound_item_id = NEW.inbound_item_id AND e.event_type = 'receipt'
                  AND NOT EXISTS (SELECT 1 FROM po_item_events r WHERE r.reverses_id = e.id)
              ) > 0 THEN RAISE(ABORT, 'inbound ignore: 割当が残る入庫は対象外にできません (先に逆仕訳を)') END;
+             SELECT CASE WHEN COALESCE(NEW.scope, 'row') = 'excess' AND (
+               SELECT COALESCE(SUM(e.qty), 0) FROM po_item_events e
+               WHERE e.inbound_item_id = NEW.inbound_item_id AND e.event_type = 'receipt'
+                 AND NOT EXISTS (SELECT 1 FROM po_item_events r WHERE r.reverses_id = e.id)
+             ) = 0 THEN RAISE(ABORT, 'inbound ignore: 超過分の対象外は割当済みの行のみです') END;
+           END`);
+  // 割当の逆仕訳で excess 対象外の前提 (割当済み) が崩れたら自動で解除する
+  // (解除しないと入庫行が対象外リストに隠れたまま再割当候補に出ない、Codex ig-R2 High)
+  db.exec(`CREATE TRIGGER trg_po_events_reversal_excess_revoke AFTER INSERT ON po_item_events
+           WHEN NEW.event_type = 'reversal'
+           BEGIN
+             UPDATE po_inbound_ignores SET revoked_at = NEW.recorded_at, revoked_by = 'system:reversal'
+             WHERE revoked_at IS NULL AND scope = 'excess'
+               AND inbound_item_id = (SELECT e.inbound_item_id FROM po_item_events e WHERE e.id = NEW.reverses_id);
            END`);
   // logizard入荷の割当ガード: 参照先の実在・非supersede・非ignore・割当合計≤入庫良品数 (要件v8 F-5)。
   // ※入庫テーブル作成後に定義する (トリガ本文のテーブル参照はCREATE時に解決される)

@@ -25,7 +25,7 @@ import {
   ensureTrackingStarted, nextPoNumber, isYmd, checkLedgerIntegrity, withCommand,
   appendPoItemEvent, reverseEvent, manualCloseOrder, setItemPlan, listBackorders, listItemEvents, balanceOf,
 } from './ledger.js';
-import { importInboundCsv, previewInboundCsv, listInbound, candidatesFor, setInboundIgnore, autoAssignPreview, parseCsv as parseCsvStrict } from './inbound.js';
+import { importInboundCsv, previewInboundCsv, listInbound, candidatesFor, setInboundIgnore, autoAssignPreview, sortCandidatesFifo, listInboundBatches, inboundBatchLines, parseCsv as parseCsvStrict } from './inbound.js';
 import { importNeBackorderCsv } from './migration.js';
 import {
   buildOrderEmail, createEmailJob, processEmailJob, reconcileEmailJobs, listEmailJobs, emailSettings, parseAddresses,
@@ -858,12 +858,18 @@ router.post('/api/inbound/auto-assign', (req, res) => {
     const db = getDB();
     const actor = actorOf(req);
     const assignments = Array.isArray((req.body || {}).assignments) ? req.body.assignments : [];
-    if (!assignments.length) return res.status(400).json({ ok: false, error: '割当がありません' });
-    if (assignments.length > 500) return res.status(400).json({ ok: false, error: '一度に割当できるのは500件までです' });
+    // 注残に対応しない入庫 (候補なし/PO残超過) を同時に「対象外」処理する (中原さん 2026-07-15)
+    const ignores = Array.isArray((req.body || {}).ignores) ? req.body.ignores : [];
+    if (!assignments.length && !ignores.length) return res.status(400).json({ ok: false, error: '割当・対象外の対象がありません' });
+    if (assignments.length + ignores.length > 500) return res.status(400).json({ ok: false, error: '一度に処理できるのは500件までです' });
+    const ignoreIds = ignores.map(x => Number(x && x.inboundItemId));
+    if (ignoreIds.some(id => !Number.isSafeInteger(id) || id <= 0)) return res.status(400).json({ ok: false, error: '対象外の指定が不正です' });
+    if (new Set(ignoreIds).size !== ignoreIds.length) return res.status(400).json({ ok: false, error: '対象外に同じ入庫明細が複数回指定されています' });
     // 冪等payloadは残数の扱いの全フィールドを含め、配列順もそのまま保持する
     // (実処理と「最終行」判定はリクエスト順=順序は意味のある入力。順序違いをreplayさせない、Codex inb-R2 Medium)
     const canonical = assignments.map(a => ({
       inboundItemId: Number(a && a.inboundItemId), orderItemId: Number(a && a.orderItemId), qty: Number(a && a.qty),
+      excess: !!(a && a.excess), // 注残超過行: PO残まで割当+残余を対象外
       remainder: a && a.remainder ? {
         action: a.remainder.action ?? null,
         keepQty: a.remainder.keepQty ?? null,
@@ -872,36 +878,62 @@ router.post('/api/inbound/auto-assign', (req, res) => {
         nextActionDate: a.remainder.nextActionDate || null,
       } : null,
     }));
-    // 同一PO明細への複数割当は「最後の行」だけが残数の扱いを設定する (途中行の設定は上書きされるだけなので受けない)
+    // 同一PO明細への複数割当は「最後の割当」だけが残数の扱いを設定する (途中の設定は上書きされるだけなので受けない)
     const lastIdxByItem = new Map();
     assignments.forEach((a, idx) => lastIdxByItem.set(Number(a && a.orderItemId), idx));
+    const ignoreSet = new Set(ignoreIds);
     const run = () => db.transaction(() => {
+      // 対象外にできる行を「書込み前の状態」でサーバが導出して固定する (Codex ig-R4 High:
+      // 別行の割当や keepQty 減数で候補を消してから対象外にする細工は、txn開始時点の正直な
+      // FIFO計画で対象外に分類される行 (未発注分の入庫/計画上の全量超過) 以外を弾くことで遮断)。
+      // 割当側は行単位のFIFO計画照合 (下) が守る — 割当されなかった行は未処理のまま画面に残るだけで隠れない
+      const ignorableAtStart = new Set(autoAssignPreview().autoIgnores.map(x => x.inboundItemId));
       const results = [];
-      const seenInbound = new Set(); // 同一入庫行の重複指定 (分割割当の細工) は拒否 (Codex inb-R3 Medium)
+      // 行ごとのFIFO割当計画: 行の初回エントリで candidatesFor から再導出し、クライアントの指定が
+      // 「古い発注から順・数量も一致」で計画どおりかを1エントリずつ照合する (クライアント提案は信用しない)。
+      // 計画外のPO/数量/順序/重複/途中打切りは全て400 → 全ロールバック
+      const rowPlans = new Map(); // iid → { allocs:[{orderItemId, qty}], excessQty, capacity, cursor, slip, product, receiptDate }
       for (let idx = 0; idx < assignments.length; idx++) {
         const a = assignments[idx];
         const iid = Number(a && a.inboundItemId), oid = Number(a && a.orderItemId), qty = Number(a && a.qty);
         if (!Number.isSafeInteger(iid) || iid <= 0 || !Number.isSafeInteger(oid) || oid <= 0) throw new Error('割当の指定が不正です');
         if (!Number.isInteger(qty) || qty <= 0) throw new Error(`数量が不正です (入庫明細 ${iid})`);
-        if (seenInbound.has(iid)) throw new Error(`同じ入庫明細が複数回指定されています (${iid})`);
-        seenInbound.add(iid);
-        const inbound = db.prepare(`
-          SELECT i.id, i.good_qty, i.superseded, r.receipt_date, r.source_key AS slip, i.product_code,
-                 (SELECT COUNT(*) FROM po_inbound_ignores g WHERE g.inbound_item_id=i.id AND g.revoked_at IS NULL) AS ignored
-          FROM po_inbound_items i JOIN po_inbound_receipts r ON r.id=i.receipt_id WHERE i.id=?`).get(iid);
-        if (!inbound) throw new Error(`入庫明細が存在しません: ${iid}`);
-        if (inbound.superseded) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 訂正で無効化された行です`);
-        if (inbound.ignored) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 対象外の行です`);
-        // 割当先の再検証: txn内で候補を再計算し「候補が1件のまま・指定先と一致・数量≤最新PO残」を要求
-        // (リクエスト改変やプレビュー後の状態変化で無関係なPOへ消し込ませない、Codex inb-R1 High)。
-        // 同一txn内の先行割当はcandidatesForの残数計算に反映されるため、同一PO明細への累積も正しく検証される
-        const chk = candidatesFor(iid);
-        if (chk.candidates.length !== 1 || chk.candidates[0].orderItemId !== oid) {
-          throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 割当先の候補が変わっています。画面を更新してやり直してください`);
+        let rp = rowPlans.get(iid);
+        if (!rp) {
+          if (ignoreSet.has(iid)) throw new Error(`同じ入庫明細が割当と対象外の両方に指定されています (${iid})`);
+          const inboundRow = db.prepare(`
+            SELECT i.id, i.good_qty, i.superseded, r.receipt_date, r.source_key AS slip, i.product_code,
+                   (SELECT COUNT(*) FROM po_inbound_ignores g WHERE g.inbound_item_id=i.id AND g.revoked_at IS NULL) AS ignored
+            FROM po_inbound_items i JOIN po_inbound_receipts r ON r.id=i.receipt_id WHERE i.id=?`).get(iid);
+          if (!inboundRow) throw new Error(`入庫明細が存在しません: ${iid}`);
+          if (inboundRow.superseded) throw new Error(`伝票 ${inboundRow.slip} / ${inboundRow.product_code}: 訂正で無効化された行です`);
+          if (inboundRow.ignored) throw new Error(`伝票 ${inboundRow.slip} / ${inboundRow.product_code}: 対象外の行です`);
+          // FIFO計画の再導出 (同一txn内の先行割当は candidatesFor の残数に反映済み → 累積も正しく検証される)
+          const chk = candidatesFor(iid);
+          const allocs = [];
+          let rest = chk.item.capacity;
+          for (const c of sortCandidatesFifo(chk.candidates)) {
+            if (rest <= 0) break;
+            if (c.remaining <= 0) continue;
+            const q = Math.min(rest, c.remaining);
+            allocs.push({ orderItemId: c.orderItemId, qty: q });
+            rest -= q;
+          }
+          if (!allocs.length) throw new Error(`伝票 ${inboundRow.slip} / ${inboundRow.product_code}: 引き当てられる発注残がありません。画面を更新してやり直してください`);
+          rp = { allocs, excessQty: rest, capacity: chk.item.capacity, cursor: 0,
+            slip: inboundRow.slip, product: inboundRow.product_code, receiptDate: inboundRow.receipt_date };
+          rowPlans.set(iid, rp);
         }
-        // ⚡一括割当の契約は「未割当入庫の全量割当」。部分量や過少の細工は拒否 (Codex inb-R3 Medium)
-        if (qty !== chk.item.capacity) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 数量(${qty})が入庫の未割当(${chk.item.capacity})と一致しません (画面を更新してやり直してください)`);
-        if (qty > chk.candidates[0].remaining) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: PO残(${chk.candidates[0].remaining})を超えています (画面を更新してやり直してください)`);
+        const inbound = { slip: rp.slip, product_code: rp.product, receipt_date: rp.receiptDate };
+        const exp = rp.allocs[rp.cursor];
+        if (!exp || exp.orderItemId !== oid || exp.qty !== qty) {
+          throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 割当内容 (PO/数量/順序) が最新のFIFO計画と一致しません (画面を更新してやり直してください)`);
+        }
+        rp.cursor++;
+        const isLast = rp.cursor === rp.allocs.length;
+        const isExcess = a.excess === true;
+        if (isExcess && !(isLast && rp.excessQty > 0)) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 超過扱いですが割当後の残余がありません (画面を更新してやり直してください)`);
+        if (isLast && rp.excessQty > 0 && !isExcess) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 注残を超える入庫です。画面を更新して超過分の扱いを確認してやり直してください`);
         // remainder.action は値の正当性だけ先に検証する。適用条件 (最終行・keep>0) の外でも不正値は400
         // (keepQty=0 や残0では適用されず素通りし、減数だけ実行されてしまう、Codex defer-R1 Medium)
         const rAct = a.remainder && a.remainder.action != null ? a.remainder.action : null;
@@ -958,25 +990,82 @@ router.post('/api/inbound/auto-assign', (req, res) => {
               }
             }
           }
+          if (isExcess) {
+            // 注残超過分の残余だけを対象外に (scope='excess'。対象外リストから↩解除可能)
+            setInboundIgnore(iid, { ignore: true, scope: 'excess',
+              reason: `一括割当で対象外: 注残超過分 ${rp.excessQty} (入庫${rp.capacity}/割当${rp.capacity - rp.excessQty})`, actor });
+          }
           results.push({ inboundItemId: iid, orderItemId: oid, qty, remaining: ev.remaining, plan: plan ? plan.remainder_disposition || true : null });
         } catch (e) {
           if (!String(e.message || '').startsWith('伝票 ')) e.message = `伝票 ${inbound.slip} / ${inbound.product_code}: ${e.message}`;
           throw e;
         }
       }
+      // FIFO計画の途中までしか指定されていない行は拒否 (半端な消込を黙って確定させない)
+      for (const [, rp] of rowPlans) {
+        if (rp.cursor !== rp.allocs.length) {
+          throw new Error(`伝票 ${rp.slip} / ${rp.product}: 割当がFIFO計画の途中までしか指定されていません (画面を更新してやり直してください)`);
+        }
+      }
+      // 対象外処理: txn開始時の正直な計画で対象外に分類された行のみ許可 (ignorableAtStart)。
+      // さらに実行後の状態でも「引き当てられる発注残が1つも無い」ことを最終確認する
+      let ignoredCount = 0;
+      for (const iid of ignoreIds) {
+        const inbound = db.prepare(`
+          SELECT i.id, i.superseded, r.source_key AS slip, i.product_code,
+                 (SELECT COUNT(*) FROM po_inbound_ignores g WHERE g.inbound_item_id=i.id AND g.revoked_at IS NULL) AS ignored
+          FROM po_inbound_items i JOIN po_inbound_receipts r ON r.id=i.receipt_id WHERE i.id=?`).get(iid);
+        if (!inbound) throw new Error(`入庫明細が存在しません: ${iid}`);
+        if (inbound.superseded) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 訂正で無効化された行は対象外にできません`);
+        if (inbound.ignored) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: すでに対象外です。画面を更新してやり直してください`);
+        if (!ignorableAtStart.has(iid)) {
+          throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 最新の計画では対象外になりません (割当できる可能性があります)。画面を更新してやり直してください`);
+        }
+        const chk = candidatesFor(iid);
+        if (chk.candidates.some(c => c.remaining > 0)) {
+          throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 状況が変わり割当できる可能性があります。画面を更新してやり直してください`);
+        }
+        const reason = '一括割当で対象外: 対応する発注残なし (未発注分の入庫、または計画上の全量超過)';
+        try {
+          setInboundIgnore(iid, { ignore: true, reason, actor }); // 一部割当済み等はここ (アプリ検証+DBトリガ) が拒否
+        } catch (e) {
+          if (!String(e.message || '').startsWith('伝票 ')) e.message = `伝票 ${inbound.slip} / ${inbound.product_code}: ${e.message}`;
+          throw e;
+        }
+        ignoredCount++;
+      }
       audit(db, { actorType: 'user', actor, action: 'inbound_auto_assign', resource: 'inbound',
-        detail: { count: results.length } });
-      return results;
+        detail: { count: results.length, ignored: ignoredCount } });
+      return { results, ignoredCount };
     }).immediate();
     const { replay, result } = withCommand(
-      { idempotencyKey: trimS(req.get('Idempotency-Key')) || null, payload: { op: 'inbound_auto_assign', assignments: canonical } },
+      { idempotencyKey: trimS(req.get('Idempotency-Key')) || null, payload: { op: 'inbound_auto_assign', assignments: canonical, ignores: ignoreIds } },
       run
     );
-    res.json({ ok: true, assigned: result.length, results: result, replay });
+    res.json({ ok: true, assigned: result.results.length, ignored: result.ignoredCount, results: result.results, replay });
   } catch (e) {
     console.error('[purchase-orders] 一括割当失敗 (全件ロールバック):', e.message); // Renderログにも残す
     res.status(e.status === 409 ? 409 : 400).json({ ok: false, error: e.message });
   }
+});
+
+// 取込履歴 (いつ・何を・何個入荷したか — 中原さん要望 2026-07-15)
+router.get('/api/inbound/batches', (req, res) => {
+  try {
+    const batches = listInboundBatches().map(b => ({
+      id: b.id, fileName: b.file_name || '(名称なし)', importedAtJst: fmtJst(b.imported_at), actor: b.actor || '',
+      rowCount: b.row_count, receiptCount: b.receipt_count, lineCount: b.line_count, totalGood: b.total_good,
+    }));
+    res.json({ ok: true, batches });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+router.get('/api/inbound/batches/:id', (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isSafeInteger(id) || id <= 0) return res.status(400).json({ ok: false, error: 'idが不正です' });
+    const { batch, lines } = inboundBatchLines(id);
+    res.json({ ok: true, batch: { id: batch.id, fileName: batch.file_name || '(名称なし)', importedAtJst: fmtJst(batch.imported_at) }, lines });
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
 router.get('/api/inbound/:id/candidates', (req, res) => {
@@ -4144,13 +4233,17 @@ router.get('/inbound', (req, res) => {
       <div id="inbResult" class="pill-row"></div>
     </div>
     <div id="conflictArea"></div>
+    <div id="tallyArea"></div>
     <div class="hint" style="margin:6px 0 10px">📅 入荷予定の作成 (出荷明細メール→ロジザード貼り付け) は <a href="/apps/purchase-orders/inbound-plan">「入荷予定」タブ</a> に移動しました</div>
 
     <h2 class="page" style="font-size:15px;display:flex;align-items:center;gap:12px">未割当の入庫 <span class="muted" id="openCount"></span>
       <button class="pri" id="autoAssignBtn" title="候補が1つに確定する入庫をまとめて発注残に割り当てます (確認画面あり)">⚡ 一括割当 (自動マッチ)</button>
     </h2>
     <div class="sec"><div class="bd" id="openList" style="max-height:none">読み込み中…</div></div>
-    <div id="ignoredArea"></div>`;
+    <div id="ignoredArea"></div>
+    <details class="sec" style="margin-top:16px" id="histBox"><summary style="cursor:pointer;padding:8px 12px">📜 取込履歴 (いつ・何を・何個入荷したか)</summary>
+      <div class="bd" id="histBody">開くと読み込みます…</div>
+    </details>`;
   const script = `
 var API = '/apps/purchase-orders/api';
 var INB = null;
@@ -4169,6 +4262,8 @@ function fmtD(s) { return s ? String(s).slice(0, 10) : '—'; }
 var LOAD_SEQ = 0;
 function load() {
   var seq = ++LOAD_SEQ;
+  var hb = document.getElementById('histBox');
+  if (hb && hb.open) loadHist(); // 取込直後も履歴を最新に
   getJson(API + '/inbound').then(function(j) {
     if (seq !== LOAD_SEQ) return;
     if (!j.ok) { document.getElementById('openList').innerHTML = '<div class="warn">エラー: ' + esc(j.error) + ' <button class="ghost" onclick="load()">再読込</button></div>'; return; }
@@ -4190,6 +4285,34 @@ function render() {
     });
     ca.innerHTML = ch + '</table></div>';
   } else ca.innerHTML = '';
+
+  // 網羅性サマリ (中原さん 2026-07-15: 割当漏れ・注残漏れを絶対に避けたい)。
+  // 取り込んだ良品数が「割当 + 対象外 + 未処理」に必ず分解され、未処理が0なら取りこぼしなし
+  var ta = document.getElementById('tallyArea');
+  var t = INB.totals || null;
+  if (t && t.totalGood <= 0) {
+    ta.innerHTML = (t.conflictLines || INB.ignored.length)
+      ? '<div class="sec" style="padding:8px 12px;margin:6px 0"><span class="muted">集計対象の良品入荷はありません' + (t.conflictLines ? ' (訂正競合 ' + t.conflictLines + '明細は🚨で対応)' : '') + '</span></div>'
+      : '';
+  } else if (t) {
+    var pieces = '✅ 割当済 ' + t.allocated.toLocaleString('ja-JP') +
+      ' ＋ 🚫 対象外 ' + t.ignored.toLocaleString('ja-JP') +
+      ' ＋ ⏳ 未処理 ' + t.unprocessed.toLocaleString('ja-JP') +
+      ' ＝ 入荷 ' + t.totalGood.toLocaleString('ja-JP') + ' 個';
+    if (!t.balanced) {
+      ta.innerHTML = '<div class="warn">🛑 <b>入荷数の内訳が合いません</b> (' + pieces + ')。データ不整合の可能性があります。開発に連絡してください</div>';
+    } else if (t.unprocessed > 0) {
+      ta.innerHTML = '<div class="warn" style="background:#fffbeb;border-color:#f59e0b;color:#92400e">' +
+        '⏳ <b>未処理の入荷が ' + t.unprocessedLines + '明細 / ' + t.unprocessed.toLocaleString('ja-JP') + '個</b> あります。' +
+        '「⚡ 一括割当」で古い発注から自動で消し込めます (注残に無い/超過分は対象外に回ります)。<br>' +
+        '<span style="font-weight:400;font-size:12px">内訳: ' + pieces + '</span>' +
+        (t.conflictLines ? '<br><span style="font-weight:400;font-size:12px">※ ほかに訂正競合 ' + t.conflictLines + '明細 (上の🚨で対応)</span>' : '') + '</div>';
+    } else {
+      ta.innerHTML = '<div class="sec" style="padding:8px 12px;margin:6px 0;background:#f0fdf4;border-color:#86ef4c">' +
+        '✅ <b>取りこぼしなし</b> — 入荷 ' + t.totalGood.toLocaleString('ja-JP') + '個はすべて処理済み (' + pieces + ')' +
+        (t.conflictLines ? ' <span class="muted">※訂正競合 ' + t.conflictLines + '明細は別途対応</span>' : '') + '</div>';
+    }
+  } else ta.innerHTML = '';
 
   document.getElementById('openCount').textContent = '(' + INB.open.length + '件)';
   if (!INB.open.length) {
@@ -4381,19 +4504,22 @@ document.getElementById('autoAssignBtn').addEventListener('click', function() {
   getJson(API + '/inbound/auto-assign/preview').then(function(j) {
     btn.disabled = false;
     if (!j.ok) { toast('エラー: ' + j.error); return; }
-    if (!j.proposals.length && !j.skipped.length) { toast('未割当の入庫はありません'); return; }
+    var aIgn = j.autoIgnores || [];
+    if (!j.proposals.length && !j.skipped.length && !aIgn.length) { toast('未割当の入庫はありません'); return; }
     var h = '<div style="display:flex;align-items:center;gap:10px"><h2 style="margin:0">⚡ 一括割当の確認</h2>' +
       '<button class="ghost" id="inbModalClose" style="margin-left:auto">✕ 閉じる</button></div>' +
-      '<div class="hint">候補が1つに確定した入庫だけを自動で割り当てます。割当後にPO残が残る行は「<b>残す数</b>」を確認してください:<br>' +
+      '<div class="hint">入庫を<b>古い発注から順に</b>自動で割り当てます (複数の発注に注残が累積していても古い方から消込)。注残に無い入庫は🚫対象外、注残を超えた分も超過として対象外にします (どちらも後から↩戻せます)。割当後にPO残が残る行は「<b>残す数</b>」を確認してください:<br>' +
       'そのまま=注残に残す (📌あとで決める=日付入力なし。🚚分納待ち/❓確認中を選ぶと予定日を記録) ・ <b>0にする=残数を全て減数で消して完了</b> (原料不足で作れなかった等) ・ 途中の数=差分だけ減数して一部を残す。</div>';
     if (j.proposals.length) {
       h += '<div style="overflow-x:auto;max-height:45vh;overflow-y:auto"><table class="t"><tr><th>伝票NO</th><th>商品</th><th class="r">割当数</th><th>割当先PO</th><th class="r">PO残→割当後</th><th>残数の扱い</th></tr>' +
         j.proposals.map(function(p, i) {
           return '<tr><td>' + esc(p.slip) + '</td><td><b>' + esc(p.productCode) + '</b><div class="muted" style="font-size:11px">' + esc(p.productName || '') + '</div></td>' +
-            '<td class="r"><b>' + p.qty + '</b></td>' +
+            '<td class="r"><b>' + p.qty + '</b>' + (p.excessQty ? '<div class="muted" style="font-size:11px" title="発注していない分 (注残超過)。割当と同時に対象外として記録されます">+超過' + p.excessQty + '</div>' : '') + '</td>' +
             '<td>' + esc(p.poNumber || ('#' + p.orderId)) + (p.costDiff ? ' <span class="badge b-draft" title="入庫単価とPO単価が異なります">💴単価差</span>' : '') + '</td>' +
             '<td class="r">' + p.poRemaining + ' → ' + p.postRemaining + '</td>' +
-            '<td>' + (p.needsRemainder
+            '<td>' + (p.excessQty
+              ? '<span class="muted">🚫 超過 ' + p.excessQty + ' は対象外に (注残は全量消込)</span>'
+              : '') + (p.excessQty ? '' : p.needsRemainder
               ? '残す <input type="number" class="aaKeep" data-idx="' + i + '" value="' + p.postRemaining + '" min="0" max="' + p.postRemaining + '" step="1" style="width:70px"> / ' + p.postRemaining +
                 ' <span class="aaOpts" data-idx="' + i + '">' +
                 '<select class="aaRem" data-idx="' + i + '"><option value="defer">📌 あとで決める</option><option value="await_delivery">🚚 分納待ち</option><option value="await_confirmation">❓ 確認中</option></select> ' +
@@ -4404,6 +4530,16 @@ document.getElementById('autoAssignBtn').addEventListener('click', function() {
     } else {
       h += '<div class="muted" style="margin:8px 0">自動で割当できる行はありません</div>';
     }
+    if (aIgn.length) {
+      // 注残に対応しない入庫は自動で対象外に (中原さん 2026-07-15: このアプリは注残しか管理しない。
+      // 一括割当を実行したら全行が処理し切られる)。対象外は「対象外」リストから↩戻せる
+      h += '<div style="margin-top:10px"><b>🚫 対象外にする行 (' + aIgn.length + '件)</b> <span class="muted" style="font-size:12px">— 注残の管理対象外として処理します (未発注分の入庫・注残超過)。間違っていたら下の「対象外」リストから↩戻せます</span>' +
+        '<div style="overflow-x:auto;max-height:30vh;overflow-y:auto"><table class="t"><tr><th>伝票NO</th><th>商品</th><th class="r">数量</th><th>理由</th></tr>' +
+        aIgn.map(function(x) {
+          return '<tr><td>' + esc(x.slip) + '</td><td><b>' + esc(x.productCode) + '</b> <span class="muted" style="font-size:11px">' + esc(x.productName || '') + '</span></td>' +
+            '<td class="r">' + x.qty + '</td><td class="muted">' + esc(x.reason) + '</td></tr>';
+        }).join('') + '</table></div></div>';
+    }
     if (j.skipped.length) {
       h += '<details style="margin-top:8px"' + (j.proposals.length ? '' : ' open') + '><summary class="muted" style="cursor:pointer">🖐 手動対応が必要な行 (' + j.skipped.length + '件)</summary>' +
         '<table class="t" style="margin-top:4px"><tr><th>伝票NO</th><th>商品</th><th class="r">未割当</th><th>理由</th></tr>' +
@@ -4412,9 +4548,13 @@ document.getElementById('autoAssignBtn').addEventListener('click', function() {
             '<td class="r">' + s.remainingCapacity + '</td><td class="muted">' + esc(s.reason) + '</td></tr>';
         }).join('') + '</table></details>';
     }
-    if (j.proposals.length) {
+    if (j.proposals.length || aIgn.length) {
+      var goLabel = '⚡ ' +
+        (j.proposals.length ? j.proposals.length + '件を割り当て (発注残を消し込み)' : '') +
+        (j.proposals.length && aIgn.length ? ' + ' : '') +
+        (aIgn.length ? aIgn.length + '件を対象外に' : '') + 'する';
       h += '<div style="margin-top:10px;display:flex;gap:10px;align-items:center">' +
-        '<button class="pri" id="aaGo">⚡ ' + j.proposals.length + '件を割り当てる (発注残を消し込みます)</button></div>';
+        '<button class="pri" id="aaGo">' + goLabel + '</button></div>';
     }
     openInbModal(h);
     document.getElementById('inbModalClose').addEventListener('click', closeInbModal);
@@ -4457,6 +4597,7 @@ document.getElementById('autoAssignBtn').addEventListener('click', function() {
     if (go) go.addEventListener('click', function() {
       var bad = null;
       var assignments = j.proposals.map(function(p, i) {
+        if (p.excessQty) return { inboundItemId: p.inboundItemId, orderItemId: p.orderItemId, qty: p.qty, excess: true, remainder: null };
         if (!p.needsRemainder) return { inboundItemId: p.inboundItemId, orderItemId: p.orderItemId, qty: p.qty, remainder: null };
         var keepEl = document.querySelector('.aaKeep[data-idx="' + i + '"]');
         // 空欄はNumber('')=0=「全量減数」に化ける事故を防ぐ (Codex keep-R2 High)
@@ -4484,7 +4625,7 @@ document.getElementById('autoAssignBtn').addEventListener('click', function() {
       });
       if (bad) { toast(bad); return; }
       go.disabled = true;
-      post(API + '/inbound/auto-assign', { assignments: assignments }, newIdemKey()).then(function(r2) {
+      post(API + '/inbound/auto-assign', { assignments: assignments, ignores: aIgn.map(function(x){ return { inboundItemId: x.inboundItemId }; }) }, newIdemKey()).then(function(r2) {
         go.disabled = false;
         if (!r2.ok) {
           // 失敗を見逃させない: alert+モーダル内に赤バナー常設 (トーストは消えて原因が追えない、中原さん報告 2026-07-14)
@@ -4500,18 +4641,60 @@ document.getElementById('autoAssignBtn').addEventListener('click', function() {
           return;
         }
         closeInbModal();
-        toast('⚡ ' + r2.assigned + '件を割り当てました' + (r2.replay ? ' (再送・二重なし)' : ''));
+        toast('⚡ ' + r2.assigned + '件を割り当て' + (r2.ignored ? '・' + r2.ignored + '件を対象外にし' : '') + 'ました' + (r2.replay ? ' (再送・二重なし)' : ''));
         load();
       }).catch(function(e){ go.disabled = false; alert('⚠️ 通信エラー: ' + e.message + '\\n\\n画面を更新して割当状態を確認してください'); });
     });
   }).catch(function(e){ btn.disabled = false; toast('通信エラー: ' + e.message); });
 });
 
+// 📜 取込履歴 (中原さん要望 2026-07-15: いつ・何を・何個入荷したかを残す)
+var HIST_LOADED = false;
+document.getElementById('histBox').addEventListener('toggle', function() {
+  if (!this.open || HIST_LOADED) return;
+  HIST_LOADED = true;
+  loadHist();
+});
+function loadHist() {
+  document.getElementById('histBody').textContent = '読み込み中…';
+  getJson(API + '/inbound/batches').then(function(j) {
+    if (!j.ok) { document.getElementById('histBody').innerHTML = '<div class="warn">エラー: ' + esc(j.error) + '</div>'; return; }
+    if (!j.batches.length) { document.getElementById('histBody').innerHTML = '<div class="muted">まだ取込履歴がありません</div>'; return; }
+    var h = '<table class="t"><tr><th>取込日時 (JST)</th><th>ファイル名</th><th class="r">伝票数</th><th class="r">明細数</th><th class="r">良品数合計</th><th></th></tr>';
+    j.batches.forEach(function(b) {
+      h += '<tr><td>' + esc(b.importedAtJst) + '</td><td>' + esc(b.fileName) + '</td>' +
+        '<td class="r">' + b.receiptCount + '</td><td class="r">' + b.lineCount + '</td><td class="r">' + Number(b.totalGood).toLocaleString('ja-JP') + '</td>' +
+        '<td><button class="ghost" data-histbatch="' + b.id + '">明細</button></td></tr>' +
+        '<tr id="histLines-' + b.id + '" style="display:none"><td colspan="6" id="histLinesBody-' + b.id + '"></td></tr>';
+    });
+    document.getElementById('histBody').innerHTML = h + '</table><div class="muted" style="font-size:11px;margin-top:4px">明細数・良品数合計は、そのアップロードで新しく追加された行の集計です (同じ内容の行は最初の取込にだけ数えられます)</div>';
+  });
+}
+
 document.addEventListener('click', function(ev) {
   var t = ev.target;
   var g = function(a){ return t.getAttribute && t.getAttribute(a); };
   var v;
   if ((v = g('data-match'))) { matchPanel(v); return; }
+  if ((v = g('data-histbatch'))) {
+    var htr = document.getElementById('histLines-' + v);
+    if (htr.style.display !== 'none') { htr.style.display = 'none'; return; }
+    htr.style.display = '';
+    var hb = document.getElementById('histLinesBody-' + v);
+    hb.textContent = '読み込み中…';
+    getJson(API + '/inbound/batches/' + v).then(function(j2) {
+      if (!j2.ok) { hb.innerHTML = '<span class="warn">' + esc(j2.error) + '</span>'; return; }
+      if (!j2.lines.length) { hb.innerHTML = '<span class="muted">このアップロードで追加された行はありません (全行が取込済みでした)</span>'; return; }
+      var h2 = '<table class="t"><tr><th>伝票NO</th><th>入庫日</th><th>商品</th><th class="r">良品数</th></tr>';
+      j2.lines.forEach(function(l) {
+        h2 += '<tr' + (l.superseded ? ' style="opacity:.5;text-decoration:line-through" title="訂正版で無効化された行"' : '') + '><td>' + esc(l.slip) + '</td><td>' + fmtD(l.receipt_date) + '</td>' +
+          '<td><b>' + esc(l.product_code) + '</b> <span class="muted" style="font-size:11px">' + esc(l.productName || '') + '</span></td>' +
+          '<td class="r">' + l.good_qty + '</td></tr>';
+      });
+      hb.innerHTML = h2 + '</table>';
+    });
+    return;
+  }
   if ((v = g('data-mclose'))) { document.getElementById('mpanel-' + v).style.display = 'none'; return; }
   if ((v = g('data-ign'))) {
     showMPanel(v, '<b>🚫 この入庫を消込の対象外にする</b> (発注に紐づかない入庫: 返品・サンプル等) ' +

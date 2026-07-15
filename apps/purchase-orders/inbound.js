@@ -309,23 +309,36 @@ export function listInbound() {
     FROM po_inbound_items i JOIN po_inbound_receipts r ON r.id = i.receipt_id
     ORDER BY r.receipt_date IS NULL, r.receipt_date DESC, r.source_key DESC, i.id`).all();
   const open = [], ignored = [], conflicts = [];
+  // 網羅性の保存則 (中原さん要望 2026-07-15: 割当漏れ・注残漏れを絶対に避けたい)。
+  // 非superseded入庫の良品数は必ず「割当済み + 対象外 + 未処理」に分解でき、合計は常に一致する:
+  //   goodQty = allocated + capacity。capacity は 対象外行→ignored / それ以外→unprocessed に計上。
+  // unprocessed>0 は「まだ消込も対象外もしていない入荷」= 一括割当で0にすべき残り。
+  const totals = { totalGood: 0, allocated: 0, ignored: 0, unprocessed: 0, unprocessedLines: 0,
+    conflictLines: 0, conflictAllocated: 0 };
   for (const i of items) {
     const allocated = alloc.get(i.id) || 0;
+    const capacity = Math.max(0, i.good_qty - allocated);
     const row = {
       id: i.id, slip: i.slip, receiptDate: i.receipt_date, supplierCode: i.supplier_code,
       productCode: i.product_code, productKey: i.product_key,
       productName: nameByKey.get(i.product_key) || '',
       goodQty: i.good_qty, defectiveQty: i.defective_qty, unitCost: i.unit_cost,
-      allocated, remainingCapacity: Math.max(0, i.good_qty - allocated),
+      allocated, remainingCapacity: capacity,
     };
     if (i.superseded) {
-      if (allocated > 0) conflicts.push({ ...row, kind: 'superseded_with_alloc' });
-      continue; // 割当なしのsupersededは表示しない (訂正で消えた行)
+      // 訂正で消えた行。割当が残っていれば競合 (別枠で警告)。網羅性の分母には入れない
+      if (allocated > 0) { conflicts.push({ ...row, kind: 'superseded_with_alloc' }); totals.conflictLines++; totals.conflictAllocated += allocated; }
+      continue;
     }
-    if (i.ignored) { ignored.push(row); continue; }
-    if (row.remainingCapacity > 0) open.push(row);
+    totals.totalGood += i.good_qty;
+    totals.allocated += allocated;
+    if (i.ignored) { totals.ignored += capacity; ignored.push(row); continue; }
+    if (capacity > 0) { totals.unprocessed += capacity; totals.unprocessedLines++; open.push(row); }
+    // capacity===0 かつ 非対象外 = 完全割当済み (allocated に計上済み)
   }
-  return { open, ignored, conflicts };
+  // 保存則が破れていたら壊れている (通常あり得ない)。UI/監視が気付けるようフラグ化
+  totals.balanced = (totals.allocated + totals.ignored + totals.unprocessed) === totals.totalGood;
+  return { open, ignored, conflicts, totals };
 }
 
 /**
@@ -377,13 +390,22 @@ export function candidatesFor(inboundItemId) {
   return { item: { ...item, capacity }, candidates };
 }
 
+/** 候補POを「古い発注から」順に並べる (FIFO引き当ての正本順序。preview/実行の両方がこれを使う) */
+export function sortCandidatesFifo(cands) {
+  return [...cands].sort((a, b) => String(a.issuedAt).localeCompare(String(b.issuedAt)) || (a.orderItemId - b.orderItemId));
+}
+
 /**
- * ⚡一括割当の提案 (書込なし)。自動で割当できるのは「候補が1つに確定し、入庫数がPO残以下」の行だけ。
- * 曖昧 (候補複数)・過納・候補なしは理由付きでskippedへ (従来どおり手動)。実行はUIの確認後に /auto-assign
+ * ⚡一括割当の提案 (書込なし)。考え方 (中原さん 2026-07-15: 注残管理はシンプルに):
+ *  - 古い注残 (発注) から順にFIFOで引き当てる。複数POに累積していても古い方から自動で消す
+ *  - 注残より多く入荷したら注残は全量消込し、超過分だけを対象外にする
+ *    (行ごと対象外にするとPO残が「未入荷」のまま残り、二重発注・不要な督促の元、Codex ig-R1 High-2)
+ *  - 注残がない商品の入庫はスルー (=対象外。↩で戻せる記録付き)
+ *  - 一括割当を実行したら全行が処理し切られる。手動に残るのは異常系 (候補計算エラー・一部割当済みの残余) のみ
  */
 export function autoAssignPreview() {
   const { open } = listInbound();
-  const proposals = [], skipped = [];
+  const proposals = [], skipped = [], autoIgnores = [];
   // 同じPO明細へ複数の入庫行が向かう場合は数量を累積して残数を表示する
   // (独立計算だと両方「20→15」に見えて実際は残10、Codex inb-R1 Medium)
   const cumByItem = new Map();
@@ -391,34 +413,73 @@ export function autoAssignPreview() {
     let cands;
     try { cands = candidatesFor(row.id).candidates; }
     catch (e) { skipped.push({ ...row, reason: `候補計算エラー: ${e.message}` }); continue; }
-    if (!cands.length) { skipped.push({ ...row, reason: '対応する発注残がありません (未発注/対象外?)' }); continue; }
-    if (cands.length > 1) { skipped.push({ ...row, reason: `候補が${cands.length}件あります (手動で選択してください)` }); continue; }
-    const c = cands[0];
-    const prior = cumByItem.get(c.orderItemId) || 0;
-    const effRemaining = c.remaining - prior; // このバッチ内の先行提案分を差し引いた実効PO残
-    if (row.remainingCapacity > effRemaining) {
-      skipped.push({ ...row, reason: `入庫数(${row.remainingCapacity})がPO残(${effRemaining}${prior ? ` — 同一POへの先行提案${prior}を差引後` : ''})を超えています (手動で分割してください)` });
+    // 古い発注から順にFIFOで引き当て (1入庫行を複数POへ分割することもある)
+    const rowProps = [];
+    let rest = row.remainingCapacity;
+    for (const c of sortCandidatesFifo(cands)) {
+      if (rest <= 0) break;
+      const prior = cumByItem.get(c.orderItemId) || 0;
+      const eff = c.remaining - prior; // このバッチ内の先行提案分を差し引いた実効PO残
+      if (eff <= 0) continue;
+      const q = Math.min(rest, eff);
+      rowProps.push({
+        inboundItemId: row.id, slip: row.slip, receiptDate: row.receiptDate, supplierCode: row.supplierCode,
+        productCode: row.productCode, productName: row.productName, qty: q,
+        excessQty: 0, // 行の最終割当にだけ超過分を載せる (下で設定)
+        orderItemId: c.orderItemId, orderId: c.orderId, poNumber: c.poNumber, supplierName: c.supplierName,
+        poRemaining: eff, postRemaining: eff - q, costDiff: c.costDiff,
+        due: c.due || null, // 残数の扱いの日付既定 (分納待ち=次回予定日 / 確認中=期限)
+      });
+      cumByItem.set(c.orderItemId, prior + q);
+      rest -= q;
+    }
+    if (!rowProps.length) {
+      // 引き当てられるPO残が1つもない: 未発注分の入庫 or 先行提案で全量超過 → 対象外 (スルー)
+      // 一部割当済みの行だけは対象外にできない (台帳と矛盾したまま隠れる、DBトリガも拒否) → 手動へ
+      if (row.allocated > 0) skipped.push({ ...row, reason: '一部割当済みで残りに対応する発注残がありません (逆仕訳などで手動対応してください)' });
+      else autoIgnores.push({ inboundItemId: row.id, slip: row.slip, productCode: row.productCode, productName: row.productName,
+        qty: row.remainingCapacity, reason: cands.length ? `入庫数(${row.remainingCapacity})が注残を超過 (先行分で注残は消込済み)` : '対応する発注残なし (未発注分の入庫)' });
       continue;
     }
-    cumByItem.set(c.orderItemId, prior + row.remainingCapacity);
-    proposals.push({
-      inboundItemId: row.id, slip: row.slip, receiptDate: row.receiptDate, supplierCode: row.supplierCode,
-      productCode: row.productCode, productName: row.productName, qty: row.remainingCapacity,
-      orderItemId: c.orderItemId, orderId: c.orderId, poNumber: c.poNumber, supplierName: c.supplierName,
-      poRemaining: effRemaining, postRemaining: effRemaining - row.remainingCapacity, costDiff: c.costDiff,
-      due: c.due || null, // 残数の扱いの日付既定 (分納待ち=次回予定日 / 確認中=期限)
-    });
+    if (rest > 0) rowProps[rowProps.length - 1].excessQty = rest; // 注残を超えた分は最終割当と同時に対象外へ
+    proposals.push(...rowProps);
   }
   // 残数の扱いは「PO明細ごとに最後の提案行」でだけ選択させる (途中行の設定は最後の行で上書きされるため)
   const lastIdxByItem = new Map();
   proposals.forEach((p, i) => lastIdxByItem.set(p.orderItemId, i));
   proposals.forEach((p, i) => { p.needsRemainder = lastIdxByItem.get(p.orderItemId) === i && p.postRemaining > 0; });
-  return { proposals, skipped };
+  return { proposals, skipped, autoIgnores };
 }
 
-/** 対象外の指定/解除 (履歴型) */
-export function setInboundIgnore(inboundItemId, { ignore, reason = null, actor = null }) {
+/** 取込履歴 (いつ・何を・何個入荷したか)。バッチ=1回のCSVアップロード */
+export function listInboundBatches(limit = 50) {
   const db = getDB();
+  return db.prepare(`
+    SELECT b.id, b.file_name, b.imported_at, b.row_count, b.receipt_count, b.actor,
+           COALESCE((SELECT SUM(i.good_qty) FROM po_inbound_items i WHERE i.batch_id = b.id), 0) AS total_good,
+           (SELECT COUNT(*) FROM po_inbound_items i WHERE i.batch_id = b.id) AS line_count
+    FROM po_inbound_batches b ORDER BY b.id DESC LIMIT ?`).all(Math.max(1, Math.min(200, limit)));
+}
+
+/** 取込バッチの明細 (そのアップロードで追加された行) */
+export function inboundBatchLines(batchId) {
+  const db = getDB();
+  const batch = db.prepare('SELECT * FROM po_inbound_batches WHERE id=?').get(batchId);
+  if (!batch) throw new Error(`取込履歴が存在しません: ${batchId}`);
+  const nameByKey = new Map();
+  try { for (const r of loadPml().rows) nameByKey.set(normProductCode(r['商品コード']), r['商品名'] || ''); } catch { /* PML未同期環境 */ }
+  const lines = db.prepare(`
+    SELECT i.id, r.source_key AS slip, r.receipt_date, i.product_code, i.product_key, i.good_qty, i.defective_qty, i.unit_cost, i.superseded
+    FROM po_inbound_items i JOIN po_inbound_receipts r ON r.id = i.receipt_id
+    WHERE i.batch_id = ? ORDER BY r.source_key DESC, i.id`).all(batchId)
+    .map(l => ({ ...l, productName: nameByKey.get(l.product_key) || '' }));
+  return { batch, lines };
+}
+
+/** 対象外の指定/解除 (履歴型)。scope: 'row'=行全体 (割当ゼロのみ) / 'excess'=注残超過分の残余だけ (割当済みの行のみ、#525) */
+export function setInboundIgnore(inboundItemId, { ignore, reason = null, actor = null, scope = 'row' }) {
+  const db = getDB();
+  if (scope !== 'row' && scope !== 'excess') throw new Error(`scopeが不正です: ${scope}`);
   const tx = db.transaction(() => {
     const item = db.prepare('SELECT id, superseded FROM po_inbound_items WHERE id=?').get(inboundItemId);
     if (!item) throw new Error(`入庫明細が存在しません: ${inboundItemId}`);
@@ -427,14 +488,16 @@ export function setInboundIgnore(inboundItemId, { ignore, reason = null, actor =
     if (ignore) {
       if (active) return { changed: false };
       if (!reason || !String(reason).trim()) throw new Error('対象外には理由が必要です');
-      // 割当が残る入庫を対象外にすると台帳と矛盾したまま画面から隠れる (Codex P14-R1 High-1)
       if (item.superseded) throw new Error('訂正で無効化された行は対象外にできません (競合の解消を先に)');
       const alloc = db.prepare(`SELECT COALESCE(SUM(e.qty),0) AS n FROM po_item_events e
         WHERE e.inbound_item_id=? AND e.event_type='receipt'
           AND NOT EXISTS (SELECT 1 FROM po_item_events r WHERE r.reverses_id=e.id)`).get(inboundItemId).n;
-      if (alloc > 0) throw new Error(`割当 (${alloc}) が残っています。先に発注残ページから逆仕訳してください`);
-      db.prepare('INSERT INTO po_inbound_ignores (inbound_item_id, reason, created_at, actor) VALUES (?,?,?,?)')
-        .run(inboundItemId, String(reason).trim(), now, actor);
+      // row=割当が残る入庫を丸ごと対象外にすると台帳と矛盾したまま隠れる (Codex P14-R1 High-1)
+      // excess=割当済みの行の残余だけを対象外にする (注残超過分。割当ゼロならrowを使う)
+      if (scope === 'row' && alloc > 0) throw new Error(`割当 (${alloc}) が残っています。先に発注残ページから逆仕訳してください`);
+      if (scope === 'excess' && alloc === 0) throw new Error('超過分の対象外は割当済みの行にだけ使えます');
+      db.prepare('INSERT INTO po_inbound_ignores (inbound_item_id, reason, scope, created_at, actor) VALUES (?,?,?,?,?)')
+        .run(inboundItemId, String(reason).trim(), scope, now, actor);
     } else {
       if (!active) return { changed: false };
       db.prepare('UPDATE po_inbound_ignores SET revoked_at=?, revoked_by=? WHERE id=?').run(now, actor, active.id);
