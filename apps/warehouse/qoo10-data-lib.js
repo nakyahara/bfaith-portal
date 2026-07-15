@@ -96,6 +96,29 @@ function dateFromFileName(name) {
   return normalizeDate(m[1]);
 }
 
+/** ファイル名の要求期間マーカー `_d<from>_<to>_` (fetcherの命名契約)。
+ *  scope置換の範囲は「要求期間」が正 — 実データのmin/maxをscopeにすると
+ *  中抜けファイルで既存日を巻き添え削除する (Codex R1 High) */
+function rangeFromFileName(name) {
+  const m = name.match(/_d(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})_/);
+  if (!m) return null;
+  const from = normalizeDate(m[1]);
+  const to = normalizeDate(m[2]);
+  return (from && to && from <= to) ? { from, to } : null;
+}
+
+function enumerateDates(from, to) {
+  const out = [];
+  let cur = from;
+  while (cur <= to) {
+    out.push(cur);
+    const d = new Date(cur + 'T00:00:00Z');
+    d.setUTCDate(d.getUTCDate() + 1);
+    cur = d.toISOString().slice(0, 10);
+  }
+  return out;
+}
+
 /** セル値 → 検証済みプリミティブ。数式セルは拒否 (Codex: cached resultを無条件に信用しない) */
 function cellVal(cell, ctx) {
   const v = cell.value;
@@ -133,14 +156,17 @@ function pvVal(cell, ctx) {
   return n;
 }
 
-/** CVR% — セルのnumFmtに%があれば比率→%換算 */
+/** CVR% — セルのnumFmtに%があれば比率→%換算。値域0〜100で fail-closed
+ *  (「百分率の値+%書式」への仕様変更で250%等になる二重換算を検出 — Codex Medium) */
 function cvrVal(cell, ctx) {
   const v = cellVal(cell, ctx);
   if (v === null || v === undefined || v === '') return null;
   const n = Number(v);
   if (!Number.isFinite(n)) throw new Error(`CVRが数値でない (${ctx}: 「${v}」)`);
   const fmt = String(cell.numFmt || '');
-  return fmt.includes('%') ? n * 100 : n;
+  const pct = fmt.includes('%') ? n * 100 : n;
+  if (pct < 0 || pct > 100) throw new Error(`CVRが値域外 (${ctx}: ${pct})。単位判定/仕様変更の疑い`);
+  return pct;
 }
 
 /** ヘッダ行を探す (先頭5行から「開始日」を含む行)。列マップを返す */
@@ -248,9 +274,16 @@ function parseStoreSheet(name, ws, hdr) {
     const visitors = pvVal(row.getCell(c.visitors), `r${r} 訪問者数`);
     const orders = pvVal(row.getCell(c.orders), `r${r} 注文完了`);
     const cvr = cvrVal(row.getCell(c.cvr), `r${r} CVR`);
-    // 検算: PV合計 vs チャネル合計 (差は許容して記録 — 未分類PVがあり得る)
+    // 検算: PV合計 vs チャネル合計 (_全体小計は除外済み)。実サンプルで差0を確認済みのため、
+    // 小差=warning+記録 (未分類PVの可能性) / 大差=エラー (チャネル欠落・列誤認の fail-closed — Codex Medium)
     const diff = pvTotal === null ? null : pvTotal - chSum;
-    if (diff !== null && diff !== 0) warnings.push(`${d}: PV合計${pvTotal}≠チャネル計${chSum} (差${diff})`);
+    if (diff !== null && diff !== 0) {
+      const tol = Math.max(10, Math.round((pvTotal ?? 0) * 0.1));
+      if (Math.abs(diff) > tol) {
+        throw new Error(`PV合計とチャネル計の大差 (${d}: 合計${pvTotal} vs 計${chSum}、差${diff} > 許容${tol})。チャネル列欠落/列誤認の疑い`);
+      }
+      warnings.push(`${d}: PV合計${pvTotal}≠チャネル計${chSum} (差${diff})`);
+    }
     // 検算: CVR ≈ orders/visitors*100 (丸め差1.0pt許容)
     if (cvr !== null && visitors > 0 && orders !== null) {
       const calc = (orders / visitors) * 100;
@@ -263,7 +296,15 @@ function parseStoreSheet(name, ws, hdr) {
   }
   if (cvrRecords.length === 0) return { name, ok: false, type: 'qoo10_cvr_daily', error: 'データ行が0件' };
   const dates = [...seenDates].sort();
-  const scope = { scopeFrom: dates[0], scopeTo: dates[dates.length - 1] };
+  // scope = ファイル名の要求期間 (無ければ実データ範囲)。中抜け検出 (Codex R1 High):
+  // 店舗版はゼロの日も必ず行が出る (実測) → scope内の全日が揃っていなければエラー
+  // (揃っていないファイルでscope置換すると既存の正常日を巻き添え削除する)
+  const range = rangeFromFileName(name) || { from: dates[0], to: dates[dates.length - 1] };
+  const missing = enumerateDates(range.from, range.to).filter((d) => !seenDates.has(d));
+  const outside = dates.filter((d) => d < range.from || d > range.to);
+  if (outside.length > 0) return { name, ok: false, type: 'qoo10_cvr_daily', error: `要求期間 ${range.from}〜${range.to} 外の日付: ${outside.slice(0, 3).join(', ')}` };
+  if (missing.length > 0) return { name, ok: false, type: 'qoo10_cvr_daily', error: `期間内に欠落日: ${missing.slice(0, 5).join(', ')} (中抜けファイルはscope置換不可)` };
+  const scope = { scopeFrom: range.from, scopeTo: range.to };
   return {
     name, ok: true,
     label: `Analytics店舗CVR (${dates.length}日, チャネル${cols.length}種)`,
@@ -302,8 +343,11 @@ function parseItemSheet(name, ws, hdr) {
     seen.add(key);
     dates.add(d);
     const sellerRaw = trimS(cellVal(row.getCell(c.seller), `r${r} SKU`));
-    if (!items.has(itemNo)) {
+    // マスタは「最新の日付の行」の属性を採用 (最初の行固定だと期間途中の名称/SKU変更を取り逃す — Codex Medium)
+    const prev = items.get(itemNo);
+    if (!prev || d >= prev._d) {
       items.set(itemNo, {
+        _d: d,
         item_no: itemNo, seller_code_raw: sellerRaw || null,
         seller_code: sellerRaw ? normSku(sellerRaw) : null,
         item_name: trimS(cellVal(row.getCell(c.name), `r${r} 商品名`)).slice(0, 300) || null,
@@ -322,15 +366,24 @@ function parseItemSheet(name, ws, hdr) {
   }
   if (records.length === 0) return { name, ok: false, type: 'qoo10_item_traffic_daily', error: 'データ行が0件' };
   const ds = [...dates].sort();
-  const scope = { scopeFrom: ds[0], scopeTo: ds[ds.length - 1] };
+  // 商品版は (日×商品) がsparse (活動のない日は行が無い) → 中抜けは正常。
+  // scope = ファイル名の要求期間 (fetcher契約)。マーカー無し (手動DL等) は実データ日付のみ置換
+  // (min〜maxをscopeにすると中抜け日を巻き添え削除する — Codex R1 High)
+  const range = rangeFromFileName(name);
+  const outside = range ? ds.filter((d) => d < range.from || d > range.to) : [];
+  if (outside.length > 0) return { name, ok: false, type: 'qoo10_item_traffic_daily', error: `要求期間 ${range.from}〜${range.to} 外の日付: ${outside.slice(0, 3).join(', ')}` };
+  const scope = range
+    ? { scopeFrom: range.from, scopeTo: range.to }
+    : { scopeFrom: ds[0], scopeTo: ds[ds.length - 1], scopeDatesOnly: ds };
+  const masterRecords = [...items.values()].map(({ _d, ...rest }) => rest);
   return {
     name, ok: true,
     label: `Analytics商品別トラフィック (${ds.length}日×${items.size}商品, sparse ${records.length}行)`,
-    warnings: [],
+    warnings: range ? [] : ['ファイル名に期間マーカーなし → 実データ日付のみ置換 (期間全体の置換はfetcher命名 qoo10_cvritem_d<from>_<to>_ で)'],
     dateFrom: scope.scopeFrom, dateTo: scope.scopeTo,
     preps: [
       { type: 'qoo10_item_traffic_daily', records, ...scope },
-      { type: 'qoo10_items', records: [...items.values()], ...scope },
+      { type: 'qoo10_items', records: masterRecords, ...scope },
     ],
   };
 }
@@ -370,7 +423,13 @@ function commitPrep(db, logStmt, p, ctx, extraMsg) {
   const importId = logInfo.lastInsertRowid;
   const meta = { source_file: ctx.fileName.slice(0, 200), import_id: importId, imported_at: ctx.importedAt, updated_at: ctx.importedAt };
   if (spec.scopeReplace) {
-    replaced = db.prepare(`DELETE FROM ${spec.table} WHERE date_jst >= ? AND date_jst <= ?`).run(p.scopeFrom, p.scopeTo).changes;
+    if (p.scopeDatesOnly) {
+      // マーカー無しファイル: 実データ日付のみ置換 (中抜け日の巻き添え削除防止)
+      const del = db.prepare(`DELETE FROM ${spec.table} WHERE date_jst = ?`);
+      for (const d of p.scopeDatesOnly) replaced += del.run(d).changes;
+    } else {
+      replaced = db.prepare(`DELETE FROM ${spec.table} WHERE date_jst >= ? AND date_jst <= ?`).run(p.scopeFrom, p.scopeTo).changes;
+    }
     const ins = db.prepare(`INSERT INTO ${spec.table}
       (${spec.cols.join(', ')}, source_file, import_id, imported_at, updated_at)
       VALUES (${spec.cols.map(k => '@' + k).join(', ')}, @source_file, @import_id, @imported_at, @updated_at)`);

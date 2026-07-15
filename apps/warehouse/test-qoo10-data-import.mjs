@@ -178,6 +178,54 @@ console.log('=== 6. ガード類 ===');
   // 実サンプル (miniPCから回収済みのファイルがある場合のみ)
 }
 
+console.log('=== 6b. scope安全性 (Codex R1 High/Medium対応) ===');
+{
+  // 店舗版の中抜け: 要求期間 7/20〜7/22 なのに 7/21 が無い → エラー (巻き添え削除防止)
+  const pv = zeroPv(); pv[5] = 1;
+  const gap = await makeStoreXlsx([
+    { date: '2026-07-20', pv, total: 1, visitors: 1, cart: 0, orders: 0, cvr: 0 },
+    { date: '2026-07-22', pv, total: 1, visitors: 1, cart: 0, orders: 0, cvr: 0 },
+  ]);
+  const p1 = await prepareQoo10File('qoo10_cvr_d2026-07-20_2026-07-22_x.xlsx', gap);
+  check('店舗版の中抜けは拒否', !p1.ok && /欠落日/.test(p1.error), p1.ok ? 'ok?' : p1.error);
+
+  // 商品版マーカー無し: 実データ日付のみ置換 (中間日を巻き添えしない)
+  const pvA = zeroPv(); pvA[5] = 2;
+  const mid = await makeItemXlsx([{ date: '2026-07-21', itemNo: 'MID', sku: 'mid', name: '中間日', pv: pvA, total: 2 }]);
+  await importQoo10File(db, { name: 'qoo10_cvritem_d2026-07-21_2026-07-21_mid.xlsx', buffer: mid, sha256: sha(mid), source: 'test' });
+  const noMarker = await makeItemXlsx([
+    { date: '2026-07-20', itemNo: 'EDGE', sku: 'e1', name: '端', pv: pvA, total: 2 },
+    { date: '2026-07-22', itemNo: 'EDGE', sku: 'e1', name: '端', pv: pvA, total: 2 },
+  ]);
+  const r = await importQoo10File(db, { name: 'manual-download.xlsx', buffer: noMarker, sha256: sha(noMarker), source: 'test' });
+  check('マーカー無し取込ok (warning付)', r.status === 'ok' && (r.results[0].warnings || []).some((w) => /期間マーカー/.test(w)), JSON.stringify(r.results).slice(0, 150));
+  const midRow = db.prepare(`SELECT COUNT(*) n FROM fact_qoo10_item_traffic_daily WHERE date_jst='2026-07-21'`).get().n;
+  check('中間日 (7/21) が巻き添え削除されない', midRow > 0, `got ${midRow}`);
+
+  // CVR値域外 (二重換算検知)
+  const pvz2 = zeroPv(); pvz2[5] = 4;
+  const badCvr = await makeStoreXlsx([{ date: '2026-07-23', pv: pvz2, total: 4, visitors: 2, cart: 0, orders: 1, cvr: 250 }]);
+  const p2 = await prepareQoo10File('qoo10_cvr_d2026-07-23_2026-07-23_x.xlsx', badCvr);
+  check('CVR値域外は拒否', !p2.ok && /値域外/.test(p2.error), p2.ok ? 'ok?' : p2.error);
+
+  // PV合計の大差 (チャネル欠落疑い) はエラー
+  const pvd = zeroPv(); pvd[5] = 5;
+  const bigDiff = await makeStoreXlsx([{ date: '2026-07-24', pv: pvd, total: 100, visitors: 3, cart: 0, orders: 0, cvr: 0 }]);
+  const p3 = await prepareQoo10File('qoo10_cvr_d2026-07-24_2026-07-24_x.xlsx', bigDiff);
+  check('PV合計の大差は拒否', !p3.ok && /大差/.test(p3.error), p3.ok ? 'ok?' : p3.error);
+
+  // マスタは最新日の属性を採用
+  const old = zeroPv(); old[5] = 1;
+  const two = await makeItemXlsx([
+    { date: '2026-07-25', itemNo: 'REN', sku: 'old-sku', name: '旧名', pv: old, total: 1 },
+    { date: '2026-07-26', itemNo: 'REN', sku: 'new-sku', name: '新名', pv: old, total: 1 },
+  ]);
+  const r2 = await importQoo10File(db, { name: 'qoo10_cvritem_d2026-07-25_2026-07-26_x.xlsx', buffer: two, sha256: sha(two), source: 'test' });
+  check('取込ok', r2.status === 'ok');
+  const m2 = db.prepare(`SELECT seller_code_raw, item_name FROM m_qoo10_items WHERE item_no='REN'`).get();
+  check('マスタ=最新日の属性', m2?.seller_code_raw === 'new-sku' && m2?.item_name === '新名', JSON.stringify(m2));
+}
+
 console.log('=== 7. 実サンプル (取得済みがあれば) ===');
 {
   const samples = [

@@ -131,36 +131,37 @@ async function persistXlsx(buf, destName, { reportType, expectDaily, from, to })
   });
 }
 
-/** 1窓 (from〜to) の2ファイルを取得 */
-async function fetchWindow(page, from, to, outcomes) {
+/** 1窓 (from〜to) の2ファイルを取得。失敗はファイル別に記録 (店舗版と商品版を混同しない — Codex Low) */
+async function fetchWindow(page, from, to, outcomes, failures) {
   console.log(`\n--- Analytics ${from}〜${to} ---`);
   await gotoQoo10Page(page, `${ANALYTICS_BASE}/conversion`, 'Analytics トラフィック/CV');
   await setPeriod(page, from, to);
   const ts = new Date().toISOString().replace(/[-:.]/g, '').replace('Z', '');
 
-  // 1. 店舗版
-  {
-    const dlP = page.waitForEvent('download', { timeout: 90000 });
-    dlP.catch(() => {});
-    await page.locator('text=エクセルダウンロード').first().click({ timeout: 10000 });
-    const dl = await dlP;
-    const buf = await readFile(await dl.path());
-    await persistXlsx(buf, `qoo10_cvr_d${from}_${to}_${ts}.xlsx`, {
-      reportType: 'qdata_cvr', expectDaily: 'qoo10_cvr_daily', from, to,
-    });
-    outcomes.push({ spec: 'cvr', ym: from, status: 'ok' });
-  }
-  // 2. 日付・商品別
-  {
-    const dlP = page.waitForEvent('download', { timeout: 120000 });
-    dlP.catch(() => {});
-    await page.locator('text=日付・商品別エクセルダウンロード').first().click({ timeout: 10000 });
-    const dl = await dlP;
-    const buf = await readFile(await dl.path());
-    await persistXlsx(buf, `qoo10_cvritem_d${from}_${to}_${ts}.xlsx`, {
-      reportType: 'qdata_cvr_item', expectDaily: 'qoo10_item_traffic_daily', from, to,
-    });
-    outcomes.push({ spec: 'cvr_item', ym: from, status: 'ok' });
+  const parts = [
+    { spec: 'cvr', reportType: 'qdata_cvr', expectDaily: 'qoo10_cvr_daily',
+      linkText: 'エクセルダウンロード', dlTimeout: 90000, dest: `qoo10_cvr_d${from}_${to}_${ts}.xlsx` },
+    { spec: 'cvr_item', reportType: 'qdata_cvr_item', expectDaily: 'qoo10_item_traffic_daily',
+      linkText: '日付・商品別エクセルダウンロード', dlTimeout: 120000, dest: `qoo10_cvritem_d${from}_${to}_${ts}.xlsx` },
+  ];
+  for (const part of parts) {
+    try {
+      const dlP = page.waitForEvent('download', { timeout: part.dlTimeout });
+      dlP.catch(() => {});
+      // 「エクセルダウンロード」は「日付・商品別エクセルダウンロード」の部分文字列 → 完全一致で選ぶ
+      await page.locator(`text="${part.linkText}"`).first().click({ timeout: 10000 });
+      const dl = await dlP;
+      const buf = await readFile(await dl.path());
+      await persistXlsx(buf, part.dest, { reportType: part.reportType, expectDaily: part.expectDaily, from, to });
+      outcomes.push({ spec: part.spec, ym: from, status: 'ok' });
+    } catch (e) {
+      if (String(e.message).startsWith('2FA_REQUIRED')) throw e;
+      console.error(`✗ ${part.spec} ${from}〜${to}: ${e.message}`);
+      await snap(page, `${part.spec}_${from}_error`);
+      await logFetch({ report_type: part.reportType, period_from: from, period_to: to, status: 'error', message: e.message });
+      outcomes.push({ spec: part.spec, ym: from, status: 'error' });
+      failures.push({ reportType: part.reportType, ym: from, error: e.message, url: page.url(), screenshot: join(OUT_DIR, `qdata_${part.spec}_${from}_error.png`) });
+    }
   }
 }
 
@@ -233,13 +234,14 @@ async function main() {
 
     for (const [from, to] of windows) {
       try {
-        await fetchWindow(page, from, to, outcomes);
+        await fetchWindow(page, from, to, outcomes, failures);
       } catch (e) {
-        console.error(`✗ ${from}〜${to}: ${e.message}`);
-        await snap(page, `${from}_error`);
-        await logFetch({ report_type: 'qdata_cvr', period_from: from, period_to: to, status: 'error', message: e.message });
-        outcomes.push({ spec: 'cvr', ym: from, status: 'error' });
-        failures.push({ reportType: 'qdata_cvr', ym: from, error: e.message, url: page.url(), screenshot: join(OUT_DIR, `qdata_${from}_error.png`) });
+        // ここに来るのは窓のセットアップ (goto/setPeriod) 失敗のみ (ファイル別失敗は fetchWindow 内で記録済み)
+        console.error(`✗ window ${from}〜${to}: ${e.message}`);
+        await snap(page, `window_${from}_error`);
+        await logFetch({ report_type: 'qdata_window', period_from: from, period_to: to, status: 'error', message: e.message });
+        outcomes.push({ spec: 'window', ym: from, status: 'error' });
+        failures.push({ reportType: 'qdata_window', ym: from, error: e.message, url: page.url(), screenshot: join(OUT_DIR, `qdata_window_${from}_error.png`) });
         if (String(e.message).startsWith('2FA_REQUIRED')) throw e;
       }
     }
