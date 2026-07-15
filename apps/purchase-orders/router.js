@@ -869,6 +869,7 @@ router.post('/api/inbound/auto-assign', (req, res) => {
     // (実処理と「最終行」判定はリクエスト順=順序は意味のある入力。順序違いをreplayさせない、Codex inb-R2 Medium)
     const canonical = assignments.map(a => ({
       inboundItemId: Number(a && a.inboundItemId), orderItemId: Number(a && a.orderItemId), qty: Number(a && a.qty),
+      excess: !!(a && a.excess), // 注残超過行: PO残まで割当+残余を対象外
       remainder: a && a.remainder ? {
         action: a.remainder.action ?? null,
         keepQty: a.remainder.keepQty ?? null,
@@ -884,6 +885,14 @@ router.post('/api/inbound/auto-assign', (req, res) => {
       const results = [];
       const seenInbound = new Set(); // 同一入庫行の重複指定 (分割割当の細工) は拒否 (Codex inb-R3 Medium)
       ignoreIds.forEach(id => seenInbound.add(id)); // 割当と対象外の重複指定も「複数回指定」として拒否される
+      // 対象外の事前検証: 割当処理の「前」の状態で候補が複数ある行は対象外にできない
+      // (同一リクエストの割当で候補を消費し尽くして「候補なし」に見せかける細工の遮断、Codex ig-R1 High-1)
+      for (const iid of ignoreIds) {
+        const pre = candidatesFor(iid);
+        if (pre.candidates.length > 1) {
+          throw new Error(`入庫明細 ${iid}: 候補が複数あります。対象外にせず手動で選択してください (画面を更新してやり直してください)`);
+        }
+      }
       for (let idx = 0; idx < assignments.length; idx++) {
         const a = assignments[idx];
         const iid = Number(a && a.inboundItemId), oid = Number(a && a.orderItemId), qty = Number(a && a.qty);
@@ -905,9 +914,16 @@ router.post('/api/inbound/auto-assign', (req, res) => {
         if (chk.candidates.length !== 1 || chk.candidates[0].orderItemId !== oid) {
           throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 割当先の候補が変わっています。画面を更新してやり直してください`);
         }
-        // ⚡一括割当の契約は「未割当入庫の全量割当」。部分量や過少の細工は拒否 (Codex inb-R3 Medium)
-        if (qty !== chk.item.capacity) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 数量(${qty})が入庫の未割当(${chk.item.capacity})と一致しません (画面を更新してやり直してください)`);
-        if (qty > chk.candidates[0].remaining) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: PO残(${chk.candidates[0].remaining})を超えています (画面を更新してやり直してください)`);
+        // ⚡一括割当の契約は「未割当入庫の全量割当」。部分量や過少の細工は拒否 (Codex inb-R3 Medium)。
+        // 例外=excess (注残超過行): PO残ちょうどまで割当し、残余は同一txnで対象外にする (#525)
+        const isExcess = a.excess === true;
+        if (isExcess) {
+          if (chk.item.capacity <= chk.candidates[0].remaining) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 超過扱いですが入庫(${chk.item.capacity})がPO残(${chk.candidates[0].remaining})以下です (画面を更新してやり直してください)`);
+          if (qty !== chk.candidates[0].remaining) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 超過行の割当数(${qty})がPO残(${chk.candidates[0].remaining})と一致しません (画面を更新してやり直してください)`);
+        } else {
+          if (qty !== chk.item.capacity) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: 数量(${qty})が入庫の未割当(${chk.item.capacity})と一致しません (画面を更新してやり直してください)`);
+          if (qty > chk.candidates[0].remaining) throw new Error(`伝票 ${inbound.slip} / ${inbound.product_code}: PO残(${chk.candidates[0].remaining})を超えています (画面を更新してやり直してください)`);
+        }
         // remainder.action は値の正当性だけ先に検証する。適用条件 (最終行・keep>0) の外でも不正値は400
         // (keepQty=0 や残0では適用されず素通りし、減数だけ実行されてしまう、Codex defer-R1 Medium)
         const rAct = a.remainder && a.remainder.action != null ? a.remainder.action : null;
@@ -963,6 +979,11 @@ router.post('/api/inbound/auto-assign', (req, res) => {
                   eventDate: inbound.receipt_date || null, actor, allowedActions: ['await_delivery', 'await_confirmation'] });
               }
             }
+          }
+          if (isExcess) {
+            // 注残超過分の残余だけを対象外に (scope='excess'。対象外リストから↩解除可能)
+            setInboundIgnore(iid, { ignore: true, scope: 'excess',
+              reason: `一括割当で対象外: 注残超過分 ${chk.item.capacity - qty} (入庫${chk.item.capacity}/PO残${qty})`, actor });
           }
           results.push({ inboundItemId: iid, orderItemId: oid, qty, remaining: ev.remaining, plan: plan ? plan.remainder_disposition || true : null });
         } catch (e) {
@@ -4443,16 +4464,18 @@ document.getElementById('autoAssignBtn').addEventListener('click', function() {
     if (!j.proposals.length && !j.skipped.length && !aIgn.length) { toast('未割当の入庫はありません'); return; }
     var h = '<div style="display:flex;align-items:center;gap:10px"><h2 style="margin:0">⚡ 一括割当の確認</h2>' +
       '<button class="ghost" id="inbModalClose" style="margin-left:auto">✕ 閉じる</button></div>' +
-      '<div class="hint">候補が1つに確定した入庫だけを自動で割り当てます。割当後にPO残が残る行は「<b>残す数</b>」を確認してください:<br>' +
+      '<div class="hint">候補が1つに確定した入庫を自動で割り当てます。注残に無い入庫は🚫対象外に、注残を超える入庫はPO残まで割当+超過分だけ対象外にします (どちらも後から↩戻せます)。割当後にPO残が残る行は「<b>残す数</b>」を確認してください:<br>' +
       'そのまま=注残に残す (📌あとで決める=日付入力なし。🚚分納待ち/❓確認中を選ぶと予定日を記録) ・ <b>0にする=残数を全て減数で消して完了</b> (原料不足で作れなかった等) ・ 途中の数=差分だけ減数して一部を残す。</div>';
     if (j.proposals.length) {
       h += '<div style="overflow-x:auto;max-height:45vh;overflow-y:auto"><table class="t"><tr><th>伝票NO</th><th>商品</th><th class="r">割当数</th><th>割当先PO</th><th class="r">PO残→割当後</th><th>残数の扱い</th></tr>' +
         j.proposals.map(function(p, i) {
           return '<tr><td>' + esc(p.slip) + '</td><td><b>' + esc(p.productCode) + '</b><div class="muted" style="font-size:11px">' + esc(p.productName || '') + '</div></td>' +
-            '<td class="r"><b>' + p.qty + '</b></td>' +
+            '<td class="r"><b>' + p.qty + '</b>' + (p.excessQty ? '<div class="muted" style="font-size:11px" title="発注していない分 (注残超過)。割当と同時に対象外として記録されます">+超過' + p.excessQty + '</div>' : '') + '</td>' +
             '<td>' + esc(p.poNumber || ('#' + p.orderId)) + (p.costDiff ? ' <span class="badge b-draft" title="入庫単価とPO単価が異なります">💴単価差</span>' : '') + '</td>' +
             '<td class="r">' + p.poRemaining + ' → ' + p.postRemaining + '</td>' +
-            '<td>' + (p.needsRemainder
+            '<td>' + (p.excessQty
+              ? '<span class="muted">🚫 超過 ' + p.excessQty + ' は対象外に (注残は全量消込)</span>'
+              : '') + (p.excessQty ? '' : p.needsRemainder
               ? '残す <input type="number" class="aaKeep" data-idx="' + i + '" value="' + p.postRemaining + '" min="0" max="' + p.postRemaining + '" step="1" style="width:70px"> / ' + p.postRemaining +
                 ' <span class="aaOpts" data-idx="' + i + '">' +
                 '<select class="aaRem" data-idx="' + i + '"><option value="defer">📌 あとで決める</option><option value="await_delivery">🚚 分納待ち</option><option value="await_confirmation">❓ 確認中</option></select> ' +
@@ -4530,6 +4553,7 @@ document.getElementById('autoAssignBtn').addEventListener('click', function() {
     if (go) go.addEventListener('click', function() {
       var bad = null;
       var assignments = j.proposals.map(function(p, i) {
+        if (p.excessQty) return { inboundItemId: p.inboundItemId, orderItemId: p.orderItemId, qty: p.qty, excess: true, remainder: null };
         if (!p.needsRemainder) return { inboundItemId: p.inboundItemId, orderItemId: p.orderItemId, qty: p.qty, remainder: null };
         var keepEl = document.querySelector('.aaKeep[data-idx="' + i + '"]');
         // 空欄はNumber('')=0=「全量減数」に化ける事故を防ぐ (Codex keep-R2 High)

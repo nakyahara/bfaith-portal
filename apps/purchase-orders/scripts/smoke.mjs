@@ -2928,34 +2928,71 @@ console.log('── 入庫取込プレビュー+一括割当 ──');
   ok(r.body.ok, 'auto-ignore: 取込');
   r = await j('/api/inbound/auto-assign/preview');
   const gNopo = (r.body.autoIgnores || []).find(x => x.slip === 'AI900');
-  const gOver = (r.body.autoIgnores || []).find(x => x.slip === 'AI901');
+  const gOver = r.body.proposals.find(x => x.slip === 'AI901');
   const gOk = r.body.proposals.find(x => x.slip === 'AI902');
   ok(gNopo && gNopo.reason.includes('発注残なし'), 'preview: 注残にない入庫は自動対象外に分類', gNopo && gNopo.reason);
-  ok(gOver && gOver.reason.includes('超過'), 'preview: 注残超過の入庫も自動対象外に分類', gOver && gOver.reason);
-  ok(gOk && gOk.qty === 6, 'preview: 割当可能な行は従来どおり提案', gOk);
+  ok(gOver && gOver.qty === 5 && gOver.excessQty === 4 && gOver.postRemaining === 0,
+    'preview: 注残超過はPO残まで割当+超過分だけ対象外 (9=割当5+超過4)', gOver);
+  ok(gOk && gOk.qty === 6 && !gOk.excessQty, 'preview: 割当可能な行は従来どおり提案', gOk);
   // 割当可能な行を ignores に細工 → 実行時再検証で全ロールバック
   r = await jpA('/api/inbound/auto-assign', { ignores: [{ inboundItemId: gOk.inboundItemId }] }, 'aa-ig-bad');
   ok(r.status === 400 && r.body.error.includes('割当できる可能性'), 'auto-ignore: 割当可能な行の対象外化は拒否 (再検証)', r.body.error);
-  // 割当+対象外の同時実行 (assignments空でもignoresだけでも可)
+  // 通常行に excess を細工 → 拒否 / 超過行の割当数がPO残と不一致 → 拒否
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: gOk.inboundItemId, orderItemId: gOk.orderItemId, qty: 6, excess: true },
+  ] }, 'aa-ex-bad1');
+  ok(r.status === 400 && r.body.error.includes('超過扱いですが'), 'excess: 超過していない行への excess 細工は拒否', r.body.error);
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: gOver.inboundItemId, orderItemId: gOver.orderItemId, qty: 9, excess: true },
+  ] }, 'aa-ex-bad2');
+  ok(r.status === 400 && r.body.error.includes('一致しません'), 'excess: PO残と違う割当数は拒否', r.body.error);
+  // 割当 (通常+超過) + 対象外を1txnで実行
   r = await jpA('/api/inbound/auto-assign', { assignments: [
     { inboundItemId: gOk.inboundItemId, orderItemId: gOk.orderItemId, qty: 6 },
-  ], ignores: [{ inboundItemId: gNopo.inboundItemId }, { inboundItemId: gOver.inboundItemId }] }, 'aa-ig-1');
-  ok(r.body.ok && r.body.assigned === 1 && r.body.ignored === 2, 'auto-ignore: 割当1+対象外2を1txnで実行', r.body);
+    { inboundItemId: gOver.inboundItemId, orderItemId: gOver.orderItemId, qty: 5, excess: true },
+  ], ignores: [{ inboundItemId: gNopo.inboundItemId }] }, 'aa-ig-1');
+  ok(r.body.ok && r.body.assigned === 2 && r.body.ignored === 1, 'auto-ignore: 割当2 (うち超過1)+対象外1を1txnで実行', r.body);
   r = await jpA('/api/inbound/auto-assign', { assignments: [
     { inboundItemId: gOk.inboundItemId, orderItemId: gOk.orderItemId, qty: 6 },
-  ], ignores: [{ inboundItemId: gNopo.inboundItemId }, { inboundItemId: gOver.inboundItemId }] }, 'aa-ig-1');
+    { inboundItemId: gOver.inboundItemId, orderItemId: gOver.orderItemId, qty: 5, excess: true },
+  ], ignores: [{ inboundItemId: gNopo.inboundItemId }] }, 'aa-ig-1');
   ok(r.body.ok && r.body.replay === true, 'auto-ignore: 同一キー再送はreplay');
   r = await j('/api/inbound');
   ok(r.body.ignored.some(x => x.slip === 'AI900') && r.body.ignored.some(x => x.slip === 'AI901'),
     'auto-ignore: 対象外リストに移動 (↩解除可能)');
   ok(!r.body.open.some(x => ['AI900', 'AI901', 'AI902'].includes(x.slip)), 'auto-ignore: 一括割当後に未処理行が残らない');
   ok(db.prepare('SELECT remaining_qty FROM v_po_item_balance b JOIN po_order_items i ON i.id=b.order_item_id WHERE i.product_key=?')
-    .get('aa-over-item').remaining_qty === 5, 'auto-ignore: 超過行の対象外化でPO残は変わらない (発注残に残る)');
+    .get('aa-over-item').remaining_qty === 0, 'excess: PO残は全量消込される (未入荷のまま残らない、Codex ig-R1 High-2)');
+  const exIg = db.prepare(`SELECT g.scope, g.reason FROM po_inbound_ignores g
+    JOIN po_inbound_items i ON i.id=g.inbound_item_id JOIN po_inbound_receipts rc ON rc.id=i.receipt_id
+    WHERE rc.source_key='AI901' AND g.revoked_at IS NULL`).get();
+  ok(exIg && exIg.scope === 'excess' && exIg.reason.includes('超過分 4'), 'excess: scope=excess で超過4を記録', exIg);
+  // 超過行の↩解除 → 残余4が未割当に戻る (割当5はそのまま)
+  const overRow = db.prepare(`SELECT i.id FROM po_inbound_items i JOIN po_inbound_receipts rc ON rc.id=i.receipt_id WHERE rc.source_key='AI901'`).get();
+  r = await jpA('/api/inbound/' + overRow.id + '/ignore', { ignore: false });
+  ok(r.body.ok, 'excess: ↩解除できる');
+  r = await j('/api/inbound');
+  const backRow = r.body.open.find(x => x.slip === 'AI901');
+  ok(backRow && backRow.allocated === 5 && backRow.remainingCapacity === 4, 'excess: 解除後は残余4が未割当に戻る (割当5維持)', backRow);
+  r = await jpA('/api/inbound/' + overRow.id + '/ignore', { ignore: true, reason: 'テスト後片付け (超過分)' });
+  ok(r.status === 400 || r.body.ok === false, 'excess: 手動の行対象外は割当済み行を拒否 (rowスコープ維持)', r.body && r.body.error);
+  // 候補が複数ある行は ignores に指定できない (割当で候補を消費してから対象外にする細工の遮断、Codex ig-R1 High-1)
+  insRow.run('aa-multi2-item', '複数候補対象外細工テスト', '0001', '取扱中', 2, 0, 0, 0, 0, 10, 1.5, 400, 200, '2026-07-01', '2026-01-01');
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'aa-multi2-item', qty: 4 }] }) });
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'aa-multi2-item', qty: 4 }] }) });
+  r = await up2('aj.csv', [HDR2, ['AJ950', 'aa-multi2-item', 'x', '0001', '200', '4', '0', '2026/07/15']]);
+  r = await j('/api/inbound/auto-assign/preview');
+  const gMul = r.body.skipped.find(x => x.slip === 'AJ950');
+  ok(gMul && gMul.reason.includes('候補が2件'), 'preview: 候補複数は従来どおり手動', gMul && gMul.reason);
+  r = await jpA('/api/inbound/auto-assign', { ignores: [{ inboundItemId: gMul.id }] }, 'aa-ig-mul');
+  ok(r.status === 400 && r.body.error.includes('候補が複数'), 'auto-ignore: 候補複数行の対象外指定は事前検証で拒否', r.body.error);
   // 割当と対象外の重複指定は拒否
   r = await jpA('/api/inbound/auto-assign', { assignments: [
-    { inboundItemId: gNopo.inboundItemId, orderItemId: gOk.orderItemId, qty: 7 },
-  ], ignores: [{ inboundItemId: gNopo.inboundItemId }] }, 'aa-ig-dup');
-  ok(r.status === 400 && r.body.error.includes('複数回'), 'auto-ignore: 割当と対象外の重複指定は拒否');
+    { inboundItemId: gMul.id, orderItemId: 1, qty: 4 },
+  ], ignores: [{ inboundItemId: gMul.id }] }, 'aa-ig-dup');
+  ok(r.status === 400, 'auto-ignore: 割当と対象外の重複指定は拒否');
   r = await jpA('/api/inbound/auto-assign', { assignments: [], ignores: [] }, 'aa-ig-empty');
   ok(r.status === 400, 'auto-ignore: 空リクエストは400');
 
