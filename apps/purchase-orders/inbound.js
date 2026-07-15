@@ -379,11 +379,13 @@ export function candidatesFor(inboundItemId) {
 
 /**
  * ⚡一括割当の提案 (書込なし)。自動で割当できるのは「候補が1つに確定し、入庫数がPO残以下」の行だけ。
- * 曖昧 (候補複数)・過納・候補なしは理由付きでskippedへ (従来どおり手動)。実行はUIの確認後に /auto-assign
+ * 注残に対応しない入庫 (候補なし/PO残超過) は自動で「対象外」に分類する (中原さん 2026-07-15:
+ * このアプリは注残しか管理していない=注残にない入庫・注残を上回る入庫は対象外として処理し、
+ * 一括割当を実行したら全行が処理し切られるイメージ)。曖昧 (候補複数) だけは従来どおり手動へ。
  */
 export function autoAssignPreview() {
   const { open } = listInbound();
-  const proposals = [], skipped = [];
+  const proposals = [], skipped = [], autoIgnores = [];
   // 同じPO明細へ複数の入庫行が向かう場合は数量を累積して残数を表示する
   // (独立計算だと両方「20→15」に見えて実際は残10、Codex inb-R1 Medium)
   const cumByItem = new Map();
@@ -391,13 +393,21 @@ export function autoAssignPreview() {
     let cands;
     try { cands = candidatesFor(row.id).candidates; }
     catch (e) { skipped.push({ ...row, reason: `候補計算エラー: ${e.message}` }); continue; }
-    if (!cands.length) { skipped.push({ ...row, reason: '対応する発注残がありません (未発注/対象外?)' }); continue; }
+    if (!cands.length) {
+      // 一部割当済みの行は対象外にできない (台帳と矛盾したまま隠れる、DBトリガも拒否) → 手動へ
+      if (row.allocated > 0) skipped.push({ ...row, reason: '一部割当済みで残りに対応する発注残がありません (逆仕訳などで手動対応してください)' });
+      else autoIgnores.push({ inboundItemId: row.id, slip: row.slip, productCode: row.productCode, productName: row.productName,
+        qty: row.remainingCapacity, reason: '対応する発注残なし (未発注分の入庫)' });
+      continue;
+    }
     if (cands.length > 1) { skipped.push({ ...row, reason: `候補が${cands.length}件あります (手動で選択してください)` }); continue; }
     const c = cands[0];
     const prior = cumByItem.get(c.orderItemId) || 0;
     const effRemaining = c.remaining - prior; // このバッチ内の先行提案分を差し引いた実効PO残
     if (row.remainingCapacity > effRemaining) {
-      skipped.push({ ...row, reason: `入庫数(${row.remainingCapacity})がPO残(${effRemaining}${prior ? ` — 同一POへの先行提案${prior}を差引後` : ''})を超えています (手動で分割してください)` });
+      if (row.allocated > 0) skipped.push({ ...row, reason: `一部割当済みで、残り(${row.remainingCapacity})がPO残(${effRemaining})を超えています (手動対応してください)` });
+      else autoIgnores.push({ inboundItemId: row.id, slip: row.slip, productCode: row.productCode, productName: row.productName,
+        qty: row.remainingCapacity, reason: `入庫数(${row.remainingCapacity})がPO残(${effRemaining}${prior ? ` — 同一POへの先行提案${prior}を差引後` : ''})を超過` });
       continue;
     }
     cumByItem.set(c.orderItemId, prior + row.remainingCapacity);
@@ -413,7 +423,32 @@ export function autoAssignPreview() {
   const lastIdxByItem = new Map();
   proposals.forEach((p, i) => lastIdxByItem.set(p.orderItemId, i));
   proposals.forEach((p, i) => { p.needsRemainder = lastIdxByItem.get(p.orderItemId) === i && p.postRemaining > 0; });
-  return { proposals, skipped };
+  return { proposals, skipped, autoIgnores };
+}
+
+/** 取込履歴 (いつ・何を・何個入荷したか)。バッチ=1回のCSVアップロード */
+export function listInboundBatches(limit = 50) {
+  const db = getDB();
+  return db.prepare(`
+    SELECT b.id, b.file_name, b.imported_at, b.row_count, b.receipt_count, b.actor,
+           COALESCE((SELECT SUM(i.good_qty) FROM po_inbound_items i WHERE i.batch_id = b.id), 0) AS total_good,
+           (SELECT COUNT(*) FROM po_inbound_items i WHERE i.batch_id = b.id) AS line_count
+    FROM po_inbound_batches b ORDER BY b.id DESC LIMIT ?`).all(Math.max(1, Math.min(200, limit)));
+}
+
+/** 取込バッチの明細 (そのアップロードで追加された行) */
+export function inboundBatchLines(batchId) {
+  const db = getDB();
+  const batch = db.prepare('SELECT * FROM po_inbound_batches WHERE id=?').get(batchId);
+  if (!batch) throw new Error(`取込履歴が存在しません: ${batchId}`);
+  const nameByKey = new Map();
+  try { for (const r of loadPml().rows) nameByKey.set(normProductCode(r['商品コード']), r['商品名'] || ''); } catch { /* PML未同期環境 */ }
+  const lines = db.prepare(`
+    SELECT i.id, r.source_key AS slip, r.receipt_date, i.product_code, i.product_key, i.good_qty, i.defective_qty, i.unit_cost, i.superseded
+    FROM po_inbound_items i JOIN po_inbound_receipts r ON r.id = i.receipt_id
+    WHERE i.batch_id = ? ORDER BY r.source_key DESC, i.id`).all(batchId)
+    .map(l => ({ ...l, productName: nameByKey.get(l.product_key) || '' }));
+  return { batch, lines };
 }
 
 /** 対象外の指定/解除 (履歴型) */

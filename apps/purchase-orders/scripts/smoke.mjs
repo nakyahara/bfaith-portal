@@ -2914,11 +2914,69 @@ console.log('── 入庫取込プレビュー+一括割当 ──');
   ] }, 'aa-act-2');
   ok(r.status === 400 && r.body.error.includes('残数の扱いが不正'), '不正action: 全量入荷 (残0) でも400', r.body.error);
 
+  // ── 自動対象外 (中原さん 2026-07-15: 注残にない入庫・注残超過の入庫は対象外として処理し切る) ──
+  insRow.run('aa-nopo-item', '未発注入庫テスト', '0001', '取扱中', 2, 0, 0, 0, 0, 10, 1.5, 400, 200, '2026-07-01', '2026-01-01');
+  insRow.run('aa-over-item', '注残超過テスト', '0001', '取扱中', 2, 0, 0, 0, 0, 10, 1.5, 400, 200, '2026-07-01', '2026-01-01');
+  insRow.run('aa-igbad-item', '対象外細工テスト', '0001', '取扱中', 2, 0, 0, 0, 0, 10, 1.5, 400, 200, '2026-07-01', '2026-01-01');
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'aa-over-item', qty: 5 }, { code: 'aa-igbad-item', qty: 10 }] }) });
+  ok(r.body.ok !== false, 'auto-ignore: テスト用PO作成');
+  r = await up2('ai.csv', [HDR2,
+    ['AI900', 'aa-nopo-item', 'x', '0001', '200', '7', '0', '2026/07/15'],
+    ['AI901', 'aa-over-item', 'x', '0001', '200', '9', '0', '2026/07/15'],
+    ['AI902', 'aa-igbad-item', 'x', '0001', '200', '6', '0', '2026/07/15']]);
+  ok(r.body.ok, 'auto-ignore: 取込');
+  r = await j('/api/inbound/auto-assign/preview');
+  const gNopo = (r.body.autoIgnores || []).find(x => x.slip === 'AI900');
+  const gOver = (r.body.autoIgnores || []).find(x => x.slip === 'AI901');
+  const gOk = r.body.proposals.find(x => x.slip === 'AI902');
+  ok(gNopo && gNopo.reason.includes('発注残なし'), 'preview: 注残にない入庫は自動対象外に分類', gNopo && gNopo.reason);
+  ok(gOver && gOver.reason.includes('超過'), 'preview: 注残超過の入庫も自動対象外に分類', gOver && gOver.reason);
+  ok(gOk && gOk.qty === 6, 'preview: 割当可能な行は従来どおり提案', gOk);
+  // 割当可能な行を ignores に細工 → 実行時再検証で全ロールバック
+  r = await jpA('/api/inbound/auto-assign', { ignores: [{ inboundItemId: gOk.inboundItemId }] }, 'aa-ig-bad');
+  ok(r.status === 400 && r.body.error.includes('割当できる可能性'), 'auto-ignore: 割当可能な行の対象外化は拒否 (再検証)', r.body.error);
+  // 割当+対象外の同時実行 (assignments空でもignoresだけでも可)
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: gOk.inboundItemId, orderItemId: gOk.orderItemId, qty: 6 },
+  ], ignores: [{ inboundItemId: gNopo.inboundItemId }, { inboundItemId: gOver.inboundItemId }] }, 'aa-ig-1');
+  ok(r.body.ok && r.body.assigned === 1 && r.body.ignored === 2, 'auto-ignore: 割当1+対象外2を1txnで実行', r.body);
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: gOk.inboundItemId, orderItemId: gOk.orderItemId, qty: 6 },
+  ], ignores: [{ inboundItemId: gNopo.inboundItemId }, { inboundItemId: gOver.inboundItemId }] }, 'aa-ig-1');
+  ok(r.body.ok && r.body.replay === true, 'auto-ignore: 同一キー再送はreplay');
+  r = await j('/api/inbound');
+  ok(r.body.ignored.some(x => x.slip === 'AI900') && r.body.ignored.some(x => x.slip === 'AI901'),
+    'auto-ignore: 対象外リストに移動 (↩解除可能)');
+  ok(!r.body.open.some(x => ['AI900', 'AI901', 'AI902'].includes(x.slip)), 'auto-ignore: 一括割当後に未処理行が残らない');
+  ok(db.prepare('SELECT remaining_qty FROM v_po_item_balance b JOIN po_order_items i ON i.id=b.order_item_id WHERE i.product_key=?')
+    .get('aa-over-item').remaining_qty === 5, 'auto-ignore: 超過行の対象外化でPO残は変わらない (発注残に残る)');
+  // 割当と対象外の重複指定は拒否
+  r = await jpA('/api/inbound/auto-assign', { assignments: [
+    { inboundItemId: gNopo.inboundItemId, orderItemId: gOk.orderItemId, qty: 7 },
+  ], ignores: [{ inboundItemId: gNopo.inboundItemId }] }, 'aa-ig-dup');
+  ok(r.status === 400 && r.body.error.includes('複数回'), 'auto-ignore: 割当と対象外の重複指定は拒否');
+  r = await jpA('/api/inbound/auto-assign', { assignments: [], ignores: [] }, 'aa-ig-empty');
+  ok(r.status === 400, 'auto-ignore: 空リクエストは400');
+
+  // ── 📜 取込履歴 (いつ・何を・何個) ──
+  r = await j('/api/inbound/batches');
+  ok(r.body.ok && r.body.batches.length >= 1, 'batches: 一覧が返る', r.body.batches && r.body.batches.length);
+  const bAi = r.body.batches.find(b => b.fileName === 'ai.csv');
+  ok(bAi && bAi.receiptCount === 3 && bAi.lineCount === 3 && bAi.totalGood === 22 && /\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(bAi.importedAtJst),
+    'batches: ai.csv=3伝票3明細22個+JST日時', bAi);
+  r = await j('/api/inbound/batches/' + bAi.id);
+  ok(r.body.ok && r.body.lines.length === 3 && r.body.lines.some(l => l.product_code === 'aa-nopo-item' && l.good_qty === 7),
+    'batches: 明細 (何を何個) が引ける', r.body.lines && r.body.lines.length);
+  r = await j('/api/inbound/batches/999999');
+  ok(r.status === 400, 'batches: 存在しないIDは400');
+
   // 画面: プレビュー/一括割当UI配信
   const inbHtml4 = await (await fetch(base + '/inbound')).text();
   ok(inbHtml4.includes('autoAssignBtn') && inbHtml4.includes('この内容で取り込む') && inbHtml4.includes('一括割当の確認'),
     '/inbound プレビュー+一括割当UI配信');
   ok(inbHtml4.includes('あとで決める'), '/inbound 一括割当に📌あとで決める選択肢');
+  ok(inbHtml4.includes('取込履歴') && inbHtml4.includes('data-histbatch'), '/inbound 📜取込履歴UI配信');
 }
 
 // ═══ 全ページのインラインJS構文チェック (サーバtemplate literal内クライアントJSの括弧崩れ等を機械検出) ═══
