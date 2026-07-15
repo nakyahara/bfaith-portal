@@ -28,6 +28,9 @@ export let yahooInitError = null;
 // au PAY分析表も同じ fail-soft 方針 (新mirror表のDDLは fail-soft 必須 — 2026-07-12 障害の教訓)
 export let aupayDataInitError = null;
 
+// Qoo10 Analytics表も同様 (mall-csv-fetcher P1-Q R1)
+export let qoo10DataInitError = null;
+
 export function initMirrorDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   // リトライ再入時 (2026-07-12 障害対応: 一過性失敗の自己回復) に前のハンドルを
@@ -36,6 +39,7 @@ export function initMirrorDB() {
   // fail-soft系のエラーもリトライごとにリセット (成功すれば null のまま)
   yahooInitError = null;
   aupayDataInitError = null;
+  qoo10DataInitError = null;
   db = new Database(DB_FILE);
   // PRAGMA は接続単位の設定。SQLite のデフォルトは foreign_keys=OFF / recursive_triggers=OFF なので、
   // f_mis_shipments の FK 制約 と append-only trigger を機能させるために毎接続で明示する必要がある。
@@ -947,6 +951,52 @@ function createTables() {
       at: String(e.stack || '').split(String.fromCharCode(10)).slice(0, 3).join(' | '),
     };
     console.error('[Mirror] au PAY分析表の初期化失敗 (mirror本体は継続):', e.message);
+  }
+
+  // ─── Qoo10 Analytics 4種 (mall-csv-fetcher P1-Q R1、2026-07-14) ───
+  // fail-soft: 失敗しても throw せず記録に留め、既存モールの mirror を止めない
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_qoo10_traffic_channel_daily (
+      date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+      channel  TEXT NOT NULL CHECK(trim(channel) <> ''),
+      pv INTEGER,
+      imported_at TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+      PRIMARY KEY (date_jst, channel)
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_qoo10_cvr_daily (
+      date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+      pv_total INTEGER, visitors INTEGER, cart_adds INTEGER, orders INTEGER, cvr_pct REAL,
+      channel_pv_diff INTEGER,
+      imported_at TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+      PRIMARY KEY (date_jst)
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_qoo10_item_traffic_daily (
+      date_jst TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+      item_no  TEXT NOT NULL CHECK(trim(item_no) <> ''),
+      channel  TEXT NOT NULL CHECK(trim(channel) <> ''),
+      pv INTEGER,
+      imported_at TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+      PRIMARY KEY (date_jst, item_no, channel)
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_mqitd_item ON mirror_qoo10_item_traffic_daily(item_no, date_jst)');
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_qoo10_items (
+      item_no TEXT PRIMARY KEY CHECK(trim(item_no) <> ''),
+      seller_code_raw TEXT, seller_code TEXT, item_name TEXT, brand TEXT,
+      attr_date_jst TEXT,
+      imported_at TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_mqi_seller ON mirror_qoo10_items(seller_code)');
+  } catch (e) {
+    qoo10DataInitError = {
+      message: String(e.message || e),
+      code: e.code || null,
+      at: String(e.stack || '').split(String.fromCharCode(10)).slice(0, 3).join(' | '),
+    };
+    console.error('[Mirror] Qoo10分析表の初期化失敗 (mirror本体は継続):', e.message);
   }
 
   // mirror_rakuten_finance_sku_daily — 楽天 Phase 1a #R-3b (Render 側 daily fact mirror)

@@ -1939,6 +1939,44 @@ function createTables() {
     }
   }
 
+  // ---- Qoo10 Analytics 4種: contract auto-seed (mall-csv-fetcher P1-Q R1、2026-07-14)
+  // seller.qoo10.jp のトラフィック/CV xlsx。qoo10_items はマスタ (no_clear upsert)
+  {
+    const qoo10Contracts = [
+      ['qoo10_traffic_channel_daily', 'fact_qoo10_traffic_channel_daily',
+        'one row = one (date_jst, channel) — Analytics流入チャネル別PV (縦持ち、チャネル=ヘッダ生ラベル)', '["date_jst","channel"]'],
+      ['qoo10_cvr_daily', 'fact_qoo10_cvr_daily',
+        'one row = one date_jst — Analytics店舗KPI (PV合計/訪問者/カート/注文/CVR%)', '["date_jst"]'],
+      ['qoo10_item_traffic_daily', 'fact_qoo10_item_traffic_daily',
+        'one row = one (date_jst, item_no, channel) — 商品別流入PV (sparse: pv>0 + (合計)行)', '["date_jst","item_no","channel"]'],
+      ['qoo10_items', 'm_qoo10_items',
+        'one row = one item_no — Qoo10商品マスタ (販売者商品コード=SKU/商品名/ブランド、最新値upsert・no_clear)', '["item_no"]'],
+    ];
+    const seedStmt = db.prepare(`
+      INSERT INTO sync_contracts (
+        entity, contract_version, source_system, source_object, target_table,
+        grain_definition, key_columns_json, payload_schema_json,
+        clear_strategy, apply_mode, enabled, owner, created_at, updated_at
+      ) VALUES (
+        ?, 1, 'minipc-warehouse', ?, ?, ?, ?,
+        '{"required":[],"amount_unit":"JPY_tax_included_integer"}',
+        ?, 'insert_or_replace', 1, 'mall-csv-fetcher',
+        strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      )
+      ON CONFLICT(entity) DO UPDATE SET
+        contract_version = excluded.contract_version, source_system = excluded.source_system,
+        source_object = excluded.source_object, target_table = excluded.target_table,
+        grain_definition = excluded.grain_definition, key_columns_json = excluded.key_columns_json,
+        payload_schema_json = excluded.payload_schema_json, clear_strategy = excluded.clear_strategy,
+        apply_mode = excluded.apply_mode, enabled = excluded.enabled, owner = excluded.owner,
+        updated_at = excluded.updated_at
+    `);
+    for (const [entity, srcTable, grain, keys] of qoo10Contracts) {
+      seedStmt.run(entity, srcTable, `mirror_${entity}`, grain, keys,
+        entity === 'qoo10_items' ? 'no_clear' : 'scope_clear_per_run');
+    }
+  }
+
   // ---- Phase 1 #1-4a: sync_runs (run ledger、miniPC 側で sync 開始記録)
   // status 遷移: started → applied (全 chunk Render から 2xx)
   //              | → failed (途中失敗、error_message に記録)

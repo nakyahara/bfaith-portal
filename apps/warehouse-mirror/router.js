@@ -13,7 +13,7 @@
  */
 import { Router } from 'express';
 import crypto from 'crypto';
-import { initMirrorDB, getMirrorDB, yahooInitError, aupayDataInitError } from './db.js';
+import { initMirrorDB, getMirrorDB, yahooInitError, aupayDataInitError, qoo10DataInitError } from './db.js';
 import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
 import {
   STORE_BENCH_COLS, STORE_DEVICE_BASE_COLS, STORE_DEVICE_OPT_COLS, CATEGORY_DEMO_COLS,
@@ -975,8 +975,33 @@ AUPAY_DATA_TABLE_SPECS.aupay_pm_query_weekly = {
 };
 const AUPAY_DATA_ENTITY_NAMES = new Set(Object.keys(AUPAY_DATA_TABLE_SPECS));
 
-// 楽天dd + Yahoo + au PAY分析 を1つのレジストリに統合 (getRakutenDdInsert/normalizeRakutenDdRow が参照)
-const DD_ALL_TABLE_SPECS = { ...RAKUTEN_DD_TABLE_SPECS, ...YAHOO_DATA_TABLE_SPECS, ...AUPAY_DATA_TABLE_SPECS };
+// Qoo10 Analytics 4種 (mall-csv-fetcher P1-Q R1)
+const QOO10_DATA_TABLE_SPECS = {
+  qoo10_traffic_channel_daily: {
+    table: 'mirror_qoo10_traffic_channel_daily',
+    required: ['date_jst', 'channel'],
+    cols: ['date_jst', 'channel', 'pv', 'imported_at'],
+  },
+  qoo10_cvr_daily: {
+    table: 'mirror_qoo10_cvr_daily',
+    required: ['date_jst'],
+    cols: ['date_jst', 'pv_total', 'visitors', 'cart_adds', 'orders', 'cvr_pct', 'channel_pv_diff', 'imported_at'],
+  },
+  qoo10_item_traffic_daily: {
+    table: 'mirror_qoo10_item_traffic_daily',
+    required: ['date_jst', 'item_no', 'channel'],
+    cols: ['date_jst', 'item_no', 'channel', 'pv', 'imported_at'],
+  },
+  qoo10_items: {
+    table: 'mirror_qoo10_items',
+    required: ['item_no'],
+    cols: ['item_no', 'seller_code_raw', 'seller_code', 'item_name', 'brand', 'attr_date_jst', 'imported_at'],
+  },
+};
+const QOO10_DATA_ENTITY_NAMES = new Set(Object.keys(QOO10_DATA_TABLE_SPECS));
+
+// 楽天dd + Yahoo + au PAY分析 + Qoo10 を1つのレジストリに統合 (getRakutenDdInsert/normalizeRakutenDdRow が参照)
+const DD_ALL_TABLE_SPECS = { ...RAKUTEN_DD_TABLE_SPECS, ...YAHOO_DATA_TABLE_SPECS, ...AUPAY_DATA_TABLE_SPECS, ...QOO10_DATA_TABLE_SPECS };
 
 function getRakutenDdInsert(db, entityKey) {
   const b = getStmtBundle(db);
@@ -1642,6 +1667,15 @@ const ENTITY_REGISTRY = {
     getInsertStmt: (db) => getRakutenDdInsert(db, 'yahoo_keyword_daily'),
     normalizeRow: (r) => normalizeRakutenDdRow('yahoo_keyword_daily', r),
   },
+  // Qoo10 Analytics 4 entity (mall-csv-fetcher P1-Q R1、2026-07-14)。qoo10_items=マスタ (no_clear)
+  ...Object.fromEntries(Object.keys(QOO10_DATA_TABLE_SPECS).map((key) => [key, {
+    contract_version: 1,
+    mirror_table: QOO10_DATA_TABLE_SPECS[key].table,
+    clear_strategy: key === 'qoo10_items' ? 'no_clear' : 'date_range',
+    ...(key === 'qoo10_items' ? {} : { clear_meta_key: `clear_${key.replace(/_daily$/, '_dates')}` }),
+    getInsertStmt: (db) => getRakutenDdInsert(db, key),
+    normalizeRow: (r) => normalizeRakutenDdRow(key, r),
+  }])),
   // au PAYマーケット分析 13 entity (mall-csv-fetcher P1-A、2026-07-13)
   // 月次 entity は date_jst=月初日を clear キーに使う (rakuten_purchaser_monthly と同方針)
   ...Object.fromEntries(Object.keys(AUPAY_DATA_TABLE_SPECS).map((key) => [key, {
@@ -1871,6 +1905,9 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
   if (AUPAY_DATA_ENTITY_NAMES.has(entity) && aupayDataInitError) {
     return res.status(503).json({ error: 'aupay data tables init failed', init_error: aupayDataInitError });
   }
+  if (QOO10_DATA_ENTITY_NAMES.has(entity) && qoo10DataInitError) {
+    return res.status(503).json({ error: 'qoo10 data tables init failed', init_error: qoo10DataInitError });
+  }
   if (contract_version !== entityCfg.contract_version) {
     return res.status(400).json({
       error: 'contract_version_mismatch',
@@ -1905,7 +1942,9 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
   //   - 全 MF entity (mf_publish_runs 親 + 6 mart 子) で meta.mf_source_run_id を要求 + ledger 保存
   //   - 子 entity は parent.status='pending_sync' を tx 内で再 check (race 防止)
   //   - finalize 時に ledger.mf_source_run_id == finalize_run_id を cross-check
-  const isMfEntity = clearStrategy === 'no_clear';
+  // ⚠️判定は entity 名 (mf_*) で行う。旧実装の「clear_strategy==='no_clear' ⇒ MF」は
+  // MF以外の no_clear マスタ (linegift_orders / qoo10_items) を誤って400にする (2026-07-14 発覚)
+  const isMfEntity = entity.startsWith('mf_');
   let mfSourceRunIdForLedger = null;
   if (isMfEntity) {
     const mfSourceRunId = meta.mf_source_run_id;

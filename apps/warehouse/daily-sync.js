@@ -628,6 +628,24 @@ async function main() {
       console.log('[DailySync] auPAY分析 sync は取込失敗のためスキップ (failed/ を確認、修正後に再投入)');
     }
 
+    // === Qoo10 Analytics取込 + mirror sync (mall-csv-fetcher P1-Q R1) ===
+    // 自動DL (qoo10-data-download.mjs、fetch-all 05:30) が incoming/qoo10-data/ に置いた
+    // xlsxを取り込む。対象0件は正常。--days 110 = 月1の90日再取得をカバー
+    const qoo10DataImportResult = runScript(
+      `apps/warehouse/import-qoo10-data.js --data-dir ${DATA_DIR_ARG}`,
+      'Qoo10分析 取込', 600000
+    );
+    results.push({ name: 'Qoo10分析 取込', ...qoo10DataImportResult });
+    if (qoo10DataImportResult.success) {
+      const qoo10DataSyncResult = runScript(
+        `apps/warehouse/sync-qoo10-data-daily.js --data-dir ${DATA_DIR_ARG} --days 110`,
+        'Qoo10分析 sync', 600000
+      );
+      results.push({ name: 'Qoo10分析 sync', ...qoo10DataSyncResult });
+    } else {
+      console.log('[DailySync] Qoo10分析 sync は取込失敗のためスキップ (failed/ を確認、修正後に再投入)');
+    }
+
     // === Yahoo finance daily fact (Yahoo Phase 1 Y-3c、Y-1 + Y-2 + Y-3a 統合) ===
     // 1. f_yahoo_finance_sku_daily_v1 build (whitelist order=5/pay=1/ship=3、partial margin)
     // 2. DQ gate (6 check、severity error で exit 1)
