@@ -146,13 +146,13 @@ function dateVal(cell, ctx) {
   return d;
 }
 
-/** 非負整数 (空欄=null と 0 を区別) */
+/** 整数 (空欄=null と 0 を区別)。負値はQoo10側の補正でまれに実在 (2026-05実測「その他」=-1) → 許容 */
 function pvVal(cell, ctx) {
   const v = cellVal(cell, ctx);
   if (v === null || v === undefined || v === '') return null;
   const n = Number(String(v).replace(/[,\s]/g, ''));
-  if (!Number.isFinite(n) || n < 0 || !Number.isInteger(n)) {
-    throw new Error(`非負整数でない値 (${ctx}: 「${v}」)`);
+  if (!Number.isFinite(n) || !Number.isInteger(n)) {
+    throw new Error(`整数でない値 (${ctx}: 「${v}」)`);
   }
   return n;
 }
@@ -275,15 +275,16 @@ function parseStoreSheet(name, ws, hdr) {
     const visitors = pvVal(row.getCell(c.visitors), `r${r} 訪問者数`);
     const orders = pvVal(row.getCell(c.orders), `r${r} 注文完了`);
     const cvr = cvrVal(row.getCell(c.cvr), `r${r} CVR`);
-    // 検算: PV合計 vs チャネル合計 (_全体小計は除外済み)。実サンプルで差0を確認済みのため、
-    // 小差=warning+記録 (未分類PVの可能性) / 大差=エラー (チャネル欠落・列誤認の fail-closed — Codex Medium)
+    // 検算: PV合計 vs チャネル合計 (_全体小計は除外済み)。方向で意味が違う (2024バックフィル実測):
+    //   合計 > チャネル計 = 未分類PV (古い期間はチャネル分類が現行と違い差19〜28%が正常) → warning+diff記録
+    //   チャネル計 > 合計 = 二重計上/列誤認の疑い → 許容小差を超えたらエラー (fail-closed)
     const diff = pvTotal === null ? null : pvTotal - chSum;
     if (diff !== null && diff !== 0) {
       const tol = Math.max(10, Math.round((pvTotal ?? 0) * 0.1));
-      if (Math.abs(diff) > tol) {
-        throw new Error(`PV合計とチャネル計の大差 (${d}: 合計${pvTotal} vs 計${chSum}、差${diff} > 許容${tol})。チャネル列欠落/列誤認の疑い`);
+      if (diff < -tol) {
+        throw new Error(`チャネル計がPV合計を超過 (${d}: 合計${pvTotal} vs 計${chSum})。二重計上/列誤認の疑い`);
       }
-      warnings.push(`${d}: PV合計${pvTotal}≠チャネル計${chSum} (差${diff})`);
+      warnings.push(`${d}: PV合計${pvTotal}≠チャネル計${chSum} (差${diff}${diff > 0 ? '=未分類PV' : ''})`);
     }
     // 検算: CVR ≈ orders/visitors*100 (丸め差1.0pt許容)
     if (cvr !== null && visitors > 0 && orders !== null) {
@@ -366,10 +367,10 @@ function parseItemSheet(name, ws, hdr) {
     // 合計行は常に格納 (0でも「その日その商品が出現した」ことの記録。sparse検証の基準)
     records.push({ date_jst: d, item_no: itemNo, channel: '(合計)', pv: total });
     if (total === 0 && anyPv) throw new Error(`PV合計0なのにチャネルPVあり (r${r}: ${key})`);
-    // 行検算: チャネル欠落/列誤認の検出 (店舗版と同じ許容 — Codex R2 Medium)
+    // 行検算 (方向つき — 店舗版と同方針): 合計>計=未分類 (正常)、計>合計=二重計上疑いのみエラー
     const diff = total - chSum;
-    if (diff !== 0 && Math.abs(diff) > Math.max(10, Math.round(total * 0.1))) {
-      throw new Error(`商品行のPV合計とチャネル計の大差 (${key}: 合計${total} vs 計${chSum})。チャネル列欠落の疑い`);
+    if (diff < -Math.max(10, Math.round(total * 0.1))) {
+      throw new Error(`商品行のチャネル計がPV合計を超過 (${key}: 合計${total} vs 計${chSum})。二重計上/列誤認の疑い`);
     }
   }
   if (records.length === 0) return { name, ok: false, type: 'qoo10_item_traffic_daily', error: 'データ行が0件' };

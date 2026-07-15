@@ -208,11 +208,23 @@ console.log('=== 6b. scope安全性 (Codex R1 High/Medium対応) ===');
   const p2 = await prepareQoo10File('qoo10_cvr_d2026-07-23_2026-07-23_x.xlsx', badCvr);
   check('CVR値域外は拒否', !p2.ok && /値域外/.test(p2.error), p2.ok ? 'ok?' : p2.error);
 
-  // PV合計の大差 (チャネル欠落疑い) はエラー
+  // 合計>チャネル計 (未分類PV) は warning で取込可 (2024実測: 古い期間は差19-28%が正常)
   const pvd = zeroPv(); pvd[5] = 5;
-  const bigDiff = await makeStoreXlsx([{ date: '2026-07-24', pv: pvd, total: 100, visitors: 3, cart: 0, orders: 0, cvr: 0 }]);
-  const p3 = await prepareQoo10File('qoo10_cvr_d2026-07-24_2026-07-24_x.xlsx', bigDiff);
-  check('PV合計の大差は拒否', !p3.ok && /大差/.test(p3.error), p3.ok ? 'ok?' : p3.error);
+  const unclassified = await makeStoreXlsx([{ date: '2026-07-24', pv: pvd, total: 100, visitors: 3, cart: 0, orders: 0, cvr: 0 }]);
+  const p3 = await prepareQoo10File('qoo10_cvr_d2026-07-24_2026-07-24_x.xlsx', unclassified);
+  check('未分類PV (合計>計) はwarningで取込可', p3.ok && p3.warnings.some((w) => /未分類/.test(w)), p3.ok ? JSON.stringify(p3.warnings) : p3.error);
+
+  // チャネル計>合計 (二重計上疑い) はエラー
+  const pvo = zeroPv(); pvo[5] = 100;
+  const overSum = await makeStoreXlsx([{ date: '2026-07-27', pv: pvo, total: 5, visitors: 3, cart: 0, orders: 0, cvr: 0 }]);
+  const p3b = await prepareQoo10File('qoo10_cvr_d2026-07-27_2026-07-27_x.xlsx', overSum);
+  check('チャネル計>合計は拒否', !p3b.ok && /超過/.test(p3b.error), p3b.ok ? 'ok?' : p3b.error);
+
+  // 負のPV (Qoo10側補正 -1) は許容
+  const pvn = zeroPv(); pvn[5] = 3; pvn[16] = -1; // その他=-1
+  const negBuf = await makeStoreXlsx([{ date: '2026-07-28', pv: pvn, total: 2, visitors: 1, cart: 0, orders: 0, cvr: 0 }]);
+  const p3c = await prepareQoo10File('qoo10_cvr_d2026-07-28_2026-07-28_x.xlsx', negBuf);
+  check('負値PV (-1補正) は許容', p3c.ok, p3c.ok ? 'ok' : p3c.error);
 
   // マスタは最新日の属性を採用
   const old = zeroPv(); old[5] = 1;
