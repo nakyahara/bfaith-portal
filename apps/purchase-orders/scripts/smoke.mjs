@@ -3214,6 +3214,98 @@ console.log('── 入庫取込プレビュー+一括割当 ──');
   ok(inbHtml4.includes('tallyArea') && inbHtml4.includes('取りこぼし'), '/inbound 網羅性サマリUI配信');
 }
 
+// ═══ 🏷️ 自社商品バーコードラベル管理 (対象=AMC×売上分類1。旧Excel移行のCSV取込+楽観ロック編集) ═══
+console.log('── 🏷️ バーコードラベル管理 ──');
+{
+  // 対象判定: fixture では 0726-001060 / diyorangeoil100 (仕入先0001×売上分類1) の2商品のみ
+  r = await j('/api/barcode-labels');
+  ok(r.status === 200 && r.body.ok && r.body.pmlSynced, 'barcode: 一覧API ok');
+  const tKeys = r.body.targets.map(t => t.key);
+  ok(tKeys.includes('0726-001060') && tKeys.includes('diyorangeoil100'), 'barcode: 対象=AMC×売上分類1', tKeys);
+  ok(!tKeys.includes('noflyersticker') && !tKeys.includes('set-2pack') && !tKeys.includes('gyoumuhandcream60-bi'),
+    'barcode: 売上分類2/3・セット商品は対象外');
+  ok(r.body.targets.every(t => !t.label) && r.body.summary.unregistered === r.body.targets.length,
+    'barcode: 初期状態は全て未登録 (label=null)', r.body.summary);
+
+  // PUT 新規登録 (version=null) → 楽観ロック更新 → 競合409
+  r = await j('/api/barcode-labels/0726-001060', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ productCode: '0726-001060', status: 'unset', barcodeValue: '', note: '' }) });
+  ok(r.status === 200 && r.body.ok && r.body.label.version === 1 && r.body.label.status === 'unset', 'barcode: 新規登録 version=1', r.body);
+  r = await j('/api/barcode-labels/0726-001060', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status: 'unset' }) });
+  ok(r.status === 409 && r.body.current && r.body.current.version === 1, 'barcode: 既存商品への新規登録(version=null)は409+current', r.status);
+  r = await j('/api/barcode-labels/0726-001060', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status: 'requested', version: 99 }) });
+  ok(r.status === 409, 'barcode: version不一致の更新は409');
+  r = await j('/api/barcode-labels/0726-001060', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status: 'requested', barcodeValue: 'X0019R42C5', version: 1 }) });
+  ok(r.status === 200 && r.body.label.version === 2 && r.body.label.barcodeType === 'fnsku',
+    'barcode: version一致で更新+FNSKU種別自動判定', r.body.label);
+  r = await j('/api/barcode-labels/0726-001060', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status: 'hen', version: 2 }) });
+  ok(r.status === 400, 'barcode: 不正statusは400');
+
+  // 対象外商品の登録は可能だが orphan として理由付きで出る
+  r = await j('/api/barcode-labels/noflyersticker', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ productCode: 'noflyersticker', status: 'printed' }) });
+  ok(r.status === 200, 'barcode: 対象外商品も登録自体は可能');
+  r = await j('/api/barcode-labels');
+  const orp = r.body.orphans.find(o => o.key === 'noflyersticker');
+  ok(orp && orp.orphanReason === 'sales_class_changed', 'barcode: 対象外はorphan+理由 (売上分類違い)', orp && orp.orphanReason);
+
+  // CSV取込: プレビュー (fileHash発行+手動編集上書き警告) → fileHash必須commit → upsert (CSVに無い行は消えない)
+  const bcCsv = '商品コード,状態,バーコード値,備考,AMC管理番号\r\ndiyorangeoil100,設定済み,X0010LO63F,テスト移行,ZZZ1745-BF1411\r\n0726-001060,未設定,,上書きテスト,\r\n';
+  const mkFd = (extra) => {
+    const fd9 = new FormData();
+    fd9.append('file', new Blob(['﻿' + bcCsv], { type: 'text/csv' }), 'barcode.csv');
+    for (const [k, v] of Object.entries(extra || {})) fd9.append(k, v);
+    return fd9;
+  };
+  r = await j('/api/barcode-labels/import-csv', { method: 'POST', body: mkFd() });
+  ok(r.status === 200 && r.body.ok && !r.body.committed && r.body.counts.new === 1 && r.body.counts.update === 1,
+    'barcode: CSVプレビュー new1/update1', r.body.counts);
+  ok(r.body.counts.manualOverwrite === 1 && r.body.manualList.length === 1, 'barcode: 手動編集の上書き警告', r.body.manualList);
+  const bcHash = r.body.fileHash;
+  r = await j('/api/barcode-labels/import-csv', { method: 'POST', body: mkFd({ commit: '1' }) });
+  ok(r.status === 400, 'barcode: fileHashなしのcommitは400');
+  r = await j('/api/barcode-labels/import-csv', { method: 'POST', body: mkFd({ commit: '1', fileHash: bcHash }) });
+  ok(r.status === 200 && r.body.committed && r.body.counts.new === 1 && r.body.counts.update === 1, 'barcode: commit成功', r.body.counts);
+  r = await j('/api/barcode-labels');
+  const oilT = r.body.targets.find(t => t.key === 'diyorangeoil100');
+  const nikuT = r.body.targets.find(t => t.key === '0726-001060');
+  ok(oilT.label && oilT.label.status === 'printed' && oilT.label.barcodeType === 'fnsku' && oilT.label.vendorCodeHint === 'ZZZ1745-BF1411',
+    'barcode: CSV取込結果 (printed+FNSKU+AMC番号ヒント)', oilT.label);
+  ok(nikuT.label.status === 'unset' && nikuT.label.source === 'csv', 'barcode: CSVが手動編集行を上書き (プレビューで警告済み)', nikuT.label);
+  ok(r.body.orphans.some(o => o.key === 'noflyersticker'), 'barcode: CSVに無い既存行は消えない (upsert方式)');
+  const badFd = new FormData();
+  badFd.append('file', new Blob(['商品コード,状態\r\nxxx,ヘンな状態\r\n'], { type: 'text/csv' }), 'bad.csv');
+  r = await j('/api/barcode-labels/import-csv', { method: 'POST', body: badFd });
+  ok(r.status === 400, 'barcode: 不正な状態値のCSVは400');
+
+  // /api/backorders の明細に barcode が付く (対象商品のみ)
+  r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: '0726-001060', qty: 10 }, { code: 'noflyersticker', qty: 5 }] }) });
+  ok(r.status === 200 && r.body.ok, 'barcode: AMC発注を作成 (添付テスト用)');
+  r = await j('/api/backorders');
+  let bcItem = null, bcNonTarget = null;
+  for (const o of r.body.orders) {
+    for (const i of o.items) {
+      if (i.product_code === '0726-001060' && i.barcode && !bcItem) bcItem = i;
+      if (i.product_code === 'noflyersticker' && !bcNonTarget) bcNonTarget = i;
+    }
+  }
+  ok(bcItem && bcItem.barcode.status === 'unset' && bcItem.barcode.version === 3, 'barcode: /api/backorders 明細に添付', bcItem && bcItem.barcode);
+  ok(bcNonTarget && bcNonTarget.barcode === undefined, 'barcode: 対象外商品の明細には付かない');
+
+  // 画面配信: ワークスペースDTO埋め込み / 発注残の編集導線 / adminタブ
+  const wsHtml = await (await fetch(base + '/supplier/1')).text();
+  ok(wsHtml.includes('"barcode":{"status":') && wsHtml.includes('bcOpenEditor'), 'barcode: ワークスペースにDTO埋め込み+編集導線');
+  const boHtml9 = await (await fetch(base + '/backorders')).text();
+  ok(boHtml9.includes('bcFindBarcode') && boHtml9.includes('data-bcedit'), 'barcode: 発注残ページにバッジ+編集導線');
+  const adHtml9 = await (await fetch(base + '/admin')).text();
+  ok(adHtml9.includes('zoneBarcode') && adHtml9.includes('loadBarcode') && adHtml9.includes('data-grp="barcode"'), 'barcode: adminに🏷️タブ+CSV取込UI');
+}
+
 // ═══ 全ページのインラインJS構文チェック (サーバtemplate literal内クライアントJSの括弧崩れ等を機械検出) ═══
 console.log('── ページ内スクリプトの構文チェック ──');
 {

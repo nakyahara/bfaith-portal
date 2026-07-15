@@ -604,6 +604,45 @@ function initLedgerSchema(db) {
     updated_at   TEXT NOT NULL
   )`);
 
+  // 自社商品バーコードラベル管理 (中原さん要望 2026-07-15)。
+  // 自社商品 (PML 売上分類='1'・仕入先=アメージングクラフト) はAMCが商品ラベルを印刷するため、
+  // AmazonのFNSKUバーコードをラベルに直接印字してもらう運用。どの商品が印字設定済みかの正本。
+  // 旧管理: Excel「BFバーコード管理_既存商品.xlsx」→ CSV取込で移行 (以後このテーブルが正)。
+  //   status: printed=ラベルにバーコード設定済み / requested=AMCに印字依頼中 /
+  //           not_needed=印字不要 (ラベルにスペースなし等) / unset=未設定 (これから依頼する)
+  //   行が無い対象商品 = 「未登録」(旧Excelの管理漏れ相当) として画面でハイライトする
+  //   barcode_value/type: 旧ExcelのH列は「FNSKUorJAN」でFNSKUとJANが混在 → 値と種別を分けて保持 (Codex設計相談)
+  //   vendor_code_hint: 旧Excel由来のAMC管理番号。対応表 (po_vendor_code_map) 未登録時のフォールバック表示用
+  //   version: 楽観ロック (複数画面から編集するため。version不一致の更新は409)
+  db.exec(`CREATE TABLE IF NOT EXISTS po_barcode_labels (
+    product_key      TEXT PRIMARY KEY,
+    product_code     TEXT NOT NULL,
+    product_name     TEXT,
+    status           TEXT NOT NULL CHECK(status IN ('printed','requested','not_needed','unset')),
+    barcode_value    TEXT,
+    barcode_type     TEXT CHECK(barcode_type IS NULL OR barcode_type IN ('fnsku','jan','other','unknown')),
+    vendor_code_hint TEXT,
+    note             TEXT,
+    source           TEXT NOT NULL CHECK(source IN ('csv','manual')),
+    version          INTEGER NOT NULL DEFAULT 1 CHECK(version >= 1),
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL,
+    updated_by       TEXT
+  )`);
+  // 状態変更の監査履歴 (いつ誰がどの状態にしたか。FNSKUの変更履歴もここで追える)
+  db.exec(`CREATE TABLE IF NOT EXISTS po_barcode_label_events (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_key   TEXT NOT NULL,
+    at            TEXT NOT NULL,
+    actor         TEXT,
+    source        TEXT NOT NULL CHECK(source IN ('csv','manual')),
+    from_status   TEXT,
+    to_status     TEXT NOT NULL,
+    barcode_value TEXT,
+    note          TEXT
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_pbl_events_key ON po_barcode_label_events(product_key, id)');
+
   // 未紐付けの先方管理番号 (仮登録)。出荷明細→ロジザード入荷予定変換で対応表に無い番号が出たとき
   // ここに置いておき、後日 (NE登録→翌朝PML反映後) 商品と紐づけて対応表へ昇格する (中原さん要望 2026-07-13)
   db.exec(`CREATE TABLE IF NOT EXISTS po_vendor_code_pending (
