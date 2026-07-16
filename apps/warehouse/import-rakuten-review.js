@@ -46,28 +46,30 @@ function moveTo(srcPath, destDir) {
   return dest;
 }
 
-/** 低評価GChat通知 (fail-soft)。本文は載せない。 */
-async function notifyLowRatings(lowRatings) {
-  if (lowRatings.length === 0) return;
+/** 低評価GChat通知。本文・注文番号は載せない (PII最小化)。
+ *  キュー方式: 新規★1-2は rakuten_review_low_notify_queue に積み、送信2xxで削除。
+ *  送信失敗時はキューに残る → 次回実行 (翌朝daily-sync) で自動リトライ (Codex R2 High:
+ *  取込duplicate化で通知が恒久欠落するのを防ぐ)。通知失敗で取込は失敗にしない (fail-soft) */
+async function notifyLowRatings(dbRw) {
+  const queued = dbRw.prepare(`SELECT * FROM rakuten_review_low_notify_queue ORDER BY posted_at`).all();
+  if (queued.length === 0) return;
   if ((process.env.NOTIFY_LOW_REVIEW || '1') === '0') {
-    console.log(`  (低評価通知は NOTIFY_LOW_REVIEW=0 のためスキップ: ${lowRatings.length}件)`);
+    console.log(`  (低評価通知は NOTIFY_LOW_REVIEW=0 のためスキップ: ${queued.length}件はキューに残置)`);
     return;
   }
   const webhook = (process.env.GCHAT_WEBHOOK_MALL_FETCH || process.env.GCHAT_WEBHOOK || '').trim();
   if (!webhook) {
-    console.log(`  ⚠ 低評価レビュー ${lowRatings.length}件 (GCHAT_WEBHOOK 未設定のため通知なし)`);
+    console.log(`  ⚠ 低評価レビュー ${queued.length}件 (GCHAT_WEBHOOK 未設定。キューに残置し次回リトライ)`);
     return;
   }
-  // 注文番号は顧客に紐づく識別子のため外部Webhookへ送らない (Codex R1 high)。
-  // 注文との突合はレビューチェックツール画面 (下記URL) で投稿時間から辿れる
-  const lines = lowRatings.slice(0, 10).map(r => {
+  const lines = queued.slice(0, 10).map(r => {
     const stars = '★'.repeat(r.rating) + '☆'.repeat(5 - r.rating);
     const what = r.review_type === 'shop' ? 'ショップレビュー' : (r.item_name || '(商品名不明)').slice(0, 40);
     return `・${stars} ${what}\n    投稿: ${r.posted_at}`;
   });
-  if (lowRatings.length > 10) lines.push(`…ほか ${lowRatings.length - 10} 件`);
+  if (queued.length > 10) lines.push(`…ほか ${queued.length - 10} 件`);
   const text = [
-    `🔻 *楽天 低評価レビュー検知 (${lowRatings.length}件)*`,
+    `🔻 *楽天 低評価レビュー検知 (${queued.length}件)*`,
     ...lines,
     'レビューチェックツール: https://review.rms.rakuten.co.jp/ (RMS>コミュニティ>みんなのレビュー)',
   ].join('\n');
@@ -77,9 +79,13 @@ async function notifyLowRatings(lowRatings) {
       headers: { 'Content-Type': 'application/json; charset=UTF-8' },
       body: JSON.stringify({ text }),
     });
-    console.log(`  📣 低評価レビュー ${lowRatings.length}件 → GChat通知 (${res.status})`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const del = dbRw.prepare(`DELETE FROM rakuten_review_low_notify_queue WHERE review_url = ?`);
+    const tx = dbRw.transaction(() => { for (const r of queued) del.run(r.review_url); });
+    tx();
+    console.log(`  📣 低評価レビュー ${queued.length}件 → GChat通知 (${res.status})、キュー消化`);
   } catch (e) {
-    console.log(`  ⚠ GChat通知失敗 (fail-soft): ${e.message}`);
+    console.log(`  ⚠ GChat通知失敗 (キューに残置、次回リトライ): ${e.message}`);
   }
 }
 
@@ -98,12 +104,18 @@ ensureRakutenReviewTables(db);
 
 if (entries.length === 0) {
   console.log('取込対象なし (正常終了)');
+  // 前回送信失敗分のキュー消化だけは行う (通知リトライは取込対象の有無と独立)
+  if (!isDryRun) await notifyLowRatings(db);
   db.close();
   process.exit(0);
 }
 
 let okCount = 0, dupCount = 0, failCount = 0;
-const allLowRatings = [];
+let newLowCount = 0;
+const enqueueLow = db.prepare(`
+  INSERT OR IGNORE INTO rakuten_review_low_notify_queue (review_url, review_type, item_name, rating, posted_at, queued_at)
+  VALUES (@review_url, @review_type, @item_name, @rating, @posted_at, @queued_at)
+`);
 try {
   for (const name of entries) {
     const srcPath = path.join(incomingDir, name);
@@ -133,7 +145,10 @@ try {
         console.log(`  ${r.duplicate ? '↷' : '✗'} ${r.file}: ${r.error}`);
       }
     }
-    allLowRatings.push(...outcome.newLowRatings);
+    for (const low of outcome.newLowRatings) {
+      enqueueLow.run({ ...low, queued_at: new Date().toISOString() });
+      newLowCount++;
+    }
 
     try {
       if (outcome.status === 'ok' || outcome.status === 'duplicate') {
@@ -151,11 +166,10 @@ try {
       if (outcome.status === 'ok' || outcome.status === 'duplicate') okCount++; else failCount++;
     }
   }
+  if (!isDryRun) await notifyLowRatings(db);
 } finally {
   db.close();
 }
 
-if (!isDryRun) await notifyLowRatings(allLowRatings);
-
-console.log(`\n=== summary: ok=${okCount} duplicate=${dupCount} failed=${failCount} 新規低評価=${allLowRatings.length} ===`);
+console.log(`\n=== summary: ok=${okCount} duplicate=${dupCount} failed=${failCount} 新規低評価=${newLowCount} ===`);
 process.exit(failCount > 0 ? 1 : 0);

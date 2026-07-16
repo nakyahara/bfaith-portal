@@ -65,6 +65,18 @@ export function ensureRakutenReviewTables(db) {
     PRIMARY KEY (review_url, observed_at)
   )`);
 
+  // 低評価通知キュー: GChat送信が失敗しても取込は成功扱い (fail-soft) のため、
+  // 未送信分をここに積んで次回実行時にリトライする (送信2xxで削除 — Codex R2 High:
+  // 送信失敗+再取込duplicateで通知が恒久欠落するのを防ぐ)。宛先情報は持たない
+  db.exec(`CREATE TABLE IF NOT EXISTS rakuten_review_low_notify_queue (
+    review_url  TEXT PRIMARY KEY,
+    review_type TEXT NOT NULL,
+    item_name   TEXT,
+    rating      INTEGER NOT NULL,
+    posted_at   TEXT NOT NULL,
+    queued_at   TEXT NOT NULL
+  )`);
+
   // 取込ログ (raw_rakuten_data_import_log と同型)
   db.exec(`CREATE TABLE IF NOT EXISTS raw_rakuten_review_import_log (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
