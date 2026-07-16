@@ -694,6 +694,20 @@ function initLedgerSchema(db) {
     `);
   }
 
+  // PO参照メール (サロンジェ等) 起点の減数の対応記録。「この明細はどのメールの連絡で減数したか」を
+  // 追跡し、別メールでの二重減数を変換画面で警告する (正本は po_item_events。これは紐づけの監査、Codex salonge設計相談)
+  db.exec(`CREATE TABLE IF NOT EXISTS po_shipment_mail_adjustments (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    mail_id        INTEGER NOT NULL REFERENCES po_shipment_mails(id),
+    order_item_id  INTEGER NOT NULL REFERENCES po_order_items(id),
+    event_id       INTEGER NOT NULL UNIQUE REFERENCES po_item_events(id),
+    qty            INTEGER NOT NULL CHECK(qty > 0),
+    exception_text TEXT,
+    created_at     TEXT NOT NULL,
+    actor          TEXT
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_po_mail_adj_item ON po_shipment_mail_adjustments(order_item_id)');
+
   // メール送信ジョブ (outbox方式。txn内でGmail APIを呼ばない。delivery_key で二重送信の確率を構造的に低減:
   // 送信前に sending をcommit → Message-IDヘッダ+本文に埋込 → lease切れ再送前にGmail照合、不明時は自動再送しない)
   db.exec(`CREATE TABLE IF NOT EXISTS po_email_jobs (
