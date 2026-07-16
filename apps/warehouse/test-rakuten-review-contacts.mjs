@@ -40,16 +40,20 @@ console.log('=== 1. 鍵と暗号化ヘルパ ===');
   try { loadContactKeys({}); } catch (e) { threw = /CONTACTS_KEY_MISSING/.test(e.message); }
   check('鍵未設定は fail-fast', threw);
   const email = 'Test+Masked@ANshin.rakuten.co.jp ';
-  const enc = encryptEmail(email, keys);
+  const orderNo = '373343-20260701-0000000001';
+  const enc = encryptEmail(email, keys, orderNo);
   check('暗号文に平文が含まれない', !enc.includes('anshin') && !enc.includes('Masked'));
-  check('復号でtrim+小文字化された平文が戻る', decryptEmail(enc, keys) === 'test+masked@anshin.rakuten.co.jp');
-  const enc2 = encryptEmail(email, keys);
+  check('復号でtrim+小文字化された平文が戻る', decryptEmail(enc, keys, orderNo) === 'test+masked@anshin.rakuten.co.jp');
+  const enc2 = encryptEmail(email, keys, orderNo);
   check('毎回異なる暗号文 (IVランダム)', enc !== enc2);
   check('HMACは大文字小文字・空白ゆれで同一', hmacEmail(email, keys) === hmacEmail('test+masked@anshin.rakuten.co.jp', keys));
   const tampered = enc.replace(/.$/, (c) => (c === 'A' ? 'B' : 'A'));
   let authFail = false;
   try { decryptEmail(tampered, keys); } catch { authFail = true; }
   check('改ざん暗号文は復号エラー (GCM認証)', authFail);
+  let aadFail = false;
+  try { decryptEmail(enc, keys, '373343-20260701-0000000002'); } catch { aadFail = true; }
+  check('別注文番号では復号エラー (AAD束縛 — 暗号文差し替えで誤宛先にならない)', aadFail);
 }
 
 console.log('=== 2. extractContact (getOrder応答のallowlist抽出) ===');
@@ -122,44 +126,53 @@ const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
 
   const urlKeep = itemUrl('keep');
   const urlGone = itemUrl('gone');
-  // 1回目: 2件とも存在
+  const day = (n) => `2026-07-${String(16 + n).padStart(2, '0')}T06:00:00.000Z`;
+  // day0: 2件とも存在
   let buf = csvOf([row(urlKeep), row(urlGone)]);
-  importReviewFile(db, { name: 'rreview_csv_d2026-07-01_2026-07-16_t1.csv', buffer: buf, sha256: sha(buf) });
-  // 2回目: gone が消える → 不在1
+  importReviewFile(db, { name: 'rreview_csv_d2026-07-01_2026-07-16_t1.csv', buffer: buf, sha256: sha(buf), nowIso: day(0) });
+  // day1: gone が消える → 不在1
   buf = csvOf([row(urlKeep)]);
-  let out = importReviewFile(db, { name: 'rreview_csv_d2026-07-01_2026-07-16_t2.csv', buffer: buf, sha256: sha(buf) });
+  let out = importReviewFile(db, { name: 'rreview_csv_d2026-07-01_2026-07-16_t2.csv', buffer: buf, sha256: sha(buf), nowIso: day(1) });
   check('不在1回目は missed=1 / deleted=0', out.results[0].missed === 1 && out.results[0].deleted === 0, JSON.stringify(out.results[0]));
   let g = db.prepare(`SELECT is_deleted, miss_count FROM fact_rakuten_reviews WHERE review_url = ?`).get(urlGone);
   check('miss_count=1・未削除', g.miss_count === 1 && g.is_deleted === 0);
-  // 3回目: まだ消えている → 2回連続不在 = 削除確定
+  // day1 の別ファイル (バックフィル月窓の重複等): 同日は二重カウントしない
+  buf = csvOf([row(urlKeep, 5, '2026/7/10 9:10:00')]);
+  out = importReviewFile(db, { name: 'rreview_csv_d2026-07-01_2026-07-31_t2b.csv', buffer: buf, sha256: sha(buf), nowIso: day(1) });
+  check('同日の重複窓では不在を二重カウントしない (Codex R1 high)', out.results[0].missed === 0 && out.results[0].deleted === 0, JSON.stringify(out.results[0]));
+  // day2: まだ消えている → 2日連続不在 = 削除確定
   buf = csvOf([row(urlKeep, 4)]);
-  out = importReviewFile(db, { name: 'rreview_csv_d2026-07-01_2026-07-16_t3.csv', buffer: buf, sha256: sha(buf) });
-  check('2回連続不在で deleted=1', out.results[0].deleted === 1, JSON.stringify(out.results[0]));
+  out = importReviewFile(db, { name: 'rreview_csv_d2026-07-01_2026-07-16_t3.csv', buffer: buf, sha256: sha(buf), nowIso: day(2) });
+  check('2回連続不在 (別日) で deleted=1', out.results[0].deleted === 1, JSON.stringify(out.results[0]));
   g = db.prepare(`SELECT is_deleted, miss_count FROM fact_rakuten_reviews WHERE review_url = ?`).get(urlGone);
   check('is_deleted=1 になる', g.is_deleted === 1 && g.miss_count === 2);
   const rev = db.prepare(`SELECT COUNT(*) c FROM fact_rakuten_review_revisions WHERE review_url = ? AND is_deleted = 1`).get(urlGone).c;
   check('削除 revision が積まれる', rev === 1);
   // 削除済み行は以降の不在対象にならない + 集計から除外される
   buf = csvOf([row(urlKeep, 3)]);
-  out = importReviewFile(db, { name: 'rreview_csv_d2026-07-01_2026-07-16_t4.csv', buffer: buf, sha256: sha(buf) });
+  out = importReviewFile(db, { name: 'rreview_csv_d2026-07-01_2026-07-16_t4.csv', buffer: buf, sha256: sha(buf), nowIso: day(3) });
   check('削除済みは再カウントしない', out.results[0].missed === 0 && out.results[0].deleted === 0, JSON.stringify(out.results[0]));
   // 再出現 → 自己修復
   buf = csvOf([row(urlKeep, 3), row(urlGone, 5)]);
-  out = importReviewFile(db, { name: 'rreview_csv_d2026-07-01_2026-07-16_t5.csv', buffer: buf, sha256: sha(buf) });
+  out = importReviewFile(db, { name: 'rreview_csv_d2026-07-01_2026-07-16_t5.csv', buffer: buf, sha256: sha(buf), nowIso: day(4) });
   g = db.prepare(`SELECT is_deleted, miss_count FROM fact_rakuten_reviews WHERE review_url = ?`).get(urlGone);
   check('再出現で is_deleted=0 / miss_count=0 に自己修復', g.is_deleted === 0 && g.miss_count === 0);
   // 窓マーカーなしファイルでは不在カウントしない
   buf = csvOf([row(urlKeep, 2, '2026/7/10 9:00:01')]);
-  out = importReviewFile(db, { name: 'manual-upload.csv', buffer: buf, sha256: sha(buf) });
+  out = importReviewFile(db, { name: 'manual-upload.csv', buffer: buf, sha256: sha(buf), nowIso: day(5) });
   check('マーカーなしは削除検知しない', out.results[0].missed === 0 && out.results[0].deleted === 0, JSON.stringify(out.results[0]));
   // 窓外のレビューは不在対象にならない
   const urlOld = itemUrl('old');
   buf = csvOf([row(urlOld, 5, '2026/6/1 9:00:00')]);
-  importReviewFile(db, { name: 'rreview_csv_d2026-06-01_2026-06-30_t6.csv', buffer: buf, sha256: sha(buf) });
+  importReviewFile(db, { name: 'rreview_csv_d2026-06-01_2026-06-30_t6.csv', buffer: buf, sha256: sha(buf), nowIso: day(6) });
   buf = csvOf([row(urlKeep, 3, '2026/7/10 9:00:02')]);
-  out = importReviewFile(db, { name: 'rreview_csv_d2026-07-01_2026-07-16_t7.csv', buffer: buf, sha256: sha(buf) });
+  out = importReviewFile(db, { name: 'rreview_csv_d2026-07-01_2026-07-16_t7.csv', buffer: buf, sha256: sha(buf), nowIso: day(7) });
   const o = db.prepare(`SELECT miss_count FROM fact_rakuten_reviews WHERE review_url = ?`).get(urlOld);
   check('窓外レビューは不在カウントされない', o.miss_count === 0);
+  // gone を再度2日連続で消す前に、0件CSVガード: レコード0件+窓マーカーでも不在判定しない
+  const emptyBuf = csvOf([]);
+  out = importReviewFile(db, { name: 'rreview_csv_d2026-07-01_2026-07-16_t8.csv', buffer: emptyBuf, sha256: sha(emptyBuf), nowIso: day(8) });
+  check('0件CSVでは不在判定しない (検索不調の空CSVで全消し防止)', out.status === 'ok' && out.results[0].missed === 0 && out.results[0].deleted === 0, JSON.stringify(out.results[0]));
 }
 
 db.close();

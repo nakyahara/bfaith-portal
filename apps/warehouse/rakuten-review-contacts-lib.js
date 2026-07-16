@@ -30,19 +30,23 @@ export function loadContactKeys(env = process.env) {
 }
 
 // ─── 暗号化ヘルパ ───
-export function encryptEmail(email, keys) {
+// AAD=注文番号で暗号文を注文レコードに束縛する (Codex R1 medium: DB内で暗号文を
+// 別注文に差し替えても復号が成功してしまう=誤宛先送信の芽を、GCM認証で潰す)
+export function encryptEmail(email, keys, orderNumber) {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', keys.encKey, iv);
+  cipher.setAAD(Buffer.from(`order:${String(orderNumber || '').trim()}`, 'utf8'));
   const ct = Buffer.concat([cipher.update(trimEmail(email), 'utf8'), cipher.final()]);
   const tag = cipher.getAuthTag();
   return `v1:${iv.toString('base64')}:${tag.toString('base64')}:${ct.toString('base64')}`;
 }
 
-export function decryptEmail(enc, keys) {
+export function decryptEmail(enc, keys, orderNumber) {
   const m = String(enc || '').match(/^v1:([^:]+):([^:]+):([^:]+)$/);
   if (!m) throw new Error('CONTACTS_DECRYPT: 暗号文の形式が不正');
   const [, ivB64, tagB64, ctB64] = m;
   const decipher = crypto.createDecipheriv('aes-256-gcm', keys.encKey, Buffer.from(ivB64, 'base64'));
+  decipher.setAAD(Buffer.from(`order:${String(orderNumber || '').trim()}`, 'utf8'));
   decipher.setAuthTag(Buffer.from(tagB64, 'base64'));
   return Buffer.concat([decipher.update(Buffer.from(ctB64, 'base64')), decipher.final()]).toString('utf8');
 }
@@ -113,7 +117,7 @@ export function extractContact(order, keys) {
   return {
     order_number: orderNumber,
     order_key_hmac: hmacOrderKey(orderNumber, keys),
-    masked_email_enc: email ? encryptEmail(email, keys) : null,
+    masked_email_enc: email ? encryptEmail(email, keys, orderNumber) : null,
     masked_email_hash: email ? hmacEmail(email, keys) : null,
     order_datetime: orderDatetime,
     shipping_datetime: shippingDatetime,

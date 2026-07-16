@@ -49,7 +49,8 @@ async function callRMS(endpoint, body) {
   // レスポンス本文はログに出さない (PII対策、rakuten-orders.js と同方針)
   if (data && data.MessageModelList) {
     const errors = data.MessageModelList.filter((m) => m.messageType === 'ERROR');
-    if (errors.length > 0) throw new Error(`RMS API ${endpoint}: ${errors.map((e) => `${e.messageCode} ${e.message}`).join(', ')}`);
+    // message本文は含めない (楽天側メッセージに注文番号等が含まれ得る — Codex R1 medium)。codeのみ
+    if (errors.length > 0) throw new Error(`RMS API ${endpoint}: ${errors.map((e) => e.messageCode).join(', ')} (本文はPII対策で非表示)`);
   }
   return data;
 }
