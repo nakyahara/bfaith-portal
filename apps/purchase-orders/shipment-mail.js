@@ -544,8 +544,10 @@ export async function reparseShipmentMail(id, actor) {
   if (!rule) return toNotCandidate('出荷明細の対象外です (差出人/件名がルールに一致しません)');
   try {
     const { items, note } = await parseByRule(c, rule);
-    applyIfStillOpen("status='new', parsed_json=?, parse_note=?, error=NULL", [JSON.stringify(items), note], { status: 'new', items: items.length });
-    return { status: 'new', itemCount: items.length };
+    // items は配列 (明細解析) または po_reference オブジェクト — 件数は配列のときのみ (Codex salonge-R1 Medium)
+    const itemCount = Array.isArray(items) ? items.length : null;
+    applyIfStillOpen("status='new', parsed_json=?, parse_note=?, error=NULL", [JSON.stringify(items), note], { status: 'new', items: itemCount });
+    return { status: 'new', itemCount };
   } catch (e) {
     if (e.transient) throw new Error(`一時的な取得エラー: ${String(e.message || e)} — もう一度試してください`);
     if (e.notCandidate) return toNotCandidate(`${String(e.message || e)} — 出荷明細ではないため一覧から外しました`);

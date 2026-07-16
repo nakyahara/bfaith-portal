@@ -2693,7 +2693,7 @@ console.log('── サロンジェ PO参照 (po_reference) ──');
   // メール取得: 出荷連絡 (※行2件、うち1件は商品コード一致) / 出荷連絡でないメール
   process.env.PO_SHIPMENT_FAKE_DATA = JSON.stringify([
     { id: 'gm-sal-1', from: '藤本 <fujimoto@salonge.co.jp>', subject: 'Re: 【発注書】', internalDate: '2026-07-15T04:32:00.000Z',
-      bodyHtml: '<div>中原様<br><br>いつもお世話になります。<br><br>7/14、7/8の御依頼分、出荷準備整いました。<br>添付ご確認ください。<br>※sal-towel3p 16502 KBミニタオル3P…在庫無し。終売となりました。<br>※まったく関係ない商品ZZZ…欠品です。<br><br>以上、宜しくお願い致します。</div>' },
+      bodyHtml: '<div>中原様<br><br>いつもお世話になります。<br><br>7/14、7/8の御依頼分、出荷準備整いました。<br>添付ご確認ください。<br>※sal-towel3p 16502 KBミニタオル3P…在庫無し。終売となりました。<br>※まったく関係ない商品ZZZ…欠品です。<br>※カップの件、また改めてご連絡します。<br><br>以上、宜しくお願い致します。</div>' },
     { id: 'gm-sal-2', from: 'fujimoto@salonge.co.jp', subject: '請求書', bodyHtml: '<p>請求書をお送りします</p>' },
   ]);
   r = await jpS('/api/inbound-plan/fetch-mails');
@@ -2701,9 +2701,10 @@ console.log('── サロンジェ PO参照 (po_reference) ──');
   const salMail = db.prepare("SELECT * FROM po_shipment_mails WHERE gmail_id='gm-sal-1'").get();
   ok(salMail && salMail.supplier_code === '107' && salMail.status === 'new', 'salonge: supplier=107/new');
   const salParsed = JSON.parse(salMail.parsed_json);
-  ok(salParsed.kind === 'po_reference' && salParsed.exceptions.length === 2 && salParsed.exceptions[0].kind === 'discontinued'
+  ok(salParsed.kind === 'po_reference' && salParsed.exceptions.length === 3 && salParsed.exceptions[0].kind === 'discontinued'
+    && salParsed.exceptions[1].kind === 'shortage' && salParsed.exceptions[2].kind === 'other'
     && salParsed.refDates.includes('7/14') && salParsed.refDates.includes('7/8'),
-    'salonge: 例外抽出 (終売/欠品) + 本文日付', salParsed.exceptions);
+    'salonge: 例外抽出 (終売/欠品/その他) + 本文日付', salParsed.exceptions);
   ok(db.prepare("SELECT status FROM po_shipment_mails WHERE gmail_id='gm-sal-2'").get().status === 'not_candidate',
     'salonge: 出荷連絡でないメールは対象外 (not_candidate)');
 
@@ -2713,7 +2714,7 @@ console.log('── サロンジェ PO参照 (po_reference) ──');
 
   // PO選択候補
   r = await jpS('/api/inbound-plan/mails/' + salMail.id + '/po-convert');
-  ok(r.body.ok && r.body.pick === true && r.body.orders.length === 2 && r.body.exceptions.length === 2 && r.body.bodyText.includes('出荷準備'),
+  ok(r.body.ok && r.body.pick === true && r.body.orders.length === 2 && r.body.exceptions.length === 3 && r.body.bodyText.includes('出荷準備'),
     'salonge: PO候補2件+例外+原文', r.body.orders && r.body.orders.length);
 
   // 別仕入先のPO指定は400
@@ -2728,8 +2729,24 @@ console.log('── サロンジェ PO参照 (po_reference) ──');
   ok(lt && lt.exception && lt.exception.level === 'strong' && lt.exception.kind === 'discontinued', 'salonge: 商品コード一致=強一致 (終売の除外提案)', lt && lt.exception);
   const la = r.body.lines.find(l => l.productName.includes('エプロン'));
   ok(la && !la.exception, 'salonge: 無関係の行に例外が付かない');
+  const lc = r.body.lines.find(l => l.productName.includes('カップ'));
+  ok(lc && !lc.exception, 'salonge: kind=other の※行 (「カップの件…」) はマッチ対象外 (誤減数候補にしない)');
   ok(r.body.lines.every(l => l.costSource === 'po' && l.cost != null), 'salonge: 単価=PO単価 (発注時スナップショット)');
   const towelItemId = lt.orderItemId, apronItemId = la.orderItemId;
+
+  // ガード: 冪等キー必須 / 非PO参照メール / 仕入先越境の明細
+  r = await jpS('/api/inbound-plan/mails/' + salMail.id + '/apply-adjustments',
+    { entries: [{ orderItemId: towelItemId, qty: 1 }] });
+  ok(r.status === 400 && r.body.error.includes('Idempotency-Key'), 'salonge: 冪等キーなしの減数は400');
+  const amcMailRow = db.prepare("SELECT id FROM po_shipment_mails WHERE gmail_id='gm-amc-1'").get();
+  r = await jpS('/api/inbound-plan/mails/' + amcMailRow.id + '/apply-adjustments',
+    { entries: [{ orderItemId: towelItemId, qty: 1 }] }, { 'Idempotency-Key': 'salonge-adj-x1' });
+  ok(r.status === 400 && r.body.error.includes('PO参照方式ではない'), 'salonge: 非PO参照メールを減数の根拠にできない');
+  const foreignItem = db.prepare(`SELECT i.id FROM po_order_items i JOIN po_orders o ON o.id=i.order_id
+    WHERE o.supplier_code<>'107' AND o.status='issued' ORDER BY i.id DESC LIMIT 1`).get();
+  r = await jpS('/api/inbound-plan/mails/' + salMail.id + '/apply-adjustments',
+    { entries: [{ orderItemId: foreignItem.id, qty: 1 }] }, { 'Idempotency-Key': 'salonge-adj-x2' });
+  ok(r.status === 400 && r.body.error.includes('仕入先'), 'salonge: 別仕入先の明細への減数は400 (越境ガード)');
 
   // 減数: 一括+冪等+原子性
   r = await jpS('/api/inbound-plan/mails/' + salMail.id + '/apply-adjustments',
@@ -2746,9 +2763,10 @@ console.log('── サロンジェ PO参照 (po_reference) ──');
   ok(db.prepare('SELECT COUNT(*) n FROM po_item_events WHERE order_item_id=?').get(apronItemId).n === 0,
     'salonge: 失敗時は全件ロールバック (1件目の正常分も登録しない)');
 
-  // 減数後の再変換: 残0の行は消える
+  // 減数後の再変換: 残0の行は消える + 同一メール由来の減数は priorAdjustments に出ない (残数に反映済み)
   r = await jpS('/api/inbound-plan/mails/' + salMail.id + '/po-convert', { orderIds: [salPo1, salPo2] });
   ok(r.body.ok && r.body.lines.length === 2 && !r.body.lines.some(l => l.orderItemId === towelItemId), 'salonge: 減数後の再変換で残0行が消える');
+  ok(r.body.lines.every(l => (l.priorAdjustments || []).length === 0), 'salonge: 同一メールの減数は警告に出ない (別メールのみ)');
 
   // 2通目のメール: 例外0件=全量出荷の正常ケース + 別メールでの二重減数警告 (priorAdjustments)
   r = await jpS('/api/inbound-plan/mails/' + salMail.id + '/apply-adjustments',
@@ -2765,6 +2783,9 @@ console.log('── サロンジェ PO参照 (po_reference) ──');
   const la2 = r.body.lines.find(l => l.orderItemId === apronItemId);
   ok(la2 && la2.priorAdjustments.length === 1 && la2.priorAdjustments[0].mailId === salMail.id && la2.priorAdjustments[0].qty === 2,
     'salonge: 別メールでの減数済みを警告 (priorAdjustments)', la2 && la2.priorAdjustments);
+  // 再解析: po_reference は itemCount=null (オブジェクト形を配列と数えない)
+  r = await jpS('/api/inbound-plan/mails/' + salMail2.id + '/reparse');
+  ok(r.body.ok && r.body.status === 'new' && r.body.itemCount === null, 'salonge: 再解析の件数はnull (po_reference)', r.body.itemCount);
 
   // UI配信
   const planHtmlS = await (await fetch(base + '/inbound-plan')).text();

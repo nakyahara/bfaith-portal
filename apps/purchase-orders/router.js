@@ -1773,10 +1773,14 @@ router.post('/api/inbound-plan/mails/:id/po-convert', (req, res) => {
       costByKey.set(key, Number.isFinite(c) ? c : null);
       codeByKey.set(key, String(r['商品コード']).trim());
     }
-    const normJa = s => String(s || '').toLowerCase().replace(/[\s　]/g, '');
-    const normEx = exceptions.map(ex => ({ ...ex, norm: normJa(ex.text) }));
+    // 比較用正規化: NFKC (全角英数→半角) + 小文字 + 空白除去。商品キー側と例外本文側の両方に同じ正規化 (Codex salonge-R1 Low)
+    const normJa = s => String(s || '').normalize('NFKC').toLowerCase().replace(/[\s　]/g, '');
+    // kind=other (終売/欠品と読めない※行) はマッチ対象にしない — 挨拶等の※行が減数候補になるのを防ぐ (Codex salonge-R1 High)
+    const normEx = exceptions.filter(ex => ex.kind === 'discontinued' || ex.kind === 'shortage')
+      .map(ex => ({ ...ex, norm: normJa(ex.text) }));
+    // 「別の出荷連絡での減数」だけを警告する (このメール自身の減数は再変換で残数に反映済み、Codex salonge-R1 Medium)
     const priorStmt = db.prepare(`SELECT a.mail_id, a.qty, m.received_at FROM po_shipment_mail_adjustments a
-      JOIN po_shipment_mails m ON m.id = a.mail_id WHERE a.order_item_id=? ORDER BY a.id`);
+      JOIN po_shipment_mails m ON m.id = a.mail_id WHERE a.order_item_id=? AND a.mail_id<>? ORDER BY a.id`);
     const lines = [];
     let totalRemaining = 0;
     for (const o of chosen) {
@@ -1784,9 +1788,10 @@ router.post('/api/inbound-plan/mails/:id/po-convert', (req, res) => {
         if (i.remaining_qty <= 0) continue;
         totalRemaining += i.remaining_qty;
         const key = i.product_key || normProductCode(i.product_code);
+        const keyNorm = normJa(key);
         let exception = null;
         for (const ex of normEx) {
-          if (key.length >= 4 && ex.norm.includes(key)) { exception = { level: 'strong', text: ex.text, kind: ex.kind }; break; }
+          if (keyNorm.length >= 4 && ex.norm.includes(keyNorm)) { exception = { level: 'strong', text: ex.text, kind: ex.kind }; break; }
         }
         if (!exception) {
           const tokens = String(i.product_name || '').split(/[\s　、。()（）[\]/・×-]+/).filter(t => t.length >= 3);
@@ -1803,7 +1808,7 @@ router.post('/api/inbound-plan/mails/:id/po-convert', (req, res) => {
           cost: i.unit_cost != null ? i.unit_cost : (pmlCost != null ? pmlCost : null),
           costSource: i.unit_cost != null ? 'po' : (pmlCost != null ? 'pml' : 'none'),
           exception,
-          priorAdjustments: priorStmt.all(i.id).map(a => ({ mailId: a.mail_id, qty: a.qty, receivedAt: a.received_at })),
+          priorAdjustments: priorStmt.all(i.id, id).map(a => ({ mailId: a.mail_id, qty: a.qty, receivedAt: a.received_at })),
         });
       }
     }
@@ -1822,6 +1827,15 @@ router.post('/api/inbound-plan/mails/:id/apply-adjustments', (req, res) => {
     const id = Number(req.params.id);
     const mail = db.prepare('SELECT * FROM po_shipment_mails WHERE id=?').get(id);
     if (!mail) return res.status(404).json({ ok: false, error: 'メールが見つかりません' });
+    // メール適格性: PO参照メール以外を減数の根拠にさせない (Codex salonge-R1 High)
+    let parsedAdj = null;
+    try { parsedAdj = JSON.parse(mail.parsed_json || 'null'); } catch { /* 下でエラー */ }
+    if (!parsedAdj || Array.isArray(parsedAdj) || parsedAdj.kind !== 'po_reference') {
+      return res.status(400).json({ ok: false, error: 'このメールはPO参照方式ではないため減数の根拠にできません' });
+    }
+    if (!['new', 'done'].includes(mail.status)) {
+      return res.status(400).json({ ok: false, error: `このメールは処理できる状態ではありません (現在: ${mail.status})` });
+    }
     const entries = Array.isArray((req.body || {}).entries) ? (req.body || {}).entries : [];
     if (!entries.length || entries.length > 200) return res.status(400).json({ ok: false, error: '減数する明細を指定してください (1〜200件)' });
     for (const en of entries) {
@@ -1829,6 +1843,8 @@ router.post('/api/inbound-plan/mails/:id/apply-adjustments', (req, res) => {
         return res.status(400).json({ ok: false, error: '明細ID/数量が不正です (数量は正の整数)' });
       }
     }
+    // 台帳を変える操作のため冪等キー必須 (再送での二重減数を構造的に防ぐ、Codex salonge-R1 High)
+    if (!req.get('Idempotency-Key')) return res.status(400).json({ ok: false, error: 'Idempotency-Key が必要です' });
     const actor = actorOf(req);
     // withCommand が全体を1トランザクションで実行: 1件でも失敗 (残数超過等) すれば全件ロールバック
     const { replay, result } = withCommand(
@@ -1836,8 +1852,15 @@ router.post('/api/inbound-plan/mails/:id/apply-adjustments', (req, res) => {
       () => {
         const ins = db.prepare(`INSERT INTO po_shipment_mail_adjustments
           (mail_id, order_item_id, event_id, qty, exception_text, created_at, actor) VALUES (?,?,?,?,?,?,?)`);
+        const itemSup = db.prepare(`SELECT o.supplier_code FROM po_order_items i JOIN po_orders o ON o.id = i.order_id WHERE i.id=?`);
         const out = [];
         for (const en of entries) {
+          // 仕入先越境ガード: このメールの仕入先の明細以外は減数させない (UI迂回の直接API呼び出し対策、Codex salonge-R1 High)
+          const supRow2 = itemSup.get(Number(en.orderItemId));
+          if (!supRow2) throw Object.assign(new Error(`明細が存在しません: ${en.orderItemId}`), { status: 400 });
+          if (supRow2.supplier_code !== mail.supplier_code) {
+            throw Object.assign(new Error(`明細 ${en.orderItemId} はこのメールの仕入先 (${mail.supplier_code}) の発注ではありません`), { status: 400 });
+          }
           const noteBase = en.note ? String(en.note).slice(0, 200) : '';
           const r2 = appendPoItemEvent({
             orderItemId: Number(en.orderItemId), eventType: 'shortage', qty: en.qty,
@@ -5578,8 +5601,11 @@ function renderPoResult(j) {
       ' <span class="muted">— ロジザード側の「入荷予定数合計」と一致するか確認</span>';
     return { rows: rows, inc: inc, bad: bad };
   }
-  area.addEventListener('input', function(ev2){ if (ev2.target.classList && (ev2.target.classList.contains('plQty') || ev2.target.classList.contains('plInc'))) updateSummary(); });
-  area.addEventListener('change', function(ev2){ if (ev2.target.classList && ev2.target.classList.contains('plInc')) updateSummary(); });
+  // リスナーは innerHTML で毎回作り直される先頭要素に付ける (永続の #ipResult に付けると再変換のたびに
+  // 古い j を閉じ込めたリスナーが累積する、Codex salonge-R1 Medium)。checkbox も input イベントを発火する
+  area.firstElementChild.addEventListener('input', function(ev2) {
+    if (ev2.target.classList && (ev2.target.classList.contains('plQty') || ev2.target.classList.contains('plInc'))) updateSummary();
+  });
   updateSummary();
 
   document.getElementById('ipLogizard3').addEventListener('click', function(){ window.open(LOGIZARD_URL, '_blank', 'noopener'); });
