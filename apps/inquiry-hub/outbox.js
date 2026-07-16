@@ -131,14 +131,17 @@ function finishJob(db, job, fields) {
 export async function runOutboxPass(adapters, opts = {}) {
   const db = getDB();
   const executor = opts.executor ?? 'server';
-  const nowMs = opts.now != null ? (typeof opts.now === 'number' ? opts.now : Date.parse(opts.now)) : Date.now();
-  const nowIso = toUtcIso(nowMs);
+  // 現在時刻は claim ごとに取り直す (先行ジョブの送信が長引くと後続のリースが最初から期限切れ近くになるため。
+  // Codexレビュー反映)。opts.now はテスト用固定時計
+  const tick = () => opts.now != null ? (typeof opts.now === 'number' ? opts.now : Date.parse(opts.now)) : Date.now();
   const leaseMinutes = opts.leaseMinutes ?? DEFAULT_SEND_LEASE_MINUTES;
 
-  const swept = sweepZombies({ now: nowMs });
+  const swept = sweepZombies({ now: tick() });
   const results = [];
 
   for (let n = 0; n < (opts.maxJobs ?? 20); n++) {
+    const nowMs = tick();
+    const nowIso = toUtcIso(nowMs);
     const job = claimNext(db, executor, nowMs, leaseMinutes);
     if (!job) break;
     const inq = db.prepare('SELECT * FROM inquiries WHERE id = ?').get(job.inquiry_id);
@@ -174,8 +177,9 @@ export async function runOutboxPass(adapters, opts = {}) {
         inquiry: inq, shop, bodyText: job.body_text, attachmentsJson: job.attachments_json,
       });
       const extReplyId = sent?.externalReplyId || `op:${job.client_operation_id}`;
+      const sentIso = toUtcIso(tick()); // 完了時刻は送信後に取り直す (長い送信でもsent_atを正確に)
       const tx = db.transaction(() => {
-        if (!finishJob(db, job, { status: 'sent', external_reply_id: extReplyId, sent_at: nowIso,
+        if (!finishJob(db, job, { status: 'sent', external_reply_id: extReplyId, sent_at: sentIso,
           lease_token: null, lease_until: null, error_message: null })) {
           // リースを失っていた (ゾンビ扱いでunknown化済み等) → メッセージ二重挿入を避けて何もしない
           return false;
@@ -185,13 +189,13 @@ export async function runOutboxPass(adapters, opts = {}) {
             (inquiry_id, external_message_id, sender_type, sender_name, message_body_text,
              is_incoming, sent_by_user_id, outbox_id, sent_at, received_at)
           VALUES (?,?,'shop',?,?,0,?,?,?,?)`)
-          .run(job.inquiry_id, extReplyId, job.created_by, job.body_text, job.created_by, job.id, nowIso, nowIso);
+          .run(job.inquiry_id, extReplyId, job.created_by, job.body_text, job.created_by, job.id, sentIso, sentIso);
         // 自送信も conversation_rev++ (以後の送信操作は送信後の会話を基準にする)
         db.prepare(`UPDATE inquiries SET conversation_rev = conversation_rev + 1,
             last_message_at = CASE WHEN last_message_at IS NULL OR last_message_at < ? THEN ? ELSE last_message_at END,
             internal_status = CASE WHEN internal_status IN ('open','in_progress') THEN 'waiting_reply' ELSE internal_status END,
             updated_at = ? WHERE id = ?`)
-          .run(nowIso, nowIso, nowIso, job.inquiry_id);
+          .run(sentIso, sentIso, sentIso, job.inquiry_id);
         logActivity(job.inquiry_id, { actorType: 'system', actionType: 'reply_sent',
           operationId: job.client_operation_id, after: { outbox_id: job.id, external_reply_id: extReplyId } });
         return true;
