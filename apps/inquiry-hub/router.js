@@ -20,6 +20,7 @@
 import { Router } from 'express';
 import { getDB, logActivity } from './db.js';
 import { CHANNELS, STATUSES, AI_FLAGS, PAGE_SIZE, listInquiries, listFilterOptions, getInquiryDetail } from './queries.js';
+import { importTemplatesCsv, importQaCsv, listTemplates, listQa } from './templates.js';
 
 const router = Router();
 
@@ -39,6 +40,32 @@ function fmtJst(iso) {
 const badge = (meta, text) => meta ? `<span class="badge" style="${meta.badge}">${he(text != null ? text : meta.label)}</span>` : '';
 const chBadge = ch => badge(CHANNELS[ch], null) || he(ch);
 const stBadge = st => badge(STATUSES[st], null) || he(st);
+
+// ─── 対応履歴の表示整形 (生JSONではなく日本語ラベルで出す) ───
+const ACTION_LABELS = {
+  status_change: '状態変更', assign: '担当変更', note_add: 'メモ追加', read_toggle: '既読/未読',
+  attention_toggle: '要確認フラグ', ai_flag: 'AIフラグ', seed: 'テストデータ投入',
+};
+function fmtLogValue(key, v) {
+  switch (key) {
+    case 'status': return (STATUSES[v] || {}).label || String(v);
+    case 'is_unread': return v ? '未読' : '既読';
+    case 'needs_attention': return v ? '⚠️要確認ON' : '要確認OFF';
+    case 'ai_needed': return Number(v) === 0 ? 'AI不要' : ((AI_FLAGS[v] || {}).label || String(v));
+    case 'assigned': return v ? String(v) : '未割当';
+    case 'length': return `${v}文字`;
+    case 'source': return String(v);
+    default: return typeof v === 'object' ? JSON.stringify(v) : String(v);
+  }
+}
+/** before_json/after_json → 「対応中」「未読」等の表示文字列。null入力はnull返し */
+function fmtLogJson(json) {
+  if (!json) return null;
+  try {
+    const o = JSON.parse(json);
+    return Object.entries(o).map(([k, v]) => fmtLogValue(k, v)).join(', ');
+  } catch { return json; } // 表示用なので壊れたJSONはそのまま出す
+}
 
 // ─── 一覧画面 ───
 router.get('/', (req, res) => {
@@ -130,18 +157,10 @@ router.get('/inquiries/:id', (req, res) => {
     <div class="note"><div class="note-head"><b>${he(n.user_id)}</b> <span class="msg-date">${fmtJst(n.created_at)}</span></div>
     <div>${he(n.body).replace(/\n/g, '<br>')}</div></div>`).join('') || '<div class="empty">メモはありません</div>';
 
-  const ACTION_LABELS = {
-    status_change: '状態変更', assign: '担当変更', note_add: 'メモ追加', read_toggle: '既読/未読',
-    attention_toggle: '要確認フラグ', ai_flag: 'AIフラグ', seed: 'テストデータ投入',
-  };
   const logHtml = logs.map(l => {
-    let detail = '';
-    try {
-      const b = l.before_json ? JSON.parse(l.before_json) : null;
-      const a = l.after_json ? JSON.parse(l.after_json) : null;
-      if (b != null && a != null) detail = `${JSON.stringify(b)} → ${JSON.stringify(a)}`;
-      else if (a != null) detail = JSON.stringify(a);
-    } catch { /* 表示用なので壊れたJSONは無視 */ }
+    const b = fmtLogJson(l.before_json);
+    const a = fmtLogJson(l.after_json);
+    const detail = b != null && a != null ? `${b} → ${a}` : (a != null ? a : '');
     return `<div class="log-row"><span class="msg-date">${fmtJst(l.created_at)}</span> <b>${he(l.user_id || l.actor_type)}</b> ${he(ACTION_LABELS[l.action_type] || l.action_type)} <span class="sub">${he(detail)}</span></div>`;
   }).join('') || '<div class="empty">履歴はありません</div>';
 
@@ -348,6 +367,375 @@ router.post('/api/inquiries/:id/notes', (req, res) => {
   res.json({ ok: true });
 });
 
+// ─── テンプレート管理 (メールディーラーCSV取込 + CRUD) ───
+router.get('/templates', (req, res) => {
+  const q = req.query || {};
+  const { rows, categories } = listTemplates(q);
+  const kw = String(q.q || '').trim();
+
+  const opt = (v, label, cur) => `<option value="${he(v)}"${String(cur || '') === String(v) ? ' selected' : ''}>${he(label)}</option>`;
+  const filterBar = `
+  <div class="filters">
+    <form method="get" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <select name="category"><option value="">グループ: 全て</option>${categories.map(c => opt(c.category, `${c.category} (${c.c})`, q.category)).join('')}</select>
+      <input type="search" name="q" value="${he(kw)}" placeholder="テンプレート名/件名/本文/キーワード" style="min-width:240px">
+      <button class="pri">検索</button>
+      <a href="/apps/inquiry-hub/templates" class="ghost btn-link">クリア</a>
+    </form>
+    <span style="flex:1"></span>
+    <button class="ghost" id="newBtn">➕ 新規テンプレート</button>
+    <label class="ghost btn-link" style="cursor:pointer">📥 メールディーラーCSV取込<input type="file" id="csvFile" accept=".csv" style="display:none"></label>
+  </div>
+  <div id="editPanel" class="panel" style="display:none">
+    <h3 id="editTitle">テンプレート編集</h3>
+    <div class="edit-grid">
+      <label>テンプレート名 *<input type="text" id="fName"></label>
+      <label>グループ<input type="text" id="fCategory" list="catList" placeholder="例: 領収書発行について"><datalist id="catList">${categories.map(c => `<option value="${he(c.category)}">`).join('')}</datalist></label>
+      <label>件名<input type="text" id="fSubject"></label>
+      <label>キーワード<input type="text" id="fKeywords"></label>
+    </div>
+    <label>本文 *<textarea id="fBody" rows="10"></textarea></label>
+    <label>本文（下）= 署名等<textarea id="fBodyBottom" rows="3"></textarea></label>
+    <label>備考<input type="text" id="fNotes"></label>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="ghost" id="editCancel">キャンセル</button>
+      <button class="pri" id="editSave">保存</button>
+    </div>
+  </div>`;
+
+  let lastCat = Symbol('none');
+  const items = rows.map(r => {
+    const catHead = r.category !== lastCat ? `<div class="cat-head">📁 ${he(r.category || '(グループなし)')}</div>` : '';
+    lastCat = r.category;
+    return `${catHead}
+    <details class="tpl" id="tpl-${r.id}">
+      <summary><b>${he(r.template_name)}</b>${r.subject ? ` <span class="sub">件名: ${he(r.subject)}</span>` : ''}
+        <span class="sub" style="margin-left:auto">使用${r.usage_count}回 ・ 更新 ${fmtJst(r.source_updated_at || r.updated_at)}</span></summary>
+      <div class="tpl-body">
+        ${r.keywords ? `<div class="sub">🔑 ${he(r.keywords)}</div>` : ''}
+        <pre>${he(r.template_body)}</pre>
+        ${r.body_bottom ? `<pre class="sub">${he(r.body_bottom)}</pre>` : ''}
+        ${r.notes ? `<div class="sub">備考: ${he(r.notes)}</div>` : ''}
+        <div class="tpl-ops">
+          <button class="pri" data-copy="${r.id}">📋 本文をコピー</button>
+          <button class="ghost" data-edit="${r.id}">✏️ 編集</button>
+          <button class="ghost" data-del="${r.id}">🗑 削除</button>
+        </div>
+      </div>
+    </details>`;
+  }).join('');
+
+  const body = `${filterBar}
+  <div class="card" style="padding:12px">
+    <div class="sub" style="margin-bottom:8px">全${rows.length}件${q.category || kw ? ' (絞り込み中)' : ''} — クリックで本文を展開。返信送信機能 (Step 3) 実装までは「📋コピー」でメールディーラー等に貼り付けて使用</div>
+    ${items || '<div class="empty">テンプレートがありません。メールディーラーのエクスポートCSVを「📥CSV取込」から取り込んでください</div>'}
+  </div>`;
+
+  const script = `
+  var TPL = ${JSON.stringify(Object.fromEntries(rows.map(r => [r.id, {
+    template_name: r.template_name, category: r.category, subject: r.subject, keywords: r.keywords,
+    template_body: r.template_body, body_bottom: r.body_bottom, notes: r.notes,
+  }]))).replace(/</g, '\\u003c')};
+  function post(path, data) {
+    return fetch('/apps/inquiry-hub/api' + path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data)
+    }).then(function(r) { return r.json().catch(function(){ return {}; }).then(function(j){ if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }); });
+  }
+  var editId = null;
+  function openEdit(id) {
+    editId = id;
+    var d = id ? TPL[id] : {};
+    document.getElementById('editTitle').textContent = id ? 'テンプレート編集' : '新規テンプレート';
+    document.getElementById('fName').value = d.template_name || '';
+    document.getElementById('fCategory').value = d.category || '';
+    document.getElementById('fSubject').value = d.subject || '';
+    document.getElementById('fKeywords').value = d.keywords || '';
+    document.getElementById('fBody').value = d.template_body || '';
+    document.getElementById('fBodyBottom').value = d.body_bottom || '';
+    document.getElementById('fNotes').value = d.notes || '';
+    document.getElementById('editPanel').style.display = 'block';
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+  document.getElementById('newBtn').addEventListener('click', function() { openEdit(null); });
+  document.getElementById('editCancel').addEventListener('click', function() { document.getElementById('editPanel').style.display = 'none'; });
+  document.getElementById('editSave').addEventListener('click', function() {
+    var btn = this; btn.disabled = true;
+    var data = {
+      template_name: document.getElementById('fName').value,
+      category: document.getElementById('fCategory').value,
+      subject: document.getElementById('fSubject').value,
+      keywords: document.getElementById('fKeywords').value,
+      template_body: document.getElementById('fBody').value,
+      body_bottom: document.getElementById('fBodyBottom').value,
+      notes: document.getElementById('fNotes').value,
+    };
+    post(editId ? '/templates/' + editId : '/templates', data)
+      .then(function() { location.reload(); })
+      .catch(function(e) { btn.disabled = false; toast('保存失敗: ' + e.message); });
+  });
+  document.addEventListener('click', function(ev) {
+    var t = ev.target;
+    if (t.dataset && t.dataset.copy) {
+      var d = TPL[t.dataset.copy];
+      var text = d.template_body + (d.body_bottom ? '\\n\\n' + d.body_bottom : '');
+      navigator.clipboard.writeText(text).then(function() {
+        toast('本文をコピーしました');
+        post('/templates/' + t.dataset.copy + '/copied', {}).catch(function(){});
+      }, function() { toast('コピーに失敗しました'); });
+    } else if (t.dataset && t.dataset.edit) {
+      openEdit(t.dataset.edit);
+    } else if (t.dataset && t.dataset.del) {
+      var dd = TPL[t.dataset.del];
+      if (!confirm('テンプレート「' + dd.template_name + '」を削除しますか?(論理削除。再取込で復活します)')) return;
+      post('/templates/' + t.dataset.del + '/delete', {})
+        .then(function() { location.reload(); })
+        .catch(function(e) { toast('削除失敗: ' + e.message); });
+    }
+  });
+  document.getElementById('csvFile').addEventListener('change', function() {
+    var f = this.files[0]; this.value = '';
+    if (!f) return;
+    if (f.size > 1.5 * 1024 * 1024) { toast('CSVが大きすぎます (1.5MBまで。JSON化で膨らむためサーバー上限2MBの手前で制限)'); return; }
+    f.text().then(function(text) {
+      if (!confirm('メールディーラーのテンプレートCSVを取り込みますか?\\n(同じテンプレートIDはCSVの内容で上書き / 手動追加分には触りません)')) return;
+      post('/templates/import', { csv: text }).then(function(r) {
+        alert('取込完了: 新規' + r.inserted + '件 / 更新' + r.updated + '件 / スキップ' + r.skipped + '件' + (r.errors.length ? '\\n\\n' + r.errors.slice(0, 10).join('\\n') : ''));
+        location.reload();
+      }).catch(function(e) { toast('取込失敗: ' + e.message); });
+    });
+  });`;
+  res.send(pageShell('問い合わせ管理 — テンプレート', 'templates', body, script));
+});
+
+// ─── Q&A管理 (社内ナレッジ) ───
+router.get('/qa', (req, res) => {
+  const q = req.query || {};
+  const { rows, categories } = listQa(q);
+  const kw = String(q.q || '').trim();
+
+  const opt = (v, label, cur) => `<option value="${he(v)}"${String(cur || '') === String(v) ? ' selected' : ''}>${he(label)}</option>`;
+  const filterBar = `
+  <div class="filters">
+    <form method="get" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <select name="category"><option value="">カテゴリ: 全て</option>${categories.map(c => opt(c.category, `${c.category} (${c.c})`, q.category)).join('')}</select>
+      <input type="search" name="q" value="${he(kw)}" placeholder="件名/質問/回答" style="min-width:240px">
+      <button class="pri">検索</button>
+      <a href="/apps/inquiry-hub/qa" class="ghost btn-link">クリア</a>
+    </form>
+    <span style="flex:1"></span>
+    <button class="ghost" id="newBtn">➕ 新規Q&A</button>
+    <label class="ghost btn-link" style="cursor:pointer">📥 メールディーラーCSV取込<input type="file" id="csvFile" accept=".csv" style="display:none"></label>
+  </div>
+  <div id="editPanel" class="panel" style="display:none">
+    <h3 id="editTitle">Q&A編集</h3>
+    <div class="edit-grid">
+      <label>件名 *<input type="text" id="fTitle"></label>
+      <label>カテゴリ<input type="text" id="fCategory" list="catList"><datalist id="catList">${categories.map(c => `<option value="${he(c.category)}">`).join('')}</datalist></label>
+    </div>
+    <label>質問内容<textarea id="fQuestion" rows="3"></textarea></label>
+    <label>回答 *<textarea id="fAnswer" rows="6"></textarea></label>
+    <label>備考<input type="text" id="fNotes"></label>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="ghost" id="editCancel">キャンセル</button>
+      <button class="pri" id="editSave">保存</button>
+    </div>
+  </div>`;
+
+  let lastCat = Symbol('none');
+  const items = rows.map(r => {
+    const catHead = r.category !== lastCat ? `<div class="cat-head">📁 ${he(r.category || '(カテゴリなし)')}</div>` : '';
+    lastCat = r.category;
+    return `${catHead}
+    <details class="tpl" id="qa-${r.id}">
+      <summary><b>❓ ${he(r.title)}</b>
+        <span class="sub" style="margin-left:auto">${he(r.staff || '')} ・ 更新 ${fmtJst(r.source_updated_at || r.updated_at)}</span></summary>
+      <div class="tpl-body">
+        ${r.question ? `<div class="qa-q">Q. ${he(r.question).replace(/\n/g, '<br>')}</div>` : ''}
+        <div class="qa-a">A. ${he(r.answer).replace(/\n/g, '<br>')}</div>
+        ${r.notes ? `<div class="sub">備考: ${he(r.notes)}</div>` : ''}
+        <div class="tpl-ops">
+          <button class="pri" data-copy="${r.id}">📋 回答をコピー</button>
+          <button class="ghost" data-edit="${r.id}">✏️ 編集</button>
+          <button class="ghost" data-del="${r.id}">🗑 削除</button>
+        </div>
+      </div>
+    </details>`;
+  }).join('');
+
+  const body = `${filterBar}
+  <div class="card" style="padding:12px">
+    <div class="sub" style="margin-bottom:8px">全${rows.length}件${q.category || kw ? ' (絞り込み中)' : ''} — 商品知識・対応ノウハウの社内ナレッジ。将来のAI返信案の参照元にもなります</div>
+    ${items || '<div class="empty">Q&amp;Aがありません。メールディーラーのエクスポートCSVを「📥CSV取込」から取り込んでください</div>'}
+  </div>`;
+
+  const script = `
+  var QA = ${JSON.stringify(Object.fromEntries(rows.map(r => [r.id, {
+    title: r.title, category: r.category, question: r.question, answer: r.answer, notes: r.notes,
+  }]))).replace(/</g, '\\u003c')};
+  function post(path, data) {
+    return fetch('/apps/inquiry-hub/api' + path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data)
+    }).then(function(r) { return r.json().catch(function(){ return {}; }).then(function(j){ if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }); });
+  }
+  var editId = null;
+  function openEdit(id) {
+    editId = id;
+    var d = id ? QA[id] : {};
+    document.getElementById('editTitle').textContent = id ? 'Q&A編集' : '新規Q&A';
+    document.getElementById('fTitle').value = d.title || '';
+    document.getElementById('fCategory').value = d.category || '';
+    document.getElementById('fQuestion').value = d.question || '';
+    document.getElementById('fAnswer').value = d.answer || '';
+    document.getElementById('fNotes').value = d.notes || '';
+    document.getElementById('editPanel').style.display = 'block';
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+  document.getElementById('newBtn').addEventListener('click', function() { openEdit(null); });
+  document.getElementById('editCancel').addEventListener('click', function() { document.getElementById('editPanel').style.display = 'none'; });
+  document.getElementById('editSave').addEventListener('click', function() {
+    var btn = this; btn.disabled = true;
+    var data = {
+      title: document.getElementById('fTitle').value,
+      category: document.getElementById('fCategory').value,
+      question: document.getElementById('fQuestion').value,
+      answer: document.getElementById('fAnswer').value,
+      notes: document.getElementById('fNotes').value,
+    };
+    post(editId ? '/qa/' + editId : '/qa', data)
+      .then(function() { location.reload(); })
+      .catch(function(e) { btn.disabled = false; toast('保存失敗: ' + e.message); });
+  });
+  document.addEventListener('click', function(ev) {
+    var t = ev.target;
+    if (t.dataset && t.dataset.copy) {
+      navigator.clipboard.writeText(QA[t.dataset.copy].answer).then(function() { toast('回答をコピーしました'); }, function() { toast('コピーに失敗しました'); });
+    } else if (t.dataset && t.dataset.edit) {
+      openEdit(t.dataset.edit);
+    } else if (t.dataset && t.dataset.del) {
+      if (!confirm('Q&A「' + QA[t.dataset.del].title + '」を削除しますか?(論理削除。再取込で復活します)')) return;
+      post('/qa/' + t.dataset.del + '/delete', {})
+        .then(function() { location.reload(); })
+        .catch(function(e) { toast('削除失敗: ' + e.message); });
+    }
+  });
+  document.getElementById('csvFile').addEventListener('change', function() {
+    var f = this.files[0]; this.value = '';
+    if (!f) return;
+    if (f.size > 1.5 * 1024 * 1024) { toast('CSVが大きすぎます (1.5MBまで。JSON化で膨らむためサーバー上限2MBの手前で制限)'); return; }
+    f.text().then(function(text) {
+      if (!confirm('メールディーラーのQ&A CSVを取り込みますか?\\n(同じQ&A IDはCSVの内容で上書き / 手動追加分には触りません)')) return;
+      post('/qa/import', { csv: text }).then(function(r) {
+        alert('取込完了: 新規' + r.inserted + '件 / 更新' + r.updated + '件 / スキップ' + r.skipped + '件' + (r.errors.length ? '\\n\\n' + r.errors.slice(0, 10).join('\\n') : ''));
+        location.reload();
+      }).catch(function(e) { toast('取込失敗: ' + e.message); });
+    });
+  });`;
+  res.send(pageShell('問い合わせ管理 — Q&A', 'qa', body, script));
+});
+
+// ─── テンプレート/Q&A API ───
+router.post('/api/templates/import', (req, res) => {
+  const csv = String((req.body || {}).csv || '');
+  if (!csv.trim()) return res.status(400).json({ error: 'CSVが空です' });
+  try { res.json(importTemplatesCsv(csv)); }
+  catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+router.post('/api/qa/import', (req, res) => {
+  const csv = String((req.body || {}).csv || '');
+  if (!csv.trim()) return res.status(400).json({ error: 'CSVが空です' });
+  try { res.json(importQaCsv(csv)); }
+  catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+/** テンプレートの入力検証。エラー時はnullを返しresへ400を書く */
+function tplFields(body, res) {
+  const b = body || {};
+  const name = String(b.template_name || '').trim().slice(0, 200);
+  const tbody = String(b.template_body || '');
+  if (!name) { res.status(400).json({ error: 'テンプレート名は必須です' }); return null; }
+  if (!tbody.trim()) { res.status(400).json({ error: '本文は必須です' }); return null; }
+  if (tbody.length > 50000) { res.status(400).json({ error: '本文が長すぎます (50000文字まで)' }); return null; }
+  return {
+    template_name: name,
+    category: String(b.category || '').trim().slice(0, 200) || null,
+    subject: String(b.subject || '').trim().slice(0, 500) || null,
+    keywords: String(b.keywords || '').trim().slice(0, 500) || null,
+    template_body: tbody,
+    body_bottom: String(b.body_bottom || '').slice(0, 50000).trim() ? String(b.body_bottom || '').slice(0, 50000) : null,
+    notes: String(b.notes || '').trim().slice(0, 1000) || null,
+  };
+}
+
+router.post('/api/templates', (req, res) => {
+  const f = tplFields(req.body, res); if (!f) return;
+  getDB().prepare(`INSERT INTO reply_templates (template_name, category, subject, keywords, template_body, body_bottom, notes)
+    VALUES (@template_name, @category, @subject, @keywords, @template_body, @body_bottom, @notes)`).run(f);
+  res.json({ ok: true });
+});
+
+router.post('/api/templates/:id(\\d+)', (req, res) => {
+  const f = tplFields(req.body, res); if (!f) return;
+  const r = getDB().prepare(`UPDATE reply_templates SET template_name = @template_name, category = @category,
+    subject = @subject, keywords = @keywords, template_body = @template_body, body_bottom = @body_bottom,
+    notes = @notes, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+    WHERE id = @id AND is_active = 1`).run({ ...f, id: Number(req.params.id) });
+  if (!r.changes) return res.status(404).json({ error: 'テンプレートが見つかりません' });
+  res.json({ ok: true });
+});
+
+router.post('/api/templates/:id(\\d+)/delete', (req, res) => {
+  const r = getDB().prepare(`UPDATE reply_templates SET is_active = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+    WHERE id = ? AND is_active = 1`).run(Number(req.params.id));
+  if (!r.changes) return res.status(404).json({ error: 'テンプレートが見つかりません' });
+  res.json({ ok: true });
+});
+
+router.post('/api/templates/:id(\\d+)/copied', (req, res) => {
+  getDB().prepare('UPDATE reply_templates SET usage_count = usage_count + 1 WHERE id = ?').run(Number(req.params.id));
+  res.json({ ok: true });
+});
+
+/** Q&Aの入力検証 */
+function qaFields(body, res) {
+  const b = body || {};
+  const title = String(b.title || '').trim().slice(0, 300);
+  const answer = String(b.answer || '');
+  if (!title) { res.status(400).json({ error: '件名は必須です' }); return null; }
+  if (!answer.trim()) { res.status(400).json({ error: '回答は必須です' }); return null; }
+  if (answer.length > 50000) { res.status(400).json({ error: '回答が長すぎます (50000文字まで)' }); return null; }
+  return {
+    title,
+    category: String(b.category || '').trim().slice(0, 200) || null,
+    question: String(b.question || '').slice(0, 50000).trim() ? String(b.question || '').slice(0, 50000) : null,
+    answer,
+    notes: String(b.notes || '').trim().slice(0, 1000) || null,
+  };
+}
+
+router.post('/api/qa', (req, res) => {
+  const f = qaFields(req.body, res); if (!f) return;
+  getDB().prepare(`INSERT INTO qa_entries (title, category, question, answer, notes)
+    VALUES (@title, @category, @question, @answer, @notes)`).run(f);
+  res.json({ ok: true });
+});
+
+router.post('/api/qa/:id(\\d+)', (req, res) => {
+  const f = qaFields(req.body, res); if (!f) return;
+  const r = getDB().prepare(`UPDATE qa_entries SET title = @title, category = @category, question = @question,
+    answer = @answer, notes = @notes, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+    WHERE id = @id AND is_active = 1`).run({ ...f, id: Number(req.params.id) });
+  if (!r.changes) return res.status(404).json({ error: 'Q&Aが見つかりません' });
+  res.json({ ok: true });
+});
+
+router.post('/api/qa/:id(\\d+)/delete', (req, res) => {
+  const r = getDB().prepare(`UPDATE qa_entries SET is_active = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+    WHERE id = ? AND is_active = 1`).run(Number(req.params.id));
+  if (!r.changes) return res.status(404).json({ error: 'Q&Aが見つかりません' });
+  res.json({ ok: true });
+});
+
 // ─── ページシェル ───
 const CSS = `
 * { box-sizing: border-box; }
@@ -406,6 +794,17 @@ button:disabled { opacity: .5; cursor: default; }
 .reply-note { color: #64748b; text-align: center; }
 .ai-draft { background: #f0fdfa; border-radius: 8px; padding: 8px 10px; margin: 8px 0; line-height: 1.7; }
 #toast { display: none; position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: #0f172a; color: #fff; padding: 10px 18px; border-radius: 10px; z-index: 2000; }
+.cat-head { background: #f1f5f9; border-radius: 8px; padding: 6px 10px; font-weight: 600; margin: 12px 0 6px; }
+details.tpl { border-bottom: 1px solid #e2e8f0; }
+details.tpl summary { display: flex; gap: 10px; align-items: baseline; padding: 8px 6px; cursor: pointer; flex-wrap: wrap; }
+details.tpl summary:hover { background: #f8fafc; }
+.tpl-body { padding: 4px 10px 12px; }
+.tpl-body pre { background: #f8fafc; border-radius: 8px; padding: 10px 12px; white-space: pre-wrap; overflow-wrap: anywhere; font-family: inherit; line-height: 1.7; margin: 8px 0; }
+.tpl-ops { display: flex; gap: 8px; margin-top: 8px; }
+.edit-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
+@media (max-width: 700px) { .edit-grid { grid-template-columns: 1fr; } }
+.qa-q { background: #fef9c3; border-radius: 8px; padding: 8px 12px; margin: 8px 0; line-height: 1.7; }
+.qa-a { background: #dcfce7; border-radius: 8px; padding: 8px 12px; margin: 8px 0; line-height: 1.7; }
 `;
 
 function pageShell(title, active, body, script) {
@@ -418,6 +817,8 @@ function pageShell(title, active, body, script) {
   <h1>💬 問い合わせ管理</h1>
   <nav style="display:flex;gap:14px">
     ${tab('/apps/inquiry-hub', '一覧', 'list')}
+    ${tab('/apps/inquiry-hub/templates', 'テンプレート', 'templates')}
+    ${tab('/apps/inquiry-hub/qa', 'Q&amp;A', 'qa')}
   </nav>
   <a href="/" class="back">← ポータルに戻る</a>
 </header>

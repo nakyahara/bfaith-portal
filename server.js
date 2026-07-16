@@ -1161,8 +1161,9 @@ app.use('/apps/product-hub/service-api', productHubServiceApiRouter); // トー�
 app.use('/apps/product-hub', requireAppAccess('product-hub'), productHubRouter);
 // 仕入先発注補助: mirror PML(read-only) + po_* マスタ/発注履歴 (warehouse-mirror.db 同居)
 app.use('/apps/purchase-orders', requireAppAccess('purchase-orders'), express.json({ limit: '1mb' }), purchaseOrdersRouter);
-// 問い合わせ管理 (inquiry-hub): 専用DB inquiry-hub.db (DATA_DIR)。Step 1 = 一覧/詳細 read-only + 社内操作のみ
-app.use('/apps/inquiry-hub', requireAppAccess('inquiry-hub'), express.json({ limit: '256kb' }), inquiryHubRouter);
+// 問い合わせ管理 (inquiry-hub): 専用DB inquiry-hub.db (DATA_DIR)。
+// limit 2mb = メールディーラーCSV取込 (テンプレート~150KB+JSONエスケープ膨張) を JSON body で受けるため
+app.use('/apps/inquiry-hub', requireAppAccess('inquiry-hub'), express.json({ limit: '2mb' }), inquiryHubRouter);
 app.use('/apps/mgmt-accounting', (req, res, next) => {
   // 管理系API (x-sync-key 直呼び対象) はセッション認証の代わりに parser より前で key 認証。
   // 監査 2026-07-06 I-43: 従来は 50MB parser が認証より前 + router 内 checkAuth が
