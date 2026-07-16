@@ -1,0 +1,299 @@
+/**
+ * inquiry-hub DB — EC問い合わせ管理システム (メールディーラー置き換え)
+ *
+ * 設計書: AI_reference/システム設計/問い合わせ管理システム_設計書_v1.2_20260716.md (§6)
+ * Codexアーキテクチャレビュー4巡承認済みのスキーマをそのまま実装する。
+ *
+ * warehouse-mirror.db とは分離した専用DB (inquiry-hub.db) を DATA_DIR に持つ。
+ * 問い合わせデータは本アプリが正本 (外部モール由来の生データ + 社内ワークフロー状態)。
+ *
+ * 方針 (設計書§6):
+ *   - PRAGMA foreign_keys=ON + WAL を毎接続で明示
+ *   - 外部由来レコードの外部IDは NOT NULL (SQLiteのUNIQUEはNULL重複を許すため)
+ *   - internal_status (社内) と external_status (モール側) を分離
+ *   - 削除は論理削除のみ (is_archived)。物理削除機能は作らない
+ *   - FTS5は使わない (LIKE検索+インデックス)
+ */
+import Database from 'better-sqlite3';
+import path from 'path';
+import fs from 'fs';
+
+const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
+const DB_FILE = path.join(DATA_DIR, 'inquiry-hub.db');
+
+let db = null;
+
+/**
+ * 日時の正準形式 (Codex R1 medium: 形式混在によるTEXT比較破綻の防止)。
+ * 本DBの日時カラムは全て UTC 'YYYY-MM-DDTHH:MM:SSZ' (秒精度・ミリ秒なし) で保存する。
+ * DB DEFAULT (strftime) も同形式。外部由来の日時 (Gmail/楽天/Yahoo!) は
+ * 同期アダプターが必ずこの関数を通してから INSERT すること。
+ */
+export function toUtcIso(input) {
+  const t = input instanceof Date ? input.getTime()
+    : typeof input === 'number' ? input
+    : Date.parse(String(input));
+  if (Number.isNaN(t)) throw new Error(`不正な日時: ${input}`);
+  return new Date(t).toISOString().slice(0, 19) + 'Z';
+}
+
+export function initInquiryHubDB() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (db) { try { db.close(); } catch { /* close済み等は無視 */ } db = null; }
+  db = new Database(DB_FILE);
+  // PRAGMAは接続単位。foreign_keys は SQLite デフォルトOFFなので毎接続で明示 (設計書§6)
+  db.pragma('foreign_keys = ON');
+  db.pragma('journal_mode = WAL');
+  db.pragma('synchronous = NORMAL'); // WAL下で安全かつ Render persistent disk の fsync 遅延を回避
+  db.pragma('busy_timeout = 5000');
+  createTables();
+  return db;
+}
+
+export function getDB() {
+  if (!db) initInquiryHubDB();
+  return db;
+}
+
+function createTables() {
+  // 店舗・チャネル
+  db.exec(`CREATE TABLE IF NOT EXISTS shops (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_type TEXT NOT NULL CHECK(channel_type IN ('email','rakuten','yahoo')),
+    shop_name TEXT NOT NULL,
+    account_identifier TEXT NOT NULL,        -- 楽天shopId / YahooセラーID / メールアドレス
+    authentication_status TEXT NOT NULL DEFAULT 'ok'
+      CHECK(authentication_status IN ('ok','expiring','expired','error')),
+    auth_expires_at TEXT,
+    last_synced_at TEXT,
+    executor TEXT NOT NULL DEFAULT 'server' CHECK(executor IN ('server','runner')),
+      -- このshopの同期・送信ジョブを実行する主体 (設計書§5.3。runner=ローカルランナー専用)
+    is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    UNIQUE(channel_type, account_identifier),
+    UNIQUE(id, channel_type)  -- inquiries の複合FK用 (channel_type と shop の整合を DB で保証。Codex R1 medium)
+  )`);
+
+  // 問い合わせチケット
+  db.exec(`CREATE TABLE IF NOT EXISTS inquiries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_type TEXT NOT NULL,
+    shop_id INTEGER NOT NULL,
+    external_inquiry_id TEXT NOT NULL,       -- 楽天inquiryNumber / Yahoo topicId / Gmail threadId
+    customer_name TEXT,
+    customer_identifier TEXT,
+    subject TEXT,
+    -- 社内ワークフロー状態 (同期処理は直接触らない。§8.1の遷移ルールのみ)
+    internal_status TEXT NOT NULL DEFAULT 'open'
+      CHECK(internal_status IN ('open','in_progress','pending','waiting_reply','done')),
+    -- 外部モール側の状態 (同期が上書きする。表示専用)
+    external_status TEXT,
+    external_is_read INTEGER,
+    last_external_synced_at TEXT,
+    assigned_user_id TEXT,
+    order_number TEXT,
+    product_code TEXT,
+    product_name TEXT,
+    is_unread INTEGER NOT NULL DEFAULT 1 CHECK(is_unread IN (0,1)),   -- 社内の未読
+    needs_attention INTEGER NOT NULL DEFAULT 0 CHECK(needs_attention IN (0,1)),
+    ai_needed INTEGER NOT NULL DEFAULT 0 CHECK(ai_needed IN (0,1,2,3)),
+      -- 0:不要 1:AI返信必要 2:社長確認 3:責任者確認 (Codex R1 low: 値域をDBでも保証)
+    ai_reply_type TEXT,
+    -- 会話リビジョン (メッセージ追加ごとに+1。AI結果の鮮度判定に使用)
+    conversation_rev INTEGER NOT NULL DEFAULT 0,
+    -- 編集ロック (社内スタッフ間の二重対応防止。外部競合は防げない→§7.5)
+    locked_by TEXT,
+    locked_at TEXT,
+    lock_expires_at TEXT,
+    is_archived INTEGER NOT NULL DEFAULT 0 CHECK(is_archived IN (0,1)),  -- 論理削除/旧データ
+    received_at TEXT NOT NULL,
+    last_message_at TEXT,
+    completed_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    UNIQUE(channel_type, shop_id, external_inquiry_id),
+    -- 複合FK: shop の存在 + channel_type の一致を同時に保証 (email shop に楽天チケット等の不整合を防ぐ)
+    FOREIGN KEY (shop_id, channel_type) REFERENCES shops(id, channel_type)
+  )`);
+
+  // メッセージ (受信・送信の両方)
+  db.exec(`CREATE TABLE IF NOT EXISTS inquiry_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    inquiry_id INTEGER NOT NULL REFERENCES inquiries(id),
+    external_message_id TEXT NOT NULL,       -- Gmail messageId / 楽天reply id / YahooメッセージID。
+                                             -- 外部IDが無いケースは決定的synthetic ID
+                                             -- 'syn:' + hash(inquiry外部ID + 送受信区分 + 外部登録日時 + 本文hash)
+    sender_type TEXT NOT NULL CHECK(sender_type IN ('customer','shop','system')),
+    sender_name TEXT,
+    message_body_text TEXT,
+    message_body_html TEXT,                  -- 表示時は必ずサニタイズ
+    is_incoming INTEGER NOT NULL CHECK(is_incoming IN (0,1)),
+    sent_by_user_id TEXT,
+    outbox_id INTEGER REFERENCES outbox_replies(id),
+    sent_at TEXT,
+    received_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    UNIQUE(inquiry_id, external_message_id)
+  )`);
+
+  // 添付ファイル
+  db.exec(`CREATE TABLE IF NOT EXISTS inquiry_attachments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    inquiry_message_id INTEGER NOT NULL REFERENCES inquiry_messages(id),
+    external_attachment_id TEXT NOT NULL,    -- 外部IDが無いチャネルはメッセージ同様の決定的synthetic ID
+                                             -- (Codex R1 high: 再同期リトライでの重複登録防止)
+    file_name TEXT,                          -- 元ファイル名はメタデータとしてのみ保持
+    content_type TEXT,
+    file_size INTEGER,
+    storage_path TEXT,                       -- サーバー生成UUIDのファイル名 (パストラバーサル防止)
+    fetch_status TEXT NOT NULL DEFAULT 'pending' CHECK(fetch_status IN ('pending','fetched','failed')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    UNIQUE(inquiry_message_id, external_attachment_id)
+  )`);
+
+  // 返信送信ジョブ (outbox・全チャネル共通)。Step 1 ではテーブルのみ (workerはStep 3以降)
+  db.exec(`CREATE TABLE IF NOT EXISTS outbox_replies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    inquiry_id INTEGER NOT NULL REFERENCES inquiries(id),
+    channel_type TEXT NOT NULL,
+    client_operation_id TEXT NOT NULL UNIQUE, -- 送信ボタン押下時にUUID発行。リトライでも不変
+    body_text TEXT NOT NULL,
+    attachments_json TEXT,
+    status TEXT NOT NULL DEFAULT 'pending'
+      CHECK(status IN ('pending','sending','sent','failed','unknown','needs_review','cancelled')),
+    external_reply_id TEXT,
+    error_message TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    created_by TEXT NOT NULL,
+    base_conversation_rev INTEGER NOT NULL,  -- 送信操作時点の会話リビジョン (競合検知)
+    lease_token TEXT,                        -- claim所有者の識別 (多重ワーカー・ゾンビ処理対策)
+    lease_until TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    sent_at TEXT,
+    -- unknown の人手解決 (§8.3。「確認できない」と「未送信確認済み」を区別する)
+    resolution TEXT CHECK(resolution IN ('confirmed_sent','confirmed_not_sent','abandoned')),
+    resolved_by TEXT,
+    resolved_at TEXT
+  )`);
+
+  // 同期状態 (チャネル×店舗)
+  db.exec(`CREATE TABLE IF NOT EXISTS sync_state (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    shop_id INTEGER NOT NULL REFERENCES shops(id) UNIQUE,
+    committed_until TEXT,                    -- ここまでの期間は完全に取り込み済み (high-water mark)
+    observed_until TEXT,                     -- 直近の同期で観測した最大時刻 (committedとは分離)
+    sync_cursor TEXT,                        -- Gmail historyId 等チャネル固有カーソル
+    lease_until TEXT,                        -- 同期ジョブの多重起動防止リース
+    last_sync_started_at TEXT,
+    last_sync_completed_at TEXT,
+    last_error TEXT,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0
+  )`);
+
+  // 同期・送信エラーログ
+  db.exec(`CREATE TABLE IF NOT EXISTS sync_errors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    shop_id INTEGER REFERENCES shops(id),
+    inquiry_id INTEGER REFERENCES inquiries(id),
+    error_type TEXT NOT NULL,
+    error_detail TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    resolved INTEGER NOT NULL DEFAULT 0 CHECK(resolved IN (0,1)),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    resolved_at TEXT
+  )`);
+
+  // 操作ログ (構造化。秘密情報・本文全量は入れない)
+  db.exec(`CREATE TABLE IF NOT EXISTS inquiry_activity_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    inquiry_id INTEGER NOT NULL REFERENCES inquiries(id),
+    actor_type TEXT NOT NULL CHECK(actor_type IN ('user','ai','system')),
+    user_id TEXT,
+    action_type TEXT NOT NULL,
+    operation_id TEXT,                       -- 送信操作等はclient_operation_idと紐付け
+    before_json TEXT,
+    after_json TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  )`);
+
+  // 社内メモ
+  db.exec(`CREATE TABLE IF NOT EXISTS internal_notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    inquiry_id INTEGER NOT NULL REFERENCES inquiries(id),
+    user_id TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  )`);
+
+  // 返信テンプレート (CRUD画面はStep 6)
+  db.exec(`CREATE TABLE IF NOT EXISTS reply_templates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_type TEXT,                       -- NULL=全チャネル共通
+    category TEXT,
+    template_name TEXT NOT NULL,
+    template_body TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+    usage_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  )`);
+
+  // AIジョブ (キュー。inquiriesのカラムではなく独立テーブル。処理系はStep 7)
+  db.exec(`CREATE TABLE IF NOT EXISTS ai_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    inquiry_id INTEGER NOT NULL REFERENCES inquiries(id),
+    status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','processing','done','failed','stale')),
+    input_rev INTEGER NOT NULL,              -- claim時点の conversation_rev
+    lease_token TEXT,                        -- claim時に発行。結果POSTで一致必須
+    lease_until TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    completed_at TEXT
+  )`);
+
+  // AI生成結果 (履歴として蓄積。最新版を詳細画面に表示)
+  db.exec(`CREATE TABLE IF NOT EXISTS ai_drafts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    inquiry_id INTEGER NOT NULL REFERENCES inquiries(id),
+    ai_job_id INTEGER NOT NULL REFERENCES ai_jobs(id),
+    input_rev INTEGER NOT NULL,              -- どの会話リビジョンを見て生成したか
+    is_stale INTEGER NOT NULL DEFAULT 0 CHECK(is_stale IN (0,1)),  -- 新着で古くなったら1
+    summary TEXT,
+    category TEXT,
+    draft_body TEXT,
+    notes TEXT,                              -- AI注意事項
+    confirmation_items TEXT,                 -- AI要確認事項
+    model_info TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  )`);
+
+  // AIバッチ実行ログ
+  db.exec(`CREATE TABLE IF NOT EXISTS ai_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    processed_count INTEGER NOT NULL DEFAULT 0,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running','done','failed')),
+    detail TEXT
+  )`);
+
+  db.exec('CREATE INDEX IF NOT EXISTS idx_inquiries_status ON inquiries(internal_status, last_message_at)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_inquiries_order ON inquiries(order_number)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_inquiries_product ON inquiries(product_code)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_inquiries_customer ON inquiries(customer_identifier)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_messages_inquiry ON inquiry_messages(inquiry_id, received_at)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox_replies(status, lease_until)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_ai_jobs_status ON ai_jobs(status)');
+}
+
+/** 操作ログ記録 (設計書§6 inquiry_activity_logs。本文全量・秘密情報は入れない) */
+export function logActivity(inquiryId, { actorType = 'user', userId = null, actionType, operationId = null, before = null, after = null }) {
+  getDB().prepare(`INSERT INTO inquiry_activity_logs
+    (inquiry_id, actor_type, user_id, action_type, operation_id, before_json, after_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .run(inquiryId, actorType, userId, actionType, operationId,
+      before == null ? null : JSON.stringify(before),
+      after == null ? null : JSON.stringify(after));
+}

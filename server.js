@@ -55,6 +55,7 @@ import misShipmentRouter from './apps/mis-shipment/router.js';
 import supplierSalesRouter from './apps/supplier-sales/router.js';
 import productHubRouter, { serviceApiRouter as productHubServiceApiRouter } from './apps/product-hub/router.js';
 import purchaseOrdersRouter from './apps/purchase-orders/router.js';
+import inquiryHubRouter from './apps/inquiry-hub/router.js';
 import supplierSalesPublicRouter from './apps/supplier-sales/public-router.js';
 import serviceRouter from './apps/warehouse/service-router.js';
 import { serviceAuth } from './apps/warehouse/service-auth.js';
@@ -400,6 +401,7 @@ function requireAdmin(req, res, next) {
 const categories = [
   { id: 'product-sync', name: '商品登録・同期', icon: '🔄' },
   { id: 'shipping', name: '出荷・伝票', icon: '🚚' },
+  { id: 'support', name: '問い合わせ対応', icon: '💬' },
   { id: 'analysis', name: '商品分析', icon: '📊' },
   { id: 'purchasing', name: '仕入れ', icon: '💰' },
   { id: 'fba', name: 'FBA管理', icon: '📦' },
@@ -723,6 +725,15 @@ const apps = [
     path: '/apps/purchase-orders',
     status: 'active',
     category: 'purchasing',
+  },
+  {
+    id: 'inquiry-hub',
+    name: '問い合わせ管理',
+    description: 'メール+楽天R-Messe+Yahoo!問い合わせの一元管理 (メールディーラー置き換え)。Step 1: 一覧/詳細/担当/メモ/検索 (read-only運用)',
+    icon: '💬',
+    path: '/apps/inquiry-hub',
+    status: 'active',
+    category: 'support',
   },
   {
     id: 'supplier-sales',
@@ -1150,6 +1161,8 @@ app.use('/apps/product-hub/service-api', productHubServiceApiRouter); // トー�
 app.use('/apps/product-hub', requireAppAccess('product-hub'), productHubRouter);
 // 仕入先発注補助: mirror PML(read-only) + po_* マスタ/発注履歴 (warehouse-mirror.db 同居)
 app.use('/apps/purchase-orders', requireAppAccess('purchase-orders'), express.json({ limit: '1mb' }), purchaseOrdersRouter);
+// 問い合わせ管理 (inquiry-hub): 専用DB inquiry-hub.db (DATA_DIR)。Step 1 = 一覧/詳細 read-only + 社内操作のみ
+app.use('/apps/inquiry-hub', requireAppAccess('inquiry-hub'), express.json({ limit: '256kb' }), inquiryHubRouter);
 app.use('/apps/mgmt-accounting', (req, res, next) => {
   // 管理系API (x-sync-key 直呼び対象) はセッション認証の代わりに parser より前で key 認証。
   // 監査 2026-07-06 I-43: 従来は 50MB parser が認証より前 + router 内 checkAuth が
