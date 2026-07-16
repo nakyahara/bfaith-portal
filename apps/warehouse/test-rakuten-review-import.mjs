@@ -72,6 +72,8 @@ console.log('=== 1. prepareReviewFile: パースとガード ===');
   check('実在しない日付は拒否', !p2.ok && /投稿時間が不正/.test(p2.error));
   const p3 = prepareReviewFile('bad3.csv', csvOf([row({ url: 'https://evil.example.com/x' })]));
   check('review.rakuten.co.jp 以外のURLは拒否', !p3.ok && /URLが不正/.test(p3.error));
+  const p4 = prepareReviewFile('bad4.csv', csvOf([row({ url: 'https://review.rakuten.co.jp/other/format/x/' })]));
+  check('item_id が抽出できない商品レビューURLは拒否 (mirror contract整合)', !p4.ok && /item_id を抽出できない/.test(p4.error));
 }
 
 console.log('=== 2. importReviewFile: UPSERT / revision / 冪等 / 低評価検知 ===');

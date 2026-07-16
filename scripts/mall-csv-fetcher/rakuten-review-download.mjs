@@ -175,8 +175,16 @@ async function fetchWindow(page, win, depth = 0) {
 
   const csvLink = page.locator('a:has-text("CSVダウンロード")').first();
   if (!(await csvLink.isVisible().catch(() => false))) {
-    // 検索結果0件はCSVリンク自体が出ない (2015年窓で実測) → empty 正常
-    console.log('  [empty] CSVダウンロードリンクなし (該当期間のレビュー0件)');
+    // 検索結果0件はCSVリンク自体が出ない (2015年窓で実測)。ただし「リンクが無い」だけでは
+    // エラー画面・仕様変更と区別できない (Codex R1 medium) → 検索フォームが正しく描画されている
+    // (= 検索画面には到達できている) ことを肯定証拠として要求し、無ければ error にする
+    const formOk = await page.locator('select[name="sy"]').first().isVisible().catch(() => false)
+      && await page.locator('select[name="ev"]').first().isVisible().catch(() => false);
+    const looksError = /\/error\//.test(page.url());
+    if (!formOk || looksError) {
+      throw new Error(`空判定の肯定証拠なし (検索フォーム不可視 or エラーURL)。画面仕様変更/権限/認可切れの疑い (URL=${page.url().slice(0, 70)})`);
+    }
+    console.log('  [empty] 検索フォーム描画済み+CSVリンクなし = 該当期間のレビュー0件');
     await logFetch({ report_type: 'rreview_csv', period_from: win.from, period_to: win.to, status: 'empty', message: 'レビュー0件' });
     return { files: 0, rows: 0, empty: true };
   }

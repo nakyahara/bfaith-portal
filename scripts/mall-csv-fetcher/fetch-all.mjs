@@ -54,7 +54,7 @@ function cleanupOldFiles() {
   const KEEP_MS = 30 * 24 * 3600 * 1000;
   const targets = [
     { dir: LOG_DIR, pattern: /\.log$/ },
-    { dir: join(__dirname, 'downloads'), pattern: /^(rpp|rdata|yahoo|aupay|qoo10)_/ },
+    { dir: join(__dirname, 'downloads'), pattern: /^(rpp|rdata|rreview|yahoo|aupay|qoo10)_/ },
   ];
   for (const t of targets) {
     let removed = 0;

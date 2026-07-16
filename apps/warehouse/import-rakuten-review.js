@@ -58,10 +58,12 @@ async function notifyLowRatings(lowRatings) {
     console.log(`  ⚠ 低評価レビュー ${lowRatings.length}件 (GCHAT_WEBHOOK 未設定のため通知なし)`);
     return;
   }
+  // 注文番号は顧客に紐づく識別子のため外部Webhookへ送らない (Codex R1 high)。
+  // 注文との突合はレビューチェックツール画面 (下記URL) で投稿時間から辿れる
   const lines = lowRatings.slice(0, 10).map(r => {
     const stars = '★'.repeat(r.rating) + '☆'.repeat(5 - r.rating);
     const what = r.review_type === 'shop' ? 'ショップレビュー' : (r.item_name || '(商品名不明)').slice(0, 40);
-    return `・${stars} ${what}\n    投稿: ${r.posted_at} / 注文: ${r.order_number || '-'}`;
+    return `・${stars} ${what}\n    投稿: ${r.posted_at}`;
   });
   if (lowRatings.length > 10) lines.push(`…ほか ${lowRatings.length - 10} 件`);
   const text = [

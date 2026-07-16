@@ -149,10 +149,16 @@ export function prepareReviewFile(name, buffer) {
     const ts = normalizePostedAt(cells[idx['投稿時間']]);
     if (!ts) return { ok: false, error: `行${i + 1}: 投稿時間が不正 (${trimS(cells[idx['投稿時間']])})` };
 
+    // 商品レビューは item_id をURLから必ず取れることを要求 (取れない=URL形式変更。
+    // mirror 側 contract が item=正整数を検証するため、ここで先に fail-fast して failed/ に落とす)
+    const itemId = reviewType === 'item' ? extractItemId(reviewUrl) : null;
+    if (reviewType === 'item' && !itemId) {
+      return { ok: false, error: `行${i + 1}: 商品レビューURLから item_id を抽出できない (${reviewUrl.slice(0, 80)})。URL形式変更の疑い` };
+    }
     const rec = {
       review_url: reviewUrl,
       review_type: reviewType,
-      item_id: reviewType === 'item' ? extractItemId(reviewUrl) : null,
+      item_id: itemId,
       item_name: trimS(cells[idx['商品名']]) || null,
       rating,
       posted_at: ts.postedAt,

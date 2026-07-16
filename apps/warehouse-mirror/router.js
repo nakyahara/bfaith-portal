@@ -1004,12 +1004,16 @@ const QOO10_DATA_ENTITY_NAMES = new Set(Object.keys(QOO10_DATA_TABLE_SPECS));
 const RAKUTEN_REVIEW_TABLE_SPECS = {
   rakuten_review_daily: {
     table: 'mirror_rakuten_review_daily',
-    required: ['date_jst', 'review_type', 'rating'],
+    required: ['date_jst', 'review_type', 'rating', 'item_id'],
     cols: ['date_jst', 'review_type', 'item_id', 'item_name', 'rating', 'review_count'],
-    defaults: { item_id: 0 },
     validate: (r, HttpErrorCls) => {
       if (r.review_type !== 'item' && r.review_type !== 'shop') {
         throw new HttpErrorCls(400, { error: 'bad_row', message: `bad review_type: ${r.review_type}` });
+      }
+      // contract整合 (Codex R1 low): item=正整数の商品ID / shop=0 固定。欠落を0へ黙って補完しない
+      const itemId = Number(r.item_id);
+      if (!Number.isInteger(itemId) || (r.review_type === 'item' ? itemId <= 0 : itemId !== 0)) {
+        throw new HttpErrorCls(400, { error: 'bad_row', message: `bad item_id for ${r.review_type}: ${r.item_id}` });
       }
       const rating = Number(r.rating);
       if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
