@@ -112,10 +112,6 @@ if (entries.length === 0) {
 
 let okCount = 0, dupCount = 0, failCount = 0;
 let newLowCount = 0;
-const enqueueLow = db.prepare(`
-  INSERT OR IGNORE INTO rakuten_review_low_notify_queue (review_url, review_type, item_name, rating, posted_at, queued_at)
-  VALUES (@review_url, @review_type, @item_name, @rating, @posted_at, @queued_at)
-`);
 try {
   for (const name of entries) {
     const srcPath = path.join(incomingDir, name);
@@ -145,10 +141,7 @@ try {
         console.log(`  ${r.duplicate ? '↷' : '✗'} ${r.file}: ${r.error}`);
       }
     }
-    for (const low of outcome.newLowRatings) {
-      enqueueLow.run({ ...low, queued_at: new Date().toISOString() });
-      newLowCount++;
-    }
+    newLowCount += outcome.newLowRatings.length; // キュー追加は取込tx内 (lib側) で完了済み
 
     try {
       if (outcome.status === 'ok' || outcome.status === 'duplicate') {

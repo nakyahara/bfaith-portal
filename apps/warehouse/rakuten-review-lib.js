@@ -274,6 +274,12 @@ export function importReviewFile(db, { name, buffer, sha256, source = 'incoming'
       row_count, inserted, updated, status, message
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ok', ?)
   `);
+  // 通知キュー追加は取込と同一トランザクション (Codex R3 High: commit後の別処理だと
+  // その間のクラッシュで duplicate 化し通知が永久欠落する)
+  const enqueueLowStmt = db.prepare(`
+    INSERT OR IGNORE INTO rakuten_review_low_notify_queue (review_url, review_type, item_name, rating, posted_at, queued_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
 
   const newLowRatings = [];
   let inserted = 0, updated = 0, unchanged = 0;
@@ -292,10 +298,10 @@ export function importReviewFile(db, { name, buffer, sha256, source = 'incoming'
         revisionStmt.run(rec.review_url, now, rec.source_hash, rec.rating, rec.posted_at);
         inserted++;
         if (rec.rating <= 2) {
+          enqueueLowStmt.run(rec.review_url, rec.review_type, rec.item_name, rec.rating, rec.posted_at, now);
           newLowRatings.push({
             review_url: rec.review_url, review_type: rec.review_type,
-            item_name: rec.item_name, rating: rec.rating,
-            posted_at: rec.posted_at, order_number: rec.order_number,
+            item_name: rec.item_name, rating: rec.rating, posted_at: rec.posted_at,
           });
         }
       } else if (existing.source_hash !== rec.source_hash) {

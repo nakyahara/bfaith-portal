@@ -88,7 +88,12 @@ const urlLow = itemUrl('709q-imp1-bbbb', 10000016, 1002);
   check('取込成功', out.status === 'ok', JSON.stringify(out.results));
   check('insert=2', out.results[0].inserted === 2);
   check('新規★2以下が検知される', out.newLowRatings.length === 1 && out.newLowRatings[0].rating === 2);
-  check('低評価通知に本文が含まれない', !JSON.stringify(out.newLowRatings).includes('いまいち'));
+  check('低評価通知に本文・注文番号が含まれない',
+    !JSON.stringify(out.newLowRatings).includes('いまいち') && !JSON.stringify(out.newLowRatings).includes('373343-2026'));
+  const q = db.prepare(`SELECT COUNT(*) c FROM rakuten_review_low_notify_queue`).get().c;
+  check('通知キューに取込tx内で積まれる', q === 1, `queue=${q}`);
+  const qCols = db.prepare(`PRAGMA table_info(rakuten_review_low_notify_queue)`).all().map((c) => c.name);
+  check('通知キューに本文・注文番号列が無い', !qCols.includes('body') && !qCols.includes('order_number'));
   const cnt = db.prepare(`SELECT COUNT(*) c FROM fact_rakuten_reviews`).get().c;
   const rev = db.prepare(`SELECT COUNT(*) c FROM fact_rakuten_review_revisions`).get().c;
   check('fact 2行 / revision 2行 (初回)', cnt === 2 && rev === 2, `fact=${cnt} rev=${rev}`);
