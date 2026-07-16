@@ -144,16 +144,14 @@ export function upsertContacts(db, records) {
       contact_delete_at = excluded.contact_delete_at,
       updated_at        = excluded.updated_at
   `);
+  const existsStmt = db.prepare(`SELECT 1 FROM rakuten_order_contacts WHERE order_number = ?`);
   let inserted = 0, updated = 0;
   const tx = db.transaction(() => {
     for (const r of records) {
-      const info = stmt.run({ ...r, now });
-      if (info.changes > 0) {
-        // better-sqlite3 は UPSERT の insert/update を区別しないため lastInsertRowid では判定できない。
-        // fetched_at==updated_at (=now) なら今回 insert とみなす
-        const row = db.prepare(`SELECT fetched_at, updated_at FROM rakuten_order_contacts WHERE order_number = ?`).get(r.order_number);
-        if (row.fetched_at === now) inserted++; else updated++;
-      }
+      // better-sqlite3 は UPSERT の insert/update を区別しないため、事前に存在チェックで数える
+      const exists = !!existsStmt.get(r.order_number);
+      stmt.run({ ...r, now });
+      if (exists) updated++; else inserted++;
     }
   });
   tx();
