@@ -37,11 +37,11 @@ export const SHORTAGE_RANGES = Object.fromEntries(Object.entries(SETTING_KEYS).m
 export function validateShortageSetting(name, value) {
   const r = SHORTAGE_RANGES[name];
   if (!r) throw new Error(`未知の欠品リスク設定です: ${name}`);
-  const n = Number(value);
-  if (!Number.isFinite(n)) throw new Error(`${name} が数値ではありません: ${value}`);
-  if (r.int && !Number.isInteger(n)) throw new Error(`${name} は整数で指定してください: ${value}`);
-  if (n < r.min || n > r.max) throw new Error(`${name} は ${r.min}〜${r.max} の範囲で指定してください: ${value}`);
-  return n;
+  // JSON number のみ受理 (Number(null)=0 / Number('')=0 で「空欄が0として保存」される事故を防ぐ、Codex R2 Medium)
+  if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error(`${name} は数値で指定してください: ${value}`);
+  if (r.int && !Number.isInteger(value)) throw new Error(`${name} は整数で指定してください: ${value}`);
+  if (value < r.min || value > r.max) throw new Error(`${name} は ${r.min}〜${r.max} の範囲で指定してください: ${value}`);
+  return value;
 }
 
 export function shortageSettings() {
@@ -101,15 +101,23 @@ export function computeShortageRisk() {
     items.push(computeProductRisk(p, pmlByKey.get(p.key), today, settings));
   }
 
-  // 仕入先ごとにグループ化 (商品のリスク判定は商品単位=全PO横断。表示行はその仕入先の明細のみ)
+  // 仕入先ごとにグループ化。予測評価 (risk/stockout/margin) は商品単位=全PO横断で共通だが、
+  // 督促関連 (遅延・未回答の数量/フラグ/文面) は**その仕入先の明細だけで再集計**する —
+  // 他仕入先のPO事情がこの仕入先の督促コピーに混ざるのは誤通知 (Codex R2 High)
   const supplierMap = new Map();
   for (const it of items) {
     for (const supCode of Object.keys(it.bySupplier)) {
       let g = supplierMap.get(supCode);
       if (!g) g = supplierMap.set(supCode, { code: supCode, name: it.bySupplier[supCode].supplierName, items: [], counts: { high: 0, attention: 0, no_demand: 0, unknown: 0, ok: 0, followup: 0 } }).get(supCode);
-      g.items.push({ ...it, lines: it.bySupplier[supCode].lines, bySupplier: undefined });
+      const lines = it.bySupplier[supCode].lines;
+      const scoped = scopeFacts(lines, today, settings);
+      g.items.push({
+        ...it, lines, bySupplier: undefined,
+        ...scoped, // overdueQty / requestedOverdueQty / undatedQty / unansweredQty / oldestUnansweredDays / flags / needsFollowup をこの仕入先分に置換
+        reason: it.predictionReason + procurementText(scoped, settings),
+      });
       g.counts[it.risk] = (g.counts[it.risk] || 0) + 1;
-      if (it.needsFollowup) g.counts.followup++;
+      if (scoped.needsFollowup) g.counts.followup++;
     }
   }
   const RISK_ORDER = { high: 0, attention: 1, unknown: 2, no_demand: 3, ok: 4 };
@@ -148,10 +156,44 @@ function jstYmd(iso) {
   return new Date(t + 9 * 3600000).toISOString().slice(0, 10);
 }
 
+/**
+ * 明細集合から督促関連の集計を導出する (lines.parts が唯一の解釈ソース)。
+ * 商品全体 (全仕入先) にも、仕入先スコープにも同じ関数を使う (Codex R2 High: スコープごとの再集計)
+ */
+function scopeFacts(lines, today, settings) {
+  let overdueQty = 0, requestedOverdueQty = 0, undatedQty = 0, unansweredQty = 0, oldestUnansweredDays = 0;
+  let requestedDateOnly = false;
+  for (const l of lines) {
+    for (const pt of l.parts) {
+      if (pt.disp.kind === 'overdue') {
+        if (pt.disp.source === 'requested') { requestedOverdueQty += pt.qty; requestedDateOnly = true; }
+        else overdueQty += pt.qty;
+      } else if (pt.disp.kind === 'undated') {
+        undatedQty += pt.qty;
+      } else if (pt.disp.source === 'requested') {
+        requestedDateOnly = true;
+      }
+    }
+    if (l.unanswered) {
+      unansweredQty += l.remaining;
+      const issuedYmd = (l.issuedAt && jstYmd(l.issuedAt)) || today;
+      oldestUnansweredDays = Math.max(oldestUnansweredDays, diffDays(issuedYmd, today));
+    }
+  }
+  const flags = {
+    overdue: overdueQty > 0,
+    unanswered: unansweredQty > 0 && oldestUnansweredDays >= settings.unansweredDays,
+    undated: undatedQty > 0,
+    requested_date_only: requestedDateOnly,
+  };
+  return {
+    overdueQty, requestedOverdueQty, undatedQty, unansweredQty, oldestUnansweredDays, flags,
+    needsFollowup: flags.overdue || flags.unanswered || requestedOverdueQty > 0,
+  };
+}
+
 function computeProductRisk(p, pmlRow, today, settings) {
   const num = v => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
-  const flags = { overdue: false, unanswered: false, undated: false, requested_date_only: false };
-  let overdueQty = 0, undatedQty = 0, requestedOverdueQty = 0, unansweredQty = 0, oldestUnansweredDays = 0;
   const arrivals = []; // { date, qty, source }
   const lines = [];    // 表示用明細 (PO横断)。数量の内訳は parts (シミュレーションの解釈と1:1)
   let totalRemaining = 0;
@@ -170,33 +212,16 @@ function computeProductRisk(p, pmlRow, today, settings) {
 
     const parts = [];
     if (!date) {
-      undatedQty += datedQty + restQty;
       parts.push({ qty: datedQty + restQty, disp: { kind: 'undated' } });
     } else if (date < today) {
       // 過去日は source で意味が違う (Codex R1 High): 回答納期/分納予定の超過=遅延中、
       // 希望納期の超過=回答が来ないまま希望日を過ぎた (未回答の一種。仕入先は約束していない)
-      if (source === 'requested') {
-        requestedOverdueQty += datedQty;
-        flags.requested_date_only = true; // 過去日になっても「希望納期ベース」の性質は維持
-      } else {
-        overdueQty += datedQty;
-        flags.overdue = true;
-      }
-      if (restQty > 0) undatedQty += restQty;
       parts.push({ qty: datedQty, disp: { kind: 'overdue', date, source } });
       if (restQty > 0) parts.push({ qty: restQty, disp: { kind: 'undated' } });
     } else {
       arrivals.push({ date, qty: datedQty, source });
-      if (restQty > 0) undatedQty += restQty;
-      if (source === 'requested') flags.requested_date_only = true;
       parts.push({ qty: datedQty, disp: { kind: 'dated', date, source } });
       if (restQty > 0) parts.push({ qty: restQty, disp: { kind: 'undated' } });
-    }
-    // 納期未回答 (回答納期なし) — 発注から unansweredDays 経過で督促フラグ。日数はJST業務日付で判定
-    if (!i.promised_date) {
-      unansweredQty += i.remaining_qty;
-      const issuedYmd = (o.issuedAt && jstYmd(o.issuedAt)) || today;
-      oldestUnansweredDays = Math.max(oldestUnansweredDays, diffDays(issuedYmd, today));
     }
     lines.push({
       orderId: o.id, poNumber: (o.origin === 'migration' ? o.neSlipNumber : null) || o.poNumber || `#${o.id}`,
@@ -207,10 +232,9 @@ function computeProductRisk(p, pmlRow, today, settings) {
       unanswered: !i.promised_date, parts,
     });
   }
-  if (undatedQty > 0) flags.undated = true;
-  if (unansweredQty > 0 && oldestUnansweredDays >= settings.unansweredDays) flags.unanswered = true;
-  // 督促対象か (リスク分類と独立の軸、Codex R1 High)。unknown/no_demand の商品も遅延・未回答なら督促に載る
-  const needsFollowup = flags.overdue || flags.unanswered || requestedOverdueQty > 0;
+  // 督促関連の集計は lines.parts から導出 (商品全体スコープ。仕入先スコープは grouping 側で同じ関数を使う)
+  const { overdueQty, requestedOverdueQty, undatedQty, unansweredQty, oldestUnansweredDays, flags, needsFollowup } =
+    scopeFacts(lines, today, settings);
 
   // 仕入先ごとの表示明細 (商品が複数仕入先の注残を持つ稀ケースは両方に出す)
   const bySupplier = {};
@@ -227,9 +251,10 @@ function computeProductRisk(p, pmlRow, today, settings) {
 
   // unknown = PML行なし (データ異常のみ)。リスク軸は unknown のまま、督促は needsFollowup 軸で拾う (2軸分離)
   if (!pmlRow) {
+    const predictionReason = 'PMLに商品が見つかりません (商品コード改廃?)';
     return { ...base, risk: 'unknown', pmlMissing: true,
       stock: null, dailySales: null, stockoutDate: null, marginDays: null,
-      reason: 'PMLに商品が見つかりません (商品コード改廃?)' + procurementText(base, settings) };
+      predictionReason, reason: predictionReason + procurementText(base, settings) };
   }
 
   const stock = num(pmlRow['総在庫数_引当なし']);
@@ -239,9 +264,10 @@ function computeProductRisk(p, pmlRow, today, settings) {
   const dailySales = d7 * settings.w7 + d30 * (1 - settings.w7);
 
   if (dailySales <= 0) {
+    const predictionReason = '販売実績なし (日販0) — 欠品予測の対象外';
     return { ...base, risk: 'no_demand',
       stock, dailySales: 0, stockoutDate: null, marginDays: null,
-      reason: '販売実績なし (日販0) — 欠品予測の対象外' + procurementText(base, settings) };
+      predictionReason, reason: predictionReason + procurementText(base, settings) };
   }
 
   // ── 日次シミュレーション: (1)入荷加算 → (2)日販消費 → (3)判定 ──
@@ -308,10 +334,11 @@ function computeProductRisk(p, pmlRow, today, settings) {
   if (d7 > 0 && d30 > 0 && (d7 / d30 >= 2 || d30 / d7 >= 2)) {
     reason += `。⚠️直近7日の販売ペース (${r1(d7)}/日) が30日平均 (${r1(d30)}/日) と乖離 — 予測が振れやすい`;
   }
-  reason += procurementText(base, settings);
+  const predictionReason = reason; // 予測評価の説明 (商品共通)。督促文は仕入先スコープで付け直す
 
   return { ...base, risk, stock, dailySales: r1(dailySales), stockDays, stockoutDate, shortageDays: stockoutDate ? shortageDays : 0,
-    maxDeficit: Math.ceil(maxDeficit), recovered, marginDays, reason };
+    maxDeficit: Math.ceil(maxDeficit), recovered, marginDays,
+    predictionReason, reason: predictionReason + procurementText(base, settings) };
 }
 
 /** 督促フラグの説明文 (リスク分類と独立に常に付す) */

@@ -6598,7 +6598,7 @@ function render() {
     ' (対象=オープン注残のある商品、' + DATA.today + ' 時点)';
   // データ基準 (在庫・販売のスナップショット時刻。古ければ警告)
   var b = DATA.dataBasis;
-  var basis = 'データ基準: PML ' + (b.pmlAsOfDate || '不明') +
+  var basis = 'データ基準: PML ' + (b.pmlAsOfDate ? esc(b.pmlAsOfDate) : '不明') +
     (b.overlay ? ' + 日中CSV (' + esc(b.overlay.source || '') + (b.overlay.applied ? '' : '・朝同期より古いため未適用') + ')' : '');
   document.getElementById('srBasis').innerHTML = b.stale
     ? '<div class="warn">⚠️ ' + basis + ' — 2日以上古いデータです。判定は参考程度にしてください</div>'
@@ -6703,13 +6703,19 @@ document.getElementById('srReset').addEventListener('click', function() {
   saveSettings(true);
 });
 function saveSettings(reset) {
-  var body = reset
-    ? { w7: 0.5, marginDays: 3, unansweredDays: 7, horizonDays: 90, soonDays: 14 }
-    : { w7: Number(document.getElementById('srW7').value),
-        marginDays: Number(document.getElementById('srMargin').value),
-        unansweredDays: Number(document.getElementById('srUnans').value),
-        horizonDays: Number(document.getElementById('srHorizon').value),
-        soonDays: Number(document.getElementById('srSoon').value) };
+  var body;
+  if (reset) {
+    body = { w7: 0.5, marginDays: 3, unansweredDays: 7, horizonDays: 90, soonDays: 14 };
+  } else {
+    // 空欄は Number('')=0 に化けるため送信前に拒否 (Codex R2 Medium)
+    var ids = { w7: 'srW7', marginDays: 'srMargin', unansweredDays: 'srUnans', horizonDays: 'srHorizon', soonDays: 'srSoon' };
+    body = {};
+    for (var name in ids) {
+      var v = document.getElementById(ids[name]).value;
+      if (String(v).trim() === '') { toast('空欄の項目があります。数値を入力してください'); return; }
+      body[name] = Number(v);
+    }
+  }
   fetch(API + '/shortage-risk/settings', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
     .then(function(r){ return r.json(); })
     .then(function(j) {

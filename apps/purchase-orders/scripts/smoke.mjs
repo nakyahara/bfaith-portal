@@ -3341,6 +3341,7 @@ console.log('── P17 欠品リスク ──');
   insSr.run('sr-nodemand-item', '販売なし', 5, 0, 0);
   insSr.run('sr-split-item', '分納分割', 1000, 70, 300);                         // 分納30個のみ日付つき・残50は納期不明
   insSr.run('sr-reqover-item', '希望納期超過・回答未着', 5000, 70, 300);          // 希望納期past=遅延ではなく未回答扱い
+  insSr.run('sr-multi-item', '複数仕入先スコープ', 5000, 70, 300);                // 仕入先1=遅延 / 仕入先2=クリーン
 
   const issueSr = async (items) => {
     const rr = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -3382,6 +3383,22 @@ console.log('── P17 欠品リスク ──');
     fdC.append('commit', '1'); fdC.append('fileHash', r.body.fileHash); fdC.append('planHash', r.body.planHash);
     r = await j('/api/backorders/ne-import', { method: 'POST', body: fdC });
     ok(r.status === 200 && r.body.ok && r.body.created.length === 1, 'P17 fixture: 希望納期過去の移行PO');
+  }
+  // 複数仕入先: 仕入先1のPOは予定日超過、仕入先2のPO (NE移行) はクリーン → 督促は仕入先スコープで分離
+  oid = await issueSr([{ code: 'sr-multi-item', qty: 30 }]);
+  await setPromised(oid, 'sr-multi-item', jstD(-2));
+  {
+    const neCsvOf2 = rows => iconv.encode(rows.map(rr => rr.map(v => '"' + String(v) + '"').join(',')).join('\r\n'), 'Shift_JIS');
+    const HDR = ['発注伝票番号', '発注先名', '商品コード', '商品名', 'option', '発注数', '注残計', '予定納期', '備考', '商品区分', '受注伝票番号', '明細行', '発行日', '仕入先cd', '発注明細行', '商品区分値'];
+    const row = ['9301', 'テスト様', 'sr-multi-item', '複数仕入先', '', 20, 20, '', '', '通常', '0', '0', '2026/7/1', '0002', '1', '0'];
+    const fdN = new FormData();
+    fdN.append('file', new Blob([neCsvOf2([HDR, row])]), 'sr-multi.csv');
+    r = await j('/api/backorders/ne-import', { method: 'POST', body: fdN });
+    const fdC = new FormData();
+    fdC.append('file', new Blob([neCsvOf2([HDR, row])]), 'sr-multi.csv');
+    fdC.append('commit', '1'); fdC.append('fileHash', r.body.fileHash); fdC.append('planHash', r.body.planHash);
+    r = await j('/api/backorders/ne-import', { method: 'POST', body: fdC });
+    ok(r.status === 200 && r.body.ok && r.body.created.length === 1, 'P17 fixture: 仕入先2の移行PO (クリーン)');
   }
 
   r = await j('/api/shortage-risk');
@@ -3431,6 +3448,17 @@ console.log('── P17 欠品リスク ──');
     && reqo.requestedOverdueQty === 25 && reqo.flags.requested_date_only === true,
     'P17: 希望納期超過 → overdueではなく回答督促 (requestedOverdueQty)', reqo && { f: reqo.flags, q: reqo.requestedOverdueQty });
   ok(reqo.reason.includes('希望納期を経過'), 'P17: 希望納期超過の理由文', reqo.reason);
+
+  // 仕入先スコープ: 同一商品でも督促の数量・フラグ・文面は各仕入先の明細だけで再集計 (Codex R2 High)
+  const multi1 = item('sr-multi-item');
+  ok(multi1 && multi1.needsFollowup === true && multi1.overdueQty === 30 && multi1.reason.includes('予定日超過'),
+    'P17: 複数仕入先 — 仕入先1スコープは遅延30個で督促対象', multi1 && { f: multi1.needsFollowup, q: multi1.overdueQty });
+  const multi2 = r.body.suppliers.find(s => s.code === '2').items.find(x => x.code === 'sr-multi-item');
+  ok(multi2 && multi2.needsFollowup === false && multi2.overdueQty === 0 && !multi2.reason.includes('予定日超過')
+    && multi2.lines.length === 1 && multi2.lines[0].poNumber === '9301',
+    'P17: 複数仕入先 — 仕入先2スコープに他仕入先の遅延が混ざらない', multi2 && { f: multi2.needsFollowup, q: multi2.overdueQty, n: multi2.lines.length });
+  ok(multi1.risk === multi2.risk && multi1.stockoutDate === multi2.stockoutDate,
+    'P17: 複数仕入先 — 予測評価 (risk/欠品予測) は商品単位で共通');
 
   // 販売なし / データ異常 (フラグがあっても risk 軸は純粋)
   const nd = item('sr-nodemand-item');

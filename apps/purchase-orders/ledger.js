@@ -96,7 +96,9 @@ export function setSetting(key, value, { actor = null, actorType = 'user', reaso
   }
   const sr = SHORTAGE_SETTING_RULES[key];
   if (sr) {
-    const n = Number(value);
+    // 空文字・null は Number() で 0 に化けるため明示拒否 (Codex P17-R2 Medium)
+    const s = String(value).trim();
+    const n = s === '' ? NaN : Number(s);
     if (!Number.isFinite(n) || n < sr.min || n > sr.max || (sr.int && !Number.isInteger(n))) {
       throw new Error(`${key} は ${sr.min}〜${sr.max}${sr.int ? ' の整数' : ''} で指定してください: ${value}`);
     }
