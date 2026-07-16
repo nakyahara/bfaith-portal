@@ -46,6 +46,14 @@ export function createReplyJob({ inquiryId, channelType, bodyText, attachmentsJs
     const inq = db.prepare('SELECT * FROM inquiries WHERE id = ?').get(inquiryId);
     if (!inq) throw new Error(`inquiry ${inquiryId} が存在しません`);
     if (inq.channel_type !== channelType) throw new Error('channelType が問い合わせと一致しません');
+    // 同一問い合わせに未決着ジョブがある間は新規作成不可 (並行ワーカーでも1問い合わせ1送信を保証。Codexレビュー反映)
+    // 未決着 = pending/sending/needs_review、および人手解決前の unknown
+    const active = db.prepare(`SELECT id, status FROM outbox_replies
+        WHERE inquiry_id = ? AND (status IN ('pending','sending','needs_review')
+          OR (status = 'unknown' AND resolution IS NULL))`).get(inquiryId);
+    if (active) {
+      return { id: null, created: false, conflict: `この問い合わせには未決着の送信ジョブ (#${active.id}: ${active.status}) があります。解決または取消してから再作成してください` };
+    }
     // 登録時点でのrev競合チェック (送信直前にもworkerが再チェックする。§7.5)
     if (inq.conversation_rev !== baseConversationRev) {
       return { id: null, created: false, conflict: `会話が更新されています (rev ${baseConversationRev} → ${inq.conversation_rev})。内容を確認してから再送信してください` };
@@ -90,10 +98,12 @@ export function sweepZombies({ now } = {}) {
 /** pending を1件 claim する (BEGIN IMMEDIATE + executor制約。設計書§8.3(b)/§5.3)。無ければ null */
 function claimNext(db, executor, nowMs, leaseMinutes) {
   const tx = db.transaction(() => {
+    // 同一問い合わせに sending が存在する間はclaimしない (作成ガードに加えた多層防御。Codexレビュー反映)
     const job = db.prepare(`SELECT o.* FROM outbox_replies o
         JOIN inquiries i ON i.id = o.inquiry_id
         JOIN shops s ON s.id = i.shop_id
       WHERE o.status = 'pending' AND s.executor = ?
+        AND NOT EXISTS (SELECT 1 FROM outbox_replies o2 WHERE o2.inquiry_id = o.inquiry_id AND o2.status = 'sending')
       ORDER BY o.id LIMIT 1`).get(executor);
     if (!job) return null;
     const leaseToken = crypto.randomUUID();
@@ -134,21 +144,28 @@ export async function runOutboxPass(adapters, opts = {}) {
     const inq = db.prepare('SELECT * FROM inquiries WHERE id = ?').get(job.inquiry_id);
     const shop = db.prepare('SELECT * FROM shops WHERE id = ?').get(inq.shop_id);
 
+    // 状態更新+ログ+エラー記録は同一txにまとめ、finishJob が0件 (=リース喪失) なら副作用を出さない (Codexレビュー反映)
+    const finishTx = (fields, sideEffects) => db.transaction(() => {
+      if (!finishJob(db, job, fields)) return false;
+      if (sideEffects) sideEffects();
+      return true;
+    }).immediate();
+
     // 送信直前のrev競合チェック → needs_review (workerは二度と拾わない。人間が新ジョブとして再作成。§8.3)
     if (inq.conversation_rev !== job.base_conversation_rev) {
-      finishJob(db, job, { status: 'needs_review', lease_token: null, lease_until: null,
-        error_message: `送信保留: 会話が更新されました (rev ${job.base_conversation_rev} → ${inq.conversation_rev})` });
-      logActivity(job.inquiry_id, { actorType: 'system', actionType: 'reply_needs_review',
-        operationId: job.client_operation_id, after: { outbox_id: job.id } });
-      results.push({ id: job.id, outcome: 'needs_review' });
+      const done = finishTx({ status: 'needs_review', lease_token: null, lease_until: null,
+        error_message: `送信保留: 会話が更新されました (rev ${job.base_conversation_rev} → ${inq.conversation_rev})` },
+      () => logActivity(job.inquiry_id, { actorType: 'system', actionType: 'reply_needs_review',
+        operationId: job.client_operation_id, after: { outbox_id: job.id } }));
+      results.push({ id: job.id, outcome: done ? 'needs_review' : 'lease_lost' });
       continue;
     }
 
     const adapter = adapters?.[job.channel_type];
     if (!adapter?.sendReply) {
-      finishJob(db, job, { status: 'needs_review', lease_token: null, lease_until: null,
+      const done = finishTx({ status: 'needs_review', lease_token: null, lease_until: null,
         error_message: `送信保留: ${job.channel_type} の送信アダプター未設定` });
-      results.push({ id: job.id, outcome: 'needs_review' });
+      results.push({ id: job.id, outcome: done ? 'needs_review' : 'lease_lost' });
       continue;
     }
 
@@ -182,20 +199,20 @@ export async function runOutboxPass(adapters, opts = {}) {
       results.push({ id: job.id, outcome: tx.immediate() ? 'sent' : 'lease_lost' });
     } catch (e) {
       const detail = String(e?.message || e).slice(0, 500);
+      const recordError = () => db.prepare('INSERT INTO sync_errors (shop_id, inquiry_id, error_type, error_detail) VALUES (?,?,?,?)')
+        .run(shop.id, job.inquiry_id, 'send_failed', detail);
       if (e instanceof SendRejectedError) {
         // 明確な拒否 = 未送信確定 → failed (UIで「未送信」明示。§8.3)
-        finishJob(db, job, { status: 'failed', error_message: detail, lease_token: null, lease_until: null });
-        db.prepare('INSERT INTO sync_errors (shop_id, inquiry_id, error_type, error_detail) VALUES (?,?,?,?)')
-          .run(shop.id, job.inquiry_id, 'send_failed', detail);
-        results.push({ id: job.id, outcome: 'failed' });
+        const done = finishTx({ status: 'failed', error_message: detail, lease_token: null, lease_until: null }, recordError);
+        results.push({ id: job.id, outcome: done ? 'failed' : 'lease_lost' });
       } else {
         // 結果不明 → unknown。自動再送しない (§8.3)
-        finishJob(db, job, { status: 'unknown', error_message: detail, lease_token: null, lease_until: null });
-        db.prepare('INSERT INTO sync_errors (shop_id, inquiry_id, error_type, error_detail) VALUES (?,?,?,?)')
-          .run(shop.id, job.inquiry_id, 'send_failed', detail);
-        logActivity(job.inquiry_id, { actorType: 'system', actionType: 'reply_unknown',
-          operationId: job.client_operation_id, after: { outbox_id: job.id } });
-        results.push({ id: job.id, outcome: 'unknown' });
+        const done = finishTx({ status: 'unknown', error_message: detail, lease_token: null, lease_until: null }, () => {
+          recordError();
+          logActivity(job.inquiry_id, { actorType: 'system', actionType: 'reply_unknown',
+            operationId: job.client_operation_id, after: { outbox_id: job.id } });
+        });
+        results.push({ id: job.id, outcome: done ? 'unknown' : 'lease_lost' });
       }
     }
   }
@@ -215,8 +232,9 @@ export function resolveUnknown(outboxId, resolution, resolvedBy, { now } = {}) {
   }
   const nowIso = toUtcIso(now ?? Date.now());
   const tx = db.transaction(() => {
-    const job = db.prepare("SELECT * FROM outbox_replies WHERE id = ? AND status = 'unknown'").get(outboxId);
-    if (!job) throw new Error(`outbox ${outboxId} は unknown 状態ではありません`);
+    // resolution 確定後は不変の終端状態 (abandoned を後から confirmed_* に変更できない。Codexレビュー反映)
+    const job = db.prepare("SELECT * FROM outbox_replies WHERE id = ? AND status = 'unknown' AND resolution IS NULL").get(outboxId);
+    if (!job) throw new Error(`outbox ${outboxId} は未解決の unknown 状態ではありません`);
     const status = resolution === 'confirmed_sent' ? 'sent' : resolution === 'confirmed_not_sent' ? 'failed' : 'unknown';
     db.prepare('UPDATE outbox_replies SET status = ?, resolution = ?, resolved_by = ?, resolved_at = ? WHERE id = ?')
       .run(status, resolution, resolvedBy, nowIso, outboxId);
@@ -237,13 +255,32 @@ export function resolveUnknown(outboxId, resolution, resolvedBy, { now } = {}) {
   return tx.immediate();
 }
 
-/** 送信結果不明/保留/失敗の一覧 (画面§7.1#4用) */
+/**
+ * pending / needs_review の送信ジョブを取消す (人間の操作)。
+ * needs_review からの再送信は「取消 → 新しいジョブ作成」の手順で行う (設計書§8.3)。
+ */
+export function cancelJob(outboxId, cancelledBy) {
+  const db = getDB();
+  const tx = db.transaction(() => {
+    const job = db.prepare("SELECT * FROM outbox_replies WHERE id = ? AND status IN ('pending','needs_review')").get(outboxId);
+    if (!job) throw new Error(`outbox ${outboxId} は取消可能な状態 (pending/needs_review) ではありません`);
+    db.prepare("UPDATE outbox_replies SET status = 'cancelled', resolved_by = ?, resolved_at = ? WHERE id = ? AND status IN ('pending','needs_review')")
+      .run(cancelledBy, toUtcIso(Date.now()), outboxId);
+    logActivity(job.inquiry_id, { actorType: 'user', userId: cancelledBy, actionType: 'reply_cancelled',
+      operationId: job.client_operation_id, after: { outbox_id: job.id } });
+    return { id: job.id, status: 'cancelled' };
+  });
+  return tx.immediate();
+}
+
+/** 送信結果不明/保留/失敗の一覧 (画面§7.1#4用)。resolution確定済み (終端) は載せない */
 export function listOutboxIssues() {
   const db = getDB();
   return db.prepare(`SELECT o.*, i.subject, i.customer_name, i.channel_type AS inquiry_channel, s.shop_name
     FROM outbox_replies o
     JOIN inquiries i ON i.id = o.inquiry_id
     JOIN shops s ON s.id = i.shop_id
-    WHERE o.status IN ('unknown', 'needs_review', 'failed')
+    WHERE o.status = 'needs_review'
+       OR (o.status IN ('unknown', 'failed') AND o.resolution IS NULL)
     ORDER BY o.created_at DESC, o.id DESC LIMIT 200`).all();
 }

@@ -4,7 +4,7 @@
 import fs from 'fs';
 import path from 'path';
 import { initInquiryHubDB, getDB, toUtcIso } from './db.js';
-import { createReplyJob, runOutboxPass, sweepZombies, resolveUnknown, listOutboxIssues, SendRejectedError } from './outbox.js';
+import { createReplyJob, runOutboxPass, sweepZombies, resolveUnknown, cancelJob, listOutboxIssues, SendRejectedError } from './outbox.js';
 
 if (!process.env.DATA_DIR) {
   console.error('FATAL: DATA_DIR が未指定です。専用の空ディレクトリを指定してください (例: DATA_DIR=c:/tmp/ih-outbox-smoke)');
@@ -58,10 +58,17 @@ const inqA = mkInquiry(shopEmail, 'email', 'th-a');
     createdBy: 'user-x', clientOperationId: 'op-a1', baseConversationRev: 0 });
   check('作成 + 同一operation_idは冪等 (二重登録しない)', r1.created && !r2.created && r1.id === r2.id
     && db.prepare('SELECT COUNT(*) c FROM outbox_replies').get().c === 1);
-  const conflict = createReplyJob({ inquiryId: inqA, channelType: 'email', bodyText: 'x',
-    createdBy: 'user-x', clientOperationId: 'op-a2', baseConversationRev: 99 });
-  check('登録時のrev競合は拒否', conflict.conflict != null && conflict.id === null
+  // 未決着ジョブがある間は別operation_idでも作成不可 (1問い合わせ1送信の保証。Codexレビュー反映)
+  const dup = createReplyJob({ inquiryId: inqA, channelType: 'email', bodyText: '別の返信',
+    createdBy: 'user-y', clientOperationId: 'op-a2', baseConversationRev: 0 });
+  check('未決着ジョブ中は新規作成不可', dup.conflict != null && dup.conflict.includes('未決着')
     && db.prepare('SELECT COUNT(*) c FROM outbox_replies').get().c === 1);
+  // rev競合の拒否 (未決着ジョブのない問い合わせで確認)
+  const inqRev = mkInquiry(shopEmail, 'email', 'th-rev', 5);
+  const conflict = createReplyJob({ inquiryId: inqRev, channelType: 'email', bodyText: 'x',
+    createdBy: 'user-x', clientOperationId: 'op-rev1', baseConversationRev: 99 });
+  check('登録時のrev競合は拒否', conflict.conflict != null && conflict.conflict.includes('会話が更新')
+    && conflict.id === null);
   throws('本文空は拒否', () => createReplyJob({ inquiryId: inqA, channelType: 'email', bodyText: ' ',
     createdBy: 'u', clientOperationId: 'op-a3', baseConversationRev: 0 }), '本文');
   throws('channel不一致は拒否', () => createReplyJob({ inquiryId: inqA, channelType: 'rakuten', bodyText: 'x',
@@ -141,6 +148,7 @@ const inqC = mkInquiry(shopEmail, 'email', 'th-c');
   const res3 = resolveUnknown(job3.id, 'abandoned', 'boss');
   check('abandoned → unknownのまま確定 (再送ボタン対象外)', res3.status === 'unknown'
     && db.prepare('SELECT resolution FROM outbox_replies WHERE id=?').get(job3.id).resolution === 'abandoned');
+  throws('abandoned は終端 (後から変更不可)', () => resolveUnknown(job3.id, 'confirmed_not_sent', 'boss'), 'unknown 状態ではありません');
 }
 
 // ─── 5. ゾンビ回収 (lease切れ sending → unknown) ───
@@ -172,6 +180,32 @@ const inqE = mkInquiry(shopEmail, 'email', 'th-e');
     && job.status === 'needs_review' && adapter.state.calls === 0);
   const r2 = await runOutboxPass({ email: adapter }, { now: T0 + 60000 });
   check('needs_review は二度と拾わない (永久ループなし)', r2.processed === 0 && adapter.state.calls === 0);
+
+  // 再送信フロー: needs_review を取消 → 新ジョブとして作成できる
+  const cancelled = cancelJob(job.id, 'user-x');
+  check('needs_review の取消', cancelled.status === 'cancelled'
+    && db.prepare('SELECT status FROM outbox_replies WHERE id=?').get(job.id).status === 'cancelled');
+  throws('取消済みの再取消は拒否', () => cancelJob(job.id, 'user-x'), '取消可能な状態');
+  const recreate = createReplyJob({ inquiryId: inqE, channelType: 'email', bodyText: '新しい内容で再送信',
+    createdBy: 'user-x', clientOperationId: 'op-e2', baseConversationRev: 1 });
+  check('取消後は新ジョブを作成できる', recreate.created === true);
+  const r3 = await runOutboxPass({ email: adapter }, { now: T0 + 120000 });
+  check('再作成ジョブが送信される', r3.results[0]?.outcome === 'sent' && adapter.state.calls === 1);
+}
+
+// ─── 6.5 同一問い合わせの sending 排他 (claimレベルの多層防御) ───
+console.log('6.5 claim排他');
+const inqG = mkInquiry(shopEmail, 'email', 'th-g');
+{
+  // 作成ガードを迂回して2つのジョブを直接投入 (並行ワーカーの競合状態を模倣)
+  const ins = db.prepare(`INSERT INTO outbox_replies (inquiry_id, channel_type, client_operation_id, body_text, created_by, base_conversation_rev, status, lease_token, lease_until)
+    VALUES (?,?,?,?,?,?,?,?,?)`);
+  ins.run(inqG, 'email', 'op-g1', 'x', 'u', 0, 'sending', 'worker-1', iso(60));
+  ins.run(inqG, 'email', 'op-g2', 'y', 'u', 0, 'pending', null, null);
+  const adapter = okAdapter();
+  const r = await runOutboxPass({ email: adapter }, { now: T0 });
+  check('同一問い合わせが sending 中は pending を拾わない', r.processed === 0 && adapter.state.calls === 0);
+  db.prepare("UPDATE outbox_replies SET status='cancelled', lease_token=NULL WHERE client_operation_id IN ('op-g1','op-g2')").run();
 }
 
 // ─── 7. executor ゲート (Yahoo!ローカルランナー構成) ───
@@ -197,6 +231,7 @@ const inqF = mkInquiry(shopEmail, 'email', 'th-f');
   const r = await runOutboxPass({}, { now: T0 });
   check('アダプター未設定 → needs_review', r.results[0].outcome === 'needs_review');
 
+  cancelJob(db.prepare("SELECT id FROM outbox_replies WHERE client_operation_id='op-f1'").get().id, 'u');
   createReplyJob({ inquiryId: inqF, channelType: 'email', bodyText: 'x', createdBy: 'u',
     clientOperationId: 'op-f2', baseConversationRev: 0 });
   const thief = { sendReply: async () => {
@@ -212,10 +247,16 @@ const inqF = mkInquiry(shopEmail, 'email', 'th-f');
 // ─── 9. issues一覧 ───
 console.log('9. issues一覧');
 {
+  // needs_review の実例を1件用意 (前段のものは取消済みのため)
+  const inqH = mkInquiry(shopEmail, 'email', 'th-h');
+  createReplyJob({ inquiryId: inqH, channelType: 'email', bodyText: 'x', createdBy: 'u',
+    clientOperationId: 'op-h1', baseConversationRev: 0 });
+  await runOutboxPass({}, { now: T0 });
   const issues = listOutboxIssues();
   const statuses = new Set(issues.map(i => i.status));
   check('unknown/needs_review/failed が一覧に載る', statuses.has('unknown') && statuses.has('needs_review') && statuses.has('failed')
     && issues.every(i => i.shop_name && i.subject !== undefined));
+  check('resolution確定済み (abandoned等) は一覧に載らない', issues.every(i => i.resolution === null));
 }
 
 console.log(`\n${failed === 0 ? 'OK' : 'NG'}: ${passed} PASS / ${failed} FAIL`);
