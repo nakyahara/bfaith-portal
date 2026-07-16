@@ -2275,15 +2275,19 @@ router.get('/api/masters/:kind', (req, res) => {
       const supName = new Map();
       for (const s of getDB().prepare('SELECT supplier_code, name FROM po_suppliers').all()) supName.set(s.supplier_code, s.name);
       const byKey = new Map(rows.map(r => [r.product_key, r]));
-      const seen = new Set();
-      const out = [];
+      // PMLに同一正規化コードが複数行あるケースは「取扱中を優先」で1行に集約する
+      // (行順依存で取扱中止が勝つと未紐付け商品が消える、Codex attrs-R1)
+      const pmlByKey = new Map();
       for (const r of loadPml().rows) {
         if (String(r['商品区分'] || '') === 'セット') continue; // セット商品は発注計算の対象外 (#519)
         const key = normProductCode(r['商品コード']);
-        if (seen.has(key)) continue;
-        seen.add(key);
-        const a = byKey.get(key);
         const active = String(r['取扱区分'] || '') === '取扱中';
+        const cur = pmlByKey.get(key);
+        if (!cur || (active && !cur.active)) pmlByKey.set(key, { r, active });
+      }
+      const out = [];
+      for (const [key, { r, active }] of pmlByKey) {
+        const a = byKey.get(key);
         if (!a && !active) continue; // 未紐付け×取扱中止はノイズなので出さない (紐付け済みなら残す)
         out.push({
           product_key: key, product_code: a ? a.product_code : String(r['商品コード']).trim(),
@@ -2296,10 +2300,11 @@ router.get('/api/masters/:kind', (req, res) => {
       }
       // attrsにあるがPMLに無い商品 (コード改廃等) も消さずに出す
       for (const a of rows) {
-        if (seen.has(a.product_key)) continue;
+        if (pmlByKey.has(a.product_key)) continue;
         out.push({ ...a, 商品名: '', 仕入先名: '', linked: true, active: false, pmlMissing: true });
       }
-      out.sort((x, y) => String(x.product_code).localeCompare(String(y.product_code)));
+      // 商品コード順 (ロケール非依存のバイナリ順、Codex attrs-R1 Low)
+      out.sort((x, y) => (x.product_key < y.product_key ? -1 : x.product_key > y.product_key ? 1 : 0));
       return res.json({ ok: true, rows: out });
     }
     if (req.params.kind === 'selectable') {
@@ -2322,6 +2327,14 @@ router.post('/api/masters/:kind', (req, res) => {
     const row = def.fromBody(req.body || {});
     const err = def.validate(row);
     if (err) return res.status(400).json({ ok: false, error: err });
+    // 商品紐付け: 未紐付け商品の「全部空欄のまま保存」で空のattrs行 (=紐付け済み扱い) を作らせない
+    // (全商品既定表示で未紐付け行も保存ボタンを持つため。既存行の全空更新は従来どおり許容、Codex attrs-R1 High)
+    if (req.params.kind === 'attrs'
+      && row.condition_id == null && row.material_group_id == null && row.capacity_per_unit == null
+      && row.case_group == null && row.case_lot == null
+      && !getDB().prepare('SELECT 1 FROM po_product_attrs WHERE product_key=?').get(row.product_key)) {
+      return res.status(400).json({ ok: false, error: 'グループ・容量・ケースが全て空です (空のままでは紐付けになりません)' });
+    }
     upsertMasterRow(def, row);
     res.json({ ok: true });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
@@ -7530,15 +7543,14 @@ function cellHtml(c, val) {
 }
 var FILT_Q = {};        // タブごとの絞り込み文字列 (保存→再描画してもフィルタを維持する、中原さん要望 2026-07-16)
 var ATTR_VIEW = 'all';  // 商品紐付けタブのチップ: all / unlinked / linked
-var SCROLL_RESTORE = null; // 保存/削除→再描画後にスクロール位置を戻す
+var SCROLL_RESTORE = null; // {tab, y} 保存/削除→再描画後にスクロール位置を戻す (同じタブのときだけ)
 function applyMasterFilter() {
   var q = (FILT_Q[TAB] || '').trim().toLowerCase();
   var shown = 0;
   document.querySelectorAll('#mtable tr[data-row]').forEach(function(tr) {
     var okChip = TAB !== 'attrs' || ATTR_VIEW === 'all' || tr.getAttribute('data-linked') === (ATTR_VIEW === 'linked' ? '1' : '0');
-    var txt = tr.textContent.toLowerCase();
-    tr.querySelectorAll('input[data-k]').forEach(function(inp){ txt += ' ' + inp.value.toLowerCase(); });
-    var show = okChip && (!q || txt.indexOf(q) >= 0);
+    // 検索対象は行生成時に作った data-search (毎入力での全セル走査は数千行で重い、Codex attrs-R1 Medium)
+    var show = okChip && (!q || (tr.getAttribute('data-search') || '').indexOf(q) >= 0);
     tr.style.display = show ? '' : 'none';
     if (show) shown++;
   });
@@ -7567,7 +7579,12 @@ function render(rows) {
   }).join('') + '<td><button class="pri sm" id="btnAdd">追加</button></td></tr>';
   rows.forEach(function(r) {
     var attrsMeta = TAB === 'attrs' ? ' data-linked="' + (r.linked ? '1' : '0') + '"' : '';
-    h += '<tr data-row="1"' + attrsMeta + (TAB === 'attrs' && !r.linked ? ' style="background:#fffbeb"' : '') + '>' + def.cols.map(function(c) {
+    // 検索用テキストを行生成時に正規化して埋め込む (グループはID+名前の両方で当たるように)
+    var searchTxt = def.cols.map(function(c) {
+      var v = r[c.k];
+      return c.dl ? groupLabelOf(c.dl, v) : (v == null ? '' : String(v));
+    }).join(' ').toLowerCase();
+    h += '<tr data-row="1" data-search="' + esc(searchTxt) + '"' + attrsMeta + (TAB === 'attrs' && !r.linked ? ' style="background:#fffbeb"' : '') + '>' + def.cols.map(function(c) {
       if (c.pk) {
         var badge = '';
         if (TAB === 'attrs') {
@@ -7583,12 +7600,15 @@ function render(rows) {
   });
   h += '</tbody></table>';
   document.getElementById('tabBody').innerHTML = h;
+  var filtTimer = null;
   document.getElementById('filter').addEventListener('input', function(ev) {
     FILT_Q[TAB] = ev.target.value;
-    applyMasterFilter();
+    clearTimeout(filtTimer);
+    filtTimer = setTimeout(applyMasterFilter, 200); // 数千行の全行走査を毎キーで走らせない
   });
   applyMasterFilter();
-  if (SCROLL_RESTORE != null) { window.scrollTo(0, SCROLL_RESTORE); SCROLL_RESTORE = null; }
+  if (SCROLL_RESTORE && SCROLL_RESTORE.tab === TAB) window.scrollTo(0, SCROLL_RESTORE.y);
+  SCROLL_RESTORE = null;
 }
 function renderUnlinked(j) {
   var h = '<div class="toolbar">' +
@@ -7750,14 +7770,20 @@ document.getElementById('bcImpForm').addEventListener('submit', function(ev) {
     }).catch(function(e){ document.getElementById('bcImpStatus').textContent = ''; alert('通信エラー: ' + e.message); });
 });
 
+var MLOAD_SEQ = 0;
 function load() {
   if (TAB === 'unlinked') { loadUnlinked(60); return; }
   if (TAB === 'vendormap') { loadVmap(); return; }
   if (TAB === 'barcode') { loadBarcode(); return; }
+  // 世代ガード: 素早いタブ切替で古いGET応答が現在タブのrenderに渡らないように (Codex attrs-R1 Medium)
+  var seq = ++MLOAD_SEQ, reqTab = TAB;
   document.getElementById('tabBody').textContent = '読み込み中…';
   ensureGroups(function() {
-    fetch('/apps/purchase-orders/api/masters/' + TAB).then(function(r){ return r.json(); })
-      .then(function(j){ if (j.ok) render(j.rows); else document.getElementById('tabBody').textContent = j.error; });
+    fetch('/apps/purchase-orders/api/masters/' + reqTab).then(function(r){ return r.json(); })
+      .then(function(j) {
+        if (seq !== MLOAD_SEQ || TAB !== reqTab) return;
+        if (j.ok) render(j.rows); else document.getElementById('tabBody').textContent = j.error;
+      });
   });
 }
 
@@ -8018,21 +8044,30 @@ document.addEventListener('click', function(ev) {
   var rmKey = t.getAttribute && t.getAttribute('data-rm');
   if (rmKey != null) {
     if (!confirm('削除しますか? ' + rmKey)) return;
-    fetch('/apps/purchase-orders/api/masters/' + TAB + '/' + encodeURIComponent(rmKey), { method: 'DELETE' })
+    var rmTab = TAB; // 応答前のタブ切替対策 (postと同じ)
+    fetch('/apps/purchase-orders/api/masters/' + rmTab + '/' + encodeURIComponent(rmKey), { method: 'DELETE' })
       .then(function(r){ return r.json(); }).then(function(j) {
-        if (j.ok) { toast('削除しました'); if (TAB === 'conditions' || TAB === 'materials') GROUPS = null; SCROLL_RESTORE = window.scrollY; load(); }
-        else toast(j.error);
+        if (j.ok) {
+          toast('削除しました');
+          if (rmTab === 'conditions' || rmTab === 'materials') GROUPS = null;
+          if (TAB !== rmTab) return;
+          SCROLL_RESTORE = { tab: rmTab, y: window.scrollY };
+          load();
+        } else toast(j.error);
       });
   }
 });
 function post(b) {
-  fetch('/apps/purchase-orders/api/masters/' + TAB, {
+  // 開始時点のタブを捕捉 (応答前にタブ切替しても別タブを誤って再読込・スクロールしない、Codex attrs-R1 Medium)
+  var reqTab = TAB;
+  fetch('/apps/purchase-orders/api/masters/' + reqTab, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b),
   }).then(function(r){ return r.json(); }).then(function(j) {
     if (j.ok) {
       toast('保存しました');
-      if (TAB === 'conditions' || TAB === 'materials') GROUPS = null; // グループ名キャッシュを更新
-      SCROLL_RESTORE = window.scrollY; // 再描画後も同じ位置・同じフィルタで作業を続けられるように (中原さん要望)
+      if (reqTab === 'conditions' || reqTab === 'materials') GROUPS = null; // グループ名キャッシュを更新
+      if (TAB !== reqTab) return; // 別タブへ移動済みなら再描画しない (戻ったときのloadで最新化される)
+      SCROLL_RESTORE = { tab: reqTab, y: window.scrollY }; // 再描画後も同じ位置・同じフィルタで作業を続けられるように (中原さん要望)
       load();
     } else toast('エラー: ' + j.error);
   });
