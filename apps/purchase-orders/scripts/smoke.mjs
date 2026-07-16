@@ -3476,6 +3476,13 @@ console.log('── P17 欠品リスク ──');
   ok(r.status === 400 && r.body.error.includes('整数'), 'P17設定: 非整数は400');
   r = await patchSr({});
   ok(r.status === 400, 'P17設定: 空は400');
+  // null/空文字/文字列数値は Number() で通さず型で拒否 (Codex R2 Medium / R3 Low)
+  r = await patchSr({ w7: null });
+  ok(r.status === 400, 'P17設定: null は400');
+  r = await patchSr({ w7: '' });
+  ok(r.status === 400, 'P17設定: 空文字は400');
+  r = await patchSr({ w7: '0.5' });
+  ok(r.status === 400, 'P17設定: 文字列数値は400 (JSON numberのみ)');
   r = await patchSr({ unansweredDays: 0 });
   ok(r.status === 200 && r.body.ok && r.body.settings.unansweredDays === 0, 'P17設定: 未回答督促=0日に変更');
   ok(db.prepare("SELECT COUNT(*) n FROM po_audit_log WHERE action='setting_change' AND resource='setting:shortage_unanswered_days'").get().n >= 1,
