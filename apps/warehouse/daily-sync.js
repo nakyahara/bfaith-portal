@@ -592,6 +592,25 @@ async function main() {
       console.log('[DailySync] 楽天データ分析 sync は取込失敗のためスキップ (failed/ を確認、修正後に再投入)');
     }
 
+    // === 楽天レビューCSV 取込 + mirror sync (mall-csv-fetcher P2 PR-A、らくらくーぽん置換) ===
+    // 自動DL (rakuten-review-download.mjs、fetch-all 05:30) が incoming/rakuten-review/ に置いた
+    // CSVを取り込む (新規★1-2は取込内でGChat通知)。対象0件は正常。
+    // --days 35 = downloader の直近30日窓+余裕。mirror へは非PII日次集計のみ
+    const rakutenReviewImportResult = runScript(
+      `apps/warehouse/import-rakuten-review.js --data-dir ${DATA_DIR_ARG}`,
+      '楽天レビュー 取込', 600000
+    );
+    results.push({ name: '楽天レビュー 取込', ...rakutenReviewImportResult });
+    if (rakutenReviewImportResult.success) {
+      const rakutenReviewSyncResult = runScript(
+        `apps/warehouse/sync-rakuten-review-daily.js --data-dir ${DATA_DIR_ARG} --days 35`,
+        '楽天レビュー sync', 600000
+      );
+      results.push({ name: '楽天レビュー sync', ...rakutenReviewSyncResult });
+    } else {
+      console.log('[DailySync] 楽天レビュー sync は取込失敗のためスキップ (failed/ を確認、修正後に再投入)');
+    }
+
     // === Yahoo!ストクリ統計CSV 取込 + mirror sync (mall-csv-fetcher P1-Y) ===
     // 自動DL (yahoo-data-download.mjs、fetch-all 05:30) が incoming/yahoo-data/ に置いた
     // CSVを取り込む。対象0件は正常。--days 110 = 全体分析の一括100日レンジをカバー

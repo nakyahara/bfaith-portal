@@ -54,7 +54,7 @@ function cleanupOldFiles() {
   const KEEP_MS = 30 * 24 * 3600 * 1000;
   const targets = [
     { dir: LOG_DIR, pattern: /\.log$/ },
-    { dir: join(__dirname, 'downloads'), pattern: /^(rpp|rdata|yahoo|aupay|qoo10)_/ },
+    { dir: join(__dirname, 'downloads'), pattern: /^(rpp|rdata|rreview|yahoo|aupay|qoo10)_/ },
   ];
   for (const t of targets) {
     let removed = 0;
@@ -82,6 +82,11 @@ const DEFAULT_FETCHERS = [
     mall: 'rakuten-data', // RMSデータ分析 (商品分析SKU日次+店舗日次)。同期DLなので短め
     script: join(__dirname, 'rakuten-data-download.mjs'),
     timeoutMs: 20 * 60 * 1000,
+  },
+  {
+    mall: 'rakuten-review', // レビューチェックツールCSV (mall-csv-fetcher P2、らくらくーぽん置換)。同期DL1本
+    script: join(__dirname, 'rakuten-review-download.mjs'),
+    timeoutMs: 15 * 60 * 1000,
   },
   {
     mall: 'yahoo', // ストクリ統計6種 (mall-csv-fetcher P1-Y)。全て同期DLなので短め
