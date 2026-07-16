@@ -55,7 +55,9 @@ export function stableStringify(v) {
 const SETTABLE_KEYS = new Set(['backorder_source', 'email_mode', 'email_dryrun_to', 'email_subject_template', 'email_body_template',
   'po_cycle_reset_at',   // データ更新 (NE取込/FBA更新) 時刻 =「✅発注確定済み」「×非表示」のリセット基準 (サイクルID)
   'dashboard_hidden_suppliers', // ダッシュボード×非表示 {"cycle":<保存時のpo_cycle_reset_at>,"codes":[...]} — サイクルIDが変わると自動失効
-  'email_issuer_name']); // 発注書CSVの「発行担当者」列
+  'email_issuer_name',   // 発注書CSVの「発行担当者」列
+  // P17 欠品リスクのしきい値 (数値範囲の検証は shortage-risk.js の validateShortageSetting をrouterが先に通す)
+  'shortage_w7', 'shortage_margin_days', 'shortage_unanswered_days', 'shortage_horizon_days', 'shortage_soon_days']);
 
 export function getSetting(key) {
   const r = getDB().prepare('SELECT value FROM po_settings WHERE key=?').get(key);
