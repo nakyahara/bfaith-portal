@@ -40,6 +40,17 @@ function isRealDate(s) {
 
 // ─── UI ───
 router.get('/', (req, res) => {
+  // 末尾スラッシュなし (/apps/giftset-assembly) で開くと、ページ内の相対 URL の解決基準が
+  // /apps/ になり誤った先へ飛ぶため、正規 URL (末尾スラッシュあり) へ寄せる。
+  // API 呼び出しは index.html 側で絶対パス化済みだが、将来相対参照のリソース
+  // (画像・追加 JS 等) が入っても壊れないようにする防御。GET のみ・完全一致のみ対象。
+  // クエリは最初の '?' 以降を丸ごと保持 (Codex 指摘: split('?') だと '?next=/a?b=1' 等で後半が欠落)
+  const qIdx = req.originalUrl.indexOf('?');
+  const pathname = qIdx === -1 ? req.originalUrl : req.originalUrl.slice(0, qIdx);
+  const query = qIdx === -1 ? '' : req.originalUrl.slice(qIdx);
+  if (!pathname.endsWith('/')) {
+    return res.redirect(308, pathname + '/' + query);
+  }
   res.sendFile(path.join(__dirname, 'views', 'index.html'));
 });
 
