@@ -23,10 +23,13 @@
  *       }],
  *     }],
  *     nextCursor?,      // Gmail historyId 等。次回の fetchNew に渡す
- *     observedUntil?,   // アダプターが観測した最大更新時刻 (省略時は untilIso)
+ *     observedUntil?,   // アダプターが完全列挙を保証できる上限時刻。untilIso まで列挙しきれない場合に
+ *                       //   必ず返すこと (committed_until はこの値までしか前進しない)。省略 = untilIso まで完全列挙した
  *   }
  *   ⚠️ 部分成功を返さないこと。ページ途中で失敗したら全体を throw する
  *      (committed_until はエンジンが「全件取り込み成功時のみ」前進させる。§8.1)
+ *   ⚠️ fetchNew はリース期間 (既定10分) 内に完了すること。超過して別ジョブにリースを奪われた場合、
+ *      本エンジンは lease_token の所有権確認によりコミットを破棄する (lease_lost)
  */
 import crypto from 'crypto';
 import { getDB, logActivity, toUtcIso } from '../db.js';
@@ -60,22 +63,25 @@ function ensureSyncState(db, shopId) {
 
 /**
  * 同期リースの取得。BEGIN IMMEDIATE で原子的にclaimする (設計書§5.2)。
- * 取得できなければ null (他プロセス/前回実行がリース保持中)。
+ * 取得できなければ null。取得できたら所有者トークンを返す
+ * (期限切れ後に別ジョブへ移ったリースを、旧ジョブが解除/上書きしないため。Codexレビュー反映)。
  */
 function acquireLease(db, shopId, nowMs, leaseMinutes) {
   const tx = db.transaction(() => {
     const st = ensureSyncState(db, shopId);
     if (st.lease_until && Date.parse(st.lease_until) > nowMs) return null;
-    const leaseUntil = toUtcIso(nowMs + leaseMinutes * 60000);
-    db.prepare('UPDATE sync_state SET lease_until = ?, last_sync_started_at = ? WHERE shop_id = ?')
-      .run(leaseUntil, toUtcIso(nowMs), shopId);
-    return leaseUntil;
+    const token = crypto.randomUUID();
+    db.prepare('UPDATE sync_state SET lease_until = ?, lease_token = ?, last_sync_started_at = ? WHERE shop_id = ?')
+      .run(toUtcIso(nowMs + leaseMinutes * 60000), token, toUtcIso(nowMs), shopId);
+    return token;
   });
   return tx.immediate();
 }
 
-function releaseLease(db, shopId) {
-  db.prepare('UPDATE sync_state SET lease_until = NULL WHERE shop_id = ?').run(shopId);
+/** リース解放 (所有している場合のみ) */
+function releaseLease(db, shopId, token) {
+  db.prepare('UPDATE sync_state SET lease_until = NULL, lease_token = NULL WHERE shop_id = ? AND lease_token = ?')
+    .run(shopId, token);
 }
 
 /** 1チケット分のUPSERT + メッセージ/添付取り込み + 状態遷移。トランザクション内で呼ぶこと */
@@ -141,10 +147,12 @@ function ingestInquiry(db, shop, item, nowIso) {
       m.bodyText ?? null, m.bodyHtml ?? null, m.isIncoming ? 1 : 0, sentAt, receivedAt);
     const msgAt = receivedAt || sentAt;
     if (msgAt && (!maxMsgAt || msgAt > maxMsgAt)) maxMsgAt = msgAt;
-    if (r.changes === 0) continue; // 既存 (UNIQUE制約でスキップ) → 添付含め再処理しない
-    stats.newMessages++;
-    if (m.isIncoming) stats.newCustomerMessages++;
-
+    if (r.changes > 0) {
+      stats.newMessages++;
+      if (m.isIncoming) stats.newCustomerMessages++;
+    }
+    // 添付メタデータは既存メッセージでも毎回照合する
+    // (初回レスポンスで添付が欠落していた場合に修復同期で取り込めるように。Codexレビュー反映)
     const msgRow = db.prepare('SELECT id FROM inquiry_messages WHERE inquiry_id = ? AND external_message_id = ?')
       .get(inq.id, extMsgId);
     for (const a of m.attachments || []) {
@@ -154,12 +162,13 @@ function ingestInquiry(db, shop, item, nowIso) {
   }
 
   if (stats.newMessages > 0) {
-    // 会話リビジョン++ (AI鮮度判定。§8.1) + last_message_at 前進 (巻き戻さない)
+    // 会話リビジョンは「新規メッセージ1件につき+1」(DBコメントの前提と一致させる。Codexレビュー反映)
+    // + last_message_at 前進 (巻き戻さない)
     db.prepare(`UPDATE inquiries SET
-        conversation_rev = conversation_rev + 1,
+        conversation_rev = conversation_rev + ?,
         last_message_at = CASE WHEN last_message_at IS NULL OR last_message_at < ? THEN ? ELSE last_message_at END,
         updated_at = ?
-      WHERE id = ?`).run(maxMsgAt, maxMsgAt, nowIso, inq.id);
+      WHERE id = ?`).run(stats.newMessages, maxMsgAt, maxMsgAt, nowIso, inq.id);
     db.prepare('UPDATE ai_drafts SET is_stale = 1 WHERE inquiry_id = ? AND is_stale = 0').run(inq.id);
   }
   if (stats.newCustomerMessages > 0) {
@@ -192,9 +201,8 @@ export async function runSync(shopId, adapter, opts = {}) {
   if (!shop) return { ok: false, error: `shop ${shopId} が存在しません` };
   if (!shop.is_active) return { ok: false, skipped: 'inactive' };
 
-  if (!acquireLease(db, shopId, nowMs, opts.leaseMinutes ?? DEFAULT_LEASE_MINUTES)) {
-    return { ok: false, skipped: 'lease' };
-  }
+  const leaseToken = acquireLease(db, shopId, nowMs, opts.leaseMinutes ?? DEFAULT_LEASE_MINUTES);
+  if (!leaseToken) return { ok: false, skipped: 'lease' };
 
   const st = db.prepare('SELECT * FROM sync_state WHERE shop_id = ?').get(shopId);
   const backfillMs = (opts.backfillDays ?? DEFAULT_BACKFILL_DAYS) * 86400000;
@@ -207,34 +215,45 @@ export async function runSync(shopId, adapter, opts = {}) {
     const fetched = await adapter.fetchNew({ sinceIso, untilIso: nowIso, cursor: st.sync_cursor });
     const items = fetched?.inquiries || [];
 
+    // committed_until はアダプターが完全列挙を保証した時刻まで (observedUntil。省略時は untilIso=now。§8.1)
+    const observedIso = fetched?.observedUntil ? toUtcIso(fetched.observedUntil) : nowIso;
+    const committedIso = observedIso < nowIso ? observedIso : nowIso;
+
     const totals = { inquiries: items.length, newInquiries: 0, newMessages: 0, reopened: 0 };
     const tx = db.transaction(() => {
+      // 所有権確認: リースを奪われていたら (fetchNew がリース期間超過) コミットを破棄 (Codexレビュー反映)
+      const cur = db.prepare('SELECT lease_token FROM sync_state WHERE shop_id = ?').get(shopId);
+      if (cur?.lease_token !== leaseToken) {
+        const e = new Error('リース期間超過により別ジョブへ移行済み。取り込みを破棄します');
+        e.errorType = 'lease_lost';
+        throw e;
+      }
       for (const item of items) {
         const s = ingestInquiry(db, shop, item, nowIso);
         totals.newInquiries += s.newInquiry ? 1 : 0;
         totals.newMessages += s.newMessages;
         totals.reopened += s.reopened ? 1 : 0;
       }
-      // 全件取り込み成功時のみ high-water mark を前進 (§8.1)。observed は参考値として分離保存
+      // 全件取り込み成功時のみ high-water mark を前進 (§8.1)
       db.prepare(`UPDATE sync_state SET
           committed_until = ?, observed_until = ?, sync_cursor = ?,
           last_sync_completed_at = ?, last_error = NULL, consecutive_failures = 0
         WHERE shop_id = ?`)
-        .run(nowIso, fetched?.observedUntil ? toUtcIso(fetched.observedUntil) : nowIso,
-          fetched?.nextCursor ?? st.sync_cursor, nowIso, shopId);
+        .run(committedIso, observedIso, fetched?.nextCursor ?? st.sync_cursor, nowIso, shopId);
       db.prepare('UPDATE shops SET last_synced_at = ?, updated_at = ? WHERE id = ?').run(nowIso, nowIso, shopId);
     });
-    tx();
+    tx.immediate();
     return { ok: true, stats: totals };
   } catch (e) {
     const detail = String(e?.message || e).slice(0, 1000);
     db.prepare(`INSERT INTO sync_errors (shop_id, error_type, error_detail) VALUES (?, ?, ?)`)
       .run(shopId, e?.errorType || 'fetch_failed', detail);
-    db.prepare(`UPDATE sync_state SET last_error = ?, consecutive_failures = consecutive_failures + 1 WHERE shop_id = ?`)
-      .run(detail, shopId);
-    return { ok: false, error: detail };
+    // sync_state の失敗記録は所有者である間のみ (奪われた後に他ジョブの状態を汚さない)
+    db.prepare(`UPDATE sync_state SET last_error = ?, consecutive_failures = consecutive_failures + 1
+      WHERE shop_id = ? AND lease_token = ?`).run(detail, shopId, leaseToken);
+    return { ok: false, error: detail, leaseLost: e?.errorType === 'lease_lost' || undefined };
   } finally {
-    releaseLease(db, shopId);
+    releaseLease(db, shopId, leaseToken);
   }
 }
 

@@ -199,6 +199,9 @@ function createTables() {
     consecutive_failures INTEGER NOT NULL DEFAULT 0
   )`);
 
+  // 同期リースの所有者トークン (Codexレビュー: 期限切れ後の旧ジョブが新ジョブのリースを解除/上書きしないため)
+  addColumnIfMissing('sync_state', 'lease_token', 'TEXT');
+
   // 同期・送信エラーログ
   db.exec(`CREATE TABLE IF NOT EXISTS sync_errors (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

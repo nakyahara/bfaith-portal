@@ -162,8 +162,54 @@ console.log('6. 修復同期ほか');
   check('存在しない shop はエラー', !rMissing.ok && /存在しません/.test(rMissing.error));
 }
 
-// ─── 7. synthetic ID の決定性 + 同期状態サマリ ───
-console.log('7. synthetic ID・サマリ');
+// ─── 7. Codexレビュー反映分 ───
+console.log('7. rev加算・後着添付・observedUntil・リース奪取');
+{
+  // 複数新着メッセージ → rev はメッセージ件数ぶん加算
+  const multi = item({ externalInquiryId: 'rk-multi', updatedAt: iso(1100), receivedAt: iso(1090), messages: [
+    { externalMessageId: 'mm-1', senderType: 'customer', bodyText: '1', isIncoming: 1, receivedAt: iso(1090) },
+    { externalMessageId: 'mm-2', senderType: 'customer', bodyText: '2', isIncoming: 1, receivedAt: iso(1095) },
+    { externalMessageId: 'mm-3', senderType: 'shop', bodyText: '3', isIncoming: 0, sentAt: iso(1099) },
+  ]});
+  await runSync(shopId, createMockAdapter([multi]), { now: T0 + 1100 * 60000 });
+  const mInq = db.prepare("SELECT * FROM inquiries WHERE external_inquiry_id = 'rk-multi'").get();
+  check('複数新着: rev = メッセージ件数', mInq.conversation_rev === 3 && mInq.last_message_at === iso(1099));
+
+  // 後着添付: 既存メッセージに添付が後から現れても取り込める
+  const withLateAtt = { ...multi, updatedAt: iso(1110), messages: multi.messages.map(m =>
+    m.externalMessageId === 'mm-1' ? { ...m, attachments: [{ externalAttachmentId: 'late-att', fileName: 'late.jpg' }] } : m) };
+  const rLate = await runSync(shopId, createMockAdapter([withLateAtt]), { now: T0 + 1110 * 60000 });
+  check('後着添付を既存メッセージに取り込む', rLate.stats.newMessages === 0
+    && db.prepare("SELECT COUNT(*) c FROM inquiry_attachments WHERE external_attachment_id = 'late-att'").get().c === 1
+    && db.prepare('SELECT conversation_rev FROM inquiries WHERE id = ?').get(mInq.id).conversation_rev === 3);
+
+  // observedUntil < untilIso → committed_until は observedUntil まで
+  const obs = iso(1105);
+  await runSync(shopId, createMockAdapter([], { observedUntil: obs }), { now: T0 + 1120 * 60000 });
+  check('committed_until = observedUntil (完全列挙の上限)',
+    db.prepare('SELECT committed_until FROM sync_state WHERE shop_id=?').get(shopId).committed_until === obs);
+
+  // リース奪取: fetchNew 中に別ジョブへリースが移ったらコミット破棄+奪取側のリースを消さない
+  const stolenToken = 'stolen-token-xyz';
+  const thief = createMockAdapter([item({ externalInquiryId: 'rk-lost', updatedAt: iso(1125), receivedAt: iso(1125),
+      messages: [{ externalMessageId: 'lost-m1', senderType: 'customer', bodyText: 'x', isIncoming: 1, receivedAt: iso(1125) }] })], {
+    onFetch: () => db.prepare('UPDATE sync_state SET lease_token = ?, lease_until = ? WHERE shop_id = ?')
+      .run(stolenToken, toUtcIso(T0 + 2000 * 60000), shopId),
+  });
+  const before = db.prepare('SELECT committed_until FROM sync_state WHERE shop_id=?').get(shopId);
+  const rLost = await runSync(shopId, thief, { now: T0 + 1130 * 60000 });
+  const after = db.prepare('SELECT * FROM sync_state WHERE shop_id=?').get(shopId);
+  check('リース喪失: コミット破棄 (leaseLost)', !rLost.ok && rLost.leaseLost === true
+    && db.prepare("SELECT COUNT(*) c FROM inquiries WHERE external_inquiry_id = 'rk-lost'").get().c === 0
+    && after.committed_until === before.committed_until);
+  check('リース喪失: 奪取側のリースを消さない・状態を汚さない', after.lease_token === stolenToken
+    && after.consecutive_failures === 0
+    && db.prepare("SELECT COUNT(*) c FROM sync_errors WHERE shop_id=? AND error_type='lease_lost'").get(shopId).c === 1);
+  db.prepare('UPDATE sync_state SET lease_token = NULL, lease_until = NULL WHERE shop_id = ?').run(shopId);
+}
+
+// ─── 8. synthetic ID の決定性 + 同期状態サマリ ───
+console.log('8. synthetic ID・サマリ');
 {
   const a = syntheticMessageId('rk-001', 1, iso(0), '本文');
   const b = syntheticMessageId('rk-001', 1, iso(0), '本文');

@@ -22,7 +22,9 @@ export function createMockAdapter(data = [], opts = {}) {
         e.errorType = opts.errorType || 'fetch_failed';
         throw e;
       }
-      const items = data.filter(i => !i.updatedAt || i.updatedAt > sinceIso);
+      if (opts.onFetch) await opts.onFetch({ sinceIso, untilIso, cursor }); // テストフック (リース奪取の再現等)
+      // 日時ウィンドウ型チャネルの模倣: sinceIso < updatedAt <= untilIso のみ返す
+      const items = data.filter(i => !i.updatedAt || (i.updatedAt > sinceIso && i.updatedAt <= untilIso));
       return {
         inquiries: items,
         nextCursor: opts.nextCursor,
