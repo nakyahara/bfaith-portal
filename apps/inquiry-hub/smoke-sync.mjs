@@ -183,11 +183,19 @@ console.log('7. rev加算・後着添付・observedUntil・リース奪取');
     && db.prepare("SELECT COUNT(*) c FROM inquiry_attachments WHERE external_attachment_id = 'late-att'").get().c === 1
     && db.prepare('SELECT conversation_rev FROM inquiries WHERE id = ?').get(mInq.id).conversation_rev === 3);
 
-  // observedUntil < untilIso → committed_until は observedUntil まで
+  // observedUntil < untilIso → committed は observedUntil までしか進まない。ただし既存より後退しない (単調増加)
   const obs = iso(1105);
   await runSync(shopId, createMockAdapter([], { observedUntil: obs }), { now: T0 + 1120 * 60000 });
+  {
+    const st = db.prepare('SELECT committed_until, observed_until FROM sync_state WHERE shop_id=?').get(shopId);
+    check('committed_until は後退しない (単調増加) + observed は記録',
+      st.committed_until === iso(1110) && st.observed_until === obs);
+  }
+  // 未コミット領域に対しては observedUntil が上限になる
+  const obs2 = iso(1115);
+  await runSync(shopId, createMockAdapter([], { observedUntil: obs2 }), { now: T0 + 1120 * 60000 });
   check('committed_until = observedUntil (完全列挙の上限)',
-    db.prepare('SELECT committed_until FROM sync_state WHERE shop_id=?').get(shopId).committed_until === obs);
+    db.prepare('SELECT committed_until FROM sync_state WHERE shop_id=?').get(shopId).committed_until === obs2);
 
   // リース奪取: fetchNew 中に別ジョブへリースが移ったらコミット破棄+奪取側のリースを消さない
   const stolenToken = 'stolen-token-xyz';

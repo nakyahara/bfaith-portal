@@ -215,9 +215,12 @@ export async function runSync(shopId, adapter, opts = {}) {
     const fetched = await adapter.fetchNew({ sinceIso, untilIso: nowIso, cursor: st.sync_cursor });
     const items = fetched?.inquiries || [];
 
-    // committed_until はアダプターが完全列挙を保証した時刻まで (observedUntil。省略時は untilIso=now。§8.1)
+    // committed_until はアダプターが完全列挙を保証した時刻まで (observedUntil。省略時は untilIso=now。§8.1)。
+    // high-water mark なので単調増加 (既存値より後退させない。Codexレビュー反映)
     const observedIso = fetched?.observedUntil ? toUtcIso(fetched.observedUntil) : nowIso;
-    const committedIso = observedIso < nowIso ? observedIso : nowIso;
+    const boundedObservedIso = observedIso < nowIso ? observedIso : nowIso;
+    const committedIso = st.committed_until && st.committed_until > boundedObservedIso
+      ? st.committed_until : boundedObservedIso;
 
     const totals = { inquiries: items.length, newInquiries: 0, newMessages: 0, reopened: 0 };
     const tx = db.transaction(() => {
