@@ -123,7 +123,13 @@ const urlLow = itemUrl('709q-imp1-bbbb', 10000016, 1002);
   ]);
   const out = importReviewFile(db, { name: 'imp3.csv', buffer: buf, sha256: sha(buf) });
   check('編集は update=1', out.status === 'ok' && out.results[0].updated === 1, JSON.stringify(out.results));
-  check('編集での低評価化は「新規」通知に含めない (Codex: 編集で再付与しない と整合)', out.newLowRatings.length === 0);
+  check('編集で★3以上→★2以下の遷移は通知対象 (Codex R4)', out.newLowRatings.length === 1 && out.newLowRatings[0].rating === 1);
+  const q = db.prepare(`SELECT COUNT(*) c FROM rakuten_review_low_notify_queue`).get().c;
+  check('遷移分がキューに積まれる (計2件)', q === 2, `queue=${q}`);
+  // ★2以下のまま編集しても再通知しない
+  const buf2 = csvOf([row({ url: urlLow, rating: 1, name: '肉球クリーム 30g', body: 'さらに編集', ts: '2026/7/11 10:00:00', order: '373343-20260711-0200000002' })]);
+  const out2 = importReviewFile(db, { name: 'imp3b.csv', buffer: buf2, sha256: sha(buf2) });
+  check('★2以下のままの編集は再通知しない', out2.status === 'ok' && out2.newLowRatings.length === 0, JSON.stringify(out2.newLowRatings));
   const cur = db.prepare(`SELECT rating, body FROM fact_rakuten_reviews WHERE review_url = ?`).get(urlA);
   check('current が最新状態', cur.rating === 1 && cur.body.includes('編集後'));
   const rev = db.prepare(`SELECT COUNT(*) c FROM fact_rakuten_review_revisions WHERE review_url = ?`).get(urlA).c;
@@ -159,8 +165,8 @@ console.log('=== 3. 集計projection (sync-rakuten-review-daily の SELECT と�
   const cols = new Set(rows.flatMap((r) => Object.keys(r)));
   check('projection に本文/注文番号/URL列が無い (非PII)',
     !cols.has('body') && !cols.has('order_number') && !cols.has('review_url'));
-  const low = rows.find((r) => r.item_id === 10000016 && r.rating === 2);
-  check('★2 の集計が正しい', low && low.review_count === 1, JSON.stringify(low));
+  const low = rows.find((r) => r.item_id === 10000016);
+  check('★2→★1 編集後の集計は★1に計上', low && low.rating === 1 && low.review_count === 1, JSON.stringify(low));
   // urlA は編集で★1になった → ★1 に計上され★5にはいない
   const edited = rows.find((r) => r.item_id === 10000355);
   check('編集後の★で集計される', edited && edited.rating === 1, JSON.stringify(edited));
@@ -170,7 +176,7 @@ console.log('=== 4. 取込ログ ===');
 {
   const logs = db.prepare(`SELECT status, COUNT(*) c FROM raw_rakuten_review_import_log GROUP BY status ORDER BY status`).all();
   const m = Object.fromEntries(logs.map((l) => [l.status, l.c]));
-  check('取込ログが揃う (ok/duplicate/error)', m.ok === 3 && m.duplicate === 1 && m.error === 1, JSON.stringify(m));
+  check('取込ログが揃う (ok/duplicate/error)', m.ok === 4 && m.duplicate === 1 && m.error === 1, JSON.stringify(m));
 }
 
 db.close();

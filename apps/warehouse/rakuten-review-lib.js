@@ -241,7 +241,7 @@ export function importReviewFile(db, { name, buffer, sha256, source = 'incoming'
     return { status: 'error', results: [{ file: name, ok: false, error: prepared.error }], newLowRatings: [] };
   }
 
-  const selectStmt = db.prepare(`SELECT review_url, source_hash FROM fact_rakuten_reviews WHERE review_url = ?`);
+  const selectStmt = db.prepare(`SELECT review_url, source_hash, rating FROM fact_rakuten_reviews WHERE review_url = ?`);
   const insertStmt = db.prepare(`
     INSERT INTO fact_rakuten_reviews (
       review_url, review_type, item_id, item_name, rating, posted_at, date_jst,
@@ -308,6 +308,15 @@ export function importReviewFile(db, { name, buffer, sha256, source = 'incoming'
         updateStmt.run(params);
         revisionStmt.run(rec.review_url, now, rec.source_hash, rec.rating, rec.posted_at);
         updated++;
+        // 編集で★3以上→★2以下へ低下した遷移も運用通知の対象 (Codex R4 High)。
+        // ★2以下のままの編集は再通知しない (INSERT OR IGNORE でも review_url PK が防ぐ)
+        if (rec.rating <= 2 && existing.rating > 2) {
+          enqueueLowStmt.run(rec.review_url, rec.review_type, rec.item_name, rec.rating, rec.posted_at, now);
+          newLowRatings.push({
+            review_url: rec.review_url, review_type: rec.review_type,
+            item_name: rec.item_name, rating: rec.rating, posted_at: rec.posted_at,
+          });
+        }
       } else {
         touchStmt.run(now, rec.review_url);
         unchanged++;
