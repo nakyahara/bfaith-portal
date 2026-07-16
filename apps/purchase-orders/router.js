@@ -7781,7 +7781,11 @@ function load() {
   ensureGroups(function() {
     fetch('/apps/purchase-orders/api/masters/' + reqTab).then(function(r){ return r.json(); })
       .then(function(j) {
-        if (seq !== MLOAD_SEQ || TAB !== reqTab) return;
+        if (seq !== MLOAD_SEQ || TAB !== reqTab) {
+          // 破棄した応答に紐づくスクロール復元も捨てる (後で元タブに戻ったとき古い位置に飛ばない、Codex attrs-R2 Medium)
+          if (SCROLL_RESTORE && SCROLL_RESTORE.tab === reqTab) SCROLL_RESTORE = null;
+          return;
+        }
         if (j.ok) render(j.rows); else document.getElementById('tabBody').textContent = j.error;
       });
   });
