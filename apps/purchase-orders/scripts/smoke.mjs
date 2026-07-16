@@ -3650,6 +3650,55 @@ console.log('── P17 欠品リスク ──');
   ok(navHtml.includes('/apps/purchase-orders/shortage-risk'), 'navに欠品リスクタブ');
 }
 
+// ═══ 商品紐付けタブの全商品既定表示 (中原さん要望 2026-07-16) ═══
+console.log('── 商品紐付け: 全商品既定表示+フィルタ維持 ──');
+{
+  r = await j('/api/masters/attrs');
+  ok(r.body.ok, 'attrs GET: 200');
+  const rows = r.body.rows;
+  // 未紐付けの取扱中商品も行として返る (グループ空欄+linked=false+商品名/仕入先名つき)
+  const hori = rows.find(x => x.product_key === 'horikoshi-item');
+  ok(hori && hori.linked === false && hori.condition_id == null && hori.商品名 === '掘り起こし対象商品' && hori.仕入先名.length > 0,
+    'attrs: 未紐付けの取扱中商品が行として返る (linked=false)', hori && { l: hori.linked, n: hori.商品名 });
+  // 紐付け済みは linked=true でattrs値を保持
+  const oil2 = rows.find(x => x.product_key === 'diyorangeoil100');
+  ok(oil2 && oil2.linked === true && oil2.material_group_id === 'mokouorange', 'attrs: 紐付け済み行は値を保持 (linked=true)');
+  // セット商品と「未紐付け×取扱中止」は出さない
+  ok(!rows.some(x => x.product_key === 'set-2pack'), 'attrs: セット商品は出さない');
+  ok(!rows.some(x => x.product_key === 'teishi-item'), 'attrs: 未紐付け×取扱中止は出さない');
+  // PMLに無い紐付け済み商品は pmlMissing で残す
+  await j('/api/masters/attrs', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ product_code: 'ghost-item-x', case_group: 'GX' }) });
+  r = await j('/api/masters/attrs');
+  const ghost = r.body.rows.find(x => x.product_key === 'ghost-item-x');
+  ok(ghost && ghost.linked === true && ghost.pmlMissing === true, 'attrs: PML外の紐付け済み商品はpmlMissingで残す', ghost && ghost.pmlMissing);
+  ok(r.body.rows.every((x, i, a) => i === 0 || a[i - 1].product_key <= x.product_key), 'attrs: 商品コード順 (バイナリ順)');
+  // PMLに同一コードが「取扱中止→取扱中」の順で重複していても取扱中を採用 (行順依存で消えない)
+  db.prepare(`INSERT INTO mirror_pml_snapshot_rows (run_id, 商品コード, 商品名, 仕入先, 取扱区分, 売上分類, 総在庫数_引当なし, 注残数, 販売数7日_合計, 販売数30日_合計)
+    VALUES ('run_test', 'dup-case-item', '重複コード旧', '0001', '取扱中止', 2, 0, 0, 0, 0)`).run();
+  db.prepare(`INSERT INTO mirror_pml_snapshot_rows (run_id, 商品コード, 商品名, 仕入先, 取扱区分, 売上分類, 総在庫数_引当なし, 注残数, 販売数7日_合計, 販売数30日_合計)
+    VALUES ('run_test', 'DUP-CASE-ITEM', '重複コード新', '0001', '取扱中', 2, 5, 0, 0, 0)`).run();
+  r = await j('/api/masters/attrs');
+  const dup = r.body.rows.find(x => x.product_key === 'dup-case-item');
+  ok(dup && dup.active === true && dup.商品名 === '重複コード新', 'attrs: 重複コードは取扱中の行を優先 (行順非依存)', dup && dup.商品名);
+  // 空保存ガード: 未紐付け商品を全欄空のまま保存しても空のattrs行 (=紐付け済み扱い) を作らない
+  r = await j('/api/masters/attrs', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ product_code: 'horikoshi-item' }) });
+  ok(r.status === 400 && r.body.error.includes('空'), 'attrs: 新規×全空欄の保存は400 (linked化させない)', r.body.error);
+  // 未紐付け行への保存=そのまま紐づけ (upsert)
+  r = await j('/api/masters/attrs', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ product_code: 'horikoshi-item', condition_id: 'testcond' }) });
+  ok(r.status === 200, 'attrs: 未紐付け行の保存でそのまま紐づけ');
+  r = await j('/api/masters/attrs');
+  ok(r.body.rows.find(x => x.product_key === 'horikoshi-item').linked === true, 'attrs: 紐づけ後は linked=true');
+  db.prepare("DELETE FROM po_product_attrs WHERE product_key IN ('ghost-item-x','horikoshi-item')").run(); // 後続テストへの影響を消す
+  // UI: チップ+フィルタ維持+スクロール復元
+  const adminHtmlA = await (await fetch(base + '/admin')).text();
+  ok(adminHtmlA.includes('data-attrview') && adminHtmlA.includes('未紐付け ') && adminHtmlA.includes('FILT_Q') && adminHtmlA.includes('SCROLL_RESTORE'),
+    '/admin 商品紐付けUI (チップ+フィルタ維持+スクロール復元)');
+  ok(adminHtmlA.includes('applyMasterFilter'), '/admin フィルタはタブ状態と組み合わせて適用');
+}
+
 // ═══ 全ページのインラインJS構文チェック (サーバtemplate literal内クライアントJSの括弧崩れ等を機械検出) ═══
 console.log('── ページ内スクリプトの構文チェック ──');
 {

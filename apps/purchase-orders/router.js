@@ -2268,7 +2268,46 @@ router.get('/api/masters/:kind', (req, res) => {
   try {
     let rows = getDB().prepare(`SELECT * FROM ${def.table} ORDER BY ${def.pk}`).all();
     // 人間が読める名前を付与 (商品コード/IDだけでは探せない、ユーザビリティ)
-    if (req.params.kind === 'attrs' || req.params.kind === 'selectable') {
+    if (req.params.kind === 'attrs') {
+      // 全商品を既定表示 (中原さん要望 2026-07-16): PMLの取扱中×非セット商品を全部返し、未紐付けは
+      // attrs空欄の行として出す — 一覧から直接グループを入れて保存すればそのまま紐づけできる。
+      // 「追加」行への手打ちや未紐付けタブ (閲覧専用) を経由しなくてよい
+      const supName = new Map();
+      for (const s of getDB().prepare('SELECT supplier_code, name FROM po_suppliers').all()) supName.set(s.supplier_code, s.name);
+      const byKey = new Map(rows.map(r => [r.product_key, r]));
+      // PMLに同一正規化コードが複数行あるケースは「取扱中を優先」で1行に集約する
+      // (行順依存で取扱中止が勝つと未紐付け商品が消える、Codex attrs-R1)
+      const pmlByKey = new Map();
+      for (const r of loadPml().rows) {
+        if (String(r['商品区分'] || '') === 'セット') continue; // セット商品は発注計算の対象外 (#519)
+        const key = normProductCode(r['商品コード']);
+        const active = String(r['取扱区分'] || '') === '取扱中';
+        const cur = pmlByKey.get(key);
+        if (!cur || (active && !cur.active)) pmlByKey.set(key, { r, active });
+      }
+      const out = [];
+      for (const [key, { r, active }] of pmlByKey) {
+        const a = byKey.get(key);
+        if (!a && !active) continue; // 未紐付け×取扱中止はノイズなので出さない (紐付け済みなら残す)
+        out.push({
+          product_key: key, product_code: a ? a.product_code : String(r['商品コード']).trim(),
+          condition_id: a ? a.condition_id : null, material_group_id: a ? a.material_group_id : null,
+          capacity_per_unit: a ? a.capacity_per_unit : null, case_group: a ? a.case_group : null,
+          case_lot: a ? a.case_lot : null,
+          商品名: r['商品名'] || '', 仕入先名: supName.get(normSupplierCode(r['仕入先'])) || '',
+          linked: !!a, active,
+        });
+      }
+      // attrsにあるがPMLに無い商品 (コード改廃等) も消さずに出す
+      for (const a of rows) {
+        if (pmlByKey.has(a.product_key)) continue;
+        out.push({ ...a, 商品名: '', 仕入先名: '', linked: true, active: false, pmlMissing: true });
+      }
+      // 商品コード順 (ロケール非依存のバイナリ順、Codex attrs-R1 Low)
+      out.sort((x, y) => (x.product_key < y.product_key ? -1 : x.product_key > y.product_key ? 1 : 0));
+      return res.json({ ok: true, rows: out });
+    }
+    if (req.params.kind === 'selectable') {
       const nameByKey = new Map();
       for (const r of loadPml().rows) nameByKey.set(normProductCode(r['商品コード']), r['商品名'] || '');
       rows = rows.map(r => ({ ...r, 商品名: nameByKey.get(r.product_key) || '' }));
@@ -2288,6 +2327,14 @@ router.post('/api/masters/:kind', (req, res) => {
     const row = def.fromBody(req.body || {});
     const err = def.validate(row);
     if (err) return res.status(400).json({ ok: false, error: err });
+    // 商品紐付け: 未紐付け商品の「全部空欄のまま保存」で空のattrs行 (=紐付け済み扱い) を作らせない
+    // (全商品既定表示で未紐付け行も保存ボタンを持つため。既存行の全空更新は従来どおり許容、Codex attrs-R1 High)
+    if (req.params.kind === 'attrs'
+      && row.condition_id == null && row.material_group_id == null && row.capacity_per_unit == null
+      && row.case_group == null && row.case_lot == null
+      && !getDB().prepare('SELECT 1 FROM po_product_attrs WHERE product_key=?').get(row.product_key)) {
+      return res.status(400).json({ ok: false, error: 'グループ・容量・ケースが全て空です (空のままでは紐付けになりません)' });
+    }
     upsertMasterRow(def, row);
     res.json({ ok: true });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
@@ -7403,7 +7450,7 @@ var DEFS = {
   materials: { title: '原料グループ', cols: [
     { k: 'group_id', l: '原料グループID', pk: 1 }, { k: 'name', l: '原料グループ名' }, { k: 'min_order_qty', l: '最低発注量', num: 1 }, { k: 'unit', l: '単位' } ] },
   attrs: { title: '商品紐付け', cols: [
-    { k: 'product_code', l: '商品コード', pk: 1 }, { k: '商品名', l: '商品名', ro: 1 },
+    { k: 'product_code', l: '商品コード', pk: 1 }, { k: '商品名', l: '商品名', ro: 1 }, { k: '仕入先名', l: '仕入先', ro: 1 },
     { k: 'condition_id', l: '発注条件グループ (名前で検索可)', dl: 'conds' }, { k: 'material_group_id', l: '原料グループ (名前で検索可)', dl: 'mats' },
     { k: 'capacity_per_unit', l: '容量/個', num: 1 }, { k: 'case_group', l: 'ケースグループ' }, { k: 'case_lot', l: 'ケースロット', num: 1 } ] },
   selectable: { title: '選べるセット構成商品 (在庫+注残≦最低在庫で要発注入り。最低在庫 空欄=既定10)', cols: [
@@ -7494,11 +7541,36 @@ function cellHtml(c, val) {
   if (c.dl) return '<td><input type="text" list="dl_' + c.dl + '" data-k="' + c.k + '" style="width:98%" value="' + esc(groupLabelOf(c.dl, val)) + '" placeholder="名前でもIDでも"></td>';
   return '<td' + (' contenteditable data-k="' + c.k + '"') + (c.num ? ' class="r"' : '') + '>' + esc(val == null ? '' : val) + '</td>';
 }
+var FILT_Q = {};        // タブごとの絞り込み文字列 (保存→再描画してもフィルタを維持する、中原さん要望 2026-07-16)
+var ATTR_VIEW = 'all';  // 商品紐付けタブのチップ: all / unlinked / linked
+var SCROLL_RESTORE = null; // {tab, y} 保存/削除→再描画後にスクロール位置を戻す (同じタブのときだけ)
+function applyMasterFilter() {
+  var q = (FILT_Q[TAB] || '').trim().toLowerCase();
+  var shown = 0;
+  document.querySelectorAll('#mtable tr[data-row]').forEach(function(tr) {
+    var okChip = TAB !== 'attrs' || ATTR_VIEW === 'all' || tr.getAttribute('data-linked') === (ATTR_VIEW === 'linked' ? '1' : '0');
+    // 検索対象は行生成時に作った data-search (毎入力での全セル走査は数千行で重い、Codex attrs-R1 Medium)
+    var show = okChip && (!q || (tr.getAttribute('data-search') || '').indexOf(q) >= 0);
+    tr.style.display = show ? '' : 'none';
+    if (show) shown++;
+  });
+  var cnt = document.getElementById('filterCount');
+  if (cnt) cnt.textContent = q || (TAB === 'attrs' && ATTR_VIEW !== 'all') ? '表示中 ' + shown + '件' : '';
+}
 function render(rows) {
   var def = DEFS[TAB];
   var h = dlHtml();
-  h += '<div class="toolbar"><span class="muted">' + rows.length + ' 件 — セルを直接編集して「保存」／最上行から追加</span>' +
-    '<input type="text" id="filter" placeholder="🔍 商品名・コード・グループ名で絞り込み" style="margin-left:auto;min-width:260px"></div>';
+  var head = rows.length + ' 件 — セルを直接編集して「保存」／最上行から追加';
+  var chipsHtml = '';
+  if (TAB === 'attrs') {
+    var nUnlinked = rows.filter(function(r){ return !r.linked; }).length;
+    head = '全商品 ' + rows.length + ' 件 (未紐付け ' + nUnlinked + ') — グループを入れて「保存」すればそのまま紐づけできます';
+    chipsHtml = [['all', '全て ' + rows.length], ['unlinked', '未紐付け ' + nUnlinked], ['linked', '紐付け済み ' + (rows.length - nUnlinked)]]
+      .map(function(c){ return '<button class="' + (ATTR_VIEW === c[0] ? 'pri' : 'ghost') + ' sm" data-attrview="' + c[0] + '">' + c[1] + '</button>'; }).join(' ');
+  }
+  h += '<div class="toolbar" style="flex-wrap:wrap;gap:6px"><span class="muted">' + head + '</span>' + chipsHtml +
+    '<span class="muted" id="filterCount" style="margin-left:auto"></span>' +
+    '<input type="text" id="filter" placeholder="🔍 商品名・コード・グループ名で絞り込み" style="min-width:260px" value="' + esc(FILT_Q[TAB] || '') + '"></div>';
   h += '<table class="t" id="mtable"><thead><tr>' + def.cols.map(function(c){ return '<th' + (c.num ? ' class="r"' : '') + '>' + c.l + '</th>'; }).join('') + '<th></th></tr></thead><tbody>';
   h += '<tr>' + def.cols.map(function(c) {
     if (c.ro) return '<td class="muted">(自動)</td>';
@@ -7506,21 +7578,37 @@ function render(rows) {
     return '<td><input type="text" style="width:98%" id="new_' + c.k + '"' + (c.dl ? ' list="dl_' + c.dl + '" placeholder="名前でもIDでも"' : '') + '></td>';
   }).join('') + '<td><button class="pri sm" id="btnAdd">追加</button></td></tr>';
   rows.forEach(function(r) {
-    h += '<tr data-row="1">' + def.cols.map(function(c) {
-      if (c.pk) return '<td>' + esc(r[c.k] == null ? '' : r[c.k]) + '</td>';
+    var attrsMeta = TAB === 'attrs' ? ' data-linked="' + (r.linked ? '1' : '0') + '"' : '';
+    // 検索用テキストを行生成時に正規化して埋め込む (グループはID+名前の両方で当たるように)
+    var searchTxt = def.cols.map(function(c) {
+      var v = r[c.k];
+      return c.dl ? groupLabelOf(c.dl, v) : (v == null ? '' : String(v));
+    }).join(' ').toLowerCase();
+    h += '<tr data-row="1" data-search="' + esc(searchTxt) + '"' + attrsMeta + (TAB === 'attrs' && !r.linked ? ' style="background:#fffbeb"' : '') + '>' + def.cols.map(function(c) {
+      if (c.pk) {
+        var badge = '';
+        if (TAB === 'attrs') {
+          if (!r.linked) badge = ' <span class="badge b-warn" title="どのグループにも未紐付け (グループ対象外の商品はそのままでOK)">未紐付け</span>';
+          else if (r.pmlMissing) badge = ' <span class="badge b-draft" title="PML (商品管理リスト) に見つからない商品 (コード改廃?)">PML外</span>';
+          else if (!r.active) badge = ' <span class="badge b-draft">取扱中止</span>';
+        }
+        return '<td>' + esc(r[c.k] == null ? '' : r[c.k]) + badge + '</td>';
+      }
       return cellHtml(c, r[c.k]);
-    }).join('') + '<td style="white-space:nowrap"><button class="ghost" data-save="' + esc(r[def.cols[0].k]) + '">保存</button><button class="ghost" data-rm="' + esc(r[def.cols[0].k]) + '">削除</button></td></tr>';
+    }).join('') + '<td style="white-space:nowrap"><button class="ghost" data-save="' + esc(r[def.cols[0].k]) + '">保存</button>' +
+      (TAB === 'attrs' && !r.linked ? '' : '<button class="ghost" data-rm="' + esc(r[def.cols[0].k]) + '">削除</button>') + '</td></tr>';
   });
   h += '</tbody></table>';
   document.getElementById('tabBody').innerHTML = h;
+  var filtTimer = null;
   document.getElementById('filter').addEventListener('input', function(ev) {
-    var q = ev.target.value.trim().toLowerCase();
-    document.querySelectorAll('#mtable tr[data-row]').forEach(function(tr) {
-      var txt = tr.textContent.toLowerCase();
-      tr.querySelectorAll('input[data-k]').forEach(function(inp){ txt += ' ' + inp.value.toLowerCase(); });
-      tr.style.display = !q || txt.indexOf(q) >= 0 ? '' : 'none';
-    });
+    FILT_Q[TAB] = ev.target.value;
+    clearTimeout(filtTimer);
+    filtTimer = setTimeout(applyMasterFilter, 200); // 数千行の全行走査を毎キーで走らせない
   });
+  applyMasterFilter();
+  if (SCROLL_RESTORE && SCROLL_RESTORE.tab === TAB) window.scrollTo(0, SCROLL_RESTORE.y);
+  SCROLL_RESTORE = null;
 }
 function renderUnlinked(j) {
   var h = '<div class="toolbar">' +
@@ -7682,14 +7770,24 @@ document.getElementById('bcImpForm').addEventListener('submit', function(ev) {
     }).catch(function(e){ document.getElementById('bcImpStatus').textContent = ''; alert('通信エラー: ' + e.message); });
 });
 
+var MLOAD_SEQ = 0;
 function load() {
   if (TAB === 'unlinked') { loadUnlinked(60); return; }
   if (TAB === 'vendormap') { loadVmap(); return; }
   if (TAB === 'barcode') { loadBarcode(); return; }
+  // 世代ガード: 素早いタブ切替で古いGET応答が現在タブのrenderに渡らないように (Codex attrs-R1 Medium)
+  var seq = ++MLOAD_SEQ, reqTab = TAB;
   document.getElementById('tabBody').textContent = '読み込み中…';
   ensureGroups(function() {
-    fetch('/apps/purchase-orders/api/masters/' + TAB).then(function(r){ return r.json(); })
-      .then(function(j){ if (j.ok) render(j.rows); else document.getElementById('tabBody').textContent = j.error; });
+    fetch('/apps/purchase-orders/api/masters/' + reqTab).then(function(r){ return r.json(); })
+      .then(function(j) {
+        if (seq !== MLOAD_SEQ || TAB !== reqTab) {
+          // 破棄した応答に紐づくスクロール復元も捨てる (後で元タブに戻ったとき古い位置に飛ばない、Codex attrs-R2 Medium)
+          if (SCROLL_RESTORE && SCROLL_RESTORE.tab === reqTab) SCROLL_RESTORE = null;
+          return;
+        }
+        if (j.ok) render(j.rows); else document.getElementById('tabBody').textContent = j.error;
+      });
   });
 }
 
@@ -7914,6 +8012,15 @@ document.addEventListener('click', function(ev) {
       }).catch(function(e){ toast('通信エラー: ' + e.message); });
     return;
   }
+  var attrView = t.getAttribute && t.getAttribute('data-attrview');
+  if (attrView) {
+    ATTR_VIEW = attrView;
+    document.querySelectorAll('[data-attrview]').forEach(function(b) {
+      b.className = (b.getAttribute('data-attrview') === attrView ? 'pri' : 'ghost') + ' sm';
+    });
+    applyMasterFilter();
+    return;
+  }
   if (t.id === 'btnAdd') {
     var def = DEFS[TAB], b = {};
     def.cols.forEach(function(c) {
@@ -7941,20 +8048,30 @@ document.addEventListener('click', function(ev) {
   var rmKey = t.getAttribute && t.getAttribute('data-rm');
   if (rmKey != null) {
     if (!confirm('削除しますか? ' + rmKey)) return;
-    fetch('/apps/purchase-orders/api/masters/' + TAB + '/' + encodeURIComponent(rmKey), { method: 'DELETE' })
+    var rmTab = TAB; // 応答前のタブ切替対策 (postと同じ)
+    fetch('/apps/purchase-orders/api/masters/' + rmTab + '/' + encodeURIComponent(rmKey), { method: 'DELETE' })
       .then(function(r){ return r.json(); }).then(function(j) {
-        if (j.ok) { toast('削除しました'); if (TAB === 'conditions' || TAB === 'materials') GROUPS = null; load(); }
-        else toast(j.error);
+        if (j.ok) {
+          toast('削除しました');
+          if (rmTab === 'conditions' || rmTab === 'materials') GROUPS = null;
+          if (TAB !== rmTab) return;
+          SCROLL_RESTORE = { tab: rmTab, y: window.scrollY };
+          load();
+        } else toast(j.error);
       });
   }
 });
 function post(b) {
-  fetch('/apps/purchase-orders/api/masters/' + TAB, {
+  // 開始時点のタブを捕捉 (応答前にタブ切替しても別タブを誤って再読込・スクロールしない、Codex attrs-R1 Medium)
+  var reqTab = TAB;
+  fetch('/apps/purchase-orders/api/masters/' + reqTab, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b),
   }).then(function(r){ return r.json(); }).then(function(j) {
     if (j.ok) {
       toast('保存しました');
-      if (TAB === 'conditions' || TAB === 'materials') GROUPS = null; // グループ名キャッシュを更新
+      if (reqTab === 'conditions' || reqTab === 'materials') GROUPS = null; // グループ名キャッシュを更新
+      if (TAB !== reqTab) return; // 別タブへ移動済みなら再描画しない (戻ったときのloadで最新化される)
+      SCROLL_RESTORE = { tab: reqTab, y: window.scrollY }; // 再描画後も同じ位置・同じフィルタで作業を続けられるように (中原さん要望)
       load();
     } else toast('エラー: ' + j.error);
   });
