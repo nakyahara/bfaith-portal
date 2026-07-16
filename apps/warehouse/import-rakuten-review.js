@@ -135,7 +135,8 @@ try {
     const outcome = importReviewFile(db, { name, buffer, sha256, source: 'incoming' });
     for (const r of outcome.results) {
       if (r.ok) {
-        console.log(`  ✓ ${r.file}: ${r.label} (insert ${r.inserted} / update ${r.updated} / 変化なし ${r.unchanged}) ${r.date_from}〜${r.date_to}`);
+        const delNote = (r.missed || r.deleted) ? ` / 不在+1 ${r.missed} / 削除確定 ${r.deleted}` : '';
+        console.log(`  ✓ ${r.file}: ${r.label} (insert ${r.inserted} / update ${r.updated} / 変化なし ${r.unchanged}${delNote}) ${r.date_from}〜${r.date_to}`);
         for (const w of r.warnings || []) console.log(`    ⚠ ${w}`);
       } else {
         console.log(`  ${r.duplicate ? '↷' : '✗'} ${r.file}: ${r.error}`);

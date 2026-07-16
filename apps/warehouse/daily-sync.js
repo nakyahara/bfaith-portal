@@ -611,6 +611,15 @@ async function main() {
       console.log('[DailySync] 楽天レビュー sync は取込失敗のためスキップ (failed/ を確認、修正後に再投入)');
     }
 
+    // === 楽天レビュー contacts 取得 (mall-csv-fetcher P2 PR-B、らくらくーぽん置換) ===
+    // 発送日直近25日の注文の「マスクメールアドレス+最終発送日」を暗号化保存 (フォローメールPR-Cの材料)。
+    // miniPC内で完結し mirror へは送らない。終了時に期限超過分の purge も実行
+    const reviewContactsResult = runScript(
+      `apps/warehouse/fetch-rakuten-review-contacts.js fetch --data-dir ${DATA_DIR_ARG} --days 25`,
+      '楽天レビューcontacts 取得', 900000
+    );
+    results.push({ name: '楽天レビューcontacts 取得', ...reviewContactsResult });
+
     // === Yahoo!ストクリ統計CSV 取込 + mirror sync (mall-csv-fetcher P1-Y) ===
     // 自動DL (yahoo-data-download.mjs、fetch-all 05:30) が incoming/yahoo-data/ に置いた
     // CSVを取り込む。対象0件は正常。--days 110 = 全体分析の一括100日レンジをカバー
