@@ -21,7 +21,11 @@ const RETRY_STATE_FILE = path.join(PROJECT_DIR, 'data', 'daily-sync-retry-state.
 // Codex Round 1 #2: 'Amazon finance sync' は RETRYABLE_JOBS に入れない。
 //   sync 単独 retry すると build やり直さずに古い fact を sync する事故になる。
 //   build を retryable に残し、sync は build 成功時のみ実行 (依存連鎖は cron 単位で完結)。
-const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build'];
+// 'Amazon手数料' (fetch-amazon-fees.js) を追加 (2026-07-16 障害対応):
+//   07:00 の SP-API 混雑帯で一過性失敗しても同日 retry されず、TTL(168h) 超過した高額 SKU が
+//   数日累積して手数料カバー率が 69.84% まで崩壊した (incident_amazon_fee_coverage_no_retry)。
+//   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
+const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
@@ -76,6 +80,7 @@ function runScript(scriptPath, label, timeoutMs = 600000) {
   // 旧仕様互換: 引数なしなら '7' を強制 (一部スクリプトが days 指定として受け取る)
   if (scriptArgs.length === 0) scriptArgs.push('7');
   console.log(`\n=== ${label} ===`);
+  const startedAt = Date.now();
   try {
     // execFileSync(node, [...]) で直接 node を起動 (cmd.exe を経由しない)
     // → timeout 時に確実に node 本体が SIGTERM で殺される
@@ -102,8 +107,34 @@ function runScript(scriptPath, label, timeoutMs = 600000) {
     const lastLine = lines[lines.length - 1] || '';
     return { success: true, summary: lastLine };
   } catch (e) {
-    console.error(`[${label}] エラー:`, e.message);
-    return { success: false, summary: extractErrorSummary(e.message) };
+    // 観測性 (2026-07-16 障害対応、Codex 指摘 Critical):
+    //   execFileSync 失敗時 e.message は "Command failed: node ..." のみ。子の stdout/stderr・
+    //   exit status・signal は e に別プロパティで残る (捨てられていない)。これらを残さないと
+    //   「timeout kill (signal=SIGTERM) / 子の非ゼロ終了 (status=1) / spawn 失敗 / maxBuffer 超過」
+    //   を後から判別できず、単日の失敗原因が特定不能になる (今回まさにこれで確定できなかった)。
+    const elapsedMs = Date.now() - startedAt;
+    // 子出力は末尾 tail のみ扱う (全量 64MiB を再連結すると失敗処理中にメモリ増幅、Codex R2 #4)。
+    const tail = (s, n) => String(s ?? '').trim().split('\n').slice(-n).join('\n');
+    const errTail = tail(e.stderr, 20);
+    const outTail = tail(e.stdout, 20);
+    const meta = `status=${e.status ?? 'null'} signal=${e.signal ?? 'null'} code=${e.code ?? 'null'} elapsed=${Math.round(elapsedMs / 1000)}s`;
+    const diagLines = [
+      `[${label}] エラー: ${e.message} (${meta})`,
+      errTail && `--- ${label} stderr(tail) ---\n${errTail}`,
+      outTail && `--- ${label} stdout(tail) ---\n${outTail}`,
+    ].filter(Boolean);
+    console.error(diagLines.join('\n'));  // ローカルログには full-ish な tail を残す
+    // GChat summary は message + meta + 子ログ tail を明示構成し ~400 字で cap。
+    //   extractErrorSummary の「Error 始まりの行を優先」に依存すると、子ログが
+    //   `[3/10] Error after 3 retries:` 形式で拾えず meta が落ちる (Codex R2 #5)。→ meta を先頭固定。
+    //   per-job summary を抑えることで、多重失敗時の集約メッセージ肥大 (Codex R2 High #1) も緩和。
+    //   meta を本当に先頭に置く (Codex R3 High): e.message が長い場合でも 400字cap で
+    //   signal/status が落ちないよう、診断上最重要な meta を先頭固定にする。
+    const rootish = errTail || outTail || '';
+    const head = `${meta} | ${e.message}`;
+    let summary = rootish ? `${head}\n${tail(rootish, 6)}` : head;
+    if (summary.length > 400) summary = summary.slice(0, 388) + '… [trunc]';
+    return { success: false, summary };
   }
 }
 
@@ -1103,8 +1134,15 @@ async function main() {
     for (const w of diskWarnings) msg += `${w}\n`;
   }
 
-  console.log('\n' + msg);
-  await notify(msg);
+  console.log('\n' + msg);  // ローカルログには全文を残す
+  // GChat は 4096 字上限。多重失敗で本文が超えると HTTP 400 で最重要通知そのものが落ちる
+  // (Codex R2 High #1)。上限手前で切り、末尾に切り詰めマーカー + 完全版はログ参照を明示。
+  const GCHAT_MAX = 3900;
+  let notifyMsg = msg;
+  if (notifyMsg.length > GCHAT_MAX) {
+    notifyMsg = notifyMsg.slice(0, GCHAT_MAX) + `\n…[本文を切り詰めました。全文は daily-sync ログ参照]`;
+  }
+  await notify(notifyMsg);
 
   console.log(`[DailySync] 完了: ${endTime.toISOString()}`);
 
