@@ -1778,9 +1778,13 @@ router.post('/api/inbound-plan/mails/:id/po-convert', (req, res) => {
     // kind=other (終売/欠品と読めない※行) はマッチ対象にしない — 挨拶等の※行が減数候補になるのを防ぐ (Codex salonge-R1 High)
     const normEx = exceptions.filter(ex => ex.kind === 'discontinued' || ex.kind === 'shortage')
       .map(ex => ({ ...ex, norm: normJa(ex.text) }));
-    // 「別の出荷連絡での減数」だけを警告する (このメール自身の減数は再変換で残数に反映済み、Codex salonge-R1 Medium)
+    // 「別の出荷連絡での減数」だけを警告する (このメール自身の減数は再変換で残数に反映済み、Codex salonge-R1 Medium)。
+    // 逆仕訳で取り消された減数は表示しない (誤減数を復元したのに警告が残り続けない、Codex salonge-R2 Medium)
     const priorStmt = db.prepare(`SELECT a.mail_id, a.qty, m.received_at FROM po_shipment_mail_adjustments a
-      JOIN po_shipment_mails m ON m.id = a.mail_id WHERE a.order_item_id=? AND a.mail_id<>? ORDER BY a.id`);
+      JOIN po_shipment_mails m ON m.id = a.mail_id
+      WHERE a.order_item_id=? AND a.mail_id<>?
+        AND NOT EXISTS (SELECT 1 FROM po_item_events r WHERE r.reverses_id = a.event_id)
+      ORDER BY a.id`);
     const lines = [];
     let totalRemaining = 0;
     for (const o of chosen) {
@@ -5661,10 +5665,18 @@ function renderPoResult(j) {
         if (!r2.ok) { toast('エラー: ' + r2.error + ' — 全件登録されていません (1件でも失敗すると全体を取り消します)'); return; }
         var closed = (r2.results || []).filter(function(x){ return x.orderClosed; }).length;
         toast((r2.replay ? '(確認) 既に登録済みでした: ' : '減数しました: ') + (r2.results || []).length + '明細' + (closed ? ' / 発注完了 ' + closed + '件' : ''));
-        // 台帳が変わったので同じPO選択で変換し直す (残数・貼り付けデータを最新化)
+        // 台帳が変わったので同じPO選択で変換し直す。古い画面を即座に消す (減数前の数量をコピーさせない) +
+        // 再変換失敗も黙殺しない (Codex salonge-R2 Medium)
+        var area2 = document.getElementById('ipResult');
+        area2.innerHTML = '<div class="muted">減数を登録しました。最新の残数で変換し直しています…</div>';
+        var failMsg = function(detail) {
+          area2.innerHTML = '<div class="warn">⚠️ 減数は登録済みですが、表示の更新に失敗しました (' + esc(detail) + ')。' +
+            'メール一覧の「🔁 変換 (発注書参照)」からやり直してください — <b>古い画面の数量をコピーしないでください</b></div>';
+        };
         post(API + '/inbound-plan/mails/' + j.mailId + '/po-convert', { orderIds: IP_PO_ORDERIDS }).then(function(r3) {
           if (r3.ok) renderPoResult(r3);
-        });
+          else failMsg(r3.error || '取得エラー');
+        }).catch(function(e3){ failMsg('通信エラー: ' + e3.message); });
       }).catch(function(e) {
         btn2.disabled = false;
         toast('通信エラー: ' + e.message + ' — 登録されたか不明です。同じ確認画面からもう一度実行すると二重減数なしで確認できます');

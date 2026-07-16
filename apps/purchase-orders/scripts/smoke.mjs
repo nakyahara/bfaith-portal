@@ -2786,6 +2786,15 @@ console.log('── サロンジェ PO参照 (po_reference) ──');
   // 再解析: po_reference は itemCount=null (オブジェクト形を配列と数えない)
   r = await jpS('/api/inbound-plan/mails/' + salMail2.id + '/reparse');
   ok(r.body.ok && r.body.status === 'new' && r.body.itemCount === null, 'salonge: 再解析の件数はnull (po_reference)', r.body.itemCount);
+  // 逆仕訳した減数は priorAdjustments に出ない (誤減数を復元したのに警告が残らない)
+  {
+    const adjEv = db.prepare('SELECT event_id FROM po_shipment_mail_adjustments WHERE mail_id=? AND order_item_id=?').get(salMail.id, apronItemId);
+    r = await jpS('/api/events/' + adjEv.event_id + '/reverse', { note: '誤減数のため取消 (テスト)' });
+    ok(r.body.ok, 'salonge: 減数イベントを逆仕訳');
+    r = await jpS('/api/inbound-plan/mails/' + salMail2.id + '/po-convert', { orderIds: [salPo1] });
+    const la3 = r.body.lines.find(l => l.orderItemId === apronItemId);
+    ok(la3 && la3.priorAdjustments.length === 0 && la3.remaining === 10, 'salonge: 逆仕訳済みの減数は警告から消える (残数も復元)', la3 && { p: la3.priorAdjustments, rem: la3.remaining });
+  }
 
   // UI配信
   const planHtmlS = await (await fetch(base + '/inbound-plan')).text();
