@@ -5657,30 +5657,43 @@ function renderPoResult(j) {
         sel.map(function(p2){ return '・' + p2.l.poNumber + ' ' + p2.l.productCode + ' −' + p2.qty; }).join('\\n') +
         '\\n\\nよろしいですか? (間違えたら発注残の履歴から↩逆仕訳できます)')) return;
       var btn2 = this; btn2.disabled = true;
-      fetch(API + '/inbound-plan/mails/' + j.mailId + '/apply-adjustments', {
-        method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idemKey },
-        body: JSON.stringify({ entries: sel.map(function(p2){ return { orderItemId: p2.l.orderItemId, qty: p2.qty, note: p2.note }; }) }),
-      }).then(function(r2){ return jsonOrErr(r2, true); }).then(function(r2) {
-        btn2.disabled = false;
-        if (!r2.ok) { toast('エラー: ' + r2.error + ' — 全件登録されていません (1件でも失敗すると全体を取り消します)'); return; }
-        var closed = (r2.results || []).filter(function(x){ return x.orderClosed; }).length;
-        toast((r2.replay ? '(確認) 既に登録済みでした: ' : '減数しました: ') + (r2.results || []).length + '明細' + (closed ? ' / 発注完了 ' + closed + '件' : ''));
-        // 台帳が変わったので同じPO選択で変換し直す。古い画面を即座に消す (減数前の数量をコピーさせない) +
-        // 再変換失敗も黙殺しない (Codex salonge-R2 Medium)
-        var area2 = document.getElementById('ipResult');
-        area2.innerHTML = '<div class="muted">減数を登録しました。最新の残数で変換し直しています…</div>';
-        var failMsg = function(detail) {
-          area2.innerHTML = '<div class="warn">⚠️ 減数は登録済みですが、表示の更新に失敗しました (' + esc(detail) + ')。' +
-            'メール一覧の「🔁 変換 (発注書参照)」からやり直してください — <b>古い画面の数量をコピーしないでください</b></div>';
-        };
-        post(API + '/inbound-plan/mails/' + j.mailId + '/po-convert', { orderIds: IP_PO_ORDERIDS }).then(function(r3) {
-          if (r3.ok) renderPoResult(r3);
-          else failMsg(r3.error || '取得エラー');
-        }).catch(function(e3){ failMsg('通信エラー: ' + e3.message); });
-      }).catch(function(e) {
-        btn2.disabled = false;
-        toast('通信エラー: ' + e.message + ' — 登録されたか不明です。同じ確認画面からもう一度実行すると二重減数なしで確認できます');
-      });
+      // 実行本体 (通信断からの再確認でも同じ関数を同じ冪等キーで呼ぶ → 二重減数なし)
+      var doApply = function() {
+        fetch(API + '/inbound-plan/mails/' + j.mailId + '/apply-adjustments', {
+          method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idemKey },
+          body: JSON.stringify({ entries: sel.map(function(p2){ return { orderItemId: p2.l.orderItemId, qty: p2.qty, note: p2.note }; }) }),
+        }).then(function(r2){ return jsonOrErr(r2, true); }).then(function(r2) {
+          if (btn2) btn2.disabled = false;
+          if (!r2.ok) { toast('エラー: ' + r2.error + ' — 全件登録されていません (1件でも失敗すると全体を取り消します)'); return; }
+          var closed = (r2.results || []).filter(function(x){ return x.orderClosed; }).length;
+          toast((r2.replay ? '(確認) 既に登録済みでした: ' : '減数しました: ') + (r2.results || []).length + '明細' + (closed ? ' / 発注完了 ' + closed + '件' : ''));
+          // 台帳が変わったので同じPO選択で変換し直す。古い画面を即座に消す (減数前の数量をコピーさせない) +
+          // 再変換失敗も黙殺しない (Codex salonge-R2 Medium)
+          var area2 = document.getElementById('ipResult');
+          area2.innerHTML = '<div class="muted">減数を登録しました。最新の残数で変換し直しています…</div>';
+          var failMsg = function(detail) {
+            area2.innerHTML = '<div class="warn">⚠️ 減数は登録済みですが、表示の更新に失敗しました (' + esc(detail) + ')。' +
+              'メール一覧の「🔁 変換 (発注書参照)」からやり直してください — <b>古い画面の数量をコピーしないでください</b></div>';
+          };
+          post(API + '/inbound-plan/mails/' + j.mailId + '/po-convert', { orderIds: IP_PO_ORDERIDS }).then(function(r3) {
+            if (r3.ok) renderPoResult(r3);
+            else failMsg(r3.error || '取得エラー');
+          }).catch(function(e3){ failMsg('通信エラー: ' + e3.message); });
+        }).catch(function(e) {
+          // 送信自体の通信断: サーバ側では登録済みの可能性がある → 古い結果画面 (減数前の数量) を残さず、
+          // 同じ冪等キーでの再確認だけをさせる (Codex salonge-R3 Medium)
+          var area3 = document.getElementById('ipResult');
+          area3.innerHTML = '<div class="warn">⚠️ 通信エラー: ' + esc(e.message) + ' — 減数が登録されたか不明です。' +
+            '下のボタンで同じ内容を再送すると、<b>二重減数なし</b> (同じ冪等キー) で結果を確認できます。' +
+            '<div style="margin-top:6px"><button class="pri" id="plShortRetry">🔁 同じ内容で再確認</button></div></div>';
+          btn2 = null; // 元のボタンはDOMから消えている
+          document.getElementById('plShortRetry').addEventListener('click', function() {
+            this.disabled = true;
+            doApply();
+          });
+        });
+      };
+      doApply();
     });
   });
 }`;
