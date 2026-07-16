@@ -128,7 +128,7 @@ router.get('/', (req, res) => {
 router.get('/inquiries/:id', (req, res) => {
   const id = Number(req.params.id);
   const detail = getInquiryDetail(id);
-  if (!detail) return res.status(404).send(pageShell('問い合わせ管理', '', '<div class="card empty">問い合わせが見つかりません。<a href="/apps/inquiry-hub">一覧に戻る</a></div>', ''));
+  if (!detail) return res.status(404).send(pageShell('問い合わせ管理', 'list', '<div class="card empty">問い合わせが見つかりません。<a href="/apps/inquiry-hub">一覧に戻る</a></div>', ''));
   const { inquiry: inq, messages, attachments, notes, logs, draft } = detail;
   const attByMsg = {};
   for (const a of attachments) (attByMsg[a.inquiry_message_id] = attByMsg[a.inquiry_message_id] || []).push(a);
@@ -267,7 +267,7 @@ router.get('/inquiries/:id', (req, res) => {
       .catch(function(e) { btn.disabled = false; toast('追加失敗: ' + e.message); });
   });`;
 
-  res.send(pageShell(`問い合わせ — ${inq.subject || inq.external_inquiry_id}`, '', body, script));
+  res.send(pageShell(`問い合わせ — ${inq.subject || inq.external_inquiry_id}`, 'list', body, script));
 });
 
 // ─── 操作API (すべて操作ログを記録) ───
@@ -367,21 +367,84 @@ router.post('/api/inquiries/:id/notes', (req, res) => {
   res.json({ ok: true });
 });
 
+// ─── カテゴリ階層ツリー (メールディーラーのグループ階層は ' > ' 区切り。例: 商品についての質問 > エッセンシャルオイル > ハッカ油) ───
+function buildCategoryTree(rows) {
+  const root = { children: new Map(), items: [], total: 0 };
+  for (const r of rows) {
+    const parts = r.category ? String(r.category).split(' > ').map(s => s.trim()).filter(Boolean) : [];
+    let node = root;
+    root.total++;
+    for (const p of parts) {
+      if (!node.children.has(p)) node.children.set(p, { children: new Map(), items: [], total: 0 });
+      node = node.children.get(p);
+      node.total++;
+    }
+    node.items.push(r);
+  }
+  return root;
+}
+
+/**
+ * 階層アコーディオンHTML。デフォルトは第一階層のみ表示 (全グループ閉)。
+ * openAll=true (検索/絞込中や「全て展開」) で全階層+中身を開いた状態で出す。
+ */
+function renderCategoryTree(node, renderItem, openAll, depth = 0) {
+  let html = '';
+  for (const [name, child] of node.children) {
+    html += `<details class="grp"${openAll ? ' open' : ''}>
+      <summary><span class="grp-arrow">▶</span>📁 ${he(name)} <span class="grp-count">${child.total}件</span></summary>
+      <div class="grp-body">${renderCategoryTree(child, renderItem, openAll, depth + 1)}${child.items.map(renderItem).join('')}</div>
+    </details>`;
+  }
+  if (depth === 0 && node.items.length) {
+    html += `<details class="grp"${openAll ? ' open' : ''}>
+      <summary><span class="grp-arrow">▶</span>📁 (グループなし) <span class="grp-count">${node.items.length}件</span></summary>
+      <div class="grp-body">${node.items.map(renderItem).join('')}</div>
+    </details>`;
+  }
+  return html;
+}
+
+/**
+ * カテゴリselectのoption (階層はインデント表示)。
+ * ラベルにフルパスを残す: 別親の同名サブグループ (食品>オイル と 化粧品>オイル) を区別するため (Codexレビュー反映)
+ */
+function categoryOptions(categories, current) {
+  return categories.map(c => {
+    const parts = String(c.category).split(' > ');
+    const label = '　'.repeat(parts.length - 1) + (parts.length > 1 ? '└ ' : '') + parts.join(' › ') + ` (${c.c})`;
+    return `<option value="${he(c.category)}"${String(current || '') === String(c.category) ? ' selected' : ''}>${he(label)}</option>`;
+  }).join('');
+}
+
+// 「全て展開/全て閉じる」ボタン (details.grp を一括開閉)
+const EXPAND_BUTTONS = `
+    <button class="ghost" type="button" id="expandAll">⬇️ 全て展開</button>
+    <button class="ghost" type="button" id="collapseAll">⬆️ 全て閉じる</button>`;
+const EXPAND_SCRIPT = `
+  document.getElementById('expandAll').addEventListener('click', function() {
+    document.querySelectorAll('details.grp').forEach(function(d) { d.open = true; });
+  });
+  document.getElementById('collapseAll').addEventListener('click', function() {
+    document.querySelectorAll('details.grp').forEach(function(d) { d.open = false; });
+  });`;
+
 // ─── テンプレート管理 (メールディーラーCSV取込 + CRUD) ───
 router.get('/templates', (req, res) => {
   const q = req.query || {};
   const { rows, categories } = listTemplates(q);
   const kw = String(q.q || '').trim();
+  const filtering = !!(kw || q.category); // 検索/絞込中は結果がすぐ見えるよう全展開
 
-  const opt = (v, label, cur) => `<option value="${he(v)}"${String(cur || '') === String(v) ? ' selected' : ''}>${he(label)}</option>`;
   const filterBar = `
   <div class="filters">
     <form method="get" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-      <select name="category"><option value="">グループ: 全て</option>${categories.map(c => opt(c.category, `${c.category} (${c.c})`, q.category)).join('')}</select>
+      <select name="category"><option value="">グループ: 全て</option>${categoryOptions(categories, q.category)}</select>
       <input type="search" name="q" value="${he(kw)}" placeholder="テンプレート名/件名/本文/キーワード" style="min-width:240px">
-      <button class="pri">検索</button>
+      <button class="pri">🔍 検索</button>
       <a href="/apps/inquiry-hub/templates" class="ghost btn-link">クリア</a>
     </form>
+    ${EXPAND_BUTTONS}
     <span style="flex:1"></span>
     <button class="ghost" id="newBtn">➕ 新規テンプレート</button>
     <label class="ghost btn-link" style="cursor:pointer">📥 メールディーラーCSV取込<input type="file" id="csvFile" accept=".csv" style="display:none"></label>
@@ -403,13 +466,9 @@ router.get('/templates', (req, res) => {
     </div>
   </div>`;
 
-  let lastCat = Symbol('none');
-  const items = rows.map(r => {
-    const catHead = r.category !== lastCat ? `<div class="cat-head">📁 ${he(r.category || '(グループなし)')}</div>` : '';
-    lastCat = r.category;
-    return `${catHead}
+  const renderTplItem = r => `
     <details class="tpl" id="tpl-${r.id}">
-      <summary><b>${he(r.template_name)}</b>${r.subject ? ` <span class="sub">件名: ${he(r.subject)}</span>` : ''}
+      <summary><span class="tpl-icon">📄</span><b>${he(r.template_name)}</b>${r.subject ? ` <span class="sub">件名: ${he(r.subject)}</span>` : ''}
         <span class="sub" style="margin-left:auto">使用${r.usage_count}回 ・ 更新 ${fmtJst(r.source_updated_at || r.updated_at)}</span></summary>
       <div class="tpl-body">
         ${r.keywords ? `<div class="sub">🔑 ${he(r.keywords)}</div>` : ''}
@@ -423,11 +482,11 @@ router.get('/templates', (req, res) => {
         </div>
       </div>
     </details>`;
-  }).join('');
+  const items = renderCategoryTree(buildCategoryTree(rows), renderTplItem, filtering);
 
   const body = `${filterBar}
   <div class="card" style="padding:12px">
-    <div class="sub" style="margin-bottom:8px">全${rows.length}件${q.category || kw ? ' (絞り込み中)' : ''} — クリックで本文を展開。返信送信機能 (Step 3) 実装までは「📋コピー」でメールディーラー等に貼り付けて使用</div>
+    <div class="sub" style="margin-bottom:8px">全${rows.length}件${filtering ? ' (絞り込み中 — 全グループ展開表示)' : ''} — 📁グループをクリックで開閉、📄テンプレートをクリックで本文表示。返信送信機能 (Step 3) 実装までは「📋コピー」でメールディーラー等に貼り付けて使用</div>
     ${items || '<div class="empty">テンプレートがありません。メールディーラーのエクスポートCSVを「📥CSV取込」から取り込んでください</div>'}
   </div>`;
 
@@ -503,7 +562,8 @@ router.get('/templates', (req, res) => {
         location.reload();
       }).catch(function(e) { toast('取込失敗: ' + e.message); });
     });
-  });`;
+  });
+  ${EXPAND_SCRIPT}`;
   res.send(pageShell('問い合わせ管理 — テンプレート', 'templates', body, script));
 });
 
@@ -512,16 +572,17 @@ router.get('/qa', (req, res) => {
   const q = req.query || {};
   const { rows, categories } = listQa(q);
   const kw = String(q.q || '').trim();
+  const filtering = !!(kw || q.category);
 
-  const opt = (v, label, cur) => `<option value="${he(v)}"${String(cur || '') === String(v) ? ' selected' : ''}>${he(label)}</option>`;
   const filterBar = `
   <div class="filters">
     <form method="get" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-      <select name="category"><option value="">カテゴリ: 全て</option>${categories.map(c => opt(c.category, `${c.category} (${c.c})`, q.category)).join('')}</select>
+      <select name="category"><option value="">カテゴリ: 全て</option>${categoryOptions(categories, q.category)}</select>
       <input type="search" name="q" value="${he(kw)}" placeholder="件名/質問/回答" style="min-width:240px">
-      <button class="pri">検索</button>
+      <button class="pri">🔍 検索</button>
       <a href="/apps/inquiry-hub/qa" class="ghost btn-link">クリア</a>
     </form>
+    ${EXPAND_BUTTONS}
     <span style="flex:1"></span>
     <button class="ghost" id="newBtn">➕ 新規Q&A</button>
     <label class="ghost btn-link" style="cursor:pointer">📥 メールディーラーCSV取込<input type="file" id="csvFile" accept=".csv" style="display:none"></label>
@@ -541,13 +602,9 @@ router.get('/qa', (req, res) => {
     </div>
   </div>`;
 
-  let lastCat = Symbol('none');
-  const items = rows.map(r => {
-    const catHead = r.category !== lastCat ? `<div class="cat-head">📁 ${he(r.category || '(カテゴリなし)')}</div>` : '';
-    lastCat = r.category;
-    return `${catHead}
+  const renderQaItem = r => `
     <details class="tpl" id="qa-${r.id}">
-      <summary><b>❓ ${he(r.title)}</b>
+      <summary><span class="tpl-icon">❓</span><b>${he(r.title)}</b>
         <span class="sub" style="margin-left:auto">${he(r.staff || '')} ・ 更新 ${fmtJst(r.source_updated_at || r.updated_at)}</span></summary>
       <div class="tpl-body">
         ${r.question ? `<div class="qa-q">Q. ${he(r.question).replace(/\n/g, '<br>')}</div>` : ''}
@@ -560,11 +617,11 @@ router.get('/qa', (req, res) => {
         </div>
       </div>
     </details>`;
-  }).join('');
+  const items = renderCategoryTree(buildCategoryTree(rows), renderQaItem, filtering);
 
   const body = `${filterBar}
   <div class="card" style="padding:12px">
-    <div class="sub" style="margin-bottom:8px">全${rows.length}件${q.category || kw ? ' (絞り込み中)' : ''} — 商品知識・対応ノウハウの社内ナレッジ。将来のAI返信案の参照元にもなります</div>
+    <div class="sub" style="margin-bottom:8px">全${rows.length}件${filtering ? ' (絞り込み中 — 全カテゴリ展開表示)' : ''} — 📁カテゴリをクリックで開閉、❓質問をクリックで回答表示。商品知識・対応ノウハウの社内ナレッジ</div>
     ${items || '<div class="empty">Q&amp;Aがありません。メールディーラーのエクスポートCSVを「📥CSV取込」から取り込んでください</div>'}
   </div>`;
 
@@ -629,7 +686,8 @@ router.get('/qa', (req, res) => {
         location.reload();
       }).catch(function(e) { toast('取込失敗: ' + e.message); });
     });
-  });`;
+  });
+  ${EXPAND_SCRIPT}`;
   res.send(pageShell('問い合わせ管理 — Q&A', 'qa', body, script));
 });
 
@@ -740,9 +798,17 @@ router.post('/api/qa/:id(\\d+)/delete', (req, res) => {
 const CSS = `
 * { box-sizing: border-box; }
 body { margin: 0; font-family: -apple-system, "Segoe UI", "Hiragino Sans", "Noto Sans JP", sans-serif; background: #f1f5f9; color: #0f172a; font-size: 14px; }
-header.app { background: #0f172a; color: #fff; padding: 10px 16px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
-header.app h1 { font-size: 16px; margin: 0; }
+header.app { background: #0f172a; color: #fff; padding: 8px 16px; display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
+header.app h1 { font-size: 16px; margin: 0; white-space: nowrap; }
 header.app .back { color: #94a3b8; text-decoration: none; margin-left: auto; font-size: 13px; }
+header.app .back:hover { color: #fff; }
+/* タブ: バイトさんでも今どこにいるか一目で分かるピル型 (アクティブ=白地) */
+nav.tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+a.tab { display: inline-flex; align-items: center; gap: 7px; padding: 9px 18px; border-radius: 10px;
+  color: #cbd5e1; text-decoration: none; font-size: 14px; font-weight: 600; line-height: 1; border: 1px solid transparent; }
+a.tab:hover { background: rgba(255,255,255,.14); color: #fff; }
+a.tab.on { background: #fff; color: #0f172a; box-shadow: 0 1px 3px rgba(0,0,0,.3); }
+.tab-icon { font-size: 16px; }
 .wrap { padding: 16px; max-width: 1400px; margin: 0 auto; }
 .card { background: #fff; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.08); overflow-x: auto; }
 table { border-collapse: collapse; width: 100%; }
@@ -794,10 +860,22 @@ button:disabled { opacity: .5; cursor: default; }
 .reply-note { color: #64748b; text-align: center; }
 .ai-draft { background: #f0fdfa; border-radius: 8px; padding: 8px 10px; margin: 8px 0; line-height: 1.7; }
 #toast { display: none; position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: #0f172a; color: #fff; padding: 10px 18px; border-radius: 10px; z-index: 2000; }
-.cat-head { background: #f1f5f9; border-radius: 8px; padding: 6px 10px; font-weight: 600; margin: 12px 0 6px; }
-details.tpl { border-bottom: 1px solid #e2e8f0; }
-details.tpl summary { display: flex; gap: 10px; align-items: baseline; padding: 8px 6px; cursor: pointer; flex-wrap: wrap; }
-details.tpl summary:hover { background: #f8fafc; }
+/* 階層アコーディオン: 📁グループ (第一階層のみ既定表示) → サブグループ → 項目 */
+details.grp { margin: 6px 0; border: 1px solid #dbe3ee; border-radius: 10px; background: #fff; overflow: hidden; }
+details.grp > summary { display: flex; gap: 8px; align-items: center; padding: 11px 14px; cursor: pointer;
+  font-weight: 600; background: #f1f5f9; list-style: none; user-select: none; }
+details.grp > summary::-webkit-details-marker { display: none; }
+details.grp > summary:hover { background: #e2e8f0; }
+.grp-arrow { display: inline-block; font-size: 11px; color: #64748b; transition: transform .15s; }
+details.grp[open] > .grp-arrow, details.grp[open] > summary .grp-arrow { transform: rotate(90deg); }
+.grp-count { margin-left: auto; font-size: 12px; font-weight: normal; color: #475569; background: #fff;
+  border: 1px solid #cbd5e1; border-radius: 999px; padding: 2px 10px; }
+.grp-body { padding: 4px 10px 8px 22px; }
+details.tpl { border-bottom: 1px solid #eef2f7; }
+details.tpl:last-child { border-bottom: none; }
+details.tpl summary { display: flex; gap: 10px; align-items: baseline; padding: 9px 6px; cursor: pointer; flex-wrap: wrap; }
+details.tpl summary:hover { background: #f8fafc; border-radius: 8px; }
+.tpl-icon { font-size: 14px; }
 .tpl-body { padding: 4px 10px 12px; }
 .tpl-body pre { background: #f8fafc; border-radius: 8px; padding: 10px 12px; white-space: pre-wrap; overflow-wrap: anywhere; font-family: inherit; line-height: 1.7; margin: 8px 0; }
 .tpl-ops { display: flex; gap: 8px; margin-top: 8px; }
@@ -808,17 +886,17 @@ details.tpl summary:hover { background: #f8fafc; }
 `;
 
 function pageShell(title, active, body, script) {
-  const tab = (href, label, key) => `<a href="${href}" style="color:${active === key ? '#fff' : '#94a3b8'};text-decoration:none;font-size:13px">${label}</a>`;
+  const tab = (href, icon, label, key) => `<a href="${href}" class="tab${active === key ? ' on' : ''}"><span class="tab-icon">${icon}</span>${label}</a>`;
   return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${he(title)}</title><style>${CSS}</style></head>
 <body>
 <header class="app">
   <h1>💬 問い合わせ管理</h1>
-  <nav style="display:flex;gap:14px">
-    ${tab('/apps/inquiry-hub', '一覧', 'list')}
-    ${tab('/apps/inquiry-hub/templates', 'テンプレート', 'templates')}
-    ${tab('/apps/inquiry-hub/qa', 'Q&amp;A', 'qa')}
+  <nav class="tabs">
+    ${tab('/apps/inquiry-hub', '📨', '問い合わせ一覧', 'list')}
+    ${tab('/apps/inquiry-hub/templates', '📄', '返信テンプレート', 'templates')}
+    ${tab('/apps/inquiry-hub/qa', '❓', 'Q&amp;A', 'qa')}
   </nav>
   <a href="/" class="back">← ポータルに戻る</a>
 </header>
