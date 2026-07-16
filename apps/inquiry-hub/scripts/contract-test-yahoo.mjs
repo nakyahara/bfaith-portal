@@ -40,14 +40,23 @@ async function getToken() {
     process.exit(2);
   }
   // 平文HTTPで mint secret + 生トークンを流さない (Codexレビュー指摘)。localhost(SSHトンネル)は許可
-  const isLoopback = /^https?:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/.test(proxy);
-  if (proxy.startsWith('http://') && !isLoopback && process.env.ALLOW_INSECURE_PROXY !== 'yes') {
+  // URLパースで判定 (startsWithだと 'HTTP://' 等の表記揺れで迂回できる)
+  let u;
+  try { u = new URL(proxy); } catch { console.error(`FATAL: VPS_PROXY_URL が不正なURLです: ${proxy}`); process.exit(2); }
+  const isLoopback = ['localhost', '127.0.0.1', '[::1]'].includes(u.hostname);
+  if (u.protocol !== 'https:' && !isLoopback && process.env.ALLOW_INSECURE_PROXY !== 'yes') {
     console.error('FATAL: 平文HTTPのプロキシ経由でトークン払い出しはできません。SSHトンネル (ssh -L 18080:localhost:8080 <VPS> → VPS_PROXY_URL=http://localhost:18080) を使うか、ALLOW_INSECURE_PROXY=yes を明示してください');
     process.exit(2);
   }
-  const res = await fetch(`${proxy.replace(/\/$/, '')}/yahoo/access-token`, {
-    method: 'POST', headers: { 'X-Proxy-Secret': secret },
-  });
+  let res;
+  try {
+    res = await fetch(`${proxy.replace(/\/$/, '')}/yahoo/access-token`, {
+      method: 'POST', headers: { 'X-Proxy-Secret': secret },
+    });
+  } catch (e) {
+    console.error(`FATAL: プロキシに接続できません (${e.cause?.code || e.message})。SSHトンネルが起動しているか確認してください`);
+    process.exit(2);
+  }
   if (!res.ok) { console.error(`FATAL: トークン払い出し失敗 HTTP ${res.status} (本文はsecretを含みうるため表示しません)`); process.exit(2); }
   const j = await res.json();
   const token = j.access_token || j.accessToken || j.token;

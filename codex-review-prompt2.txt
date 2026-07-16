@@ -1,0 +1,1 @@
+直前のレビュー指摘2件の修正を確認してください。対象: git diff HEAD~1..HEAD (apps/inquiry-hub/scripts/purge-demo.mjs のGLOB化、contract-test-yahoo.mjs の平文HTTP拒否ガード+エラー本文非表示、smoke.mjs の大小文字テスト追加。smoke 91 PASS確認済み)。指摘が正しく閉じていれば「承認」と明言、残っていれば指摘してください。
