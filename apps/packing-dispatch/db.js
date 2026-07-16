@@ -66,11 +66,13 @@ const SHIPPING_METHODS = [
 ];
 
 // 梱包機コードテーブル。name_csv が CSV 第91列に書く値 (ロジザード取込時に変換)。
+// manual_aes_nonmail は AES 特例の自動判定専用 (人が選ぶ選択肢には出さない、UI 側で除外)。
 const PACKING_MACHINES = [
-  ['pasline3', 'pasline3つ折り', 1],
-  ['pasline2', 'pasline2つ折り', 2],
-  ['meltline', 'meltline',       3],
-  ['manual',   '手動出荷',       9],
+  ['pasline3',           'pasline3つ折り',                 1],
+  ['pasline2',           'pasline2つ折り',                 2],
+  ['meltline',           'meltline',                       3],
+  ['manual',             '手動出荷',                       9],
+  ['manual_aes_nonmail', '手動出荷（AESメール便以外）',    10],
 ];
 
 // ショップ名→mall_group。Amazon 系のみ amazon、Yahoo / LINEギフト は yahoo (LINEギフトは
@@ -90,6 +92,11 @@ const DEFAULT_MALL_GROUP = 'rakuten'; // 未知ショップ・ルール無し時
 
 const COMBO_KEY_VERSION = 1;
 const NEKOPOS_PACKING = ['pasline3', 'pasline2', 'meltline']; // ネコポスで許される梱包機
+// AES 特例 (2026-07-16 中原さん指示): AES かつ 1点物 (単一SKU×数量1) の伝票は、発送条件
+// (Amazon×数量帯1) の配送方法が宅急便50/発払い相当 = メール便サイズ外なら、梱包機マーカー
+// だけ「手動出荷（AESメール便以外）」に振り分ける。配送方法 aes・連動列(34/17/76/92)は不変。
+export const AES_NONMAIL_PM = 'manual_aes_nonmail';
+const AES_NONMAIL_RULE_METHODS = ['takkyu50', 'hatsubarai'];
 // 地域特例: 沖縄/北海道宛は前方一致で判定 (CSV第6列は基本「都道府県名」のみだが、表記揺れ・住所混入の防御)。
 // '沖縄' で startsWith → '沖縄県' も '沖縄' 単体も拾える。
 const HOKKAIDO_OKINAWA_PREFIXES = ['北海道', '沖縄'];
@@ -561,9 +568,24 @@ export function classifyOrder(lines, smMap = shippingMethodMap()) {
   const pref = norm(lines[0]?.pref);
   const isRegionSpecial = HOKKAIDO_OKINAWA_PREFIXES.some((p) => pref.startsWith(p));
 
-  // (1) AES lock: いずれかの行が AES(現行配送方法) なら触らない
+  // (1) AES lock: いずれかの行が AES(現行配送方法) なら配送方法は触らない。
+  //     ただし 1点物 (単一SKU×数量1) は発送条件 (Amazon×数量帯1、Amazon 未登録は通常判定と
+  //     同じく rakuten=既定へフォールバック) を参照し、宅急便50/発払い相当ならメール便で
+  //     送れないサイズとみなして梱包機マーカーだけ manual_aes_nonmail に振り分ける
+  //     (2026-07-16 中原さん指示)。ルール未登録・数量帯穴・上記以外の配送方法は従来どおり
+  //     aes_locked (fail-safe: 判定不能でも要判断にはせず AES はそのまま流す)。
   const curMethodCodes = lines.map((l) => l.cur_method_code).filter(Boolean);
   if (curMethodCodes.includes('aes')) {
+    // 「単一SKU×数量1」は全明細が有効 (sku_key あり・qty>0) な伝票に限る (Codex R0 High)。
+    // 数量不正 ("1abc"→0) 等で bySku から除外された行が混在すると、実際は複数SKUの伝票を
+    // 1点物と誤認して特例振り分けしてしまうため、判定不能は必ず従来の aes_locked に倒す。
+    const allLinesValid = lines.every((l) => l.sku_key && l.qty > 0);
+    if (allLinesValid && skus.length === 1 && skus[0].qty === 1) {
+      const rule = lookupRule(skus[0].sku_key, 'amazon', 1);
+      if (rule && AES_NONMAIL_RULE_METHODS.includes(rule.shipping_method_code)) {
+        return { order_type: 'aes', shipping_method_code: 'aes', packing_machine_code: AES_NONMAIL_PM, row_status: 'auto', reason_code: 'aes_nonmail' };
+      }
+    }
     return { order_type: 'aes', shipping_method_code: 'aes', packing_machine_code: 'manual', row_status: 'auto', reason_code: 'aes_locked' };
   }
 
