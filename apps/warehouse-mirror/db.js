@@ -31,6 +31,9 @@ export let aupayDataInitError = null;
 // Qoo10 Analytics表も同様 (mall-csv-fetcher P1-Q R1)
 export let qoo10DataInitError = null;
 
+// 楽天レビュー日次集計表も同様 (mall-csv-fetcher P2 PR-A)
+export let rakutenReviewInitError = null;
+
 export function initMirrorDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   // リトライ再入時 (2026-07-12 障害対応: 一過性失敗の自己回復) に前のハンドルを
@@ -40,6 +43,7 @@ export function initMirrorDB() {
   yahooInitError = null;
   aupayDataInitError = null;
   qoo10DataInitError = null;
+  rakutenReviewInitError = null;
   db = new Database(DB_FILE);
   // PRAGMA は接続単位の設定。SQLite のデフォルトは foreign_keys=OFF / recursive_triggers=OFF なので、
   // f_mis_shipments の FK 制約 と append-only trigger を機能させるために毎接続で明示する必要がある。
@@ -997,6 +1001,30 @@ function createTables() {
       at: String(e.stack || '').split(String.fromCharCode(10)).slice(0, 3).join(' | '),
     };
     console.error('[Mirror] Qoo10分析表の初期化失敗 (mirror本体は継続):', e.message);
+  }
+
+  // ─── 楽天レビュー 日次集計 (mall-csv-fetcher P2 PR-A、2026-07-16) ───
+  // ★非PII集計のみ (本文/注文番号/レビューURLは miniPC 側に留める — らくらくーぽん置換 設計書§4)
+  // fail-soft: 新mirror表のDDLは fail-soft 必須 (2026-07-12 障害の教訓)
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_rakuten_review_daily (
+      date_jst    TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+      review_type TEXT NOT NULL CHECK(review_type IN ('item','shop')),
+      item_id     INTEGER NOT NULL DEFAULT 0,
+      item_name   TEXT,
+      rating      INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 5),
+      review_count INTEGER NOT NULL,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+      PRIMARY KEY (date_jst, review_type, item_id, rating)
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_mrrd_item ON mirror_rakuten_review_daily(item_id, date_jst)');
+  } catch (e) {
+    rakutenReviewInitError = {
+      message: String(e.message || e),
+      code: e.code || null,
+      at: String(e.stack || '').split(String.fromCharCode(10)).slice(0, 3).join(' | '),
+    };
+    console.error('[Mirror] 楽天レビュー集計表の初期化失敗 (mirror本体は継続):', e.message);
   }
 
   // mirror_rakuten_finance_sku_daily — 楽天 Phase 1a #R-3b (Render 側 daily fact mirror)

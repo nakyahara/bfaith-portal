@@ -13,7 +13,7 @@
  */
 import { Router } from 'express';
 import crypto from 'crypto';
-import { initMirrorDB, getMirrorDB, yahooInitError, aupayDataInitError, qoo10DataInitError } from './db.js';
+import { initMirrorDB, getMirrorDB, yahooInitError, aupayDataInitError, qoo10DataInitError, rakutenReviewInitError } from './db.js';
 import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
 import {
   STORE_BENCH_COLS, STORE_DEVICE_BASE_COLS, STORE_DEVICE_OPT_COLS, CATEGORY_DEMO_COLS,
@@ -1000,8 +1000,32 @@ const QOO10_DATA_TABLE_SPECS = {
 };
 const QOO10_DATA_ENTITY_NAMES = new Set(Object.keys(QOO10_DATA_TABLE_SPECS));
 
-// 楽天dd + Yahoo + au PAY分析 + Qoo10 を1つのレジストリに統合 (getRakutenDdInsert/normalizeRakutenDdRow が参照)
-const DD_ALL_TABLE_SPECS = { ...RAKUTEN_DD_TABLE_SPECS, ...YAHOO_DATA_TABLE_SPECS, ...AUPAY_DATA_TABLE_SPECS, ...QOO10_DATA_TABLE_SPECS };
+// 楽天レビュー 日次集計 (mall-csv-fetcher P2 PR-A)。★非PII集計のみ受ける (本文/注文番号/URLは列自体が無い)
+const RAKUTEN_REVIEW_TABLE_SPECS = {
+  rakuten_review_daily: {
+    table: 'mirror_rakuten_review_daily',
+    required: ['date_jst', 'review_type', 'rating'],
+    cols: ['date_jst', 'review_type', 'item_id', 'item_name', 'rating', 'review_count'],
+    defaults: { item_id: 0 },
+    validate: (r, HttpErrorCls) => {
+      if (r.review_type !== 'item' && r.review_type !== 'shop') {
+        throw new HttpErrorCls(400, { error: 'bad_row', message: `bad review_type: ${r.review_type}` });
+      }
+      const rating = Number(r.rating);
+      if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+        throw new HttpErrorCls(400, { error: 'bad_row', message: `bad rating: ${r.rating}` });
+      }
+      const cnt = Number(r.review_count);
+      if (!Number.isInteger(cnt) || cnt < 1) {
+        throw new HttpErrorCls(400, { error: 'bad_row', message: `bad review_count: ${r.review_count}` });
+      }
+    },
+  },
+};
+const RAKUTEN_REVIEW_ENTITY_NAMES = new Set(Object.keys(RAKUTEN_REVIEW_TABLE_SPECS));
+
+// 楽天dd + Yahoo + au PAY分析 + Qoo10 + 楽天レビュー を1つのレジストリに統合 (getRakutenDdInsert/normalizeRakutenDdRow が参照)
+const DD_ALL_TABLE_SPECS = { ...RAKUTEN_DD_TABLE_SPECS, ...YAHOO_DATA_TABLE_SPECS, ...AUPAY_DATA_TABLE_SPECS, ...QOO10_DATA_TABLE_SPECS, ...RAKUTEN_REVIEW_TABLE_SPECS };
 
 function getRakutenDdInsert(db, entityKey) {
   const b = getStmtBundle(db);
@@ -1676,6 +1700,15 @@ const ENTITY_REGISTRY = {
     getInsertStmt: (db) => getRakutenDdInsert(db, key),
     normalizeRow: (r) => normalizeRakutenDdRow(key, r),
   }])),
+  // 楽天レビュー 日次集計 1 entity (mall-csv-fetcher P2 PR-A、2026-07-16)
+  rakuten_review_daily: {
+    contract_version: 1,
+    mirror_table: 'mirror_rakuten_review_daily',
+    clear_strategy: 'date_range',
+    clear_meta_key: 'clear_rakuten_review_daily_dates',
+    getInsertStmt: (db) => getRakutenDdInsert(db, 'rakuten_review_daily'),
+    normalizeRow: (r) => normalizeRakutenDdRow('rakuten_review_daily', r),
+  },
   // au PAYマーケット分析 13 entity (mall-csv-fetcher P1-A、2026-07-13)
   // 月次 entity は date_jst=月初日を clear キーに使う (rakuten_purchaser_monthly と同方針)
   ...Object.fromEntries(Object.keys(AUPAY_DATA_TABLE_SPECS).map((key) => [key, {
@@ -1907,6 +1940,9 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
   }
   if (QOO10_DATA_ENTITY_NAMES.has(entity) && qoo10DataInitError) {
     return res.status(503).json({ error: 'qoo10 data tables init failed', init_error: qoo10DataInitError });
+  }
+  if (RAKUTEN_REVIEW_ENTITY_NAMES.has(entity) && rakutenReviewInitError) {
+    return res.status(503).json({ error: 'rakuten review tables init failed', init_error: rakutenReviewInitError });
   }
   if (contract_version !== entityCfg.contract_version) {
     return res.status(400).json({

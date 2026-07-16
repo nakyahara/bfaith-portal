@@ -84,6 +84,11 @@ const DEFAULT_FETCHERS = [
     timeoutMs: 20 * 60 * 1000,
   },
   {
+    mall: 'rakuten-review', // レビューチェックツールCSV (mall-csv-fetcher P2、らくらくーぽん置換)。同期DL1本
+    script: join(__dirname, 'rakuten-review-download.mjs'),
+    timeoutMs: 15 * 60 * 1000,
+  },
+  {
     mall: 'yahoo', // ストクリ統計6種 (mall-csv-fetcher P1-Y)。全て同期DLなので短め
     script: join(__dirname, 'yahoo-data-download.mjs'),
     timeoutMs: 20 * 60 * 1000,
