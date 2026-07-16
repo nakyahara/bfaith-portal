@@ -7,9 +7,11 @@
 //   ※ 注文APIは さくらVPS (vps-proxy) から稼働実績あり = システム系APIはDC-IP全滅ではない
 //
 // 認証トークンの取り方 (どちらか):
-//   A) 既存VPSプロキシから払い出し (推奨。注文APIで運用中のYConnect+公開鍵認証を再利用):
-//      VPS_PROXY_URL=http://133.167.122.198:8080 YAHOO_TOKEN_MINT_SECRET=... YAHOO_SELLER_ID=...
-//   B) トークン直接指定: YAHOO_ACCESS_TOKEN=... YAHOO_SELLER_ID=...
+//   A) 既存VPSプロキシの /yahoo/access-token から払い出し (注文APIで運用中のYConnect+公開鍵認証を再利用)
+//      ⚠️生トークンを扱うため平文HTTPでの取得は既定で拒否する。SSHトンネル経由を推奨:
+//        ssh -L 18080:localhost:8080 <VPS>  →  VPS_PROXY_URL=http://localhost:18080 YAHOO_TOKEN_MINT_SECRET=...
+//      直接http://133.167.122.198:8080を使う場合は ALLOW_INSECURE_PROXY=yes が必要 (盗聴リスクを理解のうえで)
+//   B) トークン直接指定: YAHOO_ACCESS_TOKEN=... YAHOO_SELLER_ID=... (VPS上でこのスクリプトを直接実行する場合など)
 //
 // 使い方 (read-only):
 //   node apps/inquiry-hub/scripts/contract-test-yahoo.mjs
@@ -37,13 +39,19 @@ async function getToken() {
     console.error('FATAL: YAHOO_ACCESS_TOKEN か (VPS_PROXY_URL + YAHOO_TOKEN_MINT_SECRET) を指定してください');
     process.exit(2);
   }
+  // 平文HTTPで mint secret + 生トークンを流さない (Codexレビュー指摘)。localhost(SSHトンネル)は許可
+  const isLoopback = /^https?:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/.test(proxy);
+  if (proxy.startsWith('http://') && !isLoopback && process.env.ALLOW_INSECURE_PROXY !== 'yes') {
+    console.error('FATAL: 平文HTTPのプロキシ経由でトークン払い出しはできません。SSHトンネル (ssh -L 18080:localhost:8080 <VPS> → VPS_PROXY_URL=http://localhost:18080) を使うか、ALLOW_INSECURE_PROXY=yes を明示してください');
+    process.exit(2);
+  }
   const res = await fetch(`${proxy.replace(/\/$/, '')}/yahoo/access-token`, {
     method: 'POST', headers: { 'X-Proxy-Secret': secret },
   });
-  if (!res.ok) { console.error(`FATAL: トークン払い出し失敗 HTTP ${res.status}: ${await res.text()}`); process.exit(2); }
+  if (!res.ok) { console.error(`FATAL: トークン払い出し失敗 HTTP ${res.status} (本文はsecretを含みうるため表示しません)`); process.exit(2); }
   const j = await res.json();
   const token = j.access_token || j.accessToken || j.token;
-  if (!token) { console.error(`FATAL: トークン払い出しレスポンスに access_token がありません: ${JSON.stringify(j).slice(0, 200)}`); process.exit(2); }
+  if (!token) { console.error(`FATAL: トークン払い出しレスポンスに access_token がありません (キー: ${Object.keys(j).join(',')})`); process.exit(2); }
   console.log('  (VPSプロキシからアクセストークン取得OK)');
   return token;
 }

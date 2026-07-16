@@ -281,6 +281,13 @@ console.log('8. デモデータ削除 (purge-demo)');
     && db.prepare('SELECT COUNT(*) c FROM shops WHERE id = ?').get(mixedShop).c === 1
     && db.prepare("SELECT COUNT(*) c FROM inquiries WHERE external_inquiry_id = 'real-yh-1'").get().c === 1
     && db.prepare("SELECT COUNT(*) c FROM inquiries WHERE external_inquiry_id = 'demo:yh-1'").get().c === 0);
+
+  // GLOBの大文字小文字区別: 'DEMO:'で始まる実データは誤爆しない (Codexレビュー指摘)
+  insInq.run('yahoo', mixedShop, 'DEMO:not-a-demo', '実顧客2', 'y-real2', '大文字DEMOで始まる実データ',
+    'open', null, null, null, null, 1, 0, 0, T('2026-07-14T12:00:00+09:00'), null);
+  const caseTest = purgeDemo({ apply: true });
+  check('purge: 大文字DEMO:は削除対象外 (GLOB大小区別)', caseTest.deleted.inquiries === 0
+    && db.prepare("SELECT COUNT(*) c FROM inquiries WHERE external_inquiry_id = 'DEMO:not-a-demo'").get().c === 1);
 }
 
 // ─── 結果 ───

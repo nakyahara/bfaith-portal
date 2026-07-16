@@ -20,7 +20,8 @@ export function purgeDemo({ apply = false } = {}) {
   const db = getDB();
   const report = { apply, deleted: {}, keptShops: [] };
 
-  const inqIds = db.prepare("SELECT id FROM inquiries WHERE external_inquiry_id LIKE 'demo:%'").all().map(r => r.id);
+  // GLOB は大文字小文字を区別する (LIKEはASCII大小無視のため 'Demo:'等の実データを誤爆しうる。Codexレビュー指摘)
+  const inqIds = db.prepare("SELECT id FROM inquiries WHERE external_inquiry_id GLOB 'demo:*'").all().map(r => r.id);
   const inqIn = `(${inqIds.map(() => '?').join(',') || 'NULL'})`;
   const msgIds = inqIds.length
     ? db.prepare(`SELECT id FROM inquiry_messages WHERE inquiry_id IN ${inqIn}`).all(...inqIds).map(r => r.id)
@@ -64,7 +65,7 @@ export function purgeDemo({ apply = false } = {}) {
     for (const s of demoShops) {
       // apply時は上でinquiriesが消えている。dry-run時は「demo以外が紐付いているか」で判定
       const remaining = db.prepare(
-        "SELECT COUNT(*) c FROM inquiries WHERE shop_id = ? AND external_inquiry_id NOT LIKE 'demo:%'").get(s.id).c;
+        "SELECT COUNT(*) c FROM inquiries WHERE shop_id = ? AND external_inquiry_id NOT GLOB 'demo:*'").get(s.id).c;
       if (remaining > 0) {
         report.keptShops.push(`${s.shop_name} (${s.account_identifier}): demo以外の問い合わせ ${remaining} 件が紐付くため店舗は残します`);
         continue;
@@ -82,7 +83,7 @@ export function purgeDemo({ apply = false } = {}) {
   if (apply) db.transaction(run)(); else run();
 
   report.remainingInquiries = db.prepare('SELECT COUNT(*) c FROM inquiries').get().c;
-  report.remainingDemo = db.prepare("SELECT COUNT(*) c FROM inquiries WHERE external_inquiry_id LIKE 'demo:%'").get().c;
+  report.remainingDemo = db.prepare("SELECT COUNT(*) c FROM inquiries WHERE external_inquiry_id GLOB 'demo:*'").get().c;
   return report;
 }
 
